@@ -13,6 +13,8 @@ REBUILD=0
 PREMERGE_GATE=0
 DRY_RUN=0
 PASS_ARGS=()
+# A remote run hands the same command line to the remote copy of this script.
+ORIGINAL_ARGS=("$@")
 
 usage() {
     cat <<'EOF'
@@ -33,6 +35,19 @@ Options:
   --all-platforms  Run linux/amd64 and linux/arm64
   --dry-run        Print Docker commands without running them
   -h, --help       Show help
+
+Remote gates:
+  Set BLORP_DOCKER_GATE_HOST to an SSH host (an ~/.ssh/config alias with key
+  login), in the environment or in a gitignored .env at the repository root,
+  to run the gate on that machine's Docker. The working tree, including
+  uncommitted and untracked files, is sent as a snapshot commit; the checkout is
+  not modified. When the host or its Docker is unreachable, the gate runs here.
+  BLORP_DOCKER_GATE_REMOTE_REPO  remote repository path (default: blorp-gate,
+                                 relative to the remote home; created on first use)
+  BLORP_DOCKER_GATE_REMOTE_MAX_CONCURRENT
+                                 gates the remote runs at once (default: 10)
+  With a remote host, --dry-run still sends the snapshot and prints the Docker
+  commands the remote would run.
 
 Examples:
   scripts/docker-gate
@@ -101,6 +116,40 @@ done
 
 cd "$(dirname "$0")/.."
 
+# Machine-local settings, such as BLORP_DOCKER_GATE_HOST, may live in a
+# gitignored .env as NAME=value lines. A worktree has no untracked files of its
+# own, so the main checkout's .env is read too. Only BLORP_DOCKER_GATE_*
+# names are taken, the file is parsed rather than sourced, and a variable
+# already in the environment (or set by an earlier line or file) wins. A value
+# may be quoted; anything after the = is the value, so a line holds no
+# trailing comment.
+load_local_settings() {
+    local file line name value main_checkout
+    main_checkout="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo .)")"
+    for file in .env "$main_checkout/.env"; do
+        [ -f "$file" ] || continue
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            line="${line#export }"
+            case "$line" in
+                BLORP_DOCKER_GATE_*=*) ;;
+                *) continue ;;
+            esac
+            name="${line%%=*}"
+            value="${line#*=}"
+            case "$name" in
+                *[!A-Z0-9_]*) continue ;;
+            esac
+            case "$value" in
+                \"*\") value="${value#\"}"; value="${value%\"}" ;;
+                \'*\') value="${value#\'}"; value="${value%\'}" ;;
+            esac
+            [ -n "${!name+x}" ] || export "$name=$value"
+        done < "$file"
+    done
+}
+load_local_settings
+
 # Logs, and so nested verdicts, are keyed by platform, so a repeated
 # `--platform` would otherwise be waiting for a verdict that cannot arrive.
 unique_platforms=()
@@ -135,6 +184,197 @@ done
 if [ "${BLORP_DOCKER_GATE_BUILD_JOBS:-1}" -eq 0 ]; then
     echo "BLORP_DOCKER_GATE_BUILD_JOBS must be at least 1." >&2
     exit 1
+fi
+
+# Remote gates. The gate runs on BLORP_DOCKER_GATE_HOST's Docker in a fresh
+# worktree of a repository there, created from a snapshot commit of this
+# working tree, and that machine's own queue limits how many run at once.
+# Docker cannot be driven remotely from here instead (DOCKER_HOST=ssh://...),
+# because the gate bind-mounts this checkout and its .git directory, and a
+# remote daemon would resolve those paths on its own disk.
+REMOTE_HOST="${BLORP_DOCKER_GATE_HOST:-}"
+REMOTE_REPO="${BLORP_DOCKER_GATE_REMOTE_REPO:-blorp-gate}"
+# A dedicated gate host has far more memory than a workstation's Docker VM.
+# At the 2-job build floor a gate's build peaks near 2 GiB (measurements
+# below), so ten fit in about 50 GB with room for their test phases; set the
+# variable to match the host.
+DEFAULT_REMOTE_MAX_CONCURRENT_GATES=10
+REMOTE_MAX_CONCURRENT="${BLORP_DOCKER_GATE_REMOTE_MAX_CONCURRENT:-$DEFAULT_REMOTE_MAX_CONCURRENT_GATES}"
+REMOTE_PROBE_TIMEOUT_SECONDS=5
+REMOTE_KEEPALIVE_SECONDS=30
+# Refs and worktrees left by a run that was cut off (the connection dropped
+# before its cleanup ran) are swept by the next run once they are this old,
+# well past the length of any gate.
+REMOTE_STALE_SECONDS=86400
+# ssh's own exit status when the connection fails. A remote gate that exits
+# with it is reported as REMOTE_GATE_STATUS_255 instead, so this status always
+# means the gate did not run to completion.
+SSH_CONNECTION_FAILED=255
+REMOTE_GATE_STATUS_255=254
+
+if [ -n "$REMOTE_HOST" ]; then
+    case "$REMOTE_MAX_CONCURRENT" in
+        ''|*[!0-9]*|0)
+            echo "BLORP_DOCKER_GATE_REMOTE_MAX_CONCURRENT must be a positive integer, got '$REMOTE_MAX_CONCURRENT'." >&2
+            exit 1
+            ;;
+    esac
+    case "$REMOTE_REPO" in
+        ''|'~'*)
+            echo "BLORP_DOCKER_GATE_REMOTE_REPO must be a path relative to the remote home or an absolute path, got '$REMOTE_REPO'." >&2
+            exit 1
+            ;;
+    esac
+fi
+
+REMOTE_SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout="$REMOTE_PROBE_TIMEOUT_SECONDS" -o ServerAliveInterval="$REMOTE_KEEPALIVE_SECONDS")
+
+remote_ssh() {
+    ssh "${REMOTE_SSH_OPTIONS[@]}" -- "$REMOTE_HOST" "$@"
+}
+
+# Run a script on the remote host with bash. The step name is only a label in
+# the remote command line. The script is a function invoked with stdin from
+# /dev/null, so bash has read all of it before anything it starts could
+# consume the rest of stdin.
+remote_bash() {
+    local step="$1"
+    local body="$2"
+    printf 'remote_step() {\n%s\n}\nremote_step </dev/null\n' "$body" |
+        remote_ssh bash -s -- "$step"
+}
+
+# Every value placed in a remote script is quoted for the remote bash.
+remote_quote() {
+    printf '%q' "$1"
+}
+
+# Exits 0 when the host answers and has git and a running Docker; otherwise
+# prints why not.
+probe_remote_host() {
+    local status=0
+    remote_bash probe 'command -v git >/dev/null 2>&1 || exit 3
+command -v docker >/dev/null 2>&1 || exit 4
+docker info >/dev/null 2>&1 || exit 5' || status=$?
+    case "$status" in
+        0) return 0 ;;
+        3) echo "git is not installed on $REMOTE_HOST" ;;
+        4) echo "docker is not on the PATH of a non-interactive shell on $REMOTE_HOST" ;;
+        5) echo "the Docker daemon on $REMOTE_HOST is not running" ;;
+        "$SSH_CONNECTION_FAILED") echo "$REMOTE_HOST is unreachable over SSH" ;;
+        *) echo "the probe of $REMOTE_HOST exited $status" ;;
+    esac
+    return 1
+}
+
+# A commit of the working tree as the volume mount would show it: tracked
+# changes and untracked files that are not ignored. It is built in a private
+# index, so the checkout's index and files are untouched (git adds the new
+# objects to its object store); when nothing differs from HEAD it is HEAD.
+# Prints nothing and fails if any step fails, so a partial tree is never sent.
+snapshot_commit() {
+    local index tree head_tree status=0
+    index="$(mktemp "${TMPDIR:-/tmp}/blorp-docker-gate-index.XXXXXX")" || return 1
+    # Starting from the checkout's index keeps its stat cache, so unchanged
+    # files are not hashed again.
+    cp "$(git rev-parse --git-path index)" "$index" 2>/dev/null ||
+        GIT_INDEX_FILE="$index" git read-tree HEAD || status=1
+    [ "$status" -ne 0 ] || GIT_INDEX_FILE="$index" git add -A || status=1
+    [ "$status" -ne 0 ] || tree="$(GIT_INDEX_FILE="$index" git write-tree)" || status=1
+    rm -f "$index"
+    [ "$status" -eq 0 ] && [ -n "$tree" ] || return 1
+    head_tree="$(git rev-parse 'HEAD^{tree}')" || return 1
+    if [ "$tree" = "$head_tree" ]; then
+        git rev-parse HEAD
+    else
+        git commit-tree "$tree" -p HEAD -m "docker-gate snapshot of the working tree"
+    fi
+}
+
+# Push the snapshot and run the gate there. Returns the remote gate's status,
+# or SSH_CONNECTION_FAILED when the connection, or the setup before the gate,
+# failed. A failed snapshot prints why and returns SSH_CONNECTION_FAILED too,
+# since the gate can still run here.
+run_remote_gate() {
+    local commit ref arg quoted_args=""
+    if ! commit="$(snapshot_commit)" || [ -z "$commit" ]; then
+        echo "docker-gate: could not snapshot the working tree." >&2
+        return "$SSH_CONNECTION_FAILED"
+    fi
+    ref="refs/blorp-docker-gate/$(date +%s)-$(hostname -s)-$$"
+    for arg in ${ORIGINAL_ARGS[@]+"${ORIGINAL_ARGS[@]}"}; do
+        quoted_args+=" $(remote_quote "$arg")"
+    done
+
+    # Creates the repository on first use and sweeps what cut-off runs left:
+    # refs older than REMOTE_STALE_SECONDS (their names start with the time
+    # they were made) and worktrees whose directories are that old.
+    remote_bash prepare "cd && mkdir -p $(remote_quote "$REMOTE_REPO") && cd $(remote_quote "$REMOTE_REPO") || exit 1
+[ -d .git ] || git init -q || exit 1
+cutoff=\$(( \$(date +%s) - $REMOTE_STALE_SECONDS ))
+git for-each-ref --format='%(refname)' refs/blorp-docker-gate | while IFS= read -r stale; do
+    made=\${stale#refs/blorp-docker-gate/}
+    made=\${made%%-*}
+    case \"\$made\" in ''|*[!0-9]*) continue ;; esac
+    [ \"\$made\" -lt \"\$cutoff\" ] && git update-ref -d \"\$stale\"
+done
+git worktree list --porcelain | sed -n 's/^worktree //p' | while IFS= read -r tree; do
+    case \"\$tree\" in */blorp-remote-gate.*/worktree) ;; *) continue ;; esac
+    [ -n \"\$(find \"\$tree\" -maxdepth 0 -mmin +$((REMOTE_STALE_SECONDS / 60)) 2>/dev/null)\" ] || continue
+    git worktree remove --force \"\$tree\" >/dev/null 2>&1
+done
+git worktree prune
+exit 0" || return "$SSH_CONNECTION_FAILED"
+
+    echo "Sending the working tree to $REMOTE_HOST:$REMOTE_REPO ($commit)..."
+    GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh ${REMOTE_SSH_OPTIONS[*]}}" \
+        git push -q "$REMOTE_HOST:$REMOTE_REPO" "$commit:$ref" || return "$SSH_CONNECTION_FAILED"
+
+    echo "Running the gate on $REMOTE_HOST (up to $REMOTE_MAX_CONCURRENT at once there)..."
+    # The worktree, its directory and the ref are removed when the gate ends or
+    # the remote shell is signalled. A run whose shell is killed outright is
+    # swept by a later run. The remote queue lives in one directory for every
+    # client, rather than under TMPDIR, which differs between SSH and desktop
+    # sessions.
+    remote_bash run "cd && cd $(remote_quote "$REMOTE_REPO") || exit 1
+repo=\$(pwd)
+parent=\$(mktemp -d \"\${TMPDIR:-/tmp}/blorp-remote-gate.XXXXXX\") || exit 1
+tree=\"\$parent/worktree\"
+cleanup() {
+    cd \"\$repo\"
+    git worktree remove --force \"\$tree\" >/dev/null 2>&1
+    git worktree prune
+    git update-ref -d $(remote_quote "$ref")
+    rm -rf \"\$parent\"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP PIPE
+trap 'exit 130' INT
+trap 'exit 143' TERM
+git worktree add -q --detach \"\$tree\" $(remote_quote "$ref") || exit 1
+cd \"\$tree\"
+# Empty rather than unset, so a .env on the remote cannot set it again.
+export BLORP_DOCKER_GATE_HOST=
+export BLORP_DOCKER_GATE_MAX_CONCURRENT=$(remote_quote "$REMOTE_MAX_CONCURRENT")
+export BLORP_DOCKER_GATE_SLOT_DIR=\"\${BLORP_DOCKER_GATE_SLOT_DIR:-\$HOME/.cache/blorp-docker-gate-slots}\"
+status=0
+scripts/docker-gate$quoted_args || status=\$?
+[ \"\$status\" -ne $SSH_CONNECTION_FAILED ] || status=$REMOTE_GATE_STATUS_255
+exit \"\$status\""
+}
+
+if [ -n "$REMOTE_HOST" ] && [ "$SHELL_MODE" -eq 0 ]; then
+    if unavailable_reason="$(probe_remote_host)"; then
+        remote_status=0
+        run_remote_gate || remote_status=$?
+        if [ "$remote_status" -ne "$SSH_CONNECTION_FAILED" ]; then
+            exit "$remote_status"
+        fi
+        # The gate's own failures are returned above and never rerun here.
+        echo "docker-gate: the gate on $REMOTE_HOST could not start or lost its connection; running the gate locally." >&2
+    else
+        echo "docker-gate: $unavailable_reason; running the gate locally." >&2
+    fi
 fi
 
 if [ "$DRY_RUN" -eq 0 ]; then

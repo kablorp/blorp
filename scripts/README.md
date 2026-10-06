@@ -348,13 +348,52 @@ Modes:
     `BLORP_DOCKER_GATE_BUILD_JOBS` to override. Fewer jobs lower a gate's peak
     memory at some cost in build time.
 
+### Remote gate host
+
+Set `BLORP_DOCKER_GATE_HOST` to an SSH host, such as an `~/.ssh/config` alias
+with key login, to run gates on that machine's Docker instead of this one's.
+Put it in a gitignored `.env` at the repository root, which every worktree of
+the checkout reads, or in the environment, which takes precedence:
+
+```bash
+echo 'BLORP_DOCKER_GATE_HOST=blorp-gate' >> .env
+scripts/docker-gate --premerge-gate --platform linux/arm64 -- --no-sanitize
+```
+
+`.env` holds `NAME=value` lines; only `BLORP_DOCKER_GATE_*` names are read, and
+the file is parsed, not sourced. Keep host names, user names and paths there
+or in `~/.ssh/config`, never in tracked files.
+
+- The working tree, including uncommitted and untracked files that are not
+  ignored, is sent as a snapshot commit built in a private index, so the
+  checkout's index and files are untouched. The gate runs in a fresh worktree
+  of `BLORP_DOCKER_GATE_REMOTE_REPO` (default `blorp-gate` in the remote home,
+  created on first use), removed with its ref when the gate ends. Anything a
+  cut-off run leaves behind is swept by a later run after a day.
+- A remote gate that itself exits 255 is reported as 254, so 255 always means
+  the connection failed.
+- The remote machine queues its gates like a local run, at most
+  `BLORP_DOCKER_GATE_REMOTE_MAX_CONCURRENT` (default 10) at once, in one slot
+  directory (`~/.cache/blorp-docker-gate-slots`) for every client.
+- If the host is unreachable, or lacks git or a running Docker, the gate runs
+  locally with a one-line note saying why. A gate that ran remotely and failed
+  returns its status; it is never rerun locally. If the connection drops during
+  the gate, it reruns locally once.
+- `--shell` always runs locally.
+- The remote host needs Remote Login (SSH), git, and Docker reachable from a
+  non-interactive shell. With Docker Desktop on macOS, put its CLI directory
+  (`/usr/local/bin` or `~/.docker/bin`) on `PATH` in `~/.zshenv`, remove
+  `credsStore` from `~/.docker/config.json` (the keychain is unavailable over
+  SSH), keep a user logged in so Docker Desktop runs, and disable sleep.
+
 ## Landing a Branch
 
 Validate a branch first with the CI-equivalent gate, the same checks CI runs on
 Ubuntu x64: from the branch's checkout or worktree run
 `scripts/docker-gate --premerge-gate -- --no-sanitize` (a clean -O2 build,
 `make quality` and the full `scripts/test` in an Ubuntu container). Gates on
-different branches may run in parallel. Then land it:
+different branches may run in parallel. With `BLORP_DOCKER_GATE_HOST` set they
+run on the gate host (see "Remote gate host" above). Then land it:
 
 ```bash
 scripts/land <branch> --title "<title>" [--body "<text>"] \
