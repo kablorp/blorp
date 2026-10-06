@@ -553,10 +553,16 @@ first slice publishes only the indexed declaration name and selection range;
 type rendering is deferred until the typed compiler product has a stable
 protocol-facing representation.
 Target-level analysis failures publish their structured diagnostics. If a
-graph-wide failure, planning failure, or rejected completion has no trustworthy
-source span, the actor publishes an empty publication at the current target
-identity to replace older diagnostics without fabricating a location. Stale
-completions publish nothing.
+graph-wide failure, planning failure, or rejected interactive completion has no
+trustworthy source span, the actor publishes an empty publication at the
+current target identity to replace older diagnostics without fabricating a
+location, unless a workspace-index completion has already proved that
+revision. A rejected workspace-index completion is an internal inconsistency,
+not evidence about any source: it publishes nothing, so the interactive lane's
+diagnostics for an open document's newest version survive, and the actor
+reports the rejection instead. A workspace-index worker failure still clears
+every declared target, open documents included. Stale completions publish
+nothing.
 
 ## Build
 
