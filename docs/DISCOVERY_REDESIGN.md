@@ -3932,6 +3932,9 @@ the proposed forms so their consequences can be reviewed.
   passes at 1,200 and overflows at 1,400. Follow-up if deeper proof is wanted:
   split the rare arms out of the general dump walker, iterate the block stack
   as the expression nesting is, or raise the main stack size at the CLI.
+  Linux programs now get a 16 MB main stack like macOS (the runtime raises the
+  soft stack limit at startup), so the Linux figures above, measured with the
+  default 8 MB, are historical.
 
 - **D7. Nested lambda depth (3.14).** A lambda nests as an expression and as a
   body, so a chain of lambdas recurses in the expression parser, the body

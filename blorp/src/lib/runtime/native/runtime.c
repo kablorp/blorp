@@ -3409,6 +3409,41 @@ __attribute__((constructor))
 static void __blorp_init_signal_handlers(void) {
     signal(SIGPIPE, SIG_IGN);
 }
+
+#if defined(__linux__)
+// The main-thread stack every Blorp program gets, so that deep native
+// recursion (the compiler's own passes, parsers over deeply nested sources)
+// behaves alike on both platforms. macOS asks for it at link time
+// (`-Wl,-stack_size` in blorp/src/lib/host_c.brp, `platform_stack_size_argument`);
+// keep the two values equal. Linux has no link-time setting for the main stack:
+// it is whatever soft RLIMIT_STACK the parent passed down, usually 8 MB. The
+// kernel checks the limit each time the main stack grows, not just at exec, so
+// raising it here, before main runs, takes effect at once; in the default
+// top-down layout the gap kept below the stack is at least 128 MB, so this size
+// fits under it.
+//
+// The raised limit is inherited by every process this one spawns, which cannot
+// be undone per child, as with SIGPIPE above. glibc fixes this process's
+// default thread stack size before constructors run, so its own thread and fiber
+// stacks keep their size, but a spawned glibc program, such as a Blorp test
+// binary run by `blorp test`, sizes its default thread stacks from the
+// inherited 16 MB.
+#define BLORP_MAIN_STACK_BYTES ((rlim_t)0x1000000)
+
+__attribute__((constructor))
+static void __blorp_raise_main_stack_limit(void) {
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_STACK, &limit) != 0) return;
+    if (limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur >= BLORP_MAIN_STACK_BYTES) return;
+    // A lower hard limit is a policy of the environment; stay under it.
+    rlim_t wanted = BLORP_MAIN_STACK_BYTES;
+    if (limit.rlim_max != RLIM_INFINITY && limit.rlim_max < wanted) wanted = limit.rlim_max;
+    limit.rlim_cur = wanted;
+    // Best effort: on failure the stack stays at the inherited limit.
+    (void)setrlimit(RLIMIT_STACK, &limit);
+}
+#endif
+
 static void __blorp_teardown_before_leak_report(void) {
     blorp_thread_pool_shutdown();
     blorp_profile_report();
