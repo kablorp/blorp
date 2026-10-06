@@ -559,6 +559,7 @@ tooling-check: build-blorp-cli
 	@blorp/test/test_build/test_build_source_generator.sh
 	@blorp/test/test_build/test_release_toolchain.sh
 	@blorp/test/test_build/test_gate_verdicts.sh
+	@blorp/test/test_build/test_c_static_analysis_cache.sh
 	@blorp/test/test_build/test_split_translation_units.sh
 
 # The benchmark-worker checks and the suites that test benchmark and
@@ -579,29 +580,10 @@ benchmark-tooling-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_memory_diagnostics_harness.py
 	@blorp/test/test_compiler/test_benchmark/test_record_layout.sh
 
-# `clang --analyze` exits 0 even when it reports findings. -analyzer-werror
-# makes every finding an error, and `set -e` fails the target at the first
-# file that has one. Suppress a false positive at its site with a comment
-# saying why rather than adding another checker disable here; the
-# BlockInCriticalSection disable below predates this rule and still hides two
-# untriaged `recv` reports.
+# scripts/c-static-analysis owns the analyzer flags and skips the run when
+# its inputs are unchanged since a passing run.
 c-static-analysis:
-	@command -v clang >/dev/null 2>&1 || { \
-		echo "clang is required for c-static-analysis."; \
-		exit 127; \
-	}
-	@set -e; \
-	tmp_plist=$$(mktemp "$${TMPDIR:-/tmp}/blorp-clang-analyze.XXXXXX"); \
-	block_checker_args=$$(clang -cc1 -analyzer-checker-help 2>/dev/null | grep -Fq 'unix.BlockInCriticalSection' && printf '%s' '-Xclang -analyzer-disable-checker=unix.BlockInCriticalSection' || true); \
-	trap 'rm -f "$$tmp_plist"' EXIT; \
-	clang --analyze -Xclang -analyzer-werror -D_GNU_SOURCE -Wno-nullability-completeness -Wno-unused-command-line-argument -o "$$tmp_plist" -x c blorp/src/lib/runtime/native/runtime_decl.c; \
-	clang --analyze -Xclang -analyzer-werror -Wno-nullability-completeness -Wno-unused-command-line-argument \
-		-D_GNU_SOURCE $$block_checker_args \
-		-DMINICORO_IMPL -include blorp/src/lib/runtime/native/minicoro.h \
-		-o "$$tmp_plist" -x c blorp/src/lib/runtime/native/runtime.c; \
-	clang --analyze -Xclang -analyzer-werror -D_GNU_SOURCE -Wno-unused-command-line-argument \
-		-Iblorp/src/lsp/server \
-		-o "$$tmp_plist" -x c "$(BLORP_LSP_NATIVE_RUNTIME_C)"
+	@scripts/c-static-analysis "$(BLORP_LSP_NATIVE_RUNTIME_C)"
 
 security-check: all c-static-analysis
 	blorp/test/test_compiler/test_pipeline/codegen_audit/run_codegen_audit.sh $(BLORP_INSTALLED_BIN)

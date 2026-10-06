@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Runs the clang static analyzer over the runtime and LSP native C files, and
+# skips the run when nothing it depends on has changed since a run passed.
+#
+# Usage (from the repository root): scripts/c-static-analysis LSP_NATIVE_RUNTIME_C
+#
+# A pass writes a stamp named by the sha256 of everything the result depends
+# on: the clang version line, the exact flags, and the contents of each
+# analyzed file and every in-repository header clang reports it includes
+# (`clang -M` with the same flags, so a new `#include` changes the key by
+# itself). A failing run never writes a stamp. The stamp directory is
+# $BLORP_QUALITY_CACHE_DIR, or blorp/build/_build/quality-cache by default.
+#
+# `clang --analyze` exits 0 even when it reports findings. -analyzer-werror
+# makes every finding an error, and `set -e` fails the script at the first
+# file that has one. Suppress a false positive at its site with a comment
+# saying why rather than adding another checker disable here; the
+# BlockInCriticalSection disable below predates this rule and still hides two
+# untriaged `recv` reports.
+set -euo pipefail
+
+lsp_native_runtime_c="${1:?usage: scripts/c-static-analysis LSP_NATIVE_RUNTIME_C}"
+runtime_dir=blorp/src/lib/runtime/native
+cache_dir="${BLORP_QUALITY_CACHE_DIR:-blorp/build/_build/quality-cache}/c-static-analysis"
+stamp_retention_days=30
+
+command -v clang >/dev/null 2>&1 || {
+	echo "clang is required for c-static-analysis." >&2
+	exit 127
+}
+
+sha256_of_stdin() {
+	if command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 | awk '{print $1}'
+	else
+		sha256sum | awk '{print $1}'
+	fi
+}
+
+# Captured first: `grep -q` closing the pipe early would fail it under pipefail.
+analyzer_checkers=$(clang -cc1 -analyzer-checker-help 2>/dev/null || true)
+block_checker_flags=()
+if grep -Fq 'unix.BlockInCriticalSection' <<<"$analyzer_checkers"; then
+	block_checker_flags=(-Xclang -analyzer-disable-checker=unix.BlockInCriticalSection)
+fi
+
+# One entry per analyzed file: "<source>" and its flags, in parallel arrays
+# indexed together. The flags exclude --analyze and -o, which the run adds.
+sources=("$runtime_dir/runtime_decl.c" "$runtime_dir/runtime.c" "$lsp_native_runtime_c")
+flags_decl=(-D_GNU_SOURCE -Wno-nullability-completeness -Wno-unused-command-line-argument)
+flags_runtime=(
+	-Wno-nullability-completeness -Wno-unused-command-line-argument
+	-D_GNU_SOURCE ${block_checker_flags[@]+"${block_checker_flags[@]}"}
+	-DMINICORO_IMPL -include "$runtime_dir/minicoro.h"
+)
+flags_lsp=(-D_GNU_SOURCE -Wno-unused-command-line-argument -Iblorp/src/lsp/server)
+
+flags_for() {
+	case "$1" in
+		0) printf '%s\n' "${flags_decl[@]}" ;;
+		1) printf '%s\n' "${flags_runtime[@]}" ;;
+		2) printf '%s\n' "${flags_lsp[@]}" ;;
+	esac
+}
+
+# Files inside the repository that analyzing source $1 reads: the source and
+# its headers. System headers are left out; the clang version stands for them.
+repository_inputs_of() {
+	local flags=()
+	while IFS= read -r flag; do flags+=("$flag"); done < <(flags_for "$1")
+	clang -M -MT target "${flags[@]}" -x c "${sources[$1]}" \
+		| tr ' ' '\n' | grep -v '^\\$' | grep -v '^target:$' | grep -v '^$' \
+		| grep -v '^/' || true
+}
+
+key_material() {
+	clang --version | head -n 1
+	clang -dumpmachine
+	for index in 0 1 2; do
+		echo "flags: ${sources[$index]}"
+		flags_for "$index"
+	done
+	for index in 0 1 2; do
+		repository_inputs_of "$index"
+	done | sort -u | while IFS= read -r path; do
+		echo "$(sha256_of_stdin < "$path") $path"
+	done
+}
+
+key=$(key_material | sha256_of_stdin)
+short_key=${key:0:12}
+stamp="$cache_dir/$key"
+
+if [ -f "$stamp" ]; then
+	echo "c-static-analysis: unchanged inputs ($short_key), skipped"
+	exit 0
+fi
+
+plist=$(mktemp "${TMPDIR:-/tmp}/blorp-clang-analyze.XXXXXX")
+trap 'rm -f "$plist"' EXIT
+for index in 0 1 2; do
+	flags=()
+	while IFS= read -r flag; do flags+=("$flag"); done < <(flags_for "$index")
+	clang --analyze -Xclang -analyzer-werror "${flags[@]}" -o "$plist" -x c "${sources[$index]}"
+done
+
+# Recording is best effort: an unwritable cache (such as a root-owned Docker
+# volume) must not fail an analysis that passed.
+if mkdir -p "$cache_dir" 2>/dev/null && : > "$stamp" 2>/dev/null; then
+	find "$cache_dir" -type f -mtime "+$stamp_retention_days" -delete 2>/dev/null || true
+	echo "c-static-analysis: passed ($short_key)"
+else
+	echo "c-static-analysis: passed ($short_key); could not record a stamp in $cache_dir"
+fi

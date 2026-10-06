@@ -174,6 +174,17 @@ stops the container too. `--help` prints no verdict, and neither does
 run); a bad `scripts/test` flag prints FAIL.
 `blorp/test/test_build/test_gate_verdicts.sh` covers `scripts/test`.
 
+## Cached Static Analysis
+
+`make c-static-analysis` runs `scripts/c-static-analysis`, which skips the
+clang analysis (about four minutes) when a passing run's stamp exists for the
+same inputs: the sources, every in-repository header `clang -M` reports, the
+clang version and target, and the flags. Stamps live in
+`$BLORP_QUALITY_CACHE_DIR`, default `blorp/build/_build/quality-cache`; a failing
+run writes none. `docker-gate` mounts the named volume `blorp-quality-cache`
+there for premerge gates; an image built before the volume existed needs
+`--rebuild` once before stamps can be recorded.
+
 ## Validation Evidence Packets
 
 Use `scripts/record-validation` when a reviewer needs a reproducible packet for
