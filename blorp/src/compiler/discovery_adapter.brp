@@ -53,7 +53,7 @@ import:
 		PreviewSource, preview_span_text, preview_dimension_literal_text, preview_variadic_wildcard_span, preview_integer_literal_text, preview_number_literal_text
 	../compiler_new/stage_01_discovery/syntax/declarations as TreeDeclarations
 	../compiler_new/stage_01_discovery/syntax/names: WrittenName, BindingTarget(BindsName, DiscardsValue)
-	../compiler_new/stage_01_discovery/syntax/sequences: small_tuple_items, at_least_one_items, at_least_two_items
+	../compiler_new/stage_01_discovery/syntax/sequences: small_tuple_items, small_tuple_first, at_least_one_items, at_least_two_items
 	../compiler_new/stage_01_discovery/syntax/expressions as TreeExpressions
 	../compiler_new/stage_01_discovery/syntax/patterns as TreePatterns
 	../compiler_new/stage_01_discovery/syntax/types as TreeTypes
@@ -4505,11 +4505,35 @@ private enum PreviewArgumentOperator:
 	PreviewSubscriptOperator
 
 
+private enum PreviewSequenceKind:
+	PreviewListSequence
+	PreviewTupleSequence
+	PreviewVectorSequence
+
+
+-- What a record's fields complete: a literal, or an update of an expression
+-- that is already projected.
+private union PreviewRecordShape:
+	PreviewRecordLiteral
+	PreviewRecordUpdate(ParsedExpr)
+
+
+-- Where the fields of a record stand: finished, or a value still to project
+-- under the continuation that will take it.
+private union PreviewFieldStep:
+	PreviewFieldsDone(ParsedExpr)
+	PreviewFieldValue(PreviewExpressionContinuation, TreeExpressions.Expression)
+
+
 private union PreviewExpressionContinuation:
 	FinishPreviewField(WrittenName, Span)
 	VisitPreviewArguments(PreviewArgumentOperator, List[TreeExpressions.Expression], Span)
 	FinishPreviewArgument(PreviewArgumentOperator, ParsedExpr, List[TreeExpressions.Expression], Int, List[ParsedExpr], Span)
-	FinishPreviewListItem(List[TreeExpressions.Expression], Int, List[ParsedExpr], Span)
+	FinishPreviewSequenceItem(PreviewSequenceKind, List[TreeExpressions.Expression], Int, List[ParsedExpr], Span)
+	StartPreviewUpdateFields(List[TreeExpressions.NamedValue], Span)
+	FinishPreviewRecordField(PreviewRecordShape, List[TreeExpressions.NamedValue], Int, List[ParsedRecordExprField], ParsedIdentifier, Span, Span)
+	FinishPreviewDictKey(TreeExpressions.Expression, Span, List[TreeExpressions.DictEntry], Int, List[ParsedDictEntry], Span)
+	FinishPreviewDictValue(ParsedExpr, Span, List[TreeExpressions.DictEntry], Int, List[ParsedDictEntry], Span)
 	FinishPreviewInterpolationHole(PreviewInterpolation, Span)
 	FinishPreviewUnary(ParsedUnaryOp, Span)
 	VisitPreviewRight(PreviewPairOperator, TreeExpressions.Expression, Span)
@@ -4633,8 +4657,37 @@ pure func legacy_expression_preview(
 							None:
 								walk = ReturnPreviewExpression(ParsedListExpr([], location))
 							Some(first):
-								continuations = continuations.append(FinishPreviewListItem(items, 1, [], current.span))
+								continuations = continuations.append(FinishPreviewSequenceItem(PreviewListSequence, items, 1, [], current.span))
 								walk = VisitPreviewExpression(first)
+					TreeExpressions.VectorLiteral(items):
+						match items.get(0):
+							None:
+								walk = ReturnPreviewExpression(ParsedVectorExpr([], location))
+							Some(first):
+								continuations = continuations.append(FinishPreviewSequenceItem(PreviewVectorSequence, items, 1, [], current.span))
+								walk = VisitPreviewExpression(first)
+					TreeExpressions.RecordLiteral(fields):
+						(after_names, step) = preview_record_field(source, extended, PreviewRecordLiteral, fields, 0, [], current.span)
+						extended = after_names
+						match step:
+							PreviewFieldsDone(finished):
+								walk = ReturnPreviewExpression(finished)
+							PreviewFieldValue(continuation, value):
+								continuations = continuations.append(continuation)
+								walk = VisitPreviewExpression(value)
+					TreeExpressions.RecordUpdate(base, fields):
+						continuations = continuations.append(StartPreviewUpdateFields(fields, current.span))
+						walk = VisitPreviewExpression(base)
+					TreeExpressions.DictLiteral(entries):
+						match entries.get(0):
+							None:
+								walk = ReturnPreviewExpression(ParsedDictExpr([], location))
+							Some(first):
+								continuations = continuations.append(FinishPreviewDictKey(first.value, first.span, entries, 1, [], current.span))
+								walk = VisitPreviewExpression(first.key)
+					TreeExpressions.TupleLiteral(tuple):
+						continuations = continuations.append(FinishPreviewSequenceItem(PreviewTupleSequence, small_tuple_items(tuple), 1, [], current.span))
+						walk = VisitPreviewExpression(small_tuple_first(tuple))
 					TreeExpressions.RangeExpression(left, right):
 						continuations = continuations.append(VisitPreviewRight(PreviewRangeOperator, right, current.span))
 						walk = VisitPreviewExpression(left)
@@ -4668,14 +4721,48 @@ pure func legacy_expression_preview(
 									Some(argument):
 										continuations = continuations.append(FinishPreviewArgument(operator, receiver, arguments, next + 1, completed_arguments, span))
 										walk = VisitPreviewExpression(argument)
-							FinishPreviewListItem(items, next, parsed, span):
+							FinishPreviewSequenceItem(kind, items, next, parsed, span):
 								completed_items = parsed.append(completed)
 								match items.get(next):
 									None:
-										walk = ReturnPreviewExpression(ParsedListExpr(completed_items, legacy_location(span)))
+										sequence: ParsedExpr = match kind:
+											PreviewListSequence: ParsedListExpr(completed_items, legacy_location(span))
+											PreviewTupleSequence: ParsedTupleExpr(completed_items, legacy_location(span))
+											PreviewVectorSequence: ParsedVectorExpr(completed_items, legacy_location(span))
+										walk = ReturnPreviewExpression(sequence)
 									Some(item):
-										continuations = continuations.append(FinishPreviewListItem(items, next + 1, completed_items, span))
+										continuations = continuations.append(FinishPreviewSequenceItem(kind, items, next + 1, completed_items, span))
 										walk = VisitPreviewExpression(item)
+							StartPreviewUpdateFields(fields, span):
+								(after_names, step) = preview_record_field(source, extended, PreviewRecordUpdate(completed), fields, 0, [], span)
+								extended = after_names
+								match step:
+									PreviewFieldsDone(finished):
+										walk = ReturnPreviewExpression(finished)
+									PreviewFieldValue(continuation, value):
+										continuations = continuations.append(continuation)
+										walk = VisitPreviewExpression(value)
+							FinishPreviewRecordField(shape, fields, next, done, name, field_span, span):
+								completed_field: ParsedRecordExprField = { name = name, value = completed, span = legacy_location(field_span) }
+								(after_names, step) = preview_record_field(source, extended, shape, fields, next, done.append(completed_field), span)
+								extended = after_names
+								match step:
+									PreviewFieldsDone(finished):
+										walk = ReturnPreviewExpression(finished)
+									PreviewFieldValue(continuation, value):
+										continuations = continuations.append(continuation)
+										walk = VisitPreviewExpression(value)
+							FinishPreviewDictKey(value, entry_span, entries, next, done, span):
+								continuations = continuations.append(FinishPreviewDictValue(completed, entry_span, entries, next, done, span))
+								walk = VisitPreviewExpression(value)
+							FinishPreviewDictValue(key, entry_span, entries, next, done, span):
+								completed_entries = done.append({ key = key, value = completed, span = legacy_location(entry_span) })
+								match entries.get(next):
+									None:
+										walk = ReturnPreviewExpression(ParsedDictExpr(completed_entries, legacy_location(span)))
+									Some(entry):
+										continuations = continuations.append(FinishPreviewDictKey(entry.value, entry.span, entries, next + 1, completed_entries, span))
+										walk = VisitPreviewExpression(entry.key)
 							FinishPreviewInterpolationHole(interpolation, hole_span):
 								read: PreviewInterpolation = { interpolation | parts = interpolation.parts.append(ParsedInterpolationExpr(completed, legacy_location(hole_span))) }
 								match next_interpolation_step(read):
@@ -4697,6 +4784,24 @@ pure func legacy_expression_preview(
 									PreviewRangeOperator: ParsedRangeExpr(left, completed, location)
 								walk = ReturnPreviewExpression(parsed)
 	result
+
+
+-- The next field of a record literal or update: its name is interned before
+-- its value is projected, so names follow written order. Past the last field
+-- the record is complete.
+private pure func preview_record_field(
+	source: PreviewSource, names: NameTable, shape: PreviewRecordShape, fields: List[TreeExpressions.NamedValue],
+	next: Int, done: List[ParsedRecordExprField], span: Span,
+) -> (NameTable, PreviewFieldStep):
+	match fields.get(next):
+		None:
+			finished: ParsedExpr = match shape:
+				PreviewRecordLiteral: ParsedRecordExpr(done, legacy_location(span))
+				PreviewRecordUpdate(base): ParsedRecordUpdateExpr(base, done, legacy_location(span))
+			(names, PreviewFieldsDone(finished))
+		Some(field):
+			(after_name, name) = preview_identifier(source, names, field.name.name)
+			(after_name, PreviewFieldValue(FinishPreviewRecordField(shape, fields, next + 1, done, name, field.span, span), field.value))
 
 
 private pure func legacy_string_form(form: TreePatterns.StringForm) -> ParsedStringLiteralForm:

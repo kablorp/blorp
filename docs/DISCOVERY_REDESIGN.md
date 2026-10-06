@@ -1965,7 +1965,12 @@ adapter's legacy projection:
 - a 5,000-term `+`;
 - a 2,000-call method chain;
 - a 2,000-deep `else if` chain (an `else if` nests in the else branch);
-- a 1,000-deep nested list literal (right-nesting, bounded by brackets).
+- a 1,000-deep nested list literal (right-nesting, bounded by brackets);
+- 1,000-deep nested tuples, alternating tuples and lists, and vectors, all
+  proved through parse, dump, ID census and projection on Linux;
+- a 1,000-deep nest of record literals, record updates and dict literals.
+  This last case is **not yet met**: it is proved only to 200 levels (open
+  item D5, section 9).
 
 The current adapter's 6,000-operand chain test is kept.
 
@@ -3339,15 +3344,54 @@ an explicit stack of open lists: its general expression walker overflowed the
 native stack of the Linux gate at about 700 nested lists, so recursion alone
 could not meet the 1,000-deep requirement.
 
-The next bounded M4 expression slice is the remaining same-line aggregates:
-tuples (two or more elements; the language has no singleton tuple) and braced forms (vector, record, record update and dict literals),
-each as its own recipe variant with the existing rollback discipline. String
-and character literals, and control expressions, follow in separate slices; the
-complete M4 gate still requires bodies.
+Another bounded M4 increment adds same-line tuples of two to four elements,
+`(a, b)`, with an optional trailing comma, in the existing `TupleLiteral`
+variant and its `SmallTuple` shapes. Grouping stays distinct: the comma after
+the first item is what makes a tuple, so `(a)` and `((a, b))` never become one.
+Every item is read ID-free before the count is judged, as the frozen parser
+does, so a one-element `(x,)` reports `SingletonTupleDiagnostic` and a tuple of
+more than four elements reports `TupleArityDiagnostic`, both over the whole
+parenthesized span, and a tuple left unclosed at end of source reports
+`expected ) after tuple expression` first, then its count diagnostic over the
+open parenthesis and first item, in the frozen parser's order. A rejected tuple
+issues no IDs and adds no schema variant. A comma before end of source, which
+the frozen parser reads as a missing counted item, is deferred, as are
+mismatched or newline-separated tuples: both restore the exact entry state. The dump walks lists and tuples nested
+directly in each other with one explicit stack of open sequences, and the
+legacy projection uses one continuation for both.
+
+Another bounded M4 increment adds the same-line braced forms through the
+existing variants: record literals (`{}` and `{name = value}`), record updates
+(`{record | name = value}`), dict literals (`{key => value}`) and vector
+literals (`{a, b}`), each with an optional trailing comma. They are told apart
+as the frozen parser does: a leading `name =` makes a record, otherwise the
+token after the first expression (`=>`, `|` or anything else) chooses the
+form. Item reading is shared with the other bracketed lists, now generic over
+the item. A field's name use is issued before its value, an update's base
+before its fields and a dict key before its value. A repeated record or update
+field is reported as `DuplicateFieldGiven` at the later name, pointing at the
+first one, after every field is read; such a record is rejected and issues no
+IDs. An unclosed form reports its own missing-brace diagnostic. As for tuples,
+a comma before end of source in a vector or dict, where the frozen parser reads
+a missing counted item, a missing `=>` or `=`, a newline inside the braces and
+anything outside the supported grammar restore the exact entry state. A
+rejection inside an item keeps only that item's diagnostics, as for lists. The
+dump's open-sequence stack now covers vectors too, and the projection
+continues through fields and entries in written order. The 1,000-deep proofs
+sit near the Linux native stack: adding the braced arms inline to the atom and
+mint functions made 1,000 nested lists crash there while macOS passed, so those
+arms are functions of their own and the frames on the nesting path stay small.
+
+The next bounded M4 slices are control expressions as values (`if` and `match`
+after `=`, then as operands), then the statement forms `select`, `with`,
+`concurrent`, `detach` and `debug:`. Lambdas and local functions are on their
+own branch, and opaque conversions follow in a separate slice; the complete M4
+gate still requires trait and implementation bodies.
 
 Argument and list nesting are the recursion in the postfix and list grammar.
 They follow brackets the source itself nests, as the frozen parser does, and
-tests parse 1,000 nested calls `f(f(...))` and 1,000 nested lists `[[...]]`.
+tests parse 1,000 nested calls `f(f(...))`, 1,000 nested lists `[[...]]`, 1,000
+nested tuples, 1,000 alternating tuples and lists and 1,000 nested vectors.
 
 The postfix slice was validated on a fresh build that includes main
 `ff4da4b31`. Focused checks passed 152/152 and declaration-scan checks 14/14,
@@ -3500,6 +3544,35 @@ parallel expression work), destructuring and values on the line after their
 operator. `compiler-new` passed 861/861, `compiler-new-parity` 3,566/3,566 and
 `compiler-blorp` 6,658/6,658.
 
+The tuple slice was validated on a fresh build at main `1d87c1ef1`. Focused
+checks passed 21/21 (expression parser), 18/18 (projection) and 16/16
+(declaration scan), the latter two with zero leaked objects under `--leak-check`.
+The broad gates passed `compiler-new` 851/851, `compiler-new-parity` 3,559/3,559
+with zero mismatched files, and `compiler-blorp` 6,622/6,622. The 1,000-nested
+tuple and the 1,000-level alternating tuple and list cases pass parse, dump, ID
+census and legacy projection. The diagnostics were compared by hand with
+`blorp check` on the frozen parser for `(1,)`, five elements and an unclosed
+five-element tuple. The corpus prefix run compared 5,220 completed declarations in
+3,401 modules and stopped at 2,903 functions, 62 traits, 61 implementations, 298
+unsupported globals and 77 ends of source, with zero rejected or non-progress
+stops. It was not baselined against the list slice, so it is not tuple evidence;
+parity evidence is the AST-JSON differential over 13 tuple shapes in the
+projection suite.
+
+The braced slice was validated on a fresh build stacked on the tuple slice and
+merged with main `7f4d4212a`. Focused checks passed 31/31 (expression parser),
+22/22 (projection), 18/18 (declaration scan), 14/14 and 12/12 (bodies). The
+broad gates passed `compiler-new` 875/875, `compiler-new-parity` 3,567/3,567
+with zero mismatched files and `compiler-blorp` 6,665/6,665. Duplicate-field,
+unclosed-brace and missing-first-item diagnostics were compared by hand with
+`blorp check` on the frozen parser. 1,000 nested vectors pass parse, dump, ID
+census and legacy projection; nested records, updates and dicts are covered to
+200 levels (open item D5). The 3,409-module "every corpus file as a root" run
+compared 13,472 completed declarations, stopped at 1,635 functions and 304
+unsupported globals, and had zero rejected or non-progress stops. Parity
+evidence for the braced forms is also the AST-JSON differential over 16 braced
+shapes in the projection suite.
+
 Validation before the main reconciliation, at `a5ae15eab`:
 
 The combined fresh-build focused run passed 121/121 tests, including a
@@ -3575,6 +3648,15 @@ the proposed forms so their consequences can be reviewed.
 - **D4. Legacy sigil order (6.2).** Recommend accepting normalized C identity
   if reordered `#N` names affect only ID-derived output names, rather than
   remembering legacy interleaving in discovery.
+
+- **D5. Depth of record, update and dict nesting (3.14).** The dump recurses
+  through record fields, update fields and dict entries, and overflowed the
+  Linux native stack for directly nested lists at about 700 levels before
+  lists, tuples and vectors got an explicit stack. The test
+  `test_braced_forms_nest_in_each_other` stops after parse and mint at 200
+  levels, so depth beyond 200 is unmeasured for the parser and mint as well as
+  the dump. Follow-up: an iterative dump for these three forms and a
+  1,000-deep proof through parse, mint, dump, census and projection on Linux.
 
 The M6 ceiling is decided and stays in section 7.3. Recovery, opaque minting,
 per-module interning, tree output, ordinary-record syntax values, glue

@@ -6,10 +6,11 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_expression_parser:
 		parse_same_line_expression, ExpressionParse(ParsedExpression, UnsupportedExpression, RejectedExpression)
 	../../../../src/compiler_new/stage_01_discovery/syntax/expressions:
-		ExpressionKind(StringLiteral, CharacterLiteral, InterpolatedString, NameReference, IntegerLiteral, Unary, Binary, ShortCircuit, RangeExpression, Call, FieldAccess, Subscript, ListLiteral),
+		ExpressionKind(StringLiteral, CharacterLiteral, InterpolatedString, NameReference, IntegerLiteral, Unary, Binary, ShortCircuit, RangeExpression, Call, FieldAccess, Subscript, ListLiteral, TupleLiteral, VectorLiteral, RecordLiteral, RecordUpdate, DictLiteral),
 		UnaryOperator(Negate), BinaryOperator(Add, Multiply), LogicalOperator(LogicalOr, LogicalAnd),
 		InterpolationForm(QuotedInterpolation, PipeInterpolation), InterpolationPiece(InterpolationText, InterpolationHole)
 	../../../../src/compiler_new/stage_01_discovery/syntax/patterns: StringForm(QuotedString, RawString, PipeString, RawPipeString)
+	../../../../src/compiler_new/stage_01_discovery/syntax/sequences: SmallTuple(Pair, Triple, Quadruple)
 	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(Plain, ExpectedToken)
 	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(ExpectedExpressionDiagnostic)
 	../../../../src/compiler_new/stage_01_discovery/tables/expected_token:
@@ -103,11 +104,14 @@ pure func hole(text: String) -> String:
 
 pure func test_unsupported_returns_original_state() -> Bool:
 	var correct = True
-	for text in ["call({1, 2})", "name.field(1, {x = 2})", "(first, other)", "1\n.field", "1\n\t.field", "1 +\n 2", "(\n1)", "not {1, 2}", "(\n)", "(007\n)", "(name\n)", "f(1,\n2)", "f(\n)", "f(x)[{1}]", "f(if True: 1 else: 2)", "f(x)\n.member", "target.member(1, {2})", "f(,x)", "f(x]",
-		"[1,\n2]", "[\n]", "[\n1]", "[1\n]", "[1 2]", "[,]", "[,1]", "[1,,2]", "[1, {x = 2}]", "[(1, 2)]", "[if True: 1 else: 2]", "[1)", "[1}", "[[1], {2}]", "{a => b}", "[1]\n.length()", "[1]\n\t.length()", "first + [1,\n2]"].concat(
+	for text in ["call(if True: 1 else: 2)", "name.field(1, if x: 1 else: 2)", "1\n.field", "1\n\t.field", "1 +\n 2", "(\n1)", "not if x: 1 else: 2", "first + if x: 1 else: 2", "(\n)", "(007\n)", "(name\n)", "f(1,\n2)", "f(\n)", "f(x)[if x: 1 else: 2]", "f(if True: 1 else: 2)", "f(x)\n.member", "target.member(1, if x: 1 else: 2)", "f(,x)", "f(x]",
+		"[1,\n2]", "[\n]", "[\n1]", "[1\n]", "[1 2]", "[,]", "[,1]", "[1,,2]", "[1, if x: 1 else: 2]", "[if x: 1 else: 2]", "[if True: 1 else: 2]", "[1)", "[1}", "[[1], if x: 1 else: 2]", "[1]\n.length()", "[1]\n\t.length()", "first + [1,\n2]",
+		"{\n}", "{a,\nb}", "{a\n}", "{a b}", "{a, b)", "{a => 1, b}", "{a => 1 b => 2}", "{a = 1, b}", "{a = 1 b = 2}", "{a = 1,\nb = 2}", "{r | }", "{r | 1}", "{r |\na = 1}",
+		"{a,", "{a, b,", "{a => 1,", "{k => v,", "{r | x}", "{on = 1}", "{r | on = 1}", "{k => v, w}", "{a = 1, b = }", "{x, if x: 1 else: 2}", "{a = if x: 1 else: 2}", "{}\n.f", "{a, b}\n\t.f", "{a = 1} c", "{,}", "{a,, b}",
+		"(a, b c)", "(a,\nb)", "(a, b\n)", "(\na, b)", "(a, if x: 1 else: 2)", "(a, b]", "(a,, b)", "(, a)", "(x,", "(a,", "(a, b,", "(a, b)\n.f", "(a, b)\n\t.f", "[(a, b),\n(c, d)]", "(a, if x: 1 else: 2)", "(a, if True: 1 else: 2)", "(a, b) c"].concat(
 		-- A hole outside the grammar leaves the whole string unsupported, even after
 		-- an earlier hole read and interned its names.
-		["first + \"" + hole("a") + " " + hole("b c") + "\"", "\"" + hole("") + "\"", "[\"" + hole("a") + hole("{1}") + "\"]", "\"" + hole("\\\"") + "\""]):
+		["first + \"" + hole("a") + " " + hole("b c") + "\"", "\"" + hole("") + "\"", "[\"" + hole("a") + hole("if x: 1 else: 2") + "\"]", "\"" + hole("\\\"") + "\""]):
 		match new_parse_state(lex_module(module_id_at_row(0), text)):
 			Ok(entry):
 				(parsed, result) = parse_same_line_expression(entry)
@@ -529,6 +533,331 @@ pure func test_nested_lists() -> Bool:
 		Err(_): False
 
 
+pure func test_tuple_source_order_and_spans() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "(first, 007, (last, 1),)")):
+		Ok(entry):
+			(parsed, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					match value.kind:
+						TupleLiteral(Triple(first, middle, inner)):
+							match inner.kind:
+								TupleLiteral(Pair(last, _)):
+									(first.id.expression_local_index() == 0 and middle.id.expression_local_index() == 1
+										and last.id.expression_local_index() == 2 and inner.id.expression_local_index() == 4
+										and value.id.expression_local_index() == 5
+										and inner.span.span_start() == 13 and inner.span.span_end() == 22
+										and value.span.span_start() == 0 and value.span.span_end() == 24
+										and parsed.issued_counts().name_uses == 2 and parsed.diagnostic_count() == 0)
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_each_tuple_arity_has_its_own_shape() -> Bool:
+	var correct = True
+	for (text, count) in [("(a, b)", 2), ("(a, b, c)", 3), ("(a, b, c, d)", 4), ("(a, b, c, d,)", 4)]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_same_line_expression(entry)
+				match result:
+					ParsedExpression(value):
+						shape_matches = match (value.kind, count):
+							(TupleLiteral(Pair(_, _)), 2): True
+							(TupleLiteral(Triple(_, _, _)), 3): True
+							(TupleLiteral(Quadruple(_, _, _, _)), 4): True
+							_: False
+						correct = correct and shape_matches and parsed.issued_counts().expressions == count + 1
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+-- Parentheses without a comma are always a grouping, and grouping never
+-- becomes a tuple, however many layers surround a tuple or a single item.
+pure func test_grouping_is_never_a_tuple() -> Bool:
+	var correct = True
+	for text in ["(a)", "((a))", "(a + b)", "([a, b])", "((a, b))"]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(_, result) = parse_same_line_expression(entry)
+				match result:
+					ParsedExpression(value):
+						is_tuple = match value.kind:
+							TupleLiteral(_): True
+							_: False
+						correct = correct and (is_tuple == (text == "((a, b))"))
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+-- Rows: source, then every diagnostic in order as (message, start, end).
+pure func test_tuple_rejection_has_exact_diagnostics_and_no_ids() -> Bool:
+	singleton = "a tuple has two to four elements, and `(x,)` has one"
+	arity = "Tuples support 2-4 elements"
+	unclosed = "expected `)` after tuple expression"
+	cases = [
+		("(x,)", [(singleton, 0, 4)]),
+		("(a, b, c, d, e)", [(arity, 0, 15)]),
+		("(a, b, c, d, e,)", [(arity, 0, 16)]),
+		("(a, b, c, d, e, f)", [(arity, 0, 18)]),
+		("[(x,)]", [(singleton, 1, 5)]),
+		("f((a, b, c, d, e))", [(arity, 2, 17)]),
+		("(a, b", [(unclosed, 5, 5)]),
+		("(a, b, c, d, e", [(unclosed, 14, 14), (arity, 0, 2)])
+	]
+	var correct = True
+	for (text, expected) in cases:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_same_line_expression(entry)
+				match result:
+					RejectedExpression:
+						correct = correct and parsed.diagnostic_count() == expected.length() and parsed.id_counts() == entry.id_counts()
+						match reject_preview(parsed):
+							Ok(rejected):
+								match render_rejected_diagnostics(rejected):
+									Ok(rows):
+										correct = correct and rows.length() == expected.length()
+										var index = 0
+										for (message, start, end) in expected:
+											match rows.get(index):
+												Some(row):
+													correct = (correct and row.rendered.message == message
+														and row.span.span_start() == start and row.span.span_end() == end)
+												None: correct = False
+											index += 1
+									Err(_): correct = False
+							Err(_): correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+-- Tuples and lists nest in each other with nothing but brackets between
+-- levels, and both are bracket recursion in the source itself.
+pure func test_tuples_and_lists_nest_in_each_other() -> Bool:
+	depth = 1000
+	var text = "1"
+	var level = 0
+	while level < depth:
+		text = if level % 2 == 0:
+			"(" + text + ", 0)"
+		else:
+			"[" + text + "]"
+		level += 1
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					var current = value
+					var layers = 0
+					var walking = True
+					while walking:
+						match current.kind:
+							TupleLiteral(Pair(inner, _)):
+								current = inner
+								layers += 1
+							ListLiteral([inner]):
+								current = inner
+								layers += 1
+							_: walking = False
+					(layers == depth and parsed.issued_counts().expressions == depth + 1 + depth / 2
+						and parsed.diagnostic_count() == 0)
+				_: False
+		Err(_): False
+
+
+pure func test_nested_tuples() -> Bool:
+	depth = 1000
+	var text = ""
+	var level = 0
+	while level < depth:
+		text += "("
+		level += 1
+	text += "1"
+	while level > 0:
+		text += ", 0)"
+		level -= 1
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					var current = value
+					var tuples = 0
+					var walking = True
+					while walking:
+						match current.kind:
+							TupleLiteral(Pair(inner, _)):
+								current = inner
+								tuples += 1
+							_: walking = False
+					tuples == depth and parsed.issued_counts().expressions == depth * 2 + 1 and parsed.diagnostic_count() == 0
+				_: False
+		Err(_): False
+
+
+pure func test_braced_forms_have_their_own_shapes() -> Bool:
+	var correct = True
+	for (text, form) in [("{}", 0), ("{a = 1}", 0), ("{a = 1, b = [2],}", 0), ("{r | a = 1, b = 2,}", 1), ("{k => v}", 2), ("{1 => 2, 3 => 4,}", 2), ("{a}", 3), ("{a, b,}", 3), ("{(a), 2}", 3), ("{{a}}", 3)]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_same_line_expression(entry)
+				match result:
+					ParsedExpression(value):
+						shape = match (value.kind, form):
+							(RecordLiteral(_), 0): True
+							(RecordUpdate(_, _), 1): True
+							(DictLiteral(_), 2): True
+							(VectorLiteral(_), 3): True
+							_: False
+						correct = correct and shape and parsed.diagnostic_count() == 0
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+-- A field's name use is issued before its value, a record update's base
+-- before its fields, and a dict entry's key before its value.
+pure func test_braced_source_order_and_spans() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "{base | first = x, second = 1,}")):
+		Ok(entry):
+			(parsed, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					match value.kind:
+						RecordUpdate(base, [first, second]):
+							(base.id.expression_local_index() == 0 and first.name.use.name_use_local_index() == 1
+								and first.value.id.expression_local_index() == 1 and second.name.use.name_use_local_index() == 3
+								and second.value.id.expression_local_index() == 2 and value.id.expression_local_index() == 3
+								and first.span.span_start() == 8 and first.span.span_end() == 17
+								and second.span.span_start() == 19 and second.span.span_end() == 29
+								and value.span.span_start() == 0 and value.span.span_end() == 31
+								and parsed.issued_counts().name_uses == 4 and parsed.diagnostic_count() == 0)
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_dict_entries_issue_key_then_value() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "{k => v, 007 => [w],}")):
+		Ok(entry):
+			(parsed, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					match value.kind:
+						DictLiteral([first, second]):
+							(first.key.id.expression_local_index() == 0 and first.value.id.expression_local_index() == 1
+								and second.key.id.expression_local_index() == 2 and second.value.id.expression_local_index() == 4
+								and value.id.expression_local_index() == 5
+								and first.span.span_start() == 1 and first.span.span_end() == 7
+								and second.span.span_start() == 9 and second.span.span_end() == 19
+								and value.span.span_start() == 0 and value.span.span_end() == 21
+								and parsed.issued_counts().name_uses == 3 and parsed.diagnostic_count() == 0)
+						_: False
+				_: False
+		Err(_): False
+
+
+-- Rows: source, then every diagnostic in order as (message, help, start, end).
+pure func test_braced_rejection_has_exact_diagnostics_and_no_ids() -> Bool:
+	duplicate = "duplicate field `a`"
+	given = "the field was already given at 1:2; give it once"
+	record_close = "expected `}` after record literal"
+	update_close = "expected `}` after record update"
+	dict_close = "expected `}` after dict literal"
+	vector_close = "expected `}` after vector literal"
+	close_help = "close the brace opened earlier with `}`"
+	expression = "expected expression"
+	expression_help = "write a value, a name or a call here"
+	cases = [
+		("{a = 1, a = 2}", [(duplicate, given, 8, 9)]),
+		("{a = 1, a = 2, a = 3}", [(duplicate, given, 8, 9), (duplicate, given, 15, 16)]),
+		("{r | a = 1, a = 2}", [(duplicate, "the field was already given at 1:6; give it once", 12, 13)]),
+		("{a = 1, a = 2", [(duplicate, given, 8, 9), (record_close, close_help, 13, 13)]),
+		("{a = 1", [(record_close, close_help, 6, 6)]),
+		("{a = 1,", [(record_close, close_help, 7, 7)]),
+		("{r | a = 1", [(update_close, close_help, 10, 10)]),
+		("{r |", [(update_close, close_help, 4, 4)]),
+		("{k => v", [(dict_close, close_help, 7, 7)]),
+		("{a", [(vector_close, close_help, 2, 2)]),
+		("{a, b", [(vector_close, close_help, 5, 5)]),
+		("{", [(expression, expression_help, 1, 1), (vector_close, close_help, 1, 1)]),
+		("[{a = 1, a = 2}]", [(duplicate, "the field was already given at 1:3; give it once", 9, 10)])
+	]
+	var correct = True
+	for (text, expected) in cases:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_same_line_expression(entry)
+				match result:
+					RejectedExpression:
+						correct = correct and parsed.diagnostic_count() == expected.length() and parsed.id_counts() == entry.id_counts()
+						match reject_preview(parsed):
+							Ok(rejected):
+								match render_rejected_diagnostics(rejected):
+									Ok(rows):
+										correct = correct and rows.length() == expected.length()
+										var index = 0
+										for (message, help, start, end) in expected:
+											match rows.get(index):
+												Some(row):
+													correct = (correct and row.rendered.message == message and row.rendered.help == Some(help)
+														and row.span.span_start() == start and row.span.span_end() == end)
+												None: correct = False
+											index += 1
+									Err(_): correct = False
+							Err(_): correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+-- Braces nest in each other, and in lists and tuples, with only brackets
+-- between levels.
+pure func test_braced_forms_nest_in_each_other() -> Bool:
+	depth = 200
+	var text = "1"
+	var level = 0
+	while level < depth:
+		text = match level % 4:
+			0: "{k => " + text + "}"
+			1: "{f = " + text + "}"
+			2: "{" + text + "}"
+			_: "{r | f = " + text + "}"
+		level += 1
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					var current = value
+					var layers = 0
+					var walking = True
+					while walking:
+						match current.kind:
+							DictLiteral([entry_value]):
+								current = entry_value.value
+								layers += 1
+							RecordLiteral([field]):
+								current = field.value
+								layers += 1
+							VectorLiteral([inner]):
+								current = inner
+								layers += 1
+							RecordUpdate(_, [field]):
+								current = field.value
+								layers += 1
+							_: walking = False
+					layers == depth and parsed.diagnostic_count() == 0
+				_: False
+		Err(_): False
+
+
 tests: TestSuite = {
 	description = "Bounded tree operator expressions",
 	tests = [
@@ -551,6 +880,17 @@ tests: TestSuite = {
 		("list is an atom", test_list_is_an_atom_for_postfix_and_operators),
 		("list rejection diagnostic and no ids", test_list_rejection_has_exact_diagnostic_and_no_ids),
 		("1000 nested lists", test_nested_lists),
+		("tuple source order and spans", test_tuple_source_order_and_spans),
+		("tuple arity shapes", test_each_tuple_arity_has_its_own_shape),
+		("grouping is never a tuple", test_grouping_is_never_a_tuple),
+		("tuple rejection diagnostics and no ids", test_tuple_rejection_has_exact_diagnostics_and_no_ids),
+		("1000 alternating tuples and lists", test_tuples_and_lists_nest_in_each_other),
+		("1000 nested tuples", test_nested_tuples),
+		("braced forms and their shapes", test_braced_forms_have_their_own_shapes),
+		("braced source order and spans", test_braced_source_order_and_spans),
+		("dict entries issue key then value", test_dict_entries_issue_key_then_value),
+		("braced rejection diagnostics and no ids", test_braced_rejection_has_exact_diagnostics_and_no_ids),
+		("braced forms nest in each other", test_braced_forms_nest_in_each_other),
 		("5000 term left spine", test_long_sum_is_left_associative_without_recursive_left_walk)
 	]
 }
