@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -69,6 +70,74 @@ class IdentityCensusTest(unittest.TestCase):
             boundary.update(rationale="Test C identifier formatting boundary.",
                             owner="C5b", oracle="fixture output")
         self.baseline.write_text(json.dumps(baseline), encoding="utf-8")
+
+    def run_hygiene_recipe(self, stale_magic=False):
+        """Execute the real static recipe with isolated source and guard fixtures."""
+        makefile = SCRIPT.parents[1] / "Makefile"
+        lines = makefile.read_text(encoding="utf-8").splitlines(True)
+        start = lines.index("hygiene-check:\n")
+        end = start + 1
+        while end < len(lines) and (lines[end].startswith("\t") or not lines[end].strip()):
+            end += 1
+        fixture_makefile = self.root / "Makefile"
+        fixture_makefile.write_text("".join(lines[start:end]), encoding="utf-8")
+        guards = self.root / "scripts"
+        guards.mkdir(exist_ok=True)
+        for name in ("check-blorp-layout", "check-editor-drift",
+                     "check-c-symbol-projection-boundary", "compiler-check", "check-std-builtins"):
+            guard = guards / name
+            guard.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            guard.chmod(0o755)
+        census = guards / "compiler-identity-census"
+        census.write_text(
+            "#!/bin/sh\nexec " + " ".join(shlex.quote(str(arg)) for arg in
+            (sys.executable, SCRIPT, "--root", self.root, "--baseline", self.baseline))
+            + ' "$@"\n', encoding="utf-8")
+        census.chmod(0o755)
+        (guards / "check-magic-spellings").write_text(
+            "import sys\n"
+            + ("sys.exit(1 if '--strict' in sys.argv else 0)\n" if stale_magic else "sys.exit(0)\n"),
+            encoding="utf-8")
+        return subprocess.run(["make", "--no-print-directory", "hygiene-check"],
+                              cwd=self.root, text=True, capture_output=True, check=False)
+
+    def test_hygiene_recipe_accepts_reviewed_census(self):
+        self.write_reviewed_baseline()
+        result = self.run_hygiene_recipe()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("budgets within baseline", result.stdout)
+
+    def test_hygiene_recipe_rejects_new_exact_identity_site(self):
+        self.write_reviewed_baseline()
+        self.source.write_text(self.source.read_text() + '\tvariable.name == "new"\n')
+        result = self.run_hygiene_recipe()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("new exact identity site", result.stderr)
+
+    def test_hygiene_recipe_rejects_stale_magic_allowlist(self):
+        self.write_reviewed_baseline()
+        result = self.run_hygiene_recipe(stale_magic=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_unminted_rendering_boundaries_need_exact_review(self):
+        for name, parameters, body in (
+            ("c_binder_name", "name: String, id: Int",
+             'if name == "_" or id == 0:\n\t\tc_local_name(name)'),
+            ("derived_anchor_key", "anchor: CoreVar",
+             'if anchor.id == 0:\n\t\t"z" + c_local_name(anchor.name)'),
+        ):
+            with self.subTest(boundary=name):
+                self.boundary.write_text(
+                    f"pure func {name}({parameters}) -> String:\n\t{body}\n",
+                    encoding="utf-8")
+                self.write_reviewed_baseline()
+                self.assertEqual(self.run_census("--check").returncode, 0)
+                self.boundary.write_text(self.boundary.read_text().replace(
+                    "c_local_name(name)", "c_local_name(other)").replace(
+                    "c_local_name(anchor.name)", "c_local_name(other.name)"))
+                rejected = self.run_census("--check")
+                self.assertEqual(rejected.returncode, 1, rejected.stderr)
+                self.assertIn("unclassified boundary", rejected.stderr)
 
     def test_sorted_json_and_text_share_rows(self):
         result = self.run_census("--json")

@@ -21,12 +21,20 @@ first; its setup, measurement, foreground-gate and landing rules apply.
 The source owners are the authority; the census and allowlist measure migration,
 not a second semantic model.
 
+The [2026-10-05 audit](IDENTITY_ROADMAP_AUDIT_2026-10-05.md) pins the inspected
+state to `ff4da4b31dc2`. The subsequent
+[census reconciliation](../benchmarks/results/compiler_identity_reconciliation_2026-10-05.md)
+records the historical drift, retained debt and frozen candidate provenance;
+both strict checks now pass through `make hygiene-check`. See
+[Strict hygiene](#strict-hygiene) for tooling limits and required invocations.
+Recheck this state before each delivery.
+
 | Landed boundary | Remaining work |
 | --- | --- |
-| Compilation `NameTable`, `ParsedIdentifier.name`, pinned vocabulary ids; diagnostic/lint/dump rendering by table | Builtin source-effect registries, formatter and remaining `.text` readers; shared table for standalone graphs |
+| Compilation `NameTable`, `ParsedIdentifier.name`, pinned vocabulary ids; call diagnostics and partial lint/dump rendering by table | Semantic lint, builtin source effects, formatter and other `.text` readers; shared table for standalone graphs |
 | `TraitId` through headers, bounds, obligations and supertraits | Exact resolved trait targets, lowering and Core trait dispatch |
 | `CoreFunction.origin`/module, id-deduplicated mono instances, known-function and runtime callback catalogs | Remove path/name dual carries, complete callback trait/type identity |
-| Callable/type/variant/member/closure/task and authored-local C projection by id; `CoreFieldRef` | Every synthetic binder gets an authoritative id; nullary references and remaining semantic consumers use it |
+| Callable/type/variant/member/closure/task and authored-local C projection by id; `CoreFieldRef` and typed `ResolvedFieldIdentity` | Every synthetic binder gets an authoritative id; nullary references and remaining semantic consumers use it; reuse the field authority |
 | `CoreSourceLoc` opaque `Int`, packed module and line/column coordinates; negative pass-minted ids with `minted_origins`, zero synthetic | Verify uniqueness on duplication before node-keyed memoization; preserve source ownership |
 | Default discovery node/definition tables, `ModuleId` lookups, per-module header builder, no-meta zonk skip | Propagate discovery's definition authority through the legacy adapter and typed front end |
 
@@ -56,12 +64,12 @@ unrelated domains.
 | `ModuleId` | module discovery | one validated module in a graph |
 | `NameId` | compilation `NameTable` | one spelling, never one entity: two shadowed locals and two overloads share a spelling and differ in entity |
 | `DefinitionId` | discovery, or the checked post-discovery generator | callable, type, constructor, field, global, trait, implementation or generated definition |
-| value id | definition projection, binder admission, or Core minting | one definition value or one authored or synthetic local binder, as the fixed-layout `(owner definition, domain, key)` |
+| value id | definition projection, binder admission, or Core minting | one definition value or one authored or synthetic local binder, as `(owner definition, domain, key)` |
 | name-site ids | source or body occurrence catalog | one identifier occurrence; never a binder target by itself |
 | node id | Core construction | one Core expression occurrence |
 | `TraitId`, `FieldId`, `TypeId`, `ConstructorId` | the graph's definition index | nominal families |
 
-For values the fixed layout is `ResolvedValueId { owner_definition_id, domain, key }`.
+For values the logical schema is `ResolvedValueId { owner_definition_id, domain, key }`.
 The owner is a checked graph definition. The domain separates the definition value
 (key 0), an authored local (key from the binder's authored source site) and a
 synthetic local (a deterministic owner-scoped minted key). Equality compares the
@@ -71,6 +79,10 @@ differ; a cloned definition gets a new owner and so a new namespace; copying a
 binder inside one owner mints a new key. Constructors and projections live in one
 identity module with no public sentinel or domain manipulation, and the
 unchecked raw constructor is private to it.
+Select the physical scalar carrier by the probes below: `record`, `fixed record`
+and an opaque alias over a record do not promise inline or allocation-free storage
+([record representation](FIXED_LAYOUT_ROADMAP.md)). The notation specifies identity,
+not a new source-level layout contract.
 
 **Strings stop at resolution.** Module discovery issues `ModuleId`s and installs
 every module-visible declaration; every declaration has a typed definition id
@@ -142,6 +154,9 @@ names. Each lives in a field named for what it is (`c_name`, `abi_name`, `path`)
 - Start each slice with its failing identity test and exact family census.
   Name the old/new authority, deleted lookup/copy/fallback, logical schema,
   acceptance and stop conditions; probe an unknown representation before edits.
+- Numeric workloads and expected gains below are historical measurements or
+  hypotheses. Remeasure the current boundary before reopening an experiment;
+  shorter source or generated C alone does not establish a compiler-resource win.
 - **Identity oracles.** Byte-identical generated C until output spelling changes
   (`benchmarks/self_compile_measure --stage2 --require-identical` against a parent
   frozen at the branch base, on `--program self` and `--program small`, plus the
@@ -242,16 +257,20 @@ carry it. What remains, in order:
 
 ### Diagnostics, dumps and the formatter through the name table
 
-Typecheck diagnostics, lint findings, AST JSON and frontend summaries already
-render identifier spellings through the table. Still open:
+Table-based identifier rendering is partly landed in diagnostics, lint, AST JSON
+and frontend summaries. Remaining readers must be classified as semantic lookup,
+copy or display before deletion; the following inventory is not a completeness
+proof:
 
 - **Formatter** (about 500 `.text` reads in `blorp/src/format/`). Own branch,
   after the formatter has a settled table parameter; the oracle is formatter
   idempotence and `bin/blorp format --check blorp/src standard_library/src`. The
   formatter must keep operating on source text and the recovery AST alone, never
   depending on a typecheck graph.
-- Remaining `.text` reads: 13 name-data copies in `stage_07_ctfe/ir.brp` (CTFE IR
-  bindings and assignment targets) and 2 key comparisons in `typed_ast_json.brp`;
+- Remaining `.text` reads: semantic lint retains readers alongside its table
+  renderer. Preserve the owning diagnostic tests.
+  The CTFE IR has 13 matching lines (bindings, assignment targets and some semantic
+  lookups), and `typed_ast_json.brp` has 2 key comparisons;
   type header resolution's `.text` lookups (`declared_unqualified_type`,
   `type_header_graph_has_unqualified_type_name`, `resolve_named_type`) kept beside
   `identifier.name` for import, alias and parameter lookups keyed by String; the
@@ -280,8 +299,14 @@ and backend predicates that recognize semantics from a source spelling.
 
 ### Parser-minted versus inference-minted binder ids
 
-An authored binder's id must be stable across unrelated edits so fixtures can pin
-it. Two designs are on file and have to be reconciled before either starts:
+Define the stability contract before selecting the authored issuer. Ids must be
+deterministic for identical input; rebuilds preserve them and clones obey the
+owner/key remapping rules below. Fixtures pin them against frozen input.
+Stability across edits to earlier source
+is a separate incremental-identity requirement: counters, source offsets and
+discovery row ids do not establish it, and compilation-local ids are not persisted.
+Do not add persistent identity machinery just to stabilize fixture numbers.
+Two designs are on file and have to be reconciled before either starts:
 a per-module counter id minted by the parser and carried on the pattern node
 (replacing lowering's span-derived positive ids; gate: identical C up to local
 spellings, normalized oracle identical, audit fixtures), and an id minted at the
@@ -351,9 +376,11 @@ identical-C measurement, plus the allowlist delta the step names.
 
 ### Binders
 
-`CoreVar.origin: CoreBinderOrigin` (`Authored(NameId)`, `PassTemporary(pass)`,
-`DerivedFrom(binder_id)`, `LoweringTemporary(kind)`) is written where each binder id
-is minted. Perceus and closure-drop temporaries already carry an id and origin.
+`CoreVar.origin: CoreBinderOrigin` currently has `AuthoredBinder`,
+`LoweringTemporary(kind)`, `PassTemporary(kind, Int)`, `PerceusTemporary(kind, Int)`,
+`PerceusBorrowedResultTemporary(kind, Int, Int)` and `DerivedFrom(String, kind, Int)`.
+The derived String is an anchor key; authored origin does not carry a `NameId`.
+Perceus and closure-drop temporaries already carry an id and origin.
 Remaining:
 
 - Stop building the `$blorp$...`, `__cdrop_`, `__perceus_shadow_`, `__qb_`,
@@ -415,13 +442,13 @@ records keep source names), closures and tasks, and locals with a binder id
   `match_projection`, `mono_option`, `record_update`, `ssa`, `tailrec`,
   `tensor_specialize`, `parallel_tensor_pipeline`, and the
   tuple-destruct temporary in lowering (about 402k binder occurrences carried a
-  synthetic spelling for this reason when last counted). Each pass mints from
-  `CorePassState.next_binder_id` once it threads state; then delete the id-0
-  spelling fallbacks in `c_naming.brp` and `c_symbol_projection.brp`. Known
-  limitation: packed-loc ids are not unique once `std_inline` clones a body, so the
-  names collide as they always did; dense ids under Perceus threaded state fix it.
-  This is the same work as "Synthetic binders" under value identity: mint through
-  the persistent identity authority, not a pass-local counter.
+  synthetic spelling for this reason when last counted). `next_binder_id` is the
+  legacy frontier. This is the same work as "Synthetic binders" under value
+  identity: every future producer uses the checked owner/domain/key mint and remap
+  API, never a direct counter. Cloning remaps introduced binders and their uses;
+  packed locations alone cannot establish uniqueness. Preserve legacy emission
+  ids and spellings during the raw-C-identical transition, then delete the id-0
+  spelling fallbacks in the separate emission slice after coverage is complete.
 - **Variant constructor references by id alone.** A nullary constructor's
   `VarExpr` name is rewritten to its projected symbol in `backend_projection.brp`
   (`indexed_constructor_c_name`) and matched by that spelling or the source name in
@@ -493,11 +520,24 @@ neutral cuts cannot hide a material regression.
   owner-derived match-projection and option-fusion temporary names; never
   `CoreVar` or recursive pass contexts). Then split the generated-definition
   frontier into `next_semantic_definition_id` and `next_emission_compatibility_id`,
-  every Stage 8 and 9 mint consuming both exactly once through one pair-mint API
-  (a private scalar-only fixed-layout result, no heap record or tuple; inspect
-  generated C), initially in lockstep. The semantic allocation frontier is a
-  checked scalar `DefinitionAllocationFrontier` published by the Stage 6 authority
-  and carried on `TypecheckedGraph`; production code never proves a frontier by
+  every Stage 8 and 9 mint consuming both exactly once through one pair-mint API,
+  initially in lockstep. Before editing producers, choose and probe how the API
+  returns or publishes both results without a new heap record or tuple: scalar
+  fields in an existing owner or a checked scalar handle are candidates, not
+  selected representations. Prove atomic frontier advancement, lossless identity
+  projection and nested ownership behavior in generated C; a `fixed record` or
+  opaque-over-record spelling alone proves none of them. If no supported carrier
+  meets the cost gates, stop and redesign this slice. The
+  [2026-10-05 carrier probe](IDENTITY_DEFINITION_AUTHORITY_PROBE.md#native-result)
+  rejects the proposed nested/shared opaque-owner calling shape: retained aliases
+  add one owner allocation per iteration over matched raw controls, despite a
+  neutral receipt/control comparison. A replacement needs the same nested and
+  shared oracles before producer migration. Publish the semantic frontier with
+  its exact Stage 6 table authority. A checked whole-graph publication may first
+  remove the independent raw Core join; distinct scalar frontier types belong at
+  the semantic/output split where they prevent wrong-domain use. Do not add an
+  unused token accessor or retype ordinary tooling views for nominal proof alone.
+  Production code never proves a frontier by
   looking up `next_def_id - 1` or scanning Core. Oracle: raw-identical C, symbol
   maps, comments, split ordering and profile metadata; divergent semantic and
   emission fixtures for both the function and global paths; symbol projection
@@ -520,13 +560,22 @@ neutral cuts cannot hide a material regression.
   explicit disjoint authorities; standalone compilation owns a small
   artifact-local catalog builder (callers never supply a raw integer); inherited
   default-method projections use the checked post-discovery generator. The old
-  enumerator is not kept as a shadow verifier. Oracle: C, diagnostics,
-  definition-id ordering and import behavior exact; discovery plus typed frontend
-  flat or better; one source-definition authority after the landing.
-- **Contiguous frontier.** Graph and later Core definition ids form one contiguous
-  range, so a row index is `definition_id - first_managed_definition_id`; an
-  invariant checks it (a sparse producer means an explicit dense id-to-row map,
-  never a list sized to a sparse maximum).
+  enumerator is not kept as a shadow verifier. Define and test the source-category,
+  child/owner and module-issuer mapping before adoption, including inherited
+  defaults, overloads, builtins, standalone catalogs and mismatched tables.
+  Discovery row order differs from Stage 6 target/dependency reservations: semantic
+  ids adopt discovery authority while compatibility ids preserve existing output
+  order. Oracle: raw-identical C, diagnostics and import behavior; checked source
+  identity mapping and compatibility ordering; discovery plus typed frontend flat
+  or better; one source-definition authority after landing. This slice uses the
+  raw-C oracle even where the discovery roadmap permits normalized ids.
+- **Rows and frontiers.** A frozen source table has its own checked contiguous
+  slice and base; only within that slice may a row index be `definition_id - base`.
+  `definition_index_advance_to_env` already permits generated/body-local allocation
+  frontiers beyond source rows without creating rows. Keep generated allocation
+  frontiers, generated-overlay rows and current-program views distinct; retained
+  declarations need not occupy every allocated id. Sparse views use explicit dense
+  id-to-row maps, never a list sized to a sparse maximum or a `next_id - 1` proof.
 
 ### Authored locals
 
@@ -569,7 +618,10 @@ Normalized publication of name-site and binding tables
 `ResolvedValueUse(name_site_id, value_id)`,
 `AuthoredBindingDisplay(value_id, source_name_id, location)`) may return only when
 a named paying consumer exists, built as graph-wide or batch parallel columns after
-typed bodies exist; a dense row key is never the value id.
+typed bodies exist; a dense row key is never the value id. The first scalar spine
+does not build a per-body census merely to prepare for those tables. Their later
+delivery must define the authority and transfer contract below and delete a named
+lookup rather than add a second target resolver.
 
 ### Core carrier
 
@@ -747,6 +799,13 @@ carriers/ARC paths, not merely integer equality or renamed keys.
 
 ### Typed frontend values
 
+Prerequisite: choose whether the site satellites replace or supplement the direct
+typed value id, name the one authoritative target mapping and the lowering accessor,
+and specify which existing body/global outcome owns and transfers the artifact.
+Reuse accepted callable/global/trait/builtin and field identities; preserve explicit
+closure, standalone and recovery provenance. No table lands without a paying
+consumer and a concrete lookup or carrier deletion in the same slice.
+
 Prevent typechecking and lowering from retaining a source spelling on every resolved
 identifier occurrence. Keep the parser and formatter recovery AST unchanged
 initially; publish successful typed resolution in side tables, not another record on
@@ -784,7 +843,10 @@ Use separate module-local site-id namespaces for type and member occurrences
 (`TypeNameSite`, `ResolvedTypeTarget`, `MemberNameSite`, `ResolvedFieldTarget`,
 `ResolvedCallableTarget`, one target satellite per successful member site or an
 explicit family tag); `FieldId` joins the canonical definition table row, whose
-name remains the display authority. Each issue names the issuer and display table,
+name remains the display authority. Typed fields already use scalar
+`ResolvedFieldIdentity` with explicit missing-state semantics for tuple, module,
+synthetic and recovery selections; reuse that issuer and state distinction.
+Each issue names the issuer and display table,
 the first phase at which the reference is resolved, every downstream representation
 that duplicates the string, the ABI and reflection exceptions, the exact string-keyed
 indexes deleted, and the oracles. Coordinate named types with "Type identity": do not
@@ -804,6 +866,25 @@ stable. They map to this document's sections: `C1b` to "Definition authority", `
 "Authored locals", `C3c` and `C4a` to "Core carrier" and "Synthetic binders", `C5a` to
 "Emitted value symbols", `C6x` to "Backend semantic decisions", `C7a`-`C7d` to
 "Late-Core consumers by exact id", `C9` to "Typed frontend values", `C11b` to this section.
+
+The [reviewed reconciliation](../benchmarks/results/compiler_identity_reconciliation_2026-10-05.md)
+restores the green start that the audited revision lacked. Every later update
+classifies added and removed exact sites, boundary changes and budget increases;
+do not blindly regenerate the baseline or hide unsupported capabilities. Preserve
+evidence of accepted changes.
+The current census is lexical, covers stages 6, 8, 9 and 10, and checks path/count
+coverage; heuristic member reads and unsupported-static rows do not establish
+semantic coverage or identity continuity. Strict completion needs typed/dynamic
+oracles for each migrated family, with unverified scope reported explicitly.
+
+Run `scripts/compiler-identity-census --check` and
+`scripts/check-magic-spellings --strict` explicitly at the start and end of each
+slice, plus the owning Python tests through `scripts/test compiler-tools` when
+tooling changes. `make hygiene-check` now runs both strict checks; existing CI
+Quality invokes it through `make quality`, and premerge selects the owning Python
+tests. Default `scripts/test` routing remains separate. A green lexical scanner
+is a migration check, not semantic completion; exact projection-site fingerprints
+do not verify enclosing guards, so boundary-owned output tests remain necessary.
 
 Keep `scripts/compiler-identity-census` (and its baseline) as a ratchet by family and
 directory: unresolved identity constructors, legacy-consumer local name uses grouped
@@ -845,28 +926,43 @@ change's evidence justifies updating them. Typecheck diagnostic fixtures pin
 
 **Two representations.** `SemanticType` (`type_system/semantic_type.brp`, metas as
 `SemanticMetaType(MetaSessionId, Int)`) and `CoreType` (`stage_09_core/ir.brp`).
-Lowering converts one to the other in `core_lower_type_with_prefixes_impl`: 1.27M
-calls per self-compile for about 22k distinct shapes
-(`benchmarks/results/core_lowering_type_histogram_2026-09-22.md`); six arg-less
-scalars are module constants and everything else allocates a fresh `CoreType` per
-call. There is no type scheme; generalization is by name at zonk time.
+Lowering converts one to the other in `core_lower_type_with_prefixes_impl`: the
+[2026-09-22 histogram](../benchmarks/results/core_lowering_type_histogram_2026-09-22.md)
+recorded 1.27M calls per self-compile for about 22k distinct shapes. Six arg-less
+scalars are module constants; other shapes are generally reconstructed.
+Mono substitution already returns the input for unchanged shapes in several arms;
+preserve that behavior. There is no type scheme; generalization is by name at zonk time.
 `core_type_equal` and `core_mono_type_equal` (with its own dim normalization) have no
 `same_object` short-circuit; `MetaSessionId` already does pointer-first equality.
 
+Keep the domains explicit: graph `TypeId` identifies a nominal declaration;
+interned `SemanticTypeId`/`CoreTypeId` identifies a complete structural
+instantiation under its table authority. Concrete specialization, ABI/storage
+layout and occurrence release facts are separate. A generic source declaration
+can have several layouts; its nominal id alone cannot key them.
+
 - **Callee type memo.** `CallExpr.callee_type_lowering` was 852,492 allocations (33%
   of call lowering's budget): the callee's function type is lowered fresh at every call
-  site. Memoize `core_lower_value_type(callee_type)` in a `Dict[Int, CoreType]` keyed
-  by the callee's definition id in the lowering context, but first verify with a test
-  that instantiates one generic at two types and asserts `info.resolved_call` yields
-  distinct ids; if it does not, key by `(def_id, lowered argument types)` after type
-  ids exist. The report includes that test. The old allocation estimate is a hypothesis;
-  remeasure the current lowering boundary before implementation.
+  site. First add tests for one generic at two parameter types and one with identical
+  parameter types but different return instantiations (`list[T](Int) -> List[T]`).
+  Current resolved calls keep declaration identity separately from instantiated
+  parameters and return. Key the complete instantiated callee type, including
+  return, dimensions and purity, under the relevant lowering authority; a def id
+  or `(def_id, argument types)` alone is insufficient. Type lowering also reads
+  `module_member_prefixes`. Select an explicit memo owner and publication path:
+  recursive lowering returns only the expression result, so adding a dictionary to
+  its immutable Reader context cannot publish sibling entries. A prepared immutable
+  catalog or bounded state-threading probe must repay its build/ownership cost and
+  delete repeated type lowering; no unused pre-walk or managed per-call carrier.
+  Remeasure the current lowering boundary before implementation.
 - **Interned `SemanticType`.** A `SemanticTypeTable` on the typecheck `Context`
   interning at the hot producers (`localize_module_types`, qualify, `apply_subst`,
-  unify's rebuilds); metas are never interned (`types_equal` distinguishes meta
-  sessions; `test_type.brp` pins that two sessions with the same slot stay unequal);
+  unify's rebuilds); exclude metas and compound meta-bearing trees until zonked and
+  proved meta-free (`types_equal` distinguishes meta sessions; `test_type.brp` pins
+  that two sessions with the same slot stay unequal);
   the six scalar constants are the first rows. Expected typed frontend -2M to -4M.
-  Oracle: C, 860 diagnostic fixtures, typed-AST JSON tests.
+  Oracle: C, the marked diagnostic fixtures owned by `scripts/test compiler-blorp`,
+  typed-AST JSON tests; use the runner's current fixture count.
 - **Core type table, re-scoped.** Construction-time interning (a `CoreTypeTable`
   threaded through type lowering and mono substitution) was parked on measurement:
   lowering +41.6% allocations, mono +12.1%, instructions +3.3%, because expression
@@ -887,8 +983,10 @@ call. There is no type scheme; generalization is by name at zonk time.
 - **Dispatch and layout keyed by type id.** `core_trait_impl_type_key` (used from
   `resolve.brp`, `runtime_projection.brp`, `backend_projection.brp`) renders a type
   per lookup; `CoreLayoutTypeIndex` and `BackendTypeNaming` key by type name. With a
-  type table the key is the row index; delete the rendering helpers and convert every
-  lookup on the data source in one task (grep for stragglers). Expected: trait resolve
+  type table use a checked id for the complete instantiation; layout queries retain
+  concrete specialization and ABI/storage facts. Delete the rendering helpers and
+  convert every lookup on the data source in one task (grep for stragglers).
+  Expected: trait resolve
   instructions -10% to -20% of its row, allocations flat; report `blorp_string_eq`
   and `blorp_dict_hash_string` samples before and after. Needs the Core type table.
 - **Definition lookup views.** Do not build a second definition table after lowering;
@@ -915,8 +1013,9 @@ share it. `TypeId` plus `owner_module_id` exist in header resolution and are dro
 reader can compare identities until a field is added. Pins are `(std module origin,
 NameId)` resolved to a `KnownStdlibType` once per declaration, not a literal
 `DefinitionId`. Every slice is byte-identical C and deletes Strings or comparisons in
-its own commit; 95 `stdlib_type_name_literal` and 28 `qualified_name_literal` allowlist
-lines remain.
+its own commit. Use `scripts/check-magic-spellings --report` for the current
+`stdlib_type_name_literal` and `qualified_name_literal` inventories; keyed allowlist
+entries, scanner findings and deduplicated report sites are different counts.
 
 1. **`KnownStdlibType` enum** and one `known_stdlib_type_of_semantic_name` and
    `known_stdlib_type_of_core_name` pair in one new module (the only file with type-name
@@ -962,9 +1061,9 @@ lines remain.
    `split_canonical_module_type_name`, `split_qualified_type_name`,
    `owner_local_type_name` and the `::` parse in `identity.brp` go with "Function names
    and module origins" (Core stops flattening by String). Needs that step and the
-   offset-returning split already in `semantic_type.brp`. Gates: 860 diagnostic
-   fixtures, `type_name` intrinsic tests, move the `"Tuple"` comparison in
-   `core_type_to_string` to a variant match first.
+   offset-returning split already in `semantic_type.brp`. Gates: the marked diagnostic
+   fixtures owned by `scripts/test compiler-blorp`, `type_name` intrinsic tests;
+   move the `"Tuple"` comparison in `core_type_to_string` to a variant match first.
 
 Risks and catches: a dead-looking arm that is live (an arm with any hit stays and is
 listed); a bare spelling that collides with a user type (the fixtures above); flat names
@@ -975,8 +1074,12 @@ compiler-private LSP types (`scripts/test lsp`).
 
 ## Core node tables
 
-Goal: stop rebuilding the Core tree once per pass. Node identity is minted by lowering
-(landed), facts about nodes live in id-keyed tables published once on the pass state, and
+Goal: stop rebuilding the Core tree once per pass. Packed source handles and the
+pass-mint API are landed; fresh expression-occurrence uniqueness is not yet proved.
+The current node invariant covers function bodies, is report-only unless
+`BLORP_NODE_IDENTITY=strict`, and deduplicates shared semantic-match DAG subtrees
+while ordinary expression traversal visits each occurrence. Facts about nodes
+will live in id-keyed tables published once on the pass state, and
 only a pass that genuinely rewrites a node allocates a new one. This is the end point the
 late-Core pass fusions and "Value identity" are walking toward. It is not a rewrite of
 Core into a flat arena in one step; each step changes one representation fact, is
@@ -1008,18 +1111,22 @@ invariant assumes inside `rebuild_managed_let`'s shadowed-match-binding fresheni
 subtree can be duplicated across match arms; whether every duplication mints a fresh id
 was not verified). The measurement hooks (`BLORP_PERCEUS_ENGINE_METRICS`,
 `perceus_engine_summary_function_begin`, the per-function table in `runtime.c`) remain.
-To reopen: first verify node-id uniqueness across shadowed-match-binding freshening with
-an invariant over the minted ids; key the memo on `(node, variable id)` and prove which
-`PerceusEnv` fields the summary reads (key on them or show they are constant within a
-body); a table built once per function body in one bottom-up walk replaces the repeated
-walks. Go/no-go: at least -5M on the Perceus row or park again. Oracle: byte-identical C,
+To reopen: first define the exact analyzed body scope and verify every eligible
+packed or minted memo key after shadowed-match-binding freshening. Exclude zero or
+loc-less handles unless a separate checked identity is supplied; distinguish shared
+physical nodes from duplicated occurrences, and extend coverage explicitly before
+analyzing globals or other executable owners. Key the memo on `(node, variable id)`
+and prove which `PerceusEnv` fields the summary reads (key on them or show they are
+constant within that scope). A table built once per function body in one bottom-up
+walk replaces repeated walks. Remeasure the historical census before reopening.
+Go/no-go: at least -5M on the Perceus row or park again. Oracle: byte-identical C,
 `scripts/test leak`, `test_core_perceus.brp`, the sanitizer gate.
 
 ### Core types as type ids
 
-Every node carries a `CoreType` union inline; mono substitution rebuilds those trees per
-instantiation; the two equalities compare structurally. Depends on the Core type table
-("Type identity and interning"); the field on each expression becomes a `CoreTypeId`, type
+Typed Core expressions carry a `CoreType`; mono substitution rebuilds changed trees
+and preserves unchanged shapes; the two equalities compare structurally. Depends on
+the Core type table ("Type identity and interning"); the field on each expression becomes a `CoreTypeId`, type
 substitution in mono becomes a remap over the table, the equalities become integer
 compares, and the codec renders the resolved type so dump JSON is unchanged. Widest
 mechanical change in this section (every arm and every private match that reads `typ`):
@@ -1116,10 +1223,12 @@ each behind a capability gate:
 `module_member_prefixes` (`graph_prepare.brp`) is built once and threaded through 19
 signatures; it needs only the module id key (a `ModuleId -> C prefix` list), with copies in
 `resolve.brp`, `mono_specialize.brp`, `mono_option.brp` and `parallel_tensor_pipeline.brp`.
-`CoreLayoutTypeIndex` was built twice per compile on the same declarations
+`CoreLayoutTypeIndex` is built for FFI annotation and again for list annotation
 (`ffi_boundary.brp`, `list_layout.brp`, back to back in `graph_prepare.brp`, with
-`annotate_list_layouts` also called from `early_stages.brp`): share one build. The type name and
-layout table (`TypeId -> {alias target, declared type, list layout}`) would retire
+`annotate_list_layouts` also called from `early_stages.brp`). Share the initial build
+only after proving FFI annotation preserves every indexed fact; later rewritten
+programs need their own validity decision. A table keyed by complete type/instance
+identity, carrying narrow alias, declared-type and layout facts, would retire
 `CoreLayoutTypeIndex`, `mono_data.brp`'s `templates` and `transparent_aliases` (threaded through
 about 20 signatures), `record_update.brp`'s `record_decls` (about 25 signatures),
 `emit_record_layout.brp`'s three tables and `flatten.brp`'s `type_rewrite_index`. Where a table
@@ -1138,7 +1247,11 @@ every compile (`global_header_completion`, 834 to 927 ms on the self-compile); f
 must be cacheable per module, keyed by a hash of the module's declarations. Deliverable is a
 design note, not code: what the per-module header product is, what it depends on (imports'
 surfaces), how it is keyed and invalidated, and how `PreparedCanonicalModuleEnvironment` can load a
-cached header product without reconstructing module facts. Write it after the module-view
+cached header product without reconstructing module facts. Distinguish reuse within
+one compilation from reuse across compilations: persisted products must rebind
+definition/module/type identities and session-sensitive meta facts under the current
+authorities, never persist live compilation ids. Include compiler/policy provenance
+and imported/prelude/default-method surfaces in invalidation. Write it after the module-view
 publication cut above proves the final publication boundary. Cold-compile gain is 0%; the value is
 per-edit latency. Related typecheck allocation work is in
 [`module-environment-preparation-rebuilds-state`](issues/module-environment-preparation-rebuilds-state.md).
@@ -1175,7 +1288,7 @@ symbol as completed work.
 | `DiscoveryNames.SeededTableOnly` adopts only the first finalized root's table; generated root keeps own-table ids | Share one append-only table across root parses; standalone precondition below, coordinate old-front-end removal |
 | `name_spelling_of_text` Core/LSP bridge; cross-owner name-table imports | Identifier text; move shared name-table owner to `blorp/src/lib` |
 | `graph_source_name_table_for_programs`, `SpellingsFromIdentifierText` standalone rendering | Share discovery's compilation table before identifier text removal |
-| Type-header, CTFE and typed-AST JSON `.text` readers | [Display/formatter boundary](#diagnostics-dumps-and-the-formatter-through-the-name-table) |
+| Call diagnostics, semantic lint, type-header, CTFE and typed-AST JSON `.text` readers | [Display/formatter boundary](#diagnostics-dumps-and-the-formatter-through-the-name-table) |
 | `ResolvedCallInfo`, `CtfeIrDirectCall`, `AcceptedCallableBinding`, `TraitMethodCallee` spelling fields; CTFE `source_name_id = None`; `builtin_is_registered` synthesized-name lookup | [Builtin vocabularies](#builtin-and-intrinsic-vocabularies-by-id), then string deletion |
 | `infer_source_name_id` reconstructs imported original/accepted names; `ctfe_imported_intrinsic` selects by module path | Shared compilation name ids on bindings; module ids for intrinsic table selection |
 | `TraitDef.name` beside `trait_id`; by-name accessors, linear `env_get_trait_by_id`, entrypoint/prelude path checks | [Trait identity](#trait-identity-through-typecheck-and-core) |
@@ -1194,7 +1307,9 @@ symbol as completed work.
 
 ## Order and parallelism
 
-- The identity relation, the definition authority and the carrier probes come first; the
+- Reconcile the census before using it as a green ratchet; run the explicit checks
+  until the enforcement delivery lands. The identity relation, source/generated
+  issuer mapping, paired-frontier API and carrier probes come first; the
   authored-locals pilot, the Core carrier and the synthetic-binder families follow in that order
   and share the inference and lowering authority, so they normally integrate serially. Producer
   families are the first broad parallel wave once the mint and remap API freezes.
@@ -1206,7 +1321,8 @@ symbol as completed work.
   small-pass minting. Types and emitter temporaries are independent of the others and can run
   whenever an emitter slot is free (the stack-option payload type waits for the small-pass binders
   because of `match_projection.brp`).
-- Type identity: the callee memo and the semantic type table can run beside each other; the Core
+- Type identity: the callee memo first freezes its complete key and publication owner;
+  it and the semantic type table can then run beside each other; the Core
   type table follows; dispatch keyed by type id follows it; named-type identity lands before the
   dispatch and semantic type steps and is the named-types family of the nominal step.
 - The Core node steps do not touch union layout; "Core types as type ids" waits for the Core type

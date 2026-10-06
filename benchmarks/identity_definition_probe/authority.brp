@@ -1,0 +1,208 @@
+-- Experimental authority only. No production issuer imports this module.
+-- The receipt reuses the existing owner representation, with explicit issued
+-- scalars. Neither record construction nor opaque conversion is public.
+opaque type SemanticDefinition = Int
+
+opaque type EmissionOrdinal = Int
+
+private record OwnerRep {
+	next_semantic: Int,
+	next_emission: Int,
+	issued_semantic: Int,
+	issued_emission: Int,
+	program: List[Int]
+}
+
+opaque type Owner = OwnerRep
+
+opaque type MintedDefinition = OwnerRep
+
+private SEMANTIC_SEED: Int = 101
+
+private EMISSION_SEED: Int = 7
+
+pure func new_owner() -> Owner:
+	into_opaque Owner({
+		next_semantic = SEMANTIC_SEED,
+		next_emission = EMISSION_SEED,
+		issued_semantic = SEMANTIC_SEED,
+		issued_emission = EMISSION_SEED,
+		program = [3, 5, 8]
+	})
+
+-- Raw representation control: opaque owner conversion itself must also be
+-- accounted for, not hidden by comparing only two already-opaque owners.
+private pure func raw_owner() -> OwnerRep:
+	{
+		next_semantic = SEMANTIC_SEED,
+		next_emission = EMISSION_SEED,
+		issued_semantic = SEMANTIC_SEED,
+		issued_emission = EMISSION_SEED,
+		program = [3, 5, 8]
+	}
+
+private pure func raw_step(rep: OwnerRep) -> OwnerRep:
+	semantic = rep.next_semantic
+	emission = rep.next_emission
+	updated = { rep |
+		next_semantic = semantic + 1,
+		next_emission = emission + 1,
+		issued_semantic = semantic,
+		issued_emission = emission
+	}
+	{ updated | program = updated.program.set(0, semantic + emission) }
+
+private pure func raw_checksum(rep: OwnerRep) -> Int:
+	rep.next_semantic + rep.next_emission + rep.issued_semantic + rep.issued_emission + rep.program.get_or(0, 0)
+
+pure func raw_run(count: Int) -> Int:
+	var rep = raw_owner()
+	for index in 0..count:
+		rep = raw_step(rep)
+	raw_checksum(rep)
+
+private record RawHolder {
+	owner: OwnerRep,
+	tag: Int
+}
+
+pure func raw_nested_run(count: Int) -> Int:
+	var holder: RawHolder = { owner = raw_owner(), tag = 0 }
+	for index in 0..count:
+		updated = raw_step(holder.owner)
+		holder = { holder | owner = updated, tag = index }
+	raw_checksum(holder.owner)
+
+pure func raw_shared_run(count: Int) -> Int:
+	var rep = raw_owner()
+	var checksum = 0
+	for index in 0..count:
+		previous = rep
+		rep = raw_step(rep)
+		checksum += raw_checksum(previous)
+	checksum + raw_checksum(rep)
+
+-- The control publishes the same owner fields without a minted opaque view.
+-- It is intentionally private to this experimental module's public probe API.
+pure func control_step(owner: Owner) -> Owner:
+	rep = from_opaque Owner(owner)
+	semantic = rep.next_semantic
+	emission = rep.next_emission
+	into_opaque Owner({ rep |
+		next_semantic = semantic + 1,
+		next_emission = emission + 1,
+		issued_semantic = semantic,
+		issued_emission = emission
+	})
+
+pure func mint(owner: Owner) -> MintedDefinition:
+	rep = from_opaque Owner(owner)
+	semantic = rep.next_semantic
+	emission = rep.next_emission
+	into_opaque MintedDefinition({ rep |
+		next_semantic = semantic + 1,
+		next_emission = emission + 1,
+		issued_semantic = semantic,
+		issued_emission = emission
+	})
+
+pure func minted_semantic(receipt: MintedDefinition) -> SemanticDefinition:
+	into_opaque SemanticDefinition(from_opaque MintedDefinition(receipt).issued_semantic)
+
+pure func minted_emission(receipt: MintedDefinition) -> EmissionOrdinal:
+	into_opaque EmissionOrdinal(from_opaque MintedDefinition(receipt).issued_emission)
+
+pure func semantic_value(id: SemanticDefinition) -> Int:
+	from_opaque SemanticDefinition(id)
+
+pure func emission_value(id: EmissionOrdinal) -> Int:
+	from_opaque EmissionOrdinal(id)
+
+pure func minted_owner(receipt: MintedDefinition) -> Owner:
+	into_opaque Owner(from_opaque MintedDefinition(receipt))
+
+pure func program_step(owner: Owner, value: Int) -> Owner:
+	rep = from_opaque Owner(owner)
+	into_opaque Owner({ rep | program = rep.program.set(0, value) })
+
+pure func owner_checksum(owner: Owner) -> Int:
+	rep = from_opaque Owner(owner)
+	rep.next_semantic + rep.next_emission + rep.issued_semantic + rep.issued_emission + rep.program.get_or(0, 0)
+
+pure func control_run(count: Int) -> Owner:
+	var owner = new_owner()
+	for index in 0..count:
+		owner = control_step(owner)
+	owner
+
+pure func receipt_step(owner: Owner) -> Owner:
+	receipt = mint(owner)
+	-- Reading the pair before handing the owner onward mirrors a producer that
+	-- assigns a generated declaration. Values deliberately have divergent seeds.
+	semantic = minted_semantic(receipt).semantic_value()
+	emission = minted_emission(receipt).emission_value()
+	updated = minted_owner(receipt)
+	program_step(updated, semantic + emission)
+
+pure func control_consumer_step(owner: Owner) -> Owner:
+	updated = control_step(owner)
+	rep = from_opaque Owner(updated)
+	value = rep.issued_semantic + rep.issued_emission
+	program_step(updated, value)
+
+pure func receipt_run(count: Int) -> Owner:
+	var owner = new_owner()
+	for index in 0..count:
+		owner = receipt_step(owner)
+	owner
+
+pure func control_consumer_run(count: Int) -> Owner:
+	var owner = new_owner()
+	for index in 0..count:
+		owner = control_consumer_step(owner)
+	owner
+
+pure func program_run(count: Int) -> Owner:
+	var owner = new_owner()
+	for index in 0..count:
+		owner = program_step(owner, index)
+	owner
+
+private record Holder {
+	owner: Owner,
+	tag: Int
+}
+
+pure func nested_control_run(count: Int) -> Owner:
+	var holder: Holder = { owner = new_owner(), tag = 0 }
+	for index in 0..count:
+		updated = control_consumer_step(holder.owner)
+		holder = { holder | owner = updated, tag = index }
+	holder.owner
+
+pure func nested_receipt_run(count: Int) -> Owner:
+	var holder: Holder = { owner = new_owner(), tag = 0 }
+	for index in 0..count:
+		updated = receipt_step(holder.owner)
+		holder = { holder | owner = updated, tag = index }
+	holder.owner
+
+-- The old owner remains observably alive. Both paths must preserve it;
+-- the extra publication cost is not blamed on opaque conversion.
+pure func shared_control_run(count: Int) -> Int:
+	var owner = new_owner()
+	var checksum = 0
+	for index in 0..count:
+		previous = owner
+		owner = control_consumer_step(owner)
+		checksum += owner_checksum(previous)
+	checksum + owner_checksum(owner)
+
+pure func shared_receipt_run(count: Int) -> Int:
+	var owner = new_owner()
+	var checksum = 0
+	for index in 0..count:
+		previous = owner
+		owner = receipt_step(owner)
+		checksum += owner_checksum(previous)
+	checksum + owner_checksum(owner)

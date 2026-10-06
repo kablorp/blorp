@@ -506,7 +506,8 @@ hygiene-check:
 	@scripts/check-c-symbol-projection-boundary
 	@scripts/compiler-check --validate-manifest
 	@scripts/check-std-builtins
-	@python3 scripts/check-magic-spellings
+	@scripts/compiler-identity-census --check
+	@python3 scripts/check-magic-spellings --strict
 
 # Stray generated files left by builds or tests.
 artifact-scan:

@@ -2,7 +2,14 @@ import:
 	../../../src/compiler/stage_06_typecheck/graph/range_record: STANDARD_RANGE_RECORD_TYPE_NAME
 	../test_support_range_record: state_with_range_record_test_authority
 	fixtures/trait_identity_fixture: test_bound_type_param, test_trait_id
-	../../../src/compiler/stage_02_lex/name_table: SYNTHESIZED_NAME_TABLE, name_spelling, synthesized_name_id
+	../../../src/compiler/stage_02_lex/name_table:
+		IdentifierSpellings(SpellingsFromIdentifierText, SpellingsFromNameTable),
+		NameTable,
+		SYNTHESIZED_NAME_TABLE,
+		name_id_from_interned_index,
+		name_spelling,
+		name_table_intern,
+		synthesized_name_id,
 	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
 	../../../src/compiler/stage_03_parse/parsed_ast:
 		ConcurrentForLimit(MissingLimit, WrittenLimit),
@@ -6784,6 +6791,68 @@ func test_direct_call_errors_are_specific() -> Bool:
 	)
 
 
+-- Semantic lookup still uses the compatibility text in this standalone Env.
+-- The diagnostic must render through the explicitly selected spelling authority.
+pure func call_diagnostic_name_fixture() -> (NameTable, ParsedIdentifier):
+	(table, index) = name_table_intern(SYNTHESIZED_NAME_TABLE, "increment")
+	identifier = parsed_identifier(
+		name_id_from_interned_index(index),
+		"add_one",
+		fixture_source_span(),
+	)
+	(table, identifier)
+
+
+func test_call_arity_diagnostic_uses_name_table_spelling() -> Bool:
+	(table, identifier) = call_diagnostic_name_fixture()
+	state = { state_with_add_one_func() | identifier_spellings = SpellingsFromNameTable(table) }
+	result = infer_expr(
+		infer_context(state),
+		call_expr(ParsedNameExpr(identifier), []),
+	)
+
+	result.context.state.errors == ["Function 'increment' expects 1 argument, got 0"]
+
+
+func test_call_argument_diagnostic_uses_name_table_spelling() -> Bool:
+	(table, identifier) = call_diagnostic_name_fixture()
+	state = { state_with_add_one_func() | identifier_spellings = SpellingsFromNameTable(table) }
+	result = infer_expr(
+		infer_context(state),
+		call_expr(ParsedNameExpr(identifier), [string_expr("x")]),
+	)
+
+	result.context.state.errors == [
+		(
+			"Argument type mismatch: in call to 'increment', argument 1 expected Int, got "
+			+ "String at 0:0"
+		),
+	]
+
+
+func test_call_diagnostics_preserve_explicit_standalone_spelling() -> Bool:
+	(_, identifier) = call_diagnostic_name_fixture()
+	state = { state_with_add_one_func() | identifier_spellings = SpellingsFromIdentifierText }
+	arity_result = infer_expr(
+		infer_context(state),
+		call_expr(ParsedNameExpr(identifier), []),
+	)
+	mismatch_result = infer_expr(
+		infer_context(state),
+		call_expr(ParsedNameExpr(identifier), [string_expr("x")]),
+	)
+
+	(
+		arity_result.context.state.errors == ["Function 'add_one' expects 1 argument, got 0"]
+		and mismatch_result.context.state.errors == [
+			(
+				"Argument type mismatch: in call to 'add_one', argument 1 expected Int, got "
+				+ "String at 0:0"
+			),
+		]
+	)
+
+
 func test_direct_call_accepts_pure_callback_for_impure_slot() -> Bool:
 	result = infer_expr(
 		infer_context(state_with_callback_consumer(False)),
@@ -12476,6 +12545,18 @@ tests: TestSuite = {
 			test_direct_call_rejects_impure_callback_for_pure_slot,
 		),
 		("direct call errors are specific", test_direct_call_errors_are_specific),
+		(
+			"call arity diagnostic uses name table spelling",
+			test_call_arity_diagnostic_uses_name_table_spelling,
+		),
+		(
+			"call argument diagnostic uses name table spelling",
+			test_call_argument_diagnostic_uses_name_table_spelling,
+		),
+		(
+			"call diagnostics preserve explicit standalone spelling",
+			test_call_diagnostics_preserve_explicit_standalone_spelling,
+		),
 		("generic direct call substitutes type var", test_generic_direct_call_substitutes_type_var),
 		(
 			"direct call accepts concrete tensor for variadic dims",
