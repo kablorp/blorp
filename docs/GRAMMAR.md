@@ -229,6 +229,7 @@ stmt = var_decl
      | "for" IDENT "in" expr ":" NEWLINE INDENT stmt_list DEDENT
      | "for" "_" "in" expr ":" NEWLINE INDENT stmt_list DEDENT
      | "for" "(" destruct_ids ")" "in" expr ":" NEWLINE INDENT stmt_list DEDENT
+     | "for" IDENT "in" expr "concurrently" "(" concurrently_params ")" ":" NEWLINE INDENT stmt_list DEDENT
      | IDENT "?=" expr                          (* question-bind *)
      | IDENT ":" type_expr "?=" expr            (* typed question-bind *)
      | [ "pure" ] "func" name [ type_params ] params [ "->" type_expr ] [ where_clause ] ":" func_body
@@ -239,6 +240,10 @@ stmt = var_decl
 destruct_ids = destruct_id "," destruct_id [ "," destruct_id [ "," destruct_id ] ] [ "," ] ;
 destruct_id  = IDENT | "_" ;
 ```
+
+`while` and `for` (including `for ... concurrently(...)`) are statements. They
+have no value, so the parser rejects one where an expression is required, such
+as an assignment value, a call argument or an operand.
 
 ### Variable Declaration
 
@@ -490,7 +495,8 @@ primary_expr = INT | BIGINT | FLOAT | STRING | RAW_STRING
                                                                 named form *)
              | "(" ")"                                      (* void literal *)
              | "(" expr ")"                                 (* grouping *)
-             | "(" expr "," expr_list ")"                   (* tuple *)
+             | "(" expr "," expr_list ")"                   (* tuple, 2-4 elements;
+                                                                `(x,)` is rejected *)
              | lambda_expr
              | "[" [ expr_list ] "]"                        (* list literal *)
              | "{" dict_pairs "}"                           (* dict literal *)
@@ -545,8 +551,7 @@ with_binding = destruct_id [ ":" type_expr ] "=" expr
 
 debug_block = "debug" ":" NEWLINE INDENT stmt_list DEDENT ;
 
-concurrent_expr = "concurrent" [ "(" concurrent_params ")" ] ":" NEWLINE INDENT stmt_list DEDENT
-                | "for" IDENT "in" expr "concurrently" "(" concurrently_params ")" ":" NEWLINE INDENT stmt_list DEDENT ;
+concurrent_expr = "concurrent" [ "(" concurrent_params ")" ] ":" NEWLINE INDENT stmt_list DEDENT ;
 
 concurrent_params = concurrent_param { "," concurrent_param } ;
 concurrent_param  = "max_threads" ":" INT

@@ -322,8 +322,11 @@ match value:
     None: 0
 ```
 
-Notes on loops — `while` and `for` loops return `Void`, and values produced
-inside the loop body are discarded after evaluation. `break` and `continue` work
+Notes on loops — `while` and `for` are statements. They have no value, and values
+produced inside the loop body are discarded after evaluation, so a loop cannot be
+an assignment value, an argument or an operand (`squares = for x in xs: ...` is a
+parse error). To build a list from the items, use `xs.map(func(x): ...)`, or
+append to a `var` list inside the loop body. `break` and `continue` work
 in both `for` and `while` loops. In nested loops, `break` only exits the
 innermost loop. Range `..` is exclusive: `0..5` gives `0, 1, 2, 3, 4`.
 Backwards ranges iterate down and still exclude the end, so `5..3` gives `5, 4`.
@@ -612,7 +615,9 @@ All three float types support full fixed-size array operations.
 
 ### Tuples
 
-Fixed-size, heterogeneous collections (2-4 elements):
+Fixed-size, heterogeneous collections (2-4 elements). A tuple has at least two
+elements: `(x)` is `x` in parentheses and `(x,)` is a parse error, so write the
+value itself or a list, `[x]`.
 
 ```blorp
 func tuple_examples() -> Int:

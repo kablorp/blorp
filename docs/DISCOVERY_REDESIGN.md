@@ -1731,7 +1731,10 @@ statement records do not repeat it.
 `select`, `with`, `debug:`, `concurrent:` and lambdas as expressions,
 anywhere a primary expression may stand. It accepts `var`, bindings,
 destructuring, `while`, `for` and local functions only as statements. The
-split above follows that. Assignment is a statement only.
+split above follows that. Assignment is a statement only. The parser rejects
+`for` where a value is required (`x = for ...`), and a one-element tuple
+`(x,)`; both were accepted before and neither has a syntax type here (decided
+2026-10-05).
 
 ### 3.13 Control flow, interpolation and concurrency
 
