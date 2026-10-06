@@ -14,7 +14,7 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: FunctionDeclaration
 	../../../../src/compiler_new/stage_01_discovery/syntax/definitions: Definition(FunctionDefinition, LocalFunctionDefinition)
 	../../../../src/compiler_new/stage_01_discovery/syntax/id_census: id_census
-	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: Spellings, spelling_text
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: Spellings, spelling_count, spelling_text
 	../../../../src/compiler_new/stage_01_discovery/syntax/ids: block_local_index, expression_local_index, statement_local_index
 	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: ModuleItem(FunctionItem, TraitItem, ImplementationItem), ModuleSyntax
 	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
@@ -58,6 +58,20 @@ private pure func completed_module(state: ParseState, scan: ModuleDeclarationPre
 			_:
 				void
 	{ documentation = None, items = items, definitions = issued.definitions, imports = issued.imports, counts = issued.counts }
+
+
+-- The dump of the one function `text` completes, when its scan reports nothing
+-- and its ids pass the census.
+private pure func completed_dump(text: String) -> Option[String]:
+	match scanned(text):
+		Some((state, scan)):
+			syntax = completed_module(state, scan)
+			if completed_count(scan) == 1 and deferred_count(scan) == 0 and state.diagnostic_count() == 0 and id_census(module_id_at_row(0), syntax).is_empty():
+				Some(syntax.dumped_module(spellings(state)))
+			else:
+				None
+		None:
+			None
 
 
 private pure func completed_count(scan: ModuleDeclarationPreviewScan) -> Int:
@@ -180,7 +194,6 @@ func test_unsupported_bodies_roll_back_exactly() -> Bool:
 		["\tmatch x:", "\t\t1: if y:", "\t\t\tz"],
 		["\tmatch x:", "\t\t1: 2", "\tmatch y:", "\t\t_: 3", "\t-z"],
 		["\tx: Int", "\ty"],
-		["\tconcurrent:", "\t\tf()"],
 		["\tif a:", "\t\tb", "\telse", "\t\tc"],
 		["\tp.x = 1"],
 		["\ta = 1", "\tb = [", "\t\t1", "\t]"],
@@ -578,6 +591,288 @@ func test_long_match_value_survives_parse_dump_and_census() -> Bool:
 		None: False
 
 
+-- A `with` mints its binder, type, value, error binder and error value, then its block, then itself.
+func test_with_ids_follow_source_order() -> Bool:
+	text = source_lines([
+		"func f(p: Int):",
+		"\twith r: File ?= open(p) on e => close(e):",
+		"\t\tr.read()",
+		"\t\tr.read()"
+	])
+	expected = joined_lines([
+		"(module",
+		"  (function def0 public @0..80 (signature impure @0..4 \"f\"@5..6 (parameters (parameter @7..13 bind0:\"p\"@7..8 (named-type type0 @10..13 use0:\"Int\"@10..13))) -) (type-parameters) (where) (block block1 @17..80",
+		"    (expression-statement stmt2 @17..80 (with expr12 @17..80 (with-try @22..57 bind1:\"r\"@22..23 (named-type type1 @25..29 use1:\"File\"@25..29) (call expr2 @33..40 (name expr0 @33..37 use2:\"open\"@33..37) (arguments (name expr1 @38..39 use3:\"p\"@38..39))) (on-error @44..57 bind2:\"e\"@44..45 (call expr5 @49..57 (name expr3 @49..54 use4:\"close\"@49..54) (arguments (name expr4 @55..56 use5:\"e\"@55..56))))) (block block0 @61..80",
+		"      (expression-statement stmt0 @61..69 (call expr8 @61..69 (field expr7 @61..67 (name expr6 @61..62 use6:\"r\"@61..62) use7:\"read\"@63..67) (arguments)))",
+		"      (expression-statement stmt1 @72..80 (call expr11 @72..80 (field expr10 @72..78 (name expr9 @72..73 use8:\"r\"@72..73) use9:\"read\"@74..78) (arguments)))))))))"
+	])
+	completed_dump(text) == Some(expected)
+
+
+-- A count parameter is a checked literal and mints nothing; the timeout value is minted before the block, whichever parameter is written first.
+func test_concurrent_ids_follow_source_order() -> Bool:
+	text = source_lines([
+		"func f(t: Int):",
+		"\tconcurrent(timeout: t + 1, max_threads: 4):",
+		"\t\twork(t)",
+		"\t\twork(t)"
+	])
+	expected = joined_lines([
+		"(module",
+		"  (function def0 public @0..80 (signature impure @0..4 \"f\"@5..6 (parameters (parameter @7..13 bind0:\"t\"@7..8 (named-type type0 @10..13 use0:\"Int\"@10..13))) -) (type-parameters) (where) (block block1 @17..80",
+		"    (expression-statement stmt2 @17..80 (concurrent expr9 @17..80 (count @44..58 @44..55 4) (timeout @28..42 @28..35 (binary expr2 @37..42 add (name expr0 @37..38 use1:\"t\"@37..38) (integer expr1 @41..42 1))) (block block0 @63..80",
+		"      (expression-statement stmt0 @63..70 (call expr5 @63..70 (name expr3 @63..67 use2:\"work\"@63..67) (arguments (name expr4 @68..69 use3:\"t\"@68..69))))",
+		"      (expression-statement stmt1 @73..80 (call expr8 @73..80 (name expr6 @73..77 use4:\"work\"@73..77) (arguments (name expr7 @78..79 use5:\"t\"@78..79))))))))))"
+	])
+	completed_dump(text) == Some(expected)
+
+
+-- Each arm mints its binder and channel before its block; the select follows its last arm.
+func test_select_ids_follow_source_order() -> Bool:
+	text = source_lines([
+		"func f(a: Chan, b: Chan):",
+		"\tselect:",
+		"\t\tv from a:",
+		"\t\t\tv",
+		"\t\tsealed b:",
+		"\t\t\t0",
+		"\t\t_ after 3:",
+		"\t\t\t1"
+	])
+	expected = joined_lines([
+		"(module",
+		"  (function def0 public @0..87 (signature impure @0..4 \"f\"@5..6 (parameters (parameter @7..14 bind0:\"a\"@7..8 (named-type type0 @10..14 use0:\"Chan\"@10..14)) (parameter @16..23 bind1:\"b\"@16..17 (named-type type1 @19..23 use1:\"Chan\"@19..23))) -) (type-parameters) (where) (block block3 @27..87",
+		"    (expression-statement stmt3 @27..87 (select expr6 @27..87",
+		"      (receive-arm @37..51 bind2:\"v\"@37..38 (name expr0 @44..45 use2:\"a\"@44..45) (block block0 @50..51",
+		"        (expression-statement stmt0 @50..51 (name expr1 @50..51 use3:\"v\"@50..51))))",
+		"      (sealed-arm @54..68 (name expr2 @61..62 use4:\"b\"@61..62) (block block1 @67..68",
+		"        (expression-statement stmt1 @67..68 (integer expr3 @67..68 0))))",
+		"      (after-arm @71..86 (integer expr4 @79..80 3) (block block2 @85..86",
+		"        (expression-statement stmt2 @85..86 (integer expr5 @85..86 1)))))))))"
+	])
+	completed_dump(text) == Some(expected)
+
+
+-- A `debug:` block is minted block first, then itself; `detach` follows its operand.
+func test_debug_and_detach_ids_follow_source_order() -> Bool:
+	text = source_lines([
+		"func f(a: Int):",
+		"\tdebug:",
+		"\t\tshow(a)",
+		"\tdetach go(a)"
+	])
+	expected = joined_lines([
+		"(module",
+		"  (function def0 public @0..47 (signature impure @0..4 \"f\"@5..6 (parameters (parameter @7..13 bind0:\"a\"@7..8 (named-type type0 @10..13 use0:\"Int\"@10..13))) -) (type-parameters) (where) (block block1 @17..47",
+		"    (expression-statement stmt1 @17..33 (debug expr3 @17..33 (block block0 @26..33",
+		"      (expression-statement stmt0 @26..33 (call expr2 @26..33 (name expr0 @26..30 use1:\"show\"@26..30) (arguments (name expr1 @31..32 use2:\"a\"@31..32)))))))",
+		"    (expression-statement stmt2 @35..47 (detach expr7 @35..47 (call expr6 @42..47 (name expr4 @42..44 use3:\"go\"@42..44) (arguments (name expr5 @45..46 use4:\"a\"@45..46))))))))"
+	])
+	completed_dump(text) == Some(expected)
+
+
+-- A select that is a statement's value is minted before the assignment that owns it.
+func test_select_value_ids_follow_source_order() -> Bool:
+	text = source_lines([
+		"func f(a: Chan) -> Int:",
+		"\tpicked = select:",
+		"\t\tv from a:",
+		"\t\t\tv",
+		"\tpicked"
+	])
+	expected = joined_lines([
+		"(module",
+		"  (function def0 public @0..66 (signature impure @0..4 \"f\"@5..6 (parameters (parameter @7..14 bind0:\"a\"@7..8 (named-type type0 @10..14 use0:\"Chan\"@10..14))) (named-type type1 @19..22 use1:\"Int\"@19..22)) (type-parameters) (where) (block block1 @25..66",
+		"    (assignment stmt1 @25..60 use2:\"picked\"@25..31 (select expr2 @34..60",
+		"      (receive-arm @44..58 bind1:\"v\"@44..45 (name expr0 @51..52 use3:\"a\"@51..52) (block block0 @57..58",
+		"        (expression-statement stmt0 @57..58 (name expr1 @57..58 use4:\"v\"@57..58))))))",
+		"    (expression-statement stmt2 @60..66 (name expr3 @60..66 use5:\"picked\"@60..66)))))"
+	])
+	completed_dump(text) == Some(expected)
+
+
+-- Each shape is read in full by the frozen grammar or reported by it; this
+-- slice leaves it to a later one. Nothing the body parsed before it survives:
+-- ids, diagnostics and the interned names all return to the entry state.
+func test_unsupported_block_forms_roll_back_exactly() -> Bool:
+	var correct: Bool = True
+	for body in [
+		["\twith a = x, b = y:", "\t\ta"],
+		["\twith a = x", "\t\ta"],
+		["\twith a:", "\t\ta"],
+		["\twith a = x on e => 0:", "\t\ta"],
+		["\twith a ?= x on 5 => 0:", "\t\ta"],
+		["\twith a ?= x on e 0:", "\t\ta"],
+		["\twith a ?= x on e => :", "\t\ta"],
+		["\twith a = x: a"],
+		["\twith a = x:", "\t\ta", "\t-z"],
+		["\ty = with a = x:", "\t\ta"],
+		["\ty = concurrent:", "\t\ta"],
+		["\ty = debug:", "\t\ta"],
+		["\t1 + with a = x:", "\t\ta"],
+		["\tf(with a = x:", "\t\ta", "\t)"],
+		["\tfor x in xs:", "\t\twith a = f(x):", "\t\t\tb ?= g(a)"],
+		["\tfor x in xs:", "\t\tconcurrent:", "\t\t\tbreak"],
+		["\tfor x in xs:", "\t\tconcurrent:", "\t\t\tcontinue"],
+		["\tconcurrent():", "\t\ta"],
+		["\tconcurrent(max_threads: 0):", "\t\ta"],
+		["\tconcurrent(max_threads: -1):", "\t\ta"],
+		["\tconcurrent(max_threads: n):", "\t\ta"],
+		["\tconcurrent(max_threads: 2 + 1):", "\t\ta"],
+		["\tconcurrent(max_threads: 9223372036854775808):", "\t\ta"],
+		["\tconcurrent(max_threads: 2, max_threads: 3):", "\t\ta"],
+		["\tconcurrent(timeout: 1, timeout: 2):", "\t\ta"],
+		["\tconcurrent(limit: 2):", "\t\ta"],
+		["\tconcurrent(max_threads: 2 timeout: 3):", "\t\ta"],
+		["\tconcurrent(max_threads: 2:", "\t\ta"],
+		["\tconcurrent(max_threads 2):", "\t\ta"],
+		["\tconcurrent(,):", "\t\ta"],
+		["\tconcurrent a:", "\t\ta"],
+		["\tconcurrent:", "\ta"],
+		["\tconcurrent: a"],
+		["\tconcurrent:", "\t\ta", "\t-z"],
+		["\tdebug.print(x)"],
+		["\tdebug: x"],
+		["\tdebug:", "\ta"],
+		["\tmatch xs:", "\t\t_: with a = x:", "\t\t\ta"],
+		["\tmatch xs:", "\t\t_: concurrent:", "\t\t\ta"],
+		["\tmatch xs:", "\t\t_: debug:", "\t\t\ta"],
+		["\tmatch xs:", "\t\t_: select:", "\t\t\tv from xs:", "\t\t\t\tv"],
+		-- A supported statement before the unsupported form leaves no ids behind.
+		["\ta = 1", "\tdebug:", "\t\tb = 2", "\twith r = x:", "\t\tc", "\tconcurrent(max_threads: 0):", "\t\td"],
+		["\tselect:", "\t\tv from xs:", "\t\t\tv", "\twith r = x, s = y:", "\t\tr"],
+		-- A lambda whose block ends on a later line cannot end the header's line.
+		["\twith r = open(func():", "\t\t1", "\t):", "\t\tr"],
+		["\tselect:", "\t\tv from pick(func():", "\t\t\txs", "\t\t):", "\t\t\tv"],
+		["\tconcurrent(timeout: pick(func():", "\t\t5", "\t)):", "\t\tf()"],
+		["\tdetach"],
+		["\tdetach with a = x:", "\t\ta"],
+		["\tdetach f(x)", "\t\t.g()"],
+		["\tselect:"],
+		["\tselect", "\t\tv from xs:", "\t\t\tv"],
+		["\tselect:", "\t\tafter from xs:", "\t\t\t0"],
+		["\tselect:", "\t\tv from xs", "\t\t\tv"],
+		["\tselect:", "\t\tv xs:", "\t\t\tv"],
+		["\tselect:", "\t\tsealed:", "\t\t\t0"],
+		["\tselect:", "\t\t_ after:", "\t\t\t0"],
+		["\tselect:", "\t\tv from xs: v"],
+		["\tselect:", "\t\tv from xs:", "\t\t\tv", "\t-z"],
+		["\tfor x in xs:", "\t\ty = select:", "\t\t\tv from x:", "\t\t\t\tbreak"],
+		["\ty = select:", "\t\tv from xs:", "\t\t\tv", "\t.map(f)"]
+	]:
+		text = source_lines(["func f(xs: List[Int]) -> Int:"].concat(body))
+		match (scanned(text), new_parse_state(lex_module(module_id_at_row(0), text))):
+			(Some((state, scan)), Ok(entry)):
+				(plain, _) = scan_module_declaration_prefix_with_expressions(entry)
+				same_state: Bool = id_counts(state) == id_counts(plain) and state.diagnostic_count() == plain.diagnostic_count() and spelling_count(spellings(state)) == spelling_count(spellings(plain))
+				if completed_count(scan) != 0 or deferred_count(scan) != 1 or not same_state:
+					print("not rolled back: ${body}")
+					correct = False
+			_: correct = False
+	correct
+
+
+-- `break` and `continue` leave the loop around a `with`, `debug` or `select`,
+-- and so does a `?=`'s refusal; a `concurrent` block is a task of its own, so
+-- it leaves every loop outside itself.
+func test_block_forms_follow_the_enclosing_loop_scope() -> Bool:
+	var correct: Bool = True
+	for body in [
+		["\tfor x in xs:", "\t\twith r = open(x):", "\t\t\tbreak"],
+		["\tfor x in xs:", "\t\tdebug:", "\t\t\tcontinue"],
+		["\tfor x in xs:", "\t\twith a ?= f(x):", "\t\t\ta"],
+		["\tfor x in xs:", "\t\tselect:", "\t\t\tv from x:", "\t\t\t\tbreak", "\t\t\tsealed x:", "\t\t\t\tcontinue"],
+		["\tfor x in xs:", "\t\tconcurrent:", "\t\t\tgot ?= load(x)", "\t\t\tgot"],
+		["\tfor x in xs:", "\t\tconcurrent:", "\t\t\tfor y in x:", "\t\t\t\tbreak"],
+		["\twith r = open(xs):", "\t\tgot ?= load(r)", "\t\tgot"]
+	]:
+		if not true_if_completed(source_lines(["func f(xs: List[Int]) -> Int:"].concat(body).concat(["\t0"]))):
+			print("not completed: ${body}")
+			correct = False
+	correct
+
+
+-- Blocks nest by indentation, one level per form.
+private pure func nested_with_lines(depth: Int) -> List[String]:
+	var lines: List[String] = ["func f(p: Int) -> Int:"]
+	var level: Int = 0
+	while level < depth:
+		lines = lines.append("\t".repeat(level + 1) + "with r${level} = open(p):")
+		level += 1
+	lines.append("\t".repeat(depth + 1) + "1")
+
+
+private pure func nested_concurrent_lines(depth: Int) -> List[String]:
+	var lines: List[String] = ["func f(p: Int) -> Int:"]
+	var level: Int = 0
+	while level < depth:
+		lines = lines.append("\t".repeat(level + 1) + "concurrent(max_threads: 2, timeout: p):")
+		level += 1
+	lines.append("\t".repeat(depth + 1) + "1")
+
+
+private pure func nested_debug_lines(depth: Int) -> List[String]:
+	var lines: List[String] = ["func f(p: Int) -> Int:"]
+	var level: Int = 0
+	while level < depth:
+		lines = lines.append("\t".repeat(level + 1) + "debug:")
+		level += 1
+	lines.append("\t".repeat(depth + 1) + "1")
+
+
+-- A `select` nests two levels of indentation per level: its arm, then its block.
+private pure func nested_select_lines(depth: Int) -> List[String]:
+	var lines: List[String] = ["func f(p: Int) -> Int:"]
+	var level: Int = 0
+	while level < depth:
+		lines = lines.append("\t".repeat(2 * level + 1) + "select:")
+		lines = lines.append("\t".repeat(2 * level + 2) + "v${level} from p:")
+		level += 1
+	lines.append("\t".repeat(2 * depth + 1) + "1")
+
+
+-- Whether `lines` complete as one function whose dump holds `form` exactly
+-- `count` times.
+private pure func nests_to_depth(lines: List[String], form: String, count: Int) -> Bool:
+	match scanned(source_lines(lines)):
+		Some((state, scan)):
+			syntax = completed_module(state, scan)
+			completed_count(scan) == 1 and state.diagnostic_count() == 0 and id_census(module_id_at_row(0), syntax).is_empty() and dumped_module(syntax, spellings(state)).split(form).length() == count + 1
+		None: False
+
+
+func test_deeply_nested_with_blocks_survive_parse_dump_and_census() -> Bool:
+	depth = 1000
+	nests_to_depth(nested_with_lines(depth), "(with expr", depth)
+
+
+func test_deeply_nested_concurrent_blocks_survive_parse_dump_and_census() -> Bool:
+	depth = 1000
+	nests_to_depth(nested_concurrent_lines(depth), "(concurrent expr", depth)
+
+
+func test_deeply_nested_debug_blocks_survive_parse_dump_and_census() -> Bool:
+	depth = 1000
+	nests_to_depth(nested_debug_lines(depth), "(debug expr", depth)
+
+
+func test_deeply_nested_selects_survive_parse_dump_and_census() -> Bool:
+	depth = 1000
+	nests_to_depth(nested_select_lines(depth), "(select expr", depth)
+
+
+func test_long_select_survives_parse_dump_and_census() -> Bool:
+	arms = 2000
+	var lines: List[String] = ["func f(p: Int) -> Int:", "\tx = select:"]
+	var written: Int = 0
+	while written < arms:
+		lines = lines.append("\t\tv${written} from p:")
+		lines = lines.append("\t\t\t${written}")
+		written += 1
+	lines = lines.append("\tx")
+	nests_to_depth(lines, "(receive-arm @", arms)
+
+
 tests: TestSuite = {
 	description = "Tree statements, blocks and function bodies",
 	tests = [
@@ -599,6 +894,18 @@ tests: TestSuite = {
 		("control value ids follow source order", test_control_value_ids_follow_source_order),
 		("1000 nested value ifs", test_deeply_nested_value_ifs_survive_parse_dump_and_census),
 		("2000 link else if value", test_long_else_if_value_survives_parse_dump_and_census),
-		("2000 arm match value", test_long_match_value_survives_parse_dump_and_census)
+		("2000 arm match value", test_long_match_value_survives_parse_dump_and_census),
+		("with ids follow source order", test_with_ids_follow_source_order),
+		("concurrent ids follow source order", test_concurrent_ids_follow_source_order),
+		("select ids follow source order", test_select_ids_follow_source_order),
+		("debug and detach ids follow source order", test_debug_and_detach_ids_follow_source_order),
+		("select value ids follow source order", test_select_value_ids_follow_source_order),
+		("unsupported block forms roll back exactly", test_unsupported_block_forms_roll_back_exactly),
+		("block forms follow the enclosing loop scope", test_block_forms_follow_the_enclosing_loop_scope),
+		("1000 nested with blocks", test_deeply_nested_with_blocks_survive_parse_dump_and_census),
+		("1000 nested concurrent blocks", test_deeply_nested_concurrent_blocks_survive_parse_dump_and_census),
+		("1000 nested debug blocks", test_deeply_nested_debug_blocks_survive_parse_dump_and_census),
+		("1000 nested selects", test_deeply_nested_selects_survive_parse_dump_and_census),
+		("2000 arm select", test_long_select_survives_parse_dump_and_census)
 	]
 }

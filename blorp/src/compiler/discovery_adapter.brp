@@ -36,7 +36,7 @@ import:
 	../compiler_new/stage_01_discovery/tables/token as PreviewTokens
 	../compiler_new/stage_01_discovery/parse/tree_global_header_parser: GlobalHeaderPreview, DeferredInitializerStart
 	../compiler_new/stage_01_discovery/syntax/module_syntax: Documentation
-	../compiler_new/stage_01_discovery/syntax/checked_values: parent_step_count, written_digits
+	../compiler_new/stage_01_discovery/syntax/checked_values: parent_step_count, positive_count_value, written_digits
 	../compiler_new/stage_01_discovery/syntax/imports as TreeImports
 	../compiler_new/stage_01_discovery/syntax/foreign_blocks as TreeForeign
 	../compiler_new/stage_01_discovery/parse/union_preview:
@@ -4536,6 +4536,7 @@ private union PreviewExpressionContinuation:
 	FinishPreviewDictValue(ParsedExpr, Span, List[TreeExpressions.DictEntry], Int, List[ParsedDictEntry], Span)
 	FinishPreviewInterpolationHole(PreviewInterpolation, Span)
 	FinishPreviewUnary(ParsedUnaryOp, Span)
+	FinishPreviewDetach(Span)
 	VisitPreviewRight(PreviewPairOperator, TreeExpressions.Expression, Span)
 	FinishPreviewPair(PreviewPairOperator, ParsedExpr, Span)
 
@@ -4641,6 +4642,9 @@ pure func legacy_expression_preview(
 							TreeExpressions.Negate: ParsedNegateOp
 							TreeExpressions.LogicalNot: ParsedNotOp
 						continuations = continuations.append(FinishPreviewUnary(legacy_operator, current.span))
+						walk = VisitPreviewExpression(operand)
+					TreeExpressions.Detach(operand):
+						continuations = continuations.append(FinishPreviewDetach(current.span))
 						walk = VisitPreviewExpression(operand)
 					TreeExpressions.Binary(operator, left, right):
 						continuations = continuations.append(VisitPreviewRight(PreviewBinaryOperator(preview_binary_operator(operator)), right, current.span))
@@ -4781,6 +4785,8 @@ pure func legacy_expression_preview(
 										walk = ReturnPreviewExpression(finished)
 							FinishPreviewUnary(operator, span):
 								walk = ReturnPreviewExpression(ParsedUnaryExpr(operator, completed, legacy_location(span)))
+							FinishPreviewDetach(span):
+								walk = ReturnPreviewExpression(ParsedDetachExpr(completed, legacy_location(span)))
 							VisitPreviewRight(operator, right, span):
 								continuations = continuations.append(FinishPreviewPair(operator, completed, span))
 								walk = VisitPreviewExpression(right)
@@ -5223,8 +5229,8 @@ private pure func legacy_statement_expression_preview(
 			legacy_value_preview(source, names, expression)
 
 
--- A statement's value: the block-bearing `if` and `match` are read here, and
--- every other expression by the expression projection.
+-- A statement's value: the block-bearing forms are read here, and every other
+-- expression by the expression projection.
 private pure func legacy_value_preview(
 	source: PreviewSource, names: NameTable, expression: TreeExpressions.Expression,
 ) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
@@ -5233,6 +5239,16 @@ private pure func legacy_value_preview(
 			legacy_conditional_preview(source, names, conditional, expression.span)
 		TreeExpressions.Match(subject, cases):
 			legacy_match_preview(source, names, subject, cases, legacy_location(expression.span))
+		TreeExpressions.Select(arms):
+			legacy_select_preview(source, names, arms, legacy_location(expression.span))
+		TreeExpressions.With(with_expression):
+			legacy_with_preview(source, names, with_expression, legacy_location(expression.span))
+		TreeExpressions.ConcurrentBlock(concurrent_block):
+			legacy_concurrent_block_preview(source, names, concurrent_block, legacy_location(expression.span))
+		TreeExpressions.DebugBlock(block):
+			translated ?= legacy_block_preview(source, names, block)
+			(after_block, body) = translated
+			Ok((after_block, ParsedDebugBlockExpr(body, legacy_location(expression.span))))
 		_:
 			legacy_expression_preview(source, names, expression)
 
@@ -5332,6 +5348,130 @@ private pure func legacy_match_preview(
 			Err(error)
 		None:
 			Ok((extended, ParsedMatchExpr(scrutinee, parsed_cases, location)))
+
+
+private pure func legacy_select_preview(
+	source: PreviewSource, names: NameTable, arms: List[TreeExpressions.SelectArm], location: SourceLocation,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	var extended: NameTable = names
+	var parsed_arms: List[ParsedSelectArm] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+	for arm in arms:
+		match legacy_select_arm_preview(source, extended, arm):
+			Ok((after_arm, parsed)):
+				extended = after_arm
+				parsed_arms = parsed_arms.append(parsed)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok((extended, ParsedSelectExpr(parsed_arms, location)))
+
+
+private pure func legacy_select_arm_preview(
+	source: PreviewSource, names: NameTable, arm: TreeExpressions.SelectArm,
+) -> Result[(NameTable, ParsedSelectArm), LegacyDeclarationPreviewError]:
+	translated_kind ?= legacy_select_arm_kind_preview(source, names, arm.kind)
+	(after_kind, kind) = translated_kind
+	translated_body ?= legacy_block_preview(source, after_kind, arm.body)
+	(after_body, body) = translated_body
+	Ok((after_body, { kind = kind, body = body, span = legacy_location(arm.span) }))
+
+
+private pure func legacy_select_arm_kind_preview(
+	source: PreviewSource, names: NameTable, kind: TreeExpressions.SelectArmKind,
+) -> Result[(NameTable, ParsedSelectArmKind), LegacyDeclarationPreviewError]:
+	match kind:
+		TreeExpressions.ReceiveArm(target, channel):
+			(after_binder, binder) = legacy_binding_target_name(source, names, target)
+			translated_channel ?= legacy_expression_preview(source, after_binder, channel)
+			(after_channel, parsed_channel) = translated_channel
+			Ok((after_channel, ParsedSelectReceiveArm(binder, parsed_channel)))
+		TreeExpressions.SealedArm(channel):
+			translated_channel ?= legacy_expression_preview(source, names, channel)
+			(after_channel, parsed_channel) = translated_channel
+			Ok((after_channel, ParsedSelectSealedArm(parsed_channel)))
+		TreeExpressions.AfterArm(timeout):
+			translated_timeout ?= legacy_expression_preview(source, names, timeout)
+			(after_timeout, parsed_timeout) = translated_timeout
+			Ok((after_timeout, ParsedSelectAfterArm(parsed_timeout)))
+
+
+private pure func legacy_with_preview(
+	source: PreviewSource, names: NameTable, with_expression: TreeExpressions.WithExpression, location: SourceLocation,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	translated_binding ?= legacy_with_acquisition_preview(source, names, with_expression.acquisition)
+	(after_binding, binding) = translated_binding
+	translated_body ?= legacy_block_preview(source, after_binding, with_expression.body)
+	(after_body, body) = translated_body
+	Ok((after_body, ParsedWithExpr(binding, body, location)))
+
+
+private pure func legacy_with_acquisition_preview(
+	source: PreviewSource, names: NameTable, acquisition: TreeExpressions.WithAcquisition,
+) -> Result[(NameTable, ParsedWithBinding), LegacyDeclarationPreviewError]:
+	match acquisition:
+		TreeExpressions.WithValue(binding):
+			legacy_with_binding_preview(source, names, binding.target, binding.declared_type, binding.value, None, ParsedWithPlainBinding, binding.span)
+		TreeExpressions.WithTry(binding):
+			legacy_with_binding_preview(source, names, binding.target, binding.declared_type, binding.value, binding.on_error, ParsedWithTryBinding, binding.span)
+
+
+private pure func legacy_with_binding_preview(
+	source: PreviewSource, names: NameTable, target: BindingTarget, declared_type: Option[TreeTypes.WrittenType],
+	value: TreeExpressions.Expression, on_error: Option[TreeExpressions.ErrorMap], kind: ParsedWithBindingKind, span: Span,
+) -> Result[(NameTable, ParsedWithBinding), LegacyDeclarationPreviewError]:
+	(after_name, name) = legacy_binding_target_name(source, names, target)
+	translated_type ?= preview_optional_type(source, after_name, declared_type)
+	(after_type, type_expr) = translated_type
+	translated_value ?= legacy_expression_preview(source, after_type, value)
+	(after_value, parsed_value) = translated_value
+	translated_map ?= legacy_error_map_preview(source, after_value, on_error)
+	(after_map, error_map) = translated_map
+	Ok((after_map, { name = name, type_expr = type_expr, value = parsed_value, kind = kind, error_map = error_map, span = legacy_location(span) }))
+
+
+private pure func legacy_error_map_preview(
+	source: PreviewSource, names: NameTable, on_error: Option[TreeExpressions.ErrorMap],
+) -> Result[(NameTable, Option[ParsedWithErrorMap]), LegacyDeclarationPreviewError]:
+	match on_error:
+		Some(written):
+			(after_name, name) = legacy_binding_target_name(source, names, written.target)
+			translated_value ?= legacy_expression_preview(source, after_name, written.value)
+			(after_value, value) = translated_value
+			Ok((after_value, Some({ name = name, value = value, span = legacy_location(written.span) })))
+		None:
+			Ok((names, None))
+
+
+-- The timeout is the only parameter that holds an expression; the count is a
+-- checked literal.
+private pure func legacy_concurrent_block_preview(
+	source: PreviewSource, names: NameTable, concurrent_block: TreeExpressions.ConcurrentBlockExpression, location: SourceLocation,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	max_threads: ConcurrentThreadLimit = match concurrent_block.max_threads:
+		Some(parameter): ThreadLimit(positive_count_value(parameter.count))
+		None: DefaultThreadLimit
+	translated_timeout ?= legacy_timeout_preview(source, names, concurrent_block.timeout)
+	(after_timeout, timeout) = translated_timeout
+	translated_body ?= legacy_block_preview(source, after_timeout, concurrent_block.body)
+	(after_body, body) = translated_body
+	Ok((after_body, ParsedConcurrentBlockExpr({ max_threads = max_threads, timeout = timeout }, body, location)))
+
+
+private pure func legacy_timeout_preview(
+	source: PreviewSource, names: NameTable, timeout: Option[TreeExpressions.TimeoutParameter],
+) -> Result[(NameTable, Option[ParsedExpr]), LegacyDeclarationPreviewError]:
+	match timeout:
+		Some(parameter):
+			translated ?= legacy_expression_preview(source, names, parameter.value)
+			(extended, value) = translated
+			Ok((extended, Some(value)))
+		None:
+			Ok((names, None))
 
 
 private pure func legacy_case_preview(

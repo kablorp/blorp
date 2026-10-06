@@ -1971,6 +1971,9 @@ adapter's legacy projection:
   1,400 levels, is open item D6, section 9);
 - 1,000-deep nested tuples, alternating tuples and lists, and vectors, all
   proved through parse, dump, ID census and projection on Linux;
+- 1,000 `with`, `concurrent`, `debug` and `select` blocks nested by
+  indentation, and a 2,000-arm `select`, proved through parse, dump, ID census
+  and projection on Linux (the limit is open item D6, section 9);
 - a 1,000-deep nest of record literals, record updates and dict literals.
   This last case is **not yet met**: it is proved only to 200 levels (open
   item D5, section 9);
@@ -3420,11 +3423,12 @@ rebased build, 1,000 and 1,200 value `if`s nested one inside another pass
 parse, mint, census, dump and projection, and 1,400 overflow the native stack.
 That limit is open item D6 in section 9.
 
-The next bounded M4 slices are control expressions as operands, then the
-statement forms `select`, `with`, `concurrent`, `detach` and `debug:`, and
-opaque conversions in a separate slice. Lambdas, local functions and the bodies
-of traits and implementations are read; the complete M4 gate still requires
-module assembly, forward pairing and the open depth items D5 to D7.
+The next bounded M4 slices are control expressions as operands and the
+statement forms `select`, `with`, `concurrent`, `detach` and `debug:` (the
+statement-forms slice below), then opaque conversions in a separate slice.
+Lambdas, local functions and the bodies of traits and implementations are read;
+the complete M4 gate still requires module assembly, forward pairing and the
+open depth items D5 to D7.
 
 Argument and list nesting are the recursion in the postfix and list grammar.
 They follow brackets the source itself nests, as the frozen parser does, and
@@ -3674,6 +3678,68 @@ A new rollback adds its reason to the enum, and the census label match
 (`blorp/test/compiler_new/support/stop_reason_label.brp`) stops compiling until
 it is named.
 
+The statement-forms slice reads `select`, `with`, `concurrent` and `debug:` as
+statements, and `detach x` as a prefix operator. `select` is also a whole value
+after `=` or `op=`, as `if` and `match` are. `with`, `concurrent` and `debug`
+are not values: the frozen parser indents their block past the keyword rather
+than past the statement, so `x = with ...:` written the usual way is rejected
+there and must stay unread here (the corpus holds none). The same column rule
+leaves a same-line `match` case body that starts with one of the four forms
+unsupported. `detach` is an
+expression recipe like `not`: its operand is a whole postfix chain, and its id
+follows its operand's. Each statement form builds an ID-free recipe, validates
+the whole header and every block, and only then mints in source order. A `with`
+mints its binder, written type, value, `on` binder and `on` value, then its
+block, then itself; a `select` mints each arm's binder and channel before the
+arm's block; a `concurrent` mints its `timeout` value before its block. A count
+parameter (`max_threads`) is a `PositiveCount` the recognizer checks, so it
+mints nothing and the two parameters may come in either order. A grouped
+literal counts; `-1`, a name, an expression, zero and a value above `Int` do
+not. What the frozen grammar reports restores the exact entry state, ids,
+diagnostics and interned names included: a second `with` binding, a missing
+colon, an `on` clause after `=`, an unknown, repeated, empty or non-literal
+`concurrent` parameter, a `select` with no arms or an arm without a block, a
+binder spelled `after` or `from`, a value after a `debug:` colon, and a
+`break` in a `concurrent` block (it leaves no loop, as in the frozen parser).
+`concurrent` blocks are read outside every loop, so `?=` is allowed in one even
+inside a loop; a `with`, `debug` or `select` block sees the enclosing loop, so
+`break` and `continue` pass and `?=` stays refused. A `with` acquisition's own
+`?=` is not the statement and is allowed in a loop. Four conventions are the
+frozen parser's: a `select` ends at the dedent that closes its arms, like
+`match`; an arm's span runs from its first token to its block; an `on` clause
+spans from its binder; and the token after any of these blocks must not
+continue it. The legacy projection builds `ParsedWithExpr`, `ParsedSelectExpr`,
+`ParsedConcurrentBlockExpr`, `ParsedDebugBlockExpr` and `ParsedDetachExpr`;
+the AST JSON equals the frozen parser's for every shape in the projection
+suite, including all four forms nested in each other and in `if`, `match` and
+`for` blocks. The dump and census arms for the four statement forms moved into
+functions of their own: inline, the 700-deep case overflowed the Linux native
+stack in the dump and census frames.
+
+On a fresh build of main `16f80b101` plus this change, the 3,412-module "every
+corpus file as a root" run compared 14,608 completed declarations (7,249
+functions, 117 traits and 167 implementations with bodies), against 14,212
+(6,858 functions) on the same main without it. The modules whose first stop is a
+function fell from 1,473 to 1,339; end of source rose from 1,561 to 1,681 and
+global initializers from 350 to 364 because modules that used to stop at a
+function now reach later owners; implementation stops are unchanged (28), and
+there are no rejected or non-progress stops and no differing file. Every new
+rollback carries a `StopPoint` (`SelectWithoutArms`, `SelectNotClosed`,
+`SelectArmMalformed`, `WithBindingMalformed`, `WithHeaderWithoutColon`,
+`WithErrorMapMalformed`, `ConcurrentHeaderWithoutColon`,
+`ConcurrentParametersMalformed`, `ConcurrentParameterUnknown`,
+`ConcurrentParameterRepeated`, `ConcurrentCountNotLiteral`), and
+`opens_block_form` in `stop_reason.brp` is the one place that tells a block
+from a soft-keyword name; `DetachExpression` is gone because `detach` is read.
+On Linux arm64 (Docker), 1,000 nested `with`, `concurrent`, `debug` and
+`select` blocks pass parse, mint, census, dump and projection. `with`,
+`concurrent` and `debug` also pass at 1,400; a nested `select` passes parse to
+1,000 and overflows by 1,400, and its projection passes at 1,200 and overflows
+at 1,400 (not narrowed between). Focused checks passed 31/31 (body parser), 32/32
+(body projection), 32/32 (expression parser) and 6/6 (stop reasons).
+`compiler-new` passed 901/901, `compiler-new-parity` 3,570/3,570 with zero
+mismatched files and `compiler-blorp` 6,682/6,682.
+
 Validation before the main reconciliation, at `a5ae15eab`:
 
 The combined fresh-build focused run passed 121/121 tests, including a
@@ -3762,7 +3828,11 @@ the proposed forms so their consequences can be reviewed.
 - **D6. Block nesting depth (3.14).** Nesting by indentation recurses in the
   body parser, the minter, the dump and the legacy projection, as it did for
   statement-position blocks before value `if`s. On Linux arm64 1,000 nested
-  value `if`s pass at 1,000 and 1,200 and overflow at 1,400. Follow-up if deeper
+  value `if`s pass at 1,000 and 1,200 and overflow at 1,400. Nested `with`,
+  `concurrent`, `debug` and `select` blocks pass at 1,000 through parse, mint,
+  census, dump and projection; `with`, `concurrent` and `debug` also pass at
+  1,400, a nested `select` passes parse at 1,000 and overflows by 1,400, and its
+  projection passes at 1,200 and overflows at 1,400. Follow-up if deeper
   proof is wanted: iterate the block stack as the expression nesting is, or
   raise the main stack size at the CLI.
 

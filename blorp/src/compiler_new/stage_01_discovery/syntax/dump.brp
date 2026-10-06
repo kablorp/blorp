@@ -60,6 +60,7 @@ import:
 		CaseBody(CaseBlock, CaseStatement),
 		CompoundAssignmentStatement,
 		CompoundOperator(AddAssign, DivideAssign, MultiplyAssign, SubtractAssign),
+		ConcurrentBlockExpression,
 		ConcurrentForStatement,
 		CountParameter,
 		ElseBody(ElseBlock, ElseIf),
@@ -82,6 +83,7 @@ import:
 		NamedValue,
 		OpaqueDirection(FromOpaque, IntoOpaque),
 		QuestionBindingStatement,
+		SelectArm,
 		SelectArmKind(AfterArm, ReceiveArm, SealedArm),
 		Statement,
 		StatementKind(
@@ -96,6 +98,7 @@ import:
 		UnaryOperator(LogicalNot, Negate),
 		VariableStatement,
 		WithAcquisition(WithTry, WithValue),
+		WithExpression,
 	foreign_blocks: ForeignBlock, ForeignFunction
 	ids:
 		binder_local_index,
@@ -1625,7 +1628,7 @@ private pure func expression_head(form: String, expression: Expression) -> Strin
 		.to_string() + " " + span_text(expression.span)
 
 
--- The `if` and `match` arms are functions of their own, reached before the
+-- The block-bearing forms are functions of their own, reached before the
 -- large general walker: a block nests statements, which nest expressions, so
 -- these frames are on the native stack once per level of nesting.
 private pure func dumped_expression(
@@ -1639,8 +1642,148 @@ private pure func dumped_expression(
 			out.dumped_if_expression(spellings, depth, expression, conditional)
 		Match(subject, cases):
 			out.dumped_match_expression(spellings, depth, expression, subject, cases)
+		Select(arms):
+			out.dumped_select_expression(spellings, depth, expression, arms)
+		With(with_expression):
+			out.dumped_with_expression(spellings, depth, expression, with_expression)
+		DebugBlock(block):
+			out.dumped_debug_expression(spellings, depth, expression, block)
+		ConcurrentBlock(concurrent_block):
+			out.dumped_concurrent_expression(spellings, depth, expression, concurrent_block)
 		_:
 			out.dumped_general_expression(spellings, depth, expression)
+
+
+private pure func dumped_select_expression(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	expression: Expression,
+	arms: List[SelectArm],
+) -> List[String]:
+	var dumped: List[String] = out.append(expression_head("select", expression))
+
+	for arm in arms:
+		dumped = dumped.on_line(depth + 1)
+
+		match arm.kind:
+			ReceiveArm(target, channel):
+				dumped = dumped
+					.append(
+						"(receive-arm " + span_text(
+							arm.span,
+						) + " " + target_text(spellings, target) + " ",
+					)
+					.dumped_expression(spellings, depth + 1, channel)
+			SealedArm(channel):
+				dumped = dumped
+					.append("(sealed-arm " + span_text(arm.span) + " ")
+					.dumped_expression(spellings, depth + 1, channel)
+			AfterArm(timeout):
+				dumped = dumped
+					.append("(after-arm " + span_text(arm.span) + " ")
+					.dumped_expression(spellings, depth + 1, timeout)
+
+		dumped = dumped
+			.append(" ")
+			.dumped_block(spellings, depth + 1, arm.body)
+			.append(")")
+
+	dumped.append(")")
+
+
+private pure func dumped_with_expression(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	expression: Expression,
+	with_expression: WithExpression,
+) -> List[String]:
+	var dumped: List[String] = out
+		.append(expression_head("with", expression) + " ")
+		.dumped_acquisition(spellings, depth, with_expression.acquisition)
+
+	dumped
+		.append(" ")
+		.dumped_block(spellings, depth, with_expression.body)
+		.append(")")
+
+
+private pure func dumped_acquisition(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	acquisition: WithAcquisition,
+) -> List[String]:
+	match acquisition:
+		WithValue(binding):
+			out
+				.append(
+					"(with-value " + span_text(
+						binding.span,
+					) + " " + target_text(spellings, binding.target) + " ",
+				)
+				.dumped_optional_type(spellings, depth, binding.declared_type)
+				.append(" ")
+				.dumped_expression(spellings, depth, binding.value)
+				.append(")")
+		WithTry(binding):
+			dumped: List[String] = out
+				.append(
+					"(with-try " + span_text(
+						binding.span,
+					) + " " + target_text(spellings, binding.target) + " ",
+				)
+				.dumped_optional_type(spellings, depth, binding.declared_type)
+				.append(" ")
+				.dumped_expression(spellings, depth, binding.value)
+
+			match binding.on_error:
+				Some(error_map):
+					dumped
+						.append(
+							" (on-error " + span_text(
+								error_map.span,
+							) + " " + target_text(spellings, error_map.target) + " ",
+						)
+						.dumped_expression(spellings, depth, error_map.value)
+						.append("))")
+				None:
+					dumped.append(" -)")
+
+
+private pure func dumped_debug_expression(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	expression: Expression,
+	block: Block,
+) -> List[String]:
+	out
+		.append(expression_head("debug", expression) + " ")
+		.dumped_block(spellings, depth, block)
+		.append(")")
+
+
+private pure func dumped_concurrent_expression(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	expression: Expression,
+	concurrent_block: ConcurrentBlockExpression,
+) -> List[String]:
+	max_threads: String = match concurrent_block.max_threads:
+		Some(count):
+			count_text(count)
+		None:
+			"-"
+
+	out
+		.append(expression_head("concurrent", expression) + " " + max_threads + " ")
+		.dumped_timeout(spellings, depth, concurrent_block.timeout)
+		.append(" ")
+		.dumped_block(spellings, depth, concurrent_block.body)
+		.append(")")
 
 
 private pure func dumped_if_expression(
@@ -1884,87 +2027,13 @@ private pure func dumped_general_expression(
 				dumped = dumped.dumped_match_expression(spellings, depth, current, subject, cases)
 				on_spine = False
 			Select(arms):
-				dumped = dumped.append(expression_head("select", current))
-
-				for arm in arms:
-					dumped = dumped.on_line(depth + 1)
-
-					match arm.kind:
-						ReceiveArm(target, channel):
-							dumped = dumped
-								.append(
-									"(receive-arm " + span_text(
-										arm.span,
-									) + " " + target_text(spellings, target) + " ",
-								)
-								.dumped_expression(spellings, depth + 1, channel)
-						SealedArm(channel):
-							dumped = dumped
-								.append("(sealed-arm " + span_text(arm.span) + " ")
-								.dumped_expression(spellings, depth + 1, channel)
-						AfterArm(timeout):
-							dumped = dumped
-								.append("(after-arm " + span_text(arm.span) + " ")
-								.dumped_expression(spellings, depth + 1, timeout)
-
-					dumped = dumped
-						.append(" ")
-						.dumped_block(spellings, depth + 1, arm.body)
-						.append(")")
-
-				dumped = dumped.append(")")
+				dumped = dumped.dumped_select_expression(spellings, depth, current, arms)
 				on_spine = False
 			With(with_expression):
-				dumped = dumped.append(expression_head("with", current) + " ")
-
-				match with_expression.acquisition:
-					WithValue(binding):
-						dumped = dumped
-							.append(
-								"(with-value " + span_text(
-									binding.span,
-								) + " " + target_text(spellings, binding.target) + " ",
-							)
-							.dumped_optional_type(spellings, depth, binding.declared_type)
-							.append(" ")
-							.dumped_expression(spellings, depth, binding.value)
-							.append(")")
-					WithTry(binding):
-						dumped = dumped
-							.append(
-								"(with-try " + span_text(
-									binding.span,
-								) + " " + target_text(spellings, binding.target) + " ",
-							)
-							.dumped_optional_type(spellings, depth, binding.declared_type)
-							.append(" ")
-							.dumped_expression(spellings, depth, binding.value)
-
-						match binding.on_error:
-							Some(error_map):
-								dumped = dumped
-									.append(
-										" (on-error " + span_text(
-											error_map.span,
-										) + " " + target_text(spellings, error_map.target) + " ",
-									)
-									.dumped_expression(spellings, depth, error_map.value)
-									.append(")")
-							None:
-								dumped = dumped.append(" -")
-
-						dumped = dumped.append(")")
-
-				dumped = dumped
-					.append(" ")
-					.dumped_block(spellings, depth, with_expression.body)
-					.append(")")
+				dumped = dumped.dumped_with_expression(spellings, depth, current, with_expression)
 				on_spine = False
 			DebugBlock(block):
-				dumped = dumped
-					.append(expression_head("debug", current) + " ")
-					.dumped_block(spellings, depth, block)
-					.append(")")
+				dumped = dumped.dumped_debug_expression(spellings, depth, current, block)
 				on_spine = False
 			Lambda(lambda):
 				dumped = dumped.append(
@@ -1992,18 +2061,7 @@ private pure func dumped_general_expression(
 					.append(")")
 				on_spine = False
 			ConcurrentBlock(concurrent_block):
-				max_threads: String = match concurrent_block.max_threads:
-					Some(count):
-						count_text(count)
-					None:
-						"-"
-
-				dumped = dumped
-					.append(expression_head("concurrent", current) + " " + max_threads + " ")
-					.dumped_timeout(spellings, depth, concurrent_block.timeout)
-					.append(" ")
-					.dumped_block(spellings, depth, concurrent_block.body)
-					.append(")")
+				dumped = dumped.dumped_concurrent_expression(spellings, depth, current, concurrent_block)
 				on_spine = False
 			Detach(value):
 				dumped = dumped
