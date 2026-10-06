@@ -1,0 +1,123 @@
+-- Assembled modules projected for the frozen parser: the whole program, module
+-- documentation, every item and forward declarations included, equals the
+-- frozen parser's own parse field for field and span for span.
+import:
+	../../../src/compiler/discovery_adapter: legacy_assembled_program
+	../../../src/compiler/stage_02_lex/name_table: EMPTY_NAME_TABLE
+	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../src/compiler/stage_03_parse/parsed_ast_json: parsed_program_to_json
+	../tools/discovery_adapter_comparison: JsonDifference, program_differences, with_holes_parsed
+	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_source
+	../../../src/compiler_new/stage_01_discovery/parse/tree_module_assembly: ModuleAssembly(AssembledModule), assemble_module
+	../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../src/lib/source: source_file
+	test: TestSuite
+
+
+private pure func source_lines(lines: List[String]) -> String:
+	lines.join("\n") + "\n"
+
+
+-- Whether `text` assembles and its projected program equals the frozen
+-- parser's; prints each differing field.
+private func module_matches_old_parser(text: String) -> Bool:
+	source = source_file("/tmp/tree_module_projection.brp", "tree_module_projection", text)
+	old = with_holes_parsed(parse_compiler_source(source))
+	lexed = lex_module(module_id_at_row(0), text)
+	match assemble_module(lexed):
+		Ok(AssembledModule(assembled)):
+			match legacy_assembled_program(source, preview_source(lexed), assembled.syntax, EMPTY_NAME_TABLE):
+				Ok((_, projected)):
+					differences: List[JsonDifference] = program_differences(parsed_program_to_json(old), parsed_program_to_json(projected))
+					for difference in differences:
+						print("${difference.declaration} ${difference.path}: old=${difference.old_text} new=${difference.new_text}")
+					old.diagnostics.is_empty() and differences.is_empty()
+				Err(_):
+					print("projection error: ${text}")
+					False
+		_:
+			print("not assembled: ${text}")
+			False
+
+
+func test_a_module_of_every_item_kind_matches_the_old_parser() -> Bool:
+	module_matches_old_parser(source_lines([
+		"---",
+		"The module.",
+		"---",
+		"import:",
+		"\tlist",
+		"",
+		"---",
+		"A point.",
+		"---",
+		"record Point {",
+		"\tx: Int",
+		"}",
+		"",
+		"union Shape:",
+		"\tDot(Point)",
+		"\tNothing",
+		"",
+		"enum Color:",
+		"\tRed",
+		"",
+		"type alias Points = List[Point]",
+		"",
+		"private LIMIT: Int = 3",
+		"",
+		"trait Sized:",
+		"\tfunc size(self: Self) -> Int",
+		"",
+		"implements Sized for Point:",
+		"\tfunc size(self: Point) -> Int:",
+		"\t\tself.x",
+		"",
+		"func main() -> Int:",
+		"\tLIMIT + 1",
+	]))
+
+
+-- The frozen parser ends a forward declaration at its last dimension
+-- constraint, else its result type, else its `func` keyword.
+func test_forward_declarations_match_the_old_parser_span_for_span() -> Bool:
+	var correct: Bool = True
+	for header in [
+		"func apply(x: Int) -> Int:",
+		"func apply(x: Int):",
+		"private pure func apply(x: Int) -> Int:",
+		"@tail_recursive\nfunc apply(x: Int) -> Int:",
+		"---\nApplies.\n---\nfunc apply(x: Int) -> Int:",
+		"func apply[T](x: T) -> T:",
+		"func apply[#N, #M](x: Int) -> Int where #N == #M + 1:",
+		"func apply[#N, #M](x: Int) where #N == #M, #M == 2:",
+	]:
+		text = source_lines([header, "", "pure func apply(x: Int) -> Int:", "\tx"])
+		if not module_matches_old_parser(text):
+			correct = False
+	correct
+
+
+func test_a_forward_declaration_after_its_implementation_matches_the_old_parser() -> Bool:
+	module_matches_old_parser(source_lines([
+		"pure func apply(x: Int) -> Int:",
+		"\tx",
+		"",
+		"func apply(x: Int) -> Int:",
+	]))
+
+
+func test_an_empty_module_matches_the_old_parser() -> Bool:
+	module_matches_old_parser("")
+
+
+tests: TestSuite = {
+	description = "Tree module projection to the frozen parser",
+	tests = [
+		("a module of every item kind matches the old parser", test_a_module_of_every_item_kind_matches_the_old_parser),
+		("forward declarations match span for span", test_forward_declarations_match_the_old_parser_span_for_span),
+		("a forward declaration after its implementation", test_a_forward_declaration_after_its_implementation_matches_the_old_parser),
+		("an empty module", test_an_empty_module_matches_the_old_parser)
+	]
+}

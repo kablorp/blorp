@@ -1,0 +1,362 @@
+-- Module assembly: a module is a `ModuleSyntax` only when every declaration
+-- is read in full, it has no diagnostic and each forward declaration has a
+-- same-named function with a body; otherwise the outcome says why.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: rejected_diagnostics
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_module_assembly:
+		AssembledSource,
+		ModuleAssembly(AssembledModule, RejectedModule, UnassembledModule),
+		UnassembledReason(FunctionBodyNotRead, DeclarationRejected),
+		assemble_module,
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: FunctionDeclaration
+	../../../../src/compiler_new/stage_01_discovery/syntax/definitions: Definition(FunctionDefinition)
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(Plain)
+	../../../../src/compiler_new/stage_01_discovery/syntax/dump: dumped_module
+	../../../../src/compiler_new/stage_01_discovery/syntax/id_census: id_census
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax:
+		ModuleItem(FunctionItem, GlobalItem, RecordItem, ImportBlockItem, TraitItem, ImplementationItem),
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(UnpairedForwardDeclarationDiagnostic)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end
+	../../support/parser_fixtures: fixture_paths, fixture_text
+	../../support/should_pass_corpus: SHOULD_PASS_DIRECTORIES
+	test: TestSuite
+
+
+STANDARD_LIBRARY_SOURCES: String = "standard_library/src/"
+
+
+private pure func source_lines(lines: List[String]) -> String:
+	lines.join("\n") + "\n"
+
+
+private pure func assembled(text: String) -> Option[ModuleAssembly]:
+	match assemble_module(lex_module(module_id_at_row(0), text)):
+		Ok(assembly):
+			Some(assembly)
+		Err(_):
+			None
+
+
+private pure func accepted(text: String) -> Option[AssembledSource]:
+	match assembled(text):
+		Some(AssembledModule(source)):
+			Some(source)
+		_:
+			None
+
+
+private pure func covers(span: Span, first: Int, last: Int) -> Bool:
+	span.span_start() == first and span.span_end() == last
+
+
+private pure func is_unpaired_forward(diagnostic: SyntaxDiagnostic) -> Bool:
+	match diagnostic:
+		Plain(UnpairedForwardDeclarationDiagnostic):
+			True
+		_:
+			False
+
+
+private pure func census_is_clean(source: AssembledSource) -> Bool:
+	id_census(module_id_at_row(0), source.syntax).is_empty()
+
+
+private pure func functions(source: AssembledSource) -> List[FunctionDeclaration]:
+	var found: List[FunctionDeclaration] = []
+	for item in source.syntax.items:
+		match item:
+			FunctionItem(function):
+				found = found.append(function)
+			_:
+				void
+	found
+
+
+func test_every_kind_of_item_assembles_in_source_order_with_a_clean_census() -> Bool:
+	text = source_lines([
+		"---",
+		"The module.",
+		"---",
+		"import:",
+		"\tlist",
+		"",
+		"record Point {",
+		"\tx: Int",
+		"}",
+		"",
+		"LIMIT: Int = 3",
+		"",
+		"trait Shape:",
+		"\tfunc area(self: Self) -> Int",
+		"",
+		"implements Shape for Point:",
+		"\tfunc area(self: Point) -> Int:",
+		"\t\tself.x",
+		"",
+		"func main() -> Int:",
+		"\tLIMIT + 1",
+	])
+	match accepted(text):
+		Some(source):
+			kinds_in_order: Bool = match source.syntax.items:
+				[ImportBlockItem(_), RecordItem(_), GlobalItem(_), TraitItem(_), ImplementationItem(_), FunctionItem(_)]:
+					True
+				_:
+					False
+			kinds_in_order and source.syntax.documentation.is_some() and source.census_is_clean() and source.syntax.imports.length() == 1
+		None:
+			False
+
+
+func test_an_empty_module_assembles() -> Bool:
+	match accepted(""):
+		Some(source):
+			source.syntax.items.is_empty() and source.syntax.definitions.is_empty() and source.census_is_clean()
+		None:
+			False
+
+
+-- A forward declaration is a function item with no body. Its id comes before
+-- its implementation's, in source order, and its span is its header, through
+-- the colon that promised no body.
+func test_a_forward_declaration_paired_after_it_assembles_without_a_body() -> Bool:
+	text = source_lines([
+		"func apply(x: Int) -> Int:",
+		"",
+		"pure func apply(x: Int) -> Int:",
+		"\tx + 1",
+	])
+	match accepted(text):
+		Some(source):
+			match source.functions():
+				[forward, implementation]:
+					(forward.function.body.is_none() and implementation.function.body.is_some()
+						and forward.span.covers(0, 26)
+						and forward.id.definition_local_index() < implementation.id.definition_local_index()
+						and source.census_is_clean())
+				_:
+					False
+		None:
+			False
+
+
+func test_a_forward_declaration_paired_before_it_assembles() -> Bool:
+	text = source_lines([
+		"func apply(x: Int) -> Int:",
+		"\tx + 1",
+		"",
+		"private pure func apply(x: Int) -> Int:",
+	])
+	match accepted(text):
+		Some(source):
+			source.functions().length() == 2 and source.census_is_clean()
+		None:
+			False
+
+
+func test_two_forward_declarations_share_one_private_body() -> Bool:
+	text = source_lines([
+		"func apply(x: Int) -> Int:",
+		"",
+		"private func apply(x: Int) -> Int:",
+		"",
+		"private pure func apply(x: Int) -> Int:",
+		"\tx",
+	])
+	match accepted(text):
+		Some(source):
+			source.functions().length() == 3 and source.census_is_clean()
+		None:
+			False
+
+
+-- Visibility does not exempt a forward declaration from pairing.
+func test_a_private_unpaired_forward_declaration_rejects_the_module() -> Bool:
+	match assembled(source_lines(["private func lonely() -> Int:"])):
+		Some(RejectedModule(rejected)):
+			match rejected.rejected_diagnostics():
+				[only]:
+					only.diagnostic.is_unpaired_forward() and only.span.covers(13, 19)
+				_:
+					False
+		_:
+			False
+
+
+func test_an_unpaired_forward_declaration_rejects_the_module_at_its_name() -> Bool:
+	text = source_lines([
+		"func lonely(x: Int) -> Int:",
+		"",
+		"func other() -> Int:",
+		"\t1",
+	])
+	match assembled(text):
+		Some(RejectedModule(rejected)):
+			match rejected.rejected_diagnostics():
+				[only]:
+					only.diagnostic.is_unpaired_forward() and only.span.covers(5, 11)
+				_:
+					False
+		_:
+			False
+
+
+-- Two forward declarations with no implementation are both reported, in
+-- source order, as the table path and the frozen parser report them.
+func test_every_unpaired_forward_declaration_is_reported() -> Bool:
+	text = source_lines(["func a() -> Int:", "", "func b() -> Int:"])
+	match assembled(text):
+		Some(RejectedModule(rejected)):
+			match rejected.rejected_diagnostics():
+				[first, second]:
+					first.diagnostic.is_unpaired_forward() and first.span.covers(5, 6) and second.span.covers(23, 24)
+				_:
+					False
+		_:
+			False
+
+
+-- A module whose lexer reported a diagnostic is rejected even when every
+-- declaration completed, and pairing is not checked: an earlier error can
+-- itself leave a header without its body.
+func test_a_lexer_diagnostic_rejects_a_module_whose_declarations_completed() -> Bool:
+	text = source_lines([
+		"func lonely() -> Int:",
+		"",
+		"func f() -> String:",
+		"\t\"\\q\"",
+	])
+	match assembled(text):
+		Some(RejectedModule(rejected)):
+			diagnostics = rejected.rejected_diagnostics()
+			not diagnostics.is_empty() and diagnostics.all(pure func(found): not found.diagnostic.is_unpaired_forward())
+		_:
+			False
+
+
+func test_a_body_the_tree_parser_does_not_read_leaves_the_module_unassembled() -> Bool:
+	text = source_lines([
+		"func f(x: Int) -> Int:",
+		"\tx",
+		"",
+		"func g(x: Int) -> Int:",
+		"\tinto_opaque Count(x)",
+	])
+	match assembled(text):
+		Some(UnassembledModule(FunctionBodyNotRead(preview))):
+			preview.header.signature.name.span.covers(32, 33)
+		_:
+			False
+
+
+func test_a_rejected_declaration_leaves_the_module_unassembled() -> Bool:
+	text = source_lines(["record Broken {", "\tx Int", "}"])
+	match assembled(text):
+		Some(UnassembledModule(DeclarationRejected)):
+			True
+		_:
+			False
+
+
+-- Pairing reads each function once and looks names up in a set, so a module
+-- of many functions and forward declarations assembles in linear time.
+func test_two_thousand_functions_and_their_forward_declarations_assemble() -> Bool:
+	var lines: List[String] = []
+	for index in 0..1000:
+		lines = lines.append("func f${index}(x: Int) -> Int:")
+		lines = lines.append("")
+	for index in 0..1000:
+		lines = lines.append("func f${index}(x: Int) -> Int:")
+		lines = lines.append("\tx + ${index}")
+	match accepted(source_lines(lines)):
+		Some(source):
+			source.syntax.items.length() == 2000 and source.syntax.definitions.length() == 2000 and source.census_is_clean()
+		None:
+			False
+
+
+-- The definitions index holds the record each item holds, at its id.
+func test_the_definitions_index_holds_each_function_at_its_id() -> Bool:
+	text = source_lines(["func a() -> Int:", "\t1", "", "func b() -> Int:", "\t2"])
+	match accepted(text):
+		Some(source):
+			source
+				.functions()
+				.all(pure func(function):
+					match source.syntax.definitions.get(function.id.definition_local_index()):
+						Some(FunctionDefinition(indexed)):
+							indexed.id.definition_local_index() == function.id.definition_local_index() and indexed.span.covers(function.span.span_start(), function.span.span_end())
+						_:
+							False
+				)
+		None:
+			False
+
+
+func test_an_assembled_module_dumps() -> Bool:
+	text = source_lines(["func a() -> Int:", "", "func a() -> Int:", "\t1"])
+	match accepted(text):
+		Some(source):
+			dumped = dumped_module(source.syntax, source.spellings)
+			dumped.starts_with("(module") and dumped.split("(function ").length() == 3
+		None:
+			False
+
+
+-- The census of section 4.6 as a corpus test of this gate: every module of
+-- the should_pass corpus and the standard library that assembles holds each
+-- id it issued exactly once, and none is rejected. Modules the tree parser
+-- does not read in full yet are skipped; at least one must assemble, so the
+-- test cannot pass by reading nothing.
+func test_every_assembled_corpus_module_passes_the_census() -> Bool:
+	var assembled_count: Int = 0
+	var correct: Bool = True
+
+	for directory in SHOULD_PASS_DIRECTORIES.append(STANDARD_LIBRARY_SOURCES):
+		match fixture_paths(directory):
+			Ok(paths):
+				for path in paths:
+					match assemble_module(lex_module(module_id_at_row(0), fixture_text(path))):
+						Ok(AssembledModule(source)):
+							assembled_count += 1
+							if not source.census_is_clean():
+								print("census problems: ${path}")
+								correct = False
+						Ok(RejectedModule(_)):
+							print("rejected by the tree path: ${path}")
+							correct = False
+						Ok(UnassembledModule(_)):
+							void
+						Err(_):
+							print("lexed input refused: ${path}")
+							correct = False
+			Err(message):
+				print(message)
+				correct = False
+
+	correct and assembled_count > 0
+
+
+tests: TestSuite = {
+	description = "Tree module assembly and forward pairing",
+	tests = [
+		("every kind of item assembles in source order", test_every_kind_of_item_assembles_in_source_order_with_a_clean_census),
+		("an empty module assembles", test_an_empty_module_assembles),
+		("a forward declaration paired after it assembles", test_a_forward_declaration_paired_after_it_assembles_without_a_body),
+		("a forward declaration paired before it assembles", test_a_forward_declaration_paired_before_it_assembles),
+		("two forward declarations share one private body", test_two_forward_declarations_share_one_private_body),
+		("a private unpaired forward declaration rejects the module", test_a_private_unpaired_forward_declaration_rejects_the_module),
+		("an unpaired forward declaration rejects the module", test_an_unpaired_forward_declaration_rejects_the_module_at_its_name),
+		("every unpaired forward declaration is reported", test_every_unpaired_forward_declaration_is_reported),
+		("a lexer diagnostic rejects a completed module", test_a_lexer_diagnostic_rejects_a_module_whose_declarations_completed),
+		("an unread body leaves the module unassembled", test_a_body_the_tree_parser_does_not_read_leaves_the_module_unassembled),
+		("a rejected declaration leaves the module unassembled", test_a_rejected_declaration_leaves_the_module_unassembled),
+		("2000 functions and forward declarations", test_two_thousand_functions_and_their_forward_declarations_assemble),
+		("the definitions index holds each function at its id", test_the_definitions_index_holds_each_function_at_its_id),
+		("an assembled module dumps", test_an_assembled_module_dumps),
+		("every assembled corpus module passes the census", test_every_assembled_corpus_module_passes_the_census)
+	]
+}

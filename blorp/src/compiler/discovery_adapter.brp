@@ -35,7 +35,7 @@ import:
 	../compiler_new/stage_01_discovery/parse/tree_implementation_parser: ImplementationPreview
 	../compiler_new/stage_01_discovery/tables/token as PreviewTokens
 	../compiler_new/stage_01_discovery/parse/tree_global_header_parser: GlobalHeaderPreview, DeferredInitializerStart
-	../compiler_new/stage_01_discovery/syntax/module_syntax: Documentation
+	../compiler_new/stage_01_discovery/syntax/module_syntax as TreeModule
 	../compiler_new/stage_01_discovery/syntax/checked_values: parent_step_count, positive_count_value, written_digits
 	../compiler_new/stage_01_discovery/syntax/imports as TreeImports
 	../compiler_new/stage_01_discovery/syntax/foreign_blocks as TreeForeign
@@ -112,7 +112,7 @@ import:
 		PackageRow,
 		RowRange,
 		SignatureRow,
-	../compiler_new/stage_01_discovery/tables/span: Span, span_end, span_start
+	../compiler_new/stage_01_discovery/tables/span: Span, span_covering, span_end, span_start
 	../lib/source:
 		SourceFile,
 		SourceLocation,
@@ -4376,11 +4376,7 @@ pure func legacy_declaration_projection(
 				failure = Some(error)
 				break
 
-	module_doc: Option[ParsedModuleDoc] = match scan.documentation:
-		None:
-			None
-		Some(documentation):
-			Some({ text = documentation.text, span = legacy_location(documentation.span) })
+	module_doc: Option[ParsedModuleDoc] = legacy_module_documentation(scan.documentation)
 	-- Only select the scan's global stop after all completed declarations. An
 	-- earlier deferred declaration owns the boundary and excludes later names.
 	stop_translation: Result[(NameTable, LegacyDeclarationProjectionStop), LegacyDeclarationPreviewError] = match failure:
@@ -4411,61 +4407,86 @@ pure func legacy_declaration_projection(
 	Ok({ module_doc = module_doc, declarations = declarations, names = projected_names, stop = stop })
 
 
+private pure func legacy_module_documentation(documentation: Option[TreeModule.Documentation]) -> Option[ParsedModuleDoc]:
+	match documentation:
+		Some(written):
+			Some({ text = written.text, span = legacy_location(written.span) })
+		None:
+			None
+
+
+---
+The existing parser's program for an assembled module: its documentation and
+every item in source order, with no diagnostic, since only a module with none
+assembles. `file` is the program's source file, which module naming outside
+the tree decides. The shared legacy name table is threaded through the items
+in written order, so one table can serve every module of a run.
+---
+pure func legacy_assembled_program(
+	file: SourceFile, source: PreviewSource, syntax: TreeModule.ModuleSyntax, names: NameTable,
+) -> Result[(NameTable, ParsedProgram), LegacyDeclarationPreviewError]:
+	var extended: NameTable = names
+	var declarations: List[ParsedDecl] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+
+	for item in syntax.items:
+		match legacy_module_item(source, extended, item):
+			Ok((after_item, declaration)):
+				extended = after_item
+				declarations = declarations.append(declaration)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok((extended, {
+				source = file, module_doc = legacy_module_documentation(syntax.documentation),
+				decls = declarations, diagnostics = []
+			}))
+
+
+-- One complete item, the same translation the declaration prefix uses.
+private pure func legacy_module_item(
+	source: PreviewSource, names: NameTable, item: TreeModule.ModuleItem,
+) -> Result[(NameTable, ParsedDecl), LegacyDeclarationPreviewError]:
+	match item:
+		TreeModule.FunctionItem(declaration):
+			preview_completed_function(source, names, declaration)
+		TreeModule.GlobalItem(declaration):
+			preview_completed_global(source, names, declaration)
+		TreeModule.RecordItem(declaration):
+			preview_record_declaration(source, names, declaration)
+		TreeModule.UnionItem(declaration):
+			preview_union_declaration(source, names, declaration)
+		TreeModule.EnumItem(declaration):
+			preview_enum_declaration(source, names, declaration)
+		TreeModule.AliasItem(declaration):
+			preview_alias_declaration(source, names, declaration)
+		TreeModule.BuiltinTypeItem(declaration):
+			preview_builtin_declaration(source, names, declaration)
+		TreeModule.ResourceTypeItem(declaration):
+			preview_resource_declaration(source, names, declaration)
+		TreeModule.TraitItem(declaration):
+			preview_completed_trait(source, names, declaration)
+		TreeModule.ImplementationItem(declaration):
+			preview_completed_implementation(source, names, declaration)
+		TreeModule.ImportBlockItem(block):
+			Ok(preview_import_block(source, names, block))
+		TreeModule.ForeignBlockItem(block):
+			preview_foreign_block(source, names, block)
+
+
 private pure func preview_declaration(
 	source: PreviewSource, names: NameTable, preview: TreePreviews.DeclarationPreview,
 ) -> Result[PreviewDeclarationProjection, LegacyDeclarationPreviewError]:
 	match preview:
-		TreePreviews.GlobalDeclarationPreview(declaration):
-			translated ?= preview_completed_global(source, names, declaration)
-			(extended, parsed) = translated
-			Ok(CompletedPreviewDeclaration(extended, parsed))
-		TreePreviews.RecordDeclarationPreview(declaration):
-			translated ?= preview_record_declaration(source, names, declaration)
-			(extended, parsed) = translated
-			Ok(CompletedPreviewDeclaration(extended, parsed))
-		TreePreviews.AliasDeclarationPreview(declaration):
-			translated ?= preview_alias_declaration(source, names, declaration)
-			(extended, parsed) = translated
-			Ok(CompletedPreviewDeclaration(extended, parsed))
-		TreePreviews.BuiltinTypeDeclarationPreview(declaration):
-			translated ?= preview_builtin_declaration(source, names, declaration)
-			(extended, parsed) = translated
-			Ok(CompletedPreviewDeclaration(extended, parsed))
-		TreePreviews.ResourceTypeDeclarationPreview(declaration):
-			translated ?= preview_resource_declaration(source, names, declaration)
-			(extended, parsed) = translated
-			Ok(CompletedPreviewDeclaration(extended, parsed))
-		TreePreviews.UnionDeclarationPreview(declaration):
-			translated ?= preview_union_declaration(source, names, declaration)
-			(extended, parsed) = translated
-			Ok(CompletedPreviewDeclaration(extended, parsed))
-		TreePreviews.EnumDeclarationPreview(declaration):
-			translated ?= preview_enum_declaration(source, names, declaration)
-			(extended, parsed) = translated
-			Ok(CompletedPreviewDeclaration(extended, parsed))
-		TreePreviews.ImportBlockDeclarationPreview(block):
-			(extended, parsed) = preview_import_block(source, names, block)
-			Ok(CompletedPreviewDeclaration(extended, parsed))
-		TreePreviews.ForeignBlockDeclarationPreview(block):
-			translated ?= preview_foreign_block(source, names, block)
-			(extended, parsed) = translated
-			Ok(CompletedPreviewDeclaration(extended, parsed))
 		TreePreviews.FunctionDeclarationPreview(preview):
 			translated ?= preview_function_header(source, names, preview)
 			(extended, header) = translated
 			Ok(DeferredPreviewDeclaration(extended, StoppedAtFunctionHeader(header)))
-		TreePreviews.CompletedFunctionPreview(declaration):
-			translated ?= preview_completed_function(source, names, declaration)
-			(extended, parsed) = translated
-			Ok(CompletedPreviewDeclaration(extended, parsed))
-		TreePreviews.CompletedTraitPreview(declaration):
-			translated ?= preview_completed_trait(source, names, declaration)
-			(extended, parsed) = translated
-			Ok(CompletedPreviewDeclaration(extended, parsed))
-		TreePreviews.CompletedImplementationPreview(declaration):
-			translated ?= preview_completed_implementation(source, names, declaration)
-			(extended, parsed) = translated
-			Ok(CompletedPreviewDeclaration(extended, parsed))
 		TreePreviews.TraitDeclarationPreview(preview):
 			translated ?= preview_trait_header(source, names, preview)
 			(extended, header) = translated
@@ -4474,6 +4495,38 @@ private pure func preview_declaration(
 			translated ?= preview_implementation_header(source, names, preview)
 			(extended, header) = translated
 			Ok(DeferredPreviewDeclaration(extended, StoppedAtImplementationPreview(header)))
+		TreePreviews.GlobalDeclarationPreview(declaration):
+			completed_preview(source, names, TreeModule.GlobalItem(declaration))
+		TreePreviews.RecordDeclarationPreview(declaration):
+			completed_preview(source, names, TreeModule.RecordItem(declaration))
+		TreePreviews.AliasDeclarationPreview(declaration):
+			completed_preview(source, names, TreeModule.AliasItem(declaration))
+		TreePreviews.BuiltinTypeDeclarationPreview(declaration):
+			completed_preview(source, names, TreeModule.BuiltinTypeItem(declaration))
+		TreePreviews.ResourceTypeDeclarationPreview(declaration):
+			completed_preview(source, names, TreeModule.ResourceTypeItem(declaration))
+		TreePreviews.UnionDeclarationPreview(declaration):
+			completed_preview(source, names, TreeModule.UnionItem(declaration))
+		TreePreviews.EnumDeclarationPreview(declaration):
+			completed_preview(source, names, TreeModule.EnumItem(declaration))
+		TreePreviews.ImportBlockDeclarationPreview(block):
+			completed_preview(source, names, TreeModule.ImportBlockItem(block))
+		TreePreviews.ForeignBlockDeclarationPreview(block):
+			completed_preview(source, names, TreeModule.ForeignBlockItem(block))
+		TreePreviews.CompletedFunctionPreview(declaration):
+			completed_preview(source, names, TreeModule.FunctionItem(declaration))
+		TreePreviews.CompletedTraitPreview(declaration):
+			completed_preview(source, names, TreeModule.TraitItem(declaration))
+		TreePreviews.CompletedImplementationPreview(declaration):
+			completed_preview(source, names, TreeModule.ImplementationItem(declaration))
+
+
+private pure func completed_preview(
+	source: PreviewSource, names: NameTable, item: TreeModule.ModuleItem,
+) -> Result[PreviewDeclarationProjection, LegacyDeclarationPreviewError]:
+	translated ?= legacy_module_item(source, names, item)
+	(extended, declaration) = translated
+	Ok(CompletedPreviewDeclaration(extended, declaration))
 
 
 private pure func preview_completed_global(
@@ -4860,11 +4913,33 @@ private pure func preview_completed_function(
 	(after_header, header) = translated
 	translated_body ?= legacy_optional_body_preview(source, after_header, function.body)
 	(after_body, body) = translated_body
-	Ok((after_body, preview_visibility(FunctionParsedDecl({
+	location: SourceLocation = legacy_function_location(declaration)
+	Ok((after_body, preview_visibility_at(FunctionParsedDecl({
 		name = header.name, keyword_span = header.keyword_span, type_params = header.type_params, params = header.params,
 		return_type = header.return_type, dim_constraints = header.dim_constraints, body = body, is_pure = header.is_pure,
-		annotations = header.annotations, doc = header.doc, span = legacy_location(declaration.span)
-	}), declaration.visibility, declaration.span)))
+		annotations = header.annotations, doc = header.doc, span = location
+	}), declaration.visibility, location)))
+
+
+-- The frozen parser ends a forward declaration at its last dimension
+-- constraint, else its written result type, else its `func` keyword; the
+-- tree's header span reaches the colon, which the frozen span never covers.
+private pure func legacy_function_location(declaration: TreeDeclarations.FunctionDeclaration) -> SourceLocation:
+	function = declaration.function
+	match function.body:
+		Some(_):
+			legacy_location(declaration.span)
+		None:
+			last_written: Span = match function.constraints.last():
+				Some(constraint):
+					constraint.span
+				None:
+					match function.signature.return_type:
+						Some(result):
+							result.span
+						None:
+							function.signature.keyword
+			legacy_location(declaration.span.span_covering(last_written))
 
 
 -- A completed trait: its header as for a deferred one, each method's header
@@ -5770,16 +5845,20 @@ private pure func preview_dimension_constraint(
 	Ok((extended, { left = left, right = right, span = legacy_location(constraint.span) }))
 
 
-private pure func preview_documentation(documentation: Option[Documentation]) -> Option[String]:
+private pure func preview_documentation(documentation: Option[TreeModule.Documentation]) -> Option[String]:
 	documentation.map(pure func(written): written.text)
 
 
 private pure func preview_visibility(declaration: ParsedDecl, visibility: Kinds.Visibility, span: Span) -> ParsedDecl:
+	preview_visibility_at(declaration, visibility, legacy_location(span))
+
+
+private pure func preview_visibility_at(declaration: ParsedDecl, visibility: Kinds.Visibility, location: SourceLocation) -> ParsedDecl:
 	match visibility:
 		Kinds.PublicVisibility:
 			declaration
 		Kinds.PrivateVisibility:
-			PrivateParsedDecl(declaration, legacy_location(span))
+			PrivateParsedDecl(declaration, location)
 
 
 private pure func preview_import_block(

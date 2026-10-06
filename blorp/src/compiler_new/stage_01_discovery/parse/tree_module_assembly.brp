@@ -1,0 +1,217 @@
+-- Module assembly (`docs/DISCOVERY_REDESIGN.md`, sections 3.4, 3.17 and 4.6):
+-- one module's syntax, accepted whole or not at all.
+--
+-- The module is read by the body-completing declaration scan. It becomes a
+-- `ModuleSyntax` only when the scan reached the end of the source, every
+-- declaration it read is complete syntax, the module has no diagnostic and
+-- each forward declaration is paired. Anything else is an explicit outcome
+-- with no partial tree: a module the tree parser did not finish reading says
+-- where it stopped, and a module it read with a diagnostic is rejected with
+-- the mint's indexes kept for its diagnostics (section 3.17).
+--
+-- Test-only until M5 puts the tree path behind the stage's module walk.
+import:
+	../lex/lexed_module: LexedModule
+	../syntax/diagnostics: SyntaxDiagnostic(Plain)
+	../syntax/ids: SpellingId
+	../syntax/module_syntax:
+		ModuleSyntax,
+		ModuleItem(
+			FunctionItem, GlobalItem, RecordItem, UnionItem, EnumItem, AliasItem, BuiltinTypeItem,
+			ResourceTypeItem, TraitItem, ImplementationItem, ImportBlockItem, ForeignBlockItem,
+		),
+	../syntax/spellings: Spellings
+	../tables/diagnostic_code: PlainSyntaxCode(UnpairedForwardDeclarationDiagnostic)
+	parse_state: ParseState, ParseInputError, new_parse_state, diagnostic_count, issued_ids, report_diagnostic, spellings
+	rejected_preview: RejectedPreview, reject_preview
+	tree_declaration_preview_parser:
+		DeclarationPreview(
+			GlobalDeclarationPreview, RecordDeclarationPreview, AliasDeclarationPreview,
+			BuiltinTypeDeclarationPreview, ResourceTypeDeclarationPreview, UnionDeclarationPreview,
+			EnumDeclarationPreview, ImportBlockDeclarationPreview, ForeignBlockDeclarationPreview,
+			FunctionDeclarationPreview, CompletedFunctionPreview, CompletedTraitPreview,
+			CompletedImplementationPreview, TraitDeclarationPreview, ImplementationDeclarationPreview,
+		),
+	tree_function_header_parser: FunctionHeaderPreview
+	tree_global_header_parser: GlobalHeaderPreview, DeferredInitializerStart
+	tree_implementation_parser: ImplementationPreview
+	tree_module_declaration_scan:
+		ModuleDeclarationPreviewScan,
+		ModuleDeclarationScanStop(
+			ReachedEndOfSource, StoppedAtGlobalInitializer, StoppedAtRejectedGlobalInitializer,
+			StoppedAtRejectedDeclaration, StoppedWithoutDeclarationProgress,
+		),
+		scan_module_declaration_prefix_with_bodies,
+	tree_trait_parser: TraitPreview
+
+
+---
+What reading one module produced. Exactly one module outcome; the spellings
+travel only with an assembled module, since a rejection owns its own.
+---
+union ModuleAssembly:
+	AssembledModule(AssembledSource)
+	RejectedModule(RejectedPreview)
+	UnassembledModule(UnassembledReason)
+
+
+---
+An accepted module: its syntax, and the module's final spellings, which the
+parse grows past the lexer's when it lexes an interpolation hole.
+---
+record AssembledSource {
+	syntax: ModuleSyntax,
+	spellings: Spellings
+}
+
+
+---
+Where the tree parser stopped reading a module, at its first unread
+declaration in source order. The module may be accepted or rejected by the
+existing parser; the tree path does not decide it yet.
+---
+union UnassembledReason:
+	FunctionBodyNotRead(FunctionHeaderPreview)
+	TraitBodiesNotRead(TraitPreview)
+	ImplementationBodiesNotRead(ImplementationPreview)
+	GlobalInitializerNotRead(GlobalHeaderPreview)
+	GlobalInitializerRejected(DeferredInitializerStart)
+	DeclarationRejected
+	DeclarationMadeNoProgress
+
+
+---
+Reads one module with its one mint. `Err` holds the reason the parse state
+refused the lexed input, which the lexer never produces; rejection itself
+cannot fail, since a module is rejected only once it holds a diagnostic.
+---
+pure func assemble_module(lexed: LexedModule) -> Result[ModuleAssembly, ParseInputError]:
+	entry ?= new_parse_state(lexed)
+	(scanned, scan) = scan_module_declaration_prefix_with_bodies(entry)
+	match module_items(scan):
+		Err(reason):
+			Ok(UnassembledModule(reason))
+		Ok(items):
+			-- Pairing waits for a module with no other diagnostic: an earlier
+			-- error can itself leave a header without its body.
+			checked: ParseState = if scanned.diagnostic_count() == 0:
+				scanned.report_unpaired_forward_declarations(items)
+			else:
+				scanned
+			if checked.diagnostic_count() != 0:
+				rejected ?= reject_preview(checked)
+				Ok(RejectedModule(rejected))
+			else:
+				issued = checked.issued_ids()
+				Ok(AssembledModule({
+					syntax = {
+						documentation = scan.documentation,
+						items = items,
+						definitions = issued.definitions,
+						imports = issued.imports,
+						counts = issued.counts
+					},
+					spellings = checked.spellings()
+				}))
+
+
+-- The scan's declarations as items when it read them all to the end of the
+-- source; otherwise the first declaration it did not read, then its stop.
+private pure func module_items(scan: ModuleDeclarationPreviewScan) -> Result[List[ModuleItem], UnassembledReason]:
+	var items: List[ModuleItem] = []
+	var unread: Option[UnassembledReason] = None
+
+	for declaration in scan.declarations:
+		match module_item(declaration):
+			Ok(item):
+				items = items.append(item)
+			Err(reason):
+				unread = Some(reason)
+				break
+
+	match unread:
+		Some(reason):
+			Err(reason)
+		None:
+			match scan.stop:
+				ReachedEndOfSource:
+					Ok(items)
+				StoppedAtGlobalInitializer(preview):
+					Err(GlobalInitializerNotRead(preview))
+				StoppedAtRejectedGlobalInitializer(start):
+					Err(GlobalInitializerRejected(start))
+				StoppedAtRejectedDeclaration:
+					Err(DeclarationRejected)
+				StoppedWithoutDeclarationProgress:
+					Err(DeclarationMadeNoProgress)
+
+
+-- One scanned declaration as a module item, or the reason it is not one.
+private pure func module_item(declaration: DeclarationPreview) -> Result[ModuleItem, UnassembledReason]:
+	match declaration:
+		GlobalDeclarationPreview(global):
+			Ok(GlobalItem(global))
+		RecordDeclarationPreview(record_declaration):
+			Ok(RecordItem(record_declaration))
+		AliasDeclarationPreview(alias_declaration):
+			Ok(AliasItem(alias_declaration))
+		BuiltinTypeDeclarationPreview(builtin_type):
+			Ok(BuiltinTypeItem(builtin_type))
+		ResourceTypeDeclarationPreview(resource_type):
+			Ok(ResourceTypeItem(resource_type))
+		UnionDeclarationPreview(union_declaration):
+			Ok(UnionItem(union_declaration))
+		EnumDeclarationPreview(enum_declaration):
+			Ok(EnumItem(enum_declaration))
+		ImportBlockDeclarationPreview(block):
+			Ok(ImportBlockItem(block))
+		ForeignBlockDeclarationPreview(block):
+			Ok(ForeignBlockItem(block))
+		CompletedFunctionPreview(function):
+			Ok(FunctionItem(function))
+		CompletedTraitPreview(trait_declaration):
+			Ok(TraitItem(trait_declaration))
+		CompletedImplementationPreview(implementation):
+			Ok(ImplementationItem(implementation))
+		FunctionDeclarationPreview(preview):
+			Err(FunctionBodyNotRead(preview))
+		TraitDeclarationPreview(preview):
+			Err(TraitBodiesNotRead(preview))
+		ImplementationDeclarationPreview(preview):
+			Err(ImplementationBodiesNotRead(preview))
+
+
+---
+Forward pairing. A top-level function with no body is a forward declaration:
+the standard library writes a higher-order function's impure and pure
+signatures twice, and only one of them has the body. It is accepted only when
+a top-level function of the same name in the module has one, before or after
+it and of either visibility, as the table path pairs them. Otherwise
+`UnpairedForwardDeclarationDiagnostic` is reported at its name, in source
+order. The pairing is checked by name and stores no link: resolution binds
+both declarations by their names, and spellings are interned per module, so
+the same name is the same `SpellingId`.
+---
+private pure func report_unpaired_forward_declarations(state: ParseState, items: List[ModuleItem]) -> ParseState:
+	var names_with_body: Set[SpellingId] = {}
+
+	for item in items:
+		match item:
+			FunctionItem(declaration):
+				if declaration.function.body.is_some():
+					names_with_body = names_with_body.add(declaration.function.signature.name.spelling)
+			_:
+				void
+
+	var out: ParseState = state
+
+	for item in items:
+		match item:
+			FunctionItem(declaration):
+				name = declaration.function.signature.name
+				if declaration.function.body.is_none() and not names_with_body.contains(name.spelling):
+					out = out.report_diagnostic(name.span, Plain(UnpairedForwardDeclarationDiagnostic))
+			_:
+				void
+
+	out

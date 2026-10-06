@@ -46,6 +46,21 @@
 --   tree-prefix-skipped <path> | <reason>
 --   tree-prefix-error <path> | <source|input|projection> | <message>
 --
+-- The tree module protocol assembles each module the old parser accepts
+-- (`tree_module_assembly.brp`), runs the id census over every assembled
+-- module and compares its whole projected program with the old one, field by
+-- field and span by span, through one shared legacy name table per run:
+--
+--   tree-module-difference <path> | <declaration> | <json path> | old=<value> | new=<value>
+--   tree-module-rejected <path> | <diagnostic count>
+--   tree-module-skipped <path> | <reason>
+--   tree-module-error <path> | <source|input|census|projection> | <message>
+--   tree-module-summary modules=<n> assembled=<n> rejected=<n> unassembled=<n> skipped=<n> errors=<n> differences=<n> reported=<n> <stop>=<n>...
+--
+-- A module the tree path did not read in full is counted by where it stopped;
+-- one the tree path rejects although the old parser accepts it is a
+-- `tree-module-rejected` line. Errors exit 4.
+--
 -- At most MAX_DIFFERENCES_PER_MODULE tree differences are printed per module.
 -- `tree-prefix-summary` counts every difference in `differences`, emitted
 -- lines in `reported`, compared declarations, and per-module distinct kind
@@ -65,6 +80,7 @@ import:
 		DeclarationReader,
 		LegacyAdapterError,
 		LegacyDeclarationPreviewError(MissingDimensionLiteralToken, MissingVariadicWildcardToken, InvalidGlobalInitializerEntry, UnsupportedGlobalInitializerExpression, MissingIntegerLiteralToken, UnsupportedBodyStatement, MissingPatternNumberToken),
+		legacy_assembled_program,
 		legacy_declaration_projection,
 		LegacyModuleNaming,
 		legacy_adapter_error_message,
@@ -78,11 +94,29 @@ import:
 	../../../src/compiler/stage_03_parse/parsed_ast: ParsedProgram
 	../../../src/compiler/stage_03_parse/parsed_ast_json: parsed_program_to_json
 	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
-	../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state, span_start_line
+	../../../src/compiler_new/stage_01_discovery/parse/parse_state:
+		ParseInputError(EmptyRejection, InvalidLineStarts, InvalidTokenInput, NonLexicalDiagnostic),
+		new_parse_state,
+		span_start_line,
 	../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_source
 	../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser: DeclarationPreview(CompletedFunctionPreview, CompletedTraitPreview, CompletedImplementationPreview)
 	../../../src/compiler_new/stage_01_discovery/parse/stop_reason: StopReason
 	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan: DeclinedKind, scan_module_declaration_prefix_with_bodies
+	../../../src/compiler_new/stage_01_discovery/parse/tree_module_assembly:
+		ModuleAssembly(AssembledModule, RejectedModule, UnassembledModule),
+		UnassembledReason(
+			FunctionBodyNotRead, TraitBodiesNotRead, ImplementationBodiesNotRead, GlobalInitializerNotRead,
+			GlobalInitializerRejected, DeclarationRejected, DeclarationMadeNoProgress,
+		),
+		assemble_module,
+	../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: rejected_diagnostics
+	../../../src/compiler_new/stage_01_discovery/syntax/id_census:
+		CensusProblem(IdHeldTwice, IdNotHeld, IdNotIssued, IdOfAnotherModule),
+		IdFamily(
+			DefinitionIds, ImportIds, StatementIds, BlockIds, ExpressionIds, PatternIds, WrittenTypeIds,
+			DimensionIds, NameUseIds, BinderIds, TypeBinderIds,
+		),
+		id_census,
 	../../../src/compiler_new/stage_01_discovery/tables/span: span_start, span_end
 	../../../src/compiler_new/stage_01_discovery/pipeline:
 		ImplicitModules,
@@ -152,6 +186,10 @@ everywhere is one problem, not hundreds of lines.
 MAX_DIFFERENCES_PER_MODULE: Int = 40
 
 
+-- Why a module is not compared; `scripts/compiler-new-parity` reads it.
+EXISTING_PARSER_REJECTED: String = "rejected by the existing parser"
+
+
 -- The comparison of one module.
 union ModuleComparison:
 	ModuleCompared(Int, List[JsonDifference])
@@ -182,8 +220,154 @@ enum TreePrefixErrorStage:
 
 record ModuleComparisons {
 	adapter: ModuleComparison,
-	tree: TreePrefixModuleComparison
+	tree: TreePrefixModuleComparison,
+	module_tree: TreeModuleComparison
 }
+
+
+-- The whole-module tree comparison of one module. Only a compared module
+-- carries names to advance the run's shared table.
+union TreeModuleComparison:
+	TreeModuleCompared(NameTable, List[JsonDifference])
+	TreeModuleRejected(Int)
+	TreeModuleUnassembled(UnassembledReason)
+	TreeModuleSkipped(String)
+	TreeModuleError(TreeModuleErrorStage, String)
+
+
+enum TreeModuleErrorStage:
+	TreeModuleSourceError
+	TreeModuleInputError
+	TreeModuleCensusError
+	TreeModuleProjectionError
+
+
+-- Modules the tree path did not read in full, by where it stopped first.
+record TreeModuleStopCounts {
+	function_body: Int,
+	trait_bodies: Int,
+	implementation_bodies: Int,
+	global_initializer: Int,
+	rejected_global_initializer: Int,
+	rejected_declaration: Int,
+	without_progress: Int
+}
+
+
+record TreeModuleCounts {
+	assembled: Int,
+	rejected: Int,
+	unassembled: Int,
+	skipped: Int,
+	errors: Int,
+	differences: Int,
+	reported: Int,
+	stops: TreeModuleStopCounts
+}
+
+
+private EMPTY_TREE_MODULE_COUNTS: TreeModuleCounts = {
+	assembled = 0, rejected = 0, unassembled = 0, skipped = 0, errors = 0, differences = 0, reported = 0,
+	stops = {
+		function_body = 0, trait_bodies = 0, implementation_bodies = 0, global_initializer = 0,
+		rejected_global_initializer = 0, rejected_declaration = 0, without_progress = 0
+	}
+}
+
+
+pure func count_tree_module_stop(counts: TreeModuleStopCounts, reason: UnassembledReason) -> TreeModuleStopCounts:
+	match reason:
+		FunctionBodyNotRead(_):
+			{ counts | function_body = counts.function_body + 1 }
+		TraitBodiesNotRead(_):
+			{ counts | trait_bodies = counts.trait_bodies + 1 }
+		ImplementationBodiesNotRead(_):
+			{ counts | implementation_bodies = counts.implementation_bodies + 1 }
+		GlobalInitializerNotRead(_):
+			{ counts | global_initializer = counts.global_initializer + 1 }
+		GlobalInitializerRejected(_):
+			{ counts | rejected_global_initializer = counts.rejected_global_initializer + 1 }
+		DeclarationRejected:
+			{ counts | rejected_declaration = counts.rejected_declaration + 1 }
+		DeclarationMadeNoProgress:
+			{ counts | without_progress = counts.without_progress + 1 }
+
+
+pure func tree_module_error_stage_label(stage: TreeModuleErrorStage) -> String:
+	match stage:
+		TreeModuleSourceError: "source"
+		TreeModuleInputError: "input"
+		TreeModuleCensusError: "census"
+		TreeModuleProjectionError: "projection"
+
+
+pure func census_problem_text(problem: CensusProblem) -> String:
+	match problem:
+		IdHeldTwice(family, index):
+			"${id_family_label(family)} ${index} held twice"
+		IdNotHeld(family, index):
+			"${id_family_label(family)} ${index} issued and not held"
+		IdNotIssued(family, index):
+			"${id_family_label(family)} ${index} held and not issued"
+		IdOfAnotherModule(family, _, index):
+			"${id_family_label(family)} ${index} of another module"
+
+
+pure func id_family_label(family: IdFamily) -> String:
+	match family:
+		DefinitionIds: "definition"
+		ImportIds: "import"
+		StatementIds: "statement"
+		BlockIds: "block"
+		ExpressionIds: "expression"
+		PatternIds: "pattern"
+		WrittenTypeIds: "written type"
+		DimensionIds: "dimension"
+		NameUseIds: "name use"
+		BinderIds: "binder"
+		TypeBinderIds: "type binder"
+
+
+pure func parse_input_error_text(error: ParseInputError) -> String:
+	match error:
+		EmptyRejection:
+			"a rejection with no diagnostic"
+		InvalidLineStarts:
+			"line starts that do not match the source"
+		InvalidTokenInput(_):
+			"tokens the cursor refuses"
+		NonLexicalDiagnostic(span, _):
+			"a parser diagnostic among the lexer's at ${span.span_start()}..${span.span_end()}"
+
+
+---
+The old program against the tree path's whole module: assembled, censused,
+projected and compared in full. `existing` is the accepted old program, whose
+source file the projection reuses: module naming belongs to the module walk.
+---
+pure func compare_tree_module(existing: ParsedProgram, module: Int, names: NameTable) -> TreeModuleComparison:
+	lexed = lex_module(module_id_at_row(module), existing.source.text)
+	match assemble_module(lexed):
+		Err(error):
+			TreeModuleError(TreeModuleInputError, "lexed source cannot initialize the tree parse state: ${parse_input_error_text(error)}")
+		Ok(UnassembledModule(reason)):
+			TreeModuleUnassembled(reason)
+		Ok(RejectedModule(rejected)):
+			TreeModuleRejected(rejected.rejected_diagnostics().length())
+		Ok(AssembledModule(assembled)):
+			problems = id_census(module_id_at_row(module), assembled.syntax)
+			match problems.get(0):
+				Some(first):
+					TreeModuleError(TreeModuleCensusError, "${problems.length()} problems, first ${census_problem_text(first)}")
+				None:
+					match legacy_assembled_program(existing.source, preview_source(lexed), assembled.syntax, names):
+						Ok((projected_names, projected)):
+							TreeModuleCompared(
+								projected_names,
+								program_differences(parsed_program_to_json(existing), parsed_program_to_json(projected)),
+							)
+						Err(error):
+							TreeModuleError(TreeModuleProjectionError, projection_error_message(error))
 
 
 record TreePrefixKindCounts {
@@ -366,24 +550,27 @@ pure func compare_tree_prefix(existing: ParsedProgram, module: Int, names: NameT
 						compared_bodies = count_completed_bodies(compared_bodies, declaration)
 					TreePrefixCompared(projection.names, declaration_prefix_comparison(existing, projection), compared_bodies, declined_stops)
 				Err(error):
-					message: String = match error:
-						MissingDimensionLiteralToken(span):
-							"missing dimension literal token at ${span.span_start()}..${span.span_end()}"
-						MissingIntegerLiteralToken(span):
-							"missing integer literal token at ${span.span_start()}..${span.span_end()}"
-						MissingVariadicWildcardToken(span):
-							"missing variadic wildcard token at ${span.span_start()}..${span.span_end()}"
-						InvalidGlobalInitializerEntry(span):
-							"invalid global initializer entry at ${span.span_start()}..${span.span_end()}"
-						UnsupportedGlobalInitializerExpression(span):
-							"unsupported completed global initializer at ${span.span_start()}..${span.span_end()}"
-						UnsupportedBodyStatement(span):
-							"unsupported body statement at ${span.span_start()}..${span.span_end()}"
-						MissingPatternNumberToken(span):
-							"missing pattern number token at ${span.span_start()}..${span.span_end()}"
-					TreePrefixError(TreePrefixProjectionError, message)
+					TreePrefixError(TreePrefixProjectionError, projection_error_message(error))
 		Err(_):
 			TreePrefixError(TreePrefixInputError, "lexed source cannot initialize the tree parse state")
+
+
+pure func projection_error_message(error: LegacyDeclarationPreviewError) -> String:
+	match error:
+		MissingDimensionLiteralToken(span):
+			"missing dimension literal token at ${span.span_start()}..${span.span_end()}"
+		MissingIntegerLiteralToken(span):
+			"missing integer literal token at ${span.span_start()}..${span.span_end()}"
+		MissingVariadicWildcardToken(span):
+			"missing variadic wildcard token at ${span.span_start()}..${span.span_end()}"
+		InvalidGlobalInitializerEntry(span):
+			"invalid global initializer entry at ${span.span_start()}..${span.span_end()}"
+		UnsupportedGlobalInitializerExpression(span):
+			"unsupported completed global initializer at ${span.span_start()}..${span.span_end()}"
+		UnsupportedBodyStatement(span):
+			"unsupported body statement at ${span.span_start()}..${span.span_end()}"
+		MissingPatternNumberToken(span):
+			"missing pattern number token at ${span.span_start()}..${span.span_end()}"
 
 
 ---
@@ -407,7 +594,7 @@ One module: the existing parser over its source, against the adapter's program
 from the tables. A module the existing parser rejects is skipped before the
 adapter runs, since the adapter rebuilds only what the parser accepted.
 ---
-func compare_module(reader: DeclarationReader, module: Int, row: ModuleRow, names: NameTable) -> ModuleComparisons:
+func compare_module(reader: DeclarationReader, module: Int, row: ModuleRow, names: NameTable, module_names: NameTable) -> ModuleComparisons:
 	match legacy_source_file(reader, module_id_at_row(module)):
 		Ok(source):
 			match existing_source_text(source):
@@ -426,17 +613,30 @@ func compare_module(reader: DeclarationReader, module: Int, row: ModuleRow, name
 					finalized: ParsedProgram = with_holes_parsed(existing)
 
 					if not finalized.diagnostics.is_empty():
-						{ adapter = ModuleSkipped("rejected by the existing parser"), tree = TreePrefixSkipped("rejected by the existing parser") }
+						{
+							adapter = ModuleSkipped(EXISTING_PARSER_REJECTED),
+							tree = TreePrefixSkipped(EXISTING_PARSER_REJECTED),
+							module_tree = TreeModuleSkipped(EXISTING_PARSER_REJECTED)
+						}
 					else:
 						{
 							adapter = compare_accepted(reader, module, row, finalized, text),
-							tree = compare_tree_prefix(finalized, module, names)
+							tree = compare_tree_prefix(finalized, module, names),
+							module_tree = compare_tree_module(finalized, module, module_names)
 						}
 				Err(message):
-					{ adapter = ModuleSkipped("unreadable: ${message}"), tree = TreePrefixError(TreePrefixSourceError, message) }
+					{
+						adapter = ModuleSkipped("unreadable: ${message}"),
+						tree = TreePrefixError(TreePrefixSourceError, message),
+						module_tree = TreeModuleError(TreeModuleSourceError, message)
+					}
 		Err(error):
 			message = legacy_adapter_error_message(error)
-			{ adapter = ModuleNotRebuilt(message), tree = TreePrefixError(TreePrefixSourceError, message) }
+			{
+				adapter = ModuleNotRebuilt(message),
+				tree = TreePrefixError(TreePrefixSourceError, message),
+				module_tree = TreeModuleError(TreeModuleSourceError, message)
+			}
 
 
 func compare_accepted(
@@ -630,12 +830,14 @@ func print_comparison(tables: FrontendTables, reader: DeclarationReader, stop_ce
 	var differing: Int = 0
 	var tree_counts: TreePrefixCounts = EMPTY_TREE_PREFIX_COUNTS
 	var tree_names: NameTable = SYNTHESIZED_NAME_TABLE
+	var module_counts: TreeModuleCounts = EMPTY_TREE_MODULE_COUNTS
+	var module_names: NameTable = SYNTHESIZED_NAME_TABLE
 
 	for module in 0..module_count(tables):
 		row: ModuleRow = module_row(tables, module_id_at_row(module))
 		path: String = path_text(tables, source_row(tables, row.source).path)
 
-		comparisons = compare_module(reader, module, row, tree_names)
+		comparisons = compare_module(reader, module, row, tree_names, module_names)
 		match comparisons.adapter:
 			ModuleCompared(count, differences):
 				compared += 1
@@ -669,12 +871,33 @@ func print_comparison(tables: FrontendTables, reader: DeclarationReader, stop_ce
 				tree_counts = { tree_counts | errors = tree_counts.errors + 1 }
 				print("tree-prefix-error ${path} | ${tree_prefix_error_stage_label(stage)} | ${shortened(message)}")
 
+		match comparisons.module_tree:
+			TreeModuleCompared(names, differences):
+				module_names = names
+				module_counts = report_tree_module_comparison(path, module_counts, differences)
+			TreeModuleRejected(diagnostics):
+				module_counts = { module_counts | rejected = module_counts.rejected + 1 }
+				print("tree-module-rejected ${path} | ${diagnostics}")
+			TreeModuleUnassembled(reason):
+				module_counts = {
+					module_counts |
+					unassembled = module_counts.unassembled + 1,
+					stops = count_tree_module_stop(module_counts.stops, reason)
+				}
+			TreeModuleSkipped(reason):
+				module_counts = { module_counts | skipped = module_counts.skipped + 1 }
+				print("tree-module-skipped ${path} | ${shortened(reason)}")
+			TreeModuleError(stage, message):
+				module_counts = { module_counts | errors = module_counts.errors + 1 }
+				print("tree-module-error ${path} | ${tree_module_error_stage_label(stage)} | ${shortened(message)}")
+
 	print_tree_prefix_summary(module_count(tables), tree_counts)
+	print_tree_module_summary(module_count(tables), module_counts)
 	print(
 		"summary modules=${module_count(tables)} compared=${compared} skipped=${skipped} declarations=${declarations} differences=${differing}",
 	)
 
-	if not_rebuilt > 0 or tree_counts.errors > 0:
+	if not_rebuilt > 0 or tree_counts.errors > 0 or module_counts.errors > 0:
 		EXIT_ADAPTER_ERROR
 	else:
 		0
@@ -726,4 +949,19 @@ func report_tree_prefix_comparison(
 func print_tree_prefix_summary(modules: Int, counts: TreePrefixCounts) -> Void:
 	print(
 		"tree-prefix-summary modules=${modules} compared=${counts.compared} skipped=${counts.skipped} errors=${counts.errors} declarations=${counts.declarations} completed_functions=${counts.completed.functions} completed_traits=${counts.completed.traits} completed_implementations=${counts.completed.implementations} differences=${counts.differences} reported=${counts.reported} kind_import_block=${counts.kinds.import_block_modules} kind_foreign_block=${counts.kinds.foreign_block_modules} kind_record=${counts.kinds.record_modules} kind_fixed_record=${counts.kinds.fixed_record_modules} kind_alias=${counts.kinds.alias_modules} kind_builtin_type=${counts.kinds.builtin_type_modules} kind_resource_type=${counts.kinds.resource_type_modules} kind_union=${counts.kinds.union_modules} kind_fixed_union=${counts.kinds.fixed_union_modules} kind_enum=${counts.kinds.enum_modules} kind_function=${counts.kinds.function_modules} kind_trait=${counts.kinds.trait_modules} kind_implementation=${counts.kinds.implementation_modules} kind_constant_global=${counts.kinds.constant_global_modules} kind_mutable_global=${counts.kinds.mutable_global_modules} stop_end_of_source=${counts.stops.end_of_source_modules} stop_function_header=${counts.stops.function_header_modules} stop_trait_preview=${counts.stops.trait_preview_modules} stop_implementation_preview=${counts.stops.implementation_preview_modules} stop_global_initializer=${counts.stops.global_initializer_modules} stop_rejected_global_initializer=${counts.stops.rejected_global_initializer_modules} stop_rejected_declaration=${counts.stops.rejected_declaration_modules} stop_without_progress=${counts.stops.without_progress_modules}",
+	)
+
+
+func report_tree_module_comparison(path: String, counts: TreeModuleCounts, differences: List[JsonDifference]) -> TreeModuleCounts:
+	reported = differences.take(MAX_DIFFERENCES_PER_MODULE)
+	for difference in reported:
+		print("tree-module-difference ${path} | ${difference.declaration} | ${difference.path} | old=${difference.old_text} | new=${difference.new_text}")
+
+	{ counts | assembled = counts.assembled + 1, differences = counts.differences + differences.length(), reported = counts.reported + reported.length() }
+
+
+func print_tree_module_summary(modules: Int, counts: TreeModuleCounts) -> Void:
+	stops = counts.stops
+	print(
+		"tree-module-summary modules=${modules} assembled=${counts.assembled} rejected=${counts.rejected} unassembled=${counts.unassembled} skipped=${counts.skipped} errors=${counts.errors} differences=${counts.differences} reported=${counts.reported} stop_function_body=${stops.function_body} stop_trait_bodies=${stops.trait_bodies} stop_implementation_bodies=${stops.implementation_bodies} stop_global_initializer=${stops.global_initializer} stop_rejected_global_initializer=${stops.rejected_global_initializer} stop_rejected_declaration=${stops.rejected_declaration} stop_without_progress=${stops.without_progress}",
 	)

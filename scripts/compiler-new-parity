@@ -28,6 +28,10 @@ rebuilt from the discovery stage's tables by `discovery_adapter.brp` (every
 declaration and every body) must equal the existing parser's with its
 interpolation holes parsed, field for field and span for span. A deliberate
 difference needs an `ADAPTER_DIFFERENCES` entry naming it and its reason.
+The same runs assemble each accepted module on the typed-tree path
+(`tree_module_assembly.brp`): every module it reads in full must pass the id
+census and its whole projected program must equal the existing parser's; the
+others are counted by where the tree path stopped reading them.
 
 It also checks the discovery stage's module graph (`discovery_module_order_dump.brp`)
 for one compile root and one `blorp test` root: it must load at least the
@@ -180,6 +184,8 @@ ADAPTER_ERROR_PREFIX = "adapter-error"
 # its output then names the module, so the run is a reported failure.
 ADAPTER_ERROR_STATUS = 4
 SKIPPED_REASON_SEPARATOR = " | "
+# Why the differential skips a module (`EXISTING_PARSER_REJECTED` in the tool).
+EXISTING_PARSER_REJECTED_REASON = "rejected by the existing parser"
 SUMMARY_PREFIX = "summary "
 DIFFERENCE_FIELD_SEPARATOR = " | "
 ESCAPED_FIELD_SEPARATOR = " \\| "
@@ -220,6 +226,29 @@ TREE_PREFIX_SUMMARY_FIELDS = frozenset(
     TREE_PREFIX_TOTAL_FIELDS
     + tuple(f"kind_{kind}" for kind in TREE_PREFIX_KINDS)
     + tuple(f"stop_{stop}" for stop in TREE_PREFIX_STOPS)
+)
+
+# The whole-module tree protocol: modules the tree path assembles are compared
+# in full; the rest are counted by where the tree path stopped reading them.
+TREE_MODULE_NAMESPACE = "tree-module-"
+TREE_MODULE_DIFFERENCE = "tree-module-difference "
+TREE_MODULE_REJECTED = "tree-module-rejected "
+TREE_MODULE_SKIPPED = "tree-module-skipped "
+TREE_MODULE_ERROR = "tree-module-error "
+TREE_MODULE_ERROR_STAGES = frozenset(("source", "input", "census", "projection"))
+TREE_MODULE_SUMMARY = "tree-module-summary "
+TREE_MODULE_STOPS = (
+    "function_body", "trait_bodies", "implementation_bodies", "global_initializer",
+    "rejected_global_initializer", "rejected_declaration", "without_progress",
+)
+TREE_MODULE_REJECTED_STOPS = (
+    "rejected_global_initializer", "rejected_declaration", "without_progress",
+)
+TREE_MODULE_TOTAL_FIELDS = (
+    "modules", "assembled", "rejected", "unassembled", "skipped", "errors", "differences", "reported",
+)
+TREE_MODULE_SUMMARY_FIELDS = frozenset(
+    TREE_MODULE_TOTAL_FIELDS + tuple(f"stop_{stop}" for stop in TREE_MODULE_STOPS)
 )
 
 FILE_HEADER_PREFIX = "== "
@@ -803,7 +832,7 @@ def parse_tree_prefix_output(text: str) -> TreePrefixReport:
                 report.differences.append(difference)
         elif line.startswith(TREE_PREFIX_SKIPPED):
             path, separator, reason = line[len(TREE_PREFIX_SKIPPED):].partition(SKIPPED_REASON_SEPARATOR)
-            if not path or not separator or reason != "rejected by the existing parser":
+            if not path or not separator or reason != EXISTING_PARSER_REJECTED_REASON:
                 report.problems.append(f"unreadable tree prefix skipped line: {line}")
             else:
                 report.skipped_paths.append(path)
@@ -883,6 +912,140 @@ def parse_tree_prefix_output(text: str) -> TreePrefixReport:
 
 
 @dataclass
+class TreeModuleReport:
+    """Whole-module tree evidence: assembled modules compared in full."""
+
+    totals: dict[str, int] = field(default_factory=dict)
+    stops: dict[str, int] = field(default_factory=dict)
+    rejected_lines: list[str] = field(default_factory=list)
+    skipped_paths: list[str] = field(default_factory=list)
+    error_lines: list[str] = field(default_factory=list)
+    differences: list[AdapterFieldDifference] = field(default_factory=list)
+    problems: list[str] = field(default_factory=list)
+
+
+def parse_tree_module_output(text: str) -> TreeModuleReport:
+    """Require one complete summary whose counts account for every line."""
+    report = TreeModuleReport()
+    summaries = 0
+    for line in text.splitlines():
+        if not line.startswith(TREE_MODULE_NAMESPACE):
+            continue
+        if line.startswith(TREE_MODULE_DIFFERENCE):
+            difference = parse_adapter_difference(line[len(TREE_MODULE_DIFFERENCE):])
+            if difference is None or not difference.module or not difference.path:
+                report.problems.append(f"unreadable tree module difference line: {line}")
+            else:
+                report.differences.append(difference)
+        elif line.startswith(TREE_MODULE_REJECTED):
+            report.rejected_lines.append(line)
+        elif line.startswith(TREE_MODULE_SKIPPED):
+            path, separator, reason = line[len(TREE_MODULE_SKIPPED):].partition(SKIPPED_REASON_SEPARATOR)
+            if not path or not separator or reason != EXISTING_PARSER_REJECTED_REASON:
+                report.problems.append(f"unreadable tree module skipped line: {line}")
+            else:
+                report.skipped_paths.append(path)
+        elif line.startswith(TREE_MODULE_ERROR):
+            fields = line[len(TREE_MODULE_ERROR):].split(DIFFERENCE_FIELD_SEPARATOR, 2)
+            if len(fields) != 3 or not all(fields) or fields[1] not in TREE_MODULE_ERROR_STAGES:
+                report.problems.append(f"unreadable tree module error line: {line}")
+            else:
+                report.error_lines.append(line)
+        elif line.startswith(TREE_MODULE_SUMMARY):
+            summaries += 1
+            if summaries > 1:
+                report.problems.append("the tree module differential printed a duplicate summary")
+                continue
+            summary: dict[str, int] = {}
+            for item in line[len(TREE_MODULE_SUMMARY):].split():
+                name, separator, value = item.partition("=")
+                if not separator or name not in TREE_MODULE_SUMMARY_FIELDS or name in summary:
+                    report.problems.append(f"unknown, malformed or duplicate tree module summary field: {item}")
+                elif re.fullmatch(r"[0-9]+", value) is None:
+                    report.problems.append(f"invalid tree module count: {item}")
+                else:
+                    summary[name] = int(value)
+            missing = TREE_MODULE_SUMMARY_FIELDS - summary.keys()
+            if missing:
+                report.problems.append(f"missing tree module summary fields: {', '.join(sorted(missing))}")
+            report.totals = {name: summary.get(name, 0) for name in TREE_MODULE_TOTAL_FIELDS}
+            report.stops = {stop: summary.get(f"stop_{stop}", 0) for stop in TREE_MODULE_STOPS}
+        else:
+            report.problems.append(f"unexpected tree module differential output: {line}")
+    if summaries == 0:
+        report.problems.append("the tree module differential printed no summary")
+        return report
+
+    totals = report.totals
+    if totals["modules"] != sum(totals[name] for name in ("assembled", "rejected", "unassembled", "skipped", "errors")):
+        report.problems.append("tree module counts do not account for every module")
+    if sum(report.stops.values()) != totals["unassembled"]:
+        report.problems.append("tree module stop counts do not equal unassembled modules")
+    if totals["rejected"] != len(report.rejected_lines):
+        report.problems.append("tree module rejected count does not match rejected lines")
+    if totals["skipped"] != len(report.skipped_paths) or len(set(report.skipped_paths)) != len(report.skipped_paths):
+        report.problems.append("tree module skipped count does not match unique skipped lines")
+    if totals["errors"] != len(report.error_lines):
+        report.problems.append("tree module error count does not match error lines")
+    if totals["reported"] != len(report.differences) or totals["reported"] > totals["differences"]:
+        report.problems.append("tree module reported difference count does not match difference lines")
+    return report
+
+
+def tree_module_problems(
+    description: str,
+    report: TreeModuleReport,
+    expected_skipped: set[str],
+    allowances: tuple[AdapterDifference, ...],
+    used: set[AdapterDifference],
+) -> list[str]:
+    """Every assembled module must equal the existing parser's program; a
+    module the tree path rejects, a census or projection error and an accepted
+    module stopped at a rejected declaration all fail. Only the existing
+    parser's known faults (`ADAPTER_DIFFERENCES`) are allowed."""
+    problems = [f"{description}: {problem}" for problem in report.problems]
+    problems.extend(f"{description}: {line}" for line in report.error_lines)
+    problems.extend(
+        f"{description}: the tree path rejects a module the existing parser accepts: {line}"
+        for line in report.rejected_lines
+    )
+    skipped = set(report.skipped_paths)
+    if skipped != expected_skipped:
+        problems.append(
+            f"{description}: skipped modules differ from the ones the existing parser rejects: "
+            f"unexpected {sorted(skipped - expected_skipped)[:1]}, "
+            f"missing {sorted(expected_skipped - skipped)[:1]}"
+        )
+    unlisted: list[AdapterFieldDifference] = []
+    for difference in report.differences:
+        entry = next((entry for entry in allowances if entry.allows(difference)), None)
+        if entry is None:
+            unlisted.append(difference)
+        else:
+            used.add(entry)
+    for difference in unlisted[:MAX_REPORTED_ADAPTER_DIFFERENCES]:
+        label = difference.declaration or "(module)"
+        problems.append(
+            f"{description}: {difference.module} | {label} | {difference.path}\n"
+            f"    existing parser: {difference.old}\n"
+            f"    tree module:     {difference.new}"
+        )
+    if len(unlisted) > MAX_REPORTED_ADAPTER_DIFFERENCES:
+        problems.append(
+            f"{description}: {len(unlisted) - MAX_REPORTED_ADAPTER_DIFFERENCES} more tree module differences not shown"
+        )
+    if report.totals and report.totals["differences"] > len(report.differences):
+        problems.append(
+            f"{description}: {report.totals['differences'] - len(report.differences)} tree module differences "
+            "were counted but not reported"
+        )
+    for stop in TREE_MODULE_REJECTED_STOPS:
+        if report.stops.get(stop, 0) > 0:
+            problems.append(f"{description}: accepted modules stopped at {stop}: {report.stops[stop]}")
+    return problems
+
+
+@dataclass
 class AdapterReport:
     """What one run of the adapter differential printed."""
 
@@ -894,6 +1057,7 @@ class AdapterReport:
     differences: list[AdapterFieldDifference]
     problems: list[str]
     tree_prefix: TreePrefixReport = field(default_factory=TreePrefixReport)
+    tree_module: TreeModuleReport = field(default_factory=TreeModuleReport)
 
 
 def parse_adapter_output(text: str) -> AdapterReport:
@@ -907,8 +1071,8 @@ def parse_adapter_output(text: str) -> AdapterReport:
     problems: list[str] = []
     summary: dict[str, int] | None = None
     for line in text.splitlines():
-        if line.startswith(TREE_PREFIX_NAMESPACE):
-            # Its strict parser records problems on the separate tree report.
+        if line.startswith(TREE_PREFIX_NAMESPACE) or line.startswith(TREE_MODULE_NAMESPACE):
+            # Their strict parsers record problems on the separate tree reports.
             continue
         if line.startswith(DIFFERENCE_PREFIX):
             difference = parse_adapter_difference(line[len(DIFFERENCE_PREFIX):])
@@ -939,6 +1103,7 @@ def parse_adapter_output(text: str) -> AdapterReport:
         differences=differences,
         problems=problems,
         tree_prefix=parse_tree_prefix_output(text),
+        tree_module=parse_tree_module_output(text),
     )
 
 
@@ -1079,6 +1244,12 @@ def check_adapter(work: Path, file_list: Path, rejected_files: set[str]) -> tupl
         ))
         if report.tree_prefix.modules != report.modules:
             found.append(f"tree prefix differential, {description}: module total differs from the full adapter")
+        found.extend(tree_module_problems(
+            f"tree module differential, {description}", report.tree_module, expected_skipped,
+            ADAPTER_DIFFERENCES, used,
+        ))
+        if report.tree_module.totals.get("modules") != report.modules:
+            found.append(f"tree module differential, {description}: module total differs from the full adapter")
         problems.extend(found)
         failed += bool(found)
         if not found:
@@ -1094,6 +1265,14 @@ def check_adapter(work: Path, file_list: Path, rejected_files: set[str]) -> tupl
                 f"({prefix.completed_functions} functions, {prefix.completed_traits} traits and "
                 f"{prefix.completed_implementations} implementations with bodies); "
                 + ", ".join(f"{stop}={prefix.stops[stop]}" for stop in TREE_PREFIX_STOPS)
+            )
+            module = report.tree_module
+            notes.append(
+                f"tree modules agree with the existing parser for {description}: "
+                f"{module.totals['assembled']} of {report.compared} accepted modules assembled and compared in full, "
+                f"{module.totals['unassembled']} not yet read in full ("
+                + ", ".join(f"{stop}={module.stops[stop]}" for stop in TREE_MODULE_STOPS)
+                + ")"
             )
     stale = stale_adapter_allowances(ADAPTER_DIFFERENCES, used)
     problems.extend(stale)

@@ -634,6 +634,103 @@ class CompilerNewParityTests(unittest.TestCase):
 		self.assertEqual(used, set())
 		self.assertTrue(self.tree_prefix_problems(output))
 
+	def tree_module_output(self, *lines: str, updates=None, omitted=(), extra=()) -> str:
+		counts = {
+			"modules": 3, "assembled": 2, "rejected": 0, "unassembled": 1, "skipped": 0, "errors": 0,
+			"differences": 0, "reported": 0,
+		}
+		for stop in (
+			"function_body", "trait_bodies", "implementation_bodies", "global_initializer",
+			"rejected_global_initializer", "rejected_declaration", "without_progress",
+		):
+			counts[f"stop_{stop}"] = int(stop == "function_body")
+		counts.update({} if updates is None else updates)
+		fields = [f"{name}={value}" for name, value in counts.items() if name not in omitted]
+		return self.adapter_output(*lines, "tree-module-summary " + " ".join([*fields, *extra]))
+
+	def tree_module_problems(self, output: str, expected_skipped=None, allowances=(), used=None) -> list[str]:
+		return parity.tree_module_problems(
+			"tree module, test root",
+			parity.parse_adapter_output(output).tree_module,
+			set() if expected_skipped is None else expected_skipped,
+			allowances,
+			set() if used is None else used,
+		)
+
+	def test_a_clean_tree_module_run_has_no_problems(self) -> None:
+		output = self.tree_module_output()
+		report = parity.parse_adapter_output(output).tree_module
+		self.assertEqual((report.totals["assembled"], report.totals["unassembled"]), (2, 1))
+		self.assertEqual(report.stops["function_body"], 1)
+		self.assertEqual(self.tree_module_problems(output), [])
+
+	def test_tree_module_requires_one_complete_summary(self) -> None:
+		output = self.tree_module_output()
+		summary = output.strip()
+		for changed in (
+			"", output + summary + "\n",
+			self.tree_module_output(omitted=("assembled",)),
+			self.tree_module_output(extra=("unknown=1",)),
+			self.tree_module_output(updates={"assembled": "two"}),
+		):
+			with self.subTest(output=changed):
+				self.assertTrue(self.tree_module_problems(changed))
+
+	def test_tree_module_counts_must_account_for_every_module_and_line(self) -> None:
+		for updates in (
+			{"modules": 4}, {"stop_function_body": 0}, {"skipped": 1, "modules": 4},
+			{"errors": 1, "modules": 4}, {"rejected": 1, "modules": 4}, {"reported": 1, "differences": 1},
+		):
+			with self.subTest(updates=updates):
+				self.assertTrue(self.tree_module_problems(self.tree_module_output(updates=updates)))
+
+	def test_a_module_the_tree_path_rejects_fails(self) -> None:
+		output = self.tree_module_output("tree-module-rejected a.brp | 1", updates={"rejected": 1, "modules": 4})
+		self.assertEqual(parity.parse_adapter_output(output).tree_module.problems, [])
+		self.assertIn("a.brp", "\n".join(self.tree_module_problems(output)))
+
+	def test_a_census_error_names_the_module_and_fails(self) -> None:
+		output = self.tree_module_output(
+			"tree-module-error a.brp | census | 1 problems, first expression 3 issued and not held",
+			updates={"errors": 1, "modules": 4},
+		)
+		joined = "\n".join(self.tree_module_problems(output))
+		self.assertIn("a.brp", joined)
+		self.assertIn("census", joined)
+		unknown_stage = self.tree_module_output(
+			"tree-module-error a.brp | unknown | x", updates={"errors": 1, "modules": 4},
+		)
+		self.assertTrue(parity.parse_adapter_output(unknown_stage).tree_module.problems)
+
+	def test_tree_module_skips_exactly_the_rejected_modules(self) -> None:
+		output = self.tree_module_output(
+			"tree-module-skipped a.brp | rejected by the existing parser", updates={"skipped": 1, "modules": 4},
+		)
+		self.assertEqual(self.tree_module_problems(output, expected_skipped={"a.brp"}), [])
+		self.assertTrue(self.tree_module_problems(output))
+
+	def test_tree_module_difference_passes_only_when_an_allowance_names_it(self) -> None:
+		output = self.tree_module_output(
+			"tree-module-difference a.brp | helper | decls[0].body.kind | old=x | new=y",
+			updates={"differences": 1, "reported": 1},
+		)
+		allowance = parity.AdapterDifference(path=r"decls\[0\]\.body\..*", reason="known fault", module="a.brp")
+		used: set = set()
+		self.assertEqual(self.tree_module_problems(output, allowances=(allowance,), used=used), [])
+		self.assertEqual(used, {allowance})
+		self.assertTrue(self.tree_module_problems(output))
+		truncated = self.tree_module_output(
+			"tree-module-difference a.brp | helper | decls[0].body.kind | old=x | new=y",
+			updates={"differences": 2, "reported": 1},
+		)
+		self.assertTrue(self.tree_module_problems(truncated, allowances=(allowance,)))
+
+	def test_tree_module_rejected_stops_fail_on_accepted_modules(self) -> None:
+		for stop in ("rejected_global_initializer", "rejected_declaration", "without_progress"):
+			with self.subTest(stop=stop):
+				output = self.tree_module_output(updates={"stop_function_body": 0, f"stop_{stop}": 1})
+				self.assertTrue(self.tree_module_problems(output))
+
 	def test_the_repository_lists_no_unexplained_adapter_difference(self) -> None:
 		for entry in parity.ADAPTER_DIFFERENCES:
 			self.assertTrue(entry.reason.strip())

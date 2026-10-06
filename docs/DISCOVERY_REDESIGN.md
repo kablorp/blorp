@@ -3,8 +3,8 @@
 This is the design and migration record for the typed-tree path. The syntax
 prerequisite M-1 has landed, M0 measured a throwaway body-parser prototype,
 and M1 and M2 are implemented and validated. M3 remains open on rejected
-module diagnostic parity; bounded M4 global expression slices are implemented,
-and M5 to M7 remain open. It replaces the data model of
+module diagnostic parity; M4 assembles and compares every module whose
+declarations the tree parser reads in full, and M5 to M7 remain open. It replaces the data model of
 [`DISCOVERY_TABLES_DESIGN.md`](DISCOVERY_TABLES_DESIGN.md) (one builder threaded
 through every module, a flat node table and about 50 side tables) with:
 
@@ -2292,6 +2292,20 @@ What it changes: an import inside a broken import item is no longer
 followed. Its module is already rejected, so the only lost diagnostic is a
 cascading "unresolved import" for a path that did not parse.
 
+**Forward pairing is the last acceptance check.** A top-level function with no
+body is a forward declaration (`FunctionDeclaration.function.body` is
+`None`): the standard library writes a higher-order function's impure and
+pure signatures twice and gives only one of them the body. Once every
+declaration is read, and only if the module has no other diagnostic (an
+earlier error can itself leave a header without its body), each forward
+declaration needs a top-level function of the same name with a body, before
+or after it and of either visibility. Each one without reports
+`UnpairedForwardDeclarationDiagnostic` at its name, in source order, and the
+module is rejected. Pairing compares `SpellingId`s, which are per-module
+interned, and stores no link: resolution binds both declarations by name. A
+forward declaration's span is its header through the colon that promised no
+body; the legacy adapter reproduces the frozen parser's shorter span.
+
 ### 3.18 Definitions index
 
 ```blorp
@@ -3614,6 +3628,45 @@ compared 13,472 completed declarations, stopped at 1,635 functions and 304
 unsupported globals, and had zero rejected or non-progress stops. Parity
 evidence for the braced forms is also the AST-JSON differential over 16 braced
 shapes in the projection suite.
+
+Module assembly (`parse/tree_module_assembly.brp`) turns the body-completing
+scan into the stage's output. `assemble_module` reads one `LexedModule` with
+its one mint and returns exactly one outcome: `AssembledModule` (a
+`ModuleSyntax` and the module's final spellings) when the scan reached the end
+of the source, every declaration is complete syntax, the module has no
+diagnostic and every forward declaration is paired (section 3.17);
+`RejectedModule` (the shared `RejectedPreview`, with the mint's definitions
+index) when every declaration was read and the module has a diagnostic,
+lexical or unpaired; and `UnassembledModule` otherwise, naming the first
+declaration in source order the tree parser did not read (a function body,
+trait or implementation bodies, a global initializer, a rejected global
+initializer or declaration, or no progress). No outcome holds a partial tree.
+Forward declarations now complete as functions with no body and are minted in
+source order like any function. The legacy adapter's module half
+(`legacy_assembled_program`) projects an assembled module to a whole
+`ParsedProgram` through the same per-item translation the declaration prefix
+uses, threading one shared name table.
+
+The adapter differential runs it over every module of each root run and of the
+every-file run: each assembled module passes the id census (section 4.6) and
+its whole projected program is compared with the existing parser's, source,
+module documentation and every declaration, span for span. The census also
+runs as a corpus test of the `compiler-new` gate
+(`test_tree_module_assembly.brp`), over every module of the should_pass corpus
+and the standard library that assembles, none of which may be rejected; the
+link-time debug census arrives with M5. Pairing covers both visibilities: the
+frozen parser paired only public functions and accepted a lone private
+forward declaration, so it was fixed to agree, with fixtures for a private
+unpaired declaration, a private body and two declarations sharing one body. On a fresh build merged with main `e51aaab9f` (lambdas, local functions,
+the statement forms and the stop-reason census included), 1,687 of the 3,417
+legacy-accepted corpus modules assemble with a clean census and zero full-AST
+differences; the other 1,730 stop at a function body (1,338), implementation
+bodies (28) or a global initializer (364), with no rejected or non-progress
+stop and no module the tree path rejects. The root runs assemble 59 of 514
+modules (compile root, either standard-library source), 23 of 103 (test
+root), 8 of 39 (native package) and 14 of 41 (source packages), all with zero
+differences. These counts grow as the remaining body slices land; the parity
+gate prints them on its "tree modules agree with the existing parser" lines.
 
 The control-value slice was validated on a fresh build rebased on main
 `3083c8c00`. Focused checks passed 17/17 (body parser), 19/19 (body projection),
