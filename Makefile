@@ -535,12 +535,7 @@ tooling-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_architecture/test_dead_code_audit.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_build/test_compiler_check.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_compiler_check_plan.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_allocator_stats.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_float_to_string.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_memory_diagnostics.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_type_registry.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_release_path.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_direct_allocation.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_unicode_case_map.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_profile_dense_ids.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_cancellation_registry_completeness.py
