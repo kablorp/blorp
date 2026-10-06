@@ -82,6 +82,13 @@ class DockerGateRemoteTests(unittest.TestCase):
         fake_docker = bin_dir / "docker"
         fake_docker.write_text('#!/bin/bash\n[ -z "${FAKE_DOCKER_DOWN:-}" ]\n')
         fake_docker.chmod(0o755)
+        # Free space in the remote home, in KiB, as `df -Pk` reports it.
+        fake_df = bin_dir / "df"
+        fake_df.write_text(
+            '#!/bin/bash\necho "Filesystem 1024-blocks Used Available Capacity Mounted"\n'
+            'echo "disk 999999999 1 ${FAKE_DF_FREE_KIB:-999999999} 1% /"\n'
+        )
+        fake_df.chmod(0o755)
         self.ssh_log = self.scratch / "ssh.log"
 
         self.environment = dict(os.environ)
@@ -218,6 +225,41 @@ class DockerGateRemoteTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(self.git("for-each-ref", "refs/blorp-docker-gate", cwd=remote), "")
+
+    def test_nearly_full_host_runs_the_gate_locally(self) -> None:
+        completed = self.run_gate(FAKE_DF_FREE_KIB=str(5 * 1024 * 1024))
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(
+            f"{FAKE_HOST} has less than 20 GiB free; running the gate locally",
+            completed.stderr,
+        )
+
+    def test_unreadable_free_space_does_not_block_the_host(self) -> None:
+        completed = self.run_gate(FAKE_DF_FREE_KIB="-")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(f"Running the gate on {FAKE_HOST}", completed.stdout)
+
+    def test_without_origin_main_no_base_ref_is_pushed(self) -> None:
+        completed = self.run_gate()
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            self.git("for-each-ref", "refs/blorp-docker-gate-base", cwd=self.remote_repo()), ""
+        )
+
+    def test_push_keeps_a_persistent_base_ref_for_main(self) -> None:
+        head = self.git("rev-parse", "HEAD").strip()
+        self.git("update-ref", "refs/remotes/origin/main", head)
+
+        completed = self.run_gate()
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            self.git("rev-parse", "refs/blorp-docker-gate-base/main", cwd=self.remote_repo()).strip(),
+            head,
+        )
 
     def test_unreachable_host_runs_the_gate_locally(self) -> None:
         completed = self.run_gate(FAKE_SSH_UNREACHABLE="1")

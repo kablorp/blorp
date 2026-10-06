@@ -375,10 +375,13 @@ or in `~/.ssh/config`, never in tracked files.
 - The remote machine queues its gates like a local run, at most
   `BLORP_DOCKER_GATE_REMOTE_MAX_CONCURRENT` (default 10) at once, in one slot
   directory (`~/.cache/blorp-docker-gate-slots`) for every client.
-- If the host is unreachable, or lacks git or a running Docker, or sending the
-  snapshot fails, the gate runs locally with a one-line note saying why.
-  A gate that ran remotely and failed returns its status; it is never rerun
-  locally.
+- If the host is unreachable, lacks git or a running Docker, has less than
+  20 GiB free in the remote home, or sending the snapshot fails, the gate runs
+  locally with a one-line note saying why. A gate that ran remotely and failed
+  returns its status; it is never rerun locally.
+- Each run first updates `refs/blorp-docker-gate-base/main` on the host from
+  `origin/main` (best effort), so a push after a quiet period sends only new
+  objects. The sweep never removes it.
 - Once the gate starts, `scripts/docker-gate` becomes the `ssh` client, so
   stopping it by any signal drops the connection, and the remote run then stops
   its gate within seconds (its container is stopped and its slot freed). A

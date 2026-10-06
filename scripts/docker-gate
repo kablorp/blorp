@@ -201,6 +201,14 @@ REMOTE_REPO="${BLORP_DOCKER_GATE_REMOTE_REPO:-blorp-gate}"
 DEFAULT_REMOTE_MAX_CONCURRENT_GATES=10
 REMOTE_MAX_CONCURRENT="${BLORP_DOCKER_GATE_REMOTE_MAX_CONCURRENT:-$DEFAULT_REMOTE_MAX_CONCURRENT_GATES}"
 REMOTE_PROBE_TIMEOUT_SECONDS=5
+# A gate adds a worktree, a container and Docker VM disk growth on the host; below
+# this much free space in the remote home (a proxy for the disk holding Docker
+# Desktop's VM) it runs here instead of failing in confusing ways on a full disk.
+REMOTE_MIN_FREE_GIB=20
+# Every push also updates this ref from origin/main, so the host always has a
+# base for git to negotiate against and a push sends only what is new, even
+# when no gate is running there.
+REMOTE_BASE_REF=refs/blorp-docker-gate-base/main
 REMOTE_KEEPALIVE_SECONDS=30
 # Refs and worktrees left by a run that was cut off (the connection dropped
 # before its cleanup ran) are swept by the next run once they are this old,
@@ -281,14 +289,21 @@ remote_quote() {
 # prints why not.
 probe_remote_host() {
     local status=0
-    remote_bash probe 'command -v git >/dev/null 2>&1 || exit 3
+    remote_bash probe "command -v git >/dev/null 2>&1 || exit 3
 command -v docker >/dev/null 2>&1 || exit 4
-docker info >/dev/null 2>&1 || exit 5' || status=$?
+docker info >/dev/null 2>&1 || exit 5
+free_kib=\$(df -Pk ~ | awk 'NR == 2 { print \$4 }')
+case \"\$free_kib\" in
+    ''|*[!0-9]*) ;;
+    *) [ \"\$free_kib\" -ge $((REMOTE_MIN_FREE_GIB * 1024 * 1024)) ] || exit 6 ;;
+esac
+exit 0" || status=$?
     case "$status" in
         0) return 0 ;;
         3) echo "git is not installed on $REMOTE_HOST" ;;
         4) echo "docker is not on the PATH of a non-interactive shell on $REMOTE_HOST" ;;
         5) echo "the Docker daemon on $REMOTE_HOST is not running" ;;
+        6) echo "$REMOTE_HOST has less than $REMOTE_MIN_FREE_GIB GiB free" ;;
         "$SSH_CONNECTION_FAILED") echo "$REMOTE_HOST is unreachable over SSH" ;;
         *) echo "the probe of $REMOTE_HOST exited $status" ;;
     esac
@@ -355,7 +370,15 @@ git worktree prune
 exit 0" || return "$SSH_CONNECTION_FAILED"
 
     echo "Sending the working tree to $REMOTE_HOST:$REMOTE_REPO ($commit)..."
-    GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh ${REMOTE_SSH_OPTIONS[*]}}" \
+    local git_ssh="${GIT_SSH_COMMAND:-ssh ${REMOTE_SSH_OPTIONS[*]}}"
+    # Best effort and first, so the snapshot push negotiates against the base,
+    # and a rejected base (another client updating it at the same moment) never
+    # decides whether the gate runs here.
+    if git rev-parse -q --verify refs/remotes/origin/main >/dev/null; then
+        GIT_SSH_COMMAND="$git_ssh" git push -q "$REMOTE_HOST:$REMOTE_REPO" \
+            "+refs/remotes/origin/main:$REMOTE_BASE_REF" 2>/dev/null || true
+    fi
+    GIT_SSH_COMMAND="$git_ssh" \
         git push -q "$REMOTE_HOST:$REMOTE_REPO" "$commit:$ref" || return "$SSH_CONNECTION_FAILED"
 
     echo "Running the gate on $REMOTE_HOST (up to $REMOTE_MAX_CONCURRENT at once there)..."
