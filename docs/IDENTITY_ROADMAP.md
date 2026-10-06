@@ -333,11 +333,12 @@ identical-C measurement, plus the allowlist delta the step names.
   (`CoreGlobal` carries only the path String, and a function hoisted out of a
   global initializer is `NoSourceModule` because of it); the module table is
   threaded through every Core pass state, `CoreDeclarationIndex.modules`,
-  `PreparedCoreProgram.modules` and `CoreStandardModules`, so readers compare ids
-  and render paths from the table; passes that spell flattened names from the path
-  take them from `origin` or the table; `--dump-core` and diagnostics render the
-  path from the table. `CoreKnownFunction` then recognizes a function by
-  `ModuleId` plus `NameId` and only `known_functions.brp` changes. Also deletes
+  `prepared_core_program_module_table` and `CoreStandardModules`, so readers
+  compare ids and render paths from the table; passes that spell flattened
+  names from the path take them from `origin` or the table; `--dump-core` and
+  diagnostics render the path from the table. `CoreKnownFunction` then
+  recognizes a function by `ModuleId` plus `NameId` and only
+  `known_functions.brp` changes. Also deletes
   `ModuleOrigin` beside the `ModuleId` in `SourceModule` once a table handle exists.
 - **Builtin prefix tests as registry rows.** `blorp_filter_map_parallel*`,
   `blorp_vector_get_opt_*` and `blorp_dict_get*` prefix tests in
