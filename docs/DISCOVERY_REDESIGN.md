@@ -3315,17 +3315,32 @@ explicitly unsupported and restore the exact entry state. This remains a test-on
 expression completion seam; statements, bodies and complete module assembly
 are still open.
 
-The next bounded M4 expression slice is same-line list literals, using the
-existing `ListLiteral` variant. It must retain child-first source-order IDs,
-exact literal token provenance, closing-bracket diagnostics and unsupported
-input rollback. Its depth evidence includes the 1,000-nested-list case through
-parse, dump, ID census and legacy projection. Tuples, braced aggregates,
-strings and control expressions follow in separate slices; the complete M4
-gate still requires bodies.
+Another bounded M4 increment adds same-line list literals through the existing
+`ListLiteral` variant: `[a, b]`, empty `[]` and a trailing comma. A list is an
+atom, so postfix steps and operators apply to the whole list. The recipe keeps
+the elements ID-free until the whole initializer boundary is accepted, then
+mints each element child-first in written order and the list last, with the
+span from `[` to `]`. An unclosed list at end of source reports
+"expected `]` after list literal" at that position and issues no IDs. Multiline lists, a
+missing comma, a closing bracket of the wrong kind and elements outside the
+supported grammar restore the exact entry state. Call arguments, subscript
+indices and list items share one item reader and one closing-bracket routine,
+so the three delimiters cannot drift apart. The legacy projection walks
+elements with the same continuation stack as call arguments, so a wide list
+needs no recursion. The syntax dump writes lists nested directly in lists with
+an explicit stack of open lists: its general expression walker overflowed the
+native stack of the Linux gate at about 700 nested lists, so recursion alone
+could not meet the 1,000-deep requirement.
 
-Argument nesting is the one recursion in the postfix grammar. It follows
-brackets the source itself nests, as the frozen parser does, and a test parses
-1,000 nested calls `f(f(...))`.
+The next bounded M4 expression slice is the remaining same-line aggregates:
+tuples (two or more elements; the language has no singleton tuple) and braced forms (vector, record, record update and dict literals),
+each as its own recipe variant with the existing rollback discipline. String
+and character literals, and control expressions, follow in separate slices; the
+complete M4 gate still requires bodies.
+
+Argument and list nesting are the recursion in the postfix and list grammar.
+They follow brackets the source itself nests, as the frozen parser does, and
+tests parse 1,000 nested calls `f(f(...))` and 1,000 nested lists `[[...]]`.
 
 The postfix slice was validated on a fresh build that includes main
 `ff4da4b31`. Focused checks passed 152/152 and declaration-scan checks 14/14,
@@ -3342,6 +3357,24 @@ completed declarations in 3,398 legacy-accepted corpus modules. It stopped at
 prints these counts on its "tree prefix agrees with the existing parser for
 every corpus file as a root" line. These are prefix comparisons, not complete
 body or module parity.
+
+The list slice was validated on a fresh build at main `6205aba41`. Focused
+checks passed 15/15 (expression parser), 15/15 (projection) and 15/15
+(declaration scan), the latter two with zero leaked objects under `--leak-check`.
+On the final tree (after merging main `3f80e94e0`) `compiler-new` passed 844/844 and
+`compiler-new-parity` 3,559/3,559 with zero mismatched files. Before the merge
+`compiler-blorp` passed 6,600/6,600, and the Linux arm64 premerge gate passed
+18,401/18,401 on the merged tree ahead of a last refactor of the delimiter types
+and the dump's open-list stack, which the focused suites and the two gates above
+rechecked. The 1,000-nested
+list passes parse (1,001 expressions, no diagnostics), dump, ID census and
+legacy projection to a 1,000-deep `ParsedListExpr`; a 3,000-element list
+projects in order. The corpus prefix run compared 5,202 completed declarations
+in 3,399 modules with stops unchanged at 2,892 functions, 61 traits, 61
+implementations, 310 unsupported globals and 75 ends of source, and zero
+rejected or non-progress stops. The stops did not move, so this run does not
+by itself show list coverage in the corpus; the list parity evidence is the
+AST-JSON differential over 14 list shapes in the projection suite.
 
 Validation before the main reconciliation, at `a5ae15eab`:
 

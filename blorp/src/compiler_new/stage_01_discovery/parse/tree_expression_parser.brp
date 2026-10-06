@@ -6,17 +6,17 @@ import:
 	../lex/lexed_module: LiteralValue(IntegerValue, FloatValue)
 	../syntax/checked_values: DecimalFloat
 	../syntax/expressions:
-		Expression, ExpressionKind(NameReference, IntegerLiteral, FloatLiteral, BooleanLiteral, VoidValue, Unary, Binary, ShortCircuit, RangeExpression, Call, FieldAccess, Subscript),
+		Expression, ExpressionKind(NameReference, IntegerLiteral, FloatLiteral, BooleanLiteral, VoidValue, Unary, Binary, ShortCircuit, RangeExpression, Call, FieldAccess, Subscript, ListLiteral),
 		UnaryOperator(Negate, LogicalNot),
 		BinaryOperator(Add, Subtract, Multiply, Divide, Modulo, Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual),
 		LogicalOperator(LogicalAnd, LogicalOr)
-	../syntax/sequences: AtLeastOne
+	../syntax/sequences: AtLeastOne, at_least_one_items
 	../syntax/names: WrittenName
 	../tables/diagnostic_code: PlainSyntaxCode(ExpectedExpressionDiagnostic)
 	../tables/expected_token:
 		NameConstruct(NameInStatementName, NameInFieldName), ExpectedTokenDiagnostic(ExpectedRightParen, ExpectedRightBracket),
 		RightParenConstruct(RightParenInGroupedExpression, RightParenInCallArguments),
-		RightBracketConstruct(RightBracketInSubscript)
+		RightBracketConstruct(RightBracketInSubscript, RightBracketInListLiteral)
 	../tables/span: Span, span_covering
 	../tables/token:
 		TokenKind(IdentifierToken, IntLiteralToken, FloatLiteralToken, TrueKeyword, FalseKeyword, VoidKeyword, UnderscoreSymbol,
@@ -53,6 +53,7 @@ private union RecipeKind:
 	CallRecipe(ExpressionRecipe, List[ExpressionRecipe])
 	FieldRecipe(ExpressionRecipe, WrittenName)
 	SubscriptRecipe(ExpressionRecipe, AtLeastOne[ExpressionRecipe])
+	ListRecipe(List[ExpressionRecipe])
 
 
 private union RecipeParse:
@@ -69,20 +70,30 @@ private union SpineFrame:
 	SubscriptFrame(Span, AtLeastOne[ExpressionRecipe])
 
 
-private union ItemRecipes:
-	CallItems(List[ExpressionRecipe])
-	SubscriptItems(AtLeastOne[ExpressionRecipe])
-
-
+-- The brackets of a postfix step: a list literal is an atom, never a step.
 private enum PostfixDelimiter:
 	CallDelimiter
 	SubscriptDelimiter
 
 
-private union ItemsParse:
-	ParsedItems(ItemRecipes)
+-- The bracket pair around a comma-separated item list.
+private union ItemDelimiter:
+	PostfixItems(PostfixDelimiter)
+	ListItems
+
+
+-- A rejected or unsupported list is abandoned whole: only a list that read to
+-- its end carries items.
+private union ItemsParse[T]:
+	ParsedItems(T)
 	UnsupportedItems
 	RejectedItems
+
+
+-- The closing bracket, consumed, with its span.
+private union ClosingParse:
+	ClosedAt(Span)
+	NotClosed(Abandonment)
 
 
 -- Why recognition gave up. An unsupported shape restores the caller's entry
@@ -241,45 +252,102 @@ private pure func member_step(
 private pure func delimited_step(
 	state: ParseState, line: Int, receiver: ExpressionRecipe, delimiter: PostfixDelimiter,
 ) -> (ParseState, ChainStep[ExpressionRecipe]):
-	end = closing_token(delimiter)
-	(after_items, items) = parse_items(state.advanced(), line, delimiter)
+	opened = state.advanced()
+	match delimiter:
+		CallDelimiter:
+			(after_items, items) = parse_optional_items(opened, line, PostfixItems(CallDelimiter))
+			(closed, closed_items) = after_items.closing_items(items, line, PostfixItems(CallDelimiter))
+			closed.postfix_items_step(receiver, closed_items, pure func(arguments):
+				CallRecipe(receiver, arguments)
+			)
+		SubscriptDelimiter:
+			(after_items, items) = parse_nonempty_items(opened, line, PostfixItems(SubscriptDelimiter))
+			(closed, closed_items) = after_items.closing_items(items, line, PostfixItems(SubscriptDelimiter))
+			closed.postfix_items_step(receiver, closed_items, pure func(indices):
+				SubscriptRecipe(receiver, indices)
+			)
+
+
+private pure func postfix_items_step[T](
+	state: ParseState, receiver: ExpressionRecipe, items: ItemsParse[(T, Span)], recipe_kind: pure (T) -> RecipeKind,
+) -> (ParseState, ChainStep[ExpressionRecipe]):
+	match items:
+		ParsedItems((values, end_span)):
+			(state, Extended({ span = receiver.span.span_covering(end_span), kind = recipe_kind(values) }))
+		UnsupportedItems:
+			(state, Abandoned(UnsupportedShape))
+		RejectedItems:
+			(state, Abandoned(RejectedShape))
+
+
+private pure func closing_token(delimiter: ItemDelimiter) -> TokenKind:
+	match delimiter:
+		PostfixItems(CallDelimiter): RightParenSymbol
+		PostfixItems(SubscriptDelimiter) | ListItems: RightBracketSymbol
+
+
+private pure func unclosed_delimiter_diagnostic(delimiter: ItemDelimiter) -> ExpectedTokenDiagnostic:
+	match delimiter:
+		PostfixItems(CallDelimiter): ExpectedRightParen(RightParenInCallArguments)
+		PostfixItems(SubscriptDelimiter): ExpectedRightBracket(RightBracketInSubscript)
+		ListItems: ExpectedRightBracket(RightBracketInListLiteral)
+
+
+-- Pair parsed items with their consumed closing bracket. A failure to close
+-- abandons the items whole, with the reason `close_items` gave.
+private pure func closing_items[T](
+	state: ParseState, items: ItemsParse[T], line: Int, delimiter: ItemDelimiter,
+) -> (ParseState, ItemsParse[(T, Span)]):
 	match items:
 		ParsedItems(values):
-			if after_items.current_kind() == end and after_items.on_line(line):
-				span = receiver.span.span_covering(after_items.current_span())
-				kind = match values:
-					CallItems(args): CallRecipe(receiver, args)
-					SubscriptItems(indices): SubscriptRecipe(receiver, indices)
-				(after_items.advanced(), Extended({ span = span, kind = kind }))
-			else if after_items.current_kind() == EndOfFileToken:
-				(after_items.expect_token(end, unclosed_delimiter_diagnostic(delimiter)), Abandoned(RejectedShape))
-			else:
-				(after_items, Abandoned(UnsupportedShape))
+			(closed, closing) = state.close_items(line, delimiter)
+			match closing:
+				ClosedAt(end_span): (closed, ParsedItems((values, end_span)))
+				NotClosed(UnsupportedShape): (closed, UnsupportedItems)
+				NotClosed(RejectedShape): (closed, RejectedItems)
 		UnsupportedItems:
-			(after_items, Abandoned(UnsupportedShape))
+			(state, UnsupportedItems)
 		RejectedItems:
-			(after_items, Abandoned(RejectedShape))
+			(state, RejectedItems)
 
 
-private pure func closing_token(delimiter: PostfixDelimiter) -> TokenKind:
-	match delimiter:
-		CallDelimiter: RightParenSymbol
-		SubscriptDelimiter: RightBracketSymbol
+-- Consume the closing bracket on the opening line. At end of source the list
+-- is unclosed and rejected; any other token (a newline, a different bracket,
+-- a missing comma) belongs to a shape this slice leaves unsupported.
+private pure func close_items(state: ParseState, line: Int, delimiter: ItemDelimiter) -> (ParseState, ClosingParse):
+	end = closing_token(delimiter)
+	if state.current_kind() == end and state.on_line(line):
+		(state.advanced(), ClosedAt(state.current_span()))
+	else if state.current_kind() == EndOfFileToken:
+		(state.expect_token(end, unclosed_delimiter_diagnostic(delimiter)), NotClosed(RejectedShape))
+	else:
+		(state, NotClosed(UnsupportedShape))
 
 
-private pure func unclosed_delimiter_diagnostic(delimiter: PostfixDelimiter) -> ExpectedTokenDiagnostic:
-	match delimiter:
-		CallDelimiter: ExpectedRightParen(RightParenInCallArguments)
-		SubscriptDelimiter: ExpectedRightBracket(RightBracketInSubscript)
+-- Call arguments and list items may be empty; subscript indices may not.
+-- Recursion follows item bracket nesting, never the callee spine.
+private pure func parse_optional_items(state: ParseState, line: Int, delimiter: ItemDelimiter) -> (ParseState, ItemsParse[List[ExpressionRecipe]]):
+	if state.current_kind() == closing_token(delimiter):
+		(state, ParsedItems([]))
+	else:
+		(after_items, items) = parse_nonempty_items(state, line, delimiter)
+		match items:
+			ParsedItems(values):
+				(after_items, ParsedItems(at_least_one_items(values)))
+			UnsupportedItems:
+				(after_items, UnsupportedItems)
+			RejectedItems:
+				(after_items, RejectedItems)
 
 
--- Recursion follows argument bracket nesting, never the callee spine.
-private pure func parse_items(state: ParseState, line: Int, delimiter: PostfixDelimiter) -> (ParseState, ItemsParse):
+-- A missing first item reports `expected expression` at the closing bracket,
+-- which is how an empty subscript is rejected.
+private pure func parse_nonempty_items(
+	state: ParseState, line: Int, delimiter: ItemDelimiter,
+) -> (ParseState, ItemsParse[AtLeastOne[ExpressionRecipe]]):
 	end = closing_token(delimiter)
 	if state.current_kind() == EndOfFileToken:
 		(state.expect_token(end, unclosed_delimiter_diagnostic(delimiter)), RejectedItems)
-	else if state.current_kind() == end and delimiter == CallDelimiter:
-		(state, ParsedItems(CallItems([])))
 	else:
 		(first_state, first_result) = parse_operators(state, line, Operators.LOWEST_PRECEDENCE)
 		match first_result:
@@ -289,15 +357,9 @@ private pure func parse_items(state: ParseState, line: Int, delimiter: PostfixDe
 					next_item_step(current, line, end, items)
 				)
 				match abandoned:
-					None:
-						values = match delimiter:
-							CallDelimiter: CallItems([first].concat(rest))
-							SubscriptDelimiter: SubscriptItems({ first = first, rest = rest })
-						(out, ParsedItems(values))
-					Some(UnsupportedShape):
-						(out, UnsupportedItems)
-					Some(RejectedShape):
-						(out, RejectedItems)
+					None: (out, ParsedItems({ first = first, rest = rest }))
+					Some(UnsupportedShape): (out, UnsupportedItems)
+					Some(RejectedShape): (out, RejectedItems)
 			UnsupportedRecipe:
 				(first_state, UnsupportedItems)
 			RejectedRecipe:
@@ -378,6 +440,16 @@ private pure func parse_atom(state: ParseState, line: Int) -> (ParseState, Recip
 								(parsed, UnsupportedRecipe)
 						_:
 							(parsed, inner)
+			LeftBracketSymbol:
+				(after_items, items) = parse_optional_items(state.advanced(), line, ListItems)
+				(closed, closed_items) = after_items.closing_items(items, line, ListItems)
+				match closed_items:
+					ParsedItems((elements, end_span)):
+						(closed, ParsedRecipe({ span = span.span_covering(end_span), kind = ListRecipe(elements) }))
+					UnsupportedItems:
+						(closed, UnsupportedRecipe)
+					RejectedItems:
+						(closed, RejectedRecipe)
 			EndOfFileToken | RightParenSymbol | RightBracketSymbol:
 				(state.report_at_current(ExpectedExpressionDiagnostic), RejectedRecipe)
 			_:
@@ -460,6 +532,14 @@ private pure func mint_nonbinary_recipe(state: ParseState, recipe: ExpressionRec
 		GroupingRecipe(inner):
 			(parsed, value) = state.mint_recipe(inner)
 			(parsed, { value | span = recipe.span })
+		ListRecipe(items):
+			var out = state
+			var elements: List[Expression] = []
+			for item in items:
+				(after_item, element) = out.mint_recipe(item)
+				out = after_item
+				elements = elements.append(element)
+			out.finished_expression(recipe.span, ListLiteral(elements))
 		BinaryRecipe(_, _, _) | CallRecipe(_, _) | FieldRecipe(_, _) | SubscriptRecipe(_, _):
 			-- This recursion boundary is total; mint_recipe owns the left-spine loop.
 			state.mint_recipe(recipe)

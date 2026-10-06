@@ -6,7 +6,7 @@ import:
 		NameTable, EMPTY_NAME_TABLE, IdentifierSpellings(SpellingsFromIdentifierText, SpellingsFromNameTable), name_table_spellings
 	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
 	../../../src/compiler/stage_03_parse/parsed_ast:
-		ParsedExpr(ParsedBinaryExpr, ParsedNameExpr, ParsedIntLiteralExpr, ParsedVoidExpr, ParsedCallExpr, ParsedFieldAccessExpr, ParsedSubscriptExpr), ParsedBinaryOp(ParsedAddOp)
+		ParsedExpr(ParsedBinaryExpr, ParsedNameExpr, ParsedIntLiteralExpr, ParsedVoidExpr, ParsedCallExpr, ParsedFieldAccessExpr, ParsedSubscriptExpr, ParsedListExpr), ParsedBinaryOp(ParsedAddOp)
 	../../../src/compiler/stage_03_parse/parsed_ast_json: ast_json_render, parsed_decl_to_json
 	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
 	../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state, issued_ids, spellings
@@ -74,6 +74,8 @@ func test_supported_expressions_match_old_ast_json() -> Bool:
 		"root.member(nested(007, other.field), (third + fourth))[index * 2, last,]().tail",
 		"f((007), ((007.500)))[007].member + other[index] * last()",
 		"(left + right)(argument)", "((target[first]))[second]",
+		"[]", "[a]", "[a, b,]", "[007, (007.500), [c, [d]], []]", "[f(x), y.z, w[0]]", "[a + b, not c, -d]",
+		"[a, b].member", "[a][0]", "([a])", "(([007]))", "f([a], [b,])", "-[1]", "[a] + [b] * [c]", "[(a)] .. [(b)]",
 	]:
 		correct = declaration_projection_matches("value = ${expression}") and correct
 	correct
@@ -211,6 +213,101 @@ func test_parsed_method_chain_dump_and_census() -> Bool:
 				_: False
 
 
+func test_list_names_follow_written_order() -> Bool:
+	match projected_expression("value = [first, [second, third.fourth], fifth(sixth), seventh]"):
+		Some((names, _)):
+			name_table_spellings(names) == ["first", "second", "third", "fourth", "fifth", "sixth", "seventh"]
+		None: False
+
+
+-- Dump and census walk the parsed tree, so this also proves nested lists
+-- survive both. Each list contributes its own expression after its element.
+func test_parsed_nested_lists_survive_dump_census_and_projection() -> Bool:
+	depth = 1000
+	var text: String = "value = "
+	var level: Int = 0
+	while level < depth:
+		text += "["
+		level += 1
+	text += "leaf"
+	while level > 0:
+		text += "]"
+		level -= 1
+	module = module_id_at_row(0)
+	lexed = lex_module(module, text)
+	match new_parse_state(lexed):
+		Err(_): False
+		Ok(entry):
+			(at_value, result) = parse_declaration_preview(entry)
+			match result:
+				DeferredGlobalInitializer(preview):
+					(completed, completion) = complete_expression_global(at_value, preview)
+					match completion:
+						CompletedExpressionGlobal(declaration):
+							issued = issued_ids(completed)
+							syntax: ModuleSyntax = {
+								documentation = None, items = [GlobalItem(declaration)],
+								definitions = issued.definitions, imports = issued.imports, counts = issued.counts
+							}
+							dumped = dumped_module(syntax, spellings(completed))
+							var projected_depth: Int = 0
+							match legacy_expression_preview(preview_source(lexed), EMPTY_NAME_TABLE, declaration.value):
+								Ok((names, projected)):
+									var current: ParsedExpr = projected
+									var walking: Bool = name_table_spellings(names) == ["leaf"]
+									while walking:
+										match current:
+											ParsedListExpr([element], _):
+												current = element
+												projected_depth += 1
+											_: walking = False
+								Err(_): void
+							(id_census(module, syntax).is_empty()
+								and issued.counts.expressions == depth + 1
+								and issued.counts.name_uses == 1
+								and issued.definitions.length() == 1
+								and dumped.split("(list expr").length() == depth + 1
+								and projected_depth == depth)
+						_: False
+				_: False
+
+
+-- The dump walks directly nested lists with an explicit stack; its text must
+-- stay exactly the nested parenthesized form, in id order child-first.
+func test_nested_list_dump_text() -> Bool:
+	lexed = lex_module(module_id_at_row(0), "value = [first, [second, []], [], 007]")
+	match new_parse_state(lexed):
+		Err(_): False
+		Ok(entry):
+			(at_value, result) = parse_declaration_preview(entry)
+			match result:
+				DeferredGlobalInitializer(preview):
+					(completed, completion) = complete_expression_global(at_value, preview)
+					match completion:
+						CompletedExpressionGlobal(declaration):
+							issued = issued_ids(completed)
+							syntax: ModuleSyntax = {
+								documentation = None, items = [GlobalItem(declaration)],
+								definitions = issued.definitions, imports = issued.imports, counts = issued.counts
+							}
+							dumped_module(syntax, spellings(completed)) == "(module\n  (global def0 public @0..38 constant \"value\"@0..5 - (list expr6 @8..38 (name expr0 @9..14 use0:\"first\"@9..14) (list expr3 @16..28 (name expr1 @17..23 use1:\"second\"@17..23) (list expr2 @25..27)) (list expr4 @30..32) (integer expr5 @34..37 7))))"
+						_: False
+				_: False
+
+
+func test_wide_list_projects_every_element_in_order() -> Bool:
+	var text: String = "value = ["
+	var count: Int = 0
+	while count < 3000:
+		text += "item${count}, "
+		count += 1
+	text += "last]"
+	match projected_expression(text):
+		Some((names, ParsedListExpr(items, _))):
+			items.length() == count + 1 and name_table_spellings(names).length() == count + 1
+		_: False
+
+
 func test_deep_postfix_spine_projects_iteratively() -> Bool:
 	var text: String = "value = root"
 	var steps: Int = 0
@@ -274,6 +371,10 @@ tests: TestSuite = {
 		("postfix names follow written order", test_postfix_names_follow_written_order),
 		("postfix integer provenance fails closed", test_postfix_integer_provenance_fails_closed),
 		("parsed method chain survives dump and ID census", test_parsed_method_chain_dump_and_census),
+		("list names follow written order", test_list_names_follow_written_order),
+		("1000 nested lists survive dump, census and projection", test_parsed_nested_lists_survive_dump_census_and_projection),
+		("nested list dump text", test_nested_list_dump_text),
+		("3000 element list projects in order", test_wide_list_projects_every_element_in_order),
 		("deep postfix projection uses an iterative walk", test_deep_postfix_spine_projects_iteratively),
 		("deep binary projection uses an iterative walk", test_deep_binary_left_spine_projects_iteratively)
 	]
