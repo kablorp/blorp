@@ -1,0 +1,264 @@
+-- Completed function bodies: the tree scan's statements and blocks, projected
+-- for the frozen parser, equal its own parse; and the walks that follow a
+-- source's length are loops.
+import:
+	../../../src/compiler/discovery_adapter: legacy_declaration_projection, LegacyDeclarationPreviewError(UnsupportedBodyStatement, MissingIntegerLiteralToken, UnsupportedGlobalInitializerExpression)
+	../../../src/compiler_new/stage_01_discovery/tables/span: span_start, span_end
+	../../../src/compiler/stage_02_lex/name_table: EMPTY_NAME_TABLE, IdentifierSpellings(SpellingsFromIdentifierText, SpellingsFromNameTable)
+	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../src/compiler/stage_03_parse/parsed_ast: ParsedDecl(FunctionParsedDecl), ParsedExpr(ParsedBlockExpr, ParsedIfExpr), ParsedElseBranch
+	../../../src/compiler/stage_03_parse/parsed_ast_json: ast_json_render, parsed_decl_to_json
+	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state, issued_ids, spellings
+	../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_source
+	../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser: DeclarationPreview(CompletedFunctionPreview)
+	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
+		scan_module_declaration_prefix_with_bodies, ModuleDeclarationScanStop(ReachedEndOfSource)
+	../../../src/compiler_new/stage_01_discovery/syntax/dump: dumped_module
+	../../../src/compiler_new/stage_01_discovery/syntax/id_census: id_census
+	../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: ModuleSyntax, ModuleItem(FunctionItem)
+	../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../src/lib/source: source_file
+	test: TestSuite
+
+
+private pure func source_lines(lines: List[String]) -> String:
+	lines.join("\n") + "\n"
+
+
+-- Whether the tree scan completes every declaration of `text`, and its
+-- projection equals the frozen parser's declaration for declaration.
+private func bodies_match_old_parser(text: String) -> Bool:
+	source = source_file("/tmp/tree_body_projection.brp", "tree_body_projection", text)
+	old = parse_compiler_source(source)
+	lexed = lex_module(module_id_at_row(0), text)
+	match new_parse_state(lexed):
+		Err(_): False
+		Ok(entry):
+			(_, scan) = scan_module_declaration_prefix_with_bodies(entry)
+			reached_end: Bool = match scan.stop:
+				ReachedEndOfSource: True
+				_: False
+			if not old.diagnostics.is_empty() or not reached_end:
+				print("scan stopped or the old parser rejected: ${text}")
+				False
+			else:
+				match legacy_declaration_projection(preview_source(lexed), scan, EMPTY_NAME_TABLE):
+					Err(UnsupportedBodyStatement(span)):
+						print("unsupported statement at ${span.span_start()}..${span.span_end()}: ${text}")
+						False
+					Err(MissingIntegerLiteralToken(span)):
+						print("integer token missing ${span.span_start()}")
+						False
+					Err(UnsupportedGlobalInitializerExpression(span)):
+						print("unsupported expression ${span.span_start()}..${span.span_end()}")
+						False
+					Err(_):
+						print("projection error: ${text}")
+						False
+					Ok(projected):
+						var correct: Bool = projected.declarations.length() == old.decls.length()
+						var index: Int = 0
+						while correct and index < old.decls.length():
+							match (old.decls.get(index), projected.declarations.get(index)):
+								(Some(expected), Some(actual)):
+									expected_json = parsed_decl_to_json(ast_json_render(source, SpellingsFromIdentifierText), expected).to_string()
+									actual_json = parsed_decl_to_json(ast_json_render(source, SpellingsFromNameTable(projected.names)), actual).to_string()
+									if expected_json != actual_json:
+										print("declaration ${index} expected: ${expected_json}\nactual: ${actual_json}")
+										correct = False
+								_: correct = False
+							index += 1
+						correct
+
+
+func test_expression_body_matches_old_parser() -> Bool:
+	first: Bool = bodies_match_old_parser("func inc(x: Int) -> Int: x + 1\n")
+	bodies_match_old_parser("pure func zero() -> Int: 0\n") and first
+
+
+func test_block_statements_match_old_parser() -> Bool:
+	bodies_match_old_parser(source_lines([
+		"func g(xs: List[Int]) -> Int:",
+		"\tvar total: Int = 0",
+		"\tcount: Int = 3",
+		"\tlater = total + count",
+		"\t_ = later",
+		"\ttotal += 1",
+		"\ttotal -= 2",
+		"\ttotal *= 3",
+		"\ttotal /= 4",
+		"\txs[0] = total",
+		"\txs[0, 1] = (total)",
+		"\t-total",
+		"\ttotal"
+	]))
+
+
+func test_declaration_metadata_matches_old_parser() -> Bool:
+	bodies_match_old_parser(source_lines([
+		"private pure func hidden(x: Int) -> Int:",
+		"\tx",
+		"",
+		"--- Documented.",
+		"@tail_recursive",
+		"func documented[T](x: T) -> T:",
+		"\tx"
+	]))
+
+
+func test_control_flow_matches_old_parser() -> Bool:
+	bodies_match_old_parser(source_lines([
+		"func g(xs: List[Int]) -> Int:",
+		"\tvar total: Int = 0",
+		"\tfor x in xs:",
+		"\t\tif x < 0:",
+		"\t\t\tcontinue",
+		"\t\telse if x == 7:",
+		"\t\t\tbreak",
+		"\t\telse:",
+		"\t\t\ttotal += x",
+		"\twhile total > 100:",
+		"\t\ttotal -= 1",
+		"\t\tif total == 50:",
+		"\t\t\tbreak",
+		"\tfor _ in xs:",
+		"\t\ttotal += 1",
+		"\ttotal"
+	]))
+
+
+func test_match_statements_match_old_parser() -> Bool:
+	bodies_match_old_parser(source_lines([
+		"func g(value: Int) -> Int:",
+		"\tmatch value:",
+		"\t\t0: value",
+		"\t\t-1: value + 1",
+		"\t\t2.5: value",
+		"\t\tTrue: 0",
+		"\t\t\"text\": 1",
+		"\t\t'c': 2",
+		"\t\tSome(inner): inner",
+		"\t\tmodule.Circle(radius, _): radius",
+		"\t\t(left, right): left",
+		"\t\t[first, second, ...rest]: first",
+		"\t\t[..._]: 0",
+		"\t\t7 | 8 | 9: 3",
+		"\t\t_:",
+		"\t\t\tvar local = value",
+		"\t\t\tlocal",
+		"\tvalue"
+	]))
+
+
+func test_nested_blocks_match_old_parser() -> Bool:
+	bodies_match_old_parser(source_lines([
+		"func g(value: Int) -> Int:",
+		"\tif value > 0:",
+		"\t\tif value > 1:",
+		"\t\t\tif value > 2:",
+		"\t\t\t\tvalue",
+		"\t\t\telse:",
+		"\t\t\t\t0",
+		"\t\telse if value > 3:",
+		"\t\t\t1",
+		"\telse:",
+		"\t\tmatch value:",
+		"\t\t\t0:",
+		"\t\t\t\tfor item in value:",
+		"\t\t\t\t\tif item:",
+		"\t\t\t\t\t\tbreak",
+		"\t\t\t_: 2",
+		"\tvalue"
+	]))
+
+
+func test_several_declarations_match_old_parser() -> Bool:
+	bodies_match_old_parser(source_lines([
+		"first = 1",
+		"",
+		"func one() -> Int: first",
+		"",
+		"func two(x: Int) -> Int:",
+		"\tx",
+		"",
+		"func three():",
+		"\tvoid"
+	]))
+
+
+-- The projected body of the only function of `text`: the old parser's
+-- `ParsedFunctionDecl.body`, shaped by the tree path.
+private func projected_function_body(text: String) -> Option[ParsedExpr]:
+	lexed = lex_module(module_id_at_row(0), text)
+	match new_parse_state(lexed):
+		Err(_): None
+		Ok(entry):
+			(_, scan) = scan_module_declaration_prefix_with_bodies(entry)
+			match legacy_declaration_projection(preview_source(lexed), scan, EMPTY_NAME_TABLE):
+				Err(_): None
+				Ok(projected):
+					match projected.declarations.get(0):
+						Some(FunctionParsedDecl(function)): function.body
+						_: None
+
+
+-- The chain is nested in the else branches, so the walk descends by a loop.
+func test_deep_else_if_chain_projects_by_a_loop() -> Bool:
+	links = 2000
+	var lines: List[String] = ["func f(a: Int) -> Int:", "\tif a:", "\t\t0"]
+	var written: Int = 1
+	while written < links:
+		lines = lines.append("\telse if a:")
+		lines = lines.append("\t\t${written}")
+		written += 1
+	lines = lines.append("\telse:")
+	lines = lines.append("\t\t${links}")
+	match projected_function_body(source_lines(lines)):
+		Some(ParsedBlockExpr([ParsedIfExpr(_, _, first_else, _)], _)):
+			var current: Option[ParsedElseBranch] = first_else
+			var depth: Int = 1
+			var correct: Bool = True
+			while current.is_some():
+				match current:
+					Some(branch):
+						match branch.body:
+							ParsedIfExpr(_, _, next, _):
+								depth += 1
+								current = next
+							_:
+								-- The last arm is the `else:` block, not another `if`.
+								current = None
+					None:
+						correct = False
+			correct and depth == links
+		_: False
+
+
+func test_long_statement_list_projects_in_order() -> Bool:
+	count = 5000
+	var lines: List[String] = ["func f() -> Int:"]
+	var written: Int = 0
+	while written < count:
+		lines = lines.append("\tvalue${written} = ${written}")
+		written += 1
+	lines = lines.append("\tvalue0")
+	match projected_function_body(source_lines(lines)):
+		Some(ParsedBlockExpr(items, _)): items.length() == count + 1
+		_: False
+
+
+tests: TestSuite = {
+	description = "Tree statement and block legacy projection",
+	tests = [
+		("expression bodies match the old parser", test_expression_body_matches_old_parser),
+		("block statements match the old parser", test_block_statements_match_old_parser),
+		("declaration metadata matches the old parser", test_declaration_metadata_matches_old_parser),
+		("control flow matches the old parser", test_control_flow_matches_old_parser),
+		("match statements match the old parser", test_match_statements_match_old_parser),
+		("nested blocks match the old parser", test_nested_blocks_match_old_parser),
+		("several declarations match the old parser", test_several_declarations_match_old_parser),
+		("a 2000 link else if chain projects by a loop", test_deep_else_if_chain_projects_by_a_loop),
+		("5000 statements project in order", test_long_statement_list_projects_in_order)
+	]
+}

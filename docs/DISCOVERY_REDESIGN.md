@@ -1736,6 +1736,13 @@ split above follows that. Assignment is a statement only. The parser rejects
 `(x,)`; both were accepted before and neither has a syntax type here (decided
 2026-10-05).
 
+**Spans.** A block's span runs from its first statement to its last, and a
+statement's from its first token to the end of its value or body. An `if`
+ends with its last branch's block. A `match` ends at the dedent token that
+closes its arms, as the frozen parser's does, so it reaches the start of the
+next line's first token. Parity with the frozen parser requires that rule, so
+it is part of the tree, not of the projection.
+
 ### 3.13 Control flow, interpolation and concurrency
 
 ```blorp
@@ -3375,6 +3382,51 @@ implementations, 310 unsupported globals and 75 ends of source, and zero
 rejected or non-progress stops. The stops did not move, so this run does not
 by itself show list coverage in the corpus; the list parity evidence is the
 AST-JSON differential over 14 list shapes in the projection suite.
+
+The statements-and-blocks slice completes top-level functions whose body the
+new body parser reads in full: an expression body, or an indented block of
+`var`, `x: T = v`, `x = v`, `_ = v`, `x op= v`, `xs[i] = v`, expression
+statements, `if` / `else if` / `else` and `match` (block or same-line cases)
+in statement position, `while`, `for name in iterable`, `break` and
+`continue`. Recognition builds an ID-free recipe over the expression slice's
+now public recipes (an `else if` chain is a flat list of links, a block a
+list of statements) and accepts the whole body or none of it. Minting then
+issues every id in source order, children before their owner: an `else if`
+before the link that owns it, a subscript place before its value, and the
+function after both its header and its body. A written type or a pattern
+issues ids of its own, so recognition parses one only to learn where it ends
+and discards what it issued (`resumed_after`); minting parses it again from
+the recorded token (`resumed_at`), which keeps every id family in source
+order. The function's skipped body is replayed the same way from the extent
+its header recorded, and must end where that extent ends. Everything else
+(`?=`, tuple destructuring, local functions, `concurrent`, `select`, `with`,
+`debug:`, a value on the line after its operator, any expression the
+expression slice rolls back, a syntax error, and forward declarations)
+restores the exact entry state: the scan keeps today's skipped-body preview
+and the projection stops at that function. `scan_module_declaration_prefix_with_bodies`
+opts in; the other scans are unchanged. Statements, blocks and `else if`
+chains project through loops (`legacy_body_preview`), patterns through every
+pattern form, and a `match` ends at the dedent token that closes its arms,
+which the frozen parser's span reaches and the tree therefore carries.
+
+On a fresh build of main `6af65febc` plus this change, the 3,403-module
+"every corpus file as a root" run compared 8,137 completed declarations, 2,759
+of them functions with bodies, against 5,241 before. The modules whose first
+stop is a function fell from 2,903 to 2,017; trait and implementation stops
+read 66 and 65 (62 and 61 before), global initializers 359 (300), because a
+module that used to stop at its first function now reaches its later owners.
+There were zero rejected or non-progress stops and zero differing files in the
+3,560-file parity gate. Function bodies are the dominant remaining stop: the
+next slices are the expression forms they still roll back on (string and
+character literals and interpolation first, then `?=`, tuples and braced
+forms from the parallel expression work) and then trait and implementation
+method bodies, which replay through the same `complete_function`. Focused
+checks passed 9/9 (body parser, with zero leaked objects) and 9/9 (projection,
+likewise), adapter 123/123, expression projection 15/15 and rejected
+differential 8/8. The depth checks run a 2,000-link `else if` chain through
+parse (the census holds), dump and projection to a 2,000-deep `ParsedIfExpr`,
+and 5,000 statements through the same three. `compiler-new` passed 853/853,
+`compiler-new-parity` 3,560/3,560 and `compiler-blorp` 6,629/6,629.
 
 Validation before the main reconciliation, at `a5ae15eab`:
 

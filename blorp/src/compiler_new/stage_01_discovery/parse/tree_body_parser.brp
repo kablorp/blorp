@@ -1,0 +1,900 @@
+-- The statement-and-block slice of M4: indented blocks of the statements
+-- below, and the top-level function bodies made of them. It follows the
+-- expression slice's discipline. Recognition builds ID-free recipes and
+-- accepts the whole body or none of it; only then does minting issue every
+-- id, in source order, children before their owner.
+--
+-- Supported statements: an expression, `var`, `x: T = v`, `x = v`, `_ = v`,
+-- `x op= v`, `xs[i] = v`, `if` / `else if` / `else`, `match` with block or
+-- same-line cases, `while`, `for name in iterable`, `break` and `continue`.
+-- Anything else (`?=`, tuple destructuring, local functions, `concurrent`,
+-- `select`, `with`, `debug:`, a value on the line after its operator, an
+-- expression the expression slice does not read, a syntax error) is
+-- unsupported: the entry points return the exact state they were given.
+--
+-- Recipes are walked by loops wherever the source can make them long: the
+-- statements of a block and the links of an `else if` chain. Recursion
+-- follows only the indentation the source itself nests.
+--
+-- A written type or a pattern issues ids of its own. Recognition parses one
+-- only to learn where it ends and where it is valid, discards the ids it
+-- issued (`resumed_after`), and records the token it started at; minting
+-- parses it again from there, so its ids follow its neighbours' in source
+-- order. The same replay restarts a function's skipped body.
+import:
+	../syntax/declarations: FunctionDeclaration
+	../syntax/expressions:
+		AssignmentTarget(AssignsName, AssignsDiscard), Block, Body(BlockBody, ExpressionBody), CaseBody(CaseBlock, CaseStatement),
+		CompoundOperator(AddAssign, SubtractAssign, MultiplyAssign, DivideAssign), ElseBody(ElseBlock, ElseIf), ElseBranch, Expression,
+		ExpressionKind(If, Match, Break, Continue), LoopBinder(LoopVariable), MatchCase, Statement,
+		StatementKind(ExpressionStatement, VariableDeclaration, TypedBinding, Assignment, CompoundAssignment, SubscriptAssignment, WhileLoop, ForLoop)
+	../syntax/names: BindingTarget(BindsName, DiscardsValue), WrittenName
+	../syntax/patterns: Pattern
+	../syntax/sequences: AtLeastOne
+	../syntax/types: WrittenType
+	../tables/expected_token: NameConstruct(NameInStatementName, NameInVariableName)
+	../tables/span: Span, span_covering
+	../tables/token:
+		TokenKind(IdentifierToken, UnderscoreSymbol, VarKeyword, WhileKeyword, ForKeyword, IfKeyword, ElseKeyword, MatchKeyword,
+			BreakKeyword, ContinueKeyword, InKeyword, AsKeyword, EqualSymbol, ColonSymbol, PlusEqualSymbol, MinusEqualSymbol,
+			StarEqualSymbol, SlashEqualSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken, DotSymbol)
+	binary_operators: binary_operator
+	parse_state:
+		ParseState, current_kind, current_span, peek_kind, position, advanced, diagnostic_count, span_start_line,
+		consume_referenced_name, finished_expression, finished_statement, finished_block, finished_else_if,
+		finished_subscript_place, finished_function, finished_name_use, finished_binder, resumed_at, resumed_after
+	tree_expression_parser: ExpressionRecipe, RecipeKind(SubscriptRecipe), RecipeParse(ParsedRecipe), parse_expression_recipe, mint_recipe
+	tree_function_header_parser:
+		FunctionHeaderPreview, FunctionBodyExtent(SkippedBody), deferred_body_token_start, deferred_body_token_end
+	tree_pattern_parser: parse_pattern
+	tree_type_parser: parse_type
+
+
+-- Whether `break` and `continue` have a loop to leave. A parameter: a nested
+-- loop body passes `InsideLoop` down and nothing saves or restores it.
+private enum BodyContext:
+	OutsideLoop
+	InsideLoop
+
+
+-- A written type, replayed at minting from the token it starts at.
+private record TypeRecipe {
+	token: Int
+}
+
+
+-- A pattern, replayed at minting from its first token. `span` is the extent
+-- the recognition parse measured, which the case's own span covers.
+private record PatternRecipe {
+	token: Int,
+	span: Span
+}
+
+
+private record StatementRecipe {
+	span: Span,
+	kind: StatementRecipeKind
+}
+
+
+private union StatementRecipeKind:
+	ExpressionStatementRecipe(ExpressionRecipe)
+	LoopExitRecipe(LoopExit)
+	ConditionalStatementRecipe(ConditionalRecipe)
+	MatchStatementRecipe(MatchRecipe)
+	VariableRecipe(WrittenName, Option[TypeRecipe], ExpressionRecipe)
+	TypedBindingRecipe(WrittenName, TypeRecipe, ExpressionRecipe)
+	AssignmentRecipe(AssignmentTargetRecipe, ExpressionRecipe)
+	CompoundAssignmentRecipe(WrittenName, CompoundOperator, ExpressionRecipe)
+	SubscriptAssignmentRecipe(SubscriptPlaceRecipe, ExpressionRecipe)
+	WhileRecipe(ExpressionRecipe, BlockRecipe)
+	ForRecipe(LoopBindingRecipe, ExpressionRecipe, BlockRecipe)
+
+
+private enum LoopExit:
+	ExitWithBreak
+	ExitWithContinue
+
+
+private union AssignmentTargetRecipe:
+	NamedTargetRecipe(WrittenName)
+	DiscardedTargetRecipe(Span)
+
+
+private union LoopBindingRecipe:
+	LoopNameRecipe(WrittenName)
+	LoopDiscardRecipe(Span)
+
+
+private record SubscriptPlaceRecipe {
+	span: Span,
+	collection: ExpressionRecipe,
+	indices: AtLeastOne[ExpressionRecipe]
+}
+
+
+private record BlockRecipe {
+	statements: AtLeastOne[StatementRecipe]
+}
+
+
+-- An `if` and its `else` chain, flat: the chain's length is a list's length,
+-- never a nesting of recipes.
+private record ConditionalRecipe {
+	head: IfLink,
+	else_ifs: List[ElseIfLink],
+	final_else: Option[ElseBlockRecipe]
+}
+
+
+private record IfLink {
+	keyword: Span,
+	condition: ExpressionRecipe,
+	then_block: BlockRecipe
+}
+
+
+private record ElseIfLink {
+	else_keyword: Span,
+	link: IfLink
+}
+
+
+private record ElseBlockRecipe {
+	keyword: Span,
+	block: BlockRecipe
+}
+
+
+-- `end` is the closing dedent's span, which the expression's own span
+-- reaches (the frozen parser's rule).
+private record MatchRecipe {
+	keyword: Span,
+	scrutinee: ExpressionRecipe,
+	cases: AtLeastOne[CaseRecipe],
+	end: Span
+}
+
+
+private record CaseRecipe {
+	pattern: PatternRecipe,
+	body: CaseBodyRecipe
+}
+
+
+private union CaseBodyRecipe:
+	CaseBlockRecipe(BlockRecipe)
+	CaseStatementRecipe(StatementRecipe)
+
+
+-- The state of an unsupported result is meaningless: the public entry points
+-- return their own entry state.
+private union StatementParse:
+	ParsedStatement(StatementRecipe)
+	UnsupportedStatement
+
+
+private union BlockParse:
+	ParsedBlock(BlockRecipe)
+	UnsupportedBlock
+
+
+private union BodyParse:
+	ParsedBlockBody(BlockRecipe)
+	ParsedExpressionBody(ExpressionRecipe)
+	UnsupportedBody
+
+
+union FunctionCompletion:
+	CompletedFunction(FunctionDeclaration)
+	DeferredFunction
+
+
+-- `state` is where the header parser left the cursor, past the skipped body.
+-- The body is replayed from the recorded token; it must end where the skipped
+-- extent ends, apart from newlines, so the two grammars agree on the extent.
+-- A forward declaration has no body and its span ends before the colon, which
+-- this slice does not project, so it stays deferred.
+pure func complete_function(state: ParseState, preview: FunctionHeaderPreview) -> (ParseState, FunctionCompletion):
+	match preview.body_extent:
+		SkippedBody(skipped):
+			skipped_end: Int = deferred_body_token_end(skipped)
+			(recognized, parsed) = parse_body_recipe(state.resumed_at(deferred_body_token_start(skipped)), state.span_start_line(preview.header.body_colon))
+			if state.position() != skipped_end or recognized.diagnostic_count() != state.diagnostic_count() or not recognized.only_newlines_until(skipped_end):
+				(state, DeferredFunction)
+			else:
+				match parsed:
+					ParsedBlockBody(recipe):
+						(minted, block) = mint_block(recognized, recipe)
+						minted.finished_with_body(preview, BlockBody(block), block.span, skipped_end)
+					ParsedExpressionBody(recipe):
+						(minted, expression) = mint_recipe(recognized, recipe)
+						minted.finished_with_body(preview, ExpressionBody(expression), expression.span, skipped_end)
+					UnsupportedBody:
+						(state, DeferredFunction)
+		_:
+			(state, DeferredFunction)
+
+
+-- The function owns its header's ids and its body's, so it is minted last.
+private pure func finished_with_body(
+	state: ParseState, preview: FunctionHeaderPreview, body: Body, body_span: Span, end: Int,
+) -> (ParseState, FunctionCompletion):
+	header = preview.header
+	(declared, declaration) = state.finished_function(
+		header.visibility, header.documentation, header.annotations,
+		{ signature = header.signature, type_parameters = header.type_parameters, constraints = header.constraints, body = Some(body) },
+		header.header_span.span_covering(body_span)
+	)
+	(declared.resumed_at(end), CompletedFunction(declaration))
+
+
+private pure func only_newlines_until(state: ParseState, end: Int) -> Bool:
+	var ahead: Int = 0
+	var layout_only: Bool = state.position() <= end
+	while layout_only and state.position() + ahead < end:
+		layout_only = state.peek_kind(ahead) == NewlineToken
+		ahead += 1
+	layout_only
+
+
+private pure func skip_newlines(state: ParseState) -> ParseState:
+	var out: ParseState = state
+	while out.current_kind() == NewlineToken:
+		out = out.advanced()
+	out
+
+
+-- A statement or expression ends at a newline that continues nothing, at the
+-- dedent of its block, or at the end of the source. A newline followed by an
+-- indent or a leading dot starts a continuation this slice leaves unsupported.
+private pure func at_statement_boundary(state: ParseState) -> Bool:
+	match state.current_kind():
+		EndOfFileToken | DedentToken:
+			True
+		NewlineToken:
+			var ahead: Int = 1
+			while state.peek_kind(ahead) == NewlineToken:
+				ahead += 1
+			next: TokenKind = state.peek_kind(ahead)
+			next != DotSymbol and next != IndentToken
+		_:
+			False
+
+
+-- The statement after an `if` or `match` block starts where the dedent left
+-- the cursor. The frozen parser would read a binary operator there as a
+-- continuation of the block's expression.
+private pure func block_statement_ends(state: ParseState) -> Bool:
+	kind: TokenKind = state.current_kind()
+	kind != AsKeyword and kind != EqualSymbol and binary_operator(kind).is_none()
+
+
+private pure func is_on_line(state: ParseState, line: Int) -> Bool:
+	state.span_start_line(state.current_span()) == line
+
+
+-- Bodies.
+private pure func parse_body_recipe(state: ParseState, colon_line: Int) -> (ParseState, BodyParse):
+	if state.current_kind() == NewlineToken:
+		(remaining, parsed) = parse_block_recipe(state, OutsideLoop)
+		match parsed:
+			ParsedBlock(block):
+				(remaining, ParsedBlockBody(block))
+			UnsupportedBlock:
+				(remaining, UnsupportedBody)
+	else if not state.is_on_line(colon_line):
+		(state, UnsupportedBody)
+	else:
+		(remaining, value) = parse_value(state)
+		match value:
+			Some(expression):
+				(remaining, ParsedExpressionBody(expression))
+			None:
+				(remaining, UnsupportedBody)
+
+
+-- Blocks.
+private pure func parse_block_recipe(state: ParseState, context: BodyContext) -> (ParseState, BlockParse):
+	opened: ParseState = state.skip_newlines()
+	if state.current_kind() != NewlineToken or opened.current_kind() != IndentToken:
+		(state, UnsupportedBlock)
+	else:
+		var out: ParseState = opened.advanced().skip_newlines()
+		var statements: List[StatementRecipe] = []
+		var supported: Bool = True
+		while supported and out.current_kind() != DedentToken and out.current_kind() != EndOfFileToken:
+			(remaining, parsed) = parse_statement_recipe(out, context)
+			match parsed:
+				ParsedStatement(statement):
+					statements = statements.append(statement)
+					out = remaining.skip_newlines()
+				UnsupportedStatement:
+					supported = False
+		match statements:
+			[first, ...rest]:
+				if supported and out.current_kind() == DedentToken:
+					(out.advanced(), ParsedBlock({ statements = { first = first, rest = rest } }))
+				else:
+					(state, UnsupportedBlock)
+			_:
+				(state, UnsupportedBlock)
+
+
+private pure func mint_block(state: ParseState, recipe: BlockRecipe) -> (ParseState, Block):
+	(after_first, first) = mint_statement(state, recipe.statements.first)
+	var out: ParseState = after_first
+	var leading: List[Statement] = []
+	var last: Statement = first
+	for item in recipe.statements.rest:
+		(after_item, statement) = mint_statement(out, item)
+		out = after_item
+		leading = leading.append(last)
+		last = statement
+	out.finished_block(leading, last, recipe.statements.first.span.span_covering(last.span))
+
+
+-- Statements.
+private pure func parse_statement_recipe(state: ParseState, context: BodyContext) -> (ParseState, StatementParse):
+	match state.current_kind():
+		VarKeyword:
+			state.parse_variable_statement()
+		WhileKeyword:
+			state.parse_while_statement()
+		ForKeyword:
+			state.parse_for_statement()
+		IfKeyword:
+			state.parse_conditional_statement(context)
+		MatchKeyword:
+			state.parse_match_statement(context)
+		BreakKeyword | ContinueKeyword:
+			state.parse_loop_exit(context)
+		IdentifierToken:
+			match state.peek_kind(1):
+				EqualSymbol:
+					state.parse_name_assignment()
+				PlusEqualSymbol | MinusEqualSymbol | StarEqualSymbol | SlashEqualSymbol:
+					state.parse_compound_assignment()
+				ColonSymbol:
+					state.parse_typed_binding()
+				_:
+					state.parse_expression_statement()
+		UnderscoreSymbol:
+			if state.peek_kind(1) == EqualSymbol:
+				state.parse_discard_assignment()
+			else:
+				state.parse_expression_statement()
+		_:
+			state.parse_expression_statement()
+
+
+-- A statement's `value` after its operator: an expression that starts on the
+-- operator's line and ends the statement.
+private pure func parse_value(state: ParseState) -> (ParseState, Option[ExpressionRecipe]):
+	(remaining, parsed) = parse_expression_recipe(state)
+	match parsed:
+		ParsedRecipe(value):
+			if remaining.at_statement_boundary():
+				(remaining, Some(value))
+			else:
+				(state, None)
+		_:
+			(state, None)
+
+
+private pure func parse_value_after(state: ParseState, operator_line: Int) -> (ParseState, Option[ExpressionRecipe]):
+	if state.is_on_line(operator_line):
+		parse_value(state)
+	else:
+		(state, None)
+
+
+-- A statement of `kind` over `start` and its value, or unsupported.
+private pure func valued_statement(
+	state: ParseState, start: Span, value: Option[ExpressionRecipe], kind: pure (ExpressionRecipe) -> StatementRecipeKind,
+) -> (ParseState, StatementParse):
+	match value:
+		Some(recipe):
+			(state, ParsedStatement({ span = start.span_covering(recipe.span), kind = kind(recipe) }))
+		None:
+			(state, UnsupportedStatement)
+
+
+private pure func parse_expression_statement(state: ParseState) -> (ParseState, StatementParse):
+	(remaining, parsed) = parse_expression_recipe(state)
+	match parsed:
+		ParsedRecipe(target):
+			if remaining.current_kind() == EqualSymbol:
+				match target.kind:
+					SubscriptRecipe(collection, indices):
+						(after_value, value) = parse_value_after(remaining.advanced(), remaining.span_start_line(remaining.current_span()))
+						place: SubscriptPlaceRecipe = { span = target.span, collection = collection, indices = indices }
+						after_value.valued_statement(target.span, value, pure func(recipe): SubscriptAssignmentRecipe(place, recipe))
+					_:
+						(state, UnsupportedStatement)
+			else if remaining.at_statement_boundary():
+				(remaining, ParsedStatement({ span = target.span, kind = ExpressionStatementRecipe(target) }))
+			else:
+				(state, UnsupportedStatement)
+		_:
+			(state, UnsupportedStatement)
+
+
+private pure func parse_loop_exit(state: ParseState, context: BodyContext) -> (ParseState, StatementParse):
+	remaining: ParseState = state.advanced()
+	if context != InsideLoop or not remaining.at_statement_boundary():
+		(state, UnsupportedStatement)
+	else:
+		exit: LoopExit = if state.current_kind() == BreakKeyword:
+			ExitWithBreak
+		else:
+			ExitWithContinue
+		(remaining, ParsedStatement({ span = state.current_span(), kind = LoopExitRecipe(exit) }))
+
+
+-- `name = value`.
+private pure func parse_name_assignment(state: ParseState) -> (ParseState, StatementParse):
+	(named, name) = state.consume_referenced_name(NameInStatementName)
+	(after_value, value) = parse_value_after(named.advanced(), named.span_start_line(named.current_span()))
+	after_value.valued_statement(name.span, value, pure func(recipe): AssignmentRecipe(NamedTargetRecipe(name), recipe))
+
+
+-- `_ = value`.
+private pure func parse_discard_assignment(state: ParseState) -> (ParseState, StatementParse):
+	target: Span = state.current_span()
+	equal: ParseState = state.advanced()
+	(after_value, value) = parse_value_after(equal.advanced(), equal.span_start_line(equal.current_span()))
+	after_value.valued_statement(target, value, pure func(recipe): AssignmentRecipe(DiscardedTargetRecipe(target), recipe))
+
+
+private pure func parse_compound_assignment(state: ParseState) -> (ParseState, StatementParse):
+	(named, name) = state.consume_referenced_name(NameInStatementName)
+	operator: CompoundOperator = match named.current_kind():
+		PlusEqualSymbol: AddAssign
+		MinusEqualSymbol: SubtractAssign
+		StarEqualSymbol: MultiplyAssign
+		_: DivideAssign
+	(after_value, value) = parse_value_after(named.advanced(), named.span_start_line(named.current_span()))
+	after_value.valued_statement(name.span, value, pure func(recipe): CompoundAssignmentRecipe(name, operator, recipe))
+
+
+-- `x: T = value`. The colon is a type annotation only when an `=` follows
+-- the type; anything else is left to the frozen grammar's diagnostics.
+private pure func parse_typed_binding(state: ParseState) -> (ParseState, StatementParse):
+	(named, name) = state.consume_referenced_name(NameInStatementName)
+	(after_type, written) = named.advanced().recognize_type()
+	match written:
+		Some(declared):
+			if after_type.current_kind() == EqualSymbol:
+				(after_value, value) = parse_value_after(after_type.advanced(), after_type.span_start_line(after_type.current_span()))
+				after_value.valued_statement(name.span, value, pure func(recipe): TypedBindingRecipe(name, declared, recipe))
+			else:
+				(state, UnsupportedStatement)
+		None:
+			(state, UnsupportedStatement)
+
+
+-- `var x [: T] = value`.
+private pure func parse_variable_statement(state: ParseState) -> (ParseState, StatementParse):
+	keyword: Span = state.current_span()
+	if state.peek_kind(1) != IdentifierToken:
+		(state, UnsupportedStatement)
+	else:
+		(named, name) = state.advanced().consume_referenced_name(NameInVariableName)
+		(after_annotation, annotation) = named.parse_type_annotation()
+		match annotation:
+			InvalidAnnotation:
+				(state, UnsupportedStatement)
+			_:
+				if after_annotation.current_kind() != EqualSymbol:
+					(state, UnsupportedStatement)
+				else:
+					(after_value, value) = parse_value_after(after_annotation.advanced(), after_annotation.span_start_line(after_annotation.current_span()))
+					declared: Option[TypeRecipe] = match annotation:
+						Annotated(recipe): Some(recipe)
+						_: None
+					after_value.valued_statement(keyword, value, pure func(recipe): VariableRecipe(name, declared, recipe))
+
+
+private union TypeAnnotationParse:
+	NoAnnotation
+	Annotated(TypeRecipe)
+	InvalidAnnotation
+
+
+-- An optional `: T`.
+private pure func parse_type_annotation(state: ParseState) -> (ParseState, TypeAnnotationParse):
+	if state.current_kind() != ColonSymbol:
+		(state, NoAnnotation)
+	else:
+		(remaining, written) = state.advanced().recognize_type()
+		match written:
+			Some(recipe):
+				(remaining, Annotated(recipe))
+			None:
+				(state, InvalidAnnotation)
+
+
+-- A type is valid here when it parses without a diagnostic. Its ids are
+-- discarded; minting parses it again.
+private pure func recognize_type(state: ParseState) -> (ParseState, Option[TypeRecipe]):
+	(remaining, _) = parse_type(state)
+	if remaining.diagnostic_count() != state.diagnostic_count():
+		(state, None)
+	else:
+		(state.resumed_after(remaining), Some({ token = state.position() }))
+
+
+private pure func recognize_pattern(state: ParseState) -> (ParseState, Option[PatternRecipe]):
+	(remaining, pattern) = parse_pattern(state)
+	if remaining.diagnostic_count() != state.diagnostic_count():
+		(state, None)
+	else:
+		(state.resumed_after(remaining), Some({ token = state.position(), span = pattern.span }))
+
+
+-- `condition:` after a block keyword: an expression and a colon on its line.
+private pure func parse_header(state: ParseState) -> (ParseState, Option[ExpressionRecipe]):
+	line: Int = state.span_start_line(state.current_span())
+	(remaining, parsed) = parse_expression_recipe(state)
+	match parsed:
+		ParsedRecipe(condition):
+			if remaining.current_kind() == ColonSymbol and remaining.is_on_line(line):
+				(remaining.advanced(), Some(condition))
+			else:
+				(state, None)
+		_:
+			(state, None)
+
+
+private pure func parse_while_statement(state: ParseState) -> (ParseState, StatementParse):
+	keyword: Span = state.current_span()
+	(after_header, condition) = parse_header(state.advanced())
+	match condition:
+		Some(recipe):
+			(after_block, block) = parse_block_recipe(after_header, InsideLoop)
+			match block:
+				ParsedBlock(body):
+					(after_block, ParsedStatement({ span = keyword.span_covering(block_span(body)), kind = WhileRecipe(recipe, body) }))
+				UnsupportedBlock:
+					(state, UnsupportedStatement)
+		None:
+			(state, UnsupportedStatement)
+
+
+-- `for name in iterable:`. A tuple binder and `concurrently` are unsupported.
+private pure func parse_for_statement(state: ParseState) -> (ParseState, StatementParse):
+	keyword: Span = state.current_span()
+	binder_start: ParseState = state.advanced()
+	(after_binder, binding) = match binder_start.current_kind():
+		IdentifierToken:
+			(named, name) = binder_start.consume_referenced_name(NameInStatementName)
+			(named, Some(LoopNameRecipe(name)))
+		UnderscoreSymbol:
+			(binder_start.advanced(), Some(LoopDiscardRecipe(binder_start.current_span())))
+		_:
+			(binder_start, None)
+	match binding:
+		Some(loop_binding):
+			if after_binder.current_kind() != InKeyword:
+				(state, UnsupportedStatement)
+			else:
+				(after_header, iterable) = parse_header(after_binder.advanced())
+				match iterable:
+					Some(recipe):
+						(after_block, block) = parse_block_recipe(after_header, InsideLoop)
+						match block:
+							ParsedBlock(body):
+								(after_block, ParsedStatement({ span = keyword.span_covering(block_span(body)), kind = ForRecipe(loop_binding, recipe, body) }))
+							UnsupportedBlock:
+								(state, UnsupportedStatement)
+					None:
+						(state, UnsupportedStatement)
+		None:
+			(state, UnsupportedStatement)
+
+
+private pure func block_span(recipe: BlockRecipe) -> Span:
+	var last: StatementRecipe = recipe.statements.first
+	for statement in recipe.statements.rest:
+		last = statement
+	recipe.statements.first.span.span_covering(last.span)
+
+
+-- The chain is read by a loop: each `else if` appends a link.
+private pure func parse_conditional_statement(state: ParseState, context: BodyContext) -> (ParseState, StatementParse):
+	(after_head, head) = parse_if_link(state, context)
+	match head:
+		None:
+			(state, UnsupportedStatement)
+		Some(first):
+			var out: ParseState = after_head
+			var else_ifs: List[ElseIfLink] = []
+			var final_else: Option[ElseBlockRecipe] = None
+			var supported: Bool = True
+			var reading: Bool = out.current_kind() == ElseKeyword
+			while reading and supported:
+				else_keyword: Span = out.current_span()
+				after_else: ParseState = out.advanced()
+				if after_else.current_kind() == IfKeyword:
+					(after_link, link) = parse_if_link(after_else, context)
+					match link:
+						Some(parsed):
+							else_ifs = else_ifs.append({ else_keyword = else_keyword, link = parsed })
+							out = after_link
+							reading = out.current_kind() == ElseKeyword
+						None:
+							supported = False
+				else if after_else.current_kind() == ColonSymbol:
+					(after_block, block) = parse_block_recipe(after_else.advanced(), context)
+					match block:
+						ParsedBlock(recipe):
+							final_else = Some({ keyword = else_keyword, block = recipe })
+							out = after_block
+							reading = False
+						UnsupportedBlock:
+							supported = False
+				else:
+					supported = False
+			if not supported or not out.block_statement_ends():
+				(state, UnsupportedStatement)
+			else:
+				chain: ConditionalRecipe = { head = first, else_ifs = else_ifs, final_else = final_else }
+				span: Span = first.keyword.span_covering(conditional_end(chain))
+				(out, ParsedStatement({ span = span, kind = ConditionalStatementRecipe(chain) }))
+
+
+-- `if condition:` and its block, for the head and for every `else if`.
+private pure func parse_if_link(state: ParseState, context: BodyContext) -> (ParseState, Option[IfLink]):
+	keyword: Span = state.current_span()
+	(after_header, condition) = parse_header(state.advanced())
+	match condition:
+		Some(recipe):
+			(after_block, block) = parse_block_recipe(after_header, context)
+			match block:
+				ParsedBlock(then_block):
+					(after_block, Some({ keyword = keyword, condition = recipe, then_block = then_block }))
+				UnsupportedBlock:
+					(state, None)
+		None:
+			(state, None)
+
+
+-- Where the whole `if` ends: the last block it holds.
+private pure func conditional_end(chain: ConditionalRecipe) -> Span:
+	match chain.final_else:
+		Some(written):
+			block_span(written.block)
+		None:
+			match chain.else_ifs.last():
+				Some(link):
+					block_span(link.link.then_block)
+				None:
+					block_span(chain.head.then_block)
+
+
+-- `match scrutinee:` and its cases, each a block or one same-line statement.
+private pure func parse_match_statement(state: ParseState, context: BodyContext) -> (ParseState, StatementParse):
+	keyword: Span = state.current_span()
+	(after_header, scrutinee) = parse_header(state.advanced())
+	opened: ParseState = after_header.skip_newlines()
+	match scrutinee:
+		Some(subject):
+			if after_header.current_kind() != NewlineToken or opened.current_kind() != IndentToken:
+				(state, UnsupportedStatement)
+			else:
+				var out: ParseState = opened.advanced().skip_newlines()
+				var cases: List[CaseRecipe] = []
+				var supported: Bool = True
+				while supported and out.current_kind() != DedentToken and out.current_kind() != EndOfFileToken:
+					(after_case, parsed) = parse_case_recipe(out, context)
+					match parsed:
+						Some(case_recipe):
+							cases = cases.append(case_recipe)
+							out = after_case.skip_newlines()
+						None:
+							supported = False
+				match cases:
+					[first, ...rest]:
+						if supported and out.current_kind() == DedentToken and out.advanced().block_statement_ends():
+							recipe: MatchRecipe = { keyword = keyword, scrutinee = subject, cases = { first = first, rest = rest }, end = out.current_span() }
+							(out.advanced(), ParsedStatement({ span = keyword.span_covering(recipe.end), kind = MatchStatementRecipe(recipe) }))
+						else:
+							(state, UnsupportedStatement)
+					_:
+						(state, UnsupportedStatement)
+		None:
+			(state, UnsupportedStatement)
+
+
+private pure func parse_case_recipe(state: ParseState, context: BodyContext) -> (ParseState, Option[CaseRecipe]):
+	(after_pattern, pattern) = recognize_pattern(state)
+	match pattern:
+		None:
+			(state, None)
+		Some(recipe):
+			if after_pattern.current_kind() != ColonSymbol:
+				(state, None)
+			else:
+				after_colon: ParseState = after_pattern.advanced()
+				if after_colon.current_kind() == NewlineToken:
+					(after_block, block) = parse_block_recipe(after_colon, context)
+					match block:
+						ParsedBlock(body):
+							(after_block, Some({ pattern = recipe, body = CaseBlockRecipe(body) }))
+						UnsupportedBlock:
+							(state, None)
+				else if after_colon.starts_nested_block():
+					(state, None)
+				else:
+					(after_statement, statement) = parse_statement_recipe(after_colon, context)
+					match statement:
+						ParsedStatement(written):
+							(after_statement, Some({ pattern = recipe, body = CaseStatementRecipe(written) }))
+						UnsupportedStatement:
+							(state, None)
+
+
+-- A same-line case body is a simple statement. The frozen grammar anchors a
+-- block-bearing one at the pattern, which this slice leaves unsupported.
+private pure func starts_nested_block(state: ParseState) -> Bool:
+	match state.current_kind():
+		IfKeyword | MatchKeyword | WhileKeyword | ForKeyword:
+			True
+		_:
+			False
+
+
+-- Minting. Every id is issued here, in source order.
+private pure func mint_statement(state: ParseState, recipe: StatementRecipe) -> (ParseState, Statement):
+	match recipe.kind:
+		ExpressionStatementRecipe(value):
+			(remaining, expression) = mint_recipe(state, value)
+			remaining.finished_statement(recipe.span, ExpressionStatement(expression))
+		LoopExitRecipe(exit):
+			kind: ExpressionKind = match exit:
+				ExitWithBreak: Break
+				ExitWithContinue: Continue
+			(remaining, expression) = state.finished_expression(recipe.span, kind)
+			remaining.finished_statement(recipe.span, ExpressionStatement(expression))
+		ConditionalStatementRecipe(chain):
+			(remaining, expression) = mint_conditional(state, chain, recipe.span)
+			remaining.finished_statement(recipe.span, ExpressionStatement(expression))
+		MatchStatementRecipe(written):
+			(remaining, expression) = mint_match(state, written, recipe.span)
+			remaining.finished_statement(recipe.span, ExpressionStatement(expression))
+		VariableRecipe(name, declared, value):
+			(after_binder, binder) = state.finished_binder(name)
+			(after_type, declared_type) = mint_optional_type(after_binder, declared)
+			(after_value, expression) = mint_recipe(after_type, value)
+			after_value.finished_statement(recipe.span, VariableDeclaration({ target = BindsName(binder), declared_type = declared_type, value = expression }))
+		TypedBindingRecipe(name, declared, value):
+			(after_binder, binder) = state.finished_binder(name)
+			(after_type, declared_type) = mint_type(after_binder, declared)
+			(after_value, expression) = mint_recipe(after_type, value)
+			after_value.finished_statement(recipe.span, TypedBinding({ target = BindsName(binder), declared_type = declared_type, value = expression }))
+		AssignmentRecipe(target, value):
+			(after_target, written) = match target:
+				NamedTargetRecipe(name):
+					(after_use, use) = state.finished_name_use(name)
+					(after_use, AssignsName(use))
+				DiscardedTargetRecipe(span):
+					(state, AssignsDiscard(span))
+			(after_value, expression) = mint_recipe(after_target, value)
+			after_value.finished_statement(recipe.span, Assignment({ target = written, value = expression }))
+		CompoundAssignmentRecipe(name, operator, value):
+			(after_use, use) = state.finished_name_use(name)
+			(after_value, expression) = mint_recipe(after_use, value)
+			after_value.finished_statement(recipe.span, CompoundAssignment({ target = use, operator = operator, value = expression }))
+		SubscriptAssignmentRecipe(place, value):
+			(after_collection, collection) = mint_recipe(state, place.collection)
+			(after_first, first) = mint_recipe(after_collection, place.indices.first)
+			var out: ParseState = after_first
+			var rest: List[Expression] = []
+			for index in place.indices.rest:
+				(after_index, written) = mint_recipe(out, index)
+				out = after_index
+				rest = rest.append(written)
+			(after_place, minted_place) = out.finished_subscript_place(place.span, collection, { first = first, rest = rest })
+			(after_value, expression) = mint_recipe(after_place, value)
+			after_value.finished_statement(recipe.span, SubscriptAssignment({ place = minted_place, value = expression }))
+		WhileRecipe(condition, body):
+			(after_condition, expression) = mint_recipe(state, condition)
+			(after_body, block) = mint_block(after_condition, body)
+			after_body.finished_statement(recipe.span, WhileLoop({ condition = expression, body = block }))
+		ForRecipe(binding, iterable, body):
+			(after_binder, target) = match binding:
+				LoopNameRecipe(name):
+					(after_name, binder) = state.finished_binder(name)
+					(after_name, BindsName(binder))
+				LoopDiscardRecipe(span):
+					(state, DiscardsValue(span))
+			(after_iterable, expression) = mint_recipe(after_binder, iterable)
+			(after_body, block) = mint_block(after_iterable, body)
+			after_body.finished_statement(recipe.span, ForLoop({ binder = LoopVariable(target), iterable = expression, body = block }))
+
+
+private pure func mint_type(state: ParseState, recipe: TypeRecipe) -> (ParseState, WrittenType):
+	parse_type(state.resumed_at(recipe.token))
+
+
+private pure func mint_optional_type(state: ParseState, recipe: Option[TypeRecipe]) -> (ParseState, Option[WrittenType]):
+	match recipe:
+		Some(written):
+			(remaining, declared) = mint_type(state, written)
+			(remaining, Some(declared))
+		None:
+			(state, None)
+
+
+private pure func mint_pattern(state: ParseState, recipe: PatternRecipe) -> (ParseState, Pattern):
+	parse_pattern(state.resumed_at(recipe.token))
+
+
+-- A conditional frame waiting for the else-if links after it to be minted:
+-- an `else if` is minted before the link that owns it.
+private record PendingElseIf {
+	else_keyword: Span,
+	keyword: Span,
+	condition: Expression,
+	then_block: Block
+}
+
+
+-- What an `if` holds as its else branch, and where that branch ends.
+private record ElseTail {
+	branch: ElseBranch,
+	end: Span
+}
+
+
+-- Source order first: every condition and block of the chain, then the
+-- `else if` expressions from the innermost out, then the outermost `if`.
+private pure func mint_conditional(state: ParseState, chain: ConditionalRecipe, span: Span) -> (ParseState, Expression):
+	(after_condition, condition) = mint_recipe(state, chain.head.condition)
+	(after_then, then_block) = mint_block(after_condition, chain.head.then_block)
+	var out: ParseState = after_then
+	var pending: List[PendingElseIf] = []
+	for else_if in chain.else_ifs:
+		(after_link_condition, link_condition) = mint_recipe(out, else_if.link.condition)
+		(after_link_block, link_block) = mint_block(after_link_condition, else_if.link.then_block)
+		out = after_link_block
+		pending = pending.append({
+			else_keyword = else_if.else_keyword, keyword = else_if.link.keyword,
+			condition = link_condition, then_block = link_block
+		})
+	var tail: Option[ElseTail] = None
+	match chain.final_else:
+		Some(written):
+			(after_else, else_block) = mint_block(out, written.block)
+			out = after_else
+			tail = Some({ branch = { keyword = written.keyword, body = ElseBlock(else_block) }, end = else_block.span })
+		None:
+			void
+	for link in pending.reverse():
+		end: Span = match tail:
+			Some(written): written.end
+			None: link.then_block.span
+		link_span: Span = link.keyword.span_covering(end)
+		(after_else_if, else_if) = out.finished_else_if(link_span, { condition = link.condition, then_block = link.then_block, else_branch = tail.map(pure func(written): written.branch) })
+		out = after_else_if
+		tail = Some({ branch = { keyword = link.else_keyword, body = ElseIf(else_if) }, end = link_span })
+	out.finished_expression(span, If({ condition = condition, then_block = then_block, else_branch = tail.map(pure func(written): written.branch) }))
+
+
+private pure func mint_match(state: ParseState, recipe: MatchRecipe, span: Span) -> (ParseState, Expression):
+	(after_scrutinee, scrutinee) = mint_recipe(state, recipe.scrutinee)
+	var out: ParseState = after_scrutinee
+	var cases: List[MatchCase] = []
+	for case_recipe in [recipe.cases.first].concat(recipe.cases.rest):
+		(after_pattern, pattern) = mint_pattern(out, case_recipe.pattern)
+		(after_body, body, body_span) = match case_recipe.body:
+			CaseBlockRecipe(block_recipe):
+				(after_block, block) = mint_block(after_pattern, block_recipe)
+				(after_block, CaseBlock(block), block.span)
+			CaseStatementRecipe(statement_recipe):
+				(after_statement, statement) = mint_statement(after_pattern, statement_recipe)
+				(after_statement, CaseStatement(statement), statement.span)
+		out = after_body
+		cases = cases.append({ pattern = pattern, body = body, span = case_recipe.pattern.span.span_covering(body_span) })
+	out.finished_expression(span, Match(scrutinee, cases))

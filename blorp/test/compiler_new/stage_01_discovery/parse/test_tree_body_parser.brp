@@ -1,0 +1,306 @@
+-- The statement-and-block slice: source-order ids, exact rollback of every
+-- unsupported shape, and loops over long statement lists and `else if` chains.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state:
+		ParseState, new_parse_state, diagnostic_count, issued_counts, issued_ids, spellings
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
+		DeclarationPreview(CompletedFunctionPreview, FunctionDeclarationPreview)
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
+		ModuleDeclarationPreviewScan, scan_module_declaration_prefix_with_bodies, scan_module_declaration_prefix_with_expressions
+	../../../../src/compiler_new/stage_01_discovery/syntax/dump: dumped_module
+	../../../../src/compiler_new/stage_01_discovery/syntax/expressions:
+		Body(BlockBody), ElseBody(ElseIf), ElseBranch, ExpressionKind(If), StatementKind(ExpressionStatement)
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: FunctionDeclaration
+	../../../../src/compiler_new/stage_01_discovery/syntax/id_census: id_census
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: expression_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: ModuleItem(FunctionItem), ModuleSyntax
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	test: TestSuite
+
+
+private pure func source_lines(lines: List[String]) -> String:
+	lines.join("\n") + "\n"
+
+
+private pure func joined_lines(lines: List[String]) -> String:
+	lines.join("\n")
+
+
+private pure func scanned(text: String) -> Option[(ParseState, ModuleDeclarationPreviewScan)]:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			Some(scan_module_declaration_prefix_with_bodies(state))
+		Err(_):
+			None
+
+
+-- A fixture assembled from the scan's actual issued indexes, never a
+-- production accepted module. Only completed functions become items.
+private pure func completed_module(state: ParseState, scan: ModuleDeclarationPreviewScan) -> ModuleSyntax:
+	issued = issued_ids(state)
+	var items: List[ModuleItem] = []
+	for declaration in scan.declarations:
+		match declaration:
+			CompletedFunctionPreview(function):
+				items = items.append(FunctionItem(function))
+			_:
+				void
+	{ documentation = None, items = items, definitions = issued.definitions, imports = issued.imports, counts = issued.counts }
+
+
+private pure func completed_count(scan: ModuleDeclarationPreviewScan) -> Int:
+	scan.declarations
+		.filter(pure func(declaration):
+			match declaration:
+				CompletedFunctionPreview(_): True
+				_: False
+		)
+		.length()
+
+
+private pure func deferred_count(scan: ModuleDeclarationPreviewScan) -> Int:
+	scan.declarations
+		.filter(pure func(declaration):
+			match declaration:
+				FunctionDeclarationPreview(_): True
+				_: False
+		)
+		.length()
+
+
+private pure func id_counts(state: ParseState) -> List[Int]:
+	counts = state.issued_counts()
+	[counts.statements, counts.blocks, counts.expressions, counts.patterns, counts.written_types,
+		counts.dimensions, counts.name_uses, counts.binders, counts.type_binders]
+
+
+func test_ids_follow_source_order_and_the_function_comes_last() -> Bool:
+	text = source_lines(["func f(x: Int) -> Int:", "\ty = x + 1", "\ty * 2"])
+	match scanned(text):
+		Some((state, scan)):
+			completed_module(state, scan).dumped_module(spellings(state)) == joined_lines([
+				"(module",
+				"  (function def0 public @0..40 (signature impure @0..4 \"f\"@5..6 (parameters (parameter @7..13 bind0:\"x\"@7..8 (named-type type0 @10..13 use0:\"Int\"@10..13))) (named-type type1 @18..21 use1:\"Int\"@18..21)) (type-parameters) (where) (block block0 @24..40",
+				"    (assignment stmt0 @24..33 use2:\"y\"@24..25 (binary expr2 @28..33 add (name expr0 @28..29 use3:\"x\"@28..29) (integer expr1 @32..33 1)))",
+				"    (expression-statement stmt1 @35..40 (binary expr5 @35..40 multiply (name expr3 @35..36 use4:\"y\"@35..36) (integer expr4 @39..40 2))))))"
+			])
+		None: False
+
+
+func test_function_body_is_complete_syntax_with_an_exact_census() -> Bool:
+	text = source_lines([
+		"func g(xs: List[Int]) -> Int:",
+		"\tvar total: Int = 0",
+		"\tfor x in xs:",
+		"\t\tif x < 0:",
+		"\t\t\tcontinue",
+		"\t\telse:",
+		"\t\t\ttotal += x",
+		"\twhile total > 100:",
+		"\t\ttotal -= 1",
+		"\txs[0] = total",
+		"\tmatch total:",
+		"\t\t0: total",
+		"\t\tSome(v):",
+		"\t\t\tv + 1",
+		"\t\t_: 0",
+		"\ttotal"
+	])
+	match scanned(text):
+		Some((state, scan)):
+			syntax = completed_module(state, scan)
+			completed_count(scan) == 1 and deferred_count(scan) == 0 and state.diagnostic_count() == 0 and id_census(module_id_at_row(0), syntax).is_empty() and syntax.definitions.length() == 1
+		None: False
+
+
+-- Each shape is read in full by the frozen grammar or reported by it; this
+-- slice leaves it to a later one. The scan keeps the skipped-body preview and
+-- every id of the whole body is rolled back, even those minted by statements
+-- the slice does support before the unsupported one.
+func test_unsupported_bodies_roll_back_exactly() -> Bool:
+	var correct: Bool = True
+	for body in [
+		["\tx ?= f()"],
+		["\ta = 1", "\tb = \"text\""],
+		["\t(a, b) = pair"],
+		["\tx =", "\t\t1"],
+		["\tvalue = if flag:", "\t\t1", "\telse:", "\t\t2"],
+		["\tfor (k, v) in pairs:", "\t\tk"],
+		["\tfor x in xs concurrently(limit: 2):", "\t\tx"],
+		["\tbreak"],
+		["\tcontinue"],
+		["\tf(a, b).g()", "\t\t.h()"],
+		["\tmatch x:", "\t\t1: if y:", "\t\t\tz"],
+		["\tmatch x:", "\t\t1: 2", "\tmatch y:", "\t\t_: 3", "\t-z"],
+		["\tx: Int", "\ty"],
+		["\tfunc inner() -> Int: 1", "\tinner()"],
+		["\tconcurrent:", "\t\tf()"],
+		["\tif a:", "\t\tb", "\telse", "\t\tc"],
+		["\tp.x = 1"],
+		["\ta = 1", "\tb = [", "\t\t1", "\t]"],
+		-- A type and a pattern parsed to find their ends issue no ids that survive.
+		["\tcount: Int = 1", "\tmatch count:", "\t\tSome(inner): inner", "\tflag = \"text\""]
+	]:
+		text = source_lines(["func f() -> Int:"].concat(body))
+		match (scanned(text), new_parse_state(lex_module(module_id_at_row(0), text))):
+			(Some((state, scan)), Ok(entry)):
+				(plain, _) = scan_module_declaration_prefix_with_expressions(entry)
+				same_ids: Bool = id_counts(state) == id_counts(plain)
+				if completed_count(scan) != 0 or deferred_count(scan) != 1 or not same_ids:
+					print("not rolled back: ${body}")
+					correct = False
+			_: correct = False
+	correct
+
+
+-- A written type and a pattern are read once to find where they end and again
+-- when minted, so their ids and the name uses inside them follow the
+-- expressions written before them, not the whole body's.
+func test_types_and_patterns_are_minted_in_source_order() -> Bool:
+	text = source_lines([
+		"func f(v: Int) -> Int:",
+		"\tcount: Int = v",
+		"\tmatch v:",
+		"\t\tSome(inner): inner",
+		"\t\t_: count"
+	])
+	match scanned(text):
+		Some((state, scan)):
+			dumped = completed_module(state, scan).dumped_module(spellings(state))
+			-- Header: `Int` twice (uses 0, 1). Body: the binding's `Int` (2), `v` (3),
+			-- the scrutinee `v` (4), `Some` (5), `inner` (6), then the case bodies (7, 8).
+			dumped.split("use2:\"Int\"").length() == 2 and dumped.split("use3:\"v\"").length() == 2 and dumped.split("use4:\"v\"").length() == 2 and dumped.split("(constructor-pattern pat1 @").length() == 2 and dumped.split("use5:\"Some\"").length() == 2 and dumped.split("use6:\"inner\"").length() == 2 and dumped.split("use7:\"inner\"").length() == 2
+		None: False
+
+
+func test_break_and_continue_are_supported_only_inside_loops() -> Bool:
+	inside = source_lines(["func f(xs: List[Int]):", "\tfor x in xs:", "\t\tif x:", "\t\t\tbreak", "\t\tcontinue", "\tvoid"])
+	match scanned(inside):
+		Some((state, scan)): completed_count(scan) == 1 and state.diagnostic_count() == 0
+		None: False
+
+
+-- The expression ids of a function's final `if` and of the `else if`s after
+-- it, in chain order.
+private pure func chain_expression_ids(function: FunctionDeclaration) -> Option[(Int, List[Int])]:
+	match function.function.body:
+		Some(BlockBody(block)):
+			match block.last.kind:
+				ExpressionStatement(outer):
+					match outer.kind:
+						If(first):
+							var ids: List[Int] = []
+							var branch: Option[ElseBranch] = first.else_branch
+							while branch.is_some():
+								match branch:
+									Some(written):
+										match written.body:
+											ElseIf(else_if):
+												ids = ids.append(else_if.id.expression_local_index())
+												branch = else_if.conditional.else_branch
+											_:
+												branch = None
+									None:
+										branch = None
+							Some((outer.id.expression_local_index(), ids))
+						_:
+							None
+				_:
+					None
+		_:
+			None
+
+
+func test_else_if_chain_mints_inner_links_before_outer_ones() -> Bool:
+	text = source_lines([
+		"func f(a: Int) -> Int:",
+		"\tif a:",
+		"\t\t1",
+		"\telse if a:",
+		"\t\t2",
+		"\telse if a:",
+		"\t\t3",
+		"\telse:",
+		"\t\t4"
+	])
+	match scanned(text):
+		Some((state, scan)):
+			match scan.declarations.get(0):
+				Some(CompletedFunctionPreview(function)):
+					-- Source order: every condition and block, then the `else if`s
+					-- from the innermost out, then the outermost `if`.
+					expressions = state.issued_counts().expressions
+					chain_expression_ids(function) == Some((expressions - 1, [expressions - 2, expressions - 3]))
+				_: False
+		None: False
+
+
+-- The deferred function mints no body and no definition; the function after
+-- it is the module's first definition and issues only its own statements.
+func test_function_after_a_deferred_function_issues_only_its_own_ids() -> Bool:
+	text = source_lines([
+		"func first() -> Int:",
+		"\ta = 1",
+		"\tb = \"text\"",
+		"func second() -> Int:",
+		"\tc = 2",
+		"\tc"
+	])
+	match scanned(text):
+		Some((state, scan)):
+			counts = state.issued_counts()
+			completed_count(scan) == 1 and deferred_count(scan) == 1 and state.diagnostic_count() == 0 and counts.statements == 2 and counts.blocks == 1 and counts.expressions == 2 and issued_ids(state).definitions.length() == 1
+		None: False
+
+
+func test_long_statement_list_is_read_and_minted_by_loops() -> Bool:
+	count = 5000
+	var lines: List[String] = ["func f() -> Int:"]
+	var written: Int = 0
+	while written < count:
+		lines = lines.append("\tvalue${written} = ${written}")
+		written += 1
+	lines = lines.append("\tvalue0")
+	match scanned(source_lines(lines)):
+		Some((state, scan)):
+			syntax = completed_module(state, scan)
+			counts = state.issued_counts()
+			completed_count(scan) == 1 and counts.statements == count + 1 and counts.blocks == 1 and id_census(module_id_at_row(0), syntax).is_empty()
+		None: False
+
+
+func test_deep_else_if_chain_survives_parse_dump_and_census() -> Bool:
+	links = 2000
+	var lines: List[String] = ["func f(a: Int) -> Int:", "\tif a:", "\t\t0"]
+	var written: Int = 1
+	while written < links:
+		lines = lines.append("\telse if a:")
+		lines = lines.append("\t\t${written}")
+		written += 1
+	lines = lines.append("\telse:")
+	lines = lines.append("\t\t${links}")
+	match scanned(source_lines(lines)):
+		Some((state, scan)):
+			syntax = completed_module(state, scan)
+			dumped = dumped_module(syntax, spellings(state))
+			counts = state.issued_counts()
+			-- One block per `if`, `else if` and `else` arm, and the function's own.
+			completed_count(scan) == 1 and id_census(module_id_at_row(0), syntax).is_empty() and counts.blocks == links + 2 and dumped.split("(else-if expr").length() == links
+		None: False
+
+
+tests: TestSuite = {
+	description = "Tree statements, blocks and function bodies",
+	tests = [
+		("ids follow source order and the function comes last", test_ids_follow_source_order_and_the_function_comes_last),
+		("a function body is complete syntax with an exact census", test_function_body_is_complete_syntax_with_an_exact_census),
+		("unsupported bodies roll back exactly", test_unsupported_bodies_roll_back_exactly),
+		("types and patterns are minted in source order", test_types_and_patterns_are_minted_in_source_order),
+		("break and continue are supported only inside loops", test_break_and_continue_are_supported_only_inside_loops),
+		("else if links are minted inner before outer", test_else_if_chain_mints_inner_links_before_outer_ones),
+		("a function after a deferred function issues only its own ids", test_function_after_a_deferred_function_issues_only_its_own_ids),
+		("5000 statements", test_long_statement_list_is_read_and_minted_by_loops),
+		("2000 link else if chain", test_deep_else_if_chain_survives_parse_dump_and_census)
+	]
+}

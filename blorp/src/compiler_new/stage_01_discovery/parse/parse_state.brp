@@ -12,6 +12,8 @@ import:
 		EnumCase,
 		EnumDeclaration,
 		FieldDeclaration,
+		Function,
+		FunctionDeclaration,
 		GlobalDeclaration,
 		GlobalForm,
 		Parameter,
@@ -28,7 +30,8 @@ import:
 			UnexpectedByte, ReservedKeywordAsName,
 		),
 		SyntaxDiagnosticAt,
-	../syntax/expressions: Expression, ExpressionKind
+	../syntax/expressions:
+		Block, ElseIfExpression, Expression, ExpressionKind, IfExpression, Statement, StatementKind, SubscriptPlace
 	../syntax/foreign_blocks: ForeignCName, ForeignFunction
 	../syntax/ids:
 		IdMint,
@@ -37,19 +40,24 @@ import:
 		issued,
 		minted_alias,
 		minted_binder,
+		minted_block,
 		minted_builtin_type,
 		minted_dimension,
+		minted_else_if,
 		minted_enum,
 		minted_enum_case,
 		minted_expression,
 		minted_field,
 		minted_foreign_function,
+		minted_function,
 		minted_global,
 		minted_import,
 		minted_name_use,
 		minted_pattern,
 		minted_record,
 		minted_resource_type,
+		minted_statement,
+		minted_subscript_place,
 		minted_type_binder,
 		minted_union,
 		minted_variant,
@@ -58,6 +66,7 @@ import:
 	../syntax/imports: Import, ImportItem, ModulePath
 	../syntax/module_syntax: Documentation, SyntaxCounts
 	../syntax/names: Binder, NameUse, TypeBinder, WrittenName
+	../syntax/sequences: AtLeastOne
 	../syntax/patterns: Pattern, PatternKind
 	../syntax/spellings: Spellings, interned_spelling
 	../syntax/types: Dimension, DimensionKind, WrittenType, WrittenTypeKind
@@ -86,11 +95,13 @@ import:
 		TokenInputError,
 		advanced as advanced_cursor,
 		current_token as cursor_token,
+		cursor_at,
 		cursor_position,
 		is_soft_keyword,
 		new_token_cursor,
 		peek_kind as cursor_peek,
 		previous_content_span as cursor_previous_content_span,
+		token_at,
 		token_spelling,
 
 
@@ -253,6 +264,35 @@ pure func advanced(state: ParseState) -> ParseState:
 			previous = cursor_token(fields.cursor).span,
 			cursor = advanced_cursor(fields.cursor)
 		})
+
+
+---
+`state` with `position` as its current token and every other fact kept: the
+mint, the spellings and the diagnostics. A body is first recognized without
+ids and then replayed from where it began, so the replay's ids follow the
+header's.
+---
+pure func resumed_at(state: ParseState, position: Int) -> ParseState:
+	fields: ParseFields = from_opaque ParseState(state)
+	cursor: TokenCursor = cursor_at(fields.cursor, position)
+	before: Span = if cursor_position(cursor) > 0:
+		cursor_token(cursor_at(cursor, cursor_position(cursor) - 1)).span
+	else:
+		cursor_token(cursor).span
+	into_opaque ParseState({ fields | cursor = cursor, previous = before })
+
+
+---
+`state` moved to where `reached` stopped, issuing none of the ids `reached`
+issued: `reached`'s cursor, spellings and diagnostics with `state`'s own mint.
+A recognition pass uses it after parsing an id-bearing construct (a written
+type or a pattern) only to learn where it ends, so that every id of the
+accepted body is issued later, in source order, by its replay.
+---
+pure func resumed_after(state: ParseState, reached: ParseState) -> ParseState:
+	own: ParseFields = from_opaque ParseState(state)
+	other: ParseFields = from_opaque ParseState(reached)
+	into_opaque ParseState({ other | mint = own.mint })
 
 
 pure func diagnostic_count(state: ParseState) -> Int:
@@ -692,6 +732,61 @@ pure func finished_pattern(
 	fields: ParseFields = from_opaque ParseState(state)
 	(mint, pattern) = minted_pattern(fields.mint, span, kind)
 	(into_opaque ParseState({ fields | mint = mint }), pattern)
+
+
+pure func finished_statement(
+	state: ParseState,
+	span: Span,
+	kind: StatementKind,
+) -> (ParseState, Statement):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, statement) = minted_statement(fields.mint, span, kind)
+	(into_opaque ParseState({ fields | mint = mint }), statement)
+
+
+pure func finished_block(
+	state: ParseState,
+	leading: List[Statement],
+	last: Statement,
+	span: Span,
+) -> (ParseState, Block):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, block) = minted_block(fields.mint, leading, last, span)
+	(into_opaque ParseState({ fields | mint = mint }), block)
+
+
+pure func finished_else_if(
+	state: ParseState,
+	span: Span,
+	conditional: IfExpression,
+) -> (ParseState, ElseIfExpression):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, else_if) = minted_else_if(fields.mint, span, conditional)
+	(into_opaque ParseState({ fields | mint = mint }), else_if)
+
+
+pure func finished_subscript_place(
+	state: ParseState,
+	span: Span,
+	collection: Expression,
+	indices: AtLeastOne[Expression],
+) -> (ParseState, SubscriptPlace):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, place) = minted_subscript_place(fields.mint, span, collection, indices)
+	(into_opaque ParseState({ fields | mint = mint }), place)
+
+
+pure func finished_function(
+	state: ParseState,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	annotations: List[Annotation],
+	function: Function,
+	span: Span,
+) -> (ParseState, FunctionDeclaration):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, declaration) = minted_function(fields.mint, visibility, documentation, annotations, function, span)
+	(into_opaque ParseState({ fields | mint = mint }), declaration)
 
 
 pure func finished_binder(state: ParseState, name: WrittenName) -> (ParseState, Binder):

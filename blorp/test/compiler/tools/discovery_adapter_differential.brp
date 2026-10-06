@@ -54,7 +54,7 @@ import:
 		CompilerEmbeddedTexts,
 		DeclarationReader,
 		LegacyAdapterError,
-		LegacyDeclarationPreviewError(MissingDimensionLiteralToken, MissingVariadicWildcardToken, InvalidGlobalInitializerEntry, UnsupportedGlobalInitializerExpression, MissingIntegerLiteralToken),
+		LegacyDeclarationPreviewError(MissingDimensionLiteralToken, MissingVariadicWildcardToken, InvalidGlobalInitializerEntry, UnsupportedGlobalInitializerExpression, MissingIntegerLiteralToken, UnsupportedBodyStatement, MissingPatternNumberToken),
 		legacy_declaration_projection,
 		LegacyModuleNaming,
 		legacy_adapter_error_message,
@@ -70,7 +70,8 @@ import:
 	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
 	../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state
 	../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_source
-	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan: scan_module_declaration_prefix_with_expressions
+	../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser: DeclarationPreview(CompletedFunctionPreview)
+	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan: scan_module_declaration_prefix_with_bodies
 	../../../src/compiler_new/stage_01_discovery/tables/span: span_start, span_end
 	../../../src/compiler_new/stage_01_discovery/pipeline:
 		ImplicitModules,
@@ -144,7 +145,7 @@ union ModuleComparison:
 
 -- Only a successful projection carries names to advance the shared table.
 union TreePrefixModuleComparison:
-	TreePrefixCompared(NameTable, DeclarationPrefixComparison)
+	TreePrefixCompared(NameTable, DeclarationPrefixComparison, Int)
 	TreePrefixSkipped(String)
 	TreePrefixError(TreePrefixErrorStage, String)
 
@@ -229,6 +230,7 @@ record TreePrefixCounts {
 	skipped: Int,
 	errors: Int,
 	declarations: Int,
+	completed_functions: Int,
 	differences: Int,
 	reported: Int,
 	kinds: TreePrefixKindCounts,
@@ -237,7 +239,7 @@ record TreePrefixCounts {
 
 
 private EMPTY_TREE_PREFIX_COUNTS: TreePrefixCounts = {
-	compared = 0, skipped = 0, errors = 0, declarations = 0, differences = 0, reported = 0,
+	compared = 0, skipped = 0, errors = 0, declarations = 0, completed_functions = 0, differences = 0, reported = 0,
 	kinds = EMPTY_TREE_PREFIX_KIND_COUNTS, stops = EMPTY_TREE_PREFIX_STOP_COUNTS
 }
 
@@ -296,6 +298,12 @@ pure func count_tree_prefix_stop(counts: TreePrefixStopCounts, kind: Declaration
 			{ counts | without_progress_modules = counts.without_progress_modules + 1 }
 
 
+pure func is_completed_function(declaration: DeclarationPreview) -> Bool:
+	match declaration:
+		CompletedFunctionPreview(_): True
+		_: False
+
+
 pure func tree_prefix_error_stage_label(stage: TreePrefixErrorStage) -> String:
 	match stage:
 		TreePrefixSourceError: "source"
@@ -307,10 +315,16 @@ pure func compare_tree_prefix(existing: ParsedProgram, module: Int, names: NameT
 	lexed = lex_module(module_id_at_row(module), existing.source.text)
 	match new_parse_state(lexed):
 		Ok(entry):
-			(_, scan) = scan_module_declaration_prefix_with_expressions(entry)
+			(_, scan) = scan_module_declaration_prefix_with_bodies(entry)
 			match legacy_declaration_projection(preview_source(lexed), scan, names):
 				Ok(projection):
-					TreePrefixCompared(projection.names, declaration_prefix_comparison(existing, projection))
+					-- The projection may stop before a later completed function; count
+					-- only those it compared.
+					compared_functions: Int = scan.declarations
+						.take(projection.declarations.length())
+						.filter(pure func(declaration): is_completed_function(declaration))
+						.length()
+					TreePrefixCompared(projection.names, declaration_prefix_comparison(existing, projection), compared_functions)
 				Err(error):
 					message: String = match error:
 						MissingDimensionLiteralToken(span):
@@ -323,6 +337,10 @@ pure func compare_tree_prefix(existing: ParsedProgram, module: Int, names: NameT
 							"invalid global initializer entry at ${span.span_start()}..${span.span_end()}"
 						UnsupportedGlobalInitializerExpression(span):
 							"unsupported completed global initializer at ${span.span_start()}..${span.span_end()}"
+						UnsupportedBodyStatement(span):
+							"unsupported body statement at ${span.span_start()}..${span.span_end()}"
+						MissingPatternNumberToken(span):
+							"missing pattern number token at ${span.span_start()}..${span.span_end()}"
 					TreePrefixError(TreePrefixProjectionError, message)
 		Err(_):
 			TreePrefixError(TreePrefixInputError, "lexed source cannot initialize the tree parse state")
@@ -583,9 +601,9 @@ func print_comparison(tables: FrontendTables, reader: DeclarationReader) -> Int:
 				print("adapter-error ${path} | ${message}")
 
 		match comparisons.tree:
-			TreePrefixCompared(names, comparison):
+			TreePrefixCompared(names, comparison, completed_functions):
 				tree_names = names
-				tree_counts = report_tree_prefix_comparison(path, tree_counts, comparison)
+				tree_counts = report_tree_prefix_comparison(path, tree_counts, comparison, completed_functions)
 			TreePrefixSkipped(reason):
 				tree_counts = { tree_counts | skipped = tree_counts.skipped + 1 }
 				print("tree-prefix-skipped ${path} | ${shortened(reason)}")
@@ -604,7 +622,9 @@ func print_comparison(tables: FrontendTables, reader: DeclarationReader) -> Int:
 		0
 
 
-func report_tree_prefix_comparison(path: String, counts: TreePrefixCounts, comparison: DeclarationPrefixComparison) -> TreePrefixCounts:
+func report_tree_prefix_comparison(
+	path: String, counts: TreePrefixCounts, comparison: DeclarationPrefixComparison, completed_functions: Int,
+) -> TreePrefixCounts:
 	var kinds: TreePrefixKindCounts = counts.kinds
 	for kind in comparison.declaration_kinds:
 		kinds = count_tree_prefix_kind(kinds, kind)
@@ -615,6 +635,7 @@ func report_tree_prefix_comparison(path: String, counts: TreePrefixCounts, compa
 
 	{ counts | compared = counts.compared + 1,
 		declarations = counts.declarations + comparison.completed_declarations,
+		completed_functions = counts.completed_functions + completed_functions,
 		differences = counts.differences + comparison.differences.length(),
 		reported = counts.reported + reported.length(),
 		kinds = kinds, stops = count_tree_prefix_stop(counts.stops, comparison.stop) }
@@ -622,5 +643,5 @@ func report_tree_prefix_comparison(path: String, counts: TreePrefixCounts, compa
 
 func print_tree_prefix_summary(modules: Int, counts: TreePrefixCounts) -> Void:
 	print(
-		"tree-prefix-summary modules=${modules} compared=${counts.compared} skipped=${counts.skipped} errors=${counts.errors} declarations=${counts.declarations} differences=${counts.differences} reported=${counts.reported} kind_import_block=${counts.kinds.import_block_modules} kind_foreign_block=${counts.kinds.foreign_block_modules} kind_record=${counts.kinds.record_modules} kind_fixed_record=${counts.kinds.fixed_record_modules} kind_alias=${counts.kinds.alias_modules} kind_builtin_type=${counts.kinds.builtin_type_modules} kind_resource_type=${counts.kinds.resource_type_modules} kind_union=${counts.kinds.union_modules} kind_fixed_union=${counts.kinds.fixed_union_modules} kind_enum=${counts.kinds.enum_modules} kind_function=${counts.kinds.function_modules} kind_trait=${counts.kinds.trait_modules} kind_implementation=${counts.kinds.implementation_modules} kind_constant_global=${counts.kinds.constant_global_modules} kind_mutable_global=${counts.kinds.mutable_global_modules} stop_end_of_source=${counts.stops.end_of_source_modules} stop_function_header=${counts.stops.function_header_modules} stop_trait_preview=${counts.stops.trait_preview_modules} stop_implementation_preview=${counts.stops.implementation_preview_modules} stop_global_initializer=${counts.stops.global_initializer_modules} stop_rejected_global_initializer=${counts.stops.rejected_global_initializer_modules} stop_rejected_declaration=${counts.stops.rejected_declaration_modules} stop_without_progress=${counts.stops.without_progress_modules}",
+		"tree-prefix-summary modules=${modules} compared=${counts.compared} skipped=${counts.skipped} errors=${counts.errors} declarations=${counts.declarations} completed_functions=${counts.completed_functions} differences=${counts.differences} reported=${counts.reported} kind_import_block=${counts.kinds.import_block_modules} kind_foreign_block=${counts.kinds.foreign_block_modules} kind_record=${counts.kinds.record_modules} kind_fixed_record=${counts.kinds.fixed_record_modules} kind_alias=${counts.kinds.alias_modules} kind_builtin_type=${counts.kinds.builtin_type_modules} kind_resource_type=${counts.kinds.resource_type_modules} kind_union=${counts.kinds.union_modules} kind_fixed_union=${counts.kinds.fixed_union_modules} kind_enum=${counts.kinds.enum_modules} kind_function=${counts.kinds.function_modules} kind_trait=${counts.kinds.trait_modules} kind_implementation=${counts.kinds.implementation_modules} kind_constant_global=${counts.kinds.constant_global_modules} kind_mutable_global=${counts.kinds.mutable_global_modules} stop_end_of_source=${counts.stops.end_of_source_modules} stop_function_header=${counts.stops.function_header_modules} stop_trait_preview=${counts.stops.trait_preview_modules} stop_implementation_preview=${counts.stops.implementation_preview_modules} stop_global_initializer=${counts.stops.global_initializer_modules} stop_rejected_global_initializer=${counts.stops.rejected_global_initializer_modules} stop_rejected_declaration=${counts.stops.rejected_declaration_modules} stop_without_progress=${counts.stops.without_progress_modules}",
 	)

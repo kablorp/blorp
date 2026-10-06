@@ -50,11 +50,12 @@ import:
 	../compiler_new/stage_01_discovery/parse/record_preview:
 		RecordPreview, record_declaration, record_source
 	../compiler_new/stage_01_discovery/parse/preview_source:
-		PreviewSource, preview_span_text, preview_dimension_literal_text, preview_variadic_wildcard_span, preview_integer_literal_text
+		PreviewSource, preview_span_text, preview_dimension_literal_text, preview_variadic_wildcard_span, preview_integer_literal_text, preview_number_literal_text
 	../compiler_new/stage_01_discovery/syntax/declarations as TreeDeclarations
-	../compiler_new/stage_01_discovery/syntax/names: WrittenName
-	../compiler_new/stage_01_discovery/syntax/sequences: small_tuple_items, at_least_one_items
+	../compiler_new/stage_01_discovery/syntax/names: WrittenName, BindingTarget(BindsName, DiscardsValue)
+	../compiler_new/stage_01_discovery/syntax/sequences: small_tuple_items, at_least_one_items, at_least_two_items
 	../compiler_new/stage_01_discovery/syntax/expressions as TreeExpressions
+	../compiler_new/stage_01_discovery/syntax/patterns as TreePatterns
 	../compiler_new/stage_01_discovery/syntax/types as TreeTypes
 	../compiler_new/stage_01_discovery/sources/embedded_standard_library:
 		EmbeddedStandardLibraryTexts,
@@ -4051,6 +4052,8 @@ union LegacyDeclarationPreviewError:
 	InvalidGlobalInitializerEntry(Span)
 	UnsupportedGlobalInitializerExpression(Span)
 	MissingIntegerLiteralToken(Span)
+	UnsupportedBodyStatement(Span)
+	MissingPatternNumberToken(Span)
 
 
 ---
@@ -4451,6 +4454,10 @@ private pure func preview_declaration(
 			translated ?= preview_function_header(source, names, preview)
 			(extended, header) = translated
 			Ok(DeferredPreviewDeclaration(extended, StoppedAtFunctionHeader(header)))
+		TreePreviews.CompletedFunctionPreview(declaration):
+			translated ?= preview_completed_function(source, names, declaration)
+			(extended, parsed) = translated
+			Ok(CompletedPreviewDeclaration(extended, parsed))
 		TreePreviews.TraitDeclarationPreview(preview):
 			translated ?= preview_trait_header(source, names, preview)
 			(extended, header) = translated
@@ -4644,6 +4651,410 @@ private pure func preview_binary_operator(operator: TreeExpressions.BinaryOperat
 		TreeExpressions.LessEqual: ParsedLessEqualOp
 		TreeExpressions.Greater: ParsedGreaterOp
 		TreeExpressions.GreaterEqual: ParsedGreaterEqualOp
+
+
+-- A completed function: its header as for a deferred one, then its body
+-- projected the way the frozen parser shapes it.
+private pure func preview_completed_function(
+	source: PreviewSource, names: NameTable, declaration: TreeDeclarations.FunctionDeclaration,
+) -> Result[(NameTable, ParsedDecl), LegacyDeclarationPreviewError]:
+	function = declaration.function
+	translated ?= preview_callable_header(source, names, function.signature, function.type_parameters,
+		function.constraints, declaration.annotations, preview_documentation(declaration.documentation))
+	(after_header, header) = translated
+	translated_body ?= legacy_optional_body_preview(source, after_header, function.body)
+	(after_body, body) = translated_body
+	Ok((after_body, preview_visibility(FunctionParsedDecl({
+		name = header.name, keyword_span = header.keyword_span, type_params = header.type_params, params = header.params,
+		return_type = header.return_type, dim_constraints = header.dim_constraints, body = body, is_pure = header.is_pure,
+		annotations = header.annotations, doc = header.doc, span = legacy_location(declaration.span)
+	}), declaration.visibility, declaration.span)))
+
+
+private pure func legacy_optional_body_preview(
+	source: PreviewSource, names: NameTable, body: Option[TreeExpressions.Body],
+) -> Result[(NameTable, Option[ParsedExpr]), LegacyDeclarationPreviewError]:
+	match body:
+		Some(written):
+			translated ?= legacy_body_preview(source, names, written)
+			(extended, projected) = translated
+			Ok((extended, Some(projected)))
+		None:
+			Ok((names, None))
+
+
+-- Bodies, blocks and statements. Statements are expressions in the frozen
+-- AST. A block's statements and an `else if` chain are walked by loops;
+-- recursion follows only the nesting the source's indentation writes.
+pure func legacy_body_preview(
+	source: PreviewSource, names: NameTable, body: TreeExpressions.Body,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	match body:
+		TreeExpressions.BlockBody(block):
+			legacy_block_preview(source, names, block)
+		TreeExpressions.ExpressionBody(expression):
+			legacy_expression_preview(source, names, expression)
+
+
+private pure func legacy_block_preview(
+	source: PreviewSource, names: NameTable, block: TreeExpressions.Block,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	var extended: NameTable = names
+	var items: List[ParsedExpr] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+	for statement in block.leading.append(block.last):
+		match legacy_statement_preview(source, extended, statement):
+			Ok((after_statement, item)):
+				extended = after_statement
+				items = items.append(item)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok((extended, ParsedBlockExpr(items, legacy_location(block.span))))
+
+
+private pure func legacy_statement_preview(
+	source: PreviewSource, names: NameTable, statement: TreeExpressions.Statement,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	location: SourceLocation = legacy_location(statement.span)
+	match statement.kind:
+		TreeExpressions.ExpressionStatement(expression):
+			legacy_statement_expression_preview(source, names, expression)
+		TreeExpressions.VariableDeclaration(declaration):
+			match declaration.target:
+				BindsName(binder):
+					(after_name, name) = preview_identifier(source, names, binder.name)
+					translated_type ?= preview_optional_type(source, after_name, declaration.declared_type)
+					(after_type, type_expr) = translated_type
+					translated_value ?= legacy_expression_preview(source, after_type, declaration.value)
+					(after_value, value) = translated_value
+					Ok((after_value, ParsedVarDeclExpr(name, type_expr, value, True, location)))
+				DiscardsValue(span):
+					Err(UnsupportedBodyStatement(span))
+		TreeExpressions.TypedBinding(binding):
+			match binding.target:
+				BindsName(binder):
+					(after_name, name) = preview_identifier(source, names, binder.name)
+					translated_type ?= preview_type(source, after_name, binding.declared_type)
+					(after_type, type_expr) = translated_type
+					translated_value ?= legacy_expression_preview(source, after_type, binding.value)
+					(after_value, value) = translated_value
+					Ok((after_value, ParsedVarDeclExpr(name, Some(type_expr), value, False, location)))
+				DiscardsValue(span):
+					Err(UnsupportedBodyStatement(span))
+		TreeExpressions.Assignment(assignment):
+			(after_target, name) = match assignment.target:
+				TreeExpressions.AssignsName(use):
+					preview_identifier(source, names, use.name)
+				TreeExpressions.AssignsDiscard(span):
+					preview_text_identifier(names, PREVIEW_DISCARD_NAME, span)
+			translated_value ?= legacy_expression_preview(source, after_target, assignment.value)
+			(after_value, value) = translated_value
+			Ok((after_value, ParsedAssignExpr(name, value, location)))
+		TreeExpressions.CompoundAssignment(assignment):
+			(after_target, name) = preview_identifier(source, names, assignment.target.name)
+			operator: ParsedCompoundAssignOp = match assignment.operator:
+				TreeExpressions.AddAssign: ParsedAssignAddOp
+				TreeExpressions.SubtractAssign: ParsedAssignSubtractOp
+				TreeExpressions.MultiplyAssign: ParsedAssignMultiplyOp
+				TreeExpressions.DivideAssign: ParsedAssignDivideOp
+			translated_value ?= legacy_expression_preview(source, after_target, assignment.value)
+			(after_value, value) = translated_value
+			Ok((after_value, ParsedCompoundAssignExpr(name, operator, value, location)))
+		TreeExpressions.SubscriptAssignment(assignment):
+			translated_collection ?= legacy_expression_preview(source, names, assignment.place.collection)
+			(after_collection, collection) = translated_collection
+			translated_indices ?= legacy_expressions_preview(source, after_collection, at_least_one_items(assignment.place.indices))
+			(extended, indices) = translated_indices
+			translated_value ?= legacy_expression_preview(source, extended, assignment.value)
+			(after_value, value) = translated_value
+			Ok((after_value, ParsedSubscriptAssignExpr(collection, indices, value, location)))
+		TreeExpressions.WhileLoop(loop):
+			translated_condition ?= legacy_expression_preview(source, names, loop.condition)
+			(after_condition, condition) = translated_condition
+			translated_body ?= legacy_block_preview(source, after_condition, loop.body)
+			(after_body, body) = translated_body
+			Ok((after_body, ParsedWhileExpr(condition, body, location)))
+		TreeExpressions.ForLoop(loop):
+			(after_binder, binder) = match loop.binder:
+				TreeExpressions.LoopVariable(BindsName(binder)):
+					(after_name, name) = preview_identifier(source, names, binder.name)
+					(after_name, Some(ParsedForNameBinder(name)))
+				TreeExpressions.LoopVariable(DiscardsValue(span)):
+					(after_name, name) = preview_text_identifier(names, PREVIEW_DISCARD_NAME, span)
+					(after_name, Some(ParsedForNameBinder(name)))
+				TreeExpressions.LoopTuple(_, _):
+					(names, None)
+			match binder:
+				None:
+					Err(UnsupportedBodyStatement(statement.span))
+				Some(written):
+					translated_iterable ?= legacy_expression_preview(source, after_binder, loop.iterable)
+					(after_iterable, iterable) = translated_iterable
+					translated_body ?= legacy_block_preview(source, after_iterable, loop.body)
+					(after_body, body) = translated_body
+					Ok((after_body, ParsedForExpr(written, iterable, body, location)))
+		_:
+			Err(UnsupportedBodyStatement(statement.span))
+
+
+-- An expression in statement position: the block-bearing forms are read here,
+-- everything else by the expression projection.
+private pure func legacy_statement_expression_preview(
+	source: PreviewSource, names: NameTable, expression: TreeExpressions.Expression,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	location: SourceLocation = legacy_location(expression.span)
+	match expression.kind:
+		TreeExpressions.If(conditional):
+			legacy_conditional_preview(source, names, conditional, expression.span)
+		TreeExpressions.Match(subject, cases):
+			legacy_match_preview(source, names, subject, cases, location)
+		TreeExpressions.Break:
+			Ok((names, ParsedBreakExpr(location)))
+		TreeExpressions.Continue:
+			Ok((names, ParsedContinueExpr(location)))
+		_:
+			legacy_expression_preview(source, names, expression)
+
+
+-- One `if` or `else if` of a chain, projected before the links that follow it.
+private record PreviewIfLink {
+	preceding_else: Option[Span],
+	span: Span,
+	condition: ParsedExpr,
+	then_block: ParsedExpr
+}
+
+
+-- Names follow written order: each link's condition and block, then the final
+-- `else` block. The nested `ParsedIfExpr`s are then built from the last link
+-- back, so no recursion follows the length of the chain.
+private pure func legacy_conditional_preview(
+	source: PreviewSource, names: NameTable, conditional: TreeExpressions.IfExpression, span: Span,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	var extended: NameTable = names
+	var links: List[PreviewIfLink] = []
+	var current: TreeExpressions.IfExpression = conditional
+	var current_span: Span = span
+	var preceding_else: Option[Span] = None
+	var final_else: Option[ParsedElseBranch] = None
+	var failure: Option[LegacyDeclarationPreviewError] = None
+	var walking: Bool = True
+	while walking:
+		match legacy_if_link_preview(source, extended, current):
+			Err(error):
+				failure = Some(error)
+				walking = False
+			Ok((after_link, condition, then_block)):
+				extended = after_link
+				links = links.append({ preceding_else = preceding_else, span = current_span, condition = condition, then_block = then_block })
+				match current.else_branch:
+					None:
+						walking = False
+					Some(written):
+						match written.body:
+							TreeExpressions.ElseBlock(block):
+								match legacy_block_preview(source, extended, block):
+									Ok((after_block, else_block)):
+										extended = after_block
+										final_else = Some(parsed_else_branch(written.keyword, else_block))
+									Err(error):
+										failure = Some(error)
+								walking = False
+							TreeExpressions.ElseIf(else_if):
+								preceding_else = Some(written.keyword)
+								current = else_if.conditional
+								current_span = else_if.span
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			var else_branch: Option[ParsedElseBranch] = final_else
+			-- The head link is the last one built, and the chain always holds it.
+			var built: Option[ParsedExpr] = None
+			for link in links.reverse():
+				chained: ParsedExpr = ParsedIfExpr(link.condition, link.then_block, else_branch, legacy_location(link.span))
+				else_branch = link.preceding_else.map(pure func(keyword): parsed_else_branch(keyword, chained))
+				built = Some(chained)
+			match built:
+				Some(head):
+					Ok((extended, head))
+				None:
+					Err(UnsupportedBodyStatement(span))
+
+
+private pure func parsed_else_branch(keyword: Span, body: ParsedExpr) -> ParsedElseBranch:
+	{ keyword = legacy_location(keyword), body = body }
+
+
+private pure func legacy_if_link_preview(
+	source: PreviewSource, names: NameTable, link: TreeExpressions.IfExpression,
+) -> Result[(NameTable, ParsedExpr, ParsedExpr), LegacyDeclarationPreviewError]:
+	translated_condition ?= legacy_expression_preview(source, names, link.condition)
+	(after_condition, condition) = translated_condition
+	translated_block ?= legacy_block_preview(source, after_condition, link.then_block)
+	(after_block, then_block) = translated_block
+	Ok((after_block, condition, then_block))
+
+
+private pure func legacy_match_preview(
+	source: PreviewSource, names: NameTable, subject: TreeExpressions.Expression,
+	cases: List[TreeExpressions.MatchCase], location: SourceLocation,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	translated_subject ?= legacy_expression_preview(source, names, subject)
+	(after_subject, scrutinee) = translated_subject
+	var extended: NameTable = after_subject
+	var parsed_cases: List[ParsedMatchCase] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+	for written in cases:
+		match legacy_case_preview(source, extended, written):
+			Ok((after_case, parsed)):
+				extended = after_case
+				parsed_cases = parsed_cases.append(parsed)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok((extended, ParsedMatchExpr(scrutinee, parsed_cases, location)))
+
+
+private pure func legacy_case_preview(
+	source: PreviewSource, names: NameTable, written: TreeExpressions.MatchCase,
+) -> Result[(NameTable, ParsedMatchCase), LegacyDeclarationPreviewError]:
+	translated_pattern ?= legacy_pattern_preview(source, names, written.pattern)
+	(after_pattern, pattern) = translated_pattern
+	translated_body ?= match written.body:
+		TreeExpressions.CaseBlock(block):
+			legacy_block_preview(source, after_pattern, block)
+		TreeExpressions.CaseStatement(statement):
+			legacy_statement_preview(source, after_pattern, statement)
+	(after_body, body) = translated_body
+	Ok((after_body, { pattern = pattern, body = body, span = legacy_location(written.span) }))
+
+
+-- Patterns nest only by their own brackets. Numbers keep their authored
+-- digits: the sign belongs to the pattern, the digits to the literal token.
+private pure func legacy_pattern_preview(
+	source: PreviewSource, names: NameTable, pattern: TreePatterns.Pattern,
+) -> Result[(NameTable, ParsedPattern), LegacyDeclarationPreviewError]:
+	location: SourceLocation = legacy_location(pattern.span)
+	match pattern.kind:
+		TreePatterns.WildcardPattern:
+			Ok((names, ParsedWildcardPattern(location)))
+		TreePatterns.NamePattern(use):
+			(extended, name) = preview_identifier(source, names, use.name)
+			Ok((extended, ParsedNamePattern(name)))
+		TreePatterns.IntegerPattern(sign, _):
+			match preview_number_literal_text(source, pattern.span):
+				Some(digits):
+					Ok((names, ParsedIntPattern(signed_pattern_digits(sign, digits), location)))
+				None:
+					Err(MissingPatternNumberToken(pattern.span))
+		TreePatterns.FloatPattern(sign, literal):
+			Ok((names, ParsedFloatPattern(signed_pattern_digits(sign, literal.written_digits()), location)))
+		TreePatterns.StringPattern(form, text):
+			legacy_form: ParsedStringLiteralForm = match form:
+				TreePatterns.QuotedString: ParsedPlainStringLiteral
+				TreePatterns.RawString: ParsedRawStringLiteral
+				TreePatterns.PipeString: ParsedPipeStringLiteral
+				TreePatterns.RawPipeString: ParsedRawPipeStringLiteral
+			Ok((names, ParsedStringPattern(text, legacy_form, location)))
+		TreePatterns.CharacterPattern(character):
+			Ok((names, ParsedCharPattern(character.to_int(), location)))
+		TreePatterns.BooleanPattern(value):
+			Ok((names, ParsedBoolPattern(value, location)))
+		TreePatterns.ConstructorPattern(constructor, arguments):
+			(after_name, name) = preview_identifier(source, names, constructor.name)
+			translated ?= legacy_patterns_preview(source, after_name, arguments)
+			(extended, parsed) = translated
+			Ok((extended, ParsedConstructorPattern(name, parsed, location)))
+		TreePatterns.QualifiedConstructorPattern(qualifier, constructor, arguments):
+			(after_qualifier, qualifier_name) = preview_identifier(source, names, qualifier.name)
+			(after_name, name) = preview_identifier(source, after_qualifier, constructor.name)
+			translated ?= legacy_patterns_preview(source, after_name, arguments)
+			(extended, parsed) = translated
+			Ok((extended, ParsedQualifiedConstructorPattern(qualifier_name, name, parsed, location)))
+		TreePatterns.TuplePattern(elements):
+			translated ?= legacy_patterns_preview(source, names, small_tuple_items(elements))
+			(extended, parsed) = translated
+			Ok((extended, ParsedTuplePattern(parsed, location)))
+		TreePatterns.AlternativePatterns(alternatives):
+			translated ?= legacy_patterns_preview(source, names, at_least_two_items(alternatives))
+			(extended, parsed) = translated
+			Ok((extended, ParsedOrPattern(parsed, location)))
+		TreePatterns.ListPattern(elements, spread):
+			translated ?= legacy_patterns_preview(source, names, elements)
+			(after_elements, parsed) = translated
+			match spread:
+				None:
+					Ok((after_elements, ParsedListPattern(parsed, None, location)))
+				Some(written):
+					match written.target:
+						BindsName(binder):
+							(extended, name) = preview_identifier(source, after_elements, binder.name)
+							Ok((extended, ParsedListPattern(parsed, Some(ParsedListSpreadName(name)), location)))
+						DiscardsValue(span):
+							Ok((after_elements, ParsedListPattern(parsed, Some(ParsedListSpreadWildcard(legacy_location(span))), location)))
+
+
+private pure func legacy_expressions_preview(
+	source: PreviewSource, names: NameTable, expressions: List[TreeExpressions.Expression],
+) -> Result[(NameTable, List[ParsedExpr]), LegacyDeclarationPreviewError]:
+	var extended: NameTable = names
+	var parsed: List[ParsedExpr] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+	for expression in expressions:
+		match legacy_expression_preview(source, extended, expression):
+			Ok((after_expression, translated)):
+				extended = after_expression
+				parsed = parsed.append(translated)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok((extended, parsed))
+
+
+private pure func legacy_patterns_preview(
+	source: PreviewSource, names: NameTable, patterns: List[TreePatterns.Pattern],
+) -> Result[(NameTable, List[ParsedPattern]), LegacyDeclarationPreviewError]:
+	var extended: NameTable = names
+	var parsed: List[ParsedPattern] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+	for pattern in patterns:
+		match legacy_pattern_preview(source, extended, pattern):
+			Ok((after_pattern, translated)):
+				extended = after_pattern
+				parsed = parsed.append(translated)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok((extended, parsed))
+
+
+private pure func signed_pattern_digits(sign: TreePatterns.Sign, digits: String) -> String:
+	match sign:
+		TreePatterns.NonNegative: digits
+		TreePatterns.Negative: NEGATIVE_SIGN + digits
+
+
+-- The name the frozen parser gives a discarded binder.
+private PREVIEW_DISCARD_NAME: String = "_"
+
 
 
 private pure func preview_global_header(
