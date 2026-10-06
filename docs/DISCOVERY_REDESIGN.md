@@ -1966,6 +1966,9 @@ adapter's legacy projection:
 - a 2,000-call method chain;
 - a 2,000-deep `else if` chain (an `else if` nests in the else branch);
 - a 1,000-deep nested list literal (right-nesting, bounded by brackets);
+- 1,000 value `if`s nested by indentation, a 2,000-link `else if` value and a
+  2,000-arm `match` value (proved on Linux; the nesting limit, between 1,200 and
+  1,400 levels, is open item D6, section 9);
 - 1,000-deep nested tuples, alternating tuples and lists, and vectors, all
   proved through parse, dump, ID census and projection on Linux;
 - a 1,000-deep nest of record literals, record updates and dict literals.
@@ -3382,11 +3385,42 @@ sit near the Linux native stack: adding the braced arms inline to the atom and
 mint functions made 1,000 nested lists crash there while macOS passed, so those
 arms are functions of their own and the frames on the nesting path stay small.
 
-The next bounded M4 slices are control expressions as values (`if` and `match`
-after `=`, then as operands), then the statement forms `select`, `with`,
-`concurrent`, `detach` and `debug:`. Lambdas and local functions are on their
-own branch, and opaque conversions follow in a separate slice; the complete M4
-gate still requires trait and implementation bodies.
+Another bounded M4 increment reads `if` / `else if` / `else` and `match` as
+the value of a statement: after `=` or `op=`, in `var x = ...`, `x: T = ...`
+and `xs[i] = ...`. The frozen language has no one-line `if`: `x = if c: a else: b`
+is rejected with "expected newline before indented block", and the schema
+agrees, since `IfExpression.then_block` is a `Block` and a `Block` always has a
+last statement. So the only value form is the block form, which is the form the
+statement slice already reads, and no new tree shape is needed. The recipe is a
+`ValueRecipe` (plain expression, conditional or match) used only where a
+statement takes a value, so a control expression cannot appear in
+`ExpressionRecipe` and the expression grammar and the body grammar need no
+import cycle and no shared recipe module. A control expression as an operand or
+an argument stays unsupported, as does a loop exit inside a value's blocks, a
+binary operator or a leading dot continuing past the closing dedent, and any
+tail indented past it. (A header condition and a function's one-line body
+cannot hold a block form in the frozen grammar either, so there is nothing to
+defer there.) `else if` links and match cases are read and minted by loops, the
+same code as the statement forms; statement-position and value-position `if`
+share one reader. The legacy projection treats a statement's value like an
+expression statement, so chains project by a loop.
+
+Block nesting follows indentation and is recursion in the parser, the minter,
+the dump and the projection.
+
+Their dispatchers (`mint_statement`, `dumped_statement`, `dumped_expression`
+and `legacy_statement_preview`) are thin, and most statement kinds have a
+function of their own (`while`, compound assignment and local functions stay
+inline), to keep the frames on that path small. Measured on Linux arm64 on the
+rebased build, 1,000 and 1,200 value `if`s nested one inside another pass
+parse, mint, census, dump and projection, and 1,400 overflow the native stack.
+That limit is open item D6 in section 9.
+
+The next bounded M4 slices are control expressions as operands, then the
+statement forms `select`, `with`, `concurrent`, `detach` and `debug:`. Lambdas
+and local functions are on their own branch, and opaque conversions follow in a
+separate slice; the complete M4 gate still requires trait and implementation
+bodies.
 
 Argument and list nesting are the recursion in the postfix and list grammar.
 They follow brackets the source itself nests, as the frozen parser does, and
@@ -3573,6 +3607,17 @@ unsupported globals, and had zero rejected or non-progress stops. Parity
 evidence for the braced forms is also the AST-JSON differential over 16 braced
 shapes in the projection suite.
 
+The control-value slice was validated on a fresh build rebased on main
+`3083c8c00`. Focused checks passed 17/17 (body parser), 19/19 (body projection),
+31/31 (expression parser) and the declaration scan. `compiler-new` passed
+880/880, `compiler-new-parity` 3,567/3,567 with zero mismatched files and
+`compiler-blorp` 6,668/6,668. The corpus prefix run compared 13,753 completed
+declarations in 3,409 modules, 6,426 functions, 115 traits and 165
+implementations with bodies, and stopped at 1,597 functions and 318 unsupported
+globals with zero rejected or non-progress stops. A value `if` and `match`,
+including after `?=`, over every statement form equal the frozen parser's AST
+JSON.
+
 Validation before the main reconciliation, at `a5ae15eab`:
 
 The combined fresh-build focused run passed 121/121 tests, including a
@@ -3657,6 +3702,13 @@ the proposed forms so their consequences can be reviewed.
   levels, so depth beyond 200 is unmeasured for the parser and mint as well as
   the dump. Follow-up: an iterative dump for these three forms and a
   1,000-deep proof through parse, mint, dump, census and projection on Linux.
+
+- **D6. Block nesting depth (3.14).** Nesting by indentation recurses in the
+  body parser, the minter, the dump and the legacy projection, as it did for
+  statement-position blocks before value `if`s. On Linux arm64 1,000 nested
+  value `if`s pass at 1,000 and 1,200 and overflow at 1,400. Follow-up if deeper
+  proof is wanted: iterate the block stack as the expression nesting is, or
+  raise the main stack size at the CLI.
 
 The M6 ceiling is decided and stays in section 7.3. Recovery, opaque minting,
 per-module interning, tree output, ordinary-record syntax values, glue

@@ -7,7 +7,7 @@ import:
 	../../../src/compiler/stage_02_lex/name_table: EMPTY_NAME_TABLE, IdentifierSpellings(SpellingsFromIdentifierText, SpellingsFromNameTable)
 	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
 	../../../src/compiler/stage_03_parse/parsed_ast:
-		ParsedDecl(FunctionParsedDecl, VarParsedDecl), ParsedExpr(ParsedBlockExpr, ParsedIfExpr, ParsedNameExpr, ParsedStringLiteralExpr, ParsedStringInterpolationPartsExpr), ParsedElseBranch,
+		ParsedDecl(FunctionParsedDecl, VarParsedDecl), ParsedExpr(ParsedBlockExpr, ParsedIfExpr, ParsedAssignExpr, ParsedMatchExpr, ParsedNameExpr, ParsedStringLiteralExpr, ParsedStringInterpolationPartsExpr), ParsedElseBranch,
 		ParsedStringInterpolationPart(ParsedInterpolationLiteral, ParsedInterpolationExpr), ParsedStringLiteralForm(ParsedPipeStringLiteral)
 	../tools/discovery_adapter_comparison: with_holes_parsed
 	../../../src/compiler/stage_03_parse/parsed_ast_json: ast_json_render, parsed_decl_to_json
@@ -174,6 +174,48 @@ func test_match_statements_match_old_parser() -> Bool:
 		"\t\t\tvar local = value",
 		"\t\t\tlocal",
 		"\tvalue"
+	]))
+
+
+func test_control_expression_values_match_old_parser() -> Bool:
+	bodies_match_old_parser(source_lines([
+		"func g(c: Int, xs: List[Int]) -> Int:",
+		"\tsign = if c > 0:",
+		"\t\t1",
+		"\telse if c < 0:",
+		"\t\t-1",
+		"\telse:",
+		"\t\t0",
+		"\tvar picked: Int = match c:",
+		"\t\t0: 1",
+		"\t\tSome(inner): inner",
+		"\t\t_:",
+		"\t\t\tvar local = c",
+		"\t\t\tlocal",
+		"\tcounted: Int = if c:",
+		"\t\tc",
+		"\ttotal = 0",
+		"\ttotal += if c:",
+		"\t\t1",
+		"\telse:",
+		"\t\t2",
+		"\txs[0] = match c:",
+		"\t\t_: 5",
+		"\t_ = if c:",
+		"\t\tvoid",
+		"\tfound ?= if c:",
+		"\t\tlookup(c)",
+		"\telse:",
+		"\t\tlookup(0)",
+		"\ttyped: Int ?= match c:",
+		"\t\t_: lookup(c)",
+		"\tnested = if c:",
+		"\t\tinner = match c:",
+		"\t\t\t_: 1",
+		"\t\tinner",
+		"\telse:",
+		"\t\t0",
+		"\tsign"
 	]))
 
 
@@ -397,6 +439,46 @@ func test_deep_else_if_chain_projects_by_a_loop() -> Bool:
 		_: False
 
 
+-- Value `if`s nest by indentation, so projection follows that nesting.
+func test_deeply_nested_value_ifs_project() -> Bool:
+	depth = 1000
+	var lines: List[String] = ["func f(a: Int) -> Int:"]
+	var level: Int = 0
+	while level < depth:
+		lines = lines.append("\t".repeat(level + 1) + "v${level} = if a:")
+		level += 1
+	lines = lines.append("\t".repeat(depth + 1) + "1")
+	match projected_function_body(source_lines(lines)):
+		Some(body):
+			var current: ParsedExpr = body
+			var nested: Int = 0
+			var walking: Bool = True
+			while walking:
+				match current:
+					ParsedBlockExpr([ParsedAssignExpr(_, ParsedIfExpr(_, then_block, _, _), _)], _):
+						current = then_block
+						nested += 1
+					_:
+						walking = False
+			nested == depth
+		None: False
+
+
+func test_long_match_value_projects_every_arm() -> Bool:
+	arms = 2000
+	var lines: List[String] = ["func f(a: Int) -> Int:", "\tx = match a:"]
+	var written: Int = 0
+	while written < arms:
+		lines = lines.append("\t\t${written}: ${written}")
+		written += 1
+	lines = lines.append("\t\t_: 0")
+	lines = lines.append("\tx")
+	match projected_function_body(source_lines(lines)):
+		Some(ParsedBlockExpr([ParsedAssignExpr(_, ParsedMatchExpr(_, cases, _), _), _], _)):
+			cases.length() == arms + 1
+		_: False
+
+
 func test_long_statement_list_projects_in_order() -> Bool:
 	count = 5000
 	var lines: List[String] = ["func f() -> Int:"]
@@ -419,6 +501,7 @@ tests: TestSuite = {
 		("control flow matches the old parser", test_control_flow_matches_old_parser),
 		("question bindings and tuple loops match the old parser", test_question_bindings_and_tuple_loops_match_old_parser),
 		("match statements match the old parser", test_match_statements_match_old_parser),
+		("control expression values match the old parser", test_control_expression_values_match_old_parser),
 		("nested blocks match the old parser", test_nested_blocks_match_old_parser),
 		("trait default bodies match the old parser", test_trait_default_bodies_match_old_parser),
 		("implementation bodies match the old parser", test_implementation_bodies_match_old_parser),
@@ -428,6 +511,8 @@ tests: TestSuite = {
 		("character escapes and raw pipe strings match the old parser", test_character_escapes_and_raw_pipe_strings_match_old_parser),
 		("pipe strings project like the old parser", test_pipe_strings_project_like_the_old_parser),
 		("a 2000 link else if chain projects by a loop", test_deep_else_if_chain_projects_by_a_loop),
+		("1000 nested value ifs project", test_deeply_nested_value_ifs_project),
+		("a 2000 arm match value projects every arm", test_long_match_value_projects_every_arm),
 		("5000 statements project in order", test_long_statement_list_projects_in_order)
 	]
 }

@@ -4996,6 +4996,11 @@ private pure func legacy_block_preview(
 			Ok((extended, ParsedBlockExpr(items, legacy_location(block.span))))
 
 
+-- Blocks nest by indentation and hold statements, so the functions between a
+-- statement and the statements of its blocks are on the native stack once per
+-- level. Each kind is projected by a function of its own and this dispatcher
+-- stays thin, which keeps the 1,000-deep proof of section 3.14 inside the
+-- Linux stack.
 private pure func legacy_statement_preview(
 	source: PreviewSource, names: NameTable, statement: TreeExpressions.Statement,
 ) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
@@ -5004,54 +5009,15 @@ private pure func legacy_statement_preview(
 		TreeExpressions.ExpressionStatement(expression):
 			legacy_statement_expression_preview(source, names, expression)
 		TreeExpressions.VariableDeclaration(declaration):
-			match declaration.target:
-				BindsName(binder):
-					(after_name, name) = preview_identifier(source, names, binder.name)
-					translated_type ?= preview_optional_type(source, after_name, declaration.declared_type)
-					(after_type, type_expr) = translated_type
-					translated_value ?= legacy_expression_preview(source, after_type, declaration.value)
-					(after_value, value) = translated_value
-					Ok((after_value, ParsedVarDeclExpr(name, type_expr, value, True, location)))
-				DiscardsValue(span):
-					Err(UnsupportedBodyStatement(span))
+			legacy_variable_preview(source, names, declaration, location)
 		TreeExpressions.TypedBinding(binding):
-			match binding.target:
-				BindsName(binder):
-					(after_name, name) = preview_identifier(source, names, binder.name)
-					translated_type ?= preview_type(source, after_name, binding.declared_type)
-					(after_type, type_expr) = translated_type
-					translated_value ?= legacy_expression_preview(source, after_type, binding.value)
-					(after_value, value) = translated_value
-					Ok((after_value, ParsedVarDeclExpr(name, Some(type_expr), value, False, location)))
-				DiscardsValue(span):
-					Err(UnsupportedBodyStatement(span))
+			legacy_typed_binding_preview(source, names, binding, location)
 		TreeExpressions.Assignment(assignment):
-			(after_target, name) = match assignment.target:
-				TreeExpressions.AssignsName(use):
-					preview_identifier(source, names, use.name)
-				TreeExpressions.AssignsDiscard(span):
-					preview_text_identifier(names, PREVIEW_DISCARD_NAME, span)
-			translated_value ?= legacy_expression_preview(source, after_target, assignment.value)
-			(after_value, value) = translated_value
-			Ok((after_value, ParsedAssignExpr(name, value, location)))
+			legacy_assignment_preview(source, names, assignment, location)
 		TreeExpressions.CompoundAssignment(assignment):
-			(after_target, name) = preview_identifier(source, names, assignment.target.name)
-			operator: ParsedCompoundAssignOp = match assignment.operator:
-				TreeExpressions.AddAssign: ParsedAssignAddOp
-				TreeExpressions.SubtractAssign: ParsedAssignSubtractOp
-				TreeExpressions.MultiplyAssign: ParsedAssignMultiplyOp
-				TreeExpressions.DivideAssign: ParsedAssignDivideOp
-			translated_value ?= legacy_expression_preview(source, after_target, assignment.value)
-			(after_value, value) = translated_value
-			Ok((after_value, ParsedCompoundAssignExpr(name, operator, value, location)))
+			legacy_compound_assignment_preview(source, names, assignment, location)
 		TreeExpressions.SubscriptAssignment(assignment):
-			translated_collection ?= legacy_expression_preview(source, names, assignment.place.collection)
-			(after_collection, collection) = translated_collection
-			translated_indices ?= legacy_expressions_preview(source, after_collection, at_least_one_items(assignment.place.indices))
-			(extended, indices) = translated_indices
-			translated_value ?= legacy_expression_preview(source, extended, assignment.value)
-			(after_value, value) = translated_value
-			Ok((after_value, ParsedSubscriptAssignExpr(collection, indices, value, location)))
+			legacy_subscript_assignment_preview(source, names, assignment, location)
 		TreeExpressions.WhileLoop(loop):
 			translated_condition ?= legacy_expression_preview(source, names, loop.condition)
 			(after_condition, condition) = translated_condition
@@ -5059,22 +5025,103 @@ private pure func legacy_statement_preview(
 			(after_body, body) = translated_body
 			Ok((after_body, ParsedWhileExpr(condition, body, location)))
 		TreeExpressions.ForLoop(loop):
-			translated_binder ?= legacy_loop_binder_preview(source, names, loop.binder)
-			(after_binder, binder) = translated_binder
-			translated_iterable ?= legacy_expression_preview(source, after_binder, loop.iterable)
-			(after_iterable, iterable) = translated_iterable
-			translated_body ?= legacy_block_preview(source, after_iterable, loop.body)
-			(after_body, body) = translated_body
-			Ok((after_body, ParsedForExpr(binder, iterable, body, location)))
+			legacy_for_preview(source, names, loop, location)
 		TreeExpressions.QuestionBinding(binding):
-			(after_name, name) = preview_identifier(source, names, binding.binder.name)
-			translated_type ?= preview_optional_type(source, after_name, binding.declared_type)
-			(after_type, type_expr) = translated_type
-			translated_value ?= legacy_expression_preview(source, after_type, binding.value)
-			(after_value, value) = translated_value
-			Ok((after_value, ParsedQuestionBindExpr(name, type_expr, value, location)))
+			legacy_question_binding_preview(source, names, binding, location)
 		_:
 			Err(UnsupportedBodyStatement(statement.span))
+
+
+private pure func legacy_variable_preview(
+	source: PreviewSource, names: NameTable, declaration: TreeExpressions.VariableStatement, location: SourceLocation,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	match declaration.target:
+		BindsName(binder):
+			(after_name, name) = preview_identifier(source, names, binder.name)
+			translated_type ?= preview_optional_type(source, after_name, declaration.declared_type)
+			(after_type, type_expr) = translated_type
+			translated_value ?= legacy_value_preview(source, after_type, declaration.value)
+			(after_value, value) = translated_value
+			Ok((after_value, ParsedVarDeclExpr(name, type_expr, value, True, location)))
+		DiscardsValue(span):
+			Err(UnsupportedBodyStatement(span))
+
+
+private pure func legacy_typed_binding_preview(
+	source: PreviewSource, names: NameTable, binding: TreeExpressions.TypedBindingStatement, location: SourceLocation,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	match binding.target:
+		BindsName(binder):
+			(after_name, name) = preview_identifier(source, names, binder.name)
+			translated_type ?= preview_type(source, after_name, binding.declared_type)
+			(after_type, type_expr) = translated_type
+			translated_value ?= legacy_value_preview(source, after_type, binding.value)
+			(after_value, value) = translated_value
+			Ok((after_value, ParsedVarDeclExpr(name, Some(type_expr), value, False, location)))
+		DiscardsValue(span):
+			Err(UnsupportedBodyStatement(span))
+
+
+private pure func legacy_assignment_preview(
+	source: PreviewSource, names: NameTable, assignment: TreeExpressions.AssignmentStatement, location: SourceLocation,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	(after_target, name) = match assignment.target:
+		TreeExpressions.AssignsName(use):
+			preview_identifier(source, names, use.name)
+		TreeExpressions.AssignsDiscard(span):
+			preview_text_identifier(names, PREVIEW_DISCARD_NAME, span)
+	translated_value ?= legacy_value_preview(source, after_target, assignment.value)
+	(after_value, value) = translated_value
+	Ok((after_value, ParsedAssignExpr(name, value, location)))
+
+
+private pure func legacy_compound_assignment_preview(
+	source: PreviewSource, names: NameTable, assignment: TreeExpressions.CompoundAssignmentStatement, location: SourceLocation,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	(after_target, name) = preview_identifier(source, names, assignment.target.name)
+	operator: ParsedCompoundAssignOp = match assignment.operator:
+		TreeExpressions.AddAssign: ParsedAssignAddOp
+		TreeExpressions.SubtractAssign: ParsedAssignSubtractOp
+		TreeExpressions.MultiplyAssign: ParsedAssignMultiplyOp
+		TreeExpressions.DivideAssign: ParsedAssignDivideOp
+	translated_value ?= legacy_value_preview(source, after_target, assignment.value)
+	(after_value, value) = translated_value
+	Ok((after_value, ParsedCompoundAssignExpr(name, operator, value, location)))
+
+
+private pure func legacy_subscript_assignment_preview(
+	source: PreviewSource, names: NameTable, assignment: TreeExpressions.SubscriptAssignmentStatement, location: SourceLocation,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	translated_collection ?= legacy_expression_preview(source, names, assignment.place.collection)
+	(after_collection, collection) = translated_collection
+	translated_indices ?= legacy_expressions_preview(source, after_collection, at_least_one_items(assignment.place.indices))
+	(extended, indices) = translated_indices
+	translated_value ?= legacy_value_preview(source, extended, assignment.value)
+	(after_value, value) = translated_value
+	Ok((after_value, ParsedSubscriptAssignExpr(collection, indices, value, location)))
+
+
+private pure func legacy_question_binding_preview(
+	source: PreviewSource, names: NameTable, binding: TreeExpressions.QuestionBindingStatement, location: SourceLocation,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	(after_name, name) = preview_identifier(source, names, binding.binder.name)
+	translated_type ?= preview_optional_type(source, after_name, binding.declared_type)
+	(after_type, type_expr) = translated_type
+	translated_value ?= legacy_value_preview(source, after_type, binding.value)
+	(after_value, value) = translated_value
+	Ok((after_value, ParsedQuestionBindExpr(name, type_expr, value, location)))
+
+
+private pure func legacy_for_preview(
+	source: PreviewSource, names: NameTable, loop: TreeExpressions.ForStatement, location: SourceLocation,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	translated_binder ?= legacy_loop_binder_preview(source, names, loop.binder)
+	(after_binder, binder) = translated_binder
+	translated_iterable ?= legacy_expression_preview(source, after_binder, loop.iterable)
+	(after_iterable, iterable) = translated_iterable
+	translated_body ?= legacy_block_preview(source, after_iterable, loop.body)
+	(after_body, body) = translated_body
+	Ok((after_body, ParsedForExpr(binder, iterable, body, location)))
 
 
 -- A loop's variable, or its tuple of variables with the parenthesized span.
@@ -5113,14 +5160,24 @@ private pure func legacy_statement_expression_preview(
 ) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
 	location: SourceLocation = legacy_location(expression.span)
 	match expression.kind:
-		TreeExpressions.If(conditional):
-			legacy_conditional_preview(source, names, conditional, expression.span)
-		TreeExpressions.Match(subject, cases):
-			legacy_match_preview(source, names, subject, cases, location)
 		TreeExpressions.Break:
 			Ok((names, ParsedBreakExpr(location)))
 		TreeExpressions.Continue:
 			Ok((names, ParsedContinueExpr(location)))
+		_:
+			legacy_value_preview(source, names, expression)
+
+
+-- A statement's value: the block-bearing `if` and `match` are read here, and
+-- every other expression by the expression projection.
+private pure func legacy_value_preview(
+	source: PreviewSource, names: NameTable, expression: TreeExpressions.Expression,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	match expression.kind:
+		TreeExpressions.If(conditional):
+			legacy_conditional_preview(source, names, conditional, expression.span)
+		TreeExpressions.Match(subject, cases):
+			legacy_match_preview(source, names, subject, cases, legacy_location(expression.span))
 		_:
 			legacy_expression_preview(source, names, expression)
 

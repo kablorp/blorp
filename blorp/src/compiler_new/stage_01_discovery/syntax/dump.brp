@@ -49,6 +49,7 @@ import:
 		UnionDeclaration,
 		UnionDeclarationForm(OrdinaryUnion, FixedUnion),
 	expressions:
+		AssignmentStatement,
 		AssignmentTarget(AssignsDiscard, AssignsName),
 		BinaryOperator(
 			Add, Divide, Equal, Greater, GreaterEqual, Less, LessEqual, Modulo, Multiply, NotEqual,
@@ -57,7 +58,9 @@ import:
 		Block,
 		Body(BlockBody, ExpressionBody),
 		CaseBody(CaseBlock, CaseStatement),
+		CompoundAssignmentStatement,
 		CompoundOperator(AddAssign, DivideAssign, MultiplyAssign, SubtractAssign),
+		ConcurrentForStatement,
 		CountParameter,
 		ElseBody(ElseBlock, ElseIf),
 		ElseBranch,
@@ -69,13 +72,16 @@ import:
 			OpaqueConversion, RangeExpression, RecordLiteral, RecordUpdate, Select, ShortCircuit,
 			StringLiteral, Subscript, TupleLiteral, Unary, VectorLiteral, VoidValue, With,
 		),
+		ForStatement,
 		IfExpression,
 		InterpolationForm(PipeInterpolation, QuotedInterpolation),
 		InterpolationPiece(InterpolationHole, InterpolationText),
 		LogicalOperator(LogicalAnd, LogicalOr),
 		LoopBinder(LoopTuple, LoopVariable),
+		MatchCase,
 		NamedValue,
 		OpaqueDirection(FromOpaque, IntoOpaque),
+		QuestionBindingStatement,
 		SelectArmKind(AfterArm, ReceiveArm, SealedArm),
 		Statement,
 		StatementKind(
@@ -83,8 +89,12 @@ import:
 			LocalFunctionStatement, QuestionBinding, SubscriptAssignment, TupleDestructure,
 			TypedBinding, VariableDeclaration, WhileLoop,
 		),
+		SubscriptAssignmentStatement,
 		TimeoutParameter,
+		TupleDestructureStatement,
+		TypedBindingStatement,
 		UnaryOperator(LogicalNot, Negate),
+		VariableStatement,
 		WithAcquisition(WithTry, WithValue),
 	foreign_blocks: ForeignBlock, ForeignFunction
 	ids:
@@ -1263,138 +1273,222 @@ private pure func dumped_block(
 		.append(")")
 
 
+-- A statement is dumped by one small function per kind. Blocks nest by
+-- indentation and a block holds statements, so the functions on that path are
+-- on the native stack once per level of nesting; keeping the dispatcher thin
+-- lets the 1,000-deep proof of section 3.14 fit the Linux stack.
 private pure func dumped_statement(
 	out: List[String],
 	spellings: Spellings,
 	depth: Int,
 	statement: Statement,
 ) -> List[String]:
-	head: String = " stmt" + statement.id
-		.statement_local_index()
-		.to_string() + " " + span_text(statement.span)
-
 	match statement.kind:
 		ExpressionStatement(expression):
 			out
-				.append("(expression-statement" + head + " ")
+				.append("(expression-statement" + statement_head(statement) + " ")
 				.dumped_expression(spellings, depth, expression)
 				.append(")")
 		VariableDeclaration(declaration):
-			out
-				.append("(var" + head + " " + target_text(spellings, declaration.target) + " ")
-				.dumped_optional_type(spellings, depth, declaration.declared_type)
-				.append(" ")
-				.dumped_expression(spellings, depth, declaration.value)
-				.append(")")
+			out.dumped_variable_declaration(spellings, depth, statement, declaration)
 		TypedBinding(binding):
-			out
-				.append(
-					"(typed-binding" + head + " " + target_text(spellings, binding.target) + " ",
-				)
-				.dumped_type(spellings, depth, binding.declared_type)
-				.append(" ")
-				.dumped_expression(spellings, depth, binding.value)
-				.append(")")
+			out.dumped_typed_binding(spellings, depth, statement, binding)
 		Assignment(assignment):
-			target: String = match assignment.target:
-				AssignsName(use):
-					use_text(spellings, use)
-				AssignsDiscard(span):
-					"_" + span_text(span)
-
-			out
-				.append("(assignment" + head + " " + target + " ")
-				.dumped_expression(spellings, depth, assignment.value)
-				.append(")")
+			out.dumped_assignment(spellings, depth, statement, assignment)
 		QuestionBinding(binding):
-			out
-				.append(
-					"(question-binding" + head + " " + binder_text(
-						spellings,
-						binding.binder,
-					) + " ",
-				)
-				.dumped_optional_type(spellings, depth, binding.declared_type)
-				.append(" ")
-				.dumped_expression(spellings, depth, binding.value)
-				.append(")")
+			out.dumped_question_binding(spellings, depth, statement, binding)
 		CompoundAssignment(assignment):
-			operator: String = match assignment.operator:
-				AddAssign:
-					"add"
-				SubtractAssign:
-					"subtract"
-				MultiplyAssign:
-					"multiply"
-				DivideAssign:
-					"divide"
-
-			out
-				.append(
-					"(compound-assignment" + head + " " + operator + " " + use_text(
-						spellings,
-						assignment.target,
-					) + " ",
-				)
-				.dumped_expression(spellings, depth, assignment.value)
-				.append(")")
+			out.dumped_compound_assignment(spellings, depth, statement, assignment)
 		SubscriptAssignment(assignment):
-			place: String = " (place expr" + assignment.place.id
-				.expression_local_index()
-				.to_string() + " " + span_text(assignment.place.span) + " "
-			out
-				.append("(subscript-assignment" + head + place)
-				.dumped_expression(spellings, depth, assignment.place.collection)
-				.dumped_expressions(spellings, depth, assignment.place.indices.at_least_one_items())
-				.append(") ")
-				.dumped_expression(spellings, depth, assignment.value)
-				.append(")")
+			out.dumped_subscript_assignment(spellings, depth, statement, assignment)
 		TupleDestructure(destructure):
-			targets: String = destructure.targets
-				.small_tuple_items()
-				.map(pure func(target): target_text(spellings, target))
-				.join(" ")
-			out
-				.append("(tuple-destructure" + head + " (" + targets + ") ")
-				.dumped_expression(spellings, depth, destructure.value)
-				.append(")")
+			out.dumped_tuple_destructure(spellings, depth, statement, destructure)
 		WhileLoop(loop):
 			out
-				.append("(while" + head + " ")
+				.append("(while" + statement_head(statement) + " ")
 				.dumped_expression(spellings, depth, loop.condition)
 				.append(" ")
 				.dumped_block(spellings, depth, loop.body)
 				.append(")")
 		ForLoop(loop):
-			binder: String = match loop.binder:
-				LoopVariable(target):
-					target_text(spellings, target)
-				LoopTuple(targets, span):
-					"(tuple " + span_text(span) + " " + targets
-						.small_tuple_items()
-						.map(pure func(target): target_text(spellings, target))
-						.join(" ") + ")"
-
-			out
-				.append("(for" + head + " " + binder + " ")
-				.dumped_expression(spellings, depth, loop.iterable)
-				.append(" ")
-				.dumped_block(spellings, depth, loop.body)
-				.append(")")
+			out.dumped_for_loop(spellings, depth, statement, loop)
 		ConcurrentForLoop(loop):
-			out
-				.append("(concurrent-for" + head + " " + binder_text(spellings, loop.binder) + " ")
-				.dumped_expression(spellings, depth, loop.iterable)
-				.append(" " + count_text(loop.limit) + " ")
-				.dumped_timeout(spellings, depth, loop.timeout)
-				.append(" ")
-				.dumped_block(spellings, depth, loop.body)
-				.append(")")
+			out.dumped_concurrent_for_loop(spellings, depth, statement, loop)
 		LocalFunctionStatement(function):
 			out
-				.append("(local-function-statement" + head + " ")
+				.append("(local-function-statement" + statement_head(statement) + " ")
 				.dumped_local_function(spellings, depth, function)
 				.append(")")
+
+
+private pure func statement_head(statement: Statement) -> String:
+	" stmt" + statement.id
+		.statement_local_index()
+		.to_string() + " " + span_text(statement.span)
+
+
+private pure func dumped_variable_declaration(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	statement: Statement,
+	declaration: VariableStatement,
+) -> List[String]:
+	out
+		.append("(var" + statement_head(statement) + " " + target_text(spellings, declaration.target) + " ")
+		.dumped_optional_type(spellings, depth, declaration.declared_type)
+		.append(" ")
+		.dumped_expression(spellings, depth, declaration.value)
+		.append(")")
+
+
+private pure func dumped_typed_binding(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	statement: Statement,
+	binding: TypedBindingStatement,
+) -> List[String]:
+	out
+		.append("(typed-binding" + statement_head(statement) + " " + target_text(spellings, binding.target) + " ")
+		.dumped_type(spellings, depth, binding.declared_type)
+		.append(" ")
+		.dumped_expression(spellings, depth, binding.value)
+		.append(")")
+
+
+private pure func dumped_assignment(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	statement: Statement,
+	assignment: AssignmentStatement,
+) -> List[String]:
+	target: String = match assignment.target:
+		AssignsName(use):
+			use_text(spellings, use)
+		AssignsDiscard(span):
+			"_" + span_text(span)
+
+	out
+		.append("(assignment" + statement_head(statement) + " " + target + " ")
+		.dumped_expression(spellings, depth, assignment.value)
+		.append(")")
+
+
+private pure func dumped_question_binding(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	statement: Statement,
+	binding: QuestionBindingStatement,
+) -> List[String]:
+	out
+		.append("(question-binding" + statement_head(statement) + " " + binder_text(spellings, binding.binder) + " ")
+		.dumped_optional_type(spellings, depth, binding.declared_type)
+		.append(" ")
+		.dumped_expression(spellings, depth, binding.value)
+		.append(")")
+
+
+private pure func dumped_compound_assignment(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	statement: Statement,
+	assignment: CompoundAssignmentStatement,
+) -> List[String]:
+	operator: String = match assignment.operator:
+		AddAssign:
+			"add"
+		SubtractAssign:
+			"subtract"
+		MultiplyAssign:
+			"multiply"
+		DivideAssign:
+			"divide"
+
+	out
+		.append("(compound-assignment" + statement_head(statement) + " " + operator + " " + use_text(spellings, assignment.target) + " ")
+		.dumped_expression(spellings, depth, assignment.value)
+		.append(")")
+
+
+private pure func dumped_subscript_assignment(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	statement: Statement,
+	assignment: SubscriptAssignmentStatement,
+) -> List[String]:
+	place: String = " (place expr" + assignment.place.id
+		.expression_local_index()
+		.to_string() + " " + span_text(assignment.place.span) + " "
+	out
+		.append("(subscript-assignment" + statement_head(statement) + place)
+		.dumped_expression(spellings, depth, assignment.place.collection)
+		.dumped_expressions(spellings, depth, assignment.place.indices.at_least_one_items())
+		.append(") ")
+		.dumped_expression(spellings, depth, assignment.value)
+		.append(")")
+
+
+private pure func dumped_tuple_destructure(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	statement: Statement,
+	destructure: TupleDestructureStatement,
+) -> List[String]:
+	targets: String = destructure.targets
+		.small_tuple_items()
+		.map(pure func(target): target_text(spellings, target))
+		.join(" ")
+	out
+		.append("(tuple-destructure" + statement_head(statement) + " (" + targets + ") ")
+		.dumped_expression(spellings, depth, destructure.value)
+		.append(")")
+
+
+private pure func dumped_for_loop(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	statement: Statement,
+	loop: ForStatement,
+) -> List[String]:
+	binder: String = match loop.binder:
+		LoopVariable(target):
+			target_text(spellings, target)
+		LoopTuple(targets, span):
+			"(tuple " + span_text(span) + " " + targets
+				.small_tuple_items()
+				.map(pure func(target): target_text(spellings, target))
+				.join(" ") + ")"
+
+	out
+		.append("(for" + statement_head(statement) + " " + binder + " ")
+		.dumped_expression(spellings, depth, loop.iterable)
+		.append(" ")
+		.dumped_block(spellings, depth, loop.body)
+		.append(")")
+
+
+private pure func dumped_concurrent_for_loop(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	statement: Statement,
+	loop: ConcurrentForStatement,
+) -> List[String]:
+	out
+		.append("(concurrent-for" + statement_head(statement) + " " + binder_text(spellings, loop.binder) + " ")
+		.dumped_expression(spellings, depth, loop.iterable)
+		.append(" " + count_text(loop.limit) + " ")
+		.dumped_timeout(spellings, depth, loop.timeout)
+		.append(" ")
+		.dumped_block(spellings, depth, loop.body)
+		.append(")")
 
 
 private pure func dumped_local_function(
@@ -1531,6 +1625,67 @@ private pure func expression_head(form: String, expression: Expression) -> Strin
 		.to_string() + " " + span_text(expression.span)
 
 
+-- The `if` and `match` arms are functions of their own, reached before the
+-- large general walker: a block nests statements, which nest expressions, so
+-- these frames are on the native stack once per level of nesting.
+private pure func dumped_expression(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	expression: Expression,
+) -> List[String]:
+	match expression.kind:
+		If(conditional):
+			out.dumped_if_expression(spellings, depth, expression, conditional)
+		Match(subject, cases):
+			out.dumped_match_expression(spellings, depth, expression, subject, cases)
+		_:
+			out.dumped_general_expression(spellings, depth, expression)
+
+
+private pure func dumped_if_expression(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	expression: Expression,
+	conditional: IfExpression,
+) -> List[String]:
+	out
+		.append(expression_head("if", expression) + " ")
+		.dumped_if(spellings, depth, conditional)
+		.append(")")
+
+
+private pure func dumped_match_expression(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	expression: Expression,
+	subject: Expression,
+	cases: List[MatchCase],
+) -> List[String]:
+	var dumped: List[String] = out
+		.append(expression_head("match", expression) + " ")
+		.dumped_expression(spellings, depth, subject)
+
+	for match_case in cases:
+		dumped = dumped
+			.on_line(depth + 1)
+			.append("(case " + span_text(match_case.span) + " ")
+			.dumped_pattern(spellings, depth + 1, match_case.pattern)
+			.append(" ")
+
+		match match_case.body:
+			CaseBlock(block):
+				dumped = dumped.dumped_block(spellings, depth + 1, block)
+			CaseStatement(statement):
+				dumped = dumped.dumped_statement(spellings, depth + 1, statement)
+
+		dumped = dumped.append(")")
+
+	dumped.append(")")
+
+
 ---
 An expression. Its left spine (the left operand of a binary or
 short-circuit operator, a callee, a receiver, a subscripted collection) is
@@ -1538,7 +1693,7 @@ walked by a loop: every spine node's head is written root first, then the
 node the spine ends at, then every spine node's remaining parts innermost
 first.
 ---
-private pure func dumped_expression(
+private pure func dumped_general_expression(
 	out: List[String],
 	spellings: Spellings,
 	depth: Int,
@@ -1723,32 +1878,10 @@ private pure func dumped_expression(
 					.append(")")
 				on_spine = False
 			If(conditional):
-				dumped = dumped
-					.append(expression_head("if", current) + " ")
-					.dumped_if(spellings, depth, conditional)
-					.append(")")
+				dumped = dumped.dumped_if_expression(spellings, depth, current, conditional)
 				on_spine = False
 			Match(subject, cases):
-				dumped = dumped
-					.append(expression_head("match", current) + " ")
-					.dumped_expression(spellings, depth, subject)
-
-				for match_case in cases:
-					dumped = dumped
-						.on_line(depth + 1)
-						.append("(case " + span_text(match_case.span) + " ")
-						.dumped_pattern(spellings, depth + 1, match_case.pattern)
-						.append(" ")
-
-					match match_case.body:
-						CaseBlock(block):
-							dumped = dumped.dumped_block(spellings, depth + 1, block)
-						CaseStatement(statement):
-							dumped = dumped.dumped_statement(spellings, depth + 1, statement)
-
-					dumped = dumped.append(")")
-
-				dumped = dumped.append(")")
+				dumped = dumped.dumped_match_expression(spellings, depth, current, subject, cases)
 				on_spine = False
 			Select(arms):
 				dumped = dumped.append(expression_head("select", current))

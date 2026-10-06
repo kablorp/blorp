@@ -7,13 +7,13 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
 		DeclarationPreview(CompletedFunctionPreview, CompletedTraitPreview, CompletedImplementationPreview, FunctionDeclarationPreview, TraitDeclarationPreview, ImplementationDeclarationPreview)
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
-		ModuleDeclarationPreviewScan, scan_module_declaration_prefix_with_bodies, scan_module_declaration_prefix_with_expressions
+		ModuleDeclarationPreviewScan, ModuleDeclarationScanStop(StoppedAtGlobalInitializer), scan_module_declaration_prefix_with_bodies, scan_module_declaration_prefix_with_expressions
 	../../../../src/compiler_new/stage_01_discovery/syntax/dump: dumped_module
 	../../../../src/compiler_new/stage_01_discovery/syntax/expressions:
-		Body(BlockBody), ElseBody(ElseIf), ElseBranch, ExpressionKind(If), StatementKind(ExpressionStatement)
+		Body(BlockBody), ElseBody(ElseBlock, ElseIf), ElseBranch, ExpressionKind(If), StatementKind(Assignment, ExpressionStatement)
 	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: FunctionDeclaration
 	../../../../src/compiler_new/stage_01_discovery/syntax/id_census: id_census
-	../../../../src/compiler_new/stage_01_discovery/syntax/ids: expression_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: block_local_index, expression_local_index, statement_local_index
 	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: ModuleItem(FunctionItem, TraitItem, ImplementationItem), ModuleSyntax
 	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
 	test: TestSuite
@@ -160,7 +160,16 @@ func test_unsupported_bodies_roll_back_exactly() -> Bool:
 		["\tfor (a, 1) in pairs:", "\t\ta"],
 		["\t(a, b) = pair"],
 		["\tx =", "\t\t1"],
-		["\tvalue = if flag:", "\t\t1", "\telse:", "\t\t2"],
+		["\tvalue = if flag: 1 else: 2"],
+		["\tvalue = 1 + if flag:", "\t\t1", "\telse:", "\t\t2"],
+		["\tvalue = f(if flag:", "\t\t1", "\telse:", "\t\t2", "\t)"],
+		["\tvalue = if flag:", "\t\t1", "\telse:", "\t\t2", "\t-z"],
+		["\tvalue = match flag:", "\t\t_: 1", "\t-z"],
+		["\tvalue = (if flag:", "\t\t1", "\telse:", "\t\t2)"],
+		["\tfor x in xs:", "\t\tvalue = if x:", "\t\t\tbreak", "\t\telse:", "\t\t\t1"],
+		["\tvalue = if flag:", "\t\t1", "\telse:", "\t\t2", "\t\t.map(f)"],
+		["\tvalue = if flag:", "\t\t1", "\telse if", "\t\t2"],
+		["\tvalue = if flag:", "\t\t1", "\telse:", "\t\t2", "\t.map(f)"],
 		["\tfor (k, v) in pairs concurrently(limit: 2):", "\t\tk"],
 		["\tfor x in xs concurrently(limit: 2):", "\t\tx"],
 		["\tbreak"],
@@ -381,6 +390,136 @@ func test_deep_else_if_chain_survives_parse_dump_and_census() -> Bool:
 		None: False
 
 
+-- A control expression is a whole value after `=` or `op=`, and its blocks
+-- end on dedents. Both sides are pinned: that shape completes, and every other
+-- way of continuing past a block or indenting a tail stays deferred.
+func test_control_expression_is_only_a_whole_value() -> Bool:
+	accepted = source_lines([
+		"func f(a: Int) -> Int:",
+		"\tx = if a:",
+		"\t\t1",
+		"\telse if a:",
+		"\t\t2",
+		"\telse:",
+		"\t\t3",
+		"\tvar y: Int = match x:",
+		"\t\t0: 1",
+		"\t\t_: 2",
+		"\tx += if a:",
+		"\t\ty",
+		"\tx"
+	])
+	deferred = source_lines(["func f(a: Int) -> Int:", "\tx = if a:", "\t\t1", "\telse:", "\t\t2", "\t\t.tail()", "\tx"])
+	global_value = source_lines(["g = if a:", "\t1", "else:", "\t2"])
+	var correct: Bool = true_if_completed(accepted) and not true_if_completed(deferred)
+	match new_parse_state(lex_module(module_id_at_row(0), global_value)):
+		Ok(entry):
+			(state, scan) = scan_module_declaration_prefix_with_expressions(entry)
+			stopped = match scan.stop:
+				StoppedAtGlobalInitializer(_): True
+				_: False
+			correct = correct and stopped and scan.declarations.is_empty() and state.issued_counts().expressions == 0
+		Err(_): correct = False
+	correct
+
+
+private pure func true_if_completed(text: String) -> Bool:
+	match scanned(text):
+		Some((state, scan)):
+			completed_count(scan) == 1 and deferred_count(scan) == 0 and state.diagnostic_count() == 0 and id_census(module_id_at_row(0), completed_module(state, scan)).is_empty()
+		None: False
+
+
+-- A value `if` mints its condition, its blocks' statements, then itself, and
+-- the assignment that owns it after all of them. Swapping any two would lower
+-- an owner's index below a child's.
+func test_control_value_ids_follow_source_order() -> Bool:
+	text = source_lines(["func f(a: Int) -> Int:", "\tx = if a:", "\t\t1", "\telse:", "\t\t2", "\tx"])
+	match scanned(text):
+		Some((state, scan)):
+			match scan.declarations.get(0):
+				Some(CompletedFunctionPreview(function)):
+					match function.function.body:
+						Some(BlockBody(block)):
+							match block.leading.get(0):
+								Some(assignment_statement):
+									match assignment_statement.kind:
+										Assignment(assignment):
+											match assignment.value.kind:
+												If(conditional):
+													match conditional.else_branch:
+														Some(branch):
+															match branch.body:
+																ElseBlock(else_block):
+																	assignment_index = assignment_statement.id.statement_local_index()
+																	(conditional.condition.id.expression_local_index() < assignment.value.id.expression_local_index()
+																		and conditional.then_block.last.id.statement_local_index() < else_block.last.id.statement_local_index()
+																		and else_block.last.id.statement_local_index() < assignment_index
+																		and conditional.then_block.id.block_local_index() < else_block.id.block_local_index()
+																		and id_census(module_id_at_row(0), completed_module(state, scan)).is_empty())
+																_: False
+														None: False
+												_: False
+										_: False
+								None: False
+						_: False
+				_: False
+		None: False
+
+
+-- Value `if`s nest by indentation, one level per line.
+func test_deeply_nested_value_ifs_survive_parse_dump_and_census() -> Bool:
+	depth = 1000
+	var lines: List[String] = ["func f(a: Int) -> Int:"]
+	var level: Int = 0
+	while level < depth:
+		lines = lines.append("\t".repeat(level + 1) + "v${level} = if a:")
+		level += 1
+	lines = lines.append("\t".repeat(depth + 1) + "1")
+	match scanned(source_lines(lines)):
+		Some((state, scan)):
+			syntax = completed_module(state, scan)
+			dumped = dumped_module(syntax, spellings(state))
+			completed_count(scan) == 1 and id_census(module_id_at_row(0), syntax).is_empty() and dumped.split("(if expr").length() == depth + 1
+		None: False
+
+
+func test_long_else_if_value_survives_parse_dump_and_census() -> Bool:
+	links = 2000
+	var lines: List[String] = ["func f(a: Int) -> Int:", "\tx = if a:", "\t\t0"]
+	var written: Int = 1
+	while written < links:
+		lines = lines.append("\telse if a:")
+		lines = lines.append("\t\t${written}")
+		written += 1
+	lines = lines.append("\telse:")
+	lines = lines.append("\t\t${links}")
+	lines = lines.append("\tx")
+	match scanned(source_lines(lines)):
+		Some((state, scan)):
+			syntax = completed_module(state, scan)
+			dumped = dumped_module(syntax, spellings(state))
+			completed_count(scan) == 1 and id_census(module_id_at_row(0), syntax).is_empty() and state.issued_counts().blocks == links + 2 and dumped.split("(else-if expr").length() == links
+		None: False
+
+
+func test_long_match_value_survives_parse_dump_and_census() -> Bool:
+	arms = 2000
+	var lines: List[String] = ["func f(a: Int) -> Int:", "\tx = match a:"]
+	var written: Int = 0
+	while written < arms:
+		lines = lines.append("\t\t${written}: ${written}")
+		written += 1
+	lines = lines.append("\t\t_: 0")
+	lines = lines.append("\tx")
+	match scanned(source_lines(lines)):
+		Some((state, scan)):
+			syntax = completed_module(state, scan)
+			dumped = dumped_module(syntax, spellings(state))
+			completed_count(scan) == 1 and id_census(module_id_at_row(0), syntax).is_empty() and dumped.split("(case @").length() == arms + 2
+		None: False
+
+
 tests: TestSuite = {
 	description = "Tree statements, blocks and function bodies",
 	tests = [
@@ -395,6 +534,11 @@ tests: TestSuite = {
 		("else if links are minted inner before outer", test_else_if_chain_mints_inner_links_before_outer_ones),
 		("a function after a deferred function issues only its own ids", test_function_after_a_deferred_function_issues_only_its_own_ids),
 		("5000 statements", test_long_statement_list_is_read_and_minted_by_loops),
-		("2000 link else if chain", test_deep_else_if_chain_survives_parse_dump_and_census)
+		("2000 link else if chain", test_deep_else_if_chain_survives_parse_dump_and_census),
+		("a control expression is only a whole value", test_control_expression_is_only_a_whole_value),
+		("control value ids follow source order", test_control_value_ids_follow_source_order),
+		("1000 nested value ifs", test_deeply_nested_value_ifs_survive_parse_dump_and_census),
+		("2000 link else if value", test_long_else_if_value_survives_parse_dump_and_census),
+		("2000 arm match value", test_long_match_value_survives_parse_dump_and_census)
 	]
 }

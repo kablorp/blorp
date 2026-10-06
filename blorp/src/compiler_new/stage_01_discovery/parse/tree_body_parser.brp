@@ -76,17 +76,30 @@ private record StatementRecipe {
 }
 
 
+-- What follows `=` or `op=`: an expression, or an `if` or `match` whose
+-- blocks end on dedents. The frozen language has no one-line `if`, so a
+-- control expression is always block-shaped, and it is a whole value: as an
+-- operand, an argument or a global's initializer it stays unsupported. Giving
+-- the whole-value position its own type keeps a control expression out of
+-- `ExpressionRecipe`, whose boundary rules assume the expression ends on a
+-- line.
+private union ValueRecipe:
+	PlainValue(ExpressionRecipe)
+	ConditionalValue(ConditionalRecipe)
+	MatchValue(MatchRecipe)
+
+
 private union StatementRecipeKind:
 	ExpressionStatementRecipe(ExpressionRecipe)
 	LoopExitRecipe(LoopExit)
 	ConditionalStatementRecipe(ConditionalRecipe)
 	MatchStatementRecipe(MatchRecipe)
-	VariableRecipe(WrittenName, Option[TypeRecipe], ExpressionRecipe)
-	TypedBindingRecipe(WrittenName, TypeRecipe, ExpressionRecipe)
-	QuestionBindingRecipe(WrittenName, Option[TypeRecipe], ExpressionRecipe)
-	AssignmentRecipe(AssignmentTargetRecipe, ExpressionRecipe)
-	CompoundAssignmentRecipe(WrittenName, CompoundOperator, ExpressionRecipe)
-	SubscriptAssignmentRecipe(SubscriptPlaceRecipe, ExpressionRecipe)
+	VariableRecipe(WrittenName, Option[TypeRecipe], ValueRecipe)
+	TypedBindingRecipe(WrittenName, TypeRecipe, ValueRecipe)
+	QuestionBindingRecipe(WrittenName, Option[TypeRecipe], ValueRecipe)
+	AssignmentRecipe(AssignmentTargetRecipe, ValueRecipe)
+	CompoundAssignmentRecipe(WrittenName, CompoundOperator, ValueRecipe)
+	SubscriptAssignmentRecipe(SubscriptPlaceRecipe, ValueRecipe)
 	WhileRecipe(ExpressionRecipe, BlockRecipe)
 	ForRecipe(LoopBindingRecipe, ExpressionRecipe, BlockRecipe)
 
@@ -306,7 +319,7 @@ private pure func parse_body_recipe(state: ParseState, colon_line: Int) -> (Pars
 	else if not state.is_on_line(colon_line):
 		(state, UnsupportedBody)
 	else:
-		(remaining, value) = parse_value(state)
+		(remaining, value) = parse_plain_value(state)
 		match value:
 			Some(expression):
 				(remaining, ParsedExpressionBody(expression))
@@ -391,8 +404,29 @@ private pure func parse_statement_recipe(state: ParseState, context: BodyContext
 
 
 -- A statement's `value` after its operator: an expression that starts on the
--- operator's line and ends the statement.
-private pure func parse_value(state: ParseState) -> (ParseState, Option[ExpressionRecipe]):
+-- operator's line and ends the statement, or an `if` or `match` that does.
+-- Its blocks read `break` and `continue` as outside any loop, so a loop exit
+-- inside one defers.
+private pure func parse_value(state: ParseState) -> (ParseState, Option[ValueRecipe]):
+	match state.current_kind():
+		IfKeyword:
+			(remaining, chain) = parse_conditional_recipe(state, OutsideLoop)
+			match chain:
+				Some(written): (remaining, Some(ConditionalValue(written)))
+				None: (remaining, None)
+		MatchKeyword:
+			(remaining, written) = parse_match_recipe(state, OutsideLoop)
+			match written:
+				Some(recipe): (remaining, Some(MatchValue(recipe)))
+				None: (remaining, None)
+		_:
+			(remaining, plain) = parse_plain_value(state)
+			match plain:
+				Some(recipe): (remaining, Some(PlainValue(recipe)))
+				None: (remaining, None)
+
+
+private pure func parse_plain_value(state: ParseState) -> (ParseState, Option[ExpressionRecipe]):
 	(remaining, parsed) = parse_expression_recipe(state)
 	match parsed:
 		ParsedRecipe(value):
@@ -404,20 +438,27 @@ private pure func parse_value(state: ParseState) -> (ParseState, Option[Expressi
 			(state, None)
 
 
-private pure func parse_value_after(state: ParseState, operator_line: Int) -> (ParseState, Option[ExpressionRecipe]):
+private pure func parse_value_after(state: ParseState, operator_line: Int) -> (ParseState, Option[ValueRecipe]):
 	if state.is_on_line(operator_line):
 		parse_value(state)
 	else:
 		(state, None)
 
 
+private pure func value_span(value: ValueRecipe) -> Span:
+	match value:
+		PlainValue(expression): expression.span
+		ConditionalValue(chain): conditional_span(chain)
+		MatchValue(written): match_span(written)
+
+
 -- A statement of `kind` over `start` and its value, or unsupported.
 private pure func valued_statement(
-	state: ParseState, start: Span, value: Option[ExpressionRecipe], kind: pure (ExpressionRecipe) -> StatementRecipeKind,
+	state: ParseState, start: Span, value: Option[ValueRecipe], kind: pure (ValueRecipe) -> StatementRecipeKind,
 ) -> (ParseState, StatementParse):
 	match value:
 		Some(recipe):
-			(state, ParsedStatement({ span = start.span_covering(recipe.span), kind = kind(recipe) }))
+			(state, ParsedStatement({ span = start.span_covering(value_span(recipe)), kind = kind(recipe) }))
 		None:
 			(state, UnsupportedStatement)
 
@@ -690,10 +731,23 @@ private pure func block_span(recipe: BlockRecipe) -> Span:
 
 -- The chain is read by a loop: each `else if` appends a link.
 private pure func parse_conditional_statement(state: ParseState, context: BodyContext) -> (ParseState, StatementParse):
+	(remaining, chain) = parse_conditional_recipe(state, context)
+	match chain:
+		Some(written):
+			(remaining, ParsedStatement({ span = conditional_span(written), kind = ConditionalStatementRecipe(written) }))
+		None:
+			(state, UnsupportedStatement)
+
+
+private pure func conditional_span(chain: ConditionalRecipe) -> Span:
+	chain.head.keyword.span_covering(conditional_end(chain))
+
+
+private pure func parse_conditional_recipe(state: ParseState, context: BodyContext) -> (ParseState, Option[ConditionalRecipe]):
 	(after_head, head) = parse_if_link(state, context)
 	match head:
 		None:
-			(state, UnsupportedStatement)
+			(state, None)
 		Some(first):
 			var out: ParseState = after_head
 			var else_ifs: List[ElseIfLink] = []
@@ -724,11 +778,9 @@ private pure func parse_conditional_statement(state: ParseState, context: BodyCo
 				else:
 					supported = False
 			if not supported or not out.block_statement_ends():
-				(state, UnsupportedStatement)
+				(state, None)
 			else:
-				chain: ConditionalRecipe = { head = first, else_ifs = else_ifs, final_else = final_else }
-				span: Span = first.keyword.span_covering(conditional_end(chain))
-				(out, ParsedStatement({ span = span, kind = ConditionalStatementRecipe(chain) }))
+				(out, Some({ head = first, else_ifs = else_ifs, final_else = final_else }))
 
 
 -- `if condition:` and its block, for the head and for every `else if`.
@@ -762,13 +814,26 @@ private pure func conditional_end(chain: ConditionalRecipe) -> Span:
 
 -- `match scrutinee:` and its cases, each a block or one same-line statement.
 private pure func parse_match_statement(state: ParseState, context: BodyContext) -> (ParseState, StatementParse):
+	(remaining, written) = parse_match_recipe(state, context)
+	match written:
+		Some(recipe):
+			(remaining, ParsedStatement({ span = match_span(recipe), kind = MatchStatementRecipe(recipe) }))
+		None:
+			(state, UnsupportedStatement)
+
+
+private pure func match_span(recipe: MatchRecipe) -> Span:
+	recipe.keyword.span_covering(recipe.end)
+
+
+private pure func parse_match_recipe(state: ParseState, context: BodyContext) -> (ParseState, Option[MatchRecipe]):
 	keyword: Span = state.current_span()
 	(after_header, scrutinee) = parse_header(state.advanced())
 	opened: ParseState = after_header.skip_newlines()
 	match scrutinee:
 		Some(subject):
 			if after_header.current_kind() != NewlineToken or opened.current_kind() != IndentToken:
-				(state, UnsupportedStatement)
+				(state, None)
 			else:
 				var out: ParseState = opened.advanced().skip_newlines()
 				var cases: List[CaseRecipe] = []
@@ -784,14 +849,13 @@ private pure func parse_match_statement(state: ParseState, context: BodyContext)
 				match cases:
 					[first, ...rest]:
 						if supported and out.current_kind() == DedentToken and out.advanced().block_statement_ends():
-							recipe: MatchRecipe = { keyword = keyword, scrutinee = subject, cases = { first = first, rest = rest }, end = out.current_span() }
-							(out.advanced(), ParsedStatement({ span = keyword.span_covering(recipe.end), kind = MatchStatementRecipe(recipe) }))
+							(out.advanced(), Some({ keyword = keyword, scrutinee = subject, cases = { first = first, rest = rest }, end = out.current_span() }))
 						else:
-							(state, UnsupportedStatement)
+							(state, None)
 					_:
-						(state, UnsupportedStatement)
+						(state, None)
 		None:
-			(state, UnsupportedStatement)
+			(state, None)
 
 
 private pure func parse_case_recipe(state: ParseState, context: BodyContext) -> (ParseState, Option[CaseRecipe]):
@@ -833,6 +897,10 @@ private pure func starts_nested_block(state: ParseState) -> Bool:
 
 
 -- Minting. Every id is issued here, in source order.
+-- Blocks nest by indentation, so the functions between a statement and the
+-- statements of its blocks are on the native stack once per level. Each kind
+-- is minted by a function of its own and this dispatcher stays thin, which
+-- keeps the 1,000-deep proof of section 3.14 inside the Linux stack.
 private pure func mint_statement(state: ParseState, recipe: StatementRecipe) -> (ParseState, Statement):
 	match recipe.kind:
 		ExpressionStatementRecipe(value):
@@ -851,54 +919,97 @@ private pure func mint_statement(state: ParseState, recipe: StatementRecipe) -> 
 			(remaining, expression) = mint_match(state, written, recipe.span)
 			remaining.finished_statement(recipe.span, ExpressionStatement(expression))
 		VariableRecipe(name, declared, value):
-			(after_binder, binder) = state.finished_binder(name)
-			(after_type, declared_type) = mint_optional_type(after_binder, declared)
-			(after_value, expression) = mint_recipe(after_type, value)
-			after_value.finished_statement(recipe.span, VariableDeclaration({ target = BindsName(binder), declared_type = declared_type, value = expression }))
+			mint_variable(state, recipe.span, name, declared, value)
 		TypedBindingRecipe(name, declared, value):
-			(after_binder, binder) = state.finished_binder(name)
-			(after_type, declared_type) = mint_type(after_binder, declared)
-			(after_value, expression) = mint_recipe(after_type, value)
-			after_value.finished_statement(recipe.span, TypedBinding({ target = BindsName(binder), declared_type = declared_type, value = expression }))
+			mint_typed_binding(state, recipe.span, name, declared, value)
 		QuestionBindingRecipe(name, declared, value):
-			(after_binder, binder) = state.finished_binder(name)
-			(after_type, declared_type) = mint_optional_type(after_binder, declared)
-			(after_value, expression) = mint_recipe(after_type, value)
-			after_value.finished_statement(recipe.span, QuestionBinding({ binder = binder, declared_type = declared_type, value = expression }))
+			mint_question_binding(state, recipe.span, name, declared, value)
 		AssignmentRecipe(target, value):
-			(after_target, written) = match target:
-				NamedTargetRecipe(name):
-					(after_use, use) = state.finished_name_use(name)
-					(after_use, AssignsName(use))
-				DiscardedTargetRecipe(span):
-					(state, AssignsDiscard(span))
-			(after_value, expression) = mint_recipe(after_target, value)
-			after_value.finished_statement(recipe.span, Assignment({ target = written, value = expression }))
+			mint_assignment(state, recipe.span, target, value)
 		CompoundAssignmentRecipe(name, operator, value):
 			(after_use, use) = state.finished_name_use(name)
-			(after_value, expression) = mint_recipe(after_use, value)
+			(after_value, expression) = mint_value(after_use, value)
 			after_value.finished_statement(recipe.span, CompoundAssignment({ target = use, operator = operator, value = expression }))
 		SubscriptAssignmentRecipe(place, value):
-			(after_collection, collection) = mint_recipe(state, place.collection)
-			(after_first, first) = mint_recipe(after_collection, place.indices.first)
-			var out: ParseState = after_first
-			var rest: List[Expression] = []
-			for index in place.indices.rest:
-				(after_index, written) = mint_recipe(out, index)
-				out = after_index
-				rest = rest.append(written)
-			(after_place, minted_place) = out.finished_subscript_place(place.span, collection, { first = first, rest = rest })
-			(after_value, expression) = mint_recipe(after_place, value)
-			after_value.finished_statement(recipe.span, SubscriptAssignment({ place = minted_place, value = expression }))
+			mint_subscript_assignment(state, recipe.span, place, value)
 		WhileRecipe(condition, body):
 			(after_condition, expression) = mint_recipe(state, condition)
 			(after_body, block) = mint_block(after_condition, body)
 			after_body.finished_statement(recipe.span, WhileLoop({ condition = expression, body = block }))
 		ForRecipe(binding, iterable, body):
-			(after_binder, loop_binder) = mint_loop_binder(state, binding)
-			(after_iterable, expression) = mint_recipe(after_binder, iterable)
-			(after_body, block) = mint_block(after_iterable, body)
-			after_body.finished_statement(recipe.span, ForLoop({ binder = loop_binder, iterable = expression, body = block }))
+			mint_for_loop(state, recipe.span, binding, iterable, body)
+
+
+private pure func mint_variable(
+	state: ParseState, span: Span, name: WrittenName, declared: Option[TypeRecipe], value: ValueRecipe,
+) -> (ParseState, Statement):
+	(after_binder, binder) = state.finished_binder(name)
+	(after_type, declared_type) = mint_optional_type(after_binder, declared)
+	(after_value, expression) = mint_value(after_type, value)
+	after_value.finished_statement(span, VariableDeclaration({ target = BindsName(binder), declared_type = declared_type, value = expression }))
+
+
+private pure func mint_typed_binding(
+	state: ParseState, span: Span, name: WrittenName, declared: TypeRecipe, value: ValueRecipe,
+) -> (ParseState, Statement):
+	(after_binder, binder) = state.finished_binder(name)
+	(after_type, declared_type) = mint_type(after_binder, declared)
+	(after_value, expression) = mint_value(after_type, value)
+	after_value.finished_statement(span, TypedBinding({ target = BindsName(binder), declared_type = declared_type, value = expression }))
+
+
+private pure func mint_assignment(
+	state: ParseState, span: Span, target: AssignmentTargetRecipe, value: ValueRecipe,
+) -> (ParseState, Statement):
+	(after_target, written) = match target:
+		NamedTargetRecipe(name):
+			(after_use, use) = state.finished_name_use(name)
+			(after_use, AssignsName(use))
+		DiscardedTargetRecipe(discarded):
+			(state, AssignsDiscard(discarded))
+	(after_value, expression) = mint_value(after_target, value)
+	after_value.finished_statement(span, Assignment({ target = written, value = expression }))
+
+
+private pure func mint_subscript_assignment(
+	state: ParseState, span: Span, place: SubscriptPlaceRecipe, value: ValueRecipe,
+) -> (ParseState, Statement):
+	(after_collection, collection) = mint_recipe(state, place.collection)
+	(after_first, first) = mint_recipe(after_collection, place.indices.first)
+	var out: ParseState = after_first
+	var rest: List[Expression] = []
+	for index in place.indices.rest:
+		(after_index, written) = mint_recipe(out, index)
+		out = after_index
+		rest = rest.append(written)
+	(after_place, minted_place) = out.finished_subscript_place(place.span, collection, { first = first, rest = rest })
+	(after_value, expression) = mint_value(after_place, value)
+	after_value.finished_statement(span, SubscriptAssignment({ place = minted_place, value = expression }))
+
+
+private pure func mint_question_binding(
+	state: ParseState, span: Span, name: WrittenName, declared: Option[TypeRecipe], value: ValueRecipe,
+) -> (ParseState, Statement):
+	(after_binder, binder) = state.finished_binder(name)
+	(after_type, declared_type) = mint_optional_type(after_binder, declared)
+	(after_value, expression) = mint_value(after_type, value)
+	after_value.finished_statement(span, QuestionBinding({ binder = binder, declared_type = declared_type, value = expression }))
+
+
+private pure func mint_for_loop(
+	state: ParseState, span: Span, binding: LoopBindingRecipe, iterable: ExpressionRecipe, body: BlockRecipe,
+) -> (ParseState, Statement):
+	(after_binder, loop_binder) = mint_loop_binder(state, binding)
+	(after_iterable, expression) = mint_recipe(after_binder, iterable)
+	(after_body, block) = mint_block(after_iterable, body)
+	after_body.finished_statement(span, ForLoop({ binder = loop_binder, iterable = expression, body = block }))
+
+
+private pure func mint_value(state: ParseState, value: ValueRecipe) -> (ParseState, Expression):
+	match value:
+		PlainValue(expression): mint_recipe(state, expression)
+		ConditionalValue(chain): mint_conditional(state, chain, conditional_span(chain))
+		MatchValue(written): mint_match(state, written, match_span(written))
 
 
 private pure func mint_loop_binder(state: ParseState, binding: LoopBindingRecipe) -> (ParseState, LoopBinder):
