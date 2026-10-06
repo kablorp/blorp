@@ -1,0 +1,163 @@
+import:
+	test: TestSuite
+
+
+-- A match payload is borrowed from an owner that outlives the
+-- concurrent form. A record built from it inside a task, a select arm or the
+-- statements after a `concurrent:` block must hold its own reference, or the
+-- record's release frees the string the owner still holds.
+
+
+record TextHolder {
+	text: String
+}
+
+
+pure func holder_length(holder: TextHolder) -> Int:
+	holder.text.length()
+
+
+func push_length(ch: Channel[Int], holder: TextHolder) -> Void:
+	_ = send(ch, holder_length(holder))
+
+
+-- Concatenation creates a managed value rather than a pooled literal.
+pure func managed_payload(iteration: Int) -> String:
+	"managed payload " + iteration.to_string()
+
+
+func select_length_from_payload(owner: Option[String]) -> Int:
+	var length: Int = 0
+
+	match owner:
+		Some(text):
+			select:
+				_ after 1:
+					length = holder_length({ text = text })
+		None:
+			length = 0
+
+	length
+
+
+func concurrent_task_length_from_payload(owner: Option[String]) -> Int:
+	match owner:
+		Some(text):
+			concurrent:
+				length = holder_length({ text = text })
+
+			match length:
+				Ok(value):
+					value
+				Err(_):
+					0
+		None:
+			0
+
+
+func concurrent_body_length_from_payload(owner: Option[String]) -> Int:
+	match owner:
+		Some(text):
+			concurrent:
+				ready = 1
+
+			holder_length({ text = text })
+		None:
+			0
+
+
+func concurrently_length_from_payload(owner: Option[String]) -> Int:
+	ch: Channel[Int] = channel(4)
+
+	match owner:
+		Some(text):
+			for item in [1, 2] concurrently(limit: 2):
+				push_length(ch, { text = text })
+		None:
+			void
+
+	first: Int = recv(ch).get_or(0)
+	second: Int = recv(ch).get_or(0)
+	first + second
+
+
+func detach_length_from_payload(owner: Option[String]) -> Int:
+	ch: Channel[Int] = channel(1)
+
+	match owner:
+		Some(text):
+			detach push_length(ch, { text = text })
+		None:
+			void
+
+	recv(ch).get_or(0)
+
+
+func owner_keeps_payload(owner: Option[String], payload: String) -> Bool:
+	match owner:
+		Some(text):
+			text == payload
+		None:
+			False
+
+
+func test_select_arm_keeps_payload() -> Bool:
+	var valid = True
+	for iteration in 0..32:
+		payload = managed_payload(iteration)
+		owner = Some(payload)
+		valid = valid and select_length_from_payload(owner) == payload.length()
+		valid = valid and owner_keeps_payload(owner, payload)
+	valid
+
+
+func test_concurrent_task_keeps_payload() -> Bool:
+	var valid = True
+	for iteration in 0..32:
+		payload = managed_payload(iteration)
+		owner = Some(payload)
+		valid = valid and concurrent_task_length_from_payload(owner) == payload.length()
+		valid = valid and owner_keeps_payload(owner, payload)
+	valid
+
+
+func test_concurrent_continuation_keeps_payload() -> Bool:
+	var valid = True
+	for iteration in 0..32:
+		payload = managed_payload(iteration)
+		owner = Some(payload)
+		valid = valid and concurrent_body_length_from_payload(owner) == payload.length()
+		valid = valid and owner_keeps_payload(owner, payload)
+	valid
+
+
+func test_concurrently_loop_keeps_payload() -> Bool:
+	var valid = True
+	for iteration in 0..32:
+		payload = managed_payload(iteration)
+		owner = Some(payload)
+		valid = valid and concurrently_length_from_payload(owner) == payload.length() * 2
+		valid = valid and owner_keeps_payload(owner, payload)
+	valid
+
+
+func test_detached_task_keeps_payload() -> Bool:
+	var valid = True
+	for iteration in 0..32:
+		payload = managed_payload(iteration)
+		owner = Some(payload)
+		valid = valid and detach_length_from_payload(owner) == payload.length()
+		valid = valid and owner_keeps_payload(owner, payload)
+	valid
+
+
+tests: TestSuite = {
+	description = "Borrowed payload ownership through concurrent forms",
+	tests = [
+		("select arm keeps payload", test_select_arm_keeps_payload),
+		("concurrent task keeps payload", test_concurrent_task_keeps_payload),
+		("concurrent continuation keeps payload", test_concurrent_continuation_keeps_payload),
+		("concurrently loop keeps payload", test_concurrently_loop_keeps_payload),
+		("detached task keeps payload", test_detached_task_keeps_payload)
+	]
+}

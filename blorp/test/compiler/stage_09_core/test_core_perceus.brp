@@ -14,6 +14,8 @@ import:
 		),
 		CoreBinaryOp(AddOp, EqualOp, LessOp),
 		CoreBoxKind(PointerBox),
+		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopCopyItem),
+		CoreConcurrentlyLoopOutput(ConcurrentlyLoopDiscard),
 		CoreBoxedStorageValue,
 		CoreCallKind(BuiltinCall, ClosureCall, ForeignCall, IntrinsicCall, UnknownCall, UserCall),
 		CoreClosureCapture,
@@ -50,6 +52,7 @@ import:
 			DebugBlockExpr,
 			DetachExpr,
 			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
 			ConstructorMatchExpr,
 			DropExpr,
 			DupExpr,
@@ -61,6 +64,7 @@ import:
 			LambdaExpr,
 			LetExpr,
 			ListGetExpr,
+			ListHandoffExpr,
 			ListRetainExpr,
 			ListSetExpr,
 			LengthMatchExpr,
@@ -77,7 +81,9 @@ import:
 			TensorRawViewLetExpr,
 			TensorRawWriteExpr,
 			TupleConstructExpr,
+			TailrecLoopExpr,
 			TupleExpr,
+			TupleFieldExpr,
 			UnaryExpr,
 			UnboxExpr,
 			VarExpr,
@@ -89,6 +95,8 @@ import:
 		CoreFunctionOrigin(ConsumingClone),
 		core_function_declared_origin,
 		CoreListAccessBounds(ProvenListAccess),
+		CoreListHandoffMode(BorrowFreshHandoff),
+		CoreListHandoffWriteOrder(ForwardCompactingHandoff),
 		CoreListStorageLayout(PointerListStorage),
 		CoreLiteral(BoolLiteral, IntLiteral, StringLiteral),
 		CoreLiteralMatchCase,
@@ -130,7 +138,7 @@ import:
 			UnionType,
 			VoidType,
 		),
-		CoreUnaryOp(NotOp),
+		CoreUnaryOp(NegateOp, NotOp),
 		CoreUnboxKind(PointerUnbox),
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
@@ -1770,7 +1778,25 @@ pure func dup_count_for(name: String, expr: CoreExpr) -> Int:
 
 			total
 		PreClosureConcurrentExpr(block, typ, loc):
-			dup_count_for(name, block.body)
+			var total: Int = dup_count_for(name, block.body)
+
+			for binding in block.bindings:
+				total += dup_count_for(name, binding.rhs)
+
+			total
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			dup_count_for(name, loop.iterable) + dup_count_for(name, loop.body)
+		PreClosureDetachExpr(detached, typ, loc):
+			dup_count_for(name, detached)
+		ListHandoffExpr(handoff, typ, loc):
+			dup_count_for(
+				name,
+				handoff.source,
+			) + dup_count_for(name, handoff.capacity) + dup_count_for(name, handoff.body)
+		TailrecLoopExpr(params, return_type, body, loc):
+			dup_count_for(name, body)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			dup_count_for(name, binding.source) + dup_count_for(name, body)
 		_:
 			0
 
@@ -20425,9 +20451,357 @@ pure func test_loop_binder_shadows_outer_borrowed_aggregate_payload() -> Bool:
 	dup_count_for("text", rewritten) == 0
 
 
+-- The next tests retain a match payload `text` that is borrowed from its
+-- owner. Each wraps a record built from `text` in one Core form that the
+-- retain walk used to return unchanged without visiting its children.
+pure func borrowed_text_owner() -> CoreParam:
+	core_param("text", string_type())
+
+
+pure func text_holder_record() -> CoreExpr:
+	RecordConstructExpr(
+		"TextHolder",
+		[{ ref = core_field_ref(0), name = "text", value = var_expr("text", string_type()) }],
+		HeapRecordType("TextHolder"),
+		synthetic_core_source_loc(),
+	)
+
+
+pure func holder_call(result_type: CoreType) -> CoreExpr:
+	user_call_expr("holder_result", None, [], [text_holder_record()], result_type)
+
+
+pure func retained_text_dups(expr: CoreExpr) -> Int:
+	dup_count_for(
+		"text",
+		retain_borrowed_owned_uses(
+			perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+			borrowed_text_owner(),
+			expr,
+		),
+	)
+
+
+pure func test_borrowed_payload_in_binary_operand_keeps_record_reference() -> Bool:
+	expr: CoreExpr = BinaryExpr(
+		AddOp,
+		holder_call(int_type()),
+		int_expr(1),
+		int_type(),
+		synthetic_core_source_loc(),
+	)
+
+	retained_text_dups(expr) == 1
+
+
+pure func test_borrowed_payload_in_logical_operand_keeps_record_reference() -> Bool:
+	expr: CoreExpr = LogicalExpr(
+		AndOp,
+		bool_expr(True),
+		holder_call(bool_type()),
+		bool_type(),
+		synthetic_core_source_loc(),
+	)
+
+	retained_text_dups(expr) == 1
+
+
+pure func test_borrowed_payload_in_unary_operand_keeps_record_reference() -> Bool:
+	expr: CoreExpr = UnaryExpr(
+		NegateOp,
+		holder_call(int_type()),
+		int_type(),
+		synthetic_core_source_loc(),
+	)
+
+	retained_text_dups(expr) == 1
+
+
+pure func test_borrowed_payload_in_cast_operand_keeps_record_reference() -> Bool:
+	expr: CoreExpr = CastExpr(
+		holder_call(int_type()),
+		NamedType("Float", []),
+		synthetic_core_source_loc(),
+	)
+
+	retained_text_dups(expr) == 1
+
+
+pure func test_borrowed_payload_in_box_and_unbox_keeps_record_reference() -> Bool:
+	boxed: CoreExpr = BoxExpr(
+		{ kind = PointerBox, value = holder_call(string_type()), source_type = string_type() },
+		string_type(),
+		synthetic_core_source_loc(),
+	)
+	unboxed: CoreExpr = UnboxExpr(
+		PointerUnbox,
+		holder_call(string_type()),
+		string_type(),
+		synthetic_core_source_loc(),
+	)
+
+	retained_text_dups(boxed) == 1 and retained_text_dups(unboxed) == 1
+
+
+pure func test_borrowed_payload_in_field_and_tuple_field_owner_keeps_record_reference() -> Bool:
+	field: CoreExpr = FieldExpr(
+		holder_call(HeapRecordType("TextHolder")),
+		"text",
+		core_field_ref(0),
+		string_type(),
+		synthetic_core_source_loc(),
+	)
+	tuple_field: CoreExpr = TupleFieldExpr(
+		holder_call(TupleType([int_type(), int_type()])),
+		1,
+		int_type(),
+		synthetic_core_source_loc(),
+	)
+
+	retained_text_dups(field) == 1 and retained_text_dups(tuple_field) == 1
+
+
+pure func test_borrowed_payload_in_list_get_operands_keeps_record_reference() -> Bool:
+	expr: CoreExpr = ListGetExpr(
+		{
+			layout = PointerListStorage,
+			list = holder_call(list_string_type()),
+			index = holder_call(int_type()),
+			bounds = ProvenListAccess
+		},
+		string_type(),
+		synthetic_core_source_loc(),
+	)
+
+	retained_text_dups(expr) == 2
+
+
+pure func test_borrowed_payload_in_tail_recursive_loop_body_keeps_record_reference() -> Bool:
+	loop: CoreExpr = TailrecLoopExpr(
+		[core_param("count", int_type())],
+		int_type(),
+		holder_call(int_type()),
+		synthetic_core_source_loc(),
+	)
+
+	retained_text_dups(loop) == 1
+
+
+pure func test_tail_recursive_loop_parameter_shadows_borrowed_payload() -> Bool:
+	loop: CoreExpr = TailrecLoopExpr(
+		[core_param("text", string_type())],
+		int_type(),
+		holder_call(int_type()),
+		synthetic_core_source_loc(),
+	)
+
+	retained_text_dups(loop) == 0
+
+
+pure func test_borrowed_payload_in_raw_tensor_view_keeps_record_reference() -> Bool:
+	view: CoreVar = named_var("__raw")
+	expr: CoreExpr = TensorRawViewLetExpr(
+		{
+			variable = view,
+			kind = TensorInt64Elements,
+			source = var_expr("tensor", tensor_int_type())
+		},
+		holder_call(int_type()),
+		int_type(),
+		synthetic_core_source_loc(),
+	)
+
+	retained_text_dups(expr) == 1
+
+
+pure func test_raw_tensor_view_binding_shadows_borrowed_payload() -> Bool:
+	expr: CoreExpr = TensorRawViewLetExpr(
+		{
+			variable = named_var("text"),
+			kind = TensorInt64Elements,
+			source = var_expr("tensor", tensor_int_type())
+		},
+		holder_call(int_type()),
+		int_type(),
+		synthetic_core_source_loc(),
+	)
+
+	retained_text_dups(expr) == 0
+
+
+pure func test_borrowed_payload_in_select_arm_keeps_record_reference() -> Bool:
+	arm: CoreSelectArm = {
+		kind = SelectAfterArm(int_expr(1)),
+		body = holder_call(void_type()),
+		loc = synthetic_core_source_loc()
+	}
+
+	retained_text_dups(SelectExpr([arm], void_type(), synthetic_core_source_loc())) == 1
+
+
+pure func test_select_receive_binder_shadows_borrowed_payload() -> Bool:
+	arm: CoreSelectArm = {
+		kind = SelectRecvArm({
+			binder = named_var("text"),
+			elem_type = string_type(),
+			channel = var_expr("ch", NamedType("Channel", [string_type()])),
+		}),
+		body = holder_call(void_type()),
+		loc = synthetic_core_source_loc()
+	}
+
+	retained_text_dups(SelectExpr([arm], void_type(), synthetic_core_source_loc())) == 0
+
+
+pure func test_borrowed_payload_in_detached_task_keeps_record_reference() -> Bool:
+	detached: CoreExpr = PreClosureDetachExpr(
+		holder_call(void_type()),
+		void_type(),
+		synthetic_core_source_loc(),
+	)
+
+	retained_text_dups(detached) == 1
+
+
+pure func pre_closure_concurrent_with(
+	binding_name: String,
+	task_rhs: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	PreClosureConcurrentExpr(
+		{
+			bindings = [{ variable = named_var(binding_name), typ = int_type(), rhs = task_rhs }],
+			body = body,
+			timeout = None,
+			max_threads = None
+		},
+		int_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+pure func test_borrowed_payload_in_concurrent_task_and_continuation_keeps_record_reference() -> Bool:
+	task: CoreExpr = pre_closure_concurrent_with("result", holder_call(int_type()), int_expr(0))
+	continuation: CoreExpr = pre_closure_concurrent_with(
+		"result",
+		int_expr(0),
+		holder_call(int_type()),
+	)
+
+	retained_text_dups(task) == 1 and retained_text_dups(continuation) == 1
+
+
+pure func test_concurrent_binding_shadows_borrowed_payload_only_in_continuation() -> Bool:
+	-- The task body runs where `text` is still the borrowed payload; only the
+	-- statements after the block see the binding that reuses its name.
+	task: CoreExpr = pre_closure_concurrent_with("text", holder_call(int_type()), int_expr(0))
+	continuation: CoreExpr = pre_closure_concurrent_with(
+		"text",
+		int_expr(0),
+		holder_call(int_type()),
+	)
+
+	retained_text_dups(task) == 1 and retained_text_dups(continuation) == 0
+
+
+pure func pre_closure_concurrently_loop_over(variable_name: String, body: CoreExpr) -> CoreExpr:
+	PreClosureConcurrentlyLoopExpr(
+		{
+			variable = named_var(variable_name),
+			item_type = int_type(),
+			item_mode = ConcurrentlyLoopCopyItem,
+			iterable = var_expr("items", list_int_type()),
+			body = body,
+			timeout = None,
+			limit = int_expr(2),
+			output = ConcurrentlyLoopDiscard
+		},
+		void_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+pure func test_borrowed_payload_in_concurrently_loop_body_keeps_record_reference() -> Bool:
+	loop: CoreExpr = pre_closure_concurrently_loop_over("item", holder_call(void_type()))
+
+	retained_text_dups(loop) == 1
+
+
+pure func test_concurrently_loop_variable_shadows_borrowed_payload() -> Bool:
+	loop: CoreExpr = pre_closure_concurrently_loop_over("text", holder_call(void_type()))
+
+	retained_text_dups(loop) == 0
+
+
+pure func list_handoff_with_result(result_name: String, body: CoreExpr) -> CoreExpr:
+	ListHandoffExpr(
+		{
+			mode = BorrowFreshHandoff,
+			layout = PointerListStorage,
+			elem_needs_release = True,
+			source = var_expr("items", list_string_type()),
+			source_var = named_var("handoff_source"),
+			source_type = list_string_type(),
+			result_type = list_string_type(),
+			capacity = int_expr(4),
+			result_var = named_var(result_name),
+			len_var = named_var("handoff_len"),
+			out_var = named_var("handoff_out"),
+			body = body,
+			write_order = ForwardCompactingHandoff
+		},
+		list_string_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+pure func test_borrowed_payload_in_list_handoff_body_keeps_record_reference() -> Bool:
+	retained_text_dups(list_handoff_with_result("result", holder_call(void_type()))) == 1
+
+
+pure func test_list_handoff_binder_shadows_borrowed_payload() -> Bool:
+	retained_text_dups(list_handoff_with_result("text", holder_call(void_type()))) == 0
+
+
+-- A lambda body is its own ownership region whose captures are its owners, so
+-- the enclosing walk leaves it alone; walking it would retain twice.
+pure func test_lambda_body_is_not_walked_for_borrowed_payload() -> Bool:
+	lambda: CoreExpr = LambdaExpr(
+		[],
+		int_type(),
+		holder_call(int_type()),
+		False,
+		NamedType("Function", []),
+		synthetic_core_source_loc(),
+	)
+
+	retained_text_dups(lambda) == 0
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core Perceus",
 	tests = [
+		("borrowed payload in binary operand keeps record reference", test_borrowed_payload_in_binary_operand_keeps_record_reference),
+		("borrowed payload in logical operand keeps record reference", test_borrowed_payload_in_logical_operand_keeps_record_reference),
+		("borrowed payload in unary operand keeps record reference", test_borrowed_payload_in_unary_operand_keeps_record_reference),
+		("borrowed payload in cast operand keeps record reference", test_borrowed_payload_in_cast_operand_keeps_record_reference),
+		("borrowed payload in box and unbox keeps record reference", test_borrowed_payload_in_box_and_unbox_keeps_record_reference),
+		("borrowed payload in field and tuple field owner keeps record reference", test_borrowed_payload_in_field_and_tuple_field_owner_keeps_record_reference),
+		("borrowed payload in list get operands keeps record reference", test_borrowed_payload_in_list_get_operands_keeps_record_reference),
+		("borrowed payload in list handoff body keeps record reference", test_borrowed_payload_in_list_handoff_body_keeps_record_reference),
+		("list handoff binder shadows borrowed payload", test_list_handoff_binder_shadows_borrowed_payload),
+		("borrowed payload in tail recursive loop body keeps record reference", test_borrowed_payload_in_tail_recursive_loop_body_keeps_record_reference),
+		("tail recursive loop parameter shadows borrowed payload", test_tail_recursive_loop_parameter_shadows_borrowed_payload),
+		("borrowed payload in raw tensor view keeps record reference", test_borrowed_payload_in_raw_tensor_view_keeps_record_reference),
+		("raw tensor view binding shadows borrowed payload", test_raw_tensor_view_binding_shadows_borrowed_payload),
+		("borrowed payload in select arm keeps record reference", test_borrowed_payload_in_select_arm_keeps_record_reference),
+		("select receive binder shadows borrowed payload", test_select_receive_binder_shadows_borrowed_payload),
+		("borrowed payload in detached task keeps record reference", test_borrowed_payload_in_detached_task_keeps_record_reference),
+		("borrowed payload in concurrent task and continuation keeps record reference", test_borrowed_payload_in_concurrent_task_and_continuation_keeps_record_reference),
+		("concurrent binding shadows borrowed payload only in continuation", test_concurrent_binding_shadows_borrowed_payload_only_in_continuation),
+		("borrowed payload in concurrently loop body keeps record reference", test_borrowed_payload_in_concurrently_loop_body_keeps_record_reference),
+		("concurrently loop variable shadows borrowed payload", test_concurrently_loop_variable_shadows_borrowed_payload),
+		("lambda body is not walked for borrowed payload", test_lambda_body_is_not_walked_for_borrowed_payload),
 		("loop binder shadows outer borrowed aggregate payload", test_loop_binder_shadows_outer_borrowed_aggregate_payload),
 		("borrowed match payload in range loop keeps record reference", test_borrowed_match_payload_in_range_loop_keeps_record_reference),
 		("borrowed match payload in list loop keeps record reference", test_borrowed_match_payload_in_list_loop_keeps_record_reference),

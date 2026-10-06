@@ -38,22 +38,24 @@ import:
 		CoreConstructorMatchTest,
 		CoreDictEntry,
 		CoreExpr(
-			AccessorLiteralMatchExpr, AssignExpr, BinaryExpr, BorrowLetExpr, BoxExpr, BreakExpr,
-			CallExpr, CastExpr, ClosureCreateExpr, ConcurrentExpr, ConcurrentlyLoopExpr,
-			ConstructorMatchExpr, DebugBlockExpr, DetachExpr, DictConstructExpr, DropExpr, DupExpr,
-			FieldExpr, ForChannelExpr, ForDictExpr, ForListExpr, ForRangeExpr,
+			AccessorLiteralMatchExpr, AssignExpr, BinaryExpr, BorrowLetExpr, BoxExpr, BreakExpr, CallExpr,
+			CastExpr, ClosureCreateExpr, ConcurrentExpr, ConcurrentlyLoopExpr, ConstructorMatchExpr,
+			ContinueExpr, CooperativeCheckpointExpr, DebugBlockExpr, DetachExpr, DictConstructExpr,
+			DictExpr, DropExpr, DupExpr, FieldExpr, ForChannelExpr, ForDictExpr, ForListExpr, ForRangeExpr,
 			ForResourceSourceExpr, ForSetExpr, ForStreamExpr, ForStringExpr, ForTensorExpr, IfExpr,
 			LambdaExpr, LetExpr, ListConstructExpr, ListAllocExpr, ListGetExpr, ListHandoffExpr,
 			ListHandoffSetOwnedExpr, ListHandoffSetSourceSlotExpr, ListRetainExpr, ListSetExpr,
 			ListSwapExpr, LiteralExpr, LogicalExpr, PreClosureConcurrentExpr,
-			PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr, RecordConstructExpr, RecordExpr,
-			RecordCowUpdateExpr, RecordReuseExpr, RecordUpdateExpr, ResourceCleanupExitExpr,
-			ResourceScopeExpr, SelectExpr, SeqExpr, StaticStringLiteralExpr, StringByteCopyExpr,
-			StringByteReadExpr, StringByteWriteExpr, StringSetLenExpr, TailrecListSpreadLoopExpr,
-			TailrecListSpreadRecurExpr, TailrecLoopExpr, TailrecRecurExpr, TensorBoxedLiteralExpr,
+			PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr, RawMatchExpr, RecordConstructExpr,
+			RecordExpr, RecordCowUpdateExpr, RecordReuseExpr, RecordUpdateExpr, ResourceCleanupExitExpr,
+			ResourceScopeExpr, SelectExpr, SemanticMatchExpr, SeqExpr, SetAllocExpr,
+			StaticStringLiteralExpr, StringByteCopyExpr, StringByteReadExpr, StringByteWriteExpr,
+			StringSetLenExpr, TailrecListSpreadLoopExpr, TailrecListSpreadRecurExpr, TailrecLoopExpr,
+			TailrecRecurExpr, TensorBoxedLiteralExpr, TensorLiteralExpr, TensorPackedLiteralExpr,
 			TensorRawFillExpr, TensorRawReadExpr, TensorRawViewLetExpr, TensorRawWriteExpr,
 			TupleConstructExpr, TupleExpr, TupleFieldExpr, UnaryExpr, UnboxExpr, UnionConstructExpr,
-			VarExpr, VectorExpr, VoidExpr, WhileExpr, LiteralMatchExpr, LengthMatchExpr,
+			UnionReuseConstructExpr, VarExpr, VectorExpr, VoidExpr, WhileExpr, LiteralMatchExpr,
+			LengthMatchExpr,
 		),
 		CoreListSet,
 		CoreLiteral(StringLiteral),
@@ -65,10 +67,13 @@ import:
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
 		CoreParam,
+		CorePreClosureConcurrentBinding,
 		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreRetainPolicy(ArcRetainPolicy, StackResultRetainPolicy),
+		CoreSelectArm,
+		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSourceLoc,
 		CoreTupleConstruct,
 		CoreTupleElement(
@@ -2870,8 +2875,209 @@ private pure func retain_borrowed_param_aggregate_members(
 				typ,
 				loc,
 			)
-		_:
+		-- These forms bind nothing. A borrowed value they store directly, as a
+		-- list set does, is retained by `protect_borrowed_param_calls`; this
+		-- walk reaches only an aggregate nested in an operand, as
+		-- `holder_length({ text = text }) + 1` has.
+		BinaryExpr(_, _, _, _, _) | UnaryExpr(_, _, _, _) | CastExpr(_, _, _) | BoxExpr(_, _, _) | UnboxExpr(_, _, _, _) | FieldExpr(_, _, _, _, _) | TupleFieldExpr(_, _, _, _) | ListAllocExpr(_, _, _) | ListGetExpr(_, _, _) | ListHandoffSetOwnedExpr(_, _, _) | ListHandoffSetSourceSlotExpr(_, _, _) | ListRetainExpr(_, _, _) | ListSetExpr(_, _, _) | ListSwapExpr(_, _, _) | StringByteReadExpr(_, _, _) | StringByteWriteExpr(_, _, _) | StringByteCopyExpr(_, _, _) | StringSetLenExpr(_, _, _) | TensorLiteralExpr(_, _, _) | TensorPackedLiteralExpr(_, _, _) | TensorRawFillExpr(_, _, _) | TensorRawReadExpr(_, _, _) | TensorRawWriteExpr(_, _, _) | TailrecRecurExpr(_, _, _) | TailrecListSpreadRecurExpr(_, _, _, _):
+			CoreTraverse.map_core_expr_children(
+				expr,
+				func(child): retain_borrowed_param_aggregate_members(env, param, child),
+			)
+		-- A long `and`/`or` chain is a deep tree; map it without native recursion.
+		LogicalExpr(_, _, _, _, _):
+			CoreTraverse.map_core_logical_tree(
+				expr,
+				func(operand): retain_borrowed_param_aggregate_members(env, param, operand),
+			)
+		ListHandoffExpr(handoff, typ, loc):
+			body_shadowed: Bool = [
+				handoff.source_var,
+				handoff.result_var,
+				handoff.len_var,
+				handoff.out_var
+			].any(func(variable): core_var_matches_param(variable, param))
+
+			retained_body: CoreExpr = if body_shadowed:
+				handoff.body
+			else:
+				retain_borrowed_param_aggregate_members(env, param, handoff.body)
+
+			ListHandoffExpr(
+				{ handoff |
+					source = retain_borrowed_param_aggregate_members(env, param, handoff.source),
+					capacity = retain_borrowed_param_aggregate_members(env, param, handoff.capacity),
+					body = retained_body
+				},
+				typ,
+				loc,
+			)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			retained_body: CoreExpr = if core_var_matches_param(binding.variable, param):
+				body
+			else:
+				retain_borrowed_param_aggregate_members(env, param, body)
+
+			TensorRawViewLetExpr(
+				{ binding |
+					source = retain_borrowed_param_aggregate_members(env, param, binding.source)
+				},
+				retained_body,
+				typ,
+				loc,
+			)
+		-- A loop parameter shadows the owner inside the loop body only.
+		TailrecLoopExpr(params, return_type, body, loc):
+			if loop_params_shadow_owner(params, param):
+				expr
+			else:
+				TailrecLoopExpr(
+					params,
+					return_type,
+					retain_borrowed_param_aggregate_members(env, param, body),
+					loc,
+				)
+		TailrecListSpreadLoopExpr(loop, loc):
+			loop_shadows_owner: Bool = (
+				loop_params_shadow_owner(loop.params.append(loop.list_param), param)
+				or core_var_matches_param(loop.cursor, param)
+			)
+
+			if loop_shadows_owner:
+				expr
+			else:
+				TailrecListSpreadLoopExpr(
+					{ loop | body = retain_borrowed_param_aggregate_members(env, param, loop.body) },
+					loc,
+				)
+		-- A task closure owns its captures, so an aggregate it builds from the
+		-- borrowed value needs its own reference. The statements after a
+		-- `concurrent:` block sit in its body, where a binding hides the owner.
+		PreClosureDetachExpr(detached, typ, loc):
+			PreClosureDetachExpr(
+				retain_borrowed_param_aggregate_members(env, param, detached),
+				typ,
+				loc,
+			)
+		PreClosureConcurrentExpr(block, typ, loc):
+			body_shadowed: Bool = block.bindings.any(
+				func(binding): core_var_matches_param(binding.variable, param),
+			)
+
+			retained_body: CoreExpr = if body_shadowed:
+				block.body
+			else:
+				retain_borrowed_param_aggregate_members(env, param, block.body)
+
+			retained_bindings: List[CorePreClosureConcurrentBinding] = block.bindings.map(
+				func(binding): { binding | rhs = retain_borrowed_param_aggregate_members(env, param, binding.rhs) },
+			)
+
+			PreClosureConcurrentExpr(
+				{ block |
+					bindings = retained_bindings,
+					body = retained_body,
+					timeout = retain_borrowed_param_optional_aggregate_members(
+						env,
+						param,
+						block.timeout,
+					)
+				},
+				typ,
+				loc,
+			)
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			PreClosureConcurrentlyLoopExpr(
+				{ loop |
+					iterable = retain_borrowed_param_aggregate_members(env, param, loop.iterable),
+					timeout = retain_borrowed_param_optional_aggregate_members(
+						env,
+						param,
+						loop.timeout,
+					),
+					limit = retain_borrowed_param_aggregate_members(env, param, loop.limit),
+					body = retain_borrowed_param_loop_body(env, param, loop.variable, loop.body)
+				},
+				typ,
+				loc,
+			)
+		SelectExpr(arms, typ, loc):
+			SelectExpr(
+				arms.map(func(arm): retain_borrowed_param_select_arm(env, param, arm)),
+				typ,
+				loc,
+			)
+		-- A lambda body is its own owner region whose captures are its owners
+		-- (`normalize_lambda_expr`), so a walk from the enclosing owner would
+		-- retain a second time.
+		LambdaExpr(_, _, _, _, _, _):
 			expr
+		-- No child expression: nothing to retain.
+		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _) | CooperativeCheckpointExpr(_, _) | BreakExpr(_, _) | ContinueExpr(_, _) | SetAllocExpr(_, _, _) | ClosureCreateExpr(_, _, _):
+			expr
+		-- The Perceus-stage late invariant (`perceus_boundary_form_violations`)
+		-- rejects the next two groups, so a leaf here cannot hide a form that
+		-- breaks its reason.
+		-- Erased before Perceus: core debug lowering removes every debug block,
+		-- match compilation every raw match, and match projection every
+		-- semantic match. A dictionary literal always has a two-argument `Dict`
+		-- type, so dictionary literal preparation lowers each one to a
+		-- `DictConstructExpr` immediately before Perceus.
+		DebugBlockExpr(_, _, _) | RawMatchExpr(_, _, _, _) | SemanticMatchExpr(_, _, _, _) | DictExpr(_, _, _):
+			expr
+		-- Built only by passes that run after Perceus: reuse, closure
+		-- conversion and resource management.
+		UnionReuseConstructExpr(_, _, _) | DetachExpr(_, _, _) | ConcurrentExpr(_, _, _) | ConcurrentlyLoopExpr(_, _, _) | ResourceCleanupExitExpr(_, _, _):
+			expr
+
+
+private pure func loop_params_shadow_owner(loop_params: List[CoreParam], owner: CoreParam) -> Bool:
+	loop_params.any(func(loop_param): core_var_matches_param(loop_param.name, owner))
+
+
+private pure func retain_borrowed_param_optional_aggregate_members(
+	env: PerceusEnv,
+	param: CoreParam,
+	expr: Option[CoreExpr],
+) -> Option[CoreExpr]:
+	match expr:
+		Some(value):
+			Some(retain_borrowed_param_aggregate_members(env, param, value))
+		None:
+			None
+
+
+-- A receive binder shadows the borrowed owner only in its own arm body; the
+-- channel and timeout expressions evaluate in the enclosing scope.
+private pure func retain_borrowed_param_select_arm(
+	env: PerceusEnv,
+	param: CoreParam,
+	arm: CoreSelectArm,
+) -> CoreSelectArm:
+	match arm.kind:
+		SelectRecvArm(recv):
+			retained_body: CoreExpr = if core_var_matches_param(recv.binder, param):
+				arm.body
+			else:
+				retain_borrowed_param_aggregate_members(env, param, arm.body)
+
+			{ arm |
+				kind = SelectRecvArm({
+					recv |
+					channel = retain_borrowed_param_aggregate_members(env, param, recv.channel)
+				}),
+				body = retained_body
+			}
+		SelectSealedArm(channel):
+			{ arm |
+				kind = SelectSealedArm(retain_borrowed_param_aggregate_members(env, param, channel)),
+				body = retain_borrowed_param_aggregate_members(env, param, arm.body)
+			}
+		SelectAfterArm(timeout):
+			{ arm |
+				kind = SelectAfterArm(retain_borrowed_param_aggregate_members(env, param, timeout)),
+				body = retain_borrowed_param_aggregate_members(env, param, arm.body)
+			}
 
 
 -- A loop binder shadows the borrowed outer owner only in its body; the

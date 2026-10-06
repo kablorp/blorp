@@ -17,7 +17,7 @@ import:
 		CoreConcurrentlyLoopOutput(ConcurrentlyLoopCollect, ConcurrentlyLoopDiscard),
 		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ImplDecl, UnionDecl),
 		CoreExpr(
-			AccessorLiteralMatchExpr, BreakExpr, CallExpr, CooperativeCheckpointExpr,
+			AccessorLiteralMatchExpr, BreakExpr, CallExpr, CooperativeCheckpointExpr, DetachExpr,
 			ConcurrentExpr, ConcurrentlyLoopExpr, ConstructorMatchExpr, DebugBlockExpr, DictExpr,
 			DropExpr, ContinueExpr, LambdaExpr, LetExpr, LengthMatchExpr, BorrowLetExpr,
 			ForChannelExpr, ForDictExpr, ForListExpr, ForRangeExpr, ForResourceSourceExpr,
@@ -25,8 +25,8 @@ import:
 			PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr, RawMatchExpr, RecordExpr,
 			RecordUpdateExpr, ResourceCleanupExitExpr, ResourceScopeExpr, SelectExpr,
 			SemanticMatchExpr, TailrecListSpreadLoopExpr, TailrecLoopExpr, TensorRawReadExpr,
-			TensorRawViewLetExpr, TensorRawWriteExpr, TupleExpr, VarExpr, VectorExpr, VoidExpr,
-			WhileExpr,
+			TensorRawViewLetExpr, TensorRawWriteExpr, TupleExpr, UnionReuseConstructExpr, VarExpr,
+			VectorExpr, VoidExpr, WhileExpr,
 		),
 		CoreFunction,
 		CoreGlobal,
@@ -86,6 +86,8 @@ union CoreLateInvariantViolation:
 	RawTensorViewKindMismatch(String, CoreSourceLoc)
 	CooperativeCheckpointMisplaced(CoreSourceLoc)
 	ManagedMatchScrutineeUnmaterialized(CoreSourceLoc)
+	FormBuiltAfterPerceusSurvived(String, CoreSourceLoc)
+	FormErasedBeforePerceusSurvived(String, CoreSourceLoc)
 	DisagreeingUserCallContract(String, Int, List[Int], List[Int], CoreSourceLoc)
 
 
@@ -145,6 +147,10 @@ pure func core_late_invariant_message(violation: CoreLateInvariantViolation) -> 
 			"cooperative checkpoint reached final Core outside a loop-entry position"
 		ManagedMatchScrutineeUnmaterialized(_):
 			"releasing match reached late Core without a named scrutinee owner"
+		FormBuiltAfterPerceusSurvived(form, _):
+			"`${form}` is built by a pass after Perceus but reached Perceus output"
+		FormErasedBeforePerceusSurvived(form, _):
+			"`${form}` is erased before Perceus but reached Perceus output"
 		DisagreeingUserCallContract(name, def_id, first, other, _):
 			"calls of `${name}` (definition ${def_id}) hand over arguments ${first} and ${other}; every call of a function must hand over the same arguments"
 
@@ -351,6 +357,35 @@ private pure func check_program_exprs(
 		index += 1
 
 	violations
+
+
+-- The Perceus borrowed-payload walk lists these forms as leaves for these
+-- reasons; this check makes a form that breaks the reason fail here instead of
+-- skipping the walk.
+private pure func perceus_boundary_form_violations(
+	expr: CoreExpr,
+) -> List[CoreLateInvariantViolation]:
+	match expr:
+		UnionReuseConstructExpr(_, _, loc):
+			[FormBuiltAfterPerceusSurvived("UnionReuseConstructExpr", loc)]
+		DetachExpr(_, _, loc):
+			[FormBuiltAfterPerceusSurvived("DetachExpr", loc)]
+		ConcurrentExpr(_, _, loc):
+			[FormBuiltAfterPerceusSurvived("ConcurrentExpr", loc)]
+		ConcurrentlyLoopExpr(_, _, loc):
+			[FormBuiltAfterPerceusSurvived("ConcurrentlyLoopExpr", loc)]
+		ResourceCleanupExitExpr(_, _, loc):
+			[FormBuiltAfterPerceusSurvived("ResourceCleanupExitExpr", loc)]
+		DebugBlockExpr(_, _, loc):
+			[FormErasedBeforePerceusSurvived("DebugBlockExpr", loc)]
+		RawMatchExpr(_, _, _, loc):
+			[FormErasedBeforePerceusSurvived("RawMatchExpr", loc)]
+		SemanticMatchExpr(_, _, _, loc):
+			[FormErasedBeforePerceusSurvived("SemanticMatchExpr", loc)]
+		DictExpr(_, _, loc):
+			[FormErasedBeforePerceusSurvived("DictExpr", loc)]
+		_:
+			[]
 
 
 private pure func record_update_violations(expr: CoreExpr) -> List[CoreLateInvariantViolation]:
@@ -1249,6 +1284,14 @@ private pure func requires_materialized_record_updates(stage: CorePipelineStage)
 			False
 
 
+private pure func requires_perceus_boundary_forms(stage: CorePipelineStage) -> Bool:
+	match stage:
+		PerceusStage:
+			True
+		_:
+			False
+
+
 private pure func requires_converted_closures(stage: CorePipelineStage) -> Bool:
 	match stage:
 		PostDceTailStage | PostPerceusTailStage | PreClosureTailStage | ClosureStage | PostClosureTailStage | PreDceTailStage | FinalStage:
@@ -1281,6 +1324,7 @@ pure func check_late_core_invariants(
 	check_closures: Bool = requires_converted_closures(stage)
 	check_final: Bool = requires_emittable_core(stage)
 	check_match_scrutinees: Bool = requires_materialized_match_scrutinees(stage)
+	check_perceus_boundary: Bool = requires_perceus_boundary_forms(stage)
 
 	check_phase_expr: pure (CoreExpr) -> List[CoreLateInvariantViolation] = func(expr):
 		var violations: List[CoreLateInvariantViolation] = []
@@ -1293,6 +1337,9 @@ pure func check_late_core_invariants(
 
 		if check_match_scrutinees:
 			violations = violations.concat(managed_match_scrutinee_violations(expr))
+
+		if check_perceus_boundary:
+			violations = violations.concat(perceus_boundary_form_violations(expr))
 
 		violations
 
