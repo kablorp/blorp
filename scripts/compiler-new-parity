@@ -51,16 +51,40 @@ the first function, trait, implementation or global initializer it could not
 read (where the tree path stops), and also every later one it tried. The table
 ranks reasons by first stops, with one example `file:line` each. The reason is
 the `StopReason` the tree parser's rollback carried; nothing is worked out from
-text. The census checks nothing and is not part of the parity gate.
+text. The census checks nothing and is not part of the parity gate. A census over the
+whole corpus also stores its per-module stops (see `--census-file`).
+
+Targeted runs. Iterating on one stop reason should not cost a corpus run, so a
+run can be narrowed to part of the corpus:
+
+  * `--files PATH...` names tracked `.brp` files;
+  * `--stop-reason LABEL` selects the modules whose first stop in the last full
+    `--stop-census` had that label (the table's "First-stop modules").
+
+Either narrows the parity run (token and verdict parity, then the adapter
+differential with its tree-prefix and tree-module comparisons) or, with
+`--stop-census`, the census; `--adapter-only` skips the token dumps, which a
+tree-path change cannot affect. A targeted run compares only the selected
+modules (the adapter differential still loads what they import), builds its
+dumpers with `-O0` (the C compile is the larger cost at this size), skips the
+root and graph checks and the corpus-wide allowance checks, and prints no
+`BLORP_GATE_RESULT` line: it is not the gate, and the gate stays the full run.
+
+The full census stores `stop-census.txt` under the system temporary directory,
+in a directory named for this checkout (`--census-file` overrides it); a
+targeted census never overwrites it.
 
 Usage: scripts/compiler-new-parity [--keep DIR] [--compare OLD_DUMP NEW_DUMP]
-                                   [--stop-census]
+                                   [--stop-census] [--census-file FILE]
+                                   [--files PATH... | --stop-reason LABEL]
+                                   [--adapter-only]
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -174,11 +198,15 @@ ROOT_CHECKS = (
 # corpus file as a root of one discovery (`files` mode), which reaches files no
 # import does, fixtures included.
 ADAPTER_FILES_MODE = "files"
+# With `files`, compare only the listed roots, not what they import.
+ONLY_LISTED_FLAG = "--only-listed"
 
 MAX_REPORTED_ADAPTER_DIFFERENCES = 20
 
 DIFFERENCE_PREFIX = "difference "
 SKIPPED_PREFIX = "skipped "
+# Printed with `--only-listed`, once per module compared.
+LISTED_MODULE_PREFIX = "listed-module "
 ADAPTER_ERROR_PREFIX = "adapter-error"
 # The differential's exit status when the adapter could not rebuild a module;
 # its output then names the module, so the run is a reported failure.
@@ -453,6 +481,11 @@ EXCERPT_LIMIT = 200
 # Flags of the host C compile of a dumper: optimized enough that the corpus
 # runs in seconds, with the wrapping integer semantics the runtime assumes.
 C_COMPILE_FLAGS = ("-O1", "-fwrapv", "-w")
+# A targeted run compiles its dumpers without optimization. Measured on the
+# adapter differential (14 MB of C): `-O0` builds in 15 s instead of 92 s and
+# runs the whole corpus 2.4 times slower (203 s instead of 84 s), so it wins
+# whenever the run covers less than about two thirds of the corpus.
+TARGETED_C_COMPILE_FLAGS = ("-O0", "-fwrapv", "-w")
 # Native headers (`*_ffi.h`) the existing compiler's foreign declarations
 # include, found beside the declaring module; only the adapter differential builds
 # the whole compiler, but every dumper is given the directories.
@@ -1056,6 +1089,7 @@ class AdapterReport:
     declarations: int
     differences: list[AdapterFieldDifference]
     problems: list[str]
+    listed_modules: list[str] = field(default_factory=list)
     tree_prefix: TreePrefixReport = field(default_factory=TreePrefixReport)
     tree_module: TreeModuleReport = field(default_factory=TreeModuleReport)
 
@@ -1068,6 +1102,7 @@ def parse_adapter_output(text: str) -> AdapterReport:
     """
     differences: list[AdapterFieldDifference] = []
     skipped_paths: list[str] = []
+    listed_modules: list[str] = []
     problems: list[str] = []
     summary: dict[str, int] | None = None
     for line in text.splitlines():
@@ -1082,6 +1117,8 @@ def parse_adapter_output(text: str) -> AdapterReport:
             differences.append(difference)
         elif line.startswith(SKIPPED_PREFIX):
             skipped_paths.append(line[len(SKIPPED_PREFIX):].split(SKIPPED_REASON_SEPARATOR, 1)[0])
+        elif line.startswith(LISTED_MODULE_PREFIX):
+            listed_modules.append(line[len(LISTED_MODULE_PREFIX):])
         elif line.startswith(ADAPTER_ERROR_PREFIX):
             problems.append(f"the adapter could not rebuild a module: {line}")
         elif line.startswith(SUMMARY_PREFIX):
@@ -1102,6 +1139,7 @@ def parse_adapter_output(text: str) -> AdapterReport:
         declarations=summary.get("declarations", 0),
         differences=differences,
         problems=problems,
+        listed_modules=listed_modules,
         tree_prefix=parse_tree_prefix_output(text),
         tree_module=parse_tree_module_output(text),
     )
@@ -1216,30 +1254,97 @@ def stale_adapter_allowances(
     ]
 
 
-def check_adapter(work: Path, file_list: Path, rejected_files: set[str]) -> tuple[list[str], list[str], int]:
-    """Run the adapter differential over each `ROOT_CHECKS` root, with the same
-    options the graph check runs it with, and over the corpus listed in
-    `file_list`: (notes, problems, failed checks). The root runs skip nothing;
-    the corpus run skips exactly `rejected_files`. Each run is a check, and so is
-    the list of allowances."""
-    binary = build_dumper(ADAPTER_DIFFERENTIAL, work)
+@dataclass(frozen=True)
+class CorpusSelection:
+    """The corpus files a run covers. The gate covers the whole corpus; a
+    targeted run covers part of it and is never the gate."""
+
+    paths: tuple[str, ...]
+    description: str
+    targeted: bool
+
+    @classmethod
+    def full(cls, corpus: list[str]) -> "CorpusSelection":
+        return cls(tuple(corpus), "the corpus", targeted=False)
+
+    @classmethod
+    def of_files(cls, paths: list[str], description: str) -> "CorpusSelection":
+        return cls(tuple(paths), description, targeted=True)
+
+    @property
+    def stores_census(self) -> bool:
+        """Only a census of the whole corpus can be selected from later."""
+        return not self.targeted
+
+
+def selection_problems(description: str, report: AdapterReport, selected: tuple[str, ...]) -> list[str]:
+    """Whether a targeted adapter run covered exactly the selected files: each
+    was compared (`listed-module`), none else was, and each was either compared
+    or skipped as rejected. Without this a run that reached nothing, or a
+    different set, would pass with no differences."""
+    problems = []
+    seen = set(report.listed_modules)
+    wanted = set(selected)
+    if seen != wanted or len(report.listed_modules) != len(seen):
+        problems.append(
+            f"{description}: the run did not cover exactly the selected files: "
+            f"{len(wanted - seen)} not reached (for example {sorted(wanted - seen)[:1]}), "
+            f"{len(seen - wanted)} others compared (for example {sorted(seen - wanted)[:1]})"
+        )
+    if report.modules != len(selected) or report.compared + report.skipped != len(selected):
+        problems.append(
+            f"{description}: {report.compared} compared and {report.skipped} skipped of "
+            f"{report.modules} modules, but {len(selected)} files were selected"
+        )
+    return problems
+
+
+def adapter_runs(
+    file_list: Path, selection: CorpusSelection
+) -> list[tuple[str, tuple[str, ...], bool]]:
+    """The adapter differential's runs: (description, dumper arguments, whether
+    it is the run over the corpus files). The gate also runs every `ROOT_CHECKS`
+    root with the options the graph check uses; a targeted run compares only
+    the selected files."""
+    if selection.targeted:
+        return [(selection.description, (ADAPTER_FILES_MODE, str(file_list), ONLY_LISTED_FLAG), True)]
+    runs = [
+        (check.description, (check.mode, check.root, *check.options), False)
+        for check in ROOT_CHECKS
+    ]
+    runs.append(("every corpus file as a root", (ADAPTER_FILES_MODE, str(file_list)), True))
+    return runs
+
+
+def check_adapter(
+    work: Path,
+    file_list: Path,
+    rejected_files: set[str] | None,
+    selection: CorpusSelection,
+) -> tuple[list[str], list[str], int]:
+    """Run the adapter differential over `adapter_runs`: (notes, problems, failed
+    checks). The root runs skip nothing; the run over files skips exactly
+    `rejected_files`, or whatever it skipped when that is `None` (no token dump
+    was made to say which the existing parser rejects). Each run is a check, and
+    so is the list of allowances, which a targeted run cannot judge."""
+    binary = build_dumper(ADAPTER_DIFFERENTIAL, work, selection)
     notes: list[str] = []
     problems: list[str] = []
     failed = 0
     used: set[AdapterDifference] = set()
-    runs = [
-        (check.description, (check.mode, check.root, *check.options), set())
-        for check in ROOT_CHECKS
-    ]
-    runs.append(("every corpus file as a root", (ADAPTER_FILES_MODE, str(file_list)), rejected_files))
-    for description, arguments, expected_skipped in runs:
+    for description, arguments, over_files in adapter_runs(file_list, selection):
         report = parse_adapter_output(run_dumper(binary, *arguments, allowed_statuses=(0, ADAPTER_ERROR_STATUS)))
+        expected_skipped = set()
+        if over_files:
+            expected_skipped = set(report.skipped_paths) if rejected_files is None else rejected_files
         found = adapter_problems(
             f"adapter differential, {description}", report, ADAPTER_DIFFERENCES, used, expected_skipped
         )
+        if selection.targeted:
+            found.extend(selection_problems(description, report, selection.paths))
         found.extend(tree_prefix_problems(
             f"tree prefix differential, {description}", report.tree_prefix, expected_skipped,
-            require_completed_kinds=arguments[0] == ADAPTER_FILES_MODE,
+            require_completed_kinds=over_files and not selection.targeted,
             allowances=ADAPTER_DIFFERENCES, used=used,
         ))
         if report.tree_prefix.modules != report.modules:
@@ -1274,9 +1379,10 @@ def check_adapter(work: Path, file_list: Path, rejected_files: set[str]) -> tupl
                 + ", ".join(f"{stop}={module.stops[stop]}" for stop in TREE_MODULE_STOPS)
                 + ")"
             )
-    stale = stale_adapter_allowances(ADAPTER_DIFFERENCES, used)
-    problems.extend(stale)
-    failed += bool(stale)
+    if not selection.targeted:
+        stale = stale_adapter_allowances(ADAPTER_DIFFERENCES, used)
+        problems.extend(stale)
+        failed += bool(stale)
     return notes, problems, failed
 
 
@@ -1325,13 +1431,13 @@ def parse_stop_census(text: str) -> StopCensus:
     return census
 
 
-def render_stop_census(census: StopCensus, files: int) -> str:
+def render_stop_census(census: StopCensus, files: int, scope: str = "Corpus files") -> str:
     """A ranked markdown table: most common reason first, ties by name."""
     stopped = sum(count.modules for count in census.reasons.values())
     declined = sum(count.declarations for count in census.reasons.values())
     kinds = ", ".join(f"{kind} {census.kinds[kind]}" for kind in sorted(census.kinds))
     lines = [
-        f"Corpus files: {files}. Modules whose tree scan left a declaration unread: {stopped} ({kinds}); "
+        f"{scope}: {files}. Modules whose tree scan left a declaration unread: {stopped} ({kinds}); "
         f"declarations left unread in all: {declined}.",
         "",
         "| Rank | Reason | First-stop modules | Share | All unread declarations | Example |",
@@ -1348,18 +1454,115 @@ def render_stop_census(census: StopCensus, files: int) -> str:
     return "\n".join(lines)
 
 
-def run_stop_census(work: Path, file_list: Path, files: int) -> int:
-    """The `--stop-census` mode: the adapter differential's per-module stops."""
-    binary = build_dumper(ADAPTER_DIFFERENTIAL, work)
-    output = run_dumper(binary, ADAPTER_FILES_MODE, str(file_list), STOP_CENSUS_FLAG)
-    print(render_stop_census(parse_stop_census(output), files))
+CENSUS_RESULT_NAME = "stop-census.txt"
+CENSUS_HEADER_PREFIX = "# "
+CHECKOUT_DIGEST_LENGTH = 12
+
+
+def default_census_file(root: Path) -> Path:
+    """Where the full census keeps its result: one directory per checkout (named
+    by a digest of its path, so worktrees never read each other's census) under
+    the system temporary directory."""
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:CHECKOUT_DIGEST_LENGTH]
+    return Path(tempfile.gettempdir()) / f"compiler-new-parity-{digest}" / CENSUS_RESULT_NAME
+
+
+def census_result_text(output: str, header: str) -> str:
+    """The reusable form of a census run: a header line saying when and where it
+    was recorded, then the dumper's `stop-reason` lines and nothing else."""
+    stops = [line for line in output.splitlines() if line.startswith(STOP_REASON_PREFIX)]
+    return "\n".join([f"{CENSUS_HEADER_PREFIX}{header}", *stops]) + "\n"
+
+
+def write_census_result(path: Path, output: str, header: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(census_result_text(output, header), encoding="utf-8")
+
+
+def read_census_result(path: Path) -> tuple[str, str]:
+    """The stored census and its header line, or an exit saying how to make one."""
+    if not path.is_file():
+        raise SystemExit(
+            f"FAIL: no stop census at {path}; run `scripts/compiler-new-parity {STOP_CENSUS_FLAG}` "
+            "over the whole corpus first, which stores it"
+        )
+    text = path.read_text(encoding="utf-8")
+    first = text.splitlines()[0] if text else ""
+    header = first[len(CENSUS_HEADER_PREFIX):] if first.startswith(CENSUS_HEADER_PREFIX) else "no header"
+    return text, header
+
+
+def first_stop_modules(census_text: str, reason: str) -> list[str]:
+    """The modules whose first unread declaration stopped for `reason`, in census
+    order. A reason that no module stops at first is an exit naming the reasons
+    that do, so a misspelt label teaches the right one."""
+    first_stops: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for line in census_text.splitlines():
+        if not line.startswith(STOP_REASON_PREFIX):
+            continue
+        fields = line[len(STOP_REASON_PREFIX):].split(" | ")
+        if len(fields) != STOP_REASON_FIELDS:
+            raise SystemExit(f"FAIL: malformed stop-reason line: {line}")
+        path, _, stop_reason, _, order = fields
+        seen.add(stop_reason)
+        if order == FIRST_STOP:
+            first_stops.setdefault(stop_reason, []).append(path)
+    if reason in first_stops:
+        return first_stops[reason]
+    if reason in seen:
+        raise SystemExit(
+            f"FAIL: no module's first stop was {reason} in the census (it only stops later "
+            "declarations); select a reason from the table's First-stop modules column"
+        )
+    known = ", ".join(sorted(first_stops))
+    raise SystemExit(f"FAIL: unknown stop reason {reason}; the census has first stops for: {known}")
+
+
+def select_files(requested: list[str], tracked: list[str]) -> list[str]:
+    """`requested` as tracked source files in `tracked` order, once each; a name
+    that is not one is an exit naming it."""
+    known = set(tracked)
+    unknown = sorted({name for name in requested if name not in known})
+    if unknown:
+        raise SystemExit(
+            f"FAIL: not a tracked `{CORPUS_SUFFIX}` file (give repository-relative paths): "
+            f"{', '.join(unknown)}"
+        )
+    wanted = set(requested)
+    return [name for name in tracked if name in wanted]
+
+
+def run_stop_census(
+    work: Path, file_list: Path, selection: CorpusSelection, census_file: Path
+) -> int:
+    """The `--stop-census` mode: the adapter differential's per-module stops. The
+    census of the whole corpus is also stored in `census_file`."""
+    binary = build_dumper(ADAPTER_DIFFERENTIAL, work, selection)
+    flags = (STOP_CENSUS_FLAG, ONLY_LISTED_FLAG) if selection.targeted else (STOP_CENSUS_FLAG,)
+    output = run_dumper(binary, ADAPTER_FILES_MODE, str(file_list), *flags)
+    scope = "Selected files" if selection.targeted else "Corpus files"
+    print(render_stop_census(parse_stop_census(output), len(selection.paths), scope))
+    if selection.stores_census:
+        write_census_result(census_file, output, census_header(len(selection.paths)))
+        print(
+            f"\nStored the stop census in {census_file}; `--stop-reason LABEL` runs "
+            "the modules whose first stop was that reason."
+        )
     return 0
 
 
-def corpus_files() -> list[str]:
-    """Tracked `.brp` files under the corpus roots, in a fixed order."""
+def census_header(files: int) -> str:
+    revision = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True
+    ).stdout.strip()
+    return f"{files} corpus files at {revision or 'unknown revision'}, {time.strftime('%Y-%m-%d %H:%M')}"
+
+
+def tracked_files(roots: tuple[str, ...]) -> list[str]:
+    """Tracked `.brp` files under `roots`, in a fixed order."""
     listing = subprocess.run(
-        ["git", "ls-files", "-z", "--", *CORPUS_ROOTS],
+        ["git", "ls-files", "-z", "--", *roots],
         cwd=REPO_ROOT,
         capture_output=True,
         check=True,
@@ -1369,6 +1572,11 @@ def corpus_files() -> list[str]:
     )
 
 
+def corpus_files() -> list[str]:
+    """The corpus the gate covers: tracked `.brp` files under the corpus roots."""
+    return tracked_files(CORPUS_ROOTS)
+
+
 def run_checked(command: list[str], description: str) -> None:
     result = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True)
     if result.returncode != 0:
@@ -1376,7 +1584,11 @@ def run_checked(command: list[str], description: str) -> None:
         raise SystemExit(1)
 
 
-def build_dumper(source: str, work: Path) -> Path:
+def c_compile_flags(selection: CorpusSelection) -> tuple[str, ...]:
+    return TARGETED_C_COMPILE_FLAGS if selection.targeted else C_COMPILE_FLAGS
+
+
+def build_dumper(source: str, work: Path, selection: CorpusSelection) -> Path:
     """Compile a dumper to a host binary: Blorp to C, then the C compiler."""
     stem = Path(source).stem
     c_file = work / f"{stem}.c"
@@ -1387,7 +1599,7 @@ def build_dumper(source: str, work: Path) -> Path:
         f"compile {source} to C",
     )
     run_checked(
-        [compiler, "-x", "c", str(c_file), *C_COMPILE_FLAGS, *C_INCLUDE_FLAGS, *C_LINK_FLAGS, "-o", str(binary)],
+        [compiler, "-x", "c", str(c_file), *c_compile_flags(selection), *C_INCLUDE_FLAGS, *C_LINK_FLAGS, "-o", str(binary)],
         f"compile {c_file} with {compiler}",
     )
     return binary
@@ -1425,9 +1637,9 @@ def degraded_graph_problems(check: RootCheck, modules: list[str]) -> list[str]:
     return problems
 
 
-def check_discovery_graphs(work: Path) -> tuple[list[str], list[str]]:
+def check_discovery_graphs(work: Path, selection: CorpusSelection) -> tuple[list[str], list[str]]:
     """Run the discovery stage's order dumper for every `ROOT_CHECKS` root: (notes, problems)."""
-    binary = build_dumper(DISCOVERY_ORDER_DUMPER, work)
+    binary = build_dumper(DISCOVERY_ORDER_DUMPER, work, selection)
     notes: list[str] = []
     problems: list[str] = []
     for check in ROOT_CHECKS:
@@ -1453,7 +1665,23 @@ def with_stale_allowances(comparison: Comparison, corpus: set[str]) -> Compariso
     return comparison
 
 
-def report(comparison: Comparison, seconds: float) -> int:
+def compare_selected_dumps(
+    legacy: dict[str, FileDump], discovery: dict[str, FileDump], paths: tuple[str, ...]
+) -> Comparison:
+    """The comparison of a targeted run: the allowances for files outside the
+    selection are left out, since the files they name are not being compared,
+    and staleness of the allowance lists is a whole-corpus question the gate
+    answers."""
+    selected = set(paths)
+    return compare_dumps(
+        legacy,
+        discovery,
+        {path: reason for path, reason in KNOWN_DIVERGENCES.items() if path in selected},
+        {path: reason for path, reason in KNOWN_POSITION_DIVERGENCES.items() if path in selected},
+    )
+
+
+def report(comparison: Comparison, seconds: float, selection: CorpusSelection) -> int:
     for note in comparison.notes:
         print(note)
     for problem in comparison.problems:
@@ -1461,6 +1689,15 @@ def report(comparison: Comparison, seconds: float) -> int:
     tally = comparison.first_diagnostics
     agreeing = comparison.files - comparison.mismatched_files
     status = "PASS" if comparison.mismatched_files == 0 else "FAIL"
+    if selection.targeted:
+        # Never a BLORP_GATE_RESULT line: a log of a narrowed run must not read
+        # as the gate's verdict.
+        print(
+            f"compiler-new parity, targeted run over {selection.description} (not the gate): {status} "
+            f"files={comparison.files} tokens={comparison.tokens} "
+            f"mismatched_files={comparison.mismatched_files} seconds={seconds:.1f}"
+        )
+        return 0 if comparison.mismatched_files == 0 else 1
     print(
         f"compiler-new parity: files={comparison.files} tokens={comparison.tokens} "
         f"rejected_by_both={comparison.rejected_by_both} "
@@ -1480,7 +1717,7 @@ def report(comparison: Comparison, seconds: float) -> int:
     return 0 if comparison.mismatched_files == 0 else 1
 
 
-def main() -> int:
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--keep", type=Path, help="keep dumpers and dumps in this directory")
     parser.add_argument(
@@ -1492,40 +1729,102 @@ def main() -> int:
     parser.add_argument(
         "--stop-census",
         action="store_true",
-        help="print the ranked reasons the tree scan stops at a declaration, instead of checking parity",
+        help="print the ranked reasons the tree scan stops at a declaration, instead of checking parity; "
+        "a census of the whole corpus is stored for --stop-reason",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--census-file",
+        type=Path,
+        help="where the full census stores its result and --stop-reason reads it "
+        "(default: stop-census.txt in this checkout's directory under the system temporary directory)",
+    )
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help="run only these tracked corpus files (a targeted run, not the gate)",
+    )
+    selection.add_argument(
+        "--stop-reason",
+        metavar="LABEL",
+        help="run only the modules whose first stop in the last full --stop-census had this reason "
+        "(a targeted run, not the gate)",
+    )
+    parser.add_argument(
+        "--adapter-only",
+        action="store_true",
+        help="with --files or --stop-reason, run only the adapter differential, not the token dumps",
+    )
+    options = parser.parse_args(argv)
+    targeted = options.files is not None or options.stop_reason is not None
+    if options.adapter_only and not targeted:
+        parser.error("--adapter-only needs --files or --stop-reason")
+    if options.compare and (targeted or options.stop_census or options.adapter_only or options.census_file):
+        parser.error("--compare takes no other option except --keep")
+    return options
+
+
+def choose_selection(options: argparse.Namespace, corpus: list[str]) -> CorpusSelection:
+    """The files a run covers: those named by `--files`, those a stored census
+    attributes to `--stop-reason`, or the whole corpus. A targeted run may name
+    any tracked source file, not only a corpus root: the census also ranks
+    modules the corpus files import from elsewhere."""
+    if options.files is None and options.stop_reason is None:
+        return CorpusSelection.full(corpus)
+    tracked = tracked_files((".",))
+    if options.files is not None:
+        paths = select_files(options.files, tracked)
+        return CorpusSelection.of_files(paths, f"{len(paths)} listed files")
+    census_file = options.census_file or default_census_file(REPO_ROOT)
+    text, header = read_census_result(census_file)
+    stopped = first_stop_modules(text, options.stop_reason)
+    known = set(tracked)
+    paths = select_files([path for path in stopped if path in known], tracked)
+    gone = len(stopped) - len(paths)
+    note = f"; {gone} not tracked now (generated or deleted)" if gone else ""
+    print(f"Selected {len(paths)} modules with first stop {options.stop_reason} from the census of {header}{note}")
+    return CorpusSelection.of_files(paths, f"{len(paths)} modules with first stop {options.stop_reason}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    options = parse_arguments(argv)
     started = time.monotonic()
 
-    if args.compare:
+    if options.compare:
         legacy_text, discovery_text = (
             Path(name).read_text(encoding="utf-8", errors="surrogateescape")
-            for name in args.compare
+            for name in options.compare
         )
         legacy_files = parse_dump(legacy_text)
         discovery_files = parse_dump(discovery_text)
-        comparison = with_stale_allowances(
-            compare_dumps(legacy_files, discovery_files), set(legacy_files) | set(discovery_files)
-        )
-        return report(comparison, time.monotonic() - started)
+        names = set(legacy_files) | set(discovery_files)
+        comparison = with_stale_allowances(compare_dumps(legacy_files, discovery_files), names)
+        return report(comparison, time.monotonic() - started, CorpusSelection.full(sorted(names)))
 
-    files = corpus_files()
-    if not files:
+    corpus = corpus_files()
+    if not corpus:
         print("FAIL: no corpus files found (is this a git checkout?)")
         return 1
+    selection = choose_selection(options, corpus)
+    files = list(selection.paths)
 
-    work = args.keep if args.keep else Path(tempfile.mkdtemp(prefix="compiler_new_parity."))
+    work = options.keep if options.keep else Path(tempfile.mkdtemp(prefix="compiler_new_parity."))
     work.mkdir(parents=True, exist_ok=True)
     try:
         file_list = work / "corpus.txt"
         file_list.write_text("\n".join(files) + "\n", encoding="utf-8")
-        if args.stop_census:
-            return run_stop_census(work, file_list, len(files))
-        legacy_binary = build_dumper(LEGACY_DUMPER, work)
-        discovery_binary = build_dumper(DISCOVERY_DUMPER, work)
+        if options.stop_census:
+            return run_stop_census(
+                work, file_list, selection, options.census_file or default_census_file(REPO_ROOT)
+            )
+        if selection.targeted:
+            return run_targeted_parity(work, file_list, selection, options.adapter_only, started)
+        legacy_binary = build_dumper(LEGACY_DUMPER, work, selection)
+        discovery_binary = build_dumper(DISCOVERY_DUMPER, work, selection)
         legacy_dump = run_dumper(legacy_binary, file_list)
         discovery_dump = run_dumper(discovery_binary, file_list)
-        if args.keep:
+        if options.keep:
             for name, dump in (("legacy.dump", legacy_dump), ("discovery.dump", discovery_dump)):
                 (work / name).write_text(dump, encoding="utf-8", errors="surrogateescape")
         legacy_files = parse_dump(legacy_dump)
@@ -1533,14 +1832,14 @@ def main() -> int:
         comparison = with_stale_allowances(
             compare_dumps(legacy_files, discovery_files), set(files)
         )
-        graph_notes, graph_problems = check_discovery_graphs(work)
+        graph_notes, graph_problems = check_discovery_graphs(work, selection)
         comparison.notes.extend(graph_notes)
         comparison.problems.extend(graph_problems)
         # Each root is one more check, failing when its discovery graph is degraded.
         comparison.files += len(ROOT_CHECKS)
         comparison.mismatched_files += sum(1 for line in graph_problems if line.startswith("discovery graph "))
         rejected = {path for path, dump in legacy_files.items() if dump.parse_diagnostics > 0}
-        adapter_notes, adapter_problem_lines, adapter_failures = check_adapter(work, file_list, rejected)
+        adapter_notes, adapter_problem_lines, adapter_failures = check_adapter(work, file_list, rejected, selection)
         comparison.notes.extend(adapter_notes)
         comparison.problems.extend(adapter_problem_lines)
         # Each adapter run, and the allowance list, is one more check.
@@ -1550,10 +1849,40 @@ def main() -> int:
         if missing:
             comparison.problems.append(f"dumps omit {len(missing)} corpus files, for example {sorted(missing)[0]}")
             comparison.mismatched_files += len(missing)
-        return report(comparison, time.monotonic() - started)
+        return report(comparison, time.monotonic() - started, selection)
     finally:
-        if not args.keep:
+        if not options.keep:
             shutil.rmtree(work, ignore_errors=True)
+
+
+def run_targeted_parity(
+    work: Path, file_list: Path, selection: CorpusSelection, adapter_only: bool, started: float
+) -> int:
+    """The narrowed parity run: token and verdict parity over the selected files
+    (unless `adapter_only`), then the adapter differential over them. It skips
+    the root and graph checks, which no file selection changes."""
+    paths = selection.paths
+    if adapter_only:
+        comparison = compare_selected_dumps({}, {}, ())
+        rejected = None
+    else:
+        legacy_dump = run_dumper(build_dumper(LEGACY_DUMPER, work, selection), file_list)
+        discovery_dump = run_dumper(build_dumper(DISCOVERY_DUMPER, work, selection), file_list)
+        legacy_files = parse_dump(legacy_dump)
+        discovery_files = parse_dump(discovery_dump)
+        comparison = compare_selected_dumps(legacy_files, discovery_files, paths)
+        rejected = {path for path, dump in legacy_files.items() if dump.parse_diagnostics > 0}
+        missing = set(paths) - (set(legacy_files) & set(discovery_files))
+        if missing:
+            comparison.problems.append(f"dumps omit {len(missing)} selected files, for example {sorted(missing)[0]}")
+            comparison.mismatched_files += len(missing)
+    notes, problems, failures = check_adapter(work, file_list, rejected, selection)
+    comparison.notes.extend(notes)
+    comparison.problems.extend(problems)
+    # The files covered, whichever checks looked at them.
+    comparison.files = len(paths)
+    comparison.mismatched_files += failures
+    return report(comparison, time.monotonic() - started, selection)
 
 
 if __name__ == "__main__":

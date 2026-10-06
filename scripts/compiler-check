@@ -6,10 +6,13 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
+from fnmatch import fnmatchcase
 import json
 import os
 from pathlib import Path, PurePosixPath
 import platform
+import posixpath
 import re
 import shlex
 import shutil
@@ -32,9 +35,12 @@ FIXTURE_DIRECTORY_NAMES = {"fixture", "fixtures", "should_pass", "should_fail", 
 # compiler manifest without misclassifying them as fixture inputs.
 BROAD_GATE_SUITE_OWNER_DIRECTORIES = {"test_runtime"}
 # Source owners with their own test manifest and gate, outside this manifest:
-# the rewritten compiler stages are not linked into bin/blorp yet, so no check
-# of the existing compiler is selected for them. Their sources live under
-# blorp/src/<owner> and their suites under blorp/test/test_<owner>.
+# the rewritten compiler stages. The discovery stage's lexer and table parser are
+# linked into bin/blorp (the front end runs them), so a change there is not
+# covered by this manifest's focused checks; `hand_back_for` says which gates a
+# change set needs instead. Their
+# sources live under blorp/src/<owner> and their suites under
+# blorp/test/test_<owner>.
 SEPARATELY_GATED_OWNERS = {"compiler_new": "scripts/test compiler-new"}
 SEPARATELY_GATED_TEST_OWNERS = {"test_compiler_new": "compiler_new"}
 
@@ -50,6 +56,313 @@ def separately_gated_owner(path: str) -> str | None:
         if owner in SEPARATELY_GATED_OWNERS:
             return owner
     return None
+
+
+# --- Hand-back scope ---------------------------------------------------------
+#
+# Which gates a worker hands back for a change set. The discovery stage's tree
+# path (the `tree_*` parse modules and their support under `compiler_new`, and
+# the tree projection of the parsed AST in
+# `compiler/discovery_tree_projection.brp`) is imported by nothing that is
+# compiled into a program, so it is not part of `bin/blorp` or any other tool,
+# and a change set confined to it cannot change what they do. The full
+# compiler-blorp gate has nothing to say about it. What it needs is the suites
+# that import the changed files and the compiler-new gates.
+#
+# Which modules are tree path is read from the import graph, not listed. A
+# module is a candidate only if it lives under `blorp/src/compiler_new/` or is
+# the tree projection. Every other `blorp/src` module may be a program's entry
+# (`main.brp`, the formatter, the bridge and benchmark roots; no list of them is
+# kept, since each is just a module nothing else need import), so a candidate is
+# tree path exactly when no module outside the candidates reaches it. A path is
+# judged where it is:
+#
+#   * a candidate module is tree path when nothing outside the candidates
+#     reaches it, and production otherwise; any other `blorp/src` module is
+#     production;
+#   * a `blorp/test/test_compiler_new` file, or a test that imports a tree-path
+#     module, is tree path unless it carries the `RUN-BLORP-CHECK` marker, which
+#     sends the file through production `bin/blorp check` in compiler-blorp;
+#   * documentation and measurement records are inert;
+#   * everything else, and everything that cannot be resolved (an import that
+#     resolves to no file, a file that is not there), is production.
+#
+# A tree-path test may import production modules (the projection tests compare
+# against the existing parser); a change to the test cannot change production.
+# The hand-back runs the suites that import any changed Blorp file.
+TREE_PROJECTION_MODULE = "blorp/src/compiler/discovery_tree_projection.brp"
+SOURCE_MODULE_ROOT = "blorp/src/"
+CANDIDATE_MODULE_ROOT = "blorp/src/compiler_new/"
+TEST_ROOT = "blorp/test/"
+COMPILER_NEW_TEST_ROOT = "blorp/test/test_compiler_new/"
+BLORP_SOURCE_SUFFIX = ".brp"
+STANDARD_LIBRARY_ROOT = "standard_library/src/"
+# Fixtures marked with this line run through production `bin/blorp check` in
+# compiler-blorp (`blorp/test/test_lib/run_blorp_check_fixtures.py`).
+CHECKED_FIXTURE_MARKER = "-- RUN-BLORP-CHECK"
+# Not Blorp, so not in the import graph: the parity script and its test.
+PARITY_SCRIPT_TESTS = "blorp/test/test_build/test_compiler_new_parity.py"
+TREE_PATH_TOOLING = ("scripts/compiler-new-parity", PARITY_SCRIPT_TESTS)
+# Documentation and measurement records: no gate reads them, so they neither
+# join a tree-path change set nor widen it. `scripts/gate-scope` keeps its own
+# `DOCUMENTATION_PATH_RULES` for the same notion; sharing one definition is a
+# follow-up (this script is copied alone into the test repositories).
+INERT_PATTERNS = ("docs/*", "benchmarks/results/*", "*.md")
+HAND_BACK_LISTED_PATH_LIMIT = 10
+TREE_PATH_GATES = ("compiler-new", "compiler-new-parity")
+BROAD_GATES = (*TREE_PATH_GATES, "compiler-blorp")
+
+
+class PathScope(Enum):
+    INERT = "inert"
+    TREE_PATH = "tree path"
+    PRODUCTION = "production"
+
+
+@dataclass(frozen=True)
+class SourceImports:
+    """What a Blorp file imports: the files its imports resolve to, and the
+    spellings that resolve to no file (what they name is unknown, never assumed
+    safe)."""
+
+    targets: tuple[str, ...]
+    unresolved: tuple[str, ...]
+
+    @property
+    def complete(self) -> bool:
+        return not self.unresolved
+
+
+def _module_imports(text: str) -> list[str]:
+    """The module spellings of a Blorp file's `import:` block."""
+    block = re.search(r"^import:\n((?:(?:\t.*)?\n)*)", text, re.MULTILINE)
+    if block is None:
+        return []
+    spellings = []
+    for line in block.group(1).splitlines():
+        header = re.match(r"\t(\S+?)(?: as \w+)?(?::.*)?$", line)
+        if header is not None and not line.startswith("\t\t"):
+            spellings.append(header.group(1))
+    return spellings
+
+
+class ImportGraph:
+    """The import graph of the checkout's Blorp files, read on demand."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._imports: dict[str, SourceImports | None] = {}
+
+    def imports(self, path: str) -> SourceImports | None:
+        """The imports of `path`, or `None` when it is not a readable file."""
+        if path not in self._imports:
+            self._imports[path] = self._read_imports(path)
+        return self._imports[path]
+
+    def _read_imports(self, path: str) -> SourceImports | None:
+        file = self.root / path
+        if not path.endswith(BLORP_SOURCE_SUFFIX) or not file.is_file():
+            return None
+        targets: list[str] = []
+        unresolved: list[str] = []
+        for spelling in _module_imports(file.read_text(encoding="utf-8")):
+            beside = posixpath.normpath(
+                posixpath.join(posixpath.dirname(path), spelling + BLORP_SOURCE_SUFFIX)
+            )
+            library = f"{STANDARD_LIBRARY_ROOT}{spelling}{BLORP_SOURCE_SUFFIX}"
+            for candidate in (beside, library):
+                if (self.root / candidate).is_file():
+                    targets.append(candidate)
+                    break
+            else:
+                unresolved.append(spelling)
+        return SourceImports(tuple(targets), tuple(unresolved))
+
+    def reachable_from(self, starts: list[str]) -> set[str]:
+        """Every Blorp file `starts` name, and every file they import, directly
+        or not. A start that is not a Blorp file is left out."""
+        seen = {start for start in starts if self.imports(start) is not None}
+        pending = list(seen)
+        while pending:
+            imported = self.imports(pending.pop())
+            for target in imported.targets if imported else ():
+                if target not in seen:
+                    seen.add(target)
+                    pending.append(target)
+        return seen
+
+    def importers_of(self, modules: set[str]) -> set[str]:
+        """The Blorp files under `blorp/` that import any of `modules`,
+        transitively."""
+        reverse: dict[str, set[str]] = {}
+        for file in sorted((self.root / "blorp").rglob(f"*{BLORP_SOURCE_SUFFIX}")):
+            path = file.relative_to(self.root).as_posix()
+            imported = self.imports(path)
+            for target in imported.targets if imported else ():
+                reverse.setdefault(target, set()).add(path)
+        seen: set[str] = set()
+        pending = list(modules)
+        while pending:
+            for importer in reverse.get(pending.pop(), ()):
+                if importer not in seen:
+                    seen.add(importer)
+                    pending.append(importer)
+        return seen
+
+
+def is_candidate_module(path: str) -> bool:
+    return path.startswith(CANDIDATE_MODULE_ROOT) or path == TREE_PROJECTION_MODULE
+
+
+class PathClassifier:
+    """The scope of a changed path, judged on the checkout's import graph."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.graph = ImportGraph(root)
+        self.production_modules = self._reached_outside_candidates()
+
+    def unprovable_reason(self, changed_paths: Iterable[str]) -> str | None:
+        """Why the tree path cannot be told from production here, or `None`: the
+        first import under a program (or in a changed file) that resolves to no
+        file. The usual cause is a checkout that has not run `make`, which writes
+        the generated modules."""
+        files = sorted(self.graph.reachable_from(self._program_files())) if self.production_modules is None else []
+        for path in [*files, *sorted(changed_paths)]:
+            imported = self.graph.imports(path)
+            if imported is not None and imported.unresolved:
+                return (
+                    f"tree path not provable: {path} imports {imported.unresolved[0]}, "
+                    "which does not resolve; run make"
+                )
+        return None
+
+    def _program_files(self) -> list[str]:
+        """The `blorp/src` modules outside the candidates: any may be a program's
+        entry."""
+        paths = (
+            file.relative_to(self.root).as_posix()
+            for file in sorted((self.root / SOURCE_MODULE_ROOT).rglob(f"*{BLORP_SOURCE_SUFFIX}"))
+        )
+        return [path for path in paths if not is_candidate_module(path)]
+
+    def _reached_outside_candidates(self) -> set[str] | None:
+        """Everything the non-candidate `blorp/src` modules reach, and those
+        modules; `None` when an import under them does not resolve (a generated
+        module not built yet, say), since what they reach is then unknown."""
+        reached = self.graph.reachable_from(self._program_files())
+        if not all(self.graph.imports(path).complete for path in reached):
+            return None
+        return reached
+
+    def scope(self, path: str) -> PathScope:
+        if any(fnmatchcase(path, pattern) for pattern in INERT_PATTERNS):
+            return PathScope.INERT
+        if path in TREE_PATH_TOOLING:
+            return PathScope.TREE_PATH
+        if path.startswith(COMPILER_NEW_TEST_ROOT) and not path.endswith(BLORP_SOURCE_SUFFIX):
+            # The suite manifest and other data nothing but the compiler-new gate reads.
+            return PathScope.TREE_PATH
+        imported = self.graph.imports(path)
+        if imported is None or not imported.complete or self.production_modules is None:
+            return PathScope.PRODUCTION
+        if path.startswith(SOURCE_MODULE_ROOT):
+            return PathScope.TREE_PATH if self.is_tree_path_module(path) else PathScope.PRODUCTION
+        if path.startswith(TEST_ROOT) and self._is_tree_path_test(path, imported):
+            return PathScope.TREE_PATH
+        return PathScope.PRODUCTION
+
+    def _is_tree_path_test(self, path: str, imported: SourceImports) -> bool:
+        if CHECKED_FIXTURE_MARKER in (self.root / path).read_text(encoding="utf-8"):
+            return False
+        return path.startswith(COMPILER_NEW_TEST_ROOT) or any(
+            self.is_tree_path_module(target) for target in imported.targets
+        )
+
+    def is_tree_path_module(self, path: str) -> bool:
+        return (
+            is_candidate_module(path)
+            and self.production_modules is not None
+            and path not in self.production_modules
+        )
+
+
+@dataclass(frozen=True)
+class NoHandBack:
+    """The change set is not about the discovery stage; the manifest's selection
+    is the whole answer."""
+
+
+@dataclass(frozen=True)
+class TreePathOnly:
+    """Every changed path is on the tree path (or inert)."""
+
+    tree_paths: tuple[str, ...]
+    commands: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BroadHandBack:
+    """The change set touches the discovery stage and something production
+    executes, or something that cannot be proven otherwise."""
+
+    tree_paths: tuple[str, ...]
+    production_paths: tuple[str, ...]
+    commands: tuple[str, ...]
+    # Why the tree path could not be proven, when that is why this is broad.
+    unprovable: str | None = None
+
+
+HandBack = NoHandBack | TreePathOnly | BroadHandBack
+
+
+def hand_back_for(root: Path, manifest: "Manifest", changed_paths: Iterable[str]) -> HandBack:
+    """The gates to hand back for `changed_paths`."""
+    classifier = PathClassifier(root)
+    scoped = {path: classifier.scope(path) for path in sorted(set(changed_paths))}
+    tree_paths = tuple(path for path, scope in scoped.items() if scope is PathScope.TREE_PATH)
+    production_paths = tuple(
+        path for path, scope in scoped.items() if scope is PathScope.PRODUCTION
+    )
+    if not tree_paths and not any(separately_gated_owner(path) for path in production_paths):
+        return NoHandBack()
+    if production_paths:
+        return BroadHandBack(
+            tree_paths,
+            production_paths,
+            (shlex.join(["scripts/test", *BROAD_GATES]),),
+            classifier.unprovable_reason(scoped),
+        )
+    return TreePathOnly(tree_paths, tuple(_tree_path_commands(manifest, classifier, tree_paths)))
+
+
+def _tree_path_commands(
+    manifest: "Manifest", classifier: PathClassifier, tree_paths: tuple[str, ...]
+) -> list[str]:
+    """The suites that run the changed files, then the compiler-new gates: the
+    registered suites among the changed paths, those of the manifest-owned
+    changed modules, and every registered suite that imports a changed Blorp
+    file, directly or not."""
+    owned = [path for path in tree_paths if path in manifest.modules]
+    selection = _selection_for_modules(manifest, owned)
+    suites = {suite.identifier: suite for suite in selection.suites}
+    blorp_files = {
+        path for path in tree_paths if classifier.graph.imports(path) is not None
+    }
+    for path in blorp_files | classifier.graph.importers_of(blorp_files):
+        if (suite := manifest.suites_by_path.get(path)) is not None:
+            suites[suite.identifier] = suite
+    focused = Selection(
+        selection.sources,
+        tuple(sorted(suites.values(), key=lambda item: item.path)),
+        selection.checks,
+    )
+    commands = [shlex.join(command) for command in _focused_action_commands(focused)]
+    # The parity script and its tests are Python: their own tests run directly.
+    if any(path in TREE_PATH_TOOLING for path in tree_paths):
+        commands.append(shlex.join(["python3", "-m", "unittest", PARITY_SCRIPT_TESTS]))
+    commands.append(shlex.join(["scripts/test", "--no-build", *TREE_PATH_GATES]))
+    return commands
 
 
 class ManifestError(Exception):
@@ -420,12 +733,20 @@ def _git_paths(root: Path, arguments: list[str]) -> set[str]:
     }
 
 
+# Every kind of change, and a rename as a delete plus an add: the changed set
+# names the path a file left as well as the one it reached. A deleted file is
+# in the set, so removing a production file beside a tree-path edit is not a
+# tree-path change.
+CHANGE_KINDS = "ACDMR"
+
+
+DIFF_ARGUMENTS = ("diff", "--name-only", "--no-renames", f"--diff-filter={CHANGE_KINDS}", "-z")
+
+
 def changed_repository_paths(root: Path, base: str | None) -> set[str]:
     changed = set()
-    changed.update(_git_paths(root, ["diff", "--name-only", "--diff-filter=ACMR", "-z"]))
-    changed.update(
-        _git_paths(root, ["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"])
-    )
+    changed.update(_git_paths(root, [*DIFF_ARGUMENTS]))
+    changed.update(_git_paths(root, [*DIFF_ARGUMENTS, "--cached"]))
     changed.update(_git_paths(root, ["ls-files", "--others", "--exclude-standard", "-z"]))
     if base is not None:
         merge_base = subprocess.run(
@@ -437,19 +758,7 @@ def changed_repository_paths(root: Path, base: str | None) -> set[str]:
         if merge_base.returncode != 0:
             message = merge_base.stderr.strip()
             raise RuntimeError(f"cannot find merge base for {base!r}: {message}")
-        changed.update(
-            _git_paths(
-                root,
-                [
-                    "diff",
-                    "--name-only",
-                    "--diff-filter=ACMR",
-                    "-z",
-                    merge_base.stdout.strip(),
-                    "HEAD",
-                ],
-            )
-        )
+        changed.update(_git_paths(root, [*DIFF_ARGUMENTS, merge_base.stdout.strip(), "HEAD"]))
     return changed
 
 
@@ -503,6 +812,37 @@ def select_changed(manifest: Manifest, changed_paths: Iterable[str]) -> Selectio
     return Selection(
         selection.sources,
         tuple(sorted(suites_by_id.values(), key=lambda item: item.path)),
+        selection.checks,
+    )
+
+
+def suites_importing_changed_tests(
+    graph: "ImportGraph", manifest: Manifest, changed_paths: Iterable[str]
+) -> tuple[Suite, ...]:
+    """The registered suites that import a changed test file, directly or not: a
+    helper or another suite's module is run by the suites that use it."""
+    tests = {
+        path
+        for path in changed_paths
+        if path.startswith(TEST_ROOT) and graph.imports(path) is not None
+    }
+    return tuple(
+        sorted(
+            (
+                suite
+                for path in graph.importers_of(tests)
+                if (suite := manifest.suites_by_path.get(path)) is not None
+            ),
+            key=lambda item: item.path,
+        )
+    )
+
+
+def with_suites(selection: Selection, suites: Iterable[Suite]) -> Selection:
+    merged = {suite.identifier: suite for suite in (*selection.suites, *suites)}
+    return Selection(
+        selection.sources,
+        tuple(sorted(merged.values(), key=lambda item: item.path)),
         selection.checks,
     )
 
@@ -610,11 +950,47 @@ def _print_noop_plan() -> None:
     )
 
 
-def _print_plan(manifest: Manifest, plan: Plan) -> None:
+def _listed(paths: tuple[str, ...]) -> str:
+    shown = ", ".join(paths[:HAND_BACK_LISTED_PATH_LIMIT])
+    hidden = len(paths) - HAND_BACK_LISTED_PATH_LIMIT
+    return f"{shown} and {hidden} more" if hidden > 0 else shown
+
+
+def _print_hand_back(hand_back: HandBack) -> None:
+    match hand_back:
+        case NoHandBack():
+            return
+        case TreePathOnly():
+            print("Hand-back gates: tree path only")
+            print(
+                "  No changed path is imported by production code: each is a discovery tree "
+                "parser or its projection, a test or tool of them, or documentation."
+            )
+            print("  Hand-back action: " + "; ".join(hand_back.commands))
+            print(
+                "  Not required for the hand-back: the full compiler-blorp gate. The Docker "
+                "premerge gate runs once at landing, by policy; this script does not check it."
+            )
+        case BroadHandBack():
+            print("Hand-back gates: broad")
+            if hand_back.unprovable is not None:
+                print(f"  {hand_back.unprovable}")
+            if hand_back.production_paths:
+                print(f"  outside the tree path: {_listed(hand_back.production_paths)}")
+                print(
+                    "  These are production, or cannot be shown not to be (a path the import "
+                    "graph does not resolve counts as production)."
+                )
+            print("  Hand-back action: " + "; ".join(hand_back.commands))
+    sys.stdout.flush()
+
+
+def _print_plan(manifest: Manifest, plan: Plan, hand_back: HandBack) -> None:
     selection = plan.selection
     print("Mode: plan only (no build, compiler, test, log, or generated-file write)")
     if not selection.sources and not selection.suites and not selection.checks:
         _print_noop_plan()
+        _print_hand_back(hand_back)
         return
 
     print(
@@ -641,10 +1017,32 @@ def _print_plan(manifest: Manifest, plan: Plan) -> None:
     for command in _broad_gate_commands(manifest, selection):
         print(f"Recommended additional gate: {command}")
         print("Reason: manifest broad_gate; review guidance only, not run by --plan")
+    _print_hand_back(hand_back)
     sys.stdout.flush()
 
 
-def _print_plan_json(manifest: Manifest, plan: Plan) -> None:
+def _hand_back_json(hand_back: HandBack) -> dict[str, Any]:
+    match hand_back:
+        case NoHandBack():
+            return {"scope": "none", "tree_paths": [], "production_paths": [], "commands": []}
+        case TreePathOnly():
+            return {
+                "scope": "tree-path-only",
+                "tree_paths": list(hand_back.tree_paths),
+                "production_paths": [],
+                "commands": list(hand_back.commands),
+            }
+        case BroadHandBack():
+            return {
+                "scope": "broad",
+                "tree_paths": list(hand_back.tree_paths),
+                "production_paths": list(hand_back.production_paths),
+                "unprovable": hand_back.unprovable,
+                "commands": list(hand_back.commands),
+            }
+
+
+def _print_plan_json(manifest: Manifest, plan: Plan, hand_back: HandBack) -> None:
     payload = {
         "schema_version": 1,
         "mode": "plan",
@@ -654,6 +1052,7 @@ def _print_plan_json(manifest: Manifest, plan: Plan) -> None:
         "focused_action": [command for command in _focused_action_commands(plan.selection)],
         "recommendations": list(_broad_gate_commands(manifest, plan.selection)),
         "recommendation_authority": "manifest broad_gate",
+        "hand_back": _hand_back_json(hand_back),
     }
     print(json.dumps(payload, indent=2))
 
@@ -895,6 +1294,7 @@ def main(arguments: list[str]) -> int:
     try:
         manifest = load_manifest(root)
         changed_paths: set[str] = set()
+        hand_back: HandBack = NoHandBack()
         if options.validate_manifest:
             print(
                 f"Compiler test ownership manifest is valid: {len(manifest.modules)} production modules, "
@@ -907,7 +1307,14 @@ def main(arguments: list[str]) -> int:
             selection = select_stage(manifest, options.stage)
         else:
             changed_paths = changed_repository_paths(root, options.base)
-            selection = select_changed(manifest, changed_paths)
+            # Selection runs on files that exist; a deleted or renamed-away path
+            # only widens the hand-back.
+            existing_paths = {path for path in changed_paths if (root / path).exists()}
+            selection = with_suites(
+                select_changed(manifest, existing_paths),
+                suites_importing_changed_tests(ImportGraph(root), manifest, existing_paths),
+            )
+            hand_back = hand_back_for(root, manifest, changed_paths)
     except ManifestError as error:
         for message in error.errors:
             print(f"error: {message}", file=sys.stderr)
@@ -916,18 +1323,6 @@ def main(arguments: list[str]) -> int:
         parser.error(str(error))
 
     if options.changed:
-        gated_owners = sorted(
-            {
-                owner
-                for path in changed_paths
-                if (owner := separately_gated_owner(path)) is not None
-            }
-        )
-        for owner in gated_owners:
-            print(
-                f"Changes under blorp/src/{owner} or blorp/test/test_{owner} are not selected here; "
-                f"run {SEPARATELY_GATED_OWNERS[owner]}."
-            )
         changed_tests = directly_changed_suites(manifest, changed_paths)
         source_label = "Changed production source"
     else:
@@ -936,11 +1331,12 @@ def main(arguments: list[str]) -> int:
     if options.plan:
         plan = Plan(selection, changed_tests, source_label)
         if options.json:
-            _print_plan_json(manifest, plan)
+            _print_plan_json(manifest, plan, hand_back)
         else:
-            _print_plan(manifest, plan)
+            _print_plan(manifest, plan, hand_back)
         return 0
 
+    _print_hand_back(hand_back)
     _print_selection(selection)
     return execute_selection(root, selection, arguments)
 

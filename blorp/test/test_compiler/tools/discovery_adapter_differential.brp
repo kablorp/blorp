@@ -3,7 +3,7 @@
 -- loads, for the adapter check of `scripts/compiler-new-parity`.
 --
 -- Usage: discovery_adapter_differential.brp <compile|test> <root.brp> [--embedded-std] [--package <spec>]...
---        discovery_adapter_differential.brp files <file listing one source path per line> [--stop-census]
+--        discovery_adapter_differential.brp files <file listing one source path per line> [--stop-census] [--only-listed]
 --
 -- The first form takes the command line of `module_order_options`: `compile`
 -- loads the implicit modules a compile or check loads, `test` also the test
@@ -12,6 +12,12 @@
 -- The root module is named `main`. `files` makes every listed file a root of one
 -- discovery (named by its path without `.brp`) and loads the implicit modules a
 -- compile loads, so one run covers files no import reaches, fixtures included.
+-- Discovery still loads everything the roots import, and by default every
+-- loaded module is compared. With `--only-listed` only the listed roots are
+-- compared (the summaries count them alone), which is how a targeted run of
+-- `scripts/compiler-new-parity` avoids comparing a root's whole import graph.
+-- It then prints `listed-module <path>` for each module it compares, so the
+-- caller can check that every listed file was reached and no other was.
 -- With `--stop-census` (`files` only) each declaration the tree scan left
 -- unread also prints why, for the stop-reason census of
 -- `scripts/compiler-new-parity --stop-census`:
@@ -154,6 +160,8 @@ import:
 		SourcePackageSpec,
 		StandardLibrarySource(StandardLibraryEmbedded, StandardLibraryOnDisk),
 		parse_module_order_options,
+	list: range
+	set as Sets
 	system: read_file
 	../../test_compiler_new/support/stop_reason_label: declined_kind_label, stop_reason_label
 
@@ -166,9 +174,11 @@ FILES_MODE: String = "files"
 
 FILES_ARGUMENT: Int = 2
 
-STOP_CENSUS_ARGUMENT: Int = 3
+FLAGS_START: Int = 3
 
 STOP_CENSUS_FLAG: String = "--stop-census"
+
+ONLY_LISTED_FLAG: String = "--only-listed"
 
 SOURCE_FILE_SUFFIX: String = ".brp"
 
@@ -697,8 +707,25 @@ record DifferentialRun {
 	implicit: ImplicitModules,
 	standard_library: StandardLibrarySource,
 	source_packages: List[SourcePackageSpec],
-	stop_census: StopCensus
+	stop_census: StopCensus,
+	compared: ComparedModules
 }
+
+
+-- Which discovered modules a run compares. Discovery loads every import of a
+-- root; a targeted run compares only the roots it was asked about, named by the
+-- paths the discovery tables hold for them.
+union ComparedModules:
+	EveryDiscoveredModule
+	ListedModulesOnly(Set[String])
+
+
+pure func is_compared(compared: ComparedModules, path: String) -> Bool:
+	match compared:
+		EveryDiscoveredModule:
+			True
+		ListedModulesOnly(listed):
+			Sets.contains(listed, path)
 
 
 -- Whether the run prints each module's first unread declaration.
@@ -719,7 +746,8 @@ func run_from_options(options: ModuleOrderOptions) -> DifferentialRun:
 		implicit = implicit,
 		standard_library = options.standard_library,
 		source_packages = options.source_packages,
-		stop_census = OmitStops
+		stop_census = OmitStops,
+		compared = EveryDiscoveredModule
 	}
 
 
@@ -727,13 +755,18 @@ func run_from_options(options: ModuleOrderOptions) -> DifferentialRun:
 Every file of the listing at `listing_path` as a root, or `None` when it cannot
 be read.
 ---
-func run_over_files(listing_path: String, stop_census: StopCensus) -> Option[DifferentialRun]:
+func run_over_files(listing_path: String, stop_census: StopCensus, only_listed: Bool) -> Option[DifferentialRun]:
 	match read_file(listing_path):
 		Ok(listing):
+			paths: List[String] = listing
+				.split("\n")
+				.filter(pure func(line): line != "")
+			compared: ComparedModules = if only_listed:
+				ListedModulesOnly(Sets.from_list(paths))
+			else:
+				EveryDiscoveredModule
 			Some({
-				paths = listing
-					.split("\n")
-					.filter(pure func(line): line != ""),
+				paths = paths,
 				root_module_name = pure func(
 					request_path,
 				): request_path.remove_suffix(SOURCE_FILE_SUFFIX),
@@ -741,6 +774,7 @@ func run_over_files(listing_path: String, stop_census: StopCensus) -> Option[Dif
 				standard_library = StandardLibraryOnDisk,
 				source_packages = [],
 				stop_census = stop_census,
+				compared = compared,
 			})
 		Err(_):
 			None
@@ -757,15 +791,16 @@ func source_package_root(spec: SourcePackageSpec) -> SourcePackageRoot:
 
 func main(args: List[String]) -> Int:
 	if args.get_or(1, "") == FILES_MODE:
-		stop_census: StopCensus = if args.get_or(STOP_CENSUS_ARGUMENT, "") == STOP_CENSUS_FLAG:
+		flags: List[String] = args.drop(FLAGS_START)
+		stop_census: StopCensus = if flags.contains(STOP_CENSUS_FLAG):
 			ReportStops
 		else:
 			OmitStops
-		match run_over_files(args.get_or(FILES_ARGUMENT, ""), stop_census):
+		match run_over_files(args.get_or(FILES_ARGUMENT, ""), stop_census, flags.contains(ONLY_LISTED_FLAG)):
 			Some(run):
 				execute(run)
 			None:
-				print("usage: discovery_adapter_differential.brp files <listing> [--stop-census]")
+				print("usage: discovery_adapter_differential.brp files <listing> [--stop-census] [--only-listed]")
 				EXIT_USAGE
 	else:
 		match parse_module_order_options(args):
@@ -814,7 +849,7 @@ func compare_discovered[Provider:SourceProvider](
 
 			match legacy_declaration_reader(tables, naming):
 				Ok(reader):
-					print_comparison(tables, reader, run.stop_census)
+					print_comparison(tables, reader, run.stop_census, run.compared)
 				Err(error):
 					print("adapter-error | ${legacy_adapter_error_message(error)}")
 					EXIT_ADAPTER_ERROR
@@ -823,7 +858,18 @@ func compare_discovered[Provider:SourceProvider](
 			EXIT_INVARIANT_VIOLATION
 
 
-func print_comparison(tables: FrontendTables, reader: DeclarationReader, stop_census: StopCensus) -> Int:
+-- The path of the module at table row `module`, as the listing names it.
+pure func module_path(tables: FrontendTables, module: Int) -> String:
+	row: ModuleRow = module_row(tables, module_id_at_row(module))
+	path_text(tables, source_row(tables, row.source).path)
+
+
+func print_comparison(
+	tables: FrontendTables, reader: DeclarationReader, stop_census: StopCensus, scope: ComparedModules,
+) -> Int:
+	selected: List[Int] = range(0, module_count(tables)).filter(
+		pure func(module): is_compared(scope, module_path(tables, module)),
+	)
 	var compared: Int = 0
 	var skipped: Int = 0
 	var not_rebuilt: Int = 0
@@ -834,9 +880,15 @@ func print_comparison(tables: FrontendTables, reader: DeclarationReader, stop_ce
 	var module_counts: TreeModuleCounts = EMPTY_TREE_MODULE_COUNTS
 	var module_names: NameTable = SYNTHESIZED_NAME_TABLE
 
-	for module in 0..module_count(tables):
+	for module in selected:
 		row: ModuleRow = module_row(tables, module_id_at_row(module))
-		path: String = path_text(tables, source_row(tables, row.source).path)
+		path: String = module_path(tables, module)
+
+		match scope:
+			ListedModulesOnly(_):
+				print("listed-module ${path}")
+			EveryDiscoveredModule:
+				void
 
 		comparisons = compare_module(reader, module, row, tree_names, module_names)
 		match comparisons.adapter:
@@ -892,10 +944,10 @@ func print_comparison(tables: FrontendTables, reader: DeclarationReader, stop_ce
 				module_counts = { module_counts | errors = module_counts.errors + 1 }
 				print("tree-module-error ${path} | ${tree_module_error_stage_label(stage)} | ${shortened(message)}")
 
-	print_tree_prefix_summary(module_count(tables), tree_counts)
-	print_tree_module_summary(module_count(tables), module_counts)
+	print_tree_prefix_summary(selected.length(), tree_counts)
+	print_tree_module_summary(selected.length(), module_counts)
 	print(
-		"summary modules=${module_count(tables)} compared=${compared} skipped=${skipped} declarations=${declarations} differences=${differing}",
+		"summary modules=${selected.length()} compared=${compared} skipped=${skipped} declarations=${declarations} differences=${differing}",
 	)
 
 	if not_rebuilt > 0 or tree_counts.errors > 0 or module_counts.errors > 0:

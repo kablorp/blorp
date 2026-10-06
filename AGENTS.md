@@ -14,7 +14,7 @@ setup/measure/land loop before reading a roadmap.
 
 | Task | Start with | First feedback |
 | --- | --- | --- |
-| Syntax or diagnostic | `blorp/src/compiler_new/stage_01_discovery/parse/` (lexer in `lex/`, message text in `diagnostics/render.brp`; also `blorp/src/compiler/stage_03_parse/` while it exists, since a syntax change lands in both), matching fixture under `blorp/test/test_compiler_new/test_stage_01_discovery/test_parse/fixtures/`, [`GRAMMAR`](docs/GRAMMAR.md) | `parse/test_parser_fixtures.brp`; then `scripts/test compiler-new` (`compiler-check --changed` selects nothing under `compiler_new`) |
+| Syntax or diagnostic | `blorp/src/compiler_new/stage_01_discovery/parse/` (lexer in `lex/`, message text in `diagnostics/render.brp`; also `blorp/src/compiler/stage_03_parse/` while it exists, since a syntax change lands in both), matching fixture under `blorp/test/test_compiler_new/test_stage_01_discovery/test_parse/fixtures/`, [`GRAMMAR`](docs/GRAMMAR.md) | `parse/test_parser_fixtures.brp`; then `scripts/compiler-check --changed --plan` names the hand-back gates (tree path only: `make`, the suites importing the changed modules, `scripts/test compiler-new compiler-new-parity`; anything else production runs: add `compiler-blorp`) |
 | Inference or typecheck | `blorp/src/compiler/stage_06_typecheck/`, matching compiler fixture | Exact suite; then `scripts/compiler-check --stage typecheck` |
 | Core/ownership | [`pipeline.brp`](blorp/src/compiler/stage_09_core/pipeline.brp), [`ARCHITECTURE`](docs/ARCHITECTURE.md), owning Core suite | Before/after Core, focused suite, relevant sanitizer |
 | Backend/runtime | `blorp/src/compiler/stage_10_backend/`, `blorp/src/lib/runtime/native/`, codegen audit | Focused emitter/runtime test and generated C |

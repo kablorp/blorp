@@ -4001,6 +4001,23 @@ A new rollback adds its reason to the enum, and the census label match
 it is named. The census mixes unlike things (missing grammar, syntax errors the
 parser does not yet report, artificial limits and cannot-happen guards); the M4
 exit criteria below classify and then delete it.
+A full census stores its stops, and `--stop-reason LABEL` or `--files PATH...`
+then runs the parity, the adapter differential or the census over just those
+modules, so a slice iterates on one stop reason without the corpus run.
+
+The tree path is test-only, which sets what an M4 slice hands back. No program
+imports it: the tree parsers and `compiler/discovery_tree_projection.brp` (the
+projection of trees to the old parser's AST, split out of `discovery_adapter.brp`
+so the import graph shows it) are reached by no other `blorp/src` module, so they
+are not part of `bin/blorp`; only tests and the parity tools use them. A slice
+whose changed paths are all tree path hands back `make`, the suites that import
+the changed files and `scripts/test compiler-new compiler-new-parity`, and not
+the full `compiler-blorp` gate. Any other path, including the old parser, the
+adapter, the lexer and diagnostics, a `RUN-BLORP-CHECK` fixture, and anything
+the graph cannot place, makes the change broad.
+`scripts/compiler-check --changed --plan` prints which one a change set is.
+[`WORKER_CHECKLIST`](WORKER_CHECKLIST.md#hand-back-gates-for-discovery-parser-work)
+has the commands.
 
 The statement-forms slice reads `select`, `with`, `concurrent` and `debug:` as
 statements, and `detach x` as a prefix operator. `select` is also a whole value

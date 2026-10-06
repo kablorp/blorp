@@ -34,9 +34,35 @@ plan that selects nothing is a no-op explanation, not a passing validation; use
 the task-specific build, docs, or release checks for those changes.
 
 Sources under `blorp/src/compiler_new` and suites under
-`blorp/test/test_compiler_new` (the discovery stage, which `bin/blorp` links through
-its adapter) are outside this manifest: `--changed` selects nothing for
-them and names their gate, `scripts/test compiler-new`.
+`blorp/test/test_compiler_new` (the discovery stage, which `bin/blorp` links and
+whose lexer and table parser production runs) are outside this manifest, so
+`--changed` selects no focused check for them. It instead prints
+`Hand-back gates` whenever the change set touches the discovery stage or the
+tree path (`--plan --json` carries the same under `hand_back`):
+
+- `tree path only`: every changed path is a `compiler_new` module (or
+  `compiler/discovery_tree_projection.brp`) that no other `blorp/src` module
+  reaches through imports, a `compiler_new` test or data file, a test that
+  imports such a module (neither carrying a `RUN-BLORP-CHECK` marker, which
+  compiler-blorp runs through production), the parity script and its test, or
+  documentation. No program imports it, so the hand-back is `make`,
+  `bin/blorp test` on every registered suite that imports a changed Blorp file
+  (directly or not; the manifest's suites for a changed module too), the
+  parity script's python tests when it or they changed, and
+  `scripts/test --no-build compiler-new compiler-new-parity`; the full
+  `compiler-blorp` gate is not needed. `make` is there for build-status
+  freshness only, since the build inputs are all of `blorp/src`.
+- `broad`: any other path in the change set, including one that was deleted or
+  renamed away, or that the import graph cannot place (an import that resolves
+  to no file, or a program root whose imports do not all resolve, as in a
+  checkout that has not run `make`, which says so): production is
+  the judge, `scripts/test compiler-new compiler-new-parity compiler-blorp`, plus
+  the manifest's recommendations above.
+
+The rule is derived from the import graph each run, so a new tree module needs
+no list entry. The hand-back is guidance, like `--plan`'s recommendations; the
+commands are not run for you. The Docker premerge gate before landing is project
+policy that this command neither runs nor verifies.
 
 The command prints the selected sources, suites, and special checks before it
 prepares the compiler once. Suites then use `bin/blorp test`, and registered gate
@@ -117,7 +143,30 @@ default gate; it is part of the premerge gate.
 runs only the adapter differential over the corpus and prints why the tree
 scan stopped at each module's first unread declaration, ranked by reason (the
 reasons are the tree parsers' own `StopReason` values), for choosing the next
-slice.
+slice. A census over the whole corpus also stores its per-module stops in
+`stop-census.txt` under the system temporary directory (a directory per
+checkout, `compiler-new-parity-<digest of the checkout path>`; `--census-file`
+overrides it), so the next run can be narrowed:
+
+```bash
+scripts/compiler-new-parity --stop-census                       # full run; stores stop-census.txt
+scripts/compiler-new-parity --stop-reason multiline-call-arguments --stop-census
+scripts/compiler-new-parity --stop-reason multiline-call-arguments --adapter-only
+scripts/compiler-new-parity --files blorp/src/check/command.brp blorp/src/check/capture.brp
+```
+
+`--stop-reason LABEL` selects the modules whose first stop had that label (the
+table's "First-stop modules" column; a misspelt label lists the right ones) and
+`--files PATH...` names tracked `.brp` files. A narrowed run compares only the
+selected modules, builds its dumpers with `-O0` (about 15 s of C compile instead
+of 92 s for the adapter differential; the run itself is slower, so it pays below
+about two thirds of the corpus), skips the root and graph checks and the
+corpus-wide allowance checks, and never prints `BLORP_GATE_RESULT`: it is for
+iterating, and the unchanged full run stays the gate. `--adapter-only` skips
+the token dumps, which a tree-path change cannot affect. A narrowed
+`--stop-census` never overwrites the stored census. The fixed cost of an
+iteration is then the C compile of the dumper, because it contains the tree
+parsers being edited.
 The `compiler-blorp` gate also runs every fixture explicitly marked
 `RUN-BLORP-CHECK` through a small runner
 (`blorp/test/test_lib/run_blorp_check_fixtures.py`) after the TestSuites have run;

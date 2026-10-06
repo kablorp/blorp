@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 from pathlib import Path
 import sys
+import tempfile
 import unittest
+import unittest.mock
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -767,6 +771,224 @@ class StopCensusTest(unittest.TestCase):
 			parity.parse_stop_census("stop-reason a.brp | function | x | 1")
 		with self.assertRaises(SystemExit):
 			parity.parse_stop_census("stop-reason a.brp | function | x | 1 | middle")
+
+
+class TargetedRunTest(unittest.TestCase):
+	CENSUS = StopCensusTest.OUTPUT
+	CORPUS = ["a.brp", "b.brp", "c.brp", "d.brp"]
+
+	def exit_message(self, call) -> str:
+		with self.assertRaises(SystemExit) as raised:
+			call()
+		return str(raised.exception.code)
+
+	def test_a_stop_reason_selects_the_modules_whose_first_stop_had_it(self) -> None:
+		self.assertEqual(
+			parity.first_stop_modules(self.CENSUS, "multiline-call-arguments"), ["a.brp", "b.brp"]
+		)
+		# a.brp stops later at lambda-header, but its first stop is another reason.
+		self.assertEqual(parity.first_stop_modules(self.CENSUS, "with-block"), ["c.brp"])
+
+	def test_a_reason_that_only_stops_later_declarations_selects_nothing_and_says_so(self) -> None:
+		message = self.exit_message(lambda: parity.first_stop_modules(self.CENSUS, "lambda-header"))
+		self.assertIn("no module's first stop was lambda-header", message)
+
+	def test_an_unknown_reason_lists_the_reasons_the_census_has(self) -> None:
+		message = self.exit_message(lambda: parity.first_stop_modules(self.CENSUS, "multiline-call"))
+		self.assertIn("multiline-call", message)
+		self.assertIn("multiline-call-arguments", message)
+		self.assertIn("with-block", message)
+
+	def test_files_must_be_corpus_files_and_come_back_in_corpus_order(self) -> None:
+		self.assertEqual(parity.select_files(["c.brp", "a.brp", "c.brp"], self.CORPUS), ["a.brp", "c.brp"])
+		message = self.exit_message(lambda: parity.select_files(["a.brp", "typo.brp"], self.CORPUS))
+		self.assertIn("typo.brp", message)
+		self.assertNotIn("a.brp is not", message)
+
+	def test_a_census_file_keeps_only_the_stop_lines_and_selects_like_the_census(self) -> None:
+		text = parity.census_result_text(self.CENSUS, "header text")
+		self.assertTrue(text.startswith("# header text\n"))
+		self.assertNotIn("difference ignored", text)
+		self.assertEqual(parity.first_stop_modules(text, "with-block"), ["c.brp"])
+		self.assertEqual(
+			parity.render_stop_census(parity.parse_stop_census(text), 3),
+			parity.render_stop_census(parity.parse_stop_census(self.CENSUS), 3),
+		)
+
+	def test_a_missing_census_file_names_the_command_that_writes_it(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			message = self.exit_message(lambda: parity.read_census_result(Path(directory) / "absent.txt"))
+		self.assertIn("--stop-census", message)
+
+	def test_a_stored_census_is_read_back_with_its_header(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			path = Path(directory) / "stop-census.txt"
+			parity.write_census_result(path, self.CENSUS, "recorded at abc")
+			text, header = parity.read_census_result(path)
+		self.assertEqual(header, "recorded at abc")
+		self.assertEqual(parity.first_stop_modules(text, "with-block"), ["c.brp"])
+
+	def test_the_default_census_file_is_per_checkout_under_the_temporary_directory(self) -> None:
+		first = parity.default_census_file(Path("/work/one"))
+		self.assertEqual(first, parity.default_census_file(Path("/work/one")))
+		self.assertNotEqual(first, parity.default_census_file(Path("/work/two")))
+		self.assertTrue(str(first).startswith(tempfile.gettempdir()))
+
+	def test_only_a_full_corpus_census_is_stored(self) -> None:
+		full = parity.CorpusSelection.full(self.CORPUS)
+		targeted = parity.CorpusSelection.of_files(["a.brp"], "one file")
+		self.assertTrue(full.stores_census)
+		self.assertFalse(targeted.stores_census)
+		self.assertEqual(full.paths, tuple(self.CORPUS))
+		self.assertFalse(full.targeted)
+		self.assertTrue(targeted.targeted)
+
+	def test_a_targeted_comparison_does_not_require_allowance_files_outside_it(self) -> None:
+		self.assertTrue(parity.KNOWN_DIVERGENCES)
+		agreeing = dump("a.brp", EOF_TOKEN)
+		comparison = parity.compare_selected_dumps(
+			parity.parse_dump(agreeing), parity.parse_dump(agreeing), ("a.brp",)
+		)
+		self.assertEqual(comparison.problems, [])
+		self.assertEqual(comparison.mismatched_files, 0)
+
+	def test_a_targeted_comparison_still_fails_a_selected_disagreement(self) -> None:
+		comparison = parity.compare_selected_dumps(
+			parity.parse_dump(dump("a.brp", EOF_TOKEN)),
+			parity.parse_dump(dump("a.brp", ["0 1 IdentifierToken x", *EOF_TOKEN])),
+			("a.brp",),
+		)
+		self.assertEqual(comparison.mismatched_files, 1)
+
+	def test_a_targeted_report_is_not_the_gate_result(self) -> None:
+		comparison = parity.compare_selected_dumps({}, {}, ())
+		captured = io.StringIO()
+		with contextlib.redirect_stdout(captured):
+			parity.report(comparison, 1.0, parity.CorpusSelection.of_files(["a.brp"], "one file"))
+		self.assertIn("targeted", captured.getvalue())
+		self.assertNotIn("BLORP_GATE_RESULT", captured.getvalue())
+		full = io.StringIO()
+		with contextlib.redirect_stdout(full):
+			parity.report(comparison, 1.0, parity.CorpusSelection.full(self.CORPUS))
+		self.assertIn("BLORP_GATE_RESULT gate=compiler_new_parity", full.getvalue())
+
+	def test_a_targeted_adapter_run_skips_the_root_runs_and_compares_only_the_listed_files(self) -> None:
+		full = parity.adapter_runs(Path("list.txt"), parity.CorpusSelection.full(self.CORPUS))
+		self.assertEqual(len(full), len(parity.ROOT_CHECKS) + 1)
+		self.assertNotIn(parity.ONLY_LISTED_FLAG, full[-1][1])
+		targeted = parity.adapter_runs(
+			Path("list.txt"), parity.CorpusSelection.of_files(["a.brp"], "one file")
+		)
+		self.assertEqual(len(targeted), 1)
+		self.assertEqual(targeted[0][1], (parity.ADAPTER_FILES_MODE, "list.txt", parity.ONLY_LISTED_FLAG))
+
+	def adapter_report(self, listed, compared, skipped=0, modules=None) -> "parity.AdapterReport":
+		lines = [f"listed-module {path}" for path in listed]
+		lines.append(
+			f"summary modules={len(listed) if modules is None else modules} compared={compared} "
+			f"skipped={skipped} declarations=0 differences=0"
+		)
+		return parity.parse_adapter_output("\n".join(lines) + "\n")
+
+	def test_a_targeted_adapter_run_must_cover_exactly_the_selected_files(self) -> None:
+		selected = ("a.brp", "b.brp")
+		self.assertEqual(
+			parity.selection_problems("run", self.adapter_report(selected, compared=2), selected), []
+		)
+		# One rejected by the existing parser is skipped, still covered.
+		self.assertEqual(
+			parity.selection_problems("run", self.adapter_report(selected, compared=1, skipped=1), selected), []
+		)
+		reached_other = parity.selection_problems(
+			"run", self.adapter_report(("a.brp", "c.brp"), compared=2), selected
+		)
+		self.assertIn("1 not reached (for example ['b.brp'])", reached_other[0])
+		self.assertIn("1 others compared (for example ['c.brp'])", reached_other[0])
+		self.assertTrue(parity.selection_problems("run", self.adapter_report((), compared=0, modules=0), selected))
+
+	def test_a_targeted_adapter_run_must_account_for_every_selected_file(self) -> None:
+		selected = ("a.brp", "b.brp")
+		self.assertTrue(
+			parity.selection_problems("run", self.adapter_report(selected, compared=1), selected)
+		)
+		self.assertTrue(
+			parity.selection_problems("run", self.adapter_report(selected, compared=2, modules=3), selected)
+		)
+		duplicated = self.adapter_report(("a.brp", "a.brp"), compared=2)
+		self.assertTrue(parity.selection_problems("run", duplicated, selected))
+
+	def run_targeted(self, adapter_only: bool, adapter_result, selection=None):
+		selection = selection or parity.CorpusSelection.of_files(["a.brp", "b.brp"], "two files")
+		built = []
+		output = io.StringIO()
+		with unittest.mock.patch.object(
+			parity, "build_dumper", side_effect=lambda source, work, chosen: built.append(source)
+		), unittest.mock.patch.object(
+			parity, "check_adapter", return_value=adapter_result
+		), contextlib.redirect_stdout(output):
+			status = parity.run_targeted_parity(Path("work"), Path("list"), selection, adapter_only, 0.0)
+		return status, built, output.getvalue()
+
+	def test_an_adapter_only_run_builds_no_token_dumper_and_counts_the_selected_files(self) -> None:
+		status, built, printed = self.run_targeted(True, ([], [], 0))
+		self.assertEqual((status, built), (0, []))
+		self.assertIn("targeted run over two files (not the gate): PASS files=2", printed)
+
+	def test_an_adapter_problem_fails_a_targeted_run_without_a_gate_result(self) -> None:
+		status, _, printed = self.run_targeted(True, ([], ["adapter differential, two files: boom"], 1))
+		self.assertEqual(status, 1)
+		self.assertIn("boom", printed)
+		self.assertIn("FAIL", printed)
+		self.assertNotIn("BLORP_GATE_RESULT", printed)
+
+	def choose(self, arguments, tracked, census=None):
+		options = parity.parse_arguments(arguments)
+		with unittest.mock.patch.object(parity, "tracked_files", return_value=tracked), \
+				contextlib.redirect_stdout(io.StringIO()):
+			return parity.choose_selection(options, ["a.brp", "b.brp"])
+
+	def test_no_selection_option_chooses_the_whole_corpus(self) -> None:
+		selection = self.choose([], ["a.brp", "b.brp", "c.brp"])
+		self.assertEqual((selection.paths, selection.targeted), (("a.brp", "b.brp"), False))
+
+	def test_files_may_be_any_tracked_source_file_not_only_corpus_roots(self) -> None:
+		selection = self.choose(["--files", "c.brp"], ["a.brp", "b.brp", "c.brp"])
+		self.assertEqual((selection.paths, selection.targeted), (("c.brp",), True))
+		with self.assertRaises(SystemExit):
+			self.choose(["--files", "elsewhere.brp"], ["a.brp"])
+
+	def test_a_stop_reason_selects_tracked_modules_from_the_stored_census(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			census = Path(directory) / "stop-census.txt"
+			parity.write_census_result(census, self.CENSUS, "recorded")
+			selection = self.choose(
+				["--stop-reason", "multiline-call-arguments", "--census-file", str(census)], ["a.brp", "b.brp"]
+			)
+		self.assertEqual((selection.paths, selection.targeted), (("a.brp", "b.brp"), True))
+		self.assertIn("multiline-call-arguments", selection.description)
+
+	def test_a_stop_reason_leaves_out_modules_no_longer_tracked(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			census = Path(directory) / "stop-census.txt"
+			parity.write_census_result(census, self.CENSUS, "recorded")
+			selection = self.choose(
+				["--stop-reason", "multiline-call-arguments", "--census-file", str(census)], ["b.brp"]
+			)
+		self.assertEqual(selection.paths, ("b.brp",))
+
+	def test_files_and_stop_reason_are_exclusive_and_adapter_only_needs_a_selection(self) -> None:
+		options = parity.parse_arguments(["--files", "a.brp", "b.brp", "--adapter-only"])
+		self.assertEqual((options.files, options.adapter_only), (["a.brp", "b.brp"], True))
+		self.assertEqual(parity.parse_arguments(["--stop-reason", "with-block"]).stop_reason, "with-block")
+		for arguments in (
+			["--files", "a.brp", "--stop-reason", "with-block"],
+			["--adapter-only"],
+			["--files", "a.brp", "--compare", "x", "y"],
+			["--census-file", "x"] + ["--compare", "x", "y"],
+		):
+			with self.subTest(arguments=arguments), contextlib.redirect_stderr(io.StringIO()):
+				with self.assertRaises(SystemExit):
+					parity.parse_arguments(arguments)
 
 
 if __name__ == "__main__":

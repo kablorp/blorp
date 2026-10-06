@@ -43,6 +43,51 @@ scripts/compiler-check --changed          # build once, run manifest-owned check
 Use the smallest program and the narrowest snapshot that exercises the
 behavior under investigation before reaching for a broad gate.
 
+## Hand-Back Gates For Discovery Parser Work
+
+The discovery stage's tree path (the `tree_*` parse modules and what only they
+use under `compiler_new`, and `compiler/discovery_tree_projection.brp`, which
+projects trees to the old parser's AST) is imported by no program: not
+`bin/blorp`, not the formatter, not a bridge or benchmark root. Only tests and
+the parity tools run it, so it is not compiled into `bin/blorp`. Before handing
+back, ask the script instead of judging:
+
+```bash
+scripts/compiler-check --changed --plan   # prints "Hand-back gates: tree path only" or "broad"
+```
+
+- **Tree path only** (every changed path is tree path; docs and
+  `benchmarks/results` do not count): `make`, `bin/blorp test` on the suites that
+  import any changed Blorp file (the plan prints them), then
+  `scripts/test --no-build compiler-new compiler-new-parity`. No full
+  `compiler-blorp`. `make` is there only for build-status freshness: the tree
+  code is no longer in `bin/blorp`, but the build inputs are every file under
+  `blorp/src`, so a tree edit makes it STALE although it rebuilds the same
+  program.
+- **Broad** (anything else: the old parser, the adapter, the lexer, diagnostics,
+  a path the import graph cannot place): `scripts/test compiler-new
+  compiler-new-parity compiler-blorp`, plus the focused checks the same plan lists.
+
+The Docker premerge gate is not part of either hand-back. Running it once on the
+final change before landing is project policy, not something the script knows
+or verifies.
+
+The rule is the import graph, not a list. A module under `blorp/src/compiler_new`
+(or the tree projection) is tree path when no other `blorp/src` module reaches
+it; any other `blorp/src` module may be a program's entry and counts as
+production. A `blorp/test/test_compiler_new` file, or a test that imports a
+tree-path module, is tree path too unless it carries a `RUN-BLORP-CHECK` marker,
+which sends it through production `bin/blorp check` in compiler-blorp. What the
+graph cannot resolve counts as production, and a mixed change set is broad. A
+deleted path, and both sides of a rename, count (`parse/recipes.brp` and any new
+tree module need no list entry). After merging main, rerun the plan.
+
+To iterate on one stop reason, do not rerun the corpus: after one full
+`scripts/compiler-new-parity --stop-census`, `--stop-reason LABEL` (or
+`--files PATH...`) with `--stop-census` or `--adapter-only` runs only those
+modules. These runs are not the gate; the full parity run still is. Details in
+[`scripts/README.md`](../scripts/README.md#test-gates).
+
 ## Measure
 
 Full protocol: [`benchmarks/README.md`](../benchmarks/README.md#self-compile-measurement-protocol).
