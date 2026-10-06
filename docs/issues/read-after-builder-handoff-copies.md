@@ -37,7 +37,7 @@ Declaring `var out = b` before the branch and branching on `out` is flat.
 
 ## Evidence
 
-`blorp/test/compiler_new/tools/builder_rule_probe.brp`, allocations at 500 /
+`blorp/test/test_compiler_new/tools/builder_rule_probe.brp`, allocations at 500 /
 2,000 rows:
 
 | Shape | Allocations |
@@ -59,4 +59,4 @@ For the arm case, join the two arms' ownership of the parameter instead of
 keeping it shared.
 
 Tests: the probe shapes as rows of
-`blorp/test/runtime/fixture/consume_owned_threading_shapes.brp`.
+`blorp/test/test_runtime/fixture/consume_owned_threading_shapes.brp`.

@@ -509,7 +509,7 @@ tests: TestSuite = {
 Run tests:
 
 ```bash
-bin/blorp test blorp/test/runtime/types/test_bool.brp
+bin/blorp test blorp/test/test_runtime/test_types/test_bool.brp
 scripts/test runtime
 scripts/test compiler-blorp
 ```
@@ -553,7 +553,7 @@ if the cited code has since moved.
 - **`memory.same_object` checks allocation identity across modules**. Its
   heap path compares object addresses without module-local state; stack
   values always return `False` (see `standard_library/src/memory.brp` and
-  `blorp/test/runtime/memory/test_same_object_identity.brp`).
+  `blorp/test/test_runtime/test_memory/test_same_object_identity.brp`).
 - **Declarations take `---` fenced docstrings, not `--` comment blocks**
   (`docs/GUIDE.md`'s Doctests section; `standard_library/src/string.brp` has
   dozens of examples). `--` is an ordinary line comment and is never picked
@@ -565,6 +565,6 @@ if the cited code has since moved.
 - `docs/GRAMMAR.md` for parser syntax.
 - `docs/MEMORY_MODEL.md` for value semantics, ARC, and COW.
 - `docs/ARCHITECTURE.md` for compiler pipeline details.
-- `standard_library/src/*.brp` and `blorp/test/runtime/**/*.brp` for current idioms.
+- `standard_library/src/*.brp` and `blorp/test/test_runtime/**/*.brp` for current idioms.
 - `docs/WORKER_CHECKLIST.md` for the build/measure/land loop before starting
   a compiler-performance task.

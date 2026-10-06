@@ -32,8 +32,8 @@ check.
 
 ## Fixtures (4)
 
-`blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/mutability_double_declaration.brp`;
-under `blorp/test/compiler/stage_06_typecheck/infer_fixtures/infer/should_fail/`:
+`blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_fail/mutability_double_declaration.brp`;
+under `blorp/test/test_compiler/test_stage_06_typecheck/infer_fixtures/infer/should_fail/`:
 `resolution_shadowing_rejected`, `shadow_different_type`, `shadow_same_scope`.
 
 ## Acceptance

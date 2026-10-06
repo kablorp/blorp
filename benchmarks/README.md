@@ -155,7 +155,7 @@ scripts/bench-blorp-test-session \
   --cache-state isolated-warm \
   --allow-dirty \
   -- test --timeout 30 \
-    blorp/test/runtime/types/test_bool.brp
+    blorp/test/test_runtime/test_types/test_bool.brp
 ```
 
 Compare two route executables with identical test arguments:
@@ -168,11 +168,16 @@ scripts/bench-blorp-test-session \
   --pairs 10 \
   --warmup-pairs 1 \
   --cache-state isolated-warm \
-  --input blorp/test/compiler \
+  --input blorp/test/test_compiler \
   --artifact-dir /tmp/blorp-test-session-evidence \
   --output benchmarks/results/blorp_test_session.json \
-  -- test --timeout 180 blorp/test/compiler/
+  -- test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_match.brp
 ```
+
+Directory discovery enters only `test_*` child folders. Supply explicit suite
+files to characterize compiler stage directories with other names; the example
+above retains the compiler tree as an input fingerprint while executing one
+owning suite.
 
 Comparison mode alternates route order and requires matching characterized
 output for every pair. Runs with at least ten and at most thirty measured pairs
@@ -222,17 +227,17 @@ scripts/bench-blorp-test-session \
   --warmup-pairs 1 \
   --timeout 180 \
   --cache-state isolated-warm \
-  --input benchmarks/fixtures/blorp_test_session/shared_import_fanout \
+  --input benchmarks/test_blorp_test_session/test_shared_import_fanout \
   --output benchmarks/results/blorp_test_session_shared_import_fanout.json \
   -- test --timeout 60 \
-    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_01.brp \
-    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_02.brp \
-    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_03.brp \
-    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_04.brp \
-    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_05.brp \
-    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_06.brp \
-    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_07.brp \
-    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_08.brp
+    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_01.brp \
+    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_02.brp \
+    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_03.brp \
+    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_04.brp \
+    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_05.brp \
+    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_06.brp \
+    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_07.brp \
+    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_08.brp
 ```
 
 Characterization refuses altered settings or fingerprint inputs. Registered
@@ -266,7 +271,7 @@ The benchmark driver's phase-local feedback loop is:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 \
-  python3 -m unittest blorp/test/test/test_session_benchmark.py
+  python3 -m unittest blorp/test/test_test/test_session_benchmark.py
 ```
 
 ### Gate Time Profile

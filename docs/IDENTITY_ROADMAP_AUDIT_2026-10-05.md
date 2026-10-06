@@ -134,7 +134,7 @@ Lines 856–864 correctly require a generic-instantiation test before using only
 the callee definition ID. Their fallback `(def_id, lowered argument types)` is
 still insufficient: `list[T](capacity: Int) -> List[T]` can have identical value
 argument types and distinct instantiated return types. The existing
-[`compile_time_collection_builders.brp`](../blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_pass/compile_time_collection_builders.brp):7
+[`compile_time_collection_builders.brp`](../blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_pass/compile_time_collection_builders.brp):7
 demonstrates expected-return inference for `L.list(limit)`; a two-return-type
 memo regression has yet to be written.
 
@@ -251,8 +251,8 @@ PYTHONDONTWRITEBYTECODE=1 scripts/compiler-identity-census --json
 PYTHONDONTWRITEBYTECODE=1 scripts/check-magic-spellings --strict
 PYTHONDONTWRITEBYTECODE=1 scripts/check-magic-spellings --report
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v \
-  blorp/test/build/test_compiler_identity_census.py \
-  blorp/test/build/test_check_magic_spellings.py
+  blorp/test/test_build/test_compiler_identity_census.py \
+  blorp/test/test_build/test_check_magic_spellings.py
 ```
 
 Raw reports and logs are retained at

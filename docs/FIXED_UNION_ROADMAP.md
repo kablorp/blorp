@@ -217,7 +217,7 @@ the actual pin before P2 changes declarations.
 
 ```bash
 bin/blorp test --timeout 180 \
-  blorp/test/compiler_new/stage_01_discovery/parse/test_parser_fixtures.brp
+  blorp/test/test_compiler_new/test_stage_01_discovery/test_parse/test_parser_fixtures.brp
 scripts/test --serial compiler-new compiler-new-parity compiler-tools lsp
 scripts/blorp-compiler-bootstrap --print-id
 ```
@@ -551,7 +551,7 @@ A public source wrapper around a private Int builtin is currently rejected by
 [`decl.brp`](../blorp/src/compiler/stage_06_typecheck/decl.brp)'s
 `validate_resource_signature_boundary`: builtin bodies are exempt, but ordinary
 resource-containing returns are not. The existing
-[`tcp_resource_return_carrier.brp`](../blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/tcp_resource_return_carrier.brp)
+[`tcp_resource_return_carrier.brp`](../blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_fail/tcp_resource_return_carrier.brp)
 pins that rule; MemoryCounter's non-resource wrapper is not TCP precedent.
 
 DirectoryEntryKind is an inbound native pointee field, not a direct argument.
@@ -560,7 +560,7 @@ as `long` (tags 0–4); its destructor releases only the managed name. A managed
 kind requires an atomic pointee layout/destructor and single-entry Option,
 batch List, and stream ownership proof across
 [`fs.brp`](../standard_library/src/fs.brp), the native result bridges, and
-[`test_directory_resource.brp`](../blorp/test/runtime/sys/test_directory_resource.brp),
+[`test_directory_resource.brp`](../blorp/test/test_runtime/test_sys/test_directory_resource.brp),
 not just an argument encoder. Shared `ScalarTag` storage is a coherent
 alternative already allowed above, but remains a separately reviewed atomic
 prerequisite: one union model, shape-derived eligibility, explicit native
@@ -627,15 +627,15 @@ Fast feedback after a serialized FRESH build uses the owning suites:
 
 ```bash
 scripts/compiler-build-status
-bin/blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_accepted_union_authority.brp
-bin/blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_trait_resolve.brp
-bin/blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_hash_key_callbacks.brp
-bin/blorp test --timeout 180 blorp/test/compiler/stage_07_ctfe/test_ctfe_globals.brp
-bin/blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp
+bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_06_typecheck/test_accepted_union_authority.brp
+bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_trait_resolve.brp
+bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_hash_key_callbacks.brp
+bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_07_ctfe/test_ctfe_globals.brp
+bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_06_typecheck/test_typecheck_decl.brp
 scripts/compiler-check --changed --plan
 ```
 
-Put the new behavioral oracle under `blorp/test/runtime/`, with CTFE/Core unit
+Put the new behavioral oracle under `blorp/test/test_runtime/`, with CTFE/Core unit
 regressions under their listed owners and typechecking fixtures under
 `stage_06_typecheck/fixtures/typecheck/`; register new compiler tests in the
 ownership manifest. Run exact runtime/leak loops, inspect generated Core/C,
@@ -694,8 +694,8 @@ nominal union/constructor authority and exact active-payload ownership.
 
 ```bash
 bin/blorp test --timeout 180 \
-  blorp/test/compiler/stage_06_typecheck/test_accepted_union_authority.brp
-bin/blorp test --timeout 180 blorp/test/compiler/stage_07_ctfe/test_ctfe_globals.brp
+  blorp/test/test_compiler/test_stage_06_typecheck/test_accepted_union_authority.brp
+bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_07_ctfe/test_ctfe_globals.brp
 scripts/compiler-check --changed --plan
 ```
 
@@ -720,10 +720,10 @@ temporary ownership, and warnings. Run the stage-2 codegen audit, runtime/leak
 and relevant sanitizers; require stage-2/stage-3 C fixpoint for changed emission.
 
 ```bash
-bin/blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_match.brp
+bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_match.brp
 scripts/test --serial compiler-blorp compiler-new compiler-new-parity compiler-tools std-check
 scripts/test --serial runtime leak doctest cli-deep lsp package compiler-core-sanitize
-bash blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh bin/blorp --jobs 1
+bash blorp/test/test_compiler/test_pipeline/codegen_audit/run_codegen_audit.sh bin/blorp --jobs 1
 scripts/compiler-fixpoint
 ```
 
@@ -784,8 +784,8 @@ remain distinct. P4d extends admitted layouts through real storage/call/capture
 boundaries. Each is a bounded measured change.
 
 ```bash
-bin/blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_type_policy.brp
-bin/blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_match.brp
+bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_type_policy.brp
+bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_match.brp
 ```
 
 **Accept:** ordinary/fixed declarations share optimization machinery for payloads

@@ -28,7 +28,7 @@ own modules and `lib`, enforced transitively by `scripts/check-blorp-layout`.
 `tables/` imports no other stage folder; `sources/` and `lex/` depend on
 tables; `parse/` uses those boundaries. Rendering consumes tables and provider
 spelling support outside lexing/parsing. Tests mirror the owners under
-[`blorp/test/compiler_new/stage_01_discovery/`](../blorp/test/compiler_new/stage_01_discovery/).
+[`blorp/test/test_compiler_new/test_stage_01_discovery/`](../blorp/test/test_compiler_new/test_stage_01_discovery/).
 
 ## Identity and source authority
 
@@ -134,7 +134,7 @@ Checks cover the facts construction types do not state:
 
 The precise catalogue and negative tests live in
 [`tables/invariants/`](../blorp/src/compiler_new/stage_01_discovery/tables/invariants/)
-and [`test_invariants.brp`](../blorp/test/compiler_new/stage_01_discovery/tables/test_invariants.brp).
+and [`test_invariants.brp`](../blorp/test/test_compiler_new/test_stage_01_discovery/test_tables/test_invariants.brp).
 Accessors binary-search owner-sorted side tables. Some supposedly total reads
 still use `UNREACHABLE_*` fallback rows in release builds. Adapter reads must
 not let invented fallback values reach an AST.
@@ -249,7 +249,7 @@ working-directory spellings later passes use for builtin modules.
 Missing rows/malformed shapes are `LegacyAdapterError`s, never placeholders.
 Invariant/adapter defects are internal compiler errors; `GraphRejected`
 preserves the graph service's program diagnostic.
-[`discovery_adapter_differential.brp`](../blorp/test/compiler/tools/discovery_adapter_differential.brp)
+[`discovery_adapter_differential.brp`](../blorp/test/test_compiler/tools/discovery_adapter_differential.brp)
 compares full old-parser/adapted ASTs, spans included, over corpus/root projects.
 Generated C must be identical, allowing normalization only for ID-derived names.
 

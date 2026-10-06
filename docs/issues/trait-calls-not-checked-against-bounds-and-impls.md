@@ -43,10 +43,10 @@ not, including the `T:Stringable` condition on a generic implementation.
 
 ## Fixtures (7)
 
-Under `blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/`:
+Under `blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_fail/`:
 `traits_eq_no_bound`, `traits_to_float_no_bound`, `traits_to_int_no_bound`,
 `traits_to_string_no_bound`, `to_string_no_impl`. Under
-`blorp/test/compiler/stage_06_typecheck/infer_fixtures/infer/should_fail/`:
+`blorp/test/test_compiler/test_stage_06_typecheck/infer_fixtures/infer/should_fail/`:
 `option_nested_non_stringable`, `option_to_string_non_stringable`.
 
 ## Acceptance

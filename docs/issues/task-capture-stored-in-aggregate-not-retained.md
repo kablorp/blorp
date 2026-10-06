@@ -40,4 +40,4 @@ bodies have no such region, and `normalize_borrowed_child` leaves them as is.
 Give a task body the same treatment as a lambda body: derive its captures and
 normalize the body with them as owners. Add `detach`, `concurrent:` and
 `concurrently` parameter cases to
-`blorp/test/runtime/memory/test_borrowed_payload_concurrency_ownership.brp`.
+`blorp/test/test_runtime/test_memory/test_borrowed_payload_concurrency_ownership.brp`.

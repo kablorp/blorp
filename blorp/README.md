@@ -36,7 +36,7 @@ blorp/
 The source generator under `blorp/tool/` is compiled by the pinned Blorp
 bootstrap and is not a compiler stage. Production compiler tests and public
 parser, inference, typecheck, and codegen fixtures live under
-`blorp/test/compiler/`. Public format, purify, and lint fixtures live under
+`blorp/test/test_compiler/`. Public format, purify, and lint fixtures live under
 their corresponding owners in `blorp/test/`.
 
 ## Source Stages

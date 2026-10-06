@@ -40,7 +40,7 @@ type satisfy an enclosing rigid parameter.
 
 ## Fixtures (6)
 
-Under `blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/`:
+Under `blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_fail/`:
 `generic_local_annotation_rejects_concrete`,
 `generic_option_return_rejects_concrete_payload`,
 `generics_body_returns_list_wrong_type`, `generics_body_wrong_concrete_type`,

@@ -32,5 +32,5 @@ same arguments.
 An emit pin that a local bound and handed to a consuming call with no
 cancellation point in between has no cleanup frame, and the
 `consuming_clone_*` leak baselines in
-`blorp/test/runtime/memory/leak_check_baselines/` unchanged. Measure the
+`blorp/test/test_runtime/test_memory/leak_check_baselines/` unchanged. Measure the
 stage-2 self-compile at `-O0` and `-O2`.

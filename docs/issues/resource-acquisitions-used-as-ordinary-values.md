@@ -47,7 +47,7 @@ and expression statements), for `match` scrutinees, or for direct `?=`.
 
 ## Fixtures (14)
 
-Under `blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/`:
+Under `blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_fail/`:
 `file_resource_acquisition_annotated_local_binding`,
 `file_resource_acquisition_discard`,
 `file_resource_acquisition_function_local_binding`,
@@ -56,7 +56,7 @@ Under `blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/`:
 `file_resource_operation_function_local_binding`,
 `tcp_resource_match_acquisition_result`, `udp_resource_acquisition_discard`,
 `resource_source_discard_assignment`, `resource_source_discard_statement`.
-Under `blorp/test/compiler/stage_06_typecheck/infer_fixtures/infer/should_fail/`:
+Under `blorp/test/test_compiler/test_stage_06_typecheck/infer_fixtures/infer/should_fail/`:
 `file_resource_direct_question_bind`, `udp_resource_direct_question_bind`.
 
 ## Acceptance

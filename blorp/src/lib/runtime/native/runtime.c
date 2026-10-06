@@ -288,7 +288,7 @@ static pthread_mutex_t __process_spawn_mutex = PTHREAD_MUTEX_INITIALIZER;
 // blorp_calloc_checked/blorp_simd_alloc, which are
 // themselves instrumented), or be listed in the allowlist comment block
 // next to it explaining why the oracle does not observe it. See
-// blorp/test/runtime/test_runtime_alloc_oracle_coverage.py.
+// blorp/test/test_runtime/test_runtime_alloc_oracle_coverage.py.
 // The two memory gates, kept in ONE atomic word so an allocation or release
 // reads a consistent pair with a single relaxed load. Both bits are monotonic
 // (once on, they stay on).
@@ -9074,7 +9074,7 @@ static int blorp_float_fewest_round_trip_digits(double f, char* buf) {
 }
 
 /* The skip-ahead proof above assumes correctly rounded printf and strtod;
-   blorp/test/runtime/test_runtime_float_to_string.py checks each platform's
+   blorp/test/test_runtime/test_runtime_float_to_string.py checks each platform's
    libc against the one-precision-at-a-time search. */
 blorp_String* blorp_float_to_string(double f) {
     if (!isfinite(f)) {

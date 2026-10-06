@@ -88,9 +88,9 @@ spelling to the wrong table): +1.709 G instructions (5.212 G to 6.921 G,
 
 Pins that carry the cost, to tighten when the fixes land: the words, layout,
 comment, dimension-name and new-spelling pins in
-`blorp/test/compiler_new/stage_01_discovery/lex/test_lexer_allocations.brp`, and
+`blorp/test/test_compiler_new/test_stage_01_discovery/test_lex/test_lexer_allocations.brp`, and
 the repeated-interpolation parse pin (3 words per hole pair, +6,000) in
-`blorp/test/compiler_new/stage_01_discovery/tables/test_allocation_budget.brp`.
+`blorp/test/test_compiler_new/test_stage_01_discovery/test_tables/test_allocation_budget.brp`.
 
 ## What the compiler must do
 

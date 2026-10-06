@@ -28,7 +28,7 @@ non-Void result is discarded. `_ = expr` stays the explicit way to discard.
 
 ## Fixtures (2)
 
-Under `blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/`:
+Under `blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_fail/`:
 `discarded_pure_call`, `discarded_pure_call_in_statement_if`.
 
 ## Acceptance

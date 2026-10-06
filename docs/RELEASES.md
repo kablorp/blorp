@@ -150,10 +150,10 @@ bin/blorp check --no-format "$smoke"
 bin/blorp compile --no-format -o "$tmpc" "$smoke"
 bin/blorp run --timeout 5 --no-format "$smoke"
 bin/blorp test --warmup-only
-bin/blorp test --timeout 5 blorp/test/runtime/types/test_bool.brp
+bin/blorp test --timeout 5 blorp/test/test_runtime/test_types/test_bool.brp
 bin/blorp test --leak-check --suite --timeout 5 \
-  blorp/test/runtime/memory/leak_check_baselines/sleep_cancelled_string.brp
-bin/blorp test --sanitize --timeout 5 blorp/test/runtime/types/test_bool.brp
+  blorp/test/test_runtime/test_memory/leak_check_baselines/sleep_cancelled_string.brp
+bin/blorp test --sanitize --timeout 5 blorp/test/test_runtime/test_types/test_bool.brp
 bin/blorp lsp </dev/null >"$lsp_out"
 ```
 
@@ -161,11 +161,11 @@ The environment smoke also checks the timeout, standard-library, no-format,
 and sanitizer routes:
 
 ```bash
-env BLORP_TIMEOUT=5 bin/blorp test blorp/test/runtime/types/test_bool.brp
+env BLORP_TIMEOUT=5 bin/blorp test blorp/test/test_runtime/test_types/test_bool.brp
 env BLORP_STD=standard_library/src BLORP_NO_FORMAT=1 \
-  bin/blorp check blorp/test/runtime/types/test_bool.brp
+  bin/blorp check blorp/test/test_runtime/test_types/test_bool.brp
 env BLORP_SANITIZE=1 bin/blorp test --timeout 5 \
-  blorp/test/runtime/types/test_bool.brp
+  blorp/test/test_runtime/test_types/test_bool.brp
 ```
 
 The codegen audit owns the warning sweep because normal generated-C

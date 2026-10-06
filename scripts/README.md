@@ -12,7 +12,7 @@ For the shortest manifest-owned compiler feedback loop, use
 `scripts/compiler-check`:
 
 ```bash
-scripts/compiler-check blorp/test/compiler/pipeline/test_type_header_graph.brp
+scripts/compiler-check blorp/test/test_compiler/test_pipeline/test_type_header_graph.brp
 scripts/compiler-check --stage typecheck
 scripts/compiler-check --changed
 scripts/compiler-check --changed --base origin/main
@@ -22,7 +22,7 @@ scripts/compiler-check --validate-manifest
 
 An exact suite path runs only that registered suite. Stage and changed-source
 selection come from
-`blorp/test/compiler/compiler_test_ownership.json`; the command does not infer
+`blorp/test/test_compiler/compiler_test_ownership.json`; the command does not infer
 owners from names, imports, timings, or previous failures. `--changed` includes
 staged, unstaged, and untracked production compiler sources, while `--base`
 also includes committed changes from the merge base with the named ref.
@@ -34,7 +34,7 @@ plan that selects nothing is a no-op explanation, not a passing validation; use
 the task-specific build, docs, or release checks for those changes.
 
 Sources under `blorp/src/compiler_new` and suites under
-`blorp/test/compiler_new` (the discovery stage, which `bin/blorp` links through
+`blorp/test/test_compiler_new` (the discovery stage, which `bin/blorp` links through
 its adapter) are outside this manifest: `--changed` selects nothing for
 them and names their gate, `scripts/test compiler-new`.
 
@@ -81,8 +81,8 @@ excerpts and can save full logs with `--log-dir`.
 The default gate exercises the production-owned compiler implementation through
 `compiler-blorp`.
 The `compiler-new` gate runs the TestSuites registered in
-`blorp/test/compiler_new/compiler_new_test_ownership.json`, after checking that
-every `test_*.brp` under `blorp/test/compiler_new` is registered and that its
+`blorp/test/test_compiler_new/compiler_new_test_ownership.json`, after checking that
+every `test_*.brp` under `blorp/test/test_compiler_new` is registered and that its
 tools and support modules type check. It is a default gate, part of the
 premerge gate and of the compiler CI lane. The layout check keeps
 `compiler_new` sources importing only `compiler_new` and `lib`. The production
@@ -94,8 +94,8 @@ are explicit temporary consumers (`temporary_cross_owner_imports` in
 The `compiler-new-parity` gate (`scripts/compiler-new-parity`) holds the
 discovery stage to the existing front end across every tracked `.brp` file
 under `blorp/src`, `standard_library/src` and `blorp/test`: it compiles
-`blorp/test/compiler/tools/legacy_front_end_dump.brp` and
-`blorp/test/compiler_new/tools/corpus_dump.brp` once each, runs them
+`blorp/test/test_compiler/tools/legacy_front_end_dump.brp` and
+`blorp/test/test_compiler_new/tools/corpus_dump.brp` once each, runs them
 sequentially over the file list, and compares every token (kind, byte range,
 text; the old `#` plus name is one `DimensionNameToken`), the set of files with
 lexer diagnostics and each file's accept/reject verdict. A mismatch prints the
@@ -115,11 +115,18 @@ takes about 1-2 minutes (mostly the C compiler on the two dumpers), so it is not
 default gate; it is part of the premerge gate.
 The `compiler-blorp` gate also runs every fixture explicitly marked
 `RUN-BLORP-CHECK` through a small runner
-(`blorp/test/lib/run_blorp_check_fixtures.py`) after the TestSuites have run;
+(`blorp/test/test_lib/run_blorp_check_fixtures.py`) after the TestSuites have run;
 `scripts/test` pins the expected fixture count (`expected_blorp_check_fixture_count`)
 and passes it to the runner.
 Runtime sources owned by the leak gate are excluded from the normal runtime corpus.
 The remaining roots compile and run together in one runtime test invocation.
+Runtime discovery starts from explicit category roots, expanding directories
+that overlap leak ownership into named file inventories. This preserves the
+corpus under `blorp test`'s `test_*.brp` file selection and `test_*` child folder
+recursion. Repository test-bearing stage and category directories use the
+`test_` prefix; raw fixture and helper-only directories do not.
+Compiler gates supply manifest-owned suite files explicitly. The doctest gate
+uses `--doc` to scan ordinary standard-library sources recursively.
 `--no-build` is for controlled CI or local workflows that have already run the
 required build and need to preserve that exact toolchain through validation.
 Without it, `scripts/test` installs the current compiler before running gates.
@@ -160,7 +167,7 @@ interrupted run leaves nothing behind that could print a late verdict;
 stops the container too. `--help` prints no verdict, and neither does
 `premerge-gate --dry-run` (a verdict would claim a validation that did not
 run); a bad `scripts/test` flag prints FAIL.
-`blorp/test/build/test_gate_interrupt_verdicts.sh` covers this.
+`blorp/test/test_build/test_gate_interrupt_verdicts.sh` covers this.
 
 ## Validation Evidence Packets
 
@@ -266,7 +273,7 @@ cutting preview builds. It composes:
 - clean build at `-O2` (`BLORP_CLI_C_OPTIMIZATION=-O2`; use `--no-release-compiler` for `-O0`)
 - `make quality`
 - `scripts/test --serial --release-compiler compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp compiler-new compiler-new-parity`
-- the direct generated-C audit in `blorp/test/compiler/pipeline/codegen_audit/`
+- the direct generated-C audit in `blorp/test/test_compiler/test_pipeline/codegen_audit/`
 - preview CLI/runtime smoke
 - example checks and selected example runs
 - sanitizer tests
@@ -300,7 +307,7 @@ rewrites the working tree.
 scripts/docker-gate
 scripts/docker-gate --premerge-gate
 scripts/docker-gate --premerge-gate --all-platforms
-scripts/docker-gate --platform linux/arm64 -- blorp/test/runtime/numeric/test_float16_vector.brp
+scripts/docker-gate --platform linux/arm64 -- blorp/test/test_runtime/test_numeric/test_float16_vector.brp
 scripts/docker-gate --shell
 ```
 
@@ -437,16 +444,16 @@ the production CLI route:
 
 ```bash
 bin/blorp test --timeout 30 \
-  blorp/test/test/test_discovery.brp \
-  blorp/test/test/test_generated_test_harness.brp \
-  blorp/test/lib/test_source_graph_context.brp \
-  blorp/test/test/test_plan.brp
+  blorp/test/test_test/test_discovery.brp \
+  blorp/test/test_test/test_generated_test_harness.brp \
+  blorp/test/test_lib/test_source_graph_context.brp \
+  blorp/test/test_test/test_plan.brp
 bin/blorp check --no-format \
   blorp/src/test/effect.brp
-blorp/test/cli/test_rebuilt_cli.sh --timeout 90
+blorp/test/test_cli/test_rebuilt_cli.sh --timeout 90
 ```
 
-Run `bin/blorp test --timeout 30 blorp/test/runtime/sys/test_process_session.brp`
+Run `bin/blorp test --timeout 30 blorp/test/test_runtime/test_sys/test_process_session.brp`
 for the session API; CLI smoke separately covers inherited stdin, stdout, and
 stderr for blocking commands. Use `scripts/bench-blorp-test-session` for
 repeatable timing or RSS evidence; its process supervisor and registered
@@ -544,7 +551,7 @@ inventory from compiler stages 6, 8, 9, and 10:
 ```bash
 scripts/compiler-identity-census --json > /tmp/identity-census.json
 scripts/compiler-identity-census --check
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp.test.build.test_compiler_identity_census
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp.test.test_build.test_compiler_identity_census
 ```
 
 The checked-in JSON baseline caps each category, family, and directory. The
@@ -656,7 +663,7 @@ spelled in other files is reported with a hint to share one named definition.
 `--update` regenerates the allowlist (keeping `#` comments above entries that
 still exist) and `--strict` also fails on stale entries. The families and their
 replacements are in `benchmarks/results/magic_spelling_census_2026-09-28.md`;
-`blorp/test/build/test_check_magic_spellings.py` tests the identity rules.
+`blorp/test/test_build/test_check_magic_spellings.py` tests the identity rules.
 `make hygiene-check` runs it.
 
 `scripts/check-std-builtins` verifies that standalone standard-library function builtin

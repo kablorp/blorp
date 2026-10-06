@@ -11,9 +11,9 @@ still guard a real rule (index proofs, purity, exhaustiveness), so restoring a
 class puts those rules back under the gate.
 
 Fixtures live under
-`blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/`
+`blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_fail/`
 ("typecheck") and
-`blorp/test/compiler/stage_06_typecheck/infer_fixtures/infer/should_fail/`
+`blorp/test/test_compiler/test_stage_06_typecheck/infer_fixtures/infer/should_fail/`
 ("infer"). Each class gives one pinned/current pair.
 
 The 13 missing-module and nine empty-list inference fixtures were restored and
@@ -192,7 +192,7 @@ typecheck: `match_or_pattern_different_vars`, `loop_offset_negative`,
 
 - A module or type from another file is named by its working-directory-relative
   path (`'secret_helper' is private in module
-  'blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/helpers/visibility_mod'`,
+  'blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/helpers/visibility_mod'`,
   `` declared as `TokenB` but initializer has type
   `blorp/test/.../helpers/type_identity_a.Token` ``) instead of the import path
   the user wrote (`'../helpers/visibility_mod'`), so the message depends on

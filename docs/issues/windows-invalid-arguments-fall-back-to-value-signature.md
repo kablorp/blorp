@@ -40,7 +40,7 @@ returning `None`.
 
 ## Fixtures (3)
 
-Under `blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/`:
+Under `blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_fail/`:
 `windows_2d_tensor`, `windows_zero_size` (accepted), and `windows_non_literal`
 (rejected only for the incidental `checked_get` error).
 

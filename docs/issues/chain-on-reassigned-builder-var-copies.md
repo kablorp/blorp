@@ -22,7 +22,7 @@ out
 
 ## Evidence
 
-`blorp/test/compiler_new/tools/builder_rule_probe.brp`, allocations at 500 /
+`blorp/test/test_compiler_new/tools/builder_rule_probe.brp`, allocations at 500 /
 2,000 rows:
 
 | Shape | Allocations | Reads as |
@@ -50,4 +50,4 @@ keeps a reference. Treat a `var` that every incoming path owns uniquely as
 owned at the join, as the single-tail-call case already is.
 
 Tests: the shapes above as rows of
-`blorp/test/runtime/fixture/consume_owned_threading_shapes.brp`.
+`blorp/test/test_runtime/fixture/consume_owned_threading_shapes.brp`.

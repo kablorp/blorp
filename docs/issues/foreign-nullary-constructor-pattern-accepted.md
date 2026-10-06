@@ -40,7 +40,7 @@ against the scrutinee's type, instead of being accepted as some other pattern.
 
 ## Fixtures (2)
 
-Under `blorp/test/compiler/stage_06_typecheck/infer_fixtures/infer/should_fail/`:
+Under `blorp/test/test_compiler/test_stage_06_typecheck/infer_fixtures/infer/should_fail/`:
 `match_wrong_union_constructor`, `nullary_cross_type`.
 
 ## Acceptance

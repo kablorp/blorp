@@ -24,7 +24,7 @@ bookkeeping.
 Use `BLORP_PERCEUS_ENGINE_METRICS` counters in `perceus/work_counters.brp`
 (consumed by `stage_09_core/work_profile.brp`) to attribute the summary and
 binding-insertion walks, then exercise their owning cases in
-`blorp/test/compiler/stage_09_core/test_core_perceus.brp`. About 94% of pass
+`blorp/test/test_compiler/test_stage_09_core/test_core_perceus.brp`. About 94% of pass
 allocations were in the drop-insertion walk; public helper size is not evidence
 of dynamic reach. Attribution:
 [pass](../../benchmarks/results/perceus_allocation_attribution_2026-09-22.md),

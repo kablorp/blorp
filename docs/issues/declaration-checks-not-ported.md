@@ -69,12 +69,12 @@ String`, which `check` never reaches.
 
 ## Fixtures (9)
 
-Under `blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/`:
+Under `blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_fail/`:
 `builtin_outside_std`, `module_builtin_outside_std`, `duplicate_func_same_purity`,
 `generic_dim_param_lowercase`, `generic_type_param_lowercase`,
 `generic_type_param_underscore`, `import_alias_shadows_builtin_type`,
 `visibility_public_returns_private_type` (rejected only for the incidental
-mismatch). Under `blorp/test/compiler/stage_06_typecheck/infer_fixtures/infer/should_fail/`:
+mismatch). Under `blorp/test/test_compiler/test_stage_06_typecheck/infer_fixtures/infer/should_fail/`:
 `concurrent_timeout_type`.
 
 ## Acceptance

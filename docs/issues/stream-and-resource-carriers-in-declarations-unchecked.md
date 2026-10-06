@@ -56,7 +56,7 @@ yet` instead of rejecting a global stream.
 ## Fixtures
 
 Unmarked should_fail fixtures under
-`blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/` that
+`blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_fail/` that
 this gap leaves failing (47):
 
 - accepted outright (38): `fallible_stream_option_function_generic_record_type_alias`,
@@ -92,7 +92,7 @@ this gap leaves failing (47):
 
 ## Acceptance
 
-Each fixture above passes `blorp/test/lib/run_blorp_check_fixtures.py` with the
+Each fixture above passes `blorp/test/test_lib/run_blorp_check_fixtures.py` with the
 diagnostic it pins (or an updated, equally specific one with a help line) and
 carries `-- RUN-BLORP-CHECK`; `expected_blorp_check_fixture_count` in
 `scripts/test` is raised to match.

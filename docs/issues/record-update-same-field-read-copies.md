@@ -13,7 +13,7 @@ updating it in place. This is builder threading rule 6.
 
 ## Evidence
 
-- `blorp/test/compiler_new/tools/builder_rule_probe.brp`:
+- `blorp/test/test_compiler_new/tools/builder_rule_probe.brp`:
   `r6_p_scalar_then_list_same_field` allocates 1005 / 10005 at 1,000 / 10,000
   rows and `r6_p_other_field_list` 1014 / 10018. The workaround
   `r6_w_locals` (read the length into a local first) is flat.
@@ -45,5 +45,5 @@ a replaced slot in another replacement, as in the shapes above, still copy.
    rejecting reads after it.
 
 Tests: the probe shapes as rows of
-`blorp/test/runtime/fixture/consume_owned_threading_shapes.brp`, and
+`blorp/test/test_runtime/fixture/consume_owned_threading_shapes.brp`, and
 value-semantics cases where the read value is checked.

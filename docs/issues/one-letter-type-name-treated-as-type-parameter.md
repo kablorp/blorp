@@ -39,7 +39,7 @@ heuristics").
 
 ## Fixtures (2)
 
-`blorp/test/compiler/stage_06_typecheck/infer_fixtures/infer/should_fail/concrete_type_named_T.brp`
+`blorp/test/test_compiler/test_stage_06_typecheck/infer_fixtures/infer/should_fail/concrete_type_named_T.brp`
 and `concrete_type_named_T_forward.brp` in the same directory.
 
 ## Acceptance

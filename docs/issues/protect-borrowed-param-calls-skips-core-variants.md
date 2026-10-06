@@ -21,5 +21,5 @@ value there takes the owner's reference. This is the bug class that
 Replace the `_: expr` with explicit arms, as the aggregate walk now has: walk
 each form's children, let a binder hide the owner only in its body, and list the
 forms that cannot reach Perceus as leaves with a reason. Write a runtime case
-under `blorp/test/runtime/memory/` for each form a user program can build, such
+under `blorp/test/test_runtime/test_memory/` for each form a user program can build, such
 as a consuming call on a match payload inside a `select:` arm.

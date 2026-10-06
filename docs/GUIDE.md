@@ -3167,12 +3167,21 @@ tests: TestSuite = {
 Run with:
 
 ```bash
-bin/blorp test blorp/test/runtime/collections/test_list_fundamentals.brp    # Single file
-bin/blorp test blorp/test/runtime/                        # All in directory
-bin/blorp test --profile blorp/test/runtime/functions/    # With timing
-bin/blorp test --timeout 0 blorp/test/runtime/            # Disable test timeout
-bin/blorp test --repeat 50 blorp/test/runtime/concurrency/ # Stress-repeat tests
+bin/blorp test blorp/test/test_runtime/test_collections/test_list_fundamentals.brp    # Single file
+scripts/test runtime                                    # Repository runtime corpus
+bin/blorp test --profile blorp/test/test_runtime/test_functions/    # With timing
+bin/blorp test --timeout 0 blorp/test/test_runtime/test_types/      # Disable test timeout
+bin/blorp test --repeat 50 blorp/test/test_runtime/test_concurrency/ # Stress-repeat tests
 ```
+
+For directory arguments, `blorp test` selects `test_*.brp` files and recurses
+only into child folders whose names start with `test_`. The directory supplied
+on the command line may have any name. Selection happens before parsing, so
+raw fixture data is not treated as a test entrypoint. Explicit `.brp` file
+arguments bypass the naming rules. Selected modules and their imports are
+checked normally; an invalid selected test or imported helper still fails.
+By default, selected modules run both TestSuite tests and doctests. `--suite`
+uses the same naming rules and runs only TestSuite tests.
 
 `blorp test` defaults to a 30-second budget for each generated test artifact.
 Use `--timeout N` to change that artifact budget or `--timeout 0` to disable it.
@@ -3231,27 +3240,29 @@ bin/blorp test --doc standard_library/src/string.brp # Run doctests in one file
 bin/blorp test --doc standard_library/src/net/       # Run doctests in a directory
 ```
 
+`--doc` scans ordinary `.brp` sources recursively, without requiring `test_`
+file or folder names. It retains the source-scan exclusions for
+`test_compiler`, `should_pass`, and `should_fail` folders. Use it to include
+doctests in ordinary source modules that directory-based test discovery does
+not select by default.
+
 ### Test Organization
 
 ```
 tests/
-  test_blorp/           # Runtime tests (TestSuite-based)
-    types/            # Type-specific tests
-    functions/        # Function tests
-    core/             # Core functionality
-    memory/           # Memory leak detection
-    concurrency/      # Thread/channel tests
-  test_compiler/      # Compiler behavior tests
-    parser/           # Parser tests
-      should_pass/    # Files that should parse successfully
-      should_fail/    # Files that should fail to parse
-    infer/            # Type inference tests
-      should_pass/
-      should_fail/
-    typecheck/        # Type checking tests
-      should_pass/
-      should_fail/
+  test_unit/
+    test_math.brp     # TestSuite entrypoint
+    test_strings.brp  # TestSuite and module doctests
+  fixtures/
+    errors.brp        # Raw data read by a test; never selected recursively
+  helpers/
+    numbers.brp       # Ordinary module imported by test_math.brp
+  custom_checks.brp   # Run by an explicit file argument
 ```
+
+`blorp test tests` selects the two files in `test_unit`. To select the custom
+entrypoint, run `blorp test tests/custom_checks.brp`. Imports into `helpers`
+remain available without making helpers additional test entrypoints.
 
 ---
 

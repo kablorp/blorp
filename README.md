@@ -101,7 +101,7 @@ scripts/compiler-check --changed
 scripts/compiler-check --stage typecheck
 bin/blorp check path/to/file.brp
 bin/blorp run path/to/file.brp
-bin/blorp test blorp/test/runtime/types/test_bool.brp
+bin/blorp test blorp/test/test_runtime/test_types/test_bool.brp
 bin/blorp format --check path/to/file.brp
 bin/blorp lint path/to/file.brp
 ```

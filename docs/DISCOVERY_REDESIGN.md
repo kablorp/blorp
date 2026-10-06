@@ -2157,7 +2157,7 @@ rejected by that compiler: a record field of the opaque type failed with `Record
 'id': expected d.DId, got DId`. The probe pairs `d.brp`/`e.brp` and `m3.brp`
 failed; the same shapes without the cycle (`f.brp`, `g.brp`, `m4.brp`)
 passed. Commit `9172b35e0` fixed the identity mismatch. The retained regression
-is [`opaque_type_import_cycle.brp`](../blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_pass/opaque_type_import_cycle.brp),
+is [`opaque_type_import_cycle.brp`](../blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_pass/opaque_type_import_cycle.brp),
 with its `opaque_cycle_ids` and `opaque_cycle_syntax` helpers; it covers records,
 unions, aliases, globals and implementations across the cycle. It passed
 `bin/blorp check --no-format` on the M1 integration base `684f5e5`.
@@ -3046,7 +3046,7 @@ tree paths inside that stage; the old parser remains an independent parity
 oracle while its other users still need it. The proofs:
 
 - **The full-AST differential**
-  (`blorp/test/compiler/tools/discovery_adapter_differential.brp`, run by
+  (`blorp/test/test_compiler/tools/discovery_adapter_differential.brp`, run by
   `scripts/compiler-new-parity`).
   - It compares the old parser's parsed program with the stage's adapted
     program for every corpus module and the root runs, through

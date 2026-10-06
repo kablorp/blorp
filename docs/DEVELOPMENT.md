@@ -114,7 +114,7 @@ make
 scripts/compiler-build-status
 bin/blorp format --check --diff path/to/changed.brp
 bin/blorp check --no-format path/to/changed.brp
-bin/blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_match.brp
+bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_match.brp
 scripts/compiler-check --changed
 git diff --check
 ```
@@ -248,17 +248,17 @@ Put a test at the boundary whose behavior it proves:
 
 | Change | Test location |
 | --- | --- |
-| Compiler implementation, internal data structure, or pass | `blorp/test/compiler/` |
-| Public parser, inference, typechecker, and codegen contract | registered fixture directories under `blorp/test/compiler/` |
+| Compiler implementation, internal data structure, or pass | `blorp/test/test_compiler/` |
+| Public parser, inference, typechecker, and codegen contract | registered fixture directories under `blorp/test/test_compiler/` |
 | Format, purify, and lint CLI contract | the matching owner under `blorp/test/` |
-| Language or runtime behavior | `blorp/test/runtime/` |
+| Language or runtime behavior | `blorp/test/test_runtime/` |
 | Standard-library runtime behavior | `standard_library/test/` |
 | Standard-library example | doctest in `standard_library/src/` |
-| LSP process/protocol behavior | `blorp/test/lsp/` |
+| LSP process/protocol behavior | `blorp/test/test_lsp/` |
 | Package lifecycle | package fixtures and `scripts/test package` |
 
 New compiler implementation suites must be registered in
-`blorp/test/compiler/compiler_test_ownership.json`. Map each suite to the production
+`blorp/test/test_compiler/compiler_test_ownership.json`. Map each suite to the production
 source it covers so `scripts/compiler-check --changed` can select it. A suite
 without a focused production owner, such as a benchmark-fixture or broad
 integration suite, uses `"scope": "broad-only"` in its suite entry. The
@@ -267,7 +267,7 @@ listed under a production module. A directly changed registered suite is
 still selected by `--changed`, regardless of its scope.
 
 The parser/inference/typecheck compatibility corpus in the registered fixture
-directories under `blorp/test/compiler/` is mostly frozen. Follow
+directories under `blorp/test/test_compiler/` is mostly frozen. Follow
 the ownership rules above before adding public fixtures there.
 
 ## Focused Tests
@@ -275,15 +275,25 @@ the ownership rules above before adding public fixtures there.
 Run the smallest relevant TestSuite directly:
 
 ```bash
-bin/blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/type_system/test_env.brp
+bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_06_typecheck/test_type_system/test_env.brp
 bin/blorp test --doc standard_library/src/string.brp
 ```
+
+Directory test discovery selects `test_*.brp` files and enters only `test_*`
+child directories; the explicit root directory itself may have any name.
+An explicit file path supports custom names. Ordinary imported helpers remain
+part of compilation. `--doc` scans ordinary source directories recursively for
+doctests. Repository suites and their test-bearing ancestor folders follow
+this naming rule, so `bin/blorp test blorp/test` discovers their TestSuites
+without entering raw fixture folders. Prefer the curated `scripts/test`
+gates for full validation: they also run Python and shell checks and explicitly
+owned diagnostic and leak fixtures.
 
 Exercise instrumentation at the smallest relevant boundary:
 
 ```bash
-bin/blorp test --leak-check --timeout 180 blorp/test/compiler/stage_09_core/test_core_perceus.brp
-bin/blorp test --sanitize --timeout 180 blorp/test/compiler/stage_10_backend/test_core_emit.brp
+bin/blorp test --leak-check --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_perceus.brp
+bin/blorp test --sanitize --timeout 180 blorp/test/test_compiler/test_stage_10_backend/test_core_emit.brp
 ```
 
 On Darwin, use `--sanitize=undefined` when AddressSanitizer is incompatible
@@ -300,7 +310,7 @@ scripts/compiler-check --changed
 scripts/compiler-check --changed --base origin/main
 scripts/compiler-check --changed --plan
 scripts/compiler-check --stage typecheck
-scripts/compiler-check blorp/test/compiler/stage_06_typecheck/type_system/test_env.brp
+scripts/compiler-check blorp/test/test_compiler/test_stage_06_typecheck/test_type_system/test_env.brp
 scripts/compiler-check --validate-manifest
 ```
 
@@ -422,7 +432,7 @@ closure capture layout, and generated declarations rather than relying only on
 successful host-C compilation. The broad warning contract lives in:
 
 ```bash
-blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh bin/blorp
+blorp/test/test_compiler/test_pipeline/codegen_audit/run_codegen_audit.sh bin/blorp
 ```
 
 That audit detects the host compiler and applies the repository's accepted
@@ -692,7 +702,7 @@ Use the narrowest relevant instrumentation:
 bin/blorp run --leak-check --timeout 30 --no-format program.brp
 bin/blorp run --sanitize --timeout 30 --no-format program.brp
 bin/blorp run --sanitize=undefined --timeout 30 --no-format program.brp
-bin/blorp test --leak-check --timeout 180 blorp/test/compiler/stage_09_core/test_core_match.brp
+bin/blorp test --leak-check --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_match.brp
 scripts/test leak
 scripts/test compiler-core-sanitize
 scripts/test compiler-blorp-sanitize
@@ -764,7 +774,7 @@ host-C compilation rather than source typechecking.
 
 ### `scripts/compiler-check` Reports An Unowned Module
 
-Update `blorp/test/compiler/compiler_test_ownership.json` with the production source,
+Update `blorp/test/test_compiler/compiler_test_ownership.json` with the production source,
 its stage, and focused suite/check ownership. Then run:
 
 ```bash

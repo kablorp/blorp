@@ -31,7 +31,7 @@ trait methods of the aliased module without checking the trait's visibility.
 
 ## Fixtures (1)
 
-`blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/file_resource_manual_close_qualified_private.brp`
+`blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_fail/file_resource_manual_close_qualified_private.brp`
 
 ## Acceptance
 

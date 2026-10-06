@@ -1,0 +1,85 @@
+-- A managed local's reference moves to a new owner (a second name or a
+-- constructor) and the task is then cancelled while parked. Cancellation
+-- cleanup must release each reference exactly once: the moved-from local's
+-- cleanup slot gives the reference up where the new owner takes it.
+--
+-- This run checks that allocations and releases balance. The leak gate
+-- cannot see a double release, so the double-free half of these shapes is
+-- pinned by the `moved_reference` emit tests in
+-- blorp/test/test_compiler/test_stage_10_backend/test_core_emit.brp and by
+-- "timeout releases moved references once" in
+-- blorp/test/test_runtime/test_concurrency/test_cancellation.brp under ASan.
+import:
+	test: cancel_after_parked_for_test
+
+
+record Tables {
+	rows: List[Int],
+	other: List[Int]
+}
+
+
+union Holder:
+	Holding(Tables)
+	Empty
+
+
+pure func append_row(t: Tables, v: Int) -> Tables:
+	{ t | rows = t.rows.append(v) }
+
+
+pure func append_other(t: Tables, v: Int) -> Tables:
+	{ t | other = t.other.append(v) }
+
+
+pure func make_tables(seed: Int) -> Tables:
+	append_other(
+		{
+			rows = [seed],
+			other = []
+		},
+		seed,
+	)
+
+
+pure func holder_rows(holder: Holder) -> Int:
+	match holder:
+		Holding(inner):
+			inner.rows.length()
+		Empty:
+			0
+
+
+func alias_kept_then_sleep(seed: Int) -> Int:
+	made: Tables = make_tables(seed)
+	same: Tables = made
+	sleep(10000)
+	append_row(same, 1).rows.length() + made.rows.length()
+
+
+func constructor_kept_then_sleep(seed: Int) -> Int:
+	base: Tables = make_tables(seed)
+	held: Holder = Holding(base)
+	sleep(10000)
+	holder_rows(held) + base.rows.length()
+
+
+func sleep_then_holder_rows(holder: Holder) -> Int:
+	sleep(10000)
+	holder_rows(holder)
+
+
+func constructor_into_cancelled_call(seed: Int) -> Int:
+	base: Tables = make_tables(seed)
+	sleep_then_holder_rows(Holding(base))
+
+
+func main(args: List[String]) -> Int:
+	if (
+		cancel_after_parked_for_test(func(): alias_kept_then_sleep(1))
+		and cancel_after_parked_for_test(func(): constructor_kept_then_sleep(2))
+		and cancel_after_parked_for_test(func(): constructor_into_cancelled_call(3))
+	):
+		0
+	else:
+		1

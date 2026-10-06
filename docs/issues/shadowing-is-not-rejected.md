@@ -66,11 +66,11 @@ declares a local. Same-scope redeclaration with an annotation
 
 Unmarked should_fail fixtures that expect the rule:
 
-- `blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/`:
+- `blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_fail/`:
   `mutability_assign_to_builtin`, `mutability_assign_to_func`,
   `mutability_assign_to_import`, `mutability_assign_to_main`,
   `mutability_assign_to_trait_method`;
-- `blorp/test/compiler/stage_06_typecheck/infer_fixtures/infer/should_fail/`:
+- `blorp/test/test_compiler/test_stage_06_typecheck/infer_fixtures/infer/should_fail/`:
   `shadow_var_func`.
 
 Several current should_pass fixtures encode shadowing and will flip when the

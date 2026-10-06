@@ -37,7 +37,7 @@ generic call site in the dimension solver
 
 ## Fixtures (6)
 
-Under `blorp/test/compiler/stage_06_typecheck/infer_fixtures/infer/should_fail/`:
+Under `blorp/test/test_compiler/test_stage_06_typecheck/infer_fixtures/infer/should_fail/`:
 `dim_nested_negative`, `dim_sub_negative`, `dim_sub_negative_generic`,
 `dim_sub_zero`, `vardims_in_let_binding`, `vardims_in_var_decl`.
 

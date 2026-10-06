@@ -1182,7 +1182,7 @@ each behind a capability gate:
 - **Immutable inference facts outside returned state (probe).** Remove `facts` from the state
   returned by recursive inference and pass one facts value separately. The characterization
   test comes first: extend
-  `blorp/test/compiler/pipeline/test_infer_session_reconstruction_profile_benchmark.brp` with a
+  `blorp/test/test_compiler/test_pipeline/test_infer_session_reconstruction_profile_benchmark.brp` with a
   nested inference-shaped probe that returns only the accumulator, checks a facts-dependent
   checksum and exposes publication and allocation counts; inspect generated C around the probe
   and recursive call before touching `infer_expr`. Proceed only if the probe removes at least one

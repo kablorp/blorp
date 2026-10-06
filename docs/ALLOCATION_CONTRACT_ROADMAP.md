@@ -325,7 +325,7 @@ Completed report milestones 0, 2 and 3 are represented by the status table above
 the canonical [contracts](../blorp/src/compiler/stage_09_core/allocation_contracts.brp),
 [analysis](../blorp/src/compiler/stage_09_core/allocation_analysis.brp), and
 [report](../blorp/src/compiler/stage_09_core/allocation_report.brp) owners and their
-[`test_core_allocation_*` suites](../blorp/test/compiler/stage_09_core/test_core_allocation_contracts.brp).
+[`test_core_allocation_*` suites](../blorp/test/test_compiler/test_stage_09_core/test_core_allocation_contracts.brp).
 Their invariants remain requirements: explicit coverage for every Core variant,
 separate `may_allocate` and `unknown` facts, deterministic artifact-local ids,
 iterative SCC propagation (safe recursion can converge), bounded witnesses and
@@ -553,7 +553,7 @@ silently interpreted as zero events. Platform allocator interposition is an
 independent supplemental check, not the only portable test mechanism.
 
 Place the native oracle harness with runtime tests, following
-`blorp/test/runtime/test_runtime_allocator_stats.py` for a small C harness.
+`blorp/test/test_runtime/test_runtime_allocator_stats.py` for a small C harness.
 Its direct Python invocation is the fast loop; explicitly wire the new
 harness into `scripts/test runtime` and its ownership checks. The existing
 allocator-stats Python test is wired through quality, so merely placing a

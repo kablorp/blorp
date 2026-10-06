@@ -70,7 +70,7 @@ Compiler source is organized by dependency direction:
 | `stage_09_core` | Core model, transformations, representation, ownership, reuse, and invariants |
 | `stage_10_backend` | Backend-ready Core projection and C artifact emission |
 | `blorp/src/format` | Source-format command and rendering engine; temporarily consumes the parser recovery AST through an explicit migration edge |
-| `blorp/src/test` | Production implementation of the `blorp test` command; its mirrored tests live in `blorp/test/test` |
+| `blorp/src/test` | Production implementation of the `blorp test` command; its mirrored tests live in `blorp/test/test_test` |
 | `blorp/src/lsp` | Native LSP protocol, workspace actor, analysis, capabilities, diagnostics, and stdio process |
 
 The public executable entry point is `blorp/src/main.brp`; it dispatches the
@@ -597,7 +597,7 @@ scripts/test lsp
 scripts/test package
 ```
 
-`blorp/test/compiler/compiler_test_ownership.json` assigns every production
+`blorp/test/test_compiler/compiler_test_ownership.json` assigns every production
 compiler module to focused suites and integration checks. `make quality`
 rejects unowned modules or nonexistent ownership entries.
 

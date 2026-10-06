@@ -20,7 +20,7 @@ holder.held.append_node(row_at(holder.tag))
 
 ## Evidence
 
-`blorp/test/compiler_new/tools/builder_rule_probe.brp`, allocations at 500 /
+`blorp/test/test_compiler_new/tools/builder_rule_probe.brp`, allocations at 500 /
 2,000 rows: `r7_p_closure_dead` 1505 / 6005 and `r7_p_stored_in_record` 1505 /
 6005. A builder bound to a second name that is dead after one use
 (`r7_p_alias_dead`) and an alias followed by an update
@@ -33,4 +33,4 @@ borrow, instead of the owner; a record built from a consumed value could take
 it by move when the value's last use is the construction.
 
 Tests: the probe shapes as rows of
-`blorp/test/runtime/fixture/consume_owned_threading_shapes.brp`.
+`blorp/test/test_runtime/fixture/consume_owned_threading_shapes.brp`.

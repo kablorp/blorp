@@ -37,7 +37,7 @@ tuples and lists in one place and also report unreachable arms
 
 ## Fixtures (3)
 
-Under `blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/`:
+Under `blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_fail/`:
 `match_nested_union_non_exhaustive`, `nested_pattern_non_exhaustive`,
 `tuple_non_exhaustive`.
 

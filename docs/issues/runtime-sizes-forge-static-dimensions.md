@@ -31,7 +31,7 @@ expected type may only check it, never supply it.
 
 ## Fixtures (3)
 
-Under `blorp/test/compiler/stage_06_typecheck/infer_fixtures/infer/should_fail/`:
+Under `blorp/test/test_compiler/test_stage_06_typecheck/infer_fixtures/infer/should_fail/`:
 `matrix_expected_type_does_not_forge_runtime_sizes`,
 `vector_expected_type_does_not_forge_runtime_size`, `vector_runtime_size`.
 

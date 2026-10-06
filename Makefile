@@ -68,31 +68,31 @@ BLORP_BUILD_TOOLS_DIR := blorp/build/_build/build-tools
 BLORP_BUILD_SOURCE_GENERATOR_SOURCE := blorp/tool/generate_build_sources.brp
 BLORP_BUILD_SOURCE_GENERATOR_C := $(BLORP_BUILD_TOOLS_DIR)/generate_build_sources.c
 BLORP_BUILD_SOURCE_GENERATOR := $(BLORP_BUILD_TOOLS_DIR)/generate-build-sources
-RUNTIME_TEST_ROOTS := $(wildcard blorp/test/runtime $(STANDARD_LIBRARY_TEST_ROOT) pkg/test)
+RUNTIME_TEST_ROOTS := $(wildcard blorp/test/test_runtime $(STANDARD_LIBRARY_TEST_ROOT) pkg/test)
 SECURITY_RUNTIME_TESTS := \
-	blorp/test/runtime/sys/test_process.brp \
-	blorp/test/runtime/sys/test_file_io.brp \
-	blorp/test/runtime/sys/test_system_fs.brp \
-	blorp/test/runtime/sys/test_system_interface.brp \
-	blorp/test/runtime/sys/test_env.brp \
-	blorp/test/runtime/sys/test_time.brp \
-	blorp/test/runtime/sys/test_runtime_safety.brp \
-	blorp/test/runtime/sys/test_streaming_io.brp \
-	blorp/test/runtime/sys/test_for_each_line.brp \
-	blorp/test/runtime/text/test_regex.brp \
-	blorp/test/runtime/text/test_string_capacity.brp \
-	blorp/test/runtime/text/test_bytes.brp \
-	blorp/test/runtime/numeric/test_crypto_random.brp \
-	blorp/test/runtime/memory/test_builtin_borrowed_arg_ownership.brp \
-	$(STANDARD_LIBRARY_TEST_ROOT)/stream/test_stream.brp
+	blorp/test/test_runtime/test_sys/test_process.brp \
+	blorp/test/test_runtime/test_sys/test_file_io.brp \
+	blorp/test/test_runtime/test_sys/test_system_fs.brp \
+	blorp/test/test_runtime/test_sys/test_system_interface.brp \
+	blorp/test/test_runtime/test_sys/test_env.brp \
+	blorp/test/test_runtime/test_sys/test_time.brp \
+	blorp/test/test_runtime/test_sys/test_runtime_safety.brp \
+	blorp/test/test_runtime/test_sys/test_streaming_io.brp \
+	blorp/test/test_runtime/test_sys/test_for_each_line.brp \
+	blorp/test/test_runtime/test_text/test_regex.brp \
+	blorp/test/test_runtime/test_text/test_string_capacity.brp \
+	blorp/test/test_runtime/test_text/test_bytes.brp \
+	blorp/test/test_runtime/test_numeric/test_crypto_random.brp \
+	blorp/test/test_runtime/test_memory/test_builtin_borrowed_arg_ownership.brp \
+	$(STANDARD_LIBRARY_TEST_ROOT)/test_stream/test_stream.brp
 SECURITY_LEAK_TESTS := \
-	blorp/test/runtime/sys/test_process.brp \
-	blorp/test/runtime/sys/test_file_io.brp \
-	blorp/test/runtime/sys/test_streaming_io.brp \
-	blorp/test/runtime/sys/test_for_each_line.brp \
-	blorp/test/runtime/text/test_regex.brp \
-	blorp/test/runtime/sys/test_runtime_safety.brp \
-	blorp/test/runtime/memory/test_builtin_borrowed_arg_ownership.brp
+	blorp/test/test_runtime/test_sys/test_process.brp \
+	blorp/test/test_runtime/test_sys/test_file_io.brp \
+	blorp/test/test_runtime/test_sys/test_streaming_io.brp \
+	blorp/test/test_runtime/test_sys/test_for_each_line.brp \
+	blorp/test/test_runtime/test_text/test_regex.brp \
+	blorp/test/test_runtime/test_sys/test_runtime_safety.brp \
+	blorp/test/test_runtime/test_memory/test_builtin_borrowed_arg_ownership.brp
 
 # Default target: build and install blorp under bin/.
 all: install
@@ -483,7 +483,7 @@ test:
 
 # Run runtime tests only (language features + standard library)
 runtime-test: all
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_cooperative_checkpoint_contract.py
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_cooperative_checkpoint_contract.py
 	$(BLORP_INSTALLED_BIN) test $(RUNTIME_TEST_ROOTS)
 
 # Fast local validation path for compiler work
@@ -528,55 +528,55 @@ artifact-scan:
 # The suites that test the benchmark tooling are `benchmark-tooling-check`.
 tooling-check: build-blorp-cli
 	@scripts/check-c-symbol-projection-self-compile
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/fixture_support/test_check_fixtures.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/tool/test_tool_fixture_runner.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_fixture_support/test_check_fixtures.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_tool/test_tool_fixture_runner.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest $(STANDARD_LIBRARY_TEST_ROOT)/test_check_std_builtins.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/architecture/test_compiler_antipattern_audit.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/architecture/test_dead_code_audit.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/build/test_compiler_check.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_compiler_check_plan.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_allocator_stats.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_float_to_string.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_memory_diagnostics.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_type_registry.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_release_path.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_direct_allocation.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_unicode_case_map.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_profile_dense_ids.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_cancellation_registry_completeness.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_blorp_cli_embedded_manifest.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_blorp_source_layout.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_compiler_build_status.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_compiler_new_parity.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_with_build_lock.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/cli/test_memory_compiler_setup.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_record_validation.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_architecture/test_compiler_antipattern_audit.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_architecture/test_dead_code_audit.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_build/test_compiler_check.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_compiler_check_plan.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_allocator_stats.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_float_to_string.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_memory_diagnostics.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_type_registry.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_release_path.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_direct_allocation.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_unicode_case_map.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_profile_dense_ids.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_cancellation_registry_completeness.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_blorp_cli_embedded_manifest.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_blorp_source_layout.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_compiler_build_status.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_compiler_new_parity.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_with_build_lock.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_cli/test_memory_compiler_setup.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_record_validation.py
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_match_allocations
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_nested_match_allocations
-	@blorp/test/build/test_build_configuration.sh
-	@blorp/test/build/test_build_source_generator.sh
-	@blorp/test/build/test_release_toolchain.sh
-	@blorp/test/build/test_gate_interrupt_verdicts.sh
-	@blorp/test/build/test_scripts_test_harness.sh
-	@blorp/test/build/test_split_translation_units.sh
+	@blorp/test/test_build/test_build_configuration.sh
+	@blorp/test/test_build/test_build_source_generator.sh
+	@blorp/test/test_build/test_release_toolchain.sh
+	@blorp/test/test_build/test_gate_interrupt_verdicts.sh
+	@blorp/test/test_build/test_scripts_test_harness.sh
+	@blorp/test/test_build/test_split_translation_units.sh
 
 # The benchmark-worker checks and the suites that test benchmark and
 # measurement tooling (benchmarks/, blorp/benchmark/, scripts/bench-*). They
 # protect the scripts used to judge performance changes, not the compiler.
 # `quality`, and so CI and the premerge gate, run them.
 benchmark-tooling-check: build-blorp-cli
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_bench_runner.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_benchmark/test_bench_runner.py
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_typecheck_worker.brp
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_backend_worker.brp
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_backend_memory.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_perceus_memory.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test/test_session_benchmark.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_worker.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_typecheck_memory.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_replay.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_identity_work_counters.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_memory_diagnostics_harness.py
-	@blorp/test/compiler/benchmark/test_record_layout.sh
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_benchmark/test_backend_memory.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_benchmark/test_perceus_memory.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_test/test_session_benchmark.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_stage_06_typecheck/test_support/test_worker.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_benchmark/test_typecheck_memory.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_stage_06_typecheck/test_support/test_replay.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_benchmark/test_identity_work_counters.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_memory_diagnostics_harness.py
+	@blorp/test/test_compiler/test_benchmark/test_record_layout.sh
 
 # `clang --analyze` exits 0 even when it reports findings. -analyzer-werror
 # makes every finding an error, and `set -e` fails the target at the first
@@ -603,7 +603,7 @@ c-static-analysis:
 		-o "$$tmp_plist" -x c "$(BLORP_LSP_NATIVE_RUNTIME_C)"
 
 security-check: all c-static-analysis
-	blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh $(BLORP_INSTALLED_BIN)
+	blorp/test/test_compiler/test_pipeline/codegen_audit/run_codegen_audit.sh $(BLORP_INSTALLED_BIN)
 	BLORP_COMPILER_TEST_TIMEOUT=360 scripts/test compiler-blorp
 	$(BLORP_INSTALLED_BIN) test --timeout 20 $(SECURITY_RUNTIME_TESTS)
 	$(BLORP_INSTALLED_BIN) test --leak-check --timeout 20 $(SECURITY_LEAK_TESTS)

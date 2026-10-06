@@ -33,7 +33,7 @@ coverage but never asks whether an arm adds any. The coverage matrix proposed in
 
 ## Fixtures (4)
 
-Under `blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/`:
+Under `blorp/test/test_compiler/test_stage_06_typecheck/fixtures/typecheck/should_fail/`:
 `duplicate_match_arm`, `duplicate_match_arm_after_or_pattern`,
 `unreachable_after_or_pattern_catchall`, `unreachable_after_wildcard`.
 

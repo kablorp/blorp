@@ -16,7 +16,7 @@ out
 
 ## Evidence
 
-- `blorp/test/compiler_new/tools/builder_rule_probe.brp`:
+- `blorp/test/test_compiler_new/tools/builder_rule_probe.brp`:
   `r1_p_cond_reads_builder` allocates 2006 / 20006 at 1,000 / 10,000 rows;
   `r1_p_cond_reads_out` (the condition reads `out`) is flat at 15 / 19.
 - `move_only_owner_alias` in

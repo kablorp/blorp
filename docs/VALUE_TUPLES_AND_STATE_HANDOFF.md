@@ -319,7 +319,7 @@ projections at Perceus ingress. After increment 4, under
 liveness and no read of a moved place. Existing once-only transfer/retain/
 drop and no-unretained-borrow rules remain in force. The targeted test
 matrix includes Core/emitter cases, the `PASS`/`FAIL` allocation oracle in
-`blorp/test/runtime/test_alloc_oracle_blorp_level.sh` over its
+`blorp/test/test_runtime/test_alloc_oracle_blorp_level.sh` over its
 `consume_owned_threading_shapes.brp` and
 `consume_owned_nested_field_shapes.brp` fixtures, and two-size instruction
 oracles in [`benchmarks/ownership_shapes/`](../benchmarks/ownership_shapes/README.md),
@@ -335,13 +335,13 @@ owning test or benchmark README, then these broader gates for each code
 increment (with stage-specific additions above):
 
 ```bash
-bash blorp/test/runtime/test_alloc_oracle_blorp_level.sh
+bash blorp/test/test_runtime/test_alloc_oracle_blorp_level.sh
 scripts/compiler-check --changed
 scripts/test compiler-blorp
 scripts/test compiler-core-sanitize
 scripts/test leak
 scripts/test runtime
-bash blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh bin/blorp
+bash blorp/test/test_compiler/test_pipeline/codegen_audit/run_codegen_audit.sh bin/blorp
 make hygiene-check
 BLORP_CLI_C_OPTIMIZATION=-O2 scripts/compiler-fixpoint
 scripts/docker-gate --premerge-gate --platform linux/arm64 -- --no-sanitize

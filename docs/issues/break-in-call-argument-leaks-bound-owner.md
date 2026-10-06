@@ -23,8 +23,8 @@ for i in 0..count:
 - `bin/blorp run --leak-check` on this shape reports 6 leaked objects
   (`Tables`, `List` and their buffers) on main at 5ef19a6ca and on
   `core/builder-handoff-gaps`; values are correct.
-- `blorp/test/runtime/functions/test_loop_temporary_leaving_early.brp` checks
+- `blorp/test/test_runtime/test_functions/test_loop_temporary_leaving_early.brp` checks
   the values of this shape outside the leak gate because of this leak; move
-  it to `blorp/test/runtime/memory/` once the leak is fixed.
+  it to `blorp/test/test_runtime/test_memory/` once the leak is fixed.
 - Suspected cause: Perceus balances the let's owner after the assignment, and
   the early exit inside the argument skips that release.
