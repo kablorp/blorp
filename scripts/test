@@ -412,6 +412,9 @@ process_is_running() {
 
 TERMINATION_GRACE_POLLS=10
 TERMINATION_POLL_SECONDS=0.1
+# Bash has only integer arithmetic, so budgets in whole seconds are counted in
+# polls; keep this equal to 1 / TERMINATION_POLL_SECONDS.
+TERMINATION_POLLS_PER_SECOND=10
 
 # Stop every gate still running under this script, in the foreground (serial
 # mode) or the background (parallel waves): TERM each process tree, give it a
@@ -669,20 +672,22 @@ parse_blorp_output() {
 
 # Run one already-built binary with a bounded wall-clock budget, without
 # depending on a `timeout`/`gtimeout` binary being installed (scripts/test has
-# no such dependency anywhere else). Polls at one-second resolution and
-# escalates through the same TERM-then-KILL process-tree teardown the
+# no such dependency anywhere else). Polls every TERMINATION_POLL_SECONDS, so a
+# case that finishes at once costs a tenth of a second rather than a whole one,
+# and escalates through the same TERM-then-KILL process-tree teardown the
 # parallel-gate interrupt handler uses.
 run_with_timeout_seconds() {
     local timeout_seconds="$1"
     local outfile="$2"
     shift 2
-    local pid waited=0
+    local pid waited_polls=0
+    local timeout_polls=$((timeout_seconds * TERMINATION_POLLS_PER_SECOND))
 
     ("$@" >"$outfile" 2>&1) &
     pid=$!
 
     while kill -0 "$pid" 2>/dev/null; do
-        if [ "$waited" -ge "$timeout_seconds" ]; then
+        if [ "$waited_polls" -ge "$timeout_polls" ]; then
             terminate_process_tree "$pid" TERM
             sleep 1
             terminate_process_tree "$pid" KILL
@@ -690,8 +695,8 @@ run_with_timeout_seconds() {
             printf '\nblorp: leak isolated case timed out after %ss\n' "$timeout_seconds" >> "$outfile"
             return 124
         fi
-        sleep 1
-        waited=$((waited + 1))
+        sleep "$TERMINATION_POLL_SECONDS"
+        waited_polls=$((waited_polls + 1))
     done
 
     wait "$pid"

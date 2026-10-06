@@ -556,8 +556,7 @@ tooling-check: build-blorp-cli
 	@blorp/test/test_build/test_build_configuration.sh
 	@blorp/test/test_build/test_build_source_generator.sh
 	@blorp/test/test_build/test_release_toolchain.sh
-	@blorp/test/test_build/test_gate_interrupt_verdicts.sh
-	@blorp/test/test_build/test_scripts_test_harness.sh
+	@blorp/test/test_build/test_gate_verdicts.sh
 	@blorp/test/test_build/test_split_translation_units.sh
 
 # The benchmark-worker checks and the suites that test benchmark and

@@ -167,7 +167,7 @@ interrupted run leaves nothing behind that could print a late verdict;
 stops the container too. `--help` prints no verdict, and neither does
 `premerge-gate --dry-run` (a verdict would claim a validation that did not
 run); a bad `scripts/test` flag prints FAIL.
-`blorp/test/test_build/test_gate_interrupt_verdicts.sh` covers this.
+`blorp/test/test_build/test_gate_verdicts.sh` covers `scripts/test`.
 
 ## Validation Evidence Packets
 
