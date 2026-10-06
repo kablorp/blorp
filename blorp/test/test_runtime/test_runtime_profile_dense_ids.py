@@ -16,9 +16,65 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 RUNTIME_NATIVE = ROOT / "blorp" / "src" / "lib" / "runtime" / "native"
+EXACT_TIMING_CASES_SOURCE = Path(__file__).with_name("profile_exact_timing_cases.c")
 
 
 class RuntimeDenseProfileIdTests(unittest.TestCase):
+    @classmethod
+    def build_exact_timing_cases(cls) -> Path:
+        """Compile the shared exact-timing C cases once, under ASan and UBSan.
+
+        The cases read runtime statics, so they include runtime.c; building
+        them as one program pays for that sanitizer compile once instead of
+        once per case. See profile_exact_timing_cases.c.
+        """
+        temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(temp.cleanup)
+        executable = Path(temp.name) / "profile-exact-timing-cases"
+        compiled = subprocess.run(
+            [
+                os.environ.get("CC", "cc"),
+                "-O1",
+                "-g",
+                "-fsanitize=address,undefined",
+                "-fno-omit-frame-pointer",
+                "-w",
+                f"-I{RUNTIME_NATIVE}",
+                str(EXACT_TIMING_CASES_SOURCE),
+                "-lm",
+                "-lpthread",
+                "-o",
+                str(executable),
+            ],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if compiled.returncode != 0:
+            raise AssertionError(compiled.stderr)
+        return executable
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.exact_timing_cases = cls.build_exact_timing_cases()
+
+    def run_case(
+        self, case: str, detect_leaks: str
+    ) -> "subprocess.CompletedProcess[str]":
+        """Run one named case of the shared exact-timing program."""
+        environment = dict(os.environ)
+        environment["ASAN_OPTIONS"] = f"detect_leaks={detect_leaks}:halt_on_error=1"
+        return subprocess.run(
+            [str(self.exact_timing_cases), case],
+            cwd=ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
     def test_exact_profile_accounts_cancelled_fiber_frames(self) -> None:
         program = textwrap.dedent(
             """\
@@ -469,319 +525,9 @@ class RuntimeDenseProfileIdTests(unittest.TestCase):
         self.assertNotIn("never_called", completed.stderr)
 
     def test_exact_profile_uses_fiber_execution_states_and_dynamic_stacks(self) -> None:
-        source = textwrap.dedent(
-            """\
-            #define BLORP_PROFILE_EXACT_TIMING 1
-            #define MINICORO_IMPL
-            #include "minicoro.h"
-            #include "runtime.c"
-
-            static const blorp_ProfileFunctionMetadata functions[] = {
-                {"parent", "brp_parent", NULL, 1, 0u},
-                {"child", "brp_child", NULL, 2, 0u},
-            };
-
-            static void unbalanced_fiber(mco_coro* coroutine) {
-                (void)coroutine;
-                blorp_profile_start_id(1);
-            }
-
-            int main(void) {
-                blorp_ProfileExecutionState failed_growth = {
-                    .depth = SIZE_MAX,
-                    .capacity = SIZE_MAX,
-                };
-                if (blorp_profile_execution_push(
-                        &failed_growth,
-                        (blorp_ProfileFrame){.id = 0, .epoch = 1})) return 2;
-                if (failed_growth.dropped_depth != 1) return 3;
-                if (atomic_load(&profile_stack_growth_failures) != 1) return 4;
-                failed_growth.depth = 0;
-                blorp_profile_execution_destroy(&failed_growth);
-
-                blorp_ProfileExecutionState clock_state = {0};
-                blorp_profile_execution_resume(&clock_state, 100);
-                if (blorp_profile_execution_active_now(&clock_state, 140) != 40) return 5;
-                blorp_profile_execution_suspend(&clock_state, 160);
-                blorp_profile_execution_resume(&clock_state, 1000);
-                if (blorp_profile_execution_active_now(&clock_state, 1030) != 90) return 6;
-                blorp_profile_execution_suspend(&clock_state, 1050);
-                if (clock_state.active_elapsed_ns != 110) return 7;
-
-                if (blorp_profile_enable(BLORP_PROFILE_MODE_EXACT, functions, 2, 2) != 0) return 8;
-
-                unsigned long arithmetic_epoch = atomic_load(&profile_epoch);
-                blorp_ProfileExecutionState arithmetic = {0};
-                if (!blorp_profile_execution_push(
-                        &arithmetic,
-                        (blorp_ProfileFrame){
-                            .id = 0,
-                            .start_active_ns = 10,
-                            .epoch = arithmetic_epoch,
-                        })) return 60;
-                if (!blorp_profile_execution_push(
-                        &arithmetic,
-                        (blorp_ProfileFrame){
-                            .id = 1,
-                            .start_active_ns = 20,
-                            .epoch = arithmetic_epoch,
-                        })) return 61;
-                blorp_ProfileFrame arithmetic_child = arithmetic.frames[1];
-                arithmetic.depth = 1;
-                blorp_profile_record_completed_frame(
-                    &arithmetic, 1, arithmetic_child, 50, false);
-                blorp_ProfileFrame arithmetic_parent = arithmetic.frames[0];
-                arithmetic.depth = 0;
-                blorp_profile_record_completed_frame(
-                    &arithmetic, 0, arithmetic_parent, 100, false);
-                if (atomic_load(&profile_entries[0].total_ns) != 90) return 62;
-                if (atomic_load(&profile_entries[0].self_ns) != 60) return 63;
-                if (atomic_load(&profile_entries[1].total_ns) != 30) return 64;
-                if (atomic_load(&profile_entries[1].self_ns) != 30) return 65;
-                if (atomic_load(&profile_calls_completed) != 2) return 66;
-                blorp_profile_execution_destroy(&arithmetic);
-                for (size_t index = 0; index < 2; index++) {
-                    atomic_store(&profile_entries[index].total_ns, 0);
-                    atomic_store(&profile_entries[index].self_ns, 0);
-                    atomic_store(&profile_entries[index].call_count, 0);
-                }
-                atomic_store(&profile_calls_completed, 0);
-
-                unsigned long cancellation_epoch = atomic_load(&profile_epoch);
-                blorp_ProfileExecutionState cancellation_state = {
-                    .epoch = cancellation_epoch,
-                };
-                if (!blorp_profile_execution_push(
-                        &cancellation_state,
-                        (blorp_ProfileFrame){
-                            .id = 0,
-                            .epoch = cancellation_epoch,
-                        })) return 42;
-                if (!blorp_profile_execution_push(
-                        &cancellation_state,
-                        (blorp_ProfileFrame){
-                            .id = 0,
-                            .epoch = BLORP_PROFILE_SUPPRESSED_EPOCH,
-                        })) return 43;
-                if (!blorp_profile_execution_push(
-                        &cancellation_state,
-                        (blorp_ProfileFrame){
-                            .id = 0,
-                            .epoch = cancellation_epoch,
-                        })) return 44;
-                cancellation_state.dropped_depth = 2;
-                profile_root_execution_state = &cancellation_state;
-                blorp_profile_abandon_current_to_depth(
-                    (blorp_ProfileExecutionDepth){.frame_depth = 1});
-                profile_root_execution_state = NULL;
-                if (cancellation_state.depth != 1) return 45;
-                if (cancellation_state.dropped_depth != 0) return 46;
-                if (atomic_load(&profile_cancellation_abandoned_frames) != 3)
-                    return 47;
-                if (atomic_load(&profile_abandoned_frames) != 3) return 48;
-                blorp_profile_execution_destroy(&cancellation_state);
-
-                blorp_profile_window_begin();
-
-                unsigned long crossing_epoch = atomic_load(&profile_epoch);
-                blorp_ProfileExecutionState crossing_state = {
-                    .epoch = crossing_epoch,
-                };
-                if (!blorp_profile_execution_push(
-                        &crossing_state,
-                        (blorp_ProfileFrame){
-                            .id = 0,
-                            .epoch = crossing_epoch,
-                        })) return 72;
-                blorp_ProfileExecutionDepth crossing_depth = {
-                    .frame_depth = crossing_state.depth,
-                };
-                if (!blorp_profile_execution_push(
-                        &crossing_state,
-                        (blorp_ProfileFrame){
-                            .id = 1,
-                            .epoch = crossing_epoch,
-                        })) return 73;
-                blorp_profile_window_end();
-                blorp_profile_window_begin();
-                profile_root_execution_state = &crossing_state;
-                blorp_profile_abandon_current_to_depth(crossing_depth);
-                profile_root_execution_state = NULL;
-                if (crossing_state.depth != 1) return 74;
-                if (atomic_load(&profile_window_abandoned_frames) != 2)
-                    return 75;
-                if (atomic_load(&profile_cancellation_abandoned_frames) != 0)
-                    return 76;
-                if (atomic_load(&profile_abandoned_frames) != 2) return 77;
-                blorp_profile_execution_destroy(&crossing_state);
-
-                blorp_profile_window_begin();
-
-                unsigned long debt_epoch = atomic_load(&profile_epoch);
-                blorp_ProfileExecutionState debt_state = {
-                    .depth = SIZE_MAX,
-                    .capacity = SIZE_MAX,
-                    .epoch = debt_epoch,
-                };
-                if (blorp_profile_execution_push(
-                        &debt_state,
-                        (blorp_ProfileFrame){.id = 0, .epoch = debt_epoch})) return 52;
-                debt_state.depth = 0;
-                debt_state.capacity = 0;
-                blorp_profile_window_end();
-                blorp_profile_window_begin();
-                unsigned long next_debt_epoch = atomic_load(&profile_epoch);
-                blorp_profile_execution_sync_epoch(&debt_state, next_debt_epoch);
-                if (debt_state.dropped_depth != 0) return 53;
-                if (debt_state.suppressed_dropped_depth != 1) return 54;
-                if (atomic_load(&profile_window_abandoned_frames) != 1) return 55;
-                if (debt_epoch == next_debt_epoch) return 56;
-                blorp_profile_execution_push(
-                    &debt_state,
-                    (blorp_ProfileFrame){.id = 0, .epoch = next_debt_epoch});
-                if (debt_state.dropped_depth != 1) return 57;
-                profile_root_execution_state = &debt_state;
-                blorp_profile_end_id(0);
-                blorp_profile_end_id(0);
-                profile_root_execution_state = NULL;
-                if (debt_state.dropped_depth != 0) return 58;
-                if (debt_state.suppressed_dropped_depth != 0) return 59;
-                blorp_profile_execution_destroy(&debt_state);
-
-                blorp_profile_window_begin();
-
-                blorp_profile_start_id(0);
-                blorp_profile_start_id(1);
-                blorp_profile_end_id(1);
-                blorp_profile_end_id(0);
-                if (atomic_load(&profile_entries[0].total_ns)
-                    < atomic_load(&profile_entries[1].total_ns)) return 49;
-                if (atomic_load(&profile_entries[0].self_ns)
-                    > atomic_load(&profile_entries[0].total_ns)) return 50;
-                if (atomic_load(&profile_entries[1].self_ns)
-                    > atomic_load(&profile_entries[1].total_ns)) return 51;
-
-                blorp_Fiber first = {0};
-                blorp_Fiber second = {0};
-                __blorp_current_fiber = &first;
-                blorp_profile_execution_resume(
-                    &first.profile_execution_state, blorp_profile_now_ns());
-                blorp_profile_start_id(0);
-                blorp_profile_execution_suspend(
-                    &first.profile_execution_state, blorp_profile_now_ns());
-
-                __blorp_current_fiber = &second;
-                blorp_profile_execution_resume(
-                    &second.profile_execution_state, blorp_profile_now_ns());
-                blorp_profile_start_id(1);
-                blorp_profile_end_id(1);
-                blorp_profile_execution_suspend(
-                    &second.profile_execution_state, blorp_profile_now_ns());
-
-                __blorp_current_fiber = &first;
-                blorp_profile_execution_resume(
-                    &first.profile_execution_state, blorp_profile_now_ns());
-                blorp_profile_end_id(0);
-                blorp_profile_execution_suspend(
-                    &first.profile_execution_state, blorp_profile_now_ns());
-                __blorp_current_fiber = NULL;
-
-                if (first.profile_execution_state.depth != 0) return 9;
-                if (second.profile_execution_state.depth != 0) return 10;
-                if (atomic_load(&profile_entries[0].call_count) != 2) return 11;
-                if (atomic_load(&profile_entries[1].call_count) != 2) return 12;
-                if (atomic_load(&profile_out_of_order_ends) != 0) return 13;
-                if (atomic_load(&profile_unmatched_ends) != 0) return 14;
-                if (atomic_load(&profile_entries[0].self_ns)
-                    > atomic_load(&profile_entries[0].total_ns)) return 15;
-                if (atomic_load(&profile_entries[1].self_ns)
-                    > atomic_load(&profile_entries[1].total_ns)) return 16;
-
-                for (size_t index = 0; index < 5000; index++) {
-                    blorp_profile_start_id(0);
-                }
-                if (profile_root_execution_state == NULL) return 17;
-                if (profile_root_execution_state->depth != 5000) return 18;
-                if (profile_root_execution_state->capacity < 5000) return 19;
-                for (size_t index = 0; index < 5000; index++) {
-                    blorp_profile_end_id(0);
-                }
-                if (atomic_load(&profile_stack_growth_failures) != 0) return 20;
-                if (atomic_load(&profile_max_stack_depth) != 5000) return 21;
-
-                blorp_Fiber* abandoned = blorp_fiber_create(unbalanced_fiber, NULL);
-                if (!abandoned) return 67;
-                __blorp_current_fiber = abandoned;
-                blorp_profile_fiber_resume(abandoned);
-                if (mco_resume(abandoned->coro) != MCO_SUCCESS) return 68;
-                blorp_profile_fiber_suspend(abandoned);
-                __blorp_current_fiber = NULL;
-                if (mco_status(abandoned->coro) != MCO_DEAD) return 69;
-                mco_destroy(abandoned->coro);
-                abandoned->coro = NULL;
-                blorp_fiber_object_recycle(abandoned);
-                if (abandoned->profile_execution_state.frames != NULL) return 70;
-                if (atomic_load(&profile_dead_or_shutdown_abandoned_frames) != 1)
-                    return 71;
-
-                atomic_store(&profile_entries[0].total_ns, 90000000);
-                atomic_store(&profile_entries[0].self_ns, 60000000);
-                atomic_store(&profile_entries[0].call_count, 1);
-                atomic_store(&profile_entries[1].total_ns, 30000000);
-                atomic_store(&profile_entries[1].self_ns, 30000000);
-                atomic_store(&profile_entries[1].call_count, 1);
-
-                blorp_profile_execution_destroy(&first.profile_execution_state);
-                blorp_profile_execution_destroy(&second.profile_execution_state);
-                blorp_profile_execution_destroy(&clock_state);
-                blorp_profile_window_end();
-                blorp_profile_report();
-                return 0;
-            }
-            """
-        )
-        with tempfile.TemporaryDirectory() as temp_name:
-            executable = Path(temp_name) / "fiber-profile-state"
-            compiled = subprocess.run(
-                [
-                    os.environ.get("CC", "cc"),
-                    "-O1",
-                    "-g",
-                    "-fsanitize=address,undefined",
-                    "-fno-omit-frame-pointer",
-                    "-w",
-                    f"-I{RUNTIME_NATIVE}",
-                    "-x",
-                    "c",
-                    "-",
-                    "-lm",
-                    "-lpthread",
-                    "-o",
-                    str(executable),
-                ],
-                cwd=ROOT,
-                input=source,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            self.assertEqual(compiled.returncode, 0, compiled.stderr)
-
-            environment = dict(os.environ)
-            detect_leaks = "0" if sys.platform == "darwin" else "1"
-            environment["ASAN_OPTIONS"] = (
-                f"detect_leaks={detect_leaks}:halt_on_error=1"
-            )
-            completed = subprocess.run(
-                [str(executable)],
-                cwd=ROOT,
-                env=environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
+        # Leak detection is unsupported by ASan on macOS.
+        detect_leaks = "0" if sys.platform == "darwin" else "1"
+        completed = self.run_case("fiber_execution_states", detect_leaks)
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("Inclusive (ms)", completed.stderr)
@@ -969,95 +715,7 @@ class RuntimeDenseProfileIdTests(unittest.TestCase):
         self.assertEqual(abandoned, terminated)
 
     def test_invalid_operations_are_sanitizer_clean_and_reported(self) -> None:
-        source = textwrap.dedent(
-            """\
-            #define BLORP_PROFILE_EXACT_TIMING 1
-            #define MINICORO_IMPL
-            #include "minicoro.h"
-            #include "runtime.c"
-
-            static const blorp_ProfileFunctionMetadata functions[] = {
-                {"duplicate", "brp_10", "fixture/first", 10, BLORP_PROFILE_METADATA_HAS_MODULE},
-                {"duplicate", "brp_11", "fixture/second", 11, BLORP_PROFILE_METADATA_HAS_MODULE},
-            };
-
-            int main(void) {
-                if (blorp_profile_enable(BLORP_PROFILE_MODE_EXACT, NULL, 1, 1) == 0) return 2;
-                if (blorp_profile_enable(BLORP_PROFILE_MODE_EXACT, functions, 2, 2) != 0) return 3;
-
-                blorp_profile_start_id(0);
-                blorp_profile_window_begin();
-                blorp_profile_start_id(1);
-                blorp_profile_end_id(1);
-                blorp_profile_end_id(0);
-
-                blorp_profile_start_id(0);
-                blorp_profile_start_id(0);
-                blorp_profile_end_id(0);
-                blorp_profile_end_id(0);
-                blorp_profile_start_id(1);
-                blorp_profile_end_id(1);
-                blorp_profile_start_id(0);
-                blorp_profile_start_id(1);
-                blorp_profile_end_id(0);
-                blorp_profile_end_id(1);
-
-                blorp_profile_start_id(2);
-                blorp_profile_end_id(2);
-                blorp_profile_end_id(0);
-
-                for (size_t index = 0; index < 5000; index++) {
-                    blorp_profile_start_id(0);
-                }
-                for (size_t index = 0; index < 5000; index++) {
-                    blorp_profile_end_id(0);
-                }
-
-                blorp_profile_window_end();
-                blorp_profile_report();
-                return 0;
-            }
-            """
-        )
-        with tempfile.TemporaryDirectory() as temp_name:
-            executable = Path(temp_name) / "dense-profile-ids"
-            compiled = subprocess.run(
-                [
-                    os.environ.get("CC", "cc"),
-                    "-O1",
-                    "-g",
-                    "-fsanitize=address,undefined",
-                    "-fno-omit-frame-pointer",
-                    "-w",
-                    f"-I{RUNTIME_NATIVE}",
-                    "-x",
-                    "c",
-                    "-",
-                    "-lm",
-                    "-lpthread",
-                    "-o",
-                    str(executable),
-                ],
-                cwd=ROOT,
-                input=source,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            self.assertEqual(compiled.returncode, 0, compiled.stderr)
-
-            environment = dict(os.environ)
-            environment["ASAN_OPTIONS"] = "detect_leaks=0:halt_on_error=1"
-            completed = subprocess.run(
-                [str(executable)],
-                cwd=ROOT,
-                env=environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
+        completed = self.run_case("invalid_operations", "0")
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("PROFILE_INITIALIZATION_FAILURE", completed.stderr)
@@ -1075,218 +733,12 @@ class RuntimeDenseProfileIdTests(unittest.TestCase):
         )
 
     def test_window_and_cleanup_wait_for_active_profile_operations(self) -> None:
-        source = textwrap.dedent(
-            """\
-            #define BLORP_PROFILE_EXACT_TIMING 1
-            #define MINICORO_IMPL
-            #include "minicoro.h"
-            #include "runtime.c"
-
-            static const blorp_ProfileFunctionMetadata functions[] = {
-                {"worker", "brp_worker", NULL, 1, 0u},
-            };
-            static atomic_int worker_started = 0;
-            static atomic_int frame_holder_started = 0;
-            static atomic_int frame_holder_release = 0;
-            static atomic_int window_completed = 0;
-            static atomic_int report_started = 0;
-            static atomic_int report_completed = 0;
-
-            static void* hold_frame_operation(void* unused) {
-                (void)unused;
-                if (!blorp_profile_frame_operation_enter()) return (void*)1;
-                atomic_store(&frame_holder_started, 1);
-                while (!atomic_load(&frame_holder_release)) sched_yield();
-                blorp_profile_frame_operation_leave();
-                return NULL;
-            }
-
-            static void* begin_profile_window(void* unused) {
-                (void)unused;
-                blorp_profile_window_begin();
-                atomic_store(&window_completed, 1);
-                return NULL;
-            }
-
-            static void* report_profile(void* unused) {
-                (void)unused;
-                atomic_store(&report_started, 1);
-                blorp_profile_report();
-                atomic_store(&report_completed, 1);
-                return NULL;
-            }
-
-            static void* profile_worker(void* unused) {
-                (void)unused;
-                atomic_fetch_add(&profile_active_update_operations, 1);
-                blorp_ProfileEntry* entry = &profile_entries[0];
-                atomic_store(&worker_started, 1);
-                struct timespec delay = {.tv_sec = 0, .tv_nsec = 50000000};
-                nanosleep(&delay, NULL);
-                atomic_fetch_add(&entry->call_count, 1);
-                atomic_fetch_sub(&profile_active_update_operations, 1);
-                return NULL;
-            }
-
-            int main(void) {
-                if (blorp_profile_enable(BLORP_PROFILE_MODE_EXACT, functions, 1, 1) != 0) return 2;
-                pthread_t frame_holder;
-                pthread_t window_worker;
-                if (pthread_create(
-                        &frame_holder, NULL, hold_frame_operation, NULL) != 0) return 6;
-                while (!atomic_load(&frame_holder_started)) sched_yield();
-                if (pthread_create(
-                        &window_worker, NULL, begin_profile_window, NULL) != 0) return 7;
-                while (atomic_load(&profile_frame_operations_enabled)) sched_yield();
-                if (atomic_load(&window_completed)) return 8;
-                atomic_store(&frame_holder_release, 1);
-                void* frame_result = NULL;
-                if (pthread_join(frame_holder, &frame_result) != 0) return 9;
-                if (frame_result != NULL) return 10;
-                if (pthread_join(window_worker, NULL) != 0) return 11;
-                if (!atomic_load(&window_completed)) return 12;
-
-                pthread_mutex_lock(&profile_window_mutex);
-                pthread_t report_worker;
-                if (pthread_create(
-                        &report_worker, NULL, report_profile, NULL) != 0) return 13;
-                while (!atomic_load(&report_started)) sched_yield();
-                struct timespec report_delay = {
-                    .tv_sec = 0,
-                    .tv_nsec = 50000000,
-                };
-                nanosleep(&report_delay, NULL);
-                if (atomic_load(&report_completed)) return 14;
-                pthread_mutex_unlock(&profile_window_mutex);
-                if (pthread_join(report_worker, NULL) != 0) return 15;
-                if (!atomic_load(&report_completed)) return 16;
-
-                pthread_t worker;
-                if (pthread_create(&worker, NULL, profile_worker, NULL) != 0) return 3;
-                while (!atomic_load(&worker_started)) sched_yield();
-                blorp_profile_cleanup();
-                if (pthread_join(worker, NULL) != 0) return 4;
-                if (profile_entries != NULL || atomic_load(&profiling_enabled)) return 5;
-                return 0;
-            }
-            """
-        )
-        with tempfile.TemporaryDirectory() as temp_name:
-            executable = Path(temp_name) / "dense-profile-cleanup"
-            compiled = subprocess.run(
-                [
-                    os.environ.get("CC", "cc"),
-                    "-O1",
-                    "-g",
-                    "-fsanitize=address,undefined",
-                    "-fno-omit-frame-pointer",
-                    "-w",
-                    f"-I{RUNTIME_NATIVE}",
-                    "-x",
-                    "c",
-                    "-",
-                    "-lm",
-                    "-lpthread",
-                    "-o",
-                    str(executable),
-                ],
-                cwd=ROOT,
-                input=source,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            self.assertEqual(compiled.returncode, 0, compiled.stderr)
-
-            environment = dict(os.environ)
-            environment["ASAN_OPTIONS"] = "detect_leaks=0:halt_on_error=1"
-            completed = subprocess.run(
-                [str(executable)],
-                cwd=ROOT,
-                env=environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
+        completed = self.run_case("window_and_cleanup_waits", "0")
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_start_between_windows_is_discarded_without_loss(self) -> None:
-        source = textwrap.dedent(
-            """\
-            #define BLORP_PROFILE_EXACT_TIMING 1
-            #define MINICORO_IMPL
-            #include "minicoro.h"
-            #include "runtime.c"
-
-            static const blorp_ProfileFunctionMetadata functions[] = {
-                {"crossing", "brp_crossing", NULL, 1, 0u},
-                {"measured", "brp_measured", NULL, 2, 0u},
-            };
-
-            int main(void) {
-                if (blorp_profile_enable(BLORP_PROFILE_MODE_EXACT, functions, 2, 2) != 0) return 2;
-                blorp_profile_window_begin();
-                blorp_profile_start_id(0);
-                if (profile_root_execution_state == NULL) return 3;
-                if (profile_root_execution_state->depth != 1) return 4;
-                blorp_profile_window_end();
-                blorp_profile_window_begin();
-                blorp_profile_start_id(1);
-                if (profile_root_execution_state->depth != 2) return 5;
-                if (profile_root_execution_state->frames[0].epoch != BLORP_PROFILE_SUPPRESSED_EPOCH) return 6;
-                blorp_profile_end_id(1);
-                blorp_profile_end_id(0);
-                blorp_profile_start_id(1);
-                blorp_profile_end_id(1);
-                blorp_profile_start_id(0);
-                blorp_profile_window_end();
-                blorp_profile_report();
-                return 0;
-            }
-            """
-        )
-        with tempfile.TemporaryDirectory() as temp_name:
-            executable = Path(temp_name) / "dense-profile-repeated-window"
-            compiled = subprocess.run(
-                [
-                    os.environ.get("CC", "cc"),
-                    "-O1",
-                    "-g",
-                    "-fsanitize=address,undefined",
-                    "-fno-omit-frame-pointer",
-                    "-w",
-                    f"-I{RUNTIME_NATIVE}",
-                    "-x",
-                    "c",
-                    "-",
-                    "-lm",
-                    "-lpthread",
-                    "-o",
-                    str(executable),
-                ],
-                cwd=ROOT,
-                input=source,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            self.assertEqual(compiled.returncode, 0, compiled.stderr)
-
-            environment = dict(os.environ)
-            environment["ASAN_OPTIONS"] = "detect_leaks=0:halt_on_error=1"
-            completed = subprocess.run(
-                [str(executable)],
-                cwd=ROOT,
-                env=environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
+        completed = self.run_case("start_between_windows", "0")
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertRegex(
