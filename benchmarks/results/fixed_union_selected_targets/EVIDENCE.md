@@ -310,9 +310,9 @@ binds those exact paths. This is source-pass worker cost, not stage2 whole
 compiler cost.
 
 Durable unchanged raw pairs: [cost-traits.json](cost-traits.json) SHA
-`c6f17898bf9a144d9e6d6d36131c557fe629c70a20cc77ee7e307d754b843cec`,
+`a99fd18571009540c1983fc7cdbfc0f440574de9abd3e0efdd576f341d447cc3`,
 [cost-mono.json](cost-mono.json) SHA
-`bdbff01efb67ddc8a70c6536c00d48b64f94026836fa1d3b0f4b8a724ce445a9`.
+`090012c5f4621fe231859a2972f95da49ecb563f51bc75c61d697f7518070a2a`.
 They retain seven alternating pairs, arguments, source status, fixture hashes,
 active-counter flags, actual order and every raw sample. Initial cost-traits.log
 rejected a missing `--checksum-field` before sampling; the flag-only correction
@@ -358,8 +358,8 @@ an integrated root and describe it as a base2ac comparison.
 
 ```bash
 packet=/tmp/blorp-selected-independent.FMUV8T
-baseline_root=/Users/keithphilpott/.codex/worktrees/43a9/blorp
-candidate_root=/Users/keithphilpott/.codex/worktrees/fixed-union-concrete-binder/blorp
+baseline_root=<worktree:43a9>
+candidate_root=<worktree:fixed-union-concrete-binder>
 common_host=/tmp/blorp-selected-target-baseline.16jYWy/baseline-blorp
 baseline_worker="$packet/cost-cache-baseline/selected-trait-pass/30a896e1f1c3a074aa9b0b33fcafb1aa24f392cdd6b4f6834bc84b864105d7ff/selected-trait-pass"
 candidate_worker="$packet/cost-cache-candidate/selected-trait-pass/7a205940f12a9a7308aa503b32c9cc0dcebf0e220ca65186c6a6e437a0f639a6/selected-trait-pass"
@@ -407,15 +407,15 @@ windows. Historical cwd and absolute input were the production-exact base2ac
 root above; `BLORP_STD` was unset. Actual command shape for each side:
 
 ```bash
-cd /Users/keithphilpott/.codex/worktrees/43a9/blorp
+cd <worktree:43a9>
 /usr/bin/time -l env -u BLORP_STD \
   /tmp/blorp-selected-target-baseline.16jYWy/baseline-blorp \
   compile --no-format -o /tmp/blorp-selected-independent.FMUV8T/self-1-baseline.c \
-  /Users/keithphilpott/.codex/worktrees/43a9/blorp/blorp/src/main.brp
+  <worktree:43a9>/blorp/src/main.brp
 ```
 
 Candidate actually invoked
-`/Users/keithphilpott/.codex/worktrees/fixed-union-concrete-binder/blorp/bin/blorp`
+`<worktree:fixed-union-concrete-binder>/bin/blorp`
 (SHA2e34 above), not the equal-byte retained temporary copy, with output
 `self-PAIR-candidate.c`; baseline output used `self-PAIR-baseline.c`.
 Pair numbers were 1–3. The exact invocation is retained in the independent

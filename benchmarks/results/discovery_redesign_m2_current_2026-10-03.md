@@ -18,7 +18,7 @@ storage probes](discovery_redesign_record_shapes_2026-10-03.md); the
   - `input-manifest.json`: 4195 files, manifest SHA-256
     `31e63e790c6f424d097d58f8a1cba9d16cb510a3e9020d821808a4972bfa85b3`.
 - Same absolute FRESH generator for both snapshots:
-  `/Users/keithphilpott/.codex/worktrees/9a08/blorp/bin/blorp`, SHA-256
+  `<worktree:9a08>/bin/blorp`, SHA-256
   `3e715bd46236b53dbeab871d5cee6995db842cac18f8a5c8ff5b04179af61080`. Its version is
   `02c0786a609f-dirty`, bootstrap `dev-8228a8fa12e3`, CLI `-O0`, runtime
   `-O2`, eight C translation units. Freshness and hash checked before and after.

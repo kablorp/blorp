@@ -8,7 +8,7 @@ integration and combined audit/fixpoint proof are recorded below; no main integr
 release or bootstrap publication is claimed.
 Base `41483b853db01e6021ed9d1fa245763387fece13`, branch
 `codex/fixed-union-default-facts`, worktree
-`/Users/keithphilpott/.codex/worktrees/fixed-union-explicit-eq/blorp`.
+`<worktree:fixed-union-explicit-eq>`.
 
 ## Isolated baseline evidence
 
@@ -195,7 +195,7 @@ mutation was made. Helper SHA256 after repair:
 
 Both retained414 baseline (`efa7ed37...`) and publication candidate (`8c745fb7...`)
 run the exact absolute ROOT owner path
-`/Users/keithphilpott/.codex/worktrees/43a9/blorp/blorp/test/compiler/stage_06_typecheck/test_frontend_declaration_catalog_profile_benchmark.brp`:
+`<worktree:43a9>/blorp/test/compiler/stage_06_typecheck/test_frontend_declaration_catalog_profile_benchmark.brp`:
 each **4/4 PASS**, exit0, no diagnostics (`root-import-prep-baseline.log`,
 `root-import-prep-candidate.log`). Both read the same ROOT subjects at HEAD
 `a1091fd135dc984a76881b1e6284a71ff5757e6d`; this is not a pristine414 subject

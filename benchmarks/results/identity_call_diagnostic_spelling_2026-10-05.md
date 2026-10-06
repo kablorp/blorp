@@ -24,7 +24,7 @@ This slice proves valid-id canonical precedence; it does not tighten that policy
 ## Provenance
 
 - Parent/source input: `ff4da4b31dc2f5e0e1b9425a2ac96c06f6399a63`.
-- Worktree: `/Users/keithphilpott/.codex/worktrees/identity-roadmap-vet/blorp`.
+- Worktree: `<worktree:identity-roadmap-vet>`.
 - Candidate build: `BLORP_CLI_C_OPTIMIZATION=-O2 make`, exit 0; status FRESH.
 - Toolchain: bootstrap `dev-c3040e79c7d8`; Apple clang 21.0.0
   (`clang-2100.3.34.2`); CLI/runtime `-O2`; normal runtime diagnostics disabled.

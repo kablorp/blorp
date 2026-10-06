@@ -18,7 +18,7 @@ future negative admission oracle or claim native/P2a closure.
 
 ## Provenance and raw evidence
 
-Worktree: `/Users/keithphilpott/.codex/worktrees/fixed-union-accepted-layout/blorp`.
+Worktree: `<worktree:fixed-union-accepted-layout>`.
 Artifact root: `/tmp/blorp-accepted-layout.cHwyXP/` (raw filenames below).
 Baseline is the retained ROOT stage-1 d390 compiler, SHA256
 `3c180d29e0d8e8d14f9acd24c118e8f04491f5ca25e05870e4bb1225a6845ea3`.

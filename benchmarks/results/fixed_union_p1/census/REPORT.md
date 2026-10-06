@@ -1,7 +1,7 @@
 # P0 migration census — review packet
 
 Read-only candidate audit against `133eaf73a63830522b659ab6a2da65f9f2963711`.
-Candidate: `/Users/keithphilpott/.codex/worktrees/fixed-union-frontend/blorp`.
+Candidate: `<worktree:fixed-union-frontend>`.
 No source conversion, compiled job, roadmap/packet edit, or commit performed.
 
 ## Reproduce and coverage

@@ -25,7 +25,7 @@ BLORP_CLI_C_OPTIMIZATION=-O2 benchmarks/self_compile_measure --stage2 \
 
 The retained raw JSON is
 [`fixed_layout_r0_baseline_399096040.json`](fixed_layout_r0_baseline_399096040.json)
-(file SHA-256 `fe0cfa7575b72d161f4a3c1b5b4250282d55ff012c82b551c6ba366f194edb78`).
+(file SHA-256 `159fd2fd6d884955d74880a9eaa9c40ebc672619d4bc5e9409024f02d2f7a9e7`).
 Stage-2 normal binary SHA-256:
 `cbd585b16bc26149541d446f32c3171dad59c25e1d7d7419de0749a34cc68614`;
 diagnostic binary SHA-256:
@@ -176,7 +176,7 @@ BLORP_CLI_C_OPTIMIZATION=-O2 python3 -B benchmarks/fixed_layout_r0_instrument.py
   --output /tmp/fixed-layout-r0-stage2-probe.c \
   --binary /tmp/fixed-layout-r0-stage2-probe
 
-frozen_input=/var/folders/m7/zszgqft538nfx_qr1kmc7dlc0000gn/T/blorp-perf-input/3990960409a0a7af4d59d11d638b87c2b7cc35e1
+frozen_input=$TMPDIR/blorp-perf-input/3990960409a0a7af4d59d11d638b87c2b7cc35e1
 /tmp/fixed-layout-r0-stage2-probe compile --no-format --no-embed-runtime \
   --time-phases --std-dir "$frozen_input/standard_library/src" \
   -o /tmp/fixed-layout-r0-stage2-probe-output.c \

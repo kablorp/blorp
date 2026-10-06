@@ -32,9 +32,9 @@ Raw Core/C: `/tmp/blorp-record-unify-20261003.DJvqm2/`.
 
 Baseline was clean `main` at
 `4d14444928c8c4a488f4a8ec461b810539a056e0` in
-`/Users/keithphilpott/CLionProjects/blorp`; candidate was dirty
+`<repo>`; candidate was dirty
 `codex/record-unification-pilot` at that same source base in
-`/Users/keithphilpott/.codex/worktrees/r2-ownership-questions/blorp`.
+`<worktree:r2-ownership-questions>`.
 Both used frozen input revision `4d14444928c8c4a488f4a8ec461b810539a056e0`,
 Apple clang 21, `cli=-O2 runtime=-O2`, eight translation units, and five
 serial instruction samples. From each respective checkout:
@@ -78,8 +78,8 @@ the candidate checkout, the control invocation was:
 
 ```bash
 env BLORP_CLI_C_OPTIMIZATION=-O2 benchmarks/self_compile_measure \
-  --compiler /Users/keithphilpott/CLionProjects/blorp/bin/blorp-stage2 \
-  --diagnostic-compiler /Users/keithphilpott/CLionProjects/blorp/bin/blorp-stage2-diagnostic \
+  --compiler <repo>/bin/blorp-stage2 \
+  --diagnostic-compiler <repo>/bin/blorp-stage2-diagnostic \
   --skip-build-check \
   --input-rev 4d14444928c8c4a488f4a8ec461b810539a056e0 \
   --label record-unification-baseline-aa-candidate-cwd --samples 2 \

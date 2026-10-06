@@ -9,7 +9,7 @@ not a performance improvement.
 
 ## Provenance
 
-- Worktree: `/Users/keithphilpott/.codex/worktrees/fixed-union-concrete-binder/blorp`.
+- Worktree: `<worktree:fixed-union-concrete-binder>`.
 - Base: `175a3821519ec6749f541933a72cf6fcb4e70590`; uncommitted production changes
   are confined to inference and accepted trait implementation authority.
 - Retained matching baseline:

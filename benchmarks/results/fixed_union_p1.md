@@ -9,9 +9,9 @@ Full P0 semantic/native closure and P2 ABI/capability-bootstrap gates remain ope
 ## Provenance
 
 - Baseline revision: `133eaf73a63830522b659ab6a2da65f9f2963711`.
-- Baseline compiler: `/Users/keithphilpott/.codex/worktrees/43a9/blorp/bin/blorp`;
+- Baseline compiler: `<worktree:43a9>/bin/blorp`;
   SHA-256 `29f646a02726705420cce82ac5d5c7282a50967667628fb4ec69c5f3097bba4c`.
-- Candidate: `/Users/keithphilpott/.codex/worktrees/fixed-union-frontend/blorp`;
+- Candidate: `<worktree:fixed-union-frontend>`;
   compiler `bin/blorp`, local dirty source revision, build status **FRESH**.
 - Candidate compiler SHA-256: `d107945c079c76cf57f8b12baa0d7b57295b615be6737c67c37b97ef17abff0a`.
 - Generated `blorp/build/_build/blorp-cli/blorp_cli_main.c` SHA-256:

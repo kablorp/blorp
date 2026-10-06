@@ -9,7 +9,7 @@ semantics. This is a correctness checkpoint, not a speed claim.
 ## Provenance and method
 
 - Baseline: clean main `831195b12c18ce06573f194c93dbad904985cd76` at
-  `/Users/keithphilpott/CLionProjects/blorp`; candidate: dirty branch at the
+  `<repo>`; candidate: dirty branch at the
   same HEAD. Both stage-1 `bin/blorp` binaries reported `FRESH` before their
   respective stage-2 builds. The measured six-file source/test diff (before
   this documentation) has SHA-256
@@ -23,10 +23,10 @@ semantics. This is a correctness checkpoint, not a speed claim.
   `beb6332adb88de9bf6ec0931c1ed86801a470d4cd5607e059983cc8d1ef7d361` /
   `276f12234e5117b57565e331c432972e12b809f27ccef742d1d98116774ad162`.
 - Both measurements ran sequentially from the **same cwd**,
-  `/Users/keithphilpott/CLionProjects/blorp`, with explicit binary paths,
+  `<repo>`, with explicit binary paths,
   `--input-dir`, `--skip-build-check`, and five samples. The input was one
   frozen snapshot of `831195b12c18ce06573f194c93dbad904985cd76` at
-  `/var/folders/m7/zszgqft538nfx_qr1kmc7dlc0000gn/T/blorp-perf-input/831195b12c18ce06573f194c93dbad904985cd76`.
+  `$TMPDIR/blorp-perf-input/831195b12c18ce06573f194c93dbad904985cd76`.
   Candidate comparison used `--require-identical`.
 - Raw records: [baseline](fixed_layout_r2_inline_policy_2026-10-03_baseline.json)
   and [candidate](fixed_layout_r2_inline_policy_2026-10-03_candidate.json).

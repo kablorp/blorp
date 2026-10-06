@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 
-repo = Path('/Users/keithphilpott/.codex/worktrees/record-spelling-verification/blorp')
+repo = Path(__file__).resolve().parents[3]
 scratch = Path('/tmp/blorp-record-s5.hzyXge')
 os.environ['BLORP_CLI_C_OPTIMIZATION'] = '-O2'
 loader = importlib.machinery.SourceFileLoader('stage2_recipe', str(repo / 'benchmarks/build_stage2_compiler'))

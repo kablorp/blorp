@@ -28,7 +28,7 @@ before the final gate. No production changes were made for these repairs.
 
 Provenance remained frozen in the shared integration checkout:
 
-- Checkout: `/Users/keithphilpott/.codex/worktrees/r2-ownership-questions/blorp`.
+- Checkout: `<worktree:r2-ownership-questions>`.
 - Branch: `codex/record-s2-internal-migrations`.
 - HEAD: `d29b264e1a74d73a1c0c02f437437947660c3ff3` with integrated working-tree changes.
 - Bootstrap pin unchanged: `dev-0322140767b0`.

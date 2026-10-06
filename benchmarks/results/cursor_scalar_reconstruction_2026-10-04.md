@@ -18,7 +18,7 @@ The byte-wise newline/tab/default transitions are unchanged. The four-column tab
 
 ## Matched performance evidence
 
-Input revision: `06f4a18da9aae41f767d6dd56865c67693500080`, archived before production edits at `/var/folders/m7/zszgqft538nfx_qr1kmc7dlc0000gn/T/blorp-perf-input/06f4a18da9aae41f767d6dd56865c67693500080`. Every baseline/candidate run used that same frozen directory and the candidate worktree cwd. Small-source SHA was also unchanged. Each workload uses three serial normal instruction samples and one diagnostic allocation process, ending at emitted C; native host compilation is setup, not measured.
+Input revision: `06f4a18da9aae41f767d6dd56865c67693500080`, archived before production edits at `$TMPDIR/blorp-perf-input/06f4a18da9aae41f767d6dd56865c67693500080`. Every baseline/candidate run used that same frozen directory and the candidate worktree cwd. Small-source SHA was also unchanged. Each workload uses three serial normal instruction samples and one diagnostic allocation process, ending at emitted C; native host compilation is setup, not measured.
 
 | Workload / signal | Baseline | Candidate | Reduction |
 | --- | ---: | ---: | ---: |
