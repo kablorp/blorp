@@ -509,7 +509,9 @@ hygiene-check:
 	@scripts/compiler-identity-census --check
 	@python3 scripts/check-magic-spellings --strict
 
-# Stray generated files left by builds or tests.
+# Stray generated files left by builds or tests. A file that git tracks, such
+# as a test's C program, is a deliberate source rather than a stray, so in a git
+# checkout only untracked files are reported.
 artifact-scan:
 	@artifacts=$$( \
 		find . \
@@ -517,6 +519,11 @@ artifact-scan:
 			\( -name 'runtime_decl.plist' -o -name '*.generated.c' -o -name '.blorp_doctest_*' \) -print; \
 		find blorp/test $(STANDARD_LIBRARY_TEST_ROOT) pkg/test -name '*.c' -print 2>/dev/null; \
 	); \
+	if git rev-parse --git-dir >/dev/null 2>&1; then \
+		artifacts=$$(printf '%s\n' "$$artifacts" | while IFS= read -r file; do \
+			[ -n "$$file" ] && ! git ls-files --error-unmatch -- "$$file" >/dev/null 2>&1 && echo "$$file"; \
+		done); \
+	fi; \
 	if [ -n "$$artifacts" ]; then \
 		echo "Generated artifacts should not be left in the repo:"; \
 		echo "$$artifacts"; \
