@@ -447,7 +447,7 @@ and_expr = and_expr "and" { NEWLINE } cmp_expr | cmp_expr ;
 cmp_expr = cmp_expr ("==" | "!=" | "<" | ">" | "<=" | ">=") { NEWLINE } range_expr
          | range_expr ;
 
-range_expr = add_expr ".." add_expr | add_expr ;
+range_expr = range_expr ".." { NEWLINE } add_expr | add_expr ;
 
 add_expr = add_expr ("+" | "-") { NEWLINE } mul_expr | mul_expr ;
 mul_expr = mul_expr ("*" | "/" | "%") { NEWLINE } unary_expr | unary_expr ;
@@ -658,13 +658,12 @@ name = IDENT | "debug" | "with" | "concurrent" | "concurrently" | "select"
 | 1 | `=` `+=` `-=` `*=` | right |
 | 2 | `or` | left |
 | 3 | `and` | left |
-| 4 | `==` `!=` | left |
-| 5 | `<` `>` `<=` `>=` | left |
-| 6 | `..` | none |
-| 7 | `+` `-` | left |
-| 8 | `*` `/` `%` | left |
-| 9 | `-` (unary) `not` | prefix |
-| 10 | `.` `()` `[]` | left (postfix) |
+| 4 | `==` `!=` `<` `>` `<=` `>=` | left |
+| 5 | `..` | left |
+| 6 | `+` `-` | left |
+| 7 | `*` `/` `%` | left |
+| 8 | `-` (unary) `not` | prefix |
+| 9 | `.` `()` `[]` | left (postfix) |
 
 ## Indentation Rules
 
@@ -673,5 +672,5 @@ name = IDENT | "debug" | "with" | "concurrent" | "concurrently" | "select"
 3. Inside balanced delimiters (`()`, `[]`, `{}`), newlines are ignored
 4. Tabs count as 4 spaces for indentation
 5. `else if` chains must not have blank lines between `if` and `else`
-6. Multi-line expressions can break after binary operators (`+`, `-`, `*`, `and`, `or`, etc.)
+6. Outside brackets, a binary operator (`+`, `-`, `*`, `and`, `or`, etc.) at the end of a line continues the expression on the next line only when that line has the same indentation. An operand on a more-indented line is rejected ("expected expression"). An operand on a less-indented line is rejected the same way: the dedent comes before an operand
 7. Method chains can continue on more-indented leading-dot lines (`value\n    .map(...)`)

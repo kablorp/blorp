@@ -2,8 +2,8 @@
 
 This is the design and migration record for the typed-tree path. The syntax
 prerequisite M-1 has landed, M0 measured a throwaway body-parser prototype,
-and M1 and M2 are implemented and validated. M3 remains open on rejected
-module diagnostic parity; M4 assembles and compares every module whose
+and M1 and M2 are implemented and validated. M3 remains open on first-diagnostic
+parity for rejected modules (section 6.3); M4 assembles and compares every module whose
 declarations the tree parser reads in full, and M5 to M7 remain open. It replaces the data model of
 [`DISCOVERY_TABLES_DESIGN.md`](DISCOVERY_TABLES_DESIGN.md) (one builder threaded
 through every module, a flat node table and about 50 side tables) with:
@@ -26,6 +26,28 @@ a throwaway cost experiment, not M1 implementation. M1 retained and passed
 the opaque-import-cycle check (3.15); M6 depends on tuple increments (7.3).
 Implementation and tests win if later work diverges, and this plan must be
 updated in the same change.
+
+## Decisions of 2026-10-06
+
+A design review of the tree parser (`stage_01_discovery/parse/tree_*`) against
+established practice produced the owner decisions below. They are normative,
+and each is stated in the section that owns it; sections they contradicted
+were rewritten rather than annotated.
+
+The review found these parts sound and kept them: the lexer's layout (CPython
+style NEWLINE, INDENT and DEDENT tokens, line joining inside brackets, and a
+Haskell/F# style context stack in `lex/layout.brp`), precedence climbing with
+loops for chains, dense per-module ids, a strict tree with no error nodes, and
+the differential migration. It found these unsound and replaced them:
+
+| Decision | Owner section |
+| --- | --- |
+| The lexer owns layout; tree parsers never compare line or column numbers, apart from named frozen-grammar quirks in one module | 3.16 |
+| Parse functions mint directly into the tree; recipes survive only as a cover grammar for assignment targets; there is no replay by token index | 3.16 |
+| Nesting is bounded by one named `MAX_SYNTAX_NESTING` checked in `ParseState`, replacing the "1,000 deep through every walker" requirement | 3.14 |
+| Diagnostic parity means the first diagnostic of a rejected module, and no cascade the old parser lacks, replacing "every diagnostic matches" | 3.17, 6.3 |
+| M4 closes only when bodies parse inline, outcomes are accepted or rejected, and `StopReason` is deleted | 8 |
+| Frozen-grammar ambiguities and the four-parsers problem are recorded for later decisions | 9 |
 
 ## 1. Goals, principles, non-goals, and what the redesign replaces
 
@@ -67,6 +89,9 @@ still applies; sections 7 and 8 own its budget and tuple prerequisites.
 - Comments/layout trivia and an error-tolerant editing tree. The formatter
   keeps its parser until a separate lossless-tree or trivia design replaces
   it. Today's LSP integration neither requires nor constrains this proposal.
+  The LSP and formatter tree is a separate later plan (a Go-style comment side
+  table, or a last-good tree). The compiler's tree stays strict: it keeps no
+  `Missing*` nodes (section 3.17).
 - Incremental rediscovery and parallel execution. Per-module isolation
   enables later work; section 2.6 gives parallelism's extra prerequisites.
 - Name resolution and type inference. Section 4.7 specifies resolution's
@@ -266,15 +291,18 @@ A module the lexer or parser reported at least one diagnostic in. It has no
 accepted `ModuleSyntax`; its definitions index still owns partial syntax.
 
 `diagnostics` is every diagnostic the module's lexing and parsing reported,
-in the order reported today: the lexer's, then the parser's, with an
-interpolation hole's lexer diagnostics where the parser reaches the hole.
+in report order: the lexer's, then the parser's, with an interpolation hole's
+lexer diagnostics where the parser reaches the hole. The first one matches the
+old parser's; later ones are not promised to (section 3.17).
 
 `kept_imports` is each `Import` (one module path with its alias and selected
 items) during whose parse no diagnostic was reported: the diagnostics count
 was the same after its last token as before its first. An import that
 reported anything is dropped whole, items included. The walk resolves the kept
 imports and loads their modules, so those modules' own problems are reported
-in the same run, as they are today. Rejection keeps the authoritative
+in the same run, as they are today. An import the parser never reaches,
+because it stopped or synchronised past it (section 3.17), is not kept.
+Rejection keeps the authoritative
 `definitions` index minted during parsing: a diagnostic such as
 `DuplicateField(DefinitionId)` still refers to an earlier field even when its
 containing declaration has no accepted tree. Final parser spellings and source
@@ -288,7 +316,7 @@ record RejectedSyntax {
 ```
 
 The lexer runs first over the whole text. The parser then runs over its
-tokens, so the diagnostics list is in today's order.
+tokens, so lexer diagnostics precede parser diagnostics, as today.
 
 ```blorp
 ---
@@ -1955,9 +1983,88 @@ The rule for walkers in discovery, the adapter and later stages: **walk a
 left spine with a loop, and recurse only on right operands and arguments.**
 For example, collect `Binary` operands down the left spine into a list, then
 fold. Do the same for `FieldAccess`, `Call` and `Subscript` receivers and
-callees. Recursion depth is then bounded by right-nesting and bracket
-nesting, which the source's own structure bounds. The parser already
-recurses that deep.
+callees. The same rule covers `else if`, `match` arm and `select` arm chains,
+which nest to the right in the tree but are flat in the parser: a reader
+iterates them, and the limit below does not count them. Recursion depth is then
+bounded by the nesting the limit does count.
+
+**Bracket and block nesting is bounded by one named limit.** What the walker
+rule cannot remove is recursion on brackets, indented blocks, lambda bodies and
+control-expression operands, which every walker takes a native frame per level
+for. Nothing bounds that depth unless the syntax does, and a requirement that
+each walker "survive 1,000 levels" is a requirement on stack frame sizes, not
+on the grammar: it moves with every frame change, and a deeper source still
+crashes the compiler. So the limit is a rule of the syntax:
+
+- **`MAX_SYNTAX_NESTING`** is a named constant (with its measured derivation in
+  its documentation), owned by `parse/parse_state.brp`.
+- **It is checked once, in `ParseState`, wherever nesting increases.** The
+  state keeps the current depth, and one function there is the only way a
+  parse function enters a nesting construct. These count, each one level:
+  - a bracketed form: a parenthesized expression, a call argument list, a
+    subscript, a list, tuple, vector, record, update or dict literal, and a
+    string interpolation hole;
+  - an indented block, including a lambda body;
+  - a control expression read as an operand (`1 + if ...`);
+  - a prefix-operator chain (`not not x`, `- - x`, `detach detach x`): the
+    parser's `parse_prefix` recurses once per operator
+    (`tree_expression_parser.brp`), so the chain is right-nesting in both the
+    parser and the tree;
+  - a nested written type (`List[List[...]]`, grouped and tuple types) and a
+    nested pattern (constructor, tuple and list patterns), each of which
+    recurses in its own parser and walker.
+  Exempt, with the reason: a left spine built by the precedence or postfix
+  loop (a loop in the parser; the walker rule above handles it in every
+  reader), and `else if`, `match` arm and `select` arm chains (right-nesting
+  handled by the iterative-walker rule, not by the limit). A form missing from
+  this list that recurses in the parser is a defect in this section.
+- **Exceeding it is a teaching diagnostic**, `SyntaxNestingTooDeep`, in the
+  syntax diagnostic union. It names the limit and suggests the fix: bind the
+  inner value to a name, or move the inner block into its own function. The
+  module is rejected like any other syntax error (section 3.17). The old
+  parser has no such limit; the stage's parity gate lists this as a deliberate
+  difference (section 6.3), and the limit must be at least the deepest legacy
+  corpus module.
+- **The compiler runs on a declared minimum stack size.** Unsanitized builds
+  get at least 16 MB of main stack: macOS asks for it at link time
+  (`-Wl,-stack_size` from `platform_stack_size_argument` in
+  `blorp/src/lib/host_c.brp`), and on Linux the runtime constructor
+  `__blorp_raise_main_stack_limit` (`BLORP_MAIN_STACK_BYTES` in
+  `blorp/src/lib/runtime/native/runtime.c`, the two values kept equal) raises
+  the soft limit. On Linux this is best effort: the constructor never lowers a
+  larger soft limit, is capped by the hard limit, and ignores a `setrlimit`
+  failure. Sanitized builds use 128 MB (`host_c.brp`, the same function). The
+  proof and the limit's measurement cover unsanitized builds. Fibers
+  have their own, much smaller stacks (128 KB or 256 KB by
+  default, `BLORP_DEFAULT_FIBER_STACK_SIZE` in `runtime.c`); which stack the
+  proof tests run on (the main thread, or a fiber) is something the depth work
+  must establish and record, not an assumption here. A change to the stack
+  size is a change to the limit's measurement.
+- **Every walker is proven at exactly the limit**, on Linux arm64 and macOS:
+  the parser, the mint, the dump, the id census and the adapter's legacy
+  projection each pass a source nested to `MAX_SYNTAX_NESTING`, and the parser
+  rejects one level more with the diagnostic. Each counted form above has
+  its own at-the-limit case, `not not ... x` and a nested type and pattern
+  included. A walker added later (resolution,
+  typecheck reading the trees) adds its own proof at the same limit before it
+  lands.
+
+The value is not fixed here: it is set by measurement, as the largest depth
+every walker survives with margin on both platforms at the declared stack size.
+The measurement record will be
+`benchmarks/results/discovery_syntax_nesting_limit_2026-10-06.md` (to be
+written by that measurement; this section names the constant and carries no
+number until the record exists).
+
+Precedents:
+
+- **Go's `maxNestLev`** in `go/parser`, added after CVE-2022-1962
+  (stack exhaustion from deeply nested source in `go/parser`): a parser-owned
+  counter that turns runaway nesting into an ordinary syntax error.
+- **CPython's tokenizer `MAXLEVEL`**: a fixed bound on bracket nesting, with
+  an ordinary error ("too many nested parentheses") when it is exceeded.
+- **clang's `-fbracket-depth`** (default 256): a named, documented limit with
+  a diagnostic that says how to raise it.
 
 M4's gate adds deep-chain tests, through parse, dump, ID census and the
 adapter's legacy projection:
@@ -1965,22 +2072,12 @@ adapter's legacy projection:
 - a 5,000-term `+`;
 - a 2,000-call method chain;
 - a 2,000-deep `else if` chain (an `else if` nests in the else branch);
-- a 1,000-deep nested list literal (right-nesting, bounded by brackets);
-- 1,000 value `if`s nested by indentation, a 2,000-link `else if` value and a
-  2,000-arm `match` value (proved on Linux; the nesting limit, between 1,200 and
-  1,400 levels, is open item D6, section 9);
-- 1,000-deep nested tuples, alternating tuples and lists, and vectors, all
-  proved through parse, dump, ID census and projection on Linux;
-- 1,000 `with`, `concurrent`, `debug` and `select` blocks nested by
-  indentation, and a 2,000-arm `select`, proved through parse, dump, ID census
-  and projection on Linux (the limit is open item D6, section 9);
-- a 1,000-deep nest of record literals, record updates and dict literals.
-  This last case is **not yet met**: it is proved only to 200 levels (open
-  item D5, section 9);
-- 1,000 lambdas nested in each other (`func(a): func(b): ...`), through parse,
-  dump, ID census and projection. This case is **not yet met**: it is proved
-  to 200 levels, and measured on Linux arm64 to pass at 500 and overflow at
-  700 (open item D7, section 9).
+- a 2,000-arm `match` value and a 2,000-arm `select`;
+- each counted nesting form at exactly `MAX_SYNTAX_NESTING`, with one level
+  more rejected: lists, tuples, vectors, calls, record literals, record updates
+  and dict literals, value `if`s, `with`, `concurrent`, `debug` and `select`
+  blocks, operands that are control expressions, lambdas, prefix-operator
+  chains (`not not ... x`), and nested written types and patterns.
 
 The current adapter's 6,000-operand chain test is kept.
 
@@ -2265,12 +2362,124 @@ private pure func parse_if(state: ParseState, context: BodyContext) -> (ParseSta
 	)
 ```
 
+**The lexer owns layout.** The lexer decides where a statement ends, where a
+block opens and closes, and where lines join, and it says so in tokens:
+NEWLINE, INDENT, DEDENT, and the delimiter tokens (inside brackets it emits no
+NEWLINE). The tree parsers read layout only through those tokens. A tree
+parser never compares the source line or column of two tokens. The review
+found about 40 direct position queries (`span_start_line`, `span_start_column`,
+`span_end_line`) in `tree_*.brp`, plus about 17 uses of the local wrappers
+`on_line` and `starts_next_line`, re-deriving what the lexer already decided;
+each becomes a token test or goes away with the skip-and-replay it served (see
+below).
+
+There is one sanctioned route for a position query. `span_start_line`,
+`span_start_column` and `span_end_line` stay in `parse_state.brp` (the line
+starts also render locations), but are restricted symbols in
+`blorp/source_ownership.json`: only `parse/layout_quirks.brp` may import them,
+and the `restricted import` rule of `scripts/check-blorp-layout` (run by
+`make hygiene-check`) rejects any other importer, `on_line` and
+`starts_next_line` included, which move into that module or are deleted. That
+rule is M4 work (exit criteria, section 8); until it lands, "never compare" is
+a convention, not a check.
+
+The precedents are the ones the lexer already follows:
+
+- **CPython's implicit line joining** and its NEWLINE, INDENT and DEDENT
+  tokens: the tokenizer, not the parser, knows about lines and brackets.
+- **The Haskell 2010 layout algorithm** (Report, section 10.3): a context stack
+  of enclosing indentation levels turns layout into explicit tokens, which is
+  what `lex/layout.brp`'s `LayoutStacks` keeps.
+- **The F# offside rule**: a construct's own column sets the offside line for
+  the tokens inside it, which is how lambda bodies inside brackets are laid out.
+
+Continuation lines are token rules in the parsers, ported from the table
+path's `parse/block_layout.brp` (`continuation_start`,
+`consume_continuation_dedent`, `consume_layout_before`) and from the old parser
+(`stage_03_parse/language_parser.brp`), and rewritten without position
+arithmetic. The table path's own comparisons (`indented_past`, and
+`has_leading_dot_continuation` over end lines) are not carried over. The four
+rules:
+
+- **Leading dot**: a DOT token after NEWLINE continues the postfix chain.
+- **Indented method chain**: NEWLINE INDENT DOT continues the chain; the chain
+  owns that indent and consumes the matching DEDENT.
+- **Value on the next line**: after `=`, `?=`, `op=` or a `var` or typed
+  binding, NEWLINE INDENT starts an indented value, which is an expression and
+  not a block; its DEDENT ends the statement.
+- **Operator then newline**: a binary operator followed by NEWLINE continues
+  the expression at the next line only when no INDENT follows. An INDENT
+  there is "expected expression" (`GRAMMAR.md`, indentation rule 6).
+
+The only line or column rules allowed are the named frozen-grammar quirks,
+kept together in one new module (`parse/layout_quirks.brp`), each a function
+documented with the frozen parser's behaviour and its fixture:
+
+- **case-line nesting**: a same-line `match` case body that opens a nested
+  block is anchored at the pattern or at its own keyword, and compared by
+  column;
+- **keyword-column blocks**: `with`, `debug` and `concurrent` blocks are
+  indented past the keyword's column, not past the statement's.
+
+Section 9 lists the ambiguities these quirks come from; when the language
+decides them, the module shrinks or disappears.
+
+**Parse functions mint directly.** A parse function reads its construct and
+mints its node as it finishes, as `parse_if` above does; there is no
+ID-free recipe tree that is validated first and minted afterwards. `ParseState`
+is a persistent value, so trying one reading and backing out keeps the earlier
+state, and the mint, spellings and diagnostics it holds come back exactly. That
+is the rollback; nothing else records or restores a position. Ids stay
+post-order because a node is minted after its children.
+
+This replaces the earlier recognize-then-mint design (its slices are recorded
+in section 8) in three ways:
+
+- The full recipe tree (`parse/recipes.brp`: expression, control, value and
+  body recipes and their `mint_*` walkers) is removed.
+- Types, patterns, bodies, local-function headers and trait and implementation
+  owners are no longer replayed by token index (`resumed_at`, `resumed_after`,
+  the owner "read again from the state before its prefix"). A body is parsed
+  once, inline, in the function that reads its header, and an owner is minted
+  last because it is post-order, not because its children were read twice. A
+  token index is not a stable address inside an interpolation hole's own token
+  run, which was the source of the hole-specific constraints.
+- A function's body is no longer skipped by layout and read later; the skipped
+  extent and the owner records that carried it are removed (section 8, M4 exit
+  criteria).
+
+**Assignment targets use a cover grammar.** A statement that begins
+`(a, b) = v` or `xs[i] = v` cannot be told from an expression statement until
+its `=`. This is the one case where an ID-free recipe remains: the parser reads
+the statement's leading expression as a recipe, then either reinterprets it as
+a target (`BindingTarget` or `SubscriptPlace`) and mints that, or, when no
+assignment operator follows, parses the statement again from the saved entry
+state with the minting parser. This follows ECMAScript's cover grammars, where
+a parenthesized expression is reinterpreted as a destructuring target once `=`
+follows. The recipe holds assignment-target shapes only (names, `_`, tuples of
+targets, and the skeleton of a subscript place), not a general expression
+recipe: an index expression inside a subscript place is read by the minting
+parser when the target is minted, and a leading expression of any other shape
+is read by the minting parser directly. The recipe type is private to the statement parser,
+is never stored in a tree, and nothing replays from a token index. Its cost is measured before it
+is accepted (rule 9 of `AGENTS.md`).
+
 ### 3.17 Recovery: a module with a syntax error has no tree
 
 How it works:
 
-- **The parser continues after a diagnostic exactly as today**, so every
-  diagnostic of every module is unchanged.
+- **The first diagnostic matches the old parser's, and no cascade is new.**
+  For a rejected module, the first diagnostic (location, message and help,
+  apart from the named `WORDING_DIFFERENCES` and `HELP_DIFFERENCES` in
+  `scripts/compiler-new-parity`) is the one the old parser reports first, and
+  the parser reports no later diagnostic the old parser does not (the subset
+  check of section 6.3 enforces this). It may stop
+  at the first error, or synchronise early at a DEDENT to the top level or a
+  declaration keyword and read on, so it may report fewer later diagnostics
+  than the old parser. Go's parser advances to the next declaration keyword
+  after an error, and Elm reports one syntax error per module; reproducing the
+  old parser's later diagnostics is not a contract. Section 6.3 states the
+  gate.
 - **Placeholders stay inside the parser.** After an error the parser keeps
   going with a well-formed placeholder in place of what is missing: `void`
   for an expression, `_` for a pattern, `()` for a type, the spelling `_`
@@ -2288,9 +2497,10 @@ What this removes: `MissingExpressionNode`, `MissingPatternNode`,
 recovery node, `RecoveryDiagnosticOutsideModule`, and the question of which
 later stage handles a recovery node.
 
-What it changes: an import inside a broken import item is no longer
-followed. Its module is already rejected, so the only lost diagnostic is a
-cascading "unresolved import" for a path that did not parse.
+What it changes: later diagnostics are fewer or absent where the parser stops
+or synchronises earlier than the old one. An import inside a broken import item
+is no longer followed. Its module is already rejected, so the only lost
+diagnostic is a cascading "unresolved import" for a path that did not parse.
 
 **Forward pairing is the last acceptance check.** A top-level function with no
 body is a forward declaration (`FunctionDeclaration.function.body` is
@@ -3085,11 +3295,23 @@ oracle while its other users still need it. The proofs:
   - Together with the id census, this proves the ids.
 - **Diagnostics.**
   - The parity gate's first-diagnostic comparison against the old compiler
-    holds unchanged.
-  - A per-module comparison of every rendered diagnostic, old stage path
-    against tree path, covers fixtures and corpus, so the second and later
-    diagnostics are pinned too. The one deliberate difference is listed:
-    the broken import item of section 3.17.
+    holds unchanged, for fixtures and corpus alike.
+  - For every rejected module, the tree path's first diagnostic equals the
+    old parser's (location, message and help, modulo the named
+    `WORDING_DIFFERENCES` and `HELP_DIFFERENCES`), and the tree path emits no
+    diagnostic the old parser does not. It may report fewer later
+    diagnostics, because it may stop or synchronise earlier (section 3.17).
+    The "no cascade" half is enforced by a subset check: for every rejected
+    fixture and corpus module, each diagnostic of the tree path must appear
+    among the old parser's, by location and message (modulo the named
+    differences), so a diagnostic the old parser lacks fails the gate. The
+    subset check is M3 and M4 work, extending the per-module rejected
+    differential (`tree_rejected_declaration_differential.brp`) to rejected
+    bodies. The gate does not require the tree path to reproduce the old
+    parser's second and later diagnostics.
+  - The deliberate differences are listed: the broken import item of section
+    3.17, and `SyntaxNestingTooDeep` for sources nested past
+    `MAX_SYNTAX_NESTING` (section 3.14), which the old parser accepts.
 - **Module order.** `discovery_module_order_dump.brp` runs on the tree path
   against `legacy_module_order_dump.brp`, unchanged.
 - **The self-compile.** C is byte-identical, or identical after normalizing
@@ -3188,6 +3410,17 @@ records.
 The schema assumes the current syntax rules described above. No prerequisite
 language migration remains in this plan; the import-cycle check is still
 required at M1. The M0 prototype is evidence only.
+
+**How to read the slice record.** The status paragraphs below record slices
+that landed under the earlier recognize-then-mint design: ID-free recipes,
+bodies skipped by layout and replayed by token index, and a `StopReason` for
+every rollback. The 2026-10-06 decisions replace that design (sections 3.14,
+3.16 and 3.17). Those mechanisms are transitional: they stay until the M4 exit
+criteria below delete them, and where a slice's description disagrees with a
+section of 3, the section wins. The measurements and corpus counts stay valid
+as the record of what each slice read. New M4 slices mint directly and add no
+recipes, no replay by token index and no new `StopReason` variants; a slice
+that needs one is a defect in the slice.
 
 **Current milestone status:** M1 and M2 are complete. M1's pre-unification ordinary-record
 construction costs and token comparison are in
@@ -3435,7 +3668,7 @@ function of their own (`while`, compound assignment and local functions stay
 inline), to keep the frames on that path small. Measured on Linux arm64 on the
 rebased build, 1,000 and 1,200 value `if`s nested one inside another pass
 parse, mint, census, dump and projection, and 1,400 overflow the native stack.
-That limit is open item D6 in section 9.
+That limit is open item D6 in section 9 (superseded, see 3.14).
 
 Another bounded M4 increment lets a control expression be an operand: the
 right operand of a binary operator or the operand of a unary one, in a
@@ -3464,14 +3697,15 @@ projection tests compare AST JSON for the accepted forms.
 Block nesting through an operand has a lower limit than through a statement's
 value, because the general expression dump and mint walkers are on the path:
 on macOS 700 nested operands pass and 900 overflow, in the dump; on Linux arm64
-300 pass and 500 overflow. The test proves 300. That is open item D6.
+300 pass and 500 overflow. The test proves 300. That is open item D6 (superseded, see 3.14).
 
 The next bounded M4 slices are multiline expressions (a value continued after an
 operator, and calls, lists and braced forms that span lines), then opaque
-conversions in a separate slice. Lambdas, local functions, the bodies of traits
-and implementations and the statement forms are read; the complete M4 gate
-still requires module assembly, forward pairing and the open depth items D5 to
-D7.
+conversions in a separate slice. Multiline continuation is read as the token
+rules of section 3.16, not by comparing line numbers. Lambdas, local functions,
+the bodies of traits and implementations and the statement forms are read; the
+complete M4 gate is the exit criteria below, which also require the nesting
+proof of section 3.14 in place of the open depth items D5 to D7.
 
 Argument and list nesting are the recursion in the postfix and list grammar.
 They follow brackets the source itself nests, as the frozen parser does, and
@@ -3546,7 +3780,8 @@ read 66 and 65 (62 and 61 before), global initializers 359 (300), because a
 module that used to stop at its first function now reaches its later owners.
 There were zero rejected or non-progress stops and zero differing files in the
 3,560-file parity gate. Function bodies are the dominant remaining stop: the
-next slices are the expression forms they still roll back on (string and
+next slices (superseded, see 3.14 and 3.16; new slices mint directly and read no
+recipes) are the expression forms they still roll back on (string and
 character literals and interpolation first, then `?=`, tuples and braced
 forms from the parallel expression work) and then trait and implementation
 method bodies, which replay through the same `complete_function`. Focused
@@ -3652,7 +3887,7 @@ with zero mismatched files and `compiler-blorp` 6,665/6,665. Duplicate-field,
 unclosed-brace and missing-first-item diagnostics were compared by hand with
 `blorp check` on the frozen parser. 1,000 nested vectors pass parse, dump, ID
 census and legacy projection; nested records, updates and dicts are covered to
-200 levels (open item D5). The 3,409-module "every corpus file as a root" run
+200 levels (open item D5, superseded, see 3.14). The 3,409-module "every corpus file as a root" run
 compared 13,472 completed declarations, stopped at 1,635 functions and 304
 unsupported globals, and had zero rejected or non-progress stops. Parity
 evidence for the braced forms is also the AST-JSON differential over 16 braced
@@ -3742,7 +3977,7 @@ non-progress stops. Nested lambdas pass parse, dump, census and projection to
 control merges, 500 deep passes and 700 overflows the native stack, as 3,000
 does on macOS: every walker (the expression parser, minting, the dump, the
 census and the projection) takes a frame per level, so the limit is their
-summed frame sizes. The 1,000-deep proof is open item D7. Reading lambdas in
+summed frame sizes. The 1,000-deep proof is open item D7 (superseded, see 3.14). Reading lambdas in
 call arguments that span lines, in holes and in a parameter list across lines remains for later slices.
 `compiler-new` passed 882/882, `compiler-new-parity` 3,567/3,567 and
 `compiler-blorp` 6,670/6,670.
@@ -3757,8 +3992,10 @@ each declined function, trait, implementation or global initializer in
 its first result is
 [`benchmarks/results/discovery_m4_stop_reason_census_2026-10-06.md`](../benchmarks/results/discovery_m4_stop_reason_census_2026-10-06.md).
 A new rollback adds its reason to the enum, and the census label match
-(`blorp/test/compiler_new/support/stop_reason_label.brp`) stops compiling until
-it is named.
+(`blorp/test/test_compiler_new/support/stop_reason_label.brp`) stops compiling until
+it is named. The census mixes unlike things (missing grammar, syntax errors the
+parser does not yet report, artificial limits and cannot-happen guards); the M4
+exit criteria below classify and then delete it.
 
 The statement-forms slice reads `select`, `with`, `concurrent` and `debug:` as
 statements, and `detach x` as a prefix operator. `select` is also a whole value
@@ -3878,11 +4115,37 @@ and 26 globals; those 150 owners remain outside the proof. Logs are in
 | --- | --- | --- | --- |
 | **M1** | Retain and rerun the opaque-type import-cycle repro (section 3.15), fixing the compiler if it still fails. Then `syntax/`: every type of section 3, using ordinary `record` for the proposed name and syntax values; `syntax/ids.brp` with `IdMint`; the layout rule that confines `IdMint` to `parse/` and tests; `syntax/dump.brp`; and unit tests that build each form through the mint and dump it. Nothing calls it yet. | Tests; `compiler-new` gate; the layout check rejects an import of `IdMint` from outside `parse/`; record-shape construction and return costs recorded (section 7.2) | none |
 | **M2** | The lexer becomes `lex_module(module, text) -> LexedModule`, with per-module `Spellings`, checked `LiteralValue`s and `InterpolationScan`. The existing builder path consumes `LexedModule` through a bridge that interns spellings into the builder and rewrites token payloads. Measure the provisional managed `Token` on the same corpus; any future inline placement is a separate record optimization, not a source-spelling choice. | Token parity test unchanged; `tables` dump identical; token storage and bridge costs recorded | the lexer's builder appenders; transient interpolation tables |
-| **M3** | `parse/` over trees, declaration level: module items, imports, foreign blocks, signatures, type parameters, bounds, written types, dimensions, patterns. Bodies are skipped by layout. One `RecordDeclaration` retains `RecordDeclarationForm(OrdinaryRecord, FixedRecord)` for source spelling and parsed-AST adaptation; both forms have managed record semantics. Then the tree adapter's declaration half, behind a test-only entry. | The differential's declaration-level comparison, tree path against the old parser including both record spellings and ordinary `struct` identifiers; per-module declaration diagnostics equal to today's stage | none |
-| **M4** | The body parser over trees (statements, blocks, expressions), and the tree adapter's body half. | Full-AST differential: the tree path equals the old parser on every corpus module and root run; every rendered diagnostic per module equals today's stage, except the listed broken-import case; the syntax dump differential matches; the id census passes; the deep-chain tests of section 3.14 pass through parse, dump, ID census and adapter (the old typecheck is excluded, section 3.14) | none |
+| **M3** | `parse/` over trees, declaration level: module items, imports, foreign blocks, signatures, type parameters, bounds, written types, dimensions, patterns. Bodies are skipped by layout (transitional: M4 parses them inline, see its exit criteria). One `RecordDeclaration` retains `RecordDeclarationForm(OrdinaryRecord, FixedRecord)` for source spelling and parsed-AST adaptation; both forms have managed record semantics. Then the tree adapter's declaration half, behind a test-only entry. | The differential's declaration-level comparison, tree path against the old parser including both record spellings and ordinary `struct` identifiers; the first diagnostic of every rejected module equals today's stage, with no new cascade (section 6.3) | none |
+| **M4** | The body parser over trees (statements, blocks, expressions), and the tree adapter's body half. | Full-AST differential: the tree path equals the old parser on every corpus module and root run; the first diagnostic of every rejected module equals today's stage and the tree path emits no cascade the old parser lacks (section 6.3); the syntax dump differential matches; the id census passes; the deep-chain tests of section 3.14 pass through parse, dump, ID census and adapter, with every walker proven at `MAX_SYNTAX_NESTING` (the old typecheck is excluded, section 3.14); the exit criteria below | `skip_body`, `DeferredBody`, owner replay, the superseded scan policies, `complete_atomic_global`, `StopReason`, the recipe tree (exit criteria) |
 | **M5** | `sources/module_walk.brp`, `link/`, `DiscoveryOutcome`, and `discovery_front_end.brp` on the tree path, behind an internal test-only selection, with `compiler-new`, `cli` and `package` gates exercised on both stage paths. | Module-order parity; self-compile C identical (or normalized); cost measured with the cost tool's `tables` and `graph` modes and the self-compile against matched main | none |
 | **M6** | Make the tree path the stage's default, within the ceiling of section 7.3, and delete the table path in the same change. | Every default and premerge gate on the new default; self-compile C identical; the ceiling's measurement record | `tables/` (builder, node builder, rows, row kinds' node part, node kind classes, `frontend_tables`, `discovery_tables`, `invariants/`, `intern_index` moved, `name_vocabulary` moved to the adapter): about 11,600 lines; the table-reading bodies of `compiler/discovery_adapter.brp` and `compiler/discovery_front_end.brp` (the files stay, now reading trees); `builder_rule_probe`, `builder_append_probe`, `test_invariants`, `test_allocation_budget` (replaced by a syntax allocation test pinning allocations per construct, so a compiler improvement shows as a decrease and a regression fails) |
 | **M7** | Documentation: `DISCOVERY_TABLES_DESIGN.md` is replaced by this document's settled form; `ARCHITECTURE.md`, `DISCOVERY_ACCEPTANCE_ROADMAP.md` and `docs/README.md` are updated; the resolution design takes section 4.7. | `git diff --check`; link check | the superseded design text |
+
+**M4 exit criteria.** Each is required before M4 closes:
+
+- **Bodies parse inline.** A function, method or lambda body is parsed by the
+  function that reads its header (section 3.16). `skip_body` and `DeferredBody`
+  (`tree_function_header_parser.brp`), owner replay, the superseded
+  `GlobalCompletionPolicy` scan policies and `complete_atomic_global`
+  (`tree_module_declaration_scan.brp`, `tree_global_parser.brp`) are deleted,
+  with the recipe tree and replay by token index.
+- **No tree parser reads line or column numbers**, except the named quirks of
+  `parse/layout_quirks.brp` (section 3.16). The restricted-symbol entry in
+  `blorp/source_ownership.json` and its `scripts/check-blorp-layout` rule land
+  with this criterion, so a position query anywhere else fails
+  `make hygiene-check`.
+- **Rejected modules satisfy the subset check** of section 6.3 on the fixtures
+  and the corpus, not only the first-diagnostic comparison.
+- **Parse outcomes are accepted or rejected.** The preview, `Unsupported`,
+  `Declined` and `UnassembledModule` outcomes go; every module either yields a
+  `ModuleSyntax` or is rejected with diagnostics.
+- **`StopReason` is deleted once coverage is complete.** Until then the
+  stop-reason census classifies each stop as one of: not read yet (missing
+  grammar), unreported syntax error (the parser should report a diagnostic),
+  or cannot-happen (a guard that should fail loudly). It ranks coverage
+  separately from the other two classes, so a worker sees the grammar still to
+  write apart from errors still to report. Artificial limits are replaced by
+  `MAX_SYNTAX_NESTING` (section 3.14), not counted as grammar.
 
 Ordering and parallelism:
 
@@ -3896,8 +4159,9 @@ a fixed target.
 
 ## 9. Open decisions
 
-These recommendations are not acceptance decisions yet; sections 3–6 use
-the proposed forms so their consequences can be reviewed.
+D1 to D4 are recommendations, not acceptance decisions yet; sections 3–6 use
+the proposed forms so their consequences can be reviewed. D5 to D9 record what
+the 2026-10-06 decisions left open.
 
 - **D1. Decimal floats (5.2).** Recommend opaque `DecimalFloat` over a
   checked 64-bit `Float`: converting decimal directly to the selected width
@@ -3911,40 +4175,41 @@ the proposed forms so their consequences can be reviewed.
   if reordered `#N` names affect only ID-derived output names, rather than
   remembering legacy interleaving in discovery.
 
-- **D5. Depth of record, update and dict nesting (3.14).** The dump recurses
-  through record fields, update fields and dict entries, and overflowed the
-  Linux native stack for directly nested lists at about 700 levels before
-  lists, tuples and vectors got an explicit stack. The test
-  `test_braced_forms_nest_in_each_other` stops after parse and mint at 200
-  levels, so depth beyond 200 is unmeasured for the parser and mint as well as
-  the dump. Follow-up: an iterative dump for these three forms and a
-  1,000-deep proof through parse, mint, dump, census and projection on Linux.
+- **D5 to D7. Depth of record, block and lambda nesting (3.14).** Superseded
+  by the 2026-10-06 decision: the "1,000 deep through every walker" proof is
+  replaced by `MAX_SYNTAX_NESTING`, checked in `ParseState`, and every walker
+  proven at exactly that limit. What remains open is the limit's value, set by
+  measurement and will be recorded in
+  `benchmarks/results/discovery_syntax_nesting_limit_2026-10-06.md`.
+  The earlier Linux figures (lists at about 700 levels, value `if`s between
+  1,200 and 1,400, nested operands at 300 to 500, lambdas at 500 to 700, all
+  on the default 8 MB stack) are historical, since Linux programs now get a
+  16 MB main stack like macOS (see 3.14).
 
-- **D6. Block nesting depth (3.14).** Nesting by indentation recurses in the
-  body parser, the minter, the dump and the legacy projection, as it did for
-  statement-position blocks before value `if`s. On Linux arm64 1,000 nested
-  value `if`s pass at 1,000 and 1,200 and overflow at 1,400. Nested operands
-  (`1 + if ...:`) pass at 300 and overflow at 500, because the general
-  expression dump walker is on that path. Nested `with`, `concurrent`, `debug`
-  and `select` blocks pass at 1,000 through parse, mint, census, dump and
-  projection; `with`, `concurrent` and `debug` also pass at 1,400, a nested
-  `select` passes parse at 1,000 and overflows by 1,400, and its projection
-  passes at 1,200 and overflows at 1,400. Follow-up if deeper proof is wanted:
-  split the rare arms out of the general dump walker, iterate the block stack
-  as the expression nesting is, or raise the main stack size at the CLI.
-  Linux programs now get a 16 MB main stack like macOS (the runtime raises the
-  soft stack limit at startup), so the Linux figures above, measured with the
-  default 8 MB, are historical.
+- **D8. Frozen-grammar ambiguities (3.16).** The review found these in the
+  frozen grammar. The tree parser reproduces each as it is, the quirks that
+  need position rules live in `parse/layout_quirks.brp`, and each wants a
+  language decision after M4 with parser-specialist and ergonomics input:
+  - `debug: Bool = True` is read as a `debug` block, because `debug` is a soft
+    keyword;
+  - a `|` at the start of a line inside braces lexes as a pipe string;
+  - the comparison operators share one left-associative level, so `a < b < 3`
+    parses (`GRAMMAR.md`, operator precedence);
+  - `not a == b` parses as `(not a) == b`;
+  - the lexer emits INDENT for any deeper line, not only after `:`;
+  - a closing bracket does not close a block opened inside it;
+  - the `OperatorAfterBlock` quirk: after an `if` or `match` value ends at its
+    DEDENT, a following binary operator, `as` or `=` continues the block's
+    expression;
+  - `{}` is stored as a record literal, though the Guide treats it as an empty
+    dict.
 
-- **D7. Nested lambda depth (3.14).** A lambda nests as an expression and as a
-  body, so a chain of lambdas recurses in the expression parser, the body
-  parser, the minter, the dump, the census and the projection, each with a
-  frame per level. On Linux arm64, after the tuple, braced and control merges,
-  500 nested lambdas pass parse, mint, dump, census and projection and 700
-  overflow the native stack (3,000 overflow on macOS); the tests carry 200. The
-  1,000-deep proof of 3.14 is not met. Follow-up: shrink the frames on that
-  path or keep an explicit stack for lambda chains (as lists and tuples have
-  in the dump), then prove 1,000 levels on Linux through all five walkers.
+- **D9. Four parsers of one grammar (tooling).** The old parser
+  (`stage_03_parse`), the table path, the tree path and the formatter's copy
+  all implement the one grammar, and a syntax change lands in each (the
+  parity gates keep the first three in agreement; the formatter has none).
+  M6 deletes the table path. The LSP and formatter tree is a separate later
+  plan (section 1, non-goals).
 
 The M6 ceiling is decided and stays in section 7.3. Recovery, opaque minting,
 per-module interning, tree output, ordinary-record syntax values, glue
