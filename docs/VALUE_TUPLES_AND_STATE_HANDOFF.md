@@ -25,7 +25,7 @@ performance claim.
 | Increment | Scope | Depends on | Decision before landing |
 | --- | --- | --- | --- |
 | 2 | Multi-value parameters/results and boxes only at defined boundaries | Implemented 1 | Prove the ABI, ownership and re-boxing rules below. |
-| 3 | Consuming clones for multi-value results; simple reads first within an expression | 2 and the `cancelled-loop-var-record-leaks` fix | Check clone growth and the stage-2 cost ceiling below. |
+| 3 | Consuming clones for multi-value results; simple reads first within an expression | 2 | Check clone growth and the stage-2 cost ceiling below. |
 | 4 | Place liveness for variables and last-use releases | 3 | Show one notion of last use across clones and Perceus, including derived borrows and cancellation. |
 | 5 | Field places and conditional takes | 4; first re-measure M0 | Proceed only if remaining field-copy cost justifies it. |
 | 7 | Stored tuples in fields, lists and optional results; `enumerate` without materialization | 2; independent of 3-5 | Fresh dynamic census first; measure each storage boundary separately. |
@@ -182,8 +182,8 @@ with an unmanaged result. It never moves a user call, a managed read or a
 read across statements. This lets `state.module` be read before an element
 updates `state`, without changing which effects or divergences occur.
 
-Fix `cancelled-loop-var-record-leaks` first: a cancelled loop already leaks
-with `(table, id) = table.intern(w)`. Then prove an immutable-binder
+A cancelled loop that threads state through `(table, id) = table.intern(w)`
+no longer leaks (`loop_var_cancelled_sleep`). Prove an immutable-binder
 recursive-descent fixture reaches consuming clones through each returned
 state. Check `UnpackLetExpr` binder tracking, result-element update benefit,
 parity of original contracts, clone count and emitted C bytes. The two-owned

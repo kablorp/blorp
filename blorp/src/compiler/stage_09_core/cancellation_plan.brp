@@ -990,8 +990,14 @@ private pure func let_cleanup_action(
 	typ: CoreType,
 	rhs: CoreExpr,
 ) -> Option[CancellationCleanupAction]:
-	if variable.name == "_" or is_mutable:
+	if variable.name == "_":
 		None
+	else if is_mutable:
+		-- Later assignments install values of their own, so the initializer's
+		-- immortality says nothing about what the variable holds at a park.
+		cancellation_cleanup_action_for_release_policy(
+			CoreTypePolicy.cleanup_release_policy_for_type(typ),
+		)
 	else:
 		match rhs:
 			StaticStringLiteralExpr(_, _, _, _):
@@ -1106,8 +1112,7 @@ self-tail call lowered to a loop reassigns every parameter on each
 iteration, and an assignment can name a parameter. A cleanup frame records
 the value it was pushed with, so an entry slot would release the first
 value after the function had already handed it on. A function that rebinds
-a parameter keeps its owned parameters unprotected, as a `var` reassigned in
-a loop is today (docs/issues/cancelled-loop-var-record-leaks.md).
+a parameter keeps its owned parameters unprotected.
 ---
 private pure func expr_rebinds_parameter(expr: CoreExpr, parameters: List[CoreVar]) -> Bool:
 	match expr:
@@ -1206,9 +1211,16 @@ private pure func analyze_current_behavior_expr(
 				typ,
 				rhs,
 			)
+			-- A `var` that the body consumes before any suspension may be assigned
+			-- a new value afterwards (a loop reassigning it, say), and that value
+			-- is the one a park finds. Only a direct return ends a `var`'s
+			-- ownership for good.
 			body_takes_ownership: Bool = (
 				vars_contain(body_facts.direct_returns, variable)
-				or vars_contain(body_facts.consumed_before_suspension, variable)
+				or (
+					not is_mutable
+					and vars_contain(body_facts.consumed_before_suspension, variable)
+				)
 			)
 
 			crosses_cancellation: Bool = match mode:
@@ -2084,6 +2096,7 @@ private RUNTIME_CALL_CANCELLATION_POINT_SYMBOLS: List[String] = [
 	"__blorp_cancel_current_task_if_requested",
 	"__blorp_concurrent_join_timeout",
 	"__blorp_task_cleanup_drain",
+	"__blorp_task_cleanup_rearm_slow",
 	"__blorp_task_fiber_entry",
 	"__blorp_task_wait_completed_uncancellable",
 	"__blorp_task_worker",
@@ -2209,6 +2222,7 @@ private RUNTIME_CALL_CANCELLATION_POINT_SYMBOLS: List[String] = [
 	"blorp_task_cleanup_push",
 	"blorp_task_cleanup_push_task",
 	"blorp_task_cleanup_push_with_task",
+	"blorp_task_cleanup_rearm_with_task",
 	"blorp_task_cleanup_scope_exit",
 	"blorp_task_cleanup_scope_exit_with_task",
 	"blorp_tcp_accept",

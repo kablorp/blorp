@@ -1144,6 +1144,9 @@ void __blorp_task_cleanup_push_task_slow(blorp_CancelCleanupFrame* frame,
 void __blorp_task_cleanup_duplicate_slot_slow(const void* slot);
 void __blorp_task_cleanup_pop_slot_slow(const void* slot);
 void __blorp_task_cleanup_scope_exit_slow(blorp_CancelCleanupFrame* frame);
+void __blorp_task_cleanup_rearm_slow(blorp_CancelCleanupFrame* frame,
+                                     const void* slot, void* value,
+                                     blorp_CancelCleanupFn release_value);
 
 static inline void blorp_task_cleanup_push(blorp_CancelCleanupFrame* frame,
                                            const void* slot, void* value,
@@ -1202,6 +1205,15 @@ static inline void blorp_task_cleanup_push_with_task(
 ) {
     if (__builtin_expect(task != NULL, 0)) {
         __blorp_task_cleanup_push_slow(frame, slot, value, release_value);
+    }
+}
+
+static inline void blorp_task_cleanup_rearm_with_task(
+    blorp_CancelCleanupFrame* frame, const void* slot, void* value,
+    blorp_CancelCleanupFn release_value, void* task
+) {
+    if (__builtin_expect(task != NULL, 0)) {
+        __blorp_task_cleanup_rearm_slow(frame, slot, value, release_value);
     }
 }
 

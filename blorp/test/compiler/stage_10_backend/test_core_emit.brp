@@ -24083,6 +24083,78 @@ pure func cancelling_let_bytes_alias_return_function() -> CoreFunction:
 
 
 ---
+A `var` of owned bytes that a loop reassigns before each `sleep`: the shape of
+`table = { table | ... }` in a loop that parks. Core keeps the `var` mutable
+here, unlike a `var` assigned outside any loop.
+---
+pure func cancelling_loop_var_reassignment_function() -> CoreFunction:
+	held_var: CoreVar = named_var("held")
+
+	{
+		name = "cancelling_loop_var_reassignment",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(
+			LetExpr(
+				held_var,
+				True,
+				bytes_type(),
+				CallExpr(
+					direct_runtime_call_kind("blorp_bytes_make"),
+					VarExpr(named_var("blorp_bytes_make"), closure_type(), synthetic_core_source_loc()),
+					[LiteralExpr(IntLiteral(1), int_type(), synthetic_core_source_loc())],
+					bytes_type(),
+					synthetic_core_source_loc(),
+				),
+				SeqExpr(
+					ForRangeExpr(
+						range_loop_binder(),
+						LiteralExpr(IntLiteral(3), int_type(), synthetic_core_source_loc()),
+						LiteralExpr(IntLiteral(0), int_type(), synthetic_core_source_loc()),
+						SeqExpr(
+							AssignExpr(
+								held_var,
+								CallExpr(
+									direct_runtime_call_kind("blorp_bytes_make"),
+									VarExpr(
+										named_var("blorp_bytes_make"),
+										closure_type(),
+										synthetic_core_source_loc(),
+									),
+									[LiteralExpr(IntLiteral(2), int_type(), synthetic_core_source_loc())],
+									bytes_type(),
+									synthetic_core_source_loc(),
+								),
+								VoidType,
+								synthetic_core_source_loc(),
+							),
+							CallExpr(
+								direct_runtime_call_kind("blorp_sleep"),
+								VarExpr(named_var("blorp_sleep"), closure_type(), synthetic_core_source_loc()),
+								[LiteralExpr(IntLiteral(0), int_type(), synthetic_core_source_loc())],
+								VoidType,
+								synthetic_core_source_loc(),
+							),
+						),
+						VoidType,
+						synthetic_core_source_loc(),
+					),
+					LiteralExpr(IntLiteral(0), int_type(), synthetic_core_source_loc()),
+				),
+			),
+		),
+		is_pure = False,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = 1913,
+		loc = synthetic_core_source_loc()
+	}
+
+
+---
 The moved-reference fixtures are source-shaped Core: the emit helper runs
 Perceus, which adds the `DUP`s and `DROP`s. `payload` is an owned String
 local, `peek` borrows a String after the cancellation point to keep `payload`
@@ -26918,6 +26990,35 @@ pure func test_emit_cancelling_let_alias_return_tracks_only_the_alias() -> Bool:
 	)
 
 
+---
+A task cancelled while parked in a loop that reassigns a `var` must release the
+value the last completed iteration stored. A cleanup frame records the value it
+was pushed with, so the assignment arms the frame again for the new value;
+the frame pushed once at the `let` counts only the initializer.
+---
+pure func test_emit_loop_var_assignment_rearms_cleanup_slot() -> Bool:
+	program: CoreProgram = {
+		decls = [FunctionDecl(cancelling_loop_var_reassignment_function())],
+		foreign_includes = [],
+		source_files = []
+	}
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
+	function: String = emitted_function_definition(
+		artifact.c_code,
+		"static long cancelling_loop_var_reassignment(void)",
+	)
+	push: String = "blorp_task_cleanup_push_with_task(&__blorp_cleanup_held, &held,"
+	rearm: String = "blorp_task_cleanup_rearm_with_task(&__blorp_cleanup_held, &held,"
+
+	(
+		function.count("blorp_CancelCleanupFrame __blorp_cleanup_held;") == 1
+		and function.count(push) == 1
+		and function.count(rearm) == 1
+		and emitted_in_order(function, "held = ", rearm)
+		and emitted_in_order(function, rearm, "blorp_sleep(0)")
+	)
+
+
 pure func emitted_in_order(c_code: String, earlier: String, later: String) -> Bool:
 	match (c_code.index_of(earlier), c_code.index_of(later)):
 		(Some(earlier_index), Some(later_index)):
@@ -29747,6 +29848,10 @@ tests: TestSuite = {
 		(
 			"emit cancelling let alias return tracks only the alias",
 			test_emit_cancelling_let_alias_return_tracks_only_the_alias,
+		),
+		(
+			"emit loop var assignment rearms cleanup slot",
+			test_emit_loop_var_assignment_rearms_cleanup_slot,
 		),
 		(
 			"emit owned parameter slot pushed at entry",

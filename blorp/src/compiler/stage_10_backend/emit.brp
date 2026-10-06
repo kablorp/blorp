@@ -10040,12 +10040,11 @@ private pure func emit_set_constructor(
 			)
 
 
-private pure func emit_dict_insert_statement(
+private pure func render_dict_insert_statement(
 	entry: CoreDictEntry,
-	emission_context: FunctionEmissionContext,
-) -> Option[String]:
-	key_c ?= emit_boxed_pointer_value(entry.key, emission_context)
-	value_c ?= emit_boxed_pointer_value(entry.value, emission_context)
+	key_c: String,
+	value_c: String,
+) -> String:
 	key_transfers_ownership: Bool = (
 		entry.key.transfers_ownership
 		and not expr_is_static_immortal(entry.key.value)
@@ -10056,13 +10055,22 @@ private pure func emit_dict_insert_statement(
 		and not expr_is_static_immortal(entry.value.value)
 	)
 
-	Some(render_prepared_backend_op(BackendDictInsert({
+	render_prepared_backend_op(BackendDictInsert({
 		temp_seed = DICT_CONSTRUCT_TEMP_SEED,
 		key = key_c,
 		value = value_c,
 		key_transfers_ownership = key_transfers_ownership,
 		value_transfers_ownership = value_transfers_ownership,
-	})))
+	}))
+
+
+private pure func emit_dict_insert_statement(
+	entry: CoreDictEntry,
+	emission_context: FunctionEmissionContext,
+) -> Option[String]:
+	key_c ?= emit_boxed_pointer_value(entry.key, emission_context)
+	value_c ?= emit_boxed_pointer_value(entry.value, emission_context)
+	Some(render_dict_insert_statement(entry, key_c, value_c))
 
 
 private pure func emit_dict_insert_statements(
@@ -10089,17 +10097,20 @@ private pure func emit_dict_insert_statements(
 		Some(statements)
 
 
-private pure func emit_dict_construct(
+---
+The literal's constructor around already rendered entry inserts, whichever
+form (expression or statement) produced them.
+---
+private pure func render_dict_construct(
 	construct: CoreDictConstruct,
+	insert_statements: String,
 	emission_context: FunctionEmissionContext,
-) -> Option[String]:
+) -> String:
 	ctor_c: String = emit_dict_constructor(emission_context.symbol_authority, construct.constructor)
 
 	if construct.entries.length() == 0 and not construct.value_needs_release:
-		Some(render_prepared_backend_op(BackendDictConstructEmpty(ctor_c)))
+		render_prepared_backend_op(BackendDictConstructEmpty(ctor_c))
 	else:
-		insert_statements ?= emit_dict_insert_statements(construct.entries, emission_context)
-
 		release_init: String = if construct.value_needs_release:
 			render_prepared_backend_op(BackendDictValueReleaseInit(DICT_CONSTRUCT_TEMP_SEED))
 		else:
@@ -10112,7 +10123,79 @@ private pure func emit_dict_construct(
 			insert_statements = insert_statements
 		}
 
-		Some(render_prepared_backend_op(BackendDictConstructWithBody(args)))
+		render_prepared_backend_op(BackendDictConstructWithBody(args))
+
+
+private pure func emit_dict_construct(
+	construct: CoreDictConstruct,
+	emission_context: FunctionEmissionContext,
+) -> Option[String]:
+	insert_statements ?= emit_dict_insert_statements(construct.entries, emission_context)
+	Some(render_dict_construct(construct, insert_statements, emission_context))
+
+
+---
+The statement form of `emit_dict_insert_statement`, for an entry whose key or
+value has no expression form: a call that hands a cancellable local over pops
+that local's cleanup slot first, which takes statements. Each entry's
+statements stay ahead of its own insert inside the literal, so entries still
+evaluate in source order.
+---
+private pure func emit_dict_insert_body(
+	entry: CoreDictEntry,
+	next_temp: Int,
+	emission_context: FunctionEmissionContext,
+) -> Option[FunctionBodyC]:
+	entry_context: FunctionEmissionContext = nested_emission_context(emission_context)
+	key_body ?= emit_boxed_pointer_body(entry.key, next_temp, entry_context)
+	key_c ?= required_body_value(key_body)
+	value_body ?= emit_boxed_pointer_body(entry.value, key_body.next_temp, entry_context)
+	value_c ?= required_body_value(value_body)
+
+	Some({
+		statements = key_body.statements + value_body.statements + render_dict_insert_statement(
+			entry,
+			key_c,
+			value_c,
+		),
+		value = "",
+		next_temp = value_body.next_temp,
+		returns = False,
+	})
+
+
+---
+A dict literal with an entry that needs statements. The simple form is tried
+first by the caller; this one builds the same constructor around the
+per-entry bodies.
+---
+private pure func emit_dict_construct_body(
+	construct: CoreDictConstruct,
+	next_temp: Int,
+	emission_context: FunctionEmissionContext,
+) -> Option[FunctionBodyC]:
+	var insert_statements: String = ""
+	var entries_next_temp: Int = next_temp
+	var failed: Bool = False
+
+	for entry in construct.entries:
+		if not failed:
+			match emit_dict_insert_body(entry, entries_next_temp, emission_context):
+				Some(entry_body):
+					insert_statements += entry_body.statements
+					entries_next_temp = entry_body.next_temp
+				None:
+					failed = True
+
+	if failed:
+		None
+	else:
+		Some(
+			body_value(
+				render_dict_construct(construct, insert_statements, emission_context),
+				entries_next_temp,
+			),
+		)
 
 
 private enum ListStoreMode:
@@ -13752,9 +13835,7 @@ private pure func let_cleanup_policy(
 ) -> CoreReleasePolicy:
 	if variable.name == "_":
 		NoReleasePolicy
-	else if is_mutable:
-		NoReleasePolicy
-	else if expr_is_static_immortal(rhs):
+	else if not is_mutable and expr_is_static_immortal(rhs):
 		NoReleasePolicy
 	else:
 		CoreTypePolicy.cleanup_release_policy_for_type(typ)
@@ -13766,12 +13847,76 @@ private pure func cancellation_cleanup_push_statement(
 	policy: CoreReleasePolicy,
 ) -> String:
 	match owned_temp_cleanup_kind(policy):
-		Some(kind):
-			var_name: String = c_var_name(variable)
+		Some(_):
 			frame_name: String = cleanup_frame_name(variable)
-			indent + "blorp_CancelCleanupFrame " + frame_name + ";\n" + indent + "BLORP_TASK_CLEANUP_SCOPE_WITH_TASK(" + frame_name + ", __blorp_task);\n" + indent + "blorp_task_cleanup_push_with_task(&" + frame_name + ", &" + var_name + ", " + owned_temp_cleanup_arguments(var_name, kind) + ", __blorp_task);\n"
+			indent + "blorp_CancelCleanupFrame " + frame_name + ";\n" + indent + "BLORP_TASK_CLEANUP_SCOPE_WITH_TASK(" + frame_name + ", __blorp_task);\n" + cancellation_cleanup_link_statement(
+				indent,
+				"blorp_task_cleanup_push_with_task",
+				variable,
+				policy,
+			)
 		None:
 			""
+
+
+---
+Links the variable's already declared cleanup frame, counting the reference
+the variable holds now, with the runtime operation `link_function` names: a
+`let` pushes its fresh frame once, right after declaring it; an assignment
+re-arms it for the value it stores (see `assignment_cleanup_rearm_statement`).
+---
+private pure func cancellation_cleanup_link_statement(
+	indent: String,
+	link_function: String,
+	variable: CoreVar,
+	policy: CoreReleasePolicy,
+) -> String:
+	match owned_temp_cleanup_kind(policy):
+		Some(kind):
+			var_name: String = c_var_name(variable)
+			indent + link_function + "(&" + cleanup_frame_name(
+				variable,
+			) + ", &" + var_name + ", " + owned_temp_cleanup_arguments(var_name, kind) + ", __blorp_task);\n"
+		None:
+			""
+
+
+---
+What an assignment to a `var` emits after the store. A cleanup frame records
+the value it was pushed with, so the frame armed for the old value cannot
+count the new one. The variable the right-hand side moves from gives up its
+unit first, as in a `let` and whether or not this `var` is tracked: a unit
+left on the source would be released again after the new owner is done. A
+tracked `var` then re-arms its frame. The runtime unlinks the frame first if
+it is still linked, because the old value's slot can still hold a unit when
+every reference to that value is gone (a duplicate that moved into an
+aggregate without a pop), and pushing a linked frame would link it to itself.
+Without the re-arm, a task cancelled while parked after an assignment would
+leak the value of the last assignment that completed: a loop's last
+iteration, or an `if` branch that stored a new value. Straight-line
+assignments are lowered to fresh `let` bindings and never reach this; those
+under a loop or a branch do.
+---
+private pure func assignment_cleanup_rearm_statement(
+	variable: CoreVar,
+	rhs: CoreExpr,
+	emission_context: FunctionEmissionContext,
+) -> String:
+	source_pop: String = moved_operand_cleanup_pop_statement(rhs, emission_context)
+
+	match cancellation_let_protection(emission_context.cleanup_plan, variable):
+		Some(decision):
+			if activation_requires_local_owner_protection(emission_context) and decision.tracks_cleanup:
+				source_pop + cancellation_cleanup_link_statement(
+					emission_context.indent,
+					"blorp_task_cleanup_rearm_with_task",
+					variable,
+					CoreTypePolicy.cleanup_release_policy_for_type(core_expr_type(rhs)),
+				)
+			else:
+				source_pop
+		None:
+			source_pop
 
 
 ---
@@ -13812,9 +13957,8 @@ Pops one unit from a tracked variable's cleanup slot where a moving position
 takes one of its references: a `let` whose right-hand side is the variable
 (or `DUP v; v`), or an operand a constructor takes over. Without it the slot
 and the new owner would both release that reference on cancellation. The pop
-is unconditional on the receiver: a mutable `var x = v` has no slot of its
-own, but leaving the unit on `v` would release it again after `x` has
-consumed or replaced it. `cancellation_variable_requires_protection` already
+is unconditional on the receiver: a unit left on `v` would be released
+again after the new owner has consumed or replaced the reference. `cancellation_variable_requires_protection` already
 answers False when the activation protects no locals, and
 `owned_temp_cleanup_pop_statement` emits nothing for a type without a
 cleanup release function, as in `call_arg_requires_transfer_cleanup_pop`.
@@ -23143,7 +23287,11 @@ private pure func emit_function_body(
 				Some({
 					statements = rhs_c.statements + emission_context.indent + c_var_name(
 						variable,
-					) + " = " + rhs_c.value + ";\n",
+					) + " = " + rhs_c.value + ";\n" + assignment_cleanup_rearm_statement(
+						variable,
+						rhs,
+						emission_context,
+					),
 					value = "",
 					next_temp = rhs_c.next_temp,
 					returns = False,
@@ -23284,8 +23432,11 @@ private pure func emit_function_body(
 				returns = body_c.returns,
 			})
 		DictConstructExpr(construct, typ, loc):
-			value ?= emit_simple_expr(expr, emission_context)
-			Some(body_value(value, next_temp))
+			match emit_simple_expr(expr, emission_context):
+				Some(value):
+					Some(body_value(value, next_temp))
+				None:
+					emit_dict_construct_body(construct, next_temp, emission_context)
 		DictExpr(entries, typ, loc):
 			None
 		SetAllocExpr(alloc, typ, loc):

@@ -3575,6 +3575,9 @@ void __blorp_task_cleanup_push_task_slow(blorp_CancelCleanupFrame* frame,
 void __blorp_task_cleanup_duplicate_slot_slow(const void* slot);
 void __blorp_task_cleanup_pop_slot_slow(const void* slot);
 void __blorp_task_cleanup_scope_exit_slow(blorp_CancelCleanupFrame* frame);
+void __blorp_task_cleanup_rearm_slow(blorp_CancelCleanupFrame* frame,
+                                     const void* slot, void* value,
+                                     blorp_CancelCleanupFn release_value);
 void blorp_task_cancel(void* t);
 void blorp_task_cancel_join_release(void* t);
 
@@ -26160,6 +26163,19 @@ void __blorp_task_cleanup_scope_exit_slow(blorp_CancelCleanupFrame* frame) {
     }
 }
 
+// Counts the value an assignment just stored into a `var` whose frame was
+// pushed earlier. Every reference to the old value is gone by now, so any unit
+// still counted on the frame (a duplicate that moved into an aggregate without
+// its own pop) refers to nothing: unlink the frame if it is still linked, then
+// push it again for the new value. Pushing a linked frame would make it point
+// at itself and hang cancellation.
+void __blorp_task_cleanup_rearm_slow(blorp_CancelCleanupFrame* frame,
+                                     const void* slot, void* value,
+                                     blorp_CancelCleanupFn release_value) {
+    __blorp_task_cleanup_scope_exit_slow(frame);
+    __blorp_task_cleanup_push_slow(frame, slot, value, release_value);
+}
+
 static inline void blorp_task_cleanup_push(blorp_CancelCleanupFrame* frame,
                                            const void* slot, void* value,
                                            blorp_CancelCleanupFn release_value) {
@@ -26253,6 +26269,23 @@ static inline void blorp_task_cleanup_push_with_task(
 #else
     if (__builtin_expect(task != NULL, 0)) {
         __blorp_task_cleanup_push_slow(frame, slot, value, release_value);
+    }
+#endif
+}
+
+static inline void blorp_task_cleanup_rearm_with_task(
+    blorp_CancelCleanupFrame* frame, const void* slot, void* value,
+    blorp_CancelCleanupFn release_value, void* task
+) {
+#if defined(__clang_analyzer__)
+    (void)frame;
+    (void)slot;
+    (void)value;
+    (void)release_value;
+    (void)task;
+#else
+    if (__builtin_expect(task != NULL, 0)) {
+        __blorp_task_cleanup_rearm_slow(frame, slot, value, release_value);
     }
 #endif
 }

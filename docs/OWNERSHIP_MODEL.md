@@ -180,6 +180,18 @@ gives a local no slot at all when its own reference is handed on before any
 cancellation point; a move under a `DUP` of the same local does not count,
 because the local keeps its own reference.
 
+A `var` gets a slot like a `let`, with one addition. A frame records the value
+it was pushed with, so an assignment pushes the `var`'s frame again for the
+value it stores (`blorp_task_cleanup_rearm_with_task`), unlinking it first if
+a unit is still counted on it. The assignment pops nothing for the old value,
+since whatever consumed it already did, but it pops the source of a `var` or
+`x = y` right-hand side, as a `let` does. A `var` assigned in a loop that parks,
+or only under a branch, therefore releases its last stored value when the task
+is cancelled. A consumption before a park does not end a `var`'s ownership,
+because a later assignment can give it a new value; only a direct return does.
+Straight-line assignments are lowered to fresh `let` bindings and need none of
+this.
+
 Parameters follow the same rule, by how the caller passes them. A caller
 lends a borrowed parameter and keeps both the reference and the slot that
 counts it, so the callee never pushes, duplicates or pops a slot for it. A

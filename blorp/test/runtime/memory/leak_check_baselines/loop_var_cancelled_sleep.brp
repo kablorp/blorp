@@ -1,0 +1,111 @@
+-- A `var` is reassigned in a loop or under a branch, then the task is
+-- cancelled while parked. Cancellation cleanup must release the value of the
+-- last assignment that completed: an assignment re-arms the variable's cleanup
+-- slot for the value it stores, so none of the shapes below may leak or hang.
+-- Straight-line assignments are lowered to fresh `let`s and were never
+-- affected.
+import:
+	test: cancel_after_parked_for_test
+
+
+record Rows {
+	items: List[Int],
+	count: Int
+}
+
+
+pure func intern(table: Rows, word: Int) -> (Rows, Int):
+	({ table | count = table.count + word }, table.count)
+
+
+func record_update_then_sleep(seed: Int) -> Int:
+	var table: Rows = { items = [seed], count = 1 }
+
+	for i in 0..3:
+		table = { table | count = table.count + i }
+		sleep(10000)
+
+	table.items.length()
+
+
+-- The tuple-threading shape of an interning loop: the old table goes into a
+-- consuming call and a new one comes back.
+func tuple_threaded_then_sleep(seed: Int) -> Int:
+	var table: Rows = { items = [seed], count = 1 }
+	var total: Int = 0
+
+	for word in 0..3:
+		(next_table, id) = table.intern(word)
+		table = next_table
+		total += id
+		sleep(10000)
+
+	table.count + total
+
+
+-- The initializer is a static string, but the later assignments are not.
+func static_initializer_then_sleep(seed: Int) -> Int:
+	var text: String = "start"
+
+	for i in 0..3:
+		text = text + "{seed + i}"
+		sleep(10000)
+
+	text.length()
+
+
+-- The task parks only on a later iteration, so the value found there is one
+-- the loop stored itself, not the initializer.
+func late_park_then_sleep(seed: Int) -> Int:
+	var table: Rows = { items = [seed], count = 1 }
+
+	for i in 0..4:
+		table = { table | count = table.count + i }
+
+		if i == 2:
+			sleep(10000)
+
+	table.count
+
+
+-- Iterating the old value leaves a unit counted on its slot that nothing pops;
+-- re-arming must not link the frame a second time.
+func iterate_then_replace_then_sleep(seed: Int) -> Int:
+	var rows: List[Rows] = [{ items = [seed], count = 1 }]
+	var total: Int = 0
+
+	for i in 0..3:
+		for row in rows:
+			total += row.count
+
+		rows = [{ items = [i], count = i }]
+		sleep(10000)
+
+	total + rows.length()
+
+
+-- No loop: the assignment under the branch is not lowered to a fresh `let`.
+func branch_assignment_then_sleep(seed: Int) -> Int:
+	var table: Rows = { items = [seed], count = 1 }
+
+	if seed > 0:
+		table = { items = [seed, seed], count = 2 }
+	else:
+		table = { items = [], count = 0 }
+
+	sleep(10000)
+	table.count
+
+
+func main(args: List[String]) -> Int:
+	if (
+		cancel_after_parked_for_test(func(): record_update_then_sleep(1))
+		and cancel_after_parked_for_test(func(): tuple_threaded_then_sleep(1))
+		and cancel_after_parked_for_test(func(): static_initializer_then_sleep(1))
+		and cancel_after_parked_for_test(func(): late_park_then_sleep(1))
+		and cancel_after_parked_for_test(func(): iterate_then_replace_then_sleep(1))
+		and cancel_after_parked_for_test(func(): branch_assignment_then_sleep(1))
+	):
+		0
+	else:
+		1
