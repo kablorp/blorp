@@ -3291,6 +3291,50 @@ an exact balanced token shape, with a projection error when provenance is
 missing. This increment does not complete function bodies, blocks, module
 assembly, forward pairing or the full M4 deep-chain gate.
 
+Another bounded M4 increment extends that same-line grammar with positional
+calls, member access and nonempty subscripts. Calls may have no arguments;
+calls and subscripts accept trailing commas. Recognition keeps ID-free recipes
+until the complete initializer boundary is accepted. Minting walks receiver
+and callee spines iteratively, then issues member names and argument/index
+expressions in written order. The legacy projection uses continuations for
+those same spines and keeps raw call, field and subscript syntax; later phases
+decide what the calls and accesses mean.
+
+Supported postfix rejection covers missing closing delimiters at EOF, empty
+subscripts and missing member names. Comma-first arguments, mismatched closing
+delimiters after a parsed item, aggregate operands and multiline tails remain
+explicitly unsupported and restore the exact entry state. This remains a test-only
+expression completion seam; statements, bodies and complete module assembly
+are still open.
+
+The next bounded M4 expression slice is same-line list literals, using the
+existing `ListLiteral` variant. It must retain child-first source-order IDs,
+exact literal token provenance, closing-bracket diagnostics and unsupported
+input rollback. Its depth evidence includes the 1,000-nested-list case through
+parse, dump, ID census and legacy projection. Tuples, braced aggregates,
+strings and control expressions follow in separate slices; the complete M4
+gate still requires bodies and the old typecheck.
+
+Argument nesting is the one recursion in the postfix grammar. It follows
+brackets the source itself nests, as the frozen parser does, and a test parses
+1,000 nested calls `f(f(...))`.
+
+The postfix slice was validated on a fresh build that includes main
+`ff4da4b31`. Focused checks passed 152/152 and declaration-scan checks 14/14,
+all with zero leaked objects under `--leak-check`. The broad gates passed
+`compiler-new` 837/837 and `compiler-new-parity` 3,548/3,548, with zero
+mismatched files under the gate's existing normalization; `compiler-blorp`
+passed 6,594/6,594 at main `dde591ecd`. Depth checks cover a 2,000-call chain
+through parsing, dumping and ID census, and 5,000 mixed field/call/subscript
+steps through legacy projection. The expression opt-in prefix compared 5,200
+completed declarations in 3,398 legacy-accepted corpus modules. It stopped at
+2,891 functions, 61 traits, 61 implementations, 310 unsupported globals and
+75 ends of source, with zero rejected or non-progress stops.
+`scripts/compiler-new-parity` (also run by `scripts/test compiler-new-parity`)
+prints these counts on its "tree prefix agrees with the existing parser for
+every corpus file as a root" line. These are prefix comparisons, not complete
+body or module parity.
+
 Validation before the main reconciliation, at `a5ae15eab`:
 
 The combined fresh-build focused run passed 121/121 tests, including a

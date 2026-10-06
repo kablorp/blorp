@@ -6,10 +6,10 @@ import:
 		NameTable, EMPTY_NAME_TABLE, IdentifierSpellings(SpellingsFromIdentifierText, SpellingsFromNameTable), name_table_spellings
 	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
 	../../../src/compiler/stage_03_parse/parsed_ast:
-		ParsedExpr(ParsedBinaryExpr, ParsedNameExpr, ParsedIntLiteralExpr), ParsedBinaryOp(ParsedAddOp)
+		ParsedExpr(ParsedBinaryExpr, ParsedNameExpr, ParsedIntLiteralExpr, ParsedVoidExpr, ParsedCallExpr, ParsedFieldAccessExpr, ParsedSubscriptExpr), ParsedBinaryOp(ParsedAddOp)
 	../../../src/compiler/stage_03_parse/parsed_ast_json: ast_json_render, parsed_decl_to_json
 	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
-	../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state
+	../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state, issued_ids, spellings
 	../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_source
 	../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
 		parse_declaration_preview, DeclarationPreviewParse(DeferredGlobalInitializer), DeclarationPreview(GlobalDeclarationPreview)
@@ -17,7 +17,13 @@ import:
 		complete_expression_global, GlobalExpressionCompletion(CompletedExpressionGlobal)
 	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
 		ModuleDeclarationPreviewScan, ModuleDeclarationScanStop(ReachedEndOfSource)
-	../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../src/compiler_new/stage_01_discovery/syntax/dump: dumped_module
+	../../../src/compiler_new/stage_01_discovery/syntax/id_census: id_census
+	../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: ModuleSyntax, ModuleItem(GlobalItem)
+	../../../src/compiler_new/stage_01_discovery/syntax/expressions: ExpressionKind(Call, VoidValue)
+	../../../src/compiler_new/stage_01_discovery/syntax/ids: new_id_mint, minted_expression
+	../../../src/compiler_new/stage_01_discovery/tables/span: pack_span
+	../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, source_id_at_row
 	../../../src/lib/source: source_file
 	test: TestSuite
 
@@ -40,6 +46,20 @@ private func projected_expression(text: String) -> Option[(NameTable, ParsedExpr
 				_: None
 
 
+-- Mint this independently of the bounded parser, so its missing postfix
+-- support cannot mask the adapter's current unsupported-expression failure.
+func test_minted_empty_call_projects_raw_ast() -> Bool:
+	lexed = lex_module(module_id_at_row(0), "void()")
+	(mint, callee) = new_id_mint(module_id_at_row(0)).minted_expression(
+		pack_span(source_id_at_row(0), 0, 4), VoidValue
+	)
+	(_, value) = mint.minted_expression(pack_span(source_id_at_row(0), 0, 6), Call(callee, []))
+	match legacy_expression_preview(preview_source(lexed), EMPTY_NAME_TABLE, value):
+		Ok((names, ParsedCallExpr(ParsedVoidExpr(_), arguments, _))):
+			name_table_spellings(names).is_empty() and arguments.is_empty()
+		_: False
+
+
 func test_supported_expressions_match_old_ast_json() -> Bool:
 	var correct: Bool = True
 	for expression in [
@@ -48,6 +68,12 @@ func test_supported_expressions_match_old_ast_json() -> Bool:
 		"left <= right and left > other or left >= last", "left..right",
 		"((007)) + (007.500)", "(left) + ((right))", "True", "False", "(True)", "void", "((void))", "_", "()",
 		"(left + right) * third", "not (left or right)", "-(-007)",
+		"f()", "f(a,)", "f(a, b)", "target.member", "target[index]", "target[first, second,]",
+		"f(a).b[c](d)", "(f)(x)", "((f(x))).member", "((target)).member",
+		"-f(x).member", "(-f(x)).member", "not f(x).member",
+		"root.member(nested(007, other.field), (third + fourth))[index * 2, last,]().tail",
+		"f((007), ((007.500)))[007].member + other[index] * last()",
+		"(left + right)(argument)", "((target[first]))[second]",
 	]:
 		correct = declaration_projection_matches("value = ${expression}") and correct
 	correct
@@ -120,6 +146,97 @@ func test_names_follow_written_order_and_reuse_spelling() -> Bool:
 		None: False
 
 
+func test_postfix_names_follow_written_order() -> Bool:
+	match projected_expression("value = root.first(second.third(fourth))[fifth, sixth].seventh(eighth)"):
+		Some((names, _)):
+			name_table_spellings(names) == ["root", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"]
+		None: False
+
+
+func test_postfix_integer_provenance_fails_closed() -> Bool:
+	var correct: Bool = True
+	for text in ["value = f((007)).member", "value = target[((007))]"]:
+		lexed = lex_module(module_id_at_row(0), text)
+		match new_parse_state(lexed):
+			Err(_): correct = False
+			Ok(entry):
+				(at_value, result) = parse_declaration_preview(entry)
+				match result:
+					DeferredGlobalInitializer(preview):
+						(_, completion) = complete_expression_global(at_value, preview)
+						match completion:
+							CompletedExpressionGlobal(declaration):
+								original = preview_source(lexed)
+								broken = { original | tokens = [] }
+								match legacy_expression_preview(broken, EMPTY_NAME_TABLE, declaration.value):
+									Err(MissingIntegerLiteralToken(_)): void
+									_: correct = False
+							_: correct = False
+					_: correct = False
+	correct
+
+
+-- Assemble only a test fixture from the preview's actual issued indexes.
+-- This does not publish a production accepted module or imply body support.
+func test_parsed_method_chain_dump_and_census() -> Bool:
+	var text: String = "value = root"
+	var steps: Int = 0
+	while steps < 2000:
+		text += ".member()"
+		steps += 1
+	module = module_id_at_row(0)
+	lexed = lex_module(module, text)
+	match new_parse_state(lexed):
+		Err(_): False
+		Ok(entry):
+			(at_value, result) = parse_declaration_preview(entry)
+			match result:
+				DeferredGlobalInitializer(preview):
+					(completed, completion) = complete_expression_global(at_value, preview)
+					match completion:
+						CompletedExpressionGlobal(declaration):
+							issued = issued_ids(completed)
+							syntax: ModuleSyntax = {
+								documentation = None, items = [GlobalItem(declaration)],
+								definitions = issued.definitions, imports = issued.imports, counts = issued.counts
+							}
+							dumped = dumped_module(syntax, spellings(completed))
+							(id_census(module, syntax).is_empty()
+								and issued.counts.expressions == 1 + steps * 2
+								and issued.counts.name_uses == 1 + steps
+								and issued.definitions.length() == 1
+								and dumped.split("(call expr").length() == steps + 1
+								and dumped.split("(field expr").length() == steps + 1)
+						_: False
+				_: False
+
+
+func test_deep_postfix_spine_projects_iteratively() -> Bool:
+	var text: String = "value = root"
+	var steps: Int = 0
+	while steps < 5000:
+		text += ".member()[index]"
+		steps += 1
+	match projected_expression(text):
+		None: False
+		Some((names, value)):
+			var current: ParsedExpr = value
+			var count: Int = 0
+			var walking: Bool = True
+			var correct: Bool = name_table_spellings(names) == ["root", "member", "index"]
+			while walking:
+				match current:
+					ParsedSubscriptExpr(ParsedCallExpr(ParsedFieldAccessExpr(receiver, _, _), arguments, _), indices, _):
+						correct = correct and arguments.is_empty() and indices.length() == 1
+						current = receiver
+						count += 1
+					ParsedNameExpr(_): walking = False
+					_:
+						correct = False
+						walking = False
+			correct and count == steps
+
+
 func test_deep_binary_left_spine_projects_iteratively() -> Bool:
 	var text: String = "value = item"
 	var terms: Int = 1
@@ -148,11 +265,16 @@ func test_deep_binary_left_spine_projects_iteratively() -> Bool:
 tests: TestSuite = {
 	description = "Tree expression legacy projection",
 	tests = [
+		("minted empty call retains raw AST", test_minted_empty_call_projects_raw_ast),
 		("supported expression AST JSON parity", test_supported_expressions_match_old_ast_json),
 		("completed global full declaration parity", test_completed_global_matches_full_old_declaration),
 		("grouped integer preserves authored digits", test_grouped_integer_keeps_exact_digits),
 		("missing integer token fails closed", test_missing_integer_token_fails_closed),
 		("names follow written order", test_names_follow_written_order_and_reuse_spelling),
+		("postfix names follow written order", test_postfix_names_follow_written_order),
+		("postfix integer provenance fails closed", test_postfix_integer_provenance_fails_closed),
+		("parsed method chain survives dump and ID census", test_parsed_method_chain_dump_and_census),
+		("deep postfix projection uses an iterative walk", test_deep_postfix_spine_projects_iteratively),
 		("deep binary projection uses an iterative walk", test_deep_binary_left_spine_projects_iteratively)
 	]
 }

@@ -4476,16 +4476,24 @@ private pure func preview_completed_global(
 	}), declaration.visibility, declaration.span)))
 
 
--- A continuation holds the completed left child while the right child is
--- visited. The state distinguishes descent from a completed value, so there
--- is no partial result stack and no recursive walk down a binary left spine.
+-- Continuations retain completed children while their siblings are visited.
+-- Descent and completed values are separate states, so binary and postfix
+-- left spines never recurse and names are interned in written order.
 private union PreviewPairOperator:
 	PreviewBinaryOperator(ParsedBinaryOp)
 	PreviewLogicalOperator(ParsedLogicalOp)
 	PreviewRangeOperator
 
 
+private enum PreviewArgumentOperator:
+	PreviewCallOperator
+	PreviewSubscriptOperator
+
+
 private union PreviewExpressionContinuation:
+	FinishPreviewField(WrittenName, Span)
+	VisitPreviewArguments(PreviewArgumentOperator, List[TreeExpressions.Expression], Span)
+	FinishPreviewArgument(PreviewArgumentOperator, ParsedExpr, List[TreeExpressions.Expression], Int, List[ParsedExpr], Span)
 	FinishPreviewUnary(ParsedUnaryOp, Span)
 	VisitPreviewRight(PreviewPairOperator, TreeExpressions.Expression, Span)
 	FinishPreviewPair(PreviewPairOperator, ParsedExpr, Span)
@@ -4542,6 +4550,15 @@ pure func legacy_expression_preview(
 							TreeExpressions.LogicalOr: ParsedOrOp
 						continuations = continuations.append(VisitPreviewRight(PreviewLogicalOperator(legacy_operator), right, current.span))
 						walk = VisitPreviewExpression(left)
+					TreeExpressions.FieldAccess(receiver, field):
+						continuations = continuations.append(FinishPreviewField(field.name, current.span))
+						walk = VisitPreviewExpression(receiver)
+					TreeExpressions.Call(callee, arguments):
+						continuations = continuations.append(VisitPreviewArguments(PreviewCallOperator, arguments, current.span))
+						walk = VisitPreviewExpression(callee)
+					TreeExpressions.Subscript(receiver, indices):
+						continuations = continuations.append(VisitPreviewArguments(PreviewSubscriptOperator, at_least_one_items(indices), current.span))
+						walk = VisitPreviewExpression(receiver)
 					TreeExpressions.RangeExpression(left, right):
 						continuations = continuations.append(VisitPreviewRight(PreviewRangeOperator, right, current.span))
 						walk = VisitPreviewExpression(left)
@@ -4556,6 +4573,25 @@ pure func legacy_expression_preview(
 					Some(continuation):
 						continuations = continuations.drop_last()
 						match continuation:
+							FinishPreviewField(field, span):
+								(after_name, name) = preview_identifier(source, extended, field)
+								extended = after_name
+								walk = ReturnPreviewExpression(ParsedFieldAccessExpr(completed, name, legacy_location(span)))
+							VisitPreviewArguments(operator, arguments, span):
+								match arguments.get(0):
+									None:
+										walk = ReturnPreviewExpression(preview_argument_expression(operator, completed, [], span))
+									Some(first):
+										continuations = continuations.append(FinishPreviewArgument(operator, completed, arguments, 1, [], span))
+										walk = VisitPreviewExpression(first)
+							FinishPreviewArgument(operator, receiver, arguments, next, parsed, span):
+								completed_arguments = parsed.append(completed)
+								match arguments.get(next):
+									None:
+										walk = ReturnPreviewExpression(preview_argument_expression(operator, receiver, completed_arguments, span))
+									Some(argument):
+										continuations = continuations.append(FinishPreviewArgument(operator, receiver, arguments, next + 1, completed_arguments, span))
+										walk = VisitPreviewExpression(argument)
 							FinishPreviewUnary(operator, span):
 								walk = ReturnPreviewExpression(ParsedUnaryExpr(operator, completed, legacy_location(span)))
 							VisitPreviewRight(operator, right, span):
@@ -4569,6 +4605,14 @@ pure func legacy_expression_preview(
 									PreviewRangeOperator: ParsedRangeExpr(left, completed, location)
 								walk = ReturnPreviewExpression(parsed)
 	result
+
+
+private pure func preview_argument_expression(
+	operator: PreviewArgumentOperator, receiver: ParsedExpr, arguments: List[ParsedExpr], span: Span,
+) -> ParsedExpr:
+	match operator:
+		PreviewCallOperator: ParsedCallExpr(receiver, arguments, legacy_location(span))
+		PreviewSubscriptOperator: ParsedSubscriptExpr(receiver, arguments, legacy_location(span))
 
 
 private pure func preview_binary_operator(operator: TreeExpressions.BinaryOperator) -> ParsedBinaryOp:

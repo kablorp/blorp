@@ -6,15 +6,18 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_expression_parser:
 		parse_same_line_expression, ExpressionParse(ParsedExpression, UnsupportedExpression, RejectedExpression)
 	../../../../src/compiler_new/stage_01_discovery/syntax/expressions:
-		ExpressionKind(NameReference, IntegerLiteral, Unary, Binary, ShortCircuit, RangeExpression),
+		ExpressionKind(NameReference, IntegerLiteral, Unary, Binary, ShortCircuit, RangeExpression, Call, FieldAccess, Subscript),
 		UnaryOperator(Negate), BinaryOperator(Add, Multiply), LogicalOperator(LogicalOr, LogicalAnd)
 	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(Plain, ExpectedToken)
 	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(ExpectedExpressionDiagnostic)
-	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedRightParen), RightParenConstruct(RightParenInGroupedExpression)
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token:
+		ExpectedTokenDiagnostic(ExpectedRightParen), RightParenConstruct(RightParenInGroupedExpression)
 	../../../../src/compiler_new/stage_01_discovery/syntax/ids: expression_local_index, name_use_local_index
 	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
 	../../../../src/compiler_new/stage_01_discovery/tables/span: span_start, span_end, spans_equal
 	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_count, spelling_text_at
+	../../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: reject_preview
+	../../../../src/compiler_new/stage_01_discovery/diagnostics/rejected_syntax_render: render_rejected_diagnostics
 	test: TestSuite
 
 
@@ -93,7 +96,7 @@ pure func test_logical_and_range_have_explicit_forms() -> Bool:
 
 pure func test_unsupported_returns_original_state() -> Bool:
 	var correct = True
-	for text in ["first + call()", "(first, other)", "name.field", "1\n.field", "1\n\t.field", "1 +\n 2", "(\n1)", "not [1]", "first + \"text\"", "()()", "(\n)", "(007\n)", "(name\n)"]:
+	for text in ["call([1])", "name.field(1, {x = 2})", "(first, other)", "1\n.field", "1\n\t.field", "1 +\n 2", "(\n1)", "not [1]", "first + \"text\"", "(\n)", "(007\n)", "(name\n)", "f(1,\n2)", "f(\n)", "f(x)[[1]]", "f(if True: 1 else: 2)", "f(x)\n.member", "target.member(1, [2])", "f(,x)", "f(x]"]:
 		match new_parse_state(lex_module(module_id_at_row(0), text)):
 			Ok(entry):
 				(parsed, result) = parse_same_line_expression(entry)
@@ -173,6 +176,130 @@ pure func test_long_sum_is_left_associative_without_recursive_left_walk() -> Boo
 		Err(_): False
 
 
+pure func test_postfix_source_order_and_spans() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "target.member(arg,)[index,]")):
+		Ok(entry):
+			(parsed, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					match value.kind:
+						Subscript(call, indices):
+							match call.kind:
+								Call(field, args):
+									match field.kind:
+										FieldAccess(target, member):
+											(target.id.expression_local_index() == 0 and member.use.name_use_local_index() == 1
+												and field.id.expression_local_index() == 1 and call.id.expression_local_index() == 3
+												and indices.first.id.expression_local_index() == 4 and value.id.expression_local_index() == 5
+												and args.length() == 1 and indices.rest.is_empty()
+												and value.span.span_start() == 0 and value.span.span_end() == 27
+												and parsed.issued_counts().name_uses == 4 and parsed.diagnostic_count() == 0)
+										_: False
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+-- Rows: source, rendered message, rendered help, and the byte offset where
+-- the empty diagnostic span sits (an unclosed delimiter reports at EOF).
+pure func test_postfix_rejection_has_exact_diagnostic_and_no_ids() -> Bool:
+	call_message = "expected `)` after call arguments"
+	call_help = "close the parenthesis opened earlier with `)`"
+	subscript_message = "expected `]` after subscript"
+	subscript_help = "close the bracket opened earlier with `]`"
+	cases = [
+		("f(", call_message, call_help, 2),
+		("f(1", call_message, call_help, 3),
+		("f(1,", call_message, call_help, 4),
+		("f[", subscript_message, subscript_help, 2),
+		("f[1", subscript_message, subscript_help, 3),
+		("f[]", "expected expression", "write a value, a name or a call here", 2),
+		("f.", "expected field name", "write an identifier here; it starts with a letter or `_` and is not a reserved keyword", 2)
+	]
+	var correct = True
+	for (text, message, help, offset) in cases:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_same_line_expression(entry)
+				match result:
+					RejectedExpression:
+						correct = correct and parsed.diagnostic_count() == 1 and parsed.id_counts() == entry.id_counts()
+						match reject_preview(parsed):
+							Ok(rejected):
+								match render_rejected_diagnostics(rejected):
+									Ok([row]):
+										correct = (correct and row.rendered.message == message and row.rendered.help == Some(help)
+											and row.line == 1 and row.column == offset + 1
+											and row.span.span_start() == offset and row.span.span_end() == offset)
+									_: correct = False
+							Err(_): correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_long_postfix_chain() -> Bool:
+	var text = "target"
+	var count = 0
+	while count < 2000:
+		text += ".member()"
+		count += 1
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					var current = value
+					var calls = 0
+					var walking = True
+					while walking:
+						match current.kind:
+							Call(field, args):
+								match field.kind:
+									FieldAccess(receiver, _):
+										current = receiver
+										calls += 1
+									_: walking = False
+							_: walking = False
+					calls == count and parsed.issued_counts().expressions == count * 2 + 1 and parsed.issued_counts().name_uses == count + 1
+				_: False
+		Err(_): False
+
+
+-- Argument nesting is the one postfix recursion: it follows brackets the
+-- source itself nests, as the frozen parser does.
+pure func test_nested_call_arguments() -> Bool:
+	depth = 1000
+	var text = ""
+	var level = 0
+	while level < depth:
+		text += "f("
+		level += 1
+	text += "1"
+	while level > 0:
+		text += ")"
+		level -= 1
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					var current = value
+					var calls = 0
+					var walking = True
+					while walking:
+						match current.kind:
+							Call(_, [argument]):
+								current = argument
+								calls += 1
+							_: walking = False
+					(calls == depth and parsed.issued_counts().expressions == depth * 2 + 1
+						and parsed.issued_counts().name_uses == depth and parsed.diagnostic_count() == 0)
+				_: False
+		Err(_): False
+
+
 tests: TestSuite = {
 	description = "Bounded tree operator expressions",
 	tests = [
@@ -181,6 +308,10 @@ tests: TestSuite = {
 		("logical and range forms", test_logical_and_range_have_explicit_forms),
 		("unsupported exact rollback", test_unsupported_returns_original_state),
 		("rejected expression has no ids", test_rejection_issues_no_ids),
+		("postfix source order and spans", test_postfix_source_order_and_spans),
+		("postfix rejection diagnostic and no ids", test_postfix_rejection_has_exact_diagnostic_and_no_ids),
+		("2000 call left spine", test_long_postfix_chain),
+		("1000 nested call arguments", test_nested_call_arguments),
 		("5000 term left spine", test_long_sum_is_left_associative_without_recursive_left_walk)
 	]
 }

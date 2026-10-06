@@ -6,23 +6,25 @@ import:
 	../lex/lexed_module: LiteralValue(IntegerValue, FloatValue)
 	../syntax/checked_values: DecimalFloat
 	../syntax/expressions:
-		Expression, ExpressionKind(NameReference, IntegerLiteral, FloatLiteral, BooleanLiteral, VoidValue, Unary, Binary, ShortCircuit, RangeExpression),
+		Expression, ExpressionKind(NameReference, IntegerLiteral, FloatLiteral, BooleanLiteral, VoidValue, Unary, Binary, ShortCircuit, RangeExpression, Call, FieldAccess, Subscript),
 		UnaryOperator(Negate, LogicalNot),
 		BinaryOperator(Add, Subtract, Multiply, Divide, Modulo, Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual),
 		LogicalOperator(LogicalAnd, LogicalOr)
+	../syntax/sequences: AtLeastOne
 	../syntax/names: WrittenName
 	../tables/diagnostic_code: PlainSyntaxCode(ExpectedExpressionDiagnostic)
 	../tables/expected_token:
-		NameConstruct(NameInStatementName), ExpectedTokenDiagnostic(ExpectedRightParen),
-		RightParenConstruct(RightParenInGroupedExpression)
+		NameConstruct(NameInStatementName, NameInFieldName), ExpectedTokenDiagnostic(ExpectedRightParen, ExpectedRightBracket),
+		RightParenConstruct(RightParenInGroupedExpression, RightParenInCallArguments),
+		RightBracketConstruct(RightBracketInSubscript)
 	../tables/span: Span, span_covering
 	../tables/token:
 		TokenKind(IdentifierToken, IntLiteralToken, FloatLiteralToken, TrueKeyword, FalseKeyword, VoidKeyword, UnderscoreSymbol,
-			MinusSymbol, NotKeyword, LeftParenSymbol, RightParenSymbol,
+			MinusSymbol, NotKeyword, LeftParenSymbol, RightParenSymbol, LeftBracketSymbol, RightBracketSymbol, CommaSymbol,
 			EndOfFileToken, NewlineToken, DotSymbol, IndentToken)
 	binary_operators as Operators
 	parse_state:
-		ParseState, current_kind, current_span, current_literal, advanced, peek_kind, span_start_line,
+		ParseState, diagnostic_count, current_kind, current_span, current_literal, advanced, peek_kind, span_start_line,
 		consume_referenced_name, finished_name_use, finished_expression, report_at_current, expect_token
 
 
@@ -48,6 +50,9 @@ private union RecipeKind:
 	UnaryRecipe(UnaryOperator, ExpressionRecipe)
 	BinaryRecipe(Operators.BinaryOperator, ExpressionRecipe, ExpressionRecipe)
 	GroupingRecipe(ExpressionRecipe)
+	CallRecipe(ExpressionRecipe, List[ExpressionRecipe])
+	FieldRecipe(ExpressionRecipe, WrittenName)
+	SubscriptRecipe(ExpressionRecipe, AtLeastOne[ExpressionRecipe])
 
 
 private union RecipeParse:
@@ -56,12 +61,43 @@ private union RecipeParse:
 	RejectedRecipe
 
 
--- A frame is one binary node whose left operand is still being walked.
-private record BinaryFrame {
-	span: Span,
-	operator: Operators.BinaryOperator,
-	right: ExpressionRecipe
-}
+-- Left-spine frames avoid recursion proportional to authored chain length.
+private union SpineFrame:
+	BinaryFrame(Span, Operators.BinaryOperator, ExpressionRecipe)
+	CallFrame(Span, List[ExpressionRecipe])
+	FieldFrame(Span, WrittenName)
+	SubscriptFrame(Span, AtLeastOne[ExpressionRecipe])
+
+
+private union ItemRecipes:
+	CallItems(List[ExpressionRecipe])
+	SubscriptItems(AtLeastOne[ExpressionRecipe])
+
+
+private enum PostfixDelimiter:
+	CallDelimiter
+	SubscriptDelimiter
+
+
+private union ItemsParse:
+	ParsedItems(ItemRecipes)
+	UnsupportedItems
+	RejectedItems
+
+
+-- Why recognition gave up. An unsupported shape restores the caller's entry
+-- state; a rejected shape keeps the diagnostics it reported.
+private enum Abandonment:
+	UnsupportedShape
+	RejectedShape
+
+
+-- One step of a left-to-right chain. Only an extending step carries a value,
+-- so a chain that stops or is abandoned cannot also claim a longer result.
+private union ChainStep[T]:
+	Extended(T)
+	Stopped
+	Abandoned(Abandonment)
 
 
 pure func parse_same_line_expression(state: ParseState) -> (ParseState, ExpressionParse):
@@ -97,35 +133,200 @@ private pure func parse_operators(state: ParseState, line: Int, minimum: Int) ->
 	(parsed, prefix) = parse_prefix(state, line)
 	match prefix:
 		ParsedRecipe(first):
-			var out = parsed
-			var left = first
-			var parsing = True
-			var failure: Option[RecipeParse] = None
-			while parsing:
-				match Operators.binary_operator(out.current_kind()):
-					Some(operator):
-						if Operators.operator_precedence(operator) < minimum:
-							parsing = False
-						else:
-							(after_right, right_result) = parse_operators(out.advanced(), line, Operators.operator_precedence(operator) + 1)
-							out = after_right
-							match right_result:
-								ParsedRecipe(right):
-									left = { span = left.span.span_covering(right.span), kind = BinaryRecipe(operator, left, right) }
-								_:
-									failure = Some(right_result)
-									parsing = False
-					None:
-						parsing = False
-			match failure:
-				Some(result): (out, result)
-				None: (out, ParsedRecipe(left))
+			(out, chain, abandoned) = extend_chain(parsed, first, pure func(current, left):
+				operator_step(current, line, minimum, left)
+			)
+			(out, chain_recipe(chain, abandoned))
 		_:
 			(parsed, prefix)
 
 
+-- Precedence climbing: the right operand binds only operators above this one.
+private pure func operator_step(
+	state: ParseState, line: Int, minimum: Int, left: ExpressionRecipe,
+) -> (ParseState, ChainStep[ExpressionRecipe]):
+	match Operators.binary_operator(state.current_kind()):
+		Some(operator):
+			precedence = Operators.operator_precedence(operator)
+			if precedence < minimum:
+				(state, Stopped)
+			else:
+				(after_right, right_result) = parse_operators(state.advanced(), line, precedence + 1)
+				match right_result:
+					ParsedRecipe(right):
+						(after_right, Extended({ span = left.span.span_covering(right.span), kind = BinaryRecipe(operator, left, right) }))
+					UnsupportedRecipe:
+						(after_right, Abandoned(UnsupportedShape))
+					RejectedRecipe:
+						(after_right, Abandoned(RejectedShape))
+		None:
+			(state, Stopped)
+
+
 private pure func parse_prefix(state: ParseState, line: Int) -> (ParseState, RecipeParse):
-	if state.current_kind() != EndOfFileToken and state.span_start_line(state.current_span()) != line:
+	(parsed, atom) = parse_atom(state, line)
+	match atom:
+		ParsedRecipe(first):
+			(out, chain, abandoned) = extend_chain(parsed, first, pure func(current, receiver):
+				postfix_step(current, line, receiver)
+			)
+			(out, chain_recipe(chain, abandoned))
+		_:
+			(parsed, atom)
+
+
+-- Grow a chain one step at a time, so authored chain length never becomes
+-- native stack depth. The final value is the chain as far as it was read.
+private pure func extend_chain[T](
+	state: ParseState, first: T, next_step: pure (ParseState, T) -> (ParseState, ChainStep[T]),
+) -> (ParseState, T, Option[Abandonment]):
+	var out = state
+	var current = first
+	var abandoned: Option[Abandonment] = None
+	var reading = True
+	while reading:
+		(after_step, step) = next_step(out, current)
+		out = after_step
+		match step:
+			Extended(longer):
+				current = longer
+			Stopped:
+				reading = False
+			Abandoned(reason):
+				abandoned = Some(reason)
+				reading = False
+	(out, current, abandoned)
+
+
+private pure func chain_recipe(recipe: ExpressionRecipe, abandoned: Option[Abandonment]) -> RecipeParse:
+	match abandoned:
+		None: ParsedRecipe(recipe)
+		Some(UnsupportedShape): UnsupportedRecipe
+		Some(RejectedShape): RejectedRecipe
+
+
+-- End of file counts as the current line, so its diagnostics stay on that line.
+private pure func on_line(state: ParseState, line: Int) -> Bool:
+	state.current_kind() == EndOfFileToken or state.span_start_line(state.current_span()) == line
+
+
+-- One same-line member access, call or subscript, or the end of the chain.
+private pure func postfix_step(
+	state: ParseState, line: Int, receiver: ExpressionRecipe,
+) -> (ParseState, ChainStep[ExpressionRecipe]):
+	if not state.on_line(line):
+		(state, Stopped)
+	else:
+		match state.current_kind():
+			DotSymbol: member_step(state, line, receiver)
+			LeftParenSymbol: delimited_step(state, line, receiver, CallDelimiter)
+			LeftBracketSymbol: delimited_step(state, line, receiver, SubscriptDelimiter)
+			_: (state, Stopped)
+
+
+private pure func member_step(
+	state: ParseState, line: Int, receiver: ExpressionRecipe,
+) -> (ParseState, ChainStep[ExpressionRecipe]):
+	member_entry = state.advanced()
+	if not member_entry.on_line(line):
+		(state, Abandoned(UnsupportedShape))
+	else:
+		(after_name, name) = member_entry.consume_referenced_name(NameInFieldName)
+		if after_name.diagnostic_count() != member_entry.diagnostic_count():
+			(after_name, Abandoned(RejectedShape))
+		else:
+			(after_name, Extended({ span = receiver.span.span_covering(name.span), kind = FieldRecipe(receiver, name) }))
+
+
+private pure func delimited_step(
+	state: ParseState, line: Int, receiver: ExpressionRecipe, delimiter: PostfixDelimiter,
+) -> (ParseState, ChainStep[ExpressionRecipe]):
+	end = closing_token(delimiter)
+	(after_items, items) = parse_items(state.advanced(), line, delimiter)
+	match items:
+		ParsedItems(values):
+			if after_items.current_kind() == end and after_items.on_line(line):
+				span = receiver.span.span_covering(after_items.current_span())
+				kind = match values:
+					CallItems(args): CallRecipe(receiver, args)
+					SubscriptItems(indices): SubscriptRecipe(receiver, indices)
+				(after_items.advanced(), Extended({ span = span, kind = kind }))
+			else if after_items.current_kind() == EndOfFileToken:
+				(after_items.expect_token(end, unclosed_delimiter_diagnostic(delimiter)), Abandoned(RejectedShape))
+			else:
+				(after_items, Abandoned(UnsupportedShape))
+		UnsupportedItems:
+			(after_items, Abandoned(UnsupportedShape))
+		RejectedItems:
+			(after_items, Abandoned(RejectedShape))
+
+
+private pure func closing_token(delimiter: PostfixDelimiter) -> TokenKind:
+	match delimiter:
+		CallDelimiter: RightParenSymbol
+		SubscriptDelimiter: RightBracketSymbol
+
+
+private pure func unclosed_delimiter_diagnostic(delimiter: PostfixDelimiter) -> ExpectedTokenDiagnostic:
+	match delimiter:
+		CallDelimiter: ExpectedRightParen(RightParenInCallArguments)
+		SubscriptDelimiter: ExpectedRightBracket(RightBracketInSubscript)
+
+
+-- Recursion follows argument bracket nesting, never the callee spine.
+private pure func parse_items(state: ParseState, line: Int, delimiter: PostfixDelimiter) -> (ParseState, ItemsParse):
+	end = closing_token(delimiter)
+	if state.current_kind() == EndOfFileToken:
+		(state.expect_token(end, unclosed_delimiter_diagnostic(delimiter)), RejectedItems)
+	else if state.current_kind() == end and delimiter == CallDelimiter:
+		(state, ParsedItems(CallItems([])))
+	else:
+		(first_state, first_result) = parse_operators(state, line, Operators.LOWEST_PRECEDENCE)
+		match first_result:
+			ParsedRecipe(first):
+				no_items: List[ExpressionRecipe] = []
+				(out, rest, abandoned) = extend_chain(first_state, no_items, pure func(current, items):
+					next_item_step(current, line, end, items)
+				)
+				match abandoned:
+					None:
+						values = match delimiter:
+							CallDelimiter: CallItems([first].concat(rest))
+							SubscriptDelimiter: SubscriptItems({ first = first, rest = rest })
+						(out, ParsedItems(values))
+					Some(UnsupportedShape):
+						(out, UnsupportedItems)
+					Some(RejectedShape):
+						(out, RejectedItems)
+			UnsupportedRecipe:
+				(first_state, UnsupportedItems)
+			RejectedRecipe:
+				(first_state, RejectedItems)
+
+
+-- A comma introduces the next item, or trails before the closing delimiter.
+private pure func next_item_step(
+	state: ParseState, line: Int, end: TokenKind, items: List[ExpressionRecipe],
+) -> (ParseState, ChainStep[List[ExpressionRecipe]]):
+	if state.current_kind() != CommaSymbol:
+		(state, Stopped)
+	else:
+		after_comma = state.advanced()
+		if after_comma.current_kind() == end or after_comma.current_kind() == EndOfFileToken:
+			(after_comma, Stopped)
+		else:
+			(after_item, item) = parse_operators(after_comma, line, Operators.LOWEST_PRECEDENCE)
+			match item:
+				ParsedRecipe(value):
+					(after_item, Extended(items.append(value)))
+				UnsupportedRecipe:
+					(after_item, Abandoned(UnsupportedShape))
+				RejectedRecipe:
+					(after_item, Abandoned(RejectedShape))
+
+
+private pure func parse_atom(state: ParseState, line: Int) -> (ParseState, RecipeParse):
+	if not state.on_line(line):
 		(state, UnsupportedRecipe)
 	else:
 		span = state.current_span()
@@ -177,34 +378,70 @@ private pure func parse_prefix(state: ParseState, line: Int) -> (ParseState, Rec
 								(parsed, UnsupportedRecipe)
 						_:
 							(parsed, inner)
-			EndOfFileToken | RightParenSymbol:
+			EndOfFileToken | RightParenSymbol | RightBracketSymbol:
 				(state.report_at_current(ExpectedExpressionDiagnostic), RejectedRecipe)
 			_:
 				(state, UnsupportedRecipe)
 
 
--- The parser and every later walker must loop over binary left spines. Frames
+-- The parser and every later walker must loop over left spines: binary
+-- operands and the receivers of member access, calls and subscripts. Frames
 -- are folded inside out, preserving the frozen parser's postorder ID issuance.
 private pure func mint_recipe(state: ParseState, recipe: ExpressionRecipe) -> (ParseState, Expression):
 	var base = recipe
-	var frames: List[BinaryFrame] = []
+	var frames: List[SpineFrame] = []
 	var walking = True
 	while walking:
 		match base.kind:
 			BinaryRecipe(operator, left, right):
-				frames = frames.append({ span = base.span, operator = operator, right = right })
+				frames = frames.append(BinaryFrame(base.span, operator, right))
 				base = left
+			CallRecipe(callee, args):
+				frames = frames.append(CallFrame(base.span, args))
+				base = callee
+			FieldRecipe(receiver, name):
+				frames = frames.append(FieldFrame(base.span, name))
+				base = receiver
+			SubscriptRecipe(receiver, indices):
+				frames = frames.append(SubscriptFrame(base.span, indices))
+				base = receiver
 			_:
 				walking = False
 	(parsed, value) = state.mint_nonbinary_recipe(base)
 	var out = parsed
 	var left = value
 	for frame in frames.reverse():
-		(after_right, right) = out.mint_recipe(frame.right)
-		kind = operator_expression_kind(frame.operator, left, right)
-		(minted, parent) = after_right.finished_expression(frame.span, kind)
-		out = minted
-		left = parent
+		match frame:
+			BinaryFrame(span, operator, right_recipe):
+				(after_right, right) = out.mint_recipe(right_recipe)
+				(minted, parent) = after_right.finished_expression(span, operator_expression_kind(operator, left, right))
+				out = minted
+				left = parent
+			FieldFrame(span, name):
+				(after_name, use) = out.finished_name_use(name)
+				(minted, parent) = after_name.finished_expression(span, FieldAccess(left, use))
+				out = minted
+				left = parent
+			CallFrame(span, args):
+				var values: List[Expression] = []
+				for argument in args:
+					(after_arg, value) = out.mint_recipe(argument)
+					out = after_arg
+					values = values.append(value)
+				(minted, parent) = out.finished_expression(span, Call(left, values))
+				out = minted
+				left = parent
+			SubscriptFrame(span, indices):
+				(after_first, first) = out.mint_recipe(indices.first)
+				out = after_first
+				var rest: List[Expression] = []
+				for index in indices.rest:
+					(after_index, value) = out.mint_recipe(index)
+					out = after_index
+					rest = rest.append(value)
+				(minted, parent) = out.finished_expression(span, Subscript(left, { first = first, rest = rest }))
+				out = minted
+				left = parent
 	(out, left)
 
 
@@ -223,8 +460,8 @@ private pure func mint_nonbinary_recipe(state: ParseState, recipe: ExpressionRec
 		GroupingRecipe(inner):
 			(parsed, value) = state.mint_recipe(inner)
 			(parsed, { value | span = recipe.span })
-		BinaryRecipe(_, _, _):
-			-- This recursion boundary is total; mint_recipe owns the binary loop.
+		BinaryRecipe(_, _, _) | CallRecipe(_, _) | FieldRecipe(_, _) | SubscriptRecipe(_, _):
+			-- This recursion boundary is total; mint_recipe owns the left-spine loop.
 			state.mint_recipe(recipe)
 
 
