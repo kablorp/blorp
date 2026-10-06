@@ -1949,8 +1949,8 @@ callees. Recursion depth is then bounded by right-nesting and bracket
 nesting, which the source's own structure bounds. The parser already
 recurses that deep.
 
-M4's gate adds deep-chain tests, through parse, dump, adapter and the old
-typecheck:
+M4's gate adds deep-chain tests, through parse, dump, ID census and the
+adapter's legacy projection:
 
 - a 5,000-term `+`;
 - a 2,000-call method chain;
@@ -1958,6 +1958,11 @@ typecheck:
 - a 1,000-deep nested list literal (right-nesting, bounded by brackets).
 
 The current adapter's 6,000-operand chain test is kept.
+
+The old typecheck is outside this proof (owner decision, 2026-10-05). Its
+recursive walks overflow on these chains, and it is to be replaced whole
+rather than made iterative, so the gate does not require deep chains to
+typecheck through it.
 
 ### 3.15 `IdMint`
 
@@ -3313,7 +3318,7 @@ exact literal token provenance, closing-bracket diagnostics and unsupported
 input rollback. Its depth evidence includes the 1,000-nested-list case through
 parse, dump, ID census and legacy projection. Tuples, braced aggregates,
 strings and control expressions follow in separate slices; the complete M4
-gate still requires bodies and the old typecheck.
+gate still requires bodies.
 
 Argument nesting is the one recursion in the postfix grammar. It follows
 brackets the source itself nests, as the frozen parser does, and a test parses
@@ -3379,7 +3384,7 @@ and 26 globals; those 150 owners remain outside the proof. Logs are in
 | **M1** | Retain and rerun the opaque-type import-cycle repro (section 3.15), fixing the compiler if it still fails. Then `syntax/`: every type of section 3, using ordinary `record` for the proposed name and syntax values; `syntax/ids.brp` with `IdMint`; the layout rule that confines `IdMint` to `parse/` and tests; `syntax/dump.brp`; and unit tests that build each form through the mint and dump it. Nothing calls it yet. | Tests; `compiler-new` gate; the layout check rejects an import of `IdMint` from outside `parse/`; record-shape construction and return costs recorded (section 7.2) | none |
 | **M2** | The lexer becomes `lex_module(module, text) -> LexedModule`, with per-module `Spellings`, checked `LiteralValue`s and `InterpolationScan`. The existing builder path consumes `LexedModule` through a bridge that interns spellings into the builder and rewrites token payloads. Measure the provisional managed `Token` on the same corpus; any future inline placement is a separate record optimization, not a source-spelling choice. | Token parity test unchanged; `tables` dump identical; token storage and bridge costs recorded | the lexer's builder appenders; transient interpolation tables |
 | **M3** | `parse/` over trees, declaration level: module items, imports, foreign blocks, signatures, type parameters, bounds, written types, dimensions, patterns. Bodies are skipped by layout. One `RecordDeclaration` retains `RecordDeclarationForm(OrdinaryRecord, FixedRecord)` for source spelling and parsed-AST adaptation; both forms have managed record semantics. Then the tree adapter's declaration half, behind a test-only entry. | The differential's declaration-level comparison, tree path against the old parser including both record spellings and ordinary `struct` identifiers; per-module declaration diagnostics equal to today's stage | none |
-| **M4** | The body parser over trees (statements, blocks, expressions), and the tree adapter's body half. | Full-AST differential: the tree path equals the old parser on every corpus module and root run; every rendered diagnostic per module equals today's stage, except the listed broken-import case; the syntax dump differential matches; the id census passes; the deep-chain tests of section 3.14 pass through parse, dump, adapter and the old typecheck | none |
+| **M4** | The body parser over trees (statements, blocks, expressions), and the tree adapter's body half. | Full-AST differential: the tree path equals the old parser on every corpus module and root run; every rendered diagnostic per module equals today's stage, except the listed broken-import case; the syntax dump differential matches; the id census passes; the deep-chain tests of section 3.14 pass through parse, dump, ID census and adapter (the old typecheck is excluded, section 3.14) | none |
 | **M5** | `sources/module_walk.brp`, `link/`, `DiscoveryOutcome`, and `discovery_front_end.brp` on the tree path, behind an internal test-only selection, with `compiler-new`, `cli` and `package` gates exercised on both stage paths. | Module-order parity; self-compile C identical (or normalized); cost measured with the cost tool's `tables` and `graph` modes and the self-compile against matched main | none |
 | **M6** | Make the tree path the stage's default, within the ceiling of section 7.3, and delete the table path in the same change. | Every default and premerge gate on the new default; self-compile C identical; the ceiling's measurement record | `tables/` (builder, node builder, rows, row kinds' node part, node kind classes, `frontend_tables`, `discovery_tables`, `invariants/`, `intern_index` moved, `name_vocabulary` moved to the adapter): about 11,600 lines; the table-reading bodies of `compiler/discovery_adapter.brp` and `compiler/discovery_front_end.brp` (the files stay, now reading trees); `builder_rule_probe`, `builder_append_probe`, `test_invariants`, `test_allocation_budget` (replaced by a syntax allocation test pinning allocations per construct, so a compiler improvement shows as a decrease and a regression fails) |
 | **M7** | Documentation: `DISCOVERY_TABLES_DESIGN.md` is replaced by this document's settled form; `ARCHITECTURE.md`, `DISCOVERY_ACCEPTANCE_ROADMAP.md` and `docs/README.md` are updated; the resolution design takes section 4.7. | `git diff --check`; link check | the superseded design text |
