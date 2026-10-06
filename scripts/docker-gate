@@ -206,6 +206,10 @@ REMOTE_KEEPALIVE_SECONDS=30
 # before its cleanup ran) are swept by the next run once they are this old,
 # well past the length of any gate.
 REMOTE_STALE_SECONDS=86400
+# How often a remote run checks that its client is still connected. A gate whose
+# client disappears is stopped within this many seconds plus the time its TERM
+# handling takes.
+REMOTE_WATCH_SECONDS=5
 # ssh's own exit status when the connection fails. A remote gate that exits
 # with it is reported as REMOTE_GATE_STATUS_255 instead, so this status always
 # means the gate did not run to completion.
@@ -233,15 +237,29 @@ remote_ssh() {
     ssh "${REMOTE_SSH_OPTIONS[@]}" -- "$REMOTE_HOST" "$@"
 }
 
+# A remote script is a function invoked with stdin from /dev/null, so bash has
+# read all of it before anything it starts could consume the rest of stdin.
+wrap_remote_script() {
+    printf 'remote_step() {\n%s\n}\nremote_step </dev/null\n' "$1"
+}
+
 # Run a script on the remote host with bash. The step name is only a label in
-# the remote command line. The script is a function invoked with stdin from
-# /dev/null, so bash has read all of it before anything it starts could
-# consume the rest of stdin.
+# the remote command line.
 remote_bash() {
     local step="$1"
     local body="$2"
-    printf 'remote_step() {\n%s\n}\nremote_step </dev/null\n' "$body" |
-        remote_ssh bash -s -- "$step"
+    wrap_remote_script "$body" | remote_ssh bash -s -- "$step"
+}
+
+# remote_bash, but this process becomes the ssh client, so stopping it by any
+# signal drops the connection rather than leaving an ssh child running the
+# remote gate. Its exit status is the remote script's, or SSH_CONNECTION_FAILED.
+exec_remote_bash() {
+    local step="$1"
+    local body="$2"
+    local script
+    script="$(wrap_remote_script "$body")"
+    exec ssh "${REMOTE_SSH_OPTIONS[@]}" -- "$REMOTE_HOST" bash -s -- "$step" <<<"$script"
 }
 
 # Every value placed in a remote script is quoted for the remote bash.
@@ -291,10 +309,10 @@ snapshot_commit() {
     fi
 }
 
-# Push the snapshot and run the gate there. Returns the remote gate's status,
-# or SSH_CONNECTION_FAILED when the connection, or the setup before the gate,
-# failed. A failed snapshot prints why and returns SSH_CONNECTION_FAILED too,
-# since the gate can still run here.
+# Push the snapshot and run the gate there. A failed snapshot, prepare step or
+# push returns SSH_CONNECTION_FAILED, so the gate can run here instead. Once the gate starts, this process becomes the ssh
+# client and exits with the remote gate's status, or with SSH_CONNECTION_FAILED
+# if the connection drops mid-gate; that cannot fall back to a local run.
 run_remote_gate() {
     local commit ref arg quoted_args=""
     if ! commit="$(snapshot_commit)" || [ -z "$commit" ]; then
@@ -331,47 +349,80 @@ exit 0" || return "$SSH_CONNECTION_FAILED"
         git push -q "$REMOTE_HOST:$REMOTE_REPO" "$commit:$ref" || return "$SSH_CONNECTION_FAILED"
 
     echo "Running the gate on $REMOTE_HOST (up to $REMOTE_MAX_CONCURRENT at once there)..."
-    # The worktree, its directory and the ref are removed when the gate ends or
-    # the remote shell is signalled. A run whose shell is killed outright is
-    # swept by a later run. The remote queue lives in one directory for every
-    # client, rather than under TMPDIR, which differs between SSH and desktop
-    # sessions.
-    remote_bash run "cd && cd $(remote_quote "$REMOTE_REPO") || exit 1
+    # The gate runs in the background beside a watcher. Without a terminal the
+    # remote shell gets no signal when the client disconnects; it is orphaned or
+    # dies instead, and the watcher then stops the gate with TERM, which the gate
+    # handles by stopping its container and freeing its slot. The worktree, its
+    # directory and the ref are removed when the shell exits; a run whose shell
+    # is killed outright is swept by a later run. The remote queue lives in one
+    # directory for every client, rather than under TMPDIR, which differs
+    # between SSH and desktop sessions.
+    exec_remote_bash run "cd && cd $(remote_quote "$REMOTE_REPO") || exit 1
 repo=\$(pwd)
 parent=\$(mktemp -d \"\${TMPDIR:-/tmp}/blorp-remote-gate.XXXXXX\") || exit 1
 tree=\"\$parent/worktree\"
+gate=
+watcher=
 cleanup() {
+    [ -z \"\$watcher\" ] || kill \"\$watcher\" 2>/dev/null
     cd \"\$repo\"
     git worktree remove --force \"\$tree\" >/dev/null 2>&1
     git worktree prune
     git update-ref -d $(remote_quote "$ref")
     rm -rf \"\$parent\"
 }
+# A signal stops the gate and waits for it, so the worktree it mounts is
+# removed only after its container has stopped.
+stop_and_exit() {
+    if [ -n \"\$gate\" ]; then
+        kill -TERM \"\$gate\" 2>/dev/null
+        wait \"\$gate\" 2>/dev/null
+    fi
+    exit \"\$1\"
+}
 trap cleanup EXIT
-trap 'exit 129' HUP PIPE
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'stop_and_exit 129' HUP PIPE
+trap 'stop_and_exit 130' INT
+trap 'stop_and_exit 143' TERM
 git worktree add -q --detach \"\$tree\" $(remote_quote "$ref") || exit 1
 cd \"\$tree\"
 # Empty rather than unset, so a .env on the remote cannot set it again.
 export BLORP_DOCKER_GATE_HOST=
 export BLORP_DOCKER_GATE_MAX_CONCURRENT=$(remote_quote "$REMOTE_MAX_CONCURRENT")
 export BLORP_DOCKER_GATE_SLOT_DIR=\"\${BLORP_DOCKER_GATE_SLOT_DIR:-\$HOME/.cache/blorp-docker-gate-slots}\"
+shell=\$\$
+launcher=\$(ps -o ppid= -p \"\$shell\" 2>/dev/null | tr -d ' ')
+scripts/docker-gate$quoted_args &
+gate=\$!
+# The client is gone once this shell has died or has been re-parented (sshd's
+# session ended; the new parent need not be PID 1). The watcher uses its own
+# descriptors so it never holds the ssh channel open after the gate ends.
+if [ -n \"\$launcher\" ]; then
+    (
+        while kill -0 \"\$gate\" 2>/dev/null; do
+            current=\$(ps -o ppid= -p \"\$shell\" 2>/dev/null | tr -d ' ')
+            if ! kill -0 \"\$shell\" 2>/dev/null || [ \"\$current\" != \"\$launcher\" ]; then
+                kill -TERM \"\$gate\" 2>/dev/null
+                break
+            fi
+            sleep $REMOTE_WATCH_SECONDS
+        done
+    ) </dev/null >/dev/null 2>&1 &
+    watcher=\$!
+else
+    echo \"docker-gate: ps cannot report this shell's parent here, so a disconnected client will not stop this gate.\" >&2
+fi
 status=0
-scripts/docker-gate$quoted_args || status=\$?
+wait \"\$gate\" || status=\$?
 [ \"\$status\" -ne $SSH_CONNECTION_FAILED ] || status=$REMOTE_GATE_STATUS_255
 exit \"\$status\""
 }
 
 if [ -n "$REMOTE_HOST" ] && [ "$SHELL_MODE" -eq 0 ]; then
     if unavailable_reason="$(probe_remote_host)"; then
-        remote_status=0
-        run_remote_gate || remote_status=$?
-        if [ "$remote_status" -ne "$SSH_CONNECTION_FAILED" ]; then
-            exit "$remote_status"
-        fi
-        # The gate's own failures are returned above and never rerun here.
-        echo "docker-gate: the gate on $REMOTE_HOST could not start or lost its connection; running the gate locally." >&2
+        # Returns only when setup failed before the gate started.
+        run_remote_gate || true
+        echo "docker-gate: the gate on $REMOTE_HOST could not start; running the gate locally." >&2
     else
         echo "docker-gate: $unavailable_reason; running the gate locally." >&2
     fi

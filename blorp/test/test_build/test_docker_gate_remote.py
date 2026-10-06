@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -46,6 +48,15 @@ FAKE_SSH = textwrap.dedent(
 # unsets BLORP_DOCKER_GATE_HOST, so the marker shows that an uncommitted edit
 # reached the remote worktree.
 REMOTE_MARKER = "REMOTE-SNAPSHOT-MARKER"
+
+
+def wait_for(condition, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.2)
+    return condition()
 
 
 class DockerGateRemoteTests(unittest.TestCase):
@@ -210,13 +221,43 @@ class DockerGateRemoteTests(unittest.TestCase):
         self.assertIn("docker run", completed.stdout)
         self.assertNotIn(f"Running the gate on {FAKE_HOST}", completed.stdout)
 
-    def test_lost_connection_during_the_gate_reruns_it_locally_once(self) -> None:
+    def test_lost_connection_during_the_gate_returns_255_without_a_local_rerun(self) -> None:
         completed = self.run_gate(FAKE_SSH_FAIL_STEP="run")
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.returncode, 255, completed.stderr)
         self.assertIn(f"Running the gate on {FAKE_HOST}", completed.stdout)
-        self.assertIn("could not start or lost its connection; running the gate locally", completed.stderr)
-        self.assertEqual(completed.stdout.count("docker run"), 1)
+        self.assertNotIn("running the gate locally", completed.stderr)
+        self.assertNotIn("docker run", completed.stdout)
+
+    def test_killing_the_local_gate_stops_the_remote_gate(self) -> None:
+        started = self.remote_home / "started"
+        stopped = self.remote_home / "stopped"
+        # The remote gate blocks until it is signalled, recording both.
+        self.edit_gate_script_uncommitted(
+            f"{{ echo > {started}; "
+            f"trap 'echo > {stopped}; kill $! 2>/dev/null; exit 143' TERM; "
+            "sleep 60 & wait; }"
+        )
+        environment = dict(self.environment)
+        gate = subprocess.Popen(
+            ["scripts/docker-gate", "--dry-run", "--platform", "linux/arm64"],
+            cwd=self.checkout,
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            self.assertTrue(wait_for(started.exists, 60), "the remote gate never started")
+            # An agent's harness may kill only this process, by any signal. The
+            # fake ssh execs its remote shell, so this kills that shell too: it
+            # covers the watcher's "shell gone" case. A real sshd instead leaves
+            # the shell running under a new parent, the case checked on a host.
+            gate.send_signal(signal.SIGKILL)
+            gate.wait(timeout=10)
+            self.assertTrue(wait_for(stopped.exists, 30), "the remote gate kept running")
+        finally:
+            if gate.poll() is None:
+                gate.kill()
 
     def test_main_checkout_env_file_selects_the_host_from_a_worktree(self) -> None:
         del self.environment["BLORP_DOCKER_GATE_HOST"]
