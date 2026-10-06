@@ -162,6 +162,12 @@ class DockerGateRemoteTests(unittest.TestCase):
         self.assertIn(f"{REMOTE_MARKER} cap=10 files=untracked.txt,", completed.stdout)
         self.assertIn("docker run", completed.stdout)
         self.assertNotIn("running the gate locally", completed.stderr)
+        # Each connection is independent of any shared ControlMaster.
+        ssh_calls = self.ssh_log.read_text().splitlines()
+        self.assertTrue(ssh_calls)
+        for call in ssh_calls:
+            self.assertIn("ControlMaster=no", call)
+            self.assertIn("ControlPath=none", call)
         # The checkout is untouched, and nothing is left behind remotely.
         self.assertEqual(self.git("status", "--porcelain"), status_before)
         remote = self.remote_repo()
