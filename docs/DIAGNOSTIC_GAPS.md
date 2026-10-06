@@ -35,6 +35,8 @@ they are not message-wording tasks.
 | CF-006 | [Triple-quoted string becomes empty](issues/triple-quoted-string-lexes-as-empty-string.md) |
 | CF-007 | [Duplicate functions and parameters accepted](issues/duplicate-function-and-parameter-accepted.md) |
 | CF-009 | [Pure function reads mutable module var](issues/pure-function-reads-mutable-module-var.md) (design decision open) |
+| CF-010 | [Generic impls lose trait defaults; operators compare pointers](issues/generic-impl-trait-defaults-fall-back-to-pointer-comparison.md) |
+| CF-011 | [Record literal fields reordered after ownership](issues/record-literal-fields-reordered-after-ownership.md) |
 
 ## High ROI
 

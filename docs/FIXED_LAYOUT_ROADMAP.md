@@ -70,9 +70,12 @@ scalar/`Ptr` wrappers for foreign aggregate boundaries. Direct C aggregate
 support, generalized aggregate annotations, and copy-in/copy-out metadata
 remain deferred; do not infer an ABI from field shapes.
 
-Tuples remain structural products with ordinal access. Existing local/match
-scalar replacement and multiple results stay distinct from managed records;
-[the tuple plan](VALUE_TUPLES_AND_STATE_HANDOFF.md) owns stored-tuple work.
+Tuples keep structural identity and ordinal access, but Core shares one
+product model with records: the same operations, scalar replacement and
+multi-value results, with representation (managed box or inline value) kept
+separate from identity. [Product unification](PRODUCT_UNIFICATION.md) owns
+that work; the declaration/use identity below is its prerequisite for one
+Core product type.
 `union`, `enum`, `Option`, and `Result` retain their current sum
 representations. Fixed-union syntax and enum retirement require separate ABI
 and active-payload ownership decisions.
@@ -123,12 +126,12 @@ unsupported erased, collection, closure, generic and foreign positions must
 produce a precise diagnostic before emission. A syntax spelling or a direct
 local oracle alone cannot establish this contract.
 
-Prioritize the existing tuple plan and measured product opportunities before
-opening this source promise. Keep `Option` and `Result` as sums: only the active
-payload is initialized and owned, and nullable, tagged and boxed specialized
-representations remain independent decisions. Record work does not authorize
-fixed-union admission, enum retirement, or replacing sum storage with ordinary
-record fields.
+Prioritize [product unification](PRODUCT_UNIFICATION.md) and measured
+product opportunities before opening this source promise. Keep `Option` and
+`Result` as sums: only the active payload is initialized and owned, and
+nullable, tagged and boxed specialized representations remain independent
+decisions. Record work does not authorize fixed-union admission, enum
+retirement, or replacing sum storage with ordinary record fields.
 
 ### Recover ownership prerequisites in bounded slices
 

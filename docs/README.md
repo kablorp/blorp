@@ -69,8 +69,12 @@ for matched measurements; do not copy a profile into the work index.
 - [Discovery Acceptance](DISCOVERY_ACCEPTANCE_ROADMAP.md): parser differences
   and retiring legacy consumers. [Discovery Redesign](DISCOVERY_REDESIGN.md)
   separately proposes typed syntax trees; that path is not implemented.
-- [Value Tuples And State Handoff](VALUE_TUPLES_AND_STATE_HANDOFF.md): remaining
-  tuple and owned-call increments; local/match flattening already exists.
+- [Product Unification](PRODUCT_UNIFICATION.md): one Core product model for
+  records and tuples, scalar replacement across calls, multi-values and typed
+  tuple boxes.
+- [Value Tuples And State Handoff](VALUE_TUPLES_AND_STATE_HANDOFF.md): owned
+  state through calls, last-use and field-place increments, and stored
+  products; local/match flattening already exists.
 
 Focused cleanup work lives in issues, not additional umbrella plans:
 [module environment preparation](issues/module-environment-preparation-rebuilds-state.md),

@@ -1,7 +1,8 @@
 # Interning a spelling copies the table's lists on a miss, and allocates a tuple per word
 
-Status: open. The fixes are in `docs/VALUE_TUPLES_AND_STATE_HANDOFF.md`
-(branch `core/value-tuples-and-state-handoff`, not yet landed).
+Status: open. Cause 1 is fixed by the increment 2 port in
+`docs/PRODUCT_UNIFICATION.md`; cause 2 by increments 3 and 4 of
+`docs/VALUE_TUPLES_AND_STATE_HANDOFF.md`.
 
 The discovery lexer interns every word it meets with one call that returns the
 table and the word's id together (the spec's `intern_slice`,
@@ -42,7 +43,8 @@ things today, which are separate causes.
 
 A `(Spellings, SpellingId)` result is a heap-allocated tuple, so every word the
 lexer meets allocates once, hit or miss. A multi-value result that is returned
-without a heap tuple removes it (`docs/VALUE_TUPLES_AND_STATE_HANDOFF.md`).
+without a heap tuple removes it (the increment 2 port in
+`docs/PRODUCT_UNIFICATION.md`).
 
 ## Cause 2: the miss arm copies the table, from two shared references
 

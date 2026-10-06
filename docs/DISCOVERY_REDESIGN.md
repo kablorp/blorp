@@ -23,7 +23,8 @@ statement, calls have no named arguments, and type parameters are explicit
 except those introduced by an `implements` receiver. The parser rejects
 syntactically forbidden forms before typecheck. The retained M0 report is
 a throwaway cost experiment, not M1 implementation. M1 retained and passed
-the opaque-import-cycle check (3.15); M6 depends on tuple increments (7.3).
+the opaque-import-cycle check (3.15); M6 depends on the tuple and product
+increments (7.3).
 Implementation and tests win if later work diverges, and this plan must be
 updated in the same change.
 
@@ -3360,10 +3361,11 @@ M0's stage-local RSS increase does not establish the whole-compiler peak;
 M5 measures the lifetime and peak directly. Value unions in record fields,
 record placement and arena allocation are possible later compiler work,
 not prerequisites silently assumed in the estimates here. The
-[record simplification roadmap](FIXED_LAYOUT_ROADMAP.md) owns product
-representation choices; the
-[tuple hand-off plan](VALUE_TUPLES_AND_STATE_HANDOFF.md) owns its
-increments.
+[record simplification roadmap](FIXED_LAYOUT_ROADMAP.md) owns record
+layout promises, [product unification](PRODUCT_UNIFICATION.md) owns the
+shared record/tuple product work, and the
+[tuple hand-off plan](VALUE_TUPLES_AND_STATE_HANDOFF.md) owns increments 3
+to 5 and 7.
 
 ### 7.3 The M6 ceiling
 
@@ -3379,9 +3381,12 @@ baseline:
 These ceilings are unchanged and are not loosened for an unrelated compiler
 change. M0 showed that its historical body parser alone exceeded the
 instruction ceiling on its compiler. M1 to M5 can proceed; M6 waits on
-increments 1 to 4 of
+slices 1 and 2 and slice 3's port of increment 2 in
+[`PRODUCT_UNIFICATION.md`](PRODUCT_UNIFICATION.md#7-m6-implications), then
+increments 3 and 4 of
 [`VALUE_TUPLES_AND_STATE_HANDOFF.md`](VALUE_TUPLES_AND_STATE_HANDOFF.md)
-and increment 5 if the re-measured M0 after 4 still needs it. The
+stated for products, and increment 5 if the re-measured M0 after 4 still
+needs it. The
 [record simplification roadmap](FIXED_LAYOUT_ROADMAP.md) also changes
 representation and cost: rerun the record-shaped parser and whole
 stage against the then-current compiler before applying the ceiling.
@@ -4152,7 +4157,7 @@ Ordering and parallelism:
 - M1 begins by verifying the opaque-type import-cycle repro on its own base.
 - M1 and M2 are independent of each other.
 - M3 needs M1 and M2, M4 needs M3, and M5 needs M4.
-- G2 (tuple hand-off, `VALUE_TUPLES_AND_STATE_HANDOFF.md`) proceeds in parallel. M1 to M5 do not wait on it; M6 does (its increments 1 to 4, and 5 if the re-measured M0 still needs it).
+- G2 (tuple hand-off, `PRODUCT_UNIFICATION.md` and `VALUE_TUPLES_AND_STATE_HANDOFF.md`) proceeds in parallel. M1 to M5 do not wait on it; M6 does (product unification slices 1 and 2 and the increment 2 port, increments 3 and 4 for products, and 5 if the re-measured M0 still needs it).
 
 Syntax stays frozen from M1 through M4, so the differential compares against
 a fixed target.

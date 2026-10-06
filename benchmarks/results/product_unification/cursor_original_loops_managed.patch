@@ -1,0 +1,126 @@
+diff --git a/blorp/src/lib/source.brp b/blorp/src/lib/source.brp
+index dfdd6a035..674fb3ca9 100644
+--- a/blorp/src/lib/source.brp
++++ b/blorp/src/lib/source.brp
+@@ -9,7 +9,7 @@ record SourceFile {
+ }
+ 
+ 
+-fixed record Cursor {
++record Cursor {
+ 	offset: Int,
+ 	line: Int,
+ 	column: Int
+@@ -28,7 +28,7 @@ record SourceSpan {
+ }
+ 
+ 
+--- Managed line/column-only source extent passed to Core lowering.
++-- Line/column-only source extent passed to Core lowering without a heap tuple.
+ fixed record SourceLineColumnSpan {
+ 	start_line: Int,
+ 	start_column: Int,
+@@ -44,7 +44,7 @@ opaque type SourceFileId = Int
+ private COMPILER_PRELUDE_FILE_ID: Int = -1
+ 
+ -- SourceLocation is stored in union payloads throughout the frontend. Keep it
+--- pointer-sized so those payloads remain inline: a record here is boxed by the
++-- pointer-sized so those payloads remain inline: a struct here is boxed by the
+ -- backend and restores the per-node allocation this representation removes.
+ -- Compiler source files are bounded to less than 2 GiB, leaving one scalar
+ -- value outside the authored-location range for the compiler prelude.
+@@ -231,7 +231,16 @@ private pure func source_table_cursor_at(data: SourceTableData, offset: Int) ->
+ 				else:
+ 					upper = middle
+ 
+-			source_scan_cursor(source.text, line_starts.get_or(lower, 0), lower + 1, target)
++			var cursor: Cursor = {
++				offset = line_starts.get_or(lower, 0),
++				line = lower + 1,
++				column = 1
++			}
++
++			while cursor.offset < target:
++				cursor = source_advance(source, cursor)
++
++			cursor
+ 		None:
+ 			source_cursor_at(source, target)
+ 
+@@ -253,8 +262,8 @@ pure func source_location_span(table: SourceTable, location: SourceLocation) ->
+ --- fields and its record allocation -- for callers (Core lowering's
+ --- `pack_core_source_loc`) that only need the four line/column numbers and
+ --- would otherwise build and immediately discard a `SourceSpan` per node.
+---- The endpoint `Cursor`s and returned `SourceLineColumnSpan` remain managed
+---- records; this projection omits the larger `SourceSpan` result.
++--- `Cursor` and `SourceLineColumnSpan` are inline structs, so the returned
++--- coordinates do not require a heap tuple.
+ pure func source_location_line_column_span(
+ 	table: SourceTable,
+ 	location: SourceLocation,
+@@ -305,42 +314,6 @@ pure func source_peek(src: SourceFile, cursor: Cursor) -> Option[Char]:
+ 	src.text.get(cursor.offset)
+ 
+ 
+-private pure func source_column_after_tab(column: Int) -> Int:
+-	column + (COMPILER_SOURCE_TAB_WIDTH - (column - 1) % COMPILER_SOURCE_TAB_WIDTH)
+-
+-
+--- Both callers supply a line start and a clamped target within immutable text:
+--- 0 <= start_offset <= target <= text.length(). Column starts at one. The
+--- default NUL is an ordinary byte and cannot affect this legal range. Scan
+--- scalar coordinates, publishing one managed Cursor at the result boundary.
+-private pure func source_scan_cursor(
+-	text: String,
+-	start_offset: Int,
+-	start_line: Int,
+-	target: Int,
+-) -> Cursor:
+-	var offset: Int = start_offset
+-	var line: Int = start_line
+-	var column: Int = 1
+-
+-	while offset < target:
+-		match text.get(offset).get_or('\0'):
+-			'\n':
+-				line += 1
+-				column = 1
+-			'\t':
+-				column = source_column_after_tab(column)
+-			_:
+-				column += 1
+-		offset += 1
+-
+-	{
+-		offset = offset,
+-		line = line,
+-		column = column
+-	}
+-
+-
+ pure func source_advance(src: SourceFile, cursor: Cursor) -> Cursor:
+ 	match source_peek(src, cursor):
+ 		Some('\n'):
+@@ -353,7 +326,7 @@ pure func source_advance(src: SourceFile, cursor: Cursor) -> Cursor:
+ 			{
+ 				offset = cursor.offset + 1,
+ 				line = cursor.line,
+-				column = source_column_after_tab(cursor.column)
++				column = cursor.column + (COMPILER_SOURCE_TAB_WIDTH - (cursor.column - 1) % COMPILER_SOURCE_TAB_WIDTH)
+ 			}
+ 		Some(_):
+ 			{
+@@ -373,7 +346,12 @@ pure func source_cursor_at(src: SourceFile, offset: Int) -> Cursor:
+ 	else:
+ 		offset
+ 
+-	source_scan_cursor(src.text, 0, 1, target)
++	var cursor: Cursor = source_start(src)
++
++	while cursor.offset < target:
++		cursor = source_advance(src, cursor)
++
++	cursor
+ 
+ 
+ pure func source_span(src: SourceFile, start_cursor: Cursor, end_cursor: Cursor) -> SourceSpan:

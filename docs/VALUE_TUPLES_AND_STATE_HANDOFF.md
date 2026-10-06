@@ -1,8 +1,12 @@
 # Value Tuples and Owned State Hand-off
 
-Status (2026-10-02): increment 1 is implemented; increments 2-5 and 7 are
-open. This is the plan of record for non-storage tuple flattening, owned state
-through calls, and stored tuple layout. Read [`WORKER_CHECKLIST.md`](WORKER_CHECKLIST.md)
+Status (2026-10-06): increment 1 is implemented; increments 2-5 and 7 are
+open. [Product unification](PRODUCT_UNIFICATION.md) now owns increment 2: it
+ports the paused `core/multi-value-results` branch onto one Core product
+model shared with records, and its Core form replaces the one specified
+below. This plan keeps the ABI, ownership and proof rules that port reuses,
+and increments 3-5 and 7, which apply to every managed product (record or
+tuple), not only tuples. Read [`WORKER_CHECKLIST.md`](WORKER_CHECKLIST.md)
 before implementing or measuring an increment. Current ownership rules are in
 [`OWNERSHIP_MODEL.md`](OWNERSHIP_MODEL.md); struct-key/value dictionary
 specialization is retired while [record simplification](FIXED_LAYOUT_ROADMAP.md)
@@ -24,11 +28,11 @@ performance claim.
 
 | Increment | Scope | Depends on | Decision before landing |
 | --- | --- | --- | --- |
-| 2 | Multi-value parameters/results and boxes only at defined boundaries | Implemented 1 | Prove the ABI, ownership and re-boxing rules below. |
+| 2 | Multi-value parameters/results and boxes only at defined boundaries; carried out as the scalar replacement slice of [product unification](PRODUCT_UNIFICATION.md#5-migration-in-landable-slices) | Implemented 1; that plan's projection and construction slices | Prove the ABI, ownership and re-boxing rules below and that plan's acceptance. |
 | 3 | Consuming clones for multi-value results; simple reads first within an expression | 2 | Check clone growth and the stage-2 cost ceiling below. |
 | 4 | Place liveness for variables and last-use releases | 3 | Show one notion of last use across clones and Perceus, including derived borrows and cancellation. |
 | 5 | Field places and conditional takes | 4; first re-measure M0 | Proceed only if remaining field-copy cost justifies it. |
-| 7 | Stored tuples in fields, lists and optional results; `enumerate` without materialization | 2; independent of 3-5 | Fresh dynamic census first; measure each storage boundary separately. |
+| 7 | Stored products in fields, lists and optional results; `enumerate` without materialization | 2 and the typed tuple box slice of [product unification](PRODUCT_UNIFICATION.md); independent of 3-5 | Fresh dynamic census of records and tuples first; measure each storage boundary separately. |
 
 Increment 6, hoisting simple reads across statements, is deferred until a
 census of real sites warrants it. The only recorded example has a natural
@@ -37,22 +41,24 @@ counts, and a full SSA conversion are separate projects. Keep the current
 one-owned-parameter consuming-clone scheme; consider inferred ownership only
 if clone growth or copies left after increments 4-5 cause a large measured
 self-compile difference. The discovery redesign's M6 flip waits on 2-4, and
-on 5 only if M0 re-measurement after 4 requires it; earlier redesign steps
-can proceed independently. Those dependencies do not turn historical M0
+on 5 only if M0 re-measurement after 4 requires it; increment 2 now means the
+slices that [product unification](PRODUCT_UNIFICATION.md#7-m6-implications)
+lists. Earlier redesign steps can proceed independently. Those dependencies do not turn historical M0
 projections into current-main acceptance evidence.
 
 ## Increment 2: tuples as values
 
 ### Layout and box preservation
 
-Blorp tuples have two to four elements and compare and hash by element. All
-source record forms are managed; tuple flattening does not introduce a
-separate source-language record representation. After monomorphization, a
-tuple that is the whole type of a local, parameter or result is a group of
-values. A multi-value result uses a C
+Blorp tuples have two to four elements and compare and hash by element. The
+rules in this section are stated for tuples and apply to every managed
+product: product unification admits records under the same rules, and an
+inline product is already a value that is never flattened. After
+monomorphization, a tuple that is the whole type of a local, parameter or
+result is a group of values. A multi-value result uses a C
 struct by value only as ABI transport; it is never a Blorp value or Perceus
-variable. A tuple nested inside another type remains a `blorp_Tuple` box
-through increment 5: list/set/dictionary slots, record fields, union and
+variable. A tuple nested inside another type remains a box through
+increment 5: list/set/dictionary slots, record fields, union and
 `Option` payloads, closure/task/channel signatures and runtime helpers are
 examples. Increment 7 owns the measured storage changes.
 
@@ -84,18 +90,21 @@ source-to-sink rule.
 
 ### Core form and failure boundary
 
-After `tuple_flatten.brp`, `CoreType.TupleType(items)` means a multi-value;
-`CoreType.BoxedTupleType(items)` means a runtime tuple box.
+The Core form is
+[product unification's](PRODUCT_UNIFICATION.md#2-operations): a product that
+keeps its box stays `ProductType`, `CoreType.MultiValueType(items)` is a
+multi-value and `MultiValueExpr` builds one. There is no `BoxedTupleType`.
 `CoreExpr.UnpackLetExpr(binders, value, body, typ, loc)` binds each result
-element as a local in element order. `TupleExpr` creates a multi-value only
-in a **multi-value context**: a tuple-returning function body, an
+element as a local in element order. A multi-value appears only in a
+**multi-value context**: a product-returning function body, an
 `UnpackLetExpr` value, or the value-bearing continuation/arm/body of a
 `LetExpr`, `BorrowLetExpr`, `UnpackLetExpr`, `SeqExpr`, `IfExpr`, match,
 tail-recursion loop, resource scope, or Perceus `DupExpr`/`DropExpr`.
 Tail-recursion jumps produce no value. An exhaustive Perceus-ingress check
 classifies every Core form, so a new form cannot silently admit an illegal
-`TupleType`. `TupleFieldExpr` reads only `BoxedTupleType`. An illegal form
-fails with an internal error naming its function; there is no heap fallback.
+`MultiValueType`; it runs on every compile. A product field read is never
+of a multi-value. An illegal form fails with an internal error naming its function; there
+is no heap fallback.
 
 Flatten all top-level tuple types, including managed elements and `var`
 tuples. A local built from a tuple becomes element locals; one bound to a
@@ -129,7 +138,7 @@ projections are `Alias(box)`. Boxing at a sink consumes elements like a
 record constructor. Capturing a flattened tuple captures elements; a boxed
 one remains one owner. `(b, b)` retains for the second use so updates still
 copy a shared record. Perceus balances multi-value branches per element and
-never sees a variable of `TupleType`.
+never sees a variable of `MultiValueType`.
 
 Keep the original ownership contract when a parameter is placed in a
 multi-value result: treat each result element like the old tuple
@@ -137,9 +146,9 @@ constructor's operand. A parameter returned alone stays borrowed and is
 retained at the return. Increment 1 intentionally changed contracts for
 parameters formerly consumed solely by removed local/match tuples; its
 [result](../benchmarks/results/tuple_flatten_increment1_2026-10-02.md)
-records them. `same_object`, `is_unique` and `refcount` answer for a tuple as
-for other stack values (`False`, `True`, `0`) without boxing, with matching
-standard-library comments and Guide text updated in increment 2.
+records them. An operand of `same_object`, `is_unique` or `refcount` is a
+sink, so the tuple keeps its box there and the builtins answer as before
+(product unification, decision 12).
 
 ### Increment 2 proof
 
@@ -272,7 +281,7 @@ both leak and ASan tests. The M0 field-copy census, stage-2 instructions,
 allocations and peak RSS decide whether the measured improvement justifies
 the change. A negative result can park increment 5.
 
-## Increment 7: stored tuples
+## Increment 7: stored products
 
 After increment 2, take a fresh dynamic tuple census on current frozen
 input. Classify record and typed-union tuple fields, `List[(A, B)]`,
@@ -313,7 +322,7 @@ to simple reads among operands that all execute; ordinary left-to-right
 source order remains. A pure user call is not assumed safe to move: it may
 diverge, overflow the stack or print from `debug:`.
 
-After increment 2, always validate `TupleType` contexts and boxed field
+After increment 2, always validate multi-value contexts and boxed field
 projections at Perceus ingress. After increment 4, under
 `--check-invariants`, validate immediate last-use releases, derived-borrow
 liveness and no read of a moved place. Existing once-only transfer/retain/
@@ -359,7 +368,7 @@ the stage-2/3 fixpoint must match even when its emitted C differs from its
 parent. Report raw artifacts, revision/toolchain identity, exact counts and
 limitations; do not infer a speedup from the older M0 estimates.
 
-The fixed-arity boxed tuple makers (`blorp_tuple_new2/3/4`) are a separate
-measured follow-up only if the residual cost at sinks is material. A direct
-destructor call instead of a `destructor_id` lookup is another separate
-runtime optimization. Neither is required for increment 2 correctness.
+Typed tuple boxes replace the varargs tuple maker in
+[product unification](PRODUCT_UNIFICATION.md#4-runtime-and-backend). A direct
+destructor call instead of a `destructor_id` lookup is a separate runtime
+optimization. Neither is required for increment 2 correctness.
