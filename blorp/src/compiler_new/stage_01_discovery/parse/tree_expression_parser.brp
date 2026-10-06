@@ -12,6 +12,9 @@ import:
 		UnaryOperator(Negate, LogicalNot),
 		BinaryOperator(Add, Subtract, Multiply, Divide, Modulo, Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual),
 		LogicalOperator(LogicalAnd, LogicalOr)
+	-- A lambda atom holds a statement recipe, so this module and the body parser import
+	-- each other until the shared recipe types move to their own module.
+	tree_body_parser: LambdaRecipe, BodyRecipe(BlockBodyRecipe), parse_lambda_recipe, mint_lambda_recipe
 	../syntax/ids: spelling_index
 	../syntax/sequences: AtLeastOne, SmallTuple(Pair, Triple, Quadruple), at_least_one_items
 	../syntax/names: WrittenName
@@ -25,13 +28,13 @@ import:
 		RightBraceConstruct(RightBraceInRecordLiteral, RightBraceInRecordUpdate, RightBraceInDictLiteral, RightBraceInVectorLiteral)
 	../tables/span: Span, span_covering
 	../tables/token:
-		TokenKind(IdentifierToken, IntLiteralToken, FloatLiteralToken, NormalStringToken, RawStringToken, PipeStringToken, RawPipeStringToken,
+		TokenKind(IdentifierToken, FuncKeyword, PureKeyword, IntLiteralToken, FloatLiteralToken, NormalStringToken, RawStringToken, PipeStringToken, RawPipeStringToken,
 			InterpolatedStringToken, InterpolatedPipeStringToken, CharLiteralToken, TrueKeyword, FalseKeyword, VoidKeyword, UnderscoreSymbol,
 			MinusSymbol, NotKeyword, LeftParenSymbol, RightParenSymbol, LeftBracketSymbol, RightBracketSymbol, LeftBraceSymbol, RightBraceSymbol, FatArrowSymbol, PipeSymbol, EqualSymbol, CommaSymbol,
 			EndOfFileToken, NewlineToken, DotSymbol, IndentToken)
 	binary_operators as Operators
 	parse_state:
-		ParseState, diagnostic_count, current_kind, current_token, current_span, current_literal, current_interpolation, advanced, peek_kind, span_start_line,
+		ParseState, resumed_at, position, diagnostic_count, current_kind, current_token, current_span, current_literal, current_interpolation, advanced, peek_kind, span_start_line,
 		consume_referenced_name, finished_name_use, finished_expression, finished_hole, report_at_current, report_diagnostic, report_unreachable_input, expect_token, entered_hole, left_hole
 
 
@@ -86,6 +89,7 @@ union RecipeKind:
 	RecordRecipe(List[RecordFieldRecipe])
 	UpdateRecipe(ExpressionRecipe, AtLeastOne[RecordFieldRecipe])
 	DictRecipe(AtLeastOne[EntryRecipe])
+	LambdaAtomRecipe(LambdaRecipe)
 
 
 -- A text piece, or a hole whose expression is still a recipe.
@@ -169,6 +173,18 @@ pure func subscript_parts(recipe: ExpressionRecipe) -> Option[(ExpressionRecipe,
 			None
 
 
+-- Whether the expression is a lambda whose body is an indented block: it ends
+-- at its block's dedent, where the next statement may already begin.
+pure func is_block_lambda(recipe: ExpressionRecipe) -> Bool:
+	match recipe.kind:
+		LambdaAtomRecipe(lambda):
+			match lambda.body:
+				BlockBodyRecipe(_): True
+				_: False
+		_:
+			False
+
+
 -- Recognizes one same-line expression without issuing ids. The caller owns
 -- the boundary after it: a value, a condition and a statement end differently.
 pure func parse_expression_recipe(state: ParseState) -> (ParseState, RecipeParse):
@@ -187,7 +203,13 @@ pure func parse_same_line_expression(state: ParseState) -> (ParseState, Expressi
 				(state, UnsupportedExpression)
 			else:
 				(minted, expression) = parsed.mint_recipe(recipe)
-				(minted, ParsedExpression(expression))
+
+				-- A replay (a lambda's parameter types) moves the cursor and may
+				-- report; neither may reach the caller.
+				if minted.diagnostic_count() != state.diagnostic_count():
+					(state, UnsupportedExpression)
+				else:
+					(minted.resumed_at(parsed.position()), ParsedExpression(expression))
 
 
 -- An unindented dot or any indented tail may continue the legacy expression.
@@ -587,6 +609,13 @@ private pure func parse_atom(state: ParseState, line: Int) -> (ParseState, Recip
 			CharLiteralToken:
 				-- The token cursor validated the payload as a Unicode scalar value.
 				(state.advanced(), ParsedRecipe({ span = span, kind = CharacterRecipe(to_char(state.current_token().payload)) }))
+			FuncKeyword | PureKeyword:
+				(remaining, lambda) = parse_lambda_recipe(state)
+				match lambda:
+					Some(recipe):
+						(remaining, ParsedRecipe({ span = recipe.span, kind = LambdaAtomRecipe(recipe) }))
+					None:
+						(state, UnsupportedRecipe)
 			TrueKeyword | FalseKeyword:
 				(state.advanced(), ParsedRecipe({ span = span, kind = BooleanRecipe(state.current_kind() == TrueKeyword) }))
 			VoidKeyword | UnderscoreSymbol:
@@ -991,6 +1020,7 @@ private pure func mint_nonbinary_recipe(state: ParseState, recipe: ExpressionRec
 						out = after_hole
 						minted = minted.append(InterpolationHole(hole))
 			out.finished_expression(recipe.span, InterpolatedString(form, minted))
+		LambdaAtomRecipe(lambda): mint_lambda_recipe(state, lambda)
 		BooleanRecipe(value): state.finished_expression(recipe.span, BooleanLiteral(value))
 		VoidRecipe: state.finished_expression(recipe.span, VoidValue)
 		UnaryRecipe(operator, operand):

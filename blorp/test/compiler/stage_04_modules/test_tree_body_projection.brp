@@ -7,7 +7,7 @@ import:
 	../../../src/compiler/stage_02_lex/name_table: EMPTY_NAME_TABLE, IdentifierSpellings(SpellingsFromIdentifierText, SpellingsFromNameTable)
 	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
 	../../../src/compiler/stage_03_parse/parsed_ast:
-		ParsedDecl(FunctionParsedDecl, VarParsedDecl), ParsedExpr(ParsedBlockExpr, ParsedIfExpr, ParsedAssignExpr, ParsedMatchExpr, ParsedNameExpr, ParsedStringLiteralExpr, ParsedStringInterpolationPartsExpr), ParsedElseBranch,
+		ParsedDecl(FunctionParsedDecl, VarParsedDecl), ParsedExpr(ParsedBlockExpr, ParsedIfExpr, ParsedLambdaExpr, ParsedAssignExpr, ParsedMatchExpr, ParsedNameExpr, ParsedStringLiteralExpr, ParsedStringInterpolationPartsExpr), ParsedElseBranch,
 		ParsedStringInterpolationPart(ParsedInterpolationLiteral, ParsedInterpolationExpr), ParsedStringLiteralForm(ParsedPipeStringLiteral)
 	../tools/discovery_adapter_comparison: with_holes_parsed
 	../../../src/compiler/stage_03_parse/parsed_ast_json: ast_json_render, parsed_decl_to_json
@@ -151,6 +151,33 @@ func test_question_bindings_and_tuple_loops_match_old_parser() -> Bool:
 		"\t\tfor (a, b, c, d,) in rows:",
 		"\t\t\tvoid",
 		"\tfirst + second"
+	]))
+
+
+func test_lambdas_and_local_functions_match_old_parser() -> Bool:
+	bodies_match_old_parser(source_lines([
+		"func g(xs: List[Int]) -> Int:",
+		"\tdouble = func(x): x * 2",
+		"\ttyped = func(first: Int, _, last: Int,) -> Int: first + last",
+		"\tconstant = pure func(): 1",
+		"\ttotal = xs.map(func(item): item + 1).map(pure func(item: Int) -> Int: item * 2).length()",
+		"\tnested = func(a): func(b): a + b",
+		"\tblock = func(x):",
+		"\t\tstep = x + 1",
+		"\t\tstep",
+		"\tfor item in xs:",
+		"\t\tlater = func(): item",
+		"\t\tchecked = func(y):",
+		"\t\t\tvalue ?= lookup(y)",
+		"\t\t\tvalue",
+		"\tfunc helper(x: Int) -> Int:",
+		"\t\tdoubled = double(x)",
+		"\t\tdoubled + 1",
+		"\tpure func tidy[T](x: T) -> T: x",
+		"\tfunc outer():",
+		"\t\tfunc inner() -> Int: 1",
+		"\t\tinner()",
+		"\thelper(double(1)) + tidy(2) + outer()"
 	]))
 
 
@@ -391,6 +418,39 @@ private func pipe_expression(text: String) -> Option[(ParsedExpr, ParsedExpr)]:
 		_: None
 
 
+-- Lambdas nest to the depth the source writes them; the projection follows
+-- each nesting once and holds nothing per link beyond its own frame.
+func test_nested_lambdas_project_to_their_depth() -> Bool:
+	depth = NESTED_LAMBDA_DEPTH
+	var text: String = "func f() -> Int: "
+	var level: Int = 0
+	while level < depth:
+		text += "func(a${level}): "
+		level += 1
+	text += "a0\n"
+	match projected_function_body(text):
+		Some(first):
+			var current: ParsedExpr = first
+			var lambdas: Int = 0
+			var walking: Bool = True
+			while walking:
+				match current:
+					ParsedLambdaExpr(_, _, _, body, _):
+						lambdas += 1
+						current = body
+					_:
+						walking = False
+			lambdas == depth
+		None: False
+
+
+-- How deep a lambda chain the tests carry. Measured on Linux arm64 after the
+-- tuple, braced and control merges: 500 passes and 700 overflows the native
+-- stack, so this keeps a margin of 2.5 below the last depth known to pass.
+-- The depth that is still owed is open item D7 (section 9).
+NESTED_LAMBDA_DEPTH: Int = 200
+
+
 -- The projected body of the only function of `text`: the old parser's
 -- `ParsedFunctionDecl.body`, shaped by the tree path.
 private func projected_function_body(text: String) -> Option[ParsedExpr]:
@@ -500,6 +560,7 @@ tests: TestSuite = {
 		("declaration metadata matches the old parser", test_declaration_metadata_matches_old_parser),
 		("control flow matches the old parser", test_control_flow_matches_old_parser),
 		("question bindings and tuple loops match the old parser", test_question_bindings_and_tuple_loops_match_old_parser),
+		("lambdas and local functions match the old parser", test_lambdas_and_local_functions_match_old_parser),
 		("match statements match the old parser", test_match_statements_match_old_parser),
 		("control expression values match the old parser", test_control_expression_values_match_old_parser),
 		("nested blocks match the old parser", test_nested_blocks_match_old_parser),
@@ -510,6 +571,7 @@ tests: TestSuite = {
 		("interpolated strings match the old parser", test_interpolated_strings_match_old_parser),
 		("character escapes and raw pipe strings match the old parser", test_character_escapes_and_raw_pipe_strings_match_old_parser),
 		("pipe strings project like the old parser", test_pipe_strings_project_like_the_old_parser),
+		("nested lambdas project to their depth", test_nested_lambdas_project_to_their_depth),
 		("a 2000 link else if chain projects by a loop", test_deep_else_if_chain_projects_by_a_loop),
 		("1000 nested value ifs project", test_deeply_nested_value_ifs_project),
 		("a 2000 arm match value projects every arm", test_long_match_value_projects_every_arm),

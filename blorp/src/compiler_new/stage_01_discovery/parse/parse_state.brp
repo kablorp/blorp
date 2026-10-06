@@ -22,6 +22,7 @@ import:
 		TraitMethod,
 		TraitReference,
 		GlobalDeclaration,
+		LocalFunction,
 		GlobalForm,
 		Parameter,
 		RecordDeclaration,
@@ -57,6 +58,7 @@ import:
 		minted_field,
 		minted_foreign_function,
 		minted_function,
+		minted_local_function,
 		minted_implementation,
 		minted_implementation_method,
 		minted_global,
@@ -136,7 +138,8 @@ private record ParseFields {
 	spellings: Spellings,
 	mint: IdMint,
 	diagnostics: List[SyntaxDiagnosticAt],
-	previous: Span
+	previous: Span,
+	hole_depth: Int
 }
 
 
@@ -185,7 +188,8 @@ pure func new_parse_state(lexed: LexedModule) -> Result[ParseState, ParseInputEr
 									spellings = lexed.spellings,
 									mint = new_id_mint(lexed.module),
 									diagnostics = diagnostics,
-									previous = cursor_token(cursor).span
+									previous = cursor_token(cursor).span,
+									hole_depth = 0
 								}))
 
 
@@ -320,6 +324,15 @@ pure func report_unreachable_input(guarantee: String):
 
 
 ---
+Whether the cursor reads an interpolation hole's own token run. A token
+position there indexes the hole's run, not the module's, so a construct that
+replays from a recorded token position cannot be read inside a hole.
+---
+pure func inside_hole(state: ParseState) -> Bool:
+	from_opaque ParseState(state).hole_depth > 0
+
+
+---
 The outer parse an interpolation hole replaced: its cursor and its source.
 ---
 opaque type ParkedParse = ParkedFields
@@ -374,7 +387,7 @@ pure func entered_hole(state: ParseState, hole: HoleScan) -> Option[(ParseState,
 		match new_token_cursor(lexed):
 			Ok(cursor):
 				Some((
-					into_opaque ParseState({ fields | cursor = cursor, source = inside, spellings = run.spellings }),
+					into_opaque ParseState({ fields | cursor = cursor, source = inside, spellings = run.spellings, hole_depth = fields.hole_depth + 1 }),
 					into_opaque ParkedParse({ cursor = fields.cursor, source = fields.source })
 				))
 			Err(_):
@@ -391,7 +404,7 @@ spellings, diagnostics and the mint.
 pure func left_hole(state: ParseState, parked: ParkedParse) -> ParseState:
 	fields: ParseFields = from_opaque ParseState(state)
 	outer: ParkedFields = from_opaque ParkedParse(parked)
-	into_opaque ParseState({ fields | cursor = outer.cursor, source = outer.source })
+	into_opaque ParseState({ fields | cursor = outer.cursor, source = outer.source, hole_depth = fields.hole_depth - 1 })
 
 
 pure func diagnostic_count(state: ParseState) -> Int:
@@ -892,6 +905,16 @@ pure func finished_hole(state: ParseState, value: Expression, span: Span) -> (Pa
 	fields: ParseFields = from_opaque ParseState(state)
 	(mint, hole) = minted_hole(fields.mint, value, span)
 	(into_opaque ParseState({ fields | mint = mint }), hole)
+
+
+pure func finished_local_function(
+	state: ParseState,
+	function: Function,
+	span: Span,
+) -> (ParseState, LocalFunction):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, declaration) = minted_local_function(fields.mint, function, span)
+	(into_opaque ParseState({ fields | mint = mint }), declaration)
 
 
 pure func finished_trait_method(

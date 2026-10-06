@@ -23,30 +23,32 @@
 -- parses it again from there, so its ids follow its neighbours' in source
 -- order. The same replay restarts a function's skipped body.
 import:
-	../syntax/declarations: FunctionDeclaration
+	../syntax/declarations: FunctionDeclaration, LocalFunction
 	../syntax/expressions:
 		AssignmentTarget(AssignsName, AssignsDiscard), Block, Body(BlockBody, ExpressionBody), CaseBody(CaseBlock, CaseStatement),
 		CompoundOperator(AddAssign, SubtractAssign, MultiplyAssign, DivideAssign), ElseBody(ElseBlock, ElseIf), ElseBranch, Expression,
-		ExpressionKind(If, Match, Break, Continue), LoopBinder(LoopVariable, LoopTuple), MatchCase, Statement,
-		StatementKind(ExpressionStatement, VariableDeclaration, TypedBinding, QuestionBinding, Assignment, CompoundAssignment, SubscriptAssignment, WhileLoop, ForLoop)
+		ExpressionKind(If, Match, Break, Continue, Lambda, VoidValue), LambdaParameter, LoopBinder(LoopVariable, LoopTuple), MatchCase, Statement,
+		StatementKind(ExpressionStatement, VariableDeclaration, TypedBinding, QuestionBinding, LocalFunctionStatement, Assignment, CompoundAssignment, SubscriptAssignment, WhileLoop, ForLoop)
 	../syntax/names: BindingTarget(BindsName, DiscardsValue), WrittenName
 	../syntax/patterns: Pattern
 	../syntax/sequences: AtLeastOne, SmallTuple(Pair, Triple, Quadruple)
 	../syntax/types: WrittenType
+	../tables/row_kinds: Purity(PureFunction, ImpureFunction), Visibility(PublicVisibility)
 	../tables/expected_token: NameConstruct(NameInStatementName, NameInVariableName)
 	../tables/span: Span, span_covering
 	../tables/token:
 		TokenKind(IdentifierToken, UnderscoreSymbol, VarKeyword, WhileKeyword, ForKeyword, IfKeyword, ElseKeyword, MatchKeyword,
 			BreakKeyword, ContinueKeyword, InKeyword, AsKeyword, EqualSymbol, ColonSymbol, QuestionEqualsSymbol, PlusEqualSymbol, MinusEqualSymbol,
-			StarEqualSymbol, SlashEqualSymbol, LeftParenSymbol, RightParenSymbol, CommaSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken, DotSymbol)
+			StarEqualSymbol, SlashEqualSymbol, LeftParenSymbol, RightParenSymbol, CommaSymbol, FuncKeyword, PureKeyword, ArrowSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken, DotSymbol)
 	binary_operators: binary_operator
 	parse_state:
 		ParseState, current_kind, current_span, previous_span, peek_kind, position, advanced, diagnostic_count, span_start_line,
 		consume_referenced_name, finished_expression, finished_statement, finished_block, finished_else_if,
-		finished_subscript_place, finished_function, finished_name_use, finished_binder, resumed_at, resumed_after
-	tree_expression_parser: ExpressionRecipe, RecipeParse(ParsedRecipe), parse_expression_recipe, mint_recipe, subscript_parts
+		finished_subscript_place, finished_function, finished_local_function, inside_hole, report_unreachable_input, finished_name_use, finished_binder, resumed_at, resumed_after
+	tree_expression_parser: ExpressionRecipe, RecipeParse(ParsedRecipe), parse_expression_recipe, mint_recipe, subscript_parts, is_block_lambda
 	tree_function_header_parser:
-		DeferredBody, FunctionHeaderPreview, FunctionBodyExtent(SkippedBody), deferred_body_token_start, deferred_body_token_end
+		DeferredBody, FunctionHeaderPreview, FunctionHeaderParse(ParsedFunctionHeader, RejectedFunctionHeader), FunctionBodyExtent(SkippedBody),
+		deferred_body_token_start, deferred_body_token_end, parse_function_header
 	tree_pattern_parser: parse_pattern
 	tree_type_parser: parse_type
 
@@ -59,7 +61,7 @@ private enum BodyContext:
 
 
 -- A written type, replayed at minting from the token it starts at.
-private record TypeRecipe {
+record TypeRecipe {
 	token: Int
 }
 
@@ -102,6 +104,7 @@ private union StatementRecipeKind:
 	SubscriptAssignmentRecipe(SubscriptPlaceRecipe, ValueRecipe)
 	WhileRecipe(ExpressionRecipe, BlockRecipe)
 	ForRecipe(LoopBindingRecipe, ExpressionRecipe, BlockRecipe)
+	LocalFunctionRecipe(LocalFunctionBody)
 
 
 private enum LoopExit:
@@ -114,8 +117,36 @@ private union AssignmentTargetRecipe:
 	DiscardedTargetRecipe(Span)
 
 
+-- A local function: its header is replayed from the token it starts at, so its
+-- ids follow its neighbours', and its own body is a recipe read once.
+private record LocalFunctionBody {
+	keyword_token: Int,
+	start: Span,
+	purity: Purity,
+	body: BodyRecipe
+}
+
+
+-- A lambda before minting: parameters and return type replay from their
+-- tokens, and the body is a recipe. `span` runs from `func` or `pure` to the
+-- end of the body.
+record LambdaRecipe {
+	purity: Purity,
+	parameters: List[LambdaParameterRecipe],
+	return_type: Option[TypeRecipe],
+	body: BodyRecipe,
+	span: Span
+}
+
+
+record LambdaParameterRecipe {
+	binder: BinderRecipe,
+	declared_type: Option[TypeRecipe]
+}
+
+
 -- A binding position that may discard.
-private union BinderRecipe:
+union BinderRecipe:
 	BindsNameRecipe(WrittenName)
 	DiscardsRecipe(Span)
 
@@ -199,10 +230,10 @@ private union BlockParse:
 	UnsupportedBlock
 
 
-private union BodyParse:
-	ParsedBlockBody(BlockRecipe)
-	ParsedExpressionBody(ExpressionRecipe)
-	UnsupportedBody
+-- A body before minting: an indented block, or an expression on the `:` line.
+union BodyRecipe:
+	BlockBodyRecipe(BlockRecipe)
+	ExpressionBodyRecipe(ExpressionRecipe)
 
 
 union FunctionCompletion:
@@ -220,24 +251,49 @@ record CompletedBody {
 -- `state` is where a header parser left the cursor, past the body it skipped.
 -- The body is replayed from the recorded token; it must end where the skipped
 -- extent ends, apart from newlines, so the two grammars agree on the extent.
--- The colon that promised the body is the token before it. An owner whose
--- body this slice does not read gets `None` and the state it was given.
-pure func complete_body(state: ParseState, skipped: DeferredBody) -> (ParseState, Option[CompletedBody]):
+-- The colon that promised the body is the token before it. A body this slice
+-- does not read gets `None` and the state it was given; one it does read gets
+-- the state back with the spellings the recognition added, at the skipped end.
+pure func recognize_skipped_body(state: ParseState, skipped: DeferredBody) -> (ParseState, Option[BodyRecipe]):
 	skipped_end: Int = deferred_body_token_end(skipped)
 	at_body: ParseState = state.resumed_at(deferred_body_token_start(skipped))
 	(recognized, parsed) = parse_body_recipe(at_body, at_body.span_start_line(at_body.previous_span()))
 	if state.position() != skipped_end or recognized.diagnostic_count() != state.diagnostic_count() or not recognized.only_newlines_until(skipped_end):
 		(state, None)
 	else:
-		match parsed:
-			ParsedBlockBody(recipe):
-				(minted, block) = mint_block(recognized, recipe)
-				(minted.resumed_at(skipped_end), Some({ body = BlockBody(block), span = block.span }))
-			ParsedExpressionBody(recipe):
-				(minted, expression) = mint_recipe(recognized, recipe)
-				(minted.resumed_at(skipped_end), Some({ body = ExpressionBody(expression), span = expression.span }))
-			UnsupportedBody:
+		(state.resumed_after(recognized).resumed_at(skipped_end), parsed)
+
+
+-- Recognize, then mint. A replay that reports anything leaves the body unread.
+pure func complete_body(state: ParseState, skipped: DeferredBody) -> (ParseState, Option[CompletedBody]):
+	(recognized, recipe) = recognize_skipped_body(state, skipped)
+	match recipe:
+		Some(body):
+			(minted, completed) = mint_body_recipe(recognized, body)
+			if minted.diagnostic_count() != state.diagnostic_count():
 				(state, None)
+			else:
+				(minted.resumed_at(deferred_body_token_end(skipped)), Some(completed))
+		None:
+			(state, None)
+
+
+private pure func mint_body_recipe(state: ParseState, recipe: BodyRecipe) -> (ParseState, CompletedBody):
+	match recipe:
+		BlockBodyRecipe(block_recipe):
+			(minted, block) = mint_block(state, block_recipe)
+			(minted, { body = BlockBody(block), span = block.span })
+		ExpressionBodyRecipe(expression_recipe):
+			(minted, expression) = mint_recipe(state, expression_recipe)
+			(minted, { body = ExpressionBody(expression), span = expression.span })
+
+
+private pure func body_recipe_span(recipe: BodyRecipe) -> Span:
+	match recipe:
+		BlockBodyRecipe(block):
+			block_span(block)
+		ExpressionBodyRecipe(expression):
+			expression.span
 
 
 -- A forward declaration has no body and its span ends before the colon, which
@@ -308,23 +364,19 @@ private pure func is_on_line(state: ParseState, line: Int) -> Bool:
 
 
 -- Bodies.
-private pure func parse_body_recipe(state: ParseState, colon_line: Int) -> (ParseState, BodyParse):
+private pure func parse_body_recipe(state: ParseState, colon_line: Int) -> (ParseState, Option[BodyRecipe]):
 	if state.current_kind() == NewlineToken:
 		(remaining, parsed) = parse_block_recipe(state, OutsideLoop)
 		match parsed:
 			ParsedBlock(block):
-				(remaining, ParsedBlockBody(block))
+				(remaining, Some(BlockBodyRecipe(block)))
 			UnsupportedBlock:
-				(remaining, UnsupportedBody)
+				(remaining, None)
 	else if not state.is_on_line(colon_line):
-		(state, UnsupportedBody)
+		(state, None)
 	else:
 		(remaining, value) = parse_plain_value(state)
-		match value:
-			Some(expression):
-				(remaining, ParsedExpressionBody(expression))
-			None:
-				(remaining, UnsupportedBody)
+		(remaining, value.map(pure func(expression): ExpressionBodyRecipe(expression)))
 
 
 -- Blocks.
@@ -382,6 +434,12 @@ private pure func parse_statement_recipe(state: ParseState, context: BodyContext
 			state.parse_match_statement(context)
 		BreakKeyword | ContinueKeyword:
 			state.parse_loop_exit(context)
+		FuncKeyword | PureKeyword:
+			-- `func name(...)` or `pure func name(...)`: a local function, not a lambda.
+			if (state.current_kind() == PureKeyword and state.peek_kind(1) == FuncKeyword and state.peek_kind(2) == IdentifierToken) or (state.current_kind() == FuncKeyword and state.peek_kind(1) == IdentifierToken):
+				state.parse_local_function()
+			else:
+				state.parse_expression_statement()
 		IdentifierToken:
 			match state.peek_kind(1):
 				EqualSymbol:
@@ -430,7 +488,9 @@ private pure func parse_plain_value(state: ParseState) -> (ParseState, Option[Ex
 	(remaining, parsed) = parse_expression_recipe(state)
 	match parsed:
 		ParsedRecipe(value):
-			if remaining.at_statement_boundary():
+			-- A lambda with a block body ends at its block's dedent, where the
+			-- next statement may already start.
+			if remaining.at_statement_boundary() or (is_block_lambda(value) and remaining.block_statement_ends()):
 				(remaining, Some(value))
 			else:
 				(state, None)
@@ -896,6 +956,172 @@ private pure func starts_nested_block(state: ParseState) -> Bool:
 			False
 
 
+-- Lambdas. Recognized from the expression grammar, minted by it. The header
+-- (everything through the colon) and the body are read apart: the header is
+-- one line, the body is a recipe of its own.
+pure func parse_lambda_recipe(state: ParseState) -> (ParseState, Option[LambdaRecipe]):
+	(after_header, header) = parse_lambda_header(state)
+	match header:
+		None:
+			(state, None)
+		Some(read):
+			(after_body, body) = parse_lambda_body(after_header, state.span_start_line(state.current_span()))
+			match body:
+				Some(recipe):
+					(after_body, Some({
+						purity = read.purity, parameters = read.parameters, return_type = read.return_type, body = recipe,
+						span = state.current_span().span_covering(body_recipe_span(recipe))
+					}))
+				None:
+					(state, None)
+
+
+-- What a lambda's header holds before its body.
+private record LambdaHeader {
+	purity: Purity,
+	parameters: List[LambdaParameterRecipe],
+	return_type: Option[TypeRecipe]
+}
+
+
+-- `[pure] func(parameters) [-> R]:` on one line. A hole's token positions index
+-- the hole's own run and parameter types replay from a recorded position, so
+-- a lambda in a hole is not read.
+private pure func parse_lambda_header(state: ParseState) -> (ParseState, Option[LambdaHeader]):
+	after_pure: ParseState = if state.current_kind() == PureKeyword:
+		state.advanced()
+	else:
+		state
+	if state.inside_hole() or after_pure.current_kind() != FuncKeyword or after_pure.peek_kind(1) != LeftParenSymbol:
+		(state, None)
+	else:
+		line: Int = state.span_start_line(state.current_span())
+		(after_parameters, parameters) = parse_lambda_parameters(after_pure.advanced().advanced())
+		after_close: ParseState = after_parameters.advanced()
+		(after_return, return_type) = if after_close.current_kind() == ArrowSymbol:
+			(remaining, written) = after_close.advanced().recognize_type()
+			(remaining, written.map(pure func(recipe): Some(recipe)))
+		else:
+			(after_close, Some(None))
+		match (parameters, return_type):
+			(Some(read), Some(annotation)):
+				if after_parameters.current_kind() != RightParenSymbol or not after_parameters.is_on_line(line) or after_return.current_kind() != ColonSymbol or not after_return.is_on_line(line):
+					(state, None)
+				else:
+					purity: Purity = if state.current_kind() == PureKeyword:
+						PureFunction
+					else:
+						ImpureFunction
+					(after_return.advanced(), Some({ purity = purity, parameters = read, return_type = annotation }))
+			_:
+				(state, None)
+
+
+-- `name [: T]` items to the closing parenthesis, a trailing comma allowed.
+private pure func parse_lambda_parameters(state: ParseState) -> (ParseState, Option[List[LambdaParameterRecipe]]):
+	var out: ParseState = state
+	var parameters: List[LambdaParameterRecipe] = []
+	var reading: Bool = out.current_kind() != RightParenSymbol
+	var valid: Bool = True
+	while reading and valid:
+		(after_binder, binder) = parse_binder_recipe(out)
+		match binder:
+			Some(written):
+				(after_annotation, annotation) = after_binder.parse_type_annotation()
+				match annotation:
+					InvalidAnnotation:
+						valid = False
+					Annotated(declared):
+						parameters = parameters.append({ binder = written, declared_type = Some(declared) })
+						out = after_annotation
+					NoAnnotation:
+						parameters = parameters.append({ binder = written, declared_type = None })
+						out = after_annotation
+				if out.current_kind() == CommaSymbol:
+					out = out.advanced()
+					reading = out.current_kind() != RightParenSymbol
+				else:
+					reading = False
+			None:
+				valid = False
+	if valid:
+		(out, Some(parameters))
+	else:
+		(state, None)
+
+
+-- A block on the lines after the colon, or an expression on its line. An
+-- expression body ends where the expression does: the enclosing construct
+-- decides what may follow.
+private pure func parse_lambda_body(state: ParseState, line: Int) -> (ParseState, Option[BodyRecipe]):
+	if state.current_kind() == NewlineToken:
+		(remaining, parsed) = parse_block_recipe(state, OutsideLoop)
+		match parsed:
+			ParsedBlock(block):
+				(remaining, Some(BlockBodyRecipe(block)))
+			UnsupportedBlock:
+				(state, None)
+	else if not state.is_on_line(line):
+		(state, None)
+	else:
+		(remaining, parsed) = parse_expression_recipe(state)
+		match parsed:
+			ParsedRecipe(value):
+				(remaining, Some(ExpressionBodyRecipe(value)))
+			_:
+				(state, None)
+
+
+pure func mint_lambda_recipe(state: ParseState, recipe: LambdaRecipe) -> (ParseState, Expression):
+	var out: ParseState = state
+	var parameters: List[LambdaParameter] = []
+	for parameter in recipe.parameters:
+		(after_target, target) = mint_binder_target(out, parameter.binder)
+		(after_type, declared) = mint_optional_type(after_target, parameter.declared_type)
+		name_span: Span = match parameter.binder:
+			BindsNameRecipe(name): name.span
+			DiscardsRecipe(discarded): discarded
+		span: Span = match declared:
+			Some(written): name_span.span_covering(written.span)
+			None: name_span
+		out = after_type
+		parameters = parameters.append({ target = target, declared_type = declared, span = span })
+	(after_return, return_type) = mint_optional_type(out, recipe.return_type)
+	(after_body, completed) = mint_body_recipe(after_return, recipe.body)
+	after_body.finished_expression(recipe.span, Lambda({ purity = recipe.purity, parameters = parameters, return_type = return_type, body = completed.body }))
+
+
+-- Local functions: `func name(...)` or `pure func name(...)` as a statement.
+-- The header is parsed to learn where it ends and that it is clean, its ids
+-- discarded; minting parses it again from its keyword.
+private pure func parse_local_function(state: ParseState) -> (ParseState, StatementParse):
+	start: Span = state.current_span()
+	purity: Purity = if state.current_kind() == PureKeyword:
+		PureFunction
+	else:
+		ImpureFunction
+	at_keyword: ParseState = if purity == PureFunction:
+		state.advanced()
+	else:
+		state
+	(after_header, parsed) = parse_function_header(at_keyword, PublicVisibility, None, [], purity, start)
+	match parsed:
+		RejectedFunctionHeader:
+			(state, UnsupportedStatement)
+		ParsedFunctionHeader(preview):
+			match preview.body_extent:
+				SkippedBody(skipped):
+					(after_body, body) = recognize_skipped_body(state.resumed_after(after_header), skipped)
+					match body:
+						Some(recipe):
+							local: LocalFunctionBody = { keyword_token = at_keyword.position(), start = start, purity = purity, body = recipe }
+							(after_body, ParsedStatement({ span = start.span_covering(body_recipe_span(recipe)), kind = LocalFunctionRecipe(local) }))
+						None:
+							(state, UnsupportedStatement)
+				_:
+					(state, UnsupportedStatement)
+
+
 -- Minting. Every id is issued here, in source order.
 -- Blocks nest by indentation, so the functions between a statement and the
 -- statements of its blocks are on the native stack once per level. Each kind
@@ -936,6 +1162,25 @@ private pure func mint_statement(state: ParseState, recipe: StatementRecipe) -> 
 			(after_condition, expression) = mint_recipe(state, condition)
 			(after_body, block) = mint_block(after_condition, body)
 			after_body.finished_statement(recipe.span, WhileLoop({ condition = expression, body = block }))
+		LocalFunctionRecipe(local):
+			(after_header, parsed) = parse_function_header(state.resumed_at(local.keyword_token), PublicVisibility, None, [], local.purity, local.start)
+			match parsed:
+				ParsedFunctionHeader(preview):
+					(after_body, completed) = mint_body_recipe(after_header, local.body)
+					header = preview.header
+					(declared, function) = after_body.finished_local_function(
+						{ signature = header.signature, type_parameters = header.type_parameters, constraints = header.constraints, body = Some(completed.body) },
+						header.header_span.span_covering(completed.span)
+					)
+					declared.finished_statement(recipe.span, LocalFunctionStatement(function))
+				RejectedFunctionHeader:
+					-- The dry run over the same tokens was clean, so the replay is too.
+					-- If it is not, its diagnostics make the owner unread (`complete_body`
+					-- compares them), so this void statement is a recovery placeholder
+					-- that never leaves the parser (section 3.17).
+					report_unreachable_input("a local function header that parsed cleanly is rejected when replayed")
+					(placeholder, value) = after_header.finished_expression(recipe.span, VoidValue)
+					placeholder.finished_statement(recipe.span, ExpressionStatement(value))
 		ForRecipe(binding, iterable, body):
 			mint_for_loop(state, recipe.span, binding, iterable, body)
 

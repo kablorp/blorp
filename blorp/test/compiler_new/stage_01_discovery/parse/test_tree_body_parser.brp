@@ -12,7 +12,9 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/syntax/expressions:
 		Body(BlockBody), ElseBody(ElseBlock, ElseIf), ElseBranch, ExpressionKind(If), StatementKind(Assignment, ExpressionStatement)
 	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: FunctionDeclaration
+	../../../../src/compiler_new/stage_01_discovery/syntax/definitions: Definition(FunctionDefinition, LocalFunctionDefinition)
 	../../../../src/compiler_new/stage_01_discovery/syntax/id_census: id_census
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: Spellings, spelling_text
 	../../../../src/compiler_new/stage_01_discovery/syntax/ids: block_local_index, expression_local_index, statement_local_index
 	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: ModuleItem(FunctionItem, TraitItem, ImplementationItem), ModuleSyntax
 	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
@@ -178,7 +180,6 @@ func test_unsupported_bodies_roll_back_exactly() -> Bool:
 		["\tmatch x:", "\t\t1: if y:", "\t\t\tz"],
 		["\tmatch x:", "\t\t1: 2", "\tmatch y:", "\t\t_: 3", "\t-z"],
 		["\tx: Int", "\ty"],
-		["\tfunc inner() -> Int: 1", "\tinner()"],
 		["\tconcurrent:", "\t\tf()"],
 		["\tif a:", "\t\tb", "\telse", "\t\tc"],
 		["\tp.x = 1"],
@@ -186,6 +187,12 @@ func test_unsupported_bodies_roll_back_exactly() -> Bool:
 		["\tvalue = \"" + hole("a b") + "\""],
 		["\tvalue = \"" + hole("") + "\""],
 		["\tvalue = \"" + hole("first") + " and " + hole("second third") + "\""],
+		["\tf = func(x):", "\t\t(a, b) = x"],
+		["\tvalue = \"" + hole("(func(x): x)(1)") + "\""],
+		["\ta = 1", "\tfunc helper(x: Int) -> Int:", "\t\t(a, b) = x"],
+		["\tfunc helper(x: Int) -> Int"],
+		["\tf = func(x: Int, y): x", "\tg = func(z): (a, b) = z"],
+		["\tfor x in xs:", "\t\tf = func(): break"],
 		-- A type and a pattern parsed to find their ends issue no ids that survive.
 		["\tcount: Int = 1", "\tmatch count:", "\t\tSome(inner): inner", "\t(flag, other) = pair"]
 	]:
@@ -272,6 +279,61 @@ func test_owner_with_an_unsupported_body_stays_a_preview_with_no_ids() -> Bool:
 					correct = False
 			_: correct = False
 	correct
+
+
+-- The name each definition of the module was written with, by definition id.
+private pure func definition_names(syntax: ModuleSyntax, written: Spellings) -> List[Option[String]]:
+	syntax.definitions.map(pure func(definition):
+		match definition:
+			LocalFunctionDefinition(local): written.spelling_text(local.function.signature.name.spelling)
+			FunctionDefinition(function): written.spelling_text(function.function.signature.name.spelling)
+			_: None
+	)
+
+
+-- A local function is minted after everything declared inside it, so its
+-- definition id sits before its enclosing function's; a lambda owns its
+-- parameters' ids and its body's, in that order.
+func test_lambda_and_local_function_ids_follow_source_order() -> Bool:
+	text = source_lines([
+		"func f(a: Int) -> Int:",
+		"\tg = func(x: Int) -> Int: x + a",
+		"\tfunc local(y: Int) -> Int:",
+		"\t\tfunc inner(z: Int) -> Int: z",
+		"\t\tinner(y)",
+		"\tg(local(1))"
+	])
+	match scanned(text):
+		Some((state, scan)):
+			syntax = completed_module(state, scan)
+			completed_count(scan) == 1 and state.diagnostic_count() == 0 and id_census(module_id_at_row(0), syntax).is_empty() and definition_names(syntax, spellings(state)) == [Some("inner"), Some("local"), Some("f")]
+		None: False
+
+
+-- Nested lambdas are right nesting: depth in the source is depth in the
+-- parser, the minting, the dump and the census, but no walk follows a chain's
+-- length with a frame per link beyond that.
+func test_nested_lambdas_survive_parse_dump_and_census() -> Bool:
+	depth = NESTED_LAMBDA_DEPTH
+	var text: String = "func f() -> Int: "
+	var level: Int = 0
+	while level < depth:
+		text += "func(a${level}): "
+		level += 1
+	text += "a0\n"
+	match scanned(text):
+		Some((state, scan)):
+			syntax = completed_module(state, scan)
+			dumped = syntax.dumped_module(spellings(state))
+			completed_count(scan) == 1 and state.diagnostic_count() == 0 and id_census(module_id_at_row(0), syntax).is_empty() and state.issued_counts().expressions == depth + 1 and dumped.split("(lambda expr").length() == depth + 1
+		None: False
+
+
+-- How deep a lambda chain the tests carry. Measured on Linux arm64 after the
+-- tuple, braced and control merges: 500 passes and 700 overflows the native
+-- stack, so this keeps a margin of 2.5 below the last depth known to pass.
+-- The depth that is still owed is open item D7 (section 9).
+NESTED_LAMBDA_DEPTH: Int = 200
 
 
 func test_break_and_continue_are_supported_only_inside_loops() -> Bool:
@@ -452,11 +514,7 @@ func test_control_value_ids_follow_source_order() -> Bool:
 															match branch.body:
 																ElseBlock(else_block):
 																	assignment_index = assignment_statement.id.statement_local_index()
-																	(conditional.condition.id.expression_local_index() < assignment.value.id.expression_local_index()
-																		and conditional.then_block.last.id.statement_local_index() < else_block.last.id.statement_local_index()
-																		and else_block.last.id.statement_local_index() < assignment_index
-																		and conditional.then_block.id.block_local_index() < else_block.id.block_local_index()
-																		and id_census(module_id_at_row(0), completed_module(state, scan)).is_empty())
+																	(conditional.condition.id.expression_local_index() < assignment.value.id.expression_local_index() and conditional.then_block.last.id.statement_local_index() < else_block.last.id.statement_local_index() and else_block.last.id.statement_local_index() < assignment_index and conditional.then_block.id.block_local_index() < else_block.id.block_local_index() and id_census(module_id_at_row(0), completed_module(state, scan)).is_empty())
 																_: False
 														None: False
 												_: False
@@ -530,6 +588,8 @@ tests: TestSuite = {
 		("interpolation holes are minted in source order", test_interpolation_holes_are_minted_in_source_order),
 		("owner methods are minted in source order", test_owner_methods_are_minted_in_source_order),
 		("an owner with an unsupported body stays a preview", test_owner_with_an_unsupported_body_stays_a_preview_with_no_ids),
+		("lambda and local function ids follow source order", test_lambda_and_local_function_ids_follow_source_order),
+		("nested lambdas", test_nested_lambdas_survive_parse_dump_and_census),
 		("break and continue are supported only inside loops", test_break_and_continue_are_supported_only_inside_loops),
 		("else if links are minted inner before outer", test_else_if_chain_mints_inner_links_before_outer_ones),
 		("a function after a deferred function issues only its own ids", test_function_after_a_deferred_function_issues_only_its_own_ids),

@@ -1973,7 +1973,11 @@ adapter's legacy projection:
   proved through parse, dump, ID census and projection on Linux;
 - a 1,000-deep nest of record literals, record updates and dict literals.
   This last case is **not yet met**: it is proved only to 200 levels (open
-  item D5, section 9).
+  item D5, section 9);
+- 1,000 lambdas nested in each other (`func(a): func(b): ...`), through parse,
+  dump, ID census and projection. This case is **not yet met**: it is proved
+  to 200 levels, and measured on Linux arm64 to pass at 500 and overflow at
+  700 (open item D7, section 9).
 
 The current adapter's 6,000-operand chain test is kept.
 
@@ -3417,10 +3421,10 @@ parse, mint, census, dump and projection, and 1,400 overflow the native stack.
 That limit is open item D6 in section 9.
 
 The next bounded M4 slices are control expressions as operands, then the
-statement forms `select`, `with`, `concurrent`, `detach` and `debug:`. Lambdas
-and local functions are on their own branch, and opaque conversions follow in a
-separate slice; the complete M4 gate still requires trait and implementation
-bodies.
+statement forms `select`, `with`, `concurrent`, `detach` and `debug:`, and
+opaque conversions in a separate slice. Lambdas, local functions and the bodies
+of traits and implementations are read; the complete M4 gate still requires
+module assembly, forward pairing and the open depth items D5 to D7.
 
 Argument and list nesting are the recursion in the postfix and list grammar.
 They follow brackets the source itself nests, as the frozen parser does, and
@@ -3618,6 +3622,45 @@ globals with zero rejected or non-progress stops. A value `if` and `match`,
 including after `?=`, over every statement form equal the frozen parser's AST
 JSON.
 
+The lambda and local-function slice reads `func(a, b: T) [-> R]: body` and
+`pure func(...)` as expression atoms and `func name(...)` as a statement. A
+lambda is a body owner of its own: its body is an expression on the `:` line
+or an indented block, recognized with the loop context reset (a `?=` inside it
+is its own, a `break` is not), and parameter and return types replay from
+their tokens like a statement's, so a lambda's ids run parameters, types, body,
+then the lambda. A block-bodied lambda ends at its block's dedent, so a
+statement value may end there when the next token cannot continue the
+expression. A local function's header is parsed to learn where it ends and
+discarded, then parsed again when minting, so its definition id follows
+everything declared inside it and precedes its enclosing function's. The
+constraint recorded for holes is now enforced rather than assumed:
+`ParseState.inside_hole` is true while a hole's token run is the cursor, and
+a lambda there is left unsupported, because a replayed token position would
+index the hole's run. Bodies share `recognize_skipped_body` and
+`mint_body_recipe` with functions and members, and a replay that reports
+anything leaves the owner unread. The expression parser and the body parser
+now import each other, because a lambda atom holds a statement recipe; the
+control-expression-operands slice's shared `parse/recipes.brp` for the recipe
+types is where that cycle is meant to end, so the two slices coordinate
+through main.
+
+Against main with the tuple, braced and control-value slices (the same 3,409
+modules, the "every corpus file as a root" run), the modules whose first stop
+is a function fell from 1,597 to 1,473, completed declarations rose from
+13,753 to 14,198, and the bodies read are now 6,848 functions (6,426) with 117
+traits (115) and 167 implementations (165). Global-initializer stops read 349
+against 318, which is first-stop accounting: modules that stopped at a function
+now reach their later globals. There were no differing files and no rejected or
+non-progress stops. Nested lambdas pass parse, dump, census and projection to
+200 deep in the tests. Measured on Linux arm64 after the tuple, braced and
+control merges, 500 deep passes and 700 overflows the native stack, as 3,000
+does on macOS: every walker (the expression parser, minting, the dump, the
+census and the projection) takes a frame per level, so the limit is their
+summed frame sizes. The 1,000-deep proof is open item D7. Reading lambdas in
+call arguments that span lines, in holes and in a parameter list across lines remains for later slices.
+`compiler-new` passed 882/882, `compiler-new-parity` 3,567/3,567 and
+`compiler-blorp` 6,670/6,670.
+
 Validation before the main reconciliation, at `a5ae15eab`:
 
 The combined fresh-build focused run passed 121/121 tests, including a
@@ -3709,6 +3752,16 @@ the proposed forms so their consequences can be reviewed.
   value `if`s pass at 1,000 and 1,200 and overflow at 1,400. Follow-up if deeper
   proof is wanted: iterate the block stack as the expression nesting is, or
   raise the main stack size at the CLI.
+
+- **D7. Nested lambda depth (3.14).** A lambda nests as an expression and as a
+  body, so a chain of lambdas recurses in the expression parser, the body
+  parser, the minter, the dump, the census and the projection, each with a
+  frame per level. On Linux arm64, after the tuple, braced and control merges,
+  500 nested lambdas pass parse, mint, dump, census and projection and 700
+  overflow the native stack (3,000 overflow on macOS); the tests carry 200. The
+  1,000-deep proof of 3.14 is not met. Follow-up: shrink the frames on that
+  path or keep an explicit stack for lambda chains (as lists and tuples have
+  in the dump), then prove 1,000 levels on Linux through all five walkers.
 
 The M6 ceiling is decided and stays in section 7.3. Recovery, opaque minting,
 per-module interning, tree output, ordinary-record syntax values, glue

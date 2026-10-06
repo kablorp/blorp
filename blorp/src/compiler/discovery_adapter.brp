@@ -4624,6 +4624,14 @@ pure func legacy_expression_preview(
 								walk = VisitPreviewExpression(hole.value)
 							FinishedPreviewInterpolation(finished):
 								walk = ReturnPreviewExpression(finished)
+					TreeExpressions.Lambda(lambda):
+						match legacy_lambda_preview(source, extended, lambda, current.span):
+							Ok((after_lambda, parsed)):
+								extended = after_lambda
+								walk = ReturnPreviewExpression(parsed)
+							Err(error):
+								result = Err(error)
+								break
 					TreeExpressions.BooleanLiteral(literal):
 						walk = ReturnPreviewExpression(ParsedBoolLiteralExpr(literal, location))
 					TreeExpressions.VoidValue:
@@ -5026,10 +5034,29 @@ private pure func legacy_statement_preview(
 			Ok((after_body, ParsedWhileExpr(condition, body, location)))
 		TreeExpressions.ForLoop(loop):
 			legacy_for_preview(source, names, loop, location)
+		TreeExpressions.LocalFunctionStatement(local):
+			legacy_local_function_preview(source, names, local)
 		TreeExpressions.QuestionBinding(binding):
 			legacy_question_binding_preview(source, names, binding, location)
 		_:
 			Err(UnsupportedBodyStatement(statement.span))
+
+
+-- A function declared in a body: its header as for any function, its body a
+-- body owner of its own.
+private pure func legacy_local_function_preview(
+	source: PreviewSource, names: NameTable, local: TreeDeclarations.LocalFunction,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	function = local.function
+	translated_header ?= preview_callable_header(source, names, function.signature, function.type_parameters, function.constraints, [], None)
+	(after_header, header) = translated_header
+	translated_body ?= legacy_optional_body_preview(source, after_header, function.body)
+	(after_body, body) = translated_body
+	Ok((after_body, ParsedFunctionDeclExpr({
+		name = header.name, keyword_span = header.keyword_span, type_params = header.type_params, params = header.params,
+		return_type = header.return_type, dim_constraints = header.dim_constraints, body = body, is_pure = header.is_pure,
+		annotations = header.annotations, doc = header.doc, span = legacy_location(local.span)
+	})))
 
 
 private pure func legacy_variable_preview(
@@ -5151,6 +5178,34 @@ private pure func legacy_binding_target_name(
 			preview_identifier(source, names, binder.name)
 		DiscardsValue(span):
 			preview_text_identifier(names, PREVIEW_DISCARD_NAME, span)
+
+
+-- A lambda's parameters and return type, then its body: the body is a body
+-- owner of its own, so it is read by the statement walk, not the expression one.
+private pure func legacy_lambda_preview(
+	source: PreviewSource, names: NameTable, lambda: TreeExpressions.LambdaExpression, span: Span,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	var extended: NameTable = names
+	var parameters: List[ParsedLambdaParam] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+	for parameter in lambda.parameters:
+		(after_name, name) = legacy_binding_target_name(source, extended, parameter.target)
+		match preview_optional_type(source, after_name, parameter.declared_type):
+			Ok((after_type, type_expr)):
+				extended = after_type
+				parameters = parameters.append({ name = name, type_expr = type_expr, span = legacy_location(parameter.span) })
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			translated_return ?= preview_optional_type(source, extended, lambda.return_type)
+			(after_return, return_type) = translated_return
+			translated_body ?= legacy_body_preview(source, after_return, lambda.body)
+			(after_body, body) = translated_body
+			Ok((after_body, ParsedLambdaExpr(lambda.purity == Kinds.PureFunction, parameters, return_type, body, legacy_location(span))))
 
 
 -- An expression in statement position: the block-bearing forms are read here,
