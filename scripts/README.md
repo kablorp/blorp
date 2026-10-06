@@ -250,7 +250,8 @@ cli-deep
 Waves skip gates you did not select. The policy is intentionally static: the
 heavy gates already do their own internal work scheduling, and a shell-level
 resource scheduler would be harder to reason about than the tests it runs. Use
-`--serial` when you need one gate at a time.
+`--serial` when you need one gate at a time. `scripts/premerge-gate` passes it
+on macOS only, because of `syspolicyd` stalls, and runs the waves on Linux.
 
 CI builds one compiler candidate per platform and restores those exact bytes in
 independent test jobs. Ubuntu separates quality, Blorp-owned compiler, and
@@ -289,8 +290,9 @@ cutting preview builds. It composes:
 - clean build at `-O2` (`BLORP_CLI_C_OPTIMIZATION=-O2`; use `--no-release-compiler` for `-O0`)
 - `make quality`
 - `make benchmark-tooling-check`, only when the change touches benchmark tooling
-- `scripts/test --serial --release-compiler compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp compiler-new compiler-new-parity`
-- the direct generated-C audit in `blorp/test/test_compiler/test_pipeline/codegen_audit/`
+- `scripts/test --release-compiler compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp compiler-new compiler-new-parity`, with `--serial` added on macOS only (see below)
+- the direct generated-C audit in `blorp/test/test_compiler/test_pipeline/codegen_audit/` (up to 4 workers on Linux, one on macOS;
+  `--jobs N` or `BLORP_CODEGEN_AUDIT_JOBS` overrides; output stays in fixture order)
 - preview CLI/runtime smoke
 - example checks and selected example runs
 - sanitizer tests
@@ -307,6 +309,12 @@ scripts/premerge-gate --no-docker --no-sanitize
 scripts/premerge-gate --require-docker
 scripts/premerge-gate --dry-run
 ```
+
+The gate passes `--serial` to `scripts/test` only when `uname -s` is `Darwin`:
+on macOS, many freshly compiled binaries running at once stall in `syspolicyd`.
+On Linux, including the Docker gate containers, `scripts/test` runs its fixed
+gate waves (the `leak`, `doctest`, `cli` and `lsp` gates share one wave) and
+each gate keeps its own output and `BLORP_GATE_RESULT` verdict.
 
 ### Change scope
 

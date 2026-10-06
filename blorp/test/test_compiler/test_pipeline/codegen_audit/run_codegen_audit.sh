@@ -9,7 +9,6 @@ set -eu
 BLORP="bin/blorp"
 blorp_bin_set=false
 NJOBS=""
-jobs_set=false
 PASS=0
 FAIL=0
 DIR="$(dirname "$0")"
@@ -20,15 +19,27 @@ RUNTIME_DECL="$REPO_ROOT/blorp/src/lib/runtime/native/runtime_decl.c"
 # header is the one such header the compiler modules declare.
 COMPILER_NATIVE_INCLUDE="$REPO_ROOT/blorp/src/compiler/stage_04_modules"
 TEST_TIMEOUT="${BLORP_COMPILER_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-30}}"
-DEFAULT_JOB_CAP=2
+# Worker count: --jobs, else BLORP_CODEGEN_AUDIT_JOBS, else min(CPU count,
+# MAX_DEFAULT_LINUX_JOBS) on Linux and one worker on macOS. macOS keeps one
+# because many freshly compiled processes at once stall in syspolicyd; Linux
+# (the Docker gate containers) has no such stall.
+FALLBACK_LINUX_JOBS=4
+# Ten concurrent gates share an 18-core host and each compiler can need over
+# 1 GiB, so the default stops here rather than at the CPU count.
+MAX_DEFAULT_LINUX_JOBS=4
 
 usage() {
     cat <<'EOF'
 Usage: blorp/test/test_compiler/test_pipeline/codegen_audit/run_codegen_audit.sh [BLORP_BIN] [--jobs N]
 
 Options:
-  --jobs N, -j N   Number of audit workers. Defaults to at most two because
-                   each compiler process can require over 1 GiB of memory.
+  --jobs N, -j N   Number of audit workers (concurrent fixtures). Defaults to
+                   BLORP_CODEGEN_AUDIT_JOBS, else min(CPU count, 4) on Linux and 1
+                   on macOS. Each worker runs a compiler process that can need
+                   over 1 GiB, so size it to the machine's memory.
+
+Output and verdicts do not depend on the worker count: results print in
+fixture order.
 EOF
 }
 
@@ -42,7 +53,6 @@ while [ $# -gt 0 ]; do
                 exit 1
             fi
             NJOBS="$2"
-            jobs_set=true
             shift 2
             ;;
         -h|--help)
@@ -80,32 +90,32 @@ esac
 
 if [ -n "$NJOBS" ]; then
     :
-elif command -v sysctl >/dev/null 2>&1; then
-    NJOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
-elif command -v nproc >/dev/null 2>&1; then
-    NJOBS=$(nproc 2>/dev/null || echo 4)
+elif [ -n "${BLORP_CODEGEN_AUDIT_JOBS:-}" ]; then
+    NJOBS="$BLORP_CODEGEN_AUDIT_JOBS"
+elif [ "$(uname -s)" = "Linux" ]; then
+    NJOBS=$(nproc 2>/dev/null || echo "$FALLBACK_LINUX_JOBS")
+    case "$NJOBS" in
+        ''|*[!0-9]*) ;;
+        *) [ "$NJOBS" -le "$MAX_DEFAULT_LINUX_JOBS" ] || NJOBS="$MAX_DEFAULT_LINUX_JOBS" ;;
+    esac
 else
-    NJOBS=4
+    NJOBS=1
 fi
 
 case "$NJOBS" in
     ''|*[!0-9]*)
-        echo "FAIL: invalid --jobs value (must be a positive integer)"
+        echo "FAIL: invalid worker count '$NJOBS' (--jobs or BLORP_CODEGEN_AUDIT_JOBS; must be a positive integer)"
         echo ""
         echo "Results: 0 passed, 1 failed"
         exit 1
         ;;
     0)
-        echo "FAIL: invalid --jobs value (must be a positive integer)"
+        echo "FAIL: invalid worker count '$NJOBS' (--jobs or BLORP_CODEGEN_AUDIT_JOBS; must be a positive integer)"
         echo ""
         echo "Results: 0 passed, 1 failed"
         exit 1
         ;;
 esac
-
-if ! $jobs_set && [ "$NJOBS" -gt "$DEFAULT_JOB_CAP" ]; then
-    NJOBS="$DEFAULT_JOB_CAP"
-fi
 
 # The audit validates generated C syntax and frontend warnings only. Linking is
 # covered by runtime tests and would make this suite pay avoidable linker cost.
@@ -420,16 +430,21 @@ on_interrupt() {
 trap on_interrupt INT TERM
 trap cleanup_results EXIT
 
+# Workers claim fixtures one at a time (mkdir is atomic) so a slow fixture does
+# not leave other workers idle. Each fixture's output goes to its own file,
+# renamed into place when the fixture finishes: a fixture without a result file
+# means its worker died, and the merge below reports it by name.
 for worker in $(seq 0 $((NJOBS - 1))); do
     {
         idx=0
         for brp in "${test_files[@]}"; do
-            if [ $((idx % NJOBS)) -eq "$worker" ]; then
-                run_case "$brp"
+            if mkdir "$RESULT_DIR/claim_$idx" 2>/dev/null; then
+                run_case "$brp" > "$RESULT_DIR/case_$idx.partial" 2>&1
+                mv "$RESULT_DIR/case_$idx.partial" "$RESULT_DIR/case_$idx"
             fi
             idx=$((idx + 1))
         done
-    } > "$RESULT_DIR/worker_$worker" 2>&1 &
+    } &
     worker_pids+=("$!")
 done
 
@@ -440,18 +455,26 @@ for pid in "${worker_pids[@]}"; do
     fi
 done
 
-for worker in $(seq 0 $((NJOBS - 1))); do
-    while IFS= read -r line; do
-        case "$line" in
-            PASS:*)
-                PASS=$((PASS + 1))
-                ;;
-            FAIL:*)
-                FAIL=$((FAIL + 1))
-                ;;
-        esac
-        echo "$line"
-    done < "$RESULT_DIR/worker_$worker"
+# Print results in fixture order, whatever order the workers finished in.
+idx=0
+for brp in "${test_files[@]}"; do
+    if [ -f "$RESULT_DIR/case_$idx" ]; then
+        while IFS= read -r line; do
+            case "$line" in
+                PASS:*)
+                    PASS=$((PASS + 1))
+                    ;;
+                FAIL:*)
+                    FAIL=$((FAIL + 1))
+                    ;;
+            esac
+            echo "$line"
+        done < "$RESULT_DIR/case_$idx"
+    else
+        echo "FAIL: $(basename "$brp") (audit worker exited before finishing this fixture)"
+        FAIL=$((FAIL + 1))
+    fi
+    idx=$((idx + 1))
 done
 
 echo ""
