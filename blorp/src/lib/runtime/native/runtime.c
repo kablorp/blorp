@@ -1057,8 +1057,12 @@ static inline bool __blorp_counters_active(void) {
 static long __blorp_allocator_bytes_in_use(void) {
     size_t bytes = 0;
 #if defined(__APPLE__)
+    // A NULL zone sums every registered zone. On macOS 15 arm64 CI the default
+    // zone alone did not grow with large raw buffers (likely the nano zone,
+    // which hands large blocks to a separate helper zone), so it missed most
+    // of the process's bytes.
     malloc_statistics_t stats = {0};
-    malloc_zone_statistics(malloc_default_zone(), &stats);
+    malloc_zone_statistics(NULL, &stats);
     bytes = stats.size_in_use;
 #elif defined(__GLIBC__)
 #if defined(__GLIBC_PREREQ)
