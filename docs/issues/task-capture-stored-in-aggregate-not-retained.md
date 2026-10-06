@@ -41,3 +41,44 @@ Give a task body the same treatment as a lambda body: derive its captures and
 normalize the body with them as owners. Add `detach`, `concurrent:` and
 `concurrently` parameter cases to
 `blorp/test/test_runtime/test_memory/test_borrowed_payload_concurrency_ownership.brp`.
+
+## A global stored the same way (found while fixing sequential `for` loops)
+
+`normalize_borrowed_boundaries` now walks the nine sequential `for` loop nodes
+in storage mode, which fixed a managed global stored in a record inside an
+ordinary `for` loop. The task and loop nodes that fall through its catch-all
+arm (`PreClosureConcurrentlyLoopExpr`, `ConcurrentlyLoopExpr`,
+`PreClosureDetachExpr`, `SelectExpr` and the `Tailrec*Loop` nodes) still get no
+retain for a global stored in an aggregate. This probe stores one in a
+`for ... concurrently` body:
+
+```blorp
+record Box {
+    name: String,
+    count: Int
+}
+
+GLOBAL_NAME: String = "shared" + "x"
+
+func record_size(box: Box) -> Void:
+    print(box.name.length())
+
+func concurrently_store(items: List[Int]) -> Void:
+    for item in items concurrently(limit: 2):
+        box: Box = {name = GLOBAL_NAME, count = item}
+        record_size(box)
+```
+
+In the generated C each task takes one reference to the global for its closure
+capture (`blorp_retain(GLOBAL_NAME)` into the closure env), builds the record
+with `brp_ty1_make(GLOBAL_NAME, ...)` and no retain, then releases the record
+(`blorp_release(box)`, which drops the global's reference) and the capture
+(`blorp_release_arc_only(GLOBAL_NAME)`). That is one retain against two
+releases, so the count falls by one per task. The probe does not crash because
+the constant-folded global is a static string literal that ignores reference
+counts; a global built at start-up would free while still in use.
+
+`select` and the tailrec loop nodes have not been probed, so they are unverified.
+They share the catch-all arm and may need the same treatment. The fix belongs
+with the proposed change above: treat a task body as a region whose captures
+are owners, and give the `select` and tailrec nodes explicit arms.

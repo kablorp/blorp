@@ -16684,6 +16684,191 @@ pure func test_managed_global_is_retained_when_stored_in_record() -> Bool:
 			False
 
 
+-- A for loop is not a borrowed-storage boundary: a borrowed owner (a global, or
+-- a lambda parameter or capture) stored in a record inside the loop needs the
+-- same retain as straight-line code, once per stored copy, or releasing the
+-- record frees the owner's value. A consumed function parameter is retained
+-- exactly once too: the loop body stores it on every iteration.
+private pure func name_box_stored_from(value: CoreExpr) -> CoreExpr:
+	box_type: CoreType = HeapRecordType("NameBox")
+
+	LetExpr(
+		named_var("box"),
+		False,
+		box_type,
+		RecordConstructExpr(
+			"NameBox",
+			[{
+				ref = core_field_ref(9),
+				name = "name",
+				value = value
+			}],
+			box_type,
+			synthetic_core_source_loc(),
+		),
+		VoidExpr(void_type(), synthetic_core_source_loc()),
+	)
+
+
+private pure func name_box_decl() -> CoreDecl:
+	HeapRecordDecl({
+		abi_type = None,
+		name = "NameBox",
+		type_params = [],
+		fields = [],
+		loc = synthetic_core_source_loc(),
+	})
+
+
+private pure func list_loop_around(body: CoreExpr) -> CoreExpr:
+	ForListExpr(
+		{
+			binder = {
+				variable = named_var("item"),
+				typ = int_type(),
+				range_direction = RangeForwardOnly
+			},
+			layout = PointerListStorage,
+			iterable = var_expr("items", list_int_type()),
+			iterable_release_policy = NoReleasePolicy,
+			body = body
+		},
+		void_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+private pure func range_loop_around(body: CoreExpr) -> CoreExpr:
+	ForRangeExpr(
+		{
+			variable = named_var("index"),
+			typ = int_type(),
+			range_direction = RangeForwardOnly
+		},
+		LiteralExpr(IntLiteral(0), int_type(), synthetic_core_source_loc()),
+		LiteralExpr(IntLiteral(2), int_type(), synthetic_core_source_loc()),
+		body,
+		void_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+private pure func store_in_loop_dup_count(
+	label: String,
+	program_decls: List[CoreDecl],
+) -> Int:
+	program: CoreProgram = insert_drops_program({
+		decls = [name_box_decl()] + program_decls,
+		foreign_includes = [],
+		source_files = []
+	})
+
+	match function_body(program, "store_in_loop"):
+		Some(body):
+			dup_count_for(label, body)
+		None:
+			0
+
+
+private pure func global_stored_in_loop_is_retained_once(
+	loop_around: pure (CoreExpr) -> CoreExpr,
+) -> Bool:
+	global_name: CoreVar = {
+		name = "GLOBAL_NAME",
+		id = 0,
+		def_id = Some(216),
+		origin = AuthoredBinder
+	}
+	stored: CoreExpr = name_box_stored_from(
+		VarExpr(global_name, string_type(), synthetic_core_source_loc()),
+	)
+
+	store_in_loop_dup_count(
+		"GLOBAL_NAME",
+		[
+			global_decl(
+				"GLOBAL_NAME",
+				216,
+				string_type(),
+				LiteralExpr(StringLiteral("shared"), string_type(), synthetic_core_source_loc()),
+			),
+			function_decl(
+				"store_in_loop",
+				217,
+				[core_param("items", list_int_type())],
+				void_type(),
+				loop_around(stored),
+			),
+		],
+	) == 1
+
+
+private pure func lambda_parameter_stored_in_loop_is_retained_once(
+	loop_around: pure (CoreExpr) -> CoreExpr,
+) -> Bool:
+	stored: CoreExpr = name_box_stored_from(var_expr("name", string_type()))
+	lambda: CoreExpr = LambdaExpr(
+		[core_param("name", string_type())],
+		void_type(),
+		loop_around(stored),
+		True,
+		closure_type(),
+		synthetic_core_source_loc(),
+	)
+
+	store_in_loop_dup_count(
+		"name",
+		[function_decl(
+				"store_in_loop",
+				218,
+				[core_param("items", list_int_type())],
+				closure_type(),
+				lambda,
+			)],
+	) == 1
+
+
+private pure func consumed_parameter_stored_in_loop_is_retained_once(
+	loop_around: pure (CoreExpr) -> CoreExpr,
+) -> Bool:
+	stored: CoreExpr = name_box_stored_from(var_expr("name", string_type()))
+
+	store_in_loop_dup_count(
+		"name",
+		[function_decl(
+				"store_in_loop",
+				219,
+				[core_param("items", list_int_type()), core_param("name", string_type())],
+				void_type(),
+				loop_around(stored),
+			)],
+	) == 1
+
+
+pure func test_managed_global_stored_in_record_in_list_loop_body_is_retained() -> Bool:
+	global_stored_in_loop_is_retained_once(list_loop_around)
+
+
+pure func test_managed_global_stored_in_record_in_range_loop_body_is_retained() -> Bool:
+	global_stored_in_loop_is_retained_once(range_loop_around)
+
+
+pure func test_lambda_parameter_stored_in_record_in_list_loop_body_is_retained() -> Bool:
+	lambda_parameter_stored_in_loop_is_retained_once(list_loop_around)
+
+
+pure func test_lambda_parameter_stored_in_record_in_range_loop_body_is_retained() -> Bool:
+	lambda_parameter_stored_in_loop_is_retained_once(range_loop_around)
+
+
+pure func test_consumed_parameter_stored_in_record_in_list_loop_body_is_retained_once() -> Bool:
+	consumed_parameter_stored_in_loop_is_retained_once(list_loop_around)
+
+
+pure func test_consumed_parameter_stored_in_record_in_range_loop_body_is_retained_once() -> Bool:
+	consumed_parameter_stored_in_loop_is_retained_once(range_loop_around)
+
+
 pure func test_managed_global_is_retained_in_releasing_union_slot() -> Bool:
 	global_name: CoreVar = {
 		name = "GLOBAL_NAME",
@@ -22066,6 +22251,30 @@ tests: TestSuite = {
 		(
 			"managed global is retained when stored in record",
 			test_managed_global_is_retained_when_stored_in_record,
+		),
+		(
+			"managed global stored in record in list loop body is retained",
+			test_managed_global_stored_in_record_in_list_loop_body_is_retained,
+		),
+		(
+			"managed global stored in record in range loop body is retained",
+			test_managed_global_stored_in_record_in_range_loop_body_is_retained,
+		),
+		(
+			"lambda parameter stored in record in list loop body is retained",
+			test_lambda_parameter_stored_in_record_in_list_loop_body_is_retained,
+		),
+		(
+			"lambda parameter stored in record in range loop body is retained",
+			test_lambda_parameter_stored_in_record_in_range_loop_body_is_retained,
+		),
+		(
+			"consumed parameter stored in record in list loop body is retained once",
+			test_consumed_parameter_stored_in_record_in_list_loop_body_is_retained_once,
+		),
+		(
+			"consumed parameter stored in record in range loop body is retained once",
+			test_consumed_parameter_stored_in_record_in_range_loop_body_is_retained_once,
 		),
 		(
 			"managed global is retained in releasing union slot",

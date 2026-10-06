@@ -1,4 +1,5 @@
 import:
+	memory: refcount
 	result: Result(Ok, Err)
 	test: TestSuite
 
@@ -17,6 +18,12 @@ record CounterBox {
 union GlobalPayload:
 	WithCounter(Counter)
 	WithText(String)
+
+
+record PayloadBox {
+	label: String,
+	payload: GlobalPayload
+}
 
 
 ZERO_COUNTER: Counter = {value = 0}
@@ -40,6 +47,14 @@ GLOBAL_NAMES: List[String] = ["alpha", "beta"]
 GLOBAL_COUNTERS: List[Counter] = [{value = 13}, {value = 21}]
 
 GLOBAL_NAME_SUFFIXES: Dict[String, String] = {"Ada" => "Lovelace", "Grace" => "Hopper"}
+
+LOOP_BODY_UPDATE_PAYLOAD: GlobalPayload = WithText("loop")
+
+RANGE_BODY_RECORD_PAYLOAD: GlobalPayload = WithText("loop")
+
+LOOP_ITERABLE_UPDATE_PAYLOAD: GlobalPayload = WithText("loop")
+
+LOOP_ITERATIONS: Int = 3
 
 
 pure func counter_value(counter: Counter) -> Int:
@@ -152,6 +167,51 @@ func test_dict_string_global_entries_are_retained() -> Bool:
 	)
 
 
+-- A loop that stores a managed global in a new aggregate must retain it once per
+-- stored copy; releasing that aggregate otherwise frees the global. Each test
+-- owns its global, and the extra holders keep an over-released global alive
+-- long enough for its count to be compared.
+private pure func payload_holders(payload: GlobalPayload) -> List[GlobalPayload]:
+	[payload, payload, payload, payload]
+
+
+func test_global_stored_by_record_update_in_list_loop_body_is_retained() -> Bool:
+	holders: List[GlobalPayload] = payload_holders(LOOP_BODY_UPDATE_PAYLOAD)
+	before: Int = refcount(LOOP_BODY_UPDATE_PAYLOAD)
+	base: PayloadBox = {label = "base", payload = WithText("base")}
+	var total: Int = 0
+
+	for index in [1, 2, 3]:
+		stored: PayloadBox = { base | payload = LOOP_BODY_UPDATE_PAYLOAD }
+		total += stored.label.length() + index
+
+	refcount(LOOP_BODY_UPDATE_PAYLOAD) == before and total == 18 and holders.length() == 4
+
+
+func test_global_stored_in_record_in_range_loop_body_is_retained() -> Bool:
+	holders: List[GlobalPayload] = payload_holders(RANGE_BODY_RECORD_PAYLOAD)
+	before: Int = refcount(RANGE_BODY_RECORD_PAYLOAD)
+	var total: Int = 0
+
+	for _ in 0..LOOP_ITERATIONS:
+		stored: PayloadBox = {label = "range", payload = RANGE_BODY_RECORD_PAYLOAD}
+		total += stored.label.length()
+
+	refcount(RANGE_BODY_RECORD_PAYLOAD) == before and total == 15 and holders.length() == 4
+
+
+func test_global_stored_by_record_update_in_loop_iterable_is_retained() -> Bool:
+	holders: List[GlobalPayload] = payload_holders(LOOP_ITERABLE_UPDATE_PAYLOAD)
+	before: Int = refcount(LOOP_ITERABLE_UPDATE_PAYLOAD)
+	base: PayloadBox = {label = "base", payload = WithText("base")}
+	var total: Int = 0
+
+	for stored in [{ base | payload = LOOP_ITERABLE_UPDATE_PAYLOAD }, { base | label = "local" }]:
+		total += stored.label.length()
+
+	refcount(LOOP_ITERABLE_UPDATE_PAYLOAD) == before and total == 9 and holders.length() == 4
+
+
 tests: TestSuite = {
 	description = "Global Managed Constants",
 	tests = [
@@ -183,5 +243,17 @@ tests: TestSuite = {
 		("list string global elements are retained", test_list_string_global_elements_are_retained),
 		("list record global elements are retained", test_list_record_global_elements_are_retained),
 		("dict string global entries are retained", test_dict_string_global_entries_are_retained),
+		(
+			"global stored by record update in list loop body is retained",
+			test_global_stored_by_record_update_in_list_loop_body_is_retained,
+		),
+		(
+			"global stored in record in range loop body is retained",
+			test_global_stored_in_record_in_range_loop_body_is_retained,
+		),
+		(
+			"global stored by record update in loop iterable is retained",
+			test_global_stored_by_record_update_in_loop_iterable_is_retained,
+		),
 	]
 }
