@@ -639,5 +639,38 @@ class CompilerNewParityTests(unittest.TestCase):
 			self.assertTrue(entry.reason.strip())
 
 
+class StopCensusTest(unittest.TestCase):
+	OUTPUT = "\n".join([
+		"difference ignored.brp | x | y | old=1 | new=2",
+		"stop-reason a.brp | function | multiline-call-arguments | 10 | first",
+		"stop-reason a.brp | function | lambda-header | 30 | later",
+		"stop-reason b.brp | function | multiline-call-arguments | 4 | first",
+		"stop-reason b.brp | function | multiline-call-arguments | 9 | later",
+		"stop-reason c.brp | global-initializer | with-block | 2 | first",
+		"tree-prefix-summary modules=3",
+	])
+
+	def test_counts_first_stops_as_modules_and_every_stop_as_declarations(self) -> None:
+		census = parity.parse_stop_census(self.OUTPUT)
+		calls = census.reasons["multiline-call-arguments"]
+		self.assertEqual((calls.modules, calls.declarations, calls.example), (2, 3, "a.brp:10"))
+		later_only = census.reasons["lambda-header"]
+		self.assertEqual((later_only.modules, later_only.declarations, later_only.example), (0, 1, ""))
+		self.assertEqual(census.kinds, {"function": 2, "global-initializer": 1})
+
+	def test_ranks_by_first_stops_then_declarations_then_name(self) -> None:
+		table = parity.render_stop_census(parity.parse_stop_census(self.OUTPUT), 5).splitlines()
+		rows = [line.split(" | ")[1] for line in table if line.startswith("| ") and line[2].isdigit()]
+		self.assertEqual(rows, ["multiline-call-arguments", "with-block", "lambda-header"])
+		self.assertIn("| 1 | multiline-call-arguments | 2 | 66.7% | 3 | a.brp:10 |", table)
+		self.assertIn("| 3 | lambda-header | 0 | 0.0% | 1 | - |", table)
+
+	def test_rejects_a_malformed_line(self) -> None:
+		with self.assertRaises(SystemExit):
+			parity.parse_stop_census("stop-reason a.brp | function | x | 1")
+		with self.assertRaises(SystemExit):
+			parity.parse_stop_census("stop-reason a.brp | function | x | 1 | middle")
+
+
 if __name__ == "__main__":
 	unittest.main()

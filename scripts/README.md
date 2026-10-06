@@ -113,6 +113,11 @@ words differently). An entry that stops disagreeing fails the gate until it is
 removed. The gate
 takes about 1-2 minutes (mostly the C compiler on the two dumpers), so it is not a
 default gate; it is part of the premerge gate.
+`scripts/compiler-new-parity --stop-census` is a separate, check-free mode: it
+runs only the adapter differential over the corpus and prints why the tree
+scan stopped at each module's first unread declaration, ranked by reason (the
+reasons are the tree parsers' own `StopReason` values), for choosing the next
+slice.
 The `compiler-blorp` gate also runs every fixture explicitly marked
 `RUN-BLORP-CHECK` through a small runner
 (`blorp/test/test_lib/run_blorp_check_fixtures.py`) after the TestSuites have run;

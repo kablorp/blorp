@@ -41,7 +41,16 @@ internal import and a relative import that must stay in its package).
 A mismatch is printed with its file and, for tokens, the first differing
 token. Exit status 0 means every file agrees.
 
+With `--stop-census` it instead runs only the adapter differential over the
+corpus and prints why the tree scan left declarations unread: for every module
+the first function, trait, implementation or global initializer it could not
+read (where the tree path stops), and also every later one it tried. The table
+ranks reasons by first stops, with one example `file:line` each. The reason is
+the `StopReason` the tree parser's rollback carried; nothing is worked out from
+text. The census checks nothing and is not part of the parity gate.
+
 Usage: scripts/compiler-new-parity [--keep DIR] [--compare OLD_DUMP NEW_DUMP]
+                                   [--stop-census]
 """
 
 from __future__ import annotations
@@ -1092,6 +1101,82 @@ def check_adapter(work: Path, file_list: Path, rejected_files: set[str]) -> tupl
     return notes, problems, failed
 
 
+STOP_CENSUS_FLAG = "--stop-census"
+STOP_REASON_PREFIX = "stop-reason "
+STOP_REASON_FIELDS = 5
+FIRST_STOP = "first"
+LATER_STOP = "later"
+
+
+@dataclass
+class StopReasonCount:
+    """One reason: the modules whose first unread declaration stopped for it
+    (`modules`, with an example) and every unread declaration it stopped."""
+    modules: int = 0
+    declarations: int = 0
+    example: str = ""
+
+
+@dataclass
+class StopCensus:
+    reasons: dict[str, StopReasonCount] = field(default_factory=dict)
+    kinds: dict[str, int] = field(default_factory=dict)
+
+
+def parse_stop_census(text: str) -> StopCensus:
+    """Collect the `stop-reason <path> | <kind> | <reason> | <line> | <order>`
+    lines. The first module in corpus order is each reason's example."""
+    census = StopCensus()
+    for line in text.splitlines():
+        if not line.startswith(STOP_REASON_PREFIX):
+            continue
+        fields = line[len(STOP_REASON_PREFIX):].split(" | ")
+        if len(fields) != STOP_REASON_FIELDS:
+            raise SystemExit(f"FAIL: malformed stop-reason line: {line}")
+        path, kind, reason, source_line, order = fields
+        count = census.reasons.setdefault(reason, StopReasonCount())
+        count.declarations += 1
+        if order == FIRST_STOP:
+            count.modules += 1
+            census.kinds[kind] = census.kinds.get(kind, 0) + 1
+            if not count.example:
+                count.example = f"{path}:{source_line}"
+        elif order != LATER_STOP:
+            raise SystemExit(f"FAIL: unknown stop order in: {line}")
+    return census
+
+
+def render_stop_census(census: StopCensus, files: int) -> str:
+    """A ranked markdown table: most common reason first, ties by name."""
+    stopped = sum(count.modules for count in census.reasons.values())
+    declined = sum(count.declarations for count in census.reasons.values())
+    kinds = ", ".join(f"{kind} {census.kinds[kind]}" for kind in sorted(census.kinds))
+    lines = [
+        f"Corpus files: {files}. Modules whose tree scan left a declaration unread: {stopped} ({kinds}); "
+        f"declarations left unread in all: {declined}.",
+        "",
+        "| Rank | Reason | First-stop modules | Share | All unread declarations | Example |",
+        "| ---: | --- | ---: | ---: | ---: | --- |",
+    ]
+    ranked = sorted(
+        census.reasons.items(), key=lambda item: (-item[1].modules, -item[1].declarations, item[0])
+    )
+    for rank, (reason, count) in enumerate(ranked, start=1):
+        share = 100.0 * count.modules / stopped
+        lines.append(
+            f"| {rank} | {reason} | {count.modules} | {share:.1f}% | {count.declarations} | {count.example or '-'} |"
+        )
+    return "\n".join(lines)
+
+
+def run_stop_census(work: Path, file_list: Path, files: int) -> int:
+    """The `--stop-census` mode: the adapter differential's per-module stops."""
+    binary = build_dumper(ADAPTER_DIFFERENTIAL, work)
+    output = run_dumper(binary, ADAPTER_FILES_MODE, str(file_list), STOP_CENSUS_FLAG)
+    print(render_stop_census(parse_stop_census(output), files))
+    return 0
+
+
 def corpus_files() -> list[str]:
     """Tracked `.brp` files under the corpus roots, in a fixed order."""
     listing = subprocess.run(
@@ -1225,6 +1310,11 @@ def main() -> int:
         metavar=("LEGACY_DUMP", "DISCOVERY_DUMP"),
         help="compare two existing dump files instead of building and running the dumpers",
     )
+    parser.add_argument(
+        "--stop-census",
+        action="store_true",
+        help="print the ranked reasons the tree scan stops at a declaration, instead of checking parity",
+    )
     args = parser.parse_args()
     started = time.monotonic()
 
@@ -1250,6 +1340,8 @@ def main() -> int:
     try:
         file_list = work / "corpus.txt"
         file_list.write_text("\n".join(files) + "\n", encoding="utf-8")
+        if args.stop_census:
+            return run_stop_census(work, file_list, len(files))
         legacy_binary = build_dumper(LEGACY_DUMPER, work)
         discovery_binary = build_dumper(DISCOVERY_DUMPER, work)
         legacy_dump = run_dumper(legacy_binary, file_list)

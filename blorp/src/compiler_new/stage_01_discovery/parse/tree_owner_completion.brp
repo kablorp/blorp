@@ -11,7 +11,8 @@ import:
 		ParseState, position, diagnostic_count, report_unreachable_input, finished_trait, finished_trait_method, finished_implementation,
 		finished_implementation_method
 	tree_body_parser: complete_body
-	method_read: MethodRead, UnsupportedMethodBody(BodyOutsideSlice)
+	method_read: MethodRead
+	stop_reason: StopPoint, Recognition(Recognized, Declined), StopReason(OwnerReplayDisagrees), stop_at
 	tree_declaration_prefix_parser: parse_declaration_prefix
 	tree_implementation_method_header_parser:
 		ImplementationMethodHeaderParse(ParsedImplementationMethodHeader, RejectedImplementationMethodHeader), parse_implementation_method_header
@@ -25,12 +26,12 @@ import:
 
 union TraitCompletion:
 	CompletedTrait(TraitDeclaration)
-	DeferredTrait
+	DeferredTrait(StopPoint)
 
 
 union ImplementationCompletion:
 	CompletedImplementation(ImplementationDeclaration)
-	DeferredImplementation
+	DeferredImplementation(StopPoint)
 
 
 -- `before` is the state before the trait's declaration prefix and `previewed`
@@ -42,7 +43,7 @@ pure func complete_trait(before: ParseState, previewed: ParseState) -> (ParseSta
 	match parsed:
 		ParsedTraitOwner(owner):
 			if out.position() != previewed.position() or out.diagnostic_count() != previewed.diagnostic_count():
-				(previewed, DeferredTrait)
+				(previewed, DeferredTrait(out.stop_at(OwnerReplayDisagrees)))
 			else:
 				(declared, declaration) = out.finished_trait(
 					owner.visibility, owner.documentation, owner.name, owner.type_parameters, owner.supertraits, owner.methods, owner.span
@@ -52,9 +53,9 @@ pure func complete_trait(before: ParseState, previewed: ParseState) -> (ParseSta
 			-- The preview parse of the same tokens was clean, and a replay reads
 			-- the same headers.
 			report_unreachable_input("a trait whose preview parsed cleanly is not rejected when replayed")
-			(previewed, DeferredTrait)
-		StoppedTraitOwner(_):
-			(previewed, DeferredTrait)
+			(previewed, DeferredTrait(previewed.stop_at(OwnerReplayDisagrees)))
+		StoppedTraitOwner(stop):
+			(previewed, DeferredTrait(stop))
 
 
 pure func complete_implementation(before: ParseState, previewed: ParseState) -> (ParseState, ImplementationCompletion):
@@ -63,7 +64,7 @@ pure func complete_implementation(before: ParseState, previewed: ParseState) -> 
 	match parsed:
 		ParsedImplementationOwner(owner):
 			if out.position() != previewed.position() or out.diagnostic_count() != previewed.diagnostic_count():
-				(previewed, DeferredImplementation)
+				(previewed, DeferredImplementation(out.stop_at(OwnerReplayDisagrees)))
 			else:
 				(declared, declaration) = out.finished_implementation(
 					owner.visibility, owner.documentation, owner.keyword, owner.trait_name, owner.receiver, owner.methods, owner.span
@@ -71,12 +72,12 @@ pure func complete_implementation(before: ParseState, previewed: ParseState) -> 
 				(declared, CompletedImplementation(declaration))
 		RejectedImplementationOwner:
 			report_unreachable_input("an implementation whose preview parsed cleanly is not rejected when replayed")
-			(previewed, DeferredImplementation)
-		StoppedImplementationOwner(_):
-			(previewed, DeferredImplementation)
+			(previewed, DeferredImplementation(previewed.stop_at(OwnerReplayDisagrees)))
+		StoppedImplementationOwner(stop):
+			(previewed, DeferredImplementation(stop))
 
 
-private pure func read_completed_trait_method(state: ParseState) -> (ParseState, MethodRead[TraitMethod, UnsupportedMethodBody]):
+private pure func read_completed_trait_method(state: ParseState) -> (ParseState, MethodRead[TraitMethod, StopPoint]):
 	(after_header, parsed) = parse_trait_method_header(state)
 	match parsed:
 		RejectedTraitMethodHeader:
@@ -89,16 +90,16 @@ private pure func read_completed_trait_method(state: ParseState) -> (ParseState,
 				SkippedDefaultBody(skipped):
 					(completed, body) = complete_body(after_header, skipped)
 					match body:
-						Some(read):
+						Recognized(read):
 							(declared, method) = completed.finished_trait_method(
 								preview.header.signature, Some(read.body), preview.header.span.span_covering(read.span)
 							)
 							(declared, Ok(Some(method)))
-						None:
-							(after_header, Err(BodyOutsideSlice))
+						Declined(stop):
+							(after_header, Err(stop))
 
 
-private pure func read_completed_implementation_method(state: ParseState) -> (ParseState, MethodRead[ImplementationMethod, UnsupportedMethodBody]):
+private pure func read_completed_implementation_method(state: ParseState) -> (ParseState, MethodRead[ImplementationMethod, StopPoint]):
 	(after_header, parsed) = parse_implementation_method_header(state)
 	match parsed:
 		RejectedImplementationMethodHeader:
@@ -106,7 +107,7 @@ private pure func read_completed_implementation_method(state: ParseState) -> (Pa
 		ParsedImplementationMethodHeader(preview):
 			(completed, body) = complete_body(after_header, preview.body)
 			match body:
-				Some(read):
+				Recognized(read):
 					header = preview.header
 					(declared, method) = completed.finished_implementation_method(
 						header.annotations,
@@ -114,5 +115,5 @@ private pure func read_completed_implementation_method(state: ParseState) -> (Pa
 						header.header_span.span_covering(read.span)
 					)
 					(declared, Ok(Some(method)))
-				None:
-					(after_header, Err(BodyOutsideSlice))
+				Declined(stop):
+					(after_header, Err(stop))

@@ -3661,6 +3661,19 @@ call arguments that span lines, in holes and in a parameter list across lines re
 `compiler-new` passed 882/882, `compiler-new-parity` 3,567/3,567 and
 `compiler-blorp` 6,670/6,670.
 
+Every rollback in the tree parsers carries why it declined. The `Unsupported`
+results of the expression, statement and owner parsers hold a `StopPoint` (a
+closed `StopReason` and the token the parser stood at, `stop_reason.brp`),
+chosen at the rollback from the construct just recognized, and the scan lists
+each declined function, trait, implementation or global initializer in
+`ModuleDeclarationPreviewScan.declined`. Nothing reads the list in production.
+`scripts/compiler-new-parity --stop-census` ranks the reasons over the corpus;
+its first result is
+[`benchmarks/results/discovery_m4_stop_reason_census_2026-10-06.md`](../benchmarks/results/discovery_m4_stop_reason_census_2026-10-06.md).
+A new rollback adds its reason to the enum, and the census label match
+(`blorp/test/compiler_new/support/stop_reason_label.brp`) stops compiling until
+it is named.
+
 Validation before the main reconciliation, at `a5ae15eab`:
 
 The combined fresh-build focused run passed 121/121 tests, including a

@@ -1,0 +1,247 @@
+-- Why a tree parser handed a declaration back to the skipped-body preview.
+--
+-- Recognition rolls back to the caller's entry state wherever the input holds
+-- a shape the slice does not read, so the reason exists only at the point of
+-- rollback. `StopPoint` carries it out in the rollback's own result: a closed
+-- `StopReason` and the token the parser stood at. The reason is chosen where
+-- the rollback happens, from the construct the parser has just recognized (a
+-- token kind, a delimiter), and is never recovered from text afterwards.
+-- Nothing here changes what is accepted: it only names what was declined, for
+-- the corpus stop-reason census (`scripts/compiler-new-parity --stop-census`).
+import:
+	../tables/span: Span
+	../tables/token:
+		TokenKind(NewlineToken, EndOfFileToken, DedentToken, DotSymbol, IndentToken, ColonSymbol, LeftParenSymbol, IdentifierToken, UnderscoreSymbol,
+			EqualSymbol, QuestionEqualsSymbol)
+	parse_state: ParseState, current_kind, current_span, peek_kind
+
+
+---
+The shape a tree parser does not read yet. One variant per kind of rollback
+point, named for the construct, so that a ranked count of them orders the
+slices still to write. A variant is added with the rollback it names.
+---
+enum StopReason:
+	-- Where an expression ends.
+	LeadingDotContinuation
+	IndentedMethodChain
+	IndentedContinuation
+	TokenAfterExpression
+	-- A line break inside an expression.
+	OperatorOperandOnNextLine
+	OperandOnNextLine
+	MemberNameOnNextLine
+	MultilineCallArguments
+	MultilineSubscript
+	MultilineListLiteral
+	MultilineTuple
+	MultilineGrouping
+	MultilineRecordLiteral
+	MultilineRecordUpdate
+	MultilineDictLiteral
+	MultilineVectorLiteral
+	MultilineBracedOpening
+	-- A bracketed form the line did not close or separate as read.
+	UnexpectedTokenInBrackets
+	MissingDictArrow
+	TrailingCommaAtEndOfSource
+	SoftKeywordFieldName
+	InterpolationHoleNotLexed
+	InterpolationHoleTrailingTokens
+	InterpolationHoleRejected
+	-- A word that opens an expression the slice does not read.
+	IfExpressionOperand
+	MatchExpressionOperand
+	SelectBlock
+	WithBlock
+	ConcurrentBlock
+	DebugBlock
+	DetachExpression
+	BuiltinBody
+	OpaqueConversion
+	SoftKeywordName
+	StatementKeywordInExpression
+	LoopExitInExpression
+	DeclarationKeywordInExpression
+	OperatorWithoutLeftOperand
+	PunctuationInExpression
+	DimensionNameInExpression
+	RejectedLiteral
+	DocStringInExpression
+	UnexpectedIndent
+	UnexpectedDedent
+	-- A token whose payload the token cursor was meant to have checked.
+	MalformedTokenPayload
+	-- Statements.
+	ExpressionSyntaxError
+	LocalFunctionHeaderRejected
+	LambdaInInterpolationHole
+	MalformedLambdaHeader
+	ConcurrentlyLoop
+	ValueOnNextLine
+	GlobalInitializerNotAtHeaderEnd
+	TupleDestructuring
+	FieldAssignment
+	NonPlaceAssignmentTarget
+	AssignmentTargetRoutedElsewhere
+	LoopExitOutsideLoop
+	QuestionBindingInLoop
+	InvalidType
+	InvalidPattern
+	MalformedTypedBinding
+	VarWithoutName
+	VarWithoutInitializer
+	HeaderWithoutColon
+	InvalidLoopBinding
+	ForWithoutIn
+	MalformedElse
+	OperatorAfterBlock
+	-- Blocks, matches and bodies.
+	BlockWithoutIndent
+	BlockNotClosed
+	MatchWithoutBlock
+	MatchNotClosed
+	CaseWithoutColon
+	NestedBlockInCaseLine
+	BodyNotOnHeaderLine
+	BodylessFunction
+	-- A replay that did not end where the skipped extent ends.
+	ReplayReported
+	BodyReplayDisagrees
+	OwnerReplayDisagrees
+
+
+---
+A rollback: what was declined, and the token the parser stood at. The span
+locates the report (`span_start_line` of it names the source line); it is not
+part of the reason.
+---
+record StopPoint {
+	reason: StopReason,
+	at: Span
+}
+
+
+---
+The stop for `reason` at the token the parser stands at.
+---
+pure func stop_at(state: ParseState, reason: StopReason) -> StopPoint:
+	{ reason = reason, at = state.current_span() }
+
+
+---
+A recognizer's result where declining is the only other outcome: the value,
+or the stop that declined it.
+---
+union Recognition[T]:
+	Recognized(T)
+	Declined(StopPoint)
+
+
+---
+The recognized value changed, or the stop that declined it.
+---
+pure func mapped[T, U](recognition: Recognition[T], change: pure (T) -> U) -> Recognition[U]:
+	match recognition:
+		Recognized(value):
+			Recognized(change(value))
+		Declined(stop):
+			Declined(stop)
+
+
+---
+Whether an expression or a statement ends here.
+---
+union Boundary:
+	AtBoundary
+	PastBoundary(StopPoint)
+
+
+---
+An expression ends at the end of source, or at a newline that continues
+nothing. An unindented dot or any indented tail may continue the legacy
+expression, so the newline stays unconsumed and those shapes are declined in
+full.
+---
+pure func expression_boundary(state: ParseState) -> Boundary:
+	match state.current_kind():
+		EndOfFileToken:
+			AtBoundary
+		NewlineToken:
+			var ahead = 1
+			while state.peek_kind(ahead) == NewlineToken:
+				ahead += 1
+			match state.peek_kind(ahead):
+				DotSymbol:
+					PastBoundary(state.stop_at(LeadingDotContinuation))
+				IndentToken:
+					-- The frozen grammar's method chain: a more-indented line that starts with `.name`.
+					match state.peek_kind(ahead + 1):
+						DotSymbol:
+							PastBoundary(state.stop_at(IndentedMethodChain))
+						_:
+							PastBoundary(state.stop_at(IndentedContinuation))
+				_:
+					AtBoundary
+		_:
+			PastBoundary(state.stop_at(TokenAfterExpression))
+
+
+---
+A statement ends where an expression does, or at the dedent of its block.
+---
+pure func statement_boundary(state: ParseState) -> Boundary:
+	if state.current_kind() == DedentToken:
+		AtBoundary
+	else:
+		expression_boundary(state)
+
+
+---
+The reason the current token gives when it stands where an expression must
+begin, or `None` for a token the expression parser reads as an atom. Every
+token kind is named, so a new kind does not compile until it is placed.
+
+A soft keyword is also a name where a name is allowed, so one is a block only
+when the tokens after it have the block's shape (`debug:`, `select:`,
+`concurrent:` or `concurrent(`, `with name =`); any other use is a name.
+---
+pure func expression_start_reason(state: ParseState) -> Option[StopReason]:
+	match state.current_kind():
+		IdentifierToken | IntLiteralToken | FloatLiteralToken | NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken | InterpolatedStringToken | InterpolatedPipeStringToken | CharLiteralToken | TrueKeyword | FalseKeyword | VoidKeyword | UnderscoreSymbol | MinusSymbol | NotKeyword | LeftParenSymbol | LeftBracketSymbol | LeftBraceSymbol | FuncKeyword | PureKeyword | EndOfFileToken | RightParenSymbol | RightBracketSymbol:
+			None
+		IfKeyword: Some(IfExpressionOperand)
+		MatchKeyword: Some(MatchExpressionOperand)
+		DebugKeyword: Some(block_or_name(state.peek_kind(1) == ColonSymbol, DebugBlock))
+		SelectKeyword: Some(block_or_name(state.peek_kind(1) == ColonSymbol, SelectBlock))
+		ConcurrentKeyword:
+			Some(block_or_name(state.peek_kind(1) == ColonSymbol or state.peek_kind(1) == LeftParenSymbol, ConcurrentBlock))
+		WithKeyword:
+			names_binding = state.peek_kind(1) == IdentifierToken or state.peek_kind(1) == UnderscoreSymbol
+			opens_binding = names_binding and (state.peek_kind(2) == EqualSymbol or state.peek_kind(2) == ColonSymbol or state.peek_kind(2) == QuestionEqualsSymbol)
+			Some(block_or_name(opens_binding, WithBlock))
+		OnKeyword | AfterKeyword | SealedKeyword | ConcurrentlyKeyword: Some(SoftKeywordName)
+		DetachKeyword: Some(DetachExpression)
+		BuiltinKeyword: Some(BuiltinBody)
+		IntoOpaqueKeyword | FromOpaqueKeyword: Some(OpaqueConversion)
+		VarKeyword | WhileKeyword | ForKeyword | InKeyword | ElseKeyword | FromKeyword | TryKeyword: Some(StatementKeywordInExpression)
+		BreakKeyword | ContinueKeyword: Some(LoopExitInExpression)
+		UnionKeyword | RecordKeyword | EnumKeyword | ResourceKeyword | ForeignKeyword | PrivateKeyword | TraitKeyword | ImplementsKeyword | SelfKeyword | TypeKeyword | AliasKeyword | OpaqueKeyword | ImportKeyword | WhereKeyword | AsKeyword:
+			Some(DeclarationKeywordInExpression)
+		AndKeyword | OrKeyword | PlusSymbol | StarSymbol | SlashSymbol | PercentSymbol | EqualEqualSymbol | NotEqualSymbol | LessSymbol | LessEqualSymbol | GreaterSymbol | GreaterEqualSymbol | DotDotSymbol:
+			Some(OperatorWithoutLeftOperand)
+		RightBraceSymbol | CommaSymbol | ColonSymbol | DotSymbol | DotDotDotSymbol | ArrowSymbol | FatArrowSymbol | EqualSymbol | QuestionEqualsSymbol | PlusEqualSymbol | MinusEqualSymbol | StarEqualSymbol | SlashEqualSymbol | HashSymbol | AtSymbol | PipeSymbol:
+			Some(PunctuationInExpression)
+		DimensionNameToken: Some(DimensionNameInExpression)
+		RejectedIntegerToken | RejectedFloatToken: Some(RejectedLiteral)
+		DocStringToken: Some(DocStringInExpression)
+		NewlineToken: Some(OperandOnNextLine)
+		IndentToken: Some(UnexpectedIndent)
+		DedentToken: Some(UnexpectedDedent)
+
+
+private pure func block_or_name(has_block_shape: Bool, block: StopReason) -> StopReason:
+	if has_block_shape:
+		block
+	else:
+		SoftKeywordName

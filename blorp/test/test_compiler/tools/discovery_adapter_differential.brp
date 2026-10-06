@@ -3,7 +3,7 @@
 -- loads, for the adapter check of `scripts/compiler-new-parity`.
 --
 -- Usage: discovery_adapter_differential.brp <compile|test> <root.brp> [--embedded-std] [--package <spec>]...
---        discovery_adapter_differential.brp files <file listing one source path per line>
+--        discovery_adapter_differential.brp files <file listing one source path per line> [--stop-census]
 --
 -- The first form takes the command line of `module_order_options`: `compile`
 -- loads the implicit modules a compile or check loads, `test` also the test
@@ -12,6 +12,16 @@
 -- The root module is named `main`. `files` makes every listed file a root of one
 -- discovery (named by its path without `.brp`) and loads the implicit modules a
 -- compile loads, so one run covers files no import reaches, fixtures included.
+-- With `--stop-census` (`files` only) each declaration the tree scan left
+-- unread also prints why, for the stop-reason census of
+-- `scripts/compiler-new-parity --stop-census`:
+--
+--   stop-reason <path> | <function|trait|implementation|global-initializer> | <reason> | <line> | <first|later>
+--
+-- `first` marks the module's first such declaration, where the tree path stops;
+-- `later` ones are declarations the scan went on to try after it. The reason is
+-- the rollback's own `StopReason`, named by `stop_reason_label`; the line is
+-- 1-based and is where the parser stood when it declined.
 --
 -- For each module the existing parser's program, with each interpolated
 -- string's holes parsed (`with_holes_parsed`: the adapter's strings come from
@@ -68,10 +78,11 @@ import:
 	../../../src/compiler/stage_03_parse/parsed_ast: ParsedProgram
 	../../../src/compiler/stage_03_parse/parsed_ast_json: parsed_program_to_json
 	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
-	../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state
+	../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state, span_start_line
 	../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_source
 	../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser: DeclarationPreview(CompletedFunctionPreview, CompletedTraitPreview, CompletedImplementationPreview)
-	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan: scan_module_declaration_prefix_with_bodies
+	../../../src/compiler_new/stage_01_discovery/parse/stop_reason: StopReason
+	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan: DeclinedKind, scan_module_declaration_prefix_with_bodies
 	../../../src/compiler_new/stage_01_discovery/tables/span: span_start, span_end
 	../../../src/compiler_new/stage_01_discovery/pipeline:
 		ImplicitModules,
@@ -109,6 +120,7 @@ import:
 		StandardLibrarySource(StandardLibraryEmbedded, StandardLibraryOnDisk),
 		parse_module_order_options,
 	system: read_file
+	../../test_compiler_new/support/stop_reason_label: declined_kind_label, stop_reason_label
 
 
 STANDARD_LIBRARY_ROOT: String = "standard_library/src"
@@ -118,6 +130,10 @@ NATIVE_PACKAGE_ROOT: String = "pkg"
 FILES_MODE: String = "files"
 
 FILES_ARGUMENT: Int = 2
+
+STOP_CENSUS_ARGUMENT: Int = 3
+
+STOP_CENSUS_FLAG: String = "--stop-census"
 
 SOURCE_FILE_SUFFIX: String = ".brp"
 
@@ -143,9 +159,17 @@ union ModuleComparison:
 	ModuleNotRebuilt(String)
 
 
+-- A declaration the tree scan could not read in full, and where.
+record LocatedStop {
+	kind: DeclinedKind,
+	reason: StopReason,
+	line: Int
+}
+
+
 -- Only a successful projection carries names to advance the shared table.
 union TreePrefixModuleComparison:
-	TreePrefixCompared(NameTable, DeclarationPrefixComparison, CompletedBodyCounts)
+	TreePrefixCompared(NameTable, DeclarationPrefixComparison, CompletedBodyCounts, List[LocatedStop])
 	TreePrefixSkipped(String)
 	TreePrefixError(TreePrefixErrorStage, String)
 
@@ -329,6 +353,10 @@ pure func compare_tree_prefix(existing: ParsedProgram, module: Int, names: NameT
 	match new_parse_state(lexed):
 		Ok(entry):
 			(_, scan) = scan_module_declaration_prefix_with_bodies(entry)
+			-- The first declined declaration is where the projection stops.
+			declined_stops: List[LocatedStop] = scan.declined.map(pure func(declined):
+				{ kind = declined.kind, reason = declined.stop.reason, line = entry.span_start_line(declined.stop.at) + 1 }
+			)
 			match legacy_declaration_projection(preview_source(lexed), scan, names):
 				Ok(projection):
 					-- The projection may stop before a later completed function; count
@@ -336,7 +364,7 @@ pure func compare_tree_prefix(existing: ParsedProgram, module: Int, names: NameT
 					var compared_bodies: CompletedBodyCounts = EMPTY_COMPLETED_BODY_COUNTS
 					for declaration in scan.declarations.take(projection.declarations.length()):
 						compared_bodies = count_completed_bodies(compared_bodies, declaration)
-					TreePrefixCompared(projection.names, declaration_prefix_comparison(existing, projection), compared_bodies)
+					TreePrefixCompared(projection.names, declaration_prefix_comparison(existing, projection), compared_bodies, declined_stops)
 				Err(error):
 					message: String = match error:
 						MissingDimensionLiteralToken(span):
@@ -467,8 +495,15 @@ record DifferentialRun {
 	root_module_name: pure (String) -> String,
 	implicit: ImplicitModules,
 	standard_library: StandardLibrarySource,
-	source_packages: List[SourcePackageSpec]
+	source_packages: List[SourcePackageSpec],
+	stop_census: StopCensus
 }
+
+
+-- Whether the run prints each module's first unread declaration.
+enum StopCensus:
+	ReportStops
+	OmitStops
 
 
 func run_from_options(options: ModuleOrderOptions) -> DifferentialRun:
@@ -482,7 +517,8 @@ func run_from_options(options: ModuleOrderOptions) -> DifferentialRun:
 		root_module_name = pure func(request_path): ROOT_MODULE_NAME,
 		implicit = implicit,
 		standard_library = options.standard_library,
-		source_packages = options.source_packages
+		source_packages = options.source_packages,
+		stop_census = OmitStops
 	}
 
 
@@ -490,7 +526,7 @@ func run_from_options(options: ModuleOrderOptions) -> DifferentialRun:
 Every file of the listing at `listing_path` as a root, or `None` when it cannot
 be read.
 ---
-func run_over_files(listing_path: String) -> Option[DifferentialRun]:
+func run_over_files(listing_path: String, stop_census: StopCensus) -> Option[DifferentialRun]:
 	match read_file(listing_path):
 		Ok(listing):
 			Some({
@@ -503,6 +539,7 @@ func run_over_files(listing_path: String) -> Option[DifferentialRun]:
 				implicit = compiler_implicit_modules(),
 				standard_library = StandardLibraryOnDisk,
 				source_packages = [],
+				stop_census = stop_census,
 			})
 		Err(_):
 			None
@@ -519,11 +556,15 @@ func source_package_root(spec: SourcePackageSpec) -> SourcePackageRoot:
 
 func main(args: List[String]) -> Int:
 	if args.get_or(1, "") == FILES_MODE:
-		match run_over_files(args.get_or(FILES_ARGUMENT, "")):
+		stop_census: StopCensus = if args.get_or(STOP_CENSUS_ARGUMENT, "") == STOP_CENSUS_FLAG:
+			ReportStops
+		else:
+			OmitStops
+		match run_over_files(args.get_or(FILES_ARGUMENT, ""), stop_census):
 			Some(run):
 				execute(run)
 			None:
-				print("usage: discovery_adapter_differential.brp files <listing>")
+				print("usage: discovery_adapter_differential.brp files <listing> [--stop-census]")
 				EXIT_USAGE
 	else:
 		match parse_module_order_options(args):
@@ -572,7 +613,7 @@ func compare_discovered[Provider:SourceProvider](
 
 			match legacy_declaration_reader(tables, naming):
 				Ok(reader):
-					print_comparison(tables, reader)
+					print_comparison(tables, reader, run.stop_census)
 				Err(error):
 					print("adapter-error | ${legacy_adapter_error_message(error)}")
 					EXIT_ADAPTER_ERROR
@@ -581,7 +622,7 @@ func compare_discovered[Provider:SourceProvider](
 			EXIT_INVARIANT_VIOLATION
 
 
-func print_comparison(tables: FrontendTables, reader: DeclarationReader) -> Int:
+func print_comparison(tables: FrontendTables, reader: DeclarationReader, stop_census: StopCensus) -> Int:
 	var compared: Int = 0
 	var skipped: Int = 0
 	var not_rebuilt: Int = 0
@@ -613,9 +654,14 @@ func print_comparison(tables: FrontendTables, reader: DeclarationReader) -> Int:
 				print("adapter-error ${path} | ${message}")
 
 		match comparisons.tree:
-			TreePrefixCompared(names, comparison, completed_bodies):
+			TreePrefixCompared(names, comparison, completed_bodies, declined_stops):
 				tree_names = names
 				tree_counts = report_tree_prefix_comparison(path, tree_counts, comparison, completed_bodies)
+				match stop_census:
+					ReportStops:
+						print_stop_census(path, declined_stops)
+					OmitStops:
+						void
 			TreePrefixSkipped(reason):
 				tree_counts = { tree_counts | skipped = tree_counts.skipped + 1 }
 				print("tree-prefix-skipped ${path} | ${shortened(reason)}")
@@ -632,6 +678,26 @@ func print_comparison(tables: FrontendTables, reader: DeclarationReader) -> Int:
 		EXIT_ADAPTER_ERROR
 	else:
 		0
+
+
+-- Where a declined declaration stands in its module: the first is where the
+-- tree path stops, the rest are ones the scan went on to try.
+enum StopOrder:
+	FirstStop
+	LaterStop
+
+
+pure func stop_order_label(order: StopOrder) -> String:
+	match order:
+		FirstStop: "first"
+		LaterStop: "later"
+
+
+func print_stop_census(path: String, stops: List[LocatedStop]) -> Void:
+	var order: StopOrder = FirstStop
+	for stop in stops:
+		print("stop-reason ${path} | ${declined_kind_label(stop.kind)} | ${stop_reason_label(stop.reason)} | ${stop.line} | ${stop_order_label(order)}")
+		order = LaterStop
 
 
 func report_tree_prefix_comparison(
