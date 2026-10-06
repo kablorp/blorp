@@ -183,7 +183,7 @@ import:
 	../../../src/compiler/stage_09_core/perceus/balance:
 		balance_branch_body,
 		freshen_shadowed_match_bindings,
-	../../../src/compiler/stage_09_core/perceus/borrowed: normalize_lambda_result_aliases
+	../../../src/compiler/stage_09_core/perceus/borrowed: normalize_lambda_result_aliases, retain_borrowed_owned_uses
 	../../../src/compiler/stage_09_core/perceus/protect: protect_repeated_consumes
 	../../../src/compiler/stage_09_core/resolve: resolve_global_value_refs
 	../../../src/compiler/stage_09_core/perceus/short_circuit:
@@ -1684,6 +1684,8 @@ pure func dup_count_for(name: String, expr: CoreExpr) -> Int:
 			) + dup_count_for(name, then_expr) + dup_count_for(name, else_expr)
 		WhileExpr(cond, body, typ, loc):
 			dup_count_for(name, cond) + dup_count_for(name, body)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			dup_count_for(name, start) + dup_count_for(name, end_value) + dup_count_for(name, body)
 		ForListExpr(loop, typ, loc):
 			dup_count_for(name, loop.iterable) + dup_count_for(name, loop.body)
 		DebugBlockExpr(body, typ, loc):
@@ -20329,9 +20331,106 @@ pure func test_consumed_parameter_mutable_alias_read_after_keeps_retain() -> Boo
 
 	dup_count_for("box", kept) == 1 and drop_count_for("box", kept) == 1
 
+-- A match payload is borrowed from the still-owned scrutinee. Entering a
+-- for loop does not transfer that payload to an aggregate constructed there.
+pure func test_borrowed_match_payload_in_range_loop_keeps_record_reference() -> Bool:
+	stored: CoreExpr = RecordConstructExpr(
+		"TextHolder",
+		[{ ref = core_field_ref(0), name = "text", value = var_expr("text", string_type()) }],
+		HeapRecordType("TextHolder"),
+		synthetic_core_source_loc(),
+	)
+	loop: CoreExpr = ForRangeExpr(
+		{ variable = named_var("index"), typ = int_type(), range_direction = RangeForwardOnly },
+		int_expr(0),
+		int_expr(2),
+		LetExpr(
+			named_var("stored"), False, HeapRecordType("TextHolder"), stored,
+			VoidExpr(void_type(), synthetic_core_source_loc()),
+		),
+		void_type(),
+		synthetic_core_source_loc(),
+	)
+	matched: CoreExpr = constructor_match_expr(
+		[constructor_case("Some", [match_binding("text", string_type())], loop)],
+		VoidExpr(void_type(), synthetic_core_source_loc()),
+		void_type(),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES), matched,
+	)
+
+	dup_count_for("text", rewritten) == 1
+
+
+pure func test_borrowed_match_payload_in_list_loop_keeps_record_reference() -> Bool:
+	stored: CoreExpr = RecordConstructExpr(
+		"TextHolder",
+		[{ ref = core_field_ref(0), name = "text", value = var_expr("text", string_type()) }],
+		HeapRecordType("TextHolder"),
+		synthetic_core_source_loc(),
+	)
+	loop: CoreExpr = ForListExpr(
+		{
+			binder = { variable = named_var("item"), typ = int_type(), range_direction = RangeForwardOnly },
+			layout = PointerListStorage,
+			iterable = var_expr("items", list_int_type()),
+			iterable_release_policy = NoReleasePolicy,
+			body = LetExpr(
+				named_var("stored"), False, HeapRecordType("TextHolder"), stored,
+				VoidExpr(void_type(), synthetic_core_source_loc()),
+			)
+		},
+		void_type(),
+		synthetic_core_source_loc(),
+	)
+	matched: CoreExpr = constructor_match_expr(
+		[constructor_case("Some", [match_binding("text", string_type())], loop)],
+		VoidExpr(void_type(), synthetic_core_source_loc()),
+		void_type(),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES), matched,
+	)
+
+	dup_count_for("text", rewritten) == 1
+
+
+pure func test_loop_binder_shadows_outer_borrowed_aggregate_payload() -> Bool:
+	stored: CoreExpr = RecordConstructExpr(
+		"TextHolder",
+		[{ ref = core_field_ref(0), name = "text", value = var_expr("text", string_type()) }],
+		HeapRecordType("TextHolder"),
+		synthetic_core_source_loc(),
+	)
+	loop: CoreExpr = ForListExpr(
+		{
+			binder = { variable = named_var("text"), typ = string_type(), range_direction = RangeForwardOnly },
+			layout = PointerListStorage,
+			iterable = var_expr("items", list_string_type()),
+			iterable_release_policy = NoReleasePolicy,
+			body = stored
+		},
+		void_type(),
+		synthetic_core_source_loc(),
+	)
+	rewritten: CoreExpr = retain_borrowed_owned_uses(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		{ name = named_var("text"), typ = string_type(), loc = synthetic_core_source_loc() },
+		loop,
+	)
+
+	-- The loop binder owns this occurrence; the outer borrowed owner must
+	-- not reserve a reference on its behalf. Loop rewriting handles it later.
+	dup_count_for("text", rewritten) == 0
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core Perceus",
 	tests = [
+		("loop binder shadows outer borrowed aggregate payload", test_loop_binder_shadows_outer_borrowed_aggregate_payload),
+		("borrowed match payload in range loop keeps record reference", test_borrowed_match_payload_in_range_loop_keeps_record_reference),
+		("borrowed match payload in list loop keeps record reference", test_borrowed_match_payload_in_list_loop_keeps_record_reference),
 		("default managed types", test_default_managed_types),
 		("program decls extend managed types", test_program_decls_extend_managed_types),
 		("result mode for type", test_result_mode_for_type),
