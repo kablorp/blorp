@@ -493,7 +493,6 @@ smoke: all
 quality:
 	$(MAKE) hygiene-check
 	$(MAKE) tooling-check
-	$(MAKE) benchmark-tooling-check
 	$(MAKE) artifact-scan
 	$(MAKE) c-static-analysis
 
@@ -551,6 +550,8 @@ tooling-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_compiler_build_status.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_compiler_new_parity.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_with_build_lock.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_premerge_gate_steps.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_gate_scope.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_cli/test_memory_compiler_setup.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_record_validation.py
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_match_allocations
@@ -565,7 +566,8 @@ tooling-check: build-blorp-cli
 # The benchmark-worker checks and the suites that test benchmark and
 # measurement tooling (benchmarks/, blorp/benchmark/, scripts/bench-*). They
 # protect the scripts used to judge performance changes, not the compiler.
-# `quality`, and so CI and the premerge gate, run them.
+# CI runs them on every push as their own step, and the premerge gate runs them
+# when the change touches their inputs (scripts/gate-scope).
 benchmark-tooling-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_benchmark/test_bench_runner.py
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_typecheck_worker.brp

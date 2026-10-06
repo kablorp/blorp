@@ -12,6 +12,7 @@ cd "$script_dir/.."
 clean_build=1
 run_quality=1
 run_sanitize=1
+force_full=0
 run_docker="auto"
 docker_clean=0
 docker_platform="linux/amd64"
@@ -31,6 +32,9 @@ example_timeout=10
 # captured here so this script can print one aggregate verdict line of its
 # own as the last line of stdout, however the script exits.
 PREMERGE_TEST_LOG=$(mktemp "${TMPDIR:-/tmp}/blorp-premerge-test.XXXXXX")
+# A gate that runs the test suites must end with exactly one valid test verdict.
+# A documentation-only change skips them, and its verdict counts no tests.
+test_verdict_expected=1
 
 # Stop every child of this script, leaf first: TERM each process tree, poll
 # briefly for it to exit, then KILL and reap what remains. Children only, never
@@ -88,6 +92,51 @@ terminate_child_processes() {
     done
 }
 
+# One entry per step the gate reached, in order: its name, outcome and seconds.
+# The outcome is PASS, FAIL or SKIP (a step that chose not to run). The summary
+# is printed from the EXIT trap, so a gate that stops early still reports the
+# steps it reached, and the step that stopped it is FAIL.
+step_names=()
+step_statuses=()
+step_seconds=()
+# Set while a step runs. A step that skips itself at run time calls
+# mark_step_skipped; the step functions run in this shell, not a subshell.
+open_step_name=""
+open_step_started=0
+open_step_outcome="PASS"
+
+step_slug() {
+    printf '%s' "$1" | tr '[:upper:] ' '[:lower:]-'
+}
+
+record_step() {
+    step_names+=("$1")
+    step_statuses+=("$2")
+    step_seconds+=("$3")
+}
+
+# One aligned table of every step reached, then the total. $1 is the gate's
+# overall verdict and $2 its elapsed seconds.
+print_step_table() {
+    local overall="$1" total_seconds="$2" index
+    echo ""
+    printf '%-20s %-7s %7s\n' "Step" "Status" "Seconds"
+    for ((index = 0; index < ${#step_names[@]}; index++)); do
+        printf '%-20s %-7s %7s\n' \
+            "${step_names[$index]}" "${step_statuses[$index]}" "${step_seconds[$index]}"
+    done
+    printf '%-20s %-7s %7s\n' "Total" "$overall" "$total_seconds"
+}
+
+# One BLORP_GATE_STEP line per step, for tools; see scripts/README.md.
+print_step_records() {
+    local index
+    for ((index = 0; index < ${#step_names[@]}; index++)); do
+        printf 'BLORP_GATE_STEP name=%s status=%s seconds=%s\n' \
+            "$(step_slug "${step_names[$index]}")" "${step_statuses[$index]}" "${step_seconds[$index]}"
+    done
+}
+
 # Set to 1 as the script's last statement. The EXIT trap treats any earlier
 # exit as a failure: a fatal signal (bash runs the EXIT trap with `$?` still
 # holding the last command's status, often 0) or a `set -e` abort. No signal is
@@ -117,7 +166,7 @@ premerge_gate_verdict() {
         "$PREMERGE_TEST_LOG" 2>/dev/null || true)
     rm -f "$PREMERGE_TEST_LOG"
     # Help and dry runs intentionally invoke no nested gate and print no PASS.
-    if [ "$print_passing_verdict" -eq 1 ]; then
+    if [ "$print_passing_verdict" -eq 1 ] && [ "$test_verdict_expected" -eq 1 ]; then
         # At most 18 digits per count keeps their sum within signed 64-bit
         # arithmetic, so an overflowing result cannot appear consistent.
         verdict_pattern="^BLORP_GATE_RESULT gate=test status=(PASS|FAIL) passed=([0-9]{1,$max_gate_count_digits}) failed=([0-9]{1,$max_gate_count_digits}) tests=([0-9]{1,$max_gate_count_digits})$"
@@ -144,6 +193,15 @@ premerge_gate_verdict() {
     [ "$gate_finished" -eq 1 ] || overall="FAIL"
     # The exit status must agree with the verdict.
     [ "$overall" = "PASS" ] || [ "$exit_code" -ne 0 ] || exit_code=1
+    # A step still open here aborted the gate (set -e, a signal): it failed.
+    if [ -n "$open_step_name" ]; then
+        record_step "$open_step_name" FAIL "$(( $(date +%s) - open_step_started ))"
+        open_step_name=""
+    fi
+    if [ "${#step_names[@]}" -gt 0 ]; then
+        print_step_table "$overall" "$(( $(date +%s) - gate_start ))"
+        [ "$print_passing_verdict" -eq 0 ] || print_step_records
+    fi
     if [ "$overall" = "PASS" ] && [ "$print_passing_verdict" -eq 0 ]; then
         exit "$exit_code"
     fi
@@ -163,6 +221,7 @@ quality, test, example, sanitizer, Docker, and lightweight security checks.
 Defaults:
   - clean build at -O2 (BLORP_CLI_C_OPTIMIZATION=-O2)
   - make quality
+  - make benchmark-tooling-check, when the change touches benchmark tooling
   - scripts/test --serial --release-compiler
   - focused preview CLI/runtime smoke
   - check all examples/
@@ -171,10 +230,16 @@ Defaults:
   - run Docker gate if Docker is available
   - run lightweight secret-pattern scan
 
+The change is classified first (scripts/gate-scope, which prints a "Change
+scope:" line). A documentation-only change runs only the preflight, security
+scan and drift/hygiene steps; the others are reported as SKIP. When the scope
+cannot be determined (no merge base with origin/main) every step runs.
+
 Options:
+  --full               Run every step, whatever the change touches.
   --quick              Skip clean build, sanitizer, Docker, and example runs.
   --no-clean           Do not run make clean before make.
-  --no-quality         Skip make quality.
+  --no-quality         Skip make quality and make benchmark-tooling-check.
   --no-sanitize        Skip make test-asan.
   --no-docker          Skip Docker validation.
   --require-docker     Fail if Docker is unavailable.
@@ -206,6 +271,10 @@ while [ $# -gt 0 ]; do
             run_docker=0
             run_examples=0
             run_preview_smoke=0
+            shift
+            ;;
+        --full)
+            force_full=1
             shift
             ;;
         --no-clean)
@@ -327,14 +396,39 @@ run_cmd() {
     "$@"
 }
 
+begin_step() {
+    print_header "$1"
+    open_step_name="$1"
+    open_step_started=$(date +%s)
+    open_step_outcome="PASS"
+}
+
+# Records the open step as completed with its recorded outcome.
+finish_step() {
+    local seconds=$(( $(date +%s) - open_step_started ))
+    record_step "$open_step_name" "$open_step_outcome" "$seconds"
+    open_step_name=""
+    echo "Completed in ${seconds}s."
+}
+
+mark_step_skipped() {
+    echo "$1"
+    open_step_outcome="SKIP"
+}
+
+# A step the gate decides not to run before it starts.
+skip_step_fn() {
+    begin_step "$1"
+    mark_step_skipped "$2"
+    finish_step
+}
+
 run_step_fn() {
     local name="$1"
     shift
-    local started
-    print_header "$name"
-    started=$(date +%s)
+    begin_step "$name"
     "$@"
-    echo "Completed in $(elapsed_since "$started")."
+    finish_step
 }
 
 snapshot_git_state() {
@@ -351,13 +445,12 @@ snapshot_git_state() {
 run_non_mutating_step_fn() {
     local name="$1"
     shift
-    local started before after status snapshot_status changed
-    print_header "$name"
-    started=$(date +%s)
+    local before after status snapshot_status changed
+    begin_step "$name"
 
     if [ "$dry_run" -eq 1 ]; then
         "$@"
-        echo "Completed in $(elapsed_since "$started")."
+        finish_step
         return 0
     fi
 
@@ -406,7 +499,7 @@ run_non_mutating_step_fn() {
         return 1
     fi
 
-    echo "Completed in $(elapsed_since "$started")."
+    finish_step
 }
 
 fail_if_unmerged() {
@@ -428,10 +521,18 @@ run_clean_build() {
 
 run_quality_gate() {
     if [ "$run_quality" -eq 0 ]; then
-        echo "Skipping quality gate."
+        mark_step_skipped "Skipping quality gate."
         return 0
     fi
     run_cmd make quality
+}
+
+run_benchmark_tooling_gate() {
+    if [ "$run_quality" -eq 0 ]; then
+        mark_step_skipped "Skipping benchmark tooling checks."
+        return 0
+    fi
+    run_cmd make benchmark-tooling-check
 }
 
 run_test_suites() {
@@ -470,11 +571,6 @@ run_preview_lsp_smoke() {
 
 run_preview_smoke_gate() {
     local tmpdir smoke tmpc lsp_out
-    if [ "$run_preview_smoke" -eq 0 ]; then
-        echo "Skipping preview smoke."
-        return 0
-    fi
-
     tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-preview.XXXXXX")
     (
         set -euo pipefail
@@ -518,7 +614,7 @@ BRP
 
 run_example_checks() {
     if [ "$check_examples" -eq 0 ]; then
-        echo "Skipping example checks."
+        mark_step_skipped "Skipping example checks."
         return 0
     fi
     run_cmd bin/blorp check --no-format examples/
@@ -527,7 +623,7 @@ run_example_checks() {
 run_example_smokes() {
     local example
     if [ "$run_examples" -eq 0 ]; then
-        echo "Skipping example runs."
+        mark_step_skipped "Skipping example runs."
         return 0
     fi
 
@@ -546,7 +642,7 @@ run_example_smokes() {
 
 run_sanitizer_gate() {
     if [ "$run_sanitize" -eq 0 ]; then
-        echo "Skipping sanitizer gate."
+        mark_step_skipped "Skipping sanitizer gate."
         return 0
     fi
     run_cmd make test-asan
@@ -555,7 +651,7 @@ run_sanitizer_gate() {
 run_docker_gate() {
     local args
     if [ "$run_docker" = "0" ]; then
-        echo "Skipping Docker gate."
+        mark_step_skipped "Skipping Docker gate."
         return 0
     fi
 
@@ -574,7 +670,7 @@ run_docker_gate() {
             echo "Docker is required but was not found in PATH." >&2
             return 1
         fi
-        echo "Docker not found; skipping Docker gate. Use --require-docker to make this a hard failure."
+        mark_step_skipped "Docker not found; skipping Docker gate. Use --require-docker to make this a hard failure."
         return 0
     fi
 
@@ -583,7 +679,7 @@ run_docker_gate() {
             echo "Docker is required but the Docker daemon is unavailable." >&2
             return 1
         fi
-        echo "Docker daemon unavailable; skipping Docker gate. Use --require-docker to make this a hard failure."
+        mark_step_skipped "Docker daemon unavailable; skipping Docker gate. Use --require-docker to make this a hard failure."
         return 0
     fi
 
@@ -596,7 +692,7 @@ run_security_scan() {
     local secret_patterns
     local grep_args
     if [ "$run_security" -eq 0 ]; then
-        echo "Skipping security scan."
+        mark_step_skipped "Skipping security scan."
         return 0
     fi
 
@@ -676,7 +772,11 @@ run_security_scan() {
 run_drift_checks() {
     run_cmd git diff --check
     run_cmd git diff --check --cached
-    if [ "$run_quality" -eq 0 ]; then
+    if [ "$gate_scope" = "docs-only" ]; then
+        # Skipping the build leaves out make tooling-check, which needs one.
+        run_cmd make hygiene-check
+        run_cmd make artifact-scan
+    elif [ "$run_quality" -eq 0 ]; then
         run_cmd make hygiene-check
         run_cmd make tooling-check
         run_cmd make artifact-scan
@@ -684,16 +784,60 @@ run_drift_checks() {
 
 }
 
+# The scope decides which steps run; see scripts/gate-scope for the rules.
+gate_scope=""
+benchmark_tooling=""
+scope_summary=""
+scope_args=()
+[ "$force_full" -eq 0 ] || scope_args+=(--full)
+scope_output=$(scripts/gate-scope ${scope_args[@]+"${scope_args[@]}"})
+while IFS='=' read -r scope_key scope_value; do
+    case "$scope_key" in
+        scope) gate_scope="$scope_value" ;;
+        benchmark_tooling) benchmark_tooling="$scope_value" ;;
+        summary) scope_summary="$scope_value" ;;
+    esac
+done <<<"$scope_output"
+case "$gate_scope:$benchmark_tooling" in
+    docs-only:skip|full:run|full:skip) ;;
+    *)
+        echo "scripts/gate-scope printed an unexpected scope: $scope_output" >&2
+        exit 1
+        ;;
+esac
+echo "Change scope: $scope_summary"
+[ "$gate_scope" != "docs-only" ] || test_verdict_expected=0
+
+# Runs `<runner> <name> <function>` unless the change is documentation only.
+code_step() {
+    if [ "$gate_scope" = "docs-only" ]; then
+        skip_step_fn "$2" "Skipping: documentation-only change."
+    else
+        "$@"
+    fi
+}
+
 run_step_fn "Preflight" fail_if_unmerged
-run_step_fn "Build" run_clean_build
-run_step_fn "Quality" run_quality_gate
-run_step_fn "Tests" run_test_suites
-run_step_fn "Codegen audit" run_codegen_audit
-run_non_mutating_step_fn "Preview smoke" run_preview_smoke_gate
-run_step_fn "Example checks" run_example_checks
-run_step_fn "Example smoke runs" run_example_smokes
-run_step_fn "Sanitizers" run_sanitizer_gate
-run_step_fn "Docker" run_docker_gate
+code_step run_step_fn "Build" run_clean_build
+code_step run_step_fn "Quality" run_quality_gate
+if [ "$benchmark_tooling" = "run" ]; then
+    code_step run_step_fn "Benchmark tooling" run_benchmark_tooling_gate
+else
+    skip_step_fn "Benchmark tooling" "Skipping: no input of the benchmark tooling suites changed."
+fi
+code_step run_step_fn "Tests" run_test_suites
+code_step run_step_fn "Codegen audit" run_codegen_audit
+if [ "$run_preview_smoke" -eq 1 ]; then
+    code_step run_non_mutating_step_fn "Preview smoke" run_preview_smoke_gate
+else
+    # Decided here: the step function runs its body in a subshell, where a
+    # skip could not be recorded.
+    skip_step_fn "Preview smoke" "Skipping preview smoke."
+fi
+code_step run_step_fn "Example checks" run_example_checks
+code_step run_step_fn "Example smoke runs" run_example_smokes
+code_step run_step_fn "Sanitizers" run_sanitizer_gate
+code_step run_step_fn "Docker" run_docker_gate
 run_step_fn "Security scan" run_security_scan
 run_step_fn "Drift and hygiene" run_drift_checks
 

@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""Classify what a change can affect, so the premerge gate runs only those steps.
+
+  scripts/gate-scope [--full] [--base REF]...
+
+Prints three lines for scripts/premerge-gate to read:
+
+  scope=docs-only|full
+  benchmark_tooling=run|skip
+  summary=<text for the "Change scope:" line>
+
+The changed paths are everything that differs from the merge base of HEAD and
+the first --base ref that has one (default origin/main, then
+refs/blorp-docker-gate-base/main, which a remote gate host keeps in place of
+origin/main): committed changes, staged and unstaged edits, and untracked files
+that are not ignored. They are classified by the path rules below. When a path
+rule does not recognise a path, or the merge base cannot be found, the scope is
+`full`, which runs every step.
+
+Scopes:
+  docs-only  every changed path is documentation (DOCUMENTATION_PATH_RULES).
+             The gate skips the build, tests and examples.
+  full       anything else. The gate runs every step except
+             `make benchmark-tooling-check`, which it runs only when a changed
+             path is an input of those suites (BENCHMARK_TOOLING_PATH_RULES)
+             or when the scope was forced (--full) or could not be determined.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import subprocess
+import sys
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# Where a gate finds the branch point: a local checkout and the local Docker
+# gate have origin/main; the remote gate host's repository has only the base ref
+# that scripts/docker-gate pushes (REMOTE_BASE_REF).
+DEFAULT_BASE_REFS = ("origin/main", "refs/blorp-docker-gate-base/main")
+
+BENCHMARK_POLICY = "benchmarks/blorp_test_session_policy.json"
+
+# A path is documentation when it matches one of these fnmatch patterns
+# (`*` also crosses `/`).
+DOCUMENTATION_PATH_RULES = ("*.md", "docs/*")
+
+# Inputs of `make benchmark-tooling-check` that are not named by the benchmark
+# policy: fnmatch patterns, then exact paths. Every input those suites read must
+# be matched here, so that a change that can turn them red runs them in the
+# gate. Recorded measurements under benchmarks/results/ are data, not tooling.
+# This is the rule scripts/land applied before it stopped running gates
+# (commit 50ad63f96), with the paths the repository uses now.
+BENCHMARK_RESULTS_PREFIX = "benchmarks/results/"
+BENCHMARK_TOOLING_PATH_RULES = (
+    # The benchmark scripts and workers, and the compiler's test session that
+    # the session benchmark runs.
+    "benchmarks/*",
+    "blorp/benchmark/*",
+    "scripts/bench-*",
+    "blorp/src/test/*",
+    # The tests of the tooling themselves.
+    "blorp/test/test_compiler/test_benchmark/*",
+)
+BENCHMARK_TOOLING_PATHS = frozenset(
+    {
+        # Wrappers that the session benchmark tests drive.
+        "scripts/with-build-lock",
+        "scripts/with-compiler-contention-lease",
+        # Compiler modules the benchmark workers and request generator import,
+        # and the Core IR tags the Perceus benchmark vocabulary tracks.
+        "blorp/src/compiler/bridge_protocol.brp",
+        "blorp/src/compiler/stage_06_typecheck/bridge.brp",
+        "blorp/src/compiler/stage_06_typecheck/trace.brp",
+        "blorp/src/compiler/stage_09_core/ir.brp",
+        "blorp/src/compiler/stage_09_core/function_origin_fixture.brp",
+        "blorp/src/compiler/stage_09_core/perceus.brp",
+        "blorp/src/compiler/stage_09_core/pipeline.brp",
+        "blorp/src/compiler/stage_10_backend/emit.brp",
+        "blorp/src/lib/build_artifact.brp",
+        "blorp/src/lib/function_profile.brp",
+        # Test files outside test_benchmark/ that the Makefile target runs.
+        "blorp/test/test_test/test_session_benchmark.py",
+        "blorp/test/test_compiler/test_stage_06_typecheck/test_support/test_worker.py",
+        "blorp/test/test_compiler/test_stage_06_typecheck/test_support/test_replay.py",
+        "blorp/test/test_build/test_memory_diagnostics_harness.py",
+    }
+)
+
+# The compiler-suite baseline fingerprints the whole compiler test tree, which
+# no benchmark-tooling suite runs and which changes in nearly every compiler
+# change, so it is not an input here.
+POLICY_INPUT_NOT_TOOLING = "blorp/test/test_compiler"
+
+
+class Scope(Enum):
+    DOCS_ONLY = "docs-only"
+    FULL = "full"
+
+
+class BenchmarkTooling(Enum):
+    RUN = "run"
+    SKIP = "skip"
+
+
+@dataclass(frozen=True)
+class Classification:
+    scope: Scope
+    benchmark_tooling: BenchmarkTooling
+    summary: str
+
+    def __post_init__(self) -> None:
+        if self.scope is Scope.DOCS_ONLY and self.benchmark_tooling is BenchmarkTooling.RUN:
+            raise ValueError("a docs-only change cannot run the benchmark tooling suites")
+
+
+def is_documentation(path: str) -> bool:
+    return any(fnmatch.fnmatchcase(path, rule) for rule in DOCUMENTATION_PATH_RULES)
+
+
+def is_benchmark_tooling_input(path: str, policy_inputs: tuple[str, ...]) -> bool:
+    if path.startswith(BENCHMARK_RESULTS_PREFIX):
+        return False
+    if path in BENCHMARK_TOOLING_PATHS:
+        return True
+    if any(fnmatch.fnmatchcase(path, rule) for rule in BENCHMARK_TOOLING_PATH_RULES):
+        return True
+    return any(path == item or path.startswith(item + "/") for item in policy_inputs)
+
+
+def forced_full(reason: str) -> Classification:
+    return Classification(Scope.FULL, BenchmarkTooling.RUN, f"full ({reason})")
+
+
+def classify(
+    changed_paths: list[str] | None,
+    policy_inputs: tuple[str, ...],
+    full_requested: bool,
+) -> Classification:
+    """`changed_paths` is None when the merge base could not be determined."""
+    if full_requested:
+        return forced_full("--full")
+    if changed_paths is None:
+        return forced_full("no merge base with the base branch")
+    if not changed_paths:
+        return forced_full("no changed paths found")
+    count = len(changed_paths)
+    if all(is_documentation(path) for path in changed_paths):
+        return Classification(Scope.DOCS_ONLY, BenchmarkTooling.SKIP, f"docs-only ({count} paths)")
+    first_tooling_path = next(
+        (path for path in changed_paths if is_benchmark_tooling_input(path, policy_inputs)),
+        None,
+    )
+    if first_tooling_path is not None:
+        return Classification(
+            Scope.FULL,
+            BenchmarkTooling.RUN,
+            f"full ({count} paths; benchmark tooling touched: {first_tooling_path})",
+        )
+    return Classification(
+        Scope.FULL,
+        BenchmarkTooling.SKIP,
+        f"full ({count} paths; benchmark tooling untouched)",
+    )
+
+
+def benchmark_policy_inputs(root: Path) -> tuple[str, ...]:
+    """Repository inputs the benchmark policy fingerprints, from the policy file."""
+    policy = json.loads((root / BENCHMARK_POLICY).read_text(encoding="utf-8"))
+    inputs = []
+    for workload in policy["workloads"].values():
+        for path in workload.get("fingerprint_inputs", []):
+            if path != POLICY_INPUT_NOT_TOOLING:
+                inputs.append(path)
+    return tuple(inputs)
+
+
+def git_lines(root: Path, *args: str) -> list[str] | None:
+    """Lines printed by a git command, or None when it fails."""
+    result = subprocess.run(
+        ["git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return [line for line in result.stdout.split("\n") if line]
+
+
+def merge_base(root: Path, base_refs: tuple[str, ...]) -> str | None:
+    for ref in base_refs:
+        found = git_lines(root, "merge-base", ref, "HEAD")
+        if found:
+            return found[0]
+    return None
+
+
+def changed_paths(root: Path, base_refs: tuple[str, ...]) -> list[str] | None:
+    """Paths that differ from the merge base in the working tree, or None.
+
+    --no-renames lists both sides of a move, so moving a file out of a directory
+    counts as touching it. The remote gate snapshots the working tree, so staged,
+    unstaged and untracked files count as changes.
+    """
+    base = merge_base(root, base_refs)
+    if base is None:
+        return None
+    tracked = git_lines(root, "diff", "--name-only", "--no-renames", base)
+    untracked = git_lines(root, "ls-files", "--others", "--exclude-standard")
+    if tracked is None or untracked is None:
+        return None
+    return sorted(set(tracked) | set(untracked))
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Classify a change for the premerge gate.")
+    parser.add_argument("--full", action="store_true", help="classify as full without looking at the paths")
+    parser.add_argument(
+        "--base",
+        action="append",
+        dest="base_refs",
+        metavar="REF",
+        help="ref to take the merge base with; the first that has one wins (repeatable)",
+    )
+    parser.add_argument("--root", type=Path, default=ROOT, help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    base_refs = tuple(args.base_refs) if args.base_refs else DEFAULT_BASE_REFS
+    paths = None if args.full else changed_paths(args.root, base_refs)
+    result = classify(paths, benchmark_policy_inputs(args.root), args.full)
+    print(f"scope={result.scope.value}")
+    print(f"benchmark_tooling={result.benchmark_tooling.value}")
+    print(f"summary={result.summary}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

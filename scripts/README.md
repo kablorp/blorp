@@ -288,6 +288,7 @@ cutting preview builds. It composes:
 
 - clean build at `-O2` (`BLORP_CLI_C_OPTIMIZATION=-O2`; use `--no-release-compiler` for `-O0`)
 - `make quality`
+- `make benchmark-tooling-check`, only when the change touches benchmark tooling
 - `scripts/test --serial --release-compiler compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp compiler-new compiler-new-parity`
 - the direct generated-C audit in `blorp/test/test_compiler/test_pipeline/codegen_audit/`
 - preview CLI/runtime smoke
@@ -307,8 +308,42 @@ scripts/premerge-gate --require-docker
 scripts/premerge-gate --dry-run
 ```
 
+### Change scope
+
+The gate first classifies the change with `scripts/gate-scope` and prints the
+result, for example `Change scope: docs-only (14 paths)`. The changed paths are
+those that differ from the merge base of `HEAD` and `origin/main` (committed,
+staged, unstaged and untracked files; a remote gate host, which has no
+`origin/main`, uses the base ref `scripts/docker-gate` pushes). The scope is:
+
+- `docs-only`: every path is `*.md` or under `docs/`. The gate runs Preflight,
+  Security scan, and Drift and hygiene (`make hygiene-check` and
+  `make artifact-scan`; `tooling-check` needs a build). Every other step is
+  `SKIP`.
+- `full`: anything else, including any path no rule recognises. Every step
+  runs, except Benchmark tooling (`make benchmark-tooling-check`, about two
+  minutes), which runs only when a changed path is an input of those suites:
+  the benchmark scripts, workers and wrappers, the compiler modules and test
+  session they use, the benchmark policy's fingerprinted inputs, and the suites
+  themselves. Recorded measurements under `benchmarks/results/` do not count.
+- `--full` forces every step, Benchmark tooling included. So does a failure to
+  find the merge base, so a checkout without `origin/main` runs everything.
+
+The path rules are named constants in `scripts/gate-scope`;
+`blorp/test/test_build/test_gate_scope.py` covers them.
+
 Use `--quick` for fast local confidence. Use the full default gate before
 claiming a preview/release-sensitive change is ready.
+
+Every run, passing or failing, ends with one aligned step table (each step's
+status and seconds, then the total) and, before the verdict line, one
+`BLORP_GATE_STEP name=<slug> status=PASS|FAIL|SKIP seconds=N` line per step for
+tools. A step that stopped the gate is `FAIL`; steps after it were not reached
+and are not listed. `SKIP` is a step that chose not to run (its flag, or no
+Docker). `--dry-run` prints the table but no step lines or verdict. The
+`BLORP_GATE_STEP` lines are not verdicts: `docker-gate` and the other parsers
+read only `BLORP_GATE_RESULT` lines. `blorp/test/test_build/test_premerge_gate_steps.py`
+covers the summary.
 
 The preview smoke step is guarded as non-mutating: it snapshots Git status plus
 tracked and staged diffs before and after the step, and fails if validation
@@ -691,9 +726,11 @@ leak check (`scripts/check-c-symbol-projection-self-compile`) and the
 Python/shell suites that test the scripts, build, runtime harnesses and
 audits. `make benchmark-tooling-check` holds the benchmark-worker `check` runs
 and the suites that test the benchmark and measurement scripts; they protect
-those scripts rather than the compiler. `make quality` runs all three, then
-`artifact-scan` for stray generated files the suites left behind;
-`scripts/premerge-gate` runs them too, and so does CI's Quality lane.
+those scripts rather than the compiler. `make quality` runs the first two, then
+`artifact-scan` for stray generated files the suites left behind. CI runs
+`benchmark-tooling-check` as its own step after Quality on every push;
+`scripts/premerge-gate` runs it as its own step only when the change touches an
+input of those suites (see "Premerge Gate").
 
 `scripts/check-blorp-layout` validates `blorp/source_ownership.json` against
 `blorp/src` and `blorp/test`: owner roots, which owners may import which (including
