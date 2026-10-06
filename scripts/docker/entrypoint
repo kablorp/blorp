@@ -10,7 +10,29 @@ if [ "${BLORP_VOLUME_MODE:-0}" = "1" ]; then
     if [ "$PREMERGE_GATE" != "1" ]; then
         tar_args+=(--exclude='.git')
     fi
-    tar -c "${tar_args[@]}" -C /blorp . | tar -x -C /tmp/blorp-work
+    # On macOS hosts GNU tar can report the untouched tree root as changed
+    # while reading it ("tar: .: file changed as we read it"; its ctime reads
+    # the same before and after the copy), probably an artifact of Docker
+    # Desktop's file sharing. tar then exits 1 and the gate failed before any
+    # test ran. --warning=no-file-changed hides the message but not the exit
+    # status, so accept exit 1 only when that exact root line is tar's sole
+    # diagnostic; a changed or removed file, or any other error, still fails.
+    spurious_root_change='tar: .: file changed as we read it'
+    tar_errors="$(mktemp)"
+    tar_status=0
+    tar -c "${tar_args[@]}" -C /blorp . 2>"$tar_errors" \
+        | tar -x -C /tmp/blorp-work || tar_status=$?
+    cat "$tar_errors" >&2
+    if [ "$tar_status" -ne 0 ]; then
+        if [ "$tar_status" -ne 1 ] \
+            || ! grep -qxF "$spurious_root_change" "$tar_errors" \
+            || grep -vqxF "$spurious_root_change" "$tar_errors"; then
+            echo "copying the source tree into the container failed (tar exit $tar_status)" >&2
+            exit "$tar_status"
+        fi
+        echo "note: ignored tar's spurious report that the tree root changed" >&2
+    fi
+    rm -f "$tar_errors"
     cd /tmp/blorp-work
     # From a linked worktree, `.git` names the host's `.git/worktrees/<name>`;
     # scripts/docker-gate mounts the shared git directory at /blorp-git-common.
