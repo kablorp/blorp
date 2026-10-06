@@ -617,7 +617,7 @@ All three float types support full fixed-size array operations.
 
 Fixed-size, heterogeneous collections (2-4 elements). A tuple has at least two
 elements: `(x)` is `x` in parentheses and `(x,)` is a parse error, so write the
-value itself or a list, `[x]`.
+value itself or a list, `[x]`. The type `(T,)` is rejected the same way; write `T`.
 
 ```blorp
 func tuple_examples() -> Int:

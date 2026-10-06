@@ -13,7 +13,7 @@ import:
 		Dimension, DimensionKind(NamedDimension, VariadicNamedDimension, WildcardDimension, VariadicWildcardDimension, LiteralDimension, DimensionArithmetic),
 		DimensionOperator(AddDimensions, SubtractDimensions, MultiplyDimensions, DivideDimensions),
 	../tables/diagnostic_code:
-		PlainSyntaxCode(ExpectedTypeDiagnostic, ExpectedDimensionDiagnostic, ExpectedHashDiagnostic, TupleArityDiagnostic, ArrayDimensionsExpectedDiagnostic, BoundInTypeDiagnostic),
+		PlainSyntaxCode(ExpectedTypeDiagnostic, ExpectedDimensionDiagnostic, ExpectedHashDiagnostic, SingletonTupleTypeDiagnostic, TupleArityDiagnostic, ArrayDimensionsExpectedDiagnostic, BoundInTypeDiagnostic),
 	../tables/expected_token:
 		NameConstruct(NameInTypeName),
 		ExpectedTokenDiagnostic(ExpectedRightBracket, ExpectedRightParen, ExpectedLeftParen, ExpectedArrow),
@@ -284,8 +284,17 @@ private pure func starts_parenthesized_dimension(state: ParseState, ahead: Int) 
 
 
 private pure func parse_arguments(state: ParseState, close: TokenKind, context: TypeContext) -> (ParseState, List[TypeArgument]):
+	(out, arguments, _) = parse_arguments_noting_trailing_comma(state, close, context)
+	(out, arguments)
+
+
+-- The arguments, and whether a comma came right before `close`. A parenthesized
+-- list needs that fact: `(T,)` is a rejected tuple type, but `(T)` is grouping
+-- and `(T,) -> R` a function type.
+private pure func parse_arguments_noting_trailing_comma(state: ParseState, close: TokenKind, context: TypeContext) -> (ParseState, List[TypeArgument], Bool):
 	var out: ParseState = state
 	var arguments: List[TypeArgument] = []
+	var trailing_comma: Bool = False
 	var parsing: Bool = out.current_kind() != close
 
 	while parsing and out.current_kind() != EndOfFileToken:
@@ -296,14 +305,16 @@ private pure func parse_arguments(state: ParseState, close: TokenKind, context: 
 
 		if out.current_kind() == CommaSymbol:
 			out = out.advanced()
+			trailing_comma = out.current_kind() == close
 			parsing = out.current_kind() != close
 		else:
+			trailing_comma = False
 			parsing = False
 
 		if out.position() == before:
 			parsing = False
 
-	(out, arguments)
+	(out, arguments, trailing_comma)
 
 
 private pure func parse_parenthesized_type(state: ParseState, context: TypeContext) -> (ParseState, WrittenType):
@@ -327,7 +338,7 @@ private pure func parse_parenthesized_type(state: ParseState, context: TypeConte
 -- grouping a single argument preserves it without minting/discarding a node.
 private pure func parse_parenthesized_argument(state: ParseState, context: TypeContext) -> (ParseState, TypeArgument):
 	start: Span = state.current_span()
-	(after_arguments, arguments) = parse_arguments(state.advanced(), RightParenSymbol, argument_context(context))
+	(after_arguments, arguments, trailing_comma) = parse_arguments_noting_trailing_comma(state.advanced(), RightParenSymbol, argument_context(context))
 	end: Span = after_arguments.current_span()
 	parsed_state: ParseState = after_arguments.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInGroupedType))
 
@@ -340,7 +351,12 @@ private pure func parse_parenthesized_argument(state: ParseState, context: TypeC
 			[single]:
 				match single:
 					TypeArgumentType(written):
-						(after_array, array) = parse_array_suffixes(parsed_state, written, context)
+						-- The rejected `(T,)` still reads as `T`, so later phases see a type.
+						reported: ParseState = if trailing_comma:
+							parsed_state.report_diagnostic(start.span_covering(end), Plain(SingletonTupleTypeDiagnostic))
+						else:
+							parsed_state
+						(after_array, array) = parse_array_suffixes(reported, written, context)
 						(after_array, TypeArgumentType(array))
 					BoundedArgument(bound):
 						if context == ReceiverArgument and parsed_state.current_kind() == LeftBracketSymbol:
