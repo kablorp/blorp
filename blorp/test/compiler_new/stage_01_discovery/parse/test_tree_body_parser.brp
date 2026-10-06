@@ -5,7 +5,7 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/parse/parse_state:
 		ParseState, new_parse_state, diagnostic_count, issued_counts, issued_ids, spellings
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
-		DeclarationPreview(CompletedFunctionPreview, FunctionDeclarationPreview)
+		DeclarationPreview(CompletedFunctionPreview, CompletedTraitPreview, CompletedImplementationPreview, FunctionDeclarationPreview, TraitDeclarationPreview, ImplementationDeclarationPreview)
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
 		ModuleDeclarationPreviewScan, scan_module_declaration_prefix_with_bodies, scan_module_declaration_prefix_with_expressions
 	../../../../src/compiler_new/stage_01_discovery/syntax/dump: dumped_module
@@ -14,7 +14,7 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: FunctionDeclaration
 	../../../../src/compiler_new/stage_01_discovery/syntax/id_census: id_census
 	../../../../src/compiler_new/stage_01_discovery/syntax/ids: expression_local_index
-	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: ModuleItem(FunctionItem), ModuleSyntax
+	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: ModuleItem(FunctionItem, TraitItem, ImplementationItem), ModuleSyntax
 	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
 	test: TestSuite
 
@@ -49,6 +49,10 @@ private pure func completed_module(state: ParseState, scan: ModuleDeclarationPre
 		match declaration:
 			CompletedFunctionPreview(function):
 				items = items.append(FunctionItem(function))
+			CompletedTraitPreview(owner):
+				items = items.append(TraitItem(owner))
+			CompletedImplementationPreview(owner):
+				items = items.append(ImplementationItem(owner))
 			_:
 				void
 	{ documentation = None, items = items, definitions = issued.definitions, imports = issued.imports, counts = issued.counts }
@@ -59,6 +63,26 @@ private pure func completed_count(scan: ModuleDeclarationPreviewScan) -> Int:
 		.filter(pure func(declaration):
 			match declaration:
 				CompletedFunctionPreview(_): True
+				_: False
+		)
+		.length()
+
+
+private pure func completed_owner_count(scan: ModuleDeclarationPreviewScan) -> Int:
+	scan.declarations
+		.filter(pure func(declaration):
+			match declaration:
+				CompletedTraitPreview(_) | CompletedImplementationPreview(_): True
+				_: False
+		)
+		.length()
+
+
+private pure func deferred_owner_count(scan: ModuleDeclarationPreviewScan) -> Int:
+	scan.declarations
+		.filter(pure func(declaration):
+			match declaration:
+				TraitDeclarationPreview(_) | ImplementationDeclarationPreview(_): True
 				_: False
 		)
 		.length()
@@ -126,12 +150,18 @@ func test_function_body_is_complete_syntax_with_an_exact_census() -> Bool:
 func test_unsupported_bodies_roll_back_exactly() -> Bool:
 	var correct: Bool = True
 	for body in [
-		["\tx ?= f()"],
-		["\ta = 1", "\tb ?= f()"],
+		["\tfor x in xs:", "\t\ty ?= f(x)"],
+		["\tfor x in xs:", "\t\tif x:", "\t\t\ty: Int ?= f(x)"],
+		["\ta = 1", "\t(b, c) = pair"],
+		["\t_ ?= f()"],
+		["\tfor (k) in pairs:", "\t\tk"],
+		["\tfor (a, b, c, d, e) in rows:", "\t\ta"],
+		["\tfor (a, b in pairs:", "\t\ta"],
+		["\tfor (a, 1) in pairs:", "\t\ta"],
 		["\t(a, b) = pair"],
 		["\tx =", "\t\t1"],
 		["\tvalue = if flag:", "\t\t1", "\telse:", "\t\t2"],
-		["\tfor (k, v) in pairs:", "\t\tk"],
+		["\tfor (k, v) in pairs concurrently(limit: 2):", "\t\tk"],
 		["\tfor x in xs concurrently(limit: 2):", "\t\tx"],
 		["\tbreak"],
 		["\tcontinue"],
@@ -148,7 +178,7 @@ func test_unsupported_bodies_roll_back_exactly() -> Bool:
 		["\tvalue = \"" + hole("") + "\""],
 		["\tvalue = \"" + hole("first") + " and " + hole("second third") + "\""],
 		-- A type and a pattern parsed to find their ends issue no ids that survive.
-		["\tcount: Int = 1", "\tmatch count:", "\t\tSome(inner): inner", "\tflag ?= f()"]
+		["\tcount: Int = 1", "\tmatch count:", "\t\tSome(inner): inner", "\t(flag, other) = pair"]
 	]:
 		text = source_lines(["func f() -> Int:"].concat(body))
 		match (scanned(text), new_parse_state(lex_module(module_id_at_row(0), text))):
@@ -193,6 +223,46 @@ func test_interpolation_holes_are_minted_in_source_order() -> Bool:
 			counts = state.issued_counts()
 			completed_count(scan) == 1 and state.diagnostic_count() == 0 and counts.expressions == 7 and dumped.split("(hole expr1 ").length() == 2 and dumped.split("(name expr2 ").length() == 2 and dumped.split("(hole expr5 ").length() == 2 and dumped.split("(interpolated expr6 ").length() == 2
 		None: False
+
+
+-- Each method is read header, body, definition, in turn; the owner is last.
+func test_owner_methods_are_minted_in_source_order() -> Bool:
+	text = source_lines([
+		"trait Shape:",
+		"\tfunc first(x: Int) -> Int:",
+		"\t\tx",
+		"\tfunc second(y: Int) -> Int",
+		"\tfunc third(z: Int) -> Int: z",
+		"implements Shape for Int:",
+		"\tfunc first(x: Int) -> Int: x",
+		"\tfunc second(y: Int) -> Int: y"
+	])
+	match scanned(text):
+		Some((state, scan)):
+			syntax = completed_module(state, scan)
+			dumped = syntax.dumped_module(spellings(state))
+			-- Definitions: three trait methods then the trait, two implementation
+			-- methods then the implementation.
+			completed_owner_count(scan) == 2 and deferred_owner_count(scan) == 0 and state.diagnostic_count() == 0 and id_census(module_id_at_row(0), syntax).is_empty() and syntax.definitions.length() == 7 and dumped.split("(trait def3 ").length() == 2 and dumped.split("(implementation def6 ").length() == 2 and dumped.split("(trait-method def0 ").length() == 2 and dumped.split("(trait-method def2 ").length() == 2
+		None: False
+
+
+-- One body outside the slice leaves the whole owner a preview, and every id
+-- its methods minted before that body is rolled back.
+func test_owner_with_an_unsupported_body_stays_a_preview_with_no_ids() -> Bool:
+	var correct: Bool = True
+	for text in [
+		source_lines(["trait Shape:", "\tfunc first(x: Int) -> Int: x", "\tfunc second(y: Int) -> Int:", "\t\t(a, b) = y"]),
+		source_lines(["implements Shape for Int:", "\tfunc first(x: Int) -> Int: x", "\tfunc second(y: Int) -> Int:", "\t\t(a, b) = y"]),
+	]:
+		match (scanned(text), new_parse_state(lex_module(module_id_at_row(0), text))):
+			(Some((state, scan)), Ok(entry)):
+				(plain, _) = scan_module_declaration_prefix_with_expressions(entry)
+				if completed_owner_count(scan) != 0 or deferred_owner_count(scan) != 1 or id_counts(state) != id_counts(plain) or state.diagnostic_count() != 0:
+					print("owner not rolled back: ${text}")
+					correct = False
+			_: correct = False
+	correct
 
 
 func test_break_and_continue_are_supported_only_inside_loops() -> Bool:
@@ -263,7 +333,7 @@ func test_function_after_a_deferred_function_issues_only_its_own_ids() -> Bool:
 	text = source_lines([
 		"func first() -> Int:",
 		"\ta = 1",
-		"\tb ?= f()",
+		"\t(b, c) = pair",
 		"func second() -> Int:",
 		"\tc = 2",
 		"\tc"
@@ -319,6 +389,8 @@ tests: TestSuite = {
 		("unsupported bodies roll back exactly", test_unsupported_bodies_roll_back_exactly),
 		("types and patterns are minted in source order", test_types_and_patterns_are_minted_in_source_order),
 		("interpolation holes are minted in source order", test_interpolation_holes_are_minted_in_source_order),
+		("owner methods are minted in source order", test_owner_methods_are_minted_in_source_order),
+		("an owner with an unsupported body stays a preview", test_owner_with_an_unsupported_body_stays_a_preview_with_no_ids),
 		("break and continue are supported only inside loops", test_break_and_continue_are_supported_only_inside_loops),
 		("else if links are minted inner before outer", test_else_if_chain_mints_inner_links_before_outer_ones),
 		("a function after a deferred function issues only its own ids", test_function_after_a_deferred_function_issues_only_its_own_ids),

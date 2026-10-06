@@ -15,19 +15,25 @@ import:
 		ParseState, current_kind, current_span, position, advanced, diagnostic_count,
 		consume_referenced_name, finished_name_use, expect_token
 	tree_type_parser: parse_receiver_type
+	method_read: MethodRead, Never, absurd
 	tree_implementation_method_header_parser:
 		ImplementationMethodHeaderPreview, ImplementationMethodHeaderParse(ParsedImplementationMethodHeader, RejectedImplementationMethodHeader), parse_implementation_method_header
 
 
-record ImplementationPreview {
+-- An implementation over its methods in whatever form the caller reads them:
+-- header previews, or complete methods that own their bodies' trees.
+record ImplementationOwner[M] {
 	visibility: Visibility,
 	documentation: Option[Documentation],
 	keyword: Span,
 	trait_name: NameUse,
 	receiver: WrittenType,
-	methods: List[ImplementationMethodHeaderPreview],
+	methods: List[M],
 	span: Span
 }
+
+
+type alias ImplementationPreview = ImplementationOwner[ImplementationMethodHeaderPreview]
 
 
 union ImplementationParse:
@@ -35,8 +41,39 @@ union ImplementationParse:
 	RejectedImplementation
 
 
+union ImplementationOwnerParse[M, S]:
+	ParsedImplementationOwner(ImplementationOwner[M])
+	RejectedImplementationOwner
+	StoppedImplementationOwner(S)
+
+
 -- The cursor is at `implements`; the caller owns any declaration prefix.
 pure func parse_implementation(state: ParseState, visibility: Visibility, documentation: Option[Documentation], start: Span) -> (ParseState, ImplementationParse):
+	(out, parsed) = parse_implementation_owner(state, visibility, documentation, start, read_implementation_method_header)
+	match parsed:
+		ParsedImplementationOwner(owner):
+			(out, ParsedImplementation(owner))
+		RejectedImplementationOwner:
+			(out, RejectedImplementation)
+		StoppedImplementationOwner(stop):
+			absurd(stop)
+
+
+private pure func read_implementation_method_header(state: ParseState) -> (ParseState, MethodRead[ImplementationMethodHeaderPreview, Never]):
+	(out, parsed) = parse_implementation_method_header(state)
+	match parsed:
+		ParsedImplementationMethodHeader(method):
+			(out, Ok(Some(method)))
+		RejectedImplementationMethodHeader:
+			(out, Ok(None))
+
+
+-- The implementation's own grammar, over methods read by `read_method`. An
+-- method the reader stops at ends the parse at once; the caller restores its state.
+pure func parse_implementation_owner[M, S](
+	state: ParseState, visibility: Visibility, documentation: Option[Documentation], start: Span,
+	read_method: pure (ParseState) -> (ParseState, MethodRead[M, S]),
+) -> (ParseState, ImplementationOwnerParse[M, S]):
 	before: Int = state.diagnostic_count()
 	keyword: Span = state.current_span()
 	(after_name, name) = state.advanced().consume_referenced_name(NameInTraitName)
@@ -49,19 +86,22 @@ pure func parse_implementation(state: ParseState, visibility: Visibility, docume
 		.expect_token(NewlineToken, ExpectedNewline(NewlineInImplementationMethods))
 		.expect_token(IndentToken, ExpectedIndent(IndentInImplementationMethods))
 		.skip_newlines()
-	var methods: List[ImplementationMethodHeaderPreview] = []
+	var methods: List[M] = []
+	var stopped: Option[S] = None
 
 	-- Every token enters method recovery. Missing indentation deliberately
 	-- does not create a source-column guard for unindented method siblings.
-	while not out.at_block_end():
+	while not out.at_block_end() and stopped.is_none():
 		method_start: Int = out.position()
-		(after_method, result) = parse_implementation_method_header(out)
+		(after_method, result) = read_method(out)
 		out = after_method.skip_newlines()
 		match result:
-			ParsedImplementationMethodHeader(method):
+			Ok(Some(method)):
 				methods = methods.append(method)
-			RejectedImplementationMethodHeader:
+			Ok(None):
 				()
+			Err(stop):
+				stopped = Some(stop)
 
 		if out.position() == method_start and not out.at_block_end():
 			out = out.advanced()
@@ -72,14 +112,18 @@ pure func parse_implementation(state: ParseState, visibility: Visibility, docume
 		end = out.current_span()
 		out = out.advanced()
 
-	if out.diagnostic_count() != before:
-		(out, RejectedImplementation)
-	else:
-		(out, ParsedImplementation({
-			visibility = visibility, documentation = documentation, keyword = keyword,
-			trait_name = trait_name, receiver = receiver, methods = methods,
-			span = start.span_covering(end)
-		}))
+	match stopped:
+		Some(stop):
+			(out, StoppedImplementationOwner(stop))
+		None:
+			if out.diagnostic_count() != before:
+				(out, RejectedImplementationOwner)
+			else:
+				(out, ParsedImplementationOwner({
+					visibility = visibility, documentation = documentation, keyword = keyword,
+					trait_name = trait_name, receiver = receiver, methods = methods,
+					span = start.span_covering(end)
+				}))
 
 
 private pure func at_block_end(state: ParseState) -> Bool:

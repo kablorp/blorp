@@ -16,19 +16,25 @@ import:
 		consume_declared_name, expect_token, report_at_current
 	tree_type_parameter_parser: TypeParametersParse(NoTypeParameters, ParsedTypeParameters, RejectedTypeParameters), parse_type_parameters
 	tree_trait_reference_parser: parse_trait_reference
+	method_read: MethodRead, Never, absurd
 	tree_trait_method_header_parser:
 		TraitMethodHeaderPreview, TraitMethodHeaderParse(ParsedTraitMethodHeader, RejectedTraitMethodHeader), parse_trait_method_header
 
 
-record TraitPreview {
+-- A trait over its methods in whatever form the caller reads them: header
+-- previews, or complete methods that own their default bodies' trees.
+record TraitOwner[M] {
 	visibility: Visibility,
 	documentation: Option[Documentation],
 	name: WrittenName,
 	type_parameters: List[TypeParameter],
 	supertraits: List[TraitReference],
-	methods: List[TraitMethodHeaderPreview],
+	methods: List[M],
 	span: Span
 }
+
+
+type alias TraitPreview = TraitOwner[TraitMethodHeaderPreview]
 
 
 union TraitParse:
@@ -36,8 +42,39 @@ union TraitParse:
 	RejectedTrait
 
 
+union TraitOwnerParse[M, S]:
+	ParsedTraitOwner(TraitOwner[M])
+	RejectedTraitOwner
+	StoppedTraitOwner(S)
+
+
 -- The cursor is at `trait`; start includes caller-owned prefixes, if any.
 pure func parse_trait(state: ParseState, visibility: Visibility, documentation: Option[Documentation], start: Span) -> (ParseState, TraitParse):
+	(out, parsed) = parse_trait_owner(state, visibility, documentation, start, read_trait_method_header)
+	match parsed:
+		ParsedTraitOwner(owner):
+			(out, ParsedTrait(owner))
+		RejectedTraitOwner:
+			(out, RejectedTrait)
+		StoppedTraitOwner(stop):
+			absurd(stop)
+
+
+private pure func read_trait_method_header(state: ParseState) -> (ParseState, MethodRead[TraitMethodHeaderPreview, Never]):
+	(out, parsed) = parse_trait_method_header(state)
+	match parsed:
+		ParsedTraitMethodHeader(method):
+			(out, Ok(Some(method)))
+		RejectedTraitMethodHeader:
+			(out, Ok(None))
+
+
+-- The trait's own grammar, over methods read by `read_method`. A method the
+-- reader stops at ends the parse at once; the caller restores its state.
+pure func parse_trait_owner[M, S](
+	state: ParseState, visibility: Visibility, documentation: Option[Documentation], start: Span,
+	read_method: pure (ParseState) -> (ParseState, MethodRead[M, S]),
+) -> (ParseState, TraitOwnerParse[M, S]):
 	before: Int = state.diagnostic_count()
 	name_position: Span = state.advanced().current_span()
 	(after_name, name) = state.advanced().consume_declared_name(NameInTraitName)
@@ -53,7 +90,8 @@ pure func parse_trait(state: ParseState, visibility: Visibility, documentation: 
 	var out: ParseState = after_parameters.expect_token(ColonSymbol, ExpectedColon(ColonInTraitName))
 	var end: Span = name_position
 	var supertraits: List[TraitReference] = []
-	var methods: List[TraitMethodHeaderPreview] = []
+	var methods: List[M] = []
+	var stopped: Option[S] = None
 	var has_methods: Bool = False
 
 	if out.current_kind() == NewlineToken:
@@ -88,16 +126,18 @@ pure func parse_trait(state: ParseState, visibility: Visibility, documentation: 
 
 		-- Every token enters method recovery, including unsupported prefixes.
 		-- Missing indentation does not create a source-column sibling guard.
-		while not out.at_block_end():
+		while not out.at_block_end() and stopped.is_none():
 			method_start: Int = out.position()
-			(after_method, parsed_method) = parse_trait_method_header(out)
+			(after_method, parsed_method) = read_method(out)
 			out = after_method.skip_newlines()
 
 			match parsed_method:
-				ParsedTraitMethodHeader(method):
+				Ok(Some(method)):
 					methods = methods.append(method)
-				RejectedTraitMethodHeader:
+				Ok(None):
 					()
+				Err(stop):
+					stopped = Some(stop)
 
 			if out.position() == method_start and not out.at_block_end():
 				out = out.advanced()
@@ -106,18 +146,22 @@ pure func parse_trait(state: ParseState, visibility: Visibility, documentation: 
 			end = out.current_span()
 			out = out.advanced()
 
-	if out.diagnostic_count() != before:
-		(out, RejectedTrait)
-	else:
-		match (name, parameters):
-			(Some(name), Some(parameters)):
-				(out, ParsedTrait({
-					visibility = visibility, documentation = documentation, name = name,
-					type_parameters = parameters, supertraits = supertraits, methods = methods,
-					span = start.span_covering(end)
-				}))
-			_:
-				(out, RejectedTrait)
+	match stopped:
+		Some(stop):
+			(out, StoppedTraitOwner(stop))
+		None:
+			if out.diagnostic_count() != before:
+				(out, RejectedTraitOwner)
+			else:
+				match (name, parameters):
+					(Some(name), Some(parameters)):
+						(out, ParsedTraitOwner({
+							visibility = visibility, documentation = documentation, name = name,
+							type_parameters = parameters, supertraits = supertraits, methods = methods,
+							span = start.span_covering(end)
+						}))
+					_:
+						(out, RejectedTraitOwner)
 
 
 private pure func at_block_end(state: ParseState) -> Bool:

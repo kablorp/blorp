@@ -11,9 +11,12 @@ import:
 		GlobalCompletion(CompletedGlobal, DeferredGlobal), complete_atomic_global,
 		GlobalExpressionCompletion(CompletedExpressionGlobal, DeferredExpressionGlobal, RejectedExpressionGlobal), complete_expression_global
 	tree_declaration_preview_parser:
-		DeclarationPreview(GlobalDeclarationPreview, FunctionDeclarationPreview, CompletedFunctionPreview),
+		DeclarationPreview(GlobalDeclarationPreview, FunctionDeclarationPreview, CompletedFunctionPreview, TraitDeclarationPreview, CompletedTraitPreview, ImplementationDeclarationPreview, CompletedImplementationPreview),
 		DeclarationPreviewParse(ParsedDeclarationPreview, DeferredGlobalInitializer, RejectedGlobalInitializer, RejectedDeclarationPreview), parse_declaration_preview
 	tree_body_parser: FunctionCompletion(CompletedFunction, DeferredFunction), complete_function
+	tree_owner_completion:
+		TraitCompletion(CompletedTrait, DeferredTrait), ImplementationCompletion(CompletedImplementation, DeferredImplementation),
+		complete_trait, complete_implementation
 
 
 union ModuleDeclarationScanStop:
@@ -35,7 +38,7 @@ private enum GlobalCompletionPolicy:
 	KeepDeferredInitializers
 	CompleteSameLineAtomicInitializers
 	CompleteSameLineExpressions
-	CompleteExpressionsAndFunctionBodies
+	CompleteExpressionsAndBodies
 
 
 pure func scan_module_declaration_previews(state: ParseState) -> (ParseState, ModuleDeclarationPreviewScan):
@@ -50,11 +53,12 @@ pure func scan_module_declaration_prefix_with_expressions(state: ParseState) -> 
 	scan_module_declaration_prefix(state, CompleteSameLineExpressions)
 
 
--- The M4 statement slice: expression globals as above, and every top-level
--- function whose body the body parser reads in full. A function it leaves
--- deferred stays a skipped-body preview, as in every other scan.
+-- The M4 statement slice: expression globals as above, and every function,
+-- trait and implementation whose bodies the body parser reads in full. An
+-- owner it leaves deferred stays a skipped-body preview, as in every other
+-- scan.
 pure func scan_module_declaration_prefix_with_bodies(state: ParseState) -> (ParseState, ModuleDeclarationPreviewScan):
-	scan_module_declaration_prefix(state, CompleteExpressionsAndFunctionBodies)
+	scan_module_declaration_prefix(state, CompleteExpressionsAndBodies)
 
 
 private pure func scan_module_declaration_prefix(state: ParseState, globals: GlobalCompletionPolicy) -> (ParseState, ModuleDeclarationPreviewScan):
@@ -66,6 +70,7 @@ private pure func scan_module_declaration_prefix(state: ParseState, globals: Glo
 
 	while scanning and out.current_kind() != EndOfFileToken:
 		before: Int = out.position()
+		entry: ParseState = out
 		(parsed, result) = parse_declaration_preview(out)
 		out = parsed
 		match result:
@@ -76,7 +81,7 @@ private pure func scan_module_declaration_prefix(state: ParseState, globals: Glo
 					stop = StoppedWithoutDeclarationProgress
 					scanning = False
 				else:
-					(completed, finished) = out.completed_declaration(declaration, globals)
+					(completed, finished) = out.completed_declaration(entry, declaration, globals)
 					out = completed
 					declarations = declarations.append(finished)
 					out = out.skip_newlines()
@@ -84,7 +89,7 @@ private pure func scan_module_declaration_prefix(state: ParseState, globals: Glo
 				if globals == KeepDeferredInitializers:
 					stop = StoppedAtGlobalInitializer(preview)
 					scanning = False
-				else if globals == CompleteSameLineExpressions or globals == CompleteExpressionsAndFunctionBodies:
+				else if globals == CompleteSameLineExpressions or globals == CompleteExpressionsAndBodies:
 					(completed, completion) = complete_expression_global(out, preview)
 					out = completed
 
@@ -120,20 +125,38 @@ private pure func scan_module_declaration_prefix(state: ParseState, globals: Glo
 	(out, { documentation = documentation, declarations = declarations, stop = stop })
 
 
--- Only the body policy replaces a skipped function body by its tree.
+-- Only the body policy replaces a skipped body by its tree. `state` is where
+-- the declaration's preview ended and `entry` where its prefix began.
 private pure func completed_declaration(
-	state: ParseState, declaration: DeclarationPreview, globals: GlobalCompletionPolicy,
+	state: ParseState, entry: ParseState, declaration: DeclarationPreview, globals: GlobalCompletionPolicy,
 ) -> (ParseState, DeclarationPreview):
-	match (globals, declaration):
-		(CompleteExpressionsAndFunctionBodies, FunctionDeclarationPreview(preview)):
-			(completed, completion) = complete_function(state, preview)
-			match completion:
-				CompletedFunction(function):
-					(completed, CompletedFunctionPreview(function))
-				DeferredFunction:
-					(state, declaration)
-		_:
-			(state, declaration)
+	if globals != CompleteExpressionsAndBodies:
+		(state, declaration)
+	else:
+		match declaration:
+			FunctionDeclarationPreview(preview):
+				(completed, completion) = complete_function(state, preview)
+				match completion:
+					CompletedFunction(function):
+						(completed, CompletedFunctionPreview(function))
+					DeferredFunction:
+						(state, declaration)
+			TraitDeclarationPreview(_):
+				(completed, completion) = complete_trait(entry, state)
+				match completion:
+					CompletedTrait(trait_declaration):
+						(completed, CompletedTraitPreview(trait_declaration))
+					DeferredTrait:
+						(state, declaration)
+			ImplementationDeclarationPreview(_):
+				(completed, completion) = complete_implementation(entry, state)
+				match completion:
+					CompletedImplementation(implementation_declaration):
+						(completed, CompletedImplementationPreview(implementation_declaration))
+					DeferredImplementation:
+						(state, declaration)
+			_:
+				(state, declaration)
 
 
 private pure func skip_newlines(state: ParseState) -> ParseState:

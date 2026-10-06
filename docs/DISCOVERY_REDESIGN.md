@@ -3471,6 +3471,35 @@ expression work), lambdas, local functions, `with`, `concurrent`, `select`,
 `debug:` and values on the line after their operator. `compiler-new` passed
 856/856, `compiler-new-parity` 3,563/3,563 and `compiler-blorp` 6,631/6,631.
 
+The question-binding and member-body slice adds three things. `x [: T] ?= v`
+joins the statements outside a loop (inside a loop the frozen parser reports
+it, so a loop body leaves it unsupported, and `_ ?= v` is not read), and
+`for (a, b) in xs` reads a tuple binder of two to four names or `_` with a
+trailing comma allowed, its span the parentheses. A trait or implementation is
+completed by reading it again from the state before its prefix, with each
+method read through its header and then its body (`complete_body`, which
+`complete_function` shares), so the owner's ids stay in source order: a
+method's header, its body, its definition, the next method, and the owner
+last. The two owner parsers are generic over how a method is read (the
+preview scans still read headers; the completing reader returns the complete
+`TraitMethod` or `ImplementationMethod`), and an owner with any body outside
+the slice stays a preview with every id of its replay rolled back. The
+projection builds `ParsedTraitDecl` and `ParsedImplDecl` with their methods'
+bodies. The scan policy is now `CompleteExpressionsAndBodies`, and the
+differential reports completed functions, traits and implementations apart.
+
+On the 3,408-module "every corpus file as a root" run, against the previous
+slice's tree on the same corpus (3,407 modules), the modules whose first stop
+is a function fell from 1,887 to 1,881 and trait stops from 70 to 0;
+implementation stops fell from 69 to 44, completed declarations rose from
+11,724 to 12,217, and the bodies read are 5,051 functions (4,847), 112 traits
+and 128 implementations (none before). Zero rejected or non-progress stops and
+no differing file. The remaining function stops use lambdas, local functions,
+`with`, `concurrent`, `select`, `debug:`, braced and tuple expressions (the
+parallel expression work), destructuring and values on the line after their
+operator. `compiler-new` passed 861/861, `compiler-new-parity` 3,566/3,566 and
+`compiler-blorp` 6,658/6,658.
+
 Validation before the main reconciliation, at `a5ae15eab`:
 
 The combined fresh-build focused run passed 121/121 tests, including a

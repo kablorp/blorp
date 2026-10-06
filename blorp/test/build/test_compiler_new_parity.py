@@ -373,7 +373,7 @@ class CompilerNewParityTests(unittest.TestCase):
 	def tree_prefix_output(self, *lines: str, updates=None, omitted=(), extra=()) -> str:
 		counts = {
 			"modules": 1, "compared": 1, "skipped": 0, "errors": 0,
-			"declarations": 10, "completed_functions": 0, "differences": 0, "reported": 0,
+			"declarations": 10, "completed_functions": 0, "completed_traits": 0, "completed_implementations": 0, "differences": 0, "reported": 0,
 		}
 		for kind in (
 			"import_block", "foreign_block", "record", "fixed_record",
@@ -486,14 +486,15 @@ class CompilerNewParityTests(unittest.TestCase):
 		problems = parity.parse_adapter_output(output).tree_prefix.problems
 		self.assertIn("tree prefix completed kind counts exceed completed declarations", problems)
 
-	def test_clean_tree_prefix_preview_coverage_matches_its_typed_stop(self) -> None:
+	def test_owner_coverage_may_exceed_its_preview_stops_but_not_fall_below(self) -> None:
+		# A module can complete owners and then stop at a later one of the same kind.
 		for kind, stop in (("trait", "trait_preview"), ("implementation", "implementation_preview")):
 			with self.subTest(kind=kind):
 				matched = {"stop_end_of_source": 0, f"stop_{stop}": 1, f"kind_{kind}": 1}
 				self.assertEqual(self.tree_prefix_problems(self.tree_prefix_output(updates=matched)), [])
-				for mismatched in ({f"kind_{kind}": 1}, {"stop_end_of_source": 0, f"stop_{stop}": 1}):
-					problems = parity.parse_adapter_output(self.tree_prefix_output(updates=mismatched)).tree_prefix.problems
-					self.assertTrue(any("coverage does not match" in problem for problem in problems))
+				uncovered = {"stop_end_of_source": 0, f"stop_{stop}": 1}
+				problems = parity.parse_adapter_output(self.tree_prefix_output(updates=uncovered)).tree_prefix.problems
+				self.assertTrue(any("coverage is below" in problem for problem in problems))
 
 	def test_function_coverage_may_exceed_its_header_stops_but_not_fall_below(self) -> None:
 		# A module can complete functions and then stop at a later function header.

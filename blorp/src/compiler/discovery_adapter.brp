@@ -4458,6 +4458,14 @@ private pure func preview_declaration(
 			translated ?= preview_completed_function(source, names, declaration)
 			(extended, parsed) = translated
 			Ok(CompletedPreviewDeclaration(extended, parsed))
+		TreePreviews.CompletedTraitPreview(declaration):
+			translated ?= preview_completed_trait(source, names, declaration)
+			(extended, parsed) = translated
+			Ok(CompletedPreviewDeclaration(extended, parsed))
+		TreePreviews.CompletedImplementationPreview(declaration):
+			translated ?= preview_completed_implementation(source, names, declaration)
+			(extended, parsed) = translated
+			Ok(CompletedPreviewDeclaration(extended, parsed))
 		TreePreviews.TraitDeclarationPreview(preview):
 			translated ?= preview_trait_header(source, names, preview)
 			(extended, header) = translated
@@ -4740,6 +4748,99 @@ private pure func preview_completed_function(
 	}), declaration.visibility, declaration.span)))
 
 
+-- A completed trait: its header as for a deferred one, each method's header
+-- then its default body in written order.
+private pure func preview_completed_trait(
+	source: PreviewSource, names: NameTable, declaration: TreeDeclarations.TraitDeclaration,
+) -> Result[(NameTable, ParsedDecl), LegacyDeclarationPreviewError]:
+	(after_name, name) = preview_identifier(source, names, declaration.name)
+	(after_type_parameters, type_parameters) = preview_type_parameters(source, after_name, declaration.type_parameters)
+	var extended: NameTable = after_type_parameters
+	var supertraits: List[ParsedTraitReference] = []
+	for bound in declaration.supertraits:
+		(after_bound, translated) = preview_bound(source, extended, bound)
+		extended = after_bound
+		supertraits = supertraits.append(translated)
+	var methods: List[ParsedTraitMethodDecl] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+	for method in declaration.methods:
+		match preview_completed_trait_method(source, extended, method):
+			Ok((after_method, parsed)):
+				extended = after_method
+				methods = methods.append(parsed)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok((extended, preview_visibility(TraitParsedDecl({
+				name = name, type_params = type_parameters, supertraits = supertraits, methods = methods,
+				doc = preview_documentation(declaration.documentation), span = legacy_location(declaration.span)
+			}), declaration.visibility, declaration.span)))
+
+
+private pure func preview_completed_trait_method(
+	source: PreviewSource, names: NameTable, method: TreeDeclarations.TraitMethod,
+) -> Result[(NameTable, ParsedTraitMethodDecl), LegacyDeclarationPreviewError]:
+	signature = method.signature
+	(after_name, name) = preview_identifier(source, names, signature.name)
+	translated_parameters ?= preview_parameters(source, after_name, signature.parameters)
+	(after_parameters, parameters) = translated_parameters
+	translated_return ?= preview_optional_type(source, after_parameters, signature.return_type)
+	(after_return, return_type) = translated_return
+	translated_body ?= legacy_optional_body_preview(source, after_return, method.default_body)
+	(after_body, body) = translated_body
+	Ok((after_body, {
+		name = name, params = parameters, return_type = return_type, body = body,
+		is_pure = signature.purity == Kinds.PureFunction, span = legacy_location(method.span)
+	}))
+
+
+private pure func preview_completed_implementation(
+	source: PreviewSource, names: NameTable, declaration: TreeDeclarations.ImplementationDeclaration,
+) -> Result[(NameTable, ParsedDecl), LegacyDeclarationPreviewError]:
+	(after_trait, trait_name) = preview_identifier(source, names, declaration.trait_name.name)
+	translated_receiver ?= preview_type(source, after_trait, declaration.receiver)
+	(after_receiver, receiver) = translated_receiver
+	var extended: NameTable = after_receiver
+	var methods: List[ParsedFunctionDecl] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+	for method in declaration.methods:
+		match preview_completed_implementation_method(source, extended, method):
+			Ok((after_method, parsed)):
+				extended = after_method
+				methods = methods.append(parsed)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok((extended, preview_visibility(ImplParsedDecl({
+				trait_name = trait_name, for_type = receiver, methods = methods,
+				doc = preview_documentation(declaration.documentation), span = legacy_location(declaration.span)
+			}), declaration.visibility, declaration.span)))
+
+
+private pure func preview_completed_implementation_method(
+	source: PreviewSource, names: NameTable, method: TreeDeclarations.ImplementationMethod,
+) -> Result[(NameTable, ParsedFunctionDecl), LegacyDeclarationPreviewError]:
+	function = method.function
+	translated ?= preview_callable_header(source, names, function.signature, function.type_parameters,
+		function.constraints, method.annotations, None)
+	(after_header, header) = translated
+	translated_body ?= legacy_optional_body_preview(source, after_header, function.body)
+	(after_body, body) = translated_body
+	Ok((after_body, {
+		name = header.name, keyword_span = header.keyword_span, type_params = header.type_params, params = header.params,
+		return_type = header.return_type, dim_constraints = header.dim_constraints, body = body, is_pure = header.is_pure,
+		annotations = header.annotations, doc = header.doc, span = legacy_location(method.span)
+	}))
+
+
 private pure func legacy_optional_body_preview(
 	source: PreviewSource, names: NameTable, body: Option[TreeExpressions.Body],
 ) -> Result[(NameTable, Option[ParsedExpr]), LegacyDeclarationPreviewError]:
@@ -4853,26 +4954,51 @@ private pure func legacy_statement_preview(
 			(after_body, body) = translated_body
 			Ok((after_body, ParsedWhileExpr(condition, body, location)))
 		TreeExpressions.ForLoop(loop):
-			(after_binder, binder) = match loop.binder:
-				TreeExpressions.LoopVariable(BindsName(binder)):
-					(after_name, name) = preview_identifier(source, names, binder.name)
-					(after_name, Some(ParsedForNameBinder(name)))
-				TreeExpressions.LoopVariable(DiscardsValue(span)):
-					(after_name, name) = preview_text_identifier(names, PREVIEW_DISCARD_NAME, span)
-					(after_name, Some(ParsedForNameBinder(name)))
-				TreeExpressions.LoopTuple(_, _):
-					(names, None)
-			match binder:
-				None:
-					Err(UnsupportedBodyStatement(statement.span))
-				Some(written):
-					translated_iterable ?= legacy_expression_preview(source, after_binder, loop.iterable)
-					(after_iterable, iterable) = translated_iterable
-					translated_body ?= legacy_block_preview(source, after_iterable, loop.body)
-					(after_body, body) = translated_body
-					Ok((after_body, ParsedForExpr(written, iterable, body, location)))
+			translated_binder ?= legacy_loop_binder_preview(source, names, loop.binder)
+			(after_binder, binder) = translated_binder
+			translated_iterable ?= legacy_expression_preview(source, after_binder, loop.iterable)
+			(after_iterable, iterable) = translated_iterable
+			translated_body ?= legacy_block_preview(source, after_iterable, loop.body)
+			(after_body, body) = translated_body
+			Ok((after_body, ParsedForExpr(binder, iterable, body, location)))
+		TreeExpressions.QuestionBinding(binding):
+			(after_name, name) = preview_identifier(source, names, binding.binder.name)
+			translated_type ?= preview_optional_type(source, after_name, binding.declared_type)
+			(after_type, type_expr) = translated_type
+			translated_value ?= legacy_expression_preview(source, after_type, binding.value)
+			(after_value, value) = translated_value
+			Ok((after_value, ParsedQuestionBindExpr(name, type_expr, value, location)))
 		_:
 			Err(UnsupportedBodyStatement(statement.span))
+
+
+-- A loop's variable, or its tuple of variables with the parenthesized span.
+-- A discarded position keeps the name the frozen parser gives it.
+private pure func legacy_loop_binder_preview(
+	source: PreviewSource, names: NameTable, binder: TreeExpressions.LoopBinder,
+) -> Result[(NameTable, ParsedForBinder), LegacyDeclarationPreviewError]:
+	match binder:
+		TreeExpressions.LoopVariable(target):
+			(after_target, name) = legacy_binding_target_name(source, names, target)
+			Ok((after_target, ParsedForNameBinder(name)))
+		TreeExpressions.LoopTuple(targets, span):
+			var extended: NameTable = names
+			var tuple_names: List[ParsedIdentifier] = []
+			for target in small_tuple_items(targets):
+				(after_target, name) = legacy_binding_target_name(source, extended, target)
+				extended = after_target
+				tuple_names = tuple_names.append(name)
+			Ok((extended, ParsedForTupleBinder(tuple_names, legacy_location(span))))
+
+
+private pure func legacy_binding_target_name(
+	source: PreviewSource, names: NameTable, target: BindingTarget,
+) -> (NameTable, ParsedIdentifier):
+	match target:
+		BindsName(binder):
+			preview_identifier(source, names, binder.name)
+		DiscardsValue(span):
+			preview_text_identifier(names, PREVIEW_DISCARD_NAME, span)
 
 
 -- An expression in statement position: the block-bearing forms are read here,
