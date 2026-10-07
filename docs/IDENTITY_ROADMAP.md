@@ -384,7 +384,10 @@ The derived String is an anchor key; authored origin does not carry a `NameId`.
 Perceus and closure-drop temporaries already carry an id and origin.
 Remaining:
 
-- Stop building the `$blorp$...`, `__cdrop_`, `__perceus_shadow_`, `__qb_`,
+- Stop building the `$blorp$...` (including `$blorp$record_field$<n>`, the
+  `record_literal_order` binders, whose name repeats the id only because
+  Perceus still tells some binders apart by name; see "Late-Core consumers by
+  exact id"), `__cdrop_`, `__perceus_shadow_`, `__qb_`,
   `__td_`, `__loop_`, `__timeout_`, `__pattern_param_` and `__record_update_`
   spellings; a Perceus or derived temporary's name is still its C spelling, built
   once at creation (`perceus_temporary_spelling`, `derived_temporary_spelling`).
@@ -775,6 +778,18 @@ index, preserve the three collision and occurrence-count fixture families in
 instructions. These stricter slice gates override the general 0.5% budget.
 If counters do not show paying index work, describe the cut as semantic cleanup,
 with no speed claim.
+
+Perceus is the known wrong answer today (CF-015): `summarize_linear_ownership_uses`
+(`perceus/uses.brp`, `summarize_linear_ownership_uses_non_binding`) and the
+shadow checks in `perceus/balance.brp` (`balance_nested_branch_body`'s `LetExpr`
+arm and `balance_managed_borrowed_match_branch_body`) compare `CoreVar.name`
+alone, so two binders with one name and different ids are conflated. When
+`record_literal_order` named every binder `$blorp$record_field`,
+`{pair = {second = noisy("second", 2), first = noisy("first", 1)}, label =
+"after ${noisy("label", 3)}"}` printed garbage for `pair.first` and
+`pair.second`, and `--sanitize` reported a heap-use-after-free, because Perceus
+dropped the bound inner record before the outer construction read it. Its
+binders now carry the id in the name; the Perceus cut above removes the need.
 
 ### Delete strings from Core variables
 

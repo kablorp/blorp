@@ -7,7 +7,7 @@ import:
 		CoreBoxedStorageValue,
 		CoreCallKind(BuiltinCall, IntrinsicCall, UserCall),
 		CoreDeclaredOrigin(ProjectedImplMethod),
-		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl),
+		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, UnionDecl),
 		CoreDictEntry,
 		CoreFunctionOrigin(Declared),
 		CoreImplMethodRole(RuntimeCallbackMethod),
@@ -98,6 +98,7 @@ import:
 			StackResultRepresentation,
 		),
 		CoreBinderOrigin(AuthoredBinder),
+		CoreRecordFieldValue,
 		CoreVar,
 		core_field_ref,
 		core_program_to_json,
@@ -109,6 +110,8 @@ import:
 		CleanupStrategy(DirectCleanup, IterativeCleanup, NoCleanup),
 		CleanupTypePlan(HeapRecordTypeCleanup, NotACleanupType, UnionTypeCleanup),
 		build_cancellation_plan_table,
+		WrittenOrderRecordLiterals,
+		bind_record_literal_fields_in_written_order,
 		build_cleanup_plan,
 		cancellation_plan_table_row,
 		cleanup_plan_row,
@@ -3117,6 +3120,208 @@ pure func test_build_cancellation_plan_table_rows() -> Bool:
 	one_row_per_decl_ok and rows_with_plans_ok and rows_without_plans_ok
 
 
+pure func label_concat_call() -> CoreExpr:
+	CallExpr(
+		BuiltinCall("blorp_string_concat"),
+		VoidExpr(VoidType, synthetic_core_source_loc()),
+		[string_literal("bo"), string_literal("x")],
+		string_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+pure func count_sum() -> CoreExpr:
+	BinaryExpr(AddOp, int_literal(3), int_literal(4), int_type(), synthetic_core_source_loc())
+
+
+pure func box_literal_program(fields: List[CoreRecordFieldValue]) -> CoreProgram:
+	{
+		decls = [
+			HeapRecordDecl(box_heap_record_decl()),
+			FunctionDecl(identity_function(RecordExpr(fields, box_type(), synthetic_core_source_loc()), box_type())),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+
+
+pure func box_literal_body(program: CoreProgram) -> Option[CoreExpr]:
+	match program.decls:
+		[HeapRecordDecl(_), FunctionDecl(function_info)]:
+			function_info.body
+		_:
+			None
+
+
+pure func record_literal_is_unchanged(fields: List[CoreRecordFieldValue]) -> Bool:
+	program: CoreProgram = box_literal_program(fields)
+	bound: WrittenOrderRecordLiterals = bind_record_literal_fields_in_written_order(program, -1)
+
+	match (box_literal_body(bound.program), box_literal_body(program)):
+		(Some(bound_body), Some(body)):
+			same_object(bound_body, body) and bound.next_binder_id == -1
+		_:
+			False
+
+
+pure func test_out_of_order_record_literal_binds_fields_in_written_order() -> Bool:
+	label_value: CoreExpr = label_concat_call()
+	count_value: CoreExpr = count_sum()
+	bound: WrittenOrderRecordLiterals = bind_record_literal_fields_in_written_order(
+		box_literal_program([
+			{ ref = core_field_ref(1), name = "label", value = label_value },
+			{ ref = core_field_ref(0), name = "count", value = count_value },
+		]),
+		-1,
+	)
+
+	match box_literal_body(bound.program):
+		Some(LetExpr(label_var, False, _, label_rhs, LetExpr(count_var, False, _, count_rhs, RecordExpr([label_field, count_field], _, _)))):
+			(
+				same_object(label_rhs, label_value)
+				and same_object(count_rhs, count_value)
+				and label_var.id == -2
+				and count_var.id == -3
+				and bound.next_binder_id == -3
+				and label_field.name == "label"
+				and count_field.name == "count"
+				and match (label_field.value, count_field.value):
+					(VarExpr(label_read, _, _), VarExpr(count_read, _, _)):
+						label_read.id == label_var.id and count_read.id == count_var.id
+					_:
+						False
+			)
+		_:
+			False
+
+
+pure func test_record_literal_in_declaration_order_is_not_bound() -> Bool:
+	record_literal_is_unchanged([
+		{ ref = core_field_ref(0), name = "count", value = count_sum() },
+		{ ref = core_field_ref(1), name = "label", value = label_concat_call() },
+	])
+
+
+pure func test_out_of_order_constant_fields_are_not_bound() -> Bool:
+	record_literal_is_unchanged([
+		{ ref = core_field_ref(1), name = "label", value = string_literal("box") },
+		{ ref = core_field_ref(0), name = "count", value = int_literal(7) },
+	])
+
+
+-- A variable read is bound too: a later field could call a function that
+-- assigns the module variable it names.
+pure func test_out_of_order_variable_read_is_bound() -> Bool:
+	label_var: CoreVar = {
+		name = "label",
+		id = 0,
+		def_id = Some(9),
+		origin = AuthoredBinder
+	}
+	label_value: CoreExpr = VarExpr(label_var, string_type(), synthetic_core_source_loc())
+	count_value: CoreExpr = count_sum()
+	bound: WrittenOrderRecordLiterals = bind_record_literal_fields_in_written_order(
+		box_literal_program([
+			{ ref = core_field_ref(1), name = "label", value = label_value },
+			{ ref = core_field_ref(0), name = "count", value = count_value },
+		]),
+		-1,
+	)
+
+	match box_literal_body(bound.program):
+		Some(LetExpr(_, False, _, label_rhs, LetExpr(_, False, _, count_rhs, RecordExpr(_, _, _)))):
+			same_object(label_rhs, label_value) and same_object(count_rhs, count_value)
+		_:
+			False
+
+
+pure func test_out_of_order_record_literal_leaves_constant_fields_in_place() -> Bool:
+	count_value: CoreExpr = count_sum()
+	label_value: CoreExpr = string_literal("box")
+	bound: WrittenOrderRecordLiterals = bind_record_literal_fields_in_written_order(
+		box_literal_program([
+			{ ref = core_field_ref(1), name = "label", value = label_value },
+			{ ref = core_field_ref(0), name = "count", value = count_value },
+		]),
+		-1,
+	)
+
+	match box_literal_body(bound.program):
+		Some(LetExpr(count_var, False, _, count_rhs, RecordExpr([label_field, count_field], _, _))):
+			(
+				same_object(count_rhs, count_value)
+				and same_object(label_field.value, label_value)
+				and bound.next_binder_id == -2
+				and match count_field.value:
+					VarExpr(count_read, _, _):
+						count_read.id == count_var.id
+					_:
+						False
+			)
+		_:
+			False
+
+
+pure func out_of_order_box_literal_of_calls() -> CoreExpr:
+	RecordExpr(
+		[
+			{ ref = core_field_ref(1), name = "label", value = label_concat_call() },
+			{ ref = core_field_ref(0), name = "count", value = count_sum() },
+		],
+		box_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+-- The two binder ids a bound out-of-order `Box` literal minted, label first.
+pure func bound_box_literal_ids(expr: CoreExpr) -> Option[(Int, Int)]:
+	match expr:
+		LetExpr(label_var, False, _, _, LetExpr(count_var, False, _, _, RecordExpr(_, _, _))):
+			Some((label_var.id, count_var.id))
+		_:
+			None
+
+
+pure func test_global_and_impl_method_literals_are_bound_with_consecutive_ids() -> Bool:
+	box_global: CoreGlobal = { cancellation_plan_test_global(5) |
+		typ = box_type(),
+		init = out_of_order_box_literal_of_calls()
+	}
+	box_method: CoreFunction = identity_function(out_of_order_box_literal_of_calls(), box_type())
+	bound: WrittenOrderRecordLiterals = bind_record_literal_fields_in_written_order(
+		{
+			decls = [
+				HeapRecordDecl(box_heap_record_decl()),
+				GlobalDecl(box_global),
+				ImplDecl({
+					trait_name = "Labelled",
+					for_type = box_type(),
+					type_params = [],
+					methods = [box_method],
+					loc = synthetic_core_source_loc()
+				}),
+			],
+			foreign_includes = [],
+			source_files = []
+		},
+		-1,
+	)
+
+	match bound.program.decls:
+		[HeapRecordDecl(_), GlobalDecl(global), ImplDecl(impl_decl)]:
+			match impl_decl.methods:
+				[method]:
+					match (bound_box_literal_ids(global.init), method.body.map(bound_box_literal_ids)):
+						(Some((-2, -3)), Some(Some((-4, -5)))):
+							bound.next_binder_id == -5
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core prepare",
 	tests = [
@@ -3155,6 +3360,24 @@ tests: TestSuite = {
 			test_prepare_orders_managed_record_construct_fields,
 		),
 		("prepare orders heap record fields", test_prepare_orders_heap_record_fields),
+		(
+			"out-of-order record literal binds fields in written order",
+			test_out_of_order_record_literal_binds_fields_in_written_order,
+		),
+		(
+			"record literal in declaration order is not bound",
+			test_record_literal_in_declaration_order_is_not_bound,
+		),
+		("out-of-order constant fields are not bound", test_out_of_order_constant_fields_are_not_bound),
+		("out-of-order variable read is bound", test_out_of_order_variable_read_is_bound),
+		(
+			"global and impl method literals are bound with consecutive ids",
+			test_global_and_impl_method_literals_are_bound_with_consecutive_ids,
+		),
+		(
+			"out-of-order record literal leaves constant fields in place",
+			test_out_of_order_record_literal_leaves_constant_fields_in_place,
+		),
 		("prepare converts raw dict literal", test_prepare_converts_raw_dict_literal),
 		(
 			"dict literal ownership transfers struct box value",

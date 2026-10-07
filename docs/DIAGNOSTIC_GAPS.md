@@ -34,9 +34,10 @@ message-wording tasks.
 | CF-006 | Triple-quoted string becomes empty |
 | CF-007 | Duplicate functions and parameters accepted |
 | CF-009 | Pure function reads mutable module var (design decision open) |
-| CF-011 | Record literal fields reordered after ownership |
+| CF-012 | Record update replacements run in declaration order: a known deviation from the decided written-order rule ([plan](PRODUCT_UNIFICATION.md#2-operations), `lower_record_update_fields`) |
 | CF-013 | Tensor equality on non-numeric elements passes typecheck, then stops in trait resolution |
 | CF-014 | An unqualified `fixed_point(1.5, 2)` call typechecks, then C emission fails (undeclared identifier without an import; unresolved call kind with a bare `import: fixed_point`) |
+| CF-015 | Perceus conflates binders that share a name and differ by id (`perceus/uses.brp`, `perceus/balance.brp`; [roadmap](IDENTITY_ROADMAP.md#late-core-consumers-by-exact-id)) |
 
 ## High ROI
 

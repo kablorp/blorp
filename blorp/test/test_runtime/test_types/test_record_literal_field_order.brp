@@ -1,0 +1,266 @@
+import:
+	test: TestSuite
+
+
+-- The field expressions of a record literal run in the order they are
+-- written, and each value is stored in its declared field. These literals
+-- are written in a different order from their declarations.
+record Holder {
+	names: List[String],
+	count: Int
+}
+
+
+record Pair {
+	first: Int,
+	second: Int
+}
+
+
+record Labelled {
+	label: String,
+	pair: Pair
+}
+
+
+-- Shares its field names with `Pair`, so a nested literal of both binds
+-- values for fields of the same name at two levels.
+record NestedPair {
+	first: Pair,
+	second: Int
+}
+
+
+-- Declared in the reverse of the order the literals below write them.
+record ReadThenBumped {
+	bumped: Int,
+	read: Int
+}
+
+
+record ListThenCount {
+	count: Int,
+	names: List[String]
+}
+
+
+-- `first` is declared before `second`; the literals write it second.
+record TwoLists {
+	first: List[String],
+	second: List[String]
+}
+
+
+-- `second` is declared before `first`.
+record TwoListsReversed {
+	second: List[String],
+	first: List[String]
+}
+
+
+var counter: Int = 1
+
+var shared_names: List[String] = ["a", "b"]
+
+
+func bump_counter() -> Int:
+	counter += 10
+	counter
+
+
+func reset_shared_names() -> Int:
+	shared_names = ["z"]
+	shared_names.length()
+
+
+pure func counted_then_extended(seed: String) -> Holder:
+	names: List[String] = [seed, seed + "!"]
+	-- `names.length()` borrows `names`, written before the field that consumes it.
+	{
+		count = names.length(),
+		names = names.append("x")
+	}
+
+
+func logged(log: Channel[String], label: String, value: Int) -> Int:
+	_ = send(log, label)
+	value
+
+
+func test_borrowing_field_written_before_consuming_field_reads_the_original() -> Bool:
+	holder: Holder = counted_then_extended("seed")
+	holder.count == 2 and holder.names.length() == 3 and holder.names.get_or(2, "") == "x"
+
+
+func test_fields_run_in_written_order() -> Bool:
+	log: Channel[String] = channel(2)
+	pair: Pair = {
+		second = logged(log, "second", 2),
+		first = logged(log, "first", 1)
+	}
+	seal(log)
+
+	(
+		recv(log) == Some("second")
+		and recv(log) == Some("first")
+		and pair.first == 1
+		and pair.second == 2
+	)
+
+
+func test_nested_literal_fields_run_in_written_order() -> Bool:
+	log: Channel[String] = channel(3)
+	labelled: Labelled = {
+		pair = {
+			second = logged(log, "second", 2),
+			first = logged(log, "first", 1)
+		},
+		label = "after ${logged(log, "label", 3)}"
+	}
+	seal(log)
+
+	(
+		recv(log) == Some("second")
+		and recv(log) == Some("first")
+		and recv(log) == Some("label")
+		and labelled.pair.first == 1
+		and labelled.pair.second == 2
+		and labelled.label == "after 3"
+	)
+
+
+func test_nested_literals_with_the_same_field_names_run_in_written_order() -> Bool:
+	log: Channel[String] = channel(3)
+	nested: NestedPair = {
+		second = logged(log, "outer second", 3),
+		first = {
+			second = logged(log, "inner second", 2),
+			first = logged(log, "inner first", 1)
+		}
+	}
+	seal(log)
+
+	(
+		recv(log) == Some("outer second")
+		and recv(log) == Some("inner second")
+		and recv(log) == Some("inner first")
+		and nested.first.first == 1
+		and nested.first.second == 2
+		and nested.second == 3
+	)
+
+
+func test_module_variable_read_before_a_call_that_assigns_it_reads_the_old_value() -> Bool:
+	counter = 1
+	bumped: ReadThenBumped = {
+		read = counter,
+		bumped = bump_counter()
+	}
+	bumped.read == 1 and bumped.bumped == 11
+
+
+func test_module_list_read_before_a_call_that_replaces_it_reads_the_old_list() -> Bool:
+	original: List[String] = shared_names
+	replaced: ListThenCount = {
+		names = shared_names,
+		count = reset_shared_names()
+	}
+	-- Put the module list back so the test leaves no new list alive.
+	shared_names = original
+	replaced.names == original and replaced.count == 1
+
+
+pure func read_then_extended(names: List[String]) -> TwoListsReversed:
+	{
+		first = names,
+		second = names.append("x")
+	}
+
+
+pure func extended_then_read(names: List[String]) -> TwoLists:
+	{
+		second = names.append("x"),
+		first = names
+	}
+
+
+pure func read_twice(names: List[String]) -> TwoListsReversed:
+	{
+		first = names,
+		second = names
+	}
+
+
+func test_local_read_before_its_extension_keeps_the_original() -> Bool:
+	both: TwoListsReversed = read_then_extended(["w"])
+	both.first.length() == 1 and both.second.length() == 2
+
+
+func test_local_read_after_its_extension_keeps_the_original() -> Bool:
+	both: TwoLists = extended_then_read(["w"])
+	both.first.length() == 1 and both.second.length() == 2
+
+
+func test_local_read_twice_stores_it_in_both_fields() -> Bool:
+	both: TwoListsReversed = read_twice(["w"])
+	both.first == ["w"] and both.second == ["w"]
+
+
+pure func updated_counted_then_extended(seed: String) -> Holder:
+	holder: Holder = {
+		names = [seed, seed + "!"],
+		count = 0
+	}
+	{ holder |
+		count = holder.names.length(),
+		names = holder.names.append("x")
+	}
+
+
+func test_update_borrowing_field_written_before_consuming_field_reads_the_original() -> Bool:
+	holder: Holder = updated_counted_then_extended("seed")
+	holder.count == 2 and holder.names.length() == 3
+
+
+tests: TestSuite = {
+	description = "Record literal field order",
+	tests = [
+		(
+			"A borrowing field written before a consuming field reads the original",
+			test_borrowing_field_written_before_consuming_field_reads_the_original,
+		),
+		("Fields run in written order", test_fields_run_in_written_order),
+		(
+			"Nested literal fields run in written order",
+			test_nested_literal_fields_run_in_written_order,
+		),
+		(
+			"Nested literals with the same field names run in written order",
+			test_nested_literals_with_the_same_field_names_run_in_written_order,
+		),
+		(
+			"A module variable read before a call that assigns it reads the old value",
+			test_module_variable_read_before_a_call_that_assigns_it_reads_the_old_value,
+		),
+		(
+			"A module list read before a call that replaces it reads the old list",
+			test_module_list_read_before_a_call_that_replaces_it_reads_the_old_list,
+		),
+		(
+			"A local read before its extension keeps the original",
+			test_local_read_before_its_extension_keeps_the_original,
+		),
+		(
+			"A local read after its extension keeps the original",
+			test_local_read_after_its_extension_keeps_the_original,
+		),
+		(
+			"A local read twice is stored in both fields",
+			test_local_read_twice_stores_it_in_both_fields,
+		),
+		(
+			"An update's borrowing field before its consuming field reads the original",
+			test_update_borrowing_field_written_before_consuming_field_reads_the_original,
+		),
+	]
+}

@@ -409,7 +409,8 @@ input revision, dumps Core just after DCE (`--dump-core-after=dce
 `benchmarks/blorp/profiles/perceus_allocations.brp` in-process, which
 advances the dumped Core through the remaining production pass functions
 (`run_consume_specialize_pass`, `run_static_string_literals_pass`,
-`run_record_update_ownership_pass`, `run_dict_literal_ownership_pass` --
+`run_record_update_ownership_pass`, `run_record_literal_order_pass`,
+`run_dict_literal_ownership_pass` --
 chained because `dict_literal_ownership` is not one of the CLI's exposed
 `--dump-core-after` stage names) to reach the exact Core state immediately
 before Perceus, then calls `insert_drops_program` and reports calls,

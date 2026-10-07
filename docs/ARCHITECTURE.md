@@ -319,7 +319,8 @@ lower + ffi_boundary + list_layout
   -> callable resolution + backend projection + match projection + dce
   -> consume_specialize
   -> static_string_literals
-  -> record-update ownership lowering + dictionary ownership preparation
+  -> record-update ownership lowering + record-literal written order
+     + dictionary ownership preparation
   -> ownership contracts + perceus (fused production pass)
   -> reuse
   -> closure

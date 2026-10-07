@@ -448,9 +448,21 @@ Several states here are representable but wrong:
   `FieldExpr(base, ...)` and has to match the base, and `record_update.brp`
   carries an `InvalidStagedField` case for when it does not.
 - One list order means both evaluation order and storage order, and `prepare`
-  reorders it after Perceus. That is a use-after-free on `main` today, fixed
-  separately under the rule this plan adopts: fields evaluate in written
-  order and are stored by declared position.
+  reorders it after Perceus. That was a use-after-free on `main`. The
+  `record_literal_order` pass fixed it under the rule this plan adopts, fields
+  evaluate in written order and are stored by declared position, by binding
+  an out-of-order literal's field values to variables before Perceus. It
+  adds 0.59% to the self-compile's allocations and 0.22% to its retired
+  instructions (`benchmarks/results/record_literal_order_pass_2026-10-06.md`);
+  the construction form here replaces it. Record updates do not follow the rule
+  yet (CF-012): `lower_record_update_fields` places each replacement in its
+  declared slot, so `{ base | second = noisy("second"), first =
+  noisy("first") }` runs `first` before `second`. Ownership is consistent,
+  because Perceus sees the order the emitter runs; only side effects run out
+  of written order. Staging the replacements in lowering would put bindings
+  between the `__record_update` binding and the `RecordUpdateExpr`, which
+  `record_update_chain` does not recognise, losing in-place updates; this
+  construction form carries both orders and is the place to fix it.
 - `prepare_tuple_expr` can fail to classify a tuple and fall back to a
   `TupleExpr` that reaches the backend.
 - `retain_mask` is a second ownership mechanism. `prepare` sets it after
@@ -871,6 +883,24 @@ build already holds its ordinals and the type names its layout.
 `prepare_record_construct_expr`, `declaration_ordered_record_fields`,
 `same_record_field_order` and `prepare_tuple_expr` are deleted.
 
+Change 1 also deletes the `record_literal_order` pass, which the ordinals make
+redundant:
+
+- `bind_record_literal_fields_in_written_order` and its helpers in
+  `prepare.brp`, `run_record_literal_order_pass`, `RECORD_LITERAL_ORDER_PASS`
+  and its entries in both pass lists in `pipeline.brp`;
+- `RecordLiteralFieldTemp` and `RECORD_LITERAL_FIELD_TEMP_ORIGIN` in `ir.brp`;
+- the two `RECORD_LITERAL_FIELD_NAME_PREFIX` lines in
+  `scripts/check-magic-spellings.allowlist`;
+- the `run_record_literal_order_pass` step in
+  `benchmarks/blorp/profiles/perceus_allocations.brp` and its mention in
+  `benchmarks/README.md`;
+- the "Record Literal Field Order" section of `docs/OWNERSHIP_MODEL.md` and
+  the pass's line in `docs/ARCHITECTURE.md`;
+- the pass's unit tests in `test_core_prepare.brp` and
+  `test_core_pipeline.brp`. The runtime cases in
+  `test_record_literal_field_order.brp` stay: they pin the rule.
+
 Evidence:
 
 - C identity for records against a base that includes the written-order fix.
@@ -1094,7 +1124,7 @@ Owner decisions (Keith), including the open ones:
 
 - **1. Field evaluation order.** Decided: Rust's rule. Record-literal fields are
   evaluated in written order and stored by declared position. The fix on
-  `main` lands separately before this plan's slices.
+  `main`, the `record_literal_order` pass, landed before this plan's slices.
 - **2. Increment 2 landing order.** Decided: rebase increment 2 onto slices 1
   and 2 rather than land it first.
 - **6. Inline scalar tuples.** Open. Making a tuple whose elements pass the

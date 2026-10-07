@@ -1181,6 +1181,11 @@ var player: Person = {name = "Alice", age = 30}
 player = { player | age = player.age + 1 }
 ```
 
+The field expressions of a record literal are evaluated in the order they are
+written, whatever the declaration order is, and each value is stored in its
+declared field. `{count = names.length(), names = names.append("x")}` reads the
+length before the append, even when `names` is declared first.
+
 Each field name appears once in a declaration, a record literal and a record update:
 `record P { x: Int, x: Int }` and `{ x = 1, x = 2 }` are rejected at the second `x`, and
 the message gives the position of the first.

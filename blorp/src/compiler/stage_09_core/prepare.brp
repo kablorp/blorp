@@ -161,6 +161,7 @@ import:
 		CoreVariantRef(
 			BuiltinOptionNone, BuiltinOptionSome, BuiltinResultErr, BuiltinResultOk, VariantById,
 		),
+		RECORD_LITERAL_FIELD_TEMP_ORIGIN,
 		clone_tensor_for_element_storage,
 		core_field_refs_equal,
 		core_var_equal,
@@ -172,6 +173,7 @@ import:
 		boxed_storage_value,
 		build_specialize_layout,
 		hash_container_constructor_for_key,
+	synth_nodes: core_var_with_id
 	traverse as CoreTraverse: same_optional_core_expr
 	type_policy:
 		is_core_fallible_stream_type_name,
@@ -290,6 +292,9 @@ is a lookup accelerator, never a second authority on declaration order.
 private record PrepareDecls {
 	decls: List[CoreDecl],
 	unions_by_name: Dict[String, CoreUnionDecl],
+	-- The heap record declarations, in declaration-list order, so a record
+	-- lookup scans only them.
+	heap_records: List[CoreHeapRecordDecl],
 	-- Both preparation passes lower dict literals, whose hash-key strategy
 	-- depends on resolved key layouts.
 	specialize_layout: CoreSpecializeLayout
@@ -320,38 +325,36 @@ private pure func prepare_decls(
 	{
 		decls = decls,
 		unions_by_name = unions_by_name,
+		heap_records = heap_record_decls(decls),
 		specialize_layout = specialize_layout
 	}
+
+
+private pure func heap_record_decls(decls: List[CoreDecl]) -> List[CoreHeapRecordDecl]:
+	var records: List[CoreHeapRecordDecl] = []
+
+	for decl in decls:
+		match decl:
+			HeapRecordDecl(record_decl):
+				records = records.append(record_decl)
+			_:
+				void
+
+	records
 
 
 
 
 private pure func find_heap_record_decl(
-	decls: PrepareDecls,
+	heap_records: List[CoreHeapRecordDecl],
 	name: String,
 ) -> Option[CoreHeapRecordDecl]:
 	var result: Option[CoreHeapRecordDecl] = None
 
-	for decl in decls.decls:
-		match decl:
-			HeapRecordDecl(record_decl):
-				if record_decl.name == name:
-					result = Some(record_decl)
-					break
-			FunctionDecl(func_info):
-				void
-			GlobalDecl(global):
-				void
-			EnumDecl(enum_decl):
-				void
-			UnionDecl(union_decl):
-				void
-			TypeAliasDecl(alias_decl):
-				void
-			TraitDecl(trait_decl):
-				void
-			ImplDecl(impl_decl):
-				void
+	for record_decl in heap_records:
+		if record_decl.name == name:
+			result = Some(record_decl)
+			break
 
 	result
 
@@ -3159,17 +3162,17 @@ private pure func prepare_record_cow_field(
 
 ---
 The declaration-ordered fields of a record literal whose type names a
-declared value or heap record, paired with that record's name. `None` when
+declared heap record, paired with that record's name. `None` when
 the type is not such a record or the literal does not cover its fields.
 ---
 private pure func declaration_ordered_record_fields(
-	decls: PrepareDecls,
+	heap_records: List[CoreHeapRecordDecl],
 	typ: CoreType,
 	fields: List[CoreRecordFieldValue],
 ) -> Option[(String, List[CoreRecordFieldValue])]:
 	match typ:
 		HeapRecordType(name):
-			match find_heap_record_decl(decls, name):
+			match find_heap_record_decl(heap_records, name):
 				Some(record_decl):
 					match order_heap_record_fields(record_decl, fields):
 						Some(ordered_fields):
@@ -3220,7 +3223,7 @@ private pure func prepare_record_expr(
 	prepared_fields: Option[List[CoreRecordFieldValue]] = prepare_record_fields(decls, fields)
 
 	match declaration_ordered_record_fields(
-		decls,
+		decls.heap_records,
 		typ,
 		prepared_fields.get_or(fields),
 	):
@@ -3245,7 +3248,7 @@ private pure func prepare_record_construct_expr(
 	prepared_fields: Option[List[CoreRecordFieldValue]] = prepare_record_fields(decls, fields)
 
 	match declaration_ordered_record_fields(
-		decls,
+		decls.heap_records,
 		typ,
 		prepared_fields.get_or(fields),
 	):
@@ -5363,6 +5366,239 @@ pure func prepare_dict_literals_for_ownership(program: CoreProgram) -> CoreProgr
 		decls = program.decls.map(
 			func(decl): prepare_dict_literals_for_ownership_decl(indexed, decl),
 		)
+	}
+
+
+---
+A program after `bind_record_literal_fields_in_written_order`, and the binder
+counter after the ids it minted.
+---
+record WrittenOrderRecordLiterals {
+	program: CoreProgram,
+	next_binder_id: Int
+}
+
+
+-- The heap records `prepare` looks up a literal's field order in, and the
+-- counter the minted binders count down from.
+private record RecordLiteralBinding {
+	heap_records: List[CoreHeapRecordDecl],
+	next_binder_id: Int
+}
+
+
+private record RecordFieldBinding {
+	variable: CoreVar,
+	typ: CoreType,
+	value: CoreExpr
+}
+
+
+-- Each bound field value's name carries its binder id. Perceus still tracks
+-- a variable's uses by name (`summarize_linear_ownership_uses`), so two
+-- binders in one function must not share a name even when their ids differ.
+private RECORD_LITERAL_FIELD_NAME_PREFIX: String = "$blorp$record_field$"
+
+
+---
+True when `prepare_record_expr` would reorder this record literal's fields,
+that is when they are not written in declaration order.
+---
+private pure func record_literal_out_of_declaration_order(
+	heap_records: List[CoreHeapRecordDecl],
+	fields: List[CoreRecordFieldValue],
+	typ: CoreType,
+) -> Bool:
+	match declaration_ordered_record_fields(heap_records, typ, fields):
+		Some((_, ordered_fields)):
+			not same_record_field_order(ordered_fields, fields)
+		None:
+			False
+
+
+---
+A constant has no effect and owns nothing, so where it is evaluated cannot
+matter. A variable read is not a constant: a later field can call a function
+that assigns the module variable it names.
+---
+private pure func is_literal_field_value(value: CoreExpr) -> Bool:
+	match value:
+		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _):
+			True
+		_:
+			False
+
+
+---
+Binds each field value of the literal that is not a constant to a fresh
+variable, in written order, and builds the record from the variables.
+Perceus then sees the bound values run before the construction.
+---
+private pure func bind_fields_in_written_order(
+	binding: RecordLiteralBinding,
+	fields: List[CoreRecordFieldValue],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreTraverse.CoreMapState[RecordLiteralBinding, CoreExpr]:
+	var next_binder_id: Int = binding.next_binder_id
+	var bound_fields: List[CoreRecordFieldValue] = []
+	var field_bindings: List[RecordFieldBinding] = []
+
+	for field in fields:
+		if is_literal_field_value(field.value):
+			bound_fields = bound_fields.append(field)
+		else:
+			next_binder_id -= 1
+			value_type: CoreType = expr_type(field.value)
+			name: String = RECORD_LITERAL_FIELD_NAME_PREFIX + (0 - next_binder_id).to_string()
+			variable: CoreVar = { core_var_with_id(name, next_binder_id) |
+				origin = RECORD_LITERAL_FIELD_TEMP_ORIGIN
+			}
+			field_bindings = field_bindings.append({
+				variable = variable,
+				typ = value_type,
+				value = field.value
+			})
+			bound_fields = bound_fields.append({ field | value = VarExpr(variable, value_type, loc) })
+
+	var bound: CoreExpr = RecordExpr(bound_fields, typ, loc)
+
+	for field_binding in field_bindings.reverse():
+		bound = LetExpr(
+			field_binding.variable,
+			False,
+			field_binding.typ,
+			field_binding.value,
+			bound,
+		)
+
+	{
+		state = { binding | next_binder_id = next_binder_id },
+		value = bound
+	}
+
+
+private pure func bind_record_literal_fields_expr(
+	binding: RecordLiteralBinding,
+	expr: CoreExpr,
+) -> CoreTraverse.CoreMapState[RecordLiteralBinding, CoreExpr]:
+	mapped: CoreTraverse.CoreMapState[RecordLiteralBinding, CoreExpr] = CoreTraverse.map_core_expr_children_with_state(
+		binding,
+		bind_record_literal_fields_expr,
+		expr,
+	)
+
+	match mapped.value:
+		RecordExpr(fields, typ, loc):
+			if (
+				fields.any(func(field): not is_literal_field_value(field.value))
+				and record_literal_out_of_declaration_order(mapped.state.heap_records, fields, typ)
+			):
+				bind_fields_in_written_order(mapped.state, fields, typ, loc)
+			else:
+				mapped
+		_:
+			mapped
+
+
+private pure func bind_record_literal_fields_function(
+	binding: RecordLiteralBinding,
+	func_info: CoreFunction,
+) -> CoreTraverse.CoreMapState[RecordLiteralBinding, CoreFunction]:
+	match func_info.body:
+		Some(body):
+			bound: CoreTraverse.CoreMapState[RecordLiteralBinding, CoreExpr] = bind_record_literal_fields_expr(
+				binding,
+				body,
+			)
+
+			bound_function: CoreFunction = if same_object(bound.value, body):
+				func_info
+			else:
+				{ func_info | body = Some(bound.value) }
+
+			{
+				state = bound.state,
+				value = bound_function
+			}
+		None:
+			{
+				state = binding,
+				value = func_info
+			}
+
+
+---
+Fixes the evaluation order of every record literal whose fields are not
+written in declaration order, before ownership analysis. `prepare_record_expr`
+sorts a literal's fields into declaration order after Perceus, and the emitter
+evaluates them in that order, while Perceus decided ownership for the written
+order: a field that borrows a value could then run after the field that
+consumes it, or a module variable could be read after the call that assigns
+it. Binding every field value other than a constant to a variable in written
+order, before Perceus, leaves the sort only moving constants and reads of
+those variables. A literal already in declaration order is left alone, and so
+is every declaration without such a literal. The binders are minted from
+`next_binder_id` (see `FIRST_MINTED_BINDER_ID`).
+---
+pure func bind_record_literal_fields_in_written_order(
+	program: CoreProgram,
+	next_binder_id: Int,
+) -> WrittenOrderRecordLiterals:
+	var binding: RecordLiteralBinding = {
+		heap_records = heap_record_decls(program.decls),
+		next_binder_id = next_binder_id
+	}
+	var decls: List[CoreDecl] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(func_info):
+				bound: CoreTraverse.CoreMapState[RecordLiteralBinding, CoreFunction] = bind_record_literal_fields_function(
+					binding,
+					func_info,
+				)
+				binding = bound.state
+				bound_decl: CoreDecl = if same_object(bound.value, func_info):
+					decl
+				else:
+					FunctionDecl(bound.value)
+				decls = decls.append(bound_decl)
+			GlobalDecl(global):
+				bound: CoreTraverse.CoreMapState[RecordLiteralBinding, CoreExpr] = bind_record_literal_fields_expr(
+					binding,
+					global.init,
+				)
+				binding = bound.state
+				bound_decl: CoreDecl = if same_object(bound.value, global.init):
+					decl
+				else:
+					GlobalDecl({ global | init = bound.value })
+				decls = decls.append(bound_decl)
+			ImplDecl(impl_decl):
+				var methods: List[CoreFunction] = []
+				var methods_changed: Bool = False
+
+				for method in impl_decl.methods:
+					bound: CoreTraverse.CoreMapState[RecordLiteralBinding, CoreFunction] = bind_record_literal_fields_function(
+						binding,
+						method,
+					)
+					binding = bound.state
+					methods_changed = methods_changed or not same_object(bound.value, method)
+					methods = methods.append(bound.value)
+
+				bound_decl: CoreDecl = if methods_changed:
+					ImplDecl({ impl_decl | methods = methods })
+				else:
+					decl
+				decls = decls.append(bound_decl)
+			_:
+				decls = decls.append(decl)
+
+	{
+		program = { program | decls = decls },
+		next_binder_id = binding.next_binder_id
 	}
 
 

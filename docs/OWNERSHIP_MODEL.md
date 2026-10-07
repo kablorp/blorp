@@ -235,6 +235,18 @@ may consume a proven post-Perceus drop and upgrade an allocation or producer
 handoff only when type, layout, liveness, element ownership, and runtime
 uniqueness are compatible.
 
+### Record Literal Field Order
+
+A record literal evaluates its field expressions in written order and stores
+each value in its declared field. Core keeps the written order through
+Perceus, and `prepare` sorts the fields into declaration order afterwards, so
+`record_literal_order` runs before ownership analysis: when a literal is not
+written in declaration order, it binds every field value other than a
+constant to a fresh variable, in written order. A variable read is bound too,
+because a later field can call a function that assigns the module variable it
+names. Perceus then decides ownership for the order the values really run in,
+and the later sort only moves constants and reads of the bound variables.
+
 ### Fieldwise Record Updates
 
 A record update evaluates every replacement exactly once, in Core field order,

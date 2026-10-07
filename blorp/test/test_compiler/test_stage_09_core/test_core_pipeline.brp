@@ -733,6 +733,95 @@ pure func test_perceus_materializes_record_update_for_ownership() -> Bool:
 	)
 
 
+-- `CounterBox` declares `count` before `limit`; this literal is written
+-- `limit` first, and each field value is a call.
+pure func counter_box_written_limit_first_program() -> CoreProgram:
+	main: CoreDecl = FunctionDecl({
+		name = "main",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = HeapRecordType("CounterBox"),
+		body = Some(
+			RecordExpr(
+				[
+					{
+						ref = core_field_ref(2),
+						name = "limit",
+						value = selected_call_without_callee_id("limit_value", 2)
+					},
+					{
+						ref = core_field_ref(0),
+						name = "count",
+						value = selected_call_without_callee_id("count_value", 3)
+					},
+				],
+				HeapRecordType("CounterBox"),
+				synthetic_core_source_loc(),
+			),
+		),
+		is_pure = True,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = 1,
+		loc = synthetic_core_source_loc(),
+	})
+
+	{
+		decls = [
+			counter_box_decl(),
+			main,
+			function_decl("limit_value", 2, LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc())),
+			function_decl("count_value", 3, LiteralExpr(IntLiteral(1), int_type(), synthetic_core_source_loc())),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+
+
+pure func calls_function(expr: CoreExpr, def_id: Int) -> Bool:
+	match expr:
+		CallExpr(_, VarExpr(callee, _, _), _, _, _):
+			callee.def_id == Some(def_id)
+		_:
+			False
+
+
+pure func test_perceus_sees_record_literal_fields_bound_in_written_order() -> Bool:
+	program: CoreProgram = run_late_core_span(
+		None,
+		Some(PERCEUS_PASS),
+		counter_box_written_limit_first_program(),
+	)
+	var bound_in_written_order: Bool = False
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				if function_info.name == "main":
+					match function_info.body:
+						Some(LetExpr(limit_var, False, _, limit_rhs, LetExpr(count_var, False, _, count_rhs, RecordExpr([limit_field, count_field], _, _)))):
+							reads_bound_values: Bool = match (limit_field.value, count_field.value):
+								(VarExpr(limit_read, _, _), VarExpr(count_read, _, _)):
+									limit_read.id == limit_var.id and count_read.id == count_var.id
+								_:
+									False
+							bound_in_written_order = (
+								calls_function(limit_rhs, 2)
+								and calls_function(count_rhs, 3)
+								and limit_field.name == "limit"
+								and count_field.name == "count"
+								and reads_bound_values
+							)
+						_:
+							void
+			_:
+				void
+
+	bound_in_written_order and core_pass_state_binder_identity_violations(EMPTY_NAME_TABLE, PERCEUS_PASS, program).is_empty()
+
+
 pure func counter_box_decl() -> CoreDecl:
 	HeapRecordDecl({
 		abi_type = None,
@@ -3465,6 +3554,10 @@ tests: TestSuite = {
 		(
 			"Perceus materializes record update for ownership",
 			test_perceus_materializes_record_update_for_ownership,
+		),
+		(
+			"Perceus sees record literal fields bound in written order",
+			test_perceus_sees_record_literal_fields_bound_in_written_order,
 		),
 		(
 			"Perceus marks heap-record self update for reuse",

@@ -1073,6 +1073,8 @@ dict_entry = expression "=>" expression ;
   (`LP:7413-7454`). A record literal or update gives each field once
   (``duplicate field `x` ``, `LP:7113-7140`). A record field's `=` is part of
   the literal, not an assignment.
+- The field expressions of a record literal are evaluated in the order they
+  are written, and each value is stored in its declared field.
 - `(x,)` is ``a tuple has two to four elements, and `(x,)` has one``; more
   than four elements is ``Tuples support 2-4 elements`` (`LP:6900-6973`).
 - `t.0` is not tuple access, since a field name must be a name; write `t[0]`.
