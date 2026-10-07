@@ -36,6 +36,7 @@ message-wording tasks.
 | CF-009 | Pure function reads mutable module var (design decision open) |
 | CF-011 | Record literal fields reordered after ownership |
 | CF-013 | Tensor equality on non-numeric elements passes typecheck, then stops in trait resolution |
+| CF-014 | An unqualified `fixed_point(1.5, 2)` call typechecks, then C emission fails (undeclared identifier without an import; unresolved call kind with a bare `import: fixed_point`) |
 
 ## High ROI
 

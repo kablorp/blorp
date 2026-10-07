@@ -7,7 +7,7 @@
 | `result` | `Result[T, E]` — `Ok(value)` or `Err(error)` |
 | `traits` | Core trait definitions (Stringable, Equatable, Orderable, etc.) |
 | `bytes` | Immutable binary buffer with COW |
-| `fixed` | Fixed-point decimal arithmetic |
+| `fixed_point` | Fixed-point decimal arithmetic |
 | `range` | First-class half-open integer ranges |
 | `tuple` | Tuple trait implementations |
 | `ptr` | Opaque pointer type for C interop |

@@ -552,7 +552,7 @@ func demo_map() -> List[Int]:
 | `String` | - | Immutable UTF-8 text | `"hello"` |
 | `Char` | 32-bit | Unicode codepoint | `'a'`, `'\n'` |
 | `Void` | - | Unit type | Return type for side-effect functions |
-| `Fixed` | - | Fixed-point decimal | `fixed(19.99, 2)` |
+| `FixedPoint` | - | Fixed-point decimal | `fixed_point(19.99, 2)` |
 | `Bytes` | - | Binary byte buffer | `bytes as B: Bytes` then `B.bytes(64)` |
 
 ### Sized Integers
@@ -2366,7 +2366,7 @@ hold the same keys and each key's values are equal by `V`'s own `==`. Insertion
 order does not matter. Comparing `Dict[Int, Point]` when `Point` has no
 `Equatable` implementation is a compile error.
 
-The standard library uses this extensively — `Vec2`, `Vec3`, `Radians`, `Degrees`, `Hz`, `Db`, and all sized numeric types define operators through traits. Builtin scalar implementations, including numeric arithmetic, `String` concatenation, and `Fixed` arithmetic, are ordinary trait implementations whose `builtin` bodies lower directly to native Core operations without a runtime trait call. See `standard_library/src/geometry.brp` and `standard_library/src/units.brp` for source-defined examples.
+The standard library uses this extensively — `Vec2`, `Vec3`, `Radians`, `Degrees`, `Hz`, `Db`, and all sized numeric types define operators through traits. Builtin scalar implementations, including numeric arithmetic, `String` concatenation, and `FixedPoint` arithmetic, are ordinary trait implementations whose `builtin` bodies lower directly to native Core operations without a runtime trait call. See `standard_library/src/geometry.brp` and `standard_library/src/units.brp` for source-defined examples.
 
 ### Using Trait Bounds
 
@@ -2563,7 +2563,7 @@ Module aliases share the visible namespace with types, constructors, traits, fun
 
 ```blorp
 import:
-    fixed as Fixed    -- error: Fixed already names the Fixed type
+    fixed_point as FixedPoint    -- error: FixedPoint already names the FixedPoint type
 ```
 
 ### Combined Qualified + Selective
@@ -3488,7 +3488,7 @@ today.
 - Parser/format modules such as JSON, TOML, YAML, XML, validation, and parser
   utilities use ordinary `Result` values, but their detailed error payloads are
   still module-specific rather than one shared diagnostics type.
-- `Fixed` and some tensor shape helper APIs are preview surfaces. Prefer
+- `FixedPoint` and some tensor shape helper APIs are preview surfaces. Prefer
   documenting concrete module imports in examples instead of relying on broad
   implicit availability.
 - The canonical pure-lambda spelling is `pure func(...)`.

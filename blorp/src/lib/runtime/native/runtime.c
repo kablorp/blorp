@@ -36173,7 +36173,7 @@ typedef struct {
     long value;      // Scaled integer value
     int scale;       // Decimal places (can be negative for large numbers)
     int precision;   // Total digits (default 18)
-} blorp_Fixed;
+} blorp_FixedPoint;
 
 // Power of 10 helper
 long blorp_pow10(int n) {
@@ -36188,9 +36188,9 @@ static int blorp_normalize_precision(int p) {
     return p < 1 ? 18 : p;
 }
 
-// Create Fixed from double
-blorp_Fixed* blorp_fixed_new(double value, int scale, int precision) {
-    blorp_Fixed* f = (blorp_Fixed*)blorp_alloc(sizeof(blorp_Fixed));
+// Create FixedPoint from double
+blorp_FixedPoint* blorp_fixed_point_new(double value, int scale, int precision) {
+    blorp_FixedPoint* f = (blorp_FixedPoint*)blorp_alloc(sizeof(blorp_FixedPoint));
     f->precision = blorp_normalize_precision(precision);
     f->scale = scale;
     if (scale >= 0) {
@@ -36201,9 +36201,9 @@ blorp_Fixed* blorp_fixed_new(double value, int scale, int precision) {
     return f;
 }
 
-// Create Fixed from integer
-blorp_Fixed* blorp_fixed_from_int(long value, int scale, int precision) {
-    blorp_Fixed* f = (blorp_Fixed*)blorp_alloc(sizeof(blorp_Fixed));
+// Create FixedPoint from integer
+blorp_FixedPoint* blorp_fixed_point_from_int(long value, int scale, int precision) {
+    blorp_FixedPoint* f = (blorp_FixedPoint*)blorp_alloc(sizeof(blorp_FixedPoint));
     f->precision = blorp_normalize_precision(precision);
     f->scale = scale;
     if (scale >= 0) {
@@ -36215,17 +36215,17 @@ blorp_Fixed* blorp_fixed_from_int(long value, int scale, int precision) {
     return f;
 }
 
-// Create Fixed from raw value
-blorp_Fixed* blorp_fixed_raw(long value, int scale, int precision) {
-    blorp_Fixed* f = (blorp_Fixed*)blorp_alloc(sizeof(blorp_Fixed));
+// Create FixedPoint from raw value
+blorp_FixedPoint* blorp_fixed_point_raw(long value, int scale, int precision) {
+    blorp_FixedPoint* f = (blorp_FixedPoint*)blorp_alloc(sizeof(blorp_FixedPoint));
     f->value = value;
     f->scale = scale;
     f->precision = blorp_normalize_precision(precision);
     return f;
 }
 
-// Scale a Fixed value to a new scale
-static long blorp_fixed_scale_to(blorp_Fixed* f, int target_scale) {
+// Scale a FixedPoint value to a new scale
+static long blorp_fixed_point_scale_to(blorp_FixedPoint* f, int target_scale) {
     int diff = target_scale - f->scale;
     if (diff > 0) {
         return f->value * blorp_pow10(diff);
@@ -36238,39 +36238,39 @@ static long blorp_fixed_scale_to(blorp_Fixed* f, int target_scale) {
 }
 
 // Addition (auto-normalize to max scale)
-blorp_Fixed* blorp_fixed_add(blorp_Fixed* a, blorp_Fixed* b) {
+blorp_FixedPoint* blorp_fixed_point_add(blorp_FixedPoint* a, blorp_FixedPoint* b) {
     int max_scale = a->scale > b->scale ? a->scale : b->scale;
     int max_prec = a->precision > b->precision ? a->precision : b->precision;
-    long va = blorp_fixed_scale_to(a, max_scale);
-    long vb = blorp_fixed_scale_to(b, max_scale);
-    return blorp_fixed_raw(va + vb, max_scale, max_prec);
+    long va = blorp_fixed_point_scale_to(a, max_scale);
+    long vb = blorp_fixed_point_scale_to(b, max_scale);
+    return blorp_fixed_point_raw(va + vb, max_scale, max_prec);
 }
 
 // Subtraction
-blorp_Fixed* blorp_fixed_sub(blorp_Fixed* a, blorp_Fixed* b) {
+blorp_FixedPoint* blorp_fixed_point_sub(blorp_FixedPoint* a, blorp_FixedPoint* b) {
     int max_scale = a->scale > b->scale ? a->scale : b->scale;
     int max_prec = a->precision > b->precision ? a->precision : b->precision;
-    long va = blorp_fixed_scale_to(a, max_scale);
-    long vb = blorp_fixed_scale_to(b, max_scale);
-    return blorp_fixed_raw(va - vb, max_scale, max_prec);
+    long va = blorp_fixed_point_scale_to(a, max_scale);
+    long vb = blorp_fixed_point_scale_to(b, max_scale);
+    return blorp_fixed_point_raw(va - vb, max_scale, max_prec);
 }
 
 // Multiplication (scales add)
-blorp_Fixed* blorp_fixed_mul(blorp_Fixed* a, blorp_Fixed* b) {
+blorp_FixedPoint* blorp_fixed_point_mul(blorp_FixedPoint* a, blorp_FixedPoint* b) {
     int new_scale = a->scale + b->scale;
     int max_prec = a->precision > b->precision ? a->precision : b->precision;
     // Use __int128 to detect overflow
     __int128 wide = (__int128)a->value * (__int128)b->value;
     long result = (wide > LONG_MAX) ? LONG_MAX : (wide < LONG_MIN) ? LONG_MIN : (long)wide;
-    return blorp_fixed_raw(result, new_scale, max_prec);
+    return blorp_fixed_point_raw(result, new_scale, max_prec);
 }
 
 // Division (use extended precision, then round)
-// Safe: returns zero Fixed on division by zero (consistent with Int/Float)
-blorp_Fixed* blorp_fixed_div(blorp_Fixed* a, blorp_Fixed* b) {
+// Safe: returns zero FixedPoint on division by zero (consistent with Int/Float)
+blorp_FixedPoint* blorp_fixed_point_div(blorp_FixedPoint* a, blorp_FixedPoint* b) {
     if (b->value == 0) {
         // Return zero with same scale/precision as dividend
-        return blorp_fixed_raw(0, a->scale, a->precision);
+        return blorp_fixed_point_raw(0, a->scale, a->precision);
     }
     // Use extra precision for division, then result has a.scale - b.scale + extra
     int extra_precision = 10;
@@ -36279,39 +36279,39 @@ blorp_Fixed* blorp_fixed_div(blorp_Fixed* a, blorp_Fixed* b) {
     // Use __int128 to detect overflow in scaling
     __int128 wide_a = (__int128)a->value * (__int128)blorp_pow10(extra_precision);
     long scaled_a = (wide_a > LONG_MAX) ? LONG_MAX : (wide_a < LONG_MIN) ? LONG_MIN : (long)wide_a;
-    return blorp_fixed_raw(scaled_a / b->value, result_scale, max_prec);
+    return blorp_fixed_point_raw(scaled_a / b->value, result_scale, max_prec);
 }
 
 
 // Comparisons (auto-normalize for comparison)
-bool blorp_fixed_eq(blorp_Fixed* a, blorp_Fixed* b) {
+bool blorp_fixed_point_eq(blorp_FixedPoint* a, blorp_FixedPoint* b) {
     int max_scale = a->scale > b->scale ? a->scale : b->scale;
-    return blorp_fixed_scale_to(a, max_scale) == blorp_fixed_scale_to(b, max_scale);
+    return blorp_fixed_point_scale_to(a, max_scale) == blorp_fixed_point_scale_to(b, max_scale);
 }
 
-bool blorp_fixed_lt(blorp_Fixed* a, blorp_Fixed* b) {
+bool blorp_fixed_point_lt(blorp_FixedPoint* a, blorp_FixedPoint* b) {
     int max_scale = a->scale > b->scale ? a->scale : b->scale;
-    return blorp_fixed_scale_to(a, max_scale) < blorp_fixed_scale_to(b, max_scale);
+    return blorp_fixed_point_scale_to(a, max_scale) < blorp_fixed_point_scale_to(b, max_scale);
 }
 
-bool blorp_fixed_le(blorp_Fixed* a, blorp_Fixed* b) {
+bool blorp_fixed_point_le(blorp_FixedPoint* a, blorp_FixedPoint* b) {
     int max_scale = a->scale > b->scale ? a->scale : b->scale;
-    return blorp_fixed_scale_to(a, max_scale) <= blorp_fixed_scale_to(b, max_scale);
+    return blorp_fixed_point_scale_to(a, max_scale) <= blorp_fixed_point_scale_to(b, max_scale);
 }
 
-bool blorp_fixed_gt(blorp_Fixed* a, blorp_Fixed* b) {
+bool blorp_fixed_point_gt(blorp_FixedPoint* a, blorp_FixedPoint* b) {
     int max_scale = a->scale > b->scale ? a->scale : b->scale;
-    return blorp_fixed_scale_to(a, max_scale) > blorp_fixed_scale_to(b, max_scale);
+    return blorp_fixed_point_scale_to(a, max_scale) > blorp_fixed_point_scale_to(b, max_scale);
 }
 
-bool blorp_fixed_ge(blorp_Fixed* a, blorp_Fixed* b) {
+bool blorp_fixed_point_ge(blorp_FixedPoint* a, blorp_FixedPoint* b) {
     int max_scale = a->scale > b->scale ? a->scale : b->scale;
-    return blorp_fixed_scale_to(a, max_scale) >= blorp_fixed_scale_to(b, max_scale);
+    return blorp_fixed_point_scale_to(a, max_scale) >= blorp_fixed_point_scale_to(b, max_scale);
 }
 
 
 // Convert to string
-blorp_String* blorp_fixed_to_string(blorp_Fixed* f) {
+blorp_String* blorp_fixed_point_to_string(blorp_FixedPoint* f) {
     char buf[64];
     int len;
     if (f->scale >= 0) {
@@ -36334,7 +36334,7 @@ blorp_String* blorp_fixed_to_string(blorp_Fixed* f) {
 
 
 // Convert to float
-double blorp_fixed_to_float(blorp_Fixed* f) {
+double blorp_fixed_point_to_float(blorp_FixedPoint* f) {
     if (f->scale >= 0) {
         return (double)f->value / blorp_pow10(f->scale);
     } else {

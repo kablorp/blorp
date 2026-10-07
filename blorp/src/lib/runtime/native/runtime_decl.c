@@ -842,7 +842,7 @@ typedef struct {
     long value;
     int scale;
     int precision;
-} blorp_Fixed;
+} blorp_FixedPoint;
 
 typedef struct {
     blorp_Object header;
@@ -2422,22 +2422,22 @@ static inline int blorp_closure_env_is_inline(blorp_Closure* c) {
 }
 
 // Fixed-Point
-blorp_Fixed* blorp_fixed_raw(long value, int scale, int precision);
+blorp_FixedPoint* blorp_fixed_point_raw(long value, int scale, int precision);
 long blorp_pow10(int n);
-blorp_Fixed* blorp_fixed_new(double value, int scale, int precision);
-blorp_Fixed* blorp_fixed_from_int(long value, int scale, int precision);
-blorp_Fixed* blorp_fixed_add(blorp_Fixed* a, blorp_Fixed* b);
-blorp_Fixed* blorp_fixed_sub(blorp_Fixed* a, blorp_Fixed* b);
-blorp_Fixed* blorp_fixed_mul(blorp_Fixed* a, blorp_Fixed* b);
-blorp_Fixed* blorp_fixed_div(blorp_Fixed* a, blorp_Fixed* b);
+blorp_FixedPoint* blorp_fixed_point_new(double value, int scale, int precision);
+blorp_FixedPoint* blorp_fixed_point_from_int(long value, int scale, int precision);
+blorp_FixedPoint* blorp_fixed_point_add(blorp_FixedPoint* a, blorp_FixedPoint* b);
+blorp_FixedPoint* blorp_fixed_point_sub(blorp_FixedPoint* a, blorp_FixedPoint* b);
+blorp_FixedPoint* blorp_fixed_point_mul(blorp_FixedPoint* a, blorp_FixedPoint* b);
+blorp_FixedPoint* blorp_fixed_point_div(blorp_FixedPoint* a, blorp_FixedPoint* b);
 // neg, round_to, to_int, get_scale, get_precision → IR intrinsics
-bool blorp_fixed_eq(blorp_Fixed* a, blorp_Fixed* b);
-bool blorp_fixed_lt(blorp_Fixed* a, blorp_Fixed* b);
-bool blorp_fixed_le(blorp_Fixed* a, blorp_Fixed* b);
-bool blorp_fixed_gt(blorp_Fixed* a, blorp_Fixed* b);
-bool blorp_fixed_ge(blorp_Fixed* a, blorp_Fixed* b);
-blorp_String* blorp_fixed_to_string(blorp_Fixed* f);
-double blorp_fixed_to_float(blorp_Fixed* f);
+bool blorp_fixed_point_eq(blorp_FixedPoint* a, blorp_FixedPoint* b);
+bool blorp_fixed_point_lt(blorp_FixedPoint* a, blorp_FixedPoint* b);
+bool blorp_fixed_point_le(blorp_FixedPoint* a, blorp_FixedPoint* b);
+bool blorp_fixed_point_gt(blorp_FixedPoint* a, blorp_FixedPoint* b);
+bool blorp_fixed_point_ge(blorp_FixedPoint* a, blorp_FixedPoint* b);
+blorp_String* blorp_fixed_point_to_string(blorp_FixedPoint* f);
+double blorp_fixed_point_to_float(blorp_FixedPoint* f);
 
 // String Operations (Extended)
 blorp_String* blorp_upper(const blorp_String* s);
