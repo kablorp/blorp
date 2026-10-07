@@ -45,13 +45,13 @@ tree path (`--plan --json` carries the same under `hand_back`):
   reaches through imports, a `compiler_new` test or data file, a test that
   imports such a module (neither carrying a `RUN-BLORP-CHECK` marker, which
   compiler-blorp runs through production), the parity script and its test, or
-  documentation. No program imports it, so the hand-back is `make`,
-  `bin/blorp test` on every registered suite that imports a changed Blorp file
-  (directly or not; the manifest's suites for a changed module too), the
-  parity script's python tests when it or they changed, and
-  `scripts/test --no-build compiler-new compiler-new-parity`; the full
-  `compiler-blorp` gate is not needed. `make` is there for build-status
-  freshness only, since the build inputs are all of `blorp/src`.
+  documentation. No program imports it, so `bin/blorp` stays FRESH and the
+  hand-back has no `make`: `scripts/compiler-build-status --quiet` (fails if the
+  binary is stale for another reason), `bin/blorp test` on every registered suite that
+  imports a changed Blorp file (directly or not; the manifest's suites for a
+  changed module too), the parity script's python tests when it or they
+  changed, and `scripts/test --no-build compiler-new compiler-new-parity`; the
+  full `compiler-blorp` gate is not needed.
 - `broad`: any other path in the change set, including one that was deleted or
   renamed away, or that the import graph cannot place (an import that resolves
   to no file, or a program root whose imports do not all resolve, as in a
@@ -599,6 +599,27 @@ how the binary on disk was actually built regardless of the current shell's
 environment. It also flags `STALE` with reason "bootstrap pin changed" when
 `blorp/build/bootstrap.env`'s tag no longer matches a `dev-` `compiled_by`,
 and prints the version block after a `FRESH` verdict.
+
+## Build Inputs
+
+`scripts/blorp-build-inputs sources` and `headers` print what `bin/blorp` is
+built from. `make` hashes them into the build manifests and
+`scripts/compiler-build-status` recomputes the same hashes, so both call this
+one script. `sources` is the Blorp modules reached by imports from the CLI's
+entry module (`entry` prints it, and the Makefile compiles it), every module in
+`blorp/src/compiler/stage_01_generated_inputs/`, and every standard library
+module (the compiler embeds the whole library). A module no built program
+imports, such as the discovery tree parser or the formatter tool's own modules,
+is not an input: editing it leaves `bin/blorp` FRESH and `make` has nothing to
+do. A module that only a test or another tool compiles is not part of the built
+compiler either; those programs are compiled by `bin/blorp` when they run.
+
+If the import graph cannot be resolved (a generated module is missing before
+the first `make`, or an import names something the reader does not resolve, such
+as a `pkg/` request), the script prints a note on stderr and lists every
+`blorp/src` module, so an unresolvable graph can cost a rebuild but never report a
+stale binary FRESH. The import reader lives in `scripts/blorp_import_graph.py`
+and is shared with `scripts/compiler-check`'s tree-path classification.
 
 ## Build Source Generation
 

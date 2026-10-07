@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""List the source files the built `bin/blorp` is made from.
+
+`make` and `scripts/compiler-build-status` both hash this list to decide whether
+the compiler must be regenerated, so they read it from here rather than each
+keeping a copy.
+
+`entry` is the CLI's entry module, which the Makefile compiles. `sources` is the
+Blorp modules that entry module reaches through its imports, every generated
+input module, and every standard library module (the compiler embeds the whole
+library, whether or not the CLI imports it). A module under `blorp/src` that no
+built program imports, such as the discovery tree parser or the formatter tool's
+own modules, is not an input: editing it leaves `bin/blorp` as it was. `headers`
+is every C header under `blorp/src`, which the generated C is compiled against.
+
+When the import graph cannot be resolved (a generated module is not written yet,
+an import names something this reader does not resolve), what the CLI reaches is
+unknown. The list is then every `blorp/src` module, and a note on stderr says
+why, so a missing input can only cost a rebuild, never a stale `bin/blorp`.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from blorp_import_graph import BLORP_SOURCE_SUFFIX, ImportGraph  # noqa: E402
+
+# The only program `make` builds from `blorp/src`. The other tool `make` builds,
+# `blorp/tool/generate_build_sources.brp`, imports the standard library alone
+# and is listed by the Makefile as its own input.
+ENTRY_MODULE = "blorp/src/main.brp"
+SOURCE_ROOT = "blorp/src"
+# Written by `make` from the standard library and build metadata. The compiler
+# imports them, but they are inputs by what they are, not by who imports them.
+GENERATED_INPUTS_DIRECTORY = "blorp/src/compiler/stage_01_generated_inputs"
+STANDARD_LIBRARY_SOURCE_ROOT = "standard_library/src"
+C_HEADER_SUFFIX = ".h"
+
+
+@dataclass(frozen=True)
+class SourceInputs:
+    """The `.brp` build inputs, and why they are every module when the import
+    graph could not be resolved."""
+
+    paths: tuple[str, ...]
+    fallback_reason: str | None
+
+
+def files_under(root: Path, directory: str, suffix: str) -> set[str]:
+    return {
+        path.relative_to(root).as_posix()
+        for path in (root / directory).rglob(f"*{suffix}")
+        if path.is_file()
+    }
+
+
+@dataclass(frozen=True)
+class ReachedModules:
+    """Every module the entry module reaches, wherever it lives."""
+
+    paths: frozenset[str]
+
+
+@dataclass(frozen=True)
+class UnknownReach:
+    """What the entry module reaches cannot be known, and why."""
+
+    reason: str
+
+
+def reach_of_entry(graph: ImportGraph) -> ReachedModules | UnknownReach:
+    if graph.imports(ENTRY_MODULE) is None:
+        return UnknownReach(f"{ENTRY_MODULE} is not a readable Blorp file")
+    reached = graph.reachable_from([ENTRY_MODULE])
+    for path in sorted(reached):
+        imported = graph.imports(path)
+        if imported is not None and imported.unresolved:
+            return UnknownReach(f"{path} imports {imported.unresolved[0]}, which does not resolve")
+    return ReachedModules(frozenset(reached))
+
+
+def source_inputs(root: Path) -> SourceInputs:
+    standard_library = files_under(root, STANDARD_LIBRARY_SOURCE_ROOT, BLORP_SOURCE_SUFFIX)
+    match reach_of_entry(ImportGraph(root)):
+        case UnknownReach(reason):
+            every_module = files_under(root, SOURCE_ROOT, BLORP_SOURCE_SUFFIX)
+            return SourceInputs(tuple(sorted(every_module | standard_library)), reason)
+        case ReachedModules(paths):
+            # Whole, not just the part under blorp/src: a reached module outside
+            # both source roots is still read by the build.
+            generated = files_under(root, GENERATED_INPUTS_DIRECTORY, BLORP_SOURCE_SUFFIX)
+            return SourceInputs(tuple(sorted(paths | generated | standard_library)), None)
+
+
+def main(arguments: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("kind", choices=("entry", "sources", "headers"))
+    parser.add_argument("--root", type=Path, default=Path.cwd())
+    options = parser.parse_args(arguments)
+    paths: tuple[str, ...]
+    if options.kind == "entry":
+        paths = (ENTRY_MODULE,)
+    elif options.kind == "headers":
+        paths = tuple(sorted(files_under(options.root, SOURCE_ROOT, C_HEADER_SUFFIX)))
+    else:
+        inputs = source_inputs(options.root)
+        paths = inputs.paths
+        if inputs.fallback_reason is not None:
+            sys.stderr.write(
+                f"blorp-build-inputs: {inputs.fallback_reason}; "
+                "treating every blorp/src module as a build input\n"
+            )
+    sys.stdout.write("".join(f"{path}\n" for path in paths))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

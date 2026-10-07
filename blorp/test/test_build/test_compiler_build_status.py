@@ -103,7 +103,21 @@ class CompilerBuildStatusTests(unittest.TestCase):
 				]
 			),
 		)
-		self.write("blorp/src/main.brp", "func main(args: List[String]) -> Int:\n\t0\n")
+		# `compiler/helper` is reached from main; the tree-path parser and the
+		# formatter tool's module import it but nothing built imports them.
+		self.write(
+			"blorp/src/main.brp",
+			"import:\n\tcompiler/helper\n\nfunc main(args: List[String]) -> Int:\n\t0\n",
+		)
+		self.write("blorp/src/compiler/helper.brp", "func helper() -> Int:\n\t0\n")
+		self.write(
+			"blorp/src/compiler_new/tree_parser.brp",
+			"import:\n\t../compiler/helper\n",
+		)
+		self.write(
+			"blorp/src/format/engine/formatter.brp",
+			"import:\n\t../../compiler/helper\n",
+		)
 		self.write("blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp", "std\n")
 		self.write("blorp/build/VERSION", "0.0.1\n")
 		self.write(
@@ -218,20 +232,35 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		]
 		return sha256_bytes("".join(records).encode("utf-8"))
 
-	def generated_c_input_paths(self) -> list[str]:
+	def source_module_paths(self, unresolved_graph: bool = False) -> list[str]:
+		"""The Blorp sources the build hashes: what main reaches plus the
+		generated modules and the standard library, or every `blorp/src` module
+		when the import graph does not resolve."""
+		if unresolved_graph:
+			modules = [
+				path.relative_to(self.root).as_posix()
+				for path in (self.root / "blorp/src").rglob("*.brp")
+			]
+		else:
+			modules = [
+				"blorp/src/main.brp",
+				"blorp/src/compiler/helper.brp",
+				"blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp",
+				"blorp/src/compiler/stage_01_generated_inputs/compiler_build_info.brp",
+			]
+		return [*modules, "standard_library/src/list.brp"]
+
+	def generated_c_input_paths(self, unresolved_graph: bool = False) -> list[str]:
 		return [
-			"blorp/src/main.brp",
-			"blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp",
-			"blorp/src/compiler/stage_01_generated_inputs/compiler_build_info.brp",
-			"standard_library/src/list.brp",
+			*self.source_module_paths(unresolved_graph),
 			self.bootstrap_compiler,
 			"scripts/blorp-compiler-bootstrap",
 			"scripts/blorp-cli-embedded-manifest",
 		]
 
-	def build_input_paths(self) -> list[str]:
+	def build_input_paths(self, unresolved_graph: bool = False) -> list[str]:
 		return [
-			*self.generated_c_input_paths(),
+			*self.generated_c_input_paths(unresolved_graph),
 			"blorp/src/lib/runtime/native/minicoro.h",
 			"blorp/src/lib/runtime/native/runtime.c",
 			"blorp/src/lib/runtime/native/runtime_decl.c",
@@ -248,8 +277,9 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		split_n: str = "8",
 		memory_diagnostics: str = "0",
 		commit: str = "deadbeef0000",
+		unresolved_graph: bool = False,
 	) -> None:
-		c_manifest = input_manifest(self.root, self.generated_c_input_paths())
+		c_manifest = input_manifest(self.root, self.generated_c_input_paths(unresolved_graph))
 		(self.build / "generated-c-build-inputs.sha256").write_bytes(c_manifest)
 		c_input_hash = hash_lines(
 			sha256_bytes(c_manifest),
@@ -267,7 +297,7 @@ class CompilerBuildStatusTests(unittest.TestCase):
 			encoding="utf-8",
 		)
 
-		build_manifest = input_manifest(self.root, self.build_input_paths())
+		build_manifest = input_manifest(self.root, self.build_input_paths(unresolved_graph))
 		(self.build / "build-inputs.sha256").write_bytes(build_manifest)
 		binary_input_hash = hash_lines(
 			sha256_bytes(build_manifest),
@@ -390,13 +420,62 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		self.assertIn("blorp/src/main.brp", result.stdout)
 		self.assertIn("Next: make", result.stdout)
 
-	def test_untracked_compiler_source_reports_stale(self) -> None:
-		self.write("blorp/src/new_input.brp", "func helper() -> Int:\n\t1\n")
+	def test_edit_to_a_module_the_cli_imports_reports_stale(self) -> None:
+		self.write("blorp/src/compiler/helper.brp", "func helper() -> Int:\n\t1\n")
 
 		result = self.run_status()
 
 		self.assert_status(result, 1, "STALE")
-		self.assertIn("blorp/src/new_input.brp", result.stdout)
+		self.assertIn("blorp/src/compiler/helper.brp", result.stdout)
+
+	def test_module_the_cli_starts_importing_reports_stale_as_a_new_input(self) -> None:
+		self.write("blorp/src/compiler/added.brp", "func added() -> Int:\n\t1\n")
+		self.assert_status(self.run_status(), 0, "FRESH")
+		self.write(
+			"blorp/src/compiler/helper.brp",
+			"import:\n\tadded\n\nfunc helper() -> Int:\n\t0\n",
+		)
+
+		result = self.run_status()
+
+		self.assert_status(result, 1, "STALE")
+		self.assertIn("blorp/src/compiler/added.brp is a new build input", result.stdout)
+
+	def test_edit_to_a_tree_path_module_nothing_built_imports_stays_fresh(self) -> None:
+		before = self.snapshot_files()
+		self.write("blorp/src/compiler_new/tree_parser.brp", "import:\n\t../compiler/helper\n\n-- edit\n")
+		self.write("blorp/src/compiler_new/tree_added.brp", "func added() -> Int:\n\t1\n")
+
+		result = self.run_status()
+
+		self.assert_status(result, 0, "FRESH")
+		self.assertNotEqual(self.snapshot_files(), before)
+
+	def test_edit_to_a_module_only_the_formatter_tool_imports_stays_fresh(self) -> None:
+		# `make` builds the CLI and the build-source generator, not the formatter
+		# tool, so a module only the formatter reaches is not a build input.
+		self.write("blorp/src/format/engine/formatter.brp", "import:\n\t../../compiler/helper\n\n-- edit\n")
+		self.write("blorp/src/format/engine/only_formatter.brp", "func only() -> Int:\n\t1\n")
+
+		self.assert_status(self.run_status(), 0, "FRESH")
+
+	def test_unresolvable_import_graph_makes_every_source_module_an_input(self) -> None:
+		self.write(
+			"blorp/src/compiler/helper.brp",
+			"import:\n\tnot_generated_yet\n\nfunc helper() -> Int:\n\t0\n",
+		)
+		self.write_fresh_manifests(unresolved_graph=True)
+		self.assert_status(self.run_status(), 0, "FRESH")
+
+		self.write("blorp/src/compiler_new/tree_parser.brp", "import:\n\t../compiler/helper\n\n-- edit\n")
+		result = self.run_status()
+
+		self.assert_status(result, 1, "STALE")
+		self.assertIn("blorp/src/compiler_new/tree_parser.brp", result.stdout)
+		self.assertIn("treating every blorp/src module as a build input", result.stderr)
+		quiet = self.run_status("--quiet")
+		self.assertEqual(quiet.returncode, 1)
+		self.assertEqual(quiet.stderr, "")
 
 	def test_standard_library_and_runtime_edits_report_stale(self) -> None:
 		for path in (

@@ -21,6 +21,12 @@ import sys
 import time
 from typing import Any, Iterable
 
+# The checkout's own scripts directory holds the import reader this and
+# `blorp-build-inputs` share; `sys.path` has it when run directly, and this line
+# keeps it when the file is loaded by path (the tests do).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from blorp_import_graph import BLORP_SOURCE_SUFFIX, ImportGraph, SourceImports  # noqa: E402
+
 
 MANIFEST_PATH = Path("blorp/test/test_compiler/compiler_test_ownership.json")
 PRODUCTION_SOURCE_DIRECTORY = Path("blorp/src")
@@ -95,8 +101,6 @@ SOURCE_MODULE_ROOT = "blorp/src/"
 CANDIDATE_MODULE_ROOT = "blorp/src/compiler_new/"
 TEST_ROOT = "blorp/test/"
 COMPILER_NEW_TEST_ROOT = "blorp/test/test_compiler_new/"
-BLORP_SOURCE_SUFFIX = ".brp"
-STANDARD_LIBRARY_ROOT = "standard_library/src/"
 # Fixtures marked with this line run through production `bin/blorp check` in
 # compiler-blorp (`blorp/test/test_lib/run_blorp_check_fixtures.py`).
 CHECKED_FIXTURE_MARKER = "-- RUN-BLORP-CHECK"
@@ -106,7 +110,8 @@ TREE_PATH_TOOLING = ("scripts/compiler-new-parity", PARITY_SCRIPT_TESTS)
 # Documentation and measurement records: no gate reads them, so they neither
 # join a tree-path change set nor widen it. `scripts/gate-scope` keeps its own
 # `DOCUMENTATION_PATH_RULES` for the same notion; sharing one definition is a
-# follow-up (this script is copied alone into the test repositories).
+# follow-up (the test repositories copy this script with only its sibling
+# `blorp_import_graph.py`, so a shared definition must stay a small module).
 INERT_PATTERNS = ("docs/*", "benchmarks/results/*", "*.md")
 HAND_BACK_LISTED_PATH_LIMIT = 10
 TREE_PATH_GATES = ("compiler-new", "compiler-new-parity")
@@ -117,97 +122,6 @@ class PathScope(Enum):
     INERT = "inert"
     TREE_PATH = "tree path"
     PRODUCTION = "production"
-
-
-@dataclass(frozen=True)
-class SourceImports:
-    """What a Blorp file imports: the files its imports resolve to, and the
-    spellings that resolve to no file (what they name is unknown, never assumed
-    safe)."""
-
-    targets: tuple[str, ...]
-    unresolved: tuple[str, ...]
-
-    @property
-    def complete(self) -> bool:
-        return not self.unresolved
-
-
-def _module_imports(text: str) -> list[str]:
-    """The module spellings of a Blorp file's `import:` block."""
-    block = re.search(r"^import:\n((?:(?:\t.*)?\n)*)", text, re.MULTILINE)
-    if block is None:
-        return []
-    spellings = []
-    for line in block.group(1).splitlines():
-        header = re.match(r"\t(\S+?)(?: as \w+)?(?::.*)?$", line)
-        if header is not None and not line.startswith("\t\t"):
-            spellings.append(header.group(1))
-    return spellings
-
-
-class ImportGraph:
-    """The import graph of the checkout's Blorp files, read on demand."""
-
-    def __init__(self, root: Path) -> None:
-        self.root = root
-        self._imports: dict[str, SourceImports | None] = {}
-
-    def imports(self, path: str) -> SourceImports | None:
-        """The imports of `path`, or `None` when it is not a readable file."""
-        if path not in self._imports:
-            self._imports[path] = self._read_imports(path)
-        return self._imports[path]
-
-    def _read_imports(self, path: str) -> SourceImports | None:
-        file = self.root / path
-        if not path.endswith(BLORP_SOURCE_SUFFIX) or not file.is_file():
-            return None
-        targets: list[str] = []
-        unresolved: list[str] = []
-        for spelling in _module_imports(file.read_text(encoding="utf-8")):
-            beside = posixpath.normpath(
-                posixpath.join(posixpath.dirname(path), spelling + BLORP_SOURCE_SUFFIX)
-            )
-            library = f"{STANDARD_LIBRARY_ROOT}{spelling}{BLORP_SOURCE_SUFFIX}"
-            for candidate in (beside, library):
-                if (self.root / candidate).is_file():
-                    targets.append(candidate)
-                    break
-            else:
-                unresolved.append(spelling)
-        return SourceImports(tuple(targets), tuple(unresolved))
-
-    def reachable_from(self, starts: list[str]) -> set[str]:
-        """Every Blorp file `starts` name, and every file they import, directly
-        or not. A start that is not a Blorp file is left out."""
-        seen = {start for start in starts if self.imports(start) is not None}
-        pending = list(seen)
-        while pending:
-            imported = self.imports(pending.pop())
-            for target in imported.targets if imported else ():
-                if target not in seen:
-                    seen.add(target)
-                    pending.append(target)
-        return seen
-
-    def importers_of(self, modules: set[str]) -> set[str]:
-        """The Blorp files under `blorp/` that import any of `modules`,
-        transitively."""
-        reverse: dict[str, set[str]] = {}
-        for file in sorted((self.root / "blorp").rglob(f"*{BLORP_SOURCE_SUFFIX}")):
-            path = file.relative_to(self.root).as_posix()
-            imported = self.imports(path)
-            for target in imported.targets if imported else ():
-                reverse.setdefault(target, set()).add(path)
-        seen: set[str] = set()
-        pending = list(modules)
-        while pending:
-            for importer in reverse.get(pending.pop(), ()):
-                if importer not in seen:
-                    seen.add(importer)
-                    pending.append(importer)
-        return seen
 
 
 def is_candidate_module(path: str) -> bool:
@@ -357,7 +271,13 @@ def _tree_path_commands(
         tuple(sorted(suites.values(), key=lambda item: item.path)),
         selection.checks,
     )
-    commands = [shlex.join(command) for command in _focused_action_commands(focused)]
+    # No `make`: a tree edit leaves `bin/blorp` FRESH. The status check catches a
+    # binary that is stale for another reason, such as a rebase onto new compiler
+    # sources (it exits 1 for STALE and 2 for UNKNOWN).
+    commands = [shlex.join(["scripts/compiler-build-status", "--quiet"])]
+    commands.extend(
+        shlex.join(command) for command in _focused_action_commands(focused, rebuild=False)
+    )
     # The parity script and its tests are Python: their own tests run directly.
     if any(path in TREE_PATH_TOOLING for path in tree_paths):
         commands.append(shlex.join(["python3", "-m", "unittest", PARITY_SCRIPT_TESTS]))
@@ -905,9 +825,11 @@ def _plan_check_command(check: Check) -> list[str]:
     return list(check.command)
 
 
-def _focused_action_commands(selection: Selection) -> list[list[str]]:
+def _focused_action_commands(selection: Selection, rebuild: bool = True) -> list[list[str]]:
+    """The commands that run `selection`. `rebuild` is false when `bin/blorp` is
+    not made from what changed (the tree path), so it needs no `make`."""
     commands: list[list[str]] = []
-    if selection.suites or selection.checks:
+    if rebuild and (selection.suites or selection.checks):
         commands.append(["make"])
     if selection.suites:
         timeout = os.environ.get("BLORP_COMPILER_TEST_TIMEOUT", DEFAULT_SUITE_TIMEOUT_SECONDS)

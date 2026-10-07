@@ -43,6 +43,7 @@ class MiniCompilerCheckRepository:
 		(self.root / "blorp/test/test_compiler/test_stage_09_core").mkdir(parents=True)
 		(self.root / "blorp/test/test_compiler/test_stage_06_typecheck").mkdir(parents=True)
 		shutil.copy(COMPILER_CHECK, self.script)
+		shutil.copy(COMPILER_CHECK.with_name("blorp_import_graph.py"), self.root / "scripts/blorp_import_graph.py")
 		self.script.chmod(0o755)
 		self.write_executable("make", "printf 'make\\n' >> tool-runs.log\n")
 		self.write_executable(
@@ -515,7 +516,7 @@ class CompilerCheckPlanTests(unittest.TestCase):
 
 			self.assertIn("Hand-back gates: tree path only", result.stdout)
 			self.assertIn(
-				f"make; bin/blorp test --timeout 180 {ADAPTER_SUITE} {TREE_SUITE}; "
+				f"scripts/compiler-build-status --quiet; bin/blorp test --timeout 180 {ADAPTER_SUITE} {TREE_SUITE}; "
 				f"python3 -m unittest {PARITY_TESTS}; "
 				"scripts/test --no-build compiler-new compiler-new-parity",
 				result.stdout,
@@ -546,7 +547,7 @@ class CompilerCheckPlanTests(unittest.TestCase):
 			result = repo.run("--changed", "--plan")
 			self.assert_success(result)
 
-			self.assertIn("Hand-back action: scripts/test --no-build compiler-new compiler-new-parity", result.stdout)
+			self.assertIn("Hand-back action: scripts/compiler-build-status --quiet; scripts/test --no-build compiler-new compiler-new-parity", result.stdout)
 
 	def test_old_parser_change_selects_compiler_blorp_and_no_tree_hand_back(self) -> None:
 		with TreePathRepository() as repo:
@@ -829,7 +830,7 @@ class CompilerCheckPlanTests(unittest.TestCase):
 			self.assertEqual(
 				tree_only["hand_back"]["commands"],
 				[
-					"make",
+					"scripts/compiler-build-status --quiet",
 					f"bin/blorp test --timeout 180 {ADAPTER_SUITE} {TREE_SUITE}",
 					"scripts/test --no-build compiler-new compiler-new-parity",
 				],

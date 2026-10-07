@@ -57,13 +57,15 @@ scripts/compiler-check --changed --plan   # prints "Hand-back gates: tree path o
 ```
 
 - **Tree path only** (every changed path is tree path; docs and
-  `benchmarks/results` do not count): `make`, `bin/blorp test` on the suites that
+  `benchmarks/results` do not count): `bin/blorp test` on the suites that
   import any changed Blorp file (the plan prints them), then
   `scripts/test --no-build compiler-new compiler-new-parity`. No full
-  `compiler-blorp`. `make` is there only for build-status freshness: the tree
-  code is no longer in `bin/blorp`, but the build inputs are every file under
-  `blorp/src`, so a tree edit makes it STALE although it rebuilds the same
-  program.
+  `compiler-blorp`, and no `make`: the tree code is not a build input
+  (`scripts/blorp-build-inputs sources` lists the inputs), so a tree edit
+  leaves `scripts/compiler-build-status` FRESH. The plan starts the hand-back
+  with `scripts/compiler-build-status --quiet`, which fails if the binary is
+  stale for another reason (a rebase onto new compiler sources, a checkout never
+  built); run `make` then.
 - **Broad** (anything else: the old parser, the adapter, the lexer, diagnostics,
   a path the import graph cannot place): `scripts/test compiler-new
   compiler-new-parity compiler-blorp`, plus the focused checks the same plan lists.

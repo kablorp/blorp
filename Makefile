@@ -5,7 +5,13 @@
 STANDARD_LIBRARY_SOURCE_ROOT := standard_library/src
 STANDARD_LIBRARY_TEST_ROOT := standard_library/test
 STANDARD_LIBRARY_SOURCES := $(shell find $(STANDARD_LIBRARY_SOURCE_ROOT) -name '*.brp' 2>/dev/null)
-BLORP_CLI_SOURCE := blorp/src/main.brp
+# Prints the CLI's entry module and the Blorp sources and C headers its build
+# hashes: the modules `bin/blorp` is built from, not every file under blorp/src.
+# scripts/compiler-build-status reads the same lists from the same script.
+BLORP_BUILD_INPUTS := scripts/blorp-build-inputs
+# Recursively expanded, so the script runs only in the recipe that compiles it
+# and not in every make invocation and sub-make.
+BLORP_CLI_SOURCE = $(shell $(BLORP_BUILD_INPUTS) entry)
 BLORP_CLI_BUILD_DIR := blorp/build/_build/blorp-cli
 BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
 BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
@@ -265,7 +271,7 @@ $(BLORP_CLI_BUILD_STAMP_OBJECT): blorp-cli-build-stamp-force $(BLORP_CLI_BUILD_S
 prepare-blorp-cli-build-stamp: $(BLORP_CLI_BUILD_STAMP_OBJECT)
 
 # Generate the compiler C separately so CI reports self-hosting time independently.
-generate-blorp-cli-c: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP_CLI_SOURCE)
+generate-blorp-cli-c: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE)
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	@set -e; \
 	bootstrap_compiler="$${BLORP_BOOTSTRAP_COMPILER_BIN:-}"; \
@@ -283,9 +289,9 @@ generate-blorp-cli-c: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(
 	tmp_c_hash="$(BLORP_CLI_C_HASH).tmp"; \
 	trap 'rm -f "$$input_manifest_tmp" "$$tmp_c" "$$tmp_input_hash" "$$tmp_c_hash"' EXIT; \
 	rm -f "$$input_manifest_tmp" "$$tmp_c" "$$tmp_input_hash" "$$tmp_c_hash"; \
+	source_inputs=$$("$(BLORP_BUILD_INPUTS)" sources); \
 	{ \
-		find blorp/src -name '*.brp' -type f -print; \
-		find $(STANDARD_LIBRARY_SOURCE_ROOT) -name '*.brp' -type f -print; \
+		printf '%s\n' "$$source_inputs"; \
 		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_MANIFEST_TOOL)"; \
 	} | LC_ALL=C sort -u | "$(BLORP_CLI_MANIFEST_TOOL)" write-inputs \
 		--root . \
@@ -328,10 +334,10 @@ prepare-blorp-cli-c: generate-blorp-cli-c $(BLORP_CLI_RUNTIME_SOURCES_C)
 	input_manifest_tmp="$(BLORP_CLI_BUILD_INPUT_MANIFEST).tmp"; \
 	trap 'rm -f "$$input_manifest_tmp"' EXIT; \
 	rm -f "$$input_manifest_tmp"; \
+	source_inputs=$$("$(BLORP_BUILD_INPUTS)" sources); \
+	header_inputs=$$("$(BLORP_BUILD_INPUTS)" headers); \
 	{ \
-		find blorp/src -name '*.brp' -type f -print; \
-		find blorp/src -name '*.h' -type f -print; \
-		find $(STANDARD_LIBRARY_SOURCE_ROOT) -name '*.brp' -type f -print; \
+		printf '%s\n' "$$source_inputs" "$$header_inputs"; \
 		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_MANIFEST_TOOL)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" "$(BLORP_BUILD_SOURCE_GENERATOR_SOURCE)" blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c blorp/src/lib/runtime/native/minicoro.h; \
 	} | LC_ALL=C sort -u | "$(BLORP_CLI_MANIFEST_TOOL)" write-inputs \
 		--root . \
@@ -488,7 +494,7 @@ runtime-test: all
 
 # Fast local validation path for compiler work
 smoke: all
-	$(BLORP_INSTALLED_BIN) check --no-format blorp/src/main.brp
+	$(BLORP_INSTALLED_BIN) check --no-format $(BLORP_CLI_SOURCE)
 
 quality:
 	$(MAKE) hygiene-check
@@ -545,6 +551,7 @@ tooling-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_unicode_case_map.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_profile_dense_ids.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_cancellation_registry_completeness.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_blorp_build_inputs.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_blorp_cli_embedded_manifest.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_blorp_source_layout.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_compiler_build_status.py

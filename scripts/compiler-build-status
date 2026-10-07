@@ -23,7 +23,8 @@ BUILD_BIN = BUILD_DIR / "blorp"
 GENERATED_C = BUILD_DIR / "blorp_cli_main.c"
 RUNTIME_SOURCES_C = BUILD_DIR / "runtime_sources.c"
 LSP_NATIVE_RUNTIME_C = Path("blorp/src/lsp/server/native_runtime.c")
-STANDARD_LIBRARY_SOURCE_ROOT = Path("standard_library/src")
+# Beside this script, which is the checkout's own `scripts/` when run normally.
+BUILD_INPUTS_SCRIPT = Path(__file__).resolve().parent / "blorp-build-inputs"
 BOOTSTRAP_SCRIPT = Path("scripts/blorp-compiler-bootstrap")
 MANIFEST_TOOL = Path("scripts/blorp-cli-embedded-manifest")
 SPLITTER_SCRIPT = Path("scripts/split-generated-c")
@@ -267,15 +268,24 @@ def expected_build_info(root: Path) -> dict[str, str]:
 	}
 
 
-def find_files(root: Path, directory: Path, suffix: str) -> list[Path]:
-	full_directory = root / directory
-	if not full_directory.is_dir():
-		return []
-	return [
-		path.relative_to(root)
-		for path in full_directory.rglob(f"*{suffix}")
-		if path.is_file()
-	]
+def blorp_build_inputs(root: Path, kind: str, quiet: bool) -> list[Path]:
+	"""The `sources` or `headers` build inputs, from the script `make` reads them
+	from: one list, so the two cannot disagree about what counts as an input. Its
+	stderr note (every module counts because the import graph did not resolve) is
+	passed through unless `quiet`."""
+	try:
+		completed = subprocess.run(
+			[sys.executable, str(BUILD_INPUTS_SCRIPT), "--root", str(root), kind],
+			text=True,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.DEVNULL if quiet else None,
+			check=False,
+		)
+	except OSError as error:
+		raise StatusError(f"could not run {BUILD_INPUTS_SCRIPT}") from error
+	if completed.returncode != 0:
+		raise StatusError(f"{BUILD_INPUTS_SCRIPT} {kind} failed")
+	return [Path(line) for line in completed.stdout.splitlines()]
 
 
 def resolve_bootstrap_compiler(root: Path) -> str:
@@ -496,21 +506,23 @@ def runtime_config_hash(root: Path, runtime_optimization: str, diagnostics: str)
 	return sha256_bytes("".join(records).encode("utf-8"))
 
 
-def generated_c_input_paths(root: Path, bootstrap_compiler: str) -> list[Path | str]:
+def generated_c_input_paths(sources: list[Path], bootstrap_compiler: str) -> list[Path | str]:
 	return [
-		*find_files(root, Path("blorp/src"), ".brp"),
-		*find_files(root, STANDARD_LIBRARY_SOURCE_ROOT, ".brp"),
+		*sources,
 		bootstrap_compiler,
 		BOOTSTRAP_SCRIPT,
 		MANIFEST_TOOL,
 	]
 
 
-def build_input_paths(root: Path, bootstrap_compiler: str) -> list[Path | str]:
+def build_input_paths(
+	sources: list[Path],
+	headers: list[Path],
+	bootstrap_compiler: str,
+) -> list[Path | str]:
 	return [
-		*find_files(root, Path("blorp/src"), ".brp"),
-		*find_files(root, Path("blorp/src"), ".h"),
-		*find_files(root, STANDARD_LIBRARY_SOURCE_ROOT, ".brp"),
+		*sources,
+		*headers,
 		bootstrap_compiler,
 		BOOTSTRAP_SCRIPT,
 		MANIFEST_TOOL,
@@ -544,11 +556,13 @@ def verify_hash_file(path: Path, expected: str, unknown_reason: str) -> None:
 		raise StatusError(unknown_reason)
 
 
-def status(root: Path) -> StatusResult:
+def status(root: Path, quiet: bool = False) -> StatusResult:
 	try:
 		require_executable(root / INSTALLED_BIN)
 		require_executable(root / BUILD_BIN)
 		bootstrap_compiler = resolve_bootstrap_compiler(root)
+		sources = blorp_build_inputs(root, "sources", quiet)
+		headers = blorp_build_inputs(root, "headers", quiet)
 		expected_build_info_lines = expected_build_info(root)
 		actual_build_info_lines = generated_build_info_lines(root)
 		if actual_build_info_lines != expected_build_info_lines:
@@ -560,7 +574,7 @@ def status(root: Path) -> StatusResult:
 
 		generated_manifest = input_manifest_bytes(
 			root,
-			generated_c_input_paths(root, bootstrap_compiler),
+			generated_c_input_paths(sources, bootstrap_compiler),
 		)
 		stale = verify_manifest_current(
 			root,
@@ -588,7 +602,7 @@ def status(root: Path) -> StatusResult:
 
 		build_manifest = input_manifest_bytes(
 			root,
-			build_input_paths(root, bootstrap_compiler),
+			build_input_paths(sources, headers, bootstrap_compiler),
 		)
 		stale = verify_manifest_current(
 			root,
@@ -711,7 +725,7 @@ def main(arguments: list[str]) -> int:
 	parser = argparse.ArgumentParser(description=__doc__)
 	parser.add_argument("--quiet", action="store_true")
 	options = parser.parse_args(arguments)
-	result = status(Path.cwd())
+	result = status(Path.cwd(), options.quiet)
 	if not options.quiet:
 		sys.stdout.write(format_result(result))
 		if result.state == "FRESH":
