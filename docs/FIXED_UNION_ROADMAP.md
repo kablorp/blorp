@@ -1051,6 +1051,13 @@ Option/Result/nested-union niches: `None`, `Some(None)`, and `Some(Some(value))`
 remain distinct. P4d extends admitted layouts through real storage/call/capture
 boundaries. Each is a bounded measured change.
 
+The first preparatory cut shares the runtime stack-Option suffix catalog between
+specialization, runtime-provided typedef classification and immediate Result
+payload admission. Result retains its named-Void exclusion and pointer/handle
+exceptions; C type spellings and erased boxes retain their distinct ABI sets.
+This behavior-preserving catalog consolidation does not admit new union layouts
+or complete the shared concrete representation plan above.
+
 ```bash
 bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_type_policy.brp
 bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_match.brp
