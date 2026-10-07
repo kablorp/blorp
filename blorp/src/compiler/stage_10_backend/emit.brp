@@ -23647,6 +23647,21 @@ private pure func find_union_decl(
 	found
 
 
+private pure func find_enum_decl(
+	decls: List[CoreDecl],
+	type_name: String,
+) -> Option[CoreEnumDecl]:
+	var found: Option[CoreEnumDecl] = None
+	for decl in decls:
+		match decl:
+			EnumDecl(enum_decl):
+				if found.is_none() and enum_decl.name == type_name:
+					found = Some(enum_decl)
+			_:
+				void
+	found
+
+
 private pure func find_union_variant(
 	variants: List[CoreUnionVariant],
 	variant_name: String,
@@ -23793,6 +23808,55 @@ private pure func channel_send_attempt_constructors(
 		sealed = sealed,
 		timed_out = timed_out,
 	})
+
+
+-- Scalar enum-lane constructors are constant macros, not callable managed
+-- union constructors. Require the issued id before selecting its symbol.
+private pure func scalar_channel_variant_name(
+	decl: CoreEnumDecl,
+	variant_name: String,
+	authority: CEmissionSymbolAuthority,
+) -> Option[String]:
+	var found: Option[String] = None
+	for variant in decl.variants:
+		if variant.name == variant_name:
+			match variant.def_id:
+				Some(_):
+					found = Some(enum_variant_constructor_symbol(authority, variant))
+				None:
+					void
+	found
+
+
+-- Select the published physical declaration, never a runtime-status integer
+-- or a source spelling. Payload receives retain the existing managed lane.
+private pure func channel_attempt_constructors_for_return(
+	decls: List[CoreDecl],
+	return_type: CoreType,
+	layout: CoreSpecializeLayout,
+	authority: CEmissionSymbolAuthority,
+) -> Option[ChannelAttemptConstructors]:
+	match return_type:
+		EnumType(name):
+			decl ?= find_enum_decl(decls, name)
+			if not decl.type_params.is_empty():
+				None
+			else:
+				Some({
+					recv_value = None,
+					recv_would_block = None,
+					recv_sealed = None,
+					recv_timed_out = None,
+					send_accepted = scalar_channel_variant_name(decl, "SendAccepted", authority),
+					send_would_block = scalar_channel_variant_name(decl, "SendWouldBlock", authority),
+					send_sealed = scalar_channel_variant_name(decl, "SendSealed", authority),
+					send_timed_out = scalar_channel_variant_name(decl, "SendTimedOut", authority),
+					recv_value_uses_release_mask = False
+				})
+		_:
+			type_name ?= union_type_name(return_type)
+			decl ?= find_union_decl(decls, type_name)
+			Some(channel_attempt_constructors(decl, layout, authority))
 
 
 private pure func channel_recv_attempt_constructors(
@@ -24098,11 +24162,10 @@ private pure func emit_channel_attempt_user_function(
 		_:
 			None
 
-	type_name ?= union_type_name(func_info.return_type)
-	union_decl ?= find_union_decl(decls, type_name)
 	layout ?= emission_context.specialize_layout
-	constructors: ChannelAttemptConstructors = channel_attempt_constructors(
-		union_decl,
+	constructors ?= channel_attempt_constructors_for_return(
+		decls,
+		func_info.return_type,
 		layout,
 		emission_context.symbol_authority,
 	)

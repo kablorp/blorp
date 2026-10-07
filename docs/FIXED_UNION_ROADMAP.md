@@ -235,13 +235,94 @@ appears, release assets are incomplete, or the build still uses an incapable pin
 **Boundary:** compiler/std/pkg/examples, embedded fixtures/tests/docs, headers/env,
 Core/lowering/CTFE. Bounded owner migrations precede source-family removal.
 
+### User contract: default union equality (planned complete delivery)
+
+The latest user decision applies to every union source form, not only the
+payload-free bootstrap precursor. A union has default nominal structural
+`Equatable` exactly when **all payload types of all variants are Equatable**.
+Payload-free variants impose no payload obligation. This is a planned contract;
+it is not evidence that the complete payload-bearing implementation exists.
+
+- Equality requires the same nominal union type and concrete type arguments;
+  structurally similar declarations do not become interchangeable.
+- Compare the variant tag first. Different tags compare unequal; equal tags
+  compare only that variant's active fields, in declaration order.
+- Compare each field using its selected `Equatable` implementation, including
+  caller-selected custom payload equality. Object identity or raw field bits
+  cannot replace that implementation.
+- An applicable explicit union `Equatable` implementation wins over the
+  default. Its behavior is not overwritten by tag or structural equality.
+- Generic eligibility is conditional on the actual payload obligations.
+  A generic body may use the default only with sufficient bounds/evidence;
+  a concrete instantiation must discharge those same obligations.
+- Eligibility examines every variant, even when a particular comparison uses
+  a payload-free variant. Execution reads only the active variant's fields.
+- CTFE and runtime must select the same implementation and produce the same
+  result. Constructor-shaped compile-time values alone do not prove this.
+- `Hashable` is **not automatically derived from Equatable**. This decision
+  adds no union hashing policy or automatic hash implementation.
+
+The intended default is illustrated by a union without an authored Eq impl:
+
+```blorp
+union Shape:
+    Circle(Int)
+    Named(String)
+    Empty
+
+-- Planned default Eq: Int and String both satisfy the payload obligations.
+-- Circle(1) == Circle(1)       True
+-- Circle(1) == Circle(2)       False
+-- Circle(1) == Named("1")      False
+-- Empty == Empty             True
+```
+
+A payload record does not acquire Eq merely because it is inside a union:
+
+```blorp
+record Point {x: Int}
+
+union Located:
+    At(Point)
+    Nowhere
+
+-- Without Point's Equatable impl, Located has no default Eq.
+-- This also rejects Nowhere == Nowhere: eligibility is declaration-wide.
+
+implements Equatable for Point:
+    pure func equals(left: Point, right: Point) -> Bool:
+        left.x == right.x
+
+    pure func not_equals(left: Point, right: Point) -> Bool:
+        not equals(left, right)
+
+-- With this selected Point impl, Located's planned default compares At fields
+-- through that impl; a custom Point equality must likewise remain observable.
+```
+
+**Current bounded precursor: locally validated.** Non-generic, wholly payload-free
+ordinary/fixed union scalar representation and default nominal tag Eq pass normal
+pinned make, compiler/leak/sanitizer gates and O2 fixpoint; see the
+[scalar bootstrap evidence](../benchmarks/results/scalar_union_bootstrap.md).
+Release publication/pinning and the separate retirement branch's gates remain
+pending. Payload-bearing, generic and recursive default derivation,
+selected payload-evidence transport and CTFE/runtime coherence remain pending.
+The first migration check's missing `Equatable` for `TriviaKind` remains historical
+RED evidence; its later tag-only repair does not establish the full contract.
+The tag-only cut must not be reported as
+completion of this full contract. No checked `fixed` placement or no-allocation
+guarantee follows from either delivery.
+
 ### P2a. Prepare common semantics and native ABI before conversion
 
 Derive payload-free shape from accepted variants, never the `fixed` qualifier.
 Common rules preserve automatic `Equatable`/`Hashable`, comparison/hashing, string
 conversion, matching, imported/qualified constructors, and CTFE equally for
-ordinary/fixed unions. Payload-bearing unions gain no automatic traits;
-generics follow ordinary rules. Keep four independently reviewable vertical
+ordinary/fixed unions. In the current tag-only checkpoint, payload-bearing
+unions gain no automatic traits. The agreed follow-up supplies default Eq iff
+all declared payload types have selected Equatable evidence, conditionally for
+generic instantiations; automatic Hash is not established by that decision.
+Keep four independently reviewable vertical
 slices: common Eq, common Hash, canonical native ABI, and foreign admission.
 No slice authorizes declaration conversion or a public ABI annotation framework.
 Completed payload-free shape is independent of default eligibility. The first Eq
@@ -453,7 +534,11 @@ The concrete Eq regression asserts `cached == choose(True)` and
 `cached != choose(False)`; generic `same` applied to the non-generic type is a
 separate dispatch checkpoint requiring the caller-selected witness mechanism above.
 Repeat with ordinary spelling and imported/qualified constructors; keep a
-payload-bearing negative control. The Hash slice adds Dict/Set lookup,
+payload-bearing negative control while the payload derivation slice is pending.
+For the complete contract above, the negative must instead contain a
+non-Equatable payload; an Int/String-only payload union becomes positive.
+Preserve the present fixture expectations until that implementation lands.
+The separate Hash slice adds Dict/Set lookup,
 membership, replacement/removal,
 and cleanup across CTFE/runtime values. The phantom-generic follow-up repeats
 these controls for concrete payload-free generic instantiations.

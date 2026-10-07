@@ -1256,6 +1256,15 @@ ownership, and storage rules, including type and dimension parameters. It
 promises no stack placement, inline payload, absence of allocation or boxing,
 or native by-value ABI.
 
+Non-generic unions whose entire declaration is payload-free use scalar tag
+storage with either spelling. They have default nominal equality: two values
+of the same union are equal exactly when their variant tags agree. An explicit
+`Equatable` implementation overrides that default, including generic calls.
+This equality capability does not imply `Hashable`; ordinary and fixed unions
+still require an explicit hashing implementation. Payload-bearing and generic
+union equality derivation is not implemented yet. Scalar tag storage is not
+the planned checked `fixed union` payload guarantee.
+
 Both union spellings let you declare a payload-free variant as `Empty` or
 `Empty()`; the formatter prints `Empty`. The constructor is a value: refer to
 it as `Empty`, not a call `Empty()`. Enum cases remain bare names without parentheses.

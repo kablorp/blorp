@@ -22,20 +22,21 @@ import:
 	../stage_08_core_lower/entrypoint: ENTRYPOINT_NAME, USER_MAIN_NAME_PREFIX
 	../stage_08_core_lower/identity: CORE_PURE_OVERLOAD_SUFFIX, core_module_member_prefix
 	closure: ETA_NAME_PREFIX, LAMBDA_NAME_PREFIX, TASK_NAME_PREFIX
-	hash_key_callbacks: HASH_KEY_EQUALS_ADAPTER_NAME, HASH_KEY_HASH_ADAPTER_NAME
+	hash_key_callbacks: HASH_KEY_EQUALS_ADAPTER_NAME, HASH_KEY_HASH_ADAPTER_NAME, NATIVE_TAG_EQUALITY_CALLBACK_NAME
 	ir:
 		CoreCopyDeclarations,
 		CoreDecl(FunctionDecl, ImplDecl, TraitDecl),
 		CoreDeclarationIndex,
 		CoreDeclaredOrigin(
 			Entrypoint, EtaExpansion, HashKeySlotAdapter, HoistedLambda, HoistedTask, ImplMethod,
-			MonoInstance, ProjectedImplMethod, PureVariant, SourceFunction,
+			MonoInstance, NativeTagEqualityCallback, ProjectedImplMethod, PureVariant, SourceFunction,
 		),
 		CoreEntrypointKind(ProgramWrapperEntrypoint, UserMainEntrypoint),
 		CoreFunction,
 		CoreFunctionOrigin(ConsumingClone, Declared, Synthesized),
 		CoreModuleOrigin(NoSourceModule, SourceModule),
 		CoreProgram,
+		CoreType(EnumType, NamedType),
 		core_declared_member,
 		core_function_declared_origin,
 	synth_name: MONO_NAME_MARKER
@@ -97,6 +98,7 @@ private union NameShape:
 	TaskName(Option[Int])
 	EtaName
 	HashKeyAdapterName
+	NativeTagEqualityName
 	MonoName
 	PureName
 	TraitMethodName
@@ -137,6 +139,7 @@ private ORIGIN_CASE_NAMES: List[String] = [
 	"HoistedTask",
 	"EtaExpansion",
 	"HashKeySlotAdapter",
+	"NativeTagEqualityCallback",
 	"Entrypoint",
 ]
 
@@ -159,6 +162,8 @@ private pure func declared_case_name(origin: CoreDeclaredOrigin) -> String:
 			"EtaExpansion"
 		HashKeySlotAdapter(_):
 			"HashKeySlotAdapter"
+		NativeTagEqualityCallback(_):
+			"NativeTagEqualityCallback"
 		Entrypoint(_):
 			"Entrypoint"
 
@@ -220,6 +225,8 @@ private pure func name_shape(
 		EtaName
 	else if name == HASH_KEY_HASH_ADAPTER_NAME or name == HASH_KEY_EQUALS_ADAPTER_NAME:
 		HashKeyAdapterName
+	else if name == NATIVE_TAG_EQUALITY_CALLBACK_NAME:
+		NativeTagEqualityName
 	else if has_mono_marker_after_module_prefix(function_info, name):
 		MonoName
 	else if strip_pure_suffix(name) != name:
@@ -277,6 +284,12 @@ private pure func shape_and_origin_agree(shape: NameShape, origin: CoreDeclaredO
 					True
 				_:
 					False
+		NativeTagEqualityName:
+			match origin:
+				NativeTagEqualityCallback(_):
+					True
+				_:
+					False
 		MonoName:
 			match origin:
 				MonoInstance(_, _):
@@ -317,6 +330,8 @@ private pure func shape_label(shape: NameShape) -> String:
 			"an eta expansion"
 		HashKeyAdapterName:
 			"a hash-key slot adapter"
+		NativeTagEqualityName:
+			"a native tag equality callback"
 		MonoName:
 			"a mono instance"
 		PureName:
@@ -383,16 +398,41 @@ private pure func table_module_disagreement(
 				None
 
 
+private pure func native_tag_callback_disagreement(
+	function_info: CoreFunction,
+) -> Option[String]:
+	match core_function_declared_origin(function_info.origin):
+		NativeTagEqualityCallback(target):
+			match (target, function_info.params):
+				(EnumType(_), [left, right]):
+					if (
+						left.typ != target or right.typ != target
+						or function_info.return_type != NamedType("Bool", [])
+						or not function_info.type_params.is_empty()
+					):
+						Some("native tag equality callback requires matching scalar parameters and Bool return")
+					else:
+						None
+				_:
+					Some("native tag equality callback requires a scalar target and two parameters")
+		_:
+			None
+
+
 private pure func function_disagreement(
 	function_info: CoreFunction,
 	trait_names: Dict[String, Bool],
 	modules: ModuleCheckScope,
 ) -> Option[String]:
-	match module_disagreement(function_info, modules):
+	match native_tag_callback_disagreement(function_info):
 		Some(message):
 			Some(message)
 		None:
-			name_disagreement(function_info, trait_names)
+			match module_disagreement(function_info, modules):
+				Some(message):
+					Some(message)
+				None:
+					name_disagreement(function_info, trait_names)
 
 
 private pure func name_disagreement(

@@ -8,14 +8,14 @@ import:
 		bound_pinned_hash_container_constructor,
 		build_hash_key_adapter_table,
 		mint_hash_key_callbacks,
-	../../../src/compiler/stage_09_core/runtime_callbacks: build_runtime_callback_table
+	../../../src/compiler/stage_09_core/runtime_callbacks: build_runtime_callback_table, find_runtime_callback
 	../../../src/compiler/stage_09_core/specialize_layout: build_specialize_layout
 	../../../src/compiler/stage_09_core/ir:
 		CoreBinderOrigin(AuthoredBinder),
 		CoreCallKind(UserCall),
-		CoreDecl(FunctionDecl),
-		CoreDeclaredOrigin(HashKeySlotAdapter, ProjectedImplMethod),
-		CoreExpr(CallExpr, LiteralExpr, UnboxExpr, VarExpr),
+		CoreDecl(FunctionDecl, ImplDecl),
+		CoreDeclaredOrigin(HashKeySlotAdapter, ImplMethod, NativeTagEqualityCallback, ProjectedImplMethod),
+		CoreExpr(BinaryExpr, CallExpr, LiteralExpr, UnboxExpr, VarExpr),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
 		CoreFunctionOrigin(Declared),
@@ -29,7 +29,7 @@ import:
 		CoreParam,
 		CoreProgram,
 		CoreRuntimeCallbackRole(EquatableEqualsCallback, HashableHashCallback),
-		CoreType(HeapRecordType, NamedType),
+		CoreType(EnumType, HeapRecordType, NamedType),
 		CoreUnboxKind(PointerUnbox, PrimUnbox, StructUnbox),
 		CoreVar,
 		core_function_declared_origin,
@@ -387,9 +387,73 @@ pure func test_leaves_pointer_key_without_adapters_unbound() -> Bool:
 			False
 
 
+private pure func nested_callback(decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function):
+			match core_function_declared_origin(function.origin):
+				ProjectedImplMethod(trait_id, method_id, target, role):
+					ImplDecl({
+						trait_name = "fixture",
+						for_type = target,
+						type_params = [],
+						methods = [{ function | origin = Declared(ImplMethod(trait_id, method_id, role)) }],
+						loc = synthetic_core_source_loc(),
+					})
+				_: decl
+		_: decl
+
+
+func test_callback_identity_survives_impl_projection() -> Bool:
+	projected = build_runtime_callback_table(program_with([hash_impl(POINT_TYPE), equals_impl(POINT_TYPE)]))
+	nested = build_runtime_callback_table(program_with([
+		nested_callback(hash_impl(POINT_TYPE)),
+		nested_callback(equals_impl(POINT_TYPE)),
+		FunctionDecl(function_info("Hashable_hash_Point", 99, [], INT_TYPE, int_literal(0))),
+	]))
+	(
+		find_runtime_callback(projected, HashableHashCallback, POINT_TYPE) == Some(HASH_IMPL_DEF_ID)
+		and find_runtime_callback(nested, HashableHashCallback, POINT_TYPE) == Some(HASH_IMPL_DEF_ID)
+		and find_runtime_callback(projected, EquatableEqualsCallback, POINT_TYPE) == Some(EQUALS_IMPL_DEF_ID)
+		and find_runtime_callback(nested, EquatableEqualsCallback, POINT_TYPE) == Some(EQUALS_IMPL_DEF_ID)
+		and nested.hashable_hash.length() == 1
+		and nested.equatable_equals.length() == 1
+	)
+
+
+private pure func native_equality_count(program: CoreProgram, key_type: CoreType) -> Int:
+	var count: Int = 0
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				match core_function_declared_origin(function_info.origin):
+					NativeTagEqualityCallback(target):
+						if target == key_type:
+							count += 1
+					_:
+						void
+			_:
+				void
+	count
+
+
+func test_hash_only_scalar_mints_native_equality_once() -> Bool:
+	key_type = EnumType("TagKey")
+	result = minted([hash_impl(key_type)])
+	callbacks = build_runtime_callback_table(result.program)
+	second = mint_hash_key_callbacks(result.program, result.next_def_id)
+	(
+		native_equality_count(result.program, key_type) == 1
+		and result.next_def_id == FIRST_FREE_DEF_ID + 3
+		and find_runtime_callback(callbacks, EquatableEqualsCallback, key_type) == Some(FIRST_FREE_DEF_ID)
+		and native_equality_count(second.program, key_type) == 1
+	)
+
+
 tests: TestSuite = {
 	description = "Core hash-key callback adapters",
 	tests = [
+		("hash-only scalar mints native equality once", test_hash_only_scalar_mints_native_equality_once),
+		("callback identity survives impl projection", test_callback_identity_survives_impl_projection),
 		("mints record pointer slot adapters", test_mints_record_slot_adapters),
 		("mints nothing without hash impls", test_mints_nothing_without_hash_impls),
 		("needs both impls to mint", test_needs_both_impls_to_mint),

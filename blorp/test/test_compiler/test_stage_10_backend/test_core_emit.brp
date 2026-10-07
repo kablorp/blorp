@@ -15274,6 +15274,97 @@ pure func test_emit_channel_allocated_box_release_callbacks() -> Bool:
 	)
 
 
+pure func scalar_send_attempt_decl() -> CoreEnumDecl:
+	{
+		abi_type = None,
+		name = "SendAttempt",
+		type_params = [],
+		variants = [
+			{ name = "SendAccepted", tag = 7, def_id = Some(601) },
+			{ name = "SendWouldBlock", tag = 3, def_id = Some(602) },
+			{ name = "SendSealed", tag = 11, def_id = Some(603) },
+			{ name = "SendTimedOut", tag = 5, def_id = Some(604) },
+		],
+		loc = synthetic_core_source_loc()
+	}
+
+
+pure func scalar_send_attempt_function(name: String, builtin_name: String, timed: Bool, def_id: Int) -> CoreFunction:
+	params = if timed:
+		[channel_string_param("ch"), string_param("value"), int_param("timeout")]
+	else:
+		[channel_string_param("ch"), string_param("value")]
+	builtin_call_function(name, builtin_name, params, EnumType("SendAttempt"), def_id)
+
+
+pure func test_emit_scalar_channel_send_attempt_uses_issued_tag_constants() -> Bool:
+	artifact = emit_source_spelled_c_artifact({
+		decls = [
+			EnumDecl(scalar_send_attempt_decl()),
+			FunctionDecl(scalar_send_attempt_function("send_timeout_attempt", "blorp_channel_send_timeout_attempt", True, 242)),
+			FunctionDecl(scalar_send_attempt_function("try_send_attempt", "blorp_channel_try_send_attempt", False, 241)),
+		],
+		foreign_includes = [],
+		source_files = []
+	})
+	(
+		artifact.c_code.contains("long send_timeout_attempt(blorp_Channel* ch, blorp_String* value, long timeout)")
+		and artifact.c_code.contains("long try_send_attempt(blorp_Channel* ch, blorp_String* value)")
+		and artifact.c_code.contains("#define __def_601_SendAccepted 7L")
+		and artifact.c_code.contains("#define __def_602_SendWouldBlock 3L")
+		and artifact.c_code.contains("#define __def_603_SendSealed 11L")
+		and artifact.c_code.contains("#define __def_604_SendTimedOut 5L")
+		and artifact.c_code.contains("__chan_send_result_242 = __def_601_SendAccepted;")
+		and artifact.c_code.contains("__chan_send_result_242 = __def_602_SendWouldBlock;")
+		and artifact.c_code.contains("__chan_send_result_242 = __def_603_SendSealed;")
+		and artifact.c_code.contains("__chan_send_result_242 = __def_604_SendTimedOut;")
+		and artifact.c_code.contains("blorp_channel_try_send_status(ch, value)")
+		and artifact.c_code.contains("blorp_channel_send_timeout_status(ch, value, timeout)")
+		and not artifact.c_code.contains("#error")
+		and not artifact.c_code.contains("SendAttempt*")
+	)
+
+
+pure func test_emit_scalar_channel_attempt_missing_variant_and_recv_fail_closed() -> Bool:
+	decl = scalar_send_attempt_decl()
+	missing = emit_source_spelled_c_artifact({
+		decls = [
+			EnumDecl({ decl | variants = decl.variants.take(3) }),
+			FunctionDecl(scalar_send_attempt_function("missing_send", "blorp_channel_try_send_attempt", False, 241)),
+		],
+		foreign_includes = [],
+		source_files = []
+	})
+	invalid_recv = emit_source_spelled_c_artifact({
+		decls = [
+			EnumDecl(decl),
+			FunctionDecl(builtin_call_function("scalar_recv", "blorp_channel_try_recv_attempt", [channel_string_param("ch")], EnumType("SendAttempt"), 245)),
+		],
+		foreign_includes = [],
+		source_files = []
+	})
+	missing_decl = emit_source_spelled_c_artifact({
+		decls = [FunctionDecl(scalar_send_attempt_function("missing_decl", "blorp_channel_try_send_attempt", False, 241))],
+		foreign_includes = [],
+		source_files = []
+	})
+	missing_id = emit_source_spelled_c_artifact({
+		decls = [
+			EnumDecl({ decl | variants = decl.variants.map(func(variant): { variant | def_id = None }) }),
+			FunctionDecl(scalar_send_attempt_function("missing_id", "blorp_channel_try_send_attempt", False, 241)),
+		],
+		foreign_includes = [],
+		source_files = []
+	})
+	(
+		missing.c_code.contains("#error \"Blorp backend could not emit function body: missing_send\"")
+		and invalid_recv.c_code.contains("#error \"Blorp backend could not emit function body: scalar_recv\"")
+		and missing_decl.c_code.contains("#error \"Blorp backend could not emit function body: missing_decl\"")
+		-- Missing issued IDs are rejected by final symbol projection before emission.
+		and missing_id.c_code == "/* variant `SendAccepted` of `SendAttempt` has no definition id at final C projection */"
+	)
+
+
 pure func test_emit_channel_attempt_wrappers_use_prepared_backend() -> Bool:
 	program: CoreProgram = {
 		decls = [
@@ -29381,6 +29472,8 @@ tests: TestSuite = {
 			"emit channel attempt wrappers use prepared backend",
 			test_emit_channel_attempt_wrappers_use_prepared_backend,
 		),
+		("scalar channel send attempts use issued tag constants", test_emit_scalar_channel_send_attempt_uses_issued_tag_constants),
+		("scalar channel attempts reject missing variants and receive", test_emit_scalar_channel_attempt_missing_variant_and_recv_fail_closed),
 		(
 			"emit RecvAttempt value-record storage release mask",
 			test_emit_recv_attempt_point_storage_release_mask,

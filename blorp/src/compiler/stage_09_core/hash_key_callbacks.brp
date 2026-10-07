@@ -15,10 +15,11 @@
 -- container uses.
 import:
 	ir:
+		CoreBinaryOp(EqualOp),
 		CoreCallKind(UserCall),
 		CoreDecl(FunctionDecl),
-		CoreDeclaredOrigin(HashKeySlotAdapter, ProjectedImplMethod),
-		CoreExpr(CallExpr, UnboxExpr, VarExpr),
+		CoreDeclaredOrigin(HashKeySlotAdapter, NativeTagEqualityCallback, ProjectedImplMethod),
+		CoreExpr(BinaryExpr, CallExpr, UnboxExpr, VarExpr),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
 		CoreFunctionOrigin(Declared),
@@ -31,7 +32,7 @@ import:
 		CoreProgram,
 		CoreRuntimeCallbackRole(EquatableEqualsCallback, HashableHashCallback),
 		CoreSourceLoc,
-		CoreType(FunctionType, NamedType),
+		CoreType(EnumType, FunctionType, NamedType),
 		CoreUnboxKind(
 			Float16Unbox, Float32Unbox, FloatUnbox, Int128Unbox, PointerUnbox, PrimUnbox,
 			StructUnbox, UInt128Unbox,
@@ -52,9 +53,14 @@ import:
 		hash_key_strategy,
 		resolve_specialize_type,
 	synth_nodes: core_var
+	trait_resolve: core_trait_impl_type_key
 
 
 private POINTER_TYPE: CoreType = NamedType("Ptr", [])
+
+private BOOL_TYPE: CoreType = NamedType("Bool", [])
+
+NATIVE_TAG_EQUALITY_CALLBACK_NAME: String = "__native_tag_equals"
 
 -- Display names only: an adapter is identified by its origin and emitted by
 -- its definition id. `origin_name_agreement` checks the two agree.
@@ -228,6 +234,57 @@ private pure func adapter_function(
 	}
 
 
+-- Minted after trait resolution: EqualOp here compares physical scalar tags,
+-- not trait dispatch. The origin shares the authored callback type identity.
+private pure func native_tag_equality_callback(key_type: CoreType, def_id: Int) -> CoreFunction:
+	loc: CoreSourceLoc = synthetic_core_source_loc()
+	left: CoreVar = core_var(LEFT_PARAM_NAME)
+	right: CoreVar = core_var(RIGHT_PARAM_NAME)
+	{
+		name = NATIVE_TAG_EQUALITY_CALLBACK_NAME,
+		source_module = None,
+		module = NoSourceModule,
+		type_params = [],
+		params = [
+			{ name = left, typ = key_type, loc = loc },
+			{ name = right, typ = key_type, loc = loc },
+		],
+		return_type = BOOL_TYPE,
+		body = Some(BinaryExpr(EqualOp, VarExpr(left, key_type, loc), VarExpr(right, key_type, loc), BOOL_TYPE, loc)),
+		is_pure = True,
+		function_kind = UserFunction,
+		origin = Declared(NativeTagEqualityCallback(key_type)),
+		def_id = def_id,
+		loc = loc
+	}
+
+
+private pure func native_tag_equality_type(
+	layout: CoreSpecializeLayout,
+	callbacks: CoreRuntimeCallbackTable,
+	type_key: String,
+	hash_impl: CoreFunction,
+) -> Option[CoreType]:
+	match hash_impl.params:
+		[key_param]:
+			key_type: CoreType = resolve_specialize_type(layout, key_param.typ)
+			match key_type:
+				EnumType(_):
+					-- Exact key agreement excludes an opaque alias erased to a tag.
+					-- The table has one hash callback per key: no second dedupe index.
+					if (
+						core_trait_impl_type_key(key_type) == Some(type_key)
+						and find_runtime_callback(callbacks, EquatableEqualsCallback, key_type).is_none()
+					):
+						Some(key_type)
+					else:
+						None
+				_:
+					None
+		_:
+			None
+
+
 ---
 Whether a projected impl method targets a type runtime projection erased: an
 opaque type, whose name no longer resolves to `key_type`, the representation
@@ -255,10 +312,35 @@ are scanned.
 ---
 pure func mint_hash_key_callbacks(program: CoreProgram, next_def_id: Int) -> HashKeyCallbackResult:
 	layout: CoreSpecializeLayout = build_specialize_layout(program)
-	callbacks: CoreRuntimeCallbackTable = build_runtime_callback_table(program)
-	functions: Dict[Int, CoreFunction] = program_functions_by_def_id(program)
+	authored_callbacks: CoreRuntimeCallbackTable = layout.runtime_callbacks
+	authored_functions: Dict[Int, CoreFunction] = program_functions_by_def_id(program)
+	var native_callbacks: List[CoreDecl] = []
 	var adapters: List[CoreDecl] = []
 	var next_id: Int = next_def_id
+
+	for (type_key, hash_def) in authored_callbacks.hashable_hash:
+		match authored_functions.get(hash_def):
+			Some(hash_impl):
+				match native_tag_equality_type(layout, authored_callbacks, type_key, hash_impl):
+					Some(key_type):
+						native_callbacks = native_callbacks.append(
+							FunctionDecl(native_tag_equality_callback(key_type, next_id)),
+						)
+						next_id += 1
+					None:
+						void
+			None:
+				void
+
+	prepared_program: CoreProgram = { program | decls = program.decls.concat(native_callbacks) }
+	callbacks: CoreRuntimeCallbackTable = if native_callbacks.is_empty():
+		authored_callbacks
+	else:
+		build_runtime_callback_table(prepared_program)
+	functions: Dict[Int, CoreFunction] = if native_callbacks.is_empty():
+		authored_functions
+	else:
+		program_functions_by_def_id(prepared_program)
 
 	for (type_key, hash_def) in callbacks.hashable_hash:
 		match (functions.get(hash_def), callbacks.equatable_equals.get(type_key)):
@@ -303,7 +385,7 @@ pure func mint_hash_key_callbacks(program: CoreProgram, next_def_id: Int) -> Has
 				void
 
 	{
-		program = { program | decls = program.decls.concat(adapters) },
+		program = { prepared_program | decls = prepared_program.decls.concat(adapters) },
 		next_def_id = next_id
 	}
 

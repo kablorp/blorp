@@ -10,8 +10,9 @@
 -- per program.
 import:
 	ir:
-		CoreDecl(FunctionDecl),
-		CoreDeclaredOrigin(ProjectedImplMethod),
+		CoreDecl(FunctionDecl, ImplDecl),
+		CoreFunction,
+		CoreDeclaredOrigin(ImplMethod, NativeTagEqualityCallback, ProjectedImplMethod),
 		CoreImplMethodRole(RuntimeCallbackMethod),
 		CoreProgram,
 		CoreRuntimeCallbackRole(
@@ -68,6 +69,20 @@ record CoreDuplicateRuntimeCallback {
 }
 
 
+private pure func runtime_callback_entry_for_target(
+	function: CoreFunction,
+	role: CoreRuntimeCallbackRole,
+	for_type: CoreType,
+) -> Option[RuntimeCallbackEntry]:
+	type_key ?= core_trait_impl_type_key(for_type)
+	Some({
+		role = role,
+		type_key = type_key,
+		function_name = function.name,
+		def_id = function.def_id,
+	})
+
+
 private pure func runtime_callback_entries(program: CoreProgram) -> List[RuntimeCallbackEntry]:
 	var entries: List[RuntimeCallbackEntry] = []
 
@@ -75,19 +90,23 @@ private pure func runtime_callback_entries(program: CoreProgram) -> List[Runtime
 		match decl:
 			FunctionDecl(function):
 				match core_function_declared_origin(function.origin):
-					ProjectedImplMethod(_, _, for_type, RuntimeCallbackMethod(role)):
-						match core_trait_impl_type_key(for_type):
-							Some(type_key):
-								entries = entries.append({
-									role = role,
-									type_key = type_key,
-									function_name = function.name,
-									def_id = function.def_id,
-								})
-							None:
-								void
-					_:
-						void
+					ProjectedImplMethod(_, _, target, RuntimeCallbackMethod(role)):
+						match runtime_callback_entry_for_target(function, role, target):
+							Some(entry): entries = entries.append(entry)
+							None: void
+					NativeTagEqualityCallback(target):
+						match runtime_callback_entry_for_target(function, EquatableEqualsCallback, target):
+							Some(entry): entries = entries.append(entry)
+							None: void
+					_: void
+			ImplDecl(implementation):
+				for method in implementation.methods:
+					match core_function_declared_origin(method.origin):
+						ImplMethod(_, _, RuntimeCallbackMethod(role)):
+							match runtime_callback_entry_for_target(method, role, implementation.for_type):
+								Some(entry): entries = entries.append(entry)
+								None: void
+						_: void
 			_:
 				void
 
@@ -108,7 +127,7 @@ private pure func role_table(
 
 
 ---
-Indexes every top-level function whose origin is a callback-role impl method.
+Indexes callback-role methods before and after impl projection.
 Run once per program; lookups never scan the function list.
 ---
 pure func build_runtime_callback_table(program: CoreProgram) -> CoreRuntimeCallbackTable:
@@ -182,3 +201,8 @@ pure func find_runtime_callback(
 	type_key ?= core_trait_impl_type_key(target)
 
 	role_table(table, role).get(type_key)
+
+
+-- Authored Hash opts scalar storage into dispatched probing; Eq-only does not.
+pure func scalar_hash_uses_callbacks(table: CoreRuntimeCallbackTable, target: CoreType) -> Bool:
+	find_runtime_callback(table, HashableHashCallback, target).is_some()
