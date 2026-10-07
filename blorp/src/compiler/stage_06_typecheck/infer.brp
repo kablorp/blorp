@@ -197,6 +197,7 @@ import:
 			AcceptedConcreteMethodInvalid, AcceptedConcreteMethodTemplate,
 		),
 		AcceptedQualifiedTraitMethodInfo,
+		AcceptedRecordEquality(DerivedRecordEquality, NoRecordEquality, WrittenRecordEquality),
 		AcceptedTraitUfcsMethodLookup(
 			AcceptedTraitUfcsMethodAmbiguous, AcceptedTraitUfcsMethodFound,
 			AcceptedTraitUfcsMethodNotFound,
@@ -211,6 +212,7 @@ import:
 		accepted_qualified_trait_method_id,
 		accepted_qualified_trait_method_identity,
 		accepted_qualified_trait_method_signature,
+		accepted_record_equality,
 		accepted_resolve_exact_trait_obligation,
 		accepted_resolve_trait_id_obligation,
 		accepted_resolve_trait_obligation,
@@ -6725,6 +6727,11 @@ private pure func compared_component(typ: SemanticType) -> Option[ComparedCompon
 				phrase = "Dict equality compares values",
 				component = value
 			})
+		SemanticNamedType("Option", [payload]):
+			Some({
+				phrase = "Option equality compares payloads",
+				component = payload
+			})
 		_:
 			None
 
@@ -6732,14 +6739,68 @@ private pure func compared_component(typ: SemanticType) -> Option[ComparedCompon
 private pure func equality_element_help(context: InferContext, typ: SemanticType) -> String:
 	match compared_component(typ):
 		Some(compared):
+			component_text = type_to_string(compared.component)
+
 			if type_satisfies_trait(context, compared.component, TRAIT_ID_EQUATABLE):
 				""
 			else:
-				" (" + compared.phrase + " with ==; add 'implements Equatable for " + type_to_string(
-					compared.component,
-				) + "')"
+				match record_equality_refusal(context, compared.component):
+					Some(refusal):
+						" (" + compared.phrase + " with ==; `" + component_text + "` is not Equatable because its field `" + refusal.field_name + ": " + type_to_string(
+							refusal.field_type,
+						) + "` is not Equatable)"
+					None:
+						" (" + compared.phrase + " with ==; add 'implements Equatable for " + component_text + "')"
 		_:
 			""
+
+
+private record RecordEqualityRefusal {
+	record_name: String,
+	field_name: String,
+	field_type: SemanticType
+}
+
+
+---
+Why the record `typ` has no derived equality and no written one: its first
+field, in declaration order, whose type (with `typ`'s arguments substituted)
+is not Equatable. None for a type that is not a record or that has a written
+implementation, whose own bounds are what failed.
+---
+private pure func record_equality_refusal(
+	context: InferContext,
+	typ: SemanticType,
+) -> Option[RecordEqualityRefusal]:
+	match typ:
+		SemanticNamedType(name, args):
+			view = context.state.facts.module_view
+			records ?= module_view_accepted_record_authority(view)
+			traits ?= module_view_accepted_trait_implementation_authority(view)
+			entry ?= accepted_record_find(records, name)
+
+			match accepted_record_equality(traits, name):
+				WrittenRecordEquality:
+					None
+				DerivedRecordEquality | NoRecordEquality:
+					subst = subst_for_params(entry.type_params, args)
+					field ?= entry.fields.find(
+						func(
+							field,
+						): not type_satisfies_trait(
+							context,
+							apply_subst(subst, field.field_type),
+							TRAIT_ID_EQUATABLE,
+						),
+					)
+					field_name ?= accepted_record_field_name(records, field.id)
+					Some({
+						record_name = type_to_string(SemanticNamedType(name, [])),
+						field_name = field_name,
+						field_type = apply_subst(subst, field.field_type),
+					})
+		_:
+			None
 
 
 private pure func check_equality_binary_op(
@@ -6784,13 +6845,26 @@ private pure func check_equality_binary_op(
 					if type_satisfies_trait(next_context, zonked_left, TRAIT_ID_EQUATABLE):
 						checked_type(next_context, TYPE_BOOL)
 					else:
-						next = infer_error_at(
-							next_context,
-							"Equality requires an implementation of Equatable for " + type_to_string(
-								zonked_left,
-							) + equality_element_help(next_context, zonked_left),
-							span,
-						)
+						next = match record_equality_refusal(next_context, zonked_left):
+							Some(refusal):
+								infer_error_at_with_help(
+									next_context,
+									"`" + type_to_string(
+										zonked_left,
+									) + "` is not Equatable because its field `" + refusal.field_name + ": " + type_to_string(
+										refusal.field_type,
+									) + "` is not Equatable",
+									span,
+									"\n    help: a record is Equatable when all its fields are; write `implements Equatable for " + refusal.record_name + "` to define its equality yourself",
+								)
+							None:
+								infer_error_at(
+									next_context,
+									"Equality requires an implementation of Equatable for " + type_to_string(
+										zonked_left,
+									) + equality_element_help(next_context, zonked_left),
+									span,
+								)
 						checked_type(next, TYPE_VOID)
 		None:
 			next = infer_error(
@@ -10464,10 +10538,17 @@ private pure func missing_hashable_help(context: InferContext, typ: SemanticType
 				SemanticTypeVar(name, _):
 					"\n    help: add the bound where `" + name + "` is declared: `[" + name + ": Hashable]`"
 				_:
-					"\n    help: Dict keys and Set elements are compared by value, so `" + culprit_text + (
-						"` must implement Equatable and Hashable over the same fields: `implements "
-						+ "Equatable for "
-					) + culprit_text + "` (define `equals`) and `implements Hashable for " + culprit_text + "` (define `hash`, for example `hash_combine(self.x.hash(), self.y.hash())`)"
+					hash_help: String = "`implements Hashable for " + culprit_text + "` (define `hash`, for example `hash_combine(self.x.hash(), self.y.hash())`)"
+
+					-- A record whose fields are all Equatable already has `==`,
+					-- so it needs only the hash.
+					if type_satisfies_trait(context, culprit, TRAIT_ID_EQUATABLE):
+						"\n    help: Dict keys and Set elements are compared by value, so `" + culprit_text + "` must implement Hashable consistently with its `==`: " + hash_help
+					else:
+						"\n    help: Dict keys and Set elements are compared by value, so `" + culprit_text + (
+							"` must implement Equatable and Hashable over the same fields: `implements "
+							+ "Equatable for "
+						) + culprit_text + "` (define `equals`) and " + hash_help
 
 
 --- Which hash container a literal builds, for the key diagnostic's wording.

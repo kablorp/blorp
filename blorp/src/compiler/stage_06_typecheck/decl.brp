@@ -140,6 +140,7 @@ import:
 		accepted_union_graph_table,
 		accepted_union_table_authority_for_module,
 		accepted_union_table_canonical_authority,
+	headers/derived_record_equality: RecordEqualityModule, derive_record_equalities
 	headers/callable_headers:
 		CallableBodyCategory(SourceCallableBody),
 		CallableHeader,
@@ -507,6 +508,7 @@ import:
 		accepted_semantic_catalog_union_table,
 	type_system/accepted_trait_implementation_authority:
 		AcceptedImplementationDefinitionIds,
+		AcceptedRecordEquality(NoRecordEquality),
 		AcceptedImplementationTableRecord,
 		AcceptedTraitImplementationAuthority,
 		AcceptedTraitImplementationAuthorityMetrics,
@@ -517,7 +519,9 @@ import:
 		AcceptedTraitVisibility,
 		ScopedTraitMethodSource(CompilerProvidedScopedTrait, IssuedScopedMethods),
 		accepted_has_direct_trait_evidence,
+		accepted_derived_tuple_equality_arities,
 		accepted_implementation_definition_ids_for_owner,
+		accepted_record_equality,
 		accepted_resolve_trait_obligation,
 		accepted_scoped_trait_methods,
 		accepted_trait_contains,
@@ -528,7 +532,9 @@ import:
 		accepted_trait_implementation_authority_from_visibility,
 		accepted_trait_implementation_authority_metrics,
 		accepted_trait_implementation_authority_preparation_errors,
+		accepted_trait_implementation_authority_with_derived_equalities,
 		accepted_trait_implementation_table,
+		accepted_trait_implementation_table_with_derived_equalities,
 		accepted_trait_implementation_table_validation_errors,
 		accepted_trait_method_binding_declaring_trait_name,
 		accepted_trait_method_binding_for_id,
@@ -804,7 +810,10 @@ record TypedRecordFieldInfo {
 
 record TypedRecordInfo {
 	decl: ParsedRecordDecl,
-	fields: List[TypedRecordFieldInfo]
+	fields: List[TypedRecordFieldInfo],
+	-- Where the record's Equatable comes from. Core lowering builds the
+	-- methods of a derived equality from `fields`.
+	equality: AcceptedRecordEquality
 }
 
 
@@ -824,7 +833,11 @@ record TypedTraitMethodInfo {
 
 record TypedTraitInfo {
 	decl: ParsedTraitDecl,
-	methods: List[TypedTraitMethodInfo]
+	methods: List[TypedTraitMethodInfo],
+	-- The tuple arities whose implementation of this trait Core lowering
+	-- derives elementwise: those without a written one, when this is the
+	-- prelude Equatable in its own module, and none otherwise.
+	derived_tuple_arities: List[Int]
 }
 
 
@@ -1890,13 +1903,25 @@ private pure func typed_record_from_parsed(
 	record_decl: ParsedRecordDecl,
 ) -> TypedRecordInfo:
 	type_params = type_param_names(record_decl.type_params)
+
+	equality: AcceptedRecordEquality = match module_view_accepted_trait_implementation_authority(
+		state.module_view,
+	):
+		Some(authority):
+			accepted_record_equality(authority, record_decl.name.text)
+		None:
+			-- Without an authority no evidence derives equality either, so
+			-- neither typecheck nor Core treats the record as Equatable.
+			NoRecordEquality
+
 	{
 		decl = record_decl,
 		fields = record_decl.fields.map(
 			func(
 				field,
 			): typed_record_field_from_parsed(state, record_decl.name.text, type_params, field),
-		)
+		),
+		equality = equality
 	}
 
 
@@ -1937,11 +1962,21 @@ private pure func typed_trait_from_parsed(
 	trait_decl: ParsedTraitDecl,
 ) -> TypedTraitInfo:
 	type_params = type_param_names(trait_decl.type_params)
+
+	derived_tuple_arities: List[Int] = match module_view_accepted_trait_implementation_authority(
+		state.module_view,
+	):
+		Some(authority):
+			accepted_derived_tuple_equality_arities(authority, trait_decl.name.text)
+		None:
+			[]
+
 	{
 		decl = trait_decl,
 		methods = trait_decl.methods.map(
 			func(method): typed_trait_method_from_parsed(state, type_params, method),
-		)
+		),
+		derived_tuple_arities = derived_tuple_arities
 	}
 
 
@@ -7037,6 +7072,32 @@ private pure func prepared_module_base_index(
 		None
 
 
+private pure func prepared_base_trait_implementation_authority(
+	table: AcceptedTraitImplementationTable,
+	base: PreparedModuleCallableBase,
+) -> AcceptedTraitImplementationAuthority:
+	-- Reuse the trait-only projection built during header conversion instead
+	-- of recomputing the trait half a second time; only the implementation
+	-- half is new here.
+	match base.trait_projection:
+		Some(projection):
+			accepted_trait_implementation_authority_from_projection(table, projection)
+		None:
+			accepted_trait_implementation_authority_for_module(table, base.bound_module)
+
+
+private pure func record_equality_module(
+	base: PreparedModuleCallableBase,
+	authority: AcceptedTraitImplementationAuthority,
+) -> RecordEqualityModule:
+	{
+		scope = bound_module_scope(base.bound_module),
+		module_path = base.module_path,
+		authority = authority,
+		env = base.state.env
+	}
+
+
 private pure func prepared_module_environments(
 	implementation_headers: ImplementationHeaderGraph,
 	accepted_global_table: AcceptedGlobalTable,
@@ -7363,15 +7424,58 @@ private pure func prepared_module_environments(
 		implementations = implementation_records
 	}
 
-	trait_implementation_table = if trait_implementation_owner_missing:
+	written_trait_implementation_table = if trait_implementation_owner_missing:
 		None
 	else:
 		accepted_trait_implementation_table(trait_implementation_input)
 
 	record_typecheck_phase("prepare_impls", impls_mark)
+	derived_equality_mark = typecheck_phase_mark()
+
+	-- Each module's authority is built once over the written implementations;
+	-- derivation reads them to decide which records derive Equatable, and
+	-- every module then sees the derived equalities through its own authority.
+	var trait_implementation_table: Option[AcceptedTraitImplementationTable] = None
+	var module_authorities: List[AcceptedTraitImplementationAuthority] = []
+
+	match written_trait_implementation_table:
+		Some(written_table):
+			var derivation_modules: List[RecordEqualityModule] = []
+			var written_authorities: List[AcceptedTraitImplementationAuthority] = []
+
+			for base in bases:
+				authority = prepared_base_trait_implementation_authority(written_table, base)
+				written_authorities = written_authorities.append(authority)
+				derivation_modules = derivation_modules.append(record_equality_module(base, authority))
+
+			derived_equalities = derive_record_equalities(
+				written_table,
+				type_headers,
+				accepted_record_table,
+				derivation_modules,
+			)
+			trait_implementation_table = Some(
+				accepted_trait_implementation_table_with_derived_equalities(
+					written_table,
+					derived_equalities,
+				),
+			)
+
+			for authority in written_authorities:
+				module_authorities = module_authorities.append(
+					accepted_trait_implementation_authority_with_derived_equalities(
+						authority,
+						derived_equalities,
+					),
+				)
+		None:
+			void
+
+	record_typecheck_phase("derive_record_equalities", derived_equality_mark)
 	environments_mark = typecheck_phase_mark()
 
-	for base in bases:
+	for indexed_base in bases.enumerate():
+		base = indexed_base[1]
 		var prepared_state = base.state
 
 		match callable_table:
@@ -7395,17 +7499,8 @@ private pure func prepared_module_environments(
 					"internal typecheck error: accepted callable table rejected prepared entries",
 				)
 
-		match trait_implementation_table:
-			Some(table):
-				-- Reuse the trait-only projection built during header
-				-- conversion instead of recomputing the trait half a second
-				-- time; only the implementation half is new here.
-				authority = match base.trait_projection:
-					Some(projection):
-						accepted_trait_implementation_authority_from_projection(table, projection)
-					None:
-						accepted_trait_implementation_authority_for_module(table, base.bound_module)
-
+		match module_authorities.get(indexed_base[0]):
+			Some(authority):
 				for message in accepted_trait_implementation_authority_preparation_errors(
 					authority,
 				):
@@ -7418,6 +7513,8 @@ private pure func prepared_module_environments(
 					)
 				}
 			None:
+				-- An authority exists for every module exactly when the table
+				-- does.
 				validation_errors = accepted_trait_implementation_table_validation_errors(
 					trait_implementation_input,
 				)

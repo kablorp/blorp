@@ -44,6 +44,8 @@ message-wording tasks.
 | CF-019 | A `concurrent:` task returning `Int128` or `UInt128` leaks its result box under `--leak-check` (`c_type_layout.brp`, `erased_slot_needs_release_type`) |
 | CF-020 | `List.unique` and `List.partition` leak one managed record per element under `--leak-check` (`synth_list.brp`, `partition_push` and `synthesize_unique`) |
 | CF-021 | A cancellation inside a hash or equality callback during a `Dict`/`Set` lookup, between boxing the key (`blorp_box_struct`, 128-bit boxes) and the lookup's release of it, leaks the key box (`specialize_collection.brp`, `dict_get_releasing_key_box` and `resolve_erased_key_temp_release`) |
+| CF-022 | `a.not_equals(b)` is rejected as a missing field, although `not_equals` is an Equatable method every implementation has |
+| CF-023 | Comparing a generic record with a record literal, `w == {value = 1}` for `Wrap[Int]`, is an internal error: "matched record type 'Wrap' has no field metadata" |
 
 ## High ROI
 

@@ -25,6 +25,7 @@ import:
 		definition_table_is_compatible_with_module_table,
 		definition_tables_share_provenance,
 	../graph/source_name_table: name_table_for_spellings
+	../graph/type_identity: TypeId
 	../headers/declaration_skeleton:
 		CallableId,
 		DeclarationVisibility(PrivateDeclaration, PublicDeclaration),
@@ -56,6 +57,7 @@ import:
 			StandaloneSelectiveDefinitionBinding,
 		),
 	../type_system/trait_identity:
+		TRAIT_ID_EQUATABLE,
 		TRAIT_ID_HAS_LENGTH,
 		TRAIT_ID_STRINGABLE,
 		TraitId,
@@ -83,10 +85,15 @@ import:
 		BoundTraitOwner(CompilerBuiltinBoundTraitOwner, GraphBoundTraitOwner),
 		BoundTypeParam,
 		bound_trait_identities_equal,
+		make_resolved_bound_type_param,
 	list: repeat
 	memory: same_object
 	semantic_type:
-		SemanticType(SemanticArrayType, SemanticMetaType, SemanticNamedType, SemanticTypeVar),
+		SemanticType(
+			SemanticArrayType, SemanticMetaType, SemanticNamedType, SemanticTupleType, SemanticTypeVar,
+		),
+		canonical_module_type_name,
+		is_dimension_parameter_name,
 		localize_module_types,
 		localize_module_types_list,
 		types_equal,
@@ -119,6 +126,72 @@ record AcceptedTraitImplementationTableInput {
 }
 
 
+---
+`Equatable` for a record that no implementation is written for, derived by
+comparing the fields in declaration order with each field type's own `==`.
+It stands for `implements Equatable for R[T:Equatable, ...]`: `pattern` is
+`R` applied to its parameters in canonical spelling, and `bounds` requires
+`Equatable` of every type parameter besides the bounds the record declares
+(a dimension parameter is unbounded), so `R[A]` is Equatable exactly when `A`
+is and meets the record's own bounds.
+
+A derived equality is decided once for the whole graph, after the written
+implementations are known (`derive_record_equalities`), and lives apart from
+them: it has no definition IDs, because Core lowering builds its methods from
+the record's own fields. Every module sees every derived equality, since it
+belongs to the type rather than to an `implements` block a module imports.
+---
+record AcceptedDerivedEquality {
+	record_id: TypeId,
+	pattern: SemanticType,
+	bounds: List[BoundTypeParam]
+}
+
+
+---
+Where a record's `Equatable` comes from. Every record falls in exactly one
+case, and the derived case is the only one Core lowering builds methods for.
+---
+enum AcceptedRecordEquality:
+	WrittenRecordEquality
+	DerivedRecordEquality
+	NoRecordEquality
+
+
+---
+A type parameter of a record whose equality may be derived: its name and the
+traits its declaration bounds it by.
+---
+record DerivedEqualityParameter {
+	name: String,
+	declared_bounds: List[TraitId]
+}
+
+
+private union DeclaredTypeEquality:
+	DerivedTypeEquality(AcceptedDerivedEquality)
+	NotDerivedTypeEquality
+
+
+private record AcceptedDerivedEqualitiesRep {
+	-- One row for every type declared in the graph, of any kind, by canonical
+	-- name. Keyed by spelling because an obligation names its type only by
+	-- spelling (`SemanticNamedType` carries no `TypeId` yet; IDENTITY_ROADMAP
+	-- "Qualified type names", step 2); a canonical spelling names one
+	-- declaration. Rows for types that derive nothing let a module tell its
+	-- own types from same-spelled standard ones (`declared_type_canonical_name`).
+	declared_types: Dict[String, DeclaredTypeEquality]
+}
+
+
+---
+The records whose Equatable is derived, decided once for the graph by
+`derive_record_equalities`. Kept apart from the written implementations, so
+replacing the derived set never touches them.
+---
+opaque type AcceptedDerivedEqualities = AcceptedDerivedEqualitiesRep
+
+
 record AcceptedImplementationDefinitionIds {
 	id: ImplId,
 	method_ids: List[CallableId]
@@ -144,7 +217,17 @@ private record AcceptedTraitImplementationTableRep {
 	trait_index_by_definition_id: Dict[Int, Int],
 	trait_index_by_compiler_identity: Dict[Int, Int],
 	trait_indices_by_module: List[List[Int]],
-	implementation_indices_by_module: List[List[Int]]
+	implementation_indices_by_module: List[List[Int]],
+	-- Canonical names of the types with a written Equatable implementation,
+	-- derived from `implementations` when the table is built. A record named
+	-- here never derives equality: the written implementation wins.
+	written_equality_type_names: Dict[String, Bool],
+	-- The graph's derived record equalities; none until derivation has run
+	-- (`accepted_trait_implementation_table_with_derived_equalities`).
+	derived_equalities: AcceptedDerivedEqualities,
+	-- Tuple arities with a written Equatable implementation, derived from
+	-- `implementations`; every other arity's equality is derived.
+	written_equality_tuple_arities: List[Int]
 }
 
 
@@ -192,7 +275,11 @@ private record AcceptedTraitImplementationAuthorityRep {
 	compiler_implementations_by_trait_identity: Dict[Int, AcceptedCompilerImplementationBucket],
 	visible_implementation_rank_by_index: List[Int],
 	visible_trait_methods: List[AcceptedVisibleTraitMethodRow],
-	preparation_errors: List[String]
+	preparation_errors: List[String],
+	-- The derived equalities this authority reads: its table's when it is
+	-- built, replaced by `accepted_trait_implementation_authority_with_derived_equalities`
+	-- while derivation decides them.
+	derived_equalities: AcceptedDerivedEqualities
 }
 
 
@@ -1191,6 +1278,16 @@ pure func accepted_trait_implementation_table(
 			prior_indices.append(current_index),
 		)
 
+	var written_equality_type_names: Dict[String, Bool] = {}
+
+	for item in input.implementations:
+		if implementation_is_equatable(input.traits, trait_indices, item):
+			match item.instance.for_type:
+				SemanticNamedType(name, _):
+					written_equality_type_names = written_equality_type_names.set(name, True)
+				_:
+					void
+
 	if valid:
 		Some(into_opaque AcceptedTraitImplementationTable({
 					module_table = input.module_table,
@@ -1206,10 +1303,205 @@ pure func accepted_trait_implementation_table(
 					trait_index_by_definition_id = trait_indices,
 					trait_index_by_compiler_identity = trait_index_by_compiler_identity,
 					trait_indices_by_module = trait_indices_by_module,
-					implementation_indices_by_module = implementation_indices_by_module
+					implementation_indices_by_module = implementation_indices_by_module,
+					written_equality_type_names = written_equality_type_names,
+					derived_equalities = accepted_no_derived_equalities(),
+					written_equality_tuple_arities = written_equality_tuple_arities(
+						input.traits,
+						trait_indices,
+						input.implementations,
+					)
 				}))
 	else:
 		None
+
+
+---
+Every arity a tuple can have: both parsers accept two to four elements
+(`MAX_TUPLE_ARITY` in the discovery type parser).
+---
+private TUPLE_ARITIES: List[Int] = [2, 3, 4]
+
+
+private pure func implementation_is_equatable(
+	traits: List[AcceptedTraitTableRecord],
+	trait_indices: Dict[Int, Int],
+	item: AcceptedImplementationTableRecord,
+) -> Bool:
+	trait_compiler_link_from_indices(traits, trait_indices, item.trait_id)
+		.map(func(linked): trait_ids_equal(linked, TRAIT_ID_EQUATABLE))
+		.get_or(False)
+
+
+private pure func written_equality_tuple_arities(
+	traits: List[AcceptedTraitTableRecord],
+	trait_indices: Dict[Int, Int],
+	implementations: List[AcceptedImplementationTableRecord],
+) -> List[Int]:
+	var arities: List[Int] = []
+
+	for item in implementations:
+		if implementation_is_equatable(traits, trait_indices, item):
+			match item.instance.for_type:
+				SemanticTupleType(items):
+					if not arities.contains(items.length()):
+						arities = arities.append(items.length())
+				_:
+					void
+
+	arities
+
+
+---
+The tuple arities whose Equatable impl Core lowering derives, when the
+viewing module declares `trait_name` and it is the prelude Equatable: tuples
+belong to no module, so the impl lives with the trait, as coherence allows.
+Arities with a written implementation are left to it. Empty for any other
+trait or module.
+---
+pure func accepted_derived_tuple_equality_arities(
+	authority: AcceptedTraitImplementationAuthority,
+	trait_name: String,
+) -> List[Int]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+
+	match visible_trait_index_for_name(representation, trait_name).and_then(
+		func(index): table.traits.get(index),
+	):
+		Some(item):
+			if (
+				item.compiler_builtin_id
+					.map(func(linked): trait_ids_equal(linked, TRAIT_ID_EQUATABLE))
+					.get_or(False)
+				and trait_owner_module_path(table.definition_table, table.module_table, item) == Some(
+					representation.owner_module_path,
+				)
+			):
+				TUPLE_ARITIES.filter(
+					func(arity): not table.written_equality_tuple_arities.contains(arity),
+				)
+			else:
+				[]
+		None:
+			[]
+
+
+---
+Whether a written implementation of Equatable exists for the record with
+canonical name `canonical_name`, in any module.
+---
+pure func accepted_trait_implementation_table_has_written_equality(
+	table: AcceptedTraitImplementationTable,
+	canonical_name: String,
+) -> Bool:
+	table_rep(table).written_equality_type_names.contains(canonical_name)
+
+
+---
+The derived equality of the record `record_id`, whose canonical name is
+`canonical_name` and whose type parameters are `parameters`. None when the
+table has no Equatable trait to bound the parameters by, which only a graph
+without the prelude can produce.
+---
+pure func accepted_derived_equality_for_record(
+	table: AcceptedTraitImplementationTable,
+	record_id: TypeId,
+	canonical_name: String,
+	parameters: List[DerivedEqualityParameter],
+) -> Option[AcceptedDerivedEquality]:
+	representation = table_rep(table)
+	trait_index ?= representation.trait_index_by_compiler_identity.get(
+		trait_id_storage_key(TRAIT_ID_EQUATABLE),
+	)
+	equatable ?= representation.traits.get(trait_index)
+	identity = bound_trait_identity_from_id(representation.definition_table, equatable.id)
+	Some({
+		record_id = record_id,
+		pattern = SemanticNamedType(
+			canonical_name,
+			parameters.map(func(parameter): SemanticNamedType(parameter.name, [])),
+		),
+		bounds = parameters.map(
+			func(parameter): derived_equality_bound(representation, identity, parameter),
+		),
+	})
+
+
+---
+A derived equality's bound on one parameter: the record's declared bounds,
+and Equatable for a type parameter. A dimension parameter is a number and
+takes no trait bound.
+---
+private pure func derived_equality_bound(
+	table: AcceptedTraitImplementationTableRep,
+	equatable: BoundTraitIdentity,
+	parameter: DerivedEqualityParameter,
+) -> BoundTypeParam:
+	declared = parameter.declared_bounds.map(
+		func(id): bound_trait_identity_from_id(table.definition_table, id),
+	)
+
+	if is_dimension_parameter_name(parameter.name):
+		make_resolved_bound_type_param(parameter.name, declared)
+	else if declared.any(func(bound): trait_ids_equal(bound.trait_id, equatable.trait_id)):
+		make_resolved_bound_type_param(parameter.name, declared)
+	else:
+		make_resolved_bound_type_param(parameter.name, declared.append(equatable))
+
+
+---
+No derived equalities: the state of a table before derivation runs.
+---
+pure func accepted_no_derived_equalities() -> AcceptedDerivedEqualities:
+	into_opaque AcceptedDerivedEqualities({declared_types = {}})
+
+
+---
+The derived equalities `derived` of a graph whose declared types, of every
+kind, have the canonical names `declared_type_names`.
+---
+pure func accepted_derived_equalities(
+	declared_type_names: List[String],
+	derived: List[AcceptedDerivedEquality],
+) -> AcceptedDerivedEqualities:
+	var declared_types: Dict[String, DeclaredTypeEquality] = {}
+
+	for name in declared_type_names:
+		declared_types = declared_types.set(name, NotDerivedTypeEquality)
+
+	for item in derived:
+		match item.pattern:
+			SemanticNamedType(name, _):
+				declared_types = declared_types.set(name, DerivedTypeEquality(item))
+			_:
+				void
+
+	into_opaque AcceptedDerivedEqualities({declared_types = declared_types})
+
+
+---
+The table with `derived` as its derived equalities. Authorities built from it
+afterwards read them.
+---
+pure func accepted_trait_implementation_table_with_derived_equalities(
+	table: AcceptedTraitImplementationTable,
+	derived: AcceptedDerivedEqualities,
+) -> AcceptedTraitImplementationTable:
+	representation = table_rep(table)
+	into_opaque AcceptedTraitImplementationTable({ representation | derived_equalities = derived })
+
+
+---
+`authority` reading `derived` as its derived equalities. Its visibility indexes
+do not depend on derived equalities, so they are kept.
+---
+pure func accepted_trait_implementation_authority_with_derived_equalities(
+	authority: AcceptedTraitImplementationAuthority,
+	derived: AcceptedDerivedEqualities,
+) -> AcceptedTraitImplementationAuthority:
+	representation = authority_rep(authority)
+	into_opaque AcceptedTraitImplementationAuthority({ representation | derived_equalities = derived })
 
 
 pure func accepted_trait_ids_for_owner(
@@ -1917,7 +2209,8 @@ private pure func accepted_trait_implementation_authority_from_fields(
 			compiler_implementations_by_trait_identity = compiler_implementations_by_trait_identity,
 			visible_implementation_rank_by_index = visible_implementation_rank_by_index,
 			visible_trait_methods = fields.visible_trait_methods,
-			preparation_errors = preparation_errors
+			preparation_errors = preparation_errors,
+			derived_equalities = representation.derived_equalities
 		})
 
 
@@ -2803,7 +3096,120 @@ private pure func accepted_has_matching_implementation(
 		if found:
 			break
 
-	found
+	(
+		found
+		or (
+			table_trait_represents_compiler_trait(table, trait_id, TRAIT_ID_EQUATABLE)
+			and accepted_derived_equality_matches_type(authority, env, typ)
+		)
+	)
+
+
+---
+The canonical name of the type that `name` spells in the viewing module: the
+module's own type when the module declares a type of any kind by that name,
+and otherwise `name` itself, which is then another module's canonical spelling
+or a standard global ABI name.
+---
+private pure func declared_type_canonical_name(
+	authority: AcceptedTraitImplementationAuthorityRep,
+	name: String,
+) -> String:
+	local_name = canonical_module_type_name(authority.owner_module_path, name)
+
+	if from_opaque AcceptedDerivedEqualities(authority.derived_equalities).declared_types.contains(
+		local_name,
+	):
+		local_name
+	else:
+		name
+
+
+private pure func derived_equality_for_name(
+	authority: AcceptedTraitImplementationAuthorityRep,
+	name: String,
+) -> Option[AcceptedDerivedEquality]:
+	match from_opaque AcceptedDerivedEqualities(authority.derived_equalities).declared_types.get_or(
+		declared_type_canonical_name(authority, name),
+		NotDerivedTypeEquality,
+	):
+		DerivedTypeEquality(item):
+			Some(item)
+		NotDerivedTypeEquality:
+			None
+
+
+private pure func accepted_derived_equality_matches_type(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	typ: SemanticType,
+) -> Bool:
+	representation = authority_rep(authority)
+
+	match typ:
+		SemanticNamedType(name, _):
+			match derived_equality_for_name(representation, name):
+				Some(item):
+					implementation_pattern_matches_with(
+						localize_module_types(representation.owner_module_path, item.pattern),
+						item.bounds,
+						typ,
+						pure func(
+							obligation,
+							bound_identity,
+						): accepted_bound_obligation_is_satisfied(
+							authority,
+							env,
+							obligation,
+							bound_identity,
+						),
+					)
+				None:
+					False
+		SemanticTupleType(items):
+			-- A tuple is Equatable exactly when each element is, as if
+			-- `implements Equatable for (A:Equatable, B:Equatable)` were written
+			-- for its arity.
+			match equatable_bound_identity(representation):
+				Some(equatable):
+					items.all(func(item): accepted_bound_obligation_is_satisfied(
+						authority,
+						env,
+						trait_obligation(item, equatable.trait_id),
+						Some(equatable),
+					))
+				None:
+					False
+		_:
+			False
+
+
+private pure func equatable_bound_identity(
+	authority: AcceptedTraitImplementationAuthorityRep,
+) -> Option[BoundTraitIdentity]:
+	table = table_rep(authority.table)
+	index ?= table.trait_index_by_compiler_identity.get(trait_id_storage_key(TRAIT_ID_EQUATABLE))
+	equatable ?= table.traits.get(index)
+	Some(bound_trait_identity_from_id(table.definition_table, equatable.id))
+
+
+---
+Where the record `name`, spelled as the viewing module spells it, gets its
+`Equatable`: a written implementation, derivation from its fields, or nowhere.
+---
+pure func accepted_record_equality(
+	authority: AcceptedTraitImplementationAuthority,
+	name: String,
+) -> AcceptedRecordEquality:
+	representation = authority_rep(authority)
+	canonical_name = declared_type_canonical_name(representation, name)
+
+	if table_rep(representation.table).written_equality_type_names.contains(canonical_name):
+		WrittenRecordEquality
+	else if derived_equality_for_name(representation, name).is_some():
+		DerivedRecordEquality
+	else:
+		NoRecordEquality
 
 
 private pure func implementation_candidate_indices_for_trait_index(
@@ -2853,7 +3259,17 @@ private pure func accepted_has_matching_exact_implementation(
 		if found:
 			break
 
-	found
+	(
+		found
+		or (
+			table.traits
+				.get(trait_index)
+				.and_then(func(item): item.compiler_builtin_id)
+				.map(func(linked): trait_ids_equal(linked, TRAIT_ID_EQUATABLE))
+				.get_or(False)
+			and accepted_derived_equality_matches_type(authority, env, typ)
+		)
+	)
 
 
 pure func accepted_resolve_exact_trait_obligation(
@@ -3640,6 +4056,11 @@ pure func accepted_has_direct_trait_evidence(
 			break
 
 	if found:
+		True
+	else if (
+		table_trait_represents_compiler_trait(table, requested_trait_id, TRAIT_ID_EQUATABLE)
+		and accepted_derived_equality_matches_type(authority, env, obligation.obligation_type)
+	):
 		True
 	else:
 		match obligation.obligation_type:

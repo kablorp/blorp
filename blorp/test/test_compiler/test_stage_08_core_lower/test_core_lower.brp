@@ -52,6 +52,8 @@ import:
 		module_table_find_id_by_canonical_path,
 		module_table_id_at,
 		singleton_module_table,
+	../../../src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority:
+		AcceptedRecordEquality(DerivedRecordEquality, NoRecordEquality, WrittenRecordEquality),
 	../../../src/compiler/stage_06_typecheck/decl:
 		TypedDecl(
 			TypedFunctionDecl,
@@ -247,6 +249,7 @@ import:
 		CoreLowerCallableNameRegistry(CoreLowerPreparedCallableNames, CoreLowerDefaultCallableNames),
 		CoreLowerContext,
 		CoreLowerError(CoreLowerInvalidCall, CoreLowerInvalidType, CoreLowerUnsupported),
+		CoreLowerProgramResult,
 		core_lower_context,
 		core_lower_context_with_callable_names,
 		core_lower_context_with_range_fields,
@@ -309,6 +312,7 @@ import:
 			LetExpr,
 			ListConstructExpr,
 			LiteralExpr,
+			LogicalExpr,
 			PreClosureDetachExpr,
 			PreClosureConcurrentExpr,
 			PreClosureConcurrentlyLoopExpr,
@@ -320,6 +324,7 @@ import:
 			SelectExpr,
 			TupleExpr,
 			TupleFieldExpr,
+			UnaryExpr,
 			VarExpr,
 			VectorExpr,
 			WhileExpr,
@@ -335,7 +340,10 @@ import:
 			UnresolvedBuiltinFunction,
 			UserFunction,
 		),
+		CoreBinaryOp(EqualOp),
 		CoreDeclaredOrigin(Entrypoint, ImplMethod, SourceFunction),
+		CoreLogicalOp(AndOp),
+		CoreUnaryOp(NotOp),
 		CoreFunctionOrigin(Declared),
 		CoreModuleOrigin(NoSourceModule, SourceModule),
 		CoreListStorageLayout(InlineListStorage),
@@ -1217,7 +1225,8 @@ pure func typed_record_info(is_fixed_record: Bool) -> TypedRecordInfo:
 		fields = [
 			typed_record_field("x", int_type(), int_type()),
 			typed_record_field("label", TYPE_STRING, TYPE_STRING),
-		]
+		],
+		equality = NoRecordEquality
 	}
 
 
@@ -6087,6 +6096,132 @@ func test_lowers_heap_record_decl_with_field_release_policy() -> Bool:
 			False
 
 
+private pure func lowered_record_program(equality: AcceptedRecordEquality) -> Option[CoreLowerProgramResult]:
+	(modules, module_id) = singleton_module_table(
+		resolved_module_identity_from_resolver("geometry", UserModule),
+	)
+	context = core_lower_context_with_callable_names(
+		10,
+		Some("geometry"),
+		empty_core_definition_table(modules),
+		module_id,
+		CoreLowerDefaultCallableNames,
+	)
+	info: TypedRecordInfo = { typed_record_info(False) | equality = equality }
+	program: TypedProgram = {
+		source = fixture_source_file(),
+		decls = [TypedRecordDecl(info)],
+		diagnostics = [],
+		type_definitions = [],
+		type_references = []
+	}
+
+	match lower_typed_program(context, program):
+		Ok(result):
+			Some(result)
+		Err(_):
+			None
+
+
+---
+Whether `body` is `left.field == right.field` for `field`.
+---
+private pure func compares_field(body: CoreExpr, field: String) -> Bool:
+	match body:
+		BinaryExpr(EqualOp, FieldExpr(VarExpr(left, _, _), left_field, _, _, _), FieldExpr(VarExpr(right, _, _), right_field, _, _, _), _, _):
+			left.name == "left" and right.name == "right" and left_field == field and right_field == field
+		_:
+			False
+
+
+func test_lowers_derived_record_equality_to_fieldwise_impl() -> Bool:
+	match lowered_record_program(DerivedRecordEquality):
+		Some(result):
+			match result.program.decls:
+				[HeapRecordDecl(_), ImplDecl(implementation)]:
+					match (
+						implementation.methods.get(0).and_then(func(method): method.body),
+						implementation.methods.get(1).and_then(func(method): method.body),
+					):
+						(Some(LogicalExpr(AndOp, first, second, _, _)), Some(UnaryExpr(NotOp, BinaryExpr(EqualOp, VarExpr(left, _, _), VarExpr(right, _, _), _, _), _, _))):
+							(
+								implementation.trait_name == "Equatable"
+								and implementation.type_params.is_empty()
+								and implementation.methods.map(func(method): method.name) == ["equals", "not_equals"]
+								and implementation.methods.map(func(method): method.def_id) == [10, 11]
+								and result.context.next_def_id == 12
+								and compares_field(first, "x")
+								and compares_field(second, "label")
+								and left.name == "left"
+								and right.name == "right"
+							)
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+func test_lowers_derived_tuple_equality_beside_trait() -> Bool:
+	(modules, module_id) = singleton_module_table(
+		resolved_module_identity_from_resolver("traits", UserModule),
+	)
+	context = core_lower_context_with_callable_names(
+		10,
+		Some("traits"),
+		empty_core_definition_table(modules),
+		module_id,
+		CoreLowerDefaultCallableNames,
+	)
+	info: TypedTraitInfo = {
+		decl = parsed_trait_decl(),
+		methods = [],
+		derived_tuple_arities = [2]
+	}
+	program: TypedProgram = {
+		source = fixture_source_file(),
+		decls = [TypedTraitDecl(info)],
+		diagnostics = [],
+		type_definitions = [],
+		type_references = []
+	}
+
+	match lower_typed_program(context, program):
+		Ok(result):
+			match result.program.decls:
+				[TraitDecl(_), ImplDecl(implementation)]:
+					match implementation.methods.get(0).and_then(func(method): method.body):
+						Some(LogicalExpr(AndOp, BinaryExpr(EqualOp, TupleFieldExpr(_, 0, _, _), TupleFieldExpr(_, 0, _, _), _, _), BinaryExpr(EqualOp, TupleFieldExpr(_, 1, _, _), TupleFieldExpr(_, 1, _, _), _, _), _, _)):
+							(
+								implementation.trait_name == "Equatable"
+								and core_type_to_json(implementation.for_type).to_string() == core_type_to_json(
+									TupleType([TypeParameterType("T0"), TypeParameterType("T1")]),
+								).to_string()
+								and implementation.type_params.map(func(param): param.bounds) == [["Equatable"], ["Equatable"]]
+								and implementation.methods.map(func(method): method.name) == ["equals", "not_equals"]
+								and result.context.next_def_id == 12
+							)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_lowers_no_impl_for_written_or_absent_record_equality() -> Bool:
+	match (lowered_record_program(WrittenRecordEquality), lowered_record_program(NoRecordEquality)):
+		(Some(written), Some(absent)):
+			match (written.program.decls, absent.program.decls):
+				([HeapRecordDecl(_)], [HeapRecordDecl(_)]):
+					written.context.next_def_id == 10 and absent.context.next_def_id == 10
+				_:
+					False
+		_:
+			False
+
+
 func test_lowers_exact_std_declaration_with_abi_identity() -> Bool:
 	base_info: TypedRecordInfo = typed_record_info(False)
 	info: TypedRecordInfo = { base_info | decl = { base_info.decl | name = ident("MemStats") } }
@@ -6347,7 +6482,8 @@ func test_lowers_trait_signatures() -> Bool:
 	}
 	info: TypedTraitInfo = {
 		decl = parsed_trait_decl(),
-		methods = [method]
+		methods = [method],
+		derived_tuple_arities = []
 	}
 
 	match lower_typed_decl(
@@ -7502,6 +7638,15 @@ tests: TestSuite = {
 			"lowers heap record decl with field release policy",
 			test_lowers_heap_record_decl_with_field_release_policy,
 		),
+		(
+			"lowers derived record equality to a fieldwise impl",
+			test_lowers_derived_record_equality_to_fieldwise_impl,
+		),
+		(
+			"lowers no impl for written or absent record equality",
+			test_lowers_no_impl_for_written_or_absent_record_equality,
+		),
+		("lowers derived tuple equality beside trait", test_lowers_derived_tuple_equality_beside_trait),
 		(
 			"lowers exact std declaration with ABI identity",
 			test_lowers_exact_std_declaration_with_abi_identity,

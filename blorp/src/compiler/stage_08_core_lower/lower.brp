@@ -21,6 +21,7 @@ import:
 		NAME_ID_EQUATABLE_TRAIT,
 		NAME_ID_HASHABLE_TRAIT,
 		NAME_ID_HASH_METHOD,
+		NAME_ID_NOT_EQUALS_METHOD,
 		NAME_ID_STRINGABLE_TRAIT,
 		NAME_ID_TO_STRING_METHOD,
 		NAME_ID_WILDCARD,
@@ -46,6 +47,7 @@ import:
 		ParsedParam,
 		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder, ParsedParamWildcardBinder),
 		ParsedTypeParamDecl,
+		ParsedTypeParamKind(ParsedDimensionParameter),
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
 		parsed_function_body_kind,
 	../stage_04_modules/module_table:
@@ -144,6 +146,8 @@ import:
 		typed_expr_value_type,
 		typed_with_binding_is_try,
 	../stage_06_typecheck/type_system/language_surface_manifest: DeclaredAbiType, declared_abi_type
+	../stage_06_typecheck/type_system/accepted_trait_implementation_authority:
+		AcceptedRecordEquality(DerivedRecordEquality, NoRecordEquality, WrittenRecordEquality),
 	../stage_06_typecheck/type_system/semantic_type:
 		SemanticDimOp(SemanticDimAdd, SemanticDimDivide, SemanticDimMultiply, SemanticDimSubtract),
 		SemanticType(
@@ -165,6 +169,7 @@ import:
 		array_type_parts,
 		canonical_module_type_name,
 		normalize_type_name,
+		semantic_type_variable_named,
 		type_to_string,
 	../stage_06_typecheck/type_system/type_name_metadata:
 		is_resource_source_type_name,
@@ -294,6 +299,16 @@ private CORE_INT_MIN_MAGNITUDE_DECIMAL: String = "9223372036854775808"
 private MICROSECONDS_PER_MILLISECOND: Int = 1000
 
 private PARALLEL_VECTOR_TYPE_NAME: String = "ParallelVector"
+
+---
+The trait a derived record equality implements, in the spelling Core names
+traits by (`CoreImplDecl.trait_name`, which trait resolution keys impls on).
+---
+private EQUATABLE_TRAIT_NAME: String = "Equatable"
+
+-- Derived tuple equality names its element parameters `T0`, `T1`, ...; the
+-- names are local to the impl.
+private DERIVED_TUPLE_ELEMENT_PARAMETER: String = "T"
 
 private PARALLEL_MATRIX_TYPE_NAME: String = "ParallelMatrix"
 
@@ -5917,6 +5932,269 @@ private pure func lower_typed_record(
 
 
 ---
+The two operands of a derived `equals`, typed as the impl's receiver. Their
+binder ids come from the span of the declaration the impl is derived for and
+the span of its name: offsets no authored binder in the file starts at.
+---
+private record DerivedEqualityOperands {
+	left: CoreVar,
+	right: CoreVar,
+	receiver: CoreType,
+	loc: CoreSourceLoc
+}
+
+
+private pure func derived_equality_operands(
+	context: CoreLowerContext,
+	receiver: CoreType,
+	declaration_span: SourceLocation,
+	name_span: SourceLocation,
+) -> DerivedEqualityOperands:
+	{
+		left = { core_var("left", None) | id = core_binder_id(declaration_span) },
+		right = { core_var("right", None) | id = core_binder_id(name_span) },
+		receiver = receiver,
+		loc = core_source_loc_from_context(context, declaration_span)
+	}
+
+
+---
+A derived `Equatable` impl: `equals` is the components' `==` joined by `and`
+in order (True when there are none), each `==` a Core operator that trait
+resolution sends to the component type's own equality, and `not_equals` is
+`not (left == right)`, the trait default.
+---
+private pure func derived_equality_impl(
+	context: CoreLowerContext,
+	operands: DerivedEqualityOperands,
+	type_params: List[CoreTypeParam],
+	component_equalities: List[CoreExpr],
+) -> Result[CoreLowerDeclResult, CoreLowerError]:
+	module ?= lowered_module_origin(context)
+	loc = operands.loc
+	var all_equal: Option[CoreExpr] = None
+
+	for component_equal in component_equalities:
+		all_equal = match all_equal:
+			Some(earlier):
+				Some(LogicalExpr(AndOp, earlier, component_equal, CORE_BOOL_TYPE, loc))
+			None:
+				Some(component_equal)
+
+	params: List[CoreParam] = [
+		{
+			name = operands.left,
+			typ = operands.receiver,
+			loc = loc
+		},
+		{
+			name = operands.right,
+			typ = operands.receiver,
+			loc = loc
+		},
+	]
+	(after_equals, equals_def_id) = mint_def_id(context)
+	(after_not_equals, not_equals_def_id) = mint_def_id(after_equals)
+	equals: CoreFunction = {
+		name = "equals",
+		source_module = context.source_module,
+		module = module,
+		type_params = type_params.map(func(param): param.name),
+		params = params,
+		return_type = CORE_BOOL_TYPE,
+		body = Some(all_equal.get_or(LiteralExpr(BoolLiteral(True), CORE_BOOL_TYPE, loc))),
+		is_pure = True,
+		function_kind = UserFunction,
+		origin = Declared(
+			ImplMethod(
+				NAME_ID_EQUATABLE_TRAIT,
+				NAME_ID_EQUALS_METHOD,
+				impl_method_role(NAME_ID_EQUATABLE_TRAIT, NAME_ID_EQUALS_METHOD),
+			),
+		),
+		def_id = equals_def_id,
+		loc = loc
+	}
+	operands_equal = BinaryExpr(
+		EqualOp,
+		VarExpr(operands.left, operands.receiver, loc),
+		VarExpr(operands.right, operands.receiver, loc),
+		CORE_BOOL_TYPE,
+		loc,
+	)
+	not_equals: CoreFunction = { equals |
+		name = "not_equals",
+		body = Some(UnaryExpr(NotOp, operands_equal, CORE_BOOL_TYPE, loc)),
+		origin = Declared(
+			ImplMethod(
+				NAME_ID_EQUATABLE_TRAIT,
+				NAME_ID_NOT_EQUALS_METHOD,
+				impl_method_role(NAME_ID_EQUATABLE_TRAIT, NAME_ID_NOT_EQUALS_METHOD),
+			),
+		),
+		def_id = not_equals_def_id
+	}
+
+	Ok({
+		context = after_not_equals,
+		decl = ImplDecl({
+			trait_name = EQUATABLE_TRAIT_NAME,
+			for_type = operands.receiver,
+			type_params = type_params,
+			methods = [equals, not_equals],
+			loc = loc,
+		}),
+	})
+
+
+---
+The `Equatable` impl of a record whose equality is derived from its fields
+(`DerivedRecordEquality`; typecheck decided which records qualify). It is
+built here from the record's own lowered fields, so it needs no source text or
+typecheck bodies: `equals` compares `left.f == right.f` for each field in
+declaration order. A generic record's impl is generic over its parameters,
+each type parameter bounded by Equatable, so monomorphization specializes it
+like a written `implements Equatable for R[T:Equatable]`.
+---
+private pure func lower_derived_record_equality(
+	context: CoreLowerContext,
+	info: TypedRecordInfo,
+) -> Result[CoreLowerDeclResult, CoreLowerError]:
+	fields ?= lower_heap_record_fields(context.module_member_prefixes, info.fields)
+	receiver ?= core_lower_type_with_prefixes(
+		context.module_member_prefixes,
+		SemanticNamedType(
+			info.decl.name.text,
+			info.decl.type_params.map(
+				func(parameter): semantic_type_variable_named(parameter.name.text),
+			),
+		),
+	)
+	operands = derived_equality_operands(context, receiver, info.decl.span, info.decl.name.span)
+	left_ref = VarExpr(operands.left, receiver, operands.loc)
+	right_ref = VarExpr(operands.right, receiver, operands.loc)
+	derived_equality_impl(
+		context,
+		operands,
+		info.decl.type_params.map(derived_equality_type_param),
+		fields.map(
+			func(
+				field,
+			): BinaryExpr(
+				EqualOp,
+				FieldExpr(left_ref, field.name, field.ref, field.typ, operands.loc),
+				FieldExpr(right_ref, field.name, field.ref, field.typ, operands.loc),
+				CORE_BOOL_TYPE,
+				operands.loc,
+			),
+		),
+	)
+
+
+---
+The `Equatable` impl derived for tuples of `arity` elements, generic over
+one Equatable parameter per element: `equals` compares `left[i] == right[i]`
+in order. Tuples belong to no module, so it is lowered with the Equatable
+trait declaration whose `derived_tuple_arities` lists the arity.
+---
+private pure func lower_derived_tuple_equality(
+	context: CoreLowerContext,
+	info: TypedTraitInfo,
+	arity: Int,
+) -> Result[CoreLowerDeclResult, CoreLowerError]:
+	type_params: List[CoreTypeParam] = 0.range(arity).map(func(index): {
+			name = DERIVED_TUPLE_ELEMENT_PARAMETER + index.to_string(),
+			bounds = [EQUATABLE_TRAIT_NAME]
+		})
+	elements: List[CoreType] = type_params.map(func(param): TypeParameterType(param.name))
+	receiver: CoreType = TupleType(elements)
+	operands = derived_equality_operands(context, receiver, info.decl.span, info.decl.name.span)
+	left_ref = VarExpr(operands.left, receiver, operands.loc)
+	right_ref = VarExpr(operands.right, receiver, operands.loc)
+	derived_equality_impl(
+		context,
+		operands,
+		type_params,
+		elements
+			.enumerate()
+			.map(
+				func(
+					element,
+				): BinaryExpr(
+					EqualOp,
+					TupleFieldExpr(left_ref, element[0], element[1], operands.loc),
+					TupleFieldExpr(right_ref, element[0], element[1], operands.loc),
+					CORE_BOOL_TYPE,
+					operands.loc,
+				),
+			),
+	)
+
+
+---
+A parameter of a derived record equality, bounded by the traits the record
+declares for it and, for a type parameter, by Equatable. A dimension parameter
+takes no trait bound. Core names bounds by trait spelling, as written impls do;
+a declared Equatable bound appears twice, which monomorphization's request set
+absorbs.
+---
+private pure func derived_equality_type_param(parameter: ParsedTypeParamDecl) -> CoreTypeParam:
+	declared: List[String] = parameter.bounds.map(func(bound): bound.name.text)
+
+	bounds: List[String] = if parameter.kind == ParsedDimensionParameter:
+		declared
+	else:
+		declared.append(EQUATABLE_TRAIT_NAME)
+
+	{
+		name = parameter.name.text,
+		bounds = bounds
+	}
+
+
+---
+The Equatable impls Core derives beside `decl`: one for a record whose
+equality is derived, one per derived tuple arity beside the Equatable trait,
+and none otherwise.
+---
+private pure func lower_derived_equalities(
+	context: CoreLowerContext,
+	decl: TypedDecl,
+) -> Result[(CoreLowerContext, List[CoreDecl]), CoreLowerError]:
+	match decl:
+		TypedRecordDecl(info):
+			match info.equality:
+				DerivedRecordEquality:
+					result ?= lower_derived_record_equality(context, info)
+					Ok((result.context, [result.decl]))
+				WrittenRecordEquality | NoRecordEquality:
+					Ok((context, []))
+		TypedTraitDecl(info):
+			var current: CoreLowerContext = context
+			var decls: List[CoreDecl] = []
+			var failure: Option[CoreLowerError] = None
+
+			for arity in info.derived_tuple_arities:
+				if failure.is_none():
+					match lower_derived_tuple_equality(current, info, arity):
+						Ok(result):
+							current = result.context
+							decls = decls.append(result.decl)
+						Err(error):
+							failure = Some(error)
+
+			match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok((current, decls))
+		TypedPrivateDecl(inner):
+			lower_derived_equalities(context, inner)
+		_:
+			Ok((context, []))
+
+
+---
 Whole-program name facts `source_union_typed_payload_field_supported` needs
 but a single module's `TypedProgram` cannot answer alone: which names are
 fieldless `enum` declarations, and what
@@ -6509,6 +6787,14 @@ pure func lower_typed_program_with_ctfe_replacements(
 						decls = decls.append(result.decl)
 					Err(error):
 						failure = Some(error)
+
+				if failure.is_none():
+					match lower_derived_equalities(current, decl):
+						Ok(derived):
+							current = derived[0]
+							decls = decls.concat(derived[1])
+						Err(error):
+							failure = Some(error)
 
 	core_lowering_type_metrics_report_flush()
 

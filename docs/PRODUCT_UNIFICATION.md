@@ -71,7 +71,7 @@ Section 3.1 shows the Core of both.
 | Field identity | `CoreFieldOrdinal`, issued by the product's layout. The typecheck `FieldId` stays a column of the record row only. |
 | Representation | `ManagedBox` or `InlineValue`, carried in the product type and separate from identity. Inline fixed records supply the first `InlineValue` products. |
 | Operations | One build, read, update, reuse and copy-on-write form for both families. Evaluation order and storage position are separate facts. |
-| Equality and hash | Tuples and records resolve to trait implementations. Core has no native equality for products. |
+| Equality and hash | Tuples and records resolve to trait implementations, a record's derived fieldwise when none is written. Core has no native equality for products. |
 | First optimization | Scalar replacement of managed products within and across calls, records admitted. It is increments 1 and 2 generalised. |
 | Runtime | Tuple boxes use the record emitter's typed layouts. The runtime's own tuple producers move behind a defined boundary. |
 
@@ -388,10 +388,25 @@ deletion of old arms.
 ### 1.7 Equality and hash
 
 Tuple `==` and hashing come from `implements Equatable for (A:Equatable,
-B:Equatable)` and its siblings in `standard_library/src/tuple.brp:46`. A
-record needs its own implementation; the Guide says there is no identity
-fallback. Dictionary key callbacks (`hash_key_callbacks`) reach the resolved
-implementation the same way for both families.
+B:Equatable)` and its siblings in `standard_library/src/tuple.brp:46`. A record
+with no written implementation derives its equality fieldwise: typecheck
+decides, once per graph, which records have every field Equatable
+(`stage_06_typecheck/headers/derived_record_equality.brp`), and Core lowering
+builds their `Equatable` impl from the record's lowered fields
+(`lower_derived_record_equality`), so each comparison is an ordinary impl
+method that trait resolution and monomorphization treat like a written one.
+Tuples derive theirs the same way, element by element, for every arity the
+graph has no written implementation of; the impl is lowered beside the
+Equatable trait declaration, since a tuple belongs to no module. Seven
+written implementations are exactly the derived comparison and stay only until
+the bootstrap compiler derives equality, because it compiles the compiler and
+the standard library: `SourcePackageLayout`, `LintConstantValue`,
+`LintConstantParameterState` and `WorkspaceRoot` in `blorp/src`, and the three
+tuple implementations in `tuple.brp`. Delete them after the next bootstrap
+rotation. There is still no
+identity fallback. Dictionary key callbacks
+(`hash_key_callbacks`) reach the resolved implementation the same way for both
+families.
 
 Core has no native equality for products. `has_native_structural_equality`
 in `trait_resolve.brp` covers only enum tags, `..#N` indices, `Ptr`, numeric

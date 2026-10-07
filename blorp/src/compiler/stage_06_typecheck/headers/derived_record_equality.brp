@@ -1,0 +1,206 @@
+-- Derived record equality: which records are Equatable without an
+-- `implements` block.
+--
+-- A record that no implementation of Equatable is written for derives one when
+-- every field type is Equatable, comparing the fields in declaration order. A
+-- generic record derives the equivalent of
+-- `implements Equatable for R[T:Equatable, ...]`, so the decision is made once,
+-- for the record's own parameters, assuming each is Equatable; an application
+-- such as `R[Int]` then matches it like any bounded implementation, and
+-- generic code and monomorphization need no special path.
+--
+-- Records may reach themselves and each other through their fields
+-- (`children: List[Tree]`), so the decision is coinductive: every candidate is
+-- first assumed Equatable, then any candidate with a field that is not
+-- Equatable under the current assumptions is dropped, until nothing changes.
+-- That is the greatest fixed point, it terminates because each round removes a
+-- candidate or stops, and it accepts a recursive record whose other fields are
+-- Equatable.
+import:
+	../graph/indexed_graph: PreparedModuleScope
+	../type_system/accepted_record_authority:
+		AcceptedRecordTable,
+		accepted_record_table_definition_table,
+		accepted_record_table_fields,
+		accepted_record_table_known_type_names,
+	../type_system/accepted_trait_implementation_authority:
+		AcceptedDerivedEqualities,
+		AcceptedDerivedEquality,
+		AcceptedTraitImplementationAuthority,
+		AcceptedTraitImplementationTable,
+		accepted_derived_equalities,
+		accepted_derived_equality_for_record,
+		accepted_resolve_trait_obligation,
+		accepted_trait_implementation_authority_with_derived_equalities,
+		accepted_trait_implementation_table_has_written_equality,
+	../type_system/env:
+		Env,
+		TraitObligationResolution(TraitObligationSatisfied),
+		env_extend_type_param_bounds,
+		env_has_compiler_structural_equality,
+		equality_component_types,
+		trait_obligation,
+	../type_system/semantic_type: SemanticType, canonical_module_type_name, localize_module_types
+	../type_system/trait_identity: TRAIT_ID_EQUATABLE
+	type_header_graph:
+		AcceptedRecordHeader,
+		TypeHeaderGraph,
+		record_type_header_id,
+		record_type_header_parameters,
+		record_type_header_source_name,
+		type_header_graph_local_record_headers_for_scope,
+	type_parameter_headers: type_parameter_id_name
+
+
+---
+What derivation needs from one module: its scope, whose record headers are
+the candidates it declares, and the authority (built over the written
+implementations) and environment its own bodies are checked with, so a field
+is judged Equatable exactly as `left.field == right.field` in that module
+would be.
+---
+record RecordEqualityModule {
+	scope: PreparedModuleScope,
+	module_path: String,
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env
+}
+
+
+private record RecordEqualityCandidate {
+	module_index: Int,
+	derived: AcceptedDerivedEquality,
+	field_types: List[SemanticType]
+}
+
+
+private pure func record_candidate(
+	table: AcceptedTraitImplementationTable,
+	record_table: AcceptedRecordTable,
+	module_index: Int,
+	module: RecordEqualityModule,
+	header: AcceptedRecordHeader,
+) -> Option[RecordEqualityCandidate]:
+	canonical_name = canonical_module_type_name(
+		module.module_path,
+		record_type_header_source_name(header),
+	)
+
+	if accepted_trait_implementation_table_has_written_equality(table, canonical_name):
+		None
+	else:
+		id = record_type_header_id(header)
+		fields ?= accepted_record_table_fields(
+			record_table,
+			accepted_record_table_definition_table(record_table),
+			id,
+		)
+		derived ?= accepted_derived_equality_for_record(
+			table,
+			id,
+			canonical_name,
+			record_type_header_parameters(header).map(func(parameter): {
+					name = type_parameter_id_name(parameter.id),
+					declared_bounds = parameter.bounds
+				}),
+		)
+		Some({
+			module_index = module_index,
+			derived = derived,
+			field_types = fields.map(
+				func(field): localize_module_types(module.module_path, field.field_type),
+			),
+		})
+
+
+---
+Whether `typ` is Equatable where the record is declared, by the same rules a
+body uses for `==` (`infer_resolve_trait_obligation`): compiler-provided
+equality, then the components of List, Option, Result and tuples, then
+implementations, derived ones included.
+---
+private pure func field_type_is_equatable(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	typ: SemanticType,
+) -> Bool:
+	if env_has_compiler_structural_equality(env, typ):
+		True
+	else:
+		match equality_component_types(typ):
+			Some(components):
+				components.all(func(component): field_type_is_equatable(authority, env, component))
+			None:
+				accepted_resolve_trait_obligation(
+					authority,
+					env,
+					trait_obligation(typ, TRAIT_ID_EQUATABLE),
+				) == TraitObligationSatisfied
+
+
+---
+One round of the fixed point: assume every candidate derives equality, and
+stop when every candidate's fields are Equatable under that assumption;
+otherwise go again with the candidates that passed. A round drops the records
+with a field that is not Equatable, so the number of rounds is one more than
+the longest chain of records each reaching the next through a field and ending
+at a record that cannot derive; the recursion is that deep.
+---
+private pure func settle_record_equalities(
+	declared_type_names: List[String],
+	modules: List[RecordEqualityModule],
+	candidates: List[RecordEqualityCandidate],
+) -> AcceptedDerivedEqualities:
+	assumed = accepted_derived_equalities(
+		declared_type_names,
+		candidates.map(func(candidate): candidate.derived),
+	)
+	authorities = modules.map(
+		func(
+			module,
+		): accepted_trait_implementation_authority_with_derived_equalities(
+			module.authority,
+			assumed,
+		),
+	)
+	survivors = candidates.filter(func(candidate):
+		match (authorities.get(candidate.module_index), modules.get(candidate.module_index)):
+			(Some(authority), Some(module)):
+				env = env_extend_type_param_bounds(module.env, candidate.derived.bounds)
+				candidate.field_types.all(
+					func(field_type): field_type_is_equatable(authority, env, field_type),
+				)
+			_:
+				False
+	)
+
+	if survivors.length() == candidates.length():
+		assumed
+	else:
+		settle_record_equalities(declared_type_names, modules, survivors)
+
+
+---
+The derived equality of every record whose fields are all Equatable and that
+has no written implementation in `table`. `modules` must cover every module of
+the graph and carry authorities built from `table`.
+---
+pure func derive_record_equalities(
+	table: AcceptedTraitImplementationTable,
+	type_headers: TypeHeaderGraph,
+	record_table: AcceptedRecordTable,
+	modules: List[RecordEqualityModule],
+) -> AcceptedDerivedEqualities:
+	var candidates: List[RecordEqualityCandidate] = []
+
+	for indexed in modules.enumerate():
+		module = indexed[1]
+
+		for header in type_header_graph_local_record_headers_for_scope(type_headers, module.scope):
+			match record_candidate(table, record_table, indexed[0], module, header):
+				Some(candidate):
+					candidates = candidates.append(candidate)
+				None:
+					void
+
+	settle_record_equalities(accepted_record_table_known_type_names(record_table), modules, candidates)

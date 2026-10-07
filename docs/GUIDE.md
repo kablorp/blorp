@@ -1028,7 +1028,7 @@ compile error that names the type:
 
 ```text
 error: `Point` cannot be a Dict key because it does not implement Hashable at app.brp:14:33
-    help: Dict keys and Set elements are compared by value, so `Point` must implement Equatable and Hashable over the same fields: ...
+    help: Dict keys and Set elements are compared by value, so `Point` must implement Hashable consistently with its `==`: ...
 ```
 
 These types are `Hashable` already:
@@ -1042,18 +1042,16 @@ These types are `Hashable` already:
   whose components are `Hashable`, element by element.
 
 `Dict` and `Set` are not `Hashable`; key by a sorted `List` of entries instead.
-For your own `record` and `union` types, implement both traits over
-the same fields:
+For your own `record` types, implement `Hashable` over fields that its `==`
+compares; a record whose fields are all `Equatable` already has that `==`
+([Derived Equality](#derived-equality)). A `union` needs both implementations,
+over the same fields:
 
 ```blorp
 record Point {
     x: Int,
     y: Int
 }
-
-implements Equatable for Point:
-    pure func equals(a: Point, b: Point) -> Bool:
-        a.x == b.x and a.y == b.y
 
 implements Hashable for Point:
     pure func hash(self: Point) -> Int:
@@ -1189,6 +1187,11 @@ length before the append, even when `names` is declared first.
 Each field name appears once in a declaration, a record literal and a record update:
 `record P { x: Int, x: Int }` and `{ x = 1, x = 2 }` are rejected at the second `x`, and
 the message gives the position of the first.
+
+A record whose fields are all `Equatable` is `Equatable` itself: `==` compares
+the fields in declaration order, so `{x = 1, y = 2} == {x = 1, y = 2}` holds for
+`Point` with no `implements` block. [Derived Equality](#derived-equality) has
+the details.
 
 ### Fixed Records
 
@@ -2321,12 +2324,7 @@ implements Stringable for Color:
     pure func to_string(c: Color) -> String:
         "rgb(${to_string(c.r)}, ${to_string(c.g)}, ${to_string(c.b)})"
 
--- Implement Equatable so == and != work on Color
-implements Equatable for Color:
-    pure func equals(a: Color, b: Color) -> Bool:
-        a.r == b.r and a.g == b.g and a.b == b.b
-
--- Now both work:
+-- Now to_string works, and == compares the fields without an implementation:
 func main(args: List[String]) -> Int:
     c: Color = {r = 255, g = 0, b = 0}
     print(to_string(c))      -- "rgb(255, 0, 0)"
@@ -2382,27 +2380,32 @@ d: Vec2 = a * b          -- {x = 3.0, y = 8.0}
 e: Vec2 = -a             -- {x = -1.0, y = -2.0}
 ```
 
-Similarly, implement `Equatable` for `==`/`!=` and `Orderable` for `<`, `>`, `<=`, `>=`:
+Similarly, implement `Orderable` for `<`, `>`, `<=`, `>=`. A record gets `==`
+and `!=` from its fields; implement `Equatable` to compare differently, for
+example within a tolerance:
 
 ```blorp
 fixed record Vec2 {x: Float, y: Float}
 
 implements Equatable for Vec2:
     pure func equals(a: Vec2, b: Vec2) -> Bool:
-        a.x == b.x and a.y == b.y
+        approx_eq(a.x, b.x) and approx_eq(a.y, b.y)
 ```
 
-Every type that has data needs an explicit `Equatable` implementation to use `==`: records and unions with payloads. There is no identity fallback. Payload-free `enum`s are compared by tag and need no implementation, and the standard library provides the implementations for scalars, `String`, tuples, `Option`, `Result`, `List`, and `Dict`. `Option[T]`, `Result[T, E]`, tuples, `List[T]`, and the values of `Dict[K, V]` are `Equatable` exactly when their components are, so `Option[Point]` is rejected unless `Point` implements `Equatable`.
+There is no identity fallback: a value compares only through an `Equatable`
+implementation. Records whose fields are all `Equatable` derive one
+([Derived Equality](#derived-equality)); a union with payloads needs a written
+one. Payload-free `enum`s are compared by tag and need no implementation, and the standard library provides the implementations for scalars, `String`, tuples, `Option`, `Result`, `List`, and `Dict`. `Option[T]`, `Result[T, E]`, tuples, `List[T]`, and the values of `Dict[K, V]` are `Equatable` exactly when their components are, so `Option[Listener]` is rejected when `Listener` is a record with a function field.
 
 `List[T]` is `Equatable` exactly when `T` is: `==` compares lengths, then elements
-with the element type's own `==`, so lists of lists, options, and records with an
-`Equatable` implementation compare by value. Comparing `List[Point]` when `Point`
-has no `Equatable` implementation is a compile error.
+with the element type's own `==`, so lists of lists, options, and records
+compare by value. Comparing `List[Listener]` is a compile error when
+`Listener` is not `Equatable`.
 
 `Dict[K, V]` is `Equatable` exactly when `V` is: two dicts are equal when they
 hold the same keys and each key's values are equal by `V`'s own `==`. Insertion
-order does not matter. Comparing `Dict[Int, Point]` when `Point` has no
-`Equatable` implementation is a compile error.
+order does not matter. Comparing `Dict[Int, Listener]` is a compile error when
+`Listener` is not `Equatable`.
 
 The standard library uses this extensively — `Vec2`, `Vec3`, `Radians`, `Degrees`, `Hz`, `Db`, and all sized numeric types define operators through traits. Builtin scalar implementations, including numeric arithmetic, `String` concatenation, and `FixedPoint` arithmetic, are ordinary trait implementations whose `builtin` bodies lower directly to native Core operations without a runtime trait call. See `standard_library/src/geometry.brp` and `standard_library/src/units.brp` for source-defined examples.
 
@@ -2489,6 +2492,59 @@ for that implementation; write the method in the implementation instead.
 
 Fieldless enums implement `Equatable` and `Hashable` without an `implements`
 block, so they satisfy `T: Equatable` and `T: Hashable` bounds.
+
+### Derived Equality
+
+A `record` or `fixed record` with no written `implements Equatable` is
+`Equatable` when every field type is. `equals` compares the fields in
+declaration order with each field type's own `==`, stopping at the first
+difference, and `!=` is the trait's default `not_equals`. A `Float` field
+compares as `Float` does, so a record holding NaN is not equal to itself.
+
+```blorp
+record Point {x: Int, y: Int}
+
+record Segment {start: Point, end: Point}
+
+func main(args: List[String]) -> Int:
+    a: Segment = {start = {x = 0, y = 0}, end = {x = 1, y = 1}}
+    b: Segment = {start = {x = 0, y = 0}, end = {x = 1, y = 1}}
+    print(a == b)            -- True
+    0
+```
+
+The derived equality behaves like a written implementation everywhere:
+`T: Equatable` bounds accept the record, `List`, `Option` and `Dict` values
+compare it with its `==`, and an `implements Hashable` needs no
+`implements Equatable` beside it.
+
+A generic record is `Equatable` exactly when its type arguments are, as if
+`implements Equatable for Wrap[T:Equatable]` were written: `Wrap[Int]` is
+`Equatable` and `Wrap[(Int) -> Int]` is not. Bounds the record declares stay:
+`record Index[K: Hashable]` is `Equatable` for a `K` that is both. A record may contain itself
+through a `List` or `Option` field (`children: List[Tree]`); its equality then
+recurses through those fields.
+
+A record with a field that is not `Equatable`, such as a function, has no `==`,
+and the error names that field:
+
+```text
+error: `Holder` is not Equatable because its field `callback: (Int) -> Int` is not Equatable at app.brp:9:8
+    help: a record is Equatable when all its fields are; write `implements Equatable for Holder` to define its equality yourself
+```
+
+A written `implements Equatable for X` always replaces the derived one, so a
+record can compare a subset of its fields, normalize them, or compare floats
+within a tolerance. A written implementation for one instantiation, such as
+`implements Equatable for Wrap[Int]`, replaces derivation for every `Wrap`, so
+`Wrap[String]` then has no `==` unless it is written too.
+
+Tuples are compared the same way, element by element, and are `Equatable`
+exactly when their elements are.
+
+Only `Equatable` is derived, and only for records and tuples. Unions with
+payloads still need a written implementation, and `Orderable` and `Hashable`
+are never derived.
 
 ---
 
