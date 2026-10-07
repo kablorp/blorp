@@ -4,15 +4,14 @@
 -- The emitter should consume prepared Core instead of discovering source-level
 -- constructs such as record literals and primitive tuple literals itself.
 import:
-	memory: same_object
 	../stage_08_core_lower/list_layout: tensor_for_element_storage_for_canonical_type
-	c_type_layout: c_type_name, generated_stack_option_c_type_name
 	allocation_contracts:
 		UnionCleanupKind(DirectUnionCleanup, IterativeUnionCleanup, NoUnionCleanup),
 		release_policy_requires_cleanup,
 		union_cleanup_kind,
 		union_field_uses_iterative_cleanup,
 		union_variant_has_cleanup,
+	c_type_layout: c_type_name, unprojected_stack_option_c_type
 	cancellation_plan:
 		CancellationActivationIdentity(
 			FunctionCancellationActivation, GlobalInitializerCancellationActivation,
@@ -30,9 +29,6 @@ import:
 		cancellation_function_summary,
 		cancellation_global_initializer_summary,
 	ir:
-		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
-		core_union_managed_payload_storage,
-		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
 		CoreBoxKind(
 			Float16Box, Float32Box, FloatBox, Int128Box, PointerBox, PrimBox, StructBox, UInt128Box,
 			VoidBox,
@@ -61,7 +57,10 @@ import:
 			ConstructorMatchFallbackBindings, ConstructorMatchFallbackBody,
 			ConstructorMatchFallbackFail,
 		),
-		CoreDecl(InlineRecordDecl, UnionDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, TraitDecl, TypeAliasDecl),
+		CoreDecl(
+			InlineRecordDecl, UnionDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl,
+			TraitDecl, TypeAliasDecl,
+		),
 		CoreDefinitionIdentity,
 		CoreDictConstruct,
 		CoreDictEntry,
@@ -143,7 +142,11 @@ import:
 			TupleFloat32Element, TupleFloat16Element, TupleFloatElement, TuplePointerElement,
 			TuplePrimElement, TupleStructElement, TupleStackResultElement, TupleVoidElement,
 		),
-		CoreType(InlineRecordType, NativeManagedType, BoxedResultType, UnionType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType, VoidType),
+		CoreType(
+			InlineRecordType, NativeManagedType, BoxedResultType, UnionType, FunctionType,
+			HeapRecordType, NamedType, RangeType, SelfType, StackResultType, TensorType, TupleType,
+			TypeParameterType, VoidType,
+		),
 		CoreUnionConstruct,
 		CoreUnionDecl,
 		CoreUnionField,
@@ -152,6 +155,8 @@ import:
 			BoxedOptionRepresentation, GenericUnionRepresentation, NullableOptionRepresentation,
 			StackOptionRepresentation, StackResultRepresentation,
 		),
+		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
 		CoreUnionVariant,
 		CoreVar,
 		CoreVariantRef(
@@ -160,7 +165,9 @@ import:
 		RECORD_LITERAL_FIELD_TEMP_ORIGIN,
 		clone_tensor_for_element_storage,
 		core_field_refs_equal,
+		core_union_managed_payload_storage,
 		core_var_equal,
+	memory: same_object
 	mono: core_mono_type_equal
 	release_mask: release_mask_bit, release_mask_first_word
 	specialize_layout:
@@ -355,17 +362,20 @@ private pure func declared_records(decls: List[CoreDecl]) -> DeclaredRecords:
 			HeapRecordDecl(record_decl):
 				heap = heap.append({
 					name = record_decl.name,
-					field_refs = record_decl.fields.map(func(field): field.ref)
+					field_refs = record_decl.fields.map(func(field): field.ref),
 				})
 			InlineRecordDecl(record_decl):
 				inline = inline.append({
 					name = record_decl.name,
-					field_refs = record_decl.fields.map(func(field): field.ref)
+					field_refs = record_decl.fields.map(func(field): field.ref),
 				})
 			_:
 				void
 
-	{heap = heap, inline = inline}
+	{
+		heap = heap,
+		inline = inline
+	}
 
 
 private pure func find_record_field_order(
@@ -764,7 +774,7 @@ private pure func boxed_kind_for_type(typ: CoreType) -> CoreBoxKind:
 			if name == "Option":
 				match args:
 					[payload]:
-						match stack_option_c_type(payload):
+						match unprojected_stack_option_c_type(payload):
 							Some(option_type):
 								StructBox(option_type)
 							None:
@@ -1702,7 +1712,7 @@ private pure func is_managed_pointer_tuple_slot_type(typ: CoreType) -> Bool:
 			if name == "Option":
 				match args:
 					[payload]:
-						match stack_option_c_type(payload):
+						match unprojected_stack_option_c_type(payload):
 							Some(option_type):
 								False
 							None:
@@ -1795,7 +1805,7 @@ private pure func stack_option_tuple_slot_c_type(typ: CoreType) -> Option[String
 			if name == "Option":
 				match args:
 					[payload]:
-						stack_option_c_type(payload)
+						unprojected_stack_option_c_type(payload)
 					[]:
 						None
 					[first, second, ...rest]:
@@ -2116,7 +2126,10 @@ private pure func tensor_for_element_storage_after_raw_proof(
 			raw_scalar_tensor_element_storage_or(
 				env,
 				iterable,
-				tensor_for_element_storage_for_canonical_type(element_type, c_type_name(element_type, {})),
+				tensor_for_element_storage_for_canonical_type(
+					element_type,
+					c_type_name(element_type, {}),
+				),
 			)
 
 
@@ -3333,75 +3346,6 @@ private pure func prepare_record_construct_expr(
 					expr
 
 
-private pure func stack_option_c_type(payload: CoreType) -> Option[String]:
-	match payload:
-		NativeManagedType(_):
-			None
-		VoidType:
-			Some("blorp_StackOption_Void")
-		NamedType(name, args):
-			match args:
-				[]:
-					if name == "Int":
-						Some("blorp_StackOption_Int")
-					else if name == "Int8":
-						Some("blorp_StackOption_Int8")
-					else if name == "Int16":
-						Some("blorp_StackOption_Int16")
-					else if name == "Int32":
-						Some("blorp_StackOption_Int32")
-					else if name == "Int64":
-						Some("blorp_StackOption_Int64")
-					else if name == "UInt8":
-						Some("blorp_StackOption_UInt8")
-					else if name == "UInt16":
-						Some("blorp_StackOption_UInt16")
-					else if name == "UInt32":
-						Some("blorp_StackOption_UInt32")
-					else if name == "UInt64":
-						Some("blorp_StackOption_UInt64")
-					else if name == "Float":
-						Some("blorp_StackOption_Float")
-					else if name == "Float32":
-						Some("blorp_StackOption_Float32")
-					else if name == "Float16":
-						Some("blorp_StackOption_Float16")
-					else if name == "Bool":
-						Some("blorp_StackOption_Bool")
-					else if name == "Char":
-						Some("blorp_StackOption_Char")
-					else if name == "Int128":
-						Some("blorp_StackOption_Int128")
-					else if name == "UInt128":
-						Some("blorp_StackOption_UInt128")
-					else:
-						None
-				[first, ...rest]:
-					None
-		TypeParameterType(_) | SelfType:
-			None
-		UnionType(name, ScalarTagValue):
-			Some("blorp_StackOption_" + name)
-		HeapRecordType(name):
-			None
-		InlineRecordType(name):
-			Some(generated_stack_option_c_type_name(name))
-		UnionType(name, ManagedUnionValue):
-			None
-		StackResultType(ok_type, err_type):
-			None
-		FunctionType(_, _, _):
-			None
-		BoxedResultType(ok_type, err_type):
-			None
-		RangeType:
-			Some("blorp_StackOption_Range")
-		TensorType(info):
-			None
-		TupleType(items):
-			None
-
-
 private pure func stack_option_none_value(payload: CoreType) -> String:
 	match payload:
 		NamedType(name, args):
@@ -3443,7 +3387,7 @@ private pure func stack_option_representation(
 	payload: CoreType,
 	tag: Int,
 ) -> Option[CoreStackOptionRepresentation]:
-	match stack_option_c_type(payload):
+	match unprojected_stack_option_c_type(payload):
 		Some(option_type):
 			Some({
 				option_type = option_type,
@@ -3933,6 +3877,7 @@ private pure func prepare_union_construct(
 					match find_union_decl(decls.unions_by_name, type_name):
 						Some(union_decl):
 							payload_storage ?= core_union_managed_payload_storage(union_decl)
+
 							match find_union_variant_by_reference(union_decl.variants, def_id):
 								Some(variant):
 									declared_id ?= variant.def_id
@@ -5528,9 +5473,11 @@ private pure func bind_fields_in_written_order(
 			field_bindings = field_bindings.append({
 				variable = variable,
 				typ = value_type,
-				value = field.value
+				value = field.value,
 			})
-			bound_fields = bound_fields.append({ field | value = VarExpr(variable, value_type, loc) })
+			bound_fields = bound_fields.append(
+				{ field | value = VarExpr(variable, value_type, loc) },
+			)
 
 	var bound: CoreExpr = RecordExpr(bound_fields, typ, loc)
 
@@ -5630,10 +5577,12 @@ pure func bind_record_literal_fields_in_written_order(
 					func_info,
 				)
 				binding = bound.state
+
 				bound_decl: CoreDecl = if same_object(bound.value, func_info):
 					decl
 				else:
 					FunctionDecl(bound.value)
+
 				decls = decls.append(bound_decl)
 			GlobalDecl(global):
 				bound: CoreTraverse.CoreMapState[RecordLiteralBinding, CoreExpr] = bind_record_literal_fields_expr(
@@ -5641,10 +5590,12 @@ pure func bind_record_literal_fields_in_written_order(
 					global.init,
 				)
 				binding = bound.state
+
 				bound_decl: CoreDecl = if same_object(bound.value, global.init):
 					decl
 				else:
 					GlobalDecl({ global | init = bound.value })
+
 				decls = decls.append(bound_decl)
 			ImplDecl(impl_decl):
 				var methods: List[CoreFunction] = []
@@ -5663,6 +5614,7 @@ pure func bind_record_literal_fields_in_written_order(
 					ImplDecl({ impl_decl | methods = methods })
 				else:
 					decl
+
 				decls = decls.append(bound_decl)
 			_:
 				decls = decls.append(decl)
@@ -5894,6 +5846,7 @@ private pure func cleanup_field_plan_for_union_field(
 			False
 		ManagedPayloadStorage(payload_storage):
 			union_field_needs_release_in_storage(layout, payload_storage, field)
+
 	{
 		needs_release = needs_release,
 		uses_iterative_cleanup = union_field_uses_iterative_cleanup(union_decl, field)
@@ -5915,6 +5868,7 @@ private pure func cleanup_variant_plan(
 			False
 		ManagedPayloadStorage(payload_storage):
 			union_variant_has_effective_cleanup(layout, payload_storage, variant.fields)
+
 	{
 		has_cleanup = has_cleanup,
 		fields = fields

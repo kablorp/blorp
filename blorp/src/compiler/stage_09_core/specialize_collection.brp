@@ -4,11 +4,9 @@
 -- specialization orchestrator owns recursion so independent builtin families
 -- can be composed without traversing the tree more than once.
 import:
-	c_type_layout: generated_stack_option_c_type_name, type_requires_release
+	c_type_layout: type_requires_release, unprojected_stack_option_c_type
 	erased_key_temps: RELEASE_HASH_KEY_BOX, is_erased_key_temp_marker
 	ir:
-		CoreUnionTagAccess(ScalarTagAccess, ManagedTagAccess),
-		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
 		CoreAccessor(RootAccessor, StackOptionPayloadAccessor, VariantFieldAccessor),
 		CoreBinaryOp(AddOp),
 		CoreBoxKind(
@@ -33,8 +31,13 @@ import:
 		CoreMatchBindingMode(MatchBorrowBindingMode),
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreSourceLoc,
-		CoreType(InlineRecordType, BoxedResultType, UnionType, HeapRecordType, NamedType, RangeType, StackResultType, VoidType),
+		CoreType(
+			InlineRecordType, BoxedResultType, UnionType, HeapRecordType, NamedType, RangeType,
+			StackResultType, VoidType,
+		),
 		CoreUnboxKind,
+		CoreUnionTagAccess(ScalarTagAccess, ManagedTagAccess),
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
 		CoreVar,
 		CoreVariantRef(VariantById),
 		core_expr_type,
@@ -151,34 +154,6 @@ private pure func stream_element_type(
 				Some(resolve_specialize_type(layout, element_type))
 			else:
 				None
-		_:
-			None
-
-
-private pure func stack_option_c_type(payload: CoreType) -> Option[String]:
-	match payload:
-		VoidType:
-			Some("blorp_StackOption_Void")
-		NamedType(name, args):
-			if not args.is_empty():
-				None
-			else if (
-				primitive_integer_type(name)
-				or name == "Float"
-				or name == "Float32"
-				or name == "Float16"
-				or name == "Int128"
-				or name == "UInt128"
-			):
-				Some("blorp_StackOption_" + name)
-			else:
-				None
-		UnionType(name, ScalarTagValue):
-			Some("blorp_StackOption_" + name)
-		InlineRecordType(name):
-			Some(generated_stack_option_c_type_name(name))
-		RangeType:
-			Some("blorp_StackOption_Range")
 		_:
 			None
 
@@ -760,7 +735,7 @@ private pure func stack_option_match_parts(
 ) -> Option[(CoreConstructorMatchTest, CoreAccessor)]:
 	resolved: CoreType = resolve_specialize_type(layout, element_type)
 
-	match stack_option_c_type(resolved):
+	match unprojected_stack_option_c_type(resolved):
 		Some(c_type):
 			Some((StackOptionSomeConstructorTest(c_type), StackOptionPayloadAccessor(RootAccessor)))
 		None:
@@ -788,7 +763,10 @@ private pure func boxed_option_some_match_parts(
 								Some(def_id):
 									result = Some(
 										(
-											UnionTagConstructorTest(VariantById(def_id), ManagedTagAccess("Option")),
+											UnionTagConstructorTest(
+												VariantById(def_id),
+												ManagedTagAccess("Option"),
+											),
 											VariantFieldAccessor(
 												RootAccessor,
 												"Option",
@@ -985,7 +963,15 @@ private pure func specialize_dict_get(
 	match args:
 		[dict_value, key]:
 			if boxed_storage_allocates(layout, core_expr_type(key)):
-				dict_get_releasing_key_box(layout, call_name, callee, dict_value, key, result_type, loc)
+				dict_get_releasing_key_box(
+					layout,
+					call_name,
+					callee,
+					dict_value,
+					key,
+					result_type,
+					loc,
+				)
 			else if runtime_name.is_some():
 				builtin_call_with_callee(
 					call_name,
@@ -1016,24 +1002,39 @@ private pure func dict_get_releasing_key_box(
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
 	dict_type: CoreType = core_expr_type(dict_value)
+
 	map_value: CoreExpr = match dict_value:
 		VarExpr(_, _, _):
 			dict_value
 		_:
 			variable("__dict_get_map", dict_type, loc)
+
 	key_box: CoreExpr = variable("__dict_get_key_box", POINTER_TYPE, loc)
 	found: CoreExpr = variable("__dict_get_found", result_type, loc)
 	lookup: CoreExpr = LetExpr(
 		core_var("__dict_get_key_box"),
 		False,
 		POINTER_TYPE,
-		box_void_slot_argument(layout, key, loc),
+		box_void_slot_argument(
+			layout,
+			key,
+			loc,
+		),
 		LetExpr(
 			core_var("__dict_get_found"),
 			False,
 			result_type,
-			builtin_call_with_callee(call_name, callee, [map_value, key_box], result_type, loc),
-			SeqExpr(intrinsic_call(RELEASE_HASH_KEY_BOX, [key_box], VoidType, loc), found),
+			builtin_call_with_callee(
+				call_name,
+				callee,
+				[map_value, key_box],
+				result_type,
+				loc,
+			),
+			SeqExpr(
+				intrinsic_call(RELEASE_HASH_KEY_BOX, [key_box], VoidType, loc),
+				found,
+			),
 		),
 	)
 

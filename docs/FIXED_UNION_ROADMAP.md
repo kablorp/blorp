@@ -1058,6 +1058,12 @@ exceptions; C type spellings and erased boxes retain their distinct ABI sets.
 This behavior-preserving catalog consolidation does not admit new union layouts
 or complete the shared concrete representation plan above.
 
+The next preparatory cut shares unprojected stack-Option C type selection across
+preparation, list synthesis, collection specialization and erased boxing.
+Primitive C spellings remain literals; backend symbol projection and the erased
+box adapter's named-Void allowance remain explicit separate boundaries. This
+deletes the three private C-type copies without admitting new representations.
+
 ```bash
 bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_type_policy.brp
 bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_match.brp
