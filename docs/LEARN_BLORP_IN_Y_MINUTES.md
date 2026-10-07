@@ -550,8 +550,8 @@ if the cited code has since moved.
 - **`from_opaque` is transparent to ownership analysis, like a cast** — it
   does not introduce a retain by itself (`perceus.brp`'s
   `direct_aliases_name` passes `CastExpr`/`from_opaque` through to its inner
-  value the same as `FieldExpr`). A borrowed argument stays borrowed after
-  `from_opaque`.
+  value the same as a field read, `ProductFieldExpr`). A borrowed argument
+  stays borrowed after `from_opaque`.
 - **`memory.same_object` checks allocation identity across modules**. Its
   heap path compares object addresses without module-local state; stack
   values always return `False`, and an inline fixed record is a compile error

@@ -745,6 +745,10 @@ union TypedExpr:
 	TypedRecordExpr(List[TypedRecordField], SourceLocation, TypedExprInfo)
 	TypedRecordUpdateExpr(TypedExpr, List[TypedRecordField], List[ResolvedRecordField], SourceLocation, TypedExprInfo)
 	TypedFieldAccessExpr(TypedExpr, ParsedIdentifier, ResolvedFieldIdentity, SourceLocation, TypedExprInfo)
+	-- `alias.member`: a member of the module imported as `alias` (a global,
+	-- function or constructor, which the info resolves). An alias is not a
+	-- value, so this is no field access.
+	TypedModuleMemberExpr(ParsedIdentifier, ParsedIdentifier, SourceLocation, TypedExprInfo)
 	TypedLambdaExpr(Bool, List[TypedLambdaParam], Option[SemanticType], TypedExpr, SourceLocation, TypedExprInfo)
 	TypedRangeExpr(TypedExpr, TypedExpr, ResolvedRangeFields, SourceLocation, TypedExprInfo)
 	TypedIfExpr(TypedExpr, TypedExpr, Option[TypedExpr], SourceLocation, TypedExprInfo)
@@ -864,7 +868,7 @@ pure func typed_expr_location(expr: TypedExpr) -> SourceLocation:
 			span
 		TypedRecordUpdateExpr(_, _, _, span, _):
 			span
-		TypedFieldAccessExpr(_, _, _, span, _):
+		TypedFieldAccessExpr(_, _, _, span, _) | TypedModuleMemberExpr(_, _, span, _):
 			span
 		TypedLambdaExpr(_, _, _, _, span, _):
 			span
@@ -2023,7 +2027,7 @@ pure func typed_expr_info(expr: TypedExpr) -> TypedExprInfo:
 			info
 		TypedRecordUpdateExpr(_, _, _, _, info):
 			info
-		TypedFieldAccessExpr(_, _, _, _, info):
+		TypedFieldAccessExpr(_, _, _, _, info) | TypedModuleMemberExpr(_, _, _, info):
 			info
 		TypedLambdaExpr(_, _, _, _, _, info):
 			info
@@ -2121,6 +2125,8 @@ private pure func typed_expr_with_info(expr: TypedExpr, info: TypedExprInfo) -> 
 			TypedRecordUpdateExpr(receiver, fields, record_fields, span, info)
 		TypedFieldAccessExpr(receiver, field, field_id, span, _):
 			TypedFieldAccessExpr(receiver, field, field_id, span, info)
+		TypedModuleMemberExpr(module_alias, member, span, _):
+			TypedModuleMemberExpr(module_alias, member, span, info)
 		TypedLambdaExpr(is_pure, params, return_annotation, body, span, _):
 			TypedLambdaExpr(is_pure, params, return_annotation, body, span, info)
 		TypedRangeExpr(start_expr, end_expr, range_fields, span, _):
@@ -2456,7 +2462,7 @@ private pure func direct_callable_resolution(callee: TypedExpr) -> Option[Resolv
 	match callee:
 		TypedNameExpr(_, _):
 			typed_expr_resolved_call(callee)
-		TypedFieldAccessExpr(_, _, _, _, _):
+		TypedFieldAccessExpr(_, _, _, _, _) | TypedModuleMemberExpr(_, _, _, _):
 			typed_expr_resolved_call(callee)
 		_:
 			None
@@ -2682,7 +2688,7 @@ pure func typed_expr_type_error(expr: TypedExpr) -> Option[String]:
 			Some(message)
 		None:
 			match expr:
-				TypedNameExpr(_, _):
+				TypedNameExpr(_, _) | TypedModuleMemberExpr(_, _, _, _):
 					None
 				TypedIntLiteralExpr(_, _, _):
 					None
@@ -2925,7 +2931,7 @@ pure func typed_expr_contains_meta(expr: TypedExpr) -> Bool:
 		True
 	else:
 		match expr:
-			TypedNameExpr(_, _):
+			TypedNameExpr(_, _) | TypedModuleMemberExpr(_, _, _, _):
 				False
 			TypedIntLiteralExpr(_, _, _):
 				False
@@ -3546,6 +3552,8 @@ pure func zonk_typed_expr(context: Context, expr: TypedExpr) -> TypedExpr:
 				span,
 				info,
 			)
+		TypedModuleMemberExpr(module_alias, member, span, _):
+			TypedModuleMemberExpr(module_alias, member, span, info)
 		TypedLambdaExpr(is_pure, params, return_annotation, body, span, _):
 			TypedLambdaExpr(
 				is_pure,
@@ -4573,7 +4581,7 @@ private pure func startup_call_name(callee: TypedExpr, info: TypedExprInfo) -> S
 			match callee:
 				TypedNameExpr(name, _):
 					name.text
-				TypedFieldAccessExpr(_, field, _, _, _):
+				TypedFieldAccessExpr(_, field, _, _, _) | TypedModuleMemberExpr(_, field, _, _):
 					field.text
 				_:
 					"<expression>"
@@ -10029,19 +10037,6 @@ private pure func inferred_call_info(
 	)
 
 
-private pure func typed_module_marker_expr(module_ident: ParsedIdentifier) -> TypedExpr:
-	TypedNameExpr(
-		module_ident,
-		typed_expr_info_from_slot(
-			None,
-			InferredOrigin,
-			UNREFINED_BINDING,
-			None,
-			KeptValueSlot(SemanticNamedType("Module", [])),
-		),
-	)
-
-
 private pure func typed_qualified_module_field_expr(
 	module_ident: ParsedIdentifier,
 	field: ParsedIdentifier,
@@ -10049,10 +10044,9 @@ private pure func typed_qualified_module_field_expr(
 	field_type: SemanticType,
 	resolved_call: Option[ResolvedCallInfo],
 ) -> TypedExpr:
-	TypedFieldAccessExpr(
-		typed_module_marker_expr(module_ident),
+	TypedModuleMemberExpr(
+		module_ident,
 		field,
-		MISSING_RESOLVED_FIELD_IDENTITY,
 		span,
 		typed_expr_info_from_slot(
 			None,
@@ -10070,10 +10064,9 @@ private pure func typed_qualified_module_var_expr(
 	span: SourceLocation,
 	binding: AcceptedGlobalBinding,
 ) -> TypedExpr:
-	TypedFieldAccessExpr(
-		typed_module_marker_expr(module_ident),
+	TypedModuleMemberExpr(
+		module_ident,
 		field,
-		MISSING_RESOLVED_FIELD_IDENTITY,
 		span,
 		{ typed_expr_info_from_slot(
 			binding.source_type,

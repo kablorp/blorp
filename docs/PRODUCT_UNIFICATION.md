@@ -1,6 +1,7 @@
 # Product Unification
 
-Status: plan; nothing here is implemented. Records and tuples become one
+Status: plan; slice 1 (one projection form) is implemented, the rest is not.
+Records and tuples become one
 product family in Core, the ownership passes, the runtime and the C backend,
 so each optimization written for one applies to the other and the parallel
 code for the two is deleted. Typecheck keeps them apart: a record is nominal,
@@ -25,7 +26,7 @@ them:
 | --- | --- | --- |
 | Core type | `HeapRecordType(String)` (and `NamedType` before layout resolution) | `TupleType(List[CoreType])` |
 | Build | `RecordExpr`, then `RecordConstructExpr` after `prepare` | `TupleExpr`, then `TupleConstructExpr` with per-slot classes and retain/release masks |
-| Read | `FieldExpr(base, name, field ref)` | `TupleFieldExpr(base, index)` |
+| Read | `ProductFieldExpr(base, ordinal)` (slice 1) | `ProductFieldExpr(base, ordinal)` (slice 1) |
 | Update | `RecordUpdateExpr`, `RecordReuseExpr`, `RecordCowUpdateExpr` | none |
 | Optimizations | in-place reuse, copy-on-write, update threading, consuming clones | scalar replacement of locals and match subjects; multi-values on the increment 2 branch |
 | Runtime box | one typed C struct per record, with `_make`, destroy and reuse helpers | generic `blorp_Tuple` with a varargs constructor, a release mask and a separate box for each inline-struct element |
@@ -230,29 +231,20 @@ names the instance row, which holds both. No second definition table is
 built; the ref indexes the existing record declaration rows through a
 read-only view.
 
-Today a field read carries both the spelling and a `CoreFieldRef` (the
-typecheck `FieldId`), and the backend recovers the position from the ref
-through a table (`emit_record_layout.brp:134`, `c_record_member_of`). After,
-the read carries the ordinal; the record row maps ordinals to `FieldId` and
-spelling for dumps, diagnostics and declared-ABI member names. Unresolved
-field refs (`CORE_FIELD_REF_UNRESOLVED`) come from two places today:
-lowering of a selection whose typecheck identity is missing, which only
-recovery produces (`lower.brp:2214`), and the JSON decoder's default for an
-absent ref (`ir.brp:7579`). An ordinal has no unresolved state. Lowering
-returns an internal error for a record selection without a `FieldId`, and
-the decoder rejects a product read without an ordinal.
-`CORE_FIELD_REF_RUNTIME_TAG`, which nothing reads, is deleted.
+Since slice 1 a field read (`ProductFieldExpr`) carries only the ordinal.
+Lowering issues it from the accepted record row of the selection's `FieldId`
+(`record_field_ordinal` in `lower.brp`) or from the checked tuple arity, and
+returns an internal error for a record selection without a `FieldId`; the JSON
+decoder rejects a product read without an ordinal. The emitter spells the
+member `f<ordinal>`, or the row's source name for a declared native ABI record
+(`c_record_member_at`). Record construction still carries `CoreFieldRef`s
+until slice 2.
 
 `Range` is `fixed record Range {start: Int, end: Int}`
-(`standard_library/src/range.brp`). Range values are already records in
-Core (`HeapRecordType("range__Range")`), built as `RecordExpr` with resolved
-refs (`lower.brp:5351`) and read through `FieldExpr` (`lower.brp:3140`). Under
-the inline change it is an all-`Int` fixed record, so it becomes an inline
-product read with `ProductFieldExpr`; it needs no form of its own. `CoreType.RangeType`
-is a different type: the `..#N` refinement index, a C `long`. It is not a
-product and stays. The `RangeType` arm of `c_field_access_value` (`emit.brp`),
-which renders `.start`, does not match any range value; slice 1 confirms that
-and deletes the arm.
+(`standard_library/src/range.brp`), an inline record read with
+`ProductFieldExpr` like any other; it needs no form of its own.
+`CoreType.RangeType` is a different type: the `..#N` refinement index, a C
+`long`. It is not a product and stays.
 
 ### 1.4 Representation is separate from identity
 
@@ -361,9 +353,9 @@ record indexes into one, and the product-type slice removes the last.
 
 Slices 1 to 3 land before `ProductType`, when three type forms name a
 product: `HeapRecordType(String)`, the inline change's
-`InlineRecordType(String)` and `TupleType(List[CoreType])`. Slice 1 adds one
-module, `stage_09_core/product_type.brp`, and every product question in
-slices 1 to 3 goes through it:
+`InlineRecordType(String)` and `TupleType(List[CoreType])`. Slice 1 added
+`stage_09_core/product_type.brp`, and every product question in slices 1 to 3
+goes through it:
 
 ```
 --- A product-shaped type, or `None`. The only function in slices 1 to 3 that
@@ -371,12 +363,15 @@ slices 1 to 3 goes through it:
 pure func core_product_of(typ: CoreType) -> Option[CoreInterimProduct]
 
 pure func interim_product_representation(product: CoreInterimProduct) -> CoreProductRepresentation
-pure func interim_products_equal(left: CoreInterimProduct, right: CoreInterimProduct) -> Bool
-pure func interim_product_field_types(
-	rows: CoreRecordFieldTypeIndex,
-	product: CoreInterimProduct,
-) -> List[CoreType]
+
+--- The record instance a record product is, or `None` for a tuple: for C
+--- member spelling and for the record-only rewrites not yet extended to
+--- tuples (record update paths, field takes).
+pure func interim_product_record(product: CoreInterimProduct) -> Option[String]
 ```
+
+`interim_products_equal` and `interim_product_field_types(rows, product)` are
+added with their first callers (slices 2 and 3).
 
 `CoreInterimProduct` is opaque over the three forms: `HeapRecordType` and
 `TupleType` are `ManagedBox`; `InlineRecordType` is `InlineValue`. New code in
@@ -424,8 +419,7 @@ native equality; they are not products.
 Today, `ir.brp:1771-1774` and `ir.brp:1801-1805`:
 
 ```
-	FieldExpr(CoreExpr, String, CoreFieldRef, CoreType, CoreSourceLoc)
-	TupleFieldExpr(CoreExpr, Int, CoreType, CoreSourceLoc)
+	ProductFieldExpr(CoreExpr, CoreFieldOrdinal, CoreType, CoreSourceLoc)
 	TupleExpr(List[CoreExpr], CoreType, CoreSourceLoc)
 	TupleConstructExpr(CoreTupleConstruct, CoreType, CoreSourceLoc)
 	...
@@ -460,7 +454,7 @@ record CoreRecordCowField {
 Several states here are representable but wrong:
 
 - A `RecordUpdateExpr` lists every field. An inherited field is spelled
-  `FieldExpr(base, ...)` and has to match the base, and `record_update.brp`
+  `ProductFieldExpr(base, ...)` and has to match the base, and `record_update.brp`
   carries an `InvalidStagedField` case for when it does not.
 - One list order means both evaluation order and storage order, and `prepare`
   reorders it after Perceus. That was a use-after-free on `main`. The
@@ -531,9 +525,9 @@ Notes on the new forms:
 - `CowFieldTakeRetainPolicy(CoreVar, String, CoreFieldRef, String)` becomes
   `CowFieldTakeRetainPolicy(CoreVar, CoreFieldOrdinal)`, since the record and
   field spellings are derivable.
-- `TupleFieldSemanticMatchAccessor` and `TupleFieldAccessor` become product
-  field accessors. That adds no record patterns; it only removes the tuple-only
-  spelling.
+- `TupleFieldSemanticMatchAccessor` and `TupleFieldAccessor` became
+  `ProductFieldSemanticMatchAccessor` and `ProductFieldAccessor` in slice 1.
+  That adds no record patterns; it only removes the tuple-only spelling.
 - Perceus treats every managed product field operand as it treats a record
   field operand today. It retains a borrowed operand and moves an owned one at
   its last use. `retain_mask` is deleted; the release mask comes from the
@@ -765,82 +759,23 @@ Slice 3's port is about 400 lines smaller than increment 2 as written (+6,824 /
 are gone. Admitting records then costs about 600 lines, where a parallel
 record pass would cost several thousand.
 
-### Slice 1. One projection form
+### Slice 1 (landed). One projection form
 
-`ProductFieldExpr(base, ordinal)` replaces `FieldExpr` and `TupleFieldExpr`,
-including the `Range` bound reads. Lowering issues the ordinal from the
-checked record row or tuple arity, and the product match accessors are
-renamed. The slice also adds the interim predicates of section 1.6.
+`ProductFieldExpr(base, ordinal)` replaced `FieldExpr` and `TupleFieldExpr`.
+Core had spelled a module-qualified name (`alias.member`) as a `FieldExpr` over
+a `Module`-typed variable, so it first gained its own pre-resolve form,
+`ModuleMemberExpr`, built from typecheck's own `TypedModuleMemberExpr`.
+Self-compile C was byte-identical. Measured in `blorp/src` the slice is net −4
+lines (+1,259/−1,263): the two module member forms and the row-order assertion
+added about 120, and the projection removed about 125, against this plan's
+estimate of −450/+150. The record-row plumbing for ordinals and the interim
+predicates account for most of the difference.
 
-Today the two projections have identical arms in many passes, for example
-`stage_09_core/perceus/uses.brp:2724`:
-
-```
-		FieldExpr(owner, field, _, typ, loc):
-			uses: OwnershipUseSummary = summarize_linear_borrow(env, name, owner)
-
-			if uses.touched and is_managed_type(env, typ):
-				ownership_uses_with_returns_alias(uses, True)
-			else:
-				uses
-		TupleFieldExpr(owner, field_index, typ, loc):
-			uses: OwnershipUseSummary = summarize_linear_borrow(env, name, owner)
-
-			if uses.touched and is_managed_type(env, typ):
-				ownership_uses_with_returns_alias(uses, True)
-			else:
-				uses
-```
-
-After:
-
-```
-		ProductFieldExpr(owner, _, typ, _):
-			uses: OwnershipUseSummary = summarize_linear_borrow(env, name, owner)
-
-			if uses.touched and is_managed_type(env, typ):
-				ownership_uses_with_returns_alias(uses, True)
-			else:
-				uses
-```
-
-Lowering today branches on the receiver's family and parses the tuple index
-from field text (`stage_08_core_lower/lower.brp:2436-2471`):
-
-```
-	match receiver_type:
-		TupleType(items):
-			match field.text.parse_int():
-				Some(index):
-					if index >= 0 and index < items.length():
-						Ok(TupleFieldExpr(lowered_receiver, index, typ, loc))
-					...
-		NamedType(name, args):
-			if name == "Tuple":
-				...
-			else:
-				Ok(FieldExpr(lowered_receiver, field.text, field_ref, typ, loc))
-		_:
-			Ok(FieldExpr(lowered_receiver, field.text, field_ref, typ, loc))
-```
-
-After, one function issues the ordinal where the row or arity is checked. A
-record selection is identified by its typecheck `FieldId`. A tuple selection
-has no `FieldId` (`ResolvedFieldIdentity` marks it missing), so its validated
-index is parsed in this one place; having typecheck publish a tuple index in
-`ResolvedFieldIdentity` would remove the parse and is a follow-up.
-
-```
-	ordinal ?= product_field_ordinal(context.products, receiver_type, field_identity, field)
-	Ok(ProductFieldExpr(lowered_receiver, ordinal, typ, loc))
-```
-
-The emitter's member lookup by field ref (`emit_record_layout.brp:134-143`)
-becomes `f<ordinal>`, or the row's source name for a declared native ABI
-record. The tuple read stays `elem[ordinal]` until slice 5. Evidence:
-byte-identical self-compile C (`--require-identical`), the codegen audit,
-the Core and Perceus suites, and the identity candidate's record/tuple
-projection ownership tests, rebased.
+Follow-ups: typecheck publishing a tuple selection's index in
+`ResolvedFieldIdentity` would remove the one parse of the selection text in
+`product_field_ordinal`; and record update paths and field takes stay
+record-only (through `interim_product_record`) until slice 3 decides them for
+tuples.
 
 ### Slice 2. One construction form
 

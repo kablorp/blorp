@@ -7,14 +7,17 @@ import:
 	../../../src/compiler/stage_09_core/ir:
 		CoreBinaryOp(EqualOp),
 		CoreCallKind(UserCall),
-		CoreDecl(FunctionDecl),
+		CoreDecl(FunctionDecl, HeapRecordDecl),
 		CoreDeclaredOrigin(ProjectedImplMethod),
-		CoreExpr(BinaryExpr, CallExpr, FieldExpr, LogicalExpr, UnaryExpr, VarExpr),
+		CoreExpr(BinaryExpr, CallExpr, LogicalExpr, ProductFieldExpr, UnaryExpr, VarExpr),
+		CoreFieldOrdinal,
 		CoreFunction,
 		CoreLogicalOp(AndOp),
 		CoreProgram,
 		CoreType(HeapRecordType, NamedType),
 		CoreUnaryOp(NotOp),
+		core_field_ordinal_index,
+		core_field_ordinals_equal,
 		core_function_declared_origin,
 	../../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
 	../../../src/lib/cli_plan: CliRunPlan(CliRunCompile)
@@ -94,33 +97,59 @@ private pure func user_call_targets(expr: CoreExpr) -> List[Int]:
 
 
 ---
-The fields an `equals` body compares, in order, when it is the derived form
+The fields an `equals` body compares, in order, spelled from `field_names` (the
+record's fields in declaration order), when it is the derived form
 `left.f == right.f and ...`; "?" marks any other shape.
 ---
-private pure func compared_fields(body: CoreExpr) -> List[String]:
+private pure func compared_fields(field_names: List[String], body: CoreExpr) -> List[String]:
 	match body:
 		LogicalExpr(AndOp, earlier, last, _, _):
-			compared_fields(earlier).concat(compared_fields(last))
-		BinaryExpr(EqualOp, FieldExpr(VarExpr(_, _, _), left_field, _, _, _), FieldExpr(VarExpr(_, _, _), right_field, _, _, _), _, _):
-			if left_field == right_field:
-				[left_field]
-			else:
-				["?"]
-		CallExpr(_, _, [FieldExpr(_, left_field, _, _, _), FieldExpr(_, right_field, _, _, _)], _, _):
+			compared_fields(field_names, earlier).concat(compared_fields(field_names, last))
+		BinaryExpr(EqualOp, ProductFieldExpr(VarExpr(_, _, _), left, _, _), ProductFieldExpr(VarExpr(_, _, _), right, _, _), _, _):
+			[same_field_name(field_names, left, right)]
+		CallExpr(_, _, [ProductFieldExpr(_, left, _, _), ProductFieldExpr(_, right, _, _)], _, _):
 			-- A field whose `==` is an impl method is a call to it.
-			if left_field == right_field:
-				[left_field]
-			else:
-				["?"]
+			[same_field_name(field_names, left, right)]
 		_:
 			["?"]
+
+
+private pure func same_field_name(
+	field_names: List[String],
+	left: CoreFieldOrdinal,
+	right: CoreFieldOrdinal,
+) -> String:
+	if core_field_ordinals_equal(left, right):
+		field_names.get(core_field_ordinal_index(left)).get_or("?")
+	else:
+		"?"
+
+
+private pure func record_field_names(program: CoreProgram, record_name: String) -> List[String]:
+	program.decls
+		.filter_map(func(decl):
+			match decl:
+				HeapRecordDecl(record_decl):
+					if record_decl.name == record_name:
+						Some(record_decl.fields.map(func(field): field.name))
+					else:
+						None
+				_:
+					None
+		)
+		.get(0)
+		.get_or([])
 
 
 ---
 Describes a call target as `Trait.method on receiver`, then what its body
 does: the fields a derived `equals` compares, or `not ==` for the default.
 ---
-private pure func describe_target(names: NameTable, target: CoreFunction) -> String:
+private pure func describe_target(
+	program: CoreProgram,
+	names: NameTable,
+	target: CoreFunction,
+) -> String:
 	match core_function_declared_origin(target.origin):
 		ProjectedImplMethod(trait_id, method_id, for_type, _):
 			receiver: String = match for_type:
@@ -133,7 +162,7 @@ private pure func describe_target(names: NameTable, target: CoreFunction) -> Str
 				Some(UnaryExpr(NotOp, CallExpr(_, _, _, _, _), _, _)):
 					"not =="
 				Some(other):
-					"compares " + compared_fields(other).join(", ")
+					"compares " + compared_fields(record_field_names(program, receiver), other).join(", ")
 				None:
 					"no body"
 
@@ -163,7 +192,7 @@ func test_record_operators_call_derived_equality() -> Bool:
 									func(function_info): function_info.def_id == def_id,
 								):
 									Some(target):
-										describe_target(names, target)
+										describe_target(program, names, target)
 									None:
 										"missing function " + def_id.to_string()
 							)

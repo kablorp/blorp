@@ -32,15 +32,14 @@ import:
 		CoreDeclaredOrigin(MonoInstance),
 		CoreExpr(
 			AccessorLiteralMatchExpr, AssignExpr, BorrowLetExpr, CallExpr, CastExpr, ConcurrentExpr,
-			ConcurrentlyLoopExpr, ConstructorMatchExpr, DropExpr, DupExpr, FieldExpr,
-			ForChannelExpr, ForDictExpr, ForListExpr, ForRangeExpr, ForResourceSourceExpr,
-			ForSetExpr, ForStreamExpr, ForStringExpr, ForTensorExpr, IfExpr, LambdaExpr,
-			LengthMatchExpr, LetExpr, ListHandoffExpr, LiteralMatchExpr, LogicalExpr,
+			ConcurrentlyLoopExpr, ConstructorMatchExpr, DropExpr, DupExpr, ModuleMemberExpr,
+			ProductFieldExpr, ForChannelExpr, ForDictExpr, ForListExpr, ForRangeExpr,
+			ForResourceSourceExpr, ForSetExpr, ForStreamExpr, ForStringExpr, ForTensorExpr, IfExpr,
+			LambdaExpr, LengthMatchExpr, LetExpr, ListHandoffExpr, LiteralMatchExpr, LogicalExpr,
 			PreClosureConcurrentExpr, PreClosureConcurrentlyLoopExpr, ResourceScopeExpr, SelectExpr,
 			SeqExpr, TailrecListSpreadLoopExpr, TailrecLoopExpr, TensorRawReadExpr,
 			TensorRawViewLetExpr, TensorRawWriteExpr, VarExpr,
 		),
-		CoreFieldRef,
 		CoreForeignArgPassing,
 		CoreForeignFunction,
 		CoreFunction,
@@ -1412,7 +1411,7 @@ private pure func resolved_user_callee(callee: CoreExpr, kind: CoreCallKind) -> 
 					)
 				_:
 					callee_loc: CoreSourceLoc = match callee:
-						FieldExpr(_, _, _, _, loc):
+						ProductFieldExpr(_, _, _, loc) | ModuleMemberExpr(_, _, _, loc):
 							loc
 						VarExpr(_, _, loc):
 							loc
@@ -1797,58 +1796,37 @@ private pure func unknown_var_call_kind(
 		result.get_or(fallback)
 
 
-private pure func unknown_field_call_kind(
+private pure func module_member_call_kind(
 	env: CoreCallResolveEnv,
 	module_path: String,
-	scope: List[String],
-	owner: CoreExpr,
-	field_name: String,
+	module_alias: String,
+	member: String,
 	callee: CoreExpr,
 	args: List[CoreExpr],
 	return_type: CoreType,
 ) -> CoreCallKind:
-	match owner:
-		VarExpr(variable, _, _):
-			if scope.contains(variable.name):
-				if is_function_type(core_expr_type(callee)):
-					ClosureCall
-				else:
-					UnknownCall
-			else:
-				var result: Option[CoreCallKind] = constructor_target_for_call(
-					env,
-					field_name,
-					callee,
-					return_type,
-				).map(
-					func(constructor): UserCall(field_name, constructor.def_id, []),
-				)
+	var result: Option[CoreCallKind] = constructor_target_for_call(
+		env,
+		member,
+		callee,
+		return_type,
+	).map(
+		func(constructor): UserCall(member, constructor.def_id, []),
+	)
 
-				if result.is_none():
-					result = callable_call_by_id(env, variable.def_id, callee, args)
-				else:
-					void
+	if result.is_none():
+		match qualified_module_path(env, module_path, module_alias):
+			Some(target_module):
+				result = module_call(env, target_module, member, args)
+			None:
+				void
 
-				if result.is_none():
-					match qualified_module_path(env, module_path, variable.name):
-						Some(target_module):
-							result = module_call(env, target_module, field_name, args)
-						None:
-							void
-				else:
-					void
+	fallback: CoreCallKind = if is_function_type(core_expr_type(callee)):
+		ClosureCall
+	else:
+		UnknownCall
 
-				fallback: CoreCallKind = if is_function_type(core_expr_type(callee)):
-					ClosureCall
-				else:
-					UnknownCall
-
-				result.get_or(fallback)
-		_:
-			if is_function_type(core_expr_type(callee)):
-				ClosureCall
-			else:
-				UnknownCall
+	result.get_or(fallback)
 
 
 ---
@@ -1912,17 +1890,8 @@ private pure func resolve_call_kind(
 						args,
 						return_type,
 					)
-				FieldExpr(owner, field_name, _, _, _):
-					unknown_field_call_kind(
-						env,
-						module_path,
-						scope,
-						owner,
-						field_name,
-						callee,
-						args,
-						return_type,
-					)
+				ModuleMemberExpr(module_alias, member, _, _):
+					module_member_call_kind(env, module_path, module_alias, member, callee, args, return_type)
 				_:
 					if is_function_type(core_expr_type(callee)):
 						ClosureCall
@@ -2158,7 +2127,7 @@ private pure func resolve_global_value_expr_inner(
 	expr: CoreExpr,
 ) -> CoreExpr:
 	match expr:
-		VarExpr(_, _, _) | FieldExpr(_, _, _, _, _) | AssignExpr(_, _, _, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _) | TensorRawReadExpr(_, _, _) | TensorRawWriteExpr(_, _, _):
+		VarExpr(_, _, _) | ModuleMemberExpr(_, _, _, _) | AssignExpr(_, _, _, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _) | TensorRawReadExpr(_, _, _) | TensorRawWriteExpr(_, _, _):
 			resolve_global_value_variable_expr(resolutions, scope, expr)
 		LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | LambdaExpr(_, _, _, _, _, _) | TensorRawViewLetExpr(_, _, _, _) | ListHandoffExpr(_, _, _) | ResourceScopeExpr(_, _, _) | TailrecLoopExpr(_, _, _, _) | TailrecListSpreadLoopExpr(_, _):
 			resolve_global_value_binding_expr(resolutions, scope, expr)
@@ -2417,87 +2386,66 @@ private pure func resolve_program_variable(
 				global_variable
 
 
-private pure func resolve_qualified_value(
+---
+The reference `alias.member` names (`expr`), or `expr` unchanged when it is
+not a global, foreign function or constructor of the aliased module. A
+function-typed member stays as it is: call resolution chooses its callee.
+---
+private pure func resolve_module_member(
 	resolutions: CoreProgramResolution,
-	scope: List[String],
-	owner: CoreExpr,
-	field_name: String,
-	field_ref: CoreFieldRef,
+	expr: CoreExpr,
+	module_alias: String,
+	member: String,
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
-	if is_function_type(typ):
-		FieldExpr(
-			resolve_global_value_expr(resolutions, scope, owner),
-			field_name,
-			field_ref,
-			typ,
-			loc,
-		)
-	else:
-		match (resolutions.call_env, owner):
-			(Some(env), VarExpr(variable, _, _)):
-				if scope.contains(variable.name):
-					FieldExpr(owner, field_name, field_ref, typ, loc)
-				else:
-					match qualified_module_path(env, resolutions.module_path, variable.name):
-						Some(module_path):
-							prefixed: String = env_module_member_name(env, module_path, field_name)
+	match resolutions.call_env:
+		Some(env):
+			if is_function_type(typ):
+				expr
+			else:
+				match qualified_module_path(env, resolutions.module_path, module_alias):
+					Some(module_path):
+						prefixed: String = env_module_member_name(env, module_path, member)
 
-							if (
-								env.global_types.contains(prefixed)
-								or env.foreign_functions.contains(prefixed)
-							):
-								VarExpr(
-									{
-										name = prefixed,
-										id = 0,
-										def_id = env.user_functions
-											.get(prefixed)
-											.map(func(target): target.def_id),
-										origin = AuthoredBinder
-									},
-									env.global_types.get_or(
-										prefixed,
-										typ,
-									),
-									loc,
-								)
-							else:
-								match constructor_target_for_type(env, field_name, typ):
-									Some(constructor):
-										VarExpr(
-											{
-												name = field_name,
-												id = 0,
-												def_id = constructor.def_id,
-												origin = AuthoredBinder
-											},
-											typ,
-											loc,
-										)
-									None:
-										FieldExpr(owner, field_name, field_ref, typ, loc)
-						None:
-							-- The owner is an ordinary value, not a module alias: a
-							-- bare-imported global (`import: ./lib: Q` then `Q.b`) still
-							-- needs its own identity resolved to the exporting module's
-							-- emitted name.
-							FieldExpr(
-								resolve_global_value_expr(resolutions, scope, owner),
-								field_name,
-								field_ref,
-								typ,
+						if (
+							env.global_types.contains(prefixed)
+							or env.foreign_functions.contains(prefixed)
+						):
+							VarExpr(
+								{
+									name = prefixed,
+									id = 0,
+									def_id = env.user_functions
+										.get(prefixed)
+										.map(func(target): target.def_id),
+									origin = AuthoredBinder
+								},
+								env.global_types.get_or(
+									prefixed,
+									typ,
+								),
 								loc,
 							)
-			_:
-				FieldExpr(
-					resolve_global_value_expr(resolutions, scope, owner),
-					field_name,
-					field_ref,
-					typ,
-					loc,
-				)
+						else:
+							match constructor_target_for_type(env, member, typ):
+								Some(constructor):
+									VarExpr(
+										{
+											name = member,
+											id = 0,
+											def_id = constructor.def_id,
+											origin = AuthoredBinder
+										},
+										typ,
+										loc,
+									)
+								None:
+									expr
+					None:
+						expr
+		None:
+			expr
 
 
 private pure func resolve_global_value_variable_expr(
@@ -2512,8 +2460,8 @@ private pure func resolve_global_value_variable_expr(
 				typ,
 				loc,
 			)
-		FieldExpr(owner, field_name, field_ref, typ, loc):
-			resolve_qualified_value(resolutions, scope, owner, field_name, field_ref, typ, loc)
+		ModuleMemberExpr(module_alias, member, typ, loc):
+			resolve_module_member(resolutions, expr, module_alias, member, typ, loc)
 		AssignExpr(variable, rhs, typ, loc):
 			AssignExpr(
 				resolve_global_value_var(resolutions, scope, variable),

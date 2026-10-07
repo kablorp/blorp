@@ -321,9 +321,9 @@ private BOX_EXPR_TAG: String = "box"
 
 private UNBOX_EXPR_TAG: String = "unbox"
 
-private FIELD_EXPR_TAG: String = "field"
+private PRODUCT_FIELD_EXPR_TAG: String = "product_field"
 
-private TUPLE_FIELD_EXPR_TAG: String = "tuple_field"
+private MODULE_MEMBER_EXPR_TAG: String = "module_member"
 
 private TUPLE_EXPR_TAG: String = "tuple"
 
@@ -708,7 +708,7 @@ private BOXED_RESULT_OK_PAYLOAD_ACCESSOR_TAG: String = "boxed_result_ok_payload"
 
 private BOXED_RESULT_ERR_PAYLOAD_ACCESSOR_TAG: String = "boxed_result_err_payload"
 
-private TUPLE_FIELD_ACCESSOR_TAG: String = "tuple_field"
+private PRODUCT_FIELD_ACCESSOR_TAG: String = "product_field"
 
 private LIST_ELEMENT_ACCESSOR_TAG: String = "list_element"
 
@@ -1683,18 +1683,18 @@ enum CoreReleasePolicy:
 ---
 How a `DupExpr` acquires its owner.
 
-`CowFieldTakeRetainPolicy(record, field, ref, record_name)` retains a field alias
-read from the named record variable (of the heap record named `record_name`, whose
-field `field` has identity `ref`) only when that record is shared at runtime; a unique
-record instead gives up its field slot (left null) so the alias becomes the
-sole owner. The reuse pass proves the record is consumed by the enclosing
-record update and that the field is read nowhere else before then.
+`CowFieldTakeRetainPolicy(record, ordinal, record_name)` retains a field alias
+read from the named record variable (of the heap record named `record_name`, at
+field `ordinal`) only when that record is shared at runtime; a unique record
+instead gives up its field slot (left null) so the alias becomes the sole owner.
+The reuse pass proves the record is consumed by the enclosing record update
+and that the field is read nowhere else before then.
 ---
 union CoreRetainPolicy:
 	NoRetainPolicy
 	ArcRetainPolicy
 	StackResultRetainPolicy
-	CowFieldTakeRetainPolicy(CoreVar, String, CoreFieldRef, String)
+	CowFieldTakeRetainPolicy(CoreVar, CoreFieldOrdinal, String)
 
 
 record CoreLoopBinder {
@@ -1798,8 +1798,13 @@ union CoreExpr:
 	CastExpr(CoreExpr, CoreType, CoreSourceLoc)
 	BoxExpr(CoreBoxOp, CoreType, CoreSourceLoc)
 	UnboxExpr(CoreUnboxKind, CoreExpr, CoreType, CoreSourceLoc)
-	FieldExpr(CoreExpr, String, CoreFieldRef, CoreType, CoreSourceLoc)
-	TupleFieldExpr(CoreExpr, Int, CoreType, CoreSourceLoc)
+	-- A read of one field of a record or tuple (`base.field`, `pair[1]`).
+	ProductFieldExpr(CoreExpr, CoreFieldOrdinal, CoreType, CoreSourceLoc)
+	-- `alias.member`: a member of an imported module named through its alias.
+	-- Only lowering builds one, from typecheck's `TypedModuleMemberExpr`.
+	-- `resolve` replaces it with the member's own reference and call
+	-- resolution replaces a callee one; an early invariant rejects any left.
+	ModuleMemberExpr(String, String, CoreType, CoreSourceLoc)
 	TupleExpr(List[CoreExpr], CoreType, CoreSourceLoc)
 	TupleConstructExpr(CoreTupleConstruct, CoreType, CoreSourceLoc)
 	VectorExpr(List[CoreExpr], CoreType, CoreSourceLoc)
@@ -1883,7 +1888,7 @@ record CoreRawMatchCase {
 union CoreSemanticMatchAccessor:
 	RootSemanticMatchAccessor
 	VariantFieldSemanticMatchAccessor(CoreSemanticMatchAccessor, String, Int)
-	TupleFieldSemanticMatchAccessor(CoreSemanticMatchAccessor, Int)
+	ProductFieldSemanticMatchAccessor(CoreSemanticMatchAccessor, CoreFieldOrdinal)
 	ListElementSemanticMatchAccessor(CoreSemanticMatchAccessor, Int)
 	ListSpreadSemanticMatchAccessor(CoreSemanticMatchAccessor, Int)
 
@@ -1957,9 +1962,9 @@ pure func core_expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		UnboxExpr(kind, value, typ, loc):
 			typ
-		FieldExpr(value, field_name, field_ref, typ, loc):
+		ProductFieldExpr(_, _, typ, _):
 			typ
-		TupleFieldExpr(value, field_index, typ, loc):
+		ModuleMemberExpr(_, _, typ, _):
 			typ
 		TupleExpr(items, typ, loc):
 			typ
@@ -2118,9 +2123,9 @@ pure func core_expr_source_loc(expr: CoreExpr) -> CoreSourceLoc:
 			loc
 		StaticStringLiteralExpr(_, _, _, loc) | CallExpr(_, _, _, _, loc) | BinaryExpr(_, _, _, _, loc) | LogicalExpr(_, _, _, _, loc) | RecordUpdateExpr(_, _, _, loc) | RecordReuseExpr(_, _, _, loc) | RecordCowUpdateExpr(_, _, _, loc) | UnionReuseConstructExpr(_, _, loc) | WhileExpr(_, _, _, loc) | LiteralMatchExpr(_, _, _, _, loc) | IfExpr(_, _, _, _, loc):
 			loc
-		UnaryExpr(_, _, _, loc) | AssignExpr(_, _, _, loc) | TupleFieldExpr(_, _, _, loc) | TensorRawViewLetExpr(_, _, _, loc) | TailrecLoopExpr(_, _, _, loc) | TailrecListSpreadRecurExpr(_, _, _, loc) | ForRangeExpr(_, _, _, _, _, loc) | AccessorLiteralMatchExpr(_, _, _, _, loc) | LengthMatchExpr(_, _, _, _, loc):
+		UnaryExpr(_, _, _, loc) | AssignExpr(_, _, _, loc) | ProductFieldExpr(_, _, _, loc) | TensorRawViewLetExpr(_, _, _, loc) | TailrecLoopExpr(_, _, _, loc) | TailrecListSpreadRecurExpr(_, _, _, loc) | ForRangeExpr(_, _, _, _, _, loc) | AccessorLiteralMatchExpr(_, _, _, _, loc) | LengthMatchExpr(_, _, _, _, loc):
 			loc
-		FieldExpr(_, _, _, _, loc):
+		ModuleMemberExpr(_, _, _, loc):
 			loc
 		LambdaExpr(_, _, _, _, _, loc) | DupExpr(_, _, _, _, _, loc) | DropExpr(_, _, _, _, _, loc) | ConstructorMatchExpr(_, _, _, _, _, loc):
 			loc
@@ -2838,7 +2843,7 @@ union CoreAccessor:
 	BoxedStackResultErrPayloadAccessor(CoreAccessor, String)
 	BoxedResultOkPayloadAccessor(CoreAccessor)
 	BoxedResultErrPayloadAccessor(CoreAccessor)
-	TupleFieldAccessor(CoreAccessor, Int, CoreType)
+	ProductFieldAccessor(CoreAccessor, CoreFieldOrdinal, CoreType)
 	ListElementAccessor(CoreAccessor, Int)
 	ListSpreadAccessor(CoreAccessor, Int)
 
@@ -3805,24 +3810,22 @@ record CoreUnionDecl {
 }
 
 
---- Resolved field identity threaded through Core, carried alongside the field
---- spelling (part (a) of the field name-table slice; emitting members by
---- ordinal is part (b), which can compute the ordinal from the declaration
---- through this id).
+--- A record field's typecheck identity, carried by the fields of record
+--- declarations, literals and updates. Projections name a field by its
+--- `CoreFieldOrdinal` instead.
 --
 --- `field_id` is the field's own `FieldId` (a `DefinitionId`) from typecheck
 --- (`ResolvedFieldIdentity`, `graph/definition_index.brp`). Distinct field
 --- declarations, even same-named ones on different records, have distinct
---- ids. `CORE_FIELD_REF_UNRESOLVED` marks the synthetic sites that have no
---- typecheck identity (the runtime tag member, `Range` start/end, tuple-as-
---- record fields); an unresolved ref is never equal to anything, so callers
---- that must match those sites compare the spelling explicitly.
+--- ids. `CORE_FIELD_REF_UNRESOLVED` marks a field whose typecheck identity is
+--- missing, which only recovery produces; an unresolved ref is never equal to
+--- anything.
 --
 --- The ref is an opaque `Int`, not a one-field `struct` or a `record`: a
---- struct payload inside a union variant (`FieldExpr`) is boxed, which cost
---- one allocation per field-access node in every pass that rebuilds it, and
---- a wrapper record cost one per node minted during lowering. An opaque Int
---- stays unboxed, the same reason `ResolvedFieldIdentity` is one.
+--- struct payload inside a union variant is boxed, which cost one allocation
+--- per node in every pass that rebuilds it, and a wrapper record cost one per
+--- node minted during lowering. An opaque Int stays unboxed, the same reason
+--- `ResolvedFieldIdentity` is one.
 opaque type CoreFieldRef = Int
 
 CORE_FIELD_REF_UNRESOLVED: Int = -1
@@ -3845,21 +3848,27 @@ pure func core_field_refs_equal(left: CoreFieldRef, right: CoreFieldRef) -> Bool
 	core_field_ref_is_resolved(left) and core_field_ref_id(left) == core_field_ref_id(right)
 
 
---- True only when both refs are resolved and name different fields. Use this
---- (not `not core_field_refs_equal`) where a conservative answer for an
---- unresolved ref is "may be the same field".
-pure func core_field_refs_distinct(left: CoreFieldRef, right: CoreFieldRef) -> Bool:
-	(
-		core_field_ref_is_resolved(left)
-		and core_field_ref_is_resolved(right)
-		and core_field_ref_id(left) != core_field_ref_id(right)
-	)
+--- A field's position in its product: declaration order for a record,
+--- element index for a tuple. Valid only with the product type of the
+--- expression it reads, and in range for it by construction: lowering issues
+--- it from the record row or tuple arity it checked, and compiler-built reads
+--- of a known shape issue it from that shape. Valid within one compilation.
+--
+--- An opaque `Int` for the reason `CoreFieldRef` is one: it stays unboxed in
+--- a union payload.
+opaque type CoreFieldOrdinal = Int
 
 
---- The backend's raw runtime union tag member (`tag` in the emitted C struct)
---- is not a declared Blorp field; it is a fixed runtime ABI member that keeps
---- its spelling forever.
-CORE_FIELD_REF_RUNTIME_TAG: CoreFieldRef = into_opaque CoreFieldRef(CORE_FIELD_REF_UNRESOLVED)
+pure func core_field_ordinal(index: Int) -> CoreFieldOrdinal:
+	into_opaque CoreFieldOrdinal(index)
+
+
+pure func core_field_ordinal_index(ordinal: CoreFieldOrdinal) -> Int:
+	from_opaque CoreFieldOrdinal(ordinal)
+
+
+pure func core_field_ordinals_equal(left: CoreFieldOrdinal, right: CoreFieldOrdinal) -> Bool:
+	core_field_ordinal_index(left) == core_field_ordinal_index(right)
 
 
 record CoreHeapRecordField {
@@ -7613,6 +7622,27 @@ pure func decode_core_list_retain_json(
 	})
 
 
+private pure func core_field_ordinal_to_json(ordinal: CoreFieldOrdinal) -> JsonValue:
+	json_int(core_field_ordinal_index(ordinal))
+
+
+---
+The ordinal stored under `key`. A projection without one is malformed: an
+ordinal has no unresolved state to default to.
+---
+private pure func decode_core_field_ordinal_json(
+	value: JsonValue,
+	path: String,
+	key: String,
+) -> Result[CoreFieldOrdinal, CoreJsonError]:
+	index ?= int_field(value, path, key)
+
+	if index < 0:
+		Err(CoreExpectedIntField(path, key))
+	else:
+		Ok(core_field_ordinal(index))
+
+
 pure func core_field_ref_to_json(ref: CoreFieldRef) -> JsonValue:
 	JsonObject([("field_id", json_int(core_field_ref_id(ref)))])
 
@@ -8104,7 +8134,7 @@ pure func core_retain_policy_to_string(policy: CoreRetainPolicy) -> String:
 			ARC_RETAIN_POLICY_TAG
 		StackResultRetainPolicy:
 			STACK_RESULT_RETAIN_POLICY_TAG
-		CowFieldTakeRetainPolicy(_, _, _, _):
+		CowFieldTakeRetainPolicy(_, _, _):
 			COW_FIELD_TAKE_RETAIN_POLICY_TAG
 
 
@@ -8124,18 +8154,17 @@ pure func parse_core_retain_policy(
 
 ---
 JSON fields that encode a retain policy inside a dup object: the
-"retain_policy" tag, plus "take_record" and "take_field" for a field take.
+"retain_policy" tag, plus "take_record" and "take_ordinal" for a field take.
 ---
 pure func retain_policy_json_fields(policy: CoreRetainPolicy) -> List[(String, JsonValue)]:
 	tag: (String, JsonValue) = ("retain_policy", JsonString(core_retain_policy_to_string(policy)))
 
 	match policy:
-		CowFieldTakeRetainPolicy(record_var, field_name, field_ref, record_name):
+		CowFieldTakeRetainPolicy(record_var, ordinal, record_name):
 			[
 				tag,
 				("take_record", core_var_to_json(record_var)),
-				("take_field", JsonString(field_name)),
-				("take_field_ref", core_field_ref_to_json(field_ref)),
+				("take_ordinal", core_field_ordinal_to_json(ordinal)),
 				("take_record_name", JsonString(record_name)),
 			]
 		_:
@@ -8157,10 +8186,9 @@ pure func decode_core_retain_policy_json(
 			record_json,
 			path_field(path, "take_record"),
 		)
-		field_name ?= string_field(value, path, "take_field")
-		field_ref ?= decode_optional_field_ref_json(value, path, "take_field_ref")
+		ordinal ?= decode_core_field_ordinal_json(value, path, "take_ordinal")
 		record_name ?= string_field(value, path, "take_record_name")
-		Ok(CowFieldTakeRetainPolicy(record_var, field_name, field_ref, record_name))
+		Ok(CowFieldTakeRetainPolicy(record_var, ordinal, record_name))
 	else:
 		parse_core_retain_policy(
 			tag,
@@ -9828,11 +9856,11 @@ pure func core_accessor_to_json(accessor: CoreAccessor) -> JsonValue:
 				(KIND_FIELD, JsonString(BOXED_RESULT_ERR_PAYLOAD_ACCESSOR_TAG)),
 				("parent", core_accessor_to_json(parent)),
 			])
-		TupleFieldAccessor(parent, index, typ):
+		ProductFieldAccessor(parent, ordinal, typ):
 			JsonObject([
-				(KIND_FIELD, JsonString(TUPLE_FIELD_ACCESSOR_TAG)),
+				(KIND_FIELD, JsonString(PRODUCT_FIELD_ACCESSOR_TAG)),
 				("parent", core_accessor_to_json(parent)),
-				("index", json_int(index)),
+				("ordinal", core_field_ordinal_to_json(ordinal)),
 				("type", core_type_to_json(typ)),
 			])
 		ListElementAccessor(parent, index):
@@ -9940,19 +9968,19 @@ pure func decode_core_accessor_json(
 			path_field(path, "parent"),
 		)
 		Ok(BoxedResultErrPayloadAccessor(parent))
-	else if tag == TUPLE_FIELD_ACCESSOR_TAG:
+	else if tag == PRODUCT_FIELD_ACCESSOR_TAG:
 		parent_json ?= object_field(value, path, "parent")
 		parent ?= decode_core_accessor_json(
 			parent_json,
 			path_field(path, "parent"),
 		)
-		index ?= int_field(value, path, "index")
+		ordinal ?= decode_core_field_ordinal_json(value, path, "ordinal")
 		type_json ?= object_field(value, path, "type")
 		typ ?= decode_core_type_json(
 			type_json,
 			path_field(path, "type"),
 		)
-		Ok(TupleFieldAccessor(parent, index, typ))
+		Ok(ProductFieldAccessor(parent, ordinal, typ))
 	else if tag == LIST_ELEMENT_ACCESSOR_TAG:
 		parent_json ?= object_field(value, path, "parent")
 		parent ?= decode_core_accessor_json(
@@ -10955,33 +10983,16 @@ private pure func core_expr_unbox_to_json(
 	])
 
 
-private pure func core_expr_field_to_json(
-	expr_value: CoreExpr,
-	field_name: String,
-	field_ref: CoreFieldRef,
+private pure func core_expr_product_field_to_json(
+	base: CoreExpr,
+	ordinal: CoreFieldOrdinal,
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> JsonValue:
 	JsonObject([
-		(KIND_FIELD, JsonString(FIELD_EXPR_TAG)),
-		("expr", core_expr_to_json(expr_value)),
-		("field", JsonString(field_name)),
-		("field_ref", core_field_ref_to_json(field_ref)),
-		("type", core_type_to_json(typ)),
-		("loc", source_loc_to_json(loc)),
-	])
-
-
-private pure func core_expr_tuple_field_to_json(
-	expr_value: CoreExpr,
-	field_index: Int,
-	typ: CoreType,
-	loc: CoreSourceLoc,
-) -> JsonValue:
-	JsonObject([
-		(KIND_FIELD, JsonString(TUPLE_FIELD_EXPR_TAG)),
-		("expr", core_expr_to_json(expr_value)),
-		("index", json_int(field_index)),
+		(KIND_FIELD, JsonString(PRODUCT_FIELD_EXPR_TAG)),
+		("expr", core_expr_to_json(base)),
+		("ordinal", core_field_ordinal_to_json(ordinal)),
 		("type", core_type_to_json(typ)),
 		("loc", source_loc_to_json(loc)),
 	])
@@ -11972,11 +11983,11 @@ pure func core_semantic_match_accessor_to_json(accessor: CoreSemanticMatchAccess
 				("constructor", JsonString(constructor)),
 				("field_index", json_int(field_index)),
 			])
-		TupleFieldSemanticMatchAccessor(parent, index):
+		ProductFieldSemanticMatchAccessor(parent, ordinal):
 			JsonObject([
-				(KIND_FIELD, JsonString(TUPLE_FIELD_ACCESSOR_TAG)),
+				(KIND_FIELD, JsonString(PRODUCT_FIELD_ACCESSOR_TAG)),
 				("parent", core_semantic_match_accessor_to_json(parent)),
-				("index", json_int(index)),
+				("ordinal", core_field_ordinal_to_json(ordinal)),
 			])
 		ListElementSemanticMatchAccessor(parent, index):
 			JsonObject([
@@ -12226,10 +12237,16 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 			core_expr_box_to_json(box, typ, loc)
 		UnboxExpr(unbox_kind, expr_value, typ, loc):
 			core_expr_unbox_to_json(unbox_kind, expr_value, typ, loc)
-		FieldExpr(expr_value, field_name, field_ref, typ, loc):
-			core_expr_field_to_json(expr_value, field_name, field_ref, typ, loc)
-		TupleFieldExpr(expr_value, field_index, typ, loc):
-			core_expr_tuple_field_to_json(expr_value, field_index, typ, loc)
+		ProductFieldExpr(base, ordinal, typ, loc):
+			core_expr_product_field_to_json(base, ordinal, typ, loc)
+		ModuleMemberExpr(module_alias, member, typ, loc):
+			JsonObject([
+				(KIND_FIELD, JsonString(MODULE_MEMBER_EXPR_TAG)),
+				("alias", JsonString(module_alias)),
+				("member", JsonString(member)),
+				("type", core_type_to_json(typ)),
+				("loc", source_loc_to_json(loc)),
+			])
 		TupleExpr(items, typ, loc):
 			core_expr_tuple_to_json(items, typ, loc)
 		TupleConstructExpr(tuple_construct, typ, loc):
@@ -12771,17 +12788,16 @@ private pure func decode_core_expr_unbox_from_json(
 	Ok(UnboxExpr(unbox_kind, expr_value, typ, loc))
 
 
-private pure func decode_core_expr_field_from_json(
+private pure func decode_core_expr_product_field_from_json(
 	value: JsonValue,
 	path: String,
 ) -> Result[CoreExpr, CoreJsonError]:
 	expr_json ?= object_field(value, path, "expr")
-	expr_value ?= decode_core_expr_json(
+	base ?= decode_core_expr_json(
 		expr_json,
 		path_field(path, "expr"),
 	)
-	field_name ?= string_field(value, path, "field")
-	field_ref ?= decode_optional_field_ref_json(value, path, "field_ref")
+	ordinal ?= decode_core_field_ordinal_json(value, path, "ordinal")
 	type_json ?= object_field(value, path, "type")
 	typ ?= decode_core_type_json(
 		type_json,
@@ -12792,30 +12808,20 @@ private pure func decode_core_expr_field_from_json(
 		loc_json,
 		path_field(path, "loc"),
 	)
-	Ok(FieldExpr(expr_value, field_name, field_ref, typ, loc))
+	Ok(ProductFieldExpr(base, ordinal, typ, loc))
 
 
-private pure func decode_core_expr_tuple_field_from_json(
+private pure func decode_core_expr_module_member_from_json(
 	value: JsonValue,
 	path: String,
 ) -> Result[CoreExpr, CoreJsonError]:
-	expr_json ?= object_field(value, path, "expr")
-	expr_value ?= decode_core_expr_json(
-		expr_json,
-		path_field(path, "expr"),
-	)
-	field_index ?= int_field(value, path, "index")
+	module_alias ?= string_field(value, path, "alias")
+	member ?= string_field(value, path, "member")
 	type_json ?= object_field(value, path, "type")
-	typ ?= decode_core_type_json(
-		type_json,
-		path_field(path, "type"),
-	)
+	typ ?= decode_core_type_json(type_json, path_field(path, "type"))
 	loc_json ?= required_field(value, path, "loc")
-	loc ?= decode_source_loc_json(
-		loc_json,
-		path_field(path, "loc"),
-	)
-	Ok(TupleFieldExpr(expr_value, field_index, typ, loc))
+	loc ?= decode_source_loc_json(loc_json, path_field(path, "loc"))
+	Ok(ModuleMemberExpr(module_alias, member, typ, loc))
 
 
 private pure func decode_core_expr_tuple_from_json(
@@ -14620,10 +14626,10 @@ pure func decode_core_semantic_match_accessor_json(
 		constructor ?= string_field(value, path, "constructor")
 		field_index ?= int_field(value, path, "field_index")
 		Ok(VariantFieldSemanticMatchAccessor(parent, constructor, field_index))
-	else if tag == TUPLE_FIELD_ACCESSOR_TAG:
+	else if tag == PRODUCT_FIELD_ACCESSOR_TAG:
 		parent ?= decode_core_semantic_match_accessor_parent(value, path)
-		index ?= int_field(value, path, "index")
-		Ok(TupleFieldSemanticMatchAccessor(parent, index))
+		ordinal ?= decode_core_field_ordinal_json(value, path, "ordinal")
+		Ok(ProductFieldSemanticMatchAccessor(parent, ordinal))
 	else if tag == LIST_ELEMENT_ACCESSOR_TAG:
 		parent ?= decode_core_semantic_match_accessor_parent(value, path)
 		index ?= int_field(value, path, "index")
@@ -15070,10 +15076,10 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 		decode_core_expr_box_from_json(value, path)
 	else if tag == UNBOX_EXPR_TAG:
 		decode_core_expr_unbox_from_json(value, path)
-	else if tag == FIELD_EXPR_TAG:
-		decode_core_expr_field_from_json(value, path)
-	else if tag == TUPLE_FIELD_EXPR_TAG:
-		decode_core_expr_tuple_field_from_json(value, path)
+	else if tag == PRODUCT_FIELD_EXPR_TAG:
+		decode_core_expr_product_field_from_json(value, path)
+	else if tag == MODULE_MEMBER_EXPR_TAG:
+		decode_core_expr_module_member_from_json(value, path)
 	else if tag == TUPLE_EXPR_TAG:
 		decode_core_expr_tuple_from_json(value, path)
 	else if tag == TUPLE_CONSTRUCT_EXPR_TAG:

@@ -50,7 +50,8 @@ import:
 			AccessorLiteralMatchExpr, AssignExpr, BinaryExpr, BorrowLetExpr, BoxExpr, BreakExpr,
 			CallExpr, CastExpr, ClosureCreateExpr, ConcurrentExpr, ConcurrentlyLoopExpr,
 			ConstructorMatchExpr, ContinueExpr, CooperativeCheckpointExpr, DebugBlockExpr,
-			DetachExpr, DictConstructExpr, DictExpr, DropExpr, DupExpr, FieldExpr, ForChannelExpr,
+			DetachExpr, DictConstructExpr, DictExpr, DropExpr, DupExpr, ProductFieldExpr,
+			ModuleMemberExpr, ForChannelExpr,
 			ForDictExpr, ForListExpr, ForRangeExpr, ForResourceSourceExpr, ForSetExpr,
 			ForStreamExpr, ForStringExpr, ForTensorExpr, IfExpr, LambdaExpr, LetExpr,
 			ListConstructExpr, ListAllocExpr, ListGetExpr, ListHandoffExpr, ListHandoffSetOwnedExpr,
@@ -63,7 +64,7 @@ import:
 			StringSetLenExpr, TailrecListSpreadLoopExpr, TailrecListSpreadRecurExpr,
 			TailrecLoopExpr, TailrecRecurExpr, TensorBoxedLiteralExpr, TensorLiteralExpr,
 			TensorPackedLiteralExpr, TensorRawFillExpr, TensorRawReadExpr, TensorRawViewLetExpr,
-			TensorRawWriteExpr, TupleConstructExpr, TupleExpr, TupleFieldExpr, UnaryExpr, UnboxExpr,
+			TensorRawWriteExpr, TupleConstructExpr, TupleExpr, UnaryExpr, UnboxExpr,
 			UnionConstructExpr, UnionReuseConstructExpr, VarExpr, VectorExpr, VoidExpr, WhileExpr,
 			LiteralMatchExpr, LengthMatchExpr,
 		),
@@ -258,10 +259,10 @@ private pure func core_expr_kind_name(expr: CoreExpr) -> String:
 			"BoxExpr"
 		UnboxExpr(_, _, _, _):
 			"UnboxExpr"
-		FieldExpr(_, _, _, _, _):
-			"FieldExpr"
-		TupleFieldExpr(_, _, _, _):
-			"TupleFieldExpr"
+		ProductFieldExpr(_, _, _, _):
+			"ProductFieldExpr"
+		ModuleMemberExpr(_, _, _, _):
+			"ModuleMemberExpr"
 		TupleExpr(_, _, _):
 			"TupleExpr"
 		TupleConstructExpr(_, _, _):
@@ -930,9 +931,7 @@ private pure func binding_alias_rhs_is_owned_temporary_impl(
 		match rhs:
 			VarExpr(variable, typ, loc):
 				False
-			FieldExpr(owner, field, _, typ, loc):
-				False
-			TupleFieldExpr(owner, field_index, typ, loc):
+			ProductFieldExpr(owner, _, typ, loc):
 				False
 			_:
 				is_owned_temporary_expr(env, rhs)
@@ -985,12 +984,7 @@ private pure func normalize_binding_alias_rhs_with_owned_status_impl(
 						bind_type,
 						loc,
 					)
-			FieldExpr(owner, field, _, typ, loc):
-				if is_owned_temporary_expr(env, owner):
-					bind_owned_temporary_field_projection(env, rhs)
-				else:
-					retain_alias_as_owned(rhs)
-			TupleFieldExpr(owner, field_index, typ, loc):
+			ProductFieldExpr(owner, _, typ, loc):
 				if is_owned_temporary_expr(env, owner):
 					bind_owned_temporary_field_projection(env, rhs)
 				else:
@@ -1055,9 +1049,7 @@ private pure func normalize_binding_alias_rhs_reuses_source_impl(
 		match rhs:
 			VarExpr(variable, typ, loc):
 				is_nullary_constructor_reference(env.nullary_constructor_definitions, variable)
-			FieldExpr(owner, field, _, typ, loc):
-				False
-			TupleFieldExpr(owner, field_index, typ, loc):
+			ProductFieldExpr(owner, _, typ, loc):
 				False
 			_:
 				is_immortal_value_expr(env, rhs) or rhs_is_owned_temporary
@@ -1086,9 +1078,7 @@ private pure func retain_alias_source_in_body(
 		match rhs:
 			VarExpr(source, source_type, source_loc):
 				body
-			FieldExpr(owner, field, _, field_type, field_loc):
-				body
-			TupleFieldExpr(owner, field_index, field_type, field_loc):
+			ProductFieldExpr(owner, _, field_type, field_loc):
 				body
 			_:
 				body
@@ -1111,7 +1101,7 @@ private pure func aggregate_value_requires_direct_field_retain(
 	value: CoreExpr,
 ) -> Bool:
 	match value:
-		FieldExpr(_, _, _, typ, _) | TupleFieldExpr(_, _, typ, _):
+		ProductFieldExpr(_, _, typ, _):
 			is_managed_type(env, typ) and direct_field_alias(value)
 		_:
 			False
@@ -1122,7 +1112,7 @@ The caller proves the direct-alias condition once before entering here.
 ---
 private pure func retain_proven_direct_field_alias_value(value: CoreExpr) -> CoreExpr:
 	match value:
-		FieldExpr(_, _, _, typ, loc) | TupleFieldExpr(_, _, typ, loc):
+		ProductFieldExpr(_, _, typ, loc):
 			temp: CoreVar = synthetic_binding_var(PerceusAggregateField, 0, loc)
 			BorrowLetExpr(
 				temp,
@@ -1221,9 +1211,7 @@ private pure func aggregate_value_can_transfer_without_retain(
 	match expr:
 		StaticStringLiteralExpr(id, value, typ, loc):
 			True
-		FieldExpr(owner, field, _, typ, loc):
-			aggregate_value_can_transfer_without_retain(env, owner)
-		TupleFieldExpr(owner, field_index, typ, loc):
+		ProductFieldExpr(owner, _, typ, loc):
 			aggregate_value_can_transfer_without_retain(env, owner)
 		_:
 			is_owned_temporary_expr(env, expr)
@@ -1589,7 +1577,7 @@ pure func normalize_projection_ownership_change_aware(
 	source: CoreExpr,
 ) -> PerceusOwnershipNormalization:
 	match source:
-		FieldExpr(owner, _, _, _, _) | TupleFieldExpr(owner, _, _, _):
+		ProductFieldExpr(owner, _, _, _):
 			normalize_projection_owner_ownership_change_aware(env, source, owner)
 		_:
 			ChangedPerceusOwnershipNormalization(source)
@@ -1600,9 +1588,7 @@ private pure func materialize_owned_temporary_projection(
 	expr: CoreExpr,
 ) -> MaterializedBorrowedTemporary:
 	match expr:
-		FieldExpr(owner, field, _, typ, loc):
-			materialize_borrowed_temporary(env, expr)
-		TupleFieldExpr(owner, field_index, typ, loc):
+		ProductFieldExpr(owner, _, typ, loc):
 			materialize_borrowed_temporary(env, expr)
 		_:
 			{
@@ -1617,29 +1603,12 @@ pure func materialize_owned_temporary_field_projection(
 	depth: Int,
 ) -> CoreExpr:
 	match expr:
-		FieldExpr(owner, field, field_ref, typ, loc):
+		ProductFieldExpr(owner, ordinal, typ, loc):
 			owner_type: CoreType = core_expr_type(owner)
 			owner_var: CoreVar = synthetic_binding_var(PerceusOwnedFieldOwner, depth, loc)
-			projection: CoreExpr = FieldExpr(
+			projection: CoreExpr = ProductFieldExpr(
 				VarExpr(owner_var, owner_type, loc),
-				field,
-				field_ref,
-				typ,
-				loc,
-			)
-
-			owned_projection: CoreExpr = if is_managed_type(env, typ):
-				retain_alias_as_owned(projection)
-			else:
-				projection
-
-			LetExpr(owner_var, False, owner_type, owner, owned_projection)
-		TupleFieldExpr(owner, field_index, typ, loc):
-			owner_type: CoreType = core_expr_type(owner)
-			owner_var: CoreVar = synthetic_binding_var(PerceusOwnedFieldOwner, depth, loc)
-			projection: CoreExpr = TupleFieldExpr(
-				VarExpr(owner_var, owner_type, loc),
-				field_index,
+				ordinal,
 				typ,
 				loc,
 			)
@@ -3555,13 +3524,9 @@ record MaterializedBorrowedTemporary {
 
 pure func direct_field_alias(expr: CoreExpr) -> Bool:
 	match expr:
-		FieldExpr(VarExpr(variable, owner_type, owner_loc), field, _, typ, loc):
+		ProductFieldExpr(VarExpr(_, _, _), _, _, _):
 			True
-		FieldExpr(owner, field, _, typ, loc):
-			direct_field_alias(owner)
-		TupleFieldExpr(VarExpr(variable, owner_type, owner_loc), field_index, typ, loc):
-			True
-		TupleFieldExpr(owner, field_index, typ, loc):
+		ProductFieldExpr(owner, _, _, _):
 			direct_field_alias(owner)
 		_:
 			False
@@ -3955,7 +3920,7 @@ private pure func materialize_borrowed_temporary_with_names(
 	expr: CoreExpr,
 ) -> MaterializedBorrowedTemporary:
 	match expr:
-		FieldExpr(owner, field, field_ref, typ, loc):
+		ProductFieldExpr(owner, ordinal, typ, loc):
 			owner_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
 				env,
 				owned,
@@ -3963,25 +3928,7 @@ private pure func materialize_borrowed_temporary_with_names(
 				owner,
 			)
 
-			projection: CoreExpr = FieldExpr(owner_result.expr, field, field_ref, typ, loc)
-
-			if owner_result.is_owned:
-				borrowed_temporary_result(
-					env,
-					owned,
-					materialize_owned_temporary_field_projection(env, projection, depth),
-				)
-			else:
-				borrowed_temporary_result(env, owned, projection)
-		TupleFieldExpr(owner, field_index, typ, loc):
-			owner_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
-				env,
-				owned,
-				depth + 1,
-				owner,
-			)
-
-			projection: CoreExpr = TupleFieldExpr(owner_result.expr, field_index, typ, loc)
+			projection: CoreExpr = ProductFieldExpr(owner_result.expr, ordinal, typ, loc)
 
 			if owner_result.is_owned:
 				borrowed_temporary_result(
@@ -4701,9 +4648,7 @@ pure func retain_alias_as_owned(expr: CoreExpr) -> CoreExpr:
 	loc: CoreSourceLoc = match expr:
 		VarExpr(variable, value_type, value_loc):
 			value_loc
-		FieldExpr(owner, field, _, value_type, value_loc):
-			value_loc
-		TupleFieldExpr(owner, field_index, value_type, value_loc):
+		ProductFieldExpr(owner, _, value_type, value_loc):
 			value_loc
 		ListGetExpr(get, value_type, value_loc):
 			value_loc
@@ -4743,9 +4688,7 @@ pure func managed_pointer_unbox_alias(env: PerceusEnv, kind: CoreUnboxKind, typ:
 
 pure func owned_result_is_alias(env: PerceusEnv, expr: CoreExpr) -> Bool:
 	match expr:
-		FieldExpr(owner, field, _, typ, loc):
-			True
-		TupleFieldExpr(owner, field_index, typ, loc):
+		ProductFieldExpr(owner, _, typ, loc):
 			True
 		ListGetExpr(get, typ, loc):
 			True
@@ -4942,7 +4885,7 @@ private pure func insert_drops_change_aware_fixed_ownership_impl(
 			normalize_unbox_ownership_change_aware(env, source)
 		BinaryExpr(_, _, _, _, _):
 			normalize_binary_ownership_change_aware(env, source)
-		FieldExpr(_, _, _, _, _) | TupleFieldExpr(_, _, _, _):
+		ProductFieldExpr(_, _, _, _):
 			normalize_projection_ownership_change_aware(env, source)
 		_:
 			ChangedPerceusOwnershipNormalization(source)
@@ -4991,7 +4934,7 @@ private pure func insert_drops_change_aware_fixed_ownership_impl(
 							BinaryExpr(op, rewritten_left.expr, rewritten_right.expr, typ, loc),
 							False,
 						)
-				FieldExpr(owner, field, field_ref, typ, loc):
+				ProductFieldExpr(owner, ordinal, typ, loc):
 					rewritten_owner: PerceusInsertedExpr = insert_drops_expr_inner_result(
 						env,
 						owner,
@@ -5002,21 +4945,7 @@ private pure func insert_drops_change_aware_fixed_ownership_impl(
 					else:
 						inserted_non_binding_expr(
 							env,
-							FieldExpr(rewritten_owner.expr, field, field_ref, typ, loc),
-							False,
-						)
-				TupleFieldExpr(owner, field_index, typ, loc):
-					rewritten_owner: PerceusInsertedExpr = insert_drops_expr_inner_result(
-						env,
-						owner,
-					)
-
-					if rewritten_owner.reuses_source:
-						inserted_non_binding_expr(env, source, True)
-					else:
-						inserted_non_binding_expr(
-							env,
-							TupleFieldExpr(rewritten_owner.expr, field_index, typ, loc),
+							ProductFieldExpr(rewritten_owner.expr, ordinal, typ, loc),
 							False,
 						)
 				_:
@@ -5060,7 +4989,7 @@ pure func insert_drops_non_binding_expr(env: PerceusEnv, expr: CoreExpr) -> Perc
 			insert_drops_change_aware_aggregate(env, expr)
 		CallExpr(kind, callee, args, typ, loc):
 			insert_drops_change_aware_call(env, expr, kind, callee, args, typ, loc)
-		UnboxExpr(_, _, _, _) | BinaryExpr(_, _, _, _, _) | FieldExpr(_, _, _, _, _) | TupleFieldExpr(_, _, _, _):
+		UnboxExpr(_, _, _, _) | BinaryExpr(_, _, _, _, _) | ProductFieldExpr(_, _, _, _):
 			insert_drops_change_aware_fixed_ownership(env, expr)
 		_:
 			insert_drops_change_aware_normalized_expr(env, expr)

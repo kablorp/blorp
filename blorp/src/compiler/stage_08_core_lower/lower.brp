@@ -80,11 +80,22 @@ import:
 		typed_foreign_arg_passing_borrows,
 	../stage_06_typecheck/graph/definition_index:
 		DefinitionTable,
+		FieldId,
 		ResolvedFieldIdentity,
 		definition_table_module_table,
 		definition_table_type_row,
+		resolved_field_identity_field_id,
 		resolved_field_identity_runtime_value,
 		field_id_definition_id,
+	../stage_06_typecheck/headers/accepted_record_graph: accepted_record_table_canonical_authority
+	../stage_06_typecheck/type_system/accepted_record_authority:
+		AcceptedFieldExactLookup(
+			AcceptedFieldExactFound, AcceptedFieldExactIncompatibleDefinitionTable,
+			AcceptedFieldExactMissing,
+		),
+		AcceptedRecordTable,
+		accepted_record_field_exact,
+		accepted_record_range_fields,
 	../stage_06_typecheck/graph/type_identity: type_id_definition_id
 	../stage_06_typecheck/headers/declaration_skeleton:
 		callable_id_definition_id,
@@ -114,12 +125,13 @@ import:
 			TypedConcurrentForExpr, TypedContinueExpr, TypedDebugBlockExpr, TypedDetachExpr,
 			TypedDictExpr, TypedFieldAccessExpr, TypedFloatLiteralExpr, TypedForExpr, TypedIfExpr,
 			TypedIntLiteralExpr, TypedLambdaExpr, TypedListExpr, TypedLogicalExpr, TypedMatchExpr,
-			TypedMissingExpr, TypedNameExpr, TypedOpaqueFromExpr, TypedOpaqueIntoExpr,
-			TypedQuestionBindExpr, TypedRangeExpr, TypedRecordExpr, TypedRecordUpdateExpr,
-			TypedSelectExpr, TypedStringInterpolationExpr, TypedStringInterpolationPartsExpr,
-			TypedStringLiteralExpr, TypedSubscriptAssignExpr, TypedSubscriptExpr,
-			TypedTupleDestructExpr, TypedTupleExpr, TypedUnaryExpr, TypedUnsupportedExpr,
-			TypedVarDeclExpr, TypedVectorExpr, TypedVoidExpr, TypedWhileExpr, TypedWithExpr,
+			TypedMissingExpr, TypedModuleMemberExpr, TypedNameExpr, TypedOpaqueFromExpr,
+			TypedOpaqueIntoExpr, TypedQuestionBindExpr, TypedRangeExpr, TypedRecordExpr,
+			TypedRecordUpdateExpr, TypedSelectExpr, TypedStringInterpolationExpr,
+			TypedStringInterpolationPartsExpr, TypedStringLiteralExpr, TypedSubscriptAssignExpr,
+			TypedSubscriptExpr, TypedTupleDestructExpr, TypedTupleExpr, TypedUnaryExpr,
+			TypedUnsupportedExpr, TypedVarDeclExpr, TypedVectorExpr, TypedVoidExpr, TypedWhileExpr,
+			TypedWithExpr,
 		),
 		TypedExprInfo,
 		TypedLambdaParam,
@@ -212,13 +224,15 @@ import:
 		CoreEnumVariant,
 		CoreExpr(
 			BinaryExpr, BreakExpr, CallExpr, ContinueExpr, DebugBlockExpr, AssignExpr, DictExpr,
-			FieldExpr, ForChannelExpr, ForDictExpr, ForListExpr, ForRangeExpr,
+			ForChannelExpr, ForDictExpr, ForListExpr, ForRangeExpr,
 			ForResourceSourceExpr, ForSetExpr, ForStreamExpr, ForStringExpr, ForTensorExpr, IfExpr,
 			LambdaExpr, LetExpr, ListConstructExpr, LiteralExpr, LogicalExpr,
 			RawMatchExpr, RecordExpr, ResourceScopeExpr, PreClosureDetachExpr,
 			PreClosureConcurrentExpr, PreClosureConcurrentlyLoopExpr, SelectExpr, SeqExpr,
-			TupleExpr, TupleFieldExpr, UnaryExpr, VarExpr, VectorExpr, WhileExpr, VoidExpr,
+			TupleExpr, UnaryExpr, VarExpr, VectorExpr, WhileExpr, VoidExpr, ModuleMemberExpr,
+			ProductFieldExpr,
 		),
+		CoreFieldOrdinal,
 		CoreFieldRef,
 		CoreForChannel,
 		CoreForDict,
@@ -284,6 +298,8 @@ import:
 		LoweringTempKind(QuestionBindTemp),
 		QUESTION_BIND_TEMP_ORIGIN,
 		TUPLE_DESTRUCT_TEMP_ORIGIN,
+		core_field_ordinal,
+		core_field_ordinal_index,
 		core_field_ref,
 		pack_core_source_loc,
 		synthetic_core_source_loc,
@@ -368,7 +384,9 @@ record CoreLowerContext {
 	source_module: Option[String],
 	source_table: Option[SourceTable],
 	definition_table: Option[DefinitionTable],
-	range_fields: Option[ResolvedRangeFields],
+	-- The graph's accepted record rows: a record field selection's ordinal is
+	-- issued from them, and they declare the standard `Range` fields.
+	records: Option[AcceptedRecordTable],
 	module_id: Option[ModuleId],
 	callable_names: CoreLowerCallableNameRegistry,
 	module_member_prefixes: Dict[String, String],
@@ -504,7 +522,7 @@ pure func core_lower_context(next_def_id: Int, source_module: Option[String]) ->
 		source_module = source_module,
 		source_table = None,
 		definition_table = None,
-		range_fields = None,
+		records = None,
 		module_id = None,
 		callable_names = CoreLowerDefaultCallableNames,
 		module_member_prefixes = {},
@@ -526,7 +544,7 @@ pure func core_lower_context_with_callable_names(
 		source_module = source_module,
 		source_table = None,
 		definition_table = Some(definition_table),
-		range_fields = None,
+		records = None,
 		module_id = Some(module_id),
 		callable_names = callable_names,
 		module_member_prefixes = {},
@@ -561,11 +579,23 @@ pure func core_lower_context_with_type_kind_table(
 	{ context | type_kind_table = type_kind_table }
 
 
-pure func core_lower_context_with_range_fields(
+---
+Attach the graph's accepted record rows so field selections and range loops
+can be lowered.
+---
+pure func core_lower_context_with_records(
 	context: CoreLowerContext,
-	range_fields: Option[ResolvedRangeFields],
+	records: Option[AcceptedRecordTable],
 ) -> CoreLowerContext:
-	{ context | range_fields = range_fields }
+	{ context | records = records }
+
+
+---
+The standard `Range` record's fields, as the accepted record rows declare them.
+---
+private pure func standard_range_fields(context: CoreLowerContext) -> Option[ResolvedRangeFields]:
+	records ?= context.records
+	accepted_record_range_fields(accepted_record_table_canonical_authority(records))
 
 
 private pure func mint_def_id(context: CoreLowerContext) -> (CoreLowerContext, Int):
@@ -1085,7 +1115,7 @@ private pure func apply_resolved_callee_identity(
 					match callee:
 						VarExpr(variable, typ, loc):
 							Ok(VarExpr({ variable | name = name }, typ, loc))
-						FieldExpr(_, _, _, typ, loc):
+						ProductFieldExpr(_, _, typ, loc) | ModuleMemberExpr(_, _, typ, loc):
 							Ok(VarExpr(core_var(name, None), typ, loc))
 						_:
 							Ok(callee)
@@ -1723,6 +1753,8 @@ private pure func typed_expr_label(expr: TypedExpr) -> String:
 			"record update"
 		TypedFieldAccessExpr(_, _, _, _, _):
 			"field access"
+		TypedModuleMemberExpr(_, _, _, _):
+			"module member"
 		TypedLambdaExpr(_, _, _, _, _, _):
 			"lambda"
 		TypedRangeExpr(_, _, range_fields, _, _):
@@ -2238,17 +2270,16 @@ private pure func lower_record_update_field(
 	base_ref: CoreExpr,
 	loc: CoreSourceLoc,
 ) -> Result[CoreRecordFieldValue, CoreLowerError]:
-	field_type ?= core_lower_type_with_prefixes(context.module_member_prefixes, field.field_type)
-	field_ref: CoreFieldRef = core_field_ref_from_resolved(field.field_id)
-
 	match updates.find(func(update): update.name == field.name):
 		Some(update):
 			Ok(update)
 		None:
+			field_type ?= core_lower_type_with_prefixes(context.module_member_prefixes, field.field_type)
+			ordinal ?= selected_record_field_ordinal(context, field.field_id)
 			Ok({
 				name = field.name,
-				ref = field_ref,
-				value = FieldExpr(base_ref, field.name, field_ref, field_type, loc),
+				ref = core_field_ref_from_resolved(field.field_id),
+				value = ProductFieldExpr(base_ref, ordinal, field_type, loc),
 			})
 
 
@@ -2449,44 +2480,88 @@ private pure func lower_typed_field_access(
 		context.module_member_prefixes,
 		typed_expr_value_type(receiver),
 	)
-	field_ref: CoreFieldRef = core_field_ref_from_resolved(field_identity)
+	ordinal ?= product_field_ordinal(context, receiver_type, field, field_identity)
+	Ok(ProductFieldExpr(lowered_receiver, ordinal, typ, loc))
 
-	match receiver_type:
-		TupleType(items):
-			match field.text.parse_int():
-				Some(index):
-					if index >= 0 and index < items.length():
-						Ok(TupleFieldExpr(lowered_receiver, index, typ, loc))
+
+---
+The ordinal of the field a selection reads, issued where its product is
+checked. A record selection names its field by typecheck identity, and the
+ordinal is that field's position in the accepted record row. A tuple
+selection has no identity (`ResolvedFieldIdentity` marks it missing); its
+field is the element index typecheck validated, spelled as the selection's
+text, and checked here against the tuple's arity.
+---
+private pure func product_field_ordinal(
+	context: CoreLowerContext,
+	receiver_type: CoreType,
+	field: ParsedIdentifier,
+	field_identity: ResolvedFieldIdentity,
+) -> Result[CoreFieldOrdinal, CoreLowerError]:
+	match resolved_field_identity_field_id(field_identity):
+		Some(field_id):
+			record_field_ordinal(context, field_id)
+		None:
+			arity ?= match receiver_type:
+				TupleType(elements):
+					Ok(elements.length())
+				NamedType(name, args):
+					if name == "Tuple":
+						Ok(args.length())
 					else:
-						Err(
-							CoreLowerInvalidType(
-								"tuple field index " + index.to_string() + " is out of bounds for tuple arity " + items
-									.length()
-									.to_string(),
-							),
-						)
-				None:
-					Err(CoreLowerInvalidType("tuple field access requires numeric field name"))
-		NamedType(name, args):
-			if name == "Tuple":
-				match field.text.parse_int():
-					Some(index):
-						if index >= 0 and index < args.length():
-							Ok(TupleFieldExpr(lowered_receiver, index, typ, loc))
-						else:
-							Err(
-								CoreLowerInvalidType(
-									"tuple field index " + index.to_string() + " is out of bounds for tuple arity " + args
-										.length()
-										.to_string(),
-								),
-							)
-					None:
-						Err(CoreLowerInvalidType("tuple field access requires numeric field name"))
+						Err(CoreLowerInvalidType("record field selection has no typecheck field identity"))
+				_:
+					Err(CoreLowerInvalidType("field selection has no typecheck field identity"))
+			index ?= field.text
+				.parse_int()
+				.to_result(CoreLowerInvalidType("tuple field access requires numeric field name"))
+
+			if index >= 0 and index < arity:
+				Ok(core_field_ordinal(index))
 			else:
-				Ok(FieldExpr(lowered_receiver, field.text, field_ref, typ, loc))
-		_:
-			Ok(FieldExpr(lowered_receiver, field.text, field_ref, typ, loc))
+				Err(
+					CoreLowerInvalidType(
+						"tuple field index " + index.to_string() + " is out of bounds for tuple arity " + arity
+							.to_string(),
+					),
+				)
+
+
+---
+The ordinal of the record field typecheck resolved `identity` to, or an error
+for a field without identity, which only recovery produces.
+---
+private pure func selected_record_field_ordinal(
+	context: CoreLowerContext,
+	identity: ResolvedFieldIdentity,
+) -> Result[CoreFieldOrdinal, CoreLowerError]:
+	field_id ?= resolved_field_identity_field_id(identity).to_result(
+		CoreLowerInvalidType("record field has no typecheck field identity"),
+	)
+	record_field_ordinal(context, field_id)
+
+
+---
+The position of field `field_id` in its accepted record row.
+---
+private pure func record_field_ordinal(
+	context: CoreLowerContext,
+	field_id: FieldId,
+) -> Result[CoreFieldOrdinal, CoreLowerError]:
+	records ?= context.records.to_result(CoreLowerInvalidType(
+		"accepted record rows are missing; prepare the accepted module graph before lowering field selections",
+	))
+	definitions ?= context.definition_table.to_result(CoreLowerInvalidType(
+		"definition table is missing; prepare the accepted module graph before lowering field selections",
+	))
+
+	match accepted_record_field_exact(records, definitions, field_id):
+		AcceptedFieldExactFound(row):
+			Ok(core_field_ordinal(row.index))
+		AcceptedFieldExactMissing:
+			Err(CoreLowerInvalidType("field selection names no accepted record field"))
+		AcceptedFieldExactIncompatibleDefinitionTable:
+			Err(CoreLowerInvalidType("accepted record rows come from another definition table"))
 
 
 ---
@@ -3047,7 +3122,7 @@ private pure func is_standard_range_record_type(context: CoreLowerContext, name:
 	if name == STANDARD_RANGE_RECORD_TYPE_NAME:
 		True
 	else:
-		match (context.range_fields, context.definition_table, context.module_id):
+		match (standard_range_fields(context), context.definition_table, context.module_id):
 			(Some(range_fields), Some(definitions), Some(module_id)):
 				match definition_table_type_row(definitions, type_id_definition_id(range_fields.record_id)):
 					Some(row):
@@ -3131,7 +3206,7 @@ private pure func lower_typed_range_value_for(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
-	range_fields ?= context.range_fields.to_result(CoreLowerInvalidType(
+	range_fields ?= standard_range_fields(context).to_result(CoreLowerInvalidType(
 		"standard Range field authority is missing; prepare the accepted module graph before lowering range values",
 	))
 	lowered_binder ?= lower_for_name_binder(context, binder, TYPE_INT)
@@ -3155,17 +3230,12 @@ private pure func lower_typed_range_value_for(
 		clone_core_type(range_type),
 		clone_core_source_loc(loc),
 	)
-	start_expr = FieldExpr(
-		range_ref,
-		RANGE_START_FIELD,
-		core_field_ref(field_id_definition_id(range_fields.start)),
-		CORE_INT_TYPE,
-		clone_core_source_loc(loc),
-	)
-	end_expr = FieldExpr(
+	start_ordinal ?= record_field_ordinal(context, range_fields.start)
+	end_ordinal ?= record_field_ordinal(context, range_fields.end)
+	start_expr = ProductFieldExpr(range_ref, start_ordinal, CORE_INT_TYPE, clone_core_source_loc(loc))
+	end_expr = ProductFieldExpr(
 		VarExpr(clone_core_var(range_var), clone_core_type(range_type), clone_core_source_loc(loc)),
-		RANGE_END_FIELD,
-		core_field_ref(field_id_definition_id(range_fields.end)),
+		end_ordinal,
 		CORE_INT_TYPE,
 		clone_core_source_loc(loc),
 	)
@@ -4922,7 +4992,7 @@ private pure func lower_tuple_destruct_bindings(
 						core_local_var(name),
 						False,
 						field_type,
-						TupleFieldExpr(tuple_ref, index, field_type, loc),
+						ProductFieldExpr(tuple_ref, core_field_ordinal(index), field_type, loc),
 						inner,
 					),
 				)
@@ -5133,6 +5203,8 @@ private pure func typed_expr_kind_name(expr: TypedExpr) -> String:
 			"TypedRecordUpdateExpr"
 		TypedFieldAccessExpr(_, _, _, _, _):
 			"TypedFieldAccessExpr"
+		TypedModuleMemberExpr(_, _, _, _):
+			"TypedModuleMemberExpr"
 		TypedLambdaExpr(_, _, _, _, _, _):
 			"TypedLambdaExpr"
 		TypedRangeExpr(_, _, range_fields, _, _):
@@ -5364,6 +5436,8 @@ private pure func lower_typed_expr_as_type_impl(
 			Ok(DictExpr(lowered_entries, typ, loc))
 		TypedFieldAccessExpr(receiver, field, field_identity, _, _):
 			lower_typed_field_access(context, receiver, field, field_identity, typ, loc)
+		TypedModuleMemberExpr(module_alias, member, _, _):
+			Ok(ModuleMemberExpr(module_alias.text, member.text, typ, loc))
 		TypedRangeExpr(start_expr, end_expr, range_fields, _, _):
 			lowered_start ?= lower_typed_expr_with_context(context, start_expr)
 			lowered_end ?= lower_typed_expr_with_context(context, end_expr)
@@ -5908,27 +5982,60 @@ private pure func lower_heap_record_fields(
 
 
 
+---
+A read addresses a field by its position in the accepted record row, while C
+members, constructors and updates follow the declaration's order, so the two
+must agree. `None` when they do, or when lowering has no rows (no module graph).
+---
+private pure func record_row_order_mismatch(
+	context: CoreLowerContext,
+	fields: List[TypedRecordFieldInfo],
+) -> Option[CoreLowerError]:
+	var mismatch: Option[CoreLowerError] = None
+
+	if context.records.is_some():
+		for (position, field) in fields.enumerate():
+			match (mismatch, resolved_field_identity_field_id(field.field_id)):
+				(None, Some(field_id)):
+					match record_field_ordinal(context, field_id):
+						Ok(ordinal):
+							if core_field_ordinal_index(ordinal) != position:
+								mismatch = Some(CoreLowerInvalidType(
+									"record field `${field.name}` is declared at position ${position.to_string()} but its accepted row puts it at ${core_field_ordinal_index(ordinal).to_string()}",
+								))
+						Err(error):
+							mismatch = Some(error)
+				_:
+					void
+
+	mismatch
+
+
 private pure func lower_typed_record(
 	context: CoreLowerContext,
 	info: TypedRecordInfo,
 ) -> Result[CoreLowerDeclResult, CoreLowerError]:
-	fields ?= lower_heap_record_fields(context.module_member_prefixes, info.fields)
-	form: CoreRecordForm = match info.decl.form:
-		OrdinaryRecord:
-			OrdinaryRecordForm
-		FixedRecord:
-			FixedRecordForm
-	Ok({
-		context = context,
-		decl = HeapRecordDecl({
-			abi_type = lowered_declared_abi_type(context, info.decl.name.text),
-			form = form,
-			name = info.decl.name.text,
-			type_params = core_type_param_names(info.decl.type_params),
-			fields = fields,
-			loc = core_source_loc_from_context(context, info.decl.span),
-		}),
-	})
+	match record_row_order_mismatch(context, info.fields):
+		Some(error):
+			Err(error)
+		None:
+			fields ?= lower_heap_record_fields(context.module_member_prefixes, info.fields)
+			form: CoreRecordForm = match info.decl.form:
+				OrdinaryRecord:
+					OrdinaryRecordForm
+				FixedRecord:
+					FixedRecordForm
+			Ok({
+				context = context,
+				decl = HeapRecordDecl({
+					abi_type = lowered_declared_abi_type(context, info.decl.name.text),
+					form = form,
+					name = info.decl.name.text,
+					type_params = core_type_param_names(info.decl.type_params),
+					fields = fields,
+					loc = core_source_loc_from_context(context, info.decl.span),
+				}),
+			})
 
 
 ---
@@ -6073,21 +6180,22 @@ private pure func lower_derived_record_equality(
 	operands = derived_equality_operands(context, receiver, info.decl.span, info.decl.name.span)
 	left_ref = VarExpr(operands.left, receiver, operands.loc)
 	right_ref = VarExpr(operands.right, receiver, operands.loc)
+	var field_equalities: List[CoreExpr] = []
+
+	for (position, field) in fields.enumerate():
+		field_equalities = field_equalities.append(BinaryExpr(
+			EqualOp,
+			ProductFieldExpr(left_ref, core_field_ordinal(position), field.typ, operands.loc),
+			ProductFieldExpr(right_ref, core_field_ordinal(position), field.typ, operands.loc),
+			CORE_BOOL_TYPE,
+			operands.loc,
+		))
+
 	derived_equality_impl(
 		context,
 		operands,
 		info.decl.type_params.map(derived_equality_type_param),
-		fields.map(
-			func(
-				field,
-			): BinaryExpr(
-				EqualOp,
-				FieldExpr(left_ref, field.name, field.ref, field.typ, operands.loc),
-				FieldExpr(right_ref, field.name, field.ref, field.typ, operands.loc),
-				CORE_BOOL_TYPE,
-				operands.loc,
-			),
-		),
+		field_equalities,
 	)
 
 
@@ -6122,8 +6230,8 @@ private pure func lower_derived_tuple_equality(
 					element,
 				): BinaryExpr(
 					EqualOp,
-					TupleFieldExpr(left_ref, element[0], element[1], operands.loc),
-					TupleFieldExpr(right_ref, element[0], element[1], operands.loc),
+					ProductFieldExpr(left_ref, core_field_ordinal(element[0]), element[1], operands.loc),
+					ProductFieldExpr(right_ref, core_field_ordinal(element[0]), element[1], operands.loc),
 					CORE_BOOL_TYPE,
 					operands.loc,
 				),

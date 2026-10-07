@@ -41,9 +41,10 @@ import:
 			ForListExpr, ForRangeExpr, ForResourceSourceExpr, ForSetExpr, ForStreamExpr,
 			ForStringExpr, ForTensorExpr, LambdaExpr, LetExpr, ListHandoffExpr,
 			PreClosureConcurrentExpr, PreClosureConcurrentlyLoopExpr, ResourceScopeExpr,
-			SelectExpr, SemanticMatchExpr, TailrecListSpreadLoopExpr, TailrecLoopExpr,
-			TensorRawViewLetExpr, TupleExpr, TupleFieldExpr, VarExpr,
+			ProductFieldExpr, SelectExpr, SemanticMatchExpr, TailrecListSpreadLoopExpr,
+			TailrecLoopExpr, TensorRawViewLetExpr, TupleExpr, VarExpr,
 		),
+		CoreFieldOrdinal,
 		CoreFunction,
 		CoreParam,
 		CorePreClosureConcurrentBinding,
@@ -55,7 +56,7 @@ import:
 		CoreSemanticLiteralMatchCase,
 		CoreSemanticMatchAccessor(
 			ListElementSemanticMatchAccessor, ListSpreadSemanticMatchAccessor,
-			RootSemanticMatchAccessor, TupleFieldSemanticMatchAccessor,
+			RootSemanticMatchAccessor, ProductFieldSemanticMatchAccessor,
 			VariantFieldSemanticMatchAccessor,
 		),
 		CoreSemanticMatchBinding,
@@ -67,6 +68,8 @@ import:
 		CoreType(TupleType),
 		CoreVar,
 		core_expr_type,
+		core_field_ordinal_index,
+		core_field_ordinals_equal,
 		core_var_equal,
 	traverse:
 		CoreMapState,
@@ -361,7 +364,7 @@ private pure func local_facts(params: List[CoreVar], body: CoreExpr) -> LocalFac
 						VarExpr(variable, typ, _):
 							if is_tuple_type(typ) and not contains_var(used_whole, variable):
 								used_whole = used_whole.append(variable)
-						TupleFieldExpr(VarExpr(_, _, _), _, _, _):
+						ProductFieldExpr(VarExpr(_, _, _), _, _, _):
 							void
 						SemanticMatchExpr(VarExpr(subject, _, _), tree, _, _):
 							-- A leaf binder that names the whole subject is the subject
@@ -772,12 +775,12 @@ private pure func flatten_element_read(
 	state: TupleFlattenState,
 	expr: CoreExpr,
 	base: CoreExpr,
-	index: Int,
+	ordinal: CoreFieldOrdinal,
 	loc: CoreSourceLoc,
 ) -> CoreMapState[TupleFlattenState, CoreExpr]:
 	match group_source(state, base):
 		ExistingGroup(group):
-			match group.elements.get(index):
+			match group.elements.get(core_field_ordinal_index(ordinal)):
 				Some(element):
 					{
 						state = state,
@@ -788,7 +791,7 @@ private pure func flatten_element_read(
 						state = with_fault(
 							state,
 							SubjectAccessorOutsideElements(
-								TupleFieldSemanticMatchAccessor(RootSemanticMatchAccessor, index),
+								ProductFieldSemanticMatchAccessor(RootSemanticMatchAccessor, ordinal),
 							),
 						),
 						value = expr
@@ -796,7 +799,7 @@ private pure func flatten_element_read(
 		BuiltElements(source):
 			bound: BoundGroup = bind_elements(state, "element", source, core_expr_type(base))
 
-			match bound.group.elements.get(index):
+			match bound.group.elements.get(core_field_ordinal_index(ordinal)):
 				Some(element):
 					{
 						state = bound.state,
@@ -807,7 +810,7 @@ private pure func flatten_element_read(
 						state = with_fault(
 							bound.state,
 							SubjectAccessorOutsideElements(
-								TupleFieldSemanticMatchAccessor(RootSemanticMatchAccessor, index),
+								ProductFieldSemanticMatchAccessor(RootSemanticMatchAccessor, ordinal),
 							),
 						),
 						value = expr
@@ -890,8 +893,10 @@ private pure func flatten_expr(
 				loop.params.map(pure func(param: CoreParam): param.name),
 			)
 			flatten_with_mutable(state, rebound, expr)
-		TupleFieldExpr(base, index, _, loc):
-			flatten_element_read(state, expr, base, index, loc)
+		-- Only a tuple local or producer has a group, so a record read is left
+		-- to `flatten_children`.
+		ProductFieldExpr(base, ordinal, _, loc):
+			flatten_element_read(state, expr, base, ordinal, loc)
 		SemanticMatchExpr(scrutinee, tree, typ, loc):
 			flatten_match(state, expr, scrutinee, tree, typ, loc)
 		VarExpr(variable, _, loc):
@@ -919,16 +924,16 @@ private pure func group_access(
 	match accessor:
 		RootSemanticMatchAccessor:
 			Some(WholeGroupAccess)
-		TupleFieldSemanticMatchAccessor(parent, index):
+		ProductFieldSemanticMatchAccessor(parent, ordinal):
 			match group_access(group, parent):
 				Some(WholeGroupAccess):
 					group.elements
-						.get(index)
+						.get(core_field_ordinal_index(ordinal))
 						.map(pure func(element: TupleElement):
 							ElementAccess(element, RootSemanticMatchAccessor)
 						)
 				Some(ElementAccess(element, path)):
-					Some(ElementAccess(element, TupleFieldSemanticMatchAccessor(path, index)))
+					Some(ElementAccess(element, ProductFieldSemanticMatchAccessor(path, ordinal)))
 				None:
 					None
 		VariantFieldSemanticMatchAccessor(parent, constructor, field_index):
@@ -973,7 +978,7 @@ private pure func path_relies_on_test(path: CoreSemanticMatchAccessor) -> Bool:
 	match path:
 		RootSemanticMatchAccessor:
 			False
-		TupleFieldSemanticMatchAccessor(parent, _):
+		ProductFieldSemanticMatchAccessor(parent, _):
 			path_relies_on_test(parent)
 		VariantFieldSemanticMatchAccessor(_, _, _) | ListElementSemanticMatchAccessor(_, _) | ListSpreadSemanticMatchAccessor(_, _):
 			True
@@ -1025,10 +1030,10 @@ private pure func same_accessor(left: CoreSemanticMatchAccessor, right: CoreSema
 	match left:
 		RootSemanticMatchAccessor:
 			is_root_accessor(right)
-		TupleFieldSemanticMatchAccessor(left_parent, left_index):
+		ProductFieldSemanticMatchAccessor(left_parent, left_index):
 			match right:
-				TupleFieldSemanticMatchAccessor(right_parent, right_index):
-					left_index == right_index and same_accessor(left_parent, right_parent)
+				ProductFieldSemanticMatchAccessor(right_parent, right_index):
+					core_field_ordinals_equal(left_index, right_index) and same_accessor(left_parent, right_parent)
 				_:
 					False
 		VariantFieldSemanticMatchAccessor(left_parent, left_constructor, left_index):

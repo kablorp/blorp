@@ -13,6 +13,7 @@ import:
 		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, InlineRecordDecl, UnionDecl),
 		CoreEnumDecl,
 		CoreExpr(CallExpr),
+		CoreFieldOrdinal,
 		CoreFieldRef,
 		CoreFunction,
 		CoreFunctionKind(ForeignFunction),
@@ -25,6 +26,7 @@ import:
 		),
 		CoreUnionDecl,
 		core_expr_type,
+		core_field_ordinal_index,
 		core_field_ref_id,
 		core_field_ref_is_resolved,
 	../stage_09_core/specialize_layout: CoreSpecializeLayout
@@ -106,7 +108,11 @@ pure func c_heap_record_field_storage(
 record CRecordLayoutRegistry {
 	foreign_abi_heap_record_names: Set[String],
 	byte_sized_enum_names: Set[String],
-	source_member_record_names: Set[String],
+	-- The records whose members keep their source names (a declared ABI
+	-- record, or one reachable from a foreign function's signature), each with
+	-- its member spellings in declaration order. Every other record spells its
+	-- members `f<ordinal>`.
+	source_member_fields: Dict[String, List[String]],
 	record_member_names: Dict[Int, String]
 }
 
@@ -121,26 +127,23 @@ union CRecordLayoutError:
 
 
 ---
-The member spelling of the record named `record_name`'s field `name` with identity
-`ref`, for a site that has the field's identity but not its position: source names
-for a record in `source_member_record_names` (a declared ABI record, or one reachable
-from a foreign function's signature), `f<ordinal>` for every other, looked up in
-`record_member_names`. That table is filled once per field when the layouts are
-classified (a member access that rebuilt the string instead cost +0.44% backend
-allocations), from the same ordinals the declaration sites use, so a declaration and
-its accesses cannot disagree. `None` for a field of a non-ABI record the table does
-not hold, which classification rules out for declared fields.
+The member spelling of field `ordinal` of the record named `record_name`, for a
+field read: its source name for a record in `source_member_fields`, `f<ordinal>`
+for every other. `None` only for an ordinal past the end of a source-named
+record, which an ordinal issued from the record's row rules out.
 ---
-pure func c_record_member_of(
+pure func c_record_member_at(
 	layouts: CRecordLayoutRegistry,
 	record_name: String,
-	name: String,
-	ref: CoreFieldRef,
+	ordinal: CoreFieldOrdinal,
 ) -> Option[String]:
-	if Sets.contains(layouts.source_member_record_names, record_name):
-		Some(c_field_name(name))
-	else:
-		layouts.record_member_names.get(core_field_ref_id(ref))
+	index: Int = core_field_ordinal_index(ordinal)
+
+	match layouts.source_member_fields.get(record_name):
+		Some(members):
+			members.get(index)
+		None:
+			Some(c_record_member_name(index))
 
 
 ---
@@ -163,21 +166,35 @@ pure func c_record_member_scope(
 	}
 
 
+---
+The member spelling of the scope record's field `name` with identity `ref`, for a
+construction site that has the field's identity but not its position: the source
+name for a record in `source_member_fields`, `f<ordinal>` for every other, looked
+up in `record_member_names`. That table is filled once per field when the layouts
+are classified (a member access that rebuilt the string instead cost +0.44%
+backend allocations), from the same ordinals the declaration sites use, so a
+declaration and its constructions cannot disagree. `None` for a field of an
+ordinary record the table does not hold, which classification rules out for
+declared fields.
+---
 pure func c_record_member(
 	scope: CRecordMemberScope,
 	name: String,
 	ref: CoreFieldRef,
 ) -> Option[String]:
-	c_record_member_of(scope.layouts, scope.record_name, name, ref)
+	if scope.layouts.source_member_fields.contains(scope.record_name):
+		Some(c_field_name(name))
+	else:
+		scope.layouts.record_member_names.get(core_field_ref_id(ref))
 
 
 ---
 The member spelling of the field at position `ordinal` of a record's declaration:
-what `c_record_member_of` finds for it in the table, without the lookup, for the
+what `c_record_member` finds for it in the table, without the lookup, for the
 declaration sites that walk the fields in order.
 ---
 pure func c_declared_record_member(scope: CRecordMemberScope, name: String, ordinal: Int) -> String:
-	if Sets.contains(scope.layouts.source_member_record_names, scope.record_name):
+	if scope.layouts.source_member_fields.contains(scope.record_name):
 		c_field_name(name)
 	else:
 		c_record_member_name(ordinal)
@@ -377,11 +394,13 @@ private pure func first_unresolved_outside(
 
 
 ---
-Member spellings collected from every record declaration, and the fields
-that have no typecheck identity to spell a member from.
+Member spellings collected from every record declaration (by field identity,
+and as source names by record in declaration order), and the fields that have
+no typecheck identity to spell a member from.
 ---
 private record RecordMemberScan {
 	member_names: Dict[Int, String],
+	source_names: Dict[String, List[String]],
 	unresolved: List[CRecordLayoutError]
 }
 
@@ -394,12 +413,20 @@ private pure func with_record_member(
 	ordinal: Int,
 ) -> RecordMemberScan:
 	member_names: Dict[Int, String] = with_member_name(scan.member_names, ref, ordinal)
+	source_names: Dict[String, List[String]] = scan.source_names.set(
+		record_name,
+		scan.source_names.get_or(record_name, []).append(c_field_name(field_name)),
+	)
 
 	if core_field_ref_is_resolved(ref):
-		{ scan | member_names = member_names }
+		{ scan |
+			member_names = member_names,
+			source_names = source_names
+		}
 	else:
 		{
 			member_names = member_names,
+			source_names = source_names,
 			unresolved = scan.unresolved.append(UnresolvedRecordFieldRef(record_name, field_name))
 		}
 
@@ -412,7 +439,11 @@ pure func classify_c_record_layouts(
 	decl_index: CRecordDeclIndex = build_record_decl_index(specialize_layout)
 	var foreign_heap_names: Set[String] = Sets.set()
 	var declared_abi_names: Set[String] = Sets.set()
-	var members: RecordMemberScan = {member_names = {}, unresolved = []}
+	var members: RecordMemberScan = {
+		member_names = {},
+		source_names = {},
+		unresolved = []
+	}
 	var byte_sized_enum_names: Set[String] = Sets.set()
 	var visited_union_names: Set[String] = Sets.set()
 	var pending: List[CoreType] = foreign_boundary_types
@@ -475,6 +506,14 @@ pure func classify_c_record_layouts(
 		source_member_names,
 	)
 
+	var source_member_fields: Dict[String, List[String]] = {}
+
+	for record_name in Sets.to_list(source_member_names):
+		source_member_fields = source_member_fields.set(
+			record_name,
+			members.source_names.get_or(record_name, []),
+		)
+
 	match unresolved:
 		Some(error):
 			Err(error)
@@ -482,6 +521,6 @@ pure func classify_c_record_layouts(
 			Ok({
 				foreign_abi_heap_record_names = foreign_heap_names,
 				byte_sized_enum_names = byte_sized_enum_names,
-				source_member_record_names = source_member_names,
+				source_member_fields = source_member_fields,
 				record_member_names = members.member_names,
 			})

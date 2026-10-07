@@ -24,10 +24,11 @@ import:
 		),
 		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl),
 		CoreExpr(
-			AssignExpr, BorrowLetExpr, ClosureCreateExpr, ConstructorMatchExpr, FieldExpr, IfExpr,
-			LambdaExpr, LetExpr, LogicalExpr, RecordExpr, RecordCowUpdateExpr, RecordReuseExpr,
-			RecordUpdateExpr, SeqExpr, VarExpr, LiteralMatchExpr,
+			AssignExpr, BorrowLetExpr, ClosureCreateExpr, ConstructorMatchExpr, IfExpr,
+			LambdaExpr, LetExpr, LogicalExpr, ProductFieldExpr, RecordExpr, RecordCowUpdateExpr,
+			RecordReuseExpr, RecordUpdateExpr, SeqExpr, VarExpr, LiteralMatchExpr,
 		),
+		CoreFieldOrdinal,
 		CoreFunction,
 		CoreFunctionOrigin(ConsumingClone),
 		CoreHeapRecordDecl,
@@ -48,9 +49,12 @@ import:
 		RECORD_UPDATE_TEMP_ORIGIN,
 		core_expr_source_loc,
 		core_expr_type,
+		core_field_ordinal,
+		core_field_ordinals_equal,
 		core_field_refs_equal,
 		core_type_equal,
 		core_var_equal,
+	product_type: core_product_of, interim_product_record
 	traverse as CoreTraverse
 
 
@@ -196,7 +200,7 @@ private pure func expr_reads_target_fields_only(expr: CoreExpr, target: CoreVar)
 	match expr:
 		VarExpr(variable, typ, loc):
 			not core_var_equal(variable, target)
-		FieldExpr(VarExpr(owner, owner_type, owner_loc), field_name, field_ref, typ, loc):
+		ProductFieldExpr(VarExpr(_, _, _), _, _, _):
 			True
 		LambdaExpr(_, _, _, _, _, _) | ClosureCreateExpr(_, _, _):
 			not expr_touches_var(expr, target)
@@ -277,6 +281,8 @@ private pure func record_cow_field_plan(
 				prepared_fields.get(index),
 			):
 				(Some(field), Some(original), Some(prepared)):
+					ordinal: CoreFieldOrdinal = core_field_ordinal(index)
+
 					if (
 						not core_field_refs_equal(field.ref, original.ref)
 						or not core_field_refs_equal(field.ref, prepared.ref)
@@ -288,11 +294,11 @@ private pure func record_cow_field_plan(
 					):
 						valid = False
 					else if (
-						record_field_references_itself(original, base)
-						and not inherited_record_field(original, base, base_type, field)
+						record_field_references_itself(original, ordinal, base)
+						and not inherited_record_field(original, ordinal, base, base_type, field)
 					):
 						valid = False
-					else if inherited_record_field(original, base, base_type, field):
+					else if inherited_record_field(original, ordinal, base, base_type, field):
 						cow_fields = cow_fields.append({
 							field = field,
 							replacement = None,
@@ -483,28 +489,34 @@ private pure func chain_uses_declared_heap_record(
 	)
 
 
+---
+Whether `field`, at position `ordinal` of a record literal or update, reads
+`base` at that same position.
+---
 private pure func record_field_references_itself(
 	field: CoreRecordFieldValue,
+	ordinal: CoreFieldOrdinal,
 	base: CoreVar,
 ) -> Bool:
 	match field.value:
-		FieldExpr(VarExpr(variable, owner_type, owner_loc), _, projected_field_ref, field_type, field_loc):
-			core_var_equal(variable, base) and core_field_refs_equal(projected_field_ref, field.ref)
+		ProductFieldExpr(VarExpr(variable, _, _), projected, _, _):
+			core_var_equal(variable, base) and core_field_ordinals_equal(projected, ordinal)
 		_:
 			False
 
 
 private pure func inherited_record_field(
 	field: CoreRecordFieldValue,
+	ordinal: CoreFieldOrdinal,
 	base: CoreVar,
 	base_type: CoreType,
 	declared_field: CoreHeapRecordField,
 ) -> Bool:
 	match field.value:
-		FieldExpr(VarExpr(variable, owner_type, owner_loc), _, projected_field_ref, field_type, field_loc):
+		ProductFieldExpr(VarExpr(variable, owner_type, _), projected, field_type, _):
 			(
 				core_var_equal(variable, base)
-				and core_field_refs_equal(projected_field_ref, field.ref)
+				and core_field_ordinals_equal(projected, ordinal)
 				and core_field_refs_equal(field.ref, declared_field.ref)
 				and core_type_equal(owner_type, base_type)
 				and core_type_equal(field_type, declared_field.typ)
@@ -553,13 +565,20 @@ private pure func resolve_staged_field(
 	layer: RecordUpdateLayer,
 	previous_fields: Option[List[CoreRecordCowField]],
 	field: CoreRecordFieldValue,
+	ordinal: CoreFieldOrdinal,
 	declared_field: CoreHeapRecordField,
 ) -> StagedFieldResolution:
 	if not core_type_equal(core_expr_type(field.value), declared_field.typ):
 		InvalidStagedField
 	else if (
-		record_field_references_itself(field, layer.base)
-		and not inherited_record_field(field, layer.base, layer.binding_type, declared_field)
+		record_field_references_itself(field, ordinal, layer.base)
+		and not inherited_record_field(
+			field,
+			ordinal,
+			layer.base,
+			layer.binding_type,
+			declared_field,
+		)
 	):
 		InvalidStagedField
 	else:
@@ -569,6 +588,7 @@ private pure func resolve_staged_field(
 			layer,
 			previous_fields,
 			field,
+			ordinal,
 			declared_field,
 		)
 
@@ -579,11 +599,12 @@ private pure func resolve_typed_staged_field(
 	layer: RecordUpdateLayer,
 	previous_fields: Option[List[CoreRecordCowField]],
 	field: CoreRecordFieldValue,
+	ordinal: CoreFieldOrdinal,
 	declared_field: CoreHeapRecordField,
 ) -> StagedFieldResolution:
 	match previous_fields:
 		None:
-			if inherited_record_field(field, layer.base, layer.binding_type, declared_field):
+			if inherited_record_field(field, ordinal, layer.base, layer.binding_type, declared_field):
 				InheritedStagedField
 			else:
 				ReplacementStagedField(
@@ -594,7 +615,7 @@ private pure func resolve_typed_staged_field(
 					),
 				)
 		Some(fields):
-			if inherited_record_field(field, layer.base, layer.binding_type, declared_field):
+			if inherited_record_field(field, ordinal, layer.base, layer.binding_type, declared_field):
 				match fields.find(
 					func(staged_field): core_field_refs_equal(staged_field.field.ref, field.ref),
 				):
@@ -640,6 +661,7 @@ private pure func stage_record_layer(
 						layer,
 						previous_fields,
 						field,
+						core_field_ordinal(field_index),
 						declared_field,
 					):
 						ReplacementStagedField(value):
@@ -1670,24 +1692,40 @@ private pure func expression_bound_base_update(
 
 
 ---
-The root variable of a field path `v.f.g`, or `None` when `expr` is not one.
+The root variable of a record field path `v.f.g`, or `None` when `expr` is
+not one. Only record fields form a path; a tuple element does not yet.
 ---
 private pure func field_path_root(expr: CoreExpr) -> Option[CoreVar]:
 	match expr:
 		VarExpr(variable, _, _):
 			Some(variable)
-		FieldExpr(inner, _, _, _, _):
-			field_path_root(inner)
+		ProductFieldExpr(inner, _, _, _):
+			if reads_record_field(inner):
+				field_path_root(inner)
+			else:
+				None
 		_:
 			None
 
 
+private pure func reads_record_field(base: CoreExpr) -> Bool:
+	core_product_of(core_expr_type(base)).and_then(interim_product_record).is_some()
+
+
+---
+Whether two field paths read the same field: two reads of one root at the
+same ordinals have the same product types at every step.
+---
 private pure func same_field_path(left: CoreExpr, right: CoreExpr) -> Bool:
 	match (left, right):
 		(VarExpr(left_var, _, _), VarExpr(right_var, _, _)):
 			core_var_equal(left_var, right_var)
-		(FieldExpr(left_inner, _, left_ref, _, _), FieldExpr(right_inner, _, right_ref, _, _)):
-			core_field_refs_equal(left_ref, right_ref) and same_field_path(left_inner, right_inner)
+		(ProductFieldExpr(left_inner, left_ordinal, _, _), ProductFieldExpr(right_inner, right_ordinal, _, _)):
+			(
+				core_field_ordinals_equal(left_ordinal, right_ordinal)
+				and reads_record_field(left_inner)
+				and same_field_path(left_inner, right_inner)
+			)
 		_:
 			False
 
@@ -1728,7 +1766,7 @@ private pure func reads_of_path_through_base(
 	base_type: CoreType,
 ) -> CoreExpr:
 	match (field_path_root(path), path, body):
-		(Some(root), FieldExpr(_, _, _, _, _), RecordUpdateExpr(carrier, fields, typ, loc)):
+		(Some(root), ProductFieldExpr(_, _, _, _), RecordUpdateExpr(carrier, fields, typ, loc)):
 			if record_fields_assign_var(fields, root):
 				body
 			else:

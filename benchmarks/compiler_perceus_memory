@@ -248,7 +248,9 @@ AGGREGATE_CHANGE_MATRIX_ROOTS = (
     "dict_construct",
     "union_construct",
 )
-FIXED_OWNERSHIP_ROOT_KINDS = ("unbox", "binary", "field", "tuple_field")
+# A field read is one Core form (`product_field`) for records and tuples; the
+# matrix still covers each family, so a root is named by its base's family.
+FIXED_OWNERSHIP_ROOT_KINDS = ("unbox", "binary", "record_field", "tuple_field")
 FIXED_OWNERSHIP_CHANGE_CASES_PER_ROOT = 3
 FIXED_OWNERSHIP_CHANGE_MATRIX_VISITS_PER_FUNCTION = 16
 FIXED_OWNERSHIP_CHANGE_MATRIX_REUSED_PER_FUNCTION = 8
@@ -301,7 +303,7 @@ CORE_EXPR_KINDS = frozenset({
     "literal", "static_string_literal", "var", "void", "debug_block",
     "cooperative_checkpoint",
     "call", "seq", "if", "binary", "unary", "logical", "assign", "cast",
-    "box", "unbox", "field", "tuple_field", "tuple", "tuple_construct",
+    "box", "unbox", "product_field", "module_member", "tuple", "tuple_construct",
     "vector", "lambda", "closure_create", "list_construct", "list_alloc",
     "list_get", "list_handoff", "list_handoff_set_owned",
     "list_handoff_set_source_slot", "string_byte_read", "string_byte_write",
@@ -1261,7 +1263,7 @@ def mixed_function_owner_ref_expr(
     if site_index < referenced_globals:
         return global_ref_expr(site_index)
     return {
-        "kind": "field",
+        "kind": "product_field",
         "expr": {
             "kind": "var",
             "var": core_var(
@@ -1274,7 +1276,7 @@ def mixed_function_owner_ref_expr(
             "type": heap_record_type(BORROWED_OWNER_TYPE_NAME),
             "loc": synthetic_loc(),
         },
-        "field": "BENCH_PAYLOAD",
+        "ordinal": 0,
         "type": named_type(MANAGED_PARAMETER_TYPE),
         "loc": synthetic_loc(),
     }
@@ -1487,7 +1489,7 @@ def borrowed_boundary_fusion_owner_ref(
     if site_index % 2 == 0:
         return global_ref_expr((site_index // 2) % BORROWED_BOUNDARY_FUSION_GLOBALS)
     return {
-        "kind": "field",
+        "kind": "product_field",
         "expr": {
             "kind": "var",
             "var": core_var(
@@ -1500,7 +1502,7 @@ def borrowed_boundary_fusion_owner_ref(
             "type": heap_record_type(BORROWED_OWNER_TYPE_NAME),
             "loc": synthetic_loc(),
         },
-        "field": "BENCH_PAYLOAD",
+        "ordinal": 0,
         "type": named_type(MANAGED_PARAMETER_TYPE),
         "loc": synthetic_loc(),
     }
@@ -1714,7 +1716,7 @@ def borrowed_boundary_fusion_census(value: Any) -> JsonObject:
                 if (
                     isinstance(call_kind, dict)
                     and isinstance(first_arg, dict)
-                    and first_arg.get("kind") in ("var", "field")
+                    and first_arg.get("kind") in ("var", "product_field")
                 ):
                     name = call_kind.get("name")
                     if name in (
@@ -2131,14 +2133,14 @@ def fixed_ownership_owned_call(result_type: JsonObject, name: str) -> JsonObject
 
 def borrowed_owner_projection_expr(function_index: int) -> JsonObject:
     return {
-        "kind": "field",
+        "kind": "product_field",
         "expr": {
             "kind": "var",
             "var": core_var(borrowed_param_name(function_index, 0), None),
             "type": heap_record_type(BORROWED_OWNER_TYPE_NAME),
             "loc": synthetic_loc(),
         },
-        "field": "BENCH_PAYLOAD",
+        "ordinal": 0,
         "type": named_type(MANAGED_PARAMETER_TYPE),
         "loc": synthetic_loc(),
     }
@@ -2358,9 +2360,9 @@ def aggregate_change_matrix_body(
 
 def fixed_ownership_field_expr(owner: JsonObject) -> JsonObject:
     return {
-        "kind": "field",
+        "kind": "product_field",
         "expr": owner,
-        "field": "BENCH_SCALAR",
+        "ordinal": 0,
         "type": named_type("Int"),
         "loc": synthetic_loc(),
     }
@@ -2368,12 +2370,29 @@ def fixed_ownership_field_expr(owner: JsonObject) -> JsonObject:
 
 def fixed_ownership_tuple_field_expr(owner: JsonObject) -> JsonObject:
     return {
-        "kind": "tuple_field",
+        "kind": "product_field",
         "expr": owner,
-        "index": 0,
+        "ordinal": 0,
         "type": named_type("Int"),
         "loc": synthetic_loc(),
     }
+
+
+def fixed_ownership_root_kind(node: JsonObject) -> str | None:
+    """The fixed-ownership root an expression node is, or None.
+
+    A `product_field` root is named by its base's family, read from the
+    base's serialized type.
+    """
+    kind = node.get("kind")
+    if not isinstance(kind, str) or "type" not in node or "loc" not in node:
+        return None
+    if kind == "product_field":
+        base = node.get("expr")
+        base_type = base.get("type") if isinstance(base, dict) else None
+        family = base_type.get("kind") if isinstance(base_type, dict) else None
+        return "tuple_field" if family == "tuple" else "record_field"
+    return kind if kind in FIXED_OWNERSHIP_ROOT_KINDS else None
 
 
 def fixed_ownership_unbox_expr(inner: JsonObject) -> JsonObject:
@@ -2402,9 +2421,9 @@ def fixed_ownership_sensitive_binary_expr(function_index: int) -> JsonObject:
         "kind": "binary",
         "op": "equal",
         "left": {
-            "kind": "field",
+            "kind": "product_field",
             "expr": fixed_ownership_record_param_ref(function_index),
-            "field": "BENCH_ITEMS",
+            "ordinal": 1,
             "type": list_type(named_type(MANAGED_PARAMETER_TYPE)),
             "loc": synthetic_loc(),
         },
@@ -3765,13 +3784,9 @@ def fixed_ownership_change_matrix_output_census(
         current = pending.pop()
         if isinstance(current, dict):
             kind = current.get("kind")
-            if (
-                isinstance(kind, str)
-                and kind in FIXED_OWNERSHIP_ROOT_KINDS
-                and "type" in current
-                and "loc" in current
-            ):
-                census["roots"][kind] += 1
+            root = fixed_ownership_root_kind(current)
+            if root is not None:
+                census["roots"][root] += 1
 
             variable = (
                 current.get("name")
@@ -3810,8 +3825,8 @@ def validate_fixed_ownership_change_matrix_output(
         "roots": {
             "unbox": 3 * function_count,
             "binary": 3 * function_count,
-            # The consuming binary owns one nested field root as well.
-            "field": 4 * function_count,
+            # The consuming binary owns one nested record field root as well.
+            "record_field": 4 * function_count,
             "tuple_field": 3 * function_count,
         },
         # Two child-only borrowing calls, two projection alias calls, and the

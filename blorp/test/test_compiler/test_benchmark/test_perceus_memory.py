@@ -555,7 +555,10 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(len(expressions), 12)
         self.assertEqual(
-            collections.Counter(expression["kind"] for expression in expressions),
+            collections.Counter(
+                self.benchmark.fixed_ownership_root_kind(expression)
+                for expression in expressions
+            ),
             collections.Counter({
                 kind: self.benchmark.FIXED_OWNERSHIP_CHANGE_CASES_PER_ROOT
                 for kind in self.benchmark.FIXED_OWNERSHIP_ROOT_KINDS

@@ -463,10 +463,11 @@ records keep source names), closures and tasks, and locals with a binder id
   (`declared_variant_lookup`) because the operation specs name their cases; key the
   specs by variant id. The variant reuse helper name is unchanged (shortening it is
   a separate change).
-- **Record field names** still carried beside the ref (`FieldExpr`,
-  `CoreRecordFieldValue`, record-field decls, `CowFieldTakeRetainPolicy`), read
-  only by the ABI branch and diagnostics, become display-only with "Identifier text
-  becomes the id".
+- **Record field names** still carried beside the ref (`CoreRecordFieldValue`,
+  record-field decls), read only by the ABI branch and diagnostics, become
+  display-only with "Identifier text becomes the id". Field reads
+  (`ProductFieldExpr`) and field takes (`CowFieldTakeRetainPolicy`) already name a
+  field by its ordinal alone.
 - **Emitted value symbols from identity.** See "Emitted value symbols" under value
   identity.
 - `c_naming.brp` imports `ir.brp` for `CoreBinderOrigin`, so a program importing

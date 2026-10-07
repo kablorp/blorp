@@ -82,7 +82,8 @@ import:
 			DetachExpr,
 			DupExpr,
 			DropExpr,
-			FieldExpr,
+			ProductFieldExpr,
+			ModuleMemberExpr,
 			ForChannelExpr,
 			ForRangeExpr,
 			ForResourceSourceExpr,
@@ -127,7 +128,6 @@ import:
 			TensorRawWriteExpr,
 			TupleExpr,
 			TupleConstructExpr,
-			TupleFieldExpr,
 			UnaryExpr,
 			UnboxExpr,
 			UnionConstructExpr,
@@ -334,6 +334,7 @@ import:
 		static_string_literal_id,
 		static_string_literal_id_value,
 		CoreVariantRef(BuiltinOptionNone, BuiltinOptionSome, BuiltinResultErr, BuiltinResultOk, VariantById),
+		core_field_ordinal,
 	json: JsonValue(JsonBool, JsonNumber, JsonObject, JsonString, JsonVector)
 	test: TestSuite
 
@@ -3627,7 +3628,7 @@ pure func managed_record_range_program() -> CoreProgram:
 		HeapRecordType("Range"),
 		sample_loc(),
 	)
-	body: CoreExpr = FieldExpr(range_expr, "start", core_field_ref(0), int_type(), sample_loc())
+	body: CoreExpr = ProductFieldExpr(range_expr, core_field_ordinal(0), int_type(), sample_loc())
 	func_info: CoreFunction = {
 		name = "range_start",
 		source_module = None,
@@ -3795,10 +3796,9 @@ pure func managed_record_update_program() -> CoreProgram:
 			{
 				name = "y",
 				ref = core_field_ref(1),
-				value = FieldExpr(
+				value = ProductFieldExpr(
 					VarExpr(point_var, point_type(), sample_loc()),
-					"y",
-					core_field_ref(1),
+					core_field_ordinal(1),
 					int_type(),
 					sample_loc(),
 				)
@@ -4027,7 +4027,7 @@ pure func heap_record_field_program() -> CoreProgram:
 		origin = AuthoredBinder
 	}
 	box_expr: CoreExpr = VarExpr(box_var, box_type(), sample_loc())
-	body: CoreExpr = FieldExpr(box_expr, "count", core_field_ref(0), int_type(), sample_loc())
+	body: CoreExpr = ProductFieldExpr(box_expr, core_field_ordinal(0), int_type(), sample_loc())
 	func_info: CoreFunction = {
 		name = "box_count",
 		source_module = None,
@@ -4254,9 +4254,9 @@ pure func tuple_construct_program() -> CoreProgram:
 		False,
 		int_pair_type(),
 		pair_expr,
-		TupleFieldExpr(
+		ProductFieldExpr(
 			VarExpr(pair_var, int_pair_type(), sample_loc()),
-			1,
+			core_field_ordinal(1),
 			int_type(),
 			sample_loc(),
 		),
@@ -4457,9 +4457,9 @@ pure func tuple_literal_program() -> CoreProgram:
 		False,
 		int_pair_type(),
 		pair_expr,
-		TupleFieldExpr(
+		ProductFieldExpr(
 			VarExpr(pair_var, int_pair_type(), sample_loc()),
-			0,
+			core_field_ordinal(0),
 			int_type(),
 			sample_loc(),
 		),
@@ -4645,21 +4645,20 @@ pure func cow_field_take_program() -> CoreProgram:
 	body: CoreExpr = BorrowLetExpr(
 		owned,
 		list_int_type(),
-		FieldExpr(
+		ProductFieldExpr(
 			VarExpr(
 				record_var,
 				NamedType("State", []),
 				sample_loc(),
 			),
-			"items",
-			core_field_ref(0),
+			core_field_ordinal(0),
 			list_int_type(),
 			sample_loc(),
 		),
 		DupExpr(
 			owned,
 			list_int_type(),
-			CowFieldTakeRetainPolicy(record_var, "items", core_field_ref(0), "State"),
+			CowFieldTakeRetainPolicy(record_var, core_field_ordinal(0), "State"),
 			VarExpr(owned, list_int_type(), sample_loc()),
 			list_int_type(),
 			sample_loc(),
@@ -4680,7 +4679,94 @@ pure func test_core_program_json_round_trips_cow_field_take() -> Bool:
 	(
 		encoded.contains("\"retain_policy\":\"cow_field_take\"")
 		and encoded.contains("\"take_record\":{\"name\":\"state\",\"id\":4")
-		and encoded.contains("\"take_field\":\"items\"")
+		and encoded.contains("\"take_ordinal\":0")
+		and program_round_trips(program)
+	)
+
+
+pure func product_field_program(ordinal: Int) -> CoreProgram:
+	{
+		decls = [
+			FunctionDecl({ sample_function() |
+				body = Some(ProductFieldExpr(
+					VarExpr(sample_var(), TupleType([int_type(), int_type()]), sample_loc()),
+					core_field_ordinal(ordinal),
+					int_type(),
+					sample_loc(),
+				))
+			}),
+		],
+		foreign_includes = [],
+		source_files = [{ path = "main.brp", module_name = "main.brp" }]
+	}
+
+
+pure func test_core_program_json_round_trips_product_field() -> Bool:
+	program: CoreProgram = product_field_program(1)
+	encoded: String = core_program_to_json(program).to_string()
+
+	(
+		encoded.contains("\"kind\":\"product_field\"")
+		and encoded.contains("\"ordinal\":1")
+		and program_round_trips(program)
+	)
+
+
+pure func test_core_json_rejects_product_field_without_ordinal() -> Bool:
+	match core_expr_to_json(product_field_body()):
+		JsonObject(entries):
+			without_ordinal: JsonValue = JsonObject(entries.filter(func(entry): entry[0] != "ordinal"))
+
+			match decode_core_expr_json(without_ordinal, "expr"):
+				Err(CoreMissingField(_, field_name)):
+					field_name == "ordinal"
+				_:
+					False
+		_:
+			False
+
+
+pure func test_core_json_rejects_negative_product_field_ordinal() -> Bool:
+	match core_expr_to_json(product_field_body()):
+		JsonObject(entries):
+			negative: JsonValue = JsonObject(entries.map(func(entry):
+				if entry[0] == "ordinal":
+					("ordinal", JsonNumber(-1.0))
+				else:
+					entry
+			))
+
+			match decode_core_expr_json(negative, "expr"):
+				Err(CoreExpectedIntField(_, field_name)):
+					field_name == "ordinal"
+				_:
+					False
+		_:
+			False
+
+
+pure func product_field_body() -> CoreExpr:
+	match product_field_program(0).decls:
+		[FunctionDecl(function_info)]:
+			function_info.body.get_or(VoidExpr(int_type(), sample_loc()))
+		_:
+			VoidExpr(int_type(), sample_loc())
+
+
+pure func test_core_program_json_round_trips_module_member() -> Bool:
+	program: CoreProgram = {
+		decls = [
+			FunctionDecl({ sample_function() |
+				body = Some(ModuleMemberExpr("Limits", "MAX", int_type(), sample_loc()))
+			}),
+		],
+		foreign_includes = [],
+		source_files = [{ path = "main.brp", module_name = "main.brp" }]
+	}
+	encoded: String = core_program_to_json(program).to_string()
+
+	(
+		encoded.contains("\"kind\":\"module_member\",\"alias\":\"Limits\",\"member\":\"MAX\"")
 		and program_round_trips(program)
 	)
 
@@ -6919,6 +7005,22 @@ tests: TestSuite = {
 		(
 			"Core program JSON round trips cow field take",
 			test_core_program_json_round_trips_cow_field_take,
+		),
+		(
+			"Core program JSON round trips module member",
+			test_core_program_json_round_trips_module_member,
+		),
+		(
+			"Core program JSON round trips product field",
+			test_core_program_json_round_trips_product_field,
+		),
+		(
+			"Core JSON rejects product field without ordinal",
+			test_core_json_rejects_product_field_without_ordinal,
+		),
+		(
+			"Core JSON rejects negative product field ordinal",
+			test_core_json_rejects_negative_product_field_ordinal,
 		),
 		(
 			"Core JSON round trips source function origin name id",

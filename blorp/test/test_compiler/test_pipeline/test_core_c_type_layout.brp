@@ -54,6 +54,7 @@ import:
 		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
 		CoreHeapRecordField,
 		core_field_ref,
+		core_field_ordinal,
 	../../../src/compiler/stage_09_core/pipeline: prepared_core_program_value, run_pre_dce_tail
 	../../../src/compiler/stage_09_core/specialize_layout: build_specialize_layout
 	../../../src/compiler/stage_09_core/type_policy:
@@ -65,6 +66,7 @@ import:
 		CRecordLayoutRegistry,
 		c_heap_record_field_storage,
 		c_heap_record_layout,
+		c_record_member_at,
 		classify_c_record_layouts,
 		collect_foreign_boundary_types,
 	set as Sets
@@ -72,16 +74,7 @@ import:
 
 
 -- What no fixture record may need: a failed classification (a field with no identity)
--- leaves the registry empty, which the assertions then reject.
-private pure func empty_layout_registry() -> CRecordLayoutRegistry:
-	{
-		foreign_abi_heap_record_names = Sets.set(),
-		byte_sized_enum_names = Sets.set(),
-		source_member_record_names = Sets.set(),
-		record_member_names = {}
-	}
-
-
+-- yields the layouts of a program with no records, which the assertions then reject.
 private pure func classify_record_layouts_for_test(program: CoreProgram) -> CRecordLayoutRegistry:
 	match classify_c_record_layouts(
 		build_specialize_layout(program),
@@ -90,7 +83,11 @@ private pure func classify_record_layouts_for_test(program: CoreProgram) -> CRec
 		Ok(layouts):
 			layouts
 		Err(_):
-			empty_layout_registry()
+			classify_record_layouts_for_test({
+				decls = [],
+				foreign_includes = [],
+				source_files = []
+			})
 
 
 pure func int_type() -> CoreType:
@@ -749,6 +746,39 @@ pure func test_native_snapshot_record_keeps_managed_layout() -> Bool:
 	c_heap_record_layout(layouts.foreign_abi_heap_record_names, "MemStats") == InternalLayout
 
 
+-- A field read spells its member from the ordinal: the source name for a
+-- declared ABI record, `f<ordinal>` for every other record.
+pure func test_field_read_members_come_from_ordinals() -> Bool:
+	int_field: pure (String, Int) -> CoreHeapRecordField = pure func(name: String, id: Int) -> CoreHeapRecordField:
+		{
+			ref = core_field_ref(id),
+			name = name,
+			typ = int_type(),
+			release_policy = NoReleasePolicy
+		}
+	layouts: CRecordLayoutRegistry = classify_record_layouts_for_test({
+		decls = [
+			HeapRecordDecl({
+				abi_type = Some(DeclaredAbiMemStats),
+				form = OrdinaryRecordForm,
+				name = "MemStats",
+				type_params = [],
+				fields = [int_field("allocations", 1), int_field("releases", 2)],
+				loc = synthetic_core_source_loc(),
+			}),
+			heap_record_decl("Counter", [int_field("count", 3), int_field("limit", 4)]),
+		],
+		foreign_includes = [],
+		source_files = []
+	})
+
+	(
+		c_record_member_at(layouts, "MemStats", core_field_ordinal(1)) == Some("releases")
+		and c_record_member_at(layouts, "Counter", core_field_ordinal(1)) == Some("f1")
+		and c_record_member_at(layouts, "MemStats", core_field_ordinal(2)).is_none()
+	)
+
+
 pure func foreign_identity_call(typ: CoreType) -> CoreExpr:
 	CallExpr(
 		ForeignCall("live_foreign_flags", ForeignBorrowArgs),
@@ -945,6 +975,7 @@ tests: TestSuite = {
 			"native snapshot report keeps ordinary managed layout",
 			test_native_snapshot_record_keeps_managed_layout,
 		),
+		("field read members come from ordinals", test_field_read_members_come_from_ordinals),
 		(
 			"retained foreign call record layout classification",
 			test_retained_foreign_call_record_layout_classification,
