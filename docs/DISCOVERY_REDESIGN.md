@@ -3333,6 +3333,39 @@ oracle while its other users still need it. The proofs:
   - The deliberate differences are listed: the broken import item of section
     3.17, and `SyntaxNestingTooDeep` for sources nested past
     `MAX_SYNTAX_NESTING` (section 3.14), which the old parser accepts.
+- **The differential fuzzer** (`scripts/discovery-fuzz`). The corpus proves
+  the parsers agree on real code; it cannot show the tree path never accepts
+  what the old parser rejects, because real code is valid. The fuzzer mutates
+  corpus declarations (a deleted, duplicated or swapped line, an indentation
+  moved a level or a space or two, tabs for spaces, lines joined or split, a
+  token deleted, duplicated or inserted, a closing bracket moved to the next
+  line), runs both parsers over each mutant in one batched process
+  (`discovery_fuzz_runner.brp`) and applies the parity rule:
+  - the tree path never accepts a source the old parser rejects (**wrong
+    accept**);
+  - for a source both accept, `compare_tree_module`'s projected AST equals the
+    old AST (**AST mismatch**);
+  - for a source the old parser rejects, the tree path may reject or decline;
+  - a source the old parser accepts and the tree path rejects (**wrong
+    reject**), a tree path that cannot be censused or projected, and a tree
+    path that crashes or hangs are failures too; a crash or hang of the old
+    parser is reported apart, and each hang or crash is run again alone with a
+    longer timeout before it is believed.
+
+  The fuzzer checks accept or reject and the projected AST only; the corpus
+  gate owns diagnostics. Its limits are stated where it reports. A source the
+  tree path declines is counted and proves nothing: about half the sources the
+  old parser rejects stop at a function body or global initializer the tree
+  path does not read yet, so the report prints the share the tree path decided
+  and calls the rest unchecked. And `--gate` (a fixed seed and count that
+  exits nonzero on any failure, each minimised to a few lines) is a sample, not
+  a regression gate: any edit to the corpus redraws every mutant. The bugs it
+  has found are kept as fixed cases in `test_discovery_fuzz_cases.brp`, run by
+  `compiler-blorp`; those are the regression gate, and a case for a bug not yet
+  fixed is marked a known defect and fails when the bug is fixed, so the
+  mark is then removed. Run against `2c39d3ecc`, the fuzzer reports within
+  20,000 mutants a block lambda whose `match` body opens at the wrong
+  indentation, which the corpus gate had not caught.
 - **Module order.** `discovery_module_order_dump.brp` runs on the tree path
   against `legacy_module_order_dump.brp`, unchanged.
 - **The self-compile.** C is byte-identical, or identical after normalizing

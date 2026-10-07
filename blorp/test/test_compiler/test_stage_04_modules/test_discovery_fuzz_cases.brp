@@ -1,0 +1,231 @@
+-- Fixed sources for the parity rule `scripts/discovery-fuzz` samples: the tree
+-- path never accepts what the old parser rejects, and where both accept the
+-- projected programs are equal. The fuzzer finds new disagreements by random
+-- sampling; this suite keeps each one it has found, so a fix stays fixed and a
+-- compiler change cannot break the runner (compiling this suite compiles
+-- `discovery_fuzz_runner.brp`) without a gate noticing.
+--
+-- A case lists the labels a correct tree path may give. A case with a
+-- `known_defect` is one the tree path still gets wrong: it passes while the
+-- label is still outside the correct ones, and fails when the parser owner
+-- fixes the bug, so the entry is then deleted and the case becomes an ordinary
+-- regression case.
+import:
+	../tools/discovery_fuzz_runner: existing_program, fuzz_verdict_fields, source_verdict
+	test: TestSuite
+
+
+record ParityCase {
+	name: String,
+	source: String,
+	correct: List[String],
+	known_defect: Option[String]
+}
+
+
+-- Both parsers accept it and the programs are equal.
+private AGREE: List[String] = ["agree"]
+
+-- The old parser rejects it: the tree path rejects, or declines (a stop is
+-- safe), and never accepts.
+private NOT_ACCEPTED: List[String] = ["both-rejected", "reject-declined"]
+
+-- The old parser accepts it: the same program, or a stop.
+private ACCEPTED_OR_STOPPED: List[String] = ["agree", "safe-stop"]
+
+private CASE_ARITHMETIC_BODY: ParityCase = {
+	name = "a function with an arithmetic body",
+	source = "func f(x: Int) -> Int:\n\tx + 1\n",
+	correct = AGREE,
+	known_defect = None
+}
+
+private CASE_BLOCK_LAMBDA_CLOSED_BY_CALL: ParityCase = {
+	name = "a block lambda closed by its call",
+	source = "func f(xs: List[Int]) -> List[Int]:\n\txs.map(func(x):\n\t\tx + 1\n\t)\n",
+	correct = AGREE,
+	known_defect = None
+}
+
+private CASE_IMPORT_SYMBOL_LIST: ParityCase = {
+	name = "an import with a symbol list",
+	source = "import:\n\tlist: map, filter\n",
+	correct = AGREE,
+	known_defect = None
+}
+
+private CASE_INDENTED_DECLARATION: ParityCase = {
+	name = "an indented declaration after a function is rejected",
+	source = "func f() -> Int:\n\t1\n func g() -> Int:\n\t2\n",
+	correct = NOT_ACCEPTED,
+	known_defect = None
+}
+
+private CASE_UNCLOSED_PARENTHESIS: ParityCase = {
+	name = "an unclosed parenthesis in a body is not accepted",
+	source = "func f(x: Int) -> Int:\n\tx + (1\n",
+	correct = NOT_ACCEPTED,
+	known_defect = None
+}
+
+private CASE_SHALLOW_LAMBDA_BODY: ParityCase = {
+	name = "a block lambda body not indented past its call is not accepted",
+	source = "func f(xs: List[Int]) -> List[Int]:\n\txs.map(func(x):\n\tx + 1\n\t)\n",
+	correct = NOT_ACCEPTED,
+	known_defect = None
+}
+
+private CASE_MATCH_IN_RECORD_FIELD: ParityCase = {
+	name = "a match opened inside a record field at the wrong indentation is not accepted",
+	source = "func f(x: Int) -> R:\n\t{ a = match x:\n\t\t1:\n\t\t\t2\n\t\t_:\n\t\t\t3\n\t}\n",
+	correct = NOT_ACCEPTED,
+	known_defect = None
+}
+
+private CASE_MATCH_IN_INLINE_LAMBDA: ParityCase = {
+	name = "a match opened in an inline lambda at the wrong indentation is not accepted",
+	source = "func optional[](parser:Parser[]):\n\tfunc():match():\n\t\tParseFailed:()",
+	correct = NOT_ACCEPTED,
+	known_defect = None
+}
+
+private CASE_IMPORT_EMPTY_SYMBOLS: ParityCase = {
+	name = "an import line ending in a colon projects an empty symbol list",
+	source = "import:\n\ttest:\n",
+	correct = AGREE,
+	known_defect = Some("the tree path projects `symbols` as null where the old AST has []")
+}
+
+private CASE_IMPORT_MISSING_COMMA: ParityCase = {
+	name = "an import constructor list needs commas",
+	source = "import:\n\tresult:Result(Ok Err)\n",
+	correct = NOT_ACCEPTED,
+	known_defect = Some("the tree path accepts a missing comma in an import constructor list")
+}
+
+private CASE_TRAILING_QUESTION_BINDING: ParityCase = {
+	name = "a trailing ?= binding in a block nested in a value if is not accepted",
+	source = "func f()->CoreExpr:\n\twhile():\n\t\trebuilt=if():\n\t\t\tsou?=()\n",
+	correct = NOT_ACCEPTED,
+	known_defect = Some((
+			"the tree path accepts a block ending in a ?= binding inside a value if inside a "
+			+ "loop"
+		))
+}
+
+private CASE_COMMENT_ONLY_BODY: ParityCase = {
+	name = "a function whose body is only a comment",
+	source = "func f():\n\t-- comment\n",
+	correct = ACCEPTED_OR_STOPPED,
+	known_defect = Some("the tree path rejects a comment-only body the old parser accepts")
+}
+
+
+pure func verdict_label(case: ParityCase) -> String:
+	(label, _) = fuzz_verdict_fields(
+		source_verdict(
+			existing_program("case.brp", case.source),
+			case.source,
+		),
+	)
+	label
+
+
+-- A case without a known defect holds when the label is a correct one; one
+-- with a known defect holds while the label is still not.
+pure func case_holds(case: ParityCase) -> Bool:
+	label = verdict_label(case)
+
+	match case.known_defect:
+		None:
+			case.correct.contains(label)
+		Some(_):
+			not case.correct.contains(label)
+
+
+pure func test_arithmetic_body() -> Bool:
+	case_holds(CASE_ARITHMETIC_BODY)
+
+
+pure func test_block_lambda_closed_by_call() -> Bool:
+	case_holds(CASE_BLOCK_LAMBDA_CLOSED_BY_CALL)
+
+
+pure func test_import_symbol_list() -> Bool:
+	case_holds(CASE_IMPORT_SYMBOL_LIST)
+
+
+pure func test_indented_declaration() -> Bool:
+	case_holds(CASE_INDENTED_DECLARATION)
+
+
+pure func test_unclosed_parenthesis() -> Bool:
+	case_holds(CASE_UNCLOSED_PARENTHESIS)
+
+
+pure func test_shallow_lambda_body() -> Bool:
+	case_holds(CASE_SHALLOW_LAMBDA_BODY)
+
+
+pure func test_match_in_record_field() -> Bool:
+	case_holds(CASE_MATCH_IN_RECORD_FIELD)
+
+
+pure func test_match_in_inline_lambda() -> Bool:
+	case_holds(CASE_MATCH_IN_INLINE_LAMBDA)
+
+
+pure func test_import_empty_symbols() -> Bool:
+	case_holds(CASE_IMPORT_EMPTY_SYMBOLS)
+
+
+pure func test_import_missing_comma() -> Bool:
+	case_holds(CASE_IMPORT_MISSING_COMMA)
+
+
+pure func test_trailing_question_binding() -> Bool:
+	case_holds(CASE_TRAILING_QUESTION_BINDING)
+
+
+pure func test_comment_only_body() -> Bool:
+	case_holds(CASE_COMMENT_ONLY_BODY)
+
+
+tests: TestSuite = {
+	description = "Discovery fuzzer regression cases",
+	tests = [
+		("a function with an arithmetic body", test_arithmetic_body),
+		("a block lambda closed by its call", test_block_lambda_closed_by_call),
+		("an import with a symbol list", test_import_symbol_list),
+		("an indented declaration after a function is rejected", test_indented_declaration),
+		("an unclosed parenthesis in a body is not accepted", test_unclosed_parenthesis),
+		(
+			"a block lambda body not indented past its call is not accepted",
+			test_shallow_lambda_body,
+		),
+		(
+			"a match opened inside a record field at the wrong indentation is not accepted",
+			test_match_in_record_field,
+		),
+		(
+			"a match opened in an inline lambda at the wrong indentation is not accepted",
+			test_match_in_inline_lambda,
+		),
+		((
+				"KNOWN DEFECT (delete its known_defect when fixed): an import line ending in a "
+				+ "colon projects an empty symbol list"
+			), test_import_empty_symbols),
+		((
+				"KNOWN DEFECT (delete its known_defect when fixed): an import constructor list "
+				+ "needs commas"
+			), test_import_missing_comma),
+		((
+				"KNOWN DEFECT (delete its known_defect when fixed): a trailing ?= binding in a "
+				+ "block nested in a value if is not accepted"
+			), test_trailing_question_binding),
+		((
+				"KNOWN DEFECT (delete its known_defect when fixed): a function whose body is "
+				+ "only a comment"
+			), test_comment_only_body),
+	]
+}

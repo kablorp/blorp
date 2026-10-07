@@ -167,6 +167,62 @@ the token dumps, which a tree-path change cannot affect. A narrowed
 `--stop-census` never overwrites the stored census. The fixed cost of an
 iteration is then the C compile of the dumper, because it contains the tree
 parsers being edited.
+
+`scripts/discovery-fuzz` is the differential fuzzer for the tree path, the
+counterpart of the parity gate for inputs the corpus does not hold. It mutates
+corpus declarations (lines deleted, duplicated, swapped, joined, split or
+re-indented; tabs and spaces swapped; one token deleted, duplicated or
+inserted; a closing bracket moved), feeds every mutant to the old parser and to
+the tree path in one batched process
+(`blorp/test/test_compiler/tools/discovery_fuzz_runner.brp`, compiled once and
+cached by a digest of its inputs; it refuses to build unless `bin/blorp` is
+fresh, so run `make` first) and classifies it: the tree path must never accept
+what the old parser rejects (**WRONG ACCEPT**), must give the same projected AST
+where both accept (**AST MISMATCH**), and may reject or decline otherwise.
+Diagnostic text is not compared; the parity gate owns that. A mutant the old
+parser accepts and the tree path rejects is a **WRONG REJECT**, as in the parity
+gate. A mutant that crashes or hangs the old parser is reported apart (the old
+parser is known to hang on some chain shapes); one that crashes or hangs the
+tree path is a failure. Every hang and crash is run again alone with four times
+the timeout before it is believed, so a loaded host does not fake one.
+
+What it cannot show: when the tree path declines a mutant it has examined
+nothing. Declining is safe and only counted, and about half the mutants the old
+parser rejects end that way (a function body or global initializer the tree path
+does not read), so the run prints how much of the rejected mutants the tree path
+decided (about half today) and labels the rest "unchecked". A mutant is deterministic (mutant `i` of seed `s` is the
+same text whatever the count) only for a given corpus: any edit to a corpus
+file redraws every mutant. The fuzzer therefore finds disagreements by sampling;
+it is not a regression gate. Each bug it finds becomes a fixed case in
+`blorp/test/test_compiler/test_stage_04_modules/test_discovery_fuzz_cases.brp`
+(run by `compiler-blorp`, which also compiles the runner), where a bug not yet
+fixed is a known defect that fails when it is.
+
+```bash
+scripts/discovery-fuzz --count 20000 --minimise          # default seed 1
+scripts/discovery-fuzz --seed 7 --count 50000 --files blorp/src/format/engine/formatter.brp
+scripts/discovery-fuzz --stop-reason indented-method-chain --whole-file
+scripts/discovery-fuzz --gate                            # fixed seed and count; exits 1 on failure
+```
+
+`--files PATH...` mutates only those tracked files, and `--stop-reason LABEL`
+only the declarations where the stored `compiler-new-parity --stop-census`
+found a module's first stop with that reason. By default a mutant is one
+declaration with one edit, so each verdict is about the edit; `--whole-file`
+keeps the rest of the file around it. `--timeout SECONDS` (default 1) is how
+long one source may take before it counts as possibly hung (the process is
+killed and the batch resumes after it). Each failure is written to `--out DIR`
+(it must be new or empty; the default is a directory of this checkout under the
+system temporary directory, whose failures from the previous run are deleted)
+as `<verdict>-<mutant>/` holding `original.brp`, `mutant.brp`, `verdict.txt`
+and, with `--minimise`, `minimised.brp`, a reproducer shrunk by deleting lines
+and then tokens while the verdict holds; a failure that does not reproduce when
+run again is reported as such and not shrunk. The run prints the verdict
+counts, where the tree path stopped, the yield of each operator and the
+throughput. `--gate` is a fixed sample (seed 1, 30,000 mutants): it minimises
+the first failures and prints `BLORP_GATE_RESULT gate=discovery_fuzz`. It is not
+part of `scripts/test` yet.
+
 The `compiler-blorp` gate also runs every fixture explicitly marked
 `RUN-BLORP-CHECK` through a small runner
 (`blorp/test/test_lib/run_blorp_check_fixtures.py`) after the TestSuites have run;

@@ -1,0 +1,1216 @@
+#!/usr/bin/env python3
+"""Differential fuzzer for the discovery tree parser against the existing parser.
+
+It mutates corpus declarations in ways that stress layout and syntax, feeds
+every mutant to both parsers in one batched process
+(`blorp/test/test_compiler/tools/discovery_fuzz_runner.brp`) and classifies it
+by the parity rule:
+
+  * the tree path never accepts a source the existing parser rejects;
+  * for a source both accept, the projected programs are equal;
+  * for a source the existing parser rejects, the tree path rejects with its
+    own diagnostic or declines (diagnostic text is not compared).
+
+A tree path that stops reading (declines) is always safe and is only counted.
+A mutant the existing parser crashes on or hangs on is reported apart, since
+the existing parser is known to hang on some chain shapes.
+
+Mutants are deterministic: mutant `i` of seed `s` is the same text on every
+run, whatever the count. By default a mutant is one top-level declaration of a
+corpus file with one edit (a small, near-valid source, so every verdict is
+about the edit); `--whole-file` keeps the rest of the file around it.
+
+Each failure is written to the output directory with the original, the mutant,
+a minimised reproducer (with `--minimise`) and its verdict.
+
+The gate mode (`--gate`) is a fixed seed and count that exits nonzero on any
+failure, for reviewers and hand-backs. It is a sample of mutants, not a
+regression gate: editing the corpus redraws every mutant. Bugs it has found are
+kept as fixed cases in `test_discovery_fuzz_cases.brp`.
+
+It checks accept or reject and the projected AST only; the corpus gate
+(`compiler-new-parity`) owns diagnostics. Mutants the tree path declines are
+counted but proven nothing about, so how much of the input it decided is
+printed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import difflib
+import enum
+import hashlib
+import importlib.machinery
+import importlib.util
+import os
+import queue
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from collections import Counter
+from pathlib import Path
+from typing import Callable, Iterator, Sequence
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RUNNER_SOURCE = "blorp/test/test_compiler/tools/discovery_fuzz_runner.brp"
+SOURCE_SUFFIX = ".brp"
+
+
+def load_script(name: str):
+    """Another script of this directory as a module; it has no `.py` suffix."""
+    path = REPO_ROOT / "scripts" / name
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise RuntimeError(f"could not create the module spec of {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+parity = load_script("compiler-new-parity")
+
+# ---------------------------------------------------------------------------
+# Verdicts
+
+GATE_SEED = 1
+GATE_COUNT = 30000
+DEFAULT_COUNT = 5000
+# One source takes milliseconds; a parser that has not answered after this
+# long is taken to be hung, and the process is killed. A loaded host can be
+# slower than that, so every hang and crash is run again alone, with
+# HANG_CONFIRMATION_FACTOR times as long, before it is believed.
+DEFAULT_INPUT_TIMEOUT_SECONDS = 1.0
+HANG_CONFIRMATION_FACTOR = 4
+# Mutants longer than this many lines are not generated, since a failure in
+# one is slow to minimise and a long function offers no more shapes than a short.
+DEFAULT_MAX_UNIT_LINES = 120
+# How many failures the gate mode minimises; a gate that finds a bug finds it
+# repeatedly, and one minimised reproducer per verdict is enough to start.
+GATE_MINIMISED_FAILURES = 6
+# How many failures the console report shows in full; every one is on disk.
+PRINTED_FAILURES = 12
+
+
+class Verdict(enum.Enum):
+    """What the two parsers did with one source. The value of each of the first
+    eight is the label `discovery_fuzz_runner.brp` prints."""
+
+    AGREE = "agree"
+    SAFE_STOP = "safe-stop"
+    BOTH_REJECTED = "both-rejected"
+    REJECT_DECLINED = "reject-declined"
+    AST_MISMATCH = "ast-mismatch"
+    WRONG_ACCEPT = "wrong-accept"
+    WRONG_REJECT = "wrong-reject"
+    TREE_ERROR = "tree-error"
+    # The runner never prints these: the driver decides them from how the
+    # process ended, after the `old` line for the tree path or before it for
+    # the existing parser.
+    OLD_CRASH = "old-crash"
+    OLD_HANG = "old-hang"
+    TREE_CRASH = "tree-crash"
+    TREE_HANG = "tree-hang"
+
+    @property
+    def is_failure(self) -> bool:
+        """A verdict the gate fails on: a parity violation, or a tree path that
+        breaks, whatever the existing parser did."""
+        return self in FAILURES
+
+    @property
+    def is_old_parser_trouble(self) -> bool:
+        return self in (Verdict.OLD_CRASH, Verdict.OLD_HANG)
+
+    @property
+    def headline(self) -> str:
+        return HEADLINES[self]
+
+
+# The verdicts the driver decides from how the runner process ended.
+RUNNER_TROUBLE = frozenset({Verdict.OLD_CRASH, Verdict.OLD_HANG, Verdict.TREE_CRASH, Verdict.TREE_HANG})
+
+FAILURES = frozenset(
+    {
+        Verdict.WRONG_ACCEPT,
+        Verdict.AST_MISMATCH,
+        Verdict.WRONG_REJECT,
+        Verdict.TREE_ERROR,
+        Verdict.TREE_CRASH,
+        Verdict.TREE_HANG,
+    }
+)
+
+HEADLINES = {
+    Verdict.AGREE: "agree: both accept, same AST",
+    Verdict.SAFE_STOP: "safe stop: old accepts, tree declines",
+    Verdict.BOTH_REJECTED: "agree: both reject",
+    Verdict.REJECT_DECLINED: "old rejects, tree declines (unchecked)",
+    Verdict.AST_MISMATCH: "AST MISMATCH: both accept, different AST",
+    Verdict.WRONG_ACCEPT: "WRONG ACCEPT: old rejects, tree accepts",
+    Verdict.WRONG_REJECT: "WRONG REJECT: old accepts, tree rejects",
+    Verdict.TREE_ERROR: "TREE ERROR: tree accepted but cannot be censused or projected",
+    Verdict.OLD_CRASH: "old parser crashed",
+    Verdict.OLD_HANG: "old parser hung",
+    Verdict.TREE_CRASH: "TREE CRASH: the tree path crashed",
+    Verdict.TREE_HANG: "TREE HANG: the tree path hung",
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class Outcome:
+    """One source's verdict, with the runner's detail line (or what the driver
+    saw of a crash)."""
+
+    verdict: Verdict
+    detail: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Tokens and declaration units
+
+TOKEN_PATTERN = re.compile(
+    r"""
+      (?P<space>[ \t]+)
+    | (?P<newline>\n)
+    | (?P<comment>--[^\n]*)
+    | (?P<string>"(?:\\.|[^"\\\n])*"|")
+    | (?P<number>\d[\w]*(?:\.\d+)?)
+    | (?P<word>[A-Za-z_]\w*)
+    | (?P<operator>\.\.\#|\.\.|==|!=|<=|>=|->|=>|\?=|\+=|-=|\*=|/=|%=|\*\*|[-+*/%<>=!?.,:;()\[\]{}|&^~@\#])
+    | (?P<other>.)
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+
+CLOSING_BRACKETS = ")]}"
+
+# What `insert-token` adds. Brackets, separators and the `.` and `=` of
+# Blorp's grammar, the operators, and a line break; words get spaces around
+# them so they stay words.
+INSERTED_SYMBOLS = (
+    "(", ")", "[", "]", "{", "}", ",", ":", "=", ".",
+    "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=", "->", "?=", "..", "|",
+)
+INSERTED_WORDS = ("and", "or", "not")
+
+TAB = "\t"
+INDENT_SPACES = 4
+
+
+@dataclasses.dataclass(frozen=True)
+class Token:
+    kind: str
+    text: str
+
+    @property
+    def is_code(self) -> bool:
+        return self.kind not in ("space", "newline", "comment")
+
+
+def tokenize(text: str) -> list[Token]:
+    """`text` as tokens that partition it: joining their texts gives it back."""
+    return [Token(match.lastgroup or "other", match.group()) for match in TOKEN_PATTERN.finditer(text)]
+
+
+def join_tokens(tokens: Sequence[Token]) -> str:
+    return "".join(token.text for token in tokens)
+
+
+def leading_whitespace(line: str) -> str:
+    return line[: len(line) - len(line.lstrip(" \t"))]
+
+
+DOCSTRING_FENCE = "---"
+
+
+def line_is_code(lines: Sequence[str]) -> list[bool]:
+    """Per line: whether it holds code, not blank, a comment or the inside of a
+    `---` documentation block."""
+    flags = []
+    in_documentation = False
+    for line in lines:
+        if line.strip() == DOCSTRING_FENCE and not line[:1].isspace():
+            in_documentation = not in_documentation
+            flags.append(False)
+        else:
+            stripped = line.strip()
+            flags.append(not in_documentation and stripped != "" and not stripped.startswith("--"))
+    return flags
+
+
+def declaration_units(lines: Sequence[str]) -> list[tuple[int, int]]:
+    """The top-level declarations of a source as `(start, end)` line ranges,
+    `end` exclusive. A declaration starts at a code line in column 0 (not a
+    closing bracket) and runs to the next declaration, with the comments and
+    documentation directly above it belonging to it. Blank lines between
+    declarations belong to none."""
+    is_code = line_is_code(lines)
+    starts = [
+        index
+        for index, line in enumerate(lines)
+        if is_code[index] and not line[:1].isspace() and line[:1] not in CLOSING_BRACKETS
+    ]
+    units = []
+    for position, code_start in enumerate(starts):
+        start = code_start
+        floor = starts[position - 1] + 1 if position else 0
+        while start > floor and lines[start - 1].strip() != "" and not is_code[start - 1]:
+            start -= 1
+        units.append((start, code_start))
+    ends = [start for start, _ in units[1:]] + [len(lines)]
+    result = []
+    for (start, _), end in zip(units, ends):
+        while end > start and lines[end - 1].strip() == "":
+            end -= 1
+        result.append((start, end))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Mutation operators
+#
+# An operator takes the unit's lines, the indexes of its code lines and a
+# random generator, and returns the mutated lines, or `None` where it does not
+# apply to the line it drew.
+
+Lines = list[str]
+Operator = Callable[[Lines, int, random.Random], "Lines | None"]
+
+
+def code_token_positions(line: str) -> list[tuple[int, Token]]:
+    """The code tokens of a line with their offsets."""
+    position = 0
+    found = []
+    for token in tokenize(line):
+        if token.is_code:
+            found.append((position, token))
+        position += len(token.text)
+    return found
+
+
+def boundaries(line: str) -> list[int]:
+    """Offsets inside the code of a line where a token ends and another starts."""
+    position = 0
+    found = []
+    seen_code = False
+    for token in tokenize(line):
+        if token.is_code and seen_code:
+            found.append(position)
+        seen_code = seen_code or token.is_code
+        position += len(token.text)
+    return found
+
+
+def replaced(lines: Lines, index: int, *replacement: str) -> Lines:
+    return lines[:index] + list(replacement) + lines[index + 1 :]
+
+
+def delete_line(lines: Lines, index: int, rng: random.Random) -> Lines | None:
+    return lines[:index] + lines[index + 1 :]
+
+
+def duplicate_line(lines: Lines, index: int, rng: random.Random) -> Lines | None:
+    return replaced(lines, index, lines[index], lines[index])
+
+
+def swap_lines(lines: Lines, index: int, rng: random.Random) -> Lines | None:
+    neighbour = index + 1 if index + 1 < len(lines) else index - 1
+    if neighbour < 0:
+        return None
+    swapped = list(lines)
+    swapped[index], swapped[neighbour] = swapped[neighbour], swapped[index]
+    return swapped
+
+
+def indent_unit(line: str) -> str:
+    """One indentation level in the style a line is already indented in."""
+    return " " * INDENT_SPACES if leading_whitespace(line).startswith(" ") else TAB
+
+
+def change_indent_level(lines: Lines, index: int, rng: random.Random) -> Lines | None:
+    line = lines[index]
+    unit = indent_unit(line)
+    if line.startswith(unit) and rng.random() < 0.5:
+        return replaced(lines, index, line[len(unit) :])
+    return replaced(lines, index, unit + line)
+
+
+def change_indent_spaces(lines: Lines, index: int, rng: random.Random) -> Lines | None:
+    line = lines[index]
+    count = rng.choice((1, 2))
+    if rng.random() < 0.5:
+        return replaced(lines, index, " " * count + line)
+    padding = leading_whitespace(line)
+    if not padding:
+        return None
+    return replaced(lines, index, padding[count:] + line[len(padding) :])
+
+
+def swap_tabs_and_spaces(lines: Lines, index: int, rng: random.Random) -> Lines | None:
+    line = lines[index]
+    padding = leading_whitespace(line)
+    body = line[len(padding) :]
+    if TAB in padding:
+        if rng.random() < 0.5:
+            return replaced(lines, index, padding.replace(TAB, " " * INDENT_SPACES) + body)
+        at = padding.index(TAB)
+        return replaced(lines, index, padding[:at] + " " * INDENT_SPACES + padding[at + 1 :] + body)
+    if padding.startswith(" " * INDENT_SPACES):
+        return replaced(lines, index, TAB + padding[INDENT_SPACES:] + body)
+    return None
+
+
+def join_lines(lines: Lines, index: int, rng: random.Random) -> Lines | None:
+    if index + 1 >= len(lines):
+        return None
+    glue = rng.choice((" ", ""))
+    joined = lines[index].rstrip() + glue + lines[index + 1].lstrip(" \t")
+    return lines[:index] + [joined] + lines[index + 2 :]
+
+
+def split_indentation(line: str, rng: random.Random) -> str:
+    """How a line cut in two continues: not indented, as before, or one deeper."""
+    padding = leading_whitespace(line)
+    return rng.choice(("", padding, padding + indent_unit(line)))
+
+
+def split_line(lines: Lines, index: int, rng: random.Random) -> Lines | None:
+    line = lines[index]
+    cuts = boundaries(line)
+    if not cuts:
+        return None
+    cut = rng.choice(cuts)
+    return replaced(lines, index, line[:cut].rstrip(), split_indentation(line, rng) + line[cut:].lstrip(" \t"))
+
+
+def delete_token(lines: Lines, index: int, rng: random.Random) -> Lines | None:
+    positions = code_token_positions(lines[index])
+    if not positions:
+        return None
+    offset, token = rng.choice(positions)
+    line = lines[index]
+    return replaced(lines, index, line[:offset] + line[offset + len(token.text) :])
+
+
+def duplicate_token(lines: Lines, index: int, rng: random.Random) -> Lines | None:
+    positions = code_token_positions(lines[index])
+    if not positions:
+        return None
+    offset, token = rng.choice(positions)
+    line = lines[index]
+    end = offset + len(token.text)
+    return replaced(lines, index, line[:end] + token.text + line[end:])
+
+
+def insert_token(lines: Lines, index: int, rng: random.Random) -> Lines | None:
+    line = lines[index]
+    code_start = len(leading_whitespace(line))
+    code_end = len(line.rstrip())
+    at = rng.randint(code_start, code_end)
+    choice = rng.randrange(len(INSERTED_SYMBOLS) + len(INSERTED_WORDS) + 1)
+    if choice < len(INSERTED_SYMBOLS):
+        return replaced(lines, index, line[:at] + INSERTED_SYMBOLS[choice] + line[at:])
+    if choice < len(INSERTED_SYMBOLS) + len(INSERTED_WORDS):
+        word = INSERTED_WORDS[choice - len(INSERTED_SYMBOLS)]
+        return replaced(lines, index, line[:at] + f" {word} " + line[at:])
+    return replaced(lines, index, line[:at], split_indentation(line, rng) + line[at:])
+
+
+def move_closing_bracket(lines: Lines, index: int, rng: random.Random) -> Lines | None:
+    line = lines[index]
+    closers = [(offset, token) for offset, token in code_token_positions(line) if token.text in CLOSING_BRACKETS]
+    if not closers:
+        return None
+    offset, token = rng.choice(closers)
+    without = line[:offset] + line[offset + 1 :]
+    if index + 1 < len(lines) and rng.random() < 0.5:
+        following = lines[index + 1]
+        padding = leading_whitespace(following)
+        return lines[:index] + [without, padding + token.text + following[len(padding) :]] + lines[index + 2 :]
+    own_line = split_indentation(line, rng) + token.text
+    return replaced(lines, index, without, own_line)
+
+
+OPERATORS: dict[str, Operator] = {
+    "delete-line": delete_line,
+    "duplicate-line": duplicate_line,
+    "swap-lines": swap_lines,
+    "indent-level": change_indent_level,
+    "indent-spaces": change_indent_spaces,
+    "tabs-spaces": swap_tabs_and_spaces,
+    "join-lines": join_lines,
+    "split-line": split_line,
+    "delete-token": delete_token,
+    "duplicate-token": duplicate_token,
+    "insert-token": insert_token,
+    "move-closing-bracket": move_closing_bracket,
+}
+
+# How many times a mutant draws an operator and a line before giving up on a
+# unit that offers it nothing (a one-token unit, say).
+MUTATION_ATTEMPTS = 30
+
+
+def mutate_lines(lines: Lines, rng: random.Random) -> tuple[str, Lines] | None:
+    """One edit of `lines`: the operator's name and the mutated lines, or `None`
+    when no operator changes this unit."""
+    code_lines = [index for index, is_code in enumerate(line_is_code(lines)) if is_code]
+    if not code_lines:
+        return None
+    names = sorted(OPERATORS)
+    for _ in range(MUTATION_ATTEMPTS):
+        name = rng.choice(names)
+        mutated = OPERATORS[name](lines, rng.choice(code_lines), rng)
+        if mutated is not None and mutated != lines:
+            return name, mutated
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Mutants
+
+
+@dataclasses.dataclass(frozen=True)
+class Unit:
+    """One top-level declaration of a corpus file: lines `start` to `end` of it."""
+
+    path: str
+    start: int
+    end: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Mutant:
+    index: int
+    unit: Unit
+    operator: str
+    original: str
+    text: str
+
+    @property
+    def name(self) -> str:
+        return f"m{self.index:06d}{SOURCE_SUFFIX}"
+
+
+def corpus_units(sources: dict[str, list[str]], max_lines: int) -> list[Unit]:
+    """Every declaration of `sources` short enough to mutate, in a fixed order."""
+    return [
+        Unit(path, start, end)
+        for path in sorted(sources)
+        for start, end in declaration_units(sources[path])
+        if end - start <= max_lines
+    ]
+
+
+def units_at_stops(units: Sequence[Unit], stops: Sequence[tuple[str, int]]) -> list[Unit]:
+    """The declarations holding the 1-based source lines the stop census names."""
+    found = []
+    for path, line in stops:
+        for unit in units:
+            if unit.path == path and unit.start < line <= unit.end:
+                found.append(unit)
+    return sorted(set(found), key=lambda unit: (unit.path, unit.start))
+
+
+def make_mutant(
+    seed: int, index: int, units: Sequence[Unit], sources: dict[str, list[str]], whole_file: bool
+) -> Mutant | None:
+    """Mutant `index` of `seed`: its own random generator picks the declaration
+    and the edit, so it never depends on the mutants before it."""
+    rng = random.Random(f"{seed}/{index}")
+    unit = rng.choice(units)
+    lines = sources[unit.path]
+    unit_lines = lines[unit.start : unit.end]
+    mutation = mutate_lines(unit_lines, rng)
+    if mutation is None:
+        return None
+    operator, mutated = mutation
+    if whole_file:
+        original_text = "\n".join(lines) + "\n"
+        text = "\n".join(lines[: unit.start] + mutated + lines[unit.end :]) + "\n"
+    else:
+        original_text = "\n".join(unit_lines) + "\n"
+        text = "\n".join(mutated) + "\n"
+    return Mutant(index, unit, operator, original_text, text)
+
+
+def generate_mutants(
+    seed: int, count: int, units: Sequence[Unit], sources: dict[str, list[str]], whole_file: bool
+) -> Iterator[Mutant]:
+    """`count` mutants of distinct texts. A draw that changes nothing, or
+    repeats an earlier mutant, is skipped, and the next index tried."""
+    seen: set[str] = set()
+    index = 0
+    produced = 0
+    skipped = 0
+    # A corpus so small that it runs out of distinct mutants must still end.
+    give_up_after = 20 * count + 1000
+    while produced < count and skipped < give_up_after:
+        mutant = make_mutant(seed, index, units, sources, whole_file)
+        index += 1
+        if mutant is None or mutant.text in seen:
+            skipped += 1
+            continue
+        seen.add(mutant.text)
+        produced += 1
+        yield mutant
+
+
+# ---------------------------------------------------------------------------
+# The runner process
+
+PROTOCOL_BEGIN = "fuzz-begin "
+PROTOCOL_OLD = "fuzz-old "
+PROTOCOL_RESULT = "fuzz-result "
+FIELD_SEPARATOR = " | "
+# What the runner prints for a source it cannot read, which the driver wrote
+# itself a moment before.
+TOOL_ERROR_LABEL = "tool-error"
+# How many lines of a crashed runner's output the crash detail keeps.
+CRASH_DETAIL_LINES = 4
+
+
+@dataclasses.dataclass
+class RunnerProcess:
+    """A running batch: its lines of stderr, in order, and the end of the stream
+    as `None`."""
+
+    process: subprocess.Popen
+    lines: "queue.Queue[str | None]"
+    reader: threading.Thread
+
+    @staticmethod
+    def start(binary: Path, listing: Path, cwd: Path) -> "RunnerProcess":
+        process = subprocess.Popen(
+            [str(binary), str(listing)],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        lines: "queue.Queue[str | None]" = queue.Queue()
+
+        def read_lines() -> None:
+            assert process.stderr is not None
+            for raw in process.stderr:
+                lines.put(raw.decode("utf-8", "replace").rstrip("\n"))
+            lines.put(None)
+
+        reader = threading.Thread(target=read_lines, daemon=True)
+        reader.start()
+        return RunnerProcess(process, lines, reader)
+
+    def stop(self) -> None:
+        """Ends the process if it still runs, and releases its pipe."""
+        if self.process.poll() is None:
+            self.process.kill()
+        self.process.wait()
+        self.reader.join()
+        assert self.process.stderr is not None
+        self.process.stderr.close()
+
+
+def parse_result_line(line: str) -> tuple[str, Outcome]:
+    """`fuzz-result <name> | <verdict> | <detail>` as the name and its outcome."""
+    fields = line[len(PROTOCOL_RESULT) :].split(FIELD_SEPARATOR, 2)
+    if len(fields) != 3:
+        raise RunnerProtocolError(f"malformed result line: {line}")
+    name, label, detail = fields
+    if label == TOOL_ERROR_LABEL:
+        raise RunnerProtocolError(f"the runner could not read {name}: {detail}")
+    try:
+        verdict = Verdict(label)
+    except ValueError:
+        raise RunnerProtocolError(f"unknown verdict in result line: {line}") from None
+    return name, Outcome(verdict, detail)
+
+
+class RunnerProtocolError(Exception):
+    """The runner printed something this driver cannot read: a bug in one of them."""
+
+
+def crash_outcome(old_finished: bool, tail: Sequence[str]) -> Outcome:
+    detail = " / ".join(tail[-CRASH_DETAIL_LINES:])
+    return Outcome(Verdict.TREE_CRASH if old_finished else Verdict.OLD_CRASH, detail)
+
+
+def hang_outcome(old_finished: bool, timeout: float) -> Outcome:
+    return Outcome(Verdict.TREE_HANG if old_finished else Verdict.OLD_HANG, f"no answer within {timeout:g}s")
+
+
+@dataclasses.dataclass
+class RunnerStats:
+    """What a batch runner did besides classify."""
+
+    processes_started: int = 0
+    # Seconds spent waiting out sources that did not answer.
+    hang_seconds: float = 0.0
+    # Hangs and crashes run again alone, and those that then classified.
+    rechecked: int = 0
+    cleared: int = 0
+
+
+class BatchRunner:
+    """Classifies sources with one runner process per batch, restarting after
+    the source that crashed or hung it."""
+
+    def __init__(self, binary: Path, work: Path, timeout: float) -> None:
+        self.binary = binary
+        self.work = work
+        self.timeout = timeout
+        self.stats = RunnerStats()
+
+    def classify(self, sources: Sequence[tuple[str, str]]) -> dict[str, Outcome]:
+        """`(name, text)` pairs to each name's outcome. Names are unique."""
+        for name, text in sources:
+            (self.work / name).write_text(text, encoding="utf-8", errors="surrogateescape")
+        outcomes: dict[str, Outcome] = {}
+        remaining = [name for name, _ in sources]
+        while remaining:
+            remaining = self.run_until_trouble(remaining, outcomes, self.timeout)
+        for name in [name for name, outcome in outcomes.items() if outcome.verdict in RUNNER_TROUBLE]:
+            outcomes[name] = self.confirm_trouble(name)
+        for name, _ in sources:
+            (self.work / name).unlink()
+        return outcomes
+
+    def confirm_trouble(self, name: str) -> Outcome:
+        """The outcome of a source that hung or crashed the runner, run again
+        alone with a longer timeout: a slow host does not make a hang."""
+        again: dict[str, Outcome] = {}
+        self.run_until_trouble([name], again, self.timeout * HANG_CONFIRMATION_FACTOR)
+        self.stats.rechecked += 1
+        if again[name].verdict not in RUNNER_TROUBLE:
+            self.stats.cleared += 1
+        return again[name]
+
+    def run_until_trouble(self, names: list[str], outcomes: dict[str, Outcome], timeout: float) -> list[str]:
+        """Runs `names`; returns those after the source that crashed or hung the
+        process, having recorded its outcome."""
+        listing = self.work / "listing.txt"
+        listing.write_text("\n".join(names) + "\n", encoding="utf-8")
+        runner = RunnerProcess.start(self.binary, listing, self.work)
+        self.stats.processes_started += 1
+        try:
+            return self.read_results(runner, names, outcomes, timeout)
+        finally:
+            runner.stop()
+
+    def read_results(
+        self, runner: RunnerProcess, names: list[str], outcomes: dict[str, Outcome], timeout: float
+    ) -> list[str]:
+        """Reads the protocol until every name has a result, or the source in
+        flight crashed or hung the process; returns the names after it."""
+        current: str | None = None
+        old_finished = False
+        tail: list[str] = []
+        done = 0
+        while done < len(names):
+            try:
+                line = runner.lines.get(timeout=timeout)
+            except queue.Empty:
+                self.stats.hang_seconds += timeout
+                outcomes[names[done]] = hang_outcome(old_finished, timeout)
+                return names[done + 1 :]
+            if line is None:
+                runner.process.wait()
+                if current != names[done]:
+                    raise RunnerProtocolError(
+                        f"the runner exited with status {runner.process.returncode} "
+                        f"while {current or 'between sources'} was running, before {names[done]} "
+                        f"finished: {' / '.join(tail[-CRASH_DETAIL_LINES:])}"
+                    )
+                outcomes[current] = crash_outcome(old_finished, tail)
+                return names[done + 1 :]
+            if line.startswith(PROTOCOL_BEGIN):
+                current = line[len(PROTOCOL_BEGIN) :]
+                old_finished = False
+                tail = []
+            elif line.startswith(PROTOCOL_OLD):
+                old_finished = True
+            elif line.startswith(PROTOCOL_RESULT):
+                name, outcome = parse_result_line(line)
+                if name != names[done]:
+                    raise RunnerProtocolError(f"expected a result for {names[done]}, got: {line}")
+                outcomes[name] = outcome
+                done += 1
+                current = None
+            else:
+                tail.append(line)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Building the runner
+
+RUNNER_INPUT_ROOTS = ("blorp/src", "standard_library/src", "blorp/test/test_compiler/tools")
+
+
+def cache_directory() -> Path:
+    digest = hashlib.sha256(str(REPO_ROOT).encode("utf-8")).hexdigest()[: parity.CHECKOUT_DIGEST_LENGTH]
+    return Path(tempfile.gettempdir()) / f"discovery-fuzz-{digest}"
+
+
+def runner_inputs_digest() -> str:
+    """A digest of everything the compiled runner depends on: the tracked
+    sources it is built from (tracked or new, as they are on disk now) and the
+    compiler that builds it."""
+    listing = subprocess.run(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", *RUNNER_INPUT_ROOTS],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        check=True,
+    ).stdout.decode("utf-8")
+    digest = hashlib.sha256()
+    for name in sorted(listing.split("\0")):
+        path = REPO_ROOT / name
+        if name and path.is_file():
+            digest.update(name.encode("utf-8") + b"\0" + path.read_bytes() + b"\0")
+    digest.update((REPO_ROOT / "bin" / "blorp").read_bytes())
+    return digest.hexdigest()[:24]
+
+
+def build_runner() -> Path:
+    """The compiled runner for the current sources, built once and cached under
+    the system temporary directory by a digest of its inputs."""
+    status = subprocess.run(["scripts/compiler-build-status"], cwd=REPO_ROOT, capture_output=True, text=True)
+    if status.returncode != 0:
+        raise SystemExit(f"FAIL: bin/blorp is not fresh; run `make` first\n{status.stdout}{status.stderr}")
+    directory = cache_directory()
+    directory.mkdir(parents=True, exist_ok=True)
+    binary = directory / f"runner-{runner_inputs_digest()}"
+    if binary.is_file():
+        return binary
+    for stale in directory.glob("runner-*"):
+        stale.unlink()
+    c_file = binary.with_suffix(".c")
+    compiler = os.environ.get(parity.C_COMPILER_VARIABLE, parity.DEFAULT_C_COMPILER)
+    parity.run_checked(
+        ["bin/blorp", "compile", "--no-format", "-o", str(c_file), RUNNER_SOURCE],
+        f"compile {RUNNER_SOURCE} to C",
+    )
+    partial = binary.with_suffix(".partial")
+    parity.run_checked(
+        [
+            compiler, "-x", "c", str(c_file), *parity.C_COMPILE_FLAGS, *parity.C_INCLUDE_FLAGS,
+            *parity.C_LINK_FLAGS, "-o", str(partial),
+        ],
+        f"compile {c_file} with {compiler}",
+    )
+    partial.replace(binary)
+    c_file.unlink()
+    return binary
+
+
+# ---------------------------------------------------------------------------
+# Minimising
+
+Probe = Callable[[Sequence[str]], list[bool]]
+
+
+def shrink(items: list[str], keeps_verdict: Probe) -> list[str]:
+    """Delta debugging: delete runs of `items` for as long as `keeps_verdict`
+    holds for what is left, trying large runs first. `keeps_verdict` takes the
+    candidates of one round and answers for each, so a round is one batch."""
+    chunk = max(1, len(items) // 2)
+    while items:
+        candidates = ["".join(items[:start] + items[start + chunk :]) for start in range(0, len(items), chunk)]
+        verdicts = keeps_verdict(candidates)
+        kept = next((start for start, holds in zip(range(0, len(items), chunk), verdicts) if holds), None)
+        if kept is not None:
+            items = items[:kept] + items[kept + chunk :]
+        elif chunk == 1:
+            break
+        else:
+            chunk = max(1, chunk // 2)
+    return items
+
+
+def pieces(text: str) -> list[str]:
+    """The tokens of `text` with each space or tab of an indentation apart, so
+    that a level of indentation can be removed on its own."""
+    found = []
+    for token in tokenize(text):
+        found.extend(token.text if token.kind == "space" else [token.text])
+    return found
+
+
+def minimise(text: str, keeps_verdict: Callable[[Sequence[str]], list[bool]]) -> str:
+    """The smallest source found by deleting lines, then tokens and single
+    indentation characters, then lines again, that `keeps_verdict` still
+    accepts."""
+    previous = None
+    while previous != text:
+        previous = text
+        text = "".join(shrink(text.splitlines(keepends=True), keeps_verdict))
+        text = "".join(shrink(pieces(text), keeps_verdict))
+    return text
+
+
+class Minimiser:
+    """Shrinks a failing source while the batch runner still gives it the same
+    verdict. Outcomes are remembered, since the search revisits texts."""
+
+    def __init__(self, runner: BatchRunner, verdict: Verdict) -> None:
+        self.runner = runner
+        self.verdict = verdict
+        self.known: dict[str, Outcome] = {}
+
+    def outcomes(self, texts: Sequence[str]) -> list[Outcome]:
+        unknown = list(dict.fromkeys(text for text in texts if text not in self.known))
+        if unknown:
+            names = [f"c{number:05d}{SOURCE_SUFFIX}" for number in range(len(unknown))]
+            result = self.runner.classify(list(zip(names, unknown)))
+            self.known.update({text: result[name] for name, text in zip(names, unknown)})
+        return [self.known[text] for text in texts]
+
+    def keeps_verdict(self, texts: Sequence[str]) -> list[bool]:
+        return [outcome.verdict == self.verdict for outcome in self.outcomes(texts)]
+
+    def minimise(self, text: str) -> tuple[str, Outcome] | Outcome:
+        """The smallest source that keeps the verdict and its outcome; or, when
+        `text` does not give the verdict again, the outcome it gave instead, so
+        a flaky failure is reported as one and not shrunk to noise."""
+        start = self.outcomes([text])[0]
+        if start.verdict != self.verdict:
+            return start
+        smallest = minimise(text, self.keeps_verdict)
+        return smallest, self.outcomes([smallest])[0]
+
+
+# ---------------------------------------------------------------------------
+# Failures on disk
+
+@dataclasses.dataclass
+class Failure:
+    mutant: Mutant
+    outcome: Outcome
+    minimised: str | None = None
+    minimised_outcome: Outcome | None = None
+    # What the mutant gave when minimisation ran it again, if not its verdict.
+    unreproduced: Outcome | None = None
+
+
+def write_failure(directory: Path, seed: int, failure: Failure) -> Path:
+    """One directory per failure: the original declaration, the mutant, the
+    minimised reproducer when there is one, and the verdict."""
+    mutant = failure.mutant
+    target = directory / f"{failure.outcome.verdict.value}-{mutant.index:06d}"
+    target.mkdir(parents=True)
+    (target / f"original{SOURCE_SUFFIX}").write_text(mutant.original, encoding="utf-8", errors="surrogateescape")
+    (target / f"mutant{SOURCE_SUFFIX}").write_text(mutant.text, encoding="utf-8", errors="surrogateescape")
+    report = [
+        f"verdict: {failure.outcome.verdict.value}",
+        f"detail: {failure.outcome.detail}",
+        f"seed: {seed}",
+        f"mutant: {mutant.index}",
+        f"operator: {mutant.operator}",
+        f"source: {mutant.unit.path} lines {mutant.unit.start + 1}-{mutant.unit.end}",
+    ]
+    if failure.minimised is not None and failure.minimised_outcome is not None:
+        (target / f"minimised{SOURCE_SUFFIX}").write_text(failure.minimised, encoding="utf-8", errors="surrogateescape")
+        report.append(f"minimised detail: {failure.minimised_outcome.detail}")
+    if failure.unreproduced is not None:
+        report.append(f"unreproducible: run again alone it gave {failure.unreproduced.verdict.value}")
+    difference = difflib.unified_diff(
+        mutant.original.splitlines(), mutant.text.splitlines(), "original", "mutant", lineterm=""
+    )
+    report += ["", "edit:", *difference]
+    (target / "verdict.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
+    return target
+
+
+# ---------------------------------------------------------------------------
+# The run
+
+
+@dataclasses.dataclass
+class RunSummary:
+    seed: int
+    mutants: int
+    verdicts: Counter
+    by_operator: dict[str, Counter]
+    failures: list[Failure]
+    declines: dict[Verdict, Counter]
+    batch_seconds: float
+    runner: RunnerStats
+
+    @property
+    def failed(self) -> bool:
+        return bool(self.failures)
+
+    @property
+    def throughput(self) -> float:
+        """Mutants per second of the batch, not counting the time spent waiting
+        out hung sources."""
+        busy = self.batch_seconds - self.runner.hang_seconds
+        return self.mutants / busy if busy > 0 else 0.0
+
+    @property
+    def tree_decided_share_of_rejected(self) -> float:
+        """Of the mutants the existing parser rejects, the share the tree path
+        decided (rejected, or wrongly accepted). The rest it declined, so no
+        parity claim is made about them."""
+        decided = self.verdicts[Verdict.BOTH_REJECTED] + self.verdicts[Verdict.WRONG_ACCEPT]
+        total = decided + self.verdicts[Verdict.REJECT_DECLINED]
+        return decided / total if total else 0.0
+
+    @property
+    def tree_completion_share(self) -> float:
+        """Of the mutants the existing parser accepts, the share the tree path
+        read in full (agree, differ or reject): how much of the input the
+        comparison actually exercised."""
+        stopped = self.verdicts[Verdict.SAFE_STOP]
+        completed = sum(self.verdicts[v] for v in (Verdict.AGREE, Verdict.AST_MISMATCH, Verdict.WRONG_REJECT))
+        total = stopped + completed
+        return completed / total if total else 0.0
+
+
+def summarise(
+    seed: int, mutants: Sequence[Mutant], outcomes: dict[str, Outcome], batch_seconds: float, runner: RunnerStats
+) -> RunSummary:
+    verdicts: Counter = Counter()
+    by_operator: dict[str, Counter] = {}
+    declines: dict[Verdict, Counter] = {Verdict.SAFE_STOP: Counter(), Verdict.REJECT_DECLINED: Counter()}
+    failures = []
+    for mutant in mutants:
+        outcome = outcomes[mutant.name]
+        verdicts[outcome.verdict] += 1
+        if outcome.verdict in declines:
+            declines[outcome.verdict][outcome.detail] += 1
+        by_operator.setdefault(mutant.operator, Counter())[outcome.verdict] += 1
+        if outcome.verdict.is_failure:
+            failures.append(Failure(mutant, outcome))
+    return RunSummary(seed, len(mutants), verdicts, by_operator, failures, declines, batch_seconds, runner)
+
+
+def render_summary(summary: RunSummary) -> str:
+    lines = [
+        f"discovery-fuzz: seed={summary.seed} mutants={summary.mutants} "
+        f"batch_seconds={summary.batch_seconds:.1f} (of which {summary.runner.hang_seconds:.1f} waiting out hangs) "
+        f"throughput={summary.throughput:.0f}/s runner_processes={summary.runner.processes_started}",
+        f"  {summary.runner.rechecked} hangs and crashes run again alone; "
+        f"{summary.runner.cleared} then classified normally",
+        "",
+    ]
+    for verdict in Verdict:
+        count = summary.verdicts[verdict]
+        if count or verdict.is_failure:
+            lines.append(f"  {count:7d}  {verdict.headline}")
+    lines.append(f"\n  tree completed {summary.tree_completion_share:.1%} of the mutants the old parser accepts")
+    lines.append(
+        f"  tree decided {summary.tree_decided_share_of_rejected:.1%} of the mutants the old parser rejects; "
+        "the rest it declined, which proves nothing about them"
+    )
+    for verdict, reasons in summary.declines.items():
+        lines.append(f"\n  where the tree path stopped ({verdict.value}):")
+        lines.extend(f"    {count:7d}  {reason}" for reason, count in reasons.most_common())
+    lines.append("\n  by operator (agree/safe-stop/both-rejected/reject-declined; failures; old-parser trouble):")
+    for operator in sorted(summary.by_operator):
+        counts = summary.by_operator[operator]
+        benign = [counts[v] for v in (Verdict.AGREE, Verdict.SAFE_STOP, Verdict.BOTH_REJECTED, Verdict.REJECT_DECLINED)]
+        failed = sum(count for verdict, count in counts.items() if verdict.is_failure)
+        trouble = sum(count for verdict, count in counts.items() if verdict.is_old_parser_trouble)
+        lines.append(f"    {operator:22s} {'/'.join(str(n) for n in benign):>20s}  {failed:4d}  {trouble:3d}")
+    return "\n".join(lines)
+
+
+def report_failures(summary: RunSummary, directory: Path) -> str:
+    lines = []
+    for failure in summary.failures[:PRINTED_FAILURES]:
+        shown = failure.minimised if failure.minimised is not None else failure.mutant.text
+        lines.append(
+            f"\n{failure.outcome.verdict.headline}  (mutant {failure.mutant.index}, {failure.mutant.operator}, "
+            f"{failure.mutant.unit.path}:{failure.mutant.unit.start + 1})"
+        )
+        lines.append(f"  detail: {failure.outcome.detail}")
+        label = "minimised" if failure.minimised is not None else "mutant"
+        lines.append(f"  {label}:")
+        lines.extend(f"    | {line}" for line in shown.rstrip("\n").splitlines())
+    hidden = len(summary.failures) - PRINTED_FAILURES
+    if hidden > 0:
+        lines.append(f"\n... and {hidden} more")
+    lines.append(f"\nFailures are in {directory}")
+    return "\n".join(lines)
+
+
+def read_sources(paths: Sequence[str]) -> dict[str, list[str]]:
+    """The lines of each file. Only `\\n` ends a line, as for the lexer, and a
+    final newline does not start another."""
+    sources = {}
+    for path in paths:
+        text = (REPO_ROOT / path).read_text(encoding="utf-8", errors="surrogateescape")
+        sources[path] = text.removesuffix("\n").split("\n")
+    return sources
+
+
+def mutable_corpus() -> list[str]:
+    """The parity corpus without the fixtures that pin a known divergence of the
+    old parser (`KNOWN_DIVERGENCES`): a mutant of one would report that same
+    divergence again, whatever the edit."""
+    return [path for path in parity.corpus_files() if path not in parity.KNOWN_DIVERGENCES]
+
+
+def choose_units(options: argparse.Namespace) -> tuple[list[Unit], dict[str, list[str]]]:
+    """The declarations the run draws from: those of the corpus, of the files
+    named, or those the stop census attributes to `--stop-reason`."""
+    corpus = parity.corpus_files() if options.files else mutable_corpus()
+    if options.files:
+        paths = parity.select_files(options.files, corpus)
+        stops = None
+    elif options.stop_reason:
+        census_file = options.census_file or parity.default_census_file(REPO_ROOT)
+        text, _ = parity.read_census_result(census_file)
+        located = parity.first_stop_locations(text, options.stop_reason)
+        stops = [(path, line) for path, line in located if path in corpus]
+        paths = sorted({path for path, _ in stops})
+    else:
+        paths = corpus
+        stops = None
+    sources = read_sources(paths)
+    units = corpus_units(sources, options.max_unit_lines)
+    if stops is not None:
+        units = units_at_stops(units, stops)
+    if not units:
+        raise SystemExit("FAIL: no declaration to mutate in the selected files")
+    return units, sources
+
+
+def run(options: argparse.Namespace) -> int:
+    units, sources = choose_units(options)
+    directory = prepare_output(options.out)
+    started = time.monotonic()
+    binary = Path(options.binary) if options.binary else build_runner()
+    build_seconds = time.monotonic() - started
+
+    mutants = list(generate_mutants(options.seed, options.count, units, sources, options.whole_file))
+    if len(mutants) < options.count:
+        print(f"note: the selection offers only {len(mutants)} distinct mutants of the {options.count} asked for")
+
+    work = Path(tempfile.mkdtemp(prefix="discovery_fuzz."))
+    try:
+        runner = BatchRunner(binary, work, options.timeout)
+        batch_started = time.monotonic()
+        outcomes = runner.classify([(mutant.name, mutant.text) for mutant in mutants])
+        batch_seconds = time.monotonic() - batch_started
+        # Before minimising, whose runs are not the batch's.
+        summary = summarise(options.seed, mutants, outcomes, batch_seconds, dataclasses.replace(runner.stats))
+
+        limit = GATE_MINIMISED_FAILURES if options.gate else len(summary.failures)
+        if options.minimise or options.gate:
+            for failure in summary.failures[:limit]:
+                result = Minimiser(runner, failure.outcome.verdict).minimise(failure.mutant.text)
+                if isinstance(result, Outcome):
+                    failure.unreproduced = result
+                else:
+                    failure.minimised, failure.minimised_outcome = result
+
+        for failure in summary.failures:
+            write_failure(directory, options.seed, failure)
+    finally:
+        if options.keep:
+            print(f"kept the run's files in {work}")
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+
+    print(render_summary(summary))
+    if summary.failures:
+        print(report_failures(summary, directory))
+    elapsed = time.monotonic() - started
+    print(f"\nbuilt in {build_seconds:.1f}s; total {elapsed:.1f}s")
+    if options.gate:
+        status = "FAIL" if summary.failed else "PASS"
+        print(
+            f"BLORP_GATE_RESULT gate=discovery_fuzz status={status} "
+            f"passed={summary.mutants - len(summary.failures)} failed={len(summary.failures)} tests={summary.mutants}"
+        )
+    return 1 if summary.failed else 0
+
+
+def prepare_output(requested: str | None) -> Path:
+    """The failure directory: the one asked for, which must be new or empty, or
+    this checkout's own under the temporary directory, whose failures from the
+    previous run are deleted."""
+    if requested:
+        directory = Path(requested)
+        if directory.exists() and any(directory.iterdir()):
+            raise SystemExit(f"FAIL: {directory} is not empty; name a new directory")
+    else:
+        directory = cache_directory() / "failures"
+        shutil.rmtree(directory, ignore_errors=True)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--seed", type=int, default=GATE_SEED, help="the random seed (default: %(default)s)")
+    parser.add_argument("--count", type=int, default=DEFAULT_COUNT, help="how many mutants (default: %(default)s)")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--files", nargs="+", metavar="PATH", help="mutate only these tracked corpus files"
+    )
+    selection.add_argument(
+        "--stop-reason",
+        metavar="LABEL",
+        help="mutate only the declarations where the last full `compiler-new-parity --stop-census` "
+        "found a module's first stop with this reason",
+    )
+    parser.add_argument("--census-file", type=Path, help="the stored stop census (as for compiler-new-parity)")
+    parser.add_argument(
+        "--whole-file", action="store_true", help="keep the rest of the file around each mutated declaration"
+    )
+    parser.add_argument(
+        "--max-unit-lines", type=int, default=DEFAULT_MAX_UNIT_LINES, help="longest declaration mutated"
+    )
+    parser.add_argument("--minimise", action="store_true", help="shrink each failing mutant to a small reproducer")
+    parser.add_argument(
+        "--out",
+        metavar="DIR",
+        help="where failures are written; it must be new or empty (default: this checkout's directory under the "
+        "temporary directory, whose failures from the previous run are deleted)",
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=DEFAULT_INPUT_TIMEOUT_SECONDS, help="seconds before one source counts as hung"
+    )
+    parser.add_argument("--binary", metavar="PATH", help="a compiled discovery_fuzz_runner instead of building one")
+    parser.add_argument("--keep", action="store_true", help="keep the run's mutant files")
+    parser.add_argument(
+        "--gate",
+        action="store_true",
+        help=f"the gate: seed {GATE_SEED}, {GATE_COUNT} mutants over the whole corpus; exit nonzero on any "
+        "failure. It is a sample, not a regression gate: any edit to the corpus redraws every mutant, so it "
+        "finds new bugs but cannot show an old one stays fixed (the fixed cases of "
+        "test_discovery_fuzz_cases.brp do that)",
+    )
+    options = parser.parse_args(argv)
+    if options.gate:
+        defaults = parser.parse_args([])
+        changed = [
+            name for name in ("seed", "count", "files", "stop_reason", "whole_file", "max_unit_lines")
+            if getattr(options, name) != getattr(defaults, name)
+        ]
+        if changed:
+            option = changed[0].replace("_", "-")
+            parser.error(f"--gate fixes the seed, the count and the selection; it takes no --{option}")
+        options.count = GATE_COUNT
+    if options.count < 1:
+        parser.error("--count must be at least 1")
+    return options
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    return run(parse_arguments(argv))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

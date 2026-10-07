@@ -1,0 +1,254 @@
+-- Classifies source texts against the parity rule between the tree path and
+-- the existing parser, for `scripts/discovery-fuzz`.
+--
+-- Usage: discovery_fuzz_runner.brp <file listing one source path per line>
+--
+-- Each listed file is parsed by the existing parser (with its interpolation
+-- holes parsed, as `scripts/compiler-new-parity` does) and read by the tree
+-- path (`assemble_module`), then compared by the rule:
+--
+--   * the tree path never accepts what the existing parser rejects;
+--   * for a source both accept, the projected programs are equal, compared
+--     by `discovery_adapter_differential.compare_tree_module`;
+--   * for a source the existing parser rejects, the tree path may reject or
+--     decline; diagnostic text is not compared.
+--
+-- It prints three protocol lines per source, to stderr, which the runtime does
+-- not buffer: a source that crashes or hangs a parser leaves its `begin` line
+-- (and its `old` line, once the existing parser has finished) behind, which
+-- tells the caller which source and which parser.
+--
+--   fuzz-begin <path>
+--   fuzz-old <path> | <accepted|rejected>
+--   fuzz-result <path> | <verdict> | <detail>
+--
+-- The verdict labels are `fuzz_verdict_fields`'s; the detail is one line.
+-- The tree path reads each source with a fresh name table, so a verdict never
+-- depends on which sources ran before it.
+import:
+	../../../src/compiler/stage_02_lex/name_table: SYNTHESIZED_NAME_TABLE
+	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../src/compiler/stage_03_parse/parsed_ast: ParsedProgram
+	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../src/compiler_new/stage_01_discovery/parse/tree_module_assembly:
+		ModuleAssembly(AssembledModule, RejectedModule, UnassembledModule),
+		UnassembledReason(
+			FunctionBodyNotRead, TraitBodiesNotRead, ImplementationBodiesNotRead,
+			GlobalInitializerNotRead, GlobalInitializerRejected, DeclarationRejected,
+			DeclarationMadeNoProgress,
+		),
+		assemble_module,
+	../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../src/lib/source: source_file
+	discovery_adapter_comparison: JsonDifference, with_holes_parsed
+	discovery_adapter_differential:
+		TreeModuleComparison(
+			TreeModuleCompared, TreeModuleRejected, TreeModuleUnassembled, TreeModuleSkipped,
+			TreeModuleError,
+		),
+		compare_tree_module,
+	system: read_file
+
+
+ROOT_MODULE_NAME: String = "main"
+
+LISTING_ARGUMENT: Int = 1
+
+EXIT_USAGE: Int = 2
+
+---
+How many differing fields a `ast-mismatch` result names; the first is the one
+that tells the story and the rest are the same difference repeated.
+---
+MAX_REPORTED_DIFFERENCES: Int = 3
+
+DIFFERENCE_SEPARATOR: String = " ;; "
+
+
+-- One source's outcome: the existing parser's verdict joined with the tree path's.
+union FuzzVerdict:
+	-- The existing parser accepted the source.
+	SameProgram
+	ProgramsDiffer(List[JsonDifference])
+	TreeDeclinedAccepted(UnassembledReason)
+	TreeRejectedAccepted(String)
+	TreeFailedAccepted(String)
+	-- The existing parser rejected the source.
+	BothRejected
+	TreeDeclinedRejected(UnassembledReason)
+	TreeAcceptedRejected
+	TreeRefusedRejected
+
+
+pure func decline_label(reason: UnassembledReason) -> String:
+	match reason:
+		FunctionBodyNotRead(_):
+			"function-body-not-read"
+		TraitBodiesNotRead(_):
+			"trait-bodies-not-read"
+		ImplementationBodiesNotRead(_):
+			"implementation-bodies-not-read"
+		GlobalInitializerNotRead(_):
+			"global-initializer-not-read"
+		GlobalInitializerRejected(_):
+			"global-initializer-rejected"
+		DeclarationRejected:
+			"declaration-rejected"
+		DeclarationMadeNoProgress:
+			"declaration-made-no-progress"
+
+
+---
+The label and detail of a verdict, as printed. `scripts/discovery-fuzz` reads
+the labels, so a label names one row of its classification table.
+---
+pure func fuzz_verdict_fields(verdict: FuzzVerdict) -> (String, String):
+	match verdict:
+		SameProgram:
+			("agree", "")
+		ProgramsDiffer(differences):
+			("ast-mismatch", difference_detail(differences))
+		TreeDeclinedAccepted(reason):
+			("safe-stop", decline_label(reason))
+		TreeRejectedAccepted(what):
+			("wrong-reject", what)
+		TreeFailedAccepted(message):
+			("tree-error", one_line(message))
+		BothRejected:
+			("both-rejected", "")
+		TreeDeclinedRejected(reason):
+			("reject-declined", decline_label(reason))
+		TreeAcceptedRejected:
+			("wrong-accept", "")
+		TreeRefusedRejected:
+			("tree-error", "the lexed source cannot initialize the parse state")
+
+
+pure func one_line(text: String) -> String:
+	text.replace("\n", "\\n")
+
+
+pure func difference_detail(differences: List[JsonDifference]) -> String:
+	differences
+		.take(MAX_REPORTED_DIFFERENCES)
+		.map(
+			pure func(
+				difference,
+			): one_line(
+				"${difference.declaration} ${difference.path} old=${difference.old_text} new=${difference.new_text}",
+			),
+		)
+		.join(DIFFERENCE_SEPARATOR)
+
+
+---
+A module the tree path stopped reading, whose source the existing parser
+accepted. Stopping at a declaration the tree path rejected is a rejection of
+accepted code, not a safe stop: it raised a diagnostic. Every other stop only
+declines.
+---
+pure func unassembled_verdict(reason: UnassembledReason) -> FuzzVerdict:
+	match reason:
+		GlobalInitializerRejected(_):
+			TreeRejectedAccepted(decline_label(reason))
+		DeclarationRejected:
+			TreeRejectedAccepted(decline_label(reason))
+		_:
+			TreeDeclinedAccepted(reason)
+
+
+---
+The tree path's verdict on a source the existing parser accepted, which is
+the whole-module comparison of the parity gate.
+---
+pure func accepted_verdict(program: ParsedProgram) -> FuzzVerdict:
+	match compare_tree_module(program, 0, SYNTHESIZED_NAME_TABLE):
+		TreeModuleCompared(_, differences):
+			if differences.is_empty():
+				SameProgram
+			else:
+				ProgramsDiffer(differences)
+		TreeModuleRejected(count):
+			TreeRejectedAccepted("${count} diagnostics")
+		TreeModuleUnassembled(reason):
+			unassembled_verdict(reason)
+		TreeModuleSkipped(reason):
+			TreeFailedAccepted("skipped: ${reason}")
+		TreeModuleError(_, message):
+			TreeFailedAccepted(message)
+
+
+---
+The tree path's verdict on a source the existing parser rejected: reading it
+in full is wrong. A stop at a declaration the tree path itself rejected is a
+rejection (it raised a diagnostic, as `unassembled_verdict` counts it for an
+accepted source); every other stop declines, and nothing is checked.
+---
+pure func rejected_verdict(text: String) -> FuzzVerdict:
+	match assemble_module(lex_module(module_id_at_row(0), text)):
+		Err(_):
+			TreeRefusedRejected
+		Ok(AssembledModule(_)):
+			TreeAcceptedRejected
+		Ok(RejectedModule(_)):
+			BothRejected
+		Ok(UnassembledModule(GlobalInitializerRejected(_))):
+			BothRejected
+		Ok(UnassembledModule(DeclarationRejected)):
+			BothRejected
+		Ok(UnassembledModule(reason)):
+			TreeDeclinedRejected(reason)
+
+
+---
+The existing parser's program for a source, as the parity gate takes its
+verdict: parse, then finalize the interpolation holes, which can reject a
+source the raw parse accepts.
+---
+pure func existing_program(path: String, text: String) -> ParsedProgram:
+	with_holes_parsed(parse_compiler_source(source_file(path, ROOT_MODULE_NAME, text)))
+
+
+---
+The tree path's verdict on `text`, given the existing parser's program for it.
+---
+pure func source_verdict(existing: ParsedProgram, text: String) -> FuzzVerdict:
+	if existing.diagnostics.is_empty():
+		accepted_verdict(existing)
+	else:
+		rejected_verdict(text)
+
+
+func classify_source(path: String, text: String) -> Void:
+	print_error("fuzz-begin ${path}")
+
+	existing: ParsedProgram = existing_program(path, text)
+
+	old_label: String = if existing.diagnostics.is_empty():
+		"accepted"
+	else:
+		"rejected"
+
+	print_error("fuzz-old ${path} | ${old_label}")
+
+	(label, detail) = fuzz_verdict_fields(source_verdict(existing, text))
+	print_error("fuzz-result ${path} | ${label} | ${detail}")
+
+
+func main(args: List[String]) -> Int:
+	match read_file(args.get_or(LISTING_ARGUMENT, "")):
+		Err(_):
+			print_error("usage: discovery_fuzz_runner.brp <file listing one source path per line>")
+			EXIT_USAGE
+		Ok(listing):
+			for path in listing.split("\n"):
+				if path.is_empty():
+					continue
+
+				match read_file(path):
+					Err(_):
+						print_error("fuzz-result ${path} | tool-error | unreadable source")
+					Ok(text):
+						classify_source(path, text)
+
+			0

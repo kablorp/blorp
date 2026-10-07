@@ -782,6 +782,15 @@ class TargetedRunTest(unittest.TestCase):
 			call()
 		return str(raised.exception.code)
 
+	def test_first_stop_locations_give_each_modules_line(self) -> None:
+		text = "stop-reason a.brp | function | with-block | 12 | first\nstop-reason a.brp | function | with-block | 30 | later\n"
+		self.assertEqual(parity.first_stop_locations(text, "with-block"), [("a.brp", 12)])
+
+	def test_a_census_line_without_a_line_number_is_an_exit_not_a_crash(self) -> None:
+		text = "stop-reason a.brp | function | with-block | x | first\n"
+		message = self.exit_message(lambda: parity.first_stop_locations(text, "with-block"))
+		self.assertIn("malformed stop-reason line", message)
+
 	def test_a_stop_reason_selects_the_modules_whose_first_stop_had_it(self) -> None:
 		self.assertEqual(
 			parity.first_stop_modules(self.CENSUS, "multiline-call-arguments"), ["a.brp", "b.brp"]
