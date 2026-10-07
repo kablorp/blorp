@@ -35,7 +35,7 @@ import:
 	ir:
 		CoreBinderOrigin(AuthoredBinder),
 		CoreCallKind(UserCall),
-		CoreDecl(FunctionDecl, GlobalDecl),
+		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl),
 		CoreExpr(
 			AccessorLiteralMatchExpr, AssignExpr, BorrowLetExpr, BoxExpr, CallExpr, CastExpr,
 			ConstructorMatchExpr, DropExpr, DupExpr, IfExpr, LengthMatchExpr, LetExpr,
@@ -57,6 +57,8 @@ import:
 		CoreType(HeapRecordType, InlineRecordType),
 		CoreVar,
 		core_field_ordinal,
+		core_field_ref_id,
+		core_field_ref_is_resolved,
 		core_field_ordinals_equal,
 		core_function_declared_origin,
 		core_var_equal,
@@ -99,7 +101,8 @@ last-use walk does not track it.
 private record ConsumeSpecializeState {
 	candidates: CloneCandidateCatalog,
 	used_clone_keys: UsedCloneKeyIndex,
-	owned_record_types: Set[String]
+	owned_record_types: Set[String],
+	record_field_ordinals: Dict[Int, CoreFieldOrdinal]
 }
 
 
@@ -249,6 +252,7 @@ private pure func discover_clone_candidates(
 
 private pure func state_from_discovery(
 	discovery: CloneCandidateDiscoveryState,
+	decls: List[CoreDecl],
 ) -> ConsumeSpecializeState:
 	var record_types: Set[String] = Sets.set()
 
@@ -259,10 +263,23 @@ private pure func state_from_discovery(
 			_:
 				void
 
+	-- Sparse authored replacements refer to declaration identities, not their
+	-- position in the evaluation list. This derived index owns no new facts.
+	var record_field_ordinals: Dict[Int, CoreFieldOrdinal] = {}
+	for decl in decls:
+		match decl:
+			HeapRecordDecl(record_decl):
+				for (index, field) in record_decl.fields.enumerate():
+					if core_field_ref_is_resolved(field.ref):
+						record_field_ordinals = record_field_ordinals.set(core_field_ref_id(field.ref), core_field_ordinal(index))
+			_:
+				void
+
 	{
 		candidates = discovery.candidates,
 		used_clone_keys = empty_used_clone_key_index(),
-		owned_record_types = record_types
+		owned_record_types = record_types,
+		record_field_ordinals = record_field_ordinals
 	}
 
 
@@ -1213,14 +1230,13 @@ private pure func rewrite_record_update_replacements(
 			var changed: Bool = False
 			var rewritten_fields: List[CoreRecordFieldValue] = []
 
-			-- An update lists every field in declaration order (lowering builds
-			-- it from the record row), so a field's position is its ordinal.
-			for (index, field) in fields.enumerate():
-				field_walk: LastUseWalk = { outer | replacing = Some({
-						base = base,
-						bound = bound,
-						ordinal = core_field_ordinal(index),
-					}) }
+			for field in fields:
+				ordinal: Option[CoreFieldOrdinal] = match (typ, core_field_ref_is_resolved(field.ref)):
+					(HeapRecordType(_), True):
+						walk.state.record_field_ordinals.get(core_field_ref_id(field.ref))
+					_:
+						None
+				field_walk: LastUseWalk = { outer | replacing = ordinal.map(func(slot): { base = base, bound = bound, ordinal = slot }) }
 				rewritten: CoreExpr = rewrite_last_use(field_walk, field.value)
 				changed = changed or not same_object(rewritten, field.value)
 				rewritten_fields = rewritten_fields.append({ field | value = rewritten })
@@ -1987,7 +2003,7 @@ pure func rewrite_program(program: CoreProgram, next_def_id: Int) -> ConsumeSpec
 			next_def_id = discovery.next_def_id
 		}
 	else:
-		var state: ConsumeSpecializeState = state_from_discovery(discovery)
+		var state: ConsumeSpecializeState = state_from_discovery(discovery, program.decls)
 		var rewritten_decls: List[CoreDecl] = []
 		var calls_by_decl: List[List[Int]] = []
 		var program_calls: List[Int] = []

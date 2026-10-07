@@ -2936,6 +2936,88 @@ pure func test_keeps_hoisted_retain_across_cancellation_checkpoint() -> Bool:
 	keeps_arc_retain(first_dup_policy(rewritten))
 
 
+pure func list_intrinsic_prefix(name: String, args: List[CoreExpr], typ: CoreType) -> CoreExpr:
+	CallExpr(
+		IntrinsicCall(name),
+		VoidExpr(VoidType, synthetic_core_source_loc()),
+		args,
+		typ,
+		synthetic_core_source_loc(),
+	)
+
+
+pure func hoisted_items_across_prefix(prefix: CoreExpr) -> Option[CoreRetainPolicy]:
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		hoisted_items_binding(SeqExpr(prefix, hoisted_items_cow_update(state_var_expr()))),
+	)
+	first_dup_policy(rewritten)
+
+
+pure func test_takes_hoisted_field_across_non_cancelling_append_prefix() -> Bool:
+	unrelated: CoreExpr = VarExpr(named_var("other_items"), list_int_type(), synthetic_core_source_loc())
+	length_read: CoreExpr = list_intrinsic_prefix("list_len", [unrelated], int_type())
+	capacity_growth: CoreExpr = list_intrinsic_prefix("list_ensure_capacity", [unrelated, int_expr(4)], list_int_type())
+	length_write: CoreExpr = list_intrinsic_prefix("list_set_len", [unrelated, int_expr(2)], VoidType)
+	retained: CoreExpr = ListRetainExpr({ list = unrelated, value = pointer_box(unrelated) }, VoidType, synthetic_core_source_loc())
+	stored: CoreExpr = ListSetExpr({
+		layout = PointerListStorage,
+		list = unrelated,
+		index = int_expr(1),
+		value = pointer_box(unrelated),
+		value_is_stack_result = False
+	}, VoidType, synthetic_core_source_loc())
+	append_prefix: CoreExpr = SeqExpr(length_read, SeqExpr(capacity_growth, SeqExpr(retained, SeqExpr(stored, length_write))))
+	row: CoreExpr = RecordExpr([
+		{ name = "items", ref = test_field_ref("items"), value = RecordExpr([
+			{ name = "items", ref = test_field_ref("items"), value = unrelated }
+		], state_type(), synthetic_core_source_loc()) }
+	], state_type(), synthetic_core_source_loc())
+	row_append_prefix: CoreExpr = LetExpr(named_var("row"), False, state_type(), row, append_prefix)
+	(
+		takes_items_from_state(hoisted_items_across_prefix(length_read))
+		and takes_items_from_state(hoisted_items_across_prefix(capacity_growth))
+		and takes_items_from_state(hoisted_items_across_prefix(length_write))
+		and takes_items_from_state(hoisted_items_across_prefix(append_prefix))
+		and takes_items_from_state(hoisted_items_across_prefix(row_append_prefix))
+	)
+
+
+pure func test_keeps_hoisted_retain_when_prefix_operands_touch_owners_or_exit() -> Bool:
+	reads_source_slot: CoreExpr = list_intrinsic_prefix("list_len", [state_field_read("items", list_int_type())], int_type())
+	reads_alias: CoreExpr = list_intrinsic_prefix("list_len", [hoisted_items_var_expr()], int_type())
+	exits: CoreExpr = list_intrinsic_prefix("list_len", [BreakExpr(VoidType, synthetic_core_source_loc())], int_type())
+	unsupported: CoreExpr = list_intrinsic_prefix("channel_send", [], VoidType)
+	wrong_length_arity: CoreExpr = list_intrinsic_prefix("list_len", [], int_type())
+	record_exits: CoreExpr = RecordExpr([
+		{ name = "items", ref = test_field_ref("items"), value = BreakExpr(VoidType, synthetic_core_source_loc()) }
+	], state_type(), synthetic_core_source_loc())
+	record_reads_source: CoreExpr = RecordExpr([
+		{ name = "items", ref = test_field_ref("items"), value = state_field_read("items", list_int_type()) }
+	], state_type(), synthetic_core_source_loc())
+	retains_alias: CoreExpr = ListRetainExpr({
+		list = state_field_read("items", list_int_type()),
+		value = pointer_box(hoisted_items_var_expr())
+	}, VoidType, synthetic_core_source_loc())
+	store_exits: CoreExpr = ListSetExpr({
+		layout = PointerListStorage,
+		list = typed_var_expr(named_var("other_items"), list_int_type()),
+		index = BreakExpr(VoidType, synthetic_core_source_loc()),
+		value = pointer_box(typed_var_expr(named_var("other_value"), list_int_type())),
+		value_is_stack_result = False
+	}, VoidType, synthetic_core_source_loc())
+	(
+		keeps_arc_retain(hoisted_items_across_prefix(reads_source_slot))
+		and keeps_arc_retain(hoisted_items_across_prefix(reads_alias))
+		and keeps_arc_retain(hoisted_items_across_prefix(exits))
+		and keeps_arc_retain(hoisted_items_across_prefix(unsupported))
+		and keeps_arc_retain(hoisted_items_across_prefix(wrong_length_arity))
+		and keeps_arc_retain(hoisted_items_across_prefix(record_exits))
+		and keeps_arc_retain(hoisted_items_across_prefix(record_reads_source))
+		and keeps_arc_retain(hoisted_items_across_prefix(retains_alias))
+		and keeps_arc_retain(hoisted_items_across_prefix(store_exits))
+	)
+
+
 pure func test_keeps_hoisted_retain_across_call_prefix() -> Bool:
 	call: CoreExpr = CallExpr(
 		UnknownCall,
@@ -3426,6 +3508,14 @@ tests: TestSuite = {
 		(
 			"keeps hoisted retain across cancellation checkpoint",
 			test_keeps_hoisted_retain_across_cancellation_checkpoint,
+		),
+		(
+			"takes hoisted field across non-cancelling append prefix",
+			test_takes_hoisted_field_across_non_cancelling_append_prefix,
+		),
+		(
+			"keeps hoisted retain when prefix operands touch owners or exit",
+			test_keeps_hoisted_retain_when_prefix_operands_touch_owners_or_exit,
 		),
 		(
 			"keeps hoisted retain across call prefix",

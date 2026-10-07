@@ -253,8 +253,9 @@ and the later sort only moves constants and reads of the bound variables.
 
 ### Fieldwise Record Updates
 
-A record update evaluates every replacement exactly once, in Core field order,
-before consuming or mutating the source record. This ordering applies even when
+A record update evaluates its base once, then every replacement exactly once
+in source written order, before consuming or mutating the source record. This
+ordering applies even when
 replacement expressions are impure, read the source, swap fields, or produce
 managed owning temporaries. No generated field write may occur while a later
 replacement can still observe the pre-update source.
@@ -287,9 +288,13 @@ fresh record.
 Field release must honor `NoReleasePolicy`, `ArcReleasePolicy`,
 `ArcReleaseOnlyPolicy`, and `StackResultReleasePolicy`; managed does not imply
 ordinary `blorp_release`. Before ownership lowering, `RecordUpdateExpr` contains
-every declared field exactly once in declaration order. Its ownership-refined
-form must distinguish inherited fields from replacements explicitly rather than
-recovering that distinction from expression shape or field names.
+only authored replacements in written order, identified by checked declaration
+field refs. Omitted fields inherit implicitly; an explicit `field = base.field`
+is still a replacement. At the ownership boundary, declaration rows supply
+untouched slots and release policies. Complete reuse/COW rows remain in
+declaration storage order. Already ordered replacements stay direct; reordered
+replacements and nested update layers bind their values in written order before
+Perceus, so ownership and emission see the same evaluation order.
 
 A replacement that consumes the field it replaces, such as
 `items = s.items.append(x)`, reads the field through Perceus's owned-alias
@@ -307,9 +312,13 @@ or ownership event on the source disqualifies.
 The owned alias may appear directly inside the replacement or in one preceding
 immutable binding whose value transfers exactly once as the matching field's
 bare replacement. The latter proof follows only explicit `LetExpr`,
-`BorrowLetExpr`, and `SeqExpr` fall-through frames. It does not cross a call,
-cooperative checkpoint, conditional, loop, logical short-circuit, lambda, or
-nested field path, and it rejects any same-slot or whole-source observation
+`BorrowLetExpr`, and `SeqExpr` fall-through frames. It may cross only the
+non-cancelling `list_len`, `list_ensure_capacity`, and `list_set_len` intrinsics,
+plus logical record construction and prepared list retain and raw store operations.
+Their field values and operands must also
+fall through without observing the taken slot, whole source, or alias.
+It does not cross other calls, a cooperative checkpoint, conditional, loop,
+logical short-circuit, lambda, or nested field path, and it rejects any same-slot or whole-source observation
 before writeback.
 
 A record field is updated through its own update the same way, at any

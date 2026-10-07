@@ -130,7 +130,6 @@ import:
 			ResolvedUnindexedSelectedTraitMethodCall, ResolvedUnresolvedTraitMethodCall,
 		),
 		ResolvedGraphCallableCategory(ResolvedForeignFunctionCall, ResolvedSourceFunctionCall),
-		ResolvedRecordField,
 		TypedConcurrentBinding,
 		TypedConcurrentBlockOptions,
 		TypedConcurrentForOptions,
@@ -2348,50 +2347,10 @@ private pure func core_field_ref_from_resolved(identity: ResolvedFieldIdentity) 
 	core_field_ref(resolved_field_identity_runtime_value(identity))
 
 
-private pure func lower_record_update_field(
-	context: CoreLowerContext,
-	field: ResolvedRecordField,
-	updates: List[CoreRecordFieldValue],
-	base_ref: CoreExpr,
-	loc: CoreSourceLoc,
-) -> Result[CoreRecordFieldValue, CoreLowerError]:
-	match updates.find(func(update): update.name == field.name):
-		Some(update):
-			Ok(update)
-		None:
-			field_type ?= core_lower_type_with_projection(core_lower_type_projection(context), field.field_type)
-			ordinal ?= selected_record_field_ordinal(context, field.field_id)
-			Ok({
-				name = field.name,
-				ref = core_field_ref_from_resolved(field.field_id),
-				value = ProductFieldExpr(base_ref, ordinal, field_type, loc),
-			})
-
-
--- Known deviation (CF-012): replacements land in declared order here, so an
--- update runs them in declaration order, not in the written order a record
--- literal follows. Ownership stays consistent because Perceus sees this order.
-private pure func lower_record_update_fields(
-	context: CoreLowerContext,
-	record_fields: List[ResolvedRecordField],
-	updates: List[CoreRecordFieldValue],
-	base_ref: CoreExpr,
-	loc: CoreSourceLoc,
-) -> Result[List[CoreRecordFieldValue], CoreLowerError]:
-	match record_fields:
-		[]:
-			Ok([])
-		[field, ...rest]:
-			lowered ?= lower_record_update_field(context, field, updates, base_ref, loc)
-			lowered_rest ?= lower_record_update_fields(context, rest, updates, base_ref, loc)
-			Ok([lowered].concat(lowered_rest))
-
-
 private pure func lower_typed_record_update(
 	context: CoreLowerContext,
 	receiver: TypedExpr,
 	updates: List[TypedRecordField],
-	record_fields: List[ResolvedRecordField],
 	span: SourceLocation,
 	typ: CoreType,
 	loc: CoreSourceLoc,
@@ -2408,13 +2367,6 @@ private pure func lower_typed_record_update(
 			temp_name = "__record_update_" + source_location_start_offset(span).to_string()
 			temp_var: CoreVar = { core_var(temp_name, None) | id = core_binder_id(span) }
 			base_ref = VarExpr(temp_var, typ, loc)
-			fields ?= lower_record_update_fields(
-				context,
-				record_fields,
-				lowered_updates,
-				base_ref,
-				loc,
-			)
 
 			Ok(
 				LetExpr(
@@ -2422,7 +2374,7 @@ private pure func lower_typed_record_update(
 					False,
 					typ,
 					lowered_receiver,
-					RecordUpdateExpr(base_ref, fields, typ, loc),
+					RecordUpdateExpr(base_ref, lowered_updates, typ, loc),
 				),
 			)
 
@@ -5543,7 +5495,7 @@ private pure func lower_typed_expr_as_type_impl(
 			lowered_fields ?= lower_typed_record_fields(context, fields)
 			Ok(RecordExpr(lowered_fields, typ, loc))
 		TypedRecordUpdateExpr(receiver, updates, record_fields, span, _):
-			lower_typed_record_update(context, receiver, updates, record_fields, span, typ, loc)
+			lower_typed_record_update(context, receiver, updates, span, typ, loc)
 		TypedIfExpr(condition, then_branch, else_branch, _, _):
 			lowered_condition ?= lower_typed_expr_with_context(context, condition)
 			lowered_then ?= lower_typed_expr_with_context(context, then_branch)

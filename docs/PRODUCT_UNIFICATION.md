@@ -453,9 +453,12 @@ record CoreRecordCowField {
 
 Several states here are representable but wrong:
 
-- A `RecordUpdateExpr` lists every field. An inherited field is spelled
-  `ProductFieldExpr(base, ...)` and has to match the base, and `record_update.brp`
-  carries an `InvalidStagedField` case for when it does not.
+- Pre-ownership `RecordUpdateExpr` now lists only authored replacements in
+  written order, using the existing checked field identities. Inheritance is
+  implicit. Ownership lowering joins declaration rows to produce complete
+  reuse/COW storage rows; it no longer guesses inheritance from expression
+  shape. The copied `CoreRecordCowField.field` metadata remains a separate
+  cleanup opportunity.
 - One list order means both evaluation order and storage order, and `prepare`
   reorders it after Perceus. That was a use-after-free on `main`. The
   `record_literal_order` pass fixed it under the rule this plan adopts, fields
@@ -463,15 +466,14 @@ Several states here are representable but wrong:
   an out-of-order literal's field values to variables before Perceus. It
   adds 0.59% to the self-compile's allocations and 0.22% to its retired
   instructions (`benchmarks/results/record_literal_order_pass_2026-10-06.md`);
-  the construction form here replaces it. Record updates do not follow the rule
-  yet (CF-012): `lower_record_update_fields` places each replacement in its
-  declared slot, so `{ base | second = noisy("second"), first =
-  noisy("first") }` runs `first` before `second`. Ownership is consistent,
-  because Perceus sees the order the emitter runs; only side effects run out
-  of written order. Staging the replacements in lowering would put bindings
-  between the `__record_update` binding and the `RecordUpdateExpr`, which
-  `record_update_chain` does not recognise, losing in-place updates; this
-  construction form carries both orders and is the place to fix it.
+  the construction form here replaces it. Updates now follow written order
+  independently of the construction migration: sparse replacements remain
+  attached directly to their base carrier until `record_update_ownership`.
+  That pass preserves direct evaluation when checked declaration positions
+  already increase, otherwise stages replacement values in written order.
+  Nested layers stage before the final owner transfer, keeping superseded
+  side effects and in-place reuse. The runtime regression is
+  `blorp/test/test_runtime/test_types/test_record_update_field_order.brp`.
 - `prepare_tuple_expr` can fail to classify a tuple and fall back to a
   `TupleExpr` that reaches the backend.
 - `retain_mask` is a second ownership mechanism. `prepare` sets it after

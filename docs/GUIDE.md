@@ -1189,6 +1189,11 @@ written, whatever the declaration order is, and each value is stored in its
 declared field. `{count = names.length(), names = names.append("x")}` reads the
 length before the append, even when `names` is declared first.
 
+A record update evaluates its base once, then its replacement expressions in
+written order. The update evaluates all replacements before writing any field;
+omitted fields keep their original values. This applies to both
+`record` and `fixed record`, including updates that reuse unique storage.
+
 Each field name appears once in a declaration, a record literal and a record update:
 `record P { x: Int, x: Int }` and `{ x = 1, x = 2 }` are rejected at the second `x`, and
 the message gives the position of the first.

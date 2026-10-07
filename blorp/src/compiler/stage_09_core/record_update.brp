@@ -22,17 +22,17 @@ import:
 			ConstructorMatchFallbackBindings, ConstructorMatchFallbackBody,
 			ConstructorMatchFallbackFail,
 		),
-		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl),
+		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, InlineRecordDecl, ImplDecl),
 		CoreExpr(
 			AssignExpr, BorrowLetExpr, ClosureCreateExpr, ConstructorMatchExpr, IfExpr,
 			LambdaExpr, LetExpr, LogicalExpr, ProductFieldExpr, RecordExpr, RecordCowUpdateExpr,
 			RecordReuseExpr, RecordUpdateExpr, SeqExpr, VarExpr, LiteralMatchExpr,
 		),
-		CoreFieldOrdinal,
+		CoreFieldRef,
 		CoreFunction,
 		CoreFunctionOrigin(ConsumingClone),
 		CoreHeapRecordDecl,
-		CoreHeapRecordField,
+		CoreInlineRecordDecl,
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(
 			LiteralMatchFallbackBindings, LiteralMatchFallbackBody, LiteralMatchFallbackFail,
@@ -59,6 +59,48 @@ import:
 
 
 private COMPILER_LOCAL_PREFIX: String = "$blorp$record_update$"
+
+
+-- A derived index references the authoritative declaration rows. Inline
+-- records participate in materialization, but never in ARC/COW eligibility.
+private union RecordUpdateDeclaration:
+	ManagedUpdateDeclaration(CoreHeapRecordDecl)
+	InlineUpdateDeclaration(CoreInlineRecordDecl)
+
+
+private fixed union RecordReplacementEvaluation:
+	DirectRecordReplacements
+	StagedRecordReplacements
+
+
+-- Direct storage is also the authored evaluation order exactly when the
+-- checked declaration positions are increasing. Nested layers always stage.
+private pure func record_replacement_evaluation(
+	declared_refs: List[CoreFieldRef],
+	replacements: List[CoreRecordFieldValue],
+) -> RecordReplacementEvaluation:
+	var previous: Option[Int] = None
+	var ordered: Bool = True
+	for replacement in replacements:
+		match declared_refs.enumerate().find(
+			func(entry):
+				(index, ref) = entry
+				core_field_refs_equal(ref, replacement.ref)
+		):
+			Some((index, _)):
+				match previous:
+					Some(prior):
+						ordered = ordered and prior < index
+					None:
+						void
+				previous = Some(index)
+			None:
+				ordered = False
+
+	if ordered:
+		DirectRecordReplacements
+	else:
+		StagedRecordReplacements
 
 
 record RecordUpdateLayer {
@@ -89,19 +131,6 @@ record StagedRecordLayer {
 	evaluations: List[RecordFieldEvaluation],
 	fields: List[CoreRecordCowField]
 }
-
-
-record RecordCowFieldPlan {
-	fields: List[CoreRecordCowField],
-	replacement_count: Int
-}
-
-
-private union StagedFieldResolution:
-	InheritedStagedField
-	CarriedReplacementStagedField(CoreExpr)
-	ReplacementStagedField(CoreExpr)
-	InvalidStagedField
 
 
 private union RecordUpdateLogicalTask:
@@ -140,33 +169,11 @@ private pure func replace_var(expr: CoreExpr, source: CoreVar, replacement: Core
 					mapped
 
 
-private pure func expr_assigns_var(expr: CoreExpr, target: CoreVar) -> Bool:
-	match expr:
-		AssignExpr(variable, _, _, _):
-			if core_var_equal(variable, target):
-				True
-			else:
-				CoreTraverse
-					.immediate_core_expr_children(expr)
-					.any(func(child): expr_assigns_var(child, target))
-		SeqExpr(_, _):
-			spine = CoreTraverse.split_core_sequence(expr)
-
-			(
-				spine.preceding_items.any(func(item): expr_assigns_var(item, target))
-				or expr_assigns_var(spine.final_item, target)
-			)
-		_:
-			CoreTraverse
-				.immediate_core_expr_children(expr)
-				.any(func(child): expr_assigns_var(child, target))
-
-
 private pure func record_fields_assign_var(
 	fields: List[CoreRecordFieldValue],
 	target: CoreVar,
 ) -> Bool:
-	fields.any(func(field): expr_assigns_var(field.value, target))
+	fields.any(func(field): CoreTraverse.core_expr_assigns_var(field.value, target))
 
 
 private pure func expr_touches_var(expr: CoreExpr, target: CoreVar) -> Bool:
@@ -219,15 +226,17 @@ private pure func expr_reads_target_fields_only(expr: CoreExpr, target: CoreVar)
 				.all(func(child): expr_reads_target_fields_only(child, target))
 
 
-private pure func declared_heap_record_decls(
+private pure func record_update_declarations(
 	decls: List[CoreDecl],
-) -> Dict[String, CoreHeapRecordDecl]:
-	var records: Dict[String, CoreHeapRecordDecl] = {}
+) -> Dict[String, RecordUpdateDeclaration]:
+	var records: Dict[String, RecordUpdateDeclaration] = {}
 
 	for decl in decls:
 		match decl:
 			HeapRecordDecl(record_decl):
-				records = records.set(record_decl.name, record_decl)
+				records = records.set(record_decl.name, ManagedUpdateDeclaration(record_decl))
+			InlineRecordDecl(record_decl):
+				records = records.set(record_decl.name, InlineUpdateDeclaration(record_decl))
 			_:
 				void
 
@@ -235,107 +244,25 @@ private pure func declared_heap_record_decls(
 
 
 private pure func declared_heap_record_type(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	typ: CoreType,
 ) -> Bool:
-	match typ:
-		HeapRecordType(name):
-			record_decls.contains(name)
-		_:
-			False
+	heap_record_decl_for_type(record_decls, typ).is_some()
 
 
 private pure func heap_record_decl_for_type(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	typ: CoreType,
 ) -> Option[CoreHeapRecordDecl]:
 	match typ:
 		HeapRecordType(name):
-			record_decls.get(name)
+			match record_decls.get(name):
+				Some(ManagedUpdateDeclaration(declaration)):
+					Some(declaration)
+				_:
+					None
 		_:
 			None
-
-
-private pure func record_cow_field_plan(
-	record_decl: CoreHeapRecordDecl,
-	base: CoreVar,
-	base_type: CoreType,
-	original_fields: List[CoreRecordFieldValue],
-	prepared_fields: List[CoreRecordFieldValue],
-) -> Option[RecordCowFieldPlan]:
-	if (
-		original_fields.length() != record_decl.fields.length()
-		or prepared_fields.length() != record_decl.fields.length()
-	):
-		None
-	else:
-		var cow_fields: List[CoreRecordCowField] = []
-		var replacement_count: Int = 0
-		var valid: Bool = True
-		var index: Int = 0
-
-		while valid and index < record_decl.fields.length():
-			match (
-				record_decl.fields.get(index),
-				original_fields.get(index),
-				prepared_fields.get(index),
-			):
-				(Some(field), Some(original), Some(prepared)):
-					ordinal: CoreFieldOrdinal = core_field_ordinal(index)
-
-					if (
-						not core_field_refs_equal(field.ref, original.ref)
-						or not core_field_refs_equal(field.ref, prepared.ref)
-					):
-						valid = False
-					else if (
-						not core_type_equal(core_expr_type(original.value), field.typ)
-						or not core_type_equal(core_expr_type(prepared.value), field.typ)
-					):
-						valid = False
-					else if (
-						record_field_references_itself(original, ordinal, base)
-						and not inherited_record_field(original, ordinal, base, base_type, field)
-					):
-						valid = False
-					else if inherited_record_field(original, ordinal, base, base_type, field):
-						cow_fields = cow_fields.append({
-							field = field,
-							replacement = None,
-						})
-					else:
-						replacement_count += 1
-						cow_fields = cow_fields.append({
-							field = field,
-							replacement = Some(prepared.value),
-						})
-				_:
-					valid = False
-
-			index += 1
-
-		if valid:
-			Some({
-				fields = cow_fields,
-				replacement_count = replacement_count,
-			})
-		else:
-			None
-
-
-private pure func prepared_record_reuse_expr(
-	source: CoreExpr,
-	complete_fields: List[CoreRecordFieldValue],
-	cow_plan: RecordCowFieldPlan,
-	typ: CoreType,
-	loc: CoreSourceLoc,
-) -> CoreExpr:
-	if cow_plan.replacement_count == 0:
-		source
-	else if cow_plan.replacement_count == cow_plan.fields.length():
-		RecordReuseExpr(source, complete_fields, typ, loc)
-	else:
-		RecordCowUpdateExpr(source, cow_plan.fields, typ, loc)
 
 
 private pure func complete_record_cow_fields(
@@ -388,27 +315,104 @@ private pure func prepared_nested_record_expr(
 		Some(RecordCowUpdateExpr(source, fields, typ, loc))
 
 
-private pure func materialize_record_update(expr: CoreExpr) -> CoreExpr:
+-- The carrier's checked type applies to every read of its bound variable.
+-- An invalid annotation must not acquire a trusted ownership form.
+private pure func record_base_annotations_agree(
+	expr: CoreExpr,
+	base: CoreVar,
+	base_type: CoreType,
+) -> Bool:
 	match expr:
-		RecordUpdateExpr(base, fields, typ, loc):
-			RecordExpr(fields, typ, loc)
+		VarExpr(variable, typ, _):
+			not core_var_equal(variable, base) or core_type_equal(typ, base_type)
+		_:
+			CoreTraverse.immediate_core_expr_children(expr).all(func(child): record_base_annotations_agree(child, base, base_type))
+
+
+private pure func materialize_record_update(
+	record_decls: Dict[String, RecordUpdateDeclaration],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		RecordUpdateExpr(VarExpr(base, base_type, base_loc), replacements, typ, loc):
+			base_expr: CoreExpr = VarExpr(base, base_type, base_loc)
+			declaration = core_product_of(typ).and_then(interim_product_record).and_then(
+				func(name): record_decls.get(name),
+			)
+			complete: Option[List[CoreRecordFieldValue]] = match declaration:
+				Some(ManagedUpdateDeclaration(record_decl)):
+					Some(record_decl.fields.enumerate().map(func(entry):
+						(index, field) = entry
+						{ name = field.name, ref = field.ref, value = ProductFieldExpr(base_expr, core_field_ordinal(index), field.typ, loc) }
+					))
+				Some(InlineUpdateDeclaration(record_decl)):
+					Some(record_decl.fields.enumerate().map(func(entry):
+						(index, field) = entry
+						{ name = field.name, ref = field.ref, value = ProductFieldExpr(base_expr, core_field_ordinal(index), field.typ, loc) }
+					))
+				None:
+					None
+
+			match complete:
+				Some(declared_fields):
+					evaluation: RecordReplacementEvaluation = record_replacement_evaluation(
+						declared_fields.map(func(field): field.ref), replacements,
+					)
+					var fields: List[CoreRecordFieldValue] = declared_fields
+					var evaluations: List[RecordFieldEvaluation] = []
+					var valid: Bool = True
+					var seen: List[CoreRecordFieldValue] = []
+
+					for replacement in replacements:
+						match declared_fields.enumerate().find(
+							func(entry):
+								(field_index, field) = entry
+								core_field_refs_equal(field.ref, replacement.ref)
+						):
+							Some((index, declared)):
+								if (
+									seen.any(func(field): core_field_refs_equal(field.ref, replacement.ref))
+									or not core_type_equal(core_expr_type(replacement.value), core_expr_type(declared.value))
+									or not record_base_annotations_agree(replacement.value, base, base_type)
+								):
+									valid = False
+									break
+								else:
+									match evaluation:
+										DirectRecordReplacements:
+											fields = fields.set(index, { declared | value = replacement.value })
+										StagedRecordReplacements:
+											variable = staged_field_variable(base, index)
+											field_type = core_expr_type(replacement.value)
+											evaluations = evaluations.append({ variable = variable, typ = field_type, rhs = replacement.value })
+											fields = fields.set(index, { declared | value = VarExpr(variable, field_type, loc) })
+									seen = seen.append(replacement)
+							None:
+								valid = False
+								break
+
+					if valid:
+						wrap_record_field_evaluations(evaluations, RecordExpr(fields, typ, loc))
+					else:
+						expr
+				None:
+					expr
 		_:
 			expr
 
 
 private pure func materialize_mapped_record_update(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	expr: CoreExpr,
 ) -> CoreExpr:
-	materialize_record_update(CoreTraverse.map_core_expr_children(
+	materialize_record_update(record_decls, CoreTraverse.map_core_expr_children(
 			expr,
 			func(child): prepare_record_update_expr(record_decls, child),
 		))
 
 
--- Updates run their replacements in declaration order (CF-012). Binding them
--- in written order ahead of the update would sit between the base binding and
--- the `RecordUpdateExpr` matched here and lose the in-place update.
+-- Sparse authored replacements preserve their written order without placing
+-- evaluation bindings between the base binding and its update carrier.
 private pure func record_update_chain(expr: CoreExpr) -> Option[RecordUpdateChain]:
 	match expr:
 		LetExpr(base, False, binding_type, initial, body):
@@ -473,7 +477,7 @@ private pure func record_update_chain(expr: CoreExpr) -> Option[RecordUpdateChai
 
 
 private pure func chain_uses_declared_heap_record(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	chain: RecordUpdateChain,
 ) -> Bool:
 	(
@@ -489,42 +493,6 @@ private pure func chain_uses_declared_heap_record(
 	)
 
 
----
-Whether `field`, at position `ordinal` of a record literal or update, reads
-`base` at that same position.
----
-private pure func record_field_references_itself(
-	field: CoreRecordFieldValue,
-	ordinal: CoreFieldOrdinal,
-	base: CoreVar,
-) -> Bool:
-	match field.value:
-		ProductFieldExpr(VarExpr(variable, _, _), projected, _, _):
-			core_var_equal(variable, base) and core_field_ordinals_equal(projected, ordinal)
-		_:
-			False
-
-
-private pure func inherited_record_field(
-	field: CoreRecordFieldValue,
-	ordinal: CoreFieldOrdinal,
-	base: CoreVar,
-	base_type: CoreType,
-	declared_field: CoreHeapRecordField,
-) -> Bool:
-	match field.value:
-		ProductFieldExpr(VarExpr(variable, owner_type, _), projected, field_type, _):
-			(
-				core_var_equal(variable, base)
-				and core_field_ordinals_equal(projected, ordinal)
-				and core_field_refs_equal(field.ref, declared_field.ref)
-				and core_type_equal(owner_type, base_type)
-				and core_type_equal(field_type, declared_field.typ)
-			)
-		_:
-			False
-
-
 private pure func staged_field_variable(base: CoreVar, field_index: Int) -> CoreVar:
 	{
 		name = COMPILER_LOCAL_PREFIX + "field$" + base.name + "$" + base.id.to_string() + "$" + field_index.to_string(),
@@ -534,171 +502,61 @@ private pure func staged_field_variable(base: CoreVar, field_index: Int) -> Core
 	}
 
 
-private pure func staged_field_with_value(
-	layer: RecordUpdateLayer,
-	field: CoreHeapRecordField,
-	field_index: Int,
-	value: CoreExpr,
-) -> StagedRecordLayer:
-	field_type: CoreType = core_expr_type(value)
-	variable: CoreVar = staged_field_variable(layer.base, field_index)
-	{
-		evaluations = [
-			{
-				variable = variable,
-				typ = field_type,
-				rhs = value
-			},
-		],
-		fields = [
-			{
-				field = field,
-				replacement = Some(VarExpr(variable, field_type, layer.loc))
-			},
-		]
-	}
-
-
-private pure func resolve_staged_field(
-	record_decls: Dict[String, CoreHeapRecordDecl],
-	target: CoreVar,
-	layer: RecordUpdateLayer,
-	previous_fields: Option[List[CoreRecordCowField]],
-	field: CoreRecordFieldValue,
-	ordinal: CoreFieldOrdinal,
-	declared_field: CoreHeapRecordField,
-) -> StagedFieldResolution:
-	if not core_type_equal(core_expr_type(field.value), declared_field.typ):
-		InvalidStagedField
-	else if (
-		record_field_references_itself(field, ordinal, layer.base)
-		and not inherited_record_field(
-			field,
-			ordinal,
-			layer.base,
-			layer.binding_type,
-			declared_field,
-		)
-	):
-		InvalidStagedField
-	else:
-		resolve_typed_staged_field(
-			record_decls,
-			target,
-			layer,
-			previous_fields,
-			field,
-			ordinal,
-			declared_field,
-		)
-
-
-private pure func resolve_typed_staged_field(
-	record_decls: Dict[String, CoreHeapRecordDecl],
-	target: CoreVar,
-	layer: RecordUpdateLayer,
-	previous_fields: Option[List[CoreRecordCowField]],
-	field: CoreRecordFieldValue,
-	ordinal: CoreFieldOrdinal,
-	declared_field: CoreHeapRecordField,
-) -> StagedFieldResolution:
-	match previous_fields:
-		None:
-			if inherited_record_field(field, ordinal, layer.base, layer.binding_type, declared_field):
-				InheritedStagedField
-			else:
-				ReplacementStagedField(
-					replace_var(
-						prepare_record_update_expr(record_decls, field.value),
-						layer.base,
-						target,
-					),
-				)
-		Some(fields):
-			if inherited_record_field(field, ordinal, layer.base, layer.binding_type, declared_field):
-				match fields.find(
-					func(staged_field): core_field_refs_equal(staged_field.field.ref, field.ref),
-				):
-					Some(previous):
-						match previous.replacement:
-							Some(replacement):
-								CarriedReplacementStagedField(replacement)
-							None:
-								InheritedStagedField
-					None:
-						InvalidStagedField
-			else:
-				prepared: CoreExpr = prepare_record_update_expr(record_decls, field.value)
-
-				if expr_touches_var(prepared, layer.base):
-					InvalidStagedField
-				else:
-					ReplacementStagedField(prepared)
-
-
+-- Replacement expressions run in authored order; COW rows stay in storage
+-- order. An absent replacement inherits the preceding layer or the base.
 private pure func stage_record_layer(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	target: CoreVar,
 	record_decl: CoreHeapRecordDecl,
 	layer: RecordUpdateLayer,
 	previous_fields: Option[List[CoreRecordCowField]],
+	evaluation: RecordReplacementEvaluation,
 ) -> Option[StagedRecordLayer]:
+	var staged_fields: List[CoreRecordCowField] = previous_fields.get_or(
+		record_decl.fields.map(func(field): { field = field, replacement = None }),
+	)
 	var evaluations: List[RecordFieldEvaluation] = []
-	var staged_fields: List[CoreRecordCowField] = []
-	var failed: Bool = False
-	var field_index: Int = 0
+	var seen: List[CoreRecordFieldValue] = []
+	var valid: Bool = True
 
-	for field in layer.fields:
-		match record_decl.fields.get(field_index):
-			Some(declared_field):
-				if not core_field_refs_equal(declared_field.ref, field.ref):
-					failed = True
+	for replacement in layer.fields:
+		match record_decl.fields.enumerate().find(
+			func(entry):
+				(field_index, field) = entry
+				core_field_refs_equal(field.ref, replacement.ref)
+		):
+			Some((index, declared)):
+				prepared: CoreExpr = prepare_record_update_expr(record_decls, replacement.value)
+				if (
+					seen.any(func(field): core_field_refs_equal(field.ref, replacement.ref))
+					or not core_type_equal(core_expr_type(prepared), declared.typ)
+					or not record_base_annotations_agree(prepared, layer.base, layer.binding_type)
+					or (previous_fields.is_some() and expr_touches_var(prepared, layer.base))
+				):
+					valid = False
 					break
 				else:
-					match resolve_staged_field(
-						record_decls,
-						target,
-						layer,
-						previous_fields,
-						field,
-						core_field_ordinal(field_index),
-						declared_field,
-					):
-						ReplacementStagedField(value):
-							staged: StagedRecordLayer = staged_field_with_value(
-								layer,
-								declared_field,
-								field_index,
-								value,
-							)
-							evaluations = evaluations.concat(staged.evaluations)
-							staged_fields = staged_fields.concat(staged.fields)
-						CarriedReplacementStagedField(value):
-							staged_fields = staged_fields.append({
-								field = declared_field,
-								replacement = Some(value),
+					value: CoreExpr = replace_var(prepared, layer.base, target)
+					match evaluation:
+						DirectRecordReplacements:
+							staged_fields = staged_fields.set(index, { field = declared, replacement = Some(value) })
+						StagedRecordReplacements:
+							field_type: CoreType = core_expr_type(value)
+							variable: CoreVar = staged_field_variable(layer.base, index)
+							evaluations = evaluations.append({ variable = variable, typ = field_type, rhs = value })
+							staged_fields = staged_fields.set(index, {
+								field = declared,
+								replacement = Some(VarExpr(variable, field_type, layer.loc))
 							})
-						InheritedStagedField:
-							staged_fields = staged_fields.append({
-								field = declared_field,
-								replacement = None,
-							})
-						InvalidStagedField:
-							failed = True
-							break
+					seen = seen.append(replacement)
 			None:
-				failed = True
+				valid = False
 				break
 
-		field_index += 1
-
-	if failed or field_index != record_decl.fields.length():
-		None
+	if valid:
+		Some({ evaluations = evaluations, fields = staged_fields })
 	else:
-		Some({
-			evaluations = evaluations,
-			fields = staged_fields,
-		})
+		None
 
 
 private pure func wrap_record_field_evaluations(
@@ -730,7 +588,7 @@ private fixed union UnchangedTargetPath:
 
 
 private pure func prepare_nested_record_reuse_value(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	target: CoreVar,
 	rhs: CoreExpr,
 ) -> Option[CoreExpr]:
@@ -759,6 +617,7 @@ private pure func prepare_nested_record_reuse_value(
 								record_decl,
 								layer,
 								previous_fields,
+								StagedRecordReplacements,
 							):
 								Some(staged):
 									evaluations = evaluations.concat(staged.evaluations)
@@ -795,7 +654,7 @@ private pure func prepare_nested_record_reuse_value(
 
 
 private pure func prepare_canonical_record_reuse_value(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	target: CoreVar,
 	update_base: CoreVar,
 	binding_type: CoreType,
@@ -817,40 +676,20 @@ private pure func prepare_canonical_record_reuse_value(
 						and declared_heap_record_type(record_decls, result_type)
 						and not record_fields_assign_var(fields, target)
 					):
-						prepared_fields: List[CoreRecordFieldValue] = fields.map(
-							func(
-								field,
-							): { field |
-								value = prepare_record_update_expr(record_decls, field.value)
-							},
-						)
-						reused_fields: List[CoreRecordFieldValue] = prepared_fields.map(
-							func(
-								field,
-							): { field | value = replace_var(field.value, update_base, target) },
-						)
-
 						match heap_record_decl_for_type(record_decls, result_type):
 							Some(record_decl):
-								match record_cow_field_plan(
+								stage_record_layer(
+									record_decls,
+									target,
 									record_decl,
-									update_base,
-									result_type,
-									fields,
-									reused_fields,
-								):
-									Some(cow_plan):
-										Some(
-											prepared_record_reuse_expr(
-												VarExpr(target, source_type, source_loc),
-												reused_fields,
-												cow_plan,
-												result_type,
-												update_loc,
-											),
-										)
-									None:
-										None
+									{ base = update_base, binding_type = binding_type, fields = fields, result_type = result_type, loc = update_loc },
+									None,
+									record_replacement_evaluation(record_decl.fields.map(func(field): field.ref), fields),
+								).and_then(func(staged):
+									prepared_nested_record_expr(
+										VarExpr(target, source_type, source_loc), staged.fields, result_type, update_loc,
+									).map(func(reuse): wrap_record_field_evaluations(staged.evaluations, reuse))
+								)
 							None:
 								None
 					else:
@@ -862,7 +701,7 @@ private pure func prepare_canonical_record_reuse_value(
 
 
 private pure func prepare_typed_record_reuse_value(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	target: CoreVar,
 	unchanged_target: UnchangedTargetPath,
 	expected_type: CoreType,
@@ -879,7 +718,7 @@ private pure func prepare_typed_record_reuse_value(
 
 
 private pure func prepare_constructor_match_body_reuse(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	target: CoreVar,
 	unchanged_target: UnchangedTargetPath,
 	expected_type: CoreType,
@@ -913,7 +752,7 @@ private pure func prepare_constructor_match_body_reuse(
 
 
 private pure func prepare_constructor_match_cases_reuse(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	target: CoreVar,
 	unchanged_target: UnchangedTargetPath,
 	expected_type: CoreType,
@@ -943,7 +782,7 @@ private pure func prepare_constructor_match_cases_reuse(
 
 
 private pure func prepare_constructor_match_fallback_reuse(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	target: CoreVar,
 	unchanged_target: UnchangedTargetPath,
 	expected_type: CoreType,
@@ -975,7 +814,7 @@ private pure func prepare_constructor_match_fallback_reuse(
 
 
 private pure func prepare_constructor_match_reuse_value(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	target: CoreVar,
 	unchanged_target: UnchangedTargetPath,
 	scrutinee: CoreExpr,
@@ -1020,7 +859,7 @@ private pure func prepare_constructor_match_reuse_value(
 
 
 private pure func prepare_literal_match_cases_reuse(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	target: CoreVar,
 	unchanged_target: UnchangedTargetPath,
 	expected_type: CoreType,
@@ -1050,7 +889,7 @@ private pure func prepare_literal_match_cases_reuse(
 
 
 private pure func prepare_literal_match_fallback_reuse(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	target: CoreVar,
 	unchanged_target: UnchangedTargetPath,
 	expected_type: CoreType,
@@ -1082,7 +921,7 @@ private pure func prepare_literal_match_fallback_reuse(
 
 
 private pure func prepare_constructor_literal_match_reuse(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	target: CoreVar,
 	unchanged_target: UnchangedTargetPath,
 	match_expr: CoreConstructorLiteralMatch,
@@ -1113,7 +952,7 @@ private pure func prepare_constructor_literal_match_reuse(
 
 
 private pure func prepare_literal_match_reuse_value(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	target: CoreVar,
 	unchanged_target: UnchangedTargetPath,
 	scrutinee: CoreExpr,
@@ -1180,7 +1019,7 @@ private pure func renames_target(
 
 
 private pure func prepare_immutable_let_reuse_value(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	target: CoreVar,
 	unchanged_target: UnchangedTargetPath,
 	variable: CoreVar,
@@ -1256,14 +1095,14 @@ private pure func prepare_immutable_let_reuse_value(
 
 
 private pure func prepare_record_reuse_value(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	target: CoreVar,
 	unchanged_target: UnchangedTargetPath,
 	rhs: CoreExpr,
 ) -> Option[CoreExpr]:
 	match rhs:
 		IfExpr(cond, then_expr, else_expr, typ, loc):
-			if expr_assigns_var(cond, target):
+			if CoreTraverse.core_expr_assigns_var(cond, target):
 				None
 			else:
 				match (
@@ -1349,7 +1188,7 @@ it (or the parameter itself). Returns `None` when the function owns no
 parameter or some path's result is not such an update.
 ---
 private pure func prepare_owned_parameter_result(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	function_info: CoreFunction,
 	body: CoreExpr,
 ) -> Option[CoreExpr]:
@@ -1381,7 +1220,7 @@ Prepares every record update in `expr`, which starts a block of its own: no
 binding made outside it is owned inside it.
 ---
 private pure func prepare_record_update_expr(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	expr: CoreExpr,
 ) -> CoreExpr:
 	prepare_record_updates_in_scope(record_decls, NoOwnedBindings, expr)
@@ -1393,7 +1232,7 @@ blocks of their own, or more than once, or not at all, so they are prepared
 without owned bindings.
 ---
 private pure func prepare_record_update_node(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	expr: CoreExpr,
 ) -> CoreExpr:
 	match expr:
@@ -1410,7 +1249,7 @@ private pure func prepare_record_update_node(
 
 
 private pure func prepare_record_update_logical_expr(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	expr: CoreExpr,
 ) -> CoreExpr:
 	var tasks: List[RecordUpdateLogicalTask] = [PrepareRecordUpdateLogicalNode(expr)]
@@ -1598,7 +1437,7 @@ private pure func owned_and_unread_later(frames: BindingFrames, variable: CoreVa
 it is a record update chain over an owned binding that nothing reads later.
 ---
 private pure func owned_binding_update(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	frames: BindingFrames,
 	expr: CoreExpr,
 ) -> Option[CoreExpr]:
@@ -1621,7 +1460,7 @@ private pure func owned_binding_update(
 
 
 private pure func prepare_sequence_in_scope(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	frames: BindingFrames,
 	expr: CoreExpr,
 ) -> CoreExpr:
@@ -1665,7 +1504,7 @@ variable is the canonical form, handled where that variable's ownership is
 known.
 ---
 private pure func expression_bound_base_update(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	base: CoreVar,
 	is_mutable: Bool,
 	binding_type: CoreType,
@@ -1792,7 +1631,7 @@ bindings in `frames`: sequences and bindings extend the chain, and a record
 update of an owned binding at its last use takes the binding over.
 ---
 private pure func prepare_record_updates_in_scope(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	frames: BindingFrames,
 	expr: CoreExpr,
 ) -> CoreExpr:
@@ -1865,7 +1704,7 @@ private pure func prepare_record_updates_in_scope(
 
 
 private pure func lower_record_update_function(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	function_info: CoreFunction,
 ) -> CoreFunction:
 	body: Option[CoreExpr] = match function_info.body:
@@ -1882,7 +1721,7 @@ private pure func lower_record_update_function(
 
 
 private pure func lower_record_update_decl(
-	record_decls: Dict[String, CoreHeapRecordDecl],
+	record_decls: Dict[String, RecordUpdateDeclaration],
 	decl: CoreDecl,
 ) -> CoreDecl:
 	match decl:
@@ -1903,7 +1742,7 @@ private pure func lower_record_update_decl(
 
 
 pure func lower_record_updates_for_ownership(program: CoreProgram) -> CoreProgram:
-	record_decls: Dict[String, CoreHeapRecordDecl] = declared_heap_record_decls(program.decls)
+	record_decls: Dict[String, RecordUpdateDeclaration] = record_update_declarations(program.decls)
 	{ program |
 		decls = program.decls.map(func(decl): lower_record_update_decl(record_decls, decl))
 	}

@@ -1902,6 +1902,7 @@ union CoreExpr:
 	ListSetExpr(CoreListSet, CoreType, CoreSourceLoc)
 	ListSwapExpr(CoreListSwap, CoreType, CoreSourceLoc)
 	RecordExpr(List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
+	-- Only authored replacements, in evaluation order; omitted slots inherit.
 	RecordUpdateExpr(CoreExpr, List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
 	RecordReuseExpr(CoreExpr, List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
 	RecordCowUpdateExpr(CoreExpr, List[CoreRecordCowField], CoreType, CoreSourceLoc)
@@ -17435,34 +17436,21 @@ pure func core_program_to_json(program: CoreProgram) -> JsonValue:
 	resolve_core_source_loc_refs(program, unresolved)
 
 
-private record CoreJsonRecordShape {
-	name: String,
-	field_names: List[String],
-	heap_fields: List[CoreHeapRecordField]
-}
+private union CoreJsonRecordShape:
+	ManagedJsonRecordShape(CoreHeapRecordDecl)
+	InlineJsonRecordShape(CoreInlineRecordDecl)
 
 
 private pure func core_json_record_shapes(decls: List[CoreDecl]) -> List[CoreJsonRecordShape]:
 	var shapes: List[CoreJsonRecordShape] = []
-
 	for decl in decls:
 		match decl:
 			HeapRecordDecl(record_decl):
-				shapes = shapes.append({
-					name = record_decl.name,
-					field_names = record_decl.fields.map(func(field): field.name),
-					heap_fields = record_decl.fields,
-				})
+				shapes = shapes.append(ManagedJsonRecordShape(record_decl))
 			InlineRecordDecl(record_decl):
-				-- Inline records are never COW-updated, so no heap fields.
-				shapes = shapes.append({
-					name = record_decl.name,
-					field_names = record_decl.fields.map(func(field): field.name),
-					heap_fields = [],
-				})
+				shapes = shapes.append(InlineJsonRecordShape(record_decl))
 			_:
 				void
-
 	shapes
 
 
@@ -17498,7 +17486,11 @@ private pure func record_shape_matches(
 	shape: CoreJsonRecordShape,
 	record_name: String,
 ) -> Bool:
-	shape.name == record_name
+	match shape:
+		ManagedJsonRecordShape(declaration):
+			declaration.name == record_name
+		InlineJsonRecordShape(declaration):
+			declaration.name == record_name
 
 
 private pure func record_update_field_names(
@@ -17537,6 +17529,40 @@ private pure func record_update_field_names(
 			Ok(names)
 
 
+-- Check authored sparse rows against declaration fields, with no shape
+-- columns that can disagree about a field's identity, spelling or type.
+private pure func validate_record_replacements_json(
+	fields: List[CoreRecordFieldValue],
+	declared_fields: List[CoreInlineRecordField],
+	record_name: String,
+	path: String,
+) -> Result[Void, CoreJsonError]:
+	var seen: List[CoreFieldRef] = []
+	var error: Option[CoreJsonError] = None
+	for (index, field) in fields.enumerate():
+		field_path = path_index(path_field(path, "fields"), index)
+		match declared_fields.find(func(declared): core_field_refs_equal(declared.ref, field.ref)):
+			Some(declared):
+				if (
+					not core_field_ref_is_resolved(field.ref)
+					or field.name != declared.name
+					or seen.any(func(ref): core_field_refs_equal(ref, field.ref))
+				):
+					error = Some(CoreInvalidRecordUpdateShape(field_path, "record update for `${record_name}` requires unique declared field identities"))
+				else if not core_type_equal(core_expr_type(field.value), declared.typ):
+					error = Some(CoreInvalidRecordUpdateShape(path_field(field_path, "value"), "record update replacement type must match `${record_name}.${declared.name}`"))
+			None:
+				error = Some(CoreInvalidRecordUpdateShape(field_path, "record update for `${record_name}` requires unique declared field identities"))
+		seen = seen.append(field.ref)
+		if error.is_some():
+			break
+	match error:
+		Some(problem):
+			Err(problem)
+		None:
+			Ok(void)
+
+
 private pure func validate_record_update_json_shape(
 	value: JsonValue,
 	path: String,
@@ -17545,28 +17571,20 @@ private pure func validate_record_update_json_shape(
 	type_value ?= object_field(value, path, "type")
 	type_path: String = path_field(path, "type")
 	type_tag ?= kind_field(type_value, type_path)
-
 	if type_tag != HEAP_RECORD_TYPE_TAG and type_tag != INLINE_RECORD_TYPE_TAG:
 		Err(CoreInvalidRecordUpdateShape(path, "record update type must be a heap or inline record"))
 	else:
 		record_name ?= string_field(type_value, type_path, "name")
-		actual_names ?= record_update_field_names(value, path)
-
-		match shapes.find(func(shape): record_shape_matches(shape, record_name)):
-			Some(shape):
-				if string_lists_equal(actual_names, shape.field_names):
-					Ok(void)
-				else:
-					Err(
-						CoreInvalidRecordUpdateShape(
-							path_field(path, "fields"),
-							"record update for `${record_name}` must contain every declared field exactly once in declaration order",
-						),
-					)
-			None:
-				missing_detail: String = "record update type `${record_name}` has no matching heap-record declaration"
-
-				Err(CoreInvalidRecordUpdateShape(path_field(path, "type"), missing_detail))
+		fields ?= decode_core_record_fields(value, path, "fields")
+		match (type_tag, shapes.find(func(shape): record_shape_matches(shape, record_name))):
+			(HEAP_RECORD_TYPE_TAG, Some(ManagedJsonRecordShape(declaration))):
+				validate_record_replacements_json(
+					fields, declaration.fields.map(func(field): { name = field.name, ref = field.ref, typ = field.typ }), record_name, path,
+				)
+			(INLINE_RECORD_TYPE_TAG, Some(InlineJsonRecordShape(declaration))):
+				validate_record_replacements_json(fields, declaration.fields, record_name, path)
+			_:
+				Err(CoreInvalidRecordUpdateShape(type_path, "record update type `${record_name}` has no matching record declaration"))
 
 
 private pure func validate_record_reuse_json_shape(
@@ -17581,7 +17599,16 @@ private pure func validate_record_reuse_json_shape(
 	if type_tag != HEAP_RECORD_TYPE_TAG:
 		Err(CoreInvalidRecordUpdateShape(type_path, "record reuse type must be a heap record"))
 	else:
-		validate_record_update_json_shape(value, path, shapes)
+		record_name ?= string_field(type_value, type_path, "name")
+		actual_names ?= record_update_field_names(value, path)
+		match shapes.find(func(shape): record_shape_matches(shape, record_name)):
+			Some(ManagedJsonRecordShape(declaration)):
+				if string_lists_equal(actual_names, declaration.fields.map(func(field): field.name)):
+					Ok(void)
+				else:
+					Err(CoreInvalidRecordUpdateShape(path_field(path, "fields"), "record reuse for `${record_name}` must contain every declared field exactly once in declaration order"))
+			_:
+				Err(CoreInvalidRecordUpdateShape(type_path, "record reuse type `${record_name}` has no matching heap-record declaration"))
 
 
 private pure func validate_record_cow_update_json_shape(
@@ -17602,8 +17629,8 @@ private pure func validate_record_cow_update_json_shape(
 		match shapes.find(
 			func(shape): record_shape_matches(shape, record_name),
 		):
-			Some(shape):
-				expected_fields = shape.heap_fields
+			Some(ManagedJsonRecordShape(declaration)):
+				expected_fields = declaration.fields
 				if fields.length() != expected_fields.length():
 					Err(
 						CoreInvalidRecordUpdateShape(
@@ -17719,7 +17746,7 @@ private pure func validate_record_cow_update_json_shape(
 								)
 							else:
 								Ok(void)
-			None:
+			_:
 				Err(
 					CoreInvalidRecordUpdateShape(
 						type_path,

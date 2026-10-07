@@ -468,33 +468,11 @@ private pure func record_cow_fields_touch_var(
 	)
 
 
-private pure func expr_assigns_var(expr: CoreExpr, target: CoreVar) -> Bool:
-	match expr:
-		AssignExpr(variable, rhs, typ, loc):
-			if core_var_equal(variable, target):
-				True
-			else:
-				CoreTraverse
-					.immediate_core_expr_children(expr)
-					.any(func(child): expr_assigns_var(child, target))
-		SeqExpr(first, second):
-			spine = CoreTraverse.split_core_sequence(expr)
-
-			(
-				spine.preceding_items.any(func(item): expr_assigns_var(item, target))
-				or expr_assigns_var(spine.final_item, target)
-			)
-		_:
-			CoreTraverse
-				.immediate_core_expr_children(expr)
-				.any(func(child): expr_assigns_var(child, target))
-
-
 private pure func record_fields_assign_var(
 	fields: List[CoreRecordFieldValue],
 	target: CoreVar,
 ) -> Bool:
-	fields.any(func(field): expr_assigns_var(field.value, target))
+	fields.any(func(field): CoreTraverse.core_expr_assigns_var(field.value, target))
 
 
 private pure func exprs_touch_var(exprs: List[CoreExpr], target: CoreVar) -> Bool:
@@ -1767,9 +1745,9 @@ private pure func take_cow_fields_from(
 	source_var: CoreVar,
 	fields: List[CoreRecordCowField],
 ) -> List[CoreRecordCowField]:
-	-- One entry per declared field in declaration order (`record_cow_field_plan`
-	-- builds the list from the declaration), so a position is the field's
-	-- ordinal. That matters: a copy-on-write update keeps every inherited slot.
+	-- Ownership lowering builds one entry per field in declaration order,
+	-- so the position is the field's ordinal. A copy-on-write update keeps
+	-- every inherited slot.
 	fields.enumerate().map(pure func(entry: (Int, CoreRecordCowField)) -> CoreRecordCowField:
 		(index, field) = entry
 		ordinal: CoreFieldOrdinal = core_field_ordinal(index)
@@ -2091,6 +2069,20 @@ private pure func linear_prefix_exprs_complete_normally(exprs: List[CoreExpr]) -
 	exprs.all(linear_prefix_completes_normally)
 
 
+private pure func non_cancelling_list_intrinsic(kind: CoreCallKind, arg_count: Int) -> Bool:
+	-- These exact intrinsic contracts emit field reads/writes or synchronous
+	-- capacity growth. Capacity growth moves unique storage or copies shared
+	-- storage without invoking element destructors, user callbacks or checkpoints.
+	match kind:
+		IntrinsicCall(name):
+			(
+				(name == "list_len" and arg_count == 1)
+					or ((name == "list_ensure_capacity" or name == "list_set_len") and arg_count == 2)
+			)
+		_:
+			False
+
+
 ---
 Whether an expression used before the terminal update must fall through to
 the next expression. The allow-list is explicit so a new Core form fails
@@ -2100,6 +2092,12 @@ private pure func linear_prefix_completes_normally(expr: CoreExpr) -> Bool:
 	match expr:
 		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _):
 			True
+		CallExpr(kind, callee, args, _, _):
+			(
+				non_cancelling_list_intrinsic(kind, args.length())
+					and linear_prefix_completes_normally(callee)
+					and linear_prefix_exprs_complete_normally(args)
+			)
 		DebugBlockExpr(body, _, _):
 			linear_prefix_completes_normally(body)
 		BinaryExpr(_, left, right, _, _):
@@ -2118,6 +2116,18 @@ private pure func linear_prefix_completes_normally(expr: CoreExpr) -> Bool:
 			linear_prefix_exprs_complete_normally(items)
 		VectorExpr(items, _, _):
 			linear_prefix_exprs_complete_normally(items)
+		RecordExpr(fields, _, _):
+			fields.all(func(field): linear_prefix_completes_normally(field.value))
+		ListRetainExpr(retain, _, _):
+			-- These storage operations only retain or write raw storage; neither
+			-- invokes element destructors, user callbacks or checkpoints.
+			linear_prefix_completes_normally(retain.list) and linear_prefix_completes_normally(retain.value.value)
+		ListSetExpr(set, _, _):
+			(
+				linear_prefix_completes_normally(set.list)
+					and linear_prefix_completes_normally(set.index)
+					and linear_prefix_completes_normally(set.value.value)
+			)
 		LetExpr(_, _, _, rhs, body):
 			linear_prefix_completes_normally(rhs) and linear_prefix_completes_normally(body)
 		BorrowLetExpr(_, _, rhs, body):

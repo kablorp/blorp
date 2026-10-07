@@ -1,0 +1,171 @@
+import:
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	test: TestSuite
+
+
+record Pair {
+	first: Int,
+	second: Int
+}
+
+
+private func logged(log: Channel[String], label: String, value: Int) -> Int:
+	_ = send(log, label)
+	value
+
+
+private func logged_base(log: Channel[String]) -> Pair:
+	_ = send(log, "base")
+	{ first = 10, second = 20 }
+
+
+func test_update_evaluates_base_once_then_written_replacements() -> Bool:
+	log: Channel[String] = channel(3)
+	pair: Pair = { logged_base(log) |
+		second = logged(log, "second", 2),
+		first = logged(log, "first", 1)
+	}
+	seal(log)
+	(
+		recv(log) == Some("base")
+		and recv(log) == Some("second")
+		and recv(log) == Some("first")
+		and recv(log) == None
+		and pair.first == 1
+		and pair.second == 2
+	)
+
+
+fixed record InlinePair {
+	first: Int,
+	second: Int
+}
+
+
+record ManagedPair {
+	first: List[String],
+	second: List[String],
+	unchanged: String
+}
+
+
+private func logged_list(log: Channel[String], label: String) -> List[String]:
+	_ = send(log, label)
+	[label]
+
+
+func test_shared_managed_update_preserves_alias_and_omitted_field() -> Bool:
+	log: Channel[String] = channel(2)
+	base: ManagedPair = { first = ["old first"], second = ["old second"], unchanged = "kept" }
+	updated: ManagedPair = { base |
+		second = logged_list(log, "second"),
+		first = logged_list(log, "first")
+	}
+	seal(log)
+	(
+		recv(log) == Some("second") and recv(log) == Some("first")
+		and updated.first == ["first"] and updated.second == ["second"]
+		and updated.unchanged == "kept"
+		and base.first == ["old first"] and base.second == ["old second"]
+	)
+
+
+func test_unique_managed_update_runs_replacements_before_writeback() -> Bool:
+	log: Channel[String] = channel(2)
+	var pair: ManagedPair = { first = ["old first"], second = ["old second"], unchanged = "kept" }
+	pair = { pair |
+		second = logged_list(log, pair.first.get_or(0, "")),
+		first = logged_list(log, pair.second.get_or(0, ""))
+	}
+	seal(log)
+	(
+		recv(log) == Some("old first") and recv(log) == Some("old second")
+		and pair.first == ["old second"] and pair.second == ["old first"]
+		and pair.unchanged == "kept"
+	)
+
+
+func test_inline_update_runs_in_written_order() -> Bool:
+	log: Channel[String] = channel(2)
+	base: InlinePair = { first = 10, second = 20 }
+	updated: InlinePair = { base |
+		second = logged(log, "second", 2),
+		first = logged(log, "first", 1)
+	}
+	seal(log)
+	(
+		recv(log) == Some("second") and recv(log) == Some("first")
+		and updated.first == 1 and updated.second == 2
+		and base.first == 10 and base.second == 20
+	)
+
+
+func test_nested_superseded_replacement_keeps_its_side_effect() -> Bool:
+	log: Channel[String] = channel(4)
+	pair: Pair = { { logged_base(log) | first = logged(log, "inner first", 11) } |
+		second = logged(log, "outer second", 2),
+		first = logged(log, "outer first", 1)
+	}
+	seal(log)
+	(
+		recv(log) == Some("base") and recv(log) == Some("inner first")
+		and recv(log) == Some("outer second") and recv(log) == Some("outer first")
+		and pair.first == 1 and pair.second == 2
+	)
+
+
+func test_sparse_update_and_authored_self_read_preserve_other_fields() -> Bool:
+	base: ManagedPair = { first = ["first"], second = ["second"], unchanged = "kept" }
+	sparse: ManagedPair = { base | second = ["new"] }
+	explicit: ManagedPair = { sparse | first = sparse.first }
+	(
+		explicit.first == ["first"] and explicit.second == ["new"]
+		and explicit.unchanged == "kept"
+		and base.first == ["first"] and base.second == ["second"]
+	)
+
+
+record CountedList {
+	count: Int,
+	items: List[Int]
+}
+
+
+private UPDATE_ROUNDS: Int = 1000
+-- Unique append doubles capacity; one record plus logarithmic list growth.
+private UPDATE_ALLOCATION_CEILING: Int = 32
+
+
+private func growing_reordered_updates() -> CountedList:
+	var state: CountedList = { count = 0, items = [] }
+	var index: Int = 0
+	while index < UPDATE_ROUNDS:
+		state = { state | items = state.items.append(index), count = state.count + 1 }
+		index += 1
+	state
+
+
+func test_reordered_replacement_preserves_unique_field_take() -> Bool:
+	reset_mem_stats()
+	state: CountedList = growing_reordered_updates()
+	stats: MemStats = get_mem_stats()
+	(
+		state.count == UPDATE_ROUNDS and state.items.length() == UPDATE_ROUNDS
+		and state.items.get_or(UPDATE_ROUNDS - 1, 0) == UPDATE_ROUNDS - 1
+		and stats.memory_stats_active == 1
+		and stats.total_allocations <= UPDATE_ALLOCATION_CEILING
+	)
+
+
+tests: TestSuite = {
+	description = "Record update evaluation order",
+	tests = [
+		("Reordered managed replacement keeps unique field take", test_reordered_replacement_preserves_unique_field_take),
+		("Base once then replacements in written order", test_update_evaluates_base_once_then_written_replacements),
+		("Shared managed update preserves aliases and omissions", test_shared_managed_update_preserves_alias_and_omitted_field),
+		("Unique managed update evaluates before writeback", test_unique_managed_update_runs_replacements_before_writeback),
+		("Inline update uses written order", test_inline_update_runs_in_written_order),
+		("Nested superseded replacement keeps side effects", test_nested_superseded_replacement_keeps_its_side_effect),
+		("Sparse and authored self-field replacements", test_sparse_update_and_authored_self_read_preserve_other_fields),
+	]
+}

@@ -59,6 +59,7 @@ import:
 		CoreMatchBindingMode(MatchBorrowBindingMode),
 		CoreRecordForm(OrdinaryRecordForm),
 		CoreProgram,
+		CoreRecordFieldValue,
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreSemanticMatchAccessor(RootSemanticMatchAccessor),
 		CoreSemanticMatchTree(SemanticLiteralMatch, SemanticMatchLeaf),
@@ -76,6 +77,7 @@ import:
 		PerceusTempKind(PerceusBorrowArg),
 		CoreVar,
 		core_field_ref,
+		core_field_refs_equal,
 		core_source_loc_from_raw,
 		perceus_temporary_binder_id,
 		core_program_to_json,
@@ -98,6 +100,7 @@ import:
 		run_core_passes,
 	../../../src/compiler/stage_09_core/pipeline:
 		DCE_PASS,
+		required_final_invariant,
 		FUSED_OWNERSHIP_PERCEUS_PASS,
 		OWNERSHIP_CONTRACTS_PASS,
 		PERCEUS_PASS,
@@ -459,15 +462,6 @@ pure func record_update_program() -> CoreProgram:
 				ref = core_field_ref(3),name = "x",
 				value = LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc())
 			},
-			{
-				ref = core_field_ref(4),name = "y",
-				value = ProductFieldExpr(
-					VarExpr(point_var, point_type, synthetic_core_source_loc()),
-					core_field_ordinal(1),
-					int_type(),
-					synthetic_core_source_loc(),
-				)
-			},
 		],
 		point_type,
 		synthetic_core_source_loc(),
@@ -674,36 +668,66 @@ pure func heap_record_update_program_without_decl() -> CoreProgram:
 	}
 
 
-pure func test_record_update_normalization_is_total_after_monomorphization() -> Bool:
-	match lower_record_updates_for_ownership(heap_record_update_program_without_decl()).decls:
-		[FunctionDecl(function_info)]:
-			match function_info.body:
-				Some(RecordExpr(fields, HeapRecordType("Box__mono_Int"), _)):
-					match (fields.get(0), fields.get(1)):
-						(Some(first), Some(second)):
-							first_is_replacement: Bool = match first.value:
-								LiteralExpr(IntLiteral(11), _, _):
-									True
+-- A sparse update cannot guess its omitted fields without a declaration.
+-- Keeping its carrier makes the ownership-boundary invariant reject it.
+-- JSON rejects spelling/ref disagreement at ingress. Inside checked Core,
+-- field identity selects the declaration row and supplies emitted spelling.
+pure func test_record_update_materialization_uses_declared_field_names() -> Bool:
+	program: CoreProgram = record_update_program()
+	x: CoreRecordFieldValue = {
+		ref = core_field_ref(3), name = "carried_wrong_x",
+		value = LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc())
+	}
+	y: CoreRecordFieldValue = {
+		ref = core_field_ref(4), name = "carried_wrong_y",
+		value = LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc())
+	}
+	var valid: Bool = True
+	for replacements in [[x], [y, x]]:
+		modified: CoreProgram = match program.decls:
+			[declaration, FunctionDecl(function_info)]:
+				match function_info.body:
+					Some(RecordUpdateExpr(base, _, typ, loc)):
+						update = RecordUpdateExpr(base, replacements, typ, loc)
+						{ program | decls = [declaration, FunctionDecl({ function_info | body = Some(update) })] }
+					_:
+						program
+			_:
+				program
+		match lower_record_updates_for_ownership(modified).decls:
+			[_, FunctionDecl(function_info)]:
+				match function_info.body:
+					Some(body):
+						var result: CoreExpr = body
+						var staging: Bool = True
+						while staging:
+							match result:
+								LetExpr(_, _, _, _, tail):
+									result = tail
 								_:
-									False
+									staging = False
+						match result:
+							RecordExpr(fields, _, _):
+								match fields:
+									[first, second]:
+										valid = valid and first.name == "x" and second.name == "y"
+										valid = valid and core_field_refs_equal(first.ref, x.ref) and core_field_refs_equal(second.ref, y.ref)
+									_:
+										valid = False
+							_:
+								valid = False
+					None:
+						valid = False
+			_:
+				valid = False
+	valid
 
-							second_uses_base: Bool = match second.value:
-								ProductFieldExpr(VarExpr(base, _, _), ordinal, _, _):
-									core_field_ordinal_index(ordinal) == 1 and base.name == "box"
-								_:
-									False
 
-							(
-								fields.length() == 2
-								and first.name == "count"
-								and first_is_replacement
-								and second.name == "label"
-								and second_uses_base
-							)
-						_:
-							False
-				_:
-					False
+pure func test_record_update_without_declaration_is_rejected() -> Bool:
+	program: CoreProgram = lower_record_updates_for_ownership(heap_record_update_program_without_decl())
+	match required_final_invariant(program):
+		Some(CorePassMessage(message)):
+			message == "record update survived ownership normalization"
 		_:
 			False
 
@@ -864,10 +888,6 @@ pure func heap_record_self_update_program() -> CoreProgram:
 					ref = core_field_ref(0),name = "count",
 					value = LiteralExpr(IntLiteral(11), int_type(), synthetic_core_source_loc())
 				},
-				{
-					ref = core_field_ref(2),name = "limit",
-					value = ProductFieldExpr(update_base_ref, core_field_ordinal(1), int_type(), synthetic_core_source_loc())
-				},
 			],
 			box_type,
 			synthetic_core_source_loc(),
@@ -967,10 +987,6 @@ pure func consumed_record_result_program_with_origin(origin: CoreFunctionOrigin)
 				{
 					ref = core_field_ref(0),name = "count",
 					value = LiteralExpr(IntLiteral(11), int_type(), synthetic_core_source_loc())
-				},
-				{
-					ref = core_field_ref(2),name = "limit",
-					value = ProductFieldExpr(update_base_ref, core_field_ordinal(1), int_type(), synthetic_core_source_loc())
 				},
 			],
 			box_type,
@@ -1163,15 +1179,12 @@ pure func malformed_consumed_record_result_program(
 			program
 
 
-pure func malformed_record_update_materializes_without_trusted_reuse(program: CoreProgram) -> Bool:
-	json: String = core_program_to_json(lower_record_updates_for_ownership(program)).to_string()
-
-	(
-		json.contains("\"kind\":\"record\"")
-		and not json.contains("\"kind\":\"record_cow_update\"")
-		and not json.contains("\"kind\":\"record_reuse\"")
-		and not json.contains("\"kind\":\"record_update\"")
-	)
+pure func malformed_record_update_is_rejected(program: CoreProgram) -> Bool:
+	match required_final_invariant(lower_record_updates_for_ownership(program)):
+		Some(CorePassMessage(message)):
+			message == "record update survived ownership normalization"
+		_:
+			False
 
 
 pure func test_record_reuse_rejects_malformed_field_annotations() -> Bool:
@@ -1190,9 +1203,34 @@ pure func test_record_reuse_rejects_malformed_field_annotations() -> Bool:
 	)
 
 	(
-		malformed_record_update_materializes_without_trusted_reuse(wrong_count_type)
-		and malformed_record_update_materializes_without_trusted_reuse(wrong_inherited_owner)
+		malformed_record_update_is_rejected(wrong_count_type)
+		and malformed_record_update_is_rejected(wrong_inherited_owner)
 	)
+
+
+-- An authored self-read is a replacement, unlike an omitted field. With
+-- both slots explicitly supplied the prepared storage form is complete reuse.
+pure func test_authored_self_field_is_not_implicit_inheritance() -> Bool:
+	program: CoreProgram = consumed_record_result_program()
+	updated: CoreProgram = match program.decls:
+		[record_decl, FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(LetExpr(base, is_mutable, binding_type, initial, RecordUpdateExpr(carrier, fields, typ, loc))):
+					self_field = {
+						ref = core_field_ref(2),
+						name = "limit",
+						value = ProductFieldExpr(carrier, core_field_ordinal(1), int_type(), loc)
+					}
+					updated_carrier = RecordUpdateExpr(carrier, fields.append(self_field), typ, loc)
+					updated_body = LetExpr(base, is_mutable, binding_type, initial, updated_carrier)
+					updated_function = { function_info | body = Some(updated_body) }
+					{ program | decls = [record_decl, FunctionDecl(updated_function)] }
+				_:
+					program
+		_:
+			program
+	json: String = core_program_to_json(lower_record_updates_for_ownership(updated)).to_string()
+	json.contains("\"kind\":\"record_reuse\"") and not json.contains("\"kind\":\"record_cow_update\"")
 
 
 pure func test_consumed_record_result_transfers_owner_into_reuse() -> Bool:
@@ -1443,11 +1481,6 @@ pure func test_update_of_field_path_base_reads_path_through_base() -> Bool:
 					name = "count",
 					value = ProductFieldExpr(path, core_field_ordinal(1), int_type(), synthetic_core_source_loc())
 				},
-				{
-					ref = core_field_ref(2),
-					name = "limit",
-					value = ProductFieldExpr(base_ref, core_field_ordinal(1), int_type(), synthetic_core_source_loc())
-				},
 			],
 			box_type,
 			synthetic_core_source_loc(),
@@ -1514,10 +1547,6 @@ pure func counter_box_update_of(source: CoreVar) -> CoreExpr:
 				{
 					ref = core_field_ref(0),name = "count",
 					value = LiteralExpr(IntLiteral(11), int_type(), synthetic_core_source_loc())
-				},
-				{
-					ref = core_field_ref(2),name = "limit",
-					value = ProductFieldExpr(carrier_ref, core_field_ordinal(1), int_type(), synthetic_core_source_loc())
 				},
 			],
 			box_type,
@@ -1761,10 +1790,6 @@ pure func consuming_record_update_loop_program() -> CoreProgram:
 				{
 					ref = core_field_ref(0),name = "count",
 					value = LiteralExpr(IntLiteral(11), int_type(), synthetic_core_source_loc())
-				},
-				{
-					ref = core_field_ref(2),name = "limit",
-					value = ProductFieldExpr(update_base_ref, core_field_ordinal(1), int_type(), synthetic_core_source_loc())
 				},
 			],
 			box_type,
@@ -2910,10 +2935,6 @@ pure func heap_record_nested_self_update_program() -> CoreProgram:
 					ref = core_field_ref(0),name = "count",
 					value = LiteralExpr(IntLiteral(11), int_type(), synthetic_core_source_loc())
 				},
-				{
-					ref = core_field_ref(2),name = "limit",
-					value = ProductFieldExpr(inner_base_ref, core_field_ordinal(1), int_type(), synthetic_core_source_loc())
-				},
 			],
 			box_type,
 			synthetic_core_source_loc(),
@@ -3037,10 +3058,6 @@ pure func heap_record_self_update_with_target_assignment_program() -> CoreProgra
 						LiteralExpr(IntLiteral(11), int_type(), synthetic_core_source_loc()),
 					)
 				},
-				{
-					ref = core_field_ref(2),name = "limit",
-					value = ProductFieldExpr(update_base_ref, core_field_ordinal(1), int_type(), synthetic_core_source_loc())
-				},
 			],
 			box_type,
 			synthetic_core_source_loc(),
@@ -3101,15 +3118,7 @@ pure func test_record_reuse_requires_matching_heap_record_declaration() -> Bool:
 				foreign_includes = [],
 				source_files = []
 			}
-			json: String = core_program_to_json(
-				lower_record_updates_for_ownership(without_record_decl),
-			).to_string()
-
-			(
-				json.contains("\"kind\":\"record\"")
-				and not json.contains("\"kind\":\"record_reuse\"")
-				and not json.contains("\"kind\":\"record_update\"")
-			)
+			malformed_record_update_is_rejected(without_record_decl)
 		_:
 			False
 
@@ -3536,9 +3545,10 @@ tests: TestSuite = {
 			"record update normalization releases changed program",
 			test_record_update_normalization_releases_changed_program,
 		),
+		("Checked update identities supply declaration field names", test_record_update_materialization_uses_declared_field_names),
 		(
-			"record update normalization is total after monomorphization",
-			test_record_update_normalization_is_total_after_monomorphization,
+			"record update without a declaration is rejected",
+			test_record_update_without_declaration_is_rejected,
 		),
 		(
 			"Perceus materializes record update for ownership",
@@ -3552,6 +3562,7 @@ tests: TestSuite = {
 			"Perceus marks heap-record self update for reuse",
 			test_perceus_marks_heap_record_self_update_for_reuse,
 		),
+		("Authored self-field is a replacement rather than inheritance", test_authored_self_field_is_not_implicit_inheritance),
 		(
 			"consumed record result transfers owner into reuse",
 			test_consumed_record_result_transfers_owner_into_reuse,

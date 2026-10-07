@@ -56,7 +56,8 @@ import:
 			ConstructorMatchFallbackFail,
 		),
 		CoreConstructorMatchTest(UnionTagConstructorTest),
-		CoreDecl(UnionDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, TraitDecl, TypeAliasDecl),
+		CoreDecl(UnionDecl, FunctionDecl, GlobalDecl, HeapRecordDecl,
+			InlineRecordDecl, ImplDecl, TraitDecl, TypeAliasDecl),
 		CoreDictLiteralEntry,
 		CoreDirectRuntimeArgs(DirectRuntimeArgsAppendListParallelLayout),
 		CoreDirectRuntimeResult(DirectRuntimeResultCast),
@@ -273,7 +274,7 @@ import:
 			TupleStackResultElement,
 			TupleStructElement,
 		),
-		CoreType(NativeManagedType, UnionType, HeapRecordType, NamedType, RangeType, SelfType, TensorType, TupleType, TypeParameterType, VoidType),
+		CoreType(NativeManagedType, UnionType, HeapRecordType, InlineRecordType, NamedType, RangeType, SelfType, TensorType, TupleType, TypeParameterType, VoidType),
 		CoreUnaryOp(NotOp),
 		CoreUnboxKind(PrimUnbox),
 		CoreUnionField,
@@ -766,7 +767,7 @@ pure func point_record_decl() -> CoreHeapRecordDecl:
 		form = OrdinaryRecordForm,
 		name = "Point",
 		type_params = [],
-		fields = [managed_record_field("x", int_type()), managed_record_field("y", int_type())],
+		fields = [managed_record_field("x", int_type()), { managed_record_field("y", int_type()) | ref = core_field_ref(1) }],
 		loc = sample_loc()
 	}
 
@@ -3806,6 +3807,23 @@ pure func managed_record_update_program() -> CoreProgram:
 	)
 
 
+pure func inline_record_update_program_with_fields(fields: List[CoreRecordFieldValue]) -> CoreProgram:
+	program: CoreProgram = managed_record_update_program_with_fields(fields, True)
+	inline_type: CoreType = InlineRecordType("Point")
+	match program.decls:
+		[HeapRecordDecl(declaration), FunctionDecl(function_info)]:
+			match function_info.params:
+				[parameter]:
+					{ program | decls = [
+						InlineRecordDecl({ name = declaration.name, fields = declaration.fields.map(func(field): { name = field.name, ref = field.ref, typ = field.typ }), loc = declaration.loc }),
+						FunctionDecl({ function_info | params = [{ parameter | typ = inline_type }], return_type = inline_type, body = Some(RecordUpdateExpr(VarExpr(parameter.name, inline_type, sample_loc()), fields, inline_type, sample_loc())) }),
+					] }
+				_:
+					program
+		_:
+			program
+
+
 pure func empty_record_update_program() -> CoreProgram:
 	empty_type: CoreType = HeapRecordType("Empty")
 	empty_var: CoreVar = {
@@ -5786,17 +5804,31 @@ pure func record_update_shape_is_rejected(
 
 pure func test_core_program_json_rejects_invalid_record_update_shapes() -> Bool:
 	x: CoreRecordFieldValue = literal_record_field("x", 1)
-	y: CoreRecordFieldValue = literal_record_field("y", 2)
-
-	record_update_shape_is_rejected([x], True) and record_update_shape_is_rejected(
-		[x, x],
-		True,
-	) and record_update_shape_is_rejected(
-		[y, x],
-		True,
-	) and record_update_shape_is_rejected(
-		[x, y],
-		False,
+	y: CoreRecordFieldValue = { literal_record_field("y", 2) | ref = core_field_ref(1) }
+	wrong_ref: CoreRecordFieldValue = { x | ref = core_field_ref(99) }
+	wrong_type: CoreRecordFieldValue = { x | value = LiteralExpr(StringLiteral("wrong"), NamedType("String", []), sample_loc()) }
+	unknown: CoreRecordFieldValue = { x | name = "other" }
+	duplicate_rejected: Bool = match decode_core_program_json(core_program_to_json(managed_record_update_program_with_fields([x, x], True))):
+		Err(CoreInvalidRecordUpdateShape(path, detail)):
+			path.contains("fields") and detail == "record update for `Point` requires unique declared field identities"
+		_:
+			False
+	var type_rejected: Bool = True
+	for program in [managed_record_update_program_with_fields([wrong_type], True), inline_record_update_program_with_fields([wrong_type])]:
+		type_rejected = type_rejected and match decode_core_program_json(core_program_to_json(program)):
+			Err(CoreInvalidRecordUpdateShape(path, detail)):
+				path.contains("value") and detail == "record update replacement type must match `Point.x`"
+			_:
+				False
+	(
+		program_round_trips(managed_record_update_program_with_fields([x], True))
+		and program_round_trips(managed_record_update_program_with_fields([y, x], True))
+		and program_round_trips(inline_record_update_program_with_fields([y, x]))
+		and duplicate_rejected and type_rejected
+		and record_update_shape_is_rejected([wrong_ref], True)
+		and record_update_shape_is_rejected([unknown], True)
+		and record_update_shape_is_rejected([{ x | ref = core_field_ref(-1) }], True)
+		and record_update_shape_is_rejected([x, y], False)
 	)
 
 

@@ -11024,23 +11024,20 @@ private pure func emit_record_reuse_body(
 			None
 
 
-private pure func record_cow_field_release_statement(
+private pure func record_field_release_statement(
+	release_policy: CoreReleasePolicy,
+	field_value: String,
 	indent: String,
-	record_value: String,
-	member: String,
-	field: CoreHeapRecordField,
 ) -> String:
-	field_value: String = record_value + "->" + member
-
-	match field.release_policy:
+	match release_policy:
 		NoReleasePolicy:
 			""
 		ArcReleasePolicy:
-			indent + "  " + "if (" + field_value + ") blorp_release((blorp_Object*)" + field_value + ");\n"
+			indent + "if (" + field_value + ") blorp_release((blorp_Object*)" + field_value + ");\n"
 		ArcReleaseOnlyPolicy:
-			indent + "  " + "if (" + field_value + ") blorp_release_arc_only(" + field_value + ");\n"
+			indent + "if (" + field_value + ") blorp_release_arc_only(" + field_value + ");\n"
 		StackResultReleasePolicy:
-			indent + "  " + "blorp_stack_result_release(" + field_value + ");\n"
+			indent + "blorp_stack_result_release(" + field_value + ");\n"
 
 
 private pure func record_cow_field_retain_statement(
@@ -11163,11 +11160,10 @@ private pure func emit_record_cow_update_body(
 
 							match field.replacement:
 								Some(replacement):
-									unique_body += record_cow_field_release_statement(
-										emission_context.indent,
-										source_slot,
-										member,
-										field.field,
+									unique_body += record_field_release_statement(
+										field.field.release_policy,
+										field_access,
+										emission_context.indent + "  ",
 									)
 									unique_body += emission_context.indent + "  " + field_access + " = " + replacement + ";\n"
 									constructor_args = constructor_args.append(replacement)
@@ -27363,25 +27359,6 @@ private pure func heap_record_field_at_is_boolean(
 			False
 
 
-private pure func heap_record_field_release_statement(
-	field: CoreHeapRecordField,
-	member_spelling: CRecordMemberScope,
-	ordinal: Int,
-) -> Result[String, CoreEmitError]:
-	field_name: String = c_declared_record_member(member_spelling, field.name, ordinal)
-
-	statement: String = match field.release_policy:
-		NoReleasePolicy:
-			""
-		ArcReleasePolicy:
-			"  if (__rec->" + field_name + ") blorp_release((blorp_Object*)__rec->" + field_name + ");\n"
-		ArcReleaseOnlyPolicy:
-			"  if (__rec->" + field_name + ") blorp_release_arc_only(__rec->" + field_name + ");\n"
-		StackResultReleasePolicy:
-			"  blorp_stack_result_release(__rec->" + field_name + ");\n"
-	Ok(statement)
-
-
 ---
 Reads the strategy a `CleanupTypePlan` row carries, whichever kind of type
 it describes. `NotACleanupType` never reaches this from a heap record or
@@ -27418,33 +27395,26 @@ private pure func emit_heap_record_destructor(
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
-) -> Result[String, CoreEmitError]:
+) -> String:
 	if cleanup_type_plan_has_destructor(type_plan):
 		var releases: String = ""
-		var failure: Option[CoreEmitError] = None
 
 		for entry in record_decl.fields.enumerate():
-			if failure.is_none():
-				match heap_record_field_release_statement(entry[1], member_spelling, entry[0]):
-					Ok(release_statement):
-						releases += release_statement
-					Err(error):
-						failure = Some(error)
+			releases += record_field_release_statement(
+				entry[1].release_policy,
+				"__rec->" + c_declared_record_member(member_spelling, entry[1].name, entry[0]),
+				"  ",
+			)
 
-		match failure:
-			Some(error):
-				Err(error)
-			None:
-				storage_class: String = if internal_type_linkage:
-					"static "
-				else:
-					""
-				definition: String = storage_class + destroy_function_signature(
-					naming.destroy_name,
-				) + " {\n" + "  " + naming.c_name + "* __rec = (" + naming.c_name + "*)obj;\n" + releases + "}\n\n"
-				Ok(definition)
+		storage_class: String = if internal_type_linkage:
+			"static "
+		else:
+			""
+		storage_class + destroy_function_signature(
+			naming.destroy_name,
+		) + " {\n" + "  " + naming.c_name + "* __rec = (" + naming.c_name + "*)obj;\n" + releases + "}\n\n"
 	else:
-		Ok("")
+		""
 
 
 private pure func emit_heap_record_reuse(
@@ -27584,7 +27554,7 @@ private pure func emit_heap_record_decl(
 		"  BLORP_INSTALL_TAG(__rec, \"" + record_decl.name + "\");\n"
 
 	header: String = "typedef struct " + naming.c_name + " {\n" + "  blorp_Object header;\n" + fields_c + "} " + naming.c_name + ";\n\n"
-	destructor_c ?= emit_heap_record_destructor(
+	destructor_c: String = emit_heap_record_destructor(
 		record_decl,
 		member_spelling,
 		type_plan,
