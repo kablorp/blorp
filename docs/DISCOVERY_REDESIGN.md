@@ -3463,852 +3463,172 @@ that makes it unreachable, not later. M6 switches the stage's internal
 default from tables to trees; it does not switch between two compiler front
 ends. The old parser still serves `compile --ast`, test discovery, the LSP
 and parity checks, as [`DISCOVERY_ACCEPTANCE_ROADMAP.md`](DISCOVERY_ACCEPTANCE_ROADMAP.md)
-records.
+records. Syntax stays frozen from M1 through M4, so the differential compares
+against a fixed target, and no prerequisite language migration remains.
 
-The schema assumes the current syntax rules described above. No prerequisite
-language migration remains in this plan; the import-cycle check is still
-required at M1. The M0 prototype is evidence only.
+This section records status, not design. The design is sections 2 to 6, the
+grammar is [`GRAMMAR.md`](GRAMMAR.md), and the history of each slice is in git
+(see the last paragraph).
 
-**How to read the slice record.** The status paragraphs below record slices
-that landed under the earlier recognize-then-mint design: ID-free recipes,
-bodies skipped by layout and replayed by token index, and a `StopReason` for
-every rollback. The 2026-10-06 decisions replace that design (sections 3.14,
-3.16 and 3.17). Those mechanisms are transitional: they stay until the M4 exit
-criteria below delete them, and where a slice's description disagrees with a
-section of 3, the section wins. The measurements and corpus counts stay valid
-as the record of what each slice read. New M4 slices mint directly and add no
-recipes, no replay by token index and no new `StopReason` variants; a slice
-that needs one is a defect in the slice.
+**Milestone status**, as of main at `7ab679600`:
 
-**Current milestone status:** M1 and M2 are complete. M1's pre-unification ordinary-record
-construction costs and token comparison are in
-[`discovery_redesign_record_shapes_2026-10-03.md`](../benchmarks/results/discovery_redesign_record_shapes_2026-10-03.md).
-M2's pre-unification stage cost and byte-identical tables dump are in
-[`discovery_redesign_m2_current_2026-10-03.md`](../benchmarks/results/discovery_redesign_m2_current_2026-10-03.md).
-M3 has the parse state, token cursor, imports, written types, dimensions,
-patterns and the shared field, type-parameter, signature and constraint
-grammar. Direct declaration leaves now cover ordinary and fixed records through
-one generic-capable `RecordDeclaration`, aliases, builtin and resource types, unions, enums and
-top-level function headers. Complete foreign blocks cover their attributes,
-bodyless function signatures and optional C names. Trait previews cover type
-parameters, supertraits and method headers. Their method previews distinguish
-abstract methods from authored deferred default bodies and reject a promised
-body that is missing. They mint no declaration definitions: M4 replays each
-completed method in source order and mints the containing trait last, preserving
-child ID order when deferred bodies become syntax trees. Declaration-prefix
-scanning preserves documentation, annotations, visibility and purity and composes
-those prefixes with the function header parser.
-Implementation-method previews reuse that signature grammar and require authored
-deferred bodies, leaving abstract and forward method states unrepresentable.
-Receiver-specific type parsing preserves bounded arguments and the grouped bounded
-type forms that can occur at a receiver root or function result. Implementation
-previews cover the single trait target, receiver and method headers without minting
-declaration definitions. M4 replays from the authoritative pre-declaration state,
-completes methods in source order and mints the containing implementation last.
-Global-header previews preserve their metadata, names and written types while
-stopping at an explicit initializer entry; M4 owns initializer expressions and
-completes the global declaration. A function header records `ForwardDeclaration`
-or `SkippedBody(DeferredBody)` explicitly, preserving forward declarations as
-authored syntax while M4 owns body trees.
-Import blocks now own their layout and repeated child imports. A test-only
-single-declaration dispatcher routes every completed leaf and declaration preview,
-and stops explicitly at global initializer or rejected-declaration boundaries.
-Both record spellings use the same type-parameter and field grammar and have
-managed semantics. The explicit `RecordDeclarationForm` preserves authored
-spelling for diagnostics and legacy projection. `struct` is an ordinary
-identifier; the retired declaration spelling is rejected by the current
-parser grammar.
-The module preamble recognizes a leading module docstring only when its next
-non-newline token is `import`; other docstrings remain declaration prefixes.
-A bounded test-only module scan retains those previews in source order and stops
-at global initializers or the first rejected declaration. It
-does not claim an accepted `ModuleSyntax`, final ID census or forward pairing.
-The test-only legacy declaration projection now maps the completed non-body
-prefix through one shared legacy name table. It covers both record spellings, aliases, builtin and resource types, unions, enums, import blocks
-and foreign blocks, including module and declaration documentation, visibility,
-annotations and normalized import paths. At a function, trait, implementation
-or global initializer it now projects the body-independent header structurally;
-it still stops at that deferred owner and at rejected or non-progressing scan
-boundaries, and never constructs a `ParsedProgram`. Unit
-differentials compare every projected declaration with the old parser and pin
-name-id continuity across declarations and projections. The additive
-declaration-prefix corpus differential now runs this projection from each exact
-accepted old-parser source and program, threads one shared synthesized name table,
-and fails closed on projection errors, rejected or non-progressing accepted
-boundaries, malformed protocol output and any unlisted field difference. Its
-first full corpus run compared 3,307 accepted modules and 4,403 completed
-declarations with zero tree-prefix differences or errors. Distinct per-module
-coverage included all completed forms: 2,095 import blocks, 69 foreign blocks,
-447 ordinary records, 118 `struct` declarations, 10 `fixed record` declarations,
-168 aliases, 29 builtin types, 10 resource types, 309 unions and 127 enums.
-The deferred function stop now projects a body-free legacy header and compares
-its name, keyword, type parameters and bounds, parameters and types, result,
-dimension constraints, purity, annotations and documentation through the shared
-AST JSON encoding. The same corpus run validated 2,683 function-header stops
-with no structural or boundary difference while leaving bodies unconstructed.
-It also validated all 452 global-initializer stops by comparing the global name,
-optional written type, constant or mutable form, documentation, visibility and
-exact assignment and initializer-entry boundary. The selected global header
-advances the shared name table, while its initializer and any later declaration
-cannot contribute names. A later 3,404-file parity run, whose 3,307 accepted
-modules entered declaration-prefix comparison, compared 60 trait headers and
-57 implementation headers, including every ordered method header,
-abstract/default or required-body presence and per-method boundary. Names from
-deferred method bodies and later declarations remain outside the projected name
-table. Module assembly, rejected-module tree diagnostic parity, the remaining
-global initializer expression families, trait and implementation bodies and
-completed owners, and forward pairing remain open.
-The standalone alias, builtin-type, enum, ordinary-record, union and
-fixed-record rejection previews now own a shared opaque `RejectedPreview`:
-source, line starts, final parser spellings, all issued definitions and ordered
-diagnostics. Its constructor rejects an empty diagnostic list. `new_parse_state`
-validates that line starts exactly match the source in one scan without building
-a second list; malformed lexical inputs fail before layout or rendering. The bounded
-`render_rejected_duplicate_field` seam resolves the surviving `DefinitionId`
-against that immutable index and shares wording with the table renderer.
-Focused regressions cover both record spellings, a nonzero earlier field id, and invalid missing, cross-module,
-wrong-kind and forward references. This closes the preview lifetime blocker;
-full rejected-module assembly and diagnostic parity remain open.
-
-The syntax diagnostic payload audit found one definition identity
-(`DuplicateField`) and spelling identities in `ReservedKeywordAsName`,
-`UnknownAnnotation`, `ConcurrentDuplicateParameter`,
-`ConcurrentUnknownParameter` and `ConcurrentForUnknownParameter`. The shared
-rejection owner keeps both lookup
-families. Other syntax payloads carry direct values or spans and retain their
-source with the same owner.
-
-The first bounded M4 slice completes a global only when its initializer is one
-same-line ordinary name, checked decimal integer literal or checked float
-literal and its following token proves an EOF or newline boundary rather than
-a leading-dot continuation. It checks the whole supported shape before minting
-anything. A name mints its `NameUse`, `Expression`, and global definition in
-that order; a numeric literal mints only its `Expression` and global definition.
-The tree keeps the checked integer magnitude or decimal float while the legacy
-projection recovers the exact authored digits, so `007` and `007.500` remain
-unchanged. Every unsupported expression returns the exact
-authoritative initializer state. The existing M3 scan remains the default; an
-explicit test-only scan opts into atomic completion. Its legacy projection
-compares the full `ParsedVarDecl`, including the initializer and complete span,
-while threading the shared name table through repeated spellings and later
-modules. After a fresh rebuild, the 3,404-file parity gate passed with zero
-mismatched files. Its declaration-prefix run compared 3,308 accepted modules
-and 4,862 completed declarations, then stopped at 2,782 functions, 60 traits,
-59 implementations, 339 unsupported global initializers and 68 ends of source,
-with no rejected or non-progressing accepted boundary. This proves only the
-three atomic initializer forms: general expressions, complete bodies, module
-assembly, final ID census and the rest of M4 remain open.
-
-
-A bounded diagnostic gate now renders every `SyntaxDiagnostic` variant
-from the retained rejection owner. Spelling payloads resolve through its final
-spelling table; `DuplicateField` resolves through its exact definitions index.
-The tree and table renderers share context-free wording helpers. A separate
-whole-source rejected-declaration scan continues leaf recovery to EOF and
-compares every ordered diagnostic, including help, byte spans and tab-aware
-locations, against the table renderer. Raw legacy differences are always
-reported, and counted as baseline differences only after exact tree/table
-equality, preserving the stage's existing help and wording changes. It explicitly
-defers functions, traits, implementations and globals before their omitted
-bodies or initializers can affect diagnostics. Those deferred counts remain
-outside this proof; full rejected-module parity remains open.
-
-A second bounded M4 expression increment recognizes same-line names, checked numeric
-literals, booleans, void, grouping, unary operators and the shared binary
-operator table, including logical and range expressions. It first builds an
-ID-free recipe and validates the complete boundary. Only then does it mint
-syntax identities in source order. Unsupported postfix, aggregate, control
-flow and multiline shapes restore the exact entry state. An explicit prefix
-scan opts into this expression grammar; production discovery remains unchanged.
-The legacy projection walks expression continuations iteratively, preserving
-source-order names and spans. Grouped integer literals recover digits from
-an exact balanced token shape, with a projection error when provenance is
-missing. This increment does not complete function bodies, blocks, module
-assembly, forward pairing or the full M4 deep-chain gate.
-
-Another bounded M4 increment extends that same-line grammar with positional
-calls, member access and nonempty subscripts. Calls may have no arguments;
-calls and subscripts accept trailing commas. Recognition keeps ID-free recipes
-until the complete initializer boundary is accepted. Minting walks receiver
-and callee spines iteratively, then issues member names and argument/index
-expressions in written order. The legacy projection uses continuations for
-those same spines and keeps raw call, field and subscript syntax; later phases
-decide what the calls and accesses mean.
-
-Supported postfix rejection covers missing closing delimiters at EOF, empty
-subscripts and missing member names. Comma-first arguments, mismatched closing
-delimiters after a parsed item, aggregate operands and multiline tails remain
-explicitly unsupported and restore the exact entry state. This remains a test-only
-expression completion seam; statements, bodies and complete module assembly
-are still open.
-
-Another bounded M4 increment adds same-line list literals through the existing
-`ListLiteral` variant: `[a, b]`, empty `[]` and a trailing comma. A list is an
-atom, so postfix steps and operators apply to the whole list. The recipe keeps
-the elements ID-free until the whole initializer boundary is accepted, then
-mints each element child-first in written order and the list last, with the
-span from `[` to `]`. An unclosed list at end of source reports
-"expected `]` after list literal" at that position and issues no IDs. Multiline lists, a
-missing comma, a closing bracket of the wrong kind and elements outside the
-supported grammar restore the exact entry state. Call arguments, subscript
-indices and list items share one item reader and one closing-bracket routine,
-so the three delimiters cannot drift apart. The legacy projection walks
-elements with the same continuation stack as call arguments, so a wide list
-needs no recursion. The syntax dump writes lists nested directly in lists with
-an explicit stack of open lists: its general expression walker overflowed the
-native stack of the Linux gate at about 700 nested lists, so recursion alone
-could not meet the 1,000-deep requirement.
-
-Another bounded M4 increment adds same-line tuples of two to four elements,
-`(a, b)`, with an optional trailing comma, in the existing `TupleLiteral`
-variant and its `SmallTuple` shapes. Grouping stays distinct: the comma after
-the first item is what makes a tuple, so `(a)` and `((a, b))` never become one.
-Every item is read ID-free before the count is judged, as the frozen parser
-does, so a one-element `(x,)` reports `SingletonTupleDiagnostic` and a tuple of
-more than four elements reports `TupleArityDiagnostic`, both over the whole
-parenthesized span, and a tuple left unclosed at end of source reports
-`expected ) after tuple expression` first, then its count diagnostic over the
-open parenthesis and first item, in the frozen parser's order. A rejected tuple
-issues no IDs and adds no schema variant. A comma before end of source, which
-the frozen parser reads as a missing counted item, is deferred, as are
-mismatched or newline-separated tuples: both restore the exact entry state. The dump walks lists and tuples nested
-directly in each other with one explicit stack of open sequences, and the
-legacy projection uses one continuation for both.
-
-Another bounded M4 increment adds the same-line braced forms through the
-existing variants: record literals (`{}` and `{name = value}`), record updates
-(`{record | name = value}`), dict literals (`{key => value}`) and vector
-literals (`{a, b}`), each with an optional trailing comma. They are told apart
-as the frozen parser does: a leading `name =` makes a record, otherwise the
-token after the first expression (`=>`, `|` or anything else) chooses the
-form. Item reading is shared with the other bracketed lists, now generic over
-the item. A field's name use is issued before its value, an update's base
-before its fields and a dict key before its value. A repeated record or update
-field is reported as `DuplicateFieldGiven` at the later name, pointing at the
-first one, after every field is read; such a record is rejected and issues no
-IDs. An unclosed form reports its own missing-brace diagnostic. As for tuples,
-a comma before end of source in a vector or dict, where the frozen parser reads
-a missing counted item, a missing `=>` or `=`, a newline inside the braces and
-anything outside the supported grammar restore the exact entry state. A
-rejection inside an item keeps only that item's diagnostics, as for lists. The
-dump's open-sequence stack now covers vectors too, and the projection
-continues through fields and entries in written order. The 1,000-deep proofs
-sit near the Linux native stack: adding the braced arms inline to the atom and
-mint functions made 1,000 nested lists crash there while macOS passed, so those
-arms are functions of their own and the frames on the nesting path stay small.
-
-Another bounded M4 increment reads `if` / `else if` / `else` and `match` as
-the value of a statement: after `=` or `op=`, in `var x = ...`, `x: T = ...`
-and `xs[i] = ...`. The frozen language has no one-line `if`: `x = if c: a else: b`
-is rejected with "expected newline before indented block", and the schema
-agrees, since `IfExpression.then_block` is a `Block` and a `Block` always has a
-last statement. So the only value form is the block form, which is the form the
-statement slice already reads, and no new tree shape is needed. The recipe is a
-`ValueRecipe` (plain expression, conditional or match) used only where a
-statement takes a value, so a control expression cannot appear in
-`ExpressionRecipe` and the expression grammar and the body grammar need no
-import cycle and no shared recipe module. A control expression as an operand or
-an argument stays unsupported, as does a loop exit inside a value's blocks, a
-binary operator or a leading dot continuing past the closing dedent, and any
-tail indented past it. (A header condition and a function's one-line body
-cannot hold a block form in the frozen grammar either, so there is nothing to
-defer there.) `else if` links and match cases are read and minted by loops, the
-same code as the statement forms; statement-position and value-position `if`
-share one reader. The legacy projection treats a statement's value like an
-expression statement, so chains project by a loop.
-
-Block nesting follows indentation and is recursion in the parser, the minter,
-the dump and the projection.
-
-Their dispatchers (`mint_statement`, `dumped_statement`, `dumped_expression`
-and `legacy_statement_preview`) are thin, and most statement kinds have a
-function of their own (`while`, compound assignment and local functions stay
-inline), to keep the frames on that path small. Measured on Linux arm64 on the
-rebased build, 1,000 and 1,200 value `if`s nested one inside another pass
-parse, mint, census, dump and projection, and 1,400 overflow the native stack.
-That limit is open item D6 in section 9 (superseded, see 3.14).
-
-Another bounded M4 increment lets a control expression be an operand: the
-right operand of a binary operator or the operand of a unary one, in a
-statement's value, an expression statement, a global initializer or a
-function's block, so `1 + if c: ...`, `-match x: ...` and `ok and match y: ...`
-read as the frozen parser reads them. An expression recipe may now hold a
-control recipe, and a control recipe holds blocks, statements and expressions,
-so the recipe types moved to `parse/recipes.brp` and the type graph has no
-cycle. The expression parser and the body parser import each other for
-functions only (`parse_control_recipe`, `mint_control`, `ends_in_control`); the
-compiler accepts mutually recursive modules and no repository check forbids
-them. A whole-value control keeps its thin front in the body parser, and the
-right operand of an operator is read through a thin front too, so the
-operator-precedence frames are not on the nesting path.
-
-An expression that ends in a control expression ends at the block's dedent, so
-it needs no newline: the next token starts the next statement or declaration,
-and `ends_in_control` says so. What may follow stays narrow: a binary
-operator, `as` or `=` after the dedent, a leading dot, a bracket or a tail
-indented past it all defer, and a control expression inside brackets defers.
-A same-line function body that ends on a later line is deferred, because the
-frozen grammar rejects a block after a one-line body. A statement of this slice
-that the new grammar accepted and the frozen one rejects would be a defect; the
-projection tests compare AST JSON for the accepted forms.
-
-Block nesting through an operand has a lower limit than through a statement's
-value, because the general expression dump and mint walkers are on the path:
-on macOS 700 nested operands pass and 900 overflow, in the dump; on Linux arm64
-300 pass and 500 overflow. The test proves 300. That is open item D6 (superseded, see 3.14).
-
-The multiline-brackets slice removes the line-number layout from the tree
-expression and statement parsers, as section 3.16 requires. The lexer emits no
-newline, indent or dedent token between `(`, `[` and `{`, so a bracketed form
-that spans lines reads token by token like one that does not: calls, subscripts,
-lists, tuples, groupings and the four brace forms may open, separate and close
-on any lines, and the ten `Multiline*` stop reasons are gone. Outside brackets
-the parsers stop on the NEWLINE token. A value that starts on the next line,
-an operator followed by a newline and a member name on the next line stop on
-it, and a header colon after a multiline condition, a `with`, `select` or
-`concurrent` header across lines and a global whose initializer opens a bracket
-on its line are read. The census of first-stop modules fell from 1,851 to 693
-(function 645, global initializer 29, implementation 19); `indented-method-chain`
-(260) is now the top reason, then `tuple-destructuring` (133) and
-`opaque-conversion` (120).
-
-What replaced the line check, each by a token or recipe rule:
-- an expression that ends in a block's dedent (a control expression or a block
-  lambda, `ends_in_dedent`) is not continued: no postfix step and no operator
-  follows it, because what follows starts the next statement. This is the
-  `OperatorAfterBlock` quirk of D8, which the frozen parser has: a binary
-  operator, `as` or `=` after the dedent continues the block's expression, and
-  the tree parsers decline it (`OperatorAfterBlock`) rather than read it;
-- a block opened inside brackets, or on a header's line, is measured against
-  the bracketed-block anchor of section 3.16 (`layout_quirks.block_may_open`).
-  A keyword rule (a block only as a call argument, never in a `while` header
-  or after a same-line body) cannot express it: the frozen parser accepts a
-  block in any of those places that is indented past the anchor.
-
-Position queries remain in the M3 header parsers (`tree_function_header_parser`,
-the trait and implementation method header parsers) in two forms. The
-skip-extent queries (`skip_body`'s anchor line and column, which end a skipped
-body where the frozen parser's indentation anchor says) go with the
-skip-and-replay design (section 8 exit criteria). The body-follows checks, which
-ask whether a body starts on the colon's line
-(`tree_function_header_parser.brp:152`, `tree_trait_method_header_parser.brp:77,84`,
-`tree_implementation_method_header_parser.brp:108,116`), could be token tests
-and are an M4 exit criterion. The restricted-symbol rule of section 3.16 is not
-enabled until both are gone.
-
-The next bounded M4 slices are continuation lines outside brackets (a value
-continued after an operator, and the leading-dot and indented method chains),
-then opaque conversions in a separate slice. Continuation is read as the token
-rules of section 3.16, not by comparing line numbers. Lambdas, local functions,
-the bodies of traits and implementations and the statement forms are read; the
-complete M4 gate is the exit criteria below, which also require the nesting
-proof of section 3.14 in place of the open depth items D5 to D7.
-
-Argument and list nesting are the recursion in the postfix and list grammar.
-They follow brackets the source itself nests, as the frozen parser does, and
-tests parse 1,000 nested calls `f(f(...))`, 1,000 nested lists `[[...]]`, 1,000
-nested tuples, 1,000 alternating tuples and lists and 1,000 nested vectors.
-
-The postfix slice was validated on a fresh build that includes main
-`ff4da4b31`. Focused checks passed 152/152 and declaration-scan checks 14/14,
-all with zero leaked objects under `--leak-check`. The broad gates passed
-`compiler-new` 837/837 and `compiler-new-parity` 3,548/3,548, with zero
-mismatched files under the gate's existing normalization; `compiler-blorp`
-passed 6,594/6,594 at main `dde591ecd`. Depth checks cover a 2,000-call chain
-through parsing, dumping and ID census, and 5,000 mixed field/call/subscript
-steps through legacy projection. The expression opt-in prefix compared 5,200
-completed declarations in 3,398 legacy-accepted corpus modules. It stopped at
-2,891 functions, 61 traits, 61 implementations, 310 unsupported globals and
-75 ends of source, with zero rejected or non-progress stops.
-`scripts/compiler-new-parity` (also run by `scripts/test compiler-new-parity`)
-prints these counts on its "tree prefix agrees with the existing parser for
-every corpus file as a root" line. These are prefix comparisons, not complete
-body or module parity.
-
-The list slice was validated on a fresh build at main `6205aba41`. Focused
-checks passed 15/15 (expression parser), 15/15 (projection) and 15/15
-(declaration scan), the latter two with zero leaked objects under `--leak-check`.
-On the final tree (after merging main `3f80e94e0`) `compiler-new` passed 844/844 and
-`compiler-new-parity` 3,559/3,559 with zero mismatched files. Before the merge
-`compiler-blorp` passed 6,600/6,600, and the Linux arm64 premerge gate passed
-18,401/18,401 on the merged tree ahead of a last refactor of the delimiter types
-and the dump's open-list stack, which the focused suites and the two gates above
-rechecked. The 1,000-nested
-list passes parse (1,001 expressions, no diagnostics), dump, ID census and
-legacy projection to a 1,000-deep `ParsedListExpr`; a 3,000-element list
-projects in order. The corpus prefix run compared 5,202 completed declarations
-in 3,399 modules with stops unchanged at 2,892 functions, 61 traits, 61
-implementations, 310 unsupported globals and 75 ends of source, and zero
-rejected or non-progress stops. The stops did not move, so this run does not
-by itself show list coverage in the corpus; the list parity evidence is the
-AST-JSON differential over 14 list shapes in the projection suite.
-
-The statements-and-blocks slice completes top-level functions whose body the
-new body parser reads in full: an expression body, or an indented block of
-`var`, `x: T = v`, `x = v`, `_ = v`, `x op= v`, `xs[i] = v`, expression
-statements, `if` / `else if` / `else` and `match` (block or same-line cases)
-in statement position, `while`, `for name in iterable`, `break` and
-`continue`. Recognition builds an ID-free recipe over the expression slice's
-now public recipes (an `else if` chain is a flat list of links, a block a
-list of statements) and accepts the whole body or none of it. Minting then
-issues every id in source order, children before their owner: an `else if`
-before the link that owns it, a subscript place before its value, and the
-function after both its header and its body. A written type or a pattern
-issues ids of its own, so recognition parses one only to learn where it ends
-and discards what it issued (`resumed_after`); minting parses it again from
-the recorded token (`resumed_at`), which keeps every id family in source
-order. The function's skipped body is replayed the same way from the extent
-its header recorded, and must end where that extent ends. Everything else
-(`?=`, tuple destructuring, local functions, `concurrent`, `select`, `with`,
-`debug:`, a value on the line after its operator, any expression the
-expression slice rolls back, a syntax error, and forward declarations)
-restores the exact entry state: the scan keeps today's skipped-body preview
-and the projection stops at that function. `scan_module_declaration_prefix_with_bodies`
-opts in; the other scans are unchanged. Statements, blocks and `else if`
-chains project through loops (`legacy_body_preview`), patterns through every
-pattern form, and a `match` ends at the dedent token that closes its arms,
-which the frozen parser's span reaches and the tree therefore carries.
-
-On a fresh build of main `6af65febc` plus this change, the 3,403-module
-"every corpus file as a root" run compared 8,137 completed declarations, 2,759
-of them functions with bodies, against 5,241 before. The modules whose first
-stop is a function fell from 2,903 to 2,017; trait and implementation stops
-read 66 and 65 (62 and 61 before), global initializers 359 (300), because a
-module that used to stop at its first function now reaches its later owners.
-There were zero rejected or non-progress stops and zero differing files in the
-3,560-file parity gate. Function bodies are the dominant remaining stop: the
-next slices (superseded, see 3.14 and 3.16; new slices mint directly and read no
-recipes) are the expression forms they still roll back on (string and
-character literals and interpolation first, then `?=`, tuples and braced
-forms from the parallel expression work) and then trait and implementation
-method bodies, which replay through the same `complete_function`. Focused
-checks passed 9/9 (body parser, with zero leaked objects) and 9/9 (projection,
-likewise), adapter 123/123, expression projection 15/15 and rejected
-differential 8/8. The depth checks run a 2,000-link `else if` chain through
-parse (the census holds), dump and projection to a 2,000-deep `ParsedIfExpr`,
-and 5,000 statements through the same three. `compiler-new` passed 853/853,
-`compiler-new-parity` 3,560/3,560 and `compiler-blorp` 6,629/6,629.
-
-The string-literal slice adds quoted, raw and pipe string literals, character
-literals and interpolated strings to the expression grammar, so every
-statement, condition, global initializer and call argument of the previous
-slices may hold them. A literal is an atom whose recipe keeps the checked text
-or codepoint. An interpolated string reads each hole as an expression: the
-hole's bytes are lexed into a token run of their own (`entered_hole`, which
-parks the outer cursor and source and takes the module's spellings), parsed to
-a recipe that must end at the run's end of file, and handed back
-(`left_hole`). The string's recipe holds hole recipes, so recognition still
-issues no id; minting walks the pieces in written order, each hole's value
-before the hole (an `ExpressionId` of its own) and the string last. A hole that
-does not lex cleanly or is not exactly one supported expression leaves the
-whole string unsupported, and the entry points restore the exact entry state,
-spellings included, even after an earlier hole read and interned names. The
-projection walks holes with the same continuation stack as other nested
-expressions. A hole's integer literal is authored text in a token run the
-module's token list does not hold, so `PreviewSource` also carries every hole's
-tokens, sorted by position, and the digit lookups search them after the
-module's own. The tree-prefix parity now accepts the one fixture on which the
-existing lexer mis-reads three-level nesting, through the same allowance the
-full adapter differential uses.
-
-Two constraints follow for the slices after this one. A pipe string or pipe
-interpolation is only ever an indented value (`x =` then an indented line), which
-the statement grammar does not read yet, so the pipe forms are tested at the
-expression level; they gain statement coverage with indented values. And a
-hole's tokens are indexed within the hole's own run, which no caller can see:
-a later slice that allows a lambda, a `match` or any construct that replays
-from a recorded token inside a hole must not replay by token index, and needs
-the hole's run kept with the recipe or the construct kept out of holes.
-
-On the 3,405-module "every corpus file as a root" run, the modules whose first
-stop is a function fell from 2,019 to 1,885, completed declarations rose from
-8,139 to 11,714 and functions with bodies from 2,759 to 4,841; global
-initializer stops fell from 359 to 257, and trait and implementation stops
-read 70 and 69 (66 and 65). The same base and tooling, with strings still
-rolling back, gave the first figures. There were no rejected or non-progress
-stops and no differing file in the parity gate. The 1,885 remaining function
-stops are bodies that use `?=`, tuple and braced forms (the parallel
-expression work), lambdas, local functions, `with`, `concurrent`, `select`,
-`debug:` and values on the line after their operator. `compiler-new` passed
-856/856, `compiler-new-parity` 3,563/3,563 and `compiler-blorp` 6,631/6,631.
-
-The question-binding and member-body slice adds three things. `x [: T] ?= v`
-joins the statements outside a loop (inside a loop the frozen parser reports
-it, so a loop body leaves it unsupported, and `_ ?= v` is not read), and
-`for (a, b) in xs` reads a tuple binder of two to four names or `_` with a
-trailing comma allowed, its span the parentheses. A trait or implementation is
-completed by reading it again from the state before its prefix, with each
-method read through its header and then its body (`complete_body`, which
-`complete_function` shares), so the owner's ids stay in source order: a
-method's header, its body, its definition, the next method, and the owner
-last. The two owner parsers are generic over how a method is read (the
-preview scans still read headers; the completing reader returns the complete
-`TraitMethod` or `ImplementationMethod`), and an owner with any body outside
-the slice stays a preview with every id of its replay rolled back. The
-projection builds `ParsedTraitDecl` and `ParsedImplDecl` with their methods'
-bodies. The scan policy is now `CompleteExpressionsAndBodies`, and the
-differential reports completed functions, traits and implementations apart.
-
-On the 3,408-module "every corpus file as a root" run, against the previous
-slice's tree on the same corpus (3,407 modules), the modules whose first stop
-is a function fell from 1,887 to 1,881 and trait stops from 70 to 0;
-implementation stops fell from 69 to 44, completed declarations rose from
-11,724 to 12,217, and the bodies read are 5,051 functions (4,847), 112 traits
-and 128 implementations (none before). Zero rejected or non-progress stops and
-no differing file. The remaining function stops use lambdas, local functions,
-`with`, `concurrent`, `select`, `debug:`, braced and tuple expressions (the
-parallel expression work), destructuring and values on the line after their
-operator. `compiler-new` passed 861/861, `compiler-new-parity` 3,566/3,566 and
-`compiler-blorp` 6,658/6,658.
-
-The tuple slice was validated on a fresh build at main `1d87c1ef1`. Focused
-checks passed 21/21 (expression parser), 18/18 (projection) and 16/16
-(declaration scan), the latter two with zero leaked objects under `--leak-check`.
-The broad gates passed `compiler-new` 851/851, `compiler-new-parity` 3,559/3,559
-with zero mismatched files, and `compiler-blorp` 6,622/6,622. The 1,000-nested
-tuple and the 1,000-level alternating tuple and list cases pass parse, dump, ID
-census and legacy projection. The diagnostics were compared by hand with
-`blorp check` on the frozen parser for `(1,)`, five elements and an unclosed
-five-element tuple. The corpus prefix run compared 5,220 completed declarations in
-3,401 modules and stopped at 2,903 functions, 62 traits, 61 implementations, 298
-unsupported globals and 77 ends of source, with zero rejected or non-progress
-stops. It was not baselined against the list slice, so it is not tuple evidence;
-parity evidence is the AST-JSON differential over 13 tuple shapes in the
-projection suite.
-
-The braced slice was validated on a fresh build stacked on the tuple slice and
-merged with main `7f4d4212a`. Focused checks passed 31/31 (expression parser),
-22/22 (projection), 18/18 (declaration scan), 14/14 and 12/12 (bodies). The
-broad gates passed `compiler-new` 875/875, `compiler-new-parity` 3,567/3,567
-with zero mismatched files and `compiler-blorp` 6,665/6,665. Duplicate-field,
-unclosed-brace and missing-first-item diagnostics were compared by hand with
-`blorp check` on the frozen parser. 1,000 nested vectors pass parse, dump, ID
-census and legacy projection; nested records, updates and dicts are covered to
-200 levels (open item D5, superseded, see 3.14). The 3,409-module "every corpus file as a root" run
-compared 13,472 completed declarations, stopped at 1,635 functions and 304
-unsupported globals, and had zero rejected or non-progress stops. Parity
-evidence for the braced forms is also the AST-JSON differential over 16 braced
-shapes in the projection suite.
-
-Module assembly (`parse/tree_module_assembly.brp`) turns the body-completing
-scan into the stage's output. `assemble_module` reads one `LexedModule` with
-its one mint and returns exactly one outcome: `AssembledModule` (a
-`ModuleSyntax` and the module's final spellings) when the scan reached the end
-of the source, every declaration is complete syntax, the module has no
-diagnostic and every forward declaration is paired (section 3.17);
-`RejectedModule` (the shared `RejectedPreview`, with the mint's definitions
-index) when every declaration was read and the module has a diagnostic,
-lexical or unpaired; and `UnassembledModule` otherwise, naming the first
-declaration in source order the tree parser did not read (a function body,
-trait or implementation bodies, a global initializer, a rejected global
-initializer or declaration, or no progress). No outcome holds a partial tree.
-Forward declarations now complete as functions with no body and are minted in
-source order like any function. The legacy adapter's module half
-(`legacy_assembled_program`) projects an assembled module to a whole
-`ParsedProgram` through the same per-item translation the declaration prefix
-uses, threading one shared name table.
-
-The adapter differential runs it over every module of each root run and of the
-every-file run: each assembled module passes the id census (section 4.6) and
-its whole projected program is compared with the existing parser's, source,
-module documentation and every declaration, span for span. The census also
-runs as a corpus test of the `compiler-new` gate
-(`test_tree_module_assembly.brp`), over every module of the should_pass corpus
-and the standard library that assembles, none of which may be rejected; the
-link-time debug census arrives with M5. Pairing covers both visibilities: the
-frozen parser paired only public functions and accepted a lone private
-forward declaration, so it was fixed to agree, with fixtures for a private
-unpaired declaration, a private body and two declarations sharing one body. On a fresh build merged with main `e51aaab9f` (lambdas, local functions,
-the statement forms and the stop-reason census included), 1,687 of the 3,417
-legacy-accepted corpus modules assemble with a clean census and zero full-AST
-differences; the other 1,730 stop at a function body (1,338), implementation
-bodies (28) or a global initializer (364), with no rejected or non-progress
-stop and no module the tree path rejects. The root runs assemble 59 of 514
-modules (compile root, either standard-library source), 23 of 103 (test
-root), 8 of 39 (native package) and 14 of 41 (source packages), all with zero
-differences. These counts grow as the remaining body slices land; the parity
-gate prints them on its "tree modules agree with the existing parser" lines.
-
-The control-value slice was validated on a fresh build rebased on main
-`3083c8c00`. Focused checks passed 17/17 (body parser), 19/19 (body projection),
-31/31 (expression parser) and the declaration scan. `compiler-new` passed
-880/880, `compiler-new-parity` 3,567/3,567 with zero mismatched files and
-`compiler-blorp` 6,668/6,668. The corpus prefix run compared 13,753 completed
-declarations in 3,409 modules, 6,426 functions, 115 traits and 165
-implementations with bodies, and stopped at 1,597 functions and 318 unsupported
-globals with zero rejected or non-progress stops. A value `if` and `match`,
-including after `?=`, over every statement form equal the frozen parser's AST
-JSON.
-
-The lambda and local-function slice reads `func(a, b: T) [-> R]: body` and
-`pure func(...)` as expression atoms and `func name(...)` as a statement. A
-lambda is a body owner of its own: its body is an expression on the `:` line
-or an indented block, recognized with the loop context reset (a `?=` inside it
-is its own, a `break` is not), and parameter and return types replay from
-their tokens like a statement's, so a lambda's ids run parameters, types, body,
-then the lambda. A block-bodied lambda ends at its block's dedent, so a
-statement value may end there when the next token cannot continue the
-expression. A local function's header is parsed to learn where it ends and
-discarded, then parsed again when minting, so its definition id follows
-everything declared inside it and precedes its enclosing function's. The
-constraint recorded for holes is now enforced rather than assumed:
-`ParseState.inside_hole` is true while a hole's token run is the cursor, and
-a lambda there is left unsupported, because a replayed token position would
-index the hole's run. Bodies share `recognize_skipped_body` and
-`mint_body_recipe` with functions and members, and a replay that reports
-anything leaves the owner unread. The expression parser and the body parser
-now import each other, because a lambda atom holds a statement recipe; the
-control-expression-operands slice's shared `parse/recipes.brp` for the recipe
-types is where that cycle is meant to end, so the two slices coordinate
-through main.
-
-Against main with the tuple, braced and control-value slices (the same 3,409
-modules, the "every corpus file as a root" run), the modules whose first stop
-is a function fell from 1,597 to 1,473, completed declarations rose from
-13,753 to 14,198, and the bodies read are now 6,848 functions (6,426) with 117
-traits (115) and 167 implementations (165). Global-initializer stops read 349
-against 318, which is first-stop accounting: modules that stopped at a function
-now reach their later globals. There were no differing files and no rejected or
-non-progress stops. Nested lambdas pass parse, dump, census and projection to
-200 deep in the tests. Measured on Linux arm64 after the tuple, braced and
-control merges, 500 deep passes and 700 overflows the native stack, as 3,000
-does on macOS: every walker (the expression parser, minting, the dump, the
-census and the projection) takes a frame per level, so the limit is their
-summed frame sizes. The 1,000-deep proof is open item D7 (superseded, see 3.14). Reading lambdas in
-call arguments that span lines, in holes and in a parameter list across lines remains for later slices.
-`compiler-new` passed 882/882, `compiler-new-parity` 3,567/3,567 and
-`compiler-blorp` 6,670/6,670.
-
-Every rollback in the tree parsers carries why it declined. The `Unsupported`
-results of the expression, statement and owner parsers hold a `StopPoint` (a
-closed `StopReason` and the token the parser stood at, `stop_reason.brp`),
-chosen at the rollback from the construct just recognized, and the scan stops
-at the declaration it declined with that `StopPoint`
-(`StoppedAtUnreadDeclaration`). Nothing reads it in production.
-`scripts/compiler-new-parity --stop-census` ranks the reasons over the corpus,
-one per module that was not read in full; its first result, which also counted
-the declarations the scan then tried after the first, is
-[`benchmarks/results/discovery_m4_stop_reason_census_2026-10-06.md`](../benchmarks/results/discovery_m4_stop_reason_census_2026-10-06.md).
-A new rollback adds its reason to the enum, and the census label match
-(`blorp/test/test_compiler_new/support/stop_reason_label.brp`) stops compiling until
-it is named. The census mixes unlike things (missing grammar, syntax errors the
-parser does not yet report, artificial limits and cannot-happen guards); the M4
-exit criteria below classify and then delete it.
-A full census stores its stops, and `--stop-reason LABEL` or `--files PATH...`
-then runs the parity, the adapter differential or the census over just those
-modules, so a slice iterates on one stop reason without the corpus run.
-
-The tree path is test-only, which sets what an M4 slice hands back. No program
-imports it: the tree parsers and `compiler/discovery_tree_projection.brp` (the
-projection of trees to the old parser's AST, split out of `discovery_adapter.brp`
-so the import graph shows it) are reached by no other `blorp/src` module, so they
-are not part of `bin/blorp`; only tests and the parity tools use them. A slice
-whose changed paths are all tree path hands back `make`, the suites that import
-the changed files and `scripts/test compiler-new compiler-new-parity`, and not
-the full `compiler-blorp` gate. Any other path, including the old parser, the
-adapter, the lexer and diagnostics, a `RUN-BLORP-CHECK` fixture, and anything
-the graph cannot place, makes the change broad.
-`scripts/compiler-check --changed --plan` prints which one a change set is.
-[`WORKER_CHECKLIST`](WORKER_CHECKLIST.md#hand-back-gates-for-discovery-parser-work)
-has the commands.
-
-The statement-forms slice reads `select`, `with`, `concurrent` and `debug:` as
-statements, and `detach x` as a prefix operator. `select` is also a whole value
-after `=` or `op=`, as `if` and `match` are. `with`, `concurrent` and `debug`
-are not values: the frozen parser indents their block past the keyword rather
-than past the statement, so `x = with ...:` written the usual way is rejected
-there and must stay unread here (the corpus holds none). The same column rule
-leaves a same-line `match` case body that starts with one of the four forms
-unsupported. `detach` is an
-expression recipe like `not`: its operand is a whole postfix chain, and its id
-follows its operand's. Each statement form builds an ID-free recipe, validates
-the whole header and every block, and only then mints in source order. A `with`
-mints its binder, written type, value, `on` binder and `on` value, then its
-block, then itself; a `select` mints each arm's binder and channel before the
-arm's block; a `concurrent` mints its `timeout` value before its block. A count
-parameter (`max_threads`) is a `PositiveCount` the recognizer checks, so it
-mints nothing and the two parameters may come in either order. A grouped
-literal counts; `-1`, a name, an expression, zero and a value above `Int` do
-not. What the frozen grammar reports restores the exact entry state, ids,
-diagnostics and interned names included: a second `with` binding, a missing
-colon, an `on` clause after `=`, an unknown, repeated, empty or non-literal
-`concurrent` parameter, a `select` with no arms or an arm without a block, a
-binder spelled `after` or `from`, a value after a `debug:` colon, and a
-`break` in a `concurrent` block (it leaves no loop, as in the frozen parser).
-`concurrent` blocks are read outside every loop, so `?=` is allowed in one even
-inside a loop; a `with`, `debug` or `select` block sees the enclosing loop, so
-`break` and `continue` pass and `?=` stays refused. A `with` acquisition's own
-`?=` is not the statement and is allowed in a loop. Four conventions are the
-frozen parser's: a `select` ends at the dedent that closes its arms, like
-`match`; an arm's span runs from its first token to its block; an `on` clause
-spans from its binder; and the token after any of these blocks must not
-continue it. The legacy projection builds `ParsedWithExpr`, `ParsedSelectExpr`,
-`ParsedConcurrentBlockExpr`, `ParsedDebugBlockExpr` and `ParsedDetachExpr`;
-the AST JSON equals the frozen parser's for every shape in the projection
-suite, including all four forms nested in each other and in `if`, `match` and
-`for` blocks. The dump and census arms for the four statement forms moved into
-functions of their own: inline, the 700-deep case overflowed the Linux native
-stack in the dump and census frames.
-
-On a fresh build of main `16f80b101` plus this change, the 3,412-module "every
-corpus file as a root" run compared 14,608 completed declarations (7,249
-functions, 117 traits and 167 implementations with bodies), against 14,212
-(6,858 functions) on the same main without it. The modules whose first stop is a
-function fell from 1,473 to 1,339; end of source rose from 1,561 to 1,681 and
-global initializers from 350 to 364 because modules that used to stop at a
-function now reach later owners; implementation stops are unchanged (28), and
-there are no rejected or non-progress stops and no differing file. Every new
-rollback carries a `StopPoint` (`SelectWithoutArms`, `SelectNotClosed`,
-`SelectArmMalformed`, `WithBindingMalformed`, `WithHeaderWithoutColon`,
-`WithErrorMapMalformed`, `ConcurrentHeaderWithoutColon`,
-`ConcurrentParametersMalformed`, `ConcurrentParameterUnknown`,
-`ConcurrentParameterRepeated`, `ConcurrentCountNotLiteral`), and
-`opens_block_form` in `stop_reason.brp` is the one place that tells a block
-from a soft-keyword name; `DetachExpression` is gone because `detach` is read.
-On Linux arm64 (Docker), 1,000 nested `with`, `concurrent`, `debug` and
-`select` blocks pass parse, mint, census, dump and projection. `with`,
-`concurrent` and `debug` also pass at 1,400; a nested `select` passes parse to
-1,000 and overflows by 1,400, and its projection passes at 1,200 and overflows
-at 1,400 (not narrowed between). Focused checks passed 31/31 (body parser), 32/32
-(body projection), 32/32 (expression parser) and 6/6 (stop reasons).
-`compiler-new` passed 901/901, `compiler-new-parity` 3,570/3,570 with zero
-mismatched files and `compiler-blorp` 6,682/6,682.
-
-The control-operand slice was validated on a fresh build merged with main
-through the statement forms, the stop-reason census and the test-naming rename.
-`compiler-new` passed 902/902, `compiler-new-parity` 3,571/3,571 with zero
-mismatched files and `compiler-blorp` 6,683/6,683. Operand shapes (right
-operands, unary operands, expression statements and global initializers) equal
-the frozen parser's AST JSON. The corpus prefix run compared 14,685 completed
-declarations in 3,413 modules (7,302 functions, 117 traits and 167
-implementations with bodies) and stopped at 1,337 functions and 362 unsupported
-globals, with zero rejected or non-progress stops. The Linux arm64 depth numbers
-in D6 (1,000 value `if`s, 300 operands) were measured before the lambda and
-statement-form merges; the 300-deep operand test is in the suite and was not
-re-measured after them.
-
-The scaffolding collapse (2026-10-06 decisions, section 3.16) removes the
-transitional machinery in steps, each with the tree-prefix and tree-module
-parity lines and the first-stop census unchanged. There is one declaration
-scan, `scan_module_declarations`: the header-only, atomic-global and
-expression-only scan policies (`GlobalCompletionPolicy`) and
-`complete_atomic_global` are deleted, and the tests that used them read the
-same declarations through the one scan. Projection tests that need the scan to
-stop at a declaration use a legal body the tree parser does not read yet,
-named once in `test_discovery_adapter.brp` (`unread_value`, `unread_block`).
-The scan then stops at the first declaration it does not read in full, since
-only reading a body finds where it ends: its result holds the module items read
-before it and the unread declaration's header with its `StopPoint`, and the
-census ranks first stops only. A global's initializer is read by the global's
-own route, right after its header (`parse_global_initializer`), so there is no
-initializer hand-off and no check that the hand-off position agrees
-(`GlobalInitializerNotAtHeaderEnd` is deleted). A value on the line after the
-`=` is a NEWLINE token, not a line comparison; `x =` before the end of the
-source is now rejected at the end, as the frozen parser reports it, where it
-used to be left unread.
-A trait or implementation is parsed once, by its own route: each method is
-read in full (header, body, definition) and the owner is minted last, so its
-ids are post-order without the owner replay (`tree_owner_completion.brp`,
-`OwnerReplayDisagrees` and the generic method readers of `method_read.brp` are
-deleted). An owner with a body the parser does not read stops the scan with
-the owner's header only (`TraitHeader`, `ImplementationHeader`), keeping the
-header's ids and none of its methods'; a diagnostic before that body still
-rejects the owner, and one after it is not seen (D10). Method headers still
-skip their bodies until bodies are read inline, the next collapse step.
-
-Validation before the main reconciliation, at `a5ae15eab`:
-
-The combined fresh-build focused run passed 121/121 tests, including a
-5,000-term binary chain through parsing and legacy projection. The separate
-rejection differential read 3,500 source files, skipped 3,320 accepted by the
-legacy parser, and compared all 35 ordered diagnostics in 27 complete rejected
-leaf modules with zero tree/table differences or errors. It reported 31 raw
-legacy baseline differences and explicitly deferred 122 function owners,
-4 traits, 1 implementation and 26 global initializers. Deferred owners are not
-rejected-module parity evidence. Logs are retained at
-`/tmp/blorp-discovery-expression-final` for this local run.
-The broader fresh-build gates also passed: `compiler-new` 805/805,
-`compiler-blorp` 6,460/6,460 and `compiler-new-parity` 3,508/3,508. The
-expression opt-in corpus prefix compared 5,028 completed declarations and
-stopped at 2,845 functions, 60 traits, 59 implementations, 326 unsupported
-global initializers and 68 ends of source, with zero rejected or non-progress
-stops. These counts establish the bounded expression seam, not complete body
-or module parity. Independent code review approved the change with no
-remaining findings.
-
-The main reconciliation uses the managed-record bootstrap `dev-d44472d3a5d0`.
-Both record spellings share one generic-capable declaration type, and `struct`
-remains an ordinary identifier. The current lexer, bridge, parser and full-load
-allocation contracts are measured separately in
-[`discovery_merge_allocations_2026-10-04.md`](../benchmarks/results/discovery_merge_allocations_2026-10-04.md);
-historical inline-record counts are not current cost evidence. Rejected type
-parameters stop the tree record parser before its field grammar. If recovery
-then reaches an identifier that may start a global, the rejection scan reports
-that deferred owner and excludes the source from complete diagnostic parity.
-
-The reconciled fresh-build checks passed 147/147 focused discovery tests,
-6/6 ownership regressions with zero reported leaks, and `compiler-new`
-825/825. The rejected corpus read 3,519 modules, skipped 3,342 accepted by the
-legacy parser, and compared 35 diagnostics in 27 complete rejected leaf modules:
-zero strict tree/table differences or errors, with 31 separately reported legacy
-baseline differences. It deferred 119 function owners, 4 traits, 1 implementation
-and 26 globals; those 150 owners remain outside the proof. Logs are in
-`/tmp/blorp-merge-publish-tests/`.
-
-| # | Change | Proof | Deleted |
+| Milestone | Delivers | State | Landed in |
 | --- | --- | --- | --- |
-| **M1** | Retain and rerun the opaque-type import-cycle repro (section 3.15), fixing the compiler if it still fails. Then `syntax/`: every type of section 3, using ordinary `record` for the proposed name and syntax values; `syntax/ids.brp` with `IdMint`; the layout rule that confines `IdMint` to `parse/` and tests; `syntax/dump.brp`; and unit tests that build each form through the mint and dump it. Nothing calls it yet. | Tests; `compiler-new` gate; the layout check rejects an import of `IdMint` from outside `parse/`; record-shape construction and return costs recorded (section 7.2) | none |
-| **M2** | The lexer becomes `lex_module(module, text) -> LexedModule`, with per-module `Spellings`, checked `LiteralValue`s and `InterpolationScan`. The existing builder path consumes `LexedModule` through a bridge that interns spellings into the builder and rewrites token payloads. Measure the provisional managed `Token` on the same corpus; any future inline placement is a separate record optimization, not a source-spelling choice. | Token parity test unchanged; `tables` dump identical; token storage and bridge costs recorded | the lexer's builder appenders; transient interpolation tables |
-| **M3** | `parse/` over trees, declaration level: module items, imports, foreign blocks, signatures, type parameters, bounds, written types, dimensions, patterns. Bodies are skipped by layout (transitional: M4 parses them inline, see its exit criteria). One `RecordDeclaration` retains `RecordDeclarationForm(OrdinaryRecord, FixedRecord)` for source spelling and parsed-AST adaptation; both forms have managed record semantics. Then the tree adapter's declaration half, behind a test-only entry. | The differential's declaration-level comparison, tree path against the old parser including both record spellings and ordinary `struct` identifiers; the first diagnostic of every rejected module equals today's stage, with no new cascade (section 6.3) | none |
-| **M4** | The body parser over trees (statements, blocks, expressions), and the tree adapter's body half. | Full-AST differential: the tree path equals the old parser on every corpus module and root run; the first diagnostic of every rejected module equals today's stage and the tree path emits no cascade the old parser lacks (section 6.3); the syntax dump differential matches; the id census passes; the deep-chain tests of section 3.14 pass through parse, dump, ID census and adapter, with every walker proven at `MAX_SYNTAX_NESTING` (the old typecheck is excluded, section 3.14); the exit criteria below | `skip_body`, `DeferredBody`, owner replay, the superseded scan policies, `complete_atomic_global`, `StopReason`, the recipe tree (exit criteria) |
-| **M5** | `sources/module_walk.brp`, `link/`, `DiscoveryOutcome`, and `discovery_front_end.brp` on the tree path, behind an internal test-only selection, with `compiler-new`, `cli` and `package` gates exercised on both stage paths. | Module-order parity; self-compile C identical (or normalized); cost measured with the cost tool's `tables` and `graph` modes and the self-compile against matched main | none |
-| **M6** | Make the tree path the stage's default, within the ceiling of section 7.3, and delete the table path in the same change. | Every default and premerge gate on the new default; self-compile C identical; the ceiling's measurement record | `tables/` (builder, node builder, rows, row kinds' node part, node kind classes, `frontend_tables`, `discovery_tables`, `invariants/`, `intern_index` moved, `name_vocabulary` moved to the adapter): about 11,600 lines; the table-reading bodies of `compiler/discovery_adapter.brp` and `compiler/discovery_front_end.brp` (the files stay, now reading trees); `builder_rule_probe`, `builder_append_probe`, `test_invariants`, `test_allocation_budget` (replaced by a syntax allocation test pinning allocations per construct, so a compiler improvement shows as a decrease and a regression fails) |
-| **M7** | Documentation: `DISCOVERY_TABLES_DESIGN.md` is replaced by this document's settled form; `ARCHITECTURE.md`, `DISCOVERY_ACCEPTANCE_ROADMAP.md` and `docs/README.md` are updated; the resolution design takes section 4.7. | `git diff --check`; link check | the superseded design text |
+| M-1 | Syntax prerequisites: assignment only as a statement, no named arguments, typecheck-only forms and one-element tuples rejected by the parsers | Complete | `d460bac5f`, `020b95d90`, `9859898e0`, `3f80e94e0` |
+| M0 | A throwaway body-parser prototype and its [cost report](../benchmarks/results/discovery_redesign_m0_2026-10-02.md) | Complete; evidence only, no prototype code kept | `684f5e586` (report) |
+| M1 | `syntax/` types, `IdMint` confined to `parse/`, the syntax dump and the id census; the opaque-type import-cycle repro retained as a fixture | Complete | `133eaf73a` |
+| M2 | `lex_module` and `LexedModule`: per-module spellings, checked literal values, a bridge into the table builder | Complete | `133eaf73a` |
+| M3 | Declaration-level tree parse: imports, foreign blocks, signatures, type parameters, bounds, types, dimensions, patterns, both record spellings, unions, enums, aliases, builtin and resource types; the rejected-declaration diagnostic gate | Complete except first-diagnostic parity for rejected modules whose owners have bodies, which the M4 subset check takes over (section 6.3) | `133eaf73a`; fixed unions `d9c737a86` |
+| M4 | Body parser over trees and module assembly | In progress: 2,741 of 3,439 accepted corpus modules assemble; exit criteria below | the slices below |
+| M5 | Link, `DiscoveryOutcome` and the tree path behind a test-only selection | Not started | none |
+| M6 | The tree path becomes the stage's default | Not started; waits on product unification and the tuple hand-off | none |
+| M7 | Documentation settles on this design | Not started | none |
 
-**M4 exit criteria.** Each is required before M4 closes:
+**Landed M4 slices**, in landing order. The last column is the number of
+corpus modules whose first stop is a function, after the slice and, where
+measured, before it. Each count is from the slice's own "every corpus file as
+a root" run, and the corpus grew between runs, so a slice is comparable only
+with its neighbour. The first three slices ran before any body was read, so
+their counts are nearly every module that has a function. Each slice landed through its hand-back gates
+(`compiler-new` and `compiler-new-parity`) with zero AST differences.
+
+| Slice | Commit | Covers | Function first stops |
+| --- | --- | --- | --- |
+| Same-line expressions and atomic globals | `133eaf73a` | names, numbers, booleans, void, grouping, unary, binary, logical and range operators; a global whose initializer is one name or number | n/a |
+| Postfix | `1a0bd57b4` | calls, member access, subscripts | 2,891 |
+| Lists | `1d87c1ef1` | list literals | 2,892 |
+| Statements and blocks | `ad1442fad` | expression and block bodies; `var`, typed and plain bindings, `_ =`, compound and subscript assignment, expression statements, `if`, `match`, `while`, `for`, `break`, `continue` | 2,017 (2,903) |
+| Strings | `1d659b315` | quoted, raw and pipe strings, characters, interpolation | 1,885 (2,019) |
+| Question bindings and member bodies | `7f4d4212a` | `?=`, tuple `for` binders, trait and implementation method bodies | 1,881 (1,887) |
+| Tuples and braced forms | `3083c8c00` | tuples of two to four, record literals and updates, dicts, vectors | 1,635 |
+| Control values | `d2959d886` | `if` and `match` as the value of a binding | 1,597 |
+| Lambdas and local functions | `44068a8af` | `func` and `pure func` lambdas, local functions | 1,473 (1,597) |
+| Statement forms | `aa602e4ce` | `select`, `with`, `concurrent`, `debug:`, `detach` | 1,339 (1,473) |
+| Module assembly | `a8229c8a4` | `assemble_module` with its accepted, rejected and unassembled outcomes; forward-declaration pairing, which also made the old parser pair private forward declarations; the adapter's whole-program projection; 1,687 of 3,417 accepted modules assemble | 1,338 |
+| Control operands | `2c39d3ecc` | `if`, `match` and block lambdas as operands | 1,337 |
+| Layout from tokens | `c9618a8ad` | bracketed forms across lines; line and column comparisons removed from the expression and statement parsers, apart from the named quirks in `parse/layout_quirks.brp` | 645 (all first stops 1,851 to 693) |
+| Scaffolding collapse, part 1 | `657da18e7` | one declaration scan; globals read in place; trait and implementation owners parsed once; scan policies and owner replay deleted | census unchanged |
+
+Supporting changes: the linear id census (`520d7194b`), the stop-reason
+census (`ecc35410e`), the tree projection split out of the adapter so
+`bin/blorp` no longer contains the tree path (`cc83590be`), hand-back gates
+scoped by production imports (`6dac84324`), the formal grammar (`c9f802b7d`),
+the differential fuzzer (`c68074aea`), the 16 MB Linux main stack
+(`656ec4aad`) and the design decisions of 2026-10-06 (`8bb937e82`).
+
+**M4 exit criteria.** Each is required before M4 closes. The state is the
+state on main.
 
 - **Bodies parse inline.** A function, method or lambda body is parsed by the
-  function that reads its header (section 3.16). `skip_body` and `DeferredBody`
-  (`tree_function_header_parser.brp`), owner replay, the superseded
-  `GlobalCompletionPolicy` scan policies and `complete_atomic_global`
-  (`tree_module_declaration_scan.brp`, `tree_global_parser.brp`) are deleted,
-  with the recipe tree and replay by token index.
+  function that reads its header (section 3.16). Partly met: owner replay, the
+  `GlobalCompletionPolicy` scan policies and `complete_atomic_global` were
+  deleted in `657da18e7`. Open: `skip_body` and `DeferredBody`
+  (`tree_function_header_parser.brp`), the recipe tree (`parse/recipes.brp`)
+  and replay by token index (`resumed_at`, `resumed_after`).
 - **Body-follows checks are token tests.** The checks that ask whether a
   function, trait-method or implementation-method body starts on the colon's
-  line (`tree_function_header_parser.brp:152`,
-  `tree_trait_method_header_parser.brp:77,84`,
-  `tree_implementation_method_header_parser.brp:108,116`) compare line numbers
-  where a token test would do: a body that follows on the next line is a NEWLINE
-  and INDENT token after the colon. They are separate from the skip-extent
-  queries, which leave with skip-and-replay, and are the last step before the
-  restricted-symbol rule can be enabled.
+  line (`tree_function_header_parser.brp`, `tree_trait_method_header_parser.brp`,
+  `tree_implementation_method_header_parser.brp`) compare line numbers where a
+  token test would do: a body that follows on the next line is a NEWLINE and
+  INDENT token after the colon. They are separate from the skip-extent
+  queries, which leave with `skip_body`, and are the last step before the
+  restricted-symbol rule can be enabled. Open.
 - **No tree parser reads line or column numbers**, except the named quirks of
   `parse/layout_quirks.brp` (section 3.16). The restricted-symbol entry in
   `blorp/source_ownership.json` and its `scripts/check-blorp-layout` rule land
   with this criterion, so a position query anywhere else fails
-  `make hygiene-check`.
+  `make hygiene-check`. Partly met: the expression and statement parsers read
+  layout from tokens (`c9618a8ad`). Open: the three header parsers above, and
+  the restricted-symbol entry.
 - **Rejected modules satisfy the subset check** of section 6.3 on the fixtures
-  and the corpus, not only the first-diagnostic comparison.
+  and the corpus, not only the first-diagnostic comparison. Open: the rejected
+  differential covers leaf declarations only.
 - **Parse outcomes are accepted or rejected.** The preview, `Unsupported`,
   `Declined` and `UnassembledModule` outcomes go; every module either yields a
-  `ModuleSyntax` or is rejected with diagnostics.
+  `ModuleSyntax` or is rejected with diagnostics. Open.
 - **`StopReason` is deleted once coverage is complete.** Until then the
   stop-reason census classifies each stop as one of: not read yet (missing
   grammar), unreported syntax error (the parser should report a diagnostic),
   or cannot-happen (a guard that should fail loudly). It ranks coverage
   separately from the other two classes, so a worker sees the grammar still to
   write apart from errors still to report. Artificial limits are replaced by
-  `MAX_SYNTAX_NESTING` (section 3.14), not counted as grammar.
+  `MAX_SYNTAX_NESTING` (section 3.14), not counted as grammar. Until the
+  variant is deleted, a new slice adds no `StopReason` variant: a rollback
+  that needs one has not read its construct, and a slice that needs a new
+  recipe or a replay by token index is a defect in the slice. Open.
+- **Nesting is bounded** by `MAX_SYNTAX_NESTING`, checked in `ParseState`, and
+  every walker (parse, dump, id census, adapter) is proven at exactly that
+  limit (section 3.14). Open.
+- **The full-AST differential covers every module.** The tree path equals the
+  old parser on every corpus module and root run, the syntax dump differential
+  matches and the id census passes (section 6.3). Open: 698 modules are not
+  read in full.
+
+**Plan for the open milestones.**
+
+| # | Change | Proof | Deleted |
+| --- | --- | --- | --- |
+| **M4** | The body parser over trees (statements, blocks, expressions) and the tree adapter's body half. | The exit criteria above, and section 6.3's differentials | `skip_body`, `DeferredBody`, `StopReason`, the recipe tree and replay by token index; the scan policies, `complete_atomic_global` and owner replay are already gone |
+| **M5** | `sources/module_walk.brp`, `link/`, `DiscoveryOutcome`, and `discovery_front_end.brp` on the tree path, behind an internal test-only selection, with `compiler-new`, `cli` and `package` gates exercised on both stage paths. | Module-order parity; self-compile C identical (or normalized); cost measured with the cost tool's `tables` and `graph` modes and the self-compile against matched main | none |
+| **M6** | Make the tree path the stage's default, within the ceiling of section 7.3, and delete the table path in the same change. | Every default and premerge gate on the new default; self-compile C identical; the ceiling's measurement record | `tables/` (builder, node builder, rows, row kinds' node part, node kind classes, `frontend_tables`, `discovery_tables`, `invariants/`, `intern_index` moved, `name_vocabulary` moved to the adapter): about 11,600 lines; the table-reading bodies of `compiler/discovery_adapter.brp` and `compiler/discovery_front_end.brp` (the files stay, now reading trees); `builder_rule_probe`, `builder_append_probe`, `test_invariants`, `test_allocation_budget` (replaced by a syntax allocation test pinning allocations per construct, so a compiler improvement shows as a decrease and a regression fails) |
+| **M7** | Documentation: `DISCOVERY_TABLES_DESIGN.md` is replaced by this document's settled form; `ARCHITECTURE.md`, `DISCOVERY_ACCEPTANCE_ROADMAP.md` and `docs/README.md` are updated; the resolution design takes section 4.7. | `git diff --check`; link check | the superseded design text |
 
 Ordering and parallelism:
 
-- M1 begins by verifying the opaque-type import-cycle repro on its own base.
-- M1 and M2 are independent of each other.
-- M3 needs M1 and M2, M4 needs M3, and M5 needs M4.
+- M3 needed M1 and M2, M4 needs M3, and M5 needs M4.
 - G2 (tuple hand-off, `PRODUCT_UNIFICATION.md` and `VALUE_TUPLES_AND_STATE_HANDOFF.md`) proceeds in parallel. M1 to M5 do not wait on it; M6 does (product unification slices 1 and 2 and the increment 2 port, increments 3 and 4 for products, and 5 if the re-measured M0 still needs it).
 
-Syntax stays frozen from M1 through M4, so the differential compares against
-a fixed target.
+**Current coverage.** On main at `7ab679600`, after `make`,
+`scripts/compiler-new-parity --stop-census` reports 3,582 corpus files, of
+which 698 modules stop at a declaration the tree scan does not read: 650 at a
+function, 29 at a global initializer and 19 at an implementation. The ranked
+reasons are `indented-method-chain` (261), `tuple-destructuring` (135),
+`opaque-conversion` (120), `builtin-body` (63), `concurrently-loop` (28),
+`value-on-next-line` (25), `soft-keyword-name` (22), `soft-keyword-field-name`
+(17) and `operator-after-block` (15), with the remaining 12 modules across five
+more reasons. The full gate, `scripts/compiler-new-parity` (also
+`scripts/test compiler-new-parity`), passes 3,598 of 3,598 with zero
+mismatched files and prints, on its "tree modules agree with the existing
+parser" lines, how many modules assemble and compare in full:
+
+| Root | Assembled in full | Not yet read in full |
+| --- | --- | --- |
+| Every corpus file as a root | 2,741 of 3,439 | 698 |
+| Compile root (`blorp/src/main.brp`) | 223 of 472 | 249 |
+| Test root | 39 of 103 | 64 |
+| Native package | 11 of 39 | 28 |
+| Source packages | 16 of 41 | 25 |
+
+No accepted module stops at a rejected declaration or without progress. The
+census took about 3 minutes and the gate about 5 on an arm64 Mac. `--stop-reason LABEL` and `--files PATH...`
+narrow either run to part of the corpus (see
+[`scripts/README.md`](../scripts/README.md) and the
+[targeted-parity measurement](../benchmarks/results/discovery_m4_targeted_parity_2026-10-06.md)).
+`scripts/discovery-fuzz` (section 6.3) is the differential fuzzer for inputs
+the corpus does not hold.
+
+**Measurement records.** The cost reports that earlier sections cite stay in
+`benchmarks/results/`: the
+[M0 prototype](../benchmarks/results/discovery_redesign_m0_2026-10-02.md), the
+[M1 record shapes](../benchmarks/results/discovery_redesign_record_shapes_2026-10-03.md),
+the [M2 stage cost and tables dump](../benchmarks/results/discovery_redesign_m2_current_2026-10-03.md),
+the [merge allocation contracts](../benchmarks/results/discovery_merge_allocations_2026-10-04.md)
+and the [first stop-reason census](../benchmarks/results/discovery_m4_stop_reason_census_2026-10-06.md).
+They predate managed-record unification or the current slice and are
+historical evidence, not baselines.
+
+**The tree path is test-only.** No program imports the tree parsers or
+`compiler/discovery_tree_projection.brp`, so they are not part of `bin/blorp`;
+only tests and the parity tools use them. A slice whose changed paths are all
+tree path hands back `make`, the suites that import the changed files and
+`scripts/test compiler-new compiler-new-parity`, not the full `compiler-blorp`
+gate. `scripts/compiler-check --changed --plan` prints which one a change set
+is, and [`WORKER_CHECKLIST`](WORKER_CHECKLIST.md#hand-back-gates-for-discovery-parser-work)
+has the commands.
+
+**History.** The slice-by-slice record, with each slice's validation counts
+and the decisions behind it, is in git: `git log -- docs/DISCOVERY_REDESIGN.md`
+shows how this plan changed and `git show <commit>` gives a slice's message.
 
 ## 9. Open decisions
 
