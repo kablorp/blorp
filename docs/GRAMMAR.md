@@ -1260,9 +1260,16 @@ list_pattern   = "[" "]"
 spread_target  = name | "_" ;
 ```
 
-- A bare name is a constructor when it names a constructor of the matched
-  type that is imported bare; otherwise it binds a variable. That is decided
-  after parsing.
+- Bare names resolve after parsing against the matched type and local scope.
+  An unshadowed constructor available bare is a constructor pattern. A local
+  shadowing name or a name unrelated to the matched type binds a variable.
+  A matching constructor from another module that is not imported bare requires
+  an import or module qualification, rather than becoming a variable binding.
+- Or-pattern alternatives cannot introduce variable bindings, including
+  payload, tuple, list-element, and named list-spread bindings. This rule also
+  applies to nested or-patterns and is checked during typechecking. Wildcards,
+  literals, and constructors with no bound payloads are valid. Bindings outside
+  a nested or-pattern are unaffected. Use separate match arms to bind data.
 - The `-` before a numeric literal may be separated from it by blanks (`- 2`).
 - An interpolated string is not a pattern: ``a string with `${...}` holes
   cannot be a match pattern`` (`LP:4424-4440`).

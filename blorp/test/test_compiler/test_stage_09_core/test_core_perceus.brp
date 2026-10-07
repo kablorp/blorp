@@ -58,6 +58,7 @@ import:
 			ForRangeExpr,
 			ForListExpr,
 			ForStringExpr,
+			ForTensorExpr,
 			IfExpr,
 			LambdaExpr,
 			LetExpr,
@@ -125,6 +126,7 @@ import:
 		CoreTensorDim(TensorStaticDim),
 		CoreTensorLiteralShape(TensorVectorLength),
 		CoreTensorRawScalarKind(TensorInt64Elements),
+		CoreTensorForElementStorage(TensorForRawScalarElement),
 		CoreTupleElement(TuplePointerElement),
 		CoreType(
 			BoxedResultType,
@@ -17591,6 +17593,102 @@ pure func inferred_contract_has_consumed_indices(
 			False
 
 
+pure func payload_tensor_loop(iterable: CoreExpr, body: CoreExpr) -> CoreExpr:
+	ForTensorExpr(
+		{
+			binder = { variable = named_var("item"), typ = int_type(), range_direction = RangeForwardOnly },
+			element_storage = TensorForRawScalarElement(TensorInt64Elements),
+			iterable = iterable,
+			iterable_release_policy = NoReleasePolicy,
+			body = body
+		},
+		void_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+pure func loop_summary_reads_both_payload_children(loop: CoreExpr) -> Bool:
+	env: PerceusEnv = perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES)
+	iterable_uses = summarize_linear_ownership_uses(env, "iterable_owner", loop)
+	body_uses = summarize_linear_ownership_uses(env, "body_owner", loop)
+	(
+		iterable_uses.touched and iterable_uses.required_refs == 1
+		and iterable_uses.consumed_refs == 0 and not iterable_uses.returns_alias
+		and body_uses.touched and body_uses.required_refs == 1
+		and body_uses.consumed_refs == 0 and not body_uses.returns_alias
+	)
+
+
+pure func test_list_loop_summary_reads_its_payload_layout() -> Bool:
+	loop_summary_reads_both_payload_children(borrowed_loop_list_loop(
+		var_expr("iterable_owner", list_int_type()),
+		intrinsic_expr("list_len", [var_expr("body_owner", list_int_type())], int_type()),
+	))
+
+
+pure func test_tensor_loop_summary_reads_its_payload_layout() -> Bool:
+	loop_summary_reads_both_payload_children(payload_tensor_loop(
+		var_expr("iterable_owner", tensor_int_type()),
+		intrinsic_expr("list_len", [var_expr("body_owner", list_int_type())], int_type()),
+	))
+
+
+pure func test_string_loop_summary_reads_its_payload_layout() -> Bool:
+	loop_summary_reads_both_payload_children(ForStringExpr(
+		{
+			binder = { variable = named_var("item"), typ = int_type(), range_direction = RangeForwardOnly },
+			iterable = var_expr("iterable_owner", string_type()),
+			iterable_release_policy = NoReleasePolicy,
+			body = intrinsic_expr("list_len", [var_expr("body_owner", list_int_type())], int_type())
+		},
+		void_type(),
+		synthetic_core_source_loc(),
+	))
+
+
+pure func loop_parameter_dup_body() -> CoreExpr:
+	DupExpr(
+		named_var("items"),
+		list_int_type(),
+		ArcRetainPolicy,
+		user_call_expr("consume_loop_items", Some(93000), [], [var_expr("items", list_int_type())], list_int_type()),
+		list_int_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+pure func loop_contract_preserves_duplicated_parameter(loop: CoreExpr, iterable_type: CoreType) -> Bool:
+	consume: CoreDecl = function_decl(
+		"consume_loop_items", 93000, [core_param("items", list_int_type())], list_int_type(),
+		intrinsic_expr("list_ensure_unique", [var_expr("items", list_int_type())], list_int_type()),
+	)
+	duplicate_then_consume: CoreDecl = function_decl(
+		"duplicate_loop_items", 93001,
+		[core_param("items", list_int_type()), core_param("iterations", iterable_type)],
+		list_int_type(), SeqExpr(loop, var_expr("items", list_int_type())),
+	)
+	facts = infer_ownership_contracts({
+		decls = [consume, duplicate_then_consume],
+		foreign_includes = [],
+		source_files = []
+	})
+	inferred_contract_has_consumed_indices(facts.env, "duplicate_loop_items", 93001, [])
+
+
+pure func test_list_loop_contract_detects_parameter_dup_in_body() -> Bool:
+	loop_contract_preserves_duplicated_parameter(
+		borrowed_loop_list_loop(var_expr("iterations", list_int_type()), loop_parameter_dup_body()),
+		list_int_type(),
+	)
+
+
+pure func test_tensor_loop_contract_detects_parameter_dup_in_body() -> Bool:
+	loop_contract_preserves_duplicated_parameter(
+		payload_tensor_loop(var_expr("iterations", tensor_int_type()), loop_parameter_dup_body()),
+		tensor_int_type(),
+	)
+
+
 pure func test_contract_collection_fast_paths_preserve_nested_and_deferred_calls() -> Bool:
 	items_type: CoreType = list_int_type()
 	consume: CoreDecl = function_decl(
@@ -22527,6 +22625,11 @@ tests: TestSuite = {
 			"contract collection fast paths preserve nested and deferred calls",
 			test_contract_collection_fast_paths_preserve_nested_and_deferred_calls,
 		),
+		("list loop summary reads its payload layout", test_list_loop_summary_reads_its_payload_layout),
+		("tensor loop summary reads its payload layout", test_tensor_loop_summary_reads_its_payload_layout),
+		("string loop summary reads its payload layout", test_string_loop_summary_reads_its_payload_layout),
+		("list loop contract detects parameter Dup in body", test_list_loop_contract_detects_parameter_dup_in_body),
+		("tensor loop contract detects parameter Dup in body", test_tensor_loop_contract_detects_parameter_dup_in_body),
 		(
 			"inferred user-call contract is written to calls",
 			test_inferred_user_call_contract_is_written_to_calls,

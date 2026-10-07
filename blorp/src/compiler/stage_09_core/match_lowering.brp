@@ -693,7 +693,11 @@ private pure func simple_constructor_payloads(
 	var matching_constructor: Bool = False
 
 	match pattern:
-		ConstructorPattern(name, payload_patterns) | QualifiedConstructorPattern(_, name, payload_patterns):
+		ConstructorPattern(name, payload_patterns):
+			if name == constructor_name:
+				patterns = payload_patterns
+				matching_constructor = True
+		QualifiedConstructorPattern(_, name, payload_patterns):
 			if name == constructor_name:
 				patterns = payload_patterns
 				matching_constructor = True
@@ -778,7 +782,9 @@ private pure func bind_constructor_payloads(
 
 private pure func pattern_constructor_name(pattern: CorePattern) -> Option[String]:
 	match pattern:
-		ConstructorPattern(name, _) | QualifiedConstructorPattern(_, name, _):
+		ConstructorPattern(name, _):
+			Some(name)
+		QualifiedConstructorPattern(_, name, _):
 			Some(name)
 		_:
 			None
@@ -883,7 +889,25 @@ private pure func prepend_pattern_bindings(
 				semantic_binding(variable, accessor),
 				bindings,
 			)
-		ConstructorPattern(constructor, patterns) | QualifiedConstructorPattern(_, constructor, patterns):
+		ConstructorPattern(constructor, patterns):
+			var result: PatternBindingSequence = bindings
+			var index: Int = patterns.length()
+
+			while index > 0:
+				index -= 1
+
+				match patterns.get(index):
+					Some(nested_pattern):
+						result = prepend_pattern_bindings(
+							result,
+							VariantFieldSemanticMatchAccessor(accessor, constructor, index),
+							nested_pattern,
+						)
+					None:
+						void
+
+			result
+		QualifiedConstructorPattern(_, constructor, patterns):
 			var result: PatternBindingSequence = bindings
 			var index: Int = patterns.length()
 
@@ -1249,7 +1273,9 @@ private pure func constructor_pattern_parts(
 	pattern: CorePattern,
 ) -> Option[(String, List[CorePattern])]:
 	match pattern:
-		ConstructorPattern(name, patterns) | QualifiedConstructorPattern(_, name, patterns):
+		ConstructorPattern(name, patterns):
+			Some((name, patterns))
+		QualifiedConstructorPattern(_, name, patterns):
 			Some((name, patterns))
 		_:
 			None
@@ -1490,7 +1516,10 @@ private pure func distinct_constructor_patterns(
 
 	for arm in arms:
 		match arm.patterns.get(position):
-			Some(ConstructorPattern(constructor, _)) | Some(QualifiedConstructorPattern(_, constructor, _)):
+			Some(ConstructorPattern(constructor, _)):
+				if not constructors.contains(constructor):
+					constructors = constructors.append(constructor)
+			Some(QualifiedConstructorPattern(_, constructor, _)):
 				if not constructors.contains(constructor):
 					constructors = constructors.append(constructor)
 			_:
@@ -1653,7 +1682,18 @@ private pure func constructor_pattern_matrix_arms(
 
 	for arm in arms:
 		match arm.patterns.get(position):
-			Some(ConstructorPattern(found, patterns)) | Some(QualifiedConstructorPattern(_, found, patterns)):
+			Some(ConstructorPattern(found, patterns)):
+				if found == constructor:
+					-- Source typechecking requires declared payload arity;
+					-- a mismatch here is malformed Core, not a tag-only pattern.
+					if patterns.length() != payload_width:
+						failed = True
+						break
+
+					specialized = specialized.append({ arm |
+						patterns = arm.patterns.take(position).concat(patterns).concat(arm.patterns.drop(position + 1))
+					})
+			Some(QualifiedConstructorPattern(_, found, patterns)):
 				if found == constructor:
 					-- Source typechecking requires declared payload arity;
 					-- a mismatch here is malformed Core, not a tag-only pattern.
@@ -1706,7 +1746,11 @@ private pure func compile_pattern_matrix_constructor_column(
 
 		for arm in arms:
 			match arm.patterns.get(position):
-				Some(ConstructorPattern(found, patterns)) | Some(QualifiedConstructorPattern(_, found, patterns)):
+				Some(ConstructorPattern(found, patterns)):
+					if found == constructor:
+						payload_width = Some(patterns.length())
+						break
+				Some(QualifiedConstructorPattern(_, found, patterns)):
 					if found == constructor:
 						payload_width = Some(patterns.length())
 						break
@@ -2126,7 +2170,7 @@ private pure func core_name_may_occur_free(name: String, root: CoreExpr) -> Bool
 								expr = rhs,
 								target_shadowed = item.target_shadowed,
 							})
-					DupExpr(variable, _, _, body, _, _) | DropExpr(variable, _, _, body, _, _):
+					DupExpr(variable, _, _, body, _, _):
 						if not item.target_shadowed and variable.name == name:
 							found = True
 						else:
@@ -2134,7 +2178,24 @@ private pure func core_name_may_occur_free(name: String, root: CoreExpr) -> Bool
 								expr = body,
 								target_shadowed = item.target_shadowed,
 							})
-					LetExpr(variable, _, _, rhs, body) | BorrowLetExpr(variable, _, rhs, body):
+					DropExpr(variable, _, _, body, _, _):
+						if not item.target_shadowed and variable.name == name:
+							found = True
+						else:
+							work = work.append({
+								expr = body,
+								target_shadowed = item.target_shadowed,
+							})
+					LetExpr(variable, _, _, rhs, body):
+						work = work.append({
+							expr = rhs,
+							target_shadowed = item.target_shadowed,
+						})
+						work = work.append({
+							expr = body,
+							target_shadowed = item.target_shadowed or variable.name == name,
+						})
+					BorrowLetExpr(variable, _, rhs, body):
 						work = work.append({
 							expr = rhs,
 							target_shadowed = item.target_shadowed,

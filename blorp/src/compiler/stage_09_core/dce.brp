@@ -226,11 +226,21 @@ private pure func collect_type_names(
 							seen = Sets.add(seen, name)
 
 						children = args
-					UnionType(name, _) | HeapRecordType(name) | InlineRecordType(name):
+					UnionType(name, _):
 						if not Sets.contains(seen, name):
 							names = names.append(name)
 							seen = Sets.add(seen, name)
-					StackResultType(ok_type, error_type) | BoxedResultType(ok_type, error_type):
+					HeapRecordType(name):
+						if not Sets.contains(seen, name):
+							names = names.append(name)
+							seen = Sets.add(seen, name)
+					InlineRecordType(name):
+						if not Sets.contains(seen, name):
+							names = names.append(name)
+							seen = Sets.add(seen, name)
+					StackResultType(ok_type, error_type):
+						children = [ok_type, error_type]
+					BoxedResultType(ok_type, error_type):
 						children = [ok_type, error_type]
 					FunctionType(_, params, return_type):
 						children = params.append(return_type)
@@ -359,7 +369,17 @@ private pure func collect_reachability_exprs(exprs: List[CoreExpr]) -> DceReacha
 											candidate_name = Some(variable.name)
 									_:
 										void
-							VarExpr(variable, typ, _) | DupExpr(variable, typ, _, _, _, _):
+							VarExpr(variable, typ, _):
+								match typ:
+									FunctionType(_, _, _):
+										match variable.def_id:
+											Some(def_id):
+												candidate_id = Some(def_id)
+											None:
+												global_name = Some(variable.name)
+									_:
+										global_name = Some(variable.name)
+							DupExpr(variable, typ, _, _, _, _):
 								match typ:
 									FunctionType(_, _, _):
 										match variable.def_id:
@@ -431,7 +451,72 @@ private pure func collect_reachability_exprs(exprs: List[CoreExpr]) -> DceReacha
 									binding_index -= 1
 							LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _) | CooperativeCheckpointExpr(_, _) | ClosureCreateExpr(_, _, _) | DetachExpr(_, _, _) | BreakExpr(_, _) | ContinueExpr(_, _) | SetAllocExpr(_, _, _):
 								void
-							LetExpr(_, _, _, first, second) | BorrowLetExpr(_, _, first, second) | SeqExpr(first, second) | BinaryExpr(_, first, second, _, _) | LogicalExpr(_, first, second, _, _) | WhileExpr(first, second, _, _):
+							LetExpr(_, _, _, first, second):
+								pending = push_reachability_work(
+									pending,
+									cursor,
+									VisitDceExpr(second),
+								)
+								cursor += 1
+								pending = push_reachability_work(
+									pending,
+									cursor,
+									VisitDceExpr(first),
+								)
+								cursor += 1
+							BorrowLetExpr(_, _, first, second):
+								pending = push_reachability_work(
+									pending,
+									cursor,
+									VisitDceExpr(second),
+								)
+								cursor += 1
+								pending = push_reachability_work(
+									pending,
+									cursor,
+									VisitDceExpr(first),
+								)
+								cursor += 1
+							SeqExpr(first, second):
+								pending = push_reachability_work(
+									pending,
+									cursor,
+									VisitDceExpr(second),
+								)
+								cursor += 1
+								pending = push_reachability_work(
+									pending,
+									cursor,
+									VisitDceExpr(first),
+								)
+								cursor += 1
+							BinaryExpr(_, first, second, _, _):
+								pending = push_reachability_work(
+									pending,
+									cursor,
+									VisitDceExpr(second),
+								)
+								cursor += 1
+								pending = push_reachability_work(
+									pending,
+									cursor,
+									VisitDceExpr(first),
+								)
+								cursor += 1
+							LogicalExpr(_, first, second, _, _):
+								pending = push_reachability_work(
+									pending,
+									cursor,
+									VisitDceExpr(second),
+								)
+								cursor += 1
+								pending = push_reachability_work(
+									pending,
+									cursor,
+									VisitDceExpr(first),
+								)
+								cursor += 1
+							WhileExpr(first, second, _, _):
 								pending = push_reachability_work(
 									pending,
 									cursor,
@@ -530,21 +615,48 @@ private pure func push_value_occurrence_children(
 	match expr:
 		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _) | CooperativeCheckpointExpr(_, _) | ClosureCreateExpr(_, _, _) | DetachExpr(_, _, _) | BreakExpr(_, _) | ContinueExpr(_, _) | SetAllocExpr(_, _, _):
 			pending
-		DebugBlockExpr(body, _, _) | UnaryExpr(_, body, _, _) | CastExpr(body, _, _) | UnboxExpr(_, body, _, _) | ProductFieldExpr(body, _, _, _) | PreClosureDetachExpr(body, _, _):
+		DebugBlockExpr(body, _, _):
 			MoreDceExpr(body, pending)
-		BinaryExpr(_, left, right, _, _) | LogicalExpr(_, left, right, _, _) | SeqExpr(left, right):
+		UnaryExpr(_, body, _, _):
+			MoreDceExpr(body, pending)
+		CastExpr(body, _, _):
+			MoreDceExpr(body, pending)
+		UnboxExpr(_, body, _, _):
+			MoreDceExpr(body, pending)
+		ProductFieldExpr(body, _, _, _):
+			MoreDceExpr(body, pending)
+		PreClosureDetachExpr(body, _, _):
+			MoreDceExpr(body, pending)
+		BinaryExpr(_, left, right, _, _):
 			MoreDceExpr(
 				left,
 				MoreDceExpr(right, pending),
 			)
-		LetExpr(_, _, _, rhs, body) | BorrowLetExpr(_, _, rhs, body):
+		LogicalExpr(_, left, right, _, _):
+			MoreDceExpr(
+				left,
+				MoreDceExpr(right, pending),
+			)
+		SeqExpr(left, right):
+			MoreDceExpr(
+				left,
+				MoreDceExpr(right, pending),
+			)
+		LetExpr(_, _, _, rhs, body):
+			MoreDceExpr(
+				rhs,
+				MoreDceExpr(body, pending),
+			)
+		BorrowLetExpr(_, _, rhs, body):
 			MoreDceExpr(
 				rhs,
 				MoreDceExpr(body, pending),
 			)
 		AssignExpr(_, rhs, _, _):
 			MoreDceExpr(rhs, pending)
-		DupExpr(_, _, _, body, _, _) | DropExpr(_, _, _, body, _, _):
+		DupExpr(_, _, _, body, _, _):
+			MoreDceExpr(body, pending)
+		DropExpr(_, _, _, body, _, _):
 			MoreDceExpr(body, pending)
 		_:
 			children: List[CoreExpr] = CoreTraverse.immediate_core_expr_children(expr)
@@ -623,7 +735,9 @@ pure func value_references(expr: CoreExpr) -> CoreValueReferences:
 				var assigned_name: Option[String] = None
 
 				match current:
-					VarExpr(variable, _, _) | DupExpr(variable, _, _, _, _, _):
+					VarExpr(variable, _, _):
+						read = Some(variable)
+					DupExpr(variable, _, _, _, _, _):
 						read = Some(variable)
 					AssignExpr(variable, rhs, typ, loc):
 						invalidation = Some(variable)
@@ -689,7 +803,32 @@ pure func value_references(expr: CoreExpr) -> CoreValueReferences:
 				match current:
 					LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _) | CooperativeCheckpointExpr(_, _) | ClosureCreateExpr(_, _, _) | DetachExpr(_, _, _) | BreakExpr(_, _) | ContinueExpr(_, _) | SetAllocExpr(_, _, _):
 						void
-					LetExpr(_, _, _, first, second) | BorrowLetExpr(_, _, first, second) | SeqExpr(first, second) | BinaryExpr(_, first, second, _, _) | LogicalExpr(_, first, second, _, _) | WhileExpr(first, second, _, _):
+					LetExpr(_, _, _, first, second):
+						pending = push_value_expr(pending, cursor, second)
+						cursor += 1
+						pending = push_value_expr(pending, cursor, first)
+						cursor += 1
+					BorrowLetExpr(_, _, first, second):
+						pending = push_value_expr(pending, cursor, second)
+						cursor += 1
+						pending = push_value_expr(pending, cursor, first)
+						cursor += 1
+					SeqExpr(first, second):
+						pending = push_value_expr(pending, cursor, second)
+						cursor += 1
+						pending = push_value_expr(pending, cursor, first)
+						cursor += 1
+					BinaryExpr(_, first, second, _, _):
+						pending = push_value_expr(pending, cursor, second)
+						cursor += 1
+						pending = push_value_expr(pending, cursor, first)
+						cursor += 1
+					LogicalExpr(_, first, second, _, _):
+						pending = push_value_expr(pending, cursor, second)
+						cursor += 1
+						pending = push_value_expr(pending, cursor, first)
+						cursor += 1
+					WhileExpr(first, second, _, _):
 						pending = push_value_expr(pending, cursor, second)
 						cursor += 1
 						pending = push_value_expr(pending, cursor, first)

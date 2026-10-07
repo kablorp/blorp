@@ -867,7 +867,9 @@ pure func typed_expr_location(expr: TypedExpr) -> SourceLocation:
 			span
 		TypedRecordUpdateExpr(_, _, _, span, _):
 			span
-		TypedFieldAccessExpr(_, _, _, span, _) | TypedModuleMemberExpr(_, _, span, _):
+		TypedFieldAccessExpr(_, _, _, span, _):
+			span
+		TypedModuleMemberExpr(_, _, span, _):
 			span
 		TypedLambdaExpr(_, _, _, _, span, _):
 			span
@@ -1541,7 +1543,9 @@ pure func infer_context_expected_type(context: InferContext) -> Option[SemanticT
 	match context.expectation:
 		NoExpectedValue:
 			None
-		ExpectedValue(expected_type) | ExpectedValueInSlot(expected_type, _):
+		ExpectedValue(expected_type):
+			Some(expected_type)
+		ExpectedValueInSlot(expected_type, _):
 			Some(expected_type)
 
 
@@ -2026,7 +2030,9 @@ pure func typed_expr_info(expr: TypedExpr) -> TypedExprInfo:
 			info
 		TypedRecordUpdateExpr(_, _, _, _, info):
 			info
-		TypedFieldAccessExpr(_, _, _, _, info) | TypedModuleMemberExpr(_, _, _, info):
+		TypedFieldAccessExpr(_, _, _, _, info):
+			info
+		TypedModuleMemberExpr(_, _, _, info):
 			info
 		TypedLambdaExpr(_, _, _, _, _, info):
 			info
@@ -4580,7 +4586,9 @@ private pure func startup_call_name(callee: TypedExpr, info: TypedExprInfo) -> S
 			match callee:
 				TypedNameExpr(name, _):
 					name.text
-				TypedFieldAccessExpr(_, field, _, _, _) | TypedModuleMemberExpr(_, field, _, _):
+				TypedFieldAccessExpr(_, field, _, _, _):
+					field.text
+				TypedModuleMemberExpr(_, field, _, _):
 					field.text
 				_:
 					"<expression>"
@@ -6564,7 +6572,9 @@ private pure func tensor_arithmetic_satisfies_trait(
 	right_type: SemanticType,
 ) -> Bool:
 	match (array_type_parts(left_type), array_type_parts(right_type)):
-		(Some((element_type, _)), _) | (_, Some((element_type, _))):
+		(Some((element_type, _)), _):
+			tensor_element_supports_native_arithmetic(context, op, element_type)
+		(_, Some((element_type, _))):
 			tensor_element_supports_native_arithmetic(context, op, element_type)
 		_:
 			False
@@ -9823,9 +9833,19 @@ private pure func resolved_call_supports_elementwise_tensor_call(
 						owner_path == Some("float")
 						and builtin_is_elementwise_tensor_function(call.source_name)
 					)
-				ResolvedSelectedTraitMethodCall(trait_name, _) | ResolvedUnindexedSelectedTraitMethodCall(trait_name, _) | ResolvedUnresolvedTraitMethodCall(trait_name):
+				ResolvedSelectedTraitMethodCall(trait_name, _):
 					trait_method_supports_elementwise_tensor_call(trait_name, call.callee_name)
-				ResolvedAcceptedTraitMethodCall(trait_id, _) | ResolvedAcceptedUnresolvedTraitMethodCall(trait_id):
+				ResolvedUnindexedSelectedTraitMethodCall(trait_name, _):
+					trait_method_supports_elementwise_tensor_call(trait_name, call.callee_name)
+				ResolvedUnresolvedTraitMethodCall(trait_name):
+					trait_method_supports_elementwise_tensor_call(trait_name, call.callee_name)
+				ResolvedAcceptedTraitMethodCall(trait_id, _):
+					accepted_trait_method_supports_elementwise_tensor_call(
+						facts,
+						trait_id,
+						call.callee_name,
+					)
+				ResolvedAcceptedUnresolvedTraitMethodCall(trait_id):
 					accepted_trait_method_supports_elementwise_tensor_call(
 						facts,
 						trait_id,
@@ -10796,7 +10816,7 @@ private pure func check_trait_method_self_bound(
 	match resolved_call:
 		Some(call):
 			match call.target:
-				ResolvedAcceptedTraitMethodCall(trait_id, _) | ResolvedAcceptedUnresolvedTraitMethodCall(trait_id):
+				ResolvedAcceptedTraitMethodCall(trait_id, _):
 					obligation_type = elementwise_tensor_element_type(
 						context.state.facts,
 						resolved_call,
@@ -10851,7 +10871,160 @@ private pure func check_trait_method_self_bound(
 						)
 					else:
 						context
-				ResolvedSelectedTraitMethodCall(trait_name, _) | ResolvedUnindexedSelectedTraitMethodCall(trait_name, _) | ResolvedUnresolvedTraitMethodCall(trait_name):
+				ResolvedAcceptedUnresolvedTraitMethodCall(trait_id):
+					obligation_type = elementwise_tensor_element_type(
+						context.state.facts,
+						resolved_call,
+						self_type,
+					).get_or(self_type)
+					accepted_context = (
+						module_view_accepted_trait_implementation_authority(
+							context.state.facts.module_view,
+						),
+						infer_module_facts_definition_table(context.state.facts),
+					)
+
+					resolution = match accepted_context:
+						(Some(accepted_authority), Some(issuing_table)):
+							is_structural_equality = (
+								accepted_trait_matches_compiler_identity(
+									accepted_authority,
+									issuing_table,
+									trait_id,
+									TRAIT_ID_EQUATABLE,
+								)
+								and infer_type_has_compiler_structural_equality(
+									context.state,
+									obligation_type,
+								)
+							)
+
+							if is_structural_equality:
+								TraitObligationSatisfied
+							else:
+								accepted_resolve_trait_id_obligation(
+									accepted_authority,
+									issuing_table,
+									context.state.env,
+									obligation_type,
+									trait_id,
+								)
+						_:
+							TraitObligationUnsatisfied
+
+					if resolution == TraitObligationUnsatisfied:
+						trait_name = infer_module_facts_definition_table(context.state.facts)
+							.map(func(table): trait_id_name(table, trait_id))
+							.get_or("<unknown trait>")
+
+						call_trait_bound_error(
+							context,
+							call.callee_name,
+							self_type,
+							trait_name,
+							Some(trait_id),
+						)
+					else:
+						context
+				ResolvedSelectedTraitMethodCall(trait_name, _):
+					obligation_type = elementwise_tensor_element_type(
+						context.state.facts,
+						resolved_call,
+						self_type,
+					).get_or(self_type)
+
+					-- A call resolved only by trait spelling (no exact identity) names a
+					-- trait through the environment; a spelling the environment does not
+					-- know cannot be satisfied.
+					-- Retain the identity used for the failed obligation so diagnostic
+					-- help cannot mistake an unrelated namesake for a compiler trait.
+					unsatisfied_trait: Option[(String, Option[TraitId])] = match call.trait_identity:
+						Some(identity):
+							infer_find_unsatisfied_exact_trait_obligation(
+								context.state,
+								obligation_type,
+								identity,
+							).map(
+								func(_obligation): (identity.name, Some(identity.trait_id)),
+							)
+						None:
+							match env_get_trait(context.state.env, trait_name):
+								Some(trait_def):
+									infer_find_unsatisfied_trait_obligation(
+										context.state,
+										[
+											trait_obligation(
+												obligation_type,
+												trait_def.trait_id,
+											),
+										],
+									).map(
+										func(_obligation): (trait_name, Some(trait_def.trait_id)),
+									)
+								None:
+									Some((trait_name, None))
+
+					match unsatisfied_trait:
+						Some((unsatisfied_name, unsatisfied_id)):
+							call_trait_bound_error(
+								context,
+								call.callee_name,
+								self_type,
+								unsatisfied_name,
+								unsatisfied_id,
+							)
+						None:
+							context
+				ResolvedUnindexedSelectedTraitMethodCall(trait_name, _):
+					obligation_type = elementwise_tensor_element_type(
+						context.state.facts,
+						resolved_call,
+						self_type,
+					).get_or(self_type)
+
+					-- A call resolved only by trait spelling (no exact identity) names a
+					-- trait through the environment; a spelling the environment does not
+					-- know cannot be satisfied.
+					-- Retain the identity used for the failed obligation so diagnostic
+					-- help cannot mistake an unrelated namesake for a compiler trait.
+					unsatisfied_trait: Option[(String, Option[TraitId])] = match call.trait_identity:
+						Some(identity):
+							infer_find_unsatisfied_exact_trait_obligation(
+								context.state,
+								obligation_type,
+								identity,
+							).map(
+								func(_obligation): (identity.name, Some(identity.trait_id)),
+							)
+						None:
+							match env_get_trait(context.state.env, trait_name):
+								Some(trait_def):
+									infer_find_unsatisfied_trait_obligation(
+										context.state,
+										[
+											trait_obligation(
+												obligation_type,
+												trait_def.trait_id,
+											),
+										],
+									).map(
+										func(_obligation): (trait_name, Some(trait_def.trait_id)),
+									)
+								None:
+									Some((trait_name, None))
+
+					match unsatisfied_trait:
+						Some((unsatisfied_name, unsatisfied_id)):
+							call_trait_bound_error(
+								context,
+								call.callee_name,
+								self_type,
+								unsatisfied_name,
+								unsatisfied_id,
+							)
+						None:
+							context
+				ResolvedUnresolvedTraitMethodCall(trait_name):
 					obligation_type = elementwise_tensor_element_type(
 						context.state.facts,
 						resolved_call,
@@ -10945,7 +11118,7 @@ private pure func resolve_trait_self_call(
 				resource_args = match updated_resolved_call:
 					Some(call):
 						match call.target:
-							ResolvedAcceptedTraitMethodCall(trait_id, _) | ResolvedAcceptedUnresolvedTraitMethodCall(trait_id):
+							ResolvedAcceptedTraitMethodCall(trait_id, _):
 								accepted_trait_method_resource_args_for_type(
 									context,
 									trait_id,
@@ -10953,7 +11126,37 @@ private pure func resolve_trait_self_call(
 									self_type,
 									call.resource_args,
 								)
-							ResolvedSelectedTraitMethodCall(trait_name, _) | ResolvedUnindexedSelectedTraitMethodCall(trait_name, _) | ResolvedUnresolvedTraitMethodCall(trait_name):
+							ResolvedAcceptedUnresolvedTraitMethodCall(trait_id):
+								accepted_trait_method_resource_args_for_type(
+									context,
+									trait_id,
+									call.callee_name,
+									self_type,
+									call.resource_args,
+								)
+							ResolvedSelectedTraitMethodCall(trait_name, _):
+								if call.trait_identity.is_some():
+									call.resource_args
+								else:
+									trait_method_resource_args_for_type(
+										context,
+										trait_name,
+										call.callee_name,
+										self_type,
+										call.resource_args,
+									)
+							ResolvedUnindexedSelectedTraitMethodCall(trait_name, _):
+								if call.trait_identity.is_some():
+									call.resource_args
+								else:
+									trait_method_resource_args_for_type(
+										context,
+										trait_name,
+										call.callee_name,
+										self_type,
+										call.resource_args,
+									)
+							ResolvedUnresolvedTraitMethodCall(trait_name):
 								if call.trait_identity.is_some():
 									call.resource_args
 								else:
@@ -13275,10 +13478,6 @@ private opaque type FreeVarFacts = InferSession
 
 private pure func free_var_facts(context: InferContext) -> FreeVarFacts:
 	into_opaque FreeVarFacts(context.state)
-
-
-private pure func free_var_facts_with_env(context: InferContext, env: Env) -> FreeVarFacts:
-	into_opaque FreeVarFacts({ context.state | env = env })
 
 
 private pure func free_var_facts_session(facts: FreeVarFacts) -> InferSession:
@@ -19908,6 +20107,41 @@ private pure func infer_qualified_constructor_pattern(
 			)
 
 
+--- Inference distinguishes bindings from constructors using the scrutinee's
+--- type. A bare name may be a constructor here and a binder at another type.
+private pure func typed_pattern_has_binding(pattern: TypedPattern) -> Bool:
+	var pending: List[TypedPattern] = [pattern]
+	var index: Int = 0
+	var has_binding: Bool = False
+
+	while index < pending.length() and not has_binding:
+		match pending.get(index):
+			Some(TypedNamePattern(_, _)):
+				has_binding = True
+			Some(TypedConstructorPattern(_, fields, _, _, _)):
+				pending = pending.concat(fields)
+			Some(TypedQualifiedConstructorPattern(_, _, fields, _, _, _)):
+				pending = pending.concat(fields)
+			Some(TypedTuplePattern(items, _)):
+				pending = pending.concat(items)
+			Some(TypedListPattern(items, spread, _)):
+				pending = pending.concat(items)
+
+				match spread:
+					Some(ParsedListSpreadName(_)):
+						has_binding = True
+					_:
+						void
+			Some(TypedOrPattern(options, _)):
+				pending = pending.concat(options)
+			_:
+				void
+
+		index += 1
+
+	has_binding
+
+
 private pure func infer_pattern(
 	context: InferContext,
 	env: Env,
@@ -20111,23 +20345,11 @@ private pure func infer_pattern(
 					var matches_false: Bool = first_result.matches_false
 					var index: Int = 1
 
+					var has_binding: Bool = typed_pattern_has_binding(first_result.pattern)
+
 					while index < options.length():
 						match options.get(index):
 							Some(option):
-								next_context = if string_lists_equal(pattern_bound_names(
-										free_var_facts_with_env(context, env),
-										first,
-									).sort(), pattern_bound_names(
-										free_var_facts_with_env(context, env),
-										option,
-									).sort()):
-									next_context
-								else:
-									infer_error(
-										next_context,
-										"Or-pattern alternatives must bind the same variables",
-									)
-
 								option_result = infer_pattern(
 									next_context,
 									env,
@@ -20135,6 +20357,7 @@ private pure func infer_pattern(
 									scrutinee_type,
 								)
 								next_context = option_result.context
+								has_binding = has_binding or typed_pattern_has_binding(option_result.pattern)
 								typed_options = typed_options.append(option_result.pattern)
 								catch_all = catch_all or option_result.catch_all
 								matches_true = matches_true or option_result.matches_true
@@ -20143,6 +20366,17 @@ private pure func infer_pattern(
 								void
 
 						index += 1
+
+					-- Infer every alternative before checking bindings: only typecheck
+					-- knows whether a bare name denotes a constructor. Avoid a second
+					-- diagnostic when a nested pattern has already failed inference.
+					if has_binding and next_context.state.errors.length() == context.state.errors.length():
+						next_context = infer_error_at_with_help(
+							next_context,
+							"Or-pattern alternatives cannot bind variables",
+							span,
+							"\n    help: use wildcards to ignore payloads, or split the alternatives into separate match arms to bind them",
+						)
 
 					infer_pattern_result(
 						next_context,

@@ -470,7 +470,9 @@ private pure func contract_expr_introduces_parameter_shadow(
 	expr: CoreExpr,
 ) -> Bool:
 	match expr:
-		LetExpr(variable, _, _, _, _) | BorrowLetExpr(variable, _, _, _):
+		LetExpr(variable, _, _, _, _):
+			contract_var_collides_with_parameter(index, variable)
+		BorrowLetExpr(variable, _, _, _):
 			contract_var_collides_with_parameter(index, variable)
 		TensorRawViewLetExpr(binding, _, _, _):
 			contract_var_collides_with_parameter(index, binding.variable)
@@ -508,11 +510,17 @@ private pure func contract_expr_introduces_parameter_shadow(
 			contract_var_collides_with_parameter(index, loop.binder.variable)
 		ForTensorExpr(loop, _, _):
 			contract_var_collides_with_parameter(index, loop.binder.variable)
-		PreClosureConcurrentExpr(block, _, _) | ConcurrentExpr(block, _, _):
+		PreClosureConcurrentExpr(block, _, _):
 			block.bindings.any(func(binding):
 				contract_var_collides_with_parameter(index, binding.variable)
 			)
-		PreClosureConcurrentlyLoopExpr(loop, _, _) | ConcurrentlyLoopExpr(loop, _, _):
+		ConcurrentExpr(block, _, _):
+			block.bindings.any(func(binding):
+				contract_var_collides_with_parameter(index, binding.variable)
+			)
+		PreClosureConcurrentlyLoopExpr(loop, _, _):
+			contract_var_collides_with_parameter(index, loop.variable)
+		ConcurrentlyLoopExpr(loop, _, _):
 			contract_var_collides_with_parameter(index, loop.variable)
 		SelectExpr(select_expr, _, _):
 			select_expr.any(func(arm):
@@ -957,22 +965,37 @@ private pure func contract_body_expr_matches(
 					contract_body_expr_matches(predicate, index, callee)
 					or contract_body_any_expr_matches(predicate, index, args)
 				)
-			BinaryExpr(_, left, right, _, _) | LogicalExpr(_, left, right, _, _):
+			BinaryExpr(_, left, right, _, _):
 				(
 					contract_body_expr_matches(predicate, index, left)
 					or contract_body_expr_matches(predicate, index, right)
 				)
-			UnaryExpr(_, value, _, _) | CastExpr(value, _, _) | UnboxExpr(_, value, _, _) | ProductFieldExpr(value, _, _, _):
+			LogicalExpr(_, left, right, _, _):
+				(
+					contract_body_expr_matches(predicate, index, left)
+					or contract_body_expr_matches(predicate, index, right)
+				)
+			UnaryExpr(_, value, _, _):
+				contract_body_expr_matches(predicate, index, value)
+			CastExpr(value, _, _):
+				contract_body_expr_matches(predicate, index, value)
+			UnboxExpr(_, value, _, _):
+				contract_body_expr_matches(predicate, index, value)
+			ProductFieldExpr(value, _, _, _):
 				contract_body_expr_matches(predicate, index, value)
 			AssignExpr(_, rhs, _, _):
 				contract_body_expr_matches(predicate, index, rhs)
 			BoxExpr(box, _, _):
 				contract_body_expr_matches(predicate, index, box.value)
-			TupleExpr(items, _, _) | VectorExpr(items, _, _):
+			TupleExpr(items, _, _):
+				contract_body_any_expr_matches(predicate, index, items)
+			VectorExpr(items, _, _):
 				contract_body_any_expr_matches(predicate, index, items)
 			TupleConstructExpr(construct, _, _):
 				contract_body_any_tuple_element_matches(predicate, index, construct.elements)
-			ListConstructExpr(construct, _, _) | TensorBoxedLiteralExpr(construct, _, _):
+			ListConstructExpr(construct, _, _):
+				contract_body_any_boxed_storage_value_matches(predicate, index, construct.elements)
+			TensorBoxedLiteralExpr(construct, _, _):
 				contract_body_any_boxed_storage_value_matches(predicate, index, construct.elements)
 			UnionConstructExpr(construct, _, _):
 				contract_body_any_boxed_storage_value_matches(predicate, index, construct.args)
@@ -1062,9 +1085,16 @@ private pure func contract_body_expr_matches(
 				)
 			DictConstructExpr(construct, _, _):
 				contract_body_any_dict_entry_matches(predicate, index, construct.entries)
-			RecordExpr(fields, _, _) | RecordConstructExpr(_, fields, _, _):
+			RecordExpr(fields, _, _):
 				contract_body_any_record_field_value_matches(predicate, index, fields)
-			RecordUpdateExpr(base, fields, _, _) | RecordReuseExpr(base, fields, _, _):
+			RecordConstructExpr(_, fields, _, _):
+				contract_body_any_record_field_value_matches(predicate, index, fields)
+			RecordUpdateExpr(base, fields, _, _):
+				(
+					contract_body_expr_matches(predicate, index, base)
+					or contract_body_any_record_field_value_matches(predicate, index, fields)
+				)
+			RecordReuseExpr(base, fields, _, _):
 				(
 					contract_body_expr_matches(predicate, index, base)
 					or contract_body_any_record_field_value_matches(predicate, index, fields)
@@ -1076,9 +1106,16 @@ private pure func contract_body_expr_matches(
 				)
 			PreClosureDetachExpr(detached, _, _):
 				contract_body_expr_matches(predicate, index, detached)
-			DupExpr(_, _, _, body, _, _) | DropExpr(_, _, _, body, _, _):
+			DupExpr(_, _, _, body, _, _):
 				contract_body_expr_matches(predicate, index, body)
-			LetExpr(_, _, _, rhs, body) | BorrowLetExpr(_, _, rhs, body):
+			DropExpr(_, _, _, body, _, _):
+				contract_body_expr_matches(predicate, index, body)
+			LetExpr(_, _, _, rhs, body):
+				(
+					contract_body_expr_matches(predicate, index, rhs)
+					or contract_body_expr_matches(predicate, index, body)
+				)
+			BorrowLetExpr(_, _, rhs, body):
 				(
 					contract_body_expr_matches(predicate, index, rhs)
 					or contract_body_expr_matches(predicate, index, body)
@@ -1115,12 +1152,54 @@ private pure func contract_body_expr_matches(
 					or contract_body_expr_matches(predicate, index, end_value)
 					or contract_body_expr_matches(predicate, index, body)
 				)
-			ForChannelExpr(loop, _, _) | ForListExpr(loop, _, _) | ForStringExpr(loop, _, _) | ForDictExpr(loop, _, _) | ForSetExpr(loop, _, _) | ForStreamExpr(loop, _, _) | ForResourceSourceExpr(loop, _, _) | ForTensorExpr(loop, _, _):
+			ForChannelExpr(loop, _, _):
 				(
 					contract_body_expr_matches(predicate, index, loop.iterable)
 					or contract_body_expr_matches(predicate, index, loop.body)
 				)
-			PreClosureConcurrentlyLoopExpr(loop, _, _) | ConcurrentlyLoopExpr(loop, _, _):
+			ForListExpr(loop, _, _):
+				(
+					contract_body_expr_matches(predicate, index, loop.iterable)
+					or contract_body_expr_matches(predicate, index, loop.body)
+				)
+			ForStringExpr(loop, _, _):
+				(
+					contract_body_expr_matches(predicate, index, loop.iterable)
+					or contract_body_expr_matches(predicate, index, loop.body)
+				)
+			ForDictExpr(loop, _, _):
+				(
+					contract_body_expr_matches(predicate, index, loop.iterable)
+					or contract_body_expr_matches(predicate, index, loop.body)
+				)
+			ForSetExpr(loop, _, _):
+				(
+					contract_body_expr_matches(predicate, index, loop.iterable)
+					or contract_body_expr_matches(predicate, index, loop.body)
+				)
+			ForStreamExpr(loop, _, _):
+				(
+					contract_body_expr_matches(predicate, index, loop.iterable)
+					or contract_body_expr_matches(predicate, index, loop.body)
+				)
+			ForResourceSourceExpr(loop, _, _):
+				(
+					contract_body_expr_matches(predicate, index, loop.iterable)
+					or contract_body_expr_matches(predicate, index, loop.body)
+				)
+			ForTensorExpr(loop, _, _):
+				(
+					contract_body_expr_matches(predicate, index, loop.iterable)
+					or contract_body_expr_matches(predicate, index, loop.body)
+				)
+			PreClosureConcurrentlyLoopExpr(loop, _, _):
+				(
+					contract_body_expr_matches(predicate, index, loop.iterable)
+					or contract_body_expr_matches(predicate, index, loop.body)
+					or contract_body_optional_expr_matches(predicate, index, loop.timeout)
+					or contract_body_expr_matches(predicate, index, loop.limit)
+				)
+			ConcurrentlyLoopExpr(loop, _, _):
 				(
 					contract_body_expr_matches(predicate, index, loop.iterable)
 					or contract_body_expr_matches(predicate, index, loop.body)
@@ -1617,7 +1696,12 @@ private pure func schedule_contract_linear(
 				state = state,
 				pending = push_contract_task(pending, BorrowContractResult, owner)
 			}
-		TupleExpr(items, typ, loc) | VectorExpr(items, typ, loc):
+		TupleExpr(items, typ, loc):
+			{
+				state = state,
+				pending = push_contract_exprs(pending, ConsumeContractResult, items)
+			}
+		VectorExpr(items, typ, loc):
 			{
 				state = state,
 				pending = push_contract_exprs(pending, ConsumeContractResult, items)
@@ -1676,7 +1760,12 @@ private pure func schedule_contract_linear(
 				state = state,
 				pending = push_contract_task(pending, demand, body)
 			}
-		RecordExpr(fields, typ, loc) | RecordConstructExpr(_, fields, typ, loc):
+		RecordExpr(fields, typ, loc):
+			{
+				state = state,
+				pending = push_contract_record_fields(pending, fields)
+			}
+		RecordConstructExpr(_, fields, typ, loc):
 			{
 				state = state,
 				pending = push_contract_record_fields(pending, fields)
@@ -2048,7 +2137,7 @@ private pure func schedule_contract_linear(
 					loop.body,
 				)
 			}
-		PreClosureConcurrentlyLoopExpr(loop, typ, loc) | ConcurrentlyLoopExpr(loop, typ, loc):
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
 			with_timeout: ContractCollectionTaskStack = push_optional_contract_expr(
 				pending,
 				ConsumeContractResult,
@@ -2062,7 +2151,34 @@ private pure func schedule_contract_linear(
 					loop.limit,
 				)
 			}
-		PreClosureConcurrentExpr(block, typ, loc) | ConcurrentExpr(block, typ, loc):
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			with_timeout: ContractCollectionTaskStack = push_optional_contract_expr(
+				pending,
+				ConsumeContractResult,
+				loop.timeout,
+			)
+			{
+				state = state,
+				pending = push_contract_task(
+					push_contract_task(with_timeout, BorrowContractResult, loop.iterable),
+					ConsumeContractResult,
+					loop.limit,
+				)
+			}
+		PreClosureConcurrentExpr(block, typ, loc):
+			with_timeout: ContractCollectionTaskStack = push_optional_contract_expr(
+				pending,
+				ConsumeContractResult,
+				block.timeout,
+			)
+			-- Lowering places the statements after a `concurrent:` block in its
+			-- body, so the body inherits the block's own demand: in return
+			-- position it is the function's result, not a consumed value.
+			{
+				state = state,
+				pending = push_contract_task(with_timeout, demand, block.body)
+			}
+		ConcurrentExpr(block, typ, loc):
 			with_timeout: ContractCollectionTaskStack = push_optional_contract_expr(
 				pending,
 				ConsumeContractResult,
@@ -2821,7 +2937,26 @@ private pure func summarize_function_return_ownership_uses(
 				summarize_linear_ownership_uses(env, name, scope.acquire),
 				summarize_function_return_ownership_uses(env, name, return_type, scope.body),
 			)
-		PreClosureConcurrentExpr(block, typ, loc) | ConcurrentExpr(block, typ, loc):
+		PreClosureConcurrentExpr(block, typ, loc):
+			-- Lowering places the statements after a `concurrent:` block in its
+			-- body, so the body is the function's return position.
+			shadowed: Bool = block.bindings.any(func(binding): binding.variable.name == name)
+
+			body_uses: OwnershipUseSummary = if shadowed:
+				NO_OWNERSHIP_USES
+			else:
+				summarize_function_return_ownership_uses(env, name, return_type, block.body)
+
+			seq_ownership_uses(
+				summarize_concurrent_block_task_uses(
+					env,
+					name,
+					block.timeout,
+					block.bindings.map(func(binding): binding.rhs),
+				),
+				body_uses,
+			)
+		ConcurrentExpr(block, typ, loc):
 			-- Lowering places the statements after a `concurrent:` block in its
 			-- body, so the body is the function's return position.
 			shadowed: Bool = block.bindings.any(func(binding): binding.variable.name == name)

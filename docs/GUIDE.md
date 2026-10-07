@@ -1828,10 +1828,29 @@ match key:
     _: void
 ```
 
-A bare pattern name matching a constructor of the value's union type must be
-imported with that type or qualified with its module alias. Otherwise the
-compiler reports an error instead of treating the name as a catch-all binding.
-A name that is not a constructor of the value's type remains a variable binding.
+Constructors from another module must be imported with their type for bare
+patterns, or qualified with the module alias. An unimported constructor of the
+value's union type produces an error instead of becoming a catch-all binding.
+A name unrelated to the value's type, or a local name that shadows a constructor,
+is a variable binding in a bare pattern. Rename the local binding to match that
+constructor instead.
+
+Or-pattern alternatives cannot introduce variable bindings, even when the
+payloads have the same type. Use `_` to ignore payload data, or split the
+alternatives into separate arms to bind it. This rule applies inside nested
+patterns too; a binding outside the nested or-pattern remains valid.
+
+```blorp
+pure func either_value(result: Result[Int, Int]) -> Int:
+    match result:
+        Ok(value): value
+        Err(value): value
+
+pure func is_empty(result: Result[List[Int], List[Int]]) -> Bool:
+    match result:
+        Ok([]) | Err([]): True
+        _: False
+```
 
 List patterns without a spread require exactly the written number of elements.
 A spread permits additional elements after the fixed prefix. These length and

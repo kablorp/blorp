@@ -359,7 +359,18 @@ private pure func singleton_constructor_value(
 					constructor_variable_matches(variable.def_id, variant.def_id)
 				None:
 					False
-		UnionType(type_name, ManagedUnionValue) | NamedType(type_name, _):
+		UnionType(type_name, ManagedUnionValue):
+			match match_projection_variant(layout, type_name, variable.name, variable.def_id):
+				Some(variant):
+					fields_empty: Bool = variant.fields.is_empty()
+					exact_constructor: Bool = constructor_variable_matches(
+						variable.def_id,
+						variant.def_id,
+					)
+					fields_empty and exact_constructor
+				None:
+					False
+		NamedType(type_name, _):
 			match match_projection_variant(layout, type_name, variable.name, variable.def_id):
 				Some(variant):
 					fields_empty: Bool = variant.fields.is_empty()
@@ -507,7 +518,7 @@ private pure func semantic_accessor_type(
 						single_named_type_argument(layout.specialize, resolved_parent, "Option")
 					else:
 						None
-				StackResultType(ok_type, error_type) | BoxedResultType(ok_type, error_type):
+				StackResultType(ok_type, error_type):
 					if field_index != 0:
 						None
 					else if constructor == "Ok":
@@ -516,7 +527,18 @@ private pure func semantic_accessor_type(
 						Some(error_type)
 					else:
 						None
-				UnionType(type_name, ManagedUnionValue) | NamedType(type_name, _):
+				BoxedResultType(ok_type, error_type):
+					if field_index != 0:
+						None
+					else if constructor == "Ok":
+						Some(ok_type)
+					else if constructor == "Err":
+						Some(error_type)
+					else:
+						None
+				UnionType(type_name, ManagedUnionValue):
+					union_variant_field_type(layout, resolved_parent, constructor, field_index)
+				NamedType(type_name, _):
 					union_variant_field_type(layout, resolved_parent, constructor, field_index)
 				_:
 					None
@@ -530,7 +552,9 @@ private pure func lower_generic_variant_accessor(
 	field_index: Int,
 ) -> Option[CoreAccessor]:
 	type_name ?= match resolve_specialize_type(layout.specialize, parent_type):
-		UnionType(name, ManagedUnionValue) | NamedType(name, _):
+		UnionType(name, ManagedUnionValue):
+			Some(name)
+		NamedType(name, _):
 			Some(name)
 		_:
 			None
@@ -699,7 +723,11 @@ private pure func constructor_test(
 			variant ?= match_projection_variant(layout, type_name, constructor, None)
 			variant_ref ?= declared_variant_ref(variant.def_id)
 			Some(UnionTagConstructorTest(variant_ref, ScalarTagAccess))
-		UnionType(type_name, ManagedUnionValue) | NamedType(type_name, _):
+		UnionType(type_name, ManagedUnionValue):
+			variant ?= match_projection_variant(layout, type_name, constructor, None)
+			variant_ref ?= declared_variant_ref(variant.def_id)
+			Some(UnionTagConstructorTest(variant_ref, ManagedTagAccess(type_name)))
+		NamedType(type_name, _):
 			variant ?= match_projection_variant(layout, type_name, constructor, None)
 			variant_ref ?= declared_variant_ref(variant.def_id)
 			Some(UnionTagConstructorTest(variant_ref, ManagedTagAccess(type_name)))
@@ -1262,7 +1290,9 @@ private pure func match_scrutinee_needs_release(
 	match scrutinee:
 		VarExpr(_, _, _):
 			False
-		CastExpr(inner, _, _) | UnboxExpr(_, inner, _, _):
+		CastExpr(inner, _, _):
+			match_scrutinee_needs_release(layout, ownership, inner)
+		UnboxExpr(_, inner, _, _):
 			match_scrutinee_needs_release(layout, ownership, inner)
 		_:
 			policy: CoreReleasePolicy = cleanup_release_policy_for_type(
@@ -1447,16 +1477,37 @@ private pure func typed_accessor_to_semantic(
 		ListSpreadAccessor(parent, offset):
 			lowered_parent ?= typed_accessor_to_semantic(parent)
 			Some(ListSpreadSemanticMatchAccessor(lowered_parent, offset))
-		VariantFieldAccessor(parent, _, constructor, field_index) | ErasedVariantFieldAccessor(parent, _, constructor, field_index):
+		VariantFieldAccessor(parent, _, constructor, field_index):
 			lowered_parent ?= typed_accessor_to_semantic(parent)
 			Some(VariantFieldSemanticMatchAccessor(lowered_parent, constructor, field_index))
-		StackOptionPayloadAccessor(parent) | BoxedStackOptionPayloadAccessor(parent, _) | NullableOptionPayloadAccessor(parent):
+		ErasedVariantFieldAccessor(parent, _, constructor, field_index):
+			lowered_parent ?= typed_accessor_to_semantic(parent)
+			Some(VariantFieldSemanticMatchAccessor(lowered_parent, constructor, field_index))
+		StackOptionPayloadAccessor(parent):
 			lowered_parent ?= typed_accessor_to_semantic(parent)
 			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Some", 0))
-		StackResultOkPayloadAccessor(parent) | BoxedStackResultOkPayloadAccessor(parent, _) | BoxedResultOkPayloadAccessor(parent):
+		BoxedStackOptionPayloadAccessor(parent, _):
+			lowered_parent ?= typed_accessor_to_semantic(parent)
+			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Some", 0))
+		NullableOptionPayloadAccessor(parent):
+			lowered_parent ?= typed_accessor_to_semantic(parent)
+			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Some", 0))
+		StackResultOkPayloadAccessor(parent):
 			lowered_parent ?= typed_accessor_to_semantic(parent)
 			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Ok", 0))
-		StackResultErrPayloadAccessor(parent) | BoxedStackResultErrPayloadAccessor(parent, _) | BoxedResultErrPayloadAccessor(parent):
+		BoxedStackResultOkPayloadAccessor(parent, _):
+			lowered_parent ?= typed_accessor_to_semantic(parent)
+			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Ok", 0))
+		BoxedResultOkPayloadAccessor(parent):
+			lowered_parent ?= typed_accessor_to_semantic(parent)
+			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Ok", 0))
+		StackResultErrPayloadAccessor(parent):
+			lowered_parent ?= typed_accessor_to_semantic(parent)
+			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Err", 0))
+		BoxedStackResultErrPayloadAccessor(parent, _):
+			lowered_parent ?= typed_accessor_to_semantic(parent)
+			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Err", 0))
+		BoxedResultErrPayloadAccessor(parent):
 			lowered_parent ?= typed_accessor_to_semantic(parent)
 			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Err", 0))
 

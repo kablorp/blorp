@@ -551,7 +551,9 @@ pure func cancellation_construct_transferred_operands(expr: CoreExpr) -> List[Co
 			boxed_storage_operands(construct.args)
 		UnionReuseConstructExpr(construct, _, _):
 			[construct.source].concat(boxed_storage_operands(construct.args))
-		RecordConstructExpr(_, fields, _, _) | RecordExpr(fields, _, _):
+		RecordConstructExpr(_, fields, _, _):
+			record_field_operands(fields)
+		RecordExpr(fields, _, _):
 			record_field_operands(fields)
 		RecordReuseExpr(source, fields, _, _):
 			[source].concat(record_field_operands(fields))
@@ -618,7 +620,19 @@ private pure func tuple_transferred_operands(
 
 private pure func tuple_element_value(element: CoreTupleElement) -> Option[CoreExpr]:
 	match element:
-		TuplePrimElement(value) | TuplePointerElement(value) | TupleStructElement(value, _) | TupleStackResultElement(value) | TupleFloatElement(value) | TupleFloat32Element(value) | TupleFloat16Element(value):
+		TuplePrimElement(value):
+			Some(value)
+		TuplePointerElement(value):
+			Some(value)
+		TupleStructElement(value, _):
+			Some(value)
+		TupleStackResultElement(value):
+			Some(value)
+		TupleFloatElement(value):
+			Some(value)
+		TupleFloat32Element(value):
+			Some(value)
+		TupleFloat16Element(value):
 			Some(value)
 		TupleVoidElement:
 			None
@@ -843,7 +857,11 @@ private pure func analyzed_consumed_vars(
 			)
 		SeqExpr(_, _):
 			merge_vars(child_facts(children, 0).consumed, child_facts(children, 1).consumed)
-		AccessorLiteralMatchExpr(scrutinee, policy, _, _, _) | LengthMatchExpr(scrutinee, policy, _, _, _) | ConstructorMatchExpr(scrutinee, policy, _, _, _, _):
+		AccessorLiteralMatchExpr(scrutinee, policy, _, _, _):
+			match_scrutinee_consumed_var(scrutinee, policy)
+		LengthMatchExpr(scrutinee, policy, _, _, _):
+			match_scrutinee_consumed_var(scrutinee, policy)
+		ConstructorMatchExpr(scrutinee, policy, _, _, _, _):
 			match_scrutinee_consumed_var(scrutinee, policy)
 		AssignExpr(_, rhs, _, _):
 			optional_var_list(expr_is_var_reference(rhs))
@@ -925,7 +943,11 @@ private pure func analyzed_consumed_before_suspension_vars(
 				merge_vars(first.consumed_before_suspension, second.consumed_before_suspension)
 			else:
 				first.consumed_before_suspension
-		AccessorLiteralMatchExpr(scrutinee, policy, _, _, _) | LengthMatchExpr(scrutinee, policy, _, _, _) | ConstructorMatchExpr(scrutinee, policy, _, _, _, _):
+		AccessorLiteralMatchExpr(scrutinee, policy, _, _, _):
+			match_scrutinee_consumed_var(scrutinee, policy)
+		LengthMatchExpr(scrutinee, policy, _, _, _):
+			match_scrutinee_consumed_var(scrutinee, policy)
+		ConstructorMatchExpr(scrutinee, policy, _, _, _, _):
 			match_scrutinee_consumed_var(scrutinee, policy)
 		AssignExpr(_, rhs, _, _):
 			optional_var_list(expr_is_var_reference(rhs))
@@ -1086,7 +1108,11 @@ private pure func cleanup_actions_equal(
 
 private pure func match_expr_has_plannable_scrutinee(expr: CoreExpr) -> Bool:
 	match expr:
-		AccessorLiteralMatchExpr(VarExpr(_, _, _), policy, _, _, _) | LengthMatchExpr(VarExpr(_, _, _), policy, _, _, _) | ConstructorMatchExpr(VarExpr(_, _, _), policy, _, _, _, _):
+		AccessorLiteralMatchExpr(VarExpr(_, _, _), policy, _, _, _):
+			cancellation_cleanup_action_for_release_policy(policy).is_some()
+		LengthMatchExpr(VarExpr(_, _, _), policy, _, _, _):
+			cancellation_cleanup_action_for_release_policy(policy).is_some()
+		ConstructorMatchExpr(VarExpr(_, _, _), policy, _, _, _, _):
 			cancellation_cleanup_action_for_release_policy(policy).is_some()
 		_:
 			False
@@ -1241,7 +1267,97 @@ private pure func analyze_current_behavior_expr(
 
 			if tracks_cleanup and body_live_slots + 1 > max_live_slots:
 				max_live_slots = body_live_slots + 1
-		AccessorLiteralMatchExpr(VarExpr(variable, _, _), policy, _, _, _) | LengthMatchExpr(VarExpr(variable, _, _), policy, _, _, _) | ConstructorMatchExpr(VarExpr(variable, _, _), policy, _, _, _, _):
+		AccessorLiteralMatchExpr(VarExpr(variable, _, _), policy, _, _, _):
+			match cancellation_cleanup_action_for_release_policy(policy):
+				Some(action):
+					force_cleanup: Bool = if forced_match_scrutinees.is_empty():
+						False
+					else:
+						vars_contain(forced_match_scrutinees, variable)
+
+					tracks_cleanup: Bool = if force_cleanup:
+						True
+					else:
+						match mode:
+							CurrentBehaviorCancellationPlanning:
+								True
+							RegionSensitiveCancellationPlanning(_, _):
+								match_branch_may_cancel
+
+					owner_id: CancellationOwnerId = cancellation_owner_id(current_owner)
+					slot_id: CancellationSlotId = cancellation_slot_id(current_owner)
+
+					candidate: CancellationCleanupCandidate = {
+						activation = activation,
+						id = owner_id,
+						owner = BackendTemporaryCancellationOwner(
+							current_site,
+							MatchScrutineeTemporary,
+						),
+						slot = slot_id,
+						action = action
+					}
+
+					match_protections = [
+						{
+							scrutinee = variable,
+							protection = {
+								candidate = candidate,
+								tracks_cleanup = tracks_cleanup
+							}
+						},
+					].concat(match_protections)
+
+					if tracks_cleanup and match_branch_live_slots + 1 > max_live_slots:
+						max_live_slots = match_branch_live_slots + 1
+				None:
+					void
+		LengthMatchExpr(VarExpr(variable, _, _), policy, _, _, _):
+			match cancellation_cleanup_action_for_release_policy(policy):
+				Some(action):
+					force_cleanup: Bool = if forced_match_scrutinees.is_empty():
+						False
+					else:
+						vars_contain(forced_match_scrutinees, variable)
+
+					tracks_cleanup: Bool = if force_cleanup:
+						True
+					else:
+						match mode:
+							CurrentBehaviorCancellationPlanning:
+								True
+							RegionSensitiveCancellationPlanning(_, _):
+								match_branch_may_cancel
+
+					owner_id: CancellationOwnerId = cancellation_owner_id(current_owner)
+					slot_id: CancellationSlotId = cancellation_slot_id(current_owner)
+
+					candidate: CancellationCleanupCandidate = {
+						activation = activation,
+						id = owner_id,
+						owner = BackendTemporaryCancellationOwner(
+							current_site,
+							MatchScrutineeTemporary,
+						),
+						slot = slot_id,
+						action = action
+					}
+
+					match_protections = [
+						{
+							scrutinee = variable,
+							protection = {
+								candidate = candidate,
+								tracks_cleanup = tracks_cleanup
+							}
+						},
+					].concat(match_protections)
+
+					if tracks_cleanup and match_branch_live_slots + 1 > max_live_slots:
+						max_live_slots = match_branch_live_slots + 1
+				None:
+					void
+		ConstructorMatchExpr(VarExpr(variable, _, _), policy, _, _, _, _):
 			match cancellation_cleanup_action_for_release_policy(policy):
 				Some(action):
 					force_cleanup: Bool = if forced_match_scrutinees.is_empty():
@@ -2352,7 +2468,13 @@ private pure func classify_call(
 				CancellingCall(BuiltinCancellationPoint(call.name))
 			else:
 				NonCancellingCall
-		SelectedDirectCall(def_id) | SelectedTraitCall(_, _, _, def_id):
+		SelectedDirectCall(def_id):
+			match unique_identity_for_def_id(identities, def_id):
+				Some(identity):
+					CallableCall(identity)
+				None:
+					CancellingCall(UnknownCallBoundary)
+		SelectedTraitCall(_, _, _, def_id):
 			match unique_identity_for_def_id(identities, def_id):
 				Some(identity):
 					CallableCall(identity)
