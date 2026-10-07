@@ -15,7 +15,8 @@ import:
 	../tools/discovery_adapter_comparison: with_holes_parsed
 	../../../src/compiler/stage_03_parse/parsed_ast_json: ast_json_render, parsed_decl_to_json
 	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
-	../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state, issued_ids, spellings, advanced
+	../../../src/compiler_new/stage_01_discovery/parse/layout_quirks: anchored_at
+	../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state, issued_ids, spellings, advanced, diagnostic_count, current_span
 	../../../src/compiler_new/stage_01_discovery/parse/tree_expression_parser: parse_expression_recipe, mint_recipe, RecipeParse(ParsedRecipe)
 	../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_source
 	../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
@@ -416,6 +417,232 @@ func test_lambdas_in_block_form_headers_match_old_parser() -> Bool:
 	]))
 
 
+func test_multiline_braced_forms_match_old_parser() -> Bool:
+	bodies_match_old_parser(source_lines([
+		"func g(c: Int, base: Config) -> Int:",
+		"\tconfig = {",
+		"\t\tname = c,",
+		"\t\tnested = {",
+		"\t\t\tinner = [1,",
+		"\t\t\t\t2],",
+		"\t\t},",
+		"\t}",
+		"\tupdated = {",
+		"\t\tbase |",
+		"\t\tname = 1,",
+		"\t\tother = f(c,",
+		"\t\t\tc),",
+		"\t}",
+		"\tlookup = {",
+		"\t\t1 => \"one\",",
+		"\t\tc => (c +",
+		"\t\t\t1),",
+		"\t}",
+		"\tvector = {",
+		"\t\tc,",
+		"\t\tc * 2",
+		"\t}",
+		"\tempty = {",
+		"\t}",
+		"\tconfig.name + 1"
+	]))
+
+
+func test_multiline_braced_globals_and_bodies_match_old_parser() -> Bool:
+	first: Bool = bodies_match_old_parser(source_lines([
+		"settings = {",
+		"\tname = 1,",
+		"\tlevel = 2,",
+		"}",
+		"",
+		"func pick() -> Config: {",
+		"\ta = 1,",
+		"\tb = 2",
+		"}",
+		"",
+		"func after() -> Int:",
+		"\tsettings.name"
+	]))
+	first
+
+
+func test_multiline_calls_lists_tuples_and_groupings_match_old_parser() -> Bool:
+	bodies_match_old_parser(source_lines([
+		"func g(c: Int, xs: List[Int]) -> Int:",
+		"\ttotal = add(",
+		"\t\tc,",
+		"\t\txs[",
+		"\t\t\t0",
+		"\t\t],",
+		"\t)",
+		"\tlist = [",
+		"\t\t1,",
+		"\t\t(c,",
+		"\t\t\tc),",
+		"\t]",
+		"\tgrouped = (c +",
+		"\t\t(c *",
+		"\t\t\t2)) * 3",
+		"\tchained = pick(c,",
+		"\t\tc).value(",
+		"\t\t1)",
+		"\tempty = f(",
+		"\t)",
+		"\ttotal"
+	]))
+
+
+-- A block lambda or a `match` as a call argument, closed by its dedent and then
+-- the bracket. Its body is indented past the anchor the call is read under.
+func test_block_arguments_inside_brackets_match_old_parser() -> Bool:
+	bodies_match_old_parser(source_lines([
+		"func g(c: Int) -> Int:",
+		"\tmapped = each(xs, func(x: Int) -> Int:",
+		"\t\tx + 1",
+		"\t)",
+		"\tif pick(func(y: Int) -> Bool:",
+		"\t\ty > 0",
+		"\t):",
+		"\t\tvoid",
+		"\tpicked = choose(match c:",
+		"\t\t0: 1",
+		"\t\t_: 2",
+		"\t)",
+		"\tpicked"
+	]))
+
+
+-- Whether the tree scan reads every declaration of `text` and reports nothing.
+private func tree_accepts(text: String) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Err(_): False
+		Ok(entry):
+			(scanned, scan) = scan_module_declaration_prefix_with_bodies(entry)
+			reached_end: Bool = match scan.stop:
+				ReachedEndOfSource: True
+				_: False
+			reached_end and scan.declined.is_empty() and scanned.diagnostic_count() == 0
+
+
+-- The differential for each named source: where the frozen parser accepts it
+-- the tree projection equals its parse, and where it rejects it the tree scan
+-- does not accept it either.
+private func agrees_with_old_parser(cases: List[(String, String)]) -> Bool:
+	var correct: Bool = True
+	for (name, text) in cases:
+		source = source_file("/tmp/tree_body_projection.brp", "tree_body_projection", text)
+		old_accepts: Bool = with_holes_parsed(parse_compiler_source(source)).diagnostics.is_empty()
+		agrees: Bool = if old_accepts:
+			bodies_match_old_parser(text)
+		else:
+			not tree_accepts(text)
+		if not agrees:
+			verdict: String = if old_accepts:
+				"accepts"
+			else:
+				"rejects"
+			print("${name}: the tree scan disagrees with the frozen parser, which ${verdict} it")
+			correct = False
+	correct
+
+
+-- A block opened inside call arguments, subscripts, lists, tuples, groupings,
+-- record fields and dict entries is read only past the frozen parser's anchor, and
+-- every shape the frozen parser rejects is not accepted here.
+func test_blocks_in_bracketed_items_follow_the_old_anchor() -> Bool:
+	agrees_with_old_parser([
+		("binary_call_match", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> Int:\n\tx = f(1) + f(match c:\n\t\tTrue: 1\n\t\tFalse: 2\n\t)\n\tx\n"),
+		("call_match_next_line", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> Int:\n\tx = f(\n\t\tmatch c:\n\t\t\tTrue: 1\n\t\t\tFalse: 2\n\t)\n\tx\n"),
+		("if_arg_plus", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> Int:\n\tf(if c:\n\t\t1\n\telse:\n\t\t2\n\t+ 3)\n"),
+		("list_call_match", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> List[Int]:\n\t[f(match c:\n\t\tTrue: 1\n\t\tFalse: 2\n\t)]\n"),
+		("list_match_next_line", "pure func g(c: Bool) -> List[Int]:\n\t[\n\t\tmatch c:\n\t\t\tTrue: 1\n\t\t\tFalse: 2\n\t]\n"),
+		("mid_if_arg", "pure func f(a: Int, b: Int) -> Int:\n\ta + b\n\n\npure func g(c: Bool) -> Int:\n\tf(if c:\n\t\t1\n\telse:\n\t\t2\n\t, 3)\n"),
+		("nested_call_match", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> Int:\n\tx = f(f(match c:\n\t\tTrue: 1\n\t\tFalse: 2\n\t))\n\tx\n"),
+		("record_call_match", "record R {\n\ta: Int\n}\n\n\npure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> R:\n\t{a = f(match c:\n\t\tTrue: 1\n\t\tFalse: 2\n\t)}\n"),
+		("subscript_if", "pure func g(xs: List[Int], c: Bool) -> Int:\n\txs[if c:\n\t\t0\n\telse:\n\t\t1\n\t]\n"),
+		("subscript_if_value", "pure func g(xs: List[Int], c: Bool) -> Int:\n\tv = xs[if c:\n\t\t0\n\telse:\n\t\t1\n\t]\n\tv\n"),
+		("tuple_call_match", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> (Int, Int):\n\t(1, f(match c:\n\t\tTrue: 1\n\t\tFalse: 2\n\t))\n"),
+		("dict_call_match", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> Dict[Int, Int]:\n\t{1 => f(match c:\n\t\tTrue: 1\n\t\tFalse: 2\n\t)}\n"),
+		("operator_newline", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> Int:\n\tvalue = f(1) +\n\t\t2\n\tvalue\n"),
+		("tuple_call_match_value", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> Int:\n\ty = 1\n\tx = (y, f(match c:\n\t\tTrue: 1\n\t\tFalse: 2\n\t))\n\ty\n"),
+		("call_match_then_op", "pure func g(c: Bool) -> Int:\n\tv = f(match c:\n\t\tTrue: 1\n\t\tFalse: 2\n\t) + 1\n\tv\n\n\npure func f(a: Int) -> Int:\n\ta\n"),
+		("empty_brace", "record E {}\n\n\npure func g() -> E:\n\tx = {\n\t}\n\tx\n"),
+		("empty_paren", "pure func g() -> Void:\n\tx = (\n\t)\n\tx\n"),
+		("lambda_then_postfix", "pure func g(xs: List[Int]) -> Int:\n\tv = xs.map(func(x):\n\t\tx + 1\n\t).length()\n\tv\n"),
+		("mid_if_deeper", "pure func g(c: Int) -> Int:\n\tv = f(1, if c > 0:\n\t\t\t1\n\t\telse:\n\t\t\t2\n\t, 3)\n\tv\n\n\npure func f(a: Int, b: Int, d: Int) -> Int:\n\ta\n"),
+		("subscript_multi", "pure func g(xs: List[Int]) -> Int:\n\ty = xs[\n\t\t0\n\t]\n\ty\n"),
+		("list_match_same_line", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> List[Int]:\n\t[match c:\n\t\tTrue: 1\n\t\tFalse: 2\n\t]\n"),
+		("tuple_if_second", "pure func g(c: Bool) -> (Int, Int):\n\t(1, if c:\n\t\t1\n\telse:\n\t\t2\n\t)\n"),
+		("group_if", "pure func g(c: Bool) -> Int:\n\t(if c:\n\t\t1\n\telse:\n\t\t2\n\t)\n"),
+		("call_if_only_arg", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> Int:\n\tf(if c:\n\t\t1\n\telse:\n\t\t2\n\t)\n"),
+		("call_match_only_arg", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> Int:\n\tf(match c:\n\t\tTrue: 1\n\t\tFalse: 2\n\t)\n"),
+		("call_if_value", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> Int:\n\tv = f(if c:\n\t\t1\n\telse:\n\t\t2\n\t)\n\tv\n"),
+		("brace_lambda_value", "pure func g() -> Int:\n\tr = {a = func(x):\n\t\tx\n\t}\n\t0\n"),
+		("dict_value_deep", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> Dict[Int, Int]:\n\t{1 => f(match c:\n\t\t\tTrue: 1\n\t\t\tFalse: 2\n\t)}\n"),
+		("record_field_deep", "record R {\n\ta: Int\n}\n\n\npure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> R:\n\t{a = f(match c:\n\t\t\tTrue: 1\n\t\t\tFalse: 2\n\t)}\n"),
+		("list_item_call_shallow", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> List[Int]:\n  x = [f(match c:\n      True: 1\n      False: 2\n  )]\n  x\n"),
+		("list_item_call_deeper", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> List[Int]:\n  x = [f(match c:\n        True: 1\n        False: 2\n  )]\n  x\n"),
+		("tuple_element_shallow", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> (Int, Int):\n  x = (1, f(match c:\n    True: 1\n    False: 2\n  ))\n  x\n"),
+		("group_shallow", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> Int:\n  x = (match c:\n    True: 1\n    False: 2\n  )\n  x\n")
+	])
+
+
+-- A block lambda in the header of an `if`, `else if`, `while`, `for` or `match`
+-- is anchored at the header expression's first token.
+func test_blocks_in_block_headers_follow_the_old_anchor() -> Bool:
+	agrees_with_old_parser([
+		("elseif_tab", "pure func g(xs: List[Int]) -> Int:\n\tif xs.is_empty():\n\t\t0\n\telse if xs.any(func(x):\n\t\tx > 1\n\t):\n\t\t1\n\telse:\n\t\t2\n"),
+		("while_deep", "pure func g(xs: List[Int]) -> Int:\n\twhile xs.any(func(x):\n\t\t\t\tx > 1\n\t):\n\t\tbreak\n\t0\n"),
+		("while_tab", "pure func g(xs: List[Int]) -> Int:\n\twhile xs.any(func(x):\n\t\tx > 1\n\t):\n\t\tbreak\n\t0\n"),
+		("elseif_deep", "pure func g(xs: List[Int], c: Bool) -> Int:\n\tif c:\n\t\t0\n\telse if xs.any(func(x):\n\t\t\t\tx > 1\n\t):\n\t\t1\n\telse:\n\t\t2\n"),
+		("for_deep", "pure func g(xs: List[Int]) -> Int:\n\tfor x in xs.filter(func(y):\n\t\t\t\ty > 1\n\t):\n\t\tbreak\n\t0\n"),
+		("lambda_header_multiline", "pure func g(xs: List[Int]) -> List[Int]:\n\txs.map(func(\n\t\tx: Int\n\t) -> Int:\n\t\tx + 1\n\t)\n"),
+		("match_paren_multiline", "pure func g(c: Bool) -> Int:\n\tmatch (\n\t\tc\n\t):\n\t\tTrue: 1\n\t\tFalse: 2\n"),
+		("while_header_lambda", "pure func g(xs: List[Int]) -> Int:\n\twhile xs.any(func(x):\n\t\tx > 1\n\t):\n\t\tbreak\n\t0\n"),
+		("if_header_lambda_tab", "pure func g(xs: List[Int]) -> Int:\n\tif xs.any(func(x):\n\t\tx > 1\n\t):\n\t\t1\n\telse:\n\t\t2\n"),
+		("for_header_lambda_tab", "pure func g(xs: List[Int]) -> Int:\n\tfor x in xs.filter(func(y):\n\t\ty > 1\n\t):\n\t\tbreak\n\t0\n"),
+		("match_scrutinee_lambda", "pure func g(xs: List[Int]) -> Int:\n\tmatch xs.any(func(x):\n\t\tx > 1\n\t):\n\t\tTrue: 1\n\t\tFalse: 2\n")
+	])
+
+
+-- Spaces and tabs, and a body or closing bracket indented deeper or no deeper
+-- than the anchor.
+func test_block_indentation_variants_follow_the_old_anchor() -> Bool:
+	agrees_with_old_parser([
+		("if2sp", "pure func g(xs: List[Int]) -> Int:\n  if xs.any(func(x):\n    x > 1\n  ):\n    1\n  else:\n    2\n"),
+		("if4sp", "pure func g(xs: List[Int]) -> Int:\n    if xs.any(func(x):\n        x > 1\n    ):\n        1\n    else:\n        2\n"),
+		("if_extra_space", "pure func g(xs: List[Int]) -> Int:\n\tif   xs.any(func(x):\n\t\tx > 1\n\t):\n\t\t1\n\telse:\n\t\t2\n"),
+		("if_tab", "pure func g(xs: List[Int]) -> Int:\n\tif xs.any(func(x):\n\t\tx > 1\n\t):\n\t\t1\n\telse:\n\t\t2\n"),
+		("lambda_arg_tab", "pure func g(xs: List[Int]) -> List[Int]:\n\tys = xs.map(func(x):\n\t\tx + 1\n\t)\n\tys\n"),
+		("lambda_arg_2sp", "pure func g(xs: List[Int]) -> List[Int]:\n  ys = xs.map(func(x):\n    x + 1\n  )\n  ys\n"),
+		("lambda_arg_4sp", "pure func g(xs: List[Int]) -> List[Int]:\n    ys = xs.map(func(x):\n        x + 1\n    )\n    ys\n"),
+		("lambda_arg_same_col_body", "pure func g(xs: List[Int]) -> List[Int]:\n\tys = xs.map(func(x):\n\tx + 1\n\t)\n\tys\n"),
+		("lambda_body_deep", "pure func g(xs: List[Int]) -> List[Int]:\n\tys = xs.map(func(x):\n\t\t\t\tx + 1\n\t)\n\tys\n"),
+		("lambda_close_deep", "pure func g(xs: List[Int]) -> List[Int]:\n\tys = xs.map(func(x):\n\t\tx + 1\n\t\t)\n\tys\n"),
+		("if_value_2sp", "pure func g(c: Bool) -> Int:\n  v = if c:\n    1\n  else:\n    2\n  v\n"),
+		("if_stmt_2sp", "pure func g(c: Bool) -> Int:\n  if c:\n    1\n  else:\n    2\n"),
+		("while_2sp", "pure func g(c: Bool) -> Int:\n  while c:\n    break\n  0\n"),
+		("match_stmt_2sp", "pure func g(c: Bool) -> Int:\n  match c:\n    True: 1\n    False: 2\n"),
+		("call_if_2sp", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> Int:\n  v = f(if c:\n    1\n  else:\n    2\n  )\n  v\n"),
+		("call_if_tab_body_deeper", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> Int:\n\tv = f(if c:\n\t\t\t1\n\t\telse:\n\t\t\t2\n\t)\n\tv\n"),
+		("call_if_close_same_as_body", "pure func f(a: Int) -> Int:\n\ta\n\n\npure func g(c: Bool) -> Int:\n\tv = f(if c:\n\t\t1\n\telse:\n\t\t2\n\t\t)\n\tv\n")
+	])
+
+
+-- A body written on the header's line, and a global value, are anchored at
+-- their own first token.
+func test_same_line_bodies_and_globals_follow_the_old_anchor() -> Bool:
+	agrees_with_old_parser([
+		("same_line_body_block", "pure func g() -> Int: f(func(x):\n\tx\n)\n"),
+		("same_line_body_call_block", "pure func g(xs: List[Int]) -> List[Int]: xs.map(func(x):\n\tx\n)\n"),
+		("same_line_body_if_arg", "pure func g(c: Bool) -> Int: f(if c:\n\t1\nelse:\n\t2\n)\n"),
+		("global_call_lambda", "xs = map(func(x):\n\tx + 1\n)\n"),
+		("global_if_value", "v = if True:\n\t1\nelse:\n\t2\n"),
+		("same_line_body_deep", "pure func g(c: Bool) -> Int: if c:\n\t\t\t\t\t\t\t\t1\nelse:\n\t\t\t\t\t\t\t\t2\n"),
+		("same_line_body_value_deep", "pure func g(c: Bool) -> Int: f(if c:\n\t\t\t\t\t\t\t\t\t1\nelse:\n\t\t\t\t\t\t\t\t\t2\n)\n")
+	])
+
+
 func test_nested_blocks_match_old_parser() -> Bool:
 	bodies_match_old_parser(source_lines([
 		"func g(value: Int) -> Int:",
@@ -576,7 +803,8 @@ private func pipe_expression(text: String) -> Option[(ParsedExpr, ParsedExpr)]:
 					-- Past the newline and the indent that precede the pipe token.
 					-- The recipe entry skips the boundary check, which an indented
 					-- value's closing dedent would fail.
-					(at_token, parsed) = parse_expression_recipe(at_value.advanced().advanced())
+					at_start = at_value.advanced().advanced()
+					(at_token, parsed) = parse_expression_recipe(at_start, anchored_at(at_start.current_span()))
 					match parsed:
 						ParsedRecipe(recipe):
 							(_, value) = mint_recipe(at_token, recipe)
@@ -853,6 +1081,14 @@ tests: TestSuite = {
 		("debug blocks and detach match the old parser", test_debug_blocks_and_detach_match_old_parser),
 		("nested block forms match the old parser", test_nested_block_forms_match_old_parser),
 		("lambdas in block form headers match the old parser", test_lambdas_in_block_form_headers_match_old_parser),
+		("multiline braced forms match the old parser", test_multiline_braced_forms_match_old_parser),
+		("multiline braced globals and bodies match the old parser", test_multiline_braced_globals_and_bodies_match_old_parser),
+		("multiline calls, lists, tuples and groupings match the old parser", test_multiline_calls_lists_tuples_and_groupings_match_old_parser),
+		("block arguments inside brackets match the old parser", test_block_arguments_inside_brackets_match_old_parser),
+		("blocks in bracketed items follow the old anchor", test_blocks_in_bracketed_items_follow_the_old_anchor),
+		("blocks in block headers follow the old anchor", test_blocks_in_block_headers_follow_the_old_anchor),
+		("block indentation variants follow the old anchor", test_block_indentation_variants_follow_the_old_anchor),
+		("same line bodies and globals follow the old anchor", test_same_line_bodies_and_globals_follow_the_old_anchor),
 		("nested blocks match the old parser", test_nested_blocks_match_old_parser),
 		("trait default bodies match the old parser", test_trait_default_bodies_match_old_parser),
 		("implementation bodies match the old parser", test_implementation_bodies_match_old_parser),

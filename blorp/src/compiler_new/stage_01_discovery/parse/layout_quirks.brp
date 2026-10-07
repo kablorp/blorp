@@ -1,0 +1,73 @@
+-- The frozen grammar's own layout rules: the few decisions that the token
+-- stream does not carry, because the frozen parser takes them from where a
+-- construct sits. Everything else about layout is read from the newline,
+-- indent, dedent and closing-delimiter tokens, never from line numbers. A rule
+-- lives here with the reason the frozen parser has it, so that the tree parsers
+-- match it deliberately and the rest of them stay free of line and column logic.
+import:
+	../tables/span: Span
+	parse_state: ParseState, current_span, span_start_line, span_start_column
+
+
+---
+The token the frozen parser measures a block opened inside an expression
+against: its `header_span`. A type of its own so that an unrelated span cannot
+be passed where an anchor is wanted.
+---
+record ExpressionAnchor {
+	token: Span
+}
+
+
+---
+The anchor that sits at `token`.
+---
+pure func anchored_at(token: Span) -> ExpressionAnchor:
+	{ token = token }
+
+
+---
+Who decides that a block may open: the lexer alone, or the lexer and the
+bracketed-block anchor.
+
+A block that is a statement of its own (a `while` body, a function body, a
+statement-level `if`) is indented past its keyword by the lexer's indent
+token, and nothing more is asked of it. A block opened inside an expression (a
+block lambda, an `if` or `match` used as a value) also has to be indented past
+the anchor of the expression it sits in, which the lexer cannot know: the
+anchor is a parse-level construct, such as the start of a condition or the
+opening bracket of a list.
+---
+union BlockAnchor:
+	IndentedByLexer
+	PastExpressionAnchor(ExpressionAnchor)
+
+
+---
+The bracketed-block anchor rule. The frozen parser threads an anchor (its
+`header_span`) through expression parsing, and reads the statements of a block
+opened inside an expression only while they are indented past it: the token
+must start on a later line and in a later column than the anchor, a tab
+advancing to the next multiple-of-4 stop (`current_token_is_indented_past_anchor`,
+`language_parser.brp:4542-4552`; `parse_statement_list`, `:4588`, and the lambda
+body at `:6793`, which stop the block's statements where the check fails). A
+block whose first statement fails it is empty there and the construct is a
+syntax error, so the tree parsers decline it as well.
+
+The anchor an expression is read under depends on what holds it: a statement's
+first token for an assignment value or an expression statement; the first token
+of a condition, an iterable, a scrutinee, a `with` value or a `select` channel;
+the opening `(` or `[` for the items of a grouping, tuple or list; the item's
+own first token for a record field, a dict entry, a vector item or a
+same-line function body; and the enclosing anchor for call arguments and
+subscript indices.
+
+The state is at the first token of the block's first statement.
+---
+pure func block_may_open(state: ParseState, anchor: BlockAnchor) -> Bool:
+	match anchor:
+		IndentedByLexer:
+			True
+		PastExpressionAnchor(past):
+			first: Span = state.current_span()
+			state.span_start_line(first) > state.span_start_line(past.token) and state.span_start_column(first) > state.span_start_column(past.token)

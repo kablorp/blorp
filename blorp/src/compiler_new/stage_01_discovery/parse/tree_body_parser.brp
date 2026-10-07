@@ -47,12 +47,13 @@ import:
 			StarEqualSymbol, SlashEqualSymbol, LeftParenSymbol, RightParenSymbol, CommaSymbol, FuncKeyword, PureKeyword, ArrowSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken, DotSymbol)
 	binary_operators: binary_operator
 	parse_state:
-		ParseState, current_kind, current_span, previous_span, peek_kind, position, advanced, diagnostic_count, span_start_line, spellings,
+		ParseState, current_kind, current_span, peek_kind, position, advanced, diagnostic_count, spellings,
 		consume_referenced_name, finished_expression, finished_statement, finished_block, finished_else_if,
 		finished_subscript_place, finished_function, finished_local_function, inside_hole, report_unreachable_input, finished_name_use, finished_binder, resumed_at, resumed_after
+	layout_quirks: BlockAnchor(IndentedByLexer, PastExpressionAnchor), ExpressionAnchor, anchored_at, block_may_open
 	stop_reason:
 		StopPoint, Recognition(Recognized, Declined), Boundary(AtBoundary, PastBoundary),
-		StopReason(BodyReplayDisagrees, ReplayReported, BodylessFunction, BodyNotOnHeaderLine, BlockWithoutIndent, BlockNotClosed, LocalFunctionHeaderRejected,
+		StopReason(BodyReplayDisagrees, ReplayReported, BodylessFunction, BlockWithoutIndent, BlockNotClosed, LocalFunctionHeaderRejected,
 			LambdaInInterpolationHole, MalformedLambdaHeader, ExpressionSyntaxError, ValueOnNextLine, TupleDestructuring, FieldAssignment, NonPlaceAssignmentTarget, AssignmentTargetRoutedElsewhere,
 			LoopExitOutsideLoop, QuestionBindingInLoop, MalformedTypedBinding, VarWithoutName, VarWithoutInitializer, InvalidType, InvalidPattern,
 			ConcurrentlyLoop, HeaderWithoutColon, ForWithoutIn, InvalidLoopBinding, MalformedElse, OperatorAfterBlock, MatchWithoutBlock, MatchNotClosed,
@@ -124,7 +125,7 @@ record CompletedBody {
 pure func recognize_skipped_body(state: ParseState, skipped: DeferredBody) -> (ParseState, Recognition[BodyRecipe]):
 	skipped_end: Int = deferred_body_token_end(skipped)
 	at_body: ParseState = state.resumed_at(deferred_body_token_start(skipped))
-	(recognized, parsed) = parse_body_recipe(at_body, at_body.span_start_line(at_body.previous_span()))
+	(recognized, parsed) = parse_body_recipe(at_body)
 	match parsed:
 		Declined(stop):
 			(state, Declined(stop))
@@ -224,64 +225,77 @@ private pure func block_statement_ends(state: ParseState) -> Bool:
 	kind != AsKeyword and kind != EqualSymbol and binary_operator(kind).is_none()
 
 
-private pure func is_on_line(state: ParseState, line: Int) -> Bool:
-	state.span_start_line(state.current_span()) == line
-
-
 -- Bodies.
-private pure func parse_body_recipe(state: ParseState, colon_line: Int) -> (ParseState, Recognition[BodyRecipe]):
+private pure func parse_body_recipe(state: ParseState) -> (ParseState, Recognition[BodyRecipe]):
 	if state.current_kind() == NewlineToken:
-		(remaining, parsed) = parse_block_recipe(state, OutsideLoop)
+		(remaining, parsed) = parse_block_recipe(state, OutsideLoop, IndentedByLexer)
 		match parsed:
 			ParsedBlock(block):
 				(remaining, Recognized(BlockBodyRecipe(block)))
 			UnsupportedBlock(stop):
 				(remaining, Declined(stop))
-	else if not state.is_on_line(colon_line):
-		(state, Declined(state.stop_at(BodyNotOnHeaderLine)))
 	else:
-		(remaining, value) = parse_value(state)
-		match value:
-			Recognized(expression):
-				-- A control expression or a block lambda ends on a later line, which
-				-- the frozen grammar rejects after a same-line body.
-				if remaining.span_start_line(remaining.previous_span()) != colon_line:
-					(state, Declined(state.stop_at(BodyNotOnHeaderLine)))
-				else:
-					(remaining, Recognized(ExpressionBodyRecipe(expression)))
-			Declined(stop):
-				(remaining, Declined(stop))
+		-- A body written on the header's line is anchored at its own first token,
+		-- so a block it opens has to be indented past that column.
+		(remaining, value) = parse_value(state, anchored_at(state.current_span()))
+		(remaining, value.mapped(pure func(expression): ExpressionBodyRecipe(expression)))
 
 
 -- Blocks.
-private pure func parse_block_recipe(state: ParseState, context: BodyContext) -> (ParseState, BlockParse):
+private pure func parse_block_recipe(state: ParseState, context: BodyContext, anchor: BlockAnchor) -> (ParseState, BlockParse):
+	match state.block_start(anchor):
+		NoBlockStart:
+			(state, UnsupportedBlock(state.stop_at(BlockWithoutIndent)))
+		BlockStartsAt(at_first_statement):
+			read_block(state, at_first_statement, context)
+
+
+-- Where a block that may open after `state` starts reading statements.
+private union BlockStart:
+	BlockStartsAt(ParseState)
+	NoBlockStart
+
+
+-- The block after a header's colon: NEWLINE and INDENT, and a first statement
+-- that the anchor allows (`layout_quirks.block_may_open`).
+private pure func block_start(state: ParseState, anchor: BlockAnchor) -> BlockStart:
 	opened: ParseState = state.skip_newlines()
 	if state.current_kind() != NewlineToken or opened.current_kind() != IndentToken:
-		(state, UnsupportedBlock(state.stop_at(BlockWithoutIndent)))
+		NoBlockStart
 	else:
-		var out: ParseState = opened.advanced().skip_newlines()
-		var statements: List[StatementRecipe] = []
-		var declined: Option[StopPoint] = None
-		while declined.is_none() and out.current_kind() != DedentToken and out.current_kind() != EndOfFileToken:
-			(remaining, parsed) = parse_statement_recipe(out, context)
-			match parsed:
-				ParsedStatement(statement):
-					statements = statements.append(statement)
-					out = remaining.skip_newlines()
-				UnsupportedStatement(stop):
-					declined = Some(stop)
-		match declined:
-			Some(stop):
-				(state, UnsupportedBlock(stop))
-			None:
-				match statements:
-					[first, ...rest]:
-						if out.current_kind() == DedentToken:
-							(out.advanced(), ParsedBlock({ statements = { first = first, rest = rest } }))
-						else:
-							(state, UnsupportedBlock(out.stop_at(BlockNotClosed)))
-					_:
+		at_first_statement: ParseState = opened.advanced().skip_newlines()
+		if at_first_statement.block_may_open(anchor):
+			BlockStartsAt(at_first_statement)
+		else:
+			NoBlockStart
+
+
+-- The statements of a block up to its dedent. `state` is the entry state that
+-- an unsupported statement rolls back to.
+private pure func read_block(state: ParseState, at_first_statement: ParseState, context: BodyContext) -> (ParseState, BlockParse):
+	var out: ParseState = at_first_statement
+	var statements: List[StatementRecipe] = []
+	var declined: Option[StopPoint] = None
+	while declined.is_none() and out.current_kind() != DedentToken and out.current_kind() != EndOfFileToken:
+		(remaining, parsed) = parse_statement_recipe(out, context)
+		match parsed:
+			ParsedStatement(statement):
+				statements = statements.append(statement)
+				out = remaining.skip_newlines()
+			UnsupportedStatement(stop):
+				declined = Some(stop)
+	match declined:
+		Some(stop):
+			(state, UnsupportedBlock(stop))
+		None:
+			match statements:
+				[first, ...rest]:
+					if out.current_kind() == DedentToken:
+						(out.advanced(), ParsedBlock({ statements = { first = first, rest = rest } }))
+					else:
 						(state, UnsupportedBlock(out.stop_at(BlockNotClosed)))
+				_:
+					(state, UnsupportedBlock(out.stop_at(BlockNotClosed)))
 
 
 private pure func mint_block(state: ParseState, recipe: BlockRecipe) -> (ParseState, Block):
@@ -351,7 +365,7 @@ private pure func parse_statement_recipe(state: ParseState, context: BodyContext
 -- `concurrent` and `debug` are not values here: the frozen parser indents their
 -- block past the keyword, not past the statement, so a value written the usual
 -- way is rejected there and must not be read here.
-private pure func parse_value(state: ParseState) -> (ParseState, Recognition[ExpressionRecipe]):
+private pure func parse_value(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, Recognition[ExpressionRecipe]):
 	match state.current_kind():
 		IfKeyword | MatchKeyword:
 			-- The whole value is the control expression. Reading it here, not
@@ -359,20 +373,20 @@ private pure func parse_value(state: ParseState) -> (ParseState, Recognition[Exp
 			-- statement and the statements of its blocks few (section 3.14).
 			-- Its twin for an operand is `parse_control_operand` in the
 			-- expression parser, which builds the same recipe.
-			(remaining, control) = parse_control_recipe(state)
+			(remaining, control) = parse_control_recipe(state, PastExpressionAnchor(anchor))
 			(remaining, control.mapped(control_expression))
 		SelectKeyword:
 			if state.opens_block_form():
-				(remaining, control) = parse_control_recipe(state)
+				(remaining, control) = parse_control_recipe(state, PastExpressionAnchor(anchor))
 				(remaining, control.mapped(control_expression))
 			else:
-				parse_expression_value(state)
+				parse_expression_value(state, anchor)
 		_:
-			parse_expression_value(state)
+			parse_expression_value(state, anchor)
 
 
-private pure func parse_expression_value(state: ParseState) -> (ParseState, Recognition[ExpressionRecipe]):
-	(remaining, parsed) = parse_expression_recipe(state)
+private pure func parse_expression_value(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, Recognition[ExpressionRecipe]):
+	(remaining, parsed) = parse_expression_recipe(state, anchor)
 	match parsed:
 		ParsedRecipe(value):
 			match remaining.statement_boundary():
@@ -391,11 +405,11 @@ private pure func parse_expression_value(state: ParseState) -> (ParseState, Reco
 			(state, Declined(remaining.stop_at(ExpressionSyntaxError)))
 
 
-private pure func parse_value_after(state: ParseState, operator_line: Int) -> (ParseState, Recognition[ExpressionRecipe]):
-	if state.is_on_line(operator_line):
-		parse_value(state)
-	else:
+private pure func parse_value_after(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, Recognition[ExpressionRecipe]):
+	if state.current_kind() == NewlineToken:
 		(state, Declined(state.stop_at(ValueOnNextLine)))
+	else:
+		parse_value(state, anchor)
 
 
 -- A statement of `kind` over `start` and its value, or unsupported.
@@ -410,13 +424,13 @@ private pure func valued_statement(
 
 
 private pure func parse_expression_statement(state: ParseState) -> (ParseState, StatementParse):
-	(remaining, parsed) = parse_expression_recipe(state)
+	(remaining, parsed) = parse_expression_recipe(state, anchored_at(state.current_span()))
 	match parsed:
 		ParsedRecipe(target):
 			if remaining.current_kind() == EqualSymbol:
 				match subscript_parts(target):
 					Some((collection, indices)):
-						(after_value, value) = parse_value_after(remaining.advanced(), remaining.span_start_line(remaining.current_span()))
+						(after_value, value) = parse_value_after(remaining.advanced(), anchored_at(state.current_span()))
 						place: SubscriptPlaceRecipe = { span = target.span, collection = collection, indices = indices }
 						after_value.valued_statement(target.span, value, pure func(recipe): SubscriptAssignmentRecipe(place, recipe))
 					None:
@@ -468,7 +482,7 @@ private pure func parse_loop_exit(state: ParseState, context: BodyContext) -> (P
 -- `name = value`.
 private pure func parse_name_assignment(state: ParseState) -> (ParseState, StatementParse):
 	(named, name) = state.consume_referenced_name(NameInStatementName)
-	(after_value, value) = parse_value_after(named.advanced(), named.span_start_line(named.current_span()))
+	(after_value, value) = parse_value_after(named.advanced(), anchored_at(state.current_span()))
 	after_value.valued_statement(name.span, value, pure func(recipe): AssignmentRecipe(NamedTargetRecipe(name), recipe))
 
 
@@ -476,7 +490,7 @@ private pure func parse_name_assignment(state: ParseState) -> (ParseState, State
 private pure func parse_discard_assignment(state: ParseState) -> (ParseState, StatementParse):
 	target: Span = state.current_span()
 	equal: ParseState = state.advanced()
-	(after_value, value) = parse_value_after(equal.advanced(), equal.span_start_line(equal.current_span()))
+	(after_value, value) = parse_value_after(equal.advanced(), anchored_at(state.current_span()))
 	after_value.valued_statement(target, value, pure func(recipe): AssignmentRecipe(DiscardedTargetRecipe(target), recipe))
 
 
@@ -487,7 +501,7 @@ private pure func parse_compound_assignment(state: ParseState) -> (ParseState, S
 		MinusEqualSymbol: SubtractAssign
 		StarEqualSymbol: MultiplyAssign
 		_: DivideAssign
-	(after_value, value) = parse_value_after(named.advanced(), named.span_start_line(named.current_span()))
+	(after_value, value) = parse_value_after(named.advanced(), anchored_at(state.current_span()))
 	after_value.valued_statement(name.span, value, pure func(recipe): CompoundAssignmentRecipe(name, operator, recipe))
 
 
@@ -500,12 +514,12 @@ private pure func parse_typed_binding(state: ParseState, context: BodyContext) -
 	match written:
 		Recognized(declared):
 			if after_type.current_kind() == EqualSymbol:
-				(after_value, value) = parse_value_after(after_type.advanced(), after_type.span_start_line(after_type.current_span()))
+				(after_value, value) = parse_value_after(after_type.advanced(), anchored_at(state.current_span()))
 				after_value.valued_statement(name.span, value, pure func(recipe): TypedBindingRecipe(name, declared, recipe))
 			else if after_type.current_kind() == QuestionEqualsSymbol:
 				match context:
 					OutsideLoop:
-						(after_value, value) = parse_value_after(after_type.advanced(), after_type.span_start_line(after_type.current_span()))
+						(after_value, value) = parse_value_after(after_type.advanced(), anchored_at(state.current_span()))
 						after_value.valued_statement(name.span, value, pure func(recipe): QuestionBindingRecipe(name, Some(declared), recipe))
 					InsideLoop:
 						(state, UnsupportedStatement(after_type.stop_at(QuestionBindingInLoop)))
@@ -523,7 +537,7 @@ private pure func parse_question_binding(state: ParseState, context: BodyContext
 	if context == InsideLoop:
 		(state, UnsupportedStatement(named.stop_at(QuestionBindingInLoop)))
 	else:
-		(after_value, value) = parse_value_after(named.advanced(), named.span_start_line(named.current_span()))
+		(after_value, value) = parse_value_after(named.advanced(), anchored_at(state.current_span()))
 		after_value.valued_statement(name.span, value, pure func(recipe): QuestionBindingRecipe(name, None, recipe))
 
 
@@ -542,7 +556,7 @@ private pure func parse_variable_statement(state: ParseState) -> (ParseState, St
 				if after_annotation.current_kind() != EqualSymbol:
 					(state, UnsupportedStatement(after_annotation.stop_at(VarWithoutInitializer)))
 				else:
-					(after_value, value) = parse_value_after(after_annotation.advanced(), after_annotation.span_start_line(after_annotation.current_span()))
+					(after_value, value) = parse_value_after(after_annotation.advanced(), anchored_at(state.current_span()))
 					declared: Option[TypeRecipe] = match annotation:
 						Annotated(recipe): Some(recipe)
 						_: None
@@ -586,15 +600,20 @@ private pure func recognize_pattern(state: ParseState) -> (ParseState, Recogniti
 		(state.resumed_after(remaining), Recognized({ token = state.position() }))
 
 
--- `condition:` after a block keyword: an expression and a colon on its line.
+-- An expression anchored at its own first token: a `with` value or error map,
+-- a `concurrent` parameter, and every header expression.
+private pure func parse_anchored_expression(state: ParseState) -> (ParseState, RecipeParse):
+	parse_expression_recipe(state, anchored_at(state.current_span()))
+
+
+-- `condition:` after a block keyword: an expression and its colon.
 -- `concurrently` after a `for` iterable is the one word that stands where the
 -- colon should.
 private pure func parse_header(state: ParseState) -> (ParseState, Recognition[ExpressionRecipe]):
-	line: Int = state.span_start_line(state.current_span())
-	(remaining, parsed) = parse_expression_recipe(state)
+	(remaining, parsed) = parse_anchored_expression(state)
 	match parsed:
 		ParsedRecipe(condition):
-			if remaining.current_kind() == ColonSymbol and remaining.is_on_line(line):
+			if remaining.current_kind() == ColonSymbol:
 				(remaining.advanced(), Recognized(condition))
 			else if remaining.current_kind() == ConcurrentlyKeyword:
 				(state, Declined(remaining.stop_at(ConcurrentlyLoop)))
@@ -611,7 +630,7 @@ private pure func parse_while_statement(state: ParseState) -> (ParseState, State
 	(after_header, condition) = parse_header(state.advanced())
 	match condition:
 		Recognized(recipe):
-			(after_block, block) = parse_block_recipe(after_header, InsideLoop)
+			(after_block, block) = parse_block_recipe(after_header, InsideLoop, IndentedByLexer)
 			match block:
 				ParsedBlock(body):
 					(after_block, ParsedStatement({ span = keyword.span_covering(block_span(body)), kind = WhileRecipe(recipe, body) }))
@@ -634,7 +653,7 @@ private pure func parse_for_statement(state: ParseState) -> (ParseState, Stateme
 				(after_header, iterable) = parse_header(after_binder.advanced())
 				match iterable:
 					Recognized(recipe):
-						(after_block, block) = parse_block_recipe(after_header, InsideLoop)
+						(after_block, block) = parse_block_recipe(after_header, InsideLoop, IndentedByLexer)
 						match block:
 							ParsedBlock(body):
 								(after_block, ParsedStatement({ span = keyword.span_covering(block_span(body)), kind = ForRecipe(loop_binding, recipe, body) }))
@@ -715,16 +734,16 @@ private pure func block_span(recipe: BlockRecipe) -> Span:
 -- one defers, and the token after its last dedent must not continue it. A
 -- `select` is a whole value only: the expression grammar reads `if` and
 -- `match` as operands but not `select`.
-pure func parse_control_recipe(state: ParseState) -> (ParseState, Recognition[ControlRecipe]):
+pure func parse_control_recipe(state: ParseState, anchor: BlockAnchor) -> (ParseState, Recognition[ControlRecipe]):
 	match state.current_kind():
 		IfKeyword:
-			(remaining, chain) = parse_conditional_recipe(state, OutsideLoop)
+			(remaining, chain) = parse_conditional_recipe(state, OutsideLoop, anchor)
 			(remaining, chain.mapped(pure func(written): ConditionalControl(written)))
 		MatchKeyword:
-			(remaining, written) = parse_match_recipe(state, OutsideLoop)
+			(remaining, written) = parse_match_recipe(state, OutsideLoop, anchor)
 			(remaining, written.mapped(pure func(recipe): MatchControl(recipe)))
 		SelectKeyword:
-			(remaining, written) = parse_select_recipe(state, OutsideLoop)
+			(remaining, written) = parse_select_recipe(state, OutsideLoop, anchor)
 			(remaining, written.mapped(pure func(recipe): SelectControl(recipe)))
 		_:
 			(state, Declined(state.stop_at(ExpressionSyntaxError)))
@@ -756,7 +775,7 @@ pure func mint_control(state: ParseState, control: ControlRecipe) -> (ParseState
 
 
 private pure func parse_conditional_statement(state: ParseState, context: BodyContext) -> (ParseState, StatementParse):
-	(remaining, chain) = parse_conditional_recipe(state, context)
+	(remaining, chain) = parse_conditional_recipe(state, context, IndentedByLexer)
 	match chain:
 		Recognized(written):
 			(remaining, ParsedStatement({ span = conditional_span(written), kind = ConditionalStatementRecipe(written) }))
@@ -768,8 +787,8 @@ private pure func conditional_span(chain: ConditionalRecipe) -> Span:
 	chain.head.keyword.span_covering(conditional_end(chain))
 
 
-private pure func parse_conditional_recipe(state: ParseState, context: BodyContext) -> (ParseState, Recognition[ConditionalRecipe]):
-	(after_head, head) = parse_if_link(state, context)
+private pure func parse_conditional_recipe(state: ParseState, context: BodyContext, anchor: BlockAnchor) -> (ParseState, Recognition[ConditionalRecipe]):
+	(after_head, head) = parse_if_link(state, context, anchor)
 	match head:
 		Declined(stop):
 			(state, Declined(stop))
@@ -783,7 +802,7 @@ private pure func parse_conditional_recipe(state: ParseState, context: BodyConte
 				else_keyword: Span = out.current_span()
 				after_else: ParseState = out.advanced()
 				if after_else.current_kind() == IfKeyword:
-					(after_link, link) = parse_if_link(after_else, context)
+					(after_link, link) = parse_if_link(after_else, context, IndentedByLexer)
 					match link:
 						Recognized(parsed):
 							else_ifs = else_ifs.append({ else_keyword = else_keyword, link = parsed })
@@ -792,7 +811,7 @@ private pure func parse_conditional_recipe(state: ParseState, context: BodyConte
 						Declined(stop):
 							declined = Some(stop)
 				else if after_else.current_kind() == ColonSymbol:
-					(after_block, block) = parse_block_recipe(after_else.advanced(), context)
+					(after_block, block) = parse_block_recipe(after_else.advanced(), context, IndentedByLexer)
 					match block:
 						ParsedBlock(recipe):
 							final_else = Some({ keyword = else_keyword, block = recipe })
@@ -813,12 +832,12 @@ private pure func parse_conditional_recipe(state: ParseState, context: BodyConte
 
 
 -- `if condition:` and its block, for the head and for every `else if`.
-private pure func parse_if_link(state: ParseState, context: BodyContext) -> (ParseState, Recognition[IfLink]):
+private pure func parse_if_link(state: ParseState, context: BodyContext, anchor: BlockAnchor) -> (ParseState, Recognition[IfLink]):
 	keyword: Span = state.current_span()
 	(after_header, condition) = parse_header(state.advanced())
 	match condition:
 		Recognized(recipe):
-			(after_block, block) = parse_block_recipe(after_header, context)
+			(after_block, block) = parse_block_recipe(after_header, context, anchor)
 			match block:
 				ParsedBlock(then_block):
 					(after_block, Recognized({ keyword = keyword, condition = recipe, then_block = then_block }))
@@ -843,7 +862,7 @@ private pure func conditional_end(chain: ConditionalRecipe) -> Span:
 
 -- `match scrutinee:` and its cases, each a block or one same-line statement.
 private pure func parse_match_statement(state: ParseState, context: BodyContext) -> (ParseState, StatementParse):
-	(remaining, written) = parse_match_recipe(state, context)
+	(remaining, written) = parse_match_recipe(state, context, IndentedByLexer)
 	match written:
 		Recognized(recipe):
 			(remaining, ParsedStatement({ span = match_span(recipe), kind = MatchStatementRecipe(recipe) }))
@@ -855,42 +874,50 @@ private pure func match_span(recipe: MatchRecipe) -> Span:
 	recipe.keyword.span_covering(recipe.end)
 
 
-private pure func parse_match_recipe(state: ParseState, context: BodyContext) -> (ParseState, Recognition[MatchRecipe]):
+private pure func parse_match_recipe(state: ParseState, context: BodyContext, anchor: BlockAnchor) -> (ParseState, Recognition[MatchRecipe]):
 	keyword: Span = state.current_span()
 	(after_header, scrutinee) = parse_header(state.advanced())
-	opened: ParseState = after_header.skip_newlines()
 	match scrutinee:
 		Declined(stop):
 			(state, Declined(stop))
 		Recognized(subject):
-			if after_header.current_kind() != NewlineToken or opened.current_kind() != IndentToken:
-				(state, Declined(after_header.stop_at(MatchWithoutBlock)))
-			else:
-				var out: ParseState = opened.advanced().skip_newlines()
-				var cases: List[CaseRecipe] = []
-				var declined: Option[StopPoint] = None
-				while declined.is_none() and out.current_kind() != DedentToken and out.current_kind() != EndOfFileToken:
-					(after_case, parsed) = parse_case_recipe(out, context)
-					match parsed:
-						Recognized(case_recipe):
-							cases = cases.append(case_recipe)
-							out = after_case.skip_newlines()
-						Declined(stop):
-							declined = Some(stop)
-				match declined:
-					Some(stop):
-						(state, Declined(stop))
-					None:
-						match cases:
-							[first, ...rest]:
-								if out.current_kind() != DedentToken:
-									(state, Declined(out.stop_at(MatchNotClosed)))
-								else if not out.advanced().block_statement_ends():
-									(state, Declined(out.advanced().stop_at(OperatorAfterBlock)))
-								else:
-									(out.advanced(), Recognized({ keyword = keyword, scrutinee = subject, cases = { first = first, rest = rest }, end = out.current_span() }))
-							_:
-								(state, Declined(out.stop_at(MatchNotClosed)))
+			match after_header.block_start(anchor):
+				NoBlockStart:
+					(state, Declined(after_header.stop_at(MatchWithoutBlock)))
+				BlockStartsAt(at_first_case):
+					read_match_cases(state, at_first_case, keyword, subject, context)
+
+
+-- The cases of a `match` up to its dedent. `state` is the entry state that an
+-- unsupported case rolls back to.
+private pure func read_match_cases(
+	state: ParseState, at_first_case: ParseState, keyword: Span, subject: ExpressionRecipe, context: BodyContext,
+) -> (ParseState, Recognition[MatchRecipe]):
+	var out: ParseState = at_first_case
+	var cases: List[CaseRecipe] = []
+	var declined: Option[StopPoint] = None
+	while declined.is_none() and out.current_kind() != DedentToken and out.current_kind() != EndOfFileToken:
+		(after_case, parsed) = parse_case_recipe(out, context)
+		match parsed:
+			Recognized(case_recipe):
+				cases = cases.append(case_recipe)
+				out = after_case.skip_newlines()
+			Declined(stop):
+				declined = Some(stop)
+	match declined:
+		Some(stop):
+			(state, Declined(stop))
+		None:
+			match cases:
+				[first, ...rest]:
+					if out.current_kind() != DedentToken:
+						(state, Declined(out.stop_at(MatchNotClosed)))
+					else if not out.advanced().block_statement_ends():
+						(state, Declined(out.advanced().stop_at(OperatorAfterBlock)))
+					else:
+						(out.advanced(), Recognized({ keyword = keyword, scrutinee = subject, cases = { first = first, rest = rest }, end = out.current_span() }))
+				_:
+					(state, Declined(out.stop_at(MatchNotClosed)))
 
 
 private pure func parse_case_recipe(state: ParseState, context: BodyContext) -> (ParseState, Recognition[CaseRecipe]):
@@ -904,7 +931,7 @@ private pure func parse_case_recipe(state: ParseState, context: BodyContext) -> 
 			else:
 				after_colon: ParseState = after_pattern.advanced()
 				if after_colon.current_kind() == NewlineToken:
-					(after_block, block) = parse_block_recipe(after_colon, context)
+					(after_block, block) = parse_block_recipe(after_colon, context, IndentedByLexer)
 					match block:
 						ParsedBlock(body):
 							(after_block, Recognized({ pattern = recipe, body = CaseBlockRecipe(body) }))
@@ -937,13 +964,13 @@ private pure func starts_nested_block(state: ParseState) -> Bool:
 -- Lambdas. Recognized from the expression grammar, minted by it. The header
 -- (everything through the colon) and the body are read apart: the header is
 -- one line, the body is a recipe of its own.
-pure func parse_lambda_recipe(state: ParseState) -> (ParseState, LambdaParse):
+pure func parse_lambda_recipe(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, LambdaParse):
 	(after_header, header) = parse_lambda_header(state)
 	match header:
 		Declined(stop):
 			(state, UnsupportedLambda(stop))
 		Recognized(read):
-			(after_body, body) = parse_lambda_body(after_header, state.span_start_line(state.current_span()))
+			(after_body, body) = parse_lambda_body(after_header, anchor)
 			match body:
 				Recognized(recipe):
 					(after_body, ParsedLambda({
@@ -982,7 +1009,6 @@ private pure func parse_lambda_header(state: ParseState) -> (ParseState, Recogni
 	else if after_pure.current_kind() != FuncKeyword or after_pure.peek_kind(1) != LeftParenSymbol:
 		(state, Declined(state.stop_at(MalformedLambdaHeader)))
 	else:
-		line: Int = state.span_start_line(state.current_span())
 		(after_parameters, parameters) = parse_lambda_parameters(after_pure.advanced().advanced())
 		match parameters:
 			Declined(stop):
@@ -995,17 +1021,17 @@ private pure func parse_lambda_header(state: ParseState) -> (ParseState, Recogni
 						Declined(stop):
 							(state, Declined(stop))
 						Recognized(declared):
-							state.lambda_header_ending(line, after_parameters, after_type, read, Some(declared))
+							state.lambda_header_ending(after_parameters, after_type, read, Some(declared))
 				else:
-					state.lambda_header_ending(line, after_parameters, after_close, read, None)
+					state.lambda_header_ending(after_parameters, after_close, read, None)
 
 
--- The header's `)` and `:` must both be on its line.
+-- The header ends in `)` and `:`.
 private pure func lambda_header_ending(
-	state: ParseState, line: Int, after_parameters: ParseState, after_return: ParseState,
+	state: ParseState, after_parameters: ParseState, after_return: ParseState,
 	parameters: List[LambdaParameterRecipe], return_type: Option[TypeRecipe],
 ) -> (ParseState, Recognition[LambdaHeader]):
-	if after_parameters.current_kind() != RightParenSymbol or not after_parameters.is_on_line(line) or after_return.current_kind() != ColonSymbol or not after_return.is_on_line(line):
+	if after_parameters.current_kind() != RightParenSymbol or after_return.current_kind() != ColonSymbol:
 		(state, Declined(after_return.stop_at(MalformedLambdaHeader)))
 	else:
 		purity: Purity = if state.current_kind() == PureKeyword:
@@ -1052,18 +1078,16 @@ private pure func parse_lambda_parameters(state: ParseState) -> (ParseState, Rec
 -- A block on the lines after the colon, or an expression on its line. An
 -- expression body ends where the expression does: the enclosing construct
 -- decides what may follow.
-private pure func parse_lambda_body(state: ParseState, line: Int) -> (ParseState, Recognition[BodyRecipe]):
+private pure func parse_lambda_body(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, Recognition[BodyRecipe]):
 	if state.current_kind() == NewlineToken:
-		(remaining, parsed) = parse_block_recipe(state, OutsideLoop)
+		(remaining, parsed) = parse_block_recipe(state, OutsideLoop, PastExpressionAnchor(anchor))
 		match parsed:
 			ParsedBlock(block):
 				(remaining, Recognized(BlockBodyRecipe(block)))
 			UnsupportedBlock(stop):
 				(state, Declined(stop))
-	else if not state.is_on_line(line):
-		(state, Declined(state.stop_at(BodyNotOnHeaderLine)))
 	else:
-		(remaining, parsed) = parse_expression_recipe(state)
+		(remaining, parsed) = parse_anchored_expression(state)
 		match parsed:
 			ParsedRecipe(value):
 				(remaining, Recognized(ExpressionBodyRecipe(value)))
@@ -1127,7 +1151,7 @@ private pure func parse_local_function(state: ParseState) -> (ParseState, Statem
 -- Blocks nest by indentation, so the functions between a statement and the
 -- statements of its blocks are on the native stack once per level. Each kind
 -- is minted by a function of its own and this dispatcher stays thin, which
--- keeps the 1,000-deep proof of section 3.14 inside the Linux stack.
+-- keeps the nesting limit (section 3.14) inside the Linux stack.
 private pure func mint_statement(state: ParseState, recipe: StatementRecipe) -> (ParseState, Statement):
 	match recipe.kind:
 		ExpressionStatementRecipe(value):
@@ -1392,7 +1416,7 @@ private pure func mint_match(state: ParseState, recipe: MatchRecipe, span: Span)
 private pure func parse_block_form_statement(state: ParseState, context: BodyContext) -> (ParseState, StatementParse):
 	match state.current_kind():
 		SelectKeyword:
-			(remaining, written) = parse_select_recipe(state, context)
+			(remaining, written) = parse_select_recipe(state, context, IndentedByLexer)
 			match written:
 				Recognized(recipe):
 					(remaining, ParsedStatement({ span = select_span(recipe), kind = SelectStatementRecipe(recipe) }))
@@ -1452,14 +1476,14 @@ private pure func binder_span(binder: BinderRecipe) -> Span:
 		DiscardsRecipe(span): span
 
 
--- Whether the `:` that ends a header written on `line` is at the cursor.
-private pure func at_header_colon(state: ParseState, line: Int) -> Bool:
-	state.current_kind() == ColonSymbol and state.is_on_line(line)
+-- Whether the `:` that ends a header is at the cursor.
+private pure func at_header_colon(state: ParseState) -> Bool:
+	state.current_kind() == ColonSymbol
 
 
 -- The indented block after a header's colon.
 private pure func parse_header_block(state: ParseState, context: BodyContext) -> (ParseState, Recognition[BlockRecipe]):
-	(remaining, block) = parse_block_recipe(state, context)
+	(remaining, block) = parse_block_recipe(state, context, IndentedByLexer)
 	match block:
 		ParsedBlock(recipe): (remaining, Recognized(recipe))
 		UnsupportedBlock(stop): (state, Declined(stop))
@@ -1486,38 +1510,46 @@ private pure func select_span(recipe: SelectRecipe) -> Span:
 
 -- `select:` and its arms, each a header and a block. The cursor is at a
 -- `select` that opens a block form, so its colon follows.
-private pure func parse_select_recipe(state: ParseState, context: BodyContext) -> (ParseState, Recognition[SelectRecipe]):
+private pure func parse_select_recipe(state: ParseState, context: BodyContext, anchor: BlockAnchor) -> (ParseState, Recognition[SelectRecipe]):
 	keyword: Span = state.current_span()
 	after_colon: ParseState = state.advanced().advanced()
-	opened: ParseState = after_colon.skip_newlines()
-	if after_colon.current_kind() != NewlineToken or opened.current_kind() != IndentToken:
-		(state, Declined(after_colon.stop_at(SelectWithoutArms)))
-	else:
-		var out: ParseState = opened.advanced().skip_newlines()
-		var arms: List[SelectArmRecipe] = []
-		var declined: Option[StopPoint] = None
-		while declined.is_none() and out.current_kind() != DedentToken and out.current_kind() != EndOfFileToken:
-			(after_arm, parsed) = parse_select_arm_recipe(out, context)
-			match parsed:
-				Recognized(arm):
-					arms = arms.append(arm)
-					out = after_arm.skip_newlines()
-				Declined(stop):
-					declined = Some(stop)
-		match declined:
-			Some(stop):
-				(state, Declined(stop))
-			None:
-				match arms:
-					[first, ...rest]:
-						if out.current_kind() != DedentToken:
-							(state, Declined(out.stop_at(SelectNotClosed)))
-						else if not out.advanced().block_statement_ends():
-							(state, Declined(out.advanced().stop_at(OperatorAfterBlock)))
-						else:
-							(out.advanced(), Recognized({ keyword = keyword, arms = { first = first, rest = rest }, end = out.current_span() }))
-					_:
+	match after_colon.block_start(anchor):
+		NoBlockStart:
+			(state, Declined(after_colon.stop_at(SelectWithoutArms)))
+		BlockStartsAt(at_first_arm):
+			read_select_arms(state, at_first_arm, keyword, context)
+
+
+-- The arms of a `select` up to its dedent. `state` is the entry state that an
+-- unsupported arm rolls back to.
+private pure func read_select_arms(
+	state: ParseState, at_first_arm: ParseState, keyword: Span, context: BodyContext,
+) -> (ParseState, Recognition[SelectRecipe]):
+	var out: ParseState = at_first_arm
+	var arms: List[SelectArmRecipe] = []
+	var declined: Option[StopPoint] = None
+	while declined.is_none() and out.current_kind() != DedentToken and out.current_kind() != EndOfFileToken:
+		(after_arm, parsed) = parse_select_arm_recipe(out, context)
+		match parsed:
+			Recognized(arm):
+				arms = arms.append(arm)
+				out = after_arm.skip_newlines()
+			Declined(stop):
+				declined = Some(stop)
+	match declined:
+		Some(stop):
+			(state, Declined(stop))
+		None:
+			match arms:
+				[first, ...rest]:
+					if out.current_kind() != DedentToken:
 						(state, Declined(out.stop_at(SelectNotClosed)))
+					else if not out.advanced().block_statement_ends():
+						(state, Declined(out.advanced().stop_at(OperatorAfterBlock)))
+					else:
+						(out.advanced(), Recognized({ keyword = keyword, arms = { first = first, rest = rest }, end = out.current_span() }))
+				_:
+					(state, Declined(out.stop_at(SelectNotClosed)))
 
 
 private pure func parse_select_arm_recipe(state: ParseState, context: BodyContext) -> (ParseState, Recognition[SelectArmRecipe]):
@@ -1569,7 +1601,7 @@ private pure func parse_receive_arm_header(state: ParseState) -> (ParseState, Re
 
 -- With.
 private pure func parse_with_recipe(state: ParseState, context: BodyContext) -> (ParseState, Recognition[WithRecipe]):
-	(after_header, header) = parse_with_header(state.advanced(), state.span_start_line(state.current_span()))
+	(after_header, header) = parse_with_header(state.advanced())
 	match header:
 		Recognized(written):
 			(after_body, body) = parse_closing_block(after_header, context)
@@ -1584,7 +1616,7 @@ private pure func parse_with_recipe(state: ParseState, context: BodyContext) -> 
 
 -- Everything after `with` through the colon. A second binding, which the
 -- frozen grammar reports, leaves the colon unmatched.
-private pure func parse_with_header(state: ParseState, line: Int) -> (ParseState, Recognition[WithHeader]):
+private pure func parse_with_header(state: ParseState) -> (ParseState, Recognition[WithHeader]):
 	(after_binder, binder) = parse_binder_recipe(state)
 	(after_annotation, annotation) = after_binder.parse_type_annotation()
 	operator: Option[WithOperator] = match after_annotation.current_kind():
@@ -1597,9 +1629,9 @@ private pure func parse_with_header(state: ParseState, line: Int) -> (ParseState
 				InvalidAnnotation(stop):
 					(state, Declined(stop))
 				NoAnnotation:
-					after_annotation.parse_written_acquisition(line, target, None, operator)
+					after_annotation.parse_written_acquisition(target, None, operator)
 				Annotated(declared):
-					after_annotation.parse_written_acquisition(line, target, Some(declared), operator)
+					after_annotation.parse_written_acquisition(target, Some(declared), operator)
 		Declined(_):
 			(state, Declined(state.stop_at(WithBindingMalformed)))
 
@@ -1607,11 +1639,11 @@ private pure func parse_with_header(state: ParseState, line: Int) -> (ParseState
 -- The acquisition after a binder and its optional type, when an operator
 -- follows them.
 private pure func parse_written_acquisition(
-	state: ParseState, line: Int, binder: BinderRecipe, declared: Option[TypeRecipe], operator: Option[WithOperator],
+	state: ParseState, binder: BinderRecipe, declared: Option[TypeRecipe], operator: Option[WithOperator],
 ) -> (ParseState, Recognition[WithHeader]):
 	match operator:
 		Some(kind):
-			state.parse_acquisition_header(line, binder, declared, kind)
+			state.parse_acquisition_header(binder, declared, kind)
 		None:
 			(state, Declined(state.stop_at(WithBindingMalformed)))
 
@@ -1619,15 +1651,15 @@ private pure func parse_written_acquisition(
 -- The value of the acquisition and, for `?=`, its optional `on` clause, then
 -- the colon.
 private pure func parse_acquisition_header(
-	state: ParseState, line: Int, binder: BinderRecipe, declared: Option[TypeRecipe], operator: WithOperator,
+	state: ParseState, binder: BinderRecipe, declared: Option[TypeRecipe], operator: WithOperator,
 ) -> (ParseState, Recognition[WithHeader]):
-	(after_value, parsed) = parse_expression_recipe(state.advanced())
+	(after_value, parsed) = parse_anchored_expression(state.advanced())
 	match parsed:
 		ParsedRecipe(value):
 			(after_acquisition, acquisition) = after_value.parse_acquisition(value, operator)
 			match acquisition:
 				Recognized(written):
-					if after_acquisition.at_header_colon(line):
+					if after_acquisition.at_header_colon():
 						(after_acquisition.advanced(), Recognized({ binder = binder, declared = declared, acquisition = written }))
 					else:
 						(state, Declined(after_acquisition.stop_at(WithHeaderWithoutColon)))
@@ -1659,7 +1691,7 @@ private pure func parse_try_acquisition(state: ParseState, value: ExpressionReci
 				if after_binder.current_kind() != FatArrowSymbol:
 					(state, Declined(after_binder.stop_at(WithErrorMapMalformed)))
 				else:
-					(after_value, parsed) = parse_expression_recipe(after_binder.advanced())
+					(after_value, parsed) = parse_anchored_expression(after_binder.advanced())
 					match parsed:
 						ParsedRecipe(mapped):
 							error_map: ErrorMapRecipe = { binder = target, value = mapped, span = binder_span(target).span_covering(mapped.span) }
@@ -1676,12 +1708,11 @@ private pure func parse_try_acquisition(state: ParseState, value: ExpressionReci
 -- `concurrent:` or `concurrent(max_threads: n, timeout: t):`. Its block is
 -- outside every loop: a `break` in it cannot leave the enclosing loop.
 private pure func parse_concurrent_recipe(state: ParseState) -> (ParseState, Recognition[ConcurrentRecipe]):
-	line: Int = state.span_start_line(state.current_span())
 	after_keyword: ParseState = state.advanced()
-	(after_parameters, parameters) = after_keyword.parse_optional_concurrent_parameters(line)
+	(after_parameters, parameters) = after_keyword.parse_optional_concurrent_parameters()
 	match parameters:
 		Recognized(written):
-			if after_parameters.at_header_colon(line):
+			if after_parameters.at_header_colon():
 				(after_body, body) = parse_closing_block(after_parameters.advanced(), OutsideLoop)
 				match body:
 					Recognized(block):
@@ -1695,9 +1726,9 @@ private pure func parse_concurrent_recipe(state: ParseState) -> (ParseState, Rec
 
 
 -- The parameters after `concurrent`, or none when no parenthesis follows.
-private pure func parse_optional_concurrent_parameters(state: ParseState, line: Int) -> (ParseState, Recognition[ConcurrentParameters]):
-	if state.current_kind() == LeftParenSymbol and state.is_on_line(line):
-		parse_concurrent_parameters(state, line)
+private pure func parse_optional_concurrent_parameters(state: ParseState) -> (ParseState, Recognition[ConcurrentParameters]):
+	if state.current_kind() == LeftParenSymbol:
+		parse_concurrent_parameters(state)
 	else:
 		no_parameters: ConcurrentParameters = { max_threads = None, timeout = None }
 		(state, Recognized(no_parameters))
@@ -1706,7 +1737,7 @@ private pure func parse_optional_concurrent_parameters(state: ParseState, line: 
 -- `(name: value, ...)` from the opening parenthesis through the closing one:
 -- at least one parameter, each of `max_threads` and `timeout` at most once, a
 -- trailing comma allowed. The frozen grammar reports every other shape.
-private pure func parse_concurrent_parameters(state: ParseState, line: Int) -> (ParseState, Recognition[ConcurrentParameters]):
+private pure func parse_concurrent_parameters(state: ParseState) -> (ParseState, Recognition[ConcurrentParameters]):
 	var out: ParseState = state.advanced()
 	var max_threads: Option[CountParameter] = None
 	var timeout: Option[TimeoutRecipe] = None
@@ -1716,7 +1747,7 @@ private pure func parse_concurrent_parameters(state: ParseState, line: Int) -> (
 		declined = Some(out.stop_at(ConcurrentParametersMalformed))
 		reading = False
 	while reading and declined.is_none():
-		(after_parameter, parameter) = parse_concurrent_parameter(out, line)
+		(after_parameter, parameter) = parse_concurrent_parameter(out)
 		match parameter:
 			ParsedCountParameter(count):
 				if max_threads.is_some():
@@ -1738,7 +1769,7 @@ private pure func parse_concurrent_parameters(state: ParseState, line: Int) -> (
 		Some(stop):
 			(state, Declined(stop))
 		None:
-			if out.current_kind() == RightParenSymbol and out.is_on_line(line):
+			if out.current_kind() == RightParenSymbol:
 				(out.advanced(), Recognized({ max_threads = max_threads, timeout = timeout }))
 			else:
 				(state, Declined(out.stop_at(ConcurrentParametersMalformed)))
@@ -1750,15 +1781,15 @@ private union ConcurrentParameterParse:
 	DeclinedParameter(StopPoint)
 
 
-private pure func parse_concurrent_parameter(state: ParseState, line: Int) -> (ParseState, ConcurrentParameterParse):
+private pure func parse_concurrent_parameter(state: ParseState) -> (ParseState, ConcurrentParameterParse):
 	if state.current_kind() != IdentifierToken:
 		(state, DeclinedParameter(state.stop_at(ConcurrentParametersMalformed)))
 	else:
 		(after_name, name) = state.consume_referenced_name(NameInConcurrentNamedParameter)
-		if after_name.current_kind() != ColonSymbol or not after_name.is_on_line(line):
+		if after_name.current_kind() != ColonSymbol:
 			(state, DeclinedParameter(after_name.stop_at(ConcurrentParametersMalformed)))
 		else:
-			(after_value, parsed) = parse_expression_recipe(after_name.advanced())
+			(after_value, parsed) = parse_anchored_expression(after_name.advanced())
 			match parsed:
 				ParsedRecipe(value):
 					match concurrent_parameter_name(after_value.spellings(), name):

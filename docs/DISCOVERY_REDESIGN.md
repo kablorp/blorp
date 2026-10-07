@@ -2398,9 +2398,10 @@ Continuation lines are token rules in the parsers, ported from the table
 path's `parse/block_layout.brp` (`continuation_start`,
 `consume_continuation_dedent`, `consume_layout_before`) and from the old parser
 (`stage_03_parse/language_parser.brp`), and rewritten without position
-arithmetic. The table path's own comparisons (`indented_past`, and
-`has_leading_dot_continuation` over end lines) are not carried over. The four
-rules:
+arithmetic. The table path's `has_leading_dot_continuation` over end lines is
+not carried over. Its `indented_past` is, as the bracketed-block anchor below,
+because the frozen parser applies that comparison to blocks opened inside
+expressions and the lexer cannot know the anchor. The four rules:
 
 - **Leading dot**: a DOT token after NEWLINE continues the postfix chain.
 - **Indented method chain**: NEWLINE INDENT DOT continues the chain; the chain
@@ -2420,7 +2421,25 @@ documented with the frozen parser's behaviour and its fixture:
   block is anchored at the pattern or at its own keyword, and compared by
   column;
 - **keyword-column blocks**: `with`, `debug` and `concurrent` blocks are
-  indented past the keyword's column, not past the statement's.
+  indented past the keyword's column, not past the statement's;
+- **bracketed-block anchor** (`block_may_open`, landed): a block opened inside an
+  expression (a block lambda, or an `if`, `match` or `select` used as a value)
+  reads its statements only while they start on a later line and in a later
+  column than the expression's anchor, a tab advancing to the next multiple-of-4 stop
+  (`current_token_is_indented_past_anchor`, `language_parser.brp:4542-4552`,
+  used at `:4567`, `:4590` and `:6793`; `block_layout.brp:33-40` is the table
+  path's copy). The anchor is the first token of a statement for an assignment
+  value or expression statement, of a condition, iterable, scrutinee, `with`
+  value or `select` channel, the opening `(` or `[` for a grouping, tuple or
+  list, the item's own first token for a record field, dict entry, vector item
+  or same-line function body, and the enclosing anchor for call arguments and
+  subscript indices. A block whose first statement fails the test is a syntax
+  error in the frozen parser, and the tree parsers decline it under
+  `BlockWithoutIndent` (or `MatchWithoutBlock`, `SelectWithoutArms`) without
+  reproducing the old diagnostic. The rule belongs to the parsers, not to the
+  lexer: the lexer's layout stack knows line indentation, but an anchor is a
+  parse-level construct (a condition's first token, a bracket in the middle of a
+  line) that only the parser has.
 
 Section 9 lists the ambiguities these quirks come from; when the language
 decides them, the module shrinks or disappears.
@@ -3704,9 +3723,48 @@ value, because the general expression dump and mint walkers are on the path:
 on macOS 700 nested operands pass and 900 overflow, in the dump; on Linux arm64
 300 pass and 500 overflow. The test proves 300. That is open item D6 (superseded, see 3.14).
 
-The next bounded M4 slices are multiline expressions (a value continued after an
-operator, and calls, lists and braced forms that span lines), then opaque
-conversions in a separate slice. Multiline continuation is read as the token
+The multiline-brackets slice removes the line-number layout from the tree
+expression and statement parsers, as section 3.16 requires. The lexer emits no
+newline, indent or dedent token between `(`, `[` and `{`, so a bracketed form
+that spans lines reads token by token like one that does not: calls, subscripts,
+lists, tuples, groupings and the four brace forms may open, separate and close
+on any lines, and the ten `Multiline*` stop reasons are gone. Outside brackets
+the parsers stop on the NEWLINE token. A value that starts on the next line,
+an operator followed by a newline and a member name on the next line stop on
+it, and a header colon after a multiline condition, a `with`, `select` or
+`concurrent` header across lines and a global whose initializer opens a bracket
+on its line are read. The census of first-stop modules fell from 1,851 to 693
+(function 645, global initializer 29, implementation 19); `indented-method-chain`
+(260) is now the top reason, then `tuple-destructuring` (133) and
+`opaque-conversion` (120).
+
+What replaced the line check, each by a token or recipe rule:
+- an expression that ends in a block's dedent (a control expression or a block
+  lambda, `ends_in_dedent`) is not continued: no postfix step and no operator
+  follows it, because what follows starts the next statement. This is the
+  `OperatorAfterBlock` quirk of D8, which the frozen parser has: a binary
+  operator, `as` or `=` after the dedent continues the block's expression, and
+  the tree parsers decline it (`OperatorAfterBlock`) rather than read it;
+- a block opened inside brackets, or on a header's line, is measured against
+  the bracketed-block anchor of section 3.16 (`layout_quirks.block_may_open`).
+  A keyword rule (a block only as a call argument, never in a `while` header
+  or after a same-line body) cannot express it: the frozen parser accepts a
+  block in any of those places that is indented past the anchor.
+
+Position queries remain in the M3 header parsers (`tree_function_header_parser`,
+the trait and implementation method header parsers) in two forms. The
+skip-extent queries (`skip_body`'s anchor line and column, which end a skipped
+body where the frozen parser's indentation anchor says) go with the
+skip-and-replay design (section 8 exit criteria). The body-follows checks, which
+ask whether a body starts on the colon's line
+(`tree_function_header_parser.brp:152`, `tree_trait_method_header_parser.brp:77,84`,
+`tree_implementation_method_header_parser.brp:108,116`), could be token tests
+and are an M4 exit criterion. The restricted-symbol rule of section 3.16 is not
+enabled until both are gone.
+
+The next bounded M4 slices are continuation lines outside brackets (a value
+continued after an operator, and the leading-dot and indented method chains),
+then opaque conversions in a separate slice. Continuation is read as the token
 rules of section 3.16, not by comparing line numbers. Lambdas, local functions,
 the bodies of traits and implementations and the statement forms are read; the
 complete M4 gate is the exit criteria below, which also require the nesting
@@ -4151,6 +4209,15 @@ and 26 globals; those 150 owners remain outside the proof. Logs are in
   `GlobalCompletionPolicy` scan policies and `complete_atomic_global`
   (`tree_module_declaration_scan.brp`, `tree_global_parser.brp`) are deleted,
   with the recipe tree and replay by token index.
+- **Body-follows checks are token tests.** The checks that ask whether a
+  function, trait-method or implementation-method body starts on the colon's
+  line (`tree_function_header_parser.brp:152`,
+  `tree_trait_method_header_parser.brp:77,84`,
+  `tree_implementation_method_header_parser.brp:108,116`) compare line numbers
+  where a token test would do: a body that follows on the next line is a NEWLINE
+  and INDENT token after the colon. They are separate from the skip-extent
+  queries, which leave with skip-and-replay, and are the last step before the
+  restricted-symbol rule can be enabled.
 - **No tree parser reads line or column numbers**, except the named quirks of
   `parse/layout_quirks.brp` (section 3.16). The restricted-symbol entry in
   `blorp/source_ownership.json` and its `scripts/check-blorp-layout` rule land
@@ -4224,7 +4291,11 @@ the 2026-10-06 decisions left open.
     DEDENT, a following binary operator, `as` or `=` continues the block's
     expression;
   - `{}` is stored as a record literal, though the Guide treats it as an empty
-    dict.
+    dict;
+  - the bracketed-block anchor: whether a block opened inside an expression is
+    accepted depends on the column of a token earlier in the expression (an
+    opening bracket, a condition's first token), so re-indenting a block that
+    the lexer already reads as a block can make it a syntax error.
 
 - **D9. Four parsers of one grammar (tooling).** The old parser
   (`stage_03_parse`), the table path, the tree path and the formatter's copy

@@ -1,6 +1,6 @@
 -- An explicitly bounded M4 operator grammar. Recognition builds only recipes:
--- no NameUse, Expression or declaration ID exists until the entire same-line
--- expression and its boundary have been accepted. Unsupported input returns
+-- no NameUse, Expression or declaration ID exists until the entire expression
+-- and its boundary have been accepted. Unsupported input returns
 -- the caller's original state, including spellings and diagnostics.
 import:
 	../lex/lexed_module: LiteralValue(IntegerValue, FloatValue, TextValue), HoleScan, ScannedPiece(ScannedText, ScannedHole)
@@ -41,14 +41,13 @@ import:
 		)
 	binary_operators as Operators
 	stop_reason:
-		StopPoint, Recognition(Recognized, Declined), StopReason(MultilineCallArguments, MultilineSubscript, MultilineListLiteral, MultilineTuple, MultilineGrouping,
-			MultilineRecordLiteral, MultilineRecordUpdate, MultilineDictLiteral, MultilineVectorLiteral, MultilineBracedOpening, OperatorOperandOnNextLine,
-			OperandOnNextLine, MemberNameOnNextLine, UnexpectedTokenInBrackets, MissingDictArrow, TrailingCommaAtEndOfSource, SoftKeywordFieldName,
+		StopPoint, Recognition(Recognized, Declined), StopReason(OperandOnNextLine, MemberNameOnNextLine, UnexpectedTokenInBrackets, MissingDictArrow, TrailingCommaAtEndOfSource, SoftKeywordFieldName,
 			InterpolationHoleNotLexed, InterpolationHoleTrailingTokens, InterpolationHoleRejected, MalformedTokenPayload),
 		Boundary(AtBoundary, PastBoundary), stop_at, expression_boundary, expression_start_reason
+	layout_quirks: BlockAnchor(PastExpressionAnchor), ExpressionAnchor, anchored_at
 	token_cursor: is_soft_keyword
 	parse_state:
-		ParseState, resumed_at, position, diagnostic_count, current_kind, current_token, current_span, current_literal, current_interpolation, advanced, peek_kind, span_start_line,
+		ParseState, resumed_at, position, diagnostic_count, current_kind, current_token, current_span, current_literal, current_interpolation, advanced, peek_kind,
 		consume_referenced_name, finished_name_use, finished_expression, finished_hole, report_at_current, report_diagnostic, report_unreachable_input, expect_token, entered_hole, left_hole
 
 
@@ -147,10 +146,32 @@ pure func is_block_lambda(recipe: ExpressionRecipe) -> Bool:
 			False
 
 
--- Recognizes one same-line expression without issuing ids. The caller owns
--- the boundary after it: a value, a condition and a statement end differently.
-pure func parse_expression_recipe(state: ParseState) -> (ParseState, RecipeParse):
-	parse_operators(state, state.span_start_line(state.current_span()), Operators.LOWEST_PRECEDENCE)
+-- Recognizes one expression without issuing ids. The caller owns the boundary
+-- after it: a value, a condition and a statement end differently. Brackets
+-- span lines because the lexer joins them. `anchor` is the token the frozen
+-- parser measures a block opened inside the expression against
+-- (`layout_quirks.block_may_open`).
+pure func parse_expression_recipe(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
+	parse_operators(state, Operators.LOWEST_PRECEDENCE, anchor)
+
+
+-- The operand an expression ends with: the right operand of an operator, or the
+-- operand of a prefix operator, to any depth. A walk by loop, so that the length
+-- of an authored chain is never native stack depth.
+private pure func last_operand(recipe: ExpressionRecipe) -> ExpressionRecipe:
+	var current: ExpressionRecipe = recipe
+	var walking: Bool = True
+	while walking:
+		match current.kind:
+			BinaryRecipe(_, _, right):
+				current = right
+			UnaryRecipe(_, operand):
+				current = operand
+			DetachRecipe(operand):
+				current = operand
+			_:
+				walking = False
+	current
 
 
 -- Whether the expression's last token closes a block: it is a control
@@ -158,25 +179,13 @@ pure func parse_expression_recipe(state: ParseState) -> (ParseState, RecipeParse
 -- expression starts a new line at the enclosing indentation, so it needs no
 -- newline of its own to end the expression.
 pure func ends_in_control(recipe: ExpressionRecipe) -> Bool:
-	var current: ExpressionRecipe = recipe
-	var walking: Bool = True
-	var ends: Bool = False
-	while walking:
-		match current.kind:
-			ControlValueRecipe(_):
-				ends = True
-				walking = False
-			BinaryRecipe(_, _, right):
-				current = right
-			UnaryRecipe(_, operand):
-				current = operand
-			_:
-				walking = False
-	ends
+	match recipe.last_operand().kind:
+		ControlValueRecipe(_): True
+		_: False
 
 
-pure func parse_same_line_expression(state: ParseState) -> (ParseState, ExpressionParse):
-	(parsed, result) = parse_expression_recipe(state)
+pure func parse_expression_to_boundary(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, ExpressionParse):
+	(parsed, result) = parse_expression_recipe(state, anchor)
 	match result:
 		UnsupportedRecipe(stop):
 			(state, UnsupportedExpression(stop))
@@ -201,12 +210,12 @@ pure func parse_same_line_expression(state: ParseState) -> (ParseState, Expressi
 						(minted.resumed_at(parsed.position()), ParsedExpression(expression))
 
 
-private pure func parse_operators(state: ParseState, line: Int, minimum: Int) -> (ParseState, RecipeParse):
-	(parsed, prefix) = parse_prefix(state, line)
+private pure func parse_operators(state: ParseState, minimum: Int, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
+	(parsed, prefix) = parse_prefix(state, anchor)
 	match prefix:
 		ParsedRecipe(first):
 			(out, chain, abandoned) = extend_chain(parsed, first, pure func(current, left):
-				operator_step(current, line, minimum, left)
+				operator_step(current, minimum, anchor, left)
 			)
 			(out, chain_recipe(chain, abandoned))
 		_:
@@ -215,18 +224,18 @@ private pure func parse_operators(state: ParseState, line: Int, minimum: Int) ->
 
 -- Precedence climbing: the right operand binds only operators above this one.
 private pure func operator_step(
-	state: ParseState, line: Int, minimum: Int, left: ExpressionRecipe,
+	state: ParseState, minimum: Int, anchor: ExpressionAnchor, left: ExpressionRecipe,
 ) -> (ParseState, ChainStep[ExpressionRecipe]):
 	match Operators.binary_operator(state.current_kind()):
 		Some(operator):
 			precedence = Operators.operator_precedence(operator)
 			after_operator = state.advanced()
-			if precedence < minimum:
+			if precedence < minimum or left.ends_in_dedent():
+				-- A control expression or block lambda ends where its block's dedent
+				-- left the cursor, which is the next statement: nothing continues it.
 				(state, Stopped)
-			else if after_operator.starts_next_line(line):
-				(state, Abandoned(UnsupportedShape(after_operator.stop_at(OperatorOperandOnNextLine))))
 			else:
-				(after_right, right_result) = parse_right_operand(after_operator, line, precedence + 1)
+				(after_right, right_result) = parse_right_operand(after_operator, precedence + 1, anchor)
 				match right_result:
 					ParsedRecipe(right):
 						(after_right, Extended({ span = left.span.span_covering(right.span), kind = BinaryRecipe(operator, left, right) }))
@@ -241,19 +250,19 @@ private pure func operator_step(
 -- A control expression ends the expression it is the right operand of, so it
 -- is read directly: the operator-precedence frames between it and the
 -- statements of its blocks are on the native stack once per level of nesting.
-private pure func parse_right_operand(state: ParseState, line: Int, minimum: Int) -> (ParseState, RecipeParse):
-	if (state.current_kind() == IfKeyword or state.current_kind() == MatchKeyword) and state.on_line(line):
-		parse_control_operand(state)
+private pure func parse_right_operand(state: ParseState, minimum: Int, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
+	if state.current_kind() == IfKeyword or state.current_kind() == MatchKeyword:
+		parse_control_operand(state, anchor)
 	else:
-		parse_operators(state, line, minimum)
+		parse_operators(state, minimum, anchor)
 
 
-private pure func parse_prefix(state: ParseState, line: Int) -> (ParseState, RecipeParse):
-	(parsed, atom) = parse_atom(state, line)
+private pure func parse_prefix(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
+	(parsed, atom) = parse_atom(state, anchor)
 	match atom:
 		ParsedRecipe(first):
 			(out, chain, abandoned) = extend_chain(parsed, first, pure func(current, receiver):
-				postfix_step(current, line, receiver)
+				postfix_step(current, anchor, receiver)
 			)
 			(out, chain_recipe(chain, abandoned))
 		_:
@@ -290,36 +299,39 @@ private pure func chain_recipe(recipe: ExpressionRecipe, abandoned: Option[Aband
 		Some(RejectedShape): RejectedRecipe
 
 
--- End of file counts as the current line, so its diagnostics stay on that line.
-private pure func on_line(state: ParseState, line: Int) -> Bool:
-	state.current_kind() == EndOfFileToken or state.span_start_line(state.current_span()) == line
+-- Whether the expression's last token is the dedent that closes a block of its
+-- own: a control expression or a lambda with an indented body. What follows
+-- such an expression starts the next statement, so a call, a subscript, a
+-- member access or an operator there is not a continuation of it. This is
+-- `ends_in_control` widened by the block lambda, which the boundary rules treat
+-- apart because only a lambda's follower needs `block_statement_ends`.
+private pure func ends_in_dedent(recipe: ExpressionRecipe) -> Bool:
+	last: ExpressionRecipe = recipe.last_operand()
+	match last.kind:
+		ControlValueRecipe(_): True
+		LambdaAtomRecipe(_): last.is_block_lambda()
+		_: False
 
 
--- A newline token ends the line; inside brackets there is none, and the next
--- token simply starts a later line.
-private pure func starts_next_line(state: ParseState, line: Int) -> Bool:
-	state.current_kind() == NewlineToken or not state.on_line(line)
-
-
--- One same-line member access, call or subscript, or the end of the chain.
+-- One member access, call or subscript, or the end of the chain.
 private pure func postfix_step(
-	state: ParseState, line: Int, receiver: ExpressionRecipe,
+	state: ParseState, anchor: ExpressionAnchor, receiver: ExpressionRecipe,
 ) -> (ParseState, ChainStep[ExpressionRecipe]):
-	if not state.on_line(line):
+	if receiver.ends_in_dedent():
 		(state, Stopped)
 	else:
 		match state.current_kind():
-			DotSymbol: member_step(state, line, receiver)
-			LeftParenSymbol: delimited_step(state, line, receiver, CallDelimiter)
-			LeftBracketSymbol: delimited_step(state, line, receiver, SubscriptDelimiter)
+			DotSymbol: member_step(state, receiver)
+			LeftParenSymbol: delimited_step(state, anchor, receiver, CallDelimiter)
+			LeftBracketSymbol: delimited_step(state, anchor, receiver, SubscriptDelimiter)
 			_: (state, Stopped)
 
 
 private pure func member_step(
-	state: ParseState, line: Int, receiver: ExpressionRecipe,
+	state: ParseState, receiver: ExpressionRecipe,
 ) -> (ParseState, ChainStep[ExpressionRecipe]):
 	member_entry = state.advanced()
-	if not member_entry.on_line(line):
+	if member_entry.current_kind() == NewlineToken:
 		(state, Abandoned(UnsupportedShape(member_entry.stop_at(MemberNameOnNextLine))))
 	else:
 		(after_name, name) = member_entry.consume_referenced_name(NameInFieldName)
@@ -330,19 +342,19 @@ private pure func member_step(
 
 
 private pure func delimited_step(
-	state: ParseState, line: Int, receiver: ExpressionRecipe, delimiter: PostfixDelimiter,
+	state: ParseState, anchor: ExpressionAnchor, receiver: ExpressionRecipe, delimiter: PostfixDelimiter,
 ) -> (ParseState, ChainStep[ExpressionRecipe]):
 	opened = state.advanced()
 	match delimiter:
 		CallDelimiter:
-			(after_items, items) = parse_optional_items(opened, line, PostfixItems(CallDelimiter))
-			(closed, closed_items) = after_items.closing_items(items, line, PostfixItems(CallDelimiter))
+			(after_items, items) = parse_optional_items(opened, PostfixItems(CallDelimiter), anchor)
+			(closed, closed_items) = after_items.closing_items(items, PostfixItems(CallDelimiter))
 			closed.postfix_items_step(receiver, closed_items, pure func(arguments):
 				CallRecipe(receiver, arguments)
 			)
 		SubscriptDelimiter:
-			(after_items, items) = parse_nonempty_items(opened, line, PostfixItems(SubscriptDelimiter))
-			(closed, closed_items) = after_items.closing_items(items, line, PostfixItems(SubscriptDelimiter))
+			(after_items, items) = parse_nonempty_items(opened, PostfixItems(SubscriptDelimiter), anchor)
+			(closed, closed_items) = after_items.closing_items(items, PostfixItems(SubscriptDelimiter))
 			closed.postfix_items_step(receiver, closed_items, pure func(indices):
 				SubscriptRecipe(receiver, indices)
 			)
@@ -383,11 +395,11 @@ private pure func unclosed_delimiter_diagnostic(delimiter: ItemDelimiter) -> Exp
 -- Pair parsed items with their consumed closing bracket. A failure to close
 -- abandons the items whole, with the reason `close_items` gave.
 private pure func closing_items[T](
-	state: ParseState, items: ItemsParse[T], line: Int, delimiter: ItemDelimiter,
+	state: ParseState, items: ItemsParse[T], delimiter: ItemDelimiter,
 ) -> (ParseState, ItemsParse[(T, Span)]):
 	match items:
 		ParsedItems(values):
-			(closed, closing) = state.close_items(line, delimiter)
+			(closed, closing) = state.close_items(delimiter)
 			match closing:
 				ClosedAt(end_span): (closed, ParsedItems((values, end_span)))
 				NotClosed(UnsupportedShape(stop)): (closed, UnsupportedItems(stop))
@@ -398,50 +410,26 @@ private pure func closing_items[T](
 			(state, RejectedItems)
 
 
--- Consume the closing bracket on the opening line. At end of source the list
--- is unclosed and rejected; any other token (a newline, a different bracket,
--- a missing comma) belongs to a shape this slice leaves unsupported, and a
--- newline names the bracket that spans lines.
-private pure func close_items(state: ParseState, line: Int, delimiter: ItemDelimiter) -> (ParseState, ClosingParse):
+-- Consume the closing bracket. At end of source the list is unclosed and
+-- rejected; any other token (a layout token, a different bracket, a missing
+-- comma) belongs to a shape this slice leaves unsupported.
+private pure func close_items(state: ParseState, delimiter: ItemDelimiter) -> (ParseState, ClosingParse):
 	end = closing_token(delimiter)
-	if state.current_kind() == end and state.on_line(line):
+	if state.current_kind() == end:
 		(state.advanced(), ClosedAt(state.current_span()))
 	else if state.current_kind() == EndOfFileToken:
 		(state.expect_token(end, unclosed_delimiter_diagnostic(delimiter)), NotClosed(RejectedShape))
 	else:
-		(state, NotClosed(UnsupportedShape(state.bracket_stop(line, multiline_reason(delimiter)))))
-
-
--- Layout is not significant inside brackets, so a token past the opening line
--- is a line break the slice does not read (the lexer emits no newline token
--- there). It is the shape most often left behind; any other token that is
--- neither a separator nor the close is a stray one.
-private pure func bracket_stop(state: ParseState, line: Int, multiline: StopReason) -> StopPoint:
-	if state.starts_next_line(line):
-		state.stop_at(multiline)
-	else:
-		state.stop_at(UnexpectedTokenInBrackets)
-
-
-private pure func multiline_reason(delimiter: ItemDelimiter) -> StopReason:
-	match delimiter:
-		PostfixItems(CallDelimiter): MultilineCallArguments
-		PostfixItems(SubscriptDelimiter): MultilineSubscript
-		ListItems: MultilineListLiteral
-		TupleItems: MultilineTuple
-		BracedItems(RecordForm): MultilineRecordLiteral
-		BracedItems(UpdateForm): MultilineRecordUpdate
-		BracedItems(DictForm): MultilineDictLiteral
-		BracedItems(VectorForm): MultilineVectorLiteral
+		(state, NotClosed(UnsupportedShape(state.stop_at(UnexpectedTokenInBrackets))))
 
 
 -- Call arguments and list items may be empty; subscript indices may not.
 -- Recursion follows item bracket nesting, never the callee spine.
-private pure func parse_optional_items(state: ParseState, line: Int, delimiter: ItemDelimiter) -> (ParseState, ItemsParse[List[ExpressionRecipe]]):
+private pure func parse_optional_items(state: ParseState, delimiter: ItemDelimiter, anchor: ExpressionAnchor) -> (ParseState, ItemsParse[List[ExpressionRecipe]]):
 	if state.current_kind() == closing_token(delimiter):
 		(state, ParsedItems([]))
 	else:
-		(after_items, items) = parse_nonempty_items(state, line, delimiter)
+		(after_items, items) = parse_nonempty_items(state, delimiter, anchor)
 		match items:
 			ParsedItems(values):
 				(after_items, ParsedItems(at_least_one_items(values)))
@@ -454,20 +442,18 @@ private pure func parse_optional_items(state: ParseState, line: Int, delimiter: 
 -- A missing first item reports `expected expression` at the closing bracket,
 -- which is how an empty subscript is rejected.
 private pure func parse_nonempty_items(
-	state: ParseState, line: Int, delimiter: ItemDelimiter,
+	state: ParseState, delimiter: ItemDelimiter, anchor: ExpressionAnchor,
 ) -> (ParseState, ItemsParse[AtLeastOne[ExpressionRecipe]]):
 	if state.current_kind() == EndOfFileToken:
 		(state.expect_token(closing_token(delimiter), unclosed_delimiter_diagnostic(delimiter)), RejectedItems)
-	else if state.starts_next_line(line):
-		(state, UnsupportedItems(state.stop_at(multiline_reason(delimiter))))
 	else:
 		-- Read directly, not through `expression_item`: this frame is on the stack
 		-- once per level of bracket nesting.
-		(first_state, first) = parse_operators(state, line, Operators.LOWEST_PRECEDENCE)
+		(first_state, first) = parse_operators(state, Operators.LOWEST_PRECEDENCE, anchor)
 		match first:
 			ParsedRecipe(value):
-				items_after(first_state, delimiter, line, ReportsOnlyUnclosed, value, pure func(current):
-					expression_item(current, line)
+				items_after(first_state, delimiter, ReportsOnlyUnclosed, value, pure func(current):
+					expression_item(current, anchor)
 				)
 			UnsupportedRecipe(stop):
 				(first_state, UnsupportedItems(stop))
@@ -475,8 +461,8 @@ private pure func parse_nonempty_items(
 				(first_state, RejectedItems)
 
 
-private pure func expression_item(state: ParseState, line: Int) -> (ParseState, ItemsParse[ExpressionRecipe]):
-	(after_item, item) = parse_operators(state, line, Operators.LOWEST_PRECEDENCE)
+private pure func expression_item(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, ItemsParse[ExpressionRecipe]):
+	(after_item, item) = parse_operators(state, Operators.LOWEST_PRECEDENCE, anchor)
 	match item:
 		ParsedRecipe(value): (after_item, ParsedItems(value))
 		UnsupportedRecipe(stop): (after_item, UnsupportedItems(stop))
@@ -486,12 +472,12 @@ private pure func expression_item(state: ParseState, line: Int) -> (ParseState, 
 -- The items that follow `first` as comma-separated, with an optional trailing
 -- comma before the closing bracket, each read by `read`.
 private pure func items_after[T](
-	state: ParseState, delimiter: ItemDelimiter, line: Int, at_end_of_source: CommaBeforeEndOfSource, first: T,
+	state: ParseState, delimiter: ItemDelimiter, at_end_of_source: CommaBeforeEndOfSource, first: T,
 	read: pure (ParseState) -> (ParseState, ItemsParse[T]),
 ) -> (ParseState, ItemsParse[AtLeastOne[T]]):
 	no_items: List[T] = []
 	(out, rest, abandoned) = extend_chain(state, no_items, pure func(current, items):
-		next_item_step(current, delimiter, line, at_end_of_source, items, read)
+		next_item_step(current, delimiter, at_end_of_source, items, read)
 	)
 	match abandoned:
 		None: (out, ParsedItems({ first = first, rest = rest }))
@@ -511,7 +497,7 @@ private enum CommaBeforeEndOfSource:
 
 -- A comma introduces the next item, or trails before the closing delimiter.
 private pure func next_item_step[T](
-	state: ParseState, delimiter: ItemDelimiter, line: Int, at_end_of_source: CommaBeforeEndOfSource, items: List[T],
+	state: ParseState, delimiter: ItemDelimiter, at_end_of_source: CommaBeforeEndOfSource, items: List[T],
 	read: pure (ParseState) -> (ParseState, ItemsParse[T]),
 ) -> (ParseState, ChainStep[List[T]]):
 	if state.current_kind() != CommaSymbol:
@@ -524,8 +510,6 @@ private pure func next_item_step[T](
 			match at_end_of_source:
 				ReportsOnlyUnclosed: (after_comma, Stopped)
 				CountsAsMissingItem: (after_comma, Abandoned(UnsupportedShape(after_comma.stop_at(TrailingCommaAtEndOfSource))))
-		else if after_comma.starts_next_line(line):
-			(after_comma, Abandoned(UnsupportedShape(after_comma.stop_at(multiline_reason(delimiter)))))
 		else:
 			(after_item, item) = read(after_comma)
 			match item:
@@ -593,7 +577,7 @@ private pure func parse_hole(state: ParseState, hole: HoleScan) -> (ParseState, 
 		None:
 			(state, Declined(state.stop_at(InterpolationHoleNotLexed)))
 		Some((inside, parked)):
-			(read, parsed) = parse_expression_recipe(inside)
+			(read, parsed) = parse_expression_recipe(inside, anchored_at(inside.current_span()))
 			match parsed:
 				ParsedRecipe(value):
 					if read.current_kind() == EndOfFileToken:
@@ -606,97 +590,94 @@ private pure func parse_hole(state: ParseState, hole: HoleScan) -> (ParseState, 
 					(state, Declined(inside.stop_at(InterpolationHoleRejected)))
 
 
-private pure func parse_atom(state: ParseState, line: Int) -> (ParseState, RecipeParse):
-	if not state.on_line(line):
-		(state, UnsupportedRecipe(state.stop_at(OperandOnNextLine)))
-	else:
-		span = state.current_span()
-		match state.current_kind():
-			IdentifierToken:
-				(advanced, name) = state.consume_referenced_name(NameInStatementName)
-				(advanced, ParsedRecipe({ span = span, kind = NameRecipe(name) }))
-			IntLiteralToken | FloatLiteralToken:
-				match state.current_literal():
-					Some(IntegerValue(magnitude)):
-						(state.advanced(), ParsedRecipe({ span = span, kind = IntegerRecipe(magnitude) }))
-					Some(FloatValue(value)):
-						(state.advanced(), ParsedRecipe({ span = span, kind = FloatRecipe(value) }))
-					_:
-						(state, UnsupportedRecipe(state.stop_at(MalformedTokenPayload)))
-			NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken:
-				match state.current_literal():
-					Some(TextValue(text)):
-						form: StringForm = match state.current_kind():
-							RawStringToken: RawString
-							PipeStringToken: PipeString
-							RawPipeStringToken: RawPipeString
-							_: QuotedString
-						(state.advanced(), ParsedRecipe({ span = span, kind = StringRecipe(form, text) }))
-					_:
-						-- The token cursor checked that a string token's literal is text.
-						report_unreachable_input("a string token indexes a text literal")
-						(state, UnsupportedRecipe(state.stop_at(MalformedTokenPayload)))
-			InterpolatedStringToken | InterpolatedPipeStringToken:
-				state.parse_interpolated_string(span)
-			CharLiteralToken:
-				-- The token cursor validated the payload as a Unicode scalar value.
-				(state.advanced(), ParsedRecipe({ span = span, kind = CharacterRecipe(to_char(state.current_token().payload)) }))
-			FuncKeyword | PureKeyword:
-				(remaining, lambda) = parse_lambda_recipe(state)
-				match lambda:
-					ParsedLambda(recipe):
-						(remaining, ParsedRecipe({ span = recipe.span, kind = LambdaAtomRecipe(recipe) }))
-					UnsupportedLambda(stop):
-						(state, UnsupportedRecipe(stop))
-			TrueKeyword | FalseKeyword:
-				(state.advanced(), ParsedRecipe({ span = span, kind = BooleanRecipe(state.current_kind() == TrueKeyword) }))
-			VoidKeyword | UnderscoreSymbol:
-				(state.advanced(), ParsedRecipe({ span = span, kind = VoidRecipe }))
-			MinusSymbol | NotKeyword:
-				operator = if state.current_kind() == MinusSymbol:
-					Negate
-				else:
-					LogicalNot
-				(parsed, operand) = parse_prefix(state.advanced(), line)
-				match operand:
-					ParsedRecipe(value):
-						(parsed, ParsedRecipe({ span = span.span_covering(value.span), kind = UnaryRecipe(operator, value) }))
-					_:
-						(parsed, operand)
-			DetachKeyword:
-				(parsed, operand) = parse_prefix(state.advanced(), line)
-				match operand:
-					ParsedRecipe(value):
-						(parsed, ParsedRecipe({ span = span.span_covering(value.span), kind = DetachRecipe(value) }))
-					_:
-						(parsed, operand)
-			LeftParenSymbol:
-				parse_parenthesized(state, line, span)
-			LeftBracketSymbol:
-				parse_list_literal(state, line, span)
-			LeftBraceSymbol:
-				parse_braced(state, line, span)
-			IfKeyword | MatchKeyword:
-				parse_control_operand(state)
-			EndOfFileToken | RightParenSymbol | RightBracketSymbol:
-				(state.report_at_current(ExpectedExpressionDiagnostic), RejectedRecipe)
-			_:
-				match expression_start_reason(state):
-					Some(reason):
-						(state, UnsupportedRecipe(state.stop_at(reason)))
-					None:
-						-- Every kind the arms above read has no reason; the others are named in full.
-						report_unreachable_input("an atom token the parser reads has an arm")
-						(state, UnsupportedRecipe(state.stop_at(MalformedTokenPayload)))
+private pure func parse_atom(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
+	span = state.current_span()
+	match state.current_kind():
+		IdentifierToken:
+			(advanced, name) = state.consume_referenced_name(NameInStatementName)
+			(advanced, ParsedRecipe({ span = span, kind = NameRecipe(name) }))
+		IntLiteralToken | FloatLiteralToken:
+			match state.current_literal():
+				Some(IntegerValue(magnitude)):
+					(state.advanced(), ParsedRecipe({ span = span, kind = IntegerRecipe(magnitude) }))
+				Some(FloatValue(value)):
+					(state.advanced(), ParsedRecipe({ span = span, kind = FloatRecipe(value) }))
+				_:
+					(state, UnsupportedRecipe(state.stop_at(MalformedTokenPayload)))
+		NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken:
+			match state.current_literal():
+				Some(TextValue(text)):
+					form: StringForm = match state.current_kind():
+						RawStringToken: RawString
+						PipeStringToken: PipeString
+						RawPipeStringToken: RawPipeString
+						_: QuotedString
+					(state.advanced(), ParsedRecipe({ span = span, kind = StringRecipe(form, text) }))
+				_:
+					-- The token cursor checked that a string token's literal is text.
+					report_unreachable_input("a string token indexes a text literal")
+					(state, UnsupportedRecipe(state.stop_at(MalformedTokenPayload)))
+		InterpolatedStringToken | InterpolatedPipeStringToken:
+			state.parse_interpolated_string(span)
+		CharLiteralToken:
+			-- The token cursor validated the payload as a Unicode scalar value.
+			(state.advanced(), ParsedRecipe({ span = span, kind = CharacterRecipe(to_char(state.current_token().payload)) }))
+		FuncKeyword | PureKeyword:
+			(remaining, lambda) = parse_lambda_recipe(state, anchor)
+			match lambda:
+				ParsedLambda(recipe):
+					(remaining, ParsedRecipe({ span = recipe.span, kind = LambdaAtomRecipe(recipe) }))
+				UnsupportedLambda(stop):
+					(state, UnsupportedRecipe(stop))
+		TrueKeyword | FalseKeyword:
+			(state.advanced(), ParsedRecipe({ span = span, kind = BooleanRecipe(state.current_kind() == TrueKeyword) }))
+		VoidKeyword | UnderscoreSymbol:
+			(state.advanced(), ParsedRecipe({ span = span, kind = VoidRecipe }))
+		MinusSymbol | NotKeyword:
+			operator = if state.current_kind() == MinusSymbol:
+				Negate
+			else:
+				LogicalNot
+			(parsed, operand) = parse_prefix(state.advanced(), anchor)
+			match operand:
+				ParsedRecipe(value):
+					(parsed, ParsedRecipe({ span = span.span_covering(value.span), kind = UnaryRecipe(operator, value) }))
+				_:
+					(parsed, operand)
+		DetachKeyword:
+			(parsed, operand) = parse_prefix(state.advanced(), anchor)
+			match operand:
+				ParsedRecipe(value):
+					(parsed, ParsedRecipe({ span = span.span_covering(value.span), kind = DetachRecipe(value) }))
+				_:
+					(parsed, operand)
+		LeftParenSymbol:
+			parse_parenthesized(state, span)
+		LeftBracketSymbol:
+			parse_list_literal(state, span)
+		LeftBraceSymbol:
+			parse_braced(state, span)
+		IfKeyword | MatchKeyword:
+			parse_control_operand(state, anchor)
+		EndOfFileToken | RightParenSymbol | RightBracketSymbol:
+			(state.report_at_current(ExpectedExpressionDiagnostic), RejectedRecipe)
+		_:
+			match expression_start_reason(state):
+				Some(reason):
+					(state, UnsupportedRecipe(state.stop_at(reason)))
+				None:
+					-- Every kind the arms above read has no reason; the others are named in full.
+					report_unreachable_input("an atom token the parser reads has an arm")
+					(state, UnsupportedRecipe(state.stop_at(MalformedTokenPayload)))
 
 
 -- An `if` or `match` as an operand. Its blocks end on dedents, so what the
--- expression may do afterwards is decided by the control reader (a binary
--- operator on the next line defers) and by the same-line checks of the
--- postfix, item and boundary rules, which a later line fails. Its twin for a
--- whole statement value is `parse_value` in the body parser.
-private pure func parse_control_operand(state: ParseState) -> (ParseState, RecipeParse):
-	(remaining, control) = parse_control_recipe(state)
+-- expression may do afterwards is decided by the control reader (an operator
+-- after the last block declines) and by `ends_in_dedent`, which stops the
+-- operator and postfix chains there. Its twin for a whole statement value is
+-- `parse_value` in the body parser.
+private pure func parse_control_operand(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
+	(remaining, control) = parse_control_recipe(state, PastExpressionAnchor(anchor))
 	match control:
 		Recognized(written):
 			(remaining, ParsedRecipe(control_expression(written)))
@@ -706,20 +687,18 @@ private pure func parse_control_operand(state: ParseState) -> (ParseState, Recip
 
 -- The arms below are functions of their own, not inline in `parse_atom`: that
 -- frame is on the native stack once for every level of bracket nesting, and
--- the 1,000-deep proof of section 3.14 has to fit the Linux stack.
-private pure func parse_parenthesized(state: ParseState, line: Int, span: Span) -> (ParseState, RecipeParse):
+-- the nesting limit (section 3.14) has to fit the Linux stack.
+private pure func parse_parenthesized(state: ParseState, span: Span) -> (ParseState, RecipeParse):
 	opened = state.advanced()
-	if opened.current_kind() == RightParenSymbol and opened.span_start_line(opened.current_span()) == line:
+	if opened.current_kind() == RightParenSymbol:
 		(opened.advanced(), ParsedRecipe({ span = span.span_covering(opened.current_span()), kind = VoidRecipe }))
-	else if opened.starts_next_line(line):
-		(state, UnsupportedRecipe(opened.stop_at(MultilineGrouping)))
 	else:
-		(parsed, inner) = parse_operators(opened, line, Operators.LOWEST_PRECEDENCE)
+		(parsed, inner) = parse_operators(opened, Operators.LOWEST_PRECEDENCE, anchored_at(span))
 		match inner:
 			ParsedRecipe(value):
 				if parsed.current_kind() == CommaSymbol:
-					parsed.parse_tuple_rest(line, span, value)
-				else if parsed.current_kind() == RightParenSymbol and parsed.span_start_line(parsed.current_span()) == line:
+					parsed.parse_tuple_rest(span, value)
+				else if parsed.current_kind() == RightParenSymbol:
 					-- Names retain their token span through every grouping layer.
 					group_span = if value.keeps_token_span():
 						value.span
@@ -729,14 +708,14 @@ private pure func parse_parenthesized(state: ParseState, line: Int, span: Span) 
 				else if parsed.current_kind() == EndOfFileToken:
 					(parsed.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInGroupedExpression)), RejectedRecipe)
 				else:
-					(parsed, UnsupportedRecipe(parsed.bracket_stop(line, MultilineGrouping)))
+					(parsed, UnsupportedRecipe(parsed.stop_at(UnexpectedTokenInBrackets)))
 			_:
 				(parsed, inner)
 
 
-private pure func parse_list_literal(state: ParseState, line: Int, span: Span) -> (ParseState, RecipeParse):
-	(after_items, items) = parse_optional_items(state.advanced(), line, ListItems)
-	(closed, closed_items) = after_items.closing_items(items, line, ListItems)
+private pure func parse_list_literal(state: ParseState, span: Span) -> (ParseState, RecipeParse):
+	(after_items, items) = parse_optional_items(state.advanced(), ListItems, anchored_at(span))
+	(closed, closed_items) = after_items.closing_items(items, ListItems)
 	match closed_items:
 		ParsedItems((elements, end_span)):
 			(closed, ParsedRecipe({ span = span.span_covering(end_span), kind = ListRecipe(elements) }))
@@ -752,15 +731,13 @@ private pure func parse_list_literal(state: ParseState, line: Int, span: Span) -
 -- (`{record | name = value}`), a dict literal (`{key => value}`) or a vector
 -- literal (`{a, b}`), told apart as the frozen parser does: by a leading
 -- `name =`, then by the token after the first expression.
-private pure func parse_braced(state: ParseState, line: Int, open_span: Span) -> (ParseState, RecipeParse):
+private pure func parse_braced(state: ParseState, open_span: Span) -> (ParseState, RecipeParse):
 	opened = state.advanced()
-	if opened.current_kind() == RightBraceSymbol and opened.on_line(line):
+	if opened.current_kind() == RightBraceSymbol:
 		(opened.advanced(), ParsedRecipe({ span = open_span.span_covering(opened.current_span()), kind = RecordRecipe([]) }))
-	else if opened.starts_next_line(line):
-		(state, UnsupportedRecipe(opened.stop_at(MultilineBracedOpening)))
 	else if opened.starts_field():
-		(after_items, items) = record_fields_from(opened, line, RecordForm)
-		braced_recipe(after_items, items, line, RecordForm, open_span, pure func(fields):
+		(after_items, items) = record_fields_from(opened, RecordForm)
+		braced_recipe(after_items, items, RecordForm, open_span, pure func(fields):
 			fields.without_repeats().map(pure func(distinct):
 				RecordRecipe(at_least_one_items(distinct))
 			)
@@ -772,10 +749,10 @@ private pure func parse_braced(state: ParseState, line: Int, open_span: Span) ->
 	else if opened.starts_soft_keyword_field():
 		(state, UnsupportedRecipe(opened.stop_at(SoftKeywordFieldName)))
 	else:
-		(after_first, first) = parse_operators(opened, line, Operators.LOWEST_PRECEDENCE)
+		(after_first, first) = parse_operators(opened, Operators.LOWEST_PRECEDENCE, anchored_at(opened.current_span()))
 		match first:
 			ParsedRecipe(value):
-				parse_braced_after_first(after_first, line, open_span, value)
+				parse_braced_after_first(after_first, open_span, value)
 			UnsupportedRecipe(stop):
 				(after_first, UnsupportedRecipe(stop))
 			RejectedRecipe:
@@ -785,12 +762,12 @@ private pure func parse_braced(state: ParseState, line: Int, open_span: Span) ->
 -- The token after the first expression picks the form: `=>` a dict, `|` a
 -- record update, anything else a vector.
 private pure func parse_braced_after_first(
-	state: ParseState, line: Int, open_span: Span, first: ExpressionRecipe,
+	state: ParseState, open_span: Span, first: ExpressionRecipe,
 ) -> (ParseState, RecipeParse):
 	match state.current_kind():
 		FatArrowSymbol:
-			(after_items, items) = dict_entries_from(state, line, first)
-			braced_recipe(after_items, items, line, DictForm, open_span, pure func(entries):
+			(after_items, items) = dict_entries_from(state, first)
+			braced_recipe(after_items, items, DictForm, open_span, pure func(entries):
 				Some(DictRecipe(entries))
 			)
 		PipeSymbol:
@@ -798,17 +775,17 @@ private pure func parse_braced_after_first(
 			if after_bar.current_kind() == EndOfFileToken:
 				(after_bar.expect_token(RightBraceSymbol, unclosed_delimiter_diagnostic(BracedItems(UpdateForm))), RejectedRecipe)
 			else:
-				(after_items, items) = record_fields_from(after_bar, line, UpdateForm)
-				braced_recipe(after_items, items, line, UpdateForm, open_span, pure func(fields):
+				(after_items, items) = record_fields_from(after_bar, UpdateForm)
+				braced_recipe(after_items, items, UpdateForm, open_span, pure func(fields):
 					fields.without_repeats().map(pure func(distinct):
 						UpdateRecipe(first, distinct)
 					)
 				)
 		_:
-			(after_items, items) = items_after(state, BracedItems(VectorForm), line, CountsAsMissingItem, first, pure func(current):
-				expression_item(current, line)
+			(after_items, items) = items_after(state, BracedItems(VectorForm), CountsAsMissingItem, first, pure func(current):
+				expression_item(current, anchored_at(current.current_span()))
 			)
-			braced_recipe(after_items, items, line, VectorForm, open_span, pure func(elements):
+			braced_recipe(after_items, items, VectorForm, open_span, pure func(elements):
 				Some(VectorRecipe(elements))
 			)
 
@@ -827,10 +804,10 @@ private pure func starts_soft_keyword_field(state: ParseState) -> Bool:
 -- rejected after its closing brace, so the frozen parser's diagnostics keep
 -- their order.
 private pure func braced_recipe[T](
-	state: ParseState, items: ItemsParse[T], line: Int, form: BracedForm, open_span: Span,
+	state: ParseState, items: ItemsParse[T], form: BracedForm, open_span: Span,
 	recipe_kind: pure (T) -> Option[RecipeKind],
 ) -> (ParseState, RecipeParse):
-	(closed, closed_items) = state.closing_items(items, line, BracedItems(form))
+	(closed, closed_items) = state.closing_items(items, BracedItems(form))
 	match closed_items:
 		ParsedItems((values, end_span)):
 			match recipe_kind(values):
@@ -855,12 +832,12 @@ private pure func without_repeats(fields: FieldList) -> Option[AtLeastOne[Record
 		RepeatedFields: None
 
 
-private pure func record_fields_from(state: ParseState, line: Int, form: BracedForm) -> (ParseState, ItemsParse[FieldList]):
-	(first_state, first) = field_item(state, line, form)
+private pure func record_fields_from(state: ParseState, form: BracedForm) -> (ParseState, ItemsParse[FieldList]):
+	(first_state, first) = field_item(state)
 	match first:
 		ParsedItems(value):
-			(after_fields, fields) = items_after(first_state, BracedItems(form), line, ReportsOnlyUnclosed, value, pure func(current):
-				field_item(current, line, form)
+			(after_fields, fields) = items_after(first_state, BracedItems(form), ReportsOnlyUnclosed, value, pure func(current):
+				field_item(current)
 			)
 			match fields:
 				ParsedItems(read_fields):
@@ -906,18 +883,16 @@ private pure func first_named(fields: List[RecordFieldRecipe], name: WrittenName
 	first
 
 
-private pure func field_item(state: ParseState, line: Int, form: BracedForm) -> (ParseState, ItemsParse[RecordFieldRecipe]):
-	if not (state.on_line(line) and state.starts_field()):
+private pure func field_item(state: ParseState) -> (ParseState, ItemsParse[RecordFieldRecipe]):
+	if not state.starts_field():
 		reason = if state.starts_soft_keyword_field():
 			SoftKeywordFieldName
-		else if not state.on_line(line):
-			multiline_reason(BracedItems(form))
 		else:
 			UnexpectedTokenInBrackets
 		(state, UnsupportedItems(state.stop_at(reason)))
 	else:
 		(after_name, name) = state.consume_referenced_name(NameInRecordFieldName)
-		(after_value, value) = expression_item(after_name.advanced(), line)
+		(after_value, value) = expression_item(after_name.advanced(), anchored_at(after_name.advanced().current_span()))
 		match value:
 			ParsedItems(recipe):
 				(after_value, ParsedItems({ name = name, value = recipe, span = name.span.span_covering(recipe.span) }))
@@ -929,12 +904,12 @@ private pure func field_item(state: ParseState, line: Int, form: BracedForm) -> 
 
 -- Dict entries from the first key, which the caller read and which is
 -- followed by `=>`.
-private pure func dict_entries_from(state: ParseState, line: Int, first_key: ExpressionRecipe) -> (ParseState, ItemsParse[AtLeastOne[EntryRecipe]]):
-	(first_state, first) = entry_after_key(state, line, first_key)
+private pure func dict_entries_from(state: ParseState, first_key: ExpressionRecipe) -> (ParseState, ItemsParse[AtLeastOne[EntryRecipe]]):
+	(first_state, first) = entry_after_key(state, first_key)
 	match first:
 		ParsedItems(entry):
-			items_after(first_state, BracedItems(DictForm), line, CountsAsMissingItem, entry, pure func(current):
-				entry_item(current, line)
+			items_after(first_state, BracedItems(DictForm), CountsAsMissingItem, entry, pure func(current):
+				entry_item(current)
 			)
 		UnsupportedItems(stop):
 			(first_state, UnsupportedItems(stop))
@@ -942,11 +917,11 @@ private pure func dict_entries_from(state: ParseState, line: Int, first_key: Exp
 			(first_state, RejectedItems)
 
 
-private pure func entry_item(state: ParseState, line: Int) -> (ParseState, ItemsParse[EntryRecipe]):
-	(after_key, key) = expression_item(state, line)
+private pure func entry_item(state: ParseState) -> (ParseState, ItemsParse[EntryRecipe]):
+	(after_key, key) = expression_item(state, anchored_at(state.current_span()))
 	match key:
 		ParsedItems(recipe):
-			entry_after_key(after_key, line, recipe)
+			entry_after_key(after_key, recipe)
 		UnsupportedItems(stop):
 			(after_key, UnsupportedItems(stop))
 		RejectedItems:
@@ -954,11 +929,11 @@ private pure func entry_item(state: ParseState, line: Int) -> (ParseState, Items
 
 
 -- `=> value` after a key. The frozen parser reports a missing arrow; this slice defers it.
-private pure func entry_after_key(state: ParseState, line: Int, key: ExpressionRecipe) -> (ParseState, ItemsParse[EntryRecipe]):
-	if state.current_kind() != FatArrowSymbol or not state.on_line(line):
+private pure func entry_after_key(state: ParseState, key: ExpressionRecipe) -> (ParseState, ItemsParse[EntryRecipe]):
+	if state.current_kind() != FatArrowSymbol:
 		(state, UnsupportedItems(state.stop_at(MissingDictArrow)))
 	else:
-		(after_value, value) = expression_item(state.advanced(), line)
+		(after_value, value) = expression_item(state.advanced(), anchored_at(state.advanced().current_span()))
 		match value:
 			ParsedItems(recipe):
 				(after_value, ParsedItems({ key = key, value = recipe, span = key.span.span_covering(recipe.span) }))
@@ -975,10 +950,10 @@ private pure func entry_after_key(state: ParseState, line: Int, key: ExpressionR
 -- kept ID-free: a rejected tuple issues no IDs, and a one-element `(x,)` or a
 -- tuple of more than four elements has no `TupleLiteral` to hold it.
 private pure func parse_tuple_rest(
-	state: ParseState, line: Int, open_span: Span, first: ExpressionRecipe,
+	state: ParseState, open_span: Span, first: ExpressionRecipe,
 ) -> (ParseState, RecipeParse):
-	(after_items, items) = items_after(state, TupleItems, line, CountsAsMissingItem, first, pure func(current):
-		expression_item(current, line)
+	(after_items, items) = items_after(state, TupleItems, CountsAsMissingItem, first, pure func(current):
+		expression_item(current, anchored_at(open_span))
 	)
 	match items:
 		UnsupportedItems(stop):
@@ -987,7 +962,7 @@ private pure func parse_tuple_rest(
 			(after_items, RejectedRecipe)
 		ParsedItems(read_items):
 			rest = read_items.rest
-			if after_items.current_kind() == RightParenSymbol and after_items.on_line(line):
+			if after_items.current_kind() == RightParenSymbol:
 				span = open_span.span_covering(after_items.current_span())
 				(counted, tuple) = after_items.advanced().counted_tuple(span, first, rest)
 				match tuple:
@@ -998,7 +973,7 @@ private pure func parse_tuple_rest(
 				(counted, _) = unclosed.counted_tuple(open_span.span_covering(first.span), first, rest)
 				(counted, RejectedRecipe)
 			else:
-				(after_items, UnsupportedRecipe(after_items.bracket_stop(line, MultilineTuple)))
+				(after_items, UnsupportedRecipe(after_items.stop_at(UnexpectedTokenInBrackets)))
 
 
 -- A tuple holds two to four elements. Any other count is reported over the
@@ -1124,7 +1099,7 @@ private pure func mint_nonbinary_recipe(state: ParseState, recipe: ExpressionRec
 
 -- Each aggregate is minted by a function of its own, so the frame of
 -- `mint_nonbinary_recipe`, which is on the native stack once per level of
--- bracket nesting, stays small enough for the 1,000-deep proof on Linux.
+-- bracket nesting, stays small enough for the nesting limit (section 3.14) on Linux.
 private pure func minted_tuple(state: ParseState, span: Span, items: SmallTuple[ExpressionRecipe]) -> (ParseState, Expression):
 	match items:
 		Pair(first, second):
