@@ -2005,9 +2005,10 @@ crashes the compiler. So the limit is a rule of the syntax:
   - a bracketed form: a parenthesized expression, a call argument list, a
     subscript, a list, tuple, vector, record, update or dict literal, and a
     string interpolation hole;
-  - an indented block, including a lambda body;
+  - an indented block, and a lambda body, whether a block or a same-line
+    expression;
   - a control expression read as an operand (`1 + if ...`);
-  - a prefix-operator chain (`not not x`, `- - x`, `detach detach x`): the
+  - a prefix-operator chain (`not not x`, `- - x`): the
     parser's `parse_prefix` recurses once per operator
     (`tree_expression_parser.brp`), so the chain is right-nesting in both the
     parser and the tree;
@@ -2411,7 +2412,7 @@ expressions and the lexer cannot know the anchor. The four rules:
   not a block; its DEDENT ends the statement.
 - **Operator then newline**: a binary operator followed by NEWLINE continues
   the expression at the next line only when no INDENT follows. An INDENT
-  there is "expected expression" (`GRAMMAR.md`, indentation rule 6).
+  there is "expected expression" (`GRAMMAR.md`, section 4.4).
 
 The only line or column rules allowed are the named frozen-grammar quirks,
 kept together in one new module (`parse/layout_quirks.brp`), each a function
@@ -4283,7 +4284,8 @@ the 2026-10-06 decisions left open.
     keyword;
   - a `|` at the start of a line inside braces lexes as a pipe string;
   - the comparison operators share one left-associative level, so `a < b < 3`
-    parses (`GRAMMAR.md`, operator precedence);
+    parses (`GRAMMAR.md`, section 3.5, which records the decision to make
+    them non-associative);
   - `not a == b` parses as `(not a) == b`;
   - the lexer emits INDENT for any deeper line, not only after `:`;
   - a closing bracket does not close a block opened inside it;

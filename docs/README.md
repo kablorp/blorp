@@ -9,7 +9,9 @@ Completed work belongs in Git history and benchmark results.
 - [Learn Blorp in Y Minutes](LEARN_BLORP_IN_Y_MINUTES.md) is the concise tour
   and preferred-pattern guide.
 - [Language Guide](GUIDE.md) is the complete source-language reference.
-- [Formal Grammar](GRAMMAR.md) is the parser-level EBNF contract.
+- [Formal Grammar](GRAMMAR.md) is the authoritative syntax: lexical structure,
+  the layout algorithm, the EBNF, the position rules and the open grammar
+  decisions.
 
 ## Use The Toolchain
 
