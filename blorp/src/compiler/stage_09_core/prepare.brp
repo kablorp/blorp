@@ -11,7 +11,11 @@ import:
 		union_cleanup_kind,
 		union_field_uses_iterative_cleanup,
 		union_variant_has_cleanup,
-	c_type_layout: c_type_name, unprojected_stack_option_c_type
+	c_type_layout:
+		CoreInlineTaggedCTypeUse(PreparedTaggedStorage),
+		c_type_name,
+		option_inline_tagged_plan,
+		unprojected_stack_option_c_type,
 	cancellation_plan:
 		CancellationActivationIdentity(
 			FunctionCancellationActivation, GlobalInitializerCancellationActivation,
@@ -90,6 +94,7 @@ import:
 		CoreGlobal,
 		CoreHashContainerConstructor,
 		CoreHeapRecordDecl,
+		CoreInlineTaggedVariantRole(EmptyInlineTaggedVariant, PayloadInlineTaggedVariant),
 		CoreListAlloc,
 		CoreListConstruct,
 		CoreListGet,
@@ -116,7 +121,6 @@ import:
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSelectRecvArm,
 		CoreSourceLoc,
-		CoreStackOptionRepresentation,
 		CoreStringByteCopy,
 		CoreStringByteRead,
 		CoreStringByteWrite,
@@ -153,7 +157,7 @@ import:
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
 		CoreUnionRepresentation(
 			BoxedOptionRepresentation, GenericUnionRepresentation, NullableOptionRepresentation,
-			StackOptionRepresentation, StackResultRepresentation,
+			InlineTaggedRepresentation, StackResultRepresentation,
 		),
 		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
 		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
@@ -276,10 +280,6 @@ record PreparedTupleLiteral {
 	retain_mask: Int
 }
 
-
-private STACK_OPTION_SOME_TAG: Int = 0
-
-private STACK_OPTION_NONE_TAG: Int = 1
 
 private STACK_RESULT_OK_TAG: Int = 0
 
@@ -812,8 +812,8 @@ private pure func boxed_kind_for_expr(expr: CoreExpr) -> CoreBoxKind:
 	match expr:
 		UnionConstructExpr(construct, typ, loc):
 			match construct.representation:
-				StackOptionRepresentation(representation):
-					StructBox(representation.option_type)
+				InlineTaggedRepresentation(representation, role):
+					StructBox(representation.c_type)
 				StackResultRepresentation(representation):
 					StructBox(representation.result_type)
 				BoxedOptionRepresentation:
@@ -3346,58 +3346,6 @@ private pure func prepare_record_construct_expr(
 					expr
 
 
-private pure func stack_option_none_value(payload: CoreType) -> String:
-	match payload:
-		NamedType(name, args):
-			match args:
-				[]:
-					if name == "Int":
-						"0L"
-					else:
-						"0"
-				[first, ...rest]:
-					"0"
-		TypeParameterType(_) | SelfType:
-			"0"
-		NativeManagedType(_):
-			"NULL"
-		VoidType:
-			"0"
-		HeapRecordType(name):
-			"0"
-		InlineRecordType(name):
-			"{0}"
-		UnionType(name, _):
-			"0"
-		StackResultType(ok_type, err_type):
-			"{0}"
-		BoxedResultType(ok_type, err_type):
-			"0"
-		FunctionType(_, _, _):
-			"0"
-		RangeType:
-			"0"
-		TensorType(info):
-			"0"
-		TupleType(items):
-			"0"
-
-
-private pure func stack_option_representation(
-	payload: CoreType,
-	tag: Int,
-) -> Option[CoreStackOptionRepresentation]:
-	match unprojected_stack_option_c_type(payload):
-		Some(option_type):
-			Some({
-				option_type = option_type,
-				tag = tag,
-				none_value = stack_option_none_value(payload),
-			})
-		None:
-			None
-
-
 private pure func stack_option_scalar_payload_type(typ: CoreType) -> Bool:
 	match typ:
 		NamedType(name, type_args):
@@ -3475,13 +3423,16 @@ private pure func prepare_stack_option_constructor(
 	payload: CoreType,
 ) -> Option[CoreUnionConstruct]:
 	if constructor_name == "Some" and args.length() == 1:
-		match stack_option_representation(payload, STACK_OPTION_SOME_TAG):
+		match option_inline_tagged_plan(payload, PreparedTaggedStorage):
 			Some(representation):
 				Some({
 					type_name = "Option",
 					constructor_name = "Some",
 					variant = BuiltinOptionSome,
-					representation = StackOptionRepresentation(representation),
+					representation = InlineTaggedRepresentation(
+						representation,
+						PayloadInlineTaggedVariant,
+					),
 					payload_storage = TypedUnionPayloadStorage,
 					uses_release_mask = False,
 					release_mask = 0,
@@ -3518,13 +3469,16 @@ private pure func prepare_stack_option_constructor(
 						args = boxed_args,
 					})
 	else if constructor_name == "None" and args.length() == 0:
-		match stack_option_representation(payload, STACK_OPTION_NONE_TAG):
+		match option_inline_tagged_plan(payload, PreparedTaggedStorage):
 			Some(representation):
 				Some({
 					type_name = "Option",
 					constructor_name = "None",
 					variant = BuiltinOptionNone,
-					representation = StackOptionRepresentation(representation),
+					representation = InlineTaggedRepresentation(
+						representation,
+						EmptyInlineTaggedVariant,
+					),
 					payload_storage = TypedUnionPayloadStorage,
 					uses_release_mask = False,
 					release_mask = 0,

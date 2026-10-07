@@ -1064,6 +1064,25 @@ Primitive C spellings remain literals; backend symbol projection and the erased
 box adapter's named-Void allowance remain explicit separate boundaries. This
 deletes the three private C-type copies without admitting new representations.
 
+The tagged-plan extraction now gives existing inline Option constructors,
+constructor tests and payload access a common physical descriptor: carrier,
+closed empty initializer and selected variant encoding. The Option adapter
+retains admission, nominal identity, raw/projected carrier differences and the
+runtime's numeric-construction/symbolic-match tag spellings. Shared immutable
+encodings avoid per-node encoding records; constructor plans replace the old
+single record, while match projection can create one temporary descriptor per
+query. This is not a measured compiler-cost improvement or ordinary-union
+admission.
+
+Ordinary one-empty/one-scalar-payload unions remain the next separate cut.
+Their authority must be established after monomorphization and record
+representation, before list layout and match/ownership lowering. Preserve
+materialized variant IDs and declaration tag order, add explicit inline Core
+value storage, then cover direct calls, returns, globals, fields and list slots
+with no ARC for release-free values and explicit struct boxes at erased
+boundaries. Semantic payload restoration must recover the actual declared
+variant from that authority rather than assume Option's `Some`.
+
 ```bash
 bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_type_policy.brp
 bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_match.brp

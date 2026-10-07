@@ -6,19 +6,19 @@
 -- remaining Core pass sees the complete expression tree.
 import:
 	backend_projection as CoreBackendProjection
-	c_type_layout: c_type_name, stack_option_c_type, type_requires_release
+	c_type_layout:
+		CoreInlineTaggedCTypeUse(ProjectedTaggedMatch),
+		c_type_name,
+		option_inline_tagged_plan,
+		type_requires_release,
 	ir:
-		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
-		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
-		CoreUnionTagAccess(ScalarTagAccess, ManagedTagAccess),
 		CoreAccessor(
-			BoxedStackOptionPayloadAccessor,
-			BoxedResultErrPayloadAccessor, BoxedResultOkPayloadAccessor,
-			BoxedStackResultErrPayloadAccessor, BoxedStackResultOkPayloadAccessor,
-			ErasedVariantFieldAccessor, ListElementAccessor, ListSpreadAccessor,
-			NullableOptionPayloadAccessor, RootAccessor, StackOptionPayloadAccessor,
-			StackResultErrPayloadAccessor, StackResultOkPayloadAccessor, ProductFieldAccessor,
-			VariantFieldAccessor,
+			BoxedInlineTaggedPayloadAccessor, BoxedResultErrPayloadAccessor,
+			BoxedResultOkPayloadAccessor, BoxedStackResultErrPayloadAccessor,
+			BoxedStackResultOkPayloadAccessor, ErasedVariantFieldAccessor, ListElementAccessor,
+			ListSpreadAccessor, NullableOptionPayloadAccessor, RootAccessor,
+			InlineTaggedPayloadAccessor, StackResultErrPayloadAccessor,
+			StackResultOkPayloadAccessor, ProductFieldAccessor, VariantFieldAccessor,
 		),
 		CoreBinderOrigin(PassTemporary),
 		CoreCallKind(
@@ -37,13 +37,18 @@ import:
 			ConstructorMatchFallbackBindings, ConstructorMatchFallbackBody,
 			ConstructorMatchFallbackFail,
 		),
-		CoreConstructorMatchTest(BoolFalseConstructorTest, BoolTrueConstructorTest, BoxedResultErrConstructorTest, BoxedResultOkConstructorTest, UnionTagConstructorTest, NullableOptionNoneConstructorTest, NullableOptionSomeConstructorTest, StackOptionNoneConstructorTest, StackOptionSomeConstructorTest, StackResultErrConstructorTest, StackResultOkConstructorTest),
+		CoreConstructorMatchTest(
+			BoolFalseConstructorTest, BoolTrueConstructorTest, BoxedResultErrConstructorTest,
+			BoxedResultOkConstructorTest, UnionTagConstructorTest,
+			NullableOptionNoneConstructorTest, NullableOptionSomeConstructorTest,
+			InlineTaggedConstructorTest, StackResultErrConstructorTest,
+			StackResultOkConstructorTest,
+		),
 		CoreDecl(UnionDecl, FunctionDecl, GlobalDecl),
-		CoreUnionVariant,
 		CoreExpr(
 			AccessorLiteralMatchExpr, CallExpr, CastExpr, ConstructorMatchExpr, DropExpr, DupExpr,
-			LetExpr, LengthMatchExpr, LiteralMatchExpr, LogicalExpr, SemanticMatchExpr,
-			SeqExpr, UnboxExpr, VarExpr,
+			LetExpr, LengthMatchExpr, LiteralMatchExpr, LogicalExpr, SemanticMatchExpr, SeqExpr,
+			UnboxExpr, VarExpr,
 		),
 		CoreFunction,
 		CoreGlobal,
@@ -78,6 +83,10 @@ import:
 		CoreType(BoxedResultType, UnionType, NamedType, StackResultType, TupleType),
 		CoreUnionDecl,
 		CoreUnionPayloadStorage(TypedUnionPayloadStorage, ErasedUnionPayloadStorage),
+		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
+		CoreUnionTagAccess(ScalarTagAccess, ManagedTagAccess),
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
+		CoreUnionVariant,
 		CoreVar,
 		CoreVariantRef(VariantById),
 		MATCH_SCRUTINEE_TEMP_ORIGIN,
@@ -393,7 +402,7 @@ private pure func stack_result_parent_uses_boxed_storage(accessor: CoreAccessor)
 			False
 		VariantFieldAccessor(_, _, _, _) | ErasedVariantFieldAccessor(_, _, _, _):
 			True
-		NullableOptionPayloadAccessor(_) | StackOptionPayloadAccessor(_) | BoxedStackOptionPayloadAccessor(_, _):
+		NullableOptionPayloadAccessor(_) | InlineTaggedPayloadAccessor(_) | BoxedInlineTaggedPayloadAccessor(_, _):
 			False
 		StackResultOkPayloadAccessor(_) | StackResultErrPayloadAccessor(_):
 			True
@@ -421,7 +430,7 @@ private pure func stack_option_parent_uses_boxed_storage(accessor: CoreAccessor)
 			True
 		RootAccessor | VariantFieldAccessor(_, _, _, _) | ProductFieldAccessor(_, _, _):
 			False
-		NullableOptionPayloadAccessor(_) | StackOptionPayloadAccessor(_) | BoxedStackOptionPayloadAccessor(_, _):
+		NullableOptionPayloadAccessor(_) | InlineTaggedPayloadAccessor(_) | BoxedInlineTaggedPayloadAccessor(_, _):
 			False
 		ListSpreadAccessor(_, _):
 			False
@@ -604,12 +613,17 @@ private pure func lower_accessor(
 							"Option",
 						)
 
-						match stack_option_c_type(payload, {}):
-							Some(option_type):
+						match option_inline_tagged_plan(payload, ProjectedTaggedMatch):
+							Some(plan):
 								if stack_option_parent_uses_boxed_storage(lowered_parent):
-									Some(BoxedStackOptionPayloadAccessor(lowered_parent, option_type))
+									Some(
+										BoxedInlineTaggedPayloadAccessor(
+											lowered_parent,
+											plan.c_type,
+										),
+									)
 								else:
-									Some(StackOptionPayloadAccessor(lowered_parent))
+									Some(InlineTaggedPayloadAccessor(lowered_parent))
 							None:
 								match option_runtime_layout(layout.specialize, resolved_parent):
 									Some(NullableManagedOptionLayout):
@@ -677,12 +691,22 @@ private pure func constructor_test(
 		NamedType("Option", _):
 			payload ?= single_named_type_argument(layout.specialize, resolved_type, "Option")
 
-			match stack_option_c_type(payload, {}):
-				Some(option_c_type):
+			match option_inline_tagged_plan(payload, ProjectedTaggedMatch):
+				Some(plan):
 					if constructor == "Some":
-						Some(StackOptionSomeConstructorTest(option_c_type))
+						Some(
+							InlineTaggedConstructorTest(
+								plan.c_type,
+								plan.payload_encoding.match_tag,
+							),
+						)
 					else if constructor == "None":
-						Some(StackOptionNoneConstructorTest(option_c_type))
+						Some(
+							InlineTaggedConstructorTest(
+								plan.c_type,
+								plan.empty_encoding.match_tag,
+							),
+						)
 					else:
 						None
 				None:
@@ -1462,53 +1486,71 @@ private pure func materialize_releasing_match_scrutinee(
 			expr
 
 
+-- Cut1 only admits Option. Physical payload access has no semantic variant
+-- identity; restoration must consult the logical parent, not assume Some.
+-- Ordinary tagged unions will need variant recovery from their early plan.
+private pure func option_typed_payload_to_semantic(
+	layout: MatchProjectionLayout,
+	root_type: CoreType,
+	parent: CoreAccessor,
+) -> Option[CoreSemanticMatchAccessor]:
+	semantic_parent ?= typed_accessor_to_semantic(layout, root_type, parent)
+	parent_type ?= semantic_accessor_type(layout, root_type, semantic_parent)
+
+	match resolve_specialize_type(layout.specialize, parent_type):
+		NamedType("Option", [payload]):
+			Some(VariantFieldSemanticMatchAccessor(semantic_parent, "Some", 0))
+		_:
+			None
+
+
 private pure func typed_accessor_to_semantic(
+	layout: MatchProjectionLayout,
+	root_type: CoreType,
 	accessor: CoreAccessor,
 ) -> Option[CoreSemanticMatchAccessor]:
 	match accessor:
 		RootAccessor:
 			Some(RootSemanticMatchAccessor)
 		ProductFieldAccessor(parent, index, _):
-			lowered_parent ?= typed_accessor_to_semantic(parent)
+			lowered_parent ?= typed_accessor_to_semantic(layout, root_type, parent)
 			Some(ProductFieldSemanticMatchAccessor(lowered_parent, index))
 		ListElementAccessor(parent, index):
-			lowered_parent ?= typed_accessor_to_semantic(parent)
+			lowered_parent ?= typed_accessor_to_semantic(layout, root_type, parent)
 			Some(ListElementSemanticMatchAccessor(lowered_parent, index))
 		ListSpreadAccessor(parent, offset):
-			lowered_parent ?= typed_accessor_to_semantic(parent)
+			lowered_parent ?= typed_accessor_to_semantic(layout, root_type, parent)
 			Some(ListSpreadSemanticMatchAccessor(lowered_parent, offset))
 		VariantFieldAccessor(parent, _, constructor, field_index):
-			lowered_parent ?= typed_accessor_to_semantic(parent)
+			lowered_parent ?= typed_accessor_to_semantic(layout, root_type, parent)
 			Some(VariantFieldSemanticMatchAccessor(lowered_parent, constructor, field_index))
 		ErasedVariantFieldAccessor(parent, _, constructor, field_index):
-			lowered_parent ?= typed_accessor_to_semantic(parent)
+			lowered_parent ?= typed_accessor_to_semantic(layout, root_type, parent)
 			Some(VariantFieldSemanticMatchAccessor(lowered_parent, constructor, field_index))
-		StackOptionPayloadAccessor(parent):
-			lowered_parent ?= typed_accessor_to_semantic(parent)
-			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Some", 0))
-		BoxedStackOptionPayloadAccessor(parent, _):
-			lowered_parent ?= typed_accessor_to_semantic(parent)
-			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Some", 0))
+		InlineTaggedPayloadAccessor(parent):
+			option_typed_payload_to_semantic(layout, root_type, parent)
+		BoxedInlineTaggedPayloadAccessor(parent, _):
+			option_typed_payload_to_semantic(layout, root_type, parent)
 		NullableOptionPayloadAccessor(parent):
-			lowered_parent ?= typed_accessor_to_semantic(parent)
+			lowered_parent ?= typed_accessor_to_semantic(layout, root_type, parent)
 			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Some", 0))
 		StackResultOkPayloadAccessor(parent):
-			lowered_parent ?= typed_accessor_to_semantic(parent)
+			lowered_parent ?= typed_accessor_to_semantic(layout, root_type, parent)
 			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Ok", 0))
 		BoxedStackResultOkPayloadAccessor(parent, _):
-			lowered_parent ?= typed_accessor_to_semantic(parent)
+			lowered_parent ?= typed_accessor_to_semantic(layout, root_type, parent)
 			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Ok", 0))
 		BoxedResultOkPayloadAccessor(parent):
-			lowered_parent ?= typed_accessor_to_semantic(parent)
+			lowered_parent ?= typed_accessor_to_semantic(layout, root_type, parent)
 			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Ok", 0))
 		StackResultErrPayloadAccessor(parent):
-			lowered_parent ?= typed_accessor_to_semantic(parent)
+			lowered_parent ?= typed_accessor_to_semantic(layout, root_type, parent)
 			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Err", 0))
 		BoxedStackResultErrPayloadAccessor(parent, _):
-			lowered_parent ?= typed_accessor_to_semantic(parent)
+			lowered_parent ?= typed_accessor_to_semantic(layout, root_type, parent)
 			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Err", 0))
 		BoxedResultErrPayloadAccessor(parent):
-			lowered_parent ?= typed_accessor_to_semantic(parent)
+			lowered_parent ?= typed_accessor_to_semantic(layout, root_type, parent)
 			Some(VariantFieldSemanticMatchAccessor(lowered_parent, "Err", 0))
 
 
@@ -1517,7 +1559,7 @@ private pure func reproject_typed_match_binding(
 	root_type: CoreType,
 	binding: CoreMatchBinding,
 ) -> CoreMatchBinding:
-	match typed_accessor_to_semantic(binding.accessor):
+	match typed_accessor_to_semantic(layout, root_type, binding.accessor):
 		Some(semantic_accessor):
 			match semantic_accessor_type(layout, root_type, semantic_accessor):
 				Some(typ):
