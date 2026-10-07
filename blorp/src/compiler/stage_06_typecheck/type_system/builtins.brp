@@ -98,9 +98,11 @@ import:
 		TRAIT_ID_TO_INT,
 		TRAIT_ID_UNSIGNED_INTEGER,
 		TraitId,
+		trait_id_registry_index,
+		trait_ids_equal,
 
 
-enum BuiltinEffect:
+fixed union BuiltinEffect:
 	BuiltinImpure
 	BuiltinParallelBoundary
 	BuiltinCancellationPoint
@@ -113,7 +115,7 @@ private PRELUDE_TRAITS_MODULE_PATH: String = "traits"
 private PRELUDE_TRAITS_MODULE_NAME: String = "traits"
 
 
-private enum BuiltinTrait:
+private fixed union BuiltinTrait:
 	BuiltinStringable
 	BuiltinEquatable
 	BuiltinOrderable
@@ -148,7 +150,7 @@ private enum BuiltinTrait:
 opaque type BuiltinTraitId = Int
 
 
-private enum RuntimeEffect:
+private fixed union RuntimeEffect:
 	NoRuntimeEffect
 	ImpureNonWaiting
 	CancellationCheckpoint
@@ -730,6 +732,206 @@ private pure func add_builtin_impl(
 			)
 
 
+private record BuiltinImplementationFactRep {
+	kind: BuiltinTrait,
+	receiver: SemanticType
+}
+
+
+opaque type BuiltinImplementationFact = BuiltinImplementationFactRep
+
+
+private pure func append_builtin_implementation_fact(
+	facts: List[BuiltinImplementationFact],
+	kind: BuiltinTrait,
+	receiver: SemanticType,
+) -> List[BuiltinImplementationFact]:
+	fact: BuiltinImplementationFact = into_opaque BuiltinImplementationFact({kind = kind, receiver = receiver})
+	facts.append(fact)
+
+
+---
+The installer and static evidence context consume this one ordered inventory.
+Prepare it once per context, not once per obligation. Runtime definition IDs
+remain installer-owned; these facts identify compiler capabilities, not calls.
+---
+pure func builtin_implementation_facts() -> List[BuiltinImplementationFact]:
+	var facts: List[BuiltinImplementationFact] = []
+	fixed_point_type = SemanticNamedType("FixedPoint", [])
+	facts = append_builtin_implementation_fact(facts, BuiltinInteger, TYPE_INT)
+	facts = append_builtin_implementation_fact(facts, BuiltinSignedInteger, TYPE_INT)
+
+	for name in ["Int8", "Int16", "Int32", "Int128"]:
+		typ = SemanticNamedType(name, [])
+		facts = append_builtin_implementation_fact(facts, BuiltinInteger, typ)
+		facts = append_builtin_implementation_fact(facts, BuiltinSignedInteger, typ)
+
+	for name in ["UInt8", "UInt16", "UInt32", "UInt64", "UInt128"]:
+		typ = SemanticNamedType(name, [])
+		facts = append_builtin_implementation_fact(facts, BuiltinInteger, typ)
+		facts = append_builtin_implementation_fact(facts, BuiltinUnsignedInteger, typ)
+
+	for name in ["Float", "Float32", "Float16"]:
+		facts = append_builtin_implementation_fact(
+			facts,
+			BuiltinFloatingPoint,
+			SemanticNamedType(name, []),
+		)
+
+	facts = append_builtin_implementation_fact(facts, BuiltinFixedPointNumber, fixed_point_type)
+	facts = append_builtin_implementation_fact(facts, BuiltinStringable, TYPE_STRING)
+	facts = append_builtin_implementation_fact(facts, BuiltinAddable, TYPE_STRING)
+	facts = append_builtin_implementation_fact(facts, BuiltinEquatable, TYPE_STRING)
+	facts = append_builtin_implementation_fact(facts, BuiltinEquatable, TYPE_BOOL)
+
+	-- Int128 and UInt128 are Hashable through their standard-library impls
+	-- (int128.brp, uint128.brp), which Dict and Set keys call.
+	for name in [
+		"Int",
+		"Int8",
+		"Int16",
+		"Int32",
+		"Int64",
+		"UInt8",
+		"UInt16",
+		"UInt32",
+		"UInt64",
+		"Float",
+		"Float32",
+		"Float16",
+		"Bool",
+		"Char",
+		"String",
+	]:
+		facts = append_builtin_implementation_fact(
+			facts,
+			BuiltinHashable,
+			SemanticNamedType(name, []),
+		)
+
+	facts = append_builtin_implementation_fact(facts, BuiltinOrderable, TYPE_STRING)
+	facts = append_builtin_implementation_fact(facts, BuiltinOrderable, TYPE_INT)
+	facts = append_builtin_implementation_fact(facts, BuiltinOrderable, TYPE_FLOAT)
+	append_builtin_implementation_fact(facts, BuiltinOrderable, TYPE_CHAR)
+
+
+pure func builtin_implementation_fact_trait(fact: BuiltinImplementationFact) -> TraitId:
+	builtin_trait_kind_id(from_opaque BuiltinImplementationFact(fact).kind)
+
+
+pure func builtin_implementation_fact_receiver(fact: BuiltinImplementationFact) -> SemanticType:
+	from_opaque BuiltinImplementationFact(fact).receiver
+
+
+
+
+private record BuiltinTraitEvidenceMemberRep {
+	declaring_trait: TraitId,
+	ordinal: Int,
+	signature: TraitMethodSig
+}
+
+
+opaque type BuiltinTraitEvidenceMember = BuiltinTraitEvidenceMemberRep
+
+
+private record BuiltinTraitEvidenceRow {
+	id: TraitId,
+	satisfied_traits: List[TraitId],
+	members: List[BuiltinTraitEvidenceMember]
+}
+
+
+opaque type BuiltinTraitEvidenceRegistry = List[BuiltinTraitEvidenceRow]
+
+
+private pure func builtin_trait_evidence_row(kind: BuiltinTrait) -> BuiltinTraitEvidenceRow:
+	id = builtin_trait_kind_id(kind)
+	var satisfied: List[TraitId] = [id]
+	var members: List[BuiltinTraitEvidenceMember] = []
+	for indexed in builtin_trait_methods(kind).enumerate():
+		member: BuiltinTraitEvidenceMember = into_opaque BuiltinTraitEvidenceMember({
+			declaring_trait = id, ordinal = indexed[0], signature = indexed[1]
+		})
+		members = members.append(member)
+	-- The registry's validated rank strictly decreases through every parent.
+	for parent in builtin_trait_kind_supertraits(kind):
+		inherited = builtin_trait_evidence_row(parent)
+		for trait_id in inherited.satisfied_traits:
+			if not satisfied.any(pure func(held): trait_ids_equal(held, trait_id)):
+				satisfied = satisfied.append(trait_id)
+		for member in inherited.members:
+			identity = from_opaque BuiltinTraitEvidenceMember(member)
+			if not members.any(pure func(held):
+				stored = from_opaque BuiltinTraitEvidenceMember(held)
+				trait_ids_equal(stored.declaring_trait, identity.declaring_trait) and stored.ordinal == identity.ordinal
+			):
+				members = members.append(member)
+	{id = id, satisfied_traits = satisfied, members = members}
+
+
+---
+Borrow this immutable preparation for the evidence context's lifetime. All
+method signatures/order and inheritance come from the installed registry's
+existing factories, never mutable Env rows or a second member inventory.
+---
+pure func builtin_trait_evidence_registry() -> Result[BuiltinTraitEvidenceRegistry, String]:
+	if not builtin_trait_topology_is_acyclic():
+		Err("compiler trait evidence topology is cyclic")
+	else:
+		Ok(into_opaque BuiltinTraitEvidenceRegistry(BUILTIN_TRAITS.map(builtin_trait_evidence_row)))
+
+
+private pure func builtin_trait_evidence_registry_row(
+	registry: BuiltinTraitEvidenceRegistry,
+	id: TraitId,
+) -> Result[BuiltinTraitEvidenceRow, String]:
+	index ?= trait_id_registry_index(id).to_result("compiler trait evidence identity is not registered")
+	row ?= from_opaque BuiltinTraitEvidenceRegistry(registry).get(index)
+		.to_result("compiler trait evidence identity is not registered")
+	if trait_ids_equal(row.id, id):
+		Ok(row)
+	else:
+		Err("compiler trait evidence identity is not registered")
+
+
+pure func builtin_trait_evidence_members(
+	registry: BuiltinTraitEvidenceRegistry,
+	id: TraitId,
+) -> Result[List[BuiltinTraitEvidenceMember], String]:
+	builtin_trait_evidence_registry_row(registry, id).map(pure func(row): row.members)
+
+
+pure func builtin_trait_evidence_satisfies(
+	registry: BuiltinTraitEvidenceRegistry,
+	id: TraitId,
+	requested: TraitId,
+) -> Result[Bool, String]:
+	requested_row ?= builtin_trait_evidence_registry_row(registry, requested)
+	row ?= builtin_trait_evidence_registry_row(registry, id)
+	Ok(row.satisfied_traits.any(pure func(held): trait_ids_equal(held, requested)))
+
+
+pure func builtin_implementation_fact_satisfies(
+	registry: BuiltinTraitEvidenceRegistry,
+	fact: BuiltinImplementationFact,
+	requested: TraitId,
+) -> Result[Bool, String]:
+	builtin_trait_evidence_satisfies(registry, builtin_implementation_fact_trait(fact), requested)
+
+
+pure func builtin_trait_evidence_member_declaring_trait(member: BuiltinTraitEvidenceMember) -> TraitId:
+	from_opaque BuiltinTraitEvidenceMember(member).declaring_trait
+
+
+pure func builtin_trait_evidence_member_ordinal(member: BuiltinTraitEvidenceMember) -> Int:
+	from_opaque BuiltinTraitEvidenceMember(member).ordinal
+
+
+pure func builtin_trait_evidence_member_signature(member: BuiltinTraitEvidenceMember) -> TraitMethodSig:
+	from_opaque BuiltinTraitEvidenceMember(member).signature
+
+
 private record BuiltinUnionType {
 	name: String,
 	type_params: List[String],
@@ -1107,7 +1309,7 @@ pure func builtin_trait_supertraits(trait_name: String) -> Option[List[String]]:
 
 ---
 A supertrait must occupy an earlier layer than its child. The exhaustive
-enum match makes every installed trait choose a layer; strict descent makes
+exhaustive match makes every installed trait choose a layer; strict descent makes
 a cycle impossible without requiring a graph traversal per typecheck.
 ---
 private pure func builtin_trait_topology_rank(kind: BuiltinTrait) -> Int:
@@ -1264,40 +1466,18 @@ private pure func builtin_binary_self_method(
 	)
 
 
-private pure func add_core_builtin_traits(env: Env) -> Env:
-	var result: Env = env
-	option_self = SemanticNamedType("Option", [SemanticSelfType])
-	fixed_point_type = SemanticNamedType("FixedPoint", [])
-
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			100,
-			BuiltinStringable,
-			[builtin_unary_self_method("to_string", TYPE_STRING)],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(101, BuiltinEquatable, [builtin_binary_self_method("equals", TYPE_BOOL)]),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			102,
-			BuiltinOrderable,
-			[builtin_binary_self_method("less_than", TYPE_BOOL)],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(103, BuiltinHasLength, [builtin_unary_self_method("length", TYPE_INT)]),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			104,
-			BuiltinInteger,
+private pure func builtin_trait_methods(kind: BuiltinTrait) -> List[TraitMethodSig]:
+	match kind:
+		BuiltinStringable:
+			[builtin_unary_self_method("to_string", TYPE_STRING)]
+		BuiltinEquatable:
+			[builtin_binary_self_method("equals", TYPE_BOOL)]
+		BuiltinOrderable:
+			[builtin_binary_self_method("less_than", TYPE_BOOL)]
+		BuiltinHasLength:
+			[builtin_unary_self_method("length", TYPE_INT)]
+		BuiltinInteger:
+			option_self = SemanticNamedType("Option", [SemanticSelfType])
 			[
 				builtin_binary_self_method("checked_div", option_self),
 				builtin_binary_self_method("checked_mod", option_self),
@@ -1317,14 +1497,8 @@ private pure func add_core_builtin_traits(env: Env) -> Env:
 					SemanticSelfType,
 					True,
 				),
-			],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			105,
-			BuiltinFloatingPoint,
+			]
+		BuiltinFloatingPoint:
 			[
 				builtin_unary_self_method("floor", SemanticSelfType),
 				builtin_unary_self_method("ceil", SemanticSelfType),
@@ -1365,146 +1539,56 @@ private pure func add_core_builtin_traits(env: Env) -> Env:
 				builtin_unary_self_method("is_nan", TYPE_BOOL),
 				builtin_unary_self_method("is_inf", TYPE_BOOL),
 				builtin_unary_self_method("is_finite", TYPE_BOOL),
-			],
-		),
-	)
-
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			106,
-			BuiltinAddable,
-			[builtin_binary_self_method("add", SemanticSelfType)],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			107,
-			BuiltinSubtractable,
-			[builtin_binary_self_method("subtract", SemanticSelfType)],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			108,
-			BuiltinMultipliable,
-			[builtin_binary_self_method("multiply", SemanticSelfType)],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			109,
-			BuiltinDivisible,
-			[builtin_binary_self_method("divide", SemanticSelfType)],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			110,
-			BuiltinModulable,
-			[builtin_binary_self_method("remainder", SemanticSelfType)],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			111,
-			BuiltinNegatable,
-			[builtin_unary_self_method("negate", SemanticSelfType)],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			112,
-			BuiltinHasZero,
-			[trait_method_sig("zero", [], SemanticSelfType, True)],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			113,
-			BuiltinHasOne,
-			[trait_method_sig("one", [], SemanticSelfType, True)],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			114,
-			BuiltinAbsolute,
-			[builtin_unary_self_method("abs", SemanticSelfType)],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			115,
-			BuiltinBounded,
+			]
+		BuiltinAddable:
+			[builtin_binary_self_method("add", SemanticSelfType)]
+		BuiltinSubtractable:
+			[builtin_binary_self_method("subtract", SemanticSelfType)]
+		BuiltinMultipliable:
+			[builtin_binary_self_method("multiply", SemanticSelfType)]
+		BuiltinDivisible:
+			[builtin_binary_self_method("divide", SemanticSelfType)]
+		BuiltinModulable:
+			[builtin_binary_self_method("remainder", SemanticSelfType)]
+		BuiltinNegatable:
+			[builtin_unary_self_method("negate", SemanticSelfType)]
+		BuiltinHasZero:
+			[trait_method_sig("zero", [], SemanticSelfType, True)]
+		BuiltinHasOne:
+			[trait_method_sig("one", [], SemanticSelfType, True)]
+		BuiltinAbsolute:
+			[builtin_unary_self_method("abs", SemanticSelfType)]
+		BuiltinBounded:
 			[
 				builtin_binary_self_method("min", SemanticSelfType),
 				builtin_binary_self_method("max", SemanticSelfType),
-			],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(116, BuiltinHashable, [builtin_unary_self_method("hash", TYPE_INT)]),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(117, BuiltinToBool, [builtin_unary_self_method("to_bool", TYPE_BOOL)]),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			118,
-			BuiltinLogical,
+			]
+		BuiltinHashable:
+			[builtin_unary_self_method("hash", TYPE_INT)]
+		BuiltinToBool:
+			[builtin_unary_self_method("to_bool", TYPE_BOOL)]
+		BuiltinLogical:
 			[
 				builtin_binary_self_method("logical_and", SemanticSelfType),
 				builtin_binary_self_method("logical_or", SemanticSelfType),
 				builtin_unary_self_method("logical_not", SemanticSelfType),
-			],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(119, BuiltinToInt, [builtin_unary_self_method("to_int", TYPE_INT)]),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(120, BuiltinToFloat, [builtin_unary_self_method("to_float", TYPE_FLOAT)]),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(121, BuiltinToFixedPoint, [builtin_unary_self_method("to_fixed_point", fixed_point_type)]),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(122, BuiltinToChar, [builtin_unary_self_method("to_char", TYPE_CHAR)]),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(123, BuiltinSignedInteger, []),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(124, BuiltinUnsignedInteger, []),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(125, BuiltinNumeric, []),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			126,
-			BuiltinFixedPointNumber,
+			]
+		BuiltinToInt:
+			[builtin_unary_self_method("to_int", TYPE_INT)]
+		BuiltinToFloat:
+			[builtin_unary_self_method("to_float", TYPE_FLOAT)]
+		BuiltinToFixedPoint:
+			fixed_point_type = SemanticNamedType("FixedPoint", [])
+			[builtin_unary_self_method("to_fixed_point", fixed_point_type)]
+		BuiltinToChar:
+			[builtin_unary_self_method("to_char", TYPE_CHAR)]
+		BuiltinSignedInteger:
+			[]
+		BuiltinUnsignedInteger:
+			[]
+		BuiltinNumeric:
+			[]
+		BuiltinFixedPointNumber:
 			[
 				builtin_unary_self_method("get_scale", TYPE_INT),
 				trait_method_sig(
@@ -1513,25 +1597,70 @@ private pure func add_core_builtin_traits(env: Env) -> Env:
 					SemanticSelfType,
 					True,
 				),
-			],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			127,
-			BuiltinCopyable,
-			[builtin_unary_self_method("copy", SemanticSelfType)],
-		),
-	)
-	result = env_add_trait(
-		result,
-		builtin_trait_def(
-			128,
-			BuiltinCloneable,
-			[trait_method_sig("clone", [SemanticSelfType], SemanticSelfType, False)],
-		),
-	)
+			]
+		BuiltinCopyable:
+			[builtin_unary_self_method("copy", SemanticSelfType)]
+		BuiltinCloneable:
+			[trait_method_sig("clone", [SemanticSelfType], SemanticSelfType, False)]
+
+
+private pure func builtin_trait_member_for_kind(kind: BuiltinTrait, name: String) -> Option[(TraitId, Int)]:
+	match builtin_trait_methods(kind).find_index(pure func(method): method.name == name):
+		Some(index):
+			Some((builtin_trait_kind_id(kind), index))
+		None:
+			var found: Option[(TraitId, Int)] = None
+			-- Registry topology is validated by builtin_trait_topology_is_acyclic;
+			-- supertraits strictly precede children, so recursion is acyclic.
+			for parent in builtin_trait_kind_supertraits(kind):
+				found = builtin_trait_member_for_kind(parent, name)
+				if found.is_some():
+					break
+			found
+
+
+---
+Exact declaring registry trait and method ordinal. Installed Env rows and this
+projection share one method factory and the registry-owned topology; mutable
+caller Env rows cannot change these identities. No Env is rebuilt for a query.
+---
+pure func builtin_trait_member_declaration(id: TraitId, name: String) -> Option[(TraitId, Int)]:
+	BUILTIN_TRAITS.find(pure func(kind): trait_ids_equal(builtin_trait_kind_id(kind), id))
+		.and_then(pure func(kind): builtin_trait_member_for_kind(kind, name))
+
+
+private pure func add_core_builtin_traits(env: Env) -> Env:
+	var result: Env = env
+
+	result = env_add_trait(result, builtin_trait_def(100, BuiltinStringable, builtin_trait_methods(BuiltinStringable)))
+	result = env_add_trait(result, builtin_trait_def(101, BuiltinEquatable, builtin_trait_methods(BuiltinEquatable)))
+	result = env_add_trait(result, builtin_trait_def(102, BuiltinOrderable, builtin_trait_methods(BuiltinOrderable)))
+	result = env_add_trait(result, builtin_trait_def(103, BuiltinHasLength, builtin_trait_methods(BuiltinHasLength)))
+	result = env_add_trait(result, builtin_trait_def(104, BuiltinInteger, builtin_trait_methods(BuiltinInteger)))
+	result = env_add_trait(result, builtin_trait_def(105, BuiltinFloatingPoint, builtin_trait_methods(BuiltinFloatingPoint)))
+	result = env_add_trait(result, builtin_trait_def(106, BuiltinAddable, builtin_trait_methods(BuiltinAddable)))
+	result = env_add_trait(result, builtin_trait_def(107, BuiltinSubtractable, builtin_trait_methods(BuiltinSubtractable)))
+	result = env_add_trait(result, builtin_trait_def(108, BuiltinMultipliable, builtin_trait_methods(BuiltinMultipliable)))
+	result = env_add_trait(result, builtin_trait_def(109, BuiltinDivisible, builtin_trait_methods(BuiltinDivisible)))
+	result = env_add_trait(result, builtin_trait_def(110, BuiltinModulable, builtin_trait_methods(BuiltinModulable)))
+	result = env_add_trait(result, builtin_trait_def(111, BuiltinNegatable, builtin_trait_methods(BuiltinNegatable)))
+	result = env_add_trait(result, builtin_trait_def(112, BuiltinHasZero, builtin_trait_methods(BuiltinHasZero)))
+	result = env_add_trait(result, builtin_trait_def(113, BuiltinHasOne, builtin_trait_methods(BuiltinHasOne)))
+	result = env_add_trait(result, builtin_trait_def(114, BuiltinAbsolute, builtin_trait_methods(BuiltinAbsolute)))
+	result = env_add_trait(result, builtin_trait_def(115, BuiltinBounded, builtin_trait_methods(BuiltinBounded)))
+	result = env_add_trait(result, builtin_trait_def(116, BuiltinHashable, builtin_trait_methods(BuiltinHashable)))
+	result = env_add_trait(result, builtin_trait_def(117, BuiltinToBool, builtin_trait_methods(BuiltinToBool)))
+	result = env_add_trait(result, builtin_trait_def(118, BuiltinLogical, builtin_trait_methods(BuiltinLogical)))
+	result = env_add_trait(result, builtin_trait_def(119, BuiltinToInt, builtin_trait_methods(BuiltinToInt)))
+	result = env_add_trait(result, builtin_trait_def(120, BuiltinToFloat, builtin_trait_methods(BuiltinToFloat)))
+	result = env_add_trait(result, builtin_trait_def(121, BuiltinToFixedPoint, builtin_trait_methods(BuiltinToFixedPoint)))
+	result = env_add_trait(result, builtin_trait_def(122, BuiltinToChar, builtin_trait_methods(BuiltinToChar)))
+	result = env_add_trait(result, builtin_trait_def(123, BuiltinSignedInteger, builtin_trait_methods(BuiltinSignedInteger)))
+	result = env_add_trait(result, builtin_trait_def(124, BuiltinUnsignedInteger, builtin_trait_methods(BuiltinUnsignedInteger)))
+	result = env_add_trait(result, builtin_trait_def(125, BuiltinNumeric, builtin_trait_methods(BuiltinNumeric)))
+	result = env_add_trait(result, builtin_trait_def(126, BuiltinFixedPointNumber, builtin_trait_methods(BuiltinFixedPointNumber)))
+	result = env_add_trait(result, builtin_trait_def(127, BuiltinCopyable, builtin_trait_methods(BuiltinCopyable)))
+	result = env_add_trait(result, builtin_trait_def(128, BuiltinCloneable, builtin_trait_methods(BuiltinCloneable)))
 
 	-- Keep the guarded updates on this owned Env so Core can take the trait list
 	-- before append. Passing it through env_add_trait_function retains the list.
@@ -1642,61 +1771,10 @@ private pure func add_core_builtin_traits(env: Env) -> Env:
 	if not env_has_trait_function(result, "hash", "Hashable"):
 		result = { result | trait_functions = result.trait_functions.append(("hash", "Hashable")) }
 
-	result = add_builtin_impl(result, BuiltinInteger, TYPE_INT)
-	result = add_builtin_impl(result, BuiltinSignedInteger, TYPE_INT)
-
-	for name in ["Int8", "Int16", "Int32", "Int128"]:
-		typ = SemanticNamedType(name, [])
-		result = add_builtin_impl(result, BuiltinInteger, typ)
-		result = add_builtin_impl(result, BuiltinSignedInteger, typ)
-
-	for name in ["UInt8", "UInt16", "UInt32", "UInt64", "UInt128"]:
-		typ = SemanticNamedType(name, [])
-		result = add_builtin_impl(result, BuiltinInteger, typ)
-		result = add_builtin_impl(result, BuiltinUnsignedInteger, typ)
-
-	for name in ["Float", "Float32", "Float16"]:
-		result = add_builtin_impl(
-			result,
-			BuiltinFloatingPoint,
-			SemanticNamedType(name, []),
-		)
-
-	result = add_builtin_impl(result, BuiltinFixedPointNumber, fixed_point_type)
-	result = add_builtin_impl(result, BuiltinStringable, TYPE_STRING)
-	result = add_builtin_impl(result, BuiltinAddable, TYPE_STRING)
-	result = add_builtin_impl(result, BuiltinEquatable, TYPE_STRING)
-	result = add_builtin_impl(result, BuiltinEquatable, TYPE_BOOL)
-
-	-- Int128 and UInt128 are Hashable through their standard-library impls
-	-- (int128.brp, uint128.brp), which Dict and Set keys call.
-	for name in [
-		"Int",
-		"Int8",
-		"Int16",
-		"Int32",
-		"Int64",
-		"UInt8",
-		"UInt16",
-		"UInt32",
-		"UInt64",
-		"Float",
-		"Float32",
-		"Float16",
-		"Bool",
-		"Char",
-		"String",
-	]:
-		result = add_builtin_impl(
-			result,
-			BuiltinHashable,
-			SemanticNamedType(name, []),
-		)
-
-	result = add_builtin_impl(result, BuiltinOrderable, TYPE_STRING)
-	result = add_builtin_impl(result, BuiltinOrderable, TYPE_INT)
-	result = add_builtin_impl(result, BuiltinOrderable, TYPE_FLOAT)
-	add_builtin_impl(result, BuiltinOrderable, TYPE_CHAR)
+	for fact in builtin_implementation_facts():
+		representation = from_opaque BuiltinImplementationFact(fact)
+		result = add_builtin_impl(result, representation.kind, representation.receiver)
+	result
 
 
 private pure func add_core_builtin_functions(env: Env) -> Env:

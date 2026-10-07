@@ -1,6 +1,8 @@
 import:
 	../../../src/compiler/stage_02_lex/name_table: synthesized_name_id
-	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
+	../../../src/compiler/stage_09_core/function_origin_fixture:
+		FIXTURE_NO_SOURCE_MODULE,
+		FIXTURE_SOURCE_FUNCTION_ORIGIN,
 	../../../src/compiler/stage_09_core/hash_key_callbacks:
 		HashKeyAdapterTable,
 		HashKeyCallbackResult,
@@ -8,20 +10,22 @@ import:
 		bound_pinned_hash_container_constructor,
 		build_hash_key_adapter_table,
 		mint_hash_key_callbacks,
-	../../../src/compiler/stage_09_core/runtime_callbacks: build_runtime_callback_table, find_runtime_callback
-	../../../src/compiler/stage_09_core/specialize_layout: build_specialize_layout
 	../../../src/compiler/stage_09_core/ir:
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
+		CoreBinaryOp(EqualOp),
 		CoreBinderOrigin(AuthoredBinder),
 		CoreCallKind(UserCall),
 		CoreDecl(FunctionDecl, ImplDecl),
-		CoreDeclaredOrigin(HashKeySlotAdapter, ImplMethod, NativeTagEqualityCallback, ProjectedImplMethod),
+		CoreDeclaredOrigin(
+			HashKeySlotAdapter, ImplMethod, NativeTagEqualityCallback, ProjectedImplMethod,
+		),
 		CoreExpr(BinaryExpr, CallExpr, LiteralExpr, UnboxExpr, VarExpr),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
 		CoreFunctionOrigin(Declared),
+		CoreHashKeySlotRole(HashSlotCallback, EqualitySlotCallback),
 		CoreHashContainerConstructor(
-			CustomHashContainerConstructor,
-			ImplHashContainerConstructor,
+			CustomHashContainerConstructor, ImplHashContainerConstructor,
 			TraitHashContainerConstructor,
 		),
 		CoreImplMethodRole(RuntimeCallbackMethod),
@@ -29,11 +33,26 @@ import:
 		CoreParam,
 		CoreProgram,
 		CoreRuntimeCallbackRole(EquatableEqualsCallback, HashableHashCallback),
-		CoreType(EnumType, HeapRecordType, NamedType),
+		CoreType(UnionType, HeapRecordType, NamedType),
 		CoreUnboxKind(PointerUnbox, PrimUnbox, StructUnbox),
 		CoreVar,
+		core_empty_declaration_index,
 		core_function_declared_origin,
 		synthetic_core_source_loc,
+	../../../src/compiler/stage_09_core/runtime_callbacks:
+		build_runtime_callback_table,
+		duplicate_runtime_callbacks,
+		find_runtime_callback,
+	../../../src/compiler/stage_09_core/runtime_projection: project_runtime_program
+	../../../src/compiler/stage_09_core/specialize_layout:
+		CoreHashKeyStrategy(TraitHashKeys, WordHashKeys),
+		build_specialize_layout,
+		hash_key_strategy,
+	../../../src/compiler/stage_09_core/synth_context: core_synth_context
+	../../../src/compiler/stage_09_core/synth_hash_collections:
+		CoreHashProbeMode(DispatchedHashProbe),
+		CoreHashTypeLayoutDecision(ExactHashTypeLayout),
+		classify_hash_collection_type,
 	test: TestSuite
 
 
@@ -107,20 +126,28 @@ pure func impl_method(
 	params: List[CoreParam],
 	return_type: CoreType,
 ) -> CoreDecl:
-	FunctionDecl({ function_info("impl", def_id, params, return_type, int_literal(0)) |
-		origin = Declared(
-			ProjectedImplMethod(
-				synthesized_name_id("_"),
-				synthesized_name_id("_"),
-				key_type,
-				RuntimeCallbackMethod(role),
-			),
-		)
-	})
+	FunctionDecl(
+		{ function_info("impl", def_id, params, return_type, int_literal(0)) |
+			origin = Declared(
+				ProjectedImplMethod(
+					synthesized_name_id("_"),
+					synthesized_name_id("_"),
+					key_type,
+					RuntimeCallbackMethod(role),
+				),
+			)
+		},
+	)
 
 
 pure func hash_impl(key_type: CoreType) -> CoreDecl:
-	impl_method(HASH_IMPL_DEF_ID, key_type, HashableHashCallback, [param("self", key_type)], INT_TYPE)
+	impl_method(
+		HASH_IMPL_DEF_ID,
+		key_type,
+		HashableHashCallback,
+		[param("self", key_type)],
+		INT_TYPE,
+	)
 
 
 pure func equals_impl(key_type: CoreType) -> CoreDecl:
@@ -135,7 +162,17 @@ pure func equals_impl(key_type: CoreType) -> CoreDecl:
 
 pure func program_with(decls: List[CoreDecl]) -> CoreProgram:
 	{
-		decls = [FunctionDecl(function_info("main", MAIN_DEF_ID, [], INT_TYPE, int_literal(0)))].concat(decls),
+		decls = [
+			FunctionDecl(
+				function_info(
+					"main",
+					MAIN_DEF_ID,
+					[],
+					INT_TYPE,
+					int_literal(0),
+				),
+			),
+		].concat(decls),
 		foreign_includes = [],
 		source_files = []
 	}
@@ -152,7 +189,7 @@ pure func adapter_for(program: CoreProgram, impl_def: Int) -> Option[CoreFunctio
 		match decl:
 			FunctionDecl(candidate):
 				match core_function_declared_origin(candidate.origin):
-					HashKeySlotAdapter(target):
+					HashKeySlotAdapter(target, _):
 						if found.is_none() and target == impl_def:
 							found = Some(candidate)
 					_:
@@ -172,7 +209,11 @@ pure func is_record_slot_unbox(expr: CoreExpr, slot_name: String, struct_name: S
 
 
 pure func adapter_table(program: CoreProgram) -> HashKeyAdapterTable:
-	build_hash_key_adapter_table(program, build_specialize_layout(program), build_runtime_callback_table(program))
+	build_hash_key_adapter_table(
+		program,
+		build_specialize_layout(program),
+		build_runtime_callback_table(program),
+	)
 
 
 pure func test_mints_record_slot_adapters() -> Bool:
@@ -180,11 +221,16 @@ pure func test_mints_record_slot_adapters() -> Bool:
 
 	hash_adapter_calls_impl: Bool = match adapter_for(result.program, HASH_IMPL_DEF_ID):
 		Some(adapter):
+			role_matches = match core_function_declared_origin(adapter.origin):
+				HashKeySlotAdapter(_, HashSlotCallback): True
+				_: False
 			match adapter.body:
 				Some(CallExpr(UserCall(_, Some(impl_id), _), _, [key], _, _)):
 					(
 						impl_id == HASH_IMPL_DEF_ID
 						and adapter.def_id == FIRST_FREE_DEF_ID
+						and adapter.return_type == INT_TYPE
+						and role_matches
 						and adapter.params.map(func(p): p.typ) == [NamedType("Ptr", [])]
 						and is_record_slot_unbox(key, "key_slot", "Point")
 					)
@@ -195,11 +241,16 @@ pure func test_mints_record_slot_adapters() -> Bool:
 
 	equals_adapter_calls_impl: Bool = match adapter_for(result.program, EQUALS_IMPL_DEF_ID):
 		Some(adapter):
+			role_matches = match core_function_declared_origin(adapter.origin):
+				HashKeySlotAdapter(_, EqualitySlotCallback): True
+				_: False
 			match adapter.body:
 				Some(CallExpr(UserCall(_, Some(impl_id), _), _, [left, right], _, _)):
 					(
 						impl_id == EQUALS_IMPL_DEF_ID
 						and adapter.def_id == FIRST_FREE_DEF_ID + 1
+						and adapter.return_type == BOOL_TYPE
+						and role_matches
 						and is_record_slot_unbox(left, "left_slot", "Point")
 						and is_record_slot_unbox(right, "right_slot", "Point")
 					)
@@ -208,7 +259,11 @@ pure func test_mints_record_slot_adapters() -> Bool:
 		None:
 			False
 
-	hash_adapter_calls_impl and equals_adapter_calls_impl and result.next_def_id == FIRST_FREE_DEF_ID + 2
+	(
+		hash_adapter_calls_impl
+		and equals_adapter_calls_impl
+		and result.next_def_id == FIRST_FREE_DEF_ID + 2
+	)
 
 
 pure func test_mints_nothing_without_hash_impls() -> Bool:
@@ -218,13 +273,159 @@ pure func test_mints_nothing_without_hash_impls() -> Bool:
 
 pure func test_needs_both_impls_to_mint() -> Bool:
 	result: HashKeyCallbackResult = minted([hash_impl(POINT_TYPE)])
-	adapter_for(result.program, HASH_IMPL_DEF_ID).is_none() and result.next_def_id == FIRST_FREE_DEF_ID
+	(
+		adapter_for(result.program, HASH_IMPL_DEF_ID).is_none()
+		and result.next_def_id == FIRST_FREE_DEF_ID
+	)
 
 
 pure func test_mints_nothing_for_runtime_hashed_keys() -> Bool:
 	-- An impl on Int itself: Int keys use the runtime's word hash.
 	result: HashKeyCallbackResult = minted([hash_impl(INT_TYPE), equals_impl(INT_TYPE)])
 	result.next_def_id == FIRST_FREE_DEF_ID
+
+
+pure func test_scalar_defaults_keep_word_fastpath() -> Bool:
+	program: CoreProgram = program_with([])
+	(
+		hash_key_strategy(build_specialize_layout(program), UnionType("Choice", ScalarTagValue)) == WordHashKeys
+		and minted([]).next_def_id == FIRST_FREE_DEF_ID
+	)
+
+
+pure func test_native_equality_callback_excludes_primitives_and_managed_unions() -> Bool:
+	keys: List[CoreType] = [INT_TYPE, BOOL_TYPE, NamedType("String", []), UnionType("Payload", ManagedUnionValue)]
+	keys.all(func(key): minted([hash_impl(key)]).next_def_id == FIRST_FREE_DEF_ID)
+
+
+pure func test_scalar_authored_pair_binds_word_slot_callbacks() -> Bool:
+	key: CoreType = UnionType("Choice", ScalarTagValue)
+	result = minted([hash_impl(key), equals_impl(key)])
+
+	match bound_hash_container_constructor(
+		build_specialize_layout(result.program),
+		adapter_table(result.program),
+		key,
+	):
+		CustomHashContainerConstructor(hash_def, equals_def, needs_release):
+			(
+				hash_def == FIRST_FREE_DEF_ID
+				and equals_def == FIRST_FREE_DEF_ID + 1
+				and not needs_release
+				and result.next_def_id == FIRST_FREE_DEF_ID + 2
+			)
+		_:
+			False
+
+
+pure func test_scalar_hash_only_mints_one_native_equality_callback() -> Bool:
+	key: CoreType = UnionType("Choice", ScalarTagValue)
+	result = minted([hash_impl(key)])
+	callbacks = build_runtime_callback_table(result.program)
+	var native_count: Int = 0
+	var native_body: Bool = False
+
+	for decl in result.program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				match core_function_declared_origin(function_info.origin):
+					NativeTagEqualityCallback(typ):
+						native_count += 1
+
+						body_matches: Bool = match function_info.body:
+							Some(BinaryExpr(EqualOp, _, _, _, _)):
+								True
+							_:
+								False
+
+						native_body = (
+							typ == key
+							and function_info.def_id == FIRST_FREE_DEF_ID
+							and function_info.params.map(func(p): p.typ) == [key, key]
+							and body_matches
+						)
+					_:
+						void
+			_:
+				void
+
+	bound: Bool = match bound_hash_container_constructor(
+		build_specialize_layout(result.program),
+		adapter_table(result.program),
+		key,
+	):
+		CustomHashContainerConstructor(_, _, needs_release):
+			not needs_release
+		_:
+			False
+
+	(
+		native_count == 1
+		and native_body
+		and bound
+		and result.next_def_id == FIRST_FREE_DEF_ID + 3
+		and find_runtime_callback(
+			callbacks,
+			EquatableEqualsCallback,
+			key,
+		) == Some(FIRST_FREE_DEF_ID)
+	)
+
+
+pure func test_preprojection_impl_uses_same_scalar_callback_policy() -> Bool:
+	key: CoreType = UnionType("Choice", ScalarTagValue)
+	method = { function_info(
+		"hash",
+		HASH_IMPL_DEF_ID,
+		[param("self", key)],
+		INT_TYPE,
+		int_literal(0),
+	) |
+		origin = Declared(
+			ImplMethod(
+				synthesized_name_id("_"),
+				synthesized_name_id("_"),
+				RuntimeCallbackMethod(HashableHashCallback),
+			),
+		)
+	}
+	program = program_with([ImplDecl({
+			trait_name = "Hashable",
+			for_type = key,
+			type_params = [],
+			methods = [method],
+			loc = synthetic_core_source_loc(),
+		})])
+	context = core_synth_context(core_empty_declaration_index(), program)
+
+	projection_preserves_identity: Bool = match project_runtime_program(program):
+		Ok(projected):
+			no_impl_declarations: Bool = projected.decls.all(func(decl):
+				match decl:
+					ImplDecl(_):
+						False
+					_:
+						True
+			)
+			(
+				build_runtime_callback_table(
+					program,
+				).hashable_hash == build_runtime_callback_table(projected).hashable_hash
+				and duplicate_runtime_callbacks(projected).is_empty()
+				and no_impl_declarations
+			)
+		Err(_):
+			False
+
+	match classify_hash_collection_type(context, key):
+		ExactHashTypeLayout(facts):
+			(
+				projection_preserves_identity
+				and facts.probe_mode == DispatchedHashProbe
+				and hash_key_strategy(build_specialize_layout(program), key) == TraitHashKeys
+			)
+		_:
+			False
 
 
 ---
@@ -238,12 +439,23 @@ pure func opaque_int_impl(
 	params: List[CoreParam],
 	return_type: CoreType,
 ) -> CoreDecl:
-	impl_method(def_id, NamedType("UserId", []), role, params, return_type)
+	impl_method(
+		def_id,
+		NamedType("UserId", []),
+		role,
+		params,
+		return_type,
+	)
 
 
 pure func opaque_int_impls() -> List[CoreDecl]:
 	[
-		opaque_int_impl(HASH_IMPL_DEF_ID, HashableHashCallback, [param("self", INT_TYPE)], INT_TYPE),
+		opaque_int_impl(
+			HASH_IMPL_DEF_ID,
+			HashableHashCallback,
+			[param("self", INT_TYPE)],
+			INT_TYPE,
+		),
 		opaque_int_impl(
 			EQUALS_IMPL_DEF_ID,
 			EquatableEqualsCallback,
@@ -278,7 +490,11 @@ pure func test_binds_pinned_constructor_to_impl_adapters() -> Bool:
 	):
 		-- A word slot owns nothing, so the container releases no key.
 		CustomHashContainerConstructor(hash_fn, equals_fn, needs_release):
-			hash_fn == FIRST_FREE_DEF_ID and equals_fn == FIRST_FREE_DEF_ID + 1 and not needs_release
+			(
+				hash_fn == FIRST_FREE_DEF_ID
+				and equals_fn == FIRST_FREE_DEF_ID + 1
+				and not needs_release
+			)
 		_:
 			False
 
@@ -304,7 +520,12 @@ pure func test_leaves_pinned_constructor_without_adapters_unbound() -> Bool:
 
 
 pure func test_rejects_other_pinned_impl_ids() -> Bool:
-	not has_expected_pinned_impl_ids(ImplHashContainerConstructor(EQUALS_IMPL_DEF_ID, HASH_IMPL_DEF_ID))
+	not has_expected_pinned_impl_ids(
+		ImplHashContainerConstructor(
+			EQUALS_IMPL_DEF_ID,
+			HASH_IMPL_DEF_ID,
+		),
+	)
 
 
 pure func test_unboxes_heap_record_slot_as_pointer() -> Bool:
@@ -340,7 +561,11 @@ pure func test_binds_record_key_to_minted_adapters() -> Bool:
 pure func test_leaves_boxed_key_without_adapters_unbound() -> Bool:
 	program: CoreProgram = program_with([])
 
-	match bound_hash_container_constructor(build_specialize_layout(program), adapter_table(program), POINT_TYPE):
+	match bound_hash_container_constructor(
+		build_specialize_layout(program),
+		adapter_table(program),
+		POINT_TYPE,
+	):
 		TraitHashContainerConstructor(HeapRecordType("Point")):
 			True
 		_:
@@ -350,15 +575,19 @@ pure func test_leaves_boxed_key_without_adapters_unbound() -> Bool:
 pure func test_refuses_adapters_with_a_different_slot_layout() -> Bool:
 	-- Even with exact impl identity, a stale scalar stack-Option slot must
 	-- never bind a managed record pointer key.
-	result: HashKeyCallbackResult = minted([hash_impl(HeapRecordType("Point")), equals_impl(HeapRecordType("Point"))])
+	result: HashKeyCallbackResult = minted([
+		hash_impl(HeapRecordType("Point")),
+		equals_impl(HeapRecordType("Point")),
+	])
 
 	table: HashKeyAdapterTable = adapter_table(result.program)
-	mismatched: HashKeyAdapterTable = { table |
-		adapters = table.adapters.set(HASH_IMPL_DEF_ID, {
-			def_id = FIRST_FREE_DEF_ID,
-			slot = StructUnbox("blorp_StackOption_Int")
-		})
-	}
+	mismatched: HashKeyAdapterTable = { table | adapters = table.adapters.set(
+			HASH_IMPL_DEF_ID,
+			{
+				def_id = FIRST_FREE_DEF_ID,
+				slot = StructUnbox("blorp_StackOption_Int")
+			},
+		) }
 
 	match bound_hash_container_constructor(
 		build_specialize_layout(result.program),
@@ -437,7 +666,7 @@ private pure func native_equality_count(program: CoreProgram, key_type: CoreType
 
 
 func test_hash_only_scalar_mints_native_equality_once() -> Bool:
-	key_type = EnumType("TagKey")
+	key_type = UnionType("TagKey", ScalarTagValue)
 	result = minted([hash_impl(key_type)])
 	callbacks = build_runtime_callback_table(result.program)
 	second = mint_hash_key_callbacks(result.program, result.next_def_id)
@@ -458,11 +687,28 @@ tests: TestSuite = {
 		("mints nothing without hash impls", test_mints_nothing_without_hash_impls),
 		("needs both impls to mint", test_needs_both_impls_to_mint),
 		("mints nothing for runtime-hashed keys", test_mints_nothing_for_runtime_hashed_keys),
+		("scalar defaults retain word fastpath", test_scalar_defaults_keep_word_fastpath),
+		("native equality callback excludes primitives and managed unions", test_native_equality_callback_excludes_primitives_and_managed_unions),
+		(
+			"scalar authored pair binds word slot callbacks",
+			test_scalar_authored_pair_binds_word_slot_callbacks,
+		),
+		(
+			"scalar hash-only mints one native equality callback",
+			test_scalar_hash_only_mints_one_native_equality_callback,
+		),
+		(
+			"preprojection impl shares scalar callback policy",
+			test_preprojection_impl_uses_same_scalar_callback_policy,
+		),
 		(
 			"mints word slot adapters for impls on erased opaque types",
 			test_mints_word_slot_adapters_for_impls_on_erased_opaque_types,
 		),
-		("binds pinned constructor to impl adapters", test_binds_pinned_constructor_to_impl_adapters),
+		(
+			"binds pinned constructor to impl adapters",
+			test_binds_pinned_constructor_to_impl_adapters,
+		),
 		(
 			"leaves pinned constructor without adapters unbound",
 			test_leaves_pinned_constructor_without_adapters_unbound,
@@ -470,8 +716,17 @@ tests: TestSuite = {
 		("rejects other pinned impl ids", test_rejects_other_pinned_impl_ids),
 		("unboxes heap record slot as pointer", test_unboxes_heap_record_slot_as_pointer),
 		("binds record key to minted adapters", test_binds_record_key_to_minted_adapters),
-		("leaves boxed key without adapters unbound", test_leaves_boxed_key_without_adapters_unbound),
-		("refuses adapters with a different slot layout", test_refuses_adapters_with_a_different_slot_layout),
-		("leaves pointer key without adapters unbound", test_leaves_pointer_key_without_adapters_unbound),
+		(
+			"leaves boxed key without adapters unbound",
+			test_leaves_boxed_key_without_adapters_unbound,
+		),
+		(
+			"refuses adapters with a different slot layout",
+			test_refuses_adapters_with_a_different_slot_layout,
+		),
+		(
+			"leaves pointer key without adapters unbound",
+			test_leaves_pointer_key_without_adapters_unbound,
+		),
 	]
 }

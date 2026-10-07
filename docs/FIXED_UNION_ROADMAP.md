@@ -1,20 +1,144 @@
 # Union Simplification and Checked Fixed Union Roadmap
 
-Status: **ORDINARY-UNION SYNONYM IMPLEMENTED; CHECKED GUARANTEE PENDING.**
-This integration implements `fixed union` as an alternative spelling of ordinary
-`union`; `enum` remains supported and unconverted. No checked payload or placement
-guarantee is enforced. Caller-selected generic trait evidence remains pending,
-and no new syntax-capable bootstrap is pinned: the pin remains
-`dev-d44472d3a5d0`. The synonym and checked guarantee are separate deliveries.
+Status: **P2c IMPLEMENTED / VALIDATION IN PROGRESS; CHECKED GUARANTEE PENDING.**
+Published source implements `fixed union` as an alternative spelling of ordinary
+`union`. The declaration migration is already reviewed and validated; the current
+P2c cut removes the remaining enum internals. No checked payload or placement
+guarantee is enforced. Non-generic payload-free unions have default tag equality;
+an authored equality implementation wins, and hashing requires explicit
+`Hashable`. Payload-bearing/generic default equality and broader caller-selected
+evidence closure remain planned. The synonym and checked guarantee are separate deliveries.
 Checked-record work is separate, not a prerequisite or a guarantee from this cut.
 
-**Current-main reconciliation:** the task branch is being finalized as a squash
-over main `4dc9a9aceea35279e4c706b74a0dc8a6b8a258c9` ("Preserve nested pattern
-guards"). That main change is retained. Historical compound-pattern failures
-below describe their saved base2ac/frozen-candidate epochs, not this reconciled
-source. Final integration validation must be recorded separately; no historical gate
-count, binary hash or freshness claim is relabeled as current-main evidence.
-This status does not claim publication or a bootstrap release.
+**Execution order superseded by user direction:** migrate all maintained
+declarations and live generated fixture source first, resolve actual test failures,
+review and commit that cut, then remove all enum internals. Common-trait closure,
+nominal-identity repairs and earlier capability/native prerequisite ordering below
+are deferred work, not gates for the mechanical declaration cut; their saved
+failure evidence remains valid and is not described as fixed. Keep `fixed union`
+as an ordinary synonym, with no no-boxing or checked placement promise.
+
+**Current integration in progress:** source base `535096f01` is being merged with
+`origin/main` at `7ab679600`, including the immutable `dev-dbc23276a2a6`
+bootstrap, isolated one-pass discovery tree projection, and inline fixed-record
+policy. Enum retirement and the closed native-managed ownership repair are being
+ported to those boundaries; production still uses the table adapter. New main
+features and explicit union hashing are preserved. The reviewed narrow identity
+census amendment passes3404 static rows; its added debt is not an identity or
+performance win. The third normal-pin O2 build passes and is FRESH under
+`dev-dbc23276a2a6`; focused gates, sanitizer, parity, fixpoint, cost and overall
+acceptance remain pending. The earlier Linux sanitizer failure is not waived. See the
+[current integration checkpoint](../benchmarks/results/union_enum_retirement/current_main_integration.md). `fixed union`
+remains a temporary synonym, not a checked placement or no-boxing guarantee.
+
+**Historical main integration:** `origin/main` at `aa602e4ce051` is merged in
+`c80069ae0c98`; the recovered enum-retirement WIP remains uncommitted. Maintained
+tests now use `test_*` parent/suite paths, with explicit raw-fixture/support
+exceptions. Pure path audit passes; restored-WIP build passes and is FRESH only
+under the retained `ebbd309a` bridge (CLI O0/runtime O2), after removing one stale
+`EnumKeyword` alternative. Default pin `d2959d886320` still fails build-tool C
+compilation; cached tools do not prove default-pin closure. Seven focused renamed
+owners now pass 585/585 after warmup exit0, with unchanged bridge/compiler inputs.
+The authorized closed native-managed ownership repair now builds FRESH under
+that bridge: the unchanged strict IP echo passes with 48 allocations/48 releases,
+zero leaked objects/bytes (baseline 48/46/two objects/84 bytes). The TCP suite
+passes 18/18, including actual IP echo. Earlier broad gates/fixpoint below are historical, not post-merge
+acceptance; current broad gates/fixpoint/LSP, default-pin capability closure,
+ABI, match-access, cost and fixed guarantees remain open. No ready-to-merge or
+publication claim is made. See the [integration evidence](../benchmarks/results/union_enum_retirement/checkpoint.md#current-native-managed-ownership-repair).
+
+**Historical P2c working checkpoint:** branch `codex/union-enum-retirement`, source base
+`07c1ee302`, implements one semantic union kind and one Core union declaration,
+with explicit scalar-tag versus managed storage. The pre-loss `9f0170` compiler
+was FRESH under the explicit retained-stage2/O2 override: all 267 disjoint owners
+passed 5859 assertions, all 840 check fixtures passed, and strict runtime 38/38
+plus the unchanged Bool probe passed. Earlier source-owner and RED/timeout
+epochs remain separate. The normal combined retry also passed its native
+5859/5859, then ended with an infrastructure FAIL when checkout removal prevented
+206 fixture commands from starting; it was not a semantic failure or gate PASS.
+Recovery verified source equality and rebuilt caches separately. The clean
+recovered normal compiler gate then passed 6699/6699 (5859 native assertions
+and 840 fixtures), with identical compiler/C hashes and final override FRESH.
+Separate frontend closure now passes compiler-new 839, parity 3563 (zero
+mismatched files), tools 241 and Std 1; earlier seed-pin and indexed-deletion
+failures remain separate. The actual O2 self-host fixpoint also passes: full
+stage1/2 and stage2/3 generated C comparisons agree. New-stage2 audit 229/0 and
+seven runtime owners 38/0 pass; canonical native owners fail 31/1 only on IP echo
+ownership (two unknown objects/84 bytes). The retained prior compiler reproduces
+the same failure with current owner/Std; this is not a fresh parent-07 comparison
+or waiver. Hygiene passes after one retired-import permission was removed.
+Broader gates pass runtime 4701, leak 1174, doctest 1057 and CLI 177, then stop
+at LSP FAIL 1/1/2 (native suite 18 tests/one diagnostics timeout); a full retry
+also fails 1/1/2. Separate isolated-test 1/1 and instrumented-prefix 4/4 passes
+are diagnostic, not LSP closure or cause proof. Independently authorized package
+49/49 and Core sanitizer 2431/2431 now pass; neither waives LSP or IP ownership.
+Full acceptance/cost remain open. The
+internal `TypeKind` layout payload is boxed and its temporary cost unmeasured.
+No checked-fixed, default-pin or publication guarantee follows. See the
+[provisional P2c evidence](../benchmarks/results/union_enum_retirement/checkpoint.md).
+An inherited DirectoryEntry native-pointee field-width mismatch remains a
+separate P3 hardening task; native behavior tests do not prove its ABI layout.
+
+**Validated declaration-cut checkpoint:** validation source base `cbffad8a3` includes the merge of
+recorded `origin/main` at `3f80e94e0`; the declaration cut is reviewed and validated.
+Final host `2f44843a7` is FRESH only with the frozen
+bridge/O2 override; default-pin closure is unverified. Independent final-host
+compiler 6672, runtime 4701, leak 1174, sanitizer 2413, product/CLI/LSP/package
+gates, codegen audit 229, O2 fixpoint and retained stage2 runtime 29/audit 229 pass.
+The separate reviewed numeric-only census closure passes hygiene and Python 32;
+the earlier hygiene RED remains frozen. Earlier frontend/parity and repair proofs
+retain their own epochs, not relabeled final-host runs. Default tag Eq/Hash is
+preserved; potentially matching custom Eq requires explicit Hash. The bounded
+late-loop traversal repair does not fix general heterogeneous OR-pattern field
+identity, which remains deferred. Enum-family deletion, checked fixed/no-box
+guarantees and broader caller-selected trait closure remain pending. See the
+[final validation](../benchmarks/results/fixed_union_declaration_migration/final-validation.md)
+for counts, hashes, retained failures and scope. Immutable
+bootstrap pin rotation is not requested. The prior `dd23675b7` checkpoint records accepted static producer
+foundation `93dbe8f8f`, published-main merge `3c3383357`, and lexical callable-bound
+slots (author `dfadf1a`). Its FRESH root O2 proof belongs to `3c3383357`;
+that historical binary is not the migrated-root host.
+The isolated source-only recursive/supertrait producer passes 25 owner cases and
+626 distinct selected cases, including an admitted diamond regression; it remains
+unintegrated and implements no inference/Core/CTFE transport, builtin capabilities
+or executable templates. Diamond products prefer an exact own override, merge
+equal full parent targets, and report actionable conflicts for different targets;
+current language admission is unchanged until transport is wired.
+Separate resource guards and constructor-identity repairs have independent green
+bounded gates; constructor fixpoint and retained stage-2 correctness gates pass.
+Matched resource guard costs are accepted within two O0 diagnostic-worker
+workloads, with output identity and small added allocation costs; constructor
+remap-product costs remain unmeasured. The TCP opaque String pilot has observed
+zero-residual ownership controls, independently verified across 364 distinct
+cases and the unchanged IPv4 probe. Direct fixture expectations pass 11/12;
+qualified default foreign parameters still produce three copy-guard errors.
+The separate foreign-copy candidate is rejected as-is despite its FRESH own host,
+212 focused passing cases and three clean negative pins. V10 lower inspection
+finds imported TextBuffer's primitive String target rebound through the consumer's
+root String=Bytes alias, selecting the wrong Bytes copy policy. The fourth probe,
+full C and native runtime are unrun. Independent source-derived diagnosis finds primitive and
+issued nominal type references erased to the same named String representation;
+complete repair must preserve that distinction through relevant typed/Core
+consumers and exceeds the three-owner boundary. No broader repair is implemented
+or approved; temporary fail-closed shadow admission would narrow supported
+language behavior and requires a deliberate policy decision.
+The frozen native candidate has broad green evidence alongside unresolved
+resource/TCP failures, with stage2/fixpoint/admission
+pending. These repairs do not complete P2. The evidence transport seam has one
+serial owner.
+The [progress checkpoint](../benchmarks/results/union_progress_checkpoint.md#current-execution-checkpoint)
+owns current revisions, counts, provenance and remaining gates. The
+[caller design/evidence](../benchmarks/results/union_caller_evidence/DESIGN.md)
+retains the preparatory, foundation and lexical frozen proofs. Canonical native
+admission/shared representation, broader common-trait/default closure and bootstrap
+publication remain open. Declaration migration is reviewed and validated;
+P2c enum-family deletion and P3–P5 remain pending. No release, pin rotation or publication is authorized by this checkpoint.
+
+**Historical reconciliation:** the synonym integration was assembled over
+`4dc9a9aceea35279e4c706b74a0dc8a6b8a258c9` ("Preserve nested pattern guards").
+Historical compound-pattern failures below describe their saved
+base2ac/frozen-candidate epochs. No historical gate count, binary hash or
+freshness claim is relabeled as current-source evidence.
 
 **Historical checkpoints:** the syntax cut was reviewed, validated and committed
 as `073b78ae6` against `133eaf73a63830522b659ab6a2da65f9f2963711` before
@@ -71,8 +195,8 @@ Historical task-branch progress (full P0 closure and the P1 bootstrap gate remai
 | --- | --- |
 | P0 contract census and baseline | Before implementation; reviewed readiness packet |
 | P1 syntax/tooling, then bootstrap | Agree source-form contract first; parser and formatter/editor work may proceed in separate files |
-| P2 common traits and native ABI, then capability bootstrap | Both before conversion; separate trait/ABI preparation may proceed in parallel |
-| P2 declarations, then family deletion | Integrate Core/ownership changes as atomic vertical slices; no P4 performance expansion |
+| P2 declarations first | Migrate all maintained declarations and fixture source; resolve actual failures, validate, review and commit using the authorized local staging host |
+| P2 family deletion second | After the validated declaration commit, remove enum internals; common-trait/native design work remains deferred, with no P4 performance expansion |
 | P3 proof and cleanup | After semantic convergence; real runtime/self-host evidence |
 | P4 representation admissions | P3 baseline; one bounded layout/storage cut at a time |
 | P5 checked constraint | P4 position proofs and audit of all interim fixed uses |
@@ -231,7 +355,9 @@ appears, release assets are incomplete, or the build still uses an incapable pin
 
 ## P2. Migrate enums and delete the separate logical family
 
-**Dependency:** P1 and the capability-bootstrap checkpoint below.
+**Current dependency:** P1 syntax. User direction now places P2b declaration
+migration and its actual validation/commit before P2c internals removal;
+the earlier P2a/capability ordering below is deferred rather than completed.
 **Boundary:** compiler/std/pkg/examples, embedded fixtures/tests/docs, headers/env,
 Core/lowering/CTFE. Bounded owner migrations precede source-family removal.
 
@@ -314,6 +440,10 @@ completion of this full contract. No checked `fixed` placement or no-allocation
 guarantee follows from either delivery.
 
 ### P2a. Prepare common semantics and native ABI before conversion
+
+**Superseded ordering:** this section retains the deferred design and its
+historical blockers. User direction now authorizes declaration migration before
+this closure; it does not claim the blockers fixed or authorize a broader redesign.
 
 Derive payload-free shape from accepted variants, never the `fixed` qualifier.
 Common rules preserve automatic `Equatable`/`Hashable`, comparison/hashing, string
@@ -417,7 +547,9 @@ must prevent namesake substitution, private-implementation leakage, and fallback
 to a bound-inapplicable implementation. Monomorphization keys distinguish
 genuinely different witnesses and reuse equivalent selections.
 
-Implementation remains pending: this specifies semantics, not runtime
+Recursive selection and transport remain pending; the accepted static foundation
+and lexical slots are recorded in the current execution checkpoint above.
+This specifies semantics, not runtime
 dictionaries, heap allocation, a cache schema, or completed coverage. Use one
 shared mechanism for all traits, with Stringable and user-defined Selector
 controls alongside Eq/Hash; there must be no Eq-specific witness pipeline. Eq is
@@ -431,13 +563,13 @@ generated callbacks rather than treating the policy decision as implementation.
 **Bounded implementation sequence:**
 
 1. Preserve existing selected Core targets by exact ID. This prerequisite is
-   accepted for local integration; see the
+   published within `d9c737a86`; see the
    [selected-target evidence](../benchmarks/results/fixed_union_selected_targets/EVIDENCE.md).
    Independent validation of the frozen 31-file snapshot is complete; this
    prerequisite and its disclosed temporary costs are accepted for local
    integration. These historical results do not assert freshness after later
-   integration. No main publication, push, release or bootstrap change is
-   claimed. Lowering
+   integration. At that checkpoint, no main publication, push, release or
+   bootstrap change was claimed. Lowering
    validates issued callable identity and owner. Core maps the selected ID to the
    actual method/enclosing implementation: canonical `SelectedTraitCall.module`
    is not the method's display `source_module`, so no module-name normalization
@@ -493,9 +625,10 @@ owners 180 and three exact-target leak-checked probes pass, and all three O2
 fixpoint C emissions are identical. The evidence pins source/binary snapshots,
 commands, raw logs and the broader compound-pattern failure demonstrated in
 saved base2ac and frozen candidate snapshots, not a general ownership or
-pattern-codegen repair. Later main/origin `4dc9a9ace` ("Preserve nested pattern
-guards") advanced in another task and has not been integrated or re-tested
-here; those failure findings do not describe later main.
+pattern-codegen repair. At that historical checkpoint, later main/origin
+`4dc9a9ace` ("Preserve nested pattern guards") had advanced in another task and
+was not integrated or re-tested in the saved snapshot; those failure findings
+do not describe later main.
 Receiver projection policy is inherited;
 additional policy coverage remains unproven, not a demonstrated new regression.
 Matched isolated costs are traits −5 allocations/iteration, mono +39 (+30%)
@@ -505,6 +638,13 @@ minimum whole-process instructions; this is not allocation or stage2 speed
 evidence. Temporary costs are accepted for correctness under this roadmap,
 not a performance win. Caller evidence, private visibility, CTFE coherence,
 automatic common Eq/Hash, native ABI and bootstrap gates remain open.
+
+**Historical caller-evidence baseline:** the diagnostic packet at `dde591ecd`
+retains 5 passing and 5 failing cases spanning caller-private evidence,
+List/Option forwarding, and CTFE/runtime divergence; non-Eq controls pass.
+This remains frozen failure evidence, not a retest of current source. See the
+[current execution checkpoint](../benchmarks/results/union_progress_checkpoint.md#current-execution-checkpoint)
+for accepted static prerequisites and the remaining recursive/transport gates.
 
 **Planned default/tag oracle (not yet observed):** compare a CTFE-materialized
 payload-free union global with a runtime-produced value of the same constructor.
@@ -708,6 +848,15 @@ and unmodified O2 raw-C fixpoint passes. These counts overlap, not additive.
 This is bounded native preparation, not all-native-ABI or P2a completion,
 enum conversion, a latency claim, or bootstrap publication/pin authority.
 
+**Accepted local user-adapter prerequisite:** `66944f3e9` changes native fixture
+crossings to explicit Int encode/decode adapters while preserving long widths,
+external tags, and unknown-tag rejection. Independent review found zero blockers
+or should-fixes; the foreign check, O0/O2 layout oracle, two leak-checked runtime
+branches, warning sweep and full 229-case codegen audit pass. The
+[native evidence](../benchmarks/results/union_native_preparation.md) retains the
+historical build/fixture epoch and independent artifacts. This closes only the
+fixture preparation, not canonical native authority, admission or P2a.
+
 Fast feedback after a serialized FRESH build uses the owning suites:
 
 ```bash
@@ -737,8 +886,10 @@ or a validated canonical shared policy, an ABI is
 guessed, unknown tags gain a fallback, or preparation grows into an unreviewed
 shared-layout rewrite. Traits and native admission must remain separate.
 
-Publish/verify/pin the capability bootstrap while compiler/std still use `enum`,
-before P2b. P1's release serves both checkpoints only with this preparation;
+The earlier plan to publish/verify/pin a capability bootstrap before P2b is
+superseded for this cut by the authorized tested local staging-host override.
+Immutable pin rotation remains separately authorized deferred work. The earlier
+capability contract remains: P1's release serves both checkpoints only with this preparation;
 syntax alone or a local override is insufficient. The actual pin must compile
 migration-shaped fixtures for `==`/`!=`, generic Equatable/Hashable, Dict/Set,
 Bool tags, counter selectors/oracles, and native recursive directory-entry fields,
@@ -761,12 +912,22 @@ fixed union Direction:
 
 Convert declarations mechanically, preserving nominal/constructor identity,
 visibility/import aliases, and all values. Migrate docs and source strings, including
-parser-fixture `PLAIN_CODES_HEADER = "enum PlainSyntaxCode:\n"` scanner and its
+parser-fixture `PLAIN_CODES_HEADER = "fixed union PlainSyntaxCode:\n"` scanner and its
 header together. Update diagnostics and expected output by intended behavior.
 Classify native C/Python enums, `enumerate`, literature/identifiers, and negative
 removed-syntax fixtures before replacement.
 
 ### P2c. Retire the source form and separate logical family
+
+**Implementation checkpoint, not acceptance:** semantic `TypeKind.TypeUnion(UnionLayout)`
+publishes `ScalarTagUnion` or `TaggedUnion`. Core uses
+`UnionType(name, ScalarTagValue | ManagedUnionValue)` and one `CoreUnionDecl` with
+`ScalarTagStorage` or `ManagedPayloadStorage(payload_storage)`; all variants share
+actual names/tags/DefIDs and fields (empty for scalar storage). Scalar publication
+requires no type parameters or payload fields. Ordinary/fixed source form remains
+tooling metadata, not a layout choice or checked no-boxing promise. Retained
+prior-host source-owner proofs and pending gates are recorded in the provisional
+evidence linked above; P2c is not yet accepted.
 
 Remove `EnumKeyword` from both lexers: `enum` becomes an ordinary identifier,
 with positive binding/parameter/field/function-name tests and helpful diagnostics
@@ -819,6 +980,28 @@ pass lines; source censuses supplement runtime gates.
 P3c independently reviews obsolete wrappers, duplicate authorities, dead imports/
 variants, compatibility codecs, and stale docs. Cleanup inventory needs owner
 review; sizeable cleanup is separate. Apply this checkpoint after each phase.
+
+**Pending bounded match-access hardening:** common `UnionTagConstructorTest`
+decodes its `ScalarTagAccess`/`ManagedTagAccess` separately from the scrutinee.
+Current declaration/value storage checks do not also validate that match-access
+fact. Valid producers currently choose correctly; the audit found no observed
+source regression. Validate access against the actual resolved subject/accessor
+type and issued parent identity at the appropriate whole-Core boundary, with
+both scalar/managed mismatches rejected and canonical Option/Bool controls
+unchanged. The local decoder lacks subject context; do not substitute name
+heuristics. Owning seams are `decode_core_constructor_match_test_json` in
+`stage_09_core/ir.brp`, `union_storage_violations` in `late_invariants.brp`, and
+`emit_constructor_match_test` in `stage_10_backend/emit.brp`. This follow-up is
+pending, not an implemented P2c guarantee.
+
+**Implemented bounded builtin-ownership repair:** the closed native-managed
+IpAddress/DnsName/InterfaceScope category preserves issued accepted authority
+through typed graph/Core publication and checked canonical-key projection;
+shared leaf ARC/native-pointer policies consume the Core witness. The unchanged
+strict IP probe passes 48 allocations/48 releases/zero leaked objects or bytes,
+and TCP passes 18/18. No managed-name whitelist, String alias or trait/FFI policy
+expansion was added. Broader P2c/P3 acceptance, current fixpoint, bootstrap
+capability closure and migration costs remain pending.
 
 **Accept:** independent reports, behavior/native/ownership gates, warning review,
 fixpoint, and migration costs retained. Reported temporary performance regressions

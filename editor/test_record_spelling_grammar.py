@@ -28,6 +28,16 @@ def rules(value):
 
 
 class RecordSpellingGrammarTest(unittest.TestCase):
+    def test_enum_is_not_a_reserved_word_rule(self):
+        for path in GRAMMARS:
+            for rule in rules(json.loads(path.read_text())):
+                self.assertNotRegex(rule.get("match", ""), r"(?<![A-Za-z_])enum(?![A-Za-z_])")
+                for capture in rule.get("captures", {}).values():
+                    self.assertNotIn(".enum.", capture.get("name", ""))
+        for path in CONFIGURATIONS:
+            pattern = json.loads(path.read_text())["indentationRules"]["increaseIndentPattern"]
+            self.assertIsNone(re.search(pattern, "enum Color:"))
+
     def test_fixed_union_headers_increase_indentation(self):
         for path in CONFIGURATIONS:
             pattern = json.loads(path.read_text())["indentationRules"]["increaseIndentPattern"]

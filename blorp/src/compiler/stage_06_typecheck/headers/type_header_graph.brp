@@ -38,7 +38,6 @@ import:
 		NameId,
 		name_ids_equal,
 	../../stage_03_parse/parsed_ast:
-		UnionDeclarationForm(LegacyEnum),
 		RecordDeclarationForm(OrdinaryRecord, FixedRecord),
 		ParsedBuiltinTypeDecl,
 		ParsedDimBinaryOp(
@@ -108,15 +107,17 @@ import:
 		module_view_find_standalone_module_alias,
 	../type_system/language_surface_manifest:
 		BuiltinValueStorage(BuiltinInlineScalar, BuiltinManagedReference, BuiltinNoValue),
+		NativeManagedBuiltin,
 		PreludeType,
 		builtin_value_storage,
+		native_managed_builtin,
 		prelude_type,
 		prelude_type_arity,
 		prelude_type_has_inline_value_storage,
 		prelude_type_is_resource,
 		prelude_type_module_path,
 	../type_system/trait_identity: TraitId, trait_ids_equal
-	../type_system/union_layout: UnionLayout(FieldlessEnum, TaggedUnion)
+	../type_system/union_layout: UnionLayout(ScalarTagUnion, TaggedUnion)
 	declaration_skeleton:
 		CallableId,
 		ConstructorId,
@@ -159,7 +160,7 @@ import:
 		type_parameter_ids_equal,
 
 
-enum IntrinsicType:
+fixed union IntrinsicType:
 	IntrinsicInt
 	IntrinsicFloat
 	IntrinsicBool
@@ -190,7 +191,7 @@ enum IntrinsicType:
 	IntrinsicChannel
 
 
-enum ResolvedDimOp:
+fixed union ResolvedDimOp:
 	ResolvedDimAdd
 	ResolvedDimSubtract
 	ResolvedDimMultiply
@@ -283,7 +284,7 @@ union TypeShapeResolutionError:
 	TypeShapeSelfNotAllowed(TypeResolutionOwner, SourceLocation)
 
 
-enum AliasLayout:
+fixed union AliasLayout:
 	TransparentAlias
 	OpaqueAlias
 
@@ -302,6 +303,7 @@ language_surface_manifest and carry that identity explicitly through Core.
 union BuiltinTypeLayout:
 	ScalarBuiltin
 	ManagedBuiltin
+	NativeManagedBuiltinLayout(NativeManagedBuiltin)
 	NoValueBuiltin
 	UnclassifiedBuiltin
 	ResourceBuiltin(ResourceCleanupPolicy)
@@ -424,7 +426,7 @@ private record AcceptedAliasHeaderRep {
 opaque type AcceptedAliasHeader = AcceptedAliasHeaderRep
 
 
-private enum HeaderVisibilitySelection:
+private fixed union HeaderVisibilitySelection:
 	AllModuleHeaders
 	PublicModuleHeaders
 
@@ -486,7 +488,6 @@ union TypeHeaderError:
 	TypeHeaderResolutionError(TypeShapeResolutionError)
 	TypeHeaderConstructorMissing(TypeId, String)
 	TypeHeaderFieldDefinitionMissing(TypeId, String, SourceLocation)
-	TypeHeaderInvalidEnumTypeParameters(TypeId)
 	TypeHeaderRecursiveValueLayout(TypeId, Bool)
 
 
@@ -1913,33 +1914,26 @@ private pure func build_union_header(
 	parameters: List[ResolvedTypeParameter],
 	decl: ParsedUnionDecl,
 ) -> TypeHeaderBuildResult:
-	var errors: List[TypeHeaderError] = []
-
-	if decl.form == LegacyEnum and not parameters.is_empty():
-		errors = errors.append(TypeHeaderInvalidEnumTypeParameters(context.owner))
-
 	match resolve_variants(context, decl.variants):
 		Err(variant_errors):
-			TypeHeaderRejected(errors.concat(variant_errors))
+			TypeHeaderRejected(variant_errors)
 		Ok(variants):
-			if errors.is_empty():
-				layout = if decl.form == LegacyEnum:
-					FieldlessEnum
-				else:
-					TaggedUnion
-
-				TypeHeaderReady({
-					id = context.owner,
-					owner_module_id = prepared_module_scope_id(
-						bound_module_scope(context.resolution.module),
-					),
-					source_name = context.owner_name,
-					parameters = parameters,
-					shape = UnionTypeHeader(layout, variants),
-					containment = EMPTY_TYPE_CONTAINMENT_FACTS,
-				})
+			-- Scalar storage is a shared accepted shape, not a source spelling.
+			layout = if parameters.is_empty() and variants.all(func(variant): variant.fields.is_empty()):
+				ScalarTagUnion
 			else:
-				TypeHeaderRejected(errors)
+				TaggedUnion
+
+			TypeHeaderReady({
+				id = context.owner,
+				owner_module_id = prepared_module_scope_id(
+					bound_module_scope(context.resolution.module),
+				),
+				source_name = context.owner_name,
+				parameters = parameters,
+				shape = UnionTypeHeader(layout, variants),
+				containment = EMPTY_TYPE_CONTAINMENT_FACTS,
+			})
 
 
 private pure func build_builtin_header(
@@ -1947,21 +1941,27 @@ private pure func build_builtin_header(
 	parameters: List[ResolvedTypeParameter],
 	decl: ParsedBuiltinTypeDecl,
 ) -> TypeHeaderBuildResult:
+	native_kind = match prepared_module_scope_origin(bound_module_scope(context.resolution.module)):
+		StdlibModule:
+			native_managed_builtin(
+				bound_module_canonical_path(context.resolution.module),
+				context.owner_name,
+			)
+		_: None
 	layout: BuiltinTypeLayout = if decl.is_resource:
 		ResourceBuiltin(resource_cleanup_policy(decl.cleanup))
 	else:
-		match builtin_value_storage(
-			bound_module_program(context.resolution.module).source.module_name,
-			context.owner_name,
-		):
-			Some(BuiltinInlineScalar):
-				ScalarBuiltin
-			Some(BuiltinManagedReference):
-				ManagedBuiltin
-			Some(BuiltinNoValue):
-				NoValueBuiltin
+		match native_kind:
+			Some(kind): NativeManagedBuiltinLayout(kind)
 			None:
-				UnclassifiedBuiltin
+				match builtin_value_storage(
+					bound_module_program(context.resolution.module).source.module_name,
+					context.owner_name,
+				):
+					Some(BuiltinInlineScalar): ScalarBuiltin
+					Some(BuiltinManagedReference): ManagedBuiltin
+					Some(BuiltinNoValue): NoValueBuiltin
+					None: UnclassifiedBuiltin
 
 	TypeHeaderReady({
 		id = context.owner,
@@ -3521,11 +3521,6 @@ pure func type_header_error_message(
 				definition_table,
 				id,
 			).get_or("<unknown type>") + "'"
-		TypeHeaderInvalidEnumTypeParameters(id):
-			"Enum '" + type_id_name(
-				definition_table,
-				id,
-			).get_or("<unknown type>") + "' cannot have type parameters"
 		TypeHeaderRecursiveValueLayout(id, is_direct):
 			if is_direct:
 				"Type '" + type_id_name(
@@ -3548,7 +3543,7 @@ pure func type_header_error_span(
 	error: TypeHeaderError,
 ) -> Option[SourceLocation]:
 	match error:
-		TypeHeaderOwnerModuleMissing(id) | TypeHeaderDuplicateIdentity(id) | TypeHeaderParametersMissing(id) | TypeHeaderConstructorMissing(id, _) | TypeHeaderInvalidEnumTypeParameters(id) | TypeHeaderRecursiveValueLayout(id, _):
+		TypeHeaderOwnerModuleMissing(id) | TypeHeaderDuplicateIdentity(id) | TypeHeaderParametersMissing(id) | TypeHeaderConstructorMissing(id, _) | TypeHeaderRecursiveValueLayout(id, _):
 			type_id_source_span(definition_table, id)
 		TypeHeaderFieldDefinitionMissing(_, _, span):
 			Some(span)

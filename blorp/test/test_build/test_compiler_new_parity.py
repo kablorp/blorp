@@ -381,7 +381,7 @@ class CompilerNewParityTests(unittest.TestCase):
 		}
 		for kind in (
 			"import_block", "foreign_block", "record", "fixed_record",
-			"alias", "builtin_type", "resource_type", "union", "fixed_union", "enum",
+			"alias", "builtin_type", "resource_type", "union", "fixed_union",
 		):
 			counts[f"kind_{kind}"] = 1
 		for kind in ("function", "trait", "implementation", "constant_global", "mutable_global"):
@@ -591,7 +591,7 @@ class CompilerNewParityTests(unittest.TestCase):
 		updates = {"modules": 0, "compared": 0, "declarations": 0, "stop_end_of_source": 0}
 		for kind in (
 			"import_block", "foreign_block", "record", "fixed_record",
-			"alias", "builtin_type", "resource_type", "union", "fixed_union", "enum",
+			"alias", "builtin_type", "resource_type", "union", "fixed_union",
 		):
 			updates[f"kind_{kind}"] = 0
 		self.assertTrue(self.tree_prefix_problems(self.tree_prefix_output(updates=updates)))
@@ -599,12 +599,16 @@ class CompilerNewParityTests(unittest.TestCase):
 	def test_corpus_tree_prefix_requires_every_completed_declaration_kind(self) -> None:
 		for kind in (
 			"import_block", "foreign_block", "record", "fixed_record",
-			"alias", "builtin_type", "resource_type", "union", "fixed_union", "enum",
+			"alias", "builtin_type", "resource_type", "union", "fixed_union",
 		):
 			with self.subTest(kind=kind):
 				output = self.tree_prefix_output(updates={f"kind_{kind}": 0})
 				self.assertEqual(self.tree_prefix_problems(output), [])
 				self.assertIn(kind, "\n".join(self.tree_prefix_problems(output, require_completed_kinds=True)))
+
+	def test_tree_prefix_rejects_retired_enum_wire_kind(self) -> None:
+		output = self.tree_prefix_output(extra=("kind_enum=0",))
+		self.assertTrue(self.tree_prefix_problems(output))
 
 	def test_tree_prefix_rejects_missing_unknown_and_negative_kind_or_stop_counts(self) -> None:
 		for output in (

@@ -3,11 +3,11 @@
 -- The synthesized bodies expose probing, COW, ownership, and insertion-order
 -- mechanics to later Core passes. Arbitrary NamedType values are deliberately
 -- rejected: without declaration registry facts, a name alone cannot distinguish
--- an alias, enum, heap record, or union.
+-- an alias, union, heap record, or union.
 import:
-	runtime_callbacks: scalar_hash_uses_callbacks
 	erased_key_temps: ERASED_KEY_TEMP_RELEASE_INTRINSIC
 	ir:
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
 		CoreBinaryOp(
 			AddOp, DivideOp, EqualOp, GreaterEqualOp, GreaterOp, LessEqualOp, LessOp, MultiplyOp,
 			NotEqualOp,
@@ -19,11 +19,7 @@ import:
 		CoreParam,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
 		CoreSourceLoc,
-		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType,
-			RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType,
-			UnionType, VoidType,
-		),
+		CoreType(InlineRecordType, NativeManagedType, BoxedResultType, UnionType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType, VoidType),
 		CoreUnboxKind(
 			Float16Unbox, Float32Unbox, FloatUnbox, Int128Unbox, PointerUnbox, PrimUnbox,
 			StructUnbox, UInt128Unbox,
@@ -31,10 +27,11 @@ import:
 		CoreVar,
 		synthetic_core_source_loc,
 	mono: core_mono_type_equal
+	runtime_callbacks: scalar_hash_key_uses_callbacks
 	synth_context:
 		CoreSynthContext,
 		CoreSynthNamedTypeLayout(
-			SynthEnumLayout, SynthHeapRecordLayout, SynthInlineRecordLayout, SynthUnionLayout,
+			SynthInlineRecordLayout, SynthHeapRecordLayout, SynthUnionLayout,
 		),
 		core_synth_expand_alias,
 		core_synth_named_type_layout,
@@ -95,7 +92,7 @@ private NULL_POINTER: CoreExpr = LiteralExpr(
 )
 
 
-enum CoreHashProbeMode:
+fixed union CoreHashProbeMode:
 	ImmediateHashProbe
 	DispatchedHashProbe
 
@@ -189,12 +186,12 @@ inline word hash of its representation.
 private pure func scalar_callbacks_required(context: CoreSynthContext, typ: CoreType) -> Bool:
 	resolved = core_synth_expand_alias(context, typ)
 	match resolved:
-		EnumType(_):
-			scalar_hash_uses_callbacks(context.runtime_callbacks, resolved)
+		UnionType(_, ScalarTagValue):
+			scalar_hash_key_uses_callbacks(context.runtime_callbacks, resolved)
 		NamedType(name, []):
 			match core_synth_named_type_layout(context, name):
-				Some(SynthEnumLayout):
-					scalar_hash_uses_callbacks(context.runtime_callbacks, resolved)
+				Some(SynthUnionLayout(ScalarTagValue)):
+					scalar_hash_key_uses_callbacks(context.runtime_callbacks, resolved)
 				_: False
 		_: False
 
@@ -296,7 +293,7 @@ private pure func classify_representation_type(
 				})
 			else:
 				match core_synth_named_type_layout(context, name):
-					Some(SynthEnumLayout):
+					Some(SynthUnionLayout(ScalarTagValue)):
 						ExactHashTypeLayout({
 							probe_mode = ImmediateHashProbe,
 							hash_key_pointer_layout = BoxedHashPointer(PrimBox, PrimUnbox, False),
@@ -306,7 +303,7 @@ private pure func classify_representation_type(
 								False,
 							),
 						})
-					Some(SynthHeapRecordLayout) | Some(SynthUnionLayout):
+					Some(SynthHeapRecordLayout) | Some(SynthUnionLayout(ManagedUnionValue)):
 						ExactHashTypeLayout({
 							probe_mode = DispatchedHashProbe,
 							hash_key_pointer_layout = CastHashPointer(PointerUnbox),
@@ -316,7 +313,7 @@ private pure func classify_representation_type(
 						inline_record_hash_layout(name)
 					None:
 						RegistryHashTypeLayoutRequired(typ)
-		EnumType(_):
+		UnionType(_, ScalarTagValue):
 			ExactHashTypeLayout({
 				probe_mode = ImmediateHashProbe,
 				hash_key_pointer_layout = BoxedHashPointer(PrimBox, PrimUnbox, False),
@@ -324,7 +321,7 @@ private pure func classify_representation_type(
 			})
 		InlineRecordType(name):
 			inline_record_hash_layout(name)
-		HeapRecordType(_) | UnionType(_) | TensorType(_) | TupleType(_) | FunctionType(_, _, _):
+		NativeManagedType(_) | HeapRecordType(_) | UnionType(_, ManagedUnionValue) | TensorType(_) | TupleType(_) | FunctionType(_, _, _):
 			ExactHashTypeLayout({
 				probe_mode = DispatchedHashProbe,
 				hash_key_pointer_layout = CastHashPointer(PointerUnbox),
@@ -401,15 +398,15 @@ private pure func exact_release_policy(
 						Ok(cleanup_release_policy_for_type(typ))
 					else:
 						match core_synth_named_type_layout(context, name):
-							Some(SynthEnumLayout):
+							Some(SynthUnionLayout(ScalarTagValue)):
 								Ok(NoReleasePolicy)
-							Some(SynthHeapRecordLayout) | Some(SynthUnionLayout):
+							Some(SynthHeapRecordLayout) | Some(SynthUnionLayout(ManagedUnionValue)):
 								Ok(ArcReleasePolicy)
 							Some(SynthInlineRecordLayout):
 								Ok(NoReleasePolicy)
 							None:
 								Err(HashCollectionLayoutUnavailable(operation, typ, loc))
-				EnumType(_) | HeapRecordType(_) | InlineRecordType(_) | UnionType(_) | RangeType | TensorType(_) | TupleType(_) | BoxedResultType(_, _) | FunctionType(_, _, _):
+				NativeManagedType(_) | UnionType(_, _) | HeapRecordType(_) | RangeType | TensorType(_) | TupleType(_) | BoxedResultType(_, _) | FunctionType(_, _, _) | InlineRecordType(_):
 					Ok(cleanup_release_policy_for_type(typ))
 				TypeParameterType(_) | SelfType | StackResultType(_, _) | VoidType:
 					Err(HashCollectionLayoutUnavailable(operation, typ, loc))

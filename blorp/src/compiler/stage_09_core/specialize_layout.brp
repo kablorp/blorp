@@ -4,7 +4,6 @@
 -- materialized. Build the declaration index once and keep representation
 -- decisions here so builtin families do not infer layouts independently.
 import:
-	runtime_callbacks: CoreRuntimeCallbackTable, build_runtime_callback_table, scalar_hash_uses_callbacks
 	../stage_08_core_lower/list_layout:
 		CoreLayoutTypeIndex,
 		build_layout_type_index,
@@ -13,6 +12,7 @@ import:
 		resolve_layout_type_with_index,
 	c_type_layout: generated_stack_option_c_type_name
 	ir:
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
 		CoreBoxKind(
 			Float16Box, Float32Box, FloatBox, Int128Box, PointerBox, PrimBox, StructBox, UInt128Box,
 			VoidBox,
@@ -27,16 +27,16 @@ import:
 		CoreListStorageLayout,
 		CoreProgram,
 		CoreTensorTypeInfo,
-		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType,
-			RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType,
-			UnionType, VoidType,
-		),
+		CoreType(InlineRecordType, NativeManagedType, BoxedResultType, UnionType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType, VoidType),
 		CoreUnboxKind(
 			Float16Unbox, Float32Unbox, FloatUnbox, Int128Unbox, PointerUnbox, PrimUnbox,
 			StructUnbox, UInt128Unbox,
 		),
 		core_expr_type,
+	runtime_callbacks:
+		CoreRuntimeCallbackTable,
+		build_runtime_callback_table,
+		scalar_hash_key_uses_callbacks,
 	type_policy: ManagedTypeIndex, is_managed_type, is_stack_result_type, managed_type_index
 
 
@@ -55,7 +55,7 @@ union CoreOptionRuntimeLayout:
 	UnspecializedOptionLayout
 
 
-enum CoreStreamElementLayout:
+fixed union CoreStreamElementLayout:
 	StreamImmediateLayout
 	StreamOwnedArcLayout
 	StreamBorrowedArcLayout
@@ -193,7 +193,9 @@ pure func hash_key_strategy(
 	layout: CoreSpecializeLayout,
 	key_type: CoreType,
 ) -> CoreHashKeyStrategy:
-	match resolve_specialize_type(layout, key_type):
+	key: CoreType = resolve_specialize_type(layout, key_type)
+
+	match key:
 		NamedType(name, args):
 			if not args.is_empty():
 				TraitHashKeys
@@ -211,8 +213,8 @@ pure func hash_key_strategy(
 				WordHashKeys
 			else:
 				TraitHashKeys
-		EnumType(name):
-			if scalar_hash_uses_callbacks(layout.runtime_callbacks, EnumType(name)):
+		UnionType(_, ScalarTagValue):
+			if scalar_hash_key_uses_callbacks(layout.runtime_callbacks, key):
 				TraitHashKeys
 			else:
 				WordHashKeys
@@ -274,16 +276,13 @@ pure func option_payload_runtime_layout(
 					NullableManagedOptionLayout
 				else:
 					UnspecializedOptionLayout
-			EnumType(name):
-				if name == "Bool":
-					PrimitiveStackOptionLayout("bool")
-				else:
-					UnspecializedOptionLayout
 			InlineRecordType(_):
+				UnspecializedOptionLayout
+			UnionType(name, ScalarTagValue):
 				UnspecializedOptionLayout
 			RangeType:
 				UnspecializedOptionLayout
-			HeapRecordType(_) | UnionType(_) | TensorType(_) | TupleType(_) | FunctionType(_, _, _):
+			NativeManagedType(_) | HeapRecordType(_) | UnionType(_, ManagedUnionValue) | TensorType(_) | TupleType(_) | FunctionType(_, _, _):
 				NullableManagedOptionLayout
 			TypeParameterType(_) | SelfType:
 				BoxedOptionLayout
@@ -360,6 +359,8 @@ private pure func stack_option_box_c_type(
 	payload: CoreType,
 ) -> Option[String]:
 	match resolve_specialize_type(layout, payload):
+		NativeManagedType(_):
+			None
 		VoidType:
 			Some("blorp_StackOption_Void")
 		NamedType(name, args):
@@ -374,7 +375,7 @@ private pure func stack_option_box_c_type(
 				Some("blorp_StackOption_${name}")
 			else:
 				None
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			Some("blorp_StackOption_${name}")
 		InlineRecordType(name):
 			Some(generated_stack_option_c_type_name(name))
@@ -391,6 +392,8 @@ pure func boxed_storage_kind(layout: CoreSpecializeLayout, typ: CoreType) -> Cor
 		StructBox("blorp_StackResult")
 	else:
 		match resolved:
+			NativeManagedType(_):
+				PointerBox
 			VoidType:
 				VoidBox
 			NamedType("Float", []):
@@ -423,7 +426,7 @@ pure func boxed_storage_kind(layout: CoreSpecializeLayout, typ: CoreType) -> Cor
 									PointerBox
 						else:
 							PointerBox
-			EnumType(_):
+			UnionType(_, ScalarTagValue):
 				PrimBox
 			InlineRecordType(name):
 				-- The one named box for an inline record in an erased `void*`

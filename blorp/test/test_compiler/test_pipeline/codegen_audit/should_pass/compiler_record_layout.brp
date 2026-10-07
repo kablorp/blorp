@@ -38,9 +38,9 @@
 -- EXPECT-C:   long count;
 -- EXPECT-C-REGEX: [A-Za-z0-9_]+\* [A-Za-z0-9_]+_make\(long state, long count\)
 -- EXPECT-C: blorp_layout_bool_identity(__t9_
--- EXPECT-C: long __t9_
+-- EXPECT-C-REGEX: long [A-Za-z0-9_]+ = blorp_layout_wire_tag_identity\(
 -- EXPECT-C-REGEX: = brp_vn?_[A-Za-z0-9]+->f[0-9]+;
--- EXPECT-C: blorp_layout_enum_identity(__t9_
+-- EXPECT-C: blorp_layout_wire_tag_identity(
 -- EXPECT-C-REGEX: = brp_vn?_[A-Za-z0-9]+->f[0-9]+;
 import:
 	list as Lists
@@ -91,7 +91,7 @@ record LayoutHeapInterleavedFlags {
 }
 
 
-enum LayoutState:
+fixed union LayoutState:
 	LayoutStateReady
 	LayoutStateRunning
 	LayoutStateComplete
@@ -113,9 +113,32 @@ record LayoutForeignHeapFlags {
 
 
 record LayoutForeignHeapState {
-	state: LayoutState,
+	state: Int,
 	count: Int
 }
+
+
+pure func layout_state_wire_tag(state: LayoutState) -> Int:
+	-- Native state tags are Ready = 0, Running = 1, Complete = 2.
+	match state:
+		LayoutStateReady:
+			0
+		LayoutStateRunning:
+			1
+		LayoutStateComplete:
+			2
+
+
+pure func layout_state_from_wire_tag(tag: Int) -> Option[LayoutState]:
+	match tag:
+		0:
+			Some(LayoutStateReady)
+		1:
+			Some(LayoutStateRunning)
+		2:
+			Some(LayoutStateComplete)
+		_:
+			None
 
 
 record LayoutForeignMixed {
@@ -130,7 +153,7 @@ foreign(include: "compiler_record_layout_ffi.h"):
 	func layout_ordered_flag(expected: Int) -> Bool = "blorp_layout_ordered_flag"
 	func layout_ordered_count(expected: Int) -> Int = "blorp_layout_ordered_count"
 	pure func layout_bool_identity(value: Bool) -> Bool = "blorp_layout_bool_identity"
-	pure func layout_enum_identity(value: LayoutState) -> LayoutState = "blorp_layout_enum_identity"
+	pure func layout_wire_tag_identity(value: Int) -> Int = "blorp_layout_wire_tag_identity"
 	pure func layout_foreign_heap_flag(
 		value: LayoutForeignHeapFlags,
 	) -> Bool = "blorp_layout_foreign_heap_flag"
@@ -254,7 +277,13 @@ func main(args: List[String]) -> Int:
 		second = LayoutStateRunning,
 		third = LayoutStateComplete
 	}
-	foreign_heap_state_value: LayoutState = layout_enum_identity(heap_states.first)
+	ready_state_tag = layout_state_wire_tag(heap_states.first)
+	running_state_tag = layout_state_wire_tag(heap_states.second)
+	complete_state_tag = layout_state_wire_tag(heap_states.third)
+	foreign_heap_state_value = heap_states.first
+		.layout_state_wire_tag()
+		.layout_wire_tag_identity()
+		.layout_state_from_wire_tag()
 	updated_heap_states: LayoutHeapStates = { heap_states | second = LayoutStateComplete }
 	copied_heap_states: LayoutHeapStates = updated_heap_states
 	foreign_heap_flags: LayoutForeignHeapFlags = {
@@ -263,7 +292,7 @@ func main(args: List[String]) -> Int:
 		count = 42
 	}
 	foreign_heap_state: LayoutForeignHeapState = {
-		state = LayoutStateRunning,
+		state = running_state_tag,
 		count = 42
 	}
 	foreign_mixed: LayoutForeignMixed = {
@@ -276,7 +305,14 @@ func main(args: List[String]) -> Int:
 	if (
 		foreign_field_value
 		and foreign_heap_field_value
-		and foreign_heap_state_value == LayoutStateReady
+		and foreign_heap_state_value == Some(LayoutStateReady)
+		and ready_state_tag == 0
+		and running_state_tag == 1
+		and complete_state_tag == 2
+		and running_state_tag.layout_wire_tag_identity().layout_state_from_wire_tag() == Some(LayoutStateRunning)
+		and complete_state_tag.layout_wire_tag_identity().layout_state_from_wire_tag() == Some(LayoutStateComplete)
+		and (ready_state_tag - 1).layout_wire_tag_identity().layout_state_from_wire_tag() == None
+		and (complete_state_tag + 1).layout_wire_tag_identity().layout_state_from_wire_tag() == None
 		and ordered_flags.first
 		and ordered_flags.second
 		and ordered_flags.third

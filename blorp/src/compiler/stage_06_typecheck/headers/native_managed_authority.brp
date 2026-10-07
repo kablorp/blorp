@@ -1,0 +1,175 @@
+-- Accepted native identities survive the typed-program boundary as a required
+-- capability. This is the only frontend authority for the closed native leaf
+-- category; absent metadata is not interpreted as an ordinary nominal type.
+import:
+	../../stage_04_modules/module_table:
+		ModuleId, module_ids_equal, module_table_canonical_path
+	../graph/definition_index:
+		DefinitionTable, definition_table_module_table, definition_tables_share_provenance
+	../graph/type_identity:
+		TypeId, type_id_definition_id, type_id_module_id, type_id_name
+	../type_system/language_surface_manifest: NativeManagedBuiltin
+	../type_system/semantic_type: canonical_module_type_name
+	type_header_graph:
+		BuiltinTypeLayout(NativeManagedBuiltinLayout),
+		TypeHeaderGraph,
+		TypeHeaderShape(BuiltinTypeHeader),
+		type_header_graph_definition_table,
+		type_header_graph_headers,
+
+
+private record NativeManagedBuiltinFactRep {
+	id: TypeId,
+	module_id: ModuleId,
+	kind: NativeManagedBuiltin,
+	source_name: String,
+	semantic_name: String
+}
+
+
+opaque type NativeManagedBuiltinFact = NativeManagedBuiltinFactRep
+
+
+private record AcceptedNativeManagedAuthority {
+	definition_table: DefinitionTable,
+	module_id: ModuleId,
+	facts: List[NativeManagedBuiltinFact]
+}
+
+
+private union NativeManagedAuthorityRep:
+	AcceptedNativeManagedTypes(AcceptedNativeManagedAuthority)
+	AuthoredNoNativeManagedTypes
+	UnissuedNativeManagedTypes
+
+
+opaque type NativeManagedAuthority = NativeManagedAuthorityRep
+
+
+---
+Intermediate and rejected typed programs cannot authorize lowering. Accepted
+materialization replaces this marker with a complete header-backed capability.
+---
+pure func native_managed_authority_unissued() -> NativeManagedAuthority:
+	into_opaque NativeManagedAuthority(UnissuedNativeManagedTypes)
+
+
+---
+An explicit contract for hand-authored, graphless compiler fixtures containing
+no native-managed builtin uses. Production typechecking never calls this.
+---
+pure func native_managed_authority_no_native_fixture() -> NativeManagedAuthority:
+	into_opaque NativeManagedAuthority(AuthoredNoNativeManagedTypes)
+
+
+pure func native_managed_authority_from_headers(
+	graph: TypeHeaderGraph,
+	module_id: ModuleId,
+) -> Result[NativeManagedAuthority, String]:
+	table = type_header_graph_definition_table(graph)
+	modules = definition_table_module_table(table)
+	if module_table_canonical_path(modules, module_id).is_none():
+		Err("native managed authority has an unissued owning module")
+	else:
+		var facts: List[NativeManagedBuiltinFact] = []
+		var failure: Option[String] = None
+		for header in type_header_graph_headers(graph):
+			if failure.is_none():
+				match header.shape:
+					BuiltinTypeHeader(NativeManagedBuiltinLayout(kind)):
+						match (type_id_module_id(table, header.id), type_id_name(table, header.id)):
+							(Some(owner), Some(name)):
+								match module_table_canonical_path(modules, owner):
+									None:
+										failure = Some("native managed header has an unissued module")
+									Some(path):
+										key = canonical_module_type_name(path, name)
+										if not header.parameters.is_empty():
+											failure = Some("native managed builtin must be monomorphic: " + key)
+										else if (
+											name != header.source_name
+											or facts.any(func(fact): native_managed_fact_semantic_name(fact) == key)
+										):
+											failure = Some("native managed header identity is conflicting: " + key)
+										else:
+											fact: NativeManagedBuiltinFact = into_opaque NativeManagedBuiltinFact({
+												id = header.id,
+												module_id = owner,
+												kind = kind,
+												source_name = name,
+												semantic_name = key
+											})
+											facts = facts.append(fact)
+							_:
+								failure = Some("native managed header has no issued type identity")
+					_:
+						void
+		match failure:
+			Some(message): Err(message)
+			None:
+				Ok(into_opaque NativeManagedAuthority(AcceptedNativeManagedTypes({
+					definition_table = table,
+					module_id = module_id,
+					facts = facts
+				})))
+
+
+pure func native_managed_authority_facts(
+	authority: NativeManagedAuthority,
+) -> Result[List[NativeManagedBuiltinFact], String]:
+	match from_opaque NativeManagedAuthority(authority):
+		AcceptedNativeManagedTypes(accepted): Ok(accepted.facts)
+		AuthoredNoNativeManagedTypes: Ok([])
+		UnissuedNativeManagedTypes:
+			Err("typed program has no accepted native managed authority; typecheck it before lowering")
+
+
+pure func native_managed_authority_matches_table(
+	authority: NativeManagedAuthority,
+	table: DefinitionTable,
+) -> Bool:
+	match from_opaque NativeManagedAuthority(authority):
+		AcceptedNativeManagedTypes(accepted):
+			definition_tables_share_provenance(accepted.definition_table, table)
+		AuthoredNoNativeManagedTypes: True
+		UnissuedNativeManagedTypes: False
+
+
+pure func native_managed_authority_definition_table(
+	authority: NativeManagedAuthority,
+) -> Option[DefinitionTable]:
+	match from_opaque NativeManagedAuthority(authority):
+		AcceptedNativeManagedTypes(accepted): Some(accepted.definition_table)
+		_: None
+
+
+pure func native_managed_authority_module_id(authority: NativeManagedAuthority) -> Option[ModuleId]:
+	match from_opaque NativeManagedAuthority(authority):
+		AcceptedNativeManagedTypes(accepted): Some(accepted.module_id)
+		_: None
+
+
+pure func native_managed_authority_local_name(
+	authority: NativeManagedAuthority,
+	fact: NativeManagedBuiltinFact,
+) -> Option[String]:
+	match from_opaque NativeManagedAuthority(authority):
+		AcceptedNativeManagedTypes(accepted):
+			representation = from_opaque NativeManagedBuiltinFact(fact)
+			if module_ids_equal(accepted.module_id, representation.module_id):
+				Some(representation.source_name)
+			else:
+				None
+		_: None
+
+
+pure func native_managed_fact_definition_id(fact: NativeManagedBuiltinFact) -> Int:
+	type_id_definition_id(from_opaque NativeManagedBuiltinFact(fact).id)
+
+
+pure func native_managed_fact_kind(fact: NativeManagedBuiltinFact) -> NativeManagedBuiltin:
+	from_opaque NativeManagedBuiltinFact(fact).kind
+
+
+pure func native_managed_fact_semantic_name(fact: NativeManagedBuiltinFact) -> String:
+	from_opaque NativeManagedBuiltinFact(fact).semantic_name

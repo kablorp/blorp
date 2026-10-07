@@ -16,7 +16,7 @@ import:
 		frontend_graph_find_module_id,
 		frontend_graph_module_table,
 	../../../src/compiler/stage_04_modules/loaded_module:
-		ModuleOrigin(SourcePackageModule, UserModule),
+		ModuleOrigin(SourcePackageModule, UserModule, StdlibModule),
 		ResolvedModuleIdentity,
 		module_identities_equal,
 		resolved_module_canonical_path,
@@ -48,6 +48,10 @@ import:
 		typechecked_module_path,
 		typechecked_module_program_with_ctfe_replacements,
 	../../../src/compiler/stage_06_typecheck/diagnostic: TypecheckDiagnostic
+	../../../src/compiler/stage_06_typecheck/decl:
+		TypedDecl(TypedRecordDecl, TypedTypeAliasDecl), TypedProgram, typed_decls_function_infos
+	../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
+		SemanticType(SemanticNamedType), types_equal
 	../../../src/compiler/stage_06_typecheck/frontend_graph_typecheck:
 		FrontendTypecheckRequestError(FrontendTypecheckRootMissing),
 		typecheck_frontend_graph_direct,
@@ -73,12 +77,185 @@ import:
 			GraphSelectiveTraitMethodBinding,
 		),
 	../../../src/compiler/stage_06_typecheck/typed_ast_json: typed_program_to_json
+	../../../src/compiler/stage_06_typecheck/headers/native_managed_authority:
+		native_managed_authority_definition_table,
+		native_managed_authority_facts,
+		native_managed_authority_unissued,
+		native_managed_fact_definition_id,
+		native_managed_fact_semantic_name,
+	../../../src/compiler/stage_08_core_lower/lower:
+		CoreLowerError(CoreLowerInvalidType), core_lower_context, lower_typed_program
+	../../../src/compiler/stage_09_core/ir:
+		CoreDecl(FunctionDecl, HeapRecordDecl, TypeAliasDecl),
+		CoreType(NativeManagedType, NamedType),
+		core_native_managed_canonical_name,
 	../../../src/lib/source:
 		SourceLocation,
 		source_file,
 		source_location_start_offset,
 		source_locations_equal,
 	test: TestSuite
+
+
+private func native_nominal_graph_program() -> Option[TypedProgram]:
+	app = module(
+		"/workspace/app.brp", "app",
+		"import:\n\tnet/tcp as Tcp\n\nrecord IpAddress {value: Int}\nrecord AddressHolder {address: Option[Tcp.IpAddress]}\ntype alias NativeAddress = Tcp.IpAddress\n\npure func native_identity(value: NativeAddress) -> Tcp.IpAddress:\n\tcopy = Tcp.identity_ip(value)\n\tcopy\n\npure func local(value: IpAddress) -> IpAddress:\n\tvalue\n",
+		UserModule,
+	)
+	tcp = module(
+		"/std/net/tcp.brp", "net/tcp",
+		"type IpAddress = builtin\ntype DnsName = builtin\ntype InterfaceScope = builtin\n\npure func identity_ip(value: IpAddress) -> IpAddress:\n\tvalue\n",
+		StdlibModule,
+	)
+	edge: FrontendImportEdge = {
+		importer = app.identity, requested_path = "net/tcp",
+		resolution = FrontendResolvedImport(tcp.identity)
+	}
+	match frontend_graph([app, tcp], [app.identity], [edge], graph_names([app, tcp])):
+		Err(_): None
+		Ok(graph):
+			match typecheck_request_for_frontend_graph(graph, app.identity, [tcp.identity], False, False):
+				Err(_): None
+				Ok(request):
+					checked = typecheck_graph(request)
+					if not checked.target.errors.is_empty() or checked.modules.any(func(unit): not unit.errors.is_empty()):
+						None
+					else:
+						Some(checked.target.typed_program)
+
+
+func test_native_nominal_graph_setup_is_accepted() -> Bool:
+	native_nominal_graph_program().is_some()
+
+
+func test_native_nominal_graph_publishes_complete_issued_authority() -> Bool:
+	match native_nominal_graph_program():
+		None: False
+		Some(program):
+			match native_managed_authority_facts(program.native_managed_authority):
+				Err(_): False
+				Ok(facts):
+					(
+						facts.length() == 3
+						and facts.all(func(fact): native_managed_fact_definition_id(fact) >= 0)
+						and ["net/tcp::IpAddress", "net/tcp::DnsName", "net/tcp::InterfaceScope"].all(func(name):
+							facts.filter(func(fact): native_managed_fact_semantic_name(fact) == name).length() == 1
+						)
+					)
+
+
+private pure func is_ip_native_type(typ: CoreType) -> Bool:
+	match typ:
+		NativeManagedType(identity):
+			core_native_managed_canonical_name(identity) == "net_tcp__IpAddress"
+		_: False
+
+
+func test_native_nominal_lowering_preserves_alias_and_nested_field_witness() -> Bool:
+	match native_nominal_graph_program():
+		None: False
+		Some(program):
+			match lower_typed_program(core_lower_context(0, None), program):
+				Err(_): False
+				Ok(lowered):
+					(
+						lowered.program.decls.any(func(decl):
+							match decl:
+								TypeAliasDecl(alias_info):
+									alias_info.name == "NativeAddress" and is_ip_native_type(alias_info.target)
+								_: False
+						)
+						and lowered.program.decls.any(func(decl):
+							match decl:
+								HeapRecordDecl(record_info):
+									record_info.name == "AddressHolder" and record_info.fields.any(func(field):
+										match field.typ:
+											NamedType("Option", [payload]):
+												is_ip_native_type(payload)
+											_: False
+									)
+								_: False
+						)
+						and lowered.program.decls.any(func(decl):
+							match decl:
+								FunctionDecl(info):
+									info.name == "native_identity" and is_ip_native_type(info.return_type)
+								_: False
+						)
+					)
+
+
+func test_native_nominal_lowering_rejects_missing_authority() -> Bool:
+	match native_nominal_graph_program():
+		None: False
+		Some(program):
+			match lower_typed_program(core_lower_context(0, None), { program | native_managed_authority = native_managed_authority_unissued() }):
+				Err(CoreLowerInvalidType(message)):
+					message == "typed program has no accepted native managed authority; typecheck it before lowering"
+				_: False
+
+
+func test_native_nominal_lowering_rejects_foreign_definition_authority() -> Bool:
+	match (native_nominal_graph_program(), native_nominal_graph_program()):
+		(Some(program), Some(other)):
+			match native_managed_authority_definition_table(other.native_managed_authority):
+				None: False
+				Some(table):
+					context = { core_lower_context(0, None) | definition_table = Some(table) }
+					match lower_typed_program(context, program):
+						Err(CoreLowerInvalidType(message)):
+							message == "native managed authority belongs to another definition table"
+						_: False
+		_: False
+
+
+func test_native_nominal_graph_alias_keeps_identity() -> Bool:
+	match native_nominal_graph_program():
+		None: False
+		Some(program):
+			program.decls.any(func(decl):
+				match decl:
+					TypedTypeAliasDecl(info):
+						info.decl.name.text == "NativeAddress" and types_equal(info.semantic_target_type, SemanticNamedType("net/tcp::IpAddress", []))
+					_: False
+			)
+
+
+func test_native_nominal_graph_nested_field_keeps_identity() -> Bool:
+	match native_nominal_graph_program():
+		None: False
+		Some(program):
+			program.decls.any(func(decl):
+				match decl:
+					TypedRecordDecl(info):
+						info.decl.name.text == "AddressHolder" and info.fields.any(func(field):
+							types_equal(field.semantic_type, SemanticNamedType("Option", [SemanticNamedType("net/tcp::IpAddress", [])]))
+						)
+					_: False
+			)
+
+
+func test_native_nominal_graph_signature_keeps_identity() -> Bool:
+	match native_nominal_graph_program():
+		None: False
+		Some(program):
+			typed_decls_function_infos(program.decls).any(func(info):
+				(
+					info.decl.name.text == "native_identity"
+					and types_equal(info.semantic_return_type, SemanticNamedType("net/tcp::IpAddress", []))
+					and info.param_types.all(func(typ): types_equal(typ, SemanticNamedType("net/tcp::IpAddress", [])))
+				)
+			)
+
+
+func test_native_nominal_graph_root_namesake_stays_distinct() -> Bool:
+	match native_nominal_graph_program():
+		None: False
+		Some(program):
+			typed_decls_function_infos(program.decls).any(func(info):
+				info.decl.name.text == "local" and not types_equal(info.semantic_return_type, SemanticNamedType("net/tcp::IpAddress", []))
+			)
 
 
 private pure func identity(module_name: String, origin: ModuleOrigin) -> ResolvedModuleIdentity:
@@ -1277,7 +1454,16 @@ func test_source_only_import_does_not_create_internal_global_error() -> Bool:
 
 tests: TestSuite = {
 	description = "Compiler frontend graph typecheck request",
-	tests = [
+		tests = [
+		("native nominal graph setup is accepted", test_native_nominal_graph_setup_is_accepted),
+		("native nominal graph publishes complete issued authority", test_native_nominal_graph_publishes_complete_issued_authority),
+		("native nominal lowering preserves alias and nested field witness", test_native_nominal_lowering_preserves_alias_and_nested_field_witness),
+		("native nominal lowering rejects missing authority", test_native_nominal_lowering_rejects_missing_authority),
+		("native nominal lowering rejects foreign definition authority", test_native_nominal_lowering_rejects_foreign_definition_authority),
+		("native nominal graph alias keeps identity", test_native_nominal_graph_alias_keeps_identity),
+		("native nominal graph nested field keeps identity", test_native_nominal_graph_nested_field_keeps_identity),
+		("native nominal graph signature keeps identity", test_native_nominal_graph_signature_keeps_identity),
+		("native nominal graph root namesake stays distinct", test_native_nominal_graph_root_namesake_stays_distinct),
 		(
 			"use exact graph identities and requested import",
 			test_request_uses_exact_graph_identities_and_requested_import,

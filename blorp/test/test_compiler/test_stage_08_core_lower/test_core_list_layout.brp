@@ -1,4 +1,6 @@
 import:
+	../../../src/compiler/stage_06_typecheck/type_system/language_surface_manifest:
+		DeclaredAbiType(DeclaredAbiBool),
 	../../../src/compiler/stage_08_core_lower/list_layout:
 		annotate_list_layouts,
 		build_layout_type_index,
@@ -9,7 +11,7 @@ import:
 	../../../src/compiler/stage_09_core/ir:
 		CoreBoxKind(PointerBox, StructBox),
 		CoreDecl(
-			EnumDecl,
+			UnionDecl,
 			FunctionDecl,
 			GlobalDecl,
 			HeapRecordDecl,
@@ -32,17 +34,23 @@ import:
 		CoreLoopRangeDirection(RangeMayRunBackward),
 		CoreRecordForm(OrdinaryRecordForm),
 		CoreProgram,
+		CoreUnionDecl,
+		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
+		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
+		CoreTensorDim(TensorStaticDim),
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreSourceLoc,
 		synthetic_core_source_loc,
 		CoreType(
-			EnumType,
+			UnionType,
 			FunctionType,
 			HeapRecordType,
 			NamedType,
 			SelfType,
 			StackResultType,
 			TupleType,
+			TensorType,
 			TypeParameterType,
 			VoidType,
 		),
@@ -148,14 +156,14 @@ pure func stale_product_list_construct(list_typ: CoreType, record_typ: CoreType)
 	)
 
 
-pure func stale_enum_list_construct(list_typ: CoreType, enum_typ: CoreType) -> CoreExpr:
+pure func stale_scalar_tag_list_construct(list_typ: CoreType, scalar_tag_typ: CoreType) -> CoreExpr:
 	ListConstructExpr(
 		{
 			layout = PointerListStorage,
 			elements = [
 				{
 					kind = PointerBox,
-					value = VarExpr(core_var("TinyZero"), enum_typ, synthetic_core_source_loc()),
+					value = VarExpr(core_var("TinyZero"), scalar_tag_typ, synthetic_core_source_loc()),
 					needs_release = False,
 					transfers_ownership = False
 				},
@@ -292,21 +300,24 @@ pure func test_classifies_primitive_widths() -> Bool:
 	)
 
 
-pure func test_classifies_declared_enum_and_managed_record() -> Bool:
+pure func test_classifies_scalar_union_and_managed_record() -> Bool:
 	program: CoreProgram = empty_program([
-		EnumDecl({
+		UnionDecl({
 			abi_type = None,
 			name = "Tiny",
 			type_params = [],
+			storage = ScalarTagStorage,
 			variants = [
 				{
 					name = "Zero",
 					tag = 0,
+					fields = [],
 					def_id = None
 				},
 				{
 					name = "Max",
 					tag = 255,
+					fields = [],
 					def_id = None
 				},
 			],
@@ -324,10 +335,64 @@ pure func test_classifies_declared_enum_and_managed_record() -> Bool:
 	index = build_layout_type_index(program)
 
 	is_inline_layout(
-		list_layout_for_type_with_index(index, list_type(EnumType("Tiny"))),
+		list_layout_for_type_with_index(index, list_type(UnionType("Tiny", ScalarTagValue))),
 		1,
 	) and is_pointer_layout(
 		list_layout_for_type_with_index(index, list_type(HeapRecordType("Point"))),
+	)
+
+
+pure func layout_union_decl(name: String, abi: Option[DeclaredAbiType], storage: CoreUnionStorage) -> CoreDecl:
+	UnionDecl({
+		abi_type = abi,
+		name = name,
+		type_params = [],
+		storage = storage,
+		variants = [{ name = "Choice", tag = 0, fields = [], def_id = None }],
+		loc = synthetic_core_source_loc(),
+	})
+
+
+pure func tensor_of(element: CoreType) -> CoreType:
+	TensorType({ element_type = element, dims = [TensorStaticDim(3)] })
+
+
+pure func test_trusted_scalar_bool_retains_primitive_layout_identity() -> Bool:
+	index = build_layout_type_index(empty_program([
+		layout_union_decl("Bool", Some(DeclaredAbiBool), ScalarTagStorage),
+		type_alias("Flag", [], named_type("Bool")),
+	]))
+	(
+		core_type_equal(resolve_layout_type_with_index(index, named_type("Bool")), named_type("Bool"))
+		and core_type_equal(resolve_layout_type_with_index(index, named_type("Flag")), named_type("Bool"))
+		and core_type_equal(resolve_layout_type_with_index(index, tensor_of(named_type("Flag"))), tensor_of(named_type("Bool")))
+	)
+
+
+pure func test_untrusted_bool_namesake_retains_scalar_union_identity() -> Bool:
+	index = build_layout_type_index(empty_program([
+		layout_union_decl("Bool", None, ScalarTagStorage),
+		type_alias("Flag", [], named_type("Bool")),
+	]))
+	scalar_bool: CoreType = UnionType("Bool", ScalarTagValue)
+	(
+		core_type_equal(resolve_layout_type_with_index(index, named_type("Bool")), scalar_bool)
+		and core_type_equal(resolve_layout_type_with_index(index, named_type("Flag")), scalar_bool)
+		and core_type_equal(resolve_layout_type_with_index(index, scalar_bool), scalar_bool)
+		and core_type_equal(resolve_layout_type_with_index(index, tensor_of(named_type("Flag"))), tensor_of(scalar_bool))
+	)
+
+
+pure func test_declared_bool_authority_requires_scalar_storage() -> Bool:
+	index = build_layout_type_index(empty_program([
+		layout_union_decl("Bool", Some(DeclaredAbiBool), ManagedPayloadStorage(TypedUnionPayloadStorage)),
+		layout_union_decl("Color", None, ScalarTagStorage),
+		layout_union_decl("Choice", None, ManagedPayloadStorage(TypedUnionPayloadStorage)),
+	]))
+	(
+		core_type_equal(resolve_layout_type_with_index(index, named_type("Bool")), UnionType("Bool", ManagedUnionValue))
+		and core_type_equal(resolve_layout_type_with_index(index, named_type("Color")), UnionType("Color", ScalarTagValue))
+		and core_type_equal(resolve_layout_type_with_index(index, named_type("Choice")), UnionType("Choice", ManagedUnionValue))
 	)
 
 
@@ -628,18 +693,20 @@ pure func test_repairs_product_pointer_element_ownership() -> Bool:
 			False
 
 
-pure func test_defers_inline_enum_element_reboxing() -> Bool:
-	enum_type: CoreType = EnumType("Tiny")
-	tiny_list: CoreType = list_type(enum_type)
+pure func test_defers_inline_scalar_union_element_reboxing() -> Bool:
+	scalar_tag_type: CoreType = UnionType("Tiny", ScalarTagValue)
+	tiny_list: CoreType = list_type(scalar_tag_type)
 	annotated = annotate_list_layouts(empty_program([
-		EnumDecl({
+		UnionDecl({
 			abi_type = None,
 			name = "Tiny",
 			type_params = [],
+			storage = ScalarTagStorage,
 			variants = [
 				{
 					name = "TinyZero",
 					tag = 0,
+					fields = [],
 					def_id = None
 				},
 			],
@@ -648,12 +715,12 @@ pure func test_defers_inline_enum_element_reboxing() -> Bool:
 		function_decl(
 			"make_tiny",
 			5,
-			stale_enum_list_construct(tiny_list, enum_type),
+			stale_scalar_tag_list_construct(tiny_list, scalar_tag_type),
 		),
 	]))
 
 	match annotated.decls:
-		[EnumDecl(_), FunctionDecl(function_info)]:
+		[UnionDecl(_), FunctionDecl(function_info)]:
 			match function_info.body:
 				Some(ListConstructExpr(construct, _, _)):
 					match (construct.layout, construct.elements):
@@ -795,10 +862,13 @@ tests: TestSuite = {
 	tests = [
 		("classifies primitive widths", test_classifies_primitive_widths),
 		(
-			"classifies declared enum and managed record",
-			test_classifies_declared_enum_and_managed_record,
+			"classifies scalar union and managed record",
+			test_classifies_scalar_union_and_managed_record,
 		),
 		("expands aliases", test_expands_aliases),
+		("trusted scalar Bool retains primitive layout identity", test_trusted_scalar_bool_retains_primitive_layout_identity),
+		("untrusted Bool namesake retains scalar union identity", test_untrusted_bool_namesake_retains_scalar_union_identity),
+		("declared Bool authority requires scalar storage", test_declared_bool_authority_requires_scalar_storage),
 		(
 			"resolves deep alias chain to canonical type",
 			test_resolves_deep_alias_chain_to_canonical_type,
@@ -832,7 +902,7 @@ tests: TestSuite = {
 			test_annotates_function_global_and_impl_bodies,
 		),
 		("repairs product pointer element ownership", test_repairs_product_pointer_element_ownership),
-		("defers inline enum element reboxing", test_defers_inline_enum_element_reboxing),
+		("defers inline scalar union element reboxing", test_defers_inline_scalar_union_element_reboxing),
 		(
 			"repairs heap record element release metadata",
 			test_repairs_heap_record_element_release_metadata,

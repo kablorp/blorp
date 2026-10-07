@@ -7,15 +7,15 @@
 import:
 	clone: clone_core_tensor_dim, clone_core_type
 	ir:
+		core_native_managed_definition_id,
+		core_native_managed_canonical_name,
+		core_type_equal,
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
 		CoreDimOp(DimAdd, DimDivide, DimMultiply, DimSubtract),
 		CoreMonoSubstitution,
 		CoreMonoSubstitutionValue(DimPackSubstitution, DimSubstitution, TypeSubstitution),
 		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
-		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType, RangeType, SelfType,
-			StackResultType, TensorType, TupleType, TypeParameterType, UnionType,
-			VoidType,
-		),
+		CoreType(InlineRecordType, NativeManagedType, BoxedResultType, UnionType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType, VoidType),
 	list: join
 	memory: same_object
 	string: append_int, string
@@ -187,6 +187,8 @@ private pure func core_type_lists_equal(left: List[CoreType], right: List[CoreTy
 
 pure func core_mono_type_equal(left: CoreType, right: CoreType) -> Bool:
 	match (left, right):
+		(NativeManagedType(_), NativeManagedType(_)):
+			core_type_equal(left, right)
 		(VoidType, VoidType) | (RangeType, RangeType):
 			True
 		(NamedType(left_name, left_args), NamedType(right_name, right_args)):
@@ -211,13 +213,11 @@ pure func core_mono_type_equal(left: CoreType, right: CoreType) -> Bool:
 				and core_type_lists_equal(left_params, right_params)
 				and core_mono_type_equal(left_return, right_return)
 			)
-		(EnumType(left_name), EnumType(right_name)):
-			left_name == right_name
+		(UnionType(left_name, left_storage), UnionType(right_name, right_storage)):
+			left_name == right_name and left_storage == right_storage
 		(HeapRecordType(left_name), HeapRecordType(right_name)):
 			left_name == right_name
 		(InlineRecordType(left_name), InlineRecordType(right_name)):
-			left_name == right_name
-		(UnionType(left_name), UnionType(right_name)):
 			left_name == right_name
 		(TensorType(left_info), TensorType(right_info)):
 			(
@@ -409,7 +409,7 @@ pure func erase_core_mono_value_refinements(typ: CoreType) -> CoreType:
 			)
 		TupleType(items):
 			TupleType(erase_type_list_refinements_for_mono(items))
-		VoidType | EnumType(_) | HeapRecordType(_) | InlineRecordType(_) | UnionType(_):
+		NativeManagedType(_) | VoidType | UnionType(_, _) | HeapRecordType(_) | InlineRecordType(_):
 			typ
 
 
@@ -761,7 +761,7 @@ pure func collect_type_substitution(
 					)
 				_:
 					Some(substitution)
-		VoidType | EnumType(_) | HeapRecordType(_) | InlineRecordType(_) | UnionType(_) | RangeType:
+		NativeManagedType(_) | VoidType | UnionType(_, _) | HeapRecordType(_) | RangeType | InlineRecordType(_):
 			Some(substitution)
 
 
@@ -968,7 +968,7 @@ pure func apply_type_substitution(substitution: CoreMonoSubstitution, typ: CoreT
 				typ
 			else:
 				TupleType(next_items)
-		VoidType | EnumType(_) | HeapRecordType(_) | InlineRecordType(_) | UnionType(_) | RangeType:
+		NativeManagedType(_) | VoidType | UnionType(_, _) | HeapRecordType(_) | RangeType | InlineRecordType(_):
 			typ
 
 
@@ -1032,7 +1032,7 @@ private pure func type_contains_parameter(type_params: List[String], typ: CoreTy
 			)
 		TupleType(items):
 			types_contain_parameter(type_params, items)
-		VoidType | EnumType(_) | HeapRecordType(_) | InlineRecordType(_) | UnionType(_) | RangeType:
+		NativeManagedType(_) | VoidType | UnionType(_, _) | HeapRecordType(_) | RangeType | InlineRecordType(_):
 			False
 
 
@@ -1222,6 +1222,8 @@ private pure func encode_data_dims(dims: List[CoreTensorDim]) -> Option[String]:
 
 private pure func encode_data_type(typ: CoreType) -> Option[String]:
 	match typ:
+		NativeManagedType(identity):
+			Some("N${core_native_managed_definition_id(identity)}_${encode_data_identifier(core_native_managed_canonical_name(identity))}")
 		TypeParameterType(_) | SelfType:
 			None
 		NamedType(name, args):
@@ -1259,14 +1261,17 @@ private pure func encode_data_type(typ: CoreType) -> Option[String]:
 			Some("T${encoded_items}")
 		VoidType:
 			Some("Void")
-		EnumType(name):
-			Some("E${frame_data_encoding(encode_data_identifier(name))}")
+		UnionType(name, storage):
+			storage_code: String = match storage:
+				ScalarTagValue:
+					"S"
+				ManagedUnionValue:
+					"M"
+			Some("U${storage_code}${frame_data_encoding(encode_data_identifier(name))}")
 		HeapRecordType(name):
 			Some("H${frame_data_encoding(encode_data_identifier(name))}")
 		InlineRecordType(name):
 			Some("N${frame_data_encoding(encode_data_identifier(name))}")
-		UnionType(name):
-			Some("U${frame_data_encoding(encode_data_identifier(name))}")
 		RangeType:
 			Some("Range")
 
@@ -1293,7 +1298,7 @@ private pure func encode_simple_substitution_value(
 				Some(encode_data_identifier(name))
 			else:
 				None
-		TypeSubstitution(EnumType(name)) | TypeSubstitution(HeapRecordType(name)) | TypeSubstitution(InlineRecordType(name)) | TypeSubstitution(UnionType(name)):
+		TypeSubstitution(UnionType(name, _)) | TypeSubstitution(HeapRecordType(name)) | TypeSubstitution(InlineRecordType(name)):
 			Some(encode_data_identifier(name))
 		TypeSubstitution(RangeType):
 			Some("Range")

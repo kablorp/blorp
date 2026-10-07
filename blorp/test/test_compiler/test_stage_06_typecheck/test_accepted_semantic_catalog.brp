@@ -12,10 +12,12 @@ import:
 		definition_table_module_table,
 	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
 		TraitMethodId,
+		impl_ids_equal,
 		callable_id_from_definition_table,
 		callable_id_name,
 		trait_id_module_id,
 		trait_method_id_owner,
+		trait_method_ids_equal,
 	../../../src/compiler/stage_06_typecheck/headers/implementation_headers:
 		ImplementationHeaderGraph,
 		implementation_header_graph_definition_table,
@@ -53,11 +55,30 @@ import:
 		),
 		AcceptedTraitImplementationAuthority,
 		AcceptedTraitImplementationTable,
+		AcceptedSourceCandidate,
+		AcceptedSourceImplementationMatch,
+		AcceptedEvidenceMemberIdentity(IssuedEvidenceMember, CompilerScopedEvidenceMember),
+		AcceptedImplementationCallable(TraitImplementationMember, AuxiliaryImplementationCallable),
 		ScopedTraitMethodSource(CompilerProvidedScopedTrait, IssuedScopedMethods),
 		accepted_find_impl_method_info,
 		accepted_find_impl_method_info_by_trait_id,
 		accepted_find_concrete_impl_method_by_trait_id,
+		accepted_has_direct_trait_evidence,
+		accepted_match_source_trait_implementation_with,
+		accepted_source_candidate_dependencies,
+		accepted_source_candidate_id,
+		accepted_source_candidate_declared_trait,
+		accepted_source_candidate_supertraits,
+		AcceptedSourceCandidateDecision(SourceCandidateApplicable, SourceCandidateDeferred, SourceCandidateCyclic),
+		AcceptedSourceMatch(SourceImplementationSelected, SourceImplementationDeferred, SourceImplementationAbsent),
+		accepted_source_implementation_match_callables,
+		accepted_source_implementation_match_id,
+		accepted_source_implementation_match_dependencies,
+		accepted_source_implementation_match_receiver,
+		bound_trait_identity_from_id,
 		accepted_resolve_trait_id_obligation,
+		accepted_resolve_trait_obligation,
+		accepted_resolve_exact_trait_obligation,
 		accepted_scoped_trait_methods,
 		accepted_trait_empty_visibility,
 		accepted_trait_find,
@@ -66,16 +87,30 @@ import:
 		accepted_trait_implementation_table,
 		accepted_trait_method_binding_declaring_trait_name,
 		accepted_trait_method_binding_for_id,
-	../../../src/compiler/stage_06_typecheck/type_system/builtins: BUILTIN_TRAIT_NAMES
+	../../../src/compiler/stage_06_typecheck/type_system/builtins:
+		BUILTIN_TRAIT_NAMES,
+		builtin_trait_member_declaration,
+		builtin_trait_topology_is_acyclic,
 	../../../src/compiler/stage_06_typecheck/type_system/env:
 		TraitObligationResolution(TraitObligationSatisfied, TraitObligationUnsatisfied),
+		ImplementationBoundDependency(InstantiatedBoundDependency),
 		resource_arg_policies_equal,
+		env_has_exact_impl_for_trait,
+		trait_obligation,
+		env_add_trait,
+		env_get_trait_by_id,
+		trait_method_sig,
+	../../../src/compiler/stage_06_typecheck/type_system/generic_params: BoundTraitIdentity, bound_trait_identities_equal
 	../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
 		SemanticType(SemanticNamedType),
 		TYPE_INT,
+		TYPE_BOOL,
+		TYPE_STRING,
 		types_equal,
 	../../../src/compiler/stage_06_typecheck/type_system/trait_identity:
 		TRAIT_ID_EQUATABLE,
+		TRAIT_ID_HASHABLE,
+		TRAIT_ID_ORDERABLE,
 		TraitId,
 		builtin_trait_id_at_registry_index,
 		trait_ids_equal,
@@ -83,6 +118,11 @@ import:
 	../typecheck_test_support: typecheck_test_accepted_graph
 	memory: same_object
 	test: TestSuite
+
+
+-- Existing builtin Env definition domain begins at 100, independently of
+-- the dense registry TraitId domain.
+private FIRST_BUILTIN_ENV_DEFINITION_ID: Int = 100
 
 
 private CATALOG_SOURCE: String =
@@ -329,6 +369,26 @@ private record ScopedAuthorityFixture {
 }
 
 
+-- These controls test exact source projection and identity boundaries only;
+-- their explicit callback is not a recursively closed trait witness. Bounds
+-- admission remains covered by the env owner and the producer owns closure.
+private pure func source_packet_for_projection_test(
+	authority: AcceptedTraitImplementationAuthority,
+	issuer: DefinitionTable,
+	receiver: SemanticType,
+	requested: BoundTraitIdentity,
+) -> Result[Option[AcceptedSourceImplementationMatch], String]:
+	applicability: pure (AcceptedSourceCandidate) -> Result[AcceptedSourceCandidateDecision[Bool, Bool], String] = pure func(_candidate): Ok(SourceCandidateApplicable(True))
+	selected ?= accepted_match_source_trait_implementation_with(authority, issuer, receiver, requested, applicability)
+	match selected:
+		SourceImplementationSelected(packet, _): Ok(Some(packet))
+		SourceImplementationAbsent(cause):
+			match cause:
+				Some(message): Err(message)
+				None: Ok(None)
+		SourceImplementationDeferred(_, _): Err("projection test callback unexpectedly deferred")
+
+
 private func scoped_authority_fixture(source: String) -> Option[ScopedAuthorityFixture]:
 	fixture ?= catalog_component_fixture("scope/main", source)
 	table = fixture.traits_and_implementations
@@ -341,6 +401,127 @@ private func scoped_authority_fixture(source: String) -> Option[ScopedAuthorityF
 			[],
 		),
 	})
+
+
+private SCALAR_EQUALITY_SOURCE: String =
+	"implements Equatable for Choice:\n\tpure func equals(left: Choice, right: Choice) -> Bool: True\n\tpure func not_equals(left: Choice, right: Choice) -> Bool: False\n"
+
+
+private SCALAR_HASH_SOURCE: String =
+	"implements Hashable for Choice:\n\tpure func hash(value: Choice) -> Int: 0\n"
+
+
+private func scalar_hash_admission(
+	equality: String,
+	hash: String,
+	expected: TraitObligationResolution,
+) -> Option[Bool]:
+	fixture ?= scoped_authority_fixture("union Choice:\n\tFirst\n\tSecond\n" + equality + hash)
+	receiver = SemanticNamedType("Choice", [])
+	env = { typecheck_state_for_origin(TYPECHECK_USER_ORIGIN).env |
+		impls = [],
+		accepted_scalar_tag_unions = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN).env.accepted_scalar_tag_unions.add("Choice")
+	}
+	identity = bound_trait_identity_from_id(fixture.issuer, TRAIT_ID_HASHABLE)
+	Some(
+		env.impls.is_empty()
+		and accepted_resolve_trait_obligation(
+			fixture.authority, env, trait_obligation(receiver, TRAIT_ID_HASHABLE),
+		) == expected
+		and accepted_resolve_exact_trait_obligation(
+			fixture.authority, env, receiver, identity,
+		) == expected
+		and accepted_resolve_trait_id_obligation(
+			fixture.authority, fixture.issuer, env, receiver, TRAIT_ID_HASHABLE,
+		) == expected
+		and accepted_has_direct_trait_evidence(
+			fixture.authority, env, trait_obligation(receiver, TRAIT_ID_HASHABLE),
+		) == (expected == TraitObligationSatisfied)
+	)
+
+
+func test_scalar_hash_requires_explicit_implementation() -> Bool:
+	scalar_hash_admission("", "", TraitObligationUnsatisfied).get_or(False)
+
+
+func test_graph_owned_scalar_equality_requires_hash() -> Bool:
+	scalar_hash_admission(SCALAR_EQUALITY_SOURCE, "", TraitObligationUnsatisfied).get_or(False)
+
+
+func test_graph_owned_scalar_equality_and_hash_are_admitted() -> Bool:
+	scalar_hash_admission(
+		SCALAR_EQUALITY_SOURCE, SCALAR_HASH_SOURCE, TraitObligationSatisfied,
+	).get_or(False)
+
+
+private func exact_bound_authored_hash_precedes_compiler_fallback() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(
+		"union Choice:\n\tFirst\n\tSecond\n" + SCALAR_EQUALITY_SOURCE + SCALAR_HASH_SOURCE,
+	)
+	base_env = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN).env
+	env = { base_env |
+		impls = [],
+		accepted_scalar_tag_unions = base_env.accepted_scalar_tag_unions.add("Choice")
+	}
+	Some(accepted_resolve_exact_trait_obligation(
+		fixture.authority, env, SemanticNamedType("Choice", []),
+		bound_trait_identity_from_id(fixture.issuer, TRAIT_ID_HASHABLE),
+	) == TraitObligationSatisfied)
+
+
+func test_exact_bound_authored_hash_precedes_compiler_fallback() -> Bool:
+	exact_bound_authored_hash_precedes_compiler_fallback().get_or(False)
+
+
+func test_graph_owned_scalar_hash_preserves_default_equality() -> Bool:
+	scalar_hash_admission("", SCALAR_HASH_SOURCE, TraitObligationSatisfied).get_or(False)
+
+
+private func conditional_scalar_equality_requires_hash(bound: String) -> Option[Bool]:
+	source = "type alias Receiver[T] = T\ntrait Unavailable:\n\tpure func unavailable(value: Self) -> Int\nimplements Equatable for Receiver[T:" + bound + "]:\n\tpure func equals(left: Receiver[T], right: Receiver[T]) -> Bool: True\n\tpure func not_equals(left: Receiver[T], right: Receiver[T]) -> Bool: False\n"
+	scalar_hash_admission(source, "", TraitObligationUnsatisfied)
+
+
+func test_conditional_scalar_equality_requires_hash_without_bound_recursion() -> Bool:
+	conditional_scalar_equality_requires_hash("Hashable").get_or(False)
+
+
+func test_inapplicable_scalar_equality_bound_still_requires_explicit_hash() -> Bool:
+	conditional_scalar_equality_requires_hash("Unavailable").get_or(False)
+
+
+func test_orderable_and_namesake_equality_require_explicit_hash() -> Bool:
+	orderable = "implements Orderable for Choice:\n\tpure func compare(left: Choice, right: Choice) -> Int: 0\n"
+	namesake = "trait Equatable:\n\tpure func unrelated(value: Self) -> Int\nimplements Equatable for Choice:\n\tpure func unrelated(value: Choice) -> Int: 0\n"
+	(
+		scalar_hash_admission(orderable, "", TraitObligationUnsatisfied).get_or(False)
+		and scalar_hash_admission(orderable, SCALAR_HASH_SOURCE, TraitObligationSatisfied).get_or(False)
+		and scalar_hash_admission(namesake, "", TraitObligationUnsatisfied).get_or(False)
+		and scalar_hash_admission(namesake, SCALAR_HASH_SOURCE, TraitObligationSatisfied).get_or(False)
+	)
+
+
+private func installed_bool_hash_survives_graph_equality() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture("implements Equatable for Bool:\n\tpure func equals(left: Bool, right: Bool) -> Bool: True\n\tpure func not_equals(left: Bool, right: Bool) -> Bool: False\n")
+	base_env = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN).env
+	env = { base_env | accepted_scalar_tag_unions = base_env.accepted_scalar_tag_unions.add("Bool") }
+	Some(
+		env_has_exact_impl_for_trait(env, TYPE_BOOL, TRAIT_ID_HASHABLE)
+		and accepted_resolve_trait_obligation(
+			fixture.authority, env, trait_obligation(TYPE_BOOL, TRAIT_ID_HASHABLE),
+		) == TraitObligationSatisfied
+		and accepted_resolve_exact_trait_obligation(
+			fixture.authority, env, TYPE_BOOL,
+			bound_trait_identity_from_id(fixture.issuer, TRAIT_ID_HASHABLE),
+		) == TraitObligationSatisfied
+		and accepted_resolve_trait_id_obligation(
+			fixture.authority, fixture.issuer, env, TYPE_BOOL, TRAIT_ID_HASHABLE,
+		) == TraitObligationSatisfied
+	)
+
+
+func test_installed_bool_hash_survives_graph_equality() -> Bool:
+	installed_bool_hash_survives_graph_equality().get_or(False)
 
 
 private pure func issued_scoped_methods(
@@ -694,9 +875,366 @@ func test_compiler_consumers_reject_foreign_and_unregistered_ids() -> Bool:
 	compiler_consumers_reject_foreign_and_unregistered_ids().get_or(False)
 
 
+private func source_match_preserves_exact_hidden_member_and_issuer() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(CATALOG_SOURCE)
+	foreign_fixture ?= scoped_authority_fixture(CATALOG_SOURCE)
+	trait_def ?= accepted_trait_find(fixture.authority, "Identity")
+	methods ?= issued_scoped_methods(fixture, trait_def.trait_id)
+	expected ?= methods.get(0)
+	identity = bound_trait_identity_from_id(fixture.issuer, trait_def.trait_id)
+	hidden = accepted_trait_implementation_authority_without_visible_names(fixture.authority)
+	matched ?= source_packet_for_projection_test(
+		hidden, fixture.issuer, SemanticNamedType("Pair", []), identity,
+	).to_option().and_then(func(found): found)
+	member ?= accepted_source_implementation_match_callables(matched).get(0)
+	foreign_rejected = match source_packet_for_projection_test(
+		hidden, foreign_fixture.issuer, SemanticNamedType("Pair", []), identity,
+	):
+		Err(message): message == "trait evidence issuer does not match accepted authority"
+		_:
+			False
+	Some(
+		foreign_rejected and accepted_trait_find(hidden, "Identity").is_none()
+		and types_equal(accepted_source_implementation_match_receiver(matched), SemanticNamedType("Pair", []))
+		and accepted_source_implementation_match_dependencies(matched).is_empty()
+		and match member:
+			TraitImplementationMember(IssuedEvidenceMember(id), _): trait_method_ids_equal(id, expected[1])
+			_:
+				False
+	)
+
+
+func test_source_match_preserves_exact_hidden_member_and_issuer() -> Bool:
+	source_match_preserves_exact_hidden_member_and_issuer().get_or(False)
+
+
+private func source_match_rejects_metadata_preserving_wrong_ids() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(CATALOG_SOURCE)
+	trait_def ?= accepted_trait_find(fixture.authority, "Identity")
+	identity = bound_trait_identity_from_id(fixture.issuer, trait_def.trait_id)
+	receiver = SemanticNamedType("Pair", [])
+	wrong_rejected = match source_packet_for_projection_test(
+		fixture.authority, fixture.issuer, receiver, { identity | trait_id = TRAIT_ID_EQUATABLE },
+	):
+		Err(message): message == "source evidence requested trait identity is absent or invalid"
+		_:
+			False
+	unregistered_rejected = match source_packet_for_projection_test(
+		fixture.authority, fixture.issuer, receiver,
+		{ identity | trait_id = builtin_trait_id_at_registry_index(BUILTIN_TRAIT_NAMES.length()) },
+	):
+		Err(message): message == "source evidence requested trait identity is absent or invalid"
+		_:
+			False
+	Some(wrong_rejected and unregistered_rejected)
+
+
+func test_source_match_rejects_metadata_preserving_wrong_ids() -> Bool:
+	source_match_rejects_metadata_preserving_wrong_ids().get_or(False)
+
+
+private func source_match_keeps_private_selection_local() -> Option[Bool]:
+	fixture ?= catalog_component_fixture("scope/main",
+		"record Choice {value: Int}\nprivate implements Equatable for Choice:\n\tpure func equals(left: Choice, right: Choice) -> Bool: True\n\tpure func not_equals(left: Choice, right: Choice) -> Bool: False\n",
+	)
+	table = fixture.traits_and_implementations
+	issuer = implementation_header_graph_definition_table(fixture.implementation_headers)
+	provider = accepted_trait_implementation_authority(table, "scope/main", accepted_trait_empty_visibility(table), [])
+	importer = accepted_trait_implementation_authority(table, "scope/importer", accepted_trait_empty_visibility(table), [])
+	identity = bound_trait_identity_from_id(issuer, TRAIT_ID_EQUATABLE)
+	selected ?= source_packet_for_projection_test(provider, issuer, SemanticNamedType("Choice", []), identity).to_option()
+	absent ?= source_packet_for_projection_test(importer, issuer, SemanticNamedType("scope/main.Choice", []), identity).to_option()
+	packet ?= selected
+	callables = accepted_source_implementation_match_callables(packet)
+	equality ?= callables.get(0)
+	inequality ?= callables.get(1)
+	Some(absent.is_none() and callables.length() == 2 and match (equality, inequality):
+		(TraitImplementationMember(CompilerScopedEvidenceMember(owner, ordinal), _), AuxiliaryImplementationCallable(target)):
+			(
+				trait_ids_equal(owner, TRAIT_ID_EQUATABLE) and ordinal == 0
+				and callable_id_name(issuer, target) == Some("not_equals")
+			)
+		_:
+			False
+	)
+
+
+func test_source_match_keeps_private_selection_local() -> Bool:
+	source_match_keeps_private_selection_local().get_or(False)
+
+
+private func source_match_retains_own_dependency_positions() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(
+		"record Wrapper[T] {value: T}\ntrait Selector:\n\tpure func select(value: Self) -> Int\nimplements Selector for Wrapper[T:Stringable]:\n\tpure func select(value: Wrapper[T]) -> Int: 1\n",
+	)
+	trait_def ?= accepted_trait_find(fixture.authority, "Selector")
+	matched ?= source_packet_for_projection_test(
+		fixture.authority, fixture.issuer,
+		SemanticNamedType("Wrapper", [TYPE_STRING]), bound_trait_identity_from_id(fixture.issuer, trait_def.trait_id),
+	).to_option().and_then(func(found): found)
+	dependencies = accepted_source_implementation_match_dependencies(matched)
+	dependency ?= dependencies.get(0)
+	Some(dependencies.length() == 1 and match dependency:
+		InstantiatedBoundDependency(position, typ, identity):
+			(
+				position.parameter_index == 0 and position.bound_index == 0
+				and types_equal(typ, TYPE_STRING) and identity.name == "Stringable"
+			)
+		_:
+			False
+	)
+
+
+func test_source_match_retains_own_dependency_positions() -> Bool:
+	source_match_retains_own_dependency_positions().get_or(False)
+
+
+private func source_match_retains_compiler_declaring_member() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(
+		"record Choice {value: Int}\nimplements Equatable for Choice:\n\tpure func equals(left: Choice, right: Choice) -> Bool: True\n",
+	)
+	env = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN).env
+	declaration ?= env_get_trait_by_id(env, TRAIT_ID_EQUATABLE)
+	shifted = env_add_trait(env, { declaration |
+		methods = [trait_method_sig("extra", [], TYPE_INT, True)].concat(declaration.methods)
+	})
+	shifted_trait ?= env_get_trait_by_id(shifted, TRAIT_ID_EQUATABLE)
+	shifted_first ?= shifted_trait.methods.get(0)
+	matched ?= source_packet_for_projection_test(
+		fixture.authority, fixture.issuer,
+		SemanticNamedType("Choice", []), bound_trait_identity_from_id(fixture.issuer, TRAIT_ID_EQUATABLE),
+	).to_option().and_then(func(found): found)
+	member ?= accepted_source_implementation_match_callables(matched).get(0)
+	Some(shifted_first.name == "extra" and match member:
+		TraitImplementationMember(CompilerScopedEvidenceMember(owner, ordinal), _): trait_ids_equal(owner, TRAIT_ID_EQUATABLE) and ordinal == 0
+		_:
+			False
+	)
+
+
+func test_source_match_retains_compiler_declaring_member() -> Bool:
+	source_match_retains_compiler_declaring_member().get_or(False)
+
+
+private func source_match_projects_inherited_compiler_member() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(
+		"record Choice {value: Int}\nimplements Equatable for Choice:\n\tpure func equals(left: Choice, right: Choice) -> Bool: True\nimplements Orderable for Choice:\n\tpure func less_than(left: Choice, right: Choice) -> Bool: False\n\tpure func equals(left: Choice, right: Choice) -> Bool: True\n",
+	)
+	env = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN).env
+	declaration ?= env_get_trait_by_id(env, TRAIT_ID_ORDERABLE)
+	changed = env_add_trait(env, { declaration | supertraits = [] })
+	changed_trait ?= env_get_trait_by_id(changed, TRAIT_ID_ORDERABLE)
+	matched ?= source_packet_for_projection_test(
+		fixture.authority, fixture.issuer,
+		SemanticNamedType("Choice", []), bound_trait_identity_from_id(fixture.issuer, TRAIT_ID_ORDERABLE),
+	).to_option().and_then(func(found): found)
+	members = accepted_source_implementation_match_callables(matched)
+	own ?= members.get(0)
+	inherited ?= members.get(1)
+	Some(changed_trait.supertraits.is_empty() and match (own, inherited):
+		(TraitImplementationMember(CompilerScopedEvidenceMember(own_trait, own_index), _), TraitImplementationMember(CompilerScopedEvidenceMember(parent, parent_index), _)):
+			(
+				trait_ids_equal(own_trait, TRAIT_ID_ORDERABLE) and own_index == 0
+				and trait_ids_equal(parent, TRAIT_ID_EQUATABLE) and parent_index == 0
+			)
+		_:
+			False
+	)
+
+
+func test_source_match_projects_inherited_compiler_member() -> Bool:
+	source_match_projects_inherited_compiler_member().get_or(False)
+
+
+func test_installed_builtin_members_agree_with_shared_registry() -> Bool:
+	env = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN).env
+	var valid: Bool = builtin_trait_topology_is_acyclic()
+	-- The equivalent nested HOF assertion exposes an independent current-base
+	-- closure emission defect; retain its reproduction in the evidence packet.
+	for indexed in BUILTIN_TRAIT_NAMES.enumerate():
+		id = builtin_trait_id_at_registry_index(indexed[0])
+		match env_get_trait_by_id(env, id):
+			Some(declaration):
+				valid = (
+					valid and declaration.def_id == FIRST_BUILTIN_ENV_DEFINITION_ID + indexed[0]
+					and declaration.name == indexed[1]
+				)
+				for method in declaration.methods.enumerate():
+					valid = valid and match builtin_trait_member_declaration(id, method[1].name):
+						Some(found): trait_ids_equal(found[0], id) and found[1] == method[0]
+						None: False
+					if not valid:
+						break
+			None:
+				valid = False
+		if not valid:
+			break
+	valid
+
+
+private CYCLIC_SOURCE: String =
+	|trait Recursive:
+	|	pure func marker(value: Self) -> Int
+	|implements Recursive for (T:Recursive):
+	|	pure func marker(value: T) -> Int: 1
+
+
+-- These differently declared implementations both survive normal coherence
+-- filtering. Deliberate callback outcomes exercise the owner loop, not a
+-- claim that a real recursively closed source witness exists.
+private ORDERED_SOURCE: String =
+	|trait Base:
+	|	pure func marker(value: Self) -> Int
+	|trait Derived: Base:
+	|	pure func child(value: Self) -> Int
+	|implements Base for Int:
+	|	pure func marker(value: Int) -> Int: 1
+	|implements Derived for Int:
+	|	pure func child(value: Int) -> Int: 2
+	|	pure func marker(value: Int) -> Int: 3
+
+
+private func guarded_candidate_retains_declared_supertraits() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(
+		|trait Parent:
+		|	pure func parent(value: Self) -> Int
+		|trait Child: Parent:
+		|	pure func child(value: Self) -> Int
+		|implements Child for Int:
+		|	pure func child(value: Int) -> Int: 2
+	)
+	child ?= accepted_trait_find(fixture.authority, "Child")
+	parent ?= accepted_trait_find(fixture.authority, "Parent")
+	applicability: pure (AcceptedSourceCandidate) -> Result[AcceptedSourceCandidateDecision[Bool, Bool], String] = pure func(candidate):
+		parents ?= accepted_source_candidate_supertraits(fixture.authority, candidate)
+		parents_valid = match parents:
+			Some(items): items.length() == 1 and items.get(0).map(
+				func(identity): bound_trait_identities_equal(identity, bound_trait_identity_from_id(fixture.issuer, parent.trait_id)),
+			).get_or(False)
+			None: False
+		Ok(SourceCandidateApplicable(
+			trait_ids_equal(accepted_source_candidate_declared_trait(candidate), child.trait_id) and parents_valid,
+		))
+	selected ?= accepted_match_source_trait_implementation_with(
+		fixture.authority, fixture.issuer, TYPE_INT,
+		bound_trait_identity_from_id(fixture.issuer, child.trait_id),
+		applicability,
+	).to_option()
+	Some(match selected:
+		SourceImplementationSelected(_, proof): proof
+		_: False
+	)
+
+
+func test_guarded_candidate_retains_declared_supertraits() -> Bool:
+	guarded_candidate_retains_declared_supertraits().get_or(False)
+
+
+private func guarded_source_cycle_skips_to_later_applicable() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(ORDERED_SOURCE)
+	declaration ?= accepted_trait_find(fixture.authority, "Base")
+	derived ?= accepted_trait_find(fixture.authority, "Derived")
+	first_callback: pure (AcceptedSourceCandidate) -> Result[AcceptedSourceCandidateDecision[Bool, Bool], String] = pure func(_candidate): Ok(SourceCandidateDeferred(True))
+	first ?= accepted_match_source_trait_implementation_with(
+		fixture.authority, fixture.issuer, TYPE_INT,
+		bound_trait_identity_from_id(fixture.issuer, declaration.trait_id), first_callback,
+	).to_option()
+	first_candidate ?= match first:
+		SourceImplementationDeferred(candidate, _): Some(candidate)
+		_: None
+	applicability: pure (AcceptedSourceCandidate) -> Result[AcceptedSourceCandidateDecision[Bool, Bool], String] = pure func(candidate):
+		Ok(if impl_ids_equal(accepted_source_candidate_id(candidate), accepted_source_candidate_id(first_candidate)):
+			SourceCandidateCyclic("recursive proof")
+		else:
+			SourceCandidateApplicable(trait_ids_equal(accepted_source_candidate_declared_trait(candidate), derived.trait_id))
+		)
+	selected ?= accepted_match_source_trait_implementation_with(
+		fixture.authority, fixture.issuer, TYPE_INT,
+		bound_trait_identity_from_id(fixture.issuer, declaration.trait_id),
+		applicability,
+	).to_option()
+	Some(match selected:
+		SourceImplementationSelected(packet, proof):
+			(proof and trait_ids_equal(accepted_source_candidate_declared_trait(first_candidate), declaration.trait_id)
+			and not impl_ids_equal(accepted_source_implementation_match_id(packet), accepted_source_candidate_id(first_candidate))
+			)
+		_: False
+	)
+
+
+func test_guarded_source_cycle_skips_to_later_applicable() -> Bool:
+	guarded_source_cycle_skips_to_later_applicable().get_or(False)
+
+
+private func guarded_source_keeps_cycle_cause_without_closed_packet() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(CYCLIC_SOURCE)
+	declaration ?= accepted_trait_find(fixture.authority, "Recursive")
+	applicability: pure (AcceptedSourceCandidate) -> Result[AcceptedSourceCandidateDecision[Bool, Bool], String] = pure func(_candidate): Ok(SourceCandidateCyclic("recursive proof"))
+	selected ?= accepted_match_source_trait_implementation_with(
+		fixture.authority, fixture.issuer, TYPE_INT,
+		bound_trait_identity_from_id(fixture.issuer, declaration.trait_id),
+		applicability,
+	).to_option()
+	Some(match selected:
+		SourceImplementationAbsent(cause): cause == Some("recursive proof")
+		_: False
+	)
+
+
+func test_guarded_source_keeps_cycle_cause_without_closed_packet() -> Bool:
+	guarded_source_keeps_cycle_cause_without_closed_packet().get_or(False)
+
+
+private func guarded_source_stops_at_first_deferred() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(ORDERED_SOURCE)
+	declaration ?= accepted_trait_find(fixture.authority, "Base")
+	applicability: pure (AcceptedSourceCandidate) -> Result[AcceptedSourceCandidateDecision[Bool, String], String] = pure func(candidate):
+		Ok(if trait_ids_equal(accepted_source_candidate_declared_trait(candidate), declaration.trait_id):
+			SourceCandidateDeferred("unresolved first candidate")
+		else:
+			SourceCandidateApplicable(True)
+		)
+	selected ?= accepted_match_source_trait_implementation_with(
+		fixture.authority, fixture.issuer, TYPE_INT,
+		bound_trait_identity_from_id(fixture.issuer, declaration.trait_id),
+		applicability,
+	).to_option()
+	Some(match selected:
+		SourceImplementationDeferred(candidate, pending):
+			(pending == "unresolved first candidate"
+			and trait_ids_equal(accepted_source_candidate_declared_trait(candidate), declaration.trait_id)
+			)
+		_: False
+	)
+
+
+func test_guarded_source_stops_at_first_deferred() -> Bool:
+	guarded_source_stops_at_first_deferred().get_or(False)
+
+
 tests: TestSuite = {
 	description = "Accepted semantic catalog",
 	tests = [
+		("scalar hash requires explicit implementation", test_scalar_hash_requires_explicit_implementation),
+		("graph owned scalar equality requires hash", test_graph_owned_scalar_equality_requires_hash),
+		("graph owned scalar equality and hash are admitted", test_graph_owned_scalar_equality_and_hash_are_admitted),
+		("exact bound authored hash precedes compiler fallback", test_exact_bound_authored_hash_precedes_compiler_fallback),
+		("graph owned scalar hash preserves default equality", test_graph_owned_scalar_hash_preserves_default_equality),
+		("conditional scalar equality requires hash without bound recursion", test_conditional_scalar_equality_requires_hash_without_bound_recursion),
+		("inapplicable scalar equality bound still requires explicit hash", test_inapplicable_scalar_equality_bound_still_requires_explicit_hash),
+		("orderable and namesake equality require explicit hash", test_orderable_and_namesake_equality_require_explicit_hash),
+		("installed Bool hash survives graph equality", test_installed_bool_hash_survives_graph_equality),
+		("guarded candidate retains declared supertraits", test_guarded_candidate_retains_declared_supertraits),
+		("guarded source cycle skips to later applicable", test_guarded_source_cycle_skips_to_later_applicable),
+		("guarded source keeps cycle cause without closed packet", test_guarded_source_keeps_cycle_cause_without_closed_packet),
+		("guarded source stops at first deferred", test_guarded_source_stops_at_first_deferred),
+		("installed builtin members agree with shared registry", test_installed_builtin_members_agree_with_shared_registry),
+		("source match preserves exact hidden member and issuer", test_source_match_preserves_exact_hidden_member_and_issuer),
+		("source match rejects metadata-preserving wrong IDs", test_source_match_rejects_metadata_preserving_wrong_ids),
+		("source match keeps private selection local", test_source_match_keeps_private_selection_local),
+		("source match retains own dependency positions", test_source_match_retains_own_dependency_positions),
+		("source match retains compiler declaring member", test_source_match_retains_compiler_declaring_member),
+		("source match projects inherited compiler member", test_source_match_projects_inherited_compiler_member),
 		("concrete method lookup preserves invalid and absent boundaries", test_concrete_method_lookup_preserves_invalid_and_absent_boundaries),
 		(
 			"compiler scope preserves obligation and selected metadata",

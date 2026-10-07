@@ -285,7 +285,7 @@ import:
 		TraitMethodSig,
 		TraitObligation,
 		TraitObligationResolution(TraitObligationSatisfied, TraitObligationUnsatisfied),
-		TypeKind(TypeBuiltin, TypeEnum, TypeResource, TypeScalarBuiltin, TypeUnion),
+		TypeKind(TypeBuiltin, TypeResource, TypeScalarBuiltin, TypeUnion),
 		VarMutability(ImmutableBinding),
 		VarOrigin(
 			ForLoopVar, FuncParam, LetBinding, MatchBinding, ScopedResource, ScopedResourceDerived,
@@ -459,7 +459,6 @@ import:
 		widening_decision,
 		widening_semantic_type,
 		widening_value_type,
-	type_system/union_layout: UnionLayout(TaggedUnion)
 	types: type_from_parsed_type_expr
 
 
@@ -469,7 +468,7 @@ union ExprTypeOrigin:
 	SynthesizedOrigin(String)
 
 
-enum ResolvedGraphCallableCategory:
+fixed union ResolvedGraphCallableCategory:
 	ResolvedSourceFunctionCall
 	ResolvedForeignFunctionCall
 
@@ -489,7 +488,7 @@ union ResolvedCallTarget:
 	ResolvedClosureCall
 
 
-enum ResolvedLoopProducer:
+fixed union ResolvedLoopProducer:
 	ResolvedLoopProducerIndices
 	ResolvedLoopProducerEnumerate
 	ResolvedLoopProducerEnumerate2
@@ -625,7 +624,7 @@ record TypedSelectArm {
 }
 
 
-enum TypedAssignScope:
+fixed union TypedAssignScope:
 	LocalAssignScope
 	ModuleAssignScope
 
@@ -1105,7 +1104,7 @@ private record ValidatedSubscriptIndices {
 }
 
 
-private enum OpaqueConversion:
+private fixed union OpaqueConversion:
 	OpaqueIntoConversion
 	OpaqueFromConversion
 
@@ -1399,7 +1398,7 @@ private pure func infer_find_impl_method_info_for_callee(
 			)
 
 
---- Fieldless enums reach the environment even when the accepted union authority owns them (`env_type_is_fieldless_enum`).
+--- Scalar-tag unions reach the environment even when the accepted union authority owns them (`env_type_is_scalar_tag_union`).
 private pure func infer_type_has_compiler_structural_equality(
 	session: InferSession,
 	typ: SemanticType,
@@ -1426,7 +1425,7 @@ private pure func infer_resolve_trait_obligation(
 	else:
 		-- Component-wise containers (List, Option, Result, tuples) are Equatable
 		-- exactly when their components are. Resolving the components here,
-		-- rather than through the stdlib impl's bounds, keeps enums (which only
+		-- rather than through the stdlib impl's bounds, keeps scalar-tag unions (which only
 		-- the module view can identify) admissible as components.
 		components = if trait_ids_equal(obligation.trait_id, TRAIT_ID_EQUATABLE):
 			equality_component_types(obligation.obligation_type)
@@ -8603,7 +8602,9 @@ private pure func infer_binary_operands(
 			}
 
 
--- Keep native scalars and legacy enums on their existing operator path.
+-- Keep native scalars on their existing operator path. Accepted scalar unions
+-- may author equality just like payload unions; selecting it here also keeps
+-- CTFE from evaluating tag equality before Core trait resolution.
 -- Declaration parameters, not just applied arguments, exclude phantom generics.
 private pure func explicit_binary_equality_receiver(
 	context: InferContext,
@@ -8612,7 +8613,7 @@ private pure func explicit_binary_equality_receiver(
 	match receiver:
 		SemanticNamedType(name, []):
 			match env_get_type_kind(context.state.env, name):
-				Some(TypeBuiltin) | Some(TypeScalarBuiltin) | Some(TypeResource) | Some(TypeEnum):
+				Some(TypeBuiltin) | Some(TypeScalarBuiltin) | Some(TypeResource):
 					False
 				_:
 					record_entry = module_view_accepted_record_authority(
@@ -8637,11 +8638,7 @@ private pure func explicit_binary_equality_receiver(
 							.map(
 								func(
 									entry,
-								): (
-									entry.type_params.is_empty()
-									and entry.layout == TaggedUnion
-									and not entry.contains_resource
-								),
+								): entry.type_params.is_empty() and not entry.contains_resource,
 							)
 							.get_or(False)
 					)
@@ -10581,7 +10578,7 @@ private pure func missing_hashable_help(context: InferContext, typ: SemanticType
 
 
 --- Which hash container a literal builds, for the key diagnostic's wording.
-enum HashContainerKind:
+fixed union HashContainerKind:
 	DictKeyContainer
 	SetElementContainer
 
@@ -10864,14 +10861,16 @@ private pure func check_trait_method_self_bound(
 					-- A call resolved only by trait spelling (no exact identity) names a
 					-- trait through the environment; a spelling the environment does not
 					-- know cannot be satisfied.
-					unsatisfied_trait_name: Option[String] = match call.trait_identity:
+					-- Retain the identity used for the failed obligation so diagnostic
+					-- help cannot mistake an unrelated namesake for a compiler trait.
+					unsatisfied_trait: Option[(String, Option[TraitId])] = match call.trait_identity:
 						Some(identity):
 							infer_find_unsatisfied_exact_trait_obligation(
 								context.state,
 								obligation_type,
 								identity,
 							).map(
-								func(_obligation): identity.name,
+								func(_obligation): (identity.name, Some(identity.trait_id)),
 							)
 						None:
 							match env_get_trait(context.state.env, trait_name):
@@ -10885,19 +10884,19 @@ private pure func check_trait_method_self_bound(
 											),
 										],
 									).map(
-										func(_obligation): trait_name,
+										func(_obligation): (trait_name, Some(trait_def.trait_id)),
 									)
 								None:
-									Some(trait_name)
+									Some((trait_name, None))
 
-					match unsatisfied_trait_name:
-						Some(unsatisfied_name):
+					match unsatisfied_trait:
+						Some((unsatisfied_name, unsatisfied_id)):
 							call_trait_bound_error(
 								context,
 								call.callee_name,
 								self_type,
 								unsatisfied_name,
-								None,
+								unsatisfied_id,
 							)
 						None:
 							context
@@ -12760,7 +12759,7 @@ private pure func infer_qualified_module_trait_call_expr(
 			None
 
 
-private enum VisibleUfcsOrigin:
+private fixed union VisibleUfcsOrigin:
 	OwnerVisibleUfcsOrigin
 	SelectiveVisibleUfcsOrigin
 	DirectVisibleUfcsOrigin
@@ -14214,9 +14213,9 @@ private pure func type_requires_resource_capability_scan(
 					accepted_union_contains(index, name)
 				None:
 					match env_get_type_kind(resource_type_facts_env(facts), name):
-						Some(kind):
-							kind == TypeUnion or kind == TypeEnum
-						None:
+						Some(TypeUnion(_)):
+							True
+						_:
 							False
 
 			if resource_type_scan_is_proven_unnecessary(facts, name):

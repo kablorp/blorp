@@ -1,4 +1,5 @@
 import:
+	../../../src/compiler/stage_06_typecheck/headers/native_managed_authority: native_managed_authority_no_native_fixture
 	fixtures/trait_identity_fixture: test_trait_id, test_trait_ids_equal
 	../../../src/compiler/stage_02_lex/name_table:
 		NameTable,
@@ -10,7 +11,7 @@ import:
 		synthesized_name_id,
 	../../../src/compiler/stage_02_lex/parse_diagnostic: parse_error
 	../../../src/compiler/stage_03_parse/parsed_ast:
-		UnionDeclarationForm(OrdinaryUnion, LegacyEnum),
+		UnionDeclarationForm(OrdinaryUnion, FixedUnion),
 		RecordDeclarationForm(OrdinaryRecord),
 		ConcurrentThreadLimit(DefaultThreadLimit, ThreadLimit),
 		ParsedBinaryOp(ParsedAddOp),
@@ -474,7 +475,7 @@ import:
 		canonical_module_type_name,
 		types_equal,
 	../../../src/compiler/stage_06_typecheck/type_system/type_widening: ValueSlot(KeptValueSlot)
-	../../../src/compiler/stage_06_typecheck/type_system/union_layout: UnionLayout(TaggedUnion)
+	../../../src/compiler/stage_06_typecheck/type_system/union_layout: UnionLayout(ScalarTagUnion, TaggedUnion)
 	../../../src/lib/source:
 		Cursor,
 		SourceFile,
@@ -1083,7 +1084,7 @@ pure func union_decl(name: String, variants: List[String]) -> ParsedDecl:
 	})
 
 
-pure func enum_decl(name: String, variants: List[String]) -> ParsedDecl:
+pure func scalar_union_decl(name: String, variants: List[String]) -> ParsedDecl:
 	UnionParsedDecl({
 		name = ident(name),
 		type_params = [],
@@ -1092,7 +1093,7 @@ pure func enum_decl(name: String, variants: List[String]) -> ParsedDecl:
 				fields = [],
 				span = fixture_source_span()
 			}),
-		form = LegacyEnum,
+		form = FixedUnion,
 		doc = None,
 		span = fixture_source_span(),
 	})
@@ -5963,7 +5964,7 @@ func test_foreign_default_args_use_accepted_enum_authority() -> Bool:
 	result = typecheck_test_program(
 		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
 		program([
-			enum_decl(
+			scalar_union_decl(
 				"NativeMode",
 				["NativeModeOn", "NativeModeOff"],
 			),
@@ -6055,12 +6056,17 @@ func test_accepted_payload_union_uses_graph_authority() -> Bool:
 			False
 
 
-func test_fixed_union_headers_use_ordinary_union_semantics() -> Bool:
+func test_union_headers_share_fieldless_scalar_layout() -> Bool:
 	var valid: Bool = True
-	for text in [
-		"fixed union Payload:\n\tItem(Int, String)\n\tEmpty()\n",
-		"fixed union Payload[T, #N]:\n\tItem(T, T[#N])\n\tEmpty\n",
-		"fixed union Payload:\n\tItem\n\tEmpty\n",
+	for (text, expected_layout) in [
+		("fixed union Payload:\n\tItem()\n\tEmpty()\n", ScalarTagUnion),
+		("union Payload:\n\tItem\n\tEmpty\n", ScalarTagUnion),
+		("fixed union Payload:\n\tItem\n\tEmpty\n", ScalarTagUnion),
+		("union Payload:\n\tItem(Int, String)\n\tEmpty()\n", TaggedUnion),
+		("fixed union Payload:\n\tItem(Int, String)\n\tEmpty()\n", TaggedUnion),
+		("union Payload[T]:\n\tItem\n\tEmpty\n", TaggedUnion),
+		("fixed union Payload[T]:\n\tItem\n\tEmpty\n", TaggedUnion),
+		("fixed union Payload[T, #N]:\n\tItem(T, T[#N])\n\tEmpty\n", TaggedUnion),
 	]:
 		result = typecheck_test_program(
 			typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
@@ -6069,9 +6075,10 @@ func test_fixed_union_headers_use_ordinary_union_semantics() -> Bool:
 		entry = module_view_accepted_union_authority(result.state.module_view).and_then(
 			func(index): accepted_union_find(index, "Payload"),
 		)
-		valid = valid and result.state.errors.is_empty() and match entry:
-			Some(accepted): accepted.layout == TaggedUnion and accepted.variants.length() == 2
-			None: False
+		valid = valid and result.state.errors.is_empty() and match (entry, result.program.decls.get(0)):
+			(Some(accepted), Some(TypedUnionDecl(typed))):
+				accepted.layout == expected_layout and typed.layout == accepted.layout and accepted.variants.length() == 2
+			_: False
 	valid
 
 
@@ -7386,7 +7393,8 @@ func test_validate_typed_program_rejects_unfinalized_meta() -> Bool:
 				decls = [TypedRecordDecl(typed_record)],
 				diagnostics = [],
 				type_definitions = [],
-				type_references = []
+				type_references = [],
+				native_managed_authority = native_managed_authority_no_native_fixture()
 			}
 			result: TypecheckProgramResult = typecheck_validate_typed_program({
 				state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
@@ -7432,7 +7440,8 @@ func test_function_body_solver_rejects_all_signature_metas_in_order() -> Bool:
 				decls = [TypedFunctionDecl(typed_function)],
 				diagnostics = [],
 				type_definitions = [],
-				type_references = []
+				type_references = [],
+				native_managed_authority = native_managed_authority_no_native_fixture()
 			}
 			result = typecheck_validate_typed_program({
 				state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
@@ -10272,8 +10281,8 @@ tests: TestSuite = {
 			test_accepted_payload_union_uses_graph_authority,
 		),
 		(
-			"fixed union headers use ordinary union semantics",
-			test_fixed_union_headers_use_ordinary_union_semantics,
+			"union headers share non-generic fieldless scalar layout",
+			test_union_headers_share_fieldless_scalar_layout,
 		),
 		(
 			"rejects foreign signatures for non-foreign origins",

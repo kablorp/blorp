@@ -11,6 +11,9 @@ import:
 	../../../src/compiler/stage_09_core/c_type_layout: type_requires_release
 	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN, unspelled_test_variant
 	../../../src/compiler/stage_09_core/ir:
+		CoreUnionTagAccess(ScalarTagAccess, ManagedTagAccess),
+		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
 		CoreAccessor(RootAccessor, VariantFieldAccessor),
 		CoreBoxKind(PointerBox),
 		CoreBoxedStorageValue,
@@ -254,11 +257,11 @@ pure func unique_var(name: String, id: Int) -> CoreVar:
 
 
 pure func expr_type() -> CoreType:
-	UnionType("Expr")
+	UnionType("Expr", ManagedUnionValue)
 
 
 pure func union_type(name: String) -> CoreType:
-	UnionType(name)
+	UnionType(name, ManagedUnionValue)
 
 
 pure func int_type() -> CoreType:
@@ -320,7 +323,7 @@ pure func expr_union_decl() -> CoreUnionDecl:
 		abi_type = None,
 		name = "Expr",
 		type_params = [],
-		payload_storage = ErasedUnionPayloadStorage,
+		storage = ManagedPayloadStorage(ErasedUnionPayloadStorage),
 		variants = [
 			{
 				name = "Add",
@@ -533,7 +536,7 @@ pure func constructor_case(
 	{
 		constructor = constructor_name,
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest(unspelled_test_variant(), type_name),
+		test = UnionTagConstructorTest(unspelled_test_variant(), ManagedTagAccess(type_name)),
 		bindings = bindings,
 		body = ConstructorMatchBodyExpr(body)
 	}
@@ -1716,6 +1719,47 @@ pure func test_prepared_reuse_recognizes_union_and_zero_arg_named_types() -> Boo
 	)
 
 	union_type_count == 1 and named_type_count == 1 and parameterized_count == 0
+
+
+---
+The source Num leaf has no payload. Its result Add owns two closed Num values,
+so managed storage reaches the nonempty-allocation reuse path. The identical
+allocation-shaped result is adversarial under the scalar declaration, which
+must not enter the managed registry through a NamedType or managed-type view.
+---
+pure func prepared_fieldless_reuse_count(storage: CoreUnionStorage, typ: CoreType) -> Int:
+	scalar_decl: CoreUnionDecl = {
+		expr_union_decl() | storage = storage, variants = [{
+			name = "Num", tag = 2, fields = [], def_id = None
+		}]
+	}
+	declaration: CoreUnionDecl = match storage:
+		ManagedPayloadStorage(_):
+			expr_union_decl()
+		ScalarTagStorage:
+			scalar_decl
+	num_value: CoreExpr = union_construct("Expr", "Num", unspelled_test_variant(), typ, [])
+	add_value: CoreExpr = union_construct(
+		"Expr", "Add", unspelled_test_variant(), typ,
+		[pointer_box(num_value), pointer_box(num_value)],
+	)
+	body: CoreExpr = prepared_let_drop_with_type(
+		typ,
+		prepared_match_for(
+			"Expr", "Num", typ, typed_var_expr(expr_var(), typ), [],
+			add_value,
+		),
+	)
+	rewrite_program_reuse_count([UnionDecl(declaration)], body)
+
+
+pure func test_prepared_reuse_excludes_scalar_declaration_views() -> Bool:
+	(
+		prepared_fieldless_reuse_count(ManagedPayloadStorage(ErasedUnionPayloadStorage), named_expr_type()) == 1
+		and prepared_fieldless_reuse_count(ScalarTagStorage, named_expr_type()) == 0
+		and prepared_fieldless_reuse_count(ScalarTagStorage, UnionType("Expr", ScalarTagValue)) == 0
+		and prepared_fieldless_reuse_count(ScalarTagStorage, expr_type()) == 0
+	)
 
 
 ---
@@ -3481,6 +3525,7 @@ tests: TestSuite = {
 			"prepared reuse recognizes union and zero-argument named types",
 			test_prepared_reuse_recognizes_union_and_zero_arg_named_types,
 		),
+		("prepared reuse excludes scalar declaration views", test_prepared_reuse_excludes_scalar_declaration_views),
 		(
 			"prepared reuse rejects generic construct of builtin variant",
 			test_prepared_reuse_rejects_generic_construct_of_builtin_variant,

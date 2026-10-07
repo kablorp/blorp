@@ -1,0 +1,292 @@
+-- Static caller evidence is constructed here, never in the accepted authority
+-- owners. This context borrows one validated module's facts; the builtin
+-- inventory and topology are prepared once, not rebuilt for each obligation.
+import:
+	../../stage_04_modules/module_table: ModuleId, module_ids_equal
+	../graph/definition_index:
+		DefinitionTable,
+		definition_table_module_table,
+		definition_tables_share_provenance,
+	../headers/implementation_headers:
+		ImplementationHeaderGraph,
+		implementation_header_graph_definition_table,
+		implementation_header_graph_callable_headers, implementation_header_graph_headers,
+		implementation_header_methods, implementation_method_header_id,
+	../headers/callable_headers: callable_header_graph_find
+	../headers/declaration_skeleton: CallableId, callable_id_module_id, callable_ids_equal
+	../modules/module_view:
+		ModuleView,
+		module_view_accepted_callable_authority,
+		module_view_accepted_trait_implementation_authority,
+		module_view_accepted_union_authority,
+		module_view_graph_has_owner,
+	accepted_callable_authority:
+		AcceptedCallableAuthority,
+		accepted_callable_authority_definition_table,
+		accepted_callable_authority_owner_module_id,
+		accepted_callable_find_exact,
+	generic_params: BoundTypeParam, BoundTraitIdentity
+	implementation_bound_params: implementation_bound_type_params, implementation_method_bound_type_params
+	accepted_trait_implementation_authority:
+		AcceptedTraitImplementationAuthority,
+		accepted_trait_implementation_authority_definition_table,
+		accepted_trait_implementation_authority_owner_module_id,
+	accepted_union_authority:
+		AcceptedUnionAuthority,
+		accepted_union_authority_definition_table,
+		accepted_union_authority_owner_module_id,
+	builtins:
+		BuiltinImplementationFact,
+		BuiltinTraitEvidenceRegistry,
+		builtin_implementation_facts,
+		builtin_trait_evidence_registry,
+
+
+private record TraitEvidenceContextRep {
+	view: ModuleView,
+	issuer: DefinitionTable,
+	owner: ModuleId,
+	headers: ImplementationHeaderGraph,
+	traits: AcceptedTraitImplementationAuthority,
+	unions: AcceptedUnionAuthority,
+	callables: AcceptedCallableAuthority,
+	builtin_facts: List[BuiltinImplementationFact],
+	builtin_registry: BuiltinTraitEvidenceRegistry
+}
+
+
+opaque type TraitEvidenceContext = TraitEvidenceContextRep
+
+
+---
+Borrow authorities from an actual accepted module view under their existing
+definition-table provenance contract. Graphless/unindexed lexical issuance is
+not supported by this constructor; absence cannot grant a lexical owner.
+---
+pure func trait_evidence_context(
+	view: ModuleView,
+	issuer: DefinitionTable,
+	headers: ImplementationHeaderGraph,
+) -> Result[TraitEvidenceContext, String]:
+	traits ?= module_view_accepted_trait_implementation_authority(view).to_result(
+		"trait evidence context requires accepted module trait authority",
+	)
+	unions ?= module_view_accepted_union_authority(view).to_result(
+		"trait evidence context requires accepted module union authority",
+	)
+	callables ?= module_view_accepted_callable_authority(view).to_result(
+		"trait evidence context requires accepted module callable authority",
+	)
+	if not (
+		definition_tables_share_provenance(issuer, accepted_trait_implementation_authority_definition_table(traits))
+		and definition_tables_share_provenance(issuer, accepted_union_authority_definition_table(unions))
+		and definition_tables_share_provenance(issuer, accepted_callable_authority_definition_table(callables))
+	):
+		Err("trait evidence context issuer does not match accepted module authorities")
+	else if not definition_tables_share_provenance(issuer, implementation_header_graph_definition_table(headers)):
+		Err("trait evidence context headers do not match accepted issuer")
+	else:
+		owner ?= accepted_trait_implementation_authority_owner_module_id(traits).to_result(
+			"trait evidence context requires an accepted module owner",
+		)
+		union_owner ?= accepted_union_authority_owner_module_id(unions).to_result(
+			"trait evidence context requires an accepted union module owner",
+		)
+		callable_owner ?= accepted_callable_authority_owner_module_id(callables).to_result(
+			"trait evidence context requires an accepted callable module owner",
+		)
+		if not (
+			module_ids_equal(owner, union_owner)
+			and module_ids_equal(owner, callable_owner)
+			and module_view_graph_has_owner(view, definition_table_module_table(issuer), owner)
+		):
+			Err("trait evidence context authority owner does not match accepted module view")
+		else:
+			registry ?= builtin_trait_evidence_registry()
+			Ok(into_opaque TraitEvidenceContext({
+				view = view, issuer = issuer, owner = owner, headers = headers,
+				traits = traits, unions = unions, callables = callables,
+				builtin_facts = builtin_implementation_facts(), builtin_registry = registry
+			}))
+
+
+private record TraitEvidenceLexicalOwnerRep {
+	issuer: DefinitionTable,
+	callable: CallableId,
+	module: ModuleId
+}
+
+
+opaque type TraitEvidenceLexicalOwner = TraitEvidenceLexicalOwnerRep
+
+
+private record TraitEvidenceBoundSlotRep {
+	owner: TraitEvidenceLexicalOwner,
+	parameter_index: Int,
+	bound_index: Int,
+	bound: BoundTraitIdentity
+}
+
+
+opaque type TraitEvidenceBoundSlot = TraitEvidenceBoundSlotRep
+
+
+private record TraitEvidenceCallableSlotsRep {
+	owner: TraitEvidenceLexicalOwner,
+	parameters: List[BoundTypeParam],
+	slots: List[TraitEvidenceBoundSlot]
+}
+
+
+opaque type TraitEvidenceCallableSlots = TraitEvidenceCallableSlotsRep
+
+
+private record TraitEvidenceLexicalContextRep {
+	context: TraitEvidenceContext,
+	slots: TraitEvidenceCallableSlots
+}
+
+
+opaque type TraitEvidenceLexicalContext = TraitEvidenceLexicalContextRep
+
+
+private pure func callable_bound_parameters(
+	context: TraitEvidenceContextRep,
+	id: CallableId,
+) -> Result[List[BoundTypeParam], String]:
+	owner ?= callable_id_module_id(context.issuer, id).to_result(
+		"trait evidence callable has no accepted module owner",
+	)
+	if not module_ids_equal(owner, context.owner):
+		Err("trait evidence callable owner does not match context module")
+	else:
+		callables = implementation_header_graph_callable_headers(context.headers)
+		match callable_header_graph_find(callables, id):
+			Some(_):
+				entry ?= accepted_callable_find_exact(context.callables,
+					definition_table_module_table(context.issuer), id).to_result(
+					"trait evidence callable has no accepted signature",
+				)
+				-- The accepted signature has already normalized variadic-only
+				-- parameters. Raw annotation positions are not evidence positions.
+				Ok(entry.type_params)
+			None:
+				implementation ?= implementation_header_graph_headers(context.headers).find(func(header):
+					implementation_header_methods(header).any(func(method):
+						callable_ids_equal(implementation_method_header_id(method), id)
+					)
+				).to_result("trait evidence callable has no accepted header")
+				method ?= implementation_header_methods(implementation).find(func(header):
+					callable_ids_equal(implementation_method_header_id(header), id)
+				).to_result("trait evidence implementation method has no accepted header")
+				Ok(implementation_bound_type_params(context.issuer, implementation).concat(
+					implementation_method_bound_type_params(context.issuer, method),
+				))
+
+
+---
+IDs are relative to an explicit issuing table. Bare numeric equality never
+establishes provenance. Unindexed/graphless callable issuance is unsupported.
+---
+pure func trait_evidence_callable_slots(
+	context: TraitEvidenceContext,
+	issuer: DefinitionTable,
+	id: CallableId,
+) -> Result[TraitEvidenceCallableSlots, String]:
+	representation = from_opaque TraitEvidenceContext(context)
+	if not definition_tables_share_provenance(representation.issuer, issuer):
+		Err("trait evidence callable issuer does not match context")
+	else:
+		parameters ?= callable_bound_parameters(representation, id)
+		owner: TraitEvidenceLexicalOwner = into_opaque TraitEvidenceLexicalOwner({
+			issuer = issuer, callable = id, module = representation.owner
+		})
+		var slots: List[TraitEvidenceBoundSlot] = []
+		var parameter_index: Int = 0
+		for parameter in parameters:
+			var bound_index: Int = 0
+			for bound in parameter.bound_identities:
+				slot: TraitEvidenceBoundSlot = into_opaque TraitEvidenceBoundSlot({
+					owner = owner, parameter_index = parameter_index, bound_index = bound_index, bound = bound
+				})
+				slots = slots.append(slot)
+				bound_index = bound_index + 1
+			parameter_index = parameter_index + 1
+		Ok(into_opaque TraitEvidenceCallableSlots({
+			owner = owner, parameters = parameters, slots = slots
+		}))
+
+
+pure func trait_evidence_lexical_context(
+	context: TraitEvidenceContext,
+	issuer: DefinitionTable,
+	active: CallableId,
+	slots: TraitEvidenceCallableSlots,
+) -> Result[TraitEvidenceLexicalContext, String]:
+	representation = from_opaque TraitEvidenceContext(context)
+	bundle = from_opaque TraitEvidenceCallableSlots(slots)
+	owner = from_opaque TraitEvidenceLexicalOwner(bundle.owner)
+	if not definition_tables_share_provenance(representation.issuer, issuer):
+		Err("trait evidence active callable issuer does not match context")
+	else if not definition_tables_share_provenance(representation.issuer, owner.issuer):
+		Err("trait evidence lexical slot issuer does not match context")
+	else if not callable_ids_equal(active, owner.callable):
+		Err("trait evidence lexical slots do not belong to active callable")
+	else if not module_ids_equal(representation.owner, owner.module):
+		Err("trait evidence callable owner does not match context module")
+	else:
+		-- Bundle issuance already fixed parameter/bound positions; validating
+		-- the active owner prevents another callable's same-spelled T proving it.
+		-- The same immutable issuer and exact ID retain the already-validated
+		-- header; do not rebuild method parameter lists merely to check ownership.
+		Ok(into_opaque TraitEvidenceLexicalContext({context = context, slots = slots}))
+
+
+pure func trait_evidence_lexical_slot(
+	context: TraitEvidenceLexicalContext,
+	slot: TraitEvidenceBoundSlot,
+) -> Result[TraitEvidenceBoundSlot, String]:
+	representation = from_opaque TraitEvidenceLexicalContext(context)
+	bundle = from_opaque TraitEvidenceCallableSlots(representation.slots)
+	active = from_opaque TraitEvidenceLexicalOwner(bundle.owner)
+	selected = from_opaque TraitEvidenceLexicalOwner(from_opaque TraitEvidenceBoundSlot(slot).owner)
+	if not definition_tables_share_provenance(active.issuer, selected.issuer):
+		Err("trait evidence detached slot issuer does not match active callable")
+	else if not callable_ids_equal(active.callable, selected.callable):
+		Err("trait evidence detached slot does not belong to active callable")
+	else:
+		Ok(slot)
+
+
+pure func trait_evidence_slot_owner(slot: TraitEvidenceBoundSlot) -> TraitEvidenceLexicalOwner:
+	from_opaque TraitEvidenceBoundSlot(slot).owner
+
+
+pure func trait_evidence_lexical_owner_callable(owner: TraitEvidenceLexicalOwner) -> CallableId:
+	from_opaque TraitEvidenceLexicalOwner(owner).callable
+
+
+pure func trait_evidence_lexical_owner_issuer(owner: TraitEvidenceLexicalOwner) -> DefinitionTable:
+	from_opaque TraitEvidenceLexicalOwner(owner).issuer
+
+
+pure func trait_evidence_callable_bound_slots(slots: TraitEvidenceCallableSlots) -> List[TraitEvidenceBoundSlot]:
+	from_opaque TraitEvidenceCallableSlots(slots).slots
+
+
+-- Forwarding resolves SemanticTypeVar spelling only within this validated
+-- active owner's effective inventory; parameter position remains authoritative.
+pure func trait_evidence_callable_parameters(slots: TraitEvidenceCallableSlots) -> List[BoundTypeParam]:
+	from_opaque TraitEvidenceCallableSlots(slots).parameters
+
+
+pure func trait_evidence_slot_parameter_index(slot: TraitEvidenceBoundSlot) -> Int:
+	from_opaque TraitEvidenceBoundSlot(slot).parameter_index
+
+
+pure func trait_evidence_slot_bound_index(slot: TraitEvidenceBoundSlot) -> Int:
+	from_opaque TraitEvidenceBoundSlot(slot).bound_index
+
+
+pure func trait_evidence_slot_bound(slot: TraitEvidenceBoundSlot) -> BoundTraitIdentity:
+	from_opaque TraitEvidenceBoundSlot(slot).bound

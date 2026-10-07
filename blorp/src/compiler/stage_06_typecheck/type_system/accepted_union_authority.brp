@@ -30,14 +30,13 @@ import:
 		env_get_type_decl,
 		env_get_type_kind,
 		env_type_contains_resource_if_valid,
-		env_type_is_enum,
 		env_type_may_contain_function,
 		env_type_may_contain_one_shot_stream,
 		env_type_may_contain_resource_source,
 	list: repeat
 	memory: same_object
-	semantic_type: SemanticType, localize_module_types, localize_module_types_list, types_equal
-	union_layout: UnionLayout(FieldlessEnum, TaggedUnion)
+	semantic_type: SemanticType(SemanticNamedType), localize_module_types, localize_module_types_list, types_equal
+	union_layout: UnionLayout(ScalarTagUnion, TaggedUnion)
 
 
 record AcceptedUnionVariantEntry {
@@ -276,15 +275,12 @@ private pure func builtin_union_entry_from_env(
 							Some(message):
 								Err(message)
 							None:
-								layout = if env_type_is_enum(env, name):
-									FieldlessEnum
-								else:
-									TaggedUnion
-
 								Ok({
 									type_params = type_params,
 									variants = projected,
-									layout = layout,
+									-- The validated TypeBuiltin projection keeps its existing
+									-- managed union layout; source layouts come from headers.
+									layout = TaggedUnion,
 									contains_resource = contains_resource,
 									may_contain_function = may_contain_function,
 									may_contain_one_shot_stream = may_contain_one_shot_stream,
@@ -837,6 +833,49 @@ pure func accepted_union_authority_without_visible_names(
 		})
 
 
+pure func accepted_union_authority_definition_table(authority: AcceptedUnionAuthority) -> DefinitionTable:
+	table_rep(authority_rep(authority).table).definition_table
+
+
+pure func accepted_union_authority_owner_module_id(authority: AcceptedUnionAuthority) -> Option[ModuleId]:
+	representation = authority_rep(authority)
+	path ?= representation.owner_module_path
+	module_table_find_id_by_canonical_path(
+		definition_table_module_table(table_rep(representation.table).definition_table), path,
+	)
+
+
+---
+Current scalar-family capability for the shared accepted non-generic,
+payload-free union layout, independent of declaration spelling.
+Resolve the semantic receiver through this accepted view, then retain its
+exact issued type identity rather than a display-name capability.
+---
+pure func accepted_union_scalar_tag_identity(
+	authority: AcceptedUnionAuthority,
+	issuer: DefinitionTable,
+	receiver: SemanticType,
+) -> Result[Option[TypeId], String]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	if not definition_tables_share_provenance(table.definition_table, issuer):
+		Err("compiler scalar union evidence issuer does not match accepted authority")
+	else:
+		match receiver:
+			SemanticNamedType(name, []):
+				match union_index_for_name(representation, table, name):
+					None: Ok(None)
+					Some(index):
+						entry ?= table.unions.get(index).to_result("compiler scalar union evidence union row is absent")
+						if entry.layout == ScalarTagUnion and entry.type_params.is_empty():
+							id ?= union_id_at(table.graph_type_ids_by_union_index, index)
+								.to_result("compiler scalar union evidence requires an issued union type identity")
+							Ok(Some(id))
+						else:
+							Ok(None)
+			_: Ok(None)
+
+
 private pure func union_index_for_name(
 	representation: AcceptedUnionAuthorityRep,
 	table: AcceptedUnionTableRep,
@@ -1220,14 +1259,13 @@ pure func accepted_union_table_definition_table(table: AcceptedUnionTable) -> De
 	table_rep(table).definition_table
 
 
-pure func accepted_union_is_enum(authority: AcceptedUnionAuthority, name: String) -> Option[Bool]:
-	-- Transitional projection: header selection remains LegacyEnum-only.
-	-- Foreign scalar admission uses this helper, including Option. Before shared
-	-- shape-derived scalar eligibility, native admission needs independent explicit
-	-- authority: storage alone must not admit an ordinary union to native ABI.
+pure func accepted_union_is_scalar_tag(authority: AcceptedUnionAuthority, name: String) -> Option[Bool]:
+	-- Physical scalar-tag projection of the header-owned non-generic,
+	-- payload-free scalar shape. All union source spellings share this fact;
+	-- existing trait and foreign scalar policies consume the same authority.
 	accepted_union_entry_raw(authority, name).map(func(entry):
 		match entry.layout:
-			FieldlessEnum:
+			ScalarTagUnion:
 				True
 			TaggedUnion:
 				False

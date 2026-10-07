@@ -1,5 +1,6 @@
 import:
 	bytes: bytes
+	channel: sleep_for
 	fs: IOError, resource_path, temporary_directory
 	process:
 		ProcessCaptureLimit(BoundedCapture, UnboundedCapture),
@@ -34,10 +35,10 @@ import:
 		write_stdin,
 		write_stdin_from,
 	string: parse_int, repeat, trim
-	system: file_exists, setenv, temp_dir
+	system: file_exists, now_microseconds, setenv, temp_dir
 	test: TestSuite
 	time: now
-	units: from_bytes, milliseconds
+	units: from_bytes, milliseconds, to_microseconds
 
 
 private SIMULTANEOUS_OUTPUT_BYTES: Int = 65536
@@ -755,21 +756,43 @@ func session_command_reports_post_start_interruption() -> Result[Bool, IOError]:
 				Ok(False)
 
 
-func session_command_preserves_output_before_timeout() -> Bool:
-	request = { command(
-		"sh",
-		["-c", "printf before; printf warning >&2; trap '' TERM; sleep 5"],
-	) | timeout = Some(milliseconds(20)) }
+func session_command_preserves_buffered_output_on_late_timeout_poll() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_session_timeout_"):
+		marker: String = directory.resource_path() + "/output_ready"
+		readiness_budget = milliseconds(2000)
+		readiness_poll_interval = milliseconds(1)
+		readiness_deadline: Int = now_microseconds() + to_microseconds(readiness_budget)
+		-- POSIX sleep takes seconds; this named 100ms delay exceeds the 20ms lifetime.
+		pre_output_delay_seconds: String = "0.1"
+		request = { command(
+			"sh",
+			[
+				"-c",
+				"sleep ${pre_output_delay_seconds}; printf before; printf warning >&2; trap '' TERM; printf ready > \"$1\"; sleep 5",
+				"sh",
+				marker,
+			],
+		) | timeout = Some(milliseconds(20)) }
+		-- Delay caller polling until both writes and TERM setup are confirmed.
+		-- The session deadline keeps running; the first late poll must enforce it
+		-- and preserve queued output. Ordinary deadline tests above cover timely polling.
+		wait_for_output: () -> Option[Int] = func():
+			while not file_exists(marker) and now_microseconds() < readiness_deadline:
+				sleep_for(readiness_poll_interval)
+			None
 
-	match run_session_command(request):
-		SessionCommandCompleted(result):
-			(
-				result.exit == TimedOut
-				and result.stdout.to_string() == "before"
-				and result.stderr.to_string() == "warning"
-			)
-		_:
-			False
+		match run_session_command_until(request, wait_for_output):
+			SessionCommandCompleted(result):
+				Ok(
+					(
+						file_exists(marker)
+						and result.exit == TimedOut
+						and result.stdout.to_string() == "before"
+						and result.stderr.to_string() == "warning"
+					),
+				)
+			_:
+				Ok(False)
 
 
 func session_command_reports_capture_limit() -> Bool:
@@ -1212,8 +1235,8 @@ func test_session_command_adapter_reports_post_start_interruption() -> Bool:
 	session_command_reports_post_start_interruption() == Ok(True)
 
 
-func test_session_command_adapter_preserves_output_before_timeout() -> Bool:
-	session_command_preserves_output_before_timeout()
+func test_session_command_adapter_preserves_buffered_output_on_late_timeout_poll() -> Bool:
+	session_command_preserves_buffered_output_on_late_timeout_poll() == Ok(True)
 
 
 func test_session_command_adapter_reports_capture_limit() -> Bool:
@@ -1301,8 +1324,8 @@ tests: TestSuite = {
 			test_session_command_adapter_reports_post_start_interruption,
 		),
 		(
-			"command adapter preserves output before timeout",
-			test_session_command_adapter_preserves_output_before_timeout,
+			"command adapter preserves buffered output on late timeout poll",
+			test_session_command_adapter_preserves_buffered_output_on_late_timeout_poll,
 		),
 		(
 			"command adapter reports capture limit",

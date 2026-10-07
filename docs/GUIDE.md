@@ -216,7 +216,7 @@ func main(args: List[String]) -> Int:
 Compile-time evaluation follows source order, so later constants can reference
 earlier evaluated constants. A constant may not reference itself or a later
 constant. A constant may also be initialized from another module's constant,
-including records, enums, unions and lists whose types that module
+including records, unions and lists whose types that module
 owns. Top-level `var` bindings are mutable runtime globals, not constants.
 Local `var` mutation is allowed inside pure functions evaluated by the
 compiler.
@@ -229,7 +229,7 @@ statement-style `if` without `else`, `match`, blocks with local bindings, local
 tuple destructuring, tuples, lists, dicts, records, record updates, record field
 access, tuple field access, range `start`/`end` field access, and string
 interpolation with `String`/`Int`/`Float`/`Bool`/`Char` expression parts. It
-also supports union and enum constructors, direct local pure function calls
+also supports union constructors, direct local pure function calls
 including tuple-pattern parameters, recursion, pure lambda and named-function
 callbacks, vector/tensor literals, tensor constructors, tensor subscripts,
 tensor length and matrix shape helpers, pure `List` construction, lookup,
@@ -1035,7 +1035,6 @@ These types are `Hashable` already:
 
 - integers of every width, `Float`, `Float32`, `Float16`, `Bool`, `Char` and
   `String`;
-- fieldless enums, compared and hashed by variant;
 - `StringSlice` (by contents, hashing like the equal `String`) and `Bytes`
   (byte by byte);
 - tuples of two to four elements, `List[T]`, `Option[T]` and `Result[T, E]`
@@ -1300,7 +1299,7 @@ the planned checked `fixed union` payload guarantee.
 
 Both union spellings let you declare a payload-free variant as `Empty` or
 `Empty()`; the formatter prints `Empty`. The constructor is a value: refer to
-it as `Empty`, not a call `Empty()`. Enum cases remain bare names without parentheses.
+it as `Empty`, not a call `Empty()`.
 
 ```blorp
 -- Temporary synonym behavior; this payload will not satisfy checked fixed unions.
@@ -1314,27 +1313,33 @@ The planned checked `fixed union` constraint will reject direct or nested
 payloads such as `String` when preparing for that constraint. This checked
 guarantee is not enforced by the current synonym.
 
-### Enum Types
+### Payload-Free Unions
 
-Enums are lightweight union types with no associated data — variants are simple named constants backed by integers:
+Use `fixed union` for named alternatives with no associated data. The qualifier
+currently has ordinary union semantics. Non-generic payload-free shape selects
+scalar tag storage for both spellings; the qualifier itself promises no storage,
+boxing or placement guarantee:
 
 ```blorp
-enum Color:
+fixed union Color:
     Red
     Green
     Blue
 
-enum Direction:
+fixed union Direction:
     North
     South
     East
     West
 ```
 
-Enums support pattern matching (with exhaustiveness checking), equality, `to_string`, storage in lists, and use as function parameters:
+Non-generic payload-free unions support exhaustive pattern matching, default tag
+`Equatable`, storage in lists, and use as function parameters. Neither union
+spelling derives `Hashable`; hashed keys need a written implementation consistent
+with their equality, including under the [custom equality policy](#7-traits):
 
 ```blorp
-enum Color:
+fixed union Color:
     Red
     Green
     Blue
@@ -1348,21 +1353,22 @@ pure func describe(c: Color) -> String:
 colors: List[Color] = [Red, Green, Blue]
 same: Bool = Red == Red
 different: Bool = Red != Blue
-name: String = to_string(Red)
 ```
 
-For variants that carry data (payloads), use `union` instead of `enum`. An `enum` case is only a name: `Circle(Float)` and even `Red()` in an `enum` are parse errors ("an `enum` case is only a name").
+Both `union` and the current `fixed union` synonym can carry payloads and type
+parameters. No checked fixed-payload guarantee is active.
 
 #### Coming From Other Languages?
 
-The naming of `union` and `enum` in blorp differs from some languages:
+Blorp's `union` describes alternatives with or without data:
 
 | Blorp | Rust | Haskell | TypeScript | Java |
 |-------|------|---------|------------|------|
 | `union` (variants with data) | `enum` | `data` | discriminated union | sealed interface |
-| `enum` (simple named constants) | C-style enum | — | string literal union | `enum` |
+| payload-free `fixed union` | fieldless `enum` | `data` | string literal union | `enum` |
 
-If you're coming from **Rust**: blorp's `union` is Rust's `enum` (variants carry data, pattern-matchable). Blorp's `enum` is closer to a C-style enum (no payloads, just named tags).
+If you're coming from **Rust**, Blorp's `union` serves the same role as Rust's
+`enum`. Use payload-free variants for simple named alternatives.
 
 ```blorp
 -- Blorp union = Rust enum (data-carrying variants)
@@ -1370,8 +1376,8 @@ union Shape:
     Circle(Float)
     Rectangle(Float, Float)
 
--- Blorp enum = Rust fieldless enum (no data, just names)
-enum Direction:
+-- A payload-free fixed union has no data, just names.
+fixed union Direction:
     North
     South
     East
@@ -1896,10 +1902,10 @@ result2: Option[Int] = safe_divide(10, 2)
 ```
 
 Representation note: `Option[T]` is optimized by payload type. Primitive
-numeric/bool/char payloads, `Int128`/`UInt128`, bounded range types, and enums
+numeric/bool/char payloads, `Int128`/`UInt128`, bounded range types, and non-generic payload-free unions
 use stack `{tag, value}` layouts, as do inline fixed records and first-class
 `Range`. Managed payloads such as `String`, `List[T]`, managed records,
-non-enum `union`, tuples, and functions use an internal nullable-pointer
+managed unions, tuples, and functions use an internal nullable-pointer
 layout. Nested options, `Ptr`, unresolved
 generic payloads, and unsupported payloads stay boxed so `Some(x)` and `None`
 remain distinguishable.
@@ -2401,7 +2407,12 @@ implements Equatable for Vec2:
 There is no identity fallback: a value compares only through an `Equatable`
 implementation. Records whose fields are all `Equatable` derive one
 ([Derived Equality](#derived-equality)); a union with payloads needs a written
-one. Payload-free `enum`s are compared by tag and need no implementation, and the standard library provides the implementations for scalars, `String`, tuples, `Option`, `Result`, `List`, and `Dict`. `Option[T]`, `Result[T, E]`, tuples, `List[T]`, and the values of `Dict[K, V]` are `Equatable` exactly when their components are, so `Option[Listener]` is rejected when `Listener` is a record with a function field.
+one. Non-generic payload-free unions of either spelling are compared by tag and
+need no implementation, and the standard library provides the implementations
+for scalars, `String`, tuples, `Option`, `Result`, `List`, and `Dict`.
+`Option[T]`, `Result[T, E]`, tuples, `List[T]`, and the values of `Dict[K, V]`
+are `Equatable` exactly when their components are, so `Option[Listener]` is
+rejected when `Listener` is a record with a function field.
 
 `List[T]` is `Equatable` exactly when `T` is: `==` compares lengths, then elements
 with the element type's own `==`, so lists of lists, options, and records
@@ -2496,8 +2507,11 @@ against the implementation's type, so a default that uses an operation the
 type lacks (`self + self` on a type that is not `Addable`) is a compile error
 for that implementation; write the method in the implementation instead.
 
-Fieldless enums implement `Equatable` and `Hashable` without an `implements`
-block, so they satisfy `T: Equatable` and `T: Hashable` bounds.
+Non-generic payload-free unions of either spelling supply default tag
+`Equatable`; an authored implementation wins. `Hashable` is separate and must
+be implemented explicitly for hashing, `T: Hashable` bounds, Dict keys and Set
+elements. Equal keys must have the same hash. Payload-bearing and generic
+default union equality remains planned, not implemented by this slice.
 
 ### Derived Equality
 
@@ -3499,7 +3513,7 @@ foreign:
 | `pure func` in a `foreign:` block | No | Yes |
 | `@no_copy func` in a `foreign:` block | No | No |
 
-**Default (safe):** impure functions in a `foreign:` block copy eligible mutable runtime buffers before passing them to C. Today that covers `String` and `Bytes` arguments. The C function receives its own call-local copy that it can read or write without affecting the original blorp data. Copies are automatically released after the call returns, so C code must not retain or return pointers to those argument copies. Other managed arguments such as lists, dicts, sets, tensors, records, unions, and function values are rejected in default mode until they have explicit defensive-copy support. Scalar by-value arguments, including user enums, are allowed. User enums use C `long` at the foreign boundary. A C function returning a user enum must return one of that enum's declared integer tags; any other value violates the foreign-function contract. Use `@no_copy` only when the C function borrows the value without mutating or retaining it.
+**Default (safe):** impure functions in a `foreign:` block copy eligible mutable runtime buffers before passing them to C. Today that covers `String` and `Bytes` arguments. The C function receives its own call-local copy that it can read or write without affecting the original blorp data. Copies are automatically released after the call returns, so C code must not retain or return pointers to those argument copies. Other managed arguments such as lists, dicts, sets, tensors, records, managed unions, and function values are rejected in default mode until they have explicit defensive-copy support. Scalar by-value arguments, including non-generic payload-free unions under either `union` or `fixed union` spelling, are allowed. These unions use C `long` at the foreign boundary. A C function returning such a union must return one of its declared integer tags; any other value violates the foreign-function contract. Use `@no_copy` only when the C function borrows the value without mutating or retaining it.
 
 **Pure:** `pure func` inside a `foreign:` block asserts that the C function is referentially transparent — no side effects, no mutation. This allows it to be called from `pure func` in blorp. No defensive copy is made since pure functions don't mutate. Use this for math functions, hash functions, and other stateless computations.
 
@@ -3627,7 +3641,7 @@ for source formatting.
 ## 18. Keywords
 
 ```
-func       pure       var        union      enum       record     trait
+func       pure       var        union      record     trait
 type       alias      opaque     private    import     as         implements Self
 builtin    on
 match      while      for        in         if         else       and        or
@@ -3638,3 +3652,6 @@ resource   where      into_opaque from_opaque
 
 `fixed` is contextual before `record` or `union` at a declaration opening; it
 remains an ordinary identifier elsewhere.
+
+`enum` is an ordinary identifier, not a declaration keyword. Declare named
+alternatives with `union` or `fixed union`.

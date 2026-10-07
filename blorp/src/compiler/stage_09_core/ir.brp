@@ -23,6 +23,8 @@ import:
 		module_table_find_id_by_canonical_path,
 		module_table_origin,
 	../stage_06_typecheck/type_system/language_surface_manifest:
+		NativeManagedBuiltin(NativeIpAddress, NativeDnsName, NativeInterfaceScope),
+		native_managed_builtin_canonical_name,
 		DeclaredAbiType(
 			DeclaredAbiBool, DeclaredAbiConcurrencyError, DeclaredAbiDirectoryEntry,
 			DeclaredAbiInt64, DeclaredAbiMemStats, DeclaredAbiOption,
@@ -81,6 +83,10 @@ private ETA_EXPANSION_ORIGIN_TAG: String = "eta_expansion"
 
 private HASH_KEY_SLOT_ADAPTER_ORIGIN_TAG: String = "hash_key_slot_adapter"
 
+private HASH_SLOT_ROLE_TAG: String = "hash_slot"
+
+private EQUALITY_SLOT_ROLE_TAG: String = "equality_slot"
+
 private NATIVE_TAG_EQUALITY_CALLBACK_ORIGIN_TAG: String = "native_tag_equality_callback"
 
 private ENTRYPOINT_ORIGIN_TAG: String = "entrypoint"
@@ -97,7 +103,6 @@ private FUNCTION_TAG: String = "function"
 
 private GLOBAL_TAG: String = "global"
 
-private ENUM_DECL_TAG: String = "enum"
 
 
 
@@ -134,6 +139,12 @@ private VOID_TYPE_TAG: String = "void"
 
 private NAMED_TYPE_TAG: String = "named"
 
+private NATIVE_MANAGED_TYPE_TAG: String = "native_managed"
+
+private NATIVE_IP_ADDRESS_TAG: String = "ip_address"
+private NATIVE_DNS_NAME_TAG: String = "dns_name"
+private NATIVE_INTERFACE_SCOPE_TAG: String = "interface_scope"
+
 private TYPE_PARAMETER_TYPE_TAG: String = "type_parameter"
 
 private SELF_TYPE_TAG: String = "self"
@@ -144,7 +155,6 @@ private STACK_RESULT_TYPE_TAG: String = "stack_result"
 
 private BOXED_RESULT_TYPE_TAG: String = "boxed_result"
 
-private ENUM_TYPE_TAG: String = "enum"
 
 
 private HEAP_RECORD_TYPE_TAG: String = "heap_record"
@@ -650,7 +660,6 @@ private LITERAL_MATCH_FALLBACK_BINDINGS_TAG: String = "bindings"
 
 private LITERAL_MATCH_FALLBACK_FAIL_TAG: String = "fail"
 
-private ENUM_CONSTRUCTOR_TEST_TAG: String = "enum"
 
 private UNION_TAG_CONSTRUCTOR_TEST_TAG: String = "union_tag"
 
@@ -1022,7 +1031,7 @@ Which pass or construct invented a Perceus temporary. The kind, with the
 ordinal and the owner the site supplies, is what tells two temporaries at one
 source node apart (see `CoreBinderOrigin`).
 ---
-enum PerceusTempKind:
+fixed union PerceusTempKind:
 	PerceusAggregateField
 	PerceusBorrowArg
 	PerceusBorrowCallee
@@ -1041,7 +1050,7 @@ are a separate origin (`PerceusBorrowedResultTemporary`) because they alone carr
 the owner: two owners protected at one call argument share node, kind and
 ordinal, and the owner is what tells them apart.
 ---
-enum PerceusBorrowedResultKind:
+fixed union PerceusBorrowedResultKind:
 	BorrowedResultAlias
 	BorrowedResultCallArg
 	BorrowedResultEqualityArg
@@ -1050,7 +1059,7 @@ enum PerceusBorrowedResultKind:
 ---
 What a pass derives from a variable it protects.
 ---
-enum DerivedTempKind:
+fixed union DerivedTempKind:
 	DropTemp
 	BorrowedView
 	AssignTemp
@@ -1060,7 +1069,7 @@ enum DerivedTempKind:
 ---
 The passes whose synthesized binders are minted at creation.
 ---
-enum PassTempKind:
+fixed union PassTempKind:
 	SynthBodyTemp
 	EtaArgument
 	TupleFlattenTemp
@@ -1078,7 +1087,7 @@ enum PassTempKind:
 ---
 Lowering's own temporaries, keyed off the construct's source span.
 ---
-enum LoweringTempKind:
+fixed union LoweringTempKind:
 	QuestionBindTemp
 	WithTemp
 	LoopTemp
@@ -1281,24 +1290,79 @@ pure func core_vars_have_same_definition(left: CoreVar, right: CoreVar) -> Bool:
 				False
 
 
+private record CoreNativeManagedIdentityRep {
+	definition_id: Int,
+	native_kind: NativeManagedBuiltin,
+	canonical_core_name: String
+}
+
+
+-- The issued definition id lives for one compilation. Lowering supplies it
+-- only after exact accepted-header and canonical-key projection validation.
+-- The closed native kind determines physical storage, not String semantics.
+opaque type CoreNativeManagedIdentity = CoreNativeManagedIdentityRep
+
+
+union CoreNativeManagedIdentityError:
+	CoreNativeManagedNegativeDefinitionId(Int)
+	CoreNativeManagedKeyMismatch(NativeManagedBuiltin, String)
+
+
+pure func core_native_managed_identity(
+	definition_id: Int,
+	native_kind: NativeManagedBuiltin,
+	canonical_core_name: String,
+) -> Result[CoreNativeManagedIdentity, CoreNativeManagedIdentityError]:
+	if definition_id < 0:
+		Err(CoreNativeManagedNegativeDefinitionId(definition_id))
+	else if canonical_core_name != native_managed_builtin_canonical_name(native_kind):
+		Err(CoreNativeManagedKeyMismatch(native_kind, canonical_core_name))
+	else:
+		Ok(into_opaque CoreNativeManagedIdentity({
+			definition_id = definition_id,
+			native_kind = native_kind,
+			canonical_core_name = canonical_core_name
+		}))
+
+
+pure func core_native_managed_definition_id(identity: CoreNativeManagedIdentity) -> Int:
+	from_opaque CoreNativeManagedIdentity(identity).definition_id
+
+
+pure func core_native_managed_native_kind(identity: CoreNativeManagedIdentity) -> NativeManagedBuiltin:
+	from_opaque CoreNativeManagedIdentity(identity).native_kind
+
+
+pure func core_native_managed_canonical_name(identity: CoreNativeManagedIdentity) -> String:
+	from_opaque CoreNativeManagedIdentity(identity).canonical_core_name
+
+
+pure func core_native_managed_identity_error_to_string(error: CoreNativeManagedIdentityError) -> String:
+	match error:
+		CoreNativeManagedNegativeDefinitionId(id):
+			"native managed identity requires an issued nonnegative definition id, got ${id}"
+		CoreNativeManagedKeyMismatch(kind, name):
+			"native managed identity key '${name}' must equal '${native_managed_builtin_canonical_name(kind)}'"
+
+
 union CoreType:
 	VoidType
+	NativeManagedType(CoreNativeManagedIdentity)
 	NamedType(String, List[CoreType])
 	TypeParameterType(String)
 	SelfType
 	FunctionType(Bool, List[CoreType], CoreType)
 	StackResultType(CoreType, CoreType)
 	BoxedResultType(CoreType, CoreType)
-	EnumType(String)
 	HeapRecordType(String)
 	InlineRecordType(String)
-	UnionType(String)
+	UnionType(String, CoreUnionValueStorage)
 	RangeType
 	TensorType(CoreTensorTypeInfo)
 	TupleType(List[CoreType])
 
 
-enum CoreDimOp:
+fixed union CoreDimOp:
 	DimAdd
 	DimSubtract
 	DimMultiply
@@ -1391,6 +1455,12 @@ implements Equatable for CoreType:
 
 pure func core_type_equal(left: CoreType, right: CoreType) -> Bool:
 	match (left, right):
+		(NativeManagedType(left_identity), NativeManagedType(right_identity)):
+			(
+				core_native_managed_definition_id(left_identity) == core_native_managed_definition_id(right_identity)
+				and core_native_managed_native_kind(left_identity) == core_native_managed_native_kind(right_identity)
+				and core_native_managed_canonical_name(left_identity) == core_native_managed_canonical_name(right_identity)
+			)
 		(VoidType, VoidType):
 			True
 		(NamedType(left_name, left_args), NamedType(right_name, right_args)):
@@ -1409,14 +1479,12 @@ pure func core_type_equal(left: CoreType, right: CoreType) -> Bool:
 				and core_type_lists_equal(left_params, right_params)
 				and core_type_equal(left_return, right_return)
 			)
-		(EnumType(left_name), EnumType(right_name)):
-			left_name == right_name
 		(HeapRecordType(left_name), HeapRecordType(right_name)):
 			left_name == right_name
 		(InlineRecordType(left_name), InlineRecordType(right_name)):
 			left_name == right_name
-		(UnionType(left_name), UnionType(right_name)):
-			left_name == right_name
+		(UnionType(left_name, left_storage), UnionType(right_name, right_storage)):
+			left_name == right_name and left_storage == right_storage
 		(RangeType, RangeType):
 			True
 		(TensorType(left_info), TensorType(right_info)):
@@ -1523,7 +1591,7 @@ union CoreOperationResultLayoutPolicy:
 	BoxedResultOnlyPolicy(String)
 
 
-enum CoreForeignCopyKind:
+fixed union CoreForeignCopyKind:
 	ForeignStringCopy
 	ForeignBytesCopy
 
@@ -1644,7 +1712,7 @@ union CoreCallKind:
 	ClosureCall
 
 
-enum CoreBinaryOp:
+fixed union CoreBinaryOp:
 	AddOp
 	SubtractOp
 	MultiplyOp
@@ -1658,22 +1726,22 @@ enum CoreBinaryOp:
 	GreaterEqualOp
 
 
-enum CoreUnaryOp:
+fixed union CoreUnaryOp:
 	NegateOp
 	NotOp
 
 
-enum CoreLogicalOp:
+fixed union CoreLogicalOp:
 	AndOp
 	OrOp
 
 
-enum CoreLoopRangeDirection:
+fixed union CoreLoopRangeDirection:
 	RangeMayRunBackward
 	RangeForwardOnly
 
 
-enum CoreReleasePolicy:
+fixed union CoreReleasePolicy:
 	NoReleasePolicy
 	ArcReleasePolicy
 	ArcReleaseOnlyPolicy
@@ -1704,7 +1772,7 @@ record CoreLoopBinder {
 }
 
 
-enum CoreTensorRawScalarKind:
+fixed union CoreTensorRawScalarKind:
 	TensorFloat64Elements
 	TensorFloat32Elements
 	TensorInt64Elements
@@ -2296,7 +2364,7 @@ keys to `CustomHashContainerConstructor`, whose definition ids are the slot
 adapters `hash_key_callbacks` minted. Typecheck requires every key to be
 Hashable, so a trait constructor that survives is an internal error, which C
 symbol projection reports. `GenericHashContainerConstructor` hashes the key
-slot's word (integers, `Bool`, `Char`, enums).
+slot's word (integers, `Bool`, `Char`, scalar unions).
 `Int128HashContainerConstructor` covers Int128 and UInt128, whose keys are
 heap boxes that the table hashes and compares by payload and owns.
 
@@ -2343,17 +2411,17 @@ union CoreListStorageLayout:
 	InlineStructListStorage(String)
 
 
-enum CoreListAccessBounds:
+fixed union CoreListAccessBounds:
 	CheckedListAccess
 	ProvenListAccess
 
 
-enum CoreListHandoffMode:
+fixed union CoreListHandoffMode:
 	BorrowFreshHandoff
 	ConsumeReuseHandoff
 
 
-enum CoreListHandoffWriteOrder:
+fixed union CoreListHandoffWriteOrder:
 	ForwardCompactingHandoff
 
 
@@ -2511,7 +2579,7 @@ record CoreForResourceSource {
 }
 
 
-enum CoreTaskCaptureKind:
+fixed union CoreTaskCaptureKind:
 	TaskCopyCapture
 	TaskMoveResourceItem
 	TaskStructuredTaskBorrow
@@ -2533,7 +2601,7 @@ record CoreTaskClosure {
 }
 
 
-enum CoreConcurrentlyLoopOutput:
+fixed union CoreConcurrentlyLoopOutput:
 	ConcurrentlyLoopCollect
 	ConcurrentlyLoopDiscard
 
@@ -2625,7 +2693,7 @@ record CoreSelectArm {
 }
 
 
-enum CoreTensorRuntimeReadHelper:
+fixed union CoreTensorRuntimeReadHelper:
 	TensorRuntimeReadI64
 	TensorRuntimeReadF64
 	TensorRuntimeReadF32
@@ -2720,9 +2788,20 @@ union CoreUnionRepresentation:
 	NullableOptionRepresentation
 
 
-enum CoreUnionPayloadStorage:
+-- Physical value storage is independent of the logical union declaration family.
+fixed union CoreUnionValueStorage:
+	ScalarTagValue
+	ManagedUnionValue
+
+
+fixed union CoreUnionPayloadStorage:
 	TypedUnionPayloadStorage
 	ErasedUnionPayloadStorage
+
+
+union CoreUnionStorage:
+	ScalarTagStorage
+	ManagedPayloadStorage(CoreUnionPayloadStorage)
 
 
 ---
@@ -2756,7 +2835,7 @@ record CoreUnionReuseConstruct {
 }
 
 
-enum CoreResourceExit:
+fixed union CoreResourceExit:
 	ResourceBreakExit
 	ResourceContinueExit
 
@@ -2815,9 +2894,13 @@ union CoreVariantRef:
 	BuiltinResultErr
 
 
+union CoreUnionTagAccess:
+	ScalarTagAccess
+	ManagedTagAccess(String)
+
+
 union CoreConstructorMatchTest:
-	EnumConstructorTest(CoreVariantRef)
-	UnionTagConstructorTest(CoreVariantRef, String)
+	UnionTagConstructorTest(CoreVariantRef, CoreUnionTagAccess)
 	NullableOptionSomeConstructorTest
 	NullableOptionNoneConstructorTest
 	StackOptionSomeConstructorTest(String)
@@ -2848,7 +2931,7 @@ union CoreAccessor:
 	ListSpreadAccessor(CoreAccessor, Int)
 
 
-enum CoreMatchBindingMode:
+fixed union CoreMatchBindingMode:
 	MatchBorrowBindingMode
 	MatchOwnBindingMode
 
@@ -2952,7 +3035,7 @@ record CoreTailrecListSpreadLoop {
 }
 
 
-enum CoreForeignLinkPlatform:
+fixed union CoreForeignLinkPlatform:
 	CoreForeignLinux
 	CoreForeignMacos
 
@@ -3027,7 +3110,7 @@ type alias CoreMonoSubstitution = List[(String, CoreMonoSubstitutionValue)]
 Which synthesis pass supplied a function's body. One case per pass module
 under `stage_09_core/synth_*.brp`.
 ---
-enum CoreSynthesisKind:
+fixed union CoreSynthesisKind:
 	ScalarOperatorSynthesis
 	HashCollectionSynthesis
 	ListSynthesis
@@ -3045,7 +3128,7 @@ enum CoreSynthesisKind:
 Which of the two functions the entrypoint pass owns: the exported program
 wrapper, or the user's `main` after it is renamed out of the wrapper's way.
 ---
-enum CoreEntrypointKind:
+fixed union CoreEntrypointKind:
 	ProgramWrapperEntrypoint
 	UserMainEntrypoint
 
@@ -3058,7 +3141,7 @@ list printing invoke by function: `Stringable.to_string` (list printing),
 where the impl method is lowered, so no later reader compares trait or method
 spellings.
 ---
-enum CoreRuntimeCallbackRole:
+fixed union CoreRuntimeCallbackRole:
 	StringableToStringCallback
 	HashableHashCallback
 	EquatableEqualsCallback
@@ -3071,6 +3154,12 @@ enum CoreRuntimeCallbackRole:
 union CoreImplMethodRole:
 	RuntimeCallbackMethod(CoreRuntimeCallbackRole)
 	OrdinaryImplMethod
+
+
+-- Slot wrappers call language implementations but expose the runtime's C return ABI.
+fixed union CoreHashKeySlotRole:
+	HashSlotCallback
+	EqualitySlotCallback
 
 
 ---
@@ -3148,10 +3237,12 @@ union CoreDeclaredOrigin:
 	-- EtaExpansion(target_def): the adapter that lets the function
 	-- `target_def` be used as a closure value. Replaces `_blorp_eta_<n>`.
 	EtaExpansion(Int)
-	-- HashKeySlotAdapter(impl_def): the adapter that lets a Dict or Set call
+	-- HashKeySlotAdapter(impl_def, role): the adapter that lets a Dict or Set call
 	-- the Hashable or Equatable impl method `impl_def` with a key's `void*`
-	-- slot (`hash_key_callbacks.brp`).
-	HashKeySlotAdapter(Int)
+	-- slot; its role owns the native return ABI (`hash_key_callbacks.brp`).
+	HashKeySlotAdapter(Int, CoreHashKeySlotRole)
+	-- Native tag equality for a scalar union with authored hash but no
+	-- authored equality. Created after trait resolution by callback minting.
 	-- Generated physical tag comparison, not an authored trait implementation.
 	NativeTagEqualityCallback(CoreType)
 	-- Entrypoint(kind): one of the two exported entrypoint functions.
@@ -3502,7 +3593,7 @@ A standard-library module the Core passes recognise a function's module by. A ne
 module is one variant here, one arm in `core_standard_module_path`, and one entry
 in `core_standard_module_variants`.
 ---
-enum CoreStandardModule:
+fixed union CoreStandardModule:
 	ListModule
 	StringModule
 	VectorModule
@@ -3770,22 +3861,6 @@ record CoreGlobal {
 }
 
 
-record CoreEnumVariant {
-	name: String,
-	tag: Int,
-	def_id: Option[Int]
-}
-
-
-record CoreEnumDecl {
-	abi_type: Option[DeclaredAbiType],
-	name: String,
-	type_params: List[String],
-	variants: List[CoreEnumVariant],
-	loc: CoreSourceLoc
-}
-
-
 record CoreUnionVariant {
 	name: String,
 	tag: Int,
@@ -3804,10 +3879,80 @@ record CoreUnionDecl {
 	abi_type: Option[DeclaredAbiType],
 	name: String,
 	type_params: List[String],
-	payload_storage: CoreUnionPayloadStorage,
+	storage: CoreUnionStorage,
 	variants: List[CoreUnionVariant],
 	loc: CoreSourceLoc
 }
+
+
+pure func core_union_storage_value(storage: CoreUnionStorage) -> CoreUnionValueStorage:
+	match storage:
+		ScalarTagStorage:
+			ScalarTagValue
+		ManagedPayloadStorage(_):
+			ManagedUnionValue
+
+
+pure func core_union_managed_payload_storage(decl: CoreUnionDecl) -> Option[CoreUnionPayloadStorage]:
+	match decl.storage:
+		ScalarTagStorage:
+			None
+		ManagedPayloadStorage(payload):
+			Some(payload)
+
+
+-- Scalar publication is admitted only for nongeneric, payload-free declarations.
+-- Generic specialization retains its managed storage; it does not optimize layout.
+pure func core_union_decl_storage_error(decl: CoreUnionDecl) -> Option[String]:
+	match decl.storage:
+		ScalarTagStorage:
+			if not decl.type_params.is_empty():
+				Some("scalar union storage requires no type parameters")
+			else:
+				var error: Option[String] = None
+				for variant in decl.variants:
+					if not variant.fields.is_empty():
+						error = Some("scalar union storage requires payload-free variants")
+						break
+				error
+		ManagedPayloadStorage(_):
+			None
+
+
+-- Missing declarations retain the existing external-type admission policy.
+-- A published declaration, however, is authoritative for its physical storage.
+pure func core_union_type_storage_errors(
+	storage_by_name: Dict[String, CoreUnionValueStorage],
+	typ: CoreType,
+) -> List[String]:
+	match typ:
+		UnionType(name, storage):
+			match storage_by_name.get(name):
+				Some(expected):
+					if storage == expected:
+						[]
+					else:
+						["union type storage disagrees with declaration `${name}`"]
+				None:
+					[]
+		NamedType(_, args) | TupleType(args):
+			var errors: List[String] = []
+			for arg in args:
+				errors = errors.concat(core_union_type_storage_errors(storage_by_name, arg))
+			errors
+		FunctionType(_, params, result):
+			var errors: List[String] = core_union_type_storage_errors(storage_by_name, result)
+			for param in params:
+				errors = errors.concat(core_union_type_storage_errors(storage_by_name, param))
+			errors
+		StackResultType(ok, err) | BoxedResultType(ok, err):
+			core_union_type_storage_errors(storage_by_name, ok).concat(
+				core_union_type_storage_errors(storage_by_name, err),
+			)
+		TensorType(info):
+			core_union_type_storage_errors(storage_by_name, info.element_type)
+		_:
+			[]
 
 
 --- A record field's typecheck identity, carried by the fields of record
@@ -3886,7 +4031,7 @@ concrete fixed record whose fields are all inline-eligible: that record becomes
 an `InlineRecordDecl`. A `HeapRecordDecl` with `FixedRecordForm` is therefore a
 fixed record that was not admitted, the case a checked guarantee will report.
 ---
-enum CoreRecordForm:
+fixed union CoreRecordForm:
 	OrdinaryRecordForm
 	FixedRecordForm
 
@@ -3973,7 +4118,6 @@ record CoreImplDecl {
 union CoreDecl:
 	FunctionDecl(CoreFunction)
 	GlobalDecl(CoreGlobal)
-	EnumDecl(CoreEnumDecl)
 	UnionDecl(CoreUnionDecl)
 	HeapRecordDecl(CoreHeapRecordDecl)
 	InlineRecordDecl(CoreInlineRecordDecl)
@@ -4010,13 +4154,6 @@ private pure func max_declared_definition_id(current: Int, decl: CoreDecl) -> In
 			max_definition_id(current, function_info.def_id)
 		GlobalDecl(global):
 			max_definition_id(current, global.def_id)
-		EnumDecl(enum_decl):
-			var result: Int = current
-
-			for variant in enum_decl.variants:
-				result = max_optional_definition_id(result, variant.def_id)
-
-			result
 		UnionDecl(union_decl):
 			var result: Int = current
 
@@ -4083,10 +4220,12 @@ pure func core_program_expr_roots(program: CoreProgram) -> List[CoreExpr]:
 
 
 union CoreJsonError:
+	CoreInvalidNativeManagedIdentity(String, CoreNativeManagedIdentityError)
 	CoreMissingField(String, String)
 	CoreExpectedObject(String)
 	CoreExpectedVariableExpr(String)
 	CoreInvalidRecordUpdateShape(String, String)
+	CoreInvalidUnionStorage(String, String)
 	CoreExpectedObjectField(String, String)
 	CoreExpectedStringField(String, String)
 	CoreExpectedIntField(String, String)
@@ -4858,6 +4997,13 @@ private pure func core_tensor_type_info_to_json(info: CoreTensorTypeInfo) -> Jso
 
 pure func core_type_to_json(typ: CoreType) -> JsonValue:
 	match typ:
+		NativeManagedType(identity):
+			JsonObject([
+				(KIND_FIELD, JsonString(NATIVE_MANAGED_TYPE_TAG)),
+				("definition_id", json_int(core_native_managed_definition_id(identity))),
+				("native_kind", JsonString(native_managed_kind_tag(core_native_managed_native_kind(identity)))),
+				("canonical_name", JsonString(core_native_managed_canonical_name(identity))),
+			])
 		VoidType:
 			JsonObject([(KIND_FIELD, JsonString(VOID_TYPE_TAG))])
 		NamedType(name, args):
@@ -4892,11 +5038,6 @@ pure func core_type_to_json(typ: CoreType) -> JsonValue:
 				("ok_type", core_type_to_json(ok_type)),
 				("err_type", core_type_to_json(err_type)),
 			])
-		EnumType(name):
-			JsonObject([
-				(KIND_FIELD, JsonString(ENUM_TYPE_TAG)),
-				("name", JsonString(name)),
-			])
 		HeapRecordType(name):
 			JsonObject([
 				(KIND_FIELD, JsonString(HEAP_RECORD_TYPE_TAG)),
@@ -4907,10 +5048,11 @@ pure func core_type_to_json(typ: CoreType) -> JsonValue:
 				(KIND_FIELD, JsonString(INLINE_RECORD_TYPE_TAG)),
 				("name", JsonString(name)),
 			])
-		UnionType(name):
+		UnionType(name, storage):
 			JsonObject([
 				(KIND_FIELD, JsonString(UNION_TYPE_TAG)),
 				("name", JsonString(name)),
+				("storage", core_union_value_storage_to_json(storage)),
 			])
 		RangeType:
 			JsonObject([(KIND_FIELD, JsonString(RANGE_TYPE_TAG))])
@@ -5065,6 +5207,27 @@ private pure func decode_core_tensor_type_info_json(
 	})
 
 
+private pure func native_managed_kind_tag(kind: NativeManagedBuiltin) -> String:
+	match kind:
+		NativeIpAddress:
+			NATIVE_IP_ADDRESS_TAG
+		NativeDnsName:
+			NATIVE_DNS_NAME_TAG
+		NativeInterfaceScope:
+			NATIVE_INTERFACE_SCOPE_TAG
+
+
+private pure func decode_native_managed_kind(tag: String, path: String) -> Result[NativeManagedBuiltin, CoreJsonError]:
+	if tag == NATIVE_IP_ADDRESS_TAG:
+		Ok(NativeIpAddress)
+	else if tag == NATIVE_DNS_NAME_TAG:
+		Ok(NativeDnsName)
+	else if tag == NATIVE_INTERFACE_SCOPE_TAG:
+		Ok(NativeInterfaceScope)
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
 private pure func list_to_string_elements_to_json(elements: CoreListToStringElements) -> JsonValue:
 	match elements:
 		PointerListToStringElements:
@@ -5078,6 +5241,16 @@ pure func decode_core_type_json(value: JsonValue, path: String) -> Result[CoreTy
 
 	if tag == VOID_TYPE_TAG:
 		Ok(VoidType)
+	else if tag == NATIVE_MANAGED_TYPE_TAG:
+		definition_id ?= int_field(value, path, "definition_id")
+		kind_tag ?= string_field(value, path, "native_kind")
+		native_kind ?= decode_native_managed_kind(kind_tag, path_field(path, "native_kind"))
+		canonical_name ?= string_field(value, path, "canonical_name")
+		match core_native_managed_identity(definition_id, native_kind, canonical_name):
+			Ok(identity):
+				Ok(NativeManagedType(identity))
+			Err(error):
+				Err(CoreInvalidNativeManagedIdentity(path, error))
 	else if tag == NAMED_TYPE_TAG:
 		name ?= string_field(value, path, "name")
 		args ?= decode_core_type_list(value, path, "args")
@@ -5120,9 +5293,6 @@ pure func decode_core_type_json(value: JsonValue, path: String) -> Result[CoreTy
 			path_field(path, "err_type"),
 		)
 		Ok(BoxedResultType(ok_type, err_type))
-	else if tag == ENUM_TYPE_TAG:
-		name ?= string_field(value, path, "name")
-		Ok(EnumType(name))
 	else if tag == HEAP_RECORD_TYPE_TAG:
 		name ?= string_field(value, path, "name")
 		Ok(HeapRecordType(name))
@@ -5131,7 +5301,9 @@ pure func decode_core_type_json(value: JsonValue, path: String) -> Result[CoreTy
 		Ok(InlineRecordType(name))
 	else if tag == UNION_TYPE_TAG:
 		name ?= string_field(value, path, "name")
-		Ok(UnionType(name))
+		storage_json ?= required_field(value, path, "storage")
+		storage ?= decode_core_union_value_storage_json(storage_json, path_field(path, "storage"))
+		Ok(UnionType(name, storage))
 	else if tag == RANGE_TYPE_TAG:
 		Ok(RangeType)
 	else if tag == TENSOR_TYPE_TAG:
@@ -7876,6 +8048,85 @@ pure func core_union_payload_storage_to_json(storage: CoreUnionPayloadStorage) -
 			JsonString(ERASED_UNION_PAYLOAD_STORAGE_TAG)
 
 
+private SCALAR_TAG_STORAGE_TAG: String = "scalar_tag"
+private MANAGED_UNION_STORAGE_TAG: String = "managed_union"
+
+
+pure func core_union_value_storage_to_json(storage: CoreUnionValueStorage) -> JsonValue:
+	match storage:
+		ScalarTagValue:
+			JsonString(SCALAR_TAG_STORAGE_TAG)
+		ManagedUnionValue:
+			JsonString(MANAGED_UNION_STORAGE_TAG)
+
+
+pure func decode_core_union_value_storage_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreUnionValueStorage, CoreJsonError]:
+	match as_string(value):
+		Some(tag):
+			if tag == SCALAR_TAG_STORAGE_TAG:
+				Ok(ScalarTagValue)
+			else if tag == MANAGED_UNION_STORAGE_TAG:
+				Ok(ManagedUnionValue)
+			else:
+				Err(CoreUnsupportedTag(path, tag))
+		None:
+			Err(CoreExpectedStringField(path, KIND_FIELD))
+
+
+pure func core_union_storage_to_json(storage: CoreUnionStorage) -> JsonValue:
+	match storage:
+		ScalarTagStorage:
+			JsonObject([(KIND_FIELD, JsonString(SCALAR_TAG_STORAGE_TAG))])
+		ManagedPayloadStorage(payload):
+			JsonObject([
+				(KIND_FIELD, JsonString(MANAGED_UNION_STORAGE_TAG)),
+				("payload_storage", core_union_payload_storage_to_json(payload)),
+			])
+
+
+pure func decode_core_union_storage_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreUnionStorage, CoreJsonError]:
+	tag ?= kind_field(value, path)
+	if tag == SCALAR_TAG_STORAGE_TAG:
+		Ok(ScalarTagStorage)
+	else if tag == MANAGED_UNION_STORAGE_TAG:
+		payload_json ?= required_field(value, path, "payload_storage")
+		payload ?= decode_core_union_payload_storage_json(payload_json, path_field(path, "payload_storage"))
+		Ok(ManagedPayloadStorage(payload))
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
+pure func core_union_tag_access_to_json(access: CoreUnionTagAccess) -> JsonValue:
+	match access:
+		ScalarTagAccess:
+			JsonObject([(KIND_FIELD, JsonString(SCALAR_TAG_STORAGE_TAG))])
+		ManagedTagAccess(c_type):
+			JsonObject([
+				(KIND_FIELD, JsonString(MANAGED_UNION_STORAGE_TAG)),
+				("union_c_type", JsonString(c_type)),
+			])
+
+
+pure func decode_core_union_tag_access_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreUnionTagAccess, CoreJsonError]:
+	tag ?= kind_field(value, path)
+	if tag == SCALAR_TAG_STORAGE_TAG:
+		Ok(ScalarTagAccess)
+	else if tag == MANAGED_UNION_STORAGE_TAG:
+		c_type ?= string_field(value, path, "union_c_type")
+		Ok(ManagedTagAccess(c_type))
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
 pure func decode_core_union_payload_storage_json(
 	value: JsonValue,
 	path: String,
@@ -9702,16 +9953,11 @@ private pure func decode_core_variant_ref_field(
 
 pure func core_constructor_match_test_to_json(test: CoreConstructorMatchTest) -> JsonValue:
 	match test:
-		EnumConstructorTest(variant):
-			JsonObject([
-				(KIND_FIELD, JsonString(ENUM_CONSTRUCTOR_TEST_TAG)),
-				("variant", core_variant_ref_to_json(variant)),
-			])
-		UnionTagConstructorTest(variant, union_c_type):
+		UnionTagConstructorTest(variant, access):
 			JsonObject([
 				(KIND_FIELD, JsonString(UNION_TAG_CONSTRUCTOR_TEST_TAG)),
 				("variant", core_variant_ref_to_json(variant)),
-				("union_c_type", JsonString(union_c_type)),
+				("access", core_union_tag_access_to_json(access)),
 			])
 		NullableOptionSomeConstructorTest:
 			JsonObject([(KIND_FIELD, JsonString(NULLABLE_OPTION_SOME_CONSTRUCTOR_TEST_TAG))])
@@ -9753,13 +9999,11 @@ pure func decode_core_constructor_match_test_json(
 ) -> Result[CoreConstructorMatchTest, CoreJsonError]:
 	tag ?= kind_field(value, path)
 
-	if tag == ENUM_CONSTRUCTOR_TEST_TAG:
+	if tag == UNION_TAG_CONSTRUCTOR_TEST_TAG:
 		variant ?= decode_core_variant_ref_field(value, path)
-		Ok(EnumConstructorTest(variant))
-	else if tag == UNION_TAG_CONSTRUCTOR_TEST_TAG:
-		variant ?= decode_core_variant_ref_field(value, path)
-		union_c_type ?= string_field(value, path, "union_c_type")
-		Ok(UnionTagConstructorTest(variant, union_c_type))
+		access_json ?= required_field(value, path, "access")
+		access ?= decode_core_union_tag_access_json(access_json, path_field(path, "access"))
+		Ok(UnionTagConstructorTest(variant, access))
 	else if tag == NULLABLE_OPTION_SOME_CONSTRUCTOR_TEST_TAG:
 		Ok(NullableOptionSomeConstructorTest)
 	else if tag == NULLABLE_OPTION_NONE_CONSTRUCTOR_TEST_TAG:
@@ -15824,6 +16068,26 @@ private pure func parse_core_impl_method_role(
 		Err(CoreUnsupportedTag(path, name))
 
 
+private pure func core_hash_key_slot_role_name(role: CoreHashKeySlotRole) -> String:
+	match role:
+		HashSlotCallback:
+			HASH_SLOT_ROLE_TAG
+		EqualitySlotCallback:
+			EQUALITY_SLOT_ROLE_TAG
+
+
+private pure func parse_core_hash_key_slot_role(
+	name: String,
+	path: String,
+) -> Result[CoreHashKeySlotRole, CoreJsonError]:
+	if name == HASH_SLOT_ROLE_TAG:
+		Ok(HashSlotCallback)
+	else if name == EQUALITY_SLOT_ROLE_TAG:
+		Ok(EqualitySlotCallback)
+	else:
+		Err(CoreUnsupportedTag(path, name))
+
+
 ---
 The JSON object for how a function was declared; `kind` names the case.
 ---
@@ -15877,10 +16141,11 @@ pure func core_declared_origin_to_json(origin: CoreDeclaredOrigin) -> JsonValue:
 				(KIND_FIELD, JsonString(ETA_EXPANSION_ORIGIN_TAG)),
 				("target_def", json_int(target_def)),
 			])
-		HashKeySlotAdapter(impl_def):
+		HashKeySlotAdapter(impl_def, role):
 			JsonObject([
 				(KIND_FIELD, JsonString(HASH_KEY_SLOT_ADAPTER_ORIGIN_TAG)),
 				("impl_def", json_int(impl_def)),
+				("role", JsonString(core_hash_key_slot_role_name(role))),
 			])
 		NativeTagEqualityCallback(for_type):
 			JsonObject([
@@ -16075,7 +16340,9 @@ pure func decode_core_declared_origin_json(
 		Ok(EtaExpansion(target_def))
 	else if tag == HASH_KEY_SLOT_ADAPTER_ORIGIN_TAG:
 		impl_def ?= int_field(value, path, "impl_def")
-		Ok(HashKeySlotAdapter(impl_def))
+		role_name ?= string_field(value, path, "role")
+		role ?= parse_core_hash_key_slot_role(role_name, path_field(path, "role"))
+		Ok(HashKeySlotAdapter(impl_def, role))
 	else if tag == NATIVE_TAG_EQUALITY_CALLBACK_ORIGIN_TAG:
 		for_type_json ?= object_field(value, path, "for_type")
 		for_type ?= decode_core_type_json(for_type_json, path_field(path, "for_type"))
@@ -16292,99 +16559,6 @@ pure func decode_core_global_json(
 	})
 
 
-pure func core_enum_variant_to_json(variant: CoreEnumVariant) -> JsonValue:
-	JsonObject([
-		("name", JsonString(variant.name)),
-		("tag", json_int(variant.tag)),
-		("def_id", option_int_to_json(variant.def_id)),
-	])
-
-
-pure func decode_core_enum_variant_json(
-	value: JsonValue,
-	path: String,
-) -> Result[CoreEnumVariant, CoreJsonError]:
-	name ?= string_field(value, path, "name")
-	tag ?= int_field(value, path, "tag")
-	def_id ?= decode_optional_int(value, path, "def_id")
-
-	Ok({
-		name = name,
-		tag = tag,
-		def_id = def_id,
-	})
-
-
-private pure func decode_core_enum_variants(
-	value: JsonValue,
-	path: String,
-	field_name: String,
-) -> Result[List[CoreEnumVariant], CoreJsonError]:
-	items ?= array_field(value, path, field_name)
-	var result: List[CoreEnumVariant] = []
-	var error: Option[CoreJsonError] = None
-	var index: Int = 0
-
-	for item in items:
-		match error:
-			Some(existing_error):
-				void
-			None:
-				match decode_core_enum_variant_json(
-					item,
-					path_index(
-						path_field(path, field_name),
-						index,
-					),
-				):
-					Ok(variant):
-						result = result.append(variant)
-					Err(err):
-						error = Some(err)
-
-		index += 1
-
-	match error:
-		Some(existing_error):
-			Err(existing_error)
-		None:
-			Ok(result)
-
-
-pure func core_enum_decl_to_json(enum_decl: CoreEnumDecl) -> JsonValue:
-	JsonObject([
-		(KIND_FIELD, JsonString(ENUM_DECL_TAG)),
-		("abi_type", optional_declared_abi_type_to_json(enum_decl.abi_type)),
-		("name", JsonString(enum_decl.name)),
-		("type_params", strings_to_json(enum_decl.type_params)),
-		("variants", JsonVector(enum_decl.variants.map(core_enum_variant_to_json))),
-		("loc", source_loc_to_json(enum_decl.loc)),
-	])
-
-
-pure func decode_core_enum_decl_json(
-	value: JsonValue,
-	path: String,
-) -> Result[CoreEnumDecl, CoreJsonError]:
-	abi_type ?= decode_optional_declared_abi_type(value, path, "abi_type")
-	name ?= string_field(value, path, "name")
-	type_params ?= decode_string_list(value, path, "type_params")
-	variants ?= decode_core_enum_variants(value, path, "variants")
-	loc_json ?= required_field(value, path, "loc")
-	loc ?= decode_source_loc_json(
-		loc_json,
-		path_field(path, "loc"),
-	)
-
-	Ok({
-		abi_type = abi_type,
-		name = name,
-		type_params = type_params,
-		variants = variants,
-		loc = loc,
-	})
-
-
 pure func core_union_field_to_json(field: CoreUnionField) -> JsonValue:
 	JsonObject([
 		("type", core_type_to_json(field.typ)),
@@ -16517,7 +16691,7 @@ pure func core_union_decl_to_json(union_decl: CoreUnionDecl) -> JsonValue:
 		("abi_type", optional_declared_abi_type_to_json(union_decl.abi_type)),
 		("name", JsonString(union_decl.name)),
 		("type_params", strings_to_json(union_decl.type_params)),
-		("payload_storage", core_union_payload_storage_to_json(union_decl.payload_storage)),
+		("storage", core_union_storage_to_json(union_decl.storage)),
 		("variants", JsonVector(union_decl.variants.map(core_union_variant_to_json))),
 		("loc", source_loc_to_json(union_decl.loc)),
 	])
@@ -16530,10 +16704,10 @@ pure func decode_core_union_decl_json(
 	abi_type ?= decode_optional_declared_abi_type(value, path, "abi_type")
 	name ?= string_field(value, path, "name")
 	type_params ?= decode_string_list(value, path, "type_params")
-	payload_storage_value ?= required_field(value, path, "payload_storage")
-	payload_storage ?= decode_core_union_payload_storage_json(
-		payload_storage_value,
-		path_field(path, "payload_storage"),
+	storage_value ?= required_field(value, path, "storage")
+	storage ?= decode_core_union_storage_json(
+		storage_value,
+		path_field(path, "storage"),
 	)
 	variants ?= decode_core_union_variants(value, path, "variants")
 	loc_json ?= required_field(value, path, "loc")
@@ -16542,14 +16716,19 @@ pure func decode_core_union_decl_json(
 		path_field(path, "loc"),
 	)
 
-	Ok({
+	decl: CoreUnionDecl = {
 		abi_type = abi_type,
 		name = name,
 		type_params = type_params,
-		payload_storage = payload_storage,
+		storage = storage,
 		variants = variants,
 		loc = loc,
-	})
+	}
+	match core_union_decl_storage_error(decl):
+		Some(reason):
+			Err(CoreInvalidUnionStorage(path, reason))
+		None:
+			Ok(decl)
 
 
 
@@ -16990,8 +17169,6 @@ pure func core_decl_to_json(decl: CoreDecl) -> JsonValue:
 			core_function_to_json(core_func)
 		GlobalDecl(global):
 			core_global_to_json(global)
-		EnumDecl(enum_decl):
-			core_enum_decl_to_json(enum_decl)
 		UnionDecl(union_decl):
 			core_union_decl_to_json(union_decl)
 		HeapRecordDecl(record_decl):
@@ -17015,9 +17192,6 @@ pure func decode_core_decl_json(value: JsonValue, path: String) -> Result[CoreDe
 	else if tag == GLOBAL_TAG:
 		global ?= decode_core_global_json(value, path)
 		Ok(GlobalDecl(global))
-	else if tag == ENUM_DECL_TAG:
-		enum_decl ?= decode_core_enum_decl_json(value, path)
-		Ok(EnumDecl(enum_decl))
 	else if tag == UNION_DECL_TAG:
 		union_decl ?= decode_core_union_decl_json(value, path)
 		Ok(UnionDecl(union_decl))
@@ -17379,10 +17553,30 @@ private pure func validate_record_cow_update_json_shape(
 				)
 
 
-private pure func validate_record_update_json_tree(
+private pure func validate_union_type_storage_json(
+	value: JsonValue,
+	path: String,
+	storage_by_name: Dict[String, CoreUnionValueStorage],
+) -> Result[Void, CoreJsonError]:
+	storage_json ?= required_field(value, path, "storage")
+	match as_string(storage_json):
+		Some(_):
+			typ ?= decode_core_type_json(value, path)
+			match core_union_type_storage_errors(storage_by_name, typ).get(0):
+				Some(reason):
+					Err(CoreInvalidUnionStorage(path, reason))
+				_:
+					Ok(void)
+		None:
+			-- Declaration storage is an object; type storage is a scalar tag.
+			Ok(void)
+
+
+private pure func validate_core_json_tree(
 	value: JsonValue,
 	path: String,
 	shapes: List[CoreJsonRecordShape],
+	storage_by_name: Dict[String, CoreUnionValueStorage],
 ) -> Result[Void, CoreJsonError]:
 	match value:
 		JsonObject(fields):
@@ -17394,6 +17588,8 @@ private pure func validate_record_update_json_tree(
 						validate_record_reuse_json_shape(value, path, shapes)
 					else if kind == RECORD_COW_UPDATE_EXPR_TAG:
 						validate_record_cow_update_json_shape(value, path, shapes)
+					else if kind == UNION_TYPE_TAG:
+						validate_union_type_storage_json(value, path, storage_by_name)
 					else:
 						Ok(void)
 				None:
@@ -17406,10 +17602,11 @@ private pure func validate_record_update_json_tree(
 					Some(_):
 						void
 					None:
-						match validate_record_update_json_tree(
+						match validate_core_json_tree(
 							child,
 							path_field(path, name),
 							shapes,
+							storage_by_name,
 						):
 							Ok(_):
 								void
@@ -17430,10 +17627,11 @@ private pure func validate_record_update_json_tree(
 					Some(_):
 						void
 					None:
-						match validate_record_update_json_tree(
+						match validate_core_json_tree(
 							child,
 							path_index(path, index),
 							shapes,
+							storage_by_name,
 						):
 							Ok(_):
 								void
@@ -17465,10 +17663,18 @@ pure func decode_core_program_json(raw_value: JsonValue) -> Result[CoreProgram, 
 	else:
 		decls ?= decode_core_decls(value, path, "decls")
 		foreign_includes ?= decode_string_list(value, path, "foreign_includes")
-		record_updates_valid ?= validate_record_update_json_tree(
+		var storage_by_name: Dict[String, CoreUnionValueStorage] = {}
+		for decl in decls:
+			match decl:
+				UnionDecl(info):
+					storage_by_name = storage_by_name.set(info.name, core_union_storage_value(info.storage))
+				_:
+					void
+		core_shapes_valid ?= validate_core_json_tree(
 			value,
 			path,
 			core_json_record_shapes(decls),
+			storage_by_name,
 		)
 		Ok({
 			decls = decls,
@@ -17482,6 +17688,8 @@ pure func decode_core_program_json(raw_value: JsonValue) -> Result[CoreProgram, 
 
 pure func core_json_error_to_string(error: CoreJsonError) -> String:
 	match error:
+		CoreInvalidNativeManagedIdentity(path, error):
+			"invalid Core native managed identity at ${path}: ${core_native_managed_identity_error_to_string(error)}"
 		CoreMissingField(path, field_name):
 			"missing Core JSON field at ${path}: ${field_name}"
 		CoreExpectedObject(path):
@@ -17504,3 +17712,5 @@ pure func core_json_error_to_string(error: CoreJsonError) -> String:
 			"Core JSON field at ${path} must be an array: ${field_name}"
 		CoreUnsupportedTag(path, tag):
 			"unsupported Core JSON tag at ${path}: ${tag}"
+		CoreInvalidUnionStorage(path, reason):
+			"invalid Core union storage at ${path}: ${reason}"

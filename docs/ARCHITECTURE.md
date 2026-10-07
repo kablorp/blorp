@@ -342,7 +342,10 @@ ABI specialization. The projected DCE stage then resolves callable IDs and
 projects backend calls and matches before pruning. Just before projection,
 `hash_key_callbacks.brp` mints, from declarations alone, adapter functions
 that take the runtime's boxed key slot and call a key type's Hashable and
-Equatable impls. Backend projection binds every trait-hashed Dict and Set
+Equatable impls. The slot adapter's closed hash/equality role owns its native C return type:
+`unsigned long` for hashing and `bool` for equality, while the called language
+implementation retains its ordinary `Int` or `Bool` return type.
+Backend projection binds every trait-hashed Dict and Set
 constructor (and lowers trait-keyed Dict literals) to those adapters by
 definition id, DCE drops adapters no container uses, and Perceus sees the adapters'
 borrowed unboxing. Typecheck requires `K: Hashable` of every Dict and Set key,

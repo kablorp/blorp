@@ -11,11 +11,15 @@ int blorp_layout_foreign_mixed_fields(int first, long count, int second, long to
         blorp_layout_bool_identity_impl(value); \
     })
 
-#define blorp_layout_enum_identity(value) \
+static inline long blorp_layout_wire_tag_identity_impl(long value) {
+    return value;
+}
+
+#define blorp_layout_wire_tag_identity(value) \
     ({ \
         _Static_assert(sizeof(value) == sizeof(long), \
-            "enum scalar arguments must retain C long storage"); \
-        (value); \
+            "wire tag arguments must retain C long storage"); \
+        blorp_layout_wire_tag_identity_impl(value); \
     })
 
 #define blorp_layout_foreign_heap_flag(value) \
@@ -30,7 +34,7 @@ int blorp_layout_foreign_mixed_fields(int first, long count, int second, long to
 #define blorp_layout_foreign_heap_state(value) \
     ({ \
         _Static_assert(sizeof((value)->state) == sizeof(long), \
-            "foreign heap enum fields must retain C long storage"); \
+            "foreign heap wire tag fields must retain C long storage"); \
         (value)->state == 1 && (value)->count == 42; \
     })
 

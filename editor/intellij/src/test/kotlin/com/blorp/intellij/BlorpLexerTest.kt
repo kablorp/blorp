@@ -3,6 +3,12 @@ package com.blorp.intellij
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 
 class BlorpLexerTest : BasePlatformTestCase() {
+    fun testEnumIsAnIdentifier() {
+        val lexer = BlorpLexer()
+        lexer.start("enum")
+        assertEquals(BlorpTokenTypes.IDENTIFIER, lexer.tokenType)
+    }
+
     fun testStructIsAnIdentifier() {
         val lexer = BlorpLexer()
         lexer.start("struct")

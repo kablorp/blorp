@@ -8,6 +8,9 @@ import:
 	backend_projection as CoreBackendProjection
 	c_type_layout: c_type_name, stack_option_c_type, type_requires_release
 	ir:
+		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
+		CoreUnionTagAccess(ScalarTagAccess, ManagedTagAccess),
 		CoreAccessor(
 			BoxedStackOptionPayloadAccessor,
 			BoxedResultErrPayloadAccessor, BoxedResultOkPayloadAccessor,
@@ -34,15 +37,9 @@ import:
 			ConstructorMatchFallbackBindings, ConstructorMatchFallbackBody,
 			ConstructorMatchFallbackFail,
 		),
-		CoreConstructorMatchTest(
-			BoolFalseConstructorTest, BoolTrueConstructorTest, BoxedResultErrConstructorTest,
-			BoxedResultOkConstructorTest, EnumConstructorTest, NullableOptionNoneConstructorTest,
-			NullableOptionSomeConstructorTest, StackOptionNoneConstructorTest,
-			StackOptionSomeConstructorTest, StackResultErrConstructorTest,
-			StackResultOkConstructorTest, UnionTagConstructorTest,
-		),
-		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, UnionDecl),
-		CoreEnumVariant,
+		CoreConstructorMatchTest(BoolFalseConstructorTest, BoolTrueConstructorTest, BoxedResultErrConstructorTest, BoxedResultOkConstructorTest, UnionTagConstructorTest, NullableOptionNoneConstructorTest, NullableOptionSomeConstructorTest, StackOptionNoneConstructorTest, StackOptionSomeConstructorTest, StackResultErrConstructorTest, StackResultOkConstructorTest),
+		CoreDecl(UnionDecl, FunctionDecl, GlobalDecl),
+		CoreUnionVariant,
 		CoreExpr(
 			AccessorLiteralMatchExpr, CallExpr, CastExpr, ConstructorMatchExpr, DropExpr, DupExpr,
 			LetExpr, LengthMatchExpr, LiteralMatchExpr, LogicalExpr, SemanticMatchExpr,
@@ -78,10 +75,9 @@ import:
 		),
 		CoreSourceLoc,
 		CoreSourceLocRow,
-		CoreType(BoxedResultType, EnumType, NamedType, StackResultType, TupleType, UnionType),
+		CoreType(BoxedResultType, UnionType, NamedType, StackResultType, TupleType),
 		CoreUnionDecl,
-		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
-		CoreUnionVariant,
+		CoreUnionPayloadStorage(TypedUnionPayloadStorage, ErasedUnionPayloadStorage),
 		CoreVar,
 		CoreVariantRef(VariantById),
 		MATCH_SCRUTINEE_TEMP_ORIGIN,
@@ -326,30 +322,6 @@ private pure func match_projection_variant(
 				Some(variant)
 
 
-private pure func find_enum_variant(
-	program: CoreProgram,
-	type_name: String,
-	constructor: String,
-) -> Option[CoreEnumVariant]:
-	var result: Option[CoreEnumVariant] = None
-
-	for decl in program.decls:
-		match decl:
-			EnumDecl(enum_decl):
-				if enum_decl.name == type_name:
-					for variant in enum_decl.variants:
-						if variant.name == constructor:
-							result = Some(variant)
-							break
-			_:
-				void
-
-		if result.is_some():
-			break
-
-	result
-
-
 private pure func constructor_variable_matches(
 	variable_def_id: Option[Int],
 	def_id: Option[Int],
@@ -381,13 +353,13 @@ private pure func singleton_constructor_value(
 						False
 			else:
 				False
-		EnumType(type_name):
-			match find_enum_variant(layout.specialize.program, type_name, variable.name):
+		UnionType(type_name, ScalarTagValue):
+			match match_projection_variant(layout, type_name, variable.name, variable.def_id):
 				Some(variant):
 					constructor_variable_matches(variable.def_id, variant.def_id)
 				None:
 					False
-		UnionType(type_name) | NamedType(type_name, _):
+		UnionType(type_name, ManagedUnionValue) | NamedType(type_name, _):
 			match match_projection_variant(layout, type_name, variable.name, variable.def_id):
 				Some(variant):
 					fields_empty: Bool = variant.fields.is_empty()
@@ -498,7 +470,7 @@ private pure func union_variant_field_type(
 	match resolve_specialize_type(layout.specialize, parent_type):
 		NamedType(type_name, args):
 			instantiate_union_variant_field_type(layout, type_name, args, constructor, field_index)
-		UnionType(type_name):
+		UnionType(type_name, ManagedUnionValue):
 			instantiate_union_variant_field_type(layout, type_name, [], constructor, field_index)
 		_:
 			None
@@ -544,7 +516,7 @@ private pure func semantic_accessor_type(
 						Some(error_type)
 					else:
 						None
-				UnionType(type_name) | NamedType(type_name, _):
+				UnionType(type_name, ManagedUnionValue) | NamedType(type_name, _):
 					union_variant_field_type(layout, resolved_parent, constructor, field_index)
 				_:
 					None
@@ -558,18 +530,20 @@ private pure func lower_generic_variant_accessor(
 	field_index: Int,
 ) -> Option[CoreAccessor]:
 	type_name ?= match resolve_specialize_type(layout.specialize, parent_type):
-		UnionType(name) | NamedType(name, _):
+		UnionType(name, ManagedUnionValue) | NamedType(name, _):
 			Some(name)
 		_:
 			None
 
 	union_decl ?= match_projection_union(layout, type_name)
 
-	match union_decl.payload_storage:
-		TypedUnionPayloadStorage:
+	match union_decl.storage:
+		ManagedPayloadStorage(TypedUnionPayloadStorage):
 			Some(VariantFieldAccessor(parent, type_name, constructor, field_index))
-		_:
+		ManagedPayloadStorage(ErasedUnionPayloadStorage):
 			Some(ErasedVariantFieldAccessor(parent, type_name, constructor, field_index))
+		ScalarTagStorage:
+			None
 
 
 private pure func lower_accessor(
@@ -699,7 +673,7 @@ private pure func constructor_test(
 						_:
 							variant ?= match_projection_variant(layout, "Option", constructor, None)
 							variant_ref ?= declared_variant_ref(variant.def_id)
-							Some(UnionTagConstructorTest(variant_ref, "Option"))
+							Some(UnionTagConstructorTest(variant_ref, ManagedTagAccess("Option")))
 		StackResultType(_, _):
 			if constructor == "Ok":
 				Some(StackResultOkConstructorTest(c_type_name(resolved_type, {})))
@@ -714,21 +688,21 @@ private pure func constructor_test(
 				Some(BoxedResultErrConstructorTest)
 			else:
 				None
-		EnumType("Bool") | NamedType("Bool", _):
+		NamedType("Bool", _):
 			if constructor == "True":
 				Some(BoolTrueConstructorTest)
 			else if constructor == "False":
 				Some(BoolFalseConstructorTest)
 			else:
 				None
-		EnumType(type_name):
-			variant ?= find_enum_variant(layout.specialize.program, type_name, constructor)
-			variant_ref ?= declared_variant_ref(variant.def_id)
-			Some(EnumConstructorTest(variant_ref))
-		UnionType(type_name) | NamedType(type_name, _):
+		UnionType(type_name, ScalarTagValue):
 			variant ?= match_projection_variant(layout, type_name, constructor, None)
 			variant_ref ?= declared_variant_ref(variant.def_id)
-			Some(UnionTagConstructorTest(variant_ref, type_name))
+			Some(UnionTagConstructorTest(variant_ref, ScalarTagAccess))
+		UnionType(type_name, ManagedUnionValue) | NamedType(type_name, _):
+			variant ?= match_projection_variant(layout, type_name, constructor, None)
+			variant_ref ?= declared_variant_ref(variant.def_id)
+			Some(UnionTagConstructorTest(variant_ref, ManagedTagAccess(type_name)))
 		_:
 			None
 

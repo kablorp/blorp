@@ -6,13 +6,13 @@
 import:
 	memory: same_object
 	../stage_08_core_lower/list_layout: tensor_for_element_storage_for_canonical_type
+	c_type_layout: c_type_name, generated_stack_option_c_type_name
 	allocation_contracts:
 		UnionCleanupKind(DirectUnionCleanup, IterativeUnionCleanup, NoUnionCleanup),
 		release_policy_requires_cleanup,
 		union_cleanup_kind,
 		union_field_uses_iterative_cleanup,
 		union_variant_has_cleanup,
-	c_type_layout: generated_stack_option_c_type_name
 	cancellation_plan:
 		CancellationActivationIdentity(
 			FunctionCancellationActivation, GlobalInitializerCancellationActivation,
@@ -30,6 +30,9 @@ import:
 		cancellation_function_summary,
 		cancellation_global_initializer_summary,
 	ir:
+		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
+		core_union_managed_payload_storage,
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
 		CoreBoxKind(
 			Float16Box, Float32Box, FloatBox, Int128Box, PointerBox, PrimBox, StructBox, UInt128Box,
 			VoidBox,
@@ -58,10 +61,7 @@ import:
 			ConstructorMatchFallbackBindings, ConstructorMatchFallbackBody,
 			ConstructorMatchFallbackFail,
 		),
-		CoreDecl(
-			EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, InlineRecordDecl, ImplDecl,
-			TraitDecl, TypeAliasDecl, UnionDecl,
-		),
+		CoreDecl(InlineRecordDecl, UnionDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, TraitDecl, TypeAliasDecl),
 		CoreDefinitionIdentity,
 		CoreDictConstruct,
 		CoreDictEntry,
@@ -143,11 +143,7 @@ import:
 			TupleFloat32Element, TupleFloat16Element, TupleFloatElement, TuplePointerElement,
 			TuplePrimElement, TupleStructElement, TupleStackResultElement, TupleVoidElement,
 		),
-		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType,
-			RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType,
-			UnionType, VoidType,
-		),
+		CoreType(InlineRecordType, NativeManagedType, BoxedResultType, UnionType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType, VoidType),
 		CoreUnionConstruct,
 		CoreUnionDecl,
 		CoreUnionField,
@@ -302,7 +298,7 @@ private record PrepareDecls {
 
 ---
 First declaration of a name wins, matching the first-match scan this index
-replaces. Value-record, heap-record, enum, and union namespaces stay
+replaces. Value-record, heap-record, union, and union namespaces stay
 distinct because only union declarations enter this dictionary.
 ---
 private pure func prepare_decls(
@@ -738,17 +734,19 @@ private pure func primitive_box_type(typ: CoreType) -> Bool:
 			False
 		FunctionType(_, _, _):
 			False
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			True
 		RangeType:
 			True
+		NativeManagedType(_):
+			False
 		VoidType:
 			False
 		HeapRecordType(name):
 			False
 		InlineRecordType(name):
 			False
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			False
 		TensorType(info):
 			False
@@ -758,6 +756,8 @@ private pure func primitive_box_type(typ: CoreType) -> Bool:
 
 private pure func boxed_kind_for_type(typ: CoreType) -> CoreBoxKind:
 	match typ:
+		NativeManagedType(_):
+			PointerBox
 		VoidType:
 			VoidBox
 		NamedType(name, args):
@@ -853,15 +853,17 @@ private pure func pointer_box_storage_needs_release_type(typ: CoreType) -> Bool:
 			True
 		InlineRecordType(name):
 			False
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			True
 		TupleType(items):
 			True
 		TensorType(info):
 			True
+		NativeManagedType(_):
+			True
 		VoidType:
 			False
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			False
 		RangeType:
 			False
@@ -1668,15 +1670,17 @@ pure func is_primitive_tuple_slot_type(typ: CoreType) -> Bool:
 				name == "Char"
 		TypeParameterType(_) | SelfType:
 			False
+		NativeManagedType(_):
+			False
 		VoidType:
 			False
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			True
 		HeapRecordType(name):
 			False
 		InlineRecordType(name):
 			False
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			False
 		StackResultType(ok_type, err_type):
 			False
@@ -1733,13 +1737,15 @@ private pure func is_managed_pointer_tuple_slot_type(typ: CoreType) -> Bool:
 			False
 		InlineRecordType(name):
 			False
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			False
 		TupleType(items):
 			True
+		NativeManagedType(_):
+			True
 		VoidType:
 			False
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			False
 		RangeType:
 			False
@@ -1763,13 +1769,15 @@ private pure func is_unmanaged_pointer_tuple_slot_type(typ: CoreType) -> Bool:
 			False
 		InlineRecordType(name):
 			False
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			False
 		TupleType(items):
 			False
+		NativeManagedType(_):
+			False
 		VoidType:
 			False
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			False
 		RangeType:
 			False
@@ -1796,15 +1804,15 @@ private pure func stack_option_tuple_slot_c_type(typ: CoreType) -> Option[String
 				None
 		TypeParameterType(_) | SelfType:
 			None
-		VoidType:
+		NativeManagedType(_):
 			None
-		EnumType(name):
+		VoidType:
 			None
 		HeapRecordType(name):
 			None
 		InlineRecordType(name):
 			None
-		UnionType(name):
+		UnionType(name, _):
 			None
 		StackResultType(ok_type, err_type):
 			None
@@ -1837,7 +1845,7 @@ private pure func is_nullable_option_payload_type(payload: CoreType) -> Bool:
 			True
 		InlineRecordType(name):
 			False
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			True
 		TupleType(items):
 			True
@@ -1845,9 +1853,11 @@ private pure func is_nullable_option_payload_type(payload: CoreType) -> Bool:
 			True
 		StackResultType(ok_type, err_type):
 			False
+		NativeManagedType(_):
+			True
 		VoidType:
 			False
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			False
 		RangeType:
 			False
@@ -1868,15 +1878,15 @@ private pure func float_tuple_element(item: CoreExpr, typ: CoreType) -> Option[C
 				None
 		TypeParameterType(_) | SelfType:
 			None
-		VoidType:
+		NativeManagedType(_):
 			None
-		EnumType(name):
+		VoidType:
 			None
 		HeapRecordType(name):
 			None
 		InlineRecordType(name):
 			None
-		UnionType(name):
+		UnionType(name, _):
 			None
 		StackResultType(ok_type, err_type):
 			None
@@ -2106,7 +2116,7 @@ private pure func tensor_for_element_storage_after_raw_proof(
 			raw_scalar_tensor_element_storage_or(
 				env,
 				iterable,
-				tensor_for_element_storage_for_canonical_type(element_type),
+				tensor_for_element_storage_for_canonical_type(element_type, c_type_name(element_type, {})),
 			)
 
 
@@ -2530,6 +2540,9 @@ private pure func prepared_tuple_literal(
 			match item_types.get(index):
 				Some(item_type):
 					match item_type:
+						NativeManagedType(_):
+							elements = elements.append(TuplePointerElement(item))
+							release_mask += release_mask_bit(index)
 						VoidType:
 							elements = elements.append(TupleVoidElement)
 						TypeParameterType(_) | SelfType:
@@ -2608,13 +2621,13 @@ private pure func prepared_tuple_literal(
 							-- The tuple slot owns a struct box holding a copy.
 							elements = elements.append(TupleStructElement(item, name))
 							release_mask += release_mask_bit(index)
-						UnionType(name):
+						UnionType(name, ManagedUnionValue):
 							elements = elements.append(TuplePointerElement(item))
 							release_mask += release_mask_bit(index)
 
 							if tuple_pointer_expr_needs_retain(item):
 								retain_mask += release_mask_bit(index)
-						EnumType(name):
+						UnionType(name, ScalarTagValue):
 							elements = elements.append(TuplePrimElement(item))
 						RangeType:
 							elements = elements.append(TuplePrimElement(item))
@@ -3232,7 +3245,7 @@ private pure func declaration_ordered_record_fields(
 			record_order ?= find_record_field_order(records.inline, name)
 			ordered_fields ?= order_record_fields(record_order, fields)
 			Some((name, ordered_fields))
-		NamedType(_, _) | TypeParameterType(_) | SelfType | VoidType | EnumType(_) | UnionType(_):
+		NamedType(_, _) | TypeParameterType(_) | SelfType | VoidType | NativeManagedType(_) | UnionType(_, _):
 			None
 		StackResultType(_, _) | BoxedResultType(_, _) | FunctionType(_, _, _) | RangeType:
 			None
@@ -3322,6 +3335,8 @@ private pure func prepare_record_construct_expr(
 
 private pure func stack_option_c_type(payload: CoreType) -> Option[String]:
 	match payload:
+		NativeManagedType(_):
+			None
 		VoidType:
 			Some("blorp_StackOption_Void")
 		NamedType(name, args):
@@ -3365,13 +3380,13 @@ private pure func stack_option_c_type(payload: CoreType) -> Option[String]:
 					None
 		TypeParameterType(_) | SelfType:
 			None
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			Some("blorp_StackOption_" + name)
 		HeapRecordType(name):
 			None
 		InlineRecordType(name):
 			Some(generated_stack_option_c_type_name(name))
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			None
 		StackResultType(ok_type, err_type):
 			None
@@ -3400,15 +3415,15 @@ private pure func stack_option_none_value(payload: CoreType) -> String:
 					"0"
 		TypeParameterType(_) | SelfType:
 			"0"
+		NativeManagedType(_):
+			"NULL"
 		VoidType:
-			"0"
-		EnumType(name):
 			"0"
 		HeapRecordType(name):
 			"0"
 		InlineRecordType(name):
 			"{0}"
-		UnionType(name):
+		UnionType(name, _):
 			"0"
 		StackResultType(ok_type, err_type):
 			"{0}"
@@ -3463,7 +3478,7 @@ private pure func stack_option_scalar_payload_type(typ: CoreType) -> Bool:
 					or name == "UInt128"
 				))
 			)
-		EnumType(_):
+		UnionType(_, ScalarTagValue):
 			True
 		_:
 			False
@@ -3720,15 +3735,15 @@ private pure func stack_result_payload_has_erased_storage(payload: CoreType) -> 
 			True
 		TupleType(items):
 			True
-		VoidType:
+		NativeManagedType(_):
 			True
-		EnumType(name):
+		VoidType:
 			True
 		HeapRecordType(name):
 			True
 		InlineRecordType(name):
 			True
-		UnionType(name):
+		UnionType(name, _):
 			True
 		RangeType:
 			True
@@ -3912,11 +3927,12 @@ private pure func prepare_union_construct(
 	layout: CoreSpecializeLayout = decls.specialize_layout
 
 	match typ:
-		UnionType(type_name):
+		UnionType(type_name, ManagedUnionValue):
 			match kind:
 				UserCall(constructor_name, def_id, consumed_args):
 					match find_union_decl(decls.unions_by_name, type_name):
 						Some(union_decl):
+							payload_storage ?= core_union_managed_payload_storage(union_decl)
 							match find_union_variant_by_reference(union_decl.variants, def_id):
 								Some(variant):
 									declared_id ?= variant.def_id
@@ -3924,12 +3940,12 @@ private pure func prepare_union_construct(
 									if variant.fields.length() == args.length():
 										boxed_args: List[CoreBoxedStorageValue] = boxed_storage_values_for_union_payload(
 											layout,
-											union_decl.payload_storage,
+											payload_storage,
 											args,
 										)
 										uses_release_mask: Bool = union_variant_requires_release_mask(
 											layout,
-											union_decl.payload_storage,
+											payload_storage,
 											variant.fields,
 										)
 
@@ -3943,7 +3959,7 @@ private pure func prepare_union_construct(
 											constructor_name = variant.name,
 											variant = VariantById(declared_id),
 											representation = GenericUnionRepresentation,
-											payload_storage = union_decl.payload_storage,
+											payload_storage = payload_storage,
 											uses_release_mask = uses_release_mask,
 											release_mask = release_mask,
 											args = boxed_args,
@@ -4011,7 +4027,7 @@ private pure func prepare_union_construct(
 			prepare_boxed_result_construct(decls, kind, args)
 		FunctionType(_, _, _):
 			None
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			None
 		HeapRecordType(name):
 			None
@@ -4022,6 +4038,8 @@ private pure func prepare_union_construct(
 		TensorType(info):
 			None
 		TupleType(items):
+			None
+		NativeManagedType(_):
 			None
 		VoidType:
 			None
@@ -5689,8 +5707,6 @@ private pure func prepare_decl(decls: PrepareDecls, decl: CoreDecl) -> CoreDecl:
 			FunctionDecl(prepare_function(decls, func_info))
 		GlobalDecl(global):
 			GlobalDecl(prepare_global(decls, global))
-		EnumDecl(enum_decl):
-			EnumDecl(enum_decl)
 		UnionDecl(union_decl):
 			UnionDecl(union_decl)
 		HeapRecordDecl(record_decl):
@@ -5750,7 +5766,7 @@ object. That fact uses the shared `specialize_layout` box-kind and slot-release
 classifier. The emitter reads the prepared row instead of deriving either
 source or erased-storage cleanup policy while printing.
 ---
-enum CleanupStrategy:
+fixed union CleanupStrategy:
 	NoCleanup
 	DirectCleanup
 	IterativeCleanup
@@ -5873,12 +5889,13 @@ private pure func cleanup_field_plan_for_union_field(
 	union_decl: CoreUnionDecl,
 	field: CoreUnionField,
 ) -> CleanupFieldPlan:
+	needs_release: Bool = match union_decl.storage:
+		ScalarTagStorage:
+			False
+		ManagedPayloadStorage(payload_storage):
+			union_field_needs_release_in_storage(layout, payload_storage, field)
 	{
-		needs_release = union_field_needs_release_in_storage(
-			layout,
-			union_decl.payload_storage,
-			field,
-		),
+		needs_release = needs_release,
 		uses_iterative_cleanup = union_field_uses_iterative_cleanup(union_decl, field)
 	}
 
@@ -5893,12 +5910,13 @@ private pure func cleanup_variant_plan(
 	for field in variant.fields:
 		fields = fields.append(cleanup_field_plan_for_union_field(layout, union_decl, field))
 
+	has_cleanup: Bool = match union_decl.storage:
+		ScalarTagStorage:
+			False
+		ManagedPayloadStorage(payload_storage):
+			union_variant_has_effective_cleanup(layout, payload_storage, variant.fields)
 	{
-		has_cleanup = union_variant_has_effective_cleanup(
-			layout,
-			union_decl.payload_storage,
-			variant.fields,
-		),
+		has_cleanup = has_cleanup,
 		fields = fields
 	}
 
@@ -5909,10 +5927,14 @@ private pure func union_decl_requires_field_cleanup(
 ) -> Bool:
 	var requires_cleanup: Bool = False
 
-	for variant in union_decl.variants:
-		if union_variant_has_effective_cleanup(layout, union_decl.payload_storage, variant.fields):
-			requires_cleanup = True
-			break
+	match union_decl.storage:
+		ScalarTagStorage:
+			void
+		ManagedPayloadStorage(payload_storage):
+			for variant in union_decl.variants:
+				if union_variant_has_effective_cleanup(layout, payload_storage, variant.fields):
+					requires_cleanup = True
+					break
 
 	requires_cleanup
 
@@ -5983,13 +6005,17 @@ private pure func cleanup_type_plan_for_decl(
 ) -> CleanupTypePlan:
 	match decl:
 		UnionDecl(union_decl):
-			union_cleanup_type_plan(layout, union_decl)
+			match union_decl.storage:
+				ManagedPayloadStorage(_):
+					union_cleanup_type_plan(layout, union_decl)
+				ScalarTagStorage:
+					NotACleanupType
 		HeapRecordDecl(record_decl):
 			heap_record_cleanup_type_plan(record_decl)
 		InlineRecordDecl(_):
 			-- Scalar fields and no header: an inline record has nothing to clean up.
 			NotACleanupType
-		FunctionDecl(_) | GlobalDecl(_) | EnumDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
+		FunctionDecl(_) | GlobalDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
 			NotACleanupType
 
 
@@ -6145,7 +6171,7 @@ private pure func cancellation_plan_for_decl(
 			function_cancellation_plan(func_info, program_summary)
 		GlobalDecl(global):
 			global_cancellation_plan(global, program_summary)
-		EnumDecl(_) | UnionDecl(_) | HeapRecordDecl(_) | InlineRecordDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
+		UnionDecl(_) | HeapRecordDecl(_) | InlineRecordDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
 			None
 
 

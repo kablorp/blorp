@@ -7,6 +7,10 @@ import:
 	dict: Dict
 	erased_key_temps: is_erased_key_temp_marker
 	ir:
+		CoreUnionValueStorage,
+		core_union_decl_storage_error,
+		core_union_storage_value,
+		core_union_type_storage_errors,
 		CoreCallKind(
 			BuiltinCall, DeferredTraitCall, IntrinsicCall, SelectedDirectCall, SelectedTraitCall,
 			UnknownCall, UserCall,
@@ -15,7 +19,7 @@ import:
 		CoreConcurrentlyLoop,
 		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopCopyItem, ConcurrentlyLoopMoveResourceItem),
 		CoreConcurrentlyLoopOutput(ConcurrentlyLoopCollect, ConcurrentlyLoopDiscard),
-		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ImplDecl, UnionDecl),
+		CoreDecl(InlineRecordDecl, UnionDecl, FunctionDecl, GlobalDecl, ImplDecl, HeapRecordDecl, TypeAliasDecl, TraitDecl),
 		CoreExpr(
 			AccessorLiteralMatchExpr, BreakExpr, CallExpr, CooperativeCheckpointExpr, DetachExpr,
 			ConcurrentExpr, ConcurrentlyLoopExpr, ConstructorMatchExpr, DebugBlockExpr, DictExpr,
@@ -63,6 +67,7 @@ import:
 
 
 union CoreLateInvariantViolation:
+	UnionStorageViolation(String)
 	DuplicateDefinitionId(Int, String, String)
 	InvalidDefinitionId(Int, String)
 	DuplicateRuntimeCallback(String, String, String, String)
@@ -98,6 +103,8 @@ union CoreLateInvariantViolation:
 
 pure func core_late_invariant_message(violation: CoreLateInvariantViolation) -> String:
 	match violation:
+		UnionStorageViolation(reason):
+			reason
 		DuplicateDefinitionId(def_id, first_owner, second_owner):
 			"definition ID ${def_id} is owned by both ${first_owner} and ${second_owner}"
 		InvalidDefinitionId(def_id, owner):
@@ -228,15 +235,6 @@ private pure func declared_definition_id_owners(
 				)
 			GlobalDecl(global):
 				owners = owners.append((global.def_id, global_definition_owner(global)))
-			EnumDecl(enum_decl):
-				for variant in enum_decl.variants:
-					match variant.def_id:
-						Some(def_id):
-							owners = owners.append(
-								(def_id, ConstructorDefinitionOwner(enum_decl.name, variant.name)),
-							)
-						None:
-							void
 			UnionDecl(union_decl):
 				for variant in union_decl.variants:
 					match variant.def_id:
@@ -393,6 +391,63 @@ private pure func perceus_boundary_form_violations(
 			[FormErasedBeforePerceusSurvived("DictExpr", loc)]
 		_:
 			[]
+
+
+
+private pure func union_storage_violations(program: CoreProgram) -> List[CoreLateInvariantViolation]:
+	var storage_by_name: Dict[String, CoreUnionValueStorage] = {}
+	var violations: List[CoreLateInvariantViolation] = []
+	var types: List[CoreType] = []
+
+	for decl in program.decls:
+		match decl:
+			UnionDecl(info):
+				storage_by_name = storage_by_name.set(info.name, core_union_storage_value(info.storage))
+				match core_union_decl_storage_error(info):
+					Some(reason):
+						violations = violations.append(UnionStorageViolation("union `${info.name}`: " + reason))
+					None:
+						void
+				for variant in info.variants:
+					for field in variant.fields:
+						types = types.append(field.typ)
+			FunctionDecl(info):
+				types = types.append(info.return_type)
+				for param in info.params:
+					types = types.append(param.typ)
+			GlobalDecl(info):
+				types = types.append(info.typ)
+			HeapRecordDecl(info):
+				for field in info.fields:
+					types = types.append(field.typ)
+			InlineRecordDecl(info):
+				for field in info.fields:
+					types = types.append(field.typ)
+			TypeAliasDecl(info):
+				types = types.append(info.target)
+			ImplDecl(info):
+				types = types.append(info.for_type)
+				for method in info.methods:
+					types = types.append(method.return_type)
+					for param in method.params:
+						types = types.append(param.typ)
+			TraitDecl(info):
+				for method in info.methods:
+					types = types.append(method.return_type)
+					for param in method.params:
+						types = types.append(param.typ)
+
+	for typ in types:
+		violations = violations.concat(core_union_type_storage_errors(storage_by_name, typ).map(
+			func(reason): UnionStorageViolation(reason),
+		))
+
+	published_storage_by_name: Dict[String, CoreUnionValueStorage] = storage_by_name
+	violations.concat(check_program_exprs(program, func(expr):
+		core_union_type_storage_errors(published_storage_by_name, core_expr_type(expr)).map(
+			func(reason): UnionStorageViolation(reason),
+		)
+	))
 
 
 private pure func record_update_violations(expr: CoreExpr) -> List[CoreLateInvariantViolation]:
@@ -559,7 +614,7 @@ private pure func is_int_type(typ: CoreType) -> Bool:
 
 private pure func is_concurrency_error_type(typ: CoreType) -> Bool:
 	match typ:
-		NamedType("ConcurrencyError", []) | UnionType("ConcurrencyError"):
+		NamedType("ConcurrencyError", []) | UnionType("ConcurrencyError", ManagedUnionValue):
 			True
 		_:
 			False
@@ -641,7 +696,23 @@ private pure func resource_body_has_unrewritten_exit(expr: CoreExpr) -> Bool:
 				resource_body_has_unrewritten_exit(start)
 				or resource_body_has_unrewritten_exit(end_value)
 			)
-		ForChannelExpr(loop, _, _) | ForListExpr(loop, _, _) | ForStringExpr(loop, _, _) | ForDictExpr(loop, _, _) | ForSetExpr(loop, _, _) | ForStreamExpr(loop, _, _) | ForResourceSourceExpr(loop, _, _) | ForTensorExpr(loop, _, _):
+		-- Distinct loop records have different field positions. Keep each
+		-- binding typed to its own record; only iterable exits escape the loop.
+		ForChannelExpr(loop, _, _):
+			resource_body_has_unrewritten_exit(loop.iterable)
+		ForListExpr(loop, _, _):
+			resource_body_has_unrewritten_exit(loop.iterable)
+		ForStringExpr(loop, _, _):
+			resource_body_has_unrewritten_exit(loop.iterable)
+		ForDictExpr(loop, _, _):
+			resource_body_has_unrewritten_exit(loop.iterable)
+		ForSetExpr(loop, _, _):
+			resource_body_has_unrewritten_exit(loop.iterable)
+		ForStreamExpr(loop, _, _):
+			resource_body_has_unrewritten_exit(loop.iterable)
+		ForResourceSourceExpr(loop, _, _):
+			resource_body_has_unrewritten_exit(loop.iterable)
+		ForTensorExpr(loop, _, _):
 			resource_body_has_unrewritten_exit(loop.iterable)
 		ConcurrentlyLoopExpr(loop, _, _):
 			(
@@ -1180,7 +1251,23 @@ private pure func checkpoint_expr_violations(expr: CoreExpr) -> List[CoreLateInv
 			checkpoint_expr_violations(start)
 				.concat(checkpoint_expr_violations(end_value))
 				.concat(checkpoint_loop_body_violations(body))
-		ForChannelExpr(loop, _, _) | ForListExpr(loop, _, _) | ForStringExpr(loop, _, _) | ForDictExpr(loop, _, _) | ForSetExpr(loop, _, _) | ForStreamExpr(loop, _, _) | ForResourceSourceExpr(loop, _, _) | ForTensorExpr(loop, _, _):
+		-- Do not merge heterogeneous loop-record bindings into one OR arm:
+		-- body/iterable offsets differ with layout and release-policy fields.
+		ForChannelExpr(loop, _, _):
+			checkpoint_iterable_loop_violations(loop.iterable, loop.body)
+		ForListExpr(loop, _, _):
+			checkpoint_iterable_loop_violations(loop.iterable, loop.body)
+		ForStringExpr(loop, _, _):
+			checkpoint_iterable_loop_violations(loop.iterable, loop.body)
+		ForDictExpr(loop, _, _):
+			checkpoint_iterable_loop_violations(loop.iterable, loop.body)
+		ForSetExpr(loop, _, _):
+			checkpoint_iterable_loop_violations(loop.iterable, loop.body)
+		ForStreamExpr(loop, _, _):
+			checkpoint_iterable_loop_violations(loop.iterable, loop.body)
+		ForResourceSourceExpr(loop, _, _):
+			checkpoint_iterable_loop_violations(loop.iterable, loop.body)
+		ForTensorExpr(loop, _, _):
 			checkpoint_iterable_loop_violations(loop.iterable, loop.body)
 		ConcurrentlyLoopExpr(loop, _, _):
 			var violations: List[CoreLateInvariantViolation] = checkpoint_iterable_loop_violations(
@@ -1374,7 +1461,7 @@ pure func check_late_core_invariants(
 
 	if check_final:
 		env: PerceusEnv = build_env(program)
-		check_definition_id_uniqueness(program)
+		check_definition_id_uniqueness(program).concat(union_storage_violations(program))
 			.concat(
 				check_program_exprs(
 					program,
@@ -1386,4 +1473,4 @@ pure func check_late_core_invariants(
 			.concat(checkpoint_program_violations(program))
 			.concat(user_call_contract_violations(program))
 	else:
-		check_program_exprs(program, check_phase_expr)
+		union_storage_violations(program).concat(check_program_exprs(program, check_phase_expr))

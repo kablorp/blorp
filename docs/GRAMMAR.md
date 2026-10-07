@@ -165,7 +165,7 @@ digit  = "0".."9" ;
 ```
 
 Identifiers are ASCII (`SCAN:101-106`). A lone `_` is the `"_"` token, not an
-identifier (`LEX:825-836`). `fixed`, `raw` and `struct` are identifiers:
+identifier (`LEX:825-836`). `enum`, `fixed`, `raw` and `struct` are identifiers:
 `fixed` introduces a declaration only directly before `record` or `union`
 (`LP:1171-1178`), and `raw` introduces a raw string only as described in
 [1.6](#16-string-literals).
@@ -177,7 +177,7 @@ These spellings are keywords (`TOK:161-208`):
 ```
 after       alias       and         as          break       builtin
 concurrent  concurrently            continue    debug       detach
-else        enum        False       for         foreign     from
+else                    False       for         foreign     from
 from_opaque func        if          implements  import      in
 into_opaque match       not         on          opaque      or
 private     pure        record      resource    select      sealed
@@ -686,7 +686,6 @@ declaration_body = function_decl
                  | global_decl
                  | record_decl
                  | union_decl
-                 | enum_decl
                  | alias_decl
                  | builtin_type_decl
                  | trait_decl
@@ -775,7 +774,7 @@ work. These rules are checked after parsing.
 > declaration``, `LP:10811-10822`), while the discovery stage accepts it.
 > [D7](#d7-the-remaining-soft-keywords) decides which is intended.
 
-#### Records, unions and enums
+#### Records and unions
 
 ```ebnf
 record_decl  = [ "fixed" ] "record" IDENT [ type_params ]
@@ -787,7 +786,6 @@ union_decl   = [ "fixed" ] "union" IDENT [ type_params ] ":" NEWLINE
 variant      = variant_name [ "(" [ type { "," type } [ "," ] ] ")" ] ;
 variant_name = IDENT | "True" | "False" ;
 
-enum_decl    = "enum" IDENT ":" NEWLINE INDENT seq(variant_name) [ NEWLINE ] DEDENT ;
 ```
 
 `fixed` is the identifier `fixed` directly before `record` or `union`. Both
@@ -796,9 +794,9 @@ Layout is not part of the grammar: the compiler stores a `fixed record` of
 numbers, `Char` values and other such records inline, and every other record
 managed (GUIDE, "Fixed Records"). A record's field names are distinct. A
 variant declares at most `MAX_UNION_VARIANT_FIELDS` = 64 payload fields
-(`LIM:11-15`). A union variant may have empty parentheses; an
-enum case is a bare name, and parentheses on one are an error that suggests
-`union`.
+(`LIM:11-15`). A union variant may have empty parentheses. `enum` is not a
+declaration form. `fixed union` is currently a temporary synonym for `union`,
+not a checked payload, no-boxing or allocation guarantee.
 
 #### Aliases and builtin types
 
@@ -1811,7 +1809,6 @@ and holes ([1.7](#17-interpolation-holes)).
   binding.
 - **Docstrings** precede a declaration, or begin the module before its first
   `import:` block (3.2).
-- **Enum cases** take no parentheses (3.3).
 - **Owner decision: `detach` is a statement only.** It is not valid as a value
   or an operand (3.4).
 - **`select` is a statement only**: recommended in

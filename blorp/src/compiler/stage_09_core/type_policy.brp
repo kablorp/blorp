@@ -6,6 +6,9 @@ import:
 	../stage_06_typecheck/type_system/semantic_type: display_type_name
 	../stage_06_typecheck/type_system/type_name_metadata as TypeNameMetadata
 	ir:
+		core_native_managed_canonical_name,
+		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
 		CoreDecl(HeapRecordDecl, UnionDecl),
 		CoreDimOp(DimAdd, DimDivide, DimMultiply, DimSubtract),
 		CoreImplDecl,
@@ -14,11 +17,7 @@ import:
 			ArcReleaseOnlyPolicy, ArcReleasePolicy, NoReleasePolicy, StackResultReleasePolicy,
 		),
 		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
-		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType, RangeType, SelfType,
-			StackResultType, TensorType, TupleType, TypeParameterType, UnionType,
-			VoidType,
-		),
+		CoreType(InlineRecordType, NativeManagedType, BoxedResultType, UnionType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType, VoidType),
 	set as Sets
 
 
@@ -112,7 +111,7 @@ pure func core_type_has_unresolved_parameters(typ: CoreType) -> Bool:
 			)
 		TupleType(items):
 			items.any(core_type_has_unresolved_parameters)
-		RangeType | VoidType | EnumType(_) | HeapRecordType(_) | InlineRecordType(_) | UnionType(_):
+		NativeManagedType(_) | RangeType | VoidType | UnionType(_, _) | HeapRecordType(_) | InlineRecordType(_):
 			False
 
 
@@ -143,7 +142,7 @@ pure func core_type_has_unresolved_mono_parameters(typ: CoreType) -> Bool:
 			core_type_has_unresolved_mono_parameters(info.element_type)
 		TupleType(items):
 			items.any(core_type_has_unresolved_mono_parameters)
-		RangeType | VoidType | EnumType(_) | HeapRecordType(_) | InlineRecordType(_) | UnionType(_):
+		NativeManagedType(_) | RangeType | VoidType | UnionType(_, _) | HeapRecordType(_) | InlineRecordType(_):
 			False
 
 
@@ -194,6 +193,8 @@ pure func is_runtime_erased_union_payload_type_name(name: String) -> Bool:
 
 pure func is_stack_result_type(typ: CoreType) -> Bool:
 	match typ:
+		NativeManagedType(_):
+			False
 		NamedType(name, args):
 			name == "Result" and args.length() == 2
 		TypeParameterType(_) | SelfType:
@@ -206,13 +207,11 @@ pure func is_stack_result_type(typ: CoreType) -> Bool:
 			False
 		VoidType:
 			False
-		EnumType(_):
-			False
 		HeapRecordType(_):
 			False
 		InlineRecordType(_):
 			False
-		UnionType(_):
+		UnionType(_, _):
 			False
 		RangeType:
 			False
@@ -240,13 +239,11 @@ pure func primitive_integer_type(name: String) -> Bool:
 	)
 
 
---- `typ` is `Bool`, whether it is spelled as a named type or as the `Bool` enum.
+--- `typ` is `Bool`, the canonical primitive named type.
 pure func bool_type_is(typ: CoreType) -> Bool:
 	match typ:
 		NamedType("Bool", args):
 			args.is_empty()
-		EnumType("Bool"):
-			True
 		_:
 			False
 
@@ -259,7 +256,11 @@ pure func managed_type_index(program: CoreProgram) -> ManagedTypeIndex:
 			HeapRecordDecl(record_decl):
 				names = Sets.add(names, record_decl.name)
 			UnionDecl(union_decl):
-				names = Sets.add(names, union_decl.name)
+				match union_decl.storage:
+					ManagedPayloadStorage(_):
+						names = Sets.add(names, union_decl.name)
+					ScalarTagStorage:
+						void
 			_:
 				void
 
@@ -268,6 +269,8 @@ pure func managed_type_index(program: CoreProgram) -> ManagedTypeIndex:
 
 private pure func is_managed_type_in_set(managed_names: Set[String], typ: CoreType) -> Bool:
 	match typ:
+		NativeManagedType(_):
+			True
 		NamedType("Option", [payload_type]):
 			match payload_type:
 				NamedType("Option", _):
@@ -286,7 +289,7 @@ private pure func is_managed_type_in_set(managed_names: Set[String], typ: CoreTy
 			)
 		TypeParameterType(_) | SelfType:
 			False
-		HeapRecordType(_) | UnionType(_) | BoxedResultType(_, _):
+		HeapRecordType(_) | UnionType(_, ManagedUnionValue) | BoxedResultType(_, _):
 			True
 		FunctionType(_, _, _) | TupleType(_) | TensorType(_):
 			True
@@ -300,7 +303,7 @@ private pure func is_managed_type_in_set(managed_names: Set[String], typ: CoreTy
 				or is_managed_type_in_set(managed_names, ok_type)
 				or is_managed_type_in_set(managed_names, err_type)
 			)
-		VoidType | EnumType(_) | RangeType:
+		VoidType | UnionType(_, ScalarTagValue) | RangeType:
 			False
 
 
@@ -321,9 +324,9 @@ pure func erased_slot_holds_owned_box(typ: CoreType) -> Bool:
 	match typ:
 		InlineRecordType(_):
 			True
-		NamedType(_, _) | StackResultType(_, _) | BoxedResultType(_, _) | VoidType | EnumType(_):
+		NamedType(_, _) | StackResultType(_, _) | BoxedResultType(_, _) | VoidType | NativeManagedType(_):
 			False
-		RangeType | TypeParameterType(_) | SelfType | HeapRecordType(_) | UnionType(_):
+		RangeType | TypeParameterType(_) | SelfType | HeapRecordType(_) | UnionType(_, _):
 			False
 		FunctionType(_, _, _) | TupleType(_) | TensorType(_):
 			False
@@ -368,6 +371,8 @@ private pure func core_type_list_to_string(types: List[CoreType]) -> String:
 
 pure func core_type_to_string(typ: CoreType) -> String:
 	match typ:
+		NativeManagedType(identity):
+			display_type_name(core_native_managed_canonical_name(identity))
 		VoidType:
 			"Void"
 		NamedType(name, args):
@@ -392,7 +397,7 @@ pure func core_type_to_string(typ: CoreType) -> String:
 			) + ") -> " + core_type_to_string(return_type)
 		StackResultType(ok_type, err_type) | BoxedResultType(ok_type, err_type):
 			"Result[" + core_type_to_string(ok_type) + ", " + core_type_to_string(err_type) + "]"
-		EnumType(name) | HeapRecordType(name) | InlineRecordType(name) | UnionType(name):
+		UnionType(name, _) | HeapRecordType(name) | InlineRecordType(name):
 			display_type_name(name)
 		RangeType:
 			"Range"
@@ -413,6 +418,8 @@ pure func nullable_managed_option_payload_release_policy(
 	payload: CoreType,
 ) -> Option[CoreReleasePolicy]:
 	match payload:
+		NativeManagedType(_):
+			Some(ArcReleaseOnlyPolicy)
 		NamedType(name, args):
 			if (
 				(name == "String" or name == "LiteralString" or name == "Bytes" or name == "FixedPoint")
@@ -449,9 +456,9 @@ pure func nullable_managed_option_payload_release_policy(
 				Some(ArcReleasePolicy)
 			else:
 				None
-		HeapRecordType(_) | UnionType(_) | TensorType(_) | TupleType(_) | FunctionType(_, _, _):
+		HeapRecordType(_) | UnionType(_, ManagedUnionValue) | TensorType(_) | TupleType(_) | FunctionType(_, _, _):
 			Some(ArcReleasePolicy)
-		TypeParameterType(_) | SelfType | StackResultType(_, _) | BoxedResultType(_, _) | VoidType | EnumType(_) | RangeType:
+		TypeParameterType(_) | SelfType | StackResultType(_, _) | BoxedResultType(_, _) | VoidType | UnionType(_, ScalarTagValue) | RangeType:
 			None
 		InlineRecordType(_):
 			None
@@ -462,6 +469,8 @@ pure func cleanup_release_policy_for_type(typ: CoreType) -> CoreReleasePolicy:
 		StackResultReleasePolicy
 	else:
 		match typ:
+			NativeManagedType(_):
+				ArcReleaseOnlyPolicy
 			NamedType(name, args):
 				if name == "Option":
 					match args:
@@ -517,7 +526,7 @@ pure func cleanup_release_policy_for_type(typ: CoreType) -> CoreReleasePolicy:
 				ArcReleasePolicy
 			InlineRecordType(_):
 				NoReleasePolicy
-			UnionType(_):
+			UnionType(_, ManagedUnionValue):
 				ArcReleasePolicy
 			TensorType(_):
 				ArcReleasePolicy
@@ -525,7 +534,7 @@ pure func cleanup_release_policy_for_type(typ: CoreType) -> CoreReleasePolicy:
 				ArcReleasePolicy
 			VoidType:
 				NoReleasePolicy
-			EnumType(_):
+			UnionType(_, ScalarTagValue):
 				NoReleasePolicy
 			RangeType:
 				NoReleasePolicy

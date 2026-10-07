@@ -2,6 +2,10 @@
 
 Measured on 2026-10-04 after reconciling discovery-tree work with main `3e5cf1ff32fb95f1b7d797a501e733341992fb15`. These are allocation contracts for the merged source, not a performance comparison.
 
+The retained executable `parser_probe.brp` now generates `fixed union E` rather
+than `enum E`. It no longer reproduces the historical source hash in the frozen
+manifest; measurements, logs and hash manifests below remain historical.
+
 ## Provenance
 
 ```text

@@ -1,4 +1,7 @@
 import:
+	../../../src/compiler/stage_06_typecheck/type_system/language_surface_manifest:
+		NativeManagedBuiltin(NativeIpAddress, NativeDnsName, NativeInterfaceScope),
+		native_managed_builtin_canonical_name,
 	../../../src/compiler/stage_09_core/type_policy as FieldPolicy
 	../../../src/compiler/stage_02_lex/name_table: NameId, name_id_from_interned_index, name_ids_equal
 	../../../src/compiler/stage_09_core/c_type_layout: type_requires_release
@@ -9,6 +12,10 @@ import:
 		FIXTURE_SOURCE_FUNCTION_ORIGIN,
 		fixture_source_module,
 	../../../src/compiler/stage_09_core/ir:
+		core_native_managed_identity,
+		CoreNativeManagedIdentityError(CoreNativeManagedNegativeDefinitionId, CoreNativeManagedKeyMismatch),
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
+		CoreUnionTagAccess(ScalarTagAccess, ManagedTagAccess),
 		CoreAccessor(
 			BoxedStackOptionPayloadAccessor,
 			ErasedVariantFieldAccessor,
@@ -48,21 +55,12 @@ import:
 			ConstructorMatchFallbackBindings,
 			ConstructorMatchFallbackFail,
 		),
-		CoreConstructorMatchTest(EnumConstructorTest, UnionTagConstructorTest),
-		CoreDecl(
-			EnumDecl,
-			FunctionDecl,
-			GlobalDecl,
-			HeapRecordDecl,
-			ImplDecl,
-			TraitDecl,
-			TypeAliasDecl,
-			UnionDecl,
-		),
+		CoreConstructorMatchTest(UnionTagConstructorTest),
+		CoreDecl(UnionDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, TraitDecl, TypeAliasDecl),
 		CoreDictLiteralEntry,
 		CoreDirectRuntimeArgs(DirectRuntimeArgsAppendListParallelLayout),
 		CoreDirectRuntimeResult(DirectRuntimeResultCast),
-		CoreEnumDecl,
+		CoreUnionDecl,
 		CoreExpr(
 			AssignExpr,
 			BinaryExpr,
@@ -149,7 +147,8 @@ import:
 		CoreFunction,
 		CoreEntrypointKind(ProgramWrapperEntrypoint, UserMainEntrypoint),
 		CoreFunctionKind(ClosureBodyFunction, ForeignFunction, UserFunction),
-		CoreDeclaredOrigin(Entrypoint, EtaExpansion, HoistedLambda, HoistedTask, ImplMethod, MonoInstance, NativeTagEqualityCallback, ProjectedImplMethod, PureVariant, SourceFunction),
+		CoreDeclaredOrigin(Entrypoint, EtaExpansion, HashKeySlotAdapter, HoistedLambda, HoistedTask, ImplMethod, MonoInstance, NativeTagEqualityCallback, ProjectedImplMethod, PureVariant, SourceFunction),
+		CoreHashKeySlotRole(HashSlotCallback, EqualitySlotCallback),
 		CoreImplMethodRole(OrdinaryImplMethod, RuntimeCallbackMethod),
 		CoreRuntimeCallbackRole(HashableHashCallback),
 		CoreFunctionOrigin(Declared, Synthesized),
@@ -176,6 +175,8 @@ import:
 		),
 		CoreHeapRecordDecl,
 		CoreJsonError(
+			CoreInvalidNativeManagedIdentity,
+			CoreInvalidUnionStorage,
 			CoreExpectedArrayField,
 			CoreExpectedBoolField,
 			CoreExpectedIntField,
@@ -272,21 +273,9 @@ import:
 			TupleStackResultElement,
 			TupleStructElement,
 		),
-		CoreType(
-			EnumType,
-			HeapRecordType,
-			NamedType,
-			RangeType,
-			SelfType,
-			TensorType,
-			TupleType,
-			TypeParameterType,
-			UnionType,
-			VoidType,
-		),
+		CoreType(NativeManagedType, UnionType, HeapRecordType, NamedType, RangeType, SelfType, TensorType, TupleType, TypeParameterType, VoidType),
 		CoreUnaryOp(NotOp),
 		CoreUnboxKind(PrimUnbox),
-		CoreUnionDecl,
 		CoreUnionField,
 		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
 		CoreUnionRepresentation(
@@ -314,6 +303,10 @@ import:
 		core_select_to_json,
 		core_set_alloc_to_json,
 		core_type_to_json,
+		core_type_equal,
+		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
+		core_union_decl_to_json,
+		decode_core_union_decl_json,
 		core_union_representation_to_json,
 		core_vars_have_same_definition,
 		decode_core_accessor_json,
@@ -449,7 +442,7 @@ pure func tcp_stream_type() -> CoreType:
 
 
 pure func io_error_type() -> CoreType:
-	UnionType("IOError")
+	UnionType("IOError", ManagedUnionValue)
 
 
 pure func resource_source_tcp_stream_io_error_type() -> CoreType:
@@ -539,7 +532,7 @@ pure func char_type() -> CoreType:
 
 
 pure func color_type() -> CoreType:
-	EnumType("Color")
+	UnionType("Color", ScalarTagValue)
 
 
 pure func range_type() -> CoreType:
@@ -582,7 +575,7 @@ pure func box_type() -> CoreType:
 
 
 pure func choice_type() -> CoreType:
-	UnionType("Choice")
+	UnionType("Choice", ManagedUnionValue)
 
 
 pure func choice_var() -> CoreVar:
@@ -869,7 +862,9 @@ pure func early_declarations_program() -> CoreProgram:
 		decls = [
 			HeapRecordDecl({ range_record_decl() | type_params = ["T"] }),
 			HeapRecordDecl({ box_heap_record_decl() | type_params = ["T"] }),
-			EnumDecl({ color_enum_decl() | type_params = ["T"] }),
+			UnionDecl({ color_scalar_union_decl() |
+				type_params = ["T"], storage = ManagedPayloadStorage(TypedUnionPayloadStorage)
+			}),
 			UnionDecl({ choice_union_decl() | type_params = ["T"] }),
 			TypeAliasDecl({
 				abi_type = None,
@@ -2486,20 +2481,23 @@ pure func nonfinite_float_literal_program() -> CoreProgram:
 	}
 
 
-pure func color_enum_decl() -> CoreEnumDecl:
+pure func color_scalar_union_decl() -> CoreUnionDecl:
 	{
 		abi_type = None,
+		storage = ScalarTagStorage,
 		name = "Color",
 		type_params = [],
 		variants = [
 			{
 				name = "Red",
 				tag = 0,
+				fields = [],
 				def_id = Some(101)
 			},
 			{
 				name = "Blue",
 				tag = 1,
+				fields = [],
 				def_id = Some(102)
 			},
 		],
@@ -2507,7 +2505,7 @@ pure func color_enum_decl() -> CoreEnumDecl:
 	}
 
 
-pure func enum_program() -> CoreProgram:
+pure func scalar_union_program() -> CoreProgram:
 	func_info: CoreFunction = {
 		name = "is_red",
 		source_module = None,
@@ -2561,7 +2559,7 @@ pure func enum_program() -> CoreProgram:
 	}
 
 	{
-		decls = [EnumDecl(color_enum_decl()), FunctionDecl(func_info)],
+		decls = [UnionDecl(color_scalar_union_decl()), FunctionDecl(func_info)],
 		foreign_includes = [],
 		source_files = [{ path = "main.brp", module_name = "main.brp" }]
 	}
@@ -2572,7 +2570,7 @@ pure func choice_union_decl() -> CoreUnionDecl:
 		abi_type = None,
 		name = "Choice",
 		type_params = [],
-		payload_storage = TypedUnionPayloadStorage,
+		storage = ManagedPayloadStorage(TypedUnionPayloadStorage),
 		variants = [
 			{
 				name = "Picked",
@@ -3271,14 +3269,14 @@ pure func constructor_match_program() -> CoreProgram:
 	red_case: CoreConstructorMatchCase = {
 		constructor = "Red",
 		accessor = RootAccessor,
-		test = EnumConstructorTest(VariantById(101)),
+		test = UnionTagConstructorTest(VariantById(101), ScalarTagAccess),
 		bindings = [],
 		body = ConstructorMatchBodyExpr(LiteralExpr(IntLiteral(1), int_type(), sample_loc()))
 	}
 	blue_case: CoreConstructorMatchCase = {
 		constructor = "Blue",
 		accessor = RootAccessor,
-		test = EnumConstructorTest(VariantById(102)),
+		test = UnionTagConstructorTest(VariantById(102), ScalarTagAccess),
 		bindings = [],
 		body = ConstructorMatchBodyExpr(LiteralExpr(IntLiteral(2), int_type(), sample_loc()))
 	}
@@ -3323,7 +3321,7 @@ pure func constructor_match_program() -> CoreProgram:
 	}
 
 	{
-		decls = [EnumDecl(color_enum_decl()), FunctionDecl(func_info)],
+		decls = [UnionDecl(color_scalar_union_decl()), FunctionDecl(func_info)],
 		foreign_includes = [],
 		source_files = [{ path = "main.brp", module_name = "main.brp" }]
 	}
@@ -3333,7 +3331,7 @@ pure func union_constructor_match_binding_program() -> CoreProgram:
 	picked_case: CoreConstructorMatchCase = {
 		constructor = "Picked",
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest(VariantById(44), "Choice"),
+		test = UnionTagConstructorTest(VariantById(44), ManagedTagAccess("Choice")),
 		bindings = [
 			{
 				variable = picked_value_var(),
@@ -4797,10 +4795,6 @@ pure func origin_round_trips(origin: CoreFunctionOrigin) -> Bool:
 			False
 
 
-pure func test_core_json_round_trips_native_tag_equality_origin() -> Bool:
-	origin_round_trips(Declared(NativeTagEqualityCallback(EnumType("TagKey"))))
-
-
 pure func test_core_json_round_trips_source_function_origin_name_id() -> Bool:
 	name: NameId = name_id_from_interned_index(1234)
 
@@ -4911,6 +4905,33 @@ pure func test_core_json_round_trips_hoisted_origins() -> Bool:
 
 pure func test_core_json_round_trips_eta_expansion_origin() -> Bool:
 	origin_round_trips(Declared(EtaExpansion(44)))
+
+
+pure func test_core_json_round_trips_native_tag_equality_origin() -> Bool:
+	origin_round_trips(Declared(NativeTagEqualityCallback(UnionType("Key", ScalarTagValue))))
+
+
+pure func test_core_json_round_trips_hash_key_slot_roles() -> Bool:
+	(
+		origin_round_trips(Declared(HashKeySlotAdapter(44, HashSlotCallback)))
+		and origin_round_trips(Declared(HashKeySlotAdapter(45, EqualitySlotCallback)))
+	)
+
+
+pure func test_core_json_requires_known_hash_key_slot_role() -> Bool:
+	base: List[(String, JsonValue)] = [
+		("kind", JsonString("hash_key_slot_adapter")),
+		("impl_def", JsonNumber(44.0)),
+	]
+	missing = match decode_core_function_origin_json(JsonObject(base), "origin"):
+		Err(CoreMissingField(_, field_name)): field_name == "role"
+		_: False
+	unknown = match decode_core_function_origin_json(
+		JsonObject(base.append(("role", JsonString("stringable")))), "origin",
+	):
+		Err(CoreUnsupportedTag(path, tag)): path == "origin.role" and tag == "stringable"
+		_: False
+	missing and unknown
 
 
 pure func test_core_json_round_trips_entrypoint_origins() -> Bool:
@@ -6170,8 +6191,8 @@ pure func test_core_literal_json_uses_float_text_tag() -> Bool:
 	)
 
 
-pure func test_core_program_json_round_trips_enum_declaration() -> Bool:
-	program_round_trips(enum_program())
+pure func test_core_program_json_round_trips_scalar_union_declaration() -> Bool:
+	program_round_trips(scalar_union_program())
 
 
 pure func test_core_program_json_round_trips_union_construct() -> Bool:
@@ -6520,10 +6541,10 @@ pure func variant_ref_label(variant: CoreVariantRef) -> String:
 
 pure func variant_ref_after_json(variant: CoreVariantRef) -> String:
 	match decode_core_constructor_match_test_json(
-		core_constructor_match_test_to_json(UnionTagConstructorTest(variant, "Option")),
+		core_constructor_match_test_to_json(UnionTagConstructorTest(variant, ManagedTagAccess("Option"))),
 		"test",
 	):
-		Ok(UnionTagConstructorTest(decoded, _)):
+		Ok(UnionTagConstructorTest(decoded, ManagedTagAccess(_))):
 			variant_ref_label(decoded)
 		_:
 			"decode failed"
@@ -6576,10 +6597,151 @@ pure func test_core_accessor_json_rejects_boxed_option_without_storage_type() ->
 			False
 
 
+pure func test_core_union_type_storage_is_identity() -> Bool:
+	scalar: CoreType = UnionType("Color", ScalarTagValue)
+	managed: CoreType = UnionType("Color", ManagedUnionValue)
+	match decode_core_type_json(core_type_to_json(scalar), "type"):
+		Ok(decoded):
+			core_type_equal(decoded, scalar) and not core_type_equal(decoded, managed)
+		Err(_):
+			False
+
+
+private NATIVE_MANAGED_JSON_FIXTURE_ID: Int = 41
+
+
+pure func test_native_managed_type_json_preserves_nominal_witness() -> Bool:
+	var valid = True
+	for kind in [NativeIpAddress, NativeDnsName, NativeInterfaceScope]:
+		match core_native_managed_identity(NATIVE_MANAGED_JSON_FIXTURE_ID, kind, native_managed_builtin_canonical_name(kind)):
+			Err(_):
+				valid = False
+			Ok(identity):
+				original = NativeManagedType(identity)
+				match decode_core_type_json(core_type_to_json(original), "native"):
+					Err(_):
+						valid = False
+					Ok(decoded):
+						valid = (
+							valid and core_type_equal(original, decoded)
+							and not core_type_equal(decoded, NamedType(native_managed_builtin_canonical_name(kind), []))
+						)
+	valid
+
+
+pure func test_native_managed_json_requires_definition_witness() -> Bool:
+	match decode_core_type_json(JsonObject([
+		("kind", JsonString("native_managed")),
+		("native_kind", JsonString("ip_address")),
+		("canonical_name", JsonString("net_tcp__IpAddress")),
+	]), "native"):
+		Err(CoreMissingField(path, field)):
+			path == "native" and field == "definition_id"
+		_:
+			False
+
+
+pure func test_native_managed_json_rejects_unknown_kind() -> Bool:
+	match decode_core_type_json(JsonObject([
+		("kind", JsonString("native_managed")),
+		("definition_id", JsonNumber(to_float(NATIVE_MANAGED_JSON_FIXTURE_ID))),
+		("native_kind", JsonString("not_a_native_kind")),
+		("canonical_name", JsonString("net_tcp__IpAddress")),
+	]), "native"):
+		Err(CoreUnsupportedTag(path, tag)):
+			path == "native.native_kind" and tag == "not_a_native_kind"
+		_:
+			False
+
+
+pure func test_native_managed_json_rejects_kind_key_mismatch() -> Bool:
+	match decode_core_type_json(JsonObject([
+		("kind", JsonString("native_managed")),
+		("definition_id", JsonNumber(to_float(NATIVE_MANAGED_JSON_FIXTURE_ID))),
+		("native_kind", JsonString("ip_address")),
+		("canonical_name", JsonString("net_tcp__DnsName")),
+	]), "native"):
+		Err(CoreInvalidNativeManagedIdentity(path, CoreNativeManagedKeyMismatch(kind, name))):
+			path == "native" and kind == NativeIpAddress and name == "net_tcp__DnsName"
+		_:
+			False
+
+
+pure func test_native_managed_json_rejects_negative_definition() -> Bool:
+	match decode_core_type_json(JsonObject([
+		("kind", JsonString("native_managed")),
+		("definition_id", JsonNumber(-1.0)),
+		("native_kind", JsonString("ip_address")),
+		("canonical_name", JsonString(native_managed_builtin_canonical_name(NativeIpAddress))),
+	]), "native"):
+		Err(CoreInvalidNativeManagedIdentity(path, CoreNativeManagedNegativeDefinitionId(id))):
+			path == "native" and id == -1
+		_:
+			False
+
+
+pure func test_core_union_json_rejects_scalar_payload() -> Bool:
+	invalid: CoreUnionDecl = { choice_union_decl() | storage = ScalarTagStorage }
+	match decode_core_union_decl_json(core_union_decl_to_json(invalid), "decl"):
+		Err(CoreInvalidUnionStorage(path, reason)):
+			path == "decl" and reason == "scalar union storage requires payload-free variants"
+		_:
+			False
+
+
+pure func test_core_union_json_rejects_scalar_type_parameters() -> Bool:
+	invalid: CoreUnionDecl = {
+		color_scalar_union_decl() | type_params = ["T"], storage = ScalarTagStorage
+	}
+	match decode_core_union_decl_json(core_union_decl_to_json(invalid), "decl"):
+		Err(CoreInvalidUnionStorage(path, reason)):
+			path == "decl" and reason == "scalar union storage requires no type parameters"
+		_:
+			False
+
+
+pure func test_core_type_json_rejects_retired_enum_family() -> Bool:
+	match decode_core_type_json(
+		JsonObject([("kind", JsonString("enum")), ("name", JsonString("Color"))]),
+		"type",
+	):
+		Err(CoreUnsupportedTag(path, tag)):
+			path == "type" and tag == "enum"
+		_:
+			False
+
+
+private pure func with_managed_union_storage(decl: CoreDecl) -> CoreDecl:
+	match decl:
+		UnionDecl(info):
+			UnionDecl({ info | storage = ManagedPayloadStorage(TypedUnionPayloadStorage) })
+		_:
+			decl
+
+
+pure func test_core_union_program_json_checks_storage_identity() -> Bool:
+	base: CoreProgram = scalar_union_program()
+	invalid: CoreProgram = { base | decls = base.decls.map(with_managed_union_storage) }
+	match decode_core_program_json(core_program_to_json(invalid)):
+		Err(CoreInvalidUnionStorage(_, reason)):
+			reason == "union type storage disagrees with declaration `Color`"
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core JSON",
 	tests = [
-		("Core JSON round trips native tag equality origin", test_core_json_round_trips_native_tag_equality_origin),
+		("Native managed JSON preserves nominal witness", test_native_managed_type_json_preserves_nominal_witness),
+		("Native managed JSON requires definition witness", test_native_managed_json_requires_definition_witness),
+		("Native managed JSON rejects unknown native kind", test_native_managed_json_rejects_unknown_kind),
+		("Native managed JSON rejects kind and key disagreement", test_native_managed_json_rejects_kind_key_mismatch),
+		("Native managed JSON rejects negative issued definition", test_native_managed_json_rejects_negative_definition),
+		("Common union program JSON checks storage identity", test_core_union_program_json_checks_storage_identity),
+		("Common union storage participates in type identity", test_core_union_type_storage_is_identity),
+		("Common union JSON rejects scalar payload", test_core_union_json_rejects_scalar_payload),
+		("Common union JSON rejects generic scalar storage", test_core_union_json_rejects_scalar_type_parameters),
+		("Core type JSON rejects retired enum family", test_core_type_json_rejects_retired_enum_family),
 		("Core accessor JSON round trips boxed Option payload", test_core_accessor_json_round_trips_boxed_option_payload),
 		("Core accessor JSON rejects boxed Option without storage type", test_core_accessor_json_rejects_boxed_option_without_storage_type),
 		("Core variant refs round trip through JSON", test_core_variant_refs_round_trip_through_json),
@@ -6903,8 +7065,8 @@ tests: TestSuite = {
 		("Core literal JSON decodes exact Int", test_core_literal_json_decodes_exact_int),
 		("Core literal JSON uses float text tag", test_core_literal_json_uses_float_text_tag),
 		(
-			"Core program JSON round trips enum declaration",
-			test_core_program_json_round_trips_enum_declaration,
+			"Core program JSON round trips scalar union declaration",
+			test_core_program_json_round_trips_scalar_union_declaration,
 		),
 		(
 			"Core program JSON round trips union construct",
@@ -7046,6 +7208,12 @@ tests: TestSuite = {
 		),
 		("Core JSON round trips every synthesis kind", test_core_json_round_trips_every_synthesis_kind),
 		("Core JSON round trips hoisted origins", test_core_json_round_trips_hoisted_origins),
+		("Core JSON round trips hash key slot roles", test_core_json_round_trips_hash_key_slot_roles),
+		("Core JSON requires known hash key slot role", test_core_json_requires_known_hash_key_slot_role),
+		(
+			"Core JSON round trips native tag equality origin",
+			test_core_json_round_trips_native_tag_equality_origin,
+		),
 		(
 			"Core JSON round trips eta expansion origin",
 			test_core_json_round_trips_eta_expansion_origin,

@@ -1,0 +1,200 @@
+diff --git a/blorp/src/compiler/stage_06_typecheck/decl.brp b/blorp/src/compiler/stage_06_typecheck/decl.brp
+index a35c9148e..fa1614b36 100644
+--- a/blorp/src/compiler/stage_06_typecheck/decl.brp
++++ b/blorp/src/compiler/stage_06_typecheck/decl.brp
+@@ -533,6 +533,7 @@ import:
+ 	type_system/accepted_union_authority:
+ 		AcceptedUnionAuthority,
+ 		AcceptedUnionTable,
++		accepted_union_find,
+ 		accepted_union_find_constructor_for_parent,
+ 	type_system/builtins:
+ 		BUILTIN_UNION_TYPE_NAMES,
+@@ -573,6 +574,7 @@ import:
+ 		TraitObligationResolution(
+ 			TraitObligationDeferred, TraitObligationSatisfied, TraitObligationUnsatisfied,
+ 		),
++		TypeKind(TypeEnum, TypeUnion),
+ 		VarMutability(ImmutableBinding),
+ 		VarOrigin(FuncParam, LetBinding),
+ 		VariantDef,
+@@ -590,6 +592,7 @@ import:
+ 		env_get_trait,
+ 		env_get_trait_by_id,
+ 		env_get_type_params,
++		env_get_type_kind,
+ 		env_has_direct_trait_evidence,
+ 		env_push_scope,
+ 		env_resolve_trait_obligation,
+@@ -605,6 +608,7 @@ import:
+ 		trait_method_sig_with_details,
+ 		trait_obligation,
+ 		var_mutability,
++	type_system/union_layout: UnionLayout(FieldlessEnum, TaggedUnion)
+ 	type_system/generic_params:
+ 		BoundTraitIdentity,
+ 		BoundTraitOwner(CompilerBuiltinBoundTraitOwner, GraphBoundTraitOwner),
+@@ -836,6 +840,7 @@ record TypedUnionVariantInfo {
+ 
+ record TypedUnionInfo {
+ 	decl: ParsedUnionDecl,
++	layout: UnionLayout,
+ 	variants: List[TypedUnionVariantInfo]
+ }
+ 
+@@ -1987,7 +1992,17 @@ private pure func typed_union_variant_from_parsed(
+ private pure func typed_union_from_parsed(
+ 	state: TypecheckState,
+ 	union_decl: ParsedUnionDecl,
+-) -> TypedUnionInfo:
++) -> Option[TypedUnionInfo]:
++	-- Graph-backed declarations consume the accepted header's layout. Graphless
++	-- entrypoints retain the same fact from their installed environment header.
++	layout ?= match module_view_accepted_union_authority(state.module_view):
++		Some(authority):
++			accepted_union_find(authority, union_decl.name.text).map(func(entry): entry.layout)
++		None:
++			match env_get_type_kind(state.env, union_decl.name.text):
++				Some(TypeEnum): Some(FieldlessEnum)
++				Some(TypeUnion): Some(TaggedUnion)
++				_: None
+ 	type_params = type_param_names(union_decl.type_params)
+ 	typed_variants: List[TypedUnionVariantInfo] = union_decl.variants
+ 		.enumerate()
+@@ -2001,10 +2016,11 @@ private pure func typed_union_from_parsed(
+ 			)
+ 		)
+ 
+-	{
++	Some({
+ 		decl = union_decl,
++		layout = layout,
+ 		variants = typed_variants
+-	}
++	})
+ 
+ 
+ private pure func type_from_optional_parsed_type_expr(
+@@ -6087,25 +6103,35 @@ private pure func typecheck_materialize_decl_body(
+ 				)
+ 			}
+ 		UnionParsedDecl(union_decl):
+-			typed_union = typed_union_from_parsed(state, union_decl)
+-			var next_state = state
++			match typed_union_from_parsed(state, union_decl):
++				Some(typed_union):
++					var next_state = state
++
++					match module_view_accepted_union_authority(state.module_view):
++						Some(_):
++							for variant in typed_union.variants:
++								if variant.def_id.is_none():
++									next_state = typecheck_state_add_error_at(
++										next_state,
++										variant.selection_span,
++										"internal typecheck error: accepted constructor '" + variant.name + "' is absent from the union authority",
++									)
++						None:
++							void
+ 
+-			match module_view_accepted_union_authority(state.module_view):
+-				Some(_):
+-					for variant in typed_union.variants:
+-						if variant.def_id.is_none():
+-							next_state = typecheck_state_add_error_at(
+-								next_state,
+-								variant.selection_span,
+-								"internal typecheck error: accepted constructor '" + variant.name + "' is absent from the union authority",
+-							)
++					{
++						state = next_state,
++						decl = MaterializedUncheckedDecl(TypedUnionDecl(typed_union))
++					}
+ 				None:
+-					void
+-
+-			{
+-				state = next_state,
+-				decl = MaterializedUncheckedDecl(TypedUnionDecl(typed_union))
+-			}
++					{
++						state = typecheck_state_add_error_at(
++							state,
++							union_decl.name.span,
++							"internal typecheck error: accepted layout for union '" + union_decl.name.text + "' is absent",
++						),
++						decl = MaterializedUncheckedDecl(TypedParsedDecl(decl))
++					}
+ 		TypeAliasParsedDecl(alias_decl):
+ 			{
+ 				state = state,
+diff --git a/blorp/src/compiler/stage_06_typecheck/headers/type_header_graph.brp b/blorp/src/compiler/stage_06_typecheck/headers/type_header_graph.brp
+index a6a8c42ad..108dd4eb0 100644
+--- a/blorp/src/compiler/stage_06_typecheck/headers/type_header_graph.brp
++++ b/blorp/src/compiler/stage_06_typecheck/headers/type_header_graph.brp
+@@ -1923,7 +1923,8 @@ private pure func build_union_header(
+ 			TypeHeaderRejected(errors.concat(variant_errors))
+ 		Ok(variants):
+ 			if errors.is_empty():
+-				layout = if decl.form == LegacyEnum:
++				-- Scalar storage is a shared accepted shape, not a source spelling.
++				layout = if parameters.is_empty() and variants.all(func(variant): variant.fields.is_empty()):
+ 					FieldlessEnum
+ 				else:
+ 					TaggedUnion
+diff --git a/blorp/src/compiler/stage_06_typecheck/type_system/accepted_union_authority.brp b/blorp/src/compiler/stage_06_typecheck/type_system/accepted_union_authority.brp
+index 3cfe8aa74..1cf66510b 100644
+--- a/blorp/src/compiler/stage_06_typecheck/type_system/accepted_union_authority.brp
++++ b/blorp/src/compiler/stage_06_typecheck/type_system/accepted_union_authority.brp
+@@ -1264,10 +1264,9 @@ pure func accepted_union_table_definition_table(table: AcceptedUnionTable) -> De
+ 
+ 
+ pure func accepted_union_is_enum(authority: AcceptedUnionAuthority, name: String) -> Option[Bool]:
+-	-- Transitional projection: header selection remains LegacyEnum-only.
+-	-- Foreign scalar admission uses this helper, including Option. Before shared
+-	-- shape-derived scalar eligibility, native admission needs independent explicit
+-	-- authority: storage alone must not admit an ordinary union to native ABI.
++	-- Transitional enum-family projection of the header-owned non-generic,
++	-- payload-free scalar shape. All union source spellings share this fact;
++	-- existing trait and foreign scalar policies consume the same authority.
+ 	accepted_union_entry_raw(authority, name).map(func(entry):
+ 		match entry.layout:
+ 			FieldlessEnum:
+diff --git a/blorp/src/compiler/stage_08_core_lower/lower.brp b/blorp/src/compiler/stage_08_core_lower/lower.brp
+index b2ffa2d49..52e5487a3 100644
+--- a/blorp/src/compiler/stage_08_core_lower/lower.brp
++++ b/blorp/src/compiler/stage_08_core_lower/lower.brp
+@@ -5,6 +5,7 @@
+ -- expressions/declarations. Unsupported shapes return explicit errors so the
+ -- production handoff cannot silently produce partial Core.
+ import:
++	../stage_06_typecheck/type_system/union_layout: UnionLayout(FieldlessEnum)
+ 	../stage_04_modules/loaded_module: ModuleOrigin(StdlibModule)
+ 	../stage_06_typecheck/graph/range_record:
+ 		ResolvedRangeFields, RANGE_START_FIELD, RANGE_END_FIELD, STANDARD_RANGE_RECORD_TYPE_NAME
+@@ -28,7 +29,6 @@ import:
+ 		name_id_pending_dynamic_intern,
+ 		name_ids_equal,
+ 	../stage_03_parse/parsed_ast:
+-		UnionDeclarationForm(LegacyEnum),
+ 		RecordDeclarationForm(OrdinaryRecord, FixedRecord),
+ 		ConcurrentThreadLimit(DefaultThreadLimit, ThreadLimit),
+ 		ParsedBinaryOp(
+@@ -5950,7 +5950,7 @@ private pure func core_lower_type_kind_note_decl(
+ 		TypedPrivateDecl(inner):
+ 			core_lower_type_kind_note_decl(inner, fieldless_enum_names, opaque_reps)
+ 		TypedUnionDecl(info):
+-			if info.decl.form == LegacyEnum:
++			if info.layout == FieldlessEnum:
+ 				(fieldless_enum_names.set(info.decl.name.text, True), opaque_reps)
+ 			else:
+ 				(fieldless_enum_names, opaque_reps)
+@@ -6199,7 +6199,7 @@ private pure func lower_typed_union(
+ 	context: CoreLowerContext,
+ 	info: TypedUnionInfo,
+ ) -> Result[CoreLowerDeclResult, CoreLowerError]:
+-	if info.decl.form == LegacyEnum:
++	if info.layout == FieldlessEnum:
+ 		variants ?= lower_enum_variants(info.variants)
+ 		Ok({
+ 			context = context,

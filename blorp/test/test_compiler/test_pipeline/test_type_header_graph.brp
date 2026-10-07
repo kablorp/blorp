@@ -29,6 +29,7 @@ import:
 		type_alias_dependency_graph_validate,
 	../../../src/compiler/stage_06_typecheck/headers/type_header_graph:
 		AliasLayout(OpaqueAlias, TransparentAlias),
+		BuiltinTypeLayout(NativeManagedBuiltinLayout),
 		IntrinsicType(IntrinsicInt, IntrinsicOption, IntrinsicTaskResult),
 		ResolvedTypeShape(
 			DeclaredTypeShape,
@@ -117,7 +118,8 @@ import:
 	../../../src/compiler/stage_06_typecheck/type_system/context: find_resource_cleanup
 	../../../src/compiler/stage_06_typecheck/type_system/env:
 		FieldDecl,
-		TypeKind(TypeBuiltin, TypeEnum, TypeResource, TypeScalarBuiltin, TypeUnion),
+		TraitObligationResolution(TraitObligationUnsatisfied),
+		TypeKind(TypeBuiltin, TypeResource, TypeScalarBuiltin, TypeUnion),
 		env_add_alias,
 		env_get_alias,
 		env_get_constructor,
@@ -127,7 +129,8 @@ import:
 		env_get_type_decl,
 		env_get_type_kind,
 		env_has_compiler_structural_equality,
-		env_has_compiler_hash,
+		env_resolve_trait_obligation,
+		trait_obligation,
 		env_type_contains_resource_if_valid,
 		env_type_may_contain_function,
 		env_type_may_contain_one_shot_stream,
@@ -136,12 +139,15 @@ import:
 		BuiltinValueStorage(BuiltinInlineScalar, BuiltinManagedReference, BuiltinNoValue),
 		PreludeType(PreludeList),
 		builtin_value_storage,
+		NativeManagedBuiltin(NativeIpAddress, NativeDnsName, NativeInterfaceScope),
+		native_managed_builtin,
+	../../../src/compiler/stage_06_typecheck/type_system/trait_identity: TRAIT_ID_HASHABLE
 	../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
 		SemanticType(SemanticNamedType, SemanticTypeVar),
 		SemanticTypeVarKind(SemanticTypeParameter),
 		canonical_module_type_name,
 		types_equal,
-	../../../src/compiler/stage_06_typecheck/type_system/union_layout: UnionLayout(TaggedUnion)
+	../../../src/compiler/stage_06_typecheck/type_system/union_layout: UnionLayout(ScalarTagUnion, TaggedUnion)
 	../typecheck_test_support as TypecheckTestSupport
 	memory: same_object
 	test: TestSuite
@@ -676,7 +682,7 @@ func test_record_spellings_accept_managed_fields_and_parameters() -> Bool:
 func test_type_header_graph_accepts_scalar_and_nested_struct_fields() -> Bool:
 	source: String =
 		|fixed record Point {x: Float32, y: Float32}
-		|enum Status:
+		|fixed union Status:
 		| Ready
 		| Busy
 		|opaque type Count = Int
@@ -761,6 +767,34 @@ func test_builtin_storage_manifest_covers_current_abi() -> Bool:
 			break
 
 	complete and builtin_value_storage("other", "Int").is_none()
+
+
+func test_native_managed_headers_publish_exact_manifest_kind() -> Bool:
+	expected = [
+		("IpAddress", NativeIpAddress),
+		("DnsName", NativeDnsName),
+		("InterfaceScope", NativeInterfaceScope),
+	]
+	var complete: Bool = True
+
+	for (name, kind) in expected:
+		match type_header_fixture_at("net/tcp", "type " + name + " = builtin"):
+			None:
+				complete = False
+			Some(fixture):
+				if not type_header_graph_headers(fixture.graph).any(func(header):
+					match header.shape:
+						BuiltinTypeHeader(NativeManagedBuiltinLayout(actual)):
+							actual == kind
+						_: False
+				):
+					complete = False
+
+	(
+		complete
+		and native_managed_builtin("other", "IpAddress").is_none()
+		and native_managed_builtin("string", "String").is_none()
+	)
 
 
 func test_scalar_builtin_installation_preserves_storage() -> Bool:
@@ -1965,7 +1999,7 @@ func test_record_header_installation_uses_exact_cross_module_identity() -> Bool:
 
 func test_imported_record_header_qualifies_owner_local_prelude_type() -> Bool:
 	source: String =
-		|enum DirectoryEntryKind:
+		|fixed union DirectoryEntryKind:
 		| EntryFile
 		| EntryDirectory
 		|record DirectoryEntry {kind: DirectoryEntryKind}
@@ -2150,7 +2184,7 @@ func test_type_header_graph_projects_union_visibility_by_module() -> Bool:
 	source: String =
 		|union PublicChoice:
 		| Item(Int)
-		|private enum HiddenKind:
+		|private fixed union HiddenKind:
 		| Hidden
 
 	match type_header_fixture(source):
@@ -2247,8 +2281,14 @@ func test_graphless_headers_publish_only_payload_free_default_equality() -> Bool
 				state.errors.is_empty()
 				and env_has_compiler_structural_equality(state.env, SemanticNamedType("Plain", []))
 				and env_has_compiler_structural_equality(state.env, SemanticNamedType("Fixed", []))
-				and not env_has_compiler_hash(state.env, SemanticNamedType("Plain", []))
-				and not env_has_compiler_hash(state.env, SemanticNamedType("Fixed", []))
+				and env_resolve_trait_obligation(
+					state.env,
+					trait_obligation(SemanticNamedType("Plain", []), TRAIT_ID_HASHABLE),
+				) == TraitObligationUnsatisfied
+				and env_resolve_trait_obligation(
+					state.env,
+					trait_obligation(SemanticNamedType("Fixed", []), TRAIT_ID_HASHABLE),
+				) == TraitObligationUnsatisfied
 				and not env_has_compiler_structural_equality(state.env, SemanticNamedType("Generic", [SemanticNamedType("Int", [])]))
 				and not env_has_compiler_structural_equality(state.env, SemanticNamedType("Payload", []))
 			)
@@ -2263,7 +2303,7 @@ func test_local_union_header_installation_preserves_shape_and_constructor_identi
 		| Branch(Tree[T], Tree[T])
 		| NamesReady(Names[String])
 		| Owns(Handle)
-		|enum Color:
+		|fixed union Color:
 		| Red
 		| Blue
 
@@ -2301,8 +2341,8 @@ func test_local_union_header_installation_preserves_shape_and_constructor_identi
 							(
 								state.errors.length() == 0
 								and parameters == ["T"]
-								and env_get_type_kind(state.env, "Tree") == Some(TypeUnion)
-								and env_get_type_kind(state.env, "Color") == Some(TypeEnum)
+								and env_get_type_kind(state.env, "Tree") == Some(TypeUnion(TaggedUnion))
+								and env_get_type_kind(state.env, "Color") == Some(TypeUnion(ScalarTagUnion))
 								and variants.length() == 4
 								and colors.length() == 2
 								and branch.tag == 1
@@ -2330,9 +2370,9 @@ func test_local_union_header_installation_preserves_shape_and_constructor_identi
 					False
 
 
-func test_imported_enum_header_uses_canonical_parent_and_exact_constructor_id() -> Bool:
+func test_imported_scalar_union_header_uses_canonical_parent_and_exact_constructor_id() -> Bool:
 	source: String =
-		|enum DirectoryEntryKind:
+		|fixed union DirectoryEntryKind:
 		| EntryFile
 		| EntryDirectory
 
@@ -2427,6 +2467,7 @@ func test_type_index_registration_preserves_home_and_resource_precedence() -> Bo
 tests: TestSuite = {
 	description = "Compiler type header graph",
 	tests = [
+		("native managed headers publish exact manifest kind", test_native_managed_headers_publish_exact_manifest_kind),
 		("graphless headers publish only payload-free default equality", test_graphless_headers_publish_only_payload_free_default_equality),
 		(
 			"type header semantic counts use record storage",
@@ -2649,8 +2690,8 @@ tests: TestSuite = {
 			test_local_union_header_installation_preserves_shape_and_constructor_identity,
 		),
 		(
-			"imported enum installation uses canonical parent and constructor identity",
-			test_imported_enum_header_uses_canonical_parent_and_exact_constructor_id,
+			"imported scalar union installation uses canonical parent and constructor identity",
+			test_imported_scalar_union_header_uses_canonical_parent_and_exact_constructor_id,
 		),
 	]
 }

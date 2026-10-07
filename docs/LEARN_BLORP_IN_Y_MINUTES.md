@@ -188,10 +188,11 @@ pure func add(a: Vec2, b: Vec2) -> Vec2:
 	{x = a.x + b.x, y = a.y + b.y}
 ```
 
-Use `enum` for a closed set of simple named cases.
+Use a payload-free union for a closed set of simple named cases. Ordinary
+`union` and `fixed union` have the same current semantics.
 
 ```blorp
-enum LogLevel:
+fixed union LogLevel:
 	Debug
 	Info
 	Warn
@@ -205,7 +206,7 @@ pure func level_name(level: LogLevel) -> String:
 		Error: "error"
 ```
 
-Do not add escape variants to an enum just to represent absence, disabled
+Do not add escape variants to a union just to represent absence, disabled
 behavior, or failure. For example, a disabled logger can store
 `Option[LogLevel]`, and parsing a level from text can return
 `Result[LogLevel, ParseError]`.

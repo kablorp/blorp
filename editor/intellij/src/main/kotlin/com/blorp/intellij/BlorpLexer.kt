@@ -147,7 +147,6 @@ class BlorpLexer : LexerBase() {
             "concurrent",
             "detach",
             "else",
-            "enum",
             "for",
             "foreign",
             "func",

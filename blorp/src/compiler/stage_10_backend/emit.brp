@@ -89,13 +89,13 @@ import:
 		),
 		CoreConstructorMatchTest(
 			BoxedResultErrConstructorTest, BoxedResultOkConstructorTest, BoolFalseConstructorTest,
-			BoolTrueConstructorTest, EnumConstructorTest, NullableOptionNoneConstructorTest,
+			BoolTrueConstructorTest, NullableOptionNoneConstructorTest,
 			NullableOptionSomeConstructorTest, StackOptionNoneConstructorTest,
 			StackOptionSomeConstructorTest, StackResultErrConstructorTest,
 			StackResultOkConstructorTest, UnionTagConstructorTest,
 		),
 		CoreDecl(
-			EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, InlineRecordDecl, ImplDecl, TraitDecl, TypeAliasDecl,
+			InlineRecordDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, TraitDecl, TypeAliasDecl,
 			UnionDecl,
 		),
 		CoreDefinitionIdentity,
@@ -111,8 +111,6 @@ import:
 			DirectRuntimeResultAsWritten, DirectRuntimeResultCast,
 			DirectRuntimeResultStackResultFromBoxed,
 		),
-		CoreEnumDecl,
-		CoreEnumVariant,
 		CoreExpr(
 			AccessorLiteralMatchExpr, AssignExpr, BinaryExpr, BoxExpr, BreakExpr, BorrowLetExpr,
 			CastExpr, CallExpr, ClosureCreateExpr, ConcurrentlyLoopExpr, ConcurrentExpr,
@@ -153,6 +151,9 @@ import:
 		CoreForeignCopyKind(ForeignBytesCopy, ForeignStringCopy),
 		CoreForeignDefaultArgPolicy(ForeignDefensiveCopy, ForeignScalarByValue),
 		CoreFunction,
+		CoreDeclaredOrigin(HashKeySlotAdapter),
+		CoreHashKeySlotRole(HashSlotCallback, EqualitySlotCallback),
+		core_function_declared_origin,
 		CoreFunctionKind(
 			BuiltinFunction, ClosureBodyFunction, ForeignFunction, ProgramEntrypointFunction,
 			UnresolvedBuiltinFunction, UserFunction,
@@ -259,7 +260,8 @@ import:
 			TuplePrimElement, TupleStackResultElement, TupleStructElement, TupleVoidElement,
 		),
 		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType, RangeType, SelfType,
+			InlineRecordType, NativeManagedType,
+			BoxedResultType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType,
 			StackResultType, TensorType, TypeParameterType, TupleType, UnionType,
 			VoidType,
 		),
@@ -270,6 +272,10 @@ import:
 		),
 		CoreUnionConstruct,
 		CoreUnionDecl,
+		core_union_decl_storage_error,
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
+		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
+		CoreUnionTagAccess(ScalarTagAccess, ManagedTagAccess),
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
 		CoreUnionRepresentation(
@@ -625,7 +631,7 @@ private BOXED_RESULT_ERR_RUNTIME_CONSTRUCTOR: String = "blorp_result_err"
 private BOXED_RESULT_RELEASE_MASK_TEMP: String = "__boxed_result"
 
 
-private enum ListHandoffEmitMode:
+private fixed union ListHandoffEmitMode:
 	EmitBorrowFreshHandoff
 	EmitConsumeReuseHandoff
 
@@ -657,7 +663,7 @@ private record FloatModuloRuntime {
 }
 
 
-private enum InfallibleIntegerArithmeticOp:
+private fixed union InfallibleIntegerArithmeticOp:
 	InfallibleIntegerDivide
 	InfallibleIntegerModulo
 
@@ -693,6 +699,7 @@ union CoreEmitError:
 	InvalidStaticStringLiteralPool(StaticStringLiteralPoolError)
 	UnknownProfileModule(String)
 	UnresolvedRecordField(String, String)
+	InvalidUnionStorage(String, String)
 	UnknownProfileFunction(String, String)
 	AmbiguousProfileFunction(String, String)
 
@@ -705,6 +712,8 @@ pure func core_emit_error_message(error: CoreEmitError) -> String:
 			"unsupported global initializer for `${global_name}`"
 		UnresolvedRecordField(record_name, field_name):
 			"field `${field_name}` of record `${record_name}` has no field identity, so its C member cannot be spelled"
+		InvalidUnionStorage(type_name, message):
+			"invalid internal union storage for `${type_name}`: ${message}"
 		CallableSymbolProjectionFailed(projection_error):
 			symbol_projection_error_text(projection_error)
 		InvalidStaticStringLiteralPool(pool_error):
@@ -838,11 +847,11 @@ private ENUM_VECTOR_TO_STRING_PREFIX: String = "blorp_vector_to_string_"
 
 
 ---
-Core lowering bakes a packed-enum tensor's `to_string` callee as
-`blorp_vector_to_string_<declared enum name>` (see `tensor_to_string_builtin`
+Core lowering bakes a packed scalar-union tensor's `to_string` callee as
+`blorp_vector_to_string_<declared scalar union name>` (see `tensor_to_string_builtin`
 in `specialize_value.brp`), before the backend has a symbol plan to offer,
-while the helper itself is defined under the projected enum symbol
-(`BackendTypeNaming.enum_vector_to_string_name`). Re-derive the spelling from
+while the helper itself is defined under the projected scalar-union symbol
+(`BackendTypeNaming.scalar_union_vector_to_string_name`). Re-derive the spelling from
 the plan when the suffix is an artifact-local type the plan projected; the
 runtime's own `blorp_vector_to_string_int`/`_float`/... and every other
 builtin name pass through unchanged.
@@ -859,7 +868,7 @@ private pure func selected_builtin_call_name(
 			else:
 				type_name: String = name.drop_left(ENUM_VECTOR_TO_STRING_PREFIX.length())
 				if selected_type_symbol_lookup(authority).contains(type_name):
-					selected_type_naming(authority, type_name).enum_vector_to_string_name
+					selected_type_naming(authority, type_name).scalar_union_vector_to_string_name
 				else:
 					name
 
@@ -873,11 +882,11 @@ private pure func selected_call_kind(
 			BuiltinCall(selected_builtin_call_name(authority, name))
 		DirectRuntimeCall(call):
 			-- `builtin_contract`'s `blorp_vector_to_string_` prefix match
-			-- (see ownership.brp) promotes the enum-vector-to-string builtin
+			-- (see ownership.brp) promotes the scalar-union-vector-to-string builtin
 			-- from a BuiltinCall into a DirectRuntimeCall during Core
 			-- lowering, before the backend has a symbol plan to offer. Reuse
 			-- the same baked-name re-resolution `BuiltinCall` gets, so a
-			-- projected enum type's helper is still found under its short
+			-- projected scalar-union type's helper is still found under its short
 			-- symbol at emission.
 			DirectRuntimeCall({ call | name = selected_builtin_call_name(authority, call.name) })
 		_:
@@ -951,7 +960,7 @@ private record LiteralMatchDispatchBranchC {
 }
 
 
-private enum CallArgOwnership:
+private fixed union CallArgOwnership:
 	CallBorrowsArg
 	CallConsumesArg
 
@@ -1017,7 +1026,7 @@ private union SimpleExprChainTask:
 	RebuildSimpleCastChainNode(CoreType)
 
 
-private enum LogicalEmitMode:
+private fixed union LogicalEmitMode:
 	EmitLogicalBody
 	EmitLogicalCondition
 
@@ -1160,6 +1169,8 @@ private pure func closure_abi_value_for_type(
 	type_symbol_lookup: Dict[String, String],
 ) -> Option[ClosureAbiValue]:
 	match typ:
+		NativeManagedType(_):
+			Some(ClosureAbiPointer)
 		VoidType:
 			Some(ClosureAbiVoid)
 		NamedType(name, args):
@@ -1172,7 +1183,7 @@ private pure func closure_abi_value_for_type(
 			Some(ClosureAbiPointer)
 		FunctionType(_, _, _):
 			Some(ClosureAbiPointer)
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			Some(ClosureAbiPrim)
 		HeapRecordType(name):
 			Some(ClosureAbiPointer)
@@ -1185,7 +1196,7 @@ private pure func closure_abi_value_for_type(
 						.get_or(name),
 				),
 			)
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			Some(ClosureAbiPointer)
 		RangeType:
 			Some(ClosureAbiPrim)
@@ -1202,7 +1213,14 @@ private pure func c_return_type(
 	if is_program_entrypoint_function_kind(func_info.function_kind):
 		"int"
 	else:
-		TypeLayout.c_type_name(func_info.return_type, type_symbol_lookup)
+		-- These wrappers cross the runtime ABI; their callees keep language Int/Bool.
+		match core_function_declared_origin(func_info.origin):
+			HashKeySlotAdapter(_, HashSlotCallback):
+				"unsigned long"
+			HashKeySlotAdapter(_, EqualitySlotCallback):
+				"bool"
+			_:
+				TypeLayout.c_type_name(func_info.return_type, type_symbol_lookup)
 
 
 private pure func c_function_name(
@@ -2936,15 +2954,17 @@ private pure func is_string_type(typ: CoreType) -> Bool:
 			False
 		FunctionType(_, _, _):
 			False
+		NativeManagedType(_):
+			False
 		VoidType:
 			False
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			False
 		HeapRecordType(name):
 			False
 		InlineRecordType(name):
 			False
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			False
 		RangeType:
 			False
@@ -2966,15 +2986,17 @@ private pure func is_ieee_float_type(typ: CoreType) -> Bool:
 			False
 		FunctionType(_, _, _):
 			False
+		NativeManagedType(_):
+			False
 		VoidType:
 			False
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			False
 		HeapRecordType(name):
 			False
 		InlineRecordType(name):
 			False
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			False
 		RangeType:
 			False
@@ -2996,15 +3018,17 @@ private pure func is_fixed_point_type(typ: CoreType) -> Bool:
 			False
 		FunctionType(_, _, _):
 			False
+		NativeManagedType(_):
+			False
 		VoidType:
 			False
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			False
 		HeapRecordType(name):
 			False
 		InlineRecordType(name):
 			False
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			False
 		RangeType:
 			False
@@ -3086,15 +3110,17 @@ private pure func float_modulo_runtime(typ: CoreType) -> Option[FloatModuloRunti
 			None
 		FunctionType(_, _, _):
 			None
+		NativeManagedType(_):
+			None
 		VoidType:
 			None
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			None
 		HeapRecordType(name):
 			None
 		InlineRecordType(name):
 			None
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			None
 		RangeType:
 			None
@@ -3667,7 +3693,7 @@ private union ResultBridgeLayout:
 	StackResultBridgeLayout(CoreType, CoreType)
 
 
-private enum NamedResultBridgeStorage:
+private fixed union NamedResultBridgeStorage:
 	NamedResultBridgeBoxed
 	NamedResultBridgeStack
 
@@ -3716,15 +3742,17 @@ private pure func result_bridge_layout_for_type(
 				None
 		TypeParameterType(_) | SelfType:
 			None
+		NativeManagedType(_):
+			None
 		VoidType:
 			None
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			None
 		HeapRecordType(name):
 			None
 		InlineRecordType(name):
 			None
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			None
 		RangeType:
 			None
@@ -3764,9 +3792,9 @@ private pure func payload_named_type_name(typ: CoreType) -> Option[String]:
 			Some(name)
 		InlineRecordType(name):
 			Some(name)
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			Some(name)
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			Some(name)
 		TensorType(info):
 			None
@@ -3775,6 +3803,8 @@ private pure func payload_named_type_name(typ: CoreType) -> Option[String]:
 		BoxedResultType(ok_type, err_type):
 			None
 		FunctionType(is_pure, param_types, return_type):
+			None
+		NativeManagedType(_):
 			None
 		VoidType:
 			Some("Void")
@@ -4112,15 +4142,17 @@ private pure func is_named_option_type(typ: CoreType) -> Bool:
 			False
 		InlineRecordType(name):
 			False
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			False
 		TupleType(items):
 			False
 		TensorType(info):
 			False
+		NativeManagedType(_):
+			False
 		VoidType:
 			False
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			False
 		RangeType:
 			False
@@ -4163,15 +4195,17 @@ private pure func fallible_stream_option_payload_release_mask(
 			0
 		InlineRecordType(name):
 			0
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			0
 		TupleType(items):
 			0
 		TensorType(info):
 			0
+		NativeManagedType(_):
+			0
 		VoidType:
 			0
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			0
 		RangeType:
 			0
@@ -5829,6 +5863,8 @@ private pure func is_foreign_string_arg(arg: CoreExpr) -> Bool:
 			name == "String" or name == "LiteralString"
 		TypeParameterType(_) | SelfType:
 			False
+		NativeManagedType(_):
+			False
 		VoidType:
 			False
 		StackResultType(ok_type, err_type):
@@ -5837,13 +5873,13 @@ private pure func is_foreign_string_arg(arg: CoreExpr) -> Bool:
 			False
 		FunctionType(is_pure, param_types, return_type):
 			False
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			False
 		HeapRecordType(name):
 			False
 		InlineRecordType(name):
 			False
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			False
 		RangeType:
 			False
@@ -5877,7 +5913,7 @@ private pure func foreign_arg_may_have_compact_scalar_field(arg: CoreExpr) -> Bo
 				True
 			else:
 				match typ:
-					EnumType(_):
+					UnionType(_, ScalarTagValue):
 						True
 					_:
 						False
@@ -6268,6 +6304,8 @@ private pure func stack_option_none_value_for_type(typ: CoreType) -> String:
 				"0"
 		TypeParameterType(_) | SelfType:
 			"0"
+		NativeManagedType(_):
+			"NULL"
 		VoidType:
 			"0"
 		StackResultType(ok_type, err_type):
@@ -6276,13 +6314,13 @@ private pure func stack_option_none_value_for_type(typ: CoreType) -> String:
 			"0"
 		FunctionType(is_pure, param_types, return_type):
 			"0"
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			"0"
 		HeapRecordType(name):
 			"0"
 		InlineRecordType(name):
 			"{0}"
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			"0"
 		RangeType:
 			"0"
@@ -6319,6 +6357,8 @@ private pure func stack_option_none_expr_for_type(
 				None
 		TypeParameterType(_) | SelfType:
 			None
+		NativeManagedType(_):
+			None
 		VoidType:
 			None
 		StackResultType(ok_type, err_type):
@@ -6327,13 +6367,13 @@ private pure func stack_option_none_expr_for_type(
 			None
 		FunctionType(is_pure, param_types, return_type):
 			None
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			None
 		HeapRecordType(name):
 			None
 		InlineRecordType(name):
 			None
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			None
 		RangeType:
 			None
@@ -6374,7 +6414,7 @@ private pure func emit_dict_get_stack_option_payload(
 				type_symbol_lookup,
 			)
 			Some(render_prepared_backend_op(BackendDictStackOptionLongGet(args, DictKeepKey)))
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			args: StackOptionScalarGetArgs = stack_option_scalar_get_args(
 				dict,
 				key,
@@ -6418,6 +6458,8 @@ private pure func emit_dict_get_stack_option_payload(
 				None
 		TypeParameterType(_) | SelfType:
 			None
+		NativeManagedType(_):
+			None
 		VoidType:
 			None
 		StackResultType(ok_type, err_type):
@@ -6440,7 +6482,7 @@ private pure func emit_dict_get_stack_option_payload(
 			Some(
 				render_prepared_backend_op(BackendDictStackOptionInlineRecordGet(args, DictKeepKey)),
 			)
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			None
 		TensorType(info):
 			None
@@ -6477,6 +6519,8 @@ private pure func emit_prepared_dict_builtin_call(
 							None
 					TypeParameterType(_) | SelfType:
 						None
+					NativeManagedType(_):
+						None
 					VoidType:
 						None
 					StackResultType(ok_type, err_type):
@@ -6485,13 +6529,13 @@ private pure func emit_prepared_dict_builtin_call(
 						None
 					FunctionType(is_pure, param_types, return_type):
 						None
-					EnumType(type_name):
+					UnionType(type_name, ScalarTagValue):
 						None
 					HeapRecordType(type_name):
 						None
 					InlineRecordType(type_name):
 						None
-					UnionType(type_name):
+					UnionType(type_name, ManagedUnionValue):
 						None
 					RangeType:
 						None
@@ -6567,7 +6611,7 @@ private pure func emit_vector_get_stack_option_payload(
 				type_symbol_lookup,
 			)
 			Some(render_prepared_tensor_op(StackOptionVectorLongGet(args)))
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			args: StackOptionVectorScalarGetArgs = stack_option_vector_scalar_get_args(
 				tensor,
 				index,
@@ -6596,6 +6640,8 @@ private pure func emit_vector_get_stack_option_payload(
 				None
 		TypeParameterType(_) | SelfType:
 			None
+		NativeManagedType(_):
+			None
 		VoidType:
 			None
 		StackResultType(ok_type, err_type):
@@ -6606,7 +6652,7 @@ private pure func emit_vector_get_stack_option_payload(
 			None
 		HeapRecordType(name):
 			None
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			None
 		TensorType(info):
 			None
@@ -6643,7 +6689,7 @@ private pure func emit_matrix_get_stack_option_payload(
 				type_symbol_lookup,
 			)
 			Some(render_prepared_tensor_op(StackOptionMatrixLongGet(args)))
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			args: StackOptionMatrixScalarGetArgs = stack_option_matrix_scalar_get_args(
 				tensor,
 				row,
@@ -6675,6 +6721,8 @@ private pure func emit_matrix_get_stack_option_payload(
 				None
 		TypeParameterType(_) | SelfType:
 			None
+		NativeManagedType(_):
+			None
 		VoidType:
 			None
 		StackResultType(ok_type, err_type):
@@ -6685,7 +6733,7 @@ private pure func emit_matrix_get_stack_option_payload(
 			None
 		HeapRecordType(name):
 			None
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			None
 		TensorType(info):
 			None
@@ -6749,6 +6797,8 @@ private pure func emit_tensor_stack_option_get_call(
 				None
 		TypeParameterType(_) | SelfType:
 			None
+		NativeManagedType(_):
+			None
 		VoidType:
 			None
 		StackResultType(ok_type, err_type):
@@ -6757,13 +6807,13 @@ private pure func emit_tensor_stack_option_get_call(
 			None
 		FunctionType(is_pure, param_types, return_type):
 			None
-		EnumType(type_name):
+		UnionType(type_name, ScalarTagValue):
 			None
 		HeapRecordType(type_name):
 			None
 		InlineRecordType(type_name):
 			None
-		UnionType(type_name):
+		UnionType(type_name, ManagedUnionValue):
 			None
 		RangeType:
 			None
@@ -9072,6 +9122,8 @@ private pure func tensor_raw_scalar_kind_for_type(typ: CoreType) -> Option[CoreT
 				None
 		TypeParameterType(_) | SelfType:
 			None
+		NativeManagedType(_):
+			None
 		VoidType:
 			None
 		StackResultType(ok_type, err_type):
@@ -9080,13 +9132,13 @@ private pure func tensor_raw_scalar_kind_for_type(typ: CoreType) -> Option[CoreT
 			None
 		FunctionType(is_pure, param_types, return_type):
 			None
-		EnumType(type_name):
+		UnionType(type_name, ScalarTagValue):
 			None
 		HeapRecordType(type_name):
 			None
 		InlineRecordType(type_name):
 			None
-		UnionType(type_name):
+		UnionType(type_name, ManagedUnionValue):
 			None
 		RangeType:
 			None
@@ -10356,7 +10408,7 @@ private pure func emit_dict_construct_body(
 		)
 
 
-private enum ListStoreMode:
+private fixed union ListStoreMode:
 	StandardListStore
 	HandoffOwnedListStore
 
@@ -11589,7 +11641,7 @@ private pure func emit_generic_union_construct_body(
 			emit_temp_value_body(
 				emission_context.indent,
 				"union_result",
-				UnionType(construct.type_name),
+				UnionType(construct.type_name, ManagedUnionValue),
 				statements,
 				constructor_value,
 				temp_index,
@@ -11653,7 +11705,7 @@ private pure func emit_generic_union_reuse_construct_body(
 				emit_temp_value_body(
 					emission_context.indent,
 					"union_result",
-					UnionType(construct.type_name),
+					UnionType(construct.type_name, ManagedUnionValue),
 					statements,
 					constructor_value,
 					temp_index,
@@ -11858,15 +11910,17 @@ private pure func is_pointer_tuple_slot_type(typ: CoreType) -> Bool:
 			True
 		InlineRecordType(name):
 			False
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			True
 		TupleType(items):
 			True
 		TensorType(info):
 			True
+		NativeManagedType(_):
+			True
 		VoidType:
 			False
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			False
 		RangeType:
 			False
@@ -11897,15 +11951,17 @@ private pure func emit_float_tuple_field_access(element_c: String, typ: CoreType
 			None
 		InlineRecordType(name):
 			None
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			None
 		TupleType(items):
 			None
 		TensorType(info):
 			None
+		NativeManagedType(_):
+			None
 		VoidType:
 			None
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			None
 		RangeType:
 			None
@@ -12005,15 +12061,17 @@ private pure func c_tuple_element_value(
 								element_c,
 							),
 						)
-					UnionType(name):
+					UnionType(name, ManagedUnionValue):
 						None
 					TupleType(items):
 						None
 					TensorType(info):
 						None
+					NativeManagedType(_):
+						None
 					VoidType:
 						None
-					EnumType(name):
+					UnionType(name, ScalarTagValue):
 						None
 					RangeType:
 						None
@@ -12492,15 +12550,17 @@ private pure func is_managed_pointer_capture_type(typ: CoreType) -> Bool:
 			True
 		InlineRecordType(name):
 			False
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			True
 		TupleType(items):
 			False
 		TensorType(info):
 			True
+		NativeManagedType(_):
+			True
 		VoidType:
 			False
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			False
 		RangeType:
 			False
@@ -12522,15 +12582,17 @@ private pure func is_unmanaged_pointer_capture_type(typ: CoreType) -> Bool:
 			False
 		InlineRecordType(name):
 			False
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			False
 		TupleType(items):
 			False
 		TensorType(info):
 			False
+		NativeManagedType(_):
+			False
 		VoidType:
 			False
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			False
 		RangeType:
 			False
@@ -13272,7 +13334,7 @@ private pure func collect_closure_env_emissions(
 										void
 					_:
 						void
-			HeapRecordDecl(_) | InlineRecordDecl(_) | UnionDecl(_) | EnumDecl(_) | GlobalDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
+			HeapRecordDecl(_) | InlineRecordDecl(_) | UnionDecl(_) | GlobalDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
 				void
 
 	result
@@ -13857,7 +13919,7 @@ private pure func transferred_body_value_release_after_match(
 				)
 
 
-private enum CCleanupCallbackKind:
+private fixed union CCleanupCallbackKind:
 	ArcCleanupCallback
 	ArcOnlyCleanupCallback
 	StackResultCleanupCallback
@@ -18746,6 +18808,8 @@ private pure func dict_loop_binding(
 	match for_dict.binder.typ:
 		TupleType(items):
 			dict_tuple_loop_binding(binding_name, iter_tmp, slot_tmp, items)
+		NativeManagedType(_):
+			None
 		VoidType:
 			None
 		NamedType(name, args):
@@ -18764,7 +18828,7 @@ private pure func dict_loop_binding(
 			None
 		FunctionType(is_pure, param_types, return_type):
 			None
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			Some(render_prepared_backend_op(BackendDictIterKeyBinding({
 				key_c_type = TypeLayout.c_type_name(for_dict.binder.typ, type_symbol_lookup),
 				binding = binding_name,
@@ -18785,7 +18849,7 @@ private pure func dict_loop_binding(
 				"${iter_tmp}->keys[${slot_tmp}]",
 				type_symbol_lookup,
 			)
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			Some(render_prepared_backend_op(BackendDictIterKeyBinding({
 				key_c_type = TypeLayout.c_type_name(for_dict.binder.typ, type_symbol_lookup),
 				binding = binding_name,
@@ -19692,9 +19756,9 @@ private pure func emit_constructor_match_test(
 	authority: CEmissionSymbolAuthority,
 ) -> String:
 	match test:
-		EnumConstructorTest(variant):
+		UnionTagConstructorTest(variant, ScalarTagAccess):
 			scrutinee_temp + " == " + variant_ref_constructor_symbol(authority, variant)
-		UnionTagConstructorTest(variant, union_c_type):
+		UnionTagConstructorTest(variant, ManagedTagAccess(union_c_type)):
 			constructor_match_test_target(
 				scrutinee_temp,
 				test,
@@ -19747,7 +19811,7 @@ private pure func constructor_match_union_scrutinee_type(
 
 	for match_case in cases:
 		match match_case.test:
-			UnionTagConstructorTest(variant, union_c_type):
+			UnionTagConstructorTest(variant, ManagedTagAccess(union_c_type)):
 				if accessors_equal(match_case.accessor, RootAccessor):
 					match result:
 						Some(c_type):
@@ -19759,7 +19823,7 @@ private pure func constructor_match_union_scrutinee_type(
 				else:
 					has_non_root_union_test = True
 					break
-			EnumConstructorTest(variant):
+			UnionTagConstructorTest(variant, ScalarTagAccess):
 				void
 			NullableOptionSomeConstructorTest:
 				void
@@ -20586,11 +20650,11 @@ private pure func constructor_match_test_target(
 	type_symbol_lookup: Dict[String, String],
 ) -> String:
 	match test:
-		UnionTagConstructorTest(variant, union_c_type):
+		UnionTagConstructorTest(variant, ManagedTagAccess(union_c_type)):
 			"((" + type_symbol_lookup
 				.get(union_c_type)
 				.get_or(union_c_type) + "*)" + source_c + ")"
-		EnumConstructorTest(variant):
+		UnionTagConstructorTest(variant, ScalarTagAccess):
 			source_c
 		NullableOptionSomeConstructorTest:
 			source_c
@@ -20757,9 +20821,9 @@ private pure func emit_match_accessor_for_constructor_case(
 									type_symbol_lookup,
 								),
 							) + ".value")
-					EnumConstructorTest(variant):
+					UnionTagConstructorTest(variant, ScalarTagAccess):
 						None
-					UnionTagConstructorTest(variant, union_c_type):
+					UnionTagConstructorTest(variant, ManagedTagAccess(union_c_type)):
 						None
 					NullableOptionSomeConstructorTest:
 						None
@@ -21723,6 +21787,8 @@ private pure func list_payload_binding(binding: CoreMatchBinding) -> Option[Core
 				None
 		TypeParameterType(_) | SelfType:
 			None
+		NativeManagedType(_):
+			None
 		VoidType:
 			None
 		StackResultType(ok_type, err_type):
@@ -21731,13 +21797,13 @@ private pure func list_payload_binding(binding: CoreMatchBinding) -> Option[Core
 			None
 		FunctionType(is_pure, param_types, return_type):
 			None
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			None
 		HeapRecordType(name):
 			None
 		InlineRecordType(name):
 			None
-		UnionType(name):
+		UnionType(name, ManagedUnionValue):
 			None
 		RangeType:
 			None
@@ -23900,34 +23966,6 @@ private pure func unsupported_expr_child_kind(
 			found
 
 
-private pure func union_type_name(typ: CoreType) -> Option[String]:
-	match typ:
-		UnionType(name):
-			Some(name)
-		NamedType(name, args):
-			None
-		TypeParameterType(_) | SelfType:
-			None
-		StackResultType(ok_type, err_type):
-			None
-		BoxedResultType(ok_type, err_type):
-			None
-		FunctionType(is_pure, param_types, return_type):
-			None
-		HeapRecordType(name):
-			None
-		InlineRecordType(name):
-			None
-		TupleType(items):
-			None
-		TensorType(info):
-			None
-		VoidType:
-			None
-		EnumType(name):
-			None
-		RangeType:
-			None
 
 
 private pure func find_union_decl(
@@ -23949,8 +23987,6 @@ private pure func find_union_decl(
 				void
 			ImplDecl(impl_decl):
 				void
-			EnumDecl(enum_decl):
-				void
 			HeapRecordDecl(record_decl):
 				void
 			InlineRecordDecl(record_decl):
@@ -23958,21 +23994,6 @@ private pure func find_union_decl(
 			GlobalDecl(global):
 				void
 
-	found
-
-
-private pure func find_enum_decl(
-	decls: List[CoreDecl],
-	type_name: String,
-) -> Option[CoreEnumDecl]:
-	var found: Option[CoreEnumDecl] = None
-	for decl in decls:
-		match decl:
-			EnumDecl(enum_decl):
-				if found.is_none() and enum_decl.name == type_name:
-					found = Some(enum_decl)
-			_:
-				void
 	found
 
 
@@ -23987,6 +24008,8 @@ private pure func find_union_variant(
 			found = Some(variant)
 
 	found
+
+
 
 
 private pure func union_variant_constructor_symbol(
@@ -24011,15 +24034,6 @@ private pure func union_variant_reuse_symbol(
 			INVALID_PROJECTED_VARIANT_NAME
 
 
-private pure func enum_variant_constructor_symbol(
-	authority: CEmissionSymbolAuthority,
-	variant: CoreEnumVariant,
-) -> String:
-	match variant.def_id:
-		Some(def_id):
-			emitted_variant_constructor(authority, def_id)
-		None:
-			INVALID_PROJECTED_VARIANT_NAME
 
 
 private pure func union_variant_tag_symbol(
@@ -24081,6 +24095,7 @@ private pure func union_variant_c_name(
 
 private pure func channel_attempt_constructors(
 	union_decl: CoreUnionDecl,
+	payload_storage: CoreUnionPayloadStorage,
 	layout: CoreSpecializeLayout,
 	authority: CEmissionSymbolAuthority,
 ) -> ChannelAttemptConstructors:
@@ -24091,7 +24106,7 @@ private pure func channel_attempt_constructors(
 
 	recv_value_uses_release_mask: Bool = match recv_value_variant:
 		Some(variant):
-			union_variant_requires_release_mask(layout, union_decl.payload_storage, variant.fields)
+			union_variant_requires_release_mask(layout, payload_storage, variant.fields)
 		None:
 			False
 
@@ -24124,26 +24139,11 @@ private pure func channel_send_attempt_constructors(
 	})
 
 
--- Scalar enum-lane constructors are constant macros, not callable managed
--- union constructors. Require the issued id before selecting its symbol.
-private pure func scalar_channel_variant_name(
-	decl: CoreEnumDecl,
-	variant_name: String,
-	authority: CEmissionSymbolAuthority,
-) -> Option[String]:
-	var found: Option[String] = None
-	for variant in decl.variants:
-		if variant.name == variant_name:
-			match variant.def_id:
-				Some(_):
-					found = Some(enum_variant_constructor_symbol(authority, variant))
-				None:
-					void
-	found
-
-
--- Select the published physical declaration, never a runtime-status integer
--- or a source spelling. Payload receives retain the existing managed lane.
+---
+Channel send statuses may use the common scalar-tag layout. Select that physical
+Core lane explicitly; receive payloads retain the existing managed-union lane.
+Both lanes publish actual declared constructor symbols, never guessed tag values.
+---
 private pure func channel_attempt_constructors_for_return(
 	decls: List[CoreDecl],
 	return_type: CoreType,
@@ -24151,26 +24151,27 @@ private pure func channel_attempt_constructors_for_return(
 	authority: CEmissionSymbolAuthority,
 ) -> Option[ChannelAttemptConstructors]:
 	match return_type:
-		EnumType(name):
-			decl ?= find_enum_decl(decls, name)
-			if not decl.type_params.is_empty():
-				None
-			else:
-				Some({
-					recv_value = None,
-					recv_would_block = None,
-					recv_sealed = None,
-					recv_timed_out = None,
-					send_accepted = scalar_channel_variant_name(decl, "SendAccepted", authority),
-					send_would_block = scalar_channel_variant_name(decl, "SendWouldBlock", authority),
-					send_sealed = scalar_channel_variant_name(decl, "SendSealed", authority),
-					send_timed_out = scalar_channel_variant_name(decl, "SendTimedOut", authority),
-					recv_value_uses_release_mask = False
-				})
+		UnionType(name, value_storage):
+			union_decl ?= find_union_decl(decls, name)
+			match (value_storage, union_decl.storage):
+				(ManagedUnionValue, ManagedPayloadStorage(payload_storage)):
+					Some(channel_attempt_constructors(union_decl, payload_storage, layout, authority))
+				(ScalarTagValue, ScalarTagStorage):
+					Some({
+						recv_value = None,
+						recv_would_block = None,
+						recv_sealed = None,
+						recv_timed_out = None,
+						send_accepted = union_variant_c_name(union_decl, "SendAccepted", authority),
+						send_would_block = union_variant_c_name(union_decl, "SendWouldBlock", authority),
+						send_sealed = union_variant_c_name(union_decl, "SendSealed", authority),
+						send_timed_out = union_variant_c_name(union_decl, "SendTimedOut", authority),
+						recv_value_uses_release_mask = False
+					})
+				_:
+					None
 		_:
-			type_name ?= union_type_name(return_type)
-			decl ?= find_union_decl(decls, type_name)
-			Some(channel_attempt_constructors(decl, layout, authority))
+			None
 
 
 private pure func channel_recv_attempt_constructors(
@@ -25113,11 +25114,11 @@ private pure func emit_static_closure_forward_decl(
 			""
 
 
-private pure func emit_enum_to_string_case(
+private pure func emit_scalar_union_to_string_case(
 	authority: CEmissionSymbolAuthority,
-	variant: CoreEnumVariant,
+	variant: CoreUnionVariant,
 ) -> String:
-	"    case " + enum_variant_constructor_symbol(
+	"    case " + union_variant_constructor_symbol(
 		authority,
 		variant,
 	) + ": return " + render_prepared_backend_op(
@@ -25126,17 +25127,17 @@ private pure func emit_enum_to_string_case(
 
 
 ---
-The signature shared by an enum's `enum_to_string` function's prototype (for
+The signature shared by a scalar union's `to_string` function's prototype (for
 a shared header) and its definition (for whichever translation unit owns
 it), so the two are never hand-written as two independently-maintained
 strings.
 ---
-private pure func enum_to_string_signature(naming: BackendTypeNaming) -> String:
-	"blorp_String* " + naming.enum_to_string_name + "(long v)"
+private pure func scalar_union_to_string_signature(naming: BackendTypeNaming) -> String:
+	"blorp_String* " + naming.scalar_union_to_string_name + "(long v)"
 
 
-private pure func emit_enum_to_string_function(
-	enum_decl: CoreEnumDecl,
+private pure func emit_scalar_union_to_string_function(
+	union_decl: CoreUnionDecl,
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
 	authority: CEmissionSymbolAuthority,
@@ -25146,11 +25147,11 @@ private pure func emit_enum_to_string_function(
 	else:
 		""
 
-	var c_code: String = storage_class + enum_to_string_signature(naming) + " {\n"
+	var c_code: String = storage_class + scalar_union_to_string_signature(naming) + " {\n"
 	c_code += "    switch (v) {\n"
 
-	for variant in enum_decl.variants:
-		c_code += emit_enum_to_string_case(authority, variant)
+	for variant in union_decl.variants:
+		c_code += emit_scalar_union_to_string_case(authority, variant)
 
 	c_code += "    default: return blorp_to_string(v);\n"
 	c_code += "    }\n"
@@ -25158,31 +25159,22 @@ private pure func emit_enum_to_string_function(
 	c_code
 
 
-private pure func emit_enum_vector_to_string_function(naming: BackendTypeNaming) -> String:
-	"blorp_String* " + naming.enum_vector_to_string_name + "(blorp_Vector* v) {\n" + "    return blorp_vector_to_string_packed_enum(v, " + naming.enum_to_string_name + ");\n" + "}\n"
+private pure func emit_scalar_union_vector_to_string_function(naming: BackendTypeNaming) -> String:
+	"blorp_String* " + naming.scalar_union_vector_to_string_name + "(blorp_Vector* v) {\n" + "    return blorp_vector_to_string_packed_enum(v, " + naming.scalar_union_to_string_name + ");\n" + "}\n"
 
 
----
-The tag macros and the enum_to_string/enum_vector_to_string functions an enum
-emits, held apart so a later step can route the macros to a shared header and
-the functions to wherever they are used, without re-parsing the emitted text.
----
-private record CEnumDeclEmission {
-	type_header: String,
-	functions: List[String]
-}
 
 
-private pure func emit_enum_decl(
-	enum_decl: CoreEnumDecl,
+private pure func emit_scalar_union_decl(
+	union_decl: CoreUnionDecl,
 	authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
-) -> CEnumDeclEmission:
+) -> CUnionDeclEmission:
 	var type_header: String = ""
-	naming: BackendTypeNaming = selected_type_naming(authority, enum_decl.name)
+	naming: BackendTypeNaming = selected_type_naming(authority, union_decl.name)
 
-	for variant in enum_decl.variants:
-		type_header += "#define " + enum_variant_constructor_symbol(
+	for variant in union_decl.variants:
+		type_header += "#define " + union_variant_constructor_symbol(
 			authority,
 			variant,
 		) + " " + variant.tag.to_string() + "L\n"
@@ -25190,9 +25182,11 @@ private pure func emit_enum_decl(
 	{
 		type_header = type_header,
 		functions = [
-			emit_enum_to_string_function(enum_decl, naming, internal_type_linkage, authority),
-			emit_enum_vector_to_string_function(naming),
-		]
+			emit_scalar_union_to_string_function(union_decl, naming, internal_type_linkage, authority),
+			emit_scalar_union_vector_to_string_function(naming),
+		],
+		constructor_pieces = [],
+		inline_support = ""
 	}
 
 
@@ -25955,6 +25949,8 @@ private pure func static_value_supported(typ: CoreType, expr: CoreExpr) -> Bool:
 				InlineRecordType(name):
 					-- Initialized at startup by value; there is no static object to share.
 					False
+				NativeManagedType(_):
+					False
 				VoidType:
 					False
 				StackResultType(ok_type, err_type):
@@ -25963,13 +25959,13 @@ private pure func static_value_supported(typ: CoreType, expr: CoreExpr) -> Bool:
 					False
 				FunctionType(is_pure, param_types, return_type):
 					False
-				EnumType(name):
+				UnionType(name, ScalarTagValue):
 					False
 				NamedType(name, args):
 					False
 				TypeParameterType(_) | SelfType:
 					False
-				UnionType(name):
+				UnionType(name, ManagedUnionValue):
 					False
 				RangeType:
 					False
@@ -26232,6 +26228,8 @@ private pure func static_value_initializer(
 					)
 				InlineRecordType(name):
 					None
+				NativeManagedType(_):
+					None
 				VoidType:
 					None
 				StackResultType(ok_type, err_type):
@@ -26240,13 +26238,13 @@ private pure func static_value_initializer(
 					None
 				FunctionType(is_pure, param_types, return_type):
 					None
-				EnumType(name):
+				UnionType(name, ScalarTagValue):
 					None
 				NamedType(name, args):
 					None
 				TypeParameterType(_) | SelfType:
 					None
-				UnionType(name):
+				UnionType(name, ManagedUnionValue):
 					None
 				RangeType:
 					None
@@ -27328,7 +27326,7 @@ private pure func heap_record_field_decl(
 	field_name: String = c_declared_record_member(member_spelling, field.name, ordinal)
 
 	match c_heap_record_field_storage(
-		layouts.byte_sized_enum_names,
+		layouts.byte_sized_scalar_union_names,
 		layout,
 		field.typ,
 		has_boolean_neighbor,
@@ -27682,12 +27680,13 @@ private pure func union_variant_uses_release_mask(
 
 private pure func union_decl_has_release_mask(
 	union_decl: CoreUnionDecl,
+	payload_storage: CoreUnionPayloadStorage,
 	type_plan: CleanupTypePlan,
 ) -> Bool:
 	var has_release_mask: Bool = False
 
 	for entry in union_decl.variants.enumerate():
-		if union_variant_uses_release_mask(union_decl.payload_storage, type_plan, entry[0]):
+		if union_variant_uses_release_mask(payload_storage, type_plan, entry[0]):
 			has_release_mask = True
 			break
 
@@ -27716,14 +27715,14 @@ private pure func erased_union_field_release_statement(index: Int, field_c: Stri
 
 
 private pure func iterative_union_field_release_statement(
-	union_decl: CoreUnionDecl,
+	payload_storage: CoreUnionPayloadStorage,
 	index: Int,
 	field_c: String,
 	naming: BackendTypeNaming,
 ) -> String:
 	release_call: String = naming.union_destroy_release_child_name + "(__destroy_stack, __destroy_count, __destroy_capacity, (" + naming.c_name + "*)" + field_c + ");\n"
 
-	match union_decl.payload_storage:
+	match payload_storage:
 		TypedUnionPayloadStorage:
 			"        if (" + field_c + ") " + release_call
 		ErasedUnionPayloadStorage:
@@ -27732,7 +27731,7 @@ private pure func iterative_union_field_release_statement(
 
 
 private pure func union_field_release_statement(
-	union_decl: CoreUnionDecl,
+	payload_storage: CoreUnionPayloadStorage,
 	variant: CoreUnionVariant,
 	field: CoreUnionField,
 	field_plan: Option[CleanupFieldPlan],
@@ -27749,9 +27748,9 @@ private pure func union_field_release_statement(
 				field_c: String = "self->data." + variant.name + ".field" + index.to_string()
 
 				if plan_row.uses_iterative_cleanup:
-					Ok(iterative_union_field_release_statement(union_decl, index, field_c, naming))
+					Ok(iterative_union_field_release_statement(payload_storage, index, field_c, naming))
 				else:
-					match union_decl.payload_storage:
+					match payload_storage:
 						TypedUnionPayloadStorage:
 							typed_union_field_release_statement(field, field_c)
 						ErasedUnionPayloadStorage:
@@ -27760,6 +27759,7 @@ private pure func union_field_release_statement(
 
 private pure func emit_union_destructor_cases(
 	union_decl: CoreUnionDecl,
+	payload_storage: CoreUnionPayloadStorage,
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	authority: CEmissionSymbolAuthority,
@@ -27782,7 +27782,7 @@ private pure func emit_union_destructor_cases(
 			for field in variant.fields:
 				if failure.is_none():
 					match union_field_release_statement(
-						union_decl,
+						payload_storage,
 						variant,
 						field,
 						union_cleanup_field_plan(type_plan, variant_index, index),
@@ -27814,12 +27814,13 @@ private pure func emit_union_destructor_cases(
 
 private pure func emit_simple_union_destructor(
 	union_decl: CoreUnionDecl,
+	payload_storage: CoreUnionPayloadStorage,
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
 	authority: CEmissionSymbolAuthority,
 ) -> Result[String, CoreEmitError]:
-	cases_c ?= emit_union_destructor_cases(union_decl, type_plan, naming, authority)
+	cases_c ?= emit_union_destructor_cases(union_decl, payload_storage, type_plan, naming, authority)
 	storage_class: String = if internal_type_linkage:
 		"static "
 	else:
@@ -27832,12 +27833,13 @@ private pure func emit_simple_union_destructor(
 
 private pure func emit_iterative_union_destructor(
 	union_decl: CoreUnionDecl,
+	payload_storage: CoreUnionPayloadStorage,
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
 	authority: CEmissionSymbolAuthority,
 ) -> Result[String, CoreEmitError]:
-	cases_c ?= emit_union_destructor_cases(union_decl, type_plan, naming, authority)
+	cases_c ?= emit_union_destructor_cases(union_decl, payload_storage, type_plan, naming, authority)
 	type_name: String = naming.c_name
 	stack_push_name: String = naming.union_destroy_stack_push_name
 	release_child_name: String = naming.union_destroy_release_child_name
@@ -27855,6 +27857,7 @@ private pure func emit_iterative_union_destructor(
 
 private pure func emit_union_destructor(
 	union_decl: CoreUnionDecl,
+	payload_storage: CoreUnionPayloadStorage,
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
@@ -27866,6 +27869,7 @@ private pure func emit_union_destructor(
 		IterativeCleanup:
 			emit_iterative_union_destructor(
 				union_decl,
+				payload_storage,
 				type_plan,
 				naming,
 				internal_type_linkage,
@@ -27874,6 +27878,7 @@ private pure func emit_union_destructor(
 		DirectCleanup:
 			emit_simple_union_destructor(
 				union_decl,
+				payload_storage,
 				type_plan,
 				naming,
 				internal_type_linkage,
@@ -27883,6 +27888,7 @@ private pure func emit_union_destructor(
 
 private pure func emit_union_constructor(
 	union_decl: CoreUnionDecl,
+	payload_storage: CoreUnionPayloadStorage,
 	variant: CoreUnionVariant,
 	variant_index: Int,
 	type_plan: CleanupTypePlan,
@@ -27911,16 +27917,16 @@ private pure func emit_union_constructor(
 		var assignments: String = ""
 		var index: Int = 0
 		uses_release_mask: Bool = union_variant_uses_release_mask(
-			union_decl.payload_storage,
+			payload_storage,
 			type_plan,
 			variant_index,
 		)
-		has_release_mask: Bool = union_decl_has_release_mask(union_decl, type_plan)
+		has_release_mask: Bool = union_decl_has_release_mask(union_decl, payload_storage, type_plan)
 
 		for field in variant.fields:
 			params = params.append(
 				emit_union_constructor_param(
-					union_decl.payload_storage,
+					payload_storage,
 					field,
 					index,
 					type_symbol_lookup,
@@ -27961,6 +27967,7 @@ private pure func emit_union_constructor(
 
 private pure func emit_union_reuse_constructor(
 	union_decl: CoreUnionDecl,
+	payload_storage: CoreUnionPayloadStorage,
 	variant: CoreUnionVariant,
 	variant_index: Int,
 	type_plan: CleanupTypePlan,
@@ -27976,18 +27983,18 @@ private pure func emit_union_reuse_constructor(
 		var fresh_args: List[String] = []
 		var index: Int = 0
 		uses_release_mask: Bool = union_variant_uses_release_mask(
-			union_decl.payload_storage,
+			payload_storage,
 			type_plan,
 			variant_index,
 		)
-		has_release_mask: Bool = union_decl_has_release_mask(union_decl, type_plan)
+		has_release_mask: Bool = union_decl_has_release_mask(union_decl, payload_storage, type_plan)
 		reuse_name: String = union_variant_reuse_symbol(authority, variant)
 
 		for field in variant.fields:
 			field_name: String = "field" + index.to_string()
 			params = params.append(
 				emit_union_constructor_param(
-					union_decl.payload_storage,
+					payload_storage,
 					field,
 					index,
 					type_symbol_lookup,
@@ -28079,13 +28086,31 @@ private pure func emit_union_decl(
 	authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
 ) -> Result[CUnionDeclEmission, CoreEmitError]:
+	match core_union_decl_storage_error(union_decl):
+		Some(message):
+			Err(InvalidUnionStorage(union_decl.name, message))
+		None:
+			match union_decl.storage:
+				ScalarTagStorage:
+					Ok(emit_scalar_union_decl(union_decl, authority, internal_type_linkage))
+				ManagedPayloadStorage(payload_storage):
+					emit_managed_union_decl(union_decl, payload_storage, type_plan, authority, internal_type_linkage)
+
+
+private pure func emit_managed_union_decl(
+	union_decl: CoreUnionDecl,
+	payload_storage: CoreUnionPayloadStorage,
+	type_plan: CleanupTypePlan,
+	authority: CEmissionSymbolAuthority,
+	internal_type_linkage: Bool,
+) -> Result[CUnionDeclEmission, CoreEmitError]:
 	var storage_c: String = make_string(0)
 	var tags_c: String = make_string(0)
 	var constructor_pieces: List[CUnionConstructorPiece] = []
 	var reuse_constructors_c: String = make_string(0)
 	naming: BackendTypeNaming = selected_type_naming(authority, union_decl.name)
 
-	release_mask_field: String = if union_decl_has_release_mask(union_decl, type_plan):
+	release_mask_field: String = if union_decl_has_release_mask(union_decl, payload_storage, type_plan):
 		"  unsigned long release_mask;\n"
 	else:
 		""
@@ -28096,7 +28121,7 @@ private pure func emit_union_decl(
 		storage_c = append_emitted_c(
 			storage_c,
 			emit_union_variant_storage(
-				union_decl.payload_storage,
+				payload_storage,
 				variant,
 				selected_type_symbol_lookup(authority),
 			),
@@ -28112,6 +28137,7 @@ private pure func emit_union_decl(
 			is_owner_data = variant.fields.length() == 0,
 			text = emit_union_constructor(
 				union_decl,
+				payload_storage,
 				variant,
 				variant_index,
 				type_plan,
@@ -28124,6 +28150,7 @@ private pure func emit_union_decl(
 			reuse_constructors_c,
 			emit_union_reuse_constructor(
 				union_decl,
+				payload_storage,
 				variant,
 				variant_index,
 				type_plan,
@@ -28136,6 +28163,7 @@ private pure func emit_union_decl(
 	header: String = "typedef struct " + naming.c_name + " {\n" + "  blorp_Object header;\n" + "  int tag;\n" + release_mask_field + "  union {\n" + storage_c + "  } data;\n" + "} " + naming.c_name + ";\n\n" + tags_c + "\n"
 	destructor_c ?= emit_union_destructor(
 		union_decl,
+		payload_storage,
 		type_plan,
 		naming,
 		internal_type_linkage,
@@ -28171,20 +28199,6 @@ private pure func emit_decl_generated_stack_option_typedef(
 	type_symbol_lookup: Dict[String, String],
 ) -> String:
 	match decl:
-		EnumDecl(enum_decl):
-			if TypeLayout.runtime_owned_stack_option_payload_name(enum_decl.name):
-				""
-			else:
-				emit_generated_stack_option_typedef(
-					"long",
-					TypeLayout.generated_stack_option_c_type_name(
-						type_symbol_lookup
-							.get(enum_decl.name)
-							.get_or(enum_decl.name),
-					),
-				)
-		HeapRecordDecl(record_decl):
-			""
 		InlineRecordDecl(record_decl):
 			record_c_type: String = type_symbol_lookup
 				.get(record_decl.name)
@@ -28194,6 +28208,22 @@ private pure func emit_decl_generated_stack_option_typedef(
 				TypeLayout.generated_stack_option_c_type_name(record_c_type),
 			)
 		UnionDecl(union_decl):
+			match union_decl.storage:
+				ScalarTagStorage:
+					if TypeLayout.runtime_owned_stack_option_payload_name(union_decl.name):
+						""
+					else:
+						emit_generated_stack_option_typedef(
+							"long",
+							TypeLayout.generated_stack_option_c_type_name(
+								type_symbol_lookup
+									.get(union_decl.name)
+									.get_or(union_decl.name),
+							),
+						)
+				ManagedPayloadStorage(_):
+					""
+		HeapRecordDecl(record_decl):
 			""
 		FunctionDecl(func_info):
 			""
@@ -28247,8 +28277,6 @@ private pure func emit_global_decls(
 						authority,
 					),
 				)
-			EnumDecl(enum_decl):
-				void
 			HeapRecordDecl(record_decl):
 				void
 			InlineRecordDecl(record_decl):
@@ -28283,8 +28311,6 @@ private pure func emit_global_extern_decls(
 						type_symbol_lookup,
 					) + " " + c_var_name(global.name) + ";\n",
 				)
-			EnumDecl(enum_decl):
-				void
 			HeapRecordDecl(record_decl):
 				void
 			InlineRecordDecl(record_decl):
@@ -28398,8 +28424,6 @@ private pure func emit_global_init_function(
 									error = Some(UnsupportedGlobalInitializer(global.name.name))
 						else:
 							void
-					EnumDecl(enum_decl):
-						void
 					HeapRecordDecl(record_decl):
 						void
 					InlineRecordDecl(record_decl):
@@ -28545,8 +28569,6 @@ private pure func emit_function_decls(
 						compact,
 					),
 				})
-			EnumDecl(enum_decl):
-				void
 			HeapRecordDecl(record_decl):
 				void
 			InlineRecordDecl(record_decl):
@@ -28579,8 +28601,6 @@ private pure func emit_function_forward_decls(
 					c_code,
 					emit_function_forward_decl(func_info, internal_linkage, symbol_authority),
 				)
-			EnumDecl(enum_decl):
-				void
 			HeapRecordDecl(record_decl):
 				void
 			InlineRecordDecl(record_decl):
@@ -28620,8 +28640,6 @@ private pure func emit_static_closure_forward_decls(
 						internal_type_linkage,
 					),
 				)
-			EnumDecl(enum_decl):
-				void
 			HeapRecordDecl(record_decl):
 				void
 			InlineRecordDecl(record_decl):
@@ -28644,7 +28662,7 @@ private pure func emit_static_closure_forward_decls(
 
 
 ---
-The common sections shared by single and split C rendering. The four type
+The common sections shared by single and split C rendering. The type
 declaration sections have separate flat and structured representations below:
 single rendering owns the joined strings, while split rendering owns the
 per-declaration emissions. Both come from one collection pass in `emit_decls`.
@@ -28656,14 +28674,12 @@ private record CClosureEnvEmission {
 
 
 private record CFlatTypeDeclSections {
-	enum_decls: String,
 	union_decls: String,
 	heap_record_decls: String
 }
 
 
 private record CTypeDeclEmissions {
-	enums: List[CEnumDeclEmission],
 	unions: List[CUnionDeclEmission],
 	heap_records: List[CHeapRecordDeclEmission]
 }
@@ -28707,7 +28723,6 @@ private pure func render_single_translation_unit(
 	var c_code: String = header
 	c_code = append_emitted_c(c_code, sections.heap_record_and_union_forward_decls)
 	c_code = append_emitted_c(c_code, sections.inline_record_decls)
-	c_code = append_emitted_c(c_code, type_decls.enum_decls)
 	c_code = append_emitted_c(c_code, sections.generated_stack_option_typedefs)
 	c_code = append_emitted_c(c_code, type_decls.union_decls)
 	c_code = append_emitted_c(c_code, type_decls.heap_record_decls)
@@ -28759,8 +28774,6 @@ private pure func render_single_translation_unit(
 						compact,
 					),
 				)
-			EnumDecl(enum_decl):
-				void
 			HeapRecordDecl(record_decl):
 				void
 			InlineRecordDecl(record_decl):
@@ -28865,17 +28878,19 @@ private pure func emit_heap_record_and_union_forward_decls(
 					"typedef struct " + record_c_type + " " + record_c_type + ";\n",
 				)
 			UnionDecl(union_decl):
-				union_c_type: String = type_symbol_lookup
-					.get(union_decl.name)
-					.get_or(union_decl.name)
-				c_code = append_emitted_c(
-					c_code,
-					"typedef struct " + union_c_type + " " + union_c_type + ";\n",
-				)
+				match union_decl.storage:
+					ScalarTagStorage:
+						void
+					ManagedPayloadStorage(_):
+						union_c_type: String = type_symbol_lookup
+							.get(union_decl.name)
+							.get_or(union_decl.name)
+						c_code = append_emitted_c(
+							c_code,
+							"typedef struct " + union_c_type + " " + union_c_type + ";\n",
+						)
 			InlineRecordDecl(_):
 				-- Defined in full before every other type; see `emit_inline_record_decls`.
-				void
-			EnumDecl(enum_decl):
 				void
 			FunctionDecl(func_info):
 				void
@@ -28938,8 +28953,6 @@ private pure func collect_heap_record_decl_emissions(
 				void
 			UnionDecl(union_decl):
 				void
-			EnumDecl(enum_decl):
-				void
 			FunctionDecl(func_info):
 				void
 			GlobalDecl(global):
@@ -28987,8 +29000,6 @@ private pure func collect_union_decl_emissions(
 				void
 			InlineRecordDecl(record_decl):
 				void
-			EnumDecl(enum_decl):
-				void
 			FunctionDecl(func_info):
 				void
 			GlobalDecl(global):
@@ -29005,37 +29016,6 @@ private pure func collect_union_decl_emissions(
 			Err(error)
 		None:
 			Ok(result)
-
-
-private pure func collect_enum_decl_emissions(
-	decls: List[CoreDecl],
-	authority: CEmissionSymbolAuthority,
-	internal_type_linkage: Bool,
-) -> List[CEnumDeclEmission]:
-	var result: List[CEnumDeclEmission] = []
-
-	for decl in decls:
-		match decl:
-			EnumDecl(enum_decl):
-				result = result.append(emit_enum_decl(enum_decl, authority, internal_type_linkage))
-			HeapRecordDecl(record_decl):
-				void
-			InlineRecordDecl(record_decl):
-				void
-			UnionDecl(union_decl):
-				void
-			FunctionDecl(func_info):
-				void
-			GlobalDecl(global):
-				void
-			TypeAliasDecl(alias_decl):
-				void
-			TraitDecl(trait_decl):
-				void
-			ImplDecl(impl_decl):
-				void
-
-	result
 
 
 ---
@@ -29069,20 +29049,10 @@ private pure func join_union_decl_emissions(emissions: List[CUnionDeclEmission])
 	c_code
 
 
-private pure func join_enum_decl_emissions(emissions: List[CEnumDeclEmission]) -> String:
-	var c_code: String = make_string(0)
-
-	for emission in emissions:
-		c_code = append_emitted_c(c_code, emission.type_header + emission.functions.join("") + "\n")
-
-	c_code
-
-
 private pure func flatten_type_decl_emissions(
 	emissions: CTypeDeclEmissions,
 ) -> CFlatTypeDeclSections:
 	{
-		enum_decls = join_enum_decl_emissions(emissions.enums),
 		union_decls = join_union_decl_emissions(emissions.unions),
 		heap_record_decls = join_heap_record_decl_emissions(emissions.heap_records)
 	}
@@ -29091,7 +29061,7 @@ private pure func flatten_type_decl_emissions(
 ---
 `internal_type_linkage` governs the storage class of the pieces this module
 has always hard-coded as `static` regardless of `internal_linkage` — record/
-union destroy functions, enum `to_string` functions, globals, profile
+union destroy functions, scalar union `to_string` functions, globals, profile
 metadata, and static closure objects/forward-decls. Both existing callers
 below pass `True`, so their output is unaffected (byte-identical to before
 this parameter existed); only the split-material builder passes `False`, to
@@ -29147,11 +29117,6 @@ private pure func emit_decls(
 	union_emissions ?= collect_union_decl_emissions(
 		decls,
 		plan,
-		symbol_authority,
-		internal_type_linkage,
-	)
-	enum_emissions: List[CEnumDeclEmission] = collect_enum_decl_emissions(
-		decls,
 		symbol_authority,
 		internal_type_linkage,
 	)
@@ -29218,7 +29183,6 @@ private pure func emit_decls(
 		function_definitions = function_definitions
 	}
 	type_emissions: CTypeDeclEmissions = {
-		enums = enum_emissions,
 		unions = union_emissions,
 		heap_records = heap_record_emissions
 	}
@@ -29389,7 +29353,7 @@ private pure func heap_record_make_signature(
 
 
 private pure func union_constructor_param_list(
-	union_decl: CoreUnionDecl,
+	payload_storage: CoreUnionPayloadStorage,
 	variant: CoreUnionVariant,
 	variant_index: Int,
 	type_plan: CleanupTypePlan,
@@ -29401,7 +29365,7 @@ private pure func union_constructor_param_list(
 	for field in variant.fields:
 		params = params.append(
 			emit_union_constructor_param(
-				union_decl.payload_storage,
+				payload_storage,
 				field,
 				index,
 				type_symbol_lookup,
@@ -29409,7 +29373,7 @@ private pure func union_constructor_param_list(
 		)
 		index += 1
 
-	if union_variant_uses_release_mask(union_decl.payload_storage, type_plan, variant_index):
+	if union_variant_uses_release_mask(payload_storage, type_plan, variant_index):
 		params = params.append("unsigned long release_mask")
 
 	params.join(", ")
@@ -29417,6 +29381,7 @@ private pure func union_constructor_param_list(
 
 private pure func union_constructor_signature(
 	union_decl: CoreUnionDecl,
+	payload_storage: CoreUnionPayloadStorage,
 	variant: CoreUnionVariant,
 	variant_index: Int,
 	type_plan: CleanupTypePlan,
@@ -29431,7 +29396,7 @@ private pure func union_constructor_signature(
 		authority,
 		variant,
 	) + "(" + union_constructor_param_list(
-		union_decl,
+		payload_storage,
 		variant,
 		variant_index,
 		type_plan,
@@ -29475,8 +29440,6 @@ private pure func emit_entrypoint_forward_decls(
 					c_code,
 					entrypoint_forward_decl_for_split(func_info, symbol_authority),
 				)
-			EnumDecl(enum_decl):
-				void
 			HeapRecordDecl(record_decl):
 				void
 			InlineRecordDecl(record_decl):
@@ -29555,21 +29518,23 @@ private pure func collect_union_owner_data_split_emissions(
 	for decl in decls:
 		match decl:
 			UnionDecl(union_decl):
-				for variant in union_decl.variants:
-					if variant.fields.length() == 0:
-						result = result.append(
-							emit_union_owner_data_split(
-								union_decl,
-								variant,
-								type_symbol_lookup,
-								authority,
-							),
-						)
+				match union_decl.storage:
+					ScalarTagStorage:
+						void
+					ManagedPayloadStorage(_):
+						for variant in union_decl.variants:
+							if variant.fields.length() == 0:
+								result = result.append(
+									emit_union_owner_data_split(
+										union_decl,
+										variant,
+										type_symbol_lookup,
+										authority,
+									),
+								)
 			HeapRecordDecl(record_decl):
 				void
 			InlineRecordDecl(record_decl):
-				void
-			EnumDecl(enum_decl):
 				void
 			FunctionDecl(func_info):
 				void
@@ -29588,7 +29553,7 @@ private pure func collect_union_owner_data_split_emissions(
 ---
 Prototypes for the type-support functions that were already externally
 linked before this step (heap record destroy/make, union destroy/non-empty
--variant constructors, enum to_string/vector_to_string) but never needed a
+-variant constructors, scalar union to_string/vector_to_string) but never needed a
 prototype, because a single translation unit never called one before
 defining it. These definitions are now balanced across every unit like any
 other function (see `collect_type_support_function_emissions`), so every TU
@@ -29624,37 +29589,39 @@ private pure func type_support_function_prototypes(
 				)
 			UnionDecl(union_decl):
 				naming: BackendTypeNaming = selected_type_naming(authority, union_decl.name)
-				type_plan: CleanupTypePlan = cleanup_plan_row(plan, decl_index)
-
-				if cleanup_type_plan_has_destructor(type_plan):
-					c_code = append_emitted_c(
-						c_code,
-						destroy_function_signature(naming.destroy_name) + ";\n",
-					)
-
-				for variant_entry in union_decl.variants.enumerate():
-					variant_index: Int = variant_entry[0]
-					variant: CoreUnionVariant = variant_entry[1]
-
-					if variant.fields.length() > 0:
+				match union_decl.storage:
+					ScalarTagStorage:
+						c_code = append_emitted_c(c_code, scalar_union_to_string_signature(naming) + ";\n")
 						c_code = append_emitted_c(
 							c_code,
-							union_constructor_signature(
-								union_decl,
-								variant,
-								variant_index,
-								type_plan,
-								selected_type_symbol_lookup(authority),
-								authority,
-							) + ";\n",
+							"blorp_String* " + naming.scalar_union_vector_to_string_name + "(blorp_Vector* v);\n",
 						)
-			EnumDecl(enum_decl):
-				naming: BackendTypeNaming = selected_type_naming(authority, enum_decl.name)
-				c_code = append_emitted_c(c_code, enum_to_string_signature(naming) + ";\n")
-				c_code = append_emitted_c(
-					c_code,
-					"blorp_String* " + naming.enum_vector_to_string_name + "(blorp_Vector* v);\n",
-				)
+					ManagedPayloadStorage(payload_storage):
+						type_plan: CleanupTypePlan = cleanup_plan_row(plan, decl_index)
+
+						if cleanup_type_plan_has_destructor(type_plan):
+							c_code = append_emitted_c(
+								c_code,
+								destroy_function_signature(naming.destroy_name) + ";\n",
+							)
+
+						for variant_entry in union_decl.variants.enumerate():
+							variant_index: Int = variant_entry[0]
+							variant: CoreUnionVariant = variant_entry[1]
+
+							if variant.fields.length() > 0:
+								c_code = append_emitted_c(
+									c_code,
+									union_constructor_signature(
+										union_decl,
+										payload_storage,
+										variant,
+										variant_index,
+										type_plan,
+										selected_type_symbol_lookup(authority),
+										authority,
+									) + ";\n",
+								)
 			InlineRecordDecl(_):
 				void
 			FunctionDecl(func_info):
@@ -29673,13 +29640,13 @@ private pure func type_support_function_prototypes(
 
 ---
 The type-support functions prototyped above (heap record destroy/make,
-union destroy/non-empty-variant constructors, enum to_string/
+union destroy/non-empty-variant constructors, scalar union to_string/
 vector_to_string), as individually weighable items rather than one fused
 string. Before this step every one of these landed unconditionally in TU 0
 regardless of `unit_count`, which made TU 0 hold the entire program's type
 -support surface on top of its normal share of `assign_translation_units`'s
 byte-balanced function bins -- for a program with hundreds of record/union
-/enum declarations that dwarfs every other unit's compile cost even though
+/scalar union declarations that dwarfs every other unit's compile cost even though
 the LPT packer below is perfectly capable of spreading it out. Each item
 here carries a synthetic negative `def_id` (real declaration `def_id`s are
 always non-negative) so it sorts before same-bin real functions while
@@ -29691,7 +29658,6 @@ so this material is packed exactly like any other function body.
 private pure func collect_type_support_function_emissions(
 	heap_record_emissions: List[CHeapRecordDeclEmission],
 	union_emissions: List[CUnionDeclEmission],
-	enum_emissions: List[CEnumDeclEmission],
 ) -> List[CFunctionEmission]:
 	var items: List[CFunctionEmission] = []
 	var next_index: Int = 0
@@ -29720,26 +29686,17 @@ private pure func collect_type_support_function_emissions(
 				})
 				next_index += 1
 
-	for emission in enum_emissions:
-		for text in emission.functions:
-			items = items.append({
-				def_id = next_index - 2000000000,
-				text = text,
-			})
-			next_index += 1
-
 	items
 
 
 ---
 Type material (`type_header` only, in today's declaration order) for the
-shared header: forward decls, then value records, enums, generated
-stack-Option typedefs, unions, and heap records. Matches
+shared header: forward decls, then generated
+stack-Option typedefs, common scalar/managed unions, and heap records. Matches
 `render_single_translation_unit`'s ordering for these same pieces.
 ---
 private pure func header_type_material(
 	sections: CEmissionSections,
-	enum_emissions: List[CEnumDeclEmission],
 	union_emissions: List[CUnionDeclEmission],
 	heap_record_emissions: List[CHeapRecordDeclEmission],
 ) -> String:
@@ -29747,9 +29704,6 @@ private pure func header_type_material(
 	c_code = append_emitted_c(c_code, sections.heap_record_and_union_forward_decls)
 	c_code = append_emitted_c(c_code, sections.inline_record_decls)
 
-
-	for emission in enum_emissions:
-		c_code = append_emitted_c(c_code, emission.type_header)
 
 	c_code = append_emitted_c(c_code, sections.generated_stack_option_typedefs)
 
@@ -29903,7 +29857,6 @@ private pure func render_split_translation_units(
 	unit_count: Int,
 	header_name: String,
 ) -> CTranslationUnitSet:
-	enum_emissions: List[CEnumDeclEmission] = type_emissions.enums
 	union_emissions: List[CUnionDeclEmission] = type_emissions.unions
 	heap_record_emissions: List[CHeapRecordDeclEmission] = type_emissions.heap_records
 	owner_data_emissions: List[CUnionOwnerDataSplitEmission] = collect_union_owner_data_split_emissions(
@@ -29963,7 +29916,6 @@ private pure func render_split_translation_units(
 		foreign_includes,
 	) + header_type_material(
 		sections,
-		enum_emissions,
 		union_emissions,
 		heap_record_emissions,
 	) + header_owner_data + header_global_init_prototype + header_literal_macro + header_canonical_empty_list_typedefs + header_canonical_empty_list_externs + header_string_literal_externs + sections.static_closure_forward_decls + header_global_externs + header_profile_metadata_extern + type_support_function_prototypes(
@@ -29997,7 +29949,6 @@ private pure func render_split_translation_units(
 	type_support_items: List[CFunctionEmission] = collect_type_support_function_emissions(
 		heap_record_emissions,
 		union_emissions,
-		enum_emissions,
 	)
 
 	-- Type-support functions are packed by the same byte-balanced LPT bin

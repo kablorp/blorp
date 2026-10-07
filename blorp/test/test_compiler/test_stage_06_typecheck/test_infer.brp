@@ -1,4 +1,5 @@
 import:
+	../../../src/compiler/stage_06_typecheck/type_system/union_layout: UnionLayout(ScalarTagUnion, TaggedUnion)
 	../../../src/compiler/stage_06_typecheck/graph/range_record: STANDARD_RANGE_RECORD_TYPE_NAME
 	../test_support_range_record: state_with_range_record_test_authority
 	fixtures/trait_identity_fixture: test_bound_type_param, test_trait_id
@@ -243,10 +244,11 @@ import:
 		ResourceResultPolicy(ResourceResultDependent, ResourceResultOrdinary),
 		SymbolKind(FuncSymbolKind, TypeSymbolKind),
 		TypeContainmentSummary,
-		TypeKind(TypeEnum, TypeResource, TypeUnion),
+		TypeKind(TypeResource, TypeUnion),
 		VarMutability(ImmutableBinding),
 		VarOrigin(LetBinding),
 		env_add_accepted_opaque_alias,
+		env_add_accepted_default_tag_equality,
 		env_add_alias,
 		env_add_func,
 		env_add_func_with_info,
@@ -313,6 +315,7 @@ import:
 	list: list
 	../../../src/compiler/stage_06_typecheck/type_system/trait_identity:
 		TRAIT_ID_EQUATABLE,
+		TRAIT_ID_HASHABLE,
 		TRAIT_ID_SIGNED_INTEGER,
 		builtin_trait_id_at_registry_index,
 		trait_ids_equal,
@@ -1441,7 +1444,7 @@ pure func state_with_option_int_value() -> TypecheckState:
 				tag = 1
 			},
 		],
-		TypeUnion,
+		TypeUnion(TaggedUnion),
 		False,
 		True,
 	)
@@ -1474,7 +1477,7 @@ pure func state_with_nested_union_value() -> TypecheckState:
 				tag = 1
 			},
 		],
-		TypeUnion,
+		TypeUnion(TaggedUnion),
 		False,
 		True,
 	)
@@ -1504,7 +1507,7 @@ pure func state_with_nested_union_value() -> TypecheckState:
 				tag = 3
 			},
 		],
-		TypeUnion,
+		TypeUnion(TaggedUnion),
 		False,
 		True,
 	)
@@ -1545,9 +1548,9 @@ pure func compiler_type_color() -> SemanticType:
 	SemanticNamedType("Color", [])
 
 
-pure func state_with_enum_values() -> TypecheckState:
+pure func state_with_scalar_tag_union_values() -> TypecheckState:
 	state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
-	with_enum = env_add_type(
+	with_union = env_add_type(
 		state.env,
 		"Color",
 		[],
@@ -1563,12 +1566,14 @@ pure func state_with_enum_values() -> TypecheckState:
 				tag = 1
 			},
 		],
-		TypeEnum,
+		TypeUnion(ScalarTagUnion),
 		False,
 		True,
 	)
+	-- This fixture supplies the accepted equality fact separately from physical layout.
+	with_equality = env_add_accepted_default_tag_equality(with_union, "Color")
 	with_left = env_add_var_with_details(
-		with_enum,
+		with_equality,
 		"left_color",
 		compiler_type_color(),
 		Some(compiler_type_color()),
@@ -1607,7 +1612,7 @@ pure func state_with_result_string_error() -> TypecheckState:
 				tag = 1
 			},
 		],
-		TypeUnion,
+		TypeUnion(TaggedUnion),
 		False,
 		True,
 	)
@@ -1646,7 +1651,7 @@ pure func state_with_shadowed_module_option_constructors() -> TypecheckState:
 				tag = 0
 			},
 		],
-		TypeUnion,
+		TypeUnion(TaggedUnion),
 		False,
 		True,
 	)
@@ -1668,7 +1673,7 @@ pure func state_with_explicitly_imported_constructor_collision(
 				tag = 0
 			},
 		],
-		TypeUnion,
+		TypeUnion(TaggedUnion),
 		False,
 		True,
 		[],
@@ -1684,7 +1689,7 @@ pure func state_with_explicitly_imported_constructor_collision(
 				tag = 0
 			},
 		],
-		TypeUnion,
+		TypeUnion(TaggedUnion),
 		False,
 		True,
 		[],
@@ -2928,6 +2933,46 @@ func test_scoped_trait_method_wins_builtin_name_collision() -> Bool:
 	)
 
 	result.context.state.errors.length() == 0 and resolved_call_targets_trait(result, "Equatable")
+
+
+private func scoped_hash_failure(namesake: Bool) -> InferResult:
+	base = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	traits = if namesake:
+		base.env.traits.map(func(definition):
+			if trait_ids_equal(definition.trait_id, TRAIT_ID_HASHABLE):
+				{ definition | trait_id = test_trait_id("UnrelatedHashable") }
+			else:
+				definition
+		)
+	else:
+		base.env.traits
+	state = add_infer_value(
+		{ base | env = { base.env | traits = traits } },
+		"value", SemanticNamedType("UnhashableKey", []),
+	)
+	scoped = typecheck_state_add_scoped_trait_function(
+		state, { source_name = "hash", owner = UnindexedScopedTrait("Hashable") },
+	)
+	infer_expr(
+		infer_context(scoped),
+		call_expr(ParsedNameExpr(ident("hash")), [ParsedNameExpr(ident("value"))]),
+	)
+
+
+func test_scoped_hash_failure_retains_identity_for_actionable_help() -> Bool:
+	result = scoped_hash_failure(False)
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors.get_or(0, "").contains("implements Hashable for UnhashableKey")
+	)
+
+
+func test_namesake_hash_failure_does_not_select_compiler_hash_help() -> Bool:
+	result = scoped_hash_failure(True)
+	(
+		result.context.state.errors.length() == 1
+		and not result.context.state.errors.get_or(0, "").contains("help:")
+	)
 
 
 pure func state_with_imported_equals_in_trait_scope() -> TypecheckState:
@@ -5864,9 +5909,9 @@ func test_generic_comparison_requires_orderable_bound() -> Bool:
 	)
 
 
-func test_enum_equality_returns_bool() -> Bool:
+func test_scalar_tag_union_equality_returns_bool() -> Bool:
 	result = infer_expr(
-		infer_context(state_with_enum_values()),
+		infer_context(state_with_scalar_tag_union_values()),
 		binary_expr(
 			ParsedEqualOp,
 			ParsedNameExpr(ident("left_color")),
@@ -11004,7 +11049,7 @@ func test_match_or_pattern_combines_bool_coverage() -> Bool:
 
 func test_match_or_pattern_nullary_constructors_bind_nothing() -> Bool:
 	result = infer_expr(
-		infer_context(state_with_enum_values()),
+		infer_context(state_with_scalar_tag_union_values()),
 		ParsedMatchExpr(
 			ParsedNameExpr(ident("left_color")),
 			[
@@ -12116,6 +12161,8 @@ tests: TestSuite = {
 			"scoped trait method wins builtin name collision",
 			test_scoped_trait_method_wins_builtin_name_collision,
 		),
+		("scoped hash failure retains identity for help", test_scoped_hash_failure_retains_identity_for_actionable_help),
+		("namesake hash failure avoids compiler help", test_namesake_hash_failure_does_not_select_compiler_hash_help),
 		(
 			"explicit import wins scoped trait method name",
 			test_explicit_import_wins_scoped_trait_method_name,
@@ -12449,7 +12496,7 @@ tests: TestSuite = {
 			"generic comparison requires Orderable bound",
 			test_generic_comparison_requires_orderable_bound,
 		),
-		("enum equality returns bool", test_enum_equality_returns_bool),
+		("scalar tag union equality returns bool", test_scalar_tag_union_equality_returns_bool),
 		("record equality requires Equatable trait", test_record_equality_requires_equatable_trait),
 		("unary and logical ops", test_unary_and_logical_ops),
 		(

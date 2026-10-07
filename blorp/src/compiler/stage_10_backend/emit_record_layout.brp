@@ -10,8 +10,7 @@ import:
 	../stage_09_core/c_type_layout: c_type_name
 	../stage_09_core/ir:
 		CoreCallKind(ForeignCall),
-		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, InlineRecordDecl, UnionDecl),
-		CoreEnumDecl,
+		CoreDecl(InlineRecordDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, UnionDecl),
 		CoreExpr(CallExpr),
 		CoreFieldOrdinal,
 		CoreFieldRef,
@@ -20,11 +19,14 @@ import:
 		CoreHeapRecordDecl,
 		CoreProgram,
 		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType, RangeType, SelfType,
+			InlineRecordType, NativeManagedType,
+			BoxedResultType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType,
 			StackResultType, TensorType, TupleType, TypeParameterType, UnionType,
 			VoidType,
 		),
 		CoreUnionDecl,
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
+		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
 		core_expr_type,
 		core_field_ordinal_index,
 		core_field_ref_id,
@@ -35,7 +37,7 @@ import:
 	set as Sets
 
 
-enum CRecordLayout:
+fixed union CRecordLayout:
 	InternalLayout
 	ForeignAbiLayout
 
@@ -63,21 +65,19 @@ implements Equatable for CHeapRecordFieldStorage:
 		not equals(left, right)
 
 
-MAX_BYTE_ENUM_TAG: Int = 255
+MAX_BYTE_UNION_TAG: Int = 255
 
 
 pure func c_record_field_type_is_boolean(typ: CoreType) -> Bool:
 	match typ:
 		NamedType(name, args):
 			name == "Bool" and args.length() == 0
-		EnumType(name):
-			name == "Bool"
 		_:
 			False
 
 
 pure func c_heap_record_field_storage(
-	byte_sized_enum_names: Set[String],
+	byte_sized_scalar_union_names: Set[String],
 	layout: CRecordLayout,
 	typ: CoreType,
 	has_boolean_neighbor: Bool,
@@ -92,8 +92,8 @@ pure func c_heap_record_field_storage(
 					OrdinaryCHeapRecordField("_Bool")
 			else:
 				match typ:
-					EnumType(name):
-						if Sets.contains(byte_sized_enum_names, name):
+					UnionType(name, ScalarTagValue):
+						if Sets.contains(byte_sized_scalar_union_names, name):
 							OrdinaryCHeapRecordField("uint8_t")
 						else:
 							OrdinaryCHeapRecordField(c_type_name(typ, type_symbol_lookup))
@@ -107,7 +107,7 @@ pure func c_heap_record_field_storage(
 
 record CRecordLayoutRegistry {
 	foreign_abi_heap_record_names: Set[String],
-	byte_sized_enum_names: Set[String],
+	byte_sized_scalar_union_names: Set[String],
 	-- The records whose members keep their source names (a declared ABI
 	-- record, or one reachable from a foreign function's signature), each with
 	-- its member spellings in declaration order. Every other record spells its
@@ -340,15 +340,15 @@ private pure func append_nested_types(pending: List[CoreType], typ: CoreType) ->
 			pending.append(info.element_type)
 		TupleType(items):
 			pending.concat(items)
-		VoidType | EnumType(_) | HeapRecordType(_) | InlineRecordType(_) | RangeType | TypeParameterType(_) | SelfType | UnionType(_):
+		NativeManagedType(_) | VoidType | HeapRecordType(_) | RangeType | TypeParameterType(_) | SelfType | UnionType(_, _) | InlineRecordType(_):
 			pending
 
 
-private pure func enum_decl_uses_byte_tags(enum_decl: CoreEnumDecl) -> Bool:
-	var uses_byte_tags: Bool = enum_decl.variants.length() > 0
+private pure func scalar_union_decl_uses_byte_tags(union_decl: CoreUnionDecl) -> Bool:
+	var uses_byte_tags: Bool = union_decl.variants.length() > 0
 
-	for variant in enum_decl.variants:
-		if variant.tag < 0 or variant.tag > MAX_BYTE_ENUM_TAG:
+	for variant in union_decl.variants:
+		if variant.tag < 0 or variant.tag > MAX_BYTE_UNION_TAG:
 			uses_byte_tags = False
 			break
 
@@ -444,16 +444,20 @@ pure func classify_c_record_layouts(
 		source_names = {},
 		unresolved = []
 	}
-	var byte_sized_enum_names: Set[String] = Sets.set()
+	var byte_sized_scalar_union_names: Set[String] = Sets.set()
 	var visited_union_names: Set[String] = Sets.set()
 	var pending: List[CoreType] = foreign_boundary_types
 	var index: Int = 0
 
 	for decl in program.decls:
 		match decl:
-			EnumDecl(enum_decl):
-				if enum_decl_uses_byte_tags(enum_decl):
-					byte_sized_enum_names = Sets.add(byte_sized_enum_names, enum_decl.name)
+			UnionDecl(union_decl):
+				match union_decl.storage:
+					ScalarTagStorage:
+						if scalar_union_decl_uses_byte_tags(union_decl):
+							byte_sized_scalar_union_names = Sets.add(byte_sized_scalar_union_names, union_decl.name)
+					ManagedPayloadStorage(_):
+						void
 			HeapRecordDecl(record_decl):
 				if record_decl.abi_type.is_some():
 					declared_abi_names = Sets.add(declared_abi_names, record_decl.name)
@@ -482,7 +486,7 @@ pure func classify_c_record_layouts(
 										pending = pending.append(field.typ)
 								None:
 									void
-					UnionType(union_name):
+					UnionType(union_name, ManagedUnionValue):
 						if not Sets.contains(visited_union_names, union_name):
 							visited_union_names = Sets.add(visited_union_names, union_name)
 
@@ -520,7 +524,7 @@ pure func classify_c_record_layouts(
 		None:
 			Ok({
 				foreign_abi_heap_record_names = foreign_heap_names,
-				byte_sized_enum_names = byte_sized_enum_names,
+				byte_sized_scalar_union_names = byte_sized_scalar_union_names,
 				source_member_fields = source_member_fields,
 				record_member_names = members.member_names,
 			})

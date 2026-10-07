@@ -3,6 +3,7 @@
 -- module; exact nominal IDs remain the source of every relationship.
 import:
 	../../../lib/source: source_locations_equal
+	builtins: builtin_trait_member_declaration
 	../../stage_02_lex/name_table:
 		NameId,
 		NameTable,
@@ -68,6 +69,8 @@ import:
 		Env,
 		ImplInstance,
 		ImplMethodInfo,
+		ImplementationBoundDependency,
+		ImplementationPatternMatch,
 		TraitDef,
 		TraitMethodSig,
 		TraitObligation,
@@ -79,6 +82,9 @@ import:
 		env_resolve_trait_obligation,
 		impl_instances_may_overlap,
 		implementation_pattern_matches_with,
+		implementation_pattern_match,
+		implementation_pattern_match_bounds_satisfied,
+		implementation_pattern_match_dependencies,
 		trait_obligation,
 	generic_params:
 		BoundTraitIdentity,
@@ -152,7 +158,7 @@ record AcceptedDerivedEquality {
 Where a record's `Equatable` comes from. Every record falls in exactly one
 case, and the derived case is the only one Core lowering builds methods for.
 ---
-enum AcceptedRecordEquality:
+fixed union AcceptedRecordEquality:
 	WrittenRecordEquality
 	DerivedRecordEquality
 	NoRecordEquality
@@ -196,6 +202,114 @@ record AcceptedImplementationDefinitionIds {
 	id: ImplId,
 	method_ids: List[CallableId]
 }
+
+
+union AcceptedEvidenceMemberIdentity:
+	IssuedEvidenceMember(TraitMethodId)
+	CompilerScopedEvidenceMember(TraitId, Int)
+
+
+union AcceptedImplementationCallable:
+	TraitImplementationMember(AcceptedEvidenceMemberIdentity, CallableId)
+	AuxiliaryImplementationCallable(CallableId)
+
+
+private record AcceptedSourceImplementationMatchRep {
+	implementation: ImplId,
+	receiver: SemanticType,
+	callables: List[AcceptedImplementationCallable],
+	pattern: ImplementationPatternMatch,
+	bounds: List[BoundTypeParam]
+}
+
+
+private record AcceptedSourceCandidateRep {
+	issuer: DefinitionTable,
+	implementation: ImplId,
+	declared_trait: TraitId,
+	receiver: SemanticType,
+	pattern: ImplementationPatternMatch,
+	bounds: List[BoundTypeParam]
+}
+
+
+---
+Exact issuer, visibility and receiver-pattern facts from one accepted row.
+This candidate proves no bound satisfaction and issues no member targets.
+Only the ordered source matching loop constructs it; dependencies always
+interpret the same row's one substitution and bound metadata.
+---
+opaque type AcceptedSourceCandidate = AcceptedSourceCandidateRep
+
+
+union AcceptedSourceCandidateDecision[Proof, Pending]:
+	SourceCandidateApplicable(Proof)
+	SourceCandidateInapplicable
+	SourceCandidateDeferred(Pending)
+	SourceCandidateCyclic(String)
+
+
+union AcceptedSourceMatch[Proof, Pending]:
+	SourceImplementationSelected(AcceptedSourceImplementationMatch, Proof)
+	SourceImplementationDeferred(AcceptedSourceCandidate, Pending)
+	SourceImplementationAbsent(Option[String])
+
+
+---
+A visible applicable source implementation with validated issued member
+targets. This is a source-match packet, not complete recursive trait evidence.
+Only the shared ordered source matching loop constructs it. The pattern
+and bounds belong to the same accepted row; dependency projection never accepts
+replacement caller-supplied bounds.
+---
+opaque type AcceptedSourceImplementationMatch = AcceptedSourceImplementationMatchRep
+
+
+pure func accepted_source_candidate_id(candidate: AcceptedSourceCandidate) -> ImplId:
+	from_opaque AcceptedSourceCandidate(candidate).implementation
+
+
+pure func accepted_source_candidate_declared_trait(candidate: AcceptedSourceCandidate) -> TraitId:
+	from_opaque AcceptedSourceCandidate(candidate).declared_trait
+
+
+-- None identifies a registry-owned declaration with no source topology row;
+-- it is not an empty inherited interface. The producer consults its prepared
+-- builtin registry for that case. Source rows preserve declared parent order.
+pure func accepted_source_candidate_supertraits(
+	authority: AcceptedTraitImplementationAuthority,
+	candidate: AcceptedSourceCandidate,
+) -> Result[Option[List[BoundTraitIdentity]], String]:
+	table = table_rep(authority_rep(authority).table)
+	representation = from_opaque AcceptedSourceCandidate(candidate)
+	if not definition_tables_share_provenance(table.definition_table, representation.issuer):
+		Err("source candidate issuer does not match accepted authority")
+	else:
+		match table_find_obligation_trait_index(table, representation.declared_trait):
+			Some(index):
+				match table.traits.get(index):
+					Some(declaration):
+						Ok(Some(declaration.supertraits.map(func(id): bound_trait_identity_from_id(table.definition_table, id))))
+					None:
+						Err("source candidate trait declaration is absent")
+			None:
+				if table_trait_is_compiler_owned(table, representation.declared_trait):
+					Ok(None)
+				else:
+					Err("source candidate trait identity is absent")
+
+
+pure func accepted_source_candidate_receiver(candidate: AcceptedSourceCandidate) -> SemanticType:
+	from_opaque AcceptedSourceCandidate(candidate).receiver
+
+
+pure func accepted_source_candidate_pattern(candidate: AcceptedSourceCandidate) -> ImplementationPatternMatch:
+	from_opaque AcceptedSourceCandidate(candidate).pattern
+
+
+pure func accepted_source_candidate_dependencies(candidate: AcceptedSourceCandidate) -> List[ImplementationBoundDependency]:
+	representation = from_opaque AcceptedSourceCandidate(candidate)
+	implementation_pattern_match_dependencies(representation.pattern, representation.bounds)
 
 
 private union AcceptedVisibleTraitBinding:
@@ -2257,6 +2371,19 @@ pure func accepted_trait_implementation_authority_preparation_errors(
 	authority_rep(authority).preparation_errors
 
 
+pure func accepted_trait_implementation_authority_definition_table(
+	authority: AcceptedTraitImplementationAuthority,
+) -> DefinitionTable:
+	table_rep(authority_rep(authority).table).definition_table
+
+
+pure func accepted_trait_implementation_authority_owner_module_id(
+	authority: AcceptedTraitImplementationAuthority,
+) -> Option[ModuleId]:
+	representation = authority_rep(authority)
+	module_table_find_id_by_canonical_path(table_rep(representation.table).module_table, representation.owner_module_path)
+
+
 ---
 Preserve visibility projection failure as an authority preparation error.
 Callers must not turn a rejected graph/table pairing into an ordinary empty
@@ -3075,6 +3202,178 @@ private pure func accepted_implementation_matches_type(
 	)
 
 
+private pure func source_implementation_callable(
+	table: AcceptedTraitImplementationTableRep,
+	implementation_index: Int,
+	item: AcceptedImplementationTableRecord,
+	method_index: Int,
+	method: ImplMethodInfo,
+) -> Result[AcceptedImplementationCallable, String]:
+	member_ids ?= table.implementation_trait_method_ids.get(implementation_index).to_result(
+		"source evidence implementation member mapping is absent",
+	)
+	-- Validate issued target and owner before classifying a generic template.
+	validated = accepted_selected_method(table, item, method_index, method, SelectConcreteAcceptedMethod)
+	match validated:
+		AcceptedConcreteMethodInvalid(message):
+			Err(message)
+		AcceptedConcreteMethodFound(_) | AcceptedConcreteMethodTemplate:
+			callable ?= item.method_ids.get(method_index).to_result("source evidence implementation callable is absent")
+			member ?= member_ids.get(method_index).to_result("source evidence implementation member mapping is incomplete")
+			match member:
+				Some(id):
+					Ok(TraitImplementationMember(IssuedEvidenceMember(id), callable))
+				None:
+					compiler_trait ?= table.compiler_trait_id_by_implementation.get(implementation_index)
+						.to_result("source evidence declaring trait mapping is absent")
+					-- The accepted table derives source member mappings from
+					-- validated callable names. Never turn an absent mapping
+					-- row into auxiliary evidence; a valid None projection
+					-- denotes no source bound-member slot.
+					declared = compiler_trait.and_then(pure func(id): builtin_trait_member_declaration(id, method.name))
+					Ok(match declared:
+						Some(identity):
+							TraitImplementationMember(CompilerScopedEvidenceMember(identity[0], identity[1]), callable)
+						None:
+							AuxiliaryImplementationCallable(callable)
+					)
+		AcceptedConcreteMethodAbsent:
+			Err("source evidence implementation member is absent")
+
+
+private pure func source_implementation_callables(
+	table: AcceptedTraitImplementationTableRep,
+	implementation_index: Int,
+	item: AcceptedImplementationTableRecord,
+) -> Result[List[AcceptedImplementationCallable], String]:
+	var members: List[AcceptedImplementationCallable] = []
+	var error: Option[String] = None
+	for indexed in item.instance.methods.enumerate():
+		match source_implementation_callable(table, implementation_index, item, indexed[0], indexed[1]):
+			Ok(member):
+				members = members.append(member)
+			Err(message):
+				error = Some(message)
+				break
+
+	match error:
+		Some(message): Err(message)
+		None: Ok(members)
+
+
+---
+One ordered source candidate loop serves recursive typed evidence selection.
+The callback owns applicability, never pattern matching. Only an
+Applicable proof validates members and issues an accepted match. Deferred
+candidates remain pending; cycles are skipped and retained only when no source
+candidate succeeds, allowing the producer to try independent compiler proof.
+---
+pure func accepted_match_source_trait_implementation_with[Proof, Pending](
+	authority: AcceptedTraitImplementationAuthority,
+	issuing_table: DefinitionTable,
+	receiver: SemanticType,
+	requested: BoundTraitIdentity,
+	applicability: pure (AcceptedSourceCandidate) -> Result[AcceptedSourceCandidateDecision[Proof, Pending], String],
+) -> Result[AcceptedSourceMatch[Proof, Pending], String]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+
+	if not definition_tables_share_provenance(table.definition_table, issuing_table):
+		Err("trait evidence issuer does not match accepted authority")
+	else:
+		indices ?= match table_find_bound_trait_index(table, requested):
+			Some(index):
+				match table.traits.get(index):
+					Some(declaration):
+						if trait_ids_equal(requested.trait_id, trait_id_compiler_identity(issuing_table, declaration.id)):
+							Ok(implementation_candidate_indices_for_trait_index(representation, index))
+						else:
+							Err("source evidence requested trait identity is absent or invalid")
+					None:
+						Err("source evidence requested trait declaration is absent")
+			None:
+				if (
+					requested.owner == CompilerBuiltinBoundTraitOwner
+					and trait_id_is_valid(issuing_table, requested.trait_id)
+					and bound_trait_identity_matches_id(issuing_table, requested, requested.trait_id)
+				):
+					Ok(implementation_candidate_indices_for_trait(representation, requested.trait_id))
+				else:
+					Err("source evidence requested trait identity is absent or invalid")
+
+		var selected: Result[AcceptedSourceMatch[Proof, Pending], String] = Ok(SourceImplementationAbsent(None))
+		var cycle: Option[String] = None
+
+		for index in indices:
+			match table.implementations.get(index):
+				None:
+					selected = Err("source evidence implementation index is invalid")
+					break
+				Some(item):
+					for_type = localize_module_types(representation.owner_module_path, item.instance.for_type)
+					match implementation_pattern_match(for_type, item.instance.bounds, receiver):
+						Some(pattern):
+							candidate = into_opaque AcceptedSourceCandidate({
+								issuer = issuing_table, declared_trait = item.trait_id,
+								implementation = item.id, receiver = receiver,
+								pattern = pattern, bounds = item.instance.bounds
+							})
+							match applicability(candidate):
+								Err(message):
+									selected = Err(message)
+									break
+								Ok(SourceCandidateApplicable(proof)):
+									match source_implementation_callables(table, index, item):
+										Err(message):
+											selected = Err(message)
+										Ok(callables):
+											selected = Ok(SourceImplementationSelected(
+												into_opaque AcceptedSourceImplementationMatch({
+													implementation = item.id, receiver = receiver,
+													callables = callables, pattern = pattern,
+													bounds = item.instance.bounds
+												}), proof,
+											))
+									break
+								Ok(SourceCandidateDeferred(pending)):
+									selected = Ok(SourceImplementationDeferred(candidate, pending))
+									break
+								Ok(SourceCandidateCyclic(message)):
+									if cycle.is_none():
+										cycle = Some(message)
+								Ok(SourceCandidateInapplicable):
+									void
+						None:
+							void
+
+		match selected:
+			Ok(SourceImplementationAbsent(_)):
+				Ok(SourceImplementationAbsent(cycle))
+			_:
+				selected
+
+
+pure func accepted_source_implementation_match_id(matched: AcceptedSourceImplementationMatch) -> ImplId:
+	from_opaque AcceptedSourceImplementationMatch(matched).implementation
+
+
+pure func accepted_source_implementation_match_receiver(matched: AcceptedSourceImplementationMatch) -> SemanticType:
+	from_opaque AcceptedSourceImplementationMatch(matched).receiver
+
+
+pure func accepted_source_implementation_match_callables(matched: AcceptedSourceImplementationMatch) -> List[AcceptedImplementationCallable]:
+	from_opaque AcceptedSourceImplementationMatch(matched).callables
+
+
+pure func accepted_source_implementation_match_pattern(matched: AcceptedSourceImplementationMatch) -> ImplementationPatternMatch:
+	from_opaque AcceptedSourceImplementationMatch(matched).pattern
+
+
+pure func accepted_source_implementation_match_dependencies(matched: AcceptedSourceImplementationMatch) -> List[ImplementationBoundDependency]:
+	representation = from_opaque AcceptedSourceImplementationMatch(matched)
+	implementation_pattern_match_dependencies(representation.pattern, representation.bounds)
+
+
 private pure func accepted_has_matching_implementation(
 	authority: AcceptedTraitImplementationAuthority,
 	env: Env,
@@ -3320,10 +3619,15 @@ pure func accepted_resolve_exact_trait_obligation(
 								TraitObligationUnsatisfied
 		None:
 			if identity.owner == CompilerBuiltinBoundTraitOwner:
-				env_resolve_trait_obligation(
-					env,
-					trait_obligation(typ, identity.trait_id),
-				)
+				-- The compiler identity may have accepted implementations without
+				-- a source trait declaration. Authored evidence precedes fallback.
+				if accepted_has_matching_implementation(authority, env, identity.trait_id, typ):
+					TraitObligationSatisfied
+				else:
+					env_resolve_trait_obligation(
+						env,
+						trait_obligation(typ, identity.trait_id),
+					)
 			else:
 				TraitObligationUnsatisfied
 
@@ -3517,7 +3821,7 @@ pure func accepted_resolve_trait_obligation(
 				accepted_or_compiler_trait_obligation_resolution(authority, env, obligation)
 
 
-private enum AcceptedMethodSelectionMode:
+private fixed union AcceptedMethodSelectionMode:
 	SelectAnyAcceptedMethod
 	SelectConcreteAcceptedMethod
 

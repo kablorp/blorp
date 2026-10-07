@@ -1056,7 +1056,7 @@ record GlobalDeclaration {
 }
 
 
-enum GlobalForm:
+fixed union GlobalForm:
 	ConstantGlobal
 	MutableGlobal
 
@@ -1073,7 +1073,7 @@ record RecordDeclaration {
 }
 
 
-enum RecordDeclarationForm:
+fixed union RecordDeclarationForm:
 	OrdinaryRecord
 	FixedRecord
 
@@ -1145,7 +1145,7 @@ record AliasDeclaration {
 }
 
 
-enum AliasForm:
+fixed union AliasForm:
 	TransparentAlias
 	OpaqueAlias
 
@@ -1245,7 +1245,7 @@ record Annotation {
 }
 
 
-enum FunctionAnnotation:
+fixed union FunctionAnnotation:
 	TailRecursiveAnnotation
 	NoCopyAnnotation
 	DebugOnlyAnnotation
@@ -1397,7 +1397,7 @@ union DimensionKind:
 	DimensionArithmetic(DimensionOperator, Dimension, Dimension)
 
 
-enum DimensionOperator:
+fixed union DimensionOperator:
 	AddDimensions
 	SubtractDimensions
 	MultiplyDimensions
@@ -1458,7 +1458,7 @@ union PatternKind:
 	AlternativePatterns(AtLeastTwo[Pattern])                     -- `p | q`
 
 
-enum Sign:
+fixed union Sign:
 	NonNegative
 	Negative
 
@@ -1467,7 +1467,7 @@ enum Sign:
 The text form a string literal or pattern was written in. The existing AST
 records it, so the formatter can keep it.
 ---
-enum StringForm:
+fixed union StringForm:
 	QuotedString
 	RawString
 	PipeString
@@ -1534,12 +1534,12 @@ union ExpressionKind:
 	Continue
 
 
-enum UnaryOperator:
+fixed union UnaryOperator:
 	Negate
 	LogicalNot
 
 
-enum BinaryOperator:
+fixed union BinaryOperator:
 	Add
 	Subtract
 	Multiply
@@ -1557,12 +1557,12 @@ enum BinaryOperator:
 `and` and `or`: they may skip their right operand, so they are not operators
 over two evaluated values.
 ---
-enum LogicalOperator:
+fixed union LogicalOperator:
 	LogicalAnd
 	LogicalOr
 
 
-enum OpaqueDirection:
+fixed union OpaqueDirection:
 	IntoOpaque
 	FromOpaque
 
@@ -1695,7 +1695,7 @@ record CompoundAssignmentStatement {
 }
 
 
-enum CompoundOperator:
+fixed union CompoundOperator:
 	AddAssign
 	SubtractAssign
 	MultiplyAssign
@@ -1888,7 +1888,7 @@ record LambdaParameter {
 }
 
 
-enum InterpolationForm:
+fixed union InterpolationForm:
 	QuotedInterpolation
 	PipeInterpolation
 
@@ -2346,7 +2346,7 @@ private record ParseFields {
 Whether the statements being parsed are inside a loop: `break`, `continue`
 and `?=` placement. A parameter, never saved or restored.
 ---
-enum BodyContext:
+fixed union BodyContext:
 	OutsideLoop
 	InsideLoop
 
@@ -2787,7 +2787,7 @@ union ModuleOrigin:
 	SourcePackageModule(PackageId)
 
 
-enum ModuleReach:
+fixed union ModuleReach:
 	RootModule
 	ImplicitModule
 	ImportedModule
@@ -3505,7 +3505,7 @@ grammar is [`GRAMMAR.md`](GRAMMAR.md), and the history of each slice is in git
 | M0 | A throwaway body-parser prototype and its [cost report](../benchmarks/results/discovery_redesign_m0_2026-10-02.md) | Complete; evidence only, no prototype code kept | `684f5e586` (report) |
 | M1 | `syntax/` types, `IdMint` confined to `parse/`, the syntax dump and the id census; the opaque-type import-cycle repro retained as a fixture | Complete | `133eaf73a` |
 | M2 | `lex_module` and `LexedModule`: per-module spellings, checked literal values, a bridge into the table builder | Complete | `133eaf73a` |
-| M3 | Declaration-level tree parse: imports, foreign blocks, signatures, type parameters, bounds, types, dimensions, patterns, both record spellings, unions, enums, aliases, builtin and resource types; the rejected-declaration diagnostic gate | Complete except first-diagnostic parity for rejected modules whose owners have bodies, which the M4 subset check takes over (section 6.3) | `133eaf73a`; fixed unions `d9c737a86` |
+| M3 | Declaration-level tree parse: imports, foreign blocks, signatures, type parameters, bounds, types, dimensions, patterns, both record spellings, unions, aliases, builtin and resource types; the rejected-declaration diagnostic gate | Complete except first-diagnostic parity for rejected modules whose owners have bodies, which the M4 subset check takes over (section 6.3) | `133eaf73a`; fixed unions `d9c737a86` |
 | M4 | Body parser over trees and module assembly | In progress: 2,741 of 3,439 accepted corpus modules assemble; exit criteria below | the slices below |
 | M5 | Link, `DiscoveryOutcome` and the tree path behind a test-only selection | Not started | none |
 | M6 | The tree path becomes the stage's default | Not started; waits on product unification and the tuple hand-off | none |

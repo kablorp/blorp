@@ -12,11 +12,12 @@ import:
 		bound_pinned_hash_container_constructor,
 		build_hash_key_adapter_table,
 	ir:
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
 		CoreCallKind(
 			BuiltinCall, DictWithCapacityCall, DirectRuntimeCall, IntrinsicCall, ListToStringCall,
 			TensorParallelCall,
 		),
-		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, UnionDecl),
+		CoreDecl(UnionDecl, FunctionDecl, GlobalDecl),
 		CoreDictLiteralEntry,
 		CoreDirectRuntimeArgs(
 			DirectRuntimeArgsAppendListParallelLayout, DirectRuntimeArgsAsWritten,
@@ -45,12 +46,10 @@ import:
 			TensorParallelRawScalarLayout,
 		),
 		CoreTensorRawScalarKind(TensorFloat32Elements, TensorFloat64Elements, TensorInt64Elements),
-		CoreType(
-			BoxedResultType, EnumType, InlineRecordType, NamedType, StackResultType, TensorType,
-			UnionType, VoidType,
-		),
+		CoreType(InlineRecordType, BoxedResultType, UnionType, NamedType, StackResultType, TensorType, VoidType),
 		CoreVar,
 		core_expr_type,
+		core_union_storage_value,
 	operation_metadata:
 		fallible_stream_terminal_builtin,
 		fallible_stream_terminal_call_kind,
@@ -90,7 +89,8 @@ private POINTER_TYPE: CoreType = NamedType("Ptr", [])
 
 private record NullaryConstructorProjection {
 	source_name: String,
-	c_name: String
+	c_name: String,
+	storage: CoreUnionValueStorage
 }
 
 
@@ -98,12 +98,11 @@ private type alias NullaryConstructorsByParentAndId = Dict[String, Dict[Int, Lis
 
 
 ---
-Enum and union indexes stay separate because constructor kind is part of
-the Core identity validated by this projection pass.
+One union index preserves issued constructor identity and physical storage.
+A requested Core type must agree with the declaring union's storage.
 ---
 private record NullaryConstructorIndex {
-	enums: NullaryConstructorsByParentAndId,
-	unions: NullaryConstructorsByParentAndId
+	constructors: NullaryConstructorsByParentAndId
 }
 
 
@@ -641,6 +640,7 @@ private pure func project_runtime_arguments(
 private pure func index_nullary_constructor(
 	index: NullaryConstructorsByParentAndId,
 	parent_name: String,
+	storage: CoreUnionValueStorage,
 	source_name: String,
 	c_name: String,
 	constructor_id: Int,
@@ -658,38 +658,26 @@ private pure func index_nullary_constructor(
 			constructors.append({
 				source_name = source_name,
 				c_name = c_name,
+				storage = storage,
 			}),
 		),
 	)
 
 
 private pure func build_nullary_constructor_index(program: CoreProgram) -> NullaryConstructorIndex:
-	var enums: NullaryConstructorsByParentAndId = {}
-	var unions: NullaryConstructorsByParentAndId = {}
+	var constructors: NullaryConstructorsByParentAndId = {}
 
 	for decl in program.decls:
 		match decl:
-			EnumDecl(enum_decl):
-				for variant in enum_decl.variants:
-					match variant.def_id:
-						Some(constructor_id):
-							enums = index_nullary_constructor(
-								enums,
-								enum_decl.name,
-								variant.name,
-								variant_constructor_symbol(constructor_id),
-								constructor_id,
-							)
-						None:
-							void
 			UnionDecl(union_decl):
 				for variant in union_decl.variants:
 					if variant.fields.is_empty():
 						match variant.def_id:
 							Some(constructor_id):
-								unions = index_nullary_constructor(
-									unions,
+								constructors = index_nullary_constructor(
+									constructors,
 									union_decl.name,
+									core_union_storage_value(union_decl.storage),
 									variant.name,
 									variant_constructor_symbol(constructor_id),
 									constructor_id,
@@ -700,14 +688,14 @@ private pure func build_nullary_constructor_index(program: CoreProgram) -> Nulla
 				void
 
 	{
-		enums = enums,
-		unions = unions
+		constructors = constructors
 	}
 
 
 private pure func indexed_constructor_c_name(
 	index: NullaryConstructorsByParentAndId,
 	parent_name: String,
+	requested_storage: CoreUnionValueStorage,
 	variable: CoreVar,
 ) -> Option[String]:
 	constructor_id ?= variable.def_id
@@ -716,28 +704,14 @@ private pure func indexed_constructor_c_name(
 	var result: Option[String] = None
 
 	for constructor in constructors:
-		if variable.name == constructor.source_name or variable.name == constructor.c_name:
+		if (
+			constructor.storage == requested_storage
+			and (variable.name == constructor.source_name or variable.name == constructor.c_name)
+		):
 			result = Some(constructor.c_name)
 			break
 
 	result
-
-
-private pure func constructor_union_type_name(
-	layout: CoreSpecializeLayout,
-	typ: CoreType,
-) -> Option[String]:
-	match typ:
-		UnionType(name):
-			Some(name)
-		NamedType(name, args):
-			match option_runtime_layout(layout, typ):
-				Some(BoxedOptionLayout):
-					Some("Option")
-				_:
-					None
-		_:
-			None
 
 
 private pure func constructor_c_name(
@@ -746,11 +720,16 @@ private pure func constructor_c_name(
 	typ: CoreType,
 ) -> Option[String]:
 	match typ:
-		EnumType(type_name):
-			indexed_constructor_c_name(context.constructors.enums, type_name, variable)
+		UnionType(name, storage):
+			indexed_constructor_c_name(context.constructors.constructors, name, storage, variable)
+		NamedType(_, _):
+			match option_runtime_layout(context.layout, typ):
+				Some(BoxedOptionLayout):
+					indexed_constructor_c_name(context.constructors.constructors, "Option", ManagedUnionValue, variable)
+				_:
+					None
 		_:
-			parent_name ?= constructor_union_type_name(context.layout, typ)
-			indexed_constructor_c_name(context.constructors.unions, parent_name, variable)
+			None
 
 
 private pure func is_stack_result(layout: CoreSpecializeLayout, typ: CoreType) -> Bool:

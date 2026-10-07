@@ -223,7 +223,6 @@ import:
 		default_implementation_method_signature,
 		default_implementation_method_source,
 		explicit_implementation_method_dimension_constraints,
-		explicit_implementation_method_parameters,
 		explicit_implementation_method_signature,
 		explicit_implementation_method_source,
 		implementation_header_graph_callable_headers,
@@ -237,10 +236,6 @@ import:
 		implementation_header_trait_id,
 		implementation_header_visibility,
 		implementation_method_header_id,
-		resolved_implementation_method_type_parameter_bounds,
-		resolved_implementation_method_type_parameter_id,
-		resolved_implementation_type_parameter_bounds,
-		resolved_implementation_type_parameter_id,
 	headers/trait_headers:
 		TraitTopologyGraph,
 		TraitTopologyHeader,
@@ -268,7 +263,6 @@ import:
 		ResolvedTypeShape,
 		TypeHeaderGraph,
 		callable_type_parameter_id_name,
-		implementation_type_parameter_id_name,
 		record_type_header_id,
 		type_header_graph_bound_graph,
 		type_header_graph_declaration_skeleton_count,
@@ -291,6 +285,10 @@ import:
 		typecheck_install_local_record_headers,
 		typecheck_install_local_union_headers,
 		typecheck_install_module_header_section,
+	headers/native_managed_authority:
+		NativeManagedAuthority,
+		native_managed_authority_from_headers,
+		native_managed_authority_unissued,
 	headers/type_resolution:
 		canonical_annotation_type,
 		canonical_function_annotation_type,
@@ -545,6 +543,7 @@ import:
 	type_system/accepted_union_authority:
 		AcceptedUnionAuthority,
 		AcceptedUnionTable,
+		accepted_union_find,
 		accepted_union_find_constructor_for_parent,
 	type_system/builtins:
 		BUILTIN_UNION_TYPE_NAMES,
@@ -585,6 +584,7 @@ import:
 		TraitObligationResolution(
 			TraitObligationDeferred, TraitObligationSatisfied, TraitObligationUnsatisfied,
 		),
+		env_union_layout,
 		VarMutability(ImmutableBinding),
 		VarOrigin(FuncParam, LetBinding),
 		VariantDef,
@@ -602,6 +602,7 @@ import:
 		env_get_trait,
 		env_get_trait_by_id,
 		env_get_type_params,
+		env_get_type_kind,
 		env_has_direct_trait_evidence,
 		env_push_scope,
 		env_resolve_trait_obligation,
@@ -617,6 +618,7 @@ import:
 		trait_method_sig_with_details,
 		trait_obligation,
 		var_mutability,
+	type_system/union_layout: UnionLayout(ScalarTagUnion, TaggedUnion)
 	type_system/generic_params:
 		BoundTraitIdentity,
 		BoundTraitOwner(CompilerBuiltinBoundTraitOwner, GraphBoundTraitOwner),
@@ -631,6 +633,8 @@ import:
 		meta_global_session,
 		meta_module_session,
 		new_compilation_run_token,
+	type_system/implementation_bound_params:
+		implementation_bound_type_params, implementation_method_bound_type_params
 	type_system/refinement: UNREFINED_BINDING
 	type_system/semantic_type:
 		SemanticType(
@@ -853,6 +857,7 @@ record TypedUnionVariantInfo {
 
 record TypedUnionInfo {
 	decl: ParsedUnionDecl,
+	layout: UnionLayout,
 	variants: List[TypedUnionVariantInfo]
 }
 
@@ -865,7 +870,7 @@ record TypedImplInfo {
 }
 
 
-enum TypedForeignLinkPlatform:
+fixed union TypedForeignLinkPlatform:
 	TypedForeignLinux
 	TypedForeignMacos
 
@@ -884,7 +889,7 @@ record TypedForeignLinkFlag {
 }
 
 
-enum TypedForeignArgPassing:
+fixed union TypedForeignArgPassing:
 	TypedForeignDefaultArgs
 	TypedForeignBorrowArgs
 
@@ -944,7 +949,8 @@ record TypedProgram {
 	decls: List[TypedDecl],
 	diagnostics: List[ParseDiagnostic],
 	type_definitions: List[TypedTypeDefinition],
-	type_references: List[TypedTypeReference]
+	type_references: List[TypedTypeReference],
+	native_managed_authority: NativeManagedAuthority
 }
 
 
@@ -976,7 +982,7 @@ record TypecheckProgramResult {
 }
 
 
-enum BodyCheckContextFailure:
+fixed union BodyCheckContextFailure:
 	BodyContextForeignOwner
 	BodyContextUnknownIdentity
 	BodyContextNotSourceBody
@@ -998,7 +1004,7 @@ record BodyImplementationPlanningFailure {
 }
 
 
-enum BodyCheckOrder:
+fixed union BodyCheckOrder:
 	SourceBodyOrder
 	ReverseBodyOrder
 	DeterministicShuffledBodyOrder
@@ -1274,7 +1280,8 @@ private pure func typed_program_from_decls(
 		decls = decls,
 		diagnostics = program.diagnostics,
 		type_definitions = typed_type_definitions(state, program),
-		type_references = typed_type_references(state, program)
+		type_references = typed_type_references(state, program),
+		native_managed_authority = native_managed_authority_unissued()
 	}
 
 
@@ -2026,7 +2033,14 @@ private pure func typed_union_variant_from_parsed(
 private pure func typed_union_from_parsed(
 	state: TypecheckState,
 	union_decl: ParsedUnionDecl,
-) -> TypedUnionInfo:
+) -> Option[TypedUnionInfo]:
+	-- Graph-backed declarations consume the accepted header's layout. Graphless
+	-- entrypoints retain the same fact from their installed environment header.
+	layout ?= match module_view_accepted_union_authority(state.module_view):
+		Some(authority):
+			accepted_union_find(authority, union_decl.name.text).map(func(entry): entry.layout)
+		None:
+			env_union_layout(state.env, union_decl.name.text)
 	type_params = type_param_names(union_decl.type_params)
 	typed_variants: List[TypedUnionVariantInfo] = union_decl.variants
 		.enumerate()
@@ -2040,10 +2054,11 @@ private pure func typed_union_from_parsed(
 			)
 		)
 
-	{
+	Some({
 		decl = union_decl,
+		layout = layout,
 		variants = typed_variants
-	}
+	})
 
 
 private pure func type_from_optional_parsed_type_expr(
@@ -3620,42 +3635,6 @@ private union ImplMethodInfosClaim:
 	ImplMethodInfosMissing(TypecheckState)
 
 
-private pure func implementation_bound_type_params(
-	definition_table: DefinitionTable,
-	header: ImplementationHeader,
-) -> List[BoundTypeParam]:
-	implementation_header_parameters(header).map(func(parameter): make_resolved_bound_type_param(
-			implementation_type_parameter_id_name(
-				resolved_implementation_type_parameter_id(parameter),
-			),
-			resolved_implementation_type_parameter_bounds(
-				parameter,
-			).map(
-				func(id): bound_trait_identity_from_id(definition_table, id),
-			),
-		))
-
-
-private pure func implementation_method_bound_type_params(
-	definition_table: DefinitionTable,
-	header: ImplementationMethodHeader,
-) -> List[BoundTypeParam]:
-	explicit_implementation_method_parameters(
-		header,
-	).map(
-		func(parameter): make_resolved_bound_type_param(
-			callable_type_parameter_id_name(
-				resolved_implementation_method_type_parameter_id(parameter),
-			),
-			resolved_implementation_method_type_parameter_bounds(
-				parameter,
-			).map(
-				func(id): bound_trait_identity_from_id(definition_table, id),
-			),
-		),
-	)
-
-
 private pure func implementation_method_info_from_header(
 	state: TypecheckState,
 	type_headers: TypeHeaderGraph,
@@ -4282,7 +4261,7 @@ private MAIN_SIGNATURE_MESSAGE: String = (
 private MAIN_GENERIC_MESSAGE: String = "main cannot be generic\n" + "help: Program entrypoint main must not declare type parameters"
 
 
-enum MainValidationPolicy:
+fixed union MainValidationPolicy:
 	ValidateProgramMain
 	IgnoreMainName
 
@@ -6125,25 +6104,35 @@ private pure func typecheck_materialize_decl_body(
 				)
 			}
 		UnionParsedDecl(union_decl):
-			typed_union = typed_union_from_parsed(state, union_decl)
-			var next_state = state
+			match typed_union_from_parsed(state, union_decl):
+				Some(typed_union):
+					var next_state = state
 
-			match module_view_accepted_union_authority(state.module_view):
-				Some(_):
-					for variant in typed_union.variants:
-						if variant.def_id.is_none():
-							next_state = typecheck_state_add_error_at(
-								next_state,
-								variant.selection_span,
-								"internal typecheck error: accepted constructor '" + variant.name + "' is absent from the union authority",
-							)
+					match module_view_accepted_union_authority(state.module_view):
+						Some(_):
+							for variant in typed_union.variants:
+								if variant.def_id.is_none():
+									next_state = typecheck_state_add_error_at(
+										next_state,
+										variant.selection_span,
+										"internal typecheck error: accepted constructor '" + variant.name + "' is absent from the union authority",
+									)
+						None:
+							void
+
+					{
+						state = next_state,
+						decl = MaterializedUncheckedDecl(TypedUnionDecl(typed_union))
+					}
 				None:
-					void
-
-			{
-				state = next_state,
-				decl = MaterializedUncheckedDecl(TypedUnionDecl(typed_union))
-			}
+					{
+						state = typecheck_state_add_error_at(
+							state,
+							union_decl.name.span,
+							"internal typecheck error: accepted layout for union '" + union_decl.name.text + "' is absent",
+						),
+						decl = MaterializedUncheckedDecl(TypedParsedDecl(decl))
+					}
 		TypeAliasParsedDecl(alias_decl):
 			{
 				state = state,
@@ -8990,7 +8979,7 @@ private pure func frontend_preparation_unique_declaration_observation(
 		})
 
 
-private enum AcceptedTypecheckImportScope:
+private fixed union AcceptedTypecheckImportScope:
 	CanonicalTypecheckImports
 	CtfeArtifactTypecheckImports
 
@@ -11369,7 +11358,7 @@ private pure func materialize_program_from_complete_body_table(
 	complete_table: CompleteBodyOutcomeTable,
 ) -> TypecheckProgramResult:
 	main_policy = from_opaque CompleteBodyOutcomeTable(complete_table).main_policy
-	typecheck_materialize_standalone_program_bodies_with_import_modules(
+	result = typecheck_materialize_standalone_program_bodies_with_import_modules(
 		base.state,
 		bound_module_program(base.representation.bound_module),
 		base.import_modules,
@@ -11380,6 +11369,26 @@ private pure func materialize_program_from_complete_body_table(
 		),
 		main_policy,
 	)
+	accepted_program_with_native_managed_authority(base, result)
+
+
+private pure func accepted_program_with_native_managed_authority(
+	base: AcceptedBodyModuleBase,
+	result: TypecheckProgramResult,
+) -> TypecheckProgramResult:
+	if not result.state.errors.is_empty():
+		result
+	else:
+		callables = implementation_header_graph_callable_headers(base.representation.graph_facts.implementation_headers)
+		headers = trait_topology_graph_type_headers(callable_header_graph_trait_topology(callables))
+		match native_managed_authority_from_headers(
+			headers,
+			prepared_module_scope_id(bound_module_scope(base.representation.bound_module)),
+		):
+			Ok(authority):
+				{ result | program = { result.program | native_managed_authority = authority } }
+			Err(message):
+				{ result | state = typecheck_state_add_error(result.state, "internal typecheck error: " + message) }
 
 
 private pure func rejected_body_table_result(
@@ -11727,7 +11736,7 @@ private func typecheck_program_with_accepted_type_headers_and_trace(
 
 	trace(BodiesComplete, TYPECHECK_TRACE_UNINDEXED)
 
-	result
+	accepted_program_with_native_managed_authority(body_base, result)
 
 
 func typecheck_program_with_type_header_module_and_trace_for_policy(

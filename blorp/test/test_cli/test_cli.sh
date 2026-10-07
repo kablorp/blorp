@@ -2556,7 +2556,7 @@ union OptionLike[T]:
     SomeLike(T)
     NoneLike
 
-enum Color:
+fixed union Color:
     Red
     Green
 

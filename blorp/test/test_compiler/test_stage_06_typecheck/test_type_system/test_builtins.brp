@@ -23,6 +23,15 @@ import:
 			TensorCheckedSetInference,
 		),
 		builtin_has_effect,
+		builtin_implementation_facts,
+		builtin_implementation_fact_trait,
+		builtin_implementation_fact_receiver,
+		builtin_trait_evidence_registry,
+		builtin_trait_evidence_satisfies,
+		builtin_trait_evidence_members,
+		builtin_trait_evidence_member_declaring_trait,
+		builtin_trait_evidence_member_ordinal,
+		builtin_trait_evidence_member_signature,
 		builtin_is_cancellation_point,
 		builtin_is_elementwise_tensor_function,
 		builtin_is_impure,
@@ -59,6 +68,8 @@ import:
 		env_resolve_trait_obligation,
 		overload_type_param_names,
 		trait_obligation,
+	../../../../src/compiler/stage_06_typecheck/type_system/trait_identity:
+		TRAIT_ID_EQUATABLE, TRAIT_ID_ORDERABLE, builtin_trait_id_at_registry_index, trait_ids_equal
 	../../../../src/compiler/stage_06_typecheck/type_system/generic_params: bound_type_param_name
 	../../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
 		SemanticType(
@@ -594,6 +605,164 @@ func test_special_inference_is_keyed_by_source_name_id_not_spelling() -> Bool:
 	)
 
 
+func test_builtin_implementation_facts_preserve_installation_order() -> Bool:
+	env = env_with_builtins(ENV_EMPTY)
+	facts = builtin_implementation_facts()
+	installed = env.impls.filter(func(item): item.is_builtin)
+	-- Independent snapshot of the original installer, including duplicate
+	-- receiver rows for distinct traits. Production has only one inventory.
+	expected = [
+		"Integer:Int", "SignedInteger:Int",
+		"Integer:Int8", "SignedInteger:Int8", "Integer:Int16", "SignedInteger:Int16",
+		"Integer:Int32", "SignedInteger:Int32", "Integer:Int128", "SignedInteger:Int128",
+		"Integer:UInt8", "UnsignedInteger:UInt8", "Integer:UInt16", "UnsignedInteger:UInt16",
+		"Integer:UInt32", "UnsignedInteger:UInt32", "Integer:UInt64", "UnsignedInteger:UInt64",
+		"Integer:UInt128", "UnsignedInteger:UInt128",
+		"FloatingPoint:Float", "FloatingPoint:Float32", "FloatingPoint:Float16", "FixedPointNumber:FixedPoint",
+		"Stringable:String", "Addable:String", "Equatable:String", "Equatable:Bool",
+		"Hashable:Int", "Hashable:Int8", "Hashable:Int16", "Hashable:Int32", "Hashable:Int64",
+		"Hashable:UInt8", "Hashable:UInt16", "Hashable:UInt32", "Hashable:UInt64",
+		"Hashable:Float", "Hashable:Float32", "Hashable:Float16", "Hashable:Bool",
+		"Hashable:Char", "Hashable:String",
+		"Orderable:String", "Orderable:Int", "Orderable:Float", "Orderable:Char",
+	]
+	-- The installer has 47 rows: integer families, floats, FixedPoint, String/Bool,
+	-- primitive hashes and the four explicit Orderable implementations.
+	var valid = facts.length() == expected.length() and installed.length() == facts.length()
+	for indexed in facts.enumerate():
+		match installed.get(indexed[0]):
+			Some(item):
+				row = match item.for_type:
+					SemanticNamedType(name, []):
+						env_get_trait_by_id(env, item.trait_id).map(func(held): held.name + ":" + name)
+					_:
+						None
+				valid = (valid and trait_ids_equal(item.trait_id, builtin_implementation_fact_trait(indexed[1]))
+					and types_equal(item.for_type, builtin_implementation_fact_receiver(indexed[1]))
+					and item.bounds.is_empty() and item.methods.is_empty()
+					and row == expected.get(indexed[0]))
+			None:
+				valid = False
+	valid
+
+
+private func builtin_evidence_registry_preserves_declaring_members() -> Result[Bool, String]:
+	registry ?= builtin_trait_evidence_registry()
+	members ?= builtin_trait_evidence_members(registry, TRAIT_ID_ORDERABLE)
+	var inherited_equality: Bool = False
+	for member in members:
+		if builtin_trait_evidence_member_signature(member).name == "equals":
+			inherited_equality = (trait_ids_equal(builtin_trait_evidence_member_declaring_trait(member), TRAIT_ID_EQUATABLE)
+				and builtin_trait_evidence_member_ordinal(member) == 0)
+	Ok(inherited_equality and match builtin_trait_evidence_members(registry, builtin_trait_id_at_registry_index(99)):
+		Err(message): message == "compiler trait evidence identity is not registered"
+		Ok(_): False
+	)
+
+
+func test_builtin_evidence_registry_preserves_declaring_members() -> Bool:
+	builtin_evidence_registry_preserves_declaring_members().get_or(False)
+
+
+private record BuiltinEvidenceExpectation {
+	name: String,
+	own_methods: List[String],
+	parents: List[Int]
+}
+
+
+-- Independent installed-registry snapshot. Parent positions refer to this
+-- golden order; own ordinals are never flattened inherited-list positions.
+private pure func builtin_evidence_expectations() -> List[BuiltinEvidenceExpectation]:
+	[
+		{name = "Stringable", own_methods = ["to_string"], parents = []},
+		{name = "Equatable", own_methods = ["equals"], parents = []},
+		{name = "Orderable", own_methods = ["less_than"], parents = [1]},
+		{name = "HasLength", own_methods = ["length"], parents = []},
+		{name = "Integer", own_methods = ["checked_div", "checked_mod", "bit_and", "bit_or", "bit_xor", "bit_not", "shift_left", "shift_right"], parents = [6, 7, 8, 9, 10, 2, 12, 13, 0, 14, 15, 19]},
+		{name = "FloatingPoint", own_methods = ["floor", "ceil", "round", "trunc", "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "exp", "exp2", "expm1", "log", "log2", "log10", "log1p", "pow", "cbrt", "hypot", "fmod", "copysign", "fma", "is_nan", "is_inf", "is_finite"], parents = [6, 7, 8, 9, 10, 11, 2, 12, 13, 0, 14, 15, 20]},
+		{name = "Addable", own_methods = ["add"], parents = []},
+		{name = "Subtractable", own_methods = ["subtract"], parents = []},
+		{name = "Multipliable", own_methods = ["multiply"], parents = []},
+		{name = "Divisible", own_methods = ["divide"], parents = []},
+		{name = "Modulable", own_methods = ["remainder"], parents = []},
+		{name = "Negatable", own_methods = ["negate"], parents = []},
+		{name = "HasZero", own_methods = ["zero"], parents = []},
+		{name = "HasOne", own_methods = ["one"], parents = []},
+		{name = "Absolute", own_methods = ["abs"], parents = []},
+		{name = "Bounded", own_methods = ["min", "max"], parents = []},
+		{name = "Hashable", own_methods = ["hash"], parents = [1]},
+		{name = "ToBool", own_methods = ["to_bool"], parents = []},
+		{name = "Logical", own_methods = ["logical_and", "logical_or", "logical_not"], parents = []},
+		{name = "ToInt", own_methods = ["to_int"], parents = []},
+		{name = "ToFloat", own_methods = ["to_float"], parents = []},
+		{name = "ToFixedPoint", own_methods = ["to_fixed_point"], parents = []},
+		{name = "ToChar", own_methods = ["to_char"], parents = []},
+		{name = "SignedInteger", own_methods = [], parents = [4, 11]},
+		{name = "UnsignedInteger", own_methods = [], parents = [4]},
+		{name = "Numeric", own_methods = [], parents = [6, 8, 12]},
+		{name = "FixedPointNumber", own_methods = ["get_scale", "round_to"], parents = [6, 7, 8, 9, 2, 12, 0, 14, 15]},
+		{name = "Copyable", own_methods = ["copy"], parents = []},
+		{name = "Cloneable", own_methods = ["clone"], parents = []},
+	]
+
+
+private pure func expected_builtin_evidence_traits(rows: List[BuiltinEvidenceExpectation], index: Int) -> List[Int]:
+	var result = [index]
+	match rows.get(index):
+		Some(row):
+			for parent in row.parents:
+				for inherited in expected_builtin_evidence_traits(rows, parent):
+					if not result.contains(inherited):
+						result = result.append(inherited)
+		None: void
+	result
+
+
+private pure func expected_builtin_evidence_members(rows: List[BuiltinEvidenceExpectation], index: Int) -> List[(Int, Int, String)]:
+	var result: List[(Int, Int, String)] = []
+	match rows.get(index):
+		Some(row):
+			for method in row.own_methods.enumerate():
+				result = result.append((index, method[0], method[1]))
+			for parent in row.parents:
+				for inherited in expected_builtin_evidence_members(rows, parent):
+					if not result.contains(inherited):
+						result = result.append(inherited)
+		None: void
+	result
+
+
+func test_prepared_registry_matches_independent_all_row_snapshot() -> Bool:
+	rows = builtin_evidence_expectations()
+	registry_result = builtin_trait_evidence_registry()
+	var valid = rows.map(func(row): row.name) == BUILTIN_TRAIT_NAMES
+	match registry_result:
+		Err(_): valid = False
+		Ok(registry):
+			for indexed in rows.enumerate():
+				id = builtin_trait_id_at_registry_index(indexed[0])
+				expected_members = expected_builtin_evidence_members(rows, indexed[0])
+				match builtin_trait_evidence_members(registry, id):
+					Err(_): valid = False
+					Ok(members):
+						valid = valid and members.length() == expected_members.length()
+						for actual in members.enumerate():
+							match expected_members.get(actual[0]):
+								None: valid = False
+								Some(expected):
+									valid = (valid
+										and trait_ids_equal(builtin_trait_evidence_member_declaring_trait(actual[1]), builtin_trait_id_at_registry_index(expected[0]))
+										and builtin_trait_evidence_member_ordinal(actual[1]) == expected[1]
+										and builtin_trait_evidence_member_signature(actual[1]).name == expected[2])
+				expected_traits = expected_builtin_evidence_traits(rows, indexed[0])
+				for requested in rows.enumerate():
+					match builtin_trait_evidence_satisfies(registry, id, builtin_trait_id_at_registry_index(requested[0])):
+						Err(_): valid = False
+						Ok(satisfied): valid = valid and satisfied == expected_traits.contains(requested[0])
+	valid
+
+
 tests: TestSuite = {
 	description = "Compiler builtins substrate",
 	tests = [
@@ -618,6 +787,9 @@ tests: TestSuite = {
 			test_prelude_traits_module_identity_is_explicit,
 		),
 		("with builtins populates core env", test_with_builtins_populates_core_env),
+		("builtin implementation facts preserve installation order", test_builtin_implementation_facts_preserve_installation_order),
+		("builtin evidence registry preserves declaring members", test_builtin_evidence_registry_preserves_declaring_members),
+		("prepared registry matches independent all row snapshot", test_prepared_registry_matches_independent_all_row_snapshot),
 		(
 			"with builtins preserves existing trait functions",
 			test_with_builtins_preserves_existing_trait_functions,

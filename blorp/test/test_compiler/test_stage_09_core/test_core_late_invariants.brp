@@ -2,12 +2,15 @@ import:
 	../../../src/compiler/stage_02_lex/name_table: synthesized_name_id
 	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
 	../../../src/compiler/stage_09_core/ir:
+		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
+		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
 		CoreCallKind(IntrinsicCall, SelectedDirectCall, UserCall),
 		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopCopyItem),
 		CoreConcurrentlyLoopOutput(ConcurrentlyLoopDiscard),
 		CoreConstructorMatchFallback(ConstructorMatchFallbackFail),
 		CoreDeclaredOrigin(ProjectedImplMethod),
-		CoreDecl(FunctionDecl, ImplDecl),
+		CoreDecl(FunctionDecl, ImplDecl, UnionDecl),
 		CoreFunction,
 		CoreFunctionOrigin(Declared),
 		CoreImplMethodRole(RuntimeCallbackMethod),
@@ -23,6 +26,14 @@ import:
 			DetachExpr,
 			DictExpr,
 			DropExpr,
+			ForChannelExpr,
+			ForListExpr,
+			ForStringExpr,
+			ForDictExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForResourceSourceExpr,
+			ForTensorExpr,
 			LambdaExpr,
 			LiteralExpr,
 			PreClosureConcurrentExpr,
@@ -48,19 +59,24 @@ import:
 		CoreFunctionKind(UserFunction),
 		CoreImplDecl,
 		CoreLiteral(IntLiteral),
+		CoreLoopBinder,
+		CoreLoopRangeDirection(RangeForwardOnly),
+		CoreListStorageLayout(PointerListStorage),
 		CoreProgram,
-		CoreReleasePolicy(ArcReleasePolicy),
+		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
 		CoreResourceExit(ResourceBreakExit),
 		CoreSelectArmKind(SelectAfterArm),
 		CoreSemanticMatchTree(SemanticMatchLeaf),
 		CoreSourceLoc,
 		synthetic_core_source_loc,
 		CoreTensorRawScalarKind(TensorFloat64Elements, TensorInt64Elements),
+		CoreTensorForElementStorage(TensorForRawScalarElement),
 		CoreType(FunctionType, NamedType, StackResultType, TensorType, UnionType, VoidType),
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
 	../../../src/compiler/stage_09_core/late_invariants:
 		CoreLateInvariantViolation(
+			UnionStorageViolation,
 			CooperativeCheckpointMisplaced,
 			ConcurrentContractViolation,
 			DebugBlockSurvived,
@@ -164,7 +180,7 @@ pure func releasing_match_program(scrutinee: CoreExpr) -> CoreProgram:
 
 
 pure func test_releasing_match_requires_named_scrutinee_at_dce() -> Bool:
-	union_type: CoreType = UnionType("Choice")
+	union_type: CoreType = UnionType("Choice", ManagedUnionValue)
 	invalid: CoreProgram = releasing_match_program(
 		CallExpr(
 			IntrinsicCall("make_choice"),
@@ -710,7 +726,7 @@ pure func test_final_boundary_rejects_nonpositive_concurrency_limit() -> Bool:
 
 
 pure func test_final_boundary_accepts_valid_concurrent_block() -> Bool:
-	concurrency_error_type: CoreType = UnionType("ConcurrencyError")
+	concurrency_error_type: CoreType = UnionType("ConcurrencyError", ManagedUnionValue)
 	concurrent_expr: CoreExpr = ConcurrentExpr(
 		{
 			bindings = [
@@ -835,6 +851,85 @@ pure func test_final_boundary_accepts_loop_entry_cooperative_checkpoint() -> Boo
 	)
 
 	check_late_core_invariants(FinalStage, program_with_body(loop)).is_empty()
+
+
+private pure func checkpoint_loop_variants(iterable: CoreExpr, body: CoreExpr) -> List[CoreExpr]:
+	binder: CoreLoopBinder = {
+		variable = variable("item"), typ = int_type(), range_direction = RangeForwardOnly
+	}
+	loc = synthetic_core_source_loc()
+	[
+		ForChannelExpr({binder = binder, iterable = iterable, body = body}, VoidType, loc),
+		ForListExpr({
+			binder = binder, layout = PointerListStorage, iterable = iterable,
+			iterable_release_policy = NoReleasePolicy, body = body
+		}, VoidType, loc),
+		ForStringExpr({
+			binder = binder, iterable = iterable, iterable_release_policy = NoReleasePolicy, body = body
+		}, VoidType, loc),
+		ForDictExpr({
+			binder = binder, iterable = iterable, iterable_release_policy = NoReleasePolicy, body = body
+		}, VoidType, loc),
+		ForSetExpr({
+			binder = binder, iterable = iterable, iterable_release_policy = NoReleasePolicy, body = body
+		}, VoidType, loc),
+		ForStreamExpr({
+			binder = binder, iterable = iterable, iterable_release_policy = NoReleasePolicy, body = body
+		}, VoidType, loc),
+		ForResourceSourceExpr({
+			binder = binder, iterable = iterable, iterable_release_policy = NoReleasePolicy, body = body
+		}, VoidType, loc),
+		ForTensorExpr({
+			binder = binder, element_storage = TensorForRawScalarElement(TensorInt64Elements),
+			iterable = iterable, iterable_release_policy = NoReleasePolicy, body = body
+		}, VoidType, loc),
+	]
+
+
+private pure func misplaced_checkpoint_count(expr: CoreExpr) -> Int:
+	check_late_core_invariants(FinalStage, program_with_body(expr)).filter(func(violation):
+		match violation:
+			CooperativeCheckpointMisplaced(_): True
+			_: False
+	).length()
+
+
+pure func test_all_iterable_loop_layouts_distinguish_checkpoint_body_from_iterable() -> Bool:
+	checkpoint = CooperativeCheckpointExpr(VoidType, synthetic_core_source_loc())
+	body_checkpoint_loops = checkpoint_loop_variants(literal(1), checkpoint)
+	iterable_checkpoint_loops = checkpoint_loop_variants(checkpoint, literal(0))
+	(
+		body_checkpoint_loops.length() == 8
+		and iterable_checkpoint_loops.length() == 8
+		and body_checkpoint_loops.all(func(loop): misplaced_checkpoint_count(loop) == 0)
+		and iterable_checkpoint_loops.all(func(loop): misplaced_checkpoint_count(loop) == 1)
+	)
+
+
+private pure func scope_nonlocal_exit_count(loop: CoreExpr) -> Int:
+	check_late_core_invariants(
+		FinalStage, program_with_body(resource_scope_with_body(loop)),
+	).filter(func(violation):
+		match violation:
+			ResourceContractViolation(detail, _):
+				detail == "scope body contains nonlocal control flow before cleanup rewriting"
+			_: False
+	).length()
+
+
+pure func test_all_iterable_loop_layouts_reject_resource_exit_in_iterable() -> Bool:
+	loops = checkpoint_loop_variants(
+		BreakExpr(VoidType, synthetic_core_source_loc()),
+		VoidExpr(VoidType, synthetic_core_source_loc()),
+	)
+	loops.length() == 8 and loops.all(func(loop): scope_nonlocal_exit_count(loop) == 1)
+
+
+pure func test_all_iterable_loop_layouts_allow_loop_local_resource_body_exit() -> Bool:
+	loops = checkpoint_loop_variants(
+		literal(1), BreakExpr(VoidType, synthetic_core_source_loc()),
+	)
+	loops.length() == 8 and loops.all(func(loop): scope_nonlocal_exit_count(loop) == 0)
 
 
 pure func test_final_boundary_accepts_concurrent_loop_entry_checkpoint() -> Bool:
@@ -1119,9 +1214,49 @@ pure func test_perceus_boundary_rejects_forms_outside_the_pass_window() -> Bool:
 	)
 
 
+
+pure func test_union_storage_invariant_rejects_payload_on_scalar() -> Bool:
+	base: CoreProgram = program_with_body(literal(0))
+	invalid: CoreProgram = { base | decls = base.decls.append(UnionDecl({
+		abi_type = None,
+		name = "Color",
+		type_params = [],
+		storage = ScalarTagStorage,
+		variants = [{
+			name = "Red", tag = 0, def_id = Some(101),
+			fields = [{ typ = int_type(), release_policy = NoReleasePolicy }]
+		}],
+		loc = synthetic_core_source_loc()
+	})) }
+	match check_late_core_invariants(DceStage, invalid):
+		[UnionStorageViolation(reason)]:
+			reason == "union `Color`: scalar union storage requires payload-free variants"
+		_:
+			False
+
+
+pure func test_union_storage_invariant_checks_declared_type_identity() -> Bool:
+	base: CoreProgram = program_with_body(
+		VarExpr(variable("color"), UnionType("Color", ScalarTagValue), synthetic_core_source_loc()),
+	)
+	invalid: CoreProgram = { base | decls = base.decls.append(UnionDecl({
+		abi_type = None, name = "Color", type_params = [],
+		storage = ManagedPayloadStorage(TypedUnionPayloadStorage),
+		variants = [{ name = "Red", tag = 0, def_id = Some(101), fields = [] }],
+		loc = synthetic_core_source_loc()
+	})) }
+	match check_late_core_invariants(DceStage, invalid):
+		[UnionStorageViolation(reason)]:
+			reason == "union type storage disagrees with declaration `Color`"
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp late Core invariants",
 	tests = [
+		("Union storage rejects payload on scalar", test_union_storage_invariant_rejects_payload_on_scalar),
+		("Union storage agrees with declared type identity", test_union_storage_invariant_checks_declared_type_identity),
 		(
 			"Perceus boundary rejects forms outside the pass window",
 			test_perceus_boundary_rejects_forms_outside_the_pass_window,
@@ -1238,6 +1373,9 @@ tests: TestSuite = {
 			"final boundary accepts loop-entry cooperative checkpoint",
 			test_final_boundary_accepts_loop_entry_cooperative_checkpoint,
 		),
+		("all iterable loop layouts distinguish checkpoint body from iterable", test_all_iterable_loop_layouts_distinguish_checkpoint_body_from_iterable),
+		("all iterable loop layouts reject resource exit in iterable", test_all_iterable_loop_layouts_reject_resource_exit_in_iterable),
+		("all iterable loop layouts allow loop local resource body exit", test_all_iterable_loop_layouts_allow_loop_local_resource_body_exit),
 		(
 			"final boundary accepts concurrent loop-entry cooperative checkpoint",
 			test_final_boundary_accepts_concurrent_loop_entry_checkpoint,

@@ -9,12 +9,15 @@ import:
 	builtin_registry: core_builtin_name
 	desugar: desugar_core_string_binary
 	ir:
+		core_native_managed_canonical_name,
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
+		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
 		CoreBinaryOp(EqualOp, NotEqualOp),
 		CoreBinderOrigin(AuthoredBinder),
 		CoreCallKind(
 			BuiltinCall, DeferredTraitCall, SelectedDirectCall, SelectedTraitCall, UnknownCall,
 		),
-		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ImplDecl, TraitDecl),
+		CoreDecl(UnionDecl, FunctionDecl, GlobalDecl, ImplDecl, TraitDecl),
 		CoreDimOp(DimAdd, DimDivide, DimMultiply, DimSubtract),
 		CoreExpr(BinaryExpr, CallExpr, LogicalExpr, ResourceScopeExpr, SeqExpr, UnaryExpr, VarExpr),
 		CoreFunction,
@@ -24,11 +27,7 @@ import:
 		CoreSourceLoc,
 		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
 		CoreTraitDecl,
-		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType, RangeType, SelfType,
-			StackResultType, TensorType, TupleType, TypeParameterType, UnionType,
-			VoidType,
-		),
+		CoreType(InlineRecordType, NativeManagedType, BoxedResultType, UnionType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType, VoidType),
 		CoreUnaryOp,
 		CoreVar,
 		core_expr_type,
@@ -156,7 +155,7 @@ private record CoreTraitResolveRegistry {
 	generic_builtin_targets: List[CoreGenericBuiltinTarget],
 	types_by_method: Dict[String, List[String]],
 	static_self_methods: Dict[String, Bool],
-	enum_type_names: Dict[String, Bool]
+	structural_type_names: Dict[String, Bool]
 }
 
 
@@ -308,6 +307,8 @@ Fully concrete arguments are retained so parameterized impls cannot collide.
 ---
 pure func core_trait_impl_type_key(typ: CoreType) -> Option[String]:
 	match typ:
+		NativeManagedType(identity):
+			Some(core_native_managed_canonical_name(identity))
 		NamedType(name, args):
 			if args.is_empty():
 				Some(name)
@@ -325,7 +326,7 @@ pure func core_trait_impl_type_key(typ: CoreType) -> Option[String]:
 					.concat(keys)
 					.join("_"),
 			)
-		EnumType(name) | HeapRecordType(name) | InlineRecordType(name) | UnionType(name):
+		UnionType(name, _) | HeapRecordType(name) | InlineRecordType(name):
 			Some(name)
 		RangeType:
 			None
@@ -544,7 +545,7 @@ private pure func collect_registry(program: CoreProgram) -> CoreTraitResolveRegi
 		generic_builtin_targets = [],
 		types_by_method = {},
 		static_self_methods = {},
-		enum_type_names = {}
+		structural_type_names = {}
 	}
 
 	for decl in program.decls:
@@ -553,8 +554,17 @@ private pure func collect_registry(program: CoreProgram) -> CoreTraitResolveRegi
 				collect_impl(registry, implementation)
 			TraitDecl(trait_info):
 				collect_trait(registry, trait_info)
-			EnumDecl(enum_info):
-				{ registry | enum_type_names = registry.enum_type_names.set(enum_info.name, True) }
+			UnionDecl(union_info):
+				match union_info.storage:
+					ScalarTagStorage:
+						{ registry |
+							structural_type_names = registry.structural_type_names.set(
+								union_info.name,
+								True,
+							)
+						}
+					ManagedPayloadStorage(_):
+						registry
 			_:
 				registry
 
@@ -588,7 +598,7 @@ private pure func is_native_tensor_element_type(typ: CoreType) -> Bool:
 
 ---
 Types whose equality the compiler provides without an impl, each lowered to
-value equality for its representation: enum tags and `..#N` indices compare
+value equality for its representation: scalar union tags and `..#N` indices compare
 as integers, numeric tensors element by element through `blorp_vector_eq`,
 String and Set through their runtime equality, and a raw `Ptr`, whose value is
 the address, natively. Every other type, tuples, records and unions included,
@@ -596,11 +606,11 @@ compares only through its Equatable impl: a native operator on a box would
 compare addresses.
 ---
 private pure func has_native_structural_equality(
-	enum_type_names: Dict[String, Bool],
+	structural_type_names: Dict[String, Bool],
 	typ: CoreType,
 ) -> Bool:
 	match typ:
-		EnumType(_) | RangeType:
+		UnionType(_, ScalarTagValue) | RangeType:
 			True
 		TensorType(info):
 			is_native_tensor_element_type(info.element_type)
@@ -608,7 +618,7 @@ private pure func has_native_structural_equality(
 			True
 		NamedType(name, _):
 			(
-				enum_type_names.get_or(name, False)
+				structural_type_names.get_or(name, False)
 				or CoreTypePolicy.core_named_type_has_structural_equality(name)
 			)
 		_:
@@ -622,7 +632,7 @@ private pure func native_structural_equality_target(
 ) -> Option[CoreTraitImplTargetKind]:
 	if (
 		identity.trait_name != "Equatable"
-		or not has_native_structural_equality(registry.enum_type_names, typ)
+		or not has_native_structural_equality(registry.structural_type_names, typ)
 	):
 		None
 	else:

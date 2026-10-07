@@ -3,7 +3,6 @@ set -euo pipefail
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../../../.." && pwd)
 runner="$repo_root/benchmarks/compiler_record_layout"
-enum_layout_runner="$repo_root/benchmarks/compiler_enum_field_layout"
 stage_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-record-layout-test.XXXXXX")
 trap 'rm -rf "$stage_dir"' EXIT
 
@@ -12,7 +11,6 @@ fake_source="$stage_dir/fake_source.brp"
 fake_support_header="$stage_dir/fake_support_header.h"
 fake_support_source="$stage_dir/fake_support_source.c"
 missing_expectation_source="$stage_dir/missing_expectation.brp"
-unparsable_enum_record="$stage_dir/unparsable_enum_record.c"
 
 cat > "$fake_compiler" <<'EOF'
 #!/usr/bin/env bash
@@ -152,11 +150,6 @@ printf '%s\n' 'int fake_support_source;' > "$fake_support_source"
 printf '%s\n' \
 	'-- EXPECT-C: typedef struct MissingLayoutExpectation {' \
 	> "$missing_expectation_source"
-cat > "$unparsable_enum_record" <<'C'
-typedef struct blorp_src_compiler_stage_02_lex_token__Trivia {
-	unsigned char other;
-} blorp_src_compiler_stage_02_lex_token__Trivia;
-C
 
 output=$(
 	BLORP_RECORD_LAYOUT_SKIP_BUILD=1 \
@@ -238,24 +231,6 @@ for corruption in missing duplicate malformed duplicate_key unknown_field; do
 		exit 1
 	fi
 done
-
-if "$enum_layout_runner" \
-	--generated-c "$unparsable_enum_record" \
-	>"$stage_dir/unparsable-enum.out" \
-	2>"$stage_dir/unparsable-enum.err"
-then
-	echo "FAIL: enum layout probe must reject a present record with a missing field" >&2
-	exit 1
-fi
-
-if ! grep -Fq \
-	'generated record blorp_src_compiler_stage_02_lex_token__Trivia is missing field kind' \
-	"$stage_dir/unparsable-enum.err"
-then
-	echo "FAIL: enum layout probe missing-field error is incomplete" >&2
-	cat "$stage_dir/unparsable-enum.err" >&2
-	exit 1
-fi
 
 if ! "$runner" --help | grep -Fq 'Usage: benchmarks/compiler_record_layout'; then
 	echo "FAIL: record layout probe help is missing" >&2

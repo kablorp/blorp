@@ -6,7 +6,7 @@
 -- type, which is a boxed copy for value structs, stack options, and stack
 -- results, so the impl cannot be the callback itself. Before backend
 -- projection, `mint_hash_key_callbacks` adds one adapter per impl method of a
--- trait-hashed key type (origin `HashKeySlotAdapter(impl_def)`): it takes the
+-- trait-hashed key type (origin `HashKeySlotAdapter(impl_def, role)`): it takes the
 -- slot as `Ptr`, unboxes it with the key's boxed-storage layout, and calls the
 -- impl. Backend projection then binds every trait-hashed constructor with
 -- `bound_hash_container_constructor`, and every constructor runtime projection
@@ -15,6 +15,7 @@
 -- container uses.
 import:
 	ir:
+		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
 		CoreBinaryOp(EqualOp),
 		CoreCallKind(UserCall),
 		CoreDecl(FunctionDecl),
@@ -23,6 +24,7 @@ import:
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
 		CoreFunctionOrigin(Declared),
+		CoreHashKeySlotRole(HashSlotCallback, EqualitySlotCallback),
 		CoreHashContainerConstructor(
 			CustomHashContainerConstructor, ImplHashContainerConstructor,
 			TraitHashContainerConstructor,
@@ -32,7 +34,7 @@ import:
 		CoreProgram,
 		CoreRuntimeCallbackRole(EquatableEqualsCallback, HashableHashCallback),
 		CoreSourceLoc,
-		CoreType(EnumType, FunctionType, NamedType),
+		CoreType(UnionType, FunctionType, NamedType),
 		CoreUnboxKind(
 			Float16Unbox, Float32Unbox, FloatUnbox, Int128Unbox, PointerUnbox, PrimUnbox,
 			StructUnbox, UInt128Unbox,
@@ -73,6 +75,8 @@ private KEY_PARAM_NAME: String = "key_slot"
 private LEFT_PARAM_NAME: String = "left_slot"
 
 private RIGHT_PARAM_NAME: String = "right_slot"
+
+
 
 
 --- The program with adapters appended and the definition-id frontier after them.
@@ -128,7 +132,7 @@ pure func build_hash_key_adapter_table(
 		match decl:
 			FunctionDecl(function_info):
 				match core_function_declared_origin(function_info.origin):
-					HashKeySlotAdapter(impl_def):
+					HashKeySlotAdapter(impl_def, _):
 						match (
 							functions
 								.get(impl_def)
@@ -203,6 +207,7 @@ private pure func adapter_function(
 	key_type: CoreType,
 	name: String,
 	param_names: List[String],
+	role: CoreHashKeySlotRole,
 	def_id: Int,
 ) -> CoreFunction:
 	loc: CoreSourceLoc = synthetic_core_source_loc()
@@ -228,14 +233,19 @@ private pure func adapter_function(
 		),
 		is_pure = impl.is_pure,
 		function_kind = UserFunction,
-		origin = Declared(HashKeySlotAdapter(impl.def_id)),
+		origin = Declared(HashKeySlotAdapter(impl.def_id, role)),
 		def_id = def_id,
 		loc = loc
 	}
 
 
--- Minted after trait resolution: EqualOp here compares physical scalar tags,
--- not trait dispatch. The origin shares the authored callback type identity.
+---
+Hash-only scalar unions retain native tag equality. Minting runs after trait
+resolution: this comparison is a physical tag operation, not another trait
+dispatch that could recursively call this callback. Its explicit origin is
+registered under the same type key as authored callbacks, then the ordinary
+slot-adapter path handles both identically.
+---
 private pure func native_tag_equality_callback(key_type: CoreType, def_id: Int) -> CoreFunction:
 	loc: CoreSourceLoc = synthetic_core_source_loc()
 	left: CoreVar = core_var(LEFT_PARAM_NAME)
@@ -246,43 +256,33 @@ private pure func native_tag_equality_callback(key_type: CoreType, def_id: Int) 
 		module = NoSourceModule,
 		type_params = [],
 		params = [
-			{ name = left, typ = key_type, loc = loc },
-			{ name = right, typ = key_type, loc = loc },
+			{
+				name = left,
+				typ = key_type,
+				loc = loc
+			},
+			{
+				name = right,
+				typ = key_type,
+				loc = loc
+			},
 		],
 		return_type = BOOL_TYPE,
-		body = Some(BinaryExpr(EqualOp, VarExpr(left, key_type, loc), VarExpr(right, key_type, loc), BOOL_TYPE, loc)),
+		body = Some(
+			BinaryExpr(
+				EqualOp,
+				VarExpr(left, key_type, loc),
+				VarExpr(right, key_type, loc),
+				BOOL_TYPE,
+				loc,
+			),
+		),
 		is_pure = True,
 		function_kind = UserFunction,
 		origin = Declared(NativeTagEqualityCallback(key_type)),
 		def_id = def_id,
 		loc = loc
 	}
-
-
-private pure func native_tag_equality_type(
-	layout: CoreSpecializeLayout,
-	callbacks: CoreRuntimeCallbackTable,
-	type_key: String,
-	hash_impl: CoreFunction,
-) -> Option[CoreType]:
-	match hash_impl.params:
-		[key_param]:
-			key_type: CoreType = resolve_specialize_type(layout, key_param.typ)
-			match key_type:
-				EnumType(_):
-					-- Exact key agreement excludes an opaque alias erased to a tag.
-					-- The table has one hash callback per key: no second dedupe index.
-					if (
-						core_trait_impl_type_key(key_type) == Some(type_key)
-						and find_runtime_callback(callbacks, EquatableEqualsCallback, key_type).is_none()
-					):
-						Some(key_type)
-					else:
-						None
-				_:
-					None
-		_:
-			None
 
 
 ---
@@ -303,11 +303,44 @@ private pure func impl_targets_erased_type(
 			False
 
 
+private pure func native_tag_equality_type(
+	layout: CoreSpecializeLayout,
+	callbacks: CoreRuntimeCallbackTable,
+	type_key: String,
+	hash_impl: CoreFunction,
+) -> Option[CoreType]:
+	match hash_impl.params:
+		[key_param]:
+			key_type: CoreType = resolve_specialize_type(layout, key_param.typ)
+
+			match key_type:
+				UnionType(_, ScalarTagValue):
+					-- Exact key agreement excludes an opaque alias erased to a tag.
+					-- One hash callback per key makes this a single construction site.
+					if (
+						core_trait_impl_type_key(key_type) == Some(type_key)
+						and find_runtime_callback(
+							callbacks,
+							EquatableEqualsCallback,
+							key_type,
+						).is_none()
+					):
+						Some(key_type)
+					else:
+						None
+				_:
+					None
+		_:
+			None
+
+
 ---
-Appends a slot adapter for the Hashable and Equatable impl methods of every
+Appends a slot adapter for the Hashable and Equatable methods of every
 key type that has both and needs them: a trait-hashed key, or an opaque key
 whose representation the runtime would otherwise hash itself. An impl on a
-runtime-hashed type (words, strings, floats) gets none. Only declarations
+runtime-hashed primitive (words, strings, floats) gets none. Scalar unions
+with authored hash use callbacks, with native equality supplied when absent.
+Only declarations
 are scanned.
 ---
 pure func mint_hash_key_callbacks(program: CoreProgram, next_def_id: Int) -> HashKeyCallbackResult:
@@ -364,6 +397,7 @@ pure func mint_hash_key_callbacks(program: CoreProgram, next_def_id: Int) -> Has
 										key_type,
 										HASH_KEY_HASH_ADAPTER_NAME,
 										[KEY_PARAM_NAME],
+										HashSlotCallback,
 										next_id,
 									),
 								),
@@ -374,6 +408,7 @@ pure func mint_hash_key_callbacks(program: CoreProgram, next_def_id: Int) -> Has
 										key_type,
 										HASH_KEY_EQUALS_ADAPTER_NAME,
 										[LEFT_PARAM_NAME, RIGHT_PARAM_NAME],
+										EqualitySlotCallback,
 										next_id + 1,
 									),
 								),

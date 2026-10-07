@@ -11,10 +11,11 @@ import:
 		CoreBoxKind(StructBox),
 		CoreBoxedStorageValue,
 		CoreDecl(
-			EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, InlineRecordDecl, TypeAliasDecl,
-			UnionDecl,
+			InlineRecordDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, TypeAliasDecl, UnionDecl,
 		),
-		CoreEnumDecl,
+		CoreUnionDecl,
+		CoreUnionStorage(ScalarTagStorage),
+		CoreUnionValueStorage(ManagedUnionValue, ScalarTagValue),
 		CoreExpr(ForListExpr, ListAllocExpr, ListConstructExpr, ListHandoffExpr),
 		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
 		CoreProgram,
@@ -25,12 +26,13 @@ import:
 			TensorRuntimeReadF16, TensorRuntimeReadF32, TensorRuntimeReadF64, TensorRuntimeReadI64,
 		),
 		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType, RangeType, SelfType,
+			InlineRecordType, BoxedResultType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType,
 			StackResultType, TensorType, TupleType, TypeParameterType, UnionType,
 			VoidType,
 		),
 		CoreTypeAliasDecl,
 		core_expr_type,
+		core_union_storage_value,
 	../stage_09_core/traverse: map_core_expr_children
 
 
@@ -63,21 +65,6 @@ pure func build_layout_type_index(program: CoreProgram) -> CoreLayoutTypeIndex:
 			TypeAliasDecl(alias_decl):
 				if not aliases.contains(alias_decl.name):
 					aliases = aliases.set(alias_decl.name, alias_decl)
-			EnumDecl(enum_decl):
-				if not declared_types.contains(enum_decl.name):
-					physical_type = match enum_decl.abi_type:
-						Some(DeclaredAbiBool): NamedType("Bool", [])
-						_: EnumType(enum_decl.name)
-					declared_types = declared_types.set(enum_decl.name, physical_type)
-
-					match enum_inline_width(enum_decl):
-						Some(width):
-							list_layouts = list_layouts.set(
-								enum_decl.name,
-								InlineListStorage(width),
-							)
-						None:
-							void
 			HeapRecordDecl(record_decl):
 				if not declared_types.contains(record_decl.name):
 					declared_types = declared_types.set(
@@ -92,7 +79,23 @@ pure func build_layout_type_index(program: CoreProgram) -> CoreLayoutTypeIndex:
 					)
 			UnionDecl(union_decl):
 				if not declared_types.contains(union_decl.name):
-					declared_types = declared_types.set(union_decl.name, UnionType(union_decl.name))
+					-- Only trusted standard Bool authority preserves the primitive
+					-- value ABI; a same-named ordinary union still has tag storage.
+					declared_type: CoreType = match (union_decl.abi_type, union_decl.storage):
+						(Some(DeclaredAbiBool), ScalarTagStorage):
+							NamedType("Bool", [])
+						_:
+							UnionType(union_decl.name, core_union_storage_value(union_decl.storage))
+					declared_types = declared_types.set(
+						union_decl.name,
+						declared_type,
+					)
+					if core_union_storage_value(union_decl.storage) == ScalarTagValue:
+						match scalar_tag_union_inline_width(union_decl):
+							Some(width):
+								list_layouts = list_layouts.set(union_decl.name, InlineListStorage(width))
+							None:
+								void
 			_:
 				void
 
@@ -198,7 +201,7 @@ Which aliases a layout resolution expands. Storage questions expand every
 alias to its representation; trait-impl questions keep opaque aliases,
 because an opaque type's impls may disagree with its representation's.
 ---
-enum CoreAliasExpansion:
+fixed union CoreAliasExpansion:
 	ExpandEveryAlias
 	KeepOpaqueAliases
 
@@ -451,24 +454,25 @@ private pure func primitive_inline_width(name: String) -> Option[Int]:
 
 pure func tensor_for_element_storage_for_canonical_type(
 	element_type: CoreType,
+	value_c_type: String,
 ) -> CoreTensorForElementStorage:
 	match element_type:
 		NamedType(name, args):
 			if args.length() != 0:
-				TensorForBoxedElement(TypeLayout.c_type_name(element_type, {}))
+				TensorForBoxedElement(value_c_type)
 			else if name == "Float":
 				TensorForRuntimeReadElement({
-					value_c_type = TypeLayout.c_type_name(element_type, {}),
+					value_c_type = value_c_type,
 					helper = TensorRuntimeReadF64,
 				})
 			else if name == "Float32":
 				TensorForRuntimeReadElement({
-					value_c_type = TypeLayout.c_type_name(element_type, {}),
+					value_c_type = value_c_type,
 					helper = TensorRuntimeReadF32,
 				})
 			else if name == "Float16":
 				TensorForRuntimeReadElement({
-					value_c_type = TypeLayout.c_type_name(element_type, {}),
+					value_c_type = value_c_type,
 					helper = TensorRuntimeReadF16,
 				})
 			else if (
@@ -485,26 +489,26 @@ pure func tensor_for_element_storage_for_canonical_type(
 				or name == "Char"
 			):
 				TensorForRuntimeReadElement({
-					value_c_type = TypeLayout.c_type_name(element_type, {}),
+					value_c_type = value_c_type,
 					helper = TensorRuntimeReadI64,
 				})
 			else:
-				TensorForBoxedElement(TypeLayout.c_type_name(element_type, {}))
-		RangeType | EnumType(_):
+				TensorForBoxedElement(value_c_type)
+		RangeType | UnionType(_, ScalarTagValue):
 			TensorForRuntimeReadElement({
-				value_c_type = TypeLayout.c_type_name(element_type, {}),
+				value_c_type = value_c_type,
 				helper = TensorRuntimeReadI64,
 			})
 		InlineRecordType(name):
 			TensorForInlineStructElement(name)
 		_:
-			TensorForBoxedElement(TypeLayout.c_type_name(element_type, {}))
+			TensorForBoxedElement(value_c_type)
 
 
-private pure func enum_inline_width(enum_decl: CoreEnumDecl) -> Option[Int]:
+private pure func scalar_tag_union_inline_width(union_decl: CoreUnionDecl) -> Option[Int]:
 	var max_tag: Option[Int] = None
 
-	for variant in enum_decl.variants:
+	for variant in union_decl.variants:
 		max_tag = match max_tag:
 			Some(current):
 				if variant.tag > current:
@@ -562,7 +566,7 @@ private pure func list_layout_for_element_type(
 								layout
 							None:
 								PointerListStorage
-		EnumType(name):
+		UnionType(name, ScalarTagValue):
 			index.list_layouts.get_or(name, PointerListStorage)
 		InlineRecordType(name):
 			-- Elements are stored by value in the list buffer, named by the
@@ -619,7 +623,7 @@ pure func list_element_needs_release_with_index(index: CoreLayoutTypeIndex, typ:
 					decl_needs_release: Bool = match index.declared_types.get(name):
 						Some(declared_type):
 							match declared_type:
-								HeapRecordType(_) | UnionType(_):
+								HeapRecordType(_) | UnionType(_, ManagedUnionValue):
 									True
 								_:
 									False
@@ -629,7 +633,7 @@ pure func list_element_needs_release_with_index(index: CoreLayoutTypeIndex, typ:
 					named_pointer_element_needs_release(name, args) or decl_needs_release
 				HeapRecordType(_):
 					True
-				UnionType(_):
+				UnionType(_, ManagedUnionValue):
 					True
 				StackResultType(_, _):
 					True

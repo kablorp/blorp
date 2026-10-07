@@ -40,7 +40,7 @@ All current rules have `advice` severity and remain report-only.
 | Rule ID | Confidence | Reports |
 | --- | --- | --- |
 | `structure.single-field-record` | High | Records containing exactly one field. |
-| `structure.single-variant-union` | High | Payload unions containing exactly one variant; enums are excluded explicitly. |
+| `structure.single-variant-union` | High | Ordinary and fixed unions containing exactly one payload-bearing variant; payload-free unions are excluded by shape. |
 | `function.pure-no-parameters` | High | Source-defined pure functions with no parameters whose bodies only materialize literal, aggregate, or constructor values, unless the callable is used as a value or callback. |
 | `option.immediate-parameter-match` | High | An `Option[T]` parameter directly matched by the first body expression. |
 | `loop.list-lookup` | Medium | Typed `get`, `get_or`, or list subscript operations nested in a loop. |
