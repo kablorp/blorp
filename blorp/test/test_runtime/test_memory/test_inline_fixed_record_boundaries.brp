@@ -1,0 +1,338 @@
+-- Where an inline record meets a container or an erased runtime slot, it is
+-- either stored inline or crosses in one struct box, an allocated copy owned
+-- by the slot. Each case pins the exact number of managed allocations that
+-- position makes and checks the value that comes back out.
+--
+-- Inline (no allocation for the record): list elements, Option payloads,
+-- elements of a local tuple, fields of a managed record, closure environments,
+-- and lists built from Dict and Set entries.
+-- Struct box (one allocation per stored record): erased union payloads, stack
+-- Result payloads, elements of a tuple stored in a heap value, Dict and Set
+-- keys and values (including a key boxed for a lookup, released after it),
+-- channel elements, task results, and arguments and results of a closure call.
+--
+-- The counters are live only under memory instrumentation, which the leak gate
+-- provides (`bin/blorp test --leak-check`); every case first requires that.
+import:
+	memory: MemoryCounter(ManagedAllocations, MemoryStatsActive), read_memory_counter
+	set: set
+	test: TestSuite
+
+
+fixed record Point {
+	x: Float,
+	y: Float
+}
+
+
+record OrdinaryPoint {
+	x: Float,
+	y: Float
+}
+
+
+record Holder {
+	name: String,
+	at: Point
+}
+
+
+union Shape:
+	Dot(Point)
+	Line(Point, Point)
+
+
+enum Color:
+	Red
+	Blue
+
+
+implements Equatable for Point:
+	pure func equals(left: Point, right: Point) -> Bool:
+		left.x == right.x and left.y == right.y
+
+
+implements Hashable for Point:
+	pure func hash(self: Point) -> Int:
+		hash_combine(self.x.hash(), self.y.hash())
+
+
+func counting() -> Bool:
+	read_memory_counter(MemoryStatsActive) == 1
+
+
+func allocations() -> Int:
+	read_memory_counter(ManagedAllocations)
+
+
+pure func first_point(points: List[Point]) -> Option[Point]:
+	match points:
+		[first, ..._]:
+			Some(first)
+		[]:
+			None
+
+
+pure func checked(point: Point) -> Result[Point, String]:
+	if point.x < 0.0:
+		Err("negative")
+	else:
+		Ok(point)
+
+
+pure func pair_of(point: Point) -> (Point, Int):
+	(point, 1)
+
+
+pure func far(n: Float) -> Point:
+	{x = n, y = n * 2.0}
+
+
+func test_list_stores_points_in_its_buffer() -> Bool:
+	before = allocations()
+	points: List[Point] = [{x = 1.0, y = 2.0}, {x = 3.0, y = 4.0}, {x = 5.0, y = 6.0}]
+	var total: Float = 0.0
+
+	for point in points:
+		total += point.x
+
+	after = allocations()
+	-- One list; an ordinary record list also allocates each element.
+	counting() and after - before == 1 and total == 9.0
+
+
+func test_ordinary_record_list_allocates_each_element() -> Bool:
+	before = allocations()
+	points: List[OrdinaryPoint] = [{x = 1.0, y = 2.0}, {x = 3.0, y = 4.0}, {x = 5.0, y = 6.0}]
+	after = allocations()
+	counting() and after - before == 4 and points.length() == 3
+
+
+func test_option_payload_is_inline() -> Bool:
+	points: List[Point] = [{x = 1.0, y = 2.0}]
+	before = allocations()
+	found: Float = match first_point(points):
+		Some(point):
+			point.y
+		None:
+			0.0
+	after = allocations()
+	counting() and after - before == 0 and found == 2.0
+
+
+func test_tuple_element_is_inline() -> Bool:
+	before = allocations()
+	pair: (Point, Int) = pair_of({x = 7.0, y = 8.0})
+	after = allocations()
+	counting() and after - before == 0 and pair[0].y == 8.0 and pair[1] == 1
+
+
+func test_managed_record_field_is_inline() -> Bool:
+	label: String = "holder"
+	before = allocations()
+	holder: Holder = {name = label, at = {x = 9.0, y = 9.5}}
+	moved: Holder = { holder | at = { holder.at | y = 1.5 } }
+	after = allocations()
+	-- One allocation per Holder; the Point inside each is part of it.
+	counting() and after - before == 2 and holder.at.y == 9.5 and moved.at.y == 1.5
+
+
+func test_heap_tuple_elements_are_boxed() -> Bool:
+	point: Point = {x = 1.0, y = 2.0}
+	before = allocations()
+	pairs: List[(Point, Int)] = [(point, 1), (point, 2), (point, 3)]
+	after = allocations()
+	var total: Float = 0.0
+
+	for (item, count) in pairs:
+		total += item.y + count.to_float()
+
+	-- The list, a tuple object per element, and a box for each Point in a
+	-- tuple slot.
+	counting() and after - before == 7 and total == 12.0
+
+
+func test_closure_environment_holds_capture_inline() -> Bool:
+	offset: Point = {x = 10.0, y = 0.0}
+	before = allocations()
+	shift = func(p: Float) -> Float: p + offset.x
+	shifted: Float = shift(1.0)
+	after = allocations()
+	-- The closure itself; the captured Point is stored in its environment.
+	counting() and after - before == 1 and shifted == 11.0
+
+
+func test_closure_call_boxes_record_argument_and_result() -> Bool:
+	before = allocations()
+	shift = func(p: Point) -> Point: {x = p.x + 1.0, y = p.y}
+	shifted: Point = shift({x = 1.0, y = 1.0})
+	after = allocations()
+	-- A closure call passes erased slots: one box for the argument and one for
+	-- the result. The closure captures nothing, so it is static.
+	counting() and after - before == 2 and shifted.x == 2.0
+
+
+func test_result_payload_is_boxed() -> Bool:
+	before = allocations()
+	value: Float = match checked({x = 1.0, y = 5.0}):
+		Ok(point):
+			point.y
+		Err(_):
+			0.0
+	after = allocations()
+	counting() and after - before == 1 and value == 5.0
+
+
+func test_union_payloads_are_boxed() -> Bool:
+	before = allocations()
+	shape: Shape = Line({x = 1.0, y = 0.0}, {x = 2.0, y = 0.0})
+	sum: Float = match shape:
+		Line(start, finish):
+			start.x + finish.x
+		Dot(point):
+			point.x
+	after = allocations()
+	-- The union object and one box per Point payload.
+	counting() and after - before == 3 and sum == 3.0
+
+
+func test_dict_value_and_key_are_boxed() -> Bool:
+	label: String = "a"
+	before = allocations()
+	var by_name: Dict[String, Point] = {}
+	by_name = by_name.set(label, {x = 1.0, y = 1.0})
+	var by_point: Dict[Point, Int] = {}
+	by_point = by_point.set({x = 2.0, y = 3.0}, 11)
+	after = allocations()
+	-- Each Dict and the one box each stores.
+	(
+		counting()
+		and after - before == 4
+		and by_name.get(label).map(func(point): point.x).get_or(0.0) == 1.0
+		and by_point.get({x = 2.0, y = 3.0}).get_or(0) == 11
+	)
+
+
+func test_lists_built_from_dict_and_set_hold_points_inline() -> Bool:
+	label: String = "a"
+	var by_name: Dict[String, Point] = {}
+	by_name = by_name.set(label, {x = 1.0, y = 2.0})
+	var by_point: Dict[Point, Int] = {}
+	by_point = by_point.set({x = 3.0, y = 4.0}, 1)
+	var seen: Set[Point] = set()
+	seen = seen.add({x = 5.0, y = 6.0})
+	before = allocations()
+	values: List[Point] = by_name.values()
+	keys: List[Point] = by_point.keys()
+	elements: List[Point] = seen.to_list()
+	after = allocations()
+	-- One list each; every entry is unboxed into the list's buffer.
+	(
+		counting()
+		and after - before == 3
+		and values.map(func(point): point.y).sum() == 2.0
+		and keys.map(func(point): point.x).sum() == 3.0
+		and elements.map(func(point): point.y).sum() == 6.0
+	)
+
+
+func test_lookup_key_box_is_released_for_stack_option_values() -> Bool:
+	var by_point: Dict[Point, Point] = {}
+	by_point = by_point.set({x = 2.0, y = 3.0}, {x = 7.0, y = 8.0})
+	var colors: Dict[Point, Color] = {}
+	colors = colors.set({x = 2.0, y = 3.0}, Blue)
+	wide: Int128 = 5
+	var by_wide: Dict[Int128, Color] = {}
+	by_wide = by_wide.set(wide, Red)
+	before = allocations()
+	found: Float = match by_point.get({x = 2.0, y = 3.0}):
+		Some(point):
+			point.x
+		None:
+			0.0
+	blue: Bool = match colors.get({x = 2.0, y = 3.0}):
+		Some(Blue):
+			True
+		Some(Red) | None:
+			False
+	red: Bool = match by_wide.get(wide):
+		Some(Red):
+			True
+		Some(Blue) | None:
+			False
+	after = allocations()
+	-- One key box per lookup, released when the lookup returns; the leak gate
+	-- fails this file if any is kept.
+	counting() and after - before == 3 and found == 7.0 and blue and red
+
+
+func test_set_element_is_boxed() -> Bool:
+	before = allocations()
+	var seen: Set[Point] = set()
+	seen = seen.add({x = 1.0, y = 1.0})
+	seen = seen.add({x = 1.0, y = 1.0})
+	after = allocations()
+	-- The Set and a box per added key; the duplicate's box is released, not
+	-- stored. A lookup also boxes its key for the call.
+	(
+		counting()
+		and after - before == 3
+		and seen.length() == 1
+		and seen.contains({x = 1.0, y = 1.0})
+	)
+
+
+func test_channel_element_is_boxed() -> Bool:
+	before = allocations()
+	queue: Channel[Point] = channel(2)
+	sent: Bool = queue.send({x = 4.0, y = 5.0})
+	received: Float = match queue.recv():
+		Some(point):
+			point.y
+		None:
+			0.0
+	after = allocations()
+	counting() and after - before == 2 and sent and received == 5.0
+
+
+func test_task_result_is_boxed() -> Bool:
+	before = allocations()
+	concurrent:
+		job = far(3.0)
+	value: Float = match job:
+		Ok(point):
+			point.y
+		Err(_):
+			0.0
+	after = allocations()
+	-- The task, its result box, and the joined Result's carrier.
+	counting() and after - before == 3 and value == 6.0
+
+
+tests: TestSuite = {
+	description = "Inline fixed record boundaries",
+	tests = [
+		("a list stores points in its buffer", test_list_stores_points_in_its_buffer),
+		("an ordinary record list allocates each element", test_ordinary_record_list_allocates_each_element),
+		("an Option payload is inline", test_option_payload_is_inline),
+		("a tuple element is inline", test_tuple_element_is_inline),
+		("a managed record field is inline", test_managed_record_field_is_inline),
+		("heap tuple elements are boxed", test_heap_tuple_elements_are_boxed),
+		("a closure environment holds a capture inline", test_closure_environment_holds_capture_inline),
+		("a closure call boxes a record argument and result", test_closure_call_boxes_record_argument_and_result),
+		("a Result payload is boxed", test_result_payload_is_boxed),
+		("union payloads are boxed", test_union_payloads_are_boxed),
+		("Dict values and keys are boxed", test_dict_value_and_key_are_boxed),
+		(
+			"lists built from Dict and Set hold points inline",
+			test_lists_built_from_dict_and_set_hold_points_inline,
+		),
+		(
+			"a lookup key box is released for stack Option values",
+			test_lookup_key_box_is_released_for_stack_option_values,
+		),
+		("a Set element is boxed", test_set_element_is_boxed),
+		("a channel element is boxed", test_channel_element_is_boxed),
+		("a task result is boxed", test_task_result_is_boxed),
+	]
+}

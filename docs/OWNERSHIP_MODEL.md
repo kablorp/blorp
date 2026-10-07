@@ -26,8 +26,12 @@ records, payload unions, captured closures, channels, and other runtime objects
 classified by Core representation.
 
 Unmanaged values include primitive scalars, enums, fieldless unions, raw
-pointers, and dimension values. `record` and `fixed record` both
-denote ordinary managed records; fields may themselves be managed.
+pointers, dimension values, and inline fixed records: a `fixed record` whose
+fields are all numbers, `Char` values or other inline fixed records is a
+by-value struct (`InlineRecordType`) with no owner. Every other `record` or
+`fixed record` is an ordinary managed record; fields may themselves be managed.
+Where an inline record enters an erased `void*` slot it travels in a struct
+box that the slot owns and releases.
 Type-header validation rejects mandatory recursive products before Core
 lowering, independently of the declaration spelling.
 

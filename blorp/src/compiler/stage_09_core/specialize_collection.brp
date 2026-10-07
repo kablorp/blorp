@@ -4,7 +4,7 @@
 -- specialization orchestrator owns recursion so independent builtin families
 -- can be composed without traversing the tree more than once.
 import:
-	c_type_layout: type_requires_release
+	c_type_layout: generated_stack_option_c_type_name, type_requires_release
 	erased_key_temps: RELEASE_HASH_KEY_BOX, is_erased_key_temp_marker
 	ir:
 		CoreAccessor(RootAccessor, StackOptionPayloadAccessor, VariantFieldAccessor),
@@ -32,8 +32,8 @@ import:
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreSourceLoc,
 		CoreType(
-			BoxedResultType, EnumType, HeapRecordType, NamedType, RangeType, StackResultType,
-			UnionType, VoidType,
+			BoxedResultType, EnumType, HeapRecordType, InlineRecordType, NamedType, RangeType,
+			StackResultType, UnionType, VoidType,
 		),
 		CoreUnboxKind,
 		CoreVar,
@@ -176,6 +176,8 @@ private pure func stack_option_c_type(payload: CoreType) -> Option[String]:
 				None
 		EnumType(name):
 			Some("blorp_StackOption_" + name)
+		InlineRecordType(name):
+			Some(generated_stack_option_c_type_name(name))
 		RangeType:
 			Some("blorp_StackOption_Range")
 		_:
@@ -959,6 +961,88 @@ private pure func list_filter_map_loop(
 	)
 
 
+---
+A `Dict.get`. With a typed runtime getter for the result's Option layout the
+call uses it and boxes its erased arguments. Without one the call stays the
+generic `blorp_dict_get`, which the emitter renders into the result's stack
+Option. In both cases a key that crosses in a fresh box (an inline record or
+a 128-bit integer) is boxed here, so the box has an owner: the lookup only
+borrows it, and the operation releases it once the lookup returns.
+---
+private pure func specialize_dict_get(
+	layout: CoreSpecializeLayout,
+	original: CoreExpr,
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	runtime_name: Option[String] = option_runtime_name(layout, result_type, name, Some(name))
+	call_name: String = runtime_name.get_or(name)
+
+	match args:
+		[dict_value, key]:
+			if boxed_storage_allocates(layout, core_expr_type(key)):
+				dict_get_releasing_key_box(layout, call_name, callee, dict_value, key, result_type, loc)
+			else if runtime_name.is_some():
+				builtin_call_with_callee(
+					call_name,
+					callee,
+					box_collection_void_slots(layout, call_name, args, loc),
+					result_type,
+					loc,
+				)
+			else:
+				original
+		_:
+			original
+
+
+---
+The lookup with its key boxed into a fresh temporary, released after the
+call. A map given as an expression is bound first so it is still evaluated
+before the key; a map variable is read in place, which needs no binding and
+so no extra reference.
+---
+private pure func dict_get_releasing_key_box(
+	layout: CoreSpecializeLayout,
+	call_name: String,
+	callee: CoreExpr,
+	dict_value: CoreExpr,
+	key: CoreExpr,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	dict_type: CoreType = core_expr_type(dict_value)
+	map_value: CoreExpr = match dict_value:
+		VarExpr(_, _, _):
+			dict_value
+		_:
+			variable("__dict_get_map", dict_type, loc)
+	key_box: CoreExpr = variable("__dict_get_key_box", POINTER_TYPE, loc)
+	found: CoreExpr = variable("__dict_get_found", result_type, loc)
+	lookup: CoreExpr = LetExpr(
+		core_var("__dict_get_key_box"),
+		False,
+		POINTER_TYPE,
+		box_void_slot_argument(layout, key, loc),
+		LetExpr(
+			core_var("__dict_get_found"),
+			False,
+			result_type,
+			builtin_call_with_callee(call_name, callee, [map_value, key_box], result_type, loc),
+			SeqExpr(intrinsic_call(RELEASE_HASH_KEY_BOX, [key_box], VoidType, loc), found),
+		),
+	)
+
+	match dict_value:
+		VarExpr(_, _, _):
+			lookup
+		_:
+			LetExpr(core_var("__dict_get_map"), False, dict_type, dict_value, lookup)
+
+
 private pure func specialize_collection_call(
 	layout: CoreSpecializeLayout,
 	original: CoreExpr,
@@ -981,6 +1065,11 @@ private pure func specialize_collection_call(
 			None:
 				original
 	else if name == "blorp_channel_recv" or name == "blorp_channel_try_recv":
+		-- Known fault (DIAGNOSTIC_GAPS CF-018): with no typed receive, an enum
+		-- or 128-bit payload keeps the erased receive although its Option is a
+		-- stack struct, and the C does not compile. Inline records take a
+		-- raw-slot receive in the emitter (`emit_inline_record_channel_receive`);
+		-- choosing that receive here for every stack-Option payload fixes both.
 		match option_runtime_name(layout, result_type, name, Some(name)):
 			Some(runtime_name):
 				builtin_call_with_callee(runtime_name, callee, args, result_type, loc)
@@ -1063,17 +1152,7 @@ private pure func specialize_collection_call(
 			loc,
 		)
 	else if name == "blorp_dict_get":
-		match option_runtime_name(layout, result_type, name, Some(name)):
-			Some(runtime_name):
-				builtin_call_with_callee(
-					runtime_name,
-					callee,
-					box_collection_void_slots(layout, runtime_name, args, loc),
-					result_type,
-					loc,
-				)
-			None:
-				original
+		specialize_dict_get(layout, original, name, callee, args, result_type, loc)
 	else if name == "blorp_stream_find":
 		match option_runtime_name(layout, result_type, name, Some(name)):
 			Some(runtime_name):

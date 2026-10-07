@@ -19,12 +19,14 @@ import:
 	match_lowering: compile_program
 	monomorphize: monomorphize_program
 	parallel_tensor_pipeline: fuse_parallel_tensor_program
+	record_representation: decide_record_representations, inline_record_identity_violation
 	pass_runner:
 		CoreModuleTableCheck,
 		CorePass,
 		CorePassControl,
 		CorePassDiagnostic(
-			CoreEarlyInvariantDiagnostic, CoreEarlyMonoDiagnostic, CoreEarlySynthDiagnostic,
+			CoreEarlyInlineRecordIdentityDiagnostic, CoreEarlyInvariantDiagnostic,
+			CoreEarlyMonoDiagnostic, CoreEarlySynthDiagnostic,
 			CoreEarlyTraitResolveDiagnostic, CoreEarlyTupleFlattenDiagnostic,
 		),
 		CorePassObservation,
@@ -370,15 +372,23 @@ private pure func run_mono_pass(state: CorePassState) -> Result[CorePassState, C
 		Err(diagnostic):
 			Err(CoreEarlyMonoDiagnostic(diagnostic))
 		Ok(specialized):
-			laid_out: CoreProgram = CoreEarlyStages.run_list_layout_stage(specialized.program)
+			-- Representation is decided here, once every generic record has a
+			-- concrete instance, and before list layout reads it.
+			represented: CoreProgram = decide_record_representations(specialized.program)
 
-			-- The one place every mono instance and its declaration coexist:
-			-- `prune_after_trait_resolve` drops declarations nothing live reaches.
-			Ok(
-				{ core_pass_state_carry_ids(state, laid_out, specialized.next_def_id) |
-					declaration_index = core_declaration_index(state.names, state.modules, laid_out)
-				},
-			)
+			match inline_record_identity_violation(represented):
+				Some(violation):
+					Err(CoreEarlyInlineRecordIdentityDiagnostic(violation))
+				None:
+					laid_out: CoreProgram = CoreEarlyStages.run_list_layout_stage(represented)
+
+					-- The one place every mono instance and its declaration coexist:
+					-- `prune_after_trait_resolve` drops declarations nothing live reaches.
+					Ok(
+						{ core_pass_state_carry_ids(state, laid_out, specialized.next_def_id) |
+							declaration_index = core_declaration_index(state.names, state.modules, laid_out)
+						},
+					)
 
 
 private pure func run_synth_pass(state: CorePassState) -> Result[CorePassState, CorePassDiagnostic]:

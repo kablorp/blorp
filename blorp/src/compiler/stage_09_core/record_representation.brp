@@ -1,0 +1,630 @@
+-- Decide which records are stored inline.
+--
+-- A `fixed record` asks for inline storage. This module grants it, once, right
+-- after monomorphization, to every concrete fixed record whose fields can all
+-- live inside the record by value. An admitted record becomes an
+-- `InlineRecordDecl`, and later phases read the representation from that
+-- declaration kind and from the `InlineRecordType` that runtime projection
+-- gives its uses; nothing after this point decides it again.
+--
+-- A fixed record that is not admitted keeps the managed representation. The
+-- checked fixed-layout guarantee (docs/FIXED_LAYOUT_ROADMAP.md) will report
+-- those instead of accepting them silently.
+--
+-- An inline record has no object identity, so `same_object`, `is_unique` and
+-- `refcount` on one are compile errors. Whether a record is inline depends on
+-- its field types after monomorphization, so this is the earliest phase that
+-- can report them (the monomorphization exception to AGENTS.md rules 6 and 8).
+import:
+	../stage_08_core_lower/list_layout:
+		CoreLayoutTypeIndex,
+		build_layout_type_index,
+		resolve_layout_type_with_index,
+	ir:
+		CoreCallKind(BuiltinCall, SelectedDirectCall, UserCall),
+		CoreDecl(
+			EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, InlineRecordDecl,
+			TraitDecl, TypeAliasDecl, UnionDecl,
+		),
+		CoreExpr(CallExpr),
+		CoreHeapRecordDecl,
+		CoreProgram,
+		CoreRecordForm(FixedRecordForm, OrdinaryRecordForm),
+		CoreSourceLoc,
+		CoreSourceLocRow,
+		CoreType(
+			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType,
+			RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType,
+			UnionType, VoidType,
+		),
+		core_expr_source_loc,
+		core_expr_type,
+		core_source_loc_path,
+		core_source_loc_row,
+	traverse: immediate_core_expr_children
+	type_policy: core_type_to_string
+
+
+---
+The scalar types an inline record may hold directly: every sized and unsized
+integer and float, and `Char`. Core spells these builtin types by name, and
+the standard library declares them as `builtin` (with `Int64` an alias of
+`Int`), so a resolved name here is the builtin type itself.
+
+`Bool` is deliberately absent: it will become eligible with fixed unions,
+which give it and other payload-free sums a checked inline layout. Do not add
+it, or any managed type, here.
+
+`FixedPoint` is a number type but is managed: the runtime allocates each value
+as a reference-counted `blorp_FixedPoint` object, so a record holding one
+keeps the managed layout until `FixedPoint` itself is stored by value.
+---
+pure func inline_record_scalar_type_name(name: String) -> Bool:
+	(
+		name == "Int"
+		or name == "Int8"
+		or name == "Int16"
+		or name == "Int32"
+		or name == "Int64"
+		or name == "Int128"
+		or name == "UInt8"
+		or name == "UInt16"
+		or name == "UInt32"
+		or name == "UInt64"
+		or name == "UInt128"
+		or name == "Float"
+		or name == "Float16"
+		or name == "Float32"
+		or name == "Char"
+	)
+
+
+---
+Where the eligibility walk stands on one type name. Every type declaration's
+name has exactly one entry, so a single table answers both "may this record be
+inline" and "has it been decided".
+---
+private union RecordStorageDecision:
+	-- A concrete fixed record not yet examined.
+	UndecidedRecord(CoreHeapRecordDecl)
+	-- A record whose fields are being examined; reaching it again means it
+	-- holds itself and has no finite inline layout.
+	ExaminingRecord
+	-- Admitted: the record is stored inline.
+	InlineRecord
+	-- Anything else with this name: a record that is not admitted, a second
+	-- declaration of a name, or a union, enum or alias.
+	NotInline
+
+
+---
+One storage decision per Core type name. Core names a type by its declared
+name (there is no type id yet), so the name is the key.
+---
+private type alias RecordStorageDecisions = Dict[String, RecordStorageDecision]
+
+
+---
+What the eligibility walk knows: one decision per type name, and the admitted
+records in the order they were admitted. A record is admitted only after every
+record its fields hold, so that order defines each field's type before the
+record that holds it.
+---
+private record EligibilityState {
+	index: CoreLayoutTypeIndex,
+	decisions: RecordStorageDecisions,
+	admitted: List[CoreHeapRecordDecl]
+}
+
+
+---
+Field eligibility is a storage question, so every alias is expanded, opaque
+ones included: an opaque type over `Float` is stored as a `Float`.
+---
+private pure func field_is_eligible(
+	state: EligibilityState,
+	typ: CoreType,
+) -> (Bool, EligibilityState):
+	match resolve_layout_type_with_index(state.index, typ):
+		NamedType(name, args):
+			(args.is_empty() and inline_record_scalar_type_name(name), state)
+		HeapRecordType(name):
+			record_is_eligible(state, name)
+		InlineRecordType(_):
+			(True, state)
+		VoidType | TypeParameterType(_) | SelfType | FunctionType(_, _, _) | StackResultType(_, _):
+			(False, state)
+		BoxedResultType(_, _) | EnumType(_) | UnionType(_) | RangeType | TensorType(_) | TupleType(_):
+			(False, state)
+
+
+private pure func record_is_eligible(
+	state: EligibilityState,
+	name: String,
+) -> (Bool, EligibilityState):
+	match state.decisions.get(name):
+		None:
+			(False, state)
+		Some(InlineRecord):
+			(True, state)
+		Some(NotInline) | Some(ExaminingRecord):
+			(False, state)
+		Some(UndecidedRecord(record_decl)):
+			var current: EligibilityState = { state |
+				decisions = state.decisions.set(name, ExaminingRecord)
+			}
+			var eligible: Bool = True
+
+			for field in record_decl.fields:
+				if eligible:
+					(field_eligible, next) = field_is_eligible(current, field.typ)
+					eligible = field_eligible
+					current = next
+
+			if eligible:
+				(True, { current |
+						decisions = current.decisions.set(name, InlineRecord),
+						admitted = current.admitted.append(record_decl)
+					})
+			else:
+				(False, { current | decisions = current.decisions.set(name, NotInline) })
+
+
+---
+Only a concrete `fixed record` asks for inline storage. A generic template is
+decided per instantiation, which monomorphization has already materialized.
+A record with a declared ABI keeps the managed layout its native snapshot
+adapter constructs.
+---
+private pure func requests_inline_storage(record_decl: CoreHeapRecordDecl) -> Bool:
+	match record_decl.form:
+		FixedRecordForm:
+			record_decl.type_params.is_empty() and record_decl.abi_type.is_none()
+		OrdinaryRecordForm:
+			False
+
+
+private pure func inline_record_decl(record_decl: CoreHeapRecordDecl) -> CoreDecl:
+	InlineRecordDecl({
+		name = record_decl.name,
+		fields = record_decl.fields.map(func(field): {
+				name = field.name,
+				ref = field.ref,
+				typ = field.typ
+			}),
+		loc = record_decl.loc,
+	})
+
+
+---
+Type declarations are keyed by name in Core, so a name declared twice is
+ambiguous: a local `union Option[T]` and the prelude `Option`, for example,
+lower to one Core type reference. Such a record keeps the managed
+representation rather than letting one spelling decide the layout of two
+declarations.
+---
+private pure func type_declaration_name(decl: CoreDecl) -> Option[String]:
+	match decl:
+		HeapRecordDecl(record_decl):
+			Some(record_decl.name)
+		InlineRecordDecl(record_decl):
+			Some(record_decl.name)
+		UnionDecl(union_decl):
+			Some(union_decl.name)
+		EnumDecl(enum_decl):
+			Some(enum_decl.name)
+		TypeAliasDecl(alias_decl):
+			Some(alias_decl.name)
+		FunctionDecl(_) | GlobalDecl(_) | TraitDecl(_) | ImplDecl(_):
+			None
+
+
+---
+The first decision for a type declaration: a concrete fixed record waits to be
+examined, and every other declaration, or a second declaration of a name
+already seen, is managed.
+---
+private pure func initial_storage_decision(
+	already_declared: Bool,
+	decl: CoreDecl,
+) -> RecordStorageDecision:
+	if already_declared:
+		NotInline
+	else:
+		match decl:
+			HeapRecordDecl(record_decl):
+				if requests_inline_storage(record_decl):
+					UndecidedRecord(record_decl)
+				else:
+					NotInline
+			_:
+				NotInline
+
+
+---
+Replaces each admitted fixed record with an `InlineRecordDecl`. The inline
+declarations come first, in admission order, so each one follows the inline
+records its fields hold; the C emitter defines them in that order. Every other
+declaration keeps its relative order.
+---
+pure func decide_record_representations(program: CoreProgram) -> CoreProgram:
+	var decisions: RecordStorageDecisions = {}
+	var candidates: List[String] = []
+
+	for decl in program.decls:
+		match type_declaration_name(decl):
+			Some(name):
+				decision: RecordStorageDecision = initial_storage_decision(
+					decisions.contains(name),
+					decl,
+				)
+
+				match decision:
+					UndecidedRecord(_):
+						candidates = candidates.append(name)
+					ExaminingRecord | InlineRecord | NotInline:
+						void
+
+				decisions = decisions.set(name, decision)
+			None:
+				void
+
+	if candidates.is_empty():
+		program
+	else:
+		var state: EligibilityState = {
+			index = build_layout_type_index(program),
+			decisions = decisions,
+			admitted = []
+		}
+
+		for name in candidates:
+			(_, next) = record_is_eligible(state, name)
+			state = next
+
+		var decls: List[CoreDecl] = state.admitted.map(inline_record_decl)
+
+		for decl in program.decls:
+			match decl:
+				HeapRecordDecl(record_decl):
+					match state.decisions.get(record_decl.name):
+						Some(InlineRecord):
+							void
+						Some(UndecidedRecord(_)) | Some(ExaminingRecord) | Some(NotInline) | None:
+							decls = decls.append(decl)
+				_:
+					decls = decls.append(decl)
+
+		{ program | decls = decls }
+
+
+---
+The `memory` builtins that observe a managed object rather than a value. Each
+is identified by the runtime builtin its standard library declaration names.
+---
+enum CoreObjectIdentityBuiltin:
+	SameObjectBuiltin
+	IsUniqueBuiltin
+	RefcountBuiltin
+
+
+--- The identity builtin a runtime builtin name denotes, if any.
+pure func object_identity_builtin(
+	runtime_name: String,
+) -> Option[CoreObjectIdentityBuiltin]:
+	if runtime_name == "blorp_same_object":
+		Some(SameObjectBuiltin)
+	else if runtime_name == "blorp_is_unique":
+		Some(IsUniqueBuiltin)
+	else if runtime_name == "blorp_refcount":
+		Some(RefcountBuiltin)
+	else:
+		None
+
+
+---
+A call that asks an inline record for its object identity, with the place the
+call was written.
+---
+record CoreInlineRecordIdentityDiagnostic {
+	identity_builtin: CoreObjectIdentityBuiltin,
+	record_type: CoreType,
+	path: String,
+	position: CoreSourceLocRow
+}
+
+
+private pure func builtin_source_name(identity_builtin: CoreObjectIdentityBuiltin) -> String:
+	match identity_builtin:
+		SameObjectBuiltin:
+			"same_object"
+		IsUniqueBuiltin:
+			"is_unique"
+		RefcountBuiltin:
+			"refcount"
+
+
+pure func core_inline_record_identity_message(
+	diagnostic: CoreInlineRecordIdentityDiagnostic,
+) -> String:
+	name: String = builtin_source_name(diagnostic.identity_builtin)
+	record_name: String = core_type_to_string(diagnostic.record_type)
+
+	what: String = match diagnostic.identity_builtin:
+		SameObjectBuiltin:
+			"compares managed objects"
+		IsUniqueBuiltin | RefcountBuiltin:
+			"reads a managed object's reference count"
+
+	location: String = if diagnostic.path == "":
+		""
+	else:
+		"${diagnostic.path}:${diagnostic.position.start_line}:${diagnostic.position.start_column}: "
+
+	"${location}error[inline_record_identity]: `${name}` ${what}; `${record_name}` is a fixed record stored inline"
+
+
+pure func core_inline_record_identity_hint(
+	diagnostic: CoreInlineRecordIdentityDiagnostic,
+) -> String:
+	match diagnostic.identity_builtin:
+		SameObjectBuiltin:
+			"Compare values with `==`; an inline record is a value with no object identity."
+		IsUniqueBuiltin | RefcountBuiltin:
+			(
+				"An inline record is copied by value and has no reference count; remove the "
+				+ "check, or declare it as `record` if it must be a shared object."
+			)
+
+
+---
+One object-identity builtin applied to an inline record, with the builtin and
+the record type it was asked about.
+---
+private record IdentityTarget {
+	identity_builtin: CoreObjectIdentityBuiltin,
+	record_type: CoreType
+}
+
+
+private pure func identity_target(
+	index: CoreLayoutTypeIndex,
+	expr: CoreExpr,
+) -> Option[IdentityTarget]:
+	match expr:
+		CallExpr(BuiltinCall(runtime_name), _, [first, ..._], _, _):
+			identity_builtin ?= object_identity_builtin(runtime_name)
+
+			match resolve_layout_type_with_index(index, core_expr_type(first)):
+				InlineRecordType(name):
+					Some({
+						identity_builtin = identity_builtin,
+						record_type = InlineRecordType(name),
+					})
+				_:
+					None
+		_:
+			None
+
+
+---
+A place to report: an identity builtin on an inline record written directly,
+or a call to a function that only forwards to one.
+---
+private record IdentityCall {
+	target: IdentityTarget,
+	loc: CoreSourceLoc
+}
+
+
+---
+The bodies the check reads, in declaration order, each with the definition id
+of the function it belongs to.
+---
+private pure func checked_bodies(program: CoreProgram) -> List[(Option[Int], CoreExpr)]:
+	var bodies: List[(Option[Int], CoreExpr)] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				match function.body:
+					Some(body):
+						bodies = bodies.append((Some(function.def_id), body))
+					None:
+						void
+			GlobalDecl(global):
+				bodies = bodies.append((None, global.init))
+			ImplDecl(impl_decl):
+				for method in impl_decl.methods:
+					match method.body:
+						Some(body):
+							bodies = bodies.append((Some(method.def_id), body))
+						None:
+							void
+			_:
+				void
+
+	bodies
+
+
+---
+The functions whose whole body is an identity builtin on an inline record:
+the monomorphized `memory.same_object[T]` and its siblings at an inline `T`.
+A use of one is reported where the forwarding function is called, which is
+where the user wrote it.
+---
+private pure func forwarding_identity_functions(
+	index: CoreLayoutTypeIndex,
+	program: CoreProgram,
+) -> Dict[Int, IdentityTarget]:
+	var found: Dict[Int, IdentityTarget] = {}
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				match function.body.and_then(func(body): identity_target(index, body)):
+					Some(target):
+						found = found.set(function.def_id, target)
+					None:
+						void
+			_:
+				void
+
+	found
+
+
+private pure func called_definition(call_kind: CoreCallKind) -> Option[Int]:
+	match call_kind:
+		SelectedDirectCall(def_id):
+			Some(def_id)
+		UserCall(_, def_id, _):
+			def_id
+		_:
+			None
+
+
+---
+Every identity builtin on an inline record in `body` that is not a whole
+forwarding body, and every call to a forwarding function.
+---
+private pure func identity_calls(
+	index: CoreLayoutTypeIndex,
+	forwarding: Dict[Int, IdentityTarget],
+	owner_forwards: Bool,
+	body: CoreExpr,
+) -> List[IdentityCall]:
+	var calls: List[IdentityCall] = []
+
+	-- A forwarding body's own builtin is reported at its callers instead.
+	var pending: List[CoreExpr] = if owner_forwards:
+		immediate_core_expr_children(body)
+	else:
+		[body]
+
+	while not pending.is_empty():
+		last: Int = pending.length() - 1
+		current: Option[CoreExpr] = pending.get(last)
+		pending = pending.take(last)
+
+		match current:
+			Some(expr):
+				match expr:
+					CallExpr(call_kind, _, _, _, loc):
+						match identity_target(index, expr):
+							Some(target):
+								calls = calls.append({
+									target = target,
+									loc = loc,
+								})
+							None:
+								match called_definition(
+									call_kind,
+								).and_then(
+									func(def_id): forwarding.get(def_id),
+								):
+									Some(target):
+										calls = calls.append({
+											target = target,
+											loc = loc,
+										})
+									None:
+										void
+					_:
+						void
+
+				pending = pending.concat(immediate_core_expr_children(expr))
+			None:
+				void
+
+	calls
+
+
+private pure func earliest_identity_call(
+	program: CoreProgram,
+	calls: List[IdentityCall],
+) -> Option[(IdentityCall, CoreSourceLocRow)]:
+	var first: Option[(IdentityCall, CoreSourceLocRow)] = None
+
+	for call in calls:
+		row: CoreSourceLocRow = core_source_loc_row(program, call.loc)
+
+		first = match first:
+			Some((best, best_row)):
+				if (
+					row.start_line < best_row.start_line
+					or (
+						row.start_line == best_row.start_line
+						and row.start_column < best_row.start_column
+					)
+				):
+					Some((call, row))
+				else:
+					first
+			None:
+				Some((call, row))
+
+	first
+
+
+---
+The first use, in declaration order, of an object-identity builtin on an
+inline record. Runs after `decide_record_representations`.
+
+At this phase a builtin call is always the whole body of the standard-library
+function that declares it (`builtin(...)` is only a function body), so finding
+the forwarding functions at an inline type finds every identity builtin on an
+inline record by reading each body's root, without walking the program. Only
+when one exists are the bodies walked for its callers, which is where the
+user wrote the use. A use inside a generic function is reported inside its
+body, at the instance that made the argument inline (DIAGNOSTIC_GAPS DG-054).
+A forwarding function nothing calls is reported itself. A later pass that
+nests such a builtin is caught by the late Core invariant
+`InlineRecordIdentityBuiltinSurvived`.
+---
+pure func inline_record_identity_violation(
+	program: CoreProgram,
+) -> Option[CoreInlineRecordIdentityDiagnostic]:
+	index: CoreLayoutTypeIndex = build_layout_type_index(program)
+	forwarding: Dict[Int, IdentityTarget] = forwarding_identity_functions(index, program)
+
+	if forwarding.is_empty():
+		None
+	else:
+		bodies: List[(Option[Int], CoreExpr)] = checked_bodies(program)
+		var first: Option[(IdentityCall, CoreSourceLocRow)] = None
+
+		for (owner, body) in bodies:
+			if first.is_none():
+				owner_forwards: Bool = match owner:
+					Some(def_id):
+						forwarding.contains(def_id)
+					None:
+						False
+
+				first = earliest_identity_call(
+					program,
+					identity_calls(index, forwarding, owner_forwards, body),
+				)
+
+		if first.is_none():
+			for (_, body) in bodies:
+				if first.is_none():
+					match identity_target(index, body):
+						Some(target):
+							first = earliest_identity_call(
+								program,
+								[{target = target, loc = core_expr_source_loc(body)}],
+							)
+						None:
+							void
+
+		match first:
+			Some((call, row)):
+				Some({
+					identity_builtin = call.target.identity_builtin,
+					record_type = call.target.record_type,
+					path = core_source_loc_path(program, call.loc),
+					position = row,
+				})
+			None:
+				None

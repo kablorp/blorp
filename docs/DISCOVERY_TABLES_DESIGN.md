@@ -60,9 +60,10 @@ lookup fallback in the reserved source; storing it in frozen rows fails
 
 ## Rows, ranges and construction
 
-The flat `DiscoveryBuilder` owns output and transient state. All source record
-spellings are managed and accept type parameters; `fixed record` does not
-select inline storage. Row construction and storage costs require measurement.
+The flat `DiscoveryBuilder` owns output and transient state. Source record
+spellings accept type parameters; a `fixed record` whose fields are all numbers
+(including opaque ids over `Int`) is stored inline, and every other record is
+managed. Row construction and storage costs require measurement.
 Text lives in the names, paths, source-text and literal tables. Optional
 relationships are side rows, at most one per owner; variable-length children occupy
 contiguous child-table blocks addressed by `RowRange`.

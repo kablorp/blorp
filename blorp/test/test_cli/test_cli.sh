@@ -2102,6 +2102,18 @@ expect_output_contains "run cross-module program from a non-identifier path" 0 \
 	"hyphen path 1 6" \
 	"$BLORP_BIN" run --no-format --timeout 60 "$hyphen_project_main"
 
+# Errors found after monomorphization, when representation is decided, so
+# `check` cannot report them. Each fixture pins its diagnostic after the path
+# (`-- EXPECT:`) and its help line (`-- EXPECT-HELP:`).
+for core_fixture in blorp/test/test_compiler/test_stage_09_core/fixtures/should_fail/*.brp; do
+	core_expected=$(sed -n 's/^-- EXPECT: //p' "$core_fixture")
+	core_expected_help=$(sed -n 's/^-- EXPECT-HELP: //p' "$core_fixture")
+	expect_diagnostics_exact "compile rejects $(basename "$core_fixture" .brp)" 1 \
+		"$core_fixture$core_expected" \
+		"$core_expected_help" \
+		"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/core_fixture.c" "$core_fixture"
+done
+
 if $run_deep_checks; then
 	expect_output_contains "compile parse failure" 1 'expected `)` after function parameters' \
 		"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/parse_invalid.c" "$parse_invalid_prog"

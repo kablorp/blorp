@@ -1,0 +1,339 @@
+-- A `fixed record` whose fields are all numbers, `Char`, or other such fixed
+-- records is stored inline: building, copying, reading and updating one makes
+-- no managed allocation. The controls show which declarations keep the managed
+-- representation: an ordinary `record`, and fixed records with a `Bool` or a
+-- `String` field.
+--
+-- The counters are live only under memory instrumentation, which the leak gate
+-- provides (`bin/blorp test --leak-check`); every case first requires that.
+import:
+	memory:
+		MemoryCounter(ManagedAllocations, ManagedReleases, MemoryStatsActive),
+		read_memory_counter,
+	test: TestSuite
+
+
+fixed record Point {
+	x: Float,
+	y: Float
+}
+
+
+fixed record Segment {
+	start: Point,
+	finish: Point
+}
+
+
+fixed record Glyph {
+	code: Char,
+	width: Int32
+}
+
+
+fixed record PlacedGlyph {
+	glyph: Glyph,
+	at: Point
+}
+
+
+fixed record Pair[T] {
+	first: T,
+	second: T
+}
+
+
+fixed record Counters {
+	small: Int8,
+	medium: Int16,
+	wide: Int64,
+	byte: UInt8,
+	half: Float16,
+	single: Float32
+}
+
+
+record OrdinaryPoint {
+	x: Float,
+	y: Float
+}
+
+
+fixed record FlaggedPoint {
+	x: Float,
+	visible: Bool
+}
+
+
+fixed record NamedPoint {
+	x: Float,
+	label: String
+}
+
+
+implements Equatable for Point:
+	pure func equals(left: Point, right: Point) -> Bool:
+		left.x == right.x and left.y == right.y
+
+
+implements Hashable for Point:
+	pure func hash(self: Point) -> Int:
+		hash_combine(self.x.hash(), self.y.hash())
+
+
+implements Orderable for Point:
+	pure func less_than(left: Point, right: Point) -> Bool:
+		left.x < right.x or left.x == right.x and left.y < right.y
+
+
+pure func moved_finish(segment: Segment, dx: Float) -> Segment:
+	{ segment | finish = { segment.finish | x = segment.finish.x + dx } }
+
+
+pure func span(segment: Segment) -> Float:
+	segment.finish.x - segment.start.x
+
+
+func impure_scaled(point: Point, factor: Float) -> Point:
+	{
+		x = point.x * factor,
+		y = point.y * factor
+	}
+
+
+pure func further(left: Point, right: Point) -> Point:
+	if left.x * left.x + left.y * left.y >= right.x * right.x + right.y * right.y:
+		left
+	else:
+		right
+
+
+func counting() -> Bool:
+	read_memory_counter(MemoryStatsActive) == 1
+
+
+func allocations() -> Int:
+	read_memory_counter(ManagedAllocations)
+
+
+func releases() -> Int:
+	read_memory_counter(ManagedReleases)
+
+
+func test_construction_field_read_and_nested_update_do_not_allocate() -> Bool:
+	before = allocations()
+	segment: Segment = {
+		start = {
+			x = 0.0,
+			y = 0.0
+		},
+		finish = {
+			x = 3.0,
+			y = 4.0
+		}
+	}
+	moved: Segment = moved_finish(segment, 2.0)
+	length: Float = span(moved)
+	after = allocations()
+	counting() and after - before == 0 and length == 5.0 and segment.finish.x == 3.0
+
+
+func test_parameters_and_results_do_not_allocate() -> Bool:
+	before = allocations()
+	scaled: Point = impure_scaled(
+		{
+			x = 1.0,
+			y = 2.0
+		},
+		3.0,
+	)
+	chosen: Point = further(
+		scaled,
+		{
+			x = 1.0,
+			y = 1.0
+		},
+	)
+	after = allocations()
+	counting() and after - before == 0 and chosen.x == 3.0 and chosen.y == 6.0
+
+
+func test_mutable_local_updated_in_a_loop_does_not_allocate() -> Bool:
+	before = allocations()
+	var position: Point = {
+		x = 0.0,
+		y = 0.0
+	}
+	var index: Int = 0
+
+	while index < 100:
+		position = { position | x = position.x + 1.0 }
+		index += 1
+
+	after = allocations()
+	counting() and after - before == 0 and position.x == 100.0 and position.y == 0.0
+
+
+func test_branch_join_does_not_allocate() -> Bool:
+	before = allocations()
+	var total: Float = 0.0
+
+	for index in 0..10:
+		point: Point = if index % 2 == 0:
+			{
+				x = 1.0,
+				y = 0.0
+			}
+		else:
+			{
+				x = 0.0,
+				y = 2.0
+			}
+
+		total += point.x + point.y
+
+	after = allocations()
+	counting() and after - before == 0 and total == 15.0
+
+
+func test_char_field_nested_in_an_eligible_record_does_not_allocate() -> Bool:
+	before = allocations()
+	placed: PlacedGlyph = {
+		glyph = {
+			code = 'A',
+			width = to_int32(7)
+		},
+		at = {
+			x = 1.0,
+			y = 2.0
+		}
+	}
+	shifted: PlacedGlyph = { placed | glyph = { placed.glyph | code = 'B' } }
+	after = allocations()
+	counting() and after - before == 0 and shifted.glyph.code == 'B' and placed.glyph.code == 'A'
+
+
+func test_generic_instantiation_and_sized_numbers_do_not_allocate() -> Bool:
+	before = allocations()
+	pair: Pair[Point] = {
+		first = {
+			x = 1.0,
+			y = 2.0
+		},
+		second = {
+			x = 3.0,
+			y = 4.0
+		}
+	}
+	counters: Counters = {
+		small = to_int8(1),
+		medium = to_int16(2),
+		wide = 3,
+		byte = to_uint8(4),
+		half = to_float16(0.5),
+		single = to_float32(1.5)
+	}
+	after = allocations()
+	counting() and after - before == 0 and pair.second.y == 4.0 and counters.byte == to_uint8(4)
+
+
+func test_equality_hash_and_order_do_not_allocate() -> Bool:
+	left: Point = {
+		x = 1.0,
+		y = 2.0
+	}
+	right: Point = {
+		x = 1.0,
+		y = 2.0
+	}
+	before = allocations()
+	same: Bool = left == right
+	hashed: Bool = left.hash() == right.hash()
+	ordered: Bool = left <= right and not (left < right)
+	after = allocations()
+	counting() and after - before == 0 and same and hashed and ordered
+
+
+func test_ordinary_record_still_allocates() -> Bool:
+	before = allocations()
+	point: OrdinaryPoint = {
+		x = 1.0,
+		y = 2.0
+	}
+	after = allocations()
+	counting() and after - before == 1 and point.y == 2.0
+
+
+func test_fixed_record_with_bool_field_still_allocates() -> Bool:
+	before = allocations()
+	point: FlaggedPoint = {
+		x = 1.0,
+		visible = True
+	}
+	after = allocations()
+	counting() and after - before == 1 and point.visible
+
+
+func test_fixed_record_with_string_field_still_allocates() -> Bool:
+	label: String = "origin"
+	before = allocations()
+	point: NamedPoint = {
+		x = 1.0,
+		label = label
+	}
+	after = allocations()
+	counting() and after - before == 1 and point.label == "origin"
+
+
+func test_inline_values_are_never_released() -> Bool:
+	before = releases()
+	segment: Segment = {
+		start = {
+			x = 0.0,
+			y = 0.0
+		},
+		finish = {
+			x = 3.0,
+			y = 4.0
+		}
+	}
+	copy: Segment = segment
+	moved: Segment = moved_finish(copy, 1.0)
+	after = releases()
+	counting() and after - before == 0 and moved.finish.x == 4.0 and segment.finish.x == 3.0
+
+
+tests: TestSuite = {
+	description = "Inline fixed record allocations",
+	tests = [
+		(
+			"construction, field read and nested update do not allocate",
+			test_construction_field_read_and_nested_update_do_not_allocate,
+		),
+		("parameters and results do not allocate", test_parameters_and_results_do_not_allocate),
+		(
+			"a mutable local updated in a loop does not allocate",
+			test_mutable_local_updated_in_a_loop_does_not_allocate,
+		),
+		("a branch join does not allocate", test_branch_join_does_not_allocate),
+		(
+			"a Char field nested in an eligible record does not allocate",
+			test_char_field_nested_in_an_eligible_record_does_not_allocate,
+		),
+		(
+			"generic instantiations and sized numbers do not allocate",
+			test_generic_instantiation_and_sized_numbers_do_not_allocate,
+		),
+		("equality, hash and order do not allocate", test_equality_hash_and_order_do_not_allocate),
+		("an ordinary record still allocates", test_ordinary_record_still_allocates),
+		(
+			"a fixed record with a Bool field still allocates",
+			test_fixed_record_with_bool_field_still_allocates,
+		),
+		(
+			"a fixed record with a String field still allocates",
+			test_fixed_record_with_string_field_still_allocates,
+		),
+		("inline values are never released", test_inline_values_are_never_released),
+	]
+}

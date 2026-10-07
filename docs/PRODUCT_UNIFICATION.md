@@ -567,7 +567,8 @@ admitted or given a defined boundary:
   `refcount` is a sink, for every managed product, so the builtins answer as
   they do today and the compiler's own `same_object` "unchanged" checks keep
   their meaning. This replaces increment 2's rule that answered `False`,
-  `True`, `0` for a flattened tuple. Inline products are open decision 14.
+  `True`, `0` for a flattened tuple. On an inline product they are a compile
+  error (decision 14).
 - **Boundaries.** A record with a declared native ABI stays boxed at its
   adapters. A product with more data members than the multi-value limit
   (decision 3) is boxed at call boundaries but may be flattened as a local.
@@ -1130,14 +1131,14 @@ Owner decisions (Keith), including the open ones:
 - **6. Inline scalar tuples.** Open. Making a tuple whose elements pass the
   inline eligibility test inline implicitly, after slice 5, applies the same
   plain-data rule as fixed records with no `fixed` promise to check. It
-  depends on decision 14. Recommendation: adopt it once decision 14 is
-  settled.
-- **14. Identity builtins on inline products.** Open. An inline value has no
-  allocation, so `same_object`, `is_unique` and `refcount` have no truthful
-  answer for it. This already arises for inline fixed records, and would for
-  inline tuples. Recommendation: they are a compile error on inline
-  products, reported by typecheck with a help line that the value is
-  stored inline.
+  depends on decision 14, now decided. Recommendation: adopt it.
+- **14. Identity builtins on inline products.** Decided by Keith
+  (2026-10-06): a compile error. An inline value has no allocation, so
+  `same_object`, `is_unique` and `refcount` have no truthful answer for it.
+  Representation is decided after monomorphization, so the inline fixed-record
+  change reports the error there (`record_representation`,
+  `error[inline_record_identity]` with a help line), not in typecheck; inline
+  tuples will use the same check.
 
 Team decisions, taken as recommended or as the coordinator decided:
 

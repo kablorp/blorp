@@ -4,11 +4,12 @@ import:
 			ArcReleaseOnlyPolicy, ArcReleasePolicy, NoReleasePolicy, StackResultReleasePolicy,
 		),
 		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType,
-			StackResultType, TensorType, TupleType, TypeParameterType, UnionType,
-			VoidType,
+			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType,
+			RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType,
+			UnionType, VoidType,
 		),
 	type_policy:
+		erased_slot_holds_owned_box,
 		is_core_fallible_stream_type_name,
 		is_core_resource_source_type_name,
 		is_core_stream_type_name,
@@ -172,6 +173,14 @@ pure func stack_option_c_type(
 			)
 		HeapRecordType(name):
 			None
+		InlineRecordType(name):
+			Some(
+				generated_stack_option_c_type_name(
+					type_symbol_lookup
+						.get(name)
+						.get_or(name),
+				),
+			)
 		UnionType(name):
 			None
 		StackResultType(ok_type, err_type):
@@ -367,6 +376,10 @@ pure func c_type_name(typ: CoreType, type_symbol_lookup: Dict[String, String]) -
 			type_symbol_lookup
 				.get(name)
 				.get_or(name) + "*"
+		InlineRecordType(name):
+			type_symbol_lookup
+				.get(name)
+				.get_or(name)
 		UnionType(name):
 			type_symbol_lookup
 				.get(name)
@@ -396,6 +409,8 @@ pure func is_void_type(typ: CoreType) -> Bool:
 		EnumType(name):
 			False
 		HeapRecordType(name):
+			False
+		InlineRecordType(name):
 			False
 		UnionType(name):
 			False
@@ -429,12 +444,21 @@ pure func type_requires_release(typ: CoreType) -> Bool:
 			False
 		HeapRecordType(name):
 			True
+		InlineRecordType(name):
+			False
 		RangeType:
 			False
 		TensorType(info):
 			True
 
 
+---
+Whether a value of `typ` itself carries references its holder must release:
+a managed pointer, or a stack Result whose payload slots own objects. This is
+a question about the value; where the value is stored in an erased slot, ask
+`erased_slot_needs_release_type`, which also counts a box made for the
+crossing.
+---
 pure func boxed_value_needs_release_type(typ: CoreType) -> Bool:
 	match typ:
 		NamedType(name, args):
@@ -484,6 +508,10 @@ pure func boxed_value_needs_release_type(typ: CoreType) -> Bool:
 			True
 		HeapRecordType(name):
 			True
+		InlineRecordType(name):
+			-- A struct of scalars owns nothing. The struct box it takes in an
+			-- erased slot is the slot's (`erased_slot_holds_owned_box`).
+			False
 		UnionType(name):
 			True
 		TupleType(items):
@@ -496,6 +524,19 @@ pure func boxed_value_needs_release_type(typ: CoreType) -> Bool:
 			False
 		RangeType:
 			False
+
+
+---
+Whether a value of `typ` stored in an erased `void*` slot (a task result, for
+example) leaves the slot holding an object it must release: the value's own
+references, or a box made for the crossing (`erased_slot_holds_owned_box`).
+
+Known fault (DIAGNOSTIC_GAPS CF-019): `Int128` and `UInt128` also cross an
+erased slot in an allocated box but are not counted, so a task returning one
+leaks its result box.
+---
+pure func erased_slot_needs_release_type(typ: CoreType) -> Bool:
+	erased_slot_holds_owned_box(typ) or boxed_value_needs_release_type(typ)
 
 
 pure func dict_stored_value_needs_release_type(typ: CoreType) -> Bool:
@@ -512,6 +553,8 @@ pure func dict_stored_value_needs_release_type(typ: CoreType) -> Bool:
 			True
 		HeapRecordType(name):
 			boxed_value_needs_release_type(typ)
+		InlineRecordType(name):
+			erased_slot_holds_owned_box(typ)
 		UnionType(name):
 			boxed_value_needs_release_type(typ)
 		TupleType(items):
@@ -550,6 +593,8 @@ pure func dict_value_needs_release_type(typ: CoreType) -> Bool:
 		FunctionType(_, _, _):
 			False
 		HeapRecordType(name):
+			False
+		InlineRecordType(name):
 			False
 		UnionType(name):
 			False
@@ -591,6 +636,8 @@ pure func channel_element_type(typ: CoreType) -> Option[CoreType]:
 		EnumType(name):
 			None
 		HeapRecordType(name):
+			None
+		InlineRecordType(name):
 			None
 		UnionType(name):
 			None

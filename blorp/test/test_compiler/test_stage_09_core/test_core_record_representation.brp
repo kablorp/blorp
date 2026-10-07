@@ -1,0 +1,579 @@
+-- Which records are stored inline, and what ownership work inline records get.
+--
+-- The decision cases cover the eligibility rule: every field a number, `Char`
+-- or another admitted fixed record, decided per concrete declaration. The
+-- ownership cases run Perceus and record-update lowering over the same Core
+-- shapes with an inline and a managed record, so the control shows the work an
+-- inline record does not get.
+import:
+	../../../src/compiler/stage_06_typecheck/type_system/language_surface_manifest:
+		DeclaredAbiType(DeclaredAbiMemStats),
+	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
+	../../../src/compiler/stage_09_core/ir:
+		CoreCallKind(BuiltinCall, SelectedDirectCall),
+		CoreBinderOrigin(AuthoredBinder),
+		CoreDecl(FunctionDecl, HeapRecordDecl, InlineRecordDecl, TypeAliasDecl),
+		CoreExpr(
+			CallExpr, DropExpr, DupExpr, FieldExpr, LetExpr, RecordExpr, RecordUpdateExpr, VarExpr,
+		),
+		CoreFunctionKind(UserFunction),
+		CoreHeapRecordField,
+		CoreParam,
+		CoreProgram,
+		CoreRecordFieldValue,
+		CoreRecordForm(FixedRecordForm, OrdinaryRecordForm),
+		CoreReleasePolicy(NoReleasePolicy),
+		CoreType(HeapRecordType, InlineRecordType, NamedType),
+		CoreVar,
+		core_field_ref,
+		core_source_loc_from_raw,
+		synthetic_core_source_loc,
+	../../../src/compiler/stage_09_core/perceus: insert_drops_program
+	../../../src/compiler/stage_09_core/pass_runner:
+		CoreModuleTableCheck(SkipModuleTableCheck),
+		CorePassControl,
+		CorePassDiagnostic(CorePassMessage),
+		CorePassRun(CorePassesFailed),
+		core_pass_state,
+		run_core_passes,
+	../../../src/compiler/stage_09_core/pipeline: late_core_passes_for_control
+	../../../src/compiler/stage_09_core/record_representation:
+		CoreObjectIdentityBuiltin(SameObjectBuiltin),
+		decide_record_representations,
+		inline_record_identity_violation,
+		inline_record_scalar_type_name,
+	../../../src/compiler/stage_09_core/record_update: lower_record_updates_for_ownership
+	../../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
+	test: TestSuite
+
+
+pure func field(name: String, ordinal: Int, typ: CoreType) -> CoreHeapRecordField:
+	{
+		name = name,
+		ref = core_field_ref(9000 + ordinal),
+		typ = typ,
+		release_policy = NoReleasePolicy
+	}
+
+
+pure func record_decl(
+	name: String,
+	form: CoreRecordForm,
+	type_params: List[String],
+	fields: List[CoreHeapRecordField],
+) -> CoreDecl:
+	HeapRecordDecl({
+		abi_type = None,
+		form = form,
+		name = name,
+		type_params = type_params,
+		fields = fields,
+		loc = synthetic_core_source_loc(),
+	})
+
+
+pure func named(name: String) -> CoreType:
+	NamedType(name, [])
+
+
+pure func program_of(decls: List[CoreDecl]) -> CoreProgram:
+	{
+		decls = decls,
+		foreign_includes = [],
+		source_files = []
+	}
+
+
+pure func inline_names(program: CoreProgram) -> List[String]:
+	var names: List[String] = []
+
+	for decl in program.decls:
+		match decl:
+			InlineRecordDecl(inline_decl):
+				names = names.append(inline_decl.name)
+			_:
+				void
+
+	names
+
+
+pure func decided(decls: List[CoreDecl]) -> List[String]:
+	inline_names(decide_record_representations(program_of(decls)))
+
+
+pure func point_decl(form: CoreRecordForm) -> CoreDecl:
+	record_decl("Point", form, [], [field("x", 0, named("Float")), field("y", 1, named("Float"))])
+
+
+pure func test_scalar_set_is_numbers_and_char() -> Bool:
+	accepted: List[String] = [
+		"Int", "Int8", "Int16", "Int32", "Int64", "Int128", "UInt8", "UInt16", "UInt32", "UInt64",
+		"UInt128", "Float", "Float16", "Float32", "Char",
+	]
+	rejected: List[String] = ["Bool", "FixedPoint", "String", "List", "Ptr", "Void", "Option"]
+	(
+		accepted.all(inline_record_scalar_type_name)
+		and not rejected.any(inline_record_scalar_type_name)
+	)
+
+
+pure func test_fixed_record_of_numbers_is_inline() -> Bool:
+	decided([point_decl(FixedRecordForm)]) == ["Point"]
+
+
+pure func test_ordinary_record_stays_managed() -> Bool:
+	decided([point_decl(OrdinaryRecordForm)]).is_empty()
+
+
+pure func test_nested_fixed_records_and_char_are_inline() -> Bool:
+	glyph: CoreDecl = record_decl("Glyph", FixedRecordForm, [], [
+		field("code", 0, named("Char")),
+		field("width", 1, named("Int32")),
+	])
+	placed: CoreDecl = record_decl("Placed", FixedRecordForm, [], [
+		field("glyph", 0, named("Glyph")),
+		field("at", 1, named("Point")),
+	])
+	names: List[String] = decided([placed, glyph, point_decl(FixedRecordForm)])
+	names.length() == 3 and names.contains("Placed") and names.contains("Glyph")
+
+
+pure func test_inline_records_follow_the_records_their_fields_hold() -> Bool:
+	segment: CoreDecl = record_decl("Segment", FixedRecordForm, [], [
+		field("start", 0, named("Point")),
+		field("finish", 1, named("Point")),
+	])
+	labelled: CoreDecl = record_decl("Labelled", OrdinaryRecordForm, [], [field("at", 0, named("Segment"))])
+	program: CoreProgram = decide_record_representations(
+		program_of([labelled, segment, point_decl(FixedRecordForm)]),
+	)
+	-- The C emitter defines inline structs in program order, so Point must
+	-- precede Segment even though Segment was declared first.
+	inline_names(program) == ["Point", "Segment"] and program.decls.length() == 3
+
+
+pure func test_bool_and_managed_fields_keep_fixed_record_managed() -> Bool:
+	flagged: CoreDecl = record_decl("Flagged", FixedRecordForm, [], [
+		field("x", 0, named("Float")),
+		field("visible", 1, named("Bool")),
+	])
+	labelled: CoreDecl = record_decl("Labelled", FixedRecordForm, [], [
+		field("label", 0, named("String")),
+	])
+	decided([flagged, labelled]).is_empty()
+
+
+pure func test_fixed_record_holding_a_managed_fixed_record_stays_managed() -> Bool:
+	labelled: CoreDecl = record_decl("Labelled", FixedRecordForm, [], [
+		field("label", 0, named("String")),
+	])
+	outer: CoreDecl = record_decl("Outer", FixedRecordForm, [], [
+		field("inner", 0, named("Labelled")),
+		field("x", 1, named("Float")),
+	])
+	ordinary_inner: CoreDecl = record_decl("Holder", FixedRecordForm, [], [
+		field("point", 0, named("Point")),
+	])
+	(
+		decided([labelled, outer]).is_empty()
+		and decided([ordinary_inner, point_decl(OrdinaryRecordForm)]).is_empty()
+	)
+
+
+pure func test_generic_template_is_decided_per_instance() -> Bool:
+	template: CoreDecl = record_decl("Pair", FixedRecordForm, ["T"], [
+		field("first", 0, NamedType("T", [])),
+		field("second", 1, NamedType("T", [])),
+	])
+	instance: CoreDecl = record_decl("Pair__Float", FixedRecordForm, [], [
+		field("first", 0, named("Float")),
+		field("second", 1, named("Float")),
+	])
+	decided([template, instance]) == ["Pair__Float"]
+
+
+pure func test_declared_abi_record_stays_managed() -> Bool:
+	stats: CoreDecl = HeapRecordDecl({
+		abi_type = Some(DeclaredAbiMemStats),
+		form = FixedRecordForm,
+		name = "MemStats",
+		type_params = [],
+		fields = [field("count", 0, named("Int"))],
+		loc = synthetic_core_source_loc(),
+	})
+	decided([stats]).is_empty()
+
+
+pure func test_self_containing_record_is_not_inline() -> Bool:
+	cyclic: CoreDecl = record_decl("Loop", FixedRecordForm, [], [field("next", 0, named("Loop"))])
+	decided([cyclic]).is_empty()
+
+
+pure func test_name_declared_twice_stays_managed() -> Bool:
+	decided([point_decl(FixedRecordForm), point_decl(FixedRecordForm)]).is_empty()
+
+
+pure func test_opaque_number_field_is_inline() -> Bool:
+	meters: CoreDecl = TypeAliasDecl({
+		abi_type = None,
+		name = "Meters",
+		type_params = [],
+		target = named("Float"),
+		is_opaque = True,
+		loc = synthetic_core_source_loc(),
+	})
+	length: CoreDecl = record_decl("Length", FixedRecordForm, [], [field("value", 0, named("Meters"))])
+	decided([meters, length]) == ["Length"]
+
+
+pure func test_empty_fixed_record_is_inline() -> Bool:
+	decided([record_decl("Empty", FixedRecordForm, [], [])]) == ["Empty"]
+
+
+pure func test_inline_decl_keeps_field_identity_and_order() -> Bool:
+	match decide_record_representations(program_of([point_decl(FixedRecordForm)])).decls:
+		[InlineRecordDecl(inline_decl)]:
+			inline_decl.fields.map(func(item): item.name) == ["x", "y"] and inline_decl.fields.length() == 2
+		_:
+			False
+
+
+pure func authored(name: String) -> CoreVar:
+	{
+		name = name,
+		id = 0,
+		def_id = None,
+		origin = AuthoredBinder
+	}
+
+
+pure func param(name: String, typ: CoreType) -> CoreParam:
+	{
+		name = authored(name),
+		typ = typ,
+		loc = synthetic_core_source_loc()
+	}
+
+
+pure func var_expr(name: String, typ: CoreType) -> CoreExpr:
+	VarExpr(authored(name), typ, synthetic_core_source_loc())
+
+
+---
+`twice(p) = let first = p; let second = p; first`: a managed `p` is duplicated
+for the second alias and the unused one is dropped.
+---
+pure func alias_program(record_type: CoreType, declaration: CoreDecl) -> CoreProgram:
+	body: CoreExpr = LetExpr(
+		authored("first"),
+		False,
+		record_type,
+		var_expr("p", record_type),
+		LetExpr(
+			authored("second"),
+			False,
+			record_type,
+			var_expr("p", record_type),
+			var_expr("first", record_type),
+		),
+	)
+	program_of([
+		declaration,
+		FunctionDecl({
+			name = "twice",
+			source_module = None,
+			type_params = [],
+			params = [param("p", record_type)],
+			return_type = record_type,
+			body = Some(body),
+			is_pure = True,
+			origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+			module = FIXTURE_NO_SOURCE_MODULE,
+			function_kind = UserFunction,
+			def_id = 7001,
+			loc = synthetic_core_source_loc(),
+		}),
+	])
+
+
+pure func ownership_operations(expr: CoreExpr) -> Int:
+	var count: Int = 0
+	var pending: List[CoreExpr] = [expr]
+
+	while not pending.is_empty():
+		last: Int = pending.length() - 1
+		current: Option[CoreExpr] = pending.get(last)
+		pending = pending.take(last)
+
+		match current:
+			Some(node):
+				match node:
+					DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _):
+						count += 1
+					_:
+						void
+				pending = pending.concat(immediate_core_expr_children(node))
+			None:
+				void
+
+	count
+
+
+pure func function_operations(program: CoreProgram) -> Int:
+	var count: Int = 0
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				match function.body:
+					Some(body):
+						count += ownership_operations(body)
+					None:
+						void
+			_:
+				void
+
+	count
+
+
+pure func inline_point_program_decl() -> CoreDecl:
+	match decide_record_representations(program_of([point_decl(FixedRecordForm)])).decls:
+		[decl]:
+			decl
+		_:
+			point_decl(FixedRecordForm)
+
+
+pure func test_perceus_inserts_no_ownership_work_for_inline_records() -> Bool:
+	inline_ops: Int = function_operations(
+		insert_drops_program(alias_program(InlineRecordType("Point"), inline_point_program_decl())),
+	)
+	managed_ops: Int = function_operations(
+		insert_drops_program(alias_program(HeapRecordType("Point"), point_decl(OrdinaryRecordForm))),
+	)
+	inline_ops == 0 and managed_ops > 0
+
+
+pure func update_fields(record_type: CoreType) -> List[CoreRecordFieldValue]:
+	base: CoreExpr = var_expr("p", record_type)
+	[
+		{
+			name = "x",
+			ref = core_field_ref(9000),
+			value = FieldExpr(base, "x", core_field_ref(9000), named("Float"), synthetic_core_source_loc())
+		},
+		{
+			name = "y",
+			ref = core_field_ref(9001),
+			value = var_expr("dy", named("Float"))
+		},
+	]
+
+
+pure func update_program(record_type: CoreType, declaration: CoreDecl) -> CoreProgram:
+	program_of([
+		declaration,
+		FunctionDecl({
+			name = "moved",
+			source_module = None,
+			type_params = [],
+			params = [param("p", record_type), param("dy", named("Float"))],
+			return_type = record_type,
+			body = Some(
+				RecordUpdateExpr(
+					var_expr("p", record_type),
+					update_fields(record_type),
+					record_type,
+					synthetic_core_source_loc(),
+				),
+			),
+			is_pure = True,
+			origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+			module = FIXTURE_NO_SOURCE_MODULE,
+			function_kind = UserFunction,
+			def_id = 7002,
+			loc = synthetic_core_source_loc(),
+		}),
+	])
+
+
+pure func lowered_body(program: CoreProgram) -> Option[CoreExpr]:
+	var found: Option[CoreExpr] = None
+
+	for decl in lower_record_updates_for_ownership(program).decls:
+		match decl:
+			FunctionDecl(function):
+				found = function.body
+			_:
+				void
+
+	found
+
+
+pure func test_inline_record_update_is_a_plain_value_copy() -> Bool:
+	match lowered_body(update_program(InlineRecordType("Point"), inline_point_program_decl())):
+		Some(RecordExpr(fields, InlineRecordType("Point"), _)):
+			fields.length() == 2
+		_:
+			False
+
+
+---
+`same(p, q)` calls the instance `same_object_at(left, right)`, whose body is
+the `blorp_same_object` builtin, as monomorphization leaves it.
+---
+pure func identity_program(record_type: CoreType, declaration: CoreDecl) -> CoreProgram:
+	builtin_call: CoreExpr = CallExpr(
+		BuiltinCall("blorp_same_object"),
+		var_expr("blorp_same_object", named("Closure")),
+		[var_expr("left", record_type), var_expr("right", record_type)],
+		named("Bool"),
+		synthetic_core_source_loc(),
+	)
+	user_call: CoreExpr = CallExpr(
+		SelectedDirectCall(7101),
+		var_expr("same_object_at", named("Closure")),
+		[var_expr("p", record_type), var_expr("p", record_type)],
+		named("Bool"),
+		synthetic_core_source_loc(),
+	)
+	program_of([
+		declaration,
+		identity_function("same_object_at", 7101, [param("left", record_type), param("right", record_type)], builtin_call),
+		identity_function("same", 7102, [param("p", record_type)], user_call),
+	])
+
+
+pure func identity_function(name: String, def_id: Int, params: List[CoreParam], body: CoreExpr) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = params,
+		return_type = named("Bool"),
+		body = Some(body),
+		is_pure = True,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = synthetic_core_source_loc(),
+	})
+
+
+pure func test_same_object_on_inline_record_is_reported() -> Bool:
+	inline_hit: Bool = match inline_record_identity_violation(
+		identity_program(named("Point"), inline_point_program_decl()),
+	):
+		Some(violation):
+			violation.identity_builtin == SameObjectBuiltin
+		None:
+			False
+	managed_hit: Bool = inline_record_identity_violation(
+		identity_program(named("Point"), point_decl(OrdinaryRecordForm)),
+	).is_some()
+	inline_hit and not managed_hit
+
+
+pure func same_object_builtin(record_type: CoreType) -> CoreExpr:
+	CallExpr(
+		BuiltinCall("blorp_same_object"),
+		var_expr("blorp_same_object", named("Closure")),
+		[var_expr("left", record_type), var_expr("left", record_type)],
+		named("Bool"),
+		synthetic_core_source_loc(),
+	)
+
+
+pure func checked_late_control() -> CorePassControl:
+	{
+		observe = [],
+		stop_after = None,
+		check_invariants = True,
+		record_timings = False,
+		modules = SkipModuleTableCheck
+	}
+
+
+func test_identity_builtin_that_escapes_the_check_fails_the_late_pipeline() -> Bool:
+	-- As if the after-monomorphization check had missed it: the late passes
+	-- run, backend projection refuses to turn the call into a pointer
+	-- comparison, and the checked final invariant stops the program before
+	-- emission.
+	point: CoreType = InlineRecordType("Point")
+	-- A well-formed body: an identified binder and a distinct node id per node.
+	left: CoreVar = { authored("left") | id = 11 }
+	body: CoreExpr = CallExpr(
+		BuiltinCall("blorp_same_object"),
+		VarExpr(authored("blorp_same_object"), named("Closure"), core_source_loc_from_raw(-11)),
+		[
+			VarExpr(left, point, core_source_loc_from_raw(-12)),
+			VarExpr(left, point, core_source_loc_from_raw(-13)),
+		],
+		named("Bool"),
+		core_source_loc_from_raw(-14),
+	)
+	program: CoreProgram = program_of([
+		inline_point_program_decl(),
+		identity_function(
+			"same",
+			7103,
+			[{name = left, typ = point, loc = synthetic_core_source_loc()}],
+			body,
+		),
+	])
+	control: CorePassControl = checked_late_control()
+
+	match run_core_passes(late_core_passes_for_control(control), core_pass_state(program, 8000), control):
+		CorePassesFailed(_, CorePassMessage(detail), _):
+			detail.contains("object-identity builtin `blorp_same_object` on an inline record")
+		_:
+			False
+
+
+pure func test_uncalled_forwarding_identity_function_is_reported() -> Bool:
+	program: CoreProgram = program_of([
+		inline_point_program_decl(),
+		identity_function(
+			"same_object_at",
+			7104,
+			[param("left", named("Point"))],
+			same_object_builtin(named("Point")),
+		),
+	])
+	inline_record_identity_violation(program).is_some()
+
+
+tests: TestSuite = {
+	description = "Core record representation",
+	tests = [
+		("the inline scalar set is the numbers and Char", test_scalar_set_is_numbers_and_char),
+		("a fixed record of numbers is inline", test_fixed_record_of_numbers_is_inline),
+		("an ordinary record stays managed", test_ordinary_record_stays_managed),
+		("nested fixed records and Char fields are inline", test_nested_fixed_records_and_char_are_inline),
+		(
+			"inline records follow the records their fields hold",
+			test_inline_records_follow_the_records_their_fields_hold,
+		),
+		("Bool and managed fields keep a fixed record managed", test_bool_and_managed_fields_keep_fixed_record_managed),
+		("a fixed record holding a managed record stays managed", test_fixed_record_holding_a_managed_fixed_record_stays_managed),
+		("a generic template is decided per instance", test_generic_template_is_decided_per_instance),
+		("a declared ABI record stays managed", test_declared_abi_record_stays_managed),
+		("a self-containing record is not inline", test_self_containing_record_is_not_inline),
+		("a name declared twice stays managed", test_name_declared_twice_stays_managed),
+		("an opaque number field is inline", test_opaque_number_field_is_inline),
+		("an empty fixed record is inline", test_empty_fixed_record_is_inline),
+		("an inline declaration keeps field identity and order", test_inline_decl_keeps_field_identity_and_order),
+		("Perceus inserts no ownership work for inline records", test_perceus_inserts_no_ownership_work_for_inline_records),
+		("an inline record update is a plain value copy", test_inline_record_update_is_a_plain_value_copy),
+		("same_object on an inline record is reported", test_same_object_on_inline_record_is_reported),
+		(
+			"an identity builtin that escapes the check fails the late pipeline",
+			test_identity_builtin_that_escapes_the_check_fails_the_late_pipeline,
+		),
+		(
+			"an uncalled forwarding identity function is reported",
+			test_uncalled_forwarding_identity_function_is_reported,
+		),
+	]
+}

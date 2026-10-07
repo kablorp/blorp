@@ -4,6 +4,7 @@
 -- materialization stay in ordinary Core so the later match, trait, ownership,
 -- and reuse stages retain one coherent view of list behavior.
 import:
+	c_type_layout: generated_stack_option_c_type_name
 	desugar: desugar_core_string_binary
 	ir:
 		CoreBinaryOp(
@@ -24,9 +25,9 @@ import:
 		CorePreClosureConcurrentlyLoop,
 		CoreSourceLoc,
 		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType,
-			StackResultType, TensorType, TupleType, TypeParameterType, UnionType,
-			VoidType,
+			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType,
+			RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType,
+			UnionType, VoidType,
 		),
 		CoreUnboxKind(
 			Float16Unbox, Float32Unbox, FloatUnbox, Int128Unbox, PointerUnbox, PrimUnbox,
@@ -38,6 +39,13 @@ import:
 		core_expr_type,
 		synthetic_core_source_loc,
 	mono: core_mono_type_equal
+	synth_context:
+		CoreSynthContext,
+		CoreSynthNamedTypeLayout(
+			SynthEnumLayout, SynthHeapRecordLayout, SynthInlineRecordLayout, SynthUnionLayout,
+		),
+		core_synth_expand_alias,
+		core_synth_named_type_layout,
 	synth_nodes:
 		BREAK_EXPR,
 		VOID_EXPR,
@@ -135,7 +143,7 @@ private pure func type_is_concrete(typ: CoreType) -> Bool:
 			type_is_concrete(info.element_type)
 		TupleType(elements):
 			elements.all(type_is_concrete)
-		VoidType | EnumType(_) | HeapRecordType(_) | UnionType(_) | RangeType:
+		VoidType | EnumType(_) | HeapRecordType(_) | InlineRecordType(_) | UnionType(_) | RangeType:
 			True
 
 
@@ -222,6 +230,8 @@ private pure func stack_option_c_type(payload: CoreType) -> Option[String]:
 				None
 		EnumType(name):
 			Some("blorp_StackOption_" + name)
+		InlineRecordType(name):
+			Some(generated_stack_option_c_type_name(name))
 		RangeType:
 			Some("blorp_StackOption_Range")
 		_:
@@ -259,6 +269,8 @@ private pure func unbox_kind_for_type(typ: CoreType) -> CoreUnboxKind:
 			PrimUnbox
 		StackResultType(_, _):
 			StructUnbox("blorp_StackResult")
+		InlineRecordType(name):
+			StructUnbox(name)
 		VoidType | RangeType:
 			PrimUnbox
 		_:
@@ -581,7 +593,55 @@ private pure func synthesize_swap(
 	)
 
 
+---
+How `remove`, `insert` and `tail` shift an element from one slot to another
+inside a uniquely owned list.
+---
+private enum ListSlotMove:
+	-- The slot holds one word (a managed pointer, a scalar bit pattern or a
+	-- box) and the list keeps owning it, so the raw word moves untyped.
+	RawWordSlotMove
+	-- The slot holds an inline record by value, so the struct itself is read
+	-- and stored.
+	InlineRecordSlotMove
+
+
+private pure func list_slot_move(context: CoreSynthContext, element_type: CoreType) -> ListSlotMove:
+	match core_synth_expand_alias(context, element_type):
+		NamedType(name, []):
+			match core_synth_named_type_layout(context, name):
+				Some(SynthInlineRecordLayout):
+					InlineRecordSlotMove
+				Some(SynthEnumLayout) | Some(SynthHeapRecordLayout) | Some(SynthUnionLayout) | None:
+					RawWordSlotMove
+		NamedType(_, [_, ..._]):
+			RawWordSlotMove
+		InlineRecordType(_):
+			InlineRecordSlotMove
+		VoidType | EnumType(_) | HeapRecordType(_) | UnionType(_) | RangeType | TupleType(_):
+			RawWordSlotMove
+		StackResultType(_, _) | BoxedResultType(_, _) | FunctionType(_, _, _) | TensorType(_):
+			RawWordSlotMove
+		TypeParameterType(_) | SelfType:
+			RawWordSlotMove
+
+
+private pure func moved_slot_value(
+	move: ListSlotMove,
+	list: CoreExpr,
+	index: CoreExpr,
+	element_type: CoreType,
+) -> CoreExpr:
+	match move:
+		RawWordSlotMove:
+			intrinsic_call("list_get", [list, index], POINTER_TYPE)
+		InlineRecordSlotMove:
+			list_value(list, index, element_type)
+
+
 private pure func synthesize_remove(
+	move: ListSlotMove,
+	element_type: CoreType,
 	list_type: CoreType,
 	self: CoreExpr,
 	index: CoreExpr,
@@ -631,11 +691,7 @@ private pure func synthesize_remove(
 									int_literal(1),
 									INT_TYPE,
 								),
-								intrinsic_call(
-									"list_get",
-									[variable("__result", list_type), variable("__i", INT_TYPE)],
-									POINTER_TYPE,
-								),
+								moved_slot_value(move, variable("__result", list_type), variable("__i", INT_TYPE), element_type),
 							],
 							VoidType,
 						),
@@ -663,6 +719,8 @@ private pure func synthesize_remove(
 
 
 private pure func synthesize_insert(
+	move: ListSlotMove,
+	element_type: CoreType,
 	list_type: CoreType,
 	self: CoreExpr,
 	index: CoreExpr,
@@ -728,14 +786,7 @@ private pure func synthesize_insert(
 										int_literal(1),
 										INT_TYPE,
 									),
-									intrinsic_call(
-										"list_get",
-										[
-											variable("__result", list_type),
-											variable("__j", INT_TYPE),
-										],
-										POINTER_TYPE,
-									),
+									moved_slot_value(move, variable("__result", list_type), variable("__j", INT_TYPE), element_type),
 								],
 								VoidType,
 							),
@@ -779,7 +830,12 @@ private pure func synthesize_insert(
 	)
 
 
-private pure func synthesize_tail(list_type: CoreType, self: CoreExpr) -> CoreExpr:
+private pure func synthesize_tail(
+	move: ListSlotMove,
+	element_type: CoreType,
+	list_type: CoreType,
+	self: CoreExpr,
+) -> CoreExpr:
 	immutable_let(
 		"__n",
 		INT_TYPE,
@@ -828,14 +884,7 @@ private pure func synthesize_tail(list_type: CoreType, self: CoreExpr) -> CoreEx
 										int_literal(1),
 										INT_TYPE,
 									),
-									intrinsic_call(
-										"list_get",
-										[
-											variable("__result", list_type),
-											variable("__i", INT_TYPE),
-										],
-										POINTER_TYPE,
-									),
+									moved_slot_value(move, variable("__result", list_type), variable("__i", INT_TYPE), element_type),
 								],
 								VoidType,
 							),
@@ -2432,6 +2481,14 @@ private pure func synthesize_drop_while(
 	)
 
 
+---
+Stores one kept element in a partition result list.
+
+Known fault (DIAGNOSTIC_GAPS CF-020): `partition` and `unique`, which builds
+the same retain-then-owned-store sequence, leak one managed record per
+element; one reference per stored element appears to be taken twice. Inline
+records are unaffected.
+---
 private pure func partition_push(
 	list_name: String,
 	out_name: String,
@@ -4695,6 +4752,7 @@ private pure func tuple_pair_types(typ: CoreType) -> Option[(CoreType, CoreType)
 
 
 private pure func synthesize_named_body(
+	context: CoreSynthContext,
 	name: String,
 	params: List[CoreParam],
 	return_type: CoreType,
@@ -4861,6 +4919,8 @@ private pure func synthesize_named_body(
 		):
 			Some(
 				synthesize_remove(
+					list_slot_move(context, element_type),
+					element_type,
 					self_param.typ,
 					parameter_value(self_param),
 					parameter_value(index_param),
@@ -4881,6 +4941,8 @@ private pure func synthesize_named_body(
 		):
 			Some(
 				synthesize_insert(
+					list_slot_move(context, element_type),
+					element_type,
 					self_param.typ,
 					parameter_value(self_param),
 					parameter_value(index_param),
@@ -4894,7 +4956,14 @@ private pure func synthesize_named_body(
 		element_type ?= list_element_type(self_param.typ)
 
 		if type_is_concrete(element_type) and core_mono_type_equal(return_type, self_param.typ):
-			Some(synthesize_tail(self_param.typ, parameter_value(self_param)))
+			Some(
+				synthesize_tail(
+					list_slot_move(context, element_type),
+					element_type,
+					self_param.typ,
+					parameter_value(self_param),
+				),
+			)
 		else:
 			None
 	else if name == "reverse" and params.length() == 1:
@@ -5626,8 +5695,12 @@ private pure func synthesize_named_body(
 		None
 
 
-pure func synthesize_list_body(function_info: CoreFunction, member: String) -> Option[CoreExpr]:
+pure func synthesize_list_body(
+	context: CoreSynthContext,
+	function_info: CoreFunction,
+	member: String,
+) -> Option[CoreExpr]:
 	if function_info.source_module != Some(LIST_MODULE):
 		None
 	else:
-		synthesize_named_body(member, function_info.params, function_info.return_type)
+		synthesize_named_body(context, member, function_info.params, function_info.return_type)

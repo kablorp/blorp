@@ -10,7 +10,7 @@ import:
 	../stage_09_core/c_type_layout: c_type_name
 	../stage_09_core/ir:
 		CoreCallKind(ForeignCall),
-		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, UnionDecl),
+		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, InlineRecordDecl, UnionDecl),
 		CoreEnumDecl,
 		CoreExpr(CallExpr),
 		CoreFieldRef,
@@ -19,7 +19,7 @@ import:
 		CoreHeapRecordDecl,
 		CoreProgram,
 		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType,
+			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType, RangeType, SelfType,
 			StackResultType, TensorType, TupleType, TypeParameterType, UnionType,
 			VoidType,
 		),
@@ -323,7 +323,7 @@ private pure func append_nested_types(pending: List[CoreType], typ: CoreType) ->
 			pending.append(info.element_type)
 		TupleType(items):
 			pending.concat(items)
-		VoidType | EnumType(_) | HeapRecordType(_) | RangeType | TypeParameterType(_) | SelfType | UnionType(_):
+		VoidType | EnumType(_) | HeapRecordType(_) | InlineRecordType(_) | RangeType | TypeParameterType(_) | SelfType | UnionType(_):
 			pending
 
 
@@ -376,6 +376,34 @@ private pure func first_unresolved_outside(
 	found
 
 
+---
+Member spellings collected from every record declaration, and the fields
+that have no typecheck identity to spell a member from.
+---
+private record RecordMemberScan {
+	member_names: Dict[Int, String],
+	unresolved: List[CRecordLayoutError]
+}
+
+
+private pure func with_record_member(
+	scan: RecordMemberScan,
+	record_name: String,
+	ref: CoreFieldRef,
+	field_name: String,
+	ordinal: Int,
+) -> RecordMemberScan:
+	member_names: Dict[Int, String] = with_member_name(scan.member_names, ref, ordinal)
+
+	if core_field_ref_is_resolved(ref):
+		{ scan | member_names = member_names }
+	else:
+		{
+			member_names = member_names,
+			unresolved = scan.unresolved.append(UnresolvedRecordFieldRef(record_name, field_name))
+		}
+
+
 pure func classify_c_record_layouts(
 	specialize_layout: CoreSpecializeLayout,
 	foreign_boundary_types: List[CoreType],
@@ -384,8 +412,7 @@ pure func classify_c_record_layouts(
 	decl_index: CRecordDeclIndex = build_record_decl_index(specialize_layout)
 	var foreign_heap_names: Set[String] = Sets.set()
 	var declared_abi_names: Set[String] = Sets.set()
-	var record_member_names: Dict[Int, String] = {}
-	var unresolved_fields: List[CRecordLayoutError] = []
+	var members: RecordMemberScan = {member_names = {}, unresolved = []}
 	var byte_sized_enum_names: Set[String] = Sets.set()
 	var visited_union_names: Set[String] = Sets.set()
 	var pending: List[CoreType] = foreign_boundary_types
@@ -400,20 +427,11 @@ pure func classify_c_record_layouts(
 				if record_decl.abi_type.is_some():
 					declared_abi_names = Sets.add(declared_abi_names, record_decl.name)
 
-				for entry in record_decl.fields.enumerate():
-					record_member_names = with_member_name(
-						record_member_names,
-						entry[1].ref,
-						entry[0],
-					)
-
-					if not core_field_ref_is_resolved(entry[1].ref):
-						unresolved_fields = unresolved_fields.append(
-							UnresolvedRecordFieldRef(
-								record_decl.name,
-								entry[1].name,
-							),
-						)
+				for (ordinal, field) in record_decl.fields.enumerate():
+					members = with_record_member(members, record_decl.name, field.ref, field.name, ordinal)
+			InlineRecordDecl(record_decl):
+				for (ordinal, field) in record_decl.fields.enumerate():
+					members = with_record_member(members, record_decl.name, field.ref, field.name, ordinal)
 			_:
 				void
 
@@ -453,7 +471,7 @@ pure func classify_c_record_layouts(
 
 	source_member_names: Set[String] = Sets.combine(declared_abi_names, foreign_heap_names)
 	unresolved: Option[CRecordLayoutError] = first_unresolved_outside(
-		unresolved_fields,
+		members.unresolved,
 		source_member_names,
 	)
 
@@ -465,5 +483,5 @@ pure func classify_c_record_layouts(
 				foreign_abi_heap_record_names = foreign_heap_names,
 				byte_sized_enum_names = byte_sized_enum_names,
 				source_member_record_names = source_member_names,
-				record_member_names = record_member_names,
+				record_member_names = members.member_names,
 			})

@@ -1192,11 +1192,35 @@ the message gives the position of the first.
 
 ### Fixed Records
 
-`fixed record` is an alternative spelling of `record`. Both
-have ordinary managed record behavior: ARC ownership, value-preserving updates,
-and the same field, type-parameter, dimension-parameter, and empty-record rules.
-Neither spelling promises stack storage, no allocation, an unmanaged layout,
-or a foreign by-value ABI.
+`fixed record` declares a record with the same value semantics as `record`:
+value-preserving updates and the same field, type-parameter,
+dimension-parameter, and empty-record rules.
+
+A `fixed record` whose fields are all numbers (`Int`, `Int8` to `Int128`,
+`UInt8` to `UInt128`, `Float`, `Float16`, `Float32`), `Char` values, or other
+such fixed records is stored inline: a by-value C struct that construction,
+copies, field reads, updates, parameters and results never allocate, and that
+needs no reference counting. A generic fixed record qualifies per
+instantiation, so `Pair[Float]` can be inline while `Pair[String]` is not.
+`Bool` fields do not qualify yet; they will with fixed unions.
+
+Inline storage is not yet a checked guarantee. A fixed record with any other
+field silently uses the ordinary managed representation, and some positions
+store an inline record in an allocated box: union payloads, `Result` payloads,
+elements of a tuple stored in a heap value such as a list element, `Dict` and
+`Set` entries, channel elements, task results, closure call arguments and
+results (two allocations per call through a closure value), and foreign
+calls. Lists, `Option`, local tuples, fields of other records, tensors and
+closure captures keep it inline. A later release
+will report fixed records that cannot be inline. No spelling promises a
+foreign by-value ABI: a foreign function still receives a record as a pointer
+to a boxed object.
+
+An inline fixed record is a value with no object identity, so
+`memory.same_object`, `memory.is_unique` and `memory.refcount` reject it at
+compile time; compare inline records with `==` (through their `Equatable`
+implementation). The check runs when the program is compiled, after generic
+code is instantiated, so `blorp check` does not report it.
 
 ```blorp
 fixed record Color {r: UInt8, g: UInt8, b: UInt8, a: UInt8}
@@ -1214,9 +1238,9 @@ v: Vec2 = {x = 1.0, y = 2.0}
 moved: Vec2 = { v | x = v.x + 10.0 }   -- v remains unchanged
 ```
 
-Prefer `record` for new declarations. Choosing another spelling does not change
-ownership or allocation behavior. Managed fields such as `String` and `List[T]`
-are accepted in every spelling.
+Use `fixed record` for small plain-data values such as points, spans and
+counters, and `record` otherwise. Managed fields such as `String` and `List[T]`
+are accepted in every spelling; they make a fixed record managed.
 
 `fixed` is contextual: it modifies a following `record` or `union` declaration and remains
 an ordinary identifier elsewhere. `struct` is also an ordinary identifier.
@@ -1444,7 +1468,7 @@ pure func bad[T]() -> T:
 ### Range Refinement Types
 
 The type `..#N` represents an integer proven to be in the range `[0, N)`.
-These refinement values are distinct from the first-class managed `Range` record used
+These refinement values are distinct from the first-class `Range` record used
 by `0..10` expressions. Refinement values come from compile-time proofs: literal indices, bounded loops,
 `enumerate`, modulo narrowing, or control-flow checks such as
 `if i >= 0 and i < length(v):`.
@@ -1864,10 +1888,10 @@ result2: Option[Int] = safe_divide(10, 2)
 
 Representation note: `Option[T]` is optimized by payload type. Primitive
 numeric/bool/char payloads, `Int128`/`UInt128`, bounded range types, and enums
-use stack `{tag, value}` layouts. Managed payloads such
-as `String`, `List[T]`, records (including `fixed record`),
-first-class `Range`, non-enum `union`, tuples, and functions
-use an internal nullable-pointer layout. Nested options, `Ptr`, unresolved
+use stack `{tag, value}` layouts, as do inline fixed records and first-class
+`Range`. Managed payloads such as `String`, `List[T]`, managed records,
+non-enum `union`, tuples, and functions use an internal nullable-pointer
+layout. Nested options, `Ptr`, unresolved
 generic payloads, and unsupported payloads stay boxed so `Some(x)` and `None`
 remain distinguishable.
 When a stack-option value is placed into currently-erased storage such as

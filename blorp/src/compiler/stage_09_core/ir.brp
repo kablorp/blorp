@@ -108,6 +108,12 @@ private OWNED_ARC_INLINE_OWNERSHIP_TAG: String = "owned_arc_inline"
 
 private HEAP_RECORD_DECL_TAG: String = "heap_record"
 
+private INLINE_RECORD_DECL_TAG: String = "inline_record"
+
+private ORDINARY_RECORD_FORM_TAG: String = "ordinary"
+
+private FIXED_RECORD_FORM_TAG: String = "fixed"
+
 private UNION_DECL_TAG: String = "union"
 
 private TYPE_ALIAS_DECL_TAG: String = "type_alias"
@@ -142,6 +148,8 @@ private ENUM_TYPE_TAG: String = "enum"
 
 
 private HEAP_RECORD_TYPE_TAG: String = "heap_record"
+
+private INLINE_RECORD_TYPE_TAG: String = "inline_record"
 
 private UNION_TYPE_TAG: String = "union"
 
@@ -1281,6 +1289,7 @@ union CoreType:
 	BoxedResultType(CoreType, CoreType)
 	EnumType(String)
 	HeapRecordType(String)
+	InlineRecordType(String)
 	UnionType(String)
 	RangeType
 	TensorType(CoreTensorTypeInfo)
@@ -1401,6 +1410,8 @@ pure func core_type_equal(left: CoreType, right: CoreType) -> Bool:
 		(EnumType(left_name), EnumType(right_name)):
 			left_name == right_name
 		(HeapRecordType(left_name), HeapRecordType(right_name)):
+			left_name == right_name
+		(InlineRecordType(left_name), InlineRecordType(right_name)):
 			left_name == right_name
 		(UnionType(left_name), UnionType(right_name)):
 			left_name == right_name
@@ -1597,6 +1608,18 @@ record CoreDirectRuntimeCall {
 }
 
 
+---
+How the elements of a printed list reach the element's `Stringable.to_string`.
+A list of pointers passes each element to the impl through the runtime's
+`void*` callback. An inline record cannot cross that callback, since the impl
+takes the struct by value; the backend instead copies each element out of the
+list's inline storage and calls the impl directly. The string names the record.
+---
+union CoreListToStringElements:
+	PointerListToStringElements
+	InlineRecordListToStringElements(String)
+
+
 union CoreCallKind:
 	UnknownCall
 	-- SelectedDirectCall(def_id): the call targets the function `def_id`. The
@@ -1614,7 +1637,7 @@ union CoreCallKind:
 	FallibleStreamTerminalCall(CoreFallibleStreamTerminalBridge)
 	TensorParallelCall(String, CoreTensorParallelLayout)
 	DictWithCapacityCall(CoreHashContainerConstructor)
-	ListToStringCall(Int)
+	ListToStringCall(Int, CoreListToStringElements)
 	IntrinsicCall(String)
 	ClosureCall
 
@@ -3845,11 +3868,51 @@ record CoreHeapRecordField {
 }
 
 
+---
+How the source declared a record. `fixed record` asks for inline storage, and
+`record_representation` grants it once, after monomorphization, to every
+concrete fixed record whose fields are all inline-eligible: that record becomes
+an `InlineRecordDecl`. A `HeapRecordDecl` with `FixedRecordForm` is therefore a
+fixed record that was not admitted, the case a checked guarantee will report.
+---
+enum CoreRecordForm:
+	OrdinaryRecordForm
+	FixedRecordForm
+
+
 record CoreHeapRecordDecl {
 	abi_type: Option[DeclaredAbiType],
+	form: CoreRecordForm,
 	name: String,
 	type_params: List[String],
 	fields: List[CoreHeapRecordField],
+	loc: CoreSourceLoc
+}
+
+
+---
+A field of an inline record. `record_representation` constructs these only
+for a number, `Char`, or another inline record (its `InlineRecordType`), so a
+field owns nothing and has no release policy.
+---
+record CoreInlineRecordField {
+	name: String,
+	ref: CoreFieldRef,
+	typ: CoreType
+}
+
+
+---
+A concrete fixed record stored by value: no object header, no reference count,
+no allocation. Values of it have type `InlineRecordType(name)`. Only
+`record_representation` constructs one, from a `HeapRecordDecl` with
+`FixedRecordForm`, no type parameters and no declared ABI, after
+monomorphization; every later phase reads the representation from this
+declaration kind and the type variant rather than deciding it again.
+---
+record CoreInlineRecordDecl {
+	name: String,
+	fields: List[CoreInlineRecordField],
 	loc: CoreSourceLoc
 }
 
@@ -3902,6 +3965,7 @@ union CoreDecl:
 	EnumDecl(CoreEnumDecl)
 	UnionDecl(CoreUnionDecl)
 	HeapRecordDecl(CoreHeapRecordDecl)
+	InlineRecordDecl(CoreInlineRecordDecl)
 	TypeAliasDecl(CoreTypeAliasDecl)
 	TraitDecl(CoreTraitDecl)
 	ImplDecl(CoreImplDecl)
@@ -4827,6 +4891,11 @@ pure func core_type_to_json(typ: CoreType) -> JsonValue:
 				(KIND_FIELD, JsonString(HEAP_RECORD_TYPE_TAG)),
 				("name", JsonString(name)),
 			])
+		InlineRecordType(name):
+			JsonObject([
+				(KIND_FIELD, JsonString(INLINE_RECORD_TYPE_TAG)),
+				("name", JsonString(name)),
+			])
 		UnionType(name):
 			JsonObject([
 				(KIND_FIELD, JsonString(UNION_TYPE_TAG)),
@@ -4985,6 +5054,14 @@ private pure func decode_core_tensor_type_info_json(
 	})
 
 
+private pure func list_to_string_elements_to_json(elements: CoreListToStringElements) -> JsonValue:
+	match elements:
+		PointerListToStringElements:
+			JsonNull
+		InlineRecordListToStringElements(record_name):
+			JsonString(record_name)
+
+
 pure func decode_core_type_json(value: JsonValue, path: String) -> Result[CoreType, CoreJsonError]:
 	tag ?= kind_field(value, path)
 
@@ -5038,6 +5115,9 @@ pure func decode_core_type_json(value: JsonValue, path: String) -> Result[CoreTy
 	else if tag == HEAP_RECORD_TYPE_TAG:
 		name ?= string_field(value, path, "name")
 		Ok(HeapRecordType(name))
+	else if tag == INLINE_RECORD_TYPE_TAG:
+		name ?= string_field(value, path, "name")
+		Ok(InlineRecordType(name))
 	else if tag == UNION_TYPE_TAG:
 		name ?= string_field(value, path, "name")
 		Ok(UnionType(name))
@@ -5939,10 +6019,11 @@ pure func core_call_kind_to_json(kind: CoreCallKind) -> JsonValue:
 				(KIND_FIELD, JsonString(DICT_WITH_CAPACITY_CALL_TAG)),
 				("constructor", core_hash_container_constructor_to_json(constructor)),
 			])
-		ListToStringCall(callback_def_id):
+		ListToStringCall(callback_def_id, elements):
 			JsonObject([
 				(KIND_FIELD, JsonString(LIST_TO_STRING_CALL_TAG)),
 				("callback_def_id", json_int(callback_def_id)),
+				("inline_record", list_to_string_elements_to_json(elements)),
 			])
 		IntrinsicCall(name):
 			JsonObject([
@@ -6028,7 +6109,13 @@ pure func decode_core_call_kind_json(
 		Ok(DictWithCapacityCall(constructor))
 	else if tag == LIST_TO_STRING_CALL_TAG:
 		callback_def_id ?= int_field(value, path, "callback_def_id")
-		Ok(ListToStringCall(callback_def_id))
+		inline_record ?= decode_optional_string(value, path, "inline_record")
+		elements: CoreListToStringElements = match inline_record:
+			Some(record_name):
+				InlineRecordListToStringElements(record_name)
+			None:
+				PointerListToStringElements
+		Ok(ListToStringCall(callback_def_id, elements))
 	else if tag == INTRINSIC_CALL_TAG:
 		name ?= string_field(value, path, "name")
 		Ok(IntrinsicCall(name))
@@ -13456,7 +13543,20 @@ private pure func decode_core_expr_record_update_from_json(
 								"record update base and result must have the same record type",
 							),
 						)
-				(_, HeapRecordType(_)):
+				(InlineRecordType(base_name), InlineRecordType(result_name)):
+					if base_name == result_name:
+						Ok(RecordUpdateExpr(base, fields, typ, loc))
+					else:
+						Err(
+							CoreInvalidRecordUpdateShape(
+								path_field(
+									path_field(path, "base"),
+									"type",
+								),
+								"record update base and result must have the same record type",
+							),
+						)
+				(_, HeapRecordType(_)) | (_, InlineRecordType(_)):
 					Err(
 						CoreInvalidRecordUpdateShape(
 							path_field(
@@ -13470,7 +13570,7 @@ private pure func decode_core_expr_record_update_from_json(
 					Err(
 						CoreInvalidRecordUpdateShape(
 							path_field(path, "type"),
-							"record update type must be a heap record",
+							"record update type must be a heap or inline record",
 						),
 					)
 		_:
@@ -16526,10 +16626,33 @@ private pure func decode_core_heap_record_fields(
 
 
 
+private pure func core_record_form_tag(form: CoreRecordForm) -> String:
+	match form:
+		OrdinaryRecordForm:
+			ORDINARY_RECORD_FORM_TAG
+		FixedRecordForm:
+			FIXED_RECORD_FORM_TAG
+
+
+private pure func decode_core_record_form(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreRecordForm, CoreJsonError]:
+	tag ?= string_field(value, path, "form")
+
+	if tag == ORDINARY_RECORD_FORM_TAG:
+		Ok(OrdinaryRecordForm)
+	else if tag == FIXED_RECORD_FORM_TAG:
+		Ok(FixedRecordForm)
+	else:
+		Err(CoreUnsupportedTag(path_field(path, "form"), tag))
+
+
 pure func core_heap_record_decl_to_json(record_decl: CoreHeapRecordDecl) -> JsonValue:
 	JsonObject([
 		(KIND_FIELD, JsonString(HEAP_RECORD_DECL_TAG)),
 		("abi_type", optional_declared_abi_type_to_json(record_decl.abi_type)),
+		("form", JsonString(core_record_form_tag(record_decl.form))),
 		("name", JsonString(record_decl.name)),
 		("type_params", strings_to_json(record_decl.type_params)),
 		("fields", JsonVector(record_decl.fields.map(core_heap_record_field_to_json))),
@@ -16542,6 +16665,7 @@ pure func decode_core_heap_record_decl_json(
 	path: String,
 ) -> Result[CoreHeapRecordDecl, CoreJsonError]:
 	abi_type ?= decode_optional_declared_abi_type(value, path, "abi_type")
+	form ?= decode_core_record_form(value, path)
 	name ?= string_field(value, path, "name")
 	type_params ?= decode_string_list(value, path, "type_params")
 	fields ?= decode_core_heap_record_fields(value, path, "fields")
@@ -16553,11 +16677,69 @@ pure func decode_core_heap_record_decl_json(
 
 	Ok({
 		abi_type = abi_type,
+		form = form,
 		name = name,
 		type_params = type_params,
 		fields = fields,
 		loc = loc,
 	})
+
+
+private pure func core_inline_record_field_to_json(field: CoreInlineRecordField) -> JsonValue:
+	JsonObject([
+		("name", JsonString(field.name)),
+		("field_ref", core_field_ref_to_json(field.ref)),
+		("type", core_type_to_json(field.typ)),
+	])
+
+
+private pure func decode_core_inline_record_field_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreInlineRecordField, CoreJsonError]:
+	name ?= string_field(value, path, "name")
+	ref ?= decode_optional_field_ref_json(value, path, "field_ref")
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(type_json, path_field(path, "type"))
+	Ok({name = name, ref = ref, typ = typ})
+
+
+pure func core_inline_record_decl_to_json(record_decl: CoreInlineRecordDecl) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(INLINE_RECORD_DECL_TAG)),
+		("name", JsonString(record_decl.name)),
+		("fields", JsonVector(record_decl.fields.map(core_inline_record_field_to_json))),
+		("loc", source_loc_to_json(record_decl.loc)),
+	])
+
+
+pure func decode_core_inline_record_decl_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreInlineRecordDecl, CoreJsonError]:
+	name ?= string_field(value, path, "name")
+	items ?= array_field(value, path, "fields")
+	loc_json ?= required_field(value, path, "loc")
+	loc ?= decode_source_loc_json(loc_json, path_field(path, "loc"))
+	var fields: List[CoreInlineRecordField] = []
+	var error: Option[CoreJsonError] = None
+
+	for (index, item) in items.enumerate():
+		if error.is_none():
+			match decode_core_inline_record_field_json(
+				item,
+				path_index(path_field(path, "fields"), index),
+			):
+				Ok(field):
+					fields = fields.append(field)
+				Err(field_error):
+					error = Some(field_error)
+
+	match error:
+		Some(field_error):
+			Err(field_error)
+		None:
+			Ok({name = name, fields = fields, loc = loc})
 
 
 pure func core_type_alias_decl_to_json(alias_decl: CoreTypeAliasDecl) -> JsonValue:
@@ -16806,6 +16988,8 @@ pure func core_decl_to_json(decl: CoreDecl) -> JsonValue:
 			core_union_decl_to_json(union_decl)
 		HeapRecordDecl(record_decl):
 			core_heap_record_decl_to_json(record_decl)
+		InlineRecordDecl(record_decl):
+			core_inline_record_decl_to_json(record_decl)
 		TypeAliasDecl(alias_decl):
 			core_type_alias_decl_to_json(alias_decl)
 		TraitDecl(trait_decl):
@@ -16832,6 +17016,9 @@ pure func decode_core_decl_json(value: JsonValue, path: String) -> Result[CoreDe
 	else if tag == HEAP_RECORD_DECL_TAG:
 		record_decl ?= decode_core_heap_record_decl_json(value, path)
 		Ok(HeapRecordDecl(record_decl))
+	else if tag == INLINE_RECORD_DECL_TAG:
+		record_decl ?= decode_core_inline_record_decl_json(value, path)
+		Ok(InlineRecordDecl(record_decl))
 	else if tag == TYPE_ALIAS_DECL_TAG:
 		alias_decl ?= decode_core_type_alias_decl_json(value, path)
 		Ok(TypeAliasDecl(alias_decl))
@@ -16908,6 +17095,13 @@ private pure func core_json_record_shapes(decls: List[CoreDecl]) -> List[CoreJso
 					name = record_decl.name,
 					field_names = record_decl.fields.map(func(field): field.name),
 					heap_fields = record_decl.fields,
+				})
+			InlineRecordDecl(record_decl):
+				-- Inline records are never COW-updated, so no heap fields.
+				shapes = shapes.append({
+					name = record_decl.name,
+					field_names = record_decl.fields.map(func(field): field.name),
+					heap_fields = [],
 				})
 			_:
 				void
@@ -16995,8 +17189,8 @@ private pure func validate_record_update_json_shape(
 	type_path: String = path_field(path, "type")
 	type_tag ?= kind_field(type_value, type_path)
 
-	if type_tag != HEAP_RECORD_TYPE_TAG:
-		Err(CoreInvalidRecordUpdateShape(path, "record update type must be a heap record"))
+	if type_tag != HEAP_RECORD_TYPE_TAG and type_tag != INLINE_RECORD_TYPE_TAG:
+		Err(CoreInvalidRecordUpdateShape(path, "record update type must be a heap or inline record"))
 	else:
 		record_name ?= string_field(type_value, type_path, "name")
 		actual_names ?= record_update_field_names(value, path)

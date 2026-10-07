@@ -1,9 +1,12 @@
 # Record Simplification Roadmap
 
-Status: S1–S4 are landed. Ordinary `record` and `fixed record` use the same
-managed-record semantics and ARC/COW representation. The old value-record
-pipeline is deleted, and native snapshot boundaries use explicit adapters.
-The source migration and keyword retirement remove the legacy `struct`
+Status: S1–S4 are landed, and so are inline fixed records. Ordinary `record`
+and `fixed record` share value semantics. A `fixed record` whose fields are all
+numbers, `Char` values or other such fixed records is stored inline, as a C
+struct by value with no allocation; every other record keeps the managed
+ARC/COW representation. Inline storage is a representation optimization, not
+yet a checked guarantee. Native snapshot boundaries use explicit adapters. The
+source migration and keyword retirement remove the legacy `struct`
 declaration form; `struct` is now an ordinary identifier.
 
 Read [WORKER_CHECKLIST](WORKER_CHECKLIST.md) before compiler work. The
@@ -14,10 +17,10 @@ Read [WORKER_CHECKLIST](WORKER_CHECKLIST.md) before compiler work. The
 
 A nominal product has one value model: immutable logical values, managed
 children, value-preserving updates, and ownership-aware reuse through ARC/COW.
-Generic and dimension-parameterized records remain supported. `fixed record`
-preserves its spelling in tooling but promises neither inline or stack
-placement, no allocation, nor a native by-value ABI. `fixed` is contextual
-before `record` and remains an identifier elsewhere.
+Generic and dimension-parameterized records remain supported. `fixed` is
+contextual before `record` and remains an identifier elsewhere. Inline fixed
+records (below) change the representation of eligible fixed records only; no
+spelling promises a native by-value ABI.
 
 S1 classified the former product layouts and froze the cost baseline; S2
 migrated callers and allocation oracles; S3 adapted native boundaries; S4
@@ -50,6 +53,60 @@ The [keyword-retirement report](../benchmarks/results/struct_keyword_retirement_
 retains the final 19,893-check packet, measured cost, output identity, source
 provenance, and the bounded S5 census. Same-cwd allocations were unchanged;
 sampled instruction deltas establish no speed benefit.
+
+## Inline fixed records (landed)
+
+A `fixed record` instantiation is stored inline when every field type, after
+monomorphization, is a number type (`Int`, `Int8` to `Int128`, `UInt8` to
+`UInt128`, `Float`, `Float16`, `Float32`), `Char`, or another inline fixed
+record. `Bool` is not eligible yet: it becomes eligible with fixed unions,
+which give payload-free sums a checked inline layout. `FixedPoint` is not
+eligible either: the runtime allocates each value as a reference-counted
+object, so it is a managed field. A generic fixed record
+is decided per instantiation. An empty fixed record is inline. A fixed record
+with a declared native ABI, or whose Core name is declared twice (see item 1
+below), keeps the managed layout. Every other fixed record silently keeps the
+managed layout.
+
+`stage_09_core/record_representation.brp` makes the decision once, right after
+monomorphization. It turns each eligible `HeapRecordDecl` (whose
+`CoreRecordForm` records the source spelling) into an `InlineRecordDecl`, and
+runtime projection gives every use the type `InlineRecordType`. Later phases
+read the representation from that variant and never decide it again;
+[product unification](PRODUCT_UNIFICATION.md) folds both into
+`ProductType` with `InlineValue`. Ownership classifies inline records as
+unmanaged by construction, so Perceus, reuse, consuming clones and record
+update lowering emit no retain, release, uniqueness check or copy-on-write for
+them; an update is a plain value copy.
+
+Positions:
+
+| Position | Storage | Status |
+| --- | --- | --- |
+| locals, parameters, results, field reads, updates, nested fields, match | by value | done |
+| field of a managed record, `List` element, `Option` payload (stack Option), element of a local (flattened) tuple, closure environment, tensor element | inline | done |
+| element of a tuple stored in a heap value (a `List[(Point, Int)]` element, a field) | one struct box per element: a list of 3 such tuples makes 7 allocations | open: product unification gives heap tuples typed element storage |
+| closure call argument and result | one struct box each: every call through a closure value makes 2 allocations for an inline argument and result | open: a typed closure ABI that passes structs by value |
+| erased union payload | one struct box per payload | open: typed union payload storage |
+| stack `Result` payload | one struct box | open: typed `Result` payload storage |
+| `Dict`/`Set` key or value | one struct box per stored entry | open: inline hash-container storage |
+| `Dict`/`Set` lookup key (`get`, `contains`) | one struct box per lookup | open: a borrowed by-value probe key |
+| channel element, task result | one struct box per value | open: typed channel and task result slots |
+| foreign argument and result | one struct box: the foreign side keeps the managed layout of an object header followed by the fields | open: a by-value foreign aggregate ABI, deferred with the other aggregate annotations below |
+
+Each struct box is `StructBox`/`StructUnbox`, owned and released by the slot
+that holds it; `test_inline_fixed_record_boundaries.brp` pins the allocation
+count of every row. A list built from a `Dict` or `Set` (`keys`, `values`,
+`to_list`) unboxes each entry into its inline buffer.
+
+Collection fusion (`collection_policy.brp`) does not fuse pipelines over lists
+of inline records: its fused loops read elements through erased `void*`
+slots. Those pipelines run unfused, one intermediate list per stage, until
+fusion reads inline struct storage.
+
+The [inline fixed-record measurement](../benchmarks/results/inline_fixed_records_2026-10-06.md)
+records the stage-2 self-compile comparison, the 71 compiler records that
+became inline and the validation packet.
 
 ## Boundaries retained for future optimization
 
@@ -107,24 +164,38 @@ layout; an extracted independent child may require materialization and an
 explicit borrow/ownership rule.
 
 Compare full-pipeline allocations, retired instructions, retains/releases, and
-C size against the simpler baseline. Reopen an explicit `fixed` layout promise
-only with a sound contract across typed, erased, collection, closure, generic,
-and foreign positions and a substantial measured benefit. Otherwise keep
-optimization implicit.
+C size against the simpler baseline. Inline fixed records cover the plain-data
+case; any further layout promise needs a sound contract across typed, erased,
+collection, closure, generic, and foreign positions and a substantial measured
+benefit.
 
 Each optimization needs its own accept/park decision. No performance claim
 follows from static source counts, shorter C, or a microfixture alone.
 
 ## Fixed-record continuation: checked layout contract
 
-The next fixed-record workstream is a future checked no-box contract, not a
-description of the landed representation. A fixed value would have a known
-shallow layout without a separate root allocation or hidden transport box.
-Managed children would still allocate and require copy/drop ownership. Source
-admission must wait until every admitted placement preserves the contract;
-unsupported erased, collection, closure, generic and foreign positions must
-produce a precise diagnostic before emission. A syntax spelling or a direct
-local oracle alone cannot establish this contract.
+The next fixed-record workstream is the checked guarantee: a `fixed record`
+that is not inline-eligible, or that reaches a position where it crosses in a
+struct box, is reported (or supported) instead of silently keeping the managed
+layout. Inline storage today is a representation choice the compiler makes, not
+a promise the source can rely on. Open work, in order:
+
+- report a non-eligible `fixed record` at its declaration, with a help line
+  naming the field that is not eligible;
+- decide each boxed position in the table above: support it inline (typed
+  union payloads, a typed closure call ABI, `Result` payload storage, struct
+  hash-container keys) or reject it with a diagnostic;
+- make `Bool`, fixed unions and payload-free enums eligible once fixed unions
+  give them a checked inline layout;
+- keep the foreign ABI explicit: a by-value C aggregate is a separate opt-in.
+
+A fixed value would have a known shallow layout without a separate root
+allocation or hidden transport box. Managed children would still allocate and
+require copy/drop ownership. Source admission must wait until every admitted
+placement preserves the contract; unsupported erased, collection, closure,
+generic and foreign positions must produce a precise diagnostic before
+emission. A syntax spelling or a direct local oracle alone cannot establish
+this contract.
 
 Prioritize [product unification](PRODUCT_UNIFICATION.md) and measured
 product opportunities before opening this source promise. Keep `Option` and
@@ -146,7 +217,10 @@ obligations remain open:
    Cover same-spelling types from distinct modules and wrong-kind uses at the
    earliest authoritative boundary. A local `union Option[T]` and the prelude
    `Option` already lower to one Core type reference, and compiling a module that declares
-   its own `Option` fails after specialization.
+   its own `Option` fails after specialization. Until uses carry their
+   declaration, the representation decision keeps any record whose Core name
+   is declared twice managed, so one spelling never decides the layout of two
+   declarations.
 2. Bind prepared cleanup and cancellation facts to the exact final Core program.
    Open: the actions and activations inside a present cancellation row,
    same-shape corrupted rows, and cleanup-plan rows are not checked. Any such

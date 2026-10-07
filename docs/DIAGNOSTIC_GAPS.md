@@ -40,6 +40,10 @@ message-wording tasks.
 | CF-015 | Perceus conflates binders that share a name and differ by id (`perceus/uses.brp`, `perceus/balance.brp`; [roadmap](IDENTITY_ROADMAP.md#late-core-consumers-by-exact-id)) |
 | CF-016 | Importing a constructor a union does not export, from a file that also imports `compiler_new/.../tables/span`, makes `check` print only a cascade of "internal compiler error: compile-time evaluation received a missing standard Range field authority" (in the span module's global constants), hiding the real "constructor ... is not exported" error |
 | CF-017 | A payload-less variant of a generic union built in another module emits an undeclared C identifier: `union Read[M]: Got(M) / Missing` in `reads.brp`, and `Missing` returned from a function in `main.brp` gives `use of undeclared identifier 'Missing'` from the C compiler |
+| CF-018 | `recv`, `try_recv` and `recv_timeout` on a `Channel` of a user enum, `Int128` or `UInt128` emit C that initializes a `blorp_StackOption_*` from `void*` and does not compile (`specialize_collection.brp`, channel receive) |
+| CF-019 | A `concurrent:` task returning `Int128` or `UInt128` leaks its result box under `--leak-check` (`c_type_layout.brp`, `erased_slot_needs_release_type`) |
+| CF-020 | `List.unique` and `List.partition` leak one managed record per element under `--leak-check` (`synth_list.brp`, `partition_push` and `synthesize_unique`) |
+| CF-021 | A cancellation inside a hash or equality callback during a `Dict`/`Set` lookup, between boxing the key (`blorp_box_struct`, 128-bit boxes) and the lookup's release of it, leaks the key box (`specialize_collection.brp`, `dict_get_releasing_key_box` and `resolve_erased_key_temp_release`) |
 
 ## High ROI
 
@@ -55,6 +59,10 @@ message-wording tasks.
   error: Unbound value `return`
   ```
   Parse errors in the same tool print `file.brp:4:10: error: ...`. The few semantic errors that have a position append it to the end of the message (`... argument 2 expected Int, got String at ty_arg_type_mismatch.brp:5:12`). An error in an imported module names neither the file nor the module (`error: Function 'helper' returns wrong type` for a fault in `./helper.brp`).
+  Exhaustiveness errors are the costliest case for compiler work: adding one
+  variant to `CoreType` printed 52 `error: Non-exhaustive match on
+  .../ir::CoreType: missing InlineRecordType` lines (and 36 for `CoreDecl`)
+  with no file or line, so each site had to be found by searching.
 - Should say: `file.brp:2:5: error: ...` for every error, the same shape as parse errors, with the module path when it is not the root file.
 - Owner: stage_06_typecheck. `infer.brp:6186 infer_error` stores `typecheck_diagnostic(message, None)`; 205 call sites in `infer.brp` use it against 6 that supply a location through `infer_error_at` (and 3 located `typecheck_state_add_error_at` calls in `decl.brp`). `TypecheckDiagnostic` already has a `span: Option[SourceLocation]` and the CLI prints only the message text.
 - Priority/cost: High / L (every `infer_error` site needs a span, or the inference context must carry the current node's span)
@@ -593,6 +601,54 @@ The wrong acceptance is closed: `Strng` is rejected. Near-name help belongs to D
   spans belong to the trait's module, which may be another file, so
   `infer_error_at` cannot use them directly. Errors from a default body need
   the implementation as their location and the trait method as context.
+- Priority/cost: Medium / M
+
+### DG-054 Errors about a generic instance print its mangled name and point into the generic body
+
+- Input:
+  ```
+  import:
+      memory: refcount
+
+
+  fixed record Pair[T] {
+      first: T,
+      second: T
+  }
+
+
+  pure func count[T](value: Pair[T]) -> Int:
+      refcount(value)
+
+
+  func main(args: List[String]) -> Int:
+      count({first = 1, second = 2})
+  ```
+- Current output: ``error[inline_record_identity]: `refcount` reads a managed
+  object's reference count; `Pair__mono_Int` is a fixed record stored inline``.
+  The error is reported at `refcount(value)` inside `count`, not at the call
+  `count({first = 1, second = 2})` that instantiated it with an inline record.
+- Should say: `` `Pair[Int]` is a fixed record stored inline``, the type as
+  written in source, at the instantiating call, with a note pointing at the
+  use inside the generic body.
+- Owner: `stage_09_core/record_representation.brp`
+  (`core_inline_record_identity_message`). Core names a monomorphized instance
+  by its mangled spelling and keeps no link to the template and arguments;
+  the instance needs a display form recorded where mono creates it, and the
+  location of the call that requested it.
+- Priority/cost: Low / M
+
+### DG-055 `check` does not report identity builtins on inline records
+
+- Input: the DG-054 program, or `same_object(p, q)` on a non-generic
+  `fixed record Point`.
+- Current output: `bin/blorp check` prints `Type checking succeeded.`;
+  `bin/blorp compile` and `run` report `error[inline_record_identity]`.
+- Should say: the same error from `check`, so the editor and LSP show it.
+- Owner: `stage_09_core/early_pipeline.brp` (`run_mono_pass`). Whether a
+  record is inline depends on its field types after monomorphization, so the
+  rule runs after mono, which `check` does not reach. A fix either runs mono
+  under `check` or decides eligibility for non-generic records before mono.
 - Priority/cost: Medium / M
 
 ---

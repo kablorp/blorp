@@ -177,8 +177,9 @@ pure func birthday(user: User) -> User:
 	{ user | age = user.age + 1 }
 ```
 
-`fixed record` is an alternative spelling of `record`, with the
-same managed ownership and value semantics. Prefer `record` for new declarations.
+`fixed record` has the same value semantics as `record`. When every field is a
+number, a `Char` or another such fixed record, it is stored inline with no
+allocation (not yet a checked guarantee). Use it for small plain-data values.
 
 ```blorp
 fixed record Vec2 {x: Float, y: Float}
@@ -541,10 +542,11 @@ if the cited code has since moved.
   `c_primitive_binary_expr`; `has_native_structural_equality` in
   `trait_resolve.brp` routes every union there). Two separately constructed
   `Circle(1.0)` values are `!=` unless you implement `Equatable` yourself.
-- **All record spellings are managed**, including inside `Option`, unions,
-  lists, and closures. Choosing `fixed record` does not promise
-  inline storage or remove allocation. Measure concrete hot workloads before
-  choosing a representation optimization.
+- **Only plain-data fixed records are inline.** A `fixed record` of numbers,
+  `Char` values and other such fixed records is a by-value struct; every other
+  record is managed. Union and `Result` payloads, `Dict`/`Set` entries,
+  channels, task results and closure calls still box an inline record. Measure
+  concrete hot workloads before choosing a representation optimization.
 - **`from_opaque` is transparent to ownership analysis, like a cast** — it
   does not introduce a retain by itself (`perceus.brp`'s
   `direct_aliases_name` passes `CastExpr`/`from_opaque` through to its inner
@@ -552,7 +554,8 @@ if the cited code has since moved.
   `from_opaque`.
 - **`memory.same_object` checks allocation identity across modules**. Its
   heap path compares object addresses without module-local state; stack
-  values always return `False` (see `standard_library/src/memory.brp` and
+  values always return `False`, and an inline fixed record is a compile error
+  (see `standard_library/src/memory.brp` and
   `blorp/test/test_runtime/test_memory/test_same_object_identity.brp`).
 - **Declarations take `---` fenced docstrings, not `--` comment blocks**
   (`docs/GUIDE.md`'s Doctests section; `standard_library/src/string.brp` has

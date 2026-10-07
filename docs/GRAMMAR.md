@@ -791,8 +791,10 @@ enum_decl    = "enum" IDENT ":" NEWLINE INDENT seq(variant_name) [ NEWLINE ] DED
 ```
 
 `fixed` is the identifier `fixed` directly before `record` or `union`. Both
-record spellings, and both union spellings, have the same managed semantics
-and promise no particular layout. A record's field names are distinct. A
+record spellings, and both union spellings, have the same value semantics.
+Layout is not part of the grammar: the compiler stores a `fixed record` of
+numbers, `Char` values and other such records inline, and every other record
+managed (GUIDE, "Fixed Records"). A record's field names are distinct. A
 variant declares at most `MAX_UNION_VARIANT_FIELDS` = 64 payload fields
 (`LIM:11-15`). A union variant may have empty parentheses; an
 enum case is a bare name, and parentheses on one are an error that suggests

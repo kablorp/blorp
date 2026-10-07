@@ -12,6 +12,7 @@ import:
 		union_cleanup_kind,
 		union_field_uses_iterative_cleanup,
 		union_variant_has_cleanup,
+	c_type_layout: generated_stack_option_c_type_name
 	cancellation_plan:
 		CancellationActivationIdentity(
 			FunctionCancellationActivation, GlobalInitializerCancellationActivation,
@@ -58,8 +59,8 @@ import:
 			ConstructorMatchFallbackFail,
 		),
 		CoreDecl(
-			EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, TraitDecl, TypeAliasDecl,
-			UnionDecl,
+			EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, InlineRecordDecl, ImplDecl,
+			TraitDecl, TypeAliasDecl, UnionDecl,
 		),
 		CoreDefinitionIdentity,
 		CoreDictConstruct,
@@ -144,9 +145,9 @@ import:
 			TuplePrimElement, TupleStructElement, TupleStackResultElement, TupleVoidElement,
 		),
 		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType,
-			StackResultType, TensorType, TupleType, TypeParameterType, UnionType,
-			VoidType,
+			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType,
+			RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType,
+			UnionType, VoidType,
 		),
 		CoreUnionConstruct,
 		CoreUnionDecl,
@@ -292,9 +293,8 @@ is a lookup accelerator, never a second authority on declaration order.
 private record PrepareDecls {
 	decls: List[CoreDecl],
 	unions_by_name: Dict[String, CoreUnionDecl],
-	-- The heap record declarations, in declaration-list order, so a record
-	-- lookup scans only them.
-	heap_records: List[CoreHeapRecordDecl],
+	-- The record declarations, so a record lookup scans only them.
+	records: DeclaredRecords,
 	-- Both preparation passes lower dict literals, whose hash-key strategy
 	-- depends on resolved key layouts.
 	specialize_layout: CoreSpecializeLayout
@@ -325,35 +325,63 @@ private pure func prepare_decls(
 	{
 		decls = decls,
 		unions_by_name = unions_by_name,
-		heap_records = heap_record_decls(decls),
+		records = declared_records(decls),
 		specialize_layout = specialize_layout
 	}
 
 
-private pure func heap_record_decls(decls: List[CoreDecl]) -> List[CoreHeapRecordDecl]:
-	var records: List[CoreHeapRecordDecl] = []
+---
+One record declaration's name and the identities of its fields in declaration
+order: all a literal's field ordering needs, the same for both declaration
+kinds. Built once per declaration when the record index is.
+---
+private record RecordFieldOrder {
+	name: String,
+	field_refs: List[CoreFieldRef]
+}
+
+
+---
+The record declarations of a program, each kind in declaration-list order.
+A record literal's type variant says which list holds its declaration.
+---
+private record DeclaredRecords {
+	heap: List[RecordFieldOrder],
+	inline: List[RecordFieldOrder]
+}
+
+
+private pure func declared_records(decls: List[CoreDecl]) -> DeclaredRecords:
+	var heap: List[RecordFieldOrder] = []
+	var inline: List[RecordFieldOrder] = []
 
 	for decl in decls:
 		match decl:
 			HeapRecordDecl(record_decl):
-				records = records.append(record_decl)
+				heap = heap.append({
+					name = record_decl.name,
+					field_refs = record_decl.fields.map(func(field): field.ref)
+				})
+			InlineRecordDecl(record_decl):
+				inline = inline.append({
+					name = record_decl.name,
+					field_refs = record_decl.fields.map(func(field): field.ref)
+				})
 			_:
 				void
 
-	records
+	{heap = heap, inline = inline}
 
 
-
-
-private pure func find_heap_record_decl(
-	heap_records: List[CoreHeapRecordDecl],
+private pure func find_record_field_order(
+	records: List[RecordFieldOrder],
 	name: String,
-) -> Option[CoreHeapRecordDecl]:
-	var result: Option[CoreHeapRecordDecl] = None
+) -> Option[RecordFieldOrder]:
+	var result: Option[RecordFieldOrder] = None
 
-	for record_decl in heap_records:
-		if record_decl.name == name:
-			result = Some(record_decl)
+	for record_order in records:
+		if record_order.name == name:
+			result = Some(record_order)
 			break
 
 	result
@@ -443,17 +471,15 @@ private pure func find_record_field(
 	result
 
 
-
-
-private pure func order_heap_record_fields(
-	record_decl: CoreHeapRecordDecl,
+private pure func order_record_fields(
+	record_order: RecordFieldOrder,
 	fields: List[CoreRecordFieldValue],
 ) -> Option[List[CoreRecordFieldValue]]:
 	var ordered: List[CoreRecordFieldValue] = []
 	var found_all_fields: Bool = True
 
-	for field_decl in record_decl.fields:
-		match find_record_field(fields, field_decl.ref):
+	for field_ref in record_order.field_refs:
+		match find_record_field(fields, field_ref):
 			Some(field):
 				ordered = ordered.append(field)
 			None:
@@ -721,6 +747,8 @@ private pure func primitive_box_type(typ: CoreType) -> Bool:
 			False
 		HeapRecordType(name):
 			False
+		InlineRecordType(name):
+			False
 		UnionType(name):
 			False
 		TensorType(info):
@@ -762,6 +790,8 @@ private pure func boxed_kind_for_type(typ: CoreType) -> CoreBoxKind:
 				PointerBox
 		StackResultType(ok_type, err_type):
 			StructBox("blorp_StackResult")
+		InlineRecordType(name):
+			StructBox(name)
 		_:
 			if primitive_box_type(typ):
 				PrimBox
@@ -822,6 +852,8 @@ private pure func pointer_box_storage_needs_release_type(typ: CoreType) -> Bool:
 			True
 		HeapRecordType(name):
 			True
+		InlineRecordType(name):
+			False
 		UnionType(name):
 			True
 		TupleType(items):
@@ -1418,10 +1450,7 @@ private pure func prepare_string_set_len(
 	prepared_target: CoreExpr = prepare_expr(decls, set_len.target)
 	prepared_len: CoreExpr = prepare_expr(decls, set_len.len)
 
-	if (
-		same_object(prepared_target, set_len.target)
-		and same_object(prepared_len, set_len.len)
-	):
+	if same_object(prepared_target, set_len.target) and same_object(prepared_len, set_len.len):
 		None
 	else:
 		Some({
@@ -1646,6 +1675,8 @@ pure func is_primitive_tuple_slot_type(typ: CoreType) -> Bool:
 			True
 		HeapRecordType(name):
 			False
+		InlineRecordType(name):
+			False
 		UnionType(name):
 			False
 		StackResultType(ok_type, err_type):
@@ -1701,6 +1732,8 @@ private pure func is_managed_pointer_tuple_slot_type(typ: CoreType) -> Bool:
 			True
 		HeapRecordType(name):
 			False
+		InlineRecordType(name):
+			False
 		UnionType(name):
 			False
 		TupleType(items):
@@ -1728,6 +1761,8 @@ private pure func is_unmanaged_pointer_tuple_slot_type(typ: CoreType) -> Bool:
 		FunctionType(_, _, _):
 			False
 		HeapRecordType(name):
+			False
+		InlineRecordType(name):
 			False
 		UnionType(name):
 			False
@@ -1768,6 +1803,8 @@ private pure func stack_option_tuple_slot_c_type(typ: CoreType) -> Option[String
 			None
 		HeapRecordType(name):
 			None
+		InlineRecordType(name):
+			None
 		UnionType(name):
 			None
 		StackResultType(ok_type, err_type):
@@ -1799,6 +1836,8 @@ private pure func is_nullable_option_payload_type(payload: CoreType) -> Bool:
 			True
 		HeapRecordType(name):
 			True
+		InlineRecordType(name):
+			False
 		UnionType(name):
 			True
 		TupleType(items):
@@ -1835,6 +1874,8 @@ private pure func float_tuple_element(item: CoreExpr, typ: CoreType) -> Option[C
 		EnumType(name):
 			None
 		HeapRecordType(name):
+			None
+		InlineRecordType(name):
 			None
 		UnionType(name):
 			None
@@ -2252,10 +2293,7 @@ private pure func annotate_tensor_storage_expr(
 				body,
 			)
 
-			if (
-				same_object(annotated_source, binding.source)
-				and same_object(annotated_body, body)
-			):
+			if same_object(annotated_source, binding.source) and same_object(annotated_body, body):
 				expr
 			else:
 				TensorRawViewLetExpr(
@@ -2567,6 +2605,10 @@ private pure func prepared_tuple_literal(
 
 							if tuple_pointer_expr_needs_retain(item):
 								retain_mask += release_mask_bit(index)
+						InlineRecordType(name):
+							-- The tuple slot owns a struct box holding a copy.
+							elements = elements.append(TupleStructElement(item, name))
+							release_mask += release_mask_bit(index)
 						UnionType(name):
 							elements = elements.append(TuplePointerElement(item))
 							release_mask += release_mask_bit(index)
@@ -2859,6 +2901,18 @@ private pure func prepare_vector_expr(
 					)
 				None:
 					match elem_type:
+						InlineRecordType(name):
+							TensorLiteralExpr(
+								{
+									shape = literal_shape,
+									payload = TensorInlineStructLiteralPayload({
+										struct_c_type = name,
+										elements = flattened_items.elements,
+									})
+								},
+								typ,
+								loc,
+							)
 						NamedType(name, args):
 							if name == "Bool" and args.length() == 0:
 								TensorPackedLiteralExpr(
@@ -3162,26 +3216,28 @@ private pure func prepare_record_cow_field(
 
 ---
 The declaration-ordered fields of a record literal whose type names a
-declared heap record, paired with that record's name. `None` when
+declared heap or inline record, paired with that record's name. `None` when
 the type is not such a record or the literal does not cover its fields.
 ---
 private pure func declaration_ordered_record_fields(
-	heap_records: List[CoreHeapRecordDecl],
+	records: DeclaredRecords,
 	typ: CoreType,
 	fields: List[CoreRecordFieldValue],
 ) -> Option[(String, List[CoreRecordFieldValue])]:
 	match typ:
 		HeapRecordType(name):
-			match find_heap_record_decl(heap_records, name):
-				Some(record_decl):
-					match order_heap_record_fields(record_decl, fields):
-						Some(ordered_fields):
-							Some((name, ordered_fields))
-						None:
-							None
-				None:
-					None
-		_:
+			record_order ?= find_record_field_order(records.heap, name)
+			ordered_fields ?= order_record_fields(record_order, fields)
+			Some((name, ordered_fields))
+		InlineRecordType(name):
+			record_order ?= find_record_field_order(records.inline, name)
+			ordered_fields ?= order_record_fields(record_order, fields)
+			Some((name, ordered_fields))
+		NamedType(_, _) | TypeParameterType(_) | SelfType | VoidType | EnumType(_) | UnionType(_):
+			None
+		StackResultType(_, _) | BoxedResultType(_, _) | FunctionType(_, _, _) | RangeType:
+			None
+		TensorType(_) | TupleType(_):
 			None
 
 
@@ -3223,7 +3279,7 @@ private pure func prepare_record_expr(
 	prepared_fields: Option[List[CoreRecordFieldValue]] = prepare_record_fields(decls, fields)
 
 	match declaration_ordered_record_fields(
-		decls.heap_records,
+		decls.records,
 		typ,
 		prepared_fields.get_or(fields),
 	):
@@ -3248,7 +3304,7 @@ private pure func prepare_record_construct_expr(
 	prepared_fields: Option[List[CoreRecordFieldValue]] = prepare_record_fields(decls, fields)
 
 	match declaration_ordered_record_fields(
-		decls.heap_records,
+		decls.records,
 		typ,
 		prepared_fields.get_or(fields),
 	):
@@ -3314,6 +3370,8 @@ private pure func stack_option_c_type(payload: CoreType) -> Option[String]:
 			Some("blorp_StackOption_" + name)
 		HeapRecordType(name):
 			None
+		InlineRecordType(name):
+			Some(generated_stack_option_c_type_name(name))
 		UnionType(name):
 			None
 		StackResultType(ok_type, err_type):
@@ -3349,6 +3407,8 @@ private pure func stack_option_none_value(payload: CoreType) -> String:
 			"0"
 		HeapRecordType(name):
 			"0"
+		InlineRecordType(name):
+			"{0}"
 		UnionType(name):
 			"0"
 		StackResultType(ok_type, err_type):
@@ -3585,7 +3645,7 @@ private pure func prepare_stack_option_construct(
 			None
 		FallibleStreamTerminalCall(bridge):
 			None
-		ListToStringCall(callback_name):
+		ListToStringCall(callback_name, _):
 			None
 		ClosureCall:
 			None
@@ -3666,6 +3726,8 @@ private pure func stack_result_payload_has_erased_storage(payload: CoreType) -> 
 		EnumType(name):
 			True
 		HeapRecordType(name):
+			True
+		InlineRecordType(name):
 			True
 		UnionType(name):
 			True
@@ -3756,7 +3818,7 @@ private pure func prepare_stack_result_construct(
 			None
 		FallibleStreamTerminalCall(bridge):
 			None
-		ListToStringCall(callback_name):
+		ListToStringCall(callback_name, _):
 			None
 		ClosureCall:
 			None
@@ -3828,7 +3890,7 @@ private pure func prepare_boxed_result_construct(
 			None
 		FallibleStreamTerminalCall(bridge):
 			None
-		ListToStringCall(callback_name):
+		ListToStringCall(callback_name, _):
 			None
 		ClosureCall:
 			None
@@ -3909,7 +3971,7 @@ private pure func prepare_union_construct(
 					None
 				FallibleStreamTerminalCall(bridge):
 					None
-				ListToStringCall(callback_name):
+				ListToStringCall(callback_name, _):
 					None
 				ClosureCall:
 					None
@@ -3953,6 +4015,8 @@ private pure func prepare_union_construct(
 		EnumType(name):
 			None
 		HeapRecordType(name):
+			None
+		InlineRecordType(name):
 			None
 		RangeType:
 			None
@@ -4516,10 +4580,7 @@ private pure func prepare_aggregate_expr(decls: PrepareDecls, expr: CoreExpr) ->
 				Some(construct):
 					UnionConstructExpr(construct, typ, loc)
 				None:
-					if (
-						same_object(prepared_callee, callee)
-						and same_object(prepared_args, args)
-					):
+					if same_object(prepared_callee, callee) and same_object(prepared_args, args):
 						expr
 					else:
 						CallExpr(kind, prepared_callee, prepared_args, typ, loc)
@@ -5379,10 +5440,10 @@ record WrittenOrderRecordLiterals {
 }
 
 
--- The heap records `prepare` looks up a literal's field order in, and the
+-- The records `prepare` looks up a literal's field order in, and the
 -- counter the minted binders count down from.
 private record RecordLiteralBinding {
-	heap_records: List[CoreHeapRecordDecl],
+	records: DeclaredRecords,
 	next_binder_id: Int
 }
 
@@ -5405,11 +5466,11 @@ True when `prepare_record_expr` would reorder this record literal's fields,
 that is when they are not written in declaration order.
 ---
 private pure func record_literal_out_of_declaration_order(
-	heap_records: List[CoreHeapRecordDecl],
+	records: DeclaredRecords,
 	fields: List[CoreRecordFieldValue],
 	typ: CoreType,
 ) -> Bool:
-	match declaration_ordered_record_fields(heap_records, typ, fields):
+	match declaration_ordered_record_fields(records, typ, fields):
 		Some((_, ordered_fields)):
 			not same_record_field_order(ordered_fields, fields)
 		None:
@@ -5492,7 +5553,7 @@ private pure func bind_record_literal_fields_expr(
 		RecordExpr(fields, typ, loc):
 			if (
 				fields.any(func(field): not is_literal_field_value(field.value))
-				and record_literal_out_of_declaration_order(mapped.state.heap_records, fields, typ)
+				and record_literal_out_of_declaration_order(mapped.state.records, fields, typ)
 			):
 				bind_fields_in_written_order(mapped.state, fields, typ, loc)
 			else:
@@ -5546,7 +5607,7 @@ pure func bind_record_literal_fields_in_written_order(
 	next_binder_id: Int,
 ) -> WrittenOrderRecordLiterals:
 	var binding: RecordLiteralBinding = {
-		heap_records = heap_record_decls(program.decls),
+		records = declared_records(program.decls),
 		next_binder_id = next_binder_id
 	}
 	var decls: List[CoreDecl] = []
@@ -5642,6 +5703,8 @@ private pure func prepare_decl(decls: PrepareDecls, decl: CoreDecl) -> CoreDecl:
 			UnionDecl(union_decl)
 		HeapRecordDecl(record_decl):
 			HeapRecordDecl(record_decl)
+		InlineRecordDecl(record_decl):
+			InlineRecordDecl(record_decl)
 		TypeAliasDecl(alias_decl):
 			TypeAliasDecl(alias_decl)
 		TraitDecl(trait_decl):
@@ -5931,6 +5994,9 @@ private pure func cleanup_type_plan_for_decl(
 			union_cleanup_type_plan(layout, union_decl)
 		HeapRecordDecl(record_decl):
 			heap_record_cleanup_type_plan(record_decl)
+		InlineRecordDecl(_):
+			-- Scalar fields and no header: an inline record has nothing to clean up.
+			NotACleanupType
 		FunctionDecl(_) | GlobalDecl(_) | EnumDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
 			NotACleanupType
 
@@ -6087,7 +6153,7 @@ private pure func cancellation_plan_for_decl(
 			function_cancellation_plan(func_info, program_summary)
 		GlobalDecl(global):
 			global_cancellation_plan(global, program_summary)
-		EnumDecl(_) | UnionDecl(_) | HeapRecordDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
+		EnumDecl(_) | UnionDecl(_) | HeapRecordDecl(_) | InlineRecordDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
 			None
 
 

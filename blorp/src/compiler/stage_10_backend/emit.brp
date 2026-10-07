@@ -95,7 +95,7 @@ import:
 			StackResultOkConstructorTest, UnionTagConstructorTest,
 		),
 		CoreDecl(
-			EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, TraitDecl, TypeAliasDecl,
+			EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, InlineRecordDecl, ImplDecl, TraitDecl, TypeAliasDecl,
 			UnionDecl,
 		),
 		CoreDefinitionIdentity,
@@ -165,8 +165,10 @@ import:
 			TraitHashContainerConstructor,
 		),
 		CoreHeapRecordDecl,
+		CoreInlineRecordDecl,
 		CoreHeapRecordField,
 		CoreListAccessBounds(CheckedListAccess, ProvenListAccess),
+		CoreListToStringElements(InlineRecordListToStringElements, PointerListToStringElements),
 		CoreListAlloc,
 		CoreListConstruct,
 		CoreListGet,
@@ -257,7 +259,7 @@ import:
 			TuplePrimElement, TupleStackResultElement, TupleStructElement, TupleVoidElement,
 		),
 		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType,
+			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType, RangeType, SelfType,
 			StackResultType, TensorType, TypeParameterType, TupleType, UnionType,
 			VoidType,
 		),
@@ -395,7 +397,14 @@ import:
 		CapacityCustomCtorArgs,
 		ChannelRecvAttemptConstructors,
 		ChannelRecvReleasePolicy(KeepChannelRecvValue, ReleaseChannelRecvValue),
+		ChannelInlineRecordReceive(
+			BlockingInlineRecordReceive, TimeoutInlineRecordReceive, TryInlineRecordReceive,
+		),
+		ChannelInlineRecordRecvArgs,
 		ChannelRecvTimeoutAttemptArgs,
+		LIST_INLINE_RECORD_TO_STRING_INDEX,
+		LIST_INLINE_RECORD_TO_STRING_LIST,
+		ListInlineRecordToStringArgs,
 		ChannelRecvTimeoutAttemptNoReleaseMaskArgs,
 		ChannelRetainingSendArgs,
 		ChannelRetainingSendRuntime(
@@ -416,7 +425,8 @@ import:
 		DictKeyReleasePolicy(DictKeepKey),
 		ElemReleaseArg(ElemReleaseFn, NoElemRelease),
 		PreparedBackendOp(
-			BackendChannelIterHeader, BackendChannelIterReleaseObject,
+			BackendChannelInlineRecordRecv, BackendChannelIterHeader, BackendChannelIterReleaseObject,
+			BackendListInlineRecordToString,
 			BackendChannelWithElemRelease, BackendChannelRecvTimeoutAttempt,
 			BackendChannelRecvTimeoutAttemptNoReleaseMask, BackendChannelRetainingSend,
 			BackendChannelRetainingSendWithTimeout, BackendChannelSendTimeoutAttempt,
@@ -432,7 +442,8 @@ import:
 			BackendDictWithCapacityString, BackendDictIterDeletedSlotGuard, BackendDictIterHeader,
 			BackendDictIterKeyBinding, BackendDictIterLoopOpen, BackendDictIterPairBinding,
 			BackendDictIterSlotBinding, BackendDictIterSourceBinding, BackendDictInsert,
-			BackendDictStackOptionInt128Get, BackendDictStackOptionLongGet,
+			BackendDictStackOptionInlineRecordGet, BackendDictStackOptionInt128Get,
+			BackendDictStackOptionLongGet,
 			BackendDictStackOptionUInt128Get,
 			BackendDictValueReleaseInit, BackendEntrypointArgvListPrelude,
 			BackendGenericObjectAlloc, BackendInlineStructBoxAlloc, BackendSelectAfterArm,
@@ -446,6 +457,7 @@ import:
 			BackendStringIterCodepointBinding, BackendStringIterHeader, BackendStringIterLoopOpen,
 			BackendStringIterSourceBinding,
 		),
+		StackOptionInlineRecordGetArgs,
 		StackOptionScalarGetArgs,
 		StackResultTaggedPayloadArgs,
 		render_prepared_backend_op,
@@ -491,8 +503,8 @@ import:
 		PreparedTensorOp(
 			F32StorageCheck, F64StorageCheck, I64StorageCheck, InlineStructElementDecl,
 			InlineStructGetChecked, InlineStructGetUnchecked, InlineStructMatrixGetChecked, RawRead,
-			RawViewDecl, RawWriteExpr, StackOptionMatrixInt128Get, StackOptionMatrixLongGet,
-			StackOptionMatrixUInt128Get,
+			RawViewDecl, RawWriteExpr, StackOptionMatrixInlineRecordGet, StackOptionMatrixInt128Get,
+			StackOptionMatrixLongGet, StackOptionMatrixUInt128Get, StackOptionVectorInlineRecordGet,
 			StackOptionVectorInt128Get, StackOptionVectorLongGet, StackOptionVectorUInt128Get,
 			TensorAllocPointer, TensorAllocPacked, TensorAllocF32,
 			TensorAllocF64, TensorAllocI64, TensorAllocSized, TensorFillDimBind, TensorFillDimName,
@@ -512,7 +524,9 @@ import:
 		),
 		RawViewDeclArgs,
 		RawWriteArgs,
+		StackOptionMatrixInlineRecordGetArgs,
 		StackOptionMatrixScalarGetArgs,
+		StackOptionVectorInlineRecordGetArgs,
 		StackOptionVectorScalarGetArgs,
 		StorageCheckArgs,
 		TensorFillDimBindArgs,
@@ -1156,6 +1170,15 @@ private pure func closure_abi_value_for_type(
 			Some(ClosureAbiPrim)
 		HeapRecordType(name):
 			Some(ClosureAbiPointer)
+		InlineRecordType(name):
+			-- Captured by value in the closure environment.
+			Some(
+				ClosureAbiStruct(
+					type_symbol_lookup
+						.get(name)
+						.get_or(name),
+				),
+			)
 		UnionType(name):
 			Some(ClosureAbiPointer)
 		RangeType:
@@ -1710,7 +1733,7 @@ private pure func expr_is_static_immortal(expr: CoreExpr) -> Bool:
 private pure func expr_transfers_ownership(expr: CoreExpr) -> Bool:
 	match expr:
 		BoxExpr(box, typ, loc):
-			TypeLayout.boxed_value_needs_release_type(box.source_type)
+			TypeLayout.erased_slot_needs_release_type(box.source_type)
 		VarExpr(variable, typ, loc):
 			False
 		FieldExpr(expr_value, field_name, _field_ref, typ, loc):
@@ -2610,7 +2633,7 @@ private pure func cleanup_release_fn(
 			None
 		FallibleStreamTerminalCall(bridge):
 			None
-		ListToStringCall(callback_name):
+		ListToStringCall(callback_name, _):
 			None
 		ClosureCall:
 			None
@@ -2913,6 +2936,8 @@ private pure func is_string_type(typ: CoreType) -> Bool:
 			False
 		HeapRecordType(name):
 			False
+		InlineRecordType(name):
+			False
 		UnionType(name):
 			False
 		RangeType:
@@ -2941,6 +2966,8 @@ private pure func is_ieee_float_type(typ: CoreType) -> Bool:
 			False
 		HeapRecordType(name):
 			False
+		InlineRecordType(name):
+			False
 		UnionType(name):
 			False
 		RangeType:
@@ -2968,6 +2995,8 @@ private pure func is_fixed_point_type(typ: CoreType) -> Bool:
 		EnumType(name):
 			False
 		HeapRecordType(name):
+			False
+		InlineRecordType(name):
 			False
 		UnionType(name):
 			False
@@ -3056,6 +3085,8 @@ private pure func float_modulo_runtime(typ: CoreType) -> Option[FloatModuloRunti
 		EnumType(name):
 			None
 		HeapRecordType(name):
+			None
+		InlineRecordType(name):
 			None
 		UnionType(name):
 			None
@@ -3685,6 +3716,8 @@ private pure func result_bridge_layout_for_type(
 			None
 		HeapRecordType(name):
 			None
+		InlineRecordType(name):
+			None
 		UnionType(name):
 			None
 		RangeType:
@@ -3722,6 +3755,8 @@ private pure func payload_named_type_name(typ: CoreType) -> Option[String]:
 		TypeParameterType(_) | SelfType:
 			None
 		HeapRecordType(name):
+			Some(name)
+		InlineRecordType(name):
 			Some(name)
 		UnionType(name):
 			Some(name)
@@ -4069,6 +4104,8 @@ private pure func is_named_option_type(typ: CoreType) -> Bool:
 			False
 		HeapRecordType(name):
 			False
+		InlineRecordType(name):
+			False
 		UnionType(name):
 			False
 		TupleType(items):
@@ -4118,6 +4155,8 @@ private pure func fallible_stream_option_payload_release_mask(
 			0
 		HeapRecordType(name):
 			0
+		InlineRecordType(name):
+			0
 		UnionType(name):
 			0
 		TupleType(items):
@@ -4141,7 +4180,7 @@ private pure func fallible_stream_ok_payload_release_mask(
 		FallibleStreamPayloadList(list_payload):
 			1
 		FallibleStreamPayloadErased:
-			if TypeLayout.boxed_value_needs_release_type(ok_type):
+			if TypeLayout.erased_slot_needs_release_type(ok_type):
 				1
 			else:
 				0
@@ -5495,7 +5534,7 @@ private pure func call_kind_ownership_contract(
 			builtin_contract(name, arg_count)
 		DictWithCapacityCall(constructor):
 			builtin_contract("blorp_dict_with_capacity_custom", arg_count)
-		ListToStringCall(callback_name):
+		ListToStringCall(callback_name, _):
 			builtin_contract("blorp_list_to_string_cb", arg_count)
 		UserCall(name, def_id, consumed_args):
 			None
@@ -5796,6 +5835,8 @@ private pure func is_foreign_string_arg(arg: CoreExpr) -> Bool:
 			False
 		HeapRecordType(name):
 			False
+		InlineRecordType(name):
+			False
 		UnionType(name):
 			False
 		RangeType:
@@ -5996,6 +6037,48 @@ private pure func emit_foreign_call_args_body(
 			)
 
 
+---
+A foreign function sees a record as a pointer to a boxed object: an object
+header followed by the fields, the layout a managed record has. An inline
+record argument is therefore passed in a struct box made for the call and
+released after it, so the foreign ABI does not depend on whether a fixed
+record is stored inline.
+---
+private pure func box_foreign_inline_record_args(
+	args: List[CoreExpr],
+	body: ForeignCallArgsBody,
+	emission_context: FunctionEmissionContext,
+) -> ForeignCallArgsBody:
+	var statements: String = body.statements
+	var boxed_args: List[String] = []
+	var releases: String = ""
+	var temp_index: Int = body.next_temp
+
+	for (arg, arg_c) in args.zip(body.args):
+		match core_expr_type(arg):
+			InlineRecordType(_):
+				inline_c_type: String = TypeLayout.c_type_name(
+					core_expr_type(arg),
+					selected_type_symbol_lookup(emission_context.symbol_authority),
+				)
+				value_temp: String = temp_name("ffi_record", temp_index, emission_context.compact)
+				box_temp: String = temp_name("ffi_record_box", temp_index + 1, emission_context.compact)
+				statements += emission_context.indent + inline_c_type + " " + value_temp + " = " + arg_c + ";\n"
+				statements += emission_context.indent + "void* " + box_temp + " = blorp_box_struct(&" + value_temp + ", sizeof(" + inline_c_type + "));\n"
+				releases += emission_context.indent + "blorp_release(" + box_temp + ");\n"
+				boxed_args = boxed_args.append(box_temp)
+				temp_index += 2
+			_:
+				boxed_args = boxed_args.append(arg_c)
+
+	{
+		statements = statements,
+		args = boxed_args,
+		release_statements = body.release_statements + releases,
+		next_temp = temp_index
+	}
+
+
 private pure func emit_foreign_call_body(
 	name: String,
 	arg_passing: CoreForeignArgPassing,
@@ -6004,11 +6087,24 @@ private pure func emit_foreign_call_body(
 	next_temp: Int,
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
-	foreign_args ?= emit_foreign_call_args_body(arg_passing, args, next_temp, emission_context)
-	call_value: String = adapt_direct_call_result(
-		direct_runtime_result_for_type(typ),
-		name + "(" + foreign_args.args.join(", ") + ")",
+	unboxed_args ?= emit_foreign_call_args_body(arg_passing, args, next_temp, emission_context)
+	foreign_args: ForeignCallArgsBody = box_foreign_inline_record_args(
+		args,
+		unboxed_args,
+		emission_context,
 	)
+	raw_call: String = name + "(" + foreign_args.args.join(", ") + ")"
+	call_value: String = match typ:
+		InlineRecordType(_):
+			-- The foreign side returns an owned boxed record (header, then the
+			-- fields); copy the struct out and release the box.
+			inline_c_type: String = TypeLayout.c_type_name(
+				typ,
+				selected_type_symbol_lookup(emission_context.symbol_authority),
+			)
+			"({ void* __ffi_box = " + raw_call + "; " + inline_c_type + " __ffi_value = blorp_unbox_struct(__ffi_box, " + inline_c_type + "); blorp_release(__ffi_box); __ffi_value; })"
+		_:
+			adapt_direct_call_result(direct_runtime_result_for_type(typ), raw_call)
 
 	if TypeLayout.is_void_type(typ):
 		Some({
@@ -6144,6 +6240,8 @@ private pure func stack_option_none_value_for_type(typ: CoreType) -> String:
 		NamedType(name, args):
 			if name == "Option":
 				match args:
+					[InlineRecordType(_)]:
+						"{0}"
 					[payload]:
 						"0"
 					[]:
@@ -6166,6 +6264,8 @@ private pure func stack_option_none_value_for_type(typ: CoreType) -> String:
 			"0"
 		HeapRecordType(name):
 			"0"
+		InlineRecordType(name):
+			"{0}"
 		UnionType(name):
 			"0"
 		RangeType:
@@ -6214,6 +6314,8 @@ private pure func stack_option_none_expr_for_type(
 		EnumType(name):
 			None
 		HeapRecordType(name):
+			None
+		InlineRecordType(name):
 			None
 		UnionType(name):
 			None
@@ -6310,6 +6412,18 @@ private pure func emit_dict_get_stack_option_payload(
 			None
 		HeapRecordType(name):
 			None
+		InlineRecordType(name):
+			args: StackOptionInlineRecordGetArgs = {
+				dict = dict,
+				key = key,
+				temp_seed = DICT_GET_TEMP_SEED,
+				option_c_type = TypeLayout.c_type_name(result_type, type_symbol_lookup),
+				payload_c_type = TypeLayout.c_type_name(payload_type, type_symbol_lookup),
+				none_value = stack_option_none_value_for_type(result_type)
+			}
+			Some(
+				render_prepared_backend_op(BackendDictStackOptionInlineRecordGet(args, DictKeepKey)),
+			)
 		UnionType(name):
 			None
 		TensorType(info):
@@ -6358,6 +6472,8 @@ private pure func emit_prepared_dict_builtin_call(
 					EnumType(type_name):
 						None
 					HeapRecordType(type_name):
+						None
+					InlineRecordType(type_name):
 						None
 					UnionType(type_name):
 						None
@@ -6417,6 +6533,16 @@ private pure func emit_vector_get_stack_option_payload(
 	type_symbol_lookup: Dict[String, String],
 ) -> Option[String]:
 	match payload_type:
+		InlineRecordType(_):
+			args: StackOptionVectorInlineRecordGetArgs = {
+				tensor = tensor,
+				index = index,
+				temp_seed = TENSOR_STACK_OPTION_GET_TEMP_SEED,
+				option_c_type = TypeLayout.c_type_name(result_type, type_symbol_lookup),
+				payload_c_type = TypeLayout.c_type_name(payload_type, type_symbol_lookup),
+				none_value = stack_option_none_value_for_type(result_type)
+			}
+			Some(render_prepared_tensor_op(StackOptionVectorInlineRecordGet(args)))
 		RangeType:
 			args: StackOptionVectorScalarGetArgs = stack_option_vector_scalar_get_args(
 				tensor,
@@ -6481,6 +6607,17 @@ private pure func emit_matrix_get_stack_option_payload(
 	type_symbol_lookup: Dict[String, String],
 ) -> Option[String]:
 	match payload_type:
+		InlineRecordType(_):
+			args: StackOptionMatrixInlineRecordGetArgs = {
+				tensor = tensor,
+				row = row,
+				col = col,
+				temp_seed = TENSOR_STACK_OPTION_GET_TEMP_SEED,
+				option_c_type = TypeLayout.c_type_name(result_type, type_symbol_lookup),
+				payload_c_type = TypeLayout.c_type_name(payload_type, type_symbol_lookup),
+				none_value = stack_option_none_value_for_type(result_type)
+			}
+			Some(render_prepared_tensor_op(StackOptionMatrixInlineRecordGet(args)))
 		RangeType:
 			args: StackOptionMatrixScalarGetArgs = stack_option_matrix_scalar_get_args(
 				tensor,
@@ -6608,6 +6745,8 @@ private pure func emit_tensor_stack_option_get_call(
 			None
 		HeapRecordType(type_name):
 			None
+		InlineRecordType(type_name):
+			None
 		UnionType(type_name):
 			None
 		RangeType:
@@ -6623,6 +6762,7 @@ private pure func emit_prepared_channel_builtin_call(
 	args: List[String],
 	typ: CoreType,
 	specialize_layout: Option[CoreSpecializeLayout],
+	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	if name == "blorp_channel_new":
 		elem_type ?= TypeLayout.channel_element_type(typ)
@@ -6643,7 +6783,71 @@ private pure func emit_prepared_channel_builtin_call(
 		else:
 			None
 	else:
-		None
+		emit_inline_record_channel_receive(name, args, typ, symbol_authority)
+
+
+private pure func emit_inline_record_channel_receive(
+	name: String,
+	args: List[String],
+	typ: CoreType,
+	symbol_authority: CEmissionSymbolAuthority,
+) -> Option[String]:
+	receive ?= inline_record_channel_receive(name, args)
+	payload_type ?= single_option_payload(typ)
+
+	match payload_type:
+		InlineRecordType(_):
+			Some(
+				render_prepared_backend_op(
+					BackendChannelInlineRecordRecv({
+						channel = receive[0],
+						receive = receive[1],
+						option_c_type = TypeLayout.c_type_name(
+							typ,
+							selected_type_symbol_lookup(symbol_authority),
+						),
+						payload_c_type = TypeLayout.c_type_name(
+							payload_type,
+							selected_type_symbol_lookup(symbol_authority),
+						),
+					}),
+				),
+			)
+		_:
+			None
+
+
+---
+The generic channel receives, which return an erased Option object. An
+inline-record element must instead be copied into its stack Option.
+---
+private pure func inline_record_channel_receive(
+	name: String,
+	args: List[String],
+) -> Option[(String, ChannelInlineRecordReceive)]:
+	match args:
+		[channel]:
+			if name == "blorp_channel_recv":
+				Some((channel, BlockingInlineRecordReceive))
+			else if name == "blorp_channel_try_recv":
+				Some((channel, TryInlineRecordReceive))
+			else:
+				None
+		[channel, timeout_ms]:
+			if name == "blorp_channel_recv_timeout":
+				Some((channel, TimeoutInlineRecordReceive(timeout_ms)))
+			else:
+				None
+		_:
+			None
+
+
+private pure func single_option_payload(typ: CoreType) -> Option[CoreType]:
+	match typ:
+		NamedType("Option", [payload]):
+			Some(payload)
+		_:
+			None
 
 
 private pure func emit_retaining_channel_send_value(
@@ -6913,17 +7117,41 @@ private pure func emit_call_value_from_args(
 				Some(c_identifier(call_name) + "(" + args_c + ")")
 		ForeignCall(name, arg_passing):
 			None
-		ListToStringCall(callback_def_id):
+		ListToStringCall(callback_def_id, elements):
 			match args:
 				[list_value]:
-					Some(
-						"blorp_list_to_string_cb(" + list_value + ", (blorp_String* (*)(void*))" + c_identifier(
-							emitted_callable_name(
-								emission_context.symbol_authority,
-								callback_def_id,
-							),
-						) + ")",
+					to_string: String = c_identifier(
+						emitted_callable_name(
+							emission_context.symbol_authority,
+							callback_def_id,
+						),
 					)
+
+					match elements:
+						PointerListToStringElements:
+							Some(
+								"blorp_list_to_string_cb(" + list_value + ", (blorp_String* (*)(void*))" + to_string + ")",
+							)
+						InlineRecordListToStringElements(record_name):
+							element_c_type: String = TypeLayout.c_type_name(
+								InlineRecordType(record_name),
+								type_symbol_lookup,
+							)
+							Some(
+								render_prepared_backend_op(
+									BackendListInlineRecordToString({
+										list = list_value,
+										element_c_type = element_c_type,
+										element_load = inline_struct_list_load_expr(
+											LIST_INLINE_RECORD_TO_STRING_LIST,
+											LIST_INLINE_RECORD_TO_STRING_INDEX,
+											element_c_type,
+											ProvenListAccess,
+										),
+										to_string = to_string,
+									}),
+								),
+							)
 				[]:
 					None
 				[first, second, ...rest]:
@@ -6942,7 +7170,16 @@ private pure func emit_call_value_from_args(
 				Some(rendered):
 					Some(rendered)
 				None:
-					emit_direct_runtime_call(call, args, type_symbol_lookup)
+					match emit_inline_record_channel_receive(
+						call.name,
+						args,
+						typ,
+						emission_context.symbol_authority,
+					):
+						Some(rendered):
+							Some(rendered)
+						None:
+							emit_direct_runtime_call(call, args, type_symbol_lookup)
 		BuiltinCall(name):
 			match emit_tensor_stack_option_get_call(name, args, typ, type_symbol_lookup):
 				Some(rendered):
@@ -6970,6 +7207,7 @@ private pure func emit_call_value_from_args(
 												args,
 												typ,
 												emission_context.specialize_layout,
+												emission_context.symbol_authority,
 											):
 												Some(rendered):
 													Some(rendered)
@@ -6983,7 +7221,7 @@ private pure func emit_call_value_from_args(
 			None
 		FallibleStreamTerminalCall(bridge):
 			None
-		ListToStringCall(callback_name):
+		ListToStringCall(callback_name, _):
 			None
 		ClosureCall:
 			None
@@ -7238,7 +7476,7 @@ private pure func emit_call_body(
 			None
 		FallibleStreamTerminalCall(bridge):
 			None
-		ListToStringCall(callback_name):
+		ListToStringCall(callback_name, _):
 			args_body ?= emit_call_args_body(args, next_temp, emission_context)
 			value ?= emit_call_value_from_args(kind, args_body.args, typ, emission_context)
 			Some(
@@ -8261,6 +8499,20 @@ private pure func emit_inline_struct_list_unbox_get(
 		c_type,
 		selected_type_symbol_lookup(emission_context.symbol_authority),
 	)
+	Some(inline_struct_list_load_expr(list_c, index_c, resolved_c_type, get.bounds))
+
+
+---
+A copy of the struct element at `index_c` of a list whose elements are stored
+inline. The load checks the list's storage mode, so a boxed list of the same
+element type still reads correctly.
+---
+private pure func inline_struct_list_load_expr(
+	list_c: String,
+	index_c: String,
+	resolved_c_type: String,
+	bounds: CoreListAccessBounds,
+) -> String:
 	list_tmp: String = render_prepared_list_op(
 		ListInlineStructUnboxListName(LIST_INLINE_STRUCT_LOAD_TEMP_SEED),
 	)
@@ -8286,18 +8538,16 @@ private pure func emit_inline_struct_list_unbox_get(
 		struct_ty = resolved_c_type
 	}
 
-	Some(
-		render_prepared_list_op(
-			ListInlineStructUnboxOpen(
-				open_args,
-			),
-		) + " " + render_prepared_list_op(
-			inline_struct_list_load_op(
-				get.bounds,
-				load_args,
-			),
-		) + " " + render_prepared_list_op(ListInlineStructUnboxClose(out_tmp)),
-	)
+	render_prepared_list_op(
+		ListInlineStructUnboxOpen(
+			open_args,
+		),
+	) + " " + render_prepared_list_op(
+		inline_struct_list_load_op(
+			bounds,
+			load_args,
+		),
+	) + " " + render_prepared_list_op(ListInlineStructUnboxClose(out_tmp))
 
 
 private pure func emit_inline_struct_tensor_get_unchecked(
@@ -8817,6 +9067,8 @@ private pure func tensor_raw_scalar_kind_for_type(typ: CoreType) -> Option[CoreT
 		EnumType(type_name):
 			None
 		HeapRecordType(type_name):
+			None
+		InlineRecordType(type_name):
 			None
 		UnionType(type_name):
 			None
@@ -10513,9 +10765,41 @@ private pure func emit_list_retain_intrinsic_body(
 			None
 
 
+---
+The C value of a record built from `args`, already in declaration order. A
+heap record calls its allocating constructor; an inline record is a compound
+literal with no allocation. Field values are evaluated before this point
+(`simple_call_args_require_ordering` or materialized temporaries), so the
+unspecified evaluation order of C initializers cannot reorder effects.
+---
+private pure func record_construct_c(
+	type_name: String,
+	typ: CoreType,
+	args: List[String],
+	emission_context: FunctionEmissionContext,
+) -> String:
+	match typ:
+		InlineRecordType(_):
+			inline_c_type: String = TypeLayout.c_type_name(
+				typ,
+				selected_type_symbol_lookup(emission_context.symbol_authority),
+			)
+			initializer: String = if args.is_empty():
+				"0"
+			else:
+				args.join(", ")
+			"((" + inline_c_type + "){ " + initializer + " })"
+		_:
+			selected_type_naming(
+				emission_context.symbol_authority,
+				type_name,
+			).make_name + "(" + args.join(", ") + ")"
+
+
 private pure func emit_record_construct(
 	type_name: String,
 	fields: List[CoreRecordFieldValue],
+	typ: CoreType,
 	emission_context: FunctionEmissionContext,
 ) -> Option[String]:
 	field_values: List[CoreExpr] = fields.map(func(field): field.value)
@@ -10538,12 +10822,7 @@ private pure func emit_record_construct(
 		if failed:
 			None
 		else:
-			Some(
-				selected_type_naming(
-					emission_context.symbol_authority,
-					type_name,
-				).make_name + "(" + values.join(", ") + ")",
-			)
+			Some(record_construct_c(type_name, typ, values, emission_context))
 
 
 private pure func emit_record_construct_args_body(
@@ -10617,10 +10896,7 @@ private pure func emit_record_construct_body(
 			"record_result",
 			typ,
 			args_body.statements,
-			selected_type_naming(
-				emission_context.symbol_authority,
-				type_name,
-			).make_name + "(" + args_body.args.join(", ") + ")",
+			record_construct_c(type_name, typ, args_body.args, emission_context),
 			args_body.next_temp,
 			selected_type_symbol_lookup(emission_context.symbol_authority),
 			emission_context.compact,
@@ -11564,6 +11840,8 @@ private pure func is_pointer_tuple_slot_type(typ: CoreType) -> Bool:
 			True
 		HeapRecordType(name):
 			True
+		InlineRecordType(name):
+			False
 		UnionType(name):
 			True
 		TupleType(items):
@@ -11600,6 +11878,8 @@ private pure func emit_float_tuple_field_access(element_c: String, typ: CoreType
 		FunctionType(is_pure, param_types, return_type):
 			None
 		HeapRecordType(name):
+			None
+		InlineRecordType(name):
 			None
 		UnionType(name):
 			None
@@ -11672,6 +11952,17 @@ private pure func emit_tuple_field_access(
 						None
 					HeapRecordType(name):
 						None
+					InlineRecordType(name):
+						-- The tuple slot holds a struct box (`TupleStructElement`).
+						Some(
+							boxed_struct_value_source(
+								TypeLayout.c_type_name(
+									typ,
+									selected_type_symbol_lookup(emission_context.symbol_authority),
+								),
+								element_c,
+							),
+						)
 					UnionType(name):
 						None
 					TupleType(items):
@@ -11702,6 +11993,14 @@ private pure func c_field_access_value(
 				field_ref,
 			)
 			Some(expr_c + "->" + member)
+		InlineRecordType(name):
+			member ?= c_record_member_of(
+				emission_context.record_members,
+				name,
+				field_name,
+				field_ref,
+			)
+			Some(expr_c + "." + member)
 		RangeType:
 			Some(expr_c + "." + c_field_name(field_name))
 		VoidType:
@@ -12034,7 +12333,7 @@ private pure func emit_unbox_expr(
 								c_type,
 								emission_context,
 							)
-						ListToStringCall(callback_name):
+						ListToStringCall(callback_name, _):
 							emit_struct_unbox_from_pointer_expr(
 								expr_value,
 								c_type,
@@ -12208,6 +12507,8 @@ private pure func is_managed_pointer_capture_type(typ: CoreType) -> Bool:
 			True
 		HeapRecordType(name):
 			True
+		InlineRecordType(name):
+			False
 		UnionType(name):
 			True
 		TupleType(items):
@@ -12235,6 +12536,8 @@ private pure func is_unmanaged_pointer_capture_type(typ: CoreType) -> Bool:
 		FunctionType(is_pure, param_types, return_type):
 			False
 		HeapRecordType(name):
+			False
+		InlineRecordType(name):
 			False
 		UnionType(name):
 			False
@@ -12986,7 +13289,7 @@ private pure func collect_closure_env_emissions(
 										void
 					_:
 						void
-			HeapRecordDecl(_) | UnionDecl(_) | EnumDecl(_) | GlobalDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
+			HeapRecordDecl(_) | InlineRecordDecl(_) | UnionDecl(_) | EnumDecl(_) | GlobalDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
 				void
 
 	result
@@ -14665,7 +14968,19 @@ private pure func emit_simple_expr_leaf(
 							Some(rendered):
 								Some(rendered)
 							None:
-								emit_intrinsic_call(name, args, emission_context)
+								match (name, typ):
+									("tensor_get_unchecked", InlineRecordType(_)):
+										-- The element is a struct stored inline in the tensor buffer.
+										emit_inline_struct_tensor_get_unchecked(
+											args,
+											TypeLayout.c_type_name(
+												typ,
+												selected_type_symbol_lookup(emission_context.symbol_authority),
+											),
+											emission_context,
+										)
+									_:
+										emit_intrinsic_call(name, args, emission_context)
 					UserCall(name, def_id, consumed_args):
 						if is_unprojected_option_constructor_call(
 							emission_context.symbol_authority,
@@ -14683,7 +14998,7 @@ private pure func emit_simple_expr_leaf(
 							Some(c_identifier(call_name) + "(" + args_c + ")")
 					ForeignCall(name, arg_passing):
 						None
-					ListToStringCall(callback_name):
+					ListToStringCall(callback_name, _):
 						arg_values ?= emit_simple_expr_arg_values(args, emission_context)
 						emit_call_value_from_args(emitted_kind, arg_values, typ, emission_context)
 					BuiltinCall(name):
@@ -14775,7 +15090,7 @@ private pure func emit_simple_expr_leaf(
 						None
 					FallibleStreamTerminalCall(bridge):
 						None
-					ListToStringCall(callback_name):
+					ListToStringCall(callback_name, _):
 						arg_values ?= emit_simple_expr_arg_values(args, emission_context)
 						emit_call_value_from_args(emitted_kind, arg_values, typ, emission_context)
 					ClosureCall:
@@ -14908,7 +15223,7 @@ private pure func emit_simple_expr_leaf(
 		RecordCowUpdateExpr(source, fields, typ, loc):
 			None
 		RecordConstructExpr(type_name, fields, typ, loc):
-			value ?= emit_record_construct(type_name, fields, emission_context)
+			value ?= emit_record_construct(type_name, fields, typ, emission_context)
 			Some(construct_value_with_transfer_cleanup_pops(expr, value, emission_context))
 		UnionConstructExpr(construct, typ, loc):
 			value ?= emit_union_construct(construct, emission_context)
@@ -17100,7 +17415,7 @@ private pure func emit_concurrent_spawn(
 		symbol_authority,
 	)
 
-	spawn_helper: String = if TypeLayout.boxed_value_needs_release_type(binding.task.return_type):
+	spawn_helper: String = if TypeLayout.erased_slot_needs_release_type(binding.task.return_type):
 		"blorp_concurrent_task_window_spawn_owned_rc"
 	else:
 		"blorp_concurrent_task_window_spawn_owned"
@@ -17426,7 +17741,7 @@ private pure func emit_concurrently_loop_spawn(
 		symbol_authority,
 	)
 
-	spawn_helper: String = if TypeLayout.boxed_value_needs_release_type(loop.task.return_type):
+	spawn_helper: String = if TypeLayout.erased_slot_needs_release_type(loop.task.return_type):
 		"blorp_concurrent_task_window_spawn_owned_rc"
 	else:
 		"blorp_concurrent_task_window_spawn_owned"
@@ -17614,7 +17929,7 @@ private pure func emit_concurrently_resource_source_spawn(
 		symbol_authority,
 	)
 
-	spawn_helper: String = if TypeLayout.boxed_value_needs_release_type(task.return_type):
+	spawn_helper: String = if TypeLayout.erased_slot_needs_release_type(task.return_type):
 		"blorp_concurrent_task_window_spawn_owned_rc"
 	else:
 		"blorp_concurrent_task_window_spawn_owned"
@@ -18484,6 +18799,13 @@ private pure func dict_loop_binding(
 				dict = iter_tmp,
 				slot = slot_tmp,
 			})) + "\n")
+		InlineRecordType(name):
+			-- The key slot holds a struct box; bind a copy of the struct.
+			borrowed_erased_value_unbox_decl(
+				for_dict.binder,
+				"${iter_tmp}->keys[${slot_tmp}]",
+				type_symbol_lookup,
+			)
 		UnionType(name):
 			Some(render_prepared_backend_op(BackendDictIterKeyBinding({
 				key_c_type = TypeLayout.c_type_name(for_dict.binder.typ, type_symbol_lookup),
@@ -19660,8 +19982,23 @@ private pure func match_binding_source(
 	binding: CoreMatchBinding,
 	type_symbol_lookup: Dict[String, String],
 ) -> Option[String]:
-	raw_source ?= emit_match_accessor(scrutinee_temp, binding.accessor, type_symbol_lookup)
-	match_accessor_value_source(raw_source, binding.accessor, binding.typ, type_symbol_lookup)
+	match (binding.accessor, binding.typ):
+		(ListElementAccessor(parent, index), InlineRecordType(_)):
+			-- An inline record list stores elements by value, not in `void*`
+			-- slots, so the element is copied out rather than unboxed. The
+			-- pattern has already checked the length.
+			parent_c ?= emit_match_accessor(scrutinee_temp, parent, type_symbol_lookup)
+			Some(
+				inline_struct_list_load_expr(
+					parent_c,
+					index.to_string(),
+					TypeLayout.c_type_name(binding.typ, type_symbol_lookup),
+					ProvenListAccess,
+				),
+			)
+		_:
+			raw_source ?= emit_match_accessor(scrutinee_temp, binding.accessor, type_symbol_lookup)
+			match_accessor_value_source(raw_source, binding.accessor, binding.typ, type_symbol_lookup)
 
 
 private pure func emit_match_binding_declaration(
@@ -21419,6 +21756,8 @@ private pure func list_payload_binding(binding: CoreMatchBinding) -> Option[Core
 			None
 		HeapRecordType(name):
 			None
+		InlineRecordType(name):
+			None
 		UnionType(name):
 			None
 		RangeType:
@@ -22966,7 +23305,7 @@ private pure func emit_dispatched_call_body(
 				emit_call_body(kind, args, typ, next_temp, emission_context)
 			else:
 				emit_simple_or_call_body(expr, kind, args, typ, next_temp, emission_context)
-		ForeignCall(_, _) | BuiltinCall(_) | DirectRuntimeCall(_) | TensorParallelCall(_, _) | DictWithCapacityCall(_) | ListToStringCall(_):
+		ForeignCall(_, _) | BuiltinCall(_) | DirectRuntimeCall(_) | TensorParallelCall(_, _) | DictWithCapacityCall(_) | ListToStringCall(_, _):
 			emit_simple_or_call_body(expr, kind, args, typ, next_temp, emission_context)
 		ClosureCall:
 			match emit_simple_expr(expr, emission_context):
@@ -23201,7 +23540,7 @@ private pure func emit_function_body(
 						{
 							kind = box.kind,
 							value = box.value,
-							needs_release = TypeLayout.boxed_value_needs_release_type(
+							needs_release = TypeLayout.erased_slot_needs_release_type(
 								box.source_type,
 							),
 							transfers_ownership = False
@@ -23606,6 +23945,8 @@ private pure func union_type_name(typ: CoreType) -> Option[String]:
 			None
 		HeapRecordType(name):
 			None
+		InlineRecordType(name):
+			None
 		TupleType(items):
 			None
 		TensorType(info):
@@ -23640,6 +23981,8 @@ private pure func find_union_decl(
 			EnumDecl(enum_decl):
 				void
 			HeapRecordDecl(record_decl):
+				void
+			InlineRecordDecl(record_decl):
 				void
 			GlobalDecl(global):
 				void
@@ -25638,6 +25981,9 @@ private pure func static_value_supported(typ: CoreType, expr: CoreExpr) -> Bool:
 			match typ:
 				HeapRecordType(name):
 					static_record_fields_supported(fields)
+				InlineRecordType(name):
+					-- Initialized at startup by value; there is no static object to share.
+					False
 				VoidType:
 					False
 				StackResultType(ok_type, err_type):
@@ -25913,6 +26259,8 @@ private pure func static_value_initializer(
 						record_members,
 						authority,
 					)
+				InlineRecordType(name):
+					None
 				VoidType:
 					None
 				StackResultType(ok_type, err_type):
@@ -27866,6 +28214,14 @@ private pure func emit_decl_generated_stack_option_typedef(
 				)
 		HeapRecordDecl(record_decl):
 			""
+		InlineRecordDecl(record_decl):
+			record_c_type: String = type_symbol_lookup
+				.get(record_decl.name)
+				.get_or(record_decl.name)
+			emit_generated_stack_option_typedef(
+				record_c_type,
+				TypeLayout.generated_stack_option_c_type_name(record_c_type),
+			)
 		UnionDecl(union_decl):
 			""
 		FunctionDecl(func_info):
@@ -27924,6 +28280,8 @@ private pure func emit_global_decls(
 				void
 			HeapRecordDecl(record_decl):
 				void
+			InlineRecordDecl(record_decl):
+				void
 			UnionDecl(union_decl):
 				void
 			FunctionDecl(func_info):
@@ -27957,6 +28315,8 @@ private pure func emit_global_extern_decls(
 			EnumDecl(enum_decl):
 				void
 			HeapRecordDecl(record_decl):
+				void
+			InlineRecordDecl(record_decl):
 				void
 			UnionDecl(union_decl):
 				void
@@ -28070,6 +28430,8 @@ private pure func emit_global_init_function(
 					EnumDecl(enum_decl):
 						void
 					HeapRecordDecl(record_decl):
+						void
+					InlineRecordDecl(record_decl):
 						void
 					UnionDecl(union_decl):
 						void
@@ -28216,6 +28578,8 @@ private pure func emit_function_decls(
 				void
 			HeapRecordDecl(record_decl):
 				void
+			InlineRecordDecl(record_decl):
+				void
 			UnionDecl(union_decl):
 				void
 			GlobalDecl(global):
@@ -28247,6 +28611,8 @@ private pure func emit_function_forward_decls(
 			EnumDecl(enum_decl):
 				void
 			HeapRecordDecl(record_decl):
+				void
+			InlineRecordDecl(record_decl):
 				void
 			UnionDecl(union_decl):
 				void
@@ -28286,6 +28652,8 @@ private pure func emit_static_closure_forward_decls(
 			EnumDecl(enum_decl):
 				void
 			HeapRecordDecl(record_decl):
+				void
+			InlineRecordDecl(record_decl):
 				void
 			UnionDecl(union_decl):
 				void
@@ -28332,6 +28700,7 @@ private record CTypeDeclEmissions {
 
 private record CEmissionSections {
 	heap_record_and_union_forward_decls: String,
+	inline_record_decls: String,
 	generated_stack_option_typedefs: String,
 	closure_env_type_decls: String,
 	canonical_empty_lists: String,
@@ -28366,6 +28735,7 @@ private pure func render_single_translation_unit(
 ) -> String:
 	var c_code: String = header
 	c_code = append_emitted_c(c_code, sections.heap_record_and_union_forward_decls)
+	c_code = append_emitted_c(c_code, sections.inline_record_decls)
 	c_code = append_emitted_c(c_code, type_decls.enum_decls)
 	c_code = append_emitted_c(c_code, sections.generated_stack_option_typedefs)
 	c_code = append_emitted_c(c_code, type_decls.union_decls)
@@ -28422,6 +28792,8 @@ private pure func render_single_translation_unit(
 				void
 			HeapRecordDecl(record_decl):
 				void
+			InlineRecordDecl(record_decl):
+				void
 			UnionDecl(union_decl):
 				void
 			GlobalDecl(global):
@@ -28434,6 +28806,75 @@ private pure func render_single_translation_unit(
 				void
 
 	c_code
+
+
+---
+ISO C has no empty struct, so a fieldless inline record holds one byte that
+nothing reads.
+---
+private INLINE_RECORD_EMPTY_MEMBER: String = "  unsigned char empty_record_unused;\n"
+
+
+---
+The by-value C struct of one inline record: no object header, members in
+declaration order. Every member is a scalar or another inline record, which
+`emit_inline_record_decls` has already defined.
+---
+private pure func emit_inline_record_decl(
+	record_decl: CoreInlineRecordDecl,
+	layouts: CRecordLayoutRegistry,
+	symbol_authority: CEmissionSymbolAuthority,
+) -> String:
+	record_c_type: String = TypeLayout.c_type_name(
+		InlineRecordType(record_decl.name),
+		selected_type_symbol_lookup(symbol_authority),
+	)
+	member_scope: CRecordMemberScope = c_record_member_scope(layouts, record_decl.name)
+	var members: String = make_string(0)
+
+	for (ordinal, field) in record_decl.fields.enumerate():
+		field_c_type: String = TypeLayout.c_type_name(
+			field.typ,
+			selected_type_symbol_lookup(symbol_authority),
+		)
+		members = append_emitted_c(
+			members,
+			"  " + field_c_type + " " + c_declared_record_member(member_scope, field.name, ordinal) + ";\n",
+		)
+
+	if record_decl.fields.is_empty():
+		members = INLINE_RECORD_EMPTY_MEMBER
+
+	"typedef struct " + record_c_type + " {\n" + members + "} " + record_c_type + ";\n"
+
+
+---
+Defines every inline record before any other type, because heap records,
+unions, stack Options and closure environments embed them by value. Record
+representation places each inline declaration after the inline records its
+fields hold, so program order is definition order.
+---
+private pure func emit_inline_record_decls(
+	decls: List[CoreDecl],
+	layouts: CRecordLayoutRegistry,
+	symbol_authority: CEmissionSymbolAuthority,
+) -> String:
+	var c_code: String = make_string(0)
+
+	for decl in decls:
+		match decl:
+			InlineRecordDecl(record_decl):
+				c_code = append_emitted_c(
+					c_code,
+					emit_inline_record_decl(record_decl, layouts, symbol_authority),
+				)
+			_:
+				void
+
+	if c_code == "":
+		""
+	else:
+		c_code + "\n"
 
 
 private pure func emit_heap_record_and_union_forward_decls(
@@ -28460,6 +28901,9 @@ private pure func emit_heap_record_and_union_forward_decls(
 					c_code,
 					"typedef struct " + union_c_type + " " + union_c_type + ";\n",
 				)
+			InlineRecordDecl(_):
+				-- Defined in full before every other type; see `emit_inline_record_decls`.
+				void
 			EnumDecl(enum_decl):
 				void
 			FunctionDecl(func_info):
@@ -28518,6 +28962,9 @@ private pure func collect_heap_record_decl_emissions(
 							result = result.append(emission)
 						Err(error):
 							failure = Some(error)
+			InlineRecordDecl(_):
+				-- No header, constructor, destructor or reuse helper.
+				void
 			UnionDecl(union_decl):
 				void
 			EnumDecl(enum_decl):
@@ -28567,6 +29014,8 @@ private pure func collect_union_decl_emissions(
 							failure = Some(error)
 			HeapRecordDecl(record_decl):
 				void
+			InlineRecordDecl(record_decl):
+				void
 			EnumDecl(enum_decl):
 				void
 			FunctionDecl(func_info):
@@ -28599,6 +29048,8 @@ private pure func collect_enum_decl_emissions(
 			EnumDecl(enum_decl):
 				result = result.append(emit_enum_decl(enum_decl, authority, internal_type_linkage))
 			HeapRecordDecl(record_decl):
+				void
+			InlineRecordDecl(record_decl):
 				void
 			UnionDecl(union_decl):
 				void
@@ -28760,6 +29211,7 @@ private pure func emit_decls(
 			decls,
 			selected_type_symbol_lookup(symbol_authority),
 		),
+		inline_record_decls = emit_inline_record_decls(decls, layouts, symbol_authority),
 		generated_stack_option_typedefs = emit_generated_stack_option_typedefs(
 			decls,
 			selected_type_symbol_lookup(symbol_authority),
@@ -29056,6 +29508,8 @@ private pure func emit_entrypoint_forward_decls(
 				void
 			HeapRecordDecl(record_decl):
 				void
+			InlineRecordDecl(record_decl):
+				void
 			UnionDecl(union_decl):
 				void
 			GlobalDecl(global):
@@ -29141,6 +29595,8 @@ private pure func collect_union_owner_data_split_emissions(
 							),
 						)
 			HeapRecordDecl(record_decl):
+				void
+			InlineRecordDecl(record_decl):
 				void
 			EnumDecl(enum_decl):
 				void
@@ -29228,6 +29684,8 @@ private pure func type_support_function_prototypes(
 					c_code,
 					"blorp_String* " + naming.enum_vector_to_string_name + "(blorp_Vector* v);\n",
 				)
+			InlineRecordDecl(_):
+				void
 			FunctionDecl(func_info):
 				void
 			GlobalDecl(global):
@@ -29316,6 +29774,7 @@ private pure func header_type_material(
 ) -> String:
 	var c_code: String = make_string(0)
 	c_code = append_emitted_c(c_code, sections.heap_record_and_union_forward_decls)
+	c_code = append_emitted_c(c_code, sections.inline_record_decls)
 
 
 	for emission in enum_emissions:

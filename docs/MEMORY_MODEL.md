@@ -37,9 +37,21 @@ compile error; explicit state should be threaded through values instead.
 
 ### Inline Values
 
-Primitive scalars, enums, opaque scalar representations, and bounded range
-refinements are copied directly. Source record spellings do not select inline
-storage.
+Primitive scalars, enums, opaque scalar representations, bounded range
+refinements, and inline fixed records are copied directly.
+
+A `fixed record` whose fields are all numbers, `Char` values, or other such
+fixed records is stored inline: a by-value struct with no allocation and no
+reference count. Building, copying, reading, updating, passing and returning
+one never allocates, and lists, `Option`, local tuples, tensors, closure
+captures and the fields of other records hold it inline. Union and `Result`
+payloads, elements of a tuple stored in a heap value (a list element or a
+field, for example), `Dict` and `Set` entries, channel elements, task results,
+closure call arguments and results, and foreign calls hold it in an allocated
+box. This is
+a representation the compiler chooses, not yet a checked guarantee: a fixed
+record with any other field type is silently a managed value, and `Bool`
+fields do not qualify until fixed unions.
 
 ### Managed Values
 
@@ -80,10 +92,11 @@ q: Point = { p | x = 10 }
 `p` remains `{x = 1, y = 2}` and `q` is `{x = 10, y = 2}`. The compiler may
 reuse `p`'s allocation when ownership proves no other live value can observe it.
 
-`fixed record` has the same managed representation and ownership
-rules as `record`, including managed fields and generic parameters. Prefer
-`record` for new declarations. Neither spelling promises no allocation, an unmanaged
-layout or a foreign by-value ABI.
+`fixed record` has the same value semantics as `record`, including managed
+fields and generic parameters. When every field is a number, a `Char` or
+another such fixed record it is an inline value (see Inline Values) rather
+than a managed one; otherwise it has the managed representation and ownership
+rules above. No spelling promises a foreign by-value ABI.
 
 ## Option And Result
 

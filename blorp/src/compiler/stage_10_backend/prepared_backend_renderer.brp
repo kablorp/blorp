@@ -15,6 +15,48 @@ enum DictKeyReleasePolicy:
 	DictReleaseKey
 
 
+---
+Which receive an inline-record channel performs. The timeout receive carries
+its rendered millisecond argument, so no other receive can be given one.
+---
+union ChannelInlineRecordReceive:
+	BlockingInlineRecordReceive
+	TryInlineRecordReceive
+	TimeoutInlineRecordReceive(String)
+
+
+---
+Printing a list of inline records. `element_load` copies the element at the
+loop index out of inline list storage; `to_string` names the element type's
+`Stringable.to_string`, which takes the struct by value.
+---
+record ListInlineRecordToStringArgs {
+	list: String,
+	element_c_type: String,
+	element_load: String,
+	to_string: String
+}
+
+
+-- The list and index variables `ListInlineRecordToStringArgs.element_load` reads.
+LIST_INLINE_RECORD_TO_STRING_INDEX: String = "__lts_index"
+
+LIST_INLINE_RECORD_TO_STRING_LIST: String = "__lts_list"
+
+
+---
+A receive whose element is an inline record: the channel slot holds a struct
+box, which the receiver owns once received. The struct is copied into the
+stack Option and the box is released.
+---
+record ChannelInlineRecordRecvArgs {
+	channel: String,
+	receive: ChannelInlineRecordReceive,
+	option_c_type: String,
+	payload_c_type: String
+}
+
+
 enum ChannelRetainingSendRuntime:
 	ChannelSendRuntime
 	ChannelTrySendRuntime
@@ -52,6 +94,20 @@ record CapacityCustomCtorArgs {
 }
 
 
+
+
+---
+A Dict lookup whose value is an inline record: the value slot holds a struct
+box, and the stack Option holds a copy of the struct.
+---
+record StackOptionInlineRecordGetArgs {
+	dict: String,
+	key: String,
+	temp_seed: String,
+	option_c_type: String,
+	payload_c_type: String,
+	none_value: String
+}
 
 
 record StackOptionScalarGetArgs {
@@ -444,6 +500,7 @@ union PreparedBackendOp:
 	BackendDictCtorFloat
 	BackendDictCtorInt128
 	BackendDictCtorCustom(CustomCtorArgs, ElemReleaseArg)
+	BackendDictStackOptionInlineRecordGet(StackOptionInlineRecordGetArgs, DictKeyReleasePolicy)
 	BackendDictStackOptionLongGet(StackOptionScalarGetArgs, DictKeyReleasePolicy)
 	BackendDictStackOptionInt128Get(StackOptionScalarGetArgs, DictKeyReleasePolicy)
 	BackendDictStackOptionUInt128Get(StackOptionScalarGetArgs, DictKeyReleasePolicy)
@@ -490,6 +547,7 @@ union PreparedBackendOp:
 	BackendDictWithCapacityInt128(String)
 	BackendDictWithCapacityCustom(CapacityCustomCtorArgs, ElemReleaseArg)
 	BackendChannelWithElemRelease(ChannelWithElemReleaseArgs)
+	BackendChannelInlineRecordRecv(ChannelInlineRecordRecvArgs)
 	BackendChannelRetainingSend(ChannelRetainingSendArgs, ChannelRetainingSendRuntime)
 	BackendChannelRetainingSendWithTimeout(ChannelRetainingSendWithTimeoutArgs, ChannelRetainingSendTimeoutRuntime)
 	BackendChannelTrySendAttempt(ChannelTrySendAttemptArgs)
@@ -527,6 +585,7 @@ union PreparedBackendOp:
 	BackendSelectReceivedValueBinding(SelectReceivedValueBindingArgs)
 	BackendGenericObjectAlloc(String)
 	BackendInlineStructBoxAlloc(String)
+	BackendListInlineRecordToString(ListInlineRecordToStringArgs)
 	BackendStringCreateFromCString(String)
 	BackendEntrypointArgvListPrelude(String)
 
@@ -649,6 +708,23 @@ private pure func render_stack_option_long_get(
 ) -> String:
 	raw_tmp: String = stack_option_raw_tmp(args.temp_seed)
 	payload_expr: String = "(long)${raw_tmp}"
+	render_stack_option_dict_shell(
+		args.dict,
+		args.key,
+		args.temp_seed,
+		args.option_c_type,
+		args.none_value,
+		payload_expr,
+		key_policy,
+	)
+
+
+private pure func render_stack_option_inline_record_get(
+	args: StackOptionInlineRecordGetArgs,
+	key_policy: DictKeyReleasePolicy,
+) -> String:
+	raw_tmp: String = stack_option_raw_tmp(args.temp_seed)
+	payload_expr: String = "blorp_unbox_struct(${raw_tmp}, ${args.payload_c_type})"
 	render_stack_option_dict_shell(
 		args.dict,
 		args.key,
@@ -1213,6 +1289,25 @@ private pure func render_select_channel_arm(
 ---
 Typed operation rendering and bridge entry points.
 ---
+private pure func render_list_inline_record_to_string(args: ListInlineRecordToStringArgs) -> String:
+	list: String = LIST_INLINE_RECORD_TO_STRING_LIST
+	index: String = LIST_INLINE_RECORD_TO_STRING_INDEX
+	"({ blorp_List* " + list + " = (blorp_List*)" + args.list + "; " + "blorp_String* __lts_result = blorp_string_create(\"[\"); " + "long __lts_len = " + list + " ? " + list + "->len : 0; " + "for (long " + index + " = 0; " + index + " < __lts_len; " + index + "++) { " + "if (" + index + " > 0) __lts_result = blorp_string_concat_consume(__lts_result, blorp_string_create(\", \")); " + args.element_c_type + " __lts_element = " + args.element_load + "; " + "__lts_result = blorp_string_concat_consume(__lts_result, " + args.to_string + "(__lts_element)); } " + "blorp_string_concat_consume(__lts_result, blorp_string_create(\"]\")); })"
+
+
+private pure func render_channel_inline_record_recv(args: ChannelInlineRecordRecvArgs) -> String:
+	channel: String = "(blorp_Channel*)" + args.channel
+	received: String = match args.receive:
+		BlockingInlineRecordReceive:
+			"blorp_channel_recv_raw(" + channel + ", &__recv_box)"
+		TryInlineRecordReceive:
+			"blorp_channel_try_recv_raw(" + channel + ", &__recv_box)"
+		TimeoutInlineRecordReceive(timeout_ms):
+			"blorp_channel_recv_timeout_raw(" + channel + ", " + timeout_ms + ", &__recv_box)"
+
+	"({ void* __recv_box = NULL; " + args.option_c_type + " __recv_option; " + "if (" + received + ") { __recv_option.tag = BLORP_TAG_SOME; " + "__recv_option.value = blorp_unbox_struct(__recv_box, " + args.payload_c_type + "); " + "blorp_release(__recv_box); } " + "else { __recv_option = (" + args.option_c_type + "){ .tag = BLORP_TAG_NONE }; } " + "__recv_option; })"
+
+
 pure func render_prepared_backend_op(op: PreparedBackendOp) -> String:
 	match op:
 		BackendDictCtorGeneric:
@@ -1225,6 +1320,8 @@ pure func render_prepared_backend_op(op: PreparedBackendOp) -> String:
 			"blorp_dict_new_int128()"
 		BackendDictCtorCustom(args, elem_release):
 			render_custom_ctor("blorp_dict_new_custom", args, elem_release)
+		BackendDictStackOptionInlineRecordGet(args, key_policy):
+			render_stack_option_inline_record_get(args, key_policy)
 		BackendDictStackOptionLongGet(args, key_policy):
 			render_stack_option_long_get(args, key_policy)
 		BackendDictStackOptionInt128Get(args, key_policy):
@@ -1317,6 +1414,8 @@ pure func render_prepared_backend_op(op: PreparedBackendOp) -> String:
 			render_capacity_custom_ctor("blorp_dict_with_capacity_custom", args, elem_release)
 		BackendChannelWithElemRelease(args):
 			render_channel_with_elem_release(args)
+		BackendChannelInlineRecordRecv(args):
+			render_channel_inline_record_recv(args)
 		BackendChannelRetainingSend(args, runtime):
 			render_channel_retaining_send(args, runtime)
 		BackendChannelRetainingSendWithTimeout(args, runtime):
@@ -1394,6 +1493,8 @@ pure func render_prepared_backend_op(op: PreparedBackendOp) -> String:
 			"blorp_alloc(sizeof(" + c_type + "))"
 		BackendInlineStructBoxAlloc(elem_size_expr):
 			"blorp_alloc(sizeof(blorp_Object) + " + elem_size_expr + ")"
+		BackendListInlineRecordToString(args):
+			render_list_inline_record_to_string(args)
 		BackendStringCreateFromCString(c_string_expr):
 			"blorp_string_create(" + c_string_expr + ")"
 		BackendEntrypointArgvListPrelude(arg_name):

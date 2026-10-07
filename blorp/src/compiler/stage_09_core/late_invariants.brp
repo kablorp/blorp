@@ -40,13 +40,17 @@ import:
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSourceLoc,
 		CoreTensorRawScalarKind(TensorFloat32Elements, TensorFloat64Elements, TensorInt64Elements),
-		CoreType(BoxedResultType, NamedType, StackResultType, TensorType, UnionType, VoidType),
+		CoreType(
+			BoxedResultType, InlineRecordType, NamedType, StackResultType, TensorType, UnionType,
+			VoidType,
+		),
 		CoreVar,
 		core_expr_type,
 		core_program_expr_roots,
 		core_type_equal,
 	mono: core_mono_type_equal
 	perceus/env: PerceusEnv, build_env, contract_for_call
+	record_representation: object_identity_builtin
 	pipeline_stage:
 		CorePipelineStage(
 			ClosureStage, ConsumeSpecializeStage, DceStage, FinalStage, PerceusStage,
@@ -77,6 +81,7 @@ union CoreLateInvariantViolation:
 	RecordLiteralSurvived(CoreSourceLoc)
 	LayoutlessListAllocationSurvived(String, CoreSourceLoc)
 	ErasedKeyTempMarkerSurvived(String, CoreSourceLoc)
+	InlineRecordIdentityBuiltinSurvived(String, CoreSourceLoc)
 	UncheckedStringByteIntrinsicSurvived(String, CoreSourceLoc)
 	UncheckedRawTensorIntrinsicSurvived(String, CoreSourceLoc)
 	MissingOwnershipCallContract(String, CoreSourceLoc)
@@ -129,6 +134,8 @@ pure func core_late_invariant_message(violation: CoreLateInvariantViolation) -> 
 			"layout-free list allocation `${name}` reached final Core"
 		ErasedKeyTempMarkerSurvived(name, _):
 			"erased key temporary marker `${name}` survived specialization"
+		InlineRecordIdentityBuiltinSurvived(name, _):
+			"object-identity builtin `${name}` on an inline record reached final Core"
 		UncheckedStringByteIntrinsicSurvived(name, _):
 			"unchecked string byte intrinsic `${name}` reached final Core"
 		UncheckedRawTensorIntrinsicSurvived(name, _):
@@ -466,6 +473,28 @@ private pure func is_unchecked_raw_tensor_intrinsic(name: String) -> Bool:
 	)
 
 
+---
+An object-identity builtin on an inline record. `record_representation`
+rejects these after monomorphization and backend projection refuses to
+project one, so one here escaped that check. Reported before the missing
+contract the unprojected call also has, since it names the cause.
+---
+private pure func identity_builtin_violations(
+	kind: CoreCallKind,
+	args: List[CoreExpr],
+	loc: CoreSourceLoc,
+) -> List[CoreLateInvariantViolation]:
+	match (kind, args):
+		(BuiltinCall(name), [first, ..._]):
+			match (object_identity_builtin(name), core_expr_type(first)):
+				(Some(_), InlineRecordType(_)):
+					[InlineRecordIdentityBuiltinSurvived(name, loc)]
+				_:
+					[]
+		_:
+			[]
+
+
 private pure func call_violations(
 	env: PerceusEnv,
 	kind: CoreCallKind,
@@ -473,7 +502,7 @@ private pure func call_violations(
 	result_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> List[CoreLateInvariantViolation]:
-	var violations: List[CoreLateInvariantViolation] = []
+	var violations: List[CoreLateInvariantViolation] = identity_builtin_violations(kind, args, loc)
 	unresolved: Option[String] = unresolved_call_kind(kind)
 
 	match unresolved:

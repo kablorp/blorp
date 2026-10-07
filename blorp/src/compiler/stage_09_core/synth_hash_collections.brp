@@ -12,7 +12,7 @@ import:
 			AddOp, DivideOp, EqualOp, GreaterEqualOp, GreaterOp, LessEqualOp, LessOp, MultiplyOp,
 			NotEqualOp,
 		),
-		CoreBoxKind(Float16Box, Float32Box, FloatBox, Int128Box, PrimBox, UInt128Box),
+		CoreBoxKind(Float16Box, Float32Box, FloatBox, Int128Box, PrimBox, StructBox, UInt128Box),
 		CoreExpr(BoxExpr, CastExpr, DropExpr, LiteralExpr, SeqExpr, TupleExpr, UnboxExpr, VarExpr),
 		CoreFunction,
 		CoreLiteral(IntLiteral),
@@ -20,13 +20,13 @@ import:
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
 		CoreSourceLoc,
 		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType,
-			StackResultType, TensorType, TupleType, TypeParameterType, UnionType,
-			VoidType,
+			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType,
+			RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType,
+			UnionType, VoidType,
 		),
 		CoreUnboxKind(
 			Float16Unbox, Float32Unbox, FloatUnbox, Int128Unbox, PointerUnbox, PrimUnbox,
-			UInt128Unbox,
+			StructUnbox, UInt128Unbox,
 		),
 		CoreVar,
 		synthetic_core_source_loc,
@@ -34,7 +34,7 @@ import:
 	synth_context:
 		CoreSynthContext,
 		CoreSynthNamedTypeLayout(
-			SynthEnumLayout, SynthHeapRecordLayout, SynthUnionLayout,
+			SynthEnumLayout, SynthHeapRecordLayout, SynthInlineRecordLayout, SynthUnionLayout,
 		),
 		core_synth_expand_alias,
 		core_synth_named_type_layout,
@@ -104,6 +104,10 @@ union CoreHashPointerLayout:
 	IdentityHashPointer(CoreUnboxKind)
 	BoxedHashPointer(CoreBoxKind, CoreUnboxKind, Bool)
 	CastHashPointer(CoreUnboxKind)
+	-- The slot holds the struct box of the named inline record: an allocated
+	-- copy the table owns. The value itself lives by value everywhere else, so
+	-- reading the slot into a list or a binding unboxes it.
+	InlineRecordHashPointer(String)
 
 
 ---
@@ -209,6 +213,22 @@ pure func classify_hash_collection_type(
 			decision
 
 
+---
+An inline record crosses a hash container's erased `void*` slot in its named
+struct box, like a 128-bit integer: the stored value box is owned by the
+container, and keys hash and compare through the record's impls.
+
+Known cost: a lookup (`get`, `contains`) also boxes its key for the call, one
+allocation that a borrowed by-value probe key would remove.
+---
+private pure func inline_record_hash_layout(name: String) -> CoreHashTypeLayoutDecision:
+	ExactHashTypeLayout({
+		probe_mode = DispatchedHashProbe,
+		hash_key_pointer_layout = InlineRecordHashPointer(name),
+		boxed_value_pointer_layout = InlineRecordHashPointer(name),
+	})
+
+
 private pure func classify_representation_type(
 	context: CoreSynthContext,
 	typ: CoreType,
@@ -292,6 +312,8 @@ private pure func classify_representation_type(
 							hash_key_pointer_layout = CastHashPointer(PointerUnbox),
 							boxed_value_pointer_layout = CastHashPointer(PointerUnbox),
 						})
+					Some(SynthInlineRecordLayout):
+						inline_record_hash_layout(name)
 					None:
 						RegistryHashTypeLayoutRequired(typ)
 		EnumType(_):
@@ -300,6 +322,8 @@ private pure func classify_representation_type(
 				hash_key_pointer_layout = BoxedHashPointer(PrimBox, PrimUnbox, False),
 				boxed_value_pointer_layout = BoxedHashPointer(PrimBox, PrimUnbox, False),
 			})
+		InlineRecordType(name):
+			inline_record_hash_layout(name)
 		HeapRecordType(_) | UnionType(_) | TensorType(_) | TupleType(_) | FunctionType(_, _, _):
 			ExactHashTypeLayout({
 				probe_mode = DispatchedHashProbe,
@@ -381,9 +405,11 @@ private pure func exact_release_policy(
 								Ok(NoReleasePolicy)
 							Some(SynthHeapRecordLayout) | Some(SynthUnionLayout):
 								Ok(ArcReleasePolicy)
+							Some(SynthInlineRecordLayout):
+								Ok(NoReleasePolicy)
 							None:
 								Err(HashCollectionLayoutUnavailable(operation, typ, loc))
-				EnumType(_) | HeapRecordType(_) | UnionType(_) | RangeType | TensorType(_) | TupleType(_) | BoxedResultType(_, _) | FunctionType(_, _, _):
+				EnumType(_) | HeapRecordType(_) | InlineRecordType(_) | UnionType(_) | RangeType | TensorType(_) | TupleType(_) | BoxedResultType(_, _) | FunctionType(_, _, _):
 					Ok(cleanup_release_policy_for_type(typ))
 				TypeParameterType(_) | SelfType | StackResultType(_, _) | VoidType:
 					Err(HashCollectionLayoutUnavailable(operation, typ, loc))
@@ -411,6 +437,16 @@ private pure func pointer_argument(
 			)
 		CastHashPointer(_):
 			CastExpr(value, POINTER_TYPE, synthetic_core_source_loc())
+		InlineRecordHashPointer(name):
+			BoxExpr(
+				{
+					kind = StructBox(name),
+					value = value,
+					source_type = source_type
+				},
+				POINTER_TYPE,
+				synthetic_core_source_loc(),
+			)
 
 
 private pure func unbox_pointer(
@@ -421,12 +457,16 @@ private pure func unbox_pointer(
 	match layout:
 		IdentityHashPointer(unbox_kind) | BoxedHashPointer(_, unbox_kind, _) | CastHashPointer(unbox_kind):
 			UnboxExpr(unbox_kind, value, result_type, synthetic_core_source_loc())
+		InlineRecordHashPointer(name):
+			UnboxExpr(StructUnbox(name), value, result_type, synthetic_core_source_loc())
 
 
 private pure func pointer_temp_needs_release(layout: CoreHashPointerLayout) -> Bool:
 	match layout:
 		BoxedHashPointer(_, _, needs_release):
 			needs_release
+		InlineRecordHashPointer(_):
+			True
 		IdentityHashPointer(_) | CastHashPointer(_):
 			False
 
@@ -1434,32 +1474,61 @@ private pure func synthesize_set_fold(
 	)
 
 
-private pure func synthesize_set_to_list(self: CoreExpr, result_type: CoreType) -> CoreExpr:
+---
+Stores one table slot in a list copied out of the table. A slot word that is
+the element itself (a managed pointer, a scalar bit pattern, a shared 128-bit
+box) is retained and stored as is. An inline record's slot holds its struct
+box, so the list stores the struct by value and keeps no reference to the box.
+---
+private pure func store_slot_in_list(
+	result: CoreExpr,
+	index: CoreExpr,
+	slot_value: CoreExpr,
+	slot_layout: CoreHashPointerLayout,
+	element_type: CoreType,
+) -> CoreExpr:
+	match slot_layout:
+		InlineRecordHashPointer(_):
+			intrinsic_call(
+				"list_set",
+				[result, index, unbox_pointer(slot_layout, slot_value, element_type)],
+				VoidType,
+			)
+		IdentityHashPointer(_) | BoxedHashPointer(_, _, _) | CastHashPointer(_):
+			SeqExpr(
+				intrinsic_call(
+					"list_retain_for",
+					[result, slot_value],
+					VoidType,
+				),
+				intrinsic_call(
+					"list_set",
+					[result, index, slot_value],
+					VoidType,
+				),
+			)
+
+
+private pure func synthesize_set_to_list(
+	self: CoreExpr,
+	result_type: CoreType,
+	element_type: CoreType,
+	element_layout: CoreHashPointerLayout,
+) -> CoreExpr:
 	result: CoreExpr = variable("__result", result_type)
 	entry: CoreExpr = variable("__entry", POINTER_TYPE)
 	index: CoreExpr = variable("__i", INT_TYPE)
 	key: CoreExpr = intrinsic_call("set_entry_key", [entry], POINTER_TYPE)
 	scan_one: CoreExpr = SeqExpr(
-		intrinsic_call(
-			"list_retain_for",
-			[result, key],
-			VoidType,
-		),
+		store_slot_in_list(result, index, key, element_layout, element_type),
 		SeqExpr(
-			intrinsic_call(
-				"list_set",
-				[result, index, key],
-				VoidType,
+			assignment(
+				"__i",
+				binary(AddOp, index, int_literal(1), INT_TYPE),
 			),
-			SeqExpr(
-				assignment(
-					"__i",
-					binary(AddOp, index, int_literal(1), INT_TYPE),
-				),
-				assignment(
-					"__entry",
-					intrinsic_call("set_entry_next_order", [entry], POINTER_TYPE),
-				),
+			assignment(
+				"__entry",
+				intrinsic_call("set_entry_next_order", [entry], POINTER_TYPE),
 			),
 		),
 	)
@@ -1521,6 +1590,8 @@ private pure func synthesize_dict_list(
 	result_type: CoreType,
 	item_intrinsic: String,
 	release_intrinsic: String,
+	element_type: CoreType,
+	element_layout: CoreHashPointerLayout,
 ) -> CoreExpr:
 	result: CoreExpr = variable("__result", result_type)
 	output_index: CoreExpr = variable("__j", INT_TYPE)
@@ -1540,28 +1611,12 @@ private pure func synthesize_dict_list(
 			INT_TYPE,
 		),
 		if_expr(
-			binary(
-				GreaterEqualOp,
-				slot,
-				int_literal(0),
-				BOOL_TYPE,
-			),
+			binary(GreaterEqualOp, slot, int_literal(0), BOOL_TYPE),
 			SeqExpr(
-				intrinsic_call(
-					"list_retain_for",
-					[result, raw_item],
-					VoidType,
-				),
-				SeqExpr(
-					intrinsic_call(
-						"list_set",
-						[result, output_index, raw_item],
-						VoidType,
-					),
-					assignment(
-						"__j",
-						binary(AddOp, output_index, int_literal(1), INT_TYPE),
-					),
+				store_slot_in_list(result, output_index, raw_item, element_layout, element_type),
+				assignment(
+					"__j",
+					binary(AddOp, output_index, int_literal(1), INT_TYPE),
 				),
 			),
 			VOID_EXPRESSION,
@@ -2818,7 +2873,22 @@ private pure func synthesize_set_named_body(
 				match (set_element_type(self.typ), list_element_type(return_type)):
 					(Some(element_type), Some(result_element_type)):
 						if core_mono_type_equal(element_type, result_element_type):
-							Ok(Some(synthesize_set_to_list(parameter_value(self), return_type)))
+							layout ?= exact_layout(
+								context,
+								"set.to_list element",
+								element_type,
+								loc,
+							)
+							Ok(
+								Some(
+									synthesize_set_to_list(
+										parameter_value(self),
+										return_type,
+										element_type,
+										layout.hash_key_pointer_layout,
+									),
+								),
+							)
 						else:
 							Ok(None)
 					_:
@@ -2945,6 +3015,7 @@ private pure func synthesize_dict_named_body(
 				match (dict_types(self.typ), list_element_type(return_type)):
 					(Some((key_type, _)), Some(result_element_type)):
 						if core_mono_type_equal(key_type, result_element_type):
+							key_layout ?= exact_layout(context, "dict.keys key", key_type, loc)
 							Ok(
 								Some(
 									synthesize_dict_list(
@@ -2952,6 +3023,8 @@ private pure func synthesize_dict_named_body(
 										return_type,
 										"dict_key_at",
 										"dict_key_release_fn",
+										key_type,
+										key_layout.hash_key_pointer_layout,
 									),
 								),
 							)
@@ -2967,6 +3040,12 @@ private pure func synthesize_dict_named_body(
 				match (dict_types(self.typ), list_element_type(return_type)):
 					(Some((_, value_type)), Some(result_element_type)):
 						if core_mono_type_equal(value_type, result_element_type):
+							value_layout ?= exact_layout(
+								context,
+								"dict.values value",
+								value_type,
+								loc,
+							)
 							Ok(
 								Some(
 									synthesize_dict_list(
@@ -2974,6 +3053,8 @@ private pure func synthesize_dict_named_body(
 										return_type,
 										"dict_value_at",
 										"dict_value_release_fn",
+										value_type,
+										value_layout.boxed_value_pointer_layout,
 									),
 								),
 							)

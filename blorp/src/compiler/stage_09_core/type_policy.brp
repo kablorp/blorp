@@ -15,7 +15,7 @@ import:
 		),
 		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
 		CoreType(
-			BoxedResultType, EnumType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType,
+			BoxedResultType, EnumType, FunctionType, HeapRecordType, InlineRecordType, NamedType, RangeType, SelfType,
 			StackResultType, TensorType, TupleType, TypeParameterType, UnionType,
 			VoidType,
 		),
@@ -112,7 +112,7 @@ pure func core_type_has_unresolved_parameters(typ: CoreType) -> Bool:
 			)
 		TupleType(items):
 			items.any(core_type_has_unresolved_parameters)
-		RangeType | VoidType | EnumType(_) | HeapRecordType(_) | UnionType(_):
+		RangeType | VoidType | EnumType(_) | HeapRecordType(_) | InlineRecordType(_) | UnionType(_):
 			False
 
 
@@ -143,7 +143,7 @@ pure func core_type_has_unresolved_mono_parameters(typ: CoreType) -> Bool:
 			core_type_has_unresolved_mono_parameters(info.element_type)
 		TupleType(items):
 			items.any(core_type_has_unresolved_mono_parameters)
-		RangeType | VoidType | EnumType(_) | HeapRecordType(_) | UnionType(_):
+		RangeType | VoidType | EnumType(_) | HeapRecordType(_) | InlineRecordType(_) | UnionType(_):
 			False
 
 
@@ -209,6 +209,8 @@ pure func is_stack_result_type(typ: CoreType) -> Bool:
 		EnumType(_):
 			False
 		HeapRecordType(_):
+			False
+		InlineRecordType(_):
 			False
 		UnionType(_):
 			False
@@ -288,12 +290,42 @@ private pure func is_managed_type_in_set(managed_names: Set[String], typ: CoreTy
 			True
 		FunctionType(_, _, _) | TupleType(_) | TensorType(_):
 			True
+		InlineRecordType(_):
+			-- Stored by value with only scalar fields: nothing to retain or release.
+			False
 		StackResultType(ok_type, err_type):
 			(
-				is_managed_type_in_set(managed_names, ok_type)
+				erased_slot_holds_owned_box(ok_type)
+				or erased_slot_holds_owned_box(err_type)
+				or is_managed_type_in_set(managed_names, ok_type)
 				or is_managed_type_in_set(managed_names, err_type)
 			)
 		VoidType | EnumType(_) | RangeType:
+			False
+
+
+---
+Whether a value of `typ` in an erased `void*` slot (a stack Result payload, a
+task result, a hash-table entry) is held in a box allocated for the crossing,
+which the slot owns and must release although the value itself owns nothing.
+This is the one classification of that fact: ownership (`is_managed_type`,
+`core_type_is_known_unmanaged`) and C layout (`erased_slot_needs_release_type`)
+all read it.
+
+An inline record crosses in its struct box. `Int128` and `UInt128` also cross
+in an allocated box but are not classified here yet (DIAGNOSTIC_GAPS CF-019).
+A nested stack Result is boxed too; whether it owns anything is decided by its
+own payloads.
+---
+pure func erased_slot_holds_owned_box(typ: CoreType) -> Bool:
+	match typ:
+		InlineRecordType(_):
+			True
+		NamedType(_, _) | StackResultType(_, _) | BoxedResultType(_, _) | VoidType | EnumType(_):
+			False
+		RangeType | TypeParameterType(_) | SelfType | HeapRecordType(_) | UnionType(_):
+			False
+		FunctionType(_, _, _) | TupleType(_) | TensorType(_):
 			False
 
 
@@ -360,7 +392,7 @@ pure func core_type_to_string(typ: CoreType) -> String:
 			) + ") -> " + core_type_to_string(return_type)
 		StackResultType(ok_type, err_type) | BoxedResultType(ok_type, err_type):
 			"Result[" + core_type_to_string(ok_type) + ", " + core_type_to_string(err_type) + "]"
-		EnumType(name) | HeapRecordType(name) | UnionType(name):
+		EnumType(name) | HeapRecordType(name) | InlineRecordType(name) | UnionType(name):
 			display_type_name(name)
 		RangeType:
 			"Range"
@@ -420,6 +452,8 @@ pure func nullable_managed_option_payload_release_policy(
 		HeapRecordType(_) | UnionType(_) | TensorType(_) | TupleType(_) | FunctionType(_, _, _):
 			Some(ArcReleasePolicy)
 		TypeParameterType(_) | SelfType | StackResultType(_, _) | BoxedResultType(_, _) | VoidType | EnumType(_) | RangeType:
+			None
+		InlineRecordType(_):
 			None
 
 
@@ -481,6 +515,8 @@ pure func cleanup_release_policy_for_type(typ: CoreType) -> CoreReleasePolicy:
 				ArcReleasePolicy
 			HeapRecordType(_):
 				ArcReleasePolicy
+			InlineRecordType(_):
+				NoReleasePolicy
 			UnionType(_):
 				ArcReleasePolicy
 			TensorType(_):

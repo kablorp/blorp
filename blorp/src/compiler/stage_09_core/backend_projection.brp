@@ -35,6 +35,7 @@ import:
 		CoreHashContainerConstructor(ImplHashContainerConstructor),
 		CoreListAccessBounds(CheckedListAccess, ProvenListAccess),
 		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
+		CoreListToStringElements(InlineRecordListToStringElements, PointerListToStringElements),
 		CoreLogicalOp,
 		CoreProgram,
 		CoreRuntimeCallbackRole(StringableToStringCallback),
@@ -45,8 +46,8 @@ import:
 		),
 		CoreTensorRawScalarKind(TensorFloat32Elements, TensorFloat64Elements, TensorInt64Elements),
 		CoreType(
-			BoxedResultType, EnumType, NamedType, StackResultType, TensorType, UnionType,
-			VoidType,
+			BoxedResultType, EnumType, InlineRecordType, NamedType, StackResultType, TensorType,
+			UnionType, VoidType,
 		),
 		CoreVar,
 		core_expr_type,
@@ -60,6 +61,7 @@ import:
 		runtime_builtin_has_erased_arguments,
 		runtime_builtin_uses_erased_argument,
 	prepare: lower_trait_keyed_dict_literal
+	record_representation: object_identity_builtin
 	runtime_callbacks: CoreRuntimeCallbackTable, build_runtime_callback_table, find_runtime_callback
 	specialize_layout:
 		CoreHashKeyStrategy(
@@ -274,6 +276,8 @@ private pure func tensor_parallel_layout(
 					TensorParallelRawScalarLayout(TensorFloat32Elements)
 				NamedType("Int", []):
 					TensorParallelRawScalarLayout(TensorInt64Elements)
+				InlineRecordType(name):
+					TensorParallelInlineStructLayout(name)
 				_:
 					TensorParallelPointerLayout
 		_:
@@ -351,7 +355,12 @@ private pure func list_callback_call_kind(
 				None
 
 		callback ?= find_runtime_callback(callbacks, StringableToStringCallback, element_type)
-		Some(ListToStringCall(callback))
+		elements: CoreListToStringElements = match element_type:
+			InlineRecordType(record_name):
+				InlineRecordListToStringElements(record_name)
+			_:
+				PointerListToStringElements
+		Some(ListToStringCall(callback, elements))
 
 
 private pure func dict_key_type(
@@ -534,7 +543,14 @@ private pure func project_call_kind(
 		_:
 			None
 
-	if memory_intrinsic.is_some():
+	if identity_builtin_on_inline_record(name, args):
+		-- Refused: an inline record has no object to compare or count, and the
+		-- projected intrinsics would compare struct values as if they were
+		-- objects. `record_representation` rejects these after monomorphization;
+		-- one that gets here stays an unprojected builtin, which the late Core
+		-- invariant `InlineRecordIdentityBuiltinSurvived` reports.
+		BuiltinCall(name)
+	else if memory_intrinsic.is_some():
 		IntrinsicCall(memory_intrinsic.get_or(""))
 	else if operation_result_builtin(name):
 		operation_result_call_kind(layout, name, result_type).get_or(BuiltinCall(name))
@@ -555,6 +571,18 @@ private pure func project_call_kind(
 		direct_runtime_call(layout, name, result_type)
 	else:
 		BuiltinCall(name)
+
+
+private pure func identity_builtin_on_inline_record(name: String, args: List[CoreExpr]) -> Bool:
+	match (object_identity_builtin(name), args):
+		(Some(_), [first, ..._]):
+			match core_expr_type(first):
+				InlineRecordType(_):
+					True
+				_:
+					False
+		_:
+			False
 
 
 private pure func explicit_box(expr: CoreExpr) -> Bool:
