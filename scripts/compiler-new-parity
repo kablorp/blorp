@@ -46,10 +46,10 @@ A mismatch is printed with its file and, for tokens, the first differing
 token. Exit status 0 means every file agrees.
 
 With `--stop-census` it instead runs only the adapter differential over the
-corpus and prints why the tree scan left declarations unread: for every module
-the first function, trait, implementation or global initializer it could not
-read (where the tree path stops), and also every later one it tried. The table
-ranks reasons by first stops, with one example `file:line` each. The reason is
+corpus and prints why the tree scan stopped: for every module it did not read
+in full, the first function, trait, implementation or global initializer it
+could not read, where the scan stops. The table ranks the reasons by module,
+with one example `file:line` each. The reason is
 the `StopReason` the tree parser's rollback carried; nothing is worked out from
 text. The census checks nothing and is not part of the parity gate. A census over the
 whole corpus also stores its per-module stops (see `--census-file`).
@@ -59,7 +59,7 @@ run can be narrowed to part of the corpus:
 
   * `--files PATH...` names tracked `.brp` files;
   * `--stop-reason LABEL` selects the modules whose first stop in the last full
-    `--stop-census` had that label (the table's "First-stop modules").
+    `--stop-census` had that label (the table's "Modules").
 
 Either narrows the parity run (token and verdict parity, then the adapter
 differential with its tree-prefix and tree-module comparisons) or, with
@@ -1385,17 +1385,13 @@ def check_adapter(
 
 STOP_CENSUS_FLAG = "--stop-census"
 STOP_REASON_PREFIX = "stop-reason "
-STOP_REASON_FIELDS = 5
-FIRST_STOP = "first"
-LATER_STOP = "later"
+STOP_REASON_FIELDS = 4
 
 
 @dataclass
 class StopReasonCount:
-    """One reason: the modules whose first unread declaration stopped for it
-    (`modules`, with an example) and every unread declaration it stopped."""
+    """One reason: the modules whose tree scan stopped for it, with an example."""
     modules: int = 0
-    declarations: int = 0
     example: str = ""
 
 
@@ -1406,8 +1402,9 @@ class StopCensus:
 
 
 def parse_stop_census(text: str) -> StopCensus:
-    """Collect the `stop-reason <path> | <kind> | <reason> | <line> | <order>`
-    lines. The first module in corpus order is each reason's example."""
+    """Collect the `stop-reason <path> | <kind> | <reason> | <line>` lines, at
+    most one per module: the scan stops at the first declaration it does not
+    read in full. The first module in corpus order is each reason's example."""
     census = StopCensus()
     for line in text.splitlines():
         if not line.startswith(STOP_REASON_PREFIX):
@@ -1415,39 +1412,29 @@ def parse_stop_census(text: str) -> StopCensus:
         fields = line[len(STOP_REASON_PREFIX):].split(" | ")
         if len(fields) != STOP_REASON_FIELDS:
             raise SystemExit(f"FAIL: malformed stop-reason line: {line}")
-        path, kind, reason, source_line, order = fields
+        path, kind, reason, source_line = fields
         count = census.reasons.setdefault(reason, StopReasonCount())
-        count.declarations += 1
-        if order == FIRST_STOP:
-            count.modules += 1
-            census.kinds[kind] = census.kinds.get(kind, 0) + 1
-            if not count.example:
-                count.example = f"{path}:{source_line}"
-        elif order != LATER_STOP:
-            raise SystemExit(f"FAIL: unknown stop order in: {line}")
+        count.modules += 1
+        census.kinds[kind] = census.kinds.get(kind, 0) + 1
+        if not count.example:
+            count.example = f"{path}:{source_line}"
     return census
 
 
 def render_stop_census(census: StopCensus, files: int, scope: str = "Corpus files") -> str:
     """A ranked markdown table: most common reason first, ties by name."""
     stopped = sum(count.modules for count in census.reasons.values())
-    declined = sum(count.declarations for count in census.reasons.values())
     kinds = ", ".join(f"{kind} {census.kinds[kind]}" for kind in sorted(census.kinds))
     lines = [
-        f"{scope}: {files}. Modules whose tree scan left a declaration unread: {stopped} ({kinds}); "
-        f"declarations left unread in all: {declined}.",
+        f"{scope}: {files}. Modules whose tree scan stopped at a declaration: {stopped} ({kinds}).",
         "",
-        "| Rank | Reason | First-stop modules | Share | All unread declarations | Example |",
-        "| ---: | --- | ---: | ---: | ---: | --- |",
+        "| Rank | Reason | Modules | Share | Example |",
+        "| ---: | --- | ---: | ---: | --- |",
     ]
-    ranked = sorted(
-        census.reasons.items(), key=lambda item: (-item[1].modules, -item[1].declarations, item[0])
-    )
+    ranked = sorted(census.reasons.items(), key=lambda item: (-item[1].modules, item[0]))
     for rank, (reason, count) in enumerate(ranked, start=1):
         share = 100.0 * count.modules / stopped
-        lines.append(
-            f"| {rank} | {reason} | {count.modules} | {share:.1f}% | {count.declarations} | {count.example or '-'} |"
-        )
+        lines.append(f"| {rank} | {reason} | {count.modules} | {share:.1f}% | {count.example} |")
     return "\n".join(lines)
 
 
@@ -1490,32 +1477,28 @@ def read_census_result(path: Path) -> tuple[str, str]:
 
 
 def first_stop_locations(census_text: str, reason: str) -> list[tuple[str, int]]:
-    """The `(path, line)` of each module's first unread declaration that stopped
-    for `reason`, in census order. A reason that no module stops at first is an
+    """The `(path, line)` of each module whose tree scan stopped for `reason`, in
+    census order (the scan stops at a module's first declaration it does not
+    read, so each module has at most one). A reason no module stops at is an
     exit naming the reasons that do, so a misspelt label teaches the right one."""
-    first_stops: dict[str, list[tuple[str, int]]] = {}
-    seen: set[str] = set()
+    stops: dict[str, list[tuple[str, int]]] = {}
     for line in census_text.splitlines():
         if not line.startswith(STOP_REASON_PREFIX):
             continue
         fields = line[len(STOP_REASON_PREFIX):].split(" | ")
         if len(fields) != STOP_REASON_FIELDS:
-            raise SystemExit(f"FAIL: malformed stop-reason line: {line}")
-        path, _, stop_reason, source_line, order = fields
+            raise SystemExit(
+                f"FAIL: the stored census has a line this version does not read (an older format?); "
+                f"re-run the full census with `scripts/compiler-new-parity {STOP_CENSUS_FLAG}`: {line}"
+            )
+        path, _, stop_reason, source_line = fields
         if not source_line.isdigit():
             raise SystemExit(f"FAIL: malformed stop-reason line (the line number is not a number): {line}")
-        seen.add(stop_reason)
-        if order == FIRST_STOP:
-            first_stops.setdefault(stop_reason, []).append((path, int(source_line)))
-    if reason in first_stops:
-        return first_stops[reason]
-    if reason in seen:
-        raise SystemExit(
-            f"FAIL: no module's first stop was {reason} in the census (it only stops later "
-            "declarations); select a reason from the table's First-stop modules column"
-        )
-    known = ", ".join(sorted(first_stops))
-    raise SystemExit(f"FAIL: unknown stop reason {reason}; the census has first stops for: {known}")
+        stops.setdefault(stop_reason, []).append((path, int(source_line)))
+    if reason in stops:
+        return stops[reason]
+    known = ", ".join(sorted(stops))
+    raise SystemExit(f"FAIL: unknown stop reason {reason}; the census has stops for: {known}")
 
 
 def first_stop_modules(census_text: str, reason: str) -> list[str]:

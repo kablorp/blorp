@@ -1,98 +1,43 @@
--- The first bounded body-tree slice: a global initialized by exactly one
--- same-line NameReference, checked IntegerLiteral or checked FloatLiteral.
--- Other expression families retain the header's authoritative deferred entry;
--- this is not complete global expression grammar.
+-- A global's initializer, read by the expression parser right after the
+-- global's header. An initializer the expression parser does not read leaves
+-- the state at its first token, with why.
 import:
-	../lex/lexed_module: LiteralValue(IntegerValue, FloatValue)
 	../syntax/declarations: GlobalDeclaration
-	../syntax/expressions: ExpressionKind(NameReference, IntegerLiteral, FloatLiteral)
-	../tables/expected_token: NameConstruct(NameInStatementName)
 	../tables/span: span_covering
-	../tables/token: TokenKind(IdentifierToken, IntLiteralToken, FloatLiteralToken, EndOfFileToken, NewlineToken, DotSymbol, IndentToken)
-	parse_state:
-		ParseState, current_kind, current_span, advanced, peek_kind, position,
-		current_literal, consume_referenced_name, finished_name_use, finished_expression, finished_global
-	stop_reason: StopPoint, StopReason(GlobalInitializerNotAtHeaderEnd, ValueOnNextLine), stop_at
+	../tables/token: TokenKind(NewlineToken)
+	parse_state: ParseState, current_kind, finished_global
+	stop_reason: StopPoint, StopReason(ValueOnNextLine), stop_at
 	layout_quirks: anchored_at
 	tree_global_header_parser: GlobalHeaderPreview
 	tree_expression_parser: parse_expression_to_boundary, ExpressionParse(ParsedExpression, UnsupportedExpression, RejectedExpression)
 
 
-union GlobalCompletion:
-	CompletedGlobal(GlobalDeclaration)
-	DeferredGlobal
+union GlobalInitializerParse:
+	ParsedInitializer(GlobalDeclaration)
+	DeclinedInitializer(StopPoint)
+	RejectedInitializer
 
 
--- Entry is the exact state returned by the successful header parser. Preflight
--- the whole supported shape before consuming names or minting any body IDs.
-pure func complete_atomic_global(state: ParseState, preview: GlobalHeaderPreview) -> (ParseState, GlobalCompletion):
-	if state.position() != preview.initializer.token_start or (state.current_kind() != IdentifierToken and state.current_kind() != IntLiteralToken and state.current_kind() != FloatLiteralToken):
-		(state, DeferredGlobal)
-	else:
-		var boundary: Bool = state.peek_kind(1) == EndOfFileToken
-		if state.peek_kind(1) == NewlineToken:
-			var after_newlines: Int = 2
-			while state.peek_kind(after_newlines) == NewlineToken:
-				after_newlines += 1
-			-- The frozen postfix grammar accepts an unindented leading dot,
-			-- or a dot after an indent. Preserve both as deferred expressions;
-			-- all other indented tails are outside this slice as well.
-			next_kind = state.peek_kind(after_newlines)
-			boundary = next_kind != DotSymbol and next_kind != IndentToken
-		if not boundary:
-			(state, DeferredGlobal)
-		else:
-			atom_span = state.current_span()
-			atom: Option[(ParseState, ExpressionKind)] = if state.current_kind() == IdentifierToken:
-				(after_name, name) = state.consume_referenced_name(NameInStatementName)
-				(after_use, use) = after_name.finished_name_use(name)
-				Some((after_use, NameReference(use)))
-			else:
-				-- TokenCursor validated the literal payload against its kind.
-				-- Integers retain their magnitude; floats retain checked decimal digits.
-				match state.current_literal():
-					Some(IntegerValue(magnitude)):
-						Some((state.advanced(), IntegerLiteral(magnitude)))
-					Some(FloatValue(value)):
-						Some((state.advanced(), FloatLiteral(value)))
-					_:
-						None
-			match atom:
-				None:
-					(state, DeferredGlobal)
-				Some((after_atom, kind)):
-					(after_expression, value) = after_atom.finished_expression(atom_span, kind)
-					header = preview.header
-					(completed, global_value) = after_expression.finished_global(
-						header.visibility, header.documentation, header.form, header.name,
-						header.declared_type, value, preview.initializer.anchor.span_covering(value.span)
-					)
-					(completed, CompletedGlobal(global_value))
-
-
--- A separate explicit opt-in; the atomic completion seam keeps its old scope.
-union GlobalExpressionCompletion:
-	CompletedExpressionGlobal(GlobalDeclaration)
-	DeferredExpressionGlobal(StopPoint)
-	RejectedExpressionGlobal
-
-
-pure func complete_expression_global(state: ParseState, preview: GlobalHeaderPreview) -> (ParseState, GlobalExpressionCompletion):
-	if state.position() != preview.initializer.token_start:
-		(state, DeferredExpressionGlobal(state.stop_at(GlobalInitializerNotAtHeaderEnd)))
-	else if state.current_kind() == NewlineToken:
-		(state, DeferredExpressionGlobal(state.stop_at(ValueOnNextLine)))
+---
+The global `preview` declares, with the initializer at `state`, where its
+header parser left the cursor. A value written on the line after the `=` is
+not read yet; the lexer says so with a NEWLINE token. A rejected initializer
+keeps its diagnostics.
+---
+pure func parse_global_initializer(state: ParseState, preview: GlobalHeaderPreview) -> (ParseState, GlobalInitializerParse):
+	if state.current_kind() == NewlineToken:
+		(state, DeclinedInitializer(state.stop_at(ValueOnNextLine)))
 	else:
 		(parsed, result) = parse_expression_to_boundary(state, anchored_at(preview.initializer.anchor))
 		match result:
 			UnsupportedExpression(stop):
-				(state, DeferredExpressionGlobal(stop))
+				(state, DeclinedInitializer(stop))
 			RejectedExpression:
-				(parsed, RejectedExpressionGlobal)
+				(parsed, RejectedInitializer)
 			ParsedExpression(value):
 				header = preview.header
 				(completed, global_value) = parsed.finished_global(
 					header.visibility, header.documentation, header.form, header.name,
 					header.declared_type, value, preview.initializer.anchor.span_covering(value.span)
 				)
-				(completed, CompletedExpressionGlobal(global_value))
+				(completed, ParsedInitializer(global_value))

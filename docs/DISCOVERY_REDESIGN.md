@@ -4082,11 +4082,12 @@ call arguments that span lines, in holes and in a parameter list across lines re
 Every rollback in the tree parsers carries why it declined. The `Unsupported`
 results of the expression, statement and owner parsers hold a `StopPoint` (a
 closed `StopReason` and the token the parser stood at, `stop_reason.brp`),
-chosen at the rollback from the construct just recognized, and the scan lists
-each declined function, trait, implementation or global initializer in
-`ModuleDeclarationPreviewScan.declined`. Nothing reads the list in production.
-`scripts/compiler-new-parity --stop-census` ranks the reasons over the corpus;
-its first result is
+chosen at the rollback from the construct just recognized, and the scan stops
+at the declaration it declined with that `StopPoint`
+(`StoppedAtUnreadDeclaration`). Nothing reads it in production.
+`scripts/compiler-new-parity --stop-census` ranks the reasons over the corpus,
+one per module that was not read in full; its first result, which also counted
+the declarations the scan then tried after the first, is
 [`benchmarks/results/discovery_m4_stop_reason_census_2026-10-06.md`](../benchmarks/results/discovery_m4_stop_reason_census_2026-10-06.md).
 A new rollback adds its reason to the enum, and the census label match
 (`blorp/test/test_compiler_new/support/stop_reason_label.brp`) stops compiling until
@@ -4186,6 +4187,35 @@ in D6 (1,000 value `if`s, 300 operands) were measured before the lambda and
 statement-form merges; the 300-deep operand test is in the suite and was not
 re-measured after them.
 
+The scaffolding collapse (2026-10-06 decisions, section 3.16) removes the
+transitional machinery in steps, each with the tree-prefix and tree-module
+parity lines and the first-stop census unchanged. There is one declaration
+scan, `scan_module_declarations`: the header-only, atomic-global and
+expression-only scan policies (`GlobalCompletionPolicy`) and
+`complete_atomic_global` are deleted, and the tests that used them read the
+same declarations through the one scan. Projection tests that need the scan to
+stop at a declaration use a legal body the tree parser does not read yet,
+named once in `test_discovery_adapter.brp` (`unread_value`, `unread_block`).
+The scan then stops at the first declaration it does not read in full, since
+only reading a body finds where it ends: its result holds the module items read
+before it and the unread declaration's header with its `StopPoint`, and the
+census ranks first stops only. A global's initializer is read by the global's
+own route, right after its header (`parse_global_initializer`), so there is no
+initializer hand-off and no check that the hand-off position agrees
+(`GlobalInitializerNotAtHeaderEnd` is deleted). A value on the line after the
+`=` is a NEWLINE token, not a line comparison; `x =` before the end of the
+source is now rejected at the end, as the frozen parser reports it, where it
+used to be left unread.
+A trait or implementation is parsed once, by its own route: each method is
+read in full (header, body, definition) and the owner is minted last, so its
+ids are post-order without the owner replay (`tree_owner_completion.brp`,
+`OwnerReplayDisagrees` and the generic method readers of `method_read.brp` are
+deleted). An owner with a body the parser does not read stops the scan with
+the owner's header only (`TraitHeader`, `ImplementationHeader`), keeping the
+header's ids and none of its methods'; a diagnostic before that body still
+rejects the owner, and one after it is not seen (D10). Method headers still
+skip their bodies until bodies are read inline, the next collapse step.
+
 Validation before the main reconciliation, at `a5ae15eab`:
 
 The combined fresh-build focused run passed 121/121 tests, including a
@@ -4284,7 +4314,7 @@ a fixed target.
 
 D1 to D4 are recommendations, not acceptance decisions yet; sections 3–6 use
 the proposed forms so their consequences can be reviewed. D5 to D9 record what
-the 2026-10-06 decisions left open.
+the 2026-10-06 decisions left open, and D10 a consequence of them.
 
 - **D1. Decimal floats (5.2).** Recommend opaque `DecimalFloat` over a
   checked 64-bit `Float`: converting decimal directly to the selected width
@@ -4338,6 +4368,18 @@ the 2026-10-06 decisions left open.
   parity gates keep the first three in agreement; the formatter has none).
   M6 deletes the table path. The LSP and formatter tree is a separate later
   plan (section 1, non-goals).
+- **D10. Owner stops compare headers only (2026-10-06).** Since owners are
+  parsed once, a trait or implementation the tree parser stops at carries its
+  header only, so the parity comparison at that stop no longer checks each
+  method's header span, purity and body presence; this affects the modules
+  whose first stop is an implementation body. An owner also stops reading at
+  the first method body it does not read, so a syntax error in a later method
+  is not reported there: `trait T:\n\tfunc f() -> Int: into_opaque
+  Count(1)\n\tfunc g(\n` stops unread with no diagnostic, where the old parser
+  reports 4:1 "expected parameter name". That is a decline, never an accept,
+  so it is safe. Both return when the bodies are read: the full-AST comparison
+  of the then assembled modules covers every method, and the owner reads on to
+  its later methods.
 
 The M6 ceiling is decided and stays in section 7.3. Recovery, opaque minting,
 per-module interning, tree output, ordinary-record syntax values, glue

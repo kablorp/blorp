@@ -5,9 +5,8 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
 	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, spellings, report_at_current, finished_builtin_type, consume_declared_name
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
-		DeclarationPreview(GlobalDeclarationPreview, RecordDeclarationPreview, AliasDeclarationPreview, BuiltinTypeDeclarationPreview, ResourceTypeDeclarationPreview, UnionDeclarationPreview, EnumDeclarationPreview, ImportBlockDeclarationPreview, ForeignBlockDeclarationPreview, FunctionDeclarationPreview, CompletedFunctionPreview, CompletedTraitPreview, CompletedImplementationPreview, TraitDeclarationPreview, ImplementationDeclarationPreview),
-		DeclarationPreviewParse(ParsedDeclarationPreview, DeferredGlobalInitializer, RejectedGlobalInitializer, RejectedDeclarationPreview), parse_declaration_preview
-	../../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser: deferred_body_span, deferred_body_token_start, deferred_body_token_end
+		DeclarationPreview(GlobalDeclarationPreview, RecordDeclarationPreview, AliasDeclarationPreview, BuiltinTypeDeclarationPreview, ResourceTypeDeclarationPreview, UnionDeclarationPreview, EnumDeclarationPreview, ImportBlockDeclarationPreview, ForeignBlockDeclarationPreview, FunctionDeclarationPreview, TraitDeclarationPreview, ImplementationDeclarationPreview),
+		DeclarationPreviewParse(ParsedDeclarationPreview, DeclinedGlobalInitializer, RejectedGlobalInitializer, RejectedDeclarationPreview), parse_declaration_preview
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_prefix_parser: parse_declaration_prefix
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_builtin_type_parser: BuiltinTypeForm(PlainBuiltinType, ResourceBuiltinType), parse_builtin_type
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_record_parser: parse_record
@@ -118,11 +117,11 @@ private pure func route_of(preview: DeclarationPreview) -> Route:
 			ImportRoute
 		ForeignBlockDeclarationPreview(_):
 			ForeignRoute
-		FunctionDeclarationPreview(_) | CompletedFunctionPreview(_):
+		FunctionDeclarationPreview(_):
 			FunctionRoute
-		TraitDeclarationPreview(_) | CompletedTraitPreview(_):
+		TraitDeclarationPreview(_):
 			TraitRoute
-		ImplementationDeclarationPreview(_) | CompletedImplementationPreview(_):
+		ImplementationDeclarationPreview(_):
 			ImplementationRoute
 
 
@@ -163,11 +162,8 @@ private pure func completed(text: String, wanted: Route) -> Bool:
 				TraitDeclarationPreview(value):
 					correct = correct and reference.definitions.get(0).map(pure func(owner): value.span.spans_equal(owner.span)) == Some(True)
 				ImplementationDeclarationPreview(_):
-					-- Never called for a deferred implementation body: M4 owns
-					-- expression parsing and its cursor/diagnostic contract.
-					correct = False
-				CompletedFunctionPreview(_) | CompletedTraitPreview(_) | CompletedImplementationPreview(_):
-					-- Only the module scan completes a body; a leaf preview never does.
+					-- Implementations are compared with the frozen owner in
+					-- `test_tree_implementation_parser.brp`, not through this helper.
 					correct = False
 			correct
 		_:
@@ -196,15 +192,18 @@ pure func test_public_import_and_foreign_are_owner_routes() -> Bool:
 		and private_global_boundary("private foreign:\n\tfunc f() -> Int\nnext", 18))
 
 
-pure func test_function_trait_and_implementation_stay_previews() -> Bool:
+-- A function stays a header preview for the scan to read its body; a trait
+-- and an implementation are read in full by their own route.
+pure func test_function_stays_a_preview_and_owners_are_read_in_full() -> Bool:
 	match parsed("implements Eq for Int:\n\tfunc f(): 1\nnext"):
 		Some((state, ParsedDeclarationPreview(ImplementationDeclarationPreview(value)))):
 			match value.methods:
 				[method]:
 					(completed("func f():\nnext", FunctionRoute) and completed("trait T: Eq\nnext", TraitRoute)
-						and value.span.covers(0, 36) and method.header.header_span.covers(24, 33) and method.body.deferred_body_span().covers(34, 35)
+						and value.span.covers(0, 36) and method.span.covers(24, 35) and method.function.body.is_some()
+						and method.id.definition_local_index() == 0 and value.id.definition_local_index() == 1
 						and state.current_kind() == IdentifierToken and state.current_span().covers(36, 40)
-						and state.diagnostic_count() == 0 and state.issued_counts().expressions == 0 and state.issued_counts().blocks == 0)
+						and state.diagnostic_count() == 0 and state.issued_counts().expressions == 1 and state.issued_counts().blocks == 0)
 				_:
 					False
 		_:
@@ -325,8 +324,9 @@ private pure func no_global_or_initializer_ids(state: ParseState) -> Bool:
 			False
 
 
--- Global comparisons use the completed header leaf, never frozen expression
--- parsing. Both success and rejection are hard handoffs at initializer entry.
+-- A global whose initializer is not read, or whose header is rejected, is
+-- handed back at its initializer entry with nothing of it minted. Comparisons
+-- use the completed header leaf, never frozen expression parsing.
 private pure func global_boundary(text: String, rejected_header: Bool, first: Int, last: Int, cursor: TokenKind) -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(entry):
@@ -344,7 +344,7 @@ private pure func global_boundary(text: String, rejected_header: Bool, first: In
 			correct: Bool = (state.position() == reference_state.position() and state.current_kind() == cursor and state.current_span().covers(first, last)
 				and diagnostics_match_leaf(state, reference_state) and no_global_or_initializer_ids(state))
 			match result:
-				DeferredGlobalInitializer(value):
+				DeclinedGlobalInitializer(value, _):
 					correct and not rejected_header and value.initializer.token_start == state.position() and value.initializer.anchor.spans_equal(entry.current_span())
 				RejectedGlobalInitializer(start):
 					correct and rejected_header and start.token_start == state.position() and start.anchor.spans_equal(entry.current_span())
@@ -354,9 +354,21 @@ private pure func global_boundary(text: String, rejected_header: Bool, first: In
 			False
 
 
-pure func test_globals_are_hard_initializer_handoffs_even_when_rejected() -> Bool:
-	(global_boundary("x: Int = 1\nrecord R {}", False, 9, 10, IntLiteralToken)
-		and global_boundary("private var x = 1\nrecord R {}", False, 16, 17, IntLiteralToken)
+-- A global the expression parser reads is read in full with its initializer,
+-- and the cursor stops where the value ends.
+private pure func read_global(text: String, value_start: Int, value_end: Int) -> Bool:
+	match parsed(text):
+		Some((state, ParsedDeclarationPreview(GlobalDeclarationPreview(global_value)))):
+			(global_value.value.span.covers(value_start, value_end) and global_value.id.definition_local_index() == 0
+				and state.issued_counts().expressions == 1 and state.diagnostic_count() == 0
+				and (state.current_kind() == NewlineToken or state.current_kind() == EndOfFileToken))
+		_:
+			False
+
+
+pure func test_globals_are_read_or_handed_back_at_their_initializer() -> Bool:
+	(read_global("x: Int = 1\nrecord R {}", 9, 10)
+		and read_global("private var x = 1\nrecord R {}", 16, 17)
 		and global_boundary("_ =\nrecord R {}", False, 4, 4, NewlineToken)
 		and global_boundary("if = 1\nrecord R {}", True, 5, 6, IntLiteralToken)
 		and global_boundary("x 1\nrecord R {}", True, 2, 3, IntLiteralToken)
@@ -408,8 +420,8 @@ pure func test_explicit_keyword_routes_precede_reserved_binding_fallback() -> Bo
 	(explicit_route_boundary("type = 1", BuiltinRoute, 7, 1) and explicit_route_boundary("resource = 1", ResourceRoute, 11, 2)
 		and explicit_route_boundary("record = 1", RecordRoute, 9, 1)
 		and global_boundary("if: Int = 1", True, 10, 11, IntLiteralToken)
-		and global_boundary("Fixed = 1", False, 8, 9, IntLiteralToken)
-		and global_boundary("fixed = 1", False, 8, 9, IntLiteralToken)
+		and read_global("Fixed = 1", 8, 9)
+		and read_global("fixed = 1", 8, 9)
 		and global_boundary("Fixed record P {}", True, 6, 12, RecordKeyword))
 
 
@@ -464,11 +476,11 @@ tests: TestSuite = {
 		("union forms reject type parameters at existing preview boundary", test_union_forms_reject_type_parameters_at_existing_preview_boundary),
 		("completed routes and keyword priorities", test_completed_routes_and_keyword_priorities),
 		("public import foreign and private recovery", test_public_import_and_foreign_are_owner_routes),
-		("deferred function trait implementation previews", test_function_trait_and_implementation_stay_previews),
+		("function preview and owners read in full", test_function_stays_a_preview_and_owners_are_read_in_full),
 		("prefix diagnostics own declaration rejection", test_prefix_diagnostics_reject_from_before_prefix_scan),
 		("private documentation pure metadata", test_private_documentation_and_pure_metadata_are_composed),
 		("fixed exact spelling and generic parameters", test_fixed_record_uses_exact_spelling_and_accepts_parameters),
-		("global handoffs preserve initializer tokens", test_globals_are_hard_initializer_handoffs_even_when_rejected),
+		("globals are read or handed back at their initializer", test_globals_are_read_or_handed_back_at_their_initializer),
 		("explicit routes before reserved bindings", test_explicit_keyword_routes_precede_reserved_binding_fallback),
 		("error eof progress", test_error_and_eof_progress_is_exactly_one_token_or_none),
 		("sequential completed leaves isolate prefixes", test_sequential_completed_leaves_isolate_prefix_purity_and_ids)

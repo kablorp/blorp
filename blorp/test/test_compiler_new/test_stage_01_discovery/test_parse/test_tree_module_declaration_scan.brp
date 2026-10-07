@@ -1,13 +1,15 @@
--- Bounded M3 evidence only: EOF is a scan stop, never module acceptance.
+-- Declaration scan evidence only: EOF is a scan stop, never module acceptance.
 -- Module acceptance, the final id census and forward pairing are tested with
 -- module assembly (`test_tree_module_assembly.brp`).
 import:
 	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
 	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, finished_builtin_type, consume_declared_name, spellings
-	../../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan: ModuleDeclarationPreviewScan, ModuleDeclarationScanStop(ReachedEndOfSource, StoppedAtGlobalInitializer, StoppedAtRejectedGlobalInitializer, StoppedAtRejectedDeclaration, StoppedWithoutDeclarationProgress), scan_module_declaration_previews, scan_module_declaration_prefix_with_expressions
-	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser: DeclarationPreview(UnionDeclarationPreview, RecordDeclarationPreview, AliasDeclarationPreview, ImportBlockDeclarationPreview, ForeignBlockDeclarationPreview, FunctionDeclarationPreview, TraitDeclarationPreview, ImplementationDeclarationPreview, GlobalDeclarationPreview)
-	../../../../src/compiler_new/stage_01_discovery/parse/tree_trait_method_header_parser: MethodBodyExtent(SkippedDefaultBody)
-	../../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser: FunctionBodyExtent(SkippedBody, ForwardDeclaration), deferred_body_span
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
+		ModuleDeclarationScan, ModuleDeclarationScanStop(ReachedEndOfSource, StoppedAtUnreadDeclaration, StoppedAtRejectedGlobalInitializer, StoppedAtRejectedDeclaration),
+		UnreadHeader(UnreadGlobalInitializer), scan_module_declarations
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_global_header_parser: GlobalHeaderPreview
+	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax:
+		ModuleItem(UnionItem, RecordItem, AliasItem, ImportBlockItem, ForeignBlockItem, FunctionItem, TraitItem, ImplementationItem, GlobalItem)
 	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics as TreeDiagnostics
 	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: UnionDeclarationForm(FixedUnion)
 	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code as Codes
@@ -25,11 +27,22 @@ private pure func covers(span: Span, first: Int, last: Int) -> Bool:
 	span.span_start() == first and span.span_end() == last
 
 
-private pure func scanned(text: String) -> Option[(ParseState, ModuleDeclarationPreviewScan)]:
+private pure func scanned(text: String) -> Option[(ParseState, ModuleDeclarationScan)]:
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(state):
-			Some(scan_module_declaration_previews(state))
+			Some(scan_module_declarations(state))
 		Err(_):
+			None
+
+
+-- The global the scan stopped at, when its initializer was not read.
+private pure func unread_global(scan: ModuleDeclarationScan) -> Option[GlobalHeaderPreview]:
+	match scan.stop:
+		StoppedAtUnreadDeclaration(unread):
+			match unread.header:
+				UnreadGlobalInitializer(global_value): Some(global_value)
+				_: None
+		_:
 			None
 
 
@@ -57,7 +70,7 @@ private pure func empty_scan(text: String) -> Bool:
 		Some((state, preview)):
 			match preview.stop:
 				ReachedEndOfSource:
-					(preview.documentation.is_none() and preview.declarations.is_empty() and state.current_kind() == EndOfFileToken
+					(preview.documentation.is_none() and preview.items.is_empty() and state.current_kind() == EndOfFileToken
 						and state.current_span().covers(text.length(), text.length()) and state.diagnostic_count() == 0 and no_body_ids(state) and definition_count(state, 0))
 				_:
 					False
@@ -73,8 +86,8 @@ pure func test_completed_leaves_keep_source_order_and_newlines() -> Bool:
 	text: String = "record R {}\n\ntype alias A = Int\nimport:\n\theap\nforeign:\n\tfunc f() -> Int\n"
 	match scanned(text):
 		Some((state, preview)):
-			match (preview.stop, preview.declarations):
-				(ReachedEndOfSource, [RecordDeclarationPreview(record_value), AliasDeclarationPreview(alias_value), ImportBlockDeclarationPreview(imported), ForeignBlockDeclarationPreview(foreign_block)]):
+			match (preview.stop, preview.items):
+				(ReachedEndOfSource, [RecordItem(record_value), AliasItem(alias_value), ImportBlockItem(imported), ForeignBlockItem(foreign_block)]):
 					match (imported.imports, foreign_block.functions):
 						([import_value], [function]):
 							(record_value.id.definition_local_index() == 0 and alias_value.id.definition_local_index() == 1
@@ -92,8 +105,8 @@ pure func test_completed_leaves_keep_source_order_and_newlines() -> Bool:
 private pure func later_import_documentation_rejects() -> Bool:
 	match scanned("import:\n\theap\n---\nDoc\n---\nimport:\n\tio"):
 		Some((state, preview)):
-			match (preview.stop, preview.declarations, state.diagnostics().get(0)):
-				(StoppedAtRejectedDeclaration, [ImportBlockDeclarationPreview(_)], Some(at)):
+			match (preview.stop, preview.items, state.diagnostics().get(0)):
+				(StoppedAtRejectedDeclaration, [ImportBlockItem(_)], Some(at)):
 					match at.diagnostic:
 						TreeDiagnostics.Plain(Codes.DocstringBeforeImportBlockDiagnostic):
 							preview.documentation.is_none() and at.span.covers(14, 26) and state.diagnostic_count() == 1
@@ -110,7 +123,7 @@ private pure func rejected_newline_is_preserved() -> Bool:
 		Some((state, preview)):
 			match preview.stop:
 				StoppedAtRejectedDeclaration:
-					preview.declarations.is_empty() and state.current_kind() == NewlineToken and state.current_span().covers(4, 4) and state.position() == 1
+					preview.items.is_empty() and state.current_kind() == NewlineToken and state.current_span().covers(4, 4) and state.position() == 1
 				_:
 					False
 		None:
@@ -121,8 +134,8 @@ pure func test_module_documentation_and_later_declaration_documentation_are_sepa
 	text: String = "---\nModule\n---\nimport:\n\theap\n---\nRecord\n---\nrecord R {}"
 	match scanned(text):
 		Some((state, preview)):
-			match (preview.stop, preview.documentation, preview.declarations):
-				(ReachedEndOfSource, Some(module_doc), [ImportBlockDeclarationPreview(_), RecordDeclarationPreview(record_value)]):
+			match (preview.stop, preview.documentation, preview.items):
+				(ReachedEndOfSource, Some(module_doc), [ImportBlockItem(_), RecordItem(record_value)]):
 					match record_value.documentation:
 						Some(record_doc):
 							(module_doc.text == "Module" and module_doc.span.covers(0, 15) and record_doc.text == "Record" and record_doc.span.covers(29, 44)
@@ -135,22 +148,21 @@ pure func test_module_documentation_and_later_declaration_documentation_are_sepa
 			False
 
 
-pure func test_function_trait_and_implementation_keep_only_lexical_body_evidence() -> Bool:
-	-- Valid bodies only; no frozen expression cursor/diagnostic parity claim.
+-- Each body is read in full, and each owner is minted after its methods.
+pure func test_function_trait_and_implementation_bodies_are_read_in_source_order() -> Bool:
 	text: String = "func f(): 1\ntrait T:\n\tfunc g(): 2\nimplements Eq for Int:\n\tfunc h(): 3\n"
 	match scanned(text):
 		Some((state, preview)):
-			match (preview.stop, preview.declarations):
-				(ReachedEndOfSource, [FunctionDeclarationPreview(function), TraitDeclarationPreview(trait_value), ImplementationDeclarationPreview(implementation)]):
-					match (function.body_extent, trait_value.methods, implementation.methods):
-						(SkippedBody(function_body), [trait_method], [implementation_method]):
-							match trait_method.body_extent:
-								SkippedDefaultBody(trait_body):
-									(function_body.deferred_body_span().covers(10, 11) and trait_body.deferred_body_span().covers(32, 33)
-										and implementation_method.body.deferred_body_span().covers(68, 69) and state.diagnostic_count() == 0
-										and no_body_ids(state) and definition_count(state, 0))
-								_:
-									False
+			match (preview.stop, preview.items):
+				(ReachedEndOfSource, [FunctionItem(function), TraitItem(trait_value), ImplementationItem(implementation)]):
+					match (function.function.body, trait_value.methods, implementation.methods):
+						(Some(_), [trait_method], [implementation_method]):
+							(function.span.covers(0, 11) and trait_method.span.covers(22, 33) and implementation_method.span.covers(58, 69)
+								and trait_method.default_body.is_some() and implementation_method.function.body.is_some()
+								and function.id.definition_local_index() == 0 and trait_method.id.definition_local_index() == 1
+								and trait_value.id.definition_local_index() == 2 and implementation_method.id.definition_local_index() == 3
+								and implementation.id.definition_local_index() == 4 and definition_count(state, 5)
+								and state.issued_counts().expressions == 3 and state.diagnostic_count() == 0)
 						_:
 							False
 				_:
@@ -160,11 +172,12 @@ pure func test_function_trait_and_implementation_keep_only_lexical_body_evidence
 
 
 pure func test_global_initializer_handoff_retains_prior_previews_and_next_tokens() -> Bool:
-	text: String = "record R {}\nx: Int = 1\nrecord S {}"
+	-- `1 Other` is not one expression, so the initializer is not read.
+	text: String = "record R {}\nx: Int = 1 Other\nrecord S {}"
 	match scanned(text):
 		Some((state, preview)):
-			match (preview.stop, preview.declarations):
-				(StoppedAtGlobalInitializer(global_value), [RecordDeclarationPreview(record_value)]):
+			match (preview.unread_global(), preview.items):
+				(Some(global_value), [RecordItem(record_value)]):
 					(state.current_kind() == IntLiteralToken and state.current_span().covers(21, 22) and global_value.initializer.token_start == state.position()
 						and global_value.initializer.anchor.covers(12, 13) and global_value.header.header_span.covers(12, 20)
 						and state.spellings().spelling_text(global_value.header.name.spelling) == Some("x") and record_value.id.definition_local_index() == 0
@@ -182,7 +195,7 @@ pure func test_rejected_global_handoff_does_not_skip_initializer_or_sibling() ->
 				(StoppedAtRejectedGlobalInitializer(start), Some(at)):
 					match at.diagnostic:
 						TreeDiagnostics.ReservedKeywordAsName(spelling):
-							(preview.declarations.is_empty() and start.token_start == state.position() and start.anchor.covers(0, 2)
+							(preview.items.is_empty() and start.token_start == state.position() and start.anchor.covers(0, 2)
 								and state.current_kind() == IntLiteralToken and state.current_span().covers(5, 6) and at.span.covers(0, 0)
 								and state.spellings().spelling_text(spelling) == Some("if") and state.diagnostic_count() == 1
 								and no_body_ids(state) and definition_count(state, 0))
@@ -197,8 +210,8 @@ pure func test_rejected_global_handoff_does_not_skip_initializer_or_sibling() ->
 pure func test_generic_fixed_record_scan_completes() -> Bool:
 	match scanned("fixed record P[T] { value: T }\nrecord S {}"):
 		Some((state, preview)):
-			match (preview.stop, preview.declarations):
-				(ReachedEndOfSource, [RecordDeclarationPreview(first), RecordDeclarationPreview(_)]):
+			match (preview.stop, preview.items):
+				(ReachedEndOfSource, [RecordItem(first), RecordItem(_)]):
 					first.type_parameters.length() == 1 and first.fields.length() == 1 and state.diagnostic_count() == 0 and no_body_ids(state)
 				_: False
 		None: False
@@ -207,8 +220,8 @@ pure func test_generic_fixed_record_scan_completes() -> Bool:
 pure func test_fixed_union_scan_keeps_children_and_sibling_ids() -> Bool:
 	match scanned("fixed union U[T]:\n\tEmpty()\n\tValue(T, String)\nrecord S {}"):
 		Some((state, preview)):
-			match (preview.stop, preview.declarations):
-				(ReachedEndOfSource, [UnionDeclarationPreview(first), RecordDeclarationPreview(second)]):
+			match (preview.stop, preview.items):
+				(ReachedEndOfSource, [UnionItem(first), RecordItem(second)]):
 					(first.form == FixedUnion and first.type_parameters.length() == 1 and first.variants.length() == 2
 						and first.id.definition_local_index() == 2 and second.id.definition_local_index() == 3
 						and definition_count(state, 4) and state.diagnostic_count() == 0 and no_body_ids(state))
@@ -223,7 +236,7 @@ pure func test_rejected_declaration_stops_after_its_one_token_recovery() -> Bool
 				(StoppedAtRejectedDeclaration, Some(at)):
 					match at.diagnostic:
 						TreeDiagnostics.Plain(Codes.ExpectedDeclarationDiagnostic):
-							(preview.declarations.is_empty() and state.position() == 1 and state.current_kind() == RecordKeyword
+							(preview.items.is_empty() and state.position() == 1 and state.current_kind() == RecordKeyword
 								and state.current_span().covers(4, 10) and at.span.covers(0, 0) and state.diagnostic_count() == 1 and rejected_newline_is_preserved()
 								and no_body_ids(state) and definition_count(state, 0))
 						_:
@@ -237,8 +250,8 @@ pure func test_rejected_declaration_stops_after_its_one_token_recovery() -> Bool
 pure func test_lexical_diagnostic_survives_reached_eof_without_claiming_acceptance() -> Bool:
 	match scanned("record R {} $"):
 		Some((state, preview)):
-			match (preview.stop, preview.declarations, state.diagnostics().get(0)):
-				(ReachedEndOfSource, [RecordDeclarationPreview(_)], Some(at)):
+			match (preview.stop, preview.items, state.diagnostics().get(0)):
+				(ReachedEndOfSource, [RecordItem(_)], Some(at)):
 					match at.diagnostic:
 						TreeDiagnostics.Plain(Codes.UnexpectedCharacterDiagnostic):
 							(at.span.covers(12, 13) and state.diagnostic_count() == 1 and state.current_kind() == EndOfFileToken
@@ -254,33 +267,30 @@ pure func test_lexical_diagnostic_survives_reached_eof_without_claiming_acceptan
 pure func test_unpaired_forward_is_retained_without_final_pairing_diagnostic() -> Bool:
 	match scanned("func f():\n\n"):
 		Some((state, preview)):
-			match (preview.stop, preview.declarations):
-				(ReachedEndOfSource, [FunctionDeclarationPreview(function)]):
-					match function.body_extent:
-						ForwardDeclaration:
-							(state.diagnostic_count() == 0 and state.current_kind() == EndOfFileToken and function.header.header_span.covers(0, 9)
-								and no_body_ids(state) and definition_count(state, 0))
-						_:
-							False
+			match (preview.stop, preview.items):
+				(ReachedEndOfSource, [FunctionItem(function)]):
+					(function.function.body.is_none() and state.diagnostic_count() == 0 and state.current_kind() == EndOfFileToken
+						and function.span.covers(0, 9) and no_body_ids(state) and definition_count(state, 1))
 				_:
 					False
 		None:
 			False
 
 
-pure func test_expression_scan_completes_operator_global_then_preserves_function_boundary() -> Bool:
+pure func test_expression_scan_completes_operator_global_then_function() -> Bool:
 	text = "value = (007 + 2) * 3\nfunc later(): value"
 
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(entry):
-			(state, preview) = scan_module_declaration_prefix_with_expressions(entry)
+			(state, preview) = scan_module_declarations(entry)
 
-			match preview.declarations:
-				[GlobalDeclarationPreview(global_value), FunctionDeclarationPreview(_)]:
+			match preview.items:
+				[GlobalItem(global_value), FunctionItem(later)]:
 					counts = state.issued_counts()
 					(
 						global_value.id.definition_local_index() == 0
-						and counts.expressions == 5
+						and later.id.definition_local_index() == 1
+						and counts.expressions == 6
 						and counts.blocks == 0
 						and counts.statements == 0
 						and state.diagnostic_count() == 0
@@ -294,10 +304,10 @@ pure func test_expression_scan_completes_operator_global_then_preserves_function
 pure func test_expression_scan_defers_unsupported_control_argument_without_minting_expression_ids() -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), "value = source.field(if x: 1 else: 2)\nrecord Later {}")):
 		Ok(entry):
-			(state, preview) = scan_module_declaration_prefix_with_expressions(entry)
+			(state, preview) = scan_module_declarations(entry)
 
-			match (preview.stop, preview.declarations):
-				(StoppedAtGlobalInitializer(global_value), []):
+			match (preview.unread_global(), preview.items):
+				(Some(global_value), []):
 					(
 						state.position() == global_value.initializer.token_start
 						and no_body_ids(state)
@@ -313,10 +323,10 @@ pure func test_expression_scan_defers_unsupported_control_argument_without_minti
 pure func test_expression_scan_defers_vector_missing_its_comma_without_minting_expression_ids() -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), "value = source.field({first second})\nrecord Later {}")):
 		Ok(entry):
-			(state, preview) = scan_module_declaration_prefix_with_expressions(entry)
+			(state, preview) = scan_module_declarations(entry)
 
-			match (preview.stop, preview.declarations):
-				(StoppedAtGlobalInitializer(global_value), []):
+			match (preview.unread_global(), preview.items):
+				(Some(global_value), []):
 					(
 						state.position() == global_value.initializer.token_start
 						and no_body_ids(state)
@@ -333,9 +343,9 @@ pure func test_expression_scan_completes_postfix_global_then_record() -> Bool:
 	text = "value = source.field(arg)[index]\nrecord Later {}"
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(entry):
-			(state, preview) = scan_module_declaration_prefix_with_expressions(entry)
-			match (preview.stop, preview.declarations):
-				(ReachedEndOfSource, [GlobalDeclarationPreview(global_value), RecordDeclarationPreview(record_value)]):
+			(state, preview) = scan_module_declarations(entry)
+			match (preview.stop, preview.items):
+				(ReachedEndOfSource, [GlobalItem(global_value), RecordItem(record_value)]):
 					counts = state.issued_counts()
 					(
 						global_value.id.definition_local_index() == 0
@@ -359,9 +369,9 @@ pure func test_expression_scan_completes_list_global_then_record() -> Bool:
 	text = "value = [first, [2], []]\nrecord Later {}"
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(entry):
-			(state, preview) = scan_module_declaration_prefix_with_expressions(entry)
-			match (preview.stop, preview.declarations):
-				(ReachedEndOfSource, [GlobalDeclarationPreview(global_value), RecordDeclarationPreview(record_value)]):
+			(state, preview) = scan_module_declarations(entry)
+			match (preview.stop, preview.items):
+				(ReachedEndOfSource, [GlobalItem(global_value), RecordItem(record_value)]):
 					counts = state.issued_counts()
 					(
 						global_value.id.definition_local_index() == 0
@@ -382,9 +392,9 @@ pure func test_expression_scan_completes_tuple_global_then_record() -> Bool:
 	text = "value = (first, [2], (3, 4))\nrecord Later {}"
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(entry):
-			(state, preview) = scan_module_declaration_prefix_with_expressions(entry)
-			match (preview.stop, preview.declarations):
-				(ReachedEndOfSource, [GlobalDeclarationPreview(global_value), RecordDeclarationPreview(record_value)]):
+			(state, preview) = scan_module_declarations(entry)
+			match (preview.stop, preview.items):
+				(ReachedEndOfSource, [GlobalItem(global_value), RecordItem(record_value)]):
 					counts = state.issued_counts()
 					(
 						global_value.id.definition_local_index() == 0
@@ -405,9 +415,9 @@ pure func test_expression_scan_completes_braced_global_then_record() -> Bool:
 	text = "value = {first = {1}, second = {k => v}}\nrecord Later {}"
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(entry):
-			(state, preview) = scan_module_declaration_prefix_with_expressions(entry)
-			match (preview.stop, preview.declarations):
-				(ReachedEndOfSource, [GlobalDeclarationPreview(global_value), RecordDeclarationPreview(record_value)]):
+			(state, preview) = scan_module_declarations(entry)
+			match (preview.stop, preview.items):
+				(ReachedEndOfSource, [GlobalItem(global_value), RecordItem(record_value)]):
 					counts = state.issued_counts()
 					(
 						global_value.id.definition_local_index() == 0
@@ -428,7 +438,7 @@ tests: TestSuite = {
 	description = "Bounded module declaration evidence and explicit scan stops",
 	tests = [
 		("fixed union scan keeps children and sibling ids", test_fixed_union_scan_keeps_children_and_sibling_ids),
-		("expression scan operator global and function boundary", test_expression_scan_completes_operator_global_then_preserves_function_boundary),
+		("expression scan operator global then function", test_expression_scan_completes_operator_global_then_function),
 		("expression scan unsupported control argument exact handoff", test_expression_scan_defers_unsupported_control_argument_without_minting_expression_ids),
 		("expression scan vector missing its comma exact handoff", test_expression_scan_defers_vector_missing_its_comma_without_minting_expression_ids),
 		("expression scan postfix global and record boundary", test_expression_scan_completes_postfix_global_then_record),
@@ -438,12 +448,12 @@ tests: TestSuite = {
 		("empty blank comment eof", test_empty_blank_and_comment_modules_reach_eof_without_nodes),
 		("completed order and newlines", test_completed_leaves_keep_source_order_and_newlines),
 		("module and declaration documentation", test_module_documentation_and_later_declaration_documentation_are_separate),
-		("body previews carry only lexical evidence", test_function_trait_and_implementation_keep_only_lexical_body_evidence),
+		("bodies are read in source order", test_function_trait_and_implementation_bodies_are_read_in_source_order),
 		("global hard stop retains prior previews", test_global_initializer_handoff_retains_prior_previews_and_next_tokens),
 		("rejected global preserves initializer", test_rejected_global_handoff_does_not_skip_initializer_or_sibling),
 		("generic fixed record scan completes", test_generic_fixed_record_scan_completes),
 		("rejected declaration sibling boundary", test_rejected_declaration_stops_after_its_one_token_recovery),
 		("lexical diagnostic retained at eof", test_lexical_diagnostic_survives_reached_eof_without_claiming_acceptance),
-		("unpaired forward deferred final pairing", test_unpaired_forward_is_retained_without_final_pairing_diagnostic)
+		("unpaired forward completes without final pairing", test_unpaired_forward_is_retained_without_final_pairing_diagnostic)
 	]
 }

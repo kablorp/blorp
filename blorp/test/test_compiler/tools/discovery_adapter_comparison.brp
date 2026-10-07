@@ -24,8 +24,6 @@ import:
 	../../../src/compiler/stage_03_parse/parsed_ast_json: AstJsonRender, ast_json_render, parsed_decl_to_json, parsed_source_location_to_json, parsed_function_header_to_json, parsed_var_header_to_json, parsed_trait_header_to_json, parsed_impl_header_to_json
 	../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end
 	../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PrivateVisibility, PublicVisibility)
-	../../../src/compiler_new/stage_01_discovery/parse/tree_trait_method_header_parser: MethodBodyExtent(AbstractMethod, SkippedDefaultBody)
-	../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser: FunctionBodyExtent(ForwardDeclaration, SkippedBody)
 	../../../src/lib/source: SourceFile, SourceLocation, source_location_start_offset, source_location_end_offset
 	../../../src/compiler/stage_03_parse/source_ast_finalize: finalize_interpolation_program
 	json: JsonValue(JsonNull, JsonObject, JsonString, JsonVector)
@@ -417,17 +415,6 @@ private pure func boundary_span_differences(old_span: SourceLocation, preview: S
 	found
 
 
--- Method headers are bounded by their own legacy methods, independently of
--- owner spans: at EOF, an owner can end before its method previews.
-private pure func method_header_span_differences(
-	path: String, old_span: SourceLocation, preview: Span,
-) -> List[JsonDifference]:
-	var found = prefix_difference(path + ".start", "${source_location_start_offset(old_span)}", "${preview.span_start()}")
-	if preview.span_end() < preview.span_start() or preview.span_end() > source_location_end_offset(old_span):
-		found = found.concat(prefix_difference(path + ".end", "within ${source_location_start_offset(old_span)}..${source_location_end_offset(old_span)}", "${preview.span_end()}"))
-	found
-
-
 -- The legacy AST drops grouping parentheses and retains no assignment token.
 -- Its lexer supplies the exact equal and immediately following token, including
 -- layout tokens; this compares lexical entry evidence without parsing a value.
@@ -535,23 +522,7 @@ pure func declaration_prefix_comparison(old_program: ParsedProgram, projection: 
 							boundary_kind = Some(FunctionPrefix)
 							span = preview.header_span
 							colon = preview.body_colon
-							match preview.body_extent:
-								SkippedBody(_):
-									boundary_found = boundary_span_differences(old_span, span)
-								ForwardDeclaration:
-									boundary_found = prefix_difference("stop.start", "${source_location_start_offset(old_span)}", "${span.span_start()}")
-									-- Legacy forward endpoints precede the authored colon;
-									-- their distance varies with whitespace and return syntax.
-									if source_location_end_offset(old_span) > colon.span_start():
-										boundary_found = boundary_found.concat(prefix_difference("stop.end", "at most ${colon.span_start()}", "${source_location_end_offset(old_span)}"))
-									-- A forward header cannot borrow a later declaration's colon.
-									upper_bound = match old_program.decls.get(completed + 1):
-										Some(next_declaration):
-											source_location_start_offset(parsed_decl_location(next_declaration))
-										None:
-											old_program.source.text.length()
-									if colon.span_end() > upper_bound:
-										boundary_found = boundary_found.concat(prefix_difference("stop.end", "at most ${upper_bound}", "${colon.span_end()}"))
+							boundary_found = boundary_span_differences(old_span, span)
 							boundary_found = boundary_found.concat(prefix_difference("stop.end", "${colon.span_end()}", "${span.span_end()}"))
 							if colon.span_start() < span.span_start() or colon.span_end() < colon.span_start():
 								boundary_found = boundary_found.concat(prefix_difference("stop.colon.start", "within header", "${colon.span_start()}..${colon.span_end()}"))
@@ -563,56 +534,38 @@ pure func declaration_prefix_comparison(old_program: ParsedProgram, projection: 
 							match unwrapped_declaration(declaration):
 								FunctionParsedDecl(function):
 									boundary_found = boundary_found.concat(value_differences("", "stop.header", parsed_function_header_to_json(old_render, parsed_function_header(function)), parsed_function_header_to_json(new_render, preview.header)))
-									expects_body = match preview.body_extent:
-										SkippedBody(_): True
-										ForwardDeclaration: False
-									boundary_found = boundary_found.concat(prefix_difference("stop.body", "${function.body.is_some()}", "${expects_body}"))
+									-- A function the tree parser stopped at always has a body (a
+									-- forward declaration is read in full), so the old one must too.
+									stopped_function_has_body: Bool = True
+									boundary_found = boundary_found.concat(prefix_difference("stop.body", "${function.body.is_some()}", "${stopped_function_has_body}"))
 								_:
 									void
+						-- An owner stop holds the owner's header only: its methods were not
+						-- read, so the old header is compared with its methods left out.
 						StoppedAtTraitPreview(preview):
 							boundary_kind = Some(TraitPrefix)
-							boundary_found = boundary_span_differences(old_span, preview.owner_span)
+							boundary_found = boundary_span_differences(old_span, preview.header_span)
 							is_private = match declaration:
 								PrivateParsedDecl(_, _): True
 								_: False
 							boundary_found = boundary_found.concat(prefix_difference("stop.visibility", "${is_private}", "${preview.visibility == PrivateVisibility}"))
 							match unwrapped_declaration(declaration):
 								TraitParsedDecl(trait_declaration):
-									boundary_found = boundary_found.concat(value_differences("", "stop.header", parsed_trait_header_to_json(old_render, parsed_trait_header(trait_declaration)), parsed_trait_header_to_json(new_render, legacy_trait_header(preview))))
-									for index in 0..preview.methods.length():
-										match (trait_declaration.methods.get(index), preview.methods.get(index)):
-											(Some(old_method), Some(method)):
-												path = "stop.methods[${index}]"
-												boundary_found = boundary_found.concat(method_header_span_differences(path + ".header_span", old_method.span, method.header_span))
-												expects_body = match method.body_extent:
-													AbstractMethod:
-														boundary_found = boundary_found.concat(prefix_difference(path + ".header_span.end", "${source_location_end_offset(old_method.span)}", "${method.header_span.span_end()}"))
-														False
-													SkippedDefaultBody(_):
-														True
-												boundary_found = boundary_found.concat(prefix_difference(path + ".body", "${old_method.body.is_some()}", "${expects_body}"))
-											_:
-												boundary_found = boundary_found.concat(prefix_difference("stop.methods[${index}].kind", "legacy method", "absent corresponding method"))
+									old_header = { parsed_trait_header(trait_declaration) | methods = [] }
+									boundary_found = boundary_found.concat(value_differences("", "stop.header", parsed_trait_header_to_json(old_render, old_header), parsed_trait_header_to_json(new_render, legacy_trait_header(preview))))
 								_:
 									void
 						StoppedAtImplementationPreview(preview):
 							boundary_kind = Some(ImplementationPrefix)
-							boundary_found = boundary_span_differences(old_span, preview.owner_span)
+							boundary_found = boundary_span_differences(old_span, preview.header_span)
 							is_private = match declaration:
 								PrivateParsedDecl(_, _): True
 								_: False
 							boundary_found = boundary_found.concat(prefix_difference("stop.visibility", "${is_private}", "${preview.visibility == PrivateVisibility}"))
 							match unwrapped_declaration(declaration):
 								ImplParsedDecl(implementation):
-									boundary_found = boundary_found.concat(value_differences("", "stop.header", parsed_impl_header_to_json(old_render, parsed_impl_header(implementation)), parsed_impl_header_to_json(new_render, legacy_implementation_header(preview))))
-									for index in 0..preview.methods.length():
-										match (implementation.methods.get(index), preview.methods.get(index)):
-											(Some(old_method), Some(method)):
-												path = "stop.methods[${index}]"
-												boundary_found = boundary_found.concat(method_header_span_differences(path + ".header_span", old_method.span, method.header_span))
-												boundary_found = boundary_found.concat(prefix_difference(path + ".body", "${old_method.body.is_some()}", "${True}"))
-											_:
-												boundary_found = boundary_found.concat(prefix_difference("stop.methods[${index}].kind", "legacy method", "absent corresponding method"))
+									old_header = { parsed_impl_header(implementation) | methods = [] }
+									boundary_found = boundary_found.concat(value_differences("", "stop.header", parsed_impl_header_to_json(old_render, old_header), parsed_impl_header_to_json(new_render, legacy_implementation_header(preview))))
 								_:
 									void
 						StoppedAtGlobalInitializer(preview):

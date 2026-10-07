@@ -1,9 +1,12 @@
--- One declaration preview step. Global initializer entry and unsupported
--- syntax are explicit stopping points; M4 owns expressions and complete bodies.
+-- One declaration step. A global is read with its initializer and a trait or
+-- implementation with its methods' bodies, each by its own parser; a function
+-- hands its header to the declaration scan, which reads its body. One whose
+-- body or initializer the tree parser does not read hands back its header and
+-- why.
 import:
 	../syntax/declarations:
-		RecordDeclaration, AliasDeclaration, FunctionDeclaration, TraitDeclaration, ImplementationDeclaration,
-		BuiltinTypeDeclaration, ResourceTypeDeclaration, UnionDeclaration, EnumDeclaration, GlobalDeclaration,
+		RecordDeclaration, AliasDeclaration, GlobalDeclaration, TraitDeclaration, ImplementationDeclaration,
+		BuiltinTypeDeclaration, ResourceTypeDeclaration, UnionDeclaration, EnumDeclaration,
 		GlobalForm(ConstantGlobal, MutableGlobal), AliasForm(TransparentAlias, OpaqueAlias),
 		RecordDeclarationForm(OrdinaryRecord, FixedRecord), UnionDeclarationForm(OrdinaryUnion, FixedUnion)
 	../syntax/imports: ImportBlock
@@ -34,14 +37,21 @@ import:
 	tree_foreign_block_parser: ForeignBlockParse(ParsedForeignBlock, RejectedForeignBlock), parse_foreign_block
 	tree_function_header_parser:
 		FunctionHeaderPreview, FunctionHeaderParse(ParsedFunctionHeader, RejectedFunctionHeader), parse_function_header
-	tree_trait_parser: TraitPreview, TraitParse(ParsedTrait, RejectedTrait), parse_trait
+	tree_trait_parser: TraitHeader, TraitParse(ParsedTrait, RejectedTrait, DeclinedTrait), parse_trait
 	tree_implementation_parser:
-		ImplementationPreview, ImplementationParse(ParsedImplementation, RejectedImplementation), parse_implementation
+		ImplementationHeader, ImplementationParse(ParsedImplementation, RejectedImplementation, DeclinedImplementation), parse_implementation
 	tree_global_header_parser:
 		GlobalHeaderPreview, DeferredInitializerStart,
 		GlobalHeaderParse(ParsedGlobalHeader, RejectedGlobalHeader), parse_global_header
+	tree_global_parser: GlobalInitializerParse(ParsedInitializer, DeclinedInitializer, RejectedInitializer), parse_global_initializer
+	stop_reason: StopPoint
 
 
+---
+One declaration as its own parser reads it: a complete leaf, global, trait or
+implementation, or the header of a function whose body the declaration scan
+reads next.
+---
 union DeclarationPreview:
 	GlobalDeclarationPreview(GlobalDeclaration)
 	RecordDeclarationPreview(RecordDeclaration)
@@ -53,105 +63,137 @@ union DeclarationPreview:
 	ImportBlockDeclarationPreview(ImportBlock)
 	ForeignBlockDeclarationPreview(ForeignBlock)
 	FunctionDeclarationPreview(FunctionHeaderPreview)
-	CompletedFunctionPreview(FunctionDeclaration)
-	CompletedTraitPreview(TraitDeclaration)
-	CompletedImplementationPreview(ImplementationDeclaration)
-	TraitDeclarationPreview(TraitPreview)
-	ImplementationDeclarationPreview(ImplementationPreview)
+	TraitDeclarationPreview(TraitDeclaration)
+	ImplementationDeclarationPreview(ImplementationDeclaration)
 
 
+---
+A declaration read; a global, trait or implementation with an initializer or
+body the tree parser does not read yet (its header, and why); or a
+declaration rejected with diagnostics. A rejected global keeps its
+initializer entry.
+---
 union DeclarationPreviewParse:
 	ParsedDeclarationPreview(DeclarationPreview)
-	DeferredGlobalInitializer(GlobalHeaderPreview)
+	DeclinedGlobalInitializer(GlobalHeaderPreview, StopPoint)
+	DeclinedTraitBodies(TraitHeader, StopPoint)
+	DeclinedImplementationBodies(ImplementationHeader, StopPoint)
 	RejectedGlobalInitializer(DeferredInitializerStart)
 	RejectedDeclarationPreview
 
 
--- This spelling is an identifier marker, independent of seeded table IDs.
+-- What a declaration's own parser read, before the prefix's diagnostics are
+-- weighed: a global's header is read on only when the declaration is clean.
+private union IntroducedDeclaration:
+	IntroducedParse(DeclarationPreviewParse)
+	IntroducedGlobalHeader(GlobalHeaderPreview)
+
+
 pure func parse_declaration_preview(state: ParseState) -> (ParseState, DeclarationPreviewParse):
 	before: Int = state.diagnostic_count()
 	(after_prefix, prefix) = parse_declaration_prefix(state)
-	(parsed, result) = parse_introduced_declaration(after_prefix, prefix)
+	(parsed, introduced) = parse_introduced_declaration(after_prefix, prefix)
 
 	-- Prefix diagnostics belong to this composition, even when a leaf's own
-	-- delta is clean. Globals still hand off the exact initializer entry.
+	-- delta is clean. A rejected global keeps the exact initializer entry, and
+	-- its initializer is not read.
 	if parsed.diagnostic_count() != before:
-		match result:
-			DeferredGlobalInitializer(preview):
+		match introduced:
+			IntroducedGlobalHeader(preview):
 				(parsed, RejectedGlobalInitializer(preview.initializer))
-			RejectedGlobalInitializer(_):
-				(parsed, result)
-			_:
+			IntroducedParse(RejectedGlobalInitializer(start)):
+				(parsed, RejectedGlobalInitializer(start))
+			IntroducedParse(_):
 				(parsed, RejectedDeclarationPreview)
 	else:
-		(parsed, result)
+		match introduced:
+			IntroducedGlobalHeader(preview):
+				parse_global(parsed, preview)
+			IntroducedParse(result):
+				(parsed, result)
 
 
-private pure func parse_introduced_declaration(state: ParseState, prefix: DeclarationPrefix) -> (ParseState, DeclarationPreviewParse):
+-- A global whose clean header left the cursor at its initializer.
+private pure func parse_global(state: ParseState, preview: GlobalHeaderPreview) -> (ParseState, DeclarationPreviewParse):
+	(parsed, result) = parse_global_initializer(state, preview)
+	match result:
+		ParsedInitializer(global_value):
+			(parsed, ParsedDeclarationPreview(GlobalDeclarationPreview(global_value)))
+		DeclinedInitializer(stop):
+			(parsed, DeclinedGlobalInitializer(preview, stop))
+		RejectedInitializer:
+			(parsed, RejectedGlobalInitializer(preview.initializer))
+
+
+private pure func parse_introduced_declaration(state: ParseState, prefix: DeclarationPrefix) -> (ParseState, IntroducedDeclaration):
 	if prefix.visibility == PublicVisibility and state.current_kind() == ImportKeyword:
 		(parsed, result) = parse_import_block(state)
 		match result:
 			ParsedImportBlock(block):
-				(parsed, ParsedDeclarationPreview(ImportBlockDeclarationPreview(block)))
+				(parsed, IntroducedParse(ParsedDeclarationPreview(ImportBlockDeclarationPreview(block))))
 			RejectedImportBlock:
-				(parsed, RejectedDeclarationPreview)
+				(parsed, IntroducedParse(RejectedDeclarationPreview))
 	else if prefix.visibility == PublicVisibility and state.current_kind() == ForeignKeyword:
 		(parsed, result) = parse_foreign_block(state, prefix.start)
 		match result:
 			ParsedForeignBlock(block):
-				(parsed, ParsedDeclarationPreview(ForeignBlockDeclarationPreview(block)))
+				(parsed, IntroducedParse(ParsedDeclarationPreview(ForeignBlockDeclarationPreview(block))))
 			RejectedForeignBlock:
-				(parsed, RejectedDeclarationPreview)
+				(parsed, IntroducedParse(RejectedDeclarationPreview))
 	else:
 		parse_after_prefix(state, prefix)
 
 
-private pure func parse_after_prefix(state: ParseState, prefix: DeclarationPrefix) -> (ParseState, DeclarationPreviewParse):
+private pure func parse_after_prefix(state: ParseState, prefix: DeclarationPrefix) -> (ParseState, IntroducedDeclaration):
 	match state.current_kind():
 		FuncKeyword:
 			(parsed, result) = parse_function_header(state, prefix.visibility, prefix.documentation, prefix.annotations, prefix.purity, prefix.start)
 			match result:
 				ParsedFunctionHeader(preview):
-					(parsed, ParsedDeclarationPreview(FunctionDeclarationPreview(preview)))
+					(parsed, IntroducedParse(ParsedDeclarationPreview(FunctionDeclarationPreview(preview))))
 				RejectedFunctionHeader:
-					(parsed, RejectedDeclarationPreview)
+					(parsed, IntroducedParse(RejectedDeclarationPreview))
 		VarKeyword:
 			parse_global_handoff(state.advanced(), prefix, MutableGlobal)
 		RecordKeyword:
 			(parsed, result) = parse_record(state.advanced(), prefix.visibility, prefix.documentation, prefix.start)
 			match result:
 				ParsedRecord(declaration):
-					(parsed, ParsedDeclarationPreview(RecordDeclarationPreview(declaration)))
+					(parsed, IntroducedParse(ParsedDeclarationPreview(RecordDeclarationPreview(declaration))))
 				RejectedRecord:
-					(parsed, RejectedDeclarationPreview)
+					(parsed, IntroducedParse(RejectedDeclarationPreview))
 		UnionKeyword:
 			(parsed, result) = parse_union(state.advanced(), prefix.visibility, prefix.documentation, prefix.start, OrdinaryUnion)
 			match result:
 				ParsedUnion(declaration):
-					(parsed, ParsedDeclarationPreview(UnionDeclarationPreview(declaration)))
+					(parsed, IntroducedParse(ParsedDeclarationPreview(UnionDeclarationPreview(declaration))))
 				RejectedUnion:
-					(parsed, RejectedDeclarationPreview)
+					(parsed, IntroducedParse(RejectedDeclarationPreview))
 		EnumKeyword:
 			(parsed, result) = parse_enum(state.advanced(), prefix.visibility, prefix.documentation, prefix.start)
 			match result:
 				ParsedEnum(declaration):
-					(parsed, ParsedDeclarationPreview(EnumDeclarationPreview(declaration)))
+					(parsed, IntroducedParse(ParsedDeclarationPreview(EnumDeclarationPreview(declaration))))
 				RejectedEnum:
-					(parsed, RejectedDeclarationPreview)
+					(parsed, IntroducedParse(RejectedDeclarationPreview))
 		TraitKeyword:
 			(parsed, result) = parse_trait(state, prefix.visibility, prefix.documentation, prefix.start)
 			match result:
 				ParsedTrait(declaration):
-					(parsed, ParsedDeclarationPreview(TraitDeclarationPreview(declaration)))
+					(parsed, IntroducedParse(ParsedDeclarationPreview(TraitDeclarationPreview(declaration))))
 				RejectedTrait:
-					(parsed, RejectedDeclarationPreview)
+					(parsed, IntroducedParse(RejectedDeclarationPreview))
+				DeclinedTrait(header, stop):
+					(parsed, IntroducedParse(DeclinedTraitBodies(header, stop)))
 		ImplementsKeyword:
 			(parsed, result) = parse_implementation(state, prefix.visibility, prefix.documentation, prefix.start)
 			match result:
 				ParsedImplementation(declaration):
-					(parsed, ParsedDeclarationPreview(ImplementationDeclarationPreview(declaration)))
+					(parsed, IntroducedParse(ParsedDeclarationPreview(ImplementationDeclarationPreview(declaration))))
 				RejectedImplementation:
-					(parsed, RejectedDeclarationPreview)
+					(parsed, IntroducedParse(RejectedDeclarationPreview))
+				DeclinedImplementation(header, stop):
+					(parsed, IntroducedParse(DeclinedImplementationBodies(header, stop)))
 		TypeKeyword:
 			if state.peek_kind(1) == AliasKeyword:
 				parse_alias_route(state.advanced(), prefix, TransparentAlias)
@@ -168,9 +210,9 @@ private pure func parse_after_prefix(state: ParseState, prefix: DeclarationPrefi
 				(parsed, result) = parse_union(state.advanced().advanced(), prefix.visibility, prefix.documentation, prefix.start, FixedUnion)
 				match result:
 					ParsedUnion(declaration):
-						(parsed, ParsedDeclarationPreview(UnionDeclarationPreview(declaration)))
+						(parsed, IntroducedParse(ParsedDeclarationPreview(UnionDeclarationPreview(declaration))))
 					RejectedUnion:
-						(parsed, RejectedDeclarationPreview)
+						(parsed, IntroducedParse(RejectedDeclarationPreview))
 			else:
 				parse_global_handoff(state, prefix, ConstantGlobal)
 		UnderscoreSymbol:
@@ -183,11 +225,12 @@ private pure func parse_after_prefix(state: ParseState, prefix: DeclarationPrefi
 			else:
 				reported: ParseState = state.report_at_current(ExpectedDeclarationDiagnostic)
 				if state.current_kind() == EndOfFileToken:
-					(reported, RejectedDeclarationPreview)
+					(reported, IntroducedParse(RejectedDeclarationPreview))
 				else:
-					(reported.advanced(), RejectedDeclarationPreview)
+					(reported.advanced(), IntroducedParse(RejectedDeclarationPreview))
 
 
+-- This spelling is an identifier marker, independent of seeded table IDs.
 private pure func is_fixed_marker(state: ParseState) -> Bool:
 	match state.current_token().token_spelling(state.spellings()):
 		Some(spelling):
@@ -196,41 +239,41 @@ private pure func is_fixed_marker(state: ParseState) -> Bool:
 			False
 
 
-private pure func parse_record_route(state: ParseState, prefix: DeclarationPrefix, form: RecordDeclarationForm) -> (ParseState, DeclarationPreviewParse):
+private pure func parse_record_route(state: ParseState, prefix: DeclarationPrefix, form: RecordDeclarationForm) -> (ParseState, IntroducedDeclaration):
 	(parsed, result) = parse_record_form(state, prefix.visibility, prefix.documentation, prefix.start, form)
 	match result:
 		ParsedRecord(declaration):
-			(parsed, ParsedDeclarationPreview(RecordDeclarationPreview(declaration)))
+			(parsed, IntroducedParse(ParsedDeclarationPreview(RecordDeclarationPreview(declaration))))
 		RejectedRecord:
-			(parsed, RejectedDeclarationPreview)
+			(parsed, IntroducedParse(RejectedDeclarationPreview))
 
 
-private pure func parse_alias_route(state: ParseState, prefix: DeclarationPrefix, form: AliasForm) -> (ParseState, DeclarationPreviewParse):
+private pure func parse_alias_route(state: ParseState, prefix: DeclarationPrefix, form: AliasForm) -> (ParseState, IntroducedDeclaration):
 	(parsed, result) = parse_alias(state, prefix.visibility, prefix.documentation, prefix.start, form)
 	match result:
 		ParsedAlias(declaration):
-			(parsed, ParsedDeclarationPreview(AliasDeclarationPreview(declaration)))
+			(parsed, IntroducedParse(ParsedDeclarationPreview(AliasDeclarationPreview(declaration))))
 		RejectedAlias:
-			(parsed, RejectedDeclarationPreview)
+			(parsed, IntroducedParse(RejectedDeclarationPreview))
 
 
-private pure func parse_builtin_route(state: ParseState, prefix: DeclarationPrefix, form: BuiltinTypeForm) -> (ParseState, DeclarationPreviewParse):
+private pure func parse_builtin_route(state: ParseState, prefix: DeclarationPrefix, form: BuiltinTypeForm) -> (ParseState, IntroducedDeclaration):
 	(parsed, result) = parse_builtin_type(state, prefix.visibility, prefix.documentation, prefix.start, form)
 	match result:
 		ParsedBuiltinType(declaration):
-			(parsed, ParsedDeclarationPreview(BuiltinTypeDeclarationPreview(declaration)))
+			(parsed, IntroducedParse(ParsedDeclarationPreview(BuiltinTypeDeclarationPreview(declaration))))
 		ParsedResourceType(declaration):
-			(parsed, ParsedDeclarationPreview(ResourceTypeDeclarationPreview(declaration)))
+			(parsed, IntroducedParse(ParsedDeclarationPreview(ResourceTypeDeclarationPreview(declaration))))
 		RejectedBuiltinType:
-			(parsed, RejectedDeclarationPreview)
+			(parsed, IntroducedParse(RejectedDeclarationPreview))
 
 
-private pure func parse_global_handoff(state: ParseState, prefix: DeclarationPrefix, form: GlobalForm) -> (ParseState, DeclarationPreviewParse):
+private pure func parse_global_handoff(state: ParseState, prefix: DeclarationPrefix, form: GlobalForm) -> (ParseState, IntroducedDeclaration):
 	(parsed, result) = parse_global_header(state, prefix, form)
 	match result:
 		ParsedGlobalHeader(preview):
-			(parsed, DeferredGlobalInitializer(preview))
+			(parsed, IntroducedGlobalHeader(preview))
 		RejectedGlobalHeader:
 			-- A rejected header still reached initializer grammar; no endpoint
 			-- or completed global can be inferred from this entry evidence.
-			(parsed, RejectedGlobalInitializer({ token_start = parsed.position(), anchor = prefix.start }))
+			(parsed, IntroducedParse(RejectedGlobalInitializer({ token_start = parsed.position(), anchor = prefix.start })))

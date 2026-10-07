@@ -1,11 +1,10 @@
 -- A single frozen declaration call pins owner recovery; no module assembly.
--- Default-body comparisons below are lexical evidence, not M4 expression parity.
+-- A trait reads each method in full, then mints itself last.
 import:
 	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
 	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, spellings, report_at_current, finished_builtin_type, consume_declared_name
-	../../../../src/compiler_new/stage_01_discovery/parse/tree_trait_parser: TraitPreview, TraitParse(ParsedTrait, RejectedTrait), parse_trait
-	../../../../src/compiler_new/stage_01_discovery/parse/tree_trait_method_header_parser: MethodBodyExtent(AbstractMethod, SkippedDefaultBody)
-	../../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser: deferred_body_span, deferred_body_token_start, deferred_body_token_end
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_trait_parser: TraitParse(ParsedTrait, RejectedTrait, DeclinedTrait), parse_trait
+	../../../../src/compiler_new/stage_01_discovery/parse/stop_reason: StopReason(OpaqueConversion)
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_prefix_parser: parse_declaration_prefix
 	../../../../src/compiler_new/stage_01_discovery/parse/declaration_parser: parse_declaration
 	../../../../src/compiler_new/stage_01_discovery/parse/lexed_bridge: bridge_lexed_module
@@ -75,16 +74,21 @@ private pure func matches_frozen(state: ParseState, reference: DiscoveryBuilder)
 	correct
 
 
-private pure func no_definitions_or_bodies(state: ParseState) -> Bool:
+-- No method body, statement or pattern was minted.
+private pure func no_bodies(state: ParseState) -> Bool:
 	counts = state.issued_counts()
+	counts.expressions == 0 and counts.blocks == 0 and counts.statements == 0 and counts.patterns == 0
+
+
+-- The mint issued exactly `count` definitions.
+private pure func definitions_issued(state: ParseState, count: Int) -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), "witness")):
 		Ok(witness_state):
 			(_, name) = witness_state.consume_declared_name(NameInTraitName)
 			match name:
 				Some(name):
 					(_, witness) = state.finished_builtin_type(PublicVisibility, None, name, [], name.span)
-					(witness.id.definition_local_index() == 0 and counts.expressions == 0 and counts.blocks == 0
-						and counts.statements == 0 and counts.patterns == 0)
+					witness.id.definition_local_index() == count
 				None:
 					False
 		Err(_):
@@ -115,19 +119,19 @@ private pure func accepted(text: String, methods: List[String], supers: List[Str
 				(ParsedTrait(declaration), Some(owner)):
 					var correct: Bool = (matches_frozen(parsed, reference) and parsed.diagnostic_count() == 0 and declaration.span.spans_equal(owner.span)
 						and declaration.name.span.spans_equal(owner.name_span) and declaration.methods.length() == methods.length() and declaration.supertraits.length() == supers.length()
-						and declaration.methods.length() + 1 == reference.definitions.length() and no_definitions_or_bodies(parsed))
+						and declaration.methods.length() + 1 == reference.definitions.length() and no_bodies(parsed)
+						and definitions_issued(parsed, methods.length() + 1) and declaration.id.definition_local_index() == methods.length())
 					for (method, name) in declaration.methods.zip(methods):
-						correct = correct and parsed.spellings().spelling_text(method.header.signature.name.spelling) == Some(name)
+						correct = correct and parsed.spellings().spelling_text(method.signature.name.spelling) == Some(name)
 					for (supertrait, name) in declaration.supertraits.zip(supers):
 						correct = correct and parsed.spellings().spelling_text(supertrait.trait_name.name.spelling) == Some(name)
 					var index: Int = 1
 					for method in declaration.methods:
-						-- Abstract spans are exact frozen extents. Defaults have separate
-						-- header/body evidence and are covered without this comparison.
-						match (method.body_extent, reference.definitions.get(index)):
-							(AbstractMethod, Some(reference_method)):
-								correct = correct and method.header.span.spans_equal(reference_method.span)
-							_:
+						-- Abstract spans are exact frozen extents.
+						match reference.definitions.get(index):
+							Some(reference_method):
+								correct = correct and method.default_body.is_none() and method.span.spans_equal(reference_method.span)
+							None:
 								correct = False
 						index += 1
 					correct
@@ -142,7 +146,7 @@ private pure func rejected(text: String) -> Bool:
 		Some((parsed, result)):
 			match result:
 				RejectedTrait:
-					matches_frozen(parsed, frozen(text)) and parsed.diagnostic_count() > 0 and no_definitions_or_bodies(parsed)
+					matches_frozen(parsed, frozen(text)) and parsed.diagnostic_count() > 0 and no_bodies(parsed)
 				_:
 					False
 		None:
@@ -211,12 +215,12 @@ pure func test_two_abstract_methods_own_dedent_and_keep_child_ids() -> Bool:
 				ParsedTrait(declaration):
 					match declaration.methods:
 						[first, second]:
-							match (first.header.signature.parameters, second.header.signature.parameters, first.header.signature.return_type, second.header.signature.return_type):
+							match (first.signature.parameters, second.signature.parameters, first.signature.return_type, second.signature.return_type):
 								([x], [y], Some(first_return), Some(second_return)):
 									match (x.binding, y.binding, x.declared_type, y.declared_type):
 										(NamedParameter(x_name), NamedParameter(y_name), Some(x_type), Some(y_type)):
-											(accepted(text, ["a", "b"], []) and accepted("trait T: Eq:\n\tfunc f()\nnext", ["f"], ["Eq"]) and declaration.span.covers(0, 60) and first.header.span.covers(10, 31) and second.header.span.covers(33, 59)
-												and first.header.signature.purity == ImpureFunction and second.header.signature.purity == PureFunction
+											(accepted(text, ["a", "b"], []) and accepted("trait T: Eq:\n\tfunc f()\nnext", ["f"], ["Eq"]) and declaration.span.covers(0, 60) and first.span.covers(10, 31) and second.span.covers(33, 59)
+												and first.signature.purity == ImpureFunction and second.signature.purity == PureFunction
 												and x_name.binder.binder_local_index() == 0 and y_name.binder.binder_local_index() == 1
 												and x_type.id.written_type_local_index() == 0 and first_return.id.written_type_local_index() == 1 and y_type.id.written_type_local_index() == 2 and second_return.id.written_type_local_index() == 3
 												and parsed.issued_counts().binders == 2 and parsed.issued_counts().written_types == 4 and parsed.issued_counts().name_uses == 4
@@ -290,28 +294,53 @@ pure func test_rejected_children_and_unsupported_items_continue_without_filterin
 			False
 
 
-pure func test_default_body_extent_then_abstract_method_is_lexical_evidence_only() -> Bool:
-	-- No frozen expression-parser comparison: M4 owns body trees, diagnostics
-	-- and final ID interleaving. Retain the header extent separately from body.
+-- A default body is read in full with its method: its ids come before the
+-- method's definition, and the abstract method after it follows both.
+pure func test_default_body_then_abstract_method_are_read_in_source_order() -> Bool:
 	match composed("trait T:\n\tfunc f():\n\t\t1\n\tfunc g()\nnext"):
 		Some((parsed, result)):
 			match result:
 				ParsedTrait(declaration):
 					match declaration.methods:
 						[first, second]:
-							match (first.body_extent, second.body_extent):
-								(SkippedDefaultBody(body), AbstractMethod):
-									(declaration.span.covers(0, 34) and first.header.span.covers(10, 16) and second.header.span.covers(25, 31)
-										and body.deferred_body_span().covers(22, 23) and body.deferred_body_token_start() == 10 and body.deferred_body_token_end() == 14
-										and parsed.current_kind() == IdentifierToken and parsed.current_span().covers(34, 38) and parsed.position() == 19
-										and parsed.diagnostic_count() == 0 and no_definitions_or_bodies(parsed))
-								_:
-									False
+							counts = parsed.issued_counts()
+							(declaration.span.covers(0, 34) and first.span.covers(10, 23) and second.span.covers(25, 31)
+								and first.default_body.is_some() and second.default_body.is_none()
+								and first.id.definition_local_index() == 0 and second.id.definition_local_index() == 1
+								and declaration.id.definition_local_index() == 2 and definitions_issued(parsed, 3)
+								and counts.expressions == 1 and counts.blocks == 1 and counts.statements == 1
+								and parsed.current_kind() == IdentifierToken and parsed.current_span().covers(34, 38) and parsed.position() == 19
+								and parsed.diagnostic_count() == 0)
 						_:
 							False
 				_:
 					False
 		None:
+			False
+
+
+-- A default body the tree parser does not read declines the trait. The trait
+-- hands back its header, through its last supertrait, and keeps only the
+-- header's ids: none of its methods' and no definition.
+pure func test_unread_default_body_declines_the_trait_with_its_header() -> Bool:
+	match composed("trait Shape[T]: Eq:\n\tfunc area(x: Int) -> Int: into_opaque Count(x)\nnext"):
+		Some((parsed, DeclinedTrait(header, stop))):
+			counts = parsed.issued_counts()
+			(stop.reason == OpaqueConversion and header.span.covers(0, 18) and header.name.span.covers(6, 11)
+				and header.type_parameters.length() == 1 and header.supertraits.length() == 1 and parsed.diagnostic_count() == 0
+				and counts.type_binders == 1 and counts.name_uses == 1 and counts.binders == 0 and counts.written_types == 0
+				and no_bodies(parsed) and definitions_issued(parsed, 0))
+		_:
+			False
+
+
+-- A diagnostic in a method before a default body the parser does not read
+-- still rejects the trait.
+pure func test_diagnostic_before_an_unread_body_rejects_the_trait() -> Bool:
+	match composed("trait T:\n\tfunc 123()\n\tfunc f() -> Int: into_opaque Count(1)\nnext"):
+		Some((parsed, RejectedTrait)):
+			parsed.diagnostic_count() > 0
+		_:
 			False
 
 
@@ -326,7 +355,7 @@ pure func test_direct_entry_uses_earlier_anchor_and_tolerates_existing_diagnosti
 						TreeDiagnostics.Plain(FrozenDiagnostics.ExpectedSupertraitOrMethodsDiagnostic):
 							(declaration.span.covers(0, 18) and declaration.name.span.covers(13, 14) and declaration.visibility == PrivateVisibility and declaration.documentation.is_none()
 								and diagnostic.span.covers(7, 7) and parsed.diagnostic_count() == 1 and parsed.current_kind() == EndOfFileToken
-								and parsed.current_span().covers(18, 18) and parsed.position() == 5 and no_definitions_or_bodies(parsed))
+								and parsed.current_span().covers(18, 18) and parsed.position() == 5 and no_bodies(parsed) and definitions_issued(parsed, 1))
 						_:
 							False
 				_:
@@ -336,7 +365,7 @@ pure func test_direct_entry_uses_earlier_anchor_and_tolerates_existing_diagnosti
 
 
 tests: TestSuite = {
-	description = "Trait owner previews and frozen declaration recovery",
+	description = "Traits read in full and frozen declaration recovery",
 	tests = [
 		("supertraits preserve qualifiers duplicates and cursor", test_supertraits_preserve_qualifiers_duplicates_order_and_following_newline),
 		("type parameter children keep source IDs", test_type_parameter_children_and_supertrait_uses_keep_source_order),
@@ -346,7 +375,9 @@ tests: TestSuite = {
 		("supertrait recovery and suffix quirks", test_supertrait_recovery_preserves_trailing_plus_and_bracket_quirks),
 		("layout failures preserve continuation", test_layout_failures_preserve_unindented_continuation_and_eof_reports),
 		("rejected and unsupported children remain unfiltered", test_rejected_children_and_unsupported_items_continue_without_filtering),
-		("default then abstract lexical evidence", test_default_body_extent_then_abstract_method_is_lexical_evidence_only),
+		("default body then abstract method in source order", test_default_body_then_abstract_method_are_read_in_source_order),
+		("unread default body declines the trait with its header", test_unread_default_body_declines_the_trait_with_its_header),
+		("diagnostic before an unread body rejects the trait", test_diagnostic_before_an_unread_body_rejects_the_trait),
 		("direct entry anchor and existing diagnostic", test_direct_entry_uses_earlier_anchor_and_tolerates_existing_diagnostic)
 	]
 }

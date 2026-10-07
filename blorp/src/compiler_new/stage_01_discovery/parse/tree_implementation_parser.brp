@@ -1,6 +1,8 @@
--- Implementation ownership over receiver syntax and method header previews.
--- Deferred bodies are lexical evidence; M4 owns bodies and definition IDs.
+-- An implementation: its header, then each method read in full in source
+-- order (its header, its body, its definition), and the implementation
+-- minted last, so its ids are post-order without reading anything twice.
 import:
+	../syntax/declarations: ImplementationDeclaration, ImplementationMethod
 	../syntax/module_syntax: Documentation
 	../syntax/names: NameUse
 	../syntax/types: WrittenType
@@ -13,67 +15,50 @@ import:
 	../tables/token: TokenKind(ForKeyword, ColonSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken)
 	parse_state:
 		ParseState, current_kind, current_span, position, advanced, diagnostic_count,
-		consume_referenced_name, finished_name_use, expect_token
+		consume_referenced_name, finished_name_use, expect_token, finished_implementation, finished_implementation_method
+	stop_reason: StopPoint, Recognition(Recognized, Declined)
+	tree_body_parser: complete_body
 	tree_type_parser: parse_receiver_type
-	method_read: MethodRead, Never, absurd
 	tree_implementation_method_header_parser:
-		ImplementationMethodHeaderPreview, ImplementationMethodHeaderParse(ParsedImplementationMethodHeader, RejectedImplementationMethodHeader), parse_implementation_method_header
+		ImplementationMethodHeaderParse(ParsedImplementationMethodHeader, RejectedImplementationMethodHeader), parse_implementation_method_header
 
 
--- An implementation over its methods in whatever form the caller reads them:
--- header previews, or complete methods that own their bodies' trees.
-record ImplementationOwner[M] {
+---
+An implementation's header: everything before its methods. `span` runs from
+the declaration's start through its receiver.
+---
+record ImplementationHeader {
 	visibility: Visibility,
 	documentation: Option[Documentation],
 	keyword: Span,
 	trait_name: NameUse,
 	receiver: WrittenType,
-	methods: List[M],
 	span: Span
 }
 
 
-type alias ImplementationPreview = ImplementationOwner[ImplementationMethodHeaderPreview]
-
-
+---
+An implementation read in full; one with a diagnostic; or the header of one
+with a method body the tree parser does not read, and why.
+---
 union ImplementationParse:
-	ParsedImplementation(ImplementationPreview)
+	ParsedImplementation(ImplementationDeclaration)
 	RejectedImplementation
+	DeclinedImplementation(ImplementationHeader, StopPoint)
 
 
-union ImplementationOwnerParse[M, S]:
-	ParsedImplementationOwner(ImplementationOwner[M])
-	RejectedImplementationOwner
-	StoppedImplementationOwner(S)
+-- One method: read and minted, rejected with its diagnostics (the
+-- implementation reads on), or a body the tree parser does not read (it stops).
+private union ImplementationMethodParse:
+	ParsedMethod(ImplementationMethod)
+	RejectedMethod
+	DeclinedMethod(StopPoint)
 
 
--- The cursor is at `implements`; the caller owns any declaration prefix.
+-- The cursor is at `implements`; the caller owns any declaration prefix. A
+-- declined implementation leaves the state after its header: the header's
+-- ids stay issued and nothing of its methods does.
 pure func parse_implementation(state: ParseState, visibility: Visibility, documentation: Option[Documentation], start: Span) -> (ParseState, ImplementationParse):
-	(out, parsed) = parse_implementation_owner(state, visibility, documentation, start, read_implementation_method_header)
-	match parsed:
-		ParsedImplementationOwner(owner):
-			(out, ParsedImplementation(owner))
-		RejectedImplementationOwner:
-			(out, RejectedImplementation)
-		StoppedImplementationOwner(stop):
-			absurd(stop)
-
-
-private pure func read_implementation_method_header(state: ParseState) -> (ParseState, MethodRead[ImplementationMethodHeaderPreview, Never]):
-	(out, parsed) = parse_implementation_method_header(state)
-	match parsed:
-		ParsedImplementationMethodHeader(method):
-			(out, Ok(Some(method)))
-		RejectedImplementationMethodHeader:
-			(out, Ok(None))
-
-
--- The implementation's own grammar, over methods read by `read_method`. An
--- method the reader stops at ends the parse at once; the caller restores its state.
-pure func parse_implementation_owner[M, S](
-	state: ParseState, visibility: Visibility, documentation: Option[Documentation], start: Span,
-	read_method: pure (ParseState) -> (ParseState, MethodRead[M, S]),
-) -> (ParseState, ImplementationOwnerParse[M, S]):
 	before: Int = state.diagnostic_count()
 	keyword: Span = state.current_span()
 	(after_name, name) = state.advanced().consume_referenced_name(NameInTraitName)
@@ -86,21 +71,21 @@ pure func parse_implementation_owner[M, S](
 		.expect_token(NewlineToken, ExpectedNewline(NewlineInImplementationMethods))
 		.expect_token(IndentToken, ExpectedIndent(IndentInImplementationMethods))
 		.skip_newlines()
-	var methods: List[M] = []
-	var stopped: Option[S] = None
+	var methods: List[ImplementationMethod] = []
+	var stopped: Option[StopPoint] = None
 
 	-- Every token enters method recovery. Missing indentation deliberately
 	-- does not create a source-column guard for unindented method siblings.
 	while not out.at_block_end() and stopped.is_none():
 		method_start: Int = out.position()
-		(after_method, result) = read_method(out)
+		(after_method, result) = parse_implementation_method(out)
 		out = after_method.skip_newlines()
 		match result:
-			Ok(Some(method)):
+			ParsedMethod(method):
 				methods = methods.append(method)
-			Ok(None):
+			RejectedMethod:
 				()
-			Err(stop):
+			DeclinedMethod(stop):
 				stopped = Some(stop)
 
 		if out.position() == method_start and not out.at_block_end():
@@ -112,18 +97,44 @@ pure func parse_implementation_owner[M, S](
 		end = out.current_span()
 		out = out.advanced()
 
-	match stopped:
-		Some(stop):
-			(out, StoppedImplementationOwner(stop))
-		None:
-			if out.diagnostic_count() != before:
-				(out, RejectedImplementationOwner)
-			else:
-				(out, ParsedImplementationOwner({
+	if out.diagnostic_count() != before:
+		-- A diagnostic before a body the parser does not read rejects the
+		-- implementation. One after that body is not seen, since it stops
+		-- reading there (`DISCOVERY_REDESIGN.md`, section 9, D10).
+		(out, RejectedImplementation)
+	else:
+		match stopped:
+			Some(stop):
+				(after_receiver, DeclinedImplementation({
 					visibility = visibility, documentation = documentation, keyword = keyword,
-					trait_name = trait_name, receiver = receiver, methods = methods,
-					span = start.span_covering(end)
-				}))
+					trait_name = trait_name, receiver = receiver, span = start.span_covering(receiver.span)
+				}, stop))
+			None:
+				(declared, declaration) = out.finished_implementation(
+					visibility, documentation, keyword, trait_name, receiver, methods, start.span_covering(end)
+				)
+				(declared, ParsedImplementation(declaration))
+
+
+-- A method's header, then its body read in full, then its definition.
+private pure func parse_implementation_method(state: ParseState) -> (ParseState, ImplementationMethodParse):
+	(after_header, parsed) = parse_implementation_method_header(state)
+	match parsed:
+		RejectedImplementationMethodHeader:
+			(after_header, RejectedMethod)
+		ParsedImplementationMethodHeader(preview):
+			(completed, body) = complete_body(after_header, preview.body)
+			match body:
+				Recognized(read):
+					header = preview.header
+					(declared, method) = completed.finished_implementation_method(
+						header.annotations,
+						{ signature = header.signature, type_parameters = header.type_parameters, constraints = header.constraints, body = Some(read.body) },
+						header.header_span.span_covering(read.span)
+					)
+					(declared, ParsedMethod(method))
+				Declined(stop):
+					(after_header, DeclinedMethod(stop))
 
 
 private pure func at_block_end(state: ParseState) -> Bool:

@@ -1,5 +1,6 @@
--- Every declaration the completing scan leaves as a skipped-body preview says
--- why: the rollback's own result names the construct and the token it stood at.
+-- The declaration the scan stops at, because the tree parser does not read it
+-- in full, says why: the rollback's own result names the construct and the
+-- token it stood at.
 -- Each case is a shape one slice leaves to a later one; the expected reason is
 -- the construct, never a message.
 import:
@@ -7,10 +8,10 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, span_start_line
 	../../../../src/compiler_new/stage_01_discovery/parse/stop_reason: StopReason
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
-		DeclinedDeclaration, DeclinedKind(DeclinedFunction, DeclinedTrait, DeclinedImplementation, DeclinedGlobalInitializer),
-		scan_module_declaration_prefix_with_bodies, scan_module_declaration_previews
+		UnreadDeclaration, UnreadHeader(UnreadFunction, UnreadTrait, UnreadImplementation, UnreadGlobalInitializer),
+		ModuleDeclarationScanStop(StoppedAtUnreadDeclaration), scan_module_declarations
 	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
-	../../support/stop_reason_label: declined_kind_label, stop_reason_label
+	../../support/stop_reason_label: unread_kind_label, stop_reason_label
 	test: TestSuite
 
 
@@ -23,16 +24,32 @@ private pure func hole(text: String) -> String:
 	"$" + "{" + text + "}"
 
 
--- The state after the scan, and the first declaration it could not complete.
-private pure func first_declined(text: String) -> Option[(ParseState, DeclinedDeclaration)]:
+-- The state after the scan, and the declaration it stopped at.
+private pure func first_declined(text: String) -> Option[(ParseState, UnreadDeclaration)]:
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(entry):
-			(state, scan) = scan_module_declaration_prefix_with_bodies(entry)
-			match scan.declined.get(0):
-				Some(declined): Some((state, declined))
-				None: None
+			(state, scan) = scan_module_declarations(entry)
+			match scan.stop:
+				StoppedAtUnreadDeclaration(unread): Some((state, unread))
+				_: None
 		Err(_):
 			None
+
+
+-- Which kind of declaration the scan stopped at.
+private enum UnreadKind:
+	FunctionUnread
+	TraitUnread
+	ImplementationUnread
+	GlobalInitializerUnread
+
+
+private pure func unread_kind(header: UnreadHeader) -> UnreadKind:
+	match header:
+		UnreadFunction(_): FunctionUnread
+		UnreadTrait(_): TraitUnread
+		UnreadImplementation(_): ImplementationUnread
+		UnreadGlobalInitializer(_): GlobalInitializerUnread
 
 
 -- The body of a function `f`, one statement per line, each indented once.
@@ -40,13 +57,13 @@ private pure func function_with(statements: List[String]) -> String:
 	source_lines(["func f(xs: List[Int], c: Bool) -> Int:"].concat(statements.map(pure func(statement): "\t" + statement)))
 
 
-private func declines_as(label: String, text: String, kind: DeclinedKind, reason: StopReason) -> Bool:
+private func declines_as(label: String, text: String, kind: UnreadKind, reason: StopReason) -> Bool:
 	match first_declined(text):
 		Some((_, declined)):
-			if declined.kind == kind and declined.stop.reason == reason:
+			if unread_kind(declined.header) == kind and declined.stop.reason == reason:
 				True
 			else:
-				print("${label}: declined as ${declined.kind.declined_kind_label()} ${declined.stop.reason.stop_reason_label()}")
+				print("${label}: declined as ${declined.header.unread_kind_label()} ${declined.stop.reason.stop_reason_label()}")
 				False
 		None:
 			print("${label}: nothing was declined")
@@ -80,7 +97,7 @@ func test_expression_shapes_are_named() -> Bool:
 		("hole with a second expression", ["x = \"" + hole("a b") + "\"", "x"], InterpolationHoleTrailingTokens),
 		("hole that does not lex", ["x = \"" + hole("\\\"") + "\"", "x"], InterpolationHoleNotLexed)
 	]:
-		correct = declines_as(label, function_with(statements), DeclinedFunction, reason) and correct
+		correct = declines_as(label, function_with(statements), FunctionUnread, reason) and correct
 	correct
 
 
@@ -98,7 +115,7 @@ func test_a_soft_keyword_is_a_block_only_with_the_shape_of_one() -> Bool:
 		("with as a name", ["with = 1", "0"], SoftKeywordName),
 		("after as a name", ["after = 1", "0"], SoftKeywordName)
 	]:
-		correct = declines_as(label, function_with(statements), DeclinedFunction, reason) and correct
+		correct = declines_as(label, function_with(statements), FunctionUnread, reason) and correct
 	correct
 
 
@@ -123,7 +140,7 @@ func test_block_forms_are_named_where_they_are_declined() -> Bool:
 		("concurrent count that is not a positive literal", ["concurrent(max_threads: 0):", "\tuse(1)", "0"], ConcurrentCountNotLiteral),
 		("debug with its body on its line", ["debug: use(1)", "0"], BlockWithoutIndent)
 	]:
-		correct = declines_as(label, function_with(statements), DeclinedFunction, reason) and correct
+		correct = declines_as(label, function_with(statements), FunctionUnread, reason) and correct
 	correct
 
 
@@ -153,7 +170,7 @@ func test_statement_shapes_are_named() -> Bool:
 		("case pattern with a diagnostic", ["match c:", "\t): 1", "0"], InvalidPattern),
 		("case with a nested block on its line", ["match c:", "\tTrue: if c:", "\t\t1", "0"], NestedBlockInCaseLine)
 	]:
-		correct = declines_as(label, function_with(statements), DeclinedFunction, reason) and correct
+		correct = declines_as(label, function_with(statements), FunctionUnread, reason) and correct
 	correct
 
 
@@ -169,27 +186,18 @@ func test_the_rollback_is_located_at_the_construct() -> Bool:
 
 func test_owners_and_globals_decline_with_their_own_kind() -> Bool:
 	var correct: Bool = True
-	correct = declines_as("global initializer", source_lines(["x = {on = 1}"]), DeclinedGlobalInitializer, SoftKeywordFieldName) and correct
+	correct = declines_as("global initializer", source_lines(["x = {on = 1}"]), GlobalInitializerUnread, SoftKeywordFieldName) and correct
 	correct = declines_as(
 		"implementation method",
 		source_lines(["implements Show for Int:", "\tfunc show(x: Int) -> Int:", "\t\tg(if c: 1 else: 2)"]),
-		DeclinedImplementation, BlockWithoutIndent,
+		ImplementationUnread, BlockWithoutIndent,
 	) and correct
 	correct = declines_as(
 		"trait default method",
 		source_lines(["trait Show:", "\tfunc show(x: Int) -> Int:", "\t\tg(if c: 1 else: 2)"]),
-		DeclinedTrait, BlockWithoutIndent,
+		TraitUnread, BlockWithoutIndent,
 	) and correct
 	correct
-
-
-pure func test_a_scan_without_bodies_declines_nothing() -> Bool:
-	match new_parse_state(lex_module(module_id_at_row(0), function_with(["x = g(if c: 1 else: 2)", "x"]))):
-		Ok(entry):
-			(_, scan) = scan_module_declaration_previews(entry)
-			scan.declined.is_empty()
-		Err(_):
-			False
 
 
 tests: TestSuite = {
@@ -199,7 +207,6 @@ tests: TestSuite = {
 		("a soft keyword is a block only with the shape of one", test_a_soft_keyword_is_a_block_only_with_the_shape_of_one),
 		("statement shapes are named", test_statement_shapes_are_named),
 		("the rollback is located at the construct", test_the_rollback_is_located_at_the_construct),
-		("owners and globals decline with their own kind", test_owners_and_globals_decline_with_their_own_kind),
-		("a scan without bodies declines nothing", test_a_scan_without_bodies_declines_nothing)
+		("owners and globals decline with their own kind", test_owners_and_globals_decline_with_their_own_kind)
 	]
 }

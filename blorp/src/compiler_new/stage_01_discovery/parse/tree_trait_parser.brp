@@ -1,7 +1,8 @@
--- Trait ownership over method header previews. Defaults carry lexical body
--- evidence; M4 owns body trees and complete method/trait definition minting.
+-- A trait: its header, then each method read in full in source order (its
+-- header, its default body, its definition), and the trait minted last, so
+-- its ids are post-order without reading anything twice.
 import:
-	../syntax/declarations: TypeParameter, TraitReference
+	../syntax/declarations: TypeParameter, TraitReference, TraitDeclaration, TraitMethod
 	../syntax/module_syntax: Documentation
 	../syntax/names: WrittenName
 	../tables/diagnostic_code: PlainSyntaxCode(ExpectedSupertraitOrMethodsDiagnostic)
@@ -13,68 +14,52 @@ import:
 	../tables/token: TokenKind(ColonSymbol, PlusSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken)
 	parse_state:
 		ParseState, current_kind, current_span, previous_span, position, advanced, diagnostic_count,
-		consume_declared_name, expect_token, report_at_current
+		consume_declared_name, expect_token, report_at_current, finished_trait, finished_trait_method
+	stop_reason: StopPoint, Recognition(Recognized, Declined)
+	tree_body_parser: complete_body
 	tree_type_parameter_parser: TypeParametersParse(NoTypeParameters, ParsedTypeParameters, RejectedTypeParameters), parse_type_parameters
 	tree_trait_reference_parser: parse_trait_reference
-	method_read: MethodRead, Never, absurd
 	tree_trait_method_header_parser:
-		TraitMethodHeaderPreview, TraitMethodHeaderParse(ParsedTraitMethodHeader, RejectedTraitMethodHeader), parse_trait_method_header
+		MethodBodyExtent(AbstractMethod, SkippedDefaultBody), TraitMethodHeaderParse(ParsedTraitMethodHeader, RejectedTraitMethodHeader),
+		parse_trait_method_header
 
 
--- A trait over its methods in whatever form the caller reads them: header
--- previews, or complete methods that own their default bodies' trees.
-record TraitOwner[M] {
+---
+A trait's header: everything before its methods. `span` runs from the
+declaration's start through its name or last supertrait.
+---
+record TraitHeader {
 	visibility: Visibility,
 	documentation: Option[Documentation],
 	name: WrittenName,
 	type_parameters: List[TypeParameter],
 	supertraits: List[TraitReference],
-	methods: List[M],
 	span: Span
 }
 
 
-type alias TraitPreview = TraitOwner[TraitMethodHeaderPreview]
-
-
+---
+A trait read in full; a trait with a diagnostic; or the header of a trait
+with a default body the tree parser does not read, and why.
+---
 union TraitParse:
-	ParsedTrait(TraitPreview)
+	ParsedTrait(TraitDeclaration)
 	RejectedTrait
+	DeclinedTrait(TraitHeader, StopPoint)
 
 
-union TraitOwnerParse[M, S]:
-	ParsedTraitOwner(TraitOwner[M])
-	RejectedTraitOwner
-	StoppedTraitOwner(S)
+-- One method: read and minted, rejected with its diagnostics (the trait reads
+-- on), or a default body the tree parser does not read (the trait stops).
+private union TraitMethodParse:
+	ParsedMethod(TraitMethod)
+	RejectedMethod
+	DeclinedMethod(StopPoint)
 
 
--- The cursor is at `trait`; start includes caller-owned prefixes, if any.
+-- The cursor is at `trait`; start includes caller-owned prefixes, if any. A
+-- declined trait leaves the state after its header: the header's ids stay
+-- issued and nothing of its methods does.
 pure func parse_trait(state: ParseState, visibility: Visibility, documentation: Option[Documentation], start: Span) -> (ParseState, TraitParse):
-	(out, parsed) = parse_trait_owner(state, visibility, documentation, start, read_trait_method_header)
-	match parsed:
-		ParsedTraitOwner(owner):
-			(out, ParsedTrait(owner))
-		RejectedTraitOwner:
-			(out, RejectedTrait)
-		StoppedTraitOwner(stop):
-			absurd(stop)
-
-
-private pure func read_trait_method_header(state: ParseState) -> (ParseState, MethodRead[TraitMethodHeaderPreview, Never]):
-	(out, parsed) = parse_trait_method_header(state)
-	match parsed:
-		ParsedTraitMethodHeader(method):
-			(out, Ok(Some(method)))
-		RejectedTraitMethodHeader:
-			(out, Ok(None))
-
-
--- The trait's own grammar, over methods read by `read_method`. A method the
--- reader stops at ends the parse at once; the caller restores its state.
-pure func parse_trait_owner[M, S](
-	state: ParseState, visibility: Visibility, documentation: Option[Documentation], start: Span,
-	read_method: pure (ParseState) -> (ParseState, MethodRead[M, S]),
-) -> (ParseState, TraitOwnerParse[M, S]):
 	before: Int = state.diagnostic_count()
 	name_position: Span = state.advanced().current_span()
 	(after_name, name) = state.advanced().consume_declared_name(NameInTraitName)
@@ -90,8 +75,8 @@ pure func parse_trait_owner[M, S](
 	var out: ParseState = after_parameters.expect_token(ColonSymbol, ExpectedColon(ColonInTraitName))
 	var end: Span = name_position
 	var supertraits: List[TraitReference] = []
-	var methods: List[M] = []
-	var stopped: Option[S] = None
+	var methods: List[TraitMethod] = []
+	var stopped: Option[StopPoint] = None
 	var has_methods: Bool = False
 
 	if out.current_kind() == NewlineToken:
@@ -118,6 +103,9 @@ pure func parse_trait_owner[M, S](
 			out = out.advanced()
 			has_methods = True
 
+	after_header: ParseState = out
+	header_end: Span = end
+
 	if has_methods:
 		out = out
 			.expect_token(NewlineToken, ExpectedNewline(NewlineInTraitMethods))
@@ -128,15 +116,15 @@ pure func parse_trait_owner[M, S](
 		-- Missing indentation does not create a source-column sibling guard.
 		while not out.at_block_end() and stopped.is_none():
 			method_start: Int = out.position()
-			(after_method, parsed_method) = read_method(out)
+			(after_method, parsed_method) = parse_trait_method(out)
 			out = after_method.skip_newlines()
 
 			match parsed_method:
-				Ok(Some(method)):
+				ParsedMethod(method):
 					methods = methods.append(method)
-				Ok(None):
+				RejectedMethod:
 					()
-				Err(stop):
+				DeclinedMethod(stop):
 					stopped = Some(stop)
 
 			if out.position() == method_start and not out.at_block_end():
@@ -146,22 +134,46 @@ pure func parse_trait_owner[M, S](
 			end = out.current_span()
 			out = out.advanced()
 
-	match stopped:
-		Some(stop):
-			(out, StoppedTraitOwner(stop))
-		None:
-			if out.diagnostic_count() != before:
-				(out, RejectedTraitOwner)
-			else:
-				match (name, parameters):
-					(Some(name), Some(parameters)):
-						(out, ParsedTraitOwner({
-							visibility = visibility, documentation = documentation, name = name,
-							type_parameters = parameters, supertraits = supertraits, methods = methods,
-							span = start.span_covering(end)
-						}))
-					_:
-						(out, RejectedTraitOwner)
+	if out.diagnostic_count() != before:
+		-- A diagnostic before a default body the parser does not read rejects
+		-- the trait. One after that body is not seen, since the trait stops
+		-- reading there (`DISCOVERY_REDESIGN.md`, section 9, D10).
+		(out, RejectedTrait)
+	else:
+		match (name, parameters, stopped):
+			(Some(name), Some(parameters), Some(stop)):
+				(after_header, DeclinedTrait({
+					visibility = visibility, documentation = documentation, name = name,
+					type_parameters = parameters, supertraits = supertraits, span = start.span_covering(header_end)
+				}, stop))
+			(Some(name), Some(parameters), None):
+				(declared, declaration) = out.finished_trait(visibility, documentation, name, parameters, supertraits, methods, start.span_covering(end))
+				(declared, ParsedTrait(declaration))
+			_:
+				(out, RejectedTrait)
+
+
+-- A method's header, then its default body read in full, then its definition.
+private pure func parse_trait_method(state: ParseState) -> (ParseState, TraitMethodParse):
+	(after_header, parsed) = parse_trait_method_header(state)
+	match parsed:
+		RejectedTraitMethodHeader:
+			(after_header, RejectedMethod)
+		ParsedTraitMethodHeader(preview):
+			match preview.body_extent:
+				AbstractMethod:
+					(declared, method) = after_header.finished_trait_method(preview.header.signature, None, preview.header.span)
+					(declared, ParsedMethod(method))
+				SkippedDefaultBody(skipped):
+					(completed, body) = complete_body(after_header, skipped)
+					match body:
+						Recognized(read):
+							(declared, method) = completed.finished_trait_method(
+								preview.header.signature, Some(read.body), preview.header.span.span_covering(read.span)
+							)
+							(declared, ParsedMethod(method))
+						Declined(stop):
+							(after_header, DeclinedMethod(stop))
 
 
 private pure func at_block_end(state: ParseState) -> Bool:

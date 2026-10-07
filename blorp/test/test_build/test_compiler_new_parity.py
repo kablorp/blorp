@@ -743,34 +743,30 @@ class CompilerNewParityTests(unittest.TestCase):
 class StopCensusTest(unittest.TestCase):
 	OUTPUT = "\n".join([
 		"difference ignored.brp | x | y | old=1 | new=2",
-		"stop-reason a.brp | function | multiline-call-arguments | 10 | first",
-		"stop-reason a.brp | function | lambda-header | 30 | later",
-		"stop-reason b.brp | function | multiline-call-arguments | 4 | first",
-		"stop-reason b.brp | function | multiline-call-arguments | 9 | later",
-		"stop-reason c.brp | global-initializer | with-block | 2 | first",
-		"tree-prefix-summary modules=3",
+		"stop-reason a.brp | function | multiline-call-arguments | 10",
+		"stop-reason b.brp | function | multiline-call-arguments | 4",
+		"stop-reason c.brp | global-initializer | with-block | 2",
+		"stop-reason d.brp | trait | lambda-header | 7",
+		"tree-prefix-summary modules=4",
 	])
 
-	def test_counts_first_stops_as_modules_and_every_stop_as_declarations(self) -> None:
+	def test_counts_one_stop_per_module(self) -> None:
 		census = parity.parse_stop_census(self.OUTPUT)
 		calls = census.reasons["multiline-call-arguments"]
-		self.assertEqual((calls.modules, calls.declarations, calls.example), (2, 3, "a.brp:10"))
-		later_only = census.reasons["lambda-header"]
-		self.assertEqual((later_only.modules, later_only.declarations, later_only.example), (0, 1, ""))
-		self.assertEqual(census.kinds, {"function": 2, "global-initializer": 1})
+		self.assertEqual((calls.modules, calls.example), (2, "a.brp:10"))
+		self.assertEqual(census.kinds, {"function": 2, "global-initializer": 1, "trait": 1})
 
-	def test_ranks_by_first_stops_then_declarations_then_name(self) -> None:
+	def test_ranks_by_modules_then_name(self) -> None:
 		table = parity.render_stop_census(parity.parse_stop_census(self.OUTPUT), 5).splitlines()
 		rows = [line.split(" | ")[1] for line in table if line.startswith("| ") and line[2].isdigit()]
-		self.assertEqual(rows, ["multiline-call-arguments", "with-block", "lambda-header"])
-		self.assertIn("| 1 | multiline-call-arguments | 2 | 66.7% | 3 | a.brp:10 |", table)
-		self.assertIn("| 3 | lambda-header | 0 | 0.0% | 1 | - |", table)
+		self.assertEqual(rows, ["multiline-call-arguments", "lambda-header", "with-block"])
+		self.assertIn("| 1 | multiline-call-arguments | 2 | 50.0% | a.brp:10 |", table)
 
 	def test_rejects_a_malformed_line(self) -> None:
 		with self.assertRaises(SystemExit):
-			parity.parse_stop_census("stop-reason a.brp | function | x | 1")
+			parity.parse_stop_census("stop-reason a.brp | function | x")
 		with self.assertRaises(SystemExit):
-			parity.parse_stop_census("stop-reason a.brp | function | x | 1 | middle")
+			parity.parse_stop_census("stop-reason a.brp | function | x | 1 | first")
 
 
 class TargetedRunTest(unittest.TestCase):
@@ -782,25 +778,25 @@ class TargetedRunTest(unittest.TestCase):
 			call()
 		return str(raised.exception.code)
 
+	def test_a_census_stored_in_an_older_format_asks_for_a_full_rerun(self) -> None:
+		older = "stop-reason a.brp | function | with-block | 2 | first"
+		message = self.exit_message(lambda: parity.first_stop_modules(older, "with-block"))
+		self.assertIn("re-run the full census", message)
+
 	def test_first_stop_locations_give_each_modules_line(self) -> None:
-		text = "stop-reason a.brp | function | with-block | 12 | first\nstop-reason a.brp | function | with-block | 30 | later\n"
+		text = "stop-reason a.brp | function | with-block | 12\n"
 		self.assertEqual(parity.first_stop_locations(text, "with-block"), [("a.brp", 12)])
 
 	def test_a_census_line_without_a_line_number_is_an_exit_not_a_crash(self) -> None:
-		text = "stop-reason a.brp | function | with-block | x | first\n"
+		text = "stop-reason a.brp | function | with-block | x\n"
 		message = self.exit_message(lambda: parity.first_stop_locations(text, "with-block"))
 		self.assertIn("malformed stop-reason line", message)
 
-	def test_a_stop_reason_selects_the_modules_whose_first_stop_had_it(self) -> None:
+	def test_a_stop_reason_selects_the_modules_that_stopped_for_it(self) -> None:
 		self.assertEqual(
 			parity.first_stop_modules(self.CENSUS, "multiline-call-arguments"), ["a.brp", "b.brp"]
 		)
-		# a.brp stops later at lambda-header, but its first stop is another reason.
 		self.assertEqual(parity.first_stop_modules(self.CENSUS, "with-block"), ["c.brp"])
-
-	def test_a_reason_that_only_stops_later_declarations_selects_nothing_and_says_so(self) -> None:
-		message = self.exit_message(lambda: parity.first_stop_modules(self.CENSUS, "lambda-header"))
-		self.assertIn("no module's first stop was lambda-header", message)
 
 	def test_an_unknown_reason_lists_the_reasons_the_census_has(self) -> None:
 		message = self.exit_message(lambda: parity.first_stop_modules(self.CENSUS, "multiline-call"))

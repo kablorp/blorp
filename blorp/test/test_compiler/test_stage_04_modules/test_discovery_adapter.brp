@@ -93,13 +93,8 @@ import:
 		RecordPreviewOutcome(PreviewedRecord, RejectedRecordPreview, UnsupportedRecordPreview),
 		preview_record,
 	../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: rejected_diagnostics
-	../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
-		DeclarationPreview(
-			FunctionDeclarationPreview, TraitDeclarationPreview, ImplementationDeclarationPreview,
-		),
-	../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser:
-		FunctionBodyExtent(ForwardDeclaration, SkippedBody),
 	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan as ScanStop
+	../../../src/compiler_new/stage_01_discovery/parse/tree_global_header_parser: GlobalHeaderPreview
 	../../../src/compiler_new/stage_01_discovery/parse/tree_trait_method_header_parser:
 		MethodBodyExtent(AbstractMethod, SkippedDefaultBody),
 	../../../src/compiler_new/stage_01_discovery/parse/union_preview:
@@ -2108,40 +2103,42 @@ func test_graph_identifiers_are_spelled_by_the_stages_name_table() -> Bool:
 			False
 
 
+---
+A value the old parser accepts and the tree parser does not read yet, so the
+scan stops at the global or function that holds it and the projection stops at
+that declaration's header. `inner` is written inside it; a name there must not
+reach the name table. These stops exist only until the tree parser reads every
+body (`docs/DISCOVERY_REDESIGN.md`, section 8, M4 exit criteria). When a slice
+reads this shape, replace it, here and in `TRAIT_HEADER_SOURCE` and
+`IMPLEMENTATION_HEADER_SOURCE`, by one the stop census still lists.
+---
+private pure func unread_value(inner: String) -> String:
+	"into_opaque Count(" + inner + ")"
+
+
+---
+An indented body the tree parser does not read yet, at `indent`, iterating
+`name`; see `unread_value`.
+---
+private pure func unread_block(indent: String, name: String) -> String:
+	"\n" + indent + "for item in " + name + " concurrently(limit: 2):\n" + indent + "\titem"
+
+
 -- The declaration projection deliberately has no ParsedProgram constructor.
 -- Compare the completed leaves individually, including spans, docs and privacy.
+-- The scan reads bodies and initializers where the tree parser reads them.
 func projected(text: String, names: NameTable) -> Option[LegacyDeclarationProjection]:
 	lexed = lex_module(module_id_at_row(0), text)
 
 	match new_parse_state(lexed):
 		Ok(entry):
-			(_, scan) = ScanStop.scan_module_declaration_previews(entry)
+			(_, scan) = ScanStop.scan_module_declarations(entry)
 
 			match legacy_declaration_projection(preview_source(lexed), scan, names):
 				Ok(projection):
 					Some(projection)
 				Err(_):
 					print("declaration projection rejected its scan")
-					None
-		Err(_):
-			None
-
-
--- Explicit body completion opt-in; the M3 preview helper above stays intact.
-func projected_with_atomic_globals(
-	text: String,
-	names: NameTable,
-) -> Option[LegacyDeclarationProjection]:
-	lexed = lex_module(module_id_at_row(0), text)
-
-	match new_parse_state(lexed):
-		Ok(entry):
-			(_, scan) = ScanStop.scan_module_declaration_prefix_with_atomic_globals(entry)
-
-			match legacy_declaration_projection(preview_source(lexed), scan, names):
-				Ok(projection):
-					Some(projection)
-				Err(_):
 					None
 		Err(_):
 			None
@@ -2169,7 +2166,7 @@ func test_float_globals_preserve_checked_digits_in_full_ast() -> Bool:
 				text = "${prefix}value${written_type} = ${digits} -- comment\n-- next comment\nrecord Later {}"
 				existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
-				match projected_with_atomic_globals(text, EMPTY_NAME_TABLE):
+				match projected(text, EMPTY_NAME_TABLE):
 					Some(projection):
 						comparison = declaration_prefix_comparison(existing, projection)
 						correct = (
@@ -2186,10 +2183,10 @@ func test_float_globals_preserve_checked_digits_in_full_ast() -> Bool:
 
 
 func test_mixed_float_globals_preserve_name_table_and_deferred_tail() -> Bool:
-	text = "first = Source\nzero = 0\nprecise: Float = 007.00\nsecond = Source\nblocked = 1.0 + BodyName\nrecord Later {}"
+	text = "first = Source\nzero = 0\nprecise: Float = 007.00\nsecond = Source\nblocked = " + unread_value("1.0 + BodyName") + "\nrecord Later {}"
 	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
-	match projected_with_atomic_globals(text, EMPTY_NAME_TABLE):
+	match projected(text, EMPTY_NAME_TABLE):
 		Some(projection):
 			match (projection.stop, projection.declarations):
 				(StoppedAtGlobalInitializer(_), [VarParsedDecl(first), VarParsedDecl(zero), VarParsedDecl(precise), VarParsedDecl(second)]):
@@ -2216,7 +2213,7 @@ func test_mixed_float_globals_preserve_name_table_and_deferred_tail() -> Bool:
 								and name_table_find_id(projection.names, "Later").is_none()
 							)
 
-							match projected_with_atomic_globals(
+							match projected(
 								"third = 007.00\nfourth = Source",
 								projection.names,
 							):
@@ -2254,7 +2251,7 @@ func test_completed_float_global_json_rejects_normalized_digits() -> Bool:
 	text = "value = 007.00"
 	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
-	match projected_with_atomic_globals(text, EMPTY_NAME_TABLE):
+	match projected(text, EMPTY_NAME_TABLE):
 		Some(projection):
 			match projection.declarations:
 				[VarParsedDecl(global_value)]:
@@ -2287,7 +2284,7 @@ func test_integer_globals_preserve_authored_digits_in_full_ast() -> Bool:
 				text = "${prefix}value${written_type} = ${digits} -- comment\n-- next comment\nrecord Later {}"
 				existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
-				match projected_with_atomic_globals(text, EMPTY_NAME_TABLE):
+				match projected(text, EMPTY_NAME_TABLE):
 					Some(projection):
 						comparison = declaration_prefix_comparison(existing, projection)
 						correct = (
@@ -2306,10 +2303,10 @@ func test_integer_globals_preserve_authored_digits_in_full_ast() -> Bool:
 
 
 func test_mixed_atomic_globals_mint_no_names_for_integer_values() -> Bool:
-	text = "first = Source\nzero = 0\nleading: Int = 007\nsecond = Source\nblocked = 1 + BodyName\nrecord Later {}"
+	text = "first = Source\nzero = 0\nleading: Int = 007\nsecond = Source\nblocked = " + unread_value("1 + BodyName") + "\nrecord Later {}"
 	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
-	match projected_with_atomic_globals(text, EMPTY_NAME_TABLE):
+	match projected(text, EMPTY_NAME_TABLE):
 		Some(projection):
 			match (projection.stop, projection.declarations):
 				(StoppedAtGlobalInitializer(_), [VarParsedDecl(first), VarParsedDecl(zero), VarParsedDecl(leading), VarParsedDecl(second)]):
@@ -2336,7 +2333,7 @@ func test_mixed_atomic_globals_mint_no_names_for_integer_values() -> Bool:
 								and name_table_find_id(projection.names, "Later").is_none()
 							)
 
-							match projected_with_atomic_globals(
+							match projected(
 								"third = 007\nfourth = Source",
 								projection.names,
 							):
@@ -2374,7 +2371,7 @@ func test_completed_integer_global_json_rejects_normalized_digits() -> Bool:
 	text = "value = 007"
 	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
-	match projected_with_atomic_globals(text, EMPTY_NAME_TABLE):
+	match projected(text, EMPTY_NAME_TABLE):
 		Some(projection):
 			match projection.declarations:
 				[VarParsedDecl(global_value)]:
@@ -2412,7 +2409,7 @@ func test_name_initialized_globals_compare_completed_syntax() -> Bool:
 				text = "${prefix}${binding}${written_type} = Source -- comment\n-- next comment\nrecord Later {}"
 				existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
-				match projected_with_atomic_globals(text, EMPTY_NAME_TABLE):
+				match projected(text, EMPTY_NAME_TABLE):
 					Some(projection):
 						comparison = declaration_prefix_comparison(existing, projection)
 
@@ -2435,10 +2432,10 @@ func test_name_initialized_globals_compare_completed_syntax() -> Bool:
 
 
 func test_name_global_projection_reuses_names_and_excludes_deferred_values() -> Bool:
-	text = "first = Source\nsecond = Source\nblocked: Int = Unsupported(BodyName)\nrecord Later {}"
+	text = "first = Source\nsecond = Source\nblocked: Int = " + unread_value("Unsupported(BodyName)") + "\nrecord Later {}"
 	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
-	match projected_with_atomic_globals(text, EMPTY_NAME_TABLE):
+	match projected(text, EMPTY_NAME_TABLE):
 		Some(projection):
 			match (projection.stop, projection.declarations):
 				(StoppedAtGlobalInitializer(_), [VarParsedDecl(first), VarParsedDecl(second)]):
@@ -2463,7 +2460,7 @@ func test_name_global_projection_reuses_names_and_excludes_deferred_values() -> 
 								and name_table_find_id(projection.names, "Later").is_none()
 							)
 
-							match projected_with_atomic_globals("third = Source", projection.names):
+							match projected("third = Source", projection.names):
 								Some(next):
 									match next.declarations:
 										[VarParsedDecl(third)]:
@@ -2498,20 +2495,18 @@ func test_name_global_completion_preserves_unsupported_name_table() -> Bool:
 	var correct: Bool = True
 
 	for initializer in [
-		"Unsupported()",
-		"Unsupported.field",
-		"Unsupported + Other",
 		"Unsupported\n.field",
 		"Unsupported\n\t.field",
-		"(Unsupported)",
 		"123 Other",
 		"\n\tUnsupported",
+		unread_value("Unsupported"),
+		"(" + unread_value("Unsupported") + ")",
 	]:
 		text = "value: Int = ${initializer}\nrecord Later {}"
 
 		match (
 			projected(text, EMPTY_NAME_TABLE),
-			projected_with_atomic_globals(text, EMPTY_NAME_TABLE),
+			projected(text, EMPTY_NAME_TABLE),
 		):
 			(Some(before), Some(after)):
 				match (before.stop, after.stop):
@@ -2540,15 +2535,15 @@ func test_name_global_completion_preserves_earlier_deferred_owner_precedence() -
 	var correct: Bool = True
 
 	for earlier in [
-		"func chosen() -> Int: BodyName",
-		"trait Chosen:\n\tfunc method() -> Int",
-		"implements Eq for Int:\n\tfunc equals(self: Int, other: Int) -> Bool: True",
+		"func chosen() -> Int: " + unread_value("BodyName"),
+		"trait Chosen:\n\tfunc method() -> Int: " + unread_value("BodyName"),
+		"implements Eq for Int:\n\tfunc equals(self: Int, other: Int) -> Bool: " + unread_value("BodyName"),
 	]:
 		text = "${earlier}\nlater = LaterSource\nrecord Last {}"
 
 		match (
 			projected(text, EMPTY_NAME_TABLE),
-			projected_with_atomic_globals(text, EMPTY_NAME_TABLE),
+			projected(text, EMPTY_NAME_TABLE),
 		):
 			(Some(before), Some(after)):
 				correct = (
@@ -2570,7 +2565,7 @@ func test_completed_name_global_full_json_rejects_changed_value() -> Bool:
 	text = "value = Source"
 	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
-	match projected_with_atomic_globals(text, EMPTY_NAME_TABLE):
+	match projected(text, EMPTY_NAME_TABLE):
 		Some(projection):
 			match projection.declarations:
 				[VarParsedDecl(global_value)]:
@@ -2749,32 +2744,53 @@ func test_declaration_projection_preserves_preseeded_name_ids() -> Bool:
 			False
 
 
--- The scan may retain later previews. A function stop translates its header
--- names, while deferred bodies and later declarations stay outside the prefix.
+-- The header the scan stopped at, when it stopped at an unread declaration.
+private pure func unread_header(scan: ScanStop.ModuleDeclarationScan) -> Option[ScanStop.UnreadHeader]:
+	match scan.stop:
+		ScanStop.StoppedAtUnreadDeclaration(unread):
+			Some(unread.header)
+		_:
+			None
+
+
+-- The global the scan stopped at, with its unread declaration.
+private pure func unread_global(scan: ScanStop.ModuleDeclarationScan) -> Option[(ScanStop.UnreadDeclaration, GlobalHeaderPreview)]:
+	match scan.stop:
+		ScanStop.StoppedAtUnreadDeclaration(unread):
+			match unread.header:
+				ScanStop.UnreadGlobalInitializer(preview):
+					Some((unread, preview))
+				_:
+					None
+		_:
+			None
+
+
+-- A stop translates its header names, while the unread body and later
+-- declarations stay outside the prefix.
 func test_declaration_projection_stops_at_function_trait_and_implementation() -> Bool:
 	var correct: Bool = True
 
 	for deferred in [
-		"func deferred(): 1",
-		"func deferred():\n",
-		"trait Deferred:\n\tfunc method() -> Int",
-		"implements Eq for Int:\n\tfunc equals(self: Int, other: Int) -> Bool: True",
+		"func deferred(): " + unread_value("1"),
+		"trait Deferred:\n\tfunc method() -> Int: " + unread_value("1"),
+		"implements Eq for Int:\n\tfunc equals(self: Int, other: Int) -> Bool: " + unread_value("True"),
 	]:
 		text = "record Before {}\n${deferred}\nrecord After {}"
 		lexed = lex_module(module_id_at_row(0), text)
 
 		match new_parse_state(lexed):
 			Ok(entry):
-				(_, scan) = ScanStop.scan_module_declaration_previews(entry)
+				(_, scan) = ScanStop.scan_module_declarations(entry)
 
 				match legacy_declaration_projection(preview_source(lexed), scan, EMPTY_NAME_TABLE):
 					Ok(projection):
-						match (scan.declarations.get(1), projection.stop):
-							(Some(FunctionDeclarationPreview(preview)), StoppedAtFunctionHeader(stopped)):
+						match (unread_header(scan), projection.stop):
+							(Some(ScanStop.UnreadFunction(header)), StoppedAtFunctionHeader(stopped)):
 								correct = (
 									correct
-									and stopped.header_span.span_start() == preview.header.header_span.span_start()
-									and stopped.header_span.span_end() == preview.header.header_span.span_end()
+									and stopped.header_span.span_start() == header.header_span.span_start()
+									and stopped.header_span.span_end() == header.header_span.span_end()
 								)
 								correct = (
 									correct
@@ -2782,29 +2798,29 @@ func test_declaration_projection_stops_at_function_trait_and_implementation() ->
 										projection.names,
 									) == ["Before", "deferred"]
 								)
-							(Some(TraitDeclarationPreview(preview)), StoppedAtTraitPreview(stopped)):
+							(Some(ScanStop.UnreadTrait(preview)), StoppedAtTraitPreview(stopped)):
 								correct = (
 									correct
-									and stopped.owner_span.span_start() == preview.span.span_start()
-									and stopped.owner_span.span_end() == preview.span.span_end()
+									and stopped.header_span.span_start() == preview.span.span_start()
+									and stopped.header_span.span_end() == preview.span.span_end()
 								)
 								correct = (
 									correct
 									and name_table_spellings(
 										projection.names,
-									) == ["Before", "Deferred", "method", "Int"]
+									) == ["Before", "Deferred"]
 								)
-							(Some(ImplementationDeclarationPreview(preview)), StoppedAtImplementationPreview(stopped)):
+							(Some(ScanStop.UnreadImplementation(preview)), StoppedAtImplementationPreview(stopped)):
 								correct = (
 									correct
-									and stopped.owner_span.span_start() == preview.span.span_start()
-									and stopped.owner_span.span_end() == preview.span.span_end()
+									and stopped.header_span.span_start() == preview.span.span_start()
+									and stopped.header_span.span_end() == preview.span.span_end()
 								)
 								correct = (
 									correct
 									and name_table_spellings(
 										projection.names,
-									) == ["Before", "Eq", "Int", "equals", "self", "other", "Bool"]
+									) == ["Before", "Eq", "Int"]
 								)
 							_:
 								correct = False
@@ -2822,7 +2838,7 @@ func test_declaration_projection_maps_scan_hard_stops_without_later_names() -> B
 	var correct: Bool = True
 
 	for tail in [
-		"value: Int = 1\nrecord After {}",
+		"value: Int = " + unread_value("1") + "\nrecord After {}",
 		"if = 1\nrecord After {}",
 		"123\nrecord After {}",
 	]:
@@ -2861,10 +2877,9 @@ func test_declaration_projection_maps_scan_hard_stops_without_later_names() -> B
 
 func test_declaration_projection_preserves_no_progress_stop() -> Bool:
 	lexed = lex_module(module_id_at_row(0), "")
-	scan: ScanStop.ModuleDeclarationPreviewScan = {
+	scan: ScanStop.ModuleDeclarationScan = {
 		documentation = None,
-		declarations = [],
-		declined = [],
+		items = [],
 		stop = ScanStop.StoppedWithoutDeclarationProgress
 	}
 
@@ -2888,7 +2903,7 @@ func test_declaration_projection_fails_closed_on_missing_dimension_token() -> Bo
 
 	match new_parse_state(lexed):
 		Ok(entry):
-			(_, scan) = ScanStop.scan_module_declaration_previews(entry)
+			(_, scan) = ScanStop.scan_module_declarations(entry)
 			broken_source: PreviewSource = {
 				source = lexed.source,
 				tokens = [],
@@ -2905,14 +2920,14 @@ func test_declaration_projection_fails_closed_on_missing_dimension_token() -> Bo
 
 
 func test_declaration_projection_fails_closed_on_invalid_global_initializer_cursor() -> Bool:
-	lexed = lex_module(module_id_at_row(0), "record Before {}\nvalue: Int = (1 + 2)")
+	lexed = lex_module(module_id_at_row(0), "record Before {}\nvalue: Int = (" + unread_value("1 + 2") + ")")
 
 	match new_parse_state(lexed):
 		Ok(entry):
-			(_, scan) = ScanStop.scan_module_declaration_previews(entry)
+			(_, scan) = ScanStop.scan_module_declarations(entry)
 
-			match scan.stop:
-				ScanStop.StoppedAtGlobalInitializer(preview):
+			match unread_global(scan):
+				Some((unread, preview)):
 					var correct: Bool = True
 
 					for token_start in [
@@ -2922,13 +2937,15 @@ func test_declaration_projection_fails_closed_on_invalid_global_initializer_curs
 						lexed.tokens.length(),
 					]:
 						changed = { scan |
-							stop = ScanStop.StoppedAtGlobalInitializer(
-								{ preview |
-									initializer = { preview.initializer |
-										token_start = token_start
-									}
-								},
-							)
+							stop = ScanStop.StoppedAtUnreadDeclaration({ unread |
+								header = ScanStop.UnreadGlobalInitializer(
+									{ preview |
+										initializer = { preview.initializer |
+											token_start = token_start
+										}
+									},
+								)
+							})
 						}
 
 						match legacy_declaration_projection(
@@ -3091,10 +3108,10 @@ func test_prefix_comparison_validates_forward_authored_and_private_functions() -
 	var correct: Bool = True
 
 	for deferred in [
-		"func next() -> Int: 1",
-		"func next() -> Int:\n\t1",
-		"private func next() -> Int: 1",
-		"---\nDoc.\n---\nprivate pure func next() -> Int: 1",
+		"func next() -> Int: " + unread_value("1"),
+		"func next() -> Int:" + unread_block("\t", "items"),
+		"private func next() -> Int: " + unread_value("1"),
+		"---\nDoc.\n---\nprivate pure func next() -> Int: " + unread_value("1"),
 	]:
 		correct = prefix_matches(
 			"record Before {}\n${deferred}\nrecord After {}",
@@ -3103,6 +3120,8 @@ func test_prefix_comparison_validates_forward_authored_and_private_functions() -
 			FunctionHeaderPrefixStop,
 		) and correct
 
+	-- A forward declaration is read in full, so a paired one is compared as a
+	-- whole declaration, its frozen shorter span included.
 	for paired in [
 		"func next() -> Int:\n\nfunc next() -> Int: 1",
 		"func next() -> Int :\n\nfunc next() -> Int: 1",
@@ -3110,9 +3129,9 @@ func test_prefix_comparison_validates_forward_authored_and_private_functions() -
 	]:
 		correct = prefix_matches(
 			"record Before {}\n${paired}\nrecord After {}",
-			1,
+			4,
 			[RecordPrefix, FunctionPrefix],
-			FunctionHeaderPrefixStop,
+			EndOfSourcePrefixStop,
 		) and correct
 
 	correct
@@ -3125,12 +3144,13 @@ func test_function_header_projection_compares_rich_authored_and_forward_headers(
 	var correct: Bool = True
 
 	-- Pair the forward declaration so the independent old module oracle accepts
-	-- it. The later definition remains outside the bounded projection.
-	for (text, forward) in [
-		("${FUNCTION_HEADER_SOURCE}\n\tvalue\nrecord Later {}", False),
+	-- it. A forward declaration is read in full, so the projection stops at the
+	-- definition after it, whose body it does not read.
+	for (text, completed) in [
+		(FUNCTION_HEADER_SOURCE + unread_block("\t", "value") + "\nrecord Later {}", 0),
 		(
-			"${FUNCTION_HEADER_SOURCE}\n\n${FUNCTION_HEADER_SOURCE}\n\tvalue\nrecord Later {}",
-			True,
+			FUNCTION_HEADER_SOURCE + "\n\n" + FUNCTION_HEADER_SOURCE + unread_block("\t", "value") + "\nrecord Later {}",
+			1,
 		),
 	]:
 		existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
@@ -3143,21 +3163,14 @@ func test_function_header_projection_compares_rich_authored_and_forward_headers(
 						translated: LegacyFunctionHeaderPreview = preview
 						header: ParsedFunctionHeader = translated.header
 
-						body_matches: Bool = match translated.body_extent:
-							ForwardDeclaration:
-								forward
-							SkippedBody(_):
-								not forward
-
 						comparison = declaration_prefix_comparison(existing, projection)
 						correct = (
 							correct
 							and existing.diagnostics.is_empty()
-							and projection.declarations.is_empty()
+							and projection.declarations.length() == completed
 							and comparison.differences.is_empty()
-							and comparison.completed_declarations == 0
+							and comparison.completed_declarations == completed
 							and comparison.declaration_kinds == [FunctionPrefix]
-							and body_matches
 							and translated.visibility == PrivateVisibility
 							and header.name.text == "apply"
 							and header.keyword_span.is_some()
@@ -3195,7 +3208,7 @@ private func changed_function_header_reports(
 
 
 func test_function_header_comparison_reports_independent_structural_mutations() -> Bool:
-	text = "${FUNCTION_HEADER_SOURCE}\n\tvalue"
+	text = FUNCTION_HEADER_SOURCE + unread_block("\t", "value")
 	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
 	match projected(text, EMPTY_NAME_TABLE):
@@ -3334,7 +3347,7 @@ func test_function_header_comparison_reports_independent_structural_mutations() 
 
 
 func test_function_header_stop_threads_authored_names_into_next_module() -> Bool:
-	text = "record Before {}\n${FUNCTION_HEADER_SOURCE}\n\tBodyOnlyName\nrecord LaterOnlyName {}"
+	text = "record Before {}\n" + FUNCTION_HEADER_SOURCE + unread_block("\t", "BodyOnlyName") + "\nrecord LaterOnlyName {}"
 
 	match projected(text, EMPTY_NAME_TABLE):
 		Some(first):
@@ -3406,63 +3419,18 @@ func test_function_header_stop_threads_authored_names_into_next_module() -> Bool
 			False
 
 
-func test_prefix_comparison_rejects_forward_header_extended_to_next_function_colon() -> Bool:
-	text = "record Before {}\nfunc next() -> Int:\n\nfunc next() -> Int: 1\nrecord After {}"
-	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
-	second_colon_start = "record Before {}\nfunc next() -> Int:\n\nfunc next() -> Int".length()
-
-	match projected(text, EMPTY_NAME_TABLE):
-		Some(projection):
-			match projection.stop:
-				StoppedAtFunctionHeader(preview):
-					match preview.body_extent:
-						ForwardDeclaration:
-							header_span = preview.header_span
-							second_colon = pack_span(
-								header_span.span_source(),
-								second_colon_start,
-								second_colon_start + 1,
-							)
-							extended_span = pack_span(
-								header_span.span_source(),
-								header_span.span_start(),
-								second_colon.span_end(),
-							)
-							changed = { preview |
-								body_colon = second_colon,
-								header_span = extended_span
-							}
-							comparison = declaration_prefix_comparison(
-								existing,
-								{ projection | stop = StoppedAtFunctionHeader(changed) },
-							)
-							(
-								existing.diagnostics.is_empty()
-								and comparison.differences.any(
-									pure func(difference): difference.path == "stop.end",
-								)
-								and comparison.declaration_kinds == [RecordPrefix]
-							)
-						_:
-							False
-				_:
-					False
-		None:
-			False
-
-
 func test_prefix_comparison_validates_trait_and_implementation_private_outer_spans() -> Bool:
 	var correct: Bool = True
 
 	for prefix in ["", "private ", "---\nDoc.\n---\nprivate "]:
 		correct = prefix_matches(
-			"record Before {}\n${prefix}trait Next:\n\tfunc method() -> Int\nrecord After {}",
+			"record Before {}\n${prefix}trait Next:\n\tfunc method() -> Int: " + unread_value("1") + "\nrecord After {}",
 			1,
 			[RecordPrefix, TraitPrefix],
 			TraitPreviewPrefixStop,
 		) and correct
 		correct = prefix_matches(
-			"record Before {}\n${prefix}implements Eq for Int:\n\tfunc equals(self: Int, other: Int) -> Bool: True\nrecord After {}",
+			"record Before {}\n${prefix}implements Eq for Int:\n\tfunc equals(self: Int, other: Int) -> Bool: " + unread_value("True") + "\nrecord After {}",
 			1,
 			[RecordPrefix, ImplementationPrefix],
 			ImplementationPreviewPrefixStop,
@@ -3474,16 +3442,16 @@ func test_prefix_comparison_validates_trait_and_implementation_private_outer_spa
 func test_prefix_comparison_rejects_wrong_next_kind_start_and_outside_extent() -> Bool:
 	var correct: Bool = True
 
-	wrong_kind = match projected("wrong = 1", EMPTY_NAME_TABLE):
+	wrong_kind = match projected("wrong = " + unread_value("1"), EMPTY_NAME_TABLE):
 		Some(projection):
 			projection.stop
 		None:
 			StoppedAtRejectedDeclaration
 
 	for deferred in [
-		"private func next() -> Int: 1",
-		"private trait Next:\n\tfunc method() -> Int",
-		"private implements Eq for Int:\n\tfunc equals(self: Int, other: Int) -> Bool: True",
+		"private func next() -> Int: " + unread_value("1"),
+		"private trait Next:\n\tfunc method() -> Int: " + unread_value("1"),
+		"private implements Eq for Int:\n\tfunc equals(self: Int, other: Int) -> Bool: " + unread_value("True"),
 	]:
 		text = "record Before {}\n${deferred}"
 		existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
@@ -3494,9 +3462,9 @@ func test_prefix_comparison_rejects_wrong_next_kind_start_and_outside_extent() -
 					StoppedAtFunctionHeader(preview):
 						preview.header_span
 					StoppedAtTraitPreview(preview):
-						preview.owner_span
+						preview.header_span
 					StoppedAtImplementationPreview(preview):
-						preview.owner_span
+						preview.header_span
 					_:
 						correct = False
 						pack_span(source_id_at_row(0), 0, 0)
@@ -3517,9 +3485,9 @@ func test_prefix_comparison_rejects_wrong_next_kind_start_and_outside_extent() -
 						StoppedAtFunctionHeader(preview):
 							StoppedAtFunctionHeader({ preview | header_span = span })
 						StoppedAtTraitPreview(preview):
-							StoppedAtTraitPreview({ preview | owner_span = span })
+							StoppedAtTraitPreview({ preview | header_span = span })
 						StoppedAtImplementationPreview(preview):
-							StoppedAtImplementationPreview({ preview | owner_span = span })
+							StoppedAtImplementationPreview({ preview | header_span = span })
 						_:
 							ReachedEndOfSource
 
@@ -3548,7 +3516,7 @@ func test_prefix_comparison_rejects_wrong_next_kind_start_and_outside_extent() -
 
 
 func test_prefix_comparison_rejects_premature_eof_extra_old_declarations_and_missing_next() -> Bool:
-	text = "record Before {}\nfunc next() -> Int: 1\nrecord After {}"
+	text = "record Before {}\nfunc next() -> Int: " + unread_value("1") + "\nrecord After {}"
 	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
 	match projected(text, EMPTY_NAME_TABLE):
@@ -3576,9 +3544,9 @@ func test_prefix_comparison_validates_constant_mutable_private_and_grouped_globa
 	var correct: Bool = True
 
 	for global in [
-		"value = (1)",
-		"value: Int = (1 + 2)",
-		"---\nDoc.\n---\nprivate value: Int = (1)",
+		"value = (" + unread_value("1") + ")",
+		"value: Int = (" + unread_value("1 + 2") + ")",
+		"---\nDoc.\n---\nprivate value: Int = (" + unread_value("1") + ")",
 	]:
 		correct = prefix_matches(
 			"record Before {}\n${global}\nrecord After {}",
@@ -3588,9 +3556,9 @@ func test_prefix_comparison_validates_constant_mutable_private_and_grouped_globa
 		) and correct
 
 	for global in [
-		"var value = (1)",
-		"private var value: Int = (1 + 2)",
-		"---\nDoc.\n---\nprivate var value: Int = (1)",
+		"var value = (" + unread_value("1") + ")",
+		"private var value: Int = (" + unread_value("1 + 2") + ")",
+		"---\nDoc.\n---\nprivate var value: Int = (" + unread_value("1") + ")",
 	]:
 		correct = prefix_matches(
 			"record Before {}\n${global}\nrecord After {}",
@@ -3621,7 +3589,7 @@ func test_global_header_projection_compares_public_private_mutable_and_optional_
 				else:
 					"global"
 
-				text = "record Before {}\n${prefix}${binding}${written_type} = InitializerOnlyName\nrecord LaterOnlyName {}"
+				text = "record Before {}\n${prefix}${binding}${written_type} = " + unread_value("InitializerOnlyName") + "\nrecord LaterOnlyName {}"
 				existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
 				match projected(text, EMPTY_NAME_TABLE):
@@ -3662,7 +3630,7 @@ func test_global_header_projection_compares_public_private_mutable_and_optional_
 
 
 func test_global_header_comparison_reports_independent_structural_mutations() -> Bool:
-	text = "record Before {}\n---\nGlobal documentation.\n---\nprivate var global: ${GLOBAL_HEADER_TYPE} = InitializerOnlyName"
+	text = "record Before {}\n---\nGlobal documentation.\n---\nprivate var global: ${GLOBAL_HEADER_TYPE} = " + unread_value("InitializerOnlyName")
 	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
 	match projected(text, EMPTY_NAME_TABLE):
@@ -3832,7 +3800,7 @@ func test_global_header_comparison_reports_independent_structural_mutations() ->
 
 
 func test_global_header_stop_threads_only_selected_header_names_across_modules() -> Bool:
-	text = "record Before {}\nglobal: ${GLOBAL_HEADER_TYPE} = InitializerOnlyName\nrecord LaterOnlyName {}"
+	text = "record Before {}\nglobal: ${GLOBAL_HEADER_TYPE} = " + unread_value("InitializerOnlyName") + "\nrecord LaterOnlyName {}"
 
 	match projected(text, EMPTY_NAME_TABLE):
 		Some(first):
@@ -3889,7 +3857,7 @@ func test_global_header_stop_threads_only_selected_header_names_across_modules()
 
 
 func test_function_stop_excludes_a_later_global_header_names() -> Bool:
-	text = "record Before {}\nfunc chosen(value: Int) -> Int: BodyOnlyName\nlater_global: m.LaterType = InitializerOnlyName"
+	text = "record Before {}\nfunc chosen(value: Int) -> Int: " + unread_value("BodyOnlyName") + "\nlater_global: m.LaterType = InitializerOnlyName"
 
 	match projected(text, EMPTY_NAME_TABLE):
 		Some(projection):
@@ -3913,7 +3881,7 @@ func test_function_stop_excludes_a_later_global_header_names() -> Bool:
 func test_prefix_comparison_global_anchor_is_declaration_start_not_grouped_expression_start(
 
 ) -> Bool:
-	text = "record Before {}\nprivate var value: Int = (1 + 2)"
+	text = "record Before {}\nprivate var value: Int = (" + unread_value("1 + 2") + ")"
 	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
 	match projected(text, EMPTY_NAME_TABLE):
@@ -3949,7 +3917,7 @@ func test_prefix_comparison_global_anchor_is_declaration_start_not_grouped_expre
 func test_prefix_comparison_global_initializer_entry_preserves_layout_and_grouping() -> Bool:
 	var correct: Bool = True
 
-	for initializer in ["(1 + 2)", "\n\t(1 + 2)", "-- comment before value\n\t(1 + 2)"]:
+	for initializer in ["(" + unread_value("1 + 2") + ")", "\n\t(1 + 2)", "-- comment before value\n\t(1 + 2)"]:
 		correct = prefix_matches(
 			"record Before {}\nprivate var value: Int = ${initializer}",
 			1,
@@ -3961,7 +3929,7 @@ func test_prefix_comparison_global_initializer_entry_preserves_layout_and_groupi
 
 
 func test_prefix_comparison_rejects_changed_global_header_evidence() -> Bool:
-	text = "record Before {}\n---\nDoc.\n---\nprivate var value: Int = (1)"
+	text = "record Before {}\n---\nDoc.\n---\nprivate var value: Int = (" + unread_value("1") + ")"
 	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
 	match projected(text, EMPTY_NAME_TABLE):
@@ -4016,7 +3984,7 @@ func test_prefix_comparison_rejects_changed_global_header_evidence() -> Bool:
 
 
 func test_prefix_comparison_rejects_changed_global_initializer_entry() -> Bool:
-	text = "record Before {}\nprivate var value: Int = (1 + 2)"
+	text = "record Before {}\nprivate var value: Int = (" + unread_value("1 + 2") + ")"
 	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
 
 	match projected(text, EMPTY_NAME_TABLE):
@@ -4105,9 +4073,9 @@ func test_prefix_comparison_rejected_and_no_progress_stops_are_always_difference
 			False
 
 
-private TRAIT_HEADER_SOURCE: String = "---\nTrait documentation.\n---\nprivate trait Shape[T: m.Eq + Hashable, #N]: m.Base + Printable:\n\tpure func area(self: T, pair: (Int, Int), _: Int) -> m.Output[#N]\n\tfunc describe(self: T) -> String:\n\t\tBodyOnlyName"
+private TRAIT_HEADER_SOURCE: String = "---\nTrait documentation.\n---\nprivate trait Shape[T: m.Eq + Hashable, #N]: m.Base + Printable:\n\tpure func area(self: T, pair: (Int, Int), _: Int) -> m.Output[#N]\n\tfunc describe(self: T) -> String:\n\t\tfor item in BodyOnlyName concurrently(limit: 2):\n\t\t\titem"
 
-private IMPLEMENTATION_HEADER_SOURCE: String = "---\nImplementation documentation.\n---\nprivate implements Shape for m.Box[List[n.Item], #03, #N]:\n\t@tail_recursive\n\tpure func apply[T: m.Eq, #M](self: m.Box[T], value: T) -> T where #M == #N:\n\t\tBodyOnlyName\n\tfunc describe(self: m.Box[Int]) -> String: OtherBodyOnlyName"
+private IMPLEMENTATION_HEADER_SOURCE: String = "---\nImplementation documentation.\n---\nprivate implements Shape for m.Box[List[n.Item], #03, #N]:\n\t@tail_recursive\n\tpure func apply[T: m.Eq, #M](self: m.Box[T], value: T) -> T where #M == #N:\n\t\tfor item in BodyOnlyName concurrently(limit: 2):\n\t\t\titem\n\tfunc describe(self: m.Box[Int]) -> String: into_opaque Count(OtherBodyOnlyName)"
 
 
 func test_trait_header_projection_preserves_structural_syntax() -> Bool:
@@ -4129,7 +4097,7 @@ func test_trait_header_projection_preserves_structural_syntax() -> Bool:
 						and header.name.text == "Shape"
 						and header.type_params.length() == 2
 						and header.supertraits.length() == 2
-						and header.methods.length() == 2
+						and header.methods.is_empty()
 						and header.doc == Some("Trait documentation.")
 						and translated.visibility == PrivateVisibility
 					)
@@ -4156,7 +4124,7 @@ func test_implementation_header_projection_preserves_structural_syntax() -> Bool
 						and comparison.completed_declarations == 1
 						and comparison.declaration_kinds == [RecordPrefix, ImplementationPrefix]
 						and header.trait_name.text == "Shape"
-						and header.methods.length() == 2
+						and header.methods.is_empty()
 						and header.doc == Some("Implementation documentation.")
 						and translated.visibility == PrivateVisibility
 					)
@@ -4183,14 +4151,6 @@ func test_trait_and_implementation_stop_names_follow_header_order_across_modules
 					"#N",
 					"Base",
 					"Printable",
-					"area",
-					"self",
-					"pair",
-					"Int",
-					"_",
-					"Output",
-					"describe",
-					"String",
 				],
 			),
 			(
@@ -4204,15 +4164,6 @@ func test_trait_and_implementation_stop_names_follow_header_order_across_modules
 					"n",
 					"Item",
 					"#N",
-					"apply",
-					"T",
-					"Eq",
-					"#M",
-					"self",
-					"value",
-					"describe",
-					"Int",
-					"String",
 				],
 			),
 		]
@@ -4230,7 +4181,9 @@ func test_trait_and_implementation_stop_names_follow_header_order_across_modules
 					and name_table_find_id(first.names, "LaterOnlyName").is_none()
 				)
 
-				match projected("record Next { self: T }", first.names):
+				-- The owner's methods are not read, so only its header's names are
+				-- shared with the next module.
+				match projected("record Next { value: Shape }", first.names):
 					Some(second):
 						match second.declarations:
 							[RecordParsedDecl(next_record)]:
@@ -4242,14 +4195,14 @@ func test_trait_and_implementation_stop_names_follow_header_order_across_modules
 													correct
 													and name_table_spellings(
 														second.names,
-													) == expected.append("Next")
+													) == expected.append("Next").append("value")
 													and name_table_find_id(
 														first.names,
-														"self",
-													) == Some(field.name.name)
+														"value",
+													).is_none()
 													and name_table_find_id(
 														first.names,
-														"T",
+														"Shape",
 													) == Some(target.name)
 												)
 											_:
@@ -4282,129 +4235,81 @@ func test_trait_and_implementation_comparison_rejects_changed_header_evidence() 
 
 				match projection.stop:
 					StoppedAtTraitPreview(preview):
-						match preview.methods:
-							[first, second]:
-								for changed in (
-									[
-										{ preview | doc = Some("Changed documentation.") },
-										{ preview | visibility = PublicVisibility },
-										{ preview | owner_span = first.header_span },
-										{ preview |
-											methods = [
-												{ first |
-													header = { first.header | is_pure = False }
-												},
-												second,
-											]
-										},
-										{ preview |
-											methods = [
-												{ first | body_extent = second.body_extent },
-												second,
-											]
-										},
-										{ preview |
-											methods = [
-												{ first | header_span = second.header_span },
-												second,
-											]
-										},
-									]
-								):
-									comparison = declaration_prefix_comparison(
-										existing,
-										{ projection | stop = StoppedAtTraitPreview(changed) },
-									)
-									correct = (
-										correct
-										and not comparison.differences.is_empty()
-										and comparison.declaration_kinds.is_empty()
-									)
-
-								reordered = declaration_prefix_comparison(
-									existing,
-									{ projection | stop = StoppedAtTraitPreview(
-											{ preview | methods = [second, first] },
-										) },
-								)
-								correct = (
-									correct
-									and reordered.differences.any(
-										pure func(
-											difference,
-										): difference.path == "stop.header.methods[0].name.text",
-									)
-									and reordered.declaration_kinds.is_empty()
-								)
-							_:
-								correct = False
+						shifted = pack_span(
+							preview.header_span.span_source(),
+							preview.header_span.span_start() + 1,
+							preview.header_span.span_end(),
+						)
+						for changed in (
+							[
+								{ preview | doc = Some("Changed documentation.") },
+								{ preview | visibility = PublicVisibility },
+								{ preview | header_span = shifted },
+								{ preview | supertraits = preview.supertraits.reverse() },
+							]
+						):
+							comparison = declaration_prefix_comparison(
+								existing,
+								{ projection | stop = StoppedAtTraitPreview(changed) },
+							)
+							correct = (
+								correct
+								and not comparison.differences.is_empty()
+								and comparison.declaration_kinds.is_empty()
+							)
 					StoppedAtImplementationPreview(preview):
-						match preview.methods:
-							[first, second]:
-								for changed in (
-									[
-										{ preview | doc = Some("Changed documentation.") },
-										{ preview | visibility = PublicVisibility },
-										{ preview | owner_span = first.header_span },
-										{ preview |
-											methods = [
-												{ first |
-													header = { first.header | is_pure = False }
-												},
-												second,
-											]
-										},
-										{ preview | methods = [first] },
-										{ preview |
-											methods = [
-												{ first | header_span = second.header_span },
-												second,
-											]
-										},
-									]
-								):
-									comparison = declaration_prefix_comparison(
-										existing,
-										{ projection |
-											stop = StoppedAtImplementationPreview(changed)
-										},
-									)
-									correct = (
-										correct
-										and not comparison.differences.is_empty()
-										and comparison.declaration_kinds.is_empty()
-									)
+						shifted = pack_span(
+							preview.header_span.span_source(),
+							preview.header_span.span_start() + 1,
+							preview.header_span.span_end(),
+						)
+						for changed in (
+							[
+								{ preview | doc = Some("Changed documentation.") },
+								{ preview | visibility = PublicVisibility },
+								{ preview | header_span = shifted },
+							]
+						):
+							comparison = declaration_prefix_comparison(
+								existing,
+								{ projection |
+									stop = StoppedAtImplementationPreview(changed)
+								},
+							)
+							correct = (
+								correct
+								and not comparison.differences.is_empty()
+								and comparison.declaration_kinds.is_empty()
+							)
 
-								changed_receiver = match preview.for_type:
-									ParsedQualifiedNamedType(qualifier, _, arguments, span):
-										ParsedQualifiedNamedType(
-											qualifier,
-											preview.trait_name,
-											arguments,
-											span,
-										)
-									written:
-										written
+						changed_receiver = match preview.for_type:
+							ParsedQualifiedNamedType(qualifier, _, arguments, span):
+								ParsedQualifiedNamedType(
+									qualifier,
+									preview.trait_name,
+									arguments,
+									span,
+								)
+							written:
+								written
 
-								receiver_comparison = declaration_prefix_comparison(
-									existing,
-									{ projection |
-										stop = StoppedAtImplementationPreview(
-											{ preview | for_type = changed_receiver },
-										)
-									},
+						receiver_comparison = declaration_prefix_comparison(
+							existing,
+							{ projection |
+								stop = StoppedAtImplementationPreview(
+									{ preview | for_type = changed_receiver },
 								)
-								correct = (
-									correct
-									and receiver_comparison.differences.any(
-										pure func(
-											difference,
-										): difference.path == "stop.header.for_type.name.text",
-									)
-									and receiver_comparison.declaration_kinds.is_empty()
-								)
-							_:
-								correct = False
+							},
+						)
+						correct = (
+							correct
+							and receiver_comparison.differences.any(
+								pure func(
+									difference,
+								): difference.path == "stop.header.for_type.name.text",
+							)
+							and receiver_comparison.declaration_kinds.is_empty()
+						)
 					_:
 						correct = False
 			None:
@@ -4507,10 +4412,6 @@ tests: TestSuite = {
 		(
 			"function header stop shared names across modules",
 			test_function_header_stop_threads_authored_names_into_next_module,
-		),
-		(
-			"prefix comparison forward header cannot extend into next declaration",
-			test_prefix_comparison_rejects_forward_header_extended_to_next_function_colon,
 		),
 		(
 			"prefix comparison private trait and implementation spans",

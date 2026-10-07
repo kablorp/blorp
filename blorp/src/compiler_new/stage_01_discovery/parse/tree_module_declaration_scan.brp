@@ -1,193 +1,163 @@
--- Bounded declaration evidence, not module acceptance. Globals and rejected
--- declarations stop the scan at their returned cursor. The explicit M4 opt-in
--- completes only its supported same-line globals; module acceptance belongs to
--- `tree_module_assembly`, which reads the body-completing scan.
+-- The declaration scan of one module: every declaration in source order, read
+-- in full, until the first one the tree parser does not read. It is evidence,
+-- not module acceptance, which belongs to `tree_module_assembly`.
+--
+-- The scan stops at the first declaration it cannot read in full: where a
+-- body or initializer the parser does not read ends is known only by reading
+-- it, so nothing after it can be read either.
 import:
-	../syntax/module_syntax: Documentation
+	../syntax/module_syntax:
+		Documentation,
+		ModuleItem(
+			FunctionItem, GlobalItem, RecordItem, UnionItem, EnumItem, AliasItem, BuiltinTypeItem,
+			ResourceTypeItem, TraitItem, ImplementationItem, ImportBlockItem, ForeignBlockItem,
+		),
 	../tables/token: TokenKind(NewlineToken, EndOfFileToken)
 	parse_state: ParseState, current_kind, position, advanced
 	tree_module_documentation_parser: parse_module_preamble
+	tree_function_header_parser: FunctionHeader
 	tree_global_header_parser: GlobalHeaderPreview, DeferredInitializerStart
-	tree_global_parser:
-		GlobalCompletion(CompletedGlobal, DeferredGlobal), complete_atomic_global,
-		GlobalExpressionCompletion(CompletedExpressionGlobal, DeferredExpressionGlobal, RejectedExpressionGlobal), complete_expression_global
+	tree_implementation_parser: ImplementationHeader
+	tree_trait_parser: TraitHeader
 	stop_reason: StopPoint
 	tree_declaration_preview_parser:
-		DeclarationPreview(GlobalDeclarationPreview, FunctionDeclarationPreview, CompletedFunctionPreview, TraitDeclarationPreview, CompletedTraitPreview, ImplementationDeclarationPreview, CompletedImplementationPreview),
-		DeclarationPreviewParse(ParsedDeclarationPreview, DeferredGlobalInitializer, RejectedGlobalInitializer, RejectedDeclarationPreview), parse_declaration_preview
+		DeclarationPreview(
+			GlobalDeclarationPreview, RecordDeclarationPreview, AliasDeclarationPreview, BuiltinTypeDeclarationPreview, ResourceTypeDeclarationPreview,
+			UnionDeclarationPreview, EnumDeclarationPreview, ImportBlockDeclarationPreview, ForeignBlockDeclarationPreview,
+			FunctionDeclarationPreview, TraitDeclarationPreview, ImplementationDeclarationPreview,
+		),
+		DeclarationPreviewParse(
+			ParsedDeclarationPreview, DeclinedGlobalInitializer, DeclinedTraitBodies, DeclinedImplementationBodies,
+			RejectedGlobalInitializer, RejectedDeclarationPreview,
+		),
+		parse_declaration_preview
 	tree_body_parser: FunctionCompletion(CompletedFunction, DeferredFunction), complete_function
-	tree_owner_completion:
-		TraitCompletion(CompletedTrait, DeferredTrait), ImplementationCompletion(CompletedImplementation, DeferredImplementation),
-		complete_trait, complete_implementation
+
+
+---
+The header of a declaration the scan read up to its body or initializer. A
+function here always has a body: a forward declaration is read in full.
+---
+union UnreadHeader:
+	UnreadFunction(FunctionHeader)
+	UnreadTrait(TraitHeader)
+	UnreadImplementation(ImplementationHeader)
+	UnreadGlobalInitializer(GlobalHeaderPreview)
+
+
+---
+The declaration the scan stopped at, and why the tree parser did not read
+the rest of it. `stop` is the rollback's own result, so the reason is not
+worked out afterwards.
+---
+record UnreadDeclaration {
+	header: UnreadHeader,
+	stop: StopPoint
+}
 
 
 union ModuleDeclarationScanStop:
 	ReachedEndOfSource
-	StoppedAtGlobalInitializer(GlobalHeaderPreview)
+	StoppedAtUnreadDeclaration(UnreadDeclaration)
 	StoppedAtRejectedGlobalInitializer(DeferredInitializerStart)
 	StoppedAtRejectedDeclaration
 	StoppedWithoutDeclarationProgress
 
 
--- What a completing scan tried to read in full and could not.
-enum DeclinedKind:
-	DeclinedFunction
-	DeclinedTrait
-	DeclinedImplementation
-	DeclinedGlobalInitializer
-
-
--- A declaration the body policy tried to complete and left as it was: a
--- skipped-body preview, or the global initializer the scan stopped at. `stop`
--- is the rollback's own result, so the reason is not worked out afterwards.
-record DeclinedDeclaration {
-	kind: DeclinedKind,
-	stop: StopPoint
-}
-
-
--- `declined` lists, in source order, every declaration the completing policies
--- tried and could not read: the first is where the tree path first falls short.
--- It is empty for a scan that does not complete bodies.
-record ModuleDeclarationPreviewScan {
+---
+The module documentation, every declaration read in full before the stop, in
+source order, and the stop.
+---
+record ModuleDeclarationScan {
 	documentation: Option[Documentation],
-	declarations: List[DeclarationPreview],
-	declined: List[DeclinedDeclaration],
+	items: List[ModuleItem],
 	stop: ModuleDeclarationScanStop
 }
 
 
-private enum GlobalCompletionPolicy:
-	KeepDeferredInitializers
-	CompleteSameLineAtomicInitializers
-	CompleteSameLineExpressions
-	CompleteExpressionsAndBodies
+-- One declaration's outcome: read in full, or where the scan stops.
+private union DeclarationRead:
+	ReadItem(ModuleItem)
+	StopsScan(ModuleDeclarationScanStop)
 
 
-pure func scan_module_declaration_previews(state: ParseState) -> (ParseState, ModuleDeclarationPreviewScan):
-	scan_module_declaration_prefix(state, KeepDeferredInitializers)
-
-
-pure func scan_module_declaration_prefix_with_atomic_globals(state: ParseState) -> (ParseState, ModuleDeclarationPreviewScan):
-	scan_module_declaration_prefix(state, CompleteSameLineAtomicInitializers)
-
-
-pure func scan_module_declaration_prefix_with_expressions(state: ParseState) -> (ParseState, ModuleDeclarationPreviewScan):
-	scan_module_declaration_prefix(state, CompleteSameLineExpressions)
-
-
--- The M4 statement slice: expression globals as above, and every function,
--- trait and implementation whose bodies the body parser reads in full. An
--- owner it leaves deferred stays a skipped-body preview, as in every other
--- scan.
-pure func scan_module_declaration_prefix_with_bodies(state: ParseState) -> (ParseState, ModuleDeclarationPreviewScan):
-	scan_module_declaration_prefix(state, CompleteExpressionsAndBodies)
-
-
-private pure func scan_module_declaration_prefix(state: ParseState, globals: GlobalCompletionPolicy) -> (ParseState, ModuleDeclarationPreviewScan):
+pure func scan_module_declarations(state: ParseState) -> (ParseState, ModuleDeclarationScan):
 	(after_preamble, documentation) = parse_module_preamble(state)
 	var out: ParseState = after_preamble
-	var declarations: List[DeclarationPreview] = []
-	var declined: List[DeclinedDeclaration] = []
+	var items: List[ModuleItem] = []
 	var stop: ModuleDeclarationScanStop = ReachedEndOfSource
 	var scanning: Bool = True
 
 	while scanning and out.current_kind() != EndOfFileToken:
-		before: Int = out.position()
-		entry: ParseState = out
-		(parsed, result) = parse_declaration_preview(out)
-		out = parsed
-		match result:
-			ParsedDeclarationPreview(declaration):
-				-- A successful leaf must consume declaration syntax. Do not hide
-				-- an invariant violation by advancing or collecting stale evidence.
-				if out.position() == before:
-					stop = StoppedWithoutDeclarationProgress
-					scanning = False
-				else:
-					(completed, finished, left_over) = out.completed_declaration(entry, declaration, globals)
-					out = completed
-					declarations = declarations.append(finished)
-					match left_over:
-						Some(unread):
-							declined = declined.append(unread)
-						None:
-							void
-					out = out.skip_newlines()
-			DeferredGlobalInitializer(preview):
-				if globals == KeepDeferredInitializers:
-					stop = StoppedAtGlobalInitializer(preview)
-					scanning = False
-				else if globals == CompleteSameLineExpressions or globals == CompleteExpressionsAndBodies:
-					(completed, completion) = complete_expression_global(out, preview)
-					out = completed
-
-					match completion:
-						CompletedExpressionGlobal(declaration):
-							declarations = declarations.append(
-								GlobalDeclarationPreview(declaration),
-							)
-							out = out.skip_newlines()
-						DeferredExpressionGlobal(unread):
-							declined = declined.append({ kind = DeclinedGlobalInitializer, stop = unread })
-							stop = StoppedAtGlobalInitializer(preview)
-							scanning = False
-						RejectedExpressionGlobal:
-							stop = StoppedAtRejectedGlobalInitializer(preview.initializer)
-							scanning = False
-				else:
-					(completed, completion) = complete_atomic_global(out, preview)
-					out = completed
-					match completion:
-						CompletedGlobal(declaration):
-							declarations = declarations.append(GlobalDeclarationPreview(declaration))
-							out = out.skip_newlines()
-						DeferredGlobal:
-							stop = StoppedAtGlobalInitializer(preview)
-							scanning = False
-			RejectedGlobalInitializer(start):
-				stop = StoppedAtRejectedGlobalInitializer(start)
-				scanning = False
-			RejectedDeclarationPreview:
-				stop = StoppedAtRejectedDeclaration
+		(read, outcome) = out.read_declaration()
+		out = read
+		match outcome:
+			ReadItem(item):
+				items = items.append(item)
+				out = out.skip_newlines()
+			StopsScan(reason):
+				stop = reason
 				scanning = False
 
-	(out, { documentation = documentation, declarations = declarations, declined = declined, stop = stop })
+	(out, { documentation = documentation, items = items, stop = stop })
 
 
--- Only the body policy replaces a skipped body by its tree. `state` is where
--- the declaration's preview ended and `entry` where its prefix began. A
--- declaration it could not complete stays as it was, with why.
-private pure func completed_declaration(
-	state: ParseState, entry: ParseState, declaration: DeclarationPreview, globals: GlobalCompletionPolicy,
-) -> (ParseState, DeclarationPreview, Option[DeclinedDeclaration]):
-	if globals != CompleteExpressionsAndBodies:
-		(state, declaration, None)
-	else:
-		match declaration:
-			FunctionDeclarationPreview(preview):
-				(completed, completion) = complete_function(state, preview)
-				match completion:
-					CompletedFunction(function):
-						(completed, CompletedFunctionPreview(function), None)
-					DeferredFunction(stop):
-						(state, declaration, Some({ kind = DeclinedFunction, stop = stop }))
-			TraitDeclarationPreview(_):
-				(completed, completion) = complete_trait(entry, state)
-				match completion:
-					CompletedTrait(trait_declaration):
-						(completed, CompletedTraitPreview(trait_declaration), None)
-					DeferredTrait(stop):
-						(state, declaration, Some({ kind = DeclinedTrait, stop = stop }))
-			ImplementationDeclarationPreview(_):
-				(completed, completion) = complete_implementation(entry, state)
-				match completion:
-					CompletedImplementation(implementation_declaration):
-						(completed, CompletedImplementationPreview(implementation_declaration), None)
-					DeferredImplementation(stop):
-						(state, declaration, Some({ kind = DeclinedImplementation, stop = stop }))
-			_:
-				(state, declaration, None)
+private pure func read_declaration(state: ParseState) -> (ParseState, DeclarationRead):
+	(parsed, result) = parse_declaration_preview(state)
+	match result:
+		ParsedDeclarationPreview(declaration):
+			-- A successful leaf must consume declaration syntax. Do not hide
+			-- an invariant violation by advancing or collecting stale evidence.
+			if parsed.position() == state.position():
+				(parsed, StopsScan(StoppedWithoutDeclarationProgress))
+			else:
+				parsed.completed_declaration(declaration)
+		DeclinedGlobalInitializer(preview, stop):
+			(parsed, StopsScan(StoppedAtUnreadDeclaration({ header = UnreadGlobalInitializer(preview), stop = stop })))
+		DeclinedTraitBodies(header, stop):
+			(parsed, StopsScan(StoppedAtUnreadDeclaration({ header = UnreadTrait(header), stop = stop })))
+		DeclinedImplementationBodies(header, stop):
+			(parsed, StopsScan(StoppedAtUnreadDeclaration({ header = UnreadImplementation(header), stop = stop })))
+		RejectedGlobalInitializer(start):
+			(parsed, StopsScan(StoppedAtRejectedGlobalInitializer(start)))
+		RejectedDeclarationPreview:
+			(parsed, StopsScan(StoppedAtRejectedDeclaration))
+
+
+-- A declaration whose preview ended at `state`, as a module item: a function's
+-- skipped body is replaced by its tree. One whose body the tree parser does
+-- not read stops the scan, with why.
+private pure func completed_declaration(state: ParseState, declaration: DeclarationPreview) -> (ParseState, DeclarationRead):
+	match declaration:
+		FunctionDeclarationPreview(preview):
+			(completed, completion) = complete_function(state, preview)
+			match completion:
+				CompletedFunction(function):
+					(completed, ReadItem(FunctionItem(function)))
+				DeferredFunction(stop):
+					(state, StopsScan(StoppedAtUnreadDeclaration({ header = UnreadFunction(preview.header), stop = stop })))
+		TraitDeclarationPreview(trait_declaration):
+			(state, ReadItem(TraitItem(trait_declaration)))
+		ImplementationDeclarationPreview(implementation_declaration):
+			(state, ReadItem(ImplementationItem(implementation_declaration)))
+		GlobalDeclarationPreview(global_declaration):
+			(state, ReadItem(GlobalItem(global_declaration)))
+		RecordDeclarationPreview(record_declaration):
+			(state, ReadItem(RecordItem(record_declaration)))
+		AliasDeclarationPreview(alias_declaration):
+			(state, ReadItem(AliasItem(alias_declaration)))
+		BuiltinTypeDeclarationPreview(builtin_type):
+			(state, ReadItem(BuiltinTypeItem(builtin_type)))
+		ResourceTypeDeclarationPreview(resource_type):
+			(state, ReadItem(ResourceTypeItem(resource_type)))
+		UnionDeclarationPreview(union_declaration):
+			(state, ReadItem(UnionItem(union_declaration)))
+		EnumDeclarationPreview(enum_declaration):
+			(state, ReadItem(EnumItem(enum_declaration)))
+		ImportBlockDeclarationPreview(block):
+			(state, ReadItem(ImportBlockItem(block)))
+		ForeignBlockDeclarationPreview(block):
+			(state, ReadItem(ForeignBlockItem(block)))
 
 
 private pure func skip_newlines(state: ParseState) -> ParseState:

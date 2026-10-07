@@ -5,9 +5,10 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/parse/parse_state:
 		ParseState, new_parse_state, diagnostic_count, issued_counts, issued_ids, spellings
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
-		DeclarationPreview(CompletedFunctionPreview, CompletedTraitPreview, CompletedImplementationPreview, FunctionDeclarationPreview, TraitDeclarationPreview, ImplementationDeclarationPreview)
+		parse_declaration_preview
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
-		ModuleDeclarationPreviewScan, ModuleDeclarationScanStop(StoppedAtGlobalInitializer), scan_module_declaration_prefix_with_bodies, scan_module_declaration_prefix_with_expressions
+		ModuleDeclarationScan, ModuleDeclarationScanStop(StoppedAtUnreadDeclaration),
+		UnreadHeader(UnreadFunction, UnreadTrait, UnreadImplementation), scan_module_declarations
 	../../../../src/compiler_new/stage_01_discovery/syntax/dump: dumped_module
 	../../../../src/compiler_new/stage_01_discovery/syntax/expressions:
 		Body(BlockBody), ElseBody(ElseBlock, ElseIf), ElseBranch, ExpressionKind(If), StatementKind(Assignment, ExpressionStatement)
@@ -34,30 +35,19 @@ private pure func hole(text: String) -> String:
 	"$" + "{" + text + "}"
 
 
-private pure func scanned(text: String) -> Option[(ParseState, ModuleDeclarationPreviewScan)]:
+private pure func scanned(text: String) -> Option[(ParseState, ModuleDeclarationScan)]:
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(state):
-			Some(scan_module_declaration_prefix_with_bodies(state))
+			Some(scan_module_declarations(state))
 		Err(_):
 			None
 
 
--- A fixture assembled from the scan's actual issued indexes, never a
--- production accepted module. Only completed functions become items.
-private pure func completed_module(state: ParseState, scan: ModuleDeclarationPreviewScan) -> ModuleSyntax:
+-- A fixture assembled from the scan's items and actual issued indexes, never
+-- a production accepted module.
+private pure func completed_module(state: ParseState, scan: ModuleDeclarationScan) -> ModuleSyntax:
 	issued = issued_ids(state)
-	var items: List[ModuleItem] = []
-	for declaration in scan.declarations:
-		match declaration:
-			CompletedFunctionPreview(function):
-				items = items.append(FunctionItem(function))
-			CompletedTraitPreview(owner):
-				items = items.append(TraitItem(owner))
-			CompletedImplementationPreview(owner):
-				items = items.append(ImplementationItem(owner))
-			_:
-				void
-	{ documentation = None, items = items, definitions = issued.definitions, imports = issued.imports, counts = issued.counts }
+	{ documentation = None, items = scan.items, definitions = issued.definitions, imports = issued.imports, counts = issued.counts }
 
 
 -- The dump of the one function `text` completes, when its scan reports nothing
@@ -74,44 +64,46 @@ private pure func completed_dump(text: String) -> Option[String]:
 			None
 
 
-private pure func completed_count(scan: ModuleDeclarationPreviewScan) -> Int:
-	scan.declarations
-		.filter(pure func(declaration):
-			match declaration:
-				CompletedFunctionPreview(_): True
+private pure func completed_count(scan: ModuleDeclarationScan) -> Int:
+	scan.items
+		.filter(pure func(item):
+			match item:
+				FunctionItem(_): True
 				_: False
 		)
 		.length()
 
 
-private pure func completed_owner_count(scan: ModuleDeclarationPreviewScan) -> Int:
-	scan.declarations
-		.filter(pure func(declaration):
-			match declaration:
-				CompletedTraitPreview(_) | CompletedImplementationPreview(_): True
+private pure func completed_owner_count(scan: ModuleDeclarationScan) -> Int:
+	scan.items
+		.filter(pure func(item):
+			match item:
+				TraitItem(_) | ImplementationItem(_): True
 				_: False
 		)
 		.length()
 
 
-private pure func deferred_owner_count(scan: ModuleDeclarationPreviewScan) -> Int:
-	scan.declarations
-		.filter(pure func(declaration):
-			match declaration:
-				TraitDeclarationPreview(_) | ImplementationDeclarationPreview(_): True
-				_: False
-		)
-		.length()
+-- 1 when the scan stopped at a trait or implementation it did not read.
+private pure func deferred_owner_count(scan: ModuleDeclarationScan) -> Int:
+	match scan.stop:
+		StoppedAtUnreadDeclaration(unread):
+			match unread.header:
+				UnreadTrait(_) | UnreadImplementation(_): 1
+				_: 0
+		_:
+			0
 
 
-private pure func deferred_count(scan: ModuleDeclarationPreviewScan) -> Int:
-	scan.declarations
-		.filter(pure func(declaration):
-			match declaration:
-				FunctionDeclarationPreview(_): True
-				_: False
-		)
-		.length()
+-- 1 when the scan stopped at a function whose body it did not read.
+private pure func deferred_count(scan: ModuleDeclarationScan) -> Int:
+	match scan.stop:
+		StoppedAtUnreadDeclaration(unread):
+			match unread.header:
+				UnreadFunction(_): 1
+				_: 0
+		_:
+			0
 
 
 private pure func id_counts(state: ParseState) -> List[Int]:
@@ -219,7 +211,7 @@ func test_unsupported_bodies_roll_back_exactly() -> Bool:
 		text = source_lines(["func f() -> Int:"].concat(body))
 		match (scanned(text), new_parse_state(lex_module(module_id_at_row(0), text))):
 			(Some((state, scan)), Ok(entry)):
-				(plain, _) = scan_module_declaration_prefix_with_expressions(entry)
+				(plain, _) = parse_declaration_preview(entry)
 				same_ids: Bool = id_counts(state) == id_counts(plain)
 				if completed_count(scan) != 0 or deferred_count(scan) != 1 or not same_ids:
 					print("not rolled back: ${body}")
@@ -283,21 +275,22 @@ func test_owner_methods_are_minted_in_source_order() -> Bool:
 		None: False
 
 
--- One body outside the slice leaves the whole owner a preview, and every id
--- its methods minted before that body is rolled back.
-func test_owner_with_an_unsupported_body_stays_a_preview_with_no_ids() -> Bool:
+-- One body outside the slice stops the scan at its owner, and every id the
+-- owner's methods minted before that body is rolled back: only the owner
+-- header's ids remain (`implements Shape for Int` holds two name uses and one
+-- written type; `trait Shape` none), and no definition.
+func test_owner_with_an_unsupported_body_keeps_only_its_header_ids() -> Bool:
 	var correct: Bool = True
-	for text in [
-		source_lines(["trait Shape:", "\tfunc first(x: Int) -> Int: x", "\tfunc second(y: Int) -> Int:", "\t\t(a, b) = y"]),
-		source_lines(["implements Shape for Int:", "\tfunc first(x: Int) -> Int: x", "\tfunc second(y: Int) -> Int:", "\t\t(a, b) = y"]),
+	for (text, header_ids) in [
+		(source_lines(["trait Shape:", "\tfunc first(x: Int) -> Int: x", "\tfunc second(y: Int) -> Int:", "\t\t(a, b) = y"]), [0, 0, 0, 0, 0, 0, 0, 0, 0]),
+		(source_lines(["implements Shape for Int:", "\tfunc first(x: Int) -> Int: x", "\tfunc second(y: Int) -> Int:", "\t\t(a, b) = y"]), [0, 0, 0, 0, 1, 0, 2, 0, 0]),
 	]:
-		match (scanned(text), new_parse_state(lex_module(module_id_at_row(0), text))):
-			(Some((state, scan)), Ok(entry)):
-				(plain, _) = scan_module_declaration_prefix_with_expressions(entry)
-				if completed_owner_count(scan) != 0 or deferred_owner_count(scan) != 1 or id_counts(state) != id_counts(plain) or state.diagnostic_count() != 0:
+		match scanned(text):
+			Some((state, scan)):
+				if completed_owner_count(scan) != 0 or deferred_owner_count(scan) != 1 or id_counts(state) != header_ids or issued_ids(state).definitions.length() != 0 or state.diagnostic_count() != 0:
 					print("owner not rolled back: ${text}")
 					correct = False
-			_: correct = False
+			None: correct = False
 	correct
 
 
@@ -408,8 +401,8 @@ func test_else_if_chain_mints_inner_links_before_outer_ones() -> Bool:
 	])
 	match scanned(text):
 		Some((state, scan)):
-			match scan.declarations.get(0):
-				Some(CompletedFunctionPreview(function)):
+			match scan.items.get(0):
+				Some(FunctionItem(function)):
 					-- Source order: every condition and block, then the `else if`s
 					-- from the innermost out, then the outermost `if`.
 					expressions = state.issued_counts().expressions
@@ -418,16 +411,20 @@ func test_else_if_chain_mints_inner_links_before_outer_ones() -> Bool:
 		None: False
 
 
--- The deferred function mints no body and no definition; the function after
--- it is the module's first definition and issues only its own statements.
-func test_function_after_a_deferred_function_issues_only_its_own_ids() -> Bool:
+-- The scan stops at a function whose body it does not read: that function
+-- mints no body and no definition, and the function after it is not read.
+-- The function before it keeps its own ids.
+func test_scan_stops_at_a_deferred_function() -> Bool:
 	text = source_lines([
 		"func first() -> Int:",
+		"\tc = 2",
+		"\tc",
+		"func second() -> Int:",
 		"\ta = 1",
 		"\t(b, c) = pair",
-		"func second() -> Int:",
-		"\tc = 2",
-		"\tc"
+		"func third() -> Int:",
+		"\td = 3",
+		"\td"
 	])
 	match scanned(text):
 		Some((state, scan)):
@@ -510,8 +507,8 @@ func test_control_expression_operands_complete_and_their_continuations_defer() -
 	for text in [global_operand, global_value]:
 		match new_parse_state(lex_module(module_id_at_row(0), text)):
 			Ok(entry):
-				(state, scan) = scan_module_declaration_prefix_with_expressions(entry)
-				correct = correct and not scan.declarations.is_empty() and state.diagnostic_count() == 0
+				(state, scan) = scan_module_declarations(entry)
+				correct = correct and not scan.items.is_empty() and state.diagnostic_count() == 0
 			Err(_): correct = False
 	-- The frozen grammar rejects a block after a same-line body; the new one
 	-- must not accept what it rejects.
@@ -538,8 +535,8 @@ func test_control_value_ids_follow_source_order() -> Bool:
 	text = source_lines(["func f(a: Int) -> Int:", "\tx = if a:", "\t\t1", "\telse:", "\t\t2", "\tx"])
 	match scanned(text):
 		Some((state, scan)):
-			match scan.declarations.get(0):
-				Some(CompletedFunctionPreview(function)):
+			match scan.items.get(0):
+				Some(FunctionItem(function)):
 					match function.function.body:
 						Some(BlockBody(block)):
 							match block.leading.get(0):
@@ -806,7 +803,7 @@ func test_unsupported_block_forms_roll_back_exactly() -> Bool:
 		text = source_lines(["func f(xs: List[Int]) -> Int:"].concat(body))
 		match (scanned(text), new_parse_state(lex_module(module_id_at_row(0), text))):
 			(Some((state, scan)), Ok(entry)):
-				(plain, _) = scan_module_declaration_prefix_with_expressions(entry)
+				(plain, _) = parse_declaration_preview(entry)
 				same_state: Bool = id_counts(state) == id_counts(plain) and state.diagnostic_count() == plain.diagnostic_count() and spelling_count(spellings(state)) == spelling_count(spellings(plain))
 				if completed_count(scan) != 0 or deferred_count(scan) != 1 or not same_state:
 					print("not rolled back: ${body}")
@@ -925,12 +922,12 @@ tests: TestSuite = {
 		("types and patterns are minted in source order", test_types_and_patterns_are_minted_in_source_order),
 		("interpolation holes are minted in source order", test_interpolation_holes_are_minted_in_source_order),
 		("owner methods are minted in source order", test_owner_methods_are_minted_in_source_order),
-		("an owner with an unsupported body stays a preview", test_owner_with_an_unsupported_body_stays_a_preview_with_no_ids),
+		("an owner with an unsupported body keeps only its header ids", test_owner_with_an_unsupported_body_keeps_only_its_header_ids),
 		("lambda and local function ids follow source order", test_lambda_and_local_function_ids_follow_source_order),
 		("nested lambdas", test_nested_lambdas_survive_parse_dump_and_census),
 		("break and continue are supported only inside loops", test_break_and_continue_are_supported_only_inside_loops),
 		("else if links are minted inner before outer", test_else_if_chain_mints_inner_links_before_outer_ones),
-		("a function after a deferred function issues only its own ids", test_function_after_a_deferred_function_issues_only_its_own_ids),
+		("the scan stops at a deferred function", test_scan_stops_at_a_deferred_function),
 		("5000 statements", test_long_statement_list_is_read_and_minted_by_loops),
 		("2000 link else if chain", test_deep_else_if_chain_survives_parse_dump_and_census),
 		("control expression operands complete and their continuations defer", test_control_expression_operands_complete_and_their_continuations_defer),

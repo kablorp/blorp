@@ -16,14 +16,9 @@ default: no placeholder value flows into the rebuilt AST.
 ---
 import:
 	../compiler_new/stage_01_discovery/parse/tree_module_declaration_scan as TreeScan
-	../compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser as TreePreviews
-	../compiler_new/stage_01_discovery/parse/tree_function_header_parser:
-		FunctionHeaderPreview,
-		FunctionBodyExtent,
-		DeferredBody,
-	../compiler_new/stage_01_discovery/parse/tree_trait_parser: TraitPreview
-	../compiler_new/stage_01_discovery/parse/tree_trait_method_header_parser: MethodBodyExtent
-	../compiler_new/stage_01_discovery/parse/tree_implementation_parser: ImplementationPreview
+	../compiler_new/stage_01_discovery/parse/tree_function_header_parser: FunctionHeader
+	../compiler_new/stage_01_discovery/parse/tree_trait_parser: TraitHeader
+	../compiler_new/stage_01_discovery/parse/tree_implementation_parser: ImplementationHeader
 	../compiler_new/stage_01_discovery/tables/token as PreviewTokens
 	../compiler_new/stage_01_discovery/parse/tree_global_header_parser:
 		GlobalHeaderPreview,
@@ -385,13 +380,13 @@ record LegacyDeclarationProjection {
 
 
 ---
-Translated function syntax and deferred body evidence. The header cannot carry
-a function body or the complete declaration's endpoint.
+Translated syntax of a function whose body the tree parser did not read. The
+header cannot carry the body or the complete declaration's endpoint; such a
+function always has a body, since a forward declaration is read in full.
 ---
 record LegacyFunctionHeaderPreview {
 	header: ParsedFunctionHeader,
 	visibility: Kinds.Visibility,
-	body_extent: FunctionBodyExtent,
 	header_span: Span,
 	body_colon: Span
 }
@@ -416,55 +411,43 @@ record LegacyGlobalHeaderPreview {
 }
 
 
--- Keep method syntax paired with its lexical body evidence and boundary.
--- Owner headers are derived from these records rather than parallel lists.
-record LegacyTraitMethodHeaderPreview {
-	header: ParsedTraitMethodHeader,
-	body_extent: MethodBodyExtent,
-	header_span: Span
-}
-
-
+---
+Translated header of a trait whose bodies the tree parser did not read: the
+trait before its methods. `header_span` runs from the declaration's start
+through its name or last supertrait.
+---
 record LegacyTraitHeaderPreview {
 	name: ParsedIdentifier,
 	type_params: List[ParsedTypeParamDecl],
 	supertraits: List[ParsedTraitReference],
-	methods: List[LegacyTraitMethodHeaderPreview],
 	doc: Option[String],
 	visibility: Kinds.Visibility,
-	owner_span: Span
-}
-
-
-pure func legacy_trait_header(preview: LegacyTraitHeaderPreview) -> ParsedTraitHeader:
-	{
-		name = preview.name, type_params = preview.type_params, supertraits = preview.supertraits,
-		methods = preview.methods.map(pure func(method): method.header), doc = preview.doc
-	}
-
-
-record LegacyImplementationMethodHeaderPreview {
-	header: ParsedFunctionHeader,
-	body: DeferredBody,
 	header_span: Span
 }
 
 
+-- The existing parser's trait header with no methods, which the tree parser
+-- did not read.
+pure func legacy_trait_header(preview: LegacyTraitHeaderPreview) -> ParsedTraitHeader:
+	{ name = preview.name, type_params = preview.type_params, supertraits = preview.supertraits, methods = [], doc = preview.doc }
+
+
+---
+Translated header of an implementation whose bodies the tree parser did not
+read. `header_span` runs from the declaration's start through its receiver.
+---
 record LegacyImplementationHeaderPreview {
 	trait_name: ParsedIdentifier,
 	for_type: ParsedTypeExpr,
-	methods: List[LegacyImplementationMethodHeaderPreview],
 	doc: Option[String],
 	visibility: Kinds.Visibility,
-	owner_span: Span
+	header_span: Span
 }
 
 
+-- The existing parser's implementation header with no methods.
 pure func legacy_implementation_header(preview: LegacyImplementationHeaderPreview) -> ParsedImplHeader:
-	{
-		trait_name = preview.trait_name, for_type = preview.for_type,
-		methods = preview.methods.map(pure func(method): method.header), doc = preview.doc
-	}
+	{ trait_name = preview.trait_name, for_type = preview.for_type, methods = [], doc = preview.doc }
 
 
 union LegacyDeclarationProjectionStop:
@@ -478,63 +461,61 @@ union LegacyDeclarationProjectionStop:
 	StoppedWithoutDeclarationProgress
 
 
-private union PreviewDeclarationProjection:
-	CompletedPreviewDeclaration(NameTable, ParsedDecl)
-	DeferredPreviewDeclaration(NameTable, LegacyDeclarationProjectionStop)
-
-
 pure func legacy_declaration_projection(
-	source: PreviewSource, scan: TreeScan.ModuleDeclarationPreviewScan, names: NameTable,
+	source: PreviewSource, scan: TreeScan.ModuleDeclarationScan, names: NameTable,
 ) -> Result[LegacyDeclarationProjection, LegacyDeclarationPreviewError]:
 	var extended: NameTable = names
 	var declarations: List[ParsedDecl] = []
-	var deferred_stop: Option[LegacyDeclarationProjectionStop] = None
-
 	var failure: Option[LegacyDeclarationPreviewError] = None
-	for preview in scan.declarations:
-		match preview_declaration(source, extended, preview):
-			Ok(CompletedPreviewDeclaration(after_declaration, declaration)):
-				extended = after_declaration
+	for item in scan.items:
+		match legacy_module_item(source, extended, item):
+			Ok((after_item, declaration)):
+				extended = after_item
 				declarations = declarations.append(declaration)
-			Ok(DeferredPreviewDeclaration(after_header, deferred)):
-				extended = after_header
-				-- The scanner may hold later previews. Their names and syntax
-				-- cannot enter this prefix until its deferred owner is implemented.
-				deferred_stop = Some(deferred)
-				break
 			Err(error):
 				failure = Some(error)
 				break
 
-	module_doc: Option[ParsedModuleDoc] = legacy_module_documentation(scan.documentation)
-	-- Only select the scan's global stop after all completed declarations. An
-	-- earlier deferred declaration owns the boundary and excludes later names.
-	stop_translation: Result[(NameTable, LegacyDeclarationProjectionStop), LegacyDeclarationPreviewError] = match failure:
+	match failure:
 		Some(error):
 			Err(error)
 		None:
-			match deferred_stop:
-				Some(stop):
-					Ok((extended, stop))
-				None:
-					match scan.stop:
-						TreeScan.ReachedEndOfSource:
-							Ok((extended, ReachedEndOfSource))
-						TreeScan.StoppedAtGlobalInitializer(preview):
-							match preview_global_header(source, extended, preview):
-								Ok((after_header, header)):
-									Ok((after_header, StoppedAtGlobalInitializer(header)))
-								Err(error):
-									Err(error)
-						TreeScan.StoppedAtRejectedGlobalInitializer(start):
-							Ok((extended, StoppedAtRejectedGlobalInitializer(start)))
-						TreeScan.StoppedAtRejectedDeclaration:
-							Ok((extended, StoppedAtRejectedDeclaration))
-						TreeScan.StoppedWithoutDeclarationProgress:
-							Ok((extended, StoppedWithoutDeclarationProgress))
-	selected_stop ?= stop_translation
-	(projected_names, stop) = selected_stop
-	Ok({ module_doc = module_doc, declarations = declarations, names = projected_names, stop = stop })
+			-- The stop's header names follow every completed declaration's.
+			translated_stop ?= legacy_projection_stop(source, extended, scan.stop)
+			(projected_names, stop) = translated_stop
+			Ok({ module_doc = legacy_module_documentation(scan.documentation), declarations = declarations, names = projected_names, stop = stop })
+
+
+private pure func legacy_projection_stop(
+	source: PreviewSource, names: NameTable, stop: TreeScan.ModuleDeclarationScanStop,
+) -> Result[(NameTable, LegacyDeclarationProjectionStop), LegacyDeclarationPreviewError]:
+	match stop:
+		TreeScan.ReachedEndOfSource:
+			Ok((names, ReachedEndOfSource))
+		TreeScan.StoppedAtUnreadDeclaration(unread):
+			match unread.header:
+				TreeScan.UnreadFunction(header):
+					translated ?= preview_function_header(source, names, header)
+					(extended, function_header) = translated
+					Ok((extended, StoppedAtFunctionHeader(function_header)))
+				TreeScan.UnreadTrait(preview):
+					translated ?= preview_trait_header(source, names, preview)
+					(extended, trait_header) = translated
+					Ok((extended, StoppedAtTraitPreview(trait_header)))
+				TreeScan.UnreadImplementation(preview):
+					translated ?= preview_implementation_header(source, names, preview)
+					(extended, implementation_header) = translated
+					Ok((extended, StoppedAtImplementationPreview(implementation_header)))
+				TreeScan.UnreadGlobalInitializer(preview):
+					translated ?= preview_global_header(source, names, preview)
+					(extended, global_header) = translated
+					Ok((extended, StoppedAtGlobalInitializer(global_header)))
+		TreeScan.StoppedAtRejectedGlobalInitializer(start):
+			Ok((names, StoppedAtRejectedGlobalInitializer(start)))
+		TreeScan.StoppedAtRejectedDeclaration:
+			Ok((names, StoppedAtRejectedDeclaration))
+		TreeScan.StoppedWithoutDeclarationProgress:
+			Ok((names, StoppedWithoutDeclarationProgress))
 
 
 private pure func legacy_module_documentation(documentation: Option[TreeModule.Documentation]) -> Option[ParsedModuleDoc]:
@@ -607,56 +588,6 @@ private pure func legacy_module_item(
 			Ok(preview_import_block(source, names, block))
 		TreeModule.ForeignBlockItem(block):
 			preview_foreign_block(source, names, block)
-
-
-private pure func preview_declaration(
-	source: PreviewSource, names: NameTable, preview: TreePreviews.DeclarationPreview,
-) -> Result[PreviewDeclarationProjection, LegacyDeclarationPreviewError]:
-	match preview:
-		TreePreviews.FunctionDeclarationPreview(preview):
-			translated ?= preview_function_header(source, names, preview)
-			(extended, header) = translated
-			Ok(DeferredPreviewDeclaration(extended, StoppedAtFunctionHeader(header)))
-		TreePreviews.TraitDeclarationPreview(preview):
-			translated ?= preview_trait_header(source, names, preview)
-			(extended, header) = translated
-			Ok(DeferredPreviewDeclaration(extended, StoppedAtTraitPreview(header)))
-		TreePreviews.ImplementationDeclarationPreview(preview):
-			translated ?= preview_implementation_header(source, names, preview)
-			(extended, header) = translated
-			Ok(DeferredPreviewDeclaration(extended, StoppedAtImplementationPreview(header)))
-		TreePreviews.GlobalDeclarationPreview(declaration):
-			completed_preview(source, names, TreeModule.GlobalItem(declaration))
-		TreePreviews.RecordDeclarationPreview(declaration):
-			completed_preview(source, names, TreeModule.RecordItem(declaration))
-		TreePreviews.AliasDeclarationPreview(declaration):
-			completed_preview(source, names, TreeModule.AliasItem(declaration))
-		TreePreviews.BuiltinTypeDeclarationPreview(declaration):
-			completed_preview(source, names, TreeModule.BuiltinTypeItem(declaration))
-		TreePreviews.ResourceTypeDeclarationPreview(declaration):
-			completed_preview(source, names, TreeModule.ResourceTypeItem(declaration))
-		TreePreviews.UnionDeclarationPreview(declaration):
-			completed_preview(source, names, TreeModule.UnionItem(declaration))
-		TreePreviews.EnumDeclarationPreview(declaration):
-			completed_preview(source, names, TreeModule.EnumItem(declaration))
-		TreePreviews.ImportBlockDeclarationPreview(block):
-			completed_preview(source, names, TreeModule.ImportBlockItem(block))
-		TreePreviews.ForeignBlockDeclarationPreview(block):
-			completed_preview(source, names, TreeModule.ForeignBlockItem(block))
-		TreePreviews.CompletedFunctionPreview(declaration):
-			completed_preview(source, names, TreeModule.FunctionItem(declaration))
-		TreePreviews.CompletedTraitPreview(declaration):
-			completed_preview(source, names, TreeModule.TraitItem(declaration))
-		TreePreviews.CompletedImplementationPreview(declaration):
-			completed_preview(source, names, TreeModule.ImplementationItem(declaration))
-
-
-private pure func completed_preview(
-	source: PreviewSource, names: NameTable, item: TreeModule.ModuleItem,
-) -> Result[PreviewDeclarationProjection, LegacyDeclarationPreviewError]:
-	translated ?= legacy_module_item(source, names, item)
-	(extended, declaration) = translated
-	Ok(CompletedPreviewDeclaration(extended, declaration))
 
 
 private pure func preview_completed_global(
@@ -1864,14 +1795,13 @@ private pure func preview_global_header(
 
 
 private pure func preview_function_header(
-	source: PreviewSource, names: NameTable, preview: FunctionHeaderPreview,
+	source: PreviewSource, names: NameTable, written: FunctionHeader,
 ) -> Result[(NameTable, LegacyFunctionHeaderPreview), LegacyDeclarationPreviewError]:
-	written = preview.header
 	translated ?= preview_callable_header(source, names, written.signature, written.type_parameters,
 		written.constraints, written.annotations, preview_documentation(written.documentation))
 	(extended, header) = translated
 	Ok((extended, {
-		header = header, visibility = written.visibility, body_extent = preview.body_extent,
+		header = header, visibility = written.visibility,
 		header_span = written.header_span, body_colon = written.body_colon
 	}))
 
@@ -1921,69 +1851,32 @@ private pure func preview_optional_type(
 
 
 private pure func preview_trait_header(
-	source: PreviewSource, names: NameTable, preview: TraitPreview,
+	source: PreviewSource, names: NameTable, header: TraitHeader,
 ) -> Result[(NameTable, LegacyTraitHeaderPreview), LegacyDeclarationPreviewError]:
-	(after_name, name) = preview_identifier(source, names, preview.name)
-	(after_type_parameters, type_parameters) = preview_type_parameters(source, after_name, preview.type_parameters)
+	(after_name, name) = preview_identifier(source, names, header.name)
+	(after_type_parameters, type_parameters) = preview_type_parameters(source, after_name, header.type_parameters)
 	var extended: NameTable = after_type_parameters
 	var supertraits: List[ParsedTraitReference] = []
-	for bound in preview.supertraits:
+	for bound in header.supertraits:
 		(after_bound, translated) = preview_bound(source, extended, bound)
 		extended = after_bound
 		supertraits = supertraits.append(translated)
-	var methods: List[LegacyTraitMethodHeaderPreview] = []
-	var failure: Option[LegacyDeclarationPreviewError] = None
-	for method in preview.methods:
-		signature = method.header.signature
-		(after_method, method_name) = preview_identifier(source, extended, signature.name)
-		match preview_parameters(source, after_method, signature.parameters):
-			Ok((after_parameters, parameters)):
-				match preview_optional_type(source, after_parameters, signature.return_type):
-					Ok((after_return, return_type)):
-						extended = after_return
-						methods = methods.append({
-							header = { name = method_name, params = parameters, return_type = return_type, is_pure = signature.purity == Kinds.PureFunction },
-							body_extent = method.body_extent, header_span = method.header.span
-						})
-					Err(error): failure = Some(error)
-			Err(error): failure = Some(error)
-		if failure.is_some():
-			break
-	match failure:
-		Some(error): Err(error)
-		None:
-			Ok((extended, {
-				name = name, type_params = type_parameters, supertraits = supertraits, methods = methods,
-				doc = preview_documentation(preview.documentation), visibility = preview.visibility, owner_span = preview.span
-			}))
+	Ok((extended, {
+		name = name, type_params = type_parameters, supertraits = supertraits,
+		doc = preview_documentation(header.documentation), visibility = header.visibility, header_span = header.span
+	}))
 
 
 private pure func preview_implementation_header(
-	source: PreviewSource, names: NameTable, preview: ImplementationPreview,
+	source: PreviewSource, names: NameTable, header: ImplementationHeader,
 ) -> Result[(NameTable, LegacyImplementationHeaderPreview), LegacyDeclarationPreviewError]:
-	(after_trait, trait_name) = preview_identifier(source, names, preview.trait_name.name)
-	translated_receiver ?= preview_type(source, after_trait, preview.receiver)
+	(after_trait, trait_name) = preview_identifier(source, names, header.trait_name.name)
+	translated_receiver ?= preview_type(source, after_trait, header.receiver)
 	(after_receiver, receiver) = translated_receiver
-	var extended: NameTable = after_receiver
-	var methods: List[LegacyImplementationMethodHeaderPreview] = []
-	var failure: Option[LegacyDeclarationPreviewError] = None
-	for method in preview.methods:
-		written = method.header
-		match preview_callable_header(source, extended, written.signature, written.type_parameters,
-			written.constraints, written.annotations, None):
-			Ok((after_method, header)):
-				extended = after_method
-				methods = methods.append({ header = header, body = method.body, header_span = written.header_span })
-			Err(error):
-				failure = Some(error)
-				break
-	match failure:
-		Some(error): Err(error)
-		None:
-			Ok((extended, {
-				trait_name = trait_name, for_type = receiver, methods = methods,
-				doc = preview_documentation(preview.documentation), visibility = preview.visibility, owner_span = preview.span
-			}))
+	Ok((after_receiver, {
+		trait_name = trait_name, for_type = receiver,
+		doc = preview_documentation(header.documentation), visibility = header.visibility, header_span = header.span
+	}))
 
 
 private pure func preview_dimension_constraint(

@@ -18,16 +18,16 @@
 -- `scripts/compiler-new-parity` avoids comparing a root's whole import graph.
 -- It then prints `listed-module <path>` for each module it compares, so the
 -- caller can check that every listed file was reached and no other was.
--- With `--stop-census` (`files` only) each declaration the tree scan left
--- unread also prints why, for the stop-reason census of
--- `scripts/compiler-new-parity --stop-census`:
+-- With `--stop-census` (`files` only) the declaration the tree scan stopped
+-- at, in a module it did not read in full, also prints why, for the
+-- stop-reason census of `scripts/compiler-new-parity --stop-census`:
 --
---   stop-reason <path> | <function|trait|implementation|global-initializer> | <reason> | <line> | <first|later>
+--   stop-reason <path> | <function|trait|implementation|global-initializer> | <reason> | <line>
 --
--- `first` marks the module's first such declaration, where the tree path stops;
--- `later` ones are declarations the scan went on to try after it. The reason is
--- the rollback's own `StopReason`, named by `stop_reason_label`; the line is
--- 1-based and is where the parser stood when it declined.
+-- The scan stops at the module's first declaration it does not read in full,
+-- so there is at most one per module. The reason is the rollback's own
+-- `StopReason`, named by `stop_reason_label`; the line is 1-based and is where
+-- the parser stood when it declined.
 --
 -- For each module the existing parser's program, with each interpolated
 -- string's holes parsed (`with_holes_parsed`: the adapter's strings come from
@@ -106,15 +106,13 @@ import:
 		new_parse_state,
 		span_start_line,
 	../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_source
-	../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser: DeclarationPreview(CompletedFunctionPreview, CompletedTraitPreview, CompletedImplementationPreview)
-	../../../src/compiler_new/stage_01_discovery/parse/stop_reason: StopReason
-	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan: DeclinedKind, scan_module_declaration_prefix_with_bodies
+	../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: ModuleItem(FunctionItem, TraitItem, ImplementationItem)
+	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
+		UnreadDeclaration, UnreadHeader(UnreadFunction, UnreadTrait, UnreadImplementation, UnreadGlobalInitializer),
+		ModuleDeclarationScanStop(StoppedAtUnreadDeclaration), scan_module_declarations
 	../../../src/compiler_new/stage_01_discovery/parse/tree_module_assembly:
 		ModuleAssembly(AssembledModule, RejectedModule, UnassembledModule),
-		UnassembledReason(
-			FunctionBodyNotRead, TraitBodiesNotRead, ImplementationBodiesNotRead, GlobalInitializerNotRead,
-			GlobalInitializerRejected, DeclarationRejected, DeclarationMadeNoProgress,
-		),
+		UnassembledReason(DeclarationNotRead, GlobalInitializerRejected, DeclarationRejected, DeclarationMadeNoProgress),
 		assemble_module,
 	../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: rejected_diagnostics
 	../../../src/compiler_new/stage_01_discovery/syntax/id_census:
@@ -163,7 +161,7 @@ import:
 	list: range
 	set as Sets
 	system: read_file
-	../../test_compiler_new/support/stop_reason_label: declined_kind_label, stop_reason_label
+	../../test_compiler_new/support/stop_reason_label: unread_kind_label, stop_reason_label
 
 
 STANDARD_LIBRARY_ROOT: String = "standard_library/src"
@@ -208,17 +206,16 @@ union ModuleComparison:
 	ModuleNotRebuilt(String)
 
 
--- A declaration the tree scan could not read in full, and where.
+-- The declaration the tree scan stopped at, and the 1-based line it declined at.
 record LocatedStop {
-	kind: DeclinedKind,
-	reason: StopReason,
+	unread: UnreadDeclaration,
 	line: Int
 }
 
 
 -- Only a successful projection carries names to advance the shared table.
 union TreePrefixModuleComparison:
-	TreePrefixCompared(NameTable, DeclarationPrefixComparison, CompletedBodyCounts, List[LocatedStop])
+	TreePrefixCompared(NameTable, DeclarationPrefixComparison, CompletedBodyCounts, Option[LocatedStop])
 	TreePrefixSkipped(String)
 	TreePrefixError(TreePrefixErrorStage, String)
 
@@ -288,14 +285,16 @@ private EMPTY_TREE_MODULE_COUNTS: TreeModuleCounts = {
 
 pure func count_tree_module_stop(counts: TreeModuleStopCounts, reason: UnassembledReason) -> TreeModuleStopCounts:
 	match reason:
-		FunctionBodyNotRead(_):
-			{ counts | function_body = counts.function_body + 1 }
-		TraitBodiesNotRead(_):
-			{ counts | trait_bodies = counts.trait_bodies + 1 }
-		ImplementationBodiesNotRead(_):
-			{ counts | implementation_bodies = counts.implementation_bodies + 1 }
-		GlobalInitializerNotRead(_):
-			{ counts | global_initializer = counts.global_initializer + 1 }
+		DeclarationNotRead(unread):
+			match unread.header:
+				UnreadFunction(_):
+					{ counts | function_body = counts.function_body + 1 }
+				UnreadTrait(_):
+					{ counts | trait_bodies = counts.trait_bodies + 1 }
+				UnreadImplementation(_):
+					{ counts | implementation_bodies = counts.implementation_bodies + 1 }
+				UnreadGlobalInitializer(_):
+					{ counts | global_initializer = counts.global_initializer + 1 }
 		GlobalInitializerRejected(_):
 			{ counts | rejected_global_initializer = counts.rejected_global_initializer + 1 }
 		DeclarationRejected:
@@ -528,11 +527,11 @@ pure func count_tree_prefix_stop(counts: TreePrefixStopCounts, kind: Declaration
 			{ counts | without_progress_modules = counts.without_progress_modules + 1 }
 
 
-pure func count_completed_bodies(counts: CompletedBodyCounts, declaration: DeclarationPreview) -> CompletedBodyCounts:
-	match declaration:
-		CompletedFunctionPreview(_): { counts | functions = counts.functions + 1 }
-		CompletedTraitPreview(_): { counts | traits = counts.traits + 1 }
-		CompletedImplementationPreview(_): { counts | implementations = counts.implementations + 1 }
+pure func count_completed_bodies(counts: CompletedBodyCounts, item: ModuleItem) -> CompletedBodyCounts:
+	match item:
+		FunctionItem(_): { counts | functions = counts.functions + 1 }
+		TraitItem(_): { counts | traits = counts.traits + 1 }
+		ImplementationItem(_): { counts | implementations = counts.implementations + 1 }
 		_: counts
 
 
@@ -547,19 +546,18 @@ pure func compare_tree_prefix(existing: ParsedProgram, module: Int, names: NameT
 	lexed = lex_module(module_id_at_row(module), existing.source.text)
 	match new_parse_state(lexed):
 		Ok(entry):
-			(_, scan) = scan_module_declaration_prefix_with_bodies(entry)
-			-- The first declined declaration is where the projection stops.
-			declined_stops: List[LocatedStop] = scan.declined.map(pure func(declined):
-				{ kind = declined.kind, reason = declined.stop.reason, line = entry.span_start_line(declined.stop.at) + 1 }
-			)
+			(_, scan) = scan_module_declarations(entry)
+			located: Option[LocatedStop] = match scan.stop:
+				StoppedAtUnreadDeclaration(unread):
+					Some({ unread = unread, line = entry.span_start_line(unread.stop.at) + 1 })
+				_:
+					None
 			match legacy_declaration_projection(preview_source(lexed), scan, names):
 				Ok(projection):
-					-- The projection may stop before a later completed function; count
-					-- only those it compared.
 					var compared_bodies: CompletedBodyCounts = EMPTY_COMPLETED_BODY_COUNTS
-					for declaration in scan.declarations.take(projection.declarations.length()):
-						compared_bodies = count_completed_bodies(compared_bodies, declaration)
-					TreePrefixCompared(projection.names, declaration_prefix_comparison(existing, projection), compared_bodies, declined_stops)
+					for item in scan.items:
+						compared_bodies = count_completed_bodies(compared_bodies, item)
+					TreePrefixCompared(projection.names, declaration_prefix_comparison(existing, projection), compared_bodies, located)
 				Err(error):
 					TreePrefixError(TreePrefixProjectionError, projection_error_message(error))
 		Err(_):
@@ -909,12 +907,12 @@ func print_comparison(
 				print("adapter-error ${path} | ${message}")
 
 		match comparisons.tree:
-			TreePrefixCompared(names, comparison, completed_bodies, declined_stops):
+			TreePrefixCompared(names, comparison, completed_bodies, located):
 				tree_names = names
 				tree_counts = report_tree_prefix_comparison(path, tree_counts, comparison, completed_bodies)
 				match stop_census:
 					ReportStops:
-						print_stop_census(path, declined_stops)
+						print_stop_census(path, located)
 					OmitStops:
 						void
 			TreePrefixSkipped(reason):
@@ -956,24 +954,12 @@ func print_comparison(
 		0
 
 
--- Where a declined declaration stands in its module: the first is where the
--- tree path stops, the rest are ones the scan went on to try.
-enum StopOrder:
-	FirstStop
-	LaterStop
-
-
-pure func stop_order_label(order: StopOrder) -> String:
-	match order:
-		FirstStop: "first"
-		LaterStop: "later"
-
-
-func print_stop_census(path: String, stops: List[LocatedStop]) -> Void:
-	var order: StopOrder = FirstStop
-	for stop in stops:
-		print("stop-reason ${path} | ${declined_kind_label(stop.kind)} | ${stop_reason_label(stop.reason)} | ${stop.line} | ${stop_order_label(order)}")
-		order = LaterStop
+func print_stop_census(path: String, located: Option[LocatedStop]) -> Void:
+	match located:
+		Some(stop):
+			print("stop-reason ${path} | ${unread_kind_label(stop.unread.header)} | ${stop_reason_label(stop.unread.stop.reason)} | ${stop.line}")
+		None:
+			void
 
 
 func report_tree_prefix_comparison(

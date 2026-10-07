@@ -38,6 +38,8 @@ message-wording tasks.
 | CF-013 | Tensor equality on non-numeric elements passes typecheck, then stops in trait resolution |
 | CF-014 | An unqualified `fixed_point(1.5, 2)` call typechecks, then C emission fails (undeclared identifier without an import; unresolved call kind with a bare `import: fixed_point`) |
 | CF-015 | Perceus conflates binders that share a name and differ by id (`perceus/uses.brp`, `perceus/balance.brp`; [roadmap](IDENTITY_ROADMAP.md#late-core-consumers-by-exact-id)) |
+| CF-016 | Importing a constructor a union does not export, from a file that also imports `compiler_new/.../tables/span`, makes `check` print only a cascade of "internal compiler error: compile-time evaluation received a missing standard Range field authority" (in the span module's global constants), hiding the real "constructor ... is not exported" error |
+| CF-017 | A payload-less variant of a generic union built in another module emits an undeclared C identifier: `union Read[M]: Got(M) / Missing` in `reads.brp`, and `Missing` returned from a function in `main.brp` gives `use of undeclared identifier 'Missing'` from the C compiler |
 
 ## High ROI
 

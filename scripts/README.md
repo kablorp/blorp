@@ -156,7 +156,7 @@ scripts/compiler-new-parity --files blorp/src/check/command.brp blorp/src/check/
 ```
 
 `--stop-reason LABEL` selects the modules whose first stop had that label (the
-table's "First-stop modules" column; a misspelt label lists the right ones) and
+table's "Modules" column; a misspelt label lists the right ones) and
 `--files PATH...` names tracked `.brp` files. A narrowed run compares only the
 selected modules, builds its dumpers with `-O0` (about 15 s of C compile instead
 of 92 s for the adapter differential; the run itself is slower, so it pays below
