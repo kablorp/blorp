@@ -132,7 +132,7 @@ format check. This keeps formatting work out of the behavior or timing window.
 Use progressive disclosure: start with the task's owning source, one nearby
 test, and the relevant contract. Read more when a concrete uncertainty or
 failure calls for it. `AGENTS.md` carries binding rules and routes tasks here;
-this guide carries detailed commands. Planned work lives in `docs/issues/` and the plans
+this guide carries detailed commands. Planned work lives in the plans
 listed in `docs/README.md`; a handoff names the one boundary to read, not every reference document.
 
 Several compiler files are large. Search for a symbol and read a bounded

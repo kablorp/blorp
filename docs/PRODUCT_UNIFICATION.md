@@ -126,9 +126,9 @@ union CoreType:
 
 `HeapRecordType(String)` keys a record by its rendered instance name. Module
 prefixes keep two user modules apart (`alpha__Point` and `beta__Point` in a
-probe), but the key is still a spelling, and the
-[`Option` origin collision](issues/core-lowering-nominal-origin-collision.md)
-shows a case where rendering does not separate two declarations. `TupleType` is also spelled
+probe), but the key is still a spelling, and a local `union Option[T]` beside
+the prelude `Option` lowers to one Core type reference, a case where rendering
+does not separate two declarations. `TupleType` is also spelled
 `NamedType("Tuple", args)` in places (`lower.brp:2453`,
 `type_policy.brp:329`). On the increment 2 branch, `TupleType` means a source
 tuple before `tuple_flatten` and a multi-value after it, with
@@ -402,8 +402,7 @@ type and method, `target_for_dispatch` in `trait_resolve.brp` calls
 and maps `Equatable.equals`/`not_equals` on them to a C `==`/`!=`. For tuples
 it is reachable and wrong: `tuple.brp` implements only `equals`, so
 `not_equals` falls through and `(1, 2) != (1, 2)` compares the two box
-pointers and prints `True`
-([issue](issues/generic-impl-trait-defaults-fall-back-to-pointer-comparison.md)).
+pointers and prints `True`.
 The cause is broader than tuples: generic implementations lose trait default
 methods, so `Wrap[T]` with only `equals` also gets a wrong `!=`, and
 `List[(Int, Int)]` equality is wrong too. The fix registers defaults for
@@ -457,8 +456,7 @@ Several states here are representable but wrong:
   `FieldExpr(base, ...)` and has to match the base, and `record_update.brp`
   carries an `InvalidStagedField` case for when it does not.
 - One list order means both evaluation order and storage order, and `prepare`
-  reorders it after Perceus. That is a use-after-free on `main` today
-  ([issue](issues/record-literal-fields-reordered-after-ownership.md)), fixed
+  reorders it after Perceus. That is a use-after-free on `main` today, fixed
   separately under the rule this plan adopts: fields evaluate in written
   order and are stored by declared position.
 - `prepare_tuple_expr` can fail to classify a tuple and fall back to a

@@ -23,20 +23,19 @@ suggestions remain open under DG-017.
 
 ## Compiler faults (CF)
 
-Wrong acceptance, internal errors, invalid C and wrong results belong in one
-issue file each. These links own the reproduction, evidence and closure needs;
-they are not message-wording tasks.
+Wrong acceptance, internal errors, invalid C and wrong results. They are not
+message-wording tasks.
 
-| ID | Open issue |
+| ID | Open fault |
 | --- | --- |
-| CF-001 | [Bare print emits an undeclared wrapper](issues/print-statement-emits-undeclared-ufcs-wrapper.md) |
-| CF-004 | [Unknown uppercase pattern binds silently](issues/unknown-uppercase-pattern-name-binds-silently.md) |
-| CF-005 | [Int[] silently becomes Int](issues/int-array-suffix-type-becomes-int.md) |
-| CF-006 | [Triple-quoted string becomes empty](issues/triple-quoted-string-lexes-as-empty-string.md) |
-| CF-007 | [Duplicate functions and parameters accepted](issues/duplicate-function-and-parameter-accepted.md) |
-| CF-009 | [Pure function reads mutable module var](issues/pure-function-reads-mutable-module-var.md) (design decision open) |
-| CF-010 | [Generic impls lose trait defaults; operators compare pointers](issues/generic-impl-trait-defaults-fall-back-to-pointer-comparison.md) |
-| CF-011 | [Record literal fields reordered after ownership](issues/record-literal-fields-reordered-after-ownership.md) |
+| CF-001 | Bare print emits an undeclared wrapper |
+| CF-004 | Unknown uppercase pattern binds silently |
+| CF-005 | Int[] silently becomes Int |
+| CF-006 | Triple-quoted string becomes empty |
+| CF-007 | Duplicate functions and parameters accepted |
+| CF-009 | Pure function reads mutable module var (design decision open) |
+| CF-010 | Generic impls lose trait defaults; operators compare pointers |
+| CF-011 | Record literal fields reordered after ownership |
 
 ## High ROI
 

@@ -274,8 +274,9 @@ requires a specific Core consumer; it is not a general escape hatch for
 retaining the typed graph.
 
 Remaining typechecking decomposition is tracked in
-[the module-environment issue](issues/module-environment-preparation-rebuilds-state.md)
-and [Identity And Tables](IDENTITY_ROADMAP.md#frontend-facts). Production behavior belongs
+[Identity And Tables](IDENTITY_ROADMAP.md#frontend-facts); module environment
+preparation still rebuilds the same per-module setup once per module and per
+header. Production behavior belongs
 here only after a phase product becomes authoritative.
 
 ## Compile-Time Evaluation

@@ -22,12 +22,14 @@ adapter's shrinkage. There is no front-end switch: the seam in
   levels deep, and braces in an interpolated pipe string). The stage reads them
   as `GUIDE.md` and `GRAMMAR.md` say; they are the two entries in
   `ADAPTER_DIFFERENCES` and `KNOWN_DIVERGENCES` and the two fixtures under
-  `fixtures/known_differences/`. They are tracked in
-  [`issues/interpolation_nesting_in_the_existing_lexer.md`](issues/interpolation_nesting_in_the_existing_lexer.md),
-  and everything else holds both acceptance criteria that these two inputs
+  `fixtures/known_differences/`. The existing lexer
+  pairs quotes in a hole with one flag, so it mis-pairs strings nested three
+  levels deep, and it reads every brace of an interpolated pipe string as a
+  hole. Everything else holds both acceptance criteria that these two inputs
   break: *same program* (the adapter's rebuilt parsed AST equals the old
   parser's) and *one syntax* (the two parsers agree on every rule decidable from
-  syntax alone). The gap closes when that issue is closed or the old front end is deleted.
+  syntax alone). The gap closes when the existing lexer reads both inputs as the language does or
+  the old front end is deleted.
 - **Not verified:** that diagnostics after the first, and the constructs the
   corpus and the targeted programs do not use, agree between the two parsers
   (a probe found the old parser accepting `./a/../a/b` imports the grammar

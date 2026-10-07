@@ -145,8 +145,8 @@ obligations remain open:
    declaration order or a second unchecked name map is not nominal identity.
    Cover same-spelling types from distinct modules and wrong-kind uses at the
    earliest authoritative boundary. A local `union Option[T]` and the prelude
-   `Option` already lower to one Core type reference; see
-   [`core-lowering-nominal-origin-collision`](issues/core-lowering-nominal-origin-collision.md).
+   `Option` already lower to one Core type reference, and compiling a module that declares
+   its own `Option` fails after specialization.
 2. Bind prepared cleanup and cancellation facts to the exact final Core program.
    Open: the actions and activations inside a present cancellation row,
    same-shape corrupted rows, and cleanup-plan rows are not checked. Any such

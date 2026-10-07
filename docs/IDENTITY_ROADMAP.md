@@ -1254,8 +1254,8 @@ definition/module/type identities and session-sensitive meta facts under the cur
 authorities, never persist live compilation ids. Include compiler/policy provenance
 and imported/prelude/default-method surfaces in invalidation. Write it after the module-view
 publication cut above proves the final publication boundary. Cold-compile gain is 0%; the value is
-per-edit latency. Related typecheck allocation work is in
-[`module-environment-preparation-rebuilds-state`](issues/module-environment-preparation-rebuilds-state.md).
+per-edit latency. Related typecheck allocation work: `prepared_module_environments` rebuilds the
+same per-module setup once per module and per header.
 
 ### Body checking follow-ups
 

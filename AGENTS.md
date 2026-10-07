@@ -288,7 +288,7 @@ For codegen changes, read the generated C.
 **11. Keep commit messages short.** A one-line subject and a body of a few
 lines at most: what was wrong, what changed, and one or two headline numbers.
 No issue numbers or names, no pasted tables or gate lists; that detail lives
-in `benchmarks/results/` and the issue docs.
+in `benchmarks/results/` and the plan documents.
 
 **12. Get it reviewed.** Every change gets reviewed before commit. Use the code-reviewer and
 test-runner agents. No exceptions for "trivial" changes — trivial changes have trivial reviews.
@@ -394,7 +394,7 @@ maps production sources and tests. In particular:
 ## Agent Coordination
 
 The main task owns integration and passes bounded context to specialists.
-Every issue file and every agent brief follows
+Every handoff (usually the brief in a message to an agent) follows
 [`docs/HANDOFF_SPEC.md`](docs/HANDOFF_SPEC.md): a problem with its
 reproduction, the proposed solution, literate code examples whenever code
 changes, and runnable acceptance criteria, plus the other sections its

@@ -13,8 +13,8 @@ Completed work belongs in Git history and benchmark results.
 
 ## Use The Toolchain
 
-- [Handoff Spec](HANDOFF_SPEC.md) is the required shape of every issue file
-  and agent brief, including literate code examples.
+- [Handoff Spec](HANDOFF_SPEC.md) is the required shape of every handoff,
+  usually a message to an agent, including literate code examples.
 - [Worker Checklist](WORKER_CHECKLIST.md) is the one page to read before
   starting a compiler or compiler-performance task: setup, fast feedback
   loop, measurement, and landing rules.
@@ -46,9 +46,8 @@ module inventory lives in
 
 ## Open Issues And Plans
 
-[`issues/`](issues/) holds reproducible open problems. [Diagnostic Gaps](DIAGNOSTIC_GAPS.md)
-owns diagnostic-quality findings and indexes compiler faults; each fault's
-issue owns its reproduction and acceptance criteria.
+[Diagnostic Gaps](DIAGNOSTIC_GAPS.md) owns diagnostic-quality findings and
+indexes compiler faults.
 
 The compiler-speed goal is to emit C for `blorp/src/main.brp` in about ten
 seconds, not a claim about current performance. Use the
@@ -78,24 +77,18 @@ for matched measurements; do not copy a profile into the work index.
   state through calls, last-use and field-place increments, and stored
   products; local/match flattening already exists.
 
-Focused cleanup work lives in issues, not additional umbrella plans:
-[module environment preparation](issues/module-environment-preparation-rebuilds-state.md),
-[Perceus frame stacks](issues/perceus-frame-stacks-duplicate-traversal-storage.md), and
-[Perceus managed-let bookkeeping](issues/perceus-managed-let-bookkeeping-allocates.md).
-
 ## Maintenance Rules
 
 - Reference docs describe current behavior, not migration history.
-- Open issues are files in [`issues/`](issues/), one per issue and named for
-  the symptom, with `Status: open` and the sections of the
-  [Handoff Spec](HANDOFF_SPEC.md). A fixture that pins a known failure names its issue file. GitHub
-  is read-only for this project; assignees and discussion do not belong in this
-  tree.
+- Work is handed off in messages that follow the [Handoff Spec](HANDOFF_SPEC.md).
+  A known problem that needs a durable record lives in the plan or ledger that
+  owns it, such as [Diagnostic Gaps](DIAGNOSTIC_GAPS.md). GitHub is read-only
+  for this project; assignees and discussion do not belong in this tree.
 - A plan for active work lives in this directory and holds only open work.
   When a step lands, delete it from the plan in the same change (Git history
   keeps it), and delete the plan when nothing is open.
 - Put raw performance evidence in `benchmarks/results/` and link it from the
-  issue or plan that uses it.
+  plan that uses it.
 - Keep common build, measurement, and landing recipes in the Worker Checklist
   and its linked references. Plans retain only task-specific commands and gates.
 - Prefer generated inventories and `--help` output over copied file, command,

@@ -171,7 +171,7 @@ The current surface deliberately does not promise resource-producing `select`
 arms, borrowed resource parameters, a copyable service abstraction, or a
 single dynamically typed `open(path, options)` API. Such features require
 explicit ownership, cancellation, and result-type contracts before they become
-part of this reference document. Active design work belongs in [`issues/`](issues/) and the plans listed in
+part of this reference document. Active design work belongs in the plans listed in
 [README.md](README.md), not in a queue here.
 
 ## Validation Gate

@@ -1,7 +1,7 @@
 # Handoff Spec
 
-Every issue file in [`issues/`](issues/) and every brief handed to an agent
-follows this spec. It exists so that whoever picks up the work, a person or an
+This spec governs every handoff: usually a message to an agent, and the same
+shape whenever a handoff is written down. It exists so that whoever picks up the work, a person or an
 agent, can start without rereading the conversation that produced it, and
 knows what done looks like, what not to touch, and when to stop and ask.
 
@@ -18,7 +18,7 @@ its own document first.
 
 Four sections are core: every handoff has them, and Code whenever the change
 touches code. Include each other section when its heuristic applies; a
-substantial issue usually uses most of them. Leave out a section that does
+substantial handoff usually uses most of them. Leave out a section that does
 not apply rather than filling it.
 
 1. **Problem** *(core).* What is wrong or missing, as the user or the
@@ -69,8 +69,8 @@ not apply rather than filling it.
     Blorp keeps no compatibility shims (`AGENTS.md`, rule 14), so a breaking
     change updates every call site, test, example and document in the same
     landing. Say how to back it out if it misbehaves on main.
-11. **Handback.** *Include in every agent brief, and in an issue when the
-    work will be delegated.* What to return and how briefly: the branch and
+11. **Handback.** *Include in every agent brief, and in any written handoff when
+    the work will be delegated.* What to return and how briefly: the branch and
     commits, evidence for each acceptance criterion, measurements, and what
     was found but not done. Then when to stop and ask instead of working
     around a problem: a premise turns out wrong, the change must grow past
@@ -121,13 +121,11 @@ named constant kept equal to `1 / TERMINATION_POLL_SECONDS`.
 
 ## Template
 
-Copy this into a new issue file or brief. Keep the core sections, add the
+Copy this into a handoff. Keep the core sections, add the
 others whose heuristic applies, and delete the italic hints.
 
 ```markdown
 # <Symptom, stated as what is wrong>
-
-Status: open
 
 ## Problem
 _What is wrong or missing: input, command, actual output, expected output._
