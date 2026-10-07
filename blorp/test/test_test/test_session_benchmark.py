@@ -150,8 +150,11 @@ def configure_child():
 
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
 child = subprocess.Popen(["sleep", "10"], preexec_fn=configure_child)
-with open(os.environ["BENCH_CHILD_PID"], "w", encoding="utf-8") as output:
+# Written aside and renamed, so a reader sees the whole pid or no file.
+child_pid_path = os.environ["BENCH_CHILD_PID"]
+with open(child_pid_path + ".partial", "w", encoding="utf-8") as output:
     output.write(str(child.pid))
+os.replace(child_pid_path + ".partial", child_pid_path)
 print("BLORP_GATE_RESULT gate=test-session-benchmark status=PASS passed=1 failed=0 tests=1", flush=True)
 time.sleep(10)
 """,
@@ -185,8 +188,11 @@ def configure_child():
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 child = subprocess.Popen(["sleep", "10"], preexec_fn=configure_child)
-with open(os.environ["BENCH_CHILD_PID"], "w", encoding="utf-8") as output:
+# Written aside and renamed, so a reader sees the whole pid or no file.
+child_pid_path = os.environ["BENCH_CHILD_PID"]
+with open(child_pid_path + ".partial", "w", encoding="utf-8") as output:
     output.write(str(child.pid))
+os.replace(child_pid_path + ".partial", child_pid_path)
 print("BLORP_GATE_RESULT gate=test-session-benchmark status=PASS passed=1 failed=0 tests=1", flush=True)
 time.sleep(0.1)
 """,

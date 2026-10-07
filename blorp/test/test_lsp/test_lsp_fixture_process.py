@@ -50,8 +50,11 @@ child = subprocess.Popen([
     "-c",
     "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
 ])
-with open(os.environ["BLORP_LSP_TEST_CHILD_PID"], "w", encoding="utf-8") as handle:
+# Written aside and renamed, so a reader sees the whole pid or no file.
+child_pid_path = os.environ["BLORP_LSP_TEST_CHILD_PID"]
+with open(child_pid_path + ".partial", "w", encoding="utf-8") as handle:
     handle.write(str(child.pid))
+os.replace(child_pid_path + ".partial", child_pid_path)
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
 time.sleep(60)
 """,
