@@ -7145,6 +7145,27 @@ private pure func var_origin_resource_dependencies(name: String, origin: VarOrig
 			[]
 
 
+--- A fresh meta standing for type parameter `param`. Outside an issued meta
+--- session there is none, so the parameter's own variable stands in and the
+--- internal error is reported.
+private pure func fresh_type_param_meta(
+	context: InferContext,
+	param: String,
+) -> (InferContext, SemanticType):
+	match fresh_meta_with_origin(context.state.context, param):
+		Some(step):
+			next_state = { context.state | context = step.context }
+			(infer_context_with_state(context, next_state), step.meta_type)
+		None:
+			(
+				infer_error(
+					context,
+					"internal typecheck error: inference meta requested outside an issued session",
+				),
+				semantic_type_variable_named(param),
+			)
+
+
 private pure func constructor_return_type(
 	context: InferContext,
 	parent_type: String,
@@ -7165,29 +7186,17 @@ private pure func constructor_return_type(
 			checked_type(context, typ)
 		None:
 			var next_context = context
-			var type_context: Context = context.state.context
 			var args: List[SemanticType] = []
 
 			for param in type_params:
 				if field_types.any(func(field_type): occurs_in(param, field_type)):
 					args = args.append(semantic_type_variable_named(param))
 				else:
-					match fresh_meta_with_origin(type_context, param):
-						Some(step):
-							type_context = step.context
-							args = args.append(step.meta_type)
-						None:
-							next_context = infer_error(
-								next_context,
-								"internal typecheck error: inference meta requested outside an issued session",
-							)
-							args = args.append(semantic_type_variable_named(param))
+					(with_meta, meta_type) = fresh_type_param_meta(next_context, param)
+					next_context = with_meta
+					args = args.append(meta_type)
 
-			next_state = { next_context.state | context = type_context }
-			checked_type(
-				infer_context_with_state(next_context, next_state),
-				SemanticNamedType(parent_type, args),
-			)
+			checked_type(next_context, SemanticNamedType(parent_type, args))
 
 
 private pure func constructor_return_subst(
@@ -8499,9 +8508,27 @@ private pure func operand_value_type(op: ParsedBinaryOp, expr: TypedExpr) -> Sem
 	numeric_operand_type(op, typed_expr_semantic_type(expr))
 
 
+--- The expectation for the right operand of a comparison. Both operands of
+--- `==`, `!=`, `<`, `<=`, `>` and `>=` have one type, so the left operand's
+--- type checks the right: `wrapped == {value = 1}` types the record literal
+--- as `wrapped`'s `Wrap[Int]`. Numeric scalars are left to the operand
+--- widening rules, and a type that still holds a meta has nothing to offer.
+private pure func comparison_right_operand_context(
+	context: InferContext,
+	left_value_type: SemanticType,
+) -> InferContext:
+	left_type = resolve_type_metas(context.state.context, infer_resolve_alias(context, left_value_type))
+
+	if is_numeric_scalar_type(left_type) or type_contains_meta(left_type):
+		infer_without_expected(context)
+	else:
+		infer_with_canonical_expected(context, left_type)
+
+
 --- Infers the operands of a binary operator. A literal-only operand is
 --- inferred after the other operand and checked against its type, whichever
---- side it is on; otherwise the left operand is inferred first.
+--- side it is on; otherwise the left operand is inferred first, and a
+--- comparison's right operand is checked against its type.
 private pure func infer_binary_operands(
 	context: InferContext,
 	op: ParsedBinaryOp,
@@ -8551,7 +8578,16 @@ private pure func infer_binary_operands(
 			}
 		(False, False):
 			left_result = infer_expr(infer_without_expected(context), left)
-			right_result = infer_expr(infer_without_expected(left_result.context), right)
+			left_inferred = left_result.context.state.errors.length() == context.state.errors.length()
+			-- A binary operator that is not arithmetic is a comparison.
+			right_context = if left_inferred and not is_arithmetic_op(op):
+				comparison_right_operand_context(
+					left_result.context,
+					typed_expr_value_type(left_result.expr),
+				)
+			else:
+				infer_without_expected(left_result.context)
+			right_result = infer_expr(right_context, right)
 			{
 				left = left_result.expr,
 				right = right_result.expr,
@@ -16429,12 +16465,13 @@ private pure func provisional_field_for_inference(field: FieldDecl) -> ResolvedR
 	}
 
 
-private pure func record_field_types(
+--- A record declaration's type parameters and fields, with field types still
+--- written in terms of those parameters.
+private pure func record_declaration_for_inference(
 	context: InferContext,
 	record_name: String,
-	args: List[SemanticType],
-) -> Option[List[ResolvedRecordField]]:
-	record_info = match module_view_accepted_record_authority(context.state.facts.module_view):
+) -> Option[(List[String], List[ResolvedRecordField])]:
+	match module_view_accepted_record_authority(context.state.facts.module_view):
 		Some(authority):
 			match accepted_record_find(authority, record_name):
 				Some(entry):
@@ -16452,19 +16489,35 @@ private pure func record_field_types(
 				None:
 					None
 
-	match record_info:
+
+--- The fields of a record declaration applied to `args`, one per type
+--- parameter.
+private pure func instantiate_record_fields(
+	type_params: List[String],
+	fields: List[ResolvedRecordField],
+	args: List[SemanticType],
+) -> List[ResolvedRecordField]:
+	subst = subst_for_params(type_params, args)
+	fields.map(
+		func(
+			field: ResolvedRecordField,
+		) -> ResolvedRecordField: { field |
+			field_type = apply_subst(subst, field.field_type)
+		},
+	)
+
+
+private pure func record_field_types(
+	context: InferContext,
+	record_name: String,
+	args: List[SemanticType],
+) -> Option[List[ResolvedRecordField]]:
+	match record_declaration_for_inference(context, record_name):
 		Some((type_params, fields)):
 			if type_params.length() != args.length():
 				None
 			else:
-				subst = subst_for_params(type_params, args)
-				Some(fields.map(
-					func(
-						field: ResolvedRecordField,
-					) -> ResolvedRecordField: { field |
-						field_type = apply_subst(subst, field.field_type)
-					},
-				))
+				Some(instantiate_record_fields(type_params, fields, args))
 		None:
 			None
 
@@ -16590,6 +16643,65 @@ private pure func missing_record_field_names(
 	missing
 
 
+private pure func record_field_mismatch_error(
+	context: InferContext,
+	field: ParsedRecordExprField,
+	expected_type: SemanticType,
+	value_type: SemanticType,
+) -> InferContext:
+	infer_error_at(
+		context,
+		"Record field '" + infer_identifier_text(context, field.name) + "': expected " + type_to_string(
+			expected_type,
+		) + ", got " + type_to_string(value_type),
+		field.span,
+	)
+
+
+--- Infers one record literal field value against its declared type. A type
+--- still holding a meta belongs to a generic record inferred from its fields,
+--- such as `{value = 1}` for `Wrap[T]`: the value is inferred on its own and
+--- unified with the field type, which solves the record's type argument. An
+--- earlier field may already have solved it, so solved metas are resolved
+--- first; unsolved ones stay metas rather than finalizing to `T`.
+private pure func infer_record_field_value(
+	context: InferContext,
+	field: ParsedRecordExprField,
+	field_type: SemanticType,
+) -> InferResult:
+	expected_type = resolve_type_metas(context.state.context, field_type)
+
+	if type_contains_meta(expected_type):
+		value_result = infer_expr(infer_without_expected(context), field.value)
+		value_type = typed_expr_value_type(value_result.expr)
+
+		match unify_symmetric(value_result.context.state.context, expected_type, value_type):
+			Some(step):
+				next_state = { value_result.context.state | context = step.context }
+				infer_result(infer_context_with_state(value_result.context, next_state), value_result.expr)
+			None:
+				-- Finalizing prints an unsolved meta as its parameter, `List[T]`.
+				expected_text_type = zonk_type(value_result.context.state.context, expected_type)
+				infer_result(
+					record_field_mismatch_error(value_result.context, field, expected_text_type, value_type),
+					value_result.expr,
+				)
+	else:
+		value_result = infer_expr(
+			infer_with_canonical_expected_value_slot(context, expected_type, ExpectedArgumentSlot),
+			field.value,
+		)
+		value_type = typed_expr_value_type(value_result.expr)
+
+		if types_equal(value_type, expected_type):
+			value_result
+		else:
+			infer_result(
+				record_field_mismatch_error(value_result.context, field, expected_type, value_type),
+				value_result.expr,
+			)
+
+
 private pure func infer_record_fields(
 	context: InferContext,
 	fields: List[ParsedRecordExprField],
@@ -16604,34 +16716,15 @@ private pure func infer_record_fields(
 			Some(field):
 				match find_record_field(expected_fields, field.name.text):
 					Some(expected_field):
-						value_result = infer_expr(
-							infer_with_canonical_expected_value_slot(
-								next_context,
-								expected_field.field_type,
-								ExpectedArgumentSlot,
-							),
-							field.value,
-						)
-						value_type = typed_expr_value_type(value_result.expr)
-
-						next_context = if types_equal(value_type, expected_field.field_type):
-							value_result.context
-						else:
-							infer_error_at(
-								value_result.context,
-								"Record field '" + infer_identifier_text(
-									context,
-									field.name,
-								) + "': expected " + type_to_string(
-									expected_field.field_type,
-								) + ", got " + type_to_string(value_type),
-								field.span,
-							)
-
-						next_context = check_resource_capability_storage(
+						value_result = infer_record_field_value(
 							next_context,
+							field,
+							expected_field.field_type,
+						)
+						next_context = check_resource_capability_storage(
+							value_result.context,
 							"record fields",
-							value_type,
+							typed_expr_value_type(value_result.expr),
 						)
 						typed_fields = typed_fields.append({
 							name = field.name,
@@ -16773,6 +16866,90 @@ private pure func invalid_record_literal_message(
 		"Cannot use record literal for type " + type_to_string(expected_type)
 
 
+--- The type argument the unsolved-parameter help suggests in its example.
+private UNSOLVED_TYPE_ARGUMENT_EXAMPLE: String = "Int"
+
+
+--- Reports a type parameter that the field values left unsolved, such as `T`
+--- in `record Phantom[T] { count: Int }`. A later use must not fix it, since
+--- the literal's type would then depend on statement order, and an unsolved
+--- meta must not reach Core. The help example keeps the solved arguments.
+private pure func check_record_type_args_solved(
+	result: InferResult,
+	record_name: String,
+	type_params: List[String],
+	args: List[SemanticType],
+	span: SourceLocation,
+) -> InferResult:
+	type_context = result.context.state.context
+	var unsolved_param: Option[String] = None
+	var example_args: List[String] = []
+
+	for (param, arg) in type_params.zip(args):
+		match resolve_type_metas(type_context, arg):
+			SemanticMetaType(_, _):
+				if unsolved_param.is_none():
+					unsolved_param = Some(param)
+
+				example_args = example_args.append(UNSOLVED_TYPE_ARGUMENT_EXAMPLE)
+			_:
+				example_args = example_args.append(type_to_string(zonk_type(type_context, arg)))
+
+	match unsolved_param:
+		Some(param):
+			reported = infer_error_at(
+				result.context,
+				"Cannot infer type parameter '" + param + "' of record '" + record_name + "' from its fields. Add an explicit record type, e.g. value: " + record_name + "[" + example_args.join(
+					", ",
+				) + "] = {...}",
+				span,
+			)
+			{ result | context = reported }
+		None:
+			result
+
+--- Infers a record literal whose fields name exactly one record type. A
+--- generic record gets a fresh meta for each type parameter, which its field
+--- values then solve: `{value = 1}` for `Wrap[T]` is a `Wrap[Int]`.
+private pure func infer_record_named_by_fields(
+	context: InferContext,
+	fields: List[ParsedRecordExprField],
+	span: SourceLocation,
+	record_name: String,
+) -> InferResult:
+	match record_declaration_for_inference(context, record_name):
+		Some((type_params, declared_fields)):
+			var next_context: InferContext = context
+			var args: List[SemanticType] = []
+
+			for param in type_params:
+				(with_meta, meta_type) = fresh_type_param_meta(next_context, param)
+				next_context = with_meta
+				args = args.append(meta_type)
+
+			result = infer_known_record_expr(
+				next_context,
+				fields,
+				span,
+				SemanticNamedType(record_name, args),
+				instantiate_record_fields(type_params, declared_fields, args),
+			)
+
+			-- A field already reported leaves its parameter unsolved by mistake;
+			-- reporting that parameter too would only repeat the error.
+			if result.context.state.errors.length() == next_context.state.errors.length():
+				check_record_type_args_solved(result, record_name, type_params, args, span)
+			else:
+				result
+		None:
+			record_literal_inference_error(
+				context,
+				fields,
+				span,
+				"Internal error: matched record type '" + record_name + "' has no field metadata",
+			)
+
+
 private pure func infer_record_from_fields(
 	context: InferContext,
 	fields: List[ParsedRecordExprField],
@@ -16794,22 +16971,7 @@ private pure func infer_record_from_fields(
 		else if matches.length() == 1:
 			match matches.get(0):
 				Some(record_name):
-					match record_field_types(context, record_name, []):
-						Some(expected_fields):
-							infer_known_record_expr(
-								context,
-								fields,
-								span,
-								SemanticNamedType(record_name, []),
-								expected_fields,
-							)
-						None:
-							record_literal_inference_error(
-								context,
-								fields,
-								span,
-								"Internal error: matched record type '" + record_name + "' has no field metadata",
-							)
+					infer_record_named_by_fields(context, fields, span, record_name)
 				None:
 					record_literal_inference_error(
 						context,

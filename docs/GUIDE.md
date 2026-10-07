@@ -1179,6 +1179,12 @@ var player: Person = {name = "Alice", age = 30}
 player = { player | age = player.age + 1 }
 ```
 
+A record literal takes its type from its context: an annotation, a parameter,
+or the left operand of a comparison, so `p == {name = "Alice", age = 30}`
+needs no annotation. Without a context its field names must match exactly one
+record type, and a generic record's type arguments come from the field values:
+`{x = 1, y = 2}` alone is a `Point[Int]`.
+
 The field expressions of a record literal are evaluated in the order they are
 written, whatever the declaration order is, and each value is stored in its
 declared field. `{count = names.length(), names = names.append("x")}` reads the
