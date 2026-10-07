@@ -393,9 +393,13 @@ maps production sources and tests. In particular:
 
 ## Agent Coordination
 
-The main task owns integration and passes bounded context to specialists:
-question, base revision/worktree, first source and test, fast loop, scope
-boundary, and expected evidence. Preserve the specialist responsibilities:
+The main task owns integration and passes bounded context to specialists.
+Every issue file and every agent brief follows
+[`docs/HANDOFF_SPEC.md`](docs/HANDOFF_SPEC.md): a problem with its
+reproduction, the proposed solution, literate code examples whenever code
+changes, and runnable acceptance criteria, plus the other sections its
+heuristics call for, in at most 3,000 words of prose. Preserve the
+specialist responsibilities:
 new syntax needs parser-specialist and ergonomics-expert input before
 implementation and documenter review after; API/user-facing design needs
 ergonomics-expert and data-engineer validation; performance work needs a

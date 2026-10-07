@@ -13,6 +13,8 @@ Completed work belongs in Git history and benchmark results.
 
 ## Use The Toolchain
 
+- [Handoff Spec](HANDOFF_SPEC.md) is the required shape of every issue file
+  and agent brief, including literate code examples.
 - [Worker Checklist](WORKER_CHECKLIST.md) is the one page to read before
   starting a compiler or compiler-performance task: setup, fast feedback
   loop, measurement, and landing rules.
@@ -85,8 +87,8 @@ Focused cleanup work lives in issues, not additional umbrella plans:
 
 - Reference docs describe current behavior, not migration history.
 - Open issues are files in [`issues/`](issues/), one per issue and named for
-  the symptom: `Status: open`, the reproduction, the cause and the change that
-  closes it. A fixture that pins a known failure names its issue file. GitHub
+  the symptom, with `Status: open` and the sections of the
+  [Handoff Spec](HANDOFF_SPEC.md). A fixture that pins a known failure names its issue file. GitHub
   is read-only for this project; assignees and discussion do not belong in this
   tree.
 - A plan for active work lives in this directory and holds only open work.
