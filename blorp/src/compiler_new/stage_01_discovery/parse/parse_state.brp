@@ -35,7 +35,7 @@ import:
 	../syntax/diagnostics:
 		SyntaxDiagnostic(
 			Plain, ExpectedToken, UnknownEscape, IntegerLiteralOverflow, FloatLiteralOverflow,
-			UnexpectedByte, ReservedKeywordAsName,
+			UnexpectedByte, ReservedKeywordAsName, SyntaxNestingTooDeep,
 		),
 		SyntaxDiagnosticAt,
 	../syntax/expressions:
@@ -139,7 +139,8 @@ private record ParseFields {
 	mint: IdMint,
 	diagnostics: List[SyntaxDiagnosticAt],
 	previous: Span,
-	hole_depth: Int
+	hole_depth: Int,
+	nesting: Int
 }
 
 
@@ -189,7 +190,8 @@ pure func new_parse_state(lexed: LexedModule) -> Result[ParseState, ParseInputEr
 									mint = new_id_mint(lexed.module),
 									diagnostics = diagnostics,
 									previous = cursor_token(cursor).span,
-									hole_depth = 0
+									hole_depth = 0,
+									nesting = 0
 								}))
 
 
@@ -324,6 +326,129 @@ pure func report_unreachable_input(guarantee: String):
 
 
 ---
+How many levels of syntax nest inside one another before the parser refuses
+the source. Every construct that recurses in the parser, and so in every walker
+that reads its tree (the minter, the dump, the ID census and the legacy
+projection), counts one level: a bracketed form, an indented block or lambda
+body, a control expression read as an operand, a prefix operator and a nested
+written type or pattern. A left spine and an `else if`, `match` arm or `select`
+arm chain are loops everywhere and do not count (section 3.14).
+
+The value is the largest depth every walker survives with margin on both
+platforms at the declared 16 MB main stack, kept clear of what the rest of the
+pipeline can take. The measurements are in
+`benchmarks/results/discovery_syntax_nesting_limit_2026-10-06.md`:
+
+- the deepest nesting in the repository's own sources is 23 levels, so the
+  limit is more than five times anything written today;
+- the generated C opens one C bracket per level of value `if`, and clang stops
+  at `-fbracket-depth` 256 by default, so the limit stays at half of that;
+- the compiler's older passes overflow the stack on nested value `if`s near 250
+  levels, so the limit stays well below that too;
+- the parser, minter, dump, census and projection each take a source nested to
+  the limit with a margin of at least 4 (the weakest, the legacy projection of
+  control-expression operands, passes 256 operands, 512 levels, on macOS).
+---
+MAX_SYNTAX_NESTING: Int = 128
+
+
+---
+`state` one level deeper, for `inner` to read the nested construct, or, when
+that is more than `MAX_SYNTAX_NESTING` levels, the state with the diagnostic
+reported at the current token and the caller's `too_deep` result for it. This
+is the only way a parse function enters a nesting construct (with
+`nested_recovering`, for constructs whose parser must return a value to go on):
+the depth is restored when `inner` returns, whatever state it returns, so a
+rollback to an earlier state needs no care. `too_deep` is the caller's own
+rejection, which keeps the diagnostic (a rollback to the state before the
+construct would lose it). It is a function so that nothing is built unless the
+limit is hit.
+---
+pure func nested[T](
+	state: ParseState,
+	too_deep: pure (ParseState) -> T,
+	inner: pure (ParseState) -> (ParseState, T),
+) -> (ParseState, T):
+	if state.at_nesting_limit():
+		reported: ParseState = state.report_nesting_too_deep()
+		(reported, too_deep(reported))
+	else:
+		state.one_level_deeper(inner)
+
+
+---
+`nested`, for a parser that always returns a value (a written type, a pattern):
+`recover` makes one from the state after the diagnostic, which has moved past
+the token it was reported at, so a loop around the construct still advances.
+---
+pure func nested_recovering[T](
+	state: ParseState,
+	recover: pure (ParseState) -> (ParseState, T),
+	inner: pure (ParseState) -> (ParseState, T),
+) -> (ParseState, T):
+	if state.at_nesting_limit():
+		recover(state.recovered_after(state.report_nesting_too_deep()))
+	else:
+		state.one_level_deeper(inner)
+
+
+private pure func at_nesting_limit(state: ParseState) -> Bool:
+	from_opaque ParseState(state).nesting >= MAX_SYNTAX_NESTING
+
+
+-- `inner` run one level deeper, the depth restored on the state it returns.
+private pure func one_level_deeper[T](
+	state: ParseState,
+	inner: pure (ParseState) -> (ParseState, T),
+) -> (ParseState, T):
+	fields: ParseFields = from_opaque ParseState(state)
+	inside: ParseState = into_opaque ParseState({ fields | nesting = fields.nesting + 1 })
+	(inner_state, result) = inner(inside)
+	after_fields: ParseFields = from_opaque ParseState(inner_state)
+	(into_opaque ParseState({ after_fields | nesting = fields.nesting }), result)
+
+
+---
+Whether a chain of `links` links, which the parser reads in a loop but the tree
+holds nested one inside the next, fits under `MAX_SYNTAX_NESTING` at the depth
+`state` stands at. This is for the chains whose walkers recurse on the nesting
+(a dimension sum, a run of array suffixes); a left spine of expression operands
+or calls needs no count, because every expression walker loops over it
+(section 3.14).
+---
+pure func chain_fits(state: ParseState, links: Int) -> Bool:
+	from_opaque ParseState(state).nesting + links <= MAX_SYNTAX_NESTING
+
+
+---
+`state` after a chain refused to grow past `MAX_SYNTAX_NESTING`: the nesting
+diagnostic is reported at the current token and nothing is consumed.
+---
+pure func refused_chain(state: ParseState) -> ParseState:
+	state.report_nesting_too_deep()
+
+
+-- One diagnostic per parse, however many constructs then refuse to nest.
+private pure func report_nesting_too_deep(state: ParseState) -> ParseState:
+	if state.reported_nesting_too_deep():
+		state
+	else:
+		state.report_diagnostic(state.current_span(), SyntaxNestingTooDeep)
+
+
+---
+Whether a construct has refused to nest in this parse, which is why a rejected
+expression was rejected.
+---
+pure func reported_nesting_too_deep(state: ParseState) -> Bool:
+	from_opaque ParseState(state).diagnostics.any(pure func(at):
+		match at.diagnostic:
+			SyntaxNestingTooDeep: True
+			_: False
+	)
+
+
+---
 Whether the cursor reads an interpolation hole's own token run. A token
 position there indexes the hole's run, not the module's, so a construct that
 replays from a recorded token position cannot be read inside a hole.
@@ -439,8 +564,12 @@ pure func report_and_recover(
 	state: ParseState,
 	code: TableDiagnostics.PlainSyntaxCode,
 ) -> ParseState:
-	reported: ParseState = state.report_at_current(code)
+	state.recovered_after(state.report_at_current(code))
 
+
+-- `reported`, the state after a diagnostic at `state`'s token, moved past that
+-- token unless it is one a construct's closer or layout needs to see.
+private pure func recovered_after(state: ParseState, reported: ParseState) -> ParseState:
 	if state.at_soft_boundary():
 		reported
 	else:

@@ -41,14 +41,14 @@ import:
 		)
 	binary_operators as Operators
 	stop_reason:
-		StopPoint, Recognition(Recognized, Declined), StopReason(OperandOnNextLine, MemberNameOnNextLine, UnexpectedTokenInBrackets, MissingDictArrow, TrailingCommaAtEndOfSource, SoftKeywordFieldName,
+		StopPoint, rejected_stop, Recognition(Recognized, Declined), StopReason(NestingTooDeep, OperandOnNextLine, MemberNameOnNextLine, UnexpectedTokenInBrackets, MissingDictArrow, TrailingCommaAtEndOfSource, SoftKeywordFieldName,
 			InterpolationHoleNotLexed, InterpolationHoleTrailingTokens, InterpolationHoleRejected, MalformedTokenPayload),
 		Boundary(AtBoundary, PastBoundary), stop_at, expression_boundary, expression_start_reason
 	layout_quirks: BlockAnchor(PastExpressionAnchor), ExpressionAnchor, anchored_at
 	token_cursor: is_soft_keyword
 	parse_state:
 		ParseState, resumed_at, position, diagnostic_count, current_kind, current_token, current_span, current_literal, current_interpolation, advanced, peek_kind,
-		consume_referenced_name, finished_name_use, finished_expression, finished_hole, report_at_current, report_diagnostic, report_unreachable_input, expect_token, entered_hole, left_hole
+		consume_referenced_name, finished_name_use, finished_expression, finished_hole, report_at_current, report_diagnostic, report_unreachable_input, expect_token, entered_hole, left_hole, nested
 
 
 union ExpressionParse:
@@ -252,7 +252,7 @@ private pure func operator_step(
 -- statements of its blocks are on the native stack once per level of nesting.
 private pure func parse_right_operand(state: ParseState, minimum: Int, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
 	if state.current_kind() == IfKeyword or state.current_kind() == MatchKeyword:
-		parse_control_operand(state, anchor)
+		state.nested(refused_recipe, pure func(inside): parse_control_operand(inside, anchor))
 	else:
 		parse_operators(state, minimum, anchor)
 
@@ -322,9 +322,19 @@ private pure func postfix_step(
 	else:
 		match state.current_kind():
 			DotSymbol: member_step(state, receiver)
-			LeftParenSymbol: delimited_step(state, anchor, receiver, CallDelimiter)
-			LeftBracketSymbol: delimited_step(state, anchor, receiver, SubscriptDelimiter)
+			LeftParenSymbol: state.nested(refused_step, pure func(inside): delimited_step(inside, anchor, receiver, CallDelimiter))
+			LeftBracketSymbol: state.nested(refused_step, pure func(inside): delimited_step(inside, anchor, receiver, SubscriptDelimiter))
 			_: (state, Stopped)
+
+
+-- What an atom is when it refuses to nest past `MAX_SYNTAX_NESTING`.
+private pure func refused_recipe(state: ParseState) -> RecipeParse:
+	RejectedRecipe
+
+
+-- What a postfix step is when it refuses to nest past `MAX_SYNTAX_NESTING`.
+private pure func refused_step(state: ParseState) -> ChainStep[ExpressionRecipe]:
+	Abandoned(RejectedShape)
 
 
 private pure func member_step(
@@ -577,7 +587,7 @@ private pure func parse_hole(state: ParseState, hole: HoleScan) -> (ParseState, 
 		None:
 			(state, Declined(state.stop_at(InterpolationHoleNotLexed)))
 		Some((inside, parked)):
-			(read, parsed) = parse_expression_recipe(inside, anchored_at(inside.current_span()))
+			(read, parsed) = inside.nested(refused_recipe, pure func(deeper): parse_expression_recipe(deeper, anchored_at(deeper.current_span())))
 			match parsed:
 				ParsedRecipe(value):
 					if read.current_kind() == EndOfFileToken:
@@ -587,7 +597,7 @@ private pure func parse_hole(state: ParseState, hole: HoleScan) -> (ParseState, 
 				UnsupportedRecipe(stop):
 					(state, Declined(stop))
 				RejectedRecipe:
-					(state, Declined(inside.stop_at(InterpolationHoleRejected)))
+					(state, Declined(inside.rejected_stop(read, InterpolationHoleRejected)))
 
 
 private pure func parse_atom(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
@@ -623,42 +633,23 @@ private pure func parse_atom(state: ParseState, anchor: ExpressionAnchor) -> (Pa
 			-- The token cursor validated the payload as a Unicode scalar value.
 			(state.advanced(), ParsedRecipe({ span = span, kind = CharacterRecipe(to_char(state.current_token().payload)) }))
 		FuncKeyword | PureKeyword:
-			(remaining, lambda) = parse_lambda_recipe(state, anchor)
-			match lambda:
-				ParsedLambda(recipe):
-					(remaining, ParsedRecipe({ span = recipe.span, kind = LambdaAtomRecipe(recipe) }))
-				UnsupportedLambda(stop):
-					(state, UnsupportedRecipe(stop))
+			state.nested(refused_recipe, pure func(inside): parse_lambda_atom(inside, anchor))
 		TrueKeyword | FalseKeyword:
 			(state.advanced(), ParsedRecipe({ span = span, kind = BooleanRecipe(state.current_kind() == TrueKeyword) }))
 		VoidKeyword | UnderscoreSymbol:
 			(state.advanced(), ParsedRecipe({ span = span, kind = VoidRecipe }))
 		MinusSymbol | NotKeyword:
-			operator = if state.current_kind() == MinusSymbol:
-				Negate
-			else:
-				LogicalNot
-			(parsed, operand) = parse_prefix(state.advanced(), anchor)
-			match operand:
-				ParsedRecipe(value):
-					(parsed, ParsedRecipe({ span = span.span_covering(value.span), kind = UnaryRecipe(operator, value) }))
-				_:
-					(parsed, operand)
+			state.nested(refused_recipe, pure func(inside): parse_prefix_operator(inside, anchor, span))
 		DetachKeyword:
-			(parsed, operand) = parse_prefix(state.advanced(), anchor)
-			match operand:
-				ParsedRecipe(value):
-					(parsed, ParsedRecipe({ span = span.span_covering(value.span), kind = DetachRecipe(value) }))
-				_:
-					(parsed, operand)
+			state.nested(refused_recipe, pure func(inside): parse_detach(inside, anchor, span))
 		LeftParenSymbol:
-			parse_parenthesized(state, span)
+			state.nested(refused_recipe, pure func(inside): parse_parenthesized(inside, span))
 		LeftBracketSymbol:
-			parse_list_literal(state, span)
+			state.nested(refused_recipe, pure func(inside): parse_list_literal(inside, span))
 		LeftBraceSymbol:
-			parse_braced(state, span)
+			state.nested(refused_recipe, pure func(inside): parse_braced(inside, span))
 		IfKeyword | MatchKeyword:
-			parse_control_operand(state, anchor)
+			state.nested(refused_recipe, pure func(inside): parse_control_operand(inside, anchor))
 		EndOfFileToken | RightParenSymbol | RightBracketSymbol:
 			(state.report_at_current(ExpectedExpressionDiagnostic), RejectedRecipe)
 		_:
@@ -669,6 +660,38 @@ private pure func parse_atom(state: ParseState, anchor: ExpressionAnchor) -> (Pa
 					-- Every kind the arms above read has no reason; the others are named in full.
 					report_unreachable_input("an atom token the parser reads has an arm")
 					(state, UnsupportedRecipe(state.stop_at(MalformedTokenPayload)))
+
+
+-- The atoms that nest, counted once each by `parse_atom` (section 3.14).
+private pure func parse_lambda_atom(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
+	(remaining, lambda) = parse_lambda_recipe(state, anchor)
+	match lambda:
+		ParsedLambda(recipe):
+			(remaining, ParsedRecipe({ span = recipe.span, kind = LambdaAtomRecipe(recipe) }))
+		UnsupportedLambda(stop):
+			(state, UnsupportedRecipe(stop))
+
+
+private pure func parse_prefix_operator(state: ParseState, anchor: ExpressionAnchor, span: Span) -> (ParseState, RecipeParse):
+	operator = if state.current_kind() == MinusSymbol:
+		Negate
+	else:
+		LogicalNot
+	(parsed, operand) = parse_prefix(state.advanced(), anchor)
+	match operand:
+		ParsedRecipe(value):
+			(parsed, ParsedRecipe({ span = span.span_covering(value.span), kind = UnaryRecipe(operator, value) }))
+		_:
+			(parsed, operand)
+
+
+private pure func parse_detach(state: ParseState, anchor: ExpressionAnchor, span: Span) -> (ParseState, RecipeParse):
+	(parsed, operand) = parse_prefix(state.advanced(), anchor)
+	match operand:
+		ParsedRecipe(value):
+			(parsed, ParsedRecipe({ span = span.span_covering(value.span), kind = DetachRecipe(value) }))
+		_:
+			(parsed, operand)
 
 
 -- An `if` or `match` as an operand. Its blocks end on dedents, so what the

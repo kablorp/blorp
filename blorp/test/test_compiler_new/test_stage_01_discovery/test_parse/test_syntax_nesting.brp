@@ -1,0 +1,642 @@
+-- `MAX_SYNTAX_NESTING` (section 3.14): every form that counts toward the limit
+-- is read, minted, dumped and passed by the ID census at exactly the limit, and
+-- one level more is rejected with `SyntaxNestingTooDeep`. The legacy projection
+-- has the same proof in `test_syntax_nesting_projection.brp`.
+--
+-- A depth is the number of levels open at the deepest point. A source at the
+-- limit puts its innermost construct at level `MAX_SYNTAX_NESTING`.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/layout_quirks: anchored_at
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state:
+		MAX_SYNTAX_NESTING, ParseState, new_parse_state, current_span, issued_ids, spellings, diagnostic_count, reported_nesting_too_deep
+	../../../../src/compiler_new/stage_01_discovery/parse/stop_reason: StopReason(NestingTooDeep)
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_expression_parser:
+		parse_expression_to_boundary, ExpressionParse(RejectedExpression, UnsupportedExpression)
+	../../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: reject_preview
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_rejected_declaration_scan: scan_rejected_declarations, RejectedDeclarationScan(CompleteDeclarationRejection)
+	../../../../src/compiler_new/stage_01_discovery/diagnostics/rejected_syntax_render: render_rejected_diagnostics
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
+		ModuleDeclarationScanStop(ReachedEndOfSource, StoppedAtRejectedDeclaration, StoppedAtUnreadDeclaration), scan_module_declarations
+	../../../../src/compiler_new/stage_01_discovery/syntax/dump: dumped_module
+	../../../../src/compiler_new/stage_01_discovery/syntax/id_census: id_census
+	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: ModuleSyntax, ModuleItem
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/limits: MAX_INTERPOLATION_DEPTH
+	../../../../src/compiler_new/stage_01_discovery/tables/source_position: TAB_WIDTH
+	test: TestSuite
+
+
+-- `count` copies of `open`, `inner`, then `count` copies of `close`.
+private pure func nested_text(open: String, inner: String, close: String, count: Int) -> String:
+	open.repeat(count) + inner + close.repeat(count)
+
+
+-- Whether the scan of `text` reads its one declaration in full, and the dump
+-- and the census pass the result with no diagnostic.
+private func is_accepted(text: String) -> Bool:
+	module = module_id_at_row(0)
+	match new_parse_state(lex_module(module, text)):
+		Err(_): False
+		Ok(entry):
+			(state, scan) = scan_module_declarations(entry)
+			issued = issued_ids(state)
+			syntax: ModuleSyntax = {
+				documentation = None, items = scan.items,
+				definitions = issued.definitions, imports = issued.imports, counts = issued.counts
+			}
+			read_to_the_end: Bool = match scan.stop:
+				ReachedEndOfSource: True
+				_: False
+			(scan.items.length() == 1 and state.diagnostic_count() == 0 and read_to_the_end
+				and id_census(module, syntax).is_empty() and dumped_module(syntax, spellings(state)).length() > 0)
+
+
+-- Whether the scan of `text` stops at its declaration for being nested too
+-- deeply: reported as a diagnostic, or kept as the reason of a rollback.
+private func is_stopped_as_too_deep(text: String) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Err(_): False
+		Ok(entry):
+			(state, scan) = scan_module_declarations(entry)
+			match scan.stop:
+				StoppedAtRejectedDeclaration: state.reported_nesting_too_deep()
+				StoppedAtUnreadDeclaration(unread): unread.stop.reason == NestingTooDeep
+				_: False
+
+
+-- Whether `text`, the value of a global, is accepted.
+private func global_value_is_accepted(text: String) -> Bool:
+	is_accepted("value = " + text)
+
+
+-- Whether `text` as an expression is rejected for being nested too deeply.
+private func expression_is_rejected_as_too_deep(text: String) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Err(_): False
+		Ok(entry):
+			(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+			match result:
+				RejectedExpression: parsed.reported_nesting_too_deep()
+				-- A construct that gives up its rollback (a lambda) hands the expression back with
+				-- the reason, which the rollback keeps and the diagnostic does not.
+				UnsupportedExpression(stop): stop.reason == NestingTooDeep
+				_: False
+
+
+-- An expression form: `count` levels around `inner` are `count` nesting levels.
+private func expression_form_at_the_limit(open: String, inner: String, close: String) -> Bool:
+	global_value_is_accepted(nested_text(open, inner, close, MAX_SYNTAX_NESTING))
+
+
+private func expression_form_one_past_the_limit(open: String, inner: String, close: String) -> Bool:
+	expression_is_rejected_as_too_deep(nested_text(open, inner, close, MAX_SYNTAX_NESTING + 1))
+
+
+func test_lists_at_the_limit() -> Bool:
+	expression_form_at_the_limit("[", "1", "]")
+
+
+func test_lists_one_past_the_limit() -> Bool:
+	expression_form_one_past_the_limit("[", "1", "]")
+
+
+func test_tuples_at_the_limit() -> Bool:
+	expression_form_at_the_limit("(", "1", ", 1)")
+
+
+func test_tuples_one_past_the_limit() -> Bool:
+	expression_form_one_past_the_limit("(", "1", ", 1)")
+
+
+func test_groupings_at_the_limit() -> Bool:
+	expression_form_at_the_limit("(", "1", ")")
+
+
+func test_groupings_one_past_the_limit() -> Bool:
+	expression_form_one_past_the_limit("(", "1", ")")
+
+
+func test_vectors_at_the_limit() -> Bool:
+	expression_form_at_the_limit("{", "1", "}")
+
+
+func test_vectors_one_past_the_limit() -> Bool:
+	expression_form_one_past_the_limit("{", "1", "}")
+
+
+func test_call_arguments_at_the_limit() -> Bool:
+	expression_form_at_the_limit("f(", "1", ")")
+
+
+func test_call_arguments_one_past_the_limit() -> Bool:
+	expression_form_one_past_the_limit("f(", "1", ")")
+
+
+func test_subscripts_at_the_limit() -> Bool:
+	expression_form_at_the_limit("a[", "1", "]")
+
+
+func test_subscripts_one_past_the_limit() -> Bool:
+	expression_form_one_past_the_limit("a[", "1", "]")
+
+
+func test_record_literals_at_the_limit() -> Bool:
+	expression_form_at_the_limit("{f = ", "1", "}")
+
+
+func test_record_literals_one_past_the_limit() -> Bool:
+	expression_form_one_past_the_limit("{f = ", "1", "}")
+
+
+func test_record_updates_at_the_limit() -> Bool:
+	expression_form_at_the_limit("{r | f = ", "1", "}")
+
+
+func test_record_updates_one_past_the_limit() -> Bool:
+	expression_form_one_past_the_limit("{r | f = ", "1", "}")
+
+
+func test_dict_literals_at_the_limit() -> Bool:
+	expression_form_at_the_limit("{k => ", "1", "}")
+
+
+func test_dict_literals_one_past_the_limit() -> Bool:
+	expression_form_one_past_the_limit("{k => ", "1", "}")
+
+
+func test_expression_bodied_lambdas_at_the_limit() -> Bool:
+	expression_form_at_the_limit("func(a): ", "1", "")
+
+
+func test_expression_bodied_lambdas_one_past_the_limit() -> Bool:
+	expression_form_one_past_the_limit("func(a): ", "1", "")
+
+
+func test_not_chains_at_the_limit() -> Bool:
+	expression_form_at_the_limit("not ", "x", "")
+
+
+func test_not_chains_one_past_the_limit() -> Bool:
+	expression_form_one_past_the_limit("not ", "x", "")
+
+
+func test_negation_chains_at_the_limit() -> Bool:
+	expression_form_at_the_limit("- ", "x", "")
+
+
+func test_negation_chains_one_past_the_limit() -> Bool:
+	expression_form_one_past_the_limit("- ", "x", "")
+
+
+func test_detach_chains_at_the_limit() -> Bool:
+	expression_form_at_the_limit("detach ", "x", "")
+
+
+func test_detach_chains_one_past_the_limit() -> Bool:
+	expression_form_one_past_the_limit("detach ", "x", "")
+
+
+-- The lexer admits `MAX_INTERPOLATION_DEPTH` nested holes, fewer than the
+-- parser's limit, so it is the lexer's own limit that ends a run of holes; each
+-- hole it admits is one level.
+func test_holes_are_accepted_up_to_the_lexer_cap() -> Bool:
+	global_value_is_accepted(nested_text("\"$" + "{", "1", "}\"", MAX_INTERPOLATION_DEPTH))
+
+
+-- A hole is a level, and what it holds nests from there: a hole around brackets
+-- reaches the limit with one bracket fewer.
+func test_a_hole_around_brackets_at_the_limit() -> Bool:
+	global_value_is_accepted("\"$" + "{" + nested_text("[", "1", "]", MAX_SYNTAX_NESTING - 1) + "}\"")
+
+
+func test_a_hole_around_brackets_one_past_the_limit() -> Bool:
+	expression_is_rejected_as_too_deep("\"$" + "{" + nested_text("[", "1", "]", MAX_SYNTAX_NESTING) + "}\"")
+
+
+-- Holes inside holes, each holding brackets, add up the same way.
+func test_nested_holes_around_brackets_add_up() -> Bool:
+	holes = MAX_INTERPOLATION_DEPTH
+	brackets = MAX_SYNTAX_NESTING - holes
+	inner = nested_text("[", "1", "]", brackets)
+	text = nested_text("\"$" + "{", inner, "}\"", holes)
+	global_value_is_accepted(text) and expression_is_rejected_as_too_deep(nested_text("\"$" + "{", "[" + inner + "]", "}\"", holes))
+
+
+-- A level counted once on the way down is not counted again: after a deep form
+-- returns, a shallow sibling is read at the depth it stands at.
+func test_siblings_do_not_accumulate_depth() -> Bool:
+	text = nested_text("[", "1", "]", MAX_SYNTAX_NESTING - 1)
+	global_value_is_accepted("[" + text + ", " + text + ", " + text + "]")
+
+
+-- The source of one function `f` whose body is `lines`, each indented once.
+private pure func function_source(lines: List[String]) -> String:
+	(["func f(a: Int) -> Int:"].concat(lines.map(pure func(line): "\t" + line))).join("\n") + "\n"
+
+
+private func function_is_accepted(text: String) -> Bool:
+	is_accepted(text)
+
+
+private func function_is_declined_as_too_deep(text: String) -> Bool:
+	is_stopped_as_too_deep(text)
+
+
+-- Lines that nest `count` blocks, each opened by `header`, around `leaf`. The
+-- function's own body is a block too, so the innermost block is level `count + 1`.
+private pure func nested_blocks(header: String, count: Int, leaf: String) -> List[String]:
+	var lines: List[String] = []
+	var level: Int = 0
+	while level < count:
+		lines = lines.append("\t".repeat(level) + header.replace("#", level.to_string()))
+		level += 1
+	lines.append("\t".repeat(count) + leaf)
+
+
+private func blocks_at_the_limit(header: String) -> Bool:
+	function_is_accepted(function_source(nested_blocks(header, MAX_SYNTAX_NESTING - 1, "1")))
+
+
+private func blocks_one_past_the_limit(header: String) -> Bool:
+	function_is_declined_as_too_deep(function_source(nested_blocks(header, MAX_SYNTAX_NESTING, "1")))
+
+
+func test_value_ifs_at_the_limit() -> Bool:
+	blocks_at_the_limit("v# = if a:")
+
+
+func test_value_ifs_one_past_the_limit() -> Bool:
+	blocks_one_past_the_limit("v# = if a:")
+
+
+func test_with_blocks_at_the_limit() -> Bool:
+	blocks_at_the_limit("with r# = open(a):")
+
+
+func test_with_blocks_one_past_the_limit() -> Bool:
+	blocks_one_past_the_limit("with r# = open(a):")
+
+
+func test_concurrent_blocks_at_the_limit() -> Bool:
+	blocks_at_the_limit("concurrent(max_threads: 2, timeout: a):")
+
+
+func test_concurrent_blocks_one_past_the_limit() -> Bool:
+	blocks_one_past_the_limit("concurrent(max_threads: 2, timeout: a):")
+
+
+func test_debug_blocks_at_the_limit() -> Bool:
+	blocks_at_the_limit("debug:")
+
+
+func test_debug_blocks_one_past_the_limit() -> Bool:
+	blocks_one_past_the_limit("debug:")
+
+
+-- A `select` nests two lines of indentation per level: the keyword, then the
+-- arm, whose block is the next level.
+private pure func nested_selects(count: Int) -> List[String]:
+	var lines: List[String] = []
+	var level: Int = 0
+	while level < count:
+		lines = lines.append("\t".repeat(2 * level) + "select:")
+		lines = lines.append("\t".repeat(2 * level + 1) + "v" + level.to_string() + " from a:")
+		level += 1
+	lines.append("\t".repeat(2 * count) + "1")
+
+
+func test_selects_at_the_limit() -> Bool:
+	function_is_accepted(function_source(nested_selects(MAX_SYNTAX_NESTING - 1)))
+
+
+func test_selects_one_past_the_limit() -> Bool:
+	function_is_declined_as_too_deep(function_source(nested_selects(MAX_SYNTAX_NESTING)))
+
+
+-- A control expression read as an operand is a level of its own, and so is its
+-- block: `v = 1 + if a:` costs two levels, so the last whole level is the
+-- 63rd, and a grouping around the leaf takes the innermost block to the limit.
+private pure func nested_operand_ifs(count: Int, leaf: String) -> List[String]:
+	var lines: List[String] = []
+	var level: Int = 0
+	while level < count:
+		lines = lines.append("\t".repeat(level) + "v" + level.to_string() + " = 1 + if a:")
+		level += 1
+	lines.append("\t".repeat(count) + leaf)
+
+
+func test_operand_ifs_at_the_limit() -> Bool:
+	count = (MAX_SYNTAX_NESTING - 2) / 2
+	function_is_accepted(function_source(nested_operand_ifs(count, "(1)")))
+
+
+func test_operand_ifs_one_past_the_limit() -> Bool:
+	count = (MAX_SYNTAX_NESTING - 2) / 2
+	function_is_declined_as_too_deep(function_source(nested_operand_ifs(count, "((1))")))
+
+
+-- A lambda with a block body: the lambda and its block are two levels.
+private pure func nested_block_lambdas(count: Int) -> List[String]:
+	var lines: List[String] = []
+	var level: Int = 0
+	while level < count:
+		lines = lines.append("\t".repeat(level) + "f" + level.to_string() + " = func(b" + level.to_string() + "):")
+		level += 1
+	lines.append("\t".repeat(count) + "1")
+
+
+func test_block_lambdas_at_the_limit() -> Bool:
+	function_is_accepted(function_source(nested_block_lambdas((MAX_SYNTAX_NESTING - 1) / 2)))
+
+
+func test_block_lambdas_one_past_the_limit() -> Bool:
+	function_is_declined_as_too_deep(function_source(nested_block_lambdas((MAX_SYNTAX_NESTING - 1) / 2 + 1)))
+
+
+private func declaration_is_rejected_as_too_deep(text: String) -> Bool:
+	is_stopped_as_too_deep(text)
+
+
+-- Written types. A type, and each argument or element inside it, is a level.
+private pure func function_with_parameter_type(written: String) -> String:
+	"func f(a: " + written + ") -> Int:\n\t1\n"
+
+
+func test_tuple_types_at_the_limit() -> Bool:
+	function_is_accepted(function_with_parameter_type(nested_text("(", "Int", ", Int)", MAX_SYNTAX_NESTING - 2)))
+
+
+func test_tuple_types_one_past_the_limit() -> Bool:
+	declaration_is_rejected_as_too_deep(function_with_parameter_type(nested_text("(", "Int", ", Int)", MAX_SYNTAX_NESTING - 1)))
+
+
+func test_grouped_types_at_the_limit() -> Bool:
+	function_is_accepted(function_with_parameter_type(nested_text("(", "Int", ")", MAX_SYNTAX_NESTING - 2)))
+
+
+func test_grouped_types_one_past_the_limit() -> Bool:
+	declaration_is_rejected_as_too_deep(function_with_parameter_type(nested_text("(", "Int", ")", MAX_SYNTAX_NESTING - 1)))
+
+
+-- Each arrow nests its parameter list and its result, two levels.
+func test_function_types_at_the_limit() -> Bool:
+	function_is_accepted(function_with_parameter_type(nested_text("(Int) -> ", "Int", "", (MAX_SYNTAX_NESTING - 2) / 2)))
+
+
+func test_function_types_one_past_the_limit() -> Bool:
+	declaration_is_rejected_as_too_deep(function_with_parameter_type(nested_text("(Int) -> ", "Int", "", (MAX_SYNTAX_NESTING - 2) / 2 + 1)))
+
+
+-- A dimension nests by its parentheses, inside the argument that holds it.
+func test_parenthesized_dimensions_at_the_limit() -> Bool:
+	function_is_accepted(function_with_parameter_type("Float[" + nested_text("(", "#N", ")", MAX_SYNTAX_NESTING - 2) + "]"))
+
+
+func test_parenthesized_dimensions_one_past_the_limit() -> Bool:
+	declaration_is_rejected_as_too_deep(function_with_parameter_type("Float[" + nested_text("(", "#N", ")", MAX_SYNTAX_NESTING - 1) + "]"))
+
+
+-- A dimension sum and a run of array suffixes are loops in the parser, but the
+-- tree holds each term inside the next and the type walkers recurse on it, so
+-- their length counts like a nesting (section 3.14).
+func test_dimension_sums_at_the_limit() -> Bool:
+	function_is_accepted(function_with_parameter_type("Float[#N" + " + #N".repeat(MAX_SYNTAX_NESTING - 2) + "]"))
+
+
+func test_dimension_sums_one_past_the_limit() -> Bool:
+	declaration_is_rejected_as_too_deep(function_with_parameter_type("Float[#N" + " + #N".repeat(MAX_SYNTAX_NESTING - 1) + "]"))
+
+
+func test_dimension_products_at_the_limit() -> Bool:
+	function_is_accepted(function_with_parameter_type("Float[#N" + " * #N".repeat(MAX_SYNTAX_NESTING - 2) + "]"))
+
+
+func test_dimension_products_one_past_the_limit() -> Bool:
+	declaration_is_rejected_as_too_deep(function_with_parameter_type("Float[#N" + " * #N".repeat(MAX_SYNTAX_NESTING - 1) + "]"))
+
+
+func test_array_suffixes_at_the_limit() -> Bool:
+	function_is_accepted(function_with_parameter_type("Int" + "[#N]".repeat(MAX_SYNTAX_NESTING)))
+
+
+func test_array_suffixes_one_past_the_limit() -> Bool:
+	declaration_is_rejected_as_too_deep(function_with_parameter_type("Int" + "[#N]".repeat(MAX_SYNTAX_NESTING + 1)))
+
+
+-- Patterns: the innermost pattern is a level of its own, and so is the
+-- function's block and the match inside it.
+private pure func function_matching(pattern: String) -> String:
+	function_source(["match a:", "\t" + pattern + ": 1", "\t_: 0"])
+
+
+func test_tuple_patterns_at_the_limit() -> Bool:
+	function_is_accepted(function_matching(nested_text("(", "1", ", 1)", MAX_SYNTAX_NESTING - 2)))
+
+
+func test_tuple_patterns_one_past_the_limit() -> Bool:
+	function_is_declined_as_too_deep(function_matching(nested_text("(", "1", ", 1)", MAX_SYNTAX_NESTING - 1)))
+
+
+func test_list_patterns_at_the_limit() -> Bool:
+	function_is_accepted(function_matching(nested_text("[", "1", "]", MAX_SYNTAX_NESTING - 2)))
+
+
+func test_list_patterns_one_past_the_limit() -> Bool:
+	function_is_declined_as_too_deep(function_matching(nested_text("[", "1", "]", MAX_SYNTAX_NESTING - 1)))
+
+
+-- Statement blocks: the function's body is the first level.
+func test_if_statement_blocks_at_the_limit() -> Bool:
+	blocks_at_the_limit("if a:")
+
+
+func test_if_statement_blocks_one_past_the_limit() -> Bool:
+	blocks_one_past_the_limit("if a:")
+
+
+func test_while_blocks_at_the_limit() -> Bool:
+	blocks_at_the_limit("while a:")
+
+
+func test_while_blocks_one_past_the_limit() -> Bool:
+	blocks_one_past_the_limit("while a:")
+
+
+func test_for_blocks_at_the_limit() -> Bool:
+	blocks_at_the_limit("for x in a:")
+
+
+func test_for_blocks_one_past_the_limit() -> Bool:
+	blocks_one_past_the_limit("for x in a:")
+
+
+-- A `match` nests one level per case block.
+private pure func nested_matches(count: Int) -> List[String]:
+	var lines: List[String] = []
+	var level: Int = 0
+	while level < count:
+		lines = lines.append("\t".repeat(2 * level) + "match a:")
+		lines = lines.append("\t".repeat(2 * level + 1) + "_:")
+		level += 1
+	lines.append("\t".repeat(2 * count) + "1")
+
+
+func test_match_blocks_at_the_limit() -> Bool:
+	function_is_accepted(function_source(nested_matches(MAX_SYNTAX_NESTING - 1)))
+
+
+func test_match_blocks_one_past_the_limit() -> Bool:
+	function_is_declined_as_too_deep(function_source(nested_matches(MAX_SYNTAX_NESTING)))
+
+
+-- Each `else` block nests inside the last `if`.
+private pure func nested_else_blocks(count: Int) -> List[String]:
+	var lines: List[String] = []
+	var level: Int = 0
+	while level < count:
+		lines = lines.append("\t".repeat(level) + "if a:")
+		lines = lines.append("\t".repeat(level + 1) + "1")
+		lines = lines.append("\t".repeat(level) + "else:")
+		level += 1
+	lines.append("\t".repeat(count) + "1")
+
+
+func test_else_blocks_at_the_limit() -> Bool:
+	function_is_accepted(function_source(nested_else_blocks(MAX_SYNTAX_NESTING - 1)))
+
+
+func test_else_blocks_one_past_the_limit() -> Bool:
+	function_is_declined_as_too_deep(function_source(nested_else_blocks(MAX_SYNTAX_NESTING)))
+
+
+func test_local_function_bodies_at_the_limit() -> Bool:
+	blocks_at_the_limit("func g#(x: Int) -> Int:")
+
+
+func test_local_function_bodies_one_past_the_limit() -> Bool:
+	blocks_one_past_the_limit("func g#(x: Int) -> Int:")
+
+
+-- The diagnostic of a real parse sits where the parser refused to nest.
+func test_the_diagnostic_is_located_at_the_refused_token() -> Bool:
+	text = nested_text("[", "1", "]", MAX_SYNTAX_NESTING + 1)
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Err(_): False
+		Ok(entry):
+			(parsed, _) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+			match reject_preview(parsed):
+				Ok(rejected):
+					match render_rejected_diagnostics(rejected):
+						Ok([row]):
+							(row.rendered.message == "syntax nested too deeply" and row.line == 1
+								and row.column == MAX_SYNTAX_NESTING + 1)
+						_: False
+				Err(_): False
+
+
+-- The same from a declaration: the `Int` that would be level 129 of a field's type.
+func test_the_diagnostic_of_a_rejected_declaration_is_located() -> Bool:
+	written = nested_text("List[", "Int", "]", MAX_SYNTAX_NESTING)
+	lexed = lex_module(module_id_at_row(0), "record R {\n\tf: " + written + "\n}\n")
+	match scan_rejected_declarations(lexed):
+		Ok(CompleteDeclarationRejection(rejected)):
+			match render_rejected_diagnostics(rejected):
+				Ok([row]):
+					-- A tab is `TAB_WIDTH` columns wide.
+					(row.rendered.message == "syntax nested too deeply" and row.line == 2
+						and row.column == TAB_WIDTH + "f: ".length() + "List[".length() * MAX_SYNTAX_NESTING + 1)
+				_: False
+		_: False
+
+
+-- The chains that are loops in the parser are not counted at any length.
+func test_left_spines_and_chains_do_not_count() -> Bool:
+	sum = "1" + " + 1".repeat(5000)
+	calls = "a" + ".f()".repeat(2000)
+	global_value_is_accepted(sum) and global_value_is_accepted(calls)
+
+
+tests: TestSuite = {
+	description = "Syntax nesting limit",
+	tests = [
+		("lists at the limit", test_lists_at_the_limit),
+		("lists one past the limit", test_lists_one_past_the_limit),
+		("tuples at the limit", test_tuples_at_the_limit),
+		("tuples one past the limit", test_tuples_one_past_the_limit),
+		("groupings at the limit", test_groupings_at_the_limit),
+		("groupings one past the limit", test_groupings_one_past_the_limit),
+		("vectors at the limit", test_vectors_at_the_limit),
+		("vectors one past the limit", test_vectors_one_past_the_limit),
+		("call arguments at the limit", test_call_arguments_at_the_limit),
+		("call arguments one past the limit", test_call_arguments_one_past_the_limit),
+		("subscripts at the limit", test_subscripts_at_the_limit),
+		("subscripts one past the limit", test_subscripts_one_past_the_limit),
+		("record literals at the limit", test_record_literals_at_the_limit),
+		("record literals one past the limit", test_record_literals_one_past_the_limit),
+		("record updates at the limit", test_record_updates_at_the_limit),
+		("record updates one past the limit", test_record_updates_one_past_the_limit),
+		("dict literals at the limit", test_dict_literals_at_the_limit),
+		("dict literals one past the limit", test_dict_literals_one_past_the_limit),
+		("expression-bodied lambdas at the limit", test_expression_bodied_lambdas_at_the_limit),
+		("expression-bodied lambdas one past the limit", test_expression_bodied_lambdas_one_past_the_limit),
+		("not chains at the limit", test_not_chains_at_the_limit),
+		("not chains one past the limit", test_not_chains_one_past_the_limit),
+		("negation chains at the limit", test_negation_chains_at_the_limit),
+		("negation chains one past the limit", test_negation_chains_one_past_the_limit),
+		("detach chains at the limit", test_detach_chains_at_the_limit),
+		("detach chains one past the limit", test_detach_chains_one_past_the_limit),
+		("holes are accepted up to the lexer cap", test_holes_are_accepted_up_to_the_lexer_cap),
+		("a hole around brackets at the limit", test_a_hole_around_brackets_at_the_limit),
+		("a hole around brackets one past the limit", test_a_hole_around_brackets_one_past_the_limit),
+		("nested holes around brackets add up", test_nested_holes_around_brackets_add_up),
+		("siblings do not accumulate depth", test_siblings_do_not_accumulate_depth),
+		("value ifs at the limit", test_value_ifs_at_the_limit),
+		("value ifs one past the limit", test_value_ifs_one_past_the_limit),
+		("with blocks at the limit", test_with_blocks_at_the_limit),
+		("with blocks one past the limit", test_with_blocks_one_past_the_limit),
+		("concurrent blocks at the limit", test_concurrent_blocks_at_the_limit),
+		("concurrent blocks one past the limit", test_concurrent_blocks_one_past_the_limit),
+		("debug blocks at the limit", test_debug_blocks_at_the_limit),
+		("debug blocks one past the limit", test_debug_blocks_one_past_the_limit),
+		("selects at the limit", test_selects_at_the_limit),
+		("selects one past the limit", test_selects_one_past_the_limit),
+		("operand ifs at the limit", test_operand_ifs_at_the_limit),
+		("operand ifs one past the limit", test_operand_ifs_one_past_the_limit),
+		("block lambdas at the limit", test_block_lambdas_at_the_limit),
+		("block lambdas one past the limit", test_block_lambdas_one_past_the_limit),
+		("tuple types at the limit", test_tuple_types_at_the_limit),
+		("tuple types one past the limit", test_tuple_types_one_past_the_limit),
+		("grouped types at the limit", test_grouped_types_at_the_limit),
+		("grouped types one past the limit", test_grouped_types_one_past_the_limit),
+		("function types at the limit", test_function_types_at_the_limit),
+		("function types one past the limit", test_function_types_one_past_the_limit),
+		("parenthesized dimensions at the limit", test_parenthesized_dimensions_at_the_limit),
+		("parenthesized dimensions one past the limit", test_parenthesized_dimensions_one_past_the_limit),
+		("dimension sums at the limit", test_dimension_sums_at_the_limit),
+		("dimension sums one past the limit", test_dimension_sums_one_past_the_limit),
+		("dimension products at the limit", test_dimension_products_at_the_limit),
+		("dimension products one past the limit", test_dimension_products_one_past_the_limit),
+		("array suffixes at the limit", test_array_suffixes_at_the_limit),
+		("array suffixes one past the limit", test_array_suffixes_one_past_the_limit),
+		("tuple patterns at the limit", test_tuple_patterns_at_the_limit),
+		("tuple patterns one past the limit", test_tuple_patterns_one_past_the_limit),
+		("list patterns at the limit", test_list_patterns_at_the_limit),
+		("list patterns one past the limit", test_list_patterns_one_past_the_limit),
+		("if statement blocks at the limit", test_if_statement_blocks_at_the_limit),
+		("if statement blocks one past the limit", test_if_statement_blocks_one_past_the_limit),
+		("while blocks at the limit", test_while_blocks_at_the_limit),
+		("while blocks one past the limit", test_while_blocks_one_past_the_limit),
+		("for blocks at the limit", test_for_blocks_at_the_limit),
+		("for blocks one past the limit", test_for_blocks_one_past_the_limit),
+		("match blocks at the limit", test_match_blocks_at_the_limit),
+		("match blocks one past the limit", test_match_blocks_one_past_the_limit),
+		("else blocks at the limit", test_else_blocks_at_the_limit),
+		("else blocks one past the limit", test_else_blocks_one_past_the_limit),
+		("local function bodies at the limit", test_local_function_bodies_at_the_limit),
+		("local function bodies one past the limit", test_local_function_bodies_one_past_the_limit),
+		("the diagnostic is located at the refused token", test_the_diagnostic_is_located_at_the_refused_token),
+		("the diagnostic of a rejected declaration is located", test_the_diagnostic_of_a_rejected_declaration_is_located),
+		("left spines and chains do not count", test_left_spines_and_chains_do_not_count),
+	]
+}

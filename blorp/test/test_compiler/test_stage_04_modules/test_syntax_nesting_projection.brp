@@ -1,0 +1,347 @@
+-- The legacy projection's half of the `MAX_SYNTAX_NESTING` proof (section 3.14):
+-- every form that counts toward the limit projects at exactly the limit. The
+-- parse, mint, dump and census halves, and the rejection one level past the
+-- limit, are in `test_syntax_nesting.brp` under `test_compiler_new`.
+import:
+	../../../src/compiler/discovery_tree_projection: legacy_expression_preview, legacy_declaration_projection
+	../../../src/compiler/stage_02_lex/name_table: EMPTY_NAME_TABLE
+	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../src/compiler_new/stage_01_discovery/parse/parse_state: MAX_SYNTAX_NESTING, new_parse_state
+	../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_source
+	../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
+		parse_declaration_preview, DeclarationPreviewParse(ParsedDeclarationPreview), DeclarationPreview(GlobalDeclarationPreview)
+	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
+		ModuleDeclarationScanStop(ReachedEndOfSource), scan_module_declarations
+	../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../src/compiler_new/stage_01_discovery/tables/limits: MAX_INTERPOLATION_DEPTH
+	test: TestSuite
+
+
+-- `count` copies of `open`, `inner`, then `count` copies of `close`.
+private pure func nested_text(open: String, inner: String, close: String, count: Int) -> String:
+	open.repeat(count) + inner + close.repeat(count)
+
+
+-- Whether `text`, the value of a global, parses and projects.
+private func global_value_projects(text: String) -> Bool:
+	lexed = lex_module(module_id_at_row(0), "value = " + text)
+	match new_parse_state(lexed):
+		Err(_): False
+		Ok(entry):
+			(_, result) = parse_declaration_preview(entry)
+			match result:
+				ParsedDeclarationPreview(GlobalDeclarationPreview(declaration)):
+					match legacy_expression_preview(preview_source(lexed), EMPTY_NAME_TABLE, declaration.value):
+						Ok(_): True
+						Err(_): False
+				_: False
+
+
+-- Whether the scan of `text` reads its one declaration in full and the whole
+-- module projects.
+private func declarations_project(text: String) -> Bool:
+	lexed = lex_module(module_id_at_row(0), text)
+	match new_parse_state(lexed):
+		Err(_): False
+		Ok(entry):
+			(_, scan) = scan_module_declarations(entry)
+			read_to_the_end: Bool = match scan.stop:
+				ReachedEndOfSource: True
+				_: False
+			match legacy_declaration_projection(preview_source(lexed), scan, EMPTY_NAME_TABLE):
+				Ok(projected): projected.declarations.length() == 1 and read_to_the_end
+				Err(_): False
+
+
+private func expression_form_projects(open: String, inner: String, close: String) -> Bool:
+	global_value_projects(nested_text(open, inner, close, MAX_SYNTAX_NESTING))
+
+
+func test_lists_project_at_the_limit() -> Bool:
+	expression_form_projects("[", "1", "]")
+
+
+func test_tuples_project_at_the_limit() -> Bool:
+	expression_form_projects("(", "1", ", 1)")
+
+
+func test_groupings_project_at_the_limit() -> Bool:
+	expression_form_projects("(", "1", ")")
+
+
+func test_vectors_project_at_the_limit() -> Bool:
+	expression_form_projects("{", "1", "}")
+
+
+func test_call_arguments_project_at_the_limit() -> Bool:
+	expression_form_projects("f(", "1", ")")
+
+
+func test_subscripts_project_at_the_limit() -> Bool:
+	expression_form_projects("a[", "1", "]")
+
+
+func test_record_literals_project_at_the_limit() -> Bool:
+	expression_form_projects("{f = ", "1", "}")
+
+
+func test_record_updates_project_at_the_limit() -> Bool:
+	expression_form_projects("{r | f = ", "1", "}")
+
+
+func test_dict_literals_project_at_the_limit() -> Bool:
+	expression_form_projects("{k => ", "1", "}")
+
+
+func test_expression_bodied_lambdas_project_at_the_limit() -> Bool:
+	expression_form_projects("func(a): ", "1", "")
+
+
+func test_not_chains_project_at_the_limit() -> Bool:
+	expression_form_projects("not ", "x", "")
+
+
+func test_negation_chains_project_at_the_limit() -> Bool:
+	expression_form_projects("- ", "x", "")
+
+
+func test_detach_chains_project_at_the_limit() -> Bool:
+	expression_form_projects("detach ", "x", "")
+
+
+func test_interpolation_holes_project() -> Bool:
+	global_value_projects(nested_text("\"$" + "{", "1", "}\"", 60))
+
+
+-- The source of one function `f` whose body is `lines`, each indented once.
+private pure func function_source(lines: List[String]) -> String:
+	(["func f(a: Int) -> Int:"].concat(lines.map(pure func(line): "\t" + line))).join("\n") + "\n"
+
+
+-- Lines that nest `count` blocks, each opened by `header`, around `leaf`.
+private pure func nested_blocks(header: String, count: Int, leaf: String) -> List[String]:
+	var lines: List[String] = []
+	var level: Int = 0
+	while level < count:
+		lines = lines.append("\t".repeat(level) + header.replace("#", level.to_string()))
+		level += 1
+	lines.append("\t".repeat(count) + leaf)
+
+
+-- The function's own body is a block, so the innermost block is at the limit
+-- with one level fewer than the limit above it.
+private func blocks_project_at_the_limit(header: String) -> Bool:
+	declarations_project(function_source(nested_blocks(header, MAX_SYNTAX_NESTING - 1, "1")))
+
+
+func test_value_ifs_project_at_the_limit() -> Bool:
+	blocks_project_at_the_limit("v# = if a:")
+
+
+func test_with_blocks_project_at_the_limit() -> Bool:
+	blocks_project_at_the_limit("with r# = open(a):")
+
+
+func test_concurrent_blocks_project_at_the_limit() -> Bool:
+	blocks_project_at_the_limit("concurrent(max_threads: 2, timeout: a):")
+
+
+func test_debug_blocks_project_at_the_limit() -> Bool:
+	blocks_project_at_the_limit("debug:")
+
+
+private pure func nested_selects(count: Int) -> List[String]:
+	var lines: List[String] = []
+	var level: Int = 0
+	while level < count:
+		lines = lines.append("\t".repeat(2 * level) + "select:")
+		lines = lines.append("\t".repeat(2 * level + 1) + "v" + level.to_string() + " from a:")
+		level += 1
+	lines.append("\t".repeat(2 * count) + "1")
+
+
+func test_selects_project_at_the_limit() -> Bool:
+	declarations_project(function_source(nested_selects(MAX_SYNTAX_NESTING - 1)))
+
+
+private pure func nested_operand_ifs(count: Int, leaf: String) -> List[String]:
+	var lines: List[String] = []
+	var level: Int = 0
+	while level < count:
+		lines = lines.append("\t".repeat(level) + "v" + level.to_string() + " = 1 + if a:")
+		level += 1
+	lines.append("\t".repeat(count) + leaf)
+
+
+-- An operand and its block are two levels each; a grouping around the leaf
+-- takes the innermost block to the limit.
+func test_operand_ifs_project_at_the_limit() -> Bool:
+	declarations_project(function_source(nested_operand_ifs((MAX_SYNTAX_NESTING - 2) / 2, "(1)")))
+
+
+private pure func nested_block_lambdas(count: Int) -> List[String]:
+	var lines: List[String] = []
+	var level: Int = 0
+	while level < count:
+		lines = lines.append("\t".repeat(level) + "f" + level.to_string() + " = func(b" + level.to_string() + "):")
+		level += 1
+	lines.append("\t".repeat(count) + "1")
+
+
+func test_block_lambdas_project_at_the_limit() -> Bool:
+	declarations_project(function_source(nested_block_lambdas((MAX_SYNTAX_NESTING - 1) / 2)))
+
+
+private pure func function_with_parameter_type(written: String) -> String:
+	"func f(a: " + written + ") -> Int:\n\t1\n"
+
+
+func test_tuple_types_project_at_the_limit() -> Bool:
+	declarations_project(function_with_parameter_type(nested_text("(", "Int", ", Int)", MAX_SYNTAX_NESTING - 2)))
+
+
+func test_grouped_types_project_at_the_limit() -> Bool:
+	declarations_project(function_with_parameter_type(nested_text("(", "Int", ")", MAX_SYNTAX_NESTING - 2)))
+
+
+func test_function_types_project_at_the_limit() -> Bool:
+	declarations_project(function_with_parameter_type(nested_text("(Int) -> ", "Int", "", (MAX_SYNTAX_NESTING - 2) / 2)))
+
+
+func test_type_arguments_project_at_the_limit() -> Bool:
+	declarations_project(function_with_parameter_type(nested_text("List[", "Int", "]", MAX_SYNTAX_NESTING - 1)))
+
+
+func test_parenthesized_dimensions_project_at_the_limit() -> Bool:
+	declarations_project(function_with_parameter_type("Float[" + nested_text("(", "#N", ")", MAX_SYNTAX_NESTING - 2) + "]"))
+
+
+func test_dimension_sums_project_at_the_limit() -> Bool:
+	declarations_project(function_with_parameter_type("Float[#N" + " + #N".repeat(MAX_SYNTAX_NESTING - 2) + "]"))
+
+
+func test_dimension_products_project_at_the_limit() -> Bool:
+	declarations_project(function_with_parameter_type("Float[#N" + " * #N".repeat(MAX_SYNTAX_NESTING - 2) + "]"))
+
+
+func test_array_suffixes_project_at_the_limit() -> Bool:
+	declarations_project(function_with_parameter_type("Int" + "[#N]".repeat(MAX_SYNTAX_NESTING)))
+
+
+private pure func function_matching(pattern: String) -> String:
+	function_source(["match a:", "\t" + pattern + ": 1", "\t_: 0"])
+
+
+func test_constructor_patterns_project_at_the_limit() -> Bool:
+	declarations_project(function_matching(nested_text("Some(", "1", ")", MAX_SYNTAX_NESTING - 2)))
+
+
+func test_tuple_patterns_project_at_the_limit() -> Bool:
+	declarations_project(function_matching(nested_text("(", "1", ", 1)", MAX_SYNTAX_NESTING - 2)))
+
+
+func test_list_patterns_project_at_the_limit() -> Bool:
+	declarations_project(function_matching(nested_text("[", "1", "]", MAX_SYNTAX_NESTING - 2)))
+
+
+func test_if_statement_blocks_project_at_the_limit() -> Bool:
+	blocks_project_at_the_limit("if a:")
+
+
+func test_while_blocks_project_at_the_limit() -> Bool:
+	blocks_project_at_the_limit("while a:")
+
+
+func test_for_blocks_project_at_the_limit() -> Bool:
+	blocks_project_at_the_limit("for x in a:")
+
+
+func test_local_function_bodies_project_at_the_limit() -> Bool:
+	blocks_project_at_the_limit("func g#(x: Int) -> Int:")
+
+
+private pure func nested_matches(count: Int) -> List[String]:
+	var lines: List[String] = []
+	var level: Int = 0
+	while level < count:
+		lines = lines.append("\t".repeat(2 * level) + "match a:")
+		lines = lines.append("\t".repeat(2 * level + 1) + "_:")
+		level += 1
+	lines.append("\t".repeat(2 * count) + "1")
+
+
+func test_match_blocks_project_at_the_limit() -> Bool:
+	declarations_project(function_source(nested_matches(MAX_SYNTAX_NESTING - 1)))
+
+
+private pure func nested_else_blocks(count: Int) -> List[String]:
+	var lines: List[String] = []
+	var level: Int = 0
+	while level < count:
+		lines = lines.append("\t".repeat(level) + "if a:")
+		lines = lines.append("\t".repeat(level + 1) + "1")
+		lines = lines.append("\t".repeat(level) + "else:")
+		level += 1
+	lines.append("\t".repeat(count) + "1")
+
+
+func test_else_blocks_project_at_the_limit() -> Bool:
+	declarations_project(function_source(nested_else_blocks(MAX_SYNTAX_NESTING - 1)))
+
+
+func test_holes_around_brackets_project_at_the_limit() -> Bool:
+	holes = MAX_INTERPOLATION_DEPTH
+	inner = nested_text("[", "1", "]", MAX_SYNTAX_NESTING - holes)
+	global_value_projects(nested_text("\"$" + "{", inner, "}\"", holes))
+
+
+-- The loops stay loops: a long left spine projects at any length.
+func test_left_spines_project() -> Bool:
+	global_value_projects("1" + " + 1".repeat(5000)) and global_value_projects("a" + ".f()".repeat(2000))
+
+
+tests: TestSuite = {
+	description = "Syntax nesting limit, legacy projection",
+	tests = [
+		("lists project at the limit", test_lists_project_at_the_limit),
+		("tuples project at the limit", test_tuples_project_at_the_limit),
+		("groupings project at the limit", test_groupings_project_at_the_limit),
+		("vectors project at the limit", test_vectors_project_at_the_limit),
+		("call arguments project at the limit", test_call_arguments_project_at_the_limit),
+		("subscripts project at the limit", test_subscripts_project_at_the_limit),
+		("record literals project at the limit", test_record_literals_project_at_the_limit),
+		("record updates project at the limit", test_record_updates_project_at_the_limit),
+		("dict literals project at the limit", test_dict_literals_project_at_the_limit),
+		("expression-bodied lambdas project at the limit", test_expression_bodied_lambdas_project_at_the_limit),
+		("not chains project at the limit", test_not_chains_project_at_the_limit),
+		("negation chains project at the limit", test_negation_chains_project_at_the_limit),
+		("detach chains project at the limit", test_detach_chains_project_at_the_limit),
+		("interpolation holes project", test_interpolation_holes_project),
+		("value ifs project at the limit", test_value_ifs_project_at_the_limit),
+		("with blocks project at the limit", test_with_blocks_project_at_the_limit),
+		("concurrent blocks project at the limit", test_concurrent_blocks_project_at_the_limit),
+		("debug blocks project at the limit", test_debug_blocks_project_at_the_limit),
+		("selects project at the limit", test_selects_project_at_the_limit),
+		("operand ifs project at the limit", test_operand_ifs_project_at_the_limit),
+		("block lambdas project at the limit", test_block_lambdas_project_at_the_limit),
+		("tuple types project at the limit", test_tuple_types_project_at_the_limit),
+		("grouped types project at the limit", test_grouped_types_project_at_the_limit),
+		("function types project at the limit", test_function_types_project_at_the_limit),
+		("type arguments project at the limit", test_type_arguments_project_at_the_limit),
+		("parenthesized dimensions project at the limit", test_parenthesized_dimensions_project_at_the_limit),
+		("dimension sums project at the limit", test_dimension_sums_project_at_the_limit),
+		("dimension products project at the limit", test_dimension_products_project_at_the_limit),
+		("array suffixes project at the limit", test_array_suffixes_project_at_the_limit),
+		("constructor patterns project at the limit", test_constructor_patterns_project_at_the_limit),
+		("tuple patterns project at the limit", test_tuple_patterns_project_at_the_limit),
+		("list patterns project at the limit", test_list_patterns_project_at_the_limit),
+		("if statement blocks project at the limit", test_if_statement_blocks_project_at_the_limit),
+		("while blocks project at the limit", test_while_blocks_project_at_the_limit),
+		("for blocks project at the limit", test_for_blocks_project_at_the_limit),
+		("local function bodies project at the limit", test_local_function_bodies_project_at_the_limit),
+		("match blocks project at the limit", test_match_blocks_project_at_the_limit),
+		("else blocks project at the limit", test_else_blocks_project_at_the_limit),
+		("holes around brackets project at the limit", test_holes_around_brackets_project_at_the_limit),
+		("left spines project", test_left_spines_project),
+	]
+}

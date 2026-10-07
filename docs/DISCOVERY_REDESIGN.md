@@ -2012,9 +2012,15 @@ crashes the compiler. So the limit is a rule of the syntax:
     parser's `parse_prefix` recurses once per operator
     (`tree_expression_parser.brp`), so the chain is right-nesting in both the
     parser and the tree;
-  - a nested written type (`List[List[...]]`, grouped and tuple types) and a
-    nested pattern (constructor, tuple and list patterns), each of which
-    recurses in its own parser and walker.
+  - a nested written type (`List[List[...]]`, grouped, tuple and function
+    types), a parenthesized dimension, and a nested pattern (constructor,
+    tuple and list patterns), each of which recurses in its own parser and
+    walker;
+  - the length of a dimension sum or product and of a run of array suffixes
+    (`Int[#N][#N]...`), by exception to the next rule: the parser reads them in
+    a loop, but the tree holds each term inside the one before and the type and
+    dimension walkers recurse on it, so each term counts as one level. This
+    stands until those walkers loop over the left spine, and then it goes.
   Exempt, with the reason: a left spine built by the precedence or postfix
   loop (a loop in the parser; the walker rule above handles it in every
   reader), and `else if`, `match` arm and `select` arm chains (right-nesting
@@ -2027,6 +2033,19 @@ crashes the compiler. So the limit is a rule of the syntax:
   parser has no such limit; the stage's parity gate lists this as a deliberate
   difference (section 6.3), and the limit must be at least the deepest legacy
   corpus module.
+  **Interim, while the tree path is test-only.** A bracket or block too deep to
+  read inside a body or an interpolation hole is rolled back, and the rollback
+  keeps only a `StopPoint`, not the diagnostic. Those two paths therefore
+  carry the cause as a stop reason, `NestingTooDeep`, a transitional exception to
+  the rule that new slices add no `StopReason` variants (section 8): the
+  declaration is handed back to the skipped-body preview, and the old-parser
+  fallback accepts it, so today a 129-deep body is accepted. Until the section
+  3.17 rejection path exists and turns `NestingTooDeep` into a rejected module
+  with `SyntaxNestingTooDeep`, the limit protects nothing inside bodies and
+  holes; expressions, declarations and signatures reject at once. The stop-reason
+  census classifies `NestingTooDeep` as an unreported syntax error, and it goes
+  with `StopReason` at M4 exit.
+
 - **The compiler runs on a declared minimum stack size.** Unsanitized builds
   get at least 16 MB of main stack: macOS asks for it at link time
   (`-Wl,-stack_size` from `platform_stack_size_argument` in
@@ -2040,8 +2059,9 @@ crashes the compiler. So the limit is a rule of the syntax:
   have their own, much smaller stacks (128 KB or 256 KB by
   default, `BLORP_DEFAULT_FIBER_STACK_SIZE` in `runtime.c`); which stack the
   proof tests run on (the main thread, or a fiber) is something the depth work
-  must establish and record, not an assumption here. A change to the stack
-  size is a change to the limit's measurement.
+  must establish and record, not an assumption here. Tree-path parsing therefore has to run on the main stack: a
+  fiber's 128 or 256 KB holds a handful of levels at 7 to 16 KB each. A change to
+  the stack size is a change to the limit's measurement.
 - **Every walker is proven at exactly the limit**, on Linux arm64 and macOS:
   the parser, the mint, the dump, the id census and the adapter's legacy
   projection each pass a source nested to `MAX_SYNTAX_NESTING`, and the parser
@@ -2051,12 +2071,15 @@ crashes the compiler. So the limit is a rule of the syntax:
   typecheck reading the trees) adds its own proof at the same limit before it
   lands.
 
-The value is not fixed here: it is set by measurement, as the largest depth
-every walker survives with margin on both platforms at the declared stack size.
-The measurement record will be
-`benchmarks/results/discovery_syntax_nesting_limit_2026-10-06.md` (to be
-written by that measurement; this section names the constant and carries no
-number until the record exists).
+The value is set by measurement, as the largest depth every walker survives
+with margin on both platforms at the declared stack size, and it is **128**. The
+record,
+`benchmarks/results/discovery_syntax_nesting_limit_2026-10-06.md`, holds the
+corpus maximum (23), the generated-C and older-pass ceilings (clang's 256, and
+about 250 for nested value `if`s), what each walker sustains without the limit
+on Linux arm64 and macOS (at least 4 times the limit on the weaker platform),
+and the stack the proofs run on: the main thread, whose 16 MB the tests
+`test_runtime/test_sys/test_main_stack.brp` and the proofs themselves rely on.
 
 Precedents:
 
@@ -2077,9 +2100,13 @@ adapter's legacy projection:
 - a 2,000-arm `match` value and a 2,000-arm `select`;
 - each counted nesting form at exactly `MAX_SYNTAX_NESTING`, with one level
   more rejected: lists, tuples, vectors, calls, record literals, record updates
-  and dict literals, value `if`s, `with`, `concurrent`, `debug` and `select`
-  blocks, operands that are control expressions, lambdas, prefix-operator
-  chains (`not not ... x`), and nested written types and patterns.
+  and dict literals, value `if`s, statement `if`, `while`, `for` and `match`
+  blocks, `else` blocks, local function bodies, `with`, `concurrent`, `debug`
+  and `select` blocks, operands that are control expressions, lambdas,
+  prefix-operator chains (`not not ... x`), interpolation holes, nested written
+  types (tuple, grouped and function types), parenthesized dimensions, dimension
+  sums and products, array suffix runs, and nested patterns (constructor, tuple
+  and list).
 
 The current adapter's 6,000-operand chain test is kept.
 
@@ -3552,13 +3579,18 @@ state on main.
   or cannot-happen (a guard that should fail loudly). It ranks coverage
   separately from the other two classes, so a worker sees the grammar still to
   write apart from errors still to report. Artificial limits are replaced by
-  `MAX_SYNTAX_NESTING` (section 3.14), not counted as grammar. Until the
-  variant is deleted, a new slice adds no `StopReason` variant: a rollback
+  `MAX_SYNTAX_NESTING` (section 3.14), not counted as grammar; the one stop
+  that reports it, `NestingTooDeep`, is a recorded exception that counts as an
+  unreported syntax error, and the rejection path of section 3.17 must turn it
+  into a rejected module. Until the variant is deleted, a new slice adds no `StopReason` variant: a rollback
   that needs one has not read its construct, and a slice that needs a new
   recipe or a replay by token index is a defect in the slice. Open.
 - **Nesting is bounded** by `MAX_SYNTAX_NESTING`, checked in `ParseState`, and
   every walker (parse, dump, id census, adapter) is proven at exactly that
-  limit (section 3.14). Open.
+  limit (section 3.14). Met: the limit is 128, with its measurements in
+  `benchmarks/results/discovery_syntax_nesting_limit_2026-10-06.md`; inside
+  bodies and holes the diagnostic is carried by `NestingTooDeep` until section
+  3.17 lands.
 - **The full-AST differential covers every module.** The tree path equals the
   old parser on every corpus module and root run, the syntax dump differential
   matches and the id census passes (section 6.3). Open: 698 modules are not

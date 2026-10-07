@@ -1,0 +1,293 @@
+-- Scratch probe (not committed): `depth_probe <form> <depth> <phase>`.
+import:
+	../../../src/compiler/discovery_adapter:
+		legacy_declaration_projection,
+		legacy_expression_preview,
+	../../../src/compiler/stage_02_lex/name_table: EMPTY_NAME_TABLE
+	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../src/compiler_new/stage_01_discovery/parse/parse_state:
+		issued_ids,
+		new_parse_state,
+		spellings,
+	../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_source
+	../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
+		DeclarationPreview(CompletedFunctionPreview),
+		DeclarationPreviewParse(DeferredGlobalInitializer),
+		parse_declaration_preview,
+	../../../src/compiler_new/stage_01_discovery/parse/tree_global_parser:
+		GlobalExpressionCompletion(CompletedExpressionGlobal),
+		complete_expression_global,
+	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
+		scan_module_declaration_prefix_with_bodies,
+	../../../src/compiler_new/stage_01_discovery/syntax/dump: dumped_module
+	../../../src/compiler_new/stage_01_discovery/syntax/id_census: id_census
+	../../../src/compiler_new/stage_01_discovery/syntax/module_syntax:
+		ModuleItem(GlobalItem, FunctionItem),
+		ModuleSyntax,
+	../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../support/syntax_samples: SampleBuild, sample_build, expression, name_expression, use, module_syntax, written, next_span
+	../../../src/compiler_new/stage_01_discovery/syntax/expressions: Expression, ExpressionKind(RecordLiteral, RecordUpdate, DictLiteral, VectorLiteral, ListLiteral, Call, NameReference), NamedValue, DictEntry
+	../../../src/compiler_new/stage_01_discovery/syntax/declarations: GlobalForm(ConstantGlobal)
+	../../../src/compiler_new/stage_01_discovery/syntax/ids: minted_global
+	../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility)
+
+
+pure func braces(openings: List[String], depth: Int) -> String:
+	var text: String = ""
+	var level: Int = 0
+
+	while level < depth:
+		match openings.get(level % openings.length()):
+			Some(opening):
+				text += opening
+			None:
+				void
+
+		level += 1
+
+	text + "leaf" + "}".repeat(depth)
+
+
+pure func expression_source(form: String, depth: Int) -> String:
+	match form:
+		"record":
+			"value = " + braces(["{f = "], depth)
+		"update":
+			"value = " + braces(["{r | f = "], depth)
+		"dict":
+			"value = " + braces(["{k => "], depth)
+		"mixed":
+			"value = " + braces(
+				["{k => ", "{f = ", "{", "{r | f = "],
+				depth,
+			)
+		"vector":
+			"value = " + braces(["{"], depth)
+		"list":
+			"value = " + "[".repeat(depth) + "leaf" + "]".repeat(depth)
+		"call":
+			"value = " + "f(".repeat(depth) + "leaf" + ")".repeat(depth)
+		"unary":
+			"value = " + "-".repeat(depth) + "leaf"
+		"hole":
+			"value = " + "\"{\".repeat(depth) + \"leaf\" + \"}\\\"".repeat(depth)
+		_:
+			"value = leaf"
+
+
+pure func function_source(form: String, depth: Int) -> String:
+	var lines: List[String] = ["func f(a: Int) -> Int:"]
+	var level: Int = 0
+
+	match form:
+		"if":
+			while level < depth:
+				lines = lines.append("\t".repeat(level + 1) + "v${level} = if a:")
+				level += 1
+
+			lines = lines.append("\t".repeat(depth + 1) + "1")
+		"type":
+			lines = ["func f(a: " + "List[".repeat(depth) + "Int" + "]".repeat(depth) + ") -> Int:", "\t1"]
+		"pattern":
+			lines = ["func f(a: Int) -> Int:", "\tmatch a:", "\t\t" + "Some(".repeat(depth) + "1" + ")".repeat(depth) + ": 1", "\t\t_: 0"]
+		"operand":
+			while level < depth:
+				lines = lines.append("\t".repeat(level + 1) + "v${level} = 1 + if a:")
+				level += 1
+			lines = lines.append("\t".repeat(depth + 1) + "1")
+		"with":
+			lines = ["func f(p: Int) -> Int:"]
+			while level < depth:
+				lines = lines.append("\t".repeat(level + 1) + "with r${level} = open(p):")
+				level += 1
+			lines = lines.append("\t".repeat(depth + 1) + "1")
+		"concurrent":
+			lines = ["func f(p: Int) -> Int:"]
+			while level < depth:
+				lines = lines.append("\t".repeat(level + 1) + "concurrent(max_threads: 2, timeout: p):")
+				level += 1
+			lines = lines.append("\t".repeat(depth + 1) + "1")
+		"debug":
+			lines = ["func f(p: Int) -> Int:"]
+			while level < depth:
+				lines = lines.append("\t".repeat(level + 1) + "debug:")
+				level += 1
+			lines = lines.append("\t".repeat(depth + 1) + "1")
+		"select":
+			lines = ["func f(p: Int) -> Int:"]
+			while level < depth:
+				lines = lines.append("\t".repeat(2 * level + 1) + "select:")
+				lines = lines.append("\t".repeat(2 * level + 2) + "v${level} from p:")
+				level += 1
+			lines = lines.append("\t".repeat(2 * depth + 1) + "1")
+		"lambda":
+			var text: String = "func f() -> Int: "
+			while level < depth:
+				text += "func(a${level}): "
+				level += 1
+			lines = [text + "a0"]
+		_:
+			lines = lines.append("\t1")
+
+	lines.join("\n") + "\n"
+
+
+func probe_expression(form: String, depth: Int, phase: Int) -> Int:
+	module = module_id_at_row(0)
+	lexed = lex_module(
+		module,
+		expression_source(form, depth),
+	)
+
+	match new_parse_state(lexed):
+		Err(_):
+			print_error("lex-fail")
+			1
+		Ok(entry):
+			(at_value, result) = parse_declaration_preview(entry)
+
+			match result:
+				DeferredGlobalInitializer(preview):
+					(completed, completion) = complete_expression_global(at_value, preview)
+
+					match completion:
+						CompletedExpressionGlobal(declaration):
+							print_error("parse-ok")
+							issued = issued_ids(completed)
+							syntax: ModuleSyntax = {
+								documentation = None,
+								items = [GlobalItem(declaration)],
+								definitions = issued.definitions,
+								imports = issued.imports,
+								counts = issued.counts
+							}
+
+							if phase >= 1:
+								dumped = dumped_module(syntax, spellings(completed))
+								print_error("dump-ok ${dumped.length()}")
+
+							if phase >= 2:
+								problems = id_census(module, syntax)
+								print_error("census-ok ${problems.length()}")
+
+							if phase >= 3:
+								match legacy_expression_preview(
+									preview_source(lexed),
+									EMPTY_NAME_TABLE,
+									declaration.value,
+								):
+									Ok(_):
+										print_error("project-ok")
+									Err(_):
+										print_error("project-err")
+
+							0
+						_:
+							print_error("not-completed")
+							1
+				_:
+					print_error("not-deferred")
+					1
+
+
+func probe_function(form: String, depth: Int, phase: Int) -> Int:
+	module = module_id_at_row(0)
+	lexed = lex_module(
+		module,
+		function_source(form, depth),
+	)
+
+	match new_parse_state(lexed):
+		Err(_):
+			print_error("lex-fail")
+			1
+		Ok(entry):
+			(state, scan) = scan_module_declaration_prefix_with_bodies(entry)
+			print_error("parse-ok ${scan.declarations.length()}")
+			issued = issued_ids(state)
+			var items: List[ModuleItem] = []
+
+			for declaration in scan.declarations:
+				match declaration:
+					CompletedFunctionPreview(function):
+						items = items.append(FunctionItem(function))
+					_:
+						void
+
+			syntax: ModuleSyntax = {
+				documentation = None,
+				items = items,
+				definitions = issued.definitions,
+				imports = issued.imports,
+				counts = issued.counts
+			}
+
+			if phase >= 1:
+				dumped = dumped_module(syntax, spellings(state))
+				print_error("dump-ok ${dumped.length()}")
+
+			if phase >= 2:
+				problems = id_census(module, syntax)
+				print_error("census-ok ${problems.length()}")
+
+			if phase >= 3:
+				match legacy_declaration_projection(preview_source(lexed), scan, EMPTY_NAME_TABLE):
+					Ok(_):
+						print_error("project-ok")
+					Err(_):
+						print_error("project-err")
+
+			0
+
+
+func main(args: List[String]) -> Int:
+	form: String = args.get_or(1, "")
+	depth: Int = args
+		.get_or(2, "10")
+		.to_int()
+	phase: Int = args
+		.get_or(3, "3")
+		.to_int()
+
+	match form:
+		"if" | "type" | "pattern" | "operand" | "lambda" | "with" | "concurrent" | "debug" | "select":
+			probe_function(form, depth, phase)
+		_:
+			if form.starts_with("built-"):
+				probe_built(form, depth, phase)
+			else:
+				probe_expression(form, depth, phase)
+
+
+func probe_built(form: String, depth: Int, phase: Int) -> Int:
+	(b0, leaf) = sample_build().name_expression("leaf")
+	var build: SampleBuild = b0
+	var current: Expression = leaf
+	var level: Int = 0
+	while level < depth:
+		(b1, name) = build.use("f")
+		(b2, span) = b1.next_span()
+		kind: ExpressionKind = match form:
+			"built-record": RecordLiteral([{ name = name, value = current, span = span }])
+			"built-update": RecordUpdate(leaf, [{ name = name, value = current, span = span }])
+			"built-dict": DictLiteral([{ key = leaf, value = current, span = span }])
+			"built-vector": VectorLiteral([current])
+			"built-call": Call(leaf, [current])
+			_: ListLiteral([current])
+		(b3, next) = b2.expression(kind)
+		build = b3
+		current = next
+		level += 1
+	(b4, global_name) = build.written("value")
+	(b5, global_span) = b4.next_span()
+	(mint, global) = b5.mint.minted_global(PublicVisibility, None, ConstantGlobal, global_name, None, current, global_span)
+	finished: SampleBuild = { b5 | mint = mint }
+	syntax = finished.module_syntax([GlobalItem(global)], None)
+	print_error("built-ok")
+	if phase >= 1:
+		dumped = dumped_module(syntax, finished.spellings)
+		print_error("dump-ok ${dumped.length()}")
+	if phase >= 2:
+		problems = id_census(module_id_at_row(0), syntax)
+		print_error("census-ok ${problems.length()}")
+	0

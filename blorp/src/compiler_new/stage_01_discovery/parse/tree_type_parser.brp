@@ -34,7 +34,7 @@ import:
 	parse_state:
 		ParseState, NameRole(TypeName), current_kind, current_span, current_literal,
 		previous_span, peek_kind, advanced, position, report_diagnostic, expect_token,
-		consume_name, consume_referenced_name, report_at_current, report_and_recover, finished_name_use, finished_written_type, finished_dimension,
+		consume_name, consume_referenced_name, report_at_current, report_and_recover, finished_name_use, finished_written_type, finished_dimension, nested_recovering, span_before_current, chain_fits, refused_chain,
 
 	tree_trait_reference_parser: parse_trait_reference
 
@@ -76,7 +76,15 @@ pure func parse_variant_payload_type(state: ParseState) -> (ParseState, WrittenT
 	parse_type_in(state, OrdinaryArgument)
 
 
+-- A written type nested in a written type is one level of nesting (section 3.14).
 private pure func parse_type_in(state: ParseState, context: TypeContext) -> (ParseState, WrittenType):
+	state.nested_recovering(
+		pure func(reported): reported.finished_written_type(reported.span_before_current(), VoidType),
+		pure func(inside): parse_type_levels(inside, context),
+	)
+
+
+private pure func parse_type_levels(state: ParseState, context: TypeContext) -> (ParseState, WrittenType):
 	(parsed_state, written) = parse_type_atom(state, context)
 
 	-- Names accept suffixes here. Parenthesized parsing owns the distinction
@@ -235,7 +243,20 @@ private pure func parse_named_type_tail(state: ParseState, first: NameUse, can_q
 		out.finished_written_type(first.name.span.span_covering(end), kind)
 
 
+-- A type argument nested in a type argument is one level of nesting (section 3.14).
 private pure func parse_argument(state: ParseState, context: TypeContext) -> (ParseState, TypeArgument):
+	state.nested_recovering(
+		pure func(reported): recovered_argument(reported),
+		pure func(inside): parse_argument_levels(inside, context),
+	)
+
+
+private pure func recovered_argument(state: ParseState) -> (ParseState, TypeArgument):
+	(parsed, written) = state.finished_written_type(state.span_before_current(), VoidType)
+	(parsed, TypeArgumentType(written))
+
+
+private pure func parse_argument_levels(state: ParseState, context: TypeContext) -> (ParseState, TypeArgument):
 	match state.current_kind():
 		IdentifierToken | SelfKeyword | VoidKeyword:
 			(parsed, argument) = parse_named_argument(state, context)
@@ -274,11 +295,14 @@ private pure func parse_argument(state: ParseState, context: TypeContext) -> (Pa
 -- The frozen grammar gives nested parentheses beginning with a dimension
 -- atom to the dimension grammar, before considering a function-type arrow.
 private pure func starts_parenthesized_dimension(state: ParseState, ahead: Int) -> Bool:
-	match state.peek_kind(ahead):
+	var offset: Int = ahead
+
+	while state.peek_kind(offset) == LeftParenSymbol:
+		offset += 1
+
+	match state.peek_kind(offset):
 		HashSymbol | DimensionNameToken | IntLiteralToken | RejectedIntegerToken:
 			True
-		LeftParenSymbol:
-			starts_parenthesized_dimension(state, ahead + 1)
 		_:
 			False
 
@@ -404,8 +428,10 @@ private pure func parse_pure_function_type(state: ParseState, context: TypeConte
 private pure func parse_array_suffixes(state: ParseState, written: WrittenType, context: TypeContext) -> (ParseState, WrittenType):
 	var out: ParseState = state
 	var element: WrittenType = written
+	var suffixes: Int = 0
 
-	while out.current_kind() == LeftBracketSymbol:
+	while out.current_kind() == LeftBracketSymbol and out.chain_fits(suffixes + 1):
+		suffixes += 1
 		out = out.advanced()
 		var dimensions: List[Dimension] = []
 		var all_dimensions: Bool = True
@@ -451,7 +477,11 @@ private pure func parse_array_suffixes(state: ParseState, written: WrittenType, 
 				-- empty rejected suffix, retain the preceding type as recovery.
 				void
 
-	(out, element)
+	-- The tree nests the suffixes one inside the next (section 3.14).
+	if out.current_kind() == LeftBracketSymbol:
+		(out.refused_chain(), element)
+	else:
+		(out, element)
 
 
 pure func parse_dimension(state: ParseState) -> (ParseState, Dimension):
@@ -462,8 +492,10 @@ pure func parse_dimension(state: ParseState) -> (ParseState, Dimension):
 private pure func parse_dimension_sum_tail(state: ParseState, first: Dimension) -> (ParseState, Dimension):
 	var out: ParseState = state
 	var left: Dimension = first
+	var terms: Int = 0
 
-	while out.current_kind() == PlusSymbol or out.current_kind() == MinusSymbol:
+	while (out.current_kind() == PlusSymbol or out.current_kind() == MinusSymbol) and out.chain_fits(terms + 1):
+		terms += 1
 		operator: DimensionOperator = if out.current_kind() == PlusSymbol:
 			AddDimensions
 		else:
@@ -474,7 +506,11 @@ private pure func parse_dimension_sum_tail(state: ParseState, first: Dimension) 
 		out = after_parent
 		left = parent
 
-	(out, left)
+	-- The tree nests the terms one inside the next (section 3.14).
+	if out.current_kind() == PlusSymbol or out.current_kind() == MinusSymbol:
+		(out.refused_chain(), left)
+	else:
+		(out, left)
 
 
 private pure func parse_dimension_product(state: ParseState) -> (ParseState, Dimension):
@@ -485,8 +521,10 @@ private pure func parse_dimension_product(state: ParseState) -> (ParseState, Dim
 private pure func parse_dimension_product_tail(state: ParseState, first: Dimension) -> (ParseState, Dimension):
 	var out: ParseState = state
 	var left: Dimension = first
+	var factors: Int = 0
 
-	while out.current_kind() == StarSymbol or out.current_kind() == SlashSymbol:
+	while (out.current_kind() == StarSymbol or out.current_kind() == SlashSymbol) and out.chain_fits(factors + 1):
+		factors += 1
 		operator: DimensionOperator = if out.current_kind() == StarSymbol:
 			MultiplyDimensions
 		else:
@@ -497,7 +535,10 @@ private pure func parse_dimension_product_tail(state: ParseState, first: Dimensi
 		out = after_parent
 		left = parent
 
-	(out, left)
+	if out.current_kind() == StarSymbol or out.current_kind() == SlashSymbol:
+		(out.refused_chain(), left)
+	else:
+		(out, left)
 
 
 private pure func parse_dimension_atom(state: ParseState) -> (ParseState, Dimension):
@@ -547,7 +588,15 @@ private pure func parse_dimension_atom(state: ParseState) -> (ParseState, Dimens
 			else:
 				out.report_at_current(ExpectedDimensionDiagnostic).finished_dimension(span, WildcardDimension)
 		LeftParenSymbol:
-			(after_dimension, dimension) = parse_dimension(state.advanced())
-			(after_dimension.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInDimensionExpression)), dimension)
+			-- A parenthesized dimension nested in a dimension is one level of nesting (section 3.14).
+			state.nested_recovering(
+				pure func(reported): reported.finished_dimension(span, WildcardDimension),
+				pure func(inside): parse_parenthesized_dimension(inside),
+			)
 		_:
 			state.report_at_current(ExpectedDimensionDiagnostic).finished_dimension(span, WildcardDimension)
+
+
+private pure func parse_parenthesized_dimension(state: ParseState) -> (ParseState, Dimension):
+	(after_dimension, dimension) = parse_dimension(state.advanced())
+	(after_dimension.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInDimensionExpression)), dimension)

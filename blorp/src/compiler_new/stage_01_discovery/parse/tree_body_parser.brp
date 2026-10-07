@@ -49,11 +49,11 @@ import:
 	parse_state:
 		ParseState, current_kind, current_span, peek_kind, position, advanced, diagnostic_count, spellings,
 		consume_referenced_name, finished_expression, finished_statement, finished_block, finished_else_if,
-		finished_subscript_place, finished_function, finished_local_function, inside_hole, report_unreachable_input, finished_name_use, finished_binder, resumed_at, resumed_after
+		finished_subscript_place, finished_function, finished_local_function, inside_hole, report_unreachable_input, finished_name_use, finished_binder, resumed_at, resumed_after, nested, reported_nesting_too_deep
 	layout_quirks: BlockAnchor(IndentedByLexer, PastExpressionAnchor), ExpressionAnchor, anchored_at, block_may_open
 	stop_reason:
-		StopPoint, Recognition(Recognized, Declined), Boundary(AtBoundary, PastBoundary),
-		StopReason(BodyReplayDisagrees, ReplayReported, BodylessFunction, BlockWithoutIndent, BlockNotClosed, LocalFunctionHeaderRejected,
+		StopPoint, rejected_stop, Recognition(Recognized, Declined), Boundary(AtBoundary, PastBoundary),
+		StopReason(NestingTooDeep, BodyReplayDisagrees, ReplayReported, BodylessFunction, BlockWithoutIndent, BlockNotClosed, LocalFunctionHeaderRejected,
 			LambdaInInterpolationHole, MalformedLambdaHeader, ExpressionSyntaxError, ValueOnNextLine, TupleDestructuring, FieldAssignment, NonPlaceAssignmentTarget, AssignmentTargetRoutedElsewhere,
 			LoopExitOutsideLoop, QuestionBindingInLoop, MalformedTypedBinding, VarWithoutName, VarWithoutInitializer, InvalidType, InvalidPattern,
 			ConcurrentlyLoop, HeaderWithoutColon, ForWithoutIn, InvalidLoopBinding, MalformedElse, OperatorAfterBlock, MatchWithoutBlock, MatchNotClosed,
@@ -242,7 +242,15 @@ private pure func parse_body_recipe(state: ParseState) -> (ParseState, Recogniti
 
 
 -- Blocks.
+-- An indented block is one level of nesting (section 3.14).
 private pure func parse_block_recipe(state: ParseState, context: BodyContext, anchor: BlockAnchor) -> (ParseState, BlockParse):
+	state.nested(
+		pure func(reported): UnsupportedBlock(state.stop_at(NestingTooDeep)),
+		pure func(inside): parse_block_in(inside, context, anchor),
+	)
+
+
+private pure func parse_block_in(state: ParseState, context: BodyContext, anchor: BlockAnchor) -> (ParseState, BlockParse):
 	match state.block_start(anchor):
 		NoBlockStart:
 			(state, UnsupportedBlock(state.stop_at(BlockWithoutIndent)))
@@ -402,7 +410,7 @@ private pure func parse_expression_value(state: ParseState, anchor: ExpressionAn
 		UnsupportedRecipe(stop):
 			(state, Declined(stop))
 		RejectedRecipe:
-			(state, Declined(remaining.stop_at(ExpressionSyntaxError)))
+			(state, Declined(remaining.rejected_stop(remaining, ExpressionSyntaxError)))
 
 
 private pure func parse_value_after(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, Recognition[ExpressionRecipe]):
@@ -447,7 +455,7 @@ private pure func parse_expression_statement(state: ParseState) -> (ParseState, 
 		UnsupportedRecipe(stop):
 			(state, UnsupportedStatement(stop))
 		RejectedRecipe:
-			(state, UnsupportedStatement(remaining.stop_at(ExpressionSyntaxError)))
+			(state, UnsupportedStatement(remaining.rejected_stop(remaining, ExpressionSyntaxError)))
 
 
 -- Why `target = value` is not an assignment this slice reads. A name and a
@@ -587,7 +595,7 @@ private pure func parse_type_annotation(state: ParseState) -> (ParseState, TypeA
 private pure func recognize_type(state: ParseState) -> (ParseState, Recognition[TypeRecipe]):
 	(remaining, _) = parse_type(state)
 	if remaining.diagnostic_count() != state.diagnostic_count():
-		(state, Declined(state.stop_at(InvalidType)))
+		(state, Declined(state.rejected_stop(remaining, InvalidType)))
 	else:
 		(state.resumed_after(remaining), Recognized({ token = state.position() }))
 
@@ -595,7 +603,7 @@ private pure func recognize_type(state: ParseState) -> (ParseState, Recognition[
 private pure func recognize_pattern(state: ParseState) -> (ParseState, Recognition[PatternRecipe]):
 	(remaining, _) = parse_pattern(state)
 	if remaining.diagnostic_count() != state.diagnostic_count():
-		(state, Declined(state.stop_at(InvalidPattern)))
+		(state, Declined(state.rejected_stop(remaining, InvalidPattern)))
 	else:
 		(state.resumed_after(remaining), Recognized({ token = state.position() }))
 
@@ -622,7 +630,7 @@ private pure func parse_header(state: ParseState) -> (ParseState, Recognition[Ex
 		UnsupportedRecipe(stop):
 			(state, Declined(stop))
 		RejectedRecipe:
-			(state, Declined(remaining.stop_at(ExpressionSyntaxError)))
+			(state, Declined(remaining.rejected_stop(remaining, ExpressionSyntaxError)))
 
 
 private pure func parse_while_statement(state: ParseState) -> (ParseState, StatementParse):
@@ -1094,7 +1102,7 @@ private pure func parse_lambda_body(state: ParseState, anchor: ExpressionAnchor)
 			UnsupportedRecipe(stop):
 				(state, Declined(stop))
 			RejectedRecipe:
-				(state, Declined(remaining.stop_at(ExpressionSyntaxError)))
+				(state, Declined(remaining.rejected_stop(remaining, ExpressionSyntaxError)))
 
 
 pure func mint_lambda_recipe(state: ParseState, recipe: LambdaRecipe) -> (ParseState, Expression):
@@ -1132,7 +1140,7 @@ private pure func parse_local_function(state: ParseState) -> (ParseState, Statem
 	(after_header, parsed) = parse_function_header(at_keyword, PublicVisibility, None, [], purity, start)
 	match parsed:
 		RejectedFunctionHeader:
-			(state, UnsupportedStatement(state.stop_at(LocalFunctionHeaderRejected)))
+			(state, UnsupportedStatement(state.rejected_stop(after_header, LocalFunctionHeaderRejected)))
 		ParsedFunctionHeader(preview):
 			match preview.body_extent:
 				SkippedBody(skipped):
@@ -1668,7 +1676,7 @@ private pure func parse_acquisition_header(
 		UnsupportedRecipe(stop):
 			(state, Declined(stop))
 		RejectedRecipe:
-			(state, Declined(after_value.stop_at(ExpressionSyntaxError)))
+			(state, Declined(after_value.rejected_stop(after_value, ExpressionSyntaxError)))
 
 
 private pure func parse_acquisition(state: ParseState, value: ExpressionRecipe, operator: WithOperator) -> (ParseState, Recognition[AcquisitionRecipe]):
@@ -1699,7 +1707,7 @@ private pure func parse_try_acquisition(state: ParseState, value: ExpressionReci
 						UnsupportedRecipe(stop):
 							(state, Declined(stop))
 						RejectedRecipe:
-							(state, Declined(after_value.stop_at(ExpressionSyntaxError)))
+							(state, Declined(after_value.rejected_stop(after_value, ExpressionSyntaxError)))
 			Declined(_):
 				(state, Declined(state.advanced().stop_at(WithErrorMapMalformed)))
 
