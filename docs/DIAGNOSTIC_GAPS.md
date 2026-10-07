@@ -498,12 +498,14 @@ The wrong acceptance is closed: `Strng` is rejected. Near-name help belongs to D
 
 ### DG-041 A missing trait implementation gives no way forward
 
-- Input: `print(p)` for `record P`, `if p == q:` for a record, a call of `biggest(p, p)` with `T: Orderable`
+- Input: `print(p)` for `record P`, `if p == q:` for a record, a call of `biggest(p, p)` with `T: Orderable`, `equals(x, y)` or `x.equals(y)` on a type parameter `T` with no bound
 - Current output:
   ```
   error: Type P does not implement trait Stringable (required by print)
   error: Type P does not implement trait Orderable (required by biggest)
+  error: Type parameter T does not have bound Equatable (required by equals)
   ```
+  For `x == y` on the same `T` the operator's own error already suggests adding `T: Equatable`.
 - Should say: add the skeleton: "write `implements Stringable for P:` with `pure func to_string(p: P) -> String:`" (interpolation `"${p}"` does not need it for built-in types; say so).
 - Owner: stage_06_typecheck `infer.brp:10015` (already has a `help` slot).
 - Priority/cost: Medium / S

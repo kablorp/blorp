@@ -1,0 +1,216 @@
+import:
+	../../../src/compiler/pipeline:
+		CompiledTypedGraph(CompiledTypedGraphReady),
+		FrontendCompilePolicy,
+		compile_frontend_graph,
+	../../../src/compiler/stage_02_lex/name_table: NameTable, name_spelling
+	../../../src/compiler/stage_09_core/ir:
+		CoreCallKind(UserCall),
+		CoreDecl(FunctionDecl),
+		CoreDeclaredOrigin(ProjectedImplMethod),
+		CoreExpr(BinaryExpr, CallExpr),
+		CoreFunction,
+		CoreProgram,
+		CoreType(HeapRecordType, NamedType, TupleType),
+		core_function_declared_origin,
+	../../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
+	../../../src/lib/cli_plan: CliRunPlan(CliRunCompile)
+	../../../src/main: run_cli
+	io: print_error
+	system: remove_file, temp_dir, write_file
+	test: TestSuite
+
+
+-- The operators in `compare` are all served by generic impls: the tuple impls
+-- in the standard library and `Wrap[T]` below. None of those impls writes
+-- `not_equals` or `greater_than_or_equal`, so each must come from the trait's
+-- default body instantiated for the impl.
+private GENERIC_IMPL_OPERATOR_SOURCE: String = "record Wrap[T] {\n" + "\tvalue: T\n" + "}\n\n\n" + "implements Equatable for Wrap[T:Equatable]:\n" + "\tpure func equals(a: Wrap[T], b: Wrap[T]) -> Bool:\n" + "\t\ta.value == b.value\n\n\n" + "func compare(t1: (Int, Int), t2: (Int, Int), w1: Wrap[Int], w2: Wrap[Int]) -> Bool:\n" + "\tt1 != t2 and t1 >= t2 and w1 != w2\n\n\n" + "func main(args: List[String]):\n" + "\tn: Int = args.length()\n" + "\tprint(compare((n, 1), (1, 1), {value = n}, {value = 1}))\n"
+
+
+-- `equals` called as a method, as a plain call and through `==` must all
+-- reach the impl written for `Point`.
+private EQUALS_CALL_FORMS_SOURCE: String = "record Point {\n" + "\tx: Int,\n" + "\ty: Int\n" + "}\n\n\n" + "implements Equatable for Point:\n" + "\tpure func equals(a: Point, b: Point) -> Bool:\n" + "\t\ta.x == b.x and a.y == b.y\n\n\n" + "func by_method(p: Point, q: Point) -> Bool:\n" + "\tp.equals(q)\n\n\n" + "func by_call(p: Point, q: Point) -> Bool:\n" + "\tequals(p, q)\n\n\n" + "func by_operator(p: Point, q: Point) -> Bool:\n" + "\tp == q\n\n\n" + "func main(args: List[String]):\n" + "\tn: Int = args.length()\n" + "\tp: Point = {x = n, y = 1}\n" + "\tprint(by_method(p, p) and by_call(p, p) and by_operator(p, p))\n"
+
+
+private func compiled_program(file_stem: String, source: String) -> Option[(CoreProgram, NameTable)]:
+	path: String = temp_dir() + "/" + file_stem + ".brp"
+	_ = remove_file(path)
+
+	if write_file(path, source).is_err():
+		print_error("could not write " + path)
+		None
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				policy: FrontendCompilePolicy = {
+					allow_debug_only_calls = False,
+					retain_debug_blocks = False,
+					include_typed_summary = False
+				}
+
+				match (
+					compile_frontend_graph(
+						compile_plan.graph,
+						policy,
+						pure func(errors): errors,
+						True,
+						False,
+						[],
+						None,
+					)
+				):
+					Ok(CompiledTypedGraphReady(compilation, _, _, _)):
+						Some((compilation.program, compilation.names))
+					Err(errors):
+						print_error("frontend compile failed:\n" + errors.join("\n"))
+						None
+					Ok(_):
+						print_error("frontend compile did not reach Core")
+						None
+			_:
+				print_error("run_cli did not produce a compile plan")
+				None
+
+
+private pure func functions(program: CoreProgram) -> List[CoreFunction]:
+	program.decls.filter_map(func(decl):
+		match decl:
+			FunctionDecl(function_info):
+				Some(function_info)
+			_:
+				None
+	)
+
+
+private pure func user_call_targets(expr: CoreExpr) -> List[Int]:
+	own: List[Int] = match expr:
+		CallExpr(UserCall(_, Some(def_id), _), _, _, _, _):
+			[def_id]
+		_:
+			[]
+
+	own.concat(immediate_core_expr_children(expr).flat_map(user_call_targets))
+
+
+private pure func contains_binary_operator(expr: CoreExpr) -> Bool:
+	match expr:
+		BinaryExpr(_, _, _, _, _):
+			True
+		_:
+			immediate_core_expr_children(expr).any(contains_binary_operator)
+
+
+---
+Describes a call target by its trait method identity and receiver kind, so the
+expected targets read as one list. A target whose method the impl does not
+write is the trait default instantiated for the impl.
+---
+private pure func describe_target(names: NameTable, target: CoreFunction) -> String:
+	match core_function_declared_origin(target.origin):
+		ProjectedImplMethod(trait_id, method_id, for_type, _):
+			receiver: String = match for_type:
+				TupleType(_):
+					"tuple"
+				HeapRecordType(_) | NamedType(_, _):
+					"record"
+				_:
+					"other"
+
+			name_spelling(
+				names,
+				trait_id,
+			).get_or(
+				"?",
+			) + "." + name_spelling(names, method_id).get_or("?") + " on " + receiver
+		_:
+			"not an impl method: " + target.name
+
+
+---
+Whether the body of `function_name` calls exactly `expected`, described by
+`describe_target`, and holds no native binary operator: every comparison in
+these sources must reach a trait method rather than a C comparison.
+---
+private func calls_exactly(
+	program: CoreProgram,
+	names: NameTable,
+	function_name: String,
+	expected: List[String],
+) -> Bool:
+	all_functions: List[CoreFunction] = functions(program)
+
+	match all_functions.find(func(function_info): function_info.name == function_name):
+		Some(function_info):
+			match function_info.body:
+				Some(body):
+					targets: List[String] = user_call_targets(body).map(func(def_id):
+						match all_functions.find(func(candidate): candidate.def_id == def_id):
+							Some(target):
+								describe_target(names, target)
+							None:
+								"missing function " + def_id.to_string()
+					)
+
+					if contains_binary_operator(body):
+						print_error(function_name + " still contains a native binary operator")
+						False
+					else if targets != expected:
+						print_error(function_name + " calls [" + targets.join("; ") + "]")
+						False
+					else:
+						True
+				None:
+					print_error(function_name + " has no body")
+					False
+		None:
+			print_error("lowered Core has no " + function_name + " function")
+			False
+
+
+func test_generic_impl_operators_call_trait_default_methods() -> Bool:
+	match compiled_program("blorp_generic_impl_operator_targets", GENERIC_IMPL_OPERATOR_SOURCE):
+		Some((program, names)):
+			calls_exactly(
+				program,
+				names,
+				"compare",
+				[
+					"Equatable.not_equals on tuple",
+					"Orderable.greater_than_or_equal on tuple",
+					"Equatable.not_equals on record",
+				],
+			)
+		None:
+			False
+
+
+func test_equals_call_forms_reach_written_impl() -> Bool:
+	match compiled_program("blorp_equals_call_form_targets", EQUALS_CALL_FORMS_SOURCE):
+		Some((program, names)):
+			written_impl: List[String] = ["Equatable.equals on record"]
+			-- Evaluate every form so one failure does not hide another.
+			by_method: Bool = calls_exactly(program, names, "by_method", written_impl)
+			by_call: Bool = calls_exactly(program, names, "by_call", written_impl)
+			by_operator: Bool = calls_exactly(program, names, "by_operator", written_impl)
+			by_method and by_call and by_operator
+		None:
+			False
+
+
+tests: TestSuite = {
+	description = "Trait method calls and operators resolve to impl targets",
+	tests = [
+		(
+			"generic impl operators call trait default methods",
+			test_generic_impl_operators_call_trait_default_methods,
+		),
+		(
+			"equals method, call and == reach the written impl",
+			test_equals_call_forms_reach_written_impl,
+		),
+	]
+}
