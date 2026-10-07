@@ -34,8 +34,8 @@ message-wording tasks.
 | CF-006 | Triple-quoted string becomes empty |
 | CF-007 | Duplicate functions and parameters accepted |
 | CF-009 | Pure function reads mutable module var (design decision open) |
-| CF-010 | Generic impls lose trait defaults; operators compare pointers |
 | CF-011 | Record literal fields reordered after ownership |
+| CF-013 | Tensor equality on non-numeric elements passes typecheck, then stops in trait resolution |
 
 ## High ROI
 
@@ -546,6 +546,47 @@ The wrong acceptance is closed: `Strng` is rejected. Near-name help belongs to D
 - Current output: `Type checking succeeded.` `totl` becomes a fresh immutable binding that nothing reads. `var x: Int = 1` that is never mutated and unused bindings are also silent.
 - Should say: a lint (not an error, since `x = 5` is the declaration form) for a binding that is never read, with a did-you-mean for a near-matching `var`.
 - Owner: `blorp/src/lint/`.
+- Priority/cost: Medium / M
+
+### DG-053 A trait default body that does not fit an impl gives no location
+
+- Input:
+  ```
+  record Box[T] {
+      value: T
+  }
+
+
+  trait Show:
+      pure func id(self: Self) -> Int
+      pure func twice(self: Self) -> Self:
+          self + self
+
+
+  implements Show for Box[T]:
+      pure func id(self: Box[T]) -> Int:
+          1
+  ```
+- Current output:
+  ```
+  error: Cannot apply + to Box[T] and Box[T]
+  error: Function 'twice' returns wrong type
+      expected: Box[T]  (declared return type)
+         found: Void  (body expression)
+  ```
+  Every implementation, generic or not, typechecks the trait's default bodies
+  it does not override, so the default `twice` is checked with `Self = Box[T]`.
+  The message names neither the trait method, the implementation nor a
+  position, and the Void return error is a cascade.
+- Should say: `file.brp:13:1: error: the default body of Show.twice does not
+  apply to Box[T]: Cannot apply + to Box[T] and Box[T]` with a help line
+  suggesting either `implements Addable for Box[T]` or writing `twice` in the
+  implementation, and no return-type cascade.
+- Owner: stage_06_typecheck. `default_impl_method_decl` in `decl.brp` gives
+  the synthesized method the implementation's span, but the body's expression
+  spans belong to the trait's module, which may be another file, so
+  `infer_error_at` cannot use them directly. Errors from a default body need
+  the implementation as their location and the trait method as context.
 - Priority/cost: Medium / M
 
 ---

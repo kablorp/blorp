@@ -67,7 +67,7 @@ import:
 	../../../src/compiler/stage_09_core/monomorphize: specialize_generic_functions_and_data
 	../../../src/compiler/stage_09_core/resolve: resolve_core_program
 	../../../src/compiler/stage_09_core/trait_resolve:
-		CoreTraitResolveDiagnostic,
+		CoreTraitResolveDiagnostic(MissingTraitImpl, UnresolvedOperatorTarget),
 		core_trait_impl_type_key,
 		core_trait_resolve_diagnostic_hint,
 		core_trait_resolve_diagnostic_message,
@@ -1168,7 +1168,9 @@ pure func test_named_enum_decl_structural_equals_uses_native_target() -> Bool:
 			False
 
 
-pure func test_named_union_decl_structural_equals_uses_native_target() -> Bool:
+pure func test_union_equals_without_impl_is_missing_impl() -> Bool:
+	-- A union box is not compared natively: without an Equatable impl there is
+	-- no target, so the call is a missing impl rather than an address compare.
 	union_name: String = "compiler__TypeResult"
 	union_type: CoreType = named_type(union_name)
 	body: CoreExpr = call(
@@ -1190,9 +1192,153 @@ pure func test_named_union_decl_structural_equals_uses_native_target() -> Bool:
 		),
 	)
 
-	match resolved_main_body(program([union_decl(union_name), equatable_trait(union_type), main])):
-		Some(BinaryExpr(EqualOp, _, _, NamedType("Bool", args), _)):
-			args.is_empty()
+	match resolve_core_traits(program([union_decl(union_name), equatable_trait(union_type), main])):
+		Err(MissingTraitImpl(missing)):
+			missing.trait_name == "Equatable" and missing.method_name == "equals"
+		_:
+			False
+
+
+pure func int_pair_type() -> CoreType:
+	TupleType([named_type("Int"), named_type("Int")])
+
+
+pure func operator_main(op: CoreBinaryOp, operand_type: CoreType) -> CoreDecl:
+	FunctionDecl(
+		function(
+			"main",
+			20,
+			[param("left", operand_type), param("right", operand_type)],
+			named_type("Bool"),
+			BinaryExpr(
+				op,
+				var_expr("left", operand_type),
+				var_expr("right", operand_type),
+				named_type("Bool"),
+				synthetic_core_source_loc(),
+			),
+		),
+	)
+
+
+pure func operator_has_no_target(
+	decls: List[CoreDecl],
+	trait_name: String,
+	method_name: String,
+) -> Bool:
+	match resolve_core_traits(program(decls)):
+		Err(UnresolvedOperatorTarget(operator)):
+			diagnostic: CoreTraitResolveDiagnostic = UnresolvedOperatorTarget(operator)
+			(
+				operator.trait_name == trait_name
+				and operator.method_name == method_name
+				and core_trait_resolve_diagnostic_message(
+					diagnostic,
+				).starts_with("internal compiler error: operator `${trait_name}.${method_name}`")
+				and core_trait_resolve_diagnostic_hint(diagnostic).contains("compiler bug")
+			)
+		_:
+			False
+
+
+pure func test_tuple_operators_without_impl_target_are_internal_errors() -> Bool:
+	-- These used to stay native and compile to a C comparison of the two
+	-- tuple boxes' addresses.
+	operator_has_no_target(
+		[equatable_trait(int_pair_type()), operator_main(NotEqualOp, int_pair_type())],
+		"Equatable",
+		"not_equals",
+	) and operator_has_no_target(
+		[equatable_trait(int_pair_type()), operator_main(EqualOp, int_pair_type())],
+		"Equatable",
+		"equals",
+	) and operator_has_no_target(
+		[orderable_trait(int_pair_type()), operator_main(GreaterEqualOp, int_pair_type())],
+		"Orderable",
+		"greater_than_or_equal",
+	)
+
+
+pure func test_union_operator_without_impl_target_is_internal_error() -> Bool:
+	union_type: CoreType = named_type("compiler__TypeResult")
+	operator_has_no_target(
+		[
+			union_decl("compiler__TypeResult"),
+			equatable_trait(union_type),
+			operator_main(NotEqualOp, union_type),
+		],
+		"Equatable",
+		"not_equals",
+	)
+
+
+pure func test_dict_equality_without_impl_target_is_internal_error() -> Bool:
+	-- Dict equality is the standard-library impl; the runtime word comparison
+	-- of values is gone.
+	dict_type: CoreType = NamedType(
+		"Dict",
+		[named_type("Int"), int_pair_type()],
+	)
+	operator_has_no_target(
+		[equatable_trait(dict_type), operator_main(EqualOp, dict_type)],
+		"Equatable",
+		"equals",
+	)
+
+
+pure func test_non_numeric_tensor_equality_has_no_native_target() -> Bool:
+	tensor_type: CoreType = TensorType({
+		element_type = string_type(),
+		dims = [TensorStaticDim(2)],
+	})
+	operator_has_no_target(
+		[equatable_trait(tensor_type), operator_main(EqualOp, tensor_type)],
+		"Equatable",
+		"equals",
+	)
+
+
+pure func test_tuple_operator_calls_impl_default_method() -> Bool:
+	pair: CoreType = int_pair_type()
+	impl_methods: List[CoreFunction] = [
+		function(
+			"equals",
+			11,
+			[param("left", pair), param("right", pair)],
+			named_type("Bool"),
+			bool_literal(True),
+		),
+		function(
+			"not_equals",
+			12,
+			[param("left", pair), param("right", pair)],
+			named_type("Bool"),
+			bool_literal(False),
+		),
+	]
+
+	match resolved_main_body(program([
+		equatable_trait(pair),
+		impl_decl("Equatable", pair, impl_methods),
+		operator_main(NotEqualOp, pair),
+	])):
+		Some(body):
+			call_targets(body, True, "Equatable_not_equals_Tuple2_Int_Int")
+		None:
+			False
+
+
+pure func test_pointer_equality_stays_native() -> Bool:
+	-- Compiler-synthesized null checks compare `Ptr` values, whose value is
+	-- the address.
+	pointer_type: CoreType = named_type("Ptr")
+
+	match resolved_main_body(program([
+		equatable_trait(pointer_type),
+		operator_main(NotEqualOp, pointer_type),
+	])):
+		Some(BinaryExpr(NotEqualOp, _, _, _, _)):
+			True
 		_:
 			False
 
@@ -2584,9 +2730,27 @@ tests: TestSuite = {
 			test_named_enum_decl_structural_equals_uses_native_target,
 		),
 		(
-			"named union declaration uses native equality target",
-			test_named_union_decl_structural_equals_uses_native_target,
+			"union equals without impl is missing impl",
+			test_union_equals_without_impl_is_missing_impl,
 		),
+		(
+			"tuple operators without impl target are internal errors",
+			test_tuple_operators_without_impl_target_are_internal_errors,
+		),
+		(
+			"union operator without impl target is internal error",
+			test_union_operator_without_impl_target_is_internal_error,
+		),
+		(
+			"dict equality without impl target is internal error",
+			test_dict_equality_without_impl_target_is_internal_error,
+		),
+		(
+			"non-numeric tensor equality has no native target",
+			test_non_numeric_tensor_equality_has_no_native_target,
+		),
+		("tuple operator calls impl default method", test_tuple_operator_calls_impl_default_method),
+		("pointer equality stays native", test_pointer_equality_stays_native),
 		("range not equals uses native target", test_range_not_equals_uses_native_target),
 		(
 			"tensor native targets reject unsupported operations",

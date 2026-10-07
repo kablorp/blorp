@@ -1,0 +1,235 @@
+-- Comparison operators on types whose `Equatable`/`Orderable` impl is generic
+-- (tuples, user generic records and unions) must call the impl or the trait's
+-- default body. They used to compile to a C comparison of the two boxes'
+-- addresses, so equal values in separate allocations compared unequal.
+--
+-- Every value here is built by a call, so equal operands never share a box,
+-- and each ordering check runs in both directions so that address order cannot
+-- make a pointer comparison pass by chance.
+import:
+	test: TestSuite
+
+
+record Wrap[T] {
+	value: T
+}
+
+
+implements Equatable for Wrap[T:Equatable]:
+	pure func equals(a: Wrap[T], b: Wrap[T]) -> Bool:
+		a.value == b.value
+
+
+record Rank[T] {
+	key: T
+}
+
+
+implements Equatable for Rank[T:Orderable]:
+	pure func equals(a: Rank[T], b: Rank[T]) -> Bool:
+		a.key == b.key
+
+
+implements Orderable for Rank[T:Orderable]:
+	pure func less_than(a: Rank[T], b: Rank[T]) -> Bool:
+		a.key < b.key
+
+
+union Maybe[T]:
+	Present(T)
+	Absent
+
+
+implements Equatable for Maybe[T:Equatable]:
+	pure func equals(a: Maybe[T], b: Maybe[T]) -> Bool:
+		match (a, b):
+			(Present(x), Present(y)):
+				x == y
+			(Absent, Absent):
+				True
+			_:
+				False
+
+
+pure func pair(first: Int, second: Int) -> (Int, Int):
+	(first, second)
+
+
+pure func triple(first: Int, second: String, third: Int) -> (Int, String, Int):
+	(first, "s${second}", third)
+
+
+pure func quadruple(
+	first: Int,
+	second: Int,
+	third: Int,
+	fourth: String,
+) -> (Int, Int, Int, String):
+	(first, second, third, "q${fourth}")
+
+
+pure func wrap(value: Int) -> Wrap[Int]:
+	{value = value}
+
+
+pure func rank(key: Int) -> Rank[Int]:
+	{key = key}
+
+
+pure func differs[T:Equatable](a: T, b: T) -> Bool:
+	a != b
+
+
+pure func ordered_both_ways[T:Orderable](a: T, b: T) -> Bool:
+	-- For equal `a` and `b`, every non-strict comparison holds and every strict
+	-- one fails, in both directions.
+	a >= b and b >= a and a <= b and b <= a and not (a > b) and not (b > a)
+
+
+func test_pair_equality_compares_values() -> Bool:
+	a: (Int, Int) = pair(1, 2)
+	b: (Int, Int) = pair(1, 2)
+	c: (Int, Int) = pair(1, 3)
+	a == b and not (a != b) and a != c and not (a == c)
+
+
+func test_pair_ordering_compares_values() -> Bool:
+	a: (Int, Int) = pair(1, 2)
+	b: (Int, Int) = pair(1, 2)
+	c: (Int, Int) = pair(1, 3)
+	(
+		a >= b
+		and b >= a
+		and a <= b
+		and b <= a
+		and not (a > b)
+		and not (b > a)
+		and c > a
+		and c >= a
+		and a < c
+		and a <= c
+		and not (a > c)
+		and not (c <= a)
+	)
+
+
+func test_triple_comparisons_compare_values() -> Bool:
+	a: (Int, String, Int) = triple(1, "x", 3)
+	b: (Int, String, Int) = triple(1, "x", 3)
+	c: (Int, String, Int) = triple(1, "y", 0)
+	a == b and not (a != b) and a != c and ordered_both_ways(a, b) and c > a and a <= c
+
+
+func test_quadruple_comparisons_compare_values() -> Bool:
+	a: (Int, Int, Int, String) = quadruple(1, 2, 3, "x")
+	b: (Int, Int, Int, String) = quadruple(1, 2, 3, "x")
+	c: (Int, Int, Int, String) = quadruple(1, 2, 3, "y")
+	a == b and not (a != b) and a != c and ordered_both_ways(a, b) and c >= a and not (c <= a)
+
+
+func test_generic_function_not_equal_on_tuples() -> Bool:
+	not differs(
+		pair(4, 5),
+		pair(4, 5),
+	) and differs(
+		pair(4, 5),
+		pair(5, 4),
+	)
+
+
+func test_generic_function_ordering_on_tuples() -> Bool:
+	ordered_both_ways(
+		pair(4, 5),
+		pair(4, 5),
+	)
+
+
+func test_generic_record_not_equal_uses_default() -> Bool:
+	a: Wrap[Int] = wrap(7)
+	b: Wrap[Int] = wrap(7)
+	c: Wrap[Int] = wrap(8)
+	not (a != b) and a != c and not differs(a, b) and differs(a, c)
+
+
+func test_generic_record_ordering_uses_defaults() -> Bool:
+	a: Rank[Int] = rank(3)
+	b: Rank[Int] = rank(3)
+	c: Rank[Int] = rank(9)
+	(
+		ordered_both_ways(a, b)
+		and a >= b
+		and a <= b
+		and not (a > b)
+		and c > a
+		and c >= a
+		and a <= c
+		and not (a >= c)
+		and not (c <= a)
+		and a != c
+		and not (a != b)
+	)
+
+
+func test_generic_union_not_equal_uses_default() -> Bool:
+	a: Maybe[Int] = Present(wrap(2).value)
+	b: Maybe[Int] = Present(wrap(2).value)
+	c: Maybe[Int] = Absent
+	not (a != b) and a != c and not differs(a, b)
+
+
+func test_list_of_tuples_equality_compares_elements() -> Bool:
+	a: List[(Int, Int)] = [pair(1, 2), pair(3, 4)]
+	b: List[(Int, Int)] = [pair(1, 2), pair(3, 4)]
+	c: List[(Int, Int)] = [pair(1, 2), pair(3, 5)]
+	a == b and not (a != b) and a != c and not (a == c)
+
+
+func test_option_of_tuple_equality_compares_payloads() -> Bool:
+	a: Option[(Int, Int)] = Some(pair(1, 2))
+	b: Option[(Int, Int)] = Some(pair(1, 2))
+	c: Option[(Int, Int)] = Some(pair(2, 1))
+	a == b and not (a != b) and a != c
+
+
+func test_dict_of_tuple_values_equality_compares_values() -> Bool:
+	a: Dict[String, (Int, Int)] = {"k" => pair(1, 2)}
+	b: Dict[String, (Int, Int)] = {"k" => pair(1, 2)}
+	c: Dict[String, (Int, Int)] = {"k" => pair(1, 3)}
+	a == b and not (a != b) and a != c
+
+
+func test_collections_of_generic_records_compare_elements() -> Bool:
+	list_a: List[Wrap[Int]] = [wrap(1), wrap(2)]
+	list_b: List[Wrap[Int]] = [wrap(1), wrap(2)]
+	option_a: Option[Wrap[Int]] = Some(wrap(3))
+	option_b: Option[Wrap[Int]] = Some(wrap(3))
+	dict_a: Dict[Int, Wrap[Int]] = {1 => wrap(4)}
+	dict_b: Dict[Int, Wrap[Int]] = {1 => wrap(4)}
+	(
+		list_a == list_b
+		and not (list_a != list_b)
+		and option_a == option_b
+		and not (option_a != option_b)
+		and dict_a == dict_b
+		and not (dict_a != dict_b)
+	)
+
+
+tests: TestSuite = {
+	description = "Comparisons through generic impls",
+	tests = [
+		("pair equality compares values", test_pair_equality_compares_values),
+		("pair ordering compares values", test_pair_ordering_compares_values),
+		("triple comparisons compare values", test_triple_comparisons_compare_values),
+		("quadruple comparisons compare values", test_quadruple_comparisons_compare_values),
+		("generic function != on tuples", test_generic_function_not_equal_on_tuples),
+		("generic function ordering on tuples", test_generic_function_ordering_on_tuples),
+		("generic record != uses default", test_generic_record_not_equal_uses_default),
+		("generic record ordering uses defaults", test_generic_record_ordering_uses_defaults),
+		("generic union != uses default", test_generic_union_not_equal_uses_default),
+		("list of tuples equality", test_list_of_tuples_equality_compares_elements),
+		("option of tuple equality", test_option_of_tuple_equality_compares_payloads),
+		("dict of tuple values equality", test_dict_of_tuple_values_equality_compares_values),
+		("collections of generic records", test_collections_of_generic_records_compare_elements),
+	]
+}

@@ -3516,25 +3516,24 @@ private pure func implementation_body_receiver_type(
 private pure func implementation_method_materialization_source(
 	implementation: ImplementationHeader,
 	method_header: ImplementationMethodHeader,
-	has_concrete_receiver: Bool,
 ) -> Option[ParsedFunctionDecl]:
+	-- Every implementation, generic or not, provides every trait method: its
+	-- own body or the trait default instantiated for it. Monomorphization
+	-- specializes a generic implementation's defaults with its other methods.
 	match explicit_implementation_method_source(method_header):
 		Some(source):
 			Some(source)
 		None:
-			if has_concrete_receiver:
-				default_implementation_method_source(
-					method_header,
-				).map(
-					func(
-						method,
-					): default_impl_method_decl(
-						implementation_header_source(implementation),
-						method,
-					),
-				)
-			else:
-				None
+			default_implementation_method_source(
+				method_header,
+			).map(
+				func(
+					method,
+				): default_impl_method_decl(
+					implementation_header_source(implementation),
+					method,
+				),
+			)
 
 
 private pure func implementation_method_materialization_signature(
@@ -3546,40 +3545,6 @@ private pure func implementation_method_materialization_signature(
 			default_implementation_method_signature(implementation, method_header)
 		ExplicitImplementationMethodHeaderValue(_):
 			explicit_implementation_method_signature(method_header)
-
-
-private pure func implementation_method_publication_headers(
-	state: TypecheckState,
-	implementation: ImplementationHeader,
-) -> List[ImplementationMethodHeader]:
-	-- Alias expansion and parameter normalization must agree with body planning;
-	-- the accepted record's resolved header receiver remains a separate fact.
-	methods = implementation_header_methods(implementation)
-	has_defaults = methods.any(func(method):
-		match method:
-			DefaultImplementationMethodHeaderValue(_):
-				True
-			ExplicitImplementationMethodHeaderValue(_):
-				False
-	)
-
-	has_concrete_receiver = if has_defaults:
-		collect_type_vars(
-			implementation_body_receiver_type(
-				state,
-				implementation_header_source(implementation),
-			),
-		).is_empty()
-	else:
-		False
-
-	methods.filter(func(method):
-		match method:
-			ExplicitImplementationMethodHeaderValue(_):
-				True
-			DefaultImplementationMethodHeaderValue(_):
-				has_concrete_receiver
-	)
 
 
 private pure func implementation_method_publication_id(
@@ -3665,10 +3630,9 @@ private pure func implementation_method_info_from_header(
 	registration: CallableHeaderRegistration,
 	module_path: String,
 ) -> ImplMethodInfoClaim:
-	-- The caller's ordered publication list already proved that every default
-	-- here has a concrete body receiver. Broken source/signature facts are errors.
+	-- Broken source/signature facts for an accepted method header are errors.
 	match (
-		implementation_method_materialization_source(implementation, method_header, True),
+		implementation_method_materialization_source(implementation, method_header),
 		implementation_method_materialization_signature(implementation, method_header),
 	):
 		(Some(source), Some(signature)):
@@ -3880,7 +3844,7 @@ private pure func prepare_accepted_implementation_header(
 	trait_id = implementation_header_trait_id(header)
 	definition_table = type_header_graph_definition_table(type_headers)
 	registration = LocalCallableHeaderRegistration(module_path)
-	method_headers = implementation_method_publication_headers(state, header)
+	method_headers = implementation_header_methods(header)
 
 	match callable_header_semantic_type(
 		type_headers,
@@ -5645,36 +5609,35 @@ private pure func typecheck_materialize_impl_body(
 			next = method_result.state
 			materialized_methods = materialized_methods.append(method_result.body)
 
-		if collect_type_vars(for_type).length() == 0:
-			match find_impl_trait_decl(next, decls, import_modules, impl_decl.trait_name.text):
-				Some(trait_decl):
-					for method in trait_decl.methods:
-						if (
-							method.body.is_some()
-							and not impl_has_method(impl_decl.methods, method.name.text)
-						):
-							default_decl = default_impl_method_decl(impl_decl, method)
+		match find_impl_trait_decl(next, decls, import_modules, impl_decl.trait_name.text):
+			Some(trait_decl):
+				for method in trait_decl.methods:
+					if (
+						method.body.is_some()
+						and not impl_has_method(impl_decl.methods, method.name.text)
+					):
+						default_decl = default_impl_method_decl(impl_decl, method)
 
-							match claim_callable_id_from_span(
-								next,
-								default_decl.name.text,
-								default_decl.span,
-							):
-								DefinitionIdMissing(with_error):
-									next = with_error
-								DefinitionIdClaimed(with_id, _):
-									method_result = typecheck_materialize_function_from_body_policy(
-										with_id,
-										default_decl,
-										IgnoreMainName,
-										function_bodies,
-									)
-									next = method_result.state
-									materialized_methods = materialized_methods.append(
-										method_result.body,
-									)
-				None:
-					void
+						match claim_callable_id_from_span(
+							next,
+							default_decl.name.text,
+							default_decl.span,
+						):
+							DefinitionIdMissing(with_error):
+								next = with_error
+							DefinitionIdClaimed(with_id, _):
+								method_result = typecheck_materialize_function_from_body_policy(
+									with_id,
+									default_decl,
+									IgnoreMainName,
+									function_bodies,
+								)
+								next = method_result.state
+								materialized_methods = materialized_methods.append(
+									method_result.body,
+								)
+			None:
+				void
 
 		{
 			state = typecheck_state_with_scoped_trait_functions(
@@ -10258,14 +10221,8 @@ private pure func implementation_method_body_signature(
 	)
 
 
-private record PreparedImplementationBody {
-	state: TypecheckState,
-	has_concrete_receiver: Bool
-}
-
-
 private union ImplementationBodyPreparation:
-	ImplementationBodyPrepared(PreparedImplementationBody)
+	ImplementationBodyPrepared(TypecheckState)
 	ImplementationBodyRejected(List[String], List[TypecheckDiagnostic])
 
 
@@ -10299,10 +10256,7 @@ private pure func prepare_implementation_body(
 		)
 
 		if with_scope.errors.length() == validated.errors.length():
-			ImplementationBodyPrepared({
-				state = with_scope,
-				has_concrete_receiver = collect_type_vars(for_type).is_empty(),
-			})
+			ImplementationBodyPrepared(with_scope)
 		else:
 			ImplementationBodyRejected(
 				with_scope.errors.drop(validated.errors.length()),
@@ -10319,13 +10273,9 @@ private pure func implementation_method_body_context_from_base(
 	base: AcceptedBodyModuleBase,
 	implementation: ImplementationHeader,
 	method_header: ImplementationMethodHeader,
-	prepared: PreparedImplementationBody,
+	prepared_state: TypecheckState,
 ) -> BodyCheckContextBuild:
-	method_source = implementation_method_materialization_source(
-		implementation,
-		method_header,
-		prepared.has_concrete_receiver,
-	)
+	method_source = implementation_method_materialization_source(implementation, method_header)
 
 	match method_source:
 		None:
@@ -10337,7 +10287,7 @@ private pure func implementation_method_body_context_from_base(
 				None:
 					BodyContextRejected(BodyContextMissingAcceptedSignature)
 				Some(accepted_signature):
-					match body_infer_session_seed(prepared.state):
+					match body_infer_session_seed(prepared_state):
 						None:
 							BodyContextRejected(BodyContextInvalidPreparedEnvironment)
 						Some(session_seed):
@@ -10377,12 +10327,12 @@ private pure func implementation_body_context_for_id(
 				context = match prepare_implementation_body(base, implementation):
 					ImplementationBodyRejected(_, _):
 						BodyContextRejected(BodyContextInvalidImplementation)
-					ImplementationBodyPrepared(prepared):
+					ImplementationBodyPrepared(prepared_state):
 						implementation_method_body_context_from_base(
 							base,
 							implementation,
 							method,
-							prepared,
+							prepared_state,
 						)
 
 				result = ImplementationBodyContextFound(context)
@@ -10504,7 +10454,7 @@ private pure func implementation_body_contexts_from_base(
 						errors = errors,
 						diagnostics = diagnostics,
 					})
-				ImplementationBodyPrepared(prepared):
+				ImplementationBodyPrepared(prepared_state):
 					for method_header in implementation_header_methods(implementation):
 						id = implementation_method_header_id(method_header)
 
@@ -10512,16 +10462,15 @@ private pure func implementation_body_contexts_from_base(
 							base,
 							implementation,
 							method_header,
-							prepared,
+							prepared_state,
 						):
 							BodyContextReady(context):
 								contexts = contexts.append(context)
 							BodyContextRejected(reason):
-								if prepared.has_concrete_receiver:
-									failures = failures.append({
-										id = id,
-										reason = reason,
-									})
+								failures = failures.append({
+									id = id,
+									reason = reason,
+								})
 
 	{
 		contexts = contexts,

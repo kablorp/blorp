@@ -14,7 +14,7 @@ import:
 		CoreCallKind(
 			BuiltinCall, DeferredTraitCall, SelectedDirectCall, SelectedTraitCall, UnknownCall,
 		),
-		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ImplDecl, TraitDecl, UnionDecl),
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ImplDecl, TraitDecl),
 		CoreDimOp(DimAdd, DimDivide, DimMultiply, DimSubtract),
 		CoreExpr(BinaryExpr, CallExpr, LogicalExpr, ResourceScopeExpr, SeqExpr, UnaryExpr, VarExpr),
 		CoreFunction,
@@ -76,9 +76,25 @@ record CoreTraitSelectedTargetDiagnostic {
 }
 
 
+---
+An operator whose operand type has neither an impl target nor a
+compiler-provided value operation. Typechecking only accepts an operator once
+it has proved the trait, so reaching this is a compiler bug. It is an error
+rather than a native operator because on a boxed value the C operator compares
+addresses, which is a silently wrong answer.
+---
+record CoreTraitOperatorTargetDiagnostic {
+	loc: CoreSourceLoc,
+	trait_name: String,
+	method_name: String,
+	operand_type: CoreType
+}
+
+
 union CoreTraitResolveDiagnostic:
 	MissingTraitImpl(CoreTraitMissingImplDiagnostic)
 	MissingSelectedTraitTarget(CoreTraitSelectedTargetDiagnostic)
+	UnresolvedOperatorTarget(CoreTraitOperatorTargetDiagnostic)
 
 
 private union CoreTraitImplTargetKind:
@@ -140,7 +156,7 @@ private record CoreTraitResolveRegistry {
 	generic_builtin_targets: List[CoreGenericBuiltinTarget],
 	types_by_method: Dict[String, List[String]],
 	static_self_methods: Dict[String, Bool],
-	structural_type_names: Dict[String, Bool]
+	enum_type_names: Dict[String, Bool]
 }
 
 
@@ -162,6 +178,12 @@ pure func core_trait_resolve_diagnostic_message(diagnostic: CoreTraitResolveDiag
 			"no impl of `${missing.method_name}` for type `${missing.type_name}` in scope"
 		MissingSelectedTraitTarget(selected):
 			"selected trait target `${selected.trait_name}.${selected.method_name}` " + "was not available after monomorphization"
+		UnresolvedOperatorTarget(operator):
+			(
+				"internal compiler error: operator `${operator.trait_name}.${operator.method_name}` on "
+				+ "`${CoreTypePolicy.core_type_to_string(operator.operand_type)}` has no implementation "
+				+ "after monomorphization"
+			)
 
 
 pure func core_trait_resolve_diagnostic_hint(diagnostic: CoreTraitResolveDiagnostic) -> String:
@@ -174,6 +196,11 @@ pure func core_trait_resolve_diagnostic_hint(diagnostic: CoreTraitResolveDiagnos
 			)
 		MissingSelectedTraitTarget(selected):
 			"compiler-selected target `${selected.module_name}` definition " + selected.def_id.to_string() + " was lost; report this as a compiler bug"
+		UnresolvedOperatorTarget(_):
+			(
+				"typechecking accepted this operator, so the implementation or trait default should "
+				+ "exist; report this as a compiler bug"
+			)
 
 
 ---
@@ -517,7 +544,7 @@ private pure func collect_registry(program: CoreProgram) -> CoreTraitResolveRegi
 		generic_builtin_targets = [],
 		types_by_method = {},
 		static_self_methods = {},
-		structural_type_names = {}
+		enum_type_names = {}
 	}
 
 	for decl in program.decls:
@@ -527,16 +554,7 @@ private pure func collect_registry(program: CoreProgram) -> CoreTraitResolveRegi
 			TraitDecl(trait_info):
 				collect_trait(registry, trait_info)
 			EnumDecl(enum_info):
-				{ registry |
-					structural_type_names = registry.structural_type_names.set(enum_info.name, True)
-				}
-			UnionDecl(union_info):
-				{ registry |
-					structural_type_names = registry.structural_type_names.set(
-						union_info.name,
-						True,
-					)
-				}
+				{ registry | enum_type_names = registry.enum_type_names.set(enum_info.name, True) }
 			_:
 				registry
 
@@ -553,16 +571,44 @@ private pure func is_integer_type_name(name: String) -> Bool:
 			False
 
 
+private pure func is_native_tensor_element_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, []):
+			(
+				is_integer_type_name(name)
+				or name == "Float"
+				or name == "Float32"
+				or name == "Float16"
+				or name == "Bool"
+				or name == "Char"
+			)
+		_:
+			False
+
+
+---
+Types whose equality the compiler provides without an impl, each lowered to
+value equality for its representation: enum tags and `..#N` indices compare
+as integers, numeric tensors element by element through `blorp_vector_eq`,
+String and Set through their runtime equality, and a raw `Ptr`, whose value is
+the address, natively. Every other type, tuples, records and unions included,
+compares only through its Equatable impl: a native operator on a box would
+compare addresses.
+---
 private pure func has_native_structural_equality(
-	structural_type_names: Dict[String, Bool],
+	enum_type_names: Dict[String, Bool],
 	typ: CoreType,
 ) -> Bool:
 	match typ:
-		EnumType(_) | RangeType | TensorType(_) | TupleType(_):
+		EnumType(_) | RangeType:
+			True
+		TensorType(info):
+			is_native_tensor_element_type(info.element_type)
+		NamedType("Ptr", []):
 			True
 		NamedType(name, _):
 			(
-				structural_type_names.get_or(name, False)
+				enum_type_names.get_or(name, False)
 				or CoreTypePolicy.core_named_type_has_structural_equality(name)
 			)
 		_:
@@ -576,7 +622,7 @@ private pure func native_structural_equality_target(
 ) -> Option[CoreTraitImplTargetKind]:
 	if (
 		identity.trait_name != "Equatable"
-		or not has_native_structural_equality(registry.structural_type_names, typ)
+		or not has_native_structural_equality(registry.enum_type_names, typ)
 	):
 		None
 	else:
@@ -1020,6 +1066,8 @@ private pure func rewrite_operator(
 								loc,
 							)
 				None:
+					-- Left native only so `unresolved_operator_diagnostic` can
+					-- report it; it never reaches emission.
 					original
 		None:
 			original
@@ -1272,6 +1320,30 @@ private pure func selected_target_diagnostic(
 	})
 
 
+---
+`rewrite_operator` keeps an operator native only when dispatch found a target,
+so an operator left without one would reach C as a raw comparison.
+---
+private pure func unresolved_operator_diagnostic(
+	registry: CoreTraitResolveRegistry,
+	identity: CoreTraitMethodIdentity,
+	operand: CoreExpr,
+	loc: CoreSourceLoc,
+) -> Option[CoreTraitResolveDiagnostic]:
+	operand_type: CoreType = core_expr_type(operand)
+
+	match target_for_dispatch(registry, identity, operand_type):
+		Some(_):
+			None
+		None:
+			Some(UnresolvedOperatorTarget({
+				loc = loc,
+				trait_name = identity.trait_name,
+				method_name = identity.method_name,
+				operand_type = operand_type,
+			}))
+
+
 private pure func diagnostic_children(
 	work: CoreTraitDiagnosticWork,
 ) -> List[CoreTraitDiagnosticWork]:
@@ -1347,6 +1419,19 @@ private pure func first_expr_diagnostic(
 							)
 						else:
 							void
+					BinaryExpr(op, left, _, _, loc):
+						found = unresolved_operator_diagnostic(
+							registry,
+							core_binary_trait_method(op),
+							left,
+							loc,
+						)
+					UnaryExpr(op, operand, _, loc):
+						match core_unary_trait_method(op):
+							Some(identity):
+								found = unresolved_operator_diagnostic(registry, identity, operand, loc)
+							None:
+								void
 					_:
 						void
 

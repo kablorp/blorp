@@ -71,7 +71,7 @@ Section 3.1 shows the Core of both.
 | Field identity | `CoreFieldOrdinal`, issued by the product's layout. The typecheck `FieldId` stays a column of the record row only. |
 | Representation | `ManagedBox` or `InlineValue`, carried in the product type and separate from identity. Inline fixed records supply the first `InlineValue` products. |
 | Operations | One build, read, update, reuse and copy-on-write form for both families. Evaluation order and storage position are separate facts. |
-| Equality and hash | Tuples and records resolve to trait implementations. Core's native structural equality fallback is removed for tuples. |
+| Equality and hash | Tuples and records resolve to trait implementations. Core has no native equality for products. |
 | First optimization | Scalar replacement of managed products within and across calls, records admitted. It is increments 1 and 2 generalised. |
 | Runtime | Tuple boxes use the record emitter's typed layouts. The runtime's own tuple producers move behind a defined boundary. |
 
@@ -92,9 +92,7 @@ From then on the family is consulted in exactly these places:
 - C type naming and the layout key;
 - boundary policies: a declared native ABI record's adapters, and the runtime's
   own tuple producers until the runtime slice;
-- dumps and diagnostics, which print record field names;
-- trait resolution's native structural equality, until the tuple entry is
-  removed (section 1.7).
+- dumps and diagnostics, which print record field names.
 
 Construction, projection, update, reuse, ownership, scalar replacement and
 multi-values never ask. `CoreProduct` is opaque to make that a type error
@@ -395,22 +393,16 @@ record needs its own implementation; the Guide says there is no identity
 fallback. Dictionary key callbacks (`hash_key_callbacks`) reach the resolved
 implementation the same way for both families.
 
-Core also has a native fallback. When no implementation is registered for a
-type and method, `target_for_dispatch` in `trait_resolve.brp` calls
-`compiler_native_target`. `has_native_structural_equality` lists
-`EnumType`, `RangeType`, `TensorType`, `TupleType` and some named types,
-and maps `Equatable.equals`/`not_equals` on them to a C `==`/`!=`. For tuples
-it is reachable and wrong: `tuple.brp` implements only `equals`, so
-`not_equals` falls through and `(1, 2) != (1, 2)` compares the two box
-pointers and prints `True`.
-The cause is broader than tuples: generic implementations lose trait default
-methods, so `Wrap[T]` with only `equals` also gets a wrong `!=`, and
-`List[(Int, Int)]` equality is wrong too. The fix registers defaults for
-generic instances and removes `TupleType` from the fallback list. It is a
-separate change and lands before slice 1.
-After it, no Core pass compares product values by shape, and none may start
-to. Enums, refinement indexes and tensors keep the fallback; they are not
-products.
+Core has no native equality for products. `has_native_structural_equality`
+in `trait_resolve.brp` covers only enum tags, `..#N` indices, `Ptr`, numeric
+tensors, String and Set, each compared by value. An operator with neither an
+implementation target nor one of those types is an internal compiler error
+(`UnresolvedOperatorTarget`), never a C `==` on two boxes. Trait default
+methods are materialized for generic implementations too, so the
+`not_equals` and ordering defaults of `tuple.brp` and of a user `Wrap[T]` are
+ordinary implementation methods. No Core pass compares product values by
+shape, and none may start to. Enums, refinement indexes and tensors keep
+native equality; they are not products.
 
 ## 2. Operations
 

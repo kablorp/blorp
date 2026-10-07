@@ -2354,12 +2354,17 @@ implements Equatable for Vec2:
         a.x == b.x and a.y == b.y
 ```
 
-Every type that has data needs an explicit `Equatable` implementation to use `==`: records and unions with payloads. There is no identity fallback. Payload-free `enum`s are compared by tag and need no implementation, and the standard library provides the implementations for scalars, `String`, tuples, `Option`, `Result`, and `List`. `Option[T]`, `Result[T, E]`, tuples, and `List[T]` are `Equatable` exactly when their components are, so `Option[Point]` is rejected unless `Point` implements `Equatable`.
+Every type that has data needs an explicit `Equatable` implementation to use `==`: records and unions with payloads. There is no identity fallback. Payload-free `enum`s are compared by tag and need no implementation, and the standard library provides the implementations for scalars, `String`, tuples, `Option`, `Result`, `List`, and `Dict`. `Option[T]`, `Result[T, E]`, tuples, `List[T]`, and the values of `Dict[K, V]` are `Equatable` exactly when their components are, so `Option[Point]` is rejected unless `Point` implements `Equatable`.
 
 `List[T]` is `Equatable` exactly when `T` is: `==` compares lengths, then elements
 with the element type's own `==`, so lists of lists, options, and records with an
 `Equatable` implementation compare by value. Comparing `List[Point]` when `Point`
 has no `Equatable` implementation is a compile error.
+
+`Dict[K, V]` is `Equatable` exactly when `V` is: two dicts are equal when they
+hold the same keys and each key's values are equal by `V`'s own `==`. Insertion
+order does not matter. Comparing `Dict[Int, Point]` when `Point` has no
+`Equatable` implementation is a compile error.
 
 The standard library uses this extensively — `Vec2`, `Vec3`, `Radians`, `Degrees`, `Hz`, `Db`, and all sized numeric types define operators through traits. Builtin scalar implementations, including numeric arithmetic, `String` concatenation, and `Fixed` arithmetic, are ordinary trait implementations whose `builtin` bodies lower directly to native Core operations without a runtime trait call. See `standard_library/src/geometry.brp` and `standard_library/src/units.brp` for source-defined examples.
 
@@ -2423,15 +2428,27 @@ import (`area` above), as for an unqualified trait.
 | `Modulable` | `remainder` | Modulo (`%`) |
 | `Negatable` | `negate` | Unary negation (`-a`) |
 | `Numeric` | `add`, `multiply`, `zero` | Basic numeric reductions |
-| `Equatable` | `equals`, `not_equals` | Equality (`==`, `!=`) |
+| `Equatable` | `equals` (`not_equals` has a default) | Equality (`==`, `!=`) |
 | `Hashable` | Equatable + `hash` | Dict keys and Set elements |
-| `Orderable` | Equatable + `less_than`, `greater_than`, `less_than_or_equal`, `greater_than_or_equal` | Ordering |
+| `Orderable` | Equatable + `less_than` (the other comparisons have defaults) | Ordering (`<`, `>`, `<=`, `>=`) |
 | `Stringable` | `to_string` | String conversion |
 | `ToBool` | `to_bool` | Boolean conversion |
 | `HasLength` | `length` | Length |
 | `Collection` | `length`, `is_empty` | Collection basics |
 
-Traits are implemented for: `Int`, `Float`, `String`, `Bool`, `Char`, `Option[T]`, `Result[T, E]`, `List[T]`.
+Traits are implemented for: `Int`, `Float`, `String`, `Bool`, `Char`, `Option[T]`, `Result[T, E]`, `List[T]`,
+`Dict[K, V]` and tuples. Containers compare their contents with each element's
+own `==`: a `List[T]`, `Option[T]` or tuple is `Equatable` when its elements are,
+and a `Dict[K, V]` when its values are. Tuples are also `Orderable`,
+lexicographically.
+
+A default method such as `not_equals` or `greater_than` is provided for every
+implementation that does not write its own, including generic ones like
+`implements Equatable for Wrap[T:Equatable]`. Each default body is checked
+against the implementation's type, so a default that uses an operation the
+type lacks (`self + self` on a type that is not `Addable`) is a compile error
+for that implementation; write the method in the implementation instead.
+
 Fieldless enums implement `Equatable` and `Hashable` without an `implements`
 block, so they satisfy `T: Equatable` and `T: Hashable` bounds.
 
