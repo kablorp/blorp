@@ -26930,33 +26930,106 @@ void blorp_task_cancel_join_release(void* t) {
     blorp_release(task);
 }
 
-long blorp_test_cancel_after_parked(blorp_Closure* func) {
-    if (!func) return 0;
-    blorp_Task* task = (blorp_Task*)blorp_task_spawn(func);
-    bool observed_parked = false;
+// Observation is bounded, but joining cancellation still requires the child
+// to cooperate. Keep this test-only policy out of task/scheduler state.
+static const uint64_t BLORP_TEST_PARK_OBSERVATION_NS = 5 * BLORP_NSEC_PER_SEC;
+static const long BLORP_TEST_PARK_POLL_BACKOFF_NS = BLORP_NSEC_PER_MSEC;
 
-    for (int i = 0; i < 100000; i++) {
+typedef enum {
+    BLORP_TEST_PARK_OBSERVED,
+    BLORP_TEST_PARK_CHILD_COMPLETED,
+    BLORP_TEST_PARK_DEADLINE
+} blorp_TestParkOutcome;
+
+typedef struct {
+    blorp_TestParkOutcome outcome;
+    bool completed;
+    bool has_fiber;
+    bool parked;
+    bool running;
+} blorp_TestParkObservation;
+
+void blorp_yield_now(void);
+
+static blorp_TestParkObservation blorp_test_observe_child_parked(
+    blorp_Task* task,
+    uint64_t observation_ns
+) {
+    uint64_t start_ns = blorp_monotonic_now_ns();
+    blorp_TestParkObservation observation = {0};
+
+    for (;;) {
         pthread_mutex_lock(&task->mutex);
-        bool completed = task->completed;
+        observation.completed = task->completed;
         blorp_Fiber* task_fiber = task->task_fiber;
-        // parked is set before mco_yield; wait until running is clear so this
-        // test hook cancels only after the fiber has actually yielded.
-        bool parked =
-            task_fiber &&
-            __atomic_load_n(&task_fiber->parked, __ATOMIC_ACQUIRE) != 0 &&
-            __atomic_load_n(&task_fiber->running, __ATOMIC_ACQUIRE) == 0;
+        observation.has_fiber = task_fiber != NULL;
+        observation.parked = task_fiber &&
+            __atomic_load_n(&task_fiber->parked, __ATOMIC_ACQUIRE) != 0;
+        observation.running = task_fiber &&
+            __atomic_load_n(&task_fiber->running, __ATOMIC_ACQUIRE) != 0;
         pthread_mutex_unlock(&task->mutex);
 
-        if (parked) {
-            observed_parked = true;
-            break;
+        // parked is set before mco_yield; wait until running is clear so this
+        // test hook cancels only after the fiber has actually yielded.
+        if (observation.parked && !observation.running) {
+            observation.outcome = BLORP_TEST_PARK_OBSERVED;
+            return observation;
         }
-        if (completed) break;
-        sched_yield();
+        if (observation.completed) {
+            observation.outcome = BLORP_TEST_PARK_CHILD_COMPLETED;
+            return observation;
+        }
+        if (blorp_monotonic_now_ns() - start_ns >= observation_ns) {
+            observation.outcome = BLORP_TEST_PARK_DEADLINE;
+            return observation;
+        }
+        if (__blorp_current_fiber) {
+            // Never sleep a carrier while its child needs scheduler progress.
+            blorp_yield_now();
+        } else {
+            struct timespec backoff = {0, BLORP_TEST_PARK_POLL_BACKOFF_NS};
+            (void)nanosleep(&backoff, NULL);
+        }
     }
+}
 
+static long blorp_test_cancel_after_parked_with_timeout(
+    blorp_Closure* func,
+    uint64_t observation_ns
+) {
+    if (!func) return 0;
+    blorp_Task* task = (blorp_Task*)blorp_task_spawn(func);
+    blorp_CancelCleanupFrame cleanup;
+    // The observing parent may be cancelled at its cooperative yield. Own the
+    // child before that point so longjmp drains it exactly once.
+    blorp_task_cleanup_push_task(&cleanup, &task, task);
+    blorp_TestParkObservation observation =
+        blorp_test_observe_child_parked(task, observation_ns);
+    if (observation.outcome != BLORP_TEST_PARK_OBSERVED) {
+        // Report before joining: an uncooperative child can delay cleanup.
+        // Everything printed is a snapshot, never a post-unlock dereference.
+        fprintf(stderr,
+            "blorp: cancel_after_parked: %s "
+            "(completed=%d fiber=%d parked=%d running=%d; %s; observation_ns=%llu). %s\n",
+            observation.outcome == BLORP_TEST_PARK_CHILD_COMPLETED
+                ? "child completed before suspension"
+                : "observation deadline expired",
+            observation.completed, observation.has_fiber,
+            observation.parked, observation.running,
+            observation.has_fiber ? "fiber runner" : "no fiber observed (pending or fallback runner)",
+            (unsigned long long)observation_ns,
+            observation.outcome == BLORP_TEST_PARK_CHILD_COMPLETED
+                ? "Child must remain blocked until cancellation."
+                : "Ensure child reaches a blocking operation and scheduler can make progress.");
+    }
+    blorp_task_cleanup_pop_slot(&task);
     blorp_task_cancel_join_release(task);
-    return observed_parked ? 1 : 0;
+    return observation.outcome == BLORP_TEST_PARK_OBSERVED ? 1 : 0;
+}
+
+long blorp_test_cancel_after_parked(blorp_Closure* func) {
+    return blorp_test_cancel_after_parked_with_timeout(
+        func, BLORP_TEST_PARK_OBSERVATION_NS);
 }
 
 static void* blorp_test_task_window_noop(void* env) {
