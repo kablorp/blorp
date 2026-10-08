@@ -17,13 +17,18 @@ import:
 			ParsedBlockExpr,
 			ParsedBoolLiteralExpr,
 			ParsedCallExpr,
+			ParsedDictExpr,
+			ParsedListExpr,
 			ParsedLogicalExpr,
+			ParsedMatchExpr,
 			ParsedNameExpr,
+			ParsedRecordExpr,
 			ParsedStringInterpolationPartsExpr,
 			ParsedSubscriptAssignExpr,
 			ParsedSubscriptExpr,
 			ParsedVoidExpr,
 		),
+		ParsedPattern(ParsedBoolPattern),
 		ParsedProgram,
 		ParsedStringInterpolationPart(ParsedInterpolationExpr, ParsedInterpolationLiteral),
 	../../../src/compiler/stage_03_parse/source_ast_finalize:
@@ -44,6 +49,7 @@ import:
 		source_file,
 		source_location_for_file,
 		source_location_span,
+		source_locations_equal,
 		source_span_text,
 		source_table_for_file,
 	test: TestSuite
@@ -593,9 +599,8 @@ func test_finalize_interpolation_program_is_stack_bounded_for_deep_logical_spine
 
 func test_finalize_nested_functions_program_hoists_simple_nested_function() -> Bool:
 	program_source: String = "func outer(x: Int) -> Int:\n\tfunc inner(y: Int) -> Int:\n\t\ty + 1\n\tinner(x)"
-	program: ParsedProgram = finalize_nested_functions_program(
-		parse_compiler_source(source(program_source)),
-	)
+	parsed: ParsedProgram = parse_compiler_source(source(program_source))
+	program: ParsedProgram = finalize_nested_functions_program(parsed)
 
 	first_body_ok: Bool = match function_body_item_at(program, 1, 0):
 		Some(ParsedVoidExpr(_)):
@@ -603,9 +608,20 @@ func test_finalize_nested_functions_program_hoists_simple_nested_function() -> B
 		_:
 			False
 
-	call_ok: Bool = match function_body_item_at(program, 1, 1):
-		Some(expr):
-			call_callee_name(expr) == "__nested_outer_inner_0"
+	call_ok: Bool = match (
+		function_body_item_at(parsed, 0, 1),
+		function_body_item_at(program, 1, 1),
+	):
+		(
+			Some(ParsedCallExpr(ParsedNameExpr(authored), _, authored_span)),
+			Some(ParsedCallExpr(ParsedNameExpr(rewritten), _, rewritten_span)),
+		):
+			(
+				rewritten.text == "__nested_outer_inner_0"
+				and name_ids_equal(authored.name, rewritten.name)
+				and source_locations_equal(authored.span, rewritten.span)
+				and source_locations_equal(authored_span, rewritten_span)
+			)
 		_:
 			False
 
@@ -723,6 +739,55 @@ func test_finalize_nested_functions_program_preserves_ordered_rewrite_chains() -
 			False
 
 	second_calls_self and third_uses_composed_prior_rewrite
+
+
+func test_finalize_nested_functions_preserves_container_order_and_labels() -> Bool:
+	program_source: String = "func outer():\n\tfunc first(): 1\n\tfunc second(): 2\n\t[first(), second(), first()]\n\t{first = second(), second = first()}\n\t{first() => second(), first() => first()}\n\tmatch True:\n\t\tTrue: first()\n\t\tFalse: second()"
+	program: ParsedProgram = finalize_nested_functions_program(
+		parse_compiler_source(source(program_source)),
+	)
+	first: String = "__nested_outer_first_0"
+	second: String = "__nested_outer_second_1"
+
+	list_ok: Bool = match function_body_item_at(program, 2, 2):
+		Some(ParsedListExpr(items, _)):
+			items.map(call_callee_name) == [first, second, first]
+		_:
+			False
+
+	record_ok: Bool = match function_body_item_at(program, 2, 3):
+		Some(ParsedRecordExpr(fields, _)):
+			(
+				fields.map(func(field): field.name.text) == ["first", "second"]
+				and fields.map(func(field): call_callee_name(field.value)) == [second, first]
+			)
+		_:
+			False
+
+	dict_ok: Bool = match function_body_item_at(program, 2, 4):
+		Some(ParsedDictExpr(entries, _)):
+			(
+				entries.map(func(entry): call_callee_name(entry.key)) == [first, first]
+				and entries.map(func(entry): call_callee_name(entry.value)) == [second, first]
+			)
+		_:
+			False
+
+	match_ok: Bool = match function_body_item_at(program, 2, 5):
+		Some(ParsedMatchExpr(_, cases, _)):
+			patterns = cases.map(func(item):
+				match item.pattern:
+					ParsedBoolPattern(value, _): Some(value)
+					_: None
+			)
+			(
+				patterns == [Some(True), Some(False)]
+				and cases.map(func(item): call_callee_name(item.body)) == [first, second]
+			)
+		_:
+			False
+
+	program.diagnostics.is_empty() and list_ok and record_ok and dict_ok and match_ok
 
 
 func test_finalize_typecheck_source_program_composes_interpolation_and_hoist() -> Bool:
@@ -1054,6 +1119,10 @@ tests: TestSuite = {
 		(
 			"finalize nested functions program preserves ordered rewrite chains",
 			test_finalize_nested_functions_program_preserves_ordered_rewrite_chains,
+		),
+		(
+			"finalize nested functions preserves container order and labels",
+			test_finalize_nested_functions_preserves_container_order_and_labels,
 		),
 		(
 			"finalize typecheck source program composes interpolation and hoist",
