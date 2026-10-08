@@ -6,18 +6,19 @@
 import:
 	../stage_06_typecheck/type_system/language_surface_manifest:
 		DeclaredAbiType(DeclaredAbiMemStats, DeclaredAbiSchedulerStats),
-	../stage_08_core_lower/list_layout: CoreLayoutTypeIndex, resolve_layout_type_with_index
+	../stage_08_core_lower/list_layout: resolve_layout_type_with_index
 	../stage_09_core/c_type_layout: c_type_name
 	../stage_09_core/ir:
+		CoreLayoutTypeIndex,
 		CoreCallKind(ForeignCall),
 		CoreDecl(InlineRecordDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, UnionDecl),
 		CoreExpr(CallExpr),
 		CoreFieldOrdinal,
-		CoreFieldRef,
 		CoreFunction,
 		CoreFunctionKind(ForeignFunction),
 		CoreHeapRecordDecl,
 		CoreProgram,
+		CoreTupleStorageCatalog,
 		CoreType(
 			InlineRecordType, NativeManagedType,
 			BoxedResultType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType,
@@ -29,8 +30,12 @@ import:
 		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
 		core_expr_type,
 		core_field_ordinal_index,
-		core_field_ref_id,
-		core_field_ref_is_resolved,
+	../stage_09_core/managed_record_layout:
+		CoreManagedRecordLayout,
+		CoreManagedRecordLayoutFault,
+		managed_record_layout_for_decl,
+		managed_record_layout_fields,
+		managed_record_layout_name,
 	../stage_09_core/specialize_layout: CoreSpecializeLayout
 	../stage_09_core/traverse: immediate_core_expr_children
 	c_naming: c_field_name, c_record_member_name
@@ -108,22 +113,16 @@ pure func c_heap_record_field_storage(
 record CRecordLayoutRegistry {
 	foreign_abi_heap_record_names: Set[String],
 	byte_sized_scalar_union_names: Set[String],
-	-- The records whose members keep their source names (a declared ABI
-	-- record, or one reachable from a foreign function's signature), each with
-	-- its member spellings in declaration order. Every other record spells its
-	-- members `f<ordinal>`.
+	-- The declared records whose members keep their source names (a declared
+	-- ABI record, or one reachable from a foreign function's signature), each
+	-- with its member spellings in declaration order. Every other record
+	-- spells its members `f<ordinal>`.
 	source_member_fields: Dict[String, List[String]],
-	record_member_names: Dict[Int, String]
+	-- Physical views are derived from the checked complete catalog. They retain
+	-- logical unit ordinals while distinguishing omitted C storage.
+	managed_layouts: Dict[String, CoreManagedRecordLayout],
+	tuple_catalog: CoreTupleStorageCatalog
 }
-
-
----
-Why classifying the record layouts failed: a record whose members are spelled
-from field identity has a field with no typecheck identity, so it has no member
-spelling. Names the record and the field.
----
-union CRecordLayoutError:
-	UnresolvedRecordFieldRef(String, String)
 
 
 ---
@@ -167,31 +166,9 @@ pure func c_record_member_scope(
 
 
 ---
-The member spelling of the scope record's field `name` with identity `ref`, for a
-construction site that has the field's identity but not its position: the source
-name for a record in `source_member_fields`, `f<ordinal>` for every other, looked
-up in `record_member_names`. That table is filled once per field when the layouts
-are classified (a member access that rebuilt the string instead cost +0.44%
-backend allocations), from the same ordinals the declaration sites use, so a
-declaration and its constructions cannot disagree. `None` for a field of an
-ordinary record the table does not hold, which classification rules out for
-declared fields.
----
-pure func c_record_member(
-	scope: CRecordMemberScope,
-	name: String,
-	ref: CoreFieldRef,
-) -> Option[String]:
-	if scope.layouts.source_member_fields.contains(scope.record_name):
-		Some(c_field_name(name))
-	else:
-		scope.layouts.record_member_names.get(core_field_ref_id(ref))
-
-
----
-The member spelling of the field at position `ordinal` of a record's declaration:
-what `c_record_member` finds for it in the table, without the lookup, for the
-declaration sites that walk the fields in order.
+The member spelling of the field at position `ordinal` of a record's declaration,
+for the declaration sites that walk the fields in order: what `c_record_member_at`
+answers for it, without the lookup.
 ---
 pure func c_declared_record_member(scope: CRecordMemberScope, name: String, ordinal: Int) -> String:
 	if scope.layouts.source_member_fields.contains(scope.record_name):
@@ -202,33 +179,45 @@ pure func c_declared_record_member(scope: CRecordMemberScope, name: String, ordi
 
 private record CRecordDeclIndex {
 	layout_types: CoreLayoutTypeIndex,
-	heap_records: Dict[String, CoreHeapRecordDecl],
+	managed_layouts: Dict[String, CoreManagedRecordLayout],
 	unions: Dict[String, CoreUnionDecl]
 }
 
 
 private pure func build_record_decl_index(
 	specialize_layout: CoreSpecializeLayout,
-) -> CRecordDeclIndex:
-	var heap_records: Dict[String, CoreHeapRecordDecl] = {}
+	catalog: CoreTupleStorageCatalog,
+) -> Result[CRecordDeclIndex, CoreManagedRecordLayoutFault]:
+	var layouts: Dict[String, CoreManagedRecordLayout] = {}
 	var unions: Dict[String, CoreUnionDecl] = {}
+	var failure: Option[CoreManagedRecordLayoutFault] = None
 
 	for decl in specialize_layout.program.decls:
+		match managed_record_layout_for_decl(catalog, decl):
+			Ok(Some(layout)):
+				name = managed_record_layout_name(layout)
+				layouts = layouts.set(name, layout)
+			Ok(None):
+				void
+			Err(fault):
+				failure = Some(fault)
+
 		match decl:
-			HeapRecordDecl(record_decl):
-				if not heap_records.contains(record_decl.name):
-					heap_records = heap_records.set(record_decl.name, record_decl)
 			UnionDecl(union_decl):
 				if not unions.contains(union_decl.name):
 					unions = unions.set(union_decl.name, union_decl)
 			_:
 				void
 
-	{
-		layout_types = specialize_layout.types,
-		heap_records = heap_records,
-		unions = unions
-	}
+	match failure:
+		Some(fault):
+			Err(fault)
+		None:
+			Ok({
+				layout_types = specialize_layout.types,
+				managed_layouts = layouts,
+				unions = unions
+			})
 
 
 
@@ -359,95 +348,15 @@ private pure func scalar_union_decl_uses_byte_tags(union_decl: CoreUnionDecl) ->
 	uses_byte_tags
 
 
----
-`names` with the spelling of the field at `ordinal`, keyed by its identity. A generic
-record's instances copy its fields with their ids and in order, so one id has one
-ordinal in every instance and the first one recorded stands.
----
-private pure func with_member_name(
-	names: Dict[Int, String],
-	ref: CoreFieldRef,
-	ordinal: Int,
-) -> Dict[Int, String]:
-	field_id: Int = core_field_ref_id(ref)
-
-	if names.contains(field_id) or not core_field_ref_is_resolved(ref):
-		names
-	else:
-		names.set(field_id, c_record_member_name(ordinal))
-
-
----
-The first field with no typecheck identity that sits in a record whose members are
-spelled from identity; an ABI record's members keep their names, so an unresolved
-field there is not an error.
----
-private pure func first_unresolved_outside(
-	unresolved: List[CRecordLayoutError],
-	source_member_names: Set[String],
-) -> Option[CRecordLayoutError]:
-	var found: Option[CRecordLayoutError] = None
-
-	for error in unresolved:
-		match error:
-			UnresolvedRecordFieldRef(record_name, _):
-				if found.is_none() and not Sets.contains(source_member_names, record_name):
-					found = Some(error)
-
-	found
-
-
----
-Member spellings collected from every record declaration (by field identity,
-and as source names by record in declaration order), and the fields that have
-no typecheck identity to spell a member from.
----
-private record RecordMemberScan {
-	member_names: Dict[Int, String],
-	source_names: Dict[String, List[String]],
-	unresolved: List[CRecordLayoutError]
-}
-
-
-private pure func with_record_member(
-	scan: RecordMemberScan,
-	record_name: String,
-	ref: CoreFieldRef,
-	field_name: String,
-	ordinal: Int,
-) -> RecordMemberScan:
-	member_names: Dict[Int, String] = with_member_name(scan.member_names, ref, ordinal)
-	source_names: Dict[String, List[String]] = scan.source_names.set(
-		record_name,
-		scan.source_names.get_or(record_name, []).append(c_field_name(field_name)),
-	)
-
-	if core_field_ref_is_resolved(ref):
-		{ scan |
-			member_names = member_names,
-			source_names = source_names
-		}
-	else:
-		{
-			member_names = member_names,
-			source_names = source_names,
-			unresolved = scan.unresolved.append(UnresolvedRecordFieldRef(record_name, field_name))
-		}
-
-
 pure func classify_c_record_layouts(
 	specialize_layout: CoreSpecializeLayout,
+	catalog: CoreTupleStorageCatalog,
 	foreign_boundary_types: List[CoreType],
-) -> Result[CRecordLayoutRegistry, CRecordLayoutError]:
+) -> Result[CRecordLayoutRegistry, CoreManagedRecordLayoutFault]:
 	program: CoreProgram = specialize_layout.program
-	decl_index: CRecordDeclIndex = build_record_decl_index(specialize_layout)
+	decl_index ?= build_record_decl_index(specialize_layout, catalog)
 	var foreign_heap_names: Set[String] = Sets.set()
 	var declared_abi_names: Set[String] = Sets.set()
-	var members: RecordMemberScan = {
-		member_names = {},
-		source_names = {},
-		unresolved = []
-	}
 	var byte_sized_scalar_union_names: Set[String] = Sets.set()
 	var visited_union_names: Set[String] = Sets.set()
 	var pending: List[CoreType] = foreign_boundary_types
@@ -465,12 +374,6 @@ pure func classify_c_record_layouts(
 			HeapRecordDecl(record_decl):
 				if record_decl.abi_type.is_some():
 					declared_abi_names = Sets.add(declared_abi_names, record_decl.name)
-
-				for (ordinal, field) in record_decl.fields.enumerate():
-					members = with_record_member(members, record_decl.name, field.ref, field.name, ordinal)
-			InlineRecordDecl(record_decl):
-				for (ordinal, field) in record_decl.fields.enumerate():
-					members = with_record_member(members, record_decl.name, field.ref, field.name, ordinal)
 			_:
 				void
 
@@ -484,9 +387,9 @@ pure func classify_c_record_layouts(
 						if not Sets.contains(foreign_heap_names, record_name):
 							foreign_heap_names = Sets.add(foreign_heap_names, record_name)
 
-							match decl_index.heap_records.get(record_name):
+							match decl_index.managed_layouts.get(record_name):
 								Some(record_decl):
-									for field in record_decl.fields:
+									for field in managed_record_layout_fields(record_decl):
 										pending = pending.append(field.typ)
 								None:
 									void
@@ -508,27 +411,29 @@ pure func classify_c_record_layouts(
 
 		index += 1
 
-	source_member_names: Set[String] = Sets.combine(declared_abi_names, foreign_heap_names)
-	unresolved: Option[CRecordLayoutError] = first_unresolved_outside(
-		members.unresolved,
-		source_member_names,
-	)
-
+	source_member_records: Set[String] = Sets.combine(declared_abi_names, foreign_heap_names)
 	var source_member_fields: Dict[String, List[String]] = {}
 
-	for record_name in Sets.to_list(source_member_names):
-		source_member_fields = source_member_fields.set(
-			record_name,
-			members.source_names.get_or(record_name, []),
-		)
+	-- Only the records spelled by name build their member names; every other
+	-- record spells a member from its ordinal when it is used.
+	for decl in program.decls:
+		match decl:
+			HeapRecordDecl(record_decl):
+				if (
+					Sets.contains(source_member_records, record_decl.name)
+					and not source_member_fields.contains(record_decl.name)
+				):
+					source_member_fields = source_member_fields.set(
+						record_decl.name,
+						record_decl.fields.map(func(field): c_field_name(field.name)),
+					)
+			_:
+				void
 
-	match unresolved:
-		Some(error):
-			Err(error)
-		None:
-			Ok({
-				foreign_abi_heap_record_names = foreign_heap_names,
-				byte_sized_scalar_union_names = byte_sized_scalar_union_names,
-				source_member_fields = source_member_fields,
-				record_member_names = members.member_names,
-			})
+	Ok({
+		foreign_abi_heap_record_names = foreign_heap_names,
+		byte_sized_scalar_union_names = byte_sized_scalar_union_names,
+		source_member_fields = source_member_fields,
+		managed_layouts = decl_index.managed_layouts,
+		tuple_catalog = catalog
+	})

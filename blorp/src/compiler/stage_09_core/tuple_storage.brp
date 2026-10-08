@@ -1,0 +1,937 @@
+-- Typed tuple storage after monomorphization and local tuple flattening.
+-- Logical row metadata stays structural. Executable types and construction
+-- use the one generated managed-record catalog before ownership preparation.
+import:
+	ir:
+		CoreCallKind(DictWithCapacityCall),
+		CoreLayoutTypeIndex,
+		build_core_layout_type_index,
+		resolve_core_layout_type_head_keeping_opaque_arguments,
+		CoreDeclaredOrigin(ProjectedImplMethod, NativeTagEqualityCallback),
+		CoreFunctionOrigin(Declared, Synthesized, ConsumingClone),
+		CoreTensorForElementStorage(TensorForBoxedElement),
+		CoreDecl(GeneratedTupleRecordDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, InlineRecordDecl, UnionDecl, ImplDecl, TraitDecl, TypeAliasDecl),
+		CoreExpr(
+			LiteralExpr, StaticStringLiteralExpr, VarExpr, VoidExpr, DebugBlockExpr, CooperativeCheckpointExpr,
+			CallExpr, BinaryExpr, UnaryExpr, LogicalExpr, AssignExpr, CastExpr,
+			BoxExpr, UnboxExpr, ProductFieldExpr, ModuleMemberExpr, TupleExpr, VectorExpr, LambdaExpr, ClosureCreateExpr, ListConstructExpr, ListAllocExpr, ListGetExpr,
+			ListHandoffExpr, ListHandoffSetOwnedExpr, ListHandoffSetSourceSlotExpr, StringByteReadExpr, StringByteWriteExpr, StringByteCopyExpr,
+			StringSetLenExpr, TensorLiteralExpr, TensorBoxedLiteralExpr, TensorPackedLiteralExpr, TensorRawFillExpr, TensorRawReadExpr,
+			TensorRawWriteExpr, TensorRawViewLetExpr, DictExpr, DictConstructExpr, SetAllocExpr, ListRetainExpr,
+			ListSetExpr, ListSwapExpr, ProductExpr, RecordUpdateExpr, RecordReuseExpr, RecordCowUpdateExpr,
+			UnionConstructExpr, UnionReuseConstructExpr, DetachExpr, DupExpr, DropExpr, LetExpr,
+			BorrowLetExpr, SeqExpr, WhileExpr, BreakExpr, ContinueExpr, ResourceScopeExpr,
+			ResourceCleanupExitExpr, TailrecLoopExpr, TailrecRecurExpr, TailrecListSpreadLoopExpr, TailrecListSpreadRecurExpr, ForRangeExpr,
+			ForChannelExpr, ForListExpr, ForStringExpr, ForDictExpr, ForSetExpr, ForStreamExpr,
+			ForResourceSourceExpr, ForTensorExpr, PreClosureConcurrentlyLoopExpr, ConcurrentlyLoopExpr, PreClosureConcurrentExpr, ConcurrentExpr,
+			PreClosureDetachExpr, SelectExpr, RawMatchExpr, SemanticMatchExpr, LiteralMatchExpr, AccessorLiteralMatchExpr,
+			LengthMatchExpr, ConstructorMatchExpr, IfExpr,
+		),
+		CoreAccessor(
+			RootAccessor, VariantFieldAccessor, ErasedVariantFieldAccessor,
+			NullableOptionPayloadAccessor, InlineTaggedPayloadAccessor, BoxedInlineTaggedPayloadAccessor,
+			StackResultOkPayloadAccessor, StackResultErrPayloadAccessor,
+			BoxedStackResultOkPayloadAccessor, BoxedStackResultErrPayloadAccessor,
+			BoxedResultOkPayloadAccessor, BoxedResultErrPayloadAccessor,
+			ProductFieldAccessor, ListElementAccessor, ListSpreadAccessor,
+		),
+		CoreConstructorMatchBody(ConstructorMatchBodyExpr, ConstructorMatchBodyLiteral, ConstructorMatchBodyLength),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(ConstructorMatchFallbackBody, ConstructorMatchFallbackBindings, ConstructorMatchFallbackFail),
+		CoreConstructorLiteralMatch,
+		CoreConstructorLengthMatch,
+		CoreConstructorLengthMatchBranch,
+		CoreConcurrentBinding,
+		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopCopyItem, ConcurrentlyLoopMoveResourceItem),
+		CoreHashContainerConstructor(
+			GenericHashContainerConstructor, StringHashContainerConstructor, FloatHashContainerConstructor,
+			Int128HashContainerConstructor, TraitHashContainerConstructor, ImplHashContainerConstructor,
+			CustomHashContainerConstructor,
+		),
+		CoreFunction,
+		CoreFunctionKind(ClosureBodyFunction),
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(LiteralMatchFallbackBody, LiteralMatchFallbackBindings, LiteralMatchFallbackFail),
+		CoreMatchBinding,
+		CoreProgram,
+		CoreSelectArm,
+		CoreSelectArmKind(SelectRecvArm, SelectSealedArm, SelectAfterArm),
+		CoreSourceLoc,
+		CoreTupleStorageCatalog,
+		CoreTupleStorageFault,
+		CoreType(
+			VoidType, NativeManagedType, NamedType, TypeParameterType, SelfType,
+			FunctionType, StackResultType, BoxedResultType, HeapRecordType,
+			InlineRecordType, UnionType, RangeType, TensorType, TupleType,
+		),
+		core_expr_source_loc,
+		core_expr_type,
+		core_field_ordinal_index,
+		core_type_equal,
+		core_generated_tuple_record_name,
+		core_tuple_storage_fault_message,
+		intern_tuple_storage_rows,
+		product_build_in_declared_order,
+		synthetic_core_source_loc,
+		tuple_storage_catalog,
+		tuple_storage_rows,
+		tuple_storage_type,
+	managed_record_layout:
+		CoreManagedRecordLayout,
+		CoreManagedRecordLayoutFault,
+		managed_record_layout_for_decl,
+		managed_record_layout_name,
+		managed_record_layout_fault_message,
+		managed_product_build_fault,
+		managed_product_projection_fault,
+	../stage_08_core_lower/list_layout: tensor_for_element_storage_for_canonical_type
+	c_type_layout: c_type_name
+	traverse as CoreTraverse
+	prepare: prepared_option_representation_matches_type
+
+
+union TupleStorageFailureReason:
+	TupleStorageCatalogFailure(CoreTupleStorageFault)
+	TupleStorageTypeSurvived(CoreType)
+	TupleStorageConstructionSurvived
+	TupleStorageOptionRepresentationMismatch
+	TupleStorageProductViolation(CoreManagedRecordLayoutFault)
+
+
+record TupleStorageFailure {
+	reason: TupleStorageFailureReason,
+	loc: CoreSourceLoc
+}
+
+
+pure func tuple_storage_failure_message(failure: TupleStorageFailure) -> String:
+	match failure.reason:
+		TupleStorageCatalogFailure(fault):
+			core_tuple_storage_fault_message(fault)
+		TupleStorageTypeSurvived(_):
+			"tuple storage type survived product lowering; lower its concrete shape through the generated row catalog"
+		TupleStorageConstructionSurvived:
+			"tuple literal survived storage lowering; lower its concrete shape before ownership preparation"
+		TupleStorageOptionRepresentationMismatch:
+			"prepared Option representation disagrees with its physical payload type; recreate the constructor after tuple storage lowering"
+		TupleStorageProductViolation(fault):
+			managed_record_layout_fault_message(fault)
+
+---
+Only types stored in this node's own metadata. The shared child walk visits
+expression operands separately. Keeping every constructor explicit means a
+new Core form cannot silently omit an unused binder, capture or ABI type.
+The result annotation is read independently through core_expr_type.
+---
+private pure func own_expression_storage_types(expr: CoreExpr) -> List[CoreType]:
+	match expr:
+		LiteralExpr(_, _, _):
+			[]
+		StaticStringLiteralExpr(_, _, _, _):
+			[]
+		VarExpr(_, _, _):
+			[]
+		VoidExpr(_, _):
+			[]
+		DebugBlockExpr(_, _, _):
+			[]
+		CooperativeCheckpointExpr(_, _):
+			[]
+		CallExpr(kind, _, _, _, _):
+			match kind:
+				DictWithCapacityCall(constructor):
+					hash_constructor_types(constructor)
+				_:
+					[]
+		BinaryExpr(_, _, _, _, _):
+			[]
+		UnaryExpr(_, _, _, _):
+			[]
+		LogicalExpr(_, _, _, _, _):
+			[]
+		AssignExpr(_, _, _, _):
+			[]
+		CastExpr(_, _, _):
+			[]
+		BoxExpr(box, _, _):
+			[box.source_type]
+		UnboxExpr(_, _, _, _):
+			[]
+		ProductFieldExpr(_, _, _, _):
+			[]
+		ModuleMemberExpr(_, _, _, _):
+			[]
+		TupleExpr(_, _, _):
+			[]
+		VectorExpr(_, _, _):
+			[]
+		LambdaExpr(params, result, _, _, _, _):
+			params.map(func(param): param.typ).append(result)
+		ClosureCreateExpr(closure, _, _):
+			closure.captures.map(func(capture): capture.typ)
+		ListConstructExpr(_, _, _):
+			[]
+		ListAllocExpr(_, _, _):
+			[]
+		ListGetExpr(_, _, _):
+			[]
+		ListHandoffExpr(handoff, _, _):
+			[handoff.source_type, handoff.result_type]
+		ListHandoffSetOwnedExpr(_, _, _):
+			[]
+		ListHandoffSetSourceSlotExpr(_, _, _):
+			[]
+		StringByteReadExpr(_, _, _):
+			[]
+		StringByteWriteExpr(_, _, _):
+			[]
+		StringByteCopyExpr(_, _, _):
+			[]
+		StringSetLenExpr(_, _, _):
+			[]
+		TensorLiteralExpr(_, _, _):
+			[]
+		TensorBoxedLiteralExpr(_, _, _):
+			[]
+		TensorPackedLiteralExpr(_, _, _):
+			[]
+		TensorRawFillExpr(_, _, _):
+			[]
+		TensorRawReadExpr(_, _, _):
+			[]
+		TensorRawWriteExpr(_, _, _):
+			[]
+		TensorRawViewLetExpr(_, _, _, _):
+			[]
+		DictExpr(_, _, _):
+			[]
+		DictConstructExpr(construct, _, _):
+			hash_constructor_types(construct.constructor)
+		SetAllocExpr(constructor, _, _):
+			hash_constructor_types(constructor)
+		ListRetainExpr(_, _, _):
+			[]
+		ListSetExpr(_, _, _):
+			[]
+		ListSwapExpr(_, _, _):
+			[]
+		ProductExpr(_, _, _):
+			[]
+		RecordUpdateExpr(_, _, _, _):
+			[]
+		RecordReuseExpr(_, _, _, _):
+			[]
+		RecordCowUpdateExpr(_, fields, _, _):
+			fields.map(func(field): field.field.typ)
+		UnionConstructExpr(_, _, _):
+			[]
+		UnionReuseConstructExpr(_, _, _):
+			[]
+		DetachExpr(task, _, _):
+			task.captures.map(func(capture): capture.typ).append(task.return_type)
+		DupExpr(_, value_type, _, _, _, _):
+			[value_type]
+		DropExpr(_, value_type, _, _, _, _):
+			[value_type]
+		LetExpr(_, _, value_type, _, _):
+			[value_type]
+		BorrowLetExpr(_, value_type, _, _):
+			[value_type]
+		SeqExpr(_, _):
+			[]
+		WhileExpr(_, _, _, _):
+			[]
+		BreakExpr(_, _):
+			[]
+		ContinueExpr(_, _):
+			[]
+		ResourceScopeExpr(scope, _, _):
+			[scope.typ]
+		ResourceCleanupExitExpr(_, _, _):
+			[]
+		TailrecLoopExpr(params, result, _, _):
+			params.map(func(param): param.typ).append(result)
+		TailrecRecurExpr(_, _, _):
+			[]
+		TailrecListSpreadLoopExpr(loop, _):
+			loop.params.map(func(param): param.typ).concat([loop.list_param.typ, loop.return_type])
+		TailrecListSpreadRecurExpr(_, _, _, _):
+			[]
+		ForRangeExpr(binder, _, _, _, _, _):
+			[binder.typ]
+		ForChannelExpr(loop, _, _):
+			[loop.binder.typ]
+		ForListExpr(loop, _, _):
+			[loop.binder.typ]
+		ForStringExpr(loop, _, _):
+			[loop.binder.typ]
+		ForDictExpr(loop, _, _):
+			[loop.binder.typ]
+		ForSetExpr(loop, _, _):
+			[loop.binder.typ]
+		ForStreamExpr(loop, _, _):
+			[loop.binder.typ]
+		ForResourceSourceExpr(loop, _, _):
+			[loop.binder.typ]
+		ForTensorExpr(loop, _, _):
+			[loop.binder.typ]
+		PreClosureConcurrentlyLoopExpr(loop, _, _):
+			[loop.item_type].concat(concurrent_item_types(loop.item_mode))
+		ConcurrentlyLoopExpr(loop, _, _):
+			[loop.item_type, loop.task.return_type].concat(concurrent_item_types(loop.item_mode)).concat(loop.task.captures.map(func(capture): capture.typ))
+		PreClosureConcurrentExpr(block, _, _):
+			block.bindings.map(func(binding): binding.typ)
+		ConcurrentExpr(block, _, _):
+			concurrent_block_types(block.bindings)
+		PreClosureDetachExpr(_, _, _):
+			[]
+		SelectExpr(arms, _, _):
+			select_arm_types(arms)
+		RawMatchExpr(_, _, _, _):
+			[]
+		SemanticMatchExpr(_, _, _, _):
+			[]
+		LiteralMatchExpr(_, cases, fallback, _, _):
+			literal_cases_types(cases).concat(literal_fallback_types(fallback))
+		AccessorLiteralMatchExpr(_, _, match_expr, _, _):
+			literal_match_types(match_expr)
+		LengthMatchExpr(_, _, match_expr, _, _):
+			length_match_types(match_expr)
+		ConstructorMatchExpr(_, _, cases, fallback, _, _):
+			constructor_cases_types(cases).concat(constructor_fallback_types(fallback))
+		IfExpr(_, _, _, _, _):
+			[]
+
+
+private pure func accessor_types(accessor: CoreAccessor) -> List[CoreType]:
+	match accessor:
+		RootAccessor:
+			[]
+		ProductFieldAccessor(parent, receiver_type, _, typ):
+			accessor_types(parent).concat([receiver_type, typ])
+		VariantFieldAccessor(parent, _, _, _):
+			accessor_types(parent)
+		ErasedVariantFieldAccessor(parent, _, _, _):
+			accessor_types(parent)
+		NullableOptionPayloadAccessor(parent):
+			accessor_types(parent)
+		InlineTaggedPayloadAccessor(parent):
+			accessor_types(parent)
+		BoxedInlineTaggedPayloadAccessor(parent, _):
+			accessor_types(parent)
+		StackResultOkPayloadAccessor(parent):
+			accessor_types(parent)
+		StackResultErrPayloadAccessor(parent):
+			accessor_types(parent)
+		BoxedStackResultOkPayloadAccessor(parent, _):
+			accessor_types(parent)
+		BoxedStackResultErrPayloadAccessor(parent, _):
+			accessor_types(parent)
+		BoxedResultOkPayloadAccessor(parent):
+			accessor_types(parent)
+		BoxedResultErrPayloadAccessor(parent):
+			accessor_types(parent)
+		ListElementAccessor(parent, _):
+			accessor_types(parent)
+		ListSpreadAccessor(parent, _):
+			accessor_types(parent)
+
+
+private pure func match_binding_types(bindings: List[CoreMatchBinding]) -> List[CoreType]:
+	var types: List[CoreType] = []
+	for binding in bindings:
+		types = types.append(binding.typ).concat(accessor_types(binding.accessor))
+	types
+
+
+private pure func literal_cases_types(cases: List[CoreLiteralMatchCase]) -> List[CoreType]:
+	var types: List[CoreType] = []
+	for match_case in cases:
+		types = types.concat(match_binding_types(match_case.bindings))
+	types
+
+
+private pure func literal_fallback_types(fallback: CoreLiteralMatchFallback) -> List[CoreType]:
+	match fallback:
+		LiteralMatchFallbackBindings(bindings, _):
+			match_binding_types(bindings)
+		LiteralMatchFallbackBody(_):
+			[]
+		LiteralMatchFallbackFail:
+			[]
+
+
+private pure func literal_match_types(match_expr: CoreConstructorLiteralMatch) -> List[CoreType]:
+	[match_expr.scrutinee_type, match_expr.result_type]
+		.concat(accessor_types(match_expr.accessor))
+		.concat(literal_cases_types(match_expr.cases))
+		.concat(literal_fallback_types(match_expr.fallback))
+
+
+private pure func constructor_body_types(body: CoreConstructorMatchBody) -> List[CoreType]:
+	match body:
+		ConstructorMatchBodyExpr(_):
+			[]
+		ConstructorMatchBodyLiteral(match_expr):
+			literal_match_types(match_expr)
+		ConstructorMatchBodyLength(match_expr):
+			length_match_types(match_expr)
+
+
+private pure func length_branch_types(branch: CoreConstructorLengthMatchBranch) -> List[CoreType]:
+	match_binding_types(branch.bindings).concat(constructor_body_types(branch.body))
+
+
+private pure func length_match_types(match_expr: CoreConstructorLengthMatch) -> List[CoreType]:
+	var types = [match_expr.result_type].concat(accessor_types(match_expr.accessor))
+	for match_case in match_expr.cases:
+		types = types.concat(length_branch_types(match_case.branch))
+	match match_expr.geq:
+		Some(geq):
+			types = types.concat(length_branch_types(geq.branch))
+		None:
+			void
+	match match_expr.fallback:
+		Some(branch):
+			types = types.concat(length_branch_types(branch))
+		None:
+			void
+	types
+
+
+private pure func constructor_cases_types(cases: List[CoreConstructorMatchCase]) -> List[CoreType]:
+	var types: List[CoreType] = []
+	for match_case in cases:
+		types = types.concat(accessor_types(match_case.accessor))
+			.concat(match_binding_types(match_case.bindings))
+			.concat(constructor_body_types(match_case.body))
+	types
+
+
+private pure func constructor_fallback_types(fallback: CoreConstructorMatchFallback) -> List[CoreType]:
+	match fallback:
+		ConstructorMatchFallbackBindings(bindings, _):
+			match_binding_types(bindings)
+		ConstructorMatchFallbackBody(_):
+			[]
+		ConstructorMatchFallbackFail:
+			[]
+
+
+private pure func concurrent_item_types(mode: CoreConcurrentlyLoopItemMode) -> List[CoreType]:
+	match mode:
+		ConcurrentlyLoopCopyItem:
+			[]
+		ConcurrentlyLoopMoveResourceItem(item):
+			[item.resource_type, item.error_type]
+
+
+private pure func concurrent_block_types(bindings: List[CoreConcurrentBinding]) -> List[CoreType]:
+	var types: List[CoreType] = []
+	for binding in bindings:
+		types = types.append(binding.typ).append(binding.task.return_type)
+			.concat(binding.task.captures.map(func(capture): capture.typ))
+	types
+
+
+private pure func select_arm_types(arms: List[CoreSelectArm]) -> List[CoreType]:
+	var types: List[CoreType] = []
+	for arm in arms:
+		match arm.kind:
+			SelectRecvArm(recv):
+				types = types.append(recv.elem_type)
+			SelectSealedArm(_):
+				void
+			SelectAfterArm(_):
+				void
+	types
+
+
+private pure func hash_constructor_types(constructor: CoreHashContainerConstructor) -> List[CoreType]:
+	match constructor:
+		TraitHashContainerConstructor(typ):
+			[typ]
+		GenericHashContainerConstructor:
+			[]
+		StringHashContainerConstructor:
+			[]
+		FloatHashContainerConstructor:
+			[]
+		Int128HashContainerConstructor:
+			[]
+		ImplHashContainerConstructor(_, _):
+			[]
+		CustomHashContainerConstructor(_, _, _):
+			[]
+
+
+private pure func collect_type_shapes(
+	index: CoreLayoutTypeIndex,
+	shapes: List[(List[CoreType], CoreSourceLoc)],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> List[(List[CoreType], CoreSourceLoc)]:
+	var found = shapes
+	resolved = resolve_core_layout_type_head_keeping_opaque_arguments(index, typ)
+	match resolved:
+		TupleType(items):
+			for item in items:
+				found = collect_type_shapes(index, found, item, loc)
+			if not found.any(func(shape): core_type_equal(TupleType(shape[0]), resolved)):
+				found = found.append((items, loc))
+		NamedType(_, args):
+			for arg in args:
+				found = collect_type_shapes(index, found, arg, loc)
+		FunctionType(_, params, result):
+			for param in params:
+				found = collect_type_shapes(index, found, param, loc)
+			found = collect_type_shapes(index, found, result, loc)
+		StackResultType(ok_type, err_type):
+			found = collect_type_shapes(index, collect_type_shapes(index, found, ok_type, loc), err_type, loc)
+		BoxedResultType(ok_type, err_type):
+			found = collect_type_shapes(index, collect_type_shapes(index, found, ok_type, loc), err_type, loc)
+		TensorType(info):
+			found = collect_type_shapes(index, found, info.element_type, loc)
+		VoidType:
+			void
+		NativeManagedType(_):
+			void
+		TypeParameterType(_):
+			void
+		SelfType:
+			void
+		HeapRecordType(_):
+			void
+		InlineRecordType(_):
+			void
+		UnionType(_, _):
+			void
+		RangeType:
+			void
+	found
+
+
+private pure func collect_expression_shapes(
+	index: CoreLayoutTypeIndex,
+	shapes: List[(List[CoreType], CoreSourceLoc)],
+	root: CoreExpr,
+) -> List[(List[CoreType], CoreSourceLoc)]:
+	var found = shapes
+	var pending: List[CoreExpr] = [root]
+	var pending_count = pending.length()
+	while pending_count > 0:
+		pending_count -= 1
+		expr = pending.get(pending_count).get_or(root)
+		loc = core_expr_source_loc(expr)
+		found = collect_type_shapes(index, found, core_expr_type(expr), loc)
+		for typ in own_expression_storage_types(expr):
+			found = collect_type_shapes(index, found, typ, loc)
+		for child in CoreTraverse.immediate_core_expr_children(expr).reverse():
+			pending = if pending_count < pending.length():
+				pending.set(pending_count, child)
+			else:
+				pending.append(child)
+			pending_count += 1
+	found
+
+
+private pure func declared_origin_storage_types(origin: CoreDeclaredOrigin) -> List[CoreType]:
+	match origin:
+		ProjectedImplMethod(_, _, for_type, _):
+			[for_type]
+		NativeTagEqualityCallback(typ):
+			[typ]
+		_:
+			-- Mono substitutions are retained semantic instance metadata;
+			-- they do not describe a runtime field or callback parameter.
+			[]
+
+
+private pure func origin_storage_types(origin: CoreFunctionOrigin) -> List[CoreType]:
+	match origin:
+		Declared(declared):
+			declared_origin_storage_types(declared)
+		Synthesized(_, declared):
+			declared_origin_storage_types(declared)
+		ConsumingClone(_, declared):
+			declared_origin_storage_types(declared)
+
+
+private pure func function_storage_types(function: CoreFunction) -> List[CoreType]:
+	types = function.params.map(func(param): param.typ).append(function.return_type)
+		.concat(origin_storage_types(function.origin))
+	match function.function_kind:
+		ClosureBodyFunction(abi):
+			types.concat(abi.params.map(func(param): param.typ))
+				.concat(abi.captures.map(func(capture): capture.typ))
+		_:
+			types
+
+
+private pure func collect_function_shapes(
+	index: CoreLayoutTypeIndex,
+	shapes: List[(List[CoreType], CoreSourceLoc)],
+	function: CoreFunction,
+) -> List[(List[CoreType], CoreSourceLoc)]:
+	if not function.type_params.is_empty():
+		shapes
+	else:
+		var found = shapes
+		for typ in function_storage_types(function):
+			found = collect_type_shapes(index, found, typ, function.loc)
+		match function.body:
+			Some(body):
+				collect_expression_shapes(index, found, body)
+			None:
+				found
+
+
+private pure func collect_program_shapes(program: CoreProgram) -> List[(List[CoreType], CoreSourceLoc)]:
+	index = build_core_layout_type_index(program)
+	var found: List[(List[CoreType], CoreSourceLoc)] = []
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				found = collect_function_shapes(index, found, function)
+			GlobalDecl(global):
+				found = collect_type_shapes(index, found, global.typ, global.loc)
+				found = collect_expression_shapes(index, found, global.init)
+			HeapRecordDecl(row):
+				if row.type_params.is_empty():
+					for field in row.fields:
+						found = collect_type_shapes(index, found, field.typ, row.loc)
+			InlineRecordDecl(row):
+				for field in row.fields:
+					found = collect_type_shapes(index, found, field.typ, row.loc)
+			UnionDecl(row):
+				if row.type_params.is_empty():
+					for variant in row.variants:
+						for field in variant.fields:
+							found = collect_type_shapes(index, found, field.typ, row.loc)
+			ImplDecl(implementation):
+				if implementation.type_params.is_empty():
+					found = collect_type_shapes(index, found, implementation.for_type, implementation.loc)
+					for method in implementation.methods:
+						found = collect_function_shapes(index, found, method)
+			GeneratedTupleRecordDecl(_):
+				-- Existing rows retain their logical shape; the catalog validates
+				-- its nested closure before adding executable requests.
+				void
+			TraitDecl(_):
+				-- Generic semantic interfaces do not issue runtime storage rows.
+				void
+			TypeAliasDecl(alias_decl):
+				if alias_decl.type_params.is_empty():
+					found = collect_type_shapes(index, found, alias_decl.target, alias_decl.loc)
+	found
+
+
+private pure func storage_type(catalog: CoreTupleStorageCatalog, typ: CoreType) -> CoreType:
+	-- Catalog validation and the residual metadata check reject missing rows.
+	-- Every opaque alias uses the accepted representation resolver here,
+	-- including scalar/unit fields that do not themselves contain a tuple.
+	tuple_storage_type(catalog, typ).get_or(typ)
+
+
+private pure func storage_hash_constructor(
+	catalog: CoreTupleStorageCatalog,
+	constructor: CoreHashContainerConstructor,
+) -> CoreHashContainerConstructor:
+	match constructor:
+		TraitHashContainerConstructor(typ):
+			TraitHashContainerConstructor(storage_type(catalog, typ))
+		_:
+			constructor
+
+
+private pure func storage_declared_origin(
+	catalog: CoreTupleStorageCatalog,
+	origin: CoreDeclaredOrigin,
+) -> CoreDeclaredOrigin:
+	match origin:
+		ProjectedImplMethod(trait_name, method_name, for_type, role):
+			ProjectedImplMethod(trait_name, method_name, storage_type(catalog, for_type), role)
+		NativeTagEqualityCallback(typ):
+			NativeTagEqualityCallback(storage_type(catalog, typ))
+		_:
+			origin
+
+
+private pure func storage_origin(
+	catalog: CoreTupleStorageCatalog,
+	origin: CoreFunctionOrigin,
+) -> CoreFunctionOrigin:
+	match origin:
+		Declared(declared):
+			Declared(storage_declared_origin(catalog, declared))
+		Synthesized(kind, declared):
+			Synthesized(kind, storage_declared_origin(catalog, declared))
+		ConsumingClone(index, declared):
+			ConsumingClone(index, storage_declared_origin(catalog, declared))
+
+
+private pure func storage_expression(catalog: CoreTupleStorageCatalog, expr: CoreExpr) -> CoreExpr:
+	mapped: CoreExpr = match expr:
+		SeqExpr(_, _):
+			spine = CoreTraverse.split_core_sequence(expr)
+			CoreTraverse.rebuild_core_sequence({
+				preceding_items = spine.preceding_items.map(func(item): storage_expression(catalog, item)),
+				final_item = storage_expression(catalog, spine.final_item),
+			})
+		LogicalExpr(_, _, _, _, _):
+			CoreTraverse.map_core_logical_tree_and_types_with_context(expr, catalog, storage_expression, storage_type)
+		_:
+			CoreTraverse.map_core_expr_children_and_types_with_context(expr, catalog, storage_expression, storage_type)
+	match mapped:
+		TupleExpr(items, typ, loc):
+			ProductExpr(product_build_in_declared_order(items), typ, loc)
+		CallExpr(DictWithCapacityCall(constructor), callee, args, typ, loc):
+			CallExpr(DictWithCapacityCall(storage_hash_constructor(catalog, constructor)), callee, args, typ, loc)
+		SetAllocExpr(constructor, typ, loc):
+			SetAllocExpr(storage_hash_constructor(catalog, constructor), typ, loc)
+		DictConstructExpr(construct, typ, loc):
+			DictConstructExpr({ construct | constructor = storage_hash_constructor(catalog, construct.constructor) }, typ, loc)
+		ForTensorExpr(loop, typ, loc):
+			-- Boxed storage contains an emitted type spelling. Reissue it
+			-- from the mapped binder through the canonical selector, keeping
+			-- existing raw and row-slice proofs intact.
+			match loop.element_storage:
+				TensorForBoxedElement(_):
+					ForTensorExpr({ loop |
+						element_storage = tensor_for_element_storage_for_canonical_type(
+							loop.binder.typ,
+							c_type_name(loop.binder.typ, {}),
+						),
+					}, typ, loc)
+				_:
+					mapped
+		_:
+			mapped
+
+
+private pure func storage_function(catalog: CoreTupleStorageCatalog, function: CoreFunction) -> CoreFunction:
+	if not function.type_params.is_empty():
+		function
+	else:
+		kind = match function.function_kind:
+			ClosureBodyFunction(abi):
+				ClosureBodyFunction({ abi |
+					params = abi.params.map(func(param): { param | typ = storage_type(catalog, param.typ) }),
+					captures = abi.captures.map(func(capture): { capture | typ = storage_type(catalog, capture.typ) }),
+				})
+			_:
+				function.function_kind
+		{ function |
+			params = function.params.map(func(param): { param | typ = storage_type(catalog, param.typ) }),
+			return_type = storage_type(catalog, function.return_type),
+			body = function.body.map(func(body): storage_expression(catalog, body)),
+			function_kind = kind,
+			origin = storage_origin(catalog, function.origin),
+		}
+
+
+private pure func storage_decl(catalog: CoreTupleStorageCatalog, decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function):
+			FunctionDecl(storage_function(catalog, function))
+		GlobalDecl(global):
+			GlobalDecl({ global |
+				typ = storage_type(catalog, global.typ),
+				init = storage_expression(catalog, global.init),
+			})
+		HeapRecordDecl(row):
+			if row.type_params.is_empty():
+				HeapRecordDecl({ row |
+					fields = row.fields.map(func(field): { field | typ = storage_type(catalog, field.typ) }),
+				})
+			else:
+				decl
+		InlineRecordDecl(row):
+			InlineRecordDecl({ row |
+				fields = row.fields.map(func(field): { field | typ = storage_type(catalog, field.typ) }),
+			})
+		UnionDecl(row):
+			if row.type_params.is_empty():
+				UnionDecl({ row |
+					variants = row.variants.map(func(variant): { variant |
+						fields = variant.fields.map(func(field): { field | typ = storage_type(catalog, field.typ) }),
+					}),
+				})
+			else:
+				decl
+		ImplDecl(implementation):
+			if implementation.type_params.is_empty():
+				ImplDecl({ implementation |
+					for_type = storage_type(catalog, implementation.for_type),
+					methods = implementation.methods.map(func(method): storage_function(catalog, method)),
+				})
+			else:
+				decl
+		GeneratedTupleRecordDecl(_):
+			decl
+		TraitDecl(_):
+			decl
+		TypeAliasDecl(alias_decl):
+			if alias_decl.type_params.is_empty():
+				TypeAliasDecl({ alias_decl | target = storage_type(catalog, alias_decl.target) })
+			else:
+				decl
+
+
+private pure func managed_layouts(
+	catalog: CoreTupleStorageCatalog,
+	program: CoreProgram,
+) -> Result[Dict[String, CoreManagedRecordLayout], TupleStorageFailure]:
+	var layouts: Dict[String, CoreManagedRecordLayout] = {}
+	var failure: Option[TupleStorageFailure] = None
+	for decl in program.decls:
+		if failure.is_none():
+			match managed_record_layout_for_decl(catalog, decl):
+				Ok(Some(layout)):
+					layouts = layouts.set(managed_record_layout_name(layout), layout)
+				Ok(None):
+					void
+				Err(fault):
+					failure = Some({ reason = TupleStorageProductViolation(fault), loc = synthetic_core_source_loc() })
+	match failure:
+		Some(found):
+			Err(found)
+		None:
+			Ok(layouts)
+
+
+private pure func managed_layout_for_type(
+	layouts: Dict[String, CoreManagedRecordLayout],
+	typ: CoreType,
+) -> Option[CoreManagedRecordLayout]:
+	match typ:
+		HeapRecordType(name):
+			layouts.get(name)
+		_:
+			None
+
+
+private pure func expression_storage_failure(
+	layouts: Dict[String, CoreManagedRecordLayout],
+	root: CoreExpr,
+) -> Option[TupleStorageFailure]:
+	var pending = [root]
+	var pending_count = pending.length()
+	var failure: Option[TupleStorageFailure] = None
+	while failure.is_none() and pending_count > 0:
+		pending_count -= 1
+		expr = pending.get(pending_count).get_or(root)
+		fault: Option[CoreManagedRecordLayoutFault] = match expr:
+			ProductExpr(build, typ, _):
+				managed_layout_for_type(layouts, typ).and_then(func(layout): managed_product_build_fault(layout, build))
+			RecordReuseExpr(_, build, typ, _):
+				managed_layout_for_type(layouts, typ).and_then(func(layout): managed_product_build_fault(layout, build))
+			ProductFieldExpr(base, ordinal, typ, _):
+				managed_layout_for_type(layouts, core_expr_type(base))
+					.and_then(func(layout): managed_product_projection_fault(layout, ordinal, typ))
+			_:
+				None
+		match fault:
+			Some(found):
+				failure = Some({ reason = TupleStorageProductViolation(found), loc = core_expr_source_loc(expr) })
+			None:
+				match expr:
+					TupleExpr(_, _, loc):
+						failure = Some({ reason = TupleStorageConstructionSurvived, loc = loc })
+					UnionConstructExpr(construct, typ, loc):
+						if not prepared_option_representation_matches_type(typ, construct.constructor_name, construct.variant, construct.args, construct.representation):
+							failure = Some({ reason = TupleStorageOptionRepresentationMismatch, loc = loc })
+					UnionReuseConstructExpr(construct, typ, loc):
+						if not prepared_option_representation_matches_type(typ, construct.constructor_name, construct.variant, construct.args, construct.representation):
+							failure = Some({ reason = TupleStorageOptionRepresentationMismatch, loc = loc })
+					_:
+						void
+		if failure.is_none():
+			for child in CoreTraverse.immediate_core_expr_children(expr).reverse():
+				pending = if pending_count < pending.length():
+					pending.set(pending_count, child)
+				else:
+					pending.append(child)
+				pending_count += 1
+	failure
+
+
+private pure func program_storage_failure(
+	layouts: Dict[String, CoreManagedRecordLayout],
+	program: CoreProgram,
+) -> Option[TupleStorageFailure]:
+	var failure: Option[TupleStorageFailure] = None
+	for decl in program.decls:
+		if failure.is_none():
+			match decl:
+				FunctionDecl(function):
+					failure = function.body.and_then(func(body): expression_storage_failure(layouts, body))
+				GlobalDecl(global):
+					failure = expression_storage_failure(layouts, global.init)
+				ImplDecl(implementation):
+					for method in implementation.methods:
+						if failure.is_none():
+							failure = method.body.and_then(func(body): expression_storage_failure(layouts, body))
+				_:
+					void
+	failure
+
+
+pure func lower_tuple_storage_program(program: CoreProgram) -> Result[CoreProgram, TupleStorageFailure]:
+	accepted_catalog ?= tuple_storage_catalog(program).map_err(
+		func(fault): { reason = TupleStorageCatalogFailure(fault), loc = synthetic_core_source_loc() },
+	)
+	catalog ?= intern_tuple_storage_rows(program, collect_program_shapes(program))
+		.map_err(func(fault): { reason = TupleStorageCatalogFailure(fault), loc = synthetic_core_source_loc() })
+	var decls: List[CoreDecl] = []
+	for decl in program.decls:
+		match decl:
+			GeneratedTupleRecordDecl(_):
+				void
+			_:
+				decls = decls.append(storage_decl(catalog, decl))
+	for row in tuple_storage_rows(catalog):
+		decls = decls.append(GeneratedTupleRecordDecl(row))
+	mapped = { program | decls = decls }
+	layouts ?= managed_layouts(catalog, mapped)
+	match program_storage_failure(layouts, mapped):
+		Some(failure):
+			Err(failure)
+		None:
+			-- The same complete metadata scan is the residual-type oracle.
+			-- Retained row shapes and generic semantic declarations are excluded.
+			match collect_program_shapes(mapped).get(0):
+				Some(shape):
+					Err({ reason = TupleStorageTypeSurvived(TupleType(shape[0])), loc = shape[1] })
+				None:
+					-- Unit projections remain checked ProductFieldExpr nodes.
+					-- Their receiver is borrowed or released by the ordinary
+					-- Perceus projection path; a discarded managed receiver
+					-- would consume a reference the projection never owned.
+					Ok(mapped)
+
+
+---
+Prepared storage may retain logical TupleType only inside generated-row metadata
+and generic semantic declarations. Runtime signatures, field types, unused
+binders and expression payloads must already use their physical row types.
+This checks decoded snapshots and direct fixture preparation at the same
+boundary as production preparation; emission has no generic tuple fallback.
+---
+pure func validate_tuple_storage_program(
+	program: CoreProgram,
+) -> Result[Void, TupleStorageFailure]:
+	catalog ?= tuple_storage_catalog(program).map_err(func(fault): {
+		reason = TupleStorageCatalogFailure(fault),
+		loc = synthetic_core_source_loc()
+	})
+	layouts ?= managed_layouts(catalog, program)
+	match collect_program_shapes(program).get(0):
+		Some(shape):
+			Err({ reason = TupleStorageTypeSurvived(TupleType(shape[0])), loc = shape[1] })
+		None:
+			match program_storage_failure(layouts, program):
+				Some(failure):
+					Err(failure)
+				None:
+					Ok(void)

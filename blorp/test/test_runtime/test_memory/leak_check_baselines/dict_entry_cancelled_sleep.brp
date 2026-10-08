@@ -1,0 +1,82 @@
+-- The hidden pair owns dictionary key/value references between native pair
+-- construction and the loop's normal release. It must survive neither a body
+-- park nor the compiler-inserted cooperative checkpoints after cancellation.
+import:
+	dict as D
+	io: print_error
+	memory:
+		MemoryCounter(LiveManagedObjects, ManagedAllocations, MemoryStatsActive),
+		read_memory_counter, refcount
+	test: cancel_after_parked_for_test
+
+
+func parked_entry_body(stored: Dict[String, List[Int]]) -> Int:
+	var score: Int = 0
+	for (key, rows) in stored:
+		sleep(10000)
+		score += key.length() + rows.length()
+	score
+
+
+func main(args: List[String]) -> Int:
+	seed = read_memory_counter(ManagedAllocations)
+	key = ("owned entry " + seed.to_string()).repeat(2)
+	rows: List[Int] = [seed, seed + 1]
+	stored: Dict[String, List[Int]] = {key => rows}
+	-- The parent keeps all three owners live before and after the child.
+	key_refs_before = refcount(key)
+	rows_refs_before = refcount(rows)
+	dict_refs_before = refcount(stored)
+	active_before = read_memory_counter(MemoryStatsActive)
+	allocations_before = read_memory_counter(ManagedAllocations)
+	live_before = read_memory_counter(LiveManagedObjects)
+	cancelled = cancel_after_parked_for_test(func(): parked_entry_body(stored))
+
+	active_after = read_memory_counter(MemoryStatsActive)
+	allocations_after = read_memory_counter(ManagedAllocations)
+	live_after = read_memory_counter(LiveManagedObjects)
+	key_refs_after = refcount(key)
+	rows_refs_after = refcount(rows)
+	dict_refs_after = refcount(stored)
+	-- Reporting occurs after scalar snapshots, so report allocations do not
+	-- weaken the live-object or owned-reference equality checks.
+	print_error("cancelled")
+	print_error(cancelled)
+	print_error("active before/after")
+	print_error(active_before)
+	print_error(active_after)
+	print_error("allocations before/after")
+	print_error(allocations_before)
+	print_error(allocations_after)
+	print_error("live before/after")
+	print_error(live_before)
+	print_error(live_after)
+	print_error("key references before/after")
+	print_error(key_refs_before)
+	print_error(key_refs_after)
+	print_error("rows references before/after")
+	print_error(rows_refs_before)
+	print_error(rows_refs_after)
+	print_error("dictionary references before/after")
+	print_error(dict_refs_before)
+	print_error(dict_refs_after)
+	survives = match D.get(stored, key):
+		Some(found): found == rows
+		None: False
+	if (
+		cancelled
+		and active_before == 1
+		and active_after == 1
+		and allocations_after > allocations_before
+		and live_after == live_before
+		and key_refs_before > 1
+		and rows_refs_before > 1
+		and dict_refs_before > 0
+		and key_refs_after == key_refs_before
+		and rows_refs_after == rows_refs_before
+		and dict_refs_after == dict_refs_before
+		and survives
+	):
+		0
+	else:
+		1

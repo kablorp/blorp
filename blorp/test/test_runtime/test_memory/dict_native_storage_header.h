@@ -34,6 +34,20 @@ static inline long dict_storage_has_int(blorp_Dict* dict, long key, long value) 
     return blorp_dict_get_raw(dict, DICT_STORAGE_INT(key), &out) && out == DICT_STORAGE_INT(value);
 }
 
+typedef struct {
+    blorp_Object header;
+    long key;
+    long value;
+} DictStorageEntry;
+
+static inline void* dict_storage_entry_factory(void* key, void* value) {
+    DictStorageEntry* entry = blorp_alloc(sizeof(*entry));
+    BLORP_INSTALL_TAG(entry, "DictStorageEntry");
+    entry->key = (long)key;
+    entry->value = (long)value;
+    return entry;
+}
+
 static inline long dict_native_empty_dict(void) {
     blorp_Dict* dict = blorp_dict_new();
     void* out = NULL;
@@ -51,7 +65,7 @@ static inline long dict_native_empty_dict(void) {
     blorp_retain(shared);
     dict = blorp_dict_remove(dict, DICT_STORAGE_INT(7));
     if (dict != shared || dict->size != 0 || dict_storage_refcount(shared) != 2) passed = 0;
-    blorp_List* entries = blorp_dict_entries(dict);
+    blorp_List* entries = blorp_dict_entries_product(dict, dict_storage_entry_factory);
     if (entries->len != 0) passed = 0;
     blorp_release(entries);
     blorp_release(dict);

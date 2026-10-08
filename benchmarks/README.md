@@ -283,6 +283,32 @@ from `BLORP_TEST_TIMING`/`BLORP_TEST_ARTIFACT_*` log rows under
 `--release-compiler --timings --log-dir`, is in
 [`results/gate_time_profile_2026-09-22.md`](results/gate_time_profile_2026-09-22.md).
 
+### Record Result Group Preparation
+
+`record_scalar_prepare` checks values, balanced managed allocations/releases,
+and zero live-object change for 24 rows, including the original 18 local-record
+probes. Two new mutually recursive managed-result probes share children or
+discard a fresh child. A mixed fresh/forwarded result control preserves root
+and child identity. This prepares an owned result boundary; it does not implement
+an optimization.
+
+The [recursive-result baseline](results/record_recursive_results_2026-10-07.md)
+records measured child/container counts and the remaining optimization gap.
+
+```bash
+BLORP_CLI_C_OPTIMIZATION=-O2 make
+benchmarks/record_scalar_prepare --output /tmp/record-results-baseline.json
+benchmarks/record_scalar_prepare --sanitize --output /tmp/record-results-sanitize.json
+# Future acceptance: one shared child, or N discarded children plus that child.
+benchmarks/record_scalar_prepare --require-result-groups --output /tmp/record-results-target.json
+```
+
+The default accepts any balanced container count for the recursive probes.
+`--require-result-groups` additionally requires totals of 1 and N+1 allocations
+at N=256/512; target failures retain the observed report and identify the case,
+rounds, observed count and target. Keep formatting outside the scalar counter
+intervals and serialize compiled runs.
+
 ### Compiler Record Layout
 
 `compiler_record_layout` compiles a bounded fixture through the production
@@ -391,12 +417,11 @@ input revision, dumps Core just after DCE (`--dump-core-after=dce
 --dump-core-file=<path>`), and runs
 `benchmarks/blorp/profiles/perceus_allocations.brp` in-process, which
 advances the dumped Core through the remaining production pass functions
-(`run_consume_specialize_pass`, `run_static_string_literals_pass`,
-`run_record_update_ownership_pass`, `run_record_literal_order_pass`,
-`run_dict_literal_ownership_pass` --
-chained because `dict_literal_ownership` is not one of the CLI's exposed
-`--dump-core-after` stage names) to reach the exact Core state immediately
-before Perceus, then calls `insert_drops_program` and reports calls,
+(consume specialization, static literals, record-update ownership,
+dict-literal ownership and product evaluation) to reach the Core state
+immediately before Perceus. The replay state starts below existing minted
+binder IDs in the decoded program rather than resetting the binder supply.
+The profiler then calls `insert_drops_program` and reports calls,
 allocations, and allocations per call:
 
 ```bash
@@ -1599,7 +1624,10 @@ and moderately sized function bodies, validates the resulting Core, and reports
 request and artifact hashes, elapsed time, peak memory, a static ownership-node
 census, and deterministic work counters. The default inner window is named
 `ownership-preparation plus Perceus` because it includes consume specialization,
-record-update lowering, dictionary ownership preparation, and Perceus. Select
+static literals, record-update lowering, dictionary ownership preparation,
+product field evaluation, and Perceus. Synthetic function origins come from
+the compiled worker's `function_origin_fixture` supplier during setup; paired
+workers must agree on that metadata. Select
 `--measurement-window perceus-direct` to perform those prerequisites before the
 window and measure only `insert_drops_program`:
 
@@ -1610,6 +1638,15 @@ benchmarks/compiler_perceus_memory --globals 384
 benchmarks/compiler_perceus_memory --global-reads-per-function 0
 benchmarks/compiler_perceus_memory --measurement-window perceus-direct
 ```
+
+The closed `aggregate_change_matrix` fixture retains ten neutral and eleven
+ownership-sensitive roots per function, plus two neutral call arguments.
+Product construction, lowered record update and record reuse now evaluate
+fields into ordinary bindings before Perceus. The output oracle follows the
+exact field binder to its RHS, preserving each sensitive/neutral pair; the
+insertion counters require fifteen reused and eight rebuilt aggregate roots
+per function because those three sensitive operands are rewritten in their
+binding RHS instead.
 
 The function count, body shape, and referenced-global count stay fixed when
 varying `--globals`, isolating the cost of irrelevant globals beyond the

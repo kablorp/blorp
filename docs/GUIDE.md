@@ -642,6 +642,12 @@ func tuple_examples() -> Int:
     0
 ```
 
+Tuples have value semantics. When stored, they use the same typed field layout
+and ownership rules as a managed record with those elements. A compile-time
+index selects a field. Fields evaluate once in left-to-right order, including
+`Void` fields whose values need no storage. Tuple types remain structural: a
+named record with corresponding fields is still a different type.
+
 ### Lists
 
 Dynamic-size, homogeneous collections with COW semantics:
@@ -1228,10 +1234,9 @@ instantiation, so `Pair[Float]` can be inline while `Pair[String]` is not.
 Inline storage is not yet a checked guarantee. A fixed record with any other
 field silently uses the ordinary managed representation, and some positions
 store an inline record in an allocated box: union payloads, `Result` payloads,
-elements of a tuple stored in a heap value such as a list element, `Dict` and
-`Set` entries, channel elements, task results, closure call arguments and
-results (two allocations per call through a closure value), and foreign
-calls. Lists, `Option`, local tuples, fields of other records, tensors and
+`Dict` and `Set` entries, channel elements, task results, closure call arguments
+and results (two allocations per call through a closure value), and foreign
+calls. Lists, `Option`, tuples, fields of other records, tensors and
 closure captures keep it inline. A later release
 will report fixed records that cannot be inline. No spelling promises a
 foreign by-value ABI: a foreign function still receives a record as a pointer
@@ -1943,8 +1948,9 @@ managed unions, tuples, and functions use an internal nullable-pointer
 layout. Nested options, `Ptr`, unresolved
 generic payloads, and unsupported payloads stay boxed so `Some(x)` and `None`
 remain distinguishable.
-When a stack-option value is placed into currently-erased storage such as
-tuples or closure captures, it is boxed as a compatibility fallback.
+When a stack-option value crosses an erased storage boundary, it is boxed as a
+compatibility fallback. Tuple fields use typed record storage and keep these
+values inline.
 Monomorphic `List[Option[T]]` values whose payload has a stack-option layout are
 already specialized further: the list stores each stack-option struct inline
 rather than boxing each element. The remaining fallback is an implementation

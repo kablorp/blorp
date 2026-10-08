@@ -372,16 +372,54 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
     def test_aggregate_change_matrix_requires_exact_decisions(self) -> None:
         counters = {
-            "insert_aggregate_visits": 50,
-            "insert_aggregate_original_nodes_reused": 26,
-            "insert_aggregate_reconstructions": 24,
+            "insert_aggregate_visits": 46,
+            "insert_aggregate_original_nodes_reused": 32,
+            "insert_aggregate_reconstructions": 14,
         }
 
         self.benchmark.validate_aggregate_change_matrix_counters(counters, 2)
 
-        counters["insert_aggregate_original_nodes_reused"] = 25
-        with self.assertRaisesRegex(RuntimeError, "matrix decisions changed"):
-            self.benchmark.validate_aggregate_change_matrix_counters(counters, 2)
+        for reused, reconstructed in [(30, 16), (31, 15), (33, 13)]:
+            with self.subTest(reused=reused, reconstructed=reconstructed):
+                stale = dict(
+                    counters,
+                    insert_aggregate_original_nodes_reused=reused,
+                    insert_aggregate_reconstructions=reconstructed,
+                )
+                with self.assertRaisesRegex(RuntimeError, "matrix decisions changed"):
+                    self.benchmark.validate_aggregate_change_matrix_counters(stale, 2)
+
+    def test_aggregate_matrix_follows_field_identity_through_let(self) -> None:
+        # Same spelling, distinct binders. Occurrence annotations do not
+        # change core_var_equal's name/id identity.
+        owner = {"name": "field", "id": -1, "def_id": None}
+        neutral = {"name": "field", "id": -2, "def_id": None}
+
+        def product(variable):
+            return {
+                "kind": "product", "type": {}, "loc": {},
+                "fields": [{"ordinal": 0, "value": {
+                    "kind": "var", "var": {**variable, "def_id": 99},
+                }}],
+            }
+
+        sensitive_rhs = {"kind": "borrow_let"}
+        program = {"decls": [{
+            "kind": "function", "name": "bench_worker_0000",
+            "body": {
+                "kind": "let", "name": owner, "rhs": sensitive_rhs,
+                "body": {
+                    "kind": "let", "name": neutral,
+                    "rhs": {"kind": "literal"},
+                    "body": [product(owner), product(neutral)],
+                },
+            },
+        }]}
+        census = self.benchmark.aggregate_change_matrix_output_census(program)
+        self.assertEqual(census["product"], {"neutral": 1, "sensitive": 1})
+        sensitive_rhs["kind"] = "literal"
+        census = self.benchmark.aggregate_change_matrix_output_census(program)
+        self.assertEqual(census["product"], {"neutral": 2, "sensitive": 0})
 
     def test_managed_let_transfer_counters_require_every_worker_to_reuse(self) -> None:
         counters = {
@@ -490,6 +528,56 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
     def test_aggregate_escape_is_a_supported_body_shape(self) -> None:
         self.assertIn("aggregate_escape", self.benchmark.BODY_SHAPES)
 
+    def test_aggregate_matrix_updates_use_declared_field_identities(self) -> None:
+        _, program = self.benchmark.fixture_request(
+            1, 2, self.benchmark.PARAMETER_MATRIX_BODY_LEAVES, 0,
+            params_per_function=2, body_shape="aggregate_change_matrix",
+            invoke_workers=False,
+        )
+        declarations = {
+            declaration["name"]: declaration
+            for declaration in program["decls"]
+            if declaration.get("kind") == "heap_record"
+        }
+        all_ids = []
+        declared_fields = {}
+        for name, declaration in declarations.items():
+            fields = declaration["fields"]
+            declared_fields[name] = {
+                field["name"]: field["field_ref"] for field in fields
+            }
+            all_ids.extend(field["field_ref"]["field_id"] for field in fields)
+        self.assertEqual(len(all_ids), len(set(all_ids)))
+        self.assertTrue(all(identity >= 0 for identity in all_ids))
+
+        update_count = cow_field_count = 0
+        pending = [program]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, dict):
+                if current.get("kind") == "record_update":
+                    update_count += 1
+                    fields = current["fields"]
+                    self.assertEqual(len(fields), 1)
+                    for field in fields:
+                        self.assertEqual(
+                            field["field_ref"],
+                            declared_fields[current["type"]["name"]][field["name"]],
+                        )
+                elif current.get("kind") == "record_cow_update":
+                    for replacement in current["fields"]:
+                        cow_field_count += 1
+                        field = replacement["field"]
+                        self.assertEqual(
+                            field["field_ref"],
+                            declared_fields[current["type"]["name"]][field["name"]],
+                        )
+                pending.extend(current.values())
+            elif isinstance(current, list):
+                pending.extend(current)
+        self.assertEqual(update_count, 4)
+        self.assertEqual(cow_field_count, 8)
+
     def test_aggregate_change_matrix_covers_every_reconstruction_family(self) -> None:
         _, program = self.benchmark.fixture_request(
             1,
@@ -540,7 +628,7 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
                 worker["body"],
                 "BENCH_BORROWED_PARAM_0000_0000",
             ),
-            16,
+            15,
         )
         self.assertEqual(
             self.benchmark.count_parameter_reads(
@@ -834,7 +922,7 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(
             [argument["kind"] for argument in call["args"]],
-            ["record_construct", "record_construct"],
+            ["product", "product"],
         )
 
     def test_call_graph_shapes_pass_borrowed_parameters_across_edges(self) -> None:

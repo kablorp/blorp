@@ -165,6 +165,42 @@ Storage places own managed values unless the place is explicitly borrowed.
 An emitter-created managed temporary is still an owner. The backend must close
 its lifetime explicitly or reject the unsupported shape.
 
+Managed tuples and managed records share typed field storage and product
+construction. Nonliteral field values become immutable owners before Perceus,
+in written order, so a later field evaluation that parks cannot leave earlier
+values outside cancellation protection. Inline fixed-record elements remain
+inline inside the managed product. Unit fields keep their logical ordinal and
+evaluation, but have no C member or release operation.
+Their projections remain product reads through Perceus so the receiver retains
+its borrowed or owned contract. Emission evaluates that receiver without
+forming a C `void` local or reading a nonexistent member.
+
+List construction also evaluates nonliteral elements into immutable owners
+before allocating its container. Completed elements remain protected if a
+later element parks; allocation and element transfers happen only after all
+values are available. The normalization preserves each element's explicit
+storage, boxing and release metadata and leaves static literal trees intact.
+
+Native dictionary entries, vector zip, enumerate, unfold and process results
+use typed product factories. Dictionary, vector and enumerate factories borrow
+input fields, retain or encode managed values as typed owners, then transfer
+those owners into the consuming constructor. Process result factories consume
+the native engine's owned output values directly. Enumerate releases a
+pulled owned value after the borrowed factory returns. Unfold adapters borrow
+the current state and closure, return owned value and successor state, and
+install the successor before releasing the old state. Process option snapshots
+borrow their input fields for the native call. The legacy generic tuple ABI
+remains only for compilers built by the pinned bootstrap, pending a separately
+validated bootstrap rotation.
+
+Each dictionary entry factory result has a separate backend owner slot; the
+Core loop binder borrows it. An always-active ARC scope guard releases the
+entry on fallthrough, `break` and `continue`. A cancellation frame protects
+that same unit before the first body checkpoint. Its unlink guard is declared
+after the normal owner guard, so ordinary C scope exit unlinks first and then
+releases; cancellation drains the frame and skips C cleanup through longjmp.
+Borrowed-binder duplicate and move bookkeeping cannot change the owner slot.
+
 ### Cancellation Cleanup Slots
 
 A managed local that may be live when its task is cancelled gets a cleanup
@@ -242,14 +278,32 @@ uniqueness are compatible.
 ### Record Literal Field Order
 
 A record literal evaluates its field expressions in written order and stores
-each value in its declared field. Core keeps the written order through
-Perceus, and `prepare` sorts the fields into declaration order afterwards, so
-`record_literal_order` runs before ownership analysis: when a literal is not
-written in declaration order, it binds every field value other than a
-constant to a fresh variable, in written order. A variable read is bound too,
-because a later field can call a function that assigns the module variable it
-names. Perceus then decides ownership for the order the values really run in,
-and the later sort only moves constants and reads of the bound variables.
+each value in its declared field. `CoreProductBuild` carries values in that
+written order together with checked declaration ordinals. Before ownership
+analysis, `product_evaluation` binds nonliteral field values in that order,
+using ordinary immutable Core bindings and the shared binder supply. Perceus
+then tracks each evaluated owner's transfer into construction, including a
+conditional result that selects an existing owner or creates a new one.
+Emission places the evaluated values in their destination fields. No late
+sort changes ownership or evaluation order. A variable read stays ahead of a
+later expression that can change the module variable it names. Reused and
+static records follow the same ordinal contract; recursively literal static
+initializers keep their existing static representation.
+
+Tensor literals use the same evaluation boundary. The shared literal storage
+issuer flattens ranked row constructors before element bindings can hide their
+shape. Nonliteral scalar elements acquire immutable `TensorElementTemp`
+bindings before ownership analysis, preserving the selected raw, packed,
+inline-record or boxed storage metadata. Every element is evaluated before
+allocating the tensor, so cancellation of a later element releases earlier
+owners through the ordinary binding cleanup plan. Literal-only elements need
+no binding. The backend copies these evaluated values into their slots.
+
+Reuse keeps a direct local source when its declared Core identity is known and
+no field evaluation reassigns it. Other sources acquire an immutable snapshot
+before the fields. This preserves the original source value across rebinding
+and indirect global changes without adding an alias to a proven stable local
+that would prevent unique reuse.
 
 ### Fieldwise Record Updates
 
@@ -311,7 +365,7 @@ or ownership event on the source disqualifies.
 
 The owned alias may appear directly inside the replacement or in one preceding
 immutable binding whose value transfers exactly once as the matching field's
-bare replacement. The latter proof follows only explicit `LetExpr`,
+bare replacement. The authored-prefix proof follows only explicit `LetExpr`,
 `BorrowLetExpr`, and `SeqExpr` fall-through frames. It may cross only the
 non-cancelling `list_len`, `list_ensure_capacity`, and `list_set_len` intrinsics,
 plus logical record construction and prepared list retain and raw store operations.
@@ -320,6 +374,15 @@ fall through without observing the taken slot, whole source, or alias.
 It does not cross other calls, a cooperative checkpoint, conditional, loop,
 logical short-circuit, lambda, or nested field path, and it rejects any same-slot or whole-source observation
 before writeback.
+
+Compiler-normalized fields have a separate proof over explicit product-field
+binders, exact Perceus result frames and sparse-update staging frames. It may
+cross later calls and constructors when they cannot observe the alias owner,
+whole source or vacated slot, replace either owner, enter a resource scope or
+leave the update early. This changes only the initial field retain policy:
+every field `Let`, its RHS and Perceus `Dup`/`Drop` remain, including a self-dup
+that owns the record reference. Ordinary binding cleanup protects these
+owners across cancellation; the vacated source slot remains null-safe.
 
 A record field is updated through its own update the same way, at any
 depth: in `{ b | nodes = b.nodes.with_parent(k) }` the replacement passes the
@@ -342,8 +405,10 @@ The policy emits a runtime test on the source: a unique source gives up its
 slot (left null) so the alias is the sole owner; a shared source retains as
 before. The emptied slot is never observable: the replacement-local form
 evaluates every replacement before consuming the source, while the hoisted
-form proves that its linear window reaches the matching update without an
-intervening observation or cancellation point. Neither form takes a field
+authored-prefix form proves that its linear window reaches the matching update
+without an intervening observation or cancellation point. The normalized-field
+form retains ordinary cancellation cleanup throughout its explicit ownership
+frames and forbids observations of the vacated slot. Neither form takes a field
 when the expression holding the take, or another replacement of the same
 update, can leave early (`break`, `continue`, a resource cleanup exit or a
 tail-recursion jump): the exit would skip the writeback and leave the slot

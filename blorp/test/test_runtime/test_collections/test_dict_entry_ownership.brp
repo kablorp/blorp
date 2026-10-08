@@ -1,0 +1,219 @@
+import:
+	dict as D
+	memory:
+		MemoryCounter(LiveManagedObjects, ManagedAllocations, MemoryStatsActive),
+		read_memory_counter, refcount
+	test: TestSuite
+
+
+record EntryFixture {
+	table: Dict[String, List[Int]],
+	first_key: String,
+	second_key: String,
+	first_rows: List[Int],
+	second_rows: List[Int]
+}
+
+
+-- Scalar snapshots must not introduce managed allocations at the frontier.
+fixed record EntrySnapshot {
+	active: Int,
+	allocations: Int,
+	live: Int,
+	table_refs: Int,
+	walk_table_refs: Int,
+	first_key_refs: Int,
+	second_key_refs: Int,
+	first_rows_refs: Int,
+	second_rows_refs: Int
+}
+
+
+union EntryWalk:
+	Fallthrough
+	BreakEntry
+	ContinueEntry
+	BreakInnerLoop
+	SkipDeletedSlot
+	KeepEntryChildren
+
+
+private func entry_fixture() -> EntryFixture:
+	seed = read_memory_counter(ManagedAllocations)
+	first_key = ("first entry " + seed.to_string()).repeat(2)
+	second_key = ("second entry " + seed.to_string()).repeat(2)
+	first_rows: List[Int] = [seed, seed + 1]
+	second_rows: List[Int] = [seed + 2, seed + 3, seed + 4]
+	table: Dict[String, List[Int]] = {first_key => first_rows, second_key => second_rows}
+	{
+		table = table,
+		first_key = first_key,
+		second_key = second_key,
+		first_rows = first_rows,
+		second_rows = second_rows
+	}
+
+
+private func entry_snapshot(fixture: EntryFixture, walk_table: Dict[String, List[Int]]) -> EntrySnapshot:
+	{
+		active = read_memory_counter(MemoryStatsActive),
+		allocations = read_memory_counter(ManagedAllocations),
+		live = read_memory_counter(LiveManagedObjects),
+		table_refs = refcount(fixture.table),
+		walk_table_refs = refcount(walk_table),
+		first_key_refs = refcount(fixture.first_key),
+		second_key_refs = refcount(fixture.second_key),
+		first_rows_refs = refcount(fixture.first_rows),
+		second_rows_refs = refcount(fixture.second_rows)
+	}
+
+
+-- Counter observations require diagnostics; ownership checks run in both modes.
+private pure func restored_entry_diagnostics(before: EntrySnapshot, after: EntrySnapshot) -> Bool:
+	if before.active == 0 and after.active == 0:
+		True
+	else if before.active == 1 and after.active == 1:
+		after.allocations > before.allocations and after.live == before.live
+	else:
+		False
+
+
+private pure func restored_entry_owners(before: EntrySnapshot, after: EntrySnapshot) -> Bool:
+	(
+		restored_entry_diagnostics(before, after)
+		and before.table_refs > 0 and before.walk_table_refs > 0
+		and before.first_key_refs > 1 and before.second_key_refs > 1
+		and before.first_rows_refs > 1 and before.second_rows_refs > 1
+		and after.table_refs == before.table_refs
+		and after.walk_table_refs == before.walk_table_refs
+		and after.first_key_refs == before.first_key_refs
+		and after.second_key_refs == before.second_key_refs
+		and after.first_rows_refs == before.first_rows_refs
+		and after.second_rows_refs == before.second_rows_refs
+	)
+
+
+private pure func entry_score(key: String, rows: List[Int]) -> Int:
+	key.length() + rows.length()
+
+
+private pure func first_entry(table: Dict[String, List[Int]]) -> Option[(String, List[Int])]:
+	D.entries(table).get(0)
+
+
+private pure func retained_entry_score(table: Dict[String, List[Int]]) -> Int:
+	-- The returned row outlives the temporary List produced by D.entries.
+	row_score = match first_entry(table):
+		Some(entry): entry_score(entry[0], entry[1])
+		None: -1
+	var kept_key: String = ""
+	var kept_rows: List[Int] = []
+	for (key, rows) in table:
+		kept_key = key
+		kept_rows = rows
+	-- These child bindings outlive the hidden pair released at loop exit.
+	row_score + entry_score(kept_key, kept_rows)
+
+
+private pure func walk_entries(table: Dict[String, List[Int]], walk: EntryWalk) -> Int:
+	match walk:
+		KeepEntryChildren:
+			retained_entry_score(table)
+		_:
+			var score: Int = 0
+			for (key, rows) in table:
+				match walk:
+					BreakEntry:
+						score += entry_score(key, rows)
+						break
+					ContinueEntry:
+						score += entry_score(key, rows)
+						continue
+					BreakInnerLoop:
+						for (inner_key, inner_rows) in table:
+							if entry_score(inner_key, inner_rows) > 0:
+								score += 1
+							break
+						-- An inner break must leave the outer entry owner live.
+						score += entry_score(key, rows)
+					_:
+						score += entry_score(key, rows)
+			score
+
+
+private func verify_entry_walk(walk: EntryWalk) -> Bool:
+	fixture = entry_fixture()
+	walk_table = match walk:
+		BreakEntry: D.remove(fixture.table, fixture.second_key)
+		KeepEntryChildren: D.remove(fixture.table, fixture.second_key)
+		SkipDeletedSlot: D.remove(fixture.table, fixture.first_key)
+		_: fixture.table
+	first_score = entry_score(fixture.first_key, fixture.first_rows)
+	second_score = entry_score(fixture.second_key, fixture.second_rows)
+	expected = match walk:
+		BreakEntry: first_score
+		KeepEntryChildren: first_score * 2
+		SkipDeletedSlot: second_score
+		BreakInnerLoop: first_score + second_score + 2
+		_: first_score + second_score
+	before = entry_snapshot(fixture, walk_table)
+	score = walk_entries(walk_table, walk)
+	after = entry_snapshot(fixture, walk_table)
+	-- Keep the parent owners live beyond both snapshots and read their values.
+	original_first = match D.get(fixture.table, fixture.first_key):
+		Some(rows): rows == fixture.first_rows
+		None: False
+	original_second = match D.get(fixture.table, fixture.second_key):
+		Some(rows): rows == fixture.second_rows
+		None: False
+	walked_value = match walk:
+		SkipDeletedSlot:
+			match D.get(walk_table, fixture.second_key):
+				Some(rows): rows == fixture.second_rows
+				None: False
+		_:
+			match D.get(walk_table, fixture.first_key):
+				Some(rows): rows == fixture.first_rows
+				None: False
+	(
+		restored_entry_owners(before, after)
+		and score == expected
+		and original_first and original_second and walked_value
+	)
+
+
+func test_fallthrough_releases_entry_pair() -> Bool:
+	verify_entry_walk(Fallthrough)
+
+
+func test_break_releases_entry_pair() -> Bool:
+	verify_entry_walk(BreakEntry)
+
+
+func test_continue_releases_entry_pair() -> Bool:
+	verify_entry_walk(ContinueEntry)
+
+
+func test_inner_break_keeps_outer_entry_live() -> Bool:
+	verify_entry_walk(BreakInnerLoop)
+
+
+func test_deleted_slot_does_not_create_entry_owner() -> Bool:
+	verify_entry_walk(SkipDeletedSlot)
+
+
+func test_retained_row_and_children_survive_entry_release() -> Bool:
+	verify_entry_walk(KeepEntryChildren)
+
+
+tests: TestSuite = {
+	description = "Dictionary entry owners across loop exits",
+	tests = [
+		("fallthrough releases the entry pair", test_fallthrough_releases_entry_pair),
+		("break releases the entry pair", test_break_releases_entry_pair),
+		("continue releases the entry pair", test_continue_releases_entry_pair),
+		("inner break keeps the outer entry live", test_inner_break_keeps_outer_entry_live),
+		("deleted slot creates no entry owner", test_deleted_slot_does_not_create_entry_owner),
+		("retained row and children survive entry release", test_retained_row_and_children_survive_entry_release),
+	],
+}

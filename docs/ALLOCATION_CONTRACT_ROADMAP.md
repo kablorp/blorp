@@ -275,10 +275,10 @@ an optional boolean that means "someone probably checked this earlier."
 | --- | --- |
 | `PrimBox`, `PointerBox`, `VoidBox`, Float/Float32/Float16 boxes | No direct allocation in current runtime; floats are bit-packed into pointer-sized storage. Analyze the operand. A helper named `box` alone is not evidence of allocation. |
 | Int128/UInt128/scalar ABI struct boxes | Heap allocation risk; see `emit.brp` box rendering and the actual runtime helper |
-| `CoreBoxedStorageValue`, tuple elements, closure/task argument adapters | Classify implicit boxing in the storage/ABI plan, not just explicit `BoxExpr` children |
-| `TupleConstructExpr` | Current prepared tuple renderer calls `blorp_tuple_new` |
-| Dict iteration with a pair binder | Current prepared backend renderer constructs a tuple; seemingly read-only iteration can allocate |
-| `RecordConstructExpr` | Both record spellings construct managed records; accept only when final Core removes allocation |
+| `CoreBoxedStorageValue`, closure/task argument adapters | Classify implicit boxing in the storage/ABI plan, not just explicit `BoxExpr` children |
+| Generated tuple `ProductExpr` | Managed typed record constructor allocates; inline aggregate fields do not require erased-slot boxes |
+| Dict iteration with a pair binder | Typed native product factory constructs a managed key/value record; seemingly read-only iteration can allocate |
+| Source-record `ProductExpr` | Use the concrete record representation: managed construction allocates, while eligible fixed records are inline; accept only when final Core removes allocation |
 | `ClosureCreateExpr` | Static zero-capture representation differs from allocated capture environment |
 | `ClosureCall` | Unknown target and argument/result ABI boxing are independent risks; V1 rejects unresolved closure calls |
 | `ForeignDefaultArgs` | Defensive argument copying can allocate even if the foreign body is audited; `@no_copy` is not an allocation-free promise |
@@ -286,7 +286,8 @@ an optional boolean that means "someone probably checked this earlier."
 | Recursive union release | Include iterative destructor `realloc`, nested field effects, and erased/dynamic release uncertainty |
 
 Owners to inspect alongside `emit.brp`: `stage_10_backend/`'s
-`prepared_tuple_renderer.brp`, `prepared_backend_renderer.brp`, and
+`emit_tuple_product_adapters.brp`, `emit_tuple_product_plan.brp`,
+`prepared_backend_renderer.brp`, and
 `intrinsic_renderer.brp`, plus `stage_09_core/operation_metadata.brp`.
 The existing iterative SCC implementation in
 `stage_06_typecheck/headers/global_header_completion.brp` is a precedent for

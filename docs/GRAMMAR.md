@@ -1092,6 +1092,10 @@ dict_entry = expression "=>" expression ;
 - `(x,)` is ``a tuple has two to four elements, and `(x,)` has one``; more
   than four elements is ``Tuples support 2-4 elements`` (`LP:6900-6973`).
 - `t.0` is not tuple access, since a field name must be a name; write `t[0]`.
+- Tuple elements evaluate once, left to right. A compile-time index selects a
+  field from typed managed-record storage. Tuple types remain structural and
+  distinct from named records; `Void` fields preserve evaluation without a
+  stored field.
 - `_` is the Void value, the same as `void` (`LP:7790-7795`, `BODY:1974`).
   `break` and `continue` are expressions whose placement 5.3 restricts.
   `after`, `sealed` and `from` are read as the names `after`, `sealed` and
@@ -1835,6 +1839,9 @@ and holes ([1.7](#17-interpolation-holes)).
 
 - **Tuple arity.** Tuple expressions, tuple types, tuple patterns, tuple
   parameters, `for` tuple binders and destructurings have 2 to 4 elements.
+  Tuple types are structural; tuple storage uses managed record fields after
+  types are concrete. A compile-time tuple index selects the corresponding
+  typed field without introducing a nominal source record type.
 - **Union variants** have at most 64 payload fields. **Field names** are
   distinct in a record declaration, literal and update.
 - **`for` has no value** (3.4); **`as` was removed** (3.5); **`try:` was

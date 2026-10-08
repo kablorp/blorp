@@ -37,6 +37,9 @@ import:
 		as_number,
 		as_string,
 	known_functions: CoreKnownFunction, core_known_function, core_known_impl_method
+	list: repeat
+	memory: same_object
+	set as Sets
 
 
 private KIND_FIELD: String = "kind"
@@ -108,6 +111,8 @@ private TRIVIAL_INLINE_OWNERSHIP_TAG: String = "trivial_inline"
 private OWNED_ARC_INLINE_OWNERSHIP_TAG: String = "owned_arc_inline"
 
 private HEAP_RECORD_DECL_TAG: String = "heap_record"
+
+private GENERATED_TUPLE_RECORD_DECL_TAG: String = "generated_tuple_record"
 
 private INLINE_RECORD_DECL_TAG: String = "inline_record"
 
@@ -333,8 +338,6 @@ private MODULE_MEMBER_EXPR_TAG: String = "module_member"
 
 private TUPLE_EXPR_TAG: String = "tuple"
 
-private TUPLE_CONSTRUCT_EXPR_TAG: String = "tuple_construct"
-
 private VECTOR_EXPR_TAG: String = "vector"
 
 private LAMBDA_EXPR_TAG: String = "lambda"
@@ -423,15 +426,13 @@ private LIST_HANDOFF_MODE_CONSUME_REUSE_TAG: String = "consume_reuse"
 
 private LIST_HANDOFF_WRITE_ORDER_FORWARD_COMPACTING_TAG: String = "forward_compacting"
 
-private RECORD_EXPR_TAG: String = "record"
+private PRODUCT_EXPR_TAG: String = "product"
 
 private RECORD_UPDATE_EXPR_TAG: String = "record_update"
 
 private RECORD_REUSE_EXPR_TAG: String = "record_reuse"
 
 private RECORD_COW_UPDATE_EXPR_TAG: String = "record_cow_update"
-
-private RECORD_CONSTRUCT_EXPR_TAG: String = "record_construct"
 
 private UNION_CONSTRUCT_EXPR_TAG: String = "union_construct"
 
@@ -458,22 +459,6 @@ private ARC_RETAIN_POLICY_TAG: String = "arc"
 private STACK_RESULT_RETAIN_POLICY_TAG: String = "stack_result"
 
 private COW_FIELD_TAKE_RETAIN_POLICY_TAG: String = "cow_field_take"
-
-private TUPLE_PRIM_ELEMENT_TAG: String = "prim"
-
-private TUPLE_POINTER_ELEMENT_TAG: String = "pointer"
-
-private TUPLE_STRUCT_ELEMENT_TAG: String = "struct"
-
-private TUPLE_STACK_RESULT_ELEMENT_TAG: String = "stack_result"
-
-private TUPLE_VOID_ELEMENT_TAG: String = "void"
-
-private TUPLE_FLOAT_ELEMENT_TAG: String = "float"
-
-private TUPLE_FLOAT32_ELEMENT_TAG: String = "float32"
-
-private TUPLE_FLOAT16_ELEMENT_TAG: String = "float16"
 
 private BOX_PRIM_TAG: String = "prim"
 
@@ -723,7 +708,11 @@ private BOXED_RESULT_OK_PAYLOAD_ACCESSOR_TAG: String = "boxed_result_ok_payload"
 
 private BOXED_RESULT_ERR_PAYLOAD_ACCESSOR_TAG: String = "boxed_result_err_payload"
 
-private PRODUCT_FIELD_ACCESSOR_TAG: String = "product_field"
+-- Typed accessors carry receiver storage authority. Expressions and semantic
+-- accessors retain their earlier wire spelling without entering that validator.
+private PRODUCT_FIELD_ACCESSOR_TAG: String = "product_field_accessor"
+
+private PRODUCT_FIELD_SEMANTIC_ACCESSOR_TAG: String = "product_field"
 
 private LIST_ELEMENT_ACCESSOR_TAG: String = "list_element"
 
@@ -1081,7 +1070,10 @@ fixed union PassTempKind:
 	TupleFlattenTemp
 	OptionFusionTemp
 	RecordUpdateTemp
-	RecordLiteralFieldTemp
+	ProductFieldTemp
+	ProductReuseSourceTemp
+	TensorElementTemp
+	ListElementTemp
 	SsaVersion
 	PipelineTemp
 	InlinedCalleeTemp
@@ -1143,7 +1135,13 @@ OPTION_FUSION_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(OptionFusionTemp, 0)
 
 RECORD_UPDATE_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(RecordUpdateTemp, 0)
 
-RECORD_LITERAL_FIELD_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(RecordLiteralFieldTemp, 0)
+PRODUCT_FIELD_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(ProductFieldTemp, 0)
+
+PRODUCT_REUSE_SOURCE_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(ProductReuseSourceTemp, 0)
+
+TENSOR_ELEMENT_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(TensorElementTemp, 0)
+
+LIST_ELEMENT_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(ListElementTemp, 0)
 
 SSA_VERSION_ORIGIN: CoreBinderOrigin = PassTemporary(SsaVersion, 0)
 
@@ -1829,13 +1827,6 @@ record CoreTensorPackedLiteral {
 }
 
 
-record CoreTupleConstruct {
-	elements: List[CoreTupleElement],
-	release_mask: Int,
-	retain_mask: Int
-}
-
-
 ---
 `id` is the captured binder's identity (the `CoreVar.id` at the
 capture site), not just its source spelling, so a consumer that matches captures can use
@@ -1890,7 +1881,6 @@ union CoreExpr:
 	-- resolution replaces a callee one; an early invariant rejects any left.
 	ModuleMemberExpr(String, String, CoreType, CoreSourceLoc)
 	TupleExpr(List[CoreExpr], CoreType, CoreSourceLoc)
-	TupleConstructExpr(CoreTupleConstruct, CoreType, CoreSourceLoc)
 	VectorExpr(List[CoreExpr], CoreType, CoreSourceLoc)
 	LambdaExpr(List[CoreParam], CoreType, CoreExpr, Bool, CoreType, CoreSourceLoc)
 	ClosureCreateExpr(CoreClosureCreate, CoreType, CoreSourceLoc)
@@ -1917,12 +1907,13 @@ union CoreExpr:
 	ListRetainExpr(CoreListRetain, CoreType, CoreSourceLoc)
 	ListSetExpr(CoreListSet, CoreType, CoreSourceLoc)
 	ListSwapExpr(CoreListSwap, CoreType, CoreSourceLoc)
-	RecordExpr(List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
+	-- A record built from every one of its fields (see `CoreProductBuild`).
+	ProductExpr(CoreProductBuild, CoreType, CoreSourceLoc)
 	-- Only authored replacements, in evaluation order; omitted slots inherit.
 	RecordUpdateExpr(CoreExpr, List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
-	RecordReuseExpr(CoreExpr, List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
+	-- A record built into the storage of the source when it is unique.
+	RecordReuseExpr(CoreExpr, CoreProductBuild, CoreType, CoreSourceLoc)
 	RecordCowUpdateExpr(CoreExpr, List[CoreRecordCowField], CoreType, CoreSourceLoc)
-	RecordConstructExpr(String, List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
 	UnionConstructExpr(CoreUnionConstruct, CoreType, CoreSourceLoc)
 	UnionReuseConstructExpr(CoreUnionReuseConstruct, CoreType, CoreSourceLoc)
 	DetachExpr(CoreTaskClosure, CoreType, CoreSourceLoc)
@@ -2053,8 +2044,6 @@ pure func core_expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		TupleExpr(items, typ, loc):
 			typ
-		TupleConstructExpr(construct, typ, loc):
-			typ
 		VectorExpr(items, typ, loc):
 			typ
 		LambdaExpr(params, return_type, body, is_pure, typ, loc):
@@ -2107,15 +2096,13 @@ pure func core_expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		ListSwapExpr(swap, typ, loc):
 			typ
-		RecordExpr(fields, typ, loc):
+		ProductExpr(build, typ, loc):
 			typ
 		RecordUpdateExpr(base, fields, typ, loc):
 			typ
-		RecordReuseExpr(source, fields, typ, loc):
+		RecordReuseExpr(source, build, typ, loc):
 			typ
 		RecordCowUpdateExpr(source, fields, typ, loc):
-			typ
-		RecordConstructExpr(type_name, fields, typ, loc):
 			typ
 		UnionConstructExpr(construct, typ, loc):
 			typ
@@ -2222,8 +2209,6 @@ pure func core_expr_source_loc(expr: CoreExpr) -> CoreSourceLoc:
 			loc
 		TupleExpr(_, _, loc):
 			loc
-		TupleConstructExpr(_, _, loc):
-			loc
 		VectorExpr(_, _, loc):
 			loc
 		ClosureCreateExpr(_, _, loc):
@@ -2272,9 +2257,7 @@ pure func core_expr_source_loc(expr: CoreExpr) -> CoreSourceLoc:
 			loc
 		ListSwapExpr(_, _, loc):
 			loc
-		RecordExpr(_, _, loc):
-			loc
-		RecordConstructExpr(_, _, _, loc):
+		ProductExpr(_, _, loc):
 			loc
 		UnionConstructExpr(_, _, loc):
 			loc
@@ -2394,17 +2377,6 @@ pure func core_expr_own_node_id(expr: CoreExpr) -> Option[CoreSourceLoc]:
 			None
 		_:
 			Some(core_expr_source_loc(expr))
-
-
-union CoreTupleElement:
-	TuplePrimElement(CoreExpr)
-	TuplePointerElement(CoreExpr)
-	TupleStructElement(CoreExpr, String)
-	TupleStackResultElement(CoreExpr)
-	TupleVoidElement
-	TupleFloatElement(CoreExpr)
-	TupleFloat32Element(CoreExpr)
-	TupleFloat16Element(CoreExpr)
 
 
 union CoreBoxKind:
@@ -2726,8 +2698,16 @@ record CoreForString {
 }
 
 
+-- Issued from the parsed binder, independently of the key type: a tuple key
+-- remains a key, while a tuple binder requests one owned key/value product.
+fixed union CoreDictIterationMode:
+	CoreDictIterationKeys
+	CoreDictIterationEntries
+
+
 record CoreForDict {
 	binder: CoreLoopBinder,
+	iteration_mode: CoreDictIterationMode,
 	iterable: CoreExpr,
 	iterable_release_policy: CoreReleasePolicy,
 	body: CoreExpr
@@ -2932,6 +2912,8 @@ record CoreForTensor {
 }
 
 
+--- One field of a `RecordUpdateExpr`, which lists every field in declaration
+--- order. A record build names its fields by ordinal instead (`CoreProductBuild`).
 record CoreRecordFieldValue {
 	name: String,
 	ref: CoreFieldRef,
@@ -3142,7 +3124,7 @@ union CoreAccessor:
 	BoxedStackResultErrPayloadAccessor(CoreAccessor, String)
 	BoxedResultOkPayloadAccessor(CoreAccessor)
 	BoxedResultErrPayloadAccessor(CoreAccessor)
-	ProductFieldAccessor(CoreAccessor, CoreFieldOrdinal, CoreType)
+	ProductFieldAccessor(CoreAccessor, CoreType, CoreFieldOrdinal, CoreType)
 	ListElementAccessor(CoreAccessor, Int)
 	ListSpreadAccessor(CoreAccessor, Int)
 
@@ -3428,9 +3410,9 @@ union CoreDeclaredOrigin:
 	-- ProjectedImplMethod(trait, method, for_type, role): the same method once
 	-- runtime projection has turned its impl into top-level functions. The
 	-- impl (and with it `for_type`) is gone, so the target type, as the impl
-	-- spelled it at that moment, moves onto the function. Written only by
-	-- runtime projection, which is what keeps the type in step with the
-	-- passes that rename or specialize types inside impls.
+	-- spelled it at that moment, moves onto the function. Runtime projection
+	-- issues this origin; tuple storage later maps its target together with
+	-- executable parameter types. Logical tuple shape remains in checked rows.
 	ProjectedImplMethod(NameId, NameId, CoreType, CoreImplMethodRole)
 	-- PureVariant(base_def): the pure overload of the function whose `def_id`
 	-- is `base_def` (the impure or builtin sibling that shares its source
@@ -4197,7 +4179,7 @@ pure func core_union_type_storage_errors(
 
 
 --- A record field's typecheck identity, carried by the fields of record
---- declarations, literals and updates. Projections name a field by its
+--- declarations and updates. Projections and builds name a field by its
 --- `CoreFieldOrdinal` instead.
 --
 --- `field_id` is the field's own `FieldId` (a `DefinitionId`) from typecheck
@@ -4257,6 +4239,294 @@ pure func core_field_ordinals_equal(left: CoreFieldOrdinal, right: CoreFieldOrdi
 	core_field_ordinal_index(left) == core_field_ordinal_index(right)
 
 
+--- One value of a product build and the ordinal of the field it is stored in.
+record CoreProductFieldValue {
+	ordinal: CoreFieldOrdinal,
+	value: CoreExpr
+}
+
+
+-- The values in evaluation order, and at each position the ordinal that value
+-- is stored at. Two lists of one length rather than a list of pairs: passes
+-- read and replace values far more often than ordinals, and a rewrite then
+-- copies one list and shares the ordinals.
+private record CoreProductBuildRep {
+	values: List[CoreExpr],
+	ordinals: List[CoreFieldOrdinal]
+}
+
+
+---
+The field values that build a product: every field exactly once, so the
+ordinals are `0` up to the field count, each once. Evaluation order is the
+order of the values, and each value names the ordinal it is stored at, so a
+literal keeps the order its fields were written in, and emission evaluates in
+that order and stores by ordinal. That is Rust's rule for struct expressions;
+the two orders need no pass to reconcile them.
+
+Only `product_build` (which checks the ordinals) and
+`product_build_in_declared_order` make one. Passes rewrite one only through
+`map_product_build_values`, `map_product_build_fields` and
+`rewrite_product_build_values`, which replace values and keep every ordinal in
+place, so no pass can drop, repeat or move a field.
+---
+opaque type CoreProductBuild = CoreProductBuildRep
+
+
+--- Why a list of field values does not build a product with a given field count.
+union CoreProductBuildError:
+	-- An ordinal outside the product's fields.
+	ProductBuildOrdinalOutOfRange(Int)
+	-- An ordinal given more than one value.
+	ProductBuildOrdinalRepeated(Int)
+	-- The first ordinal given no value.
+	ProductBuildOrdinalMissing(Int)
+
+
+---
+A rewritten value and the state after it: what a stateful Core rewrite
+returns for one child, and for a build after all its values
+(`rewrite_product_build_values`). `traverse`'s stateful child maps thread it
+through every child in source order.
+---
+record CoreMapState[S, T] {
+	state: S,
+	value: T
+}
+
+
+--- `fields` as the build of a product with `field_count` fields, or why they
+--- are not one: each ordinal must be in range and appear exactly once.
+pure func product_build(
+	field_count: Int,
+	fields: List[CoreProductFieldValue],
+) -> Result[CoreProductBuild, CoreProductBuildError]:
+	ordinals: List[CoreFieldOrdinal] = fields.map(func(field): field.ordinal)
+	var seen: List[Bool] = repeat(False, field_count)
+	var error: Option[CoreProductBuildError] = None
+
+	for ordinal in ordinals:
+		index: Int = core_field_ordinal_index(ordinal)
+
+		if index < 0 or index >= field_count:
+			error = Some(ProductBuildOrdinalOutOfRange(index))
+			break
+		else if seen.get_or(index, False):
+			error = Some(ProductBuildOrdinalRepeated(index))
+			break
+
+		seen = seen.set(index, True)
+
+	if error.is_none():
+		for index in 0..field_count:
+			if not seen.get_or(index, True):
+				error = Some(ProductBuildOrdinalMissing(index))
+				break
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			Ok(into_opaque CoreProductBuild({
+				values = fields.map(func(field): field.value),
+				ordinals = ordinals
+			}))
+
+
+--- A build whose values are already in declaration order, as a record update
+--- lists them: the value at each position is stored at that ordinal.
+pure func product_build_in_declared_order(values: List[CoreExpr]) -> CoreProductBuild:
+	var ordinals: List[CoreFieldOrdinal] = []
+
+	for index in 0..values.length():
+		ordinals = ordinals.append(core_field_ordinal(index))
+
+	into_opaque CoreProductBuild({
+		values = values,
+		ordinals = ordinals
+	})
+
+
+--- The values in evaluation order.
+pure func product_build_values(build: CoreProductBuild) -> List[CoreExpr]:
+	(from_opaque CoreProductBuild(build)).values
+
+
+--- At each position of `product_build_values`, the ordinal that value is stored at.
+pure func product_build_ordinals(build: CoreProductBuild) -> List[CoreFieldOrdinal]:
+	(from_opaque CoreProductBuild(build)).ordinals
+
+
+--- The values paired with their ordinals, in evaluation order.
+pure func product_build_fields(build: CoreProductBuild) -> List[CoreProductFieldValue]:
+	representation: CoreProductBuildRep = from_opaque CoreProductBuild(build)
+
+	representation.values.enumerate().map(pure func(entry: (Int, CoreExpr)) -> CoreProductFieldValue:
+		(position, value) = entry
+		{
+			ordinal = product_build_ordinal_at(representation, position),
+			value = value
+		}
+	)
+
+
+---
+`items`, one for each value of `build` in evaluation order, rearranged into
+ordinal order: the order a positional constructor takes its fields in. A
+build written in declaration order, the common case, returns `items` itself.
+---
+pure func in_declared_order[T](build: CoreProductBuild, items: List[T]) -> List[T]:
+	ordinals: List[CoreFieldOrdinal] = product_build_ordinals(build)
+	var declared: Bool = True
+	var position: Int = 0
+
+	for ordinal in ordinals:
+		if core_field_ordinal_index(ordinal) != position:
+			declared = False
+			break
+
+		position += 1
+
+	if declared:
+		items
+	else:
+		ordinals
+			.zip(items)
+			.sort_by(pure func(entry: (CoreFieldOrdinal, T)) -> Int:
+				(ordinal, _) = entry
+				core_field_ordinal_index(ordinal)
+			)
+			.map(pure func(entry: (CoreFieldOrdinal, T)) -> T:
+				(_, item) = entry
+				item
+			)
+
+
+-- The ordinal stored with the value at `position`. The two lists have one
+-- length by construction, so the fallback is never taken.
+private pure func product_build_ordinal_at(
+	representation: CoreProductBuildRep,
+	position: Int,
+) -> CoreFieldOrdinal:
+	representation.ordinals.get_or(position, core_field_ordinal(position))
+
+
+private pure func product_build_with_values(
+	build: CoreProductBuild,
+	values: List[CoreExpr],
+) -> CoreProductBuild:
+	into_opaque CoreProductBuild({ from_opaque CoreProductBuild(build) | values = values })
+
+
+---
+`build` with `mapper` applied to each value in evaluation order, each keeping
+its ordinal, or `None` when every value maps to itself (the same object), so
+an unchanged build is not copied.
+---
+pure func map_product_build_values[C](
+	build: CoreProductBuild,
+	context: C,
+	mapper: pure (C, CoreExpr) -> CoreExpr,
+) -> Option[CoreProductBuild]:
+	values: List[CoreExpr] = product_build_values(build)
+	var mapped: List[CoreExpr] = []
+	var changed: Bool = False
+	var index: Int = 0
+
+	for value in values:
+		mapped_value: CoreExpr = mapper(context, value)
+
+		if changed:
+			mapped = mapped.append(mapped_value)
+		else if not same_object(mapped_value, value):
+			mapped = values
+				.take(index)
+				.append(mapped_value)
+			changed = True
+
+		index += 1
+
+	if changed:
+		Some(product_build_with_values(build, mapped))
+	else:
+		None
+
+
+---
+`build` with `mapper` applied to each value and its ordinal in evaluation
+order, each keeping its ordinal, or `None` when every value maps to itself.
+---
+pure func map_product_build_fields[C](
+	build: CoreProductBuild,
+	context: C,
+	mapper: pure (C, CoreFieldOrdinal, CoreExpr) -> CoreExpr,
+) -> Option[CoreProductBuild]:
+	representation: CoreProductBuildRep = from_opaque CoreProductBuild(build)
+	var mapped: List[CoreExpr] = []
+	var changed: Bool = False
+	var index: Int = 0
+
+	for value in representation.values:
+		mapped_value: CoreExpr = mapper(context, product_build_ordinal_at(representation, index), value)
+
+		if changed:
+			mapped = mapped.append(mapped_value)
+		else if not same_object(mapped_value, value):
+			mapped = representation.values
+				.take(index)
+				.append(mapped_value)
+			changed = True
+
+		index += 1
+
+	if changed:
+		Some(product_build_with_values(build, mapped))
+	else:
+		None
+
+
+---
+`build` with each value replaced by `step`, which sees the state and the value
+in evaluation order and returns the new value and state; each value keeps its
+ordinal. The result's build is `build` itself when every step returned its
+value unchanged (the same object).
+---
+pure func rewrite_product_build_values[S](
+	build: CoreProductBuild,
+	state: S,
+	step: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
+) -> CoreMapState[S, CoreProductBuild]:
+	values: List[CoreExpr] = product_build_values(build)
+	var current: S = state
+	var rewritten: List[CoreExpr] = []
+	var changed: Bool = False
+	var index: Int = 0
+
+	for value in values:
+		result: CoreMapState[S, CoreExpr] = step(current, value)
+		current = result.state
+
+		if changed:
+			rewritten = rewritten.append(result.value)
+		else if not same_object(result.value, value):
+			rewritten = values
+				.take(index)
+				.append(result.value)
+			changed = True
+
+		index += 1
+
+	rewritten_build: CoreProductBuild = if changed:
+		product_build_with_values(build, rewritten)
+	else:
+		build
+
+	{
+		state = current,
+		value = rewritten_build
+	}
+
+
 record CoreHeapRecordField {
 	name: String,
 	ref: CoreFieldRef,
@@ -4314,6 +4584,940 @@ record CoreInlineRecordDecl {
 }
 
 
+---
+The storage row for a concrete structural tuple. Its original element types
+are the semantic authority: nested tuples remain TupleType here, while the
+generated-row catalog derives every physical field type from this row.
+No source type or field identity is issued for this declaration.
+
+Only core_generated_tuple_record_decl constructs one. Declaration-name
+uniqueness is checked when the program's generated-row catalog is built.
+---
+private record CoreGeneratedTupleRecordRow {
+	name: String,
+	element_types: List[CoreType],
+	loc: CoreSourceLoc
+}
+
+
+opaque type CoreGeneratedTupleRecordDecl = CoreGeneratedTupleRecordRow
+
+
+union CoreGeneratedTupleRecordFault:
+	GeneratedTupleArityOutsideSurface(Int)
+	GeneratedTupleElementNotConcrete(Int, CoreType)
+
+
+MIN_TUPLE_STORAGE_ARITY: Int = 2
+MAX_TUPLE_STORAGE_ARITY: Int = 4
+
+
+private pure func generated_tuple_type_is_concrete(typ: CoreType) -> Bool:
+	match typ:
+		TypeParameterType(_) | SelfType:
+			False
+		NamedType(_, args):
+			args.all(generated_tuple_type_is_concrete)
+		TupleType(items):
+			(
+				items.length() >= MIN_TUPLE_STORAGE_ARITY
+				and items.length() <= MAX_TUPLE_STORAGE_ARITY
+				and items.all(generated_tuple_type_is_concrete)
+			)
+		FunctionType(_, params, result):
+			params.all(generated_tuple_type_is_concrete) and generated_tuple_type_is_concrete(result)
+		StackResultType(ok_type, err_type):
+			generated_tuple_type_is_concrete(ok_type) and generated_tuple_type_is_concrete(err_type)
+		BoxedResultType(ok_type, err_type):
+			generated_tuple_type_is_concrete(ok_type) and generated_tuple_type_is_concrete(err_type)
+		TensorType(info):
+			generated_tuple_type_is_concrete(info.element_type)
+		VoidType | NativeManagedType(_) | HeapRecordType(_) | InlineRecordType(_) | UnionType(_, _) | RangeType:
+			True
+
+
+pure func core_generated_tuple_record_decl(
+	name: String,
+	element_types: List[CoreType],
+	loc: CoreSourceLoc,
+) -> Result[CoreGeneratedTupleRecordDecl, CoreGeneratedTupleRecordFault]:
+	arity: Int = element_types.length()
+
+	if arity < MIN_TUPLE_STORAGE_ARITY or arity > MAX_TUPLE_STORAGE_ARITY:
+		Err(GeneratedTupleArityOutsideSurface(arity))
+	else:
+		var failure: Option[CoreGeneratedTupleRecordFault] = None
+
+		for (ordinal, element_type) in element_types.enumerate():
+			if failure.is_none() and not generated_tuple_type_is_concrete(element_type):
+				failure = Some(GeneratedTupleElementNotConcrete(ordinal, element_type))
+
+		match failure:
+			Some(fault):
+				Err(fault)
+			None:
+				Ok(into_opaque CoreGeneratedTupleRecordDecl({
+					name = name,
+					element_types = element_types,
+					loc = loc,
+				}))
+
+
+pure func core_generated_tuple_record_name(row: CoreGeneratedTupleRecordDecl) -> String:
+	from_opaque CoreGeneratedTupleRecordDecl(row).name
+
+
+pure func core_generated_tuple_record_elements(row: CoreGeneratedTupleRecordDecl) -> List[CoreType]:
+	from_opaque CoreGeneratedTupleRecordDecl(row).element_types
+
+
+pure func core_generated_tuple_record_location(row: CoreGeneratedTupleRecordDecl) -> CoreSourceLoc:
+	from_opaque CoreGeneratedTupleRecordDecl(row).loc
+
+
+record CoreLayoutTypeIndex {
+	aliases: Dict[String, CoreTypeAliasDecl],
+	declared_types: Dict[String, CoreType],
+	list_layouts: Dict[String, CoreListStorageLayout]
+}
+
+
+pure func build_core_layout_type_index(program: CoreProgram) -> CoreLayoutTypeIndex:
+	var aliases: Dict[String, CoreTypeAliasDecl] = {}
+	var declared_types: Dict[String, CoreType] = {}
+
+	for decl in program.decls:
+		match decl:
+			TypeAliasDecl(alias_decl):
+				if not aliases.contains(alias_decl.name):
+					aliases = aliases.set(alias_decl.name, alias_decl)
+			GeneratedTupleRecordDecl(row):
+				name = core_generated_tuple_record_name(row)
+				declared_types = declared_types.set(name, HeapRecordType(name))
+			HeapRecordDecl(record_decl):
+				if not declared_types.contains(record_decl.name):
+					declared_types = declared_types.set(
+						record_decl.name,
+						HeapRecordType(record_decl.name),
+					)
+			InlineRecordDecl(record_decl):
+				if not declared_types.contains(record_decl.name):
+					declared_types = declared_types.set(
+						record_decl.name,
+						InlineRecordType(record_decl.name),
+					)
+			UnionDecl(union_decl):
+				if not declared_types.contains(union_decl.name):
+					-- Only trusted standard Bool authority preserves the primitive
+					-- value ABI; a same-named ordinary union still has tag storage.
+					declared_type: CoreType = match (union_decl.abi_type, union_decl.storage):
+						(Some(DeclaredAbiBool), ScalarTagStorage):
+							NamedType("Bool", [])
+						_:
+							UnionType(union_decl.name, core_union_storage_value(union_decl.storage))
+					declared_types = declared_types.set(
+						union_decl.name,
+						declared_type,
+					)
+			_:
+				void
+
+	{
+		aliases = aliases,
+		declared_types = declared_types,
+		list_layouts = {}
+	}
+
+
+private pure func alias_type_argument(
+	params: List[String],
+	args: List[CoreType],
+	name: String,
+) -> Option[CoreType]:
+	var result: Option[CoreType] = None
+	var index: Int = 0
+
+	while index < params.length() and result.is_none():
+		match (params.get(index), args.get(index)):
+			(Some(param), Some(arg)):
+				if param == name:
+					result = Some(arg)
+			(Some(_), None) | (None, Some(_)) | (None, None):
+				void
+
+		index += 1
+
+	result
+
+
+private pure func substitute_alias_type(
+	typ: CoreType,
+	params: List[String],
+	args: List[CoreType],
+) -> CoreType:
+	match typ:
+		TypeParameterType(name):
+			alias_type_argument(params, args, name).get_or(typ)
+		SelfType:
+			typ
+		NamedType(name, nested_args):
+			NamedType(
+				name,
+				nested_args.map(func(arg): substitute_alias_type(arg, params, args)),
+			)
+		StackResultType(ok_type, err_type):
+			StackResultType(
+				substitute_alias_type(ok_type, params, args),
+				substitute_alias_type(err_type, params, args),
+			)
+		BoxedResultType(ok_type, err_type):
+			BoxedResultType(
+				substitute_alias_type(ok_type, params, args),
+				substitute_alias_type(err_type, params, args),
+			)
+		FunctionType(is_pure, function_params, return_type):
+			FunctionType(
+				is_pure,
+				function_params.map(func(param): substitute_alias_type(param, params, args)),
+				substitute_alias_type(return_type, params, args),
+			)
+		TensorType(info):
+			TensorType(
+				{ info | element_type = substitute_alias_type(info.element_type, params, args) },
+			)
+		TupleType(items):
+			TupleType(items.map(
+				func(item): substitute_alias_type(item, params, args),
+			))
+		_:
+			typ
+
+
+-- Allocation identity for resolved Core types: a NamedType whose alias/arity
+-- lookups leave it unchanged hands back its own input rather than an
+-- allocated copy.
+private pure func canonical_declared_type(
+	index: CoreLayoutTypeIndex,
+	typ: CoreType,
+	name: String,
+	args: List[CoreType],
+	args_unchanged: Bool,
+) -> CoreType:
+	if args.length() != 0:
+		if args_unchanged:
+			typ
+		else:
+			NamedType(name, args)
+	else:
+		match index.declared_types.get(name):
+			Some(declared):
+				declared
+			None:
+				if args_unchanged:
+					typ
+				else:
+					NamedType(name, args)
+
+
+---
+Which aliases a layout resolution expands. Storage questions expand every
+alias to its representation; trait-impl questions keep opaque aliases,
+because an opaque type's impls may disagree with its representation's.
+---
+fixed union CoreAliasExpansion:
+	ExpandEveryAlias
+	KeepOpaqueAliases
+
+
+private pure func expands_alias(
+	expansion: CoreAliasExpansion,
+	alias_decl: CoreTypeAliasDecl,
+) -> Bool:
+	match expansion:
+		ExpandEveryAlias:
+			True
+		KeepOpaqueAliases:
+			not alias_decl.is_opaque
+
+
+private pure func resolve_types(
+	index: CoreLayoutTypeIndex,
+	types: List[CoreType],
+	seen_aliases: List[String],
+	expansion: CoreAliasExpansion,
+) -> List[CoreType]:
+	var result: List[CoreType] = []
+	var changed: Bool = False
+	var pos: Int = 0
+
+	for typ in types:
+		resolved: CoreType = resolve_type(index, typ, seen_aliases, expansion)
+
+		if changed:
+			result = result.append(resolved)
+		else if not same_object(resolved, typ):
+			result = types
+				.take(pos)
+				.append(resolved)
+			changed = True
+
+		pos += 1
+
+	if changed:
+		result
+	else:
+		types
+
+
+private pure func resolve_type(
+	index: CoreLayoutTypeIndex,
+	typ: CoreType,
+	seen_aliases: List[String],
+	expansion: CoreAliasExpansion,
+) -> CoreType:
+	match typ:
+		NamedType(name, args):
+			resolved_args: List[CoreType] = resolve_types(index, args, seen_aliases, expansion)
+			args_unchanged: Bool = same_object(resolved_args, args)
+
+			if seen_aliases.contains(name):
+				canonical_declared_type(index, typ, name, resolved_args, args_unchanged)
+			else:
+				alias_expansion: Option[CoreType] = match index.aliases.get(name):
+					Some(alias_decl):
+						if (
+							alias_decl.type_params.length() == resolved_args.length()
+							and expands_alias(expansion, alias_decl)
+						):
+							Some(
+								substitute_alias_type(
+									alias_decl.target,
+									alias_decl.type_params,
+									resolved_args,
+								),
+							)
+						else:
+							None
+					None:
+						None
+
+				match alias_expansion:
+					Some(target):
+						resolve_type(
+							index,
+							target,
+							seen_aliases.append(name),
+							expansion,
+						)
+					None:
+						canonical_declared_type(index, typ, name, resolved_args, args_unchanged)
+		StackResultType(ok_type, err_type):
+			resolved_ok: CoreType = resolve_type(index, ok_type, seen_aliases, expansion)
+			resolved_err: CoreType = resolve_type(index, err_type, seen_aliases, expansion)
+
+			if same_object(resolved_ok, ok_type) and same_object(resolved_err, err_type):
+				typ
+			else:
+				StackResultType(resolved_ok, resolved_err)
+		BoxedResultType(ok_type, err_type):
+			resolved_ok: CoreType = resolve_type(index, ok_type, seen_aliases, expansion)
+			resolved_err: CoreType = resolve_type(index, err_type, seen_aliases, expansion)
+
+			if same_object(resolved_ok, ok_type) and same_object(resolved_err, err_type):
+				typ
+			else:
+				BoxedResultType(resolved_ok, resolved_err)
+		FunctionType(is_pure, params, return_type):
+			resolved_params: List[CoreType] = resolve_types(index, params, seen_aliases, expansion)
+			resolved_return: CoreType = resolve_type(index, return_type, seen_aliases, expansion)
+
+			if (
+				same_object(resolved_params, params)
+				and same_object(resolved_return, return_type)
+			):
+				typ
+			else:
+				FunctionType(is_pure, resolved_params, resolved_return)
+		TensorType(info):
+			resolved_element: CoreType = resolve_type(
+				index,
+				info.element_type,
+				seen_aliases,
+				expansion,
+			)
+
+			if same_object(resolved_element, info.element_type):
+				typ
+			else:
+				TensorType({ info | element_type = resolved_element })
+		TupleType(items):
+			resolved_items: List[CoreType] = resolve_types(index, items, seen_aliases, expansion)
+
+			if same_object(resolved_items, items):
+				typ
+			else:
+				TupleType(resolved_items)
+		_:
+			typ
+
+
+pure func resolve_core_layout_type_with_index(index: CoreLayoutTypeIndex, typ: CoreType) -> CoreType:
+	resolve_type(index, typ, [], ExpandEveryAlias)
+
+
+---
+Resolves `typ` like `resolve_core_layout_type_with_index` but leaves every opaque
+alias named, at the top and inside type arguments. An opaque type's trait
+impls are its own, not its representation's, so a question about which impl
+applies must see the opaque name; a question about storage must not.
+---
+pure func resolve_core_layout_type_keeping_opaque_aliases(
+	index: CoreLayoutTypeIndex,
+	typ: CoreType,
+) -> CoreType:
+	resolve_type(index, typ, [], KeepOpaqueAliases)
+
+
+---
+Resolves `typ` until its outermost type is not an alias, opaque or not,
+while its type arguments keep their opaque aliases. A container question
+("is this a Dict, and what is its key?") must see through an opaque
+container such as `opaque type Store = Dict[Key, Entry]`, but the key it
+finds must still name `Key` if `Key` is opaque.
+---
+pure func resolve_core_layout_type_head_keeping_opaque_arguments(
+	index: CoreLayoutTypeIndex,
+	typ: CoreType,
+) -> CoreType:
+	resolve_opaque_head(
+		index,
+		resolve_core_layout_type_keeping_opaque_aliases(index, typ),
+		[],
+	)
+
+
+private pure func resolve_opaque_head(
+	index: CoreLayoutTypeIndex,
+	typ: CoreType,
+	seen_aliases: List[String],
+) -> CoreType:
+	match typ:
+		NamedType(name, args):
+			match index.aliases.get(name):
+				Some(alias_decl):
+					if (
+						seen_aliases.contains(name)
+						or alias_decl.type_params.length() != args.length()
+					):
+						typ
+					else:
+						resolve_opaque_head(
+							index,
+							resolve_core_layout_type_keeping_opaque_aliases(
+								index,
+								substitute_alias_type(
+									alias_decl.target,
+									alias_decl.type_params,
+									args,
+								),
+							),
+							seen_aliases.append(name),
+						)
+				None:
+					typ
+		_:
+			typ
+
+
+private record TupleStorageCatalogRows {
+	type_index: CoreLayoutTypeIndex,
+	rows: List[CoreGeneratedTupleRecordDecl],
+	by_name: Dict[String, CoreGeneratedTupleRecordDecl],
+	occupied_names: Set[String]
+}
+
+
+---
+Every concrete structural tuple has one generated row. Build this catalog
+before mapping executable types; a nested tuple resolves against the same
+complete catalog as a top-level one. Source record identities stay nominal.
+---
+opaque type CoreTupleStorageCatalog = TupleStorageCatalogRows
+
+
+union CoreTupleStorageFault:
+	InvalidGeneratedTupleRow(CoreGeneratedTupleRecordFault)
+	GeneratedTupleNameCollision(String)
+	GeneratedTupleShapeDeclaredTwice(String, String)
+	GeneratedTupleStorageReferenceInLogicalRow(String)
+	ConcreteTupleRowMissing(CoreType)
+	CyclicTupleStorageAlias(String)
+	CyclicGeneratedTupleStorage(String)
+
+
+private GENERATED_TUPLE_STORAGE_NAME: String = "$blorp$tuple_storage$"
+
+
+private pure func generated_tuple_shape(row: CoreGeneratedTupleRecordDecl) -> CoreType:
+	TupleType(core_generated_tuple_record_elements(row))
+
+
+pure func generated_tuple_record_for_type(
+	catalog: CoreTupleStorageCatalog,
+	typ: CoreType,
+) -> Option[CoreGeneratedTupleRecordDecl]:
+	rows: TupleStorageCatalogRows = from_opaque CoreTupleStorageCatalog(catalog)
+
+	match typ:
+		HeapRecordType(name):
+			rows.by_name.get(name)
+		TupleType(_):
+			rows.rows.find(func(row): core_type_equal(generated_tuple_shape(row), typ))
+		_:
+			None
+
+
+pure func tuple_storage_rows(catalog: CoreTupleStorageCatalog) -> List[CoreGeneratedTupleRecordDecl]:
+	from_opaque CoreTupleStorageCatalog(catalog).rows
+
+
+pure func core_tuple_storage_fault_message(fault: CoreTupleStorageFault) -> String:
+	match fault:
+		InvalidGeneratedTupleRow(GeneratedTupleArityOutsideSurface(arity)):
+			"generated tuple row has ${arity} elements; use a concrete tuple with two, three or four elements"
+		InvalidGeneratedTupleRow(GeneratedTupleElementNotConcrete(ordinal, _)):
+			"generated tuple element ${ordinal} is not concrete; run monomorphization before issuing storage rows"
+		GeneratedTupleNameCollision(name):
+			"generated tuple storage name `${name}` collides with a declaration; issue a fresh storage name"
+		GeneratedTupleShapeDeclaredTwice(first, second):
+			"generated rows `${first}` and `${second}` have the same structural tuple shape; keep one canonical row"
+		GeneratedTupleStorageReferenceInLogicalRow(name):
+			"generated storage `${name}` appears in logical tuple metadata; preserve the original TupleType shape"
+		CyclicTupleStorageAlias(name):
+			"tuple storage alias '" + name + "' recursively refers to itself; use a nonrecursive alias target"
+		CyclicGeneratedTupleStorage(name):
+			"generated tuple storage row '" + name + "' recursively contains itself; preserve a finite logical tuple shape"
+		ConcreteTupleRowMissing(_):
+			"concrete tuple has no generated storage row; lower all nested tuple shapes before replaying storage Core"
+
+
+private pure func tuple_storage_types(
+	catalog: CoreTupleStorageCatalog,
+	types: List[CoreType],
+) -> Result[List[CoreType], CoreTupleStorageFault]:
+	var mapped: List[CoreType] = []
+	var failure: Option[CoreTupleStorageFault] = None
+
+	for typ in types:
+		if failure.is_none():
+			match tuple_storage_type(catalog, typ):
+				Ok(storage_type):
+					mapped = mapped.append(storage_type)
+				Err(fault):
+					failure = Some(fault)
+
+	match failure:
+		Some(fault):
+			Err(fault)
+		None:
+			Ok(mapped)
+
+
+---
+The physical counterpart of a concrete logical type. This is the only tuple
+type rewrite: all callers, including field layout, native adapters and replay
+validation, use the same catalog and mapping.
+---
+pure func tuple_storage_type(
+	catalog: CoreTupleStorageCatalog,
+	typ: CoreType,
+) -> Result[CoreType, CoreTupleStorageFault]:
+	index = from_opaque CoreTupleStorageCatalog(catalog).type_index
+	-- Preserve logical opaque arguments when selecting a structural row;
+	-- derive each actual field's representation through the same resolver.
+	resolved = resolve_core_layout_type_head_keeping_opaque_arguments(index, typ)
+	if not core_type_equal(resolved, typ):
+		tuple_storage_type(catalog, resolved)
+	else:
+		match typ:
+			TupleType(_):
+				match generated_tuple_record_for_type(catalog, typ):
+					Some(row):
+						Ok(HeapRecordType(core_generated_tuple_record_name(row)))
+					None:
+						Err(ConcreteTupleRowMissing(typ))
+			NamedType(name, args):
+				mapped ?= tuple_storage_types(catalog, args)
+				Ok(NamedType(name, mapped))
+			FunctionType(is_pure, params, result):
+				mapped_params ?= tuple_storage_types(catalog, params)
+				mapped_result ?= tuple_storage_type(catalog, result)
+				Ok(FunctionType(is_pure, mapped_params, mapped_result))
+			StackResultType(ok_type, err_type):
+				mapped_ok ?= tuple_storage_type(catalog, ok_type)
+				mapped_err ?= tuple_storage_type(catalog, err_type)
+				Ok(StackResultType(mapped_ok, mapped_err))
+			BoxedResultType(ok_type, err_type):
+				mapped_ok ?= tuple_storage_type(catalog, ok_type)
+				mapped_err ?= tuple_storage_type(catalog, err_type)
+				Ok(BoxedResultType(mapped_ok, mapped_err))
+			TensorType(info):
+				mapped_element ?= tuple_storage_type(catalog, info.element_type)
+				Ok(TensorType({ info | element_type = mapped_element }))
+			_:
+				Ok(typ)
+
+
+private pure func source_type_name(decl: CoreDecl) -> Option[String]:
+	match decl:
+		HeapRecordDecl(row):
+			Some(row.name)
+		InlineRecordDecl(row):
+			Some(row.name)
+		UnionDecl(row):
+			Some(row.name)
+		TypeAliasDecl(row):
+			Some(row.name)
+		_:
+			None
+
+
+private pure func insert_existing_tuple_row(
+	rows: TupleStorageCatalogRows,
+	row: CoreGeneratedTupleRecordDecl,
+) -> Result[TupleStorageCatalogRows, CoreTupleStorageFault]:
+	name: String = core_generated_tuple_record_name(row)
+	shape: CoreType = generated_tuple_shape(row)
+
+	if Sets.contains(rows.occupied_names, name):
+		Err(GeneratedTupleNameCollision(name))
+	else:
+		match rows.rows.find(func(existing): core_type_equal(generated_tuple_shape(existing), shape)):
+			Some(existing):
+				Err(GeneratedTupleShapeDeclaredTwice(core_generated_tuple_record_name(existing), name))
+			None:
+				Ok({ rows |
+					rows = rows.rows.append(row),
+					by_name = rows.by_name.set(name, row),
+					occupied_names = Sets.add(rows.occupied_names, name),
+				})
+
+
+-- Validate declared alias dependencies before deriving container fields.
+-- Arguments are checked independently, but never substituted into the callee's
+-- target here: Identity[Identity[Int]] has no recursive declaration. Checking
+-- every original target also catches cycles whose generic arguments grow.
+private pure func tuple_storage_alias_cycle(
+	index: CoreLayoutTypeIndex,
+	typ: CoreType,
+	active: List[String],
+) -> Option[String]:
+	match typ:
+		NamedType(name, args):
+			var failure = tuple_storage_alias_cycles(index, args, active)
+			if failure.is_none():
+				match index.aliases.get(name):
+					Some(alias_decl):
+						if alias_decl.type_params.length() == args.length():
+							if active.contains(name):
+								failure = Some(name)
+							else:
+								failure = tuple_storage_alias_cycle(
+									index,
+									alias_decl.target,
+									active.append(name),
+								)
+					None:
+						void
+			failure
+		TupleType(elements):
+			tuple_storage_alias_cycles(index, elements, active)
+		FunctionType(_, params, result):
+			tuple_storage_alias_cycles(index, params.append(result), active)
+		StackResultType(success, error):
+			tuple_storage_alias_cycles(index, [success, error], active)
+		BoxedResultType(success, error):
+			tuple_storage_alias_cycles(index, [success, error], active)
+		TensorType(info):
+			tuple_storage_alias_cycle(index, info.element_type, active)
+		_:
+			None
+
+
+private pure func tuple_storage_alias_cycles(
+	index: CoreLayoutTypeIndex,
+	types: List[CoreType],
+	active: List[String],
+) -> Option[String]:
+	var failure: Option[String] = None
+	for typ in types:
+		if failure.is_none():
+			failure = tuple_storage_alias_cycle(index, typ, active)
+	failure
+
+
+private pure func validate_tuple_storage_aliases(
+	index: CoreLayoutTypeIndex,
+) -> Result[Void, CoreTupleStorageFault]:
+	var failure: Option[String] = None
+	for alias_decl in index.aliases.values():
+		if failure.is_none():
+			failure = tuple_storage_alias_cycle(
+				index,
+				NamedType(alias_decl.name, alias_decl.type_params.map(func(name): TypeParameterType(name))),
+				[],
+			)
+	match failure:
+		Some(name): Err(CyclicTupleStorageAlias(name))
+		None: Ok(void)
+
+
+private pure func logical_tuple_element_fault(
+	rows: TupleStorageCatalogRows,
+	typ: CoreType,
+) -> Option[CoreTupleStorageFault]:
+	match typ:
+		HeapRecordType(name):
+			if rows.by_name.contains(name):
+				Some(GeneratedTupleStorageReferenceInLogicalRow(name))
+			else:
+				None
+		InlineRecordType(name):
+			if rows.by_name.contains(name):
+				Some(GeneratedTupleStorageReferenceInLogicalRow(name))
+			else:
+				None
+		UnionType(name, _):
+			if rows.by_name.contains(name):
+				Some(GeneratedTupleStorageReferenceInLogicalRow(name))
+			else:
+				None
+		NamedType(name, args):
+			if rows.by_name.contains(name):
+				Some(GeneratedTupleStorageReferenceInLogicalRow(name))
+			else:
+				logical_tuple_elements_fault(rows, args)
+		TupleType(items):
+			logical_tuple_elements_fault(rows, items)
+		FunctionType(_, params, result):
+			logical_tuple_elements_fault(rows, params.append(result))
+		StackResultType(ok_type, err_type):
+			logical_tuple_elements_fault(rows, [ok_type, err_type])
+		BoxedResultType(ok_type, err_type):
+			logical_tuple_elements_fault(rows, [ok_type, err_type])
+		TensorType(info):
+			logical_tuple_element_fault(rows, info.element_type)
+		VoidType | NativeManagedType(_) | TypeParameterType(_) | SelfType | RangeType:
+			None
+
+
+private pure func logical_tuple_elements_fault(
+	rows: TupleStorageCatalogRows,
+	types: List[CoreType],
+) -> Option[CoreTupleStorageFault]:
+	var failure: Option[CoreTupleStorageFault] = None
+
+	for typ in types:
+		if failure.is_none():
+			failure = logical_tuple_element_fault(rows, typ)
+
+	failure
+
+
+-- Catalog aliases have already passed the declared dependency check. Derive
+-- every edge with the shared mapper, then follow only registered generated
+-- storage rows. Source nominal records are leaves in this structural graph.
+private pure func generated_tuple_storage_dependency(
+	catalog: CoreTupleStorageCatalog,
+	typ: CoreType,
+	active_rows: List[String],
+) -> Result[Void, CoreTupleStorageFault]:
+	physical_type ?= tuple_storage_type(catalog, typ)
+
+	match physical_type:
+		HeapRecordType(name):
+			match generated_tuple_record_for_type(catalog, physical_type):
+				Some(row):
+					if active_rows.contains(name):
+						Err(CyclicGeneratedTupleStorage(name))
+					else:
+						generated_tuple_storage_dependencies(
+							catalog,
+							core_generated_tuple_record_elements(row),
+							active_rows.append(name),
+						)
+				None:
+					Ok(void)
+		NamedType(_, arguments):
+			generated_tuple_storage_dependencies(catalog, arguments, active_rows)
+		FunctionType(_, parameters, result):
+			generated_tuple_storage_dependencies(catalog, parameters.append(result), active_rows)
+		StackResultType(success, error):
+			generated_tuple_storage_dependencies(catalog, [success, error], active_rows)
+		BoxedResultType(success, error):
+			generated_tuple_storage_dependencies(catalog, [success, error], active_rows)
+		TensorType(info):
+			generated_tuple_storage_dependency(catalog, info.element_type, active_rows)
+		TupleType(elements):
+			generated_tuple_storage_dependencies(catalog, elements, active_rows)
+		VoidType | InlineRecordType(_) | NativeManagedType(_) | UnionType(_, _) | TypeParameterType(_) | SelfType | RangeType:
+			Ok(void)
+
+
+private pure func generated_tuple_storage_dependencies(
+	catalog: CoreTupleStorageCatalog,
+	types: List[CoreType],
+	active_rows: List[String],
+) -> Result[Void, CoreTupleStorageFault]:
+	var failure: Option[CoreTupleStorageFault] = None
+
+	for typ in types:
+		if failure.is_none():
+			match generated_tuple_storage_dependency(catalog, typ, active_rows):
+				Ok(_):
+					void
+				Err(fault):
+					failure = Some(fault)
+
+	match failure:
+		Some(fault):
+			Err(fault)
+		None:
+			Ok(void)
+
+
+private pure func validate_tuple_catalog(
+	rows: TupleStorageCatalogRows,
+) -> Result[CoreTupleStorageCatalog, CoreTupleStorageFault]:
+	catalog: CoreTupleStorageCatalog = into_opaque CoreTupleStorageCatalog(rows)
+	var failure: Option[CoreTupleStorageFault] = None
+
+	for row in rows.rows:
+		if failure.is_none():
+			-- Logical metadata may contain genuine source record types, but
+			-- generated storage references lose structural tuple identity.
+			failure = logical_tuple_elements_fault(rows, core_generated_tuple_record_elements(row))
+
+		if failure.is_none():
+			match tuple_storage_types(catalog, core_generated_tuple_record_elements(row)):
+				Ok(_):
+					void
+				Err(fault):
+					failure = Some(fault)
+
+		if failure.is_none():
+			match generated_tuple_storage_dependencies(
+				catalog,
+				core_generated_tuple_record_elements(row),
+				[core_generated_tuple_record_name(row)],
+			):
+				Ok(_):
+					void
+				Err(fault):
+					failure = Some(fault)
+
+	match failure:
+		Some(fault):
+			Err(fault)
+		None:
+			Ok(catalog)
+
+
+---
+Read the generated rows already present in a program or decoded snapshot.
+Logical tuple metadata is valid only inside these rows. Executable tuple
+types must resolve through them, and nested tuple shapes must also have rows.
+---
+pure func tuple_storage_catalog(
+	program: CoreProgram,
+) -> Result[CoreTupleStorageCatalog, CoreTupleStorageFault]:
+	index = build_core_layout_type_index(program)
+	aliases_valid ?= validate_tuple_storage_aliases(index)
+	var occupied: Set[String] = Sets.set()
+
+	for decl in program.decls:
+		match source_type_name(decl):
+			Some(name):
+				occupied = Sets.add(occupied, name)
+			None:
+				void
+
+	var rows: TupleStorageCatalogRows = {
+		rows = [],
+		by_name = {},
+		occupied_names = occupied,
+		type_index = index,
+	}
+	var failure: Option[CoreTupleStorageFault] = None
+
+	for decl in program.decls:
+		if failure.is_none():
+			match decl:
+				GeneratedTupleRecordDecl(row):
+					match insert_existing_tuple_row(rows, row):
+						Ok(next):
+							rows = next
+						Err(fault):
+							failure = Some(fault)
+				_:
+					void
+
+	match failure:
+		Some(fault):
+			Err(fault)
+		None:
+			validate_tuple_catalog(rows)
+
+
+private pure func unused_tuple_storage_name(rows: TupleStorageCatalogRows) -> String:
+	var serial: Int = rows.rows.length()
+	var name: String = GENERATED_TUPLE_STORAGE_NAME + serial.to_string()
+
+	while Sets.contains(rows.occupied_names, name):
+		serial += 1
+		name = GENERATED_TUPLE_STORAGE_NAME + serial.to_string()
+
+	name
+
+
+---
+Issue rows for a complete list of concrete tuple shapes collected from live
+runtime Core. Generic trait signatures are not a storage request. Insert all
+rows before deriving any physical element type; traversal order does not
+decide whether a nested tuple can be represented.
+---
+pure func intern_tuple_storage_rows(
+	program: CoreProgram,
+	shapes: List[(List[CoreType], CoreSourceLoc)],
+) -> Result[CoreTupleStorageCatalog, CoreTupleStorageFault]:
+	existing ?= tuple_storage_catalog(program)
+	var rows: TupleStorageCatalogRows = from_opaque CoreTupleStorageCatalog(existing)
+	var failure: Option[CoreTupleStorageFault] = None
+
+	for (elements, loc) in shapes:
+		shape: CoreType = TupleType(elements)
+
+		if (
+			failure.is_none()
+			and not rows.rows.any(func(row): core_type_equal(generated_tuple_shape(row), shape))
+		):
+			match core_generated_tuple_record_decl(unused_tuple_storage_name(rows), elements, loc):
+				Ok(row):
+					match insert_existing_tuple_row(rows, row):
+						Ok(next):
+							rows = next
+						Err(fault):
+							failure = Some(fault)
+				Err(fault):
+					failure = Some(InvalidGeneratedTupleRow(fault))
+
+	match failure:
+		Some(fault):
+			Err(fault)
+		None:
+			validate_tuple_catalog(rows)
+
+
 record CoreTypeAliasDecl {
 	abi_type: Option[DeclaredAbiType],
 	name: String,
@@ -4362,6 +5566,7 @@ union CoreDecl:
 	UnionDecl(CoreUnionDecl)
 	HeapRecordDecl(CoreHeapRecordDecl)
 	InlineRecordDecl(CoreInlineRecordDecl)
+	GeneratedTupleRecordDecl(CoreGeneratedTupleRecordDecl)
 	TypeAliasDecl(CoreTypeAliasDecl)
 	TraitDecl(CoreTraitDecl)
 	ImplDecl(CoreImplDecl)
@@ -4466,10 +5671,15 @@ union CoreJsonError:
 	CoreExpectedObject(String)
 	CoreExpectedVariableExpr(String)
 	CoreInvalidRecordUpdateShape(String, String)
+	CoreInvalidTupleStorage(String, String)
 	CoreInvalidUnionStorage(String, String)
 	CoreExpectedObjectField(String, String)
 	CoreExpectedStringField(String, String)
 	CoreExpectedIntField(String, String)
+	-- A field ordinal below zero, at the path and key.
+	CoreNegativeFieldOrdinal(String, String)
+	-- A product build whose ordinals do not name each field once, at the path.
+	CoreInvalidProductBuild(String, CoreProductBuildError)
 	CoreExpectedNumberField(String, String)
 	CoreExpectedBoolField(String, String)
 	CoreExpectedArrayField(String, String)
@@ -6566,169 +7776,6 @@ pure func decode_core_call_kind_json(
 		Err(CoreUnsupportedTag(path, tag))
 
 
-pure func core_tuple_element_to_json(element: CoreTupleElement) -> JsonValue:
-	match element:
-		TuplePrimElement(value):
-			JsonObject([
-				(KIND_FIELD, JsonString(TUPLE_PRIM_ELEMENT_TAG)),
-				("value", core_expr_to_json(value)),
-			])
-		TuplePointerElement(value):
-			JsonObject([
-				(KIND_FIELD, JsonString(TUPLE_POINTER_ELEMENT_TAG)),
-				("value", core_expr_to_json(value)),
-			])
-		TupleStructElement(value, c_type):
-			JsonObject([
-				(KIND_FIELD, JsonString(TUPLE_STRUCT_ELEMENT_TAG)),
-				("value", core_expr_to_json(value)),
-				("c_type", JsonString(c_type)),
-			])
-		TupleStackResultElement(value):
-			JsonObject([
-				(KIND_FIELD, JsonString(TUPLE_STACK_RESULT_ELEMENT_TAG)),
-				("value", core_expr_to_json(value)),
-			])
-		TupleVoidElement:
-			JsonObject([(KIND_FIELD, JsonString(TUPLE_VOID_ELEMENT_TAG))])
-		TupleFloatElement(value):
-			JsonObject([
-				(KIND_FIELD, JsonString(TUPLE_FLOAT_ELEMENT_TAG)),
-				("value", core_expr_to_json(value)),
-			])
-		TupleFloat32Element(value):
-			JsonObject([
-				(KIND_FIELD, JsonString(TUPLE_FLOAT32_ELEMENT_TAG)),
-				("value", core_expr_to_json(value)),
-			])
-		TupleFloat16Element(value):
-			JsonObject([
-				(KIND_FIELD, JsonString(TUPLE_FLOAT16_ELEMENT_TAG)),
-				("value", core_expr_to_json(value)),
-			])
-
-
-pure func decode_core_tuple_element_json(
-	value: JsonValue,
-	path: String,
-) -> Result[CoreTupleElement, CoreJsonError]:
-	tag ?= kind_field(value, path)
-
-	if tag == TUPLE_PRIM_ELEMENT_TAG:
-		value_json ?= object_field(value, path, "value")
-		expr_value ?= decode_core_expr_json(
-			value_json,
-			path_field(path, "value"),
-		)
-		Ok(TuplePrimElement(expr_value))
-	else if tag == TUPLE_POINTER_ELEMENT_TAG:
-		value_json ?= object_field(value, path, "value")
-		expr_value ?= decode_core_expr_json(
-			value_json,
-			path_field(path, "value"),
-		)
-		Ok(TuplePointerElement(expr_value))
-	else if tag == TUPLE_STRUCT_ELEMENT_TAG:
-		value_json ?= object_field(value, path, "value")
-		expr_value ?= decode_core_expr_json(
-			value_json,
-			path_field(path, "value"),
-		)
-		c_type ?= string_field(value, path, "c_type")
-		Ok(TupleStructElement(expr_value, c_type))
-	else if tag == TUPLE_STACK_RESULT_ELEMENT_TAG:
-		value_json ?= object_field(value, path, "value")
-		expr_value ?= decode_core_expr_json(
-			value_json,
-			path_field(path, "value"),
-		)
-		Ok(TupleStackResultElement(expr_value))
-	else if tag == TUPLE_VOID_ELEMENT_TAG:
-		Ok(TupleVoidElement)
-	else if tag == TUPLE_FLOAT_ELEMENT_TAG:
-		value_json ?= object_field(value, path, "value")
-		expr_value ?= decode_core_expr_json(
-			value_json,
-			path_field(path, "value"),
-		)
-		Ok(TupleFloatElement(expr_value))
-	else if tag == TUPLE_FLOAT32_ELEMENT_TAG:
-		value_json ?= object_field(value, path, "value")
-		expr_value ?= decode_core_expr_json(
-			value_json,
-			path_field(path, "value"),
-		)
-		Ok(TupleFloat32Element(expr_value))
-	else if tag == TUPLE_FLOAT16_ELEMENT_TAG:
-		value_json ?= object_field(value, path, "value")
-		expr_value ?= decode_core_expr_json(
-			value_json,
-			path_field(path, "value"),
-		)
-		Ok(TupleFloat16Element(expr_value))
-	else:
-		Err(CoreUnsupportedTag(path, tag))
-
-
-private pure func decode_core_tuple_elements(
-	value: JsonValue,
-	path: String,
-	field_name: String,
-) -> Result[List[CoreTupleElement], CoreJsonError]:
-	items ?= array_field(value, path, field_name)
-	var result: List[CoreTupleElement] = []
-	var error: Option[CoreJsonError] = None
-	var index: Int = 0
-
-	for item in items:
-		match error:
-			Some(existing_error):
-				void
-			None:
-				match decode_core_tuple_element_json(
-					item,
-					path_index(
-						path_field(path, field_name),
-						index,
-					),
-				):
-					Ok(element):
-						result = result.append(element)
-					Err(err):
-						error = Some(err)
-
-		index += 1
-
-	match error:
-		Some(existing_error):
-			Err(existing_error)
-		None:
-			Ok(result)
-
-
-pure func core_tuple_construct_to_json(construct: CoreTupleConstruct) -> JsonValue:
-	JsonObject([
-		("elements", JsonVector(construct.elements.map(core_tuple_element_to_json))),
-		("release_mask", json_int(construct.release_mask)),
-		("retain_mask", json_int(construct.retain_mask)),
-	])
-
-
-pure func decode_core_tuple_construct_json(
-	value: JsonValue,
-	path: String,
-) -> Result[CoreTupleConstruct, CoreJsonError]:
-	elements ?= decode_core_tuple_elements(value, path, "elements")
-	release_mask ?= int_field(value, path, "release_mask")
-	retain_mask ?= int_field(value, path, "retain_mask")
-
-	Ok({
-		elements = elements,
-		release_mask = release_mask,
-		retain_mask = retain_mask,
-	})
-
-
 pure func core_box_kind_to_json(kind: CoreBoxKind) -> JsonValue:
 	match kind:
 		PrimBox:
@@ -8068,9 +9115,65 @@ private pure func decode_core_field_ordinal_json(
 	index ?= int_field(value, path, key)
 
 	if index < 0:
-		Err(CoreExpectedIntField(path, key))
+		Err(CoreNegativeFieldOrdinal(path, key))
 	else:
 		Ok(core_field_ordinal(index))
+
+
+private pure func core_product_build_to_json(build: CoreProductBuild) -> JsonValue:
+	JsonVector(product_build_fields(build).map(func(field): JsonObject([
+		("ordinal", core_field_ordinal_to_json(field.ordinal)),
+		("value", core_expr_to_json(field.value)),
+	])))
+
+
+---
+The build stored under "fields". Its type is not decoded yet, so the ordinals
+are checked against the number of values: each must name a distinct field
+below that count.
+---
+private pure func decode_core_product_build_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreProductBuild, CoreJsonError]:
+	items ?= array_field(value, path, "fields")
+	fields_path: String = path_field(path, "fields")
+	var fields: List[CoreProductFieldValue] = []
+	var error: Option[CoreJsonError] = None
+
+	for (index, item) in items.enumerate():
+		if error.is_some():
+			break
+
+		item_path: String = path_index(fields_path, index)
+
+		match decode_core_product_field_value_json(item, item_path):
+			Ok(field):
+				fields = fields.append(field)
+			Err(item_error):
+				error = Some(item_error)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			product_build(fields.length(), fields).map_err(func(build_error):
+				CoreInvalidProductBuild(fields_path, build_error)
+			)
+
+
+private pure func decode_core_product_field_value_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreProductFieldValue, CoreJsonError]:
+	ordinal ?= decode_core_field_ordinal_json(value, path, "ordinal")
+	value_json ?= object_field(value, path, "value")
+	expr_value ?= decode_core_expr_json(value_json, path_field(path, "value"))
+
+	Ok({
+		ordinal = ordinal,
+		value = expr_value,
+	})
 
 
 pure func core_field_ref_to_json(ref: CoreFieldRef) -> JsonValue:
@@ -9011,9 +10114,35 @@ pure func decode_core_for_string_json(
 	})
 
 
+-- Stable wire tags carry the syntax-issued iteration fact across Core replay.
+private DICT_ITERATION_KEYS_TAG: String = "keys"
+private DICT_ITERATION_ENTRIES_TAG: String = "entries"
+
+
+pure func core_dict_iteration_mode_to_string(mode: CoreDictIterationMode) -> String:
+	match mode:
+		CoreDictIterationKeys:
+			DICT_ITERATION_KEYS_TAG
+		CoreDictIterationEntries:
+			DICT_ITERATION_ENTRIES_TAG
+
+
+private pure func parse_core_dict_iteration_mode(
+	tag: String,
+	path: String,
+) -> Result[CoreDictIterationMode, CoreJsonError]:
+	if tag == DICT_ITERATION_KEYS_TAG:
+		Ok(CoreDictIterationKeys)
+	else if tag == DICT_ITERATION_ENTRIES_TAG:
+		Ok(CoreDictIterationEntries)
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
 pure func core_for_dict_to_json(for_dict: CoreForDict) -> JsonValue:
 	JsonObject([
 		("binder", core_loop_binder_to_json(for_dict.binder)),
+		("iteration_mode", JsonString(core_dict_iteration_mode_to_string(for_dict.iteration_mode))),
 		("iterable", core_expr_to_json(for_dict.iterable)),
 		(
 			"iterable_release_policy",
@@ -9032,6 +10161,8 @@ pure func decode_core_for_dict_json(
 		binder_json,
 		path_field(path, "binder"),
 	)
+	mode_tag ?= string_field(value, path, "iteration_mode")
+	iteration_mode ?= parse_core_dict_iteration_mode(mode_tag, path_field(path, "iteration_mode"))
 	iterable_json ?= object_field(value, path, "iterable")
 	iterable ?= decode_core_expr_json(
 		iterable_json,
@@ -9050,6 +10181,7 @@ pure func decode_core_for_dict_json(
 
 	Ok({
 		binder = binder,
+		iteration_mode = iteration_mode,
 		iterable = iterable,
 		iterable_release_policy = iterable_release_policy,
 		body = body,
@@ -10495,10 +11627,11 @@ pure func core_accessor_to_json(accessor: CoreAccessor) -> JsonValue:
 				(KIND_FIELD, JsonString(BOXED_RESULT_ERR_PAYLOAD_ACCESSOR_TAG)),
 				("parent", core_accessor_to_json(parent)),
 			])
-		ProductFieldAccessor(parent, ordinal, typ):
+		ProductFieldAccessor(parent, receiver_type, ordinal, typ):
 			JsonObject([
 				(KIND_FIELD, JsonString(PRODUCT_FIELD_ACCESSOR_TAG)),
 				("parent", core_accessor_to_json(parent)),
+				("receiver_type", core_type_to_json(receiver_type)),
 				("ordinal", core_field_ordinal_to_json(ordinal)),
 				("type", core_type_to_json(typ)),
 			])
@@ -10622,7 +11755,10 @@ pure func decode_core_accessor_json(
 			type_json,
 			path_field(path, "type"),
 		)
-		Ok(ProductFieldAccessor(parent, ordinal, typ))
+		receiver_json ?= object_field(value, path, "receiver_type")
+		receiver_type ?= decode_core_type_json(receiver_json, path_field(path, "receiver_type"))
+
+		Ok(ProductFieldAccessor(parent, receiver_type, ordinal, typ))
 	else if tag == LIST_ELEMENT_ACCESSOR_TAG:
 		parent_json ?= object_field(value, path, "parent")
 		parent ?= decode_core_accessor_json(
@@ -11653,19 +12789,6 @@ private pure func core_expr_tuple_to_json(
 	])
 
 
-private pure func core_expr_tuple_construct_to_json(
-	tuple_construct: CoreTupleConstruct,
-	typ: CoreType,
-	loc: CoreSourceLoc,
-) -> JsonValue:
-	JsonObject([
-		(KIND_FIELD, JsonString(TUPLE_CONSTRUCT_EXPR_TAG)),
-		("construct", core_tuple_construct_to_json(tuple_construct)),
-		("type", core_type_to_json(typ)),
-		("loc", source_loc_to_json(loc)),
-	])
-
-
 private pure func core_expr_vector_to_json(
 	items: List[CoreExpr],
 	typ: CoreType,
@@ -12019,14 +13142,14 @@ private pure func core_expr_list_swap_to_json(
 	])
 
 
-private pure func core_expr_record_to_json(
-	fields: List[CoreRecordFieldValue],
+private pure func core_expr_product_to_json(
+	build: CoreProductBuild,
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> JsonValue:
 	JsonObject([
-		(KIND_FIELD, JsonString(RECORD_EXPR_TAG)),
-		("fields", core_record_fields_to_json(fields)),
+		(KIND_FIELD, JsonString(PRODUCT_EXPR_TAG)),
+		("fields", core_product_build_to_json(build)),
 		("type", core_type_to_json(typ)),
 		("loc", source_loc_to_json(loc)),
 	])
@@ -12049,14 +13172,14 @@ private pure func core_expr_record_update_to_json(
 
 private pure func core_expr_record_reuse_to_json(
 	source: CoreExpr,
-	fields: List[CoreRecordFieldValue],
+	build: CoreProductBuild,
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> JsonValue:
 	JsonObject([
 		(KIND_FIELD, JsonString(RECORD_REUSE_EXPR_TAG)),
 		("source", core_expr_to_json(source)),
-		("fields", core_record_fields_to_json(fields)),
+		("fields", core_product_build_to_json(build)),
 		("type", core_type_to_json(typ)),
 		("loc", source_loc_to_json(loc)),
 	])
@@ -12072,21 +13195,6 @@ private pure func core_expr_record_cow_update_to_json(
 		(KIND_FIELD, JsonString(RECORD_COW_UPDATE_EXPR_TAG)),
 		("source", core_expr_to_json(source)),
 		("fields", JsonVector(fields.map(core_record_cow_field_to_json))),
-		("type", core_type_to_json(typ)),
-		("loc", source_loc_to_json(loc)),
-	])
-
-
-private pure func core_expr_record_construct_to_json(
-	type_name: String,
-	fields: List[CoreRecordFieldValue],
-	typ: CoreType,
-	loc: CoreSourceLoc,
-) -> JsonValue:
-	JsonObject([
-		(KIND_FIELD, JsonString(RECORD_CONSTRUCT_EXPR_TAG)),
-		("type_name", JsonString(type_name)),
-		("fields", core_record_fields_to_json(fields)),
 		("type", core_type_to_json(typ)),
 		("loc", source_loc_to_json(loc)),
 	])
@@ -12625,7 +13733,7 @@ pure func core_semantic_match_accessor_to_json(accessor: CoreSemanticMatchAccess
 			])
 		ProductFieldSemanticMatchAccessor(parent, ordinal):
 			JsonObject([
-				(KIND_FIELD, JsonString(PRODUCT_FIELD_ACCESSOR_TAG)),
+				(KIND_FIELD, JsonString(PRODUCT_FIELD_SEMANTIC_ACCESSOR_TAG)),
 				("parent", core_semantic_match_accessor_to_json(parent)),
 				("ordinal", core_field_ordinal_to_json(ordinal)),
 			])
@@ -12889,8 +13997,6 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 			])
 		TupleExpr(items, typ, loc):
 			core_expr_tuple_to_json(items, typ, loc)
-		TupleConstructExpr(tuple_construct, typ, loc):
-			core_expr_tuple_construct_to_json(tuple_construct, typ, loc)
 		VectorExpr(items, typ, loc):
 			core_expr_vector_to_json(items, typ, loc)
 		LambdaExpr(params, return_type, body, is_pure, typ, loc):
@@ -12943,16 +14049,14 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 			core_expr_list_set_to_json(set, typ, loc)
 		ListSwapExpr(swap, typ, loc):
 			core_expr_list_swap_to_json(swap, typ, loc)
-		RecordExpr(fields, typ, loc):
-			core_expr_record_to_json(fields, typ, loc)
+		ProductExpr(build, typ, loc):
+			core_expr_product_to_json(build, typ, loc)
 		RecordUpdateExpr(base, fields, typ, loc):
 			core_expr_record_update_to_json(base, fields, typ, loc)
-		RecordReuseExpr(source, fields, typ, loc):
-			core_expr_record_reuse_to_json(source, fields, typ, loc)
+		RecordReuseExpr(source, build, typ, loc):
+			core_expr_record_reuse_to_json(source, build, typ, loc)
 		RecordCowUpdateExpr(source, fields, typ, loc):
 			core_expr_record_cow_update_to_json(source, fields, typ, loc)
-		RecordConstructExpr(type_name, fields, typ, loc):
-			core_expr_record_construct_to_json(type_name, fields, typ, loc)
 		UnionConstructExpr(construct, typ, loc):
 			core_expr_union_construct_to_json(construct, typ, loc)
 		UnionReuseConstructExpr(construct, typ, loc):
@@ -13486,28 +14590,6 @@ private pure func decode_core_expr_tuple_from_json(
 		path_field(path, "loc"),
 	)
 	Ok(TupleExpr(items, typ, loc))
-
-
-private pure func decode_core_expr_tuple_construct_from_json(
-	value: JsonValue,
-	path: String,
-) -> Result[CoreExpr, CoreJsonError]:
-	construct_json ?= object_field(value, path, "construct")
-	tuple_construct ?= decode_core_tuple_construct_json(
-		construct_json,
-		path_field(path, "construct"),
-	)
-	type_json ?= object_field(value, path, "type")
-	typ ?= decode_core_type_json(
-		type_json,
-		path_field(path, "type"),
-	)
-	loc_json ?= required_field(value, path, "loc")
-	loc ?= decode_source_loc_json(
-		loc_json,
-		path_field(path, "loc"),
-	)
-	Ok(TupleConstructExpr(tuple_construct, typ, loc))
 
 
 private pure func decode_core_expr_vector_from_json(
@@ -14142,11 +15224,11 @@ private pure func decode_core_expr_list_swap_from_json(
 	Ok(ListSwapExpr(swap, typ, loc))
 
 
-private pure func decode_core_expr_record_from_json(
+private pure func decode_core_expr_product_from_json(
 	value: JsonValue,
 	path: String,
 ) -> Result[CoreExpr, CoreJsonError]:
-	fields ?= decode_core_record_fields(value, path, "fields")
+	build ?= decode_core_product_build_json(value, path)
 	type_json ?= object_field(value, path, "type")
 	typ ?= decode_core_type_json(
 		type_json,
@@ -14157,7 +15239,7 @@ private pure func decode_core_expr_record_from_json(
 		loc_json,
 		path_field(path, "loc"),
 	)
-	Ok(RecordExpr(fields, typ, loc))
+	Ok(ProductExpr(build, typ, loc))
 
 
 private pure func decode_core_expr_record_update_from_json(
@@ -14240,7 +15322,7 @@ private pure func decode_core_expr_record_reuse_from_json(
 		source_json,
 		path_field(path, "source"),
 	)
-	fields ?= decode_core_record_fields(value, path, "fields")
+	build ?= decode_core_product_build_json(value, path)
 	type_json ?= object_field(value, path, "type")
 	typ ?= decode_core_type_json(
 		type_json,
@@ -14259,7 +15341,7 @@ private pure func decode_core_expr_record_reuse_from_json(
 					match source_type:
 						HeapRecordType(source_name):
 							if source_name == result_name:
-								Ok(RecordReuseExpr(source, fields, typ, loc))
+								Ok(RecordReuseExpr(source, build, typ, loc))
 							else:
 								Err(
 									CoreInvalidRecordUpdateShape(
@@ -14337,25 +15419,6 @@ private pure func decode_core_expr_record_cow_update_from_json(
 					)
 		_:
 			Err(CoreExpectedVariableExpr(path_field(path, "source")))
-
-
-private pure func decode_core_expr_record_construct_from_json(
-	value: JsonValue,
-	path: String,
-) -> Result[CoreExpr, CoreJsonError]:
-	type_name ?= string_field(value, path, "type_name")
-	fields ?= decode_core_record_fields(value, path, "fields")
-	type_json ?= object_field(value, path, "type")
-	typ ?= decode_core_type_json(
-		type_json,
-		path_field(path, "type"),
-	)
-	loc_json ?= required_field(value, path, "loc")
-	loc ?= decode_source_loc_json(
-		loc_json,
-		path_field(path, "loc"),
-	)
-	Ok(RecordConstructExpr(type_name, fields, typ, loc))
 
 
 private pure func decode_core_expr_union_construct_from_json(
@@ -15270,7 +16333,7 @@ pure func decode_core_semantic_match_accessor_json(
 		constructor ?= string_field(value, path, "constructor")
 		field_index ?= int_field(value, path, "field_index")
 		Ok(VariantFieldSemanticMatchAccessor(parent, constructor, field_index))
-	else if tag == PRODUCT_FIELD_ACCESSOR_TAG:
+	else if tag == PRODUCT_FIELD_SEMANTIC_ACCESSOR_TAG:
 		parent ?= decode_core_semantic_match_accessor_parent(value, path)
 		ordinal ?= decode_core_field_ordinal_json(value, path, "ordinal")
 		Ok(ProductFieldSemanticMatchAccessor(parent, ordinal))
@@ -15726,8 +16789,6 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 		decode_core_expr_module_member_from_json(value, path)
 	else if tag == TUPLE_EXPR_TAG:
 		decode_core_expr_tuple_from_json(value, path)
-	else if tag == TUPLE_CONSTRUCT_EXPR_TAG:
-		decode_core_expr_tuple_construct_from_json(value, path)
 	else if tag == VECTOR_EXPR_TAG:
 		decode_core_expr_vector_from_json(value, path)
 	else if tag == LAMBDA_EXPR_TAG:
@@ -15780,16 +16841,14 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 		decode_core_expr_list_set_from_json(value, path)
 	else if tag == LIST_SWAP_EXPR_TAG:
 		decode_core_expr_list_swap_from_json(value, path)
-	else if tag == RECORD_EXPR_TAG:
-		decode_core_expr_record_from_json(value, path)
+	else if tag == PRODUCT_EXPR_TAG:
+		decode_core_expr_product_from_json(value, path)
 	else if tag == RECORD_UPDATE_EXPR_TAG:
 		decode_core_expr_record_update_from_json(value, path)
 	else if tag == RECORD_REUSE_EXPR_TAG:
 		decode_core_expr_record_reuse_from_json(value, path)
 	else if tag == RECORD_COW_UPDATE_EXPR_TAG:
 		decode_core_expr_record_cow_update_from_json(value, path)
-	else if tag == RECORD_CONSTRUCT_EXPR_TAG:
-		decode_core_expr_record_construct_from_json(value, path)
 	else if tag == UNION_CONSTRUCT_EXPR_TAG:
 		decode_core_expr_union_construct_from_json(value, path)
 	else if tag == UNION_REUSE_CONSTRUCT_EXPR_TAG:
@@ -17293,6 +18352,28 @@ private pure func decode_core_inline_record_field_json(
 	})
 
 
+pure func core_generated_tuple_record_decl_to_json(row: CoreGeneratedTupleRecordDecl) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(GENERATED_TUPLE_RECORD_DECL_TAG)),
+		("name", JsonString(core_generated_tuple_record_name(row))),
+		("element_types", core_type_list_to_json(core_generated_tuple_record_elements(row))),
+		("loc", source_loc_to_json(core_generated_tuple_record_location(row))),
+	])
+
+
+private pure func decode_core_generated_tuple_record_decl_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreGeneratedTupleRecordDecl, CoreJsonError]:
+	name ?= string_field(value, path, "name")
+	element_types ?= decode_core_type_list(value, path, "element_types")
+	loc_value ?= required_field(value, path, "loc")
+	loc ?= decode_source_loc_json(loc_value, path_field(path, "loc"))
+	core_generated_tuple_record_decl(name, element_types, loc).map_err(func(fault):
+		CoreInvalidTupleStorage(path, core_tuple_storage_fault_message(InvalidGeneratedTupleRow(fault)))
+	)
+
+
 pure func core_inline_record_decl_to_json(record_decl: CoreInlineRecordDecl) -> JsonValue:
 	JsonObject([
 		(KIND_FIELD, JsonString(INLINE_RECORD_DECL_TAG)),
@@ -17587,6 +18668,8 @@ pure func core_decl_to_json(decl: CoreDecl) -> JsonValue:
 			core_heap_record_decl_to_json(record_decl)
 		InlineRecordDecl(record_decl):
 			core_inline_record_decl_to_json(record_decl)
+		GeneratedTupleRecordDecl(row):
+			core_generated_tuple_record_decl_to_json(row)
 		TypeAliasDecl(alias_decl):
 			core_type_alias_decl_to_json(alias_decl)
 		TraitDecl(trait_decl):
@@ -17613,6 +18696,9 @@ pure func decode_core_decl_json(value: JsonValue, path: String) -> Result[CoreDe
 	else if tag == INLINE_RECORD_DECL_TAG:
 		record_decl ?= decode_core_inline_record_decl_json(value, path)
 		Ok(InlineRecordDecl(record_decl))
+	else if tag == GENERATED_TUPLE_RECORD_DECL_TAG:
+		row ?= decode_core_generated_tuple_record_decl_json(value, path)
+		Ok(GeneratedTupleRecordDecl(row))
 	else if tag == TYPE_ALIAS_DECL_TAG:
 		alias_decl ?= decode_core_type_alias_decl_json(value, path)
 		Ok(TypeAliasDecl(alias_decl))
@@ -17675,9 +18761,10 @@ pure func core_program_to_json(program: CoreProgram) -> JsonValue:
 private union CoreJsonRecordShape:
 	ManagedJsonRecordShape(CoreHeapRecordDecl)
 	InlineJsonRecordShape(CoreInlineRecordDecl)
+	GeneratedJsonTupleShape(CoreGeneratedTupleRecordDecl, CoreTupleStorageCatalog)
 
 
-private pure func core_json_record_shapes(decls: List[CoreDecl]) -> List[CoreJsonRecordShape]:
+private pure func core_json_record_shapes(decls: List[CoreDecl], catalog: CoreTupleStorageCatalog) -> List[CoreJsonRecordShape]:
 	var shapes: List[CoreJsonRecordShape] = []
 	for decl in decls:
 		match decl:
@@ -17685,6 +18772,8 @@ private pure func core_json_record_shapes(decls: List[CoreDecl]) -> List[CoreJso
 				shapes = shapes.append(ManagedJsonRecordShape(record_decl))
 			InlineRecordDecl(record_decl):
 				shapes = shapes.append(InlineJsonRecordShape(record_decl))
+			GeneratedTupleRecordDecl(row):
+				shapes = shapes.append(GeneratedJsonTupleShape(row, catalog))
 			_:
 				void
 	shapes
@@ -17725,42 +18814,8 @@ private pure func record_shape_matches(
 			declaration.name == record_name
 		InlineJsonRecordShape(declaration):
 			declaration.name == record_name
-
-
-private pure func record_update_field_names(
-	value: JsonValue,
-	path: String,
-) -> Result[List[String], CoreJsonError]:
-	field_values ?= array_field(value, path, "fields")
-	var names: List[String] = []
-	var error: Option[CoreJsonError] = None
-	var index: Int = 0
-
-	for field_value in field_values:
-		match error:
-			Some(_):
-				void
-			None:
-				match string_field(
-					field_value,
-					path_index(
-						path_field(path, "fields"),
-						index,
-					),
-					"name",
-				):
-					Ok(name):
-						names = names.append(name)
-					Err(field_error):
-						error = Some(field_error)
-
-		index += 1
-
-	match error:
-		Some(field_error):
-			Err(field_error)
-		None:
-			Ok(names)
+		GeneratedJsonTupleShape(row, _):
+			core_generated_tuple_record_name(row) == record_name
 
 
 -- Check authored sparse rows against declaration fields, with no shape
@@ -17815,14 +18870,28 @@ private pure func validate_record_update_json_shape(
 	else:
 		record_name ?= string_field(type_value, type_path, "name")
 		fields ?= decode_core_record_fields(value, path, "fields")
-		match (type_tag, shapes.find(func(shape): record_shape_matches(shape, record_name))):
-			(HEAP_RECORD_TYPE_TAG, Some(ManagedJsonRecordShape(declaration))):
-				validate_record_replacements_json(
-					fields, declaration.fields.map(func(field): { name = field.name, ref = field.ref, typ = field.typ }), record_name, path,
-				)
-			(INLINE_RECORD_TYPE_TAG, Some(InlineJsonRecordShape(declaration))):
-				validate_record_replacements_json(fields, declaration.fields, record_name, path)
-			_:
+		match shapes.find(func(shape): record_shape_matches(shape, record_name)):
+			Some(shape):
+				-- Match one constructor at a time for the pinned bootstrap.
+				match shape:
+					ManagedJsonRecordShape(declaration):
+						if type_tag == HEAP_RECORD_TYPE_TAG:
+							validate_record_replacements_json(
+								fields,
+								declaration.fields.map(func(field): { name = field.name, ref = field.ref, typ = field.typ }),
+								record_name,
+								path,
+							)
+						else:
+							Err(CoreInvalidRecordUpdateShape(type_path, "record update type `${record_name}` has no matching record declaration"))
+					InlineJsonRecordShape(declaration):
+						if type_tag == INLINE_RECORD_TYPE_TAG:
+							validate_record_replacements_json(fields, declaration.fields, record_name, path)
+						else:
+							Err(CoreInvalidRecordUpdateShape(type_path, "record update type `${record_name}` has no matching record declaration"))
+					GeneratedJsonTupleShape(_, _):
+						Err(CoreInvalidRecordUpdateShape(type_path, "record updates require authored record field identities"))
+			None:
 				Err(CoreInvalidRecordUpdateShape(type_path, "record update type `${record_name}` has no matching record declaration"))
 
 
@@ -17839,15 +18908,168 @@ private pure func validate_record_reuse_json_shape(
 		Err(CoreInvalidRecordUpdateShape(type_path, "record reuse type must be a heap record"))
 	else:
 		record_name ?= string_field(type_value, type_path, "name")
-		actual_names ?= record_update_field_names(value, path)
+
 		match shapes.find(func(shape): record_shape_matches(shape, record_name)):
-			Some(ManagedJsonRecordShape(declaration)):
-				if string_lists_equal(actual_names, declaration.fields.map(func(field): field.name)):
-					Ok(void)
-				else:
-					Err(CoreInvalidRecordUpdateShape(path_field(path, "fields"), "record reuse for `${record_name}` must contain every declared field exactly once in declaration order"))
-			_:
+			Some(shape):
+				match shape:
+					ManagedJsonRecordShape(_):
+						validate_product_build_field_count(value, path, shape)
+					GeneratedJsonTupleShape(row, catalog):
+						validate_generated_product_build_json(value, path, row, catalog)
+					InlineJsonRecordShape(_):
+						Err(CoreInvalidRecordUpdateShape(type_path, "record reuse type `${record_name}` has no matching heap-record declaration"))
+			None:
 				Err(CoreInvalidRecordUpdateShape(type_path, "record reuse type `${record_name}` has no matching heap-record declaration"))
+
+
+---
+Decoding a build checks that its ordinals name distinct fields below the
+number of values; this checks that the number is the field count of the
+record the build's type names, so a decoded build has a value for every
+field. A build typed before layout names its records (a `NamedType`) has no
+declaration to compare with yet; a heap or inline record type must name one.
+---
+private pure func validate_product_build_json_shape(
+	value: JsonValue,
+	path: String,
+	shapes: List[CoreJsonRecordShape],
+) -> Result[Void, CoreJsonError]:
+	type_value ?= object_field(value, path, "type")
+	type_path: String = path_field(path, "type")
+	type_tag ?= kind_field(type_value, type_path)
+
+	if type_tag != HEAP_RECORD_TYPE_TAG and type_tag != INLINE_RECORD_TYPE_TAG:
+		Ok(void)
+	else:
+		record_name ?= string_field(type_value, type_path, "name")
+
+		match shapes.find(func(shape): record_shape_matches(shape, record_name)):
+			Some(shape):
+				match shape:
+					ManagedJsonRecordShape(_):
+						if type_tag == HEAP_RECORD_TYPE_TAG:
+							validate_product_build_field_count(value, path, shape)
+						else:
+							Err(CoreInvalidRecordUpdateShape(type_path, "product type `${record_name}` has no matching record declaration"))
+					InlineJsonRecordShape(_):
+						if type_tag == INLINE_RECORD_TYPE_TAG:
+							validate_product_build_field_count(value, path, shape)
+						else:
+							Err(CoreInvalidRecordUpdateShape(type_path, "product type `${record_name}` has no matching record declaration"))
+					GeneratedJsonTupleShape(row, catalog):
+						if type_tag == HEAP_RECORD_TYPE_TAG:
+							validate_generated_product_build_json(value, path, row, catalog)
+						else:
+							Err(CoreInvalidTupleStorage(type_path, "generated tuple storage is a managed record"))
+			None:
+				Err(CoreInvalidRecordUpdateShape(type_path, "product type `${record_name}` has no matching record declaration"))
+
+
+private pure func validate_product_build_field_count(
+	value: JsonValue,
+	path: String,
+	shape: CoreJsonRecordShape,
+) -> Result[Void, CoreJsonError]:
+	field_values ?= array_field(value, path, "fields")
+	field_count: Int = match shape:
+		ManagedJsonRecordShape(declaration):
+			declaration.fields.length()
+		InlineJsonRecordShape(declaration):
+			declaration.fields.length()
+		GeneratedJsonTupleShape(row, _):
+			core_generated_tuple_record_elements(row).length()
+
+	if field_values.length() < field_count:
+		Err(
+			CoreInvalidProductBuild(
+				path_field(path, "fields"),
+				ProductBuildOrdinalMissing(field_values.length()),
+			),
+		)
+	else if field_values.length() > field_count:
+		Err(
+			CoreInvalidProductBuild(
+				path_field(path, "fields"),
+				ProductBuildOrdinalOutOfRange(field_count),
+			),
+		)
+	else:
+		Ok(void)
+
+
+private pure func validate_generated_product_build_json(
+	value: JsonValue,
+	path: String,
+	row: CoreGeneratedTupleRecordDecl,
+	catalog: CoreTupleStorageCatalog,
+) -> Result[Void, CoreJsonError]:
+	count_valid ?= validate_product_build_field_count(value, path, GeneratedJsonTupleShape(row, catalog))
+	build ?= decode_core_product_build_json(value, path)
+	var failure: Option[CoreJsonError] = None
+
+	for (index, field) in product_build_fields(build).enumerate():
+		if failure.is_none():
+			field_path = path_field(path_index(path_field(path, "fields"), index), "value")
+			match core_generated_tuple_record_elements(row).get(core_field_ordinal_index(field.ordinal)):
+				Some(logical_type):
+					match tuple_storage_type(catalog, logical_type):
+						Ok(physical_type):
+							if not core_type_equal(core_expr_type(field.value), physical_type):
+								failure = Some(CoreInvalidTupleStorage(field_path, "generated product field must have its registered physical type"))
+						Err(fault):
+							failure = Some(CoreInvalidTupleStorage(field_path, core_tuple_storage_fault_message(fault)))
+				None:
+					failure = Some(CoreInvalidProductBuild(field_path, ProductBuildOrdinalOutOfRange(core_field_ordinal_index(field.ordinal))))
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+
+private pure func validate_product_accessor_json(
+	value: JsonValue,
+	path: String,
+	shapes: List[CoreJsonRecordShape],
+) -> Result[Void, CoreJsonError]:
+	accessor ?= decode_core_accessor_json(value, path)
+	match accessor:
+		ProductFieldAccessor(_, receiver_type, ordinal, field_type):
+			match receiver_type:
+				TupleType(elements):
+					match elements.get(core_field_ordinal_index(ordinal)):
+						Some(expected_type):
+							if core_type_equal(field_type, expected_type):
+								Ok(void)
+							else:
+								Err(CoreInvalidTupleStorage(path_field(path, "type"), "product accessor must have its receiver's selected field type"))
+						None:
+							Err(CoreInvalidTupleStorage(path_field(path, "ordinal"), "product accessor ordinal must belong to its receiver"))
+				HeapRecordType(name):
+					match shapes.find(func(shape): record_shape_matches(shape, name)):
+						Some(shape):
+							match shape:
+								GeneratedJsonTupleShape(row, catalog):
+									match core_generated_tuple_record_elements(row).get(core_field_ordinal_index(ordinal)):
+										Some(logical_type):
+											expected_type ?= tuple_storage_type(catalog, logical_type).map_err(func(fault):
+												CoreInvalidTupleStorage(path, core_tuple_storage_fault_message(fault))
+											)
+											if core_type_equal(field_type, expected_type):
+												Ok(void)
+											else:
+												Err(CoreInvalidTupleStorage(path_field(path, "type"), "product accessor must have its registered physical field type"))
+										None:
+											Err(CoreInvalidTupleStorage(path_field(path, "ordinal"), "product accessor ordinal must belong to its receiver"))
+								_:
+									Err(CoreInvalidTupleStorage(path_field(path, "receiver_type"), "tuple-pattern projection requires a generated tuple row"))
+						None:
+							Err(CoreInvalidTupleStorage(path_field(path, "receiver_type"), "product accessor receiver has no registered tuple row"))
+				_:
+					Err(CoreInvalidTupleStorage(path_field(path, "receiver_type"), "product accessor receiver must be a tuple product"))
+		_:
+			Ok(void)
 
 
 private pure func validate_record_cow_update_json_shape(
@@ -18016,10 +19238,14 @@ private pure func validate_core_json_tree(
 				Some(kind):
 					if kind == RECORD_UPDATE_EXPR_TAG:
 						validate_record_update_json_shape(value, path, shapes)
+					else if kind == PRODUCT_EXPR_TAG:
+						validate_product_build_json_shape(value, path, shapes)
 					else if kind == RECORD_REUSE_EXPR_TAG:
 						validate_record_reuse_json_shape(value, path, shapes)
 					else if kind == RECORD_COW_UPDATE_EXPR_TAG:
 						validate_record_cow_update_json_shape(value, path, shapes)
+					else if kind == PRODUCT_FIELD_ACCESSOR_TAG:
+						validate_product_accessor_json(value, path, shapes)
 					else if kind == UNION_TYPE_TAG:
 						validate_union_type_storage_json(value, path, storage_by_name)
 					else:
@@ -18106,21 +19332,24 @@ pure func decode_core_program_json(raw_value: JsonValue) -> Result[CoreProgram, 
 					)
 				_:
 					void
-
-		core_shapes_valid ?= validate_core_json_tree(
-			value,
-			path,
-			core_json_record_shapes(decls),
-			storage_by_name,
-		)
-		Ok({
+		program: CoreProgram = {
 			decls = decls,
 			foreign_includes = foreign_includes,
 			source_files = folded.state.files.map(func(p): {
 					path = p,
 					module_name = p
 				}),
-		})
+		}
+		catalog ?= tuple_storage_catalog(program).map_err(func(fault):
+			CoreInvalidTupleStorage(path, core_tuple_storage_fault_message(fault))
+		)
+		core_shapes_valid ?= validate_core_json_tree(
+			value,
+			path,
+			core_json_record_shapes(decls, catalog),
+			storage_by_name,
+		)
+		Ok(program)
 
 
 pure func core_json_error_to_string(error: CoreJsonError) -> String:
@@ -18135,12 +19364,24 @@ pure func core_json_error_to_string(error: CoreJsonError) -> String:
 			"Core JSON value at ${path} must be a variable expression"
 		CoreInvalidRecordUpdateShape(path, detail):
 			"invalid Core record update at ${path}: ${detail}"
+		CoreInvalidTupleStorage(path, detail):
+			"invalid Core tuple storage at ${path}: ${detail}"
 		CoreExpectedObjectField(path, field_name):
 			"Core JSON field at ${path} must be an object: ${field_name}"
 		CoreExpectedStringField(path, field_name):
 			"Core JSON field at ${path} must be a string: ${field_name}"
 		CoreExpectedIntField(path, field_name):
 			"Core JSON field at ${path} must be an integer: ${field_name}"
+		CoreNegativeFieldOrdinal(path, field_name):
+			"Core JSON field ordinal at ${path} must not be negative: ${field_name}"
+		CoreInvalidProductBuild(path, build_error):
+			match build_error:
+				ProductBuildOrdinalOutOfRange(ordinal):
+					"Core product build at ${path} stores a value at ordinal ${ordinal.to_string()}, past its fields"
+				ProductBuildOrdinalRepeated(ordinal):
+					"Core product build at ${path} stores more than one value at ordinal ${ordinal.to_string()}"
+				ProductBuildOrdinalMissing(ordinal):
+					"Core product build at ${path} has no value for ordinal ${ordinal.to_string()}"
 		CoreExpectedNumberField(path, field_name):
 			"Core JSON field at ${path} must be a number: ${field_name}"
 		CoreExpectedBoolField(path, field_name):

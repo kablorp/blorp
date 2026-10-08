@@ -1,0 +1,759 @@
+import:
+	../test_support_core_product_build: fixture_build
+	../../../src/compiler/stage_09_core/function_origin_fixture:
+		FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN,
+	../../../src/compiler/stage_09_core/ir:
+		CoreBinderOrigin(AuthoredBinder, PassTemporary),
+		CoreDecl(FunctionDecl, GlobalDecl),
+		CoreExpr(AssignExpr, BorrowLetExpr, CallExpr, IfExpr, LambdaExpr, LetExpr, ListConstructExpr, LiteralExpr, ProductFieldExpr, ProductExpr, RecordReuseExpr, SeqExpr, TensorBoxedLiteralExpr, TensorLiteralExpr, TensorPackedLiteralExpr, VarExpr, VectorExpr),
+		CoreCallKind(UserCall),
+		CoreBoxKind(PointerBox, PrimBox),
+		CoreBoxedStorageValue,
+		CoreListStorageLayout(InlineListStorage, PointerListStorage),
+		CoreTensorBoxedLiteral,
+		CoreTensorLiteralShape(TensorStaticShape, TensorVectorLength),
+		CoreTensorLiteralPayload(TensorInlineStructLiteralPayload, TensorRawLiteralPayload),
+		CoreTensorDim(TensorStaticDim),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreGlobal,
+		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreProgram,
+		CoreType(FunctionType, HeapRecordType, InlineRecordType, NamedType, TensorType),
+		CoreVar,
+		PassTempKind(ProductFieldTemp, ProductReuseSourceTemp, TensorElementTemp, ListElementTemp),
+		core_field_ordinal_index,
+		core_field_ordinal,
+		core_expr_type,
+		core_type_equal,
+		core_var_equal,
+		product_build_values,
+		product_build_ordinals,
+		product_build_in_declared_order,
+		synthetic_core_source_loc,
+	../../../src/compiler/stage_09_core/product_evaluation:
+		normalize_product_evaluation, product_evaluation_is_literal_global,
+	../../../src/compiler/stage_09_core/pipeline:
+		PRODUCT_EVALUATION_PASS, fused_late_core_passes, late_core_passes, prepare_perceus_input,
+	memory: same_object
+	test: TestSuite
+
+
+private pure func integer(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), NamedType("Int", []), synthetic_core_source_loc())
+
+
+private pure func variable(name: String, id: Int) -> CoreVar:
+	{ name = name, id = id, def_id = None, origin = AuthoredBinder }
+
+
+private pure func typed_field_call(name: String, typ: CoreType) -> CoreExpr:
+	CallExpr(
+		UserCall(name, None, []),
+		VarExpr(variable(name, 0), FunctionType(True, [], typ), synthetic_core_source_loc()),
+		[],
+		typ,
+		synthetic_core_source_loc(),
+	)
+
+
+private pure func field_call(name: String) -> CoreExpr:
+	typed_field_call(name, NamedType("Int", []))
+
+
+private pure func function(body: CoreExpr) -> CoreFunction:
+	{
+		name = "product_values",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = core_expr_type(body),
+		body = Some(body),
+		is_pure = False,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = 1,
+		loc = synthetic_core_source_loc()
+	}
+
+
+private pure func program(body: CoreExpr) -> CoreProgram:
+	{ decls = [FunctionDecl(function(body))], foreign_includes = [], source_files = [] }
+
+
+private pure func body_of(program: CoreProgram) -> Option[CoreExpr]:
+	match program.decls:
+		[FunctionDecl(function)]: function.body
+		_: None
+
+
+pure func test_fields_bind_in_written_order_and_keep_ordinals() -> Bool:
+	first = field_call("first_written")
+	second = field_call("second_written")
+	body = ProductExpr(fixture_build(2, [(1, first), (0, second)]), HeapRecordType("Payload"), synthetic_core_source_loc())
+	normalized = normalize_product_evaluation(program(body), -7)
+
+	match body_of(normalized.program):
+		Some(LetExpr(first_var, False, _, first_rhs, LetExpr(second_var, False, _, second_rhs, ProductExpr(build, _, _)))):
+			match product_build_values(build):
+				[VarExpr(first_use, _, _), VarExpr(second_use, _, _)]:
+					(
+						normalized.ids_used == 2
+						and first_var.id == -7
+						and second_var.id == -8
+						and first_var.name != second_var.name
+						and same_object(first_rhs, first)
+						and same_object(second_rhs, second)
+						and core_var_equal(first_var, first_use)
+						and core_var_equal(second_var, second_use)
+						and product_build_ordinals(build).map(core_field_ordinal_index) == [1, 0]
+					)
+				_: False
+		_: False
+
+
+pure func test_variable_field_is_snapshotted_before_later_evaluation() -> Bool:
+	read = VarExpr(variable("global_rows", 2), NamedType("List", [NamedType("Int", [])]), synthetic_core_source_loc())
+	normalized = normalize_product_evaluation(program(ProductExpr(
+		product_build_in_declared_order([read, field_call("change_global")]),
+		HeapRecordType("Payload"),
+		synthetic_core_source_loc(),
+	)), -4)
+
+	match body_of(normalized.program):
+		Some(LetExpr(snapshot, False, _, rhs, LetExpr(_, False, _, _, ProductExpr(_, _, _)))):
+			match snapshot.origin:
+				PassTemporary(ProductFieldTemp, 0): same_object(rhs, read) and normalized.ids_used == 2
+				_: False
+		_: False
+
+
+pure func test_conditional_value_gets_one_named_owner() -> Bool:
+	selected = IfExpr(
+		LiteralExpr(BoolLiteral(True), NamedType("Bool", []), synthetic_core_source_loc()),
+		VarExpr(variable("rows", 2), NamedType("List", [NamedType("Int", [])]), synthetic_core_source_loc()),
+		typed_field_call("fresh_rows", NamedType("List", [NamedType("Int", [])])),
+		NamedType("List", [NamedType("Int", [])]),
+		synthetic_core_source_loc(),
+	)
+	normalized = normalize_product_evaluation(program(ProductExpr(
+		product_build_in_declared_order([selected, field_call("park")]),
+		HeapRecordType("Payload"),
+		synthetic_core_source_loc(),
+	)), -1)
+
+	match body_of(normalized.program):
+		Some(LetExpr(owner, False, _, IfExpr(_, _, _, _, _), LetExpr(_, False, _, _, ProductExpr(build, _, _)))):
+			match product_build_values(build).get(0):
+				Some(VarExpr(use, _, _)): core_var_equal(owner, use) and normalized.ids_used == 2
+				_: False
+		_: False
+
+
+pure func test_reuse_source_is_bound_before_fields() -> Bool:
+	source = VarExpr(variable("old_record", 3), HeapRecordType("Payload"), synthetic_core_source_loc())
+	normalized = normalize_product_evaluation(program(RecordReuseExpr(
+		source,
+		fixture_build(2, [(1, field_call("first_field")), (0, field_call("second_field"))]),
+		HeapRecordType("Payload"),
+		synthetic_core_source_loc(),
+	)), -12)
+
+	match body_of(normalized.program):
+		Some(LetExpr(source_var, False, _, source_rhs, LetExpr(_, False, _, _, LetExpr(_, False, _, _, RecordReuseExpr(VarExpr(source_use, _, _), build, _, _))))):
+			match source_var.origin:
+				PassTemporary(ProductReuseSourceTemp, 0):
+					(
+						normalized.ids_used == 3
+						and source_var.id == -12
+						and same_object(source_rhs, source)
+						and core_var_equal(source_var, source_use)
+						and product_build_ordinals(build).map(core_field_ordinal_index) == [1, 0]
+					)
+				_: False
+		_: False
+
+
+pure func test_stable_mutable_local_reuse_keeps_consuming_source() -> Bool:
+	old = variable("old_record", 3)
+	typ = HeapRecordType("Payload")
+	body = LetExpr(old, True, typ, typed_field_call("make_payload", typ), RecordReuseExpr(
+		VarExpr(old, typ, synthetic_core_source_loc()),
+		fixture_build(2, [(1, field_call("first_written")), (0, field_call("second_written"))]),
+		typ, synthetic_core_source_loc(),
+	))
+	normalized = normalize_product_evaluation(program(body), -1)
+	match body_of(normalized.program):
+		Some(LetExpr(_, True, _, _, LetExpr(_, False, _, first, LetExpr(_, False, _, second, RecordReuseExpr(VarExpr(source, _, _), build, _, _))))):
+			(
+				core_var_equal(source, old) and normalized.ids_used == 2
+				and core_type_equal(core_expr_type(first), NamedType("Int", []))
+				and core_type_equal(core_expr_type(second), NamedType("Int", []))
+				and product_build_ordinals(build).map(core_field_ordinal_index) == [1, 0]
+			)
+		_: False
+
+
+pure func test_rebound_local_reuse_snapshots_source_before_fields() -> Bool:
+	old = variable("old_record", 3)
+	typ = HeapRecordType("Payload")
+	rebind = SeqExpr(AssignExpr(old, typed_field_call("replacement", typ), typ, synthetic_core_source_loc()), field_call("count"))
+	body = LetExpr(old, True, typ, typed_field_call("make_payload", typ), RecordReuseExpr(
+		VarExpr(old, typ, synthetic_core_source_loc()), product_build_in_declared_order([rebind, integer(2)]), typ, synthetic_core_source_loc(),
+	))
+	normalized = normalize_product_evaluation(program(body), -1)
+	match body_of(normalized.program):
+		Some(LetExpr(_, True, _, _, LetExpr(snapshot, False, _, VarExpr(original, _, _), LetExpr(_, False, _, SeqExpr(_, _), RecordReuseExpr(VarExpr(source, _, _), _, _, _))))):
+			(
+				core_var_equal(original, old) and core_var_equal(source, snapshot) and normalized.ids_used == 2
+				and not core_var_equal(source, old)
+			)
+		_: False
+
+
+pure func test_unresolved_global_reuse_snapshots_source_before_calls() -> Bool:
+	typ = HeapRecordType("Payload")
+	global_var = variable("GLOBAL_PAYLOAD", 0)
+	global: CoreGlobal = {
+		name = global_var, source_module = None, typ = typ,
+		init = typed_field_call("make_payload", typ), is_mutable = True,
+		is_const = False, is_private = False, def_id = 4, loc = synthetic_core_source_loc()
+	}
+	body = RecordReuseExpr(VarExpr(global_var, typ, synthetic_core_source_loc()), product_build_in_declared_order([field_call("rebind_global"), integer(2)]), typ, synthetic_core_source_loc())
+	normalized = normalize_product_evaluation({ decls = [GlobalDecl(global), FunctionDecl(function(body))], foreign_includes = [], source_files = [] }, -1)
+	match normalized.program.decls:
+		[_, FunctionDecl(result)]:
+			match result.body:
+				Some(LetExpr(snapshot, False, _, VarExpr(original, _, _), LetExpr(_, False, _, _, RecordReuseExpr(VarExpr(source, _, _), _, _, _)))):
+					core_var_equal(original, global_var) and core_var_equal(source, snapshot) and normalized.ids_used == 2
+				_: False
+		_: False
+
+
+pure func test_literal_fields_keep_the_original_build() -> Bool:
+	body = ProductExpr(product_build_in_declared_order([integer(1), integer(2)]), HeapRecordType("Payload"), synthetic_core_source_loc())
+	normalized = normalize_product_evaluation(program(body), -3)
+
+	match body_of(normalized.program):
+		Some(result): normalized.ids_used == 0 and same_object(result, body)
+		None: False
+
+
+pure func test_nested_literal_global_keeps_static_tree() -> Bool:
+	inner = ProductExpr(product_build_in_declared_order([integer(1)]), HeapRecordType("Inner"), synthetic_core_source_loc())
+	outer = ProductExpr(product_build_in_declared_order([inner, integer(2)]), HeapRecordType("Outer"), synthetic_core_source_loc())
+	global: CoreGlobal = {
+		name = { variable("NESTED", 0) | def_id = Some(2) },
+		source_module = None,
+		typ = HeapRecordType("Outer"),
+		init = outer,
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = 2,
+		loc = synthetic_core_source_loc()
+	}
+	normalized = normalize_product_evaluation({ decls = [GlobalDecl(global)], foreign_includes = [], source_files = [] }, -1)
+
+	match normalized.program.decls:
+		[GlobalDecl(result)]: normalized.ids_used == 0 and same_object(result.init, outer)
+		_: False
+
+
+pure func test_local_nested_product_gets_owned_binding() -> Bool:
+	inner = ProductExpr(product_build_in_declared_order([integer(1)]), HeapRecordType("Inner"), synthetic_core_source_loc())
+	body = ProductExpr(product_build_in_declared_order([inner, field_call("park")]), HeapRecordType("Outer"), synthetic_core_source_loc())
+	normalized = normalize_product_evaluation(program(body), -1)
+
+	match body_of(normalized.program):
+		Some(LetExpr(_, False, _, ProductExpr(_, _, _), LetExpr(_, False, _, _, ProductExpr(_, _, _)))):
+			normalized.ids_used == 2
+		_: False
+
+
+pure func test_nested_reuse_and_managed_fields_have_unique_names() -> Bool:
+	string_type = NamedType("String", [])
+	inner = RecordReuseExpr(
+		VarExpr(variable("old_record", 3), HeapRecordType("Payload"), synthetic_core_source_loc()),
+		product_build_in_declared_order([
+			VarExpr(variable("first", 4), string_type, synthetic_core_source_loc()),
+			VarExpr(variable("second", 5), string_type, synthetic_core_source_loc()),
+		]),
+		HeapRecordType("Payload"), synthetic_core_source_loc(),
+	)
+	body = ProductExpr(product_build_in_declared_order([
+		inner,
+		VarExpr(variable("third", 6), string_type, synthetic_core_source_loc()),
+	]), HeapRecordType("Outer"), synthetic_core_source_loc())
+	normalized = normalize_product_evaluation(program(body), -1)
+
+	match body_of(normalized.program):
+		Some(LetExpr(outer_first, False, _, LetExpr(source, False, _, _, LetExpr(first, False, _, _, LetExpr(second, False, _, _, RecordReuseExpr(_, _, _, _)))), LetExpr(outer_second, False, _, _, ProductExpr(_, _, _)))):
+			names = [source.name, first.name, second.name, outer_first.name, outer_second.name]
+			normalized.ids_used == 5 and names.unique().length() == 5
+		_: False
+
+
+pure func test_perceus_input_helper_includes_field_normalization() -> Bool:
+	body = ProductExpr(product_build_in_declared_order([
+		field_call("first_written"), field_call("second_written"),
+	]), HeapRecordType("Payload"), synthetic_core_source_loc())
+	match body_of(prepare_perceus_input(program(body))):
+		Some(LetExpr(_, False, _, _, LetExpr(_, False, _, _, ProductExpr(_, _, _)))): True
+		_: False
+
+
+pure func test_both_pipeline_paths_normalize_before_ownership() -> Bool:
+	standalone = late_core_passes().map(func(pass): pass.name)
+	fused = fused_late_core_passes().map(func(pass): pass.name)
+	(
+		standalone.index_of(PRODUCT_EVALUATION_PASS).get_or(0) < standalone.index_of("ownership_contracts").get_or(0)
+		and fused.index_of(PRODUCT_EVALUATION_PASS).get_or(0) < fused.index_of("ownership_perceus_fused").get_or(0)
+		and standalone.count(func(name): name == PRODUCT_EVALUATION_PASS) == 1
+		and fused.count(func(name): name == PRODUCT_EVALUATION_PASS) == 1
+	)
+
+
+private pure func tensor_element_origin(variable: CoreVar) -> Bool:
+	match variable.origin:
+		PassTemporary(TensorElementTemp, 0): True
+		_: False
+
+
+private pure func boxed_tensor(elements: List[CoreBoxedStorageValue]) -> CoreExpr:
+	TensorBoxedLiteralExpr({
+		shape = TensorVectorLength(elements.length()),
+		elements = elements,
+		elem_needs_release = True
+	}, NamedType("Vector", [HeapRecordType("Payload")]), synthetic_core_source_loc())
+
+
+pure func test_boxed_tensor_elements_bind_before_allocation_in_written_order() -> Bool:
+	first = typed_field_call("first_record", HeapRecordType("Payload"))
+	second = typed_field_call("parked_record", HeapRecordType("Payload"))
+	body = boxed_tensor([
+		{ kind = PointerBox, value = first, needs_release = True, transfers_ownership = True },
+		{ kind = PointerBox, value = second, needs_release = True, transfers_ownership = False },
+	])
+	normalized = normalize_product_evaluation(program(body), -7)
+
+	match body_of(normalized.program):
+		Some(LetExpr(first_owner, False, _, first_rhs, LetExpr(second_owner, False, _, second_rhs, TensorBoxedLiteralExpr(literal, _, _)))):
+			match literal.elements:
+				[first_slot, second_slot]:
+					match (first_slot.value, second_slot.value):
+						(VarExpr(first_use, _, _), VarExpr(second_use, _, _)):
+							(
+								normalized.ids_used == 2
+								and first_owner.id == -7
+								and second_owner.id == -8
+								and first_owner.name != second_owner.name
+								and tensor_element_origin(first_owner)
+								and tensor_element_origin(second_owner)
+								and same_object(first_rhs, first)
+								and same_object(second_rhs, second)
+								and core_var_equal(first_owner, first_use)
+								and core_var_equal(second_owner, second_use)
+								and first_slot.kind == PointerBox
+								and second_slot.kind == PointerBox
+								and first_slot.needs_release and second_slot.needs_release
+								and first_slot.transfers_ownership
+								and not second_slot.transfers_ownership
+							)
+						_: False
+				_: False
+		_: False
+
+
+pure func test_normalized_product_tensor_element_gets_one_owner() -> Bool:
+	product = ProductExpr(product_build_in_declared_order([field_call("score")]), HeapRecordType("Payload"), synthetic_core_source_loc())
+	normalized = normalize_product_evaluation(program(boxed_tensor([
+		{ kind = PointerBox, value = product, needs_release = True, transfers_ownership = True },
+	])), -1)
+
+	match body_of(normalized.program):
+		Some(LetExpr(owner, False, _, LetExpr(field_owner, False, _, _, ProductExpr(_, _, _)), TensorBoxedLiteralExpr(literal, _, _))):
+			match literal.elements:
+				[slot]:
+					match slot.value:
+						VarExpr(use, _, _):
+							match field_owner.origin:
+								PassTemporary(ProductFieldTemp, 0): core_var_equal(owner, use) and tensor_element_origin(owner) and normalized.ids_used == 2
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+pure func test_literal_boxed_tensor_element_keeps_original_tree() -> Bool:
+	body = boxed_tensor([{ kind = PrimBox, value = integer(4), needs_release = False, transfers_ownership = False }])
+	normalized = normalize_product_evaluation(program(body), -1)
+
+	match body_of(normalized.program):
+		Some(result): same_object(body, result) and normalized.ids_used == 0
+		_: False
+
+
+pure func test_ranked_source_vector_names_scalar_elements_and_keeps_shape() -> Bool:
+	row_type = TensorType({ element_type = HeapRecordType("Payload"), dims = [TensorStaticDim(2)] })
+	matrix_type = TensorType({ element_type = HeapRecordType("Payload"), dims = [TensorStaticDim(2), TensorStaticDim(2)] })
+	first = ProductExpr(product_build_in_declared_order([integer(4)]), HeapRecordType("Payload"), synthetic_core_source_loc())
+	second = ProductExpr(product_build_in_declared_order([field_call("negative_score")]), HeapRecordType("Payload"), synthetic_core_source_loc())
+	body = VectorExpr([
+		VectorExpr([first, second], row_type, synthetic_core_source_loc()),
+		VectorExpr([first, first], row_type, synthetic_core_source_loc()),
+	], matrix_type, synthetic_core_source_loc())
+	normalized = normalize_product_evaluation(program(body), -1)
+
+	match body_of(normalized.program):
+		Some(LetExpr(_, False, _, ProductExpr(_, _, _), LetExpr(_, False, _, LetExpr(_, False, _, _, ProductExpr(_, _, _)), LetExpr(_, False, _, ProductExpr(_, _, _), LetExpr(_, False, _, ProductExpr(_, _, _), TensorBoxedLiteralExpr(literal, typ, _)))))):
+			match literal.shape:
+				TensorStaticShape(dims):
+					(
+						dims == [2, 2]
+						and core_type_equal(typ, matrix_type)
+						and literal.elements.length() == 4
+						and normalized.ids_used == 5
+					)
+				_: False
+		_: False
+
+
+private pure func tensor_after_bindings(expr: CoreExpr) -> Option[CoreTensorBoxedLiteral]:
+	match expr:
+		LetExpr(_, False, _, _, body): tensor_after_bindings(body)
+		TensorBoxedLiteralExpr(literal, _, _): Some(literal)
+		_: None
+
+
+pure func test_rank_three_source_vector_keeps_all_dimensions() -> Bool:
+	element_type = HeapRecordType("Payload")
+	row_type = TensorType({ element_type = element_type, dims = [TensorStaticDim(2)] })
+	matrix_type = TensorType({ element_type = element_type, dims = [TensorStaticDim(2), TensorStaticDim(2)] })
+	cube_type = TensorType({ element_type = element_type, dims = [TensorStaticDim(2), TensorStaticDim(2), TensorStaticDim(2)] })
+	product = ProductExpr(product_build_in_declared_order([integer(4)]), element_type, synthetic_core_source_loc())
+	row = VectorExpr([product, product], row_type, synthetic_core_source_loc())
+	matrix = VectorExpr([row, row], matrix_type, synthetic_core_source_loc())
+	normalized = normalize_product_evaluation(program(VectorExpr([matrix, matrix], cube_type, synthetic_core_source_loc())), -1)
+
+	match body_of(normalized.program):
+		Some(body):
+			match tensor_after_bindings(body):
+				Some(literal):
+					match literal.shape:
+						TensorStaticShape(dims): dims == [2, 2, 2] and literal.elements.length() == 8 and normalized.ids_used == 8
+						_: False
+				_: False
+		_: False
+
+
+pure func test_inline_record_tensor_element_binds_before_allocation() -> Bool:
+	element_type = InlineRecordType("Point")
+	product = ProductExpr(product_build_in_declared_order([field_call("score")]), element_type, synthetic_core_source_loc())
+	body = VectorExpr([product], TensorType({ element_type = element_type, dims = [TensorStaticDim(1)] }), synthetic_core_source_loc())
+	normalized = normalize_product_evaluation(program(body), -1)
+
+	match body_of(normalized.program):
+		Some(LetExpr(owner, False, typ, LetExpr(_, False, _, _, ProductExpr(_, _, _)), TensorLiteralExpr(literal, _, _))):
+			match literal.payload:
+				TensorInlineStructLiteralPayload(inline_struct):
+					match inline_struct.elements:
+						[VarExpr(use, _, _)]: core_var_equal(owner, use) and tensor_element_origin(owner) and core_type_equal(typ, element_type)
+						_: False
+				_: False
+		_: False
+
+
+pure func test_raw_tensor_record_projection_gets_scalar_binding() -> Bool:
+	product = ProductExpr(product_build_in_declared_order([field_call("score")]), HeapRecordType("Payload"), synthetic_core_source_loc())
+	projection = ProductFieldExpr(product, core_field_ordinal(0), NamedType("Int", []), synthetic_core_source_loc())
+	body = VectorExpr([projection], TensorType({ element_type = NamedType("Int", []), dims = [TensorStaticDim(1)] }), synthetic_core_source_loc())
+	normalized = normalize_product_evaluation(program(body), -1)
+
+	match body_of(normalized.program):
+		Some(LetExpr(owner, False, typ, ProductFieldExpr(LetExpr(_, False, _, _, ProductExpr(_, _, _)), _, _, _), TensorLiteralExpr(literal, _, _))):
+			match literal.payload:
+				TensorRawLiteralPayload(raw):
+					match raw.elements:
+						[VarExpr(use, _, _)]: core_var_equal(owner, use) and tensor_element_origin(owner) and core_type_equal(typ, NamedType("Int", []))
+						_: False
+				_: False
+		_: False
+
+
+pure func test_packed_tensor_element_has_scalar_owner_role() -> Bool:
+	body = VectorExpr([typed_field_call("flag", NamedType("Bool", []))], TensorType({ element_type = NamedType("Bool", []), dims = [TensorStaticDim(1)] }), synthetic_core_source_loc())
+	normalized = normalize_product_evaluation(program(body), -1)
+
+	match body_of(normalized.program):
+		Some(LetExpr(owner, False, _, _, TensorPackedLiteralExpr(literal, _, _))):
+			match literal.elements:
+				[VarExpr(use, _, _)]: core_var_equal(owner, use) and tensor_element_origin(owner) and literal.elem_size == 1
+				_: False
+		_: False
+
+
+pure func test_literal_tensor_projection_survives_sequence_without_new_ids() -> Bool:
+	body = SeqExpr(integer(0), VectorExpr([integer(4)], TensorType({ element_type = NamedType("Int", []), dims = [TensorStaticDim(1)] }), synthetic_core_source_loc()))
+	normalized = normalize_product_evaluation(program(body), -1)
+
+	match body_of(normalized.program):
+		Some(SeqExpr(_, TensorLiteralExpr(_, _, _))): normalized.ids_used == 0
+		_: False
+
+
+private pure func list_element_origin(variable: CoreVar) -> Bool:
+	match variable.origin:
+		PassTemporary(ListElementTemp, 0): True
+		_: False
+
+
+private pure func pointer_list_layout(layout: CoreListStorageLayout) -> Bool:
+	match layout:
+		PointerListStorage: True
+		_: False
+
+
+private pure func inline_list_layout(layout: CoreListStorageLayout) -> Bool:
+	match layout:
+		InlineListStorage(8): True
+		_: False
+
+
+private pure func boxed_list(elements: List[CoreBoxedStorageValue]) -> CoreExpr:
+	ListConstructExpr({
+		layout = PointerListStorage,
+		elements = elements,
+		elem_needs_release = True
+	}, NamedType("List", [HeapRecordType("Payload")]), synthetic_core_source_loc())
+
+
+pure func test_list_elements_bind_before_allocation_in_written_order() -> Bool:
+	first = typed_field_call("first_record", HeapRecordType("Payload"))
+	second = typed_field_call("parked_record", HeapRecordType("Payload"))
+	body = boxed_list([
+		{ kind = PointerBox, value = first, needs_release = True, transfers_ownership = True },
+		{ kind = PointerBox, value = second, needs_release = True, transfers_ownership = False },
+	])
+	normalized = normalize_product_evaluation(program(body), -7)
+
+	match body_of(normalized.program):
+		Some(LetExpr(first_owner, False, _, first_rhs, LetExpr(second_owner, False, _, second_rhs, ListConstructExpr(construct, _, _)))):
+			match construct.elements:
+				[first_slot, second_slot]:
+					match (first_slot.value, second_slot.value):
+						(VarExpr(first_use, _, _), VarExpr(second_use, _, _)):
+							(
+								normalized.ids_used == 2
+								and first_owner.id == -7
+								and second_owner.id == -8
+								and first_owner.name != second_owner.name
+								and list_element_origin(first_owner)
+								and list_element_origin(second_owner)
+								and same_object(first_rhs, first)
+								and same_object(second_rhs, second)
+								and core_var_equal(first_owner, first_use)
+								and core_var_equal(second_owner, second_use)
+								and pointer_list_layout(construct.layout)
+								and construct.elem_needs_release
+								and first_slot.kind == PointerBox
+								and second_slot.kind == PointerBox
+								and first_slot.needs_release and second_slot.needs_release
+								and first_slot.transfers_ownership
+								and not second_slot.transfers_ownership
+							)
+						_: False
+				_: False
+		_: False
+
+
+pure func test_normalized_product_list_element_gets_one_owner() -> Bool:
+	product = ProductExpr(product_build_in_declared_order([field_call("score")]), HeapRecordType("Payload"), synthetic_core_source_loc())
+	normalized = normalize_product_evaluation(program(boxed_list([
+		{ kind = PointerBox, value = product, needs_release = True, transfers_ownership = False },
+	])), -1)
+
+	match body_of(normalized.program):
+		Some(LetExpr(owner, False, _, LetExpr(field_owner, False, _, _, ProductExpr(_, _, _)), ListConstructExpr(construct, _, _))):
+			match construct.elements:
+				[slot]:
+					match slot.value:
+						VarExpr(use, _, _):
+							match field_owner.origin:
+								PassTemporary(ProductFieldTemp, 0): core_var_equal(owner, use) and list_element_origin(owner) and normalized.ids_used == 2
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+pure func test_inline_list_element_keeps_storage_metadata() -> Bool:
+	call = field_call("scalar")
+	body = ListConstructExpr({
+		layout = InlineListStorage(8),
+		elements = [{ kind = PrimBox, value = call, needs_release = False, transfers_ownership = False }],
+		elem_needs_release = False
+	}, NamedType("List", [NamedType("Int", [])]), synthetic_core_source_loc())
+	normalized = normalize_product_evaluation(program(body), -1)
+
+	match body_of(normalized.program):
+		Some(LetExpr(owner, False, _, rhs, ListConstructExpr(construct, _, _))):
+			match construct.elements:
+				[slot]:
+					match slot.value:
+						VarExpr(use, _, _):
+							(
+								normalized.ids_used == 1
+								and same_object(rhs, call)
+								and core_var_equal(owner, use)
+								and list_element_origin(owner)
+								and inline_list_layout(construct.layout)
+								and not construct.elem_needs_release
+								and slot.kind == PrimBox
+								and not slot.needs_release
+								and not slot.transfers_ownership
+							)
+						_: False
+				_: False
+		_: False
+
+
+pure func test_literal_list_keeps_the_original_tree() -> Bool:
+	body = ListConstructExpr({
+		layout = InlineListStorage(8),
+		elements = [{ kind = PrimBox, value = integer(4), needs_release = False, transfers_ownership = False }],
+		elem_needs_release = False
+	}, NamedType("List", [NamedType("Int", [])]), synthetic_core_source_loc())
+	normalized = normalize_product_evaluation(program(body), -1)
+	match body_of(normalized.program):
+		Some(result): normalized.ids_used == 0 and same_object(result, body)
+		_: False
+
+
+pure func test_literal_product_list_global_keeps_static_tree() -> Bool:
+	product = ProductExpr(product_build_in_declared_order([integer(1)]), HeapRecordType("Payload"), synthetic_core_source_loc())
+	body = boxed_list([{ kind = PointerBox, value = product, needs_release = True, transfers_ownership = False }])
+	global: CoreGlobal = {
+		name = { variable("PAYLOADS", 0) | def_id = Some(2) },
+		source_module = None,
+		typ = core_expr_type(body),
+		init = body,
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = 2,
+		loc = synthetic_core_source_loc()
+	}
+	normalized = normalize_product_evaluation({ decls = [GlobalDecl(global)], foreign_includes = [], source_files = [] }, -1)
+
+	match normalized.program.decls:
+		[GlobalDecl(result)]: normalized.ids_used == 0 and same_object(result.init, body)
+		_: False
+
+
+private pure func reuse_uses_source(expr: CoreExpr, source: CoreVar) -> Bool:
+	match expr:
+		RecordReuseExpr(VarExpr(variable, _, _), _, _, _): core_var_equal(variable, source)
+		_: False
+
+
+pure func test_lambda_parameters_and_borrowed_bindings_keep_exact_local_reuse() -> Bool:
+	loc = synthetic_core_source_loc()
+	typ = HeapRecordType("Payload")
+	first = variable("first", 11)
+	second = variable("shared_spelling", 12)
+	borrowed = variable("borrowed", 13)
+	global_var = { variable("shared_spelling", 14) | def_id = Some(31) }
+	build = product_build_in_declared_order([integer(1), integer(2)])
+	callable = LambdaExpr([
+		{ name = first, typ = typ, loc = loc },
+		{ name = second, typ = typ, loc = loc },
+	], typ, BorrowLetExpr(borrowed, typ, VarExpr(second, typ, loc), SeqExpr(
+		RecordReuseExpr(VarExpr(second, typ, loc), build, typ, loc),
+		RecordReuseExpr(VarExpr(borrowed, typ, loc), build, typ, loc),
+	)), False, FunctionType(False, [typ, typ], typ), loc)
+	global_read = VarExpr(global_var, typ, loc)
+	body = SeqExpr(callable, RecordReuseExpr(global_read, build, typ, loc))
+	global: CoreGlobal = {
+		name = global_var, source_module = None, typ = typ,
+		init = typed_field_call("make_payload", typ), is_mutable = True,
+		is_const = False, is_private = False, def_id = 31, loc = loc,
+	}
+	normalized = normalize_product_evaluation({
+		decls = [GlobalDecl(global), FunctionDecl(function(body))], foreign_includes = [], source_files = [],
+	}, -1)
+	match normalized.program.decls:
+		[_, FunctionDecl(result)]:
+			match result.body:
+				Some(SeqExpr(callable_result, LetExpr(snapshot, False, _, rhs, reuse))):
+					local_reuses = match callable_result:
+						LambdaExpr(_, _, BorrowLetExpr(alias_var, _, _, SeqExpr(parameter_reuse, alias_reuse)), _, _, _):
+							(
+								core_var_equal(alias_var, borrowed)
+								and reuse_uses_source(parameter_reuse, second)
+								and reuse_uses_source(alias_reuse, borrowed)
+							)
+						_: False
+					(
+						normalized.ids_used == 1 and local_reuses
+						and same_object(rhs, global_read)
+						and not core_var_equal(snapshot, global_var)
+						and reuse_uses_source(reuse, snapshot)
+					)
+				_: False
+		_: False
+
+
+pure func test_literal_global_queue_checks_nested_later_values() -> Bool:
+	loc = synthetic_core_source_loc()
+	typ = HeapRecordType("Payload")
+	first = ProductExpr(product_build_in_declared_order([integer(1), integer(2)]), typ, loc)
+	second = ProductExpr(product_build_in_declared_order([integer(3), integer(4)]), typ, loc)
+	read = VarExpr(variable("global_number", 20), NamedType("Int", []), loc)
+	with_read = ProductExpr(product_build_in_declared_order([integer(3), read]), typ, loc)
+	literal_tree = boxed_list([
+		{ kind = PointerBox, value = first, needs_release = True, transfers_ownership = False },
+		{ kind = PointerBox, value = second, needs_release = True, transfers_ownership = False },
+	])
+	read_tree = boxed_list([
+		{ kind = PointerBox, value = first, needs_release = True, transfers_ownership = False },
+		{ kind = PointerBox, value = with_read, needs_release = True, transfers_ownership = False },
+	])
+	product_evaluation_is_literal_global(literal_tree) and not product_evaluation_is_literal_global(read_tree)
+
+
+tests: TestSuite = {
+	description = "Written-order owned field evaluation before Perceus",
+	tests = [
+		("lambda parameters and borrowed bindings keep exact local reuse", test_lambda_parameters_and_borrowed_bindings_keep_exact_local_reuse),
+		("literal global queue checks nested later values", test_literal_global_queue_checks_nested_later_values),
+		("list elements bind before allocation in written order", test_list_elements_bind_before_allocation_in_written_order),
+		("normalized product list element gets one owner", test_normalized_product_list_element_gets_one_owner),
+		("inline list element keeps storage metadata", test_inline_list_element_keeps_storage_metadata),
+		("literal list keeps the original tree", test_literal_list_keeps_the_original_tree),
+		("literal product list global keeps static tree", test_literal_product_list_global_keeps_static_tree),
+		("fields bind in written order and keep ordinals", test_fields_bind_in_written_order_and_keep_ordinals),
+		("variable field snapshots before later evaluation", test_variable_field_is_snapshotted_before_later_evaluation),
+		("conditional field gets one named owner", test_conditional_value_gets_one_named_owner),
+		("reuse source binds before fields", test_reuse_source_is_bound_before_fields),
+		("stable mutable local reuse keeps consuming source", test_stable_mutable_local_reuse_keeps_consuming_source),
+		("rebound local reuse snapshots source first", test_rebound_local_reuse_snapshots_source_before_fields),
+		("unresolved global reuse snapshots before calls", test_unresolved_global_reuse_snapshots_source_before_calls),
+		("literal fields preserve the build", test_literal_fields_keep_the_original_build),
+		("nested literal global keeps static tree", test_nested_literal_global_keeps_static_tree),
+		("local nested product gets an owned binding", test_local_nested_product_gets_owned_binding),
+		("nested reuse and managed fields have unique names", test_nested_reuse_and_managed_fields_have_unique_names),
+		("Perceus input helper includes field normalization", test_perceus_input_helper_includes_field_normalization),
+		("both pipelines normalize before ownership", test_both_pipeline_paths_normalize_before_ownership),
+		("boxed tensor elements bind before allocation in written order", test_boxed_tensor_elements_bind_before_allocation_in_written_order),
+		("normalized product tensor element gets one owner", test_normalized_product_tensor_element_gets_one_owner),
+		("literal boxed tensor element keeps original tree", test_literal_boxed_tensor_element_keeps_original_tree),
+		("ranked source vector names scalar elements and keeps shape", test_ranked_source_vector_names_scalar_elements_and_keeps_shape),
+		("rank three source vector keeps all dimensions", test_rank_three_source_vector_keeps_all_dimensions),
+		("inline record tensor element binds before allocation", test_inline_record_tensor_element_binds_before_allocation),
+		("raw tensor record projection gets scalar binding", test_raw_tensor_record_projection_gets_scalar_binding),
+		("packed tensor element has scalar owner role", test_packed_tensor_element_has_scalar_owner_role),
+		("literal tensor projection survives sequence without new ids", test_literal_tensor_projection_survives_sequence_without_new_ids),
+	]
+}

@@ -57,13 +57,13 @@ import:
 			LambdaExpr, LetExpr, ListConstructExpr, ListAllocExpr, ListGetExpr, ListHandoffExpr,
 			ListHandoffSetOwnedExpr, ListHandoffSetSourceSlotExpr, ListRetainExpr, ListSetExpr,
 			ListSwapExpr, LiteralExpr, LogicalExpr, PreClosureConcurrentExpr,
-			PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr, RecordConstructExpr, RecordExpr,
+			PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr, ProductExpr,
 			RecordCowUpdateExpr, RecordReuseExpr, RecordUpdateExpr, ResourceCleanupExitExpr,
 			ResourceScopeExpr, SelectExpr, SeqExpr, StaticStringLiteralExpr, StringByteCopyExpr,
 			StringByteReadExpr, StringByteWriteExpr, StringSetLenExpr, TailrecListSpreadLoopExpr,
 			TailrecListSpreadRecurExpr, TailrecLoopExpr, TailrecRecurExpr, TensorBoxedLiteralExpr,
 			TensorRawFillExpr, TensorRawReadExpr, TensorRawViewLetExpr, TensorRawWriteExpr,
-			TupleConstructExpr, TupleExpr, UnaryExpr, UnboxExpr, UnionConstructExpr,
+			TupleExpr, UnaryExpr, UnboxExpr, UnionConstructExpr,
 			VarExpr, VectorExpr, VoidExpr, WhileExpr, LiteralMatchExpr, LengthMatchExpr,
 		),
 		CoreFunction,
@@ -85,24 +85,19 @@ import:
 		CorePreClosureConcurrentBinding,
 		CoreProgram,
 		CoreRecordCowField,
-		CoreRecordFieldValue,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy, StackResultReleasePolicy),
 		CoreRetainPolicy(ArcRetainPolicy, StackResultRetainPolicy),
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSourceLoc,
 		CoreTailrecListSpreadRebind,
-		CoreTupleConstruct,
-		CoreTupleElement(
-			TupleFloat16Element, TupleFloat32Element, TupleFloatElement, TuplePointerElement,
-			TuplePrimElement, TupleStackResultElement, TupleStructElement, TupleVoidElement,
-		),
 		CoreType(BoxedResultType, UnionType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType, VoidType),
 		CoreUnboxKind(PointerUnbox),
 		CoreVar,
 		core_expr_type,
 		core_var_equal,
 		core_vars_have_same_definition,
+		product_build_values,
 		synthetic_core_source_loc,
 	ownership:
 		OwnershipArgMode(BorrowArg, TransferArg),
@@ -563,30 +558,6 @@ private pure func contract_expr_is_parameter_dup(
 			False
 
 
-private pure func contract_body_tuple_element_matches(
-	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
-	index: ContractParameterIndex,
-	element: CoreTupleElement,
-) -> Bool:
-	match element:
-		TuplePrimElement(value):
-			contract_body_expr_matches(predicate, index, value)
-		TuplePointerElement(value):
-			contract_body_expr_matches(predicate, index, value)
-		TupleStructElement(value, _):
-			contract_body_expr_matches(predicate, index, value)
-		TupleStackResultElement(value):
-			contract_body_expr_matches(predicate, index, value)
-		TupleVoidElement:
-			False
-		TupleFloatElement(value):
-			contract_body_expr_matches(predicate, index, value)
-		TupleFloat32Element(value):
-			contract_body_expr_matches(predicate, index, value)
-		TupleFloat16Element(value):
-			contract_body_expr_matches(predicate, index, value)
-
-
 private pure func contract_body_optional_expr_matches(
 	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
 	index: ContractParameterIndex,
@@ -698,21 +669,6 @@ private pure func contract_body_any_expr_matches(
 	found
 
 
-private pure func contract_body_any_tuple_element_matches(
-	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
-	index: ContractParameterIndex,
-	elements: List[CoreTupleElement],
-) -> Bool:
-	var found: Bool = False
-
-	for element in elements:
-		if contract_body_tuple_element_matches(predicate, index, element):
-			found = True
-			break
-
-	found
-
-
 private pure func contract_body_any_boxed_storage_value_matches(
 	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
 	index: ContractParameterIndex,
@@ -728,15 +684,15 @@ private pure func contract_body_any_boxed_storage_value_matches(
 	found
 
 
-private pure func contract_body_any_record_field_value_matches(
+private pure func contract_body_any_value_matches(
 	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
 	index: ContractParameterIndex,
-	fields: List[CoreRecordFieldValue],
+	values: List[CoreExpr],
 ) -> Bool:
 	var found: Bool = False
 
-	for field in fields:
-		if contract_body_expr_matches(predicate, index, field.value):
+	for value in values:
+		if contract_body_expr_matches(predicate, index, value):
 			found = True
 			break
 
@@ -991,8 +947,6 @@ private pure func contract_body_expr_matches(
 				contract_body_any_expr_matches(predicate, index, items)
 			VectorExpr(items, _, _):
 				contract_body_any_expr_matches(predicate, index, items)
-			TupleConstructExpr(construct, _, _):
-				contract_body_any_tuple_element_matches(predicate, index, construct.elements)
 			ListConstructExpr(construct, _, _):
 				contract_body_any_boxed_storage_value_matches(predicate, index, construct.elements)
 			TensorBoxedLiteralExpr(construct, _, _):
@@ -1085,19 +1039,21 @@ private pure func contract_body_expr_matches(
 				)
 			DictConstructExpr(construct, _, _):
 				contract_body_any_dict_entry_matches(predicate, index, construct.entries)
-			RecordExpr(fields, _, _):
-				contract_body_any_record_field_value_matches(predicate, index, fields)
-			RecordConstructExpr(_, fields, _, _):
-				contract_body_any_record_field_value_matches(predicate, index, fields)
+			ProductExpr(build, _, _):
+				contract_body_any_value_matches(predicate, index, product_build_values(build))
 			RecordUpdateExpr(base, fields, _, _):
 				(
 					contract_body_expr_matches(predicate, index, base)
-					or contract_body_any_record_field_value_matches(predicate, index, fields)
+					or contract_body_any_value_matches(
+						predicate,
+						index,
+						fields.map(func(field): field.value),
+					)
 				)
-			RecordReuseExpr(base, fields, _, _):
+			RecordReuseExpr(base, build, _, _):
 				(
 					contract_body_expr_matches(predicate, index, base)
-					or contract_body_any_record_field_value_matches(predicate, index, fields)
+					or contract_body_any_value_matches(predicate, index, product_build_values(build))
 				)
 			RecordCowUpdateExpr(source, fields, _, _):
 				(
@@ -1398,14 +1354,14 @@ private pure func push_contract_boxed_storage_values(
 	next
 
 
-private pure func push_contract_record_fields(
+private pure func push_contract_values(
 	pending: ContractCollectionTaskStack,
-	fields: List[CoreRecordFieldValue],
+	values: List[CoreExpr],
 ) -> ContractCollectionTaskStack:
 	var next: ContractCollectionTaskStack = pending
 
-	for field in fields:
-		next = push_contract_task(next, ConsumeContractResult, field.value)
+	for value in values:
+		next = push_contract_task(next, ConsumeContractResult, value)
 
 	next
 
@@ -1760,29 +1716,24 @@ private pure func schedule_contract_linear(
 				state = state,
 				pending = push_contract_task(pending, demand, body)
 			}
-		RecordExpr(fields, typ, loc):
+		ProductExpr(build, typ, loc):
 			{
 				state = state,
-				pending = push_contract_record_fields(pending, fields)
-			}
-		RecordConstructExpr(_, fields, typ, loc):
-			{
-				state = state,
-				pending = push_contract_record_fields(pending, fields)
+				pending = push_contract_values(pending, product_build_values(build))
 			}
 		RecordUpdateExpr(base, fields, typ, loc):
 			{
 				state = state,
-				pending = push_contract_record_fields(
+				pending = push_contract_values(
 					push_contract_task(pending, ConsumeContractResult, base),
-					fields,
+					fields.map(func(field): field.value),
 				)
 			}
-		RecordReuseExpr(source, fields, typ, loc):
+		RecordReuseExpr(source, build, typ, loc):
 			{
 				state = state,
 				pending = push_contract_task(
-					push_contract_record_fields(pending, fields),
+					push_contract_values(pending, product_build_values(build)),
 					ConsumeContractResult,
 					source,
 				)

@@ -32,24 +32,24 @@
 -- local's (name, id) pair is bound once in its function, so a use names one
 -- binder and the facts below are keyed by binder identity.
 import:
-	memory: same_object
 	ir:
 		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
-		CoreConcurrentBinding,
 		CoreExpr(
 			BorrowLetExpr, ConcurrentExpr, ConcurrentlyLoopExpr, ForChannelExpr, ForDictExpr,
 			ForListExpr, ForRangeExpr, ForResourceSourceExpr, ForSetExpr, ForStreamExpr,
 			ForStringExpr, ForTensorExpr, LambdaExpr, LetExpr, ListHandoffExpr,
 			PreClosureConcurrentExpr, PreClosureConcurrentlyLoopExpr, ResourceScopeExpr,
 			ProductFieldExpr, SelectExpr, SemanticMatchExpr, TailrecListSpreadLoopExpr,
-			TailrecLoopExpr, TensorRawViewLetExpr, TupleExpr, VarExpr,
+			TailrecLoopExpr, TensorRawViewLetExpr, ProductExpr, TupleExpr, VarExpr,
 		),
 		CoreFieldOrdinal,
+		CoreProductBuild,
+		product_build_values,
+		in_declared_order,
 		CoreFunction,
+		CoreMapState,
 		CoreParam,
-		CorePreClosureConcurrentBinding,
 		CoreProgram,
-		CoreSelectArmKind(SelectRecvArm),
 		CoreSemanticConstructorMatchCase,
 		CoreSemanticLengthMatchCase,
 		CoreSemanticLengthMatchGeq,
@@ -71,9 +71,20 @@ import:
 		core_field_ordinal_index,
 		core_field_ordinals_equal,
 		core_var_equal,
+	mono: core_mono_type_equal
+	product_group_uses:
+		ProductGroupUses,
+		contains_var,
+		is_group_type,
+		is_tuple_type,
+		is_root_accessor,
+		product_group_uses,
+		tree_bindings,
+	product_type:
+		CoreInterimRecordFields,
+		interim_product_fields,
+		interim_record_fields,
 	traverse:
-		CoreMapState,
-		immediate_core_expr_children,
 		map_core_expr_children_with_state,
 	tuple_element_producers:
 		TupleBinderMint,
@@ -170,44 +181,17 @@ private record ElementAlias {
 
 
 ---
-Locals that name `source` again: an immutable alias, or a leaf binder that
-names a matched variable's whole value. Their whole uses are the source's.
----
-private record TupleAliases {
-	aliases: List[CoreVar],
-	source: CoreVar
-}
-
-
----
-What the pass needs to know about a function's binders, from its body as
-written:
-
-- which tuple variables are used whole: anywhere but as the base of an
-  element read, the subject of a `match`, or the value of an immutable alias,
-  with an alias's whole uses carried back to its source;
-- which binders are bound more than once. The binder identity contract makes
-  that an error, but a body that `std_inline` clones can still repeat one
-  (docs/NAME_ID_ROADMAP.md, B1). Such a binder is never flattened, renamed or
-  reused as an element, so a use can never resolve to the wrong binding.
----
-private record LocalFacts {
-	used_whole: List[CoreVar],
-	rebound: List[CoreVar]
-}
-
-
----
 Walked on demand, once per function: most functions have no tuple local or
 tuple subject, and never pay for the walk.
 ---
 private union LocalFactsAnalysis:
 	LocalFactsNotWalked(List[CoreVar], CoreExpr)
-	LocalFactsWalked(LocalFacts)
+	LocalFactsWalked(ProductGroupUses)
 
 
 private record TupleFlattenState {
 	producers: TupleElementProducers,
+	fields: CoreInterimRecordFields,
 	local_facts: LocalFactsAnalysis,
 	-- The last binder id minted; ids count down.
 	last_id: Int,
@@ -223,227 +207,9 @@ private record TupleFlattenState {
 }
 
 
-private pure func contains_var(variables: List[CoreVar], variable: CoreVar) -> Bool:
-	variables.any(pure func(candidate: CoreVar): core_var_equal(candidate, variable))
-
-
-private pure func is_tuple_type(typ: CoreType) -> Bool:
-	match typ:
-		TupleType(_):
-			True
-		_:
-			False
-
-
----
-The binders `expr` itself introduces, for the binder count. A match's leaf
-bindings are counted once per match: one pattern variable can appear in
-several leaves of one decision tree.
----
-private pure func introduced_binders(expr: CoreExpr) -> List[CoreVar]:
-	match expr:
-		LetExpr(variable, _, _, _, _):
-			[variable]
-		BorrowLetExpr(variable, _, _, _):
-			[variable]
-		LambdaExpr(params, _, _, _, _, _):
-			params.map(pure func(param: CoreParam): param.name)
-		TailrecLoopExpr(params, _, _, _):
-			params.map(pure func(param: CoreParam): param.name)
-		TailrecListSpreadLoopExpr(loop, _):
-			[loop.cursor, loop.list_param.name].concat(
-				loop.params.map(pure func(param: CoreParam): param.name),
-			)
-		ForRangeExpr(binder, _, _, _, _, _):
-			[binder.variable]
-		ForChannelExpr(loop, _, _):
-			[loop.binder.variable]
-		ForListExpr(loop, _, _):
-			[loop.binder.variable]
-		ForStringExpr(loop, _, _):
-			[loop.binder.variable]
-		ForDictExpr(loop, _, _):
-			[loop.binder.variable]
-		ForSetExpr(loop, _, _):
-			[loop.binder.variable]
-		ForStreamExpr(loop, _, _):
-			[loop.binder.variable]
-		ForResourceSourceExpr(loop, _, _):
-			[loop.binder.variable]
-		ForTensorExpr(loop, _, _):
-			[loop.binder.variable]
-		ResourceScopeExpr(scope, _, _):
-			[scope.variable]
-		ListHandoffExpr(handoff, _, _):
-			[handoff.source_var, handoff.result_var, handoff.len_var, handoff.out_var]
-		TensorRawViewLetExpr(binding, _, _, _):
-			[binding.variable]
-		ConcurrentExpr(block, _, _):
-			block.bindings.map(pure func(binding: CoreConcurrentBinding): binding.variable)
-		PreClosureConcurrentExpr(block, _, _):
-			block.bindings.map(pure func(binding: CorePreClosureConcurrentBinding): binding.variable)
-		ConcurrentlyLoopExpr(loop, _, _):
-			[loop.variable]
-		PreClosureConcurrentlyLoopExpr(loop, _, _):
-			[loop.variable]
-		SelectExpr(arms, _, _):
-			var binders: List[CoreVar] = []
-
-			for arm in arms:
-				match arm.kind:
-					SelectRecvArm(recv):
-						binders = binders.append(recv.binder)
-					_:
-						void
-
-			binders
-		SemanticMatchExpr(_, tree, _, _):
-			var binders: List[CoreVar] = []
-
-			for binding in tree_bindings(tree):
-				if not contains_var(binders, binding.variable):
-					binders = binders.append(binding.variable)
-
-			binders
-		_:
-			[]
-
-
----
-The children of `expr` to walk, each once: a decision tree reaches a shared
-subtree, and its leaf bodies, from more than one branch.
----
-private pure func distinct_children(expr: CoreExpr) -> List[CoreExpr]:
-	var children: List[CoreExpr] = []
-
-	for child in immediate_core_expr_children(expr):
-		if not children.any(pure func(seen: CoreExpr): same_object(seen, child)):
-			children = children.append(child)
-
-	children
-
-
----
-The function's local facts, by one walk with an explicit stack. Every table
-is a local of this walk, so it grows in place; threading the tables through a
-recursive walk would copy them at each binder.
----
-private pure func local_facts(params: List[CoreVar], body: CoreExpr) -> LocalFacts:
-	var used_whole: List[CoreVar] = []
-	var aliases: List[TupleAliases] = []
-	-- Binders seen so far, kept by id and compared by full identity
-	-- `(name, id)`. The binders with no minted id yet (id 0) share one bucket.
-	var binders_by_id: Dict[Int, List[CoreVar]] = {}
-	var rebound: List[CoreVar] = []
-	var stack: List[CoreExpr] = [body]
-	var depth: Int = 1
-	var introduced: List[CoreVar] = params
-
-	while depth > 0 or not introduced.is_empty():
-		for variable in introduced:
-			if contains_var(binders_by_id.get_or(variable.id, []), variable):
-				if not contains_var(rebound, variable):
-					rebound = rebound.append(variable)
-			else:
-				binders_by_id = binders_by_id.set(
-					variable.id,
-					binders_by_id.get_or(variable.id, []).append(variable),
-				)
-
-		introduced = []
-
-		if depth > 0:
-			depth -= 1
-
-			match stack.get(depth):
-				Some(expr):
-					introduced = introduced_binders(expr)
-					var children: List[CoreExpr] = []
-
-					match expr:
-						VarExpr(variable, typ, _):
-							if is_tuple_type(typ) and not contains_var(used_whole, variable):
-								used_whole = used_whole.append(variable)
-						ProductFieldExpr(VarExpr(_, _, _), _, _, _):
-							void
-						SemanticMatchExpr(VarExpr(subject, _, _), tree, _, _):
-							-- A leaf binder that names the whole subject is the subject
-							-- again: its whole uses are the subject's, or a box would be
-							-- rebuilt in that leaf each time it runs. The scrutinee
-							-- comes first among the children; the rest are leaf bodies.
-							-- The subject is stored once: storing one match binding in
-							-- a loop over-releases it (a Perceus bug; see the
-							-- increment 1 results in benchmarks/results).
-							whole_binders: List[CoreVar] = tree_bindings(tree)
-								.filter(pure func(binding: CoreSemanticMatchBinding): is_root_accessor(binding.accessor))
-								.map(pure func(binding: CoreSemanticMatchBinding): binding.variable)
-							aliases = aliases.append({
-								aliases = whole_binders,
-								source = subject,
-							})
-
-							children = distinct_children(expr).drop(1)
-						LetExpr(variable, is_mutable, typ, rhs, body):
-							-- One payload column per pattern: the pinned bootstrap tests
-							-- only the first one (match lowering, fixed in 65341398d, not
-							-- yet pinned).
-							match rhs:
-								VarExpr(source, _, _):
-									if not is_mutable and is_tuple_type(typ):
-										aliases = aliases.append({
-											aliases = [variable],
-											source = source,
-										})
-										children = [body]
-									else:
-										children = distinct_children(expr)
-								_:
-									children = distinct_children(expr)
-						_:
-							children = distinct_children(expr)
-
-					for child in children:
-						stack = if depth < stack.length():
-							stack.set(depth, child)
-						else:
-							stack.append(child)
-						depth += 1
-				None:
-					depth = 0
-
-	-- A binder bound more than once keeps its box, which is a whole use: an
-	-- alias of a flattened local kept boxed this way needs its source boxed.
-	for variable in rebound:
-		if not contains_var(used_whole, variable):
-			used_whole = used_whole.append(variable)
-
-	var changed: Bool = True
-
-	while changed:
-		changed = False
-
-		for group in aliases:
-			if not contains_var(used_whole, group.source):
-				var alias_used_whole: Bool = False
-
-				for alias_variable in group.aliases:
-					if contains_var(used_whole, alias_variable):
-						alias_used_whole = True
-						break
-
-				if alias_used_whole:
-					used_whole = used_whole.append(group.source)
-					changed = True
-
-	{
-		used_whole = used_whole,
-		rebound = rebound
-	}
-
-
 private record LocalFactsAnswer {
 	state: TupleFlattenState,
-	facts: LocalFacts
+	facts: ProductGroupUses
 }
 
 
@@ -455,7 +221,7 @@ private pure func local_facts_of(state: TupleFlattenState) -> LocalFactsAnswer:
 				facts = facts
 			}
 		LocalFactsNotWalked(params, body):
-			facts: LocalFacts = local_facts(params, body)
+			facts: ProductGroupUses = product_group_uses(params, body)
 			{
 				state = { state | local_facts = LocalFactsWalked(facts) },
 				facts = facts
@@ -528,11 +294,17 @@ private pure func bind_all(bindings: List[TupleCoreBinding], body: CoreExpr) -> 
 ---
 Where a tuple about to be taken apart comes from.
 ---
+private union ElementSource:
+	TupleElements(TupleElementSource)
+	-- Issued only after the declaration schema proves arity and every operand type.
+	BuiltProduct(CoreProductBuild)
+
+
 private union TupleGroupSource:
 	-- A flattened local named again: the same elements.
 	ExistingGroup(ElementGroup)
 	-- A tuple built here, whose elements can be bound one by one.
-	BuiltElements(TupleElementSource)
+	BuiltElements(ElementSource)
 	-- Anything else, a source among them: it keeps its box.
 	NotBuiltHere
 
@@ -546,29 +318,31 @@ private pure func group_source(state: TupleFlattenState, expr: CoreExpr) -> Tupl
 				None:
 					NotBuiltHere
 		TupleExpr(items, _, _):
-			BuiltElements({
+			BuiltElements(TupleElements({
 				prelude = [],
 				elements = items,
 				last_id = state.last_id,
-			})
+			}))
+		ProductExpr(build, typ, _):
+			match interim_product_fields(state.fields, typ):
+				Some(fields):
+					declared_values: List[CoreExpr] = in_declared_order(build, product_build_values(build))
+					types_match: Bool = fields.zip(declared_values).all(pure func(entry: (CoreType, CoreExpr)):
+						(field_type, value) = entry
+						core_mono_type_equal(field_type, core_expr_type(value))
+					)
+					if is_group_type(typ) and fields.length() == declared_values.length() and types_match:
+						BuiltElements(BuiltProduct(build))
+					else:
+						NotBuiltHere
+				None:
+					NotBuiltHere
 		_:
 			match produced_tuple_elements(state.producers, expr, state.last_id):
 				Some(source):
-					BuiltElements(source)
+					BuiltElements(TupleElements(source))
 				None:
 					NotBuiltHere
-
-
----
-An element's type is the one its tuple type declares, which is the type match
-projection reads an accessor of the subject at.
----
-private pure func tuple_element_type(tuple_type: CoreType, index: Int) -> Option[CoreType]:
-	match tuple_type:
-		TupleType(items):
-			items.get(index)
-		_:
-			None
 
 
 private record BoundGroup {
@@ -628,21 +402,40 @@ immutable local needs no binding.
 private pure func bind_elements(
 	state: TupleFlattenState,
 	label: String,
-	source: TupleElementSource,
+	source: ElementSource,
 	tuple_type: CoreType,
 ) -> BoundGroup:
-	var current: TupleFlattenState = { state | last_id = source.last_id }
+	ordered: TupleElementSource = match source:
+		TupleElements(elements):
+			elements
+		BuiltProduct(build):
+			{ prelude = [], elements = product_build_values(build), last_id = state.last_id }
+	var current: TupleFlattenState = { state | last_id = ordered.last_id }
 	var bindings: List[TupleCoreBinding] = []
 
-	for binding in source.prelude:
+	for binding in ordered.prelude:
 		rewritten: CoreMapState[TupleFlattenState, CoreExpr] = flatten_expr(current, binding.rhs)
 		current = rewritten.state
 		bindings = bindings.append({ binding | rhs = rewritten.value })
 
 	var elements: List[TupleElement] = []
 	var index: Int = 0
+	field_types: Option[List[CoreType]] = interim_product_fields(state.fields, tuple_type)
 
-	for element_expr in source.elements:
+	for element_expr in ordered.elements:
+		element_type: Option[CoreType] = match source:
+			TupleElements(_):
+				match field_types:
+					Some(types):
+						types.get(index)
+					None:
+						None
+			BuiltProduct(_):
+				-- Admission proved this equals the declared type at its checked
+				-- ordinal. The build remains the projection-order authority.
+				Some(core_expr_type(element_expr))
+		if element_type.is_none():
+			current = with_fault(current, ElementTypeMissing(tuple_type, index))
 		rewritten: CoreMapState[TupleFlattenState, CoreExpr] = flatten_expr(current, element_expr)
 		reused: ReusableElement = reusable_element(rewritten.state, rewritten.value)
 
@@ -657,16 +450,11 @@ private pure func bind_elements(
 				)
 				-- A missing element type is a fault: the bound local keeps the
 				-- expression's type only so the walk can finish before failing.
-				typed_state: TupleFlattenState = match tuple_element_type(tuple_type, index):
-					Some(_):
-						reused.state
-					None:
-						with_fault(reused.state, ElementTypeMissing(tuple_type, index))
 				element: TupleElement = {
 					variable = minted.variable,
-					typ = tuple_element_type(tuple_type, index).get_or(core_expr_type(element_expr))
+					typ = element_type.get_or(core_expr_type(element_expr))
 				}
-				current = { typed_state | last_id = minted.last_id }
+				current = { reused.state | last_id = minted.last_id }
 				bindings = bindings.append({
 					variable = element.variable,
 					typ = element.typ,
@@ -676,11 +464,16 @@ private pure func bind_elements(
 
 		index += 1
 
+	declared_elements: List[TupleElement] = match source:
+		TupleElements(_):
+			elements
+		BuiltProduct(build):
+			in_declared_order(build, elements)
 	{
 		state = current,
 		bindings = bindings,
 		group = {
-			elements = elements,
+			elements = declared_elements,
 			tuple_type = tuple_type
 		}
 	}
@@ -729,6 +522,22 @@ private pure func flatten_in_scope_of(
 		state = { rewritten.state | flattened = state.flattened },
 		value = rewritten.value
 	}
+
+
+-- Record groups have only these local producers in R1. Reject unsupported
+-- sources before paying for the function's lazy whole-use facts; tuples keep
+-- their existing checked producer analysis and its binder ordering.
+private pure func is_local_group_candidate(state: TupleFlattenState, rhs: CoreExpr) -> Bool:
+	if is_tuple_type(core_expr_type(rhs)):
+		True
+	else:
+		match rhs:
+			ProductExpr(_, _, _):
+				True
+			VarExpr(source, _, _):
+				flattened_group(state, source).is_some()
+			_:
+				False
 
 
 private pure func flatten_tuple_let(
@@ -882,7 +691,7 @@ private pure func flatten_expr(
 		LetExpr(variable, is_mutable, typ, rhs, body):
 			if is_mutable:
 				flatten_with_mutable(state, [variable], expr)
-			else if is_tuple_type(typ):
+			else if is_group_type(typ) and is_local_group_candidate(state, rhs):
 				flatten_tuple_let(state, expr, variable, rhs, body)
 			else:
 				flatten_children(state, expr)
@@ -893,12 +702,13 @@ private pure func flatten_expr(
 				loop.params.map(pure func(param: CoreParam): param.name),
 			)
 			flatten_with_mutable(state, rebound, expr)
-		-- Only a tuple local or producer has a group, so a record read is left
-		-- to `flatten_children`.
 		ProductFieldExpr(base, ordinal, _, loc):
 			flatten_element_read(state, expr, base, ordinal, loc)
 		SemanticMatchExpr(scrutinee, tree, typ, loc):
-			flatten_match(state, expr, scrutinee, tree, typ, loc)
+			if is_tuple_type(core_expr_type(scrutinee)):
+				flatten_match(state, expr, scrutinee, tree, typ, loc)
+			else:
+				flatten_children(state, expr)
 		VarExpr(variable, _, loc):
 			flatten_variable(state, expr, variable, loc)
 		_:
@@ -966,14 +776,6 @@ Whether reading `path` relies on a test: a variant payload needs its
 constructor tested, a list item its length. A path of tuple fields alone
 reads a value that is always there.
 ---
-private pure func is_root_accessor(accessor: CoreSemanticMatchAccessor) -> Bool:
-	match accessor:
-		RootSemanticMatchAccessor:
-			True
-		_:
-			False
-
-
 private pure func path_relies_on_test(path: CoreSemanticMatchAccessor) -> Bool:
 	match path:
 		RootSemanticMatchAccessor:
@@ -1058,49 +860,6 @@ private pure func same_accessor(left: CoreSemanticMatchAccessor, right: CoreSema
 					left_offset == right_offset and same_accessor(left_parent, right_parent)
 				_:
 					False
-
-
-private pure func tree_bindings(tree: CoreSemanticMatchTree) -> List[CoreSemanticMatchBinding]:
-	match tree:
-		SemanticMatchLeaf(bindings, _):
-			bindings
-		SemanticMatchFail:
-			[]
-		SemanticConstructorMatch(_, cases, fallback):
-			var bindings: List[CoreSemanticMatchBinding] = []
-
-			for match_case in cases:
-				bindings = bindings.concat(tree_bindings(match_case.body))
-
-			match fallback:
-				Some(fallback_tree):
-					bindings.concat(tree_bindings(fallback_tree))
-				None:
-					bindings
-		SemanticLiteralMatch(_, cases, fallback):
-			var bindings: List[CoreSemanticMatchBinding] = []
-
-			for match_case in cases:
-				bindings = bindings.concat(tree_bindings(match_case.body))
-
-			bindings.concat(tree_bindings(fallback))
-		SemanticLengthMatch(_, cases, geq, fallback):
-			var bindings: List[CoreSemanticMatchBinding] = []
-
-			for match_case in cases:
-				bindings = bindings.concat(tree_bindings(match_case.body))
-
-			match geq:
-				Some(geq_case):
-					bindings = bindings.concat(tree_bindings(geq_case.body))
-				None:
-					void
-
-			match fallback:
-				Some(fallback_tree):
-					bindings.concat(tree_bindings(fallback_tree))
-				None:
-					bindings
 
 
 ---
@@ -1639,6 +1398,7 @@ private record FlattenedBody {
 
 private pure func flatten_body(
 	producers: TupleElementProducers,
+	fields: CoreInterimRecordFields,
 	params: List[CoreVar],
 	body: CoreExpr,
 	id_base: Int,
@@ -1646,6 +1406,7 @@ private pure func flatten_body(
 	rewritten: CoreMapState[TupleFlattenState, CoreExpr] = flatten_expr(
 		{
 			producers = producers,
+			fields = fields,
 			local_facts = LocalFactsNotWalked(params, body),
 			last_id = id_base + 1,
 			mutable_in_scope = [],
@@ -1664,6 +1425,7 @@ private pure func flatten_body(
 
 private pure func flatten_function_body(
 	producers: TupleElementProducers,
+	fields: CoreInterimRecordFields,
 	function_info: CoreFunction,
 	id_base: Int,
 ) -> Option[FlattenedBody]:
@@ -1673,6 +1435,7 @@ private pure func flatten_function_body(
 		Some(
 			flatten_body(
 				producers,
+				fields,
 				function_info.params.map(pure func(param: CoreParam): param.name),
 				body,
 				id_base,
@@ -1694,6 +1457,7 @@ pure func flatten_tuples_program(
 	id_base: Int,
 ) -> Result[TupleFlattenedProgram, TupleFlattenFailure]:
 	producers: TupleElementProducers = tuple_element_producers(program)
+	fields: CoreInterimRecordFields = interim_record_fields(program)
 	var decls: List[CoreDecl] = []
 	var ids_used: Int = 0
 	var failure: Option[TupleFlattenFailure] = None
@@ -1701,7 +1465,7 @@ pure func flatten_tuples_program(
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(function_info):
-				match flatten_function_body(producers, function_info, id_base):
+				match flatten_function_body(producers, fields, function_info, id_base):
 					Some(flattened):
 						decls = decls.append(FunctionDecl({ function_info | body = Some(flattened.body) }))
 						ids_used = ids_used.max(flattened.ids_used)
@@ -1713,7 +1477,7 @@ pure func flatten_tuples_program(
 					var methods: List[CoreFunction] = []
 
 					for method in implementation.methods:
-						match flatten_function_body(producers, method, id_base):
+						match flatten_function_body(producers, fields, method, id_base):
 							Some(flattened):
 								methods = methods.append({ method | body = Some(flattened.body) })
 								ids_used = ids_used.max(flattened.ids_used)
@@ -1725,7 +1489,7 @@ pure func flatten_tuples_program(
 				else:
 					decls = decls.append(decl)
 			GlobalDecl(global):
-				flattened: FlattenedBody = flatten_body(producers, [], global.init, id_base)
+				flattened: FlattenedBody = flatten_body(producers, fields, [], global.init, id_base)
 				decls = decls.append(GlobalDecl({ global | init = flattened.body }))
 				ids_used = ids_used.max(flattened.ids_used)
 				failure = first_failure(failure, global.name.name, flattened.fault)
@@ -1752,7 +1516,7 @@ pure func flatten_tuples_expr(expr: CoreExpr, id_base: Int) -> Result[CoreExpr, 
 		foreign_includes = [],
 		source_files = []
 	}
-	flattened: FlattenedBody = flatten_body(tuple_element_producers(empty_program), [], expr, id_base)
+	flattened: FlattenedBody = flatten_body(tuple_element_producers(empty_program), interim_record_fields(empty_program), [], expr, id_base)
 
 	match flattened.fault:
 		Some(fault):

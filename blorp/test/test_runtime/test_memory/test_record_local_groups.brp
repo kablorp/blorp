@@ -1,0 +1,262 @@
+-- R1 removes containers for immutable literal records and aliases used only
+-- through fields. These intervals include the workload, but no stats reports,
+-- formatting, or test-runner setup. Whole uses still require managed records.
+-- Run with --leak-check so both counter gates are active.
+import:
+	channel: RecvAttempt(RecvValue, RecvWouldBlock), channel, send, try_recv_attempt
+	memory:
+		MemoryCounter(ManagedAllocations, ManagedReleases, LiveManagedObjects, MemoryStatsActive, OracleStatsActive),
+		read_memory_counter, same_object
+	test: TestSuite
+
+
+record Pair {
+	first: Int,
+	second: Int
+}
+
+
+record ManagedChild {
+	items: List[Int],
+	index: Int
+}
+
+
+func counting() -> Bool:
+	read_memory_counter(MemoryStatsActive) == 1 and read_memory_counter(OracleStatsActive) == 1
+
+
+pure func scalar_fields(rounds: Int) -> Int:
+	var total: Int = 0
+	for index in 0..rounds:
+		pair: Pair = { first = index, second = index + 1 }
+		total += pair.first + pair.second
+	total
+
+
+func test_scalar_local_has_no_container() -> Bool:
+	before = read_memory_counter(ManagedAllocations)
+	value = scalar_fields(32)
+	after = read_memory_counter(ManagedAllocations)
+	counting() and after - before == 0 and value == 1024
+
+
+pure func alias_fields(rounds: Int) -> Int:
+	var total: Int = 0
+	for index in 0..rounds:
+		pair: Pair = { first = index, second = index + 1 }
+		copy: Pair = pair
+		other: Pair = copy
+		total += pair.first + copy.second + other.first
+	total
+
+
+func test_immutable_aliases_keep_field_values() -> Bool:
+	before = read_memory_counter(ManagedAllocations)
+	value = alias_fields(32)
+	after = read_memory_counter(ManagedAllocations)
+	counting() and after - before == 0 and value == 1520
+
+
+pure func shared_child_fields(rounds: Int) -> Int:
+	items: List[Int] = [7, 8]
+	var total: Int = 0
+	for index in 0..rounds:
+		state: ManagedChild = { items = items, index = index }
+		copy: ManagedChild = state
+		if same_object(state.items, items) and same_object(copy.items, items):
+			total += state.index + copy.items.length()
+		else:
+			total -= 1000
+	total
+
+
+func test_shared_child_keeps_identity_and_releases_once() -> Bool:
+	before_allocations = read_memory_counter(ManagedAllocations)
+	before_releases = read_memory_counter(ManagedReleases)
+	before_live = read_memory_counter(LiveManagedObjects)
+	value = shared_child_fields(32)
+	after_live = read_memory_counter(LiveManagedObjects)
+	after_releases = read_memory_counter(ManagedReleases)
+	after_allocations = read_memory_counter(ManagedAllocations)
+	(
+		counting() and value == 560
+		and after_allocations - before_allocations == 1
+		and after_releases - before_releases == 1
+		and after_live == before_live
+	)
+
+
+pure func fresh_child_fields(rounds: Int) -> Int:
+	var total: Int = 0
+	for index in 0..rounds:
+		items: List[Int] = [index, index + 1]
+		state: ManagedChild = { items = items, index = index }
+		copy: ManagedChild = state
+		child: List[Int] = copy.items
+		if same_object(child, items):
+			total += state.items.get(0).get_or(-1) + child.get(1).get_or(-1)
+		else:
+			total -= 1000
+	total
+
+
+func test_fresh_children_and_aliases_drop_without_containers() -> Bool:
+	before_allocations = read_memory_counter(ManagedAllocations)
+	before_releases = read_memory_counter(ManagedReleases)
+	before_live = read_memory_counter(LiveManagedObjects)
+	value = fresh_child_fields(32)
+	after_live = read_memory_counter(LiveManagedObjects)
+	after_releases = read_memory_counter(ManagedReleases)
+	after_allocations = read_memory_counter(ManagedAllocations)
+	(
+		counting() and value == 1024
+		and after_allocations - before_allocations == 32
+		and after_releases - before_releases == 32
+		and after_live == before_live
+	)
+
+
+func test_alias_children_keep_their_snapshot() -> Bool:
+	var items: List[Int] = [7, 8]
+	state: ManagedChild = { items = items, index = 2 }
+	copy: ManagedChild = state
+	items = items.append(9)
+	(
+		state.items.length() == 2 and copy.items.length() == 2
+		and items.length() == 3 and state.index == 2 and copy.index == 2
+		and same_object(state.items, copy.items)
+		and not same_object(copy.items, items)
+	)
+
+
+func logged_field(log: Channel[Int], value: Int) -> Int:
+	_ = send(log, value)
+	value
+
+
+func logged_child(log: Channel[Int]) -> List[Int]:
+	_ = send(log, 7)
+	[7, 8]
+
+
+func unused_child_field(log: Channel[Int]) -> Int:
+	state: ManagedChild = { items = logged_child(log), index = 9 }
+	state.index
+
+
+func test_unused_managed_child_evaluates_once_and_is_released() -> Bool:
+	log: Channel[Int] = channel(4)
+	before_allocations = read_memory_counter(ManagedAllocations)
+	before_releases = read_memory_counter(ManagedReleases)
+	before_live = read_memory_counter(LiveManagedObjects)
+	value: Int = unused_child_field(log)
+	after_live = read_memory_counter(LiveManagedObjects)
+	after_releases = read_memory_counter(ManagedReleases)
+	after_allocations = read_memory_counter(ManagedAllocations)
+	evaluated: Bool = match try_recv_attempt(log):
+		RecvValue(7):
+			True
+		_:
+			False
+	only_once: Bool = match try_recv_attempt(log):
+		RecvWouldBlock:
+			True
+		_:
+			False
+	(
+		counting() and value == 9 and evaluated and only_once
+		and after_allocations - before_allocations == 1
+		and after_releases - before_releases == 1
+		and after_live == before_live
+	)
+
+
+func test_fields_evaluate_once_in_written_order() -> Bool:
+	log: Channel[Int] = channel(4)
+	before = read_memory_counter(ManagedAllocations)
+	pair: Pair = { second = logged_field(log, 2), first = logged_field(log, 1) }
+	value: Int = pair.first + pair.second + pair.first
+	after = read_memory_counter(ManagedAllocations)
+	second_first: Bool = match try_recv_attempt(log):
+		RecvValue(2):
+			True
+		_:
+			False
+	first_second: Bool = match try_recv_attempt(log):
+		RecvValue(1):
+			True
+		_:
+			False
+	only_twice: Bool = match try_recv_attempt(log):
+		RecvWouldBlock:
+			True
+		_:
+			False
+	counting() and after - before == 0 and value == 4 and second_first and first_second and only_twice
+
+
+func test_root_identity_keeps_the_record_box() -> Bool:
+	before = read_memory_counter(ManagedAllocations)
+	pair: Pair = { first = 7, second = 8 }
+	copy: Pair = pair
+	identity: Bool = same_object(pair, copy)
+	after = read_memory_counter(ManagedAllocations)
+	counting() and after - before == 1 and identity and copy.second == 8
+
+
+-- Recursive whole-argument use cannot disappear through ordinary inlining.
+pure func recursive_sum(pair: Pair, depth: Int) -> Int:
+	if depth == 0:
+		pair.first + pair.second
+	else:
+		recursive_sum(pair, depth - 1) + 1
+
+
+func test_whole_call_keeps_the_record_box() -> Bool:
+	before = read_memory_counter(ManagedAllocations)
+	pair: Pair = { first = 7, second = 8 }
+	value: Int = recursive_sum(pair, 3)
+	after = read_memory_counter(ManagedAllocations)
+	counting() and after - before == 1 and value == 18
+
+
+func test_whole_storage_keeps_the_record_box() -> Bool:
+	before = read_memory_counter(ManagedAllocations)
+	pair: Pair = { first = 7, second = 8 }
+	pairs: List[Pair] = [pair]
+	after = read_memory_counter(ManagedAllocations)
+	stored: Bool = match pairs:
+		[first, ..._]:
+			same_object(first, pair) and first.second == 8
+		[]:
+			False
+	counting() and after - before == 2 and stored
+
+
+-- The captured root is observed whole; projection capture cannot replace it.
+func test_whole_capture_keeps_the_record_box() -> Bool:
+	before = read_memory_counter(ManagedAllocations)
+	pair: Pair = { first = 7, second = 8 }
+	inspect = func() -> Bool: same_object(pair, pair) and pair.second == 8
+	identity: Bool = inspect()
+	after = read_memory_counter(ManagedAllocations)
+	counting() and after - before == 2 and identity
+
+
+tests: TestSuite = {
+	description = "Immutable record local groups",
+	tests = [
+		("a scalar local has no container", test_scalar_local_has_no_container),
+		("immutable aliases keep field values", test_immutable_aliases_keep_field_values),
+		("a shared child keeps identity and releases once", test_shared_child_keeps_identity_and_releases_once),
+		("fresh children and aliases drop without containers", test_fresh_children_and_aliases_drop_without_containers),
+		("alias children keep their snapshot", test_alias_children_keep_their_snapshot),
+		("an unused managed child evaluates once and is released", test_unused_managed_child_evaluates_once_and_is_released),
+		("fields evaluate once in written order", test_fields_evaluate_once_in_written_order),
+		("root identity keeps the record box", test_root_identity_keeps_the_record_box),
+		("a whole call keeps the record box", test_whole_call_keeps_the_record_box),
+		("whole storage keeps the record box", test_whole_storage_keeps_the_record_box),
+		("a whole capture keeps the record box", test_whole_capture_keeps_the_record_box),
+	]
+}

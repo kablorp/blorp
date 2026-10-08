@@ -1,0 +1,432 @@
+-- Native adapters use exact registered rows and explicit ownership contracts.
+import:
+	../test_support_core_native_product: native_process_product_fixture
+	../../../src/compiler/stage_09_core/ir:
+		CoreDecl(GeneratedTupleRecordDecl),
+		CoreProgram,
+		CoreTupleStorageCatalog,
+		CoreType(HeapRecordType, NamedType, TupleType, VoidType),
+		core_generated_tuple_record_decl,
+		core_generated_tuple_record_elements,
+		core_type_equal,
+		generated_tuple_record_for_type,
+		tuple_storage_type,
+		tuple_storage_catalog,
+		synthetic_core_source_loc,
+	../../../src/compiler/stage_10_backend/emit_tuple_product_adapters:
+		CNativeProductAdapterEmission,
+		CNativeProductAdapterFault(
+			NativeProductArityMismatch, NativeProductFieldTypeMismatch,
+			NativeProductMemberMismatch, NativeProductRowUnavailable,
+			NativeProcessOptionsShapeMismatch,
+			NativeProductFieldCodecUnavailable, NativeProductFieldOwnershipUnavailable,
+		),
+		CNativeProductFactoryKind(
+			DictionaryEntryProductFactory, EnumeratedProductFactory,
+			ProcessErrorProductFactory, ProcessOutputProductFactory,
+			ProcessSuccessProductFactory, VectorPairProductFactory,
+		),
+		CNativeProductStorageSymbols,
+		CRuntimeProductAdapterOps,
+		CUnfoldProductResultRepresentation(NullableUnfoldProductResult, BoxedUnfoldProductResult),
+		emit_native_product_factory,
+		emit_native_unfold_product_adapter,
+		emit_native_process_options_snapshot,
+		emit_native_process_session_snapshot,
+	test: TestSuite
+
+
+private pure func named(name: String) -> CoreType:
+	NamedType(name, [])
+
+
+private pure func registered_catalog(elements: List[CoreType]) -> Option[CoreTupleStorageCatalog]:
+	match core_generated_tuple_record_decl("Pair", elements, synthetic_core_source_loc()):
+		Ok(row):
+			program: CoreProgram = { decls = [GeneratedTupleRecordDecl(row)], foreign_includes = [], source_files = [] }
+			match tuple_storage_catalog(program):
+				Ok(catalog):
+					Some(catalog)
+				Err(_):
+					None
+		Err(_):
+			None
+
+
+private pure func adapter_ops(members: List[Option[String]]) -> CRuntimeProductAdapterOps:
+	type_name: pure (CoreType) -> String = func(typ): "Field"
+	symbols: pure (CoreType) -> Option[CNativeProductStorageSymbols] = func(typ):
+		if core_type_equal(typ, HeapRecordType("Pair")):
+			Some({ c_type = "Pair*", make_name = "Pair_make", members = members })
+		else:
+			None
+	decode: pure (CoreType, String) -> Option[String] = func(typ, value): Some("decode(" + value + ")")
+	encode: pure (CoreType, String) -> Option[String] = func(typ, value): Some("encode_owned(" + value + ")")
+	read_vector: pure (CoreType, String, String) -> Option[String] = func(typ, vector, index): Some("read_typed(" + vector + ", " + index + ")")
+	retain: pure (CoreType, String) -> Option[String] = func(typ, value): Some("  retain_field(" + value + ");\n")
+	{
+		c_type = type_name,
+		resolve_product_type = func(typ): Some(typ),
+		product_symbols = symbols,
+		decode_borrowed_slot = decode,
+		encode_owned_slot = encode,
+		read_vector_element = read_vector,
+		retain_typed = retain,
+	}
+
+
+private pure func factory(
+	elements: List[CoreType],
+	kind: CNativeProductFactoryKind,
+	members: List[Option[String]],
+) -> Result[CNativeProductAdapterEmission, CNativeProductAdapterFault]:
+	match registered_catalog(elements):
+		Some(catalog):
+			emit_native_product_factory(catalog, {
+				kind = kind,
+				result_type = HeapRecordType("Pair"),
+				callback_name = "make_native_pair",
+			}, adapter_ops(members))
+		None:
+			Err(NativeProductRowUnavailable(TupleType(elements)))
+
+
+pure func test_native_pair_decodes_and_retains_borrowed_fields() -> Bool:
+	match factory([named("String"), named("String")], DictionaryEntryProductFactory, [Some("f0"), Some("f1")]):
+		Ok(result):
+			(
+				result.declarations.contains("void* first, void* second")
+				and result.declarations.contains("__product_field_0 = decode(first)")
+				and result.declarations.contains("__product_field_1 = decode(second)")
+				and result.declarations.contains("retain_field(__product_field_0)")
+				and result.declarations.contains("retain_field(__product_field_1)")
+				and result.declarations.contains("Pair_make(__product_field_0, __product_field_1)")
+			)
+		_:
+			False
+
+
+pure func test_native_pair_preserves_unit_ordinal_without_physical_argument() -> Bool:
+	match factory([VoidType, named("String")], DictionaryEntryProductFactory, [None, Some("f1")]):
+		Ok(result):
+			(
+				result.declarations.contains("(void)first;")
+				and not result.declarations.contains("decode(first)")
+				and result.declarations.contains("decode(second)")
+				and result.declarations.contains("Pair_make(__product_field_1)")
+			)
+		_:
+			False
+
+
+pure func test_all_unit_vector_pair_preserves_callback_parameters() -> Bool:
+	match factory([VoidType, VoidType], VectorPairProductFactory, [None, None]):
+		Ok(result):
+			(
+				result.declarations.contains("(void)first;")
+				and result.declarations.contains("(void)second;")
+				and result.declarations.contains("(void)index;")
+				and result.declarations.contains("Pair_make()")
+				and not result.declarations.contains("read_typed(")
+				and not result.declarations.contains("retain_field(")
+			)
+		_:
+			False
+
+
+pure func test_vector_pair_uses_typed_reader_for_both_inputs() -> Bool:
+	match factory([named("Bool"), named("Float")], VectorPairProductFactory, [Some("f0"), Some("f1")]):
+		Ok(result):
+			(
+				result.declarations.contains("const blorp_Vector* first, const blorp_Vector* second, long index")
+				and result.declarations.contains("read_typed(first, index)")
+				and result.declarations.contains("read_typed(second, index)")
+				and not result.declarations.contains("decode(")
+			)
+		_:
+			False
+
+
+pure func test_enumeration_requires_int_index_field() -> Bool:
+	match factory([named("Bool"), named("String")], EnumeratedProductFactory, [Some("f0"), Some("f1")]):
+		Err(fault):
+			match fault:
+				NativeProductFieldTypeMismatch(0, expected, actual):
+					core_type_equal(expected, named("Int")) and core_type_equal(actual, named("Bool"))
+				_:
+					False
+		_:
+			False
+
+
+pure func test_process_factories_consume_owned_native_fields() -> Bool:
+	outputs = factory([named("String"), named("String"), named("Int")], ProcessOutputProductFactory, [Some("f0"), Some("f1"), Some("f2")])
+	errors = factory([named("Int"), named("String")], ProcessErrorProductFactory, [Some("f0"), Some("f1")])
+	successes = factory([named("Int"), named("Int"), named("Bytes"), named("Bytes")], ProcessSuccessProductFactory, [Some("f0"), Some("f1"), Some("f2"), Some("f3")])
+	match outputs:
+		Ok(output):
+			match errors:
+				Ok(error):
+					match successes:
+						Ok(success):
+							(
+								not output.declarations.contains("retain_field(")
+								and not error.declarations.contains("retain_field(")
+								and not success.declarations.contains("retain_field(")
+								and output.declarations.contains("blorp_String* stdout_string, blorp_String* stderr_string, long exit_code")
+								and error.declarations.contains("long kind, blorp_String* detail")
+								and success.declarations.contains("blorp_Bytes* stdout_bytes, blorp_Bytes* stderr_bytes")
+							)
+						Err(_):
+							False
+				Err(_):
+					False
+		Err(_):
+			False
+
+
+pure func test_native_factory_rejects_wrong_arity() -> Bool:
+	match factory([named("Int"), named("Int"), named("Int")], DictionaryEntryProductFactory, [Some("f0"), Some("f1"), Some("f2")]):
+		Err(fault):
+			match fault:
+				NativeProductArityMismatch(_, _):
+					True
+				_:
+					False
+		_:
+			False
+
+
+pure func test_native_factory_rejects_member_for_unit() -> Bool:
+	match factory([VoidType, named("Int")], DictionaryEntryProductFactory, [Some("f0"), Some("f1")]):
+		Err(fault):
+			match fault:
+				NativeProductMemberMismatch(0):
+					True
+				_:
+					False
+		_:
+			False
+
+
+pure func test_native_factory_rejects_unregistered_product_type() -> Bool:
+	match registered_catalog([named("Int"), named("Int")]):
+		Some(catalog):
+			match emit_native_product_factory(catalog, {
+				kind = DictionaryEntryProductFactory,
+				result_type = HeapRecordType("AuthoredPair"),
+				callback_name = "make_native_pair",
+			}, adapter_ops([Some("f0"), Some("f1")])):
+				Err(_):
+					True
+				Ok(_):
+					False
+		None:
+			False
+
+
+pure func test_unfold_retains_outputs_before_dropping_nullable_pair() -> Bool:
+	catalog = registered_catalog([named("String"), named("String")])
+	match catalog:
+		Some(rows):
+			match emit_native_unfold_product_adapter(rows, {
+				pair_type = HeapRecordType("Pair"), callback_name = "step_pair", result_representation = NullableUnfoldProductResult,
+			}, adapter_ops([Some("f0"), Some("f1")])):
+				Ok(result):
+					(
+						result.declarations.contains("if (!__pair) return false")
+						and result.declarations.contains("retain_field(__product_field_0)")
+						and result.declarations.contains("retain_field(__product_field_1)")
+						and result.declarations.contains("*value = encode_owned(__product_field_0)")
+						and result.declarations.contains("*next_state = encode_owned(__product_field_1);\n  blorp_release(__pair)")
+						and not result.declarations.contains("release_mask")
+					)
+				Err(_):
+					False
+		None:
+			False
+
+
+pure func test_unfold_unit_has_no_member_and_boxed_result_is_released() -> Bool:
+	match registered_catalog([VoidType, named("String")]):
+		Some(catalog):
+			match emit_native_unfold_product_adapter(catalog, {
+				pair_type = HeapRecordType("Pair"), callback_name = "step_pair", result_representation = BoxedUnfoldProductResult,
+			}, adapter_ops([None, Some("f1")])):
+				Ok(result):
+					(
+						result.declarations.contains("BLORP_TAG_SOME")
+						and result.declarations.contains("*value = (void*)0")
+						and not result.declarations.contains("__pair->f0")
+						and result.declarations.contains("*next_state = encode_owned(__product_field_1);\n  blorp_release(__step)")
+					)
+				Err(_):
+					False
+		None:
+			False
+
+
+private pure func process_catalog() -> Option[(CoreTupleStorageCatalog, CoreType)]:
+	match native_process_product_fixture():
+		Some(fixture): Some((fixture[0], fixture[1]))
+		None: None
+
+
+private pure func process_adapter_ops(catalog: CoreTupleStorageCatalog) -> CRuntimeProductAdapterOps:
+	symbols: pure (CoreType) -> Option[CNativeProductStorageSymbols] = func(typ):
+		match generated_tuple_record_for_type(catalog, typ):
+			Some(row):
+				members: List[Option[String]] = core_generated_tuple_record_elements(row).enumerate().map(func(entry): Some("f" + entry[0].to_string()))
+				Some({ c_type = "Product*", make_name = "Product_make", members = members })
+			None:
+				None
+	{ adapter_ops([]) | product_symbols = symbols }
+
+
+pure func test_process_snapshot_reads_exact_nested_members() -> Bool:
+	match process_catalog():
+		Some(fixture):
+			catalog = fixture[0]
+			match emit_native_process_options_snapshot(catalog, fixture[1], "options", "native_options", process_adapter_ops(catalog)):
+				Ok(code):
+					(
+						code.contains("blorp_ProcessCommandOptions native_options")
+						and code.contains(".cwd = ((options)->f0)->f0")
+						and code.contains(".has_cwd = ((options)->f0)->f1")
+						and code.contains(".environment_set_names = ((options)->f1)->f0")
+						and code.contains(".environment_set_values = ((options)->f1)->f1")
+						and code.contains(".environment_unset_names = ((options)->f1)->f2")
+						and code.contains(".stdin_mode = ((options)->f2)->f0")
+						and code.contains(".stdin_bytes = (((options)->f2)->f1)->f0")
+						and code.contains(".stdin_bytes_parts = (((options)->f2)->f1)->f1")
+						and code.contains(".stdout_mode = ((options)->f2)->f2")
+						and code.contains(".stderr_mode = ((options)->f2)->f3")
+						and code.contains(".has_timeout = ((options)->f3)->f0")
+						and code.contains(".timeout_ms = ((options)->f3)->f1")
+						and code.contains(".group_mode = ((options)->f3)->f2")
+						and code.contains(".capture_limit = ((options)->f3)->f3")
+						and not code.contains("retain_field(")
+					)
+				Err(_):
+					False
+		None:
+			False
+
+
+pure func test_process_snapshot_rejects_wrong_logical_shape() -> Bool:
+	match registered_catalog([named("Int"), named("Int")]):
+		Some(catalog):
+			match emit_native_process_options_snapshot(catalog, HeapRecordType("Pair"), "options", "native_options", adapter_ops([Some("f0"), Some("f1")])):
+				Err(fault):
+					match fault:
+						NativeProcessOptionsShapeMismatch(_):
+							True
+						_:
+							False
+				Ok(_):
+					False
+		None:
+			False
+
+
+pure func test_unfold_rejects_missing_retain_operation() -> Bool:
+	match registered_catalog([named("String"), named("String")]):
+		Some(catalog):
+			no_retain: pure (CoreType, String) -> Option[String] = func(typ, value): None
+			ops = { adapter_ops([Some("f0"), Some("f1")]) | retain_typed = no_retain }
+			match emit_native_unfold_product_adapter(catalog, {
+				pair_type = HeapRecordType("Pair"), callback_name = "step_pair", result_representation = NullableUnfoldProductResult,
+			}, ops):
+				Err(fault):
+					match fault:
+						NativeProductFieldOwnershipUnavailable(0, _):
+							True
+						_:
+							False
+				Ok(_):
+					False
+		None:
+			False
+
+
+pure func test_unfold_rejects_missing_encode_operation() -> Bool:
+	match registered_catalog([named("String"), named("String")]):
+		Some(catalog):
+			no_encode: pure (CoreType, String) -> Option[String] = func(typ, value): None
+			ops = { adapter_ops([Some("f0"), Some("f1")]) | encode_owned_slot = no_encode }
+			match emit_native_unfold_product_adapter(catalog, {
+				pair_type = HeapRecordType("Pair"), callback_name = "step_pair", result_representation = NullableUnfoldProductResult,
+			}, ops):
+				Err(fault):
+					match fault:
+						NativeProductFieldCodecUnavailable(0, _):
+							True
+						_:
+							False
+				Ok(_):
+					False
+		None:
+			False
+
+
+pure func test_session_snapshot_resolves_the_accepted_opaque_row() -> Bool:
+	match process_catalog():
+		Some(fixture):
+			catalog = fixture[0]
+			match generated_tuple_record_for_type(catalog, fixture[1]):
+				Some(options_row):
+					options_type = TupleType(core_generated_tuple_record_elements(options_row))
+					match tuple_storage_type(catalog, TupleType([named("String"), NamedType("List", [named("String")]), options_type])):
+						Ok(session_type):
+							resolve: pure (CoreType) -> Option[CoreType] = func(typ):
+								if core_type_equal(typ, named("SessionFixture")):
+									Some(session_type)
+								else:
+									Some(typ)
+							ops = { process_adapter_ops(catalog) | resolve_product_type = resolve }
+							match emit_native_process_session_snapshot(catalog, named("SessionFixture"), "request", "session_options", ops):
+								Ok(snapshot):
+									(
+										snapshot.command == "(((Product*)(request)))->f0"
+										and snapshot.arguments == "(((Product*)(request)))->f1"
+										and snapshot.options_address == "&session_options"
+										and snapshot.statements.contains("->f2)->f0)->f0")
+										and not snapshot.statements.contains("retain_field(")
+									)
+								Err(_): False
+						Err(_): False
+				None: False
+		None: False
+
+
+pure func test_session_snapshot_rejects_an_unregistered_alias() -> Bool:
+	match process_catalog():
+		Some(fixture):
+			unresolved: pure (CoreType) -> Option[CoreType] = func(typ): None
+			ops = { process_adapter_ops(fixture[0]) | resolve_product_type = unresolved }
+			emit_native_process_session_snapshot(fixture[0], named("MissingSession"), "request", "session_options", ops).is_err()
+		None: False
+
+
+tests: TestSuite = {
+	description = "Core native product adapters",
+	tests = [
+		("borrowed entry fields decoded and retained", test_native_pair_decodes_and_retains_borrowed_fields),
+		("unit ordinal has no physical argument", test_native_pair_preserves_unit_ordinal_without_physical_argument),
+		("unit vector pair preserves callback parameters", test_all_unit_vector_pair_preserves_callback_parameters),
+		("vector pair loads concrete storage", test_vector_pair_uses_typed_reader_for_both_inputs),
+		("enumeration validates index type", test_enumeration_requires_int_index_field),
+		("process factories consume owned fields", test_process_factories_consume_owned_native_fields),
+		("native factory rejects wrong arity", test_native_factory_rejects_wrong_arity),
+		("native factory rejects member for unit", test_native_factory_rejects_member_for_unit),
+		("native factory rejects unregistered row", test_native_factory_rejects_unregistered_product_type),
+		("unfold transfers outputs before pair drop", test_unfold_retains_outputs_before_dropping_nullable_pair),
+		("unfold unit and boxed owner", test_unfold_unit_has_no_member_and_boxed_result_is_released),
+		("process snapshot typed member paths", test_process_snapshot_reads_exact_nested_members),
+		("process snapshot rejects wrong logical shape", test_process_snapshot_rejects_wrong_logical_shape),
+		("session snapshot resolves accepted opaque row", test_session_snapshot_resolves_the_accepted_opaque_row),
+		("session snapshot rejects unregistered alias", test_session_snapshot_rejects_an_unregistered_alias),
+		("unfold rejects missing retain operation", test_unfold_rejects_missing_retain_operation),
+		("unfold rejects missing encode operation", test_unfold_rejects_missing_encode_operation),
+	]
+}

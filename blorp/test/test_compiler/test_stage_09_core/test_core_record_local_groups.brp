@@ -1,0 +1,486 @@
+-- Local record groups must preserve the checked build's written order while
+-- field projections continue to use declaration ordinals. The program API is
+-- intentional: a named record without a concrete declaration stays boxed.
+import:
+	../test_support_core_product_build: fixture_build
+	../../../src/compiler/stage_09_core/function_origin_fixture:
+		FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN,
+	../../../src/compiler/stage_09_core/ir:
+		CoreBinaryOp(AddOp),
+		CoreBinderOrigin(AuthoredBinder),
+		CoreCallKind(UserCall),
+		CoreDecl(FunctionDecl, GeneratedTupleRecordDecl, HeapRecordDecl),
+		CoreExpr(AssignExpr, BinaryExpr, CallExpr, LambdaExpr, LetExpr, LiteralExpr, ProductExpr, ProductFieldExpr, SemanticMatchExpr, SeqExpr, VarExpr),
+		CoreFunctionKind(UserFunction),
+		CoreHeapRecordField,
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		CoreRecordForm(OrdinaryRecordForm),
+		CoreReleasePolicy(NoReleasePolicy),
+		CoreSemanticMatchTree(SemanticMatchLeaf),
+		CoreType(FunctionType, HeapRecordType, NamedType, TupleType, VoidType),
+		CoreVar,
+		FIRST_MINTED_BINDER_ID,
+		core_expr_type,
+		core_generated_tuple_record_decl,
+		core_field_ordinal,
+		core_field_ref,
+		core_var_equal,
+		synthetic_core_source_loc,
+	../../../src/compiler/stage_09_core/product_group_uses: contains_var, is_group_type, product_group_uses
+	../../../src/compiler/stage_09_core/product_type:
+		CoreInterimRecordFields,
+		core_product_of, interim_product_fields, interim_product_field_count, interim_record_fields
+	../../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
+	../../../src/compiler/stage_09_core/tuple_flatten: flatten_tuples_program
+	memory: same_object
+	test: TestSuite
+
+
+TY_INT: CoreType = NamedType("Int", [])
+TY_PAIR: CoreType = HeapRecordType("LocalPair")
+TY_CHILD_PAIR: CoreType = HeapRecordType("ChildPair")
+TY_ROWS: CoreType = NamedType("List", [TY_INT])
+
+
+private pure func binder(name: String, id: Int) -> CoreVar:
+	{ name = name, id = id, def_id = None, origin = AuthoredBinder }
+
+
+private pure func read(variable: CoreVar, typ: CoreType) -> CoreExpr:
+	VarExpr(variable, typ, synthetic_core_source_loc())
+
+
+private pure func integer(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), TY_INT, synthetic_core_source_loc())
+
+
+private pure func field(base: CoreExpr, ordinal: Int, typ: CoreType) -> CoreExpr:
+	ProductFieldExpr(base, core_field_ordinal(ordinal), typ, synthetic_core_source_loc())
+
+
+private pure func add(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	BinaryExpr(AddOp, left, right, TY_INT, synthetic_core_source_loc())
+
+
+private pure func call(name: String, args: List[CoreExpr], typ: CoreType) -> CoreExpr:
+	CallExpr(
+		UserCall(name, None, []),
+		read(binder(name, 0), FunctionType(False, args.map(core_expr_type), typ)),
+		args,
+		typ,
+		synthetic_core_source_loc(),
+	)
+
+
+private pure func pair(first: CoreExpr, second: CoreExpr) -> CoreExpr:
+	ProductExpr(fixture_build(2, [(0, first), (1, second)]), TY_PAIR, synthetic_core_source_loc())
+
+
+private pure func record_field(name: String, ordinal: Int, typ: CoreType) -> CoreHeapRecordField:
+	{ name = name, ref = core_field_ref(ordinal + 1), typ = typ, release_policy = NoReleasePolicy }
+
+
+private pure func record_decl(name: String, types: List[CoreType]) -> CoreDecl:
+	fields = types.enumerate().map(pure func(entry: (Int, CoreType)) -> CoreHeapRecordField:
+		(ordinal, typ) = entry
+		record_field("field_${ordinal}", ordinal, typ)
+	)
+	HeapRecordDecl({
+		abi_type = None,
+		form = OrdinaryRecordForm,
+		name = name,
+		type_params = [],
+		fields = fields,
+		loc = synthetic_core_source_loc()
+	})
+
+
+private pure func program(body: CoreExpr, with_shape: Bool) -> CoreProgram:
+	function = FunctionDecl({
+		name = "local_groups",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = core_expr_type(body),
+		body = Some(body),
+		is_pure = False,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = 1,
+		loc = synthetic_core_source_loc()
+	})
+	declarations: List[CoreDecl] = if with_shape:
+		[record_decl("LocalPair", [TY_INT, TY_INT]), record_decl("ChildPair", [TY_ROWS, TY_INT]), record_decl("Container", [TY_PAIR, TY_INT]), function]
+	else:
+		[function]
+
+	{ decls = declarations, foreign_includes = [], source_files = [] }
+
+
+private pure func flattened(body: CoreExpr, with_shape: Bool) -> Option[CoreExpr]:
+	match flatten_tuples_program(program(body, with_shape), FIRST_MINTED_BINDER_ID):
+		Ok(result):
+			var found: Option[CoreExpr] = None
+			for declaration in result.program.decls:
+				match declaration:
+					FunctionDecl(function): found = function.body
+					_: void
+			found
+		Err(_): None
+
+
+private pure func products(body: CoreExpr) -> Int:
+	own: Int = match body:
+		ProductExpr(_, _, _): 1
+		_: 0
+	var total: Int = own
+	for child in immediate_core_expr_children(body):
+		total += products(child)
+	total
+
+
+-- A small semantic oracle for scalar lets avoids pinning temporary spelling
+-- or the choice between literal substitution and an immutable field owner.
+private pure func scalar_value(body: CoreExpr, values: List[(CoreVar, Int)]) -> Option[Int]:
+	match body:
+		LiteralExpr(IntLiteral(value), _, _): Some(value)
+		VarExpr(variable, _, _):
+			var found: Option[Int] = None
+			for entry in values.reverse():
+				(candidate, value) = entry
+				if core_var_equal(variable, candidate):
+					found = Some(value)
+					break
+			found
+		LetExpr(variable, False, _, rhs, rest):
+			match scalar_value(rhs, values):
+				Some(value): scalar_value(rest, values.append((variable, value)))
+				None: None
+		BinaryExpr(AddOp, left, right, _, _):
+			match (scalar_value(left, values), scalar_value(right, values)):
+				(Some(first), Some(second)): Some(first + second)
+				_: None
+		_: None
+
+
+pure func test_literal_alias_chain_loses_container() -> Bool:
+	owner = binder("pair", 2)
+	copy = binder("alias", 3)
+	second_alias = binder("second_alias", 4)
+	body = LetExpr(owner, False, TY_PAIR, pair(integer(11), integer(7)),
+		LetExpr(copy, False, TY_PAIR, read(owner, TY_PAIR),
+			LetExpr(second_alias, False, TY_PAIR, read(copy, TY_PAIR),
+				add(field(read(second_alias, TY_PAIR), 0, TY_INT), field(read(owner, TY_PAIR), 1, TY_INT)))))
+	match flattened(body, True):
+		Some(result): products(result) == 0 and scalar_value(result, []) == Some(18)
+		None: False
+
+
+pure func test_reversed_written_order_binds_once_and_maps_ordinals() -> Bool:
+	owner = binder("pair", 2)
+	second = call("second_effect", [], TY_INT)
+	first = call("first_effect", [], TY_INT)
+	build = ProductExpr(fixture_build(2, [(1, second), (0, first)]), TY_PAIR, synthetic_core_source_loc())
+	body = LetExpr(owner, False, TY_PAIR, build,
+		add(field(read(owner, TY_PAIR), 0, TY_INT), field(read(owner, TY_PAIR), 1, TY_INT)))
+	match flattened(body, True):
+		Some(LetExpr(second_owner, False, _, second_rhs, LetExpr(first_owner, False, _, first_rhs,
+			BinaryExpr(AddOp, VarExpr(first_use, _, _), VarExpr(second_use, _, _), _, _)))):
+			(
+				same_object(second, second_rhs) and same_object(first, first_rhs)
+				and core_var_equal(first_owner, first_use)
+				and core_var_equal(second_owner, second_use)
+				and not core_var_equal(first_owner, second_owner)
+			)
+		_: False
+
+
+pure func test_same_raw_id_does_not_merge_distinct_locals() -> Bool:
+	flattened_owner = binder("projected", 2)
+	boxed_owner = binder("escaped", 2)
+	body = LetExpr(flattened_owner, False, TY_PAIR, pair(integer(11), integer(7)),
+		LetExpr(boxed_owner, False, TY_PAIR, pair(integer(3), integer(5)),
+			SeqExpr(call("sink", [read(boxed_owner, TY_PAIR)], TY_INT), field(read(flattened_owner, TY_PAIR), 0, TY_INT))))
+	match flattened(body, True):
+		Some(result): products(result) == 1 and not core_var_equal(flattened_owner, boxed_owner)
+		None: False
+
+
+pure func test_unused_field_effect_is_still_evaluated() -> Bool:
+	owner = binder("pair", 2)
+	unused = call("unused_effect", [], TY_INT)
+	used = call("used_effect", [], TY_INT)
+	body = LetExpr(owner, False, TY_PAIR, pair(unused, used), field(read(owner, TY_PAIR), 1, TY_INT))
+	match flattened(body, True):
+		Some(LetExpr(_, False, _, unused_rhs, LetExpr(used_owner, False, _, used_rhs, VarExpr(used_ref, _, _)))):
+			same_object(unused_rhs, unused) and same_object(used_rhs, used) and core_var_equal(used_owner, used_ref)
+		_: False
+
+
+private pure func final_variable(body: CoreExpr) -> Option[CoreVar]:
+	match body:
+		VarExpr(variable, _, _): Some(variable)
+		LetExpr(_, _, _, _, rest): final_variable(rest)
+		SeqExpr(_, rest): final_variable(rest)
+		_: None
+
+
+pure func test_mutable_child_is_snapshotted_before_reassignment() -> Bool:
+	child = binder("rows", 2)
+	owner = binder("pair", 3)
+	initial = call("initial_rows", [], TY_ROWS)
+	replacement = call("replacement_rows", [], TY_ROWS)
+	build = ProductExpr(fixture_build(2, [(0, read(child, TY_ROWS)), (1, integer(0))]), TY_CHILD_PAIR, synthetic_core_source_loc())
+	body = LetExpr(child, True, TY_ROWS, initial,
+		LetExpr(owner, False, TY_CHILD_PAIR, build,
+			SeqExpr(AssignExpr(child, replacement, TY_ROWS, synthetic_core_source_loc()), field(read(owner, TY_CHILD_PAIR), 0, TY_ROWS))))
+	match flattened(body, True):
+		Some(LetExpr(_, True, _, _, LetExpr(snapshot, False, _, VarExpr(source, _, _), rest))):
+			valid_snapshot: Bool = match final_variable(rest):
+				Some(use): core_var_equal(snapshot, use)
+				None: False
+			products(rest) == 0 and core_var_equal(source, child) and not core_var_equal(snapshot, child) and valid_snapshot
+		_: False
+
+
+pure func test_managed_child_call_has_an_ordinary_owner() -> Bool:
+	owner = binder("pair", 2)
+	child = call("fresh_rows", [], TY_ROWS)
+	build = ProductExpr(fixture_build(2, [(0, child), (1, integer(0))]), TY_CHILD_PAIR, synthetic_core_source_loc())
+	body = LetExpr(owner, False, TY_CHILD_PAIR, build, field(read(owner, TY_CHILD_PAIR), 0, TY_ROWS))
+	match flattened(body, True):
+		Some(LetExpr(child_owner, False, child_type, rhs, rest)):
+			-- This pre-ownership structural check establishes an ordinary Let
+			-- boundary. Runtime sanitizer/leak tests establish child safety.
+			valid_owner: Bool = match final_variable(rest):
+				Some(use): core_var_equal(child_owner, use)
+				None: False
+			products(rest) == 0 and child_type == TY_ROWS and same_object(rhs, child) and valid_owner
+		_: False
+
+
+private pure func remains_boxed(body: CoreExpr, with_shape: Bool) -> Bool:
+	match flattened(body, with_shape):
+		Some(result): products(result) == 1
+		None: False
+
+
+pure func test_whole_alias_call_keeps_source_box() -> Bool:
+	owner = binder("pair", 2)
+	copy = binder("alias", 3)
+	remains_boxed(LetExpr(owner, False, TY_PAIR, pair(integer(1), integer(2)),
+		LetExpr(copy, False, TY_PAIR, read(owner, TY_PAIR), call("sink", [read(copy, TY_PAIR)], TY_INT))), True)
+
+
+pure func test_root_identity_keeps_source_box() -> Bool:
+	owner = binder("pair", 2)
+	remains_boxed(LetExpr(owner, False, TY_PAIR, pair(integer(1), integer(2)),
+		call("same_object", [read(owner, TY_PAIR), read(owner, TY_PAIR)], NamedType("Bool", []))), True)
+
+
+pure func test_whole_storage_keeps_source_box() -> Bool:
+	owner = binder("pair", 2)
+	stored = ProductExpr(fixture_build(2, [(0, read(owner, TY_PAIR)), (1, integer(0))]), HeapRecordType("Container"), synthetic_core_source_loc())
+	match flattened(LetExpr(owner, False, TY_PAIR, pair(integer(1), integer(2)), stored), True):
+		Some(result): products(result) == 2
+		None: False
+
+
+pure func test_whole_capture_keeps_source_box() -> Bool:
+	owner = binder("pair", 2)
+	closure = LambdaExpr([], TY_PAIR, read(owner, TY_PAIR), True, FunctionType(True, [], TY_PAIR), synthetic_core_source_loc())
+	remains_boxed(LetExpr(owner, False, TY_PAIR, pair(integer(1), integer(2)), closure), True)
+
+
+pure func test_mutable_record_local_keeps_source_box() -> Bool:
+	owner = binder("pair", 2)
+	remains_boxed(LetExpr(owner, True, TY_PAIR, pair(integer(1), integer(2)), field(read(owner, TY_PAIR), 0, TY_INT)), True)
+
+
+pure func test_record_semantic_match_stays_conservative() -> Bool:
+	owner = binder("pair", 2)
+	matched = SemanticMatchExpr(read(owner, TY_PAIR), SemanticMatchLeaf([], integer(1)), TY_INT, synthetic_core_source_loc())
+	remains_boxed(LetExpr(owner, False, TY_PAIR, pair(integer(1), integer(2)), matched), True)
+
+
+pure func test_missing_concrete_shape_stays_boxed() -> Bool:
+	owner = binder("pair", 2)
+	remains_boxed(LetExpr(owner, False, TY_PAIR, pair(integer(1), integer(2)), field(read(owner, TY_PAIR), 0, TY_INT)), False)
+
+
+-- These controls exercise use facts through the existing public pass before
+-- those facts become a shared authority for bound result consumers.
+pure func test_alias_chain_return_keeps_original_box() -> Bool:
+	owner = binder("pair", 2)
+	copy = binder("copy", 3)
+	last = binder("last", 4)
+	remains_boxed(LetExpr(owner, False, TY_PAIR, pair(integer(1), integer(2)),
+		LetExpr(copy, False, TY_PAIR, read(owner, TY_PAIR),
+			LetExpr(last, False, TY_PAIR, read(copy, TY_PAIR), read(last, TY_PAIR)))), True)
+
+
+pure func test_repeated_local_identity_keeps_both_boxes() -> Bool:
+	owner = binder("pair", 2)
+	body = LetExpr(owner, False, TY_PAIR, pair(integer(1), integer(2)),
+		LetExpr(owner, False, TY_PAIR, pair(integer(3), integer(4)),
+			field(read(owner, TY_PAIR), 0, TY_INT)))
+	match flattened(body, True):
+		Some(result): products(result) == 2
+		None: False
+
+
+pure func test_same_spelling_distinct_ids_remain_independent() -> Bool:
+	outer = binder("pair", 2)
+	inner = binder("pair", 3)
+	body = LetExpr(outer, False, TY_PAIR, pair(integer(11), integer(7)),
+		LetExpr(inner, False, TY_PAIR, pair(integer(3), integer(5)),
+			add(field(read(outer, TY_PAIR), 0, TY_INT), field(read(inner, TY_PAIR), 1, TY_INT))))
+	match flattened(body, True):
+		Some(result): products(result) == 0 and scalar_value(result, []) == Some(16)
+		None: False
+
+
+pure func test_bound_call_result_has_only_field_uses() -> Bool:
+	owner = binder("result", 2)
+	body = LetExpr(owner, False, TY_PAIR, call("producer", [], TY_PAIR),
+		field(read(owner, TY_PAIR), 0, TY_INT))
+	facts = product_group_uses([], body)
+	facts.used_whole.is_empty() and facts.rebound.is_empty()
+
+
+pure func test_bound_call_result_alias_sink_is_whole() -> Bool:
+	owner = binder("result", 2)
+	copy = binder("copy", 3)
+	body = LetExpr(owner, False, TY_PAIR, call("producer", [], TY_PAIR),
+		LetExpr(copy, False, TY_PAIR, read(owner, TY_PAIR),
+			call("sink", [read(copy, TY_PAIR)], TY_INT)))
+	facts = product_group_uses([], body)
+	contains_var(facts.used_whole, owner) and contains_var(facts.used_whole, copy) and facts.rebound.is_empty()
+
+
+pure func test_parameter_rebound_as_local_is_whole() -> Bool:
+	owner = binder("result", 2)
+	body = LetExpr(owner, False, TY_PAIR, call("producer", [], TY_PAIR),
+		field(read(owner, TY_PAIR), 0, TY_INT))
+	facts = product_group_uses([owner], body)
+	contains_var(facts.rebound, owner) and contains_var(facts.used_whole, owner)
+
+
+pure func test_occurrence_metadata_does_not_change_use_identity() -> Bool:
+	owner = binder("result", 2)
+	annotated: CoreVar = { owner | def_id = Some(99) }
+	facts = product_group_uses([owner], read(annotated, TY_PAIR))
+	contains_var(facts.used_whole, owner) and facts.rebound.is_empty()
+
+
+
+private pure func schemas_for(declarations: List[CoreDecl]) -> CoreInterimRecordFields:
+	interim_record_fields({ decls = declarations, foreign_includes = [], source_files = [] })
+
+
+-- Generated metadata keeps logical tuples; schemas must use the catalog's
+-- physical field view, including logical Unit ordinals that have no C member.
+pure func test_generated_nested_field_uses_registered_storage() -> Bool:
+	match (
+		core_generated_tuple_record_decl("Nested", [TY_INT, TY_INT], synthetic_core_source_loc()),
+		core_generated_tuple_record_decl("Outer", [TupleType([TY_INT, TY_INT]), TY_INT], synthetic_core_source_loc()),
+	):
+		(Ok(nested), Ok(outer)):
+			fields = schemas_for([GeneratedTupleRecordDecl(outer), GeneratedTupleRecordDecl(nested)])
+			interim_product_fields(fields, HeapRecordType("Outer")) == Some([HeapRecordType("Nested"), TY_INT])
+		_: False
+
+
+pure func test_generated_unit_keeps_logical_field_ordinal() -> Bool:
+	match core_generated_tuple_record_decl("WithUnit", [VoidType, TY_INT], synthetic_core_source_loc()):
+		Ok(row):
+			fields = schemas_for([GeneratedTupleRecordDecl(row)])
+			match core_product_of(HeapRecordType("WithUnit")):
+				Some(product):
+					(
+						interim_product_fields(fields, HeapRecordType("WithUnit")) == Some([VoidType, TY_INT])
+						and interim_product_field_count(fields, product) == Some(2)
+					)
+				None: False
+		Err(_): False
+
+
+pure func test_ambiguous_record_schema_fails_closed() -> Bool:
+	fields = schemas_for([record_decl("LocalPair", [TY_INT, TY_INT]), record_decl("LocalPair", [TY_ROWS, TY_INT])])
+	match core_product_of(TY_PAIR):
+		Some(product):
+			interim_product_fields(fields, TY_PAIR).is_none() and interim_product_field_count(fields, product).is_none()
+		None: False
+
+
+pure func test_generic_record_schema_fails_closed() -> Bool:
+	match record_decl("Generic", [TY_INT, TY_INT]):
+		HeapRecordDecl(row):
+			fields = schemas_for([HeapRecordDecl({ row | type_params = ["T"] })])
+			interim_product_fields(fields, HeapRecordType("Generic")).is_none()
+		_: False
+
+
+pure func test_generated_source_name_collision_fails_closed() -> Bool:
+	match core_generated_tuple_record_decl("LocalPair", [TY_INT, TY_INT], synthetic_core_source_loc()):
+		Ok(row):
+			fields = schemas_for([GeneratedTupleRecordDecl(row), record_decl("LocalPair", [TY_INT, TY_INT])])
+			interim_product_fields(fields, TY_PAIR).is_none()
+		Err(_): False
+
+
+pure func test_missing_nested_generated_schema_fails_closed() -> Bool:
+	match core_generated_tuple_record_decl("Outer", [TupleType([TY_INT, TY_INT]), TY_INT], synthetic_core_source_loc()):
+		Ok(row):
+			interim_product_fields(schemas_for([GeneratedTupleRecordDecl(row)]), HeapRecordType("Outer")).is_none()
+		Err(_): False
+
+
+pure func test_logical_tuple_admission_precedes_physical_storage() -> Bool:
+	typ = TupleType([TY_INT, TY_INT])
+	owner = binder("tuple", 2)
+	build = ProductExpr(fixture_build(2, [(0, integer(11)), (1, integer(7))]), typ, synthetic_core_source_loc())
+	body = LetExpr(owner, False, typ, build, add(field(read(owner, typ), 0, TY_INT), field(read(owner, typ), 1, TY_INT)))
+	match flattened(body, False):
+		Some(result):
+			(
+				core_product_of(typ).is_none() and is_group_type(typ)
+				and products(result) == 0 and scalar_value(result, []) == Some(18)
+			)
+		None: False
+
+
+tests: TestSuite = {
+	description = "Immutable record local groups through checked product construction",
+	tests = [
+		("generated nested fields use registered storage", test_generated_nested_field_uses_registered_storage),
+		("generated Unit preserves logical ordinal", test_generated_unit_keeps_logical_field_ordinal),
+		("ambiguous record schema fails closed", test_ambiguous_record_schema_fails_closed),
+		("generic record schema fails closed", test_generic_record_schema_fails_closed),
+		("generated source name collision fails closed", test_generated_source_name_collision_fails_closed),
+		("missing nested generated schema fails closed", test_missing_nested_generated_schema_fails_closed),
+		("logical tuple admission precedes physical storage", test_logical_tuple_admission_precedes_physical_storage),
+		("bound call result has only field uses", test_bound_call_result_has_only_field_uses),
+		("bound call result alias sink is whole", test_bound_call_result_alias_sink_is_whole),
+		("parameter rebound as local is whole", test_parameter_rebound_as_local_is_whole),
+		("occurrence metadata does not change use identity", test_occurrence_metadata_does_not_change_use_identity),
+		("alias chain return keeps original box", test_alias_chain_return_keeps_original_box),
+		("repeated local identity keeps both boxes", test_repeated_local_identity_keeps_both_boxes),
+		("same spelling distinct ids remain independent", test_same_spelling_distinct_ids_remain_independent),
+		("literal alias chain loses container", test_literal_alias_chain_loses_container),
+		("written order binds once and maps ordinals", test_reversed_written_order_binds_once_and_maps_ordinals),
+		("same raw id distinguishes local identities", test_same_raw_id_does_not_merge_distinct_locals),
+		("unused field effect still evaluates", test_unused_field_effect_is_still_evaluated),
+		("mutable child snapshots before reassignment", test_mutable_child_is_snapshotted_before_reassignment),
+		("managed child has ordinary let owner", test_managed_child_call_has_an_ordinary_owner),
+		("whole alias call keeps source box", test_whole_alias_call_keeps_source_box),
+		("root identity keeps source box", test_root_identity_keeps_source_box),
+		("whole storage keeps source box", test_whole_storage_keeps_source_box),
+		("whole capture keeps source box", test_whole_capture_keeps_source_box),
+		("mutable record local keeps source box", test_mutable_record_local_keeps_source_box),
+		("record semantic match stays conservative", test_record_semantic_match_stays_conservative),
+		("missing concrete shape stays boxed", test_missing_concrete_shape_stays_boxed),
+	]
+}

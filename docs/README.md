@@ -64,6 +64,8 @@ for matched measurements; do not copy a profile into the work index.
   IDs, type interning, and remaining table migrations.
 - [Record Simplification](FIXED_LAYOUT_ROADMAP.md): ordinary-record semantics,
   ABI boundaries, and later measured placement optimizations.
+- [Record Allocation](RECORD_ALLOCATION_ROADMAP.md): incremental container and
+  transport-box removal, shared ownership/storage, and checked inline policy.
 - [Union Simplification](FIXED_UNION_ROADMAP.md): enum migration, one logical
   union model, shared representations, and later checked fixed unions.
 - [Allocation Contracts](ALLOCATION_CONTRACT_ROADMAP.md): incomplete backend
@@ -75,6 +77,8 @@ for matched measurements; do not copy a profile into the work index.
 - [Product Unification](PRODUCT_UNIFICATION.md): one Core product model for
   records and tuples, scalar replacement across calls, multi-values and typed
   tuple boxes.
+- [Tuple Record Storage](TUPLE_RECORD_STORAGE.md): approved implementation order
+  for shared construction, runtime interfaces and tuples through record layouts.
 - [Value Tuples And State Handoff](VALUE_TUPLES_AND_STATE_HANDOFF.md): owned
   state through calls, last-use and field-place increments, and stored
   products; local/match flattening already exists.

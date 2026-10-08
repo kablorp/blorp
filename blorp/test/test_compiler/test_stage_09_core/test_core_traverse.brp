@@ -17,7 +17,7 @@ import:
 			PreClosureDetachExpr,
 			RawMatchExpr,
 			RecordCowUpdateExpr,
-			RecordExpr,
+			ProductExpr,
 			SelectExpr,
 			SemanticMatchExpr,
 			SeqExpr,
@@ -42,16 +42,28 @@ import:
 			TuplePattern,
 			WildcardPattern,
 		),
+		CoreMapState,
 		CorePreClosureConcurrentBinding,
+		CoreProductBuild,
+		CoreProductBuildError(
+			ProductBuildOrdinalMissing, ProductBuildOrdinalOutOfRange, ProductBuildOrdinalRepeated,
+		),
 		CoreRawMatchCase,
 		CoreRecordCowField,
-		CoreRecordFieldValue,
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm),
 		CoreSemanticMatchAccessor(RootSemanticMatchAccessor),
 		CoreSemanticMatchTree(SemanticLiteralMatch, SemanticMatchFail, SemanticMatchLeaf),
 		CoreSourceLoc,
+		core_field_ordinal,
+		core_field_ordinal_index,
+		in_declared_order,
+		product_build,
+		product_build_in_declared_order,
+		product_build_ordinals,
+		product_build_values,
+		rewrite_product_build_values,
 		synthetic_core_source_loc,
 		CoreTensorRawScalarKind(TensorFloat64Elements),
 		CoreType(HeapRecordType, NamedType, VoidType),
@@ -60,7 +72,6 @@ import:
 		core_expr_to_json,
 		core_field_ref,
 	../../../src/compiler/stage_09_core/traverse:
-		CoreMapState,
 		core_expr_assigns_var,
 		core_pattern_binds_name,
 		core_pattern_bound_names,
@@ -357,10 +368,7 @@ pure func reusable_expr_shapes() -> List[CoreExpr]:
 		key = var_expr("key"),
 		value = var_expr("value")
 	}
-	record_field: CoreRecordFieldValue = {
-		ref = core_field_ref(1),name = "field",
-		value = var_expr("field_value")
-	}
+	record_build: CoreProductBuild = product_build_in_declared_order([var_expr("field_value")])
 	cow_field: CoreRecordCowField = {
 		field = {
 			ref = core_field_ref(0),name = "changed",
@@ -399,7 +407,7 @@ pure func reusable_expr_shapes() -> List[CoreExpr]:
 			synthetic_core_source_loc(),
 		),
 		DictExpr([dict_entry], int_type(), synthetic_core_source_loc()),
-		RecordExpr([record_field], HeapRecordType("Pair"), synthetic_core_source_loc()),
+		ProductExpr(record_build, HeapRecordType("Pair"), synthetic_core_source_loc()),
 		RecordCowUpdateExpr(
 			var_expr("source"),
 			[cow_field],
@@ -750,10 +758,7 @@ pure func test_state_aggregate_family_identity_mapper_reuses_shape() -> Bool:
 		key = var_expr("key"),
 		value = var_expr("value")
 	}
-	record_field: CoreRecordFieldValue = {
-		ref = core_field_ref(1),name = "field",
-		value = var_expr("field_value")
-	}
+	record_build: CoreProductBuild = product_build_in_declared_order([var_expr("field_value")])
 	shapes: List[CoreExpr] = [
 		CallExpr(
 			BuiltinCall("blorp_print"),
@@ -763,7 +768,7 @@ pure func test_state_aggregate_family_identity_mapper_reuses_shape() -> Bool:
 			synthetic_core_source_loc(),
 		),
 		DictExpr([dict_entry], int_type(), synthetic_core_source_loc()),
-		RecordExpr([record_field], HeapRecordType("Pair"), synthetic_core_source_loc()),
+		ProductExpr(record_build, HeapRecordType("Pair"), synthetic_core_source_loc()),
 		SelectExpr(
 			[{
 				kind = SelectAfterArm(var_expr("timeout")),
@@ -1152,6 +1157,141 @@ pure func test_assignment_query_distinguishes_rebound_binders() -> Bool:
 		and core_expr_assigns_var(assignment, rebound)
 	)
 
+-- `{second = second_value, first = first_value}` of a two-field record: written
+-- `second` first.
+pure func written_second_first_build(
+	second_value: CoreExpr,
+	first_value: CoreExpr,
+) -> Result[CoreProductBuild, CoreProductBuildError]:
+	product_build(2, [
+		{ ordinal = core_field_ordinal(1), value = second_value },
+		{ ordinal = core_field_ordinal(0), value = first_value },
+	])
+
+
+pure func ordinal_indexes(build: CoreProductBuild) -> List[Int]:
+	product_build_ordinals(build).map(core_field_ordinal_index)
+
+
+pure func test_product_build_keeps_written_order_and_ordinals() -> Bool:
+	second_value: CoreExpr = var_expr("second")
+	first_value: CoreExpr = var_expr("first")
+
+	match written_second_first_build(second_value, first_value):
+		Ok(build):
+			match product_build_values(build):
+				[written_first, written_second]:
+					(
+						same_object(written_first, second_value)
+						and same_object(written_second, first_value)
+						and ordinal_indexes(build) == [1, 0]
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_product_build_rejects_a_repeated_ordinal() -> Bool:
+	match product_build(2, [
+		{ ordinal = core_field_ordinal(0), value = var_expr("a") },
+		{ ordinal = core_field_ordinal(0), value = var_expr("b") },
+	]):
+		Err(ProductBuildOrdinalRepeated(0)):
+			True
+		_:
+			False
+
+
+pure func test_product_build_rejects_a_missing_ordinal() -> Bool:
+	match product_build(3, [
+		{ ordinal = core_field_ordinal(2), value = var_expr("c") },
+		{ ordinal = core_field_ordinal(0), value = var_expr("a") },
+	]):
+		Err(ProductBuildOrdinalMissing(1)):
+			True
+		_:
+			False
+
+
+pure func test_product_build_rejects_an_ordinal_past_the_fields() -> Bool:
+	match product_build(2, [
+		{ ordinal = core_field_ordinal(0), value = var_expr("a") },
+		{ ordinal = core_field_ordinal(2), value = var_expr("c") },
+	]):
+		Err(ProductBuildOrdinalOutOfRange(2)):
+			True
+		_:
+			False
+
+
+-- Mapping replaces values and keeps each one's ordinal.
+pure func test_mapping_a_product_keeps_each_value_at_its_ordinal() -> Bool:
+	literal: CoreExpr = LiteralExpr(IntLiteral(1), int_type(), synthetic_core_source_loc())
+
+	match written_second_first_build(var_expr("second"), literal):
+		Ok(build):
+			match map_core_expr_children(ProductExpr(build, HeapRecordType("Pair"), synthetic_core_source_loc()), replace_vars):
+				ProductExpr(mapped, _, _):
+					(
+						ordinal_indexes(mapped) == [1, 0]
+						and match product_build_values(mapped):
+							[LiteralExpr(IntLiteral(99), _, _), kept]:
+								same_object(kept, literal)
+							_:
+								False
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
+-- A build no mapper changes is handed back as the same object.
+pure func test_mapping_an_unchanged_product_returns_it() -> Bool:
+	expr: CoreExpr = ProductExpr(
+		product_build_in_declared_order([LiteralExpr(IntLiteral(1), int_type(), synthetic_core_source_loc())]),
+		HeapRecordType("Box"),
+		synthetic_core_source_loc(),
+	)
+
+	same_object(map_core_expr_children(expr, replace_vars), expr)
+
+
+-- A stateful rewrite visits the values in evaluation order.
+pure func test_rewriting_a_product_threads_state_in_written_order() -> Bool:
+	match written_second_first_build(var_expr("second"), var_expr("first")):
+		Ok(build):
+			visited: CoreMapState[List[String], CoreProductBuild] = rewrite_product_build_values(
+				build,
+				[],
+				pure func(seen: List[String], value: CoreExpr) -> CoreMapState[List[String], CoreExpr]:
+					name: String = match value:
+						VarExpr(variable, _, _):
+							variable.name
+						_:
+							""
+					{
+						state = seen.append(name),
+						value = value
+					}
+			)
+
+			visited.state == ["second", "first"] and same_object(visited.value, build)
+		Err(_):
+			False
+
+
+pure func test_declared_order_puts_values_at_their_ordinals() -> Bool:
+	match written_second_first_build(var_expr("second"), var_expr("first")):
+		Ok(build):
+			(
+				in_declared_order(build, ["second", "first"]) == ["first", "second"]
+				and in_declared_order(product_build_in_declared_order([var_expr("a"), var_expr("b")]), ["a", "b"]) == ["a", "b"]
+			)
+		Err(_):
+			False
+
 
 tests: TestSuite = {
 	description = "Blorp compiler Core traversal",
@@ -1162,6 +1302,23 @@ tests: TestSuite = {
 		),
 		("assignment query distinguishes rebound binders", test_assignment_query_distinguishes_rebound_binders),
 		("maps pre-closure detach body", test_maps_pre_closure_detach_body),
+		("product build keeps written order and ordinals", test_product_build_keeps_written_order_and_ordinals),
+		("product build rejects a repeated ordinal", test_product_build_rejects_a_repeated_ordinal),
+		("product build rejects a missing ordinal", test_product_build_rejects_a_missing_ordinal),
+		(
+			"product build rejects an ordinal past the fields",
+			test_product_build_rejects_an_ordinal_past_the_fields,
+		),
+		(
+			"mapping a product keeps each value at its ordinal",
+			test_mapping_a_product_keeps_each_value_at_its_ordinal,
+		),
+		("mapping an unchanged product returns it", test_mapping_an_unchanged_product_returns_it),
+		(
+			"rewriting a product threads state in written order",
+			test_rewriting_a_product_threads_state_in_written_order,
+		),
+		("declared order puts values at their ordinals", test_declared_order_puts_values_at_their_ordinals),
 		(
 			"maps record COW replacements and source without materializing inherited fields",
 			test_maps_record_cow_replacements_and_source_without_materializing_inherited_fields,

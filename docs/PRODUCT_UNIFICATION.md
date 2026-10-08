@@ -1,6 +1,17 @@
 # Product Unification
 
-Status: plan; slice 1 (one projection form) is implemented, the rest is not.
+Status: projection unification is implemented; the record construction
+prerequisite is committed. Typed tuple storage is implemented; runtime and self-hosting checks pass.
+Measured cost review and final source validation pass. Bootstrap rotation and
+further product optimizations remain separate work.
+The approved [Tuple Record Storage](TUPLE_RECORD_STORAGE.md) roadmap now owns
+implementation order for shared storage: construction, runtime boundaries and
+typed tuple layouts come before scalar replacement and multi-value calls.
+The numbered slices below retain the detailed designs, rather than the current
+landing order. Generated tuple layout rows are backend storage identities,
+so that bounded storage slice need not wait for the full `CoreRecordRef`
+identity redesign described here.
+
 Records and tuples become one
 product family in Core, the ownership passes, the runtime and the C backend,
 so each optimization written for one applies to the other and the parallel
@@ -19,19 +30,20 @@ unions stay tagged sums and are out of scope.
 
 ## Why
 
-Core has two product families, and each optimization exists for only one of
-them:
+At the starting boundary, Core had two product families, and each
+optimization existed for only one of them:
 
 | | Records | Tuples |
 | --- | --- | --- |
 | Core type | `HeapRecordType(String)` (and `NamedType` before layout resolution) | `TupleType(List[CoreType])` |
-| Build | `RecordExpr`, then `RecordConstructExpr` after `prepare` | `TupleExpr`, then `TupleConstructExpr` with per-slot classes and retain/release masks |
+| Build | `ProductExpr(CoreProductBuild, ...)`, including checked ordinals for reuse | `TupleExpr`, then `TupleConstructExpr` with per-slot classes and retain/release masks |
 | Read | `ProductFieldExpr(base, ordinal)` (slice 1) | `ProductFieldExpr(base, ordinal)` (slice 1) |
 | Update | `RecordUpdateExpr`, `RecordReuseExpr`, `RecordCowUpdateExpr` | none |
 | Optimizations | in-place reuse, copy-on-write, update threading, consuming clones | scalar replacement of locals and match subjects; multi-values on the increment 2 branch |
 | Runtime box | one typed C struct per record, with `_make`, destroy and reuse helpers | generic `blorp_Tuple` with a varargs constructor, a release mask and a separate box for each inline-struct element |
 
-Counted in `stage_08_core_lower`, `stage_09_core` and `stage_10_backend`: the
+Before the record construction prerequisite, counted in `stage_08_core_lower`,
+`stage_09_core` and `stage_10_backend`: the
 three tuple expression forms have 185 match arms (748 lines), the five record
 forms and `FieldExpr` have 380 arms (1,975 lines), and `HeapRecordType` and
 `TupleType` have 178 arms (820 lines). Most pairs repeat each other. The
@@ -466,13 +478,15 @@ Several states here are representable but wrong:
   an out-of-order literal's field values to variables before Perceus. It
   adds 0.59% to the self-compile's allocations and 0.22% to its retired
   instructions (`benchmarks/results/record_literal_order_pass_2026-10-06.md`);
-  the construction form here replaces it. Updates now follow written order
-  independently of the construction migration: sparse replacements remain
-  attached directly to their base carrier until `record_update_ownership`.
-  That pass preserves direct evaluation when checked declaration positions
-  already increase, otherwise stages replacement values in written order.
-  Nested layers stage before the final owner transfer, keeping superseded
-  side effects and in-place reuse. The runtime regression is
+  checked product ordinals replace its late storage-order role, while
+  `product_evaluation` binds nonliteral values before ownership analysis.
+  Updates now follow written order independently of the construction
+  migration: sparse replacements remain attached directly to their base
+  carrier until `record_update_ownership`. That pass preserves direct
+  evaluation when checked declaration positions already increase, otherwise
+  stages replacement values in written order. Nested layers stage before
+  the final owner transfer, keeping superseded side effects and in-place
+  reuse. The runtime regression is
   `blorp/test/test_runtime/test_types/test_record_update_field_order.brp`.
 - `prepare_tuple_expr` can fail to classify a tuple and fall back to a
   `TupleExpr` that reaches the backend.
@@ -836,8 +850,10 @@ build already holds its ordinals and the type names its layout.
 `prepare_record_construct_expr`, `declaration_ordered_record_fields`,
 `same_record_field_order` and `prepare_tuple_expr` are deleted.
 
-Change 1 also deletes the `record_literal_order` pass, which the ordinals make
-redundant:
+Change 1 deletes the `record_literal_order` pass and its storage-order
+workaround. Checked ordinals replace late reordering; `product_evaluation`
+binds nonliteral values before ownership analysis so conditional results and
+cancellation use the ordinary Core binding boundary:
 
 - `bind_record_literal_fields_in_written_order` and its helpers in
   `prepare.brp`, `run_record_literal_order_pass`, `RECORD_LITERAL_ORDER_PASS`
@@ -848,15 +864,18 @@ redundant:
 - the `run_record_literal_order_pass` step in
   `benchmarks/blorp/profiles/perceus_allocations.brp` and its mention in
   `benchmarks/README.md`;
-- the "Record Literal Field Order" section of `docs/OWNERSHIP_MODEL.md` and
-  the pass's line in `docs/ARCHITECTURE.md`;
+- the old pass's description in `docs/OWNERSHIP_MODEL.md` and
+  its line in `docs/ARCHITECTURE.md`, replaced with the new ownership boundary;
 - the pass's unit tests in `test_core_prepare.brp` and
   `test_core_pipeline.brp`. The runtime cases in
   `test_record_literal_field_order.brp` stay: they pin the rule.
 
 Evidence:
 
-- C identity for records against a base that includes the written-order fix.
+- Equivalent record behavior and layouts against a base that includes the
+  written-order fix, with caller/callee attribution of intentional ownership
+  contract and binding differences in generated C. Byte identity is not the
+  acceptance oracle for those differences.
 - For tuples, an exact retain/release and allocation oracle with equal counts
   per fixture: the retains move from inline mask code to explicit dups.
 - The ownership-shape probes and the Perceus suites.
@@ -1077,7 +1096,9 @@ Owner decisions (Keith), including the open ones:
 
 - **1. Field evaluation order.** Decided: Rust's rule. Record-literal fields are
   evaluated in written order and stored by declared position. The fix on
-  `main`, the `record_literal_order` pass, landed before this plan's slices.
+  `main` originally used the `record_literal_order` pass. Checked product
+  builds carry storage ordinals, while `product_evaluation` binds nonliteral
+  values in written order before ownership analysis.
 - **2. Increment 2 landing order.** Decided: rebase increment 2 onto slices 1
   and 2 rather than land it first.
 - **6. Inline scalar tuples.** Open. Making a tuple whose elements pass the

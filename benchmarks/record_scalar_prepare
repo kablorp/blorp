@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Run record-only scalar-replacement preparation probes; report observed costs."""
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+
+
+ROOT = Path(__file__).resolve().parent.parent
+PROBE = "benchmarks/blorp/profiles/record_scalar_preparation.brp"
+ROUNDS = (256, 512)
+CASES = (
+    "local_fields", "aliased_fields", "branched_fields", "call_result_fields",
+    "managed_child_fields", "unique_updates", "fresh_reassignments",
+    "observed_identity", "inline_fields",
+    "recursive_shared_children", "recursive_discarded_child", "mixed_result_identity",
+)
+
+
+def validate_rows(output):
+    rows = []
+    seen = set()
+    for line in output.splitlines():
+        name, rounds, result, allocations, releases, live = line.split("\t")
+        rounds, result, allocations, releases, live = map(
+            int, (rounds, result, allocations, releases, live)
+        )
+        key = (name, rounds)
+        if name not in CASES or rounds not in ROUNDS or key in seen:
+            raise ValueError(f"unexpected or repeated probe: {key}")
+        seen.add(key)
+        expected = rounds * rounds
+        if name == "managed_child_fields":
+            expected = rounds * (rounds + 3) // 2
+        elif name in ("unique_updates", "fresh_reassignments"):
+            expected = 2 * rounds + 1
+        elif name in ("recursive_shared_children", "mixed_result_identity"):
+            expected = 4 * rounds
+        elif name == "recursive_discarded_child":
+            expected = 2 * rounds
+        if result != expected:
+            raise ValueError(f"{key}: value {result}, expected {expected}")
+        if allocations < 0 or allocations != releases or live != 0:
+            raise ValueError(f"{key}: unbalanced ownership counters")
+        if name == "inline_fields" and allocations != 0:
+            raise ValueError(f"{key}: inline control allocated")
+        if name == "unique_updates" and allocations > 1:
+            raise ValueError(f"{key}: unique-update control lost reuse")
+        if name == "observed_identity" and allocations < rounds:
+            raise ValueError(f"{key}: observed identity lost its source boxes")
+        if name == "mixed_result_identity" and allocations != 2 + rounds // 2:
+            raise ValueError(f"{key}: mixed result changed its source-box allocation count")
+        rows.append(dict(case=name, rounds=rounds, result=result,
+                         allocations=allocations, releases=releases, live_delta=live))
+    if seen != {(name, rounds) for name in CASES for rounds in ROUNDS}:
+        raise ValueError("incomplete probe output")
+    return rows
+
+
+def require_result_groups(rows):
+    for row in rows:
+        if row["case"] == "recursive_shared_children":
+            expected = 1
+        elif row["case"] == "recursive_discarded_child":
+            expected = row["rounds"] + 1
+        else:
+            continue
+        if row["allocations"] != expected:
+            raise ValueError(
+                f"{row['case']} ({row['rounds']} rounds): result-group allocation target "
+                f"{expected}, observed {row['allocations']}"
+            )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sanitize", action="store_true")
+    parser.add_argument("--require-result-groups", action="store_true",
+                        help="require recursive result containers to be eliminated")
+    parser.add_argument("--output", required=True, type=Path)
+    options = parser.parse_args()
+    subprocess.run(["scripts/compiler-build-status", "--quiet"], cwd=ROOT, check=True)
+    command = ["bin/blorp", "run", "--no-format", "--memory-stats",
+               "--leak-check", "--release", "--timeout", "180"]
+    if options.sanitize:
+        command.append("--sanitize")
+    command.append(PROBE)
+    run = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=240)
+    if run.returncode:
+        raise RuntimeError(run.stderr or run.stdout)
+    if re.search(r"runtime error:|(?:ERROR|SUMMARY):.*Sanitizer", run.stderr):
+        raise RuntimeError(run.stderr)
+    rows = validate_rows(run.stdout)
+    if not re.search(r"leak check: \d+ allocs, \d+ releases, 0 leaked, 0 bytes", run.stderr):
+        raise ValueError("missing successful leak-check report")
+    report = {
+        "source_revision": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        "probe_sha256": hashlib.sha256((ROOT / PROBE).read_bytes()).hexdigest(),
+        "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "compiler_sha256": hashlib.sha256((ROOT / "bin/blorp").read_bytes()).hexdigest(),
+        "compiler_version": subprocess.check_output(
+            ["bin/blorp", "--version"], cwd=ROOT, text=True).strip(),
+        "command": command, "sanitized": options.sanitize,
+        "require_result_groups": options.require_result_groups,
+        "stdout": run.stdout, "stderr": run.stderr, "rows": rows,
+    }
+    options.output.write_text(json.dumps(report, indent=2) + "\n")
+    if options.require_result_groups:
+        try:
+            require_result_groups(rows)
+        except ValueError as error:
+            parser.exit(1, f"FAIL: {error}; report {options.output}\n")
+    print(f"PASS: {len(rows)} value/ownership probes; report {options.output}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,276 @@
+-- Record-only baseline probes. Construction/storage migration is owned by
+-- codex/tuple-record-storage; these use the source language, not its Core API.
+import:
+	memory:
+		MemoryCounter(ManagedAllocations, ManagedReleases, LiveManagedObjects, MemoryStatsActive, OracleStatsActive),
+		read_memory_counter, reset_mem_stats, same_object
+
+
+record Pair {
+	first: Int,
+	second: Int
+}
+
+
+fixed record InlinePair {
+	first: Int,
+	second: Int
+}
+
+
+record ManagedChild {
+	items: List[Int],
+	index: Int
+}
+
+
+record ManagedResult {
+	first: List[Int],
+	second: List[Int]
+}
+
+
+RESULT_RECURSION_DEPTH: Int = 3
+
+
+pure func local_fields(rounds: Int) -> Int:
+	var total: Int = 0
+	for index in 0..rounds:
+		pair: Pair = { first = index, second = index + 1 }
+		total += pair.first + pair.second
+	total
+
+
+pure func aliased_fields(rounds: Int) -> Int:
+	var total: Int = 0
+	for index in 0..rounds:
+		pair: Pair = { first = index, second = index + 1 }
+		other: Pair = pair
+		total += pair.first + other.second
+	total
+
+
+pure func branched_fields(rounds: Int) -> Int:
+	var total: Int = 0
+	for index in 0..rounds:
+		pair: Pair = if index % 2 == 0:
+			{ first = index, second = index + 1 }
+		else:
+			{ first = index + 1, second = index }
+		total += pair.first + pair.second
+	total
+
+
+pure func make_pair(index: Int) -> Pair:
+	{ first = index, second = index + 1 }
+
+
+pure func call_result_fields(rounds: Int) -> Int:
+	var total: Int = 0
+	for index in 0..rounds:
+		pair = make_pair(index)
+		total += pair.first + pair.second
+	total
+
+
+pure func managed_child_fields(rounds: Int) -> Int:
+	items: List[Int] = [7, 8]
+	var total: Int = 0
+	for index in 0..rounds:
+		state: ManagedChild = { items = items, index = index }
+		total += state.index + state.items.length()
+	total
+
+
+pure func unique_updates(rounds: Int) -> Int:
+	var pair: Pair = { first = 0, second = 1 }
+	for _ in 0..rounds:
+		pair = { pair | first = pair.first + 1, second = pair.second + 1 }
+	pair.first + pair.second
+
+
+pure func fresh_reassignments(rounds: Int) -> Int:
+	var pair: Pair = { first = 0, second = 1 }
+	for _ in 0..rounds:
+		pair = { first = pair.first + 1, second = pair.second + 1 }
+	pair.first + pair.second
+
+
+pure func observed_identity(rounds: Int) -> Int:
+	var total: Int = 0
+	for index in 0..rounds:
+		pair: Pair = { first = index, second = index + 1 }
+		if same_object(pair, pair):
+			total += pair.first + pair.second
+		else:
+			total -= 1
+	total
+
+
+pure func inline_fields(rounds: Int) -> Int:
+	var total: Int = 0
+	for index in 0..rounds:
+		pair: InlinePair = { first = index, second = index + 1 }
+		total += pair.first + pair.second
+	total
+
+
+-- Each recursive step consumes fields from the callee's result and builds a
+-- fresh wrapper, as the monomorphization rewrite producers do. Depth three
+-- visits four producers. Opposite written field orders share one schema.
+pure func managed_result_a(
+	items: List[Int],
+	index: Int,
+	fresh_second: Bool,
+	depth: Int,
+) -> ManagedResult:
+	if depth == 0:
+		second: List[Int] = if fresh_second:
+			[index]
+		else:
+			items
+
+		{
+			first = items,
+			second = second
+		}
+	else:
+		result = managed_result_b(items, index, fresh_second, depth - 1)
+		{
+			first = result.first,
+			second = result.second
+		}
+
+
+pure func managed_result_b(
+	items: List[Int],
+	index: Int,
+	fresh_second: Bool,
+	depth: Int,
+) -> ManagedResult:
+	if depth == 0:
+		second: List[Int] = if fresh_second:
+			[index]
+		else:
+			items
+
+		{
+			second = second,
+			first = items
+		}
+	else:
+		result = managed_result_a(items, index, fresh_second, depth - 1)
+		{
+			second = result.second,
+			first = result.first
+		}
+
+
+pure func recursive_shared_children(rounds: Int) -> Int:
+	items: List[Int] = [7, 8]
+	var total: Int = 0
+
+	for index in 0..rounds:
+		result = managed_result_a(items, index, False, RESULT_RECURSION_DEPTH)
+
+		if same_object(result.first, items) and same_object(result.second, items):
+			total += result.first.length() + result.second.length()
+		else:
+			total -= 1
+
+	total
+
+
+pure func recursive_discarded_child(rounds: Int) -> Int:
+	items: List[Int] = [7, 8]
+	var total: Int = 0
+
+	for index in 0..rounds:
+		result = managed_result_a(items, index, True, RESULT_RECURSION_DEPTH)
+
+		-- The caller never projects second. Its fresh child must still be
+		-- released after passing through all intermediate result owners.
+		if same_object(result.first, items):
+			total += result.first.length()
+		else:
+			total -= 1
+
+	total
+
+
+pure func mixed_managed_result(
+	items: List[Int],
+	existing: ManagedResult,
+	fresh: Bool,
+) -> ManagedResult:
+	if fresh:
+		{
+			second = items,
+			first = items
+		}
+	else:
+		existing
+
+
+pure func mixed_result_identity(rounds: Int) -> Int:
+	items: List[Int] = [7, 8]
+	existing: ManagedResult = {
+		first = items,
+		second = items
+	}
+	var total: Int = 0
+
+	for index in 0..rounds:
+		fresh: Bool = index % 2 == 0
+		result = mixed_managed_result(items, existing, fresh)
+
+		root_ok: Bool = if fresh:
+			not same_object(result, existing)
+		else:
+			same_object(result, existing)
+
+		if (
+			root_ok
+			and same_object(result.first, items)
+			and same_object(result.second, items)
+		):
+			total += result.first.length() + result.second.length()
+		else:
+			total -= 1
+
+	total
+
+
+-- Counter endpoints are scalar. Formatting and printing occur afterward;
+-- calls through this harness return Int, so no tested record crosses its ABI.
+func measure(name: String, rounds: Int, workload: (Int) -> Int) -> Void:
+	before_allocations = read_memory_counter(ManagedAllocations)
+	before_releases = read_memory_counter(ManagedReleases)
+	before_live = read_memory_counter(LiveManagedObjects)
+	result = workload(rounds)
+	after_live = read_memory_counter(LiveManagedObjects)
+	after_releases = read_memory_counter(ManagedReleases)
+	after_allocations = read_memory_counter(ManagedAllocations)
+	print("${name}\t${rounds}\t${result}\t${after_allocations - before_allocations}\t${after_releases - before_releases}\t${after_live - before_live}")
+
+
+func main(args: List[String]) -> Int:
+	reset_mem_stats()
+	if read_memory_counter(MemoryStatsActive) != 1 or read_memory_counter(OracleStatsActive) != 1:
+		print("record scalar preparation requires active memory and oracle counters")
+		1
+	else:
+		for rounds in [256, 512]:
+			measure("local_fields", rounds, local_fields)
+			measure("aliased_fields", rounds, aliased_fields)
+			measure("branched_fields", rounds, branched_fields)
+			measure("call_result_fields", rounds, call_result_fields)
+			measure("managed_child_fields", rounds, managed_child_fields)
+			measure("unique_updates", rounds, unique_updates)
+			measure("fresh_reassignments", rounds, fresh_reassignments)
+			measure("observed_identity", rounds, observed_identity)
+			measure("inline_fields", rounds, inline_fields)
+			measure("recursive_shared_children", rounds, recursive_shared_children)
+			measure("recursive_discarded_child", rounds, recursive_discarded_child)
+			measure("mixed_result_identity", rounds, mixed_result_identity)
+		0

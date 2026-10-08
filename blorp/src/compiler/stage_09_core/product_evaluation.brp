@@ -1,0 +1,524 @@
+-- Give product field evaluation ordinary Core ownership boundaries.
+--
+-- ProductBuild keeps written evaluation order and checked declaration ordinals.
+-- Before ownership analysis, each nonliteral value is bound once to an immutable
+-- local. Perceus and cancellation planning then own its result through the same
+-- Let rules as user-written code, including conditional and match results.
+-- The backend only copies those named values into the positional constructor.
+-- List elements use the same boundary before list allocation.
+-- Tensor scalar elements use the same boundary before tensor allocation;
+-- ranked row syntax is projected by the shared storage/shape issuer first.
+import:
+	ir:
+		CoreBinderOrigin,
+		CoreBoxedStorageValue,
+		CoreTensorBoxedLiteral,
+		CoreListConstruct,
+		CoreTensorLiteral,
+		CoreTensorLiteralPayload(TensorInlineStructLiteralPayload, TensorRawLiteralPayload),
+		CoreTensorPackedLiteral,
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreFunctionKind(ClosureBodyFunction),
+		CoreExpr(
+			BorrowLetExpr, BoxExpr, LambdaExpr, LetExpr, ListConstructExpr, LiteralExpr, ProductExpr,
+			RecordReuseExpr, SeqExpr, StaticStringLiteralExpr, TensorBoxedLiteralExpr, TensorLiteralExpr, TensorPackedLiteralExpr, TupleExpr, UnionConstructExpr, VarExpr, VectorExpr, VoidExpr,
+		),
+		CoreFunction,
+		CoreMapState,
+		CoreProductBuild,
+		CoreProgram,
+		CoreType,
+		CoreVar,
+		PRODUCT_FIELD_TEMP_ORIGIN,
+		PRODUCT_REUSE_SOURCE_TEMP_ORIGIN,
+		TENSOR_ELEMENT_TEMP_ORIGIN,
+		LIST_ELEMENT_TEMP_ORIGIN,
+		core_expr_source_loc,
+		core_expr_type,
+		core_var_equal,
+		product_build_values,
+		rewrite_product_build_values,
+	memory: same_object
+	prepare: project_vector_literal_storage
+	traverse as CoreTraverse
+
+
+-- Perceus still has name-indexed ownership queries. Reserve source-illegal,
+-- binder-qualified names until those queries use CoreVar identity; the prefix
+-- is only a spelling and is never used to classify these variables.
+private PRODUCT_FIELD_NAME_PREFIX: String = "$blorp$product_field$"
+
+private PRODUCT_REUSE_SOURCE_NAME_PREFIX: String = "$blorp$product_reuse_source$"
+
+private TENSOR_ELEMENT_NAME_PREFIX: String = "$blorp$tensor_element$"
+
+private LIST_ELEMENT_NAME_PREFIX: String = "$blorp$list_element$"
+
+
+private record ProductValueBinding {
+	variable: CoreVar,
+	typ: CoreType,
+	value: CoreExpr
+}
+
+
+private record ProductFieldEvaluation {
+	next_binder_id: Int,
+	bindings: List[ProductValueBinding]
+}
+
+
+private record ProductEvaluationTraversal {
+	next_binder_id: Int,
+	local_variables: List[CoreVar]
+}
+
+
+record ProductEvaluationResult {
+	program: CoreProgram,
+	ids_used: Int
+}
+
+
+private pure func literal_value(expr: CoreExpr) -> Bool:
+	match expr:
+		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VoidExpr(_, _):
+			True
+		_:
+			False
+
+
+---
+A global initializer consisting entirely of literal constructors has no reads,
+calls or cancellation point. Keep that exact tree for the backend's static
+object classifier. This is a global-context exception, not a purity guess:
+the same nested constructor in a function must acquire a named owner before a
+later field can cancel. Variables are not literals, even immutable globals.
+---
+pure func product_evaluation_is_literal_global(root: CoreExpr) -> Bool:
+	var pending: List[CoreExpr] = [root]
+	var cursor: Int = 0
+	var literal: Bool = True
+
+	while cursor < pending.length() and literal:
+		expr: CoreExpr = pending.get_or(cursor, root)
+		match expr:
+			LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VoidExpr(_, _):
+				void
+			ProductExpr(_, _, _) | TupleExpr(_, _, _) | ListConstructExpr(_, _, _) | UnionConstructExpr(_, _, _) | BoxExpr(_, _, _):
+				for child in CoreTraverse.immediate_core_expr_children(expr):
+					pending = pending.append(child)
+			_:
+				literal = False
+
+		cursor += 1
+
+	literal
+
+
+private pure func bind_owned_value(
+	state: ProductFieldEvaluation,
+	value: CoreExpr,
+	name_prefix: String,
+	origin: CoreBinderOrigin,
+) -> CoreMapState[ProductFieldEvaluation, CoreExpr]:
+	if literal_value(value):
+		{ state = state, value = value }
+	else:
+		variable: CoreVar = {
+			name = name_prefix + state.next_binder_id.to_string(),
+			id = state.next_binder_id,
+			def_id = None,
+			origin = origin
+		}
+		typ: CoreType = core_expr_type(value)
+		{
+			state = {
+				next_binder_id = state.next_binder_id - 1,
+				bindings = state.bindings.append({
+					variable = variable,
+					typ = typ,
+					value = value
+				})
+			},
+			value = VarExpr(variable, typ, core_expr_source_loc(value))
+		}
+
+
+private pure func bind_field_value(
+	state: ProductFieldEvaluation,
+	value: CoreExpr,
+) -> CoreMapState[ProductFieldEvaluation, CoreExpr]:
+	bind_owned_value(state, value, PRODUCT_FIELD_NAME_PREFIX, PRODUCT_FIELD_TEMP_ORIGIN)
+
+
+private pure func bind_product_values(
+	build: CoreProductBuild,
+	next_binder_id: Int,
+) -> CoreMapState[ProductFieldEvaluation, CoreProductBuild]:
+	rewrite_product_build_values(
+		build,
+		{ next_binder_id = next_binder_id, bindings = [] },
+		bind_field_value,
+	)
+
+
+private pure func with_value_bindings(
+	bindings: List[ProductValueBinding],
+	body: CoreExpr,
+) -> CoreExpr:
+	var bound: CoreExpr = body
+
+	for binding in bindings.reverse():
+		bound = LetExpr(binding.variable, False, binding.typ, binding.value, bound)
+
+	bound
+
+
+private pure func normalize_product(
+	next_binder_id: Int,
+	build: CoreProductBuild,
+	typ: CoreType,
+	expr: CoreExpr,
+) -> CoreMapState[Int, CoreExpr]:
+	evaluated = bind_product_values(build, next_binder_id)
+	bound: CoreExpr = if evaluated.state.bindings.is_empty():
+		expr
+	else:
+		with_value_bindings(
+			evaluated.state.bindings,
+			ProductExpr(evaluated.value, typ, core_expr_source_loc(expr)),
+		)
+	{ state = evaluated.state.next_binder_id, value = bound }
+
+
+private pure func normalize_list(
+	next_binder_id: Int,
+	construct: CoreListConstruct,
+	typ: CoreType,
+	expr: CoreExpr,
+) -> CoreMapState[Int, CoreExpr]:
+	var evaluation: ProductFieldEvaluation = { next_binder_id = next_binder_id, bindings = [] }
+	var elements: List[CoreBoxedStorageValue] = []
+
+	for element in construct.elements:
+		bound = bind_owned_value(evaluation, element.value, LIST_ELEMENT_NAME_PREFIX, LIST_ELEMENT_TEMP_ORIGIN)
+		evaluation = bound.state
+		elements = elements.append({ element | value = bound.value })
+
+	bound: CoreExpr = if evaluation.bindings.is_empty():
+		expr
+	else:
+		-- No list container exists while an element can cancel. Ordinary Let
+		-- owners protect completed elements until all values reach their stores.
+		with_value_bindings(evaluation.bindings, ListConstructExpr(
+			{ construct | elements = elements }, typ, core_expr_source_loc(expr),
+		))
+	{ state = evaluation.next_binder_id, value = bound }
+
+
+private pure func normalize_boxed_tensor(
+	next_binder_id: Int,
+	literal: CoreTensorBoxedLiteral,
+	typ: CoreType,
+	expr: CoreExpr,
+) -> CoreMapState[Int, CoreExpr]:
+	var evaluation: ProductFieldEvaluation = { next_binder_id = next_binder_id, bindings = [] }
+	var elements: List[CoreBoxedStorageValue] = []
+
+	for element in literal.elements:
+		bound = bind_owned_value(evaluation, element.value, TENSOR_ELEMENT_NAME_PREFIX, TENSOR_ELEMENT_TEMP_ORIGIN)
+		evaluation = bound.state
+		elements = elements.append({ element | value = bound.value })
+
+	bound: CoreExpr = if evaluation.bindings.is_empty():
+		expr
+	else:
+		-- No partially built tensor exists while a later element can cancel.
+		-- Ordinary Let owners protect each result until the final stores.
+		with_value_bindings(evaluation.bindings, TensorBoxedLiteralExpr(
+			{ literal | elements = elements }, typ, core_expr_source_loc(expr),
+		))
+	{ state = evaluation.next_binder_id, value = bound }
+
+
+private pure func bind_tensor_values(
+	values: List[CoreExpr],
+	next_binder_id: Int,
+) -> CoreMapState[ProductFieldEvaluation, List[CoreExpr]]:
+	var evaluation: ProductFieldEvaluation = { next_binder_id = next_binder_id, bindings = [] }
+	var elements: List[CoreExpr] = []
+
+	for value in values:
+		bound = bind_owned_value(evaluation, value, TENSOR_ELEMENT_NAME_PREFIX, TENSOR_ELEMENT_TEMP_ORIGIN)
+		evaluation = bound.state
+		elements = elements.append(bound.value)
+
+	{ state = evaluation, value = elements }
+
+
+private pure func normalize_tensor_literal(
+	next_binder_id: Int,
+	literal: CoreTensorLiteral,
+	typ: CoreType,
+	expr: CoreExpr,
+) -> CoreMapState[Int, CoreExpr]:
+	values: List[CoreExpr] = match literal.payload:
+		TensorRawLiteralPayload(raw): raw.elements
+		TensorInlineStructLiteralPayload(inline_struct): inline_struct.elements
+	evaluated = bind_tensor_values(values, next_binder_id)
+	payload: CoreTensorLiteralPayload = match literal.payload:
+		TensorRawLiteralPayload(raw): TensorRawLiteralPayload({ raw | elements = evaluated.value })
+		TensorInlineStructLiteralPayload(inline_struct): TensorInlineStructLiteralPayload({ inline_struct | elements = evaluated.value })
+	bound: CoreExpr = if evaluated.state.bindings.is_empty():
+		expr
+	else:
+		with_value_bindings(evaluated.state.bindings, TensorLiteralExpr(
+			{ literal | payload = payload }, typ, core_expr_source_loc(expr),
+		))
+	{ state = evaluated.state.next_binder_id, value = bound }
+
+
+private pure func normalize_packed_tensor(
+	next_binder_id: Int,
+	literal: CoreTensorPackedLiteral,
+	typ: CoreType,
+	expr: CoreExpr,
+) -> CoreMapState[Int, CoreExpr]:
+	evaluated = bind_tensor_values(literal.elements, next_binder_id)
+	bound: CoreExpr = if evaluated.state.bindings.is_empty():
+		expr
+	else:
+		with_value_bindings(evaluated.state.bindings, TensorPackedLiteralExpr(
+			{ literal | elements = evaluated.value }, typ, core_expr_source_loc(expr),
+		))
+	{ state = evaluated.state.next_binder_id, value = bound }
+
+
+-- This catalog is deliberately conservative. Parameters and explicit local
+-- bindings prove locality by CoreVar identity; an unrecognized binder takes
+-- the safe snapshot path. Calls cannot rebind a caller's local under value
+-- semantics, but a global can change indirectly and is never catalogued.
+private pure func declared_local_variables(
+	root: CoreExpr,
+	parameters: List[CoreVar],
+) -> List[CoreVar]:
+	var local_variables: List[CoreVar] = parameters
+	var pending: List[CoreExpr] = [root]
+	var cursor: Int = 0
+
+	while cursor < pending.length():
+		expr = pending.get_or(cursor, root)
+		match expr:
+			LetExpr(variable, _, _, _, _):
+				local_variables = local_variables.append(variable)
+			BorrowLetExpr(variable, _, _, _):
+				local_variables = local_variables.append(variable)
+			LambdaExpr(params, _, _, _, _, _):
+				for param in params:
+					local_variables = local_variables.append(param.name)
+			_:
+				void
+		for child in CoreTraverse.immediate_core_expr_children(expr):
+			pending = pending.append(child)
+		cursor += 1
+
+	local_variables
+
+
+private pure func reuse_source_is_stable_local(
+	local_variables: List[CoreVar],
+	source: CoreExpr,
+	build: CoreProductBuild,
+) -> Bool:
+	match source:
+		VarExpr(variable, _, _):
+			(
+				local_variables.any(func(local): core_var_equal(local, variable))
+				and not product_build_values(build).any(func(value): CoreTraverse.core_expr_assigns_var(value, variable))
+			)
+		_:
+			False
+
+
+private pure func normalize_reuse(
+	local_variables: List[CoreVar],
+	next_binder_id: Int,
+	source: CoreExpr,
+	build: CoreProductBuild,
+	typ: CoreType,
+	expr: CoreExpr,
+) -> CoreMapState[Int, CoreExpr]:
+	if reuse_source_is_stable_local(local_variables, source, build):
+		-- Keep the source's established consuming handoff. A new ordinary alias
+		-- Let would retain it and hide that handoff from mutable ownership analysis.
+		evaluated = bind_product_values(build, next_binder_id)
+		{
+			state = evaluated.state.next_binder_id,
+			value = with_value_bindings(
+				evaluated.state.bindings,
+				RecordReuseExpr(source, evaluated.value, typ, core_expr_source_loc(expr)),
+			)
+		}
+	else:
+		-- Snapshot a call, global or rebound local before evaluating any field.
+		variable: CoreVar = {
+			name = PRODUCT_REUSE_SOURCE_NAME_PREFIX + next_binder_id.to_string(),
+			id = next_binder_id,
+			def_id = None,
+			origin = PRODUCT_REUSE_SOURCE_TEMP_ORIGIN
+		}
+		source_type: CoreType = core_expr_type(source)
+		evaluated = bind_product_values(build, next_binder_id - 1)
+		bindings: List[ProductValueBinding] = [{
+			variable = variable,
+			typ = source_type,
+			value = source
+		}].concat(evaluated.state.bindings)
+		{
+			state = evaluated.state.next_binder_id,
+			value = with_value_bindings(
+				bindings,
+				RecordReuseExpr(VarExpr(variable, source_type, core_expr_source_loc(source)), evaluated.value, typ, core_expr_source_loc(expr)),
+			)
+		}
+
+
+private pure func normalize_expr(
+	state: ProductEvaluationTraversal,
+	expr: CoreExpr,
+) -> CoreMapState[ProductEvaluationTraversal, CoreExpr]:
+	match expr:
+		VectorExpr(items, typ, loc):
+			-- Project rows before child normalization can wrap them in Lets and
+			-- hide the literal shape. Storage and rank come from the shared issuer.
+			projected = project_vector_literal_storage(expr, items, typ, loc)
+			match projected:
+				TensorBoxedLiteralExpr(_, _, _) | TensorLiteralExpr(_, _, _) | TensorPackedLiteralExpr(_, _, _):
+					normalize_expr(state, projected)
+				_:
+					CoreTraverse.map_core_expr_children_with_state(state, normalize_expr, expr)
+		SeqExpr(_, _):
+			spine = CoreTraverse.split_core_sequence(expr)
+			var current: ProductEvaluationTraversal = state
+			var preceding: List[CoreExpr] = []
+			var changed: Bool = False
+
+			for item in spine.preceding_items:
+				mapped = normalize_expr(current, item)
+				current = mapped.state
+				preceding = preceding.append(mapped.value)
+				changed = changed or not same_object(mapped.value, item)
+
+			final_item = normalize_expr(current, spine.final_item)
+			normalized: CoreExpr = if not changed and same_object(final_item.value, spine.final_item):
+				expr
+			else:
+				CoreTraverse.rebuild_core_sequence({
+					preceding_items = preceding,
+					final_item = final_item.value
+				})
+			{
+				state = final_item.state,
+				value = normalized
+			}
+		_:
+			mapped = CoreTraverse.map_core_expr_children_with_state(state, normalize_expr, expr)
+			match mapped.value:
+				ListConstructExpr(construct, typ, _):
+					list = normalize_list(mapped.state.next_binder_id, construct, typ, mapped.value)
+					{ state = { mapped.state | next_binder_id = list.state }, value = list.value }
+				TensorLiteralExpr(literal, typ, _):
+					tensor = normalize_tensor_literal(mapped.state.next_binder_id, literal, typ, mapped.value)
+					{ state = { mapped.state | next_binder_id = tensor.state }, value = tensor.value }
+				TensorPackedLiteralExpr(literal, typ, _):
+					tensor = normalize_packed_tensor(mapped.state.next_binder_id, literal, typ, mapped.value)
+					{ state = { mapped.state | next_binder_id = tensor.state }, value = tensor.value }
+				TensorBoxedLiteralExpr(literal, typ, _):
+					tensor = normalize_boxed_tensor(mapped.state.next_binder_id, literal, typ, mapped.value)
+					{ state = { mapped.state | next_binder_id = tensor.state }, value = tensor.value }
+				ProductExpr(build, typ, _):
+					product = normalize_product(mapped.state.next_binder_id, build, typ, mapped.value)
+					{
+						state = { mapped.state | next_binder_id = product.state },
+						value = product.value
+					}
+				RecordReuseExpr(source, build, typ, _):
+					reuse = normalize_reuse(
+						mapped.state.local_variables,
+						mapped.state.next_binder_id,
+						source,
+						build,
+						typ,
+						mapped.value,
+					)
+					{
+						state = { mapped.state | next_binder_id = reuse.state },
+						value = reuse.value
+					}
+				_:
+					mapped
+
+private pure func normalize_function(
+	next_binder_id: Int,
+	function: CoreFunction,
+) -> CoreMapState[Int, CoreFunction]:
+	match function.body:
+		Some(body):
+			parameters: List[CoreVar] = function.params.map(func(param): param.name)
+			closure_parameters: List[CoreVar] = match function.function_kind:
+				ClosureBodyFunction(abi):
+					abi.params.map(func(param): param.name).concat(abi.captures.map(func(capture): {
+						name = capture.name, id = capture.id, def_id = None, origin = capture.origin
+					}))
+				_: []
+			mapped = normalize_expr({
+				next_binder_id = next_binder_id,
+				local_variables = declared_local_variables(body, parameters.concat(closure_parameters))
+			}, body)
+			{ state = mapped.state.next_binder_id, value = { function | body = Some(mapped.value) } }
+		None:
+			{ state = next_binder_id, value = function }
+
+
+---
+Normalize products at the ownership boundary. `next_binder_id` is the pass
+runner's shared descending frontier; the caller reserves `ids_used` before
+the next pass can mint a binder. Each build retains its checked ordinals.
+---
+pure func normalize_product_evaluation(
+	program: CoreProgram,
+	next_binder_id: Int,
+) -> ProductEvaluationResult:
+	var current: Int = next_binder_id
+	var declarations: List[CoreDecl] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				mapped = normalize_function(current, function)
+				current = mapped.state
+				declarations = declarations.append(FunctionDecl(mapped.value))
+			GlobalDecl(global):
+				if product_evaluation_is_literal_global(global.init):
+					declarations = declarations.append(decl)
+				else:
+					mapped = normalize_expr({ next_binder_id = current, local_variables = declared_local_variables(global.init, []) }, global.init)
+					current = mapped.state.next_binder_id
+					declarations = declarations.append(GlobalDecl({ global | init = mapped.value }))
+			ImplDecl(implementation):
+				var methods: List[CoreFunction] = []
+
+				for method in implementation.methods:
+					mapped = normalize_function(current, method)
+					current = mapped.state
+					methods = methods.append(mapped.value)
+
+				declarations = declarations.append(ImplDecl({ implementation | methods = methods }))
+			_:
+				declarations = declarations.append(decl)
+
+	{
+		program = { program | decls = declarations },
+		ids_used = next_binder_id - current
+	}

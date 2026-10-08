@@ -27,7 +27,7 @@ import:
 		CorePassDiagnostic(
 			CoreEarlyInlineRecordIdentityDiagnostic, CoreEarlyInvariantDiagnostic,
 			CoreEarlyMonoDiagnostic, CoreEarlySynthDiagnostic,
-			CoreEarlyTraitResolveDiagnostic, CoreEarlyTupleFlattenDiagnostic,
+			CoreEarlyTraitResolveDiagnostic, CoreEarlyTupleFlattenDiagnostic, CoreEarlyTupleStorageDiagnostic,
 		),
 		CorePassObservation,
 		CorePassRun(CorePassesCompleted, CorePassesFailed, CorePassesStopped),
@@ -48,6 +48,7 @@ import:
 	tensor_fusion: fuse_tensor_update_program
 	trait_resolve: resolve_core_traits
 	tuple_flatten: flatten_tuples_program
+	tuple_storage: lower_tuple_storage_program
 
 
 fixed union CoreEarlyPipelineStage:
@@ -102,10 +103,11 @@ FUSE_PARALLEL_TENSOR_PASS: String = "fuse_parallel_tensor"
 
 FUSE_TENSOR_UPDATE_PASS: String = "fuse_tensor_update"
 
--- Generic templates are projected out between tensor fusion and tuple
--- flattening, so the user-visible `fusion` snapshot is the one taken after
--- tuple flattening.
+-- Generic templates are projected out before tuple flattening; managed
+-- tuple storage follows flattening, so `fusion` observes that final projection.
 TUPLE_FLATTEN_PASS: String = "tuple_flatten"
+
+TUPLE_STORAGE_PASS: String = "tuple_storage"
 
 FUSION_STAGE: String = "fusion"
 
@@ -179,18 +181,18 @@ pure func core_early_pipeline_stage_name(stage: CoreEarlyPipelineStage) -> Strin
 
 ---
 User-visible stage names are aliases for the pass they end at. Only `fusion`
-differs from its pass, because it names the program after tuple flattening.
+differs from its pass, because it names the program after tuple storage.
 ---
 pure func early_core_pass_name(stage: CoreEarlyPipelineStage) -> String:
 	match stage:
 		CoreEarlyFusionStage:
-			TUPLE_FLATTEN_PASS
+			TUPLE_STORAGE_PASS
 		_:
 			core_early_pipeline_stage_name(stage)
 
 
 pure func early_core_pass_stage_name(pass_name: String) -> String:
-	if pass_name == TUPLE_FLATTEN_PASS:
+	if pass_name == TUPLE_STORAGE_PASS:
 		FUSION_STAGE
 	else:
 		pass_name
@@ -363,6 +365,28 @@ private pure func run_tuple_flatten_pass(
 
 
 ---
+Issue concrete tuple rows after local flattening and before ownership. The
+copy/source index also retains provenance for declarations pruned earlier;
+refresh live facts without erasing that original identity authority.
+---
+private pure func run_tuple_storage_pass(
+	state: CorePassState,
+) -> Result[CorePassState, CorePassDiagnostic]:
+	match lower_tuple_storage_program(state.program):
+		Ok(program):
+			refreshed = core_declaration_index(state.names, state.modules, program)
+			Ok({ state |
+				program = program,
+				declaration_index = { refreshed |
+					copy_declarations = state.declaration_index.copy_declarations.merge(refreshed.copy_declarations),
+					known_functions = state.declaration_index.known_functions.merge(refreshed.known_functions),
+				}
+			})
+		Err(failure):
+			Err(CoreEarlyTupleStorageDiagnostic(failure))
+
+
+---
 Monomorphization mints declarations, so it is the one pass that advances
 `next_def_id`. List layout runs with it so the `mono` snapshot shows the
 laid-out program, exactly as the nested stage chain did.
@@ -478,7 +502,8 @@ is its own list segment rather than a tail of the one above.
 ---
 pure func early_core_projection_passes() -> List[CorePass]:
 	[
-		{ core_pass(TUPLE_FLATTEN_PASS, run_tuple_flatten_pass) |
+		core_pass(TUPLE_FLATTEN_PASS, run_tuple_flatten_pass),
+		{ core_pass(TUPLE_STORAGE_PASS, run_tuple_storage_pass) |
 			invariant = Some(resolve_and_std_inline_invariant)
 		},
 	]

@@ -46,13 +46,13 @@ import:
 			LambdaExpr, LetExpr, ListConstructExpr, ListAllocExpr, ListGetExpr, ListHandoffExpr,
 			ListHandoffSetOwnedExpr, ListHandoffSetSourceSlotExpr, ListRetainExpr, ListSetExpr,
 			ListSwapExpr, LiteralExpr, LogicalExpr, PreClosureConcurrentExpr,
-			PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr, RecordConstructExpr, RecordExpr,
+			PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr, ProductExpr,
 			RecordCowUpdateExpr, RecordReuseExpr, RecordUpdateExpr, ResourceCleanupExitExpr,
 			ResourceScopeExpr, SelectExpr, SeqExpr, StaticStringLiteralExpr, StringByteCopyExpr,
 			StringByteReadExpr, StringByteWriteExpr, StringSetLenExpr, TailrecListSpreadLoopExpr,
 			TailrecListSpreadRecurExpr, TailrecLoopExpr, TailrecRecurExpr, TensorBoxedLiteralExpr,
 			TensorRawFillExpr, TensorRawReadExpr, TensorRawViewLetExpr, TensorRawWriteExpr,
-			TupleConstructExpr, TupleExpr, UnaryExpr, UnboxExpr, UnionConstructExpr,
+			TupleExpr, UnaryExpr, UnboxExpr, UnionConstructExpr,
 			VarExpr, VectorExpr, VoidExpr, WhileExpr, LiteralMatchExpr, LengthMatchExpr,
 		),
 		CoreListHandoffMode(BorrowFreshHandoff),
@@ -66,6 +66,8 @@ import:
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
 		CoreParam,
+		CoreProductBuild,
+		CoreMapState,
 		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy, StackResultReleasePolicy),
@@ -77,6 +79,9 @@ import:
 		CoreVar,
 		DerivedTempKind(AssignTemp),
 		core_expr_type,
+		map_product_build_values,
+		product_build_values,
+		rewrite_product_build_values,
 		synthetic_core_source_loc,
 	../ownership: OwnershipCallContract, OwnershipResultMode(ReturnAliasOfArg), arg_consumes_caller
 	../traverse as CoreTraverse
@@ -136,6 +141,13 @@ private record MutableExprListRewrite {
 private record MutableRecordFieldsRewrite {
 	fields: List[CoreRecordFieldValue],
 	next_temp: Int
+}
+
+
+-- The state `rewrite_mutable_assignments` threads through a build's values.
+private record MutableProductValueState {
+	next_temp: Int,
+	skips_old_release: Bool
 }
 
 
@@ -1256,19 +1268,17 @@ pure func expr_assigns_mutable_target(target: CoreVar, expr: CoreExpr) -> Bool:
 			expr_list_assigns_mutable_target(target, items)
 		VectorExpr(items, typ, loc):
 			expr_list_assigns_mutable_target(target, items)
-		RecordExpr(fields, typ, loc):
-			record_fields_assign_mutable_target(target, fields)
-		RecordConstructExpr(_, fields, typ, loc):
-			record_fields_assign_mutable_target(target, fields)
+		ProductExpr(build, typ, loc):
+			expr_list_assigns_mutable_target(target, product_build_values(build))
 		RecordUpdateExpr(base, fields, typ, loc):
 			(
 				expr_assigns_mutable_target(target, base)
 				or record_fields_assign_mutable_target(target, fields)
 			)
-		RecordReuseExpr(base, fields, typ, loc):
+		RecordReuseExpr(base, build, typ, loc):
 			(
 				expr_assigns_mutable_target(target, base)
-				or record_fields_assign_mutable_target(target, fields)
+				or expr_list_assigns_mutable_target(target, product_build_values(build))
 			)
 		RecordCowUpdateExpr(source, fields, typ, loc):
 			(
@@ -1515,6 +1525,44 @@ private pure func rewrite_mutable_record_fields(
 	}
 
 
+private pure func rewrite_mutable_product_build(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	build: CoreProductBuild,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> CoreMapState[MutableProductValueState, CoreProductBuild]:
+	initial: MutableProductValueState = {
+		next_temp = temp_index,
+		skips_old_release = skip_old_release
+	}
+
+	rewrite_product_build_values(
+		build,
+		initial,
+		pure func(
+			state: MutableProductValueState,
+			value: CoreExpr,
+		) -> CoreMapState[MutableProductValueState, CoreExpr]:
+			result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				value,
+				state.next_temp,
+				state.skips_old_release,
+			)
+			{
+				state = {
+					next_temp = result.next_temp,
+					skips_old_release = skip_old_release_after_expr(env, target, state.skips_old_release, value)
+				},
+				value = result.expr
+			}
+	)
+
+
 private pure func rewrite_mutable_record_cow_fields(
 	env: PerceusEnv,
 	target: CoreVar,
@@ -1684,6 +1732,19 @@ private pure func stabilize_nested_assignment_record_fields(
 		)
 
 	stabilized
+
+
+private pure func stabilize_nested_assignment_build(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	build: CoreProductBuild,
+) -> CoreProductBuild:
+	map_product_build_values(
+		build,
+		target,
+		func(assigned, value): stabilize_nested_assignment_rhs(env, assigned, target_type, value),
+	).get_or(build)
 
 
 private pure func stabilize_nested_assignment_boxed_values(
@@ -1897,16 +1958,9 @@ private pure func stabilize_nested_assignment_rhs(
 					typ,
 					loc,
 				)
-			RecordExpr(fields, typ, loc):
-				RecordExpr(
-					stabilize_nested_assignment_record_fields(env, target, target_type, fields),
-					typ,
-					loc,
-				)
-			RecordConstructExpr(type_name, fields, typ, loc):
-				RecordConstructExpr(
-					type_name,
-					stabilize_nested_assignment_record_fields(env, target, target_type, fields),
+			ProductExpr(build, typ, loc):
+				ProductExpr(
+					stabilize_nested_assignment_build(env, target, target_type, build),
 					typ,
 					loc,
 				)
@@ -1917,10 +1971,10 @@ private pure func stabilize_nested_assignment_rhs(
 					typ,
 					loc,
 				)
-			RecordReuseExpr(source, fields, typ, loc):
+			RecordReuseExpr(source, build, typ, loc):
 				RecordReuseExpr(
 					stabilize_nested_assignment_rhs(env, target, target_type, source),
-					stabilize_nested_assignment_record_fields(env, target, target_type, fields),
+					stabilize_nested_assignment_build(env, target, target_type, build),
 					typ,
 					loc,
 				)
@@ -3877,31 +3931,18 @@ private pure func rewrite_mutable_assignments(
 				expr = VectorExpr(items_result.exprs, typ, loc),
 				next_temp = items_result.next_temp
 			}
-		RecordExpr(fields, typ, loc):
-			fields_result: MutableRecordFieldsRewrite = rewrite_mutable_record_fields(
+		ProductExpr(build, typ, loc):
+			build_result: CoreMapState[MutableProductValueState, CoreProductBuild] = rewrite_mutable_product_build(
 				env,
 				target,
 				target_type,
-				fields,
+				build,
 				temp_index,
 				skip_old_release,
 			)
 			{
-				expr = RecordExpr(fields_result.fields, typ, loc),
-				next_temp = fields_result.next_temp
-			}
-		RecordConstructExpr(type_name, fields, typ, loc):
-			fields_result: MutableRecordFieldsRewrite = rewrite_mutable_record_fields(
-				env,
-				target,
-				target_type,
-				fields,
-				temp_index,
-				skip_old_release,
-			)
-			{
-				expr = RecordConstructExpr(type_name, fields_result.fields, typ, loc),
-				next_temp = fields_result.next_temp
+				expr = ProductExpr(build_result.value, typ, loc),
+				next_temp = build_result.state.next_temp
 			}
 		RecordUpdateExpr(base, fields, typ, loc):
 			base_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
@@ -3924,7 +3965,7 @@ private pure func rewrite_mutable_assignments(
 				expr = RecordUpdateExpr(base_result.expr, fields_result.fields, typ, loc),
 				next_temp = fields_result.next_temp
 			}
-		RecordReuseExpr(source, fields, typ, loc):
+		RecordReuseExpr(source, build, typ, loc):
 			source_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
 				env,
 				target,
@@ -3933,17 +3974,17 @@ private pure func rewrite_mutable_assignments(
 				temp_index,
 				skip_old_release,
 			)
-			fields_result: MutableRecordFieldsRewrite = rewrite_mutable_record_fields(
+			build_result: CoreMapState[MutableProductValueState, CoreProductBuild] = rewrite_mutable_product_build(
 				env,
 				target,
 				target_type,
-				fields,
+				build,
 				source_result.next_temp,
 				skip_old_release_after_expr(env, target, skip_old_release, source),
 			)
 			{
-				expr = RecordReuseExpr(source_result.expr, fields_result.fields, typ, loc),
-				next_temp = fields_result.next_temp
+				expr = RecordReuseExpr(source_result.expr, build_result.value, typ, loc),
+				next_temp = build_result.state.next_temp
 			}
 		RecordCowUpdateExpr(source, fields, typ, loc):
 			fields_result: MutableRecordCowFieldsRewrite = rewrite_mutable_record_cow_fields(

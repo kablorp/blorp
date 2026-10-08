@@ -700,6 +700,17 @@ struct blorp_Bytes {
 
 typedef struct { blorp_Object header; long arity; long release_mask; void* elem[]; } blorp_Tuple;
 
+// Generated product factories borrow erased container slots and return one
+// owned managed record. They decode/retain fields using the concrete layout.
+typedef void* (*blorp_ProductPairFactory)(void* first, void* second);
+typedef void* (*blorp_ProductEnumerateFactory)(long index, void* value);
+// Vector inputs may be packed or inline; the generated factory reads their
+// concrete element storage rather than assuming erased pointer slots.
+typedef void* (*blorp_ProductVectorPairFactory)(
+    const blorp_Vector* first, const blorp_Vector* second, long index
+);
+
+
 #define DICT_META_EMPTY   0xFF
 #define DICT_META_DELETED 0x80
 #define DICT_GROUP_SIZE   16
@@ -1190,6 +1201,19 @@ static inline void blorp_task_cleanup_scope_exit(
 #define BLORP_TASK_CLEANUP_SCOPE(frame) \
     blorp_CancelCleanupScopeGuard __blorp_scope_guard_##frame \
         __attribute__((cleanup(blorp_task_cleanup_scope_exit))) = { &(frame) }
+
+// A backend-created ARC unit has no consuming Core binding. Its normal owner
+// guard is declared before the cancellation frame's unlink guard: normal scope
+// exit unlinks first and releases once; cancellation drains the frame and
+// longjmps past these C cleanup callbacks. The borrowed Core view is separate.
+// Kept identical in runtime.c and runtime_decl.c.
+typedef struct {
+    void* value;
+} blorp_ArcOwnerScope;
+
+static inline void blorp_arc_owner_scope_exit(blorp_ArcOwnerScope* scope) {
+    blorp_release(scope->value);
+}
 
 // The current task is fiber-scoped and is rebound on every fiber resume, so it
 // is constant for one execution of one function, including across yields. A
@@ -2007,7 +2031,7 @@ blorp_StackOption_Float16 blorp_dict_get_f16(blorp_Dict* dict, void* key);
 #endif
 blorp_Dict* blorp_dict_insert(blorp_Dict* dict, void* key, void* value);
 blorp_Dict* blorp_dict_remove(blorp_Dict* dict, void* key);
-blorp_List* blorp_dict_entries(blorp_Dict* dict);
+blorp_List* blorp_dict_entries_product(blorp_Dict* dict, blorp_ProductPairFactory make_pair);
 
 // Set
 blorp_Set* blorp_set_new(void);
@@ -2228,14 +2252,19 @@ typedef struct blorp_FallibleStream {
     blorp_StreamElementLayout elem_layout;
 } blorp_FallibleStream;
 
+// The callback borrows closure/state and transfers two owned erased slots on
+// success. It releases the typed step pair only after retaining/transferring
+// both outputs; no product release metadata is mutated.
+typedef bool (*blorp_ProductUnfoldStep)(
+    blorp_Closure* func, void* state, void** value, void** next_state
+);
+
 blorp_Stream* blorp_stream_from_list(blorp_List* list);
 blorp_Stream* blorp_stream_from_range(long start, long end);
 blorp_Stream* blorp_stream_repeat(void* value, long elem_layout_code);
-blorp_Stream* blorp_stream_unfold(
-    void* seed,
-    blorp_Closure* func,
-    long elem_layout_code,
-    long state_layout_code
+blorp_Stream* blorp_stream_unfold_product(
+    void* seed, blorp_Closure* func, long elem_layout_code,
+    long state_layout_code, blorp_ProductUnfoldStep step
 );
 blorp_Stream* blorp_stream_empty(void);
 blorp_FallibleStream* blorp_file_chunks_reader_raw(const blorp_FileReader* reader);
@@ -2271,7 +2300,7 @@ blorp_Stream* blorp_stream_filter_map_nullable(blorp_Stream* inner, blorp_Closur
 blorp_Stream* blorp_stream_take(blorp_Stream* inner, long n);
 blorp_Stream* blorp_stream_drop(blorp_Stream* inner, long n);
 blorp_Stream* blorp_stream_take_while(blorp_Stream* inner, blorp_Closure* pred);
-blorp_Stream* blorp_stream_enumerate(blorp_Stream* inner);
+blorp_Stream* blorp_stream_enumerate_product(blorp_Stream* inner, blorp_ProductEnumerateFactory make_pair);
 blorp_List* blorp_stream_collect(blorp_Stream* stream);
 blorp_FallibleStreamListResult blorp_fallible_stream_collect_raw(blorp_FallibleStream* stream, uint8_t storage_mode, int16_t elem_size);
 blorp_FallibleStreamValueResult blorp_fallible_stream_fold_raw(blorp_FallibleStream* stream, void* init, blorp_Closure* func, bool acc_is_rc);
@@ -2355,7 +2384,7 @@ blorp_List* blorp_zip_parallel_with(blorp_List* list_a, blorp_List* list_b, blor
 
 // Sequential list HOFs are synthesized as Core IR.
 blorp_List* blorp_list_drop(blorp_List* list, long n);
-blorp_Vector* blorp_vector_zip(blorp_Vector* a, blorp_Vector* b);
+blorp_Vector* blorp_vector_zip_product(blorp_Vector* a, blorp_Vector* b, blorp_ProductVectorPairFactory make_pair);
 
 // Vector HOFs / Parallel Vector Ops
 blorp_Vector* blorp_vector_map(blorp_Vector* arr, blorp_Closure* f, long result_elem_is_rc);
@@ -2640,6 +2669,35 @@ void blorp_debug_warn(blorp_String* s);
 void blorp_debug_error(blorp_String* s);
 
 // System / Filesystem Ops
+// Borrowed snapshot of an evaluated typed process command. The native call
+// reads these fields without taking ownership of any input pointer.
+typedef struct {
+    const blorp_String* cwd;
+    bool has_cwd;
+    const blorp_List* environment_set_names;
+    const blorp_List* environment_set_values;
+    const blorp_List* environment_unset_names;
+    long stdin_mode;
+    const blorp_Bytes* stdin_bytes;
+    const blorp_List* stdin_bytes_parts;
+    long stdout_mode;
+    long stderr_mode;
+    bool has_timeout;
+    long timeout_ms;
+    long group_mode;
+    long capture_limit;
+} blorp_ProcessCommandOptions;
+
+// Factories consume every supplied owned pointer exactly once and return an
+// owned generated record payload. The native caller supplies the Result box.
+typedef void* (*blorp_ProcessSuccessFactory)(
+    long exit_kind, long exit_code, blorp_Bytes* stdout_bytes, blorp_Bytes* stderr_bytes
+);
+typedef void* (*blorp_ProcessErrorFactory)(long kind, blorp_String* detail);
+typedef void* (*blorp_ProcessOutputFactory)(
+    blorp_String* stdout_string, blorp_String* stderr_string, long exit_code
+);
+
 blorp_String* blorp_getcwd(void);
 long blorp_mkdir(const blorp_String* path);
 long blorp_remove_file(const blorp_String* path);
@@ -2650,7 +2708,10 @@ void* blorp_file_modified(const blorp_String* path);
 blorp_String* blorp_temp_dir(void);
 void* blorp_mkstemp_path(const blorp_String* prefix);
 void* blorp_exec_output(const blorp_String* cmd);
-void* blorp_process_run(const blorp_String* program, const blorp_List* args);
+void* blorp_process_run_product(const blorp_String* program, const blorp_List* args, blorp_ProcessOutputFactory make_output);
+void* blorp_process_shell_product(const blorp_String* command, blorp_ProcessOutputFactory make_output);
+void* blorp_process_run_command_product(const blorp_String* program, const blorp_List* args, const blorp_ProcessCommandOptions* options, blorp_ProcessSuccessFactory make_success, blorp_ProcessErrorFactory make_error);
+blorp_ProcessSessionResult blorp_process_session_start_product(const blorp_String* program, const blorp_List* args, const blorp_ProcessCommandOptions* options);
 void* blorp_process_run_inherit(const blorp_String* program, const blorp_List* args);
 void* blorp_process_run_command_raw(const blorp_String* program, const blorp_List* args, const blorp_Tuple* options);
 blorp_ProcessSessionResult blorp_process_session_start_raw(const blorp_Tuple* request);
@@ -2666,7 +2727,6 @@ blorp_String* blorp_compiler_runtime_source(void);
 blorp_String* blorp_compiler_runtime_decl(void);
 blorp_CompilerStdinReadResult blorp_compiler_stdin_read_raw(long max_bytes);
 blorp_CompilerStdoutWriteResult blorp_compiler_stdout_write_all_raw(const blorp_Bytes* data);
-void* blorp_process_shell(const blorp_String* command);
 
 // Hashing / Crypto
 long blorp_hash_int(long k);

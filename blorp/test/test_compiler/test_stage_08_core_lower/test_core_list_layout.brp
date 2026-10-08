@@ -23,7 +23,7 @@ import:
 			ListAllocExpr,
 			ListConstructExpr,
 			LiteralExpr,
-			RecordExpr,
+			ProductExpr,
 			VarExpr,
 			VoidExpr,
 		),
@@ -41,6 +41,7 @@ import:
 		CoreTensorDim(TensorStaticDim),
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreSourceLoc,
+		product_build_in_declared_order,
 		synthetic_core_source_loc,
 		CoreType(
 			UnionType,
@@ -144,7 +145,11 @@ pure func stale_product_list_construct(list_typ: CoreType, record_typ: CoreType)
 			elements = [
 				{
 					kind = PointerBox,
-					value = RecordExpr([], record_typ, synthetic_core_source_loc()),
+					value = ProductExpr(
+						product_build_in_declared_order([]),
+						record_typ,
+						synthetic_core_source_loc(),
+					),
 					needs_release = False,
 					transfers_ownership = False
 				},
@@ -182,7 +187,11 @@ pure func stale_heap_record_list_construct(list_typ: CoreType, record_typ: CoreT
 			elements = [
 				{
 					kind = PointerBox,
-					value = RecordExpr([], record_typ, synthetic_core_source_loc()),
+					value = ProductExpr(
+						product_build_in_declared_order([]),
+						record_typ,
+						synthetic_core_source_loc(),
+					),
 					needs_release = False,
 					transfers_ownership = False
 				},
@@ -608,6 +617,69 @@ pure func test_indexed_layout_queries_reuse_declaration_facts() -> Bool:
 	)
 
 
+pure func test_function_list_elements_require_release() -> Bool:
+	index = build_layout_type_index(empty_program([]))
+	callback = FunctionType(True, [named_type("String")], named_type("Bool"))
+	(
+		is_pointer_layout(list_layout_for_type_with_index(index, list_type(callback)))
+		and list_element_needs_release_with_index(index, callback)
+	)
+
+
+pure func test_function_alias_list_elements_require_release() -> Bool:
+	callback = FunctionType(True, [named_type("String")], named_type("Bool"))
+	index = build_layout_type_index(empty_program([type_alias("Validator", [], callback)]))
+	alias_type = named_type("Validator")
+	(
+		is_pointer_layout(list_layout_for_type_with_index(index, list_type(alias_type)))
+		and list_element_needs_release_with_index(index, alias_type)
+	)
+
+
+pure func test_function_list_construct_repairs_container_and_element_release() -> Bool:
+	callback = FunctionType(True, [named_type("String")], named_type("Bool"))
+	construct = ListConstructExpr({
+		layout = PointerListStorage,
+		elements = [{
+			kind = PointerBox,
+			value = VarExpr(core_var("validator"), callback, synthetic_core_source_loc()),
+			needs_release = False,
+			transfers_ownership = False,
+		}],
+		elem_needs_release = False,
+	}, list_type(callback), synthetic_core_source_loc())
+	annotated = annotate_list_layouts(empty_program([function_decl("validators", 12, construct)]))
+	match annotated.decls:
+		[FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(ListConstructExpr(actual, _, _)):
+					match actual.elements:
+						[element]:
+							(
+								is_pointer_layout(actual.layout)
+								and actual.elem_needs_release
+								and element.needs_release
+								and not element.transfers_ownership
+							)
+						_: False
+				_: False
+		_: False
+
+
+pure func test_function_list_alloc_repairs_container_release() -> Bool:
+	callback = FunctionType(True, [named_type("String")], named_type("Bool"))
+	annotated = annotate_list_layouts(empty_program([
+		function_decl("validators", 13, stale_list_alloc(list_type(callback))),
+	]))
+	match annotated.decls:
+		[FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(ListAllocExpr(actual, _, _)):
+					is_pointer_layout(actual.layout) and actual.elem_needs_release
+				_: False
+		_: False
+
+
 pure func test_annotates_function_global_and_impl_bodies() -> Bool:
 	int_list: CoreType = list_type(named_type("Int"))
 	string_list: CoreType = list_type(named_type("String"))
@@ -893,6 +965,10 @@ tests: TestSuite = {
 		),
 		("classifies stack option inline struct", test_classifies_stack_option_inline_struct),
 		("classifies pointer release policy", test_classifies_pointer_release_policy),
+		("function list elements require release", test_function_list_elements_require_release),
+		("function alias list elements require release", test_function_alias_list_elements_require_release),
+		("function list construct repairs release policies", test_function_list_construct_repairs_container_and_element_release),
+		("function list allocation repairs release policy", test_function_list_alloc_repairs_container_release),
 		(
 			"indexed layout queries reuse declaration facts",
 			test_indexed_layout_queries_reuse_declaration_facts,

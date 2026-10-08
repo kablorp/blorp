@@ -6,8 +6,16 @@ import:
 	../../../src/compiler/stage_09_core/ir:
 		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
 		CoreDeclaredOrigin(ImplMethod, ProjectedImplMethod),
-		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, TraitDecl, TypeAliasDecl, UnionDecl),
-		CoreExpr(DictExpr, RecordExpr, SetAllocExpr, VarExpr, VoidExpr),
+		CoreDecl(
+			FunctionDecl,
+			GlobalDecl,
+			HeapRecordDecl,
+			ImplDecl,
+			TraitDecl,
+			TypeAliasDecl,
+			UnionDecl,
+		),
+		CoreExpr(CastExpr, DictExpr, ProductExpr, SetAllocExpr, VarExpr, VoidExpr),
 		CoreFunction,
 		CoreFunctionKind(UnresolvedBuiltinFunction, UserFunction),
 		CoreFunctionOrigin(Declared),
@@ -18,8 +26,9 @@ import:
 		CoreHashContainerConstructor(ImplHashContainerConstructor),
 		CoreRuntimeCallbackRole(EquatableEqualsCallback, HashableHashCallback),
 		CoreSourceLoc,
+		product_build_in_declared_order,
 		synthetic_core_source_loc,
-		CoreType(BoxedResultType, HeapRecordType, NamedType, StackResultType, TypeParameterType, VoidType),
+		CoreType(InlineRecordType, RangeType, BoxedResultType, HeapRecordType, NamedType, StackResultType, TypeParameterType, VoidType),
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
 		CoreUnionVariant,
@@ -27,6 +36,7 @@ import:
 		CoreVar,
 		core_field_ref,
 		core_type_to_json,
+		core_expr_to_json,
 	../../../src/compiler/stage_09_core/runtime_projection:
 		CoreRuntimeProjectionError,
 		core_runtime_projection_error_message,
@@ -452,7 +462,11 @@ pure func test_canonicalizes_declared_runtime_types() -> Bool:
 				},
 				source_module = None,
 				typ = config_type,
-				init = RecordExpr([], config_type, synthetic_core_source_loc()),
+				init = ProductExpr(
+					product_build_in_declared_order([]),
+					config_type,
+					synthetic_core_source_loc(),
+				),
 				is_mutable = False,
 				is_const = True,
 				is_private = False,
@@ -469,7 +483,7 @@ pure func test_canonicalizes_declared_runtime_types() -> Bool:
 			match projected.decls:
 				[HeapRecordDecl(_), GlobalDecl(global)]:
 					match (global.typ, global.init):
-						(HeapRecordType("Config"), RecordExpr(_, HeapRecordType("Config"), _)):
+						(HeapRecordType("Config"), ProductExpr(_, HeapRecordType("Config"), _)):
 							True
 						_:
 							False
@@ -718,9 +732,70 @@ pure func test_projects_builtin_concurrency_error_result_to_stack_representation
 			False
 
 
+private pure func projected_cast_body(source_type: CoreType, result_type: CoreType, alias_target: CoreType) -> Option[CoreExpr]:
+	loc = synthetic_core_source_loc()
+	variable: CoreVar = { name = "source", id = 42, def_id = None, origin = AuthoredBinder }
+	function = { boundary_function("conversion", [], True) |
+		params = [{ name = variable, typ = source_type, loc = loc }],
+		return_type = result_type,
+		body = Some(CastExpr(VarExpr(variable, source_type, loc), result_type, loc)),
+	}
+	program: CoreProgram = {
+		decls = [
+			TypeAliasDecl({
+				abi_type = None,
+				name = "OpaqueValue",
+				type_params = [],
+				target = alias_target,
+				is_opaque = True,
+				loc = loc,
+			}),
+			FunctionDecl(function),
+		],
+		foreign_includes = [],
+		source_files = [],
+	}
+	match project_runtime_program(program):
+		Ok(projected):
+			match projected.decls.get(0):
+				Some(FunctionDecl(found)):
+					found.body
+				_:
+					None
+		Err(_):
+			None
+
+
+func test_opaque_inline_identity_cast_is_removed_after_projection() -> Bool:
+	match projected_cast_body(NamedType("OpaqueValue", []), InlineRecordType("Point"), InlineRecordType("Point")):
+		Some(VarExpr(_, InlineRecordType("Point"), _)):
+			True
+		_:
+			False
+
+
+func test_opaque_unit_identity_cast_is_removed_after_projection() -> Bool:
+	match projected_cast_body(NamedType("OpaqueValue", []), VoidType, VoidType):
+		Some(VarExpr(_, VoidType, _)):
+			True
+		_:
+			False
+
+
+func test_nonidentity_range_conversion_survives_projection() -> Bool:
+	match projected_cast_body(RangeType, NamedType("Int", []), RangeType):
+		Some(CastExpr(VarExpr(_, RangeType, _), NamedType("Int", []), _)):
+			True
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp Core runtime projection",
 	tests = [
+		("opaque inline identity cast is removed", test_opaque_inline_identity_cast_is_removed_after_projection),
+		("opaque unit identity cast is removed", test_opaque_unit_identity_cast_is_removed_after_projection),
+		("nonidentity range conversion survives", test_nonidentity_range_conversion_survives_projection),
 		("projects only runtime declarations", test_projects_only_runtime_declarations),
 		(
 			"projection moves the impl target type onto the method origin",

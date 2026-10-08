@@ -22158,26 +22158,31 @@ blorp_Dict* blorp_dict_remove(blorp_Dict* dict, void* key) {
     return result;
 }
 
+// Generated product factories borrow erased container slots and return one
+// owned managed record. They decode/retain fields using the concrete layout.
+typedef void* (*blorp_ProductPairFactory)(void* first, void* second);
+typedef void* (*blorp_ProductEnumerateFactory)(long index, void* value);
+// Vector inputs may be packed or inline; the generated factory reads their
+// concrete element storage rather than assuming erased pointer slots.
+typedef void* (*blorp_ProductVectorPairFactory)(
+    const blorp_Vector* first, const blorp_Vector* second, long index
+);
+
 // Dict contains, get_or, keys, values, entries, and length are now IR intrinsics.
 
-blorp_List* blorp_dict_entries(blorp_Dict* dict) {
+blorp_List* blorp_dict_entries_product(
+    blorp_Dict* dict,
+    blorp_ProductPairFactory make_pair
+) {
     blorp_List* result = blorp_list_new(dict ? dict->size : 0);
     result->elem_release = blorp_elem_release_fn;
     if (!dict) return result;
-    long rc_mask = 0;
-    if (dict->key_release) rc_mask |= 1;
-    if (dict->value_release) rc_mask |= 2;
-    long j = 0;
+    long output_index = 0;
     for (long i = 0; i < dict->order_len; i++) {
         long slot = dict->order[i];
         if (slot < 0) continue;
-        void* key = dict->keys[slot];
-        void* value = dict->values[slot];
-        if (dict->key_release && key) blorp_retain(key);
-        if (dict->value_release && value) blorp_retain(value);
-        blorp_Tuple* tuple = blorp_tuple_new(2, key, value);
-        if (rc_mask) blorp_tuple_set_rc(tuple, rc_mask);
-        blorp_list_set_raw(result, j++, (void*)tuple);
+        void* pair = make_pair(dict->keys[slot], dict->values[slot]);
+        blorp_list_set_raw(result, output_index++, pair);
     }
     result->len = dict->size;
     return result;
@@ -26207,6 +26212,19 @@ static inline void blorp_task_cleanup_scope_exit(
     blorp_CancelCleanupScopeGuard __blorp_scope_guard_##frame \
         __attribute__((cleanup(blorp_task_cleanup_scope_exit))) = { &(frame) }
 
+// A backend-created ARC unit has no consuming Core binding. Its normal owner
+// guard is declared before the cancellation frame's unlink guard: normal scope
+// exit unlinks first and releases once; cancellation drains the frame and
+// longjmps past these C cleanup callbacks. The borrowed Core view is separate.
+// Kept identical in runtime.c and runtime_decl.c.
+typedef struct {
+    void* value;
+} blorp_ArcOwnerScope;
+
+static inline void blorp_arc_owner_scope_exit(blorp_ArcOwnerScope* scope) {
+    blorp_release(scope->value);
+}
+
 // The current task is fiber-scoped and is rebound on every fiber resume, so it
 // is constant for one execution of one function, including across yields. A
 // generated function that performs cleanup operations reads the thread-local
@@ -29972,18 +29990,16 @@ blorp_List* blorp_list_drop(blorp_List* list, long n) {
     return result;
 }
 
-// Returns List[(A, B)] - uses blorp_Tuple
-blorp_Vector* blorp_vector_zip(blorp_Vector* a, blorp_Vector* b) {
+blorp_Vector* blorp_vector_zip_product(
+    blorp_Vector* a,
+    blorp_Vector* b,
+    blorp_ProductVectorPairFactory make_pair
+) {
     if (!a || !b) return blorp_vector_new(0);
     long len = a->len < b->len ? a->len : b->len;
     blorp_Vector* result = blorp_vector_new(len);
     for (long i = 0; i < len; i++) {
-        blorp_Tuple* tuple = blorp_tuple_new(2, a->data[i], b->data[i]);
-        long rc_mask = 0;
-        if (a->elem_release && a->data[i]) { blorp_retain(a->data[i]); rc_mask |= 1; }
-        if (b->elem_release && b->data[i]) { blorp_retain(b->data[i]); rc_mask |= 2; }
-        if (rc_mask) blorp_tuple_set_rc(tuple, rc_mask);
-        result->data[i] = (void*)tuple;
+        result->data[i] = make_pair(a, b, i);
     }
     blorp_vector_init_elem_release(result, blorp_elem_release_fn);
     return result;
@@ -31881,6 +31897,13 @@ static void blorp_fallible_stream_destroy(void* obj) {
 
 // --- State types for different stream kinds ---
 
+// The callback borrows closure/state and transfers two owned erased slots on
+// success. It releases the typed step pair only after retaining/transferring
+// both outputs; no product release metadata is mutated.
+typedef bool (*blorp_ProductUnfoldStep)(
+    blorp_Closure* func, void* state, void** value, void** next_state
+);
+
 typedef struct { blorp_List* list; long idx; } StreamListState;
 typedef struct { long current; long end; } StreamRangeState;
 typedef struct { blorp_Stream* inner; blorp_Closure* func; } StreamMapState;
@@ -31888,7 +31911,11 @@ typedef struct { blorp_Stream* inner; blorp_Closure* pred; } StreamFilterState;
 typedef struct { blorp_Stream* inner; long remaining; } StreamTakeState;
 typedef struct { blorp_Stream* inner; long skipped; long n; } StreamDropState;
 typedef struct { blorp_Stream* inner; blorp_Closure* pred; bool done; } StreamTakeWhileState;
-typedef struct { blorp_Stream* inner; long idx; } StreamEnumState;
+typedef struct {
+    blorp_Stream* inner;
+    long idx;
+    blorp_ProductEnumerateFactory make_pair;
+} StreamEnumState;
 typedef struct { blorp_Stream* inner; blorp_Closure* func; } StreamFilterMapState;
 typedef struct { void* value; blorp_StreamElementLayout elem_layout; } StreamRepeatState;
 typedef struct {
@@ -31896,6 +31923,7 @@ typedef struct {
     blorp_Closure* func;
     bool done;
     blorp_StreamElementLayout state_layout;
+    blorp_ProductUnfoldStep step;
 } StreamUnfoldState;
 typedef struct {
     int fd;
@@ -32206,20 +32234,18 @@ blorp_Stream* blorp_stream_repeat(void* value, long elem_layout_code) {
 static bool stream_unfold_pull(blorp_Stream* self, void** out) {
     StreamUnfoldState* st = (StreamUnfoldState*)self->state;
     if (st->done) return false;
-    blorp_Tuple* pair = (blorp_Tuple*)blorp_call1(st->func, st->state_val);
-    if (!pair) {
+    void* value = NULL;
+    void* next_state = NULL;
+    if (!st->step(st->func, st->state_val, &value, &next_state)) {
         st->done = true;
         return false;
     }
-    *out = pair->elem[0];
-    void* new_state = pair->elem[1];
     void* old_state = st->state_val;
-    st->state_val = new_state;
+    st->state_val = next_state;
     if (blorp_stream_layout_is_arc(st->state_layout) && old_state) {
         blorp_release(old_state);
     }
-    pair->release_mask = 0;
-    blorp_release(pair);
+    *out = value;
     return true;
 }
 static void stream_unfold_cleanup(blorp_Stream* self) {
@@ -32230,15 +32256,17 @@ static void stream_unfold_cleanup(blorp_Stream* self) {
     }
     free(st);
 }
-blorp_Stream* blorp_stream_unfold(
+blorp_Stream* blorp_stream_unfold_product(
     void* seed,
     blorp_Closure* func,
     long elem_layout_code,
-    long state_layout_code
+    long state_layout_code,
+    blorp_ProductUnfoldStep step
 ) {
     blorp_Stream* s = blorp_stream_new();
     StreamUnfoldState* st = BLORP_ORACLE_MALLOC(sizeof(StreamUnfoldState));
     st->state_val = seed;
+    st->step = step;
     st->func = func;
     if (func) blorp_retain((blorp_Object*)func);
     st->done = false;
@@ -32573,15 +32601,9 @@ static bool stream_enum_pull(blorp_Stream* self, void** out) {
     StreamEnumState* st = (StreamEnumState*)self->state;
     void* val;
     if (!st->inner->pull(st->inner, &val)) return false;
-    blorp_Tuple* t = blorp_tuple_new(2, (void*)(long)st->idx, val);
-    if (blorp_stream_has_arc_elements(st->inner) && val) {
-        if (blorp_stream_layout_is_borrowed_arc(st->inner->elem_layout)) {
-            blorp_retain(val);
-        }
-        blorp_tuple_set_rc(t, 2UL);
-    }
-    st->idx++;
-    *out = t;
+    void* pair = st->make_pair(st->idx++, val);
+    blorp_stream_release_pulled_if_owned(st->inner, val);
+    *out = pair;
     return true;
 }
 static void stream_enum_cleanup(blorp_Stream* self) {
@@ -32589,10 +32611,13 @@ static void stream_enum_cleanup(blorp_Stream* self) {
     if (st->inner) blorp_release((blorp_Object*)st->inner);
     free(st);
 }
-blorp_Stream* blorp_stream_enumerate(blorp_Stream* inner) {
+blorp_Stream* blorp_stream_enumerate_product(
+    blorp_Stream* inner, blorp_ProductEnumerateFactory make_pair
+) {
     blorp_Stream* s = blorp_stream_new();
     s->elem_layout = BLORP_STREAM_ELEM_OWNED_ARC;
     StreamEnumState* st = BLORP_ORACLE_MALLOC(sizeof(StreamEnumState));
+    st->make_pair = make_pair;
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
     st->idx = 0;
@@ -41573,6 +41598,35 @@ typedef enum {
     BLORP_PROCESS_ERROR_OUTPUT_LIMIT = 4
 } blorp_ProcessErrorKind;
 
+// Borrowed snapshot of an evaluated typed process command. The native call
+// reads these fields without taking ownership of any input pointer.
+typedef struct {
+    const blorp_String* cwd;
+    bool has_cwd;
+    const blorp_List* environment_set_names;
+    const blorp_List* environment_set_values;
+    const blorp_List* environment_unset_names;
+    long stdin_mode;
+    const blorp_Bytes* stdin_bytes;
+    const blorp_List* stdin_bytes_parts;
+    long stdout_mode;
+    long stderr_mode;
+    bool has_timeout;
+    long timeout_ms;
+    long group_mode;
+    long capture_limit;
+} blorp_ProcessCommandOptions;
+
+// Factories consume every supplied owned pointer exactly once and return an
+// owned generated record payload. The native caller supplies the Result box.
+typedef void* (*blorp_ProcessSuccessFactory)(
+    long exit_kind, long exit_code, blorp_Bytes* stdout_bytes, blorp_Bytes* stderr_bytes
+);
+typedef void* (*blorp_ProcessErrorFactory)(long kind, blorp_String* detail);
+typedef void* (*blorp_ProcessOutputFactory)(
+    blorp_String* stdout_string, blorp_String* stderr_string, long exit_code
+);
+
 typedef enum {
     BLORP_PROCESS_OPTION_CWD = 0,
     BLORP_PROCESS_OPTION_ENVIRONMENT = 1,
@@ -42465,41 +42519,48 @@ static void* __process_error_result(
     return (void*)blorp_result_err_cstr(message);
 }
 
+// Legacy factories retained only for the pinned bootstrap's tuple ABI.
+static void* __process_legacy_error_payload(long kind, blorp_String* detail) {
+    blorp_Tuple* payload = blorp_tuple_new(2, (void*)kind, (void*)detail);
+    blorp_tuple_set_rc(payload, 0x2);
+    return payload;
+}
+
+static void* __process_legacy_success_payload(
+    long exit_kind, long exit_code, blorp_Bytes* stdout_bytes, blorp_Bytes* stderr_bytes
+) {
+    blorp_Tuple* payload = blorp_tuple_new(
+        4, (void*)exit_kind, (void*)exit_code, (void*)stdout_bytes, (void*)stderr_bytes);
+    blorp_tuple_set_rc(payload, 0xC);
+    return payload;
+}
+
 static void* __process_command_error_string(
+    blorp_ProcessErrorFactory make_error,
     blorp_ProcessErrorKind kind,
     blorp_String* detail
 ) {
-    blorp_Tuple* payload =
-        blorp_tuple_new(2, (void*)(long)kind, (void*)detail);
-    blorp_tuple_set_rc(payload, 0x2);
-    return (void*)blorp_result_err_owned((void*)payload);
+    return (void*)blorp_result_err_owned(make_error((long)kind, detail));
 }
 
 static void* __process_command_error(
+    blorp_ProcessErrorFactory make_error,
     blorp_ProcessErrorKind kind,
     const char* detail
 ) {
     return __process_command_error_string(
-        kind,
-        blorp_string_from_buf_size(detail, strlen(detail))
-    );
+        make_error, kind, blorp_string_from_buf_size(detail, strlen(detail)));
 }
 
 static void* __process_command_success(
+    blorp_ProcessSuccessFactory make_success,
     blorp_ProcessExitKind exit_kind,
     long exit_code,
     blorp_Bytes* stdout_bytes,
     blorp_Bytes* stderr_bytes
 ) {
-    blorp_Tuple* payload = blorp_tuple_new(
-        4,
-        (void*)(long)exit_kind,
-        (void*)exit_code,
-        (void*)stdout_bytes,
-        (void*)stderr_bytes
-    );
-    blorp_tuple_set_rc(payload, 0xC);
-    blorp_Result* result = blorp_result_ok((void*)payload);
+    blorp_Result* result = blorp_result_ok(
+        make_success((long)exit_kind, exit_code, stdout_bytes, stderr_bytes));
     result->release_mask = 1UL;
     return (void*)result;
 }
@@ -42950,10 +43011,94 @@ static blorp_ProcessPrepareResult __process_prepare_errno(
     return __process_prepare_error(kind, detail);
 }
 
+// Decode the immutable generic payload only at the pinned-bootstrap boundary.
+static blorp_ProcessPrepareResult __process_decode_legacy_options(
+    const blorp_Tuple* options, blorp_ProcessCommandOptions* decoded
+) {
+    if (!options || options->arity != BLORP_PROCESS_OPTION_COUNT) {
+        return __process_prepare_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "invalid process option payload"
+        );
+    }
+    const blorp_Tuple* cwd_options =
+        (const blorp_Tuple*)options->elem[BLORP_PROCESS_OPTION_CWD];
+    const blorp_Tuple* environment_options =
+        (const blorp_Tuple*)options->elem[BLORP_PROCESS_OPTION_ENVIRONMENT];
+    const blorp_Tuple* stream_options =
+        (const blorp_Tuple*)options->elem[BLORP_PROCESS_OPTION_STREAMS];
+    const blorp_Tuple* lifecycle_options =
+        (const blorp_Tuple*)options->elem[BLORP_PROCESS_OPTION_LIFECYCLE];
+    if (
+        !cwd_options || cwd_options->arity != BLORP_PROCESS_CWD_COUNT ||
+        !environment_options ||
+        environment_options->arity != BLORP_PROCESS_ENVIRONMENT_COUNT ||
+        !stream_options ||
+        stream_options->arity != BLORP_PROCESS_STREAMS_COUNT ||
+        !lifecycle_options ||
+        lifecycle_options->arity != BLORP_PROCESS_LIFECYCLE_COUNT
+    ) {
+        return __process_prepare_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "invalid nested process option payload"
+        );
+    }
+
+    decoded->cwd = (const blorp_String*)cwd_options->elem[BLORP_PROCESS_CWD_PATH];
+    decoded->has_cwd = (bool)(long)cwd_options->elem[BLORP_PROCESS_CWD_PRESENT];
+    decoded->environment_set_names = (const blorp_List*)
+        environment_options->elem[BLORP_PROCESS_ENVIRONMENT_SET_NAMES];
+    decoded->environment_set_values = (const blorp_List*)
+        environment_options->elem[BLORP_PROCESS_ENVIRONMENT_SET_VALUES];
+    decoded->environment_unset_names = (const blorp_List*)
+        environment_options->elem[BLORP_PROCESS_ENVIRONMENT_UNSET_NAMES];
+    const blorp_Tuple* stdin_payload = stream_options
+        ? (const blorp_Tuple*)stream_options->elem[
+            BLORP_PROCESS_STREAMS_STDIN_PAYLOAD]
+        : NULL;
+    if (!stdin_payload || stdin_payload->arity != BLORP_PROCESS_STDIN_PAYLOAD_COUNT) {
+        char detail[128];
+        snprintf(
+            detail,
+            sizeof(detail),
+            "invalid process stdin payload (observed arity %ld)",
+            stdin_payload ? stdin_payload->arity : -1L
+        );
+        return __process_prepare_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            detail
+        );
+    }
+    decoded->stdin_mode =
+        (long)stream_options->elem[BLORP_PROCESS_STREAMS_STDIN_MODE];
+    decoded->stdin_bytes = (const blorp_Bytes*)
+        stdin_payload->elem[BLORP_PROCESS_STDIN_PAYLOAD_BYTES];
+    decoded->stdin_bytes_parts = (const blorp_List*)
+        stdin_payload->elem[BLORP_PROCESS_STDIN_PAYLOAD_BYTES_PARTS];
+    decoded->stdout_mode =
+        (long)stream_options->elem[BLORP_PROCESS_STREAMS_STDOUT_MODE];
+    decoded->stderr_mode =
+        (long)stream_options->elem[BLORP_PROCESS_STREAMS_STDERR_MODE];
+    decoded->has_timeout = (bool)(long)lifecycle_options->elem[
+        BLORP_PROCESS_LIFECYCLE_HAS_TIMEOUT
+    ];
+    decoded->timeout_ms = (long)lifecycle_options->elem[
+        BLORP_PROCESS_LIFECYCLE_TIMEOUT_MS
+    ];
+    decoded->group_mode = (long)lifecycle_options->elem[
+        BLORP_PROCESS_LIFECYCLE_GROUP_MODE
+    ];
+    decoded->capture_limit = (long)lifecycle_options->elem[
+        BLORP_PROCESS_LIFECYCLE_CAPTURE_LIMIT
+    ];
+
+    return (blorp_ProcessPrepareResult){.succeeded = true};
+}
+
 static blorp_ProcessPrepareResult __process_prepare_command(
     const blorp_String* program,
     const blorp_List* args,
-    const blorp_Tuple* options
+    const blorp_ProcessCommandOptions* options
 ) {
     blorp_ProcessPrepareResult result;
     const blorp_String* cwd = NULL;
@@ -42982,85 +43127,25 @@ static blorp_ProcessPrepareResult __process_prepare_command(
     long process_group_mode_value = -1;
     long capture_limit = BLORP_PROCESS_USE_DEFAULT_CAPTURE_LIMIT;
 
-    if (!options || options->arity != BLORP_PROCESS_OPTION_COUNT) {
+    if (!options) {
         result = __process_prepare_error(
-            BLORP_PROCESS_ERROR_INVALID_COMMAND,
-            "invalid process option payload"
-        );
+            BLORP_PROCESS_ERROR_INVALID_COMMAND, "invalid process option payload");
         goto cleanup;
     }
-    const blorp_Tuple* cwd_options =
-        (const blorp_Tuple*)options->elem[BLORP_PROCESS_OPTION_CWD];
-    const blorp_Tuple* environment_options =
-        (const blorp_Tuple*)options->elem[BLORP_PROCESS_OPTION_ENVIRONMENT];
-    const blorp_Tuple* stream_options =
-        (const blorp_Tuple*)options->elem[BLORP_PROCESS_OPTION_STREAMS];
-    const blorp_Tuple* lifecycle_options =
-        (const blorp_Tuple*)options->elem[BLORP_PROCESS_OPTION_LIFECYCLE];
-    if (
-        !cwd_options || cwd_options->arity != BLORP_PROCESS_CWD_COUNT ||
-        !environment_options ||
-        environment_options->arity != BLORP_PROCESS_ENVIRONMENT_COUNT ||
-        !stream_options ||
-        stream_options->arity != BLORP_PROCESS_STREAMS_COUNT ||
-        !lifecycle_options ||
-        lifecycle_options->arity != BLORP_PROCESS_LIFECYCLE_COUNT
-    ) {
-        result = __process_prepare_error(
-            BLORP_PROCESS_ERROR_INVALID_COMMAND,
-            "invalid nested process option payload"
-        );
-        goto cleanup;
-    }
-
-    cwd = (const blorp_String*)cwd_options->elem[BLORP_PROCESS_CWD_PATH];
-    has_cwd = (bool)(long)cwd_options->elem[BLORP_PROCESS_CWD_PRESENT];
-    set_environment_names = (const blorp_List*)
-        environment_options->elem[BLORP_PROCESS_ENVIRONMENT_SET_NAMES];
-    set_environment_values = (const blorp_List*)
-        environment_options->elem[BLORP_PROCESS_ENVIRONMENT_SET_VALUES];
-    unset_environment_names = (const blorp_List*)
-        environment_options->elem[BLORP_PROCESS_ENVIRONMENT_UNSET_NAMES];
-    const blorp_Tuple* stdin_payload = stream_options
-        ? (const blorp_Tuple*)stream_options->elem[
-            BLORP_PROCESS_STREAMS_STDIN_PAYLOAD]
-        : NULL;
-    if (!stdin_payload || stdin_payload->arity != BLORP_PROCESS_STDIN_PAYLOAD_COUNT) {
-        char detail[128];
-        snprintf(
-            detail,
-            sizeof(detail),
-            "invalid process stdin payload (observed arity %ld)",
-            stdin_payload ? stdin_payload->arity : -1L
-        );
-        result = __process_prepare_error(
-            BLORP_PROCESS_ERROR_INVALID_COMMAND,
-            detail
-        );
-        goto cleanup;
-    }
-    stdin_mode_value =
-        (long)stream_options->elem[BLORP_PROCESS_STREAMS_STDIN_MODE];
-    stdin_bytes = (const blorp_Bytes*)
-        stdin_payload->elem[BLORP_PROCESS_STDIN_PAYLOAD_BYTES];
-    stdin_bytes_parts = (const blorp_List*)
-        stdin_payload->elem[BLORP_PROCESS_STDIN_PAYLOAD_BYTES_PARTS];
-    stdout_mode_value =
-        (long)stream_options->elem[BLORP_PROCESS_STREAMS_STDOUT_MODE];
-    stderr_mode_value =
-        (long)stream_options->elem[BLORP_PROCESS_STREAMS_STDERR_MODE];
-    has_timeout = (bool)(long)lifecycle_options->elem[
-        BLORP_PROCESS_LIFECYCLE_HAS_TIMEOUT
-    ];
-    timeout_ms = (long)lifecycle_options->elem[
-        BLORP_PROCESS_LIFECYCLE_TIMEOUT_MS
-    ];
-    process_group_mode_value = (long)lifecycle_options->elem[
-        BLORP_PROCESS_LIFECYCLE_GROUP_MODE
-    ];
-    capture_limit = (long)lifecycle_options->elem[
-        BLORP_PROCESS_LIFECYCLE_CAPTURE_LIMIT
-    ];
+    cwd = options->cwd;
+    has_cwd = options->has_cwd;
+    set_environment_names = options->environment_set_names;
+    set_environment_values = options->environment_set_values;
+    unset_environment_names = options->environment_unset_names;
+    stdin_mode_value = options->stdin_mode;
+    stdin_bytes = options->stdin_bytes;
+    stdin_bytes_parts = options->stdin_bytes_parts;
+    stdout_mode_value = options->stdout_mode;
+    stderr_mode_value = options->stderr_mode;
+    has_timeout = options->has_timeout;
+    timeout_ms = options->timeout_ms;
+    process_group_mode_value = options->group_mode;
+    capture_limit = options->capture_limit;
 
     if (!program || program->len <= 0) {
         result = __process_prepare_error(
@@ -43351,10 +43436,12 @@ void* blorp_exec_output(const blorp_String* command) {
     return (void*)result;
 }
 
-void* blorp_process_run_command_raw(
+void* blorp_process_run_command_product(
     const blorp_String* program,
     const blorp_List* args,
-    const blorp_Tuple* options
+    const blorp_ProcessCommandOptions* options,
+    blorp_ProcessSuccessFactory make_success,
+    blorp_ProcessErrorFactory make_error
 ) {
     void* result = NULL;
     blorp_ProcessChild child = __process_child_empty();
@@ -43362,6 +43449,7 @@ void* blorp_process_run_command_raw(
         __process_prepare_command(program, args, options);
     if (!prepared_result.succeeded) {
         return __process_command_error_string(
+            make_error,
             prepared_result.error_kind,
             prepared_result.detail
         );
@@ -43370,6 +43458,7 @@ void* blorp_process_run_command_raw(
     blorp_PreparedProcessCommand prepared = prepared_result.command;
     if (prepared.stdin_mode == BLORP_PROCESS_STDIN_SESSION) {
         result = __process_command_error(
+            make_error,
             BLORP_PROCESS_ERROR_INVALID_COMMAND,
             "streaming stdin requires a process session"
         );
@@ -43391,6 +43480,7 @@ void* blorp_process_run_command_raw(
         __process_spawn_command(&spawn_spec);
     if (!spawn_result.succeeded) {
         result = __process_command_error_string(
+            make_error,
             spawn_result.error_kind,
             spawn_result.detail
         );
@@ -43433,6 +43523,7 @@ void* blorp_process_run_command_raw(
         blorp_release(stdout_bytes);
         blorp_release(stderr_bytes);
         result = __process_command_error(
+            make_error,
             BLORP_PROCESS_ERROR_OUTPUT_LIMIT,
             "captured stdout and stderr exceeded the configured limit"
         );
@@ -43446,6 +43537,7 @@ void* blorp_process_run_command_raw(
         blorp_release(stdout_bytes);
         blorp_release(stderr_bytes);
         result = __process_command_error(
+            make_error,
             BLORP_PROCESS_ERROR_IO_FAILED,
             child.state.wait_failed
                 ? "failed to wait for child process"
@@ -43456,6 +43548,7 @@ void* blorp_process_run_command_raw(
 
     if (child.state.timed_out) {
         result = __process_command_success(
+            make_success,
             BLORP_PROCESS_EXIT_TIMED_OUT,
             0,
             stdout_bytes,
@@ -43463,6 +43556,7 @@ void* blorp_process_run_command_raw(
         );
     } else if (WIFEXITED(child.state.status)) {
         result = __process_command_success(
+            make_success,
             BLORP_PROCESS_EXIT_EXITED,
             (long)WEXITSTATUS(child.state.status),
             stdout_bytes,
@@ -43470,6 +43564,7 @@ void* blorp_process_run_command_raw(
         );
     } else if (WIFSIGNALED(child.state.status)) {
         result = __process_command_success(
+            make_success,
             BLORP_PROCESS_EXIT_SIGNALED,
             (long)WTERMSIG(child.state.status),
             stdout_bytes,
@@ -43479,6 +43574,7 @@ void* blorp_process_run_command_raw(
         blorp_release(stdout_bytes);
         blorp_release(stderr_bytes);
         result = __process_command_error(
+            make_error,
             BLORP_PROCESS_ERROR_IO_FAILED,
             "child process ended with an unknown wait status"
         );
@@ -43488,6 +43584,22 @@ cleanup:
     __process_child_dispose(&child);
     __process_prepared_command_dispose(&prepared);
     return result;
+}
+
+// Legacy entry point retained for the pinned bootstrap.
+void* blorp_process_run_command_raw(
+    const blorp_String* program, const blorp_List* args, const blorp_Tuple* options
+) {
+    blorp_ProcessCommandOptions decoded;
+    blorp_ProcessPrepareResult result =
+        __process_decode_legacy_options(options, &decoded);
+    if (!result.succeeded) {
+        return __process_command_error_string(
+            __process_legacy_error_payload, result.error_kind, result.detail);
+    }
+    return blorp_process_run_command_product(
+        program, args, &decoded,
+        __process_legacy_success_payload, __process_legacy_error_payload);
 }
 
 typedef struct blorp_ProcessSession {
@@ -43796,22 +43908,11 @@ static bool __process_session_read_stream(
     return true;
 }
 
-blorp_ProcessSessionResult blorp_process_session_start_raw(
-    const blorp_Tuple* request
+blorp_ProcessSessionResult blorp_process_session_start_product(
+    const blorp_String* program,
+    const blorp_List* args,
+    const blorp_ProcessCommandOptions* options
 ) {
-    if (!request || request->arity != 3) {
-        return __process_session_start_error(
-            BLORP_PROCESS_ERROR_INVALID_COMMAND,
-            __process_session_detail("invalid process session command")
-        );
-    }
-    const blorp_String* program =
-        (const blorp_String*)request->elem[0];
-    const blorp_List* args =
-        (const blorp_List*)request->elem[1];
-    const blorp_Tuple* options =
-        (const blorp_Tuple*)request->elem[2];
-
     blorp_ProcessPrepareResult prepared_result =
         __process_prepare_command(program, args, options);
     if (!prepared_result.succeeded) {
@@ -43919,6 +44020,25 @@ cleanup_prepared:
     __process_prepared_command_dispose(prepared);
     return result;
 }
+
+// Legacy request decoder retained for the pinned bootstrap.
+blorp_ProcessSessionResult blorp_process_session_start_raw(const blorp_Tuple* request) {
+    if (!request || request->arity != 3) {
+        return __process_session_start_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            __process_session_detail("invalid process session command"));
+    }
+    blorp_ProcessCommandOptions options;
+    blorp_ProcessPrepareResult result = __process_decode_legacy_options(
+        (const blorp_Tuple*)request->elem[2], &options);
+    if (!result.succeeded) {
+        return __process_session_start_error(result.error_kind, result.detail);
+    }
+    return blorp_process_session_start_product(
+        (const blorp_String*)request->elem[0],
+        (const blorp_List*)request->elem[1], &options);
+}
+
 
 static long __process_duration_us_to_timeout_ms(long duration_us) {
     if (duration_us <= 0) return 0;
@@ -44463,7 +44583,10 @@ long blorp_test_process_spawn_fallback_probe(void) {
 
 // Returns Result[Tuple3[String, String, Int], String]
 // Tuple: (stdout, stderr, exit_code)
-void* blorp_process_run(const blorp_String* program, const blorp_List* args) {
+void* blorp_process_run_product(
+    const blorp_String* program, const blorp_List* args,
+    blorp_ProcessOutputFactory make_output
+) {
     if (!program || program->len == 0) {
         return (void*)blorp_result_err_cstr("empty program");
     }
@@ -44633,10 +44756,7 @@ void* blorp_process_run(const blorp_String* program, const blorp_List* args) {
     long exit_code =
         WIFEXITED(run_state.status) ? WEXITSTATUS(run_state.status) : -1;
 
-    // Return (stdout, stderr, exit_code) tuple
-    blorp_Tuple* t = blorp_tuple_new(3, (void*)out_str, (void*)err_str, (void*)(long)exit_code);
-    blorp_tuple_set_rc(t, 0x3); // release_mask = 0b011 (first two are strings)
-    blorp_Result* res = blorp_result_ok((void*)t);
+    blorp_Result* res = blorp_result_ok(make_output(out_str, err_str, exit_code));
     res->release_mask = 1UL;
     return (void*)res;
 }
@@ -44725,13 +44845,15 @@ void* blorp_process_run_inherit(const blorp_String* program, const blorp_List* a
 }
 
 // Shell convenience: run via /bin/sh -c
-void* blorp_process_shell(const blorp_String* command) {
+void* blorp_process_shell_product(
+    const blorp_String* command, blorp_ProcessOutputFactory make_output
+) {
     blorp_String* sh = blorp_string_create("/bin/sh");
     blorp_String* flag = blorp_string_create("-c");
     blorp_List* args = blorp_list_new(2);
     args = blorp_list_append(args, (void*)flag);
     args = blorp_list_append(args, (void*)command);
-    void* result = blorp_process_run(sh, args);
+    void* result = blorp_process_run_product(sh, args, make_output);
     blorp_release((void*)sh);
     blorp_release((void*)flag);
     blorp_release((void*)args);

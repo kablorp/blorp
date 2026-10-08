@@ -1,0 +1,226 @@
+import:
+	../../../src/compiler/stage_09_core/function_origin_fixture:
+		FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
+	../../../src/compiler/stage_09_core/ir:
+		CoreBinderOrigin(AuthoredBinder),
+		CoreCallKind(DirectRuntimeCall),
+		CoreDirectRuntimeArgs(DirectRuntimeArgsAsWritten),
+		CoreDirectRuntimeResult(DirectRuntimeResultAsWritten),
+		CoreDecl(FunctionDecl, HeapRecordDecl),
+		CoreExpr(BorrowLetExpr, CallExpr, LiteralExpr, ProductFieldExpr, RecordCowUpdateExpr, VarExpr, VoidExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreHeapRecordDecl,
+		CoreHeapRecordField,
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		CoreRecordForm(OrdinaryRecordForm),
+		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
+		CoreType(FunctionType, HeapRecordType, NamedType, VoidType),
+		core_field_ref,
+		core_field_ordinal,
+		synthetic_core_source_loc,
+	../../../src/compiler/stage_09_core/pipeline: prepared_core_program, run_pre_dce_tail
+	../../../src/compiler/stage_10_backend/emit:
+		try_emit_prepared_core_program_c_artifact_with_profile_and_indentation
+	../../../src/lib/function_profile: FunctionProfileConfiguration(FunctionProfileOff)
+	test: TestSuite
+
+
+-- Source-field identities declared by this owning Core fixture.
+private UNIT_EFFECT_FIELD_ID: Int = 101
+private UNIT_COUNT_FIELD_ID: Int = 102
+private UNIT_LABEL_FIELD_ID: Int = 103
+private UNIT_UPDATE_FUNCTION_ID: Int = 345
+
+
+private pure func unit_effect_field() -> CoreHeapRecordField:
+	{
+		ref = core_field_ref(UNIT_EFFECT_FIELD_ID),
+		name = "effect",
+		typ = VoidType,
+		release_policy = NoReleasePolicy
+	}
+
+
+private pure func unit_count_field() -> CoreHeapRecordField:
+	{
+		ref = core_field_ref(UNIT_COUNT_FIELD_ID),
+		name = "count",
+		typ = NamedType("Int", []),
+		release_policy = NoReleasePolicy
+	}
+
+
+private pure func unit_label_field() -> CoreHeapRecordField:
+	{
+		ref = core_field_ref(UNIT_LABEL_FIELD_ID),
+		name = "label",
+		typ = NamedType("String", []),
+		release_policy = ArcReleasePolicy
+	}
+
+
+private pure func unit_record_decl() -> CoreHeapRecordDecl:
+	{
+		abi_type = None,
+		form = OrdinaryRecordForm,
+		name = "UnitRecord",
+		type_params = [],
+		fields = [unit_effect_field(), unit_count_field(), unit_label_field()],
+		loc = synthetic_core_source_loc()
+	}
+
+
+private pure func unit_record_update_function(replace_unit: Bool) -> CoreFunction:
+	loc = synthetic_core_source_loc()
+	typ = HeapRecordType("UnitRecord")
+	parameter = { name = "source", id = 0, def_id = None, origin = AuthoredBinder }
+	name = if replace_unit:
+		"update_unit_effect"
+	else:
+		"update_unit_count"
+	effect = if replace_unit:
+		Some(CallExpr(
+			DirectRuntimeCall({
+				name = "blorp_sleep",
+				args = DirectRuntimeArgsAsWritten,
+				result = DirectRuntimeResultAsWritten
+			}),
+			VoidExpr(FunctionType(False, [NamedType("Int", [])], VoidType), loc),
+			[LiteralExpr(IntLiteral(0), NamedType("Int", []), loc)],
+			VoidType,
+			loc,
+		))
+	else:
+		None
+	{
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [{ name = parameter, typ = typ, loc = loc }],
+		return_type = typ,
+		body = Some(RecordCowUpdateExpr(
+			VarExpr(parameter, typ, loc),
+			[
+				{ field = unit_effect_field(), replacement = effect },
+				{ field = unit_count_field(), replacement = Some(LiteralExpr(IntLiteral(4), NamedType("Int", []), loc)) },
+				{ field = unit_label_field(), replacement = None },
+			],
+			typ,
+			loc,
+		)),
+		is_pure = False,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = UNIT_UPDATE_FUNCTION_ID,
+		loc = loc
+	}
+
+
+pure func emitted_unit_update(replace_unit: Bool) -> Option[String]:
+	program: CoreProgram = {
+		decls = [
+			HeapRecordDecl(unit_record_decl()),
+			FunctionDecl(unit_record_update_function(replace_unit)),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+	match run_pre_dce_tail(program):
+		Ok(prepared):
+			match try_emit_prepared_core_program_c_artifact_with_profile_and_indentation(prepared, FunctionProfileOff, False):
+				Ok(artifact): Some(artifact.c_code)
+				Err(_): None
+		Err(_): None
+
+
+pure func test_sparse_update_omits_inherited_unit_storage_in_both_paths() -> Bool:
+	match emitted_unit_update(False):
+		Some(code):
+			(
+				not code.contains("#error")
+				and code.contains("if (blorp_is_unique(__record_cow_source_")
+				and code.contains("->f1 = __record_cow_field_")
+				and code.contains("blorp_retain(__record_cow_source_")
+				and code.contains("->f2);")
+				and not code.contains("->f0")
+				and not code.contains("void f0")
+			)
+		None: False
+
+
+pure func test_sparse_unit_replacement_runs_once_before_source_mutation() -> Bool:
+	match emitted_unit_update(True):
+		Some(code):
+			order = match (code.index_of("(void)(blorp_sleep(0));"), code.index_of("if (blorp_is_unique(__record_cow_source_")):
+				(Some(effect), Some(update)):
+					effect < update
+				_:
+					False
+			(
+				not code.contains("#error")
+				and order
+				and code.count("(void)(blorp_sleep(0));") == 1
+				and not code.contains("->f0")
+				and not code.contains("void __record_cow_field_")
+			)
+		None: False
+
+
+pure func emitted_borrowed_unit_projection() -> Option[String]:
+	loc = synthetic_core_source_loc()
+	typ = HeapRecordType("UnitRecord")
+	base = unit_record_update_function(False)
+	parameter = { name = "source", id = 0, def_id = None, origin = AuthoredBinder }
+	alias_variable = { name = "projected", id = 1, def_id = None, origin = AuthoredBinder }
+	receiver = BorrowLetExpr(
+		alias_variable,
+		typ,
+		VarExpr(parameter, typ, loc),
+		VarExpr(alias_variable, typ, loc),
+	)
+	function = { base |
+		name = "unit_projection_from_borrowed_receiver",
+		return_type = VoidType,
+		body = Some(ProductFieldExpr(receiver, core_field_ordinal(0), VoidType, loc)),
+	}
+	program: CoreProgram = {
+		decls = [HeapRecordDecl(unit_record_decl()), FunctionDecl(function)],
+		foreign_includes = [],
+		source_files = []
+	}
+	-- This validated prepared fixture deliberately retains the non-simple
+	-- borrowed receiver. It is accepted storage, not an ownership producer.
+	match prepared_core_program(program):
+		Ok(prepared):
+			match try_emit_prepared_core_program_c_artifact_with_profile_and_indentation(prepared, FunctionProfileOff, False):
+				Ok(artifact): Some(artifact.c_code)
+				Err(_): None
+		Err(_): None
+
+
+pure func test_unit_projection_evaluates_non_simple_borrowed_receiver_as_statement() -> Bool:
+	match emitted_borrowed_unit_projection():
+		Some(code):
+			(
+				not code.contains("#error")
+				and code.count("brp_v_1 = source;") == 1
+				and code.count("(void)(brp_v_1);") == 1
+				and not code.contains("void __field_result")
+				and not code.contains("blorp_release(source)")
+				and not code.contains("blorp_release(brp_v_1)")
+			)
+		None:
+			False
+
+
+tests: TestSuite = {
+	description = "Managed record unit fields",
+	tests = [
+		("sparse update omits inherited unit in unique and shared paths", test_sparse_update_omits_inherited_unit_storage_in_both_paths),
+		("sparse unit replacement runs once before source mutation", test_sparse_unit_replacement_runs_once_before_source_mutation),
+		("unit projection emits a non-simple borrowed receiver once", test_unit_projection_evaluates_non_simple_borrowed_receiver_as_statement),
+	],
+}

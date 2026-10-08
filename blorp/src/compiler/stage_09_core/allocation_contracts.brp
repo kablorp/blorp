@@ -17,6 +17,7 @@ import:
 		),
 		CoreClosureCapture,
 		CoreDictConstruct,
+		CoreDictIterationMode(CoreDictIterationKeys, CoreDictIterationEntries),
 		CoreExpr(
 			AccessorLiteralMatchExpr, AssignExpr, BinaryExpr, BoxExpr, BreakExpr, BorrowLetExpr,
 			CallExpr, CastExpr, ClosureCreateExpr, ConcurrentlyLoopExpr, ConcurrentExpr,
@@ -28,13 +29,13 @@ import:
 			ListHandoffExpr, ListHandoffSetOwnedExpr, ListHandoffSetSourceSlotExpr, ListRetainExpr,
 			ListSetExpr, ListSwapExpr, LiteralExpr, LiteralMatchExpr, LogicalExpr,
 			PreClosureConcurrentExpr, PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr,
-			RawMatchExpr, RecordConstructExpr, RecordCowUpdateExpr, RecordExpr, RecordReuseExpr,
+			RawMatchExpr, RecordCowUpdateExpr, ProductExpr, RecordReuseExpr,
 			RecordUpdateExpr, ResourceCleanupExitExpr, ResourceScopeExpr, SelectExpr,
 			SemanticMatchExpr, SeqExpr, SetAllocExpr, StaticStringLiteralExpr, StringByteCopyExpr,
 			StringByteReadExpr, StringByteWriteExpr, StringSetLenExpr, TailrecListSpreadLoopExpr,
 			TailrecListSpreadRecurExpr, TailrecLoopExpr, TailrecRecurExpr, TensorBoxedLiteralExpr,
 			TensorLiteralExpr, TensorPackedLiteralExpr, TensorRawFillExpr, TensorRawReadExpr,
-			TensorRawViewLetExpr, TensorRawWriteExpr, TupleConstructExpr, TupleExpr, UnaryExpr,
+			TensorRawViewLetExpr, TensorRawWriteExpr, TupleExpr, UnaryExpr,
 			UnboxExpr, UnionConstructExpr, UnionReuseConstructExpr, VarExpr, VectorExpr, VoidExpr,
 			WhileExpr,
 		),
@@ -57,14 +58,7 @@ import:
 			TensorForBoxedElement, TensorForInlineStructElement, TensorForRawScalarElement,
 			TensorForRowSliceElement, TensorForRuntimeReadElement,
 		),
-		CoreTupleConstruct,
-		CoreTupleElement(
-			TupleFloat16Element, TupleFloat32Element, TupleFloatElement, TuplePointerElement,
-			TuplePrimElement, TupleStackResultElement, TupleStructElement, TupleVoidElement,
-		),
-		CoreType(
-			HeapRecordType, InlineRecordType, NamedType, StackResultType, TupleType, UnionType,
-		),
+		CoreType(HeapRecordType, InlineRecordType, NamedType, StackResultType, TupleType, UnionType),
 		CoreUnionConstruct,
 		CoreUnionDecl,
 		CoreUnionField,
@@ -86,7 +80,6 @@ fixed union AllocationRiskReason:
 	CapacityGrowthAllocation
 	HeapBoxAllocation
 	ClosureEnvironmentAllocation
-	TupleStorageAllocation
 	CowFallbackAllocation
 	TaskAllocation
 	CleanupScratchAllocation
@@ -117,7 +110,6 @@ fixed union AllocationOperationCategory:
 	ScalarAllocationOperation
 	ControlFlowAllocationOperation
 	BoxAllocationOperation
-	TupleAllocationOperation
 	CollectionAllocationOperation
 	RecordAllocationOperation
 	UnionAllocationOperation
@@ -175,7 +167,7 @@ private pure func allocation_risk_reasons_equal(
 	right: AllocationRiskReason,
 ) -> Bool:
 	match (left, right):
-		(ManagedObjectAllocation, ManagedObjectAllocation) | (RawBufferAllocation, RawBufferAllocation) | (CapacityGrowthAllocation, CapacityGrowthAllocation) | (HeapBoxAllocation, HeapBoxAllocation) | (ClosureEnvironmentAllocation, ClosureEnvironmentAllocation) | (TupleStorageAllocation, TupleStorageAllocation) | (CowFallbackAllocation, CowFallbackAllocation) | (TaskAllocation, TaskAllocation) | (CleanupScratchAllocation, CleanupScratchAllocation) | (RuntimeOperationAllocation, RuntimeOperationAllocation) | (UnknownCallTarget, UnknownCallTarget) | (MissingFunctionBody, MissingFunctionBody) | (ForeignCallBoundary, ForeignCallBoundary) | (RuntimeCallbackBoundary, RuntimeCallbackBoundary):
+		(ManagedObjectAllocation, ManagedObjectAllocation) | (RawBufferAllocation, RawBufferAllocation) | (CapacityGrowthAllocation, CapacityGrowthAllocation) | (HeapBoxAllocation, HeapBoxAllocation) | (ClosureEnvironmentAllocation, ClosureEnvironmentAllocation) | (CowFallbackAllocation, CowFallbackAllocation) | (TaskAllocation, TaskAllocation) | (CleanupScratchAllocation, CleanupScratchAllocation) | (RuntimeOperationAllocation, RuntimeOperationAllocation) | (UnknownCallTarget, UnknownCallTarget) | (MissingFunctionBody, MissingFunctionBody) | (ForeignCallBoundary, ForeignCallBoundary) | (RuntimeCallbackBoundary, RuntimeCallbackBoundary):
 			True
 		_:
 			False
@@ -334,8 +326,6 @@ pure func allocation_reason_code(reason: AllocationRiskReason) -> String:
 			"heap_box"
 		ClosureEnvironmentAllocation:
 			"closure_environment"
-		TupleStorageAllocation:
-			"tuple_storage"
 		CowFallbackAllocation:
 			"cow_fallback"
 		TaskAllocation:
@@ -629,31 +619,6 @@ private pure func union_construct_allocation_contract(
 	merge_contract_facts(base, box_facts)
 
 
-private pure func tuple_construct_allocation_contract(
-	construct: CoreTupleConstruct,
-) -> CoreAllocationContract:
-	var facts: CoreLocalAllocationFacts = {
-		may_allocate = [TupleStorageAllocation],
-		unknown = []
-	}
-
-	for element in construct.elements:
-		element_facts: CoreLocalAllocationFacts = match element:
-			TupleStructElement(_, c_type):
-				box_allocation_facts(StructBox(c_type))
-			TupleStackResultElement(_):
-				{
-					may_allocate = [HeapBoxAllocation],
-					unknown = []
-				}
-			TuplePrimElement(_) | TuplePointerElement(_) | TupleVoidElement | TupleFloatElement(_) | TupleFloat32Element(_) | TupleFloat16Element(_):
-				EMPTY_ALLOCATION_FACTS
-
-		facts = merge_allocation_facts(facts, element_facts)
-
-	covered_allocation_contract(TupleAllocationOperation, facts, [])
-
-
 private pure func drop_allocation_contract(
 	value_type: CoreType,
 	policy: CoreReleasePolicy,
@@ -670,18 +635,20 @@ private pure func drop_allocation_contract(
 
 
 private pure func dict_iteration_allocation_contract(
+	iteration_mode: CoreDictIterationMode,
 	binder_type: CoreType,
 ) -> CoreAllocationContract:
-	base: CoreAllocationContract = match binder_type:
-		TupleType(_):
-			may_allocate_contract(TupleAllocationOperation, TupleStorageAllocation)
-		_:
+	base: CoreAllocationContract = match iteration_mode:
+		CoreDictIterationEntries:
+			may_allocate_contract(RecordAllocationOperation, ManagedObjectAllocation)
+		CoreDictIterationKeys:
 			free_allocation_contract(ControlFlowAllocationOperation)
 
-	if type_requires_release(binder_type):
-		append_cleanup_dependency(base, binder_type, ArcReleasePolicy)
-	else:
-		base
+	match iteration_mode:
+		CoreDictIterationEntries:
+			append_cleanup_dependency(base, binder_type, cleanup_release_policy_for_type(binder_type))
+		CoreDictIterationKeys:
+			base
 
 
 private pure func dict_construct_allocation_contract(
@@ -844,8 +811,6 @@ pure func core_expr_allocation_contract(expr: CoreExpr) -> CoreAllocationContrac
 			core_call_allocation_contract(kind)
 		BoxExpr(box, _, _):
 			covered_allocation_contract(BoxAllocationOperation, box_allocation_facts(box.kind), [])
-		TupleConstructExpr(construct, _, _):
-			tuple_construct_allocation_contract(construct)
 		ClosureCreateExpr(closure, _, _):
 			if closure.captures.is_empty():
 				free_allocation_contract(ClosureAllocationOperation)
@@ -906,7 +871,7 @@ pure func core_expr_allocation_contract(expr: CoreExpr) -> CoreAllocationContrac
 				typ,
 				ArcReleasePolicy,
 			)
-		RecordConstructExpr(_, _, typ, _):
+		ProductExpr(_, typ, _):
 			record_construct_allocation_contract(typ)
 		UnionConstructExpr(construct, _, _):
 			union_construct_allocation_contract(construct)
@@ -941,7 +906,7 @@ pure func core_expr_allocation_contract(expr: CoreExpr) -> CoreAllocationContrac
 			)
 		ForDictExpr(loop, _, _):
 			append_cleanup_dependency(
-				dict_iteration_allocation_contract(loop.binder.typ),
+				dict_iteration_allocation_contract(loop.iteration_mode, loop.binder.typ),
 				core_expr_type(loop.iterable),
 				loop.iterable_release_policy,
 			)
@@ -1027,7 +992,7 @@ pure func core_expr_allocation_contract(expr: CoreExpr) -> CoreAllocationContrac
 				core_expr_type(scrutinee),
 				policy,
 			)
-		DebugBlockExpr(_, _, _) | TupleExpr(_, _, _) | VectorExpr(_, _, _) | LambdaExpr(_, _, _, _, _, _) | DictExpr(_, _, _) | RecordExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | PreClosureConcurrentlyLoopExpr(_, _, _) | PreClosureConcurrentExpr(_, _, _) | PreClosureDetachExpr(_, _, _) | RawMatchExpr(_, _, _, _) | SemanticMatchExpr(_, _, _, _):
+		DebugBlockExpr(_, _, _) | TupleExpr(_, _, _) | VectorExpr(_, _, _) | LambdaExpr(_, _, _, _, _, _) | DictExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | PreClosureConcurrentlyLoopExpr(_, _, _) | PreClosureConcurrentExpr(_, _, _) | PreClosureDetachExpr(_, _, _) | RawMatchExpr(_, _, _, _) | SemanticMatchExpr(_, _, _, _):
 			unsupported_allocation_contract()
 
 

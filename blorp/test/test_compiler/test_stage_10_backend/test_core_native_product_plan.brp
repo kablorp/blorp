@@ -1,0 +1,648 @@
+import:
+	../test_support_core_native_product: native_process_product_fixture
+	../../../src/compiler/stage_09_core/ir:
+		CoreBinderOrigin(AuthoredBinder),
+		CoreCallKind(BuiltinCall, DirectRuntimeCall, OperationResultCall),
+		CoreDecl(GeneratedTupleRecordDecl, TypeAliasDecl),
+		CoreDirectRuntimeArgs(DirectRuntimeArgsAsWritten),
+		CoreDirectRuntimeResult(DirectRuntimeResultAsWritten),
+		CoreDictIterationMode(CoreDictIterationKeys, CoreDictIterationEntries),
+		CoreExpr(CallExpr, ForDictExpr, SeqExpr, VarExpr, VoidExpr),
+		CoreLoopRangeDirection(RangeMayRunBackward),
+		CoreOperationResultBridge,
+		CoreOperationResultLayoutPolicy(DefaultResultLayoutPolicy),
+		CoreRuntimeSuccessPayload(RuntimeField),
+		CoreReleasePolicy(NoReleasePolicy),
+		CoreType(BoxedResultType, FunctionType, HeapRecordType, NamedType, RangeType, StackResultType, VoidType),
+		CoreTupleStorageCatalog,
+		core_generated_tuple_record_decl,
+		core_generated_tuple_record_elements,
+		generated_tuple_record_for_type,
+		core_type_equal,
+		synthetic_core_source_loc,
+		tuple_storage_catalog,
+	../../../src/compiler/stage_10_backend/emit_tuple_product_adapters:
+		CNativeProductFactoryKind(DictionaryEntryProductFactory, EnumeratedProductFactory, ProcessOutputProductFactory, VectorPairProductFactory),
+		CNativeProductStorageSymbols,
+		CRuntimeProductAdapterOps,
+		CUnfoldProductResultRepresentation(NullableUnfoldProductResult, BoxedUnfoldProductResult),
+	../../../src/compiler/stage_10_backend/emit_tuple_product_plan:
+		CNativeProductPlanFault(NativeProductCallShapeMismatch, NativeProductCanonicalRowUnavailable),
+		build_native_product_adapter_plan,
+		native_product_adapter_declarations,
+		native_product_factory_callback,
+		native_unfold_product_callback,
+		native_product_plan_fault_message,
+	test: TestSuite
+
+
+private pure func catalog() -> Option[CoreTupleStorageCatalog]:
+	match core_generated_tuple_record_decl("Pair", [NamedType("Int", []), NamedType("Int", [])], synthetic_core_source_loc()):
+		Ok(row):
+			match tuple_storage_catalog({ decls = [GeneratedTupleRecordDecl(row)], foreign_includes = [], source_files = [] }):
+				Ok(value): Some(value)
+				Err(_): None
+		Err(_): None
+
+
+private pure func ops() -> CRuntimeProductAdapterOps:
+	symbols: pure (CoreType) -> Option[CNativeProductStorageSymbols] = func(typ):
+		if core_type_equal(typ, HeapRecordType("Pair")):
+			Some({ c_type = "Pair*", make_name = "Pair_make", members = [Some("f0"), Some("f1")] })
+		else:
+			None
+	{
+		c_type = func(typ): "long",
+		resolve_product_type = func(typ): Some(typ),
+		product_symbols = symbols,
+		decode_borrowed_slot = func(typ, value): Some("decode(" + value + ")"),
+		encode_owned_slot = func(typ, value): Some("encode(" + value + ")"),
+		read_vector_element = func(typ, vector, index): Some("read(" + vector + ", " + index + ")"),
+		retain_typed = func(typ, value): Some(""),
+	}
+
+
+private pure func typed_input(typ: CoreType) -> CoreExpr:
+	VarExpr({ name = "input", id = 1, def_id = None, origin = AuthoredBinder }, typ, synthetic_core_source_loc())
+
+
+private pure func native_call(name: String, result: CoreType) -> CoreExpr:
+	input_type = if name == "blorp_dict_entries":
+		NamedType("Dict", [NamedType("Int", []), NamedType("Int", [])])
+	else:
+		NamedType("Stream", [NamedType("Int", [])])
+	CallExpr(BuiltinCall(name), VoidExpr(VoidType, synthetic_core_source_loc()), [typed_input(input_type)], result, synthetic_core_source_loc())
+
+
+pure func test_repeated_pair_calls_share_one_factory() -> Bool:
+	match catalog():
+		Some(rows):
+			call = native_call("blorp_dict_entries", NamedType("List", [HeapRecordType("Pair")]))
+			match build_native_product_adapter_plan(rows, [call, call], ops()):
+				Ok(plan):
+					match native_product_factory_callback(plan, DictionaryEntryProductFactory, HeapRecordType("Pair")):
+						Ok(callback):
+							(
+								native_product_adapter_declarations(plan).split(callback + "(").length() == 2
+								and native_product_adapter_declarations(plan).contains("static inline void* " + callback)
+							)
+						Err(_): False
+				Err(_): False
+		None: False
+
+
+pure func test_pair_factories_keep_native_signatures_distinct() -> Bool:
+	match catalog():
+		Some(rows):
+			calls = [
+				native_call("blorp_dict_entries", NamedType("List", [HeapRecordType("Pair")])),
+				native_call("blorp_stream_enumerate", NamedType("Stream", [HeapRecordType("Pair")])),
+			]
+			match build_native_product_adapter_plan(rows, calls, ops()):
+				Ok(plan):
+					match native_product_factory_callback(plan, DictionaryEntryProductFactory, HeapRecordType("Pair")):
+						Ok(dictionary):
+							match native_product_factory_callback(plan, EnumeratedProductFactory, HeapRecordType("Pair")):
+								Ok(enumeration): dictionary != enumeration
+								Err(_): False
+						Err(_): False
+				Err(_): False
+		None: False
+
+
+pure func test_direct_runtime_calls_use_registered_products() -> Bool:
+	match catalog():
+		Some(rows):
+			call = CallExpr(DirectRuntimeCall({ name = "blorp_dict_entries", args = DirectRuntimeArgsAsWritten, result = DirectRuntimeResultAsWritten }), VoidExpr(VoidType, synthetic_core_source_loc()), [typed_input(NamedType("Dict", [NamedType("Int", []), NamedType("Int", [])]))], NamedType("List", [HeapRecordType("Pair")]), synthetic_core_source_loc())
+			match build_native_product_adapter_plan(rows, [call], ops()):
+				Ok(plan): native_product_factory_callback(plan, DictionaryEntryProductFactory, HeapRecordType("Pair")).is_ok()
+				Err(_): False
+		None: False
+
+
+pure func test_unfold_reads_the_typed_step_result() -> Bool:
+	match catalog():
+		Some(rows):
+			step_type = FunctionType(True, [NamedType("Int", [])], NamedType("Option", [HeapRecordType("Pair")]))
+			call = CallExpr(BuiltinCall("blorp_stream_unfold"), VoidExpr(VoidType, synthetic_core_source_loc()), [typed_input(NamedType("Int", [])), typed_input(step_type), typed_input(NamedType("Int", [])), typed_input(NamedType("Int", []))], NamedType("Stream", [NamedType("Int", [])]), synthetic_core_source_loc())
+			match build_native_product_adapter_plan(rows, [call], ops()):
+				Ok(plan): native_unfold_product_callback(plan, HeapRecordType("Pair"), NullableUnfoldProductResult).is_ok()
+				Err(_): False
+		None: False
+
+
+pure func test_invalid_native_result_teaches_the_layout_boundary() -> Bool:
+	match catalog():
+		Some(rows):
+			match build_native_product_adapter_plan(rows, [native_call("blorp_dict_entries", NamedType("Int", []))], ops()):
+				Err(fault):
+					match fault:
+						NativeProductCallShapeMismatch(name):
+							name == "blorp_dict_entries" and native_product_plan_fault_message(fault).contains("registered product")
+						_:
+							False
+				Ok(_): False
+		None: False
+
+
+pure func test_dictionary_keys_do_not_construct_entry_pairs() -> Bool:
+	match catalog():
+		Some(rows):
+			loop = ForDictExpr({
+				iteration_mode = CoreDictIterationKeys,
+				binder = { variable = { name = "key", id = 2, def_id = None, origin = AuthoredBinder }, typ = HeapRecordType("Pair"), range_direction = RangeMayRunBackward },
+				iterable = typed_input(NamedType("Dict", [HeapRecordType("Pair"), NamedType("Int", [])])),
+				iterable_release_policy = NoReleasePolicy,
+				body = VoidExpr(VoidType, synthetic_core_source_loc()),
+			}, VoidType, synthetic_core_source_loc())
+			match build_native_product_adapter_plan(rows, [loop], ops()):
+				Ok(plan): native_product_adapter_declarations(plan) == ""
+				Err(_): False
+		None: False
+
+
+pure func test_dictionary_entries_construct_a_checked_pair() -> Bool:
+	match catalog():
+		Some(rows):
+			loop = ForDictExpr({
+				iteration_mode = CoreDictIterationEntries,
+				binder = { variable = { name = "entry", id = 2, def_id = None, origin = AuthoredBinder }, typ = HeapRecordType("Pair"), range_direction = RangeMayRunBackward },
+				iterable = typed_input(NamedType("Dict", [NamedType("Int", []), NamedType("Int", [])])),
+				iterable_release_policy = NoReleasePolicy,
+				body = VoidExpr(VoidType, synthetic_core_source_loc()),
+			}, VoidType, synthetic_core_source_loc())
+			match build_native_product_adapter_plan(rows, [loop], ops()):
+				Ok(plan): native_product_factory_callback(plan, DictionaryEntryProductFactory, HeapRecordType("Pair")).is_ok()
+				Err(_): False
+		None: False
+
+
+pure func test_dictionary_entry_range_input_uses_tuple_value_shape() -> Bool:
+	match catalog():
+		Some(rows):
+			loop = ForDictExpr({
+				iteration_mode = CoreDictIterationEntries,
+				binder = {
+					variable = { name = "entry", id = 2, def_id = None, origin = AuthoredBinder },
+					typ = HeapRecordType("Pair"),
+					range_direction = RangeMayRunBackward,
+				},
+				iterable = typed_input(NamedType("Dict", [NamedType("Int", []), RangeType])),
+				iterable_release_policy = NoReleasePolicy,
+				body = VoidExpr(VoidType, synthetic_core_source_loc()),
+			}, VoidType, synthetic_core_source_loc())
+			match build_native_product_adapter_plan(rows, [loop], ops()):
+				Ok(plan): native_product_factory_callback(plan, DictionaryEntryProductFactory, HeapRecordType("Pair")).is_ok()
+				Err(_): False
+		None: False
+
+
+private pure func vector_pair_call(element: CoreType, pair: CoreType) -> CoreExpr:
+	CallExpr(
+		BuiltinCall("blorp_vector_zip"),
+		VoidExpr(VoidType, synthetic_core_source_loc()),
+		[typed_input(NamedType("Vector", [element])), typed_input(NamedType("Vector", [NamedType("Int", [])]))],
+		NamedType("Vector", [pair]),
+		synthetic_core_source_loc(),
+	)
+
+
+pure func test_vector_pair_range_input_uses_tuple_value_shape() -> Bool:
+	match catalog():
+		Some(rows):
+			match build_native_product_adapter_plan(rows, [vector_pair_call(RangeType, HeapRecordType("Pair"))], ops()):
+				Ok(plan): native_product_factory_callback(plan, VectorPairProductFactory, HeapRecordType("Pair")).is_ok()
+				Err(_): False
+		None: False
+
+
+pure func test_tuple_value_projection_does_not_admit_other_input_types() -> Bool:
+	match catalog():
+		Some(rows):
+			[NamedType("Float", []), NamedType("Bool", [])].all(func(element):
+				build_native_product_adapter_plan(rows, [vector_pair_call(element, HeapRecordType("Pair"))], ops()).is_err()
+			)
+		None: False
+
+
+private pure func range_row_symbols(typ: CoreType) -> Option[CNativeProductStorageSymbols]:
+	if core_type_equal(typ, HeapRecordType("RangeRow")):
+		Some({ c_type = "RangeRow*", make_name = "RangeRow_make", members = [Some("f0"), Some("f1")] })
+	else:
+		None
+
+
+pure func test_native_tuple_value_projection_keeps_container_elements() -> Bool:
+	loc = synthetic_core_source_loc()
+	match core_generated_tuple_record_decl("RangeRow", [NamedType("List", [NamedType("Int", [])]), NamedType("Int", [])], loc):
+		Ok(row):
+			match tuple_storage_catalog({ decls = [GeneratedTupleRecordDecl(row)], foreign_includes = [], source_files = [] }):
+				Ok(rows):
+					fixture_ops = { ops() | product_symbols = range_row_symbols }
+					call = vector_pair_call(NamedType("List", [RangeType]), HeapRecordType("RangeRow"))
+					match build_native_product_adapter_plan(rows, [call], fixture_ops):
+						Err(NativeProductCallShapeMismatch(name)): name == "blorp_vector_zip"
+						_: False
+				Err(_): False
+		Err(_): False
+
+
+pure func test_physical_range_output_matches_the_same_native_input() -> Bool:
+	match core_generated_tuple_record_decl("RangeRow", [RangeType, NamedType("Int", [])], synthetic_core_source_loc()):
+		Ok(row):
+			match tuple_storage_catalog({ decls = [GeneratedTupleRecordDecl(row)], foreign_includes = [], source_files = [] }):
+				Ok(rows):
+					fixture_ops = { ops() | product_symbols = range_row_symbols }
+					match build_native_product_adapter_plan(rows, [vector_pair_call(RangeType, HeapRecordType("RangeRow"))], fixture_ops):
+						Ok(plan): native_product_factory_callback(plan, VectorPairProductFactory, HeapRecordType("RangeRow")).is_ok()
+						Err(_): False
+				Err(_): False
+		Err(_): False
+
+
+pure func test_native_int_input_does_not_gain_a_range_proof() -> Bool:
+	match core_generated_tuple_record_decl("RangeRow", [RangeType, NamedType("Int", [])], synthetic_core_source_loc()):
+		Ok(row):
+			match tuple_storage_catalog({ decls = [GeneratedTupleRecordDecl(row)], foreign_includes = [], source_files = [] }):
+				Ok(rows):
+					fixture_ops = { ops() | product_symbols = range_row_symbols }
+					match build_native_product_adapter_plan(rows, [vector_pair_call(NamedType("Int", []), HeapRecordType("RangeRow"))], fixture_ops):
+						Err(NativeProductCallShapeMismatch(name)): name == "blorp_vector_zip"
+						_: False
+				Err(_): False
+		Err(_): False
+
+
+pure func test_native_named_opaque_range_input_is_not_projected_to_int() -> Bool:
+	loc = synthetic_core_source_loc()
+	opaque_type = NamedType("OpaqueIndex", [])
+	match core_generated_tuple_record_decl("Pair", [NamedType("Int", []), NamedType("Int", [])], loc):
+		Ok(row):
+			alias_decl = TypeAliasDecl({
+				abi_type = None,
+				name = "OpaqueIndex",
+				type_params = [],
+				target = RangeType,
+				is_opaque = True,
+				loc = loc,
+			})
+			match tuple_storage_catalog({ decls = [alias_decl, GeneratedTupleRecordDecl(row)], foreign_includes = [], source_files = [] }):
+				Ok(rows):
+					match build_native_product_adapter_plan(rows, [vector_pair_call(opaque_type, HeapRecordType("Pair"))], ops()):
+						Err(NativeProductCallShapeMismatch(name)): name == "blorp_vector_zip"
+						_: False
+				Err(_): False
+		Err(_): False
+
+
+pure func test_opaque_scalar_range_input_keeps_its_nominal_tuple_slot() -> Bool:
+	loc = synthetic_core_source_loc()
+	opaque_type = NamedType("OpaqueIndex", [])
+	match core_generated_tuple_record_decl("RangeRow", [opaque_type, NamedType("Int", [])], loc):
+		Ok(row):
+			alias_decl = TypeAliasDecl({
+				abi_type = None,
+				name = "OpaqueIndex",
+				type_params = [],
+				target = RangeType,
+				is_opaque = True,
+				loc = loc,
+			})
+			match tuple_storage_catalog({ decls = [alias_decl, GeneratedTupleRecordDecl(row)], foreign_includes = [], source_files = [] }):
+				Ok(rows):
+					fixture_ops = { ops() | product_symbols = range_row_symbols }
+					match build_native_product_adapter_plan(rows, [vector_pair_call(opaque_type, HeapRecordType("RangeRow"))], fixture_ops):
+						Ok(plan): native_product_factory_callback(plan, VectorPairProductFactory, HeapRecordType("RangeRow")).is_ok()
+						Err(_): False
+				Err(_): False
+		Err(_): False
+
+
+pure func test_dictionary_input_types_must_match_entry_fields() -> Bool:
+	match catalog():
+		Some(rows):
+			call = CallExpr(BuiltinCall("blorp_dict_entries"), VoidExpr(VoidType, synthetic_core_source_loc()), [typed_input(NamedType("Dict", [NamedType("String", []), NamedType("Int", [])]))], NamedType("List", [HeapRecordType("Pair")]), synthetic_core_source_loc())
+			build_native_product_adapter_plan(rows, [call], ops()).is_err()
+		None: False
+
+
+pure func test_unfold_value_type_must_match_stream_result() -> Bool:
+	match catalog():
+		Some(rows):
+			step_type = FunctionType(True, [NamedType("Int", [])], NamedType("Option", [HeapRecordType("Pair")]))
+			call = CallExpr(BuiltinCall("blorp_stream_unfold"), VoidExpr(VoidType, synthetic_core_source_loc()), [typed_input(NamedType("Int", [])), typed_input(step_type), typed_input(NamedType("Int", [])), typed_input(NamedType("Int", []))], NamedType("Stream", [NamedType("String", [])]), synthetic_core_source_loc())
+			build_native_product_adapter_plan(rows, [call], ops()).is_err()
+		None: False
+
+
+pure func test_missing_factory_remains_a_checked_failure() -> Bool:
+	match catalog():
+		Some(rows):
+			match build_native_product_adapter_plan(rows, [], ops()):
+				Ok(plan): native_product_factory_callback(plan, DictionaryEntryProductFactory, HeapRecordType("Pair")).is_err()
+				Err(_): False
+		None: False
+
+
+pure func test_nested_emitted_calls_are_planned() -> Bool:
+	match catalog():
+		Some(rows):
+			call = native_call("blorp_dict_entries", NamedType("List", [HeapRecordType("Pair")]))
+			root = SeqExpr(VoidExpr(VoidType, synthetic_core_source_loc()), call)
+			match build_native_product_adapter_plan(rows, [root], ops()):
+				Ok(plan): native_product_factory_callback(plan, DictionaryEntryProductFactory, HeapRecordType("Pair")).is_ok()
+				Err(_): False
+		None: False
+
+
+pure func test_process_outputs_plan_the_success_payload_in_every_result_layout() -> Bool:
+	match core_generated_tuple_record_decl("ProcessOutput", [NamedType("String", []), NamedType("String", []), NamedType("Int", [])], synthetic_core_source_loc()):
+		Ok(row):
+			match tuple_storage_catalog({ decls = [GeneratedTupleRecordDecl(row)], foreign_includes = [], source_files = [] }):
+				Ok(rows):
+					success = HeapRecordType("ProcessOutput")
+					error = NamedType("String", [])
+					results: List[CoreType] = [NamedType("Result", [success, error]), StackResultType(success, error), BoxedResultType(success, error)]
+					calls = results.map(func(result): CallExpr(BuiltinCall("blorp_process_shell"), VoidExpr(VoidType, synthetic_core_source_loc()), [typed_input(NamedType("String", []))], result, synthetic_core_source_loc()))
+					symbols: pure (CoreType) -> Option[CNativeProductStorageSymbols] = func(typ):
+						if core_type_equal(typ, success):
+							Some({ c_type = "Output*", make_name = "Output_make", members = [Some("f0"), Some("f1"), Some("f2")] })
+						else:
+							None
+					fixture_ops = { ops() | product_symbols = symbols }
+					match build_native_product_adapter_plan(rows, calls, fixture_ops):
+						Ok(plan): native_product_factory_callback(plan, ProcessOutputProductFactory, success).is_ok()
+						Err(_): False
+				Err(_): False
+		Err(_): False
+
+
+pure func test_process_options_are_validated_before_call_emission() -> Bool:
+	match catalog():
+		Some(rows):
+			call = CallExpr(BuiltinCall("blorp_process_run_command_raw"), VoidExpr(VoidType, synthetic_core_source_loc()), [typed_input(NamedType("String", [])), typed_input(NamedType("List", [NamedType("String", [])])), typed_input(HeapRecordType("Pair"))], NamedType("Result", [HeapRecordType("Pair"), HeapRecordType("Pair")]), synthetic_core_source_loc())
+			build_native_product_adapter_plan(rows, [call], ops()).is_err()
+		None: False
+
+
+pure func test_process_output_rejects_a_non_string_error_payload() -> Bool:
+	match catalog():
+		Some(rows):
+			call = CallExpr(BuiltinCall("blorp_process_shell"), VoidExpr(VoidType, synthetic_core_source_loc()), [typed_input(NamedType("String", []))], StackResultType(HeapRecordType("Pair"), NamedType("Int", [])), synthetic_core_source_loc())
+			match build_native_product_adapter_plan(rows, [call], ops()):
+				Err(fault):
+					match fault:
+						NativeProductCallShapeMismatch(name): name == "blorp_process_shell"
+						_: False
+				Ok(_): False
+		None: False
+
+
+private pure func session_call(request_type: CoreType) -> CoreExpr:
+	-- The planner reads the operation's accepted name and arguments; these
+	-- bridge payload facts are not projected or emitted by this fixture.
+	bridge: CoreOperationResultBridge = {
+		builtin_name = "blorp_process_session_start_raw",
+		runtime_c_name = "blorp_process_session_start_raw",
+		runtime_result_c_type = "blorp_ProcessSessionResult",
+		temp_prefix = "process_session",
+		result_layout_policy = DefaultResultLayoutPolicy,
+		success = { runtime_payload = RuntimeField("handle"), release_mask = 0 },
+		error = { none_tag = "BLORP_PROCESS_ERROR_NONE", detail_field = "detail", other_constructor = "ProcessIoFailed", other_constructor_def_id = 1, cases = [] },
+	}
+	CallExpr(OperationResultCall(bridge), VoidExpr(VoidType, synthetic_core_source_loc()), [typed_input(request_type)], NamedType("Result", [NamedType("ProcessSession", []), NamedType("ProcessError", [])]), synthetic_core_source_loc())
+
+
+private pure func process_fixture_ops(catalog: CoreTupleStorageCatalog) -> CRuntimeProductAdapterOps:
+	symbols: pure (CoreType) -> Option[CNativeProductStorageSymbols] = func(typ):
+		match generated_tuple_record_for_type(catalog, typ):
+			Some(row):
+				members: List[Option[String]] = core_generated_tuple_record_elements(row).enumerate().map(func(entry): Some("f" + entry[0].to_string()))
+				Some({ c_type = "Product*", make_name = "Product_make", members = members })
+			None: None
+	{ ops() | product_symbols = symbols }
+
+
+pure func test_operation_result_call_validates_session_product_arguments() -> Bool:
+	match native_process_product_fixture():
+		Some(fixture):
+			rows = fixture[0]
+			build_native_product_adapter_plan(rows, [session_call(fixture[2])], process_fixture_ops(rows)).is_ok()
+		None: False
+
+
+pure func test_operation_result_call_rejects_a_malformed_session_argument() -> Bool:
+	match native_process_product_fixture():
+		Some(fixture):
+			rows = fixture[0]
+			build_native_product_adapter_plan(rows, [session_call(fixture[1])], process_fixture_ops(rows)).is_err()
+		None: False
+
+
+private pure func output_catalog() -> Option[CoreTupleStorageCatalog]:
+	match core_generated_tuple_record_decl("OutputRow", [NamedType("String", []), NamedType("String", []), NamedType("Int", [])], synthetic_core_source_loc()):
+		Ok(row):
+			match tuple_storage_catalog({ decls = [GeneratedTupleRecordDecl(row)], foreign_includes = [], source_files = [] }):
+				Ok(rows): Some(rows)
+				Err(_): None
+		Err(_): None
+
+
+private pure func output_call(success: CoreType) -> CoreExpr:
+	CallExpr(BuiltinCall("blorp_process_shell"), VoidExpr(VoidType, synthetic_core_source_loc()), [typed_input(NamedType("String", []))], BoxedResultType(success, NamedType("String", [])), synthetic_core_source_loc())
+
+
+pure func test_opaque_and_physical_outputs_share_one_registered_factory() -> Bool:
+	match output_catalog():
+		Some(rows):
+			physical = HeapRecordType("OutputRow")
+			opaque_type = NamedType("OpaqueOutputFixture", [])
+			resolver: pure (CoreType) -> Option[CoreType] = func(typ):
+				if core_type_equal(typ, opaque_type):
+					Some(physical)
+				else:
+					Some(typ)
+			fixture_ops = { process_fixture_ops(rows) | resolve_product_type = resolver }
+			match build_native_product_adapter_plan(rows, [output_call(opaque_type), output_call(physical)], fixture_ops):
+				Ok(plan):
+					(
+						native_product_factory_callback(plan, ProcessOutputProductFactory, physical).is_ok()
+						and native_product_adapter_declarations(plan).split("static inline void* Product_make_native_process_output").length() == 2
+					)
+				Err(_): False
+		None: False
+
+
+pure func test_unregistered_opaque_output_remains_a_checked_failure() -> Bool:
+	match output_catalog():
+		Some(rows):
+			opaque_type = NamedType("OpaqueOutputFixture", [])
+			match build_native_product_adapter_plan(rows, [output_call(opaque_type)], process_fixture_ops(rows)):
+				Err(fault):
+					match fault:
+						NativeProductCanonicalRowUnavailable(typ): core_type_equal(typ, opaque_type)
+						_: False
+				Ok(_): False
+		None: False
+
+
+pure func test_nested_opaque_elements_match_their_physical_input() -> Bool:
+	opaque_type = NamedType("NestedOpaqueFixture", [])
+	loc = synthetic_core_source_loc()
+	match core_generated_tuple_record_decl("NestedRow", [NamedType("String", []), NamedType("Int", [])], loc):
+		Ok(nested):
+			match core_generated_tuple_record_decl("AliasPair", [NamedType("Int", []), opaque_type], loc):
+				Ok(outer):
+					match tuple_storage_catalog({ decls = [GeneratedTupleRecordDecl(nested), GeneratedTupleRecordDecl(outer)], foreign_includes = [], source_files = [] }):
+						Ok(rows):
+							physical = HeapRecordType("NestedRow")
+							resolver: pure (CoreType) -> Option[CoreType] = func(typ):
+								if core_type_equal(typ, opaque_type):
+									Some(physical)
+								else:
+									Some(typ)
+							fixture_ops = { process_fixture_ops(rows) | resolve_product_type = resolver }
+							calls = [opaque_type, physical].map(func(element): CallExpr(BuiltinCall("blorp_stream_enumerate"), VoidExpr(VoidType, loc), [typed_input(NamedType("Stream", [element]))], NamedType("Stream", [HeapRecordType("AliasPair")]), loc))
+							match build_native_product_adapter_plan(rows, calls, fixture_ops):
+								Ok(plan):
+									(
+										native_product_factory_callback(plan, EnumeratedProductFactory, HeapRecordType("AliasPair")).is_ok()
+										and native_product_adapter_declarations(plan).split("static inline void* Product_make_native_enumeration").length() == 2
+									)
+								Err(_): False
+						Err(_): False
+				Err(_): False
+		Err(_): False
+
+
+pure func test_unfold_alias_preserves_the_original_option_abi() -> Bool:
+	match catalog():
+		Some(rows):
+			opaque_type = NamedType("OpaquePairFixture", [])
+			physical = HeapRecordType("Pair")
+			resolver: pure (CoreType) -> Option[CoreType] = func(typ):
+				if core_type_equal(typ, opaque_type):
+					Some(physical)
+				else:
+					Some(typ)
+			fixture_ops = { ops() | resolve_product_type = resolver }
+			calls = [opaque_type, physical].map(func(pair): CallExpr(BuiltinCall("blorp_stream_unfold"), VoidExpr(VoidType, synthetic_core_source_loc()), [typed_input(NamedType("Int", [])), typed_input(FunctionType(True, [NamedType("Int", [])], NamedType("Option", [pair]))), typed_input(NamedType("Int", [])), typed_input(NamedType("Int", []))], NamedType("Stream", [NamedType("Int", [])]), synthetic_core_source_loc()))
+			match build_native_product_adapter_plan(rows, calls, fixture_ops):
+				Ok(plan):
+					(
+						native_unfold_product_callback(plan, physical, NullableUnfoldProductResult).is_ok()
+						and native_unfold_product_callback(plan, physical, BoxedUnfoldProductResult).is_ok()
+						and native_product_adapter_declarations(plan).split("static inline bool Pair_make_native_unfold_").length() == 3
+					)
+				Err(_): False
+		None: False
+
+
+pure func test_factories_follow_depth_first_root_and_child_order() -> Bool:
+	match catalog():
+		Some(rows):
+			dictionary = native_call("blorp_dict_entries", NamedType("List", [HeapRecordType("Pair")]))
+			enumeration = native_call("blorp_stream_enumerate", NamedType("Stream", [HeapRecordType("Pair")]))
+			vector = vector_pair_call(NamedType("Int", []), HeapRecordType("Pair"))
+			root = SeqExpr(SeqExpr(enumeration, vector), dictionary)
+			match build_native_product_adapter_plan(rows, [root, dictionary, vector, enumeration], ops()):
+				Ok(plan):
+					declarations = native_product_adapter_declarations(plan)
+					match native_product_factory_callback(plan, EnumeratedProductFactory, HeapRecordType("Pair")):
+						Ok(enumeration_name):
+							match native_product_factory_callback(plan, VectorPairProductFactory, HeapRecordType("Pair")):
+								Ok(vector_name):
+									match native_product_factory_callback(plan, DictionaryEntryProductFactory, HeapRecordType("Pair")):
+										Ok(dictionary_name):
+											enumeration_index = declarations.index_of(enumeration_name + "(").get_or(-1)
+											vector_index = declarations.index_of(vector_name + "(").get_or(-1)
+											dictionary_index = declarations.index_of(dictionary_name + "(").get_or(-1)
+											(
+												enumeration_index >= 0
+												and enumeration_index < vector_index
+												and vector_index < dictionary_index
+												and declarations.split(enumeration_name + "(").length() == 2
+												and declarations.split(vector_name + "(").length() == 2
+												and declarations.split(dictionary_name + "(").length() == 2
+											)
+										Err(_): False
+								Err(_): False
+						Err(_): False
+				Err(_): False
+		None: False
+
+
+pure func test_first_root_fault_precedes_later_roots() -> Bool:
+	match catalog():
+		Some(rows):
+			first = SeqExpr(VoidExpr(VoidType, synthetic_core_source_loc()), native_call("blorp_dict_entries", NamedType("Int", [])))
+			later = native_call("blorp_stream_enumerate", NamedType("Int", []))
+			match build_native_product_adapter_plan(rows, [first, later], ops()):
+				Err(NativeProductCallShapeMismatch(name)): name == "blorp_dict_entries"
+				_: False
+		None: False
+
+
+pure func test_first_child_fault_precedes_later_children() -> Bool:
+	match catalog():
+		Some(rows):
+			first = native_call("blorp_stream_enumerate", NamedType("Int", []))
+			later = native_call("blorp_dict_entries", NamedType("Int", []))
+			match build_native_product_adapter_plan(rows, [SeqExpr(first, later)], ops()):
+				Err(NativeProductCallShapeMismatch(name)): name == "blorp_stream_enumerate"
+				_: False
+		None: False
+
+
+pure func test_parent_fault_precedes_child_faults() -> Bool:
+	match catalog():
+		Some(rows):
+			child = native_call("blorp_stream_enumerate", NamedType("Int", []))
+			parent = CallExpr(
+				BuiltinCall("blorp_dict_entries"), child,
+				[typed_input(NamedType("Dict", [NamedType("Int", []), NamedType("Int", [])]))],
+				NamedType("Int", []), synthetic_core_source_loc(),
+			)
+			match build_native_product_adapter_plan(rows, [parent], ops()):
+				Err(NativeProductCallShapeMismatch(name)): name == "blorp_dict_entries"
+				_: False
+		None: False
+
+
+tests: TestSuite = {
+	description = "Native product adapter plan",
+	tests = [
+		("repeated pair calls share one factory", test_repeated_pair_calls_share_one_factory),
+		("native factory signatures stay distinct", test_pair_factories_keep_native_signatures_distinct),
+		("direct runtime calls use registered products", test_direct_runtime_calls_use_registered_products),
+		("unfold reads typed step result", test_unfold_reads_the_typed_step_result),
+		("invalid result teaches layout boundary", test_invalid_native_result_teaches_the_layout_boundary),
+		("dictionary tuple keys do not construct entry pairs", test_dictionary_keys_do_not_construct_entry_pairs),
+		("dictionary entries construct checked pairs", test_dictionary_entries_construct_a_checked_pair),
+		("dictionary Range input uses tuple value shape", test_dictionary_entry_range_input_uses_tuple_value_shape),
+		("vector Range input uses tuple value shape", test_vector_pair_range_input_uses_tuple_value_shape),
+		("tuple value projection rejects unrelated input types", test_tuple_value_projection_does_not_admit_other_input_types),
+		("native tuple projection keeps container elements", test_native_tuple_value_projection_keeps_container_elements),
+		("physical Range output matches native input", test_physical_range_output_matches_the_same_native_input),
+		("native Int input gains no Range proof", test_native_int_input_does_not_gain_a_range_proof),
+		("native named opaque Range is not projected to Int", test_native_named_opaque_range_input_is_not_projected_to_int),
+		("opaque Range slot remains nominal", test_opaque_scalar_range_input_keeps_its_nominal_tuple_slot),
+		("dictionary input types match entry fields", test_dictionary_input_types_must_match_entry_fields),
+		("unfold value type matches stream result", test_unfold_value_type_must_match_stream_result),
+		("missing factory is checked failure", test_missing_factory_remains_a_checked_failure),
+		("nested emitted calls are planned", test_nested_emitted_calls_are_planned),
+		("factories preserve depth-first root and child order", test_factories_follow_depth_first_root_and_child_order),
+		("first root fault precedes later roots", test_first_root_fault_precedes_later_roots),
+		("first child fault precedes later children", test_first_child_fault_precedes_later_children),
+		("parent fault precedes child faults", test_parent_fault_precedes_child_faults),
+		("process output factory uses success payload", test_process_outputs_plan_the_success_payload_in_every_result_layout),
+		("process options validated before call emission", test_process_options_are_validated_before_call_emission),
+		("process output requires string error payload", test_process_output_rejects_a_non_string_error_payload),
+		("operation result validates session argument", test_operation_result_call_validates_session_product_arguments),
+		("operation result rejects malformed session argument", test_operation_result_call_rejects_a_malformed_session_argument),
+		("opaque and physical outputs share registered factory", test_opaque_and_physical_outputs_share_one_registered_factory),
+		("unregistered opaque output is checked failure", test_unregistered_opaque_output_remains_a_checked_failure),
+		("nested opaque element matches physical input", test_nested_opaque_elements_match_their_physical_input),
+		("unfold opaque_type preserves original Option ABI", test_unfold_alias_preserves_the_original_option_abi),
+	],
+}

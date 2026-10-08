@@ -57,14 +57,14 @@ import:
 			ListConstructExpr, ListAllocExpr, ListGetExpr, ListHandoffExpr, ListHandoffSetOwnedExpr,
 			ListHandoffSetSourceSlotExpr, ListRetainExpr, ListSetExpr, ListSwapExpr, LiteralExpr,
 			LogicalExpr, PreClosureConcurrentExpr, PreClosureConcurrentlyLoopExpr,
-			PreClosureDetachExpr, RawMatchExpr, RecordConstructExpr, RecordExpr,
+			PreClosureDetachExpr, RawMatchExpr, ProductExpr,
 			RecordCowUpdateExpr, RecordReuseExpr, RecordUpdateExpr, ResourceCleanupExitExpr,
 			ResourceScopeExpr, SelectExpr, SemanticMatchExpr, SeqExpr, SetAllocExpr,
 			StaticStringLiteralExpr, StringByteCopyExpr, StringByteReadExpr, StringByteWriteExpr,
 			StringSetLenExpr, TailrecListSpreadLoopExpr, TailrecListSpreadRecurExpr,
 			TailrecLoopExpr, TailrecRecurExpr, TensorBoxedLiteralExpr, TensorLiteralExpr,
 			TensorPackedLiteralExpr, TensorRawFillExpr, TensorRawReadExpr, TensorRawViewLetExpr,
-			TensorRawWriteExpr, TupleConstructExpr, TupleExpr, UnaryExpr, UnboxExpr,
+			TensorRawWriteExpr, TupleExpr, UnaryExpr, UnboxExpr,
 			UnionConstructExpr, UnionReuseConstructExpr, VarExpr, VectorExpr, VoidExpr, WhileExpr,
 			LiteralMatchExpr, LengthMatchExpr,
 		),
@@ -80,6 +80,8 @@ import:
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
 		CoreParam,
 		CorePreClosureConcurrentBinding,
+		CoreProductBuild,
+		CoreMapState,
 		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy, StackResultReleasePolicy),
@@ -99,7 +101,9 @@ import:
 		),
 		core_expr_type,
 		core_node_id_raw,
+		map_product_build_values,
 		perceus_temporary_binder_id,
+		rewrite_product_build_values,
 		synthetic_core_source_loc,
 	../ownership:
 		OwnershipCallContract,
@@ -261,8 +265,6 @@ private pure func core_expr_kind_name(expr: CoreExpr) -> String:
 			"ModuleMemberExpr"
 		TupleExpr(_, _, _):
 			"TupleExpr"
-		TupleConstructExpr(_, _, _):
-			"TupleConstructExpr"
 		VectorExpr(_, _, _):
 			"VectorExpr"
 		LambdaExpr(_, _, _, _, _, _):
@@ -315,16 +317,14 @@ private pure func core_expr_kind_name(expr: CoreExpr) -> String:
 			"ListSetExpr"
 		ListSwapExpr(_, _, _):
 			"ListSwapExpr"
-		RecordExpr(_, _, _):
-			"RecordExpr"
+		ProductExpr(_, _, _):
+			"ProductExpr"
 		RecordUpdateExpr(_, _, _, _):
 			"RecordUpdateExpr"
 		RecordReuseExpr(_, _, _, _):
 			"RecordReuseExpr"
 		RecordCowUpdateExpr(_, _, _, _):
 			"RecordCowUpdateExpr"
-		RecordConstructExpr(_, _, _, _):
-			"RecordConstructExpr"
 		UnionConstructExpr(_, _, _):
 			"UnionConstructExpr"
 		UnionReuseConstructExpr(_, _, _):
@@ -474,6 +474,11 @@ union PerceusAggregateExprsRewrite:
 union PerceusAggregateRecordFieldsRewrite:
 	UnchangedPerceusAggregateRecordFields
 	ChangedPerceusAggregateRecordFields(List[CoreRecordFieldValue])
+
+
+union PerceusAggregateBuildRewrite:
+	UnchangedPerceusAggregateBuild
+	ChangedPerceusAggregateBuild(CoreProductBuild)
 
 
 union PerceusAggregateCowFieldsRewrite:
@@ -1200,6 +1205,36 @@ private pure func rewrite_aggregate_record_fields(
 		UnchangedPerceusAggregateRecordFields
 
 
+-- The state is whether any value was rewritten: a child that does not reuse
+-- its source counts as rewritten even when it comes back as the same object.
+private pure func rewrite_aggregate_build(
+	env: PerceusEnv,
+	build: CoreProductBuild,
+) -> PerceusAggregateBuildRewrite:
+	rewritten: CoreMapState[Bool, CoreProductBuild] = rewrite_product_build_values(
+		build,
+		False,
+		pure func(changed: Bool, value: CoreExpr) -> CoreMapState[Bool, CoreExpr]:
+			result: PerceusInsertedExpr = insert_aggregate_child(env, value, True)
+
+			if result.reuses_source:
+				{
+					state = changed,
+					value = value
+				}
+			else:
+				{
+					state = True,
+					value = result.expr
+				}
+	)
+
+	if rewritten.state:
+		ChangedPerceusAggregateBuild(rewritten.value)
+	else:
+		UnchangedPerceusAggregateBuild
+
+
 private pure func aggregate_value_can_transfer_without_retain(
 	env: PerceusEnv,
 	expr: CoreExpr,
@@ -1390,14 +1425,14 @@ private pure func insert_drops_change_aware_aggregate_impl(
 						VectorExpr(rewritten, typ, loc),
 						False,
 					)
-		RecordExpr(fields, typ, loc):
-			match rewrite_aggregate_record_fields(env, fields):
-				UnchangedPerceusAggregateRecordFields:
+		ProductExpr(build, typ, loc):
+			match rewrite_aggregate_build(env, build):
+				UnchangedPerceusAggregateBuild:
 					inserted_non_binding_expr(env, source, True)
-				ChangedPerceusAggregateRecordFields(rewritten):
+				ChangedPerceusAggregateBuild(rewritten):
 					inserted_non_binding_expr(
 						env,
-						RecordExpr(rewritten, typ, loc),
+						ProductExpr(rewritten, typ, loc),
 						False,
 					)
 		RecordUpdateExpr(base, fields, typ, loc):
@@ -1419,23 +1454,23 @@ private pure func insert_drops_change_aware_aggregate_impl(
 						RecordUpdateExpr(rewritten_base.expr, rewritten, typ, loc),
 						False,
 					)
-		RecordReuseExpr(record_source, fields, typ, loc):
+		RecordReuseExpr(record_source, build, typ, loc):
 			rewritten_source: PerceusInsertedExpr = insert_drops_expr_inner_result(
 				env,
 				record_source,
 			)
 
-			match rewrite_aggregate_record_fields(env, fields):
-				UnchangedPerceusAggregateRecordFields:
+			match rewrite_aggregate_build(env, build):
+				UnchangedPerceusAggregateBuild:
 					if rewritten_source.reuses_source:
 						inserted_non_binding_expr(env, source, True)
 					else:
 						inserted_non_binding_expr(
 							env,
-							RecordReuseExpr(rewritten_source.expr, fields, typ, loc),
+							RecordReuseExpr(rewritten_source.expr, build, typ, loc),
 							False,
 						)
-				ChangedPerceusAggregateRecordFields(rewritten):
+				ChangedPerceusAggregateBuild(rewritten):
 					inserted_non_binding_expr(
 						env,
 						RecordReuseExpr(rewritten_source.expr, rewritten, typ, loc),
@@ -1461,16 +1496,6 @@ private pure func insert_drops_change_aware_aggregate_impl(
 					inserted_non_binding_expr(
 						env,
 						RecordCowUpdateExpr(rewritten_source.expr, rewritten, typ, loc),
-						False,
-					)
-		RecordConstructExpr(type_name, fields, typ, loc):
-			match rewrite_aggregate_record_fields(env, fields):
-				UnchangedPerceusAggregateRecordFields:
-					inserted_non_binding_expr(env, source, True)
-				ChangedPerceusAggregateRecordFields(rewritten):
-					inserted_non_binding_expr(
-						env,
-						RecordConstructExpr(type_name, rewritten, typ, loc),
 						False,
 					)
 		ListConstructExpr(construct, typ, loc):
@@ -2364,6 +2389,10 @@ pure func rewrite_record_fields(
 		rewritten = rewritten.append({ field | value = insert_drops_expr_inner(env, field.value) })
 
 	rewritten
+
+
+pure func rewrite_build(env: PerceusEnv, build: CoreProductBuild) -> CoreProductBuild:
+	map_product_build_values(build, env, insert_drops_expr_inner).get_or(build)
 
 
 pure func rewrite_dict_entries(
@@ -3860,15 +3889,13 @@ private pure func is_owned_temporary_with_names(
 				True
 			VectorExpr(items, result_type, loc):
 				True
-			RecordExpr(fields, result_type, loc):
+			ProductExpr(build, result_type, loc):
 				True
 			RecordUpdateExpr(base, fields, result_type, loc):
 				True
-			RecordReuseExpr(source, fields, result_type, loc):
+			RecordReuseExpr(source, build, result_type, loc):
 				True
 			RecordCowUpdateExpr(source, fields, result_type, loc):
-				True
-			RecordConstructExpr(type_name, fields, result_type, loc):
 				True
 			UnionConstructExpr(construct, result_type, loc):
 				True
@@ -4981,7 +5008,7 @@ pure func insert_drops_non_binding_expr(env: PerceusEnv, expr: CoreExpr) -> Perc
 				env,
 				insert_drops_ownership_node(env, expr),
 			)
-		TupleExpr(_, _, _) | VectorExpr(_, _, _) | RecordExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | RecordConstructExpr(_, _, _, _) | ListConstructExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | DictConstructExpr(_, _, _) | UnionConstructExpr(_, _, _):
+		TupleExpr(_, _, _) | VectorExpr(_, _, _) | ProductExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | ListConstructExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | DictConstructExpr(_, _, _) | UnionConstructExpr(_, _, _):
 			insert_drops_change_aware_aggregate(env, expr)
 		CallExpr(kind, callee, args, typ, loc):
 			insert_drops_change_aware_call(env, expr, kind, callee, args, typ, loc)
@@ -5458,12 +5485,8 @@ pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) -> CoreE
 				typ,
 				loc,
 			)
-		RecordExpr(fields, typ, loc):
-			RecordExpr(
-				rewrite_record_fields(env, fields),
-				typ,
-				loc,
-			)
+		ProductExpr(build, typ, loc):
+			ProductExpr(rewrite_build(env, build), typ, loc)
 		RecordUpdateExpr(base, fields, typ, loc):
 			RecordUpdateExpr(
 				insert_drops_expr_inner(env, base),
@@ -5471,10 +5494,10 @@ pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) -> CoreE
 				typ,
 				loc,
 			)
-		RecordReuseExpr(source, fields, typ, loc):
+		RecordReuseExpr(source, build, typ, loc):
 			RecordReuseExpr(
 				insert_drops_expr_inner(env, source),
-				rewrite_record_fields(env, fields),
+				rewrite_build(env, build),
 				typ,
 				loc,
 			)
@@ -5485,13 +5508,6 @@ pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) -> CoreE
 					fields,
 					pure func(replacement): insert_drops_expr_inner(env, replacement),
 				),
-				typ,
-				loc,
-			)
-		RecordConstructExpr(type_name, fields, typ, loc):
-			RecordConstructExpr(
-				type_name,
-				rewrite_record_fields(env, fields),
 				typ,
 				loc,
 			)

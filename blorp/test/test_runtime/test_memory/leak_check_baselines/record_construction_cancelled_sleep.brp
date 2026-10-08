@@ -1,0 +1,115 @@
+-- A fresh field owner waits for a later field to finish before the record
+-- constructor takes it. Cancelling that later field must release the owner.
+import:
+	memory:
+		MemoryCounter(LiveManagedObjects, ManagedAllocations, MemoryStatsActive),
+		read_memory_counter, refcount,
+	test: cancel_after_parked_for_test
+
+
+record PendingRecord {
+	tag: Int,
+	rows: List[Int]
+}
+
+
+pure func make_rows(seed: Int) -> List[Int]:
+	[seed, seed + 1]
+
+
+var SHARED_ROWS: List[Int] = []
+
+
+func parked_tag() -> Int:
+	sleep(10000)
+	7
+
+
+func record_between_field_evaluations(seed: Int) -> Int:
+	pending: PendingRecord = {
+		rows = make_rows(seed),
+		tag = parked_tag()
+	}
+
+	pending.rows.length() + pending.tag
+
+
+func retained_global_between_field_evaluations() -> Int:
+	pending: PendingRecord = {
+		rows = SHARED_ROWS,
+		tag = parked_tag()
+	}
+
+	pending.rows.length() + pending.tag
+
+
+func duplicated_local_between_field_evaluations(seed: Int) -> Int:
+	rows = make_rows(seed)
+	pending: PendingRecord = {
+		rows = rows,
+		tag = parked_tag()
+	}
+
+	pending.rows.length() + rows.length() + pending.tag
+
+
+func conditional_field_between_evaluations(seed: Int, take_local: Bool) -> Int:
+	rows = make_rows(seed)
+	pending: PendingRecord = {
+		rows = (
+			if take_local:
+				rows
+			else:
+				make_rows(seed + 1)
+		),
+		tag = parked_tag()
+	}
+
+	pending.rows.length() + rows.length() + pending.tag
+
+
+func main(args: List[String]) -> Int:
+	-- A runtime seed prevents the shared global from becoming an immortal
+	-- constant, so this exercises its retained reference during cancellation.
+	SHARED_ROWS = make_rows(read_memory_counter(ManagedAllocations))
+	captured_rows = make_rows(9)
+	shared_refs_before = refcount(SHARED_ROWS)
+	-- Counter reads allocate no report records inside the measured interval.
+	active_before: Int = read_memory_counter(MemoryStatsActive)
+	allocations_before: Int = read_memory_counter(ManagedAllocations)
+	live_before: Int = read_memory_counter(LiveManagedObjects)
+	cancelled = cancel_after_parked_for_test(func(): record_between_field_evaluations(3))
+	global_cancelled = cancel_after_parked_for_test(retained_global_between_field_evaluations)
+	local_cancelled = cancel_after_parked_for_test(func(): duplicated_local_between_field_evaluations(5))
+	captured_cancelled = cancel_after_parked_for_test(func():
+		pending: PendingRecord = {
+			rows = captured_rows,
+			tag = parked_tag()
+		}
+
+		pending.rows.length() + pending.tag
+	)
+	selected_local_cancelled = cancel_after_parked_for_test(func(): conditional_field_between_evaluations(11, True))
+	selected_fresh_cancelled = cancel_after_parked_for_test(func(): conditional_field_between_evaluations(13, False))
+	active_after: Int = read_memory_counter(MemoryStatsActive)
+	allocations_after: Int = read_memory_counter(ManagedAllocations)
+	live_after: Int = read_memory_counter(LiveManagedObjects)
+
+	if (
+		cancelled
+		and global_cancelled
+		and local_cancelled
+		and captured_cancelled
+		and selected_local_cancelled
+		and selected_fresh_cancelled
+		and active_before == 1
+		and active_after == 1
+		and allocations_after > allocations_before
+		and live_after == live_before
+		and shared_refs_before == 1
+		and refcount(SHARED_ROWS) == shared_refs_before
+		and refcount(captured_rows) == 1
+	):
+		0
+	else:
+		1

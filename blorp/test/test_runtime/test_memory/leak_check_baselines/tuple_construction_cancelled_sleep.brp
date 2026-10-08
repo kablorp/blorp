@@ -1,0 +1,129 @@
+-- A managed tuple stored in a list has the same field-owner frontier as a
+-- record. Cancellation while a later field parks must release earlier owners.
+import:
+	memory:
+		MemoryCounter(LiveManagedObjects, ManagedAllocations, MemoryStatsActive),
+		read_memory_counter, refcount,
+	test: cancel_after_parked_for_test
+
+
+pure func make_rows(seed: Int) -> List[Int]:
+	[seed, seed + 1]
+
+
+var SHARED_ROWS: List[Int] = []
+
+var EVALUATION_TRACE: Int = 0
+
+
+func ordered_rows(event: Int) -> List[Int]:
+	EVALUATION_TRACE = EVALUATION_TRACE * 10 + event
+	make_rows(event)
+
+
+func ordered_tag(event: Int) -> Int:
+	EVALUATION_TRACE = EVALUATION_TRACE * 10 + event
+	event
+
+
+func list_evaluation_is_in_written_order() -> Bool:
+	EVALUATION_TRACE = 0
+	entries: List[(List[Int], Int)] = [
+		(ordered_rows(1), ordered_tag(2)),
+		(ordered_rows(3), ordered_tag(4)),
+	]
+	-- Decimal event digits distinguish both field order and element order.
+	EVALUATION_TRACE == 1234 and entries.length() == 2 and stored_score(entries) == 4
+
+
+func parked_tag() -> Int:
+	sleep(10000)
+	7
+
+
+private pure func stored_score(entries: List[(List[Int], Int)]) -> Int:
+	match entries.get(0):
+		Some(entry): entry[0].length() + entry[1]
+		None: 0
+
+
+func tuple_between_field_evaluations(seed: Int) -> Int:
+	pending: List[(List[Int], Int)] = [(make_rows(seed), parked_tag())]
+	stored_score(pending)
+
+
+func completed_element_before_parked_element(seed: Int) -> Int:
+	pending: List[(List[Int], Int)] = [
+		(make_rows(seed), 3),
+		(make_rows(seed + 1), parked_tag()),
+	]
+	stored_score(pending)
+
+
+func retained_global_between_field_evaluations() -> Int:
+	pending: List[(List[Int], Int)] = [(SHARED_ROWS, parked_tag())]
+	stored_score(pending)
+
+
+func duplicated_local_between_field_evaluations(seed: Int) -> Int:
+	rows = make_rows(seed)
+	pending: List[(List[Int], Int)] = [(rows, parked_tag())]
+	stored_score(pending) + rows.length()
+
+
+func conditional_field_between_evaluations(seed: Int, take_local: Bool) -> Int:
+	rows = make_rows(seed)
+	pending: List[(List[Int], Int)] = [(
+		(
+			if take_local:
+				rows
+			else:
+				make_rows(seed + 1)
+		),
+		parked_tag(),
+	)]
+	stored_score(pending) + rows.length()
+
+
+func main(args: List[String]) -> Int:
+	ordered = list_evaluation_is_in_written_order()
+	SHARED_ROWS = make_rows(read_memory_counter(ManagedAllocations))
+	captured_rows = make_rows(9)
+	shared_refs_before = refcount(SHARED_ROWS)
+	active_before: Int = read_memory_counter(MemoryStatsActive)
+	allocations_before: Int = read_memory_counter(ManagedAllocations)
+	live_before: Int = read_memory_counter(LiveManagedObjects)
+	cancelled = cancel_after_parked_for_test(func(): tuple_between_field_evaluations(3))
+	completed_element_cancelled = cancel_after_parked_for_test(func(): completed_element_before_parked_element(7))
+	global_cancelled = cancel_after_parked_for_test(retained_global_between_field_evaluations)
+	local_cancelled = cancel_after_parked_for_test(func(): duplicated_local_between_field_evaluations(5))
+	captured_cancelled = cancel_after_parked_for_test(func():
+		pending: List[(List[Int], Int)] = [(captured_rows, parked_tag())]
+		stored_score(pending)
+	)
+	selected_local_cancelled = cancel_after_parked_for_test(func(): conditional_field_between_evaluations(11, True))
+	selected_fresh_cancelled = cancel_after_parked_for_test(func(): conditional_field_between_evaluations(13, False))
+	active_after: Int = read_memory_counter(MemoryStatsActive)
+	allocations_after: Int = read_memory_counter(ManagedAllocations)
+	live_after: Int = read_memory_counter(LiveManagedObjects)
+
+	if (
+		ordered
+		and cancelled
+		and completed_element_cancelled
+		and global_cancelled
+		and local_cancelled
+		and captured_cancelled
+		and selected_local_cancelled
+		and selected_fresh_cancelled
+		and active_before == 1
+		and active_after == 1
+		and allocations_after > allocations_before
+		and live_after == live_before
+		and shared_refs_before == 1
+		and refcount(SHARED_ROWS) == shared_refs_before
+		and refcount(captured_rows) == 1
+	):
+		0
+	else:
+		1

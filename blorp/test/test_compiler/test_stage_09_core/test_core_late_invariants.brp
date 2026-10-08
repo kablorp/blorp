@@ -10,11 +10,13 @@ import:
 		CoreConcurrentlyLoopOutput(ConcurrentlyLoopDiscard),
 		CoreConstructorMatchFallback(ConstructorMatchFallbackFail),
 		CoreDeclaredOrigin(ProjectedImplMethod),
-		CoreDecl(FunctionDecl, ImplDecl, UnionDecl),
+		CoreDecl(FunctionDecl, HeapRecordDecl, ImplDecl, InlineRecordDecl, UnionDecl),
+		CoreRecordForm(OrdinaryRecordForm),
 		CoreFunction,
 		CoreFunctionOrigin(Declared),
 		CoreImplMethodRole(RuntimeCallbackMethod),
 		CoreRuntimeCallbackRole(HashableHashCallback),
+		CoreDictIterationMode(CoreDictIterationKeys, CoreDictIterationEntries),
 		CoreExpr(
 			BreakExpr,
 			CallExpr,
@@ -25,6 +27,9 @@ import:
 			DebugBlockExpr,
 			DetachExpr,
 			DictExpr,
+			DupExpr,
+			IfExpr,
+			ProductFieldExpr,
 			DropExpr,
 			ForChannelExpr,
 			ForListExpr,
@@ -40,7 +45,8 @@ import:
 			PreClosureConcurrentlyLoopExpr,
 			PreClosureDetachExpr,
 			RawMatchExpr,
-			RecordExpr,
+			ProductExpr,
+			RecordReuseExpr,
 			RecordUpdateExpr,
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
@@ -49,7 +55,6 @@ import:
 			SeqExpr,
 			TensorRawReadExpr,
 			TensorRawViewLetExpr,
-			TupleConstructExpr,
 			TupleExpr,
 			VarExpr,
 			VectorExpr,
@@ -58,20 +63,24 @@ import:
 		),
 		CoreFunctionKind(UserFunction),
 		CoreImplDecl,
-		CoreLiteral(IntLiteral),
+		CoreLiteral(BoolLiteral, IntLiteral),
 		CoreLoopBinder,
 		CoreLoopRangeDirection(RangeForwardOnly),
 		CoreListStorageLayout(PointerListStorage),
 		CoreProgram,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
+		CoreRetainPolicy(NoRetainPolicy),
 		CoreResourceExit(ResourceBreakExit),
 		CoreSelectArmKind(SelectAfterArm),
 		CoreSemanticMatchTree(SemanticMatchLeaf),
 		CoreSourceLoc,
+		core_field_ref,
+		core_field_ordinal,
+		product_build_in_declared_order,
 		synthetic_core_source_loc,
 		CoreTensorRawScalarKind(TensorFloat64Elements, TensorInt64Elements),
 		CoreTensorForElementStorage(TensorForRawScalarElement),
-		CoreType(FunctionType, NamedType, StackResultType, TensorType, UnionType, VoidType),
+		CoreType(TupleType, FunctionType, HeapRecordType, InlineRecordType, NamedType, StackResultType, TensorType, UnionType, VoidType),
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
 	../../../src/compiler/stage_09_core/late_invariants:
@@ -96,7 +105,9 @@ import:
 			PreClosureConcurrentlyLoopSurvived,
 			PreClosureDetachSurvived,
 			RawMatchSurvived,
-			RecordLiteralSurvived,
+			ProductFieldCountMismatch,
+			ProductFieldEvaluationSurvived,
+			ProductWithoutRecordType,
 			RecordUpdateSurvived,
 			RawTensorViewUnbound,
 			RawTensorViewKindMismatch,
@@ -112,6 +123,7 @@ import:
 		check_late_core_invariants,
 	../../../src/compiler/stage_09_core/pipeline_stage:
 		CorePipelineStage(ClosureStage, DceStage, FinalStage, PerceusStage, PostDceTailStage),
+	../../../src/compiler/stage_09_core/tuple_storage: lower_tuple_storage_program
 	test: TestSuite
 
 
@@ -422,35 +434,177 @@ pure func test_final_boundary_rejects_raw_dict() -> Bool:
 			False
 
 
-pure func test_final_boundary_rejects_raw_record() -> Bool:
-	raw_record: CoreExpr = RecordExpr(
-		[],
+pure func test_final_boundary_rejects_product_without_record_type() -> Bool:
+	untyped_record: CoreExpr = ProductExpr(
+		product_build_in_declared_order([]),
 		NamedType("Point", []),
 		synthetic_core_source_loc(),
 	)
 
-	match check_late_core_invariants(FinalStage, program_with_body(raw_record)):
-		[RecordLiteralSurvived(_)]:
+	match check_late_core_invariants(FinalStage, program_with_body(untyped_record)):
+		[ProductWithoutRecordType(_)]:
 			True
 		_:
 			False
 
 
-pure func test_final_boundary_accepts_prepared_tuple() -> Bool:
-	prepared_tuple: CoreExpr = TupleConstructExpr(
-		{
-			elements = [],
-			release_mask = 0,
-			retain_mask = 0
-		},
-		NamedType(
-			"Tuple0",
-			[],
-		),
+pure func test_final_boundary_rejects_product_of_an_undeclared_record() -> Bool:
+	undeclared: CoreExpr = ProductExpr(
+		product_build_in_declared_order([]),
+		InlineRecordType("Point"),
 		synthetic_core_source_loc(),
 	)
 
-	check_late_core_invariants(FinalStage, program_with_body(prepared_tuple)).is_empty()
+	match check_late_core_invariants(FinalStage, program_with_body(undeclared)):
+		[ProductWithoutRecordType(_)]:
+			True
+		_:
+			False
+
+
+-- `fixed record Point {x: Int, y: Int}`, stored inline.
+pure func inline_point_program(body: CoreExpr) -> CoreProgram:
+	program: CoreProgram = program_with_body(body)
+	point_decl: CoreDecl = InlineRecordDecl({
+		name = "Point",
+		fields = [
+			{ name = "x", ref = core_field_ref(1), typ = int_type() },
+			{ name = "y", ref = core_field_ref(2), typ = int_type() },
+		],
+		loc = synthetic_core_source_loc()
+	})
+
+	{ program | decls = [point_decl].concat(program.decls) }
+
+
+-- A build short of the record's fields would emit a C compound literal that
+-- silently zero-fills the missing member.
+pure func test_final_boundary_rejects_product_short_of_its_fields() -> Bool:
+	short: CoreExpr = ProductExpr(
+		product_build_in_declared_order([LiteralExpr(IntLiteral(1), int_type(), synthetic_core_source_loc())]),
+		InlineRecordType("Point"),
+		synthetic_core_source_loc(),
+	)
+
+	match check_late_core_invariants(FinalStage, inline_point_program(short)):
+		[ProductFieldCountMismatch(record_name, field_count, value_count, _)]:
+			record_name == "Point" and field_count == 2 and value_count == 1
+		_:
+			False
+
+
+pure func test_final_boundary_accepts_product_with_every_field() -> Bool:
+	complete: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			LiteralExpr(IntLiteral(1), int_type(), synthetic_core_source_loc()),
+			LiteralExpr(IntLiteral(2), int_type(), synthetic_core_source_loc()),
+		]),
+		InlineRecordType("Point"),
+		synthetic_core_source_loc(),
+	)
+
+	check_late_core_invariants(FinalStage, inline_point_program(complete)).is_empty()
+
+
+private pure func managed_point_program(body: CoreExpr) -> CoreProgram:
+	program: CoreProgram = program_with_body(body)
+	point_decl: CoreDecl = HeapRecordDecl({
+		name = "Point",
+		abi_type = None,
+		form = OrdinaryRecordForm,
+		type_params = [],
+		fields = [
+			{ name = "x", ref = core_field_ref(1), typ = int_type(), release_policy = NoReleasePolicy },
+			{ name = "y", ref = core_field_ref(2), typ = int_type(), release_policy = NoReleasePolicy },
+		],
+		loc = synthetic_core_source_loc()
+	})
+
+	{ program | decls = [point_decl].concat(program.decls) }
+
+
+pure func test_final_boundary_rejects_record_reuse_short_of_its_fields() -> Bool:
+	typ = HeapRecordType("Point")
+	short = RecordReuseExpr(
+		VarExpr(variable("old_point"), typ, synthetic_core_source_loc()),
+		product_build_in_declared_order([literal(1)]),
+		typ,
+		synthetic_core_source_loc(),
+	)
+
+	match check_late_core_invariants(FinalStage, managed_point_program(short)):
+		[ProductFieldCountMismatch(record_name, field_count, value_count, _)]:
+			record_name == "Point" and field_count == 2 and value_count == 1
+		_:
+			False
+
+
+pure func test_final_boundary_accepts_record_reuse_with_every_field() -> Bool:
+	typ = HeapRecordType("Point")
+	complete = RecordReuseExpr(
+		VarExpr(variable("old_point"), typ, synthetic_core_source_loc()),
+		product_build_in_declared_order([literal(1), literal(2)]),
+		typ,
+		synthetic_core_source_loc(),
+	)
+
+	check_late_core_invariants(FinalStage, managed_point_program(complete)).is_empty()
+
+
+pure func test_perceus_boundary_rejects_product_field_evaluation() -> Bool:
+	call = CallExpr(
+		IntrinsicCall("make_field"),
+		VarExpr(variable("make_field"), FunctionType(True, [], int_type()), synthetic_core_source_loc()),
+		[], int_type(), synthetic_core_source_loc(),
+	)
+	values: List[CoreExpr] = [
+		call,
+		IfExpr(LiteralExpr(BoolLiteral(True), NamedType("Bool", []), synthetic_core_source_loc()), literal(2), literal(3), int_type(), synthetic_core_source_loc()),
+		SeqExpr(literal(1), literal(2)),
+	]
+	values.all(func(value):
+		build = product_build_in_declared_order([value, literal(0)])
+		product = ProductExpr(build, InlineRecordType("Point"), synthetic_core_source_loc())
+		reuse = RecordReuseExpr(VarExpr(variable("old_point"), HeapRecordType("Point"), synthetic_core_source_loc()), build, HeapRecordType("Point"), synthetic_core_source_loc())
+		match check_late_core_invariants(PerceusStage, inline_point_program(product)):
+			[ProductFieldEvaluationSurvived(_)]:
+				match check_late_core_invariants(PerceusStage, managed_point_program(reuse)):
+					[ProductFieldEvaluationSurvived(_)]: True
+					_: False
+			_: False
+	)
+
+
+pure func test_perceus_boundary_rejects_evaluable_record_reuse_source() -> Bool:
+	typ = HeapRecordType("Point")
+	source = CallExpr(IntrinsicCall("make_point"), VarExpr(variable("make_point"), FunctionType(True, [], typ), synthetic_core_source_loc()), [], typ, synthetic_core_source_loc())
+	reuse = RecordReuseExpr(source, product_build_in_declared_order([literal(1), literal(2)]), typ, synthetic_core_source_loc())
+	match check_late_core_invariants(PerceusStage, managed_point_program(reuse)):
+		[ProductFieldEvaluationSurvived(_)]: True
+		_: False
+
+
+pure func test_perceus_boundary_accepts_named_product_ownership_wrappers() -> Bool:
+	field = variable("field")
+	value = DupExpr(field, int_type(), NoRetainPolicy, VarExpr(field, int_type(), synthetic_core_source_loc()), int_type(), synthetic_core_source_loc())
+	projection = ProductFieldExpr(VarExpr(variable("old_point"), HeapRecordType("Point"), synthetic_core_source_loc()), core_field_ordinal(1), int_type(), synthetic_core_source_loc())
+	product = ProductExpr(product_build_in_declared_order([value, projection]), InlineRecordType("Point"), synthetic_core_source_loc())
+	check_late_core_invariants(PerceusStage, inline_point_program(product)).is_empty()
+
+
+pure func test_final_boundary_accepts_prepared_tuple() -> Bool:
+	tuple_type = TupleType([int_type(), int_type()])
+	source = program_with_body(TupleExpr([literal(1), literal(2)], tuple_type, synthetic_core_source_loc()))
+	match source.decls:
+		[FunctionDecl(function)]:
+			typed_source = { source | decls = [FunctionDecl({ function | return_type = tuple_type })] }
+			match lower_tuple_storage_program(typed_source):
+				Ok(mapped_source):
+					check_late_core_invariants(FinalStage, mapped_source).is_empty()
+				Err(_):
+					False
+		_:
+			False
 
 
 pure func intrinsic_call(name: String) -> CoreExpr:
@@ -868,6 +1022,7 @@ private pure func checkpoint_loop_variants(iterable: CoreExpr, body: CoreExpr) -
 			binder = binder, iterable = iterable, iterable_release_policy = NoReleasePolicy, body = body
 		}, VoidType, loc),
 		ForDictExpr({
+			iteration_mode = CoreDictIterationKeys,
 			binder = binder, iterable = iterable, iterable_release_policy = NoReleasePolicy, body = body
 		}, VoidType, loc),
 		ForSetExpr({
@@ -1295,7 +1450,24 @@ tests: TestSuite = {
 		("final boundary rejects raw tuple", test_final_boundary_rejects_raw_tuple),
 		("final boundary rejects raw vector", test_final_boundary_rejects_raw_vector),
 		("final boundary rejects raw dictionary", test_final_boundary_rejects_raw_dict),
-		("final boundary rejects raw record", test_final_boundary_rejects_raw_record),
+		(
+			"final boundary rejects product without record type",
+			test_final_boundary_rejects_product_without_record_type,
+		),
+		(
+			"final boundary rejects product of an undeclared record",
+			test_final_boundary_rejects_product_of_an_undeclared_record,
+		),
+		(
+			"final boundary rejects product short of its fields",
+			test_final_boundary_rejects_product_short_of_its_fields,
+		),
+		("Perceus boundary rejects product field evaluation", test_perceus_boundary_rejects_product_field_evaluation),
+		("Perceus boundary rejects evaluable reuse source", test_perceus_boundary_rejects_evaluable_record_reuse_source),
+		("Perceus boundary accepts named product ownership wrappers", test_perceus_boundary_accepts_named_product_ownership_wrappers),
+		("final boundary accepts product with every field", test_final_boundary_accepts_product_with_every_field),
+		("final boundary rejects record reuse short of its fields", test_final_boundary_rejects_record_reuse_short_of_its_fields),
+		("final boundary accepts record reuse with every field", test_final_boundary_accepts_record_reuse_with_every_field),
 		("final boundary accepts prepared tuple", test_final_boundary_accepts_prepared_tuple),
 		(
 			"final boundary rejects missing ownership contract",

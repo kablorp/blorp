@@ -1,0 +1,428 @@
+-- Recover the binder supply when a Core snapshot crosses a replay boundary.
+-- Serialized Core currently loses binder-origin variants, so the documented
+-- counter-minted id band is the authority. Inspect both bindings and uses,
+-- including ids held in metadata rather than ordinary expression children.
+import:
+	ir:
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl, TraitDecl),
+		CoreExpr(
+			LiteralExpr, StaticStringLiteralExpr, VarExpr, VoidExpr,
+			DebugBlockExpr, CooperativeCheckpointExpr, CallExpr, BinaryExpr,
+			UnaryExpr, LogicalExpr, AssignExpr, CastExpr,
+			BoxExpr, UnboxExpr, ProductFieldExpr, ModuleMemberExpr,
+			TupleExpr, VectorExpr, LambdaExpr,
+			ClosureCreateExpr, ListConstructExpr, ListAllocExpr, ListGetExpr,
+			ListHandoffExpr, ListHandoffSetOwnedExpr, ListHandoffSetSourceSlotExpr, StringByteReadExpr,
+			StringByteWriteExpr, StringByteCopyExpr, StringSetLenExpr, TensorLiteralExpr,
+			TensorBoxedLiteralExpr, TensorPackedLiteralExpr, TensorRawFillExpr, TensorRawReadExpr,
+			TensorRawWriteExpr, TensorRawViewLetExpr, DictExpr, DictConstructExpr,
+			SetAllocExpr, ListRetainExpr, ListSetExpr, ListSwapExpr,
+			ProductExpr, RecordUpdateExpr, RecordReuseExpr, RecordCowUpdateExpr,
+			UnionConstructExpr, UnionReuseConstructExpr, DetachExpr, DupExpr,
+			DropExpr, LetExpr, BorrowLetExpr, SeqExpr,
+			WhileExpr, BreakExpr, ContinueExpr, ResourceScopeExpr,
+			ResourceCleanupExitExpr, TailrecLoopExpr, TailrecRecurExpr, TailrecListSpreadLoopExpr,
+			TailrecListSpreadRecurExpr, ForRangeExpr, ForChannelExpr, ForListExpr,
+			ForStringExpr, ForDictExpr, ForSetExpr, ForStreamExpr,
+			ForResourceSourceExpr, ForTensorExpr, PreClosureConcurrentlyLoopExpr, ConcurrentlyLoopExpr,
+			PreClosureConcurrentExpr, ConcurrentExpr, PreClosureDetachExpr, SelectExpr,
+			RawMatchExpr, SemanticMatchExpr, LiteralMatchExpr, AccessorLiteralMatchExpr,
+			LengthMatchExpr, ConstructorMatchExpr, IfExpr,
+		),
+		CoreConstructorLengthMatch,
+		CoreConstructorMatchBody(ConstructorMatchBodyExpr, ConstructorMatchBodyLength, ConstructorMatchBodyLiteral),
+		CoreConstructorMatchFallback(ConstructorMatchFallbackBindings),
+		CoreConstructorLiteralMatch,
+		CoreFunction,
+		CoreFunctionKind(ClosureBodyFunction),
+		CoreLiteralMatchFallback(LiteralMatchFallbackBindings),
+		CorePattern(NamePattern, ConstructorPattern, QualifiedConstructorPattern, TuplePattern, ListPattern, OrPattern),
+		CoreProgram,
+		CoreRetainPolicy(CowFieldTakeRetainPolicy),
+		CoreSelectArmKind(SelectRecvArm),
+		CoreSemanticMatchTree(SemanticMatchLeaf, SemanticConstructorMatch, SemanticLiteralMatch, SemanticLengthMatch, SemanticMatchFail),
+		FIRST_MINTED_BINDER_ID,
+		MINTED_BINDER_ID_FLOOR,
+		core_program_expr_roots,
+	traverse: immediate_core_expr_children
+
+
+private pure func pattern_ids(root: CorePattern) -> List[Int]:
+	var pending: List[CorePattern] = [root]
+	var ids: List[Int] = []
+	var cursor: Int = 0
+
+	while cursor < pending.length():
+		pattern = pending.get_or(cursor, root)
+		match pattern:
+			NamePattern(variable):
+				ids = ids.append(variable.id)
+			ConstructorPattern(_, children):
+				pending = pending.concat(children)
+			QualifiedConstructorPattern(_, _, children):
+				pending = pending.concat(children)
+			TuplePattern(children):
+				pending = pending.concat(children)
+			ListPattern(children, spread):
+				pending = pending.concat(children)
+				match spread:
+					Some(child):
+						pending = pending.append(child)
+					None:
+						void
+			OrPattern(children):
+				pending = pending.concat(children)
+			_:
+				void
+		cursor += 1
+
+	ids
+
+
+private pure func semantic_match_ids(root: CoreSemanticMatchTree) -> List[Int]:
+	var pending: List[CoreSemanticMatchTree] = [root]
+	var ids: List[Int] = []
+	var cursor: Int = 0
+
+	while cursor < pending.length():
+		tree = pending.get_or(cursor, root)
+		match tree:
+			SemanticMatchLeaf(bindings, _):
+				ids = ids.concat(bindings.map(func(binding): binding.variable.id))
+			SemanticConstructorMatch(_, cases, fallback):
+				pending = pending.concat(cases.map(func(item): item.body))
+				match fallback:
+					Some(body):
+						pending = pending.append(body)
+					None:
+						void
+			SemanticLiteralMatch(_, cases, fallback):
+				pending = pending.concat(cases.map(func(item): item.body)).append(fallback)
+			SemanticLengthMatch(_, cases, geq, fallback):
+				pending = pending.concat(cases.map(func(item): item.body))
+				match geq:
+					Some(item):
+						pending = pending.append(item.body)
+					None:
+						void
+				match fallback:
+					Some(body):
+						pending = pending.append(body)
+					None:
+						void
+			SemanticMatchFail:
+				void
+		cursor += 1
+
+	ids
+
+
+private pure func literal_match_ids(match_expr: CoreConstructorLiteralMatch) -> List[Int]:
+	var ids: List[Int] = []
+	for item in match_expr.cases:
+		ids = ids.concat(item.bindings.map(func(binding): binding.variable.id))
+	match match_expr.fallback:
+		LiteralMatchFallbackBindings(bindings, _):
+			ids = ids.concat(bindings.map(func(binding): binding.variable.id))
+		_:
+			void
+	ids
+
+
+private pure func constructor_body_ids(body: CoreConstructorMatchBody) -> List[Int]:
+	match body:
+		ConstructorMatchBodyExpr(_):
+			[]
+		ConstructorMatchBodyLiteral(match_expr):
+			literal_match_ids(match_expr)
+		ConstructorMatchBodyLength(match_expr):
+			length_match_ids(match_expr)
+
+
+private pure func length_match_ids(match_expr: CoreConstructorLengthMatch) -> List[Int]:
+	var ids: List[Int] = []
+	for item in match_expr.cases:
+		ids = ids.concat(item.branch.bindings.map(func(binding): binding.variable.id))
+		ids = ids.concat(constructor_body_ids(item.branch.body))
+	match match_expr.geq:
+		Some(item):
+			ids = ids.concat(item.branch.bindings.map(func(binding): binding.variable.id))
+			ids = ids.concat(constructor_body_ids(item.branch.body))
+		None:
+			void
+	match match_expr.fallback:
+		Some(branch):
+			ids = ids.concat(branch.bindings.map(func(binding): binding.variable.id))
+			ids = ids.concat(constructor_body_ids(branch.body))
+		None:
+			void
+	ids
+
+
+-- These are precisely the id-bearing expression payloads in ir.brp. All
+-- ordinary nested CoreExpr values are visited separately by the child walk.
+private pure func expression_metadata_ids(expr: CoreExpr) -> List[Int]:
+	match expr:
+		VarExpr(variable, _, _):
+			[variable.id]
+		AssignExpr(variable, _, _, _):
+			[variable.id]
+		LetExpr(variable, _, _, _, _):
+			[variable.id]
+		BorrowLetExpr(variable, _, _, _):
+			[variable.id]
+		DropExpr(variable, _, _, _, _, _):
+			[variable.id]
+		DupExpr(variable, _, policy, _, _, _):
+			match policy:
+				CowFieldTakeRetainPolicy(source, _, _):
+					[variable.id, source.id]
+				_:
+					[variable.id]
+		LambdaExpr(params, _, _, _, _, _):
+			params.map(func(param): param.name.id)
+		ClosureCreateExpr(closure, _, _):
+			closure.captures.map(func(capture): capture.id)
+		DetachExpr(task, _, _):
+			task.captures.map(func(capture): capture.id)
+		ForRangeExpr(binder, _, _, _, _, _):
+			[binder.variable.id]
+		ForChannelExpr(loop, _, _):
+			[loop.binder.variable.id]
+		ForListExpr(loop, _, _):
+			[loop.binder.variable.id]
+		ForStringExpr(loop, _, _):
+			[loop.binder.variable.id]
+		ForDictExpr(loop, _, _):
+			[loop.binder.variable.id]
+		ForSetExpr(loop, _, _):
+			[loop.binder.variable.id]
+		ForStreamExpr(loop, _, _):
+			[loop.binder.variable.id]
+		ForResourceSourceExpr(loop, _, _):
+			[loop.binder.variable.id]
+		ForTensorExpr(loop, _, _):
+			[loop.binder.variable.id]
+		ResourceScopeExpr(scope, _, _):
+			[scope.variable.id]
+		TensorRawViewLetExpr(binding, _, _, _):
+			[binding.variable.id]
+		TensorRawReadExpr(read, _, _):
+			[read.view.id]
+		TensorRawWriteExpr(write, _, _):
+			[write.view.id]
+		ListHandoffExpr(handoff, _, _):
+			[handoff.source_var.id, handoff.result_var.id, handoff.len_var.id, handoff.out_var.id]
+		TailrecLoopExpr(params, _, _, _):
+			params.map(func(param): param.name.id)
+		TailrecListSpreadLoopExpr(loop, _):
+			loop.params.map(func(param): param.name.id).concat([loop.list_param.name.id, loop.cursor.id])
+		PreClosureConcurrentlyLoopExpr(loop, _, _):
+			[loop.variable.id]
+		ConcurrentlyLoopExpr(loop, _, _):
+			[loop.variable.id].concat(loop.task.captures.map(func(capture): capture.id))
+		PreClosureConcurrentExpr(block, _, _):
+			block.bindings.map(func(binding): binding.variable.id)
+		ConcurrentExpr(block, _, _):
+			var ids: List[Int] = []
+			for binding in block.bindings:
+				ids = ids.append(binding.variable.id).concat(binding.task.captures.map(func(capture): capture.id))
+			ids
+		SelectExpr(arms, _, _):
+			var ids: List[Int] = []
+			for arm in arms:
+				match arm.kind:
+					SelectRecvArm(recv):
+						ids = ids.append(recv.binder.id)
+					_:
+						void
+			ids
+		RawMatchExpr(_, cases, _, _):
+			var ids: List[Int] = []
+			for item in cases:
+				ids = ids.concat(pattern_ids(item.pattern))
+			ids
+		SemanticMatchExpr(_, tree, _, _):
+			semantic_match_ids(tree)
+		LiteralMatchExpr(_, cases, fallback, _, _):
+			var ids: List[Int] = []
+			for item in cases:
+				ids = ids.concat(item.bindings.map(func(binding): binding.variable.id))
+			match fallback:
+				LiteralMatchFallbackBindings(bindings, _):
+					ids = ids.concat(bindings.map(func(binding): binding.variable.id))
+				_:
+					void
+			ids
+		AccessorLiteralMatchExpr(_, _, match_expr, _, _):
+			literal_match_ids(match_expr)
+		LengthMatchExpr(_, _, match_expr, _, _):
+			length_match_ids(match_expr)
+		ConstructorMatchExpr(_, _, cases, fallback, _, _):
+			var ids: List[Int] = []
+			for item in cases:
+				ids = ids.concat(item.bindings.map(func(binding): binding.variable.id)).concat(constructor_body_ids(item.body))
+			match fallback:
+				ConstructorMatchFallbackBindings(bindings, _):
+					ids = ids.concat(bindings.map(func(binding): binding.variable.id))
+				_:
+					void
+			ids
+		LiteralExpr(_, _, _):
+			[]
+		StaticStringLiteralExpr(_, _, _, _):
+			[]
+		VoidExpr(_, _):
+			[]
+		DebugBlockExpr(_, _, _):
+			[]
+		CooperativeCheckpointExpr(_, _):
+			[]
+		CallExpr(_, _, _, _, _):
+			[]
+		BinaryExpr(_, _, _, _, _):
+			[]
+		UnaryExpr(_, _, _, _):
+			[]
+		LogicalExpr(_, _, _, _, _):
+			[]
+		CastExpr(_, _, _):
+			[]
+		BoxExpr(_, _, _):
+			[]
+		UnboxExpr(_, _, _, _):
+			[]
+		ProductFieldExpr(_, _, _, _):
+			[]
+		ModuleMemberExpr(_, _, _, _):
+			[]
+		TupleExpr(_, _, _):
+			[]
+		VectorExpr(_, _, _):
+			[]
+		ListConstructExpr(_, _, _):
+			[]
+		ListAllocExpr(_, _, _):
+			[]
+		ListGetExpr(_, _, _):
+			[]
+		ListHandoffSetOwnedExpr(_, _, _):
+			[]
+		ListHandoffSetSourceSlotExpr(_, _, _):
+			[]
+		StringByteReadExpr(_, _, _):
+			[]
+		StringByteWriteExpr(_, _, _):
+			[]
+		StringByteCopyExpr(_, _, _):
+			[]
+		StringSetLenExpr(_, _, _):
+			[]
+		TensorLiteralExpr(_, _, _):
+			[]
+		TensorBoxedLiteralExpr(_, _, _):
+			[]
+		TensorPackedLiteralExpr(_, _, _):
+			[]
+		TensorRawFillExpr(_, _, _):
+			[]
+		DictExpr(_, _, _):
+			[]
+		DictConstructExpr(_, _, _):
+			[]
+		SetAllocExpr(_, _, _):
+			[]
+		ListRetainExpr(_, _, _):
+			[]
+		ListSetExpr(_, _, _):
+			[]
+		ListSwapExpr(_, _, _):
+			[]
+		ProductExpr(_, _, _):
+			[]
+		RecordUpdateExpr(_, _, _, _):
+			[]
+		RecordReuseExpr(_, _, _, _):
+			[]
+		RecordCowUpdateExpr(_, _, _, _):
+			[]
+		UnionConstructExpr(_, _, _):
+			[]
+		UnionReuseConstructExpr(_, _, _):
+			[]
+		SeqExpr(_, _):
+			[]
+		WhileExpr(_, _, _, _):
+			[]
+		BreakExpr(_, _):
+			[]
+		ContinueExpr(_, _):
+			[]
+		ResourceCleanupExitExpr(_, _, _):
+			[]
+		TailrecRecurExpr(_, _, _):
+			[]
+		TailrecListSpreadRecurExpr(_, _, _, _):
+			[]
+		PreClosureDetachExpr(_, _, _):
+			[]
+		IfExpr(_, _, _, _, _):
+			[]
+
+
+private pure func reserve_existing_id(frontier: Int, id: Int) -> Int:
+	if id < 0 and id > MINTED_BINDER_ID_FLOOR and id <= frontier:
+		id - 1
+	else:
+		frontier
+
+
+private pure func function_parameter_ids(function: CoreFunction) -> List[Int]:
+	ids = function.params.map(func(param): param.name.id)
+	match function.function_kind:
+		ClosureBodyFunction(abi):
+			ids.concat(abi.params.map(func(param): param.name.id)).concat(abi.captures.map(func(capture): capture.id))
+		_:
+			ids
+
+
+---
+The first free descending id below every counter-minted id present in this
+program, or the reserved floor if the supply has been exhausted. The replay
+state constructor checks that floor before admitting a new pass state.
+---
+pure func replay_binder_frontier(program: CoreProgram) -> Int:
+	var frontier: Int = FIRST_MINTED_BINDER_ID
+	for decl in program.decls:
+		ids: List[Int] = match decl:
+			FunctionDecl(function):
+				function_parameter_ids(function)
+			GlobalDecl(global):
+				[global.name.id]
+			ImplDecl(implementation):
+				var method_ids: List[Int] = []
+				for method in implementation.methods:
+					method_ids = method_ids.concat(function_parameter_ids(method))
+				method_ids
+			TraitDecl(trait_decl):
+				var parameter_ids: List[Int] = []
+				for method in trait_decl.methods:
+					parameter_ids = parameter_ids.concat(method.params.map(func(param): param.name.id))
+				parameter_ids
+			_:
+				[]
+		for id in ids:
+			frontier = reserve_existing_id(frontier, id)
+
+	var pending: List[CoreExpr] = core_program_expr_roots(program)
+	var cursor: Int = 0
+	while cursor < pending.length():
+		match pending.get(cursor):
+			Some(expr):
+				for id in expression_metadata_ids(expr):
+					frontier = reserve_existing_id(frontier, id)
+				pending = pending.concat(immediate_core_expr_children(expr))
+			None:
+				void
+		cursor += 1
+	frontier

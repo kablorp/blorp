@@ -10,10 +10,17 @@ import:
 			CallAllocationOperation, ScalarAllocationOperation, UnsupportedAllocationOperation,
 		),
 		AllocationRiskReason(
-			ClosureEnvironmentAllocation, CleanupScratchAllocation, CowFallbackAllocation,
-			ForeignCallBoundary, HeapBoxAllocation, ManagedObjectAllocation, MissingFunctionBody,
-			RawBufferAllocation, RuntimeCallbackBoundary, RuntimeOperationAllocation,
-			TupleStorageAllocation, UnknownCallTarget,
+			ClosureEnvironmentAllocation,
+			CleanupScratchAllocation,
+			CowFallbackAllocation,
+			ForeignCallBoundary,
+			HeapBoxAllocation,
+			ManagedObjectAllocation,
+			MissingFunctionBody,
+			RawBufferAllocation,
+			RuntimeCallbackBoundary,
+			RuntimeOperationAllocation,
+			UnknownCallTarget,
 		),
 		CoreAllocationContract,
 		CoreLocalAllocationFacts,
@@ -45,12 +52,31 @@ import:
 		CoreClosureCapture,
 		CoreDirectRuntimeArgs(DirectRuntimeArgsAsWritten),
 		CoreDirectRuntimeResult(DirectRuntimeResultAsWritten),
+		CoreDictIterationMode(CoreDictIterationKeys, CoreDictIterationEntries),
 		CoreExpr(
-			AccessorLiteralMatchExpr, CallExpr, ClosureCreateExpr, CooperativeCheckpointExpr,
-			DebugBlockExpr, DropExpr, DictConstructExpr, ForChannelExpr, ForDictExpr, ForListExpr,
-			ForResourceSourceExpr, ForSetExpr, ForStreamExpr, ForStringExpr, ForTensorExpr,
-			ListGetExpr, ListConstructExpr, LiteralExpr, RecordConstructExpr, RecordReuseExpr,
-			SelectExpr, TensorBoxedLiteralExpr, TupleConstructExpr, UnionConstructExpr,
+			AccessorLiteralMatchExpr,
+			CallExpr,
+			ClosureCreateExpr,
+			CooperativeCheckpointExpr,
+			DebugBlockExpr,
+			DropExpr,
+			DictConstructExpr,
+			ForChannelExpr,
+			ForDictExpr,
+			ForListExpr,
+			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
+			ForTensorExpr,
+			ListGetExpr,
+			ListConstructExpr,
+			LiteralExpr,
+			ProductExpr,
+			RecordReuseExpr,
+			SelectExpr,
+			TensorBoxedLiteralExpr,
+			UnionConstructExpr,
 			UnionReuseConstructExpr,
 		),
 		CoreForeignArgPassing(ForeignDefaultArgs),
@@ -71,10 +97,11 @@ import:
 		),
 		CoreSelectArmKind(SelectRecvArm),
 		CoreSourceLoc,
+		product_build_in_declared_order,
+		synthetic_core_source_loc,
 		CoreTensorForElementStorage(TensorForRawScalarElement, TensorForRowSliceElement),
 		CoreTensorLiteralShape(TensorVectorLength),
 		CoreTensorRawScalarKind(TensorInt64Elements),
-		CoreTupleElement(TuplePrimElement, TupleStackResultElement, TupleStructElement),
 		CoreType(HeapRecordType, NamedType, StackResultType, TupleType, UnionType),
 		CoreUnionDecl,
 		CoreUnionField,
@@ -87,7 +114,6 @@ import:
 		CoreUnionVariant,
 		OPTION_INLINE_TAGGED_EMPTY_ENCODING,
 		OPTION_INLINE_TAGGED_PAYLOAD_ENCODING,
-		synthetic_core_source_loc,
 	test: TestSuite
 
 
@@ -378,9 +404,13 @@ private pure func test_expr_coverage_is_separate_from_semantic_facts() -> Bool:
 	)
 
 
-private pure func dict_loop(binder_type: CoreType) -> CoreExpr:
+private pure func dict_loop(
+	mode: CoreDictIterationMode,
+	binder_type: CoreType,
+) -> CoreExpr:
 	ForDictExpr(
 		{
+			iteration_mode = mode,
 			binder = {
 				variable = {
 					name = "item",
@@ -405,15 +435,15 @@ private pure func dict_loop(binder_type: CoreType) -> CoreExpr:
 
 private pure func test_dict_iteration_distinguishes_pair_binders() -> Bool:
 	key_only: CoreAllocationContract = core_expr_allocation_contract(
-		dict_loop(NamedType("String", [])),
+		dict_loop(CoreDictIterationKeys, NamedType("String", [])),
 	)
 	pair: CoreAllocationContract = core_expr_allocation_contract(
-		dict_loop(TupleType([NamedType("String", []), NamedType("Int", [])])),
+		dict_loop(CoreDictIterationEntries, TupleType([NamedType("String", []), NamedType("Int", [])])),
 	)
 
 	(
 		allocation_facts_are_free(key_only.facts)
-		and pair.facts.may_allocate == [TupleStorageAllocation]
+		and pair.facts.may_allocate == [ManagedObjectAllocation]
 		and pair.facts.unknown.is_empty()
 	)
 
@@ -475,9 +505,8 @@ private pure func test_closure_creation_distinguishes_capture_environments() -> 
 
 private pure func test_record_construction_uses_managed_allocation() -> Bool:
 	heap_record: CoreAllocationContract = core_expr_allocation_contract(
-		RecordConstructExpr(
-			"Node",
-			[],
+		ProductExpr(
+			product_build_in_declared_order([]),
 			HeapRecordType("Node"),
 			synthetic_core_source_loc(),
 		),
@@ -674,50 +703,28 @@ private pure func test_union_box_facts_follow_payload_emission() -> Bool:
 	)
 
 
-private pure func tuple_construct(struct_element: Bool) -> CoreExpr:
-	elements: List[CoreTupleElement] = if struct_element:
-		[TupleStructElement(stack_option_value(), "blorp_StackOption_Int")]
-	else:
-		[TuplePrimElement(int_literal(1))]
-
-	element_type: CoreType = if struct_element:
-		NamedType("Option", [NamedType("Int", [])])
-	else:
-		NamedType("Int", [])
-
-	TupleConstructExpr(
-		{
-			elements = elements,
-			release_mask = 0,
-			retain_mask = 0
-		},
-		TupleType([element_type]),
+-- Typed products allocate only their managed row. Inline aggregates and
+-- StackResult fields use their declared C storage without erased-slot boxes.
+private pure func test_typed_product_fields_do_not_add_slot_boxes() -> Bool:
+	primitive: CoreExpr = ProductExpr(
+		product_build_in_declared_order([int_literal(1), int_literal(2)]),
+		HeapRecordType("PrimitivePair"),
+		synthetic_core_source_loc(),
+	)
+	structure: CoreExpr = ProductExpr(
+		product_build_in_declared_order([stack_option_value(), int_literal(2)]),
+		HeapRecordType("InlinePair"),
+		synthetic_core_source_loc(),
+	)
+	stack_result: CoreExpr = ProductExpr(
+		product_build_in_declared_order([int_literal(1), int_literal(2)]),
+		HeapRecordType("ResultPair"),
 		synthetic_core_source_loc(),
 	)
 
-
-private pure func test_tuple_construction_preserves_storage_and_implicit_box_facts() -> Bool:
-	primitive: CoreAllocationContract = core_expr_allocation_contract(tuple_construct(False))
-	structure: CoreAllocationContract = core_expr_allocation_contract(tuple_construct(True))
-	stack_result: CoreAllocationContract = core_expr_allocation_contract(
-		TupleConstructExpr(
-			{
-				elements = [TupleStackResultElement(int_literal(1))],
-				release_mask = 0,
-				retain_mask = 0
-			},
-			TupleType([NamedType("Result", [])]),
-			synthetic_core_source_loc(),
-		),
-	)
-
-	(
-		primitive.facts.may_allocate == [TupleStorageAllocation]
-		and primitive.facts.unknown.is_empty()
-		and structure.facts.may_allocate == [TupleStorageAllocation, HeapBoxAllocation]
-		and structure.facts.unknown.is_empty()
-		and stack_result.facts.may_allocate == [TupleStorageAllocation, HeapBoxAllocation]
-		and stack_result.facts.unknown.is_empty()
+	[primitive, structure, stack_result].all(func(expr):
+		contract = core_expr_allocation_contract(expr)
+		contract.facts.may_allocate == [ManagedObjectAllocation] and contract.facts.unknown.is_empty()
 	)
 
 
@@ -1132,7 +1139,7 @@ private pure func test_capture_and_reuse_contracts_preserve_hidden_causes() -> B
 	record_reuse: CoreAllocationContract = core_expr_allocation_contract(
 		RecordReuseExpr(
 			int_literal(0),
-			[],
+			product_build_in_declared_order([]),
 			HeapRecordType("Node"),
 			synthetic_core_source_loc(),
 		),
@@ -1274,7 +1281,7 @@ private pure func test_closed_runtime_catalog_distinguishes_safe_and_allocating(
 private pure func test_fact_merging_is_stable_and_deduplicated() -> Bool:
 	merged: CoreLocalAllocationFacts = merge_allocation_facts(
 		{
-			may_allocate = [TupleStorageAllocation, HeapBoxAllocation],
+			may_allocate = [RawBufferAllocation, HeapBoxAllocation],
 			unknown = [RuntimeOperationAllocation]
 		},
 		{
@@ -1284,7 +1291,7 @@ private pure func test_fact_merging_is_stable_and_deduplicated() -> Bool:
 	)
 
 	(
-		merged.may_allocate == [TupleStorageAllocation, HeapBoxAllocation, ManagedObjectAllocation]
+		merged.may_allocate == [RawBufferAllocation, HeapBoxAllocation, ManagedObjectAllocation]
 		and merged.unknown == [RuntimeOperationAllocation, ForeignCallBoundary]
 	)
 
@@ -1427,6 +1434,7 @@ private pure func test_all_loop_site_details_use_their_own_iterable_field() -> B
 		),
 		ForDictExpr(
 			{
+			iteration_mode = CoreDictIterationKeys,
 				binder = loop_binder(),
 				iterable = iterable,
 				iterable_release_policy = NoReleasePolicy,
@@ -1514,8 +1522,8 @@ tests: TestSuite = {
 		("stack union elides implicit boxes", test_stack_union_elides_implicit_boxes),
 		("union box facts follow payload emission", test_union_box_facts_follow_payload_emission),
 		(
-			"tuple construction preserves storage and implicit box facts",
-			test_tuple_construction_preserves_storage_and_implicit_box_facts,
+			"typed product fields avoid erased-slot boxes",
+			test_typed_product_fields_do_not_add_slot_boxes,
 		),
 		(
 			"drop policies publish exact cleanup dependencies",

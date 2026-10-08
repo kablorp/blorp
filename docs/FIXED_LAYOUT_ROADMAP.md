@@ -85,7 +85,7 @@ Positions:
 | --- | --- | --- |
 | locals, parameters, results, field reads, updates, nested fields, match | by value | done |
 | field of a managed record, `List` element, `Option` payload (stack Option), element of a local (flattened) tuple, closure environment, tensor element | inline | done |
-| element of a tuple stored in a heap value (a `List[(Point, Int)]` element, a field) | one struct box per element: a list of 3 such tuples makes 7 allocations | open: product unification gives heap tuples typed element storage |
+| element of a tuple stored in a heap value (a `List[(Point, Int)]` element, a field) | inline inside the managed tuple row; a list of 3 such tuples makes 4 allocations, matching equivalent managed records | implemented: shared typed tuple storage; cost review and final gates pass |
 | closure call argument and result | one struct box each: every call through a closure value makes 2 allocations for an inline argument and result | open: a typed closure ABI that passes structs by value |
 | erased union payload | one struct box per payload | open: typed union payload storage |
 | stack `Result` payload | one struct box | open: typed `Result` payload storage |

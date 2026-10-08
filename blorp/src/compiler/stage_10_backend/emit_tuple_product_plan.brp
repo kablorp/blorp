@@ -1,0 +1,495 @@
+-- Plan native factories from accepted, physically represented expression roots.
+-- The emitter supplies only declarations it will emit. Registered row identity
+-- selects storage; projected constructor symbols supply callback spelling only.
+import:
+	../stage_09_core/c_type_layout: nullable_managed_option_payload_type
+	../stage_09_core/ir:
+		CoreCallKind(BuiltinCall, DirectRuntimeCall, OperationResultCall),
+		CoreDictIterationMode(CoreDictIterationEntries),
+		CoreExpr(CallExpr, ForDictExpr),
+		CoreTupleStorageCatalog,
+		CoreTupleStorageFault,
+		CoreType(BoxedResultType, FunctionType, NamedType, StackResultType, TensorType),
+		core_expr_type,
+		core_generated_tuple_record_elements,
+		core_tuple_storage_fault_message,
+		core_type_equal,
+		generated_tuple_record_for_type,
+		tuple_storage_type,
+	../stage_09_core/traverse: immediate_core_expr_children
+	../stage_09_core/type_policy: core_scalar_int_value_type, is_core_stream_type_name
+	emit_tuple_product_adapters:
+		CNativeProductAdapterFault,
+		CNativeProductFactoryKind(
+			DictionaryEntryProductFactory, EnumeratedProductFactory, VectorPairProductFactory,
+			ProcessSuccessProductFactory, ProcessErrorProductFactory, ProcessOutputProductFactory,
+		),
+		CNativeProductFactoryRequest,
+		CNativeUnfoldProductRequest,
+		CRuntimeProductAdapterOps,
+		CUnfoldProductResultRepresentation(NullableUnfoldProductResult, BoxedUnfoldProductResult),
+		emit_native_product_factory,
+		emit_native_process_options_snapshot,
+		emit_native_process_session_snapshot,
+		emit_native_unfold_product_adapter
+
+
+union CNativeProductPlanFault:
+	NativeProductCallShapeMismatch(String)
+	NativeProductPlanRowFailure(CoreTupleStorageFault)
+	NativeProductPlanRenderingFailure(CNativeProductAdapterFault)
+	NativeProductFactoryNotPlanned(CoreType)
+	NativeUnfoldProductNotPlanned(CoreType)
+	NativeProductCallbackSymbolsMissing(CoreType)
+	NativeProductCanonicalRowUnavailable(CoreType)
+
+
+pure func native_product_plan_fault_message(fault: CNativeProductPlanFault) -> String:
+	match fault:
+		NativeProductCallShapeMismatch(name):
+			"native call `${name}` requires its accepted argument and registered product result types; prepare the concrete tuple storage before C emission"
+		NativeProductPlanRowFailure(problem):
+			core_tuple_storage_fault_message(problem)
+		NativeProductPlanRenderingFailure(_):
+			"native product adapter violates the selected layout; use the registered row's typed field codecs and ownership policies"
+		NativeProductFactoryNotPlanned(_):
+			"native product factory is missing; include the emitted call or dictionary entry loop when preparing adapters"
+		NativeUnfoldProductNotPlanned(_):
+			"native unfold adapter is missing; prepare its concrete step result before emitting the stream call"
+		NativeProductCallbackSymbolsMissing(_):
+			"native product callback has no projected constructor symbol; register its row with the shared record emitter"
+		NativeProductCanonicalRowUnavailable(_):
+			"native product alias has no registered concrete storage row; resolve accepted aliases and prepare tuple storage before C emission"
+
+
+private record CNativeProductAdapterPlanRows {
+	factories: List[CNativeProductFactoryRequest],
+	unfolds: List[CNativeUnfoldProductRequest],
+	fragments: List[String]
+}
+
+
+opaque type CNativeProductAdapterPlan = CNativeProductAdapterPlanRows
+
+
+pure func native_product_adapter_declarations(plan: CNativeProductAdapterPlan) -> String:
+	from_opaque CNativeProductAdapterPlan(plan).fragments.join("")
+
+
+-- Lookup uses the same canonical physical row as adapter issuance. Resolve an
+-- accepted alias through the emitter layout authority before calling this API.
+pure func native_product_factory_callback(
+	plan: CNativeProductAdapterPlan,
+	kind: CNativeProductFactoryKind,
+	result_type: CoreType,
+) -> Result[String, CNativeProductPlanFault]:
+	match from_opaque CNativeProductAdapterPlan(plan).factories.find(
+		func(request): request.kind == kind and core_type_equal(request.result_type, result_type)
+	):
+		Some(request): Ok(request.callback_name)
+		None: Err(NativeProductFactoryNotPlanned(result_type))
+
+
+pure func native_unfold_product_callback(
+	plan: CNativeProductAdapterPlan,
+	pair_type: CoreType,
+	representation: CUnfoldProductResultRepresentation,
+) -> Result[String, CNativeProductPlanFault]:
+	match from_opaque CNativeProductAdapterPlan(plan).unfolds.find(
+		func(request): request.result_representation == representation and core_type_equal(request.pair_type, pair_type)
+	):
+		Some(request): Ok(request.callback_name)
+		None: Err(NativeUnfoldProductNotPlanned(pair_type))
+
+
+private pure func factory_suffix(kind: CNativeProductFactoryKind) -> String:
+	match kind:
+		DictionaryEntryProductFactory: "_native_dict_entry"
+		EnumeratedProductFactory: "_native_enumeration"
+		VectorPairProductFactory: "_native_vector_pair"
+		ProcessSuccessProductFactory: "_native_process_success"
+		ProcessErrorProductFactory: "_native_process_error"
+		ProcessOutputProductFactory: "_native_process_output"
+
+
+-- Accepted aliases may keep their source identity in a native result type.
+-- The layout authority resolves them; the catalog issues the physical identity
+-- used for both deduplication and callback lookup. Spelling is never identity.
+private pure func canonical_product_type(
+	catalog: CoreTupleStorageCatalog,
+	typ: CoreType,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[CoreType, CNativeProductPlanFault]:
+	resolved ?= match ops.resolve_product_type(typ):
+		Some(found): Ok(found)
+		None: Err(NativeProductCanonicalRowUnavailable(typ))
+	physical ?= tuple_storage_type(catalog, resolved).map_err(func(fault): NativeProductPlanRowFailure(fault))
+	match generated_tuple_record_for_type(catalog, physical):
+		Some(_): Ok(physical)
+		None: Err(NativeProductCanonicalRowUnavailable(typ))
+
+
+private pure func add_factory(
+	catalog: CoreTupleStorageCatalog,
+	rows: CNativeProductAdapterPlanRows,
+	kind: CNativeProductFactoryKind,
+	typ: CoreType,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[CNativeProductAdapterPlanRows, CNativeProductPlanFault]:
+	physical ?= canonical_product_type(catalog, typ, ops)
+	if rows.factories.any(func(request): request.kind == kind and core_type_equal(request.result_type, physical)):
+		Ok(rows)
+	else:
+		match ops.product_symbols(physical):
+			None:
+				Err(NativeProductCallbackSymbolsMissing(typ))
+			Some(symbols):
+				request: CNativeProductFactoryRequest = { kind = kind, result_type = physical, callback_name = symbols.make_name + factory_suffix(kind) }
+				emission ?= emit_native_product_factory(catalog, request, ops).map_err(func(fault): NativeProductPlanRenderingFailure(fault))
+				Ok({ rows | factories = rows.factories.append(request), fragments = rows.fragments.append(emission.declarations) })
+
+
+private pure func add_unfold(
+	catalog: CoreTupleStorageCatalog,
+	rows: CNativeProductAdapterPlanRows,
+	step_type: CoreType,
+	result: CoreType,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[CNativeProductAdapterPlanRows, CNativeProductPlanFault]:
+	match step_type:
+		FunctionType(_, [state_type], NamedType("Option", [pair_type])):
+			value_type ?= match result:
+				NamedType(stream_name, [value]):
+					if is_core_stream_type_name(stream_name):
+						Ok(value)
+					else:
+						Err(NativeProductCallShapeMismatch("blorp_stream_unfold"))
+				_: Err(NativeProductCallShapeMismatch("blorp_stream_unfold"))
+			matches ?= product_matches_types(catalog, pair_type, [value_type, state_type], ops)
+			physical ?= canonical_product_type(catalog, pair_type, ops)
+			-- Canonical row identity does not change the step's prepared Option
+			-- ABI: an opaque payload may still use a boxed Option wrapper.
+			representation = if nullable_managed_option_payload_type(NamedType("Option", [pair_type])).is_some():
+				NullableUnfoldProductResult
+			else:
+				BoxedUnfoldProductResult
+			if not matches:
+				Err(NativeProductCallShapeMismatch("blorp_stream_unfold"))
+			else if rows.unfolds.any(func(request): core_type_equal(request.pair_type, physical) and request.result_representation == representation):
+				Ok(rows)
+			else:
+				match ops.product_symbols(physical):
+					None:
+						Err(NativeProductCallbackSymbolsMissing(pair_type))
+					Some(symbols):
+						suffix = match representation:
+							NullableUnfoldProductResult: "_native_unfold_nullable"
+							BoxedUnfoldProductResult: "_native_unfold_boxed"
+						request: CNativeUnfoldProductRequest = { pair_type = physical, callback_name = symbols.make_name + suffix, result_representation = representation }
+						emission ?= emit_native_unfold_product_adapter(catalog, request, ops).map_err(func(fault): NativeProductPlanRenderingFailure(fault))
+						Ok({ rows | unfolds = rows.unfolds.append(request), fragments = rows.fragments.append(emission.declarations) })
+		_:
+			Err(NativeProductCallShapeMismatch("blorp_stream_unfold"))
+
+
+private pure func physical_elements_match(
+	catalog: CoreTupleStorageCatalog,
+	logical: List[CoreType],
+	expected: List[CoreType],
+	ops: CRuntimeProductAdapterOps,
+) -> Result[Bool, CNativeProductPlanFault]:
+	match (logical, expected):
+		([], []): Ok(True)
+		([head, ...tail], [expected_head, ...expected_tail]):
+			logical_resolved = ops.resolve_product_type(head).get_or(head)
+			physical ?= tuple_storage_type(catalog, logical_resolved).map_err(func(fault): NativeProductPlanRowFailure(fault))
+			expected_resolved = ops.resolve_product_type(expected_head).get_or(expected_head)
+			expected_physical ?= tuple_storage_type(catalog, expected_resolved).map_err(func(fault): NativeProductPlanRowFailure(fault))
+			if core_type_equal(physical, expected_physical):
+				-- Physical identity remains valid after opaque alias projection.
+				physical_elements_match(catalog, tail, expected_tail, ops)
+			else:
+				-- A bare scalar proof may also supply its accepted Int value
+				-- slot. Apply that one-way projection to the original head,
+				-- keeping named opaque and container slots unchanged.
+				expected_value = core_scalar_int_value_type(expected_head)
+				if core_type_equal(expected_value, expected_head):
+					Ok(False)
+				else:
+					value_resolved = ops.resolve_product_type(expected_value).get_or(expected_value)
+					value_physical ?= tuple_storage_type(catalog, value_resolved).map_err(func(fault): NativeProductPlanRowFailure(fault))
+					if core_type_equal(physical, value_physical):
+						physical_elements_match(catalog, tail, expected_tail, ops)
+					else:
+						Ok(False)
+		_: Ok(False)
+
+
+private pure func product_matches_types(
+	catalog: CoreTupleStorageCatalog,
+	pair: CoreType,
+	expected: List[CoreType],
+	ops: CRuntimeProductAdapterOps,
+) -> Result[Bool, CNativeProductPlanFault]:
+	match canonical_product_type(catalog, pair, ops):
+		Ok(physical):
+			match generated_tuple_record_for_type(catalog, physical):
+				Some(row): physical_elements_match(catalog, core_generated_tuple_record_elements(row), expected, ops)
+				None: Ok(False)
+		Err(_): Ok(False)
+
+
+private pure func vector_element(typ: CoreType) -> Option[CoreType]:
+	match typ:
+		TensorType(info): Some(info.element_type)
+		NamedType("Vector", [element]): Some(element)
+		_: None
+
+
+private pure func native_input_elements(name: String, args: List[CoreExpr]) -> Option[List[CoreType]]:
+	if name == "blorp_vector_zip":
+		match args:
+			[first, second]:
+				match vector_element(core_expr_type(first)):
+					Some(left):
+						match vector_element(core_expr_type(second)):
+							Some(right): Some([left, right])
+							None: None
+					None: None
+			_: None
+	else:
+		match args:
+			[source]:
+				match core_expr_type(source):
+					NamedType("Dict", [key, value]):
+						if name == "blorp_dict_entries":
+							Some([key, value])
+						else:
+							None
+					NamedType(stream_name, [element]):
+						if name == "blorp_stream_enumerate" and is_core_stream_type_name(stream_name):
+							Some([NamedType("Int", []), element])
+						else:
+							None
+					_: None
+			_: None
+
+
+private pure func container_element(name: String, result: CoreType) -> Result[CoreType, CNativeProductPlanFault]:
+	match result:
+		NamedType(container, [element]):
+			if (
+				(name == "blorp_dict_entries" and container == "List")
+				or (name == "blorp_stream_enumerate" and is_core_stream_type_name(container))
+				or (name == "blorp_vector_zip" and container == "Vector")
+			):
+				Ok(element)
+			else:
+				Err(NativeProductCallShapeMismatch(name))
+		TensorType(info):
+			if name == "blorp_vector_zip":
+				Ok(info.element_type)
+			else:
+				Err(NativeProductCallShapeMismatch(name))
+		_:
+			Err(NativeProductCallShapeMismatch(name))
+
+
+private pure func add_process_factories(
+	catalog: CoreTupleStorageCatalog,
+	rows: CNativeProductAdapterPlanRows,
+	result: CoreType,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[CNativeProductAdapterPlanRows, CNativeProductPlanFault]:
+	payloads: Option[(CoreType, CoreType)] = match result:
+		StackResultType(success, error): Some((success, error))
+		BoxedResultType(success, error): Some((success, error))
+		NamedType("Result", [success, error]): Some((success, error))
+		_: None
+	match payloads:
+		Some((success, error)):
+			with_success ?= add_factory(catalog, rows, ProcessSuccessProductFactory, success, ops)
+			add_factory(catalog, with_success, ProcessErrorProductFactory, error, ops)
+		None:
+			Err(NativeProductCallShapeMismatch("blorp_process_run_command_raw"))
+
+
+private pure func checked_process_success(
+	name: String,
+	success: CoreType,
+	error: CoreType,
+) -> Result[CoreType, CNativeProductPlanFault]:
+	if core_type_equal(error, NamedType("String", [])):
+		Ok(success)
+	else:
+		Err(NativeProductCallShapeMismatch(name))
+
+
+private pure func process_argument_types_match(program: CoreExpr, arguments: CoreExpr) -> Bool:
+	(
+		core_type_equal(core_expr_type(program), NamedType("String", []))
+		and core_type_equal(core_expr_type(arguments), NamedType("List", [NamedType("String", [])]))
+	)
+
+
+private pure func process_success_type(
+	name: String,
+	result: CoreType,
+) -> Result[CoreType, CNativeProductPlanFault]:
+	match result:
+		StackResultType(success, error): checked_process_success(name, success, error)
+		BoxedResultType(success, error): checked_process_success(name, success, error)
+		NamedType("Result", [success, error]): checked_process_success(name, success, error)
+		_: Err(NativeProductCallShapeMismatch(name))
+
+
+private pure func add_call_factories(
+	catalog: CoreTupleStorageCatalog,
+	rows: CNativeProductAdapterPlanRows,
+	name: String,
+	args: List[CoreExpr],
+	result: CoreType,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[CNativeProductAdapterPlanRows, CNativeProductPlanFault]:
+	-- These names and arities belong to runtime_decl.c's accepted native ABI.
+	if name == "blorp_dict_entries" or name == "blorp_stream_enumerate" or name == "blorp_vector_zip":
+		expected_arity = if name == "blorp_vector_zip":
+			2
+		else:
+			1
+		if args.length() != expected_arity:
+			Err(NativeProductCallShapeMismatch(name))
+		else:
+			element ?= container_element(name, result)
+			expected ?= match native_input_elements(name, args):
+				Some(types): Ok(types)
+				None: Err(NativeProductCallShapeMismatch(name))
+			matches ?= product_matches_types(catalog, element, expected, ops)
+			if matches:
+				kind = if name == "blorp_dict_entries":
+					DictionaryEntryProductFactory
+				else if name == "blorp_stream_enumerate":
+					EnumeratedProductFactory
+				else:
+					VectorPairProductFactory
+				add_factory(catalog, rows, kind, element, ops)
+			else:
+				Err(NativeProductCallShapeMismatch(name))
+	else if name == "blorp_stream_unfold":
+		match args:
+			[_, step, _, _]: add_unfold(catalog, rows, core_expr_type(step), result, ops)
+			_: Err(NativeProductCallShapeMismatch(name))
+	else if name == "blorp_process_run_command_raw":
+		match args:
+			[program, arguments, options]:
+				if process_argument_types_match(program, arguments):
+					-- Validate the borrowed snapshot before issuing any C artifact.
+					-- Placeholder names are local emission spellings, never Core identities.
+					snapshot ?= emit_native_process_options_snapshot(
+						catalog, core_expr_type(options), "options_value", "options_snapshot", ops,
+					).map_err(func(fault): NativeProductPlanRenderingFailure(fault))
+					add_process_factories(catalog, rows, result, ops)
+				else:
+					Err(NativeProductCallShapeMismatch(name))
+			_:
+				Err(NativeProductCallShapeMismatch(name))
+	else if name == "blorp_process_session_start_raw":
+		match args:
+			[request]:
+				snapshot ?= emit_native_process_session_snapshot(
+					catalog, core_expr_type(request), "session_request", "session_options", ops,
+				).map_err(func(fault): NativeProductPlanRenderingFailure(fault))
+				Ok(rows)
+			_:
+				Err(NativeProductCallShapeMismatch(name))
+	else if name == "blorp_process_run" or name == "blorp_process_shell":
+		valid_arguments = match args:
+			[program, arguments]:
+				name == "blorp_process_run" and process_argument_types_match(program, arguments)
+			[command]:
+				name == "blorp_process_shell" and core_type_equal(core_expr_type(command), NamedType("String", []))
+			_:
+				False
+		if valid_arguments:
+			success ?= process_success_type(name, result)
+			add_factory(catalog, rows, ProcessOutputProductFactory, success, ops)
+		else:
+			Err(NativeProductCallShapeMismatch(name))
+	else:
+		Ok(rows)
+
+
+private pure func add_dictionary_loop_factory(
+	catalog: CoreTupleStorageCatalog,
+	rows: CNativeProductAdapterPlanRows,
+	pair_type: CoreType,
+	iterable_type: CoreType,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[CNativeProductAdapterPlanRows, CNativeProductPlanFault]:
+	match iterable_type:
+		NamedType("Dict", [key, value]):
+			matches ?= product_matches_types(catalog, pair_type, [key, value], ops)
+			if matches:
+				add_factory(catalog, rows, DictionaryEntryProductFactory, pair_type, ops)
+			else:
+				Err(NativeProductCallShapeMismatch("dictionary entry loop"))
+		_: Err(NativeProductCallShapeMismatch("dictionary entry loop"))
+
+
+private pure func add_expression_factories(
+	catalog: CoreTupleStorageCatalog,
+	rows: CNativeProductAdapterPlanRows,
+	expr: CoreExpr,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[CNativeProductAdapterPlanRows, CNativeProductPlanFault]:
+	match expr:
+		CallExpr(kind, _, args, result, _):
+			match kind:
+				BuiltinCall(name):
+					add_call_factories(catalog, rows, name, args, result, ops)
+				DirectRuntimeCall(call):
+					add_call_factories(catalog, rows, call.name, args, result, ops)
+				OperationResultCall(bridge):
+					add_call_factories(catalog, rows, bridge.builtin_name, args, result, ops)
+				_:
+					Ok(rows)
+		ForDictExpr(loop, _, _):
+			if loop.iteration_mode == CoreDictIterationEntries:
+				add_dictionary_loop_factory(catalog, rows, loop.binder.typ, core_expr_type(loop.iterable), ops)
+			else:
+				Ok(rows)
+		_:
+			Ok(rows)
+
+
+pure func build_native_product_adapter_plan(
+	catalog: CoreTupleStorageCatalog,
+	emitted_expression_roots: List[CoreExpr],
+	ops: CRuntimeProductAdapterOps,
+) -> Result[CNativeProductAdapterPlan, CNativeProductPlanFault]:
+	var rows: CNativeProductAdapterPlanRows = { factories = [], unfolds = [], fragments = [] }
+	var pending = emitted_expression_roots.reverse()
+	-- Reuse popped slots instead of copying the whole frontier for each node.
+	var pending_count: Int = pending.length()
+	var failure: Option[CNativeProductPlanFault] = None
+	while pending_count > 0 and failure.is_none():
+		pending_count -= 1
+		next = pending.get(pending_count)
+		match next:
+			None:
+				void
+			Some(expr):
+				match add_expression_factories(catalog, rows, expr, ops):
+					Ok(updated):
+						rows = updated
+					Err(fault):
+						failure = Some(fault)
+				for child in immediate_core_expr_children(expr).reverse():
+					pending = if pending_count < pending.length():
+						pending.set(pending_count, child)
+					else:
+						pending.append(child)
+					pending_count += 1
+	match failure:
+		Some(fault): Err(fault)
+		None: Ok(into_opaque CNativeProductAdapterPlan(rows))

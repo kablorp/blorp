@@ -18,7 +18,6 @@ import:
 		CoreRecordForm(OrdinaryRecordForm),
 		CoreProgram,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
-		CoreHeapRecordField,
 		CoreSourceLoc,
 		synthetic_core_source_loc,
 		CoreType(NamedType, HeapRecordType),
@@ -29,19 +28,41 @@ import:
 		CoreVar,
 		core_field_ref,
 		core_field_ordinal,
-	../../../src/compiler/stage_09_core/pipeline: run_pre_dce_tail
+	../../../src/compiler/stage_09_core/pass_runner: CorePassDiagnostic
+	../../../src/compiler/stage_09_core/pipeline: PreparedCoreProgram, run_pre_dce_tail
 	../../../src/compiler/stage_10_backend/c_symbol_projection:
 		projected_callable_base_symbol,
 		projected_type_base_symbol,
 	../../../src/compiler/stage_10_backend/emit:
 		CTranslationUnitSet,
-		CoreEmitError(UnresolvedRecordField),
+		CoreEmitError(CorePreparationFailed),
 		static_string_literal_macro,
 		try_emit_prepared_core_program_c_artifact_with_profile,
 		try_emit_prepared_core_program_c_split_artifact_with_profile,
 	../../../src/lib/function_profile: FunctionProfileConfiguration(FunctionProfileOff)
+	../../../src/lib/build_artifact: CArtifact
 	../../../src/compiler/stage_10_backend/c_naming: variant_constructor_symbol
 	test: TestSuite
+
+
+-- Fixture setup propagates preparation failures instead of issuing an invalid
+-- opaque artifact. Both renderers still receive only checked prepared input.
+private pure func try_emit_fixture_single(
+	preparation: Result[PreparedCoreProgram, CorePassDiagnostic],
+	profile: FunctionProfileConfiguration,
+) -> Result[CArtifact, CoreEmitError]:
+	prepared ?= preparation.map_err(func(diagnostic): CorePreparationFailed(diagnostic))
+	try_emit_prepared_core_program_c_artifact_with_profile(prepared, profile)
+
+
+private pure func try_emit_fixture_split(
+	preparation: Result[PreparedCoreProgram, CorePassDiagnostic],
+	profile: FunctionProfileConfiguration,
+	unit_count: Int,
+	shared_header: String,
+) -> Result[CTranslationUnitSet, CoreEmitError]:
+	prepared ?= preparation.map_err(func(diagnostic): CorePreparationFailed(diagnostic))
+	try_emit_prepared_core_program_c_split_artifact_with_profile(prepared, profile, unit_count, shared_header)
 
 
 pure func int_type() -> CoreType:
@@ -418,7 +439,7 @@ pure func count_occurrences_across(bodies: List[String], needle: String) -> Int:
 
 
 pure func split_result() -> Result[CTranslationUnitSet, CoreEmitError]:
-	try_emit_prepared_core_program_c_split_artifact_with_profile(
+	try_emit_fixture_split(
 		run_pre_dce_tail(split_test_program()),
 		FunctionProfileOff,
 		3,
@@ -427,7 +448,7 @@ pure func split_result() -> Result[CTranslationUnitSet, CoreEmitError]:
 
 
 pure func entrypoint_split_result() -> Result[CTranslationUnitSet, CoreEmitError]:
-	try_emit_prepared_core_program_c_split_artifact_with_profile(
+	try_emit_fixture_split(
 		run_pre_dce_tail(entrypoint_only_program()),
 		FunctionProfileOff,
 		3,
@@ -442,13 +463,13 @@ extra units.
 ---
 pure func test_unit_count_one_matches_single_file_path() -> Bool:
 	match (
-		try_emit_prepared_core_program_c_split_artifact_with_profile(
+		try_emit_fixture_split(
 			run_pre_dce_tail(split_test_program()),
 			FunctionProfileOff,
 			1,
 			"blorp_shared.h",
 		),
-		try_emit_prepared_core_program_c_artifact_with_profile(
+		try_emit_fixture_single(
 			run_pre_dce_tail(split_test_program()),
 			FunctionProfileOff,
 		),
@@ -476,11 +497,11 @@ pure func test_single_function_bodies_follow_declaration_order() -> Bool:
 		source_files = [],
 	}
 	match (
-		try_emit_prepared_core_program_c_artifact_with_profile(
+		try_emit_fixture_single(
 			run_pre_dce_tail(program),
 			FunctionProfileOff,
 		),
-		try_emit_prepared_core_program_c_split_artifact_with_profile(
+		try_emit_fixture_split(
 			run_pre_dce_tail(program),
 			FunctionProfileOff,
 			1,
@@ -510,8 +531,8 @@ headers in the shared header and no typedef in a body.
 pure func test_all_type_sections_render_in_both_modes() -> Bool:
 	prepared = run_pre_dce_tail(all_type_sections_program())
 	match (
-		try_emit_prepared_core_program_c_artifact_with_profile(prepared, FunctionProfileOff),
-		try_emit_prepared_core_program_c_split_artifact_with_profile(
+		try_emit_fixture_single(prepared, FunctionProfileOff),
+		try_emit_fixture_split(
 			prepared,
 			FunctionProfileOff,
 			3,
@@ -610,7 +631,7 @@ the field and cleanup mask must also agree across the prototype/definition
 boundary.
 ---
 pure func test_projected_erased_union_constructor_abi_matches() -> Bool:
-	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+	match try_emit_fixture_split(
 		run_pre_dce_tail(erased_doc_split_program()),
 		FunctionProfileOff,
 		3,
@@ -941,7 +962,7 @@ regardless of how the program is shaped; this is LPT binning's balance
 guarantee, exercised end to end.
 ---
 pure func test_skewed_program_balances_within_bound() -> Bool:
-	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+	match try_emit_fixture_split(
 		run_pre_dce_tail(skewed_program()),
 		FunctionProfileOff,
 		4,
@@ -1030,7 +1051,7 @@ in strictly increasing order -- the re-sort step after LPT assignment, not
 whatever order the greedy bin-packing itself produced.
 ---
 pure func test_order_within_bin_is_by_def_id() -> Bool:
-	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+	match try_emit_fixture_split(
 		run_pre_dce_tail(scrambled_size_program()),
 		FunctionProfileOff,
 		2,
@@ -1070,7 +1091,7 @@ bodies as there are functions, each non-empty, rather than padding with
 empty bodies up to `unit_count`.
 ---
 pure func test_unit_count_exceeding_function_count_has_no_empty_bodies() -> Bool:
-	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+	match try_emit_fixture_split(
 		run_pre_dce_tail(few_functions_program()),
 		FunctionProfileOff,
 		5,
@@ -1151,7 +1172,7 @@ assigns through the same spelling, and the raw collision (an unescaped
 the header or any body.
 ---
 pure func test_split_path_spells_a_field_named_header_from_its_id() -> Bool:
-	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+	match try_emit_fixture_split(
 		run_pre_dce_tail(runtime_reserved_field_split_program()),
 		FunctionProfileOff,
 		2,
@@ -1234,7 +1255,7 @@ bound `test_skewed_program_balances_within_bound` checks for ordinary
 functions.
 ---
 pure func test_type_support_heavy_program_balances_across_units() -> Bool:
-	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+	match try_emit_fixture_split(
 		run_pre_dce_tail(type_support_heavy_program()),
 		FunctionProfileOff,
 		4,
@@ -1256,7 +1277,7 @@ function emission. The shared header declares the typed env and destructor;
 exactly one definition must occur in the same TU as that closure body.
 ---
 pure func test_closure_environment_destructor_follows_closure_body() -> Bool:
-	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+	match try_emit_fixture_split(
 		run_pre_dce_tail(captured_closure_split_program()),
 		FunctionProfileOff,
 		2,
@@ -1384,7 +1405,7 @@ pure func projected_point_closure_split_program() -> CoreProgram:
 -- the declaration and the read of `Point.x` (field id 3) agree, and the source
 -- name is gone from the C.
 pure func test_projected_emission_spells_a_non_abi_member_from_its_field_id() -> Bool:
-	match try_emit_prepared_core_program_c_artifact_with_profile(
+	match try_emit_fixture_single(
 		run_pre_dce_tail(projected_point_closure_split_program()),
 		FunctionProfileOff,
 	):
@@ -1413,7 +1434,7 @@ pure func test_projected_emission_keeps_source_member_names_for_an_abi_record() 
 	}
 	program: CoreProgram = split_test_program()
 
-	match try_emit_prepared_core_program_c_artifact_with_profile(
+	match try_emit_fixture_single(
 		run_pre_dce_tail({ program | decls = program.decls.append(HeapRecordDecl(stats_decl)) }),
 		FunctionProfileOff,
 	):
@@ -1423,33 +1444,8 @@ pure func test_projected_emission_keeps_source_member_names_for_an_abi_record() 
 			False
 
 
--- A non-ABI record's member is spelled from its field's position and looked up by
--- its identity, so a field with no typecheck identity has no spelling: emission fails
--- naming the record and the field, where an invalid C identifier would only fail in
--- the C compiler. An ABI record keeps its source names and needs no identity.
-pure func test_unresolved_field_ref_on_a_non_abi_record_fails_at_emission() -> Bool:
-	header_box: CoreHeapRecordDecl = header_field_box_heap_record_decl()
-	unresolved_field: CoreHeapRecordField = {
-		ref = core_field_ref(-1),
-		name = "header",
-		typ = int_type(),
-		release_policy = NoReleasePolicy
-	}
-	broken: CoreHeapRecordDecl = { header_box | fields = [unresolved_field] }
-	program: CoreProgram = split_test_program()
-
-	match try_emit_prepared_core_program_c_artifact_with_profile(
-		run_pre_dce_tail({ program | decls = program.decls.append(HeapRecordDecl(broken)) }),
-		FunctionProfileOff,
-	):
-		Err(UnresolvedRecordField(record_name, field_name)):
-			record_name == "HeaderBox" and field_name == unresolved_field.name
-		_:
-			False
-
-
 pure func test_projected_closure_env_uses_projected_point_type() -> Bool:
-	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+	match try_emit_fixture_split(
 		run_pre_dce_tail(projected_point_closure_split_program()),
 		FunctionProfileOff,
 		2,
@@ -1497,10 +1493,6 @@ tests: TestSuite = {
 		(
 			"projected emission keeps source member names for an ABI record",
 			test_projected_emission_keeps_source_member_names_for_an_abi_record,
-		),
-		(
-			"unresolved field ref on a non-ABI record fails at emission",
-			test_unresolved_field_ref_on_a_non_abi_record_fails_at_emission,
 		),
 		("all type sections render in both modes", test_all_type_sections_render_in_both_modes),
 		("header/body partition at three units", test_header_body_partition_at_three_units),

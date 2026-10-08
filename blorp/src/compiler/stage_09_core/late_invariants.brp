@@ -19,21 +19,23 @@ import:
 		CoreConcurrentlyLoop,
 		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopCopyItem, ConcurrentlyLoopMoveResourceItem),
 		CoreConcurrentlyLoopOutput(ConcurrentlyLoopCollect, ConcurrentlyLoopDiscard),
-		CoreDecl(InlineRecordDecl, UnionDecl, FunctionDecl, GlobalDecl, ImplDecl, HeapRecordDecl, TypeAliasDecl, TraitDecl),
+		CoreDecl(GeneratedTupleRecordDecl, InlineRecordDecl, UnionDecl, FunctionDecl, GlobalDecl, ImplDecl, HeapRecordDecl, TypeAliasDecl, TraitDecl),
 		CoreExpr(
 			AccessorLiteralMatchExpr, BreakExpr, CallExpr, CooperativeCheckpointExpr, DetachExpr,
 			ConcurrentExpr, ConcurrentlyLoopExpr, ConstructorMatchExpr, DebugBlockExpr, DictExpr,
-			DropExpr, ContinueExpr, LambdaExpr, LetExpr, LengthMatchExpr, BorrowLetExpr,
+			DropExpr, DupExpr, ContinueExpr, LambdaExpr, LetExpr, LengthMatchExpr, BorrowLetExpr,
+			CastExpr, LiteralExpr, ProductFieldExpr, StaticStringLiteralExpr, UnboxExpr,
 			ForChannelExpr, ForDictExpr, ForListExpr, ForRangeExpr, ForResourceSourceExpr,
 			ForSetExpr, ForStreamExpr, ForStringExpr, ForTensorExpr, PreClosureConcurrentExpr,
-			PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr, RawMatchExpr, RecordExpr,
-			RecordUpdateExpr, ResourceCleanupExitExpr, ResourceScopeExpr, SelectExpr,
+			PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr, RawMatchExpr, ProductExpr,
+			RecordReuseExpr, RecordUpdateExpr, ResourceCleanupExitExpr, ResourceScopeExpr, SelectExpr,
 			SemanticMatchExpr, TailrecListSpreadLoopExpr, TailrecLoopExpr, TensorRawReadExpr,
 			TensorRawViewLetExpr, TensorRawWriteExpr, TupleExpr, UnionReuseConstructExpr, VarExpr,
 			VectorExpr, VoidExpr, WhileExpr,
 		),
 		CoreFunction,
 		CoreGlobal,
+		CoreProductBuild,
 		CoreProgram,
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreResourceScope,
@@ -52,8 +54,16 @@ import:
 		core_expr_type,
 		core_program_expr_roots,
 		core_type_equal,
+		product_build_values,
 	mono: core_mono_type_equal
 	perceus/env: PerceusEnv, build_env, contract_for_call
+	product_evaluation: product_evaluation_is_literal_global
+	product_type:
+		CoreInterimRecordFields,
+		core_product_of,
+		interim_product_field_count,
+		interim_product_record,
+		interim_record_fields,
 	record_representation: object_identity_builtin
 	pipeline_stage:
 		CorePipelineStage(
@@ -83,7 +93,12 @@ union CoreLateInvariantViolation:
 	TupleLiteralSurvived(CoreSourceLoc)
 	VectorLiteralSurvived(CoreSourceLoc)
 	DictLiteralSurvived(CoreSourceLoc)
-	RecordLiteralSurvived(CoreSourceLoc)
+	-- A record build whose type names no declared record.
+	ProductWithoutRecordType(CoreSourceLoc)
+	-- A record build with a value count other than its record's field count:
+	-- the record, its field count, and the build's value count.
+	ProductFieldCountMismatch(String, Int, Int, CoreSourceLoc)
+	ProductFieldEvaluationSurvived(CoreSourceLoc)
 	LayoutlessListAllocationSurvived(String, CoreSourceLoc)
 	ErasedKeyTempMarkerSurvived(String, CoreSourceLoc)
 	InlineRecordIdentityBuiltinSurvived(String, CoreSourceLoc)
@@ -135,8 +150,12 @@ pure func core_late_invariant_message(violation: CoreLateInvariantViolation) -> 
 			"unprepared vector literal reached final Core"
 		DictLiteralSurvived(_):
 			"unprepared dictionary literal reached final Core"
-		RecordLiteralSurvived(_):
-			"unprepared record literal reached final Core"
+		ProductWithoutRecordType(_):
+			"record build whose type names no declared record reached final Core"
+		ProductFieldCountMismatch(record_name, field_count, value_count, _):
+			"record build of `${record_name}` gives ${value_count.to_string()} values for ${field_count.to_string()} fields"
+		ProductFieldEvaluationSurvived(_):
+			"record field evaluation survived ownership normalization; bind the value before building the record"
 		LayoutlessListAllocationSurvived(name, _):
 			"layout-free list allocation `${name}` reached final Core"
 		ErasedKeyTempMarkerSurvived(name, _):
@@ -401,6 +420,8 @@ private pure func union_storage_violations(program: CoreProgram) -> List[CoreLat
 
 	for decl in program.decls:
 		match decl:
+			GeneratedTupleRecordDecl(_):
+				void
 			UnionDecl(info):
 				storage_by_name = storage_by_name.set(info.name, core_union_storage_value(info.storage))
 				match core_union_decl_storage_error(info):
@@ -1055,8 +1076,89 @@ private pure func concurrently_loop_violations(
 	violations
 
 
+---
+A record build's type must name a declared record, which emission names the
+constructor after, and the build must give each of that record's fields one
+value: the build checked its ordinals against the count it was made with, and
+this ties that count to the declaration, so an inline record's C compound
+literal cannot zero-fill a missing member.
+---
+private pure func product_build_violations(
+	field_counts: CoreInterimRecordFields,
+	build: CoreProductBuild,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> List[CoreLateInvariantViolation]:
+	match core_product_of(typ):
+		Some(product):
+			match (interim_product_record(product), interim_product_field_count(field_counts, product)):
+				(Some(record_name), Some(field_count)):
+					value_count: Int = product_build_values(build).length()
+
+					if value_count == field_count:
+						[]
+					else:
+						[ProductFieldCountMismatch(record_name, field_count, value_count, loc)]
+				_:
+					[ProductWithoutRecordType(loc)]
+		None:
+			[ProductWithoutRecordType(loc)]
+
+
+-- Later ownership and reuse passes may add retains, releases and borrowed
+-- projections to a named value. These operations cannot evaluate a constructor,
+-- call or branch across a later field. Core Let owns every such evaluation.
+private pure func normalized_product_value(expr: CoreExpr) -> Bool:
+	match expr:
+		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _):
+			True
+		ProductFieldExpr(value, _, _, _):
+			normalized_product_value(value)
+		UnboxExpr(_, value, _, _):
+			normalized_product_value(value)
+		CastExpr(value, _, _):
+			normalized_product_value(value)
+		DupExpr(_, _, _, body, _, _):
+			normalized_product_value(body)
+		DropExpr(_, _, _, body, _, _):
+			normalized_product_value(body)
+		BorrowLetExpr(_, _, value, body):
+			normalized_product_value(value) and normalized_product_value(body)
+		_:
+			False
+
+
+private pure func product_evaluation_violations(expr: CoreExpr) -> List[CoreLateInvariantViolation]:
+	match expr:
+		ProductExpr(build, _, loc):
+			if product_build_values(build).all(normalized_product_value):
+				[]
+			else:
+				[ProductFieldEvaluationSurvived(loc)]
+		RecordReuseExpr(source, build, _, loc):
+			if normalized_product_value(source) and product_build_values(build).all(normalized_product_value):
+				[]
+			else:
+				[ProductFieldEvaluationSurvived(loc)]
+		_:
+			[]
+
+
+private pure func normalized_product_program_violations(program: CoreProgram) -> List[CoreLateInvariantViolation]:
+	-- The normalizer preserves a closed literal global for static emission.
+	-- Skip that exact declaration tree, rather than allowing nested constructors
+	-- in function fields or guessing from a global's name or is_const flag.
+	checked_declarations: List[CoreDecl] = program.decls.filter(func(decl):
+		match decl:
+			GlobalDecl(global): not product_evaluation_is_literal_global(global.init)
+			_: True
+	)
+	check_program_exprs({ program | decls = checked_declarations }, product_evaluation_violations)
+
+
 private pure func final_violations(
 	env: PerceusEnv,
+	field_counts: CoreInterimRecordFields,
 	expr: CoreExpr,
 ) -> List[CoreLateInvariantViolation]:
 	match expr:
@@ -1074,8 +1176,10 @@ private pure func final_violations(
 			[VectorLiteralSurvived(loc)]
 		DictExpr(_, _, loc):
 			[DictLiteralSurvived(loc)]
-		RecordExpr(_, _, loc):
-			[RecordLiteralSurvived(loc)]
+		ProductExpr(build, typ, loc):
+			product_build_violations(field_counts, build, typ, loc)
+		RecordReuseExpr(_, build, typ, loc):
+			product_build_violations(field_counts, build, typ, loc)
 		ResourceScopeExpr(scope, typ, loc):
 			resource_scope_violations(typ, scope, loc)
 		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
@@ -1439,6 +1543,14 @@ private pure func requires_perceus_boundary_forms(stage: CorePipelineStage) -> B
 			False
 
 
+private pure func requires_normalized_product_values(stage: CorePipelineStage) -> Bool:
+	match stage:
+		PerceusStage | PostDceTailStage | PostPerceusTailStage | PreClosureTailStage | ReuseStage | ClosureStage | PostClosureTailStage | PreDceTailStage | FinalStage:
+			True
+		_:
+			False
+
+
 private pure func requires_converted_closures(stage: CorePipelineStage) -> Bool:
 	match stage:
 		PostDceTailStage | PostPerceusTailStage | PreClosureTailStage | ClosureStage | PostClosureTailStage | PreDceTailStage | FinalStage:
@@ -1472,6 +1584,10 @@ pure func check_late_core_invariants(
 	check_final: Bool = requires_emittable_core(stage)
 	check_match_scrutinees: Bool = requires_materialized_match_scrutinees(stage)
 	check_perceus_boundary: Bool = requires_perceus_boundary_forms(stage)
+	product_violations: List[CoreLateInvariantViolation] = if requires_normalized_product_values(stage):
+		normalized_product_program_violations(program)
+	else:
+		[]
 
 	check_phase_expr: pure (CoreExpr) -> List[CoreLateInvariantViolation] = func(expr):
 		var violations: List[CoreLateInvariantViolation] = []
@@ -1492,16 +1608,18 @@ pure func check_late_core_invariants(
 
 	if check_final:
 		env: PerceusEnv = build_env(program)
+		field_counts: CoreInterimRecordFields = interim_record_fields(program)
 		check_definition_id_uniqueness(program).concat(union_storage_violations(program))
 			.concat(
 				check_program_exprs(
 					program,
 					func(expr):
-						check_phase_expr(expr).concat(final_violations(env, expr))
+						check_phase_expr(expr).concat(final_violations(env, field_counts, expr))
 				),
 			)
 			.concat(raw_tensor_program_violations(program))
 			.concat(checkpoint_program_violations(program))
 			.concat(user_call_contract_violations(program))
+			.concat(product_violations)
 	else:
-		union_storage_violations(program).concat(check_program_exprs(program, check_phase_expr))
+		union_storage_violations(program).concat(check_program_exprs(program, check_phase_expr)).concat(product_violations)

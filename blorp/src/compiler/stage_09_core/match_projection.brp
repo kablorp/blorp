@@ -62,6 +62,11 @@ import:
 		CoreMonoSubstitution,
 		CoreMonoSubstitutionValue(TypeSubstitution),
 		CoreProgram,
+		CoreTupleStorageCatalog,
+		tuple_storage_catalog,
+		core_generated_tuple_record_elements,
+		generated_tuple_record_for_type,
+		tuple_storage_type,
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreRetainPolicy(NoRetainPolicy),
 		CoreSemanticConstructorMatchCase,
@@ -80,7 +85,7 @@ import:
 		),
 		CoreSourceLoc,
 		CoreSourceLocRow,
-		CoreType(BoxedResultType, UnionType, NamedType, StackResultType, TupleType),
+		CoreType(HeapRecordType, BoxedResultType, UnionType, NamedType, StackResultType, TupleType),
 		CoreUnionDecl,
 		CoreUnionPayloadStorage(TypedUnionPayloadStorage, ErasedUnionPayloadStorage),
 		CoreUnionStorage(ScalarTagStorage, ManagedPayloadStorage),
@@ -172,6 +177,7 @@ private record MatchProjectionLayoutState {
 
 private record MatchProjectionLayout {
 	specialize: CoreSpecializeLayout,
+	tuple_catalog: Option[CoreTupleStorageCatalog],
 	unions_by_name: Dict[String, MatchProjectionUnionLayout],
 	index_counters: MatchProjectionLayoutCounters,
 	valid: Bool
@@ -266,11 +272,18 @@ private pure func build_match_projection_layout(program: CoreProgram) -> MatchPr
 			_:
 				void
 
+	catalog: Option[CoreTupleStorageCatalog] = match tuple_storage_catalog(program):
+		Ok(value):
+			Some(value)
+		Err(_):
+			None
+
 	{
 		specialize = build_specialize_layout(program),
+		tuple_catalog = catalog,
 		unions_by_name = state.unions_by_name,
 		index_counters = state.counters,
-		valid = state.valid
+		valid = state.valid and catalog.is_some()
 	}
 
 
@@ -398,7 +411,7 @@ private pure func stack_result_parent_uses_boxed_storage(accessor: CoreAccessor)
 	-- Container accessors return boxed payload storage, except tuple fields, which
 	-- materialize struct values while decoding the tuple element.
 	match accessor:
-		RootAccessor | ProductFieldAccessor(_, _, _):
+		RootAccessor | ProductFieldAccessor(_, _, _, _):
 			False
 		VariantFieldAccessor(_, _, _, _) | ErasedVariantFieldAccessor(_, _, _, _):
 			True
@@ -428,7 +441,7 @@ private pure func stack_option_parent_uses_boxed_storage(accessor: CoreAccessor)
 			True
 		BoxedResultOkPayloadAccessor(_) | BoxedResultErrPayloadAccessor(_):
 			True
-		RootAccessor | VariantFieldAccessor(_, _, _, _) | ProductFieldAccessor(_, _, _):
+		RootAccessor | VariantFieldAccessor(_, _, _, _) | ProductFieldAccessor(_, _, _, _):
 			False
 		NullableOptionPayloadAccessor(_) | InlineTaggedPayloadAccessor(_) | BoxedInlineTaggedPayloadAccessor(_, _):
 			False
@@ -510,6 +523,15 @@ private pure func semantic_accessor_type(
 			match resolve_specialize_type(layout.specialize, parent_type):
 				TupleType(items):
 					items.get(core_field_ordinal_index(index))
+				HeapRecordType(_):
+					catalog ?= layout.tuple_catalog
+					row ?= generated_tuple_record_for_type(catalog, parent_type)
+					logical_type ?= core_generated_tuple_record_elements(row).get(core_field_ordinal_index(index))
+					match tuple_storage_type(catalog, logical_type):
+						Ok(physical_type):
+							Some(physical_type)
+						Err(_):
+							None
 				_:
 					None
 		ListElementSemanticMatchAccessor(parent, _):
@@ -589,8 +611,9 @@ private pure func lower_accessor(
 			Some(RootAccessor)
 		ProductFieldSemanticMatchAccessor(parent, index):
 			lowered_parent ?= lower_accessor(layout, root_type, parent)
+			parent_type ?= semantic_accessor_type(layout, root_type, parent)
 			field_type ?= semantic_accessor_type(layout, root_type, accessor)
-			Some(ProductFieldAccessor(lowered_parent, index, field_type))
+			Some(ProductFieldAccessor(lowered_parent, parent_type, index, field_type))
 		ListElementSemanticMatchAccessor(parent, index):
 			lowered_parent ?= lower_accessor(layout, root_type, parent)
 			Some(ListElementAccessor(lowered_parent, index))
@@ -1512,7 +1535,7 @@ private pure func typed_accessor_to_semantic(
 	match accessor:
 		RootAccessor:
 			Some(RootSemanticMatchAccessor)
-		ProductFieldAccessor(parent, index, _):
+		ProductFieldAccessor(parent, _, index, _):
 			lowered_parent ?= typed_accessor_to_semantic(layout, root_type, parent)
 			Some(ProductFieldSemanticMatchAccessor(lowered_parent, index))
 		ListElementAccessor(parent, index):

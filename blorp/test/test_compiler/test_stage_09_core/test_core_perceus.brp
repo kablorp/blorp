@@ -1,4 +1,6 @@
 import:
+	../test_support_core_product_build: fixture_build
+	../../../src/compiler/stage_09_core/pipeline: prepare_perceus_input
 	../../../src/compiler/stage_09_core/closure as CoreClosure
 	../../../src/compiler/stage_09_core/consume_specialize as CoreConsumeSpecialize
 	../../../src/compiler/stage_09_core/c_type_layout: type_requires_release
@@ -70,7 +72,7 @@ import:
 			LiteralExpr,
 			LogicalExpr,
 			PreClosureDetachExpr,
-			RecordConstructExpr,
+			ProductExpr,
 			ResourceScopeExpr,
 			SelectExpr,
 			SeqExpr,
@@ -79,7 +81,6 @@ import:
 			TensorRawReadExpr,
 			TensorRawViewLetExpr,
 			TensorRawWriteExpr,
-			TupleConstructExpr,
 			TailrecLoopExpr,
 			TupleExpr,
 			UnaryExpr,
@@ -110,7 +111,6 @@ import:
 		CoreParam,
 		CoreRecordForm(OrdinaryRecordForm),
 		CoreProgram,
-		CoreRecordFieldValue,
 		CoreReleasePolicy(
 			ArcReleaseOnlyPolicy,
 			ArcReleasePolicy,
@@ -127,7 +127,6 @@ import:
 		CoreTensorLiteralShape(TensorVectorLength),
 		CoreTensorRawScalarKind(TensorInt64Elements),
 		CoreTensorForElementStorage(TensorForRawScalarElement),
-		CoreTupleElement(TuplePointerElement),
 		CoreType(
 			BoxedResultType,
 			HeapRecordType,
@@ -169,6 +168,8 @@ import:
 		core_source_loc_is_synthetic,
 		core_source_loc_row_unresolved,
 		pack_core_source_loc,
+		product_build_in_declared_order,
+		product_build_values,
 		static_string_literal_id,
 		synthetic_core_source_loc,
 		core_field_ordinal,
@@ -1489,10 +1490,8 @@ pure func drop_count_for(name: String, expr: CoreExpr) -> Int:
 			drop_count_in_boxed_values(name, construct.args)
 		TupleExpr(items, typ, loc):
 			drop_count_in_args(name, items)
-		RecordExpr(fields, typ, loc):
-			drop_count_in_record_fields(name, fields)
-		RecordConstructExpr(type_name, fields, typ, loc):
-			drop_count_in_record_fields(name, fields)
+		ProductExpr(build, typ, loc):
+			drop_count_in_args(name, product_build_values(build))
 		ResourceScopeExpr(scope, typ, loc):
 			drop_count_for(
 				name,
@@ -1542,15 +1541,6 @@ pure func drop_count_in_args(name: String, args: List[CoreExpr]) -> Int:
 
 	for arg in args:
 		total += drop_count_for(name, arg)
-
-	total
-
-
-pure func drop_count_in_record_fields(name: String, fields: List[CoreRecordFieldValue]) -> Int:
-	var total: Int = 0
-
-	for field in fields:
-		total += drop_count_for(name, field.value)
 
 	total
 
@@ -1746,12 +1736,8 @@ pure func dup_count_for(name: String, expr: CoreExpr) -> Int:
 			) + dup_count_for(name, set.index) + dup_count_for(name, set.value.value)
 		TupleExpr(items, typ, loc):
 			dup_count_in_args(name, items)
-		TupleConstructExpr(construct, typ, loc):
-			dup_count_in_tuple_elements(name, construct.elements)
-		RecordExpr(fields, typ, loc):
-			dup_count_in_record_fields(name, fields)
-		RecordConstructExpr(type_name, fields, typ, loc):
-			dup_count_in_record_fields(name, fields)
+		ProductExpr(build, typ, loc):
+			dup_count_in_args(name, product_build_values(build))
 		ResourceScopeExpr(scope, typ, loc):
 			dup_count_for(
 				name,
@@ -1811,33 +1797,11 @@ pure func dup_count_for(name: String, expr: CoreExpr) -> Int:
 			0
 
 
-pure func dup_count_in_tuple_elements(name: String, elements: List[CoreTupleElement]) -> Int:
-	var total: Int = 0
-
-	for element in elements:
-		match element:
-			TuplePointerElement(value):
-				total += dup_count_for(name, value)
-			_:
-				void
-
-	total
-
-
 pure func dup_count_in_args(name: String, args: List[CoreExpr]) -> Int:
 	var total: Int = 0
 
 	for arg in args:
 		total += dup_count_for(name, arg)
-
-	total
-
-
-pure func dup_count_in_record_fields(name: String, fields: List[CoreRecordFieldValue]) -> Int:
-	var total: Int = 0
-
-	for field in fields:
-		total += dup_count_for(name, field.value)
 
 	total
 
@@ -3393,7 +3357,10 @@ pure func test_stack_result_uses_stack_ownership_policies() -> Bool:
 				result_type,
 			),
 			TupleExpr(
-				[var_expr("result", result_type), var_expr("result", result_type)],
+				[
+					var_expr("result", result_type),
+					var_expr("result", result_type),
+				],
 				TupleType([result_type, result_type]),
 				synthetic_core_source_loc(),
 			),
@@ -3554,7 +3521,11 @@ pure func test_unrelated_length_binding_does_not_extend_consumed_owner() -> Bool
 					named_var("span"),
 					False,
 					span_type,
-					RecordConstructExpr("Span", [], span_type, synthetic_core_source_loc()),
+					ProductExpr(
+						product_build_in_declared_order([]),
+						span_type,
+						synthetic_core_source_loc(),
+					),
 					match_body,
 				),
 			),
@@ -4560,7 +4531,13 @@ pure func test_tuple_construction_transfers_consumed_parameter_member() -> Bool:
 				87,
 				[core_param("value", list_int_type())],
 				tuple_type,
-				TupleExpr([var_expr("value", list_int_type())], tuple_type, synthetic_core_source_loc()),
+				TupleExpr(
+					[
+						var_expr("value", list_int_type()),
+					],
+					tuple_type,
+					synthetic_core_source_loc(),
+				),
 			)],
 		foreign_includes = [],
 		source_files = []
@@ -9287,7 +9264,9 @@ pure func test_mutable_set_equality_preserves_slot_owner() -> Bool:
 pure func test_mutable_aggregate_result_preserves_slot_owner() -> Bool:
 	result_type: CoreType = TupleType([list_int_type()])
 	result: CoreExpr = TupleExpr(
-		[var_expr("slot", list_int_type())],
+		[
+			var_expr("slot", list_int_type()),
+		],
 		result_type,
 		synthetic_core_source_loc(),
 	)
@@ -9306,13 +9285,10 @@ pure func test_mutable_aggregate_result_preserves_slot_owner() -> Bool:
 
 
 pure func test_mutable_record_result_preserves_slot_owner() -> Bool:
-	result: CoreExpr = RecordExpr(
-		[
-			{
-				ref = core_field_ref(6),name = "items",
-				value = var_expr("slot", list_int_type())
-			},
-		],
+	result: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			var_expr("slot", list_int_type()),
+		]),
 		HeapRecordType("Env"),
 		synthetic_core_source_loc(),
 	)
@@ -9331,23 +9307,17 @@ pure func test_mutable_record_result_preserves_slot_owner() -> Bool:
 
 
 pure func test_nested_mutable_record_result_preserves_slot_owner() -> Bool:
-	inner: CoreExpr = RecordExpr(
-		[
-			{
-				ref = core_field_ref(6),name = "items",
-				value = var_expr("slot", list_int_type())
-			},
-		],
+	inner: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			var_expr("slot", list_int_type()),
+		]),
 		HeapRecordType("Env"),
 		synthetic_core_source_loc(),
 	)
-	result: CoreExpr = RecordExpr(
-		[
-			{
-				ref = core_field_ref(4),name = "env",
-				value = inner
-			},
-		],
+	result: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			inner,
+		]),
 		HeapRecordType("Analysis"),
 		synthetic_core_source_loc(),
 	)
@@ -9367,18 +9337,11 @@ pure func test_nested_mutable_record_result_preserves_slot_owner() -> Bool:
 
 pure func test_managed_record_update_releases_consumed_owners_after_field_read() -> Bool:
 	pair_type: CoreType = HeapRecordType("Pair")
-	initial: CoreExpr = RecordConstructExpr(
-		"Pair",
-		[
-			{
-				ref = core_field_ref(1),name = "a",
-				value = int_expr(10)
-			},
-			{
-				ref = core_field_ref(2),name = "b",
-				value = int_expr(32)
-			},
-		],
+	initial: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			int_expr(10),
+			int_expr(32),
+		]),
 		pair_type,
 		synthetic_core_source_loc(),
 	)
@@ -9390,23 +9353,16 @@ pure func test_managed_record_update_releases_consumed_owners_after_field_read()
 			"p",
 			pair_type,
 		),
-		RecordConstructExpr(
-			"Pair",
-			[
-				{
-					ref = core_field_ref(1),name = "a",
-					value = int_expr(40)
-				},
-				{
-					ref = core_field_ref(2),name = "b",
-					value = ProductFieldExpr(
-						var_expr("__upd_0", pair_type),
-						core_field_ordinal(1),
-						int_type(),
-						synthetic_core_source_loc(),
-					)
-				},
-			],
+		ProductExpr(
+			product_build_in_declared_order([
+				int_expr(40),
+				ProductFieldExpr(
+					var_expr("__upd_0", pair_type),
+					core_field_ordinal(1),
+					int_type(),
+					synthetic_core_source_loc(),
+				),
+			]),
 			pair_type,
 			synthetic_core_source_loc(),
 		),
@@ -9440,7 +9396,7 @@ pure func test_managed_record_update_releases_consumed_owners_after_field_read()
 			match p_body:
 				LetExpr(_, False, _, LetExpr(q, False, _, q_rhs, q_body), _):
 					update_has_arc_drop: Bool = match q_rhs:
-						LetExpr(_, False, _, _, LetExpr(_, False, _, RecordConstructExpr("Pair", _, _, _), DropExpr(update_base, _, ArcReleasePolicy, _, _, _))):
+						LetExpr(_, False, _, _, LetExpr(_, False, _, ProductExpr(_, HeapRecordType("Pair"), _), DropExpr(update_base, _, ArcReleasePolicy, _, _, _))):
 							update_base.name == "__upd_0"
 						_:
 							False
@@ -9809,31 +9765,21 @@ pure func test_mutable_sequential_assignments_release_each_replaced_owner() -> B
 
 pure func assignment_box_value(value: Int) -> CoreExpr:
 	box_type: CoreType = HeapRecordType("AssignmentBox")
-	RecordConstructExpr(
-		"AssignmentBox",
-		[
-			{
-				ref = core_field_ref(20),name = "value",
-				value = int_expr(value)
-			},
-		],
+	ProductExpr(
+		product_build_in_declared_order([
+			int_expr(value),
+		]),
 		box_type,
 		synthetic_core_source_loc(),
 	)
 
 
 pure func nested_assignment_record_rhs(first: CoreExpr, second: CoreExpr) -> CoreExpr:
-	RecordExpr(
-		[
-			{
-				ref = core_field_ref(5),name = "first",
-				value = first
-			},
-			{
-				ref = core_field_ref(15),name = "second",
-				value = second
-			},
-		],
+	ProductExpr(
+		product_build_in_declared_order([
+			first,
+			second,
+		]),
 		HeapRecordType("AssignmentBox"),
 		synthetic_core_source_loc(),
 	)
@@ -11671,7 +11617,13 @@ pure func test_borrowed_for_list_item_is_retained_in_aggregate() -> Bool:
 			iterable_release_policy = NoReleasePolicy,
 			body = AssignExpr(
 				named_var("previous"),
-				TupleExpr([var_expr("item", item_type)], result_type, synthetic_core_source_loc()),
+				TupleExpr(
+					[
+						var_expr("item", item_type),
+					],
+					result_type,
+					synthetic_core_source_loc(),
+				),
 				void_type(),
 				synthetic_core_source_loc(),
 			)
@@ -12303,7 +12255,10 @@ pure func test_owned_local_borrowed_call_match_drops_nontransfer_branch() -> Boo
 				token_type,
 				ArcRetainPolicy,
 				TupleExpr(
-					[var_expr("state", state_type), var_expr("kind", token_type)],
+					[
+						var_expr("state", state_type),
+						var_expr("kind", token_type),
+					],
 					result_type,
 					synthetic_core_source_loc(),
 				),
@@ -12471,7 +12426,13 @@ pure func test_consumed_parameter_borrowed_call_match_drops_nontransfer_branch()
 		1609,
 		[core_param("state", state_type)],
 		scanned_type,
-		TupleExpr([var_expr("fresh_state", state_type)], scanned_type, synthetic_core_source_loc()),
+		TupleExpr(
+			[
+				var_expr("fresh_state", state_type),
+			],
+			scanned_type,
+			synthetic_core_source_loc(),
+		),
 	)
 	combine: CoreDecl = function_decl(
 		"combine_state",
@@ -12479,7 +12440,10 @@ pure func test_consumed_parameter_borrowed_call_match_drops_nontransfer_branch()
 		[core_param("prefix", prefix_type), core_param("scanned", scanned_type)],
 		result_type,
 		TupleExpr(
-			[var_expr("fresh_state", state_type), var_expr("prefix", prefix_type)],
+			[
+				var_expr("fresh_state", state_type),
+				var_expr("prefix", prefix_type),
+			],
 			result_type,
 			synthetic_core_source_loc(),
 		),
@@ -12570,7 +12534,10 @@ pure func test_consumed_parameter_borrowed_call_match_drops_nontransfer_branch()
 						"None",
 						[],
 						TupleExpr(
-							[var_expr("state", state_type), var_expr("prefix", prefix_type)],
+							[
+								var_expr("state", state_type),
+								var_expr("prefix", prefix_type),
+							],
 							result_type,
 							synthetic_core_source_loc(),
 						),
@@ -12649,14 +12616,10 @@ pure func test_statement_if_balances_record_transfer_before_consuming_continuati
 		bool_type(),
 		synthetic_core_source_loc(),
 	)
-	record_transfer: CoreExpr = RecordConstructExpr(
-		"IdentityHolder",
-		[
-			{
-				ref = core_field_ref(20),name = "value",
-				value = var_expr("source", value_type)
-			},
-		],
+	record_transfer: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			var_expr("source", value_type),
+		]),
 		HeapRecordType("IdentityHolder"),
 		synthetic_core_source_loc(),
 	)
@@ -12989,14 +12952,10 @@ pure func test_releasing_constructor_match_consumes_let_owner_once() -> Bool:
 pure func test_releasing_match_retains_owner_escaping_in_record() -> Bool:
 	tag_type: CoreType = UnionType("Tag", ManagedUnionValue)
 	result_type: CoreType = HeapRecordType("HeldTag")
-	escaping_result: CoreExpr = RecordConstructExpr(
-		"HeldTag",
-		[
-			{
-				ref = core_field_ref(20),name = "value",
-				value = var_expr("tag", tag_type)
-			},
-		],
+	escaping_result: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			var_expr("tag", tag_type),
+		]),
 		result_type,
 		synthetic_core_source_loc(),
 	)
@@ -13026,14 +12985,10 @@ pure func test_releasing_match_retains_owner_escaping_in_record() -> Bool:
 pure func test_consumed_list_parameter_escaping_releasing_match_is_retained() -> Bool:
 	comments_type: CoreType = list_int_type()
 	result_type: CoreType = HeapRecordType("HeldComments")
-	escaping_result: CoreExpr = RecordConstructExpr(
-		"HeldComments",
-		[
-			{
-				ref = core_field_ref(13),name = "remaining",
-				value = var_expr("comments", comments_type)
-			},
-		],
+	escaping_result: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			var_expr("comments", comments_type),
+		]),
 		result_type,
 		synthetic_core_source_loc(),
 	)
@@ -13820,28 +13775,21 @@ pure func test_multi_owner_record_fields_are_retained_once_each() -> Bool:
 	result_type: CoreType = HeapRecordType("BorrowPair")
 	left: CoreParam = core_owner_param_with_id("left", 2210, owner_type)
 	right: CoreParam = core_owner_param_with_id("right", 2211, owner_type)
-	body: CoreExpr = RecordConstructExpr(
-		"BorrowPair",
-		[
-			{
-				ref = core_field_ref(7),name = "left",
-				value = ProductFieldExpr(
-					VarExpr(left.name, owner_type, synthetic_core_source_loc()),
-					core_field_ordinal(0),
-					list_int_type(),
-					synthetic_core_source_loc(),
-				)
-			},
-			{
-				ref = core_field_ref(14),name = "right",
-				value = ProductFieldExpr(
-					VarExpr(right.name, owner_type, synthetic_core_source_loc()),
-					core_field_ordinal(0),
-					list_int_type(),
-					synthetic_core_source_loc(),
-				)
-			},
-		],
+	body: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			ProductFieldExpr(
+				VarExpr(left.name, owner_type, synthetic_core_source_loc()),
+				core_field_ordinal(0),
+				list_int_type(),
+				synthetic_core_source_loc(),
+			),
+			ProductFieldExpr(
+				VarExpr(right.name, owner_type, synthetic_core_source_loc()),
+				core_field_ordinal(0),
+				list_int_type(),
+				synthetic_core_source_loc(),
+			),
+		]),
 		result_type,
 		synthetic_core_source_loc(),
 	)
@@ -13875,19 +13823,15 @@ pure func test_consuming_call_argument_with_transferring_aggregate_retains_proje
 	owner_type: CoreType = HeapRecordType("BorrowOwner")
 	box_type: CoreType = HeapRecordType("BorrowBox")
 	owner: CoreParam = core_param_with_id("owner", 2220, owner_type)
-	boxed_argument: CoreExpr = RecordConstructExpr(
-		"BorrowBox",
-		[
-			{
-				ref = core_field_ref(6),name = "items",
-				value = ProductFieldExpr(
-					VarExpr(owner.name, owner_type, synthetic_core_source_loc()),
-					core_field_ordinal(0),
-					list_int_type(),
-					synthetic_core_source_loc(),
-				)
-			},
-		],
+	boxed_argument: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			ProductFieldExpr(
+				VarExpr(owner.name, owner_type, synthetic_core_source_loc()),
+				core_field_ordinal(0),
+				list_int_type(),
+				synthetic_core_source_loc(),
+			),
+		]),
 		box_type,
 		synthetic_core_source_loc(),
 	)
@@ -13924,14 +13868,10 @@ pure func test_existing_drop_preserves_nested_consuming_call_retain() -> Bool:
 		named_var("incoming_owner"),
 		list_int_type(),
 		ArcReleasePolicy,
-		RecordConstructExpr(
-			"BorrowBox",
-			[
-				{
-					ref = core_field_ref(6),name = "items",
-					value = consumed_projection
-				},
-			],
+		ProductExpr(
+			product_build_in_declared_order([
+				consumed_projection,
+			]),
 			box_type,
 			synthetic_core_source_loc(),
 		),
@@ -15169,7 +15109,11 @@ private pure func owned_node_match_argument() -> CoreExpr:
 			named_var("default"),
 			False,
 			node_type,
-			RecordConstructExpr("Node", [], node_type, synthetic_core_source_loc()),
+			ProductExpr(
+				product_build_in_declared_order([]),
+				node_type,
+				synthetic_core_source_loc(),
+			),
 			match_body,
 		),
 	)
@@ -16652,14 +16596,10 @@ pure func test_managed_global_is_retained_when_stored_in_record() -> Bool:
 				215,
 				[],
 				box_type,
-				RecordConstructExpr(
-					"NameBox",
-					[
-						{
-							ref = core_field_ref(9),name = "name",
-							value = VarExpr(global_name, string_type(), synthetic_core_source_loc())
-						},
-					],
+				ProductExpr(
+					product_build_in_declared_order([
+						VarExpr(global_name, string_type(), synthetic_core_source_loc()),
+					]),
 					box_type,
 					synthetic_core_source_loc(),
 				),
@@ -16688,13 +16628,10 @@ private pure func name_box_stored_from(value: CoreExpr) -> CoreExpr:
 		named_var("box"),
 		False,
 		box_type,
-		RecordConstructExpr(
-			"NameBox",
-			[{
-				ref = core_field_ref(9),
-				name = "name",
-				value = value
-			}],
+		ProductExpr(
+			product_build_in_declared_order([
+				value,
+			]),
 			box_type,
 			synthetic_core_source_loc(),
 		),
@@ -16934,14 +16871,10 @@ pure func test_managed_global_is_retained_in_nested_record_union_payload() -> Bo
 	}
 	args_type: CoreType = HeapRecordType("RenderArgs")
 	op_type: CoreType = UnionType("RenderOp", ManagedUnionValue)
-	args: CoreExpr = RecordConstructExpr(
-		"RenderArgs",
-		[
-			{
-				ref = core_field_ref(17),name = "temp_seed",
-				value = VarExpr(global_seed, string_type(), synthetic_core_source_loc())
-			},
-		],
+	args: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			VarExpr(global_seed, string_type(), synthetic_core_source_loc()),
+		]),
 		args_type,
 		synthetic_core_source_loc(),
 	)
@@ -17017,14 +16950,10 @@ pure func test_managed_global_is_retained_in_record_passed_to_union_constructor(
 	}
 	args_type: CoreType = HeapRecordType("RenderArgs")
 	op_type: CoreType = UnionType("RenderOp", ManagedUnionValue)
-	args: CoreExpr = RecordConstructExpr(
-		"RenderArgs",
-		[
-			{
-				ref = core_field_ref(17),name = "temp_seed",
-				value = VarExpr(global_seed, string_type(), synthetic_core_source_loc())
-			},
-		],
+	args: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			VarExpr(global_seed, string_type(), synthetic_core_source_loc()),
+		]),
 		args_type,
 		synthetic_core_source_loc(),
 	)
@@ -17081,14 +17010,10 @@ pure func test_managed_global_in_length_match_branch_is_retained() -> Bool:
 	}
 	args_type: CoreType = HeapRecordType("RenderArgs")
 	op_type: CoreType = UnionType("RenderOp", ManagedUnionValue)
-	args: CoreExpr = RecordConstructExpr(
-		"RenderArgs",
-		[
-			{
-				ref = core_field_ref(17),name = "temp_seed",
-				value = VarExpr(global_seed, string_type(), synthetic_core_source_loc())
-			},
-		],
+	args: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			VarExpr(global_seed, string_type(), synthetic_core_source_loc()),
+		]),
 		args_type,
 		synthetic_core_source_loc(),
 	)
@@ -17756,6 +17681,107 @@ pure func test_contract_collection_fast_paths_preserve_nested_and_deferred_calls
 	)
 
 
+private pure func contract_loop(body: CoreExpr, tensor: Bool) -> CoreExpr:
+	binder = {
+		variable = named_var("element"),
+		typ = int_type(),
+		range_direction = RangeForwardOnly
+	}
+	if tensor:
+		ForTensorExpr({
+			binder = binder,
+			element_storage = TensorForRawScalarElement(TensorInt64Elements),
+			iterable = intrinsic_expr("tensor_alloc", [int_expr(0)], tensor_int_type()),
+			iterable_release_policy = ArcReleasePolicy,
+			body = body
+		}, void_type(), synthetic_core_source_loc())
+	else:
+		ForListExpr({
+			binder = binder,
+			layout = PointerListStorage,
+			iterable = intrinsic_expr("list_alloc", [int_expr(0)], list_int_type()),
+			iterable_release_policy = ArcReleasePolicy,
+			body = body
+		}, void_type(), synthetic_core_source_loc())
+
+
+-- List/Tensor loop payloads put body at ordinal four. The old heterogeneous
+-- loop arm read Channel's ordinal two and missed parameter duplication and
+-- shadowing, allowing the collection fast path to infer a consuming contract.
+pure func test_loop_contracts_find_parameter_duplication_and_shadowing() -> Bool:
+	items = named_var("items")
+	items_type = list_int_type()
+	release = DropExpr(items, items_type, ArcReleasePolicy, VoidExpr(void_type(), synthetic_core_source_loc()), void_type(), synthetic_core_source_loc())
+	duplicate = DupExpr(items, items_type, ArcRetainPolicy, release, void_type(), synthetic_core_source_loc())
+	shadow = LetExpr(
+		items,
+		False,
+		items_type,
+		intrinsic_expr("list_alloc", [int_expr(0)], items_type),
+		intrinsic_expr("list_ensure_unique", [var_expr("items", items_type)], items_type),
+	)
+	var declarations: List[CoreDecl] = []
+	for tensor in [False, True]:
+		base: Int = if tensor:
+			92020
+		else:
+			92010
+		for entry in [("loop_duplicate", duplicate, base), ("loop_shadow", shadow, base + 1), ("loop_consume", release, base + 2)]:
+			(name, body, def_id) = entry
+			declarations = declarations.append(function_decl(
+				name,
+				def_id,
+				[core_param("items", items_type)],
+				int_type(),
+				SeqExpr(contract_loop(body, tensor), int_expr(0)),
+			))
+	facts = infer_ownership_contracts(resolve_global_value_refs({
+		decls = declarations,
+		foreign_includes = [],
+		source_files = []
+	}))
+	(
+		inferred_contract_has_consumed_indices(facts.env, "loop_duplicate", 92010, [])
+		and inferred_contract_has_consumed_indices(facts.env, "loop_shadow", 92011, [])
+		and inferred_contract_has_consumed_indices(facts.env, "loop_consume", 92012, [0])
+		and inferred_contract_has_consumed_indices(facts.env, "loop_duplicate", 92020, [])
+		and inferred_contract_has_consumed_indices(facts.env, "loop_shadow", 92021, [])
+		and inferred_contract_has_consumed_indices(facts.env, "loop_consume", 92022, [0])
+	)
+
+
+pure func test_named_record_field_snapshot_borrows_source_parameter() -> Bool:
+	items_type = list_int_type()
+	snapshot_type: CoreType = HeapRecordType("FieldSnapshot")
+	factory = function_decl(
+		"make_field_snapshot",
+		92030,
+		[core_param("items", items_type)],
+		snapshot_type,
+		ProductExpr(fixture_build(1, [(0, var_expr("items", items_type))]), snapshot_type, synthetic_core_source_loc()),
+	)
+	caller = function_decl(
+		"borrow_field_snapshot",
+		92031,
+		[core_param("items", items_type)],
+		int_type(),
+		SeqExpr(
+			user_call_expr("make_field_snapshot", Some(92030), [], [var_expr("items", items_type)], snapshot_type),
+			int_expr(0),
+		),
+	)
+	prepared = prepare_perceus_input(resolve_global_value_refs({
+		decls = [factory, caller],
+		foreign_includes = [],
+		source_files = []
+	}))
+	facts = infer_ownership_contracts(prepared)
+	(
+		inferred_contract_has_consumed_indices(facts.env, "make_field_snapshot", 92030, [])
+		and inferred_contract_has_consumed_indices(facts.env, "borrow_field_snapshot", 92031, [])
+	)
+
+
 pure func test_inferred_user_call_contract_is_written_to_calls() -> Bool:
 	consume: CoreDecl = function_decl(
 		"consume",
@@ -18311,23 +18337,19 @@ pure func test_borrowed_match_binding_is_retained_in_aggregate() -> Bool:
 			constructor_case(
 				"Some",
 				[match_binding("payload", payload_type)],
-				TupleConstructExpr(
-					{
-						elements = [TuplePointerElement(var_expr("payload", payload_type))],
-						release_mask = 1,
-						retain_mask = 0
-					},
+				TupleExpr(
+					[
+						var_expr("payload", payload_type),
+					],
 					result_type,
 					synthetic_core_source_loc(),
 				),
 			),
 		],
-		TupleConstructExpr(
-			{
-				elements = [],
-				release_mask = 0,
-				retain_mask = 0
-			},
+		TupleExpr(
+			[
+
+			],
 			result_type,
 			synthetic_core_source_loc(),
 		),
@@ -18355,15 +18377,11 @@ pure func test_nested_borrowed_match_bindings_are_retained_in_tuple_scrutinee() 
 	left_binding: CoreMatchBinding = match_binding("left_target", option_type)
 	right_binding: CoreMatchBinding = match_binding("right_target", option_type)
 	tuple_match: CoreExpr = ConstructorMatchExpr(
-		TupleConstructExpr(
-			{
-				elements = [
-					TuplePointerElement(var_expr("left_target", option_type)),
-					TuplePointerElement(var_expr("right_target", option_type)),
-				],
-				release_mask = 3,
-				retain_mask = 0
-			},
+		TupleExpr(
+			[
+				var_expr("left_target", option_type),
+				var_expr("right_target", option_type),
+			],
 			pair_type,
 			synthetic_core_source_loc(),
 		),
@@ -18424,120 +18442,13 @@ pure func test_nested_borrowed_match_bindings_are_retained_in_tuple_scrutinee() 
 			False
 
 
-pure func test_prepared_tuple_retain_mask_avoids_duplicate_retain() -> Bool:
-	payload_type: CoreType = string_type()
-	result_type: CoreType = TupleType([payload_type])
-	body: CoreExpr = constructor_match_expr(
-		[
-			constructor_case(
-				"Some",
-				[match_binding("payload", payload_type)],
-				TupleConstructExpr(
-					{
-						elements = [TuplePointerElement(var_expr("payload", payload_type))],
-						release_mask = 1,
-						retain_mask = 1
-					},
-					result_type,
-					synthetic_core_source_loc(),
-				),
-			),
-		],
-		TupleConstructExpr(
-			{
-				elements = [],
-				release_mask = 0,
-				retain_mask = 0
-			},
-			result_type,
-			synthetic_core_source_loc(),
-		),
-		result_type,
-	)
-	program: CoreProgram = insert_drops_program({
-		decls = [
-			function_decl(
-				"pack_retained",
-				782,
-				[core_param("tag", UnionType("Tag", ManagedUnionValue))],
-				result_type,
-				body,
-			),
-		],
-		foreign_includes = [],
-		source_files = []
-	})
-
-	match function_body(program, "pack_retained"):
-		Some(rewritten):
-			dup_count_for("payload", rewritten) == 0
-		None:
-			False
-
-
-pure func test_prepared_tuple_retain_mask_uses_slot_indices() -> Bool:
-	payload_type: CoreType = string_type()
-	result_type: CoreType = TupleType([payload_type, payload_type])
-	body: CoreExpr = constructor_match_expr(
-		[
-			constructor_case(
-				"Some",
-				[match_binding("payload", payload_type)],
-				TupleConstructExpr(
-					{
-						elements = [
-							TuplePointerElement(var_expr("payload", payload_type)),
-							TuplePointerElement(var_expr("payload", payload_type)),
-						],
-						release_mask = 3,
-						retain_mask = 2
-					},
-					result_type,
-					synthetic_core_source_loc(),
-				),
-			),
-		],
-		TupleConstructExpr(
-			{
-				elements = [],
-				release_mask = 0,
-				retain_mask = 0
-			},
-			result_type,
-			synthetic_core_source_loc(),
-		),
-		result_type,
-	)
-	program: CoreProgram = insert_drops_program({
-		decls = [
-			function_decl(
-				"pack_mixed_retains",
-				784,
-				[core_param("tag", UnionType("Tag", ManagedUnionValue))],
-				result_type,
-				body,
-			),
-		],
-		foreign_includes = [],
-		source_files = []
-	})
-
-	match function_body(program, "pack_mixed_retains"):
-		Some(rewritten):
-			dup_count_for("payload", rewritten) == 1
-		None:
-			False
-
-
 pure func test_consumed_stack_result_tuple_element_transfers_without_dup() -> Bool:
 	result_type: CoreType = StackResultType(int_type(), string_type())
 	tuple_type: CoreType = TupleType([result_type])
-	body: CoreExpr = TupleConstructExpr(
-		{
-			elements = [TupleStackResultElement(var_expr("result", result_type))],
-			release_mask = 1,
-			retain_mask = 0
-		},
+	body: CoreExpr = TupleExpr(
+		[
+			var_expr("result", result_type),
+		],
 		tuple_type,
 		synthetic_core_source_loc(),
 	)
@@ -18566,7 +18477,10 @@ pure func test_duplicated_stack_result_tuple_value_retains_once() -> Bool:
 	result_type: CoreType = StackResultType(int_type(), string_type())
 	tuple_type: CoreType = TupleType([result_type, result_type])
 	body: CoreExpr = TupleExpr(
-		[var_expr("result", result_type), var_expr("result", result_type)],
+		[
+			var_expr("result", result_type),
+			var_expr("result", result_type),
+		],
 		tuple_type,
 		synthetic_core_source_loc(),
 	)
@@ -18594,14 +18508,10 @@ pure func test_duplicated_stack_result_tuple_value_retains_once() -> Bool:
 pure func test_borrowed_match_binding_is_retained_in_aggregate_call_arg() -> Bool:
 	payload_type: CoreType = list_int_type()
 	box_type: CoreType = HeapRecordType("Box")
-	boxed_payload: CoreExpr = RecordConstructExpr(
-		"Box",
-		[
-			{
-				ref = core_field_ref(11),name = "payload",
-				value = var_expr("payload", payload_type)
-			},
-		],
+	boxed_payload: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			var_expr("payload", payload_type),
+		]),
 		box_type,
 		synthetic_core_source_loc(),
 	)
@@ -18617,14 +18527,10 @@ pure func test_borrowed_match_binding_is_retained_in_aggregate_call_arg() -> Boo
 	)
 	body: CoreExpr = constructor_match_expr(
 		[constructor_case("Some", [match_binding("payload", payload_type)], consume_box)],
-		RecordConstructExpr(
-			"Box",
-			[
-				{
-					ref = core_field_ref(11),name = "payload",
-					value = intrinsic_expr("list_alloc", [int_expr(0)], payload_type)
-				},
-			],
+		ProductExpr(
+			product_build_in_declared_order([
+				intrinsic_expr("list_alloc", [int_expr(0)], payload_type),
+			]),
 			box_type,
 			synthetic_core_source_loc(),
 		),
@@ -18915,9 +18821,21 @@ pure func test_borrowed_match_binding_is_retained_once_with_multiple_params() ->
 		[constructor_case(
 				"Some",
 				[match_binding("payload", payload_type)],
-				TupleExpr([var_expr("payload", payload_type)], result_type, synthetic_core_source_loc()),
+				TupleExpr(
+					[
+						var_expr("payload", payload_type),
+					],
+					result_type,
+					synthetic_core_source_loc(),
+				),
 			)],
-		TupleExpr([], result_type, synthetic_core_source_loc()),
+		TupleExpr(
+			[
+
+			],
+			result_type,
+			synthetic_core_source_loc(),
+		),
 		result_type,
 	)
 	program: CoreProgram = insert_drops_program({
@@ -19240,18 +19158,11 @@ pure func test_nested_aggregate_call_retains_borrowed_match_binding() -> Bool:
 		220,
 		[core_param("value", payload_type), core_param("span", span_type)],
 		parsed_type,
-		RecordConstructExpr(
-			"Parsed",
-			[
-				{
-					ref = core_field_ref(20),name = "value",
-					value = var_expr("value", payload_type)
-				},
-				{
-					ref = core_field_ref(16),name = "span",
-					value = var_expr("span", span_type)
-				},
-			],
+		ProductExpr(
+			product_build_in_declared_order([
+				var_expr("value", payload_type),
+				var_expr("span", span_type),
+			]),
 			parsed_type,
 			synthetic_core_source_loc(),
 		),
@@ -19295,14 +19206,10 @@ pure func test_nested_aggregate_call_retains_borrowed_match_binding() -> Bool:
 			constructor_case(
 				"Some",
 				[match_binding("payload", payload_type)],
-				RecordConstructExpr(
-					"Step",
-					[
-						{
-							ref = core_field_ref(20),name = "value",
-							value = nested_value
-						},
-					],
+				ProductExpr(
+					product_build_in_declared_order([
+						nested_value,
+					]),
 					step_type,
 					synthetic_core_source_loc(),
 				),
@@ -19351,9 +19258,21 @@ pure func test_many_borrowed_constructor_cases_preserve_ownership() -> Bool:
 			[constructor_case(
 					"Some",
 					[match_binding("payload", payload_type)],
-					TupleExpr([var_expr("payload", payload_type)], result_type, synthetic_core_source_loc()),
+					TupleExpr(
+						[
+							var_expr("payload", payload_type),
+						],
+						result_type,
+						synthetic_core_source_loc(),
+					),
 				)],
-			TupleExpr([], result_type, synthetic_core_source_loc()),
+			TupleExpr(
+				[
+
+				],
+				result_type,
+				synthetic_core_source_loc(),
+			),
 			result_type,
 		)
 		decls = decls.append(
@@ -20779,9 +20698,10 @@ pure func test_consumed_parameter_mutable_alias_read_after_keeps_retain() -> Boo
 -- A match payload is borrowed from the still-owned scrutinee. Entering a
 -- for loop does not transfer that payload to an aggregate constructed there.
 pure func test_borrowed_match_payload_in_range_loop_keeps_record_reference() -> Bool:
-	stored: CoreExpr = RecordConstructExpr(
-		"TextHolder",
-		[{ ref = core_field_ref(0), name = "text", value = var_expr("text", string_type()) }],
+	stored: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			var_expr("text", string_type()),
+		]),
 		HeapRecordType("TextHolder"),
 		synthetic_core_source_loc(),
 	)
@@ -20809,9 +20729,10 @@ pure func test_borrowed_match_payload_in_range_loop_keeps_record_reference() -> 
 
 
 pure func test_borrowed_match_payload_in_list_loop_keeps_record_reference() -> Bool:
-	stored: CoreExpr = RecordConstructExpr(
-		"TextHolder",
-		[{ ref = core_field_ref(0), name = "text", value = var_expr("text", string_type()) }],
+	stored: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			var_expr("text", string_type()),
+		]),
 		HeapRecordType("TextHolder"),
 		synthetic_core_source_loc(),
 	)
@@ -20842,9 +20763,10 @@ pure func test_borrowed_match_payload_in_list_loop_keeps_record_reference() -> B
 
 
 pure func test_loop_binder_shadows_outer_borrowed_aggregate_payload() -> Bool:
-	stored: CoreExpr = RecordConstructExpr(
-		"TextHolder",
-		[{ ref = core_field_ref(0), name = "text", value = var_expr("text", string_type()) }],
+	stored: CoreExpr = ProductExpr(
+		product_build_in_declared_order([
+			var_expr("text", string_type()),
+		]),
 		HeapRecordType("TextHolder"),
 		synthetic_core_source_loc(),
 	)
@@ -20878,9 +20800,10 @@ pure func borrowed_text_owner() -> CoreParam:
 
 
 pure func text_holder_record() -> CoreExpr:
-	RecordConstructExpr(
-		"TextHolder",
-		[{ ref = core_field_ref(0), name = "text", value = var_expr("text", string_type()) }],
+	ProductExpr(
+		product_build_in_declared_order([
+			var_expr("text", string_type()),
+		]),
 		HeapRecordType("TextHolder"),
 		synthetic_core_source_loc(),
 	)
@@ -22631,6 +22554,14 @@ tests: TestSuite = {
 		("list loop contract detects parameter Dup in body", test_list_loop_contract_detects_parameter_dup_in_body),
 		("tensor loop contract detects parameter Dup in body", test_tensor_loop_contract_detects_parameter_dup_in_body),
 		(
+			"loop contracts find parameter duplication and shadowing",
+			test_loop_contracts_find_parameter_duplication_and_shadowing,
+		),
+		(
+			"named record field snapshot borrows source parameter",
+			test_named_record_field_snapshot_borrows_source_parameter,
+		),
+		(
 			"inferred user-call contract is written to calls",
 			test_inferred_user_call_contract_is_written_to_calls,
 		),
@@ -22673,14 +22604,6 @@ tests: TestSuite = {
 		(
 			"nested borrowed match bindings are retained in tuple scrutinee",
 			test_nested_borrowed_match_bindings_are_retained_in_tuple_scrutinee,
-		),
-		(
-			"prepared tuple retain mask avoids duplicate retain",
-			test_prepared_tuple_retain_mask_avoids_duplicate_retain,
-		),
-		(
-			"prepared tuple retain mask uses slot indices",
-			test_prepared_tuple_retain_mask_uses_slot_indices,
 		),
 		(
 			"consumed stack Result tuple element transfers without dup",

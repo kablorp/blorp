@@ -46,13 +46,13 @@ import:
 			ListHandoffExpr, ListHandoffSetOwnedExpr, ListHandoffSetSourceSlotExpr, ListRetainExpr,
 			ListSetExpr, ListSwapExpr, LiteralExpr, LiteralMatchExpr, LogicalExpr,
 			PreClosureConcurrentExpr, PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr,
-			RawMatchExpr, RecordConstructExpr, RecordCowUpdateExpr, RecordExpr, RecordReuseExpr,
-			RecordUpdateExpr, ResourceCleanupExitExpr, ResourceScopeExpr, SemanticMatchExpr,
+			ProductExpr, RawMatchExpr, RecordCowUpdateExpr, RecordReuseExpr, RecordUpdateExpr,
+			ResourceCleanupExitExpr, ResourceScopeExpr, SemanticMatchExpr,
 			SelectExpr, SeqExpr, SetAllocExpr, StaticStringLiteralExpr, StringByteCopyExpr,
 			StringByteReadExpr, StringByteWriteExpr, StringSetLenExpr, TailrecListSpreadLoopExpr,
 			TailrecListSpreadRecurExpr, TailrecLoopExpr, TailrecRecurExpr, TensorBoxedLiteralExpr,
 			TensorLiteralExpr, TensorPackedLiteralExpr, TensorRawFillExpr, TensorRawReadExpr,
-			TensorRawViewLetExpr, TensorRawWriteExpr, TupleConstructExpr, TupleExpr, UnaryExpr,
+			TensorRawViewLetExpr, TensorRawWriteExpr, TupleExpr, UnaryExpr,
 			UnboxExpr, UnionConstructExpr, UnionReuseConstructExpr, VarExpr, VectorExpr, VoidExpr,
 			WhileExpr,
 		),
@@ -70,6 +70,8 @@ import:
 		),
 		CorePreClosureConcurrentBinding,
 		CoreRawMatchCase,
+		CoreProductBuild,
+		CoreMapState,
 		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreSelectArm,
@@ -87,13 +89,12 @@ import:
 		CoreTaskCapture,
 		CoreTaskClosure,
 		CoreTensorLiteralPayload(TensorInlineStructLiteralPayload, TensorRawLiteralPayload),
-		CoreTupleElement(
-			TupleFloat16Element, TupleFloat32Element, TupleFloatElement, TuplePointerElement,
-			TuplePrimElement, TupleStackResultElement, TupleStructElement, TupleVoidElement,
-		),
 		CoreType,
 		CoreVar,
 		core_var_equal,
+		map_product_build_values,
+		product_build_values,
+		rewrite_product_build_values,
 	memory: same_object
 
 
@@ -457,9 +458,10 @@ private pure func map_context_accessor[C](
 							type_mapper,
 						),
 					)
-				ProductFieldAccessor(parent, field_index, typ):
+				ProductFieldAccessor(parent, receiver_type, field_index, typ):
 					ProductFieldAccessor(
 						map_context_accessor(parent, context, mapper, type_mapper),
+						map_context_type(context, mapper, type_mapper, receiver_type),
 						field_index,
 						map_context_type(context, mapper, type_mapper, typ),
 					)
@@ -660,65 +662,6 @@ private pure func map_context_dict_entry[C](
 				key = mapped_key.get_or(entry.key),
 				value = mapped_value.get_or(entry.value)
 			})
-
-
-private pure func map_context_tuple_element[C](
-	context: C,
-	mapper: pure (C, CoreExpr) -> CoreExpr,
-	element: CoreTupleElement,
-) -> Option[CoreTupleElement]:
-	match element:
-		TuplePrimElement(value):
-			mapped: CoreExpr = mapper(context, value)
-
-			if same_object(mapped, value):
-				None
-			else:
-				Some(TuplePrimElement(mapped))
-		TuplePointerElement(value):
-			mapped: CoreExpr = mapper(context, value)
-
-			if same_object(mapped, value):
-				None
-			else:
-				Some(TuplePointerElement(mapped))
-		TupleStructElement(value, c_type):
-			mapped: CoreExpr = mapper(context, value)
-
-			if same_object(mapped, value):
-				None
-			else:
-				Some(TupleStructElement(mapped, c_type))
-		TupleStackResultElement(value):
-			mapped: CoreExpr = mapper(context, value)
-
-			if same_object(mapped, value):
-				None
-			else:
-				Some(TupleStackResultElement(mapped))
-		TupleVoidElement:
-			None
-		TupleFloatElement(value):
-			mapped: CoreExpr = mapper(context, value)
-
-			if same_object(mapped, value):
-				None
-			else:
-				Some(TupleFloatElement(mapped))
-		TupleFloat32Element(value):
-			mapped: CoreExpr = mapper(context, value)
-
-			if same_object(mapped, value):
-				None
-			else:
-				Some(TupleFloat32Element(mapped))
-		TupleFloat16Element(value):
-			mapped: CoreExpr = mapper(context, value)
-
-			if same_object(mapped, value):
-				None
-			else:
-				Some(TupleFloat16Element(mapped))
 
 
 private pure func map_context_literal_match_case[C](
@@ -1187,40 +1130,6 @@ private pure func map_context_dict_entries[C](
 			None:
 				if changed:
 					mapped = mapped.append(entry)
-				else:
-					void
-
-		index += 1
-
-	if changed:
-		Some(mapped)
-	else:
-		None
-
-
-private pure func map_context_tuple_elements[C](
-	elements: List[CoreTupleElement],
-	context: C,
-	mapper: pure (C, CoreExpr) -> CoreExpr,
-) -> Option[List[CoreTupleElement]]:
-	var mapped: List[CoreTupleElement] = []
-	var changed: Bool = False
-	var index: Int = 0
-
-	for element in elements:
-		match map_context_tuple_element(context, mapper, element):
-			Some(mapped_element):
-				mapped = if changed:
-					mapped.append(mapped_element)
-				else:
-					elements
-						.take(index)
-						.append(mapped_element)
-
-				changed = True
-			None:
-				if changed:
-					mapped = mapped.append(element)
 				else:
 					void
 
@@ -2634,22 +2543,6 @@ private pure func map_core_aggregate_children_with_map_context[C](
 					mapped_typ,
 					loc,
 				)
-		TupleConstructExpr(construct, typ, loc):
-			mapped_elements: Option[List[CoreTupleElement]] = map_context_tuple_elements(
-				construct.elements,
-				context,
-				mapper,
-			)
-			mapped_typ: CoreType = map_context_type(context, mapper, type_mapper, typ)
-
-			if mapped_elements.is_none() and same_object(mapped_typ, typ):
-				expr
-			else:
-				TupleConstructExpr(
-					{ construct | elements = mapped_elements.get_or(construct.elements) },
-					mapped_typ,
-					loc,
-				)
 		VectorExpr(items, typ, loc):
 			mapped_items: Option[List[CoreExpr]] = map_context_exprs(items, context, mapper)
 			mapped_typ: CoreType = map_context_type(context, mapper, type_mapper, typ)
@@ -2710,22 +2603,14 @@ private pure func map_core_aggregate_children_with_map_context[C](
 					mapped_typ,
 					loc,
 				)
-		RecordExpr(fields, typ, loc):
-			mapped_fields: Option[List[CoreRecordFieldValue]] = map_context_record_fields(
-				fields,
-				context,
-				mapper,
-			)
+		ProductExpr(build, typ, loc):
+			mapped_build: Option[CoreProductBuild] = map_product_build_values(build, context, mapper)
 			mapped_typ: CoreType = map_context_type(context, mapper, type_mapper, typ)
 
-			if mapped_fields.is_none() and same_object(mapped_typ, typ):
+			if mapped_build.is_none() and same_object(mapped_typ, typ):
 				expr
 			else:
-				RecordExpr(
-					mapped_fields.get_or(fields),
-					mapped_typ,
-					loc,
-				)
+				ProductExpr(mapped_build.get_or(build), mapped_typ, loc)
 		RecordUpdateExpr(base, fields, typ, loc):
 			mapped_base: CoreExpr = mapper(context, base)
 			mapped_fields: Option[List[CoreRecordFieldValue]] = map_context_record_fields(
@@ -2748,25 +2633,21 @@ private pure func map_core_aggregate_children_with_map_context[C](
 					mapped_typ,
 					loc,
 				)
-		RecordReuseExpr(source, fields, typ, loc):
+		RecordReuseExpr(source, build, typ, loc):
 			mapped_source: CoreExpr = mapper(context, source)
-			mapped_fields: Option[List[CoreRecordFieldValue]] = map_context_record_fields(
-				fields,
-				context,
-				mapper,
-			)
+			mapped_build: Option[CoreProductBuild] = map_product_build_values(build, context, mapper)
 			mapped_typ: CoreType = map_context_type(context, mapper, type_mapper, typ)
 
 			if (
 				same_object(mapped_source, source)
-				and mapped_fields.is_none()
+				and mapped_build.is_none()
 				and same_object(mapped_typ, typ)
 			):
 				expr
 			else:
 				RecordReuseExpr(
 					mapped_source,
-					mapped_fields.get_or(fields),
+					mapped_build.get_or(build),
 					mapped_typ,
 					loc,
 				)
@@ -2789,23 +2670,6 @@ private pure func map_core_aggregate_children_with_map_context[C](
 			else:
 				RecordCowUpdateExpr(
 					mapped_source,
-					mapped_fields.get_or(fields),
-					mapped_typ,
-					loc,
-				)
-		RecordConstructExpr(type_name, fields, typ, loc):
-			mapped_fields: Option[List[CoreRecordFieldValue]] = map_context_record_fields(
-				fields,
-				context,
-				mapper,
-			)
-			mapped_typ: CoreType = map_context_type(context, mapper, type_mapper, typ)
-
-			if mapped_fields.is_none() and same_object(mapped_typ, typ):
-				expr
-			else:
-				RecordConstructExpr(
-					type_name,
 					mapped_fields.get_or(fields),
 					mapped_typ,
 					loc,
@@ -4026,7 +3890,7 @@ private pure func map_core_expr_children_with_map_context[C](
 			map_core_leaf_children_with_map_context(expr, context, mapper, type_mapper)
 		DebugBlockExpr(_, _, _) | BinaryExpr(_, _, _, _, _) | UnaryExpr(_, _, _, _) | LogicalExpr(_, _, _, _, _) | AssignExpr(_, _, _, _) | CastExpr(_, _, _) | UnboxExpr(_, _, _, _) | ProductFieldExpr(_, _, _, _) | BoxExpr(_, _, _) | PreClosureDetachExpr(_, _, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _) | LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | SeqExpr(_, _) | WhileExpr(_, _, _, _) | IfExpr(_, _, _, _, _):
 			map_core_operator_children_with_map_context(expr, context, mapper, type_mapper)
-		CallExpr(_, _, _, _, _) | TupleExpr(_, _, _) | TupleConstructExpr(_, _, _) | VectorExpr(_, _, _) | ListConstructExpr(_, _, _) | DictExpr(_, _, _) | DictConstructExpr(_, _, _) | RecordExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | RecordConstructExpr(_, _, _, _) | UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | SelectExpr(_, _, _):
+		CallExpr(_, _, _, _, _) | TupleExpr(_, _, _) | VectorExpr(_, _, _) | ListConstructExpr(_, _, _) | DictExpr(_, _, _) | DictConstructExpr(_, _, _) | ProductExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | SelectExpr(_, _, _):
 			map_core_aggregate_children_with_map_context(expr, context, mapper, type_mapper)
 		ListAllocExpr(_, _, _) | ListGetExpr(_, _, _) | ListHandoffExpr(_, _, _) | ListHandoffSetOwnedExpr(_, _, _) | ListHandoffSetSourceSlotExpr(_, _, _) | ListRetainExpr(_, _, _) | ListSetExpr(_, _, _) | ListSwapExpr(_, _, _) | StringByteReadExpr(_, _, _) | StringByteWriteExpr(_, _, _) | StringByteCopyExpr(_, _, _) | StringSetLenExpr(_, _, _) | TensorLiteralExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | TensorPackedLiteralExpr(_, _, _) | TensorRawFillExpr(_, _, _) | TensorRawReadExpr(_, _, _) | TensorRawWriteExpr(_, _, _) | TensorRawViewLetExpr(_, _, _, _):
 			map_core_storage_children_with_map_context(expr, context, mapper, type_mapper)
@@ -4318,26 +4182,6 @@ private pure func boxed_storage_value_items(value: CoreBoxedStorageValue) -> Lis
 	[value.value]
 
 
-private pure func tuple_element_items(element: CoreTupleElement) -> List[CoreExpr]:
-	match element:
-		TuplePrimElement(value):
-			[value]
-		TuplePointerElement(value):
-			[value]
-		TupleStructElement(value, _):
-			[value]
-		TupleStackResultElement(value):
-			[value]
-		TupleVoidElement:
-			[]
-		TupleFloatElement(value):
-			[value]
-		TupleFloat32Element(value):
-			[value]
-		TupleFloat16Element(value):
-			[value]
-
-
 private pure func literal_match_fallback_items(
 	fallback: CoreLiteralMatchFallback,
 ) -> List[CoreExpr]:
@@ -4517,8 +4361,6 @@ pure func immediate_core_expr_children(expr: CoreExpr) -> List[CoreExpr]:
 			[]
 		TupleExpr(items, _, _):
 			items
-		TupleConstructExpr(construct, _, _):
-			construct.elements.flat_map(tuple_element_items)
 		VectorExpr(items, _, _):
 			items
 		LambdaExpr(_, _, body, _, _, _):
@@ -4575,16 +4417,14 @@ pure func immediate_core_expr_children(expr: CoreExpr) -> List[CoreExpr]:
 			[set.list, set.index, set.value.value]
 		ListSwapExpr(swap, _, _):
 			[swap.list, swap.left_index, swap.right_index]
-		RecordExpr(fields, _, _):
-			fields.map(func(field): field.value)
+		ProductExpr(build, _, _):
+			product_build_values(build)
 		RecordUpdateExpr(base, fields, _, _):
 			[base].concat(fields.map(
 				func(field): field.value,
 			))
-		RecordReuseExpr(source, fields, _, _):
-			[source].concat(fields.map(
-				func(field): field.value,
-			))
+		RecordReuseExpr(source, build, _, _):
+			[source].concat(product_build_values(build))
 		RecordCowUpdateExpr(source, fields, _, _):
 			fields
 				.flat_map(pure func(field) -> List[CoreExpr]:
@@ -4595,8 +4435,6 @@ pure func immediate_core_expr_children(expr: CoreExpr) -> List[CoreExpr]:
 							[]
 				)
 				.concat([source])
-		RecordConstructExpr(_, fields, _, _):
-			fields.map(func(field): field.value)
 		UnionConstructExpr(construct, _, _):
 			construct.args.flat_map(boxed_storage_value_items)
 		UnionReuseConstructExpr(construct, _, _):
@@ -4750,11 +4588,8 @@ pure func any_core_dict_literal_entry_exprs(
 -- before the next lands. `map_core_expr_children_with_state` only becomes
 -- part of the public surface once every family is covered; until then the
 -- family functions below are exercised directly by tests and are not wired
--- into any pass.
-record CoreMapState[S, T] {
-	state: S,
-	value: T
-}
+-- into any pass. The threaded pair is `ir`'s `CoreMapState`, so a product
+-- build's values thread through the same mapper.
 
 
 ---
@@ -5157,151 +4992,6 @@ private pure func map_core_state_exprs[S](
 			changed = True
 		else:
 			void
-
-		index += 1
-
-	if changed:
-		{
-			state = current_state,
-			value = Some(mapped)
-		}
-	else:
-		{
-			state = current_state,
-			value = None
-		}
-
-
-private pure func map_core_state_tuple_element[S](
-	state: S,
-	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
-	element: CoreTupleElement,
-) -> CoreMapState[S, Option[CoreTupleElement]]:
-	match element:
-		TuplePrimElement(value):
-			mapped: CoreMapState[S, CoreExpr] = mapper(state, value)
-
-			rebuilt: Option[CoreTupleElement] = if same_object(mapped.value, value):
-				None
-			else:
-				Some(TuplePrimElement(mapped.value))
-
-			{
-				state = mapped.state,
-				value = rebuilt
-			}
-		TuplePointerElement(value):
-			mapped: CoreMapState[S, CoreExpr] = mapper(state, value)
-
-			rebuilt: Option[CoreTupleElement] = if same_object(mapped.value, value):
-				None
-			else:
-				Some(TuplePointerElement(mapped.value))
-
-			{
-				state = mapped.state,
-				value = rebuilt
-			}
-		TupleStructElement(value, c_type):
-			mapped: CoreMapState[S, CoreExpr] = mapper(state, value)
-
-			rebuilt: Option[CoreTupleElement] = if same_object(mapped.value, value):
-				None
-			else:
-				Some(TupleStructElement(mapped.value, c_type))
-
-			{
-				state = mapped.state,
-				value = rebuilt
-			}
-		TupleStackResultElement(value):
-			mapped: CoreMapState[S, CoreExpr] = mapper(state, value)
-
-			rebuilt: Option[CoreTupleElement] = if same_object(mapped.value, value):
-				None
-			else:
-				Some(TupleStackResultElement(mapped.value))
-
-			{
-				state = mapped.state,
-				value = rebuilt
-			}
-		TupleVoidElement:
-			{
-				state = state,
-				value = None
-			}
-		TupleFloatElement(value):
-			mapped: CoreMapState[S, CoreExpr] = mapper(state, value)
-
-			rebuilt: Option[CoreTupleElement] = if same_object(mapped.value, value):
-				None
-			else:
-				Some(TupleFloatElement(mapped.value))
-
-			{
-				state = mapped.state,
-				value = rebuilt
-			}
-		TupleFloat32Element(value):
-			mapped: CoreMapState[S, CoreExpr] = mapper(state, value)
-
-			rebuilt: Option[CoreTupleElement] = if same_object(mapped.value, value):
-				None
-			else:
-				Some(TupleFloat32Element(mapped.value))
-
-			{
-				state = mapped.state,
-				value = rebuilt
-			}
-		TupleFloat16Element(value):
-			mapped: CoreMapState[S, CoreExpr] = mapper(state, value)
-
-			rebuilt: Option[CoreTupleElement] = if same_object(mapped.value, value):
-				None
-			else:
-				Some(TupleFloat16Element(mapped.value))
-
-			{
-				state = mapped.state,
-				value = rebuilt
-			}
-
-
-private pure func map_core_state_tuple_elements[S](
-	elements: List[CoreTupleElement],
-	state: S,
-	mapper: pure (S, CoreExpr) -> CoreMapState[S, CoreExpr],
-) -> CoreMapState[S, Option[List[CoreTupleElement]]]:
-	var mapped: List[CoreTupleElement] = []
-	var changed: Bool = False
-	var current_state: S = state
-	var index: Int = 0
-
-	for element in elements:
-		result: CoreMapState[S, Option[CoreTupleElement]] = map_core_state_tuple_element(
-			current_state,
-			mapper,
-			element,
-		)
-		current_state = result.state
-
-		match result.value:
-			Some(mapped_element):
-				mapped = if changed:
-					mapped.append(mapped_element)
-				else:
-					elements
-						.take(index)
-						.append(mapped_element)
-
-				changed = True
-			None:
-				if changed:
-					mapped = mapped.append(element)
-				else:
-					void
 
 		index += 1
 
@@ -5821,26 +5511,6 @@ pure func map_core_aggregate_children_with_state[S](
 				state = mapped_items.state,
 				value = rebuilt
 			}
-		TupleConstructExpr(construct, typ, loc):
-			mapped_elements: CoreMapState[S, Option[List[CoreTupleElement]]] = map_core_state_tuple_elements(
-				construct.elements,
-				state,
-				mapper,
-			)
-
-			rebuilt: CoreExpr = if mapped_elements.value.is_none():
-				expr
-			else:
-				TupleConstructExpr(
-					{ construct | elements = mapped_elements.value.get_or(construct.elements) },
-					typ,
-					loc,
-				)
-
-			{
-				state = mapped_elements.state,
-				value = rebuilt
-			}
 		VectorExpr(items, typ, loc):
 			mapped_items: CoreMapState[S, Option[List[CoreExpr]]] = map_core_state_exprs(
 				items,
@@ -5921,24 +5591,16 @@ pure func map_core_aggregate_children_with_state[S](
 				state = mapped_entries.state,
 				value = rebuilt
 			}
-		RecordExpr(fields, typ, loc):
-			mapped_fields: CoreMapState[S, Option[List[CoreRecordFieldValue]]] = map_core_state_record_fields(
-				fields,
-				state,
-				mapper,
-			)
+		ProductExpr(build, typ, loc):
+			mapped_build: CoreMapState[S, CoreProductBuild] = rewrite_product_build_values(build, state, mapper)
 
-			rebuilt: CoreExpr = if mapped_fields.value.is_none():
+			rebuilt: CoreExpr = if same_object(mapped_build.value, build):
 				expr
 			else:
-				RecordExpr(
-					mapped_fields.value.get_or(fields),
-					typ,
-					loc,
-				)
+				ProductExpr(mapped_build.value, typ, loc)
 
 			{
-				state = mapped_fields.state,
+				state = mapped_build.state,
 				value = rebuilt
 			}
 		RecordUpdateExpr(base, fields, typ, loc):
@@ -5966,29 +5628,24 @@ pure func map_core_aggregate_children_with_state[S](
 				state = mapped_fields.state,
 				value = rebuilt
 			}
-		RecordReuseExpr(source, fields, typ, loc):
+		RecordReuseExpr(source, build, typ, loc):
 			mapped_source: CoreMapState[S, CoreExpr] = mapper(state, source)
-			mapped_fields: CoreMapState[S, Option[List[CoreRecordFieldValue]]] = map_core_state_record_fields(
-				fields,
+			mapped_build: CoreMapState[S, CoreProductBuild] = rewrite_product_build_values(
+				build,
 				mapped_source.state,
 				mapper,
 			)
 
 			rebuilt: CoreExpr = if (
 				same_object(mapped_source.value, source)
-				and mapped_fields.value.is_none()
+				and same_object(mapped_build.value, build)
 			):
 				expr
 			else:
-				RecordReuseExpr(
-					mapped_source.value,
-					mapped_fields.value.get_or(fields),
-					typ,
-					loc,
-				)
+				RecordReuseExpr(mapped_source.value, mapped_build.value, typ, loc)
 
 			{
-				state = mapped_fields.state,
+				state = mapped_build.state,
 				value = rebuilt
 			}
 		RecordCowUpdateExpr(source, fields, typ, loc):
@@ -6014,27 +5671,6 @@ pure func map_core_aggregate_children_with_state[S](
 
 			{
 				state = mapped_source.state,
-				value = rebuilt
-			}
-		RecordConstructExpr(type_name, fields, typ, loc):
-			mapped_fields: CoreMapState[S, Option[List[CoreRecordFieldValue]]] = map_core_state_record_fields(
-				fields,
-				state,
-				mapper,
-			)
-
-			rebuilt: CoreExpr = if mapped_fields.value.is_none():
-				expr
-			else:
-				RecordConstructExpr(
-					type_name,
-					mapped_fields.value.get_or(fields),
-					typ,
-					loc,
-				)
-
-			{
-				state = mapped_fields.state,
 				value = rebuilt
 			}
 		UnionConstructExpr(construct, typ, loc):
@@ -8395,7 +8031,7 @@ pure func map_core_expr_children_with_state[S](
 			map_core_logical_tree_with_state(state, mapper, expr)
 		DebugBlockExpr(_, _, _) | BinaryExpr(_, _, _, _, _) | UnaryExpr(_, _, _, _) | AssignExpr(_, _, _, _) | CastExpr(_, _, _) | UnboxExpr(_, _, _, _) | ProductFieldExpr(_, _, _, _) | BoxExpr(_, _, _) | PreClosureDetachExpr(_, _, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _) | LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | SeqExpr(_, _) | WhileExpr(_, _, _, _) | IfExpr(_, _, _, _, _):
 			map_core_operator_children_with_state(state, mapper, expr)
-		CallExpr(_, _, _, _, _) | TupleExpr(_, _, _) | TupleConstructExpr(_, _, _) | VectorExpr(_, _, _) | ListConstructExpr(_, _, _) | DictExpr(_, _, _) | DictConstructExpr(_, _, _) | RecordExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | RecordConstructExpr(_, _, _, _) | UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | SelectExpr(_, _, _):
+		CallExpr(_, _, _, _, _) | TupleExpr(_, _, _) | VectorExpr(_, _, _) | ListConstructExpr(_, _, _) | DictExpr(_, _, _) | DictConstructExpr(_, _, _) | ProductExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | SelectExpr(_, _, _):
 			map_core_aggregate_children_with_state(state, mapper, expr)
 		ListAllocExpr(_, _, _) | ListGetExpr(_, _, _) | ListHandoffExpr(_, _, _) | ListHandoffSetOwnedExpr(_, _, _) | ListHandoffSetSourceSlotExpr(_, _, _) | ListRetainExpr(_, _, _) | ListSetExpr(_, _, _) | ListSwapExpr(_, _, _) | StringByteReadExpr(_, _, _) | StringByteWriteExpr(_, _, _) | StringByteCopyExpr(_, _, _) | StringSetLenExpr(_, _, _) | TensorLiteralExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | TensorPackedLiteralExpr(_, _, _) | TensorRawFillExpr(_, _, _) | TensorRawReadExpr(_, _, _) | TensorRawWriteExpr(_, _, _) | TensorRawViewLetExpr(_, _, _, _):
 			map_core_storage_children_with_state(state, mapper, expr)

@@ -1,0 +1,266 @@
+-- One physical layout view for authored managed records and generated tuples.
+--
+-- Source fields retain their declared identities in CoreHeapRecordDecl.
+-- Generated tuple rows have no such identity: this view issues their ordinals
+-- from logical tuple order and derives physical types through the complete
+-- generated-row catalog. The backend needs neither invented FieldIds nor an
+-- erased slot representation to emit the shared header, constructor or cleanup.
+import:
+	../stage_06_typecheck/type_system/language_surface_manifest: DeclaredAbiType
+	ir:
+		CoreDecl(GeneratedTupleRecordDecl, HeapRecordDecl),
+		CoreFieldOrdinal,
+		CoreGeneratedTupleRecordDecl,
+		CoreHeapRecordDecl,
+		CoreProductBuild,
+		CoreReleasePolicy,
+		CoreSourceLoc,
+		CoreType(HeapRecordType, TupleType, VoidType),
+		CoreTupleStorageCatalog,
+		CoreTupleStorageFault,
+		core_expr_type,
+		core_field_ordinal,
+		core_field_ordinal_index,
+		core_generated_tuple_record_elements,
+		core_generated_tuple_record_location,
+		core_generated_tuple_record_name,
+		core_type_equal,
+		core_tuple_storage_fault_message,
+		generated_tuple_record_for_type,
+		product_build_fields,
+		tuple_storage_type,
+	type_policy: cleanup_release_policy_for_type
+
+
+---
+A physical field, in declared order. A source name is present only for an
+authored record, where explicit foreign ABI policy may require that spelling.
+Generated members use the backend's ordinal spelling policy.
+---
+record CoreManagedRecordField {
+	ordinal: CoreFieldOrdinal,
+	source_name: Option[String],
+	typ: CoreType,
+	storage: CoreManagedRecordFieldStorage,
+	release_policy: CoreReleasePolicy
+}
+
+
+---
+Void is a unit value, including an accepted tuple element or record field.
+Its logical position remains present, but it has no member, constructor
+parameter or cleanup in C. Its producing expression is evaluated before
+construction by product evaluation normalization.
+---
+fixed union CoreManagedRecordFieldStorage:
+	TypedManagedRecordField
+	UnitManagedRecordField
+
+
+private pure func managed_record_field_storage(typ: CoreType) -> CoreManagedRecordFieldStorage:
+	match typ:
+		VoidType:
+			UnitManagedRecordField
+		_:
+			TypedManagedRecordField
+
+
+union CoreManagedRecordOrigin:
+	DeclaredManagedRecord(Option[DeclaredAbiType])
+	GeneratedTupleManagedRecord(CoreGeneratedTupleRecordDecl)
+
+
+private record CoreManagedRecordLayoutRow {
+	name: String,
+	origin: CoreManagedRecordOrigin,
+	fields: List[CoreManagedRecordField],
+	loc: CoreSourceLoc
+}
+
+
+opaque type CoreManagedRecordLayout = CoreManagedRecordLayoutRow
+
+
+union CoreManagedRecordLayoutFault:
+	GeneratedTupleRowOutsideCatalog(String)
+	GeneratedTupleFieldStorageUnavailable(CoreTupleStorageFault)
+	ManagedProductFieldCountMismatch(String, Int, Int)
+	ManagedProductFieldOrdinalOutsideRow(String, Int)
+	ManagedProductFieldTypeMismatch(String, Int, CoreType, CoreType)
+
+
+pure func managed_record_layout_name(layout: CoreManagedRecordLayout) -> String:
+	from_opaque CoreManagedRecordLayout(layout).name
+
+
+pure func managed_record_layout_origin(layout: CoreManagedRecordLayout) -> CoreManagedRecordOrigin:
+	from_opaque CoreManagedRecordLayout(layout).origin
+
+
+pure func managed_record_layout_fields(layout: CoreManagedRecordLayout) -> List[CoreManagedRecordField]:
+	from_opaque CoreManagedRecordLayout(layout).fields
+
+
+pure func managed_record_layout_location(layout: CoreManagedRecordLayout) -> CoreSourceLoc:
+	from_opaque CoreManagedRecordLayout(layout).loc
+
+
+pure func declared_managed_record_layout(row: CoreHeapRecordDecl) -> CoreManagedRecordLayout:
+	var fields: List[CoreManagedRecordField] = []
+
+	for (ordinal, field) in row.fields.enumerate():
+		fields = fields.append({
+			ordinal = core_field_ordinal(ordinal),
+			source_name = Some(field.name),
+			typ = field.typ,
+			storage = managed_record_field_storage(field.typ),
+			release_policy = field.release_policy,
+		})
+
+	into_opaque CoreManagedRecordLayout({
+		name = row.name,
+		origin = DeclaredManagedRecord(row.abi_type),
+		fields = fields,
+		loc = row.loc,
+	})
+
+
+---
+A layout belongs to the catalog that issued its row. An identically named row
+from another snapshot is insufficient unless its logical shape is registered
+here too. Derive the view from the catalog's row after this exact check.
+---
+pure func generated_tuple_record_layout(
+	catalog: CoreTupleStorageCatalog,
+	row: CoreGeneratedTupleRecordDecl,
+) -> Result[CoreManagedRecordLayout, CoreManagedRecordLayoutFault]:
+	name: String = core_generated_tuple_record_name(row)
+
+	match generated_tuple_record_for_type(catalog, HeapRecordType(name)):
+		Some(registered):
+			if core_type_equal(
+				TupleType(core_generated_tuple_record_elements(row)),
+				TupleType(core_generated_tuple_record_elements(registered)),
+			):
+				registered_tuple_record_layout(catalog, registered)
+			else:
+				Err(GeneratedTupleRowOutsideCatalog(name))
+		None:
+			Err(GeneratedTupleRowOutsideCatalog(name))
+
+
+private pure func registered_tuple_record_layout(
+	catalog: CoreTupleStorageCatalog,
+	row: CoreGeneratedTupleRecordDecl,
+) -> Result[CoreManagedRecordLayout, CoreManagedRecordLayoutFault]:
+	var fields: List[CoreManagedRecordField] = []
+	var failure: Option[CoreManagedRecordLayoutFault] = None
+
+	for (ordinal, logical_type) in core_generated_tuple_record_elements(row).enumerate():
+		if failure.is_none():
+			match tuple_storage_type(catalog, logical_type):
+				Ok(storage_type):
+					fields = fields.append({
+						ordinal = core_field_ordinal(ordinal),
+						source_name = None,
+						typ = storage_type,
+						storage = managed_record_field_storage(storage_type),
+						release_policy = cleanup_release_policy_for_type(storage_type),
+					})
+				Err(fault):
+					failure = Some(GeneratedTupleFieldStorageUnavailable(fault))
+
+	match failure:
+		Some(fault):
+			Err(fault)
+		None:
+			Ok(into_opaque CoreManagedRecordLayout({
+				name = core_generated_tuple_record_name(row),
+				origin = GeneratedTupleManagedRecord(row),
+				fields = fields,
+				loc = core_generated_tuple_record_location(row),
+			}))
+
+
+pure func managed_record_layout_for_decl(
+	catalog: CoreTupleStorageCatalog,
+	decl: CoreDecl,
+) -> Result[Option[CoreManagedRecordLayout], CoreManagedRecordLayoutFault]:
+	match decl:
+		HeapRecordDecl(row):
+			Ok(Some(declared_managed_record_layout(row)))
+		GeneratedTupleRecordDecl(row):
+			layout ?= generated_tuple_record_layout(catalog, row)
+			Ok(Some(layout))
+		_:
+			Ok(None)
+
+
+---
+The value at each checked build ordinal must have the physical field's type.
+Typecheck owns authored tuple semantics. This validation owns only the new
+post-monomorphization storage translation and decoded Core's row promises.
+---
+pure func managed_product_build_fault(
+	layout: CoreManagedRecordLayout,
+	build: CoreProductBuild,
+) -> Option[CoreManagedRecordLayoutFault]:
+	row: CoreManagedRecordLayoutRow = from_opaque CoreManagedRecordLayout(layout)
+	values = product_build_fields(build)
+
+	if values.length() != row.fields.length():
+		Some(ManagedProductFieldCountMismatch(row.name, row.fields.length(), values.length()))
+	else:
+		var failure: Option[CoreManagedRecordLayoutFault] = None
+
+		for value in values:
+			ordinal: Int = core_field_ordinal_index(value.ordinal)
+
+			if failure.is_none():
+				match row.fields.get(ordinal):
+					Some(field):
+						actual_type: CoreType = core_expr_type(value.value)
+
+						if not core_type_equal(field.typ, actual_type):
+							failure = Some(ManagedProductFieldTypeMismatch(
+								row.name,
+								ordinal,
+								field.typ,
+								actual_type,
+							))
+					None:
+						failure = Some(ManagedProductFieldOrdinalOutsideRow(row.name, ordinal))
+
+		failure
+
+
+pure func managed_product_projection_fault(
+	layout: CoreManagedRecordLayout,
+	ordinal: CoreFieldOrdinal,
+	result_type: CoreType,
+) -> Option[CoreManagedRecordLayoutFault]:
+	row: CoreManagedRecordLayoutRow = from_opaque CoreManagedRecordLayout(layout)
+	index: Int = core_field_ordinal_index(ordinal)
+
+	match row.fields.get(index):
+		Some(field):
+			if core_type_equal(field.typ, result_type):
+				None
+			else:
+				Some(ManagedProductFieldTypeMismatch(row.name, index, field.typ, result_type))
+		None:
+			Some(ManagedProductFieldOrdinalOutsideRow(row.name, index))
+
+
+pure func managed_record_layout_fault_message(fault: CoreManagedRecordLayoutFault) -> String:
+	match fault:
+		GeneratedTupleRowOutsideCatalog(name):
+			"generated tuple row `${name}` is not registered with this shape; use the row issued by the complete catalog"
+		GeneratedTupleFieldStorageUnavailable(storage_fault):
+			core_tuple_storage_fault_message(storage_fault)
+		ManagedProductFieldCountMismatch(name, expected, actual):
+			"managed product `${name}` has ${actual} fields but its row requires ${expected}; build each logical field once"
+		ManagedProductFieldOrdinalOutsideRow(name, ordinal):
+			"managed product `${name}` has no field ${ordinal}; use an ordinal issued by its row"
+		ManagedProductFieldTypeMismatch(name, ordinal, _, _):
+			"managed product `${name}` field ${ordinal} has an incompatible type; use its registered physical field type"

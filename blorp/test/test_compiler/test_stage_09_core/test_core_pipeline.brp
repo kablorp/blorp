@@ -1,4 +1,5 @@
 import:
+	../test_support_core_product_build: fixture_build
 	../../../src/compiler/stage_09_core/c_type_layout: type_requires_release
 	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
 	../../../src/compiler/stage_09_core/ir:
@@ -32,8 +33,7 @@ import:
 			LiteralExpr,
 			LiteralMatchExpr,
 			LogicalExpr,
-			RecordConstructExpr,
-			RecordExpr,
+			ProductExpr,
 			RecordCowUpdateExpr,
 			RecordReuseExpr,
 			RecordUpdateExpr,
@@ -45,6 +45,8 @@ import:
 		),
 		CoreFunctionKind(UserFunction),
 		CoreFunctionOrigin(ConsumingClone),
+		CoreProductBuild,
+		CoreProductFieldValue,
 		core_function_declared_origin,
 		CoreListStorageLayout(InlineListStorage, PointerListStorage),
 		CoreLiteral(BoolLiteral, IntLiteral, StringLiteral),
@@ -64,6 +66,8 @@ import:
 		CoreSemanticMatchAccessor(RootSemanticMatchAccessor),
 		CoreSemanticMatchTree(SemanticLiteralMatch, SemanticMatchLeaf),
 		CoreSourceLoc,
+		product_build_fields,
+		product_build_in_declared_order,
 		synthetic_core_source_loc,
 		CoreTensorDim(TensorStaticDim),
 		CoreType(BoxedResultType, FunctionType, HeapRecordType, NamedType, TensorType, VoidType),
@@ -83,6 +87,7 @@ import:
 		core_program_to_json,
 		core_field_ordinal,
 		core_field_ordinal_index,
+		core_var_equal,
 	../../../src/compiler/stage_02_lex/name_table: EMPTY_NAME_TABLE
 	../../../src/compiler/stage_08_core_lower/lower: QUESTION_BIND_ID_BAND
 	../../../src/compiler/stage_10_backend/c_naming: perceus_temporary_spelling
@@ -224,10 +229,15 @@ pure func test_pre_dce_tail_resolves_selected_direct_call() -> Bool:
 		source_files = []
 	}
 
-	prepared: CoreProgram = prepared_core_program_value(run_pre_dce_tail(program))
-	json: String = core_program_to_json(prepared).to_string()
+	match run_pre_dce_tail(program):
+		Ok(value):
+			prepared = prepared_core_program_value(value)
+			json: String = core_program_to_json(prepared).to_string()
 
-	json.contains("\"call_kind\":{\"kind\":\"user\"") and not json.contains("selected_direct")
+			json.contains("\"call_kind\":{\"kind\":\"user\"") and not json.contains("selected_direct")
+
+		Err(_):
+			False
 
 
 pure func test_pre_dce_tail_handles_deep_logical_tree() -> Bool:
@@ -249,16 +259,21 @@ pure func test_pre_dce_tail_handles_deep_logical_tree() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	prepared: CoreProgram = prepared_core_program_value(run_pre_dce_tail(program))
+	match run_pre_dce_tail(program):
+		Ok(value):
+			prepared = prepared_core_program_value(value)
 
-	match prepared.decls.get(0):
-		Some(FunctionDecl(function)):
-			match function.body:
-				Some(LogicalExpr(_, _, _, _, _)):
-					True
+			match prepared.decls.get(0):
+				Some(FunctionDecl(function)):
+					match function.body:
+						Some(LogicalExpr(_, _, _, _, _)):
+							True
+						_:
+							False
 				_:
 					False
-		_:
+
+		Err(_):
 			False
 
 
@@ -337,10 +352,15 @@ pure func test_pre_dce_tail_projects_semantic_matches() -> Bool:
 		source_files = []
 	}
 
-	prepared: CoreProgram = prepared_core_program_value(run_pre_dce_tail(program))
-	json: String = core_program_to_json(prepared).to_string()
+	match run_pre_dce_tail(program):
+		Ok(value):
+			prepared = prepared_core_program_value(value)
+			json: String = core_program_to_json(prepared).to_string()
 
-	json.contains("\"kind\":\"literal_match\"") and not json.contains("\"kind\":\"semantic_match\"")
+			json.contains("\"kind\":\"literal_match\"") and not json.contains("\"kind\":\"semantic_match\"")
+
+		Err(_):
+			False
 
 
 pure func test_pre_dce_tail_preserves_erased_float_argument_box() -> Bool:
@@ -390,16 +410,21 @@ pure func test_pre_dce_tail_preserves_erased_float_argument_box() -> Bool:
 		source_files = []
 	}
 
-	prepared: CoreProgram = prepared_core_program_value(run_pre_dce_tail(program))
+	match run_pre_dce_tail(program):
+		Ok(value):
+			prepared = prepared_core_program_value(value)
 
-	match prepared.decls:
-		[FunctionDecl(function_info)]:
-			match function_info.body:
-				Some(CallExpr(DirectRuntimeCall(runtime), _, [_, _, BoxExpr(box, NamedType("Ptr", []), _)], _, _)):
-					runtime.name == "blorp_vector_set_cow_nullable" and box.kind == FloatBox
+			match prepared.decls:
+				[FunctionDecl(function_info)]:
+					match function_info.body:
+						Some(CallExpr(DirectRuntimeCall(runtime), _, [_, _, BoxExpr(box, NamedType("Ptr", []), _)], _, _)):
+							runtime.name == "blorp_vector_set_cow_nullable" and box.kind == FloatBox
+						_:
+							False
 				_:
 					False
-		_:
+
+		Err(_):
 			False
 
 
@@ -531,7 +556,9 @@ pure func test_record_update_normalization_preserves_complete_field_shape() -> B
 	match lower_record_updates_for_ownership(record_update_program()).decls:
 		[HeapRecordDecl(_), FunctionDecl(function_info)]:
 			match function_info.body:
-				Some(RecordExpr(fields, _, _)):
+				Some(ProductExpr(build, _, _)):
+					fields: List[CoreProductFieldValue] = product_build_fields(build)
+
 					match (fields.get(0), fields.get(1)):
 						(Some(first), Some(second)):
 							first_is_replacement: Bool = match first.value:
@@ -548,9 +575,9 @@ pure func test_record_update_normalization_preserves_complete_field_shape() -> B
 
 							(
 								fields.length() == 2
-								and first.name == "x"
+								and core_field_ordinal_index(first.ordinal) == 0
 								and first_is_replacement
-								and second.name == "y"
+								and core_field_ordinal_index(second.ordinal) == 1
 								and second_uses_base
 							)
 						_:
@@ -668,18 +695,19 @@ pure func heap_record_update_program_without_decl() -> CoreProgram:
 	}
 
 
--- A sparse update cannot guess its omitted fields without a declaration.
--- Keeping its carrier makes the ownership-boundary invariant reject it.
 -- JSON rejects spelling/ref disagreement at ingress. Inside checked Core,
--- field identity selects the declaration row and supplies emitted spelling.
-pure func test_record_update_materialization_uses_declared_field_names() -> Bool:
+-- exact field identity selects the declaration ordinal, including omitted
+-- fields; the replacement's carried spelling cannot change that position.
+pure func test_record_update_materialization_uses_declared_field_identity() -> Bool:
 	program: CoreProgram = record_update_program()
 	x: CoreRecordFieldValue = {
-		ref = core_field_ref(3), name = "carried_wrong_x",
+		ref = core_field_ref(3),
+		name = "carried_wrong_x",
 		value = LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc())
 	}
 	y: CoreRecordFieldValue = {
-		ref = core_field_ref(4), name = "carried_wrong_y",
+		ref = core_field_ref(4),
+		name = "carried_wrong_y",
 		value = LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc())
 	}
 	var valid: Bool = True
@@ -689,7 +717,9 @@ pure func test_record_update_materialization_uses_declared_field_names() -> Bool
 				match function_info.body:
 					Some(RecordUpdateExpr(base, _, typ, loc)):
 						update = RecordUpdateExpr(base, replacements, typ, loc)
-						{ program | decls = [declaration, FunctionDecl({ function_info | body = Some(update) })] }
+						{ program |
+							decls = [declaration, FunctionDecl({ function_info | body = Some(update) })]
+						}
 					_:
 						program
 			_:
@@ -697,32 +727,37 @@ pure func test_record_update_materialization_uses_declared_field_names() -> Bool
 		match lower_record_updates_for_ownership(modified).decls:
 			[_, FunctionDecl(function_info)]:
 				match function_info.body:
-					Some(body):
-						var result: CoreExpr = body
-						var staging: Bool = True
-						while staging:
-							match result:
-								LetExpr(_, _, _, _, tail):
-									result = tail
-								_:
-									staging = False
-						match result:
-							RecordExpr(fields, _, _):
-								match fields:
-									[first, second]:
-										valid = valid and first.name == "x" and second.name == "y"
-										valid = valid and core_field_refs_equal(first.ref, x.ref) and core_field_refs_equal(second.ref, y.ref)
+					Some(ProductExpr(build, _, _)):
+						match product_build_fields(build):
+							[first, second]:
+								valid = valid and core_field_ordinal_index(first.ordinal) == 0 and core_field_ordinal_index(second.ordinal) == 1
+								match (first.value, second.value):
+									(LiteralExpr(IntLiteral(10), _, _), ProductFieldExpr(VarExpr(base, _, _), ordinal, _, _)):
+										valid = valid and core_field_ordinal_index(ordinal) == 1 and base.name == "point" and base.id == 0
 									_:
 										valid = False
 							_:
 								valid = False
-					None:
+					Some(LetExpr(y_variable, False, _, LiteralExpr(IntLiteral(20), _, _), LetExpr(x_variable, False, _, LiteralExpr(IntLiteral(10), _, _), ProductExpr(build, _, _)))):
+						match product_build_fields(build):
+							[first, second]:
+								valid = valid and core_field_ordinal_index(first.ordinal) == 0 and core_field_ordinal_index(second.ordinal) == 1
+								match (first.value, second.value):
+									(VarExpr(actual_x, _, _), VarExpr(actual_y, _, _)):
+										valid = valid and core_var_equal(actual_x, x_variable) and core_var_equal(actual_y, y_variable)
+									_:
+										valid = False
+							_:
+								valid = False
+					_:
 						valid = False
 			_:
 				valid = False
 	valid
 
 
+-- A sparse update cannot guess its omitted fields without a declaration.
+-- Keeping its carrier makes the ownership-boundary invariant reject it.
 pure func test_record_update_without_declaration_is_rejected() -> Bool:
 	program: CoreProgram = lower_record_updates_for_ownership(heap_record_update_program_without_decl())
 	match required_final_invariant(program):
@@ -743,7 +778,7 @@ pure func test_perceus_materializes_record_update_for_ownership() -> Bool:
 
 	(
 		not json.contains("\"kind\":\"record_update\"")
-		and json.contains("\"kind\":\"record\"")
+		and json.contains("\"kind\":\"product\"")
 		and json.contains("\"kind\":\"product_field\"")
 		and json.contains("\"ordinal\":1")
 	)
@@ -752,30 +787,17 @@ pure func test_perceus_materializes_record_update_for_ownership() -> Bool:
 -- `CounterBox` declares `count` before `limit`; this literal is written
 -- `limit` first, and each field value is a call.
 pure func counter_box_written_limit_first_program() -> CoreProgram:
+	build: CoreProductBuild = fixture_build(2, [
+		(1, selected_call_without_callee_id("limit_value", 2)),
+		(0, selected_call_without_callee_id("count_value", 3)),
+	])
 	main: CoreDecl = FunctionDecl({
 		name = "main",
 		source_module = None,
 		type_params = [],
 		params = [],
 		return_type = HeapRecordType("CounterBox"),
-		body = Some(
-			RecordExpr(
-				[
-					{
-						ref = core_field_ref(2),
-						name = "limit",
-						value = selected_call_without_callee_id("limit_value", 2)
-					},
-					{
-						ref = core_field_ref(0),
-						name = "count",
-						value = selected_call_without_callee_id("count_value", 3)
-					},
-				],
-				HeapRecordType("CounterBox"),
-				synthetic_core_source_loc(),
-			),
-		),
+		body = Some(ProductExpr(build, HeapRecordType("CounterBox"), synthetic_core_source_loc())),
 		is_pure = True,
 		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
 		module = FIXTURE_NO_SOURCE_MODULE,
@@ -804,38 +826,46 @@ pure func calls_function(expr: CoreExpr, def_id: Int) -> Bool:
 			False
 
 
-pure func test_perceus_sees_record_literal_fields_bound_in_written_order() -> Bool:
+-- Product evaluation binds each call in written order before ownership.
+-- Perceus sees two named values, and the build retains the checked [1, 0]
+-- ordinal permutation for emission.
+pure func test_perceus_keeps_record_build_in_written_order() -> Bool:
 	program: CoreProgram = run_late_core_span(
 		None,
 		Some(PERCEUS_PASS),
 		counter_box_written_limit_first_program(),
 	)
-	var bound_in_written_order: Bool = False
+	var kept_in_written_order: Bool = False
 
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(function_info):
 				if function_info.name == "main":
 					match function_info.body:
-						Some(LetExpr(limit_var, False, _, limit_rhs, LetExpr(count_var, False, _, count_rhs, RecordExpr([limit_field, count_field], _, _)))):
-							reads_bound_values: Bool = match (limit_field.value, count_field.value):
-								(VarExpr(limit_read, _, _), VarExpr(count_read, _, _)):
-									limit_read.id == limit_var.id and count_read.id == count_var.id
-								_:
-									False
-							bound_in_written_order = (
-								calls_function(limit_rhs, 2)
-								and calls_function(count_rhs, 3)
-								and limit_field.name == "limit"
-								and count_field.name == "count"
-								and reads_bound_values
-							)
+						Some(LetExpr(limit_var, False, _, limit_call, LetExpr(count_var, False, _, count_call, ProductExpr(build, _, _)))):
+							match product_build_fields(build):
+								[limit_field, count_field]:
+									match limit_field.value:
+										VarExpr(limit_use, _, _):
+											match count_field.value:
+												VarExpr(count_use, _, _):
+													kept_in_written_order = (
+														calls_function(limit_call, 2)
+														and calls_function(count_call, 3)
+														and core_var_equal(limit_var, limit_use)
+														and core_var_equal(count_var, count_use)
+														and core_field_ordinal_index(limit_field.ordinal) == 1
+														and core_field_ordinal_index(count_field.ordinal) == 0
+													)
+												_: void
+										_: void
+								_: void
 						_:
 							void
 			_:
 				void
 
-	bound_in_written_order and core_pass_state_binder_identity_violations(EMPTY_NAME_TABLE, PERCEUS_PASS, program).is_empty()
+	kept_in_written_order
 
 
 pure func counter_box_decl() -> CoreDecl:
@@ -897,18 +927,11 @@ pure func heap_record_self_update_program() -> CoreProgram:
 		box_var,
 		True,
 		box_type,
-		RecordConstructExpr(
-			"CounterBox",
-			[
-				{
-					ref = core_field_ref(0),name = "count",
-					value = LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc())
-				},
-				{
-					ref = core_field_ref(2),name = "limit",
-					value = LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc())
-				},
-			],
+		ProductExpr(
+			product_build_in_declared_order([
+				LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc()),
+				LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc()),
+			]),
 			box_type,
 			synthetic_core_source_loc(),
 		),
@@ -1516,7 +1539,7 @@ pure func test_record_result_without_owned_parameter_builds_fresh_record() -> Bo
 	).to_string()
 
 	(
-		json.contains("\"kind\":\"record\"")
+		json.contains("\"kind\":\"product\"")
 		and not json.contains("\"kind\":\"record_cow_update\"")
 		and not json.contains("\"kind\":\"record_reuse\"")
 	)
@@ -1628,7 +1651,7 @@ pure func test_update_of_owned_local_at_last_use_transfers_owner() -> Bool:
 		owned_local_update_program(VarExpr(local_box_var("updated", 2), box_type, synthetic_core_source_loc())),
 	)
 
-	json.contains("\"kind\":\"record_cow_update\"") and not json.contains("\"kind\":\"record\"")
+	json.contains("\"kind\":\"record_cow_update\"") and not json.contains("\"kind\":\"product\"")
 
 
 ---
@@ -1648,7 +1671,7 @@ pure func test_update_of_owned_local_read_afterwards_builds_fresh_record() -> Bo
 	)
 	json: String = lowered_program_json(owned_local_update_program(read_after))
 
-	json.contains("\"kind\":\"record\"") and not json.contains("\"kind\":\"record_cow_update\"")
+	json.contains("\"kind\":\"product\"") and not json.contains("\"kind\":\"record_cow_update\"")
 
 
 ---
@@ -1688,7 +1711,7 @@ pure func test_update_of_owned_local_inside_branch_transfers_owner() -> Bool:
 			program
 	json: String = lowered_program_json(branching)
 
-	json.contains("\"kind\":\"record_cow_update\"") and not json.contains("\"kind\":\"record\"")
+	json.contains("\"kind\":\"record_cow_update\"") and not json.contains("\"kind\":\"product\"")
 
 
 ---
@@ -1720,18 +1743,11 @@ pure func test_update_of_owned_local_inside_loop_builds_fresh_record() -> Bool:
 									fresh_var,
 									False,
 									box_type,
-									RecordConstructExpr(
-										"CounterBox",
-										[
-											{
-												ref = core_field_ref(0),name = "count",
-												value = LiteralExpr(IntLiteral(1), int_type(), synthetic_core_source_loc())
-											},
-											{
-												ref = core_field_ref(2),name = "limit",
-												value = LiteralExpr(IntLiteral(2), int_type(), synthetic_core_source_loc())
-											},
-										],
+									ProductExpr(
+										product_build_in_declared_order([
+											LiteralExpr(IntLiteral(1), int_type(), synthetic_core_source_loc()),
+											LiteralExpr(IntLiteral(2), int_type(), synthetic_core_source_loc()),
+										]),
 										box_type,
 										synthetic_core_source_loc(),
 									),
@@ -1754,7 +1770,7 @@ pure func test_update_of_owned_local_inside_loop_builds_fresh_record() -> Bool:
 			program
 	json: String = lowered_program_json(looping)
 
-	json.contains("\"kind\":\"record\"") and not json.contains("\"kind\":\"record_cow_update\"")
+	json.contains("\"kind\":\"product\"") and not json.contains("\"kind\":\"record_cow_update\"")
 
 
 pure func consuming_record_update_loop_program() -> CoreProgram:
@@ -1812,18 +1828,11 @@ pure func consuming_record_update_loop_program() -> CoreProgram:
 		box_var,
 		True,
 		box_type,
-		RecordConstructExpr(
-			"CounterBox",
-			[
-				{
-					ref = core_field_ref(0),name = "count",
-					value = LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc())
-				},
-				{
-					ref = core_field_ref(2),name = "limit",
-					value = LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc())
-				},
-			],
+		ProductExpr(
+			product_build_in_declared_order([
+				LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc()),
+				LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc()),
+			]),
 			box_type,
 			synthetic_core_source_loc(),
 		),
@@ -2001,18 +2010,11 @@ pure func heap_record_branch_self_update_program(
 		box_var,
 		True,
 		box_type,
-		RecordConstructExpr(
-			"CounterBox",
-			[
-				{
-					ref = core_field_ref(0),name = "count",
-					value = LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc())
-				},
-				{
-					ref = core_field_ref(2),name = "limit",
-					value = LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc())
-				},
-			],
+		ProductExpr(
+			product_build_in_declared_order([
+				LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc()),
+				LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc()),
+			]),
 			box_type,
 			synthetic_core_source_loc(),
 		),
@@ -2088,7 +2090,7 @@ pure func test_record_reuse_rejects_mixed_if_branches() -> Bool:
 	).to_string()
 
 	(
-		json.contains("\"kind\":\"record\"")
+		json.contains("\"kind\":\"product\"")
 		and not json.contains("\"kind\":\"record_reuse\"")
 		and not json.contains("\"kind\":\"record_update\"")
 	)
@@ -2106,7 +2108,7 @@ pure func test_record_reuse_rejects_if_condition_that_assigns_target() -> Bool:
 	).to_string()
 
 	(
-		json.contains("\"kind\":\"record\"")
+		json.contains("\"kind\":\"product\"")
 		and not json.contains("\"kind\":\"record_reuse\"")
 		and not json.contains("\"kind\":\"record_update\"")
 	)
@@ -2198,18 +2200,11 @@ pure func heap_record_match_self_update_program(
 		box_var,
 		True,
 		box_type,
-		RecordConstructExpr(
-			"CounterBox",
-			[
-				{
-					ref = core_field_ref(0),name = "count",
-					value = LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc())
-				},
-				{
-					ref = core_field_ref(2),name = "limit",
-					value = LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc())
-				},
-			],
+		ProductExpr(
+			product_build_in_declared_order([
+				LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc()),
+				LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc()),
+			]),
 			box_type,
 			synthetic_core_source_loc(),
 		),
@@ -2269,7 +2264,7 @@ pure func test_record_reuse_rejects_mixed_constructor_match_branches() -> Bool:
 	).to_string()
 
 	(
-		json.contains("\"kind\":\"record\"")
+		json.contains("\"kind\":\"product\"")
 		and not json.contains("\"kind\":\"record_reuse\"")
 		and not json.contains("\"kind\":\"record_update\"")
 	)
@@ -2288,7 +2283,7 @@ pure func test_record_reuse_rejects_constructor_match_scrutinee_that_assigns_tar
 	).to_string()
 
 	(
-		json.contains("\"kind\":\"record\"")
+		json.contains("\"kind\":\"product\"")
 		and not json.contains("\"kind\":\"record_reuse\"")
 		and not json.contains("\"kind\":\"record_update\"")
 	)
@@ -2307,7 +2302,7 @@ pure func test_record_reuse_rejects_malformed_constructor_match_result_type() ->
 	).to_string()
 
 	(
-		json.contains("\"kind\":\"record\"")
+		json.contains("\"kind\":\"product\"")
 		and not json.contains("\"kind\":\"record_reuse\"")
 		and not json.contains("\"kind\":\"record_update\"")
 	)
@@ -2451,18 +2446,11 @@ pure func heap_record_literal_match_self_update_program(
 		box_var,
 		True,
 		box_type,
-		RecordConstructExpr(
-			"CounterBox",
-			[
-				{
-					ref = core_field_ref(0),name = "count",
-					value = LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc())
-				},
-				{
-					ref = core_field_ref(2),name = "limit",
-					value = LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc())
-				},
-			],
+		ProductExpr(
+			product_build_in_declared_order([
+				LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc()),
+				LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc()),
+			]),
 			box_type,
 			synthetic_core_source_loc(),
 		),
@@ -2527,7 +2515,7 @@ pure func test_record_reuse_rejects_mixed_literal_match_branches() -> Bool:
 	).to_string()
 
 	(
-		json.contains("\"kind\":\"record\"")
+		json.contains("\"kind\":\"product\"")
 		and not json.contains("\"kind\":\"record_reuse\"")
 		and not json.contains("\"kind\":\"record_update\"")
 	)
@@ -2546,7 +2534,7 @@ pure func test_record_reuse_rejects_literal_match_scrutinee_that_assigns_target(
 	).to_string()
 
 	(
-		json.contains("\"kind\":\"record\"")
+		json.contains("\"kind\":\"product\"")
 		and not json.contains("\"kind\":\"record_reuse\"")
 		and not json.contains("\"kind\":\"record_update\"")
 	)
@@ -2565,7 +2553,7 @@ pure func test_record_reuse_rejects_malformed_literal_match_result_type() -> Boo
 	).to_string()
 
 	(
-		json.contains("\"kind\":\"record\"")
+		json.contains("\"kind\":\"product\"")
 		and not json.contains("\"kind\":\"record_reuse\"")
 		and not json.contains("\"kind\":\"record_update\"")
 	)
@@ -2753,18 +2741,11 @@ pure func heap_record_nested_literal_match_self_update_program(
 		box_var,
 		True,
 		box_type,
-		RecordConstructExpr(
-			"CounterBox",
-			[
-				{
-					ref = core_field_ref(0),name = "count",
-					value = LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc())
-				},
-				{
-					ref = core_field_ref(2),name = "limit",
-					value = LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc())
-				},
-			],
+		ProductExpr(
+			product_build_in_declared_order([
+				LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc()),
+				LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc()),
+			]),
 			box_type,
 			synthetic_core_source_loc(),
 		),
@@ -2822,7 +2803,7 @@ pure func test_record_reuse_rejects_mixed_nested_literal_match_results() -> Bool
 	).to_string()
 
 	(
-		json.contains("\"kind\":\"record\"")
+		json.contains("\"kind\":\"product\"")
 		and not json.contains("\"kind\":\"record_reuse\"")
 		and not json.contains("\"kind\":\"record_update\"")
 	)
@@ -2856,7 +2837,7 @@ pure func test_record_reuse_rejects_mixed_nested_literal_match_fallback_result()
 	).to_string()
 
 	(
-		json.contains("\"kind\":\"record\"")
+		json.contains("\"kind\":\"product\"")
 		and not json.contains("\"kind\":\"record_reuse\"")
 		and not json.contains("\"kind\":\"record_update\"")
 	)
@@ -2875,7 +2856,7 @@ pure func test_record_reuse_rejects_malformed_nested_literal_match_result_type()
 	).to_string()
 
 	(
-		json.contains("\"kind\":\"record\"")
+		json.contains("\"kind\":\"product\"")
 		and not json.contains("\"kind\":\"record_reuse\"")
 		and not json.contains("\"kind\":\"record_update\"")
 	)
@@ -2894,7 +2875,7 @@ pure func test_record_reuse_rejects_nested_length_match_body() -> Bool:
 	).to_string()
 
 	(
-		json.contains("\"kind\":\"record\"")
+		json.contains("\"kind\":\"product\"")
 		and not json.contains("\"kind\":\"record_reuse\"")
 		and not json.contains("\"kind\":\"record_update\"")
 	)
@@ -2965,18 +2946,11 @@ pure func heap_record_nested_self_update_program() -> CoreProgram:
 		box_var,
 		True,
 		box_type,
-		RecordConstructExpr(
-			"CounterBox",
-			[
-				{
-					ref = core_field_ref(0),name = "count",
-					value = LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc())
-				},
-				{
-					ref = core_field_ref(2),name = "limit",
-					value = LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc())
-				},
-			],
+		ProductExpr(
+			product_build_in_declared_order([
+				LiteralExpr(IntLiteral(10), int_type(), synthetic_core_source_loc()),
+				LiteralExpr(IntLiteral(20), int_type(), synthetic_core_source_loc()),
+			]),
 			box_type,
 			synthetic_core_source_loc(),
 		),
@@ -3020,7 +2994,8 @@ pure func test_nested_heap_record_self_update_preserves_overwritten_replacement_
 	(
 		json.count("\"kind\":\"record_reuse\"") == 1
 		and not json.contains("\"kind\":\"record_update\"")
-		and not json.contains("\"kind\":\"record\"")
+		-- Only the fixture's initial record is built fresh; both updates reuse it.
+		and json.count("\"kind\":\"product\"") == 1
 		and json.contains("\"name\":\"$blorp$record_update$field$__record_update$1$0\"")
 		and json.contains("\"name\":\"$blorp$record_update$field$__record_update$2$0\"")
 		and json.contains("\"name\":\"$blorp$record_update$field$__record_update$2$1\"")
@@ -3102,7 +3077,7 @@ pure func test_record_reuse_rejects_fields_that_assign_the_target() -> Bool:
 	).to_string()
 
 	(
-		json.contains("\"kind\":\"record\"")
+		json.contains("\"kind\":\"product\"")
 		and not json.contains("\"kind\":\"record_reuse\"")
 		and not json.contains("\"kind\":\"record_update\"")
 	)
@@ -3143,7 +3118,11 @@ pure func test_record_reuse_classification_rejects_ordinary_let_assignment() -> 
 			temporary_var,
 			False,
 			box_type,
-			RecordConstructExpr("CounterBox", [], box_type, synthetic_core_source_loc()),
+			ProductExpr(
+				product_build_in_declared_order([]),
+				box_type,
+				synthetic_core_source_loc(),
+			),
 			VarExpr(temporary_var, box_type, synthetic_core_source_loc()),
 		),
 		VoidType,
@@ -3157,7 +3136,7 @@ pure func test_record_reuse_classification_rejects_ordinary_let_assignment() -> 
 	json: String = core_program_to_json(lower_record_updates_for_ownership(program)).to_string()
 
 	(
-		json.contains("\"kind\":\"record_construct\"")
+		json.contains("\"kind\":\"product\"")
 		and not json.contains("\"kind\":\"record_reuse\"")
 		and not json.contains("\"kind\":\"record_update\"")
 	)
@@ -3545,7 +3524,10 @@ tests: TestSuite = {
 			"record update normalization releases changed program",
 			test_record_update_normalization_releases_changed_program,
 		),
-		("Checked update identities supply declaration field names", test_record_update_materialization_uses_declared_field_names),
+		(
+			"record update materialization uses declared field identity",
+			test_record_update_materialization_uses_declared_field_identity,
+		),
 		(
 			"record update without a declaration is rejected",
 			test_record_update_without_declaration_is_rejected,
@@ -3555,8 +3537,8 @@ tests: TestSuite = {
 			test_perceus_materializes_record_update_for_ownership,
 		),
 		(
-			"Perceus sees record literal fields bound in written order",
-			test_perceus_sees_record_literal_fields_bound_in_written_order,
+			"Perceus keeps a record build in written order",
+			test_perceus_keeps_record_build_in_written_order,
 		),
 		(
 			"Perceus marks heap-record self update for reuse",

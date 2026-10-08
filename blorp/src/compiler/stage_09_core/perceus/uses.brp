@@ -48,13 +48,13 @@ import:
 			LambdaExpr, LetExpr, ListConstructExpr, ListAllocExpr, ListGetExpr, ListHandoffExpr,
 			ListHandoffSetOwnedExpr, ListHandoffSetSourceSlotExpr, ListRetainExpr, ListSetExpr,
 			ListSwapExpr, LiteralExpr, LogicalExpr, PreClosureConcurrentExpr,
-			PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr, RecordConstructExpr, RecordExpr,
+			PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr, ProductExpr,
 			RecordCowUpdateExpr, RecordReuseExpr, RecordUpdateExpr, ResourceCleanupExitExpr,
 			ResourceScopeExpr, SelectExpr, SeqExpr, StaticStringLiteralExpr, StringByteCopyExpr,
 			StringByteReadExpr, StringByteWriteExpr, StringSetLenExpr, TailrecListSpreadLoopExpr,
 			TailrecListSpreadRecurExpr, TailrecLoopExpr, TailrecRecurExpr, TensorBoxedLiteralExpr,
 			TensorRawFillExpr, TensorRawReadExpr, TensorRawViewLetExpr, TensorRawWriteExpr,
-			TupleConstructExpr, TupleExpr, UnaryExpr, UnboxExpr, UnionConstructExpr,
+			TupleExpr, UnaryExpr, UnboxExpr, UnionConstructExpr,
 			VarExpr, VectorExpr, VoidExpr, WhileExpr, LiteralMatchExpr, LengthMatchExpr,
 		),
 		CoreFunctionKind(ClosureBodyFunction),
@@ -72,17 +72,11 @@ import:
 		CoreParam,
 		CorePreClosureConcurrentBinding,
 		CoreRecordCowField,
-		CoreRecordFieldValue,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy, StackResultReleasePolicy),
 		CoreRetainPolicy(ArcRetainPolicy, StackResultRetainPolicy),
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSourceLoc,
-		CoreTupleConstruct,
-		CoreTupleElement(
-			TupleFloat16Element, TupleFloat32Element, TupleFloatElement, TuplePointerElement,
-			TuplePrimElement, TupleStackResultElement, TupleStructElement, TupleVoidElement,
-		),
 		CoreType(BoxedResultType, UnionType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType, VoidType),
 		CoreUnboxKind(PointerUnbox),
 		CoreVar,
@@ -91,6 +85,7 @@ import:
 		core_node_id_raw,
 		core_var_equal,
 		core_vars_have_same_definition,
+		product_build_values,
 		synthetic_core_source_loc,
 	../ownership:
 		OwnershipArgMode(BorrowArg, TransferArg),
@@ -418,18 +413,6 @@ private pure func count_uses_in_boxed_values(
 	total
 
 
-private pure func count_uses_in_record_fields(
-	name: String,
-	fields: List[CoreRecordFieldValue],
-) -> Int:
-	var total: Int = 0
-
-	for field in fields:
-		total += count_uses(name, field.value)
-
-	total
-
-
 private pure func count_uses_in_record_cow_fields(
 	name: String,
 	fields: List[CoreRecordCowField],
@@ -684,19 +667,6 @@ private pure func summarize_borrowed_exprs(
 
 	for expr in exprs:
 		summaries = summaries.append(summarize_linear_borrow(env, name, expr))
-
-	aggregate_ownership_uses(summaries)
-
-
-private pure func summarize_record_fields(
-	env: PerceusEnv,
-	name: String,
-	fields: List[CoreRecordFieldValue],
-) -> OwnershipUseSummary:
-	var summaries: List[OwnershipUseSummary] = []
-
-	for field in fields:
-		summaries = summaries.append(summarize_linear_ownership_uses(env, name, field.value))
 
 	aggregate_ownership_uses(summaries)
 
@@ -2732,16 +2702,16 @@ private pure func summarize_linear_ownership_uses_non_binding(
 			summarize_exprs(env, name, items)
 		VectorExpr(items, typ, loc):
 			summarize_exprs(env, name, items)
-		RecordExpr(fields, typ, loc):
-			summarize_record_fields(env, name, fields)
+		ProductExpr(build, typ, loc):
+			summarize_exprs(env, name, product_build_values(build))
 		RecordUpdateExpr(base, fields, typ, loc):
 			seq_ownership_uses(
 				summarize_linear_ownership_uses(env, name, base),
-				summarize_record_fields(env, name, fields),
+				summarize_exprs(env, name, fields.map(func(field): field.value)),
 			)
-		RecordReuseExpr(source, fields, typ, loc):
+		RecordReuseExpr(source, build, typ, loc):
 			seq_ownership_uses(
-				summarize_record_fields(env, name, fields),
+				summarize_exprs(env, name, product_build_values(build)),
 				summarize_linear_ownership_uses(env, name, source),
 			)
 		RecordCowUpdateExpr(source, fields, typ, loc):
@@ -2749,8 +2719,6 @@ private pure func summarize_linear_ownership_uses_non_binding(
 				summarize_record_cow_fields(env, name, fields),
 				summarize_linear_ownership_uses(env, name, source),
 			)
-		RecordConstructExpr(type_name, fields, typ, loc):
-			summarize_record_fields(env, name, fields)
 		ListConstructExpr(construct, typ, loc):
 			summarize_boxed_storage_values(env, name, construct.elements)
 		ListAllocExpr(alloc, typ, loc):
@@ -3842,16 +3810,14 @@ pure func count_uses(name: String, expr: CoreExpr) -> Int:
 			count_uses_in_exprs(name, items)
 		VectorExpr(items, typ, loc):
 			count_uses_in_exprs(name, items)
-		RecordExpr(fields, typ, loc):
-			count_uses_in_record_fields(name, fields)
+		ProductExpr(build, typ, loc):
+			count_uses_in_exprs(name, product_build_values(build))
 		RecordUpdateExpr(base, fields, typ, loc):
-			count_uses(name, base) + count_uses_in_record_fields(name, fields)
-		RecordReuseExpr(source, fields, typ, loc):
-			count_uses(name, source) + count_uses_in_record_fields(name, fields)
+			count_uses(name, base) + count_uses_in_exprs(name, fields.map(func(field): field.value))
+		RecordReuseExpr(source, build, typ, loc):
+			count_uses(name, source) + count_uses_in_exprs(name, product_build_values(build))
 		RecordCowUpdateExpr(source, fields, typ, loc):
 			count_uses_in_record_cow_fields(name, fields) + count_uses(name, source)
-		RecordConstructExpr(type_name, fields, typ, loc):
-			count_uses_in_record_fields(name, fields)
 		ListConstructExpr(construct, typ, loc):
 			count_uses_in_boxed_values(name, construct.elements)
 		ListAllocExpr(alloc, typ, loc):

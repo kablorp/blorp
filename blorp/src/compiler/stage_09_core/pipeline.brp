@@ -12,14 +12,16 @@ import:
 	early_stages as CoreEarlyStages
 	fairness: insert_cooperative_checkpoints
 	hash_key_callbacks as CoreHashKeyCallbacks
-	ir: CoreProgram, core_program_to_json
+	ir: CoreProgram, MINTED_BINDER_ID_FLOOR, core_program_max_declared_definition_id, core_program_to_json
 	late_invariants:
 		check_definition_id_uniqueness,
 		check_late_core_invariants,
 		core_late_invariant_message,
+	managed_record_layout: managed_record_layout_fault_message
 	match_projection as CoreMatchProjection
 	ownership_contracts as CoreOwnershipContracts
 	pass_runner:
+		CORE_REPLAY_BINDER_EXHAUSTION_MESSAGE,
 		CorePass,
 		CorePassControl,
 		CorePassDiagnostic(CorePassMessage),
@@ -28,9 +30,11 @@ import:
 		core_pass,
 		core_pass_matches,
 		core_pass_state,
+		core_pass_replay_state,
 		core_pass_state_carry_ids,
 		core_program_invariant,
 		core_program_pass,
+		core_reserve_binder_ids,
 		run_core_passes,
 	perceus as CorePerceus
 	pipeline_stage:
@@ -44,6 +48,7 @@ import:
 		FINAL_STAGE,
 		LIST_LAYOUT_STAGE,
 	prepare as CorePrepare: CancellationPlanTable, CleanupPlan
+	product_evaluation: normalize_product_evaluation
 	record_update as CoreRecordUpdate
 	resolve as CoreResolve
 	resource_management: rewrite_resource_program
@@ -51,6 +56,7 @@ import:
 	specialize as CoreSpecialize
 	static_string_literals as CoreStaticStringLiterals
 	tensor_specialize as CoreTensorSpecialize
+	tuple_storage: lower_tuple_storage_program, tuple_storage_failure_message, validate_tuple_storage_program
 
 
 -- The representation is private so a caller cannot replace a plan after
@@ -83,14 +89,20 @@ private pure func prepared_core_program_rep(prepared: PreparedCoreProgram) -> Pr
 	from_opaque PreparedCoreProgram(prepared)
 
 
-pure func prepared_core_program(program: CoreProgram) -> PreparedCoreProgram:
-	into_opaque PreparedCoreProgram({
+pure func prepared_core_program(program: CoreProgram) -> Result[PreparedCoreProgram, CorePassDiagnostic]:
+	storage_validation ?= validate_tuple_storage_program(program).map_err(
+		func(failure): CorePassMessage(tuple_storage_failure_message(failure)),
+	)
+	cleanup_plan ?= CorePrepare.build_cleanup_plan(program).map_err(
+		func(fault): CorePassMessage(managed_record_layout_fault_message(fault)),
+	)
+	Ok(into_opaque PreparedCoreProgram({
 		program = program,
-		cleanup_plan = CorePrepare.build_cleanup_plan(program),
+		cleanup_plan = cleanup_plan,
 		cancellation_plan_table = CorePrepare.build_cancellation_plan_table(program),
 		names = EMPTY_NAME_TABLE,
 		modules = empty_module_table()
-	})
+	}))
 
 
 -- The runtime prints allocation and RSS counters for a named checkpoint when
@@ -126,21 +138,26 @@ func prepared_core_program_with_checkpoints(
 	program: CoreProgram,
 	names: NameTable,
 	modules: ModuleTable,
-) -> PreparedCoreProgram:
-	cleanup_plan: CleanupPlan = CorePrepare.build_cleanup_plan(program)
+) -> Result[PreparedCoreProgram, CorePassDiagnostic]:
+	storage_validation ?= validate_tuple_storage_program(program).map_err(
+		func(failure): CorePassMessage(tuple_storage_failure_message(failure)),
+	)
+	cleanup_plan ?= CorePrepare.build_cleanup_plan(program).map_err(
+		func(fault): CorePassMessage(managed_record_layout_fault_message(fault)),
+	)
 	record_compile_memory_checkpoint(CLEANUP_PLAN_CHECKPOINT)
 	cancellation_plan_table: CancellationPlanTable = CorePrepare.build_cancellation_plan_table(
 		program,
 	)
 	record_compile_memory_checkpoint(CANCELLATION_PLAN_CHECKPOINT)
 
-	into_opaque PreparedCoreProgram({
+	Ok(into_opaque PreparedCoreProgram({
 		program = program,
 		cleanup_plan = cleanup_plan,
 		cancellation_plan_table = cancellation_plan_table,
 		names = names,
 		modules = modules
-	})
+	}))
 
 
 ---
@@ -211,7 +228,7 @@ STATIC_STRING_LITERALS_PASS: String = "static_string_literals"
 
 RECORD_UPDATE_OWNERSHIP_PASS: String = "record_update_ownership"
 
-RECORD_LITERAL_ORDER_PASS: String = "record_literal_order"
+PRODUCT_EVALUATION_PASS: String = "product_evaluation"
 
 DICT_LITERAL_OWNERSHIP_PASS: String = "dict_literal_ownership"
 
@@ -391,17 +408,11 @@ pure func run_record_update_ownership_pass(program: CoreProgram) -> CoreProgram:
 	CoreRecordUpdate.lower_record_updates_for_ownership(program)
 
 
-pure func run_record_literal_order_pass(
+pure func run_product_evaluation_pass(
 	state: CorePassState,
 ) -> Result[CorePassState, CorePassDiagnostic]:
-	bound: CorePrepare.WrittenOrderRecordLiterals = CorePrepare.bind_record_literal_fields_in_written_order(
-		state.program,
-		state.next_binder_id,
-	)
-	Ok({ state |
-			program = bound.program,
-			next_binder_id = bound.next_binder_id
-		})
+	normalized = normalize_product_evaluation(state.program, state.next_binder_id)
+	Ok(core_reserve_binder_ids({ state | program = normalized.program }, normalized.ids_used))
 
 
 pure func run_dict_literal_ownership_pass(program: CoreProgram) -> CoreProgram:
@@ -544,8 +555,8 @@ pure func late_core_passes() -> List[CorePass]:
 			StaticStringLiteralsStage,
 		),
 		core_program_pass(RECORD_UPDATE_OWNERSHIP_PASS, run_record_update_ownership_pass),
-		core_pass(RECORD_LITERAL_ORDER_PASS, run_record_literal_order_pass),
 		core_program_pass(DICT_LITERAL_OWNERSHIP_PASS, run_dict_literal_ownership_pass),
+		core_pass(PRODUCT_EVALUATION_PASS, run_product_evaluation_pass),
 		core_pass(OWNERSHIP_CONTRACTS_PASS, run_ownership_contracts_pass),
 		checked_stateful_late_core_pass(PERCEUS_PASS, run_perceus_pass, PerceusStage),
 		checked_late_core_pass(REUSE_PASS, run_reuse_pass, ReuseStage),
@@ -593,8 +604,8 @@ pure func fused_late_core_passes() -> List[CorePass]:
 			StaticStringLiteralsStage,
 		),
 		core_program_pass(RECORD_UPDATE_OWNERSHIP_PASS, run_record_update_ownership_pass),
-		core_pass(RECORD_LITERAL_ORDER_PASS, run_record_literal_order_pass),
 		core_program_pass(DICT_LITERAL_OWNERSHIP_PASS, run_dict_literal_ownership_pass),
+		core_pass(PRODUCT_EVALUATION_PASS, run_product_evaluation_pass),
 		checked_stateful_late_core_pass(
 			FUSED_OWNERSHIP_PERCEUS_PASS,
 			run_fused_ownership_perceus_pass,
@@ -697,38 +708,109 @@ pure func late_core_pass_name(stage: CorePipelineStage) -> String:
 
 
 ---
-Pure evaluation of a contiguous span of the list, for snapshot tests, the
-work profiler, and the backend bridge. Production compiles go through
-`run_core_passes`, which also times, observes, stops, and checks invariants.
+Checked replay of a contiguous late-Core span. A decoded snapshot must reserve
+its existing binder ids before any pass can mint, and preparation callers must
+propagate failures instead of admitting partially processed Core as prepared.
+---
+pure func try_run_late_core_span(
+	from_pass: Option[String],
+	through_pass: Option[String],
+	program: CoreProgram,
+) -> Result[CoreProgram, CorePassDiagnostic]:
+	initial ?= core_pass_replay_state(program, core_program_max_declared_definition_id(program) + 1)
+	var current: CorePassState = initial
+	var running: Bool = from_pass.is_none()
+	var done: Bool = False
+	var failure: Option[CorePassDiagnostic] = None
+
+	for pass in late_core_passes():
+		if not done:
+			if not running and core_pass_matches(from_pass, pass.name):
+				running = True
+			if running:
+				match pass.run(current):
+					Ok(advanced):
+						if advanced.next_binder_id < MINTED_BINDER_ID_FLOOR:
+							failure = Some(CorePassMessage(CORE_REPLAY_BINDER_EXHAUSTION_MESSAGE))
+							done = True
+						else:
+							current = advanced
+					Err(diagnostic):
+						failure = Some(diagnostic)
+						done = True
+			if core_pass_matches(through_pass, pass.name):
+				done = True
+	match failure:
+		Some(diagnostic):
+			Err(diagnostic)
+		None:
+			Ok(current.program)
+
+
+pure func try_prepare_perceus_input(program: CoreProgram) -> Result[CoreProgram, CorePassDiagnostic]:
+	storage ?= lower_tuple_storage_program(program).map_err(
+		func(failure): CorePassMessage(tuple_storage_failure_message(failure)),
+	)
+	try_run_late_core_span(Some(CONSUME_SPECIALIZE_PASS), Some(PRODUCT_EVALUATION_PASS), storage)
+
+
+pure func try_run_perceus_stage(program: CoreProgram) -> Result[CoreProgram, CorePassDiagnostic]:
+	storage ?= lower_tuple_storage_program(program).map_err(
+		func(failure): CorePassMessage(tuple_storage_failure_message(failure)),
+	)
+	try_run_late_core_span(Some(CONSUME_SPECIALIZE_PASS), Some(PERCEUS_PASS), storage)
+
+
+pure func try_run_post_perceus_tail(program: CoreProgram) -> Result[CoreProgram, CorePassDiagnostic]:
+	try_run_late_core_span(Some(REUSE_PASS), None, program)
+
+
+pure func try_run_pre_dce_tail(program: CoreProgram) -> Result[PreparedCoreProgram, CorePassDiagnostic]:
+	storage ?= lower_tuple_storage_program(program).map_err(
+		func(failure): CorePassMessage(tuple_storage_failure_message(failure)),
+	)
+	processed ?= try_run_late_core_span(None, None, storage)
+	prepared_core_program(processed)
+
+
+---
+Legacy partial-Core convenience for fixture and debug consumers. This helper
+returns the last successful state on failure and is not a validation boundary.
+Use the checked try_run_late_core_span or its preparation wrappers when a
+successful result promises prepared Core. Production compiles use
+run_core_passes, which times, observes, stops and checks invariants.
 ---
 pure func run_late_core_span(
 	from_pass: Option[String],
 	through_pass: Option[String],
 	program: CoreProgram,
 ) -> CoreProgram:
-	var current: CorePassState = core_pass_state(program, 0)
-	var running: Bool = from_pass.is_none()
-	var done: Bool = False
+	match core_pass_replay_state(program, core_program_max_declared_definition_id(program) + 1):
+		Err(_):
+			program
+		Ok(initial):
+			var current: CorePassState = initial
+			var running: Bool = from_pass.is_none()
+			var done: Bool = False
 
-	for pass in late_core_passes():
-		if not done:
-			if not running and core_pass_matches(from_pass, pass.name):
-				running = True
+			for pass in late_core_passes():
+				if not done:
+					if not running and core_pass_matches(from_pass, pass.name):
+						running = True
 
-			if running:
-				-- Late passes never fail in `run`; only their invariants report,
-				-- and this span helper deliberately runs none.
-				match pass.run(current):
-					Ok(advanced):
-						current = advanced
-					Err(_):
-						done = True
+					if running:
+						-- This debug span runs no invariants and returns the last
+						-- successful Core state if a pass fails.
+						match pass.run(current):
+							Ok(advanced):
+								current = advanced
+							Err(_):
+								done = True
 
-				if core_pass_matches(through_pass, pass.name):
-					done = True
+						if core_pass_matches(through_pass, pass.name):
+							done = True
 
-	current.program
-
+			current.program
 
 pure func run_list_layout_stage(program: CoreProgram) -> CoreProgram:
 	CoreEarlyStages.run_list_layout_stage(program)
@@ -739,7 +821,7 @@ pure func run_specialize_stage(program: CoreProgram) -> CoreProgram:
 
 
 pure func prepare_perceus_input(program: CoreProgram) -> CoreProgram:
-	run_late_core_span(Some(CONSUME_SPECIALIZE_PASS), Some(DICT_LITERAL_OWNERSHIP_PASS), program)
+	run_late_core_span(Some(CONSUME_SPECIALIZE_PASS), Some(PRODUCT_EVALUATION_PASS), program)
 
 
 pure func run_perceus_stage(program: CoreProgram) -> CoreProgram:
@@ -750,8 +832,10 @@ pure func run_post_perceus_tail(program: CoreProgram) -> CoreProgram:
 	run_late_core_span(Some(REUSE_PASS), None, program)
 
 
-pure func run_pre_dce_tail(program: CoreProgram) -> PreparedCoreProgram:
-	prepared_core_program(run_late_core_span(None, None, program))
+-- Preparation always returns a checked artifact, including fixture callers.
+-- The partial-Core replay convenience cannot issue a PreparedCoreProgram.
+pure func run_pre_dce_tail(program: CoreProgram) -> Result[PreparedCoreProgram, CorePassDiagnostic]:
+	try_run_pre_dce_tail(program)
 
 
 ---

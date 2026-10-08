@@ -4,11 +4,11 @@
 -- the frozen self-compile's Core, starting from the DCE dump
 -- (`--dump-core-after=dce --dump-core-file=<path>`) and advancing through
 -- consume_specialize, static string literals, record-update ownership,
--- record-literal written order, and dict-literal ownership to reach the exact point immediately before
+-- dict-literal ownership and product evaluation to reach the exact point immediately before
 -- Perceus. `dict_literal_ownership` is not one of the CLI's exposed
 -- `--dump-core-after` stage names (see CORE_STAGE_NAMES in
 -- stage_manifest.brp), so this program drives the rest of the pipeline
--- itself by calling the same public pass functions pipeline.brp calls,
+-- itself through the checked preparation helper in pipeline.brp,
 -- rather than trying a CLI flag that does not exist.
 --
 -- This committed program calls only the Perceus helpers that are public
@@ -35,15 +35,8 @@ import:
 		CoreExpr(LambdaExpr),
 		CoreFunction,
 		CoreProgram,
-		core_program_max_declared_definition_id,
 		decode_core_program_json,
-	../../../blorp/src/compiler/stage_09_core/pass_runner: core_pass_state, CorePassState
-	../../../blorp/src/compiler/stage_09_core/pipeline:
-		run_consume_specialize_pass,
-		run_dict_literal_ownership_pass,
-		run_record_literal_order_pass,
-		run_record_update_ownership_pass,
-		run_static_string_literals_pass,
+	../../../blorp/src/compiler/stage_09_core/pipeline: try_prepare_perceus_input
 	../../../blorp/src/compiler/stage_09_core/perceus: insert_drops_program
 	../../../blorp/src/compiler/stage_09_core/perceus/env: PerceusEnv, build_env
 	../../../blorp/src/compiler/stage_09_core/perceus/index:
@@ -118,28 +111,15 @@ pure func count_lambdas(expr: CoreExpr) -> Int:
 	count
 
 
--- Builds the exact late Core state immediately before Perceus by chaining
--- the same public pass functions `pipeline.brp` calls, starting from the
--- post-DCE Core dumped for the frozen self-compile.
-func late_core_before_perceus(post_dce: CoreProgram) -> CoreProgram:
-	next_def_id: Int = core_program_max_declared_definition_id(post_dce) + 1
-	state: CorePassState = core_pass_state(post_dce, next_def_id)
-
-	match run_consume_specialize_pass(state):
-		Ok(after_consume_specialize):
-			after_static_strings: CoreProgram = run_static_string_literals_pass(
-				after_consume_specialize.program,
-			)
-			after_record_update: CoreProgram = run_record_update_ownership_pass(after_static_strings)
-
-			match run_record_literal_order_pass({ after_consume_specialize | program = after_record_update }):
-				Ok(after_record_literal_order):
-					run_dict_literal_ownership_pass(after_record_literal_order.program)
-				Err(_):
-					post_dce
+-- Builds the exact late Core state immediately before Perceus. The checked
+-- replay boundary reserves decoded binder/definition ids and propagates seed
+-- or pass failure instead of reporting a partially prepared measurement input.
+func late_core_before_perceus(post_dce: CoreProgram) -> Option[CoreProgram]:
+	match try_prepare_perceus_input(post_dce):
+		Ok(prepared):
+			Some(prepared)
 		Err(_):
-			post_dce
-
+			None
 
 -- Reads and decodes the post-DCE Core dump, then advances it to the exact
 -- point immediately before Perceus.
@@ -159,7 +139,7 @@ func decode_late_core(path: String) -> Option[CoreProgram]:
 						Err(_):
 							None
 						Ok(post_dce_program):
-							Some(late_core_before_perceus(post_dce_program))
+							late_core_before_perceus(post_dce_program)
 
 
 -- Every measurement below shares one decoded `late_core` value. Each call is

@@ -313,14 +313,14 @@ lower + ffi_boundary + list_layout
   -> std_inline
   -> tailrec
   -> string_pipeline + collection_pipeline
-  -> parallel_tensor_pipeline + tensor_fusion + tuple_flatten
+  -> parallel_tensor_pipeline + tensor_fusion + tuple_flatten + tuple_storage
   -> function-reference adaptation + tensor_specialize + specialize
   -> hash-key callbacks
   -> callable resolution + backend projection + match projection + dce
   -> consume_specialize
   -> static_string_literals
-  -> record-update ownership lowering + record-literal written order
-     + dictionary ownership preparation
+  -> record-update ownership lowering + dictionary ownership preparation
+  -> product field, List element and tensor literal element evaluation bindings
   -> ownership contracts + perceus (fused production pass)
   -> reuse
   -> closure
@@ -331,10 +331,42 @@ lower + ffi_boundary + list_layout
   -> backend emit
 ```
 
+`tuple_storage.brp` runs after concrete record representation, trait selection
+and local tuple flattening. It interns structural tuple shapes as explicit
+`GeneratedTupleRecordDecl` rows, maps runtime types to their managed storage
+rows, and lowers construction to `ProductExpr`. Logical shapes remain in the
+catalog and semantic declarations for trait identity.
+Stage 08 applies the existing scalar value rule to immediate tuple slots:
+bounded integer proofs have `Int` value storage. Explicit casts preserve
+operand operations and accepted projection proofs while signatures, literals
+and synthesized enumeration tuples select the same row. Native factory plans
+first match resolved physical fields exactly. A remaining bare bounded input
+may cross the established value-slot boundary to `Int`; this fallback inspects
+the original expected slot before alias resolution. Named opaque slots and
+nested containers do not gain that fallback, and registered fields retain
+their checked types. Opaque unwrapping lowers its operand at the
+accepted operand type and represents the conversion explicitly; runtime
+projection removes exact physical identity casts before ownership analysis.
+`managed_record_layout.brp` supplies the same typed fields, Unit omission and
+release policies for source records and generated tuple rows. Prepared-Core
+construction validates this catalog and rejects residual tuple storage or
+inconsistent prepared Option representations before emission.
+
 `early_pipeline.brp` owns early-stage orchestration, observations, stops,
 and diagnostics. `pipeline.brp` owns the contiguous late-Core order.
 Changing order requires a test that demonstrates the dependency between the
 affected stages.
+
+The early `tuple_flatten` pass also groups literal managed records and their
+immutable aliases when every use reads a field. It shares the tuple pass's
+use facts, binder supply and owner bindings. Record operands are evaluated once
+in written order; only the resulting references are arranged in declaration
+order for projection. The declaration-derived product field view supplies their
+types. Whole-value calls, storage, captures, identity observations, record
+matches and mutable bindings retain their boxes. Managed children continue
+through ordinary local ownership and borrow rules for the later ownership and
+cancellation passes; removing the record container does not remove its
+children's allocations.
 
 The grouped late stages above are semantically significant. Specialization
 first adapts function references and specializes tensor dispatch before general

@@ -55,6 +55,7 @@ import:
 		prepared_core_program,
 		prepared_core_program_name_table,
 		prepared_core_program_value,
+	../../../src/compiler/stage_09_core/pass_runner: CorePassDiagnostic
 	../../../src/compiler/stage_09_core/pipeline_stage:
 		CorePipelineStage(DceStage, FinalStage, PerceusStage),
 	../../../src/lib/build_artifact:
@@ -225,44 +226,56 @@ pure func invalid_foreign_link_program() -> CoreProgram:
 	}
 
 
-pure func late_core_compile_execution(program: CoreProgram) -> LateCoreCompileExecution:
-	{
-		configuration = artifact_configuration(),
-		typed_program_summary = None,
-		allocation_report = None,
-		prepared_core = prepared_core_program(program),
-		observations = []
-	}
+pure func late_core_compile_execution(program: CoreProgram) -> Result[LateCoreCompileExecution, CorePassDiagnostic]:
+	match prepared_core_program(program):
+		Ok(prepared):
+			Ok({
+				configuration = artifact_configuration(),
+				typed_program_summary = None,
+				allocation_report = None,
+				prepared_core = prepared,
+				observations = []
+			})
+		Err(diagnostic):
+			Err(diagnostic)
 
 
 pure func test_backend_emission_failure_stops_before_artifact_construction() -> Bool:
-	match emit_backend_c(
-		prepared_core_program(duplicate_definition_program()),
-		artifact_configuration(),
-	):
-		BackendEmissionPhaseFailed(message):
-			message.contains("definition ID")
-		BackendEmissionPhaseReady(emission):
-			match construct_backend_artifact(emission):
-				ArtifactConstructionPhaseFailed(_):
-					False
-				_:
-					False
+	match prepared_core_program(duplicate_definition_program()):
+		Ok(prepared):
+			match emit_backend_c(
+				prepared,
+				artifact_configuration(),
+			):
+				BackendEmissionPhaseFailed(message):
+					message.contains("definition ID")
+				BackendEmissionPhaseReady(emission):
+					match construct_backend_artifact(emission):
+						ArtifactConstructionPhaseFailed(_):
+							False
+						_:
+							False
+		Err(_):
+			False
 
 
 pure func test_artifact_construction_failure_happens_after_backend_emission() -> Bool:
-	match emit_backend_c(
-		prepared_core_program(invalid_foreign_link_program()),
-		artifact_configuration(),
-	):
-		BackendEmissionPhaseFailed(_):
-			False
-		BackendEmissionPhaseReady(emission):
-			match construct_backend_artifact(emission):
-				ArtifactConstructionPhaseFailed(message):
-					message.contains("invalid foreign link arguments")
-				_:
+	match prepared_core_program(invalid_foreign_link_program()):
+		Ok(prepared):
+			match emit_backend_c(
+				prepared,
+				artifact_configuration(),
+			):
+				BackendEmissionPhaseFailed(_):
 					False
+				BackendEmissionPhaseReady(emission):
+					match construct_backend_artifact(emission):
+						ArtifactConstructionPhaseFailed(message):
+							message.contains("invalid foreign link arguments")
+						_:
+							False
+		Err(_):
+			False
 
 
 func test_timed_backend_emission_failure_reports_backend_only() -> Bool:
@@ -272,22 +285,26 @@ func test_timed_backend_emission_failure_reports_backend_only() -> Bool:
 		microseconds = 7
 	}]
 	outer_started: Int = now_microseconds() - 1000
-	timed = execute_backend_artifact_compile_tail_timed(
-		late_core_compile_execution(duplicate_definition_program()),
-		True,
-		prior_timings,
-		outer_started,
-	)
-
-	match timed.execution:
-		CompileEmitFailed(message):
-			(
-				message.contains("definition ID")
-				and timing_labels(timed.timings) == ["late_core", "backend_emission"]
-				and timed.timings.get(0).map(func(timing): timing.microseconds).get_or(0) == 7
-				and timed.outer_microseconds >= 1000
+	match late_core_compile_execution(duplicate_definition_program()):
+		Ok(execution):
+			timed = execute_backend_artifact_compile_tail_timed(
+				execution,
+				True,
+				prior_timings,
+				outer_started,
 			)
-		_:
+
+			match timed.execution:
+				CompileEmitFailed(message):
+					(
+						message.contains("definition ID")
+						and timing_labels(timed.timings) == ["late_core", "backend_emission"]
+						and timed.timings.get(0).map(func(timing): timing.microseconds).get_or(0) == 7
+						and timed.outer_microseconds >= 1000
+					)
+				_:
+					False
+		Err(_):
 			False
 
 
@@ -298,24 +315,28 @@ func test_timed_artifact_construction_failure_reports_backend_and_artifact() -> 
 		microseconds = 7
 	}]
 	outer_started: Int = now_microseconds() - 1000
-	timed = execute_backend_artifact_compile_tail_timed(
-		late_core_compile_execution(invalid_foreign_link_program()),
-		True,
-		prior_timings,
-		outer_started,
-	)
-
-	match timed.execution:
-		CompileBuildArtifactFailed(message):
-			(
-				message.contains("invalid foreign link arguments")
-				and timing_labels(timed.timings) == [
-					"late_core", "backend_emission", "artifact_construction",
-				]
-				and timed.timings.get(0).map(func(timing): timing.microseconds).get_or(0) == 7
-				and timed.outer_microseconds >= 1000
+	match late_core_compile_execution(invalid_foreign_link_program()):
+		Ok(execution):
+			timed = execute_backend_artifact_compile_tail_timed(
+				execution,
+				True,
+				prior_timings,
+				outer_started,
 			)
-		_:
+
+			match timed.execution:
+				CompileBuildArtifactFailed(message):
+					(
+						message.contains("invalid foreign link arguments")
+						and timing_labels(timed.timings) == [
+							"late_core", "backend_emission", "artifact_construction",
+						]
+						and timed.timings.get(0).map(func(timing): timing.microseconds).get_or(0) == 7
+						and timed.outer_microseconds >= 1000
+					)
+				_:
+					False
+		Err(_):
 			False
 
 

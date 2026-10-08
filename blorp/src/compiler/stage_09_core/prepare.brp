@@ -62,6 +62,7 @@ import:
 			ConstructorMatchFallbackFail,
 		),
 		CoreDecl(
+			GeneratedTupleRecordDecl,
 			InlineRecordDecl, UnionDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl,
 			TraitDecl, TypeAliasDecl,
 		),
@@ -78,23 +79,26 @@ import:
 			ForResourceSourceExpr, ForSetExpr, ForStreamExpr, ForStringExpr, ForTensorExpr, IfExpr,
 			LambdaExpr, LetExpr, ListAllocExpr, ListConstructExpr, ListGetExpr, ListHandoffExpr,
 			ListHandoffSetOwnedExpr, ListHandoffSetSourceSlotExpr, ListRetainExpr, ListSetExpr,
-			ListSwapExpr, LengthMatchExpr, LiteralExpr, LiteralMatchExpr, LogicalExpr, RecordExpr,
-			RecordConstructExpr, RecordCowUpdateExpr, RecordReuseExpr, RecordUpdateExpr,
+			ListSwapExpr, LengthMatchExpr, LiteralExpr, LiteralMatchExpr, LogicalExpr, ProductExpr,
+			RecordCowUpdateExpr, RecordReuseExpr, RecordUpdateExpr,
 			PreClosureConcurrentExpr, PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr,
 			RawMatchExpr, SemanticMatchExpr, ResourceCleanupExitExpr, ResourceScopeExpr, SelectExpr,
 			SeqExpr, SetAllocExpr, StaticStringLiteralExpr, StringByteCopyExpr, StringByteReadExpr,
 			StringByteWriteExpr, StringSetLenExpr, TailrecListSpreadLoopExpr,
 			TailrecListSpreadRecurExpr, TailrecLoopExpr, TailrecRecurExpr, TensorBoxedLiteralExpr,
 			TensorLiteralExpr, TensorPackedLiteralExpr, TensorRawFillExpr, TensorRawReadExpr,
-			TensorRawViewLetExpr, TensorRawWriteExpr, TupleExpr, TupleConstructExpr, UnaryExpr,
+			TensorRawViewLetExpr, TensorRawWriteExpr, TupleExpr, UnaryExpr,
 			UnionConstructExpr, UnionReuseConstructExpr, VarExpr, VectorExpr, VoidExpr, WhileExpr,
 		),
-		CoreFieldRef,
 		CoreFunction,
 		CoreGlobal,
 		CoreHashContainerConstructor,
 		CoreHeapRecordDecl,
 		CoreInlineTaggedVariantRole(EmptyInlineTaggedVariant, PayloadInlineTaggedVariant),
+		CoreInlineTaggedTag(NumericInlineTaggedTag, VariantInlineTaggedTag),
+		CoreInlineTaggedVariantEncoding,
+		CoreTupleStorageCatalog,
+		tuple_storage_catalog,
 		CoreListAlloc,
 		CoreListConstruct,
 		CoreListGet,
@@ -113,6 +117,7 @@ import:
 			LiteralMatchFallbackBindings, LiteralMatchFallbackBody, LiteralMatchFallbackFail,
 		),
 		CoreLogicalOp,
+		CoreProductBuild,
 		CoreProgram,
 		CoreRawMatchCase,
 		CoreRecordCowField,
@@ -142,10 +147,6 @@ import:
 		CoreTensorRawScalarKind(TensorFloat32Elements, TensorFloat64Elements, TensorInt64Elements),
 		CoreTensorRawViewBinding,
 		CoreTensorRawWrite,
-		CoreTupleElement(
-			TupleFloat32Element, TupleFloat16Element, TupleFloatElement, TuplePointerElement,
-			TuplePrimElement, TupleStructElement, TupleStackResultElement, TupleVoidElement,
-		),
 		CoreType(
 			InlineRecordType, NativeManagedType, BoxedResultType, UnionType, FunctionType,
 			HeapRecordType, NamedType, RangeType, SelfType, StackResultType, TensorType, TupleType,
@@ -166,11 +167,10 @@ import:
 		CoreVariantRef(
 			BuiltinOptionNone, BuiltinOptionSome, BuiltinResultErr, BuiltinResultOk, VariantById,
 		),
-		RECORD_LITERAL_FIELD_TEMP_ORIGIN,
 		clone_tensor_for_element_storage,
-		core_field_refs_equal,
 		core_union_managed_payload_storage,
 		core_var_equal,
+		map_product_build_values,
 	memory: same_object
 	mono: core_mono_type_equal
 	release_mask: release_mask_bit, release_mask_first_word
@@ -180,7 +180,6 @@ import:
 		boxed_storage_value,
 		build_specialize_layout,
 		hash_container_constructor_for_key,
-	synth_nodes: core_var_with_id
 	traverse as CoreTraverse: same_optional_core_expr
 	type_policy:
 		is_core_fallible_stream_type_name,
@@ -188,6 +187,13 @@ import:
 		is_core_stream_type_name,
 		is_stack_result_type,
 		release_policy_requires_release,
+	managed_record_layout:
+		CoreManagedRecordLayout,
+		CoreManagedRecordLayoutFault(GeneratedTupleFieldStorageUnavailable),
+		CoreManagedRecordFieldStorage(TypedManagedRecordField, UnitManagedRecordField),
+		managed_record_layout_fields,
+		managed_record_layout_for_decl,
+
 
 
 -- Allocation identity for the reuse rule this pass follows: a prepared child
@@ -274,12 +280,6 @@ private pure func same_boxed_storage_value(
 	)
 
 
-record PreparedTupleLiteral {
-	elements: List[CoreTupleElement],
-	release_mask: Int,
-	retain_mask: Int
-}
-
 
 private STACK_RESULT_OK_TAG: Int = 0
 
@@ -295,8 +295,6 @@ is a lookup accelerator, never a second authority on declaration order.
 private record PrepareDecls {
 	decls: List[CoreDecl],
 	unions_by_name: Dict[String, CoreUnionDecl],
-	-- The record declarations, so a record lookup scans only them.
-	records: DeclaredRecords,
 	-- Both preparation passes lower dict literals, whose hash-key strategy
 	-- depends on resolved key layouts.
 	specialize_layout: CoreSpecializeLayout
@@ -327,69 +325,8 @@ private pure func prepare_decls(
 	{
 		decls = decls,
 		unions_by_name = unions_by_name,
-		records = declared_records(decls),
 		specialize_layout = specialize_layout
 	}
-
-
----
-One record declaration's name and the identities of its fields in declaration
-order: all a literal's field ordering needs, the same for both declaration
-kinds. Built once per declaration when the record index is.
----
-private record RecordFieldOrder {
-	name: String,
-	field_refs: List[CoreFieldRef]
-}
-
-
----
-The record declarations of a program, each kind in declaration-list order.
-A record literal's type variant says which list holds its declaration.
----
-private record DeclaredRecords {
-	heap: List[RecordFieldOrder],
-	inline: List[RecordFieldOrder]
-}
-
-
-private pure func declared_records(decls: List[CoreDecl]) -> DeclaredRecords:
-	var heap: List[RecordFieldOrder] = []
-	var inline: List[RecordFieldOrder] = []
-
-	for decl in decls:
-		match decl:
-			HeapRecordDecl(record_decl):
-				heap = heap.append({
-					name = record_decl.name,
-					field_refs = record_decl.fields.map(func(field): field.ref),
-				})
-			InlineRecordDecl(record_decl):
-				inline = inline.append({
-					name = record_decl.name,
-					field_refs = record_decl.fields.map(func(field): field.ref),
-				})
-			_:
-				void
-
-	{
-		heap = heap,
-		inline = inline
-	}
-
-
-private pure func find_record_field_order(
-	records: List[RecordFieldOrder],
-	name: String,
-) -> Option[RecordFieldOrder]:
-	var result: Option[RecordFieldOrder] = None
-
-	for record_order in records:
-		if record_order.name == name:
-			result = Some(record_order)
-			break
-
-	result
 
 
 private pure func find_union_decl(
@@ -462,41 +399,6 @@ private pure func variable_is_union_constructor(
 			False
 
 
-private pure func find_record_field(
-	fields: List[CoreRecordFieldValue],
-	declared_ref: CoreFieldRef,
-) -> Option[CoreRecordFieldValue]:
-	var result: Option[CoreRecordFieldValue] = None
-
-	for field in fields:
-		if core_field_refs_equal(field.ref, declared_ref):
-			result = Some(field)
-			break
-
-	result
-
-
-private pure func order_record_fields(
-	record_order: RecordFieldOrder,
-	fields: List[CoreRecordFieldValue],
-) -> Option[List[CoreRecordFieldValue]]:
-	var ordered: List[CoreRecordFieldValue] = []
-	var found_all_fields: Bool = True
-
-	for field_ref in record_order.field_refs:
-		match find_record_field(fields, field_ref):
-			Some(field):
-				ordered = ordered.append(field)
-			None:
-				found_all_fields = False
-				break
-
-	if found_all_fields and ordered.length() == fields.length():
-		Some(ordered)
-	else:
-		None
-
-
 private pure func prepare_exprs(decls: PrepareDecls, exprs: List[CoreExpr]) -> List[CoreExpr]:
 	CoreTraverse.map_core_exprs(exprs, func(expr): prepare_expr(decls, expr))
 
@@ -561,8 +463,6 @@ private pure func expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		TupleExpr(items, typ, loc):
 			typ
-		TupleConstructExpr(tuple_construct, typ, loc):
-			typ
 		VectorExpr(items, typ, loc):
 			typ
 		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
@@ -615,15 +515,13 @@ private pure func expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		SetAllocExpr(alloc, typ, loc):
 			typ
-		RecordExpr(fields, typ, loc):
+		ProductExpr(build, typ, loc):
 			typ
 		RecordUpdateExpr(base, fields, typ, loc):
 			typ
-		RecordReuseExpr(source, fields, typ, loc):
+		RecordReuseExpr(source, build, typ, loc):
 			typ
 		RecordCowUpdateExpr(source, fields, typ, loc):
-			typ
-		RecordConstructExpr(type_name, fields, typ, loc):
 			typ
 		UnionConstructExpr(construct, typ, loc):
 			typ
@@ -831,7 +729,7 @@ private pure func boxed_kind_for_expr(expr: CoreExpr) -> CoreBoxKind:
 private pure func pointer_box_storage_needs_release_type(typ: CoreType) -> Bool:
 	match typ:
 		NamedType(name, args):
-			if is_managed_pointer_tuple_slot_type(typ):
+			if is_builtin_managed_pointer_type(typ):
 				True
 			else if name == "Channel" and args.length() == 1:
 				True
@@ -961,64 +859,6 @@ private pure func boxed_storage_values_for_union_payload(
 			boxed_storage_values_for_exprs(exprs)
 		ErasedUnionPayloadStorage:
 			exprs.map(func(expr): boxed_storage_value(layout, expr, False))
-
-
-private pure func prepare_tuple_element(
-	decls: PrepareDecls,
-	element: CoreTupleElement,
-) -> Option[CoreTupleElement]:
-	match element:
-		TuplePrimElement(value):
-			prepared: CoreExpr = prepare_expr(decls, value)
-
-			if same_object(prepared, value):
-				None
-			else:
-				Some(TuplePrimElement(prepared))
-		TuplePointerElement(value):
-			prepared: CoreExpr = prepare_expr(decls, value)
-
-			if same_object(prepared, value):
-				None
-			else:
-				Some(TuplePointerElement(prepared))
-		TupleStructElement(value, c_type):
-			prepared: CoreExpr = prepare_expr(decls, value)
-
-			if same_object(prepared, value):
-				None
-			else:
-				Some(TupleStructElement(prepared, c_type))
-		TupleStackResultElement(value):
-			prepared: CoreExpr = prepare_expr(decls, value)
-
-			if same_object(prepared, value):
-				None
-			else:
-				Some(TupleStackResultElement(prepared))
-		TupleVoidElement:
-			None
-		TupleFloatElement(value):
-			prepared: CoreExpr = prepare_expr(decls, value)
-
-			if same_object(prepared, value):
-				None
-			else:
-				Some(TupleFloatElement(prepared))
-		TupleFloat32Element(value):
-			prepared: CoreExpr = prepare_expr(decls, value)
-
-			if same_object(prepared, value):
-				None
-			else:
-				Some(TupleFloat32Element(prepared))
-		TupleFloat16Element(value):
-			prepared: CoreExpr = prepare_expr(decls, value)
-
-			if same_object(prepared, value):
-				None
-			else:
-				Some(TupleFloat16Element(prepared))
 
 
 ---
@@ -1651,62 +1491,7 @@ private pure func prepare_select_arm(
 			})
 
 
-pure func is_primitive_tuple_slot_type(typ: CoreType) -> Bool:
-	match typ:
-		NamedType(name, args):
-			if args.length() != 0:
-				False
-			else if name == "Int":
-				True
-			else if name == "Int8":
-				True
-			else if name == "Int16":
-				True
-			else if name == "Int32":
-				True
-			else if name == "Int64":
-				True
-			else if name == "UInt8":
-				True
-			else if name == "UInt16":
-				True
-			else if name == "UInt32":
-				True
-			else if name == "UInt64":
-				True
-			else if name == "Bool":
-				True
-			else:
-				name == "Char"
-		TypeParameterType(_) | SelfType:
-			False
-		NativeManagedType(_):
-			False
-		VoidType:
-			False
-		UnionType(name, ScalarTagValue):
-			True
-		HeapRecordType(name):
-			False
-		InlineRecordType(name):
-			False
-		UnionType(name, ManagedUnionValue):
-			False
-		StackResultType(ok_type, err_type):
-			False
-		BoxedResultType(ok_type, err_type):
-			False
-		FunctionType(_, _, _):
-			False
-		RangeType:
-			True
-		TensorType(info):
-			False
-		TupleType(items):
-			False
-
-
-private pure func is_managed_pointer_tuple_slot_type(typ: CoreType) -> Bool:
+private pure func is_builtin_managed_pointer_type(typ: CoreType) -> Bool:
 	match typ:
 		NamedType(name, args):
 			if name == "Option":
@@ -1763,81 +1548,6 @@ private pure func is_managed_pointer_tuple_slot_type(typ: CoreType) -> Bool:
 			True
 
 
-private pure func is_unmanaged_pointer_tuple_slot_type(typ: CoreType) -> Bool:
-	match typ:
-		NamedType(name, args):
-			name == "Ptr" and args.length() == 0
-		TypeParameterType(_) | SelfType:
-			False
-		StackResultType(ok_type, err_type):
-			False
-		BoxedResultType(ok_type, err_type):
-			False
-		FunctionType(_, _, _):
-			False
-		HeapRecordType(name):
-			False
-		InlineRecordType(name):
-			False
-		UnionType(name, ManagedUnionValue):
-			False
-		TupleType(items):
-			False
-		NativeManagedType(_):
-			False
-		VoidType:
-			False
-		UnionType(name, ScalarTagValue):
-			False
-		RangeType:
-			False
-		TensorType(info):
-			False
-
-
-private pure func is_pointer_tuple_slot_type(typ: CoreType) -> Bool:
-	is_managed_pointer_tuple_slot_type(typ) or is_unmanaged_pointer_tuple_slot_type(typ)
-
-
-private pure func stack_option_tuple_slot_c_type(typ: CoreType) -> Option[String]:
-	match typ:
-		NamedType(name, args):
-			if name == "Option":
-				match args:
-					[payload]:
-						unprojected_stack_option_c_type(payload)
-					[]:
-						None
-					[first, second, ...rest]:
-						None
-			else:
-				None
-		TypeParameterType(_) | SelfType:
-			None
-		NativeManagedType(_):
-			None
-		VoidType:
-			None
-		HeapRecordType(name):
-			None
-		InlineRecordType(name):
-			None
-		UnionType(name, _):
-			None
-		StackResultType(ok_type, err_type):
-			None
-		BoxedResultType(ok_type, err_type):
-			None
-		FunctionType(_, _, _):
-			None
-		RangeType:
-			None
-		TensorType(info):
-			None
-		TupleType(items):
-			None
-
-
 private pure func is_nullable_option_payload_type(payload: CoreType) -> Bool:
 	match payload:
 		NamedType(name, args):
@@ -1871,45 +1581,6 @@ private pure func is_nullable_option_payload_type(payload: CoreType) -> Bool:
 			False
 		RangeType:
 			False
-
-
-private pure func float_tuple_element(item: CoreExpr, typ: CoreType) -> Option[CoreTupleElement]:
-	match typ:
-		NamedType(name, args):
-			if args.length() != 0:
-				None
-			else if name == "Float":
-				Some(TupleFloatElement(item))
-			else if name == "Float32":
-				Some(TupleFloat32Element(item))
-			else if name == "Float16":
-				Some(TupleFloat16Element(item))
-			else:
-				None
-		TypeParameterType(_) | SelfType:
-			None
-		NativeManagedType(_):
-			None
-		VoidType:
-			None
-		HeapRecordType(name):
-			None
-		InlineRecordType(name):
-			None
-		UnionType(name, _):
-			None
-		StackResultType(ok_type, err_type):
-			None
-		BoxedResultType(ok_type, err_type):
-			None
-		FunctionType(_, _, _):
-			None
-		RangeType:
-			None
-		TensorType(info):
-			None
-		TupleType(items):
-			None
 
 
 --- Whether a union field's stored representation owns something its
@@ -2336,363 +2007,6 @@ private pure func annotate_tensor_storage_expr(
 			expr
 
 
-private pure func tuple_pointer_expr_needs_retain(expr: CoreExpr) -> Bool:
-	match expr:
-		LiteralExpr(literal, typ, loc):
-			match literal:
-				StringLiteral(value):
-					False
-				IntLiteral(value):
-					False
-				WideIntLiteral(value):
-					False
-				FloatLiteral(value):
-					False
-				FloatTextLiteral(value):
-					False
-				FloatInfinityLiteral:
-					False
-				FloatNegInfinityLiteral:
-					False
-				FloatNanLiteral:
-					False
-				BoolLiteral(value):
-					False
-				CharLiteral(value):
-					False
-		StaticStringLiteralExpr(id, value, typ, loc):
-			False
-		VarExpr(variable, typ, loc):
-			False
-		ProductFieldExpr(expr_value, _, typ, loc):
-			True
-		ModuleMemberExpr(_, _, _, _):
-			True
-		UnboxExpr(unbox_kind, expr_value, typ, loc):
-			True
-		ListGetExpr(get, typ, loc):
-			True
-		CooperativeCheckpointExpr(typ, loc):
-			False
-		VoidExpr(typ, loc):
-			False
-		DebugBlockExpr(body, typ, loc):
-			False
-		CallExpr(kind, callee, args, typ, loc):
-			False
-		BinaryExpr(op, left, right, typ, loc):
-			False
-		UnaryExpr(op, expr_value, typ, loc):
-			False
-		LogicalExpr(op, left, right, typ, loc):
-			False
-		AssignExpr(variable, rhs, typ, loc):
-			False
-		CastExpr(expr_value, typ, loc):
-			False
-		BoxExpr(box, typ, loc):
-			False
-		TupleExpr(items, typ, loc):
-			False
-		TupleConstructExpr(tuple_construct, typ, loc):
-			False
-		VectorExpr(items, typ, loc):
-			False
-		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
-			False
-		ClosureCreateExpr(closure, typ, loc):
-			False
-		ListConstructExpr(construct, typ, loc):
-			False
-		ListAllocExpr(alloc, typ, loc):
-			False
-		ListHandoffExpr(handoff, typ, loc):
-			False
-		ListHandoffSetOwnedExpr(set, typ, loc):
-			False
-		ListHandoffSetSourceSlotExpr(slot, typ, loc):
-			False
-		ListRetainExpr(retain, typ, loc):
-			False
-		ListSetExpr(set, typ, loc):
-			False
-		ListSwapExpr(swap, typ, loc):
-			False
-		StringByteReadExpr(read, typ, loc):
-			False
-		StringByteWriteExpr(write, typ, loc):
-			False
-		StringByteCopyExpr(copy, typ, loc):
-			False
-		StringSetLenExpr(set_len, typ, loc):
-			False
-		TensorLiteralExpr(literal, typ, loc):
-			False
-		TensorBoxedLiteralExpr(literal, typ, loc):
-			False
-		TensorPackedLiteralExpr(literal, typ, loc):
-			False
-		TensorRawFillExpr(fill, typ, loc):
-			False
-		TensorRawReadExpr(read, typ, loc):
-			False
-		TensorRawWriteExpr(write, typ, loc):
-			False
-		TensorRawViewLetExpr(binding, body, typ, loc):
-			False
-		DictExpr(entries, typ, loc):
-			False
-		DictConstructExpr(construct, typ, loc):
-			False
-		SetAllocExpr(alloc, typ, loc):
-			False
-		RecordExpr(fields, typ, loc):
-			False
-		RecordUpdateExpr(base, fields, typ, loc):
-			False
-		RecordReuseExpr(source, fields, typ, loc):
-			False
-		RecordCowUpdateExpr(source, fields, typ, loc):
-			False
-		RecordConstructExpr(type_name, fields, typ, loc):
-			False
-		UnionConstructExpr(construct, typ, loc):
-			False
-		UnionReuseConstructExpr(construct, typ, loc):
-			False
-		PreClosureDetachExpr(detached, typ, loc):
-			False
-		DetachExpr(detached, typ, loc):
-			False
-		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			False
-		DropExpr(variable, value_type, release_policy, body, typ, loc):
-			False
-		LetExpr(name, is_mutable, typ, rhs, body):
-			False
-		BorrowLetExpr(name, typ, rhs, body):
-			False
-		SeqExpr(first, second):
-			False
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			False
-		WhileExpr(cond, body, typ, loc):
-			False
-		ForRangeExpr(binder, start, end, body, typ, loc):
-			False
-		ForChannelExpr(loop, typ, loc):
-			False
-		ForListExpr(loop, typ, loc):
-			False
-		ForStringExpr(loop, typ, loc):
-			False
-		ForDictExpr(loop, typ, loc):
-			False
-		ForSetExpr(loop, typ, loc):
-			False
-		ForResourceSourceExpr(loop, typ, loc):
-			False
-		ForStreamExpr(loop, typ, loc):
-			False
-		ForTensorExpr(loop, typ, loc):
-			False
-		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
-			False
-		DetachExpr(detached, typ, loc):
-			False
-		ConcurrentlyLoopExpr(loop, typ, loc):
-			False
-		PreClosureConcurrentExpr(block, typ, loc):
-			False
-		ConcurrentExpr(block, typ, loc):
-			False
-		SelectExpr(select_expr, typ, loc):
-			False
-		BreakExpr(typ, loc):
-			False
-		ContinueExpr(typ, loc):
-			False
-		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
-			False
-		LengthMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
-			False
-		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			False
-		RawMatchExpr(scrutinee, cases, typ, loc):
-			False
-		SemanticMatchExpr(scrutinee, tree, typ, loc):
-			False
-		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
-			False
-		ResourceScopeExpr(scope, typ, loc):
-			False
-		ResourceCleanupExitExpr(exit, typ, loc):
-			False
-		TailrecLoopExpr(params, return_type, body, loc):
-			False
-		TailrecRecurExpr(args, typ, loc):
-			False
-		TailrecListSpreadLoopExpr(loop, loc):
-			False
-		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
-			False
-
-
-private pure func prepared_tuple_literal(
-	items: List[CoreExpr],
-	item_types: List[CoreType],
-) -> Option[PreparedTupleLiteral]:
-	var elements: List[CoreTupleElement] = []
-	var release_mask: Int = 0
-	var retain_mask: Int = 0
-	var failed: Bool = False
-	var index: Int = 0
-
-	for item in items:
-		if not failed:
-			match item_types.get(index):
-				Some(item_type):
-					match item_type:
-						NativeManagedType(_):
-							elements = elements.append(TuplePointerElement(item))
-							release_mask += release_mask_bit(index)
-						VoidType:
-							elements = elements.append(TupleVoidElement)
-						TypeParameterType(_) | SelfType:
-							failed = True
-							break
-						NamedType(name, args):
-							if is_primitive_tuple_slot_type(item_type):
-								elements = elements.append(TuplePrimElement(item))
-							else:
-								match stack_option_tuple_slot_c_type(item_type):
-									Some(c_type):
-										elements = elements.append(TupleStructElement(item, c_type))
-										release_mask += release_mask_bit(index)
-									None:
-										match float_tuple_element(item, item_type):
-											Some(tuple_element):
-												elements = elements.append(tuple_element)
-											None:
-												if is_pointer_tuple_slot_type(item_type):
-													elements = elements.append(
-														TuplePointerElement(item),
-													)
-
-													if is_managed_pointer_tuple_slot_type(
-														item_type,
-													):
-														release_mask += release_mask_bit(index)
-
-														if tuple_pointer_expr_needs_retain(item):
-															retain_mask += release_mask_bit(index)
-												else:
-													failed = True
-													break
-						TupleType(items):
-							if is_pointer_tuple_slot_type(item_type):
-								elements = elements.append(TuplePointerElement(item))
-
-								if is_managed_pointer_tuple_slot_type(item_type):
-									release_mask += release_mask_bit(index)
-
-									if tuple_pointer_expr_needs_retain(item):
-										retain_mask += release_mask_bit(index)
-							else:
-								failed = True
-								break
-						BoxedResultType(ok_type, err_type):
-							elements = elements.append(TuplePointerElement(item))
-							release_mask += release_mask_bit(index)
-
-							if tuple_pointer_expr_needs_retain(item):
-								retain_mask += release_mask_bit(index)
-						FunctionType(_, _, _):
-							elements = elements.append(TuplePointerElement(item))
-							release_mask += release_mask_bit(index)
-
-							if tuple_pointer_expr_needs_retain(item):
-								retain_mask += release_mask_bit(index)
-						TensorType(info):
-							elements = elements.append(TuplePointerElement(item))
-							release_mask += release_mask_bit(index)
-
-							if tuple_pointer_expr_needs_retain(item):
-								retain_mask += release_mask_bit(index)
-						StackResultType(ok_type, err_type):
-							-- Perceus has already assigned this slot an owner. The
-							-- backend transfers that owner into the stack-Result box.
-							elements = elements.append(TupleStackResultElement(item))
-							release_mask += release_mask_bit(index)
-						HeapRecordType(name):
-							elements = elements.append(TuplePointerElement(item))
-							release_mask += release_mask_bit(index)
-
-							if tuple_pointer_expr_needs_retain(item):
-								retain_mask += release_mask_bit(index)
-						InlineRecordType(name):
-							-- The tuple slot owns a struct box holding a copy.
-							elements = elements.append(TupleStructElement(item, name))
-							release_mask += release_mask_bit(index)
-						UnionType(name, ManagedUnionValue):
-							elements = elements.append(TuplePointerElement(item))
-							release_mask += release_mask_bit(index)
-
-							if tuple_pointer_expr_needs_retain(item):
-								retain_mask += release_mask_bit(index)
-						UnionType(name, ScalarTagValue):
-							elements = elements.append(TuplePrimElement(item))
-						RangeType:
-							elements = elements.append(TuplePrimElement(item))
-				None:
-					failed = True
-					break
-
-		index += 1
-
-	if failed or index != item_types.length():
-		None
-	else:
-		Some({
-			elements = elements,
-			release_mask = release_mask,
-			retain_mask = retain_mask,
-		})
-
-
-private pure func prepare_tuple_expr(
-	decls: PrepareDecls,
-	expr: CoreExpr,
-	items: List[CoreExpr],
-	typ: CoreType,
-	loc: CoreSourceLoc,
-) -> CoreExpr:
-	prepared_items: List[CoreExpr] = prepare_exprs(decls, items)
-
-	prepared_literal: Option[PreparedTupleLiteral] = match typ:
-		TupleType(item_types):
-			prepared_tuple_literal(prepared_items, item_types)
-		_:
-			None
-
-	match prepared_literal:
-		Some(prepared):
-			TupleConstructExpr(
-				{
-					elements = prepared.elements,
-					release_mask = prepared.release_mask,
-					retain_mask = prepared.retain_mask
-				},
-				typ,
-				loc,
-			)
-		None:
-			if same_object(prepared_items, items):
-				expr
-			else:
-				TupleExpr(prepared_items, typ, loc)
-
-
 private pure func vector_element_type(typ: CoreType) -> Option[CoreType]:
 	match typ:
 		TensorType(info):
@@ -2817,6 +2131,12 @@ private pure func tensor_literal_shape_total_length(shape: CoreTensorLiteralShap
 
 private pure func tensor_literal_row(expr: CoreExpr) -> Option[TensorLiteralRow]:
 	match expr:
+		VectorExpr(items, typ, _):
+			-- Before preparation, ranked literal rows are still VectorExpr trees.
+			-- Read their shape without evaluating or hiding their scalar elements.
+			flattened = flatten_vector_literal_items(items)
+			length ?= tensor_literal_shape_total_length(vector_literal_shape(typ, flattened.shape))
+			Some({ elements = flattened.elements, length = length })
 		TensorLiteralExpr(literal, typ, loc):
 			length ?= tensor_literal_shape_total_length(literal.shape)
 
@@ -2906,7 +2226,22 @@ private pure func prepare_vector_expr(
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
 	prepared_items: List[CoreExpr] = prepare_exprs(decls, items)
-	flattened_items: FlattenedVectorItems = flatten_vector_literal_items(prepared_items)
+	project_vector_literal_storage(expr, prepared_items, typ, loc)
+
+
+---
+Issue a literal's storage and flattened shape from its concrete type and row
+constructors. This does not prepare or evaluate children. The ownership boundary
+can therefore name boxed scalar elements before Perceus, while late preparation
+uses this same issuer after preparing its children.
+---
+pure func project_vector_literal_storage(
+	expr: CoreExpr,
+	items: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	flattened_items: FlattenedVectorItems = flatten_vector_literal_items(items)
 	literal_shape: CoreTensorLiteralShape = vector_literal_shape(typ, flattened_items.shape)
 
 	match vector_element_type(typ):
@@ -2976,10 +2311,14 @@ private pure func prepare_vector_expr(
 								loc,
 							)
 		None:
-			if same_object(prepared_items, items):
-				expr
-			else:
-				VectorExpr(prepared_items, typ, loc)
+			match expr:
+				VectorExpr(original_items, _, _):
+					if same_object(original_items, items):
+						expr
+					else:
+						VectorExpr(items, typ, loc)
+				_:
+					VectorExpr(items, typ, loc)
 
 
 private record DictKeyValueTypes {
@@ -3239,111 +2578,6 @@ private pure func prepare_record_cow_field(
 			None
 
 
----
-The declaration-ordered fields of a record literal whose type names a
-declared heap or inline record, paired with that record's name. `None` when
-the type is not such a record or the literal does not cover its fields.
----
-private pure func declaration_ordered_record_fields(
-	records: DeclaredRecords,
-	typ: CoreType,
-	fields: List[CoreRecordFieldValue],
-) -> Option[(String, List[CoreRecordFieldValue])]:
-	match typ:
-		HeapRecordType(name):
-			record_order ?= find_record_field_order(records.heap, name)
-			ordered_fields ?= order_record_fields(record_order, fields)
-			Some((name, ordered_fields))
-		InlineRecordType(name):
-			record_order ?= find_record_field_order(records.inline, name)
-			ordered_fields ?= order_record_fields(record_order, fields)
-			Some((name, ordered_fields))
-		NamedType(_, _) | TypeParameterType(_) | SelfType | VoidType | NativeManagedType(_) | UnionType(_, _):
-			None
-		StackResultType(_, _) | BoxedResultType(_, _) | FunctionType(_, _, _) | RangeType:
-			None
-		TensorType(_) | TupleType(_):
-			None
-
-
----
-True when `ordered` lists exactly the allocations of `fields` in the same
-order. Ordering always builds a fresh list, so this is what lets a construct
-whose fields already follow declaration order keep its own field list.
----
-private pure func same_record_field_order(
-	ordered: List[CoreRecordFieldValue],
-	fields: List[CoreRecordFieldValue],
-) -> Bool:
-	var same: Bool = ordered.length() == fields.length()
-	var index: Int = 0
-
-	for field in fields:
-		if not same:
-			break
-
-		match ordered.get(index):
-			Some(ordered_field):
-				if not same_object(ordered_field, field):
-					same = False
-			None:
-				same = False
-
-		index += 1
-
-	same
-
-
-private pure func prepare_record_expr(
-	decls: PrepareDecls,
-	expr: CoreExpr,
-	fields: List[CoreRecordFieldValue],
-	typ: CoreType,
-	loc: CoreSourceLoc,
-) -> CoreExpr:
-	prepared_fields: Option[List[CoreRecordFieldValue]] = prepare_record_fields(decls, fields)
-
-	match declaration_ordered_record_fields(
-		decls.records,
-		typ,
-		prepared_fields.get_or(fields),
-	):
-		Some((name, ordered_fields)):
-			RecordConstructExpr(name, ordered_fields, typ, loc)
-		None:
-			match prepared_fields:
-				Some(changed_fields):
-					RecordExpr(changed_fields, typ, loc)
-				None:
-					expr
-
-
-private pure func prepare_record_construct_expr(
-	decls: PrepareDecls,
-	expr: CoreExpr,
-	type_name: String,
-	fields: List[CoreRecordFieldValue],
-	typ: CoreType,
-	loc: CoreSourceLoc,
-) -> CoreExpr:
-	prepared_fields: Option[List[CoreRecordFieldValue]] = prepare_record_fields(decls, fields)
-
-	match declaration_ordered_record_fields(
-		decls.records,
-		typ,
-		prepared_fields.get_or(fields),
-	):
-		Some((_, ordered_fields)):
-			if prepared_fields.is_none() and same_record_field_order(ordered_fields, fields):
-				expr
-			else:
-				RecordConstructExpr(type_name, ordered_fields, typ, loc)
-		None:
-			match prepared_fields:
-				Some(changed_fields):
-					RecordConstructExpr(type_name, changed_fields, typ, loc)
-				None:
-					expr
 
 
 private pure func stack_option_scalar_payload_type(typ: CoreType) -> Bool:
@@ -3692,6 +2926,118 @@ private pure func prepare_stack_result_constructor(
 		})
 	else:
 		None
+
+
+-- The source issuer above is the one representation selector; replay checks
+-- ask it read-only after physical type mapping rather than repairing metadata.
+private pure func same_inline_tagged_variant_ref(
+	actual: CoreVariantRef,
+	expected: CoreVariantRef,
+) -> Bool:
+	match actual:
+		VariantById(actual_id):
+			match expected:
+				VariantById(expected_id): actual_id == expected_id
+				_: False
+		BuiltinOptionSome:
+			match expected:
+				BuiltinOptionSome: True
+				_: False
+		BuiltinOptionNone:
+			match expected:
+				BuiltinOptionNone: True
+				_: False
+		BuiltinResultOk:
+			match expected:
+				BuiltinResultOk: True
+				_: False
+		BuiltinResultErr:
+			match expected:
+				BuiltinResultErr: True
+				_: False
+
+
+private pure func same_inline_tagged_tag(
+	actual: CoreInlineTaggedTag,
+	expected: CoreInlineTaggedTag,
+) -> Bool:
+	match actual:
+		NumericInlineTaggedTag(actual_value):
+			match expected:
+				NumericInlineTaggedTag(expected_value): actual_value == expected_value
+				_: False
+		VariantInlineTaggedTag(actual_variant):
+			match expected:
+				VariantInlineTaggedTag(expected_variant):
+					same_inline_tagged_variant_ref(actual_variant, expected_variant)
+				_: False
+
+
+private pure func same_inline_tagged_encoding(
+	actual: CoreInlineTaggedVariantEncoding,
+	expected: CoreInlineTaggedVariantEncoding,
+) -> Bool:
+	(
+		same_inline_tagged_tag(actual.constructor_tag, expected.constructor_tag)
+		and same_inline_tagged_tag(actual.match_tag, expected.match_tag)
+	)
+
+
+private pure func same_prepared_option_representation(
+	actual: CoreUnionRepresentation,
+	expected: CoreUnionRepresentation,
+) -> Bool:
+	match actual:
+		NullableOptionRepresentation:
+			match expected:
+				NullableOptionRepresentation: True
+				_: False
+		BoxedOptionRepresentation:
+			match expected:
+				BoxedOptionRepresentation: True
+				_: False
+		InlineTaggedRepresentation(actual_plan, actual_role):
+			match expected:
+				InlineTaggedRepresentation(expected_plan, expected_role):
+					(
+						actual_plan.c_type == expected_plan.c_type
+						and actual_plan.empty_initializer == expected_plan.empty_initializer
+						and actual_role == expected_role
+						and same_inline_tagged_encoding(actual_plan.empty_encoding, expected_plan.empty_encoding)
+						and same_inline_tagged_encoding(actual_plan.payload_encoding, expected_plan.payload_encoding)
+					)
+				_: False
+		GenericUnionRepresentation | StackResultRepresentation(_):
+			False
+
+
+pure func prepared_option_representation_matches_type(
+	typ: CoreType,
+	constructor_name: String,
+	variant: CoreVariantRef,
+	args: List[CoreBoxedStorageValue],
+	representation: CoreUnionRepresentation,
+) -> Bool:
+	match typ:
+		NamedType(name, [payload]):
+			if name == "Option":
+				definition_id = match variant:
+					VariantById(id): Some(id)
+					_: None
+				match prepare_stack_option_constructor(
+					constructor_name,
+					definition_id,
+					args.map(func(arg): arg.value),
+					payload,
+				):
+					Some(expected):
+						same_prepared_option_representation(representation, expected.representation)
+					None:
+						False
+			else:
+				True
+		_:
+			True
 
 
 private pure func prepare_stack_result_construct(
@@ -4283,7 +3629,7 @@ private pure func prepare_expr(decls: PrepareDecls, expr: CoreExpr) -> CoreExpr:
 			prepare_leaf_expr(decls, expr)
 		DebugBlockExpr(_, _, _) | BinaryExpr(_, _, _, _, _) | UnaryExpr(_, _, _, _) | LogicalExpr(_, _, _, _, _) | AssignExpr(_, _, _, _) | CastExpr(_, _, _) | UnboxExpr(_, _, _, _) | ProductFieldExpr(_, _, _, _) | BoxExpr(_, _, _) | PreClosureDetachExpr(_, _, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _) | LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | SeqExpr(_, _) | WhileExpr(_, _, _, _) | IfExpr(_, _, _, _, _):
 			prepare_operator_expr(decls, expr)
-		CallExpr(_, _, _, _, _) | TupleExpr(_, _, _) | TupleConstructExpr(_, _, _) | VectorExpr(_, _, _) | ListConstructExpr(_, _, _) | DictExpr(_, _, _) | DictConstructExpr(_, _, _) | RecordExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | RecordConstructExpr(_, _, _, _) | UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | SelectExpr(_, _, _):
+		CallExpr(_, _, _, _, _) | TupleExpr(_, _, _) | VectorExpr(_, _, _) | ListConstructExpr(_, _, _) | DictExpr(_, _, _) | DictConstructExpr(_, _, _) | ProductExpr(_, _, _) | RecordUpdateExpr(_, _, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | SelectExpr(_, _, _):
 			prepare_aggregate_expr(decls, expr)
 		ListAllocExpr(_, _, _) | ListGetExpr(_, _, _) | ListHandoffExpr(_, _, _) | ListHandoffSetOwnedExpr(_, _, _) | ListHandoffSetSourceSlotExpr(_, _, _) | ListRetainExpr(_, _, _) | ListSetExpr(_, _, _) | ListSwapExpr(_, _, _) | StringByteReadExpr(_, _, _) | StringByteWriteExpr(_, _, _) | StringByteCopyExpr(_, _, _) | StringSetLenExpr(_, _, _) | TensorLiteralExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | TensorPackedLiteralExpr(_, _, _) | TensorRawFillExpr(_, _, _) | TensorRawReadExpr(_, _, _) | TensorRawWriteExpr(_, _, _) | TensorRawViewLetExpr(_, _, _, _):
 			prepare_storage_expr(decls, expr)
@@ -4494,16 +3840,7 @@ private pure func prepare_aggregate_expr(decls: PrepareDecls, expr: CoreExpr) ->
 					else:
 						CallExpr(kind, prepared_callee, prepared_args, typ, loc)
 		TupleExpr(items, typ, loc):
-			prepare_tuple_expr(decls, expr, items, typ, loc)
-		TupleConstructExpr(tuple_construct, typ, loc):
-			match prepare_list_items(
-				tuple_construct.elements,
-				func(element): prepare_tuple_element(decls, element),
-			):
-				Some(elements):
-					TupleConstructExpr({ tuple_construct | elements = elements }, typ, loc)
-				None:
-					expr
+			expr
 		VectorExpr(items, typ, loc):
 			prepare_vector_expr(decls, expr, items, typ, loc)
 		ListConstructExpr(construct, typ, loc):
@@ -4520,8 +3857,12 @@ private pure func prepare_aggregate_expr(decls: PrepareDecls, expr: CoreExpr) ->
 					DictConstructExpr(prepared_construct, typ, loc)
 				None:
 					expr
-		RecordExpr(fields, typ, loc):
-			prepare_record_expr(decls, expr, fields, typ, loc)
+		ProductExpr(build, typ, loc):
+			match map_product_build_values(build, decls, prepare_expr):
+				Some(prepared_build):
+					ProductExpr(prepared_build, typ, loc)
+				None:
+					expr
 		RecordUpdateExpr(base, fields, typ, loc):
 			prepared_base: CoreExpr = prepare_expr(decls, base)
 			prepared_fields: Option[List[CoreRecordFieldValue]] = prepare_record_fields(
@@ -4538,22 +3879,14 @@ private pure func prepare_aggregate_expr(decls: PrepareDecls, expr: CoreExpr) ->
 					typ,
 					loc,
 				)
-		RecordReuseExpr(source, fields, typ, loc):
+		RecordReuseExpr(source, build, typ, loc):
 			prepared_source: CoreExpr = prepare_expr(decls, source)
-			prepared_fields: Option[List[CoreRecordFieldValue]] = prepare_record_fields(
-				decls,
-				fields,
-			)
+			prepared_build: Option[CoreProductBuild] = map_product_build_values(build, decls, prepare_expr)
 
-			if same_object(prepared_source, source) and prepared_fields.is_none():
+			if same_object(prepared_source, source) and prepared_build.is_none():
 				expr
 			else:
-				RecordReuseExpr(
-					prepared_source,
-					prepared_fields.get_or(fields),
-					typ,
-					loc,
-				)
+				RecordReuseExpr(prepared_source, prepared_build.get_or(build), typ, loc)
 		RecordCowUpdateExpr(source, fields, typ, loc):
 			prepared_source: CoreExpr = prepare_expr(decls, source)
 			prepared_fields: Option[List[CoreRecordCowField]] = prepare_list_items(
@@ -4570,8 +3903,6 @@ private pure func prepare_aggregate_expr(decls: PrepareDecls, expr: CoreExpr) ->
 					typ,
 					loc,
 				)
-		RecordConstructExpr(type_name, fields, typ, loc):
-			prepare_record_construct_expr(decls, expr, type_name, fields, typ, loc)
 		UnionConstructExpr(construct, typ, loc):
 			match prepare_boxed_storage_values(decls, construct.args):
 				Some(args):
@@ -5339,246 +4670,6 @@ pure func prepare_dict_literals_for_ownership(program: CoreProgram) -> CoreProgr
 	}
 
 
----
-A program after `bind_record_literal_fields_in_written_order`, and the binder
-counter after the ids it minted.
----
-record WrittenOrderRecordLiterals {
-	program: CoreProgram,
-	next_binder_id: Int
-}
-
-
--- The records `prepare` looks up a literal's field order in, and the
--- counter the minted binders count down from.
-private record RecordLiteralBinding {
-	records: DeclaredRecords,
-	next_binder_id: Int
-}
-
-
-private record RecordFieldBinding {
-	variable: CoreVar,
-	typ: CoreType,
-	value: CoreExpr
-}
-
-
--- Each bound field value's name carries its binder id. Perceus still tracks
--- a variable's uses by name (`summarize_linear_ownership_uses`), so two
--- binders in one function must not share a name even when their ids differ.
-private RECORD_LITERAL_FIELD_NAME_PREFIX: String = "$blorp$record_field$"
-
-
----
-True when `prepare_record_expr` would reorder this record literal's fields,
-that is when they are not written in declaration order.
----
-private pure func record_literal_out_of_declaration_order(
-	records: DeclaredRecords,
-	fields: List[CoreRecordFieldValue],
-	typ: CoreType,
-) -> Bool:
-	match declaration_ordered_record_fields(records, typ, fields):
-		Some((_, ordered_fields)):
-			not same_record_field_order(ordered_fields, fields)
-		None:
-			False
-
-
----
-A constant has no effect and owns nothing, so where it is evaluated cannot
-matter. A variable read is not a constant: a later field can call a function
-that assigns the module variable it names.
----
-private pure func is_literal_field_value(value: CoreExpr) -> Bool:
-	match value:
-		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _):
-			True
-		_:
-			False
-
-
----
-Binds each field value of the literal that is not a constant to a fresh
-variable, in written order, and builds the record from the variables.
-Perceus then sees the bound values run before the construction.
----
-private pure func bind_fields_in_written_order(
-	binding: RecordLiteralBinding,
-	fields: List[CoreRecordFieldValue],
-	typ: CoreType,
-	loc: CoreSourceLoc,
-) -> CoreTraverse.CoreMapState[RecordLiteralBinding, CoreExpr]:
-	var next_binder_id: Int = binding.next_binder_id
-	var bound_fields: List[CoreRecordFieldValue] = []
-	var field_bindings: List[RecordFieldBinding] = []
-
-	for field in fields:
-		if is_literal_field_value(field.value):
-			bound_fields = bound_fields.append(field)
-		else:
-			next_binder_id -= 1
-			value_type: CoreType = expr_type(field.value)
-			name: String = RECORD_LITERAL_FIELD_NAME_PREFIX + (0 - next_binder_id).to_string()
-			variable: CoreVar = { core_var_with_id(name, next_binder_id) |
-				origin = RECORD_LITERAL_FIELD_TEMP_ORIGIN
-			}
-			field_bindings = field_bindings.append({
-				variable = variable,
-				typ = value_type,
-				value = field.value,
-			})
-			bound_fields = bound_fields.append(
-				{ field | value = VarExpr(variable, value_type, loc) },
-			)
-
-	var bound: CoreExpr = RecordExpr(bound_fields, typ, loc)
-
-	for field_binding in field_bindings.reverse():
-		bound = LetExpr(
-			field_binding.variable,
-			False,
-			field_binding.typ,
-			field_binding.value,
-			bound,
-		)
-
-	{
-		state = { binding | next_binder_id = next_binder_id },
-		value = bound
-	}
-
-
-private pure func bind_record_literal_fields_expr(
-	binding: RecordLiteralBinding,
-	expr: CoreExpr,
-) -> CoreTraverse.CoreMapState[RecordLiteralBinding, CoreExpr]:
-	mapped: CoreTraverse.CoreMapState[RecordLiteralBinding, CoreExpr] = CoreTraverse.map_core_expr_children_with_state(
-		binding,
-		bind_record_literal_fields_expr,
-		expr,
-	)
-
-	match mapped.value:
-		RecordExpr(fields, typ, loc):
-			if (
-				fields.any(func(field): not is_literal_field_value(field.value))
-				and record_literal_out_of_declaration_order(mapped.state.records, fields, typ)
-			):
-				bind_fields_in_written_order(mapped.state, fields, typ, loc)
-			else:
-				mapped
-		_:
-			mapped
-
-
-private pure func bind_record_literal_fields_function(
-	binding: RecordLiteralBinding,
-	func_info: CoreFunction,
-) -> CoreTraverse.CoreMapState[RecordLiteralBinding, CoreFunction]:
-	match func_info.body:
-		Some(body):
-			bound: CoreTraverse.CoreMapState[RecordLiteralBinding, CoreExpr] = bind_record_literal_fields_expr(
-				binding,
-				body,
-			)
-
-			bound_function: CoreFunction = if same_object(bound.value, body):
-				func_info
-			else:
-				{ func_info | body = Some(bound.value) }
-
-			{
-				state = bound.state,
-				value = bound_function
-			}
-		None:
-			{
-				state = binding,
-				value = func_info
-			}
-
-
----
-Fixes the evaluation order of every record literal whose fields are not
-written in declaration order, before ownership analysis. `prepare_record_expr`
-sorts a literal's fields into declaration order after Perceus, and the emitter
-evaluates them in that order, while Perceus decided ownership for the written
-order: a field that borrows a value could then run after the field that
-consumes it, or a module variable could be read after the call that assigns
-it. Binding every field value other than a constant to a variable in written
-order, before Perceus, leaves the sort only moving constants and reads of
-those variables. A literal already in declaration order is left alone, and so
-is every declaration without such a literal. The binders are minted from
-`next_binder_id` (see `FIRST_MINTED_BINDER_ID`).
----
-pure func bind_record_literal_fields_in_written_order(
-	program: CoreProgram,
-	next_binder_id: Int,
-) -> WrittenOrderRecordLiterals:
-	var binding: RecordLiteralBinding = {
-		records = declared_records(program.decls),
-		next_binder_id = next_binder_id
-	}
-	var decls: List[CoreDecl] = []
-
-	for decl in program.decls:
-		match decl:
-			FunctionDecl(func_info):
-				bound: CoreTraverse.CoreMapState[RecordLiteralBinding, CoreFunction] = bind_record_literal_fields_function(
-					binding,
-					func_info,
-				)
-				binding = bound.state
-
-				bound_decl: CoreDecl = if same_object(bound.value, func_info):
-					decl
-				else:
-					FunctionDecl(bound.value)
-
-				decls = decls.append(bound_decl)
-			GlobalDecl(global):
-				bound: CoreTraverse.CoreMapState[RecordLiteralBinding, CoreExpr] = bind_record_literal_fields_expr(
-					binding,
-					global.init,
-				)
-				binding = bound.state
-
-				bound_decl: CoreDecl = if same_object(bound.value, global.init):
-					decl
-				else:
-					GlobalDecl({ global | init = bound.value })
-
-				decls = decls.append(bound_decl)
-			ImplDecl(impl_decl):
-				var methods: List[CoreFunction] = []
-				var methods_changed: Bool = False
-
-				for method in impl_decl.methods:
-					bound: CoreTraverse.CoreMapState[RecordLiteralBinding, CoreFunction] = bind_record_literal_fields_function(
-						binding,
-						method,
-					)
-					binding = bound.state
-					methods_changed = methods_changed or not same_object(bound.value, method)
-					methods = methods.append(bound.value)
-
-				bound_decl: CoreDecl = if methods_changed:
-					ImplDecl({ impl_decl | methods = methods })
-				else:
-					decl
-
-				decls = decls.append(bound_decl)
-			_:
-				decls = decls.append(decl)
-
-	{
-		program = { program | decls = decls },
-		next_binder_id = binding.next_binder_id
-	}
-
-
 private pure func prepare_function(decls: PrepareDecls, func_info: CoreFunction) -> CoreFunction:
 	match func_info.body:
 		Some(body):
@@ -5617,6 +4708,8 @@ private pure func prepare_decl(decls: PrepareDecls, decl: CoreDecl) -> CoreDecl:
 			UnionDecl(union_decl)
 		HeapRecordDecl(record_decl):
 			HeapRecordDecl(record_decl)
+		GeneratedTupleRecordDecl(row):
+			GeneratedTupleRecordDecl(row)
 		InlineRecordDecl(record_decl):
 			InlineRecordDecl(record_decl)
 		TypeAliasDecl(alias_decl):
@@ -5879,12 +4972,16 @@ private pure func union_cleanup_type_plan(
 	})
 
 
-private pure func heap_record_cleanup_type_plan(record_decl: CoreHeapRecordDecl) -> CleanupTypePlan:
+private pure func managed_record_cleanup_type_plan(record_layout: CoreManagedRecordLayout) -> CleanupTypePlan:
 	var fields: List[CleanupFieldPlan] = []
 	var has_destructor: Bool = False
 
-	for field in record_decl.fields:
-		needs_release: Bool = release_policy_requires_cleanup(field.release_policy)
+	for field in managed_record_layout_fields(record_layout):
+		needs_release: Bool = match field.storage:
+			TypedManagedRecordField:
+				release_policy_requires_cleanup(field.release_policy)
+			UnitManagedRecordField:
+				False
 
 		if needs_release:
 			has_destructor = True
@@ -5909,41 +5006,54 @@ private pure func heap_record_cleanup_type_plan(record_decl: CoreHeapRecordDecl)
 
 private pure func cleanup_type_plan_for_decl(
 	layout: CoreSpecializeLayout,
+	catalog: CoreTupleStorageCatalog,
 	decl: CoreDecl,
-) -> CleanupTypePlan:
-	match decl:
-		UnionDecl(union_decl):
-			match union_decl.storage:
-				ManagedPayloadStorage(_):
-					union_cleanup_type_plan(layout, union_decl)
-				ScalarTagStorage:
-					NotACleanupType
-		HeapRecordDecl(record_decl):
-			heap_record_cleanup_type_plan(record_decl)
-		InlineRecordDecl(_):
-			-- Scalar fields and no header: an inline record has nothing to clean up.
-			NotACleanupType
-		FunctionDecl(_) | GlobalDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
-			NotACleanupType
+) -> Result[CleanupTypePlan, CoreManagedRecordLayoutFault]:
+	managed_layout ?= managed_record_layout_for_decl(catalog, decl)
+
+	match managed_layout:
+		Some(record_layout):
+			Ok(managed_record_cleanup_type_plan(record_layout))
+		None:
+			match decl:
+				UnionDecl(union_decl):
+					match union_decl.storage:
+						ManagedPayloadStorage(_):
+							Ok(union_cleanup_type_plan(layout, union_decl))
+						ScalarTagStorage:
+							Ok(NotACleanupType)
+				_:
+					Ok(NotACleanupType)
 
 
 ---
-Builds the program's cleanup plan once. Heap record rows use shared
-`allocation_contracts` policy; union rows combine that source-owned policy
-with the erased-storage box ownership classifier. Every other declaration
-gets `NotACleanupType`. Called once, from the single place a `CoreProgram`
-becomes a `PreparedCoreProgram`
-(`stage_09_core/pipeline.brp`), so the emitter never has to call the
-policy predicates itself.
+Build the program's cleanup plan once from the complete, validated generated
+catalog and the common managed-record physical layout. Unit fields keep
+logical positions but never require cleanup. Invalid generated rows cannot
+be paired with a PreparedCoreProgram. Union rows retain their existing
+storage-owned cleanup policy; other declarations have no cleanup row.
 ---
-pure func build_cleanup_plan(program: CoreProgram) -> CleanupPlan:
+pure func build_cleanup_plan(program: CoreProgram) -> Result[CleanupPlan, CoreManagedRecordLayoutFault]:
+	catalog ?= tuple_storage_catalog(program).map_err(
+		func(fault): GeneratedTupleFieldStorageUnavailable(fault),
+	)
 	layout: CoreSpecializeLayout = build_specialize_layout(program)
 	var rows: List[CleanupTypePlan] = []
+	var failure: Option[CoreManagedRecordLayoutFault] = None
 
 	for decl in program.decls:
-		rows = rows.append(cleanup_type_plan_for_decl(layout, decl))
+		if failure.is_none():
+			match cleanup_type_plan_for_decl(layout, catalog, decl):
+				Ok(row):
+					rows = rows.append(row)
+				Err(fault):
+					failure = Some(fault)
 
-	{rows = rows}
+	match failure:
+		Some(fault):
+			Err(fault)
+		None:
+			Ok({ rows = rows })
 
 
 ---
@@ -6079,7 +5189,7 @@ private pure func cancellation_plan_for_decl(
 			function_cancellation_plan(func_info, program_summary)
 		GlobalDecl(global):
 			global_cancellation_plan(global, program_summary)
-		UnionDecl(_) | HeapRecordDecl(_) | InlineRecordDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
+		UnionDecl(_) | HeapRecordDecl(_) | GeneratedTupleRecordDecl(_) | InlineRecordDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
 			None
 
 

@@ -1,24 +1,22 @@
--- The one place that tells a record from a tuple by its Core type.
---
--- Records and tuples are one product family in Core (docs/PRODUCT_UNIFICATION.md).
--- Until `ProductType` replaces them, three type variants name a product: a
--- managed record (`HeapRecordType`), an inline record (`InlineRecordType`) and
--- a tuple (`TupleType`). This module is the only code that matches those three
--- variants to answer a product question: new code asks it, and code that
--- still matches a variant directly answers a narrower question (such as
--- whether a type is stored as a heap record pointer). When `ProductType`
--- lands, these bodies change and their callers do not.
---
--- The record-or-tuple answer is reserved for C layout (member spelling, and
--- the packed scalar members only records have) and for the record-only
--- rewrites that have not yet been extended to tuples (record update paths).
+-- Product storage classification after representation and tuple storage lowering.
+-- Authored records and generated tuple rows both use HeapRecordType; source
+-- fixed records proven scalar use InlineRecordType. Logical TupleType belongs
+-- to semantic Core and has no constructor or member layout at this boundary.
 import:
 	ir:
+		CoreDecl(GeneratedTupleRecordDecl, HeapRecordDecl, InlineRecordDecl),
+		CoreProgram,
+		CoreTupleStorageCatalog,
 		CoreType(
 			BoxedResultType, NativeManagedType, FunctionType, HeapRecordType, InlineRecordType, NamedType,
 			RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType,
 			UnionType, VoidType,
 		),
+		core_generated_tuple_record_name,
+		tuple_storage_catalog,
+	managed_record_layout:
+		generated_tuple_record_layout,
+		managed_record_layout_fields,
 
 
 --- How a product is stored: as a reference-counted box, or by value with no
@@ -32,14 +30,13 @@ fixed union CoreProductRepresentation:
 private union CoreInterimProductForm:
 	ManagedRecordProduct(String)
 	InlineRecordProduct(String)
-	TupleProduct
 
 
 --- A product type, issued only by `core_product_of`.
 opaque type CoreInterimProduct = CoreInterimProductForm
 
 
---- The product `typ` is, or `None` when it is not a record or tuple type.
+--- The physical product `typ` is, or `None` before its record layout is issued.
 --- A record is a product only once layout has named it: before that it is a
 --- `NamedType`, which this answers `None` for.
 pure func core_product_of(typ: CoreType) -> Option[CoreInterimProduct]:
@@ -49,26 +46,122 @@ pure func core_product_of(typ: CoreType) -> Option[CoreInterimProduct]:
 		InlineRecordType(name):
 			Some(into_opaque CoreInterimProduct(InlineRecordProduct(name)))
 		TupleType(_):
-			Some(into_opaque CoreInterimProduct(TupleProduct))
+			None
 		VoidType | NativeManagedType(_) | NamedType(_, _) | TypeParameterType(_) | SelfType | FunctionType(_, _, _) | StackResultType(_, _) | BoxedResultType(_, _) | UnionType(_, _) | RangeType | TensorType(_):
 			None
 
 
 pure func interim_product_representation(product: CoreInterimProduct) -> CoreProductRepresentation:
 	match from_opaque CoreInterimProduct(product):
-		ManagedRecordProduct(_) | TupleProduct:
+		ManagedRecordProduct(_):
 			ManagedBox
 		InlineRecordProduct(_):
 			InlineValue
 
 
 --- The record instance a record product is, by its emitted declaration name,
---- or `None` for a tuple.
+--- or `None` when no physical record was issued.
 pure func interim_product_record(product: CoreInterimProduct) -> Option[String]:
 	match from_opaque CoreInterimProduct(product):
 		ManagedRecordProduct(name):
 			Some(name)
 		InlineRecordProduct(name):
 			Some(name)
-		TupleProduct:
+
+
+---
+Checked fields of each concrete record, derived from its declaration once.
+The key is the existing Core record spelling, not a new identity authority.
+Missing, generic or ambiguous declarations never provide a field schema.
+Generated rows use the existing catalog and layout view for physical fields;
+invalid catalog/layout facts leave those schemas unavailable for optimization.
+Lowering issues
+resolved field identities and declared types; mono preserves their order and
+rewrites their types (lower.brp, lower_heap_record_field; mono_data.brp).
+---
+private union InterimRecordSchema:
+	CheckedRecordFields(List[CoreType])
+	InvalidRecordFields
+
+
+opaque type CoreInterimRecordFields = Dict[String, InterimRecordSchema]
+
+
+pure func interim_record_fields(program: CoreProgram) -> CoreInterimRecordFields:
+	-- Logical tuple flattening runs before generated rows exist. Only physical
+	-- rows need the accepted storage catalog, built once for this snapshot.
+	has_generated_rows: Bool = program.decls.any(pure func(decl):
+		match decl:
+			GeneratedTupleRecordDecl(_): True
+			_: False
+	)
+	catalog: Option[CoreTupleStorageCatalog] = if has_generated_rows:
+		match tuple_storage_catalog(program):
+			Ok(checked): Some(checked)
+			Err(_): None
+	else:
+		None
+	var schemas: Dict[String, InterimRecordSchema] = {}
+
+	for decl in program.decls:
+		match decl:
+			GeneratedTupleRecordDecl(row):
+				name: String = core_generated_tuple_record_name(row)
+				schema: InterimRecordSchema = if schemas.contains(name):
+					InvalidRecordFields
+				else:
+					match catalog:
+						Some(checked):
+							match generated_tuple_record_layout(checked, row):
+								Ok(layout):
+									CheckedRecordFields(managed_record_layout_fields(layout).map(pure func(field): field.typ))
+								Err(_): InvalidRecordFields
+						None: InvalidRecordFields
+				schemas = schemas.set(name, schema)
+			HeapRecordDecl(record_decl):
+				schema: InterimRecordSchema = if schemas.contains(record_decl.name) or not record_decl.type_params.is_empty():
+					InvalidRecordFields
+				else:
+					CheckedRecordFields(record_decl.fields.map(pure func(field): field.typ))
+				schemas = schemas.set(record_decl.name, schema)
+			InlineRecordDecl(record_decl):
+				schema: InterimRecordSchema = if schemas.contains(record_decl.name):
+					InvalidRecordFields
+				else:
+					CheckedRecordFields(record_decl.fields.map(pure func(field): field.typ))
+				schemas = schemas.set(record_decl.name, schema)
+			_:
+				void
+
+	into_opaque CoreInterimRecordFields(schemas)
+
+
+--- Logical tuple elements before storage, or checked physical record fields.
+--- Missing schemas fail closed; logical tuples need no record layout yet.
+pure func interim_product_fields(
+	fields: CoreInterimRecordFields,
+	typ: CoreType,
+) -> Option[List[CoreType]]:
+	match typ:
+		TupleType(items):
+			Some(items)
+		_:
+			product ?= core_product_of(typ)
+			name ?= interim_product_record(product)
+			match (from_opaque CoreInterimRecordFields(fields)).get(name):
+				Some(CheckedRecordFields(types)):
+					Some(types)
+				_:
+					None
+
+
+pure func interim_product_field_count(
+	fields: CoreInterimRecordFields,
+	product: CoreInterimProduct,
+) -> Option[Int]:
+	name ?= interim_product_record(product)
+	match (from_opaque CoreInterimRecordFields(fields)).get(name):
+		Some(CheckedRecordFields(types)):
+			Some(types.length())
+		_:
 			None

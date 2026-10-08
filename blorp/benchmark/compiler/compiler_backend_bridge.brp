@@ -9,16 +9,21 @@ import:
 		decode_bridge_payload,
 	../../../blorp/src/compiler/stage_09_core/ir:
 		CoreProgram,
+		core_function_origin_to_json,
+		core_module_origin_to_json,
 		core_json_error_to_string,
 		core_program_to_json,
 		decode_core_program_json,
+	../../../blorp/src/compiler/stage_09_core/function_origin_fixture:
+		FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN,
+	../../../blorp/src/compiler/stage_09_core/pass_runner: core_pass_diagnostic_message
 	../../../blorp/src/compiler/stage_09_core/perceus as CorePerceus
 	../../../blorp/src/compiler/stage_09_core/pipeline:
 		PreparedCoreProgram,
-		prepare_perceus_input,
-		run_perceus_stage,
-		run_post_perceus_tail,
-		run_pre_dce_tail,
+		try_prepare_perceus_input,
+		try_run_perceus_stage,
+		try_run_post_perceus_tail,
+		try_run_pre_dce_tail,
 		run_reuse_pass,
 	../../../blorp/src/compiler/stage_10_backend/emit:
 		core_emit_error_message,
@@ -208,7 +213,9 @@ private pure func handle_emit_core_c(body: JsonValue) -> Result[JsonValue, Backe
 private pure func handle_run_perceus(body: JsonValue) -> Result[JsonValue, BackendBridgeError]:
 	core_json ?= json_field(body, "core", "Core program JSON")
 	program ?= decode_core_program(core_json)
-	perceus_program: CoreProgram = run_perceus_stage(program)
+	perceus_program ?= try_run_perceus_stage(program).map_err(
+		func(diagnostic): EmitFailure(core_pass_diagnostic_message(diagnostic)),
+	)
 	Ok(
 		bridge_success_json(
 			JsonObject([(CORE_ARTIFACT_FIELD, core_program_to_json(perceus_program))]),
@@ -229,15 +236,18 @@ private func measured_core_artifact(
 
 	started: Int = now_microseconds()
 
-	output: CoreProgram = if direct_perceus:
-		CorePerceus.insert_drops_program(program)
+	output_result: Result[CoreProgram, BackendBridgeError] = if direct_perceus:
+		Ok(CorePerceus.insert_drops_program(program))
 	else:
-		run_perceus_stage(program)
+		try_run_perceus_stage(program).map_err(
+			func(diagnostic): EmitFailure(core_pass_diagnostic_message(diagnostic)),
+		)
 
 	elapsed_microseconds: Int = now_microseconds() - started
 	end_function_profile_window()
 	memory = get_mem_stats()
 	memory_stats_active ?= require_memory_stats(memory.memory_stats_active)
+	output ?= output_result
 
 	Ok(bridge_success_json(JsonObject([
 		(CORE_ARTIFACT_FIELD, core_program_to_json(output)),
@@ -261,7 +271,9 @@ private func handle_measure_perceus_direct(
 ) -> Result[JsonValue, BackendBridgeError]:
 	core_json ?= json_field(body, "core", "Core program JSON")
 	program ?= decode_core_program(core_json)
-	ownership_ready_program: CoreProgram = prepare_perceus_input(program)
+	ownership_ready_program ?= try_prepare_perceus_input(program).map_err(
+		func(diagnostic): EmitFailure(core_pass_diagnostic_message(diagnostic)),
+	)
 	measured_core_artifact(DIRECT_PERCEUS_WINDOW, ownership_ready_program, True)
 
 
@@ -270,10 +282,14 @@ private pure func handle_inspect_ownership_stages(
 ) -> Result[JsonValue, BackendBridgeError]:
 	core_json ?= json_field(body, "core", "Core program JSON")
 	program ?= decode_core_program(core_json)
-	ownership_ready: CoreProgram = prepare_perceus_input(program)
+	ownership_ready ?= try_prepare_perceus_input(program).map_err(
+		func(diagnostic): EmitFailure(core_pass_diagnostic_message(diagnostic)),
+	)
 	post_perceus: CoreProgram = CorePerceus.insert_drops_program(ownership_ready)
 	post_reuse: CoreProgram = run_reuse_pass(post_perceus)
-	prepared: CoreProgram = run_post_perceus_tail(post_perceus)
+	prepared ?= try_run_post_perceus_tail(post_perceus).map_err(
+		func(diagnostic): EmitFailure(core_pass_diagnostic_message(diagnostic)),
+	)
 
 	Ok(bridge_success_json(JsonObject([
 		("ownership_ready", core_program_to_json(ownership_ready)),
@@ -289,7 +305,9 @@ private func handle_measure_backend_emission(
 	core_json ?= json_field(body, "core", "Core program JSON")
 	profile ?= optional_bool_field(body, "profile", False)
 	program ?= decode_core_program(core_json)
-	prepared: PreparedCoreProgram = run_pre_dce_tail(program)
+	prepared ?= try_run_pre_dce_tail(program).map_err(
+		func(diagnostic): EmitFailure(core_pass_diagnostic_message(diagnostic)),
+	)
 
 	reset_mem_stats()
 	begin_function_profile_window()
@@ -320,7 +338,14 @@ private func dispatch_request(root: JsonValue) -> Result[JsonValue, BackendBridg
 
 	body ?= decode_bridge_payload(root).map_err(func(error): ProtocolError(error))
 
-	if header.action_name == "emit_core_c":
+	if header.action_name == "fixture_function_metadata":
+		-- JSON fixtures obtain the authentic placeholder from its owning name
+		-- table, outside every measured window; they never mint a NameId.
+		Ok(bridge_success_json(JsonObject([
+			("module_origin", core_module_origin_to_json(FIXTURE_NO_SOURCE_MODULE)),
+			("origin", core_function_origin_to_json(FIXTURE_SOURCE_FUNCTION_ORIGIN)),
+		])))
+	else if header.action_name == "emit_core_c":
 		handle_emit_core_c(body)
 	else if header.action_name == "run_perceus":
 		handle_run_perceus(body)

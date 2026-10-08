@@ -1,0 +1,142 @@
+import:
+	memory:
+		MemoryCounter(ManagedAllocations, LiveManagedObjects, MemoryStatsActive),
+		read_memory_counter, refcount
+	test: TestSuite
+
+
+type alias Reader = pure (Int) -> Int
+
+
+fixed record LifetimeSnapshot {
+	active: Int,
+	allocations: Int,
+	live: Int
+}
+
+
+private func lifetime_snapshot() -> LifetimeSnapshot:
+	{
+		active = read_memory_counter(MemoryStatsActive),
+		allocations = read_memory_counter(ManagedAllocations),
+		live = read_memory_counter(LiveManagedObjects)
+	}
+
+
+private pure func balanced_lifetimes(before: LifetimeSnapshot, after: LifetimeSnapshot) -> Bool:
+	if before.active == 0 and after.active == 0:
+		True
+	else if before.active == 1 and after.active == 1:
+		after.allocations > before.allocations and after.live == before.live
+	else:
+		False
+
+
+private pure func plain_reader(input: Int) -> Int:
+	input
+
+
+private pure func offset_reader(input: Int) -> Int:
+	input + 1
+
+
+private pure func captured_reader(text: String, bias: Int) -> Reader:
+	func(input: Int) -> Int:
+		text.length() + bias + input
+
+
+private pure func fresh_readers(text: String, bias: Int) -> List[Reader]:
+	[plain_reader, captured_reader(text, bias)]
+
+
+private pure func repeated_readers(reader: Reader) -> List[Reader]:
+	[reader, reader]
+
+
+private pure func static_readers() -> List[Reader]:
+	[plain_reader, offset_reader]
+
+
+private pure func returned_values(readers: List[Reader], first_expected: Int, second_expected: Int) -> Bool:
+	before_refs = refcount(readers)
+	first_value = match readers.get(0):
+		Some(reader):
+			reader(3) == first_expected
+		None:
+			False
+	second_value = match readers.get(1):
+		Some(reader):
+			reader(3) == second_expected
+		None:
+			False
+	first_value and second_value and before_refs > 0 and refcount(readers) == before_refs
+
+
+-- Each observer returns only Bool, so list destruction precedes the snapshots.
+private pure func observe_fresh_readers(text: String, bias: Int) -> Bool:
+	readers = fresh_readers(text, bias)
+	returned_values(readers, 3, text.length() + bias + 3)
+
+
+private pure func observe_repeated_readers(reader: Reader, expected: Int) -> Bool:
+	readers = repeated_readers(reader)
+	returned_values(readers, expected, expected)
+
+
+private pure func observe_static_readers() -> Bool:
+	readers = static_readers()
+	returned_values(readers, 3, 4)
+
+
+func test_fresh_reader_survives_list_producer() -> Bool:
+	seed = read_memory_counter(ManagedAllocations)
+	text = ("fresh reader " + seed.to_string()).repeat(2)
+	bias = seed + text.length()
+	before_refs = refcount(text)
+	before = lifetime_snapshot()
+	values = observe_fresh_readers(text, bias)
+	after = lifetime_snapshot()
+	after_refs = refcount(text)
+	(
+		values and before_refs > 0 and after_refs == before_refs
+		and text.length() > 0 and balanced_lifetimes(before, after)
+	)
+
+
+func test_repeated_borrowed_reader_preserves_parent() -> Bool:
+	seed = read_memory_counter(ManagedAllocations)
+	text = ("borrowed reader " + seed.to_string()).repeat(2)
+	bias = seed + text.length()
+	reader = captured_reader(text, bias)
+	expected = text.length() + bias + 3
+	before_text_refs = refcount(text)
+	before_reader_refs = refcount(reader)
+	before = lifetime_snapshot()
+	values = observe_repeated_readers(reader, expected)
+	after = lifetime_snapshot()
+	after_text_refs = refcount(text)
+	after_reader_refs = refcount(reader)
+	parent_value = reader(3) == expected
+	(
+		values and parent_value
+		and before_text_refs > 0 and after_text_refs == before_text_refs
+		and before_reader_refs > 0 and after_reader_refs == before_reader_refs
+		and balanced_lifetimes(before, after)
+	)
+
+
+func test_static_readers_release_the_list() -> Bool:
+	before = lifetime_snapshot()
+	values = observe_static_readers()
+	after = lifetime_snapshot()
+	values and balanced_lifetimes(before, after)
+
+
+tests: TestSuite = {
+	description = "Callable list ownership after producer return",
+	tests = [
+		("fresh reader survives the list producer", test_fresh_reader_survives_list_producer),
+		("repeated borrowed reader preserves its parent", test_repeated_borrowed_reader_preserves_parent),
+		("static readers preserve values and release the list", test_static_readers_release_the_list),
+	]
+}

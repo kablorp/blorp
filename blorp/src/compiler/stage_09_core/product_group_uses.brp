@@ -1,0 +1,344 @@
+-- Conservative use facts for logical tuple groups and managed products.
+-- Derived from the original function parameters/body, with full CoreVar
+-- identity. These facts do not prove producer eligibility or owned results.
+-- The consumer retains its lazy cache; no rewritten body reuses this analysis.
+import:
+	memory: same_object
+	ir:
+		CoreConcurrentBinding,
+		CoreExpr(
+			BorrowLetExpr, ConcurrentExpr, ConcurrentlyLoopExpr, ForChannelExpr, ForDictExpr,
+			ForListExpr, ForRangeExpr, ForResourceSourceExpr, ForSetExpr, ForStreamExpr,
+			ForStringExpr, ForTensorExpr, LambdaExpr, LetExpr, ListHandoffExpr,
+			PreClosureConcurrentExpr, PreClosureConcurrentlyLoopExpr, ProductFieldExpr,
+			ResourceScopeExpr, SelectExpr, SemanticMatchExpr, TailrecListSpreadLoopExpr,
+			TailrecLoopExpr, TensorRawViewLetExpr, VarExpr,
+		),
+		CoreParam,
+		CorePreClosureConcurrentBinding,
+		CoreSelectArmKind(SelectRecvArm),
+		CoreSemanticMatchAccessor(RootSemanticMatchAccessor),
+		CoreSemanticMatchBinding,
+		CoreSemanticMatchTree(
+			SemanticConstructorMatch, SemanticLengthMatch, SemanticLiteralMatch,
+			SemanticMatchFail, SemanticMatchLeaf,
+		),
+		CoreType(TupleType),
+		CoreVar,
+		core_var_equal,
+	product_type:
+		CoreProductRepresentation(ManagedBox), core_product_of, interim_product_representation,
+	traverse: immediate_core_expr_children
+
+
+---
+Locals that name `source` again: an immutable alias, or a leaf binder that
+names a matched variable's whole value. Their whole uses are the source's.
+---
+private record ProductAliases {
+	aliases: List[CoreVar],
+	source: CoreVar
+}
+
+
+---
+What the pass needs to know about a function's binders, from its body as
+written:
+
+- which group variables are used whole: anywhere but as the base of an
+  element read, a tuple match subject, or an immutable alias,
+  with an alias's whole uses carried back to its source;
+- which binders are bound more than once. The binder identity contract makes
+  that an error, but a body that `std_inline` clones can still repeat one
+  (docs/NAME_ID_ROADMAP.md, B1). Such a binder is never flattened, renamed or
+  reused as an element, so a use can never resolve to the wrong binding.
+---
+record ProductGroupUses {
+	used_whole: List[CoreVar],
+	rebound: List[CoreVar]
+}
+
+
+pure func contains_var(variables: List[CoreVar], variable: CoreVar) -> Bool:
+	variables.any(pure func(candidate: CoreVar): core_var_equal(candidate, variable))
+
+
+pure func is_tuple_type(typ: CoreType) -> Bool:
+	match typ:
+		TupleType(_):
+			True
+		_:
+			False
+
+
+-- Logical tuple groups precede typed storage. A tuple remains eligible even
+-- when the physical product classifier only recognises its generated record.
+pure func is_group_type(typ: CoreType) -> Bool:
+	if is_tuple_type(typ):
+		True
+	else:
+		match core_product_of(typ):
+			Some(product):
+				interim_product_representation(product) == ManagedBox
+			None:
+				False
+
+
+---
+The binders `expr` itself introduces, for the binder count. A match's leaf
+bindings are counted once per match: one pattern variable can appear in
+several leaves of one decision tree.
+---
+private pure func introduced_binders(expr: CoreExpr) -> List[CoreVar]:
+	match expr:
+		LetExpr(variable, _, _, _, _):
+			[variable]
+		BorrowLetExpr(variable, _, _, _):
+			[variable]
+		LambdaExpr(params, _, _, _, _, _):
+			params.map(pure func(param: CoreParam): param.name)
+		TailrecLoopExpr(params, _, _, _):
+			params.map(pure func(param: CoreParam): param.name)
+		TailrecListSpreadLoopExpr(loop, _):
+			[loop.cursor, loop.list_param.name].concat(
+				loop.params.map(pure func(param: CoreParam): param.name),
+			)
+		ForRangeExpr(binder, _, _, _, _, _):
+			[binder.variable]
+		ForChannelExpr(loop, _, _):
+			[loop.binder.variable]
+		ForListExpr(loop, _, _):
+			[loop.binder.variable]
+		ForStringExpr(loop, _, _):
+			[loop.binder.variable]
+		ForDictExpr(loop, _, _):
+			[loop.binder.variable]
+		ForSetExpr(loop, _, _):
+			[loop.binder.variable]
+		ForStreamExpr(loop, _, _):
+			[loop.binder.variable]
+		ForResourceSourceExpr(loop, _, _):
+			[loop.binder.variable]
+		ForTensorExpr(loop, _, _):
+			[loop.binder.variable]
+		ResourceScopeExpr(scope, _, _):
+			[scope.variable]
+		ListHandoffExpr(handoff, _, _):
+			[handoff.source_var, handoff.result_var, handoff.len_var, handoff.out_var]
+		TensorRawViewLetExpr(binding, _, _, _):
+			[binding.variable]
+		ConcurrentExpr(block, _, _):
+			block.bindings.map(pure func(binding: CoreConcurrentBinding): binding.variable)
+		PreClosureConcurrentExpr(block, _, _):
+			block.bindings.map(pure func(binding: CorePreClosureConcurrentBinding): binding.variable)
+		ConcurrentlyLoopExpr(loop, _, _):
+			[loop.variable]
+		PreClosureConcurrentlyLoopExpr(loop, _, _):
+			[loop.variable]
+		SelectExpr(arms, _, _):
+			var binders: List[CoreVar] = []
+
+			for arm in arms:
+				match arm.kind:
+					SelectRecvArm(recv):
+						binders = binders.append(recv.binder)
+					_:
+						void
+
+			binders
+		SemanticMatchExpr(_, tree, _, _):
+			var binders: List[CoreVar] = []
+
+			for binding in tree_bindings(tree):
+				if not contains_var(binders, binding.variable):
+					binders = binders.append(binding.variable)
+
+			binders
+		_:
+			[]
+
+
+---
+The children of `expr` to walk, each once: a decision tree reaches a shared
+subtree, and its leaf bodies, from more than one branch.
+---
+private pure func distinct_children(expr: CoreExpr) -> List[CoreExpr]:
+	var children: List[CoreExpr] = []
+
+	for child in immediate_core_expr_children(expr):
+		if not children.any(pure func(seen: CoreExpr): same_object(seen, child)):
+			children = children.append(child)
+
+	children
+
+
+---
+The function's local facts, by one walk with an explicit stack. Every table
+is a local of this walk, so it grows in place; threading the tables through a
+recursive walk would copy them at each binder.
+---
+pure func product_group_uses(params: List[CoreVar], body: CoreExpr) -> ProductGroupUses:
+	var used_whole: List[CoreVar] = []
+	var aliases: List[ProductAliases] = []
+	-- Binders seen so far, kept by id and compared by full identity
+	-- `(name, id)`. The binders with no minted id yet (id 0) share one bucket.
+	var binders_by_id: Dict[Int, List[CoreVar]] = {}
+	var rebound: List[CoreVar] = []
+	var stack: List[CoreExpr] = [body]
+	var depth: Int = 1
+	var introduced: List[CoreVar] = params
+
+	while depth > 0 or not introduced.is_empty():
+		for variable in introduced:
+			if contains_var(binders_by_id.get_or(variable.id, []), variable):
+				if not contains_var(rebound, variable):
+					rebound = rebound.append(variable)
+			else:
+				binders_by_id = binders_by_id.set(
+					variable.id,
+					binders_by_id.get_or(variable.id, []).append(variable),
+				)
+
+		introduced = []
+
+		if depth > 0:
+			depth -= 1
+
+			match stack.get(depth):
+				Some(expr):
+					introduced = introduced_binders(expr)
+					var children: List[CoreExpr] = []
+
+					match expr:
+						VarExpr(variable, typ, _):
+							if is_group_type(typ) and not contains_var(used_whole, variable):
+								used_whole = used_whole.append(variable)
+						ProductFieldExpr(VarExpr(_, _, _), _, _, _):
+							void
+						SemanticMatchExpr(VarExpr(subject, subject_type, _), tree, _, _):
+							if not is_tuple_type(subject_type):
+								if not contains_var(used_whole, subject):
+									used_whole = used_whole.append(subject)
+							-- A leaf binder that names the whole subject is the subject
+							-- again: its whole uses are the subject's, or a box would be
+							-- rebuilt in that leaf each time it runs. The scrutinee
+							-- comes first among the children; the rest are leaf bodies.
+							-- The subject is stored once: storing one match binding in
+							-- a loop over-releases it (a Perceus bug; see the
+							-- increment 1 results in benchmarks/results).
+							whole_binders: List[CoreVar] = tree_bindings(tree)
+								.filter(pure func(binding: CoreSemanticMatchBinding): is_root_accessor(binding.accessor))
+								.map(pure func(binding: CoreSemanticMatchBinding): binding.variable)
+							aliases = aliases.append({
+								aliases = whole_binders,
+								source = subject,
+							})
+
+							children = distinct_children(expr).drop(1)
+						LetExpr(variable, is_mutable, typ, rhs, body):
+							-- One payload column per pattern: the pinned bootstrap tests
+							-- only the first one (match lowering, fixed in 65341398d, not
+							-- yet pinned).
+							match rhs:
+								VarExpr(source, _, _):
+									if not is_mutable and is_group_type(typ):
+										aliases = aliases.append({
+											aliases = [variable],
+											source = source,
+										})
+										children = [body]
+									else:
+										children = distinct_children(expr)
+								_:
+									children = distinct_children(expr)
+						_:
+							children = distinct_children(expr)
+
+					for child in children:
+						stack = if depth < stack.length():
+							stack.set(depth, child)
+						else:
+							stack.append(child)
+						depth += 1
+				None:
+					depth = 0
+
+	-- A binder bound more than once keeps its box, which is a whole use: an
+	-- alias of a flattened local kept boxed this way needs its source boxed.
+	for variable in rebound:
+		if not contains_var(used_whole, variable):
+			used_whole = used_whole.append(variable)
+
+	var changed: Bool = True
+
+	while changed:
+		changed = False
+
+		for group in aliases:
+			if not contains_var(used_whole, group.source):
+				var alias_used_whole: Bool = False
+
+				for alias_variable in group.aliases:
+					if contains_var(used_whole, alias_variable):
+						alias_used_whole = True
+						break
+
+				if alias_used_whole:
+					used_whole = used_whole.append(group.source)
+					changed = True
+
+	{
+		used_whole = used_whole,
+		rebound = rebound
+	}
+
+
+pure func is_root_accessor(accessor: CoreSemanticMatchAccessor) -> Bool:
+	match accessor:
+		RootSemanticMatchAccessor:
+			True
+		_:
+			False
+
+
+pure func tree_bindings(tree: CoreSemanticMatchTree) -> List[CoreSemanticMatchBinding]:
+	match tree:
+		SemanticMatchLeaf(bindings, _):
+			bindings
+		SemanticMatchFail:
+			[]
+		SemanticConstructorMatch(_, cases, fallback):
+			var bindings: List[CoreSemanticMatchBinding] = []
+
+			for match_case in cases:
+				bindings = bindings.concat(tree_bindings(match_case.body))
+
+			match fallback:
+				Some(fallback_tree):
+					bindings.concat(tree_bindings(fallback_tree))
+				None:
+					bindings
+		SemanticLiteralMatch(_, cases, fallback):
+			var bindings: List[CoreSemanticMatchBinding] = []
+
+			for match_case in cases:
+				bindings = bindings.concat(tree_bindings(match_case.body))
+
+			bindings.concat(tree_bindings(fallback))
+		SemanticLengthMatch(_, cases, geq, fallback):
+			var bindings: List[CoreSemanticMatchBinding] = []
+
+			for match_case in cases:
+				bindings = bindings.concat(tree_bindings(match_case.body))
+
+			match geq:
+				Some(geq_case):
+					bindings = bindings.concat(tree_bindings(geq_case.body))
+				None:
+					void
+
+			match fallback:
+				Some(fallback_tree):
+					bindings.concat(tree_bindings(fallback_tree))
+				None:
+					bindings

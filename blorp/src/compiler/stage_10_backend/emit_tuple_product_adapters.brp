@@ -1,0 +1,544 @@
+-- Native tuple-facing interfaces construct the selected managed product row.
+-- Slot decoding, vector loads and ownership are supplied by the emitter's
+-- existing authorities. This renderer neither classifies erased storage nor
+-- invents source field or binder identities.
+import:
+	../stage_09_core/ir:
+		CoreType(NamedType, TupleType),
+		CoreTupleStorageCatalog,
+		core_field_ordinal_index,
+		core_type_equal,
+		core_generated_tuple_record_elements,
+		generated_tuple_record_for_type,
+	../stage_09_core/managed_record_layout:
+		CoreManagedRecordField,
+		CoreManagedRecordFieldStorage(TypedManagedRecordField, UnitManagedRecordField),
+		CoreManagedRecordLayout,
+		CoreManagedRecordLayoutFault,
+		generated_tuple_record_layout,
+		managed_record_layout_fields
+
+
+record CRuntimeProductAdapterOps {
+	resolve_product_type: pure (CoreType) -> Option[CoreType],
+	c_type: pure (CoreType) -> String,
+	product_symbols: pure (CoreType) -> Option[CNativeProductStorageSymbols],
+	decode_borrowed_slot: pure (CoreType, String) -> Option[String],
+	encode_owned_slot: pure (CoreType, String) -> Option[String],
+	read_vector_element: pure (CoreType, String, String) -> Option[String],
+	retain_typed: pure (CoreType, String) -> Option[String]
+}
+
+
+-- These facts are issued by the shared layout/member and type naming code.
+-- Units have no member. The list still preserves every logical ordinal.
+record CNativeProductStorageSymbols {
+	c_type: String,
+	make_name: String,
+	members: List[Option[String]]
+}
+
+
+fixed union CNativeProductFactoryKind:
+	DictionaryEntryProductFactory
+	EnumeratedProductFactory
+	VectorPairProductFactory
+	ProcessSuccessProductFactory
+	ProcessErrorProductFactory
+	ProcessOutputProductFactory
+
+
+record CNativeProductFactoryRequest {
+	kind: CNativeProductFactoryKind,
+	result_type: CoreType,
+	callback_name: String
+}
+
+
+union CNativeProductAdapterFault:
+	NativeProductRowUnavailable(CoreType)
+	NativeProductSymbolsUnavailable(CoreType)
+	NativeProductLayoutUnavailable(CoreManagedRecordLayoutFault)
+	NativeProductArityMismatch(Int, Int)
+	NativeProductMemberMismatch(Int)
+	NativeProductFieldTypeMismatch(Int, CoreType, CoreType)
+	NativeProductFieldCodecUnavailable(Int, CoreType)
+	NativeProductFieldOwnershipUnavailable(Int, CoreType)
+	NativeProcessOptionsShapeMismatch(CoreType)
+	NativeProcessSessionShapeMismatch(CoreType)
+
+
+record CNativeProductAdapterEmission {
+	declarations: String,
+	callback: String
+}
+
+
+private union CNativeProductFieldSource:
+	BorrowedErasedNativeField(String)
+	BorrowedVectorNativeField(String, String)
+	BorrowedTypedNativeField(CoreType, String)
+	OwnedTypedNativeField(CoreType, String)
+
+
+private record CNativeProductFactoryFields {
+	declarations: String,
+	arguments: List[String]
+}
+
+
+private pure func native_factory_parameters(kind: CNativeProductFactoryKind) -> String:
+	match kind:
+		DictionaryEntryProductFactory:
+			"void* first, void* second"
+		EnumeratedProductFactory:
+			"long index, void* value"
+		VectorPairProductFactory:
+			"const blorp_Vector* first, const blorp_Vector* second, long index"
+		ProcessSuccessProductFactory:
+			"long exit_kind, long exit_code, blorp_Bytes* stdout_bytes, blorp_Bytes* stderr_bytes"
+		ProcessErrorProductFactory:
+			"long kind, blorp_String* detail"
+		ProcessOutputProductFactory:
+			"blorp_String* stdout_string, blorp_String* stderr_string, long exit_code"
+
+
+private pure func native_factory_sources(kind: CNativeProductFactoryKind) -> List[CNativeProductFieldSource]:
+	match kind:
+		DictionaryEntryProductFactory:
+			[BorrowedErasedNativeField("first"), BorrowedErasedNativeField("second")]
+		EnumeratedProductFactory:
+			[BorrowedTypedNativeField(NamedType("Int", []), "index"), BorrowedErasedNativeField("value")]
+		VectorPairProductFactory:
+			[BorrowedVectorNativeField("first", "index"), BorrowedVectorNativeField("second", "index")]
+		ProcessSuccessProductFactory:
+			[
+				OwnedTypedNativeField(NamedType("Int", []), "exit_kind"),
+				OwnedTypedNativeField(NamedType("Int", []), "exit_code"),
+				OwnedTypedNativeField(NamedType("Bytes", []), "stdout_bytes"),
+				OwnedTypedNativeField(NamedType("Bytes", []), "stderr_bytes"),
+			]
+		ProcessErrorProductFactory:
+			[
+				OwnedTypedNativeField(NamedType("Int", []), "kind"),
+				OwnedTypedNativeField(NamedType("String", []), "detail"),
+			]
+		ProcessOutputProductFactory:
+			[
+				OwnedTypedNativeField(NamedType("String", []), "stdout_string"),
+				OwnedTypedNativeField(NamedType("String", []), "stderr_string"),
+				OwnedTypedNativeField(NamedType("Int", []), "exit_code"),
+			]
+
+
+private pure func adapter_layout(
+	catalog: CoreTupleStorageCatalog,
+	typ: CoreType,
+	storage: CNativeProductStorageSymbols,
+) -> Result[CoreManagedRecordLayout, CNativeProductAdapterFault]:
+	match generated_tuple_record_for_type(catalog, typ):
+		Some(row):
+			layout ?= generated_tuple_record_layout(catalog, row).map_err(func(fault): NativeProductLayoutUnavailable(fault))
+			fields = managed_record_layout_fields(layout)
+
+			if storage.members.length() != fields.length():
+				Err(NativeProductArityMismatch(fields.length(), storage.members.length()))
+			else:
+				match validate_adapter_members(fields, storage.members):
+					Ok(_):
+						Ok(layout)
+					Err(fault):
+						Err(fault)
+		None:
+			Err(NativeProductRowUnavailable(typ))
+
+
+private pure func validate_adapter_members(
+	fields: List[CoreManagedRecordField],
+	members: List[Option[String]],
+) -> Result[Void, CNativeProductAdapterFault]:
+	-- One constructor per match also keeps this check correct under the pinned
+	-- bootstrap, which skips tags of nested constructors in tuple patterns.
+	match fields:
+		[]:
+			if members.length() == 0:
+				Ok(void)
+			else:
+				Err(NativeProductArityMismatch(0, members.length()))
+		[field, ...rest_fields]:
+			match members:
+				[member, ...rest_members]:
+					match field.storage:
+						TypedManagedRecordField:
+							match member:
+								Some(_):
+									validate_adapter_members(rest_fields, rest_members)
+								None:
+									Err(NativeProductMemberMismatch(core_field_ordinal_index(field.ordinal)))
+						UnitManagedRecordField:
+							match member:
+								None:
+									validate_adapter_members(rest_fields, rest_members)
+								Some(_):
+									Err(NativeProductMemberMismatch(core_field_ordinal_index(field.ordinal)))
+				[]:
+					Err(NativeProductArityMismatch(fields.length(), 0))
+
+
+private pure func native_field_value(
+	field: CoreManagedRecordField,
+	source: CNativeProductFieldSource,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[String, CNativeProductAdapterFault]:
+	ordinal = core_field_ordinal_index(field.ordinal)
+	match source:
+		BorrowedErasedNativeField(raw):
+			match ops.decode_borrowed_slot(field.typ, raw):
+				Some(value):
+					Ok(value)
+				None:
+					Err(NativeProductFieldCodecUnavailable(ordinal, field.typ))
+		BorrowedVectorNativeField(vector, index):
+			match ops.read_vector_element(field.typ, vector, index):
+				Some(value):
+					Ok(value)
+				None:
+					Err(NativeProductFieldCodecUnavailable(ordinal, field.typ))
+		BorrowedTypedNativeField(native_type, value):
+			checked_native_typed_value(field, native_type, value)
+		OwnedTypedNativeField(native_type, value):
+			checked_native_typed_value(field, native_type, value)
+
+
+private pure func checked_native_typed_value(
+	field: CoreManagedRecordField,
+	native_type: CoreType,
+	value: String,
+) -> Result[String, CNativeProductAdapterFault]:
+	if core_type_equal(field.typ, native_type):
+		Ok(value)
+	else:
+		Err(NativeProductFieldTypeMismatch(core_field_ordinal_index(field.ordinal), native_type, field.typ))
+
+
+private pure func native_field_retain(
+	field: CoreManagedRecordField,
+	source: CNativeProductFieldSource,
+	name: String,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[String, CNativeProductAdapterFault]:
+	match source:
+		OwnedTypedNativeField(_, _):
+			Ok("")
+		_:
+			match ops.retain_typed(field.typ, name):
+				Some(statement):
+					Ok(statement)
+				None:
+					Err(NativeProductFieldOwnershipUnavailable(core_field_ordinal_index(field.ordinal), field.typ))
+
+
+private pure func render_factory_fields(
+	fields: List[CoreManagedRecordField],
+	sources: List[CNativeProductFieldSource],
+	ops: CRuntimeProductAdapterOps,
+) -> Result[CNativeProductFactoryFields, CNativeProductAdapterFault]:
+	match (fields, sources):
+		([], []):
+			Ok({ declarations = "", arguments = [] })
+		([field, ...rest_fields], [source, ...rest_sources]):
+			rest ?= render_factory_fields(rest_fields, rest_sources, ops)
+			match field.storage:
+				UnitManagedRecordField:
+					-- The source call already evaluated this logical argument.
+					-- Native erased/vector unit values carry no owned reference.
+					match source:
+						BorrowedErasedNativeField(name):
+							Ok({ rest | declarations = "  (void)" + name + ";\n" + rest.declarations })
+						BorrowedVectorNativeField(vector, index):
+							Ok({ rest | declarations = "  (void)" + vector + ";\n  (void)" + index + ";\n" + rest.declarations })
+						_:
+							Err(NativeProductFieldCodecUnavailable(core_field_ordinal_index(field.ordinal), field.typ))
+				TypedManagedRecordField:
+					name = "__product_field_" + core_field_ordinal_index(field.ordinal).to_string()
+					value ?= native_field_value(field, source, ops)
+					retain ?= native_field_retain(field, source, name, ops)
+					Ok({
+						declarations = "  " + ops.c_type(field.typ) + " " + name + " = " + value + ";\n" + retain + rest.declarations,
+						arguments = [name].concat(rest.arguments),
+					})
+		_:
+			Err(NativeProductArityMismatch(fields.length(), sources.length()))
+
+
+pure func emit_native_product_factory(
+	catalog: CoreTupleStorageCatalog,
+	request: CNativeProductFactoryRequest,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[CNativeProductAdapterEmission, CNativeProductAdapterFault]:
+	storage ?= native_product_symbols(request.result_type, ops)
+	layout ?= adapter_layout(catalog, request.result_type, storage)
+	fields ?= render_factory_fields(managed_record_layout_fields(layout), native_factory_sources(request.kind), ops)
+	Ok({
+		declarations = "static inline void* " + request.callback_name + "(" + native_factory_parameters(request.kind) + ") {\n" + fields.declarations + "  return (void*)" + storage.make_name + "(" + fields.arguments.join(", ") + ");\n}\n\n",
+		callback = request.callback_name,
+	})
+
+
+private pure func native_product_symbols(
+	typ: CoreType,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[CNativeProductStorageSymbols, CNativeProductAdapterFault]:
+	match ops.product_symbols(typ):
+		Some(symbols):
+			Ok(symbols)
+		None:
+			Err(NativeProductSymbolsUnavailable(typ))
+
+
+-- This representation comes from the prepared Option authority. A generated
+-- tuple row is always managed, so scalar stack Options are not legal here.
+fixed union CUnfoldProductResultRepresentation:
+	NullableUnfoldProductResult
+	BoxedUnfoldProductResult
+
+
+record CNativeUnfoldProductRequest {
+	pair_type: CoreType,
+	callback_name: String,
+	result_representation: CUnfoldProductResultRepresentation
+}
+
+
+private pure func unfold_result_prefix(
+	representation: CUnfoldProductResultRepresentation,
+	storage: CNativeProductStorageSymbols,
+) -> String:
+	match representation:
+		NullableUnfoldProductResult:
+			"  " + storage.c_type + " __pair = (" + storage.c_type + ")blorp_call1(func, state);\n  if (!__pair) return false;\n"
+		BoxedUnfoldProductResult:
+			"  blorp_Option* __step = (blorp_Option*)blorp_call1(func, state);\n  if (!__step || __step->tag != BLORP_TAG_SOME) { blorp_release(__step); return false; }\n  " + storage.c_type + " __pair = (" + storage.c_type + ")__step->data.Some.field0;\n"
+
+
+private pure func encode_unfold_output(
+	field: CoreManagedRecordField,
+	member: Option[String],
+	output: String,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[String, CNativeProductAdapterFault]:
+	ordinal = core_field_ordinal_index(field.ordinal)
+	match field.storage:
+		UnitManagedRecordField:
+			match member:
+				None:
+					Ok("  *" + output + " = (void*)0;\n")
+				Some(_):
+					Err(NativeProductMemberMismatch(ordinal))
+		TypedManagedRecordField:
+			match member:
+				Some(member_name):
+					name = "__product_field_" + ordinal.to_string()
+					match ops.retain_typed(field.typ, name):
+						Some(retain):
+							match ops.encode_owned_slot(field.typ, name):
+								Some(encoded):
+									Ok("  " + ops.c_type(field.typ) + " " + name + " = __pair->" + member_name + ";\n" + retain + "  *" + output + " = " + encoded + ";\n")
+								None:
+									Err(NativeProductFieldCodecUnavailable(ordinal, field.typ))
+						None:
+							Err(NativeProductFieldOwnershipUnavailable(ordinal, field.typ))
+				None:
+					Err(NativeProductMemberMismatch(ordinal))
+
+
+pure func emit_native_unfold_product_adapter(
+	catalog: CoreTupleStorageCatalog,
+	request: CNativeUnfoldProductRequest,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[CNativeProductAdapterEmission, CNativeProductAdapterFault]:
+	storage ?= native_product_symbols(request.pair_type, ops)
+	layout ?= adapter_layout(catalog, request.pair_type, storage)
+
+	match (managed_record_layout_fields(layout), storage.members):
+		([value_field, state_field], [value_member, state_member]):
+			value ?= encode_unfold_output(value_field, value_member, "value", ops)
+			state ?= encode_unfold_output(state_field, state_member, "next_state", ops)
+			cleanup: String = match request.result_representation:
+				NullableUnfoldProductResult:
+					"  blorp_release(__pair);\n"
+				BoxedUnfoldProductResult:
+					"  blorp_release(__step);\n"
+			Ok({
+				declarations = "static inline bool " + request.callback_name + "(blorp_Closure* func, void* state, void** value, void** next_state) {\n" + unfold_result_prefix(request.result_representation, storage) + value + state + cleanup + "  return true;\n}\n\n",
+				callback = request.callback_name,
+			})
+		_:
+			Err(NativeProductArityMismatch(2, managed_record_layout_fields(layout).length()))
+
+
+private record CTypedNativeProductValue {
+	typ: CoreType,
+	value: String
+}
+
+
+private pure func native_product_field_path(
+	catalog: CoreTupleStorageCatalog,
+	base: CTypedNativeProductValue,
+	path: List[Int],
+	ops: CRuntimeProductAdapterOps,
+) -> Result[CTypedNativeProductValue, CNativeProductAdapterFault]:
+	match path:
+		[]:
+			Ok(base)
+		[index, ...rest]:
+			storage ?= native_product_symbols(base.typ, ops)
+			layout ?= adapter_layout(catalog, base.typ, storage)
+			match managed_record_layout_fields(layout).get(index):
+				Some(field):
+					match storage.members.get(index):
+						Some(optional_member):
+							match optional_member:
+								Some(member):
+									native_product_field_path(catalog, {
+										typ = field.typ,
+										value = "(" + base.value + ")->" + member,
+									}, rest, ops)
+								None:
+									Err(NativeProductMemberMismatch(index))
+						None:
+							Err(NativeProductMemberMismatch(index))
+				None:
+					Err(NativeProductMemberMismatch(index))
+
+
+private pure func process_options_logical_type() -> CoreType:
+	int_type = NamedType("Int", [])
+	bool_type = NamedType("Bool", [])
+	string_type = NamedType("String", [])
+	bytes_type = NamedType("Bytes", [])
+	strings = NamedType("List", [string_type])
+	TupleType([
+		TupleType([string_type, bool_type]),
+		TupleType([strings, strings, strings]),
+		TupleType([int_type, TupleType([bytes_type, NamedType("List", [bytes_type])]), int_type, int_type]),
+		TupleType([bool_type, int_type, int_type, int_type]),
+	])
+
+
+-- The shape belongs to the process native ABI, not to generated-name spelling.
+-- The caller passes one already evaluated options value and keeps it alive
+-- across the native call. This snapshot only borrows its transitive fields.
+pure func emit_native_process_options_snapshot(
+	catalog: CoreTupleStorageCatalog,
+	options_type: CoreType,
+	options_value: String,
+	snapshot_name: String,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[String, CNativeProductAdapterFault]:
+	canonical ?= match ops.resolve_product_type(options_type):
+		Some(typ): Ok(typ)
+		None: Err(NativeProductRowUnavailable(options_type))
+	match generated_tuple_record_for_type(catalog, canonical):
+		Some(row):
+			if core_type_equal(TupleType(core_generated_tuple_record_elements(row)), process_options_logical_type()):
+				storage ?= native_product_symbols(canonical, ops)
+				canonical_value = if core_type_equal(canonical, options_type):
+					options_value
+				else:
+					"((" + storage.c_type + ")(" + options_value + "))"
+				render_process_options_snapshot(catalog, {
+					typ = canonical,
+					value = canonical_value,
+				}, snapshot_name, ops)
+			else:
+				Err(NativeProcessOptionsShapeMismatch(options_type))
+		None:
+			Err(NativeProductRowUnavailable(options_type))
+
+
+-- The opaque ProcessSessionCommand exposes one concrete product to the native
+-- bridge. Resolve its accepted alias through the caller's layout authority,
+-- validate that registered row, then borrow its typed arguments exactly once.
+record CNativeProcessSessionArgs {
+	statements: String,
+	command: String,
+	arguments: String,
+	options_address: String
+}
+
+
+pure func emit_native_process_session_snapshot(
+	catalog: CoreTupleStorageCatalog,
+	request_type: CoreType,
+	request_value: String,
+	snapshot_name: String,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[CNativeProcessSessionArgs, CNativeProductAdapterFault]:
+	canonical ?= match ops.resolve_product_type(request_type):
+		Some(typ): Ok(typ)
+		None: Err(NativeProductRowUnavailable(request_type))
+	row ?= match generated_tuple_record_for_type(catalog, canonical):
+		Some(found): Ok(found)
+		None: Err(NativeProductRowUnavailable(request_type))
+	match core_generated_tuple_record_elements(row):
+		[command_type, arguments_type, options_type]:
+			if (
+				core_type_equal(command_type, NamedType("String", []))
+				and core_type_equal(arguments_type, NamedType("List", [NamedType("String", [])]))
+				and core_type_equal(options_type, process_options_logical_type())
+			):
+				storage ?= native_product_symbols(canonical, ops)
+				request: CTypedNativeProductValue = {
+					typ = canonical,
+					value = "((" + storage.c_type + ")(" + request_value + "))"
+				}
+				command ?= native_product_field_path(catalog, request, [0], ops)
+				arguments ?= native_product_field_path(catalog, request, [1], ops)
+				options ?= native_product_field_path(catalog, request, [2], ops)
+				statements ?= emit_native_process_options_snapshot(catalog, options.typ, options.value, snapshot_name, ops)
+				Ok({ statements = statements, command = command.value, arguments = arguments.value, options_address = "&" + snapshot_name })
+			else:
+				Err(NativeProcessSessionShapeMismatch(request_type))
+		_:
+			Err(NativeProcessSessionShapeMismatch(request_type))
+
+
+private pure func render_process_options_snapshot(
+	catalog: CoreTupleStorageCatalog,
+	options: CTypedNativeProductValue,
+	snapshot_name: String,
+	ops: CRuntimeProductAdapterOps,
+) -> Result[String, CNativeProductAdapterFault]:
+	-- The paths follow the typed private process builtin signature in process.brp.
+	-- Native field names match blorp_ProcessCommandOptions in runtime_decl.c.
+	cwd ?= native_product_field_path(catalog, options, [0, 0], ops)
+	has_cwd ?= native_product_field_path(catalog, options, [0, 1], ops)
+	set_names ?= native_product_field_path(catalog, options, [1, 0], ops)
+	set_values ?= native_product_field_path(catalog, options, [1, 1], ops)
+	unset_names ?= native_product_field_path(catalog, options, [1, 2], ops)
+	stdin_mode ?= native_product_field_path(catalog, options, [2, 0], ops)
+	stdin_bytes ?= native_product_field_path(catalog, options, [2, 1, 0], ops)
+	stdin_parts ?= native_product_field_path(catalog, options, [2, 1, 1], ops)
+	stdout_mode ?= native_product_field_path(catalog, options, [2, 2], ops)
+	stderr_mode ?= native_product_field_path(catalog, options, [2, 3], ops)
+	has_timeout ?= native_product_field_path(catalog, options, [3, 0], ops)
+	timeout ?= native_product_field_path(catalog, options, [3, 1], ops)
+	group ?= native_product_field_path(catalog, options, [3, 2], ops)
+	limit ?= native_product_field_path(catalog, options, [3, 3], ops)
+	Ok("  blorp_ProcessCommandOptions " + snapshot_name + " = {\n" +
+		"    .cwd = " + cwd.value + ",\n" +
+		"    .has_cwd = " + has_cwd.value + ",\n" +
+		"    .environment_set_names = " + set_names.value + ",\n" +
+		"    .environment_set_values = " + set_values.value + ",\n" +
+		"    .environment_unset_names = " + unset_names.value + ",\n" +
+		"    .stdin_mode = " + stdin_mode.value + ",\n" +
+		"    .stdin_bytes = " + stdin_bytes.value + ",\n" +
+		"    .stdin_bytes_parts = " + stdin_parts.value + ",\n" +
+		"    .stdout_mode = " + stdout_mode.value + ",\n" +
+		"    .stderr_mode = " + stderr_mode.value + ",\n" +
+		"    .has_timeout = " + has_timeout.value + ",\n" +
+		"    .timeout_ms = " + timeout.value + ",\n" +
+		"    .group_mode = " + group.value + ",\n" +
+		"    .capture_limit = " + limit.value + "\n  };\n")

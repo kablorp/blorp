@@ -28,25 +28,21 @@ import:
 			ConcurrentlyLoopExpr, CooperativeCheckpointExpr, DetachExpr, ForChannelExpr,
 			ForStreamExpr, PreClosureConcurrentExpr, PreClosureConcurrentlyLoopExpr,
 			PreClosureDetachExpr, SelectExpr, TailrecListSpreadRecurExpr, TailrecRecurExpr,
-			TupleConstructExpr, ListConstructExpr, TensorBoxedLiteralExpr, DictConstructExpr,
+			ListConstructExpr, TensorBoxedLiteralExpr, DictConstructExpr,
 		),
 		CoreFunction,
 		CoreGlobal,
 		CoreParam,
 		CoreProgram,
 		CoreRecordCowField,
-		CoreRecordFieldValue,
 		CoreReleasePolicy(
 			ArcReleaseOnlyPolicy, ArcReleasePolicy, NoReleasePolicy, StackResultReleasePolicy,
-		),
-		CoreTupleElement(
-			TupleFloat16Element, TupleFloat32Element, TupleFloatElement, TuplePointerElement,
-			TuplePrimElement, TupleStackResultElement, TupleStructElement, TupleVoidElement,
 		),
 		CoreType(NamedType),
 		CoreVar,
 		core_expr_type,
 		core_var_equal,
+		product_build_values,
 	ownership: OwnershipCallContract, arg_consumes_caller, builtin_contract, intrinsic_contract
 	release_mask: release_mask_word_has_bit
 	traverse as CoreTraverse
@@ -124,6 +120,7 @@ union BackendCleanupTemporaryRole:
 	CallResultTemporary
 	MatchScrutineeTemporary
 	IterableTemporary
+	DictionaryEntryTemporary
 	ChannelValueTemporary
 	SelectValueTemporary(Int)
 	ConcurrentCaptureTemporary(Int)
@@ -551,12 +548,10 @@ pure func cancellation_construct_transferred_operands(expr: CoreExpr) -> List[Co
 			boxed_storage_operands(construct.args)
 		UnionReuseConstructExpr(construct, _, _):
 			[construct.source].concat(boxed_storage_operands(construct.args))
-		RecordConstructExpr(_, fields, _, _):
-			record_field_operands(fields)
-		RecordExpr(fields, _, _):
-			record_field_operands(fields)
-		RecordReuseExpr(source, fields, _, _):
-			[source].concat(record_field_operands(fields))
+		ProductExpr(build, _, _):
+			product_build_values(build)
+		RecordReuseExpr(source, build, _, _):
+			[source].concat(product_build_values(build))
 		RecordCowUpdateExpr(source, fields, _, _):
 			var operands: List[CoreExpr] = [source]
 
@@ -568,12 +563,6 @@ pure func cancellation_construct_transferred_operands(expr: CoreExpr) -> List[Co
 						void
 
 			operands
-		TupleConstructExpr(construct, _, _):
-			tuple_transferred_operands(
-				construct.elements,
-				construct.release_mask,
-				construct.retain_mask,
-			)
 		ListConstructExpr(construct, _, _):
 			owned_boxed_storage_operands(construct.elements)
 		TensorBoxedLiteralExpr(literal, _, _):
@@ -590,55 +579,6 @@ pure func cancellation_construct_transferred_operands(expr: CoreExpr) -> List[Co
 
 
 ---
-A prepared tuple owns the slots in its release mask and retains those in its
-retain mask (a value read out of another owner). A slot it owns without
-retaining took the operand's own reference.
----
-private pure func tuple_transferred_operands(
-	elements: List[CoreTupleElement],
-	release_mask: Int,
-	retain_mask: Int,
-) -> List[CoreExpr]:
-	var operands: List[CoreExpr] = []
-	var index: Int = 0
-
-	for element in elements:
-		if (
-			release_mask_word_has_bit(release_mask, index)
-			and not release_mask_word_has_bit(retain_mask, index)
-		):
-			match tuple_element_value(element):
-				Some(value):
-					operands = operands.append(value)
-				None:
-					void
-
-		index += 1
-
-	operands
-
-
-private pure func tuple_element_value(element: CoreTupleElement) -> Option[CoreExpr]:
-	match element:
-		TuplePrimElement(value):
-			Some(value)
-		TuplePointerElement(value):
-			Some(value)
-		TupleStructElement(value, _):
-			Some(value)
-		TupleStackResultElement(value):
-			Some(value)
-		TupleFloatElement(value):
-			Some(value)
-		TupleFloat32Element(value):
-			Some(value)
-		TupleFloat16Element(value):
-			Some(value)
-		TupleVoidElement:
-			None
-
-
----
 The values a list, tensor or dictionary literal takes over: it retains a
 value stored without `transfers_ownership`, and that operand keeps its own
 reference.
@@ -651,15 +591,6 @@ private pure func owned_boxed_storage_operands(
 	for value in values:
 		if value.transfers_ownership:
 			operands = operands.append(value.value)
-
-	operands
-
-
-private pure func record_field_operands(fields: List[CoreRecordFieldValue]) -> List[CoreExpr]:
-	var operands: List[CoreExpr] = []
-
-	for field in fields:
-		operands = operands.append(field.value)
 
 	operands
 
@@ -869,7 +800,7 @@ private pure func analyzed_consumed_vars(
 			collection_equality_vars(op, left, right)
 		TupleExpr(_, _, _) | VectorExpr(_, _, _) | DictExpr(_, _, _):
 			merge_child_vars(children, func(child): child.consumed)
-		UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | RecordConstructExpr(_, _, _, _) | RecordExpr(_, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | TupleConstructExpr(_, _, _) | ListConstructExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | DictConstructExpr(_, _, _):
+		UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | ProductExpr(_, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | ListConstructExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | DictConstructExpr(_, _, _):
 			merge_vars(
 				merge_child_vars(children, func(child): child.consumed),
 				construct_transferred_vars(expr),
@@ -899,7 +830,7 @@ private pure func analyzed_consumed_before_suspension_vars(
 			-- leave the variable untracked while it still owns a reference
 			-- across a later suspension.
 			remove_var(child_facts(children, 0).consumed_before_suspension, variable)
-		UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | RecordConstructExpr(_, _, _, _) | RecordExpr(_, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | TupleConstructExpr(_, _, _) | ListConstructExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | DictConstructExpr(_, _, _):
+		UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | ProductExpr(_, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | ListConstructExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | DictConstructExpr(_, _, _):
 			-- Operands are evaluated first and the construction or update takes
 			-- them over last, so a variable operand moves before any suspension
 			-- only when no operand can suspend.

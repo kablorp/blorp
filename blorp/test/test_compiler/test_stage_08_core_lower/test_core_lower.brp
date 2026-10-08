@@ -223,7 +223,7 @@ import:
 		semantic_function_type,
 		type_list,
 	../../../src/compiler/stage_06_typecheck/type_system/type_widening:
-		TypeWideningReason(MutableBindingWidening),
+		TypeWideningReason(MutableBindingWidening, TupleLiteral),
 		ValueSlot(KeptValueSlot, WidenedValueSlot),
 	../../../src/compiler/stage_07_ctfe/context: ctfe_context_empty
 	../../../src/compiler/stage_07_ctfe/env: CTFE_ENV_EMPTY
@@ -301,6 +301,7 @@ import:
 		),
 		CoreExpr(
 			AssignExpr,
+			CastExpr,
 			BinaryExpr,
 			BreakExpr,
 			CallExpr,
@@ -328,7 +329,7 @@ import:
 			PreClosureConcurrentlyLoopExpr,
 			ProductFieldExpr,
 			RawMatchExpr,
-			RecordExpr,
+			ProductExpr,
 			RecordUpdateExpr,
 			ResourceScopeExpr,
 			SeqExpr,
@@ -392,6 +393,7 @@ import:
 		core_release_policy_to_string,
 		core_type_to_json,
 		core_var_equal,
+		product_build_fields,
 	../../../src/lib/source:
 		Cursor,
 		SourceFile,
@@ -2211,6 +2213,159 @@ func test_lowers_tuple_expression() -> Bool:
 					TupleType([NamedType("Int", []), NamedType("Int", [])]),
 				).to_string()
 			)
+		_:
+			False
+
+
+private pure func refined_tuple_fixture_type() -> SemanticType:
+	SemanticRangeType(SemanticConstIntType(3))
+
+
+private pure func tuple_with_refined_values(items: List[TypedExpr]) -> TypedExpr:
+	semantic_type = SemanticTupleType([refined_tuple_fixture_type(), refined_tuple_fixture_type()])
+	value_type = SemanticTupleType([TYPE_INT, TYPE_INT])
+	info = { expr_info(semantic_type) |
+		value_slot = WidenedValueSlot(semantic_type, value_type, TupleLiteral),
+	}
+	TypedTupleExpr(items, fixture_source_span(), info)
+
+
+private func refined_tuple_child_is_cast_without_retagging(child: TypedExpr) -> Bool:
+	expr = tuple_with_refined_values([child, child])
+	match lower_typed_expr(fixture_source_table(), child):
+		Ok(original):
+			match lower_typed_expr(fixture_source_table(), expr):
+				Ok(TupleExpr(items, typ, _)):
+					match items.get(0):
+						Some(CastExpr(value, target, _)):
+							(
+								core_exprs_equal(value, original)
+								and core_types_equal(target, core_int_type())
+								and core_types_equal(typ, TupleType([core_int_type(), core_int_type()]))
+								and items.length() == 2
+							)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_tuple_value_type_erases_only_immediate_scalar_refinements() -> Bool:
+	range_type = refined_tuple_fixture_type()
+	match core_lower_type(range_type):
+		Ok(RangeType):
+			match core_lower_type(SemanticTupleType([range_type, SemanticTupleType([range_type, TYPE_BOOL])])):
+				Ok(typ):
+					core_types_equal(typ, TupleType([core_int_type(), TupleType([core_int_type(), core_bool_type()])]))
+				Err(_):
+					False
+		_:
+			False
+
+
+func test_tuple_value_slot_casts_refined_variable() -> Bool:
+	refined_tuple_child_is_cast_without_retagging(
+		TypedNameExpr(ident("index"), expr_info(refined_tuple_fixture_type())),
+	)
+
+
+func test_tuple_value_slot_casts_refined_if_without_retagging_branches() -> Bool:
+	range_type = refined_tuple_fixture_type()
+	child = TypedIfExpr(
+		bool_expr(True),
+		TypedNameExpr(ident("index"), expr_info(range_type)),
+		Some(TypedIntLiteralExpr("0", fixture_source_span(), expr_info(range_type))),
+		fixture_source_span(),
+		expr_info(range_type),
+	)
+	refined_tuple_child_is_cast_without_retagging(child)
+
+
+func test_tuple_value_slot_casts_refined_call_without_retagging_callee() -> Bool:
+	range_type = refined_tuple_fixture_type()
+	callee = TypedNameExpr(ident("refined"), expr_info(SemanticFunctionType(True, [], range_type)))
+	child = TypedCallExpr(
+		callee,
+		[],
+		fixture_source_span(),
+		expr_info_with_resolved(range_type, resolved_call_info("<closure>", ResolvedClosureCall)),
+	)
+	refined_tuple_child_is_cast_without_retagging(child)
+
+
+func test_tuple_value_slot_casts_refined_block_without_retagging_tail() -> Bool:
+	range_type = refined_tuple_fixture_type()
+	child = TypedBlockExpr(
+		[TypedIntLiteralExpr("0", fixture_source_span(), expr_info(range_type)),
+			TypedNameExpr(ident("index"), expr_info(range_type))],
+		fixture_source_span(),
+		expr_info(range_type),
+	)
+	refined_tuple_child_is_cast_without_retagging(child)
+
+
+func test_tuple_projection_reads_canonical_field_before_refined_result() -> Bool:
+	range_type = refined_tuple_fixture_type()
+	receiver = TypedNameExpr(ident("pair"), expr_info(SemanticTupleType([range_type, range_type])))
+	expr = TypedFieldAccessExpr(
+		receiver,
+		ident("0"),
+		MISSING_RESOLVED_FIELD_IDENTITY,
+		fixture_source_span(),
+		expr_info(range_type),
+	)
+	match lower_typed_expr(fixture_source_table(), expr):
+		Ok(CastExpr(value, target, _)):
+			match value:
+				ProductFieldExpr(_, ordinal, field_type, _):
+					(
+						core_field_ordinal_index(ordinal) == 0
+						and core_types_equal(field_type, core_int_type())
+						and core_types_equal(target, RangeType)
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_opaque_tuple_field_keeps_operand_type_before_conversion() -> Bool:
+	opaque_type = SemanticNamedType("Position", [])
+	receiver = TypedNameExpr(ident("pair"), expr_info(SemanticTupleType([TYPE_STRING, opaque_type])))
+	field = TypedFieldAccessExpr(
+		receiver,
+		ident("1"),
+		MISSING_RESOLVED_FIELD_IDENTITY,
+		fixture_source_span(),
+		expr_info(opaque_type),
+	)
+	expr = TypedOpaqueFromExpr(opaque_type, field, fixture_source_span(), expr_info(TYPE_INT))
+	match lower_typed_expr(fixture_source_table(), expr):
+		Ok(CastExpr(ProductFieldExpr(_, ordinal, field_type, _), target, _)):
+			(
+				core_field_ordinal_index(ordinal) == 1
+				and core_types_equal(field_type, NamedType("Position", []))
+				and core_types_equal(target, core_int_type())
+			)
+		_:
+			False
+
+
+func test_opaque_call_keeps_result_type_before_conversion() -> Bool:
+	opaque_type = SemanticNamedType("Position", [])
+	callee = TypedNameExpr(ident("position"), expr_info(SemanticFunctionType(True, [], opaque_type)))
+	call = TypedCallExpr(
+		callee,
+		[],
+		fixture_source_span(),
+		expr_info_with_resolved(opaque_type, resolved_call_info("<closure>", ResolvedClosureCall)),
+	)
+	expr = TypedOpaqueFromExpr(opaque_type, call, fixture_source_span(), expr_info(TYPE_INT))
+	match lower_typed_expr(fixture_source_table(), expr):
+		Ok(CastExpr(CallExpr(_, _, _, result_type, _), target, _)):
+			core_types_equal(result_type, NamedType("Position", [])) and core_types_equal(target, core_int_type())
 		_:
 			False
 
@@ -4938,13 +5093,17 @@ func test_lowers_opaque_wrappers_to_representation_types() -> Bool:
 						),
 					) and core_exprs_equal(
 						from_lowered,
-						VarExpr(
-							{
-								name = "opaque",
-								id = 0,
-								def_id = None,
-								origin = AuthoredBinder
-							},
+						CastExpr(
+							VarExpr(
+								{
+									name = "opaque",
+									id = 0,
+									def_id = None,
+									origin = AuthoredBinder
+								},
+								NamedType("OpaqueInt", []),
+								core_source_loc(0, fixture_source_table(), fixture_source_span()),
+							),
 							core_int_type(),
 							core_source_loc(0, fixture_source_table(), fixture_source_span()),
 						),
@@ -5137,12 +5296,14 @@ func test_lowers_tuple_field_access_expression() -> Bool:
 
 
 func test_lowers_range_expression() -> Bool:
-	match range_record_test_fields():
-		Some(fields): lowers_range_expression(fields)
-		None: False
+	match (range_record_test_table(), range_record_test_fields()):
+		(Ok(records), Some(fields)):
+			lowers_range_expression(records, fields)
+		_:
+			False
 
 
-private func lowers_range_expression(fields: ResolvedRangeFields) -> Bool:
+private func lowers_range_expression(records: AcceptedRecordTable, fields: ResolvedRangeFields) -> Bool:
 	range_type = SemanticNamedType(STANDARD_RANGE_RECORD_TYPE_NAME, [])
 	expr = TypedRangeExpr(
 		int_expr("1"),
@@ -5152,28 +5313,127 @@ private func lowers_range_expression(fields: ResolvedRangeFields) -> Bool:
 		expr_info(range_type),
 	)
 
-	match lower_typed_expr(fixture_source_table(), expr):
-		Ok(RecordExpr([start, end_value], typ, _)):
-			core_exprs_equal(
-				start.value,
-				LiteralExpr(
-					IntLiteral(1),
-					core_int_type(),
-					core_source_loc(0, fixture_source_table(), fixture_source_span()),
-				),
-			) and core_exprs_equal(
-				end_value.value,
-				LiteralExpr(
-					IntLiteral(5),
-					core_int_type(),
-					core_source_loc(0, fixture_source_table(), fixture_source_span()),
-				),
-			) and core_type_to_json(typ).to_string() == core_type_to_json(NamedType(flatten_canonical_core_type_name(STANDARD_RANGE_RECORD_TYPE_NAME), [])).to_string()
+	match lower_core_test_expr_with_context(record_lowering_context(records), expr):
+		Ok(ProductExpr(build, typ, _)):
+			match product_build_fields(build):
+				[start, end_value]:
+					(
+						core_field_ordinal_index(start.ordinal) == 0
+						and core_field_ordinal_index(end_value.ordinal) == 1
+						and match (start.value, end_value.value):
+							(LiteralExpr(IntLiteral(1), _, _), LiteralExpr(IntLiteral(5), _, _)):
+								True
+							_:
+								False
+						and core_type_to_json(typ).to_string() == core_type_to_json(
+							NamedType(flatten_canonical_core_type_name(STANDARD_RANGE_RECORD_TYPE_NAME), []),
+						).to_string()
+					)
+				_:
+					False
 		_:
 			False
 
 
-func test_lowers_record_expression() -> Bool:
+---
+A record literal over `POINT_RECORD_SOURCE` with the given field names and
+values, written in `fields` order.
+---
+private pure func point_literal(records: AcceptedRecordTable, fields: List[(String, String)]) -> Option[TypedExpr]:
+	var typed_fields: List[TypedRecordField] = []
+	var resolved: Bool = True
+
+	for (name, value) in fields:
+		match accepted_record_find_field_id(
+			accepted_record_table_canonical_authority(records),
+			canonical_module_type_name("point", "Point"),
+			name,
+		):
+			Some(field_id):
+				typed_fields = typed_fields.append({
+					name = ident(name),
+					value = int_expr(value),
+					span = fixture_source_span(),
+					field_id = resolved_field_identity(field_id)
+				})
+			None:
+				resolved = False
+
+	if resolved:
+		Some(TypedRecordExpr(typed_fields, fixture_source_span(), expr_info(SemanticNamedType("Point", []))))
+	else:
+		None
+
+
+-- A literal keeps its written order, and each value names the ordinal of its
+-- field in the accepted row, so emission can evaluate in written order and
+-- store by declared position.
+func test_lowers_record_literal_in_written_order_with_row_ordinals() -> Bool:
+	match record_test_table("point", POINT_RECORD_SOURCE):
+		Ok(records):
+			match point_literal(records, [("y", "2"), ("x", "1")]):
+				Some(expr):
+					match lower_core_test_expr_with_context(record_lowering_context(records), expr):
+						Ok(ProductExpr(build, typ, _)):
+							match product_build_fields(build):
+								[first, second]:
+									(
+										core_field_ordinal_index(first.ordinal) == 1
+										and core_field_ordinal_index(second.ordinal) == 0
+										and match (first.value, second.value):
+											(LiteralExpr(IntLiteral(2), _, _), LiteralExpr(IntLiteral(1), _, _)):
+												True
+											_:
+												False
+										and core_type_to_json(typ).to_string() == core_type_to_json(
+											NamedType("Point", []),
+										).to_string()
+									)
+								_:
+									False
+						_:
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
+-- Typecheck rejects a literal that repeats a field, so lowering one is an
+-- internal error rather than a build that stores two values in one member.
+func test_rejects_record_literal_that_repeats_a_field() -> Bool:
+	match record_test_table("point", POINT_RECORD_SOURCE):
+		Ok(records):
+			match point_literal(records, [("x", "1"), ("x", "2")]):
+				Some(expr):
+					match lower_core_test_expr_with_context(record_lowering_context(records), expr):
+						Err(CoreLowerInvalidType(message)):
+							message == "record literal does not give each field one value: ordinal 0 is given twice"
+						_:
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
+func test_rejects_record_literal_that_misses_a_field() -> Bool:
+	match record_test_table("point", POINT_RECORD_SOURCE):
+		Ok(records):
+			match point_literal(records, [("y", "2")]):
+				Some(expr):
+					match lower_core_test_expr_with_context(record_lowering_context(records), expr):
+						Err(CoreLowerInvalidType(message)):
+							message == "record literal does not give each field one value: ordinal 0 has no value"
+						_:
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
+func test_rejects_record_literal_field_without_identity() -> Bool:
 	record_type = SemanticNamedType("Point", [])
 	fields: List[TypedRecordField] = [
 		{
@@ -5182,29 +5442,12 @@ func test_lowers_record_expression() -> Bool:
 			span = fixture_source_span(),
 			field_id = MISSING_RESOLVED_FIELD_IDENTITY
 		},
-		{
-			name = ident("y"),
-			value = int_expr("2"),
-			span = fixture_source_span(),
-			field_id = MISSING_RESOLVED_FIELD_IDENTITY
-		},
 	]
 	expr = TypedRecordExpr(fields, fixture_source_span(), expr_info(record_type))
 
 	match lower_typed_expr(fixture_source_table(), expr):
-		Ok(RecordExpr(core_fields, typ, _)):
-			match (core_fields.get(0), core_fields.get(1)):
-				(Some(first), Some(second)):
-					(
-						core_fields.length() == 2
-						and first.name == "x"
-						and second.name == "y"
-						and core_type_to_json(
-							typ,
-						).to_string() == core_type_to_json(NamedType("Point", [])).to_string()
-					)
-				_:
-					False
+		Err(CoreLowerInvalidType(message)):
+			message == "record field has no typecheck field identity"
 		_:
 			False
 
@@ -7647,6 +7890,14 @@ tests: TestSuite = {
 			test_lowers_resolved_constructor_value_with_constructor_id,
 		),
 		("lowers tuple expression", test_lowers_tuple_expression),
+		("tuple value type erases scalar refinements", test_tuple_value_type_erases_only_immediate_scalar_refinements),
+		("tuple value slot casts refined variable", test_tuple_value_slot_casts_refined_variable),
+		("tuple value slot casts refined if", test_tuple_value_slot_casts_refined_if_without_retagging_branches),
+		("tuple value slot casts refined call", test_tuple_value_slot_casts_refined_call_without_retagging_callee),
+		("tuple value slot casts refined block", test_tuple_value_slot_casts_refined_block_without_retagging_tail),
+		("tuple projection reads canonical refined field", test_tuple_projection_reads_canonical_field_before_refined_result),
+		("opaque tuple field keeps operand type", test_opaque_tuple_field_keeps_operand_type_before_conversion),
+		("opaque call keeps result type", test_opaque_call_keeps_result_type_before_conversion),
 		("lowers list expression", test_lowers_list_expression),
 		("lowers vector expression", test_lowers_vector_expression),
 		("lowers dict expression", test_lowers_dict_expression),
@@ -7769,7 +8020,13 @@ tests: TestSuite = {
 		),
 		("lowers tuple field access expression", test_lowers_tuple_field_access_expression),
 		("lowers range expression", test_lowers_range_expression),
-		("lowers record expression", test_lowers_record_expression),
+		(
+			"lowers record literal in written order with row ordinals",
+			test_lowers_record_literal_in_written_order_with_row_ordinals,
+		),
+		("rejects record literal that repeats a field", test_rejects_record_literal_that_repeats_a_field),
+		("rejects record literal that misses a field", test_rejects_record_literal_that_misses_a_field),
+		("rejects record literal field without identity", test_rejects_record_literal_field_without_identity),
 		(
 			"lowers record update with explicit Core intent",
 			test_lowers_record_update_with_explicit_core_intent,

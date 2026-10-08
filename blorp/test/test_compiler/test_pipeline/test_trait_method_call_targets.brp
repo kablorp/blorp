@@ -11,8 +11,12 @@ import:
 		CoreExpr(BinaryExpr, CallExpr),
 		CoreFunction,
 		CoreProgram,
-		CoreType(HeapRecordType, NamedType, TupleType),
+		CoreTupleStorageCatalog,
+		CoreType(HeapRecordType, NamedType),
 		core_function_declared_origin,
+		core_tuple_storage_fault_message,
+		generated_tuple_record_for_type,
+		tuple_storage_catalog,
 	../../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
 	../../../src/lib/cli_plan: CliRunPlan(CliRunCompile)
 	../../../src/main: run_cli
@@ -105,17 +109,25 @@ private pure func contains_binary_operator(expr: CoreExpr) -> Bool:
 
 
 ---
-Describes a call target by its trait method identity and receiver kind, so the
-expected targets read as one list. A target whose method the impl does not
-write is the trait default instantiated for the impl.
+Describes a call target by its trait method identity and logical receiver kind.
+Projected impl receivers now carry physical storage types; only an exact row
+in the checked tuple catalog establishes tuple origin. A target whose method
+the impl does not write is the trait default instantiated for the impl.
 ---
-private pure func describe_target(names: NameTable, target: CoreFunction) -> String:
+private pure func describe_target(
+	catalog: CoreTupleStorageCatalog,
+	names: NameTable,
+	target: CoreFunction,
+) -> String:
 	match core_function_declared_origin(target.origin):
 		ProjectedImplMethod(trait_id, method_id, for_type, _):
 			receiver: String = match for_type:
-				TupleType(_):
-					"tuple"
-				HeapRecordType(_) | NamedType(_, _):
+				HeapRecordType(_):
+					if generated_tuple_record_for_type(catalog, for_type).is_some():
+						"tuple"
+					else:
+						"record"
+				NamedType(_, _):
 					"record"
 				_:
 					"other"
@@ -135,7 +147,8 @@ Whether the body of `function_name` calls exactly `expected`, described by
 `describe_target`, and holds no native binary operator: every comparison in
 these sources must reach a trait method rather than a C comparison.
 ---
-private func calls_exactly(
+private func calls_exactly_with_catalog(
+	catalog: CoreTupleStorageCatalog,
 	program: CoreProgram,
 	names: NameTable,
 	function_name: String,
@@ -150,7 +163,7 @@ private func calls_exactly(
 					targets: List[String] = user_call_targets(body).map(func(def_id):
 						match all_functions.find(func(candidate): candidate.def_id == def_id):
 							Some(target):
-								describe_target(names, target)
+								describe_target(catalog, names, target)
 							None:
 								"missing function " + def_id.to_string()
 					)
@@ -168,6 +181,20 @@ private func calls_exactly(
 					False
 		None:
 			print_error("lowered Core has no " + function_name + " function")
+			False
+
+
+private func calls_exactly(
+	program: CoreProgram,
+	names: NameTable,
+	function_name: String,
+	expected: List[String],
+) -> Bool:
+	match tuple_storage_catalog(program):
+		Ok(catalog):
+			calls_exactly_with_catalog(catalog, program, names, function_name, expected)
+		Err(fault):
+			print_error("trait target program has invalid tuple storage: " + core_tuple_storage_fault_message(fault))
 			False
 
 

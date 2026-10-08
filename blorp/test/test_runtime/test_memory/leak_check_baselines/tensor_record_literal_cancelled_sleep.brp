@@ -1,0 +1,65 @@
+-- All element owners exist before tensor allocation. Cancelling the later
+-- element must release the earlier record and its managed field.
+import:
+	memory:
+		MemoryCounter(LiveManagedObjects, ManagedAllocations, MemoryStatsActive),
+		read_memory_counter, refcount,
+	test: cancel_after_parked_for_test
+
+
+record PendingElement {
+	rows: List[Int],
+	tag: Int
+}
+
+
+pure func make_rows(seed: Int) -> List[Int]:
+	[seed, seed + 1]
+
+
+func parked_tag() -> Int:
+	sleep(10000)
+	7
+
+
+func build_tensor_between_elements(seed: Int) -> Int:
+	rows: PendingElement[#2] = {
+		{rows = make_rows(seed), tag = 3},
+		{rows = make_rows(seed + 1), tag = parked_tag()},
+	}
+
+	rows[0].rows.length() + rows[1].tag
+
+
+func main(args: List[String]) -> Int:
+	kept: PendingElement = { rows = make_rows(9), tag = 5 }
+	kept_refs_before = refcount(kept)
+	active_before = read_memory_counter(MemoryStatsActive)
+	allocations_before = read_memory_counter(ManagedAllocations)
+	live_before = read_memory_counter(LiveManagedObjects)
+	cancelled = cancel_after_parked_for_test(func(): build_tensor_between_elements(3))
+	kept_cancelled = cancel_after_parked_for_test(func():
+		rows: PendingElement[#2] = {
+			kept,
+			{rows = make_rows(11), tag = parked_tag()},
+		}
+
+		rows[0].rows.length() + rows[1].tag + kept.rows.length()
+	)
+	active_after = read_memory_counter(MemoryStatsActive)
+	allocations_after = read_memory_counter(ManagedAllocations)
+	live_after = read_memory_counter(LiveManagedObjects)
+
+	if (
+		cancelled
+		and kept_cancelled
+		and kept_refs_before == 1
+		and refcount(kept) == kept_refs_before
+		and active_before == 1
+		and active_after == 1
+		and allocations_after > allocations_before
+		and live_after == live_before
+	):
+		0
+	else:
+		1

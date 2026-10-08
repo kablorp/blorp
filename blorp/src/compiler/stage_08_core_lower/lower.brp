@@ -19,7 +19,7 @@ import:
 	../stage_06_typecheck/type_system/union_layout: UnionLayout(ScalarTagUnion)
 	../stage_04_modules/loaded_module: ModuleOrigin(StdlibModule)
 	../stage_06_typecheck/graph/range_record:
-		ResolvedRangeFields, RANGE_START_FIELD, RANGE_END_FIELD, STANDARD_RANGE_RECORD_TYPE_NAME
+		ResolvedRangeFields, STANDARD_RANGE_RECORD_TYPE_NAME
 	../../lib/source:
 		SourceLineColumnSpan,
 		SourceLocation,
@@ -109,10 +109,12 @@ import:
 			AcceptedFieldExactFound, AcceptedFieldExactIncompatibleDefinitionTable,
 			AcceptedFieldExactMissing,
 		),
+		AcceptedFieldRow,
 		AcceptedRecordTable,
 		accepted_record_field_exact,
 		accepted_record_range_fields,
-	../stage_06_typecheck/graph/type_identity: type_id_definition_id
+		accepted_record_table_fields,
+	../stage_06_typecheck/graph/type_identity: TypeId, type_id_definition_id, type_ids_equal
 	../stage_06_typecheck/headers/declaration_skeleton:
 		callable_id_definition_id,
 		callable_id_module_id,
@@ -197,6 +199,7 @@ import:
 		array_type_parts,
 		canonical_module_type_name,
 		normalize_type_name,
+		scalar_int_value_type,
 		semantic_type_variable_named,
 		type_to_string,
 	../stage_06_typecheck/type_system/type_name_metadata:
@@ -241,11 +244,11 @@ import:
 		CoreDictLiteralEntry,
 		CoreDimOp(DimAdd, DimDivide, DimMultiply, DimSubtract),
 		CoreExpr(
-			BinaryExpr, BreakExpr, CallExpr, ContinueExpr, DebugBlockExpr, AssignExpr, DictExpr,
+			BinaryExpr, BreakExpr, CallExpr, CastExpr, ContinueExpr, DebugBlockExpr, AssignExpr, DictExpr,
 			ForChannelExpr, ForDictExpr, ForListExpr, ForRangeExpr,
 			ForResourceSourceExpr, ForSetExpr, ForStreamExpr, ForStringExpr, ForTensorExpr, IfExpr,
 			LambdaExpr, LetExpr, ListConstructExpr, LiteralExpr, LogicalExpr,
-			RawMatchExpr, RecordExpr, ResourceScopeExpr, PreClosureDetachExpr,
+			RawMatchExpr, ProductExpr, ResourceScopeExpr, PreClosureDetachExpr,
 			PreClosureConcurrentExpr, PreClosureConcurrentlyLoopExpr, SelectExpr, SeqExpr,
 			TupleExpr, UnaryExpr, VarExpr, VectorExpr, WhileExpr, VoidExpr, ModuleMemberExpr,
 			ProductFieldExpr,
@@ -254,6 +257,7 @@ import:
 		CoreFieldRef,
 		CoreForChannel,
 		CoreForDict,
+		CoreDictIterationMode(CoreDictIterationKeys, CoreDictIterationEntries),
 		CoreForList,
 		CoreForResourceSource,
 		CoreForSet,
@@ -287,6 +291,11 @@ import:
 		CorePreClosureConcurrentBinding,
 		CorePreClosureConcurrentBlock,
 		CorePreClosureConcurrentlyLoop,
+		CoreProductBuild,
+		CoreProductBuildError(
+			ProductBuildOrdinalMissing, ProductBuildOrdinalOutOfRange, ProductBuildOrdinalRepeated,
+		),
+		CoreProductFieldValue,
 		CoreProgram,
 		CoreRawMatchCase,
 		CoreRecordFieldValue,
@@ -318,11 +327,15 @@ import:
 		LoweringTempKind(QuestionBindTemp),
 		QUESTION_BIND_TEMP_ORIGIN,
 		TUPLE_DESTRUCT_TEMP_ORIGIN,
+		core_expr_source_loc,
+		core_expr_type,
+		core_type_equal,
 		core_field_ordinal,
 		core_field_ordinal_index,
 		core_field_ref,
 		core_union_decl_storage_error,
 		pack_core_source_loc,
+		product_build,
 		synthetic_core_source_loc,
 	../stage_09_core/type_policy as CoreTypePolicy
 	../stage_09_core/c_type_layout: c_type_name
@@ -1487,7 +1500,12 @@ private pure func core_lower_type_with_projection_impl(
 							Err(error):
 								Err(error)
 				SemanticTupleType(elements):
-					lowered_elements ?= core_lower_value_type_list(projection, elements)
+					-- Tuple value slots erase immediate scalar proofs, matching
+					-- inference; standalone and nominal field refinements remain.
+					lowered_elements ?= core_lower_value_type_list(
+						projection,
+						elements.map(pure func(element): scalar_int_value_type(element)),
+					)
 					Ok(TupleType(lowered_elements))
 				SemanticRangeType(_):
 					Ok(RangeType)
@@ -1565,6 +1583,46 @@ private CORE_BOOL_TYPE: CoreType = NamedType("Bool", [])
 private CORE_CHAR_TYPE: CoreType = NamedType("Char", [])
 
 private CORE_FLOAT_TYPE: CoreType = NamedType("Float", [])
+
+
+---
+A tuple's stored value shape may erase a scalar range proof. Preserve the
+lowered operand's operation and callable metadata, and cross only that
+accepted Range-to-Int representation boundary with an explicit cast.
+---
+private pure func tuple_value_items(
+	items: List[CoreExpr],
+	field_types: List[CoreType],
+) -> List[CoreExpr]:
+	match items:
+		[]:
+			[]
+		[item, ...rest]:
+			match field_types:
+				[field_type, ...remaining_types]:
+					value = match core_expr_type(item):
+						RangeType:
+							if core_type_equal(field_type, CoreTypePolicy.core_scalar_int_value_type(core_expr_type(item))):
+								CastExpr(item, field_type, core_expr_source_loc(item))
+							else:
+								item
+						_:
+							item
+					[value].concat(tuple_value_items(rest, remaining_types))
+				[]:
+					items
+
+
+private pure func tuple_value_expr(
+	items: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	match typ:
+		TupleType(field_types):
+			TupleExpr(tuple_value_items(items, field_types), typ, loc)
+		_:
+			TupleExpr(items, typ, loc)
 
 
 private pure func core_type_is_void(typ: CoreType) -> Bool:
@@ -2518,7 +2576,28 @@ private pure func lower_typed_field_access(
 		typed_expr_value_type(receiver),
 	)
 	ordinal ?= product_field_ordinal(context, receiver_type, field, field_identity)
-	Ok(ProductFieldExpr(lowered_receiver, ordinal, typ, loc))
+	match receiver_type:
+		TupleType(elements):
+			match typ:
+				RangeType:
+					match elements.get(core_field_ordinal_index(ordinal)):
+						Some(field_type):
+							if core_type_equal(field_type, CORE_INT_TYPE):
+								-- Read the actual value slot, then restore the
+								-- proof already accepted for the selected result.
+								Ok(CastExpr(
+									ProductFieldExpr(lowered_receiver, ordinal, field_type, loc),
+									typ,
+									loc,
+								))
+							else:
+								Ok(ProductFieldExpr(lowered_receiver, ordinal, typ, loc))
+						None:
+							Ok(ProductFieldExpr(lowered_receiver, ordinal, typ, loc))
+				_:
+					Ok(ProductFieldExpr(lowered_receiver, ordinal, typ, loc))
+		_:
+			Ok(ProductFieldExpr(lowered_receiver, ordinal, typ, loc))
 
 
 ---
@@ -2585,20 +2664,139 @@ private pure func record_field_ordinal(
 	context: CoreLowerContext,
 	field_id: FieldId,
 ) -> Result[CoreFieldOrdinal, CoreLowerError]:
-	records ?= context.records.to_result(CoreLowerInvalidType(
-		"accepted record rows are missing; prepare the accepted module graph before lowering field selections",
+	row ?= accepted_field_row(context, field_id)
+	Ok(core_field_ordinal(row.index))
+
+
+private pure func accepted_record_rows(context: CoreLowerContext) -> Result[AcceptedRecordTable, CoreLowerError]:
+	context.records.to_result(CoreLowerInvalidType(
+		"accepted record rows are missing; prepare the accepted module graph before lowering record fields",
 	))
-	definitions ?= context.definition_table.to_result(CoreLowerInvalidType(
-		"definition table is missing; prepare the accepted module graph before lowering field selections",
+
+
+private pure func accepted_rows_definitions(context: CoreLowerContext) -> Result[DefinitionTable, CoreLowerError]:
+	context.definition_table.to_result(CoreLowerInvalidType(
+		"definition table is missing; prepare the accepted module graph before lowering record fields",
 	))
+
+
+private pure func accepted_field_row(
+	context: CoreLowerContext,
+	field_id: FieldId,
+) -> Result[AcceptedFieldRow, CoreLowerError]:
+	records ?= accepted_record_rows(context)
+	definitions ?= accepted_rows_definitions(context)
 
 	match accepted_record_field_exact(records, definitions, field_id):
 		AcceptedFieldExactFound(row):
-			Ok(core_field_ordinal(row.index))
+			Ok(row)
 		AcceptedFieldExactMissing:
-			Err(CoreLowerInvalidType("field selection names no accepted record field"))
+			Err(CoreLowerInvalidType("record field names no accepted record field"))
 		AcceptedFieldExactIncompatibleDefinitionTable:
 			Err(CoreLowerInvalidType("accepted record rows come from another definition table"))
+
+
+---
+A record build from `fields`, each a field's identity and its lowered value in
+written order: each value is stored at its field's position in the accepted
+row. Typecheck accepted the literal, so every field of one record appears
+once; the build checks that again against the record's row, so a literal that
+repeats or misses a field is an internal error here rather than a wrong store
+in emitted C.
+---
+private pure func record_build(
+	context: CoreLowerContext,
+	fields: List[(FieldId, CoreExpr)],
+) -> Result[CoreProductBuild, CoreLowerError]:
+	var values: List[CoreProductFieldValue] = []
+	var parent_record: Option[TypeId] = None
+	var failure: Option[CoreLowerError] = None
+
+	for (field_id, value) in fields:
+		if failure.is_some():
+			break
+
+		match accepted_field_row(context, field_id):
+			Ok(row):
+				match parent_record:
+					Some(parent):
+						if not type_ids_equal(parent, row.parent):
+							failure = Some(CoreLowerInvalidType("record literal names fields of two records"))
+					None:
+						parent_record = Some(row.parent)
+
+				values = values.append({
+					ordinal = core_field_ordinal(row.index),
+					value = value
+				})
+			Err(error):
+				failure = Some(error)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			field_count ?= match parent_record:
+				Some(parent):
+					record_field_count(context, parent)
+				None:
+					Ok(0)
+			product_build(field_count, values).map_err(func(build_error): CoreLowerInvalidType(
+				"record literal does not give each field one value: " + core_product_build_error_text(
+					build_error,
+				),
+			))
+
+
+private pure func record_field_count(
+	context: CoreLowerContext,
+	record_id: TypeId,
+) -> Result[Int, CoreLowerError]:
+	records ?= accepted_record_rows(context)
+	definitions ?= accepted_rows_definitions(context)
+	rows ?= accepted_record_table_fields(records, definitions, record_id).to_result(
+		CoreLowerInvalidType("record literal names no accepted record"),
+	)
+	Ok(rows.length())
+
+
+private pure func core_product_build_error_text(error: CoreProductBuildError) -> String:
+	match error:
+		ProductBuildOrdinalOutOfRange(ordinal):
+			"ordinal ${ordinal.to_string()} is past the record's fields"
+		ProductBuildOrdinalRepeated(ordinal):
+			"ordinal ${ordinal.to_string()} is given twice"
+		ProductBuildOrdinalMissing(ordinal):
+			"ordinal ${ordinal.to_string()} has no value"
+
+
+private pure func lower_typed_record_literal(
+	context: CoreLowerContext,
+	fields: List[TypedRecordField],
+) -> Result[CoreProductBuild, CoreLowerError]:
+	var lowered: List[(FieldId, CoreExpr)] = []
+	var failure: Option[CoreLowerError] = None
+
+	for field in fields:
+		if failure.is_some():
+			break
+
+		match (
+			resolved_field_identity_field_id(field.field_id),
+			lower_typed_expr_with_context(context, field.value),
+		):
+			(Some(field_id), Ok(value)):
+				lowered = lowered.append((field_id, value))
+			(_, Err(error)):
+				failure = Some(error)
+			(None, Ok(_)):
+				failure = Some(CoreLowerInvalidType("record field has no typecheck field identity"))
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			record_build(context, lowered)
 
 
 ---
@@ -3112,9 +3310,9 @@ private pure func lower_typed_for_binding(
 							),
 						)
 					else:
-						field_types ?= core_lower_type_list(
+						field_types ?= core_lower_value_type_list(
 							core_lower_type_projection(context),
-							element_types,
+							element_types.map(pure func(element): scalar_int_value_type(element)),
 						)
 						tuple_type: CoreType = TupleType(field_types)
 						tuple_var = core_tuple_destruct_var(span)
@@ -3334,8 +3532,15 @@ private pure func lower_typed_named_iterable_for(
 					ParsedForNameBinder(_):
 						key_type
 
+				iteration_mode: CoreDictIterationMode = match binder:
+					ParsedForTupleBinder(_, _):
+						CoreDictIterationEntries
+					ParsedForNameBinder(_):
+						CoreDictIterationKeys
+
 				parts ?= lower_typed_for_parts(context, binder, element_type, iterable, body)
 				for_dict: CoreForDict = {
+					iteration_mode = iteration_mode,
 					binder = parts.binder,
 					iterable = parts.iterable,
 					iterable_release_policy = parts.iterable_release_policy,
@@ -3616,6 +3821,7 @@ private pure func lower_enumerate_loop_body(
 	index_type: CoreType,
 	element_expr: CoreExpr,
 	element_type: CoreType,
+	tuple_type: CoreType,
 	body: TypedExpr,
 ) -> Result[CoreExpr, CoreLowerError]:
 	lowered_body ?= lower_typed_expr_with_context(context, body)
@@ -3658,9 +3864,6 @@ private pure func lower_enumerate_loop_body(
 			if name_ids_equal(name.name, NAME_ID_WILDCARD):
 				Ok(lowered_body)
 			else:
-				tuple_type: CoreType = TupleType(
-					[clone_core_type(index_type), clone_core_type(element_type)],
-				)
 				index_ref = VarExpr(
 					clone_core_var(index_var),
 					clone_core_type(index_type),
@@ -3675,7 +3878,7 @@ private pure func lower_enumerate_loop_body(
 						),
 						False,
 						tuple_type,
-						TupleExpr(
+						tuple_value_expr(
 							[index_ref, element_expr],
 							clone_core_type(tuple_type),
 							core_source_loc_from_context(
@@ -3795,6 +3998,10 @@ private pure func lower_typed_tensor_enumerate_for(
 		dims,
 		loc,
 	)
+	tuple_type ?= core_lower_value_type(
+		core_lower_type_projection(context),
+		SemanticTupleType([index_source_type, element_source_type]),
+	)
 	loop_body ?= lower_enumerate_loop_body(
 		context,
 		binder,
@@ -3803,6 +4010,7 @@ private pure func lower_typed_tensor_enumerate_for(
 		index_type,
 		element_expr,
 		element_type,
+		tuple_type,
 		body,
 	)
 	length_call = unknown_named_core_call(
@@ -3895,6 +4103,7 @@ private pure func lower_enumerate2_loop_body(
 	column_type: CoreType,
 	element_expr: CoreExpr,
 	element_type: CoreType,
+	tuple_type: CoreType,
 	body: TypedExpr,
 ) -> Result[CoreExpr, CoreLowerError]:
 	lowered_body ?= lower_typed_expr_with_context(context, body)
@@ -3946,11 +4155,6 @@ private pure func lower_enumerate2_loop_body(
 			if name_ids_equal(name.name, NAME_ID_WILDCARD):
 				Ok(lowered_body)
 			else:
-				tuple_type: CoreType = TupleType([
-					clone_core_type(row_type),
-					clone_core_type(column_type),
-					clone_core_type(element_type),
-				])
 				row_ref = VarExpr(
 					clone_core_var(row_var),
 					clone_core_type(row_type),
@@ -3970,7 +4174,7 @@ private pure func lower_enumerate2_loop_body(
 						),
 						False,
 						tuple_type,
-						TupleExpr(
+						tuple_value_expr(
 							[row_ref, column_ref, element_expr],
 							clone_core_type(tuple_type),
 							core_source_loc_from_context(
@@ -4040,6 +4244,10 @@ private pure func lower_typed_2d_enumerate2_for(
 		clone_core_type(element_type),
 		clone_core_source_loc(loc),
 	)
+	tuple_type ?= core_lower_value_type(
+		core_lower_type_projection(context),
+		SemanticTupleType([row_source_type, column_source_type, element_source_type]),
+	)
 	loop_body ?= lower_enumerate2_loop_body(
 		context,
 		binder,
@@ -4050,6 +4258,7 @@ private pure func lower_typed_2d_enumerate2_for(
 		column_type,
 		element_expr,
 		element_type,
+		tuple_type,
 		body,
 	)
 	rows_call = unknown_named_core_call(
@@ -5369,7 +5578,13 @@ private pure func lower_typed_expr_as_type_impl(
 		TypedOpaqueIntoExpr(_, inner, _, _):
 			lower_typed_expr_with_context(context, inner)
 		TypedOpaqueFromExpr(_, inner, _, _):
-			lower_typed_expr_as_type(context, inner, typ)
+			-- Keep the accepted operand type, especially a selected tuple
+			-- field or callable result; opaque unwrapping converts its value.
+			lowered_inner ?= lower_typed_expr_with_context(context, inner)
+			if core_type_equal(core_expr_type(lowered_inner), typ):
+				Ok(lowered_inner)
+			else:
+				Ok(CastExpr(lowered_inner, typ, loc))
 		TypedAssignExpr(name, _, value, _, _):
 			lowered_value ?= lower_typed_expr_with_context(context, value)
 			Ok(AssignExpr(core_local_var_use(context, name.text, None), lowered_value, typ, loc))
@@ -5455,7 +5670,7 @@ private pure func lower_typed_expr_as_type_impl(
 				Ok(call_node)
 		TypedTupleExpr(items, _, _):
 			lowered_items ?= lower_typed_exprs(context, items)
-			Ok(TupleExpr(lowered_items, typ, loc))
+			Ok(tuple_value_expr(lowered_items, typ, loc))
 		TypedListExpr(items, _, _):
 			lowered_items ?= lower_typed_list_items(context, items)
 			construct: CoreListConstruct = {
@@ -5479,21 +5694,14 @@ private pure func lower_typed_expr_as_type_impl(
 		TypedRangeExpr(start_expr, end_expr, range_fields, _, _):
 			lowered_start ?= lower_typed_expr_with_context(context, start_expr)
 			lowered_end ?= lower_typed_expr_with_context(context, end_expr)
-			Ok(RecordExpr([
-				{
-					name = RANGE_START_FIELD,
-					ref = core_field_ref(field_id_definition_id(range_fields.start)),
-					value = lowered_start,
-				},
-				{
-					name = RANGE_END_FIELD,
-					ref = core_field_ref(field_id_definition_id(range_fields.end)),
-					value = lowered_end,
-				},
-			], typ, loc))
+			build ?= record_build(
+				context,
+				[(range_fields.start, lowered_start), (range_fields.end, lowered_end)],
+			)
+			Ok(ProductExpr(build, typ, loc))
 		TypedRecordExpr(fields, _, _):
-			lowered_fields ?= lower_typed_record_fields(context, fields)
-			Ok(RecordExpr(lowered_fields, typ, loc))
+			build ?= lower_typed_record_literal(context, fields)
+			Ok(ProductExpr(build, typ, loc))
 		TypedRecordUpdateExpr(receiver, updates, record_fields, span, _):
 			lower_typed_record_update(context, receiver, updates, span, typ, loc)
 		TypedIfExpr(condition, then_branch, else_branch, _, _):
