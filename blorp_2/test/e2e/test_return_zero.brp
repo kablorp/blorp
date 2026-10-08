@@ -1,0 +1,257 @@
+import:
+	cost: CompilationCost, CostLimits, check_limits, parse_allocations, parse_instructions
+	process: ProcessOutput, run
+	system: file_exists, getenv, read_file, remove_dir, remove_file, temp_dir, write_file
+	test: TestSuite
+
+
+-- Initial baseline: 82 allocations and 18,807,794 minimum retired instructions.
+-- Rounded ceilings allow startup variation; changes to them are reviewed.
+private RETURN_ZERO_LIMITS: CostLimits = {
+	allocations = 90,
+	instructions = 22000000
+}
+
+private EXPECTED_C: String = "int main(void){return 0;}\n"
+
+
+func run_isolated(program: String, arguments: List[String]) -> Result[ProcessOutput, String]:
+	-- A parent's leak-check mode must not instrument the normal instruction run.
+	run(
+		"/usr/bin/env",
+		["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", program].concat(arguments),
+	)
+
+
+func run_successfully(program: String, arguments: List[String]) -> Result[ProcessOutput, String]:
+	output ?= run_isolated(program, arguments)
+
+	if output.exit_code() != 0:
+		Err(program + " failed: " + output.stderr())
+	else:
+		Ok(output)
+
+
+func build_compiler(directory: String) -> Result[Void, String]:
+	compiler_c: String = directory + "/compiler.c"
+	generated ?= run_successfully(
+		"bin/blorp",
+		["compile", "--no-format", "blorp_2/src/main.brp", "-o", compiler_c],
+	)
+	compiler: String = getenv("BLORP_CC").get_or("clang")
+	normal ?= run_successfully(
+		compiler,
+		[
+			"-O2",
+			"-DBLORP_MEMORY_DIAGNOSTICS=0",
+			compiler_c,
+			"-o",
+			directory + "/compiler",
+			"-lm",
+			"-lpthread",
+		],
+	)
+	diagnostic ?= run_successfully(
+		compiler,
+		[
+			"-O2",
+			"-DBLORP_MEMORY_DIAGNOSTICS=1",
+			compiler_c,
+			"-o",
+			directory + "/compiler-diagnostic",
+			"-lm",
+			"-lpthread",
+		],
+	)
+	Ok(void)
+
+
+func verify_generated_c(path: String) -> Result[Void, String]:
+	actual ?= read_file(path)
+
+	if actual == EXPECTED_C:
+		Ok(void)
+	else:
+		Err("the compiler did not emit the expected return-zero C")
+
+
+func remove_existing_file(path: String) -> Result[Void, String]:
+	if not file_exists(path) or remove_file(path):
+		Ok(void)
+	else:
+		Err("could not remove previous measurement output: " + path)
+
+
+func measure_instructions(directory: String) -> Result[Int, String]:
+	-- Each child must publish fresh C and a fresh report; old files are no oracle.
+	removed_c ?= remove_existing_file(directory + "/program.c")
+	removed_report ?= remove_existing_file(directory + "/instructions.txt")
+	output ?= run_successfully(
+		"/usr/bin/time",
+		[
+			"-l",
+			"-o",
+			directory + "/instructions.txt",
+			directory + "/compiler",
+			"blorp_2/test/e2e/fixtures/return_zero.brp",
+			directory + "/program.c",
+		],
+	)
+
+	if output.stdout() != "" or output.stderr() != "":
+		Err("the compiler must be silent on success")
+	else:
+		verified ?= verify_generated_c(directory + "/program.c")
+		report ?= read_file(directory + "/instructions.txt")
+		parse_instructions(report)
+
+
+func verify_compilation_cost(directory: String) -> Result[Void, String]:
+	-- Allocation diagnostics and normal instruction measurements use the same C.
+	removed_c ?= remove_existing_file(directory + "/program.c")
+	allocation_run ?= run_successfully(
+		"/usr/bin/env",
+		[
+			"BLORP_LEAK_CHECK=strict",
+			directory + "/compiler-diagnostic",
+			"blorp_2/test/e2e/fixtures/return_zero.brp",
+			directory + "/program.c",
+		],
+	)
+
+	if allocation_run.stdout() != "":
+		Err("the compiler must have empty stdout on success")
+	else:
+		verified ?= verify_generated_c(directory + "/program.c")
+		allocations ?= parse_allocations(allocation_run.stderr())
+		first ?= measure_instructions(directory)
+		second ?= measure_instructions(directory)
+		third ?= measure_instructions(directory)
+		instructions: Int = min(
+			min(first, second),
+			third,
+		)
+		cost: CompilationCost = {
+			allocations = allocations,
+			instructions = instructions
+		}
+		print(
+			"return_zero compiler: allocations=" + "".append_int(
+				allocations,
+			) + "/" + "".append_int(
+				RETURN_ZERO_LIMITS.allocations,
+			) + "; instructions=" + "".append_int(
+				instructions,
+			) + "/" + "".append_int(RETURN_ZERO_LIMITS.instructions) + " (minimum of 3)",
+		)
+		print(
+			"instruction samples: " + "".append_int(
+				first,
+			) + ", " + "".append_int(second) + ", " + "".append_int(third),
+		)
+		check_limits(cost, RETURN_ZERO_LIMITS)
+
+
+func verify_return_zero(directory: String) -> Result[Void, String]:
+	generated_c: String = directory + "/program.c"
+	binary: String = directory + "/program"
+	linked ?= run_successfully(
+		getenv("BLORP_CC").get_or("clang"),
+		["-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic", "-O2", generated_c, "-o", binary],
+	)
+	executed ?= run_successfully(binary, [])
+
+	if executed.stdout() != "" or executed.stderr() != "":
+		Err("the return-zero program must have empty stdout and stderr")
+	else:
+		Ok(void)
+
+
+func verify_rejected_command(
+	compiler: String,
+	input: String,
+	output: String,
+	expected: String,
+) -> Result[Void, String]:
+	rejected ?= run_isolated(
+		compiler,
+		[input, output],
+	)
+
+	if (
+		rejected.exit_code() != 1
+		or rejected.stdout() != ""
+		or rejected.stderr() != expected
+	):
+		Err("rejected input must exit 1 with the expected location, diagnostic, and help")
+	else:
+		Ok(void)
+
+
+func verify_rejected_input(directory: String) -> Result[Void, String]:
+	input: String = directory + "/invalid.brp"
+	output: String = directory + "/rejected.c"
+	compiler: String = directory + "/compiler"
+	written_input ?= write_file(input, "func start() -> Int:\n\t0\n")
+	expected: String = input + ":1:6: error: expected exactly one main function\nhelp: name the entrypoint main\n"
+	missing_output_rejection ?= verify_rejected_command(compiler, input, output, expected)
+
+	missing_output ?= if file_exists(output):
+		Err("rejected source created a C output file")
+	else:
+		Ok(void)
+
+	written_output ?= write_file(output, "preserve this output")
+	existing_output_rejection ?= verify_rejected_command(compiler, input, output, expected)
+	actual ?= read_file(output)
+
+	if actual != "preserve this output":
+		Err("rejected source overwrote the existing output")
+	else:
+		Ok(void)
+
+
+func verify_all(directory: String) -> Result[Void, String]:
+	built ?= build_compiler(directory)
+	within_budget ?= verify_compilation_cost(directory)
+	native_result ?= verify_return_zero(directory)
+	verify_rejected_input(directory)
+
+
+func test_return_zero_and_rejected_output() -> Bool:
+	match (
+		run_successfully(
+			"mktemp",
+			["-d", temp_dir() + "/blorp-2-e2e.XXXXXX"],
+		)
+	):
+		Err(error):
+			print_error(error)
+			False
+		Ok(temporary):
+			directory: String = temporary
+				.stdout()
+				.trim()
+			result: Result[Void, String] = verify_all(directory)
+			_ = remove_file(directory + "/compiler.c")
+			_ = remove_file(directory + "/compiler")
+			_ = remove_file(directory + "/compiler-diagnostic")
+			_ = remove_file(directory + "/instructions.txt")
+			_ = remove_file(directory + "/program.c")
+			_ = remove_file(directory + "/program")
+			_ = remove_file(directory + "/invalid.brp")
+			_ = remove_file(directory + "/rejected.c")
+			_ = remove_dir(directory)
+
+			match result:
+				Ok(_):
+					True
+				Err(error):
+					print_error("FAIL: " + error)
+					False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 native execution",
+	tests = [("return zero and preserve rejected output", test_return_zero_and_rejected_output)]
+}
