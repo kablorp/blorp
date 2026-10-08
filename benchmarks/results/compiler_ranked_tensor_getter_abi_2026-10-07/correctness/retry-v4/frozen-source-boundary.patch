@@ -1,0 +1,855 @@
+diff --git a/blorp/src/compiler/stage_09_core/specialize_collection.brp b/blorp/src/compiler/stage_09_core/specialize_collection.brp
+index 50db5c1cc..e5c0603c0 100644
+--- a/blorp/src/compiler/stage_09_core/specialize_collection.brp
++++ b/blorp/src/compiler/stage_09_core/specialize_collection.brp
+@@ -84,6 +84,12 @@ private FIRST_ERASED_ARGUMENT_INDEX: Int = 1
+ private SECOND_ERASED_ARGUMENT_INDEX: Int = 2
+ 
+ 
++private enum CollectionErasedSlots:
++	NoErasedSlots
++	FirstErasedSlot
++	FirstAndSecondErasedSlots
++
++
+ private pure func variable(name: String, typ: CoreType, loc: CoreSourceLoc) -> CoreExpr:
+ 	VarExpr(core_var(name), typ, loc)
+ 
+@@ -469,22 +475,32 @@ private pure func first_erased_argument_builtin(name: String) -> Bool:
+ 		or name == "blorp_fold_parallel_ordered_with"
+ 		or name == "blorp_stream_fold"
+ 		or name == "blorp_fallible_stream_fold_raw"
+-		or name.starts_with("blorp_dict_get")
+ 	)
+ 
+ 
+-private pure func collection_has_erased_arguments(name: String) -> Bool:
+-	first_erased_argument_builtin(name) or name == "blorp_dict_insert"
+-
+-
+-private pure func collection_argument_is_erased(name: String, index: Int) -> Bool:
+-	(
+-		first_erased_argument_builtin(name) and index == FIRST_ERASED_ARGUMENT_INDEX
+-		or (
+-			name == "blorp_dict_insert"
+-			and (index == FIRST_ERASED_ARGUMENT_INDEX or index == SECOND_ERASED_ARGUMENT_INDEX)
+-		)
+-	)
++private pure func collection_erased_slots(
++	layout: CoreSpecializeLayout,
++	name: String,
++	args: List[CoreExpr],
++	result_type: CoreType,
++) -> CollectionErasedSlots:
++	if name == "blorp_dict_insert":
++		FirstAndSecondErasedSlots
++	else if first_erased_argument_builtin(name):
++		FirstErasedSlot
++	else:
++		-- Typed getters must agree with the producer's Option selector. The
++		-- two-argument runtime ABI gates this check; arity alone admits nothing.
++		match args:
++			[_, _]:
++				if option_runtime_name(
++					layout, result_type, "blorp_dict_get", Some("blorp_dict_get"),
++				) == Some(name):
++					FirstErasedSlot
++				else:
++					NoErasedSlots
++			_:
++				NoErasedSlots
+ 
+ 
+ private pure func explicit_box(expr: CoreExpr) -> Bool:
+@@ -523,19 +539,27 @@ private pure func box_void_slot_argument(
+ 
+ private pure func box_collection_void_slots(
+ 	layout: CoreSpecializeLayout,
+-	name: String,
++	slots: CollectionErasedSlots,
+ 	args: List[CoreExpr],
+ 	loc: CoreSourceLoc,
+ ) -> List[CoreExpr]:
+-	if not collection_has_erased_arguments(name):
++	if slots == NoErasedSlots:
+ 		args
+ 	else:
+ 		var result: List[CoreExpr] = []
+ 		var index: Int = 0
+ 
+ 		for arg in args:
++			erased: Bool = match slots:
++				NoErasedSlots:
++					False
++				FirstErasedSlot:
++					index == FIRST_ERASED_ARGUMENT_INDEX
++				FirstAndSecondErasedSlots:
++					index == FIRST_ERASED_ARGUMENT_INDEX or index == SECOND_ERASED_ARGUMENT_INDEX
++
+ 			result = result.append(
+-				if collection_argument_is_erased(name, index):
++				if erased:
+ 					box_void_slot_argument(layout, arg, loc)
+ 				else:
+ 					arg
+@@ -991,7 +1015,7 @@ private pure func specialize_dict_get(
+ 				builtin_call_with_callee(
+ 					call_name,
+ 					callee,
+-					box_collection_void_slots(layout, call_name, args, loc),
++					box_collection_void_slots(layout, FirstErasedSlot, args, loc),
+ 					result_type,
+ 					loc,
+ 				)
+@@ -1125,7 +1149,7 @@ private pure func specialize_collection_call(
+ 			callee,
+ 			box_collection_void_slots(
+ 				layout,
+-				name,
++				FirstErasedSlot,
+ 				[set_expr, args.get_or(1, void_expr(loc))],
+ 				loc,
+ 			),
+@@ -1146,7 +1170,7 @@ private pure func specialize_collection_call(
+ 			callee,
+ 			box_collection_void_slots(
+ 				layout,
+-				name,
++				FirstAndSecondErasedSlots,
+ 				[dict_expr, key, value],
+ 				loc,
+ 			),
+@@ -1281,7 +1305,7 @@ private pure func specialize_collection_call(
+ 			None:
+ 				VoidType
+ 
+-		boxed_args: List[CoreExpr] = box_collection_void_slots(layout, name, args, loc)
++		boxed_args: List[CoreExpr] = box_collection_void_slots(layout, FirstErasedSlot, args, loc)
+ 		raw: CoreExpr = append_release_flag(
+ 			name,
+ 			callee,
+@@ -1310,7 +1334,7 @@ private pure func specialize_collection_call(
+ 		append_release_flag(
+ 			name,
+ 			callee,
+-			box_collection_void_slots(layout, name, args, loc),
++			box_collection_void_slots(layout, FirstErasedSlot, args, loc),
+ 			result_type,
+ 			boxed_storage_slot_needs_release(layout, init_type),
+ 			loc,
+@@ -1322,12 +1346,14 @@ private pure func specialize_collection_call(
+ 			None:
+ 				original
+ 	else:
+-		boxed_args: List[CoreExpr] = box_collection_void_slots(layout, name, args, loc)
++		slots: CollectionErasedSlots = collection_erased_slots(layout, name, args, result_type)
+ 
+-		if not collection_has_erased_arguments(name):
++		if slots == NoErasedSlots:
+ 			original
+ 		else:
+-			builtin_call_with_callee(name, callee, boxed_args, result_type, loc)
++			builtin_call_with_callee(
++				name, callee, box_collection_void_slots(layout, slots, args, loc), result_type, loc,
++			)
+ 
+ 
+ pure func specialize_collection_expr(layout: CoreSpecializeLayout, expr: CoreExpr) -> CoreExpr:
+diff --git a/blorp/test/test_compiler/test_stage_09_core/test_core_specialize_collection.brp b/blorp/test/test_compiler/test_stage_09_core/test_core_specialize_collection.brp
+index 48c83b726..f2c623ed2 100644
+--- a/blorp/test/test_compiler/test_stage_09_core/test_core_specialize_collection.brp
++++ b/blorp/test/test_compiler/test_stage_09_core/test_core_specialize_collection.brp
+@@ -1,6 +1,6 @@
+ import:
+ 	../../../src/compiler/stage_09_core/ir:
+-		CoreBoxKind(FloatBox, PointerBox, PrimBox, StructBox),
++		CoreBoxKind(FloatBox, Int128Box, PointerBox, PrimBox, StructBox),
+ 		CoreCallKind(BuiltinCall, IntrinsicCall),
+ 		CoreDecl(EnumDecl, HeapRecordDecl, TypeAliasDecl),
+ 		CoreExpr(
+@@ -8,9 +8,11 @@ import:
+ 			CallExpr,
+ 			CastExpr,
+ 			ConstructorMatchExpr,
++			LetExpr,
+ 			ListAllocExpr,
+ 			ListConstructExpr,
+ 			LiteralExpr,
++			SeqExpr,
+ 			UnboxExpr,
+ 			VarExpr,
+ 			VoidExpr,
+@@ -36,6 +38,7 @@ import:
+ 		CoreBinderOrigin(AuthoredBinder),
+ 		CoreVar,
+ 		core_expr_to_json,
++		core_var_equal,
+ 	../../../src/compiler/stage_09_core/specialize_collection: specialize_collection_expr
+ 	../../../src/compiler/stage_09_core/specialize_layout:
+ 		CoreSpecializeLayout,
+@@ -119,6 +122,22 @@ private pure func collection_program() -> CoreProgram:
+ 				is_opaque = False,
+ 				loc = synthetic_core_source_loc(),
+ 			}),
++			TypeAliasDecl({
++				abi_type = None,
++				name = "Number",
++				type_params = [],
++				target = named_type("Int"),
++				is_opaque = False,
++				loc = synthetic_core_source_loc(),
++			}),
++			TypeAliasDecl({
++				abi_type = None,
++				name = "MaybeName",
++				type_params = [],
++				target = option_type(named_type("Name")),
++				is_opaque = False,
++				loc = synthetic_core_source_loc(),
++			}),
+ 			TypeAliasDecl({
+ 				abi_type = None,
+ 				name = "Shade",
+@@ -250,6 +269,30 @@ private pure func dict_get_boxes_key(expr: CoreExpr) -> Bool:
+ 			False
+ 
+ 
++private pure func same_core_expr(left: CoreExpr, right: CoreExpr) -> Bool:
++	core_expr_to_json(left).to_string() == core_expr_to_json(right).to_string()
++
++
++private pure func int_key_dict_get(name: String, payload: CoreType) -> CoreExpr:
++	call(
++		name,
++		[variable("dict", NamedType("Dict", [named_type("Int"), payload])), int_literal(1)],
++		option_type(payload),
++	)
++
++
++private pure func dict_get_has_one_int_key_box(expr: CoreExpr) -> Bool:
++	match expr:
++		CallExpr(_, _, [VarExpr(_, _, _), BoxExpr(box, NamedType("Ptr", []), _)], _, _):
++			(
++				box.kind == PrimBox
++				and box.source_type == named_type("Int")
++				and is_int_literal(box.value, 1)
++			)
++		_:
++			False
++
++
+ private pure func unfold_has_layouts(expr: CoreExpr, element: Int, state: Int) -> Bool:
+ 	match expr:
+ 		CallExpr(BuiltinCall("blorp_stream_unfold"), _, [BoxExpr(_, NamedType("Ptr", []), _), _, element_layout, state_layout], _, _):
+@@ -729,6 +772,183 @@ pure func test_already_specialized_dict_get_boxes_primitive_key() -> Bool:
+ 	call_name(dict_get) == Some("blorp_dict_get_nullable") and dict_get_boxes_key(dict_get)
+ 
+ 
++pure func test_unknown_dict_get_suffix_stays_unboxed() -> Bool:
++	var unchanged: Bool = True
++
++	for name in ["blorp_dict_get_future", "blorp_dict_get_int_extra", "blorp_dict_getter"]:
++		original: CoreExpr = int_key_dict_get(name, named_type("Int"))
++		unchanged = unchanged and same_core_expr(specialized(original), original)
++
++	unchanged
++
++
++pure func test_dict_get_suffix_requires_matching_option_payload() -> Bool:
++	primitive: CoreExpr = int_key_dict_get("blorp_dict_get_int", named_type("String"))
++	nullable: CoreExpr = int_key_dict_get("blorp_dict_get_nullable", named_type("Int"))
++	not_option: CoreExpr = call(
++		"blorp_dict_get_int",
++		[variable("dict", NamedType("Dict", [named_type("Int"), named_type("Int")])), int_literal(1)],
++		named_type("Int"),
++	)
++
++	(
++		same_core_expr(specialized(primitive), primitive)
++		and same_core_expr(specialized(nullable), nullable)
++		and same_core_expr(specialized(not_option), not_option)
++	)
++
++
++pure func test_typed_dict_get_wrong_arity_stays_unboxed() -> Bool:
++	dict_value: CoreExpr = variable(
++		"dict", NamedType("Dict", [named_type("Int"), named_type("String")]),
++	)
++	one_argument: CoreExpr = call(
++		"blorp_dict_get_nullable", [dict_value], option_type(named_type("String")),
++	)
++	three_arguments: CoreExpr = call(
++		"blorp_dict_get_nullable", [dict_value, int_literal(1), int_literal(2)],
++		option_type(named_type("String")),
++	)
++
++	(
++		same_core_expr(specialized(one_argument), one_argument)
++		and same_core_expr(specialized(three_arguments), three_arguments)
++	)
++
++
++pure func test_intrinsic_dict_get_name_stays_unboxed() -> Bool:
++	original: CoreExpr = intrinsic(
++		"blorp_dict_get_nullable",
++		[variable("dict", NamedType("Dict", [named_type("Int"), named_type("String")])), int_literal(1)],
++		option_type(named_type("String")),
++	)
++
++	same_core_expr(specialized(original), original)
++
++
++pure func test_dict_get_primitive_widths_share_key_boxing() -> Bool:
++	-- This table is the native getter ABI, not another production selector.
++	cases: List[(String, String)] = [
++		("Int", "int"), ("Int8", "int8"), ("Int16", "int16"), ("Int32", "int32"),
++		("Int64", "int64"), ("UInt8", "uint8"), ("UInt16", "uint16"),
++		("UInt32", "uint32"), ("UInt64", "uint64"), ("Float", "float"),
++		("Float32", "f32"), ("Float16", "f16"), ("Bool", "bool"), ("Char", "char")
++	]
++	var boxed: Bool = True
++
++	for (payload_name, suffix) in cases:
++		payload: CoreType = named_type(payload_name)
++		runtime_name: String = "blorp_dict_get_" + suffix
++		generic: CoreExpr = specialized(int_key_dict_get("blorp_dict_get", payload))
++		typed: CoreExpr = specialized(int_key_dict_get(runtime_name, payload))
++		boxed = (
++			boxed
++			and call_name(generic) == Some(runtime_name)
++			and call_name(typed) == Some(runtime_name)
++			and dict_get_has_one_int_key_box(generic)
++			and dict_get_has_one_int_key_box(typed)
++		)
++
++	boxed
++
++
++pure func test_dict_get_payload_and_option_aliases_keep_key_boxing() -> Bool:
++	primitive: CoreExpr = specialized(int_key_dict_get("blorp_dict_get_int", named_type("Number")))
++	managed: CoreExpr = specialized(int_key_dict_get("blorp_dict_get_nullable", named_type("Name")))
++	option_alias: CoreExpr = specialized(call(
++			"blorp_dict_get_nullable",
++			[variable("dict", NamedType("Dict", [named_type("Int"), named_type("Name")])), int_literal(1)],
++			named_type("MaybeName"),
++		))
++
++	(
++		call_name(primitive) == Some("blorp_dict_get_int")
++		and call_name(managed) == Some("blorp_dict_get_nullable")
++		and call_name(option_alias) == Some("blorp_dict_get_nullable")
++		and dict_get_has_one_int_key_box(primitive)
++		and dict_get_has_one_int_key_box(managed)
++		and dict_get_has_one_int_key_box(option_alias)
++	)
++
++
++pure func test_generic_dict_get_preserves_boxed_and_unspecialized_payloads() -> Bool:
++	var preserved: Bool = True
++
++	for payload in [option_type(named_type("Int")), named_type("Ptr")]:
++		result: CoreExpr = specialized(int_key_dict_get("blorp_dict_get", payload))
++		preserved = (
++			preserved
++			and call_name(result) == Some("blorp_dict_get")
++			and dict_get_has_one_int_key_box(result)
++		)
++
++	for payload in [named_type("Color"), RangeType, named_type("Int128"), named_type("UInt128")]:
++		original: CoreExpr = int_key_dict_get("blorp_dict_get", payload)
++		preserved = preserved and same_core_expr(specialized(original), original)
++
++	preserved
++
++
++pure func test_dict_get_repeated_specialization_keeps_one_key_box() -> Bool:
++	var unchanged: Bool = True
++
++	for (name, payload) in [("blorp_dict_get_int", named_type("Int")), ("blorp_dict_get_nullable", named_type("String"))]:
++		once: CoreExpr = specialized(int_key_dict_get(name, payload))
++		twice: CoreExpr = specialized(once)
++		unchanged = (
++			unchanged and dict_get_has_one_int_key_box(twice) and same_core_expr(twice, once)
++		)
++
++	unchanged
++
++
++pure func test_dict_get_managed_key_remains_borrowed() -> Bool:
++	original: CoreExpr = call(
++		"blorp_dict_get_int",
++		[variable("dict", NamedType("Dict", [named_type("String"), named_type("Int")])), variable("key", named_type("String"))],
++		option_type(named_type("Int")),
++	)
++
++	same_core_expr(specialized(original), original)
++
++
++pure func test_generic_dict_get_evaluates_map_before_fresh_key_box() -> Bool:
++	wide_type: CoreType = named_type("Int128")
++	dict_type: CoreType = NamedType("Dict", [wide_type, named_type("String")])
++	make_dict: CoreExpr = call("make_dict", [], dict_type)
++	key: CoreExpr = variable("key", wide_type)
++	result: CoreExpr = specialized(call(
++			"blorp_dict_get", [make_dict, key], option_type(named_type("String")),
++		))
++
++	match result:
++		LetExpr(map_binding, False, _, map_value, boxed_lookup):
++			match boxed_lookup:
++				LetExpr(key_binding, False, _, BoxExpr(box, _, _), bound_found):
++					match bound_found:
++						LetExpr(found_binding, False, _, lookup, release_then_found):
++							match (lookup, release_then_found):
++								(CallExpr(BuiltinCall("blorp_dict_get_nullable"), _, [VarExpr(map_ref, _, _), VarExpr(key_ref, _, _)], _, _), SeqExpr(CallExpr(IntrinsicCall("release_hash_key_box"), _, [VarExpr(released_key, _, _)], _, _), VarExpr(found_ref, _, _))):
++									(
++										same_core_expr(map_value, make_dict)
++										and box.kind == Int128Box
++										and box.source_type == wide_type
++										and same_core_expr(box.value, key)
++										and core_var_equal(map_binding, map_ref)
++										and core_var_equal(key_binding, key_ref)
++										and core_var_equal(key_binding, released_key)
++										and core_var_equal(found_binding, found_ref)
++									)
++								_:
++									False
++						_:
++							False
++				_:
++					False
++		_:
++			False
++
++
+ pure func test_nullable_managed_option_runtime_renames() -> Bool:
+ 	getenv: CoreExpr = specialized(
+ 		call(
+@@ -1110,6 +1330,31 @@ tests: TestSuite = {
+ 			"already-specialized dict get boxes primitive key",
+ 			test_already_specialized_dict_get_boxes_primitive_key,
+ 		),
++		("unknown dict get suffix stays unboxed", test_unknown_dict_get_suffix_stays_unboxed),
++		(
++			"dict get suffix requires matching Option payload",
++			test_dict_get_suffix_requires_matching_option_payload,
++		),
++		("typed dict get wrong arity stays unboxed", test_typed_dict_get_wrong_arity_stays_unboxed),
++		("intrinsic dict get name stays unboxed", test_intrinsic_dict_get_name_stays_unboxed),
++		("dict get primitive widths share key boxing", test_dict_get_primitive_widths_share_key_boxing),
++		(
++			"dict get payload and Option aliases keep key boxing",
++			test_dict_get_payload_and_option_aliases_keep_key_boxing,
++		),
++		(
++			"generic dict get preserves boxed and unspecialized payloads",
++			test_generic_dict_get_preserves_boxed_and_unspecialized_payloads,
++		),
++		(
++			"dict get repeated specialization keeps one key box",
++			test_dict_get_repeated_specialization_keeps_one_key_box,
++		),
++		("dict get managed key remains borrowed", test_dict_get_managed_key_remains_borrowed),
++		(
++			"generic dict get evaluates map before fresh key box",
++			test_generic_dict_get_evaluates_map_before_fresh_key_box,
++		),
+ 		("nullable managed Option runtime renames", test_nullable_managed_option_runtime_renames),
+ 		("stream repeat, map, and unfold layouts", test_stream_repeat_map_and_unfold_layouts),
+ 		("stream scalar and managed-state layouts", test_stream_scalar_and_managed_state_layouts),
+diff --git a/blorp/test/test_compiler/test_stage_10_backend/test_core_emit.brp b/blorp/test/test_compiler/test_stage_10_backend/test_core_emit.brp
+index 1985d4735..cba766505 100644
+--- a/blorp/test/test_compiler/test_stage_10_backend/test_core_emit.brp
++++ b/blorp/test/test_compiler/test_stage_10_backend/test_core_emit.brp
+@@ -76,7 +76,7 @@ import:
+ 			StackResultOkConstructorTest,
+ 			UnionTagConstructorTest,
+ 		),
+-		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl),
++		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, InlineRecordDecl, UnionDecl),
+ 		CoreDictConstruct,
+ 		CoreDirectRuntimeArgs(
+ 			DirectRuntimeArgsAppendListParallelLayout,
+@@ -198,6 +198,7 @@ import:
+ 			StringHashContainerConstructor,
+ 		),
+ 		CoreHeapRecordDecl,
++		CoreInlineRecordDecl,
+ 		CoreListAccessBounds(ProvenListAccess),
+ 		CoreListHandoff,
+ 		CoreListHandoffMode(ConsumeReuseHandoff),
+@@ -255,7 +256,7 @@ import:
+ 		CoreTaskClosure,
+ 		CoreTensorBoxedLiteral,
+ 		CoreTensorLiteralPayload(TensorRawLiteralPayload),
+-		CoreTensorDim(TensorStaticDim),
++		CoreTensorDim(TensorRuntimeDim, TensorStaticDim),
+ 		CoreTensorForElementStorage(
+ 			TensorForBoxedElement,
+ 			TensorForRawScalarElement,
+@@ -282,6 +283,7 @@ import:
+ 			EnumType,
+ 			FunctionType,
+ 			HeapRecordType,
++			InlineRecordType,
+ 			NamedType,
+ 			RangeType,
+ 			StackResultType,
+@@ -292,7 +294,7 @@ import:
+ 			VoidType,
+ 		),
+ 		CoreUnaryOp(NegateOp, NotOp),
+-		CoreUnboxKind(FloatUnbox, PointerUnbox, PrimUnbox, StructUnbox),
++		CoreUnboxKind(Float16Unbox, Float32Unbox, FloatUnbox, PointerUnbox, PrimUnbox, StructUnbox),
+ 		CoreUnionDecl,
+ 		CoreUnionField,
+ 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
+@@ -22119,6 +22121,110 @@ pure func ranked_tensor_checked_get_function() -> CoreFunction:
+ 	}
+ 
+ 
++record RankedGetterCase {
++	name: String,
++	dims: List[CoreTensorDim],
++	arguments: List[Int],
++	element_type: CoreType,
++	result_type: CoreType,
++	value_declaration: String,
++	read_expression: String
++}
++
++
++pure func ranked_getter_case(
++	name: String,
++	rank: Int,
++	shaped: Bool,
++	element_type: CoreType,
++	result_type: CoreType,
++	value_declaration: String,
++	read_expression: String,
++) -> RankedGetterCase:
++	dimensions: List[Int] = [2, 3, 4, 5, 6].take(rank)
++	indices: List[Int] = [-1, 1, 0, 1, 0].take(rank)
++	arguments: List[Int] = if shaped:
++		dimensions.concat(indices)
++	else:
++		indices
++	{
++		name = name,
++		dims = dimensions.map(pure func(dimension): TensorStaticDim(dimension)),
++		arguments = arguments,
++		element_type = element_type,
++		result_type = result_type,
++		value_declaration = value_declaration,
++		read_expression = read_expression
++	}
++
++
++pure func ranked_getter_cases() -> List[RankedGetterCase]:
++	erased_value: String = "void* __tgnd_value_tensor_ranked_checked_get = (void*)0;"
++	erased_read: String = "storage_mode == BLORP_VECTOR_STORAGE_INLINE"
++	float_value: String = "double __tgnd_value_tensor_ranked_checked_get = 0.0;"
++	float_read: String = "blorp_vector_read_f64(__tgnd_vec_tensor_ranked_checked_get, __tgnd_flat_tensor_ranked_checked_get)"
++	float32_value: String = "float __tgnd_value_tensor_ranked_checked_get = 0.0f;"
++	float32_read: String = "blorp_vector_read_f32(__tgnd_vec_tensor_ranked_checked_get, __tgnd_flat_tensor_ranked_checked_get)"
++	[
++		ranked_getter_case("blorp_tensor3_checked_get", 3, False, float_type(), raw_pointer_type(), erased_value, erased_read),
++		ranked_getter_case("blorp_tensor3_checked_get_shape", 3, True, float_type(), raw_pointer_type(), erased_value, erased_read),
++		ranked_getter_case("blorp_tensor3_checked_get_shape_f64", 3, True, float_type(), float_type(), float_value, float_read),
++		ranked_getter_case("blorp_tensor3_checked_get_shape_f32", 3, True, float32_type(), float32_type(), float32_value, float32_read),
++		ranked_getter_case("blorp_tensor4_checked_get", 4, False, float_type(), raw_pointer_type(), erased_value, erased_read),
++		ranked_getter_case("blorp_tensor4_checked_get_shape", 4, True, float_type(), raw_pointer_type(), erased_value, erased_read),
++		ranked_getter_case("blorp_tensor4_checked_get_shape_f64", 4, True, float_type(), float_type(), float_value, float_read),
++		ranked_getter_case("blorp_tensor4_checked_get_shape_f32", 4, True, float32_type(), float32_type(), float32_value, float32_read),
++		ranked_getter_case("blorp_tensor5_checked_get", 5, False, float_type(), raw_pointer_type(), erased_value, erased_read),
++		ranked_getter_case("blorp_tensor5_checked_get_shape", 5, True, float_type(), raw_pointer_type(), erased_value, erased_read),
++		ranked_getter_case("blorp_tensor5_checked_get_shape_f64", 5, True, float_type(), float_type(), float_value, float_read),
++		ranked_getter_case("blorp_tensor5_checked_get_shape_f32", 5, True, float32_type(), float32_type(), float32_value, float32_read),
++	]
++
++
++pure func ranked_getter_program(case: RankedGetterCase, statement_receiver: Bool) -> CoreProgram:
++	tensor_type: CoreType = TensorType({ element_type = case.element_type, dims = case.dims })
++	tensor: CoreExpr = VarExpr(named_var("tensor"), tensor_type, synthetic_core_source_loc())
++	receiver: CoreExpr = if statement_receiver:
++		SeqExpr(CooperativeCheckpointExpr(VoidType, synthetic_core_source_loc()), tensor)
++	else:
++		tensor
++	read: CoreExpr = CallExpr(
++		BuiltinCall(case.name),
++		VoidExpr(VoidType, synthetic_core_source_loc()),
++		[receiver].concat(case.arguments.map(pure func(value): int_expr(value))),
++		case.result_type,
++		synthetic_core_source_loc(),
++	)
++	function: CoreFunction = {
++		ranked_tensor_checked_get_function() |
++		name = "ranked_getter_control",
++		params = [{ name = named_var("tensor"), typ = tensor_type, loc = synthetic_core_source_loc() }],
++		return_type = case.result_type,
++		body = Some(read),
++		is_pure = not statement_receiver,
++	}
++	{ decls = [FunctionDecl(function)], foreign_includes = [], source_files = [] }
++
++
++---
++Standalone prepared-emitter controls intentionally bypass late-Core projection:
++valid ranked Builtin calls become DirectRuntimeCall in the full pipeline.
++These exercise the supported emitter entry paths, not production scalar inlining.
++---
++pure func ranked_standalone_c_source(program: CoreProgram) -> String:
++	match try_emit_source_spelled_prepared_c_artifact(prepared_core_program(program), FunctionProfileOff):
++		Ok(artifact): artifact.c_code
++		Err(error): "/* " + core_emit_error_message(error) + " */"
++
++
++pure func ranked_getter_inline_record_decl() -> CoreInlineRecordDecl:
++	{
++		name = "RankedPoint",
++		fields = [{ name = "value", ref = core_field_ref(0), typ = int_type() }],
++		loc = synthetic_core_source_loc()
++	}
++
++
+ pure func stream_fold_statement_unbox_function() -> CoreFunction:
+ 	callback_param: CoreParam = closure_param("combine")
+ 	stream_var: CoreVar = named_var("__borrow_arg_1")
+@@ -26459,6 +26565,211 @@ pure func test_emit_ranked_tensor_checked_get_injects_static_shape() -> Bool:
+ 	)
+ 
+ 
++pure func test_standalone_ranked_getters_preserve_all_abis() -> Bool:
++	var valid: Bool = True
++
++	for case in ranked_getter_cases():
++		c_source: String = ranked_standalone_c_source(ranked_getter_program(case, False))
++		valid = (
++			valid
++			and c_source.contains(case.value_declaration)
++			and c_source.contains(case.read_expression)
++			and c_source.contains("long __tgnd_i" + (case.dims.length() - 1).to_string() + "_tensor_ranked_checked_get = ")
++			and not c_source.contains("#error")
++		)
++
++	valid
++
++
++pure func test_standalone_ranked_getters_sequence_receiver_before_read() -> Bool:
++	var valid: Bool = True
++
++	for case in ranked_getter_cases():
++		c_source: String = ranked_standalone_c_source(ranked_getter_program(case, True))
++		valid = (
++			valid
++			and c_source.contains(case.value_declaration)
++			and c_source.contains(case.read_expression)
++			and c_source.contains("blorp_Vector* __call_arg_0;")
++			and option_int_less_than(
++				c_source.index_of("blorp_Vector* __call_arg_0;"),
++				c_source.index_of("blorp_cooperative_checkpoint();"),
++			)
++			and option_int_less_than(
++				c_source.index_of("blorp_cooperative_checkpoint();"),
++				c_source.index_of("__call_arg_0 = tensor;"),
++			)
++			and not c_source.contains("#error")
++		)
++		var previous_binding: String = "__call_arg_0 = tensor;"
++
++		for (offset, argument) in case.arguments.enumerate():
++			binding: String = "long __call_arg_" + (offset + 1).to_string() + " = " + argument.to_string() + ";"
++			valid = valid and option_int_less_than(c_source.index_of(previous_binding), c_source.index_of(binding))
++			previous_binding = binding
++
++		valid = valid and option_int_less_than(
++			c_source.index_of(previous_binding),
++			c_source.index_of("blorp_Vector* __tgnd_vec_tensor_ranked_checked_get"),
++		)
++
++	valid
++
++
++pure func test_standalone_ranked_getters_reject_incompatible_parts() -> Bool:
++	var valid: Bool = True
++
++	for case in ranked_getter_cases():
++		for incompatible in [
++			{ case | arguments = case.arguments.drop(1) },
++			{ case | arguments = case.arguments.append(0) },
++			{ case | dims = case.dims.drop(1) },
++			{ case | dims = [TensorRuntimeDim("extent")].concat(case.dims.drop(1)) },
++		]:
++			c_source: String = ranked_standalone_c_source(ranked_getter_program(incompatible, False))
++			valid = (
++				valid
++				and c_source.contains("#error \"Blorp backend could not emit function body: ranked_getter_control\"")
++				and not c_source.contains("__tgnd_value_tensor_ranked_checked_get")
++			)
++
++	valid
++
++
++pure func test_standalone_ranked_getter_lookalikes_preserve_emission_rejection() -> Bool:
++	base: RankedGetterCase = ranked_getter_case(
++		"blorp_tensor3_checked_get_shape", 3, True, float_type(), raw_pointer_type(), "", "",
++	)
++	var valid: Bool = True
++
++	for name in [
++		"blorp_tensor3_checked_get_shape_f16",
++		"blorp_tensor3_checked_get_shape_impostor_f64",
++		"blorp_tensor3_checked_get_shape_f64_extra",
++	]:
++		c_source: String = ranked_standalone_c_source(ranked_getter_program({ base | name = name }, False))
++		valid = (
++			valid
++			and c_source.contains("#error \"Blorp backend could not emit function body: ranked_getter_control\"")
++			and not c_source.contains("__tgnd_value_tensor_ranked_checked_get")
++		)
++
++	valid
++
++
++pure func test_pipeline_ranked_getters_preserve_runtime_projection() -> Bool:
++	var valid: Bool = True
++
++	for case in ranked_getter_cases():
++		c_source: String = emit_source_spelled_c_artifact(ranked_getter_program(case, False)).c_code
++		runtime_name: String = match case.name:
++			"blorp_tensor3_checked_get": "blorp_tensor3_checked_get_shape"
++			"blorp_tensor4_checked_get": "blorp_tensor4_checked_get_shape"
++			"blorp_tensor5_checked_get": "blorp_tensor5_checked_get_shape"
++			_: case.name
++		runtime_arguments: List[Int] = if runtime_name != case.name:
++			[2, 3, 4, 5, 6].take(case.dims.length()).concat(case.arguments)
++		else:
++			case.arguments
++		valid = (
++			valid
++			and c_source.contains(runtime_name + "(tensor, " + runtime_arguments.map(pure func(value): value.to_string()).join(", ") + ")")
++			and not c_source.contains("__tgnd_value_tensor_ranked_checked_get")
++			and not c_source.contains("#error")
++		)
++
++	valid
++
++
++pure func test_standalone_ranked_unboxes_follow_explicit_scalar_kind() -> Bool:
++	var valid: Bool = True
++
++	for rank in [3, 4, 5]:
++		for shaped in [False, True]:
++			shape_suffix: String = if shaped:
++				"_shape"
++			else:
++				""
++			name: String = "blorp_tensor" + rank.to_string() + "_checked_get" + shape_suffix
++			case: RankedGetterCase = ranked_getter_case(name, rank, shaped, float_type(), raw_pointer_type(), "", "")
++			for (kind, result_type, value_declaration, read_helper) in [
++				(FloatUnbox, float_type(), "double __tgnd_value_tensor_ranked_checked_get = 0.0;", "blorp_vector_read_f64"),
++				(Float32Unbox, float32_type(), "float __tgnd_value_tensor_ranked_checked_get = 0.0f;", "blorp_vector_read_f32"),
++				(Float16Unbox, float16_type(), "_Float16 __tgnd_value_tensor_ranked_checked_get = (_Float16)0.0;", "blorp_vector_read_f16"),
++			]:
++				program: CoreProgram = ranked_getter_program({ case | element_type = result_type }, False)
++				match program.decls:
++					[FunctionDecl(function)]:
++						match function.body:
++							Some(read):
++								unboxed: CoreFunction = {
++									function |
++									return_type = result_type,
++									body = Some(UnboxExpr(kind, read, result_type, synthetic_core_source_loc())),
++								}
++								c_source: String = ranked_standalone_c_source({ program | decls = [FunctionDecl(unboxed)] })
++								valid = (
++									valid
++									and c_source.contains(value_declaration)
++									and c_source.contains(read_helper + "(__tgnd_vec_tensor_ranked_checked_get, __tgnd_flat_tensor_ranked_checked_get)")
++									and not c_source.contains("#error")
++								)
++							_:
++								valid = False
++					_:
++						valid = False
++
++	valid
++
++
++pure func test_pipeline_ranked_struct_unbox_uses_validated_parts() -> Bool:
++	var valid: Bool = True
++
++	for rank in [3, 4, 5]:
++		for shaped in [False, True]:
++			shape_suffix: String = if shaped:
++				"_shape"
++			else:
++				""
++			name: String = "blorp_tensor" + rank.to_string() + "_checked_get" + shape_suffix
++			point_type: CoreType = InlineRecordType("RankedPoint")
++			case: RankedGetterCase = ranked_getter_case(name, rank, shaped, point_type, raw_pointer_type(), "", "")
++			program: CoreProgram = ranked_getter_program(case, False)
++			match program.decls:
++				[FunctionDecl(function)]:
++					match function.body:
++						Some(read):
++							unboxed: CoreFunction = {
++								function |
++								return_type = point_type,
++								body = Some(UnboxExpr(StructUnbox("RankedPoint"), read, point_type, synthetic_core_source_loc())),
++							}
++							c_source: String = emit_source_spelled_c_artifact({
++								program | decls = [InlineRecordDecl(ranked_getter_inline_record_decl()), FunctionDecl(unboxed)]
++							}).c_code
++							if shaped:
++								valid = (
++									valid
++									and c_source.contains("__tgnd_value_tensor_ranked_checked_get = {0};")
++									and c_source.contains("memcpy(&__tgnd_value_tensor_ranked_checked_get")
++									and c_source.contains("storage_mode == BLORP_VECTOR_STORAGE_INLINE")
++								)
++							else:
++								-- Existing specialization wraps the plain call in a pointer cast.
++								valid = (
++									valid
++									and c_source.contains("blorp_unbox_struct(((void*)" + name + "_shape(")
++									and not c_source.contains("__tgnd_value_tensor_ranked_checked_get")
++								)
++							valid = valid and not c_source.contains("#error")
++						_:
++							valid = False
++				_:
++					valid = False
++
++	valid
++
++
+ pure func test_emit_unbox_statement_shaped_stream_fold() -> Bool:
+ 	program: CoreProgram = {
+ 		decls = [FunctionDecl(stream_fold_statement_unbox_function())],
+@@ -29806,6 +30117,13 @@ tests: TestSuite = {
+ 			"emit ranked tensor checked get injects static shape",
+ 			test_emit_ranked_tensor_checked_get_injects_static_shape,
+ 		),
++		("standalone ranked getters preserve all ABIs", test_standalone_ranked_getters_preserve_all_abis),
++		("standalone ranked getters sequence receiver before read", test_standalone_ranked_getters_sequence_receiver_before_read),
++		("standalone ranked getters reject incompatible parts", test_standalone_ranked_getters_reject_incompatible_parts),
++		("standalone ranked getter lookalikes preserve emission rejection", test_standalone_ranked_getter_lookalikes_preserve_emission_rejection),
++		("pipeline ranked getters preserve runtime projection", test_pipeline_ranked_getters_preserve_runtime_projection),
++		("standalone ranked unboxes follow explicit scalar kind", test_standalone_ranked_unboxes_follow_explicit_scalar_kind),
++		("pipeline ranked struct unbox uses validated parts", test_pipeline_ranked_struct_unbox_uses_validated_parts),
+ 		("emit unbox statement-shaped stream fold", test_emit_unbox_statement_shaped_stream_fold),
+ 		("emit tensor packed fill", test_emit_tensor_packed_fill),
+ 		("emit tensor packed matrix checked set", test_emit_tensor_packed_matrix_checked_set),
+diff --git a/scripts/check-magic-spellings.allowlist b/scripts/check-magic-spellings.allowlist
+index 0191cab22..1a0e23adf 100644
+--- a/scripts/check-magic-spellings.allowlist
++++ b/scripts/check-magic-spellings.allowlist
+@@ -200,7 +200,6 @@ compiler/stage_09_core/resolve.brp	reader	stdlib_type_name_literal	type_module_p
+ compiler/stage_09_core/resolve.brp	reader	stdlib_type_name_literal	type_module_paths	"ParallelVector"	1	"ParallelVector":
+ compiler/stage_09_core/result_layout.brp	reader	stdlib_type_name_literal	immediate_result_payload_name	"Port"	1	or name == "Port"
+ compiler/stage_09_core/specialize_collection.brp	producer	marker_concatenation	stack_option_c_type	"blorp_StackOption_"	2	Some("blorp_StackOption_" + name)
+-compiler/stage_09_core/specialize_collection.brp	reader	starts_with	first_erased_argument_builtin	"blorp_dict_get"	1	or name.starts_with("blorp_dict_get")
+ compiler/stage_09_core/specialize_collection.brp	reader	stdlib_type_name_literal	list_element_type	"ParallelList"	1	if (name == "List" or name == "ParallelList") and args.length() == 1:
+ compiler/stage_09_core/specialize_layout.brp	producer	marker_concatenation	stack_option_box_c_type	"blorp_StackOption_${name}"	2	Some("blorp_StackOption_${name}")
+ compiler/stage_09_core/specialize_tensor_dispatch.brp	producer	marker_concatenation	tensor_to_string_runtime_name	"blorp_vector_to_string_"	1	Some("blorp_vector_to_string_" + name)

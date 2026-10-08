@@ -5,7 +5,7 @@ import:
 		CoreUnionValueStorage(ScalarTagValue, ManagedUnionValue),
 		CoreAccessor(RootAccessor),
 		CoreBinaryOp(GreaterEqualOp, LessOp, NotEqualOp),
-		CoreCallKind(BuiltinCall, DirectRuntimeCall, IntrinsicCall),
+		CoreCallKind(BuiltinCall, DirectRuntimeCall, IntrinsicCall, UserCall),
 		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
 		CoreConstructorMatchFallback(ConstructorMatchFallbackBody),
 		CoreConstructorMatchTest(BoxedResultOkConstructorTest, StackResultOkConstructorTest),
@@ -35,7 +35,18 @@ import:
 		synthetic_core_source_loc,
 		CoreTensorDim(TensorStaticDim),
 		CoreTensorTypeInfo,
-		CoreType(BoxedResultType, HeapRecordType, NamedType, RangeType, StackResultType, TensorType, TupleType, VoidType),
+		CoreType(
+			BoxedResultType,
+			HeapRecordType,
+			InlineRecordType,
+			NamedType,
+			RangeType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			VoidType,
+			UnionType,
+		),
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
 		core_expr_to_json,
@@ -299,6 +310,20 @@ pure func test_specialization_recurses_through_semantic_match_leaf() -> Bool:
 
 
 private pure func tensor_get_or_match(return_type: CoreType, default: CoreExpr) -> CoreExpr:
+	tensor_get_or_match_for_getter(
+		BuiltinCall("blorp_vector_get_opt"),
+		NamedType("Option", [return_type]),
+		return_type,
+		default,
+	)
+
+
+private pure func tensor_get_or_match_for_getter(
+	get_kind: CoreCallKind,
+	option_type: CoreType,
+	return_type: CoreType,
+	default: CoreExpr,
+) -> CoreExpr:
 	payload: CoreVar = core_var("payload")
 	array_type: CoreType = TensorType({
 		element_type = return_type,
@@ -306,13 +331,12 @@ private pure func tensor_get_or_match(return_type: CoreType, default: CoreExpr) 
 	})
 
 	SemanticMatchExpr(
-		builtin_call_args(
-			"blorp_vector_get_opt",
+		CallExpr(
+			get_kind,
+			VoidExpr(VoidType, synthetic_core_source_loc()),
 			[variable("values", array_type), variable("index", named_type("Int"))],
-			NamedType(
-				"Option",
-				[return_type],
-			),
+			option_type,
+			synthetic_core_source_loc(),
 		),
 		SemanticConstructorMatch(
 			RootSemanticMatchAccessor,
@@ -395,6 +419,92 @@ pure func test_scalar_tensor_get_or_uses_bounded_direct_storage_read() -> Bool:
 					False
 		_:
 			False
+
+
+private pure func get_or_body_is_preserved(get_kind: CoreCallKind, payload: CoreType) -> Bool:
+	body: CoreExpr = tensor_get_or_match_for_getter(
+		get_kind,
+		NamedType("Option", [payload]),
+		payload,
+		variable("default", payload),
+	)
+
+	match specialized_body(body):
+		Some(actual):
+			core_expr_to_json(actual).to_string() == core_expr_to_json(body).to_string()
+		None:
+			False
+
+
+pure func test_tensor_get_or_preserves_unsupported_getter_suffixes() -> Bool:
+	(
+		get_or_body_is_preserved(BuiltinCall("blorp_vector_get_opt_int_extra"), named_type("Int"))
+		and get_or_body_is_preserved(BuiltinCall("blorp_vector_get_opt_unknown"), named_type("Int"))
+	)
+
+
+pure func test_tensor_get_or_preserves_incompatible_getter_payloads() -> Bool:
+	(
+		get_or_body_is_preserved(BuiltinCall("blorp_vector_get_opt_f32"), named_type("Int"))
+		and get_or_body_is_preserved(BuiltinCall("blorp_vector_get_opt_int"), named_type("Float32"))
+		and get_or_body_is_preserved(BuiltinCall("blorp_vector_get_opt_int"), RangeType)
+		and get_or_body_is_preserved(BuiltinCall("blorp_vector_get_opt_int"), UnionType("Color", ScalarTagValue))
+	)
+
+
+pure func test_tensor_get_or_preserves_nullable_and_nonbuiltin_calls() -> Bool:
+	(
+		get_or_body_is_preserved(BuiltinCall("blorp_vector_get_nullable"), HeapRecordType("Point"))
+		and get_or_body_is_preserved(BuiltinCall("blorp_vector_get_opt_int"), HeapRecordType("Point"))
+		and get_or_body_is_preserved(UserCall("blorp_vector_get_opt_int", Some(42), []), named_type("Int"))
+	)
+
+
+pure func test_tensor_get_or_rewrites_supported_scalar_getters() -> Bool:
+	var rewrites: Bool = True
+
+	for (getter, payload, read_name) in [
+		("blorp_vector_get_opt_int", named_type("Int"), "tensor_get_i64"),
+		("blorp_vector_get_opt_int8", named_type("Int8"), "tensor_get_i64"),
+		("blorp_vector_get_opt_int16", named_type("Int16"), "tensor_get_i64"),
+		("blorp_vector_get_opt_int32", named_type("Int32"), "tensor_get_i64"),
+		("blorp_vector_get_opt_int64", named_type("Int64"), "tensor_get_i64"),
+		("blorp_vector_get_opt_uint8", named_type("UInt8"), "tensor_get_i64"),
+		("blorp_vector_get_opt_uint16", named_type("UInt16"), "tensor_get_i64"),
+		("blorp_vector_get_opt_uint32", named_type("UInt32"), "tensor_get_i64"),
+		("blorp_vector_get_opt_uint64", named_type("UInt64"), "tensor_get_i64"),
+		("blorp_vector_get_opt_float", named_type("Float"), "tensor_get_f64"),
+		("blorp_vector_get_opt_f32", named_type("Float32"), "tensor_get_f32"),
+		("blorp_vector_get_opt_f16", named_type("Float16"), "tensor_get_f16"),
+		("blorp_vector_get_opt_bool", named_type("Bool"), "tensor_get_i64"),
+		("blorp_vector_get_opt_char", named_type("Char"), "tensor_get_i64"),
+	]:
+		body: CoreExpr = tensor_get_or_match_for_getter(
+			BuiltinCall(getter), NamedType("Option", [payload]), payload, variable("default", payload),
+		)
+
+		match specialized_body(body):
+			Some(IfExpr(LogicalExpr(AndOp, _, _, _, _), CallExpr(IntrinsicCall(actual), _, _, _, _), _, _, _)):
+				rewrites = rewrites and actual == read_name
+			_:
+				rewrites = False
+
+	rewrites
+
+
+pure func test_tensor_get_or_preserves_generic_enum_and_inline_record_fallbacks() -> Bool:
+	var rewrites: Bool = True
+
+	for (payload, read_name) in [(UnionType("Color", ScalarTagValue), "tensor_get_i64"), (InlineRecordType("Point"), "tensor_get_unchecked")]:
+		body: CoreExpr = tensor_get_or_match(payload, variable("default", payload))
+
+		match specialized_body(body):
+			Some(IfExpr(LogicalExpr(AndOp, _, _, _, _), CallExpr(IntrinsicCall(actual), _, _, _, _), _, _, _)):
+				rewrites = rewrites and actual == read_name
+			_:
+				rewrites = False
+
+	rewrites
 
 
 pure func test_managed_tensor_get_or_preserves_nullable_payload_match() -> Bool:
@@ -649,6 +759,11 @@ tests: TestSuite = {
 			"managed tensor get_or preserves nullable payload match",
 			test_managed_tensor_get_or_preserves_nullable_payload_match,
 		),
+		("tensor get_or preserves unsupported getter suffixes", test_tensor_get_or_preserves_unsupported_getter_suffixes),
+		("tensor get_or preserves incompatible getter payloads", test_tensor_get_or_preserves_incompatible_getter_payloads),
+		("tensor get_or preserves nullable and nonbuiltin calls", test_tensor_get_or_preserves_nullable_and_nonbuiltin_calls),
+		("tensor get_or rewrites supported scalar getters", test_tensor_get_or_rewrites_supported_scalar_getters),
+		("tensor get_or preserves generic enum and inline-record fallbacks", test_tensor_get_or_preserves_generic_enum_and_inline_record_fallbacks),
 		(
 			"program specialization boxes Dict[Int] keys",
 			test_program_specialization_boxes_dict_int_key,

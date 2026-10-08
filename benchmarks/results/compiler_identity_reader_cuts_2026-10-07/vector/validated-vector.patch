@@ -1,0 +1,244 @@
+diff --git a/blorp/src/compiler/stage_09_core/specialize.brp b/blorp/src/compiler/stage_09_core/specialize.brp
+index 16b43e7e7..c5065b3a1 100644
+--- a/blorp/src/compiler/stage_09_core/specialize.brp
++++ b/blorp/src/compiler/stage_09_core/specialize.brp
+@@ -44,7 +44,13 @@ import:
+ 		core_var_equal,
+ 		synthetic_core_source_loc,
+ 	specialize_collection: specialize_collection_expr
+-	specialize_layout: CoreSpecializeLayout, build_specialize_layout, resolve_specialize_type
++	specialize_layout:
++		CoreOptionRuntimeLayout(PrimitiveStackOptionLayout),
++		CoreSpecializeLayout,
++		build_specialize_layout,
++		option_runtime_builtin,
++		option_runtime_layout,
++		resolve_specialize_type,
+ 	specialize_tensor_dispatch: specialize_tensor_dispatch_expr
+ 	specialize_value: specialize_value_expr
+ 	tensor_specialize as CoreTensorSpecialize
+@@ -654,16 +660,23 @@ private pure func direct_tensor_get_or_read(
+ private pure func rewrite_tensor_get_or_call(
+ 	layout: CoreSpecializeLayout,
+ 	get_name: String,
++	option_type: CoreType,
+ 	array: CoreExpr,
+ 	index: CoreExpr,
+ 	tree: CoreSemanticMatchTree,
+ 	return_type: CoreType,
+ 	loc: CoreSourceLoc,
+ ) -> Option[CoreExpr]:
+-	is_vector_get_option: Bool = (
+-		get_name == "blorp_vector_get_opt"
+-		or get_name.starts_with("blorp_vector_get_opt_")
+-	)
++	is_vector_get_option: Bool = if get_name == "blorp_vector_get_opt":
++		True
++	else:
++		match option_runtime_layout(layout, option_type):
++			Some(PrimitiveStackOptionLayout(_)):
++				option_runtime_builtin(
++					layout, option_type, "blorp_vector_get_opt", "blorp_vector_get_nullable", None,
++				) == Some(get_name)
++			_:
++				False
+ 
+ 	if (
+ 		not is_vector_get_option
+@@ -703,7 +716,7 @@ private pure func rewrite_tensor_get_or_scrutinee(
+ 	loc: CoreSourceLoc,
+ ) -> Option[CoreExpr]:
+ 	match scrutinee:
+-		CallExpr(call_kind, _, args, _, _):
++		CallExpr(call_kind, _, args, option_type, _):
+ 			if args.length() != 2:
+ 				None
+ 			else:
+@@ -714,6 +727,7 @@ private pure func rewrite_tensor_get_or_scrutinee(
+ 						rewrite_tensor_get_or_call(
+ 							layout,
+ 							get_name,
++							option_type,
+ 							array,
+ 							index,
+ 							tree,
+diff --git a/blorp/test/test_compiler/test_stage_09_core/test_core_specialize.brp b/blorp/test/test_compiler/test_stage_09_core/test_core_specialize.brp
+index 51ac327c6..fa589969d 100644
+--- a/blorp/test/test_compiler/test_stage_09_core/test_core_specialize.brp
++++ b/blorp/test/test_compiler/test_stage_09_core/test_core_specialize.brp
+@@ -4,7 +4,7 @@ import:
+ 	../../../src/compiler/stage_09_core/ir:
+ 		CoreAccessor(RootAccessor),
+ 		CoreBinaryOp(GreaterEqualOp, LessOp, NotEqualOp),
+-		CoreCallKind(BuiltinCall, DirectRuntimeCall, IntrinsicCall),
++		CoreCallKind(BuiltinCall, DirectRuntimeCall, IntrinsicCall, UserCall),
+ 		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
+ 		CoreConstructorMatchFallback(ConstructorMatchFallbackBody),
+ 		CoreConstructorMatchTest(BoxedResultOkConstructorTest, StackResultOkConstructorTest),
+@@ -37,7 +37,9 @@ import:
+ 		CoreTensorTypeInfo,
+ 		CoreType(
+ 			BoxedResultType,
++			EnumType,
+ 			HeapRecordType,
++			InlineRecordType,
+ 			NamedType,
+ 			RangeType,
+ 			StackResultType,
+@@ -308,6 +310,20 @@ pure func test_specialization_recurses_through_semantic_match_leaf() -> Bool:
+ 
+ 
+ private pure func tensor_get_or_match(return_type: CoreType, default: CoreExpr) -> CoreExpr:
++	tensor_get_or_match_for_getter(
++		BuiltinCall("blorp_vector_get_opt"),
++		NamedType("Option", [return_type]),
++		return_type,
++		default,
++	)
++
++
++private pure func tensor_get_or_match_for_getter(
++	get_kind: CoreCallKind,
++	option_type: CoreType,
++	return_type: CoreType,
++	default: CoreExpr,
++) -> CoreExpr:
+ 	payload: CoreVar = core_var("payload")
+ 	array_type: CoreType = TensorType({
+ 		element_type = return_type,
+@@ -315,13 +331,12 @@ private pure func tensor_get_or_match(return_type: CoreType, default: CoreExpr)
+ 	})
+ 
+ 	SemanticMatchExpr(
+-		builtin_call_args(
+-			"blorp_vector_get_opt",
++		CallExpr(
++			get_kind,
++			VoidExpr(VoidType, synthetic_core_source_loc()),
+ 			[variable("values", array_type), variable("index", named_type("Int"))],
+-			NamedType(
+-				"Option",
+-				[return_type],
+-			),
++			option_type,
++			synthetic_core_source_loc(),
+ 		),
+ 		SemanticConstructorMatch(
+ 			RootSemanticMatchAccessor,
+@@ -406,6 +421,92 @@ pure func test_scalar_tensor_get_or_uses_bounded_direct_storage_read() -> Bool:
+ 			False
+ 
+ 
++private pure func get_or_body_is_preserved(get_kind: CoreCallKind, payload: CoreType) -> Bool:
++	body: CoreExpr = tensor_get_or_match_for_getter(
++		get_kind,
++		NamedType("Option", [payload]),
++		payload,
++		variable("default", payload),
++	)
++
++	match specialized_body(body):
++		Some(actual):
++			core_expr_to_json(actual).to_string() == core_expr_to_json(body).to_string()
++		None:
++			False
++
++
++pure func test_tensor_get_or_preserves_unsupported_getter_suffixes() -> Bool:
++	(
++		get_or_body_is_preserved(BuiltinCall("blorp_vector_get_opt_int_extra"), named_type("Int"))
++		and get_or_body_is_preserved(BuiltinCall("blorp_vector_get_opt_unknown"), named_type("Int"))
++	)
++
++
++pure func test_tensor_get_or_preserves_incompatible_getter_payloads() -> Bool:
++	(
++		get_or_body_is_preserved(BuiltinCall("blorp_vector_get_opt_f32"), named_type("Int"))
++		and get_or_body_is_preserved(BuiltinCall("blorp_vector_get_opt_int"), named_type("Float32"))
++		and get_or_body_is_preserved(BuiltinCall("blorp_vector_get_opt_int"), RangeType)
++		and get_or_body_is_preserved(BuiltinCall("blorp_vector_get_opt_int"), EnumType("Color"))
++	)
++
++
++pure func test_tensor_get_or_preserves_nullable_and_nonbuiltin_calls() -> Bool:
++	(
++		get_or_body_is_preserved(BuiltinCall("blorp_vector_get_nullable"), HeapRecordType("Point"))
++		and get_or_body_is_preserved(BuiltinCall("blorp_vector_get_opt_int"), HeapRecordType("Point"))
++		and get_or_body_is_preserved(UserCall("blorp_vector_get_opt_int", Some(42), []), named_type("Int"))
++	)
++
++
++pure func test_tensor_get_or_rewrites_supported_scalar_getters() -> Bool:
++	var rewrites: Bool = True
++
++	for (getter, payload, read_name) in [
++		("blorp_vector_get_opt_int", named_type("Int"), "tensor_get_i64"),
++		("blorp_vector_get_opt_int8", named_type("Int8"), "tensor_get_i64"),
++		("blorp_vector_get_opt_int16", named_type("Int16"), "tensor_get_i64"),
++		("blorp_vector_get_opt_int32", named_type("Int32"), "tensor_get_i64"),
++		("blorp_vector_get_opt_int64", named_type("Int64"), "tensor_get_i64"),
++		("blorp_vector_get_opt_uint8", named_type("UInt8"), "tensor_get_i64"),
++		("blorp_vector_get_opt_uint16", named_type("UInt16"), "tensor_get_i64"),
++		("blorp_vector_get_opt_uint32", named_type("UInt32"), "tensor_get_i64"),
++		("blorp_vector_get_opt_uint64", named_type("UInt64"), "tensor_get_i64"),
++		("blorp_vector_get_opt_float", named_type("Float"), "tensor_get_f64"),
++		("blorp_vector_get_opt_f32", named_type("Float32"), "tensor_get_f32"),
++		("blorp_vector_get_opt_f16", named_type("Float16"), "tensor_get_f16"),
++		("blorp_vector_get_opt_bool", named_type("Bool"), "tensor_get_i64"),
++		("blorp_vector_get_opt_char", named_type("Char"), "tensor_get_i64"),
++	]:
++		body: CoreExpr = tensor_get_or_match_for_getter(
++			BuiltinCall(getter), NamedType("Option", [payload]), payload, variable("default", payload),
++		)
++
++		match specialized_body(body):
++			Some(IfExpr(LogicalExpr(AndOp, _, _, _, _), CallExpr(IntrinsicCall(actual), _, _, _, _), _, _, _)):
++				rewrites = rewrites and actual == read_name
++			_:
++				rewrites = False
++
++	rewrites
++
++
++pure func test_tensor_get_or_preserves_generic_enum_and_inline_record_fallbacks() -> Bool:
++	var rewrites: Bool = True
++
++	for (payload, read_name) in [(EnumType("Color"), "tensor_get_i64"), (InlineRecordType("Point"), "tensor_get_unchecked")]:
++		body: CoreExpr = tensor_get_or_match(payload, variable("default", payload))
++
++		match specialized_body(body):
++			Some(IfExpr(LogicalExpr(AndOp, _, _, _, _), CallExpr(IntrinsicCall(actual), _, _, _, _), _, _, _)):
++				rewrites = rewrites and actual == read_name
++			_:
++				rewrites = False
++
++	rewrites
++
++
+ pure func test_managed_tensor_get_or_preserves_nullable_payload_match() -> Bool:
+ 	point_type: CoreType = HeapRecordType("Point")
+ 	point_default: CoreExpr = variable("default_point", point_type)
+@@ -658,6 +759,11 @@ tests: TestSuite = {
+ 			"managed tensor get_or preserves nullable payload match",
+ 			test_managed_tensor_get_or_preserves_nullable_payload_match,
+ 		),
++		("tensor get_or preserves unsupported getter suffixes", test_tensor_get_or_preserves_unsupported_getter_suffixes),
++		("tensor get_or preserves incompatible getter payloads", test_tensor_get_or_preserves_incompatible_getter_payloads),
++		("tensor get_or preserves nullable and nonbuiltin calls", test_tensor_get_or_preserves_nullable_and_nonbuiltin_calls),
++		("tensor get_or rewrites supported scalar getters", test_tensor_get_or_rewrites_supported_scalar_getters),
++		("tensor get_or preserves generic enum and inline-record fallbacks", test_tensor_get_or_preserves_generic_enum_and_inline_record_fallbacks),
+ 		(
+ 			"program specialization boxes Dict[Int] keys",
+ 			test_program_specialization_boxes_dict_int_key,
+diff --git a/scripts/check-magic-spellings.allowlist b/scripts/check-magic-spellings.allowlist
+index 5a036eaf4..e2d11ccb3 100644
+--- a/scripts/check-magic-spellings.allowlist
++++ b/scripts/check-magic-spellings.allowlist
+@@ -201,7 +201,6 @@ compiler/stage_09_core/resolve.brp	reader	stdlib_type_name_literal	type_module_p
+ compiler/stage_09_core/resolve.brp	reader	stdlib_type_name_literal	type_module_paths	"ParallelMatrix"	1	"ParallelMatrix":
+ compiler/stage_09_core/resolve.brp	reader	stdlib_type_name_literal	type_module_paths	"ParallelVector"	1	"ParallelVector":
+ compiler/stage_09_core/result_layout.brp	reader	stdlib_type_name_literal	immediate_result_payload_name	"Port"	1	or name == "Port"
+-compiler/stage_09_core/specialize.brp	reader	starts_with	rewrite_tensor_get_or_call	"blorp_vector_get_opt_"	1	or get_name.starts_with("blorp_vector_get_opt_")
+ compiler/stage_09_core/specialize_collection.brp	producer	marker_concatenation	stack_option_c_type	"blorp_StackOption_"	2	Some("blorp_StackOption_" + name)
+ compiler/stage_09_core/specialize_collection.brp	reader	starts_with	first_erased_argument_builtin	"blorp_dict_get"	1	or name.starts_with("blorp_dict_get")
+ compiler/stage_09_core/specialize_collection.brp	reader	stdlib_type_name_literal	list_element_type	"ParallelList"	1	if (name == "List" or name == "ParallelList") and args.length() == 1:

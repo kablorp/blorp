@@ -1,0 +1,211 @@
+diff --git a/blorp/test/test_compiler/test_stage_06_typecheck/test_type_system/test_dim_solver.brp b/blorp/test/test_compiler/test_stage_06_typecheck/test_type_system/test_dim_solver.brp
+index ee97ed65c..f61caa4d3 100644
+--- a/blorp/test/test_compiler/test_stage_06_typecheck/test_type_system/test_dim_solver.brp
++++ b/blorp/test/test_compiler/test_stage_06_typecheck/test_type_system/test_dim_solver.brp
+@@ -12,7 +12,7 @@ import:
+ 			SemanticNamedType,
+ 			SemanticTypeVar,
+ 		),
+-		SemanticTypeVarKind(SemanticDimensionParameter),
++		SemanticTypeVarKind(SemanticDimensionParameter, SemanticTypeParameter),
+ 		type_to_string,
+ 		types_equal,
+ 	test: TestSuite
+@@ -273,11 +273,12 @@ func test_opaque_division_equivalent_after_operand_normalization() -> Bool:
+ 
+ func test_opaque_type_distinguishes_type_var_display_spelling() -> Bool:
+ 	context = test_meta_context()
+-	left = dim_add(
+-		dim_const(1),
+-		SemanticNamedType("Foo", []),
+-	)
+-	right = dim_add(dim_const(1), dim_var("Foo"))
++	-- Squared factors make this an equality check: neither side is isolatable.
++	-- A single dimension factor can legitimately bind to the opaque type.
++	opaque_type = SemanticNamedType("Foo", [])
++	dimension = dim_var("Foo")
++	left = dim_add(dim_const(1), dim_mul(opaque_type, opaque_type))
++	right = dim_add(dim_const(1), dim_mul(dimension, dimension))
+ 
+ 	match test_dim_solve(context, [], left, right):
+ 		DimStuck:
+@@ -476,6 +477,150 @@ func test_named_binding_choice_is_independent_of_opaque_term_order() -> Bool:
+ 	forward_choice and reverse_choice
+ 
+ 
++func test_dimension_kind_solves_without_sigil() -> Bool:
++	context = test_meta_context()
++
++	match test_dim_solve(context, [], dim_add(dim_var("Rows"), dim_const(1)), dim_const(5)):
++		DimBindVar(name, value):
++			name == "Rows" and types_equal(value, dim_const(4))
++		_:
++			False
++
++
++func test_ordinary_kind_does_not_solve_from_sigil() -> Bool:
++	context = test_meta_context()
++	ordinary = SemanticTypeVar("#Rows", SemanticTypeParameter)
++
++	match test_dim_solve(context, [], dim_add(ordinary, dim_const(1)), dim_const(5)):
++		DimStuck:
++			True
++		_:
++			False
++
++
++func test_same_spelling_kinds_bind_without_cancelling() -> Bool:
++	context = test_meta_context()
++	var preserved = True
++
++	for name in ["Parameter", "#Parameter"]:
++		ordinary = SemanticTypeVar(name, SemanticTypeParameter)
++		bound: Bool = match test_dim_solve(
++			context,
++			[],
++			dim_add(dim_var(name), dim_const(1)),
++			dim_add(ordinary, dim_const(1)),
++		):
++			DimBindVar(bound_name, value):
++				bound_name == name and types_equal(value, ordinary)
++			_:
++				False
++		preserved = preserved and bound
++
++	preserved
++
++
++func test_meta_binding_preserves_no_sigil_dimension_kind() -> Bool:
++	context = test_meta_context()
++	dimension = dim_var("Rows")
++	expected = dim_add(dim_const(5), dim_mul(dim_const(-1), dimension))
++
++	match test_dim_solve(
++		context,
++		[],
++		dim_add(test_meta(context, 1), dimension),
++		dim_const(5),
++	):
++		DimBindMeta(_, meta_id, value):
++			meta_id == 1 and types_equal(value, expected)
++		_:
++			False
++
++
++func test_meta_binding_preserves_sigil_looking_ordinary_kind() -> Bool:
++	context = test_meta_context()
++	ordinary = SemanticTypeVar("#Element", SemanticTypeParameter)
++	expected = dim_add(dim_const(5), dim_mul(dim_const(-1), ordinary))
++
++	match test_dim_solve(
++		context,
++		[],
++		dim_add(test_meta(context, 1), ordinary),
++		dim_const(5),
++	):
++		DimBindMeta(_, meta_id, value):
++			meta_id == 1 and types_equal(value, expected)
++		_:
++			False
++
++
++func test_named_isolation_keeps_ordinary_remainder() -> Bool:
++	context = test_meta_context()
++	ordinary = SemanticTypeVar("#Element", SemanticTypeParameter)
++	expected = dim_add(dim_const(7), dim_mul(dim_const(-1), ordinary))
++
++	match test_dim_solve(
++		context,
++		[],
++		dim_add(dim_var("Rows"), ordinary),
++		dim_const(7),
++	):
++		DimBindVar(name, value):
++			name == "Rows" and types_equal(value, expected)
++		_:
++			False
++
++
++func test_mixed_candidates_prefer_meta_and_preserve_kinds() -> Bool:
++	context = test_meta_context()
++	dimension = dim_var("Rows")
++	ordinary = SemanticTypeVar("#Element", SemanticTypeParameter)
++	expected = dim_add(
++		dim_add(dim_const(7), dim_mul(dim_const(-1), dimension)),
++		dim_mul(dim_const(-1), ordinary),
++	)
++
++	match test_dim_solve(
++		context,
++		[],
++		dim_add(test_meta(context, 2), dim_add(dimension, ordinary)),
++		dim_const(7),
++	):
++		DimBindMeta(_, meta_id, value):
++			meta_id == 2 and types_equal(value, expected)
++		_:
++			False
++
++
++func test_opaque_ordinary_factors_commute_and_keep_multiplicity() -> Bool:
++	context = test_meta_context()
++	first = SemanticTypeVar("#Element", SemanticTypeParameter)
++	second = SemanticTypeVar("Item", SemanticTypeParameter)
++
++	commuted: Bool = match test_dim_solve(
++		context,
++		[],
++		dim_mul(first, second),
++		dim_mul(second, first),
++	):
++		DimSolved:
++			True
++		_:
++			False
++
++	multiplicity: Bool = match test_dim_solve(
++		context,
++		[],
++		dim_mul(first, first),
++		dim_mul(first, second),
++	):
++		DimStuck:
++			True
++		_:
++			False
++
++	commuted and multiplicity
++
++
+ tests: TestSuite = {
+ 	description = "Compiler dimension solver",
+ 	tests = [
+@@ -530,5 +675,28 @@ tests: TestSuite = {
+ 			"named binding choice is independent of opaque term order",
+ 			test_named_binding_choice_is_independent_of_opaque_term_order,
+ 		),
++		("dimension kind solves without sigil", test_dimension_kind_solves_without_sigil),
++		("ordinary kind does not solve from sigil", test_ordinary_kind_does_not_solve_from_sigil),
++		(
++			"same spelling kinds bind without cancelling",
++			test_same_spelling_kinds_bind_without_cancelling,
++		),
++		(
++			"meta binding preserves no-sigil dimension kind",
++			test_meta_binding_preserves_no_sigil_dimension_kind,
++		),
++		(
++			"meta binding preserves sigil-looking ordinary kind",
++			test_meta_binding_preserves_sigil_looking_ordinary_kind,
++		),
++		("named isolation keeps ordinary remainder", test_named_isolation_keeps_ordinary_remainder),
++		(
++			"mixed candidates prefer meta and preserve kinds",
++			test_mixed_candidates_prefer_meta_and_preserve_kinds,
++		),
++		(
++			"opaque ordinary factors commute and keep multiplicity",
++			test_opaque_ordinary_factors_commute_and_keep_multiplicity,
++		),
+ 	]
+ }

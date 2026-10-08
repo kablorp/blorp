@@ -1,0 +1,94 @@
+--- compare_resources.before.py
++++ compare_resources.py
+@@ -28,6 +28,8 @@
+ BUSY = re.compile(r'(?:^|\s)(?:\S*/)?(?:scripts/(?:test|compiler-check|compiler-fixpoint|premerge-gate)|benchmarks/(?:self_compile_measure|build_stage2_compiler)|blorp(?:-stage2|-stage2-diagnostic)?|clang(?:-\d+)?|make)(?:\s|$)')
+ COMMANDS = []
+ PAIR_PROVENANCE_SHA = None
++CONSTRUCTION_PINS = {}
++CONSTRUCTION_MANIFEST_SHA = None
+ MEASUREMENT_PINS = {}
+ MEASUREMENT_MANIFEST_SHA = None
+ 
+@@ -217,7 +219,61 @@
+         for item in pairs.values():
+             if sha(item['path']) != item['sha256']:
+                 raise SystemExit('Candidate paired compiler changed.')
++    verify_construction_pins()
+     verify_measurement_pins()
++
++
++def pin_candidate_construction(setup_text):
++    global CONSTRUCTION_PINS, CONSTRUCTION_MANIFEST_SHA
++    if CONSTRUCTION_PINS:
++        raise SystemExit('Candidate construction must not be recaptured.')
++    log = OUT / 'candidate-stage2-setup.log'
++    raw = log.read_bytes()
++    if raw.decode() != setup_text:
++        raise SystemExit('Setup log changed before construction validation.')
++
++    def value(label):
++        matches = re.findall('^' + re.escape(label) + r'\s*:\s*(.+)$', setup_text, re.MULTILINE)
++        if len(matches) != 1:
++            raise SystemExit('Setup log lacks one exact artifact field: ' + label)
++        return matches[0].strip()
++
++    pins = {'setup_log': {'path': str(log.resolve()), 'sha256': hashlib.sha256(raw).hexdigest()}}
++    artifacts = [
++        ('generated_c', OUT / 'candidate-main.c', 'stage2 generated C sha256', 'stage2 generated C'),
++        ('body_object', OUT / 'candidate-main.o', 'stage2 body sha256', None),
++        ('normal_binary', OUT / 'blorp-stage2', 'stage2 binary sha256', 'stage2 binary'),
++        ('diagnostic_binary', OUT / 'blorp-stage2-diagnostic', 'stage2 diagnostic sha256', 'stage2 diagnostic binary'),
++    ]
++    for mode in ['0', '1']:
++        artifacts.append(('runtime_object_' + mode, Path(value('stage2 runtime object diagnostics=' + mode)),
++                          'stage2 runtime sha256 diagnostics=' + mode, None))
++    for name, path, hash_label, path_label in artifacts:
++        expected = value(hash_label)
++        if not re.fullmatch(r'[0-9a-f]{64}', expected):
++            raise SystemExit('Setup log artifact hash is invalid: ' + hash_label)
++        if path_label and Path(value(path_label)).resolve() != path.resolve():
++            raise SystemExit('Setup log artifact path differs from expected output: ' + name)
++        if sha(path) != expected:
++            raise SystemExit('Produced artifact differs from setup-log authority: ' + name)
++        pins[name] = {'path': str(path.resolve()), 'sha256': expected}
++    # Protect the validation-to-pin interval for every artifact, including the log.
++    for item in pins.values():
++        if sha(item['path']) != item['sha256']:
++            raise SystemExit('Construction artifact changed before immediate pinning.')
++    CONSTRUCTION_PINS = pins
++    write_json(OUT / 'construction-pins.json', pins)
++    CONSTRUCTION_MANIFEST_SHA = sha(OUT / 'construction-pins.json')
++
++
++def verify_construction_pins():
++    if not CONSTRUCTION_PINS:
++        return
++    if sha(OUT / 'construction-pins.json') != CONSTRUCTION_MANIFEST_SHA:
++        raise SystemExit('Candidate construction pin manifest changed.')
++    for name, item in CONSTRUCTION_PINS.items():
++        if sha(item['path']) != item['sha256']:
++            raise SystemExit('Candidate construction artifact changed: ' + name)
+ 
+ 
+ def verify_measurement_pins():
+@@ -355,9 +411,11 @@
+     generator = OUT / 'captured-candidate-stage1'; shutil.copy2(ROOT / 'bin/blorp', generator)
+     if sha(generator) != config['candidate_state']['generator_sha256']:
+         raise SystemExit('Copied candidate generator differs from reviewed generator.')
+-    run('candidate-stage2-setup', ['benchmarks/build_stage2_compiler', '--generator', str(generator),
++    setup_text = run('candidate-stage2-setup', ['benchmarks/build_stage2_compiler', '--generator', str(generator),
+         '--generated-c', str(OUT / 'candidate-main.c'), '--diagnostic-output', str(OUT / 'blorp-stage2-diagnostic'),
+         str(OUT / 'blorp-stage2')], config, config_sha, proof)
++    pin_candidate_construction(setup_text)
++    verify_state(config, config_sha, proof)
+     pairs = {}
+     for mode, name in [('normal', 'blorp-stage2'), ('diagnostic', 'blorp-stage2-diagnostic')]:
+         path = (OUT / name).resolve()
+@@ -401,6 +459,7 @@
+         'configuration_sha256': config_sha, 'controller_sha256': config['controller_sha256'],
+         'source_frozen': True, 'baseline_live_freshness_required': False, 'baseline_sealed_pins_rechecked': True,
+         'candidate_stage1_fresh_before_after': True, 'native_processes_finished': True,
++        'candidate_construction_pins': CONSTRUCTION_PINS,
+         'all_four_raw_records_and_saved_c_revalidated': True, 'measurement_output_pins': MEASUREMENT_PINS,
+         'limits': 'Self/small enabling scope only; background activity logged, no quiet/wall-time/speed claim.',
+         'file_pins': {str(p.relative_to(OUT)): sha(p) for p in sorted(OUT.rglob('*')) if p.is_file()}})

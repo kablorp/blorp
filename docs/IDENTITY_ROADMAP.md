@@ -340,10 +340,19 @@ identical-C measurement, plus the allowlist delta the step names.
   recognizes a function by `ModuleId` plus `NameId` and only
   `known_functions.brp` changes. Also deletes
   `ModuleOrigin` beside the `ModuleId` in `SourceModule` once a table handle exists.
-- **Builtin prefix tests as registry rows.** `blorp_filter_map_parallel*`,
-  `blorp_vector_get_opt_*` and `blorp_dict_get*` prefix tests in
-  `backend_projection.brp`, `specialize.brp` and `specialize_collection.brp`
-  become `BuiltinFamily` rows of the builtin registry (4 allowlist lines remain).
+- **Builtin family admission from authoritative facts.** Parallel filter-map projection now
+  reuses specialization's exact supported-operation predicate instead of its
+  two prefix tests; unknown suffixes remain unsupported. The vector option-get
+  reader now retains the call's Option result type and admits suffixed getters
+  through the same exact layout selector as their producer, preserving the
+  generic getter. Dictionary getter admission now shares the exact alias-aware
+  Option selector between producer and pre-specialized fallback, then carries
+  a private immutable erased-slot policy through all six boxing callers. Unknown
+  suffixes, incompatible result layouts and wrong arities remain unboxed while
+  existing nullable-key boxing is preserved. Its correctness, C-identity and
+  matched self/small resource gates pass within the enabling scope; the prefix
+  reader and its one obsolete allowlist row are retired. The broader builtin
+  registry migration remains open.
 - **Every call site reaches `resolve` with its callee's definition id.** Lowering
   gives each call site a def id; this retires `dce.brp`'s `function_ids_by_name`
   (before `resolve` runs, a function-typed `UnknownCall` callee names its target
@@ -414,7 +423,15 @@ Remaining:
   `synth_list.brp`, `match_projection.brp`, `emit.brp`.
 - Packed-enum `to_string` becomes a `CoreCallKind` case carrying the enum type; the
   `_f64`/`_f32` width becomes a field of the checked-get call.
-- **Dimension sigil.** Route `mono.brp`'s dimension handling through the kind, then
+- **Dimension sigil.** Semantic variable equality now compares the existing
+  `SemanticTypeVarKind` as well as the name; same-spelling type and dimension
+  variables are distinct. The dimension solver also admits only explicit
+  dimension parameters into its private named-factor channel; ordinary type
+  variables retain their full semantic kind through the existing opaque-factor
+  path. Reconstruction uses that admission rather than re-reading the sigil.
+  Equality and solver cuts do not add kinds to Core or type-parameter-list
+  carriers; those migrations and name-based binding identity remain open.
+  Route `mono.brp`'s dimension handling through the kind, then
   delete `type_parameter_name_kind`'s sigil read once `List[String]` type-parameter
   lists carry kinds.
 - **Tuple field access** parsed as `NamedField(NameId) | TupleIndex(Int)` by the
@@ -1324,6 +1341,48 @@ symbol as completed work.
 
 ## Order and parallelism
 
+- Prefer complete consumer cuts that reuse existing authoritative facts before
+  widening carriers or changing an IR schema. Semantic variable equality,
+  exact parallel filter-map admission and the vector option-get reader are the
+  first such cuts. All three are integrated with independent review and combined
+  correctness and resource gates passed within the measured scope.
+  Validate and review each slice independently, then integrate in dependency
+  order. Broader vector formatter, parameter-kind carrier and nominal-identity
+  preparation remain separate work.
+- The dictionary getter reader retirement preserves the existing pre-specialized
+  nullable-key boxing contract through a private slot policy and the exact shared
+  Option selector. Producer and fallback are both covered without a second
+  runtime-name registry; generic return conditions and fresh-key ownership remain
+  unchanged. Independent review, native correctness/C gates and matched stage2
+  self/small resource comparison pass within the unchanged 0.5% ceilings.
+  Broader registry/carrier/authority/architecture work remains separate; preexisting
+  Void selector/runtime reachability is still unverified. Evidence is recorded in
+  [the dictionary getter results](../benchmarks/results/compiler_dictionary_getter_admission_2026-10-07.md);
+  the earlier three accepted cuts remain in
+  [the first reader-cut results](../benchmarks/results/compiler_identity_reader_cuts_2026-10-07.md).
+- The emitter-local ranked tensor getter ABI descriptor is complete within its
+  tested scope. One exact twelve-name private admission supplies immutable rank,
+  argument-convention and representation facts; validated parts retain only the
+  representation needed by emission. Two scalar-width suffix readers and their
+  allowlist rows are retired. Preparation and final gates pass with unchanged
+  production-oracle C. Matched stage2 self/small allocations are unchanged and
+  minimum instructions increase 0.081059602% / 0.049190453%, within both existing
+  0.5% ceilings. Standalone Builtin scalar controls and production runtime/struct
+  paths are qualified separately in
+  [the ranked getter results](../benchmarks/results/compiler_ranked_tensor_getter_abi_2026-10-07.md).
+  The [earlier proposal](../benchmarks/results/compiler_dictionary_getter_admission_2026-10-07/review/NEXT_CUT.md)
+  remains historical. Vector formatting still needs authoritative enum facts
+  across phases; broader registry/carrier/authority work remains open.
+- The dimension solver's kind-preserving consumer cut is complete. Three
+  spelling-derived admission/reconstruction calls are retired without a public
+  carrier or second registry. Seven fail-before regressions now pass; the owning
+  suite, surrounding types/leak stage and broad compiler gates pass. Matched
+  stage2 self/small allocations are unchanged; minimum instructions increase
+  0.080790% / 0.081524%, within the unchanged 0.5% ceilings, with identical C.
+  The scanner misses these older accessor names, so this is a manual three-call
+  retirement, not an allowlist-count reduction. Parameter-list/Core kinds,
+  substitution identity, scanner coverage and wider storage/formatter carriers
+  remain separate. See [dimension solver results](../benchmarks/results/compiler_dimension_kind_preservation_2026-10-07.md).
 - Reconcile the census before using it as a green ratchet; run the explicit checks
   until the enforcement delivery lands. The identity relation, source/generated
   issuer mapping, paired-frontier API and carrier probes come first; the

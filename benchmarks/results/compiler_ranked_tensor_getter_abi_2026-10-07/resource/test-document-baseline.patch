@@ -1,0 +1,368 @@
+diff --git a/blorp/test/test_compiler/test_stage_09_core/test_core_specialize_collection.brp b/blorp/test/test_compiler/test_stage_09_core/test_core_specialize_collection.brp
+index 48c83b726..f2c623ed2 100644
+--- a/blorp/test/test_compiler/test_stage_09_core/test_core_specialize_collection.brp
++++ b/blorp/test/test_compiler/test_stage_09_core/test_core_specialize_collection.brp
+@@ -1,6 +1,6 @@
+ import:
+ 	../../../src/compiler/stage_09_core/ir:
+-		CoreBoxKind(FloatBox, PointerBox, PrimBox, StructBox),
++		CoreBoxKind(FloatBox, Int128Box, PointerBox, PrimBox, StructBox),
+ 		CoreCallKind(BuiltinCall, IntrinsicCall),
+ 		CoreDecl(EnumDecl, HeapRecordDecl, TypeAliasDecl),
+ 		CoreExpr(
+@@ -8,9 +8,11 @@ import:
+ 			CallExpr,
+ 			CastExpr,
+ 			ConstructorMatchExpr,
++			LetExpr,
+ 			ListAllocExpr,
+ 			ListConstructExpr,
+ 			LiteralExpr,
++			SeqExpr,
+ 			UnboxExpr,
+ 			VarExpr,
+ 			VoidExpr,
+@@ -36,6 +38,7 @@ import:
+ 		CoreBinderOrigin(AuthoredBinder),
+ 		CoreVar,
+ 		core_expr_to_json,
++		core_var_equal,
+ 	../../../src/compiler/stage_09_core/specialize_collection: specialize_collection_expr
+ 	../../../src/compiler/stage_09_core/specialize_layout:
+ 		CoreSpecializeLayout,
+@@ -119,6 +122,22 @@ private pure func collection_program() -> CoreProgram:
+ 				is_opaque = False,
+ 				loc = synthetic_core_source_loc(),
+ 			}),
++			TypeAliasDecl({
++				abi_type = None,
++				name = "Number",
++				type_params = [],
++				target = named_type("Int"),
++				is_opaque = False,
++				loc = synthetic_core_source_loc(),
++			}),
++			TypeAliasDecl({
++				abi_type = None,
++				name = "MaybeName",
++				type_params = [],
++				target = option_type(named_type("Name")),
++				is_opaque = False,
++				loc = synthetic_core_source_loc(),
++			}),
+ 			TypeAliasDecl({
+ 				abi_type = None,
+ 				name = "Shade",
+@@ -250,6 +269,30 @@ private pure func dict_get_boxes_key(expr: CoreExpr) -> Bool:
+ 			False
+ 
+ 
++private pure func same_core_expr(left: CoreExpr, right: CoreExpr) -> Bool:
++	core_expr_to_json(left).to_string() == core_expr_to_json(right).to_string()
++
++
++private pure func int_key_dict_get(name: String, payload: CoreType) -> CoreExpr:
++	call(
++		name,
++		[variable("dict", NamedType("Dict", [named_type("Int"), payload])), int_literal(1)],
++		option_type(payload),
++	)
++
++
++private pure func dict_get_has_one_int_key_box(expr: CoreExpr) -> Bool:
++	match expr:
++		CallExpr(_, _, [VarExpr(_, _, _), BoxExpr(box, NamedType("Ptr", []), _)], _, _):
++			(
++				box.kind == PrimBox
++				and box.source_type == named_type("Int")
++				and is_int_literal(box.value, 1)
++			)
++		_:
++			False
++
++
+ private pure func unfold_has_layouts(expr: CoreExpr, element: Int, state: Int) -> Bool:
+ 	match expr:
+ 		CallExpr(BuiltinCall("blorp_stream_unfold"), _, [BoxExpr(_, NamedType("Ptr", []), _), _, element_layout, state_layout], _, _):
+@@ -729,6 +772,183 @@ pure func test_already_specialized_dict_get_boxes_primitive_key() -> Bool:
+ 	call_name(dict_get) == Some("blorp_dict_get_nullable") and dict_get_boxes_key(dict_get)
+ 
+ 
++pure func test_unknown_dict_get_suffix_stays_unboxed() -> Bool:
++	var unchanged: Bool = True
++
++	for name in ["blorp_dict_get_future", "blorp_dict_get_int_extra", "blorp_dict_getter"]:
++		original: CoreExpr = int_key_dict_get(name, named_type("Int"))
++		unchanged = unchanged and same_core_expr(specialized(original), original)
++
++	unchanged
++
++
++pure func test_dict_get_suffix_requires_matching_option_payload() -> Bool:
++	primitive: CoreExpr = int_key_dict_get("blorp_dict_get_int", named_type("String"))
++	nullable: CoreExpr = int_key_dict_get("blorp_dict_get_nullable", named_type("Int"))
++	not_option: CoreExpr = call(
++		"blorp_dict_get_int",
++		[variable("dict", NamedType("Dict", [named_type("Int"), named_type("Int")])), int_literal(1)],
++		named_type("Int"),
++	)
++
++	(
++		same_core_expr(specialized(primitive), primitive)
++		and same_core_expr(specialized(nullable), nullable)
++		and same_core_expr(specialized(not_option), not_option)
++	)
++
++
++pure func test_typed_dict_get_wrong_arity_stays_unboxed() -> Bool:
++	dict_value: CoreExpr = variable(
++		"dict", NamedType("Dict", [named_type("Int"), named_type("String")]),
++	)
++	one_argument: CoreExpr = call(
++		"blorp_dict_get_nullable", [dict_value], option_type(named_type("String")),
++	)
++	three_arguments: CoreExpr = call(
++		"blorp_dict_get_nullable", [dict_value, int_literal(1), int_literal(2)],
++		option_type(named_type("String")),
++	)
++
++	(
++		same_core_expr(specialized(one_argument), one_argument)
++		and same_core_expr(specialized(three_arguments), three_arguments)
++	)
++
++
++pure func test_intrinsic_dict_get_name_stays_unboxed() -> Bool:
++	original: CoreExpr = intrinsic(
++		"blorp_dict_get_nullable",
++		[variable("dict", NamedType("Dict", [named_type("Int"), named_type("String")])), int_literal(1)],
++		option_type(named_type("String")),
++	)
++
++	same_core_expr(specialized(original), original)
++
++
++pure func test_dict_get_primitive_widths_share_key_boxing() -> Bool:
++	-- This table is the native getter ABI, not another production selector.
++	cases: List[(String, String)] = [
++		("Int", "int"), ("Int8", "int8"), ("Int16", "int16"), ("Int32", "int32"),
++		("Int64", "int64"), ("UInt8", "uint8"), ("UInt16", "uint16"),
++		("UInt32", "uint32"), ("UInt64", "uint64"), ("Float", "float"),
++		("Float32", "f32"), ("Float16", "f16"), ("Bool", "bool"), ("Char", "char")
++	]
++	var boxed: Bool = True
++
++	for (payload_name, suffix) in cases:
++		payload: CoreType = named_type(payload_name)
++		runtime_name: String = "blorp_dict_get_" + suffix
++		generic: CoreExpr = specialized(int_key_dict_get("blorp_dict_get", payload))
++		typed: CoreExpr = specialized(int_key_dict_get(runtime_name, payload))
++		boxed = (
++			boxed
++			and call_name(generic) == Some(runtime_name)
++			and call_name(typed) == Some(runtime_name)
++			and dict_get_has_one_int_key_box(generic)
++			and dict_get_has_one_int_key_box(typed)
++		)
++
++	boxed
++
++
++pure func test_dict_get_payload_and_option_aliases_keep_key_boxing() -> Bool:
++	primitive: CoreExpr = specialized(int_key_dict_get("blorp_dict_get_int", named_type("Number")))
++	managed: CoreExpr = specialized(int_key_dict_get("blorp_dict_get_nullable", named_type("Name")))
++	option_alias: CoreExpr = specialized(call(
++			"blorp_dict_get_nullable",
++			[variable("dict", NamedType("Dict", [named_type("Int"), named_type("Name")])), int_literal(1)],
++			named_type("MaybeName"),
++		))
++
++	(
++		call_name(primitive) == Some("blorp_dict_get_int")
++		and call_name(managed) == Some("blorp_dict_get_nullable")
++		and call_name(option_alias) == Some("blorp_dict_get_nullable")
++		and dict_get_has_one_int_key_box(primitive)
++		and dict_get_has_one_int_key_box(managed)
++		and dict_get_has_one_int_key_box(option_alias)
++	)
++
++
++pure func test_generic_dict_get_preserves_boxed_and_unspecialized_payloads() -> Bool:
++	var preserved: Bool = True
++
++	for payload in [option_type(named_type("Int")), named_type("Ptr")]:
++		result: CoreExpr = specialized(int_key_dict_get("blorp_dict_get", payload))
++		preserved = (
++			preserved
++			and call_name(result) == Some("blorp_dict_get")
++			and dict_get_has_one_int_key_box(result)
++		)
++
++	for payload in [named_type("Color"), RangeType, named_type("Int128"), named_type("UInt128")]:
++		original: CoreExpr = int_key_dict_get("blorp_dict_get", payload)
++		preserved = preserved and same_core_expr(specialized(original), original)
++
++	preserved
++
++
++pure func test_dict_get_repeated_specialization_keeps_one_key_box() -> Bool:
++	var unchanged: Bool = True
++
++	for (name, payload) in [("blorp_dict_get_int", named_type("Int")), ("blorp_dict_get_nullable", named_type("String"))]:
++		once: CoreExpr = specialized(int_key_dict_get(name, payload))
++		twice: CoreExpr = specialized(once)
++		unchanged = (
++			unchanged and dict_get_has_one_int_key_box(twice) and same_core_expr(twice, once)
++		)
++
++	unchanged
++
++
++pure func test_dict_get_managed_key_remains_borrowed() -> Bool:
++	original: CoreExpr = call(
++		"blorp_dict_get_int",
++		[variable("dict", NamedType("Dict", [named_type("String"), named_type("Int")])), variable("key", named_type("String"))],
++		option_type(named_type("Int")),
++	)
++
++	same_core_expr(specialized(original), original)
++
++
++pure func test_generic_dict_get_evaluates_map_before_fresh_key_box() -> Bool:
++	wide_type: CoreType = named_type("Int128")
++	dict_type: CoreType = NamedType("Dict", [wide_type, named_type("String")])
++	make_dict: CoreExpr = call("make_dict", [], dict_type)
++	key: CoreExpr = variable("key", wide_type)
++	result: CoreExpr = specialized(call(
++			"blorp_dict_get", [make_dict, key], option_type(named_type("String")),
++		))
++
++	match result:
++		LetExpr(map_binding, False, _, map_value, boxed_lookup):
++			match boxed_lookup:
++				LetExpr(key_binding, False, _, BoxExpr(box, _, _), bound_found):
++					match bound_found:
++						LetExpr(found_binding, False, _, lookup, release_then_found):
++							match (lookup, release_then_found):
++								(CallExpr(BuiltinCall("blorp_dict_get_nullable"), _, [VarExpr(map_ref, _, _), VarExpr(key_ref, _, _)], _, _), SeqExpr(CallExpr(IntrinsicCall("release_hash_key_box"), _, [VarExpr(released_key, _, _)], _, _), VarExpr(found_ref, _, _))):
++									(
++										same_core_expr(map_value, make_dict)
++										and box.kind == Int128Box
++										and box.source_type == wide_type
++										and same_core_expr(box.value, key)
++										and core_var_equal(map_binding, map_ref)
++										and core_var_equal(key_binding, key_ref)
++										and core_var_equal(key_binding, released_key)
++										and core_var_equal(found_binding, found_ref)
++									)
++								_:
++									False
++						_:
++							False
++				_:
++					False
++		_:
++			False
++
++
+ pure func test_nullable_managed_option_runtime_renames() -> Bool:
+ 	getenv: CoreExpr = specialized(
+ 		call(
+@@ -1110,6 +1330,31 @@ tests: TestSuite = {
+ 			"already-specialized dict get boxes primitive key",
+ 			test_already_specialized_dict_get_boxes_primitive_key,
+ 		),
++		("unknown dict get suffix stays unboxed", test_unknown_dict_get_suffix_stays_unboxed),
++		(
++			"dict get suffix requires matching Option payload",
++			test_dict_get_suffix_requires_matching_option_payload,
++		),
++		("typed dict get wrong arity stays unboxed", test_typed_dict_get_wrong_arity_stays_unboxed),
++		("intrinsic dict get name stays unboxed", test_intrinsic_dict_get_name_stays_unboxed),
++		("dict get primitive widths share key boxing", test_dict_get_primitive_widths_share_key_boxing),
++		(
++			"dict get payload and Option aliases keep key boxing",
++			test_dict_get_payload_and_option_aliases_keep_key_boxing,
++		),
++		(
++			"generic dict get preserves boxed and unspecialized payloads",
++			test_generic_dict_get_preserves_boxed_and_unspecialized_payloads,
++		),
++		(
++			"dict get repeated specialization keeps one key box",
++			test_dict_get_repeated_specialization_keeps_one_key_box,
++		),
++		("dict get managed key remains borrowed", test_dict_get_managed_key_remains_borrowed),
++		(
++			"generic dict get evaluates map before fresh key box",
++			test_generic_dict_get_evaluates_map_before_fresh_key_box,
++		),
+ 		("nullable managed Option runtime renames", test_nullable_managed_option_runtime_renames),
+ 		("stream repeat, map, and unfold layouts", test_stream_repeat_map_and_unfold_layouts),
+ 		("stream scalar and managed-state layouts", test_stream_scalar_and_managed_state_layouts),
+diff --git a/docs/IDENTITY_ROADMAP.md b/docs/IDENTITY_ROADMAP.md
+index f2f1d9ab6..b0ab5ff8b 100644
+--- a/docs/IDENTITY_ROADMAP.md
++++ b/docs/IDENTITY_ROADMAP.md
+@@ -345,10 +345,14 @@ identical-C measurement, plus the allowlist delta the step names.
+   two prefix tests; unknown suffixes remain unsupported. The vector option-get
+   reader now retains the call's Option result type and admits suffixed getters
+   through the same exact layout selector as their producer, preserving the
+-  generic getter. The remaining `blorp_dict_get*` prefix test in
+-  `specialize_collection.brp` needs authoritative admission shared with its
+-  producer and pre-specialized fallback (1 allowlist line remains). This does
+-  not complete the broader builtin-registry migration.
++  generic getter. Dictionary getter admission now shares the exact alias-aware
++  Option selector between producer and pre-specialized fallback, then carries
++  a private immutable erased-slot policy through all six boxing callers. Unknown
++  suffixes, incompatible result layouts and wrong arities remain unboxed while
++  existing nullable-key boxing is preserved. Its correctness, C-identity and
++  matched self/small resource gates pass within the enabling scope; the prefix
++  reader and its one obsolete allowlist row are retired. The broader builtin
++  registry migration remains open.
+ - **Every call site reaches `resolve` with its callee's definition id.** Lowering
+   gives each call site a def id; this retires `dce.brp`'s `function_ids_by_name`
+   (before `resolve` runs, a function-typed `UnknownCall` callee names its target
+@@ -1340,13 +1344,23 @@ symbol as completed work.
+   Validate and review each slice independently, then integrate in dependency
+   order. Broader vector formatter, parameter-kind carrier and nominal-identity
+   preparation remain separate work.
+-- The dictionary getter prefix is not another producer-only deletion: the
+-  pre-specialized nullable getter in `test_core_specialize_collection.brp`
+-  requires its key to be boxed through the general fallback. Its retirement
+-  needs authoritative operation admission shared with the producer and fallback.
+-  Keep that contract while choosing the next cut. Current acceptance evidence is
+-  recorded in
++- The dictionary getter reader retirement preserves the existing pre-specialized
++  nullable-key boxing contract through a private slot policy and the exact shared
++  Option selector. Producer and fallback are both covered without a second
++  runtime-name registry; generic return conditions and fresh-key ownership remain
++  unchanged. Independent review, native correctness/C gates and matched stage2
++  self/small resource comparison pass within the unchanged 0.5% ceilings.
++  Broader registry/carrier/authority/architecture work remains separate; preexisting
++  Void selector/runtime reachability is still unverified. Evidence is recorded in
++  [the dictionary getter results](../benchmarks/results/compiler_dictionary_getter_admission_2026-10-07.md);
++  the earlier three accepted cuts remain in
+   [the first reader-cut results](../benchmarks/results/compiler_identity_reader_cuts_2026-10-07.md).
++- The next bounded preparation is an emitter-local ranked tensor getter ABI
++  descriptor, consolidating existing exact admission tables before retiring
++  the two scalar-width suffix readers. The
++  [unimplemented handoff](../benchmarks/results/compiler_dictionary_getter_admission_2026-10-07/review/NEXT_CUT.md)
++  records unchanged-output controls, ownership/fallback invariants and gates.
++  Vector formatting still needs authoritative enum facts across phases.
+ - Reconcile the census before using it as a green ratchet; run the explicit checks
+   until the enforcement delivery lands. The identity relation, source/generated
+   issuer mapping, paired-frontier API and carrier probes come first; the
+diff --git a/docs/README.md b/docs/README.md
+index c38eab5a9..23eb0ec92 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -72,6 +72,8 @@ for matched measurements; do not copy a profile into the work index.
+ - [Discovery Acceptance](DISCOVERY_ACCEPTANCE_ROADMAP.md): parser differences
+   and retiring legacy consumers. [Discovery Redesign](DISCOVERY_REDESIGN.md)
+   separately proposes typed syntax trees; that path is not implemented.
++- [Module Resolution](MODULE_RESOLUTION_DESIGN.md): proposed immutable binding
++  boundary, existing-stage integration constraints and staged extraction.
+ - [Product Unification](PRODUCT_UNIFICATION.md): one Core product model for
+   records and tuples, scalar replacement across calls, multi-values and typed
+   tuple boxes.

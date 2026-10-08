@@ -1,0 +1,169 @@
+diff --git a/blorp/src/compiler/stage_09_core/specialize_collection.brp b/blorp/src/compiler/stage_09_core/specialize_collection.brp
+index 50db5c1cc..e5c0603c0 100644
+--- a/blorp/src/compiler/stage_09_core/specialize_collection.brp
++++ b/blorp/src/compiler/stage_09_core/specialize_collection.brp
+@@ -84,6 +84,12 @@ private FIRST_ERASED_ARGUMENT_INDEX: Int = 1
+ private SECOND_ERASED_ARGUMENT_INDEX: Int = 2
+ 
+ 
++private enum CollectionErasedSlots:
++	NoErasedSlots
++	FirstErasedSlot
++	FirstAndSecondErasedSlots
++
++
+ private pure func variable(name: String, typ: CoreType, loc: CoreSourceLoc) -> CoreExpr:
+ 	VarExpr(core_var(name), typ, loc)
+ 
+@@ -469,22 +475,32 @@ private pure func first_erased_argument_builtin(name: String) -> Bool:
+ 		or name == "blorp_fold_parallel_ordered_with"
+ 		or name == "blorp_stream_fold"
+ 		or name == "blorp_fallible_stream_fold_raw"
+-		or name.starts_with("blorp_dict_get")
+ 	)
+ 
+ 
+-private pure func collection_has_erased_arguments(name: String) -> Bool:
+-	first_erased_argument_builtin(name) or name == "blorp_dict_insert"
+-
+-
+-private pure func collection_argument_is_erased(name: String, index: Int) -> Bool:
+-	(
+-		first_erased_argument_builtin(name) and index == FIRST_ERASED_ARGUMENT_INDEX
+-		or (
+-			name == "blorp_dict_insert"
+-			and (index == FIRST_ERASED_ARGUMENT_INDEX or index == SECOND_ERASED_ARGUMENT_INDEX)
+-		)
+-	)
++private pure func collection_erased_slots(
++	layout: CoreSpecializeLayout,
++	name: String,
++	args: List[CoreExpr],
++	result_type: CoreType,
++) -> CollectionErasedSlots:
++	if name == "blorp_dict_insert":
++		FirstAndSecondErasedSlots
++	else if first_erased_argument_builtin(name):
++		FirstErasedSlot
++	else:
++		-- Typed getters must agree with the producer's Option selector. The
++		-- two-argument runtime ABI gates this check; arity alone admits nothing.
++		match args:
++			[_, _]:
++				if option_runtime_name(
++					layout, result_type, "blorp_dict_get", Some("blorp_dict_get"),
++				) == Some(name):
++					FirstErasedSlot
++				else:
++					NoErasedSlots
++			_:
++				NoErasedSlots
+ 
+ 
+ private pure func explicit_box(expr: CoreExpr) -> Bool:
+@@ -523,19 +539,27 @@ private pure func box_void_slot_argument(
+ 
+ private pure func box_collection_void_slots(
+ 	layout: CoreSpecializeLayout,
+-	name: String,
++	slots: CollectionErasedSlots,
+ 	args: List[CoreExpr],
+ 	loc: CoreSourceLoc,
+ ) -> List[CoreExpr]:
+-	if not collection_has_erased_arguments(name):
++	if slots == NoErasedSlots:
+ 		args
+ 	else:
+ 		var result: List[CoreExpr] = []
+ 		var index: Int = 0
+ 
+ 		for arg in args:
++			erased: Bool = match slots:
++				NoErasedSlots:
++					False
++				FirstErasedSlot:
++					index == FIRST_ERASED_ARGUMENT_INDEX
++				FirstAndSecondErasedSlots:
++					index == FIRST_ERASED_ARGUMENT_INDEX or index == SECOND_ERASED_ARGUMENT_INDEX
++
+ 			result = result.append(
+-				if collection_argument_is_erased(name, index):
++				if erased:
+ 					box_void_slot_argument(layout, arg, loc)
+ 				else:
+ 					arg
+@@ -991,7 +1015,7 @@ private pure func specialize_dict_get(
+ 				builtin_call_with_callee(
+ 					call_name,
+ 					callee,
+-					box_collection_void_slots(layout, call_name, args, loc),
++					box_collection_void_slots(layout, FirstErasedSlot, args, loc),
+ 					result_type,
+ 					loc,
+ 				)
+@@ -1125,7 +1149,7 @@ private pure func specialize_collection_call(
+ 			callee,
+ 			box_collection_void_slots(
+ 				layout,
+-				name,
++				FirstErasedSlot,
+ 				[set_expr, args.get_or(1, void_expr(loc))],
+ 				loc,
+ 			),
+@@ -1146,7 +1170,7 @@ private pure func specialize_collection_call(
+ 			callee,
+ 			box_collection_void_slots(
+ 				layout,
+-				name,
++				FirstAndSecondErasedSlots,
+ 				[dict_expr, key, value],
+ 				loc,
+ 			),
+@@ -1281,7 +1305,7 @@ private pure func specialize_collection_call(
+ 			None:
+ 				VoidType
+ 
+-		boxed_args: List[CoreExpr] = box_collection_void_slots(layout, name, args, loc)
++		boxed_args: List[CoreExpr] = box_collection_void_slots(layout, FirstErasedSlot, args, loc)
+ 		raw: CoreExpr = append_release_flag(
+ 			name,
+ 			callee,
+@@ -1310,7 +1334,7 @@ private pure func specialize_collection_call(
+ 		append_release_flag(
+ 			name,
+ 			callee,
+-			box_collection_void_slots(layout, name, args, loc),
++			box_collection_void_slots(layout, FirstErasedSlot, args, loc),
+ 			result_type,
+ 			boxed_storage_slot_needs_release(layout, init_type),
+ 			loc,
+@@ -1322,12 +1346,14 @@ private pure func specialize_collection_call(
+ 			None:
+ 				original
+ 	else:
+-		boxed_args: List[CoreExpr] = box_collection_void_slots(layout, name, args, loc)
++		slots: CollectionErasedSlots = collection_erased_slots(layout, name, args, result_type)
+ 
+-		if not collection_has_erased_arguments(name):
++		if slots == NoErasedSlots:
+ 			original
+ 		else:
+-			builtin_call_with_callee(name, callee, boxed_args, result_type, loc)
++			builtin_call_with_callee(
++				name, callee, box_collection_void_slots(layout, slots, args, loc), result_type, loc,
++			)
+ 
+ 
+ pure func specialize_collection_expr(layout: CoreSpecializeLayout, expr: CoreExpr) -> CoreExpr:
+diff --git a/scripts/check-magic-spellings.allowlist b/scripts/check-magic-spellings.allowlist
+index 0191cab22..1a0e23adf 100644
+--- a/scripts/check-magic-spellings.allowlist
++++ b/scripts/check-magic-spellings.allowlist
+@@ -200,7 +200,6 @@ compiler/stage_09_core/resolve.brp	reader	stdlib_type_name_literal	type_module_p
+ compiler/stage_09_core/resolve.brp	reader	stdlib_type_name_literal	type_module_paths	"ParallelVector"	1	"ParallelVector":
+ compiler/stage_09_core/result_layout.brp	reader	stdlib_type_name_literal	immediate_result_payload_name	"Port"	1	or name == "Port"
+ compiler/stage_09_core/specialize_collection.brp	producer	marker_concatenation	stack_option_c_type	"blorp_StackOption_"	2	Some("blorp_StackOption_" + name)
+-compiler/stage_09_core/specialize_collection.brp	reader	starts_with	first_erased_argument_builtin	"blorp_dict_get"	1	or name.starts_with("blorp_dict_get")
+ compiler/stage_09_core/specialize_collection.brp	reader	stdlib_type_name_literal	list_element_type	"ParallelList"	1	if (name == "List" or name == "ParallelList") and args.length() == 1:
+ compiler/stage_09_core/specialize_layout.brp	producer	marker_concatenation	stack_option_box_c_type	"blorp_StackOption_${name}"	2	Some("blorp_StackOption_${name}")
+ compiler/stage_09_core/specialize_tensor_dispatch.brp	producer	marker_concatenation	tensor_to_string_runtime_name	"blorp_vector_to_string_"	1	Some("blorp_vector_to_string_" + name)

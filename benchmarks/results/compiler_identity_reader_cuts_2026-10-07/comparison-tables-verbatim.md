@@ -1,0 +1,125 @@
+### self
+
+```text
+baseline : identity-wave-baseline-self @ 7ab679600bce
+candidate: identity-wave-candidate-self @ 7ab679600bce
+input    : 7ab679600bce  program=self
+output C : IDENTICAL (83979351 vs 83979351 bytes)
+
+metric                                               baseline        candidate     delta
+----------------------------------------------------------------------------------------
+allocs source_discovery_start                             650              650    +0.00%
+allocs source_discovery_complete                   17,023,265       17,023,265    +0.00%
+allocs typed_frontend_start                                 5                5    +0.00%
+allocs typed_frontend_complete                     36,738,216       36,738,216    +0.00%
+allocs core_lowering_input_ready                            8                8    +0.00%
+allocs core_lowering_complete                      17,677,668       17,677,668    +0.00%
+allocs pass_lower_complete                                 64               64    +0.00%
+allocs pass_debug_complete                            137,279          137,279    +0.00%
+allocs pass_prune_early_complete                      166,753          166,753    +0.00%
+allocs pass_desugar_complete                        1,417,893        1,417,893    +0.00%
+allocs pass_mono_complete                          27,365,896       27,365,896    +0.00%
+allocs pass_synth_complete                            224,165          224,165    +0.00%
+allocs pass_match_complete                          5,794,610        5,794,610    +0.00%
+allocs pass_trait_resolve_complete                  4,972,409        4,972,409    +0.00%
+allocs pass_prune_after_trait_resolve_complete        2,355,051        2,355,051    +0.00%
+allocs pass_resolve_complete                        3,784,484        3,784,484    +0.00%
+allocs pass_std_inline_complete                     1,997,620        1,997,620    +0.00%
+allocs pass_tailrec_complete                          179,686          179,686    +0.00%
+allocs pass_fuse_string_complete                    2,649,317        2,649,317    +0.00%
+allocs pass_fuse_collection_complete                3,092,207        3,092,207    +0.00%
+allocs pass_fuse_parallel_tensor_complete           1,336,146        1,336,146    +0.00%
+allocs pass_fuse_tensor_update_complete                44,350           44,350    +0.00%
+allocs early_core_complete                                  7                7    +0.00%
+allocs pass_tuple_flatten_complete                  8,041,478        8,041,478    +0.00%
+allocs runtime_projection_complete                    995,580          995,580    +0.00%
+allocs pass_adapt_function_refs_complete            1,998,552        1,998,552    +0.00%
+allocs pass_tensor_specialize_specialize_fused_complete        1,791,491        1,791,491    +0.00%
+allocs pass_hash_key_callbacks_complete                 3,777            3,777    +0.00%
+allocs pass_resolve_backend_match_fused_complete        3,597,762        3,597,762    +0.00%
+allocs pass_dce_complete                            2,673,871        2,673,871    +0.00%
+allocs pass_consume_specialize_complete             2,018,584        2,018,584    +0.00%
+allocs pass_static_string_literals_complete         1,656,738        1,656,738    +0.00%
+allocs pass_record_update_ownership_complete        1,783,125        1,783,125    +0.00%
+allocs pass_record_literal_order_complete           1,468,771        1,468,771    +0.00%
+allocs pass_dict_literal_ownership_complete           135,425          135,425    +0.00%
+allocs pass_ownership_perceus_fused_complete       57,629,045       57,629,045    +0.00%
+allocs pass_reuse_complete                            855,986          855,986    +0.00%
+allocs pass_closure_complete                        2,503,934        2,503,934    +0.00%
+allocs pass_resource_management_complete              334,639          334,639    +0.00%
+allocs pass_fairness_complete                         173,311          173,311    +0.00%
+allocs pass_prepare_complete                          933,085          933,085    +0.00%
+allocs pass_prepared_reuse_complete                   412,816          412,816    +0.00%
+allocs cleanup_plan_complete                        1,265,059        1,265,059    +0.00%
+allocs cancellation_plan_complete                  10,798,164       10,798,164    +0.00%
+allocs late_core_complete                                   5                5    +0.00%
+allocs backend_emission_complete                   17,027,089       17,027,089    +0.00%
+allocs artifact_construction_complete                      76               76    +0.00%
+allocs TOTAL                                      245,056,112      245,056,112    +0.00%
+instructions retired (min)                    229,157,014,450  229,357,161,486    +0.09%
+output bytes                                       83,979,351       83,979,351    +0.00%
+peak RSS bytes                                  2,208,727,040    2,210,660,352    +0.09%
+```
+
+### small
+
+```text
+baseline : identity-wave-baseline-small @ 7ab679600bce
+candidate: identity-wave-candidate-small @ 7ab679600bce
+input    : 7ab679600bce  program=small
+output C : IDENTICAL (40512 vs 40512 bytes)
+
+metric                                               baseline        candidate     delta
+----------------------------------------------------------------------------------------
+allocs source_discovery_start                             650              650    +0.00%
+allocs source_discovery_complete                      403,342          403,342    +0.00%
+allocs typed_frontend_start                                 5                5    +0.00%
+allocs typed_frontend_complete                        767,943          767,943    +0.00%
+allocs core_lowering_input_ready                            8                8    +0.00%
+allocs core_lowering_complete                         198,760          198,760    +0.00%
+allocs pass_lower_complete                                 64               64    +0.00%
+allocs pass_debug_complete                              3,549            3,549    +0.00%
+allocs pass_prune_early_complete                       15,639           15,639    +0.00%
+allocs pass_desugar_complete                            8,434            8,434    +0.00%
+allocs pass_mono_complete                              38,963           38,963    +0.00%
+allocs pass_synth_complete                              6,944            6,944    +0.00%
+allocs pass_match_complete                             24,297           24,297    +0.00%
+allocs pass_trait_resolve_complete                     46,934           46,934    +0.00%
+allocs pass_prune_after_trait_resolve_complete           16,735           16,735    +0.00%
+allocs pass_resolve_complete                           15,434           15,434    +0.00%
+allocs pass_std_inline_complete                            14               14    +0.00%
+allocs pass_tailrec_complete                            6,734            6,734    +0.00%
+allocs pass_fuse_string_complete                       10,136           10,136    +0.00%
+allocs pass_fuse_collection_complete                    9,965            9,965    +0.00%
+allocs pass_fuse_parallel_tensor_complete               6,182            6,182    +0.00%
+allocs pass_fuse_tensor_update_complete                 1,674            1,674    +0.00%
+allocs early_core_complete                                  7                7    +0.00%
+allocs pass_tuple_flatten_complete                     29,853           29,853    +0.00%
+allocs runtime_projection_complete                      3,924            3,924    +0.00%
+allocs pass_adapt_function_refs_complete                6,587            6,587    +0.00%
+allocs pass_tensor_specialize_specialize_fused_complete            5,432            5,432    +0.00%
+allocs pass_hash_key_callbacks_complete                   162              162    +0.00%
+allocs pass_resolve_backend_match_fused_complete           13,989           13,989    +0.00%
+allocs pass_dce_complete                                3,022            3,022    +0.00%
+allocs pass_consume_specialize_complete                    96               96    +0.00%
+allocs pass_static_string_literals_complete             1,090            1,090    +0.00%
+allocs pass_record_update_ownership_complete            1,084            1,084    +0.00%
+allocs pass_record_literal_order_complete                 811              811    +0.00%
+allocs pass_dict_literal_ownership_complete               190              190    +0.00%
+allocs pass_ownership_perceus_fused_complete           20,268           20,268    +0.00%
+allocs pass_reuse_complete                                200              200    +0.00%
+allocs pass_closure_complete                            1,507            1,507    +0.00%
+allocs pass_resource_management_complete                  164              164    +0.00%
+allocs pass_fairness_complete                             219              219    +0.00%
+allocs pass_prepare_complete                              291              291    +0.00%
+allocs pass_prepared_reuse_complete                       326              326    +0.00%
+allocs cleanup_plan_complete                              767              767    +0.00%
+allocs cancellation_plan_complete                       6,836            6,836    +0.00%
+allocs late_core_complete                                   5                5    +0.00%
+allocs backend_emission_complete                        9,796            9,796    +0.00%
+allocs artifact_construction_complete                      12               12    +0.00%
+allocs TOTAL                                        1,689,044        1,689,044    +0.00%
+instructions retired (min)                      1,596,202,656    1,596,939,719    +0.05%
+output bytes                                           40,512           40,512    +0.00%
+peak RSS bytes                                     37,552,128       38,436,864    +2.36%
+```
