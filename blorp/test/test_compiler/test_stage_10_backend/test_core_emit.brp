@@ -21,7 +21,7 @@ import:
 		CoreBinaryOp(
 			AddOp, DivideOp, EqualOp, GreaterEqualOp, GreaterOp, LessOp, ModuloOp, SubtractOp,
 		),
-		CoreBinderOrigin(AuthoredBinder),
+		CoreBinderOrigin(AuthoredBinder, DerivedFrom),
 		CoreBoxKind(Float16Box, FloatBox, Int128Box, PointerBox, PrimBox, StructBox, VoidBox),
 		CoreBoxedStorageValue,
 		CoreCallKind(
@@ -50,6 +50,7 @@ import:
 			StackResultErrConstructorTest, StackResultOkConstructorTest, UnionTagConstructorTest,
 		),
 		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, InlineRecordDecl, UnionDecl),
+		DerivedTempKind(DropTemp),
 		CoreDeclaredOrigin(HashKeySlotAdapter),
 		CoreDictConstruct,
 		CoreDirectRuntimeArgs(
@@ -257,6 +258,7 @@ import:
 		),
 		OPTION_INLINE_TAGGED_EMPTY_ENCODING,
 		OPTION_INLINE_TAGGED_PAYLOAD_ENCODING,
+		core_expr_type,
 		core_field_ordinal,
 		core_field_ref,
 		tuple_storage_catalog,
@@ -269,7 +271,7 @@ import:
 		prepared_core_program_value,
 		run_pre_dce_tail,
 	../../../src/compiler/stage_09_core/static_string_literals: rewrite_static_string_literals
-	../../../src/compiler/stage_10_backend/c_naming: c_identifier, c_local_name, c_local_spelling, encode_base62, variant_constructor_symbol, variant_tag_symbol
+	../../../src/compiler/stage_10_backend/c_naming: c_identifier, c_local_name, c_local_spelling, derived_temporary_spelling, encode_base62, variant_constructor_symbol, variant_tag_symbol
 	../../../src/compiler/stage_10_backend/c_symbol_projection:
 		CEmissionSymbolPlan,
 		CSymbolProjectionError(MissingProjectedCallable),
@@ -30704,6 +30706,239 @@ pure func test_emit_let_binding_statement() -> Bool:
 	)
 
 
+private pure func initializer_product_var(id: Int) -> CoreVar:
+	{ name = "initializer_product", id = id, def_id = None, origin = PRODUCT_FIELD_TEMP_ORIGIN }
+
+
+private pure func initializer_drop_var() -> CoreVar:
+	{
+		name = derived_temporary_spelling("initializer_owner", DropTemp, 0),
+		id = -901,
+		def_id = None,
+		origin = DerivedFrom("initializer_owner", DropTemp, 0)
+	}
+
+
+private pure func initializer_drop_spine(inner: CoreVar, rhs: CoreExpr) -> CoreExpr:
+	typ = core_expr_type(rhs)
+	owner = initializer_product_var(-901)
+	result = initializer_drop_var()
+	loc = synthetic_core_source_loc()
+	LetExpr(
+		owner,
+		False,
+		int_type(),
+		LiteralExpr(IntLiteral(1), int_type(), loc),
+		LetExpr(
+			result,
+			False,
+			typ,
+			LetExpr(inner, False, typ, rhs, VarExpr(inner, typ, loc)),
+			DropExpr(owner, int_type(), NoReleasePolicy, VarExpr(result, typ, loc), typ, loc),
+		),
+	)
+
+
+private pure func initializer_drop_spine_code(inner: CoreVar, rhs: CoreExpr) -> String:
+	global: CoreGlobal = {
+		dynamic_answer_global() |
+		typ = core_expr_type(rhs),
+		init = initializer_drop_spine(inner, rhs),
+	}
+	program: CoreProgram = { decls = [GlobalDecl(global)], foreign_includes = [], source_files = [] }
+	match try_emit_prepared_fixture_c_artifact(prepared_core_program(program), FunctionProfileOff):
+		Ok(artifact): artifact.c_code
+		Err(_): ""
+
+
+private pure func initializer_drop_declaration() -> String:
+	variable = initializer_drop_var()
+	"long " + c_local_spelling(variable.name, variable.id, variable.origin) + " = "
+
+
+pure func test_emit_global_owned_temporary_spine_has_sequential_rhs() -> Bool:
+	inner = initializer_product_var(-902)
+	rhs = LiteralExpr(IntLiteral(2), int_type(), synthetic_core_source_loc())
+	code = initializer_drop_spine_code(inner, rhs)
+	inner_c = c_local_spelling(inner.name, inner.id, inner.origin)
+	(
+		code.contains("long " + inner_c + " = 2;")
+		and code.contains(initializer_drop_declaration() + inner_c + ";")
+		and not code.contains(initializer_drop_declaration() + "({")
+	)
+
+
+pure func test_emit_global_duplicate_temporary_keeps_rhs_scope() -> Bool:
+	-- The same minted binder is legal in a nested lexical RHS. Hoisting it
+	-- would redeclare it beside the outer owner, so admission must fall back.
+	inner = initializer_product_var(-901)
+	rhs = LiteralExpr(IntLiteral(2), int_type(), synthetic_core_source_loc())
+	code = initializer_drop_spine_code(inner, rhs)
+	code != "" and code.contains(initializer_drop_declaration() + "({")
+
+
+pure func test_emit_global_source_binding_keeps_rhs_scope() -> Bool:
+	inner: CoreVar = { name = "source_inner", id = 901, def_id = None, origin = AuthoredBinder }
+	rhs = LiteralExpr(IntLiteral(2), int_type(), synthetic_core_source_loc())
+	code = initializer_drop_spine_code(inner, rhs)
+	code != "" and code.contains(initializer_drop_declaration() + "({")
+
+
+pure func test_emit_global_branch_keeps_rhs_scope() -> Bool:
+	loc = synthetic_core_source_loc()
+	rhs = IfExpr(
+		LiteralExpr(BoolLiteral(True), bool_type(), loc),
+		LiteralExpr(IntLiteral(2), int_type(), loc),
+		LiteralExpr(IntLiteral(3), int_type(), loc),
+		int_type(),
+		loc,
+	)
+	code = initializer_drop_spine_code(initializer_product_var(-902), rhs)
+	code != "" and code.contains(initializer_drop_declaration() + "({")
+
+
+private pure func initializer_colliding_global_var() -> CoreVar:
+	inner = initializer_product_var(-902)
+	{
+		name = c_local_spelling(inner.name, inner.id, inner.origin),
+		id = inner.id,
+		def_id = Some(991),
+		origin = inner.origin
+	}
+
+
+private pure func initializer_reference_spine_program(
+	continuation: CoreExpr,
+	typ: CoreType,
+	additional_decls: List[CoreDecl],
+) -> CoreProgram:
+	loc = synthetic_core_source_loc()
+	owner = initializer_product_var(-901)
+	inner = initializer_product_var(-902)
+	result = initializer_drop_var()
+	free_global: CoreGlobal = {
+		dynamic_answer_global() |
+		name = initializer_colliding_global_var(),
+		init = LiteralExpr(IntLiteral(40), int_type(), loc),
+		def_id = 991,
+	}
+	answer: CoreGlobal = {
+		dynamic_answer_global() |
+		typ = typ,
+		init = LetExpr(
+			owner,
+			False,
+			int_type(),
+			LiteralExpr(IntLiteral(1), int_type(), loc),
+			LetExpr(
+				result,
+				False,
+				int_type(),
+				LetExpr(
+					inner,
+					False,
+					int_type(),
+					LiteralExpr(IntLiteral(2), int_type(), loc),
+					VarExpr(inner, int_type(), loc),
+				),
+				DropExpr(owner, int_type(), NoReleasePolicy, continuation, typ, loc),
+			),
+		),
+	}
+	{
+		decls = [GlobalDecl(free_global), GlobalDecl(answer)] + additional_decls,
+		foreign_includes = [],
+		source_files = [],
+	}
+
+
+pure func test_emit_global_free_reference_keeps_rhs_scope() -> Bool:
+	loc = synthetic_core_source_loc()
+	free = initializer_colliding_global_var()
+	program = initializer_reference_spine_program(
+		VarExpr(free, int_type(), loc),
+		int_type(),
+		[],
+	)
+	match try_emit_prepared_fixture_c_artifact(prepared_core_program(program), FunctionProfileOff):
+		Ok(artifact):
+			(
+				artifact.c_code.contains(initializer_drop_declaration() + "({")
+				and artifact.c_code.contains("DYNAMIC_ANSWER = " + free.name + ";")
+			)
+		Err(_): False
+
+
+pure func test_emit_global_capture_reference_keeps_rhs_scope() -> Bool:
+	loc = synthetic_core_source_loc()
+	inner = initializer_product_var(-902)
+	capture: CoreClosureCapture = {
+		name = inner.name,
+		id = inner.id,
+		typ = int_type(),
+		origin = inner.origin,
+	}
+	abi: CoreClosureAbi = {
+		params = [],
+		captures = [capture],
+		moved_captures = [],
+		task_abi = False,
+	}
+	closure: CoreFunction = {
+		captured_closure_body_function() |
+		name = "initializer_capture",
+		params = [],
+		body = Some(VarExpr(inner, int_type(), loc)),
+		function_kind = ClosureBodyFunction(abi),
+	}
+	value = ClosureCreateExpr(
+		{ def_id = closure.def_id, captures = [capture] },
+		closure_type(),
+		loc,
+	)
+	program = initializer_reference_spine_program(value, closure_type(), [FunctionDecl(closure)])
+	match try_emit_prepared_fixture_c_artifact(prepared_core_program(program), FunctionProfileOff):
+		Ok(artifact):
+			(
+				artifact.c_code.contains(initializer_drop_declaration() + "({")
+				and (
+					artifact.c_code.contains("= " + initializer_colliding_global_var().name + ";")
+					or artifact.c_code.contains("(void*)(long)(" + initializer_colliding_global_var().name + ");")
+				)
+			)
+		Err(_): False
+
+
+pure func test_emit_global_mismatched_temporary_spelling_keeps_rhs_scope() -> Bool:
+	inner: CoreVar = {
+		name = derived_temporary_spelling("different_cached_anchor", DropTemp, 0),
+		id = -902,
+		def_id = None,
+		origin = DerivedFrom("actual_anchor", DropTemp, 0)
+	}
+	rhs = LiteralExpr(IntLiteral(2), int_type(), synthetic_core_source_loc())
+	code = initializer_drop_spine_code(inner, rhs)
+	code != "" and code.contains(initializer_drop_declaration() + "({")
+
+
+pure func test_emit_global_raw_box_type_keeps_rhs_scope() -> Bool:
+	loc = synthetic_core_source_loc()
+	value = BoxExpr(
+		{
+			kind = StructBox("long"),
+			value = LiteralExpr(IntLiteral(2), int_type(), loc),
+			source_type = int_type(),
+		},
+		raw_pointer_type(),
+		loc,
+	)
+	code = initializer_drop_spine_code(initializer_product_var(-902), value)
+	result = initializer_drop_var()
+	code != "" and code.contains(
+		"void* " + c_local_spelling(result.name, result.id, result.origin) + " = ({",
+	)
+
+
 pure func test_emit_let_binding_from_statement_rhs() -> Bool:
 	program: CoreProgram = {
 		decls = [FunctionDecl(let_from_statement_rhs_function())],
@@ -32206,6 +32441,38 @@ tests: TestSuite = {
 		("emit boxed Option stack Result constructor", test_emit_boxed_option_stack_result_constructor),
 		("emit let binding statement", test_emit_let_binding_statement),
 		("emit let binding from statement RHS", test_emit_let_binding_from_statement_rhs),
+		(
+			"emit global owned temporary spine has sequential rhs",
+			test_emit_global_owned_temporary_spine_has_sequential_rhs,
+		),
+		(
+			"emit global duplicate temporary keeps rhs scope",
+			test_emit_global_duplicate_temporary_keeps_rhs_scope,
+		),
+		(
+			"emit global source binding keeps rhs scope",
+			test_emit_global_source_binding_keeps_rhs_scope,
+		),
+		(
+			"emit global branch keeps rhs scope",
+			test_emit_global_branch_keeps_rhs_scope,
+		),
+		(
+			"emit global free reference keeps rhs scope",
+			test_emit_global_free_reference_keeps_rhs_scope,
+		),
+		(
+			"emit global capture reference keeps rhs scope",
+			test_emit_global_capture_reference_keeps_rhs_scope,
+		),
+		(
+			"emit global mismatched temporary spelling keeps rhs scope",
+			test_emit_global_mismatched_temporary_spelling_keeps_rhs_scope,
+		),
+		(
+			"emit global raw box type keeps rhs scope",
+			test_emit_global_raw_box_type_keeps_rhs_scope,
+		),
 		(
 			"emit statement RHS scopes reused inner names",
 			test_emit_statement_rhs_scopes_reused_inner_names,

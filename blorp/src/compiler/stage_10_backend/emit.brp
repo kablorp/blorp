@@ -55,11 +55,14 @@ import:
 			AddOp, DivideOp, EqualOp, GreaterEqualOp, GreaterOp, LessOp, LessEqualOp, ModuloOp,
 			MultiplyOp, NotEqualOp, SubtractOp,
 		),
-		CoreBinderOrigin(AuthoredBinder),
+		CoreBinderOrigin(AuthoredBinder, PassTemporary, DerivedFrom),
 		CoreBoxKind(
 			Float16Box, Float32Box, FloatBox, Int128Box, PointerBox, PrimBox, StructBox, UInt128Box,
 			VoidBox,
 		),
+		DerivedTempKind(DropTemp),
+		PassTempKind(ProductFieldTemp, ListElementTemp),
+		MINTED_BINDER_ID_FLOOR,
 		CoreBoxOp,
 		CoreBoxedStorageValue,
 		CoreCallKind(
@@ -365,6 +368,7 @@ import:
 		c_local_name,
 		c_local_spelling,
 		c_variable_spelling,
+		projected_temporary_spelling,
 		static_record_child_path,
 		static_closure_name,
 		static_list_child_path,
@@ -418,6 +422,7 @@ import:
 		c_record_member_scope,
 		classify_c_record_layouts,
 	intrinsic_renderer as Intrinsic
+	dict: Dict
 	list: list
 	prepared_backend_renderer:
 		CapacityCustomCtorArgs,
@@ -820,6 +825,7 @@ private type alias CEmissionSymbolAuthority = CEmissionSymbolPlan
 
 
 private record FunctionEmissionContext {
+	initializer_rhs_scope: GlobalInitializerRhsScope,
 	cleanup_plan: CancellationProtectionPlan,
 	-- Expression-only diagnostic callers have no program-wide type index;
 	-- production contexts carry the once-built emission layout.
@@ -1131,6 +1137,7 @@ private pure func emission_context_from_plan(
 		BASE_INDENT
 
 	{
+		initializer_rhs_scope = PreserveLexicalRhsScopes,
 		cleanup_plan = plan,
 		specialize_layout = Some(specialize_layout),
 		profile_function_id = profile_function_id,
@@ -23249,6 +23256,158 @@ private pure func emit_bound_let_body(
 	})
 
 
+private fixed union GlobalInitializerRhsScope:
+	PreserveLexicalRhsScopes
+	UniqueOwnedTemporarySpine
+
+
+-- A linked event stack keeps the walk linear without copying list tails.
+private union InitializerScopeWalk:
+	InitializerScopeComplete
+	VisitInitializerValue(CoreExpr, InitializerScopeWalk)
+	EnterInitializerBinding(CoreVar, InitializerScopeWalk)
+	LeaveInitializerBinding(CoreVar, InitializerScopeWalk)
+
+
+private pure func initializer_has_canonical_temporary(variable: CoreVar) -> Bool:
+	if (
+		variable.def_id.is_some()
+		or variable.name == "_"
+		or variable.id >= 0
+		or variable.id <= MINTED_BINDER_ID_FLOOR
+	):
+		False
+	else:
+		match variable.origin:
+			PassTemporary(ProductFieldTemp, _) | PassTemporary(ListElementTemp, _): True
+			DerivedFrom(_, DropTemp, _): projected_temporary_spelling(variable) == Some(variable.name)
+			_: False
+
+
+private pure func initializer_box_has_known_type(
+	kind: CoreBoxKind,
+	source_type: CoreType,
+	type_symbols: Dict[String, String],
+) -> Bool:
+	match kind:
+		StructBox(c_type):
+			type_symbols.contains(c_type) or (
+				CoreTypePolicy.is_stack_result_type(source_type)
+				and c_type == TypeLayout.c_type_name(source_type, type_symbols)
+			)
+		_: True
+
+
+-- Admit only a closed, collision-free global constructor spine. Canonical
+-- temporary spellers are disjoint from automatic/cleanup/type helper names;
+-- exact output-reference checks also protect free values and callable names.
+private pure func global_initializer_rhs_scope(
+	init: CoreExpr,
+	symbol_authority: CEmissionSymbolAuthority,
+) -> GlobalInitializerRhsScope:
+	type_symbols = selected_type_symbol_lookup(symbol_authority)
+	var pending: InitializerScopeWalk = VisitInitializerValue(init, InitializerScopeComplete)
+	var active: Dict[String, CoreVar] = {}
+	var introduced: Dict[String, Bool] = {}
+	var free_names: Dict[String, Bool] = {}
+	var admitted: Bool = True
+
+	while admitted:
+		match pending:
+			InitializerScopeComplete:
+				break
+			EnterInitializerBinding(variable, rest):
+				pending = rest
+				name = c_var_name(variable)
+				if introduced.contains(name):
+					admitted = False
+				else:
+					introduced = introduced.set(name, True)
+					active = active.set(name, variable)
+			LeaveInitializerBinding(variable, rest):
+				pending = rest
+				active = active.remove(c_var_name(variable))
+			VisitInitializerValue(expr, rest):
+				pending = rest
+				match expr:
+					LetExpr(variable, False, typ, rhs, body):
+						if TypeLayout.is_void_type(typ) or not initializer_has_canonical_temporary(variable):
+							admitted = False
+						else:
+							pending = VisitInitializerValue(
+								rhs,
+								EnterInitializerBinding(
+									variable,
+									VisitInitializerValue(body, LeaveInitializerBinding(variable, rest)),
+								),
+							)
+					_:
+						var references: List[CoreVar] = []
+						match expr:
+							LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VoidExpr(_, _) | ProductExpr(_, _, _):
+								void
+							VarExpr(variable, _, _):
+								references = [variable]
+							DupExpr(variable, _, _, _, _, _):
+								references = [variable]
+							DropExpr(variable, _, _, _, _, _):
+								references = [variable]
+							BoxExpr(box, _, _):
+								admitted = admitted and initializer_box_has_known_type(
+									box.kind,
+									box.source_type,
+									type_symbols,
+								)
+							ListConstructExpr(construct, _, _):
+								match construct.layout:
+									InlineStructListStorage(c_type):
+										if not type_symbols.contains(c_type):
+											match construct.elements.get(0):
+												Some(first):
+													source_type = core_expr_type(first.value)
+													admitted = admitted and (
+														CoreTypePolicy.is_stack_result_type(source_type)
+														and c_type == TypeLayout.c_type_name(source_type, type_symbols)
+													)
+												None: admitted = False
+									_: void
+								for element in construct.elements:
+									admitted = admitted and initializer_box_has_known_type(
+										element.kind,
+										core_expr_type(element.value),
+										type_symbols,
+									)
+							ClosureCreateExpr(closure, _, _):
+								closure_name = emitted_callable_name(symbol_authority, closure.def_id)
+								free_names = free_names.set(c_identifier(static_closure_name(closure_name)), True)
+								for capture in closure.captures:
+									references = references.append(moved_capture_var(capture))
+							_:
+								admitted = False
+
+						for variable in references:
+							name = c_var_name(variable)
+							if variable.def_id.is_some():
+								free_names = free_names.set(name, True)
+							else:
+								match active.get(name):
+									Some(binding): admitted = admitted and core_var_equal(variable, binding)
+									None: free_names = free_names.set(name, True)
+
+						if admitted:
+							for child in CoreTraverse.immediate_core_expr_children(expr).reverse():
+								pending = VisitInitializerValue(child, pending)
+
+	for name in free_names.keys():
+		if introduced.contains(name):
+			admitted = False
+
+	if admitted:
+		UniqueOwnedTemporarySpine
+	else:
+		PreserveLexicalRhsScopes
+
+
 private pure func emit_let_body(
 	name: CoreVar,
 	is_mutable: Bool,
@@ -23274,22 +23433,33 @@ private pure func emit_let_body(
 					emission_context,
 				)
 			None:
-				rhs_body ?= emit_function_body(
-					rhs,
-					next_temp,
-					nested_emission_context(emission_context),
-				)
+				sequential_rhs = match (emission_context.initializer_rhs_scope, name.origin):
+					(UniqueOwnedTemporarySpine, DerivedFrom(_, DropTemp, _)): True
+					_: False
+				rhs_context = if sequential_rhs:
+					emission_context
+				else:
+					nested_emission_context(emission_context)
+				rhs_body ?= emit_function_body(rhs, next_temp, rhs_context)
 				rhs_value ?= required_body_value(rhs_body)
-				emit_bound_let_body(
+				rendered_rhs = if sequential_rhs:
+					rhs_value
+				else:
+					statement_expression(emission_context.indent, rhs_body.statements, rhs_value)
+				bound_body ?= emit_bound_let_body(
 					name,
 					is_mutable,
 					typ,
 					rhs,
-					statement_expression(emission_context.indent, rhs_body.statements, rhs_value),
+					rendered_rhs,
 					body,
 					rhs_body.next_temp,
 					emission_context,
 				)
+				if sequential_rhs:
+					Some({ bound_body | statements = rhs_body.statements + bound_body.statements })
+				else:
+					Some(bound_body)
 
 
 private pure func emit_bound_borrow_let_body(
@@ -26768,7 +26938,7 @@ private pure func emit_global_runtime_init_body(
 	compact: Bool,
 	native_product_plan: CNativeProductAdapterPlan,
 ) -> Option[FunctionBodyC]:
-	emission_context: FunctionEmissionContext = emission_context_from_plan(
+	planned_context: FunctionEmissionContext = emission_context_from_plan(
 		plan,
 		specialize_layout,
 		record_members,
@@ -26777,6 +26947,9 @@ private pure func emit_global_runtime_init_body(
 		compact,
 		native_product_plan,
 	)
+	emission_context: FunctionEmissionContext = { planned_context |
+		initializer_rhs_scope = global_initializer_rhs_scope(global.init, symbol_authority)
+	}
 	init_body ?= emit_function_body(global.init, next_temp, emission_context)
 
 	wrapper_indent: String = if compact:
