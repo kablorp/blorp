@@ -8,6 +8,8 @@ temporary repository stands in for the remote one. The gate itself runs with
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -149,6 +151,86 @@ class DockerGateRemoteTests(unittest.TestCase):
 
     def remote_repo(self) -> Path:
         return self.remote_home / "gate-repo"
+
+    def volume_build_environment(self, output: str) -> dict[str, str]:
+        commands = [
+            shlex.split(line[2:])
+            for line in output.splitlines()
+            if line.startswith("+ docker run ")
+        ]
+        self.assertEqual(len(commands), 1, output)
+        command = commands[0]
+        return {
+            command[index + 1].split("=", 1)[0]: command[index + 1].split("=", 1)[1]
+            for index, argument in enumerate(command)
+            if argument == "-e"
+        }
+
+    def test_clean_volume_build_names_the_checked_out_commit(self) -> None:
+        head = self.git("rev-parse", "HEAD").strip()
+
+        completed = self.run_gate(BLORP_DOCKER_GATE_HOST="")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        environment = self.volume_build_environment(completed.stdout)
+        self.assertEqual(environment.get("BLORP_BUILD_COMMIT"), head)
+        self.assertEqual(environment.get("BLORP_BUILD_DIRTY"), "false")
+
+    def test_dirty_volume_build_names_complete_snapshot_without_changing_index(self) -> None:
+        script = self.checkout / "scripts" / "docker-gate"
+        script.write_text(script.read_text() + "\n# Tracked source change.\n")
+        untracked = self.checkout / "untracked.brp"
+        untracked.write_text("func main() -> Int:\n\t0\n")
+        head = self.git("rev-parse", "HEAD").strip()
+        status = self.git("status", "--porcelain")
+        index = self.git("ls-files", "--stage")
+
+        completed = self.run_gate(
+            gate_args=("--", "untracked.brp"), BLORP_DOCKER_GATE_HOST=""
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        environment = self.volume_build_environment(completed.stdout)
+        commit = environment.get("BLORP_BUILD_COMMIT", "")
+        self.assertRegex(commit, r"^[0-9a-f]{40}$")
+        self.assertNotEqual(commit, head)
+        self.assertEqual(environment.get("BLORP_BUILD_DIRTY"), "false")
+        self.assertEqual(self.git("show", f"{commit}:scripts/docker-gate"), script.read_text())
+        self.assertEqual(self.git("show", f"{commit}:untracked.brp"), untracked.read_text())
+        self.assertEqual(self.git("rev-parse", f"{commit}^").strip(), head)
+        self.assertEqual(self.git("status", "--porcelain"), status)
+        self.assertEqual(self.git("ls-files", "--stage"), index)
+
+    def test_remote_volume_build_names_the_sent_snapshot(self) -> None:
+        (self.checkout / "untracked.txt").write_text("snapshot source\n")
+
+        completed = self.run_gate(
+            BLORP_BUILD_COMMIT="unrelated-caller-stamp", BLORP_BUILD_DIRTY="true"
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        sent = re.search(r"Sending the working tree .* \(([0-9a-f]{40})\)", completed.stdout)
+        self.assertIsNotNone(sent, completed.stdout)
+        environment = self.volume_build_environment(completed.stdout)
+        self.assertEqual(environment.get("BLORP_BUILD_COMMIT"), sent.group(1))
+        self.assertEqual(environment.get("BLORP_BUILD_DIRTY"), "false")
+
+    def test_failed_volume_snapshot_stops_before_docker_run(self) -> None:
+        git = shutil.which("git")
+        self.assertIsNotNone(git)
+        fake_git = self.scratch / "bin" / "git"
+        fake_git.write_text(
+            '#!/bin/bash\n[ "$1" = "write-tree" ] && exit 1\n'
+            f'exec {shlex.quote(git)} "$@"\n'
+        )
+        fake_git.chmod(0o755)
+
+        completed = self.run_gate(BLORP_DOCKER_GATE_HOST="")
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("could not snapshot", completed.stderr)
+        self.assertIn("then rerun the gate", completed.stderr)
+        self.assertNotIn("+ docker run ", completed.stdout)
 
     def test_reachable_host_runs_the_working_tree_remotely_and_cleans_up(self) -> None:
         self.edit_gate_script_uncommitted(
