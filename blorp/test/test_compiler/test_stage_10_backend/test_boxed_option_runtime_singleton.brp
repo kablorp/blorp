@@ -1,0 +1,204 @@
+import:
+	../../../src/compiler/stage_06_typecheck/type_system/language_surface_manifest:
+		DeclaredAbiType(DeclaredAbiOption, DeclaredAbiResult),
+	../../../src/compiler/stage_09_core/ir:
+		CoreDecl(UnionDecl),
+		CoreProgram,
+		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
+		CoreType(TypeParameterType, NamedType),
+		CoreUnionDecl,
+		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
+		CoreUnionStorage(ManagedPayloadStorage),
+		synthetic_core_source_loc,
+	../../../src/compiler/stage_09_core/pipeline: prepared_core_program
+	../../../src/compiler/stage_10_backend/c_naming:
+		union_instance_name,
+		variant_constructor_symbol,
+		variant_tag_symbol,
+	../../../src/compiler/stage_10_backend/emit:
+		try_emit_prepared_core_program_c_artifact_with_profile,
+		try_emit_prepared_core_program_c_split_artifact_with_profile,
+	../../../src/lib/function_profile: FunctionProfileConfiguration(FunctionProfileOff)
+	test: TestSuite
+
+
+-- This is the valid erased Option ABI template accepted by runtime projection.
+private pure func option_template() -> CoreUnionDecl:
+	{
+		name = "Option",
+		abi_type = Some(DeclaredAbiOption),
+		type_params = ["T"],
+		storage = ManagedPayloadStorage(ErasedUnionPayloadStorage),
+		variants = [
+			{
+				name = "Some",
+				tag = 0,
+				fields = [
+					{
+						typ = TypeParameterType("T"),
+						release_policy = ArcReleasePolicy
+					},
+				],
+				def_id = Some(401)
+			},
+			{
+				name = "None",
+				tag = 1,
+				fields = [],
+				def_id = Some(402)
+			},
+		],
+		loc = synthetic_core_source_loc()
+	}
+
+
+private pure func singleton_binding_count(code: String) -> Int:
+	code
+		.split("__blorp_none_singleton_ptr = (void*)&")
+		.length() - 1
+
+
+private pure func empty_owner_is_emitted(code: String) -> Bool:
+	(
+		code.contains(union_instance_name(variant_constructor_symbol(402)) + ";")
+		and code.contains(".tag = " + variant_tag_symbol(402) + ";")
+		and code.contains("BLORP_IMMORTAL_REFCOUNT")
+	)
+
+
+private pure func emits_expected_binding(declaration: CoreUnionDecl, expected_count: Int) -> Bool:
+	program: CoreProgram = {
+		decls = [UnionDecl(declaration)],
+		foreign_includes = [],
+		source_files = []
+	}
+	prepared = prepared_core_program(program)
+
+	single_valid: Bool = match try_emit_prepared_core_program_c_artifact_with_profile(
+		prepared,
+		FunctionProfileOff,
+	):
+		Ok(artifact):
+			(
+				singleton_binding_count(artifact.c_code) == expected_count
+				and ((
+					not declaration.variants.any(func(variant): variant.fields.is_empty())
+					or empty_owner_is_emitted(artifact.c_code)
+				))
+				and artifact.c_code.contains(
+					"#define " + variant_constructor_symbol(
+						402,
+					),
+				) == declaration.variants.any(func(variant): variant.fields.is_empty())
+			)
+		Err(_):
+			False
+
+	split_valid: Bool = match try_emit_prepared_core_program_c_split_artifact_with_profile(
+		prepared,
+		FunctionProfileOff,
+		2,
+		"singleton.h",
+	):
+		Ok(split):
+			(
+				singleton_binding_count(split.shared_header) == 0
+				and singleton_binding_count(split.bodies.get_or(0, "")) == expected_count
+				and singleton_binding_count(split.bodies.get_or(1, "")) == 0
+				and ((
+					not declaration.variants.any(func(variant): variant.fields.is_empty())
+					or empty_owner_is_emitted(split.bodies.get_or(0, ""))
+				))
+				and split.shared_header.contains(
+					"#define " + variant_constructor_symbol(
+						402,
+					),
+				) == declaration.variants.any(func(variant): variant.fields.is_empty())
+			)
+		Err(_):
+			False
+
+	single_valid and split_valid
+
+
+pure func test_runtime_option_empty_singleton_is_bound() -> Bool:
+	emits_expected_binding(option_template(), 1)
+
+
+pure func test_user_option_none_does_not_bind_runtime_singleton() -> Bool:
+	declaration: CoreUnionDecl = { option_template() |
+		abi_type = None,
+		type_params = [],
+		variants = [
+			{
+				name = "Some",
+				tag = 0,
+				fields = [
+					{
+						typ = NamedType("Int", []),
+						release_policy = NoReleasePolicy
+					},
+				],
+				def_id = Some(401)
+			},
+			{
+				name = "None",
+				tag = 1,
+				fields = [],
+				def_id = Some(402)
+			},
+		]
+	}
+	emits_expected_binding(declaration, 0)
+
+
+pure func test_runtime_result_does_not_bind_option_singleton() -> Bool:
+	declaration: CoreUnionDecl = { option_template() |
+		name = "Result",
+		abi_type = Some(DeclaredAbiResult),
+		type_params = ["T", "E"],
+		variants = [
+			{
+				name = "Ok",
+				tag = 0,
+				fields = [
+					{
+						typ = TypeParameterType("T"),
+						release_policy = ArcReleasePolicy
+					},
+				],
+				def_id = Some(403)
+			},
+			{
+				name = "Err",
+				tag = 1,
+				fields = [
+					{
+						typ = TypeParameterType("E"),
+						release_policy = ArcReleasePolicy
+					},
+				],
+				def_id = Some(404)
+			},
+		]
+	}
+	emits_expected_binding(declaration, 0)
+
+
+tests: TestSuite = {
+	description = "Boxed Option runtime singleton",
+	tests = [
+		(
+			"runtime Option empty singleton is bound once",
+			test_runtime_option_empty_singleton_is_bound,
+		),
+		(
+			"user Option and None cannot bind runtime singleton",
+			test_user_option_none_does_not_bind_runtime_singleton,
+		),
+		(
+			"runtime Result cannot bind Option singleton",
+			test_runtime_result_does_not_bind_option_singleton,
+		),
+	]
+}
