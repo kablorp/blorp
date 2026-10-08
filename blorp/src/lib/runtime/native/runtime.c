@@ -21845,9 +21845,9 @@ blorp_Dict* blorp_dict_new_int128(void) {
 // pointer-shaped. key_release is the standard ARC release whenever the slot
 // owns a box or a managed pointer.
 //
-// The remaining casts ([long (*)(void*)] to [unsigned long (*)(void*)] and a
-// Bool-returning adapter to [bool (*)(void*, void*)]) only change the integer
-// return type; every platform blorp targets returns both in the same register.
+// Slot adapters must have these exact native callback signatures, including
+// unsigned long and bool returns. They convert the language impl's long/int
+// result at return; function-pointer casts cannot repair a mismatched ABI.
 blorp_Dict* blorp_dict_new_custom(
     unsigned long (*hash_fn)(void*),
     bool (*eq_fn)(void*, void*),
