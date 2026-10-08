@@ -1,0 +1,103 @@
+-- Test-only readers for the host runtime and macOS /usr/bin/time reports.
+-- Missing counters are errors; they must never look like zero-cost compilation.
+record CompilationCost {
+	allocations: Int,
+	instructions: Int
+}
+
+
+record CostLimits {
+	allocations: Int,
+	instructions: Int
+}
+
+
+private ALLOCATION_PREFIX: String = "blorp: leak check: "
+
+private INSTRUCTION_SUFFIX: String = " instructions retired"
+
+
+private pure func positive_count(text: String) -> Result[Int, String]:
+	var decimal: Bool = text.length() > 0
+
+	for position in 0..text.length():
+		decimal = decimal and "0123456789".contains(text.substring(position, 1))
+
+	if decimal:
+		match text.parse_int():
+			Some(count):
+				if count > 0:
+					Ok(count)
+				else:
+					Err("cost counter must be positive")
+			None:
+				Err("cost counter is outside Int range")
+	else:
+		Err("cost counter must contain decimal digits")
+
+
+private pure func counter_field(text: String, suffix: String) -> Result[Int, String]:
+	if text.ends_with(suffix):
+		positive_count(text.substring(0, text.length() - suffix.length()))
+	else:
+		Err("missing cost counter field " + suffix)
+
+
+pure func parse_allocations(report: String) -> Result[Int, String]:
+	text: String = report.trim()
+
+	if text.starts_with(ALLOCATION_PREFIX):
+		fields: List[String] = text
+			.substring(ALLOCATION_PREFIX.length(), text.length() - ALLOCATION_PREFIX.length())
+			.split(", ")
+
+		match fields:
+			[allocated, released, "0 leaked", "0 bytes"]:
+				allocations ?= counter_field(allocated, " allocs")
+				releases ?= counter_field(released, " releases")
+
+				if allocations == releases:
+					Ok(allocations)
+				else:
+					Err("compiler allocation and release counters disagree")
+			_:
+				Err("expected one complete allocation report with no leaks")
+	else:
+		Err("missing compiler allocation report")
+
+
+pure func parse_instructions(report: String) -> Result[Int, String]:
+	var counters: List[String] = []
+
+	for line in report.split("\n"):
+		text: String = line.trim()
+
+		if text.ends_with(INSTRUCTION_SUFFIX):
+			counters = counters.append(
+				text
+					.substring(0, text.length() - INSTRUCTION_SUFFIX.length())
+					.trim(),
+			)
+
+	match counters:
+		[counter]:
+			positive_count(counter)
+		_:
+			Err("expected exactly one retired-instruction counter from macOS /usr/bin/time -l")
+
+
+pure func check_limits(cost: CompilationCost, limits: CostLimits) -> Result[Void, String]:
+	if cost.allocations > limits.allocations:
+		Err(
+			"compiler allocations exceeded limit: " + "".append_int(
+				cost.allocations,
+			) + " > " + "".append_int(limits.allocations),
+		)
+	else if cost.instructions > limits.instructions:
+		Err(
+			"compiler retired instructions exceeded limit: " + "".append_int(
+				cost.instructions,
+			) + " > " + "".append_int(limits.instructions),
+		)
+	else:
+		Ok(void)

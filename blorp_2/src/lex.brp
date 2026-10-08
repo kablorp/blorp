@@ -1,0 +1,202 @@
+import:
+	syntax:
+		Diagnostic,
+		LexedProgram,
+		Symbol(FunctionKeyword, LeftParen, RightParen, Arrow, Colon, Newline, Indent),
+		Token,
+		TokenKind(IdentifierToken, SymbolToken, ZeroLiteral),
+
+
+private SPACE_INDENT_WIDTH: Int = 4
+
+private IDENTIFIER_START: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
+
+private DIGITS: String = "0123456789"
+
+private IDENTIFIER_CONTINUE: String = IDENTIFIER_START + DIGITS
+
+
+private fixed union LinePosition:
+	AtLineStart
+	WithinLine
+
+
+private pure func token(kind: TokenKind, start: Int, end: Int) -> Token:
+	{
+		kind = kind,
+		span = {
+			start = start,
+			end = end
+		}
+	}
+
+
+private pure func diagnostic(
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+) -> Diagnostic:
+	{
+		span = {
+			start = start,
+			end = end
+		},
+		message = message,
+		help = help
+	}
+
+
+-- The preceding byte already belongs to the run; inspect the remaining bytes.
+private pure func run_end(source: String, byte_offset: Int, accepted_bytes: String) -> Int:
+	var end: Int = byte_offset
+
+	while end < source.length() and accepted_bytes.contains(source.substring(end, 1)):
+		end += 1
+
+	end
+
+
+pure func lex(source: String) -> Result[LexedProgram, Diagnostic]:
+	var tokens: List[Token] = []
+	var cursor: Int = 0
+	var line_position: LinePosition = AtLineStart
+	var failure: Option[Diagnostic] = None
+
+	while cursor < source.length():
+		byte_slice: String = source.substring(cursor, 1)
+
+		if line_position == AtLineStart and (byte_slice == "\t" or byte_slice == " "):
+			if byte_slice == "\t":
+				next_slice: String = source.substring(cursor + 1, 1)
+
+				if next_slice == " " or next_slice == "\t":
+					failure = Some(
+						diagnostic(
+							cursor,
+							cursor + 1,
+							"expected an indent of one tab or four spaces",
+							"use exactly one tab or exactly four spaces before the zero expression",
+						),
+					)
+					break
+
+				tokens = tokens.append(token(SymbolToken(Indent), cursor, cursor + 1))
+				cursor += 1
+			else:
+				indentation_end: Int = run_end(source, cursor + 1, " ")
+
+				if (
+					indentation_end - cursor != SPACE_INDENT_WIDTH
+					or source.substring(indentation_end, 1) == "\t"
+				):
+					failure = Some(
+						diagnostic(
+							cursor,
+							indentation_end,
+							"expected an indent of one tab or four spaces",
+							"use exactly one tab or exactly four spaces before the zero expression",
+						),
+					)
+					break
+
+				tokens = tokens.append(token(SymbolToken(Indent), cursor, indentation_end))
+				cursor = indentation_end
+
+			line_position = WithinLine
+		else:
+			line_position = WithinLine
+
+			if byte_slice == " ":
+				cursor += 1
+			else if byte_slice == "\n":
+				tokens = tokens.append(token(SymbolToken(Newline), cursor, cursor + 1))
+				cursor += 1
+				line_position = AtLineStart
+			else if byte_slice == "\r":
+				failure = Some(
+					diagnostic(
+						cursor,
+						cursor + 1,
+						"only LF line endings are supported",
+						"replace CRLF or CR line endings with LF",
+					),
+				)
+				break
+			else if byte_slice == "\t":
+				failure = Some(
+					diagnostic(
+						cursor,
+						cursor + 1,
+						"tabs are allowed only in the body indentation",
+						"separate tokens with spaces and indent the body with one tab or four spaces",
+					),
+				)
+				break
+			else if IDENTIFIER_START.contains(byte_slice):
+				identifier_end: Int = run_end(source, cursor + 1, IDENTIFIER_CONTINUE)
+				spelling: String = source.substring(cursor, identifier_end - cursor)
+
+				kind: TokenKind = if spelling == "func":
+					SymbolToken(FunctionKeyword)
+				else:
+					IdentifierToken(spelling)
+
+				tokens = tokens.append(token(kind, cursor, identifier_end))
+				cursor = identifier_end
+			else if DIGITS.contains(byte_slice):
+				number_end: Int = run_end(source, cursor + 1, DIGITS)
+
+				if source.substring(cursor, number_end - cursor) != "0":
+					failure = Some(
+						diagnostic(
+							cursor,
+							number_end,
+							"only the integer literal 0 is supported",
+							"use the single character 0 as the function body",
+						),
+					)
+					break
+
+				tokens = tokens.append(token(ZeroLiteral, cursor, number_end))
+				cursor = number_end
+			else if byte_slice == "-" and source.substring(cursor + 1, 1) == ">":
+				tokens = tokens.append(token(SymbolToken(Arrow), cursor, cursor + 2))
+				cursor += 2
+			else:
+				symbol: Option[Symbol] = match byte_slice:
+					"(":
+						Some(LeftParen)
+					")":
+						Some(RightParen)
+					":":
+						Some(Colon)
+					_:
+						None
+
+				match symbol:
+					Some(value):
+						tokens = tokens.append(token(SymbolToken(value), cursor, cursor + 1))
+						cursor += 1
+					None:
+						failure = Some(
+							diagnostic(
+								cursor,
+								cursor + 1,
+								"unsupported character",
+								"use func main() -> Int: followed by an indented 0; keep -> adjacent",
+							),
+						)
+						break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				tokens = tokens,
+				end = {
+					start = source.length(),
+					end = source.length()
+				},
+			})

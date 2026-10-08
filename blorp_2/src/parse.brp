@@ -1,0 +1,204 @@
+import:
+	syntax:
+		Diagnostic,
+		LexedProgram,
+		ParsedProgram,
+		ReturnExpression(ZeroExpression),
+		Span,
+		Symbol(FunctionKeyword, LeftParen, RightParen, Arrow, Colon, Newline, Indent),
+		TokenKind(IdentifierToken, SymbolToken, ZeroLiteral),
+		WrittenName,
+
+
+private fixed record ParserState {
+	input: LexedProgram,
+	position: Int
+}
+
+
+private fixed record ParsedName {
+	name: WrittenName,
+	next: ParserState
+}
+
+
+private pure func expected(state: ParserState, message: String, help: String) -> Diagnostic:
+	span: Span = match state.input.tokens.get(state.position):
+		Some(token):
+			token.span
+		None:
+			state.input.end
+
+	{
+		span = span,
+		message = message,
+		help = help
+	}
+
+
+private pure func consume_symbol(
+	state: ParserState,
+	symbol: Symbol,
+	message: String,
+	help: String,
+) -> Result[ParserState, Diagnostic]:
+	match state.input.tokens.get(state.position):
+		Some(token):
+			match token.kind:
+				SymbolToken(actual):
+					if actual == symbol:
+						Ok({
+							input = state.input,
+							position = state.position + 1,
+						})
+					else:
+						Err(expected(state, message, help))
+				_:
+					Err(expected(state, message, help))
+		None:
+			Err(expected(state, message, help))
+
+
+private pure func consume_name(
+	state: ParserState,
+	message: String,
+) -> Result[ParsedName, Diagnostic]:
+	match state.input.tokens.get(state.position):
+		Some(token):
+			match token.kind:
+				IdentifierToken(spelling):
+					Ok({
+						name = {
+							spelling = spelling,
+							span = token.span
+						},
+						next = {
+							input = state.input,
+							position = state.position + 1
+						},
+					})
+				_:
+					Err(
+						expected(
+							state,
+							message,
+							"use an ASCII identifier starting with a letter or underscore",
+						),
+					)
+		None:
+			Err(
+				expected(
+					state,
+					message,
+					"use an ASCII identifier starting with a letter or underscore",
+				),
+			)
+
+
+-- This is the expression boundary for the only currently supported expression.
+private pure func consume_zero(state: ParserState) -> Result[ParserState, Diagnostic]:
+	match state.input.tokens.get(state.position):
+		Some(token):
+			match token.kind:
+				ZeroLiteral:
+					Ok({
+						input = state.input,
+						position = state.position + 1,
+					})
+				_:
+					Err(
+						expected(
+							state,
+							"expected the integer literal 0",
+							"use 0 as the entire function body",
+						),
+					)
+		None:
+			Err(
+				expected(
+					state,
+					"expected the integer literal 0",
+					"use 0 as the entire function body",
+				),
+			)
+
+
+pure func parse(input: LexedProgram) -> Result[ParsedProgram, Diagnostic]:
+	start: ParserState = {
+		input = input,
+		position = 0
+	}
+	after_func ?= consume_symbol(
+		start,
+		FunctionKeyword,
+		"expected a function declaration at column 1",
+		"start with func main() -> Int:",
+	)
+	function ?= consume_name(after_func, "expected a function name")
+	after_open ?= consume_symbol(
+		function.next,
+		LeftParen,
+		"expected '(' after the function name",
+		"write main() with no parameters",
+	)
+	after_parameters ?= consume_symbol(
+		after_open,
+		RightParen,
+		"expected ')' with no parameters",
+		"write main() with no parameters",
+	)
+	after_arrow ?= consume_symbol(
+		after_parameters,
+		Arrow,
+		"expected '->' before the return type",
+		"write main() -> Int with adjacent arrow characters",
+	)
+	return_type ?= consume_name(after_arrow, "expected a return type")
+	after_header ?= consume_symbol(
+		return_type.next,
+		Colon,
+		"expected ':' after the function header",
+		"end the header with ':' and put 0 on the next line",
+	)
+	after_newline ?= consume_symbol(
+		after_header,
+		Newline,
+		"expected a newline after the function header",
+		"put 0 on the next line",
+	)
+	after_indent ?= consume_symbol(
+		after_newline,
+		Indent,
+		"expected an indent of one tab or four spaces",
+		"indent 0 with exactly one tab or four spaces",
+	)
+	after_body ?= consume_zero(after_indent)
+	var end: ParserState = after_body
+
+	match input.tokens.get(end.position):
+		Some(token):
+			match token.kind:
+				SymbolToken(Newline):
+					end = {
+						input = input,
+						position = end.position + 1
+					}
+				_:
+					void
+		None:
+			void
+
+	if end.position != input.tokens.length():
+		Err(
+			expected(
+				end,
+				"unexpected input after the zero expression",
+				"keep exactly one function with only 0 as its body and no extra blank lines",
+			),
+		)
+	else:
+		Ok({
+			function_name = function.name,
+			return_type = return_type.name,
+			body = ZeroExpression,
+		})
