@@ -35,7 +35,7 @@ import:
 		CoreFunction,
 		CoreForeignArgPassing(ForeignBorrowArgs),
 		CoreForeignFunction,
-		CoreFunctionKind(ClosureBodyFunction, UserFunction),
+		CoreFunctionKind(ClosureBodyFunction, ForeignFunction, UserFunction),
 		CoreHashContainerConstructor(
 			CustomHashContainerConstructor,
 			ImplHashContainerConstructor,
@@ -83,7 +83,7 @@ import:
 			VariantSymbolCollision,
 			VariantWithoutDefinitionId,
 		),
-		build_callable_symbol_plan,
+		validate_callable_identities,
 		symbol_projection_error_text,
 		c_emission_foreign_boundary_types,
 		c_emission_static_string_literals,
@@ -94,7 +94,8 @@ import:
 		planned_emitted_callable_name,
 		prepare_c_emission_symbols,
 		projected_callable_base_symbol,
-		projected_callable_name,
+		callable_identity_matches,
+		c_emission_canonical_empty_lists,
 	../../../src/compiler/stage_10_backend/emit:
 		CoreEmitError(CorePreparationFailed),
 		core_emit_error_message,
@@ -768,34 +769,19 @@ pure func test_callable_id_contract_uses_compact_portable_identifiers() -> Bool:
 	name == "brp_no" and not name.starts_with("__") and not name.starts_with("_[A-Z]")
 
 
-pure func test_callable_plan_is_order_independent() -> Bool:
+pure func test_callable_index_is_order_independent() -> Bool:
 	first = candidate("module_alpha_first", 7, ProjectedUserFunction)
 	second = candidate("module_beta_second", 3, ProjectedClosureBody)
 
-	match (
-		(
-			build_callable_symbol_plan(
-				[first, second],
-				["main"],
-			),
-			build_callable_symbol_plan(
-				[second, first],
-				["main"],
-			),
-		)
-	):
+	match (validate_callable_identities([first, second]), validate_callable_identities([second, first])):
 		(Ok(left), Ok(right)):
 			(
-				projected_callable_name(
-					left,
-					"module_alpha_first",
-					7,
-				) == projected_callable_name(right, "module_alpha_first", 7)
-				and projected_callable_name(
-					left,
-					"module_beta_second",
-					3,
-				) == projected_callable_name(right, "module_beta_second", 3)
+				callable_identity_matches(left, "module_alpha_first", 7)
+				and callable_identity_matches(right, "module_alpha_first", 7)
+				and callable_identity_matches(left, "module_beta_second", 3)
+				and callable_identity_matches(right, "module_beta_second", 3)
+				and not callable_identity_matches(left, "module_beta_second", 7)
+				and not callable_identity_matches(right, "module_alpha_first", 99)
 			)
 		_:
 			False
@@ -805,87 +791,97 @@ pure func test_similar_callable_names_have_distinct_symbols() -> Bool:
 	projected_callable_base_symbol(1) != projected_callable_base_symbol(2)
 
 
-pure func test_callable_plan_coalesces_repeated_identity() -> Bool:
+pure func test_callable_index_coalesces_repeated_identity() -> Bool:
 	item = candidate("module_repeat", 9, ProjectedUserFunction)
 
-	match (
-		build_callable_symbol_plan(
-			[item, item],
-			["main"],
-		)
-	):
-		Ok(plan):
-			projected_callable_name(
-				plan,
-				"module_repeat",
-				9,
-			) == Some(projected_callable_base_symbol(9))
+	match validate_callable_identities([item, item]):
+		Ok(index):
+			callable_identity_matches(index, "module_repeat", 9)
 		Err(_):
 			False
 
 
-pure func test_callable_plan_rejects_disagreeing_repeated_identity() -> Bool:
+pure func test_callable_index_rejects_disagreeing_repeated_identity() -> Bool:
 	first = candidate("module_repeat", 9, ProjectedUserFunction)
 	second = { first | kind = ProjectedClosureBody }
 
-	match (
-		build_callable_symbol_plan(
-			[first, second],
-			[],
-		)
-	):
+	match validate_callable_identities([first, second]):
 		Err(DuplicateCallableIdentity(name, def_id)):
 			name == "module_repeat" and def_id == 9
 		_:
 			False
 
 
-pure func test_callable_plan_rejects_definition_id_owned_by_two_callables() -> Bool:
-	match (
-		build_callable_symbol_plan(
-			[
-				candidate("module_first", 9, ProjectedUserFunction),
-				candidate("module_second", 9, ProjectedUserFunction),
-			],
-			[],
-		)
-	):
-		Err(DuplicateCallableDefinitionId(9, first, second)):
-			first == "module_first" and second == "module_second"
+pure func test_callable_index_rejects_definition_id_owned_by_two_callables() -> Bool:
+	first = candidate("module_first", 9, ProjectedUserFunction)
+	second = candidate("module_second", 9, ProjectedClosureBody)
+
+	match (validate_callable_identities([second, first]), validate_callable_identities([first, second])):
+		(Err(DuplicateCallableDefinitionId(9, left_first, left_second)),
+		 Err(DuplicateCallableDefinitionId(9, right_first, right_second))):
+			(
+				left_first == "module_first" and left_second == "module_second"
+				and right_first == left_first and right_second == left_second
+			)
 		_:
 			False
 
 
-pure func test_callable_plan_escapes_preserved_compact_name() -> Bool:
-	match (
-		build_callable_symbol_plan(
-			[candidate("module_first", 0, ProjectedUserFunction)],
-			["main", "brp_0"],
-		)
-	):
+private pure func callable_reservation_program(closure: Bool, reservations: List[String]) -> CoreProgram:
+	body = if closure:
+		closure_body_function("fixture_closure", 0, "fixture_closure", False)
+	else:
+		user_function("fixture_user", 0, LiteralExpr(IntLiteral(1), int_type(), synthetic_core_source_loc()))
+	var decls: List[CoreDecl] = [FunctionDecl(body)]
+	var def_id: Int = 1
+
+	for name in reservations:
+		reservation = user_function(name, def_id, VoidExpr(VoidType, synthetic_core_source_loc()))
+		decls = decls.append(FunctionDecl({ reservation |
+			body = None, function_kind = ForeignFunction({
+				c_name = name,
+				includes = [],
+				link_flags = [],
+				arg_passing = ForeignBorrowArgs
+			})
+		}))
+		def_id += 1
+
+	{ decls = decls, foreign_includes = [], source_files = [] }
+
+
+pure func test_emission_plan_escapes_preserved_compact_name() -> Bool:
+	match prepare_c_emission_symbols(callable_reservation_program(False, ["brp_0", "brp_0_"])):
 		Ok(plan):
-			projected_callable_name(plan, "module_first", 0) == Some("brp_0_")
+			planned_emitted_callable_name(plan, 0) == Some("brp_0__")
 		Err(_):
 			False
 
 
-pure func test_callable_plan_escapes_preserved_closure_static_name() -> Bool:
-	match (
-		build_callable_symbol_plan(
-			[candidate("module_first", 0, ProjectedClosureBody)],
-			["__sc_brp_0", "__sc_brp_0_"],
-		)
-	):
+pure func test_emission_plan_escapes_preserved_closure_static_name() -> Bool:
+	match prepare_c_emission_symbols(callable_reservation_program(True, ["__sc_brp_0", "__sc_brp_0_"])):
 		Ok(plan):
-			projected_callable_name(plan, "module_first", 0) == Some("brp_0__")
+			planned_emitted_callable_name(plan, 0) == Some("brp_0__")
 		Err(_):
 			False
 
 
-pure func test_callable_plan_rejects_negative_definition_id() -> Bool:
-	match build_callable_symbol_plan([candidate("module_first", -1, ProjectedUserFunction)], []):
+pure func test_callable_index_rejects_negative_definition_id() -> Bool:
+	match validate_callable_identities([candidate("module_first", -1, ProjectedUserFunction)]):
 		Err(InvalidCallableDefinitionId(-1, name)):
 			name == "module_first"
+		_:
+			False
+
+
+pure func test_callable_index_preserves_first_error() -> Bool:
+	first = candidate("module_repeat", 9, ProjectedUserFunction)
+	second = { first | kind = ProjectedClosureBody }
+	invalid = candidate("module_invalid", -1, ProjectedUserFunction)
+
+	match (validate_callable_identities([first, second, invalid]), validate_callable_identities([invalid, first, second])):
+		(Err(DuplicateCallableIdentity("module_repeat", 9)), Err(InvalidCallableDefinitionId(-1, "module_invalid"))):
+			True
 		_:
 			False
 
@@ -1609,11 +1605,22 @@ pure func test_production_emits_canonical_empty_list_from_plan() -> Bool:
 		source_files = []
 	}
 	symbol_name: String = "__blorp_canonical_empty_list_pointer_plain"
+	late_reservation_is_present: Bool = match prepare_c_emission_symbols(program):
+		Ok(plan):
+			match c_emission_canonical_empty_lists(plan):
+				[empty]:
+					empty.symbol_name == symbol_name and planned_emitted_callable_name(plan, 34) == Some("brp_y")
+				_:
+					False
+		Err(_):
+			False
 
 	match emit_fixture_program(program):
 		Ok(artifact):
 			(
-				artifact.c_code.contains("void* data[1]; } ${symbol_name} = {")
+				late_reservation_is_present
+				and artifact.c_code.contains("brp_y(")
+				and artifact.c_code.contains("void* data[1]; } ${symbol_name} = {")
 				and artifact.c_code.contains("return (blorp_List*)&${symbol_name};")
 			)
 		Err(_):
@@ -1974,34 +1981,35 @@ tests: TestSuite = {
 			"callable ID contract uses compact portable identifiers",
 			test_callable_id_contract_uses_compact_portable_identifiers,
 		),
-		("callable plan is order independent", test_callable_plan_is_order_independent),
+		("callable index is order independent", test_callable_index_is_order_independent),
+		("callable index preserves first error", test_callable_index_preserves_first_error),
 		(
 			"similar callable names have distinct symbols",
 			test_similar_callable_names_have_distinct_symbols,
 		),
 		(
-			"callable plan coalesces repeated identity",
-			test_callable_plan_coalesces_repeated_identity,
+			"callable index coalesces repeated identity",
+			test_callable_index_coalesces_repeated_identity,
 		),
 		(
-			"callable plan rejects disagreeing repeated identity",
-			test_callable_plan_rejects_disagreeing_repeated_identity,
+			"callable index rejects disagreeing repeated identity",
+			test_callable_index_rejects_disagreeing_repeated_identity,
 		),
 		(
-			"callable plan rejects definition ID owned by two callables",
-			test_callable_plan_rejects_definition_id_owned_by_two_callables,
+			"callable index rejects definition ID owned by two callables",
+			test_callable_index_rejects_definition_id_owned_by_two_callables,
 		),
 		(
-			"callable plan escapes preserved compact name",
-			test_callable_plan_escapes_preserved_compact_name,
+			"emission plan escapes preserved compact name",
+			test_emission_plan_escapes_preserved_compact_name,
 		),
 		(
-			"callable plan escapes preserved closure static name",
-			test_callable_plan_escapes_preserved_closure_static_name,
+			"emission plan escapes preserved closure static name",
+			test_emission_plan_escapes_preserved_closure_static_name,
 		),
 		(
-			"callable plan rejects negative definition ID",
-			test_callable_plan_rejects_negative_definition_id,
+			"callable index rejects negative definition ID",
+			test_callable_index_rejects_negative_definition_id,
 		),
 		(
 			"projection boundary rejects duplicate final definition ID",

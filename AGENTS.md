@@ -196,6 +196,16 @@ the change's design document or in `benchmarks/results/`, so that compiler
 work can remove it. A change still stays within any cost ceiling its spec
 sets.
 
+For compiler data-model refactors, require matched before/after self-compile
+allocations and retired instructions, plus production/test line counts reported
+separately. Significant regressions in allocations, retired instructions, or
+production line count are not acceptable merely because the model is cleaner or
+another metric improves. Necessary correctness-test growth is allowed. Aim to
+reduce production lines; do not hide growth through compressed formatting or
+deleted coverage.
+Set numerical cost ceilings before implementation, investigate repeatable
+increases at the owning phase, and reject or rescope a change that exceeds them.
+
 ### Naming
 
 Function, parameter and binding shape follow [`docs/CODE_STYLE.md`](docs/CODE_STYLE.md).

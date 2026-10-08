@@ -43,6 +43,7 @@ import:
 		ctfe_context_from_program,
 		ctfe_context_function_by_callable_id,
 		ctfe_context_imported_functions_by_source,
+		ctfe_context_imported_function_by_callable_id,
 		ctfe_context_module_alias,
 		ctfe_context_module_global_value,
 		ctfe_context_module_has_global_binding,
@@ -541,6 +542,42 @@ func test_context_groups_imported_functions_by_module_and_source() -> Bool:
 			False
 
 
+func test_context_imported_function_lookup_preserves_selection_outcomes() -> Bool:
+	context = ctfe_fixture_imported_context(
+		typed_program([]),
+		"dep",
+		[[
+			TypedFunctionDecl(typed_function("render", Some(20))),
+			TypedFunctionDecl(typed_function("render", Some(21))),
+			TypedFunctionDecl({ typed_function("render", Some(21)) | decl = { parsed_function("render") | is_pure = False } }),
+			TypedFunctionDecl(typed_function("parse", Some(22))),
+		]],
+	)
+
+	match context:
+		Some(value):
+			match ctfe_fixture_module_id(value, "dep"):
+				Some(module_id):
+					match (
+						ctfe_context_imported_function_by_callable_id(value, module_id, "render", 21),
+						ctfe_context_imported_function_by_callable_id(value, module_id, "parse", 99),
+						ctfe_context_imported_function_by_callable_id(value, module_id, "missing", 20),
+						ctfe_context_imported_function_by_callable_id(value, module_id, "render", 99),
+					):
+						(Some(exact), Some(singleton), None, None):
+							(
+								exact.info.callable_id == Some(21)
+								and exact.info.decl.is_pure
+								and singleton.info.callable_id == Some(22)
+							)
+						_:
+							False
+				None:
+					False
+		None:
+			False
+
+
 func test_context_groups_private_imported_functions() -> Bool:
 	imported_program = typed_program(
 		[TypedPrivateDecl(TypedFunctionDecl(typed_function("helper", Some(23))))],
@@ -565,10 +602,13 @@ func test_context_groups_private_imported_functions() -> Bool:
 
 func test_context_merges_duplicate_imported_module_groups() -> Bool:
 	context = ctfe_fixture_imported_context(
-		typed_program([]),
+		typed_program([TypedFunctionDecl(typed_function("local", Some(10)))]),
 		"dep",
 		[
-			[TypedFunctionDecl(typed_function("render", Some(24)))],
+			[
+				TypedFunctionDecl(typed_function("render", Some(24))),
+				TypedFunctionDecl(typed_function("unindexed", None)),
+			],
 			[TypedFunctionDecl(typed_function("render", Some(25)))],
 		],
 	)
@@ -576,6 +616,16 @@ func test_context_merges_duplicate_imported_module_groups() -> Bool:
 	match context:
 		Some(value):
 			functions = ctfe_fixture_imported_functions_by_source(value, "dep", "render")
+			callable_order_matches = match value.functions:
+				[(10, local), (24, first), (25, second)]:
+					(
+						local.source_name == "local"
+						and ctfe_context_module_path(value, local.module_id) == Some("target")
+						and ctfe_context_module_path(value, first.module_id) == Some("dep")
+						and ctfe_context_module_path(value, second.module_id) == Some("dep")
+					)
+				_:
+					False
 
 			match (functions.get(0), functions.get(1)):
 				(Some(first), Some(second)):
@@ -583,6 +633,8 @@ func test_context_merges_duplicate_imported_module_groups() -> Bool:
 						functions.length() == 2
 						and first.info.callable_id == Some(24)
 						and second.info.callable_id == Some(25)
+						and callable_order_matches
+						and ctfe_fixture_imported_functions_by_source(value, "dep", "unindexed").is_empty()
 					)
 				_:
 					False
@@ -777,6 +829,10 @@ tests: TestSuite = {
 		(
 			"context groups private imported functions",
 			test_context_groups_private_imported_functions,
+		),
+		(
+			"context imported function lookup preserves selection outcomes",
+			test_context_imported_function_lookup_preserves_selection_outcomes,
 		),
 		(
 			"context imported function index has bounded allocation growth",

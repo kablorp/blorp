@@ -122,17 +122,18 @@ record CCallableSymbolCandidate {
 }
 
 
-record CCallableSymbol {
+private record ValidatedCallableIdentity {
 	kind: CProjectedCallableKind,
-	qualified_name: String,
-	def_id: Int,
-	projected_name: String
+	diagnostic_name: String
 }
 
 
-record CCallableSymbolPlan {
-	by_definition_id: Dict[Int, CCallableSymbol]
-}
+---
+A read-only index derived from the inventory's candidates after checking their
+compilation-local definition identities. Only validation constructs it; C
+spellings are minted later, after every reservation has been collected.
+---
+opaque type ValidatedCallableIndex = Dict[Int, ValidatedCallableIdentity]
 
 
 private record CEmissionCallablePlan {
@@ -299,71 +300,38 @@ private pure func ordered_pair(first: String, second: String) -> (String, String
 		(second, first)
 
 
-private pure func callable_symbol(
-	candidate: CCallableSymbolCandidate,
-	preserved: Dict[String, Bool],
-) -> CCallableSymbol:
-	{
-		kind = candidate.kind,
-		qualified_name = candidate.qualified_name,
-		def_id = candidate.def_id,
-		projected_name = available_projected_callable_name(
-			candidate.def_id,
-			candidate.kind,
-			preserved,
-		)
-	}
-
-
-pure func build_callable_symbol_plan(
+pure func validate_callable_identities(
 	candidates: List[CCallableSymbolCandidate],
-	preserved_names: List[String],
-) -> Result[CCallableSymbolPlan, CSymbolProjectionError]:
-	var by_definition_id: Dict[Int, CCallableSymbol] = {}
+) -> Result[ValidatedCallableIndex, CSymbolProjectionError]:
+	var by_definition_id: Dict[Int, ValidatedCallableIdentity] = {}
 	var plan_error: Option[CSymbolProjectionError] = None
-	preserved: Dict[String, Bool] = preserved_symbol_index(preserved_names)
 
 	for candidate in candidates:
 		if plan_error.is_none():
 			if candidate.def_id < 0:
 				plan_error = Some(
-					InvalidCallableDefinitionId(
-						candidate.def_id,
-						candidate.qualified_name,
-					),
+					InvalidCallableDefinitionId(candidate.def_id, candidate.qualified_name),
 				)
 			else:
-				symbol: CCallableSymbol = callable_symbol(candidate, preserved)
-
 				match by_definition_id.get(candidate.def_id):
 					Some(existing):
-						if existing.qualified_name != symbol.qualified_name:
+						if existing.diagnostic_name != candidate.qualified_name:
 							(first, second) = ordered_pair(
-								existing.qualified_name,
-								symbol.qualified_name,
+								existing.diagnostic_name,
+								candidate.qualified_name,
 							)
 							plan_error = Some(
-								DuplicateCallableDefinitionId(
-									candidate.def_id,
-									first,
-									second,
-								),
+								DuplicateCallableDefinitionId(candidate.def_id, first, second),
 							)
-						else if (
-							existing.kind != symbol.kind
-							or existing.def_id != symbol.def_id
-							or existing.projected_name != symbol.projected_name
-						):
+						else if existing.kind != candidate.kind:
 							plan_error = Some(
-								DuplicateCallableIdentity(
-									candidate.qualified_name,
-									candidate.def_id,
-								),
+								DuplicateCallableIdentity(candidate.qualified_name, candidate.def_id),
 							)
-						else:
-							void
 					None:
-						by_definition_id = by_definition_id.set(candidate.def_id, symbol)
+						by_definition_id = by_definition_id.set(candidate.def_id, {
+							kind = candidate.kind,
+							diagnostic_name = candidate.qualified_name
+						})
 		else:
 			void
 
@@ -371,13 +339,12 @@ pure func build_callable_symbol_plan(
 		Some(error):
 			Err(error)
 		None:
-			Ok({by_definition_id = by_definition_id})
+			Ok(into_opaque ValidatedCallableIndex(by_definition_id))
 
 
 ---
-Publish only the callable facts needed while printing C. Semantic names and
-the original callable records remain in the validation plan above, whose
-lifetime ends at the projection boundary.
+Publish only the callable facts needed while printing C. Semantic names remain
+in the validated identity index above, whose lifetime ends at this boundary.
 ---
 private pure func build_emission_callable_plan(
 	candidates: List[CCallableSymbolCandidate],
@@ -397,33 +364,16 @@ private pure func build_emission_callable_plan(
 	{by_definition_id = by_definition_id}
 
 
-pure func projected_callable_name(
-	plan: CCallableSymbolPlan,
+pure func callable_identity_matches(
+	index: ValidatedCallableIndex,
 	qualified_name: String,
 	def_id: Int,
-) -> Option[String]:
-	planned_callable(
-		plan.by_definition_id,
-		qualified_name,
-		def_id,
-	).map(
-		func(symbol): symbol.projected_name,
-	)
-
-
-private pure func planned_callable(
-	by_definition_id: Dict[Int, CCallableSymbol],
-	qualified_name: String,
-	def_id: Int,
-) -> Option[CCallableSymbol]:
-	match by_definition_id.get(def_id):
-		Some(symbol):
-			if symbol.qualified_name == qualified_name:
-				Some(symbol)
-			else:
-				None
+) -> Bool:
+	match (from_opaque ValidatedCallableIndex(index)).get(def_id):
+		Some(identity):
+			identity.diagnostic_name == qualified_name
 		None:
-			None
+			False
 
 
 private pure func c_emission_callable_plan(plan: CEmissionSymbolPlan) -> CEmissionCallablePlan:
@@ -821,13 +771,13 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 
 
 private pure func missing_structured_callable(
-	plan: CCallableSymbolPlan,
+	plan: ValidatedCallableIndex,
 	name: String,
 	def_id: Option[Int],
 ) -> Option[CSymbolProjectionError]:
 	match def_id:
 		Some(selected_id):
-			if projected_callable_name(plan, name, selected_id).is_some():
+			if callable_identity_matches(plan, name, selected_id):
 				None
 			else:
 				Some(MissingProjectedCallable(name, selected_id))
@@ -841,10 +791,10 @@ that chose it (`backend_projection`) or a later one dropped or renumbered the
 function.
 ---
 private pure func unresolved_callback_definition(
-	plan: CCallableSymbolPlan,
+	plan: ValidatedCallableIndex,
 	def_id: Int,
 ) -> Option[CSymbolProjectionError]:
-	if plan.by_definition_id.contains(def_id):
+	if (from_opaque ValidatedCallableIndex(plan)).contains(def_id):
 		None
 	else:
 		Some(UnresolvedCallbackDefinition(def_id))
@@ -856,10 +806,10 @@ projection can check is that the body was declared. A miss means a pass
 dropped or renumbered a hoisted body after closure conversion.
 ---
 private pure func hoisted_callable_projection_error(
-	plan: CCallableSymbolPlan,
+	plan: ValidatedCallableIndex,
 	def_id: Int,
 ) -> Option[CSymbolProjectionError]:
-	match plan.by_definition_id.get(def_id):
+	match (from_opaque ValidatedCallableIndex(plan)).get(def_id):
 		Some(_):
 			None
 		None:
@@ -867,14 +817,14 @@ private pure func hoisted_callable_projection_error(
 
 
 private pure func task_projection_error(
-	plan: CCallableSymbolPlan,
+	plan: ValidatedCallableIndex,
 	task: CoreTaskClosure,
 ) -> Option[CSymbolProjectionError]:
 	hoisted_callable_projection_error(plan, task.def_id)
 
 
 private pure func constructor_projection_error(
-	plan: CCallableSymbolPlan,
+	plan: ValidatedCallableIndex,
 	constructor: CoreHashContainerConstructor,
 ) -> Option[CSymbolProjectionError]:
 	match constructor:
@@ -893,7 +843,7 @@ private pure func constructor_projection_error(
 
 
 private pure func expr_projection_error(
-	plan: CCallableSymbolPlan,
+	plan: ValidatedCallableIndex,
 	expr: CoreExpr,
 ) -> Option[CSymbolProjectionError]:
 	match expr:
@@ -934,7 +884,7 @@ private pure func expr_projection_error(
 		VarExpr(variable, FunctionType(_, _, _), _):
 			match variable.def_id:
 				Some(def_id):
-					if projected_callable_name(plan, variable.name, def_id).is_some():
+					if callable_identity_matches(plan, variable.name, def_id):
 						Some(UnprojectedCallableValue(variable.name, def_id))
 					else:
 						None
@@ -945,7 +895,7 @@ private pure func expr_projection_error(
 
 
 private pure func validate_expr_projection(
-	plan: Option[CCallableSymbolPlan],
+	plan: Option[ValidatedCallableIndex],
 	initial_static_string_literal_pool: BackendStaticStringLiteralPool,
 	root: CoreExpr,
 ) -> CProjectionValidation:
@@ -1061,7 +1011,7 @@ private pure func validate_expr_projection(
 
 
 private pure func validate_program_projection(
-	plan: Option[CCallableSymbolPlan],
+	plan: Option[ValidatedCallableIndex],
 	program: CoreProgram,
 ) -> CProjectionValidation:
 	var error: Option[CSymbolProjectionError] = None
@@ -1268,12 +1218,12 @@ private pure func prepare_c_emission_symbols_for_inventory(
 	inventory: CProgramSymbolInventory,
 ) -> Result[CEmissionSymbolPlan, CSymbolProjectionError]:
 	native_snapshot_helpers ?= native_snapshot_helper_names(program, inventory.type_naming)
-	match build_callable_symbol_plan(inventory.candidates, inventory.preserved_names):
+	match validate_callable_identities(inventory.candidates):
 		Err(error):
 			Err(error)
-		Ok(preliminary_plan):
+		Ok(validated_identities):
 			validation: CProjectionValidation = validate_program_projection(
-				Some(preliminary_plan),
+				Some(validated_identities),
 				program,
 			)
 
