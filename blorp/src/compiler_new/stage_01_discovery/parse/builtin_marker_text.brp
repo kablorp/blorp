@@ -1,0 +1,79 @@
+-- The frozen parser treats an interpolated builtin marker as static splitter
+-- text, not an expression with holes. Reproduce that text from immutable lexical
+-- bytes without parsing holes or issuing syntax ids. The lexer remains the
+-- authority for token boundaries; this compatibility encoding goes with the
+-- frozen marker contract when that contract is redesigned.
+import:
+	../lex/interpolation: interpolation_segments
+	../lex/lexed_module: InterpolationScan, ScannedPiece(ScannedText, ScannedHole)
+	../lex/scan_support: byte_at
+	../tables/span: Span, span_start, span_end
+	../tables/token: TokenKind(InterpolatedPipeStringToken)
+
+
+pure func static_builtin_marker_text(text: String, kind: TokenKind, span: Span, scan: InterpolationScan) -> String:
+	if kind == InterpolatedPipeStringToken:
+		var marker = ""
+		for segment in interpolation_segments(text, kind, span.span_start(), span.span_end()):
+			marker = marker + segment.lead + text.substring(segment.start, segment.end - segment.start).replace("$" + "{", "{")
+		marker
+	else:
+		var prefix = ""
+		var tail_start: Option[Int] = None
+		for piece in scan.pieces:
+			match piece:
+				ScannedText(value): prefix = prefix + value.text
+				ScannedHole(hole):
+					tail_start = Some(hole.expression_start)
+					break
+		match tail_start:
+			Some(start): quoted_marker_tail(text, start, span.span_end() - 1, prefix)
+			None: prefix
+
+
+private pure func quoted_marker_tail(text: String, start: Int, end: Int, prefix: String) -> String:
+	var marker = prefix.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}") + "{"
+	var position = start
+	var run_start = start
+	var depth = 1
+	var in_string = False
+	while position < end:
+		character = byte_at(text, position)
+		if character == '\\':
+			-- Escapes in the tail retain their authored spelling. Outside a
+			-- hole, a Unicode escape's braces are part of that escape too.
+			if (depth == 0 and position + 2 < end
+				and byte_at(text, position + 1) == 'u'
+				and byte_at(text, position + 2) == '{'):
+				position = position + 3
+				while position < end:
+					if byte_at(text, position) == '}' or byte_at(text, position) == '"' or byte_at(text, position) == '\n':
+						if byte_at(text, position) == '}':
+							position = position + 1
+						break
+					position = position + 1
+			else:
+				position = position + 2
+		else if character == '"':
+			if depth > 0:
+				in_string = not in_string
+			position = position + 1
+		else if (character == '$' and position + 1 < end
+			and byte_at(text, position + 1) == '{' and not in_string):
+			marker = marker + text.substring(run_start, position - run_start) + "{"
+			position = position + 2
+			run_start = position
+			depth = depth + 1
+		else if character == '{' or character == '}':
+			if not in_string:
+				if depth == 0:
+					marker = marker + text.substring(run_start, position - run_start) + "\\" + text.substring(position, 1)
+					run_start = position + 1
+				else if character == '{':
+					depth = depth + 1
+				else:
+					depth = depth - 1
+			position = position + 1
+		else:
+			position = position + 1
+	marker + text.substring(run_start, end - run_start)

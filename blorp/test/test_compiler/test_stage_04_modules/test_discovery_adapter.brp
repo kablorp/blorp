@@ -83,6 +83,7 @@ import:
 		BuiltinTypePreviewOutcome(PreviewedBuiltinType),
 		preview_builtin_type,
 	../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state
+	../../../src/compiler_new/stage_01_discovery/parse/stop_reason: StopReason(TokenAfterExpression)
 	../../../src/compiler_new/stage_01_discovery/parse/preview_source: PreviewSource, preview_source
 	../../../src/compiler_new/stage_01_discovery/parse/record_preview:
 		RecordPreviewOutcome(PreviewedRecord, RejectedRecordPreview, UnsupportedRecordPreview),
@@ -90,8 +91,6 @@ import:
 	../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: rejected_diagnostics
 	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan as ScanStop
 	../../../src/compiler_new/stage_01_discovery/parse/tree_global_header_parser: GlobalHeaderPreview
-	../../../src/compiler_new/stage_01_discovery/parse/tree_trait_method_header_parser:
-		MethodBodyExtent(AbstractMethod, SkippedDefaultBody),
 	../../../src/compiler_new/stage_01_discovery/parse/union_preview:
 		UnionPreviewOutcome(PreviewedUnion),
 		preview_union,
@@ -2064,20 +2063,27 @@ A value the old parser accepts and the tree parser does not read yet, so the
 scan stops at the global or function that holds it and the projection stops at
 that declaration's header. `inner` is written inside it; a name there must not
 reach the name table. These stops exist only until the tree parser reads every
-body (`docs/DISCOVERY_REDESIGN.md`, section 8, M4 exit criteria). When a slice
-reads this shape, replace it, here and in `TRAIT_HEADER_SOURCE` and
-`IMPLEMENTATION_HEADER_SOURCE`, by one the stop census still lists.
+body (`docs/DISCOVERY_REDESIGN.md`, section 8, M4 exit criteria). A binary
+operator after a block lambda remains unread even when the corpus has no
+such input. The grouping starts on its own line so its anchor is independent
+of the declaration header's width. `Count` precedes the lambda's real body,
+preserving the authored spelling order and the body-only name oracle.
 ---
 private pure func unread_value(inner: String) -> String:
-	"into_opaque Count(" + inner + ")"
+	"Count(\n\t(func():\n\t\t" + inner + " + Count(func(): 1)\n\t+ Count)\n)"
 
 
 ---
 An indented body the tree parser does not read yet, at `indent`, iterating
-`name`; see `unread_value`.
+`name`. The concurrent loop is supported; its body holds the same unsupported
+block-lambda continuation as `unread_value`. Reusing `item` as the call
+name preserves the authored identifier vocabulary of the loop fixture.
 ---
 private pure func unread_block(indent: String, name: String) -> String:
-	"\n" + indent + "for item in " + name + " concurrently(limit: 2):\n" + indent + "\titem"
+	("\n" + indent + "for item in " + name + " concurrently(limit: 2):\n"
+		+ indent + "\titem + func():\n"
+		+ indent + "\t\titem + item(func(): 1)\n"
+		+ indent + "\t+ item")
 
 
 -- The declaration projection deliberately has no ParsedProgram constructor.
@@ -2098,6 +2104,23 @@ func projected(text: String, names: NameTable) -> Option[LegacyDeclarationProjec
 					None
 		Err(_):
 			None
+
+
+-- Successful conversions translate type names before value names and reuse
+-- repeated type/value spellings across the next declaration.
+func test_opaque_globals_complete_and_preserve_written_name_order() -> Bool:
+	text = "first = into_opaque m.Handle[Item](Source)\nsecond = from_opaque m.Handle[Item](first)\nrecord Later {}"
+	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
+	match projected(text, EMPTY_NAME_TABLE):
+		Some(projection):
+			comparison = declaration_prefix_comparison(existing, projection)
+			match projection.stop:
+				ReachedEndOfSource:
+					(existing.diagnostics.is_empty() and comparison.differences.is_empty()
+						and comparison.completed_declarations == 3
+						and name_table_spellings(projection.names) == ["first", "m", "Handle", "Item", "Source", "second", "Later"])
+				_: False
+		None: False
 
 
 func test_float_globals_preserve_checked_digits_in_full_ast() -> Bool:
@@ -2448,13 +2471,14 @@ func test_name_global_projection_reuses_names_and_excludes_deferred_values() -> 
 
 
 func test_name_global_completion_preserves_unsupported_name_table() -> Bool:
-	var correct: Bool = True
+	-- A name after the initializer newline is now read in full, including its
+	-- authored layout and spelling in the independent legacy AST comparison.
+	var correct: Bool = projection_matches("value: Int =\n\tUnsupported\nrecord Later {}", 2)
 
 	for initializer in [
-		"Unsupported\n.field",
-		"Unsupported\n\t.field",
+		"Unsupported\n.\nfield",
+		"Unsupported\n\t.field(if True: 1 else: 2)",
 		"123 Other",
-		"\n\tUnsupported",
 		unread_value("Unsupported"),
 		"(" + unread_value("Unsupported") + ")",
 	]:
@@ -2484,6 +2508,44 @@ func test_name_global_completion_preserves_unsupported_name_table() -> Bool:
 			_:
 				correct = False
 
+	correct
+
+
+func test_builtin_global_projection_reuses_names_without_marker_names() -> Bool:
+	(before, source_index) = name_table_intern(EMPTY_NAME_TABLE, "Source")
+	text = "value: Int = builtin(\"helper_name\") + Source\nrecord Later {}"
+	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
+	match projected(text, before):
+		Some(projection):
+			comparison = declaration_prefix_comparison(existing, projection)
+			completed = match projection.stop:
+				ReachedEndOfSource: True
+				_: False
+			(completed and existing.diagnostics.is_empty() and comparison.differences.is_empty()
+				and comparison.completed_declarations == 2
+				and name_table_spellings(projection.names) == ["Source", "value", "Int", "Later"]
+				and name_table_find_id(projection.names, "Source") == Some(name_id_from_interned_index(source_index))
+				and name_table_spellings(before) == ["Source"])
+		None: False
+
+
+func test_leading_dot_global_projection_reuses_existing_names() -> Bool:
+	(before, source_index) = name_table_intern(EMPTY_NAME_TABLE, "Source")
+	var correct = True
+	for initializer in ["Source\n.field()", "Source\n\t.field()"]:
+		text = "value: Int = ${initializer}\nrecord Later {}"
+		existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
+		match projected(text, before):
+			Some(projection):
+				comparison = declaration_prefix_comparison(existing, projection)
+				completed = match projection.stop:
+					ReachedEndOfSource: True
+					_: False
+				correct = (correct and completed and existing.diagnostics.is_empty() and comparison.differences.is_empty()
+					and comparison.completed_declarations == 2 and name_table_spellings(projection.names) == ["Source", "value", "Int", "field", "Later"]
+					and name_table_find_id(projection.names, "Source") == Some(name_id_from_interned_index(source_index))
+					and name_table_spellings(before) == ["Source"])
+			None: correct = False
 	correct
 
 
@@ -3096,8 +3158,33 @@ func test_prefix_comparison_validates_forward_authored_and_private_functions() -
 private FUNCTION_HEADER_SOURCE: String = "---\nApply a value.\n---\nprivate @tail_recursive pure func apply[T: m.Eq + Hashable, #N](value: T, (left, right): (Int, Int), _: Int) -> T[#N] where #N == #3:"
 
 
+-- Retain the fixture's exact unsupported boundary independently of prefix
+-- projection. A malformed legacy body must not become a header-stop oracle.
+private func block_lambda_tail_boundary_matches(text: String) -> Bool:
+	existing = parse_compiler_source(source_file(ROOT_PATH, ROOT_MODULE_NAME, text))
+	lexed = lex_module(module_id_at_row(0), text)
+
+	match new_parse_state(lexed):
+		Ok(entry):
+			(_, scan) = ScanStop.scan_module_declarations(entry)
+			match scan.stop:
+				ScanStop.StoppedAtUnreadDeclaration(unread):
+					existing.diagnostics.is_empty() and unread.stop.reason == TokenAfterExpression
+				_:
+					False
+		Err(_):
+			False
+
+
 func test_function_header_projection_compares_rich_authored_and_forward_headers() -> Bool:
 	var correct: Bool = True
+
+	for text in [
+		FUNCTION_HEADER_SOURCE + unread_block("\t", "value"),
+		TRAIT_HEADER_SOURCE,
+		IMPLEMENTATION_HEADER_SOURCE,
+	]:
+		correct = block_lambda_tail_boundary_matches(text) and correct
 
 	-- Pair the forward declaration so the independent old module oracle accepts
 	-- it. A forward declaration is read in full, so the projection stops at the
@@ -3873,7 +3960,19 @@ func test_prefix_comparison_global_anchor_is_declaration_start_not_grouped_expre
 func test_prefix_comparison_global_initializer_entry_preserves_layout_and_grouping() -> Bool:
 	var correct: Bool = True
 
-	for initializer in ["(" + unread_value("1 + 2") + ")", "\n\t(1 + 2)", "-- comment before value\n\t(1 + 2)"]:
+	-- These layouts now complete, so compare every AST field and span rather
+	-- than expecting an initializer stop.
+	for initializer in ["\n\t(1 + 2)", "-- comment before value\n\t(1 + 2)"]:
+		correct = projection_matches(
+			"record Before {}\nprivate var value: Int = ${initializer}",
+			2,
+		) and correct
+
+	for initializer in [
+		"(" + unread_value("1 + 2") + ")",
+		"\n\t(" + unread_value("1 + 2") + ")",
+		"-- comment before value\n\t(" + unread_value("1 + 2") + ")",
+	]:
 		correct = prefix_matches(
 			"record Before {}\nprivate var value: Int = ${initializer}",
 			1,
@@ -4029,9 +4128,9 @@ func test_prefix_comparison_rejected_and_no_progress_stops_are_always_difference
 			False
 
 
-private TRAIT_HEADER_SOURCE: String = "---\nTrait documentation.\n---\nprivate trait Shape[T: m.Eq + Hashable, #N]: m.Base + Printable:\n\tpure func area(self: T, pair: (Int, Int), _: Int) -> m.Output[#N]\n\tfunc describe(self: T) -> String:\n\t\tfor item in BodyOnlyName concurrently(limit: 2):\n\t\t\titem"
+private TRAIT_HEADER_SOURCE: String = "---\nTrait documentation.\n---\nprivate trait Shape[T: m.Eq + Hashable, #N]: m.Base + Printable:\n\tpure func area(self: T, pair: (Int, Int), _: Int) -> m.Output[#N]\n\tfunc describe(self: T) -> String:" + unread_block("\t\t", "BodyOnlyName")
 
-private IMPLEMENTATION_HEADER_SOURCE: String = "---\nImplementation documentation.\n---\nprivate implements Shape for m.Box[List[n.Item], #03, #N]:\n\t@tail_recursive\n\tpure func apply[T: m.Eq, #M](self: m.Box[T], value: T) -> T where #M == #N:\n\t\tfor item in BodyOnlyName concurrently(limit: 2):\n\t\t\titem\n\tfunc describe(self: m.Box[Int]) -> String: into_opaque Count(OtherBodyOnlyName)"
+private IMPLEMENTATION_HEADER_SOURCE: String = "---\nImplementation documentation.\n---\nprivate implements Shape for m.Box[List[n.Item], #03, #N]:\n\t@tail_recursive\n\tpure func apply[T: m.Eq, #M](self: m.Box[T], value: T) -> T where #M == #N:" + unread_block("\t\t", "BodyOnlyName") + "\n\tfunc describe(self: m.Box[Int]) -> String: into_opaque Count(OtherBodyOnlyName)"
 
 
 func test_trait_header_projection_preserves_structural_syntax() -> Bool:
@@ -4281,6 +4380,7 @@ func test_the_stages_seed_names_equal_the_existing_vocabulary() -> Bool:
 tests: TestSuite = {
 	description = "Legacy discovery adapter",
 	tests = [
+		("opaque globals complete and preserve written name order", test_opaque_globals_complete_and_preserve_written_name_order),
 		(
 			"float globals preserve checked full ast",
 			test_float_globals_preserve_checked_digits_in_full_ast,
@@ -4316,6 +4416,14 @@ tests: TestSuite = {
 		(
 			"unsupported name globals preserve names",
 			test_name_global_completion_preserves_unsupported_name_table,
+		),
+		(
+			"builtin globals reuse names without marker names",
+			test_builtin_global_projection_reuses_names_without_marker_names,
+		),
+		(
+			"leading dot globals reuse existing names",
+			test_leading_dot_global_projection_reuses_existing_names,
 		),
 		(
 			"name globals preserve earlier deferred owner",

@@ -1049,14 +1049,17 @@ primary = IDENT
                                                         (* tuple, 2 to 4 elements *)
         | "[" [ expr_list ] "]"                         (* list *)
         | braced
-        | "builtin" [ "(" STRING ")" ]                  (* standard library bodies *)
+        | "builtin" [ "(" builtin_marker ")" ]          (* standard library bodies *)
         | "into_opaque" conversion_type "(" expression ")"
         | "from_opaque" conversion_type "(" expression ")"
         | with_expr
         | debug_block
         | concurrent_block ;
 
-conversion_type = IDENT [ "." IDENT ] [ "[" type_args "]" ] ;
+builtin_marker = STRING | RAW_STRING | PIPE_STRING | RAW_PIPE_STRING
+               | ISTRING | IPIPE_STRING ;
+
+conversion_type = type ;                         (* ordinary written type grammar *)
 
 braced = "{" "}"                                                        (* empty Dict *)
        | "{" field_init { "," field_init } [ "," ] "}"                  (* record *)
@@ -1067,6 +1070,15 @@ field_init = name "=" expression ;
 dict_entry = expression "=>" expression ;
 ```
 
+- A builtin marker is one string token, including raw and pipe forms, and
+  excludes docstrings (`LP:7456-7510`). The frozen parser stores interpolated
+  marker text without evaluating or parsing its holes; marker parentheses
+  contain metadata, not an expression or argument list. Use a concrete quoted
+  helper name when writing a builtin body.
+- Opaque conversions read an ordinary written type before the parenthesized
+  value (`LP:7512-7559`). Whether that type refers to an opaque type defined
+  in the current module is checked after parsing. The parentheses contain one
+  expression, rather than a call's argument list.
 - A braced form is a record literal when the token after `{` is a name
   followed by `=`. Otherwise its first expression is read, and the token after
   it decides: `=>` a Dict, `|` a record update, anything else a vector
@@ -1157,8 +1169,9 @@ lambda_body  = NEWLINE block              (* a bracketed block when inside brack
   requires `limit` and accepts `limit` and `timeout`. `max_threads` and
   `limit` are positive integer literals that fit in `Int`; `0`, negative
   numbers, larger literals and other expressions are errors. Each name
-  appears at most once. `for ... concurrently` takes a single name as its
-  binder. These are parser rules (`LP:5442-5764`).
+  appears at most once. `for ... concurrently` takes a single binding target,
+  a name or `_`; tuple binders are rejected. These are parser rules
+  (`LP:5442-5764`).
 - `with` takes exactly one binding; a second one is rejected with the help to
   nest `with` blocks (`LP:5319-5378`).
 - `select` may be a binding's value today, and both the parser and the
@@ -1186,8 +1199,14 @@ on the line after its `DEDENT` continues the expression
 
 parses as `(if c: print("a")) - 3`, and in `x = 1 + if c: ...` a following
 line `+ 4` adds 4 to the whole sum. An `if` or `match` that is a binding's
-whole value is not read inside the operator loop (`LP:3677-3698`), so there
-the operator line is ``expected expression``.
+whole value on the assignment's line is not read inside the operator loop
+(`LP:3677-3698`), so there
+the operator does not continue the value: `- 3` starts a separate negation
+statement, while a line beginning with `+` or `and` is ``expected expression``.
+A next-line assignment value enters the operator loop within its own indent.
+Leading `if`/`match` call arguments, list elements and subscript indices use
+the direct control entry; grouping, tuples and braced items use the operator
+entry.
 
 > **Recommended (D3):** what follows the `DEDENT` that ends a control
 > expression is always the next statement, so a line starting with `-` is a
@@ -1509,8 +1528,8 @@ A second line at the value's indentation is a syntax error at its first
 token: ``expected the end of the assignment value``, with the help that an
 indented value is one expression.
 
-> **Current behaviour differs:** both parsers end the value after its first
-> expression and leave the `INDENT` open, so
+> **Current behaviour differs:** the frozen legacy parser ends the value after
+> its first expression and leaves the `INDENT` open, so
 >
 > ```blorp
 >     x =
@@ -1520,7 +1539,8 @@ indented value is one expression.
 > ```
 >
 > reads `2` as a statement and reports misleading errors where the function
-> ends. *(implementation defect)*
+> ends. The tree reader safely declines this malformed closing layout instead
+> of reproducing that recovery. *(implementation defect)*
 
 **Token grammar.** Expressible, as above.
 
@@ -1549,8 +1569,17 @@ binary operator, `as` or `=` on the line after its closing `DEDENT` continues
 the expression ([3.7](#37-control-expressions-and-blocks)).
 
 **Token grammar.** Expressible: the control expression ends with `DEDENT`, and
-the operator loop simply continues with the next token. The tree path declines
-this form (`TREE:219-225`) and leaves it to the table path. See
+the operator loop simply continues with the next token. The tree reader now
+continues binary operators after completed `if` and `match` operands and
+expression statements, preserving their entry context and operator precedence.
+Same-line direct binding values keep their separate entry rule; next-line
+values use the operator grammar within their own indent. Direct call/list/
+subscript items also retain their bypass. A completed block-lambda tail now
+leaves the next statement or global declaration at the cursor, including
+through prefix operators or as the last operand of a binary expression.
+Grouping clears this ending evidence. Binary operators following that lambda
+tail remain outside the tree reader's coverage, as do the `as`/`=` rejection
+paths. See
 [D3](#d3-operator-after-a-block) for the recommended rule.
 
 ### 4.6 Blocks inside same-line bodies
@@ -1783,7 +1812,9 @@ A hole holds exactly one expression, written on one line: the form of a
 Anything more is ``an interpolation hole must hold exactly one expression``; an
 empty hole is ``expected expression``; an assignment is rejected as in 5.1. A
 hole lies on one line, so it cannot hold a block, and therefore no `if` or
-`match`; a lambda with a same-line body is allowed. The owner decisions add:
+`match`; a lambda with a same-line body is allowed, including as a call
+argument (`"${items.map(pure func(item): item + 1).length()}"`). The owner
+decisions add:
 
 - the expression's type must be `Stringable`, a type rule enforced by
   inference (``Interpolated expression has type ... which cannot be converted
@@ -1871,13 +1902,14 @@ hexadecimal or exponent literals.
 ### D3. Operator after a block
 
 An operator on the line after a control expression's `DEDENT` continues the
-expression in statement and operand positions, but not as a binding's value
+expression in statement and operand positions, but not as a same-line binding's value
 (3.7, 4.5). An `if` statement followed by a line `- 3` silently becomes a
 subtraction. **Recommendation:** an expression that ends with a block's
 `DEDENT` ends there, and what follows is the next statement. A line starting
 with `-` is then a negation statement, and a line starting with any other
 binary operator is ``expected expression`` with the help that an operator
-cannot start a line. This also removes the tree path's decline.
+cannot start a line. The tree reader currently reproduces the frozen binary
+continuation rule for `if` and `match`; this recommendation remains undecided.
 
 ### D4. Method-chain continuation
 
@@ -1927,8 +1959,9 @@ keywords, and `from` is reserved. They behave unevenly:
 | `from` | no: reserved | yes, as a name | `x from ch:` select arms |
 
 `after` looks accidental: it is a keyword only because a timeout arm is
-written `_ after t:`, a position where an identifier would be unambiguous, and
-the tree path declines it in expressions (`STOP:216`). **Recommendation:**
+written `_ after t:`, a position where an identifier would be unambiguous.
+The tree expression reader preserves the frozen value-name rules above;
+this does not settle the contextual-identifier decision. **Recommendation:**
 reserve `with` and `concurrent` for the reason `debug` and `select` are
 reserved: each starts a block, so binding one creates a name that cannot be
 read. Make `after`, `sealed`, `on`, `concurrently` and `from` contextual
@@ -2036,8 +2069,8 @@ in these places, where this document quotes the discovery stage:
 | Field assignment (5.2) | ``Field assignment is not supported. Use record update syntax: { record \| field = value }`` (`LP:6594-6595`) | message ``field assignment is not supported``, help ``use record update syntax…`` |
 | `?=` binding `_` (5.2) | `` `?=` cannot bind to `_`; use a name for the unwrapped value `` (`LP:6319`) | message `` `?=` cannot bind to `_` ``, help ``use a name for the unwrapped value`` |
 
-The tree path declines, rather than rejects, several forms that the table path
-reads: an operator after a block, `with`, `debug` and `concurrent` values,
-tuple destructuring, and `after`, `sealed`, `on` and `concurrently` in
-expressions (`TREE:1-15`, `STOP:198-239`). A decline is not a disagreement:
-the table path then reads the form as the old parser does.
+The tree path still declines, rather than rejects, some unsupported syntax and
+layout forms. Its remaining first-stop coverage is recorded in the M4 census
+linked from [Discovery Redesign](DISCOVERY_REDESIGN.md). A decline is not a
+disagreement: the table path then reads or rejects the form as the old parser
+does.

@@ -1,10 +1,10 @@
--- Top-level function header and deferred body evidence; no body syntax minted.
+-- Function heads stop at body entry; recovery retains rejected-header boundaries.
 import:
 	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
-	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, finished_builtin_type
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, finished_builtin_type, advanced
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser:
-		FunctionHeaderParse(ParsedFunctionHeader, RejectedFunctionHeader), FunctionBodyExtent(ForwardDeclaration, SkippedBody),
-		parse_function_header, deferred_body_span, deferred_body_token_start, deferred_body_token_end
+		FunctionHeadParse(ParsedFunctionHead, RejectedFunctionHead), FunctionBodyPresence(ForwardDeclaration, BodyFollows),
+		parse_function_head, function_body_follows
 	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: TypeParameter(TypeVariable, DimensionVariable, WildcardDimensionParameter)
 	../../../../src/compiler_new/stage_01_discovery/syntax/names: WrittenName
 	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: Documentation
@@ -15,8 +15,25 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
 	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility, PrivateVisibility), Purity(PureFunction), FunctionAnnotation(TailRecursiveAnnotation)
 	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end, spans_equal
-	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(FuncKeyword, ElseKeyword, ColonSymbol, NewlineToken, IdentifierToken, EndOfFileToken)
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(FuncKeyword, ElseKeyword, ColonSymbol, NewlineToken, DedentToken, IntLiteralToken, IdentifierToken, EndOfFileToken)
 	test: TestSuite
+
+
+pure func test_successful_head_stops_before_inline_and_indented_bodies() -> Bool:
+	var correct = True
+	for (text, cursor, first, last) in [
+		("func f(): 1\nfunc g():", IntLiteralToken, 10, 11),
+		("func f():\n\t1\nfunc g():", NewlineToken, 11, 11)
+	]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(state):
+				(parsed, result) = parse_function_head(state, PublicVisibility, None, [], PureFunction, state.current_span())
+				match result:
+					ParsedFunctionHead(head):
+						correct = correct and head.body_presence == BodyFollows and parsed.current_kind() == cursor and parsed.current_span().covers(first, last) and parsed.position() == 5 and no_body_ids(parsed)
+					_: correct = False
+			Err(_): correct = False
+	correct
 
 
 private pure func covers(span: Span, start: Int, end: Int) -> Bool:
@@ -35,18 +52,44 @@ private pure func no_definition_ids(parsed: ParseState, name: WrittenName) -> Bo
 	witness.id.definition_local_index() == 0
 
 
+-- At the token after an authored colon, layout alone says whether it
+-- promises an inline/indented body. The owner decides what absence means.
+pure func test_body_follows_uses_the_token_after_the_colon() -> Bool:
+	var correct = True
+	for (text, cursor, expected) in [
+		("func f():", EndOfFileToken, False),
+		("func f(): -- comment", EndOfFileToken, False),
+		("func f(): else:", ElseKeyword, False),
+		("holder\n\tfunc f():\nnext", DedentToken, False),
+		("func f():\nfunc g():", NewlineToken, False),
+		("func f():\n-- comment\n\nfunc g():", NewlineToken, False),
+		("func f():\n\t1", NewlineToken, True),
+		("func f():\n-- comment\n\n\t1", NewlineToken, True),
+		("func f(): 1", IntLiteralToken, True)
+	]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				var at_colon = entry
+				while at_colon.current_kind() != ColonSymbol and at_colon.current_kind() != EndOfFileToken:
+					at_colon = at_colon.advanced()
+				after_colon = at_colon.advanced()
+				correct = correct and after_colon.current_kind() == cursor and after_colon.function_body_follows() == expected
+			Err(_): correct = False
+	correct
+
+
 pure func test_rich_forward_header_composes_metadata_parameters_return_and_constraints() -> Bool:
 	text: String = "func apply[T: m.Eq + Hashable, #N, #_](x: T) -> T[#N] where #N == #3:"
 	match new_parse_state(lex_module(module_id_at_row(3), text)):
 		Ok(state):
 			documentation: Documentation = { text = "Apply a value.", span = state.current_span() }
 			annotations = [{ annotation = TailRecursiveAnnotation, span = state.current_span() }]
-			(parsed, result) = parse_function_header(state, PrivateVisibility, Some(documentation), annotations, PureFunction, state.current_span())
+			(parsed, result) = parse_function_head(state, PrivateVisibility, Some(documentation), annotations, PureFunction, state.current_span())
 
 			match result:
-				ParsedFunctionHeader(preview):
+				ParsedFunctionHead(preview):
 					header = preview.header
-					match (preview.body_extent, header.type_parameters, header.documentation, header.annotations):
+					match (preview.body_presence, header.type_parameters, header.documentation, header.annotations):
 						(ForwardDeclaration, [TypeVariable(variable), DimensionVariable(_), WildcardDimensionParameter(_)], Some(doc), [annotation]):
 							(header.visibility == PrivateVisibility and doc.text == documentation.text and doc.span.spans_equal(documentation.span)
 								and annotation.annotation == TailRecursiveAnnotation and annotation.span.spans_equal(state.current_span())
@@ -67,16 +110,18 @@ pure func test_rich_forward_header_composes_metadata_parameters_return_and_const
 pure func test_forward_colon_at_eof_and_newline_preserves_following_cursor() -> Bool:
 	var correct: Bool = True
 
-	for text in ["func f():", "func f():\nfunc g():"]:
+	for text in ["func f():", "func f():\nfunc g():", "func f():\n-- comment\n\nfunc g():", "func f(): else:"]:
 		match new_parse_state(lex_module(module_id_at_row(0), text)):
 			Ok(state):
-				(parsed, result) = parse_function_header(state, PublicVisibility, None, [], PureFunction, state.current_span())
+				(parsed, result) = parse_function_head(state, PublicVisibility, None, [], PureFunction, state.current_span())
 				match result:
-					ParsedFunctionHeader(preview):
-						match preview.body_extent:
+					ParsedFunctionHead(preview):
+						match preview.body_presence:
 							ForwardDeclaration:
 								cursor_correct: Bool = if text == "func f():":
 									parsed.current_kind() == EndOfFileToken and parsed.current_span().covers(9, 9)
+								else if text == "func f(): else:":
+									parsed.current_kind() == ElseKeyword and parsed.current_span().covers(10, 14)
 								else:
 									parsed.current_kind() == NewlineToken and parsed.current_span().covers(10, 10)
 								correct = (cursor_correct and preview.header.header_span.covers(0, 9) and preview.header.signature.return_type.is_none()
@@ -100,9 +145,9 @@ pure func test_function_header_preserves_authored_body_colon_span() -> Bool:
 		("func next():", 11, False), ("func next()   :", 14, False), ("func next()   : ()", 14, False)]:
 		match new_parse_state(lex_module(module_id_at_row(0), text)):
 			Ok(state):
-				(parsed, result) = parse_function_header(state, PublicVisibility, None, [], PureFunction, state.current_span())
+				(parsed, result) = parse_function_head(state, PublicVisibility, None, [], PureFunction, state.current_span())
 				match result:
-					ParsedFunctionHeader(preview):
+					ParsedFunctionHead(preview):
 						correct = (preview.header.body_colon.covers(colon_start, colon_start + 1)
 							and preview.header.signature.return_type.is_some() == has_return
 							and parsed.diagnostic_count() == 0 and no_body_ids(parsed)) and correct
@@ -113,102 +158,12 @@ pure func test_function_header_preserves_authored_body_colon_span() -> Bool:
 	correct
 
 
-private pure func skipped_body(text: String, body_start: Int, body_end: Int, next_start: Int, token_end: Int) -> Bool:
-	match new_parse_state(lex_module(module_id_at_row(0), text)):
-		Ok(state):
-			(parsed, result) = parse_function_header(state, PublicVisibility, None, [], PureFunction, state.current_span())
-			match result:
-				ParsedFunctionHeader(preview):
-					match preview.body_extent:
-						SkippedBody(body):
-							(preview.header.header_span.covers(0, 9) and body.deferred_body_span().covers(body_start, body_end)
-								and body.deferred_body_token_start() == 5 and body.deferred_body_token_end() == token_end and parsed.position() == token_end
-								and parsed.current_kind() == FuncKeyword and parsed.current_span().covers(next_start, next_start + 4)
-								and parsed.diagnostic_count() == 0 and no_body_ids(parsed) and no_definition_ids(parsed, preview.header.signature.name))
-						_:
-							False
-				_:
-					False
-		Err(_):
-			False
-
-
-pure func test_inline_body_skips_owned_newline_and_preserves_next_declaration() -> Bool:
-	skipped_body("func f(): 1 + 2\nfunc g():", 10, 15, 16, 9)
-
-
--- `else` at the function anchor continues the inline block expression;
--- the skipped extent must retain both branches before the next declaration.
-pure func test_inline_block_continuation_at_function_anchor_remains_one_body() -> Bool:
-	skipped_body("func f(): if True:\n\t1\nelse:\n\t2\nfunc g():", 10, 30, 31, 18)
-
-
-pure func test_indented_nested_body_preserves_authored_span_and_layout_interval() -> Bool:
-	skipped_body("func f():\n\tif True:\n\t\t1\n\telse:\n\t\t2\nfunc g():", 11, 34, 35, 21)
-
-
-pure func test_stray_else_after_nonconditional_body_remains_outside_deferred_extent() -> Bool:
-	text: String = "func f(): 1\nelse: 2\nfunc g():"
-	match new_parse_state(lex_module(module_id_at_row(0), text)):
-		Ok(state):
-			(parsed, result) = parse_function_header(state, PublicVisibility, None, [], PureFunction, state.current_span())
-			match result:
-				ParsedFunctionHeader(preview):
-					match preview.body_extent:
-						SkippedBody(body):
-							(body.deferred_body_span().covers(10, 11) and body.deferred_body_token_start() == 5
-								and body.deferred_body_token_end() == 7 and parsed.position() == 7
-								and parsed.current_kind() == ElseKeyword and parsed.current_span().covers(12, 16)
-								and parsed.diagnostic_count() == 0 and no_body_ids(parsed) and no_definition_ids(parsed, preview.header.signature.name))
-						_:
-							False
-				_:
-					False
-		Err(_):
-			False
-
-
-pure func test_multiple_else_if_continuations_stay_in_one_deferred_body() -> Bool:
-	skipped_body("func f(): if True:\n\t1\nelse if False:\n\t2\nelse:\n\t3\nfunc g():", 10, 48, 49, 26)
-
-
-pure func test_leading_dot_postfix_continuation_stays_in_inline_body() -> Bool:
-	skipped_body("func f(): value\n.method()\nfunc g():", 10, 25, 26, 12)
-
-
--- Parenthesized inline bodies may put their close at the function anchor;
--- that close still belongs to the body despite its column.
-pure func test_multiline_parenthesized_body_owns_anchor_close_and_following_layout() -> Bool:
-	skipped_body("func f(): foo(\n\t1,\n\t2,\n)\nfunc g():", 10, 24, 25, 13)
-
-
-pure func test_conditional_inside_parentheses_owns_else_but_leaves_later_stray_else() -> Bool:
-	text: String = "func f(): foo(if True:\n\t1\nelse:\n\t2\n)\nelse: 3\nfunc g():"
-	match new_parse_state(lex_module(module_id_at_row(0), text)):
-		Ok(state):
-			(parsed, result) = parse_function_header(state, PublicVisibility, None, [], PureFunction, state.current_span())
-			match result:
-				ParsedFunctionHeader(preview):
-					match preview.body_extent:
-						SkippedBody(body):
-							(body.deferred_body_span().covers(10, 36) and body.deferred_body_token_start() == 5
-								and body.deferred_body_token_end() == 22 and parsed.position() == 22
-								and parsed.current_kind() == ElseKeyword and parsed.current_span().covers(37, 41)
-								and parsed.diagnostic_count() == 0 and no_body_ids(parsed) and no_definition_ids(parsed, preview.header.signature.name))
-						_:
-							False
-				_:
-					False
-		Err(_):
-			False
-
-
 pure func test_missing_colon_before_indented_body_reports_header_and_skips_body() -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), "func f()\n\t1\nfunc g():")):
 		Ok(state):
-			(parsed, result) = parse_function_header(state, PublicVisibility, None, [], PureFunction, state.current_span())
+			(parsed, result) = parse_function_head(state, PublicVisibility, None, [], PureFunction, state.current_span())
 			match (result, parsed.diagnostics()):
-				(RejectedFunctionHeader, [at]):
+				(RejectedFunctionHead, [at]):
 					match at.diagnostic:
 						ExpectedToken(ExpectedColon(ColonInFunctionBody)):
 							(at.span.covers(8, 8) and parsed.current_kind() == FuncKeyword and parsed.current_span().covers(12, 16)
@@ -247,9 +202,9 @@ private pure func diagnostic_matches(actual: SyntaxDiagnostic, expected: Expecte
 private pure func rejected_header(text: String, expected: List[(ExpectedDiagnostic, Int)], cursor: TokenKind, first: Int, last: Int) -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(state):
-			(parsed, result) = parse_function_header(state, PublicVisibility, None, [], PureFunction, state.current_span())
+			(parsed, result) = parse_function_head(state, PublicVisibility, None, [], PureFunction, state.current_span())
 			var correct: Bool = match result:
-				RejectedFunctionHeader:
+				RejectedFunctionHead:
 					True
 				_:
 					False
@@ -286,27 +241,23 @@ pure func test_malformed_headers_reject_at_bounded_grammar_boundary() -> Bool:
 			(TokenDiagnostic(ExpectedColon(ColonInFunctionBody)), 9)
 		], IdentifierToken, 9, 10)
 		and rejected_header("func f(x: ): 1", [(PlainDiagnostic(ExpectedTypeDiagnostic), 10)], EndOfFileToken, 14, 14)
+		and rejected_header("func f(x: Int:\n1\nfunc g(): 2", [(TokenDiagnostic(ExpectedRightParen(RightParenInFunctionParameters)), 13)], NewlineToken, 15, 15)
+		and rejected_header("func f(x: Int:\n\t1\nfunc g(): 2", [(TokenDiagnostic(ExpectedRightParen(RightParenInFunctionParameters)), 13)], FuncKeyword, 18, 22)
 		and rejected_header("func f() -> : 1", [(PlainDiagnostic(ExpectedTypeDiagnostic), 12)], EndOfFileToken, 15, 15)
 		and rejected_header("func f()", [(TokenDiagnostic(ExpectedColon(ColonInFunctionBody)), 8)], EndOfFileToken, 8, 8))
 
 
 tests: TestSuite = {
-	description = "Direct tree function header and deferred body evidence",
+	description = "Direct tree function heads and body entry",
 	tests = [
-		("leading dot postfix continuation stays in inline body", test_leading_dot_postfix_continuation_stays_in_inline_body),
-		("multiline parenthesized body owns anchor close and following layout", test_multiline_parenthesized_body_owns_anchor_close_and_following_layout),
-		("conditional inside parentheses owns else but leaves later stray else", test_conditional_inside_parentheses_owns_else_but_leaves_later_stray_else),
+		("successful head stops at body entry", test_successful_head_stops_before_inline_and_indented_bodies),
+		("body follows the tokens after its colon", test_body_follows_uses_the_token_after_the_colon),
 
-		("stray else after nonconditional body remains outside deferred extent", test_stray_else_after_nonconditional_body_remains_outside_deferred_extent),
-		("multiple else if continuations stay in one deferred body", test_multiple_else_if_continuations_stay_in_one_deferred_body),
 		("bracket in function name preserves declared name recovery", test_bracket_in_function_name_preserves_declared_name_recovery),
 
-		("inline block continuation at function anchor remains one body", test_inline_block_continuation_at_function_anchor_remains_one_body),
 		("rich forward header composes metadata parameters return constraints", test_rich_forward_header_composes_metadata_parameters_return_and_constraints),
 		("function header preserves authored body colon span", test_function_header_preserves_authored_body_colon_span),
 		("forward colon at eof and newline preserves following cursor", test_forward_colon_at_eof_and_newline_preserves_following_cursor),
-		("inline body skips owned newline preserves next declaration", test_inline_body_skips_owned_newline_and_preserves_next_declaration),
-		("indented nested body preserves authored span and layout interval", test_indented_nested_body_preserves_authored_span_and_layout_interval),
 		("missing colon before indented body reports header and skips body", test_missing_colon_before_indented_body_reports_header_and_skips_body),
 		("malformed headers reject at bounded grammar boundary", test_malformed_headers_reject_at_bounded_grammar_boundary)
 	]

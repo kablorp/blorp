@@ -14,6 +14,7 @@ import:
 	../tables/token:
 		TokenKind(NewlineToken, EndOfFileToken, DedentToken, DotSymbol, IndentToken, ColonSymbol, LeftParenSymbol, IdentifierToken, UnderscoreSymbol,
 			EqualSymbol, QuestionEqualsSymbol)
+	token_cursor: is_soft_keyword
 	parse_state: ParseState, current_kind, current_span, peek_kind, reported_nesting_too_deep
 
 
@@ -62,7 +63,6 @@ fixed union StopReason:
 	-- Statements.
 	ExpressionSyntaxError
 	LocalFunctionHeaderRejected
-	LambdaInInterpolationHole
 	MalformedLambdaHeader
 	ConcurrentlyLoop
 	ValueOnNextLine
@@ -110,9 +110,6 @@ fixed union StopReason:
 	-- rejection path of section 3.17 turns it into a rejected module, and it goes
 	-- with `StopReason`.
 	NestingTooDeep
-	-- A replay that did not end where the skipped extent ends.
-	ReplayReported
-	BodyReplayDisagrees
 
 
 ---
@@ -206,22 +203,25 @@ The reason the current token gives when it stands where an expression must
 begin, or `None` for a token the expression parser reads as an atom. Every
 token kind is named, so a new kind does not compile until it is placed.
 
-A soft keyword is also a name where a name is allowed, so one is a block only
-when the tokens after it have the block's shape (`debug:`, `select:`,
-`concurrent:` or `concurrent(`, `with name =`); any other use is a name.
+Soft words are ordinary names in binder and field positions. Primary names
+are narrower: `after`, `sealed`, `from`, and `debug` immediately before a dot.
+The other block words require their block shape; `on` and `concurrently`
+remain unread as primary values.
 ---
 pure func expression_start_reason(state: ParseState) -> Option[StopReason]:
 	match state.current_kind():
-		IdentifierToken | DetachKeyword | IntLiteralToken | FloatLiteralToken | NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken | InterpolatedStringToken | InterpolatedPipeStringToken | CharLiteralToken | TrueKeyword | FalseKeyword | VoidKeyword | UnderscoreSymbol | MinusSymbol | NotKeyword | LeftParenSymbol | LeftBracketSymbol | LeftBraceSymbol | FuncKeyword | PureKeyword | IfKeyword | MatchKeyword | EndOfFileToken | RightParenSymbol | RightBracketSymbol:
+		IdentifierToken | DetachKeyword | IntLiteralToken | FloatLiteralToken | NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken | InterpolatedStringToken | InterpolatedPipeStringToken | CharLiteralToken | TrueKeyword | FalseKeyword | VoidKeyword | UnderscoreSymbol | MinusSymbol | NotKeyword | LeftParenSymbol | LeftBracketSymbol | LeftBraceSymbol | FuncKeyword | PureKeyword | IfKeyword | MatchKeyword | IntoOpaqueKeyword | FromOpaqueKeyword | BuiltinKeyword | AfterKeyword | SealedKeyword | FromKeyword | EndOfFileToken | RightParenSymbol | RightBracketSymbol:
 			None
-		DebugKeyword: Some(block_or_name(state.opens_block_form(), DebugBlock))
+		DebugKeyword:
+			if state.peek_kind(1) == DotSymbol:
+				None
+			else:
+				Some(block_or_name(state.opens_block_form(), DebugBlock))
 		SelectKeyword: Some(block_or_name(state.opens_block_form(), SelectBlock))
 		ConcurrentKeyword: Some(block_or_name(state.opens_block_form(), ConcurrentBlock))
 		WithKeyword: Some(block_or_name(state.opens_block_form(), WithBlock))
-		OnKeyword | AfterKeyword | SealedKeyword | ConcurrentlyKeyword: Some(SoftKeywordName)
-		BuiltinKeyword: Some(BuiltinBody)
-		IntoOpaqueKeyword | FromOpaqueKeyword: Some(OpaqueConversion)
-		VarKeyword | WhileKeyword | ForKeyword | InKeyword | ElseKeyword | FromKeyword | TryKeyword: Some(StatementKeywordInExpression)
+		OnKeyword | ConcurrentlyKeyword: Some(SoftKeywordName)
+		VarKeyword | WhileKeyword | ForKeyword | InKeyword | ElseKeyword | TryKeyword: Some(StatementKeywordInExpression)
 		BreakKeyword | ContinueKeyword: Some(LoopExitInExpression)
 		UnionKeyword | RecordKeyword | ResourceKeyword | ForeignKeyword | PrivateKeyword | TraitKeyword | ImplementsKeyword | SelfKeyword | TypeKeyword | AliasKeyword | OpaqueKeyword | ImportKeyword | WhereKeyword | AsKeyword:
 			Some(DeclarationKeywordInExpression)
@@ -240,7 +240,7 @@ pure func expression_start_reason(state: ParseState) -> Option[StopReason]:
 ---
 Whether the soft keyword at the cursor has the shape of its block: `debug:`
 or `select:`, `concurrent:` or `concurrent(`, `with name =` (or `:` or `?=`).
-Any other use of the word is a name.
+Other uses are handled by the frozen primary-name rules.
 ---
 pure func opens_block_form(state: ParseState) -> Bool:
 	match state.current_kind():
@@ -249,7 +249,7 @@ pure func opens_block_form(state: ParseState) -> Bool:
 		ConcurrentKeyword:
 			state.peek_kind(1) == ColonSymbol or state.peek_kind(1) == LeftParenSymbol
 		WithKeyword:
-			names_binding = state.peek_kind(1) == IdentifierToken or state.peek_kind(1) == UnderscoreSymbol
+			names_binding = state.peek_kind(1) == IdentifierToken or state.peek_kind(1).is_soft_keyword() or state.peek_kind(1) == UnderscoreSymbol
 			names_binding and (state.peek_kind(2) == EqualSymbol or state.peek_kind(2) == ColonSymbol or state.peek_kind(2) == QuestionEqualsSymbol)
 		_:
 			False

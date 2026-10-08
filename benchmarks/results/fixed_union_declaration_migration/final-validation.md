@@ -9,7 +9,7 @@ caller-selected trait closure remain deferred. No publication or release claim.
 
 ## Provenance
 
-Root `/Users/keithphilpott/.codex/worktrees/43a9/blorp`, HEAD
+Root `<worktree:43a9>`, HEAD
 `cbffad8a3b2cc62cf0194e13c97b44bc775ace4d`, dirty reviewed candidate.
 Compiled gates validated pre-final-docs staged tree
 `80375eff8b349a55e24fabd14ca3dd7c4f55017e`; numeric-only hygiene closure validated
@@ -59,7 +59,7 @@ send1+receive1. Stage2 is not the frozen bootstrap bridge. All jobs ran serially
 no timeout overrides or gate waivers. Typical gate command was
 `scripts/test --no-build --serial --log-dir <packet>/<gate>-logs <gate>`; raw
 metadata records the exact command for each gate. Audit used `--jobs 1`; focused
-tests used explicit own `--std-dir /Users/keithphilpott/.codex/worktrees/43a9/blorp/standard_library/src`.
+tests used explicit own `--std-dir <worktree:43a9>/standard_library/src`.
 
 The original independent compiled report is frozen at
 `/tmp/blorp-channel-final.tbXdUz/REPORT.md`, SHA

@@ -1,4 +1,4 @@
--- Implementation-method headers require lexical body evidence. M4 owns body
+-- Implementation-method heads require a body and stop at its entry. M4 owns body
 -- trees and expression diagnostics; this preview mints no method or body IDs.
 import:
 	../syntax/declarations: Annotation, Signature, TypeParameter, DimensionConstraint
@@ -9,7 +9,7 @@ import:
 	../tables/span: Span, span_covering
 	../tables/token: TokenKind(PureKeyword, FuncKeyword, ArrowSymbol, ColonSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken)
 	parse_state:
-		ParseState, diagnostic_count, current_kind, current_span, advanced, peek_kind, span_start_line,
+		ParseState, diagnostic_count, current_kind, current_span, advanced, peek_kind,
 		consume_declared_name, report_at_current, report_diagnostic, expect_token, report_expected_after_previous_content
 	tree_declaration_prefix_parser: parse_annotations_skipping_newlines
 	tree_type_parameter_parser: TypeParametersParse(NoTypeParameters, ParsedTypeParameters, RejectedTypeParameters), parse_type_parameters
@@ -17,7 +17,7 @@ import:
 	tree_parameter_parser: parse_parenthesized_parameters
 	tree_type_parser: parse_type
 	tree_dimension_constraint_parser: DimensionConstraintsParse(NoDimensionConstraints, ParsedDimensionConstraints, RejectedDimensionConstraints), parse_dimension_constraints
-	tree_function_header_parser: DeferredBody, FunctionBodyExtent(ForwardDeclaration, SkippedBody), skip_deferred_body
+	tree_function_header_parser: recover_rejected_function_body, function_body_follows
 
 
 record ImplementationMethodHeader {
@@ -29,18 +29,12 @@ record ImplementationMethodHeader {
 }
 
 
-record ImplementationMethodHeaderPreview {
-	header: ImplementationMethodHeader,
-	body: DeferredBody
-}
+union ImplementationMethodHeadParse:
+	ParsedImplementationMethodHead(ImplementationMethodHeader)
+	RejectedImplementationMethodHead
 
 
-union ImplementationMethodHeaderParse:
-	ParsedImplementationMethodHeader(ImplementationMethodHeaderPreview)
-	RejectedImplementationMethodHeader
-
-
-pure func parse_implementation_method_header(state: ParseState) -> (ParseState, ImplementationMethodHeaderParse):
+pure func parse_implementation_method_head(state: ParseState) -> (ParseState, ImplementationMethodHeadParse):
 	before: Int = state.diagnostic_count()
 	var start: Span = state.current_span()
 	(after_annotations, annotations) = parse_annotations_skipping_newlines(state)
@@ -57,12 +51,12 @@ pure func parse_implementation_method_header(state: ParseState) -> (ParseState, 
 		out = out.report_at_current(ExpectedImplMethodDiagnostic)
 		if out.current_kind() != DedentToken and out.current_kind() != EndOfFileToken:
 			out = out.advanced()
-		(out, RejectedImplementationMethodHeader)
+		(out, RejectedImplementationMethodHead)
 	else:
 		parse_method_header(out, before, start, annotations, purity)
 
 
-private pure func parse_method_header(out_at_keyword: ParseState, before: Int, start: Span, annotations: List[Annotation], purity: Purity) -> (ParseState, ImplementationMethodHeaderParse):
+private pure func parse_method_header(out_at_keyword: ParseState, before: Int, start: Span, annotations: List[Annotation], purity: Purity) -> (ParseState, ImplementationMethodHeadParse):
 	var out: ParseState = out_at_keyword
 
 	keyword: Span = out.current_span()
@@ -101,46 +95,30 @@ private pure func parse_method_header(out_at_keyword: ParseState, before: Int, s
 			[]
 	out = after_constraints
 	header_end: Span = out.current_span()
-	var body: Option[DeferredBody] = None
-	var scan_body: Bool = False
+	var body_follows: Bool = False
 
 	if out.current_kind() == ColonSymbol:
-		colon_line: Int = out.span_start_line(out.current_span())
 		out = out.advanced()
-		-- A colon promises a body only under the frozen body-follows predicate.
-		scan_body = if out.current_kind() == EndOfFileToken or out.current_kind() == DedentToken:
-			False
-		else if out.current_kind() == NewlineToken:
-			out.peek_kind(1) == IndentToken
-		else:
-			out.span_start_line(out.current_span()) <= colon_line
-		if not scan_body:
+		body_follows = out.function_body_follows()
+		if not body_follows:
 			out = out.report_diagnostic(name_position, Plain(MissingFunctionBodyDiagnostic))
 	else if out.current_kind() == NewlineToken and out.peek_kind(1) == IndentToken:
 		out = out.report_expected_after_previous_content(ExpectedColon(ColonInFunctionBody))
-		scan_body = True
+		body_follows = True
 	else if out.current_kind() == NewlineToken or out.current_kind() == DedentToken or out.current_kind() == EndOfFileToken:
 		out = out.report_diagnostic(name_position, Plain(MissingFunctionBodyDiagnostic))
 	else:
 		out = out.expect_token(ColonSymbol, ExpectedColon(ColonInFunctionBody))
 
-	if scan_body:
-		(after_body, extent) = skip_deferred_body(out, start)
-		out = after_body
-		match extent:
-			SkippedBody(deferred):
-				body = Some(deferred)
-			ForwardDeclaration:
-				out = out.report_diagnostic(name_position, Plain(MissingFunctionBodyDiagnostic))
-
 	if out.diagnostic_count() != before:
-		(out, RejectedImplementationMethodHeader)
+		recovered = if body_follows:
+			recover_rejected_function_body(out, start)
+		else:
+			out
+		(recovered, RejectedImplementationMethodHead)
 	else:
-		match (signature, body):
-			(Some(signature), Some(body)):
-				(out, ParsedImplementationMethodHeader({
-					header = { annotations = annotations, signature = signature, type_parameters = type_parameters, constraints = constraints, header_span = start.span_covering(header_end) },
-					body = body
-				}))
+		match signature:
+			Some(signature):
+				(out, ParsedImplementationMethodHead({ annotations = annotations, signature = signature, type_parameters = type_parameters, constraints = constraints, header_span = start.span_covering(header_end) }))
 			_:
-				(out, RejectedImplementationMethodHeader)
+				(out, RejectedImplementationMethodHead)

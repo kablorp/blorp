@@ -8,7 +8,7 @@ allowance. `EXACT_TOLERANCE` remains 100.
 All runs use the same unchanged root host SHA-256
 `e27b8bc719a8e7f4554368be27d522e039ccaed6c8717d9c698fdebe77296ea9`, CLI/runtime O2,
 split 8. Build status is FRESH only with the authorized staging-host override
-`BLORP_BOOTSTRAP_COMPILER_BIN=/Users/keithphilpott/.codex/worktrees/union-migration-bridge/blorp/bin/blorp`;
+`BLORP_BOOTSTRAP_COMPILER_BIN=<worktree:union-migration-bridge>/bin/blorp`;
 this is not default pinned-bootstrap freshness. No rebuild or parser source change.
 
 The scratch baseline and candidate differ only in that declaration's spelling.

@@ -98,7 +98,7 @@ func factorial(n: Int, acc: Int) -> Int:
 - `pure func` declares a pure function (no side effects)
 - Return type follows `->`. Body is indented; last expression is the return value. A body must have at least one expression or statement (`void` is a body that does nothing); a header with nothing under it is an error, except a top-level forward declaration (a header ending in `:` with no body) whose same-named function supplies the body, as the standard library's paired impure and pure signatures do
 - `@tail_recursive` verifies all recursive calls are in tail position. The Core pipeline lowers unmanaged scalar self-recursion to explicit loops, and lowers common list-consumer patterns like `[x, ...rest]` into cursor loops instead of allocating a tail list on every step
-- `builtin("module.name")` as a standard-library function body names a compiler-provided intrinsic; `builtin("c_name")` binds standard-library/runtime wrappers to a named C helper. Bare function-body `builtin` is not used in standard-library source.
+- `builtin("module.name")` as a standard-library function body names a compiler-provided intrinsic; `builtin("c_name")` binds standard-library/runtime wrappers to a named C helper. Bare function-body `builtin` is not used in standard-library source. The marker is static string-token text: interpolation holes are not evaluated. Write a concrete quoted helper name.
 
 ### Lambdas (Anonymous Functions)
 
@@ -121,6 +121,11 @@ Lambda parameter types are inferred from the expected function type at call site
 numbers: List[Int] = [1, 2, 3]
 doubled: List[Int] = numbers.map(func(x): x * 2)  -- x inferred as Int
 ```
+
+A lambda may also have an indented body. Returning to the enclosing indentation
+ends that body, so the following statement or declaration belongs to the
+enclosing scope. This also applies when `detach` takes a lambda with an
+indented body.
 
 ### Variables
 
@@ -346,6 +351,9 @@ for i in r:
 ```
 
 ### Strings
+
+An interpolation hole may call a function with a lambda whose body fits on the
+same line. The hole's final value must support conversion to `String`.
 
 ```blorp
 greeting: String = "Hello, world!"
@@ -1416,8 +1424,10 @@ pure func email_value(value: Email) -> String:
 `Email` is not interchangeable with `String`, so callers cannot accidentally
 pass arbitrary strings where an `Email` is required. `into_opaque Email(...)` and
 `from_opaque Email(...)` work only in the module that defines `Email`; expose public
-constructor/accessor functions when other modules need controlled access. The
-compiler erases the conversion after typechecking, so the representation keeps
+constructor/accessor functions when other modules need controlled access.
+The type after either keyword may include type arguments, as in
+`into_opaque Box[Int](value)`. The parentheses contain one value expression.
+The compiler erases the conversion after typechecking, so the representation keeps
 the same layout and optimizations as the target type.
 
 ### Generics
@@ -2901,6 +2911,9 @@ optional. Each name may appear once and no other names are accepted, so
 without a `limit` are parse errors. (`max_threads` belongs to `concurrent(...)`
 blocks, not loops.)
 
+The loop binds one name per element. Use `_` when the body does not need the
+element; tuple binders are not supported in concurrent loops.
+
 Loop-wide timeouts accept either raw integer milliseconds or typed `Duration`
 values:
 
@@ -3679,3 +3692,13 @@ remains an ordinary identifier elsewhere.
 
 `enum` is an ordinary identifier, not a declaration keyword. Declare named
 alternatives with `union` or `fixed union`.
+
+In the current syntax, `after`, `sealed`, `on`, `concurrently`, `debug`,
+`select`, `with` and `concurrent` can be names in bindings, parameters and
+record fields. Their use as values differs: `after` and `sealed` are value
+names, and `debug.log(...)` reads the name `debug`; bare `debug`, `select`,
+`with` and `concurrent` start their respective constructs. `on` and
+`concurrently` cannot be standalone values. `from` is a value name but remains
+reserved in ordinary binding and field positions. Prefer ordinary identifiers
+when naming a new binding; the [formal grammar](GRAMMAR.md#14-keywords)
+records these context distinctions.

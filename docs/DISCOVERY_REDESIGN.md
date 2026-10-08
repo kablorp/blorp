@@ -44,7 +44,7 @@ the differential migration. It found these unsound and replaced them:
 | Decision | Owner section |
 | --- | --- |
 | The lexer owns layout; tree parsers never compare line or column numbers, apart from named frozen-grammar quirks in one module | 3.16 |
-| Parse functions mint directly into the tree; recipes survive only as a cover grammar for assignment targets; there is no replay by token index | 3.16 |
+| Parse functions mint directly into the tree; a typed statement-head result distinguishes expressions from places; there are no recipes or replay by token index | 3.16 |
 | Nesting is bounded by one named `MAX_SYNTAX_NESTING` checked in `ParseState`, replacing the "1,000 deep through every walker" requirement | 3.14 |
 | Diagnostic parity means the first diagnostic of a rejected module, and no cascade the old parser lacks, replacing "every diagnostic matches" | 3.17, 6.3 |
 | M4 closes only when bodies parse inline, outcomes are accepted or rejected, and `StopReason` is deleted | 8 |
@@ -1931,7 +1931,7 @@ parser reports a missing one, so an accepted module always has it. The body
 runs as a task per element: its `BlockId` identifies that closure.
 ---
 record ConcurrentForStatement {
-	binder: Binder,
+	binder: BindingTarget,
 	iterable: Expression,
 	limit: CountParameter,
 	timeout: Option[TimeoutParameter],
@@ -2496,21 +2496,43 @@ in section 8) in three ways:
   extent and the owner records that carried it are removed (section 8, M4 exit
   criteria).
 
-**Assignment targets use a cover grammar.** A statement that begins
-`(a, b) = v` or `xs[i] = v` cannot be told from an expression statement until
-its `=`. This is the one case where an ID-free recipe remains: the parser reads
-the statement's leading expression as a recipe, then either reinterprets it as
-a target (`BindingTarget` or `SubscriptPlace`) and mints that, or, when no
-assignment operator follows, parses the statement again from the saved entry
-state with the minting parser. This follows ECMAScript's cover grammars, where
-a parenthesized expression is reinterpreted as a destructuring target once `=`
-follows. The recipe holds assignment-target shapes only (names, `_`, tuples of
-targets, and the skeleton of a subscript place), not a general expression
-recipe: an index expression inside a subscript place is read by the minting
-parser when the target is minted, and a leading expression of any other shape
-is read by the minting parser directly. The recipe type is private to the statement parser,
-is never stored in a tree, and nothing replays from a token index. Its cost is measured before it
-is accepted (rule 9 of `AGENTS.md`).
+**Statement heads finish as expressions or places.** A subscript at the start
+of a statement cannot be told from an expression statement until its `=`.
+The shared postfix parser receives an explicit completion context: an outer
+statement head, or an expression value. When a terminal ungrouped subscript
+in statement-head context is immediately followed by `=`, it finishes a
+`SubscriptPlace`; otherwise it finishes a `Subscript` expression. Its
+collection and indices have already parsed as expressions. This preserves
+their ids followed by the place's id, without issuing an unused expression id
+for the outer subscript. A typed result distinguishes the completed expression
+from the completed place; neither carries a recipe or an address to read later.
+
+Only the outer statement prefix/postfix reader receives statement-head context.
+Binary right operands, prefix operands, grouping contents, call arguments,
+subscript indices, controls, lambdas and interpolation holes use expression
+context. Thus `xs[i] + ys[j] = v` remains a non-place binary head;
+`xs[i].field = v` remains a field head. Earlier subscript links complete as
+expressions, so `xs[i][j] = v` completes only the last link as a place.
+Authored grouping is retained as parse evidence even though syntax erases the
+grouping node: `(xs[i]) = v` is not a place, while `(xs)[i] = v` is one.
+Name and discard assignments have their existing token-directed statement
+forms. A flat binder tuple followed immediately by `=` selects tuple
+destructuring through a token-only predicate. Its targets parse as binders,
+then its value parses as an expression, then the statement finishes; no tuple
+expression or target name-use ids are issued. The checked target tuple has two
+to four elements, each a name or `_`, with an optional trailing comma. Arity
+validation belongs to the binding parser, rather than the head predicate, so
+one-element and oversized comma-bearing heads reach their binding refusal.
+The frozen selector admits reserved keyword tokens on the binder path
+but excludes keyword-token soft words; it is not the general name predicate.
+Ordinary tuple values remain on the expression path.
+
+The direct-minting audit of 2026-10-07 replaces the earlier target-only cover
+recipe prescription with this completion boundary. A subscript's collection
+and indices can contain the full expression grammar; retaining their generic
+recipes would defeat the conversion, while recognizing them in another parser
+would duplicate that grammar. The shared parser can decide its terminal node
+before minting it, so a cover recipe and a speculative retry are unnecessary.
 
 ### 3.17 Recovery: a module with a syntax error has no tree
 
@@ -3506,7 +3528,7 @@ grammar is [`GRAMMAR.md`](GRAMMAR.md), and the history of each slice is in git
 | M1 | `syntax/` types, `IdMint` confined to `parse/`, the syntax dump and the id census; the opaque-type import-cycle repro retained as a fixture | Complete | `133eaf73a` |
 | M2 | `lex_module` and `LexedModule`: per-module spellings, checked literal values, a bridge into the table builder | Complete | `133eaf73a` |
 | M3 | Declaration-level tree parse: imports, foreign blocks, signatures, type parameters, bounds, types, dimensions, patterns, both record spellings, unions, aliases, builtin and resource types; the rejected-declaration diagnostic gate | Complete except first-diagnostic parity for rejected modules whose owners have bodies, which the M4 subset check takes over (section 6.3) | `133eaf73a`; fixed unions `d9c737a86` |
-| M4 | Body parser over trees and module assembly | In progress: 2,741 of 3,439 accepted corpus modules assemble; exit criteria below | the slices below |
+| M4 | Body parser over trees and module assembly | In progress: zero first stops across the 3,618-file current corpus; rejected-body subset parity, outcome unification and recovery deletion remain open | the slices below and the integration record |
 | M5 | Link, `DiscoveryOutcome` and the tree path behind a test-only selection | Not started | none |
 | M6 | The tree path becomes the stage's default | Not started; waits on product unification and the tuple hand-off | none |
 | M7 | Documentation settles on this design | Not started | none |
@@ -3543,30 +3565,455 @@ scoped by production imports (`6dac84324`), the formal grammar (`c9f802b7d`),
 the differential fuzzer (`c68074aea`), the 16 MB Linux main stack
 (`656ec4aad`) and the design decisions of 2026-10-06 (`8bb937e82`).
 
-**M4 exit criteria.** Each is required before M4 closes. The state is the
-state on main.
+**Worktree slice, 2026-10-07: leading-dot continuations.** The tree expression
+parser reads same-indent and indented leading-dot chains through its existing
+postfix recipes. A transient parser result records the indentation owned by
+the chain and whether it consumed the dedent ending the expression; this keeps
+the next statement and enclosing owner intact without source-position queries.
+Binary and logical tails use explicit evidence for the frozen parser's repair
+of one leaked continuation indent. Unary and range wrapping do not grant that
+repair, multiple leaked levels remain unread, and a newline that neither closes
+nor extends a chain stops recognition rather than repeating without progress.
+The ungrouped call-only condition remains unread; grouping the condition reads
+through the existing bracket grammar.
+
+Focused tests cover projected AST and span identity, exact id census and
+post-order, sibling and declaration boundaries, partial dedents, malformed
+rollback and diagnostics, and a 256-link continued chain. The matched baseline
+at `5fed50a38` scans 3,604 corpus files and records 702 stops (654 functions,
+29 globals and 19 implementations), of which 263 are indented method chains.
+The candidate scans the same 3,604 files and records 484 stops (439 functions,
+26 globals and 19 implementations): 218 fewer stops, with no remaining
+`indented-method-chain` first stop. The largest remaining coverage bucket is
+tuple destructuring, at 147 modules. Full corpus parity assembles and compares
+2,977 of 3,461 accepted modules, with zero mismatched files.
+
+Validation: `compiler-new` passes 1,011 tests, the seven importing suites pass
+252 tests, and `compiler-new-parity` passes all 3,620 checks. A targeted adapter
+differential also passes for the final global-parser test-only edit. Repository
+hygiene, artifact scanning and `git diff --check` pass; review reports no
+findings. The full ranked census is reproduced with
+`scripts/compiler-new-parity --stop-census`. This is coverage work, with no
+performance claim, and the slice is not yet recorded as landed.
+Direct minting, inline bodies, `DeferredBody`, existing recipe/replay removal,
+rejected-body diagnostic parity and the remaining M4 exit criteria stay open.
+
+**Worktree slice, 2026-10-07: token body-follows.** Function, trait-method
+and implementation-method headers share `function_body_follows`: at the token
+after the colon, EOF and DEDENT mean no body, NEWLINE needs a following INDENT,
+and an authored inline token starts a body. Each owner retains its policy for
+absence: a function forward declaration, a trait's abstract method without a
+colon, or a missing-body diagnostic when a method's colon promised one.
+The deferred-body scanner and its sibling/extent checks are unchanged. Its
+remaining line and column queries stay in `tree_function_header_parser.brp`
+until `skip_body` and `DeferredBody` leave; they are deferred scanner debt,
+not a frozen-grammar quirk to relocate. The restricted-symbol rule still waits
+on that removal. Focused tests pin the token contract, owner diagnostics,
+comments and blank lines, cursor/spans, sibling boundaries and absence of body
+ids. All 35 focused header tests, 252 importing tests, 1,012 `compiler-new`
+tests and 3,620 `compiler-new-parity` checks pass, with zero mismatched files.
+Twelve baseline/candidate malformed-header comparisons preserve the exact
+ordered diagnostic messages, help, spans and cursors; the malformed-parameter
+sibling regression also preserves the following declaration.
+The matched 3,604-file census retains the exact 484 module/kind/stop-reason
+records and their source lines (439 functions, 26 globals, 19 implementations).
+Hygiene, artifact scanning and `git diff --check` pass; review reports no
+findings. This slice is validated in the worktree and is not yet landed.
+
+**Direct-minting dependency boundary.** The existing expression and body
+recipes form one recursive group: expressions contain control and lambda
+bodies, and bodies contain statements, conditions, assignment places and
+expressions. An atoms/operators/postfix conversion cannot delete its shared
+recipes independently. A second parser for globals would duplicate the grammar;
+putting already-minted expressions in recipes would mix recognition with minted
+syntax and break their ID-free contract. The conversion therefore starts by
+removing the separate skipped-body extent authority from successful owner parsing.
+Headers stop at the body's entry, and their owners read it there. The existing
+body recognition and minting walks remain until the recursive group is converted
+together; this preparation is not direct minting completion. Recovery after
+head or declaration-prefix diagnostics must remain separate from accepted
+body parsing, so unsupported body grammar cannot add diagnostics or prevent
+that header from reaching its existing synchronization boundary.
+
+**Worktree preparatory slice, 2026-10-07: accepted-body entry.** Successful
+function, trait-method and implementation-method heads stop at the body entry.
+Functions distinguish a forward declaration from a following body; traits
+distinguish an abstract method from a default body; a successful implementation
+method head promises a body. Owners complete the body at that cursor and mint
+themselves after its children. A stray initial `else` remains outside the body,
+preserving the frozen scanner's absence-of-body behavior with a token test.
+`DeferredBody`, its span and token-bound accessors, skipped-body preview variants,
+`recognize_skipped_body`, extent-agreement checks and `BodyReplayDisagrees` are
+removed. Body recognition and recipe minting remain separate. The saved
+recognized state supplies the completed cursor after minting; its spellings
+already contain the written names, and the diagnostic guard prevents replay
+diagnostics from being discarded. Existing type, pattern and local-function
+head replays remain open.
+
+The lexical scanner is retained only for recovery after a head or its
+declaration prefix reports diagnostics. It returns a synchronized state,
+retains no body address, and does not determine the extent of an accepted body.
+Its coordinate queries remain explicit recovery debt; the restricted-symbol
+criterion is still open.
+
+A comment-only indented body exposes why the accepted scanner must leave:
+at `3c7dfb703`, it becomes a forward declaration and assembly rejects it even
+though the frozen parser accepts it. With the body-entry contract, the body
+parser declines the empty block with the existing `BlockNotClosed` stop and
+no rejection diagnostics. The fuzzer verdict changes from `wrong-reject` to
+`safe-stop`, so its obsolete known-defect allowance is removed. The module
+still does not assemble; this is a corrected outcome, not completed coverage.
+
+An existing lexer diagnostic takes priority over unread body grammar. Module
+assembly rejects the entry state before scanning declarations or checking
+forward pairs, preserving the lexer's ordered diagnostics without minting
+definitions. Otherwise a lexer-damaged empty body could become an unread-body
+outcome and hide the rejection. Stopping there follows section 3.17; modules
+without entry lexer diagnostics retain their existing scan and assembly rules.
+
+Validation passes: 226 focused parser/assembly tests, 253 importing tests,
+1,018 `compiler-new` tests, 6,828 `compiler-blorp` checks and 3,620 full
+`compiler-new-parity` checks, with zero mismatched files. The matched 3,604-path
+census retains 484 stopped modules (439 functions, 26 globals and 19
+implementations), with no added or removed stopped modules. All 3,582 unchanged
+inputs retain their exact stop outcomes and source lines. Removing
+`DeferredBody` advances the edited function-header parser's first stop from
+`opaque-conversion` to `tuple-destructuring`; ten source-line shifts are confined
+to edited files. Lexer-priority regressions fail before the guard (14/16) and
+pass afterward (16/16), pinning diagnostic text, help, spans, order and empty
+definitions. Hygiene, artifact scanning and `git diff --check` pass; review
+reports no findings. This preparation is validated in the worktree and is not
+yet landed. Recipes and the remaining replay/recovery debt keep M4 open.
+
+**Worktree slice, 2026-10-07: direct expressions and bodies.** The closed
+expression/body group now constructs syntax while reading it. Operators,
+postfix steps, aggregates, interpolation holes, statements, blocks, controls
+and lambdas finish their nodes after their children. Types, patterns and local
+function heads parse where their ids belong, without a recognition pass.
+`recipes.brp`, the recipe parse APIs, their generic mint walkers, saved
+type/pattern/local-head token positions, `resumed_at` and `resumed_after` are
+removed, along with the obsolete `ReplayReported` stop. The shared
+statement-head completion context of section 3.16 preserves
+subscript-place identity without a cover parser. Grouping and continuation
+facts remain explicit transient parse evidence; they are not inferred from
+the finished tree. Iterative control-chain construction frames hold completed
+children while their unfinished owners await post-order completion.
+
+Unsupported forms return their saved entry state whole. Public rejected
+expression trials retain the failed cursor, spellings and diagnostics with
+the entry's mint, discarding every trial id and definition. These retained
+diagnostics carry spans or spellings rather than discarded syntax identities;
+debug assertions require an added diagnostic, restored hole/nesting context and
+no new definition-bearing diagnostic at that boundary. Body and local-head
+errors decline before reaching it. A concurrent count is a checked value, so
+its literal/grouping reader
+issues no expression id. For other count shapes, a discarded direct-expression
+trial supplies the existing stop classification. The slice preserves the
+current grammar and interpolation-hole restrictions; unread grammar and
+rejected-header recovery remain open M4 work.
+
+Validation passes: 423 independent focused/importing checks, 6,828
+`compiler-blorp` checks, 1,023 `compiler-new` tests and 3,619 full
+`compiler-new-parity` checks. Full corpus parity compares 2,976 of 3,460
+accepted modules with zero mismatched files. The live corpus has 3,603 paths,
+one fewer because `recipes.brp` is deleted. The matched census retains the
+exact 484 module/owner/reason mappings (439 functions, 26 globals and 19
+implementations). All 3,595 unchanged surviving inputs retain their stop
+locations; five line shifts are confined to edited files. The
+[evidence and bounded cost record](../benchmarks/results/discovery_direct_mint_cost_2026-10-07.md)
+keeps deletion accounting and source/binary provenance separate from the
+remaining M4 coverage and M6 performance gates. Three paired retained-binary
+runs of a six-function assembly probe retain identical trees, spans, ids,
+spellings and family counts with a clean census. Managed allocations fall
+from 4,381 to 3,602; the live-object endpoint delta rises from 525 to 528.
+These fixture counts make no speed or retained-memory claim.
+
+**Worktree slice, 2026-10-07: flat tuple destructuring.** Statement parsing
+reads `(a, _, c) = value`, with two to four flat targets and an optional
+trailing comma. Bracket-joined target lines use the same token grammar. A
+private `TupleBinding` holds completed targets and their authored span; tuple
+loops wrap that result in `LoopTuple`, while destructuring wraps it in
+`TupleDestructure`. Discards issue no binder id. Named targets issue binder
+ids in written order, before value children, and the statement finishes last.
+The head predicate reads only token kinds through a transient lookahead
+offset; it saves no address and constructs no trial syntax. Projection
+translates target names before the value and preserves the frozen AST and
+spans.
+
+The selector preserves the frozen reserved/soft keyword distinction and
+defers arity checks to the binding parser. In this bounded slice, a reserved
+target or invalid arity safely stops with the existing `TupleDestructuring`
+reason and restores the saved body entry. Keyword-token soft words remain on
+their existing expression path; for example, `(debug, b) = value` stops at
+`debug` with `SoftKeywordName`. Nested, typed and non-name targets retain
+their previous refusal behavior. Unsupported or malformed values discard
+every target, prior body statement and trial spelling through whole-entry
+rollback. No new diagnostic, stop reason, recipe or token replay is added;
+body rejection conversion remains open M4 work.
+
+Validation passes 427 independent focused/importing checks, 1,026
+`compiler-new` tests and 3,619 full `compiler-new-parity` checks, with zero
+mismatched files. All 148 former tuple-first corpus stops advance: 138 modules
+fully assemble and ten reach later unread grammar. The accepted corpus now
+assembles 3,114 of 3,460 modules; 346 remain stopped. The matched 3,603-path
+census has five edited inputs and 3,598 byte-identical inputs, without unrelated
+stop mapping or location movements. Three paired runs of a ten-loop assembly
+probe preserve identical trees, spans, ids, spellings and counts with a clean
+census. The shared target result adds 30 managed allocation/release events
+(2,041 to 2,071 allocations), while both live-object endpoint deltas are 315.
+The [evidence and bounded cost record](../benchmarks/results/discovery_tuple_destructuring_2026-10-07.md)
+retains the source/binary provenance and fixture scope; no speed or retained-byte
+claim is made. The remaining grammar, rejected recovery and final outcome
+criteria keep M4 open.
+
+**Worktree slice, 2026-10-07: opaque conversions.** The expression reader
+constructs `into_opaque Type(value)` and `from_opaque Type(value)` directly
+using the existing `OpaqueConversion` and `OpaqueDirection` variants. Written
+type children finish first, value children next, and the conversion expression
+last. The ordinary written-type parser is shared with declarations; a type
+trial that adds diagnostics cannot produce an accepted conversion containing
+recovery syntax. The value is exactly one lowest-precedence expression,
+anchored at its own first token. Its enclosing conversion span runs from the
+keyword through the closing parenthesis. Postfix and operator composition
+then follow the ordinary expression path.
+
+Each conversion enters the existing nesting boundary once, and written types
+retain their own nesting levels. A chain of 127 conversions with simple named
+types fits the 128-level limit; 128 conversions exceed it because the deepest
+written type consumes a level too. The iterative legacy projection translates
+type names before value names, then completes the corresponding
+`ParsedOpaqueIntoExpr` or `ParsedOpaqueFromExpr`. Unsupported trials restore
+the saved entry whole; rejected expression trials retain diagnostics and
+spellings while restoring mint authority. This slice adds no recipe, replay,
+stop reason or general rejection recovery. The historical `OpaqueConversion`
+stop label remains until the later outcome cleanup.
+
+Validation passes 476 independent focused/importing checks, 1,031
+`compiler-new` tests and 3,619 full `compiler-new-parity` checks, with zero
+mismatched files. Accepted modules assembled in full rise from 3,114 to 3,236
+of 3,460; unread modules fall from 346 to 224. All 128 former opaque-first
+stops advance: 122 unchanged modules fully assemble and six reach later unread
+grammar. The matched 3,603-root census has thirteen edited inputs and 3,590
+byte-identical inputs; four benchmark dependencies outside that root list are
+verified separately. All other owner/reason mappings remain unchanged; the only
+unrelated location shift belongs to the edited adapter test. The adapter
+suite's shared unread fixture now uses a builtin expression that preserves its body-only names;
+all 21 existing boundary/name assertions remain unchanged, and an independent
+completed conversion case pins full AST and source-order name-table equality.
+The [evidence record](../benchmarks/results/discovery_opaque_conversions_2026-10-07.md)
+keeps baseline input identity, regression logs, gate commands and the matched
+stop comparison separate from remaining M4 coverage and outcome cleanup.
+
+**Worktree slice, 2026-10-07: builtin expressions.** The expression reader
+directly mints the existing `CompilerBuiltin(Option[String])` leaf for bare
+`builtin` and `builtin("name")`; the legacy walk produces `ParsedBuiltinExpr`
+without interning marker text as a name. Marker parentheses contain literal
+metadata, so they add no expression nesting or child IDs. Tests prove parsing,
+dumping, census and projection under 128 grouping levels and rejection at 129.
+Malformed markers retain the existing expected-name/closing-parenthesis
+diagnostics and public rejection rollback; unsupported trials restore their
+entry whole. The `BuiltinBody` label remains for final outcome cleanup, but
+the expression start classifier no longer stops at it.
+
+The frozen parser also stores interpolated marker tokens as static text,
+without reading their holes. A narrow `ParseState` accessor and parse-owned
+marker helper reproduce its quoted prefix/tail escape distinctions and pipe
+joining from immutable lexical evidence. Exact AST JSON cases pin those bytes;
+ordinary interpolation parsing and lexer data remain unchanged. Stale unread
+fixtures now use the frozen soft-keyword name `after`, preserving real inner
+expressions and all 21 shared adapter boundary/name assertions without
+snapshot or literal-offset edits. The
+[evidence record](../benchmarks/results/discovery_builtin_expressions_2026-10-07.md)
+records the regression proof, independent gates and matched coverage census.
+Validation passes 486 independent focused/importing checks, 1,037
+`compiler-new` tests and 3,620 full parity checks with zero mismatched files.
+Fully assembled accepted corpus modules rise from 3,236/3,460 to 3,299/3,461:
+62 existing modules complete, and the new marker helper adds one accepted
+input. Unread modules fall from 224 to 162 (141 functions and 21 globals),
+with no remaining implementation first stops.
+All 64 former builtin-first stops advance on unchanged inputs: 62 complete
+and two reach later soft-keyword grammar. The 160 other owner/reason/location
+records remain exactly unchanged. The matched corpus adds only the helper
+path; fourteen prior inputs are edited and 3,589 remain byte-identical.
+Remaining grammar, rejected-header recovery/layout ownership, rejected-module
+subset parity and accepted/rejected outcome unification keep M4 open.
+
+**Worktree slice, 2026-10-07: keyword-name positions.** The tree expression
+reader mints name uses for the frozen primary names `after`, `sealed` and
+`from`, and for `debug` immediately before a dot. A distinct `ExpressionName`
+role admits `from` only in that primary-name consumer; ordinary binding and
+field roles still reserve it. Other soft keyword primaries keep their frozen
+construct/value distinctions. Record literal/update fields reuse ordinary
+name consumption and duplicate-field checking, with no projection change.
+
+Soft named statement tails take precedence over block dispatch, using a
+token-only typed-tail scan matching the frozen parser. Var, loop, local-function
+and with selectors admit ordinary soft names. Select receive binders do too,
+with the existing `sealed` and `_ after` arm precedence intact. The tuple
+destructuring selector still excludes soft-keyword heads. Existing name-use
+order, source spans and exact unsupported rollback are covered by direct and
+full legacy-AST tests; no recipe, token replay, new stop reason or broader
+recovery is introduced.
+
+The shared unread-value fixture now uses a lambda in an interpolation hole,
+retaining real inner expression tokens and the existing `Count` name. Its
+legacy acceptance and exact tree rollback are pinned, and existing adapter
+boundary/name assertions remain unchanged. A pre-existing case-line guard
+still declines inline match-arm typed soft bindings such as
+`_: debug: Int = 1` before the statement dispatcher; this slice does not
+complete that inline context or the unread keyword constructs. The
+[evidence record](../benchmarks/results/discovery_keyword_names_2026-10-07.md)
+records the regression proof, independent gates and matched census.
+
+The expert-focused union passes 347 tests; independent importing/owning
+suites pass 493, `compiler-new` passes 1,041 and full parity passes 3,620
+with zero AST mismatches. Fully assembled accepted corpus modules rise from
+3,299/3,461 to 3,367/3,461. Unread modules fall from 162 to 94 (75 functions
+and 19 globals). All 47 former soft-name stops disappear; of 23 former
+soft-field stops, 21 disappear and two reach later `ValueOnNextLine` grammar.
+Of the 68 newly complete modules, 67 have unchanged bytes and one is an
+edited fixture source. The other 92 owner/reason/location records remain
+exactly unchanged. The matched corpus retains all 3,604 paths: thirteen
+inputs are edited and 3,591 remain byte-identical. These are coverage and
+correctness results, not performance measurements. M4 remains open.
+
+**Worktree slices, 2026-10-07: value layout, concurrent loops and control
+continuations.** Three isolated workers extend the frozen grammar in parallel;
+compiled validation is serialized. Next-line assignment/global values use
+lexer-owned `NEWLINE INDENT` entry and require their closing `DEDENT`, with
+the value's first token as the anchor. Malformed second expression lines
+safely decline rather than reproducing legacy recovery.
+
+Concurrent-for statements now complete and project their existing syntax
+form, with required checked-literal `limit` and optional `timeout`. The binder
+is a `BindingTarget` so both a name and frozen-accepted `_` are representable;
+tuple binders still decline. Dump, ID census, samples and nesting observers
+cover the form. This shared syntax record is a production build input, so
+the hand-back includes a rebuild and `compiler-blorp`.
+
+Completed `if`/`match` operands resume the existing iterative operator loop
+at the caller's precedence. Contextual statement controls retain their loop
+context. Same-line assignment controls and leading controls in call/list/
+subscript items keep their direct entry; next-line values and other aggregate
+items use the operator entry. Tests distinguish these frozen boundaries,
+including a combined next-line control regression that failed before the
+caller correction. Block-lambda tails and other block constructs retain
+their existing scope. No recipe, token replay, new stop reason or broader
+recovery is introduced. The
+[evidence record](../benchmarks/results/discovery_body_coverage_2026-10-07.md)
+retains the separate TDD proofs, integration review and final validation.
+
+Independent importing/owning suites pass 1,435 tests and `compiler-new` passes
+1,050; `compiler-blorp` passes 6,848. Full parity passes 3,621 cases with zero
+AST mismatches. Fully assembled
+accepted corpus modules rise from 3,367/3,461 to 3,449/3,462, with 13 unread
+modules (11 functions and two globals). The added accepted module is the shared
+value-layout helper. All 82 baseline inputs stopped by the three targeted
+reasons are byte-identical: 81 now complete and one reaches a later
+`MatchWithoutBlock`. The other 12 first-stop records remain exactly unchanged.
+The largest remaining groups are `TokenAfterExpression` (five) and
+`IndentedContinuation` (four). The evidence packet records the source freeze
+and production validation; these are coverage results, not performance
+measurements. Rejected-module subset parity and outcome cleanup remain open.
+
+**Worktree slice, 2026-10-07: completed block-lambda boundaries.** The tree
+reader uses existing `BlockLambdaOperand` ending evidence through prefix and
+binary parents to leave following statements and declarations to their owners.
+Assignment values, expression statements, resumed control statements and
+global initializers share the token-only follower rule. Grouping still clears
+the evidence. Binary operators following block lambdas remain unsupported by
+this coverage slice, and `as`/`=` followers retain exact rollback. An
+expression-bodied outer lambda returning a block lambda keeps its existing
+plain-ending classification. No recipe, replay, new stop reason, position
+query or broader recovery is introduced. The
+[evidence record](../benchmarks/results/discovery_lambda_boundaries_2026-10-07.md)
+retains the baseline regressions, boundary tests and final validation.
+
+Independent importing/owning suites pass 603 tests; `compiler-new` passes
+1,052 and full parity passes 3,621 with zero AST mismatches. Fully assembled
+accepted corpus modules rise from 3,449/3,462 to 3,453/3,462. The nine remaining
+unread modules stop in function bodies, with no global-initializer stop.
+The matched census falls from 13 to nine first stops: all four targeted inputs
+complete with unchanged bytes, and the other nine records remain exactly
+unchanged. The corpus retains all 3,605 paths; no new path stops or reaches a
+later stop. `IndentedContinuation` now accounts for four of the nine remaining
+modules. Rejected-module subset parity and outcome cleanup remain open.
+
+**Worktree slice, 2026-10-07: closing the corpus body coverage gaps.**
+Expression-bodied lambdas now complete in interpolation holes using the shared
+mint/spelling authority and the hole's parked cursor. Same-line match-arm `if`
+and `match` use the pattern anchor and the frozen direct control entry, without
+resuming binary operators. Loop context now passes explicitly through expression
+operands and their children; function, lambda and concurrent-task bodies reset
+it. The runtime call-argument early-exit ownership regression is unchanged.
+This preserves M4's frozen behavior; the intended restriction on exits in
+value-position `if`/`match` remains pending in `GRAMMAR.md` section 5.3.
+
+Six stopped sources are corrected independently of parser coverage: four use
+parentheses around multiline control headers, one extracts a boolean match
+before a continued method chain, and the ordinary-name `into` fixture removes
+adjacent expressions. Formatter negatives retain their exact existing goldens
+and their unformatted-valid role. No corpus path or ownership regression is
+removed. Temporary unread-header fixtures move to the genuine remaining gap of
+binary continuation after a block lambda, preserving the original name, span,
+ID and mutation assertions; the obsolete interpolation-lambda stop is deleted.
+The [evidence record](../benchmarks/results/discovery_zero_stops_2026-10-07.md)
+distinguishes parser coverage on unchanged inputs from edited corpus sources.
+Independent importing/owning suites pass 984 assertions across 24 suites;
+`compiler-new` passes 1,058, full parity passes 3,621 with zero AST mismatches,
+and `compiler-blorp` passes 6,853. All 3,462 accepted modules fully assemble.
+The separate census falls from nine to zero on the same 3,605 paths: three
+stopped inputs advance with unchanged bytes and six complete after the source
+corrections above. No later or newly stopped path appears. Final source and
+compiler hashes remain frozen, with FRESH build status. These are coverage
+results, not performance measurements.
+Rejected-body subset parity, outcome unification and recovery deletion remain
+required before M4 closes.
+
+**Main integration, 2026-10-07.** The accumulated M4 slices through
+`d5bf20be4` are integrated over `39aff089e`, preserving the newer scalar
+payload and record-lifetime changes. Newly introduced fieldless alternatives
+use `fixed union` following main's enum retirement. Historical source patches
+and measurements are retained; evidence paths are made portable, with original
+capture hashes recorded in the integration packet. An independent current-tree
+census reports zero first stops
+across 3,618 corpus files; the earlier 3,605-file comparisons above remain
+historical measurements of their own source sets. Full parity passes 3,634
+checks with zero AST mismatches; its every-corpus-root adapter traversal
+assembles and compares all 3,476 accepted modules, including recursively
+loaded modules outside the listed corpus roots. The
+[integration record](../benchmarks/results/discovery_m4_main_integration_2026-10-07.md)
+records the combined-tree validation and its source provenance. Zero corpus
+stops does not close the rejected-body, outcome or recovery criteria below.
+
+**M4 exit criteria.** Each is required before M4 closes. States describe main
+unless explicitly marked as a worktree slice.
 
 - **Bodies parse inline.** A function, method or lambda body is parsed by the
-  function that reads its header (section 3.16). Partly met: owner replay, the
-  `GlobalCompletionPolicy` scan policies and `complete_atomic_global` were
-  deleted in `657da18e7`. Open: `skip_body` and `DeferredBody`
-  (`tree_function_header_parser.brp`), the recipe tree (`parse/recipes.brp`)
-  and replay by token index (`resumed_at`, `resumed_after`).
+  function that reads its header (section 3.16). Met for accepted bodies:
+  owner replay, the `GlobalCompletionPolicy` scan policies and
+  `complete_atomic_global` were deleted in `657da18e7`; the accumulated M4
+  slices remove `skip_body`, `DeferredBody`, recipes and accepted-path replay
+  by token index (`resumed_at`, `resumed_after`). Rejected-head lexical
+  recovery remains.
 - **Body-follows checks are token tests.** The checks that ask whether a
   function, trait-method or implementation-method body starts on the colon's
   line (`tree_function_header_parser.brp`, `tree_trait_method_header_parser.brp`,
-  `tree_implementation_method_header_parser.brp`) compare line numbers where a
-  token test would do: a body that follows on the next line is a NEWLINE and
-  INDENT token after the colon. They are separate from the skip-extent
-  queries, which leave with `skip_body`, and are the last step before the
-  restricted-symbol rule can be enabled. Open.
+  `tree_implementation_method_header_parser.brp`) use the shared token
+  predicate above. Met: a body that follows on the next
+  line is a NEWLINE and INDENT token after the colon. The accepted-body-entry
+  slice also treats a stray initial `else` as no body, preserving the frozen
+  scanner's untouched branch boundary. The remaining rejected-head recovery
+  queries must leave before the restricted-symbol rule is enabled.
 - **No tree parser reads line or column numbers**, except the named quirks of
   `parse/layout_quirks.brp` (section 3.16). The restricted-symbol entry in
   `blorp/source_ownership.json` and its `scripts/check-blorp-layout` rule land
   with this criterion, so a position query anywhere else fails
   `make hygiene-check`. Partly met: the expression and statement parsers read
-  layout from tokens (`c9618a8ad`). Open: the three header parsers above, and
-  the restricted-symbol entry.
+  layout from tokens (`c9618a8ad`), and the body-follows slice removes
+  the header body-presence queries. Open: the function-header rejected-body
+  recovery queries and the
+  restricted-symbol entry.
 - **Rejected modules satisfy the subset check** of section 6.3 on the fixtures
   and the corpus, not only the first-diagnostic comparison. Open: the rejected
   differential covers leaf declarations only.
@@ -3593,14 +4040,16 @@ state on main.
   3.17 lands.
 - **The full-AST differential covers every module.** The tree path equals the
   old parser on every corpus module and root run, the syntax dump differential
-  matches and the id census passes (section 6.3). Open: 698 modules are not
-  read in full.
+  matches and the id census passes (section 6.3). Met for accepted modules
+  under the maintained differential allowances: the current every-corpus-root
+  traversal assembles and compares 3,476/3,476, and all seven root checks agree.
+  Rejected-body subset parity and unified outcomes remain open.
 
 **Plan for the open milestones.**
 
 | # | Change | Proof | Deleted |
 | --- | --- | --- | --- |
-| **M4** | The body parser over trees (statements, blocks, expressions) and the tree adapter's body half. | The exit criteria above, and section 6.3's differentials | `skip_body`, `DeferredBody`, `StopReason`, the recipe tree and replay by token index; the scan policies, `complete_atomic_global` and owner replay are already gone |
+| **M4** | Finish body rejection, outcome unification and lexical recovery removal in the tree parser and adapter. | The exit criteria above, and section 6.3's differentials | Remaining preview/unsupported outcomes, `StopReason` and rejected-head lexical recovery; `skip_body`, `DeferredBody`, recipes, accepted-path replay, scan policies, `complete_atomic_global` and owner replay are already gone |
 | **M5** | `sources/module_walk.brp`, `link/`, `DiscoveryOutcome`, and `discovery_front_end.brp` on the tree path, behind an internal test-only selection, with `compiler-new`, `cli` and `package` gates exercised on both stage paths. | Module-order parity; self-compile C identical (or normalized); cost measured with the cost tool's `tables` and `graph` modes and the self-compile against matched main | none |
 | **M6** | Make the tree path the stage's default, within the ceiling of section 7.3, and delete the table path in the same change. | Every default and premerge gate on the new default; self-compile C identical; the ceiling's measurement record | `tables/` (builder, node builder, rows, row kinds' node part, node kind classes, `frontend_tables`, `discovery_tables`, `invariants/`, `intern_index` moved, `name_vocabulary` moved to the adapter): about 11,600 lines; the table-reading bodies of `compiler/discovery_adapter.brp` and `compiler/discovery_front_end.brp` (the files stay, now reading trees); `builder_rule_probe`, `builder_append_probe`, `test_invariants`, `test_allocation_budget` (replaced by a syntax allocation test pinning allocations per construct, so a compiler improvement shows as a decrease and a regression fails) |
 | **M7** | Documentation: `DISCOVERY_TABLES_DESIGN.md` is replaced by this document's settled form; `ARCHITECTURE.md`, `DISCOVERY_ACCEPTANCE_ROADMAP.md` and `docs/README.md` are updated; the resolution design takes section 4.7. | `git diff --check`; link check | the superseded design text |
@@ -3610,7 +4059,7 @@ Ordering and parallelism:
 - M3 needed M1 and M2, M4 needs M3, and M5 needs M4.
 - G2 (tuple hand-off, `PRODUCT_UNIFICATION.md` and `VALUE_TUPLES_AND_STATE_HANDOFF.md`) proceeds in parallel. M1 to M5 do not wait on it; M6 does (product unification slices 1 and 2 and the increment 2 port, increments 3 and 4 for products, and 5 if the re-measured M0 still needs it).
 
-**Current coverage.** On main at `7ab679600`, after `make`,
+**Historical coverage baseline (`7ab679600`).** On main at that revision, after `make`,
 `scripts/compiler-new-parity --stop-census` reports 3,582 corpus files, of
 which 698 modules stop at a declaration the tree scan does not read: 650 at a
 function, 29 at a global initializer and 19 at an implementation. The ranked
@@ -3695,8 +4144,9 @@ the 2026-10-06 decisions left open, and D10 a consequence of them.
   frozen grammar. The tree parser reproduces each as it is, the quirks that
   need position rules live in `parse/layout_quirks.brp`, and each wants a
   language decision after M4 with parser-specialist and ergonomics input:
-  - `debug: Bool = True` is read as a `debug` block, because `debug` is a soft
-    keyword;
+  - `debug: Bool = True` at a statement opening binds the soft name `debug`,
+    while `debug` as a primary value starts its block unless immediately
+    followed by `.`; a bound `debug` therefore cannot be read as a bare value;
   - a `|` at the start of a line inside braces lexes as a pipe string;
   - the comparison operators share one left-associative level, so `a < b < 3`
     parses (`GRAMMAR.md`, section 3.5, which records the decision to make
@@ -3704,9 +4154,11 @@ the 2026-10-06 decisions left open, and D10 a consequence of them.
   - `not a == b` parses as `(not a) == b`;
   - the lexer emits INDENT for any deeper line, not only after `:`;
   - a closing bracket does not close a block opened inside it;
-  - the `OperatorAfterBlock` quirk: after an `if` or `match` value ends at its
-    DEDENT, a following binary operator, `as` or `=` continues the block's
-    expression;
+  - the `OperatorAfterBlock` quirk: when an `if` or `match` value is read inside
+    the operator loop and ends at its DEDENT, a following binary operator,
+    `as` or `=` continues the block's expression. Direct same-line assignment
+    and call/list/subscript entries bypass that loop (`GRAMMAR.md`, sections
+    3.7 and 4.5);
   - `{}` is stored as a record literal, though the Guide treats it as an empty
     dict;
   - the bracketed-block anchor: whether a block opened inside an expression is

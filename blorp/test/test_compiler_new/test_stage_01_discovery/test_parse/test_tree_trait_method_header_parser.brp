@@ -1,10 +1,11 @@
--- Exact trait header/missing-body grammar, followed by lexical default-body evidence.
+-- Exact trait head/missing-body grammar and completed default-body boundaries.
 -- header.span is the frozen declaration header extent, never the full method/body.
 import:
 	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
 	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, spellings, consume_declared_name, finished_builtin_type, report_at_current
-	../../../../src/compiler_new/stage_01_discovery/parse/tree_trait_method_header_parser: TraitMethodHeaderParse(ParsedTraitMethodHeader, RejectedTraitMethodHeader), MethodBodyExtent(AbstractMethod, SkippedDefaultBody), parse_trait_method_header
-	../../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser: deferred_body_span, deferred_body_token_start, deferred_body_token_end
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_trait_method_header_parser: TraitMethodHeadParse(ParsedTraitMethodHead, RejectedTraitMethodHead), MethodBodyPresence(AbstractMethod, DefaultBodyFollows), parse_trait_method_head
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_body_parser: complete_body
+	../../../../src/compiler_new/stage_01_discovery/parse/stop_reason: Recognition(Recognized)
 	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: ParameterBinding(NamedParameter, WildcardParameter, TupleParameter)
 	../../../../src/compiler_new/stage_01_discovery/syntax/sequences: SmallTuple(Pair)
 	../../../../src/compiler_new/stage_01_discovery/syntax/types: WrittenTypeKind(NamedType, TupleType), TypeArgument(TypeArgumentType)
@@ -16,7 +17,9 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
 	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility), Purity(PureFunction, ImpureFunction)
 	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end
-	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(EndOfFileToken, FuncKeyword, IdentifierToken, LeftBracketSymbol, WhereKeyword, NewlineToken, DedentToken)
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(EndOfFileToken, FuncKeyword, IdentifierToken, LeftBracketSymbol, WhereKeyword, NewlineToken, DedentToken, IntLiteralToken, ElseKeyword)
+	../../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: reject_preview
+	../../../../src/compiler_new/stage_01_discovery/diagnostics/rejected_syntax_render: render_rejected_diagnostics
 	test: TestSuite
 
 
@@ -24,11 +27,11 @@ private pure func covers(span: Span, first: Int, last: Int) -> Bool:
 	span.span_start() == first and span.span_end() == last
 
 
-private pure func is_abstract(body: MethodBodyExtent) -> Bool:
+private pure func is_abstract(body: MethodBodyPresence) -> Bool:
 	match body:
 		AbstractMethod:
 			True
-		SkippedDefaultBody(_):
+		DefaultBodyFollows:
 			False
 
 
@@ -86,9 +89,9 @@ private pure func rejected(text: String, advance: Int, expected: List[(ExpectedD
 			var state = initial
 			for _ in 0..advance:
 				state = state.advanced()
-			(parsed, result) = parse_trait_method_header(state)
+			(parsed, result) = parse_trait_method_head(state)
 			match result:
-				RejectedTraitMethodHeader:
+				RejectedTraitMethodHead:
 					(diagnostics_match(parsed, expected) and parsed.current_kind() == cursor and parsed.current_span().covers(first, last)
 						and parsed.position() == token_position and parsed.issued_counts().written_types == types and no_parent_or_body_ids(parsed))
 				_:
@@ -100,10 +103,10 @@ private pure func rejected(text: String, advance: Int, expected: List[(ExpectedD
 private pure func abstract_method(text: String, purity: Purity, end: Int, return_span: Option[(Int, Int)], cursor: TokenKind, first: Int, last: Int, token_position: Int) -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(state):
-			(parsed, result) = parse_trait_method_header(state)
+			(parsed, result) = parse_trait_method_head(state)
 			match result:
-				ParsedTraitMethodHeader(preview):
-					var correct: Bool = (is_abstract(preview.body_extent) and preview.header.span.covers(0, end)
+				ParsedTraitMethodHead(preview):
+					var correct: Bool = (is_abstract(preview.body_presence) and preview.header.span.covers(0, end)
 						and preview.header.signature.purity == purity and preview.header.signature.parameters.is_empty()
 						and parsed.current_kind() == cursor and parsed.current_span().covers(first, last) and parsed.position() == token_position
 						and parsed.diagnostic_count() == 0 and parsed.issued_counts().binders == 0 and no_parent_or_body_ids(parsed))
@@ -149,16 +152,18 @@ pure func test_unsupported_prefixes_use_leaf_recovery_and_generics_stay_unconsum
 
 pure func test_authored_colon_requires_body_at_eof_dedent_or_unindented_line() -> Bool:
 	(rejected("func f():", 0, [(MissingBody, 5, 6)], EndOfFileToken, 9, 9, 5, 0)
+		and rejected("func f(): else:", 0, [(MissingBody, 5, 6)], ElseKeyword, 10, 14, 5, 0)
 		and rejected("func f():\nfunc g()", 0, [(MissingBody, 5, 6)], NewlineToken, 10, 10, 5, 0)
+		and rejected("func f():\n-- comment\n\nfunc g()", 0, [(MissingBody, 5, 6)], NewlineToken, 10, 10, 5, 0)
 		and rejected("holder\n\tfunc f():\nnext", 3, [(MissingBody, 13, 14)], DedentToken, 18, 18, 8, 0))
 
 
 pure func test_parameter_children_keep_source_order_without_parent_definition() -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), "func f(x: List[Int], _, _: Int, (a, b): (Int, Bool))")):
 		Ok(state):
-			(parsed, result) = parse_trait_method_header(state)
+			(parsed, result) = parse_trait_method_head(state)
 			match result:
-				ParsedTraitMethodHeader(preview):
+				ParsedTraitMethodHead(preview):
 					match preview.header.signature.parameters:
 						[first, wildcard, discard, pair]:
 							match (first.binding, wildcard.binding, discard.binding, pair.binding):
@@ -169,7 +174,7 @@ pure func test_parameter_children_keep_source_order_without_parent_definition() 
 												(NamedType(list_name, [TypeArgumentType(int_type)]), NamedType(discard_use, []), TupleType(Pair(TypeArgumentType(left), TypeArgumentType(right)))):
 													match (int_type.kind, left.kind, right.kind):
 														(NamedType(int_use, []), NamedType(left_use, []), NamedType(right_use, [])):
-															(is_abstract(preview.body_extent) and preview.header.span.covers(0, 6)
+															(is_abstract(preview.body_presence) and preview.header.span.covers(0, 6)
 																and x.binder.binder_local_index() == 0 and discard_name.binder.binder_local_index() == 1 and a.binder.binder_local_index() == 2 and b.binder.binder_local_index() == 3
 																and wildcard_span.covers(21, 22) and tuple_binding.span.covers(32, 38)
 																and first.span.covers(7, 19) and discard.span.covers(24, 30) and pair.span.covers(32, 51)
@@ -194,53 +199,52 @@ pure func test_parameter_children_keep_source_order_without_parent_definition() 
 			False
 
 
--- These cases assert lexical DeferredBody intervals only. Expression diagnostics
--- and malformed expression recovery belong to M4, not this preview wrapper.
-private pure func skipped(text: String, advance: Int, header_first: Int, header_last: Int, body_first: Int, body_last: Int, next_first: Int, token_first: Int, token_last: Int) -> Bool:
+-- Heads stop at body entry; completion owns syntax and its sibling boundary.
+private pure func completed_default(text: String, advance: Int, header_first: Int, header_last: Int, body_first: Int, body_last: Int, next_first: Int, token_first: Int, token_last: Int) -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(initial):
 			var state = initial
 			for _ in 0..advance:
 				state = state.advanced()
-			(parsed, result) = parse_trait_method_header(state)
+			(parsed, result) = parse_trait_method_head(state)
 			match result:
-				ParsedTraitMethodHeader(preview):
-					match preview.body_extent:
-						SkippedDefaultBody(body):
-							(preview.header.span.covers(header_first, header_last) and body.deferred_body_span().covers(body_first, body_last)
-								and body.deferred_body_token_start() == token_first and body.deferred_body_token_end() == token_last and parsed.position() == token_last
-								and parsed.current_kind() == FuncKeyword and parsed.current_span().covers(next_first, next_first + 4)
-								and parsed.diagnostic_count() == 0 and no_parent_or_body_ids(parsed))
-						_:
-							False
-				_:
-					False
-		Err(_):
-			False
+				ParsedTraitMethodHead(head):
+					(completed, body) = complete_body(parsed)
+					match body:
+						Recognized(body):
+							(head.body_presence == DefaultBodyFollows and head.header.span.covers(header_first, header_last)
+								and parsed.position() == token_first and no_parent_or_body_ids(parsed)
+								and body.span.covers(body_first, body_last) and completed.position() == token_last
+								and completed.current_kind() == FuncKeyword and completed.current_span().covers(next_first, next_first + 4)
+								and completed.diagnostic_count() == 0)
+						_: False
+				_: False
+		Err(_): False
 
 
-pure func test_default_wrapper_composes_inline_indented_and_continuation_extents() -> Bool:
-	(skipped("func f(): 1 + 2\nfunc g()", 0, 0, 6, 10, 15, 16, 5, 9)
-		and skipped("func f():\n\t1\nfunc g()", 0, 0, 6, 11, 12, 13, 5, 9)
-		and skipped("func f(): if True:\n\t1\nelse if False:\n\t2\nelse:\n\t3\nfunc g()", 0, 0, 6, 10, 48, 49, 5, 26)
-		and skipped("outer\n\tfunc f():\n\t\t1\n\tfunc g()", 3, 7, 13, 19, 20, 22, 8, 12)
-		and skipped("func f(): foo(\n\t1,\n\t2,\n)\nfunc g()", 0, 0, 6, 10, 24, 25, 5, 13))
+pure func test_completed_default_bodies_preserve_sibling_boundaries() -> Bool:
+	(completed_default("func f(): 1 + 2\nfunc g()", 0, 0, 6, 10, 15, 16, 5, 9)
+		and completed_default("func f():\n\t1\nfunc g()", 0, 0, 6, 11, 12, 13, 5, 9)
+		and completed_default("func f():\n-- comment\n\n\t1\nfunc g()", 0, 0, 6, 23, 24, 25, 5, 9)
+		and completed_default("func f(): if True:\n\t\t\t1\nelse if False:\n\t\t\t2\nelse:\n\t\t\t3\nfunc g()", 0, 0, 6, 10, 54, 55, 5, 26)
+		and completed_default("outer\n\tfunc f():\n\t\t1\n\tfunc g()", 3, 7, 13, 19, 20, 22, 8, 12)
+		and completed_default("func f(): foo(\n\t1,\n\t2,\n)\nfunc g()", 0, 0, 6, 10, 24, 25, 5, 13))
 
 
 pure func test_sequential_abstract_and_default_headers_do_not_leak_state() -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), "func f()\npure func g(): 1")):
 		Ok(state):
-			(first_state, first_result) = parse_trait_method_header(state)
-			(second_state, second_result) = parse_trait_method_header(first_state.advanced())
+			(first_state, first_result) = parse_trait_method_head(state)
+			(second_state, second_result) = parse_trait_method_head(first_state.advanced())
 			match (first_result, second_result):
-				(ParsedTraitMethodHeader(first), ParsedTraitMethodHeader(second)):
-					match (first.body_extent, second.body_extent):
-						(AbstractMethod, SkippedDefaultBody(body)):
+				(ParsedTraitMethodHead(first), ParsedTraitMethodHead(second)):
+					match (first.body_presence, second.body_presence):
+						(AbstractMethod, DefaultBodyFollows):
 							(first.header.span.covers(0, 6) and first.header.signature.purity == ImpureFunction and first.header.signature.name.span.covers(5, 6)
 								and first_state.current_kind() == NewlineToken and first_state.current_span().covers(9, 9) and first_state.position() == 4
 								and second.header.span.covers(9, 20) and second.header.signature.purity == PureFunction and second.header.signature.keyword.covers(14, 18) and second.header.signature.name.span.covers(19, 20)
-								and body.deferred_body_span().covers(24, 25) and body.deferred_body_token_start() == 11 and body.deferred_body_token_end() == 12
-								and second_state.current_kind() == EndOfFileToken and second_state.current_span().covers(25, 25) and second_state.position() == 12 and second_state.diagnostic_count() == 0
+								and second_state.current_span().covers(24, 25)
+								and second_state.current_kind() == IntLiteralToken and second_state.position() == 11 and second_state.diagnostic_count() == 0
 								and second_state.issued_counts().binders == 0 and second_state.issued_counts().written_types == 0 and no_parent_or_body_ids(second_state))
 						_:
 							False
@@ -253,13 +257,13 @@ pure func test_sequential_abstract_and_default_headers_do_not_leak_state() -> Bo
 pure func test_direct_leaf_tolerates_preexisting_diagnostics() -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), "func f()")):
 		Ok(state):
-			(parsed, result) = parse_trait_method_header(state.report_at_current(ExpectedSupertraitOrMethodsDiagnostic))
+			(parsed, result) = parse_trait_method_head(state.report_at_current(ExpectedSupertraitOrMethodsDiagnostic))
 			match result:
-				ParsedTraitMethodHeader(preview):
+				ParsedTraitMethodHead(preview):
 					match parsed.diagnostics():
 						[diagnostic]:
 							(is_preexisting_diagnostic(diagnostic.diagnostic) and diagnostic.span.covers(0, 0)
-								and is_abstract(preview.body_extent) and preview.header.span.covers(0, 6) and parsed.current_kind() == EndOfFileToken
+								and is_abstract(preview.body_presence) and preview.header.span.covers(0, 6) and parsed.current_kind() == EndOfFileToken
 								and parsed.current_span().covers(8, 8) and parsed.position() == 4 and no_parent_or_body_ids(parsed))
 						_:
 							False
@@ -269,9 +273,29 @@ pure func test_direct_leaf_tolerates_preexisting_diagnostics() -> Bool:
 			False
 
 
+pure func test_leading_else_keeps_the_missing_body_diagnostic() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "func f(): else:")):
+		Ok(entry):
+			(state, parsed) = parse_trait_method_head(entry)
+			match parsed:
+				RejectedTraitMethodHead:
+					match reject_preview(state):
+						Ok(rejected):
+							match render_rejected_diagnostics(rejected):
+								Ok([diagnostic]):
+									(state.current_kind() == ElseKeyword and state.current_span().covers(10, 14) and state.position() == 5
+										and diagnostic.span.covers(5, 6) and diagnostic.rendered.message == "function has no body"
+										and diagnostic.rendered.help == Some("a function body must have at least one expression or statement, indented on the lines below the header; write `void` for a body that does nothing"))
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
 tests: TestSuite = {
-	description = "Trait method headers and deferred default-body evidence",
+	description = "Trait method heads and completed default-body boundaries",
 	tests = [
+		("leading else keeps missing-body diagnostic", test_leading_else_keeps_the_missing_body_diagnostic),
 		("abstract header frozen endpoint and purity", test_abstract_header_ends_at_name_unless_return_is_written),
 		("grouped return consumes close without extending header", test_grouped_return_consumes_close_without_extending_header),
 		("where remains for trait owner", test_where_remains_for_the_trait_owner),
@@ -279,7 +303,7 @@ tests: TestSuite = {
 		("unsupported prefixes recover and generics remain", test_unsupported_prefixes_use_leaf_recovery_and_generics_stay_unconsumed),
 		("authored colon requires promised body", test_authored_colon_requires_body_at_eof_dedent_or_unindented_line),
 		("parameter children keep IDs without parent", test_parameter_children_keep_source_order_without_parent_definition),
-		("inline indented and conditional default extents", test_default_wrapper_composes_inline_indented_and_continuation_extents),
+		("completed default bodies preserve sibling boundaries", test_completed_default_bodies_preserve_sibling_boundaries),
 		("sequential methods do not leak state", test_sequential_abstract_and_default_headers_do_not_leak_state),
 		("direct leaf tolerates existing diagnostics", test_direct_leaf_tolerates_preexisting_diagnostics)
 	]

@@ -10,7 +10,7 @@ import:
 		UnreadHeader(UnreadGlobalInitializer)
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_global_header_parser: GlobalHeaderPreview
 	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: ModuleItem(GlobalItem, RecordItem)
-	../../../../src/compiler_new/stage_01_discovery/syntax/expressions: ExpressionKind(NameReference, IntegerLiteral, FloatLiteral)
+	../../../../src/compiler_new/stage_01_discovery/syntax/expressions: ExpressionKind(NameReference, IntegerLiteral, FloatLiteral, FieldAccess)
 	../../../../src/compiler_new/stage_01_discovery/syntax/checked_values: written_digits
 	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: GlobalDeclaration, GlobalForm(ConstantGlobal, MutableGlobal)
 	../../../../src/compiler_new/stage_01_discovery/syntax/ids:
@@ -220,13 +220,45 @@ pure func test_comment_and_blank_lines_preserve_unconsumed_boundary() -> Bool:
 	correct
 
 
+pure func test_continued_global_fields_keep_spans_and_postorder_ids() -> Bool:
+	var correct = True
+	for initializer in ["Source\n.field", "Source\n\n.field", "Source\n-- comment\n.field", "Source\n\t.field", "1\n.field", "1\n\t.field", "1.0\n.field", "1.0\n\t.field"]:
+		suffix = "\nrecord Later {}"
+		text = "value: Int = ${initializer}${suffix}"
+		match read_global(text, 2):
+			Some((state, global_value)):
+				match global_value.value.kind:
+					FieldAccess(receiver, field):
+						(receiver_matches, value_names) = match receiver.kind:
+							NameReference(use):
+								(state.spellings().spelling_text(use.name.spelling) == Some("Source") and use.use.name_use_local_index() == 1, 2)
+							IntegerLiteral(magnitude): (magnitude.to_string() == "1", 1)
+							FloatLiteral(value): (value.written_digits() == "1.0", 1)
+							_: (False, 0)
+						counts = state.issued_counts()
+						correct = (correct and receiver_matches and state.spellings().spelling_text(field.name.spelling) == Some("field")
+							and receiver.span.span_start() == "value: Int = ".length()
+							and field.name.span.span_end() == text.length() - suffix.length()
+							and global_value.value.span.span_start() == receiver.span.span_start()
+							and global_value.value.span.span_end() == field.name.span.span_end()
+							and global_value.span.span_start() == 0 and global_value.span.span_end() == field.name.span.span_end()
+							and receiver.id.expression_local_index() == 0 and global_value.value.id.expression_local_index() == 1
+							and field.use.name_use_local_index() == value_names and counts.name_uses == value_names + 1
+							and counts.expressions == 2 and counts.written_types == 1 and counts.statements == 0 and counts.blocks == 0
+							and global_value.id.definition_local_index() == 0 and state.next_definition(global_value) == 2
+							and state.current_kind() == EndOfFileToken)
+					_: correct = False
+			None: correct = False
+	correct
+
+
 -- Each shape here is one the expression parser does not read yet, or one it
 -- reads as a different expression than a whole initializer. The scan stops at
 -- the initializer with only the header's ids issued: one written type and its
 -- name use, no expression and no definition.
 func test_unsupported_initializer_returns_exact_authoritative_state() -> Bool:
 	var correct: Bool = True
-	for initializer in ["Source Other", "123 Other", "Self", "\n\tSource", "Source\n.field", "Source\n\n.field", "Source\n-- comment\n.field", "Source\n\t.field", "Source\n\tOther", "Source\n\t+ Other", "Source, Other", "1.5 Other", "0x4", "1_000", "\n\t1", "1\n.field", "1\n\t.field", "1\n\tOther", "\n\t1.0", "1.0\n.field", "1.0\n\t.field", "1.0\n\tOther", ".5", "1e3", "1.0e3", "1.0f", "1.0_0"]:
+	for initializer in ["Count(\n\t(func():\n\t\tBodyName + Count(func(): 1)\n\t+ Count)\n)", "\n\t|first " + "$" + "{a} second " + "$" + "{b c}", "Source Other", "123 Other", "Self", "\n\tSource\n\tOther", "Source\n\t.field\n\tOther", "Source\n\tOther", "Source\n\t+ Other", "Source, Other", "1.5 Other", "0x4", "1_000", "\n\t1\n\t2", "1\n\tOther", "\n\t1.0\n\t2.0", "1.0\n\tOther", ".5", "1e3", "1.0e3", "1.0f", "1.0_0"]:
 		text = "value: Int = ${initializer}"
 		match scanned(text):
 			Some((state, scan)):
@@ -336,6 +368,7 @@ tests: TestSuite = {
 		("name initializer mints use expression then global", test_name_initializer_mints_use_expression_then_global),
 		("rich header ids precede value and completed owner", test_rich_header_ids_precede_value_and_completed_owner),
 		("comments preserve unconsumed boundary", test_comment_and_blank_lines_preserve_unconsumed_boundary),
+		("continued global fields preserve spans and ids", test_continued_global_fields_keep_spans_and_postorder_ids),
 		("scan preserves deferred mint", test_scan_completes_prefix_and_preserves_next_deferred_mint),
 		("out of range literal leaves initializer unread", test_out_of_range_literal_leaves_initializer_unread),
 		("missing initializer at end of source is rejected at the end", test_missing_initializer_at_end_of_source_is_rejected_at_the_end),

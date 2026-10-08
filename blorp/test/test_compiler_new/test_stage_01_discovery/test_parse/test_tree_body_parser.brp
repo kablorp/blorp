@@ -4,7 +4,7 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
 	../../../../src/compiler_new/stage_01_discovery/parse/parse_state:
 		MAX_SYNTAX_NESTING,
-		ParseState, new_parse_state, diagnostic_count, issued_counts, issued_ids, spellings
+		ParseState, new_parse_state, diagnostic_count, issued_counts, issued_ids, spellings, position, current_kind, current_span
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
 		parse_declaration_preview
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
@@ -12,14 +12,24 @@ import:
 		UnreadHeader(UnreadFunction, UnreadTrait, UnreadImplementation), scan_module_declarations
 	../../../../src/compiler_new/stage_01_discovery/syntax/dump: dumped_module
 	../../../../src/compiler_new/stage_01_discovery/syntax/expressions:
-		Body(BlockBody), ElseBody(ElseBlock, ElseIf), ElseBranch, ExpressionKind(If), StatementKind(Assignment, ExpressionStatement)
+		Body(BlockBody, ExpressionBody), ElseBody(ElseBlock, ElseIf), ElseBranch, AssignmentTarget(AssignsName), ExpressionKind(If, Subscript, NameReference), StatementKind(Assignment, ExpressionStatement, SubscriptAssignment, TupleDestructure)
 	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: FunctionDeclaration
 	../../../../src/compiler_new/stage_01_discovery/syntax/definitions: Definition(FunctionDefinition, LocalFunctionDefinition)
 	../../../../src/compiler_new/stage_01_discovery/syntax/id_census: id_census
 	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: Spellings, spelling_count, spelling_text
-	../../../../src/compiler_new/stage_01_discovery/syntax/ids: block_local_index, expression_local_index, statement_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: block_local_index, expression_local_index, statement_local_index, binder_local_index, name_use_local_index
 	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: ModuleItem(FunctionItem, TraitItem, ImplementationItem), ModuleSyntax
 	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/span: span_start, span_end
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser: parse_function_head, FunctionHeadParse(ParsedFunctionHead)
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_expression_parser: parse_expression_to_boundary, ExpressionParse(UnsupportedExpression)
+	../../../../src/compiler_new/stage_01_discovery/parse/layout_quirks: anchored_at
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_body_parser: complete_function, FunctionCompletion(CompletedFunction)
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(FuncKeyword, ElseKeyword)
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility), Purity(PureFunction)
+	../../../../src/compiler_new/stage_01_discovery/parse/stop_reason: StopReason(AssignmentTargetRoutedElsewhere, BlockNotClosed, NonPlaceAssignmentTarget, TupleDestructuring, FieldAssignment, SoftKeywordName)
+	../../../../src/compiler_new/stage_01_discovery/syntax/names: BindingTarget(BindsName, DiscardsValue)
+	../../../../src/compiler_new/stage_01_discovery/syntax/sequences: SmallTuple(Triple)
 	test: TestSuite
 
 
@@ -63,6 +73,212 @@ private pure func completed_dump(text: String) -> Option[String]:
 				None
 		None:
 			None
+
+
+func test_next_line_pipe_value_has_real_span_and_postorder_ids() -> Bool:
+	text = "func f():\n\tvalue =\n\t\t|hello\n\tvalue\n"
+	match scanned(text):
+		Some((state, scan)):
+			match scan.items:
+				[FunctionItem(declaration)]:
+					match declaration.function.body:
+						Some(BlockBody(block)):
+							match block.leading:
+								[statement]:
+									match statement.kind:
+										Assignment(assignment):
+											(completed_count(scan) == 1 and deferred_count(scan) == 0 and state.diagnostic_count() == 0
+												and assignment.value.span.span_start() == 21 and assignment.value.span.span_end() == 28
+												and assignment.value.id.expression_local_index() == 0 and statement.id.statement_local_index() == 0
+												and block.last.id.statement_local_index() == 1 and block.id.block_local_index() == 0
+												and id_census(module_id_at_row(0), completed_module(state, scan)).is_empty())
+										_: False
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+func test_soft_keyword_assignment_mints_target_before_value() -> Bool:
+	text = "func f():\n\tdebug = after\n"
+	match scanned(text):
+		Some((state, scan)):
+			match scan.items:
+				[FunctionItem(declaration)]:
+					match declaration.function.body:
+						Some(BlockBody(block)):
+							match (block.leading, block.last):
+								([], statement):
+									match statement.kind:
+										Assignment(assignment):
+											match (assignment.target, assignment.value.kind):
+												(AssignsName(target), NameReference(value)):
+													(state.id_counts() == [1, 1, 1, 0, 0, 0, 2, 0, 0]
+														and target.use.name_use_local_index() == 0 and value.use.name_use_local_index() == 1
+														and assignment.value.id.expression_local_index() == 0 and statement.id.statement_local_index() == 0
+														and block.id.block_local_index() == 0 and target.name.span.span_start() == 11 and target.name.span.span_end() == 16
+														and value.name.span.span_start() == 19 and value.name.span.span_end() == 24
+														and id_census(module_id_at_row(0), completed_module(state, scan)).is_empty())
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+func test_flat_tuple_destructuring_mints_only_binders_and_value() -> Bool:
+	var correct = True
+	for target in ["(a, b)", "(a, _, c)", "(_, b, c, _)", "(a, b,)", "(a, _, c, d,)"]:
+		correct = correct and completed_dump(source_lines(["func f():", "\t" + target + " = pair"])).is_some()
+	match scanned(source_lines(["func f():", "\t(a, _, c) = pair"])):
+		Some((state, scan)):
+			match scan.items:
+				[FunctionItem(function)]:
+					match function.function.body:
+						Some(BlockBody(block)):
+							match block.last.kind:
+								TupleDestructure(destructure):
+									match destructure.targets:
+										Triple(BindsName(first), DiscardsValue(discard), BindsName(last)):
+											correct = (correct and state.id_counts() == [1, 1, 1, 0, 0, 0, 1, 2, 0]
+												and first.binder.binder_local_index() == 0 and last.binder.binder_local_index() == 1
+												and first.name.span.span_start() == 12 and discard.span_start() == 15 and last.name.span.span_start() == 18
+												and destructure.value.id.expression_local_index() == 0
+												and block.last.span.span_start() == 11 and block.last.span.span_end() == 27
+												and block.last.id.statement_local_index() == 0 and block.id.block_local_index() == 0
+												and id_census(module_id_at_row(0), completed_module(state, scan)).is_empty())
+										_: correct = False
+								_: correct = False
+						_: correct = False
+				_: correct = False
+		None: correct = False
+	correct
+
+
+func test_tuple_destructuring_does_not_admit_other_targets_or_keyword_tokens() -> Bool:
+	var correct = True
+	for target in ["(a)", "((a, b))", "((a, b), c)", "(a: Int, b)", "(a, 1)", "(a,)", "(a, b, c, d, e)", "(alias, b)", "(debug, b)", "(with, b)", "(concurrent, b)", "(select, b)"]:
+		text = source_lines(["func f():", "\t" + target + " = pair"])
+		match (scanned(text), new_parse_state(lex_module(module_id_at_row(0), text))):
+			(Some((state, scan)), Ok(entry)):
+				(plain, _) = parse_declaration_preview(entry)
+				correct = (correct and completed_count(scan) == 0 and deferred_count(scan) == 1
+					and state.position() == plain.position() and state.id_counts() == plain.id_counts()
+					and state.diagnostic_count() == plain.diagnostic_count()
+					and spelling_count(state.spellings()) == spelling_count(plain.spellings()))
+			_: correct = False
+	correct and tuple_keyword_routing() and completed_dump(source_lines(["func f():", "\t(a, b)"])).is_some()
+
+
+-- Reserved keywords enter the binder refusal at their token. Soft keywords
+-- keep the existing unsupported expression-name classification.
+private pure func tuple_keyword_routing() -> Bool:
+	var correct = True
+	for (target, reason, start, end) in [("(alias, b)", TupleDestructuring, 12, 17), ("(debug, b)", SoftKeywordName, 12, 17), ("from", AssignmentTargetRoutedElsewhere, 16, 17)]:
+		match scanned(source_lines(["func f():", "\t" + target + " = pair"])):
+			Some((state, scan)):
+				match scan.stop:
+					StoppedAtUnreadDeclaration(unread):
+						correct = (correct and unread.stop.reason == reason
+							and unread.stop.at.span_start() == start and unread.stop.at.span_end() == end
+							and state.diagnostic_count() == 0 and state.id_counts() == [0, 0, 0, 0, 0, 0, 0, 0, 0])
+					_: correct = False
+			None: correct = False
+	correct
+
+
+func test_tuple_destructuring_with_unread_value_rolls_back_binders_and_spellings() -> Bool:
+	var correct = True
+	for body in [
+		["\t(fresh, other) =", "\t\tvalue", "\t\tother"],
+		["\t(fresh, other) = f("],
+		["\t(fresh, other) = into_opaque(value)"],
+		["\tprevious = 1", "\t(fresh, other) = value extra"]
+	]:
+		text = source_lines(["func f():"].concat(body))
+		match (scanned(text), new_parse_state(lex_module(module_id_at_row(0), text))):
+			(Some((state, scan)), Ok(entry)):
+				(plain, _) = parse_declaration_preview(entry)
+				correct = (correct and completed_count(scan) == 0 and deferred_count(scan) == 1
+					and state.position() == plain.position() and state.id_counts() == plain.id_counts()
+					and state.diagnostic_count() == plain.diagnostic_count()
+					and spelling_count(state.spellings()) == spelling_count(plain.spellings()))
+			_: correct = False
+	correct
+
+
+-- Only the terminal ungrouped subscript is a place. The census detects an
+-- extra Subscript expression id even when its AST is discarded afterward.
+func test_only_the_outer_terminal_subscript_is_an_assignment_place() -> Bool:
+	var correct = True
+	for target in ["xs[i]", "make()[i]", "xs[i][j]", "(xs)[i]", "f(xs[i])[j]"]:
+		correct = correct and completed_dump(source_lines(["func f():", "\t" + target + " = value"])).is_some()
+	for (target, reason) in [
+		("(xs[i])", NonPlaceAssignmentTarget),
+		("((xs[i], ys[j]))", NonPlaceAssignmentTarget),
+		("(xs[i], ys[j])", TupleDestructuring),
+		("xs[i].field", FieldAssignment),
+		("xs[i] + ys[j]", NonPlaceAssignmentTarget),
+		("first + ys[j]", NonPlaceAssignmentTarget),
+		("-xs[i]", NonPlaceAssignmentTarget),
+		("not xs[i]", NonPlaceAssignmentTarget),
+		("f(xs[i])", NonPlaceAssignmentTarget),
+	]:
+		match scanned(source_lines(["func f():", "\t" + target + " = value"])):
+			Some((state, scan)):
+				counts = state.issued_counts()
+				correct = (correct and completed_count(scan) == 0 and deferred_count(scan) == 1
+					and state.position() == 5 and state.diagnostic_count() == 0 and counts.expressions == 0 and counts.statements == 0)
+				match scan.stop:
+					StoppedAtUnreadDeclaration(unread):
+						correct = (correct and unread.stop.reason == reason
+							and unread.stop.at.span_start() == 12 + target.length()
+							and unread.stop.at.span_end() == 13 + target.length())
+					_: correct = False
+			None: correct = False
+	correct and nested_subscript_place_ids()
+
+
+private pure func nested_subscript_place_ids() -> Bool:
+	match scanned(source_lines(["func f():", "\txs[i][j] = value"])):
+		Some((state, scan)):
+			match scan.items:
+				[FunctionItem(function)]:
+					match function.function.body:
+						Some(BlockBody(block)):
+							match block.last.kind:
+								SubscriptAssignment(assignment):
+									match assignment.place.collection.kind:
+										Subscript(collection, indices):
+											(state.id_counts() == [1, 1, 6, 0, 0, 0, 4, 0, 0]
+												and collection.id.expression_local_index() == 0
+												and indices.first.id.expression_local_index() == 1
+												and assignment.place.collection.id.expression_local_index() == 2
+												and assignment.place.indices.first.id.expression_local_index() == 3
+												and assignment.place.id.expression_local_index() == 4
+												and assignment.value.id.expression_local_index() == 5
+												and block.last.id.statement_local_index() == 0 and block.id.block_local_index() == 0
+												and id_census(module_id_at_row(0), completed_module(state, scan)).is_empty())
+										_: False
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+func test_grouped_thread_counts_issue_no_expression_ids() -> Bool:
+	var correct = True
+	for count in ["2", "((2))"]:
+		text = source_lines(["func f():", "\tconcurrent(max_threads: " + count + ", timeout: delay):", "\t\twork()"])
+		match scanned(text):
+			Some((state, scan)):
+				correct = (correct and completed_count(scan) == 1 and deferred_count(scan) == 0
+					and state.id_counts() == [2, 2, 4, 0, 0, 0, 2, 0, 0]
+					and id_census(module_id_at_row(0), completed_module(state, scan)).is_empty())
+			None: correct = False
+	correct
+
 
 
 private pure func completed_count(scan: ModuleDeclarationScan) -> Int:
@@ -152,6 +368,48 @@ func test_function_body_is_complete_syntax_with_an_exact_census() -> Bool:
 		None: False
 
 
+func test_leading_dot_chains_preserve_siblings_and_owner_boundaries() -> Bool:
+	var correct = True
+	for tail in ["", " == 0", " == 0 or ready"]:
+		text = source_lines([
+			"func f():", "\tx = values", "\t\t.map(func(item): item)", "\t\t.length()${tail}",
+			"\tprint(x)", "\tx", "func g(): 1"
+		])
+		match scanned(text):
+			Some((state, scan)):
+				syntax = completed_module(state, scan)
+				correct = (correct and completed_count(scan) == 2 and deferred_count(scan) == 0 and state.diagnostic_count() == 0
+					and id_census(module_id_at_row(0), syntax).is_empty() and state.issued_counts().statements == 3
+					and definition_names(syntax, spellings(state)) == [Some("f"), Some("g")])
+			None: correct = False
+	correct
+
+
+func test_closed_chains_preserve_unary_siblings_and_nested_levels() -> Bool:
+	var correct = True
+	for sibling in ["-other", "not other", "(other)"]:
+		correct = correct and true_if_completed(source_lines([
+			"func f():", "\tx = values", "\t\t.first()", "\t\t\t.second()", "\t\t.third()", "\t${sibling}", "\tx"
+		]))
+	correct
+
+
+func test_long_continuation_chain_has_an_exact_census() -> Bool:
+	links = 256
+	var lines = ["func f():", "\tvalues"]
+	var index = 0
+	while index < links:
+		lines = lines.append("\t\t.step()")
+		index += 1
+	lines = lines.append("\t0")
+	match scanned(source_lines(lines)):
+		Some((state, scan)):
+			(completed_count(scan) == 1 and deferred_count(scan) == 0 and state.diagnostic_count() == 0
+				and state.issued_counts().expressions == links * 2 + 2 and state.issued_counts().statements == 2
+				and id_census(module_id_at_row(0), completed_module(state, scan)).is_empty())
+		None: False
+
+
 -- Each shape is read in full by the frozen grammar or reported by it; this
 -- slice leaves it to a later one. The scan keeps the skipped-body preview and
 -- every id of the whole body is rolled back, even those minted by statements
@@ -161,25 +419,29 @@ func test_unsupported_bodies_roll_back_exactly() -> Bool:
 	for body in [
 		["\tfor x in xs:", "\t\ty ?= f(x)"],
 		["\tfor x in xs:", "\t\tif x:", "\t\t\ty: Int ?= f(x)"],
-		["\ta = 1", "\t(b, c) = pair"],
+		["\ta = 1", "\t(b, c[0]) = pair"],
 		["\t_ ?= f()"],
 		["\tfor (k) in pairs:", "\t\tk"],
 		["\tfor (a, b, c, d, e) in rows:", "\t\ta"],
 		["\tfor (a, b in pairs:", "\t\ta"],
 		["\tfor (a, 1) in pairs:", "\t\ta"],
-		["\t(a, b) = pair"],
-		["\tx =", "\t\t1"],
+		["\t(a, b[0]) = pair"],
+		["\tx =", "\t\t1", "\t\t2"],
+		["\tx =", "\t1"],
+		["\tx =", "\t\t|first " + hole("a") + " second " + hole("b c")],
+		["\twhile", "\t\tflag:", "\t\t1"],
+		["\twith resource =", "\t\tacquire():", "\t\t1"],
+		["\tx =", "\t\tif flag:", "\t\t1", "\t\telse:", "\t\t2"],
 		["\tvalue = if flag: 1 else: 2"],
-		["\tvalue = 1 + if flag:", "\t\t1", "\telse:", "\t\t2", "\t-z"],
+		["\tvalue = 1 + if flag:", "\t\t1", "\telse:", "\t\t2", "\tas Int"],
 		["\tvalue = if flag:", "\t\t1", "\telse:", "\t\t2", "\tand other"],
 		["\tvalue = 1 + if flag:", "\t\t1", "\telse:", "\t\t2", "\t.map(f)"],
 		["\tvalue = match flag:", "\t\t_: 1", "\t.map(f)"],
 		["\tvalue = [if flag:", "\t\t1", "\telse:", "\t\t2", "\t]"],
-		["\tvalue = if flag:", "\t\t1", "\telse:", "\t\t2", "\t-z"],
-		["\tvalue = match flag:", "\t\t_: 1", "\t-z"],
+		["\tvalue = if flag:", "\t\t1", "\telse:", "\t\t2", "\tas Int"],
+		["\tvalue = match flag:", "\t\t_: 1", "\tas Int"],
 		["\tvalue = (if flag:", "\t\t1", "\telse:", "\t\t2)"],
-		["\tfor x in xs:", "\t\tvalue = if x:", "\t\t\tbreak", "\t\telse:", "\t\t\t1"],
-		["\tvalue = if flag:", "\t\t1", "\telse:", "\t\t2", "\t\t.map(f)"],
+		["\tvalue = if flag:", "\t\t1", "\telse:", "\t\t2", "\t.map(f)"],
 		["\tvalue = if flag:", "\t\t1", "\telse if", "\t\t2"],
 		-- A comma on a block's last line belongs to that statement, which the frozen
 		-- grammar rejects; a block no deeper than the bracket of its list fails the
@@ -188,26 +450,27 @@ func test_unsupported_bodies_roll_back_exactly() -> Bool:
 		["\tvalue = [if flag:", "\t\t\t1", "\t\telse:", "\t\t\t2]"],
 		["\tvalue = if flag:", "\t\t1", "\telse:", "\t\t2", "\t.map(f)"],
 		["\tfor (k, v) in pairs concurrently(limit: 2):", "\t\tk"],
-		["\tfor x in xs concurrently(limit: 2):", "\t\tx"],
 		["\tbreak"],
 		["\tcontinue"],
-		["\tf(a, b).g()", "\t\t.h()"],
-		["\tmatch x:", "\t\t1: if y:", "\t\t\tz"],
-		["\tmatch x:", "\t\t1: 2", "\tmatch y:", "\t\t_: 3", "\t-z"],
+		["\tx = values", "\t\t.method()", "\t\tunrelated"],
+		["\tx = -values", "\t\t.length() + 1", "\tx"],
+		["\tx = values", "\t\t.length() .. 10", "\tx"],
+		["\tx = values", "\t\t.first()", "\t\t\t.second() + 1", "\tx"],
+		["\tif text", "\t\t.trim()", "\t\t.is_empty():", "\t\treport()"],
+		["\tmatch x:", "\t\t1: 2", "\tmatch y:", "\t\t_: 3", "\tas Int"],
 		["\tx: Int", "\ty"],
 		["\tif a:", "\t\tb", "\telse", "\t\tc"],
 		["\tp.x = 1"],
 		["\tvalue = \"" + hole("a b") + "\""],
 		["\tvalue = \"" + hole("") + "\""],
 		["\tvalue = \"" + hole("first") + " and " + hole("second third") + "\""],
-		["\tf = func(x):", "\t\t(a, b) = x"],
-		["\tvalue = \"" + hole("(func(x): x)(1)") + "\""],
-		["\ta = 1", "\tfunc helper(x: Int) -> Int:", "\t\t(a, b) = x"],
+		["\tf = func(x):", "\t\t(a, b[0]) = x"],
+		["\ta = 1", "\tfunc helper(x: Int) -> Int:", "\t\t(a, b[0]) = x"],
 		["\tfunc helper(x: Int) -> Int"],
-		["\tf = func(x: Int, y): x", "\tg = func(z): (a, b) = z"],
+		["\tf = func(x: Int, y): x", "\tg = func(z): (a, b[0]) = z"],
 		["\tfor x in xs:", "\t\tf = func(): break"],
 		-- A type and a pattern parsed to find their ends issue no ids that survive.
-		["\tcount: Int = 1", "\tmatch count:", "\t\tSome(inner): inner", "\t(flag, other) = pair"]
+		["\tcount: Int = 1", "\tmatch count:", "\t\tSome(inner): inner", "\t(flag, other[0]) = pair"]
 	]:
 		text = source_lines(["func f() -> Int:"].concat(body))
 		match (scanned(text), new_parse_state(lex_module(module_id_at_row(0), text))):
@@ -219,6 +482,25 @@ func test_unsupported_bodies_roll_back_exactly() -> Bool:
 					correct = False
 			_: correct = False
 	correct
+
+
+-- Comment indentation is layout evidence, but there is no supported statement
+-- to mint. Decline the body without diagnosing the old parser's accepted input.
+func test_comment_only_body_stops_without_diagnostics_or_body_ids() -> Bool:
+	text = "func f():\n\t-- comment\n"
+	match scanned(text):
+		Some((state, scan)):
+			match scan.stop:
+				StoppedAtUnreadDeclaration(unread):
+					match unread.header:
+						UnreadFunction(_):
+							counts = state.issued_counts()
+							(completed_count(scan) == 0 and state.diagnostic_count() == 0
+								and unread.stop.reason == BlockNotClosed and unread.stop.at.span_start() == 22 and unread.stop.at.span_end() == 22
+								and state.position() == 5 and counts.blocks == 0 and counts.statements == 0 and counts.expressions == 0 and counts.patterns == 0)
+						_: False
+				_: False
+		None: False
 
 
 -- A written type and a pattern are read once to find where they end and again
@@ -283,8 +565,8 @@ func test_owner_methods_are_minted_in_source_order() -> Bool:
 func test_owner_with_an_unsupported_body_keeps_only_its_header_ids() -> Bool:
 	var correct: Bool = True
 	for (text, header_ids) in [
-		(source_lines(["trait Shape:", "\tfunc first(x: Int) -> Int: x", "\tfunc second(y: Int) -> Int:", "\t\t(a, b) = y"]), [0, 0, 0, 0, 0, 0, 0, 0, 0]),
-		(source_lines(["implements Shape for Int:", "\tfunc first(x: Int) -> Int: x", "\tfunc second(y: Int) -> Int:", "\t\t(a, b) = y"]), [0, 0, 0, 0, 1, 0, 2, 0, 0]),
+		(source_lines(["trait Shape:", "\tfunc first(x: Int) -> Int: x", "\tfunc second(y: Int) -> Int:", "\t\t(a, b[0]) = y"]), [0, 0, 0, 0, 0, 0, 0, 0, 0]),
+		(source_lines(["implements Shape for Int:", "\tfunc first(x: Int) -> Int: x", "\tfunc second(y: Int) -> Int:", "\t\t(a, b[0]) = y"]), [0, 0, 0, 0, 1, 0, 2, 0, 0]),
 	]:
 		match scanned(text):
 			Some((state, scan)):
@@ -421,7 +703,7 @@ func test_scan_stops_at_a_deferred_function() -> Bool:
 		"\tc",
 		"func second() -> Int:",
 		"\ta = 1",
-		"\t(b, c) = pair",
+		"\t(b, c[0]) = pair",
 		"func third() -> Int:",
 		"\td = 3",
 		"\td"
@@ -472,8 +754,8 @@ func test_deep_else_if_chain_survives_parse_dump_and_census() -> Bool:
 -- A control expression is an operand wherever the frozen grammar reads one at
 -- the end of a line: a statement's value, the right operand of an operator, a
 -- unary operand and an expression statement's right end. Both sides are
--- pinned: those shapes complete, and every other way of continuing past a
--- block, indenting a tail or bracketing one stays deferred.
+-- pinned: those shapes complete; a postfix tail after a block stays deferred.
+-- Binary continuations have their separate precedence and rollback probes.
 func test_control_expression_operands_complete_and_their_continuations_defer() -> Bool:
 	accepted = source_lines([
 		"func f(a: Int) -> Int:",
@@ -498,7 +780,7 @@ func test_control_expression_operands_complete_and_their_continuations_defer() -
 		"\t\t_: True",
 		"\tx"
 	])
-	deferred = source_lines(["func f(a: Int) -> Int:", "\tx = if a:", "\t\t1", "\telse:", "\t\t2", "\t\t.tail()", "\tx"])
+	deferred = source_lines(["func f(a: Int) -> Int:", "\tx = if a:", "\t\t1", "\telse:", "\t\t2", "\t.tail()", "\tx"])
 	global_operand = source_lines(["g = 1 + if a:", "\t1", "else:", "\t2", "", "record Later {}"])
 	global_value = source_lines(["h = match a:", "\t_: 1"])
 	one_line_body = source_lines(["func k(a: Int) -> Int: match a:", "\t_: 1"])
@@ -518,6 +800,52 @@ func test_control_expression_operands_complete_and_their_continuations_defer() -
 	match scanned(one_line_lambda_body):
 		Some((_, scan)): correct = correct and completed_count(scan) == 0
 		None: correct = False
+	correct
+
+
+-- Block dedents close postfix chains, but the frozen operator loop keeps
+-- reading controls as operands without counting a flat chain as nesting.
+func test_long_control_operator_chain_survives_dump_and_census() -> Bool:
+	links = 256
+	var lines: List[String] = ["func f(c: Int):", "\t(match c:", "\t\t_: True"]
+	var index = 1
+	while index < links:
+		lines = lines.append("\tand match c:")
+		lines = lines.append("\t\t_: True")
+		index += 1
+	lines = lines.append("\t)")
+	lines = lines.append("\tfollowing(c)")
+	match completed_dump(source_lines(lines)):
+		Some(dumped): dumped.split("(match expr").length() == links + 1
+		None: False
+
+
+func test_control_operator_tail_rollback_preserves_entry() -> Bool:
+	var correct = True
+	for tail in ["\t+ [1, 2] unexpected", "\tas Int", "\t= value", "\t.tail()"]:
+		text = source_lines(["func f(c: Int):", "\tmatch c:", "\t\t_: 1", tail])
+		match scanned(text):
+			Some((state, scan)):
+				counts = state.issued_counts()
+				correct = (correct and completed_count(scan) == 0 and deferred_count(scan) == 1
+					and state.position() == 8 and state.diagnostic_count() == 0 and counts.expressions == 0 and counts.statements == 0)
+			None: correct = False
+	correct
+
+
+func test_standalone_control_operator_tail_rollback_preserves_entry() -> Bool:
+	var correct = True
+	for tail in ["+ [1, 2] unexpected", "as Int", "= value"]:
+		text = source_lines(["match c:", "\t_: 1", tail])
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(state, parsed) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+				match parsed:
+					UnsupportedExpression(_):
+						correct = (correct and state.position() == entry.position() and state.issued_counts() == entry.issued_counts()
+							and state.spellings().spelling_count() == entry.spellings().spelling_count() and state.diagnostic_count() == entry.diagnostic_count())
+					_: correct = False
+			Err(_): correct = False
 	correct
 
 
@@ -771,7 +1099,7 @@ func test_unsupported_block_forms_roll_back_exactly() -> Bool:
 		["\tconcurrent:", "\ta"],
 		["\tconcurrent: a"],
 		["\tconcurrent:", "\t\ta", "\t-z"],
-		["\tdebug.print(x)"],
+		["\tdebug.print(if flag: 1 else: 2)"],
 		["\tdebug: x"],
 		["\tdebug:", "\ta"],
 		["\tmatch xs:", "\t\t_: with a = x:", "\t\t\ta"],
@@ -787,17 +1115,16 @@ func test_unsupported_block_forms_roll_back_exactly() -> Bool:
 		["\tconcurrent(timeout: pick(func():", "\t\t5", "\t)):", "\t\tf()"],
 		["\tdetach"],
 		["\tdetach with a = x:", "\t\ta"],
-		["\tdetach f(x)", "\t\t.g()"],
+		["\tdetach f(x)", "\t\t.g(if x: 1 else: 2)"],
 		["\tselect:"],
 		["\tselect", "\t\tv from xs:", "\t\t\tv"],
-		["\tselect:", "\t\tafter from xs:", "\t\t\t0"],
+		["\tselect:", "\t\tfrom from xs:", "\t\t\t0"],
 		["\tselect:", "\t\tv from xs", "\t\t\tv"],
 		["\tselect:", "\t\tv xs:", "\t\t\tv"],
 		["\tselect:", "\t\tsealed:", "\t\t\t0"],
 		["\tselect:", "\t\t_ after:", "\t\t\t0"],
 		["\tselect:", "\t\tv from xs: v"],
 		["\tselect:", "\t\tv from xs:", "\t\t\tv", "\t-z"],
-		["\tfor x in xs:", "\t\ty = select:", "\t\t\tv from x:", "\t\t\t\tbreak"],
 		["\ty = select:", "\t\tv from xs:", "\t\t\tv", "\t.map(f)"]
 	]:
 		text = source_lines(["func f(xs: List[Int]) -> Int:"].concat(body))
@@ -886,6 +1213,16 @@ func test_deeply_nested_with_blocks_survive_parse_dump_and_census() -> Bool:
 	nests_to_depth(nested_with_lines(depth), "(with expr", depth)
 
 
+func test_deeply_nested_concurrently_for_survives_parse_dump_and_census() -> Bool:
+	depth = 100
+	var lines: List[String] = ["func f():"]
+	for level in 0..depth:
+		lines = lines.append("\t".repeat(level + 1) + "for item in items concurrently(limit: 2, timeout: delay):")
+	lines = lines.append("\t".repeat(depth + 1) + "continue")
+	nests_to_depth(lines, "(concurrent-for stmt", depth)
+
+
+
 func test_deeply_nested_concurrent_blocks_survive_parse_dump_and_census() -> Bool:
 	depth = 100
 	nests_to_depth(nested_concurrent_lines(depth), "(concurrent expr", depth)
@@ -913,11 +1250,180 @@ func test_long_select_survives_parse_dump_and_census() -> Bool:
 	nests_to_depth(lines, "(receive-arm @", arms)
 
 
+private pure func completed_owner_body(text: String, body_start: Int, body_end: Int, next_start: Int, token_end: Int, cursor: TokenKind) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(head_state, result) = parse_function_head(state, PublicVisibility, None, [], PureFunction, state.current_span())
+			match result:
+				ParsedFunctionHead(head):
+					(completed, parsed) = complete_function(head_state, head)
+					match parsed:
+						CompletedFunction(function):
+							match function.function.body:
+								Some(body):
+									written_span = match body:
+										BlockBody(block): block.span
+										ExpressionBody(expression): expression.span
+									(written_span.span_start() == body_start and written_span.span_end() == body_end
+										and head_state.position() == 5 and head_state.issued_counts().expressions == 0
+										and completed.position() == token_end and completed.current_kind() == cursor
+										and completed.current_span().span_start() == next_start and completed.diagnostic_count() == 0)
+								None: False
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_inline_body_consumes_owned_newline_and_preserves_next_declaration() -> Bool:
+	completed_owner_body("func f(): 1 + 2\nfunc g():", 10, 15, 16, 9, FuncKeyword)
+
+pure func test_inline_block_continuation_at_function_anchor_remains_one_body() -> Bool:
+	completed_owner_body("func f(): if True:\n\t\t\t1\nelse:\n\t\t\t2\nfunc g():", 10, 34, 35, 18, FuncKeyword)
+
+pure func test_indented_nested_body_preserves_authored_span_and_layout_interval() -> Bool:
+	(completed_owner_body("func f():\n\tif True:\n\t\t1\n\telse:\n\t\t2\nfunc g():", 11, 34, 35, 21, FuncKeyword)
+		and completed_owner_body("func f():\n-- comment\n\n\t1\nfunc g():", 23, 24, 25, 9, FuncKeyword))
+
+pure func test_stray_else_after_nonconditional_body_remains_outside_completed_body() -> Bool:
+	completed_owner_body("func f(): 1\nelse: 2\nfunc g():", 10, 11, 12, 7, ElseKeyword)
+
+pure func test_multiple_else_if_continuations_stay_in_one_completed_body() -> Bool:
+	completed_owner_body("func f(): if True:\n\t\t\t1\nelse if False:\n\t\t\t2\nelse:\n\t\t\t3\nfunc g():", 10, 54, 55, 26, FuncKeyword)
+
+pure func test_leading_dot_postfix_continuation_stays_in_inline_body() -> Bool:
+	completed_owner_body("func f(): value\n.method()\nfunc g():", 10, 25, 26, 12, FuncKeyword)
+
+pure func test_multiline_parenthesized_body_owns_anchor_close_and_following_layout() -> Bool:
+	completed_owner_body("func f(): foo(\n\t1,\n\t2,\n)\nfunc g():", 10, 24, 25, 13, FuncKeyword)
+
+pure func test_conditional_inside_parentheses_owns_else_but_leaves_later_stray_else() -> Bool:
+	completed_owner_body("func f(): foo(if True:\n\t\t\t1\nelse:\n\t\t\t2\n)\nelse: 3\nfunc g():", 10, 40, 41, 22, ElseKeyword)
+
+
+
+func test_invalid_concurrently_for_rolls_back_every_written_child() -> Bool:
+	var correct = True
+	for header in ["for (a, b) in items concurrently(limit: 2):", "for x in items concurrently:", "for x in items concurrently():", "for x in items concurrently(timeout: delay):", "for x in items concurrently(max_threads: 2):", "for x in items concurrently(priority: delay):", "for x in items concurrently(limit: 0):", "for x in items concurrently(limit: -1):", "for x in items concurrently(limit: size):", "for x in items concurrently(limit: 1 + 1):", "for x in items concurrently(limit: 9223372036854775808):", "for x in items concurrently(limit: 2, limit: 3):", "for x in items concurrently(limit: 2, timeout: delay, timeout: other):", "for x in items concurrently(limit 2):", "for x in items concurrently(limit: 2 timeout: delay):", "for x in items concurrently(limit: 2)"]:
+		text = source_lines(["func f():", "\tbefore = already", "\t" + header, "\t\tcontinue"])
+		match (scanned(text), new_parse_state(lex_module(module_id_at_row(0), text))):
+			(Some((state, scan)), Ok(entry)):
+				(plain, _) = parse_declaration_preview(entry)
+				correct = (correct and completed_count(scan) == 0 and deferred_count(scan) == 1
+					and state.position() == plain.position() and id_counts(state) == id_counts(plain)
+					and state.diagnostic_count() == plain.diagnostic_count()
+					and spelling_count(spellings(state)) == spelling_count(spellings(plain)))
+			_: correct = False
+	correct
+
+
+
+func test_concurrently_for_completes_the_statement_and_censuses_every_id() -> Bool:
+	text = source_lines(["func f():", "\tfor x in items concurrently(timeout: delay + 1, limit: 2):", "\t\tcontinue", "\t0"])
+	match completed_dump(text):
+		Some(dump):
+			(dump.contains("(concurrent-for stmt1 @11..80 bind0:\"x\"@15..16 (name expr0 @20..25 use0:\"items\"@20..25) (count @59..67 @59..64 2)")
+			and dump.contains("(timeout @39..57 @39..46 (binary expr3 @48..57 add (name expr1 @48..53 use1:\"delay\"@48..53) (integer expr2 @56..57 1)))")
+			and dump.contains("(block block0 @72..80")
+			and dump.contains("(expression-statement stmt0 @72..80 (continue expr4 @72..80))")
+			and dump.contains("(expression-statement stmt2 @82..83 (integer expr5 @82..83 0))")
+			and dump.contains("(block block1 @11..83"))
+		None: False
+
+func test_lambda_holes_complete_and_restore_outer_tokens() -> Bool:
+	text = source_lines(["func f():", "\tvalue = \"" + hole("(pure func(x: Int) -> Int: x + 1)(2)") + " tail\"", "\tvalue"])
+	completed_dump(text).is_some()
+
+
+func test_case_line_controls_use_the_pattern_anchor() -> Bool:
+	text = source_lines(["func f(value):", "\tmatch value:", "\t\t_: if True:", "\t\t\t1", "\t\telse:", "\t\t\t2"])
+	completed_dump(text).is_some()
+
+
+func test_control_call_operands_inherit_loop_scope() -> Bool:
+	var correct = True
+	for exit in ["break", "continue"]:
+		text = source_lines(["func f(items):", "\tfor item in items:", "\t\tconsume(", "\t\t\tmatch item:", "\t\t\t\t_: ", "\t\t\t\t\t" + exit, "\t\t\t\t\t0", "\t\t)", "\t0"])
+		correct = correct and completed_dump(text).is_some()
+	correct
+
+
+func test_previously_unread_controls_and_holes_complete_with_ids() -> Bool:
+	var correct = True
+	for body in [
+		["\tx =", "\t\t|hello " + hole("(func(x): x)(1)")],
+		["\tfor x in xs:", "\t\tvalue = if x:", "\t\t\tbreak", "\t\telse:", "\t\t\t1"],
+		["\tmatch x:", "\t\t1: if y:", "\t\t\tz"],
+		["\tvalue = \"" + hole("(func(x): x)(1)") + "\""],
+		["\tfor x in xs:", "\t\ty = select:", "\t\t\tv from x:", "\t\t\t\tbreak"],
+		["\tmatch x:", "\t\t_: match y:", "\t\t\t_: z"]
+	]:
+		correct = correct and completed_dump(source_lines(["func f():"].concat(body))).is_some()
+	correct
+
+
+func test_operand_loop_exits_reset_at_lambda_function_and_task_boundaries() -> Bool:
+	var correct = True
+	for owner in ["value = func():", "func local():", "concurrent:"]:
+		for exit in ["break", "continue"]:
+			text = source_lines(["func f(items):", "\tfor item in items:", "\t\t" + owner, "\t\t\tconsume(", "\t\t\t\tmatch item:", "\t\t\t\t\t_:", "\t\t\t\t\t\t" + exit, "\t\t\t\t\t\t0", "\t\t\t)", "\t0"])
+			match (scanned(text), new_parse_state(lex_module(module_id_at_row(0), text))):
+				(Some((state, scan)), Ok(entry)):
+					(plain, _) = parse_declaration_preview(entry)
+					correct = (correct and completed_count(scan) == 0 and deferred_count(scan) == 1
+						and state.position() == plain.position() and id_counts(state) == id_counts(plain)
+						and spelling_count(spellings(state)) == spelling_count(spellings(plain)) and state.diagnostic_count() == 0)
+				_: correct = False
+	correct
+
+
+func test_inline_case_control_tail_restores_the_function_header() -> Bool:
+	var correct = True
+	for control in [["\t\t_: if flag:", "\t\t\t1", "\t\telse:", "\t\t\t2"], ["\t\t_: match flag:", "\t\t\t_: 1"]]:
+		for follower in ["+ 3", "- 3"]:
+			text = source_lines(["func f(flag):", "\tmatch flag:"].concat(control).concat(["\t\t" + follower]))
+			match (scanned(text), new_parse_state(lex_module(module_id_at_row(0), text))):
+				(Some((state, scan)), Ok(entry)):
+					(plain, _) = parse_declaration_preview(entry)
+					correct = (correct and completed_count(scan) == 0 and deferred_count(scan) == 1
+						and state.position() == plain.position() and id_counts(state) == id_counts(plain)
+						and spelling_count(spellings(state)) == spelling_count(spellings(plain)) and state.diagnostic_count() == 0)
+				_: correct = False
+	correct
+
+
 tests: TestSuite = {
 	description = "Tree statements, blocks and function bodies",
 	tests = [
+		("inline case control tail restores the function header", test_inline_case_control_tail_restores_the_function_header),
+		("operand exits reset at lambda function and task boundaries", test_operand_loop_exits_reset_at_lambda_function_and_task_boundaries),
+		("previously unread controls and holes complete with ids", test_previously_unread_controls_and_holes_complete_with_ids),
+		("lambda holes restore outer tokens", test_lambda_holes_complete_and_restore_outer_tokens),
+		("case controls use pattern anchor", test_case_line_controls_use_the_pattern_anchor),
+		("control operands inherit loop scope", test_control_call_operands_inherit_loop_scope),
+		("next line pipe value has real span and postorder ids", test_next_line_pipe_value_has_real_span_and_postorder_ids),
+		("100 nested concurrently for loops", test_deeply_nested_concurrently_for_survives_parse_dump_and_census),
+		("invalid concurrently for rolls back every child", test_invalid_concurrently_for_rolls_back_every_written_child),
+		("concurrently for completes and censuses ids", test_concurrently_for_completes_the_statement_and_censuses_every_id),
+		("tuple destructuring with unread value rolls back binders and spellings", test_tuple_destructuring_with_unread_value_rolls_back_binders_and_spellings),
+		("soft keyword assignment mints target before value", test_soft_keyword_assignment_mints_target_before_value),
+		("flat tuple destructuring mints only binders and value", test_flat_tuple_destructuring_mints_only_binders_and_value),
+		("tuple destructuring does not admit other targets or keyword tokens", test_tuple_destructuring_does_not_admit_other_targets_or_keyword_tokens),
+		("grouped thread counts issue no expression ids", test_grouped_thread_counts_issue_no_expression_ids),
+		("only the outer terminal subscript is an assignment place", test_only_the_outer_terminal_subscript_is_an_assignment_place),
+		("comment-only body stops without diagnostics or body ids", test_comment_only_body_stops_without_diagnostics_or_body_ids),
+		("conditional inside parentheses owns else but leaves later stray else", test_conditional_inside_parentheses_owns_else_but_leaves_later_stray_else),
+		("multiline parenthesized body owns anchor close and following layout", test_multiline_parenthesized_body_owns_anchor_close_and_following_layout),
+		("leading dot postfix continuation stays in inline body", test_leading_dot_postfix_continuation_stays_in_inline_body),
+		("multiple else if continuations stay in one completed body", test_multiple_else_if_continuations_stay_in_one_completed_body),
+		("stray else after nonconditional body remains outside completed body", test_stray_else_after_nonconditional_body_remains_outside_completed_body),
+		("indented nested body preserves authored span and layout interval", test_indented_nested_body_preserves_authored_span_and_layout_interval),
+		("inline block continuation at function anchor remains one body", test_inline_block_continuation_at_function_anchor_remains_one_body),
+		("inline body consumes owned newline and preserves next declaration", test_inline_body_consumes_owned_newline_and_preserves_next_declaration),
 		("ids follow source order and the function comes last", test_ids_follow_source_order_and_the_function_comes_last),
 		("a function body is complete syntax with an exact census", test_function_body_is_complete_syntax_with_an_exact_census),
+		("leading dots preserve siblings and owners", test_leading_dot_chains_preserve_siblings_and_owner_boundaries),
+		("closed chains preserve unary siblings and nested levels", test_closed_chains_preserve_unary_siblings_and_nested_levels),
+		("256 continued postfix links have an exact census", test_long_continuation_chain_has_an_exact_census),
 		("unsupported bodies roll back exactly", test_unsupported_bodies_roll_back_exactly),
 		("types and patterns are minted in source order", test_types_and_patterns_are_minted_in_source_order),
 		("interpolation holes are minted in source order", test_interpolation_holes_are_minted_in_source_order),
@@ -931,6 +1437,9 @@ tests: TestSuite = {
 		("5000 statements", test_long_statement_list_is_read_and_minted_by_loops),
 		("2000 link else if chain", test_deep_else_if_chain_survives_parse_dump_and_census),
 		("control expression operands complete and their continuations defer", test_control_expression_operands_complete_and_their_continuations_defer),
+		("long control operator chain survives dump and census", test_long_control_operator_chain_survives_dump_and_census),
+		("control operator tail rollback preserves entry", test_control_operator_tail_rollback_preserves_entry),
+		("standalone control operator tail rollback preserves entry", test_standalone_control_operator_tail_rollback_preserves_entry),
 		("control value ids follow source order", test_control_value_ids_follow_source_order),
 		("100 nested value ifs", test_deeply_nested_value_ifs_survive_parse_dump_and_census),
 		("40 nested operand ifs", test_deeply_nested_operand_ifs_survive_parse_dump_and_census),

@@ -33,7 +33,7 @@ import:
 	../syntax/diagnostics:
 		SyntaxDiagnostic(
 			Plain, ExpectedToken, UnknownEscape, IntegerLiteralOverflow, FloatLiteralOverflow,
-			UnexpectedByte, ReservedKeywordAsName, SyntaxNestingTooDeep,
+			UnexpectedByte, ReservedKeywordAsName, SyntaxNestingTooDeep, DuplicateField,
 		),
 		SyntaxDiagnosticAt,
 	../syntax/expressions:
@@ -93,7 +93,7 @@ import:
 		KEYWORD_KINDS_IN_SEEDED_ORDER,
 		Token,
 		TokenKind(
-			IdentifierToken, DimensionNameToken, SelfKeyword, VoidKeyword, TrueKeyword,
+			IdentifierToken, DimensionNameToken, SelfKeyword, VoidKeyword, FromKeyword, TrueKeyword,
 			FalseKeyword, IntLiteralToken, FloatLiteralToken, NormalStringToken, RawStringToken,
 			PipeStringToken, RawPipeStringToken, DocStringToken, EndOfFileToken, NewlineToken,
 			DedentToken, ColonSymbol, CommaSymbol, LeftParenSymbol, RightBracketSymbol,
@@ -101,12 +101,12 @@ import:
 			UnderscoreSymbol, InterpolatedStringToken, InterpolatedPipeStringToken,
 		),
 		fixed_token_spelling,
+	builtin_marker_text: static_builtin_marker_text
 	token_cursor:
 		TokenCursor,
 		TokenInputError,
 		advanced as advanced_cursor,
 		current_token as cursor_token,
-		cursor_at,
 		cursor_position,
 		is_soft_keyword,
 		new_token_cursor,
@@ -142,6 +142,7 @@ private record ParseFields {
 
 fixed union NameRole:
 	OrdinaryName
+	ExpressionName
 	TypeName
 	VariantName
 
@@ -282,32 +283,28 @@ pure func advanced(state: ParseState) -> ParseState:
 
 
 ---
-`state` with `position` as its current token and every other fact kept: the
-mint, the spellings and the diagnostics. A body is first recognized without
-ids and then replayed from where it began, so the replay's ids follow the
-header's.
+A rejected expression trial keeps its cursor, spellings and diagnostics but
+returns every trial id to the saved entry authority. This is failure-only:
+accepted parsing never restores a cursor or merges a mint. Expression errors
+carry spans/spellings, never identities of discarded definitions; body/head
+errors are declined whole before reaching this boundary.
 ---
-pure func resumed_at(state: ParseState, position: Int) -> ParseState:
-	fields: ParseFields = from_opaque ParseState(state)
-	cursor: TokenCursor = cursor_at(fields.cursor, position)
-	before: Span = if cursor_position(cursor) > 0:
-		cursor_token(cursor_at(cursor, cursor_position(cursor) - 1)).span
-	else:
-		cursor_token(cursor).span
-	into_opaque ParseState({ fields | cursor = cursor, previous = before })
-
-
----
-`state` moved to where `reached` stopped, issuing none of the ids `reached`
-issued: `reached`'s cursor, spellings and diagnostics with `state`'s own mint.
-A recognition pass uses it after parsing an id-bearing construct (a written
-type or a pattern) only to learn where it ends, so that every id of the
-accepted body is issued later, in source order, by its replay.
----
-pure func resumed_after(state: ParseState, reached: ParseState) -> ParseState:
-	own: ParseFields = from_opaque ParseState(state)
-	other: ParseFields = from_opaque ParseState(reached)
-	into_opaque ParseState({ other | mint = own.mint })
+pure func rejected_trial(entry: ParseState, failed: ParseState) -> ParseState:
+	own: ParseFields = from_opaque ParseState(entry)
+	trial: ParseFields = from_opaque ParseState(failed)
+	if trial.hole_depth != own.hole_depth or trial.nesting != own.nesting:
+		report_unreachable_input("a rejected expression trial has restored its token run and nesting")
+	if trial.diagnostics.length() <= own.diagnostics.length():
+		report_unreachable_input("a rejected expression trial added a diagnostic")
+	var index = 0
+	for diagnostic in trial.diagnostics:
+		if index >= own.diagnostics.length():
+			match diagnostic.diagnostic:
+				DuplicateField(_):
+					report_unreachable_input("an expression diagnostic does not reference a discarded definition")
+				_: void
+		index += 1
+	into_opaque ParseState({ trial | mint = own.mint })
 
 
 ---
@@ -445,9 +442,8 @@ pure func reported_nesting_too_deep(state: ParseState) -> Bool:
 
 
 ---
-Whether the cursor reads an interpolation hole's own token run. A token
-position there indexes the hole's run, not the module's, so a construct that
-replays from a recorded token position cannot be read inside a hole.
+Whether the cursor reads an interpolation hole's own token run. Parsers use
+this fact for their current hole grammar restrictions, never token replay.
 ---
 pure func inside_hole(state: ParseState) -> Bool:
 	from_opaque ParseState(state).hole_depth > 0
@@ -476,6 +472,14 @@ pure func current_interpolation(state: ParseState) -> Option[InterpolationScan]:
 			fields.source.interpolations.get(token.payload)
 		_:
 			None
+
+
+-- Builtin marker interpolation is frozen static text, with no hole syntax.
+pure func current_builtin_marker_text(state: ParseState) -> Option[String]:
+	fields: ParseFields = from_opaque ParseState(state)
+	match state.current_interpolation():
+		Some(scan): Some(static_builtin_marker_text(fields.source.text, state.current_kind(), state.current_span(), scan))
+		None: None
 
 
 ---
@@ -641,6 +645,8 @@ pure func name_allowed(kind: TokenKind, role: NameRole) -> Bool:
 				kind == TrueKeyword or kind == FalseKeyword
 			OrdinaryName:
 				False
+			ExpressionName:
+				kind == FromKeyword
 
 
 -- Capture the frozen declaration diagnostic payload without constructing a

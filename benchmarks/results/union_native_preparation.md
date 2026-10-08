@@ -45,7 +45,7 @@ and unchanged compact language state field widths 1 byte. Generated C contains
 Raw baseline logs: `/tmp/union-native-baseline-build.log`,
 `/tmp/union-native-baseline-foreign.log`, `/tmp/union-native-baseline-layout.log`.
 Retained C/Core/probes:
-`/var/folders/m7/zszgqft538nfx_qr1kmc7dlc0000gn/T/blorp-record-layout.wYoEZL`.
+`$TMPDIR/blorp-record-layout.wYoEZL`.
 
 ## Candidate validation
 
@@ -55,7 +55,7 @@ fixture check passes. The retained layout oracle passes at O0 and O2 with the
 same eight record sizes/alignments/field widths as baseline. Candidate generated
 C SHA-256 is `e1609b42cbf339bf93ffd5b3b459bf8219f5797da2e6dda9b03f105e1c702b92`;
 C/Core/probes are retained at
-`/var/folders/m7/zszgqft538nfx_qr1kmc7dlc0000gn/T/blorp-record-layout.s3EBIT`.
+`$TMPDIR/blorp-record-layout.s3EBIT`.
 
 The companion runs at release O2 with `--leak-check` in both runtime-selected
 branches: no args yields 3 allocations/3 releases/0 leaked; `-- blue` yields
@@ -110,7 +110,7 @@ Neither failure establishes a compiler ABI defect.
 
 The original layout failure log was overwritten during iteration. The failed
 generated C remains untouched at
-`/var/folders/m7/zszgqft538nfx_qr1kmc7dlc0000gn/T/blorp-record-layout.xL918Y/compiler_record_layout.c`,
+`$TMPDIR/blorp-record-layout.xL918Y/compiler_record_layout.c`,
 SHA-256 `a5ddac56d2d237b38aeadff2f41991a67c0ab03c8b4aa97a13cd9e2ac47e2b60`.
 `/tmp/union-native-macro-oracle-supplementary.log` is a new syntax-check
 reproduction, not recovery of the original log. It uses current header SHA-256

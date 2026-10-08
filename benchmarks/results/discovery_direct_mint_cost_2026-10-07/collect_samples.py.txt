@@ -1,0 +1,34 @@
+from pathlib import Path
+import hashlib,json,os,re,subprocess
+base=Path(__file__).parent
+rows=[]
+for pair in range(1,4):
+    for label in ['baseline','candidate']:
+        binary=base/(label+'-probe')
+        env=os.environ.copy()
+        env['BLORP_MEMORY_STATS']='1'
+        env['BLORP_THREADS']='1'
+        env.pop('BLORP_LEAK_CHECK',None)
+        result=subprocess.run([str(binary)],env=env,capture_output=True,text=True,timeout=180)
+        (base/(label+'-sample-'+str(pair)+'.stdout.log')).write_text(result.stdout)
+        (base/(label+'-sample-'+str(pair)+'.stderr.log')).write_text(result.stderr)
+        assert result.returncode==0,(label,pair,result.returncode,result.stderr)
+        match=re.search(r'COUNTERS active=(\d+)/(\d+) oracle=(\d+)/(\d+) managed=(\d+) releases=(\d+) live=(-?\d+) backing=(\d+)',result.stdout)
+        assert match,(label,pair,'missing counter line')
+        values=[int(x) for x in match.groups()]
+        assert values[:4]==[1,1,1,1],(label,pair,'inactive counters',values)
+        output=next(x for x in result.stdout.splitlines() if x.startswith('OUTPUT '))
+        assert 'items=6 ' in output and 'census=0 ' in output,(label,pair,output)
+        oracle=result.stdout.split('ORACLE_BEGIN\n',1)[1].split('\nORACLE_END',1)[0]
+        row={'source':label,'pair':pair,'managed_allocations':values[4],'managed_releases':values[5],'live_managed_objects_delta':values[6],'backing_malloc_events':values[7],'output':output,'oracle_sha256':hashlib.sha256(oracle.encode()).hexdigest(),'stdout_sha256':hashlib.sha256(result.stdout.encode()).hexdigest(),'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest()}
+        rows.append(row)
+        (base/'samples-in-progress.json').write_text(json.dumps(rows,indent=2)+'\n')
+assert len(set(r['output'] for r in rows))==1,'count/spelling/census mismatch'
+assert len(set(r['oracle_sha256'] for r in rows))==1,'syntax/id/span mismatch'
+fields=['managed_allocations','managed_releases','live_managed_objects_delta','backing_malloc_events']
+for label in ['baseline','candidate']:
+    assert len(set(tuple(r[k] for k in fields) for r in rows if r['source']==label))==1,('variable counters',label)
+a=rows[0];b=rows[1]
+report={'samples':rows,'exact_output_and_syntax_identity':True,'counter_repeatability':'identical in three independent processes per retained binary','delta_candidate_minus_baseline':{k:b[k]-a[k] for k in fields},'scope':'assemble_module after lexing; result retained at final scalar counter endpoints; no speed or byte claim','launch_environment':{'BLORP_MEMORY_STATS':'1','BLORP_THREADS':'1','BLORP_LEAK_CHECK':'unset'},'timeout_seconds':180}
+(base/'samples.json').write_text(json.dumps(report,indent=2)+'\n')
+print(json.dumps(report,indent=2))

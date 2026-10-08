@@ -1,4 +1,4 @@
--- Trait method headers and lexical evidence for default bodies. M4 owns
+-- Trait method heads stop at their default-body entry. M4 owns
 -- body trees and expression diagnostics; these previews mint no method IDs.
 import:
 	../syntax/declarations: Signature
@@ -9,14 +9,14 @@ import:
 		NameConstruct(NameInTraitMethodName), LeftParenConstruct(LeftParenInTraitMethodName)
 	../tables/row_kinds: Purity(PureFunction, ImpureFunction)
 	../tables/span: Span, span_covering
-	../tables/token: TokenKind(PureKeyword, FuncKeyword, ArrowSymbol, ColonSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken)
+	../tables/token: TokenKind(PureKeyword, FuncKeyword, ArrowSymbol, ColonSymbol)
 	parse_state:
-		ParseState, diagnostic_count, current_kind, current_span, advanced, peek_kind, span_start_line,
+		ParseState, diagnostic_count, current_kind, current_span, advanced,
 		expect_token, consume_declared_name, report_diagnostic
 	tree_parameter_parser: ParametersParse(ParsedParameters), parse_parenthesized_parameters
 	tree_type_parser: parse_type
 	tree_function_header_parser:
-		DeferredBody, FunctionBodyExtent(ForwardDeclaration, SkippedBody), skip_deferred_body
+		recover_rejected_function_body, function_body_follows
 
 
 record TraitMethodHeader {
@@ -25,23 +25,23 @@ record TraitMethodHeader {
 }
 
 
-union MethodBodyExtent:
+fixed union MethodBodyPresence:
 	AbstractMethod
-	SkippedDefaultBody(DeferredBody)
+	DefaultBodyFollows
 
 
-record TraitMethodHeaderPreview {
+record TraitMethodHead {
 	header: TraitMethodHeader,
-	body_extent: MethodBodyExtent
+	body_presence: MethodBodyPresence
 }
 
 
-union TraitMethodHeaderParse:
-	ParsedTraitMethodHeader(TraitMethodHeaderPreview)
-	RejectedTraitMethodHeader
+union TraitMethodHeadParse:
+	ParsedTraitMethodHead(TraitMethodHead)
+	RejectedTraitMethodHead
 
 
-pure func parse_trait_method_header(state: ParseState) -> (ParseState, TraitMethodHeaderParse):
+pure func parse_trait_method_head(state: ParseState) -> (ParseState, TraitMethodHeadParse):
 	before: Int = state.diagnostic_count()
 	start: Span = state.current_span()
 	purity: Purity = if state.current_kind() == PureKeyword:
@@ -69,43 +69,32 @@ pure func parse_trait_method_header(state: ParseState) -> (ParseState, TraitMeth
 			name_position
 
 	var out: ParseState = after_return
-	var body_extent: MethodBodyExtent = AbstractMethod
+	var body_presence: MethodBodyPresence = AbstractMethod
 
-	-- An authored colon promises a body. This is the frozen body-follows
-	-- predicate, applied before the lexical scanner consumes any body tokens.
+	-- An authored colon promises a body. The shared token predicate decides
+	-- whether one follows; a successful head leaves its tokens unread.
 	if out.current_kind() == ColonSymbol:
-		colon_line: Int = out.span_start_line(out.current_span())
 		out = out.advanced()
-		body_follows: Bool = if out.current_kind() == EndOfFileToken or out.current_kind() == DedentToken:
-			False
-		else if out.current_kind() == NewlineToken:
-			out.peek_kind(1) == IndentToken
-		else:
-			out.span_start_line(out.current_span()) <= colon_line
-
-		if body_follows:
-			(after_body, body) = skip_deferred_body(out, start)
-			out = after_body
-
-			match body:
-				SkippedBody(body):
-					body_extent = SkippedDefaultBody(body)
-				ForwardDeclaration:
-					out = out.report_diagnostic(name_position, Plain(MissingFunctionBodyDiagnostic))
+		if out.function_body_follows():
+			body_presence = DefaultBodyFollows
 		else:
 			out = out.report_diagnostic(name_position, Plain(MissingFunctionBodyDiagnostic))
 
 	if out.diagnostic_count() != before:
-		(out, RejectedTraitMethodHeader)
+		recovered = if body_presence == DefaultBodyFollows:
+			recover_rejected_function_body(out, start)
+		else:
+			out
+		(recovered, RejectedTraitMethodHead)
 	else:
 		match (name, parameters):
 			(Some(name), ParsedParameters(parameters, _)):
-				(out, ParsedTraitMethodHeader({
+				(out, ParsedTraitMethodHead({
 					header = {
 						signature = { purity = purity, keyword = keyword, name = name, parameters = parameters, return_type = return_type },
 						span = start.span_covering(header_end)
 					},
-					body_extent = body_extent
+					body_presence = body_presence
 				}))
 			_:
-				(out, RejectedTraitMethodHeader)
+				(out, RejectedTraitMethodHead)

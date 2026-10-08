@@ -20,8 +20,8 @@ probes are historical scalar controls, not managed-union admission policy.
 ## Frozen sources
 
 Baseline revision: `66944f3e97af7c394661747af69ef9f1afa44dfd`.
-Baseline checkout: `/Users/keithphilpott/.codex/worktrees/union-native-baseline/blorp`.
-Candidate checkout: `/Users/keithphilpott/.codex/worktrees/union-native-authority/blorp`.
+Baseline checkout: `<worktree:union-native-baseline>`.
+Candidate checkout: `<worktree:union-native-authority>`.
 
 Reviewed candidate production SHA-256:
 
@@ -50,9 +50,9 @@ using separate output files; compare complete C bytes and retain SHA-256s.
 
 ```sh
 bin/blorp compile --no-format --no-embed-runtime \
-  --std-dir /Users/keithphilpott/.codex/worktrees/union-native-baseline/blorp/standard_library/src \
+  --std-dir <worktree:union-native-baseline>/standard_library/src \
   -o /tmp/union-native-plumbing-baseline-small.c \
-  /Users/keithphilpott/.codex/worktrees/union-native-baseline/blorp/benchmarks/self_compile/small.brp
+  <worktree:union-native-baseline>/benchmarks/self_compile/small.brp
 ```
 
 The candidate command changes only compiler/output path. Repeat for frozen

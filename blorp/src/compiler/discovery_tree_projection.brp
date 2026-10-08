@@ -79,6 +79,7 @@ import:
 		UnionDeclarationForm(OrdinaryUnion, FixedUnion),
 		RecordDeclarationForm(OrdinaryRecord, FixedRecord),
 		ConcurrentThreadLimit(DefaultThreadLimit, ThreadLimit),
+		ConcurrentForLimit(WrittenLimit),
 		ParsedBinaryOp(
 			ParsedAddOp, ParsedDivideOp, ParsedEqualOp, ParsedGreaterEqualOp, ParsedGreaterOp,
 			ParsedLessEqualOp, ParsedLessOp, ParsedModuloOp, ParsedMultiplyOp, ParsedNotEqualOp,
@@ -98,14 +99,14 @@ import:
 		ParsedElseBranch,
 		ParsedExpr(
 			ParsedAssignExpr, ParsedBinaryExpr, ParsedBlockExpr, ParsedBoolLiteralExpr, ParsedBreakExpr,
-			ParsedCallExpr, ParsedCharLiteralExpr, ParsedCompoundAssignExpr, ParsedConcurrentBlockExpr,
+			ParsedCallExpr, ParsedCharLiteralExpr, ParsedCompoundAssignExpr, ParsedConcurrentBlockExpr, ParsedConcurrentForExpr,
 			ParsedContinueExpr, ParsedDebugBlockExpr, ParsedDetachExpr, ParsedDictExpr,
 			ParsedFieldAccessExpr, ParsedFloatLiteralExpr, ParsedForExpr, ParsedFunctionDeclExpr,
 			ParsedIfExpr, ParsedIntLiteralExpr, ParsedLambdaExpr, ParsedListExpr, ParsedLogicalExpr,
-			ParsedMatchExpr, ParsedNameExpr, ParsedQuestionBindExpr, ParsedRangeExpr, ParsedRecordExpr,
+			ParsedMatchExpr, ParsedNameExpr, ParsedOpaqueIntoExpr, ParsedOpaqueFromExpr, ParsedQuestionBindExpr, ParsedRangeExpr, ParsedRecordExpr,
 			ParsedRecordUpdateExpr, ParsedSelectExpr, ParsedStringInterpolationPartsExpr,
-			ParsedStringLiteralExpr, ParsedSubscriptAssignExpr, ParsedSubscriptExpr, ParsedTupleExpr,
-			ParsedUnaryExpr, ParsedVarDeclExpr, ParsedVectorExpr, ParsedVoidExpr, ParsedWhileExpr,
+			ParsedStringLiteralExpr, ParsedSubscriptAssignExpr, ParsedSubscriptExpr, ParsedTupleExpr, ParsedTupleDestructExpr,
+			ParsedUnaryExpr, ParsedVarDeclExpr, ParsedVectorExpr, ParsedVoidExpr, ParsedBuiltinExpr, ParsedWhileExpr,
 			ParsedWithExpr,
 		),
 		ParsedFieldDecl,
@@ -618,6 +619,7 @@ private union PreviewExpressionContinuation:
 	FinishPreviewInterpolationHole(PreviewInterpolation, Span)
 	FinishPreviewUnary(ParsedUnaryOp, Span)
 	FinishPreviewDetach(Span)
+	FinishPreviewOpaqueConversion(TreeExpressions.OpaqueDirection, ParsedTypeExpr, Span)
 	VisitPreviewRight(PreviewPairOperator, TreeExpressions.Expression, Span)
 	FinishPreviewPair(PreviewPairOperator, ParsedExpr, Span)
 
@@ -716,6 +718,8 @@ pure func legacy_expression_preview(
 								break
 					TreeExpressions.BooleanLiteral(literal):
 						walk = ReturnPreviewExpression(ParsedBoolLiteralExpr(literal, location))
+					TreeExpressions.CompilerBuiltin(name):
+						walk = ReturnPreviewExpression(ParsedBuiltinExpr(name, location))
 					TreeExpressions.VoidValue:
 						walk = ReturnPreviewExpression(ParsedVoidExpr(location))
 					TreeExpressions.Unary(operator, operand):
@@ -727,6 +731,15 @@ pure func legacy_expression_preview(
 					TreeExpressions.Detach(operand):
 						continuations = continuations.append(FinishPreviewDetach(current.span))
 						walk = VisitPreviewExpression(operand)
+					TreeExpressions.OpaqueConversion(direction, written, value):
+						match preview_type(source, extended, written):
+							Ok((after_type, parsed_type)):
+								extended = after_type
+								continuations = continuations.append(FinishPreviewOpaqueConversion(direction, parsed_type, current.span))
+								walk = VisitPreviewExpression(value)
+							Err(error):
+								result = Err(error)
+								break
 					TreeExpressions.Binary(operator, left, right):
 						continuations = continuations.append(VisitPreviewRight(PreviewBinaryOperator(preview_binary_operator(operator)), right, current.span))
 						walk = VisitPreviewExpression(left)
@@ -886,6 +899,11 @@ pure func legacy_expression_preview(
 								walk = ReturnPreviewExpression(ParsedUnaryExpr(operator, completed, legacy_location(span)))
 							FinishPreviewDetach(span):
 								walk = ReturnPreviewExpression(ParsedDetachExpr(completed, legacy_location(span)))
+							FinishPreviewOpaqueConversion(direction, written, span):
+								parsed: ParsedExpr = match direction:
+									TreeExpressions.IntoOpaque: ParsedOpaqueIntoExpr(written, completed, legacy_location(span))
+									TreeExpressions.FromOpaque: ParsedOpaqueFromExpr(written, completed, legacy_location(span))
+								walk = ReturnPreviewExpression(parsed)
 							VisitPreviewRight(operator, right, span):
 								continuations = continuations.append(FinishPreviewPair(operator, completed, span))
 								walk = VisitPreviewExpression(right)
@@ -1151,6 +1169,16 @@ private pure func legacy_statement_preview(
 			legacy_assignment_preview(source, names, assignment, location)
 		TreeExpressions.CompoundAssignment(assignment):
 			legacy_compound_assignment_preview(source, names, assignment, location)
+		TreeExpressions.TupleDestructure(destructure):
+			var extended = names
+			var tuple_names: List[ParsedIdentifier] = []
+			for target in small_tuple_items(destructure.targets):
+				(after_target, name) = legacy_binding_target_name(source, extended, target)
+				extended = after_target
+				tuple_names = tuple_names.append(name)
+			translated ?= legacy_value_preview(source, extended, destructure.value)
+			(after_value, value) = translated
+			Ok((after_value, ParsedTupleDestructExpr(tuple_names, value, location)))
 		TreeExpressions.SubscriptAssignment(assignment):
 			legacy_subscript_assignment_preview(source, names, assignment, location)
 		TreeExpressions.WhileLoop(loop):
@@ -1161,6 +1189,8 @@ private pure func legacy_statement_preview(
 			Ok((after_body, ParsedWhileExpr(condition, body, location)))
 		TreeExpressions.ForLoop(loop):
 			legacy_for_preview(source, names, loop, location)
+		TreeExpressions.ConcurrentForLoop(loop):
+			legacy_concurrent_for_preview(source, names, loop, location)
 		TreeExpressions.LocalFunctionStatement(local):
 			legacy_local_function_preview(source, names, local)
 		TreeExpressions.QuestionBinding(binding):
@@ -1276,6 +1306,19 @@ private pure func legacy_for_preview(
 	translated_body ?= legacy_block_preview(source, after_iterable, loop.body)
 	(after_body, body) = translated_body
 	Ok((after_body, ParsedForExpr(binder, iterable, body, location)))
+
+
+private pure func legacy_concurrent_for_preview(
+	source: PreviewSource, names: NameTable, loop: TreeExpressions.ConcurrentForStatement, location: SourceLocation,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	(after_binder, binder) = legacy_binding_target_name(source, names, loop.binder)
+	translated_iterable ?= legacy_expression_preview(source, after_binder, loop.iterable)
+	(after_iterable, iterable) = translated_iterable
+	translated_timeout ?= legacy_timeout_preview(source, after_iterable, loop.timeout)
+	(after_timeout, timeout) = translated_timeout
+	translated_body ?= legacy_block_preview(source, after_timeout, loop.body)
+	(after_body, body) = translated_body
+	Ok((after_body, ParsedConcurrentForExpr(binder, iterable, { limit = WrittenLimit(positive_count_value(loop.limit.count)), timeout = timeout }, body, location)))
 
 
 -- A loop's variable, or its tuple of variables with the parenthesized span.

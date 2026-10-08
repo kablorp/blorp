@@ -46,7 +46,7 @@ C SHA `c4104e4b2661c160f640fbb45d3ff00105e7488fea914b433fbec9ef7beb8e54`.
 The final host was rebuilt after the identity-only help correction:
 
 ```sh
-BLORP_BOOTSTRAP_COMPILER_BIN=/Users/keithphilpott/.codex/worktrees/union-migration-bridge/blorp/bin/blorp BLORP_CLI_C_OPTIMIZATION=-O2 make
+BLORP_BOOTSTRAP_COMPILER_BIN=<worktree:union-migration-bridge>/bin/blorp BLORP_CLI_C_OPTIMIZATION=-O2 make
 ```
 
 Final binary SHA `ee23938ff1411e093f1de268b230a202ef6623759b990fb8cf1427750de17823`.
@@ -69,7 +69,7 @@ Exact fixture census is 839: preceding 838 plus this one marker, not relaxed.
 Focused commands (all invoked from the root checkout):
 
 ```sh
-repair_std=/Users/keithphilpott/.codex/worktrees/43a9/blorp/standard_library/src
+repair_std=<worktree:43a9>/standard_library/src
 bin/blorp test --timeout 180 --std-dir "$repair_std" blorp/test/compiler/stage_06_typecheck/test_accepted_semantic_catalog.brp
 bin/blorp test --timeout 180 --std-dir "$repair_std" blorp/test/compiler/stage_06_typecheck/test_infer.brp
 bin/blorp test --timeout 180 --leak-check --std-dir "$repair_std" blorp/test/runtime/types/test_fieldless_union_scalar_bridge.brp

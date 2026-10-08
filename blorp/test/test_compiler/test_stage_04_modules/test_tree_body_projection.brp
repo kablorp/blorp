@@ -4,23 +4,18 @@
 import:
 	../../../src/compiler/discovery_tree_projection:
 		legacy_declaration_projection,
-		legacy_expression_preview,
 		LegacyDeclarationPreviewError(UnsupportedBodyStatement, MissingIntegerLiteralToken, UnsupportedGlobalInitializerExpression),
 	../../../src/compiler_new/stage_01_discovery/tables/span: span_start, span_end
-	../../../src/compiler/stage_02_lex/name_table: EMPTY_NAME_TABLE, IdentifierSpellings(SpellingsFromIdentifierText, SpellingsFromNameTable)
+	../../../src/compiler/stage_02_lex/name_table: name_table_spellings, EMPTY_NAME_TABLE, IdentifierSpellings(SpellingsFromIdentifierText, SpellingsFromNameTable)
 	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
 	../../../src/compiler/stage_03_parse/parsed_ast:
-		ParsedDecl(FunctionParsedDecl, VarParsedDecl), ParsedExpr(ParsedBlockExpr, ParsedIfExpr, ParsedLambdaExpr, ParsedAssignExpr, ParsedMatchExpr, ParsedNameExpr, ParsedStringLiteralExpr, ParsedStringInterpolationPartsExpr, ParsedWithExpr, ParsedSelectExpr, ParsedConcurrentBlockExpr, ParsedDebugBlockExpr), ParsedElseBranch,
+		ParsedDecl(FunctionParsedDecl, VarParsedDecl), ParsedExpr(ParsedBlockExpr, ParsedIfExpr, ParsedLambdaExpr, ParsedAssignExpr, ParsedMatchExpr, ParsedNameExpr, ParsedStringLiteralExpr, ParsedStringInterpolationPartsExpr, ParsedWithExpr, ParsedSelectExpr, ParsedConcurrentBlockExpr, ParsedConcurrentForExpr, ParsedDebugBlockExpr), ParsedElseBranch,
 		ParsedStringInterpolationPart(ParsedInterpolationLiteral, ParsedInterpolationExpr), ParsedStringLiteralForm(ParsedPipeStringLiteral)
 	../tools/discovery_adapter_comparison: with_holes_parsed
 	../../../src/compiler/stage_03_parse/parsed_ast_json: ast_json_render, parsed_decl_to_json
 	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
-	../../../src/compiler_new/stage_01_discovery/parse/layout_quirks: anchored_at
-	../../../src/compiler_new/stage_01_discovery/parse/parse_state: MAX_SYNTAX_NESTING, new_parse_state, issued_ids, spellings, advanced, diagnostic_count, current_span
-	../../../src/compiler_new/stage_01_discovery/parse/tree_expression_parser: parse_expression_recipe, mint_recipe, RecipeParse(ParsedRecipe)
+	../../../src/compiler_new/stage_01_discovery/parse/parse_state: MAX_SYNTAX_NESTING, new_parse_state, issued_ids, spellings, diagnostic_count
 	../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_source
-	../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
-		DeclarationPreviewParse(DeclinedGlobalInitializer), parse_declaration_preview
 	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
 		scan_module_declarations, ModuleDeclarationScanStop(ReachedEndOfSource)
 	../../../src/compiler_new/stage_01_discovery/syntax/dump: dumped_module
@@ -86,9 +81,198 @@ private func bodies_match_old_parser(text: String) -> Bool:
 						correct
 
 
+-- Newly completed body fixtures must own exactly their issued syntax ids.
+private func bodies_and_ids_match_old_parser(text: String) -> Bool:
+	if not bodies_match_old_parser(text):
+		False
+	else:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(state, scan) = scan_module_declarations(entry)
+				issued = state.issued_ids()
+				syntax: ModuleSyntax = { documentation = None, items = scan.items, definitions = issued.definitions, imports = issued.imports, counts = issued.counts }
+				id_census(module_id_at_row(0), syntax).is_empty()
+			Err(_): False
+
+
+func test_next_line_values_match_frozen_layout_and_anchors() -> Bool:
+	var correct = True
+	for head in ["value =", "var value =", "value: String =", "value ?=", "value: String ?=", "value +=", "values[0] =", "_ =", "(left, right) ="]:
+		for value in ["|hello", "|hello " + hole("name"), "1 + 2", "raw", "if flag:"]:
+			lines = if value == "raw":
+				["func f():", "\t" + head, "\t\traw", "\t\t\t|hello", "\t1", "func sibling(): 1"]
+			else if value == "if flag:":
+				["func f():", "\t" + head, "\t\tif flag:", "\t\t\t1", "\t\telse:", "\t\t\t2", "\t1", "func sibling(): 1"]
+			else:
+				["func f():", "\t" + head, "\t\t" + value, "\t1", "func sibling(): 1"]
+			correct = bodies_and_ids_match_old_parser(source_lines(lines)) and correct
+	correct = bodies_and_ids_match_old_parser(source_lines(["func f():", "\tvalue =", "\t\t|first " + hole("name"), "\t\t|second", "\tvalue", "func sibling(): 1"])) and correct
+	correct = bodies_and_ids_match_old_parser(source_lines(["func f():", "\tvalue =", "\t\tsource", "\t\t\t.first()", "\t\t\t.second()", "\tvalue", "func sibling(): 1"])) and correct
+	for value in ["|hello", "|hello " + hole("name"), "1 + 2"]:
+		correct = bodies_and_ids_match_old_parser(source_lines(["var greeting =", "\t" + value, "func sibling(): 1"])) and correct
+	correct
+
+
+func test_next_line_control_values_continue_operators() -> Bool:
+	var correct = True
+	for head in ["value =", "var value =", "value: Int =", "value ?=", "value: Int ?=", "value +=", "values[0] =", "_ =", "(left, right) ="]:
+		for operator in ["+ 3", "- 3", "* 3"]:
+			for control in [
+				["\t\tif flag:", "\t\t\t1", "\t\telse:", "\t\t\t2"],
+				["\t\tmatch flag:", "\t\t\tTrue: 1", "\t\t\tFalse: 2"]
+			]:
+				lines = ["func f():", "\t" + head].concat(control).concat(["\t\t" + operator, "\t1", "func sibling(): 1"])
+				correct = bodies_and_ids_match_old_parser(source_lines(lines)) and correct
+	for operator in ["+ 3", "- 3", "* 3"]:
+		correct = bodies_and_ids_match_old_parser(source_lines(["value =", "\tif flag:", "\t\t1", "\telse:", "\t\t2", "\t" + operator, "func sibling(): 1"])) and correct
+	correct
+
+
+func test_soft_keyword_binding_heads_match_old_parser() -> Bool:
+	var correct = True
+	for name in ["debug", "select", "with", "concurrent", "concurrently", "after", "sealed", "on"]:
+		for tail in [" = 1", " += 1", ": Int = 1", " ?= value", ": Int ?= value"]:
+			correct = bodies_and_ids_match_old_parser(source_lines(["func f():", "\t" + name + tail, "\t1", "func sibling(): 1"])) and correct
+		for lines in [
+			["\tvar " + name + " = 1", "\t1"],
+			["\tfor " + name + " in values:", "\t\t1", "\t1"],
+			["\twith " + name + " = source:", "\t\t1", "\t1"],
+			["\tfunc " + name + "(): 1", "\t1"]
+		]:
+			correct = bodies_and_ids_match_old_parser(source_lines(["func f():"].concat(lines).concat(["func sibling(): 1"]))) and correct
+		if name != "sealed":
+			correct = bodies_and_ids_match_old_parser(source_lines([
+				"func f():", "\tselect:", "\t\t" + name + " from source:", "\t\t\t1",
+				"\t\tsealed source:", "\t\t\t2", "\t\t_ after 1:", "\t\t\t3", "\t1", "func sibling(): 1"
+			])) and correct
+	correct and bodies_and_ids_match_old_parser(source_lines(["func f():", "\tdebug.print(value)", "\t1", "func sibling(): 1"]))
+
+
+func test_soft_select_binder_names_follow_authored_order() -> Bool:
+	text = source_lines(["func f():", "\tselect:", "\t\tafter from source:", "\t\t\t1", "func sibling(): 1"])
+	lexed = lex_module(module_id_at_row(0), text)
+	match new_parse_state(lexed):
+		Ok(entry):
+			(_, scan) = scan_module_declarations(entry)
+			match legacy_declaration_projection(preview_source(lexed), scan, EMPTY_NAME_TABLE):
+				Ok(projected):
+					name_table_spellings(projected.names) == ["f", "after", "source", "sibling"] and bodies_and_ids_match_old_parser(text)
+				Err(_): False
+		Err(_): False
+
+
+func test_builtin_values_match_frozen_body_contexts() -> Bool:
+	bodies_match_old_parser(source_lines([
+		"trait Shape:", "\tfunc value(x: Int) -> Int: builtin(\"trait_helper\")",
+		"implements Shape for Int:", "\tfunc value(x: Int) -> Int: builtin",
+		"func f():", "\t(a, b) = builtin(\"pair_helper\")",
+		"\tvalue = f(builtin, builtin(\"helper\")).field + builtin",
+		"\ttext = \"" + hole("builtin(\"helper\")") + "\"", "\tvalue", "func sibling(): builtin"
+	]))
+
+
+func test_opaque_conversion_values_keep_their_own_block_anchor() -> Bool:
+	var correct = True
+	for value_lines in [
+		["\t\tfunc(x):", "\t\t\tx"],
+		["\t\tif flag:", "\t\t\tfirst", "\t\telse:", "\t\t\tsecond"],
+		["\t\tmatch flag:", "\t\t\t_: first"]
+	]:
+		correct = bodies_match_old_parser(source_lines([
+			"func f():", "\tconverted = into_opaque Handle("
+		].concat(value_lines).concat(["\t).finish()", "\tconverted", "func sibling(): 1"]))) and correct
+	correct = correct and bodies_match_old_parser(source_lines([
+		"trait Shape:", "\tfunc value(x: Int) -> Int: into_opaque Count(x)",
+		"implements Shape for Int:", "\tfunc value(x: Int) -> Int: from_opaque Count(x)",
+		"func sibling(): 1"
+	]))
+	correct and bodies_match_old_parser(source_lines([
+		"func f():", "\t(a, b) = from_opaque Pair(pair)",
+		"\tvalue = \"" + hole("into_opaque Handle(a)") + "\"", "\tvalue", "func sibling(): 1"
+	]))
+
+
+func test_flat_tuple_destructuring_matches_old_parser() -> Bool:
+	var correct = True
+	for target in ["(a, b)", "(_, b)", "(a, _, c)", "(_, b, c, _)", "(a, b,)", "(a, _, c, d,)", "(\n\t\ta,\n\t\t_,\n\t\tc,\n\t)"]:
+		correct = correct and bodies_and_ids_match_old_parser(source_lines([
+			"func f():", "\t" + target + " = pair", "\ta", "func sibling(): 1"
+		]))
+	correct = correct and bodies_and_ids_match_old_parser(source_lines([
+		"func f():", "\t(a, b) = if True:", "\t\tpair", "\telse:", "\t\tpair", "\ta", "func sibling(): 1"
+	]))
+	correct = correct and bodies_and_ids_match_old_parser(source_lines([
+		"trait Shape:", "\tfunc value(x: Int) -> Int:", "\t\t(a, b) = x", "\t\ta",
+		"implements Shape for Int:", "\tfunc value(x: Int) -> Int:", "\t\t(_, b) = x", "\t\tb"
+	]))
+	correct and bodies_and_ids_match_old_parser(source_lines([
+		"func f():", "\tmapper = func(x):", "\t\t(a, b) = x", "\t\ta",
+		"\tfunc local(x):", "\t\t(_, b) = x", "\t\tb", "\tmapper(pair)",
+		"func sibling(): (first, second)"
+	]))
+
+
+-- Direct body parsing preserves body-only spelling order and the next owner.
+func test_body_completion_keeps_written_spellings_and_following_owner() -> Bool:
+	text = source_lines([
+		"func f(source):",
+		"\tvalue: BodyType = source",
+		"\tmapper = func(lambda_arg: LambdaType) -> LambdaResult: lambda_arg",
+		"\tfunc local(local_arg: LocalType) -> LocalResult:",
+		"\t\tmatch local_arg:",
+		"\t\t\tLocalCase(inner): \"value " + hole("inner + hole_only") + "\"",
+		"\t\t\t_: value",
+		"\tmapper(local(value))",
+		"func sibling(sibling_arg: SiblingType): sibling_arg"
+	])
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(state, scan) = scan_module_declarations(entry)
+			issued = state.issued_ids()
+			syntax: ModuleSyntax = { documentation = None, items = scan.items, definitions = issued.definitions, imports = issued.imports, counts = issued.counts }
+			dump = syntax.dumped_module(state.spellings())
+			var correct = state.diagnostic_count() == 0 and syntax.items.length() == 2 and syntax.definitions.length() == 3 and id_census(module_id_at_row(0), syntax).is_empty()
+			for name in ["BodyType", "lambda_arg", "LambdaType", "LambdaResult", "local", "local_arg", "LocalType", "LocalResult", "LocalCase", "inner", "hole_only", "sibling", "SiblingType"]:
+				correct = correct and dump.split(name).length() > 1
+			correct and bodies_match_old_parser(text)
+		Err(_): False
+
+
 func test_expression_body_matches_old_parser() -> Bool:
 	first: Bool = bodies_match_old_parser("func inc(x: Int) -> Int: x + 1\n")
 	bodies_match_old_parser("pure func zero() -> Int: 0\n") and first
+
+
+func test_leading_dot_chains_match_old_parser_with_siblings() -> Bool:
+	var correct = True
+	for tail in ["", " == 0", " == 0 or ready"]:
+		correct = correct and bodies_match_old_parser(source_lines([
+			"func f():", "\tx = values", "\t\t.map(func(item): item)", "\t\t.length()${tail}", "\tprint(x)", "\t-other", "\tx", "func g(): 1"
+		]))
+	for text in [
+		source_lines(["func f():", "\tvalues", "\t\t.first()", "\t\t\t.second()", "\t\t.third()", "\tnot other"]),
+		source_lines(["func f():", "\tx = values", "\t.first()", "\tx"]),
+		source_lines(["func f():", "\tx: Int = values", "\t\t.length()", "\t(", "\t\tx == 1", "\t)"]),
+		source_lines(["func f():", "\tif (text", "\t\t.trim()", "\t\t.is_empty()):", "\t\treport()", "\t0"]),
+		source_lines(["func f():", "\tx = if flag:", "\t\t1", "\telse:", "\t\t2", "\t\t.abs()", "\tx"]),
+		source_lines(["func f():", "\tdetach g(x)", "\t\t.finish()", "\t0"]),
+		source_lines(["func f():", "\tfunc local():", "\t\tvalues", "\t\t\t.first()", "\tlocal()"]),
+		source_lines(["func f():", "\tx = call(func():", "\t\tvalues", "\t\t\t.first()", "\t)", "\tprint(x)"]),
+		source_lines(["func f():", "\tx = (values", "\t\t.first())", "\ty = call(values", "\t\t.second())", "\tx"]),
+		source_lines(["func f():", "\tvalue = values", "\t\t.first()", "\t\"value " + hole("value.second()") + "\""])
+	]:
+		correct = correct and bodies_match_old_parser(text)
+	correct
+
+
+func test_long_continuation_chain_projects_by_a_loop() -> Bool:
+	var lines = ["func f():", "\tvalues"]
+	var index = 0
+	while index < 256:
+		lines = lines.append("\t\t.step()")
+		index += 1
+	lines = lines.append("\t0")
+	bodies_match_old_parser(source_lines(lines))
 
 
 func test_block_statements_match_old_parser() -> Bool:
@@ -158,6 +342,29 @@ func test_question_bindings_and_tuple_loops_match_old_parser() -> Bool:
 	]))
 
 
+func test_completed_block_lambda_followers_match_old_parser() -> Bool:
+	var correct = True
+	for prefix in ["", "detach ", "not ", "- ", "1 + "]:
+		for head in ["", "value = ", "var value = "]:
+			correct = bodies_and_ids_match_old_parser(source_lines([
+				"func f():", "\t" + head + prefix + "func(arg: Input) -> Output:",
+				"\t\targ", "\tvar next = following", "\tnext", "func sibling(): sibling_value"
+			])) and correct
+		correct = bodies_and_ids_match_old_parser(source_lines([
+			"global = " + prefix + "func(arg: Input) -> Output:", "\targ",
+			"var next = following", "func sibling(): sibling_value"
+		])) and correct
+	correct = bodies_and_ids_match_old_parser(source_lines([
+		"func f():", "\tif flag:", "\t\tdetach func():", "\t\t\tfunc(arg):",
+		"\t\t\t\targ", "\tvar next = following", "\tnext", "func sibling(): sibling_value"
+	])) and correct
+	correct = bodies_and_ids_match_old_parser(source_lines([
+		"func f():", "\tif flag:", "\t\tleft", "\telse:", "\t\tright",
+		"\t+ func(arg):", "\t\targ", "\tvar next = following", "\tnext", "func sibling(): sibling_value"
+	])) and correct
+	correct
+
+
 func test_lambdas_and_local_functions_match_old_parser() -> Bool:
 	bodies_match_old_parser(source_lines([
 		"func g(xs: List[Int]) -> Int:",
@@ -206,6 +413,52 @@ func test_match_statements_match_old_parser() -> Bool:
 		"\t\t\tlocal",
 		"\tvalue"
 	]))
+
+
+func test_control_item_entries_match_old_parser() -> Bool:
+	var cases: List[(String, String)] = []
+	for (name, opening, closing) in [
+		("call control bypass", "f(match c:", "+ 3)"),
+		("later call control bypass", "f(0, match c:", "+ 3)"),
+		("list control bypass", "[match c:", "+ 3]"),
+		("subscript control bypass", "values[match c:", "+ 3]"),
+		("call RHS operators", "f(1 + match c:", "+ 3)"),
+		("list RHS operators", "[1 + match c:", "+ 3]"),
+		("subscript RHS operators", "values[1 + match c:", "+ 3]"),
+		("first tuple operators", "(match c:", "+ 3, 2)"),
+		("later tuple operators", "(0, match c:", "+ 3)"),
+		("record field operators", "{field = match c:", "+ 3}"),
+		("dict value operators", "{0 => match c:", "+ 3}"),
+		("vector operators", "{match c:", "+ 3, 2}")
+	]:
+		cases = cases.append((name, source_lines(["func f(c: Int):", "\t" + opening, "\t\t\t\t_: 1", "\t" + closing, "\tfollowing(c)", "func sibling(): 1"])))
+	var correct = agrees_with_old_parser(cases)
+	for (_, text) in cases:
+		source = source_file("/tmp/tree_control_items.brp", "tree_control_items", text)
+		if with_holes_parsed(parse_compiler_source(source)).diagnostics.is_empty():
+			correct = bodies_and_ids_match_old_parser(text) and correct
+	correct
+
+
+func test_control_operator_tails_match_old_parser() -> Bool:
+	var correct = True
+	for lines in [
+		["\t(if c:", "\t\t1", "\telse:", "\t\t2", "\t+ 3 * 4)"],
+		["\t(match c:", "\t\t0: True", "\t\t_: False", "\tand match c:", "\t\t_: True", "\t)"],
+		["\tx = 1 + 2 * if c:", "\t\t3", "\telse:", "\t\t4", "\t+ 5 * 6", "\tx"],
+		["\tx = c == 1 and match c:", "\t\t_: True", "\tor False and True", "\tx"],
+		["\tif c:", "\t\t1", "\telse:", "\t\t2", "\t+ 3"],
+		["\t-match c:", "\t\t_: 2", "\t* 3"],
+		["\tx = if c:", "\t\t1", "\telse:", "\t\t2", "\t- 3", "\tx"],
+		["\t((match c:", "\t\t_: values", "\t) + values).length()"],
+		["\tmatch c:", "\t\t0:", "\t\t\t1", "\t\t_:", "\t\t\t2", "\t+ 3"],
+		["\tx = 1 + if c:", "\t\t1", "\telse:", "\t\t2", "\t-z", "\tx"],
+		["\tx = match c:", "\t\t_: 1", "\t-z", "\tx"],
+		["\tmatch c:", "\t\t_: 1", "\tmatch c:", "\t\t_: 2", "\t-z"]
+	]:
+		text = source_lines(["func f(c: Int):"].concat(lines).concat(["\tfollowing(c)", "func sibling(): 1"]))
+		correct = bodies_and_ids_match_old_parser(text) and correct
+	correct
 
 
 func test_control_expression_values_match_old_parser() -> Bool:
@@ -769,10 +1022,8 @@ func test_character_escapes_and_raw_pipe_strings_match_old_parser() -> Bool:
 	]))
 
 
--- A pipe string or pipe interpolation can only be an indented value, which the
--- statement grammar of this slice leaves to a later one, so the tree's
--- expression is parsed where its token begins and its projection is compared
--- with the old parser's text, form and parts.
+-- Compare pipe text, form and parts through the completed global route,
+-- including the value's opening and closing layout.
 func test_pipe_strings_project_like_the_old_parser() -> Bool:
 	plain_text = source_lines(["x =", "\t|one", "\t|two"])
 	interpolated_text = source_lines(["x =", "\t|a " + hole("b"), "\t|c"])
@@ -790,29 +1041,22 @@ private func pipe_parts_match(old_parts: List[ParsedStringInterpolationPart], ne
 		_: False
 
 
--- The old parser's value of the global `x`, and the tree path's, for a value
--- that begins on the line after the `=`: the tree parser starts at that token.
+-- Compare the complete global route, including its opening and closing layout.
 private func pipe_expression(text: String) -> Option[(ParsedExpr, ParsedExpr)]:
 	source = source_file("/tmp/tree_body_projection.brp", "tree_body_projection", text)
 	old = with_holes_parsed(parse_compiler_source(source))
 	lexed = lex_module(module_id_at_row(0), text)
 	match (old.decls.get(0), new_parse_state(lexed)):
 		(Some(VarParsedDecl(global)), Ok(entry)):
-			(at_value, result) = parse_declaration_preview(entry)
-			match result:
-				DeclinedGlobalInitializer(_, _):
-					-- Past the newline and the indent that precede the pipe token.
-					-- The recipe entry skips the boundary check, which an indented
-					-- value's closing dedent would fail.
-					at_start = at_value.advanced().advanced()
-					(at_token, parsed) = parse_expression_recipe(at_start, anchored_at(at_start.current_span()))
-					match parsed:
-						ParsedRecipe(recipe):
-							(_, value) = mint_recipe(at_token, recipe)
-							match legacy_expression_preview(preview_source(lexed), EMPTY_NAME_TABLE, value):
-								Ok((_, projected)): Some((global.value, projected))
-								Err(_): None
-						_: None
+			(_, scan) = scan_module_declarations(entry)
+			match scan.stop:
+				ReachedEndOfSource:
+					match legacy_declaration_projection(preview_source(lexed), scan, EMPTY_NAME_TABLE):
+						Ok(projected):
+							match projected.declarations.get(0):
+								Some(VarParsedDecl(value)): Some((global.value, value.value))
+								_: None
+						Err(_): None
 				_: None
 		_: None
 
@@ -1064,16 +1308,130 @@ func test_long_statement_list_projects_in_order() -> Bool:
 		_: False
 
 
+
+func test_deeply_nested_concurrently_for_projects_every_body() -> Bool:
+	depth = 100
+	var lines: List[String] = ["func f():"]
+	for level in 0..depth:
+		lines = lines.append("\t".repeat(level + 1) + "for item in items concurrently(limit: 2, timeout: delay):")
+	lines = lines.append("\t".repeat(depth + 1) + "continue")
+	match projected_function_body(source_lines(lines)):
+		Some(body):
+			var current = body
+			var nested = 0
+			var walking = True
+			while walking:
+				match current:
+					ParsedBlockExpr([ParsedConcurrentForExpr(_, _, _, next, _)], _):
+						nested += 1
+						current = next
+					_: walking = False
+			nested == depth
+		None: False
+
+
+
+func test_concurrently_for_names_follow_authored_order() -> Bool:
+	text = source_lines(["func f():", "\tfor item in items concurrently(timeout: delay, limit: 2):", "\t\twork(item)", "func sibling(): 1"])
+	lexed = lex_module(module_id_at_row(0), text)
+	match new_parse_state(lexed):
+		Ok(entry):
+			(_, scan) = scan_module_declarations(entry)
+			match legacy_declaration_projection(preview_source(lexed), scan, EMPTY_NAME_TABLE):
+				Ok(projected): name_table_spellings(projected.names) == ["f", "item", "items", "delay", "work", "sibling"] and bodies_and_ids_match_old_parser(text)
+				Err(_): False
+		Err(_): False
+
+
+
+func test_concurrently_for_matches_the_frozen_parser() -> Bool:
+	var correct = True
+	for parameters in ["limit: 2", "limit: ((007))", "limit: 2, timeout: delay + 1", "timeout: delay + 1, limit: 2", "limit: 2, timeout: wait(func(): 5),"]:
+		for binder in ["item", "_", "debug", "concurrently"]:
+			text = source_lines(["func f():", "\tfor " + binder + " in items concurrently(" + parameters + "):", "\t\tfor inner in items:", "\t\t\tcontinue", "\t\tbreak", "\t0", "func following(): 1"])
+			correct = correct and bodies_and_ids_match_old_parser(text)
+	correct
+
+func test_lambda_holes_and_case_controls_match_frozen_syntax() -> Bool:
+	var correct = True
+	for text in [
+		source_lines(["func f():", "\tvalue = \"" + hole("(pure func(x: Int) -> Int: x + 1)(2)") + " tail\"", "\tvalue", "func sibling(): 1"]),
+		source_lines(["func f():", "\tx =", "\t\t|hello " + hole("(func(x): x)(1)"), "\tx", "func sibling(): 1"]),
+		source_lines(["func f(value):", "\tmatch value:", "\t\t_: if True:", "\t\t\t1", "\t\telse:", "\t\t\t2", "func sibling(): 1"]),
+		source_lines(["func f(value):", "\tmatch value:", "\t\t_: match value:", "\t\t\t_: 1", "func sibling(): 1"])
+	]:
+		correct = bodies_and_ids_match_old_parser(text) and correct
+	correct
+
+
+func test_call_and_braced_controls_inherit_loop_scope() -> Bool:
+	var correct = True
+	for exit in ["break", "continue"]:
+		for (entry, closing) in [("consume(", ")"), ("consume(0,", ")"), ("-consume(", ")"), ("value = {", "}"), ("value = {field =", "}"), ("value = {0 =>", "}")]:
+			text = source_lines(["func f(items):", "\tfor item in items:", "\t\t" + entry, "\t\t\tmatch item:", "\t\t\t\t_: ", "\t\t\t\t\t" + exit, "\t\t\t\t\t0", "\t\t" + closing, "\t0", "func sibling(): 1"])
+			correct = bodies_and_ids_match_old_parser(text) and correct
+	correct
+
+
+func test_inline_case_control_leaves_binary_followers_to_the_match_reader() -> Bool:
+	var correct = True
+	for control in [["\t\t_: if flag:", "\t\t\t1", "\t\telse:", "\t\t\t2"], ["\t\t_: match flag:", "\t\t\t_: 1"]]:
+		for follower in ["+ 3", "- 3"]:
+			text = source_lines(["func f(flag):", "\tmatch flag:"].concat(control).concat(["\t\t" + follower]))
+			source = source_file("/tmp/tree_inline_case_tail.brp", "tree_inline_case_tail", text)
+			old = with_holes_parsed(parse_compiler_source(source))
+			correct = correct and not old.diagnostics.is_empty()
+			match new_parse_state(lex_module(module_id_at_row(0), text)):
+				Ok(entry):
+					(_, scan) = scan_module_declarations(entry)
+					match scan.stop:
+						ReachedEndOfSource: correct = False
+						_: void
+				Err(_): correct = False
+	correct
+
+
+func test_global_lambda_holes_preserve_frozen_syntax_and_ids() -> Bool:
+	var correct = True
+	for (header, value) in [
+		("value: Int =", "\n\t|hello " + hole("(func(x): x)(1)")),
+		("value =", " \"" + hole("(func(x): x)(1)") + "\""),
+		("private var values: m.Buffer[Int][#N] =", " (\"" + hole("(pure func(x: Int) -> Int: x)(1)") + "\")")
+	]:
+		correct = bodies_and_ids_match_old_parser(header + value + "\nfunc sibling(): 1\n") and correct
+	correct
+
+
 tests: TestSuite = {
 	description = "Tree statement and block legacy projection",
 	tests = [
+		("global lambda holes preserve frozen syntax and ids", test_global_lambda_holes_preserve_frozen_syntax_and_ids),
+		("inline case controls leave binary followers to match reader", test_inline_case_control_leaves_binary_followers_to_the_match_reader),
+		("lambda holes and case controls match frozen syntax", test_lambda_holes_and_case_controls_match_frozen_syntax),
+		("call and braced controls inherit loop scope", test_call_and_braced_controls_inherit_loop_scope),
+		("next line values match frozen layout and anchors", test_next_line_values_match_frozen_layout_and_anchors),
+		("next line control values continue operators", test_next_line_control_values_continue_operators),
+		("100 nested concurrently for loops project every body", test_deeply_nested_concurrently_for_projects_every_body),
+		("concurrently for names follow authored order", test_concurrently_for_names_follow_authored_order),
+		("concurrently for matches the frozen parser", test_concurrently_for_matches_the_frozen_parser),
+		("soft select binder names follow authored order", test_soft_select_binder_names_follow_authored_order),
+		("soft keyword binding heads match old parser", test_soft_keyword_binding_heads_match_old_parser),
+		("builtin values match frozen body contexts", test_builtin_values_match_frozen_body_contexts),
+		("opaque conversion values keep their own block anchor", test_opaque_conversion_values_keep_their_own_block_anchor),
+		("flat tuple destructuring matches the old parser", test_flat_tuple_destructuring_matches_old_parser),
+		("body completion keeps written spellings and following owner", test_body_completion_keeps_written_spellings_and_following_owner),
 		("expression bodies match the old parser", test_expression_body_matches_old_parser),
+		("leading dot chains match the old parser with siblings", test_leading_dot_chains_match_old_parser_with_siblings),
+		("256 continued postfix links project by a loop", test_long_continuation_chain_projects_by_a_loop),
 		("block statements match the old parser", test_block_statements_match_old_parser),
 		("declaration metadata matches the old parser", test_declaration_metadata_matches_old_parser),
 		("control flow matches the old parser", test_control_flow_matches_old_parser),
 		("question bindings and tuple loops match the old parser", test_question_bindings_and_tuple_loops_match_old_parser),
+		("completed block lambda followers match the old parser", test_completed_block_lambda_followers_match_old_parser),
 		("lambdas and local functions match the old parser", test_lambdas_and_local_functions_match_old_parser),
 		("match statements match the old parser", test_match_statements_match_old_parser),
+		("control item entries match the old parser", test_control_item_entries_match_old_parser),
+		("control operator tails match the old parser", test_control_operator_tails_match_old_parser),
 		("control expression values match the old parser", test_control_expression_values_match_old_parser),
 		("with resources match the old parser", test_with_resources_match_old_parser),
 		("concurrent blocks match the old parser", test_concurrent_blocks_match_old_parser),

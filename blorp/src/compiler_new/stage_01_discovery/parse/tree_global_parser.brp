@@ -5,11 +5,12 @@ import:
 	../syntax/declarations: GlobalDeclaration
 	../tables/span: span_covering
 	../tables/token: TokenKind(NewlineToken)
-	parse_state: ParseState, current_kind, finished_global
+	parse_state: ParseState, current_kind, current_span, finished_global
 	stop_reason: StopPoint, StopReason(ValueOnNextLine), stop_at
 	layout_quirks: anchored_at
+	tree_value_layout: next_line_value_entry, close_next_line_value
 	tree_global_header_parser: GlobalHeaderPreview
-	tree_expression_parser: parse_expression_to_boundary, ExpressionParse(ParsedExpression, UnsupportedExpression, RejectedExpression)
+	tree_expression_parser: parse_expression, parse_expression_to_boundary, ExpressionParse(ParsedExpression, UnsupportedExpression, RejectedExpression)
 
 
 union GlobalInitializerParse:
@@ -20,24 +21,38 @@ union GlobalInitializerParse:
 
 ---
 The global `preview` declares, with the initializer at `state`, where its
-header parser left the cursor. A value written on the line after the `=` is
-not read yet; the lexer says so with a NEWLINE token. A rejected initializer
-keeps its diagnostics.
+header parser left the cursor. A value written after NEWLINE INDENT uses its
+own first token as the anchor, and consumes its closing DEDENT. A rejected
+initializer keeps its diagnostics.
 ---
 pure func parse_global_initializer(state: ParseState, preview: GlobalHeaderPreview) -> (ParseState, GlobalInitializerParse):
-	if state.current_kind() == NewlineToken:
-		(state, DeclinedInitializer(state.stop_at(ValueOnNextLine)))
+	(parsed, result) = if state.current_kind() == NewlineToken:
+		parse_next_line_initializer(state)
 	else:
-		(parsed, result) = parse_expression_to_boundary(state, anchored_at(preview.initializer.anchor))
-		match result:
-			UnsupportedExpression(stop):
-				(state, DeclinedInitializer(stop))
-			RejectedExpression:
-				(parsed, RejectedInitializer)
-			ParsedExpression(value):
-				header = preview.header
-				(completed, global_value) = parsed.finished_global(
-					header.visibility, header.documentation, header.form, header.name,
-					header.declared_type, value, preview.initializer.anchor.span_covering(value.span)
-				)
-				(completed, ParsedInitializer(global_value))
+		parse_expression_to_boundary(state, anchored_at(preview.initializer.anchor))
+	match result:
+		UnsupportedExpression(stop):
+			(state, DeclinedInitializer(stop))
+		RejectedExpression:
+			(parsed, RejectedInitializer)
+		ParsedExpression(value):
+			header = preview.header
+			(completed, global_value) = parsed.finished_global(
+				header.visibility, header.documentation, header.form, header.name,
+				header.declared_type, value, preview.initializer.anchor.span_covering(value.span)
+			)
+			(completed, ParsedInitializer(global_value))
+
+
+private pure func parse_next_line_initializer(state: ParseState) -> (ParseState, ExpressionParse):
+	match next_line_value_entry(state):
+		None:
+			(state, UnsupportedExpression(state.stop_at(ValueOnNextLine)))
+		Some(entry):
+			(parsed, result) = parse_expression(entry, anchored_at(entry.current_span()))
+			match result:
+				ParsedExpression(value):
+					match close_next_line_value(parsed):
+						Some(closed): (closed, ParsedExpression(value))
+						None: (state, UnsupportedExpression(parsed.stop_at(ValueOnNextLine)))
+				_: (parsed, result)

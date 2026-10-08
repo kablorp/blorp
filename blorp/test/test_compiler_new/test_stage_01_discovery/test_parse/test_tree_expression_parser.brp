@@ -3,12 +3,12 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
 	../../../../src/compiler_new/stage_01_discovery/parse/layout_quirks: anchored_at
 	../../../../src/compiler_new/stage_01_discovery/parse/parse_state:
-		ParseState, new_parse_state, position, issued_counts, diagnostics, spellings, diagnostic_count, current_kind, current_span, previous_span
+		MAX_SYNTAX_NESTING, ParseState, new_parse_state, position, issued_counts, issued_ids, diagnostics, spellings, diagnostic_count, current_kind, current_span, previous_span
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_expression_parser:
-		parse_expression_to_boundary, ExpressionParse(ParsedExpression, UnsupportedExpression, RejectedExpression)
+		parse_expression, parse_expression_with_ending, ValueParse(ParsedValue), ends_in_block_lambda, parse_expression_to_boundary, ExpressionParse(ParsedExpression, UnsupportedExpression, RejectedExpression)
 	../../../../src/compiler_new/stage_01_discovery/syntax/expressions:
-		ExpressionKind(StringLiteral, CharacterLiteral, InterpolatedString, NameReference, IntegerLiteral, Unary, Binary, ShortCircuit, RangeExpression, Call, FieldAccess, Subscript, ListLiteral, TupleLiteral, VectorLiteral, RecordLiteral, RecordUpdate, DictLiteral, Detach),
-		UnaryOperator(Negate), BinaryOperator(Add, Multiply), LogicalOperator(LogicalOr, LogicalAnd),
+		ExpressionKind(StringLiteral, CharacterLiteral, InterpolatedString, NameReference, IntegerLiteral, Unary, Binary, ShortCircuit, RangeExpression, Call, FieldAccess, Subscript, ListLiteral, TupleLiteral, VectorLiteral, RecordLiteral, RecordUpdate, DictLiteral, Detach, OpaqueConversion, CompilerBuiltin),
+		OpaqueDirection(IntoOpaque, FromOpaque), UnaryOperator(Negate), BinaryOperator(Add, Multiply), LogicalOperator(LogicalOr, LogicalAnd),
 		InterpolationForm(QuotedInterpolation, PipeInterpolation), InterpolationPiece(InterpolationText, InterpolationHole)
 	../../../../src/compiler_new/stage_01_discovery/syntax/patterns: StringForm(QuotedString, RawString, PipeString, RawPipeString)
 	../../../../src/compiler_new/stage_01_discovery/syntax/sequences: SmallTuple(Pair, Triple, Quadruple)
@@ -16,12 +16,14 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(ExpectedExpressionDiagnostic)
 	../../../../src/compiler_new/stage_01_discovery/tables/expected_token:
 		ExpectedTokenDiagnostic(ExpectedRightParen), RightParenConstruct(RightParenInGroupedExpression)
-	../../../../src/compiler_new/stage_01_discovery/syntax/ids: expression_local_index, name_use_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: expression_local_index, name_use_local_index, written_type_local_index
 	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
 	../../../../src/compiler_new/stage_01_discovery/tables/span: span_start, span_end, spans_equal
 	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_count, spelling_text_at
 	../../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: reject_preview
 	../../../../src/compiler_new/stage_01_discovery/diagnostics/rejected_syntax_render: render_rejected_diagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/types: WrittenTypeKind(NamedType)
+	../../../../src/compiler_new/stage_01_discovery/parse/stop_reason: StopReason(DeclarationKeywordInExpression, SoftKeywordName, UnexpectedTokenInBrackets, TokenAfterExpression)
 	test: TestSuite
 
 
@@ -29,6 +31,319 @@ private pure func id_counts(state: ParseState) -> List[Int]:
 	counts = state.issued_counts()
 	[counts.expressions, counts.name_uses, counts.statements, counts.blocks, counts.patterns,
 		counts.written_types, counts.dimensions, counts.binders, counts.type_binders]
+
+
+pure func test_frozen_keyword_name_atoms_mint_token_spans() -> Bool:
+	var correct = True
+	for text in ["after", "sealed", "from"]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+				match result:
+					ParsedExpression(expression):
+						match expression.kind:
+							NameReference(name):
+								correct = (correct and expression.id.expression_local_index() == 0 and name.use.name_use_local_index() == 0
+									and name.name.span.span_start() == 0 and name.name.span.span_end() == text.length()
+									and parsed.id_counts() == [1, 1, 0, 0, 0, 0, 0, 0, 0] and parsed.diagnostic_count() == 0)
+							_: correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_unread_block_lambda_tail_restores_names_and_ids() -> Bool:
+	text = "func(arg):\n\tvalue + Count(arg)\n+ next"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+			match result:
+				UnsupportedExpression(stop):
+					(stop.reason == TokenAfterExpression and stop.at.span_start() == 31
+						and parsed.position() == entry.position() and parsed.id_counts() == entry.id_counts()
+						and parsed.spellings().spelling_count() == entry.spellings().spelling_count() and parsed.diagnostic_count() == 0)
+				_: False
+		Err(_): False
+
+
+pure func test_unread_soft_value_and_block_roots_preserve_entry() -> Bool:
+	var correct = True
+	for (text, reason) in [("on", SoftKeywordName), ("concurrently", SoftKeywordName), ("debug", SoftKeywordName), ("select.field", SoftKeywordName), ("with.field", SoftKeywordName), ("concurrent.field", SoftKeywordName), ("record", DeclarationKeywordInExpression)]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+				match result:
+					UnsupportedExpression(stop):
+						correct = (correct and stop.reason == reason and stop.at.span_start() == 0 and parsed.position() == entry.position()
+							and parsed.id_counts() == entry.id_counts() and parsed.diagnostic_count() == 0)
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_builtin_marker_is_one_leaf_without_literal_ids() -> Bool:
+	var correct = True
+	for (text, name) in [("builtin", None), ("builtin(\"\")", Some("")), ("builtin(\"helper\")", Some("helper")), ("builtin(raw\"helper\")", Some("helper")), ("builtin(\n\t|helper\n)", Some("helper")), ("builtin(\n\traw\n\t|helper\n)", Some("helper"))]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+				match result:
+					ParsedExpression(expression):
+						match expression.kind:
+							CompilerBuiltin(actual):
+								correct = (correct and actual == name and expression.id.expression_local_index() == 0
+									and parsed.id_counts() == [1, 0, 0, 0, 0, 0, 0, 0, 0]
+									and expression.span.span_start() == 0 and expression.span.span_end() == text.length()
+									and parsed.diagnostic_count() == 0)
+							_: correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_builtin_interpolated_marker_keeps_static_text_without_hole_ids() -> Bool:
+	marker_hole = "$" + "{not_read}"
+	text = "builtin(\"pre " + marker_hole + " tail\")"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+			match result:
+				ParsedExpression(expression):
+					match expression.kind:
+						CompilerBuiltin(Some(marker)):
+							(marker == "pre {not_read} tail" and parsed.id_counts() == [1, 0, 0, 0, 0, 0, 0, 0, 0]
+								and parsed.issued_ids().definitions.is_empty() and expression.id.expression_local_index() == 0)
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_builtin_marker_errors_reject_without_trial_ids() -> Bool:
+	var correct = True
+	for (text, message, help, at) in [
+		("builtin()", "expected builtin name", "write builtin(\"runtime_helper_name\") or bare builtin", 8),
+		("builtin(123)", "expected builtin name", "write builtin(\"runtime_helper_name\") or bare builtin", 8),
+		("builtin(\n---\ndoc\n---\n)", "expected builtin name", "write builtin(\"runtime_helper_name\") or bare builtin", 9),
+		("builtin(\"x\"", "expected `)` after builtin name", "close the parenthesis opened earlier with `)`", 11)
+	]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+				match result:
+					RejectedExpression:
+						correct = correct and parsed.id_counts() == entry.id_counts() and parsed.issued_ids().definitions.is_empty()
+						match reject_preview(parsed):
+							Ok(rejected):
+								match render_rejected_diagnostics(rejected):
+									Ok([row]):
+										correct = (correct and row.rendered.message == message and row.rendered.help == Some(help)
+											and row.span.span_start() == at and row.span.span_end() == at)
+									_: correct = False
+							_: correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_builtin_marker_parentheses_do_not_spend_a_nesting_level() -> Bool:
+	text = "(".repeat(MAX_SYNTAX_NESTING) + "builtin(\"helper\")" + ")".repeat(MAX_SYNTAX_NESTING)
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+			match result:
+				ParsedExpression(_): parsed.id_counts() == [1, 0, 0, 0, 0, 0, 0, 0, 0] and parsed.diagnostic_count() == 0
+				_: False
+		Err(_): False
+
+
+pure func test_builtin_before_unsupported_operand_restores_entry() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "builtin + on")):
+		Ok(entry):
+			(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+			match result:
+				UnsupportedExpression(stop):
+					(stop.reason == SoftKeywordName and stop.at.span_start() == 10 and parsed.position() == entry.position()
+						and parsed.id_counts() == entry.id_counts() and parsed.diagnostic_count() == 0)
+				_: False
+		Err(_): False
+
+
+pure func test_opaque_conversions_mint_type_then_value_then_owner() -> Bool:
+	var correct = True
+	for (keyword, direction) in [("into_opaque", IntoOpaque), ("from_opaque", FromOpaque)]:
+		text = keyword + " Handle(source + 1)"
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+				match result:
+					ParsedExpression(expression):
+						match expression.kind:
+							OpaqueConversion(actual_direction, written, value):
+								match (written.kind, value.kind):
+									(NamedType(type_name, []), Binary(Add, first, second)):
+										match first.kind:
+											NameReference(value_name):
+												correct = (correct and actual_direction == direction
+													and parsed.id_counts() == [4, 2, 0, 0, 0, 1, 0, 0, 0]
+													and written.id.written_type_local_index() == 0 and type_name.use.name_use_local_index() == 0
+													and value_name.use.name_use_local_index() == 1
+													and first.id.expression_local_index() == 0 and second.id.expression_local_index() == 1
+													and value.id.expression_local_index() == 2 and expression.id.expression_local_index() == 3
+													and expression.span.span_start() == 0 and expression.span.span_end() == text.length()
+													and written.span.span_start() == 12 and written.span.span_end() == 18 and parsed.diagnostic_count() == 0)
+											_: correct = False
+									_: correct = False
+							_: correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_opaque_conversion_unsupported_values_restore_entry() -> Bool:
+	var correct = True
+	for (text, reason) in [("into_opaque Handle(on(\"x\"))", SoftKeywordName), ("from_opaque m.Handle[T](first last)", UnexpectedTokenInBrackets)]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+				match result:
+					UnsupportedExpression(stop):
+						correct = (correct and stop.reason == reason and parsed.position() == entry.position()
+							and parsed.id_counts() == entry.id_counts() and parsed.diagnostic_count() == entry.diagnostic_count()
+							and parsed.spellings().spelling_count() == entry.spellings().spelling_count())
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_opaque_conversion_rejection_preserves_diagnostics_without_ids() -> Bool:
+	var correct = True
+	for (text, message, help) in [
+		("into_opaque Handle", "expected `(` after opaque conversion type", "write the parameters or arguments inside parentheses"),
+		("from_opaque Handle(value", "expected `)` after opaque conversion value", "close the parenthesis opened earlier with `)`")
+	]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+				match result:
+					RejectedExpression:
+						correct = correct and parsed.id_counts() == entry.id_counts() and parsed.diagnostic_count() == 1
+						match reject_preview(parsed):
+							Ok(rejected):
+								match render_rejected_diagnostics(rejected):
+									Ok([row]):
+										correct = (correct and row.rendered.message == message and row.rendered.help == Some(help)
+											and row.span.span_start() == text.length() and row.span.span_end() == text.length())
+									_: correct = False
+							_: correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_opaque_conversion_recovered_type_is_never_accepted() -> Bool:
+	text = "into_opaque ,(value)"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+			match result:
+				RejectedExpression:
+					match reject_preview(parsed):
+						Ok(rejected):
+							match render_rejected_diagnostics(rejected):
+								Ok([row]):
+									(parsed.id_counts() == entry.id_counts() and parsed.issued_ids().definitions.is_empty()
+										and row.rendered.message == "expected type"
+										and row.rendered.help == Some("write a type such as `Int` or `List[String]`")
+										and row.span.span_start() == 12 and row.span.span_end() == 12)
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+-- The direct entry leaves its caller's delimiter unread and mints once.
+pure func test_direct_expression_entry_keeps_the_callers_boundary() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "first + last)")):
+		Ok(entry):
+			(parsed, result) = parse_expression(entry, anchored_at(entry.current_span()))
+			match result:
+				ParsedExpression(value):
+					value.id.expression_local_index() == 2 and parsed.id_counts() == [3, 2, 0, 0, 0, 0, 0, 0, 0] and parsed.position() == 3 and parsed.diagnostic_count() == 0
+				_: False
+		Err(_): False
+
+
+pure func test_completed_block_lambda_leaves_following_name_unread() -> Bool:
+	var correct = True
+	for prefix in ["", "detach ", "not ", "- ", "1 + "]:
+		text = prefix + "func(arg):\n\targ\nfollowing"
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+				match result:
+					ParsedExpression(expression):
+						correct = (correct and parsed.current_span().span_start() == text.length() - "following".length()
+							and expression.span.span_start() == 0 and expression.span.span_end() < parsed.current_span().span_start()
+							and parsed.diagnostic_count() == 0)
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_block_lambda_unread_followers_restore_entry() -> Bool:
+	var correct = True
+	for prefix in ["", "detach ", "not ", "- ", "1 + "]:
+		for follower in ["+ next", "as Type", "= next"]:
+			text = prefix + "func(arg):\n\targ\n" + follower
+			match new_parse_state(lex_module(module_id_at_row(0), text)):
+				Ok(entry):
+					(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+					match result:
+						UnsupportedExpression(stop):
+							correct = (correct and stop.reason == TokenAfterExpression and stop.at.span_start() == text.length() - follower.length()
+								and parsed.position() == entry.position() and parsed.spellings().spelling_count() == entry.spellings().spelling_count()
+								and parsed.id_counts() == entry.id_counts() and parsed.issued_ids().definitions.is_empty()
+								and parsed.diagnostic_count() == entry.diagnostic_count())
+						_: correct = False
+				Err(_): correct = False
+	correct
+
+
+pure func test_grouping_a_block_lambda_changes_its_boundary_classification() -> Bool:
+	var correct = True
+	for (text, expected) in [("func(x):\n\tx\n", True), ("detach func(x):\n\tx\n", True), ("not func(x):\n\tx\n", True), ("1 + func(x):\n\tx\n", True), ("(func(x):\n\tx\n)", False), ("func(x): x", False), ("func(x): func(y):\n\t\t\ty\n", False)]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(_, parsed, _) = parse_expression_with_ending(entry, anchored_at(entry.current_span()))
+				match parsed:
+					ParsedValue(value): correct = correct and value.ends_in_block_lambda() == expected
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+-- The trial contains a local definition before its later call diagnostic.
+-- Retaining that diagnostic must discard definition authority as well as ids.
+pure func test_rejected_lambda_call_discards_trial_definitions() -> Bool:
+	text = "(func():\n\tfunc local(): 1\n\tlocal()\n)(last"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+			match result:
+				RejectedExpression:
+					match reject_preview(parsed):
+						Ok(rejected):
+							match render_rejected_diagnostics(rejected):
+								Ok([row]):
+									(parsed.id_counts() == entry.id_counts() and parsed.issued_ids().definitions.is_empty()
+										and parsed.current_span().span_start() == text.length()
+										and parsed.spellings().spelling_count() == entry.spellings().spelling_count()
+										and row.rendered.message == "expected `)` after call arguments"
+										and row.rendered.help == Some("close the parenthesis opened earlier with `)`"))
+								_: False
+						_: False
+				_: False
+		Err(_): False
 
 
 pure func test_precedence_and_postorder_ids() -> Bool:
@@ -131,12 +446,12 @@ pure func hole(text: String) -> String:
 
 pure func test_unsupported_returns_original_state() -> Bool:
 	var correct = True
-	for text in ["detach if x: 1 else: 2", "detach\n.field", "call(if True: 1 else: 2)", "name.field(1, if x: 1 else: 2)", "1\n.field", "1\n\t.field", "1 +\n 2", "not if x: 1 else: 2", "first + if x: 1 else: 2", "f(x)[if x: 1 else: 2]", "f(if True: 1 else: 2)", "f(x)\n.member", "target.member(1, if x: 1 else: 2)", "f(,x)", "f(x]",
-		"[1 2]", "[,]", "[,1]", "[1,,2]", "[1, if x: 1 else: 2]", "[if x: 1 else: 2]", "[if True: 1 else: 2]", "[1)", "[1}", "[[1], if x: 1 else: 2]", "[1]\n.length()", "[1]\n\t.length()", 
+	for text in ["target\n    .\n    member", "target\n    .member(", "target\n    .member(if x: 1 else: 2)", "target\n    .member()\n    unrelated", "detach if x: 1 else: 2", "detach\n.field", "call(if True: 1 else: 2)", "name.field(1, if x: 1 else: 2)", "1 +\n 2", "not if x: 1 else: 2", "first + if x: 1 else: 2", "f(x)[if x: 1 else: 2]", "f(if True: 1 else: 2)", "target.member(1, if x: 1 else: 2)", "f(,x)", "f(x]",
+		"[1 2]", "[,]", "[,1]", "[1,,2]", "[1, if x: 1 else: 2]", "[if x: 1 else: 2]", "[if True: 1 else: 2]", "[1)", "[1}", "[[1], if x: 1 else: 2]",
 		"{a = match x:\n\t_: 1\n}", "{1 => match x:\n\t_: 1\n}", "f(1 + [match x:\n\t_: 1\n])",
-		"{a b}", "{a, b)", "{a => 1, b}", "{a => 1 b => 2}", "{a = 1, b}", "{a = 1 b = 2}", "{r | }", "{r | 1}", "{\na b\n}", "{\na = 1\nb = 2\n}", "{\nk => 1,\nw\n}", "{\nr |\n}", "{\na = 1\n} c", "{\n\na,\n\nb\n}\n.f", "{\na = if x:\n1\nelse:\n2\n}",
-		"{a,", "{a, b,", "{a => 1,", "{k => v,", "{r | x}", "{on = 1}", "{r | on = 1}", "{k => v, w}", "{a = 1, b = }", "{x, if x: 1 else: 2}", "{a = if x: 1 else: 2}", "{}\n.f", "{a, b}\n\t.f", "{a = 1} c", "{,}", "{a,, b}",
-		"(a, b c)", "(a, if x: 1 else: 2)", "(a, b]", "(a,, b)", "(, a)", "(x,", "(a,", "(a, b,", "(a, b)\n.f", "(a, b)\n\t.f", "(a, if x: 1 else: 2)", "(a, if True: 1 else: 2)", "(a, b) c"].concat(
+		"{a b}", "{a, b)", "{a => 1, b}", "{a => 1 b => 2}", "{a = 1, b}", "{a = 1 b = 2}", "{r | }", "{r | 1}", "{\na b\n}", "{\na = 1\nb = 2\n}", "{\nk => 1,\nw\n}", "{\nr |\n}", "{\na = 1\n} c", "{\na = if x:\n1\nelse:\n2\n}",
+		"{a,", "{a, b,", "{a => 1,", "{k => v,", "{r | x}", "{on 1}", "{r | on 1}", "{from = 1}", "{r | from = 1}", "{k => v, w}", "{a = 1, b = }", "{x, if x: 1 else: 2}", "{a = if x: 1 else: 2}", "{a = 1} c", "{,}", "{a,, b}",
+		"(a, b c)", "(a, if x: 1 else: 2)", "(a, b]", "(a,, b)", "(, a)", "(x,", "(a,", "(a, b,", "(a, if x: 1 else: 2)", "(a, if True: 1 else: 2)", "(a, b) c"].concat(
 		-- A hole outside the grammar leaves the whole string unsupported, even after
 		-- an earlier hole read and interned its names.
 		["first + \"" + hole("a") + " " + hole("b c") + "\"", "\"" + hole("") + "\"", "[\"" + hole("a") + hole("if x: 1 else: 2") + "\"]", "\"" + hole("\\\"") + "\""]):
@@ -348,6 +663,54 @@ pure func test_postfix_source_order_and_spans() -> Bool:
 										_: False
 								_: False
 						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_leading_dot_chains_keep_postorder_ids_and_authored_spans() -> Bool:
+	var correct = True
+	for text in ["target\n    .member(arg)[index]", "target\n.member(arg)[index]", "(target\n    .member(arg)[index])"]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+				match result:
+					ParsedExpression(value):
+						match value.kind:
+							Subscript(call, indices):
+								match call.kind:
+									Call(field, [argument]):
+										match field.kind:
+											FieldAccess(target, _):
+												correct = (correct and target.id.expression_local_index() == 0 and field.id.expression_local_index() == 1
+													and argument.id.expression_local_index() == 2 and call.id.expression_local_index() == 3
+													and indices.first.id.expression_local_index() == 4 and value.id.expression_local_index() == 5
+													and parsed.issued_counts().expressions == 6 and parsed.diagnostic_count() == 0
+													and value.span.span_start() == 0 and value.span.span_end() == text.length())
+											_: correct = False
+									_: correct = False
+							_: correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_malformed_continued_calls_report_without_issuing_ids() -> Bool:
+	-- An unclosed indented call first sees the lexer's synthetic DEDENT;
+	-- that existing delimiter-recovery gap stays in the rollback cases above.
+	text = "target\n.member("
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+			match result:
+				RejectedExpression:
+					match reject_preview(parsed):
+						Ok(rejected):
+							match render_rejected_diagnostics(rejected):
+								Ok([row]):
+									(parsed.id_counts() == entry.id_counts() and row.rendered.message == "expected `)` after call arguments"
+										and row.rendered.help == Some("close the parenthesis opened earlier with `)`"))
+								_: False
+						Err(_): False
 				_: False
 		Err(_): False
 
@@ -804,6 +1167,7 @@ pure func test_braced_rejection_has_exact_diagnostics_and_no_ids() -> Bool:
 	expression_help = "write a value, a name or a call here"
 	cases = [
 		("{a = 1, a = 2}", [(duplicate, given, 8, 9)]),
+		("{after = 1, after = 2}", [("duplicate field `after`", given, 12, 17)]),
 		("{a = 1, a = 2, a = 3}", [(duplicate, given, 8, 9), (duplicate, given, 15, 16)]),
 		("{r | a = 1, a = 2}", [(duplicate, "the field was already given at 1:6; give it once", 12, 13)]),
 		("{a = 1, a = 2", [(duplicate, given, 8, 9), (record_close, close_help, 13, 13)]),
@@ -1028,6 +1392,23 @@ pure func test_multiline_braced_rejection_reports_the_right_line() -> Bool:
 tests: TestSuite = {
 	description = "Bounded tree operator expressions",
 	tests = [
+		("unread block lambda tails restore names and ids", test_unread_block_lambda_tail_restores_names_and_ids),
+		("unread soft value and block roots preserve entry", test_unread_soft_value_and_block_roots_preserve_entry),
+		("frozen keyword name atoms mint token spans", test_frozen_keyword_name_atoms_mint_token_spans),
+		("builtin static marker has no hole ids", test_builtin_interpolated_marker_keeps_static_text_without_hole_ids),
+		("builtin marker errors reject without trial ids", test_builtin_marker_errors_reject_without_trial_ids),
+		("builtin marker metadata has no nesting cost", test_builtin_marker_parentheses_do_not_spend_a_nesting_level),
+		("builtin rollback discards its leaf ids", test_builtin_before_unsupported_operand_restores_entry),
+		("builtin marker is one leaf without literal ids", test_builtin_marker_is_one_leaf_without_literal_ids),
+		("opaque conversion recovered type is never accepted", test_opaque_conversion_recovered_type_is_never_accepted),
+		("opaque conversions mint type then value then owner", test_opaque_conversions_mint_type_then_value_then_owner),
+		("opaque conversion unsupported values restore entry", test_opaque_conversion_unsupported_values_restore_entry),
+		("opaque conversion rejection preserves diagnostics without ids", test_opaque_conversion_rejection_preserves_diagnostics_without_ids),
+		("completed block lambda leaves follower unread", test_completed_block_lambda_leaves_following_name_unread),
+		("block lambda unread followers restore entry", test_block_lambda_unread_followers_restore_entry),
+		("grouped block lambda boundary classification", test_grouping_a_block_lambda_changes_its_boundary_classification),
+		("rejected lambda call discards trial definitions", test_rejected_lambda_call_discards_trial_definitions),
+		("direct expression keeps the caller boundary", test_direct_expression_entry_keeps_the_callers_boundary),
 		("precedence and postorder ids", test_precedence_and_postorder_ids),
 		("string and character literals", test_string_and_character_literals_are_atoms),
 		("string literals keep form and text", test_string_literals_keep_their_form_and_text),
@@ -1040,6 +1421,8 @@ tests: TestSuite = {
 		("unsupported exact rollback", test_unsupported_returns_original_state),
 		("rejected expression has no ids", test_rejection_issues_no_ids),
 		("postfix source order and spans", test_postfix_source_order_and_spans),
+		("leading dots keep postorder ids and spans", test_leading_dot_chains_keep_postorder_ids_and_authored_spans),
+		("malformed continued calls report without ids", test_malformed_continued_calls_report_without_issuing_ids),
 		("postfix rejection diagnostic and no ids", test_postfix_rejection_has_exact_diagnostic_and_no_ids),
 		("2000 call left spine", test_long_postfix_chain),
 		("100 nested call arguments", test_nested_call_arguments),

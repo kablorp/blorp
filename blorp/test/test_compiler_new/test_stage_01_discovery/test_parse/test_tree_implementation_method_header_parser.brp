@@ -1,10 +1,11 @@
 -- Implementation-method preview only: no receiver or owner grammar.
--- Header recovery is frozen; deferred-body intervals are lexical M3 evidence.
+-- Header recovery is frozen; accepted heads stop at their body entry.
 import:
 	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
 	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, spellings, report_at_current, finished_builtin_type, consume_declared_name
-	../../../../src/compiler_new/stage_01_discovery/parse/tree_implementation_method_header_parser: ImplementationMethodHeaderParse(ParsedImplementationMethodHeader, RejectedImplementationMethodHeader), parse_implementation_method_header
-	../../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser: deferred_body_span, deferred_body_token_start, deferred_body_token_end
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_implementation_method_header_parser: ImplementationMethodHeadParse(ParsedImplementationMethodHead, RejectedImplementationMethodHead), parse_implementation_method_head
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_body_parser: complete_body
+	../../../../src/compiler_new/stage_01_discovery/parse/stop_reason: Recognition(Recognized)
 	../../../../src/compiler_new/stage_01_discovery/parse/body_parser: parse_impl_method_function
 	../../../../src/compiler_new/stage_01_discovery/parse/declaration_header as FrozenHeader
 	../../../../src/compiler_new/stage_01_discovery/parse/definition_openings: impl_opening, open_impl
@@ -22,7 +23,9 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, name_id_index
 	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility), Purity(PureFunction, ImpureFunction), FunctionAnnotation(NoCopyAnnotation)
 	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end, spans_equal
-	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(FuncKeyword, PureKeyword, IdentifierToken, NewlineToken, EndOfFileToken)
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(FuncKeyword, PureKeyword, IdentifierToken, NewlineToken, EndOfFileToken, IntLiteralToken, ElseKeyword)
+	../../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: reject_preview
+	../../../../src/compiler_new/stage_01_discovery/diagnostics/rejected_syntax_render: render_rejected_diagnostics
 	test: TestSuite
 
 
@@ -119,9 +122,9 @@ private pure func no_function_method_or_body_ids(state: ParseState) -> Bool:
 private pure func rejected(text: String) -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(state):
-			(parsed, result) = parse_implementation_method_header(state)
+			(parsed, result) = parse_implementation_method_head(state)
 			match result:
-				RejectedImplementationMethodHeader:
+				RejectedImplementationMethodHead:
 					parsed.diagnostic_count() > 0 and matches_frozen(parsed, frozen_method(text)) and no_function_method_or_body_ids(parsed)
 				_:
 					False
@@ -133,12 +136,12 @@ private pure func rejected(text: String) -> Bool:
 -- scanner owns the terminal newline, whereas frozen expression recovery leaves
 -- it. Compare every diagnostic exactly and pin the tree's sibling explicitly.
 -- ExpectedTypeDiagnostic is a Plain code, handled by diagnostics_match_frozen.
-private pure func rejected_after_deferred_body(text: String, next_first: Int, token_position: Int) -> Bool:
+private pure func rejected_after_body_recovery(text: String, next_first: Int, token_position: Int) -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(state):
-			(parsed, result) = parse_implementation_method_header(state)
+			(parsed, result) = parse_implementation_method_head(state)
 			match result:
-				RejectedImplementationMethodHeader:
+				RejectedImplementationMethodHead:
 					(parsed.diagnostic_count() == 1 and diagnostics_match_frozen(parsed, frozen_method(text))
 						and parsed.current_kind() == FuncKeyword and parsed.current_span().covers(next_first, next_first + 4)
 						and parsed.position() == token_position and no_function_method_or_body_ids(parsed))
@@ -151,14 +154,14 @@ private pure func rejected_after_deferred_body(text: String, next_first: Int, to
 pure func test_authored_colon_at_eof_requires_body_at_full_method_name() -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), "func f():")):
 		Ok(state):
-			(parsed, result) = parse_implementation_method_header(state)
+			(parsed, result) = parse_implementation_method_head(state)
 			match (result, parsed.diagnostics().get(0)):
-				(RejectedImplementationMethodHeader, Some(at)):
+				(RejectedImplementationMethodHead, Some(at)):
 					match at.diagnostic:
 						TreeDiagnostics.Plain(FrozenDiagnostics.MissingFunctionBodyDiagnostic):
 							(at.span.covers(5, 6) and parsed.diagnostic_count() == 1 and parsed.current_kind() == EndOfFileToken
-								and parsed.current_span().covers(9, 9) and parsed.position() == 5 and rejected("func f():")
-								and rejected("func f():\nfunc g():"))
+							and parsed.current_span().covers(9, 9) and parsed.position() == 5 and rejected("func f():")
+							and rejected("func f():\nfunc g():") and rejected("func f():\n-- comment\n\nfunc g():"))
 						_:
 							False
 				_:
@@ -171,24 +174,24 @@ pure func test_rich_signature_preserves_annotation_generic_constraint_and_child_
 	text: String = "@no_copy pure func f[T: m.Eq, #N](x: T) -> T[#N] where #N == #3: x"
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(state):
-			(parsed, result) = parse_implementation_method_header(state)
+			(parsed, result) = parse_implementation_method_head(state)
 			match result:
-				ParsedImplementationMethodHeader(preview):
-					match (preview.header.annotations, preview.header.type_parameters, preview.header.signature.parameters, preview.header.signature.return_type):
+				ParsedImplementationMethodHead(preview):
+					match (preview.annotations, preview.type_parameters, preview.signature.parameters, preview.signature.return_type):
 						([annotation], [TypeVariable(variable), DimensionVariable(dimension)], [parameter], Some(return_type)):
 							match (parameter.binding, parameter.declared_type, variable.bounds):
 								(NamedParameter(binder), Some(parameter_type), [bound]):
 									match bound.qualifier:
 										Some(qualifier):
-											(annotation.annotation == NoCopyAnnotation and annotation.span.covers(1, 8) and preview.header.signature.purity == PureFunction
-												and preview.header.signature.keyword.covers(14, 18) and preview.header.signature.name.span.covers(19, 20) and preview.header.header_span.covers(0, 64)
+											(annotation.annotation == NoCopyAnnotation and annotation.span.covers(1, 8) and preview.signature.purity == PureFunction
+												and preview.signature.keyword.covers(14, 18) and preview.signature.name.span.covers(19, 20) and preview.header_span.covers(0, 64)
 												and variable.binder.binder.type_binder_local_index() == 0 and dimension.binder.type_binder_local_index() == 1
 												and qualifier.use.name_use_local_index() == 0 and bound.trait_name.use.name_use_local_index() == 1 and binder.binder.binder_local_index() == 0
 												and parameter_type.id.written_type_local_index() == 0 and return_type.id.written_type_local_index() == 2 and return_type.span.covers(43, 48)
-												and preview.header.constraints.length() == 1 and preview.body.deferred_body_span().covers(65, 66)
+												and preview.constraints.length() == 1 and parsed.current_span().covers(65, 66)
 												and parsed.issued_counts().type_binders == 2 and parsed.issued_counts().binders == 1 and parsed.issued_counts().written_types == 3
 												and parsed.issued_counts().name_uses == 6 and parsed.issued_counts().dimensions == 3 and parsed.diagnostic_count() == 0
-												and parsed.current_kind() == EndOfFileToken and parsed.current_span().covers(66, 66) and no_function_method_or_body_ids(parsed))
+												and parsed.current_kind() == IdentifierToken and no_function_method_or_body_ids(parsed))
 										None:
 											False
 								_:
@@ -201,37 +204,39 @@ pure func test_rich_signature_preserves_annotation_generic_constraint_and_child_
 			False
 
 
--- Valid bodies only: token intervals are evidence for M4, not expression trees.
-private pure func skipped(text: String, header_first: Int, header_last: Int, body_first: Int, body_last: Int, next_first: Int, token_first: Int, token_last: Int) -> Bool:
+-- Heads stop at body entry; completion owns syntax and its sibling boundary.
+private pure func completed_method_body(text: String, header_first: Int, header_last: Int, body_first: Int, body_last: Int, next_first: Int, token_first: Int, token_last: Int) -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(state):
-			(parsed, result) = parse_implementation_method_header(state)
+			(parsed, result) = parse_implementation_method_head(state)
 			match result:
-				ParsedImplementationMethodHeader(preview):
-					(preview.header.header_span.covers(header_first, header_last) and preview.body.deferred_body_span().covers(body_first, body_last)
-						and preview.body.deferred_body_token_start() == token_first and preview.body.deferred_body_token_end() == token_last
-						and parsed.position() == token_last and parsed.current_kind() == FuncKeyword and parsed.current_span().covers(next_first, next_first + 4)
-						and parsed.diagnostic_count() == 0 and no_function_method_or_body_ids(parsed))
-				_:
-					False
-		Err(_):
-			False
+				ParsedImplementationMethodHead(head):
+					(completed, body) = complete_body(parsed)
+					match body:
+						Recognized(body):
+							(head.header_span.covers(header_first, header_last) and body.span.covers(body_first, body_last)
+								and parsed.position() == token_first and no_function_method_or_body_ids(parsed)
+								and completed.position() == token_last and completed.current_kind() == FuncKeyword and completed.current_span().covers(next_first, next_first + 4)
+								and completed.diagnostic_count() == 0)
+						_: False
+				_: False
+		Err(_): False
 
 
 pure func test_annotations_skip_newlines_and_keep_method_anchor() -> Bool:
-	(skipped("@no_copy\npure func f(): 1\nfunc g():", 0, 23, 24, 25, 26, 9, 11)
-		and skipped("@no_copy\n@no_copy\nfunc f(): 1\nfunc g():", 0, 27, 28, 29, 30, 11, 13))
+	(completed_method_body("@no_copy\npure func f(): 1\nfunc g():", 0, 23, 24, 25, 26, 9, 11)
+		and completed_method_body("@no_copy\n@no_copy\nfunc f(): 1\nfunc g():", 0, 27, 28, 29, 30, 11, 13))
 
 
 pure func test_unknown_annotation_rejects_without_attachment_diagnostic() -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), "@unknown func f(): 1\nfunc g():")):
 		Ok(state):
-			(parsed, result) = parse_implementation_method_header(state)
+			(parsed, result) = parse_implementation_method_head(state)
 			match (result, parsed.diagnostics().get(0)):
-				(RejectedImplementationMethodHeader, Some(at)):
+				(RejectedImplementationMethodHead, Some(at)):
 					match at.diagnostic:
 						TreeDiagnostics.UnknownAnnotation(spelling):
-							(rejected_after_deferred_body("@unknown func f(): 1\nfunc g():", 21, 9) and parsed.diagnostic_count() == 1 and at.span.covers(1, 8)
+							(rejected_after_body_recovery("@unknown func f(): 1\nfunc g():", 21, 9) and parsed.diagnostic_count() == 1 and at.span.covers(1, 8)
 								and parsed.spellings().spelling_text(spelling) == Some("unknown"))
 						_:
 							False
@@ -247,16 +252,16 @@ pure func test_private_documentation_and_nonfunction_entries_use_method_gate() -
 
 
 pure func test_invalid_name_and_parameters_consume_authored_return_and_body() -> Bool:
-	(rejected_after_deferred_body("func 123() -> Int: 1\nfunc g():", 21, 9) and rejected_after_deferred_body("func if() -> Int: 1\nfunc g():", 20, 9)
-		and rejected_after_deferred_body("func f(123) -> Int: 1\nfunc g():", 22, 10) and rejected_after_deferred_body("func f(x: +) -> Int: 1\nfunc g():", 23, 12))
+	(rejected_after_body_recovery("func 123() -> Int: 1\nfunc g():", 21, 9) and rejected_after_body_recovery("func if() -> Int: 1\nfunc g():", 20, 9)
+		and rejected_after_body_recovery("func f(123) -> Int: 1\nfunc g():", 22, 10) and rejected_after_body_recovery("func f(x: +) -> Int: 1\nfunc g():", 23, 12))
 
 
 pure func test_colonless_headers_distinguish_missing_body_from_inline_token() -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), "func f()")):
 		Ok(state):
-			(parsed, result) = parse_implementation_method_header(state)
+			(parsed, result) = parse_implementation_method_head(state)
 			match (result, parsed.diagnostics().get(0)):
-				(RejectedImplementationMethodHeader, Some(at)):
+				(RejectedImplementationMethodHead, Some(at)):
 					match at.diagnostic:
 						TreeDiagnostics.Plain(FrozenDiagnostics.MissingFunctionBodyDiagnostic):
 							(at.span.covers(5, 6) and parsed.diagnostic_count() == 1 and parsed.position() == 4
@@ -273,9 +278,9 @@ pure func test_colonless_headers_distinguish_missing_body_from_inline_token() ->
 pure func test_missing_colon_before_indented_body_consumes_body_and_preserves_sibling() -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), "func f()\n\t1\nfunc g():")):
 		Ok(state):
-			(parsed, result) = parse_implementation_method_header(state)
+			(parsed, result) = parse_implementation_method_head(state)
 			match (result, parsed.diagnostics().get(0)):
-				(RejectedImplementationMethodHeader, Some(at)):
+				(RejectedImplementationMethodHead, Some(at)):
 					match at.diagnostic:
 						TreeDiagnostics.ExpectedToken(ExpectedColon(ColonInFunctionBody)):
 							(at.span.covers(8, 8) and parsed.diagnostic_count() == 1 and rejected("func f()\n\t1\nfunc g():")
@@ -288,21 +293,22 @@ pure func test_missing_colon_before_indented_body_consumes_body_and_preserves_si
 			False
 
 
-pure func test_inline_and_indented_body_extents_preserve_sibling_without_body_ids() -> Bool:
-	(skipped("func f(): 1\nfunc g():", 0, 9, 10, 11, 12, 5, 7)
-		and skipped("func f():\n\t1\nfunc g():", 0, 9, 11, 12, 13, 5, 9))
+pure func test_inline_and_indented_body_presences_preserve_sibling_without_body_ids() -> Bool:
+	(completed_method_body("func f(): 1\nfunc g():", 0, 9, 10, 11, 12, 5, 7)
+		and completed_method_body("func f():\n\t1\nfunc g():", 0, 9, 11, 12, 13, 5, 9)
+		and completed_method_body("func f():\n-- comment\n\n\t1\nfunc g():", 0, 9, 23, 24, 25, 5, 9))
 
 
 private pure func accepts_preexisting_diagnostic() -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), "func f(): 1")):
 		Ok(state):
-			(parsed, result) = parse_implementation_method_header(state.report_at_current(FrozenDiagnostics.ExpectedImplMethodDiagnostic))
+			(parsed, result) = parse_implementation_method_head(state.report_at_current(FrozenDiagnostics.ExpectedImplMethodDiagnostic))
 			match (result, parsed.diagnostics().get(0)):
-				(ParsedImplementationMethodHeader(preview), Some(at)):
+				(ParsedImplementationMethodHead(preview), Some(at)):
 					match at.diagnostic:
 						TreeDiagnostics.Plain(FrozenDiagnostics.ExpectedImplMethodDiagnostic):
-							(at.span.covers(0, 0) and parsed.diagnostic_count() == 1 and preview.header.header_span.covers(0, 9)
-								and preview.body.deferred_body_span().covers(10, 11) and parsed.current_kind() == EndOfFileToken and no_function_method_or_body_ids(parsed))
+							(at.span.covers(0, 0) and parsed.diagnostic_count() == 1 and preview.header_span.covers(0, 9)
+								and parsed.current_span().covers(10, 11) and parsed.current_kind() == IntLiteralToken and no_function_method_or_body_ids(parsed))
 						_:
 							False
 				_:
@@ -314,17 +320,18 @@ private pure func accepts_preexisting_diagnostic() -> Bool:
 pure func test_sequential_methods_do_not_leak_annotations_purity_or_entry_diagnostics() -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), "@no_copy pure func f(): 1\nfunc g(): 2")):
 		Ok(state):
-			(first_state, first_result) = parse_implementation_method_header(state)
-			(second_state, second_result) = parse_implementation_method_header(first_state)
+			(first_state, first_result) = parse_implementation_method_head(state)
+			(after_first, _) = complete_body(first_state)
+			(second_state, second_result) = parse_implementation_method_head(after_first)
 			match (first_result, second_result):
-				(ParsedImplementationMethodHeader(first), ParsedImplementationMethodHeader(second)):
-					match first.header.annotations:
+				(ParsedImplementationMethodHead(first), ParsedImplementationMethodHead(second)):
+					match first.annotations:
 						[annotation]:
-							(annotation.annotation == NoCopyAnnotation and first.header.signature.purity == PureFunction and second.header.annotations.is_empty()
-								and second.header.signature.purity == ImpureFunction and first.header.header_span.covers(0, 23) and second.header.header_span.covers(26, 35)
-								and first.body.deferred_body_span().covers(24, 25) and second.body.deferred_body_span().covers(36, 37)
-								and second_state.diagnostic_count() == 0 and second_state.current_kind() == EndOfFileToken and second_state.current_span().covers(37, 37)
-								and no_function_method_or_body_ids(second_state) and accepts_preexisting_diagnostic())
+							(annotation.annotation == NoCopyAnnotation and first.signature.purity == PureFunction and second.annotations.is_empty()
+								and second.signature.purity == ImpureFunction and first.header_span.covers(0, 23) and second.header_span.covers(26, 35)
+								and first_state.current_span().covers(24, 25) and second_state.current_span().covers(36, 37)
+								and second_state.diagnostic_count() == 0 and second_state.current_kind() == IntLiteralToken
+								and second_state.issued_counts().expressions == 1 and accepts_preexisting_diagnostic())
 						_:
 							False
 				_:
@@ -333,9 +340,29 @@ pure func test_sequential_methods_do_not_leak_annotations_purity_or_entry_diagno
 			False
 
 
+pure func test_leading_else_keeps_the_missing_body_diagnostic() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "func f(): else:")):
+		Ok(entry):
+			(state, parsed) = parse_implementation_method_head(entry)
+			match parsed:
+				RejectedImplementationMethodHead:
+					match reject_preview(state):
+						Ok(rejected):
+							match render_rejected_diagnostics(rejected):
+								Ok([diagnostic]):
+									(state.current_kind() == ElseKeyword and state.current_span().covers(10, 14) and state.position() == 5
+										and diagnostic.span.covers(5, 6) and diagnostic.rendered.message == "function has no body"
+										and diagnostic.rendered.help == Some("a function body must have at least one expression or statement, indented on the lines below the header; write `void` for a body that does nothing"))
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
 tests: TestSuite = {
-	description = "Implementation method headers and required deferred bodies",
+	description = "Implementation method heads and body entry",
 	tests = [
+		("leading else keeps missing-body diagnostic", test_leading_else_keeps_the_missing_body_diagnostic),
 		("authored colon at eof requires body", test_authored_colon_at_eof_requires_body_at_full_method_name),
 		("rich signature annotation and child IDs", test_rich_signature_preserves_annotation_generic_constraint_and_child_ids),
 		("annotations skip newlines and retain anchor", test_annotations_skip_newlines_and_keep_method_anchor),
@@ -344,7 +371,7 @@ tests: TestSuite = {
 		("bad names parameters recover through body", test_invalid_name_and_parameters_consume_authored_return_and_body),
 		("colonless header body-required recovery", test_colonless_headers_distinguish_missing_body_from_inline_token),
 		("missing colon consumes indent and keeps sibling", test_missing_colon_before_indented_body_consumes_body_and_preserves_sibling),
-		("inline and indented lexical body intervals", test_inline_and_indented_body_extents_preserve_sibling_without_body_ids),
+		("method heads and completed bodies preserve siblings", test_inline_and_indented_body_presences_preserve_sibling_without_body_ids),
 		("sequential isolation and existing diagnostics", test_sequential_methods_do_not_leak_annotations_purity_or_entry_diagnostics)
 	]
 }

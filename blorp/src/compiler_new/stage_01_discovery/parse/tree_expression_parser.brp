@@ -1,29 +1,28 @@
--- An explicitly bounded M4 operator grammar. Recognition builds only recipes:
--- no NameUse, Expression or declaration ID exists until the entire expression
--- and its boundary have been accepted. Unsupported input returns
--- the caller's original state, including spellings and diagnostics.
+-- Direct post-order parsing. Unsupported input returns the saved persistent
+-- entry; rejected expressions retain diagnostics but discard trial ids.
 import:
 	../lex/lexed_module: LiteralValue(IntegerValue, FloatValue, TextValue), HoleScan, ScannedPiece(ScannedText, ScannedHole)
-	../syntax/checked_values: DecimalFloat
 	../syntax/expressions:
-		Expression, ExpressionKind(NameReference, IntegerLiteral, FloatLiteral, StringLiteral, InterpolatedString, BooleanLiteral, CharacterLiteral, VoidValue, Unary, Binary, ShortCircuit, RangeExpression, Call, FieldAccess, Subscript, ListLiteral, TupleLiteral, VectorLiteral, RecordLiteral, RecordUpdate, DictLiteral, Detach),
+		Expression, Hole, SubscriptPlace, Body(BlockBody), ExpressionKind(If, Match, Select, Lambda, NameReference, IntegerLiteral, FloatLiteral, StringLiteral, InterpolatedString, BooleanLiteral, CharacterLiteral, VoidValue, Unary, Binary, ShortCircuit, RangeExpression, Call, FieldAccess, Subscript, ListLiteral, TupleLiteral, VectorLiteral, RecordLiteral, RecordUpdate, DictLiteral, Detach, OpaqueConversion, CompilerBuiltin),
 		InterpolationForm(QuotedInterpolation, PipeInterpolation), InterpolationPiece(InterpolationText, InterpolationHole),
 		NamedValue, DictEntry,
+		OpaqueDirection(IntoOpaque, FromOpaque),
 		UnaryOperator(Negate, LogicalNot),
 		BinaryOperator(Add, Subtract, Multiply, Divide, Modulo, Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual),
 		LogicalOperator(LogicalAnd, LogicalOr)
-	-- A lambda atom and a control expression hold statement recipes, so this module and
-	-- the body parser import each other for functions; the recipe types share `recipes`.
-	tree_body_parser: LambdaParse(ParsedLambda, UnsupportedLambda), parse_lambda_recipe, mint_lambda_recipe, parse_control_recipe, control_expression, mint_control
+	-- Expressions and bodies call each other for controls and lambdas;
+	-- their completed recursive syntax types belong to syntax/expressions.
+	tree_body_parser: BodyContext(OutsideLoop, InsideLoop), LambdaParse(ParsedLambda, UnsupportedLambda), parse_lambda, parse_control
 	../syntax/ids: spelling_index
 	../syntax/sequences: AtLeastOne, SmallTuple(Pair, Triple, Quadruple), at_least_one_items
 	../syntax/names: WrittenName
 	../syntax/diagnostics: SyntaxDiagnostic(Plain, DuplicateFieldGiven)
 	../syntax/patterns: StringForm(QuotedString, RawString, PipeString, RawPipeString)
-	../tables/diagnostic_code: PlainSyntaxCode(ExpectedExpressionDiagnostic, SingletonTupleDiagnostic, TupleArityDiagnostic)
+	../tables/diagnostic_code: PlainSyntaxCode(ExpectedExpressionDiagnostic, SingletonTupleDiagnostic, TupleArityDiagnostic, ExpectedBuiltinNameDiagnostic)
 	../tables/expected_token:
-		NameConstruct(NameInStatementName, NameInFieldName, NameInRecordFieldName), ExpectedTokenDiagnostic(ExpectedRightParen, ExpectedRightBracket, ExpectedRightBrace),
-		RightParenConstruct(RightParenInGroupedExpression, RightParenInCallArguments, RightParenInTupleExpression),
+		NameConstruct(NameInStatementName, NameInFieldName, NameInRecordFieldName), ExpectedTokenDiagnostic(ExpectedLeftParen, ExpectedRightParen, ExpectedRightBracket, ExpectedRightBrace),
+		RightParenConstruct(RightParenInGroupedExpression, RightParenInCallArguments, RightParenInTupleExpression, RightParenInOpaqueConversionValue, RightParenInBuiltinName),
+		LeftParenConstruct(LeftParenInOpaqueConversionType),
 		RightBracketConstruct(RightBracketInSubscript, RightBracketInListLiteral),
 		RightBraceConstruct(RightBraceInRecordLiteral, RightBraceInRecordUpdate, RightBraceInDictLiteral, RightBraceInVectorLiteral)
 	../tables/span: Span, span_covering
@@ -31,24 +30,18 @@ import:
 		TokenKind(IdentifierToken, FuncKeyword, PureKeyword, IntLiteralToken, FloatLiteralToken, NormalStringToken, RawStringToken, PipeStringToken, RawPipeStringToken,
 			InterpolatedStringToken, InterpolatedPipeStringToken, CharLiteralToken, TrueKeyword, FalseKeyword, VoidKeyword, UnderscoreSymbol,
 			MinusSymbol, NotKeyword, DetachKeyword, LeftParenSymbol, RightParenSymbol, LeftBracketSymbol, RightBracketSymbol, LeftBraceSymbol, RightBraceSymbol, FatArrowSymbol, PipeSymbol, EqualSymbol, CommaSymbol,
-			EndOfFileToken, NewlineToken, DotSymbol, IfKeyword, MatchKeyword)
-	recipes:
-		BodyRecipe(BlockBodyRecipe), EntryRecipe, ExpressionRecipe, LambdaRecipe, InterpolationPieceRecipe(TextPieceRecipe, HolePieceRecipe), RecordFieldRecipe,
-		RecipeKind(
-			NameRecipe, IntegerRecipe, FloatRecipe, StringRecipe, InterpolatedRecipe, CharacterRecipe, BooleanRecipe, VoidRecipe, UnaryRecipe,
-			BinaryRecipe, GroupingRecipe, CallRecipe, FieldRecipe, SubscriptRecipe, ListRecipe, TupleRecipe, VectorRecipe, RecordRecipe,
-			UpdateRecipe, DictRecipe, ControlValueRecipe, DetachRecipe, LambdaAtomRecipe
-		)
+			EndOfFileToken, NewlineToken, IndentToken, DedentToken, DotSymbol, IfKeyword, MatchKeyword, AsKeyword, IntoOpaqueKeyword, FromOpaqueKeyword, BuiltinKeyword, AfterKeyword, SealedKeyword, FromKeyword, DebugKeyword)
 	binary_operators as Operators
 	stop_reason:
-		StopPoint, rejected_stop, Recognition(Recognized, Declined), StopReason(NestingTooDeep, OperandOnNextLine, MemberNameOnNextLine, UnexpectedTokenInBrackets, MissingDictArrow, TrailingCommaAtEndOfSource, SoftKeywordFieldName,
+		StopPoint, rejected_stop, Recognition(Recognized, Declined), StopReason(NestingTooDeep, IndentedContinuation, OperandOnNextLine, MemberNameOnNextLine, UnexpectedTokenInBrackets, MissingDictArrow, TrailingCommaAtEndOfSource,
 			InterpolationHoleNotLexed, InterpolationHoleTrailingTokens, InterpolationHoleRejected, MalformedTokenPayload),
 		Boundary(AtBoundary, PastBoundary), stop_at, expression_boundary, expression_start_reason
 	layout_quirks: BlockAnchor(PastExpressionAnchor), ExpressionAnchor, anchored_at
+	tree_type_parser: parse_type
 	token_cursor: is_soft_keyword
 	parse_state:
-		ParseState, resumed_at, position, diagnostic_count, current_kind, current_token, current_span, current_literal, current_interpolation, advanced, peek_kind,
-		consume_referenced_name, finished_name_use, finished_expression, finished_hole, report_at_current, report_diagnostic, report_unreachable_input, expect_token, entered_hole, left_hole, nested
+		ParseState, rejected_trial, diagnostic_count, current_kind, current_token, current_span, current_literal, current_interpolation, current_builtin_marker_text, advanced, peek_kind,
+		consume_referenced_name, consume_name, NameRole(ExpressionName), finished_name_use, finished_expression, finished_subscript_place, finished_hole, report_at_current, report_and_recover, report_diagnostic, report_unreachable_input, expect_token, entered_hole, left_hole, nested
 
 
 union ExpressionParse:
@@ -57,18 +50,55 @@ union ExpressionParse:
 	RejectedExpression
 
 
-union RecipeParse:
-	ParsedRecipe(ExpressionRecipe)
-	UnsupportedRecipe(StopPoint)
-	RejectedRecipe
+-- Completed syntax plus authored facts that grouping erases from the AST.
+record ExpressionValue {
+	expression: Expression,
+	root: ExpressionRoot,
+	tail: OperandEnding,
+	keeps_name_span: Bool
+}
 
 
--- Left-spine frames avoid recursion proportional to authored chain length.
-private union SpineFrame:
-	BinaryFrame(Span, Operators.BinaryOperator, ExpressionRecipe)
-	CallFrame(Span, List[ExpressionRecipe])
-	FieldFrame(Span, WrittenName)
-	SubscriptFrame(Span, AtLeastOne[ExpressionRecipe])
+fixed union ExpressionRoot:
+	NameRoot
+	SubscriptRoot
+	TupleRoot
+	FieldRoot
+	GroupedRoot
+	OtherRoot
+
+
+fixed union OperandEnding:
+	PlainOperand
+	ControlOperand
+	BlockLambdaOperand
+
+
+union ValueParse:
+	ParsedValue(ExpressionValue)
+	UnsupportedValue(StopPoint)
+	RejectedValue
+
+
+-- Only the outer prefix/postfix of an expression statement may finish a
+-- subscript as a place. Every nested expression uses ValueContext.
+private fixed union ExpressionContext:
+	ValueContext
+	StatementContext
+
+
+union StatementHeadParse:
+	ParsedStatementValue(ExpressionValue)
+	ParsedSubscriptPlace(SubscriptPlace)
+	UnsupportedStatementHead(StopPoint)
+	RejectedStatementHead
+
+
+private union PostfixStep:
+	ExtendedPostfix(ExpressionValue)
+	CompletedPlace(SubscriptPlace)
+	StoppedPostfix
+	AbandonedPostfix(Abandonment)
 
 
 -- The brackets of a postfix step: a list literal is an atom, never a step.
@@ -123,150 +153,323 @@ private union ChainStep[T]:
 	Abandoned(Abandonment)
 
 
--- The collection and indices of a subscript recipe, so that a statement can
--- turn `xs[i] = v` into an assignment to that place. A grouped subscript is a
--- grouping recipe, not a subscript, and has none.
-pure func subscript_parts(recipe: ExpressionRecipe) -> Option[(ExpressionRecipe, AtLeastOne[ExpressionRecipe])]:
-	match recipe.kind:
-		SubscriptRecipe(collection, indices):
-			Some((collection, indices))
+-- A consumed continuation dedent ends this expression even when its sibling
+-- starts with an operator token. This is transient parse evidence.
+fixed union ExpressionEnding:
+	AtExpressionToken
+	AfterContinuationDedent
+
+
+private fixed union ContinuedField:
+	NoContinuedField
+	HasContinuedField
+
+
+-- The frozen statement reader repairs one leaked chain indent for a binary
+-- whose left contains a continued field, or whose right needs the same repair.
+-- Unary wrapping deliberately does not carry this evidence.
+private fixed union ContinuationRepair:
+	NoContinuationRepair
+	RepairOneContinuationDedent
+
+
+private record ExpressionProgress {
+	value: ExpressionValue,
+	continuation_indents: Int,
+	ending: ExpressionEnding,
+	continued_field: ContinuedField,
+	repair: ContinuationRepair
+}
+
+
+private union ExpressionRead:
+	ReadExpression(ExpressionProgress)
+	ReadPlace(SubscriptPlace)
+	UnreadExpression(Abandonment)
+
+
+-- Parse one value, leaving its caller to check the boundary.
+pure func parse_expression(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, ExpressionParse):
+	(parsed, value, _) = parse_scoped_expression(state, anchor, OutsideLoop)
+	match value:
+		ParsedValue(read): (parsed, ParsedExpression(read.expression))
+		UnsupportedValue(stop): (state, UnsupportedExpression(stop))
+		RejectedValue: (state.rejected_trial(parsed), RejectedExpression)
+
+
+pure func parse_scoped_expression(state: ParseState, anchor: ExpressionAnchor, loop_context: BodyContext) -> (ParseState, ValueParse, ExpressionEnding):
+	(read, result) = read_operators(state, Operators.LOWEST_PRECEDENCE, anchor, ValueContext, loop_context)
+	finish_expression_read(read, result)
+
+
+pure func parse_statement_head(state: ParseState, anchor: ExpressionAnchor, loop_context: BodyContext) -> (ParseState, StatementHeadParse, ExpressionEnding):
+	(read, result) = read_operators(state, Operators.LOWEST_PRECEDENCE, anchor, StatementContext, loop_context)
+	match result:
+		ReadPlace(place): (read, ParsedSubscriptPlace(place), AtExpressionToken)
 		_:
-			None
+			(parsed, value, ending) = finish_expression_read(read, result)
+			match value:
+				ParsedValue(value): (parsed, ParsedStatementValue(value), ending)
+				UnsupportedValue(stop): (state, UnsupportedStatementHead(stop), ending)
+				RejectedValue: (parsed, RejectedStatementHead, ending)
 
 
--- Whether the expression is a lambda whose body is an indented block: it ends
--- at its block's dedent, where the next statement may already begin.
-pure func is_block_lambda(recipe: ExpressionRecipe) -> Bool:
-	match recipe.kind:
-		LambdaAtomRecipe(lambda):
-			match lambda.body:
-				BlockBodyRecipe(_): True
-				_: False
-		_:
-			False
+pure func ends_in_control(value: ExpressionValue) -> Bool:
+	value.tail == ControlOperand
 
 
--- Recognizes one expression without issuing ids. The caller owns the boundary
--- after it: a value, a condition and a statement end differently. Brackets
--- span lines because the lexer joins them. `anchor` is the token the frozen
--- parser measures a block opened inside the expression against
--- (`layout_quirks.block_may_open`).
-pure func parse_expression_recipe(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
-	parse_operators(state, Operators.LOWEST_PRECEDENCE, anchor)
+-- Prefix and binary parents retain the last operand's consumed block dedent;
+-- grouping resets it. The syntax root cannot recover this authored boundary.
+pure func ends_in_block_lambda(value: ExpressionValue) -> Bool:
+	value.tail == BlockLambdaOperand
 
 
--- The operand an expression ends with: the right operand of an operator, or the
--- operand of a prefix operator, to any depth. A walk by loop, so that the length
--- of an authored chain is never native stack depth.
-private pure func last_operand(recipe: ExpressionRecipe) -> ExpressionRecipe:
-	var current: ExpressionRecipe = recipe
-	var walking: Bool = True
-	while walking:
-		match current.kind:
-			BinaryRecipe(_, _, right):
-				current = right
-			UnaryRecipe(_, operand):
-				current = operand
-			DetachRecipe(operand):
-				current = operand
-			_:
-				walking = False
-	current
-
-
--- Whether the expression's last token closes a block: it is a control
--- expression, or an operator whose last operand is one. What follows such an
--- expression starts a new line at the enclosing indentation, so it needs no
--- newline of its own to end the expression.
-pure func ends_in_control(recipe: ExpressionRecipe) -> Bool:
-	match recipe.last_operand().kind:
-		ControlValueRecipe(_): True
-		_: False
+-- A completed block leaves the next statement/declaration token at the cursor.
+-- Binary followers remain unsupported here; `as` and `=` are removed forms.
+pure func block_expression_ends(kind: TokenKind) -> Bool:
+	kind != AsKeyword and kind != EqualSymbol and Operators.binary_operator(kind).is_none()
 
 
 pure func parse_expression_to_boundary(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, ExpressionParse):
-	(parsed, result) = parse_expression_recipe(state, anchor)
+	(parsed, result, ending) = parse_scoped_expression(state, anchor, OutsideLoop)
 	match result:
-		UnsupportedRecipe(stop):
-			(state, UnsupportedExpression(stop))
-		RejectedRecipe:
-			(parsed, RejectedExpression)
-		ParsedRecipe(recipe):
-			boundary: Boundary = if recipe.ends_in_control():
+		UnsupportedValue(stop): (state, UnsupportedExpression(stop))
+		RejectedValue: (state.rejected_trial(parsed), RejectedExpression)
+		ParsedValue(value):
+			boundary: Boundary = if value.ends_in_control() or ending == AfterContinuationDedent or (value.ends_in_block_lambda() and block_expression_ends(parsed.current_kind())):
 				AtBoundary
 			else:
 				parsed.expression_boundary()
 			match boundary:
-				PastBoundary(stop):
-					(state, UnsupportedExpression(stop))
-				AtBoundary:
-					(minted, expression) = parsed.mint_recipe(recipe)
-
-					-- A replay (a lambda's parameter types) moves the cursor and may
-					-- report; neither may reach the caller.
-					if minted.diagnostic_count() != state.diagnostic_count():
-						(state, UnsupportedExpression(minted.stop_at(ReplayReported)))
-					else:
-						(minted.resumed_at(parsed.position()), ParsedExpression(expression))
+				PastBoundary(stop): (state, UnsupportedExpression(stop))
+				AtBoundary: (parsed, ParsedExpression(value.expression))
 
 
-private pure func parse_operators(state: ParseState, minimum: Int, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
-	(parsed, prefix) = parse_prefix(state, anchor)
+-- Finished children, not a recognition tree. Grouping changes authored facts
+-- without creating another expression identity.
+private pure func expression_value(expression: Expression) -> ExpressionValue:
+	root: ExpressionRoot = match expression.kind:
+		NameReference(_): NameRoot
+		Subscript(_, _): SubscriptRoot
+		TupleLiteral(_): TupleRoot
+		FieldAccess(_, _): FieldRoot
+		_: OtherRoot
+	tail: OperandEnding = match expression.kind:
+		If(_) | Match(_, _) | Select(_): ControlOperand
+		Lambda(lambda):
+			match lambda.body:
+				BlockBody(_): BlockLambdaOperand
+				_: PlainOperand
+		_: PlainOperand
+	{ expression = expression, root = root, tail = tail, keeps_name_span = root == NameRoot }
+
+
+private pure func finished_value(state: ParseState, span: Span, kind: ExpressionKind) -> (ParseState, ValueParse):
+	(minted, expression) = state.finished_expression(span, kind)
+	(minted, ParsedValue(expression_value(expression)))
+
+
+private pure func value_span(value: ExpressionValue) -> Span:
+	value.expression.span
+
+
+private pure func parse_operators(state: ParseState, minimum: Int, anchor: ExpressionAnchor, loop_context: BodyContext) -> (ParseState, ValueParse):
+	(read, result) = read_operators(state, minimum, anchor, ValueContext, loop_context)
+	(parsed, written, _) = finish_expression_read(read, result)
+	(parsed, written)
+
+
+-- Precedence climbing retains chain-owned indentation across binary tails.
+-- The outer expression closes it after its right operand, never by inspecting
+-- expression spans or reconstructing whether a field crossed a source line.
+private pure func read_operators(state: ParseState, minimum: Int, anchor: ExpressionAnchor, context: ExpressionContext, loop_context: BodyContext) -> (ParseState, ExpressionRead):
+	(parsed, prefix) = read_prefix(state, anchor, context, loop_context)
 	match prefix:
-		ParsedRecipe(first):
-			(out, chain, abandoned) = extend_chain(parsed, first, pure func(current, left):
-				operator_step(current, minimum, anchor, left)
-			)
-			(out, chain_recipe(chain, abandoned))
-		_:
-			(parsed, prefix)
+		UnreadExpression(_) | ReadPlace(_): (parsed, prefix)
+		ReadExpression(first): continue_operators(parsed, minimum, anchor, first, loop_context)
 
 
--- Precedence climbing: the right operand binds only operators above this one.
-private pure func operator_step(
-	state: ParseState, minimum: Int, anchor: ExpressionAnchor, left: ExpressionRecipe,
-) -> (ParseState, ChainStep[ExpressionRecipe]):
-	match Operators.binary_operator(state.current_kind()):
-		Some(operator):
-			precedence = Operators.operator_precedence(operator)
-			after_operator = state.advanced()
-			if precedence < minimum or left.ends_in_dedent():
-				-- A control expression or block lambda ends where its block's dedent
-				-- left the cursor, which is the next statement: nothing continues it.
-				(state, Stopped)
-			else:
-				(after_right, right_result) = parse_right_operand(after_operator, precedence + 1, anchor)
-				match right_result:
-					ParsedRecipe(right):
-						(after_right, Extended({ span = left.span.span_covering(right.span), kind = BinaryRecipe(operator, left, right) }))
-					UnsupportedRecipe(stop):
-						(after_right, Abandoned(UnsupportedShape(stop)))
-					RejectedRecipe:
-						(after_right, Abandoned(RejectedShape))
-		None:
-			(state, Stopped)
+-- Resume only from completed syntax and its parse evidence. The same loop
+-- owns every binary tail, including a control operand's tail at the caller's
+-- minimum precedence; no accepted token is replayed.
+private pure func continue_operators(state: ParseState, minimum: Int, anchor: ExpressionAnchor, first: ExpressionProgress, loop_context: BodyContext) -> (ParseState, ExpressionRead):
+	var out = state
+	var progress = first
+	var abandoned: Option[Abandonment] = None
+	var reading = True
+	while reading and abandoned.is_none():
+		if progress.ending == AfterContinuationDedent or progress.value.tail == BlockLambdaOperand:
+			reading = False
+		else:
+			match Operators.binary_operator(out.current_kind()):
+				None: reading = False
+				Some(operator):
+					precedence = Operators.operator_precedence(operator)
+					if precedence < minimum:
+						reading = False
+					else:
+						(after_right, right) = read_right_operand(out.advanced(), precedence + 1, anchor, loop_context)
+						out = after_right
+						match right:
+							UnreadExpression(reason): abandoned = Some(reason)
+							ReadPlace(_): report_unreachable_input("a binary right operand is a value")
+							ReadExpression(operand):
+								continued_field = if operator != Operators.RangeOperator and (progress.continued_field == HasContinuedField or operand.continued_field == HasContinuedField):
+									HasContinuedField
+								else:
+									NoContinuedField
+								repair = if operator != Operators.RangeOperator and (progress.continued_field == HasContinuedField or operand.repair == RepairOneContinuationDedent):
+									RepairOneContinuationDedent
+								else:
+									NoContinuationRepair
+								(minted, parent) = out.finished_expression(progress.value.value_span().span_covering(operand.value.value_span()), operator_expression_kind(operator, progress.value.expression, operand.value.expression))
+								out = minted
+								progress = {
+									value = { expression = parent, root = OtherRoot, tail = operand.value.tail, keeps_name_span = False },
+									continuation_indents = progress.continuation_indents + operand.continuation_indents,
+									ending = operand.ending,
+									continued_field = continued_field,
+									repair = repair
+								}
+	match abandoned:
+		Some(reason): (out, UnreadExpression(reason))
+		None: (out, ReadExpression(progress))
 
 
--- A control expression ends the expression it is the right operand of, so it
--- is read directly: the operator-precedence frames between it and the
--- statements of its blocks are on the native stack once per level of nesting.
-private pure func parse_right_operand(state: ParseState, minimum: Int, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
+-- Read a control directly to keep operator-precedence frames out of its
+-- nested blocks, then resume its actual completed value at this RHS's minimum.
+private pure func read_right_operand(state: ParseState, minimum: Int, anchor: ExpressionAnchor, loop_context: BodyContext) -> (ParseState, ExpressionRead):
 	if state.current_kind() == IfKeyword or state.current_kind() == MatchKeyword:
-		state.nested(refused_recipe, pure func(inside): parse_control_operand(inside, anchor))
+		(read, written) = state.nested(refused_value, pure func(inside): parse_control_operand(inside, anchor, loop_context))
+		match expression_read(written):
+			ReadExpression(first): continue_operators(read, minimum, anchor, first, loop_context)
+			other: (read, other)
 	else:
-		parse_operators(state, minimum, anchor)
+		read_operators(state, minimum, anchor, ValueContext, loop_context)
 
 
-private pure func parse_prefix(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
-	(parsed, atom) = parse_atom(state, anchor)
-	match atom:
-		ParsedRecipe(first):
-			(out, chain, abandoned) = extend_chain(parsed, first, pure func(current, receiver):
-				postfix_step(current, anchor, receiver)
-			)
-			(out, chain_recipe(chain, abandoned))
-		_:
-			(parsed, atom)
+-- A statement control has already been read with its enclosing loop context.
+-- Resume its operator grammar without reparsing it as an out-of-loop operand.
+pure func continue_control_expression(state: ParseState, expression: Expression, anchor: ExpressionAnchor, loop_context: BodyContext) -> (ParseState, ValueParse, ExpressionEnding):
+	first: ExpressionProgress = { value = expression_value(expression), continuation_indents = 0, ending = AtExpressionToken, continued_field = NoContinuedField, repair = NoContinuationRepair }
+	(read, written) = continue_operators(state, Operators.LOWEST_PRECEDENCE, anchor, first, loop_context)
+	finish_expression_read(read, written)
+
+
+private pure func expression_read(written: ValueParse) -> ExpressionRead:
+	match written:
+		ParsedValue(value): ReadExpression({ value = value, continuation_indents = 0, ending = AtExpressionToken, continued_field = NoContinuedField, repair = NoContinuationRepair })
+		UnsupportedValue(stop): UnreadExpression(UnsupportedShape(stop))
+		RejectedValue: UnreadExpression(RejectedShape)
+
+
+private pure func read_prefix(state: ParseState, anchor: ExpressionAnchor, context: ExpressionContext, loop_context: BodyContext) -> (ParseState, ExpressionRead):
+	if state.current_kind() == MinusSymbol or state.current_kind() == NotKeyword or state.current_kind() == DetachKeyword:
+		state.nested(pure func(reported): UnreadExpression(RejectedShape), pure func(inside): read_prefix_operator(inside, anchor, loop_context))
+	else:
+		(parsed, atom) = parse_atom(state, anchor, loop_context)
+		match atom:
+			ParsedValue(first): read_postfix(parsed, anchor, first, context, loop_context)
+			_: (parsed, expression_read(atom))
+
+
+private pure func read_prefix_operator(state: ParseState, anchor: ExpressionAnchor, loop_context: BodyContext) -> (ParseState, ExpressionRead):
+	(parsed, operand) = read_prefix(state.advanced(), anchor, ValueContext, loop_context)
+	match operand:
+		UnreadExpression(_): (parsed, operand)
+		ReadPlace(_):
+			report_unreachable_input("a prefix operand is a value")
+			(parsed, UnreadExpression(RejectedShape))
+		ReadExpression(progress):
+			kind: ExpressionKind = if state.current_kind() == DetachKeyword:
+				Detach(progress.value.expression)
+			else:
+				operator = if state.current_kind() == MinusSymbol:
+					Negate
+				else:
+					LogicalNot
+				Unary(operator, progress.value.expression)
+			(minted, parent) = parsed.finished_expression(state.current_span().span_covering(progress.value.value_span()), kind)
+			(minted, ReadExpression({ progress | value = { expression = parent, root = OtherRoot, tail = progress.value.tail, keeps_name_span = False }, continued_field = NoContinuedField, repair = NoContinuationRepair }))
+
+
+-- Consume only an indent opened by NEWLINE INDENT DOT. A non-continuing
+-- newline stops the loop, including while an owned indent remains open; that
+-- case must make progress or stop, unlike the frozen parser's hanging branch.
+private pure func read_postfix(state: ParseState, anchor: ExpressionAnchor, first: ExpressionValue, context: ExpressionContext, loop_context: BodyContext) -> (ParseState, ExpressionRead):
+	var out = state
+	var value = first
+	var indents = 0
+	var ending = AtExpressionToken
+	var continued_field = NoContinuedField
+	var place: Option[SubscriptPlace] = None
+	var abandoned: Option[Abandonment] = None
+	var reading = True
+	while reading and abandoned.is_none():
+		if value.ends_in_dedent():
+			reading = False
+		else if indents > 0 and (out.current_kind() == DedentToken or (out.current_kind() == NewlineToken and out.peek_kind(1) == DedentToken)):
+			if out.current_kind() == NewlineToken:
+				out = out.advanced()
+			out = out.advanced()
+			indents -= 1
+			if indents == 0:
+				ending = AfterContinuationDedent
+				reading = False
+		else:
+			if out.current_kind() == NewlineToken and out.peek_kind(1) == IndentToken and out.peek_kind(2) == DotSymbol:
+				out = out.advanced().advanced()
+				indents += 1
+				continued_field = HasContinuedField
+			else if out.current_kind() == NewlineToken and out.peek_kind(1) == DotSymbol:
+				out = out.advanced()
+				continued_field = HasContinuedField
+			step_context = if indents == 0:
+				context
+			else:
+				ValueContext
+			(after_step, step) = postfix_step(out, anchor, value, step_context, loop_context)
+			out = after_step
+			match step:
+				ExtendedPostfix(next): value = next
+				CompletedPlace(completed):
+					place = Some(completed)
+					reading = False
+				StoppedPostfix: reading = False
+				AbandonedPostfix(reason): abandoned = Some(reason)
+	match place:
+		Some(completed): (out, ReadPlace(completed))
+		None:
+			match abandoned:
+				Some(reason): (out, UnreadExpression(reason))
+				None: (out, ReadExpression({ value = value, continuation_indents = indents, ending = ending, continued_field = continued_field, repair = NoContinuationRepair }))
+
+
+-- A binary tail can finish while its left postfix still owns indentation.
+-- The frozen grammar repairs just one leaked level, and only for its binary
+-- predicate. Any other still-open chain is unread, rather than losing its
+-- ownership at a newline or broadening which malformed inputs can complete.
+private pure func finish_expression_read(state: ParseState, read: ExpressionRead) -> (ParseState, ValueParse, ExpressionEnding):
+	match read:
+		ReadPlace(_):
+			report_unreachable_input("a value boundary never receives a subscript place")
+			(state, RejectedValue, AtExpressionToken)
+		UnreadExpression(UnsupportedShape(stop)): (state, UnsupportedValue(stop), AtExpressionToken)
+		UnreadExpression(RejectedShape): (state, RejectedValue, AtExpressionToken)
+		ReadExpression(progress):
+			var out = state
+			var pending = progress.continuation_indents
+			var ending = progress.ending
+			if pending == 1 and progress.repair == RepairOneContinuationDedent and (out.current_kind() == DedentToken or (out.current_kind() == NewlineToken and out.peek_kind(1) == DedentToken)):
+				if out.current_kind() == NewlineToken:
+					out = out.advanced()
+				out = out.advanced()
+				pending -= 1
+				ending = AfterContinuationDedent
+			if pending > 0:
+				(out, UnsupportedValue(out.stop_at(IndentedContinuation)), AtExpressionToken)
+			else:
+				(out, ParsedValue(progress.value), ending)
 
 
 -- Grow a chain one step at a time, so authored chain length never becomes
@@ -292,94 +495,78 @@ private pure func extend_chain[T](
 	(out, current, abandoned)
 
 
-private pure func chain_recipe(recipe: ExpressionRecipe, abandoned: Option[Abandonment]) -> RecipeParse:
-	match abandoned:
-		None: ParsedRecipe(recipe)
-		Some(UnsupportedShape(stop)): UnsupportedRecipe(stop)
-		Some(RejectedShape): RejectedRecipe
-
-
 -- Whether the expression's last token is the dedent that closes a block of its
--- own: a control expression or a lambda with an indented body. What follows
--- such an expression starts the next statement, so a call, a subscript, a
--- member access or an operator there is not a continuation of it. This is
+-- own: a control expression or a lambda with an indented body. A call, a
+-- subscript or member access after that dedent is not a continuation of it.
+-- Binary operators may
+-- resume a control operand through `continue_operators`. This is
 -- `ends_in_control` widened by the block lambda, which the boundary rules treat
--- apart because only a lambda's follower needs `block_statement_ends`.
-private pure func ends_in_dedent(recipe: ExpressionRecipe) -> Bool:
-	last: ExpressionRecipe = recipe.last_operand()
-	match last.kind:
-		ControlValueRecipe(_): True
-		LambdaAtomRecipe(_): last.is_block_lambda()
-		_: False
+-- apart because only a lambda's follower needs `block_expression_ends`.
+private pure func ends_in_dedent(value: ExpressionValue) -> Bool:
+	value.tail != PlainOperand
 
 
 -- One member access, call or subscript, or the end of the chain.
-private pure func postfix_step(
-	state: ParseState, anchor: ExpressionAnchor, receiver: ExpressionRecipe,
-) -> (ParseState, ChainStep[ExpressionRecipe]):
+private pure func postfix_step(state: ParseState, anchor: ExpressionAnchor, receiver: ExpressionValue, context: ExpressionContext, loop_context: BodyContext) -> (ParseState, PostfixStep):
 	if receiver.ends_in_dedent():
-		(state, Stopped)
+		(state, StoppedPostfix)
 	else:
 		match state.current_kind():
 			DotSymbol: member_step(state, receiver)
-			LeftParenSymbol: state.nested(refused_step, pure func(inside): delimited_step(inside, anchor, receiver, CallDelimiter))
-			LeftBracketSymbol: state.nested(refused_step, pure func(inside): delimited_step(inside, anchor, receiver, SubscriptDelimiter))
-			_: (state, Stopped)
+			LeftParenSymbol: state.nested(refused_step, pure func(inside): delimited_step(inside, anchor, receiver, CallDelimiter, ValueContext, loop_context))
+			LeftBracketSymbol: state.nested(refused_step, pure func(inside): delimited_step(inside, anchor, receiver, SubscriptDelimiter, context, loop_context))
+			_: (state, StoppedPostfix)
 
 
--- What an atom is when it refuses to nest past `MAX_SYNTAX_NESTING`.
-private pure func refused_recipe(state: ParseState) -> RecipeParse:
-	RejectedRecipe
+private pure func refused_value(state: ParseState) -> ValueParse:
+	RejectedValue
 
 
--- What a postfix step is when it refuses to nest past `MAX_SYNTAX_NESTING`.
-private pure func refused_step(state: ParseState) -> ChainStep[ExpressionRecipe]:
-	Abandoned(RejectedShape)
+private pure func refused_step(state: ParseState) -> PostfixStep:
+	AbandonedPostfix(RejectedShape)
 
 
-private pure func member_step(
-	state: ParseState, receiver: ExpressionRecipe,
-) -> (ParseState, ChainStep[ExpressionRecipe]):
+private pure func member_step(state: ParseState, receiver: ExpressionValue) -> (ParseState, PostfixStep):
 	member_entry = state.advanced()
 	if member_entry.current_kind() == NewlineToken:
-		(state, Abandoned(UnsupportedShape(member_entry.stop_at(MemberNameOnNextLine))))
+		(state, AbandonedPostfix(UnsupportedShape(member_entry.stop_at(MemberNameOnNextLine))))
 	else:
 		(after_name, name) = member_entry.consume_referenced_name(NameInFieldName)
 		if after_name.diagnostic_count() != member_entry.diagnostic_count():
-			(after_name, Abandoned(RejectedShape))
+			(after_name, AbandonedPostfix(RejectedShape))
 		else:
-			(after_name, Extended({ span = receiver.span.span_covering(name.span), kind = FieldRecipe(receiver, name) }))
+			(after_use, use) = after_name.finished_name_use(name)
+			(minted, expression) = after_use.finished_expression(receiver.value_span().span_covering(name.span), FieldAccess(receiver.expression, use))
+			(minted, ExtendedPostfix(expression_value(expression)))
 
 
-private pure func delimited_step(
-	state: ParseState, anchor: ExpressionAnchor, receiver: ExpressionRecipe, delimiter: PostfixDelimiter,
-) -> (ParseState, ChainStep[ExpressionRecipe]):
+private pure func delimited_step(state: ParseState, anchor: ExpressionAnchor, receiver: ExpressionValue, delimiter: PostfixDelimiter, context: ExpressionContext, loop_context: BodyContext) -> (ParseState, PostfixStep):
 	opened = state.advanced()
 	match delimiter:
 		CallDelimiter:
-			(after_items, items) = parse_optional_items(opened, PostfixItems(CallDelimiter), anchor)
+			(after_items, items) = parse_optional_items(opened, PostfixItems(CallDelimiter), anchor, loop_context)
 			(closed, closed_items) = after_items.closing_items(items, PostfixItems(CallDelimiter))
-			closed.postfix_items_step(receiver, closed_items, pure func(arguments):
-				CallRecipe(receiver, arguments)
-			)
+			match closed_items:
+				ParsedItems((arguments, end_span)):
+					(minted, expression) = closed.finished_expression(receiver.value_span().span_covering(end_span), Call(receiver.expression, arguments.map(pure func(value): value.expression)))
+					(minted, ExtendedPostfix(expression_value(expression)))
+				UnsupportedItems(stop): (closed, AbandonedPostfix(UnsupportedShape(stop)))
+				RejectedItems: (closed, AbandonedPostfix(RejectedShape))
 		SubscriptDelimiter:
-			(after_items, items) = parse_nonempty_items(opened, PostfixItems(SubscriptDelimiter), anchor)
+			(after_items, items) = parse_nonempty_items(opened, PostfixItems(SubscriptDelimiter), anchor, loop_context)
 			(closed, closed_items) = after_items.closing_items(items, PostfixItems(SubscriptDelimiter))
-			closed.postfix_items_step(receiver, closed_items, pure func(indices):
-				SubscriptRecipe(receiver, indices)
-			)
-
-
-private pure func postfix_items_step[T](
-	state: ParseState, receiver: ExpressionRecipe, items: ItemsParse[(T, Span)], recipe_kind: pure (T) -> RecipeKind,
-) -> (ParseState, ChainStep[ExpressionRecipe]):
-	match items:
-		ParsedItems((values, end_span)):
-			(state, Extended({ span = receiver.span.span_covering(end_span), kind = recipe_kind(values) }))
-		UnsupportedItems(stop):
-			(state, Abandoned(UnsupportedShape(stop)))
-		RejectedItems:
-			(state, Abandoned(RejectedShape))
+			match closed_items:
+				ParsedItems((indices, end_span)):
+					span = receiver.value_span().span_covering(end_span)
+					values: AtLeastOne[Expression] = { first = indices.first.expression, rest = indices.rest.map(pure func(value): value.expression) }
+					if context == StatementContext and closed.current_kind() == EqualSymbol:
+						(minted, place) = closed.finished_subscript_place(span, receiver.expression, values)
+						(minted, CompletedPlace(place))
+					else:
+						(minted, expression) = closed.finished_expression(span, Subscript(receiver.expression, values))
+						(minted, ExtendedPostfix(expression_value(expression)))
+				UnsupportedItems(stop): (closed, AbandonedPostfix(UnsupportedShape(stop)))
+				RejectedItems: (closed, AbandonedPostfix(RejectedShape))
 
 
 private pure func closing_token(delimiter: ItemDelimiter) -> TokenKind:
@@ -435,11 +622,11 @@ private pure func close_items(state: ParseState, delimiter: ItemDelimiter) -> (P
 
 -- Call arguments and list items may be empty; subscript indices may not.
 -- Recursion follows item bracket nesting, never the callee spine.
-private pure func parse_optional_items(state: ParseState, delimiter: ItemDelimiter, anchor: ExpressionAnchor) -> (ParseState, ItemsParse[List[ExpressionRecipe]]):
+private pure func parse_optional_items(state: ParseState, delimiter: ItemDelimiter, anchor: ExpressionAnchor, loop_context: BodyContext) -> (ParseState, ItemsParse[List[ExpressionValue]]):
 	if state.current_kind() == closing_token(delimiter):
 		(state, ParsedItems([]))
 	else:
-		(after_items, items) = parse_nonempty_items(state, delimiter, anchor)
+		(after_items, items) = parse_nonempty_items(state, delimiter, anchor, loop_context)
 		match items:
 			ParsedItems(values):
 				(after_items, ParsedItems(at_least_one_items(values)))
@@ -453,30 +640,48 @@ private pure func parse_optional_items(state: ParseState, delimiter: ItemDelimit
 -- which is how an empty subscript is rejected.
 private pure func parse_nonempty_items(
 	state: ParseState, delimiter: ItemDelimiter, anchor: ExpressionAnchor,
-) -> (ParseState, ItemsParse[AtLeastOne[ExpressionRecipe]]):
+	loop_context: BodyContext,
+) -> (ParseState, ItemsParse[AtLeastOne[ExpressionValue]]):
 	if state.current_kind() == EndOfFileToken:
 		(state.expect_token(closing_token(delimiter), unclosed_delimiter_diagnostic(delimiter)), RejectedItems)
 	else:
 		-- Read directly, not through `expression_item`: this frame is on the stack
 		-- once per level of bracket nesting.
-		(first_state, first) = parse_operators(state, Operators.LOWEST_PRECEDENCE, anchor)
+		(first_state, first) = if state.current_kind() == IfKeyword or state.current_kind() == MatchKeyword:
+			state.nested(refused_value, pure func(inside): parse_control_operand(inside, anchor, loop_context))
+		else:
+			parse_operators(state, Operators.LOWEST_PRECEDENCE, anchor, loop_context)
 		match first:
-			ParsedRecipe(value):
+			ParsedValue(value):
 				items_after(first_state, delimiter, ReportsOnlyUnclosed, value, pure func(current):
-					expression_item(current, anchor)
+					anchored_item(current, anchor, loop_context)
 				)
-			UnsupportedRecipe(stop):
+			UnsupportedValue(stop):
 				(first_state, UnsupportedItems(stop))
-			RejectedRecipe:
+			RejectedValue:
 				(first_state, RejectedItems)
 
 
-private pure func expression_item(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, ItemsParse[ExpressionRecipe]):
-	(after_item, item) = parse_operators(state, Operators.LOWEST_PRECEDENCE, anchor)
+-- Calls, subscripts and lists use the frozen header-anchored entry for each
+-- item: a leading control is the whole item. A grouping, tuple or braced
+-- value enters the operator grammar instead, as does a control on an RHS.
+private pure func anchored_item(state: ParseState, anchor: ExpressionAnchor, loop_context: BodyContext) -> (ParseState, ItemsParse[ExpressionValue]):
+	(after_item, item) = if state.current_kind() == IfKeyword or state.current_kind() == MatchKeyword:
+		state.nested(refused_value, pure func(inside): parse_control_operand(inside, anchor, loop_context))
+	else:
+		parse_operators(state, Operators.LOWEST_PRECEDENCE, anchor, loop_context)
 	match item:
-		ParsedRecipe(value): (after_item, ParsedItems(value))
-		UnsupportedRecipe(stop): (after_item, UnsupportedItems(stop))
-		RejectedRecipe: (after_item, RejectedItems)
+		ParsedValue(value): (after_item, ParsedItems(value))
+		UnsupportedValue(stop): (after_item, UnsupportedItems(stop))
+		RejectedValue: (after_item, RejectedItems)
+
+
+private pure func expression_item(state: ParseState, anchor: ExpressionAnchor, loop_context: BodyContext) -> (ParseState, ItemsParse[ExpressionValue]):
+	(after_item, item) = parse_operators(state, Operators.LOWEST_PRECEDENCE, anchor, loop_context)
+	match item:
+		ParsedValue(value): (after_item, ParsedItems(value))
+		UnsupportedValue(stop): (after_item, UnsupportedItems(stop))
+		RejectedValue: (after_item, RejectedItems)
 
 
 -- The items that follow `first` as comma-separated, with an optional trailing
@@ -532,9 +737,9 @@ private pure func next_item_step[T](
 
 
 -- An interpolated string whose every hole is one clean expression. A hole is
--- lexed and read on its own, so the string's recipe holds hole recipes; any
+-- lexed and read on its own; its expression and hole finish there. Any
 -- hole outside the grammar leaves the whole string unsupported.
-private pure func parse_interpolated_string(state: ParseState, span: Span) -> (ParseState, RecipeParse):
+private pure func parse_interpolated_string(state: ParseState, span: Span, loop_context: BodyContext) -> (ParseState, ValueParse):
 	form: InterpolationForm = if state.current_kind() == InterpolatedPipeStringToken:
 		PipeInterpolation
 	else:
@@ -543,38 +748,39 @@ private pure func parse_interpolated_string(state: ParseState, span: Span) -> (P
 		None:
 			-- The token cursor checked that an interpolated string token indexes a scan.
 			report_unreachable_input("an interpolated string token indexes its scan")
-			(state, UnsupportedRecipe(state.stop_at(MalformedTokenPayload)))
+			(state, UnsupportedValue(state.stop_at(MalformedTokenPayload)))
 		Some(scan):
-			no_pieces: List[InterpolationPieceRecipe] = []
+			no_pieces: List[InterpolationPiece] = []
 			(out, pieces, abandoned) = extend_chain(state, no_pieces, pure func(current, read):
-				interpolation_piece_step(current, scan.pieces, read)
+				interpolation_piece_step(current, scan.pieces, read, loop_context)
 			)
 			match abandoned:
 				None:
-					(out.advanced(), ParsedRecipe({ span = span, kind = InterpolatedRecipe(form, pieces) }))
+					out.advanced().finished_value(span, InterpolatedString(form, pieces))
 				Some(UnsupportedShape(stop)):
-					(state, UnsupportedRecipe(stop))
+					(state, UnsupportedValue(stop))
 				Some(RejectedShape):
 					-- A hole is declined whole, never rejected: `parse_hole` has no rejected outcome.
 					report_unreachable_input("an interpolation piece is abandoned only as unsupported")
-					(state, UnsupportedRecipe(state.stop_at(MalformedTokenPayload)))
+					(state, UnsupportedValue(state.stop_at(MalformedTokenPayload)))
 
 
 -- The next piece of the string, after the `read` ones: a text piece, a hole
--- read to a recipe, or the end. A hole outside the grammar abandons the string.
+-- finished on its own token run, or the end. An unread hole abandons the string.
 private pure func interpolation_piece_step(
-	state: ParseState, pieces: List[ScannedPiece], read: List[InterpolationPieceRecipe],
-) -> (ParseState, ChainStep[List[InterpolationPieceRecipe]]):
+	state: ParseState, pieces: List[ScannedPiece], read: List[InterpolationPiece],
+	loop_context: BodyContext,
+) -> (ParseState, ChainStep[List[InterpolationPiece]]):
 	match pieces.get(read.length()):
 		None:
 			(state, Stopped)
 		Some(ScannedText(text)):
-			(state, Extended(read.append(TextPieceRecipe(text.text))))
+			(state, Extended(read.append(InterpolationText(text.text))))
 		Some(ScannedHole(hole)):
-			(after_hole, value) = state.parse_hole(hole)
+			(after_hole, value) = state.parse_hole(hole, loop_context)
 			match value:
-				Recognized(recipe):
-					(after_hole, Extended(read.append(HolePieceRecipe(hole.span, recipe))))
+				Recognized(written):
+					(after_hole, Extended(read.append(InterpolationHole(written))))
 				Declined(stop):
 					(state, Abandoned(UnsupportedShape(stop)))
 
@@ -582,38 +788,47 @@ private pure func interpolation_piece_step(
 -- One hole's expression: the whole of the hole's own tokens, and nothing else.
 -- A hole that is rejected or declined leaves the string declined; the reason
 -- of a declined hole is the one the hole's own parse gave.
-private pure func parse_hole(state: ParseState, hole: HoleScan) -> (ParseState, Recognition[ExpressionRecipe]):
+private pure func parse_hole(state: ParseState, hole: HoleScan, loop_context: BodyContext) -> (ParseState, Recognition[Hole]):
 	match state.entered_hole(hole):
 		None:
 			(state, Declined(state.stop_at(InterpolationHoleNotLexed)))
 		Some((inside, parked)):
-			(read, parsed) = inside.nested(refused_recipe, pure func(deeper): parse_expression_recipe(deeper, anchored_at(deeper.current_span())))
+			(read, parsed) = inside.nested(refused_value, pure func(deeper): parse_operators(deeper, Operators.LOWEST_PRECEDENCE, anchored_at(deeper.current_span()), loop_context))
 			match parsed:
-				ParsedRecipe(value):
+				ParsedValue(value):
 					if read.current_kind() == EndOfFileToken:
-						(read.left_hole(parked), Recognized(value))
+						(minted, completed) = read.finished_hole(value.expression, hole.span)
+						(minted.left_hole(parked), Recognized(completed))
 					else:
 						(state, Declined(read.stop_at(InterpolationHoleTrailingTokens)))
-				UnsupportedRecipe(stop):
+				UnsupportedValue(stop):
 					(state, Declined(stop))
-				RejectedRecipe:
+				RejectedValue:
 					(state, Declined(inside.rejected_stop(read, InterpolationHoleRejected)))
 
 
-private pure func parse_atom(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
+private pure func parse_atom(state: ParseState, anchor: ExpressionAnchor, loop_context: BodyContext) -> (ParseState, ValueParse):
 	span = state.current_span()
 	match state.current_kind():
-		IdentifierToken:
-			(advanced, name) = state.consume_referenced_name(NameInStatementName)
-			(advanced, ParsedRecipe({ span = span, kind = NameRecipe(name) }))
+		IdentifierToken | AfterKeyword | SealedKeyword | FromKeyword:
+			state.parse_name_atom(span)
+		DebugKeyword:
+			if state.peek_kind(1) == DotSymbol:
+				state.parse_name_atom(span)
+			else:
+				match expression_start_reason(state):
+					Some(reason): (state, UnsupportedValue(state.stop_at(reason)))
+					None:
+						report_unreachable_input("a non-dotted debug atom has a stop reason")
+						(state, UnsupportedValue(state.stop_at(MalformedTokenPayload)))
 		IntLiteralToken | FloatLiteralToken:
 			match state.current_literal():
 				Some(IntegerValue(magnitude)):
-					(state.advanced(), ParsedRecipe({ span = span, kind = IntegerRecipe(magnitude) }))
+					state.advanced().finished_value(span, IntegerLiteral(magnitude))
 				Some(FloatValue(value)):
-					(state.advanced(), ParsedRecipe({ span = span, kind = FloatRecipe(value) }))
+					state.advanced().finished_value(span, FloatLiteral(value))
 				_:
-					(state, UnsupportedRecipe(state.stop_at(MalformedTokenPayload)))
+					(state, UnsupportedValue(state.stop_at(MalformedTokenPayload)))
 		NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken:
 			match state.current_literal():
 				Some(TextValue(text)):
@@ -622,130 +837,164 @@ private pure func parse_atom(state: ParseState, anchor: ExpressionAnchor) -> (Pa
 						PipeStringToken: PipeString
 						RawPipeStringToken: RawPipeString
 						_: QuotedString
-					(state.advanced(), ParsedRecipe({ span = span, kind = StringRecipe(form, text) }))
+					state.advanced().finished_value(span, StringLiteral(form, text))
 				_:
 					-- The token cursor checked that a string token's literal is text.
 					report_unreachable_input("a string token indexes a text literal")
-					(state, UnsupportedRecipe(state.stop_at(MalformedTokenPayload)))
+					(state, UnsupportedValue(state.stop_at(MalformedTokenPayload)))
 		InterpolatedStringToken | InterpolatedPipeStringToken:
-			state.parse_interpolated_string(span)
+			state.parse_interpolated_string(span, loop_context)
 		CharLiteralToken:
 			-- The token cursor validated the payload as a Unicode scalar value.
-			(state.advanced(), ParsedRecipe({ span = span, kind = CharacterRecipe(to_char(state.current_token().payload)) }))
+			state.advanced().finished_value(span, CharacterLiteral(to_char(state.current_token().payload)))
 		FuncKeyword | PureKeyword:
-			state.nested(refused_recipe, pure func(inside): parse_lambda_atom(inside, anchor))
+			state.nested(refused_value, pure func(inside): parse_lambda_atom(inside, anchor))
 		TrueKeyword | FalseKeyword:
-			(state.advanced(), ParsedRecipe({ span = span, kind = BooleanRecipe(state.current_kind() == TrueKeyword) }))
+			state.advanced().finished_value(span, BooleanLiteral(state.current_kind() == TrueKeyword))
 		VoidKeyword | UnderscoreSymbol:
-			(state.advanced(), ParsedRecipe({ span = span, kind = VoidRecipe }))
-		MinusSymbol | NotKeyword:
-			state.nested(refused_recipe, pure func(inside): parse_prefix_operator(inside, anchor, span))
-		DetachKeyword:
-			state.nested(refused_recipe, pure func(inside): parse_detach(inside, anchor, span))
+			state.advanced().finished_value(span, VoidValue)
 		LeftParenSymbol:
-			state.nested(refused_recipe, pure func(inside): parse_parenthesized(inside, span))
+			state.nested(refused_value, pure func(inside): parse_parenthesized(inside, span, loop_context))
 		LeftBracketSymbol:
-			state.nested(refused_recipe, pure func(inside): parse_list_literal(inside, span))
+			state.nested(refused_value, pure func(inside): parse_list_literal(inside, span, loop_context))
 		LeftBraceSymbol:
-			state.nested(refused_recipe, pure func(inside): parse_braced(inside, span))
+			state.nested(refused_value, pure func(inside): parse_braced(inside, span, loop_context))
+		BuiltinKeyword:
+			state.parse_builtin(span)
+		IntoOpaqueKeyword | FromOpaqueKeyword:
+			state.nested(refused_value, pure func(inside): parse_opaque_conversion(inside, span, loop_context))
 		IfKeyword | MatchKeyword:
-			state.nested(refused_recipe, pure func(inside): parse_control_operand(inside, anchor))
+			state.nested(refused_value, pure func(inside): parse_control_operand(inside, anchor, loop_context))
 		EndOfFileToken | RightParenSymbol | RightBracketSymbol:
-			(state.report_at_current(ExpectedExpressionDiagnostic), RejectedRecipe)
+			(state.report_at_current(ExpectedExpressionDiagnostic), RejectedValue)
 		_:
 			match expression_start_reason(state):
 				Some(reason):
-					(state, UnsupportedRecipe(state.stop_at(reason)))
+					(state, UnsupportedValue(state.stop_at(reason)))
 				None:
 					-- Every kind the arms above read has no reason; the others are named in full.
 					report_unreachable_input("an atom token the parser reads has an arm")
-					(state, UnsupportedRecipe(state.stop_at(MalformedTokenPayload)))
+					(state, UnsupportedValue(state.stop_at(MalformedTokenPayload)))
+
+
+-- Only the frozen primary-name arms call this role: `from` is a name here,
+-- while it remains reserved in binder, field and member name positions.
+private pure func parse_name_atom(state: ParseState, span: Span) -> (ParseState, ValueParse):
+	(advanced, name) = state.consume_name(ExpressionName, NameInStatementName)
+	(used, use) = advanced.finished_name_use(name)
+	used.finished_value(span, NameReference(use))
+
+
+-- Marker parentheses hold literal metadata, so they add no expression nesting.
+private pure func parse_builtin(state: ParseState, span: Span) -> (ParseState, ValueParse):
+	entry = state.advanced()
+	if entry.current_kind() != LeftParenSymbol:
+		entry.finished_value(span, CompilerBuiltin(None))
+	else:
+		marker_state = entry.advanced()
+		marker: Option[String] = match marker_state.current_kind():
+			NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken:
+				match marker_state.current_literal():
+					Some(TextValue(text)): Some(text)
+					_: None
+			_: marker_state.current_builtin_marker_text()
+		match marker:
+			Some(text):
+				after_marker = marker_state.advanced()
+				if after_marker.current_kind() == RightParenSymbol:
+					after_marker.advanced().finished_value(span.span_covering(after_marker.current_span()), CompilerBuiltin(Some(text)))
+				else:
+					(after_marker.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInBuiltinName)), RejectedValue)
+			None:
+				after_error = marker_state.report_and_recover(ExpectedBuiltinNameDiagnostic)
+				(after_error.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInBuiltinName)), RejectedValue)
+
+
+-- Types finish first, then the value at its own expression anchor. A type's
+-- recovery syntax must not escape as an accepted conversion; public rejection
+-- retains its diagnostics while restoring the caller's mint authority.
+private pure func parse_opaque_conversion(state: ParseState, span: Span, loop_context: BodyContext) -> (ParseState, ValueParse):
+	direction = if state.current_kind() == IntoOpaqueKeyword:
+		IntoOpaque
+	else:
+		FromOpaque
+	(after_type, written) = parse_type(state.advanced())
+	if after_type.diagnostic_count() != state.diagnostic_count():
+		(after_type, RejectedValue)
+	else if after_type.current_kind() != LeftParenSymbol:
+		(after_type.expect_token(LeftParenSymbol, ExpectedLeftParen(LeftParenInOpaqueConversionType)), RejectedValue)
+	else:
+		value_entry = after_type.advanced()
+		(after_value, result) = parse_operators(value_entry, Operators.LOWEST_PRECEDENCE, anchored_at(value_entry.current_span()), loop_context)
+		match result:
+			ParsedValue(value):
+				if after_value.current_kind() == RightParenSymbol:
+					after_value.advanced().finished_value(span.span_covering(after_value.current_span()), OpaqueConversion(direction, written, value.expression))
+				else if after_value.current_kind() == EndOfFileToken:
+					(after_value.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInOpaqueConversionValue)), RejectedValue)
+				else:
+					(after_value, UnsupportedValue(after_value.stop_at(UnexpectedTokenInBrackets)))
+			_:
+				(after_value, result)
 
 
 -- The atoms that nest, counted once each by `parse_atom` (section 3.14).
-private pure func parse_lambda_atom(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
-	(remaining, lambda) = parse_lambda_recipe(state, anchor)
+private pure func parse_lambda_atom(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, ValueParse):
+	(remaining, lambda) = parse_lambda(state, anchor)
 	match lambda:
-		ParsedLambda(recipe):
-			(remaining, ParsedRecipe({ span = recipe.span, kind = LambdaAtomRecipe(recipe) }))
-		UnsupportedLambda(stop):
-			(state, UnsupportedRecipe(stop))
-
-
-private pure func parse_prefix_operator(state: ParseState, anchor: ExpressionAnchor, span: Span) -> (ParseState, RecipeParse):
-	operator = if state.current_kind() == MinusSymbol:
-		Negate
-	else:
-		LogicalNot
-	(parsed, operand) = parse_prefix(state.advanced(), anchor)
-	match operand:
-		ParsedRecipe(value):
-			(parsed, ParsedRecipe({ span = span.span_covering(value.span), kind = UnaryRecipe(operator, value) }))
-		_:
-			(parsed, operand)
-
-
-private pure func parse_detach(state: ParseState, anchor: ExpressionAnchor, span: Span) -> (ParseState, RecipeParse):
-	(parsed, operand) = parse_prefix(state.advanced(), anchor)
-	match operand:
-		ParsedRecipe(value):
-			(parsed, ParsedRecipe({ span = span.span_covering(value.span), kind = DetachRecipe(value) }))
-		_:
-			(parsed, operand)
+		ParsedLambda(expression): (remaining, ParsedValue(expression_value(expression)))
+		UnsupportedLambda(stop): (state, UnsupportedValue(stop))
 
 
 -- An `if` or `match` as an operand. Its blocks end on dedents, so what the
--- expression may do afterwards is decided by the control reader (an operator
--- after the last block declines) and by `ends_in_dedent`, which stops the
--- operator and postfix chains there. Its twin for a whole statement value is
+-- expression may do afterwards is decided by the enclosing operator loop;
+-- `ends_in_dedent` still stops postfix chains there. Its twin for a whole statement value is
 -- `parse_value` in the body parser.
-private pure func parse_control_operand(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, RecipeParse):
-	(remaining, control) = parse_control_recipe(state, PastExpressionAnchor(anchor))
+private pure func parse_control_operand(state: ParseState, anchor: ExpressionAnchor, loop_context: BodyContext) -> (ParseState, ValueParse):
+	(remaining, control) = parse_control(state, PastExpressionAnchor(anchor), loop_context)
 	match control:
-		Recognized(written):
-			(remaining, ParsedRecipe(control_expression(written)))
-		Declined(stop):
-			(state, UnsupportedRecipe(stop))
+		Recognized(expression): (remaining, ParsedValue(expression_value(expression)))
+		Declined(stop): (state, UnsupportedValue(stop))
 
 
 -- The arms below are functions of their own, not inline in `parse_atom`: that
 -- frame is on the native stack once for every level of bracket nesting, and
 -- the nesting limit (section 3.14) has to fit the Linux stack.
-private pure func parse_parenthesized(state: ParseState, span: Span) -> (ParseState, RecipeParse):
+private pure func parse_parenthesized(state: ParseState, span: Span, loop_context: BodyContext) -> (ParseState, ValueParse):
 	opened = state.advanced()
 	if opened.current_kind() == RightParenSymbol:
-		(opened.advanced(), ParsedRecipe({ span = span.span_covering(opened.current_span()), kind = VoidRecipe }))
+		opened.advanced().finished_value(span.span_covering(opened.current_span()), VoidValue)
 	else:
-		(parsed, inner) = parse_operators(opened, Operators.LOWEST_PRECEDENCE, anchored_at(span))
+		(parsed, inner) = parse_operators(opened, Operators.LOWEST_PRECEDENCE, anchored_at(span), loop_context)
 		match inner:
-			ParsedRecipe(value):
+			ParsedValue(value):
 				if parsed.current_kind() == CommaSymbol:
-					parsed.parse_tuple_rest(span, value)
+					parsed.parse_tuple_rest(span, value, loop_context)
 				else if parsed.current_kind() == RightParenSymbol:
 					-- Names retain their token span through every grouping layer.
-					group_span = if value.keeps_token_span():
-						value.span
+					group_span = if value.keeps_name_span:
+						value.value_span()
 					else:
 						span.span_covering(parsed.current_span())
-					(parsed.advanced(), ParsedRecipe({ span = group_span, kind = GroupingRecipe(value) }))
+					(parsed.advanced(), ParsedValue({ value | expression = { value.expression | span = group_span }, root = GroupedRoot, tail = PlainOperand }))
 				else if parsed.current_kind() == EndOfFileToken:
-					(parsed.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInGroupedExpression)), RejectedRecipe)
+					(parsed.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInGroupedExpression)), RejectedValue)
 				else:
-					(parsed, UnsupportedRecipe(parsed.stop_at(UnexpectedTokenInBrackets)))
+					(parsed, UnsupportedValue(parsed.stop_at(UnexpectedTokenInBrackets)))
 			_:
 				(parsed, inner)
 
 
-private pure func parse_list_literal(state: ParseState, span: Span) -> (ParseState, RecipeParse):
-	(after_items, items) = parse_optional_items(state.advanced(), ListItems, anchored_at(span))
+private pure func parse_list_literal(state: ParseState, span: Span, loop_context: BodyContext) -> (ParseState, ValueParse):
+	(after_items, items) = parse_optional_items(state.advanced(), ListItems, anchored_at(span), loop_context)
 	(closed, closed_items) = after_items.closing_items(items, ListItems)
 	match closed_items:
 		ParsedItems((elements, end_span)):
-			(closed, ParsedRecipe({ span = span.span_covering(end_span), kind = ListRecipe(elements) }))
+			closed.finished_value(span.span_covering(end_span), ListLiteral(elements.map(pure func(value): value.expression)))
 		UnsupportedItems(stop):
-			(closed, UnsupportedRecipe(stop))
+			(closed, UnsupportedValue(stop))
 		RejectedItems:
-			(closed, RejectedRecipe)
+			(closed, RejectedValue)
 
 
 -- A field name that is a soft keyword (`{on = 1}`) does not start a record
@@ -754,113 +1003,107 @@ private pure func parse_list_literal(state: ParseState, span: Span) -> (ParseSta
 -- (`{record | name = value}`), a dict literal (`{key => value}`) or a vector
 -- literal (`{a, b}`), told apart as the frozen parser does: by a leading
 -- `name =`, then by the token after the first expression.
-private pure func parse_braced(state: ParseState, open_span: Span) -> (ParseState, RecipeParse):
+private pure func parse_braced(state: ParseState, open_span: Span, loop_context: BodyContext) -> (ParseState, ValueParse):
 	opened = state.advanced()
 	if opened.current_kind() == RightBraceSymbol:
-		(opened.advanced(), ParsedRecipe({ span = open_span.span_covering(opened.current_span()), kind = RecordRecipe([]) }))
+		opened.advanced().finished_value(open_span.span_covering(opened.current_span()), RecordLiteral([]))
 	else if opened.starts_field():
-		(after_items, items) = record_fields_from(opened, RecordForm)
-		braced_recipe(after_items, items, RecordForm, open_span, pure func(fields):
+		(after_items, items) = record_fields_from(opened, RecordForm, loop_context)
+		parse_braced_items(after_items, items, RecordForm, open_span, pure func(fields):
 			fields.without_repeats().map(pure func(distinct):
-				RecordRecipe(at_least_one_items(distinct))
+				RecordLiteral(at_least_one_items(distinct))
 			)
 		)
 	else if opened.current_kind() == EndOfFileToken:
 		-- The frozen parser reads a missing first item before the missing brace.
 		missing = opened.report_at_current(ExpectedExpressionDiagnostic)
-		(missing.expect_token(RightBraceSymbol, unclosed_delimiter_diagnostic(BracedItems(VectorForm))), RejectedRecipe)
-	else if opened.starts_soft_keyword_field():
-		(state, UnsupportedRecipe(opened.stop_at(SoftKeywordFieldName)))
+		(missing.expect_token(RightBraceSymbol, unclosed_delimiter_diagnostic(BracedItems(VectorForm))), RejectedValue)
 	else:
-		(after_first, first) = parse_operators(opened, Operators.LOWEST_PRECEDENCE, anchored_at(opened.current_span()))
+		(after_first, first) = parse_operators(opened, Operators.LOWEST_PRECEDENCE, anchored_at(opened.current_span()), loop_context)
 		match first:
-			ParsedRecipe(value):
-				parse_braced_after_first(after_first, open_span, value)
-			UnsupportedRecipe(stop):
-				(after_first, UnsupportedRecipe(stop))
-			RejectedRecipe:
-				(after_first, RejectedRecipe)
+			ParsedValue(value):
+				parse_braced_after_first(after_first, open_span, value, loop_context)
+			UnsupportedValue(stop):
+				(after_first, UnsupportedValue(stop))
+			RejectedValue:
+				(after_first, RejectedValue)
 
 
 -- The token after the first expression picks the form: `=>` a dict, `|` a
 -- record update, anything else a vector.
 private pure func parse_braced_after_first(
-	state: ParseState, open_span: Span, first: ExpressionRecipe,
-) -> (ParseState, RecipeParse):
+	state: ParseState, open_span: Span, first: ExpressionValue,
+	loop_context: BodyContext,
+) -> (ParseState, ValueParse):
 	match state.current_kind():
 		FatArrowSymbol:
-			(after_items, items) = dict_entries_from(state, first)
-			braced_recipe(after_items, items, DictForm, open_span, pure func(entries):
-				Some(DictRecipe(entries))
+			(after_items, items) = dict_entries_from(state, first, loop_context)
+			parse_braced_items(after_items, items, DictForm, open_span, pure func(entries):
+				Some(DictLiteral(at_least_one_items(entries)))
 			)
 		PipeSymbol:
 			after_bar = state.advanced()
 			if after_bar.current_kind() == EndOfFileToken:
-				(after_bar.expect_token(RightBraceSymbol, unclosed_delimiter_diagnostic(BracedItems(UpdateForm))), RejectedRecipe)
+				(after_bar.expect_token(RightBraceSymbol, unclosed_delimiter_diagnostic(BracedItems(UpdateForm))), RejectedValue)
 			else:
-				(after_items, items) = record_fields_from(after_bar, UpdateForm)
-				braced_recipe(after_items, items, UpdateForm, open_span, pure func(fields):
+				(after_items, items) = record_fields_from(after_bar, UpdateForm, loop_context)
+				parse_braced_items(after_items, items, UpdateForm, open_span, pure func(fields):
 					fields.without_repeats().map(pure func(distinct):
-						UpdateRecipe(first, distinct)
+						RecordUpdate(first.expression, at_least_one_items(distinct))
 					)
 				)
 		_:
 			(after_items, items) = items_after(state, BracedItems(VectorForm), CountsAsMissingItem, first, pure func(current):
-				expression_item(current, anchored_at(current.current_span()))
+				expression_item(current, anchored_at(current.current_span()), loop_context)
 			)
-			braced_recipe(after_items, items, VectorForm, open_span, pure func(elements):
-				Some(VectorRecipe(elements))
+			parse_braced_items(after_items, items, VectorForm, open_span, pure func(elements):
+				Some(VectorLiteral(at_least_one_items(elements).map(pure func(value): value.expression)))
 			)
 
 
 private pure func starts_field(state: ParseState) -> Bool:
-	state.current_kind() == IdentifierToken and state.peek_kind(1) == EqualSymbol
-
-
--- A soft keyword used as a field name: it is a keyword token, not an identifier.
-private pure func starts_soft_keyword_field(state: ParseState) -> Bool:
-	state.current_kind().is_soft_keyword() and state.peek_kind(1) == EqualSymbol
+	(state.current_kind() == IdentifierToken or state.current_kind().is_soft_keyword()) and state.peek_kind(1) == EqualSymbol
 
 
 -- Close a braced form's items and wrap them. A form whose items were already
--- reported as a rejection (a repeated record field) has no recipe, and is
+-- reported as a rejection (a repeated record field) has no accepted owner, and is
 -- rejected after its closing brace, so the frozen parser's diagnostics keep
 -- their order.
-private pure func braced_recipe[T](
+private pure func parse_braced_items[T](
 	state: ParseState, items: ItemsParse[T], form: BracedForm, open_span: Span,
-	recipe_kind: pure (T) -> Option[RecipeKind],
-) -> (ParseState, RecipeParse):
+	expression_kind: pure (T) -> Option[ExpressionKind],
+) -> (ParseState, ValueParse):
 	(closed, closed_items) = state.closing_items(items, BracedItems(form))
 	match closed_items:
 		ParsedItems((values, end_span)):
-			match recipe_kind(values):
-				Some(kind): (closed, ParsedRecipe({ span = open_span.span_covering(end_span), kind = kind }))
-				None: (closed, RejectedRecipe)
+			match expression_kind(values):
+				Some(kind): closed.finished_value(open_span.span_covering(end_span), kind)
+				None: (closed, RejectedValue)
 		UnsupportedItems(stop):
-			(closed, UnsupportedRecipe(stop))
+			(closed, UnsupportedValue(stop))
 		RejectedItems:
-			(closed, RejectedRecipe)
+			(closed, RejectedValue)
 
 
 -- Record fields, or fields that repeat a name. Repetition is reported where
 -- the fields end, but the record is still read to its closing brace.
 private union FieldList:
-	DistinctFields(AtLeastOne[RecordFieldRecipe])
+	DistinctFields(AtLeastOne[NamedValue])
 	RepeatedFields
 
 
-private pure func without_repeats(fields: FieldList) -> Option[AtLeastOne[RecordFieldRecipe]]:
+private pure func without_repeats(fields: FieldList) -> Option[AtLeastOne[NamedValue]]:
 	match fields:
 		DistinctFields(distinct): Some(distinct)
 		RepeatedFields: None
 
 
-private pure func record_fields_from(state: ParseState, form: BracedForm) -> (ParseState, ItemsParse[FieldList]):
-	(first_state, first) = field_item(state)
+private pure func record_fields_from(state: ParseState, form: BracedForm, loop_context: BodyContext) -> (ParseState, ItemsParse[FieldList]):
+	(first_state, first) = field_item(state, loop_context)
 	match first:
 		ParsedItems(value):
 			(after_fields, fields) = items_after(first_state, BracedItems(form), ReportsOnlyUnclosed, value, pure func(current):
-				field_item(current)
+				field_item(current, loop_context)
 			)
 			match fields:
 				ParsedItems(read_fields):
@@ -878,14 +1121,14 @@ private pure func record_fields_from(state: ParseState, form: BracedForm) -> (Pa
 
 -- Each later field that repeats an earlier name is reported at its own name,
 -- pointing at the first field of that name.
-private pure func reported_repeated_fields(state: ParseState, fields: AtLeastOne[RecordFieldRecipe]) -> (ParseState, FieldList):
+private pure func reported_repeated_fields(state: ParseState, fields: AtLeastOne[NamedValue]) -> (ParseState, FieldList):
 	var out = state
-	var seen: List[RecordFieldRecipe] = []
+	var seen: List[NamedValue] = []
 	var repeated = False
 	for field in at_least_one_items(fields):
-		match seen.first_named(field.name):
+		match seen.first_named(field.name.name):
 			Some(earlier):
-				out = out.report_diagnostic(field.name.span, DuplicateFieldGiven(earlier.name.span))
+				out = out.report_diagnostic(field.name.name.span, DuplicateFieldGiven(earlier.name.name.span))
 				repeated = True
 			None:
 				void
@@ -898,27 +1141,24 @@ private pure func reported_repeated_fields(state: ParseState, fields: AtLeastOne
 
 -- Spellings are per module, and a parse covers one module, so the spelling
 -- index identifies a name.
-private pure func first_named(fields: List[RecordFieldRecipe], name: WrittenName) -> Option[RecordFieldRecipe]:
-	var first: Option[RecordFieldRecipe] = None
+private pure func first_named(fields: List[NamedValue], name: WrittenName) -> Option[NamedValue]:
+	var first: Option[NamedValue] = None
 	for field in fields:
-		if first.is_none() and spelling_index(field.name.spelling) == spelling_index(name.spelling):
+		if first.is_none() and spelling_index(field.name.name.spelling) == spelling_index(name.spelling):
 			first = Some(field)
 	first
 
 
-private pure func field_item(state: ParseState) -> (ParseState, ItemsParse[RecordFieldRecipe]):
+private pure func field_item(state: ParseState, loop_context: BodyContext) -> (ParseState, ItemsParse[NamedValue]):
 	if not state.starts_field():
-		reason = if state.starts_soft_keyword_field():
-			SoftKeywordFieldName
-		else:
-			UnexpectedTokenInBrackets
-		(state, UnsupportedItems(state.stop_at(reason)))
+		(state, UnsupportedItems(state.stop_at(UnexpectedTokenInBrackets)))
 	else:
 		(after_name, name) = state.consume_referenced_name(NameInRecordFieldName)
-		(after_value, value) = expression_item(after_name.advanced(), anchored_at(after_name.advanced().current_span()))
+		(used, use) = after_name.finished_name_use(name)
+		(after_value, value) = expression_item(used.advanced(), anchored_at(after_name.advanced().current_span()), loop_context)
 		match value:
-			ParsedItems(recipe):
-				(after_value, ParsedItems({ name = name, value = recipe, span = name.span.span_covering(recipe.span) }))
+			ParsedItems(written):
+				(after_value, ParsedItems({ name = use, value = written.expression, span = name.span.span_covering(written.value_span()) }))
 			UnsupportedItems(stop):
 				(after_value, UnsupportedItems(stop))
 			RejectedItems:
@@ -927,12 +1167,12 @@ private pure func field_item(state: ParseState) -> (ParseState, ItemsParse[Recor
 
 -- Dict entries from the first key, which the caller read and which is
 -- followed by `=>`.
-private pure func dict_entries_from(state: ParseState, first_key: ExpressionRecipe) -> (ParseState, ItemsParse[AtLeastOne[EntryRecipe]]):
-	(first_state, first) = entry_after_key(state, first_key)
+private pure func dict_entries_from(state: ParseState, first_key: ExpressionValue, loop_context: BodyContext) -> (ParseState, ItemsParse[AtLeastOne[DictEntry]]):
+	(first_state, first) = entry_after_key(state, first_key, loop_context)
 	match first:
 		ParsedItems(entry):
 			items_after(first_state, BracedItems(DictForm), CountsAsMissingItem, entry, pure func(current):
-				entry_item(current)
+				entry_item(current, loop_context)
 			)
 		UnsupportedItems(stop):
 			(first_state, UnsupportedItems(stop))
@@ -940,11 +1180,11 @@ private pure func dict_entries_from(state: ParseState, first_key: ExpressionReci
 			(first_state, RejectedItems)
 
 
-private pure func entry_item(state: ParseState) -> (ParseState, ItemsParse[EntryRecipe]):
-	(after_key, key) = expression_item(state, anchored_at(state.current_span()))
+private pure func entry_item(state: ParseState, loop_context: BodyContext) -> (ParseState, ItemsParse[DictEntry]):
+	(after_key, key) = expression_item(state, anchored_at(state.current_span()), loop_context)
 	match key:
-		ParsedItems(recipe):
-			entry_after_key(after_key, recipe)
+		ParsedItems(written):
+			entry_after_key(after_key, written, loop_context)
 		UnsupportedItems(stop):
 			(after_key, UnsupportedItems(stop))
 		RejectedItems:
@@ -952,14 +1192,14 @@ private pure func entry_item(state: ParseState) -> (ParseState, ItemsParse[Entry
 
 
 -- `=> value` after a key. The frozen parser reports a missing arrow; this slice defers it.
-private pure func entry_after_key(state: ParseState, key: ExpressionRecipe) -> (ParseState, ItemsParse[EntryRecipe]):
+private pure func entry_after_key(state: ParseState, key: ExpressionValue, loop_context: BodyContext) -> (ParseState, ItemsParse[DictEntry]):
 	if state.current_kind() != FatArrowSymbol:
 		(state, UnsupportedItems(state.stop_at(MissingDictArrow)))
 	else:
-		(after_value, value) = expression_item(state.advanced(), anchored_at(state.advanced().current_span()))
+		(after_value, value) = expression_item(state.advanced(), anchored_at(state.advanced().current_span()), loop_context)
 		match value:
-			ParsedItems(recipe):
-				(after_value, ParsedItems({ key = key, value = recipe, span = key.span.span_covering(recipe.span) }))
+			ParsedItems(written):
+				(after_value, ParsedItems({ key = key.expression, value = written.expression, span = key.value_span().span_covering(written.value_span()) }))
 			UnsupportedItems(stop):
 				(after_value, UnsupportedItems(stop))
 			RejectedItems:
@@ -970,230 +1210,48 @@ private pure func entry_after_key(state: ParseState, key: ExpressionRecipe) -> (
 -- a grouping. The frozen parser reads every item before judging arity, so an
 -- out-of-range count is rejected only once the closing parenthesis (or the
 -- end of source) is reached, with the same diagnostics and spans. Elements are
--- kept ID-free: a rejected tuple issues no IDs, and a one-element `(x,)` or a
--- tuple of more than four elements has no `TupleLiteral` to hold it.
+-- finished in source order. Rejection discards the entire trial mint; a
+-- one-element `(x,)` or a longer tuple never finishes a TupleLiteral owner.
 private pure func parse_tuple_rest(
-	state: ParseState, open_span: Span, first: ExpressionRecipe,
-) -> (ParseState, RecipeParse):
+	state: ParseState, open_span: Span, first: ExpressionValue,
+	loop_context: BodyContext,
+) -> (ParseState, ValueParse):
 	(after_items, items) = items_after(state, TupleItems, CountsAsMissingItem, first, pure func(current):
-		expression_item(current, anchored_at(open_span))
+		expression_item(current, anchored_at(open_span), loop_context)
 	)
 	match items:
 		UnsupportedItems(stop):
-			(after_items, UnsupportedRecipe(stop))
+			(after_items, UnsupportedValue(stop))
 		RejectedItems:
-			(after_items, RejectedRecipe)
+			(after_items, RejectedValue)
 		ParsedItems(read_items):
 			rest = read_items.rest
 			if after_items.current_kind() == RightParenSymbol:
 				span = open_span.span_covering(after_items.current_span())
 				(counted, tuple) = after_items.advanced().counted_tuple(span, first, rest)
 				match tuple:
-					Some(elements): (counted, ParsedRecipe({ span = span, kind = TupleRecipe(elements) }))
-					None: (counted, RejectedRecipe)
+					Some(elements): counted.finished_value(span, TupleLiteral(elements))
+					None: (counted, RejectedValue)
 			else if after_items.current_kind() == EndOfFileToken:
 				unclosed = after_items.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInTupleExpression))
-				(counted, _) = unclosed.counted_tuple(open_span.span_covering(first.span), first, rest)
-				(counted, RejectedRecipe)
+				(counted, _) = unclosed.counted_tuple(open_span.span_covering(first.value_span()), first, rest)
+				(counted, RejectedValue)
 			else:
-				(after_items, UnsupportedRecipe(after_items.stop_at(UnexpectedTokenInBrackets)))
+				(after_items, UnsupportedValue(after_items.stop_at(UnexpectedTokenInBrackets)))
 
 
 -- A tuple holds two to four elements. Any other count is reported over the
 -- tuple's span, a single element as `(x,)` and a longer one as an arity error,
 -- and has no tuple to return.
 private pure func counted_tuple(
-	state: ParseState, span: Span, first: ExpressionRecipe, rest: List[ExpressionRecipe],
-) -> (ParseState, Option[SmallTuple[ExpressionRecipe]]):
+	state: ParseState, span: Span, first: ExpressionValue, rest: List[ExpressionValue],
+) -> (ParseState, Option[SmallTuple[Expression]]):
 	match rest:
 		[]: (state.report_diagnostic(span, Plain(SingletonTupleDiagnostic)), None)
-		[second]: (state, Some(Pair(first, second)))
-		[second, third]: (state, Some(Triple(first, second, third)))
-		[second, third, fourth]: (state, Some(Quadruple(first, second, third, fourth)))
+		[second]: (state, Some(Pair(first.expression, second.expression)))
+		[second, third]: (state, Some(Triple(first.expression, second.expression, third.expression)))
+		[second, third, fourth]: (state, Some(Quadruple(first.expression, second.expression, third.expression, fourth.expression)))
 		_: (state.report_diagnostic(span, Plain(TupleArityDiagnostic)), None)
-
-
--- The parser and every later walker must loop over left spines: binary
--- operands and the receivers of member access, calls and subscripts. Frames
--- are folded inside out, preserving the frozen parser's postorder ID issuance.
-pure func mint_recipe(state: ParseState, recipe: ExpressionRecipe) -> (ParseState, Expression):
-	var base = recipe
-	var frames: List[SpineFrame] = []
-	var walking = True
-	while walking:
-		match base.kind:
-			BinaryRecipe(operator, left, right):
-				frames = frames.append(BinaryFrame(base.span, operator, right))
-				base = left
-			CallRecipe(callee, args):
-				frames = frames.append(CallFrame(base.span, args))
-				base = callee
-			FieldRecipe(receiver, name):
-				frames = frames.append(FieldFrame(base.span, name))
-				base = receiver
-			SubscriptRecipe(receiver, indices):
-				frames = frames.append(SubscriptFrame(base.span, indices))
-				base = receiver
-			_:
-				walking = False
-	(parsed, value) = state.mint_nonbinary_recipe(base)
-	var out = parsed
-	var left = value
-	for frame in frames.reverse():
-		match frame:
-			BinaryFrame(span, operator, right_recipe):
-				(after_right, right) = out.mint_recipe(right_recipe)
-				(minted, parent) = after_right.finished_expression(span, operator_expression_kind(operator, left, right))
-				out = minted
-				left = parent
-			FieldFrame(span, name):
-				(after_name, use) = out.finished_name_use(name)
-				(minted, parent) = after_name.finished_expression(span, FieldAccess(left, use))
-				out = minted
-				left = parent
-			CallFrame(span, args):
-				var values: List[Expression] = []
-				for argument in args:
-					(after_arg, value) = out.mint_recipe(argument)
-					out = after_arg
-					values = values.append(value)
-				(minted, parent) = out.finished_expression(span, Call(left, values))
-				out = minted
-				left = parent
-			SubscriptFrame(span, indices):
-				(after_first, first) = out.mint_recipe(indices.first)
-				out = after_first
-				var rest: List[Expression] = []
-				for index in indices.rest:
-					(after_index, value) = out.mint_recipe(index)
-					out = after_index
-					rest = rest.append(value)
-				(minted, parent) = out.finished_expression(span, Subscript(left, { first = first, rest = rest }))
-				out = minted
-				left = parent
-	(out, left)
-
-
-private pure func mint_nonbinary_recipe(state: ParseState, recipe: ExpressionRecipe) -> (ParseState, Expression):
-	match recipe.kind:
-		NameRecipe(name):
-			(after_use, use) = state.finished_name_use(name)
-			after_use.finished_expression(recipe.span, NameReference(use))
-		IntegerRecipe(magnitude): state.finished_expression(recipe.span, IntegerLiteral(magnitude))
-		FloatRecipe(value): state.finished_expression(recipe.span, FloatLiteral(value))
-		StringRecipe(form, text): state.finished_expression(recipe.span, StringLiteral(form, text))
-		CharacterRecipe(character): state.finished_expression(recipe.span, CharacterLiteral(character))
-		InterpolatedRecipe(form, pieces):
-			var out: ParseState = state
-			var minted: List[InterpolationPiece] = []
-			for piece in pieces:
-				match piece:
-					TextPieceRecipe(text):
-						minted = minted.append(InterpolationText(text))
-					HolePieceRecipe(hole_span, value_recipe):
-						(after_value, value) = mint_recipe(out, value_recipe)
-						(after_hole, hole) = after_value.finished_hole(value, hole_span)
-						out = after_hole
-						minted = minted.append(InterpolationHole(hole))
-			out.finished_expression(recipe.span, InterpolatedString(form, minted))
-		ControlValueRecipe(control): mint_control(state, control)
-		LambdaAtomRecipe(lambda): mint_lambda_recipe(state, lambda)
-		BooleanRecipe(value): state.finished_expression(recipe.span, BooleanLiteral(value))
-		VoidRecipe: state.finished_expression(recipe.span, VoidValue)
-		UnaryRecipe(operator, operand):
-			(parsed, value) = state.mint_recipe(operand)
-			parsed.finished_expression(recipe.span, Unary(operator, value))
-		DetachRecipe(operand):
-			(parsed, value) = state.mint_recipe(operand)
-			parsed.finished_expression(recipe.span, Detach(value))
-		GroupingRecipe(inner):
-			(parsed, value) = state.mint_recipe(inner)
-			(parsed, { value | span = recipe.span })
-		TupleRecipe(items): state.minted_tuple(recipe.span, items)
-		VectorRecipe(items): state.minted_vector(recipe.span, items)
-		RecordRecipe(fields): state.minted_record(recipe.span, fields)
-		UpdateRecipe(base, fields): state.minted_update(recipe.span, base, fields)
-		DictRecipe(entries): state.minted_dict(recipe.span, entries)
-		ListRecipe(items): state.minted_list(recipe.span, items)
-		BinaryRecipe(_, _, _) | CallRecipe(_, _) | FieldRecipe(_, _) | SubscriptRecipe(_, _):
-			-- This recursion boundary is total; mint_recipe owns the left-spine loop.
-			state.mint_recipe(recipe)
-
-
--- Each aggregate is minted by a function of its own, so the frame of
--- `mint_nonbinary_recipe`, which is on the native stack once per level of
--- bracket nesting, stays small enough for the nesting limit (section 3.14) on Linux.
-private pure func minted_tuple(state: ParseState, span: Span, items: SmallTuple[ExpressionRecipe]) -> (ParseState, Expression):
-	match items:
-		Pair(first, second):
-			(after_first, first_value) = state.mint_recipe(first)
-			(after_second, second_value) = after_first.mint_recipe(second)
-			after_second.finished_expression(span, TupleLiteral(Pair(first_value, second_value)))
-		Triple(first, second, third):
-			(after_first, first_value) = state.mint_recipe(first)
-			(after_second, second_value) = after_first.mint_recipe(second)
-			(after_third, third_value) = after_second.mint_recipe(third)
-			after_third.finished_expression(span, TupleLiteral(Triple(first_value, second_value, third_value)))
-		Quadruple(first, second, third, fourth):
-			(after_first, first_value) = state.mint_recipe(first)
-			(after_second, second_value) = after_first.mint_recipe(second)
-			(after_third, third_value) = after_second.mint_recipe(third)
-			(after_fourth, fourth_value) = after_third.mint_recipe(fourth)
-			after_fourth.finished_expression(span, TupleLiteral(Quadruple(first_value, second_value, third_value, fourth_value)))
-
-
-private pure func minted_list(state: ParseState, span: Span, items: List[ExpressionRecipe]) -> (ParseState, Expression):
-	(minted, elements) = state.minted_all(items)
-	minted.finished_expression(span, ListLiteral(elements))
-
-
-private pure func minted_vector(state: ParseState, span: Span, items: AtLeastOne[ExpressionRecipe]) -> (ParseState, Expression):
-	(minted, elements) = state.minted_all(at_least_one_items(items))
-	minted.finished_expression(span, VectorLiteral(elements))
-
-
-private pure func minted_record(state: ParseState, span: Span, fields: List[RecordFieldRecipe]) -> (ParseState, Expression):
-	(minted, values) = state.minted_fields(fields)
-	minted.finished_expression(span, RecordLiteral(values))
-
-
-private pure func minted_update(state: ParseState, span: Span, base: ExpressionRecipe, fields: AtLeastOne[RecordFieldRecipe]) -> (ParseState, Expression):
-	(after_base, base_value) = state.mint_recipe(base)
-	(minted, values) = after_base.minted_fields(at_least_one_items(fields))
-	minted.finished_expression(span, RecordUpdate(base_value, values))
-
-
-private pure func minted_dict(state: ParseState, span: Span, entries: AtLeastOne[EntryRecipe]) -> (ParseState, Expression):
-	var out = state
-	var dict_entries: List[DictEntry] = []
-	for entry in at_least_one_items(entries):
-		(after_key, key) = out.mint_recipe(entry.key)
-		(after_value, value) = after_key.mint_recipe(entry.value)
-		out = after_value
-		dict_entries = dict_entries.append({ key = key, value = value, span = entry.span })
-	out.finished_expression(span, DictLiteral(dict_entries))
-
-
-private pure func minted_all(state: ParseState, recipes: List[ExpressionRecipe]) -> (ParseState, List[Expression]):
-	var out = state
-	var values: List[Expression] = []
-	for recipe in recipes:
-		(after_recipe, value) = out.mint_recipe(recipe)
-		out = after_recipe
-		values = values.append(value)
-	(out, values)
-
-
--- A field's name is minted before its value, in written order.
-private pure func minted_fields(state: ParseState, fields: List[RecordFieldRecipe]) -> (ParseState, List[NamedValue]):
-	var out = state
-	var values: List[NamedValue] = []
-	for field in fields:
-		(after_name, use) = out.finished_name_use(field.name)
-		(after_value, value) = after_name.mint_recipe(field.value)
-		out = after_value
-		values = values.append({ name = use, value = value, span = field.span })
-	(out, values)
 
 
 -- Mapping is exhaustive: logical and range forms never enter ordinary Binary.
@@ -1215,15 +1273,7 @@ private pure func operator_expression_kind(operator: Operators.BinaryOperator, l
 		Operators.GreaterEqualOperator: Binary(GreaterEqual, left, right)
 
 
-private pure func keeps_token_span(recipe: ExpressionRecipe) -> Bool:
-	var inner = recipe
-	var walking = True
-	var keeps = False
-	while walking:
-		match inner.kind:
-			GroupingRecipe(grouped): inner = grouped
-			NameRecipe(_):
-				keeps = True
-				walking = False
-			_: walking = False
-	keeps
+-- Standalone expressions start outside any enclosing loop. Body readers pass
+-- their explicit loop context to parse_scoped_expression.
+pure func parse_expression_with_ending(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, ValueParse, ExpressionEnding):
+	parse_scoped_expression(state, anchor, OutsideLoop)

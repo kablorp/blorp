@@ -1,4 +1,5 @@
--- Top-level header syntax and deferred body evidence, without function/body IDs.
+-- Function heads end at the body entry, without function/body IDs.
+-- Only rejected heads use lexical body recovery to keep the next declaration.
 import:
 	../syntax/declarations: Annotation, Signature, TypeParameter, DimensionConstraint
 	../syntax/module_syntax: Documentation
@@ -7,7 +8,7 @@ import:
 	../tables/span: Span, span_covering
 	../tables/token: TokenKind(DotSymbol, IfKeyword, ElseKeyword, ColonSymbol, ArrowSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken, LeftParenSymbol, RightParenSymbol, LeftBracketSymbol, RightBracketSymbol, LeftBraceSymbol, RightBraceSymbol)
 	parse_state:
-		ParseState, current_kind, current_span, previous_span, position, peek_kind, advanced, diagnostic_count,
+		ParseState, current_kind, current_span, previous_span, peek_kind, advanced, diagnostic_count,
 		consume_declared_name, expect_token, report_expected_after_previous_content, span_start_line, span_start_column
 	tree_type_parameter_parser: TypeParametersParse(NoTypeParameters, ParsedTypeParameters, RejectedTypeParameters), parse_type_parameters
 	tree_signature_parser: SignatureParse(ParsedSignature, RejectedSignature), parse_signature
@@ -28,48 +29,28 @@ record FunctionHeader {
 }
 
 
-opaque type DeferredBody = DeferredBodyContents
-
-private record DeferredBodyContents {
-	span: Span,
-	token_start: Int,
-	token_end: Int
-}
-
-
-union FunctionBodyExtent:
+fixed union FunctionBodyPresence:
 	ForwardDeclaration
-	SkippedBody(DeferredBody)
+	BodyFollows
 
 
-record FunctionHeaderPreview {
+record FunctionHead {
 	header: FunctionHeader,
-	body_extent: FunctionBodyExtent
+	body_presence: FunctionBodyPresence
 }
 
 
-union FunctionHeaderParse:
-	ParsedFunctionHeader(FunctionHeaderPreview)
-	RejectedFunctionHeader
+union FunctionHeadParse:
+	ParsedFunctionHead(FunctionHead)
+	RejectedFunctionHead
 
 
-pure func deferred_body_span(body: DeferredBody) -> Span:
-	from_opaque DeferredBody(body).span
-
-
-pure func deferred_body_token_start(body: DeferredBody) -> Int:
-	from_opaque DeferredBody(body).token_start
-
-
-pure func deferred_body_token_end(body: DeferredBody) -> Int:
-	from_opaque DeferredBody(body).token_end
-
-
--- The caller owns prefixes and places the cursor at `func`.
-pure func parse_function_header(
+-- The caller owns prefixes and places the cursor at `func`. A successful
+-- head leaves the body unread; a rejected head retains lexical recovery.
+pure func parse_function_head(
 	state: ParseState, visibility: Visibility, documentation: Option[Documentation],
 	annotations: List[Annotation], purity: Purity, start: Span,
-) -> (ParseState, FunctionHeaderParse):
+) -> (ParseState, FunctionHeadParse):
 	before: Int = state.diagnostic_count()
 	keyword: Span = state.current_span()
 	(after_name, name) = state.advanced().consume_declared_name(NameInFunctionName)
@@ -117,42 +98,42 @@ pure func parse_function_header(
 	else:
 		(after_constraints.expect_token(ColonSymbol, ExpectedColon(ColonInFunctionBody)), after_constraints.previous_span())
 
-	(parsed, body_extent) = if has_colon or indented_body:
-		parse_body_extent(after_colon, start, colon)
+	body_presence = if (has_colon or indented_body) and after_colon.function_body_follows():
+		BodyFollows
 	else:
-		(after_colon, ForwardDeclaration)
+		ForwardDeclaration
 
-	if parsed.diagnostic_count() != before:
-		(parsed, RejectedFunctionHeader)
+	if after_colon.diagnostic_count() != before:
+		recovered = if body_presence == BodyFollows:
+			recover_rejected_function_body(after_colon, start)
+		else:
+			after_colon
+		(recovered, RejectedFunctionHead)
 	else:
 		match signature:
 			None:
-				(parsed, RejectedFunctionHeader)
+				(after_colon, RejectedFunctionHead)
 			Some(signature):
-				(parsed, ParsedFunctionHeader({
+				(after_colon, ParsedFunctionHead({
 					header = {
 						visibility = visibility, documentation = documentation, annotations = annotations,
 						signature = signature, type_parameters = parameters, constraints = constraints,
 						body_colon = colon, header_span = start.span_covering(header_end)
 					},
-					body_extent = body_extent
+					body_presence = body_presence
 				}))
 
 
-private pure func parse_body_extent(state: ParseState, anchor: Span, colon: Span) -> (ParseState, FunctionBodyExtent):
-	colon_line: Int = state.span_start_line(colon)
-	anchor_line: Int = state.span_start_line(anchor)
-	anchor_column: Int = state.span_start_column(anchor)
-	indented_body: Bool = state.current_kind() == NewlineToken and state.peek_kind(1) == IndentToken
-
-	if state.current_kind() == EndOfFileToken or state.current_kind() == DedentToken:
-		(state, ForwardDeclaration)
-	else if state.current_kind() == NewlineToken and not indented_body:
-		(state, ForwardDeclaration)
-	else if not indented_body and state.span_start_line(state.current_span()) > colon_line:
-		(state, ForwardDeclaration)
-	else:
-		skip_body(state, anchor_line, anchor_column)
+-- The token after an authored colon decides whether a body follows. The
+-- caller owns whether its absence is a forward declaration or an error.
+-- A leading ELSE cannot begin a body: the frozen scanner left it to its
+-- owner without consuming an authored body token. Missing-colon recovery
+-- may also use this at the untouched NEWLINE INDENT.
+pure func function_body_follows(state: ParseState) -> Bool:
+	match state.current_kind():
+		EndOfFileToken | DedentToken | ElseKeyword: False
+		NewlineToken: state.peek_kind(1) == IndentToken
+		_: True
 
 
 -- Only an authored inline conditional can own an anchor-column else.
@@ -168,22 +149,18 @@ private fixed union PostfixContinuation:
 	LeadingDot
 
 
--- Layout nesting owns the interval. Source positions prevent a later sibling
--- from being swallowed even when a body token has no preceding newline token.
--- Lexical evidence only. The caller owns whether its grammar permits or
--- requires a body; ForwardDeclaration means the scan found no authored body.
-pure func skip_deferred_body(state: ParseState, anchor: Span) -> (ParseState, FunctionBodyExtent):
-	skip_body(state, state.span_start_line(anchor), state.span_start_column(anchor))
+-- Rejected heads keep the frozen lexical synchronization boundary. This
+-- scanner is never used to discover or address a successful owner's body.
+pure func recover_rejected_function_body(state: ParseState, anchor: Span) -> ParseState:
+	recover_body(state, state.span_start_line(anchor), state.span_start_column(anchor))
 
 
-private pure func skip_body(state: ParseState, anchor_line: Int, anchor_column: Int) -> (ParseState, FunctionBodyExtent):
-	token_start: Int = state.position()
+private pure func recover_body(state: ParseState, anchor_line: Int, anchor_column: Int) -> ParseState:
 	var out: ParseState = state
 	var depth: Int = 0
 	var continuation: BodyContinuation = AtBodyStart
 	var postfix: PostfixContinuation = NoPostfixContinuation
 	var expected_closes: List[TokenKind] = []
-	var authored: Option[Span] = None
 	var skipping: Bool = True
 
 	while skipping and out.current_kind() != EndOfFileToken:
@@ -220,7 +197,6 @@ private pure func skip_body(state: ParseState, anchor_line: Int, anchor_column: 
 				else:
 					if depth == 0 and expected_closes.is_empty():
 						continuation = AfterElse
-					authored = covering_authored(authored, out.current_span())
 					out = out.advanced()
 			_:
 				line: Int = out.span_start_line(out.current_span())
@@ -245,22 +221,9 @@ private pure func skip_body(state: ParseState, anchor_line: Int, anchor_column: 
 					-- A matching delimiter closes its own lexical extent even when
 					-- it returns to the function anchor's column on a later line.
 					expected_closes = update_delimiters(expected_closes, out.current_kind())
-					authored = covering_authored(authored, out.current_span())
 					out = out.advanced()
 
-	match authored:
-		None:
-			(out, ForwardDeclaration)
-		Some(span):
-			(out, SkippedBody(into_opaque DeferredBody({ span = span, token_start = token_start, token_end = out.position() })))
-
-
-private pure func covering_authored(previous: Option[Span], current: Span) -> Option[Span]:
-	match previous:
-		None:
-			Some(current)
-		Some(previous):
-			Some(previous.span_covering(current))
+	out
 
 
 private pure func update_delimiters(expected: List[TokenKind], kind: TokenKind) -> List[TokenKind]:

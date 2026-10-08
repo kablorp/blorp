@@ -2,8 +2,9 @@
 -- is read in full, it has no diagnostic and each forward declaration has a
 -- same-named function with a body; otherwise the outcome says why.
 import:
+	../../../../src/compiler_new/stage_01_discovery/diagnostics/rejected_syntax_render: render_rejected_diagnostics
 	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
-	../../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: rejected_diagnostics
+	../../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: rejected_diagnostics, rejected_definitions
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_module_assembly:
 		AssembledSource,
 		ModuleAssembly(AssembledModule, RejectedModule, UnassembledModule),
@@ -12,7 +13,7 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan: UnreadHeader(UnreadFunction)
 	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: FunctionDeclaration
 	../../../../src/compiler_new/stage_01_discovery/syntax/definitions: Definition(FunctionDefinition)
-	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(Plain)
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(Plain, UnknownEscape)
 	../../../../src/compiler_new/stage_01_discovery/syntax/dump: dumped_module
 	../../../../src/compiler_new/stage_01_discovery/syntax/id_census: id_census
 	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index
@@ -220,22 +221,46 @@ func test_every_unpaired_forward_declaration_is_reported() -> Bool:
 			False
 
 
--- A module whose lexer reported a diagnostic is rejected even when every
--- declaration completed, and pairing is not checked: an earlier error can
--- itself leave a header without its body.
-func test_a_lexer_diagnostic_rejects_a_module_whose_declarations_completed() -> Bool:
-	text = source_lines([
+-- Initial lexer errors reject before declarations or pairing can mint nodes,
+-- even when an unsupported body would otherwise stop the declaration scan.
+private pure func rejected_unknown_escapes(text: String, offsets: List[Int]) -> Bool:
+	match assembled(text):
+		Some(RejectedModule(rejected)):
+			var correct = (rejected.rejected_definitions().is_empty()
+				and rejected.rejected_diagnostics().length() == offsets.length())
+			for (diagnostic, offset) in rejected.rejected_diagnostics().zip(offsets):
+				match diagnostic.diagnostic:
+					UnknownEscape('q'):
+						correct = correct and diagnostic.span.covers(offset, offset)
+					_: correct = False
+			match render_rejected_diagnostics(rejected):
+				Ok(rendered):
+					correct = correct and rendered.length() == offsets.length()
+					for (diagnostic, offset) in rendered.zip(offsets):
+						correct = (correct and diagnostic.span.covers(offset, offset)
+							and diagnostic.rendered.message == "unknown escape sequence '\\q'"
+							and diagnostic.rendered.help == Some("write `\\n`, `\\t`, `\\r`, `\\0`, `\\\\`, `\\\"`, `\\'`, `\\{`, `\\}` or `\\u{...}`; to write a backslash, double it"))
+					correct
+				Err(_): False
+		_: False
+
+
+func test_a_lexer_diagnostic_rejects_before_declaration_scan_and_pairing() -> Bool:
+	rejected_unknown_escapes(source_lines([
 		"func lonely() -> Int:",
 		"",
 		"func f() -> String:",
 		"\t\"\\q\"",
-	])
-	match assembled(text):
-		Some(RejectedModule(rejected)):
-			diagnostics = rejected.rejected_diagnostics()
-			not diagnostics.is_empty() and diagnostics.all(pure func(found): not found.diagnostic.is_unpaired_forward())
-		_:
-			False
+	]), [45])
+
+
+func test_lexer_diagnostics_keep_order_before_a_conversion_body() -> Bool:
+	rejected_unknown_escapes(source_lines([
+		"func f():",
+		"\tinto_opaque Count(value)",
+		"\t\"\\q\"",
+		"\t\"\\q\"",
+	]), [38, 44])
 
 
 func test_a_body_the_tree_parser_does_not_read_leaves_the_module_unassembled() -> Bool:
@@ -244,7 +269,7 @@ func test_a_body_the_tree_parser_does_not_read_leaves_the_module_unassembled() -
 		"\tx",
 		"",
 		"func g(x: Int) -> Int:",
-		"\tinto_opaque Count(x)",
+		"\tCount(\n\t\t(func():\n\t\t\tBodyName + Count(func(): 1)\n\t\t+ Count)\n\t)",
 	])
 	match assembled(text):
 		Some(UnassembledModule(DeclarationNotRead(unread))):
@@ -356,7 +381,8 @@ tests: TestSuite = {
 		("a private unpaired forward declaration rejects the module", test_a_private_unpaired_forward_declaration_rejects_the_module),
 		("an unpaired forward declaration rejects the module", test_an_unpaired_forward_declaration_rejects_the_module_at_its_name),
 		("every unpaired forward declaration is reported", test_every_unpaired_forward_declaration_is_reported),
-		("a lexer diagnostic rejects a completed module", test_a_lexer_diagnostic_rejects_a_module_whose_declarations_completed),
+		("a lexer diagnostic rejects before declaration scan and pairing", test_a_lexer_diagnostic_rejects_before_declaration_scan_and_pairing),
+		("lexer diagnostics keep order before a conversion body", test_lexer_diagnostics_keep_order_before_a_conversion_body),
 		("an unread body leaves the module unassembled", test_a_body_the_tree_parser_does_not_read_leaves_the_module_unassembled),
 		("a rejected declaration leaves the module unassembled", test_a_rejected_declaration_leaves_the_module_unassembled),
 		("2000 functions and forward declarations", test_two_thousand_functions_and_their_forward_declarations_assemble),
