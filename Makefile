@@ -490,6 +490,7 @@ test:
 # Run runtime tests only (language features + standard library)
 runtime-test: all
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_cooperative_checkpoint_contract.py
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_cancel_after_parked_contract.py
 	$(BLORP_INSTALLED_BIN) test $(RUNTIME_TEST_ROOTS)
 
 # Fast local validation path for compiler work

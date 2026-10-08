@@ -337,6 +337,17 @@ The runner is quiet on success. `--log-dir` keeps full output off the
 conversation; inspect the first child failure when a parent summary is
 invalid.
 
+The runtime gate includes the native `test_cancel_after_parked_contract.py`
+contracts. `test.cancel_after_parked_for_test` observes actual child suspension
+with a five-second monotonic deadline, yielding cooperatively from a fiber or
+backing off from an OS caller. A failed observation prints its last runner state.
+The deadline does not bound cancel/join: cleanup still requires a cooperative
+child. Run the narrow native contract without rebuilding the CLI:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_cancel_after_parked_contract.py
+```
+
 ## Reproducing CI
 
 CI builds normal and diagnostic compilers together and bundles both in its
