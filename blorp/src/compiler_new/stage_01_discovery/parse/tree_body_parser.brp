@@ -42,7 +42,7 @@ import:
 			ConcurrentCountNotLiteral),
 		stop_at, statement_boundary, mapped, opens_block_form
 	tree_expression_parser:
-		ValueParse(ParsedValue, UnsupportedValue, RejectedValue), ExpressionValue, ExpressionRoot(NameRoot, SubscriptRoot, TupleRoot, FieldRoot, GroupedRoot, OtherRoot), StatementHeadParse(ParsedStatementValue, ParsedSubscriptPlace, UnsupportedStatementHead, RejectedStatementHead), ExpressionEnding(AfterContinuationDedent), ends_in_control, parse_scoped_expression, parse_statement_head, ends_in_block_lambda, block_expression_ends, continue_control_expression
+		ValueParse(ParsedValue, UnsupportedValue, RejectedValue), ExpressionValue, ExpressionRoot(NameRoot, SubscriptRoot, TupleRoot, FieldRoot, GroupedRoot, OtherRoot), StatementHeadParse(ParsedStatementValue, ParsedSubscriptPlace, UnsupportedStatementHead, RejectedStatementHead), parse_scoped_expression, parse_statement_head, block_operand_ends, block_expression_ends, continue_control_expression
 	tree_function_header_parser:
 		FunctionHead, FunctionHeadParse(ParsedFunctionHead, RejectedFunctionHead), FunctionBodyPresence(ForwardDeclaration, BodyFollows), parse_function_head
 	tree_value_layout: next_line_value_entry, close_next_line_value
@@ -204,38 +204,41 @@ private pure func block_start(state: ParseState, anchor: BlockAnchor) -> BlockSt
 			NoBlockStart
 
 
--- The statements of a block up to its dedent. `state` is the entry state that
--- an unsupported statement rolls back to.
+-- The first statement establishes a nonempty block. Keep its final shape as
+-- later statements arrive, and mint only after the closing dedent. `state` is
+-- the entry state that every unsupported statement or closure rolls back to.
 private pure func read_block(state: ParseState, at_first_statement: ParseState, context: BodyContext) -> (ParseState, BlockParse):
-	var out: ParseState = at_first_statement
-	var statements: List[Statement] = []
-	var declined: Option[StopPoint] = None
-	while declined.is_none() and out.current_kind() != DedentToken and out.current_kind() != EndOfFileToken:
-		(remaining, parsed) = parse_statement(out, context)
+	if at_first_statement.current_kind() == DedentToken or at_first_statement.current_kind() == EndOfFileToken:
+		(state, UnsupportedBlock(at_first_statement.stop_at(BlockNotClosed)))
+	else:
+		(remaining, parsed) = parse_statement(at_first_statement, context)
 		match parsed:
-			ParsedStatement(statement):
-				statements = statements.append(statement)
-				out = remaining.skip_newlines()
 			UnsupportedStatement(stop):
-				declined = Some(stop)
-	match declined:
-		Some(stop):
-			(state, UnsupportedBlock(stop))
-		None:
-			match statements:
-				[first, ...rest]:
-					if out.current_kind() == DedentToken:
-						var leading: List[Statement] = []
-						var last = first
-						for statement in rest:
+				(state, UnsupportedBlock(stop))
+			ParsedStatement(first):
+				start = first.span
+				var out: ParseState = remaining.skip_newlines()
+				var leading: List[Statement] = []
+				var last = first
+				var declined: Option[StopPoint] = None
+				while declined.is_none() and out.current_kind() != DedentToken and out.current_kind() != EndOfFileToken:
+					(next, statement_parse) = parse_statement(out, context)
+					match statement_parse:
+						ParsedStatement(statement):
 							leading = leading.append(last)
 							last = statement
-						(minted, block) = out.advanced().finished_block(leading, last, first.span.span_covering(last.span))
-						(minted, ParsedBlock(block))
-					else:
-						(state, UnsupportedBlock(out.stop_at(BlockNotClosed)))
-				_:
-					(state, UnsupportedBlock(out.stop_at(BlockNotClosed)))
+							out = next.skip_newlines()
+						UnsupportedStatement(stop):
+							declined = Some(stop)
+				match declined:
+					Some(stop):
+						(state, UnsupportedBlock(stop))
+					None:
+						if out.current_kind() == DedentToken:
+							(minted, block) = out.advanced().finished_block(leading, last, start.span_covering(last.span))
+							(minted, ParsedBlock(block))
+						else:
+							(state, UnsupportedBlock(out.stop_at(BlockNotClosed)))
 
 
 -- Statements.
@@ -369,7 +372,7 @@ private pure func parse_expression_value(state: ParseState, anchor: ExpressionAn
 				PastBoundary(stop):
 					-- A control expression, or a lambda with a block body, ends at its
 					-- block's dedent, where the next statement may already start.
-					if ending == AfterContinuationDedent or value.ends_in_control() or (value.ends_in_block_lambda() and block_expression_ends(remaining.current_kind())):
+					if block_operand_ends(ending, value.tail, remaining.current_kind()):
 						(remaining, Recognized(value.expression))
 					else:
 						(state, Declined(stop))
@@ -431,7 +434,7 @@ private pure func parse_expression_statement(state: ParseState, context: BodyCon
 				match remaining.statement_boundary():
 					AtBoundary: remaining.expression_statement(value.expression)
 					PastBoundary(stop):
-						if ending == AfterContinuationDedent or value.ends_in_control() or (value.ends_in_block_lambda() and block_expression_ends(remaining.current_kind())):
+						if block_operand_ends(ending, value.tail, remaining.current_kind()):
 							remaining.expression_statement(value.expression)
 						else:
 							(state, UnsupportedStatement(stop))
@@ -823,7 +826,7 @@ private pure func continue_control_statement(entry: ParseState, state: ParseStat
 			match remaining.statement_boundary():
 				AtBoundary: remaining.expression_statement(value.expression)
 				PastBoundary(stop):
-					if ending == AfterContinuationDedent or value.ends_in_control() or (value.ends_in_block_lambda() and block_expression_ends(remaining.current_kind())):
+					if block_operand_ends(ending, value.tail, remaining.current_kind()):
 						remaining.expression_statement(value.expression)
 					else:
 						(entry, UnsupportedStatement(stop))
@@ -947,17 +950,13 @@ private pure func read_match_cases(
 		Some(stop):
 			(state, Declined(stop))
 		None:
-			match cases:
-				[first, ...rest]:
-					if out.current_kind() != DedentToken:
-						(state, Declined(out.stop_at(MatchNotClosed)))
-					else if not out.advanced().control_operator_may_follow():
-						(state, Declined(out.advanced().stop_at(OperatorAfterBlock)))
-					else:
-						(minted, expression) = out.advanced().finished_expression(keyword.span_covering(out.current_span()), Match(subject, [first].concat(rest)))
-						(minted, Recognized(expression))
-				_:
-					(state, Declined(out.stop_at(MatchNotClosed)))
+			if cases.is_empty() or out.current_kind() != DedentToken:
+				(state, Declined(out.stop_at(MatchNotClosed)))
+			else if not out.advanced().control_operator_may_follow():
+				(state, Declined(out.advanced().stop_at(OperatorAfterBlock)))
+			else:
+				(minted, expression) = out.advanced().finished_expression(keyword.span_covering(out.current_span()), Match(subject, cases))
+				(minted, Recognized(expression))
 
 
 private pure func parse_case(state: ParseState, context: BodyContext) -> (ParseState, Recognition[MatchCase]):
@@ -1285,17 +1284,13 @@ private pure func read_select_arms(
 		Some(stop):
 			(state, Declined(stop))
 		None:
-			match arms:
-				[first, ...rest]:
-					if out.current_kind() != DedentToken:
-						(state, Declined(out.stop_at(SelectNotClosed)))
-					else if not block_expression_ends(out.advanced().current_kind()):
-						(state, Declined(out.advanced().stop_at(OperatorAfterBlock)))
-					else:
-						(minted, expression) = out.advanced().finished_expression(keyword.span_covering(out.current_span()), Select([first].concat(rest)))
-						(minted, Recognized(expression))
-				_:
-					(state, Declined(out.stop_at(SelectNotClosed)))
+			if arms.is_empty() or out.current_kind() != DedentToken:
+				(state, Declined(out.stop_at(SelectNotClosed)))
+			else if not block_expression_ends(out.advanced().current_kind()):
+				(state, Declined(out.advanced().stop_at(OperatorAfterBlock)))
+			else:
+				(minted, expression) = out.advanced().finished_expression(keyword.span_covering(out.current_span()), Select(arms))
+				(minted, Recognized(expression))
 
 
 private pure func parse_select_arm(state: ParseState, context: BodyContext) -> (ParseState, Recognition[SelectArm]):

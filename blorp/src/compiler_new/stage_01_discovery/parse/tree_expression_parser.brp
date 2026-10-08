@@ -1,6 +1,7 @@
 -- Direct post-order parsing. Unsupported input returns the saved persistent
 -- entry; rejected expressions retain diagnostics but discard trial ids.
 import:
+	dict: dict, get, set
 	../lex/lexed_module: LiteralValue(IntegerValue, FloatValue, TextValue), HoleScan, ScannedPiece(ScannedText, ScannedHole)
 	../syntax/expressions:
 		Expression, Hole, SubscriptPlace, Body(BlockBody), ExpressionKind(If, Match, Select, Lambda, NameReference, IntegerLiteral, FloatLiteral, StringLiteral, InterpolatedString, BooleanLiteral, CharacterLiteral, VoidValue, Unary, Binary, ShortCircuit, RangeExpression, Call, FieldAccess, Subscript, ListLiteral, TupleLiteral, VectorLiteral, RecordLiteral, RecordUpdate, DictLiteral, Detach, OpaqueConversion, CompilerBuiltin),
@@ -13,9 +14,8 @@ import:
 	-- Expressions and bodies call each other for controls and lambdas;
 	-- their completed recursive syntax types belong to syntax/expressions.
 	tree_body_parser: BodyContext(OutsideLoop, InsideLoop), LambdaParse(ParsedLambda, UnsupportedLambda), parse_lambda, parse_control
-	../syntax/ids: spelling_index
+	../syntax/ids: SpellingId
 	../syntax/sequences: AtLeastOne, SmallTuple(Pair, Triple, Quadruple), at_least_one_items
-	../syntax/names: WrittenName
 	../syntax/diagnostics: SyntaxDiagnostic(Plain, DuplicateFieldGiven)
 	../syntax/patterns: StringForm(QuotedString, RawString, PipeString, RawPipeString)
 	../tables/diagnostic_code: PlainSyntaxCode(ExpectedExpressionDiagnostic, SingletonTupleDiagnostic, TupleArityDiagnostic, ExpectedBuiltinNameDiagnostic)
@@ -214,10 +214,6 @@ pure func parse_statement_head(state: ParseState, anchor: ExpressionAnchor, loop
 				RejectedValue: (parsed, RejectedStatementHead, ending)
 
 
-pure func ends_in_control(value: ExpressionValue) -> Bool:
-	value.tail == ControlOperand
-
-
 -- Prefix and binary parents retain the last operand's consumed block dedent;
 -- grouping resets it. The syntax root cannot recover this authored boundary.
 pure func ends_in_block_lambda(value: ExpressionValue) -> Bool:
@@ -230,13 +226,17 @@ pure func block_expression_ends(kind: TokenKind) -> Bool:
 	kind != AsKeyword and kind != EqualSymbol and Operators.binary_operator(kind).is_none()
 
 
+pure func block_operand_ends(ending: ExpressionEnding, tail: OperandEnding, follower: TokenKind) -> Bool:
+	ending == AfterContinuationDedent or tail == ControlOperand or (tail == BlockLambdaOperand and block_expression_ends(follower))
+
+
 pure func parse_expression_to_boundary(state: ParseState, anchor: ExpressionAnchor) -> (ParseState, ExpressionParse):
 	(parsed, result, ending) = parse_scoped_expression(state, anchor, OutsideLoop)
 	match result:
 		UnsupportedValue(stop): (state, UnsupportedExpression(stop))
 		RejectedValue: (state.rejected_trial(parsed), RejectedExpression)
 		ParsedValue(value):
-			boundary: Boundary = if value.ends_in_control() or ending == AfterContinuationDedent or (value.ends_in_block_lambda() and block_expression_ends(parsed.current_kind())):
+			boundary: Boundary = if block_operand_ends(ending, value.tail, parsed.current_kind()):
 				AtBoundary
 			else:
 				parsed.expression_boundary()
@@ -500,7 +500,7 @@ private pure func extend_chain[T](
 -- subscript or member access after that dedent is not a continuation of it.
 -- Binary operators may
 -- resume a control operand through `continue_operators`. This is
--- `ends_in_control` widened by the block lambda, which the boundary rules treat
+-- `ControlOperand` widened by the block lambda, which the boundary rules treat
 -- apart because only a lambda's follower needs `block_expression_ends`.
 private pure func ends_in_dedent(value: ExpressionValue) -> Bool:
 	value.tail != PlainOperand
@@ -1123,30 +1123,20 @@ private pure func record_fields_from(state: ParseState, form: BracedForm, loop_c
 -- pointing at the first field of that name.
 private pure func reported_repeated_fields(state: ParseState, fields: AtLeastOne[NamedValue]) -> (ParseState, FieldList):
 	var out = state
-	var seen: List[NamedValue] = []
+	-- The module interner gives equal written names the same spelling id.
+	var first_span_by_spelling: Dict[SpellingId, Span] = dict()
 	var repeated = False
 	for field in at_least_one_items(fields):
-		match seen.first_named(field.name.name):
+		match first_span_by_spelling.get(field.name.name.spelling):
 			Some(earlier):
-				out = out.report_diagnostic(field.name.name.span, DuplicateFieldGiven(earlier.name.name.span))
+				out = out.report_diagnostic(field.name.name.span, DuplicateFieldGiven(earlier))
 				repeated = True
 			None:
-				void
-		seen = seen.append(field)
+				first_span_by_spelling = first_span_by_spelling.set(field.name.name.spelling, field.name.name.span)
 	if repeated:
 		(out, RepeatedFields)
 	else:
 		(out, DistinctFields(fields))
-
-
--- Spellings are per module, and a parse covers one module, so the spelling
--- index identifies a name.
-private pure func first_named(fields: List[NamedValue], name: WrittenName) -> Option[NamedValue]:
-	var first: Option[NamedValue] = None
-	for field in fields:
-		if first.is_none() and spelling_index(field.name.name.spelling) == spelling_index(name.spelling):
-			first = Some(field)
-	first
 
 
 private pure func field_item(state: ParseState, loop_context: BodyContext) -> (ParseState, ItemsParse[NamedValue]):

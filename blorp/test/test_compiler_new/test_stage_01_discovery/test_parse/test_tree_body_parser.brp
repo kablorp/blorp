@@ -12,7 +12,7 @@ import:
 		UnreadHeader(UnreadFunction, UnreadTrait, UnreadImplementation), scan_module_declarations
 	../../../../src/compiler_new/stage_01_discovery/syntax/dump: dumped_module
 	../../../../src/compiler_new/stage_01_discovery/syntax/expressions:
-		Body(BlockBody, ExpressionBody), ElseBody(ElseBlock, ElseIf), ElseBranch, AssignmentTarget(AssignsName), ExpressionKind(If, Subscript, NameReference), StatementKind(Assignment, ExpressionStatement, SubscriptAssignment, TupleDestructure)
+		Body(BlockBody, ExpressionBody), ElseBody(ElseBlock, ElseIf), ElseBranch, AssignmentTarget(AssignsName), ExpressionKind(If, Subscript, NameReference, IntegerLiteral), StatementKind(Assignment, ExpressionStatement, SubscriptAssignment, TupleDestructure)
 	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: FunctionDeclaration
 	../../../../src/compiler_new/stage_01_discovery/syntax/definitions: Definition(FunctionDefinition, LocalFunctionDefinition)
 	../../../../src/compiler_new/stage_01_discovery/syntax/id_census: id_census
@@ -27,7 +27,7 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_body_parser: complete_function, FunctionCompletion(CompletedFunction)
 	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(FuncKeyword, ElseKeyword)
 	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility), Purity(PureFunction)
-	../../../../src/compiler_new/stage_01_discovery/parse/stop_reason: StopReason(AssignmentTargetRoutedElsewhere, BlockNotClosed, NonPlaceAssignmentTarget, TupleDestructuring, FieldAssignment, SoftKeywordName)
+	../../../../src/compiler_new/stage_01_discovery/parse/stop_reason: StopReason(AssignmentTargetRoutedElsewhere, BlockNotClosed, MatchNotClosed, SelectNotClosed, NonPlaceAssignmentTarget, TupleDestructuring, FieldAssignment, SoftKeywordName)
 	../../../../src/compiler_new/stage_01_discovery/syntax/names: BindingTarget(BindsName, DiscardsValue)
 	../../../../src/compiler_new/stage_01_discovery/syntax/sequences: SmallTuple(Triple)
 	test: TestSuite
@@ -501,6 +501,28 @@ func test_comment_only_body_stops_without_diagnostics_or_body_ids() -> Bool:
 						_: False
 				_: False
 		None: False
+
+
+-- Comment indentation opens a list but contributes no case or arm. Its
+-- closing dedent reports the empty list, and every attempted child rolls back.
+func test_comment_only_match_and_select_lists_restore_function_header() -> Bool:
+	var correct = True
+	for (header, reason) in [("match subject:", MatchNotClosed), ("select:", SelectNotClosed)]:
+		text = source_lines(["func f():", "\t" + header, "\t\t-- comment"])
+		match (scanned(text), new_parse_state(lex_module(module_id_at_row(0), text))):
+			(Some((state, scan)), Ok(entry)):
+				(plain, _) = parse_declaration_preview(entry)
+				match scan.stop:
+					StoppedAtUnreadDeclaration(unread):
+						correct = (correct and completed_count(scan) == 0 and deferred_count(scan) == 1
+							and unread.stop.reason == reason and unread.stop.at.span_start() == text.length() and unread.stop.at.span_end() == text.length()
+							and state.position() == plain.position() and state.current_kind() == plain.current_kind()
+							and state.current_span().span_start() == plain.current_span().span_start()
+							and state.current_span().span_end() == plain.current_span().span_end() and state.issued_counts() == plain.issued_counts()
+							and state.spellings().spelling_count() == plain.spellings().spelling_count() and state.diagnostic_count() == 0)
+					_: correct = False
+			_: correct = False
+	correct
 
 
 -- A written type and a pattern are read once to find where they end and again
@@ -1250,6 +1272,56 @@ func test_long_select_survives_parse_dump_and_census() -> Bool:
 	nests_to_depth(lines, "(receive-arm @", arms)
 
 
+-- The final block payload is source-ordered for singleton and wider blocks;
+-- each child's span/id survives, and closure leaves the next owner untouched.
+func test_block_payload_preserves_statements_spans_and_next_owner() -> Bool:
+	var correct = True
+	for width in [1, 2, 8, 64, 256]:
+		var text = "func f():\n"
+		var offsets: List[Int] = []
+		for index in 0..width:
+			offsets = offsets.append(text.length() + 1)
+			text += "\t${index}\n"
+		end = text.length() - 1
+		next_start = text.length()
+		text += "func g():"
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(head_state, head_parse) = parse_function_head(entry, PublicVisibility, None, [], PureFunction, entry.current_span())
+				match head_parse:
+					ParsedFunctionHead(head):
+						(completed, result) = complete_function(head_state, head)
+						match result:
+							CompletedFunction(function):
+								match function.function.body:
+									Some(BlockBody(block)):
+										counts = completed.issued_counts()
+										correct = (correct and block.leading.length() == width - 1
+											and block.span.span_start() == 11 and block.span.span_end() == end
+											and block.id.block_local_index() == 0 and counts.blocks == 1
+											and counts.statements == width and counts.expressions == width
+											and completed.current_kind() == FuncKeyword and completed.current_span().span_start() == next_start
+											and completed.diagnostic_count() == 0)
+										var index = 0
+										for statement in block.leading.append(block.last):
+											match (statement.kind, offsets.get(index)):
+												(ExpressionStatement(expression), Some(start)):
+													match expression.kind:
+														IntegerLiteral(value):
+															correct = (correct and value == index.to_int128()
+																and statement.id.statement_local_index() == index and expression.id.expression_local_index() == index
+																and statement.span.span_start() == start and statement.span.span_end() == start + "${index}".length()
+																and expression.span.span_start() == statement.span.span_start() and expression.span.span_end() == statement.span.span_end())
+														_: correct = False
+												_: correct = False
+											index += 1
+									_: correct = False
+							_: correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
 private pure func completed_owner_body(text: String, body_start: Int, body_end: Int, next_start: Int, token_end: Int, cursor: TokenKind) -> Bool:
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(state):
@@ -1394,6 +1466,7 @@ func test_inline_case_control_tail_restores_the_function_header() -> Bool:
 tests: TestSuite = {
 	description = "Tree statements, blocks and function bodies",
 	tests = [
+		("block payload preserves statements spans and next owner", test_block_payload_preserves_statements_spans_and_next_owner),
 		("inline case control tail restores the function header", test_inline_case_control_tail_restores_the_function_header),
 		("operand exits reset at lambda function and task boundaries", test_operand_loop_exits_reset_at_lambda_function_and_task_boundaries),
 		("previously unread controls and holes complete with ids", test_previously_unread_controls_and_holes_complete_with_ids),
@@ -1411,6 +1484,7 @@ tests: TestSuite = {
 		("grouped thread counts issue no expression ids", test_grouped_thread_counts_issue_no_expression_ids),
 		("only the outer terminal subscript is an assignment place", test_only_the_outer_terminal_subscript_is_an_assignment_place),
 		("comment-only body stops without diagnostics or body ids", test_comment_only_body_stops_without_diagnostics_or_body_ids),
+		("comment-only match and select lists restore function header", test_comment_only_match_and_select_lists_restore_function_header),
 		("conditional inside parentheses owns else but leaves later stray else", test_conditional_inside_parentheses_owns_else_but_leaves_later_stray_else),
 		("multiline parenthesized body owns anchor close and following layout", test_multiline_parenthesized_body_owns_anchor_close_and_following_layout),
 		("leading dot postfix continuation stays in inline body", test_leading_dot_postfix_continuation_stays_in_inline_body),

@@ -1,0 +1,29 @@
+from pathlib import Path
+import subprocess,os,re,json,hashlib,statistics,time
+root=Path(__file__).parent
+labels=[f'{d}-{r}-{w}' for d in ('False','True') for r in ('False','True') for w in (0,1,2,8,64,256) if d == "True" or w > 0]
+rows={}
+for label in labels:
+ row={}
+ for version in ('baseline','candidate'):
+  env=dict(os.environ,BLORP_MEMORY_STATS='1')
+  result=subprocess.run([str(root/f'{version}-diagnostic'),label],text=True,capture_output=True,env=env,check=True)
+  (root/f'{version}-{label}-alloc.txt').write_text(result.stdout+result.stderr)
+  lines=result.stdout.splitlines(); counter=lines[0]; oracle='\n'.join(lines[1:])
+  if 'active=1 oracle=1' not in counter or 'ERROR' in oracle or 'UNSUPPORTED' in oracle: raise RuntimeError(result.stdout)
+  row[version]={'counters':dict((k,int(v)) for k,v in re.findall(r'(\w+)=(-?\d+)',counter)),'oracle_sha256':hashlib.sha256(oracle.encode()).hexdigest(),'instructions':[]}
+ if row['baseline']['oracle_sha256']!=row['candidate']['oracle_sha256']:raise RuntimeError('oracle mismatch '+label)
+ for sample in range(5):
+  for version in (('baseline','candidate') if sample%2==0 else ('candidate','baseline')):
+   env=dict(os.environ);env.pop('BLORP_MEMORY_STATS',None);env.pop('BLORP_LEAK_CHECK',None)
+   result=subprocess.run(['/usr/bin/time','-l',str(root/f'{version}-normal'),label],text=True,capture_output=True,env=env,check=True)
+   (root/f'{version}-{label}-{sample}-time.txt').write_text(result.stdout+result.stderr)
+   instructions=re.search(r'(\d+)\s+instructions retired',result.stderr)
+   if not instructions:raise RuntimeError('no instructions: '+result.stderr)
+   row[version]['instructions'].append(int(instructions.group(1)))
+ for version in ('baseline','candidate'):
+  samples=row[version]['instructions'];row[version]['min_instructions']=min(samples);row[version]['median_instructions']=statistics.median(samples)
+ row['instruction_change_percent']=100*(row['candidate']['min_instructions']/row['baseline']['min_instructions']-1)
+ rows[label]=row
+ (root/'measurements.json').write_text(json.dumps(rows,indent=2)+'\n')
+ print(label,row['instruction_change_percent'],row['baseline']['counters']['managed'],row['candidate']['counters']['managed'],flush=True)

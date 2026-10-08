@@ -6,7 +6,7 @@
 import:
 	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
 	../../../../src/compiler_new/stage_01_discovery/parse/parse_state:
-		ParseState, new_parse_state, advanced, current_kind, current_span, current_name_spelling_or_empty, diagnostics, diagnostic_count, issued_counts, spellings, position, finished_builtin_type, consume_declared_name, finished_type_binder, finished_name_use, finished_written_type
+		ParseState, new_parse_state, advanced, current_kind, current_span, current_name_spelling_or_empty, diagnostics, diagnostic_count, issued_counts, issued_ids, spellings, position, finished_builtin_type, consume_declared_name, finished_type_binder, finished_name_use, finished_written_type
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_record_parser:
 		parse_record_form, RecordParse(ParsedRecord, RejectedRecord)
 	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: RecordDeclarationForm(OrdinaryRecord, FixedRecord)
@@ -15,6 +15,7 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
 	../../../../src/compiler_new/stage_01_discovery/syntax/types: WrittenTypeKind(NamedType, VoidType), TypeArgument(TypeArgumentType)
 	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(DuplicateField, ExpectedToken, ReservedKeywordAsName, Plain)
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(ExpectedTypeDiagnostic)
 	../../../../src/compiler_new/stage_01_discovery/tables/expected_token:
 		ExpectedTokenDiagnostic(ExpectedLeftBrace, ExpectedName, ExpectedRightBrace, ExpectedRightBracket, ExpectedColon, ExpectedRightParen), NameConstruct(NameInTypeName, NameInFieldName), LeftBraceConstruct(LeftBraceInRecordFields, LeftBraceInFixedRecordFields)
 	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, name_id_index
@@ -26,7 +27,6 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/parse/lexed_bridge: bridge_lexed_module
 	../../../../src/compiler_new/stage_01_discovery/sources/source_admission: admit_source
 	../../../../src/compiler_new/stage_01_discovery/tables/builder: DiscoveryBuilder, empty_discovery_builder
-	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code as FrozenDiagnostics
 	test: TestSuite
 
 
@@ -162,6 +162,34 @@ private pure func duplicate_field(text: String, spelling: RecordDeclarationForm,
 pure func test_duplicate_field_rejects_declaration_and_identifies_first_field() -> Bool:
 	(duplicate_field("record Point { x: Int, x: Bool }", OrdinaryRecord, 0)
 		and duplicate_field("fixed record Point { x: Int, x: Bool }", FixedRecord, 6))
+
+
+pure func test_interleaved_duplicates_keep_first_ids_after_type_diagnostics() -> Bool:
+	var correct = True
+	for (text, form, offset) in [
+		("record Point { x: Int, y: Int, x: Bool, y: Bool, x: , } if", OrdinaryRecord, 0),
+		("fixed record Point { x: Int, y: Int, x: Bool, y: Bool, x: , } if", FixedRecord, 6),
+	]:
+		match new_parse_state(lex_module(module_id_at_row(3), text)):
+			Ok(entry):
+				(state, result) = parse_record_form(after_introducer(entry, form), PublicVisibility, None, entry.current_span(), form)
+				match (result, state.diagnostics()):
+					(RejectedRecord, [first, second, type_error, third]):
+						match (first.diagnostic, second.diagnostic, type_error.diagnostic, third.diagnostic):
+							(DuplicateField(first_id), DuplicateField(second_id), Plain(ExpectedTypeDiagnostic), DuplicateField(third_id)):
+								correct = (correct and first_id.definition_local_index() == 0
+									and second_id.definition_local_index() == 1 and third_id.definition_local_index() == first_id.definition_local_index()
+									and first.span.span_is(31 + offset, 32 + offset)
+									and second.span.span_is(40 + offset, 41 + offset)
+									and third.span.span_is(49 + offset, 50 + offset)
+									and state.issued_ids().definitions.length() == 5
+									and state.issued_counts().written_types == 5
+									and state.current_kind() == IfKeyword
+									and state.current_span().span_is(text.length() - 2, text.length()))
+							_: correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
 
 
 -- One frozen declaration owns transitional parameter recovery; no module scan.
@@ -332,6 +360,7 @@ tests: TestSuite = {
 		("both spellings keep spans child order and trailing comma", test_both_spellings_keep_spans_child_order_and_trailing_comma),
 		("visibility and documentation are preserved", test_visibility_and_documentation_are_preserved),
 		("duplicate field rejects declaration and identifies first field", test_duplicate_field_rejects_declaration_and_identifies_first_field),
+		("interleaved duplicates keep first ids after type diagnostics", test_interleaved_duplicates_keep_first_ids_after_type_diagnostics),
 		("missing open brace rejects at next token", test_missing_open_brace_rejects_at_next_token),
 		("dimension tokens are rejected as declaration names", test_dimension_tokens_are_rejected_as_declaration_names),
 		("dimension tokens are rejected as field names", test_dimension_tokens_are_rejected_as_field_names),

@@ -1,0 +1,61 @@
+-- Shared function and implementation-method header grammar, ending before the colon.
+-- Declaration owners retain diagnostic acceptance and body/recovery policy.
+import:
+	../syntax/declarations: Signature, TypeParameter, DimensionConstraint
+	../tables/expected_token: NameConstruct(NameInFunctionName), LeftParenConstruct(LeftParenInFunctionName)
+	../tables/row_kinds: Purity
+	../tables/span: Span
+	../tables/token: TokenKind(ArrowSymbol)
+	parse_state: ParseState, current_span, current_kind, advanced, consume_declared_name
+	tree_type_parameter_parser: TypeParametersParse(NoTypeParameters, ParsedTypeParameters, RejectedTypeParameters), parse_type_parameters
+	tree_signature_parser: SignatureParse(ParsedSignature, RejectedSignature), parse_signature
+	tree_parameter_parser: parse_parenthesized_parameters
+	tree_type_parser: parse_type
+	tree_dimension_constraint_parser: DimensionConstraintsParse(NoDimensionConstraints, ParsedDimensionConstraints, RejectedDimensionConstraints), parse_dimension_constraints
+
+
+record CallableHeaderParts {
+	signature: Option[Signature],
+	type_parameters: List[TypeParameter],
+	constraints: List[DimensionConstraint]
+}
+
+
+-- Entry is at `func`; rejected names/parameters still consume authored return
+-- types and constraints so each owner's body recovery sees the same cursor.
+pure func read_callable_header(state: ParseState, purity: Purity) -> (ParseState, CallableHeaderParts):
+	keyword: Span = state.current_span()
+	(after_name, name) = state.advanced().consume_declared_name(NameInFunctionName)
+	(after_parameters, parsed_parameters) = parse_type_parameters(after_name)
+	type_parameters: List[TypeParameter] = match parsed_parameters:
+		ParsedTypeParameters(parameters, _):
+			parameters
+		NoTypeParameters | RejectedTypeParameters:
+			[]
+
+	(after_signature, signature) = match name:
+		Some(name):
+			(parsed, result) = parse_signature(after_parameters, purity, keyword, name, LeftParenInFunctionName)
+
+			match result:
+				ParsedSignature(signature, _):
+					(parsed, Some(signature))
+				RejectedSignature:
+					(parsed, None)
+		None:
+			(parsed, _) = parse_parenthesized_parameters(after_parameters, LeftParenInFunctionName)
+			(parsed, None)
+
+	before_constraints: ParseState = if signature.is_none() and after_signature.current_kind() == ArrowSymbol:
+		(parsed, _) = parse_type(after_signature.advanced())
+		parsed
+	else:
+		after_signature
+	(after_constraints, parsed_constraints) = parse_dimension_constraints(before_constraints)
+	constraints: List[DimensionConstraint] = match parsed_constraints:
+		ParsedDimensionConstraints(constraints, _):
+			constraints
+		NoDimensionConstraints | RejectedDimensionConstraints:
+			[]
+
+	(after_constraints, { signature = signature, type_parameters = type_parameters, constraints = constraints })

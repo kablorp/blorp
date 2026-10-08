@@ -1,0 +1,102 @@
+import:
+	blorp/src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	blorp/src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, current_span, position, diagnostic_count, issued_counts, issued_ids, diagnostics
+	blorp/src/compiler_new/stage_01_discovery/parse/layout_quirks: anchored_at
+	blorp/src/compiler_new/stage_01_discovery/parse/tree_expression_parser: parse_expression_to_boundary, ExpressionParse(ParsedExpression, RejectedExpression, UnsupportedExpression)
+	blorp/src/compiler_new/stage_01_discovery/parse/tree_record_fields_parser: parse_record_fields, RecordFieldsForm(OrdinaryRecordFields), RecordFieldsParse(ParsedRecordFields, RejectedRecordFields)
+	blorp/src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(DuplicateField, DuplicateFieldGiven)
+	blorp/src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index, expression_local_index, name_use_local_index, written_type_local_index, spelling_index
+	blorp/src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	blorp/src/compiler_new/stage_01_discovery/tables/span: span_start, span_end
+	blorp/src/compiler_new/stage_01_discovery/syntax/expressions: ExpressionKind(RecordLiteral, IntegerLiteral)
+	memory: MemoryCounter(ManagedAllocations, ManagedReleases, LiveManagedObjects, BackingMallocEvents, MemoryStatsActive, OracleStatsActive), read_memory_counter
+
+pure func input(width: Int, repeated: Bool, declaration: Bool) -> String:
+	var fields: List[String] = []
+	for index in 0..width:
+		name_index = if repeated:
+			index % (width / 2)
+		else:
+			index
+		field = if declaration:
+			"f${name_index}: Int"
+		else:
+			"f${name_index} = ${index}"
+		fields = fields.append(field)
+	"{" + fields.join(", ") + "}"
+
+pure func parsed_checksum(entry: ParseState, declaration: Bool) -> Int:
+	if declaration:
+		(state, result) = parse_record_fields(entry, OrdinaryRecordFields)
+		value = match result:
+			ParsedRecordFields(fields, end): fields.length() + end.span_end()
+			RejectedRecordFields: -1
+		value + state.position() * 31 + state.diagnostic_count() * 131 + state.issued_ids().definitions.length() * 257 + state.issued_counts().written_types * 521
+	else:
+		(state, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+		value = match result:
+			ParsedExpression(value): value.span.span_end()
+			RejectedExpression: -1
+			UnsupportedExpression(_): -2
+		value + state.position() * 31 + state.diagnostic_count() * 131 + state.issued_counts().expressions * 257 + state.issued_counts().name_uses * 521
+
+func oracle(entry: ParseState, declaration: Bool):
+	var out = entry
+	if declaration:
+		(state, result) = parse_record_fields(entry, OrdinaryRecordFields)
+		out = state
+		match result:
+			ParsedRecordFields(fields, end):
+				print("FIELDS ${fields.length()} end=${end.span_start()}:${end.span_end()}")
+				for field in fields:
+					print("FIELD ${field.id.definition_local_index()} spelling=${field.name.spelling.spelling_index()} span=${field.name.span.span_start()}:${field.name.span.span_end()} type=${field.field_type.id.written_type_local_index()} type_span=${field.field_type.span.span_start()}:${field.field_type.span.span_end()}")
+			RejectedRecordFields: print("REJECTED")
+	else:
+		(state, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+		out = state
+		match result:
+			ParsedExpression(value):
+				print("EXPRESSION ${value.id.expression_local_index()} span=${value.span.span_start()}:${value.span.span_end()}")
+				match value.kind:
+					RecordLiteral(fields):
+						for field in fields:
+							match field.value.kind:
+								IntegerLiteral(number): print("VALUE ${field.name.use.name_use_local_index()} spelling=${field.name.name.spelling.spelling_index()} span=${field.name.name.span.span_start()}:${field.name.name.span.span_end()} expression=${field.value.id.expression_local_index()} number=${number}")
+								_: print("ERROR VALUE")
+					_: print("ERROR SHAPE")
+			RejectedExpression: print("REJECTED")
+			UnsupportedExpression(_): print("UNSUPPORTED")
+	print("STATE cursor=${out.position()} diagnostics=${out.diagnostic_count()} definitions=${out.issued_ids().definitions.length()} expressions=${out.issued_counts().expressions} types=${out.issued_counts().written_types} uses=${out.issued_counts().name_uses}")
+	for at in out.diagnostics():
+		match at.diagnostic:
+			DuplicateField(first): print("DUPLICATE id=${first.definition_local_index()} at=${at.span.span_start()}:${at.span.span_end()}")
+			DuplicateFieldGiven(first): print("DUPLICATE span=${first.span_start()}:${first.span_end()} at=${at.span.span_start()}:${at.span.span_end()}")
+			_: print("ERROR DIAGNOSTIC")
+
+
+func main(args: List[String]) -> Int:
+	for declaration in [False, True]:
+		for repeated in [False, True]:
+			for width in [0, 1, 2, 8, 64, 256]:
+				label = "${declaration}-${repeated}-${width}"
+				if (declaration or width > 0) and args.contains(label):
+					text = input(width, repeated, declaration)
+					match new_parse_state(lex_module(module_id_at_row(3), text)):
+						Ok(entry):
+							alloc_before = read_memory_counter(ManagedAllocations)
+							release_before = read_memory_counter(ManagedReleases)
+							live_before = read_memory_counter(LiveManagedObjects)
+							backing_before = read_memory_counter(BackingMallocEvents)
+							var checksum = 0
+							for iteration in 0..3000:
+								checksum += parsed_checksum(entry, declaration)
+							alloc_after = read_memory_counter(ManagedAllocations)
+							release_after = read_memory_counter(ManagedReleases)
+							live_after = read_memory_counter(LiveManagedObjects)
+							backing_after = read_memory_counter(BackingMallocEvents)
+							print("COUNTERS active=${read_memory_counter(MemoryStatsActive)} oracle=${read_memory_counter(OracleStatsActive)} managed=${alloc_after - alloc_before} releases=${release_after - release_before} live=${live_after - live_before} backing=${backing_after - backing_before}")
+							print("OUTPUT ${label} iterations=3000 checksum=${checksum}")
+							oracle(entry, declaration)
+						Err(_):
+							print("ERROR")
+	0
