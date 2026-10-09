@@ -1528,7 +1528,7 @@ pure func test_match_header_requires_scrutinee_colon_and_lf() -> Bool:
 			39,
 			40,
 			"expected a newline after the match header",
-			"put each pattern and inline result on its own indented line",
+			"put each pattern on its own indented line, with an inline or indented result",
 		)
 	)
 
@@ -1624,38 +1624,31 @@ pure func test_match_patterns_require_supported_field_shape() -> Bool:
 			42,
 			43,
 			"expected ':' after the match pattern",
-			"write Pattern: expression on one line",
+			"write Pattern: expression, or put the arm body on the next indented line",
 		)
 		and rejects(
 			MATCH_HEADER + "\t\tValue.Empty: 1",
 			46,
 			47,
 			"expected ':' after the match pattern",
-			"write Pattern: expression on one line",
+			"write Pattern: expression, or put the arm body on the next indented line",
 		)
 	)
 
 
-pure func test_match_arms_require_colon_and_inline_result() -> Bool:
+pure func test_match_arms_require_colon_and_result() -> Bool:
 	(
 		rejects(
 			MATCH_HEADER + "\t\t_ 0",
 			43,
 			44,
 			"expected ':' after the match pattern",
-			"write Pattern: expression on one line",
+			"write Pattern: expression, or put the arm body on the next indented line",
 		)
 		and rejects(
 			MATCH_HEADER + "\t\t_:",
 			43,
 			43,
-			"expected a return expression",
-			EXPRESSION_HELP,
-		)
-		and rejects(
-			MATCH_HEADER + "\t\t_: \n\t\t\t1",
-			44,
-			45,
 			"expected a return expression",
 			EXPRESSION_HELP,
 		)
@@ -1804,9 +1797,258 @@ pure func test_binding_annotations_and_discards_remain_unsupported() -> Bool:
 	)
 
 
+pure func test_arm_block_bindings_and_inline_sibling_spans() -> Bool:
+	source = MATCH_HEADER + "\t\tA:\n\t\t\tvar current = value\n\t\t\toriginal = current\n\t\t\tcurrent = 42\n\t\t\toriginal\n\t\tB: 0"
+
+	match parse_source(source):
+		Err(_):
+			False
+		Ok(parsed):
+			program = parsed_contents(parsed)
+
+			match program.functions:
+				[function]:
+					match function.body:
+						ParsedMatchBody(body):
+							match body.arms:
+								[first, second]:
+									match first.bindings:
+										[current, original, reassigned]:
+											(
+												current.mutability == MutableBinding
+												and written_name_is(
+													program.names,
+													current.name,
+													"current",
+													51,
+													58,
+												)
+												and expression_name_is(
+													program.names,
+													current.initializer,
+													"value",
+													61,
+													66,
+												)
+												and original.mutability == ImmutableBinding
+												and written_name_is(
+													program.names,
+													original.name,
+													"original",
+													70,
+													78,
+												)
+												and expression_name_is(
+													program.names,
+													original.initializer,
+													"current",
+													81,
+													88,
+												)
+												and reassigned.mutability == ImmutableBinding
+												and written_name_is(
+													program.names,
+													reassigned.name,
+													"current",
+													92,
+													99,
+												)
+												and expression_integer_is(
+													reassigned.initializer,
+													42,
+													102,
+													104,
+												)
+												and expression_name_is(
+													program.names,
+													first.body,
+													"original",
+													108,
+													116,
+												)
+												and first.span.start == 41
+												and first.span.end == 116
+												and second.bindings.length() == 0
+												and second.span.start == 119
+												and second.span.end == 123
+												and expression_integer_is(second.body, 0, 122, 123)
+												and body.span.end == 123
+												and program.end.start == 123
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_arm_block_without_bindings_and_optional_final_lf() -> Bool:
+	var accepted = True
+
+	for suffix in ["", "\n"]:
+		match parse_source(MATCH_HEADER + "\t\t_: \n\t\t\t7" + suffix):
+			Err(_):
+				accepted = False
+			Ok(parsed):
+				match parsed_contents(parsed).functions:
+					[function]:
+						match function.body:
+							ParsedMatchBody(body):
+								match body.arms:
+									[arm]:
+										accepted = (
+											accepted
+											and arm.bindings.length() == 0
+											and expression_integer_is(arm.body, 7, 48, 49)
+										)
+									_:
+										accepted = False
+							_:
+								accepted = False
+					_:
+						accepted = False
+
+	accepted
+
+
+pure func test_arm_block_spaces_and_following_declaration() -> Bool:
+	source = "func f(value: V) -> Int:\n    match value:\n        A:\n            x = 7\n            x\n        B: 0\nfunc main() -> Int:\n    0"
+
+	match parse_source(source):
+		Err(_):
+			False
+		Ok(parsed):
+			program = parsed_contents(parsed)
+
+			match program.functions:
+				[first, second]:
+					match first.body:
+						ParsedMatchBody(body):
+							match body.arms:
+								[block, inline]:
+									match block.bindings:
+										[binding]:
+											(
+												written_name_is(
+													program.names,
+													binding.name,
+													"x",
+													65,
+													66,
+												)
+												and expression_integer_is(
+													binding.initializer,
+													7,
+													69,
+													70,
+												)
+												and expression_name_is(
+													program.names,
+													block.body,
+													"x",
+													83,
+													84,
+												)
+												and inline.bindings.length() == 0
+												and expression_integer_is(inline.body, 0, 96, 97)
+												and written_name_is(
+													program.names,
+													second.function_name,
+													"main",
+													103,
+													107,
+												)
+												and program.end.start == 123
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_arm_block_requires_result_before_sibling() -> Bool:
+	rejects(
+		MATCH_HEADER + "\t\tA:\n\t\t\tx = 1\n\t\tB: 0",
+		53,
+		55,
+		"expected a match arm result indented three levels",
+		"finish the arm with a value expression indented with three tabs or twelve spaces",
+	)
+
+
+pure func test_arm_block_requires_result_before_eof() -> Bool:
+	rejects(
+		MATCH_HEADER + "\t\t_:\n\t\t\tx = 1",
+		52,
+		52,
+		"expected a final expression after the arm bindings",
+		"finish the arm with a value expression on its own indented line",
+	)
+
+
+pure func test_arm_block_requires_exact_depth_three() -> Bool:
+	(
+		rejects(
+			MATCH_HEADER + "\t\t_:\n\t\t7",
+			44,
+			46,
+			"expected a match arm result indented three levels",
+			"finish the arm with a value expression indented with three tabs or twelve spaces",
+		)
+		and rejects(
+			MATCH_HEADER + "\t\t_:\n\t\t\t\t7",
+			44,
+			48,
+			"expected a match arm result indented three levels",
+			"finish the arm with a value expression indented with three tabs or twelve spaces",
+		)
+	)
+
+
+pure func test_arm_block_rejects_nested_match() -> Bool:
+	rejects(
+		MATCH_HEADER + "\t\t_:\n\t\t\tmatch value:\n\t\t\t\t_: 0",
+		47,
+		52,
+		"expected a return expression",
+		EXPRESSION_HELP,
+	)
+
+
+pure func test_arm_binding_requires_initializer_on_same_line() -> Bool:
+	rejects(
+		MATCH_HEADER + "\t\t_:\n\t\t\tx =\n\t\t\t0",
+		50,
+		51,
+		"expected a binding initializer",
+		"put one expression after '=' on the same line",
+	)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 EBNF syntax conformance",
 	tests = [
+		("arm block binding and sibling spans", test_arm_block_bindings_and_inline_sibling_spans),
+		(
+			"arm block without bindings and optional LF",
+			test_arm_block_without_bindings_and_optional_final_lf,
+		),
+		(
+			"arm block spaces and following declaration",
+			test_arm_block_spaces_and_following_declaration,
+		),
+		("arm block result before sibling", test_arm_block_requires_result_before_sibling),
+		("arm block result before EOF", test_arm_block_requires_result_before_eof),
+		("arm block exact depth three", test_arm_block_requires_exact_depth_three),
+		("arm block nested match rejected", test_arm_block_rejects_nested_match),
+		("arm initializer on same line", test_arm_binding_requires_initializer_on_same_line),
 		("binding prefix and final value shape", test_binding_prefix_and_final_value_shape),
 		("binding spaces and tail match", test_binding_spaces_and_tail_match),
 		(
@@ -1838,10 +2080,7 @@ tests: TestSuite = {
 			"match patterns require supported field shape",
 			test_match_patterns_require_supported_field_shape,
 		),
-		(
-			"match arms require colon and inline result",
-			test_match_arms_require_colon_and_inline_result,
-		),
+		("match arms require colon and result", test_match_arms_require_colon_and_result),
 		(
 			"union names, variants and expression byte spans",
 			test_union_names_variants_and_expression_spans,

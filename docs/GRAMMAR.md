@@ -2,7 +2,8 @@
 
 The separate [Blorp 2 pilot grammar](../blorp_2/grammar.ebnf) defines that
 compiler's restricted subset, including binding prefixes before a final
-expression or tail match. The grammar below describes the full language.
+expression or tail match, and depth-three binding blocks inside match arms.
+The grammar below describes the full language.
 
 This document is the authoritative specification of Blorp's syntax. A parser
 implementer, a reviewer or a fuzzer should be able to decide from it alone

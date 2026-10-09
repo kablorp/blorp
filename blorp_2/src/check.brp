@@ -149,6 +149,7 @@ fixed union CheckedPattern:
 
 fixed record CheckedArm {
 	pattern: CheckedPattern,
+	assignments: List[CheckedAssignment],
 	body: CheckedValue
 }
 
@@ -1399,16 +1400,7 @@ private pure func resolve_match(
 	var definitions = bindings
 
 	for arm in body.arms:
-		match resolve_arm(
-			purity,
-			return_type,
-			owner,
-			definitions.length(),
-			scope,
-			arm,
-			remaining,
-			context,
-		):
+		match resolve_arm(purity, return_type, owner, definitions, scope, arm, remaining, context):
 			Err(error):
 				failure = Some(error)
 				break
@@ -1416,11 +1408,7 @@ private pure func resolve_match(
 				arms = arms.append(resolved.arm)
 				remaining = resolved.remaining
 
-				match resolved.binding:
-					Some(definition):
-						definitions = definitions.append(definition)
-					None:
-						void
+				definitions = resolved.bindings
 
 	match failure:
 		Some(error):
@@ -1442,7 +1430,7 @@ private pure func resolve_match(
 private fixed record ResolvedArm {
 	arm: CheckedArm,
 	remaining: List[VariantId],
-	binding: Option[BindingDefinition]
+	bindings: List[BindingDefinition]
 }
 
 
@@ -1450,22 +1438,31 @@ private pure func resolve_arm(
 	purity: Purity,
 	return_type: TypeRef,
 	owner: UnionId,
-	ordinal: Int,
+	bindings: List[BindingDefinition],
 	scope: List[LocalBinding],
 	arm: ParsedMatchArm,
 	remaining: List[VariantId],
 	context: ResolutionContext,
 ) -> Result[ResolvedArm, Diagnostic]:
-	pattern ?= resolve_pattern(arm.pattern, owner, ordinal, scope, context)
+	pattern ?= resolve_pattern(arm.pattern, owner, bindings.length(), scope, context)
 	remaining ?= remaining_after(pattern.pattern, remaining, pattern_span(arm.pattern))
-	value ?= resolve_value(purity, pattern.scope, arm.body, Some(return_type), context)
+
+	definitions = match pattern.binding:
+		Some(definition):
+			bindings.append(definition)
+		None:
+			bindings
+
+	prefix ?= resolve_bindings(arm.bindings, purity, pattern.scope, definitions, context)
+	value ?= resolve_value(purity, prefix.scope, arm.body, Some(return_type), context)
 	Ok({
 		arm = {
 			pattern = pattern.pattern,
+			assignments = prefix.assignments,
 			body = value.value
 		},
 		remaining = remaining,
-		binding = pattern.binding,
+		bindings = prefix.bindings,
 	})
 
 
@@ -1524,6 +1521,7 @@ private pure func resolve_assignment(
 	purity: Purity,
 	scope: List[LocalBinding],
 	ordinal: Int,
+	block_start: Int,
 	context: ResolutionContext,
 ) -> Result[ResolvedAssignment, Diagnostic]:
 	previous = lookup_binding(scope, written.name.id)
@@ -1535,16 +1533,22 @@ private pure func resolve_assignment(
 				Some(binding):
 					match binding.definition.origin:
 						BodyLocal:
-							Err(
-								rejection(
-									written.name.span,
-									"duplicate local binding",
-									Text.concat(
-										"give each body-local declaration a distinct name; ",
-										"omit var to reassign a mutable binding",
+							if IntOps.greater_than_or_equal(
+								binding_number(binding.id),
+								block_start,
+							):
+								Err(
+									rejection(
+										written.name.span,
+										"duplicate local binding",
+										Text.concat(
+											"give each body-local declaration a distinct name; ",
+											"omit var to reassign a mutable binding",
+										),
 									),
-								),
-							)
+								)
+							else:
+								Ok(empty)
 						_:
 							Ok(empty)
 				None:
@@ -1609,21 +1613,36 @@ private pure func resolve_assignment(
 			})
 
 
-private pure func resolve_body(
-	function: ParsedFunction,
-	signature: FunctionSignature,
+private fixed record ResolvedBindings {
+	bindings: List[BindingDefinition],
+	scope: List[LocalBinding],
+	assignments: List[CheckedAssignment]
+}
+
+
+private pure func resolve_bindings(
+	written_bindings: List[ParsedBinding],
+	purity: Purity,
+	initial: List[LocalBinding],
+	bindings: List[BindingDefinition],
 	context: ResolutionContext,
-) -> Result[ResolvedBody, Diagnostic]:
-	initial ?= function_scope(function, signature)
+) -> Result[ResolvedBindings, Diagnostic]:
 	var scope = initial
-	var definitions = initial.map(
-		pure func(binding: LocalBinding) -> BindingDefinition: binding.definition,
-	)
+	var definitions = bindings
 	var assignments: List[CheckedAssignment] = []
 	var failure: Option[Diagnostic] = None
 
-	for written in function.bindings:
-		match resolve_assignment(written, signature.purity, scope, definitions.length(), context):
+	-- Function-owned ordinals distinguish this block's declarations from outer
+	-- bindings and the arm capture. Only explicit var may shadow those bindings.
+	for written in written_bindings:
+		match resolve_assignment(
+			written,
+			purity,
+			scope,
+			definitions.length(),
+			bindings.length(),
+			context,
+		):
 			Err(error):
 				failure = Some(error)
 				break
@@ -1637,38 +1656,57 @@ private pure func resolve_body(
 					None:
 						void
 
-	accepted ?= match failure:
+	match failure:
 		Some(error):
 			Err(error)
 		None:
-			Ok(void)
+			Ok({
+				bindings = definitions,
+				scope = scope,
+				assignments = assignments,
+			})
+
+
+private pure func resolve_body(
+	function: ParsedFunction,
+	signature: FunctionSignature,
+	context: ResolutionContext,
+) -> Result[ResolvedBody, Diagnostic]:
+	initial ?= function_scope(function, signature)
+	prefix ?= resolve_bindings(
+		function.bindings,
+		signature.purity,
+		initial,
+		initial.map(pure func(binding: LocalBinding) -> BindingDefinition: binding.definition),
+		context,
+	)
 
 	match function.body:
 		ParsedValueBody(body):
 			value ?= resolve_value(
 				signature.purity,
-				scope,
+				prefix.scope,
 				body,
 				Some(signature.return_type),
 				context,
 			)
 			Ok({
-				bindings = definitions,
-				assignments = assignments,
+				bindings = prefix.bindings,
+				assignments = prefix.assignments,
 				body = CheckedValueBody(value.value),
 			})
 		ParsedMatchBody(body):
 			matched ?= resolve_match(
 				signature.purity,
 				signature.return_type,
-				scope,
+				prefix.scope,
 				body,
-				definitions,
+				prefix.bindings,
 				context,
 			)
 			Ok({
 				bindings = matched.bindings,
-				assignments = assignments,
+				assignments = prefix.assignments,
 				body = CheckedMatchBody(matched.body),
 			})
 
@@ -1758,13 +1796,13 @@ private pure func unsettled_value(body: CheckedValue, settled: List[FunctionId])
 	found
 
 
-private pure func unsettled_edge(
-	function: CheckedFunction,
+private pure func unsettled_assignments(
+	assignments: List[CheckedAssignment],
 	settled: List[FunctionId],
 ) -> Option[Span]:
 	var found: Option[Span] = None
 
-	for assignment in function.assignments:
+	for assignment in assignments:
 		value = match assignment:
 			InitializeBinding(_, value):
 				value
@@ -1776,10 +1814,18 @@ private pure func unsettled_edge(
 		if found.is_some():
 			break
 
-	if found.is_some():
-		found
-	else:
-		unsettled_body(function.body, settled)
+	found
+
+
+private pure func unsettled_edge(
+	function: CheckedFunction,
+	settled: List[FunctionId],
+) -> Option[Span]:
+	match unsettled_assignments(function.assignments, settled):
+		Some(span):
+			Some(span)
+		None:
+			unsettled_body(function.body, settled)
 
 
 private pure func unsettled_body(body: CheckedBody, settled: List[FunctionId]) -> Option[Span]:
@@ -1793,7 +1839,10 @@ private pure func unsettled_body(body: CheckedBody, settled: List[FunctionId]) -
 				if found.is_some():
 					break
 
-				found = unsettled_value(arm.body, settled)
+				found = unsettled_assignments(arm.assignments, settled)
+
+				if not found.is_some():
+					found = unsettled_value(arm.body, settled)
 
 			found
 

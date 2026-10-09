@@ -3,6 +3,7 @@ import:
 	list: reverse
 	names: NameTable, find_name, initial_names, intern_name
 	option: is_some, to_result
+	result: and_then
 	string: index_of
 	syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
@@ -725,7 +726,7 @@ private pure func consume_match(start: ParserState) -> Result[BodyResult, Diagno
 		colon,
 		Newline,
 		"expected a newline after the match header",
-		"put each pattern and inline result on its own indented line",
+		"put each pattern on its own indented line, with an inline or indented result",
 	)
 	var state = newline
 	var arms: List[ParsedMatchArm] = []
@@ -788,12 +789,29 @@ private pure func consume_arm(state: ParserState) -> Result[ArmResult, Diagnosti
 		pattern.next,
 		Colon,
 		"expected ':' after the match pattern",
-		"write Pattern: expression on one line",
+		"write Pattern: expression, or put the arm body on the next indented line",
 	)
-	body ?= consume_value(colon)
+
+	prefix ?= if at_symbol(colon, Newline):
+		consume_binding_indent(
+			{ colon | position = IntOps.add(colon.position, 1) },
+			ArmBindings,
+		).and_then(
+			pure func(
+				indented: ParserState,
+			) -> Result[BindingPrefix, Diagnostic]: consume_bindings(indented, ArmBindings),
+		)
+	else:
+		Ok({
+			bindings = [],
+			next = colon,
+		})
+
+	body ?= consume_value(prefix.next)
 	Ok({
 		arm = {
 			pattern = pattern.pattern,
+			bindings = prefix.bindings,
 			body = body.body,
 			span = {
 				start = pattern.span.start,
@@ -821,6 +839,32 @@ private fixed record BindingPrefix {
 }
 
 
+private fixed union BindingBlock:
+	FunctionBindings
+	ArmBindings
+
+
+private pure func consume_binding_indent(
+	state: ParserState,
+	block: BindingBlock,
+) -> Result[ParserState, Diagnostic]:
+	match block:
+		FunctionBindings:
+			consume_indent(
+				state,
+				1,
+				"expected a final expression after the bindings",
+				"finish the function with a value expression or tail match indented one level",
+			)
+		ArmBindings:
+			consume_indent(
+				state,
+				3,
+				"expected a match arm result indented three levels",
+				"finish the arm with a value expression indented with three tabs or twelve spaces",
+			)
+
+
 private pure func at_binding(state: ParserState) -> Bool:
 	if at_symbol(state, VarKeyword):
 		True
@@ -842,7 +886,10 @@ private fixed record BindingLine {
 }
 
 
-private pure func consume_binding(state: ParserState) -> Result[BindingLine, Diagnostic]:
+private pure func consume_binding(
+	state: ParserState,
+	block: BindingBlock,
+) -> Result[BindingLine, Diagnostic]:
 	mutability = if at_symbol(state, VarKeyword):
 		MutableBinding
 	else:
@@ -876,18 +923,20 @@ private pure func consume_binding(state: ParserState) -> Result[BindingLine, Dia
 	else:
 		consume_value(equals)
 
-	newline ?= consume_symbol(
-		initializer.next,
-		Newline,
-		"expected a final expression after the bindings",
-		"finish the function with a value expression or tail match",
-	)
-	next ?= consume_indent(
-		newline,
-		1,
-		"expected a final expression after the bindings",
-		"finish the function with a value expression or tail match indented one level",
-	)
+	message = match block:
+		FunctionBindings:
+			"expected a final expression after the bindings"
+		ArmBindings:
+			"expected a final expression after the arm bindings"
+
+	help = match block:
+		FunctionBindings:
+			"finish the function with a value expression or tail match"
+		ArmBindings:
+			"finish the arm with a value expression on its own indented line"
+
+	newline ?= consume_symbol(initializer.next, Newline, message, help)
+	next ?= consume_binding_indent(newline, block)
 	Ok({
 		binding = {
 			name = name.name,
@@ -898,13 +947,16 @@ private pure func consume_binding(state: ParserState) -> Result[BindingLine, Dia
 	})
 
 
-private pure func consume_bindings(start: ParserState) -> Result[BindingPrefix, Diagnostic]:
+private pure func consume_bindings(
+	start: ParserState,
+	block: BindingBlock,
+) -> Result[BindingPrefix, Diagnostic]:
 	var state = start
 	var bindings: List[ParsedBinding] = []
 	var failure: Option[Diagnostic] = None
 
 	while at_binding(state):
-		match consume_binding(state):
+		match consume_binding(state, block):
 			Err(error):
 				failure = Some(error)
 				break
@@ -982,7 +1034,7 @@ private pure func consume_function(start: ParserState) -> Result[FunctionResult,
 		"expected an indent of one tab or four spaces",
 		"indent the body with exactly one tab or four spaces",
 	)
-	prefix ?= consume_bindings(after_indent)
+	prefix ?= consume_bindings(after_indent, FunctionBindings)
 	body ?= consume_function_body(prefix.next)
 	Ok({
 		function = {

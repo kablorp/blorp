@@ -1,6 +1,7 @@
 # Memory architecture
 
-Status: scalar binding checking and value lowering implemented; managed
+Status: scalar binding checking and value lowering, including match-arm
+blocks, implemented; managed
 responsibilities and later increments proposed, 2026-10-09. This document
 adds no runtime machinery. Read
 [AGENTS.md](AGENTS.md) and the parent instructions first. The current pilot
@@ -348,8 +349,20 @@ nor code coverage promotes it to verified support.
 
 ## Increment sequence and evidence
 
+After composing bindings with match-arm blocks, the agreed order is value
+identity versus ownership obligations, borrow dependencies, then independent
+verification. These are ordered responsibilities within small executable
+increments, not permission to add three speculative frameworks. Introduce
+each distinction only with a supported example that needs it, publish complete
+typed facts, and keep one authority for each fact. Granular tests at every
+affected phase boundary are mandatory, including exact rejection cases and
+deliberate invalid-operation mutations. A managed example must have all three
+responsibilities integrated and verified before it is accepted; an intermediate
+slice must not create an unchecked managed-emission path.
+
 1. **Scalar bindings:** establish identity, immutable/mutable rules and ordered
-   value versions. Keep current unmanaged layout and native result oracles.
+   value versions, including branch-local arm blocks. Keep current unmanaged
+   layout and native result oracles.
 2. **One managed value:** explicit layout/ABI, ownership insertion and independent
    straight-line verification integrated together; fresh allocation, copy,
    return, unused value and reassignment fixtures.
