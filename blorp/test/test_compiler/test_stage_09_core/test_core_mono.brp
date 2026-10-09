@@ -481,6 +481,204 @@ func test_collects_implicit_trailing_dimension_pack() -> Bool:
 			False
 
 
+func test_trailing_pack_kind_selects_dimension_substitution() -> Bool:
+	param_type = tensor_type(named_type("Int"), [TensorVariadicDim("Dims")])
+	arg_type = tensor_type(named_type("Int"), [TensorStaticDim(2), TensorStaticDim(3)])
+
+	match (
+		collect_type_substitution(["Dims"], [], param_type, arg_type, []),
+		collect_type_substitution(["Dims"], [], type_parameter("Dims"), named_type("String"), []),
+	):
+		(Some(dim_substitution), Some(type_substitution)):
+			(
+				substitution_has_value(
+					dim_substitution,
+					"Dims",
+					DimPackSubstitution([TensorStaticDim(2), TensorStaticDim(3)]),
+				)
+				and substitution_has_value(
+					type_substitution,
+					"Dims",
+					TypeSubstitution(named_type("String")),
+				)
+				and core_mono_type_equal(apply_type_substitution(dim_substitution, param_type), arg_type)
+				and substitution_closes_parameters(dim_substitution, ["Dims"])
+			)
+		_:
+			False
+
+
+func test_trailing_pack_preserves_prefix_and_implicit_parameters() -> Bool:
+	param_type = tensor_type(
+		named_type("Int"),
+		[TensorRuntimeDim("#N"), TensorStaticDim(5), TensorVariadicDim("Dims")],
+	)
+	arg_type = tensor_type(
+		named_type("Int"),
+		[TensorStaticDim(2), TensorStaticDim(5), TensorStaticDim(3), TensorStaticDim(4)],
+	)
+	var valid: Bool = True
+
+	for type_params in [["#N", "Dims"], ["#N"]]:
+		case_valid: Bool = match collect_type_substitution(type_params, [], param_type, arg_type, []):
+			Some(substitution):
+				(
+					substitution_has_value(substitution, "#N", DimSubstitution(TensorStaticDim(2)))
+					and substitution_has_value(
+						substitution,
+						"Dims",
+						DimPackSubstitution([TensorStaticDim(3), TensorStaticDim(4)]),
+					)
+					and core_mono_type_equal(apply_type_substitution(substitution, param_type), arg_type)
+				)
+			None:
+				False
+
+		valid = valid and case_valid
+
+	valid
+
+
+func test_trailing_pack_accepts_empty_remainder() -> Bool:
+	arg_type = tensor_type(named_type("Int"), [TensorStaticDim(2)])
+	var valid: Bool = True
+
+	for name in ["Dims", "#Dims"]:
+		param_type = tensor_type(named_type("Int"), [TensorStaticDim(2), TensorVariadicDim(name)])
+		case_valid: Bool = match collect_type_substitution([name], [], param_type, arg_type, []):
+			Some(substitution):
+				(
+					substitution_has_value(substitution, name, DimPackSubstitution([]))
+					and core_mono_type_equal(apply_type_substitution(substitution, param_type), arg_type)
+					and substitution_closes_parameters(substitution, [name])
+				)
+			None:
+				False
+
+		valid = valid and case_valid
+
+	valid
+
+
+func test_unsigilled_outer_pack_stays_open_in_both_orders() -> Bool:
+	param_type = tensor_type(named_type("Int"), [TensorVariadicDim("Dims")])
+	concrete_type = tensor_type(named_type("Int"), [TensorStaticDim(2), TensorStaticDim(3)])
+
+	identity_then_concrete: Bool = match collect_type_substitution([], ["Dims"], param_type, param_type, []):
+		Some(identity):
+			match collect_type_substitution([], ["Dims"], param_type, concrete_type, identity):
+				Some(open):
+					(
+						substitution_has_value(open, "Dims", DimPackSubstitution([TensorVariadicDim("Dims")]))
+						and not is_concrete_substitution(["Dims"], open)
+					)
+				None:
+					False
+		None:
+			False
+
+	concrete_then_identity: Bool = match collect_type_substitution([], ["Dims"], param_type, concrete_type, []):
+		Some(concrete):
+			match collect_type_substitution([], ["Dims"], param_type, param_type, concrete):
+				Some(open):
+					(
+						substitution_has_value(open, "Dims", DimPackSubstitution([TensorVariadicDim("Dims")]))
+						and not is_concrete_substitution(["Dims"], open)
+					)
+				None:
+					False
+		None:
+			False
+
+	identity_then_concrete and concrete_then_identity
+
+
+func test_trailing_pack_rejects_conflicting_evidence() -> Bool:
+	arg_type = tensor_type(named_type("Int"), [TensorStaticDim(3)])
+	conflicting_values: List[CoreMonoSubstitutionValue] = [
+		DimPackSubstitution([TensorStaticDim(2)]),
+		TypeSubstitution(named_type("Int")),
+	]
+	var valid: Bool = True
+
+	for name in ["Dims", "#Dims"]:
+		param_type = tensor_type(named_type("Int"), [TensorVariadicDim(name)])
+		for existing in conflicting_values:
+			valid = valid and collect_type_substitution(
+				[name],
+				[],
+				param_type,
+				arg_type,
+				[(name, existing)],
+			).is_none()
+
+	valid
+
+
+func test_trailing_pack_wildcard_keeps_only_prefix_evidence() -> Bool:
+	param_type = tensor_type(named_type("Int"), [TensorRuntimeDim("#N"), TensorVariadicDim("#_")])
+	arg_type = tensor_type(named_type("Int"), [TensorStaticDim(2), TensorStaticDim(3)])
+
+	match collect_type_substitution(["#N", "#_"], [], param_type, arg_type, []):
+		Some(substitution):
+			(
+				substitution.length() == 1
+				and substitution_has_value(substitution, "#N", DimSubstitution(TensorStaticDim(2)))
+				and substitution_value(substitution, "#_").is_none()
+			)
+		None:
+			False
+
+
+func test_nonterminal_pack_preserves_prefix_evidence() -> Bool:
+	arg_type = tensor_type(named_type("Int"), [TensorStaticDim(5), TensorStaticDim(2), TensorStaticDim(3)])
+	var valid: Bool = True
+
+	for name in ["Dims", "#Dims"]:
+		param_type = tensor_type(
+			named_type("Int"),
+			[TensorRuntimeDim("#N"), TensorVariadicDim(name), TensorStaticDim(3)],
+		)
+		case_valid: Bool = match collect_type_substitution(["#N", name], [], param_type, arg_type, []):
+			Some(substitution):
+				(
+					substitution.length() == 1
+					and substitution_has_value(substitution, "#N", DimSubstitution(TensorStaticDim(5)))
+					and substitution_value(substitution, name).is_none()
+					and core_mono_type_equal(
+						apply_type_substitution(substitution, param_type),
+						tensor_type(named_type("Int"), [TensorStaticDim(5), TensorVariadicDim(name), TensorStaticDim(3)]),
+					)
+				)
+			None:
+				False
+
+		valid = valid and case_valid
+
+	valid
+
+
+func test_trailing_pack_identity_keeps_closed_evidence() -> Bool:
+	var valid: Bool = True
+
+	for name in ["Dims", "#Dims"]:
+		param_type = tensor_type(named_type("Int"), [TensorVariadicDim(name)])
+		closed: CoreMonoSubstitution = [(name, DimPackSubstitution([TensorStaticDim(2)]))]
+		case_valid: Bool = match collect_type_substitution([name], [], param_type, param_type, closed):
+			Some(substitution):
+				(
+					substitution.length() == 1
+					and substitution_has_value(substitution, name, DimPackSubstitution([TensorStaticDim(2)]))
+					and substitution_closes_parameters(substitution, [name])
+				)
+			None:
+				False
+
+		valid = valid and case_valid
+
+	valid
+
+
 func test_applies_nested_type_and_dimension_substitution() -> Bool:
 	substitution: CoreMonoSubstitution = [
 		("T", TypeSubstitution(named_type("Float"))),
@@ -806,6 +1004,26 @@ tests: TestSuite = {
 			"collects implicit trailing dimension pack",
 			test_collects_implicit_trailing_dimension_pack,
 		),
+		(
+			"trailing pack kind selects dimension substitution",
+			test_trailing_pack_kind_selects_dimension_substitution,
+		),
+		(
+			"trailing pack preserves prefix and implicit parameters",
+			test_trailing_pack_preserves_prefix_and_implicit_parameters,
+		),
+		("trailing pack accepts empty remainder", test_trailing_pack_accepts_empty_remainder),
+		(
+			"unsigilled outer pack stays open in both orders",
+			test_unsigilled_outer_pack_stays_open_in_both_orders,
+		),
+		("trailing pack rejects conflicting evidence", test_trailing_pack_rejects_conflicting_evidence),
+		(
+			"trailing pack wildcard keeps only prefix evidence",
+			test_trailing_pack_wildcard_keeps_only_prefix_evidence,
+		),
+		("nonterminal pack preserves prefix evidence", test_nonterminal_pack_preserves_prefix_evidence),
+		("trailing pack identity keeps closed evidence", test_trailing_pack_identity_keeps_closed_evidence),
 		(
 			"applies nested type and dimension substitution",
 			test_applies_nested_type_and_dimension_substitution,

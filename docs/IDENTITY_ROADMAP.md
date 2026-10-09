@@ -429,11 +429,16 @@ Remaining:
   dimension parameters into its private named-factor channel; ordinary type
   variables retain their full semantic kind through the existing opaque-factor
   path. Reconstruction uses that admission rather than re-reading the sigil.
-  Equality and solver cuts do not add kinds to Core or type-parameter-list
-  carriers; those migrations and name-based binding identity remain open.
-  Route `mono.brp`'s dimension handling through the kind, then
-  delete `type_parameter_name_kind`'s sigil read once `List[String]` type-parameter
-  lists carry kinds.
+  Mono's terminal `TensorVariadicDim` consumer now uses that existing variant
+  as its pack-kind authority rather than checking the substitution key's prefix.
+  The `#_` wildcard, implicit packs, caller-rigid evidence and conflict behavior
+  remain unchanged. This retires one of three Mono sigil-reader calls; two
+  value-parameter readers and the helper's allowlist row remain. These cuts do
+  not add kinds to Core value types or type-parameter-list carriers, and
+  name-based binding identity remains open. Route the remaining value-parameter
+  consumers through explicit kind when those carriers provide it; delete
+  `type_parameter_name_kind`'s sigil read once bare-name parameter lists carry
+  kinds. See the [terminal-pack validation and resource report](../benchmarks/results/compiler_mono_pack_kind_2026-10-08.md).
 - **Tuple field access** parsed as `NamedField(NameId) | TupleIndex(Int)` by the
   parser; the five decimal readers (`infer.brp`, CTFE `ir.brp`, `lower.brp`, the
   formatter) go.
