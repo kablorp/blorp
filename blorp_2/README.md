@@ -15,7 +15,7 @@ func main() -> Int:
 ```
 
 The executable returns exit status 0 with empty stdout and stderr. This first
-increment needs no imports, prelude, builtin functions, or target runtime.
+example needs no imports, builtin functions, or target runtime.
 The next example adds a call to a zero-argument function:
 
 [`test/e2e/fixtures/call_one.brp`](test/e2e/fixtures/call_one.brp):
@@ -109,7 +109,9 @@ hit when its source changes are reverted.
 Each fixture still owns fresh temporary output, native execution, allocation
 checks and three instruction samples. These checks never reuse fixture output.
 
-Every source module has a matching unit suite under `test/unit/`. Integration
+Every host-compiled source module has a matching unit suite under `test/unit/`.
+The staged target prelude is a future input fixture, not a host module.
+Integration
 and native execution suites live under `test/e2e/`; their input programs live
 under `test/e2e/fixtures/`. The suites use the existing compiler's `TestSuite`
 API and run with `bin/blorp test --suite`; the example
@@ -125,12 +127,16 @@ deliberately as examples and the compiler grow; tests never raise them automatic
 The call-one limits in [`test/e2e/test_call_one.brp`](test/e2e/test_call_one.brp)
 are **230 managed allocations** and **26,000,000 retired instructions**.
 The shared native/cost harness gives each fixture its own expected C, exit status
-and limits. The pure-call fixture has **360 managed allocations** and
-**32,000,000 retired instructions** as its initial ceilings.
+and limits. The pure-call fixture has **400 managed allocations** and
+**32,000,000 retired instructions** as its current ceilings; its allocation
+ceiling was deliberately raised from 360 for full integer conversion.
 Both nested-call fixtures have **500 managed allocations** and **40,000,000
-retired instructions** as their initial ceilings. Earlier ceilings remain unchanged.
+retired instructions** as their initial ceilings.
 Both UFCS fixtures have **550 managed allocations** and **40,000,000 retired
-instructions** as their initial ceilings; the five earlier examples keep their limits.
+instructions** as their initial ceilings. The return-42 fixture has **230 managed
+allocations** and **26,000,000 retired instructions** as its ceilings. Small
+allocation changes are reported alongside work and readability; they do not
+justify literal-specific fast paths.
 
 These measure one execution of the new compiler on the example, including
 process startup, argument handling, input/output, and the compile pipeline.
@@ -159,7 +165,7 @@ the earlier measurements and final validation provenance.
 
 This specification defines only the examples' language: one or more functions
 with explicit return types and zero or one explicitly typed parameter. A function
-body starts with the integer literal `0` or `1`, its own parameter name, or a
+body starts with a signed Int64 literal, its own parameter name, or a
 direct call with zero or one argument. UFCS suffixes may follow that expression.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
 No other declarations, expressions, literals, statements, or comments are supported.
@@ -196,8 +202,12 @@ Lexical and layout rules:
 - `func` and `pure` are reserved. The optional `pure` qualifier precedes `func`
   with spaces between the two keywords. Function, parameter and type names are
   identifiers whose meaning is checked after parsing.
-- Integer literals are the single characters `0` and `1`. Other values and
-  spellings, including `00`, `-0`, and `0.0`, are outside this increment.
+- Integer literals are decimal values from `-9223372036854775808` through
+  `9223372036854775807`, with an optional adjacent minus. `-0` is accepted
+  and has value zero. Leading zeros (`00`, `-01`), plus signs, separated minus
+  signs and arithmetic operators are rejected. The lexer preserves the whole
+  digit run; the parser validates spelling and range before converting it.
+  A dot starts UFCS: `42.identity()` is a call, while `42.5` is invalid.
   Non-ASCII characters and CRLF line endings are rejected.
 - Every token must be consumed. Extra expressions and malformed declarations are errors.
 
@@ -251,12 +261,15 @@ The impure command shell owns file I/O and diagnostic rendering. Its pure
 pipeline publishes these complete results:
 
 1. Lexing produces tokens with source spans and an explicit end-of-source span.
+   Integer tokens retain their complete raw spelling.
 2. Parsing produces complete declarations, parameter annotations, written names,
    and expression syntax. Each expression has a literal, name, or zero-argument
    call base, followed by unary call wrappers in evaluation order. Each wrapper
    retains explicit direct or receiver notation because their target lookup differs.
    A local interning builder assigns one opaque `NameId` per spelling. Parsing
    seals the complete syntax and immutable name table in an opaque `ParsedProgram`.
+   Integer conversion accumulates negatively against derived range cutoffs,
+   checking before multiplication so even the minimum is represented safely.
 3. Checking validates signatures and call chains, resolves calls to function
    identities and parameter reads to the sole parameter slot, and publishes an
    opaque checked program with its entrypoint identity. Call notation is erased
@@ -277,8 +290,25 @@ programs need no target heap allocation or ownership pass.
 Ownership, type registries, and general pass infrastructure will be introduced
 when an executable example requires them.
 
+[`src/prelude_temp.brp`](src/prelude_temp.brp) stages the target declaration
+`type Int = builtin`. It is neither imported by the host compiler nor loaded
+by Blorp 2 yet: the host permits builtin type declarations only in its standard
+library, and the pilot does not parse type declarations or imports. Until the
+next prelude-loading increment, the parser and emitter use the existing host
+`int` module's signed bounds, and the frontend seeds the known `Int` spelling
+before publishing NameIds. This is a temporary host dependency, not a loaded
+target prelude or a claim of bootstrap readiness.
+
 C emission uses the whitespace required to separate C tokens and a final LF.
 It adds no indentation or internal line breaks for presentation.
+Nonnegative literals use `INT64_C`; negative literals negate a representable
+positive magnitude. The minimum uses `<stdint.h>`'s `INT64_MIN`, avoiding an
+unrepresentable positive magnitude. The new
+[`return_42.brp`](test/e2e/fixtures/return_42.brp) example exits 42. The endpoint
+TestSuite calls generated `int64_t` helpers directly from an independent C
+driver and compares against `INT64_MIN` and `INT64_MAX` under UBSan. It also
+changes the emitted minimum to zero and requires the driver to fail. This
+checks full-width values independently of the platform's process exit status.
 
 The lexer shares token/diagnostic construction and byte-run scanning helpers.
 Their local work is separate from collecting tokens and advancing the cursor.

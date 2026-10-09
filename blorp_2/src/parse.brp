@@ -3,8 +3,10 @@ import:
 	list: reverse
 	names: NameTable, find_name, initial_names, intern_name
 	option: is_some
+	string: index_of
 	syntax:
 		CallNotation(DirectCall, ReceiverCall),
+		DECIMAL_DIGITS,
 		Diagnostic,
 		ExpressionBase(IntegerExpression, NameExpression, CallExpression),
 		LexedProgram,
@@ -20,7 +22,7 @@ import:
 		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral),
 		UnaryCall,
 		WrittenName,
-	text: concat
+	text as Text
 
 
 private fixed record ParserState {
@@ -213,13 +215,104 @@ private pure func at_symbol(state: ParserState, symbol: Symbol) -> Bool:
 			False
 
 
+private DECIMAL_RADIX: Int = 10
+
+
+private pure func integer_error(span: Span, message: String, help: String) -> Diagnostic:
+	{
+		span = span,
+		message = message,
+		help = help
+	}
+
+
+private pure func invalid_integer(span: Span) -> Diagnostic:
+	integer_error(
+		span,
+		"invalid integer literal",
+		"write decimal digits, optionally preceded by an adjacent '-'",
+	)
+
+
+private pure func integer_value(spelling: String, span: Span) -> Result[Int, Diagnostic]:
+	negative: Bool = spelling.starts_with("-")
+
+	digit_start: Int = if negative:
+		1
+	else:
+		0
+
+	if IntOps.equals(digit_start, spelling.length()):
+		Err(invalid_integer(span))
+	else if IntOps.less_than(
+		IntOps.add(digit_start, 1),
+		spelling.length(),
+	) and Text.equals(
+		spelling.substring(digit_start, 1),
+		"0",
+	):
+		Err(
+			integer_error(
+				span,
+				"integer literals cannot have leading zeros",
+				"write 0 or -0, or remove the leading zeros",
+			),
+		)
+	else:
+		limit: Int = if negative:
+			IntOps.INT_MIN
+		else:
+			IntOps.subtract(0, IntOps.INT_MAX)
+
+		decimal_cutoff: Int = IntOps.divide(limit, DECIMAL_RADIX)
+		var position: Int = digit_start
+		var value: Int = 0
+		var failure: Option[Diagnostic] = None
+
+		while IntOps.less_than(position, spelling.length()):
+			match DECIMAL_DIGITS.index_of(spelling.substring(position, 1)):
+				None:
+					failure = Some(invalid_integer(span))
+					break
+				Some(digit):
+					-- Accumulate negatively so the minimum needs no overflowing magnitude.
+					if IntOps.less_than(value, decimal_cutoff) or IntOps.less_than(
+						IntOps.multiply(value, DECIMAL_RADIX),
+						IntOps.add(limit, digit),
+					):
+						failure = Some(
+							integer_error(
+								span,
+								"integer literal is outside the Int64 range",
+								"use a value from -9223372036854775808 to 9223372036854775807",
+							),
+						)
+						break
+
+					value = IntOps.subtract(
+						IntOps.multiply(value, DECIMAL_RADIX),
+						digit,
+					)
+					position = IntOps.add(position, 1)
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				if negative:
+					Ok(value)
+				else:
+					Ok(IntOps.subtract(0, value))
+
+
 private pure func consume_expression_step(state: ParserState) -> Result[ExpressionStep, Diagnostic]:
 	match state.input.tokens.get(state.position):
 		Some(token):
 			after_token: ParserState = { state | position = IntOps.add(state.position, 1) }
 
 			match token.kind:
-				IntegerLiteral(value):
+				IntegerLiteral(spelling):
+					value ?= integer_value(spelling, token.span)
 					Ok(ReadBase(IntegerExpression(value), after_token))
 				IdentifierToken(spelling):
 					names = intern_name(state.names, spelling)
@@ -261,7 +354,7 @@ private pure func consume_expression_step(state: ParserState) -> Result[Expressi
 						expected(
 							state,
 							"expected a return expression",
-							"use 0, 1, a parameter name, or a call as the entire body",
+							"use an Int literal, a parameter name, or a call as the entire body",
 						),
 					)
 		None:
@@ -269,7 +362,7 @@ private pure func consume_expression_step(state: ParserState) -> Result[Expressi
 				expected(
 					state,
 					"expected a return expression",
-					"use 0, 1, a parameter name, or a call as the entire body",
+					"use an Int literal, a parameter name, or a call as the entire body",
 				),
 			)
 
