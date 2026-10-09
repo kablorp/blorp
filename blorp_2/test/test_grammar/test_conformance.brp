@@ -1,0 +1,521 @@
+import:
+	../../src/lex: lex
+	../../src/parse: parse
+	../../src/syntax:
+		Diagnostic,
+		IntegerValue(Zero, One),
+		ParsedProgram,
+		Purity(Pure, Impure),
+		ReturnExpression(IntegerExpression, CallExpression),
+	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+private IDENTIFIER_HELP: String = (
+	"use an ASCII identifier starting with a letter or underscore; 'func' and 'pure' "
+	+ "are reserved"
+)
+
+private INDENT_HELP: String = "use exactly one tab or exactly four spaces before the return expression"
+
+private CHARACTER_HELP: String = "use func main() -> Int: followed by an indented 0; keep -> adjacent"
+
+private TRAILING_HELP: String = "start each declaration at column 1 with no blank lines"
+
+
+private pure func parse_source(source: String) -> Result[ParsedProgram, Diagnostic]:
+	input ?= lex(source)
+	parse(input)
+
+
+-- Expected names and byte spans are written independently of the lexer/parser.
+private pure func accepts(
+	source: String,
+	name: String,
+	name_start: Int,
+	name_end: Int,
+	type_name: String,
+	type_start: Int,
+	type_end: Int,
+) -> Bool:
+	match parse_source(source):
+		Err(_):
+			False
+		Ok(program):
+			match program.functions:
+				[function]:
+					match function.body:
+						IntegerExpression(value):
+							(
+								value == Zero
+								and function.purity == Impure
+								and function.function_name.spelling == name
+								and function.function_name.span.start == name_start
+								and function.function_name.span.end == name_end
+								and function.return_type.spelling == type_name
+								and function.return_type.span.start == type_start
+								and function.return_type.span.end == type_end
+							)
+						_:
+							False
+				_:
+					False
+
+
+private pure func rejects(
+	source: String,
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+) -> Bool:
+	match parse_source(source):
+		Ok(_):
+			False
+		Err(diagnostic):
+			(
+				diagnostic.span.start == start
+				and diagnostic.span.end == end
+				and diagnostic.message == message
+				and diagnostic.help == help
+			)
+
+
+pure func test_indent_alternatives_and_final_lf() -> Bool:
+	(
+		accepts(HEADER + "\t0\n", "main", 5, 9, "Int", 15, 18)
+		and accepts(HEADER + "    0", "main", 5, 9, "Int", 15, 18)
+	)
+
+
+pure func test_identifier_start_alternatives() -> Bool:
+	(
+		accepts("func a()->Z:\n\t0", "a", 5, 6, "Z", 10, 11)
+		and accepts("func _()->_:\n\t0", "_", 5, 6, "_", 10, 11)
+		and accepts("func A()->z:\n\t0", "A", 5, 6, "z", 10, 11)
+	)
+
+
+pure func test_identifier_continuation_repetition() -> Bool:
+	(
+		accepts("func a0()->Z_:\n\t0", "a0", 5, 7, "Z_", 11, 13)
+		and accepts("func A0_bZ9()->a9_Zb0:\n\t0", "A0_bZ9", 5, 11, "a9_Zb0", 15, 21)
+		and accepts("func funcx()->func0:\n\t0", "funcx", 5, 10, "func0", 14, 19)
+	)
+
+
+pure func test_space_repetition_and_token_adjacency() -> Bool:
+	(
+		accepts("func main()->Int:\n\t0", "main", 5, 9, "Int", 13, 16)
+		and accepts("func main ( ) -> Int : \n\t0 \n", "main", 5, 9, "Int", 17, 20)
+		and accepts("func  main  (  )  ->  Int  :  \n    0  ", "main", 6, 10, "Int", 22, 25)
+	)
+
+
+pure func test_reserved_keyword_and_word_boundaries() -> Bool:
+	(
+		rejects(
+			"funcmain() -> Int:\n\t0",
+			0,
+			8,
+			"expected a function declaration at column 1",
+			"start with func main() -> Int:",
+		)
+		and rejects(
+			"Func main() -> Int:\n\t0",
+			0,
+			4,
+			"expected a function declaration at column 1",
+			"start with func main() -> Int:",
+		)
+		and rejects("func func() -> Int:\n\t0", 5, 9, "expected a function name", IDENTIFIER_HELP)
+		and rejects("func main() -> func:\n\t0", 15, 19, "expected a return type", IDENTIFIER_HELP)
+	)
+
+
+pure func test_identifier_invalid_start_and_non_ascii() -> Bool:
+	(
+		rejects("func 0() -> Int:\n\t0", 5, 6, "expected a function name", IDENTIFIER_HELP)
+		and rejects("func é() -> Int:\n\t0", 5, 6, "unsupported character", CHARACTER_HELP)
+	)
+
+
+pure func test_header_requires_every_term_in_order() -> Bool:
+	(
+		rejects(
+			"",
+			0,
+			0,
+			"expected a function declaration at column 1",
+			"start with func main() -> Int:",
+		)
+		and rejects("func () -> Int:\n\t0", 5, 6, "expected a function name", IDENTIFIER_HELP)
+		and rejects(
+			"func main) -> Int:\n\t0",
+			9,
+			10,
+			"expected '(' after the function name",
+			"write main() with no parameters",
+		)
+		and rejects(
+			"func main( -> Int:\n\t0",
+			11,
+			13,
+			"expected ')' with no parameters",
+			"write main() with no parameters",
+		)
+		and rejects(
+			"func main() Int:\n\t0",
+			12,
+			15,
+			"expected '->' before the return type",
+			"write main() -> Int with adjacent arrow characters",
+		)
+		and rejects("func main() -> :\n\t0", 15, 16, "expected a return type", IDENTIFIER_HELP)
+		and rejects(
+			"func main() -> Int\n\t0",
+			18,
+			19,
+			"expected ':' after the function header",
+			"end the header with ':' and put the return expression on the next line",
+		)
+		and rejects(
+			"func main() -> Int: 0",
+			20,
+			21,
+			"expected a newline after the function header",
+			"put the return expression on the next line",
+		)
+	)
+
+
+pure func test_parameters_and_separated_arrow_are_rejected() -> Bool:
+	(
+		rejects(
+			"func main(x) -> Int:\n\t0",
+			10,
+			11,
+			"expected ')' with no parameters",
+			"write main() with no parameters",
+		)
+		and rejects("func main() - > Int:\n\t0", 12, 13, "unsupported character", CHARACTER_HELP)
+	)
+
+
+pure func test_indentation_is_exact() -> Bool:
+	(
+		rejects(
+			HEADER + "0",
+			20,
+			21,
+			"expected an indent of one tab or four spaces",
+			"indent the body with exactly one tab or four spaces",
+		)
+		and rejects(
+			HEADER + "   0",
+			20,
+			23,
+			"expected an indent of one tab or four spaces",
+			INDENT_HELP,
+		)
+		and rejects(
+			HEADER + "     0",
+			20,
+			25,
+			"expected an indent of one tab or four spaces",
+			INDENT_HELP,
+		)
+		and rejects(
+			HEADER + "\t 0",
+			20,
+			21,
+			"expected an indent of one tab or four spaces",
+			INDENT_HELP,
+		)
+		and rejects(
+			HEADER + "    \t0",
+			20,
+			24,
+			"expected an indent of one tab or four spaces",
+			INDENT_HELP,
+		)
+		and rejects(
+			HEADER + "\t\t0",
+			20,
+			21,
+			"expected an indent of one tab or four spaces",
+			INDENT_HELP,
+		)
+	)
+
+
+pure func test_header_starts_at_column_one() -> Bool:
+	(
+		rejects(
+			"    " + HEADER + "\t0",
+			0,
+			4,
+			"expected a function declaration at column 1",
+			"start with func main() -> Int:",
+		)
+		and rejects(
+			"\n" + HEADER + "\t0",
+			0,
+			1,
+			"expected a function declaration at column 1",
+			"start with func main() -> Int:",
+		)
+	)
+
+
+pure func test_only_ascii_spaces_and_lf_separate_terms() -> Bool:
+	(
+		rejects(
+			"func\tmain() -> Int:\n\t0",
+			4,
+			5,
+			"tabs are allowed only in the body indentation",
+			"separate tokens with spaces and indent the body with one tab or four spaces",
+		)
+		and rejects(
+			"func main() -> Int:\r\n\t0",
+			19,
+			20,
+			"only LF line endings are supported",
+			"replace CRLF or CR line endings with LF",
+		)
+		and rejects(
+			HEADER + "\t0\r",
+			22,
+			23,
+			"only LF line endings are supported",
+			"replace CRLF or CR line endings with LF",
+		)
+	)
+
+
+pure func test_body_requires_indent_and_expression() -> Bool:
+	(
+		rejects(
+			HEADER,
+			20,
+			20,
+			"expected an indent of one tab or four spaces",
+			"indent the body with exactly one tab or four spaces",
+		)
+		and rejects(
+			HEADER + "\t",
+			21,
+			21,
+			"expected a return expression",
+			"use 0, 1, or a zero-argument function call as the entire body",
+		)
+		and rejects(
+			HEADER + "\tx",
+			22,
+			22,
+			"expected '(' after the called function",
+			"write a zero-argument call such as one()",
+		)
+		and rejects(
+			HEADER + "\n\t0",
+			20,
+			21,
+			"expected an indent of one tab or four spaces",
+			"indent the body with exactly one tab or four spaces",
+		)
+	)
+
+
+pure func test_numeric_spelling_is_restricted() -> Bool:
+	(
+		rejects(
+			HEADER + "\t00",
+			21,
+			23,
+			"only the integer literals 0 and 1 are supported",
+			"use the single character 0 or 1 as the function body",
+		)
+		and rejects(
+			HEADER + "\t2",
+			21,
+			22,
+			"only the integer literals 0 and 1 are supported",
+			"use the single character 0 or 1 as the function body",
+		)
+		and rejects(HEADER + "\t-0", 21, 22, "unsupported character", CHARACTER_HELP)
+		and rejects(HEADER + "\t0.0", 22, 23, "unsupported character", CHARACTER_HELP)
+	)
+
+
+pure func test_optional_final_lf_cannot_repeat() -> Bool:
+	(
+		rejects(
+			HEADER + "\t0\n\n",
+			23,
+			24,
+			"expected a function declaration at column 1",
+			"start with func main() -> Int:",
+		)
+		and rejects(
+			HEADER + "\t0\n    ",
+			23,
+			27,
+			"expected a function declaration at column 1",
+			"start with func main() -> Int:",
+		)
+	)
+
+
+pure func test_eof_requires_full_consumption() -> Bool:
+	(
+		rejects(
+			HEADER + "\t0 0",
+			23,
+			24,
+			"expected a newline after the return expression",
+			"put each declaration on its own two lines with no blank lines",
+		)
+		and rejects(
+			HEADER + "\t0\n0",
+			23,
+			24,
+			"expected a function declaration at column 1",
+			"start with func main() -> Int:",
+		)
+	)
+
+
+pure func test_declaration_repetition_and_call_syntax() -> Bool:
+	match parse_source("func main() -> Int:\n\tone ( )\nfunc one() -> Int:\n    1"):
+		Err(_):
+			False
+		Ok(program):
+			match program.functions:
+				[first, second]:
+					second_is_one: Bool = match second.body:
+						IntegerExpression(One):
+							True
+						_:
+							False
+
+					match first.body:
+						CallExpression(name):
+							(
+								name.spelling == "one"
+								and name.span.start == 21
+								and name.span.end == 24
+								and first.function_name.spelling == "main"
+								and first.function_name.span.start == 5
+								and first.function_name.span.end == 9
+								and first.return_type.spelling == "Int"
+								and first.return_type.span.start == 15
+								and first.return_type.span.end == 18
+								and second.function_name.spelling == "one"
+								and second.function_name.span.start == 34
+								and second.function_name.span.end == 37
+								and second.return_type.spelling == "Int"
+								and second.return_type.span.start == 43
+								and second.return_type.span.end == 46
+								and second_is_one
+								and program.end.start == 53
+								and program.end.end == 53
+							)
+						_:
+							False
+				_:
+					False
+
+
+pure func test_call_arguments_and_blank_separators_are_rejected() -> Bool:
+	(
+		rejects(
+			HEADER + "\tone(0)",
+			25,
+			26,
+			"expected ')' with no arguments",
+			"calls take no arguments in this increment",
+		)
+		and rejects(
+			HEADER + "\t0\n\nfunc one() -> Int:\n\t1",
+			23,
+			24,
+			"expected a function declaration at column 1",
+			"start with func main() -> Int:",
+		)
+	)
+
+
+pure func test_pure_qualifier_preserves_names_and_spans() -> Bool:
+	match parse_source("pure func main() -> Int:\n\t0"):
+		Err(_):
+			False
+		Ok(program):
+			match program.functions:
+				[function]:
+					match function.body:
+						IntegerExpression(Zero):
+							(
+								function.purity == Pure
+								and function.function_name.spelling == "main"
+								and function.function_name.span.start == 10
+								and function.function_name.span.end == 14
+								and function.return_type.spelling == "Int"
+								and function.return_type.span.start == 20
+								and function.return_type.span.end == 23
+								and program.end.start == 27
+								and program.end.end == 27
+							)
+						_:
+							False
+				_:
+					False
+
+
+pure func test_malformed_and_reserved_pure_are_rejected() -> Bool:
+	(
+		rejects(
+			"pure pure func main() -> Int:\n\t0",
+			5,
+			9,
+			"expected 'func' after 'pure'",
+			"write pure func name() -> Int:",
+		)
+		and rejects("pure", 4, 4, "expected 'func' after 'pure'", "write pure func name() -> Int:")
+		and rejects("func pure() -> Int:\n\t0", 5, 9, "expected a function name", IDENTIFIER_HELP)
+		and rejects("func main() -> pure:\n\t0", 15, 19, "expected a return type", IDENTIFIER_HELP)
+		and accepts("func purex() -> Int:\n\t0", "purex", 5, 10, "Int", 16, 19)
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 EBNF syntax conformance",
+	tests = [
+		("indent alternatives and optional final LF", test_indent_alternatives_and_final_lf),
+		("identifier start alternatives", test_identifier_start_alternatives),
+		("identifier continuation repetition", test_identifier_continuation_repetition),
+		("space repetition and token adjacency", test_space_repetition_and_token_adjacency),
+		("reserved keyword and word boundaries", test_reserved_keyword_and_word_boundaries),
+		("invalid identifier start and non-ASCII", test_identifier_invalid_start_and_non_ascii),
+		("header requires every term in order", test_header_requires_every_term_in_order),
+		(
+			"parameters and separated arrow are rejected",
+			test_parameters_and_separated_arrow_are_rejected,
+		),
+		("indentation is exact", test_indentation_is_exact),
+		("header starts at column one", test_header_starts_at_column_one),
+		("only ASCII spaces and LF separate terms", test_only_ascii_spaces_and_lf_separate_terms),
+		("body requires indent and expression", test_body_requires_indent_and_expression),
+		("numeric spelling is restricted", test_numeric_spelling_is_restricted),
+		("optional final LF cannot repeat", test_optional_final_lf_cannot_repeat),
+		("pure qualifier preserves names and spans", test_pure_qualifier_preserves_names_and_spans),
+		("malformed and reserved pure rejected", test_malformed_and_reserved_pure_are_rejected),
+		("EOF requires full consumption", test_eof_requires_full_consumption),
+		("declaration repetition and call syntax", test_declaration_repetition_and_call_syntax),
+		(
+			"call arguments and blank separators rejected",
+			test_call_arguments_and_blank_separators_are_rejected,
+		),
+	]
+}
