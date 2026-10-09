@@ -1,0 +1,380 @@
+import:
+	../../src/check:
+		CheckedBase(ReturnVariant),
+		CheckedBody(CheckedValueBody),
+		CheckedFunction,
+		CheckedProgram,
+		TypeRef(UnionType),
+		check,
+		checked_functions,
+		same_type,
+		union_number,
+		variant_number,
+		variant_owner,
+	../../src/lex: lex
+	../../src/parse: parse
+	../../src/syntax: Diagnostic
+	test: TestSuite
+
+
+private pure func base_of(function: CheckedFunction) -> Option[CheckedBase]:
+	match function.body:
+		CheckedValueBody(value):
+			Some(value.base)
+		_:
+			None
+
+
+private CHOICE: String = "fixed union Choice:\n\tFirst\n\tSecond\n"
+
+private OTHER: String = "fixed union Other:\n\tFirst\n\tSecond\n"
+
+private MAIN: String = "func main() -> Int:\n\t0\n"
+
+private IDENTITY: String = "pure func identity(value: Choice) -> Choice:\n\tvalue\n"
+
+
+private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
+	input ?= lex(source)
+	parsed ?= parse(input)
+	check(parsed)
+
+
+private pure func accepts(source: String) -> Bool:
+	match checked(source):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+private pure func rejects(
+	source: String,
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+) -> Bool:
+	match checked(source):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.span.start == start
+				and error.span.end == end
+				and error.message == message
+				and error.help == help
+			)
+
+
+pure func test_context_assigns_nominal_constructor_and_type_identities() -> Bool:
+	match checked(
+		"pure func a() -> Choice:\n\tFirst\npure func b() -> Other:\n\tFirst\n" + CHOICE + OTHER + MAIN,
+	):
+		Err(_):
+			False
+		Ok(program):
+			rows = checked_functions(program)
+
+			match rows.functions:
+				[a, b, _]:
+					match base_of(a):
+						Some(ReturnVariant(first)):
+							match base_of(b):
+								Some(ReturnVariant(other)):
+									(
+										not same_type(
+											a.signature.return_type,
+											b.signature.return_type,
+										)
+										and union_number(variant_owner(first)) == 0
+										and union_number(variant_owner(other)) == 1
+										and variant_number(first) == 0
+										and variant_number(other) == 0
+										and rows.unions.length() == 2
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_contextual_variants_work_in_direct_and_receiver_arguments() -> Bool:
+	accepts(
+		CHOICE + OTHER + IDENTITY + "pure func a() -> Choice:\n\tidentity(First).identity()\npure func b(value: Other) -> Other:\n\tvalue\npure func c() -> Other:\n\tFirst.b()\n" + MAIN,
+	)
+
+
+pure func test_type_and_value_names_and_contextual_words_are_independent() -> Bool:
+	(
+		accepts(CHOICE + "func Choice() -> Int:\n\t42\nfunc main() -> Int:\n\tChoice()\n")
+		and accepts(
+			"func fixed() -> Int:\n\t0\nfunc union() -> Int:\n\tfixed()\nfunc main() -> Int:\n\tunion()\n",
+		)
+		and accepts("fixed union Bool:\n\tTrue\n\tFalse\nfunc value() -> Bool:\n\tTrue\n" + MAIN)
+	)
+
+
+pure func test_parameter_shadows_constructor_without_type_fallback() -> Bool:
+	prefix = CHOICE + "func wrong(First: Int) -> Choice:\n\t"
+	(
+		rejects(
+			prefix + "First\n" + MAIN,
+			prefix.length(),
+			prefix.length() + 5,
+			"return expression does not match the declared type",
+			"use an expression of type Choice here",
+		)
+		and accepts(CHOICE + "func value(First: Int) -> Int:\n\tFirst\n" + MAIN)
+	)
+
+
+pure func test_union_parameter_shadows_direct_call_but_not_receiver_target() -> Bool:
+	prefix = CHOICE + IDENTITY + "func use(identity: Choice) -> Choice:\n\t"
+	(
+		rejects(
+			prefix + "identity(identity)\n" + MAIN,
+			prefix.length(),
+			prefix.length() + 8,
+			"parameters cannot be called",
+			"use the parameter as a value, or rename it to call the function",
+		)
+		and accepts(prefix + "identity.identity()\n" + MAIN)
+	)
+
+
+pure func test_constructor_is_a_value_not_a_function() -> Bool:
+	prefix = CHOICE + "func value() -> Choice:\n\t"
+	integer_call = CHOICE + "func number(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\t"
+	other = CHOICE + "fixed union Other:\n\tThird\nfunc value() -> Choice:\n\t"
+	(
+		rejects(
+			prefix + "First()\n" + MAIN,
+			prefix.length(),
+			prefix.length() + 5,
+			"payload-free variants cannot be called",
+			"use the bare variant name without parentheses",
+		)
+		and rejects(
+			CHOICE + "func value() -> Int:\n\tFirst\n" + MAIN,
+			CHOICE.length() + 22,
+			CHOICE.length() + 27,
+			"variant does not belong to the expected type",
+			"use an expression of type Int here",
+		)
+		and rejects(
+			integer_call + "number(First)\n",
+			integer_call.length() + 7,
+			integer_call.length() + 12,
+			"variant does not belong to the expected type",
+			"use an expression of type Int here",
+		)
+		and rejects(
+			other + "Third\n" + MAIN,
+			other.length(),
+			other.length() + 5,
+			"variant does not belong to the expected type",
+			"use an expression of type Choice here",
+		)
+	)
+
+
+pure func test_cross_union_call_rejects_equal_variant_positions() -> Bool:
+	prefix = CHOICE + OTHER + IDENTITY + "pure func other() -> Other:\n\tFirst\nfunc bad() -> Choice:\n\t"
+	rejects(
+		prefix + "identity(other())\n" + MAIN,
+		prefix.length(),
+		prefix.length() + 8,
+		"argument type does not match the parameter type",
+		"use an expression of type Choice here",
+	)
+
+
+pure func test_literal_argument_mismatch_highlights_call_site() -> Bool:
+	prefix = CHOICE + IDENTITY + "func bad() -> Choice:\n\t"
+	rejects(
+		prefix + "identity(42)\n" + MAIN,
+		prefix.length(),
+		prefix.length() + 8,
+		"argument type does not match the parameter type",
+		"use an expression of type Choice here",
+	)
+
+
+pure func test_later_direct_and_receiver_edges_check_result_type() -> Bool:
+	prefix = CHOICE + IDENTITY + "pure func number(value: Int) -> Int:\n\tvalue\nfunc bad() -> Int:\n\t"
+	(
+		rejects(
+			prefix + "number(identity(First))\n" + MAIN,
+			prefix.length(),
+			prefix.length() + 6,
+			"argument type does not match the parameter type",
+			"use an expression of type Int here",
+		)
+		and rejects(
+			prefix + "First.identity().number()\n" + MAIN,
+			prefix.length() + 17,
+			prefix.length() + 23,
+			"argument type does not match the parameter type",
+			"use an expression of type Int here",
+		)
+	)
+
+
+pure func test_return_mismatch_uses_exact_complete_expression_span() -> Bool:
+	prefix = CHOICE + IDENTITY + "func bad() -> Int:\n\t"
+	rejects(
+		prefix + "identity(First)   \n" + MAIN,
+		prefix.length(),
+		prefix.length() + 15,
+		"return expression does not match the declared type",
+		"use an expression of type Int here",
+	)
+
+
+pure func test_unknown_type_and_main_return_type_are_distinct() -> Bool:
+	(
+		rejects(
+			"func main() -> Bool:\n\t0\n",
+			15,
+			19,
+			"unknown type",
+			"use Int or a fixed union declared in this file",
+		)
+		and rejects(
+			CHOICE + "func main() -> Choice:\n\tFirst\n",
+			CHOICE.length() + 15,
+			CHOICE.length() + 21,
+			"main must return Int",
+			"declare main() -> Int: as the entrypoint",
+		)
+	)
+
+
+pure func test_duplicate_types_and_variants_are_rejected() -> Bool:
+	(
+		rejects(
+			CHOICE + CHOICE + MAIN,
+			CHOICE.length() + 12,
+			CHOICE.length() + 18,
+			"duplicate union type name",
+			"give union types distinct names; Int is already built in",
+		)
+		and rejects(
+			"fixed union Int:\n\tOther\n" + MAIN,
+			12,
+			15,
+			"duplicate union type name",
+			"give union types distinct names; Int is already built in",
+		)
+		and rejects(
+			"fixed union Choice:\n\tFirst\n\tFirst\n" + MAIN,
+			28,
+			33,
+			"duplicate variant name",
+			"give each variant in a union a distinct name",
+		)
+	)
+
+
+pure func test_function_constructor_collision_highlights_later_declaration() -> Bool:
+	function = "func First() -> Int:\n\t0\n"
+	(
+		rejects(
+			CHOICE + function + MAIN,
+			CHOICE.length() + 5,
+			CHOICE.length() + 10,
+			"variant name conflicts with a function",
+			"give functions and union variants distinct names",
+		)
+		and rejects(
+			function + CHOICE + MAIN,
+			function.length() + 21,
+			function.length() + 26,
+			"variant name conflicts with a function",
+			"give functions and union variants distinct names",
+		)
+	)
+
+
+pure func test_union_purity_cycles_and_arity_precedence_are_preserved() -> Bool:
+	prefix = CHOICE + "func value() -> Choice:\n\tFirst\npure func use() -> Choice:\n\t"
+	(
+		rejects(
+			prefix + "value()\n" + MAIN,
+			prefix.length(),
+			prefix.length() + 5,
+			"pure functions cannot call impure functions",
+			"mark the callee pure or remove pure from the caller",
+		)
+		and rejects(
+			prefix + "value(First)\n" + MAIN,
+			prefix.length(),
+			prefix.length() + 5,
+			"function takes no arguments",
+			"remove the argument and call the function with ()",
+		)
+		and rejects(
+			CHOICE + "func loop(value: Choice) -> Choice:\n\tvalue.loop()\n" + MAIN,
+			CHOICE.length() + 43,
+			CHOICE.length() + 47,
+			"call chain contains recursion",
+			"use an acyclic call chain; recursion is not supported in this increment",
+		)
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 nominal payload-free union checking",
+	tests = [
+		(
+			"context assigns nominal constructor and type identities",
+			test_context_assigns_nominal_constructor_and_type_identities,
+		),
+		(
+			"contextual variants in direct and receiver arguments",
+			test_contextual_variants_work_in_direct_and_receiver_arguments,
+		),
+		(
+			"type/value namespaces and contextual words",
+			test_type_and_value_names_and_contextual_words_are_independent,
+		),
+		(
+			"parameter shadows constructor without fallback",
+			test_parameter_shadows_constructor_without_type_fallback,
+		),
+		(
+			"union parameter shadows direct call, not receiver target",
+			test_union_parameter_shadows_direct_call_but_not_receiver_target,
+		),
+		("constructor is a value, not a function", test_constructor_is_a_value_not_a_function),
+		(
+			"cross-union same-position arguments rejected",
+			test_cross_union_call_rejects_equal_variant_positions,
+		),
+		(
+			"literal argument mismatch call-site span",
+			test_literal_argument_mismatch_highlights_call_site,
+		),
+		(
+			"later direct and receiver edge types",
+			test_later_direct_and_receiver_edges_check_result_type,
+		),
+		(
+			"return mismatch complete expression span",
+			test_return_mismatch_uses_exact_complete_expression_span,
+		),
+		("unknown type and main return type", test_unknown_type_and_main_return_type_are_distinct),
+		("duplicate types and variants", test_duplicate_types_and_variants_are_rejected),
+		(
+			"function/constructor collision both source orders",
+			test_function_constructor_collision_highlights_later_declaration,
+		),
+		(
+			"union purity, cycles and arity precedence",
+			test_union_purity_cycles_and_arity_precedence_are_preserved,
+		),
+	]
+}

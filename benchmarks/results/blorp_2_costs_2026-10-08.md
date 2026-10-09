@@ -1355,3 +1355,246 @@ samples are under `blorp_2/build/guardrails/int64-independent-hUuKdf/` and
 | Normal pilot compiler | `ae4f6c5364a14305fb80caa33da3212d25c7f2d5ba8176b4833f2e86fb7d4b29` |
 | Diagnostic pilot compiler | `cebef194dc44c8d880f0aaea78302122bf1c62f273392647f4ee2b20d94a249b` |
 | Cache input manifest | `344f814a984c63b4be6eb6f72043eb07aa79493ae25be97672ba807bb2f23d44` |
+
+## Payload-free fixed unions: preimplementation guardrails
+
+The first slice adds declarations, constructor values, and typed function
+parameters/results. Matching, payloads, generics and prelude loading remain
+later increments. The clean baseline is commit
+`8114c9379c8e429e5ed27430f1de6bbd669b537e`. Before implementation,
+the focused native suites passed **19/19 callbacks across six TestSuites**,
+including the independent full-width Int64 UBSan driver and its wrong-value
+fault proof. Host build status is FRESH; warm setup generated no C and linked
+no compiler. Complete source snapshots, hashes, raw samples and retained C
+are in `blorp_2/build/guardrails/unions-baseline/` and
+`blorp_2/build/guardrails/unions-baseline-validation/report.md`.
+
+Production starts at 1,773 lines, test/support at 3,764, and raw fixtures at
+44 (counted separately). This feature's hard limits are **2,350 production
+lines** and **4,600 test/support lines**. New union fixture limits are
+**1,000 managed allocations and 40,000,000 retired instructions**.
+All eight prior C outputs must remain byte-identical. Existing broad cost
+caps remain the initial fixture gates; allocation deltas are reported rather
+than treated as an additional rejection threshold, following the user's
+relaxed allocation policy. A necessary cap adjustment requires measured
+evidence and an explicit explanation rather than code contorted to save tiny
+allocation differences.
+
+The additional matched instruction ceiling is the baseline minimum of three
+samples plus 5%, floored. Pilot self-compilation remains unsupported; these
+eight owned input compilations are the proxy, not self-compile measurements.
+
+| Fixture | Baseline allocations | Minimum instructions | Candidate +5% ceiling |
+| --- | ---: | ---: | ---: |
+| `return_zero` | 119 | 18,995,016 | 19,944,766 |
+| `call_one` | 228 | 19,088,229 | 20,042,640 |
+| `pure_calls` | 363 | 19,289,172 | 20,253,630 |
+| `nested_calls` | 417 | 19,326,396 | 20,292,715 |
+| `nested_order` | 459 | 19,356,033 | 20,323,834 |
+| `ufcs_calls` | 419 | 19,403,335 | 20,373,501 |
+| `ufcs_chain` | 463 | 19,346,618 | 20,313,948 |
+| `return_42` | 122 | 18,956,870 | 19,904,713 |
+
+Repeatable cost or line-count failures must be investigated at their owning
+phase and either fixed or explicitly rescoped before completion. Clean typed
+boundaries and meaningful behavioral tests take precedence over hiding
+necessary work through compressed formatting or omitted coverage.
+
+### Reviewed production-size rescope
+
+Before candidate compilation or cost gates, the formatted first draft reached
+2,494 production lines. Inspection found that call resolution discarded a
+signature and body checking fetched it repeatedly. The reviewed correction
+introduced complete transient call contracts and one private resolution context,
+removing those repeated joins and reducing the draft to 2,423 lines. These
+contracts are erased only after body validation; published function signatures
+remain authoritative. A further required correction constructs a unary contract
+in the same branch that validates its arity, rather than checking that shape
+again in another helper.
+
+The original 2,350-line estimate did not account accurately for the formatted
+nominal identities, typed signatures, contextual constructors and exact
+diagnostics this feature needs. The remaining specialized-call correction is
+expected to save 15–25 lines, leaving about 2,400. The production hard limit is
+therefore explicitly rescoped to **2,450 lines**, before that correction and any
+candidate executable gate. The support ceiling remains 4,600, and instruction
+and output-identity guardrails remain unchanged. This accepts necessary typed
+data rather than removing checks or compressing formatting to meet an estimate.
+Final review and actual counts still determine acceptance.
+
+### Early native measurements and deliberate allocation-cap updates
+
+The corrected source checks and native compiler build pass at 2,424 source
+lines. Target resolution now retrieves each signature once. The successful
+zero/unary arity branch validates purity once and constructs a complete typed
+result; body checking performs no callee-signature join or repeated arity proof.
+This is a structural work reduction from the uncompiled draft, not a measured
+speedup claim against that draft.
+
+The early native gate (`fixed-union-early-costs.log`) passes 18/20 callbacks
+across seven suites. The only failures are two allocation caps; actual C,
+native status/streams, independent Int64 endpoint and fault proof, and all
+instruction guards pass. Measurements before changing caps:
+
+| Fixture | Allocations | Delta | Minimum instructions |
+| --- | ---: | ---: | ---: |
+| `return_zero` | 129 | +10 | 19,044,722 |
+| `call_one` | 244 | +16 | 19,161,462 |
+| `pure_calls` | 385 | +22 | 19,275,120 |
+| `nested_calls` | 445 | +28 | 19,419,069 |
+| `nested_order` | 492 | +33 | 19,412,096 |
+| `ufcs_calls` | 447 | +28 | 19,372,861 |
+| `ufcs_chain` | 496 | +33 | 19,369,836 |
+| `return_42` | 132 | +10 | 19,024,645 |
+
+The typed signatures and complete transient contracts add managed compiler
+objects; this does not indicate target-program allocations. Under the user's
+explicitly relaxed allocation policy, the return-zero cap is deliberately
+updated **120 → 160**, and call-one **230 → 300**. These were the only failing
+allocation limits. All other fixture limits, strict zero-leak checks, and
+additional matched instruction ceilings remain unchanged. No representation
+or literal-specific shortcut is introduced to avoid this necessary typed data.
+
+Two host restrictions surfaced during this implementation: nested `?=` within
+a match bound by another `?=` needed a small parameter-resolution helper; a
+nested `None → if → Err/Err` branch generated boxed `Result*` where the native
+C expected a stack Result. Selecting the Diagnostic first and wrapping it in
+one outer Err fixes that build failure without changing semantics or the host.
+The rejected C is retained as `fixed-union-nested-result-rejected.c`; source
+checks/build logs are under the ignored guardrails directory. These are
+temporary host constraints, not verified fixes to the existing compiler.
+
+### Final normal validation
+
+The reviewed, frozen tree passes **154/154 callbacks across 19 Blorp
+TestSuites**, including the new wrong-context bare-constructor oracles,
+immutable union/expression-span publication, exact two-union C emission,
+grammar conformance, and both native union callbacks. The complete final
+command is `make -C blorp_2 test`; its log is
+`fixed-union-final-normal.log`, SHA-256
+`3f5d819cb81659fb287be8edf5e222cef7962cbb26d72a7bd216aa68cddad3c4`.
+Code review has zero remaining findings after the grammar introduction and
+constructor-context test corrections.
+
+Final production is **2,424 lines (+651)**, test/support **4,595 (+831)**,
+and raw fixtures **59 (+15)**. Both revised production and original support
+ceilings hold. Format and whitespace checks pass. The target-only staged
+prelude remains outside host compilation and pilot loading.
+
+| Fixture | Allocations | Delta | Minimum instructions |
+| --- | ---: | ---: | ---: |
+| `return_zero` | 129 | +10 | 19,087,300 |
+| `call_one` | 244 | +16 | 19,230,847 |
+| `pure_calls` | 385 | +22 | 19,454,395 |
+| `nested_calls` | 445 | +28 | 19,485,542 |
+| `nested_order` | 492 | +33 | 19,499,149 |
+| `ufcs_calls` | 447 | +28 | 19,477,153 |
+| `ufcs_chain` | 496 | +33 | 19,548,467 |
+| `return_42` | 132 | +10 | 19,123,399 |
+| `union_values` | 999 | new | 19,984,074 |
+
+All broad fixture limits and all eight additional matched +5% instruction
+ceilings hold. Normal instruction samples, in execution order:
+
+- `return_zero`: 19,201,062; 19,087,300; 19,120,724.
+- `call_one`: 19,356,916; 19,233,459; 19,230,847.
+- `pure_calls`: 19,526,583; 19,454,395; 19,947,910.
+- `nested_calls`: 19,626,126; 19,493,026; 19,485,542.
+- `nested_order`: 19,659,488; 19,560,838; 19,499,149.
+- `ufcs_calls`: 19,663,442; 19,495,144; 19,477,153.
+- `ufcs_chain`: 19,688,528; 19,749,835; 19,548,467.
+- `return_42`: 19,274,422; 19,163,009; 19,123,399.
+- `union_values`: 20,144,003; 19,984,074; 20,019,452.
+
+All eight prior cost-fixture C outputs and the independent Int64 endpoint C
+compare byte-identically with the frozen baseline. Actual C for all nine cost
+fixtures and the endpoint program is retained in
+`blorp_2/build/guardrails/unions-candidate/`. The union driver's comparisons
+cover distinct variants, both identity inputs and source-level direct/UFCS
+calls. Changing the emitted Second-returning function to return First leaves
+the oracle unchanged and must fail silently with status 1. A CLI rejection
+case checks same-ordinal constructors from different nominal types, the exact
+diagnostic, and preservation of absent/existing output.
+
+Warm final setup and the complete normal gate perform **zero C generations
+and zero compiler links**. Before/after cached C and both compiler-binary
+hash/mtime manifests agree. The host remains FRESH and unchanged. Detailed
+input, C, cache and provenance manifests are `fixed-union-inputs.sha256`,
+`fixed-union-generated-c.sha256`, `fixed-union-cache-before.sha256`,
+`fixed-union-cache-after.sha256` and `fixed-union-provenance.sha256` under
+the ignored guardrails directory.
+
+| Frozen artifact | SHA-256 |
+| --- | --- |
+| Host `bin/blorp` | `c67d5bb315a67999ec5d608eaa41aab83f8d75e6220b44b936ea2a4849b7ba0a` |
+| Shared compiler C | `c9feb7893a586ddb7045f684eecd83ca3e7ecee5530442681e09455be67199c8` |
+| Normal pilot compiler | `8c9083d6e2455388058fe0e65bfae66611d2ad2dc5bb8fa40ceef7f0d1900f90` |
+| Diagnostic pilot compiler | `13764b5e89e54acf24b4a75ad42c95fb9f56056f8217629440d3fcb7f0d28b91` |
+| Union example C | `029626c4f36daa8ea06d91717a27af22395c99af0462d06d83b947ae659aaf93` |
+
+### Independent final validation
+
+The independent runner audited the frozen normal log and ran:
+
+```sh
+scripts/compiler-build-status
+make -C blorp_2 test-compiler
+bin/blorp test --suite --sanitize=undefined --leak-check --timeout 180 \
+  blorp_2/test/unit blorp_2/test/e2e blorp_2/test/test_grammar
+```
+
+The complete independent run passes **154/154 callbacks across 19 suites**,
+with zero failures, sanitizer errors or leaks. Both actual-value native drivers
+and their wrong-value fault proofs pass. All allocation counts match the
+normal run; all nine broad fixture ceilings and eight additional matched
+instruction ceilings hold. Independent instruction minima:
+
+| Fixture | Minimum instructions |
+| --- | ---: |
+| `return_zero` | 19,078,888 |
+| `call_one` | 19,182,416 |
+| `pure_calls` | 19,331,564 |
+| `nested_calls` | 19,420,631 |
+| `nested_order` | 19,468,740 |
+| `ufcs_calls` | 19,442,817 |
+| `ufcs_chain` | 19,448,055 |
+| `return_42` | 19,080,897 |
+| `union_values` | 19,980,580 |
+
+All independent samples, in execution order:
+
+- `return_zero`: 19,227,203; 19,078,888; 19,124,773.
+- `call_one`: 19,216,537; 19,243,887; 19,182,416.
+- `pure_calls`: 19,488,429; 19,331,564; 19,376,125.
+- `nested_calls`: 19,578,151; 19,461,913; 19,420,631.
+- `nested_order`: 19,636,260; 19,468,740; 19,470,871.
+- `ufcs_calls`: 19,566,269; 19,510,634; 19,442,817.
+- `ufcs_chain`: 19,578,788; 19,448,055; 19,559,373.
+- `return_42`: 19,236,611; 19,094,761; 19,080,897.
+- `union_values`: 20,114,964; 19,982,301; 19,980,580.
+
+UBSan instruments the host-built TestSuites and imported pilot implementation.
+The emitted Int64 and union value drivers are independently compiled with
+native UBSan and non-recovering errors. The cached normal compiler used by
+instruction children remains the normal `-O2` build; allocation children use
+its diagnostic counterpart with strict zero-leak checks, without additional
+native UBSan flags. The staged prelude is not compiled or loaded. These remain
+owned-input compilation proxies, not pilot self-compilation evidence.
+
+Eight old cost-fixture C files and the endpoint C are byte-identical to the
+frozen baseline. The union C is 638 bytes with the hash above. Host, source,
+tests, README, grammar and Makefile fingerprints remain unchanged. SHA/stat
+snapshots of all four cached artifacts (C, normal binary, diagnostic binary
+and input manifest, including mtime, ctime, size and inode) agree before setup,
+after warm setup and after sanitizer execution. Warm
+setup is empty: **zero C generations and zero compiler links**. FRESH host
+provenance and the source/support/raw counts are confirmed. Formatting passes
+for 30 maintained Blorp files; whitespace and diff checks pass.
+
+The complete independent report, logs, 54 final normal/independent instruction
+samples, retained C and hash/stat manifests are under
+`blorp_2/build/guardrails/unions-independent-DbBknN/` and
+`/tmp/blorp-2-unions-validation.DbBknN/`. This increment adds payload-free
+fixed unions and complete internal call contracts; matching, payloads and
+prelude loading remain future increments. No commit or push is part of this
+validation.

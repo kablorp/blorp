@@ -85,6 +85,53 @@ This exits 0. Chains run left to right, so the body is equivalent to
 is equivalent to `identity(zero(one(identity(1))))`. The tests specify the exact
 generated C and parsed call order for this mixed expression.
 
+The [`union_values.brp`](test/e2e/fixtures/union_values.brp) example adds
+payload-free fixed unions:
+
+```blorp
+fixed union Choice:
+	First
+	Second
+pure func identity(value: Choice) -> Choice:
+	value
+pure func choose() -> Choice:
+	identity(Second)
+func main() -> Int:
+	0
+```
+
+A variant is written as a bare value. `First.identity()` also works. Helpers
+can take and return the declared union; `main` still returns `Int`. The native
+TestSuite calls emitted helpers directly, verifies distinct variants and both
+call notations, and requires an intentionally collapsed constructor to fail
+the independent C driver under UBSan.
+
+The match example, [`match_value.brp`](test/e2e/fixtures/match_value.brp), adds
+an optional `Int` field and a match as the complete function body:
+
+```blorp
+fixed union Value:
+	Empty
+	Number(Int)
+pure func unwrap(value: Value) -> Int:
+	match value:
+		Empty: 0
+		Number(number): number
+func main() -> Int:
+	unwrap(Number(42))
+```
+
+It exits 42 with empty stdout and stderr. `Number(42)` constructs a value;
+`Number(number)` selects that constructor and binds its field. A field `_`
+discards the field, and a whole-pattern `_` matches any remaining value.
+An unshadowed bare variant pattern selects that variant; another bare name
+binds the complete matched value. Matches require exhaustive, useful arms.
+The scrutinee runs once and only the first matching arm's result runs.
+The companion [`match_values.brp`](test/e2e/fixtures/match_values.brp) supplies
+helpers for native checks of field preservation, Int64 endpoints, whole-value
+bindings, shadowing, and evaluation counts. Pattern captures are immutable;
+general immutable and mutable local bindings are a future increment.
+
 From the repository root:
 
 ```sh
@@ -121,22 +168,36 @@ registration. The compiler source under `src/` stays within the agreed subset.
 Each executable example defines allocation and instruction ceilings in its
 end-to-end test. The test prints actual costs and ceilings, then fails when a
 ceiling is exceeded. The return-zero limits in
-[`test/e2e/test_return_zero.brp`](test/e2e/test_return_zero.brp) are **120 managed
+[`test/e2e/test_return_zero.brp`](test/e2e/test_return_zero.brp) are **160 managed
 allocations** and **22,000,000 retired instructions**. Ceilings may be changed
 deliberately as examples and the compiler grow; tests never raise them automatically.
 The call-one limits in [`test/e2e/test_call_one.brp`](test/e2e/test_call_one.brp)
-are **230 managed allocations** and **26,000,000 retired instructions**.
+are **300 managed allocations** and **26,000,000 retired instructions**.
+These two allocation limits were deliberately raised from 120 and 230 for
+resolved union signatures and complete call contracts: the retained examples
+measured 129 and 244 allocations. Their instruction limits remain unchanged.
 The shared native/cost harness gives each fixture its own expected C, exit status
 and limits. The pure-call fixture has **400 managed allocations** and
 **32,000,000 retired instructions** as its current ceilings; its allocation
 ceiling was deliberately raised from 360 for full integer conversion.
-Both nested-call fixtures have **500 managed allocations** and **40,000,000
-retired instructions** as their initial ceilings.
+The nested-call fixture has **500 managed allocations**, and the nested-order
+fixture has **550 managed allocations**. Both retain **40,000,000 retired
+instructions** as their ceilings.
 Both UFCS fixtures have **550 managed allocations** and **40,000,000 retired
 instructions** as their initial ceilings. The return-42 fixture has **230 managed
 allocations** and **26,000,000 retired instructions** as its ceilings. Small
 allocation changes are reported alongside work and readability; they do not
 justify literal-specific fast paths.
+The union fixture has **1,150 managed allocations** and **40,000,000 retired
+instructions** as its limits. The nested-order and union allocation ceilings
+were deliberately raised from 500 and 1,000 after adding typed bodies, binding
+identities, constructor operations and checked emission: their matched counts
+rose from 492 to 516 and from 999 to 1,072. See the
+[match increment measurements](../benchmarks/results/blorp_2_match_2026-10-09.md).
+The `match_value` example starts with **5,000 managed allocations** and
+**100,000,000 retired instructions** as its limits. The companion
+`match_values` fixture supplies independent native value and evaluation proofs;
+it is not a separately measured example.
 
 These measure one execution of the new compiler on the example, including
 process startup, argument handling, input/output, and the compile pipeline.
@@ -163,17 +224,20 @@ the earlier measurements and final validation provenance.
 
 ## Grammar for this increment
 
-This specification defines only the examples' language: one or more functions
-with explicit return types and zero or one explicitly typed parameter. A function
-body starts with a signed Int64 literal, its own parameter name, or a
-direct call with zero or one argument. UFCS suffixes may follow that expression.
+This specification defines only the examples' language: functions with explicit
+return types and zero or one explicitly typed parameter, and fixed union
+declarations whose variants have zero fields or one `Int` field. A function
+body is a single expression or a tail match with inline arm results. Expressions
+start with a signed Int64 literal, a binding or variant name, or an application
+with zero or one argument. UFCS suffixes may follow that expression.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
 No other declarations, expressions, literals, statements, or comments are supported.
 
 [`grammar.ebnf`](grammar.ebnf) defines the complete restricted source grammar
 and its EBNF dialect. Whitespace is explicit: LF is `"\n"`, TAB is `"\t"`, and
 the header/body spacing and EOF rules are productions. Identifier rules
-exclude the reserved spellings `func` and `pure`.
+exclude the reserved spellings `func`, `pure`, `match`, and lone `_`.
+Names beginning with underscore, such as `_value`, remain identifiers.
 
 [`test/test_grammar/test_conformance.brp`](test/test_grammar/test_conformance.brp)
 checks grammar conformance through lexing and parsing, without semantic
@@ -189,19 +253,37 @@ bin/blorp test --suite --timeout 180 blorp_2/test/test_grammar
 
 Lexical and layout rules:
 
-- The header starts at column 1. No blank lines precede, separate, or follow
-  declarations or their two lines. Exactly one LF separates declarations.
+- Every declaration header starts at column 1. A function has one header and
+  an expression line or tail match; a union has one header and at least one variant line. No blank
+  lines precede, separate, or follow declarations. Exactly one LF separates declarations.
   The final line may end at EOF or with one LF.
-- The entire indentation prefix on each body line is one tab or four spaces.
-  Mixed indentation and additional leading whitespace are errors.
-- Spaces may separate tokens and trail either line. They are required between
-  `func` and the function name. Identifiers are scanned as whole words, so
+- The entire indentation prefix uses tabs only or spaces in groups of four.
+  Body and variant lines require depth one: one tab or four spaces. Match arms
+  require depth two: two tabs or eight spaces. Mixed indentation is invalid;
+  parsing rejects a valid depth in the wrong position. No indentation stack
+  or synthetic dedent tokens are needed for this restricted layout.
+- Spaces may separate tokens and trail each line. They are required between
+  `func` and the function name, and between `fixed`, `union` and the type name.
+  Identifiers are scanned as whole words, so
   `funcmain` is one identifier. The two characters of `->` are adjacent.
   Spaces may surround a UFCS dot and its parentheses, as in `1 . one ( )`.
-  Tabs occur only in the indentation prefix. Calls stay on the single body line.
-- `func` and `pure` are reserved. The optional `pure` qualifier precedes `func`
+  Tabs occur only in the indentation prefix. Each expression stays on one line,
+  including match scrutinees and arm results.
+- `func`, `pure`, `match`, and lone `_` are reserved. The optional `pure` qualifier precedes `func`
   with spaces between the two keywords. Function, parameter and type names are
   identifiers whose meaning is checked after parsing.
+- `fixed union Type:` introduces one or more variants on indented
+  lines. `fixed` and `union` are contextual header words and remain valid names
+  elsewhere. A variant is bare or has one type-name annotation, as in
+  `Number(Int)`. Parsing preserves that type name; checking requires `Int`.
+  Empty declaration parentheses, multiple fields and generic type parameters
+  are unsupported.
+- `match expression:` starts a nonempty sequence of depth-two arms written
+  `Pattern: expression`. A pattern is a bare name, `_`, or a constructor name
+  followed by parentheses containing zero or one field pattern. A field
+  pattern is a binder or `_`; literal and nested field patterns are unsupported.
+  A nullary constructor pattern may be written `Empty` or `Empty()`. `Number()`
+  is valid syntax but fails semantic arity checking for a one-field constructor.
 - Integer literals are decimal values from `-9223372036854775808` through
   `9223372036854775807`, with an optional adjacent minus. `-0` is accepted
   and has value zero. Leading zeros (`00`, `-01`), plus signs, separated minus
@@ -214,21 +296,54 @@ Lexical and layout rules:
 Semantic rules:
 
 - Exactly one function must be named `main`, and it takes no parameters. A helper
-  takes zero or one parameter, written `value: Int`. Every function returns `Int`,
-  the language's signed 64-bit integer type.
+  takes zero or one explicitly typed parameter. Helper parameter and return types
+  are `Int`, the signed 64-bit integer type, or a fixed union declared in this
+  file. `main` must return `Int`.
+- Union types have nominal identity. Equal variant positions or shared variant
+  spellings do not make two unions interchangeable. Union type names must be
+  unique and cannot redeclare `Int`; each union's variant names must be unique.
+  Type names occupy a separate namespace from functions and variant values, so
+  a function may share a type name. A function cannot share any variant name;
+  a collision highlights whichever declaration appears later in the source.
 - Function names are unique within the input file. Every callee must be declared
   in that file; declaration order does not affect resolution. Calls supply exactly
   the number of arguments the callee declares.
-- A bare name resolves only to the containing function's parameter. It cannot
-  refer to another function's parameter or denote a function value. A parameter
-  shadows a same-named direct call; calling that name rejects the non-callable `Int`.
+- A bare expression name first resolves to the nearest local binding: an
+  arm capture, or the containing function's parameter. Otherwise
+  it resolves to a variant in the expected union: the innermost call's parameter
+  type, or the containing function's return type when there is no unary call.
+  Variants in different unions may share a spelling; expected type chooses the
+  owner. `First()` is invalid because a payload-free constructor is a value;
+  `Number(expression)` supplies the one `Int` field of a payload constructor.
+  A name cannot refer to another function's parameter or denote a function value.
+  A local binding shadows a same-named constructor or direct call; its established type
+  is preserved, with no fallback to a constructor when that type is wrong.
   Arguments use the caller's scope, even when the callee has a parameter with
   the same spelling.
 - `receiver.function()` resolves its target from the file's declared functions,
   independently of parameter shadowing. The receiver still uses the caller's scope.
   A parameter named `identity` can therefore be read and passed to the declared
   function with `identity.identity()`; the direct call `identity(identity)` tries
-  to call the parameter and is rejected. UFCS targets require one `Int` parameter.
+  to call the parameter and is rejected. UFCS targets require one parameter.
+- Each argument and final return expression must match its receiving type.
+  Resolved call-edge mismatches highlight the callee name at the call site;
+  constructor lookup errors highlight the variant name. Return mismatches highlight
+  the complete expression, excluding indentation and trailing spaces.
+- A match scrutinee must synthesize a declared union type from a binding or
+  function result. `match Empty:` and `match Number(42):` lack a receiving type;
+  no type is guessed from patterns or the containing function's return type.
+  Integer scrutinees are outside this increment. Each arm result must match
+  the containing function's declared result type, which may differ from the
+  matched union. All arms are checked, including ones a constant scrutinee
+  cannot select.
+- An unshadowed constructor spelling in a bare pattern selects that variant
+  of the matched union. Other bare names, including a spelling shadowed by a
+  local binding, introduce fresh whole-value binders. Explicit constructor
+  patterns require an unshadowed constructor of the matched union. Its declared field
+  shape determines the required pattern arity. Field binders and wildcards
+  cover the constructor's entire field domain. Arm bindings are immutable and
+  scoped to that arm; sibling arms may reuse a spelling. Earlier arms determine
+  usefulness, and the remaining variants determine exhaustiveness.
 - A pure caller may call only declared pure callees. Every function body is
   checked, including unreachable helpers, so a pure call chain cannot hide an
   impure edge. Calls inside arguments obey the containing function's purity.
@@ -238,12 +353,19 @@ Semantic rules:
   recursion produce a semantic diagnostic. Repeating an acyclic call, such as
   `identity(identity(1))`, is valid. General recursion and its resource rules are
   future work.
-- Each source function has a 64-bit C return value and a generated symbol based
-  on its compilation-local identity. A separate C `int main(void)` wrapper calls
+- Each source function has its checked C return type and a generated symbol based
+  on its compilation-local identity. `Int` uses `int64_t`; each union uses its own
+  synthetic enum when all its variants are nullary. A payload-bearing union
+  uses a distinct struct with an enum tag and one `int64_t` payload slot;
+  nullary construction initializes that unused slot to zero. A separate C `int main(void)` wrapper calls
   the checked entrypoint and converts the result to the process exit status.
 - The final expression is the return value. No explicit `return` is needed.
 - Multiple parameters or arguments, explicit UFCS arguments, parenthesized expressions,
-  fields, multiline chains, bindings, and function values are outside this increment.
+  multiple or non-Int payload fields, nested matches, block arm results,
+  guards, qualified/nested/literal patterns, constructor UFCS, multiline chains,
+  general bindings, generics, and function
+  values are outside this increment. `Bool` has no special treatment: a written
+  `fixed union Bool` follows the ordinary union path, and an undeclared `Bool` is unknown.
   Imports and UFCS-only import visibility are deferred; every function in this
   input file is available to either call notation.
 - Syntax and semantic errors carry a source location, an explanation, and help.
@@ -257,24 +379,47 @@ The command reads an input file and writes an output C file:
 bin/blorp run --no-format blorp_2/src/main.brp -- input.brp output.c
 ```
 
-The impure command shell owns file I/O and diagnostic rendering. Its pure
-pipeline publishes these complete results:
+The impure command shell owns file I/O and printing. Compilation and
+diagnostic rendering are pure. The pipeline publishes these complete results:
 
 1. Lexing produces tokens with source spans and an explicit end-of-source span.
-   Integer tokens retain their complete raw spelling.
-2. Parsing produces complete declarations, parameter annotations, written names,
-   and expression syntax. Each expression has a literal, name, or zero-argument
-   call base, followed by unary call wrappers in evaluation order. Each wrapper
+   Integer tokens retain their complete raw spelling; indentation tokens retain
+   their depth and the entire prefix span.
+2. Parsing produces function and union declarations, payload and parameter
+   annotations, written names, expression syntax, and structured match bodies.
+   Match patterns preserve names and field syntax without deciding whether a
+   bare name denotes a constructor or binding. Each expression has a literal,
+   name, or zero-argument application base, followed by unary application
+   wrappers in evaluation order. Each wrapper
    retains explicit direct or receiver notation because their target lookup differs.
+   Every expression records its consumed token span directly, without reconstructing
+   locations from names or literal values.
    A local interning builder assigns one opaque `NameId` per spelling. Parsing
    seals the complete syntax and immutable name table in an opaque `ParsedProgram`.
    Integer conversion accumulates negatively against derived range cutoffs,
    checking before multiplication so even the minimum is represented safely.
-3. Checking validates signatures and call chains, resolves calls to function
-   identities and parameter reads to the sole parameter slot, and publishes an
-   opaque checked program with its entrypoint identity. Call notation is erased
+3. Checking resolves nominal union and owned variant identities, then publishes
+   one authoritative signature per function. A private resolution context holds
+   the aligned declarations and signatures. Target resolution returns a complete
+   call and signature after one lookup. The zero-argument and unary boundaries
+   prove arity once, check purity afterward, and publish complete transient contracts.
+   Unary contracts retain parameter and return types while the body validates every
+   edge; they are erased to checked calls only after validation. Published function
+   signatures remain the sole signature authority. Constructor operations are
+   distinct from function calls and use the owning variant's declared field shape.
+   Local reads carry a function-owned `BindingId`, distinguishing the parameter
+   from each arm's binding. Match checking resolves patterns and result types,
+   and establishes usefulness and exhaustiveness before publishing checked arms.
+   Constructors retain their owning union and variant identities. Checking
+   publishes an opaque program with its entrypoint identity. Call notation is erased
    after target resolution; emission receives the same checked calls for both forms.
 4. Emission consumes that checked program and produces C.
+   A match saves its scrutinee once and switches on its tag. Arm-local field
+   projections occur only in the selected branch; a whole-value binder reads
+   the saved value. Emission consumes checked patterns without repeating
+   resolution, arity, purity, or coverage checks. Its result can report an
+   internal checked-reference error instead of silently choosing a C layout;
+   source-language acceptance is already complete.
 
 The names module owns the spelling table and constructs canonical `main` and
 `Int` identities once. Parsing uses string lookup only in its local interning
@@ -285,9 +430,15 @@ as an internal compiler error. IDs are meaningful only within their owning
 parse and table; equality and lookup do not validate table ownership. Only the
 parser can construct the sealed program that checking accepts. `FunctionId` remains a separate
 nominal identity assigned in declaration order. Checking retains call spans;
-emission uses resolved identities, parameter shapes and expressions. These integer-only
-programs need no target heap allocation or ownership pass.
-Ownership, type registries, and general pass infrastructure will be introduced
+`UnionId` identifies a declared type and `VariantId` records both its owner and
+variant position; neither is interchangeable with a `NameId` or `FunctionId`.
+`BindingId` identifies a function-local parameter or arm binding independently
+of spelling; reusing a spelling in sibling arms creates distinct bindings.
+Emission uses resolved identities, typed signatures and expressions. Integer and
+union programs with optional Int fields need no target heap allocation or ownership pass.
+The flat expression chain remains the single-line, zero/one-argument leaf.
+A structured body sum distinguishes that leaf from a match with ordered arms.
+Ownership and general pass infrastructure will be introduced
 when an executable example requires them.
 
 [`src/prelude_temp.brp`](src/prelude_temp.brp) stages the target declaration
@@ -321,6 +472,9 @@ end-to-end cost. Self-compilation is a later milestone.
 
 ## Bootstrap direction and process
 
+[MEMORY_PLAN.md](MEMORY_PLAN.md) proposes memory responsibilities and typed
+boundaries for the upcoming bindings increments; it adds no runtime support.
+
 Compiler source under `src/` stays within the agreed eventual subset: `String`, `Int`
 (64-bit), `Float` (64-bit), `Bool`, `Void`, `List`, `Option`, `Result`, `Dict`,
 `Set`, records/unions and their fixed spellings, opaque types, generics,
@@ -337,6 +491,14 @@ it is a temporary host dependency, not a subset-compatible bootstrap library.
 Self-hosting requires a library/runtime with explicit primitive contracts and
 source dependencies that fit the subset.
 
+The performance goal is roughly five times faster compilation through C emission
+than the existing compiler on matched workloads. Measure this separately from
+Clang compilation/linking and native execution, with explicit source and toolchain
+identity; it is a goal, not a measured result. The current unit command still
+uses the existing compiler. Its measured 615 ms pipeline would become about
+123 ms at that target, saving about 492 ms once the pilot supports that workload.
+See the [timing record](../benchmarks/results/blorp_2_match_2026-10-09.md#unit-test-feedback-time).
+
 Each next increment adds an example, the exact grammar and semantic rules it
 needs, positive and negative tests, and independently reviewed implementation.
 Builders remain local; published results remain immutable; each semantic fact
@@ -344,7 +506,7 @@ has one authority. Function identity is declaration-list position; checked calls
 contain resolved identities and diagnostic spans, and the checked program owns the
 entrypoint. Local topological elimination checks all base and wrapper call edges;
 no persistent graph registry is needed. Each checked function retains its validated
-purity and parameter shape beside its resolved body. Emission reads only validated
+signature beside its resolved body. Emission reads only validated
 facts and does not recheck purity or name scope. C function and parameter names are
 synthetic, and unused parameters are explicitly discarded to keep warning checks
 clean. Existing compiler internals are not pilot dependencies.

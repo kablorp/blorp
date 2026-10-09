@@ -1,4 +1,4 @@
-(* Blorp 2: signed Int64 literals.
+(* Blorp 2: fixed unions with an optional Int field and tail matches.
 
    This is a byte-level source grammar. No whitespace is implicit.
    Dialect: `=` defines a rule; `;` ends it; juxtaposition concatenates;
@@ -11,7 +11,8 @@
 
    Lexical contracts:
    - Identifiers use the longest consecutive identifier byte run.
-   - The exact spellings `func` and `pure` are reserved identifiers.
+   - The exact spellings `func`, `pure`, `match`, and `_` are reserved.
+     Lone `_` is a wildcard token; `_name` remains an identifier.
    - Integer tokens use the longest consecutive digit run, with an optional
      adjacent minus. Parsing rejects leading zeros and values outside
      -9223372036854775808..9223372036854775807. `-0` has value zero.
@@ -21,32 +22,54 @@
    - All source bytes are ASCII; CR, comments and other bytes are unsupported.
 
    Syntax accepts any unreserved function, parameter and type identifier.
-   The checker requires exactly one zero-parameter `main`, `Int` parameter
-   and return types, declared callees, matching call arity, distinct function
-   names, acyclic calls, and pure callers calling only pure callees. A bare
-   name must be the containing function's parameter. That parameter shadows
-   a same-named direct call and cannot be called. A UFCS target resolves to a
-   declared function independently of parameter shadowing; its receiver uses
-   the containing function's scope. Unannotated functions are impure.
+   `fixed` and `union` are contextual words in a union header, and remain
+   valid function, type, parameter and variant identifiers elsewhere.
+   The checker requires exactly one zero-parameter `main` returning `Int`.
+   Helper parameter and return types are `Int` or a declared fixed union.
+   Type names occupy a separate namespace from function and variant names.
+   Union type names and variants within one union must be unique. Functions
+   cannot share a variant name; variants in different unions may share names.
+   Bare variants resolve in the expected union type, determined by the
+   receiving function parameter or declared return type. A local parameter
+   shadows a same-named variant or direct call and cannot be called. A UFCS
+   target resolves globally, independently of parameter shadowing; its receiver
+   uses the containing function's scope. Calls require matching arity and
+   nominal types, acyclic edges, and pure callers calling only pure callees.
+   Unannotated functions are impure. Nullary variants are bare values. A
+   variant with one Int field uses unary construction syntax. Constructor
+   application is pure and is not a function call; constructor UFCS is deferred.
+   Matches occupy the complete function body. Their scrutinee must synthesize
+   a union type from a binding or function result; a constructor alone does not
+   provide a receiving type. An unshadowed constructor spelling selects that
+   union's variant. Other bare names, including a spelling shadowed by a local
+   binding, introduce fresh whole-value bindings. Field binders and wildcards
+   are irrefutable. Checking requires
+   exhaustive, useful arms and type-checks every arm result.
 *)
 
 letter           = "A".."Z" | "a".."z" ;
 digit            = "0".."9" ;
 identifier_start = letter | "_" ;
 identifier_byte  = identifier_start | digit ;
-identifier       = (identifier_start { identifier_byte }) - ("func" | "pure") ;
+identifier       = (identifier_start { identifier_byte }) - ("func" | "pure" | "match" | "_") ;
 
 space            = " " ;
 spaces           = { space } ;
 required_spaces  = space spaces ;
 newline          = "\n" ;
-indent           = "\t" | "    " ;
+indent_one       = "\t" | "    " ;
+indent_two       = "\t\t" | "        " ;
 
-(* Each declaration is two lines. A single LF separates declarations; the
-   final body may omit its LF. Blank lines and trailing whitespace after the
+(* A function has one header followed by an expression line or tail match.
+   A union has one header and one or more variant lines. A single LF
+   separates declarations; the final line may omit its LF.
+   Blank lines and trailing whitespace after the
    final LF are unsupported. Spaces in a call are explicit, including f ( )
    and 1 . f ( ). UFCS adds its receiver as the function's sole argument;
-   the parentheses contain no explicit arguments. All calls stay on one line. *)
+   the parentheses contain no explicit arguments. All expressions stay on one
+   line, including scrutinees and arm results. Indentation prefixes are entirely
+   tabs or spaces; spaces count in groups of four. Bodies and variants require
+   depth one, match arms depth two. No nested matches or block arms. *)
 nonzero_digit    = "1".."9" ;
 integer          = [ "-" ] ("0" | nonzero_digit { digit }) ;
 direct_call      = identifier spaces "(" spaces [ expression ] spaces ")" ;
@@ -56,5 +79,15 @@ expression       = primary { receiver_call } ;
 parameter        = identifier spaces ":" spaces identifier ;
 function         = [ "pure" required_spaces ] "func" required_spaces identifier spaces "(" spaces
                    [ parameter ] spaces ")" spaces "->" spaces identifier spaces ":" spaces
-                   newline indent expression spaces ;
-program          = function { newline function } [ newline ] EOF ;
+                   newline body ;
+field_pattern    = "_" | identifier ;
+pattern          = "_" | identifier spaces [ "(" spaces [ field_pattern ] spaces ")" ] ;
+match_arm        = indent_two pattern spaces ":" spaces expression spaces ;
+match_body       = indent_one "match" required_spaces expression spaces ":" spaces
+                   newline match_arm { newline match_arm } ;
+body             = indent_one expression spaces | match_body ;
+variant          = indent_one identifier spaces [ "(" spaces identifier spaces ")" spaces ] ;
+fixed_union      = "fixed" required_spaces "union" required_spaces identifier spaces ":" spaces
+                   newline variant { newline variant } ;
+declaration      = function | fixed_union ;
+program          = declaration { newline declaration } [ newline ] EOF ;

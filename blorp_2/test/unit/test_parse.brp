@@ -5,12 +5,35 @@ import:
 		CallNotation(ReceiverCall),
 		Diagnostic,
 		ExpressionBase(IntegerExpression, NameExpression),
+		FieldPattern(FieldName),
 		ParameterList(EmptyParameters),
+		ParsedBody(ParsedValueBody, ParsedMatchBody),
+		ParsedFunction,
+		ParsedPattern(PatternConstructor),
+		PatternFields(OnePatternField),
 		Purity(Impure),
-		Symbol(FunctionKeyword, LeftParen, RightParen, Dot, Arrow, Colon, Newline, Indent),
+		Symbol(FunctionKeyword, MatchKeyword, LeftParen, RightParen, Dot, Arrow, Colon, Newline),
 		Token,
-		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral),
+		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, Indentation),
+		UnaryApplication,
+		ValueExpression,
 	test: TestSuite
+
+
+private pure func value_of(function: ParsedFunction) -> Option[ValueExpression]:
+	match function.body:
+		ParsedValueBody(value):
+			Some(value)
+		_:
+			None
+
+
+private pure func base_of(function: ParsedFunction) -> Option[ExpressionBase]:
+	value_of(function).map(pure func(value): value.base)
+
+
+private pure func applications_of(function: ParsedFunction) -> Option[List[UnaryApplication]]:
+	value_of(function).map(pure func(value): value.applications)
 
 
 -- Construct the phase input directly so lexer changes cannot change this oracle.
@@ -73,7 +96,7 @@ private pure func program_tokens(function_name: String, return_type: String) -> 
 			}
 		},
 		{
-			kind = SymbolToken(Indent),
+			kind = Indentation(1),
 			span = {
 				start = 20,
 				end = 21
@@ -132,9 +155,13 @@ pure func test_unchecked_names_and_spans() -> Bool:
 
 			match program.functions:
 				[function]:
-					body_is_zero: Bool = match function.body.base:
-						IntegerExpression(0):
-							function.body.unary_calls.length() == 0
+					body_is_zero: Bool = match base_of(function):
+						Some(IntegerExpression(0)):
+							applications_of(
+								function,
+							).map(
+								pure func(values): values.length(),
+							) == Some(0)
 						_:
 							False
 
@@ -154,6 +181,9 @@ pure func test_unchecked_names_and_spans() -> Bool:
 						and body_is_zero
 						and parameters_empty
 						and function.purity == Impure
+						and value_of(function).map(pure func(value): value.span.start) == Some(21)
+						and value_of(function).map(pure func(value): value.span.end) == Some(22)
+						and program.unions.length() == 0
 						and program.end.start == 23
 					)
 				_:
@@ -259,13 +289,17 @@ pure func test_bare_name_is_parsed_without_scope_resolution() -> Bool:
 
 					match program.functions:
 						[function]:
-							match function.body.base:
-								NameExpression(name):
+							match base_of(function):
+								Some(NameExpression(name)):
 									(
 										name_spelling(program.names, name.id) == Some("x")
 										and name.span.start == 21
 										and name.span.end == 22
-										and function.body.unary_calls.length() == 0
+										and applications_of(
+											function,
+										).map(
+											pure func(values): values.length(),
+										) == Some(0)
 									)
 								_:
 									False
@@ -307,7 +341,7 @@ pure func test_missing_body_uses_explicit_eof_span() -> Bool:
 		21,
 		21,
 		"expected a return expression",
-		"use an Int literal, a parameter name, or a call as the entire body",
+		"use a literal, a parameter or variant name, or a call as the entire body",
 	)
 
 
@@ -345,10 +379,10 @@ pure func test_ufcs_from_independent_token_spans() -> Bool:
 
 			match program.functions:
 				[function]:
-					match function.body.base:
-						IntegerExpression(1):
-							match function.body.unary_calls:
-								[call]:
+					match base_of(function):
+						Some(IntegerExpression(1)):
+							match applications_of(function):
+								Some([call]):
 									(
 										call.notation == ReceiverCall
 										and name_spelling(
@@ -388,9 +422,16 @@ private pure func literal_is(spelling: String, expected: Int) -> Bool:
 		Ok(parsed):
 			match parsed_contents(parsed).functions:
 				[function]:
-					match function.body.base:
-						IntegerExpression(value):
-							value == expected and function.body.unary_calls.length() == 0
+					match base_of(function):
+						Some(IntegerExpression(value)):
+							(
+								value == expected
+								and applications_of(
+									function,
+								).map(
+									pure func(values): values.length(),
+								) == Some(0)
+							)
 						_:
 							False
 				_:
@@ -444,9 +485,164 @@ pure func test_raw_token_spelling_is_validated() -> Bool:
 	)
 
 
+private pure func match_tokens() -> List[Token]:
+	program_tokens("main", "Int")
+		.take(9)
+		.concat([
+			token(SymbolToken(MatchKeyword), 21, 26),
+			token(IdentifierToken("Choice"), 27, 33),
+			token(SymbolToken(Colon), 33, 34),
+			token(SymbolToken(Newline), 34, 35),
+			token(Indentation(2), 35, 37),
+			token(IdentifierToken("Number"), 37, 43),
+			token(SymbolToken(LeftParen), 43, 44),
+			token(IdentifierToken("item"), 44, 48),
+			token(SymbolToken(RightParen), 48, 49),
+			token(SymbolToken(Colon), 49, 50),
+			token(IntegerLiteral("42"), 51, 53),
+			token(SymbolToken(Newline), 53, 54),
+		])
+
+
+pure func test_match_from_independent_tokens_preserves_structure_and_spans() -> Bool:
+	match (
+		parse({
+			tokens = match_tokens(),
+			end = {
+				start = 54,
+				end = 54
+			},
+		})
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			program = parsed_contents(parsed)
+
+			match program.functions:
+				[function]:
+					match function.body:
+						ParsedMatchBody(body):
+							scrutinee = match body.scrutinee.base:
+								NameExpression(name):
+									(
+										name_spelling(program.names, name.id) == Some("Choice")
+										and name.span.start == 27
+										and name.span.end == 33
+									)
+								_:
+									False
+
+							match body.arms:
+								[arm]:
+									pattern = match arm.pattern:
+										PatternConstructor(name, OnePatternField(FieldName(field)), span):
+											(
+												name_spelling(
+													program.names,
+													name.id,
+												) == Some("Number")
+												and name.span.start == 37
+												and name.span.end == 43
+												and name_spelling(
+													program.names,
+													field.id,
+												) == Some("item")
+												and field.span.start == 44
+												and field.span.end == 48
+												and span.start == 37
+												and span.end == 49
+											)
+										_:
+											False
+
+									value = match arm.body.base:
+										IntegerExpression(42):
+											True
+										_:
+											False
+
+									(
+										scrutinee
+										and pattern
+										and value
+										and body.keyword_span.start == 21
+										and body.keyword_span.end == 26
+										and body.span.start == 21
+										and body.span.end == 53
+										and body.scrutinee.span.start == 27
+										and body.scrutinee.span.end == 33
+										and body.scrutinee.applications.length() == 0
+										and arm.span.start == 37
+										and arm.span.end == 53
+										and arm.body.span.start == 51
+										and arm.body.span.end == 53
+										and arm.body.applications.length() == 0
+										and program.end.start == 54
+										and program.end.end == 54
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_match_keyword_requires_a_space_before_the_expression() -> Bool:
+	match match_tokens().set_index(
+		10,
+		token(IntegerLiteral("42"), 26, 28),
+	):
+		None:
+			False
+		Some(tokens):
+			rejects(
+				parse({
+					tokens = tokens,
+					end = {
+						start = 54,
+						end = 54
+					},
+				}),
+				26,
+				28,
+				"expected a space after 'match'",
+				"put a space between 'match' and the matched expression",
+			)
+
+
+pure func test_missing_match_arm_result_uses_explicit_eof_span() -> Bool:
+	rejects(
+		parse({
+			tokens = match_tokens().take(19),
+			end = {
+				start = 50,
+				end = 50
+			},
+		}),
+		50,
+		50,
+		"expected a return expression",
+		"use a literal, a parameter or variant name, or a call as the entire body",
+	)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 parser",
 	tests = [
+		(
+			"match tokens preserve structure and spans",
+			test_match_from_independent_tokens_preserves_structure_and_spans,
+		),
+		(
+			"match keyword requires a following space",
+			test_match_keyword_requires_a_space_before_the_expression,
+		),
+		(
+			"missing match arm result uses explicit EOF",
+			test_missing_match_arm_result_uses_explicit_eof_span,
+		),
 		("signed literals and endpoints", test_signed_literals_and_endpoints),
 		(
 			"range rejection spans cover whole token",

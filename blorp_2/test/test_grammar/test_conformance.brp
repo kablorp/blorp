@@ -1,24 +1,36 @@
 import:
 	../../src/lex: lex
-	../../src/names: name_spelling
+	../../src/names: NameTable, name_spelling
 	../../src/parse: ParsedProgram, parse, parsed_contents
 	../../src/syntax:
 		CallNotation(DirectCall, ReceiverCall),
 		Diagnostic,
-		ExpressionBase(IntegerExpression, NameExpression, CallExpression),
+		ExpressionBase(IntegerExpression, NameExpression, ZeroArgumentApplication),
+		FieldPattern(FieldName, FieldWildcard),
 		ParameterList(EmptyParameters, SingleParameter),
+		ParsedBody(ParsedValueBody, ParsedMatchBody),
+		ParsedFunction,
+		ParsedMatch,
+		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
+		ParsedUnion,
+		PatternFields(NoPatternFields, OnePatternField),
+		PayloadSyntax(NoPayloadSyntax, OnePayloadSyntax),
 		Purity(Pure, Impure),
+		ValueExpression,
+		WrittenName,
 	test: TestSuite
 
 
 private HEADER: String = "func main() -> Int:\n"
 
+private MATCH_HEADER: String = "func f(value: V) -> Int:\n\tmatch value:\n"
+
 private IDENTIFIER_HELP: String = (
-	"use an ASCII identifier starting with a letter or underscore; 'func' and 'pure' "
-	+ "are reserved"
+	"use an ASCII identifier starting with a letter or underscore; 'func', 'pure', "
+	+ "'match', and lone '_' are reserved"
 )
 
-private INDENT_HELP: String = "use exactly one tab or exactly four spaces before the return expression"
+private INDENT_HELP: String = "use tabs only, or spaces in groups of four; do not mix tabs and spaces"
 
 private CHARACTER_HELP: String = (
 	"use ASCII function declarations and Int literals, parameter names, or calls "
@@ -26,6 +38,10 @@ private CHARACTER_HELP: String = (
 )
 
 private TRAILING_HELP: String = "start each declaration at column 1 with no blank lines"
+
+private EXPRESSION_HELP: String = "use a literal, a parameter or variant name, or a call as the entire body"
+
+private PATTERN_CLOSE_HELP: String = "write Variant(name), Variant(_), or a nullary Variant()"
 
 
 private pure func parse_source(source: String) -> Result[ParsedProgram, Diagnostic]:
@@ -51,25 +67,29 @@ private pure func accepts(
 
 			match program.functions:
 				[function]:
-					match function.body.base:
-						IntegerExpression(value):
-							(
-								value == 0
-								and function.purity == Impure
-								and function.body.unary_calls.length() == 0
-								and name_spelling(
-									program.names,
-									function.function_name.id,
-								) == Some(name)
-								and function.function_name.span.start == name_start
-								and function.function_name.span.end == name_end
-								and name_spelling(
-									program.names,
-									function.return_type.id,
-								) == Some(type_name)
-								and function.return_type.span.start == type_start
-								and function.return_type.span.end == type_end
-							)
+					match function.body:
+						ParsedValueBody(body):
+							match body.base:
+								IntegerExpression(value):
+									(
+										value == 0
+										and function.purity == Impure
+										and body.applications.length() == 0
+										and name_spelling(
+											program.names,
+											function.function_name.id,
+										) == Some(name)
+										and function.function_name.span.start == name_start
+										and function.function_name.span.end == name_end
+										and name_spelling(
+											program.names,
+											function.return_type.id,
+										) == Some(type_name)
+										and function.return_type.span.start == type_start
+										and function.return_type.span.end == type_end
+									)
+								_:
+									False
 						_:
 							False
 				_:
@@ -95,6 +115,66 @@ private pure func rejects(
 			)
 
 
+private pure func written_name_is(
+	names: NameTable,
+	name: WrittenName,
+	spelling: String,
+	start: Int,
+	end: Int,
+) -> Bool:
+	(
+		name_spelling(names, name.id) == Some(spelling)
+		and name.span.start == start
+		and name.span.end == end
+	)
+
+
+private pure func rejects_identifier(
+	source: String,
+	start: Int,
+	end: Int,
+	message: String,
+) -> Bool:
+	rejects(source, start, end, message, IDENTIFIER_HELP)
+
+
+private pure func expression_name_is(
+	names: NameTable,
+	expression: ValueExpression,
+	spelling: String,
+	start: Int,
+	end: Int,
+) -> Bool:
+	match expression.base:
+		NameExpression(name):
+			(
+				written_name_is(names, name, spelling, start, end)
+				and expression.applications.length() == 0
+				and expression.span.start == start
+				and expression.span.end == end
+			)
+		_:
+			False
+
+
+private pure func expression_integer_is(
+	expression: ValueExpression,
+	value: Int,
+	start: Int,
+	end: Int,
+) -> Bool:
+	match expression.base:
+		IntegerExpression(actual):
+			(
+				actual == value
+				and expression.applications.length() == 0
+				and expression.span.start == start
+				and expression.span.end == end
+			)
+		_:
+			False
+
+
 pure func test_indent_alternatives_and_final_lf() -> Bool:
 	(
 		accepts(HEADER + "\t0\n", "main", 5, 9, "Int", 15, 18)
@@ -105,7 +185,7 @@ pure func test_indent_alternatives_and_final_lf() -> Bool:
 pure func test_identifier_start_alternatives() -> Bool:
 	(
 		accepts("func a()->Z:\n\t0", "a", 5, 6, "Z", 10, 11)
-		and accepts("func _()->_:\n\t0", "_", 5, 6, "_", 10, 11)
+		and accepts("func _n()->_t:\n\t0", "_n", 5, 7, "_t", 11, 13)
 		and accepts("func A()->z:\n\t0", "A", 5, 6, "z", 10, 11)
 	)
 
@@ -231,40 +311,16 @@ pure func test_indentation_is_exact() -> Bool:
 			"expected an indent of one tab or four spaces",
 			"indent the body with exactly one tab or four spaces",
 		)
-		and rejects(
-			HEADER + "   0",
-			20,
-			23,
-			"expected an indent of one tab or four spaces",
-			INDENT_HELP,
-		)
-		and rejects(
-			HEADER + "     0",
-			20,
-			25,
-			"expected an indent of one tab or four spaces",
-			INDENT_HELP,
-		)
-		and rejects(
-			HEADER + "\t 0",
-			20,
-			21,
-			"expected an indent of one tab or four spaces",
-			INDENT_HELP,
-		)
-		and rejects(
-			HEADER + "    \t0",
-			20,
-			24,
-			"expected an indent of one tab or four spaces",
-			INDENT_HELP,
-		)
+		and rejects(HEADER + "   0", 20, 23, "invalid indentation", INDENT_HELP)
+		and rejects(HEADER + "     0", 20, 25, "invalid indentation", INDENT_HELP)
+		and rejects(HEADER + "\t 0", 20, 22, "invalid indentation", INDENT_HELP)
+		and rejects(HEADER + "    \t0", 20, 25, "invalid indentation", INDENT_HELP)
 		and rejects(
 			HEADER + "\t\t0",
 			20,
-			21,
+			22,
 			"expected an indent of one tab or four spaces",
-			INDENT_HELP,
+			"indent the body with exactly one tab or four spaces",
 		)
 	)
 
@@ -328,14 +384,14 @@ pure func test_body_requires_indent_and_expression() -> Bool:
 			21,
 			21,
 			"expected a return expression",
-			"use an Int literal, a parameter name, or a call as the entire body",
+			"use a literal, a parameter or variant name, or a call as the entire body",
 		)
 		and rejects(
 			HEADER + "\tx(",
 			23,
 			23,
 			"expected a return expression",
-			"use an Int literal, a parameter name, or a call as the entire body",
+			"use a literal, a parameter or variant name, or a call as the entire body",
 		)
 		and rejects(
 			HEADER + "\n\t0",
@@ -395,7 +451,7 @@ pure func test_eof_requires_full_consumption() -> Bool:
 			23,
 			24,
 			"expected a newline after the return expression",
-			"put each declaration on its own two lines with no blank lines",
+			"separate declarations with one newline and no blank lines",
 		)
 		and rejects(
 			HEADER + "\t0\n0",
@@ -416,47 +472,55 @@ pure func test_declaration_repetition_and_call_syntax() -> Bool:
 
 			match program.functions:
 				[first, second]:
-					second_is_one: Bool = match second.body.base:
-						IntegerExpression(1):
-							second.body.unary_calls.length() == 0
+					second_is_one: Bool = match second.body:
+						ParsedValueBody(body):
+							match body.base:
+								IntegerExpression(1):
+									body.applications.length() == 0
+								_:
+									False
 						_:
 							False
 
-					match first.body.base:
-						CallExpression(name):
-							(
-								name_spelling(program.names, name.id) == Some("one")
-								and first.body.unary_calls.length() == 0
-								and name.span.start == 21
-								and name.span.end == 24
-								and name_spelling(
-									program.names,
-									first.function_name.id,
-								) == Some("main")
-								and first.function_name.span.start == 5
-								and first.function_name.span.end == 9
-								and name_spelling(
-									program.names,
-									first.return_type.id,
-								) == Some("Int")
-								and first.return_type.span.start == 15
-								and first.return_type.span.end == 18
-								and name_spelling(
-									program.names,
-									second.function_name.id,
-								) == Some("one")
-								and second.function_name.span.start == 34
-								and second.function_name.span.end == 37
-								and name_spelling(
-									program.names,
-									second.return_type.id,
-								) == Some("Int")
-								and second.return_type.span.start == 43
-								and second.return_type.span.end == 46
-								and second_is_one
-								and program.end.start == 53
-								and program.end.end == 53
-							)
+					match first.body:
+						ParsedValueBody(body):
+							match body.base:
+								ZeroArgumentApplication(name):
+									(
+										name_spelling(program.names, name.id) == Some("one")
+										and body.applications.length() == 0
+										and name.span.start == 21
+										and name.span.end == 24
+										and name_spelling(
+											program.names,
+											first.function_name.id,
+										) == Some("main")
+										and first.function_name.span.start == 5
+										and first.function_name.span.end == 9
+										and name_spelling(
+											program.names,
+											first.return_type.id,
+										) == Some("Int")
+										and first.return_type.span.start == 15
+										and first.return_type.span.end == 18
+										and name_spelling(
+											program.names,
+											second.function_name.id,
+										) == Some("one")
+										and second.function_name.span.start == 34
+										and second.function_name.span.end == 37
+										and name_spelling(
+											program.names,
+											second.return_type.id,
+										) == Some("Int")
+										and second.return_type.span.start == 43
+										and second.return_type.span.end == 46
+										and second_is_one
+										and program.end.start == 53
+										and program.end.end == 53
+									)
+								_:
+									False
 						_:
 							False
 				_:
@@ -470,16 +534,23 @@ pure func test_argument_syntax_and_blank_separator_rule() -> Bool:
 
 			match program.functions:
 				[function]:
-					match function.body.base:
-						IntegerExpression(0):
-							match function.body.unary_calls:
-								[call]:
-									(
-										name_spelling(program.names, call.callee.id) == Some("one")
-										and call.callee.span.start == 21
-										and call.callee.span.end == 24
-										and call.notation == DirectCall
-									)
+					match function.body:
+						ParsedValueBody(body):
+							match body.base:
+								IntegerExpression(0):
+									match body.applications:
+										[call]:
+											(
+												name_spelling(
+													program.names,
+													call.callee.id,
+												) == Some("one")
+												and call.callee.span.start == 21
+												and call.callee.span.end == 24
+												and call.notation == DirectCall
+											)
+										_:
+											False
 								_:
 									False
 						_:
@@ -510,26 +581,30 @@ pure func test_pure_qualifier_preserves_names_and_spans() -> Bool:
 
 			match program.functions:
 				[function]:
-					match function.body.base:
-						IntegerExpression(0):
-							(
-								function.purity == Pure
-								and function.body.unary_calls.length() == 0
-								and name_spelling(
-									program.names,
-									function.function_name.id,
-								) == Some("main")
-								and function.function_name.span.start == 10
-								and function.function_name.span.end == 14
-								and name_spelling(
-									program.names,
-									function.return_type.id,
-								) == Some("Int")
-								and function.return_type.span.start == 20
-								and function.return_type.span.end == 23
-								and program.end.start == 27
-								and program.end.end == 27
-							)
+					match function.body:
+						ParsedValueBody(body):
+							match body.base:
+								IntegerExpression(0):
+									(
+										function.purity == Pure
+										and body.applications.length() == 0
+										and name_spelling(
+											program.names,
+											function.function_name.id,
+										) == Some("main")
+										and function.function_name.span.start == 10
+										and function.function_name.span.end == 14
+										and name_spelling(
+											program.names,
+											function.return_type.id,
+										) == Some("Int")
+										and function.return_type.span.start == 20
+										and function.return_type.span.end == 23
+										and program.end.start == 27
+										and program.end.end == 27
+									)
+								_:
+									False
 						_:
 							False
 				_:
@@ -561,59 +636,63 @@ pure func test_parameter_and_nested_call_are_valid_syntax() -> Bool:
 				[function]:
 					match function.parameters:
 						SingleParameter(parameter):
-							match function.body.base:
-								NameExpression(value):
-									match function.body.unary_calls:
-										[inner, outer]:
-											(
-												function.purity == Impure
-												and name_spelling(
-													program.names,
-													function.function_name.id,
-												) == Some("f")
-												and function.function_name.span.start == 5
-												and function.function_name.span.end == 6
-												and name_spelling(
-													program.names,
-													parameter.name.id,
-												) == Some("value")
-												and parameter.name.span.start == 7
-												and parameter.name.span.end == 12
-												and name_spelling(
-													program.names,
-													parameter.type_name.id,
-												) == Some("Foo")
-												and parameter.type_name.span.start == 14
-												and parameter.type_name.span.end == 17
-												and name_spelling(
-													program.names,
-													function.return_type.id,
-												) == Some("Bar")
-												and function.return_type.span.start == 22
-												and function.return_type.span.end == 25
-												and name_spelling(
-													program.names,
-													value.id,
-												) == Some("value")
-												and value.span.start == 40
-												and value.span.end == 45
-												and name_spelling(
-													program.names,
-													inner.callee.id,
-												) == Some("inner")
-												and inner.callee.span.start == 34
-												and inner.callee.span.end == 39
-												and inner.notation == DirectCall
-												and name_spelling(
-													program.names,
-													outer.callee.id,
-												) == Some("outer")
-												and outer.callee.span.start == 28
-												and outer.callee.span.end == 33
-												and outer.notation == DirectCall
-												and program.end.start == 48
-												and program.end.end == 48
-											)
+							match function.body:
+								ParsedValueBody(body):
+									match body.base:
+										NameExpression(value):
+											match body.applications:
+												[inner, outer]:
+													(
+														function.purity == Impure
+														and name_spelling(
+															program.names,
+															function.function_name.id,
+														) == Some("f")
+														and function.function_name.span.start == 5
+														and function.function_name.span.end == 6
+														and name_spelling(
+															program.names,
+															parameter.name.id,
+														) == Some("value")
+														and parameter.name.span.start == 7
+														and parameter.name.span.end == 12
+														and name_spelling(
+															program.names,
+															parameter.type_name.id,
+														) == Some("Foo")
+														and parameter.type_name.span.start == 14
+														and parameter.type_name.span.end == 17
+														and name_spelling(
+															program.names,
+															function.return_type.id,
+														) == Some("Bar")
+														and function.return_type.span.start == 22
+														and function.return_type.span.end == 25
+														and name_spelling(
+															program.names,
+															value.id,
+														) == Some("value")
+														and value.span.start == 40
+														and value.span.end == 45
+														and name_spelling(
+															program.names,
+															inner.callee.id,
+														) == Some("inner")
+														and inner.callee.span.start == 34
+														and inner.callee.span.end == 39
+														and inner.notation == DirectCall
+														and name_spelling(
+															program.names,
+															outer.callee.id,
+														) == Some("outer")
+														and outer.callee.span.start == 28
+														and outer.callee.span.end == 33
+														and outer.notation == DirectCall
+														and program.end.start == 48
+														and program.end.end == 48
+													)
+												_:
+													False
 										_:
 											False
 								_:
@@ -643,21 +722,21 @@ pure func test_call_requires_one_complete_argument_and_closing_paren() -> Bool:
 			26,
 			26,
 			"expected ')' after the call argument",
-			"pass at most one complete Int expression, then close the call with ')'",
+			"pass at most one complete expression, then close the call with ')'",
 		)
 		and rejects(
 			HEADER + "\tone(1))",
 			27,
 			28,
 			"expected a newline after the return expression",
-			"put each declaration on its own two lines with no blank lines",
+			"separate declarations with one newline and no blank lines",
 		)
 		and rejects(
 			HEADER + "\t(1)",
 			21,
 			22,
 			"expected a return expression",
-			"use an Int literal, a parameter name, or a call as the entire body",
+			"use a literal, a parameter or variant name, or a call as the entire body",
 		)
 	)
 
@@ -669,14 +748,14 @@ pure func test_multiple_parameters_and_arguments_are_rejected() -> Bool:
 			13,
 			14,
 			"only zero or one parameter or argument is supported",
-			"use at most one Int parameter and one call argument",
+			"use at most one typed parameter and one call argument",
 		)
 		and rejects(
 			HEADER + "\tone(0, 1)",
 			26,
 			27,
 			"only zero or one parameter or argument is supported",
-			"use at most one Int parameter and one call argument",
+			"use at most one typed parameter and one call argument",
 		)
 	)
 
@@ -690,45 +769,52 @@ pure func test_ufcs_interleaves_with_pending_direct_calls() -> Bool:
 
 			match program.functions:
 				[function]:
-					match function.body.base:
-						NameExpression(value):
-							match function.body.unary_calls:
-								[first, second, third, fourth]:
-									(
-										name_spelling(program.names, value.id) == Some("value")
-										and value.span.start == 42
-										and value.span.end == 47
-										and name_spelling(
-											program.names,
-											first.callee.id,
-										) == Some("identity")
-										and first.callee.span.start == 33
-										and first.callee.span.end == 41
-										and first.notation == DirectCall
-										and name_spelling(
-											program.names,
-											second.callee.id,
-										) == Some("one")
-										and second.callee.span.start == 49
-										and second.callee.span.end == 52
-										and second.notation == ReceiverCall
-										and name_spelling(
-											program.names,
-											third.callee.id,
-										) == Some("zero")
-										and third.callee.span.start == 28
-										and third.callee.span.end == 32
-										and third.notation == DirectCall
-										and name_spelling(
-											program.names,
-											fourth.callee.id,
-										) == Some("identity")
-										and fourth.callee.span.start == 56
-										and fourth.callee.span.end == 64
-										and fourth.notation == ReceiverCall
-										and program.end.start == 67
-										and program.end.end == 67
-									)
+					match function.body:
+						ParsedValueBody(body):
+							match body.base:
+								NameExpression(value):
+									match body.applications:
+										[first, second, third, fourth]:
+											(
+												name_spelling(
+													program.names,
+													value.id,
+												) == Some("value")
+												and value.span.start == 42
+												and value.span.end == 47
+												and name_spelling(
+													program.names,
+													first.callee.id,
+												) == Some("identity")
+												and first.callee.span.start == 33
+												and first.callee.span.end == 41
+												and first.notation == DirectCall
+												and name_spelling(
+													program.names,
+													second.callee.id,
+												) == Some("one")
+												and second.callee.span.start == 49
+												and second.callee.span.end == 52
+												and second.notation == ReceiverCall
+												and name_spelling(
+													program.names,
+													third.callee.id,
+												) == Some("zero")
+												and third.callee.span.start == 28
+												and third.callee.span.end == 32
+												and third.notation == DirectCall
+												and name_spelling(
+													program.names,
+													fourth.callee.id,
+												) == Some("identity")
+												and fourth.callee.span.start == 56
+												and fourth.callee.span.end == 64
+												and fourth.notation == ReceiverCall
+												and program.end.start == 67
+												and program.end.end == 67
+											)
+										_:
+											False
 								_:
 									False
 						_:
@@ -759,14 +845,14 @@ pure func test_ufcs_requires_name_and_empty_parentheses() -> Bool:
 			27,
 			27,
 			"UFCS calls take no explicit arguments",
-			"the receiver supplies the single Int argument; write receiver.function()",
+			"the receiver supplies the single argument; write receiver.function()",
 		)
 		and rejects(
 			HEADER + "\t1.one(0)",
 			27,
 			28,
 			"UFCS calls take no explicit arguments",
-			"the receiver supplies the single Int argument; write receiver.function()",
+			"the receiver supplies the single argument; write receiver.function()",
 		)
 	)
 
@@ -777,13 +863,864 @@ pure func test_ufcs_tail_requires_full_consumption() -> Bool:
 		29,
 		30,
 		"expected a newline after the return expression",
-		"put each declaration on its own two lines with no blank lines",
+		"separate declarations with one newline and no blank lines",
+	)
+
+
+pure func test_union_names_variants_and_expression_spans() -> Bool:
+	match parse_source(
+		"fixed union Choice:\n\tFirst\n\tSecond\nfunc value() -> Choice:\n\tFirst   \n",
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			program = parsed_contents(parsed)
+
+			match program.unions:
+				[declaration]:
+					match declaration.variants:
+						[first, second]:
+							match program.functions:
+								[function]:
+									match function.body:
+										ParsedValueBody(body):
+											match body.base:
+												NameExpression(name):
+													(
+														name_spelling(
+															program.names,
+															declaration.type_name.id,
+														) == Some("Choice")
+														and declaration.type_name.span.start == 12
+														and declaration.type_name.span.end == 18
+														and name_spelling(
+															program.names,
+															first.name.id,
+														) == Some("First")
+														and first.name.span.start == 21
+														and first.name.span.end == 26
+														and name_spelling(
+															program.names,
+															second.name.id,
+														) == Some("Second")
+														and second.name.span.start == 28
+														and second.name.span.end == 34
+														and name_spelling(
+															program.names,
+															function.function_name.id,
+														) == Some("value")
+														and function.function_name.span.start == 40
+														and function.function_name.span.end == 45
+														and name_spelling(
+															program.names,
+															function.return_type.id,
+														) == Some("Choice")
+														and function.return_type.span.start == 51
+														and function.return_type.span.end == 57
+														and name_spelling(
+															program.names,
+															name.id,
+														) == Some("First")
+														and name.span.start == 60
+														and name.span.end == 65
+														and body.span.start == 60
+														and body.span.end == 65
+														and body.applications.length() == 0
+														and program.end.start == 69
+														and program.end.end == 69
+													)
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_union_layout_variants_and_optional_lf() -> Bool:
+	match parse_source("func main() -> Int:\n\t0\nfixed union Choice : \n    First \n    Second"):
+		Err(_):
+			False
+		Ok(parsed):
+			program = parsed_contents(parsed)
+			(
+				program.functions.length() == 1
+				and program.unions.length() == 1
+				and program.unions
+					.get(0)
+					.map(pure func(declaration): declaration.variants.length()) == Some(2)
+			)
+
+
+pure func test_union_header_and_nonempty_body_are_required() -> Bool:
+	(
+		rejects(
+			"fixed Choice:\n\tFirst",
+			6,
+			12,
+			"expected 'union' after 'fixed'",
+			"write fixed union Choice: followed by indented variant names",
+		)
+		and rejects(
+			"fixed union Choice\n\tFirst",
+			18,
+			19,
+			"expected ':' after the union type name",
+			"use a fixed union without type parameters",
+		)
+		and rejects(
+			"fixed union Choice:\n",
+			20,
+			20,
+			"expected an indented union variant",
+			"declare at least one variant, indented with one tab or four spaces",
+		)
+		and rejects(
+			"fixed union Choice:\nfunc main() -> Int:\n\t0",
+			20,
+			24,
+			"expected an indented union variant",
+			"declare at least one variant, indented with one tab or four spaces",
+		)
+		and rejects(
+			"fixed union Choice:\n\t",
+			21,
+			21,
+			"expected a union variant name",
+			IDENTIFIER_HELP,
+		)
+	)
+
+
+pure func test_union_payloads_generics_and_extra_variant_tokens_are_rejected() -> Bool:
+	(
+		rejects(
+			"fixed union Choice:\n\tFirst()",
+			27,
+			28,
+			"expected a payload type",
+			IDENTIFIER_HELP,
+		)
+		and rejects(
+			"fixed union Choice:\n\tFirst(Int",
+			30,
+			30,
+			"expected ')' after the payload type",
+			"declare zero fields or one Int field, written Variant(Int)",
+		)
+		and rejects(
+			"fixed union Choice:\n\tFirst(Int Int)",
+			31,
+			34,
+			"expected ')' after the payload type",
+			"declare zero fields or one Int field, written Variant(Int)",
+		)
+		and rejects(
+			"fixed union Choice[T]:\n\tFirst",
+			18,
+			19,
+			"unsupported character",
+			CHARACTER_HELP,
+		)
+		and rejects(
+			"fixed union Choice:\n\tFirst Second",
+			27,
+			33,
+			"expected a newline after the variant name",
+			"put each variant on its own indented line",
+		)
+		and rejects(
+			"fixed union Choice:\n\tFirst\n\n",
+			27,
+			28,
+			"expected a function declaration at column 1",
+			"start with func main() -> Int:",
+		)
+	)
+
+
+private pure func value_union_shape(names: NameTable, declaration: ParsedUnion) -> Bool:
+	match declaration.variants:
+		[empty, number]:
+			match empty.payload:
+				NoPayloadSyntax:
+					match number.payload:
+						OnePayloadSyntax(type_name):
+							(
+								written_name_is(names, declaration.type_name, "Value", 12, 17)
+								and written_name_is(names, empty.name, "Empty", 20, 25)
+								and written_name_is(names, number.name, "Number", 27, 33)
+								and written_name_is(names, type_name, "Int", 34, 37)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private pure func unwrap_match_shape(names: NameTable, body: ParsedMatch) -> Bool:
+	match body.arms:
+		[empty, number]:
+			match empty.pattern:
+				PatternName(empty_name):
+					match number.pattern:
+						PatternConstructor(number_name, OnePatternField(FieldName(field)), span):
+							match empty.body.base:
+								IntegerExpression(0):
+									(
+										expression_name_is(names, body.scrutinee, "value", 85, 90)
+										and body.span.start == 79
+										and body.span.end == 127
+										and body.keyword_span.start == 79
+										and body.keyword_span.end == 84
+										and written_name_is(names, empty_name, "Empty", 94, 99)
+										and empty.span.start == 94
+										and empty.span.end == 102
+										and empty.body.span.start == 101
+										and empty.body.span.end == 102
+										and empty.body.applications.length() == 0
+										and written_name_is(names, number_name, "Number", 105, 111)
+										and written_name_is(names, field, "number", 112, 118)
+										and span.start == 105
+										and span.end == 119
+										and number.span.start == 105
+										and number.span.end == 127
+										and expression_name_is(
+											names,
+											number.body,
+											"number",
+											121,
+											127,
+										)
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private pure func unwrap_function_shape(names: NameTable, function: ParsedFunction) -> Bool:
+	match function.parameters:
+		SingleParameter(parameter):
+			match function.body:
+				ParsedMatchBody(body):
+					(
+						unwrap_match_shape(names, body)
+						and function.purity == Pure
+						and written_name_is(names, function.function_name, "unwrap", 49, 55)
+						and written_name_is(names, parameter.name, "value", 56, 61)
+						and written_name_is(names, parameter.type_name, "Value", 63, 68)
+						and written_name_is(names, function.return_type, "Int", 73, 76)
+					)
+				_:
+					False
+		_:
+			False
+
+
+private pure func constructed_main_shape(names: NameTable, function: ParsedFunction) -> Bool:
+	no_parameters: Bool = match function.parameters:
+		EmptyParameters:
+			True
+		SingleParameter(_):
+			False
+
+	match function.body:
+		ParsedValueBody(body):
+			match body.base:
+				IntegerExpression(42):
+					match body.applications:
+						[number, call]:
+							(
+								function.purity == Impure
+								and no_parameters
+								and written_name_is(names, function.function_name, "main", 133, 137)
+								and written_name_is(names, function.return_type, "Int", 143, 146)
+								and body.span.start == 149
+								and body.span.end == 167
+								and written_name_is(names, number.callee, "Number", 156, 162)
+								and number.notation == DirectCall
+								and written_name_is(names, call.callee, "unwrap", 149, 155)
+								and call.notation == DirectCall
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_payload_and_match_syntax() -> Bool:
+	match parse_source(
+		"fixed union Value:\n\tEmpty\n\tNumber(Int)\npure func unwrap(value: Value) -> Int:\n\tmatch value:\n\t\tEmpty: 0\n\t\tNumber(number): number\nfunc main() -> Int:\n\tunwrap(Number(42))\n",
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			program = parsed_contents(parsed)
+
+			match program.unions:
+				[declaration]:
+					match program.functions:
+						[unwrap, main_function]:
+							(
+								value_union_shape(program.names, declaration)
+								and unwrap_function_shape(program.names, unwrap)
+								and constructed_main_shape(program.names, main_function)
+								and program.end.start == 168
+								and program.end.end == 168
+							)
+						_:
+							False
+				_:
+					False
+
+
+private pure func spaced_union_shape(names: NameTable, declaration: ParsedUnion) -> Bool:
+	match declaration.variants:
+		[empty, number]:
+			match empty.payload:
+				NoPayloadSyntax:
+					match number.payload:
+						OnePayloadSyntax(type_name):
+							(
+								written_name_is(names, declaration.type_name, "V", 148, 149)
+								and written_name_is(names, empty.name, "Empty", 155, 160)
+								and written_name_is(names, number.name, "Number", 165, 171)
+								and written_name_is(names, type_name, "Float", 174, 179)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_pattern_alternatives_space_layout_and_following_union() -> Bool:
+	match parse_source(
+		"func f(value:V)->Int:\n    match value : \n        Empty ( ) : zero(1).identity() \n        Number ( _ ) : 2\n        whole: 3\n        _: 4\nfixed union V:\n    Empty\n    Number ( Float ) ",
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			program = parsed_contents(parsed)
+
+			union_ok: Bool = match program.unions:
+				[declaration]:
+					spaced_union_shape(program.names, declaration)
+				_:
+					False
+
+			match program.functions:
+				[function]:
+					header_ok: Bool = match function.parameters:
+						SingleParameter(parameter):
+							(
+								function.purity == Impure
+								and written_name_is(
+									program.names,
+									function.function_name,
+									"f",
+									5,
+									6,
+								)
+								and written_name_is(program.names, parameter.name, "value", 7, 12)
+								and written_name_is(program.names, parameter.type_name, "V", 13, 14)
+								and written_name_is(
+									program.names,
+									function.return_type,
+									"Int",
+									17,
+									20,
+								)
+							)
+						_:
+							False
+
+					match function.body:
+						ParsedMatchBody(body):
+							match body.arms:
+								[empty, number, whole, wildcard]:
+									empty_body_ok: Bool = match empty.body.base:
+										IntegerExpression(1):
+											match empty.body.applications:
+												[zero, identity]:
+													(
+														written_name_is(
+															program.names,
+															zero.callee,
+															"zero",
+															61,
+															65,
+														)
+														and zero.notation == DirectCall
+														and written_name_is(
+															program.names,
+															identity.callee,
+															"identity",
+															69,
+															77,
+														)
+														and identity.notation == ReceiverCall
+														and empty.body.span.start == 61
+														and empty.body.span.end == 79
+													)
+												_:
+													False
+										_:
+											False
+
+									empty_ok: Bool = match empty.pattern:
+										PatternConstructor(name, NoPatternFields, span):
+											(
+												written_name_is(
+													program.names,
+													name,
+													"Empty",
+													49,
+													54,
+												)
+												and span.start == 49
+												and span.end == 58
+											)
+										_:
+											False
+
+									number_ok: Bool = match number.pattern:
+										PatternConstructor(name, OnePatternField(FieldWildcard(field)), span):
+											(
+												written_name_is(
+													program.names,
+													name,
+													"Number",
+													89,
+													95,
+												)
+												and field.start == 98
+												and field.end == 99
+												and span.start == 89
+												and span.end == 101
+											)
+										_:
+											False
+
+									whole_ok: Bool = match whole.pattern:
+										PatternName(name):
+											written_name_is(program.names, name, "whole", 114, 119)
+										_:
+											False
+
+									wildcard_ok: Bool = match wildcard.pattern:
+										PatternWildcard(span):
+											span.start == 131 and span.end == 132
+										_:
+											False
+
+									(
+										header_ok
+										and empty_ok
+										and number_ok
+										and whole_ok
+										and wildcard_ok
+										and empty_body_ok
+										and expression_integer_is(number.body, 2, 104, 105)
+										and expression_integer_is(whole.body, 3, 121, 122)
+										and expression_integer_is(wildcard.body, 4, 134, 135)
+										and expression_name_is(
+											program.names,
+											body.scrutinee,
+											"value",
+											32,
+											37,
+										)
+										and body.span.start == 26
+										and body.span.end == 135
+										and body.keyword_span.start == 26
+										and body.keyword_span.end == 31
+										and empty.span.start == 49
+										and empty.span.end == 79
+										and number.span.start == 89
+										and number.span.end == 105
+										and whole.span.start == 114
+										and whole.span.end == 122
+										and wildcard.span.start == 131
+										and wildcard.span.end == 135
+										and union_ok
+										and program.end.start == 182
+										and program.end.end == 182
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+private pure func single_wildcard_match_is(source: String, eof: Int) -> Bool:
+	match parse_source(source):
+		Err(_):
+			False
+		Ok(parsed):
+			program = parsed_contents(parsed)
+
+			match program.functions:
+				[function]:
+					match function.parameters:
+						SingleParameter(parameter):
+							match function.body:
+								ParsedMatchBody(body):
+									match body.arms:
+										[arm]:
+											match arm.pattern:
+												PatternWildcard(span):
+													(
+														function.purity == Impure
+														and written_name_is(
+															program.names,
+															function.function_name,
+															"f",
+															5,
+															6,
+														)
+														and written_name_is(
+															program.names,
+															parameter.name,
+															"value",
+															7,
+															12,
+														)
+														and written_name_is(
+															program.names,
+															parameter.type_name,
+															"V",
+															14,
+															15,
+														)
+														and written_name_is(
+															program.names,
+															function.return_type,
+															"Int",
+															20,
+															23,
+														)
+														and expression_name_is(
+															program.names,
+															body.scrutinee,
+															"value",
+															32,
+															37,
+														)
+														and body.span.start == 26
+														and body.span.end == 45
+														and body.keyword_span.start == 26
+														and body.keyword_span.end == 31
+														and span.start == 41
+														and span.end == 42
+														and arm.span.start == 41
+														and arm.span.end == 45
+														and expression_integer_is(
+															arm.body,
+															1,
+															44,
+															45,
+														)
+														and program.unions.length() == 0
+														and program.end.start == eof
+														and program.end.end == eof
+													)
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_match_one_arm_and_optional_final_lf() -> Bool:
+	(
+		single_wildcard_match_is(MATCH_HEADER + "\t\t_: 1", 45)
+		and single_wildcard_match_is(MATCH_HEADER + "\t\t_: 1\n", 46)
+	)
+
+
+pure func test_match_and_wildcard_are_reserved_in_name_contexts() -> Bool:
+	(
+		rejects_identifier("func _() -> Int:\n\t0", 5, 6, "expected a function name")
+		and rejects_identifier("func match() -> Int:\n\t0", 5, 10, "expected a function name")
+		and rejects_identifier("func main() -> _:\n\t0", 15, 16, "expected a return type")
+		and rejects_identifier("func main() -> match:\n\t0", 15, 20, "expected a return type")
+		and rejects_identifier(
+			"func f(_: Int) -> Int:\n\t0",
+			7,
+			8,
+			"expected a parameter name or ')'",
+		)
+		and rejects_identifier(
+			"func f(match: Int) -> Int:\n\t0",
+			7,
+			12,
+			"expected a parameter name or ')'",
+		)
+		and rejects_identifier("func f(x: _) -> Int:\n\t0", 10, 11, "expected a parameter type")
+		and rejects_identifier("func f(x: match) -> Int:\n\t0", 10, 15, "expected a parameter type")
+		and rejects_identifier("fixed union _:\n\tA", 12, 13, "expected a union type name")
+		and rejects_identifier("fixed union match:\n\tA", 12, 17, "expected a union type name")
+		and rejects_identifier("fixed union V:\n\t_", 16, 17, "expected a union variant name")
+		and rejects_identifier("fixed union V:\n\tmatch", 16, 21, "expected a union variant name")
+		and rejects_identifier("fixed union V:\n\tNumber(_)", 23, 24, "expected a payload type")
+		and rejects_identifier("fixed union V:\n\tNumber(match)", 23, 28, "expected a payload type")
+		and rejects_identifier(HEADER + "\t1._()", 23, 24, "expected a function name after '.'")
+		and rejects_identifier(HEADER + "\t1.match()", 23, 28, "expected a function name after '.'")
+		and rejects_identifier(MATCH_HEADER + "\t\tmatch: 1", 41, 46, "expected a match pattern")
+		and rejects_identifier(
+			MATCH_HEADER + "\t\tNumber(match): 1",
+			48,
+			53,
+			"expected an Int field binding or '_'",
+		)
+		and accepts("func matchx()->_t:\n\t0", "matchx", 5, 11, "_t", 15, 17)
+	)
+
+
+pure func test_match_header_requires_scrutinee_colon_and_lf() -> Bool:
+	(
+		rejects(
+			"fixed union Value:\n\tEmpty\npure func make(value: Int) -> Value:\n\tEmpty\nfunc main() -> Int:\n\tmatch-1.make():\n\t\t_: 0\n",
+			96,
+			98,
+			"expected a space after 'match'",
+			"put a space between 'match' and the matched expression",
+		)
+		and rejects(
+			"func f(value: V) -> Int:\n\tmatch :\n\t\t_: 0",
+			32,
+			33,
+			"expected a return expression",
+			EXPRESSION_HELP,
+		)
+		and rejects(
+			"func f(value: V) -> Int:\n\tmatch value\n\t\t_: 0",
+			37,
+			38,
+			"expected ':' after the match value",
+			"write match value: and put each arm on the next line",
+		)
+		and rejects(
+			"func f(value: V) -> Int:\n\tmatch value: 0",
+			39,
+			40,
+			"expected a newline after the match header",
+			"put each pattern and inline result on its own indented line",
+		)
+	)
+
+
+pure func test_match_requires_nonempty_depth_two_arms() -> Bool:
+	(
+		rejects(
+			MATCH_HEADER,
+			39,
+			39,
+			"expected a match arm indented two levels",
+			"indent each arm with two tabs or eight spaces",
+		)
+		and rejects(
+			MATCH_HEADER + "_: 0",
+			39,
+			40,
+			"expected a match arm indented two levels",
+			"indent each arm with two tabs or eight spaces",
+		)
+		and rejects(
+			MATCH_HEADER + "\t_: 0",
+			39,
+			40,
+			"expected a match arm indented two levels",
+			"indent each arm with two tabs or eight spaces",
+		)
+		and rejects(
+			MATCH_HEADER + "\t\t\t_: 0",
+			39,
+			42,
+			"expected a match arm indented two levels",
+			"indent each arm with two tabs or eight spaces",
+		)
+		and rejects(MATCH_HEADER + "       _: 0", 39, 46, "invalid indentation", INDENT_HELP)
+		and rejects(MATCH_HEADER + "\t\t _: 0", 39, 42, "invalid indentation", INDENT_HELP)
+		and rejects(
+			MATCH_HEADER + "\n\t\t_: 0",
+			39,
+			40,
+			"expected a match arm indented two levels",
+			"indent each arm with two tabs or eight spaces",
+		)
+		and rejects(
+			MATCH_HEADER + HEADER + "\t0",
+			39,
+			43,
+			"expected a match arm indented two levels",
+			"indent each arm with two tabs or eight spaces",
+		)
+		and rejects(
+			MATCH_HEADER + "fixed union V:\n\tA",
+			39,
+			44,
+			"expected a match arm indented two levels",
+			"indent each arm with two tabs or eight spaces",
+		)
+	)
+
+
+pure func test_match_patterns_require_supported_field_shape() -> Bool:
+	(
+		rejects_identifier(MATCH_HEADER + "\t\t0: 1", 41, 42, "expected a match pattern")
+		and rejects_identifier(
+			MATCH_HEADER + "\t\tNumber(0): 1",
+			48,
+			49,
+			"expected an Int field binding or '_'",
+		)
+		and rejects(
+			MATCH_HEADER + "\t\tNumber(Inner(x)): 1",
+			53,
+			54,
+			"expected ')' after the constructor pattern",
+			PATTERN_CLOSE_HELP,
+		)
+		and rejects(
+			MATCH_HEADER + "\t\tNumber(x: 1",
+			49,
+			50,
+			"expected ')' after the constructor pattern",
+			PATTERN_CLOSE_HELP,
+		)
+		and rejects(
+			MATCH_HEADER + "\t\tNumber(x y): 1",
+			50,
+			51,
+			"expected ')' after the constructor pattern",
+			PATTERN_CLOSE_HELP,
+		)
+		and rejects(
+			MATCH_HEADER + "\t\t_(): 1",
+			42,
+			43,
+			"expected ':' after the match pattern",
+			"write Pattern: expression on one line",
+		)
+		and rejects(
+			MATCH_HEADER + "\t\tValue.Empty: 1",
+			46,
+			47,
+			"expected ':' after the match pattern",
+			"write Pattern: expression on one line",
+		)
+	)
+
+
+pure func test_match_arms_require_colon_and_inline_result() -> Bool:
+	(
+		rejects(
+			MATCH_HEADER + "\t\t_ 0",
+			43,
+			44,
+			"expected ':' after the match pattern",
+			"write Pattern: expression on one line",
+		)
+		and rejects(
+			MATCH_HEADER + "\t\t_:",
+			43,
+			43,
+			"expected a return expression",
+			EXPRESSION_HELP,
+		)
+		and rejects(
+			MATCH_HEADER + "\t\t_: \n\t\t\t1",
+			44,
+			45,
+			"expected a return expression",
+			EXPRESSION_HELP,
+		)
+		and rejects(
+			MATCH_HEADER + "\t\t_: match value:",
+			44,
+			49,
+			"expected a return expression",
+			EXPRESSION_HELP,
+		)
+		and rejects(
+			HEADER + "\tone(match value)",
+			25,
+			30,
+			"expected a return expression",
+			EXPRESSION_HELP,
+		)
+		and rejects(
+			MATCH_HEADER + "\t\t_: 1 2",
+			46,
+			47,
+			"expected a newline after the return expression",
+			"separate declarations with one newline and no blank lines",
+		)
 	)
 
 
 tests: TestSuite = {
 	description = "Blorp 2 EBNF syntax conformance",
 	tests = [
+		("payload and tail-match syntax", test_payload_and_match_syntax),
+		(
+			"pattern alternatives, space layout and following union",
+			test_pattern_alternatives_space_layout_and_following_union,
+		),
+		("one match arm and optional final LF", test_match_one_arm_and_optional_final_lf),
+		(
+			"match and wildcard reserved in name contexts",
+			test_match_and_wildcard_are_reserved_in_name_contexts,
+		),
+		(
+			"match header requires scrutinee, colon and LF",
+			test_match_header_requires_scrutinee_colon_and_lf,
+		),
+		("match requires nonempty depth-two arms", test_match_requires_nonempty_depth_two_arms),
+		(
+			"match patterns require supported field shape",
+			test_match_patterns_require_supported_field_shape,
+		),
+		(
+			"match arms require colon and inline result",
+			test_match_arms_require_colon_and_inline_result,
+		),
+		(
+			"union names, variants and expression byte spans",
+			test_union_names_variants_and_expression_spans,
+		),
+		(
+			"union layout, repeated variants and optional LF",
+			test_union_layout_variants_and_optional_lf,
+		),
+		("union header and nonempty body", test_union_header_and_nonempty_body_are_required),
+		(
+			"union payload, generic and trailing syntax rejection",
+			test_union_payloads_generics_and_extra_variant_tokens_are_rejected,
+		),
 		(
 			"UFCS interleaves with pending direct calls",
 			test_ufcs_interleaves_with_pending_direct_calls,

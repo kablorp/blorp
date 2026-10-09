@@ -2,25 +2,34 @@ import:
 	int as IntOps
 	list: reverse
 	names: NameTable, find_name, initial_names, intern_name
-	option: is_some
+	option: is_some, to_result
 	string: index_of
 	syntax:
 		CallNotation(DirectCall, ReceiverCall),
 		DECIMAL_DIGITS,
 		Diagnostic,
-		ExpressionBase(IntegerExpression, NameExpression, CallExpression),
+		ExpressionBase(IntegerExpression, NameExpression, ZeroArgumentApplication),
+		FieldPattern(FieldName, FieldWildcard),
 		LexedProgram,
 		ParameterList(EmptyParameters, SingleParameter),
+		ParsedBody(ParsedValueBody, ParsedMatchBody),
 		ParsedContents,
 		ParsedFunction,
+		ParsedMatchArm,
+		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
+		ParsedUnion,
+		ParsedVariant,
+		PatternFields(NoPatternFields, OnePatternField),
+		PayloadSyntax(NoPayloadSyntax, OnePayloadSyntax),
 		Purity(Pure, Impure),
-		ReturnExpression,
 		Span,
 		Symbol(
-			PureKeyword, FunctionKeyword, LeftParen, RightParen, Dot, Arrow, Colon, Newline, Indent,
+			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
+			Colon, Newline,
 		),
-		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral),
-		UnaryCall,
+		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, Indentation),
+		UnaryApplication,
+		ValueExpression,
 		WrittenName,
 	text as Text
 
@@ -110,9 +119,15 @@ private pure func symbol_matches(actual: Symbol, expected: Symbol) -> Bool:
 					True
 				_:
 					False
-		Indent:
+		MatchKeyword:
 			match expected:
-				Indent:
+				MatchKeyword:
+					True
+				_:
+					False
+		Wildcard:
+			match expected:
+				Wildcard:
 					True
 				_:
 					False
@@ -140,7 +155,7 @@ private pure func consume_symbol(
 
 private pure func identifier_help() -> String:
 	"use an ASCII identifier starting with a letter or underscore; ".concat(
-		"'func' and 'pure' are reserved",
+		"'func', 'pure', 'match', and lone '_' are reserved",
 	)
 
 
@@ -180,8 +195,8 @@ private pure func consume_name(
 			Err(expected(state, message, identifier_help()))
 
 
-private fixed record ParsedBody {
-	body: ReturnExpression,
+private fixed record ParsedValue {
+	body: ValueExpression,
 	next: ParserState
 }
 
@@ -213,6 +228,38 @@ private pure func at_symbol(state: ParserState, symbol: Symbol) -> Bool:
 					False
 		None:
 			False
+
+
+private pure func at_indent(state: ParserState) -> Bool:
+	match state.input.tokens.get(state.position):
+		Some(token):
+			match token.kind:
+				Indentation(_):
+					True
+				_:
+					False
+		None:
+			False
+
+
+private pure func consume_indent(
+	state: ParserState,
+	depth: Int,
+	message: String,
+	help: String,
+) -> Result[ParserState, Diagnostic]:
+	match state.input.tokens.get(state.position):
+		Some(token):
+			match token.kind:
+				Indentation(actual):
+					if IntOps.equals(actual, depth):
+						Ok({ state | position = IntOps.add(state.position, 1) })
+					else:
+						Err(expected(state, message, help))
+				_:
+					Err(expected(state, message, help))
+		None:
+			Err(expected(state, message, help))
 
 
 private DECIMAL_RADIX: Int = 10
@@ -343,7 +390,7 @@ private pure func consume_expression_step(state: ParserState) -> Result[Expressi
 								if at_symbol(opened, RightParen):
 									Ok(
 										ReadBase(
-											CallExpression(name),
+											ZeroArgumentApplication(name),
 											{ opened | position = IntOps.add(opened.position, 1) },
 										),
 									)
@@ -354,7 +401,7 @@ private pure func consume_expression_step(state: ParserState) -> Result[Expressi
 						expected(
 							state,
 							"expected a return expression",
-							"use an Int literal, a parameter name, or a call as the entire body",
+							"use a literal, a parameter or variant name, or a call as the entire body",
 						),
 					)
 		None:
@@ -362,20 +409,20 @@ private pure func consume_expression_step(state: ParserState) -> Result[Expressi
 				expected(
 					state,
 					"expected a return expression",
-					"use an Int literal, a parameter name, or a call as the entire body",
+					"use a literal, a parameter or variant name, or a call as the entire body",
 				),
 			)
 
 
-private fixed record ParsedUnaryCall {
-	call: UnaryCall,
+private fixed record ParsedUnaryApplication {
+	call: UnaryApplication,
 	next: ParserState
 }
 
 
 private pure func consume_receiver_call(
 	after_dot: ParserState,
-) -> Result[ParsedUnaryCall, Diagnostic]:
+) -> Result[ParsedUnaryApplication, Diagnostic]:
 	name ?= consume_name(after_dot, "expected a function name after '.'")
 	after_open ?= consume_symbol(
 		name.next,
@@ -387,7 +434,7 @@ private pure func consume_receiver_call(
 		after_open,
 		RightParen,
 		"UFCS calls take no explicit arguments",
-		"the receiver supplies the single Int argument; write receiver.function()",
+		"the receiver supplies the single argument; write receiver.function()",
 	)
 	Ok({
 		call = {
@@ -398,7 +445,7 @@ private pure func consume_receiver_call(
 	})
 
 
-private pure func consume_body(start: ParserState) -> Result[ParsedBody, Diagnostic]:
+private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagnostic]:
 	var state: ParserState = start
 	var pending: List[WrittenName] = []
 	var base: Option[ExpressionBase] = None
@@ -434,7 +481,7 @@ private pure func consume_body(start: ParserState) -> Result[ParsedBody, Diagnos
 
 	closers: List[WrittenName] = pending.reverse()
 	var next_closer: Int = 0
-	var calls: List[UnaryCall] = []
+	var calls: List[UnaryApplication] = []
 
 	while True:
 		if at_symbol(state, Dot):
@@ -454,7 +501,7 @@ private pure func consume_body(start: ParserState) -> Result[ParsedBody, Diagnos
 						state,
 						RightParen,
 						"expected ')' after the call argument",
-						"pass at most one complete Int expression, then close the call with ')'",
+						"pass at most one complete expression, then close the call with ')'",
 					):
 						Err(error):
 							failure = Some(error)
@@ -471,10 +518,32 @@ private pure func consume_body(start: ParserState) -> Result[ParsedBody, Diagnos
 		Some(error):
 			Err(error)
 		None:
+			first ?= start.input.tokens
+				.get(start.position)
+				.to_result(
+					expected(
+						start,
+						"invalid expression span",
+						"report this compiler error with the input program",
+					),
+				)
+			last ?= state.input.tokens
+				.get(IntOps.subtract(state.position, 1))
+				.to_result(
+					expected(
+						state,
+						"invalid expression span",
+						"report this compiler error with the input program",
+					),
+				)
 			Ok({
 				body = {
 					base = value,
-					unary_calls = calls
+					applications = calls,
+					span = {
+						start = first.span.start,
+						end = last.span.end
+					}
 				},
 				next = state,
 			})
@@ -499,7 +568,7 @@ private pure func consume_parameters(state: ParserState) -> Result[ParsedParamet
 			type_name.next,
 			RightParen,
 			"expected ')' after the parameter",
-			"declare at most one parameter, written name: Int",
+			"declare at most one parameter with an explicit type",
 		)
 		Ok({
 			parameters = SingleParameter({
@@ -507,6 +576,224 @@ private pure func consume_parameters(state: ParserState) -> Result[ParsedParamet
 				type_name = type_name.name,
 			}),
 			next = closed,
+		})
+
+
+private fixed record PatternResult {
+	pattern: ParsedPattern,
+	span: Span,
+	next: ParserState
+}
+
+
+private pure func consume_pattern(state: ParserState) -> Result[PatternResult, Diagnostic]:
+	if at_symbol(state, Wildcard):
+		token ?= state.input.tokens
+			.get(state.position)
+			.to_result(expected(state, "expected a pattern", "write a variant, a binding, or '_'"))
+		Ok({
+			pattern = PatternWildcard(token.span),
+			span = token.span,
+			next = { state | position = IntOps.add(state.position, 1) },
+		})
+	else:
+		name ?= consume_name(state, "expected a match pattern")
+
+		if not at_symbol(name.next, LeftParen):
+			Ok({
+				pattern = PatternName(name.name),
+				span = name.name.span,
+				next = name.next,
+			})
+		else:
+			opened = { name.next | position = IntOps.add(name.next.position, 1) }
+			field ?= consume_pattern_field(opened)
+			closed ?= consume_symbol(
+				field.next,
+				RightParen,
+				"expected ')' after the constructor pattern",
+				"write Variant(name), Variant(_), or a nullary Variant()",
+			)
+			last ?= field.next.input.tokens
+				.get(field.next.position)
+				.to_result(expected(field.next, "expected ')'", "close the constructor pattern"))
+			span: Span = {
+				start = name.name.span.start,
+				end = last.span.end
+			}
+			Ok({
+				pattern = PatternConstructor(name.name, field.fields, span),
+				span = span,
+				next = closed,
+			})
+
+
+private fixed record PatternFieldResult {
+	fields: PatternFields,
+	next: ParserState
+}
+
+
+private pure func consume_pattern_field(
+	state: ParserState,
+) -> Result[PatternFieldResult, Diagnostic]:
+	if at_symbol(state, RightParen):
+		Ok({
+			fields = NoPatternFields,
+			next = state,
+		})
+	else if at_symbol(state, Wildcard):
+		token ?= state.input.tokens
+			.get(state.position)
+			.to_result(
+				expected(
+					state,
+					"expected a field pattern",
+					"bind the Int field with a name or ignore it with '_'",
+				),
+			)
+		Ok({
+			fields = OnePatternField(FieldWildcard(token.span)),
+			next = { state | position = IntOps.add(state.position, 1) },
+		})
+	else:
+		name ?= consume_name(state, "expected an Int field binding or '_'")
+		Ok({
+			fields = OnePatternField(FieldName(name.name)),
+			next = name.next,
+		})
+
+
+private fixed record BodyResult {
+	body: ParsedBody,
+	next: ParserState
+}
+
+
+private pure func consume_match(start: ParserState) -> Result[BodyResult, Diagnostic]:
+	keyword ?= start.input.tokens
+		.get(start.position)
+		.to_result(
+			expected(
+				start,
+				"expected 'match'",
+				"write match value: followed by indented arms",
+			),
+		)
+	after_keyword = { start | position = IntOps.add(start.position, 1) }
+
+	scrutinee ?= match after_keyword.input.tokens.get(after_keyword.position):
+		Some(token):
+			if IntOps.greater_than(token.span.start, keyword.span.end):
+				consume_value(after_keyword)
+			else:
+				Err(
+					expected(
+						after_keyword,
+						"expected a space after 'match'",
+						"put a space between 'match' and the matched expression",
+					),
+				)
+		None:
+			consume_value(after_keyword)
+
+	colon ?= consume_symbol(
+		scrutinee.next,
+		Colon,
+		"expected ':' after the match value",
+		"write match value: and put each arm on the next line",
+	)
+	newline ?= consume_symbol(
+		colon,
+		Newline,
+		"expected a newline after the match header",
+		"put each pattern and inline result on its own indented line",
+	)
+	var state = newline
+	var arms: List[ParsedMatchArm] = []
+	var end = keyword.span.end
+	var failure: Option[Diagnostic] = None
+
+	while True:
+		match consume_arm(state):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(arm):
+				arms = arms.append(arm.arm)
+				end = arm.arm.span.end
+				state = arm.next
+
+		if not at_symbol(state, Newline):
+			break
+
+		next = { state | position = IntOps.add(state.position, 1) }
+
+		if not at_indent(next):
+			break
+
+		state = next
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				body = ParsedMatchBody({
+					scrutinee = scrutinee.body,
+					arms = arms,
+					keyword_span = keyword.span,
+					span = {
+						start = keyword.span.start,
+						end = end
+					},
+				}),
+				next = state,
+			})
+
+
+private fixed record ArmResult {
+	arm: ParsedMatchArm,
+	next: ParserState
+}
+
+
+private pure func consume_arm(state: ParserState) -> Result[ArmResult, Diagnostic]:
+	indented ?= consume_indent(
+		state,
+		2,
+		"expected a match arm indented two levels",
+		"indent each arm with two tabs or eight spaces",
+	)
+	pattern ?= consume_pattern(indented)
+	colon ?= consume_symbol(
+		pattern.next,
+		Colon,
+		"expected ':' after the match pattern",
+		"write Pattern: expression on one line",
+	)
+	body ?= consume_value(colon)
+	Ok({
+		arm = {
+			pattern = pattern.pattern,
+			body = body.body,
+			span = {
+				start = pattern.span.start,
+				end = body.body.span.end
+			}
+		},
+		next = body.next,
+	})
+
+
+private pure func consume_function_body(state: ParserState) -> Result[BodyResult, Diagnostic]:
+	if at_symbol(state, MatchKeyword):
+		consume_match(state)
+	else:
+		value ?= consume_value(state)
+		Ok({
+			body = ParsedValueBody(value.body),
+			next = value.next,
 		})
 
 
@@ -564,13 +851,13 @@ private pure func consume_function(start: ParserState) -> Result[FunctionResult,
 		"expected a newline after the function header",
 		"put the return expression on the next line",
 	)
-	after_indent ?= consume_symbol(
+	after_indent ?= consume_indent(
 		after_newline,
-		Indent,
+		1,
 		"expected an indent of one tab or four spaces",
 		"indent the body with exactly one tab or four spaces",
 	)
-	body ?= consume_body(after_indent)
+	body ?= consume_function_body(after_indent)
 	Ok({
 		function = {
 			purity = purity,
@@ -583,6 +870,140 @@ private pure func consume_function(start: ParserState) -> Result[FunctionResult,
 	})
 
 
+private pure func at_word(state: ParserState, word: String) -> Bool:
+	match state.input.tokens.get(state.position):
+		Some(token):
+			match token.kind:
+				IdentifierToken(spelling):
+					Text.equals(spelling, word)
+				_:
+					False
+		None:
+			False
+
+
+private fixed record UnionResult {
+	declaration: ParsedUnion,
+	next: ParserState
+}
+
+
+private fixed record VariantResult {
+	variant: ParsedVariant,
+	next: ParserState
+}
+
+
+private pure func consume_variant(state: ParserState) -> Result[VariantResult, Diagnostic]:
+	indented ?= consume_indent(
+		state,
+		1,
+		"expected an indented union variant",
+		"declare at least one variant, indented with one tab or four spaces",
+	)
+	name ?= consume_name(indented, "expected a union variant name")
+
+	if at_symbol(name.next, LeftParen):
+		field ?= consume_name(
+			{ name.next | position = IntOps.add(name.next.position, 1) },
+			"expected a payload type",
+		)
+		closed ?= consume_symbol(
+			field.next,
+			RightParen,
+			"expected ')' after the payload type",
+			"declare zero fields or one Int field, written Variant(Int)",
+		)
+		Ok({
+			variant = {
+				name = name.name,
+				payload = OnePayloadSyntax(field.name)
+			},
+			next = closed,
+		})
+	else:
+		Ok({
+			variant = {
+				name = name.name,
+				payload = NoPayloadSyntax
+			},
+			next = name.next,
+		})
+
+
+private pure func consume_union(start: ParserState) -> Result[UnionResult, Diagnostic]:
+	after_fixed: ParserState = { start | position = IntOps.add(start.position, 1) }
+
+	word ?= if at_word(after_fixed, "union"):
+		Ok({ after_fixed | position = IntOps.add(after_fixed.position, 1) })
+	else:
+		Err(
+			expected(
+				after_fixed,
+				"expected 'union' after 'fixed'",
+				"write fixed union Choice: followed by indented variant names",
+			),
+		)
+
+	name ?= consume_name(word, "expected a union type name")
+	colon ?= consume_symbol(
+		name.next,
+		Colon,
+		"expected ':' after the union type name",
+		"use a fixed union without type parameters",
+	)
+	newline ?= consume_symbol(
+		colon,
+		Newline,
+		"expected a newline after the union header",
+		"put each variant name on its own indented line",
+	)
+	var state = newline
+	var variants: List[ParsedVariant] = []
+	var failure: Option[Diagnostic] = None
+
+	while True:
+		match consume_variant(state):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(variant):
+				variants = variants.append(variant.variant)
+				state = variant.next
+
+		if IntOps.equals(state.position, start.input.tokens.length()):
+			break
+
+		if not at_symbol(state, Newline):
+			failure = Some(
+				expected(
+					state,
+					"expected a newline after the variant name",
+					"put each variant on its own indented line",
+				),
+			)
+			break
+
+		next: ParserState = { state | position = IntOps.add(state.position, 1) }
+
+		if not at_indent(next):
+			break
+
+		state = next
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				declaration = {
+					type_name = name.name,
+					variants = variants
+				},
+				next = state,
+			})
+
+
 pure func parse(input: LexedProgram) -> Result[ParsedProgram, Diagnostic]:
 	initial = initial_names()
 	special = initial.special
@@ -592,16 +1013,26 @@ pure func parse(input: LexedProgram) -> Result[ParsedProgram, Diagnostic]:
 		names = initial.names
 	}
 	var functions: List[ParsedFunction] = []
+	var unions: List[ParsedUnion] = []
 	var failure: Option[Diagnostic] = None
 
 	while True:
-		match consume_function(state):
-			Err(error):
-				failure = Some(error)
-				break
-			Ok(parsed):
-				functions = functions.append(parsed.function)
-				state = parsed.next
+		if at_word(state, "fixed"):
+			match consume_union(state):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(parsed):
+					unions = unions.append(parsed.declaration)
+					state = parsed.next
+		else:
+			match consume_function(state):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(parsed):
+					functions = functions.append(parsed.function)
+					state = parsed.next
 
 		if IntOps.equals(state.position, input.tokens.length()):
 			break
@@ -610,7 +1041,7 @@ pure func parse(input: LexedProgram) -> Result[ParsedProgram, Diagnostic]:
 			state,
 			Newline,
 			"expected a newline after the return expression",
-			"put each declaration on its own two lines with no blank lines",
+			"separate declarations with one newline and no blank lines",
 		):
 			Err(error):
 				failure = Some(error)
@@ -629,5 +1060,6 @@ pure func parse(input: LexedProgram) -> Result[ParsedProgram, Diagnostic]:
 						names = state.names,
 						special = special,
 						functions = functions,
+						unions = unions,
 						end = input.end
 					}))
