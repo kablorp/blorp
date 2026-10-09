@@ -1,7 +1,8 @@
 import:
+	./prelude: CheckedPrelude, prelude_names
 	int as IntOps
 	list: reverse
-	names: NameTable, find_name, initial_names, intern_name
+	names: NameTable, find_name, intern_name, program_names
 	option: is_some, to_result
 	result: and_then
 	string: index_of
@@ -12,14 +13,18 @@ import:
 		Diagnostic,
 		ExpressionBase(IntegerExpression, NameExpression, ZeroArgumentApplication),
 		FieldPattern(FieldName, FieldWildcard),
+		FunctionHeader,
 		LexedProgram,
 		ParameterList(EmptyParameters, SingleParameter),
 		ParsedBinding,
 		ParsedBody(ParsedValueBody, ParsedMatchBody),
-		ParsedContents,
+		ParsedBuiltinType(IntegerBuiltin, StringBuiltin),
 		ParsedFunction,
 		ParsedMatchArm,
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
+		ParsedPrelude,
+		ParsedRuntimeFunction,
+		ParsedRuntimeOperation(IntegerToStringBuiltin, StringLengthBuiltin),
 		ParsedUnion,
 		ParsedVariant,
 		PatternFields(NoPatternFields, OnePatternField),
@@ -30,7 +35,7 @@ import:
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
 			Colon, Newline, VarKeyword, Equals,
 		),
-		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, Indentation),
+		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, BuiltinLabel, Indentation),
 		UnaryApplication,
 		ValueExpression,
 		WrittenName,
@@ -44,7 +49,16 @@ private fixed record ParserState {
 }
 
 
--- Only parsing can pair the ID-bearing syntax with its complete name table.
+fixed record ParsedContents {
+	names: NameTable,
+	prelude: CheckedPrelude,
+	functions: List[ParsedFunction],
+	unions: List[ParsedUnion],
+	end: Span
+}
+
+
+-- Parsing carries its accepted prelude authority with its complete name table.
 opaque type ParsedProgram = ParsedContents
 
 
@@ -233,6 +247,12 @@ private fixed record FunctionResult {
 }
 
 
+private fixed record HeaderResult {
+	header: FunctionHeader,
+	next: ParserState
+}
+
+
 private pure func at_symbol(state: ParserState, symbol: Symbol) -> Bool:
 	match state.input.tokens.get(state.position):
 		Some(token):
@@ -376,6 +396,14 @@ private pure func consume_expression_step(state: ParserState) -> Result[Expressi
 				IntegerLiteral(spelling):
 					value ?= integer_value(spelling, token.span)
 					Ok(ReadBase(IntegerExpression(value), token.span, after_token))
+				BuiltinLabel(_):
+					Err(
+						expected(
+							state,
+							"quoted builtin labels are only allowed in the prelude",
+							"call a String-producing prelude function; String literals are not supported yet",
+						),
+					)
 				IdentifierToken(spelling):
 					names = intern_name(state.names, spelling)
 
@@ -974,7 +1002,7 @@ private pure func consume_bindings(
 			})
 
 
-private pure func consume_function(start: ParserState) -> Result[FunctionResult, Diagnostic]:
+private pure func consume_header(start: ParserState) -> Result[HeaderResult, Diagnostic]:
 	purity: Purity = match start.input.tokens.get(start.position):
 		Some(token):
 			match token.kind:
@@ -1034,14 +1062,27 @@ private pure func consume_function(start: ParserState) -> Result[FunctionResult,
 		"expected an indent of one tab or four spaces",
 		"indent the body with exactly one tab or four spaces",
 	)
-	prefix ?= consume_bindings(after_indent, FunctionBindings)
-	body ?= consume_function_body(prefix.next)
 	Ok({
-		function = {
+		header = {
 			purity = purity,
 			function_name = function.name,
 			parameters = parameters.parameters,
-			return_type = return_type.name,
+			return_type = return_type.name
+		},
+		next = after_indent,
+	})
+
+
+private pure func consume_function(start: ParserState) -> Result[FunctionResult, Diagnostic]:
+	header ?= consume_header(start)
+	prefix ?= consume_bindings(header.next, FunctionBindings)
+	body ?= consume_function_body(prefix.next)
+	Ok({
+		function = {
+			purity = header.header.purity,
+			function_name = header.header.function_name,
+			parameters = header.header.parameters,
+			return_type = header.header.return_type,
 			bindings = prefix.bindings,
 			body = body.body
 		},
@@ -1183,9 +1224,199 @@ private pure func consume_union(start: ParserState) -> Result[UnionResult, Diagn
 			})
 
 
-pure func parse(input: LexedProgram) -> Result[ParsedProgram, Diagnostic]:
-	initial = initial_names()
-	special = initial.special
+private pure func consume_word(state: ParserState, word: String) -> Result[ParserState, Diagnostic]:
+	if at_word(state, word):
+		Ok({ state | position = IntOps.add(state.position, 1) })
+	else:
+		Err(
+			expected(
+				state,
+				Text
+					.concat("expected '", word)
+					.concat("'"),
+				"use the temporary prelude declaration syntax",
+			),
+		)
+
+
+private fixed record BuiltinTypeResult {
+	declaration: ParsedBuiltinType,
+	next: ParserState
+}
+
+
+private pure func consume_builtin_type(start: ParserState) -> Result[BuiltinTypeResult, Diagnostic]:
+	after_type ?= consume_word(start, "type")
+	integer = at_word(after_type, "Int")
+
+	known ?= if integer or at_word(after_type, "String"):
+		Ok(void)
+	else:
+		Err(
+			expected(
+				after_type,
+				"unknown builtin type",
+				"declare type Int = builtin or type String = builtin",
+			),
+		)
+
+	name ?= consume_name(after_type, "expected a builtin type name")
+	equals ?= consume_symbol(
+		name.next,
+		Equals,
+		"expected '=' after the builtin type name",
+		"write type Int = builtin or type String = builtin",
+	)
+	end ?= consume_word(equals, "builtin")
+
+	declaration = if integer:
+		IntegerBuiltin(name.name)
+	else:
+		StringBuiltin(name.name)
+
+	Ok({
+		declaration = declaration,
+		next = end,
+	})
+
+
+private fixed record RuntimeFunctionResult {
+	function: ParsedRuntimeFunction,
+	next: ParserState
+}
+
+
+private pure func consume_runtime_function(
+	start: ParserState,
+) -> Result[RuntimeFunctionResult, Diagnostic]:
+	header ?= consume_header(start)
+	after_builtin ?= consume_word(header.next, "builtin")
+	opened ?= consume_symbol(
+		after_builtin,
+		LeftParen,
+		"expected '(' after builtin",
+		"write builtin(\"int.to_string\") or builtin(\"string.length\")",
+	)
+	label ?= opened.input.tokens
+		.get(opened.position)
+		.to_result(
+			expected(
+				opened,
+				"expected a builtin label",
+				"use \"int.to_string\" or \"string.length\"",
+			),
+		)
+
+	operation ?= match label.kind:
+		BuiltinLabel(spelling):
+			if Text.equals(spelling, "int.to_string"):
+				Ok(IntegerToStringBuiltin)
+			else if Text.equals(spelling, "string.length"):
+				Ok(StringLengthBuiltin)
+			else:
+				Err(
+					expected(
+						opened,
+						"unknown builtin operation",
+						"use \"int.to_string\" or \"string.length\"",
+					),
+				)
+		_:
+			Err(
+				expected(
+					opened,
+					"expected a quoted builtin label",
+					"use \"int.to_string\" or \"string.length\"",
+				),
+			)
+
+	closed ?= consume_symbol(
+		{ opened | position = IntOps.add(opened.position, 1) },
+		RightParen,
+		"expected ')' after the builtin label",
+		"give builtin exactly one quoted operation label",
+	)
+	Ok({
+		function = {
+			header = header.header,
+			operation = operation,
+			span = label.span
+		},
+		next = closed,
+	})
+
+
+-- Prelude parsing uses the same tokens, headers and name authority as programs.
+-- Only this entrypoint admits compiler-known type and operation declarations.
+pure func parse_prelude(input: LexedProgram) -> Result[ParsedPrelude, Diagnostic]:
+	seed = program_names()
+	var state: ParserState = {
+		input = input,
+		position = 0,
+		names = seed.names
+	}
+	var types: List[ParsedBuiltinType] = []
+	var functions: List[ParsedRuntimeFunction] = []
+	var failure: Option[Diagnostic] = None
+
+	while IntOps.less_than(state.position, input.tokens.length()):
+		if at_word(state, "type"):
+			match consume_builtin_type(state):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(parsed):
+					types = types.append(parsed.declaration)
+					state = parsed.next
+		else if at_symbol(state, FunctionKeyword) or at_symbol(state, PureKeyword):
+			match consume_runtime_function(state):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(parsed):
+					functions = functions.append(parsed.function)
+					state = parsed.next
+		else:
+			failure = Some(expected(
+				state,
+				"expected a builtin prelude declaration",
+				Text.concat(
+					"declare type Int = builtin, type String = builtin, ",
+					"or a pure function with a builtin(...) body",
+				),
+			))
+			break
+
+		if IntOps.equals(state.position, input.tokens.length()):
+			break
+
+		match consume_symbol(
+			state,
+			Newline,
+			"expected a newline after the prelude declaration",
+			"put each prelude declaration on its own line without blank lines",
+		):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(next):
+				state = next
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				names = state.names,
+				main = seed.main,
+				types = types,
+				functions = functions,
+				end = input.end,
+			})
+
+
+pure func parse(input: LexedProgram, prelude: CheckedPrelude) -> Result[ParsedProgram, Diagnostic]:
+	initial = prelude_names(prelude)
 	var state: ParserState = {
 		input = input,
 		position = 0,
@@ -1237,7 +1468,7 @@ pure func parse(input: LexedProgram) -> Result[ParsedProgram, Diagnostic]:
 		None:
 			Ok(into_opaque ParsedProgram({
 						names = state.names,
-						special = special,
+						prelude = prelude,
 						functions = functions,
 						unions = unions,
 						end = input.end

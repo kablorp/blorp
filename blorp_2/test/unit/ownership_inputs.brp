@@ -1,0 +1,210 @@
+import:
+	../../src/check:
+		CallTarget(RuntimeFunction, UserFunction),
+		CheckedUnion,
+		FunctionId,
+		ParameterShape,
+		TypeRef(IntType, UnionType),
+		UnionId,
+		VariantId,
+	../../src/lex: lex
+	../../src/lower:
+		CallArguments,
+		LoweredFunction,
+		LoweredTail(ReturnValue, MatchValue),
+		MatchLabel(VariantLabel),
+		ValueDefinition,
+		ValueId,
+		ValueOperation(IntegerValue, ParameterValue, CallValue),
+		lower,
+		lowered_functions,
+	../../src/prelude: RuntimeOperation
+	../../src/syntax: Diagnostic, Purity(Pure), Span
+	input: check, parse
+
+
+fixed record InputIds {
+	first: ValueId,
+	second: ValueId,
+	third: ValueId,
+	fourth: ValueId,
+	fifth: ValueId,
+	entrypoint: FunctionId,
+	second_function: FunctionId,
+	union_id: UnionId,
+	second_variant: VariantId,
+	union_value: ValueDefinition,
+	unions: List[CheckedUnion]
+}
+
+
+-- Mint opaque source/value identities through their actual authorities.
+-- Every phase test below constructs its own typed input; this seed supplies no
+-- ownership operations and is never used as a verifier oracle.
+private pure func seed_function_id(definition: ValueDefinition) -> Result[FunctionId, Diagnostic]:
+	match definition.operation:
+		CallValue(call, _):
+			match call.target:
+				UserFunction(id):
+					Ok(id)
+				_:
+					Err({
+						span = definition.span,
+						message = "expected user call seed",
+						help = "fix ownership test seed",
+					})
+		_:
+			Err({
+				span = definition.span,
+				message = "expected call seed",
+				help = "fix ownership test seed",
+			})
+
+
+private pure func seed_variant(function: LoweredFunction) -> Result[VariantId, Diagnostic]:
+	match function.tail:
+		MatchValue(matched):
+			match matched.arms:
+				[_, arm]:
+					match arm.label:
+						VariantLabel(id):
+							Ok(id)
+						_:
+							Err({
+								span = span(0),
+								message = "expected variant seed",
+								help = "fix ownership test seed",
+							})
+				_:
+					Err({
+						span = span(0),
+						message = "expected two seed arms",
+						help = "fix ownership test seed",
+					})
+		_:
+			Err({
+				span = span(0),
+				message = "expected match seed",
+				help = "fix ownership test seed",
+			})
+
+
+pure func input_ids() -> Result[InputIds, Diagnostic]:
+	lexed ?= lex(
+		"fixed union Flag:\n\tOff\n\tOn\npure func use(value: Flag) -> Int:\n\tmatch value:\n\t\tOff: 0\n\t\tOn: 0\nfunc main() -> Int:\n\tunused = use(Off)\n\tthird = 2\n\tfourth = 3\n\t4\n",
+	)
+	parsed ?= parse(lexed)
+	checked ?= check(parsed)
+	lowered ?= lower(checked)
+	program = lowered_functions(lowered)
+
+	match program.functions:
+		[seed, function]:
+			second_variant ?= seed_variant(seed)
+
+			match function.definitions:
+				[first, second, third, fourth, fifth]:
+					entrypoint ?= seed_function_id(second)
+
+					match first.value_type:
+						UnionType(id):
+							Ok({
+								first = first.id,
+								second = second.id,
+								third = third.id,
+								fourth = fourth.id,
+								fifth = fifth.id,
+								entrypoint = entrypoint,
+								second_function = program.entrypoint,
+								union_id = id,
+								second_variant = second_variant,
+								union_value = first,
+								unions = program.unions,
+							})
+						_:
+							Err({
+								span = first.span,
+								message = "expected union seed",
+								help = "fix the ownership test seed",
+							})
+				_:
+					Err({
+						span = {
+							start = 0,
+							end = 0
+						},
+						message = "expected five seed values",
+						help = "fix the ownership test seed",
+					})
+		_:
+			Err({
+				span = {
+					start = 0,
+					end = 0
+				},
+				message = "expected one seed function",
+				help = "fix the ownership test seed",
+			})
+
+
+pure func span(start: Int) -> Span:
+	{
+		start = start,
+		end = start + 1
+	}
+
+
+pure func integer(id: ValueId, value: Int, start: Int) -> ValueDefinition:
+	{
+		id = id,
+		value_type = IntType,
+		operation = IntegerValue(value),
+		span = span(start)
+	}
+
+
+pure func parameter(id: ValueId, value_type: TypeRef) -> ValueDefinition:
+	{
+		id = id,
+		value_type = value_type,
+		operation = ParameterValue,
+		span = span(10)
+	}
+
+
+pure func runtime(
+	id: ValueId,
+	operation: RuntimeOperation,
+	arguments: CallArguments,
+	value_type: TypeRef,
+	start: Int,
+) -> ValueDefinition:
+	{
+		id = id,
+		value_type = value_type,
+		operation = CallValue(
+			{
+				target = RuntimeFunction(operation),
+				span = span(start)
+			},
+			arguments,
+		),
+		span = span(start)
+	}
+
+
+pure func function(
+	definitions: List[ValueDefinition],
+	result: ValueId,
+	parameters: ParameterShape,
+	return_type: TypeRef,
+) -> LoweredFunction:
+	{
+		signature = {
+			purity = Pure,
+			parameters = parameters,
+			return_type = return_type
+		},
+		definitions = definitions,
+		tail = ReturnValue(result)
+	}

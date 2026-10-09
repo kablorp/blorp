@@ -1,7 +1,7 @@
 import:
 	../../src/lex: lex
 	../../src/names: NameTable, name_spelling
-	../../src/parse: ParsedProgram, parse, parsed_contents
+	../../src/parse: ParsedProgram, parse_prelude, parsed_contents
 	../../src/syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
 		CallNotation(DirectCall, ReceiverCall),
@@ -10,15 +10,19 @@ import:
 		FieldPattern(FieldName, FieldWildcard),
 		ParameterList(EmptyParameters, SingleParameter),
 		ParsedBody(ParsedValueBody, ParsedMatchBody),
+		ParsedBuiltinType(IntegerBuiltin, StringBuiltin),
 		ParsedFunction,
 		ParsedMatch,
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
+		ParsedPrelude,
+		ParsedRuntimeOperation(IntegerToStringBuiltin, StringLengthBuiltin),
 		ParsedUnion,
 		PatternFields(NoPatternFields, OnePatternField),
 		PayloadSyntax(NoPayloadSyntax, OnePayloadSyntax),
 		Purity(Pure, Impure),
 		ValueExpression,
 		WrittenName,
+	../unit/input: parse
 	test: TestSuite
 
 
@@ -48,6 +52,124 @@ private PATTERN_CLOSE_HELP: String = "write Variant(name), Variant(_), or a null
 private pure func parse_source(source: String) -> Result[ParsedProgram, Diagnostic]:
 	input ?= lex(source)
 	parse(input)
+
+
+private pure func prelude_syntax(source: String) -> Result[ParsedPrelude, Diagnostic]:
+	input ?= lex(source)
+	parse_prelude(input)
+
+
+private pure func prelude_rejects(
+	source: String,
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+) -> Bool:
+	match prelude_syntax(source):
+		Err(error):
+			(
+				error.span.start == start
+				and error.span.end == end
+				and error.message == message
+				and error.help == help
+			)
+		Ok(_):
+			False
+
+
+pure func test_prelude_builtin_type_alternatives_and_spaces() -> Bool:
+	match prelude_syntax("type Int=builtin\ntype String = builtin"):
+		Err(_):
+			False
+		Ok(parsed):
+			contents = parsed
+
+			match contents.types:
+				[IntegerBuiltin(integer), StringBuiltin(string)]:
+					(
+						name_spelling(contents.names, integer.id) == Some("Int")
+						and name_spelling(contents.names, string.id) == Some("String")
+						and contents.functions.length() == 0
+					)
+				_:
+					False
+
+
+pure func test_prelude_runtime_labels_and_shared_header_syntax() -> Bool:
+	match prelude_syntax(
+		"pure func convert(value: Int) -> String:\n    builtin ( \"int.to_string\" )\nfunc size ( value : String ) -> Int :\n\tbuiltin(\"string.length\")\n",
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			match parsed.functions:
+				[first, second]:
+					(
+						first.operation == IntegerToStringBuiltin
+						and first.header.purity == Pure
+						and second.operation == StringLengthBuiltin
+						and second.header.purity == Impure
+					)
+				_:
+					False
+
+
+pure func test_prelude_unknown_type_and_operation_are_closed_syntax() -> Bool:
+	(
+		prelude_rejects(
+			"type Float = builtin",
+			5,
+			10,
+			"unknown builtin type",
+			"declare type Int = builtin or type String = builtin",
+		)
+		and prelude_rejects(
+			"pure func f(value: Int) -> String:\n\tbuiltin(\"unknown\")",
+			44,
+			53,
+			"unknown builtin operation",
+			"use \"int.to_string\" or \"string.length\"",
+		)
+	)
+
+
+pure func test_prelude_requires_quoted_label_and_closing_parenthesis() -> Bool:
+	(
+		prelude_rejects(
+			"pure func f(value: Int) -> String:\n\tbuiltin(int.to_string)",
+			44,
+			47,
+			"expected a quoted builtin label",
+			"use \"int.to_string\" or \"string.length\"",
+		)
+		and prelude_rejects(
+			"pure func f(value: Int) -> String:\n\tbuiltin(\"int.to_string\"",
+			59,
+			59,
+			"expected ')' after the builtin label",
+			"give builtin exactly one quoted operation label",
+		)
+	)
+
+
+pure func test_prelude_has_no_general_function_body_or_blank_separator() -> Bool:
+	(
+		prelude_rejects(
+			"pure func f(value: Int) -> Int:\n\tvalue",
+			33,
+			38,
+			"expected 'builtin'",
+			"use the temporary prelude declaration syntax",
+		)
+		and prelude_rejects(
+			"type Int = builtin\n\n",
+			19,
+			20,
+			"expected a builtin prelude declaration",
+			"declare type Int = builtin, type String = builtin, or a pure function with a builtin(...) body",
+		)
+	)
 
 
 -- Expected names and byte spans are written independently of the lexer/parser.
@@ -2035,6 +2157,26 @@ pure func test_arm_binding_requires_initializer_on_same_line() -> Bool:
 tests: TestSuite = {
 	description = "Blorp 2 EBNF syntax conformance",
 	tests = [
+		(
+			"prelude builtin type alternatives and spaces",
+			test_prelude_builtin_type_alternatives_and_spaces,
+		),
+		(
+			"prelude runtime labels and shared header syntax",
+			test_prelude_runtime_labels_and_shared_header_syntax,
+		),
+		(
+			"prelude unknown type and operation are closed syntax",
+			test_prelude_unknown_type_and_operation_are_closed_syntax,
+		),
+		(
+			"prelude requires quoted label and closing parenthesis",
+			test_prelude_requires_quoted_label_and_closing_parenthesis,
+		),
+		(
+			"prelude has no general function body or blank separator",
+			test_prelude_has_no_general_function_body_or_blank_separator,
+		),
 		("arm block binding and sibling spans", test_arm_block_bindings_and_inline_sibling_spans),
 		(
 			"arm block without bindings and optional LF",

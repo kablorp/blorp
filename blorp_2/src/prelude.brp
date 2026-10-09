@@ -1,0 +1,336 @@
+import:
+	names: InitialNames, NameId, NameTable, SpecialNames, name_spelling, same_name
+	option: is_some, to_result
+	syntax:
+		Diagnostic,
+		FunctionHeader,
+		ParameterList(EmptyParameters, SingleParameter),
+		ParsedBuiltinType(IntegerBuiltin, StringBuiltin),
+		ParsedPrelude,
+		ParsedRuntimeOperation(IntegerToStringBuiltin, StringLengthBuiltin),
+		Purity(Pure, Impure),
+		Span,
+		WrittenName,
+	text as Text
+
+
+fixed union RuntimeOperation:
+	IntToString
+	StringLength
+
+
+fixed union PrimitiveType:
+	BuiltinInt
+	BuiltinString
+
+
+fixed record RuntimeContract {
+	purity: Purity,
+	parameter: PrimitiveType,
+	return_type: PrimitiveType
+}
+
+
+-- The runtime ABI has one authority. Checking translates these primitive types
+-- to its TypeRef without deciding the contract again.
+pure func runtime_contract(operation: RuntimeOperation) -> RuntimeContract:
+	match operation:
+		IntToString:
+			{
+				purity = Pure,
+				parameter = BuiltinInt,
+				return_type = BuiltinString
+			}
+		StringLength:
+			{
+				purity = Pure,
+				parameter = BuiltinString,
+				return_type = BuiltinInt
+			}
+
+
+private fixed record RuntimeBinding {
+	name: NameId,
+	operation: RuntimeOperation
+}
+
+
+private fixed record PreludeAuthority {
+	names: InitialNames,
+	functions: List[RuntimeBinding]
+}
+
+
+opaque type CheckedPrelude = PreludeAuthority
+
+
+pure func prelude_names(prelude: CheckedPrelude) -> InitialNames:
+	from_opaque CheckedPrelude(prelude).names
+
+
+pure func runtime_operation(prelude: CheckedPrelude, name: NameId) -> Option[RuntimeOperation]:
+	var found: Option[RuntimeOperation] = None
+
+	for function in from_opaque CheckedPrelude(prelude).functions:
+		if same_name(function.name, name):
+			found = Some(function.operation)
+			break
+
+	found
+
+
+private pure func rejection(span: Span, message: String, help: String) -> Diagnostic:
+	{
+		span = span,
+		message = message,
+		help = help
+	}
+
+
+private pure func validate_name(name: WrittenName, names: NameTable) -> Result[Void, Diagnostic]:
+	if name_spelling(names, name.id).is_some():
+		Ok(void)
+	else:
+		Err(
+			rejection(
+				name.span,
+				"invalid parsed prelude name identity",
+				"report this compiler error with the prelude input",
+			),
+		)
+
+
+private pure func resolve_builtin_types(parsed: ParsedPrelude) -> Result[SpecialNames, Diagnostic]:
+	main ?= validate_name(
+		{
+			id = parsed.main,
+			span = parsed.end
+		},
+		parsed.names,
+	)
+	var integer: Option[NameId] = None
+	var string: Option[NameId] = None
+	var failure: Option[Diagnostic] = None
+
+	for declaration in parsed.types:
+		name = match declaration:
+			IntegerBuiltin(name):
+				name
+			StringBuiltin(name):
+				name
+
+		match validate_name(name, parsed.names):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(_):
+				void
+
+		match declaration:
+			IntegerBuiltin(name):
+				if integer.is_some():
+					failure = Some(
+						rejection(
+							name.span,
+							"duplicate builtin type declaration",
+							"declare type Int = builtin exactly once",
+						),
+					)
+					break
+
+				integer = Some(name.id)
+			StringBuiltin(name):
+				if string.is_some():
+					failure = Some(
+						rejection(
+							name.span,
+							"duplicate builtin type declaration",
+							"declare type String = builtin exactly once",
+						),
+					)
+					break
+
+				string = Some(name.id)
+
+	types ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	integer_id ?= integer.to_result(
+		rejection(
+			parsed.end,
+			"missing Int builtin declaration",
+			"add type Int = builtin to the prelude",
+		),
+	)
+	string_id ?= string.to_result(
+		rejection(
+			parsed.end,
+			"missing String builtin declaration",
+			"add type String = builtin to the prelude",
+		),
+	)
+
+	if (
+		same_name(integer_id, string_id)
+		or same_name(parsed.main, integer_id)
+		or same_name(parsed.main, string_id)
+	):
+		Err(
+			rejection(
+				parsed.end,
+				"prelude builtin identities conflict",
+				"report this compiler error with the prelude input",
+			),
+		)
+	else:
+		Ok({
+			main = parsed.main,
+			integer = integer_id,
+			string = string_id,
+		})
+
+
+private pure func primitive_type(name: NameId, special: SpecialNames) -> Option[PrimitiveType]:
+	if same_name(name, special.integer):
+		Some(BuiltinInt)
+	else if same_name(name, special.string):
+		Some(BuiltinString)
+	else:
+		None
+
+
+private pure func matches_type(actual: Option[PrimitiveType], expected: PrimitiveType) -> Bool:
+	match actual:
+		None:
+			False
+		Some(BuiltinInt):
+			match expected:
+				BuiltinInt:
+					True
+				BuiltinString:
+					False
+		Some(BuiltinString):
+			match expected:
+				BuiltinString:
+					True
+				BuiltinInt:
+					False
+
+
+private pure func validate_runtime_parameter(
+	parameters: ParameterList,
+	expected: PrimitiveType,
+	names: InitialNames,
+) -> Result[Bool, Diagnostic]:
+	match parameters:
+		EmptyParameters:
+			Ok(False)
+		SingleParameter(parameter):
+			parameter_name ?= validate_name(parameter.name, names.names)
+			type_name ?= validate_name(parameter.type_name, names.names)
+			Ok(matches_type(primitive_type(parameter.type_name.id, names.special), expected))
+
+
+private pure func validate_runtime_header(
+	header: FunctionHeader,
+	contract: RuntimeContract,
+	names: InitialNames,
+) -> Result[Bool, Diagnostic]:
+	function_name ?= validate_name(header.function_name, names.names)
+	return_name ?= validate_name(header.return_type, names.names)
+	parameter_matches ?= validate_runtime_parameter(header.parameters, contract.parameter, names)
+
+	purity_matches = match contract.purity:
+		Pure:
+			match header.purity:
+				Pure:
+					True
+				Impure:
+					False
+		Impure:
+			match header.purity:
+				Impure:
+					True
+				Pure:
+					False
+
+	Ok(purity_matches and parameter_matches and matches_type(
+			primitive_type(header.return_type.id, names.special),
+			contract.return_type,
+		))
+
+
+pure func check_prelude(parsed: ParsedPrelude) -> Result[CheckedPrelude, Diagnostic]:
+	special ?= resolve_builtin_types(parsed)
+	names: InitialNames = {
+		names = parsed.names,
+		special = special
+	}
+	var functions: List[RuntimeBinding] = []
+	var failure: Option[Diagnostic] = None
+
+	for function in parsed.functions:
+		function_name = function.header.function_name
+		var duplicate = same_name(function_name.id, special.main)
+
+		for known in functions:
+			if same_name(known.name, function_name.id):
+				duplicate = True
+				break
+
+		if duplicate:
+			failure = Some(
+				rejection(
+					function_name.span,
+					"duplicate or reserved prelude function name",
+					Text.concat(
+						"give prelude functions distinct names and reserve main for the program ",
+						"entrypoint",
+					),
+				),
+			)
+			break
+
+		operation = match function.operation:
+			IntegerToStringBuiltin:
+				IntToString
+			StringLengthBuiltin:
+				StringLength
+
+		match validate_runtime_header(function.header, runtime_contract(operation), names):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(matches):
+				if not matches:
+					help = match operation:
+						IntToString:
+							"declare a pure function with one Int parameter returning String"
+						StringLength:
+							"declare a pure function with one String parameter returning Int"
+
+					failure = Some(
+						rejection(
+							function.span,
+							"builtin declaration does not match its runtime contract",
+							help,
+						),
+					)
+					break
+
+		functions = functions.append({
+			name = function_name.id,
+			operation = operation,
+		})
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(into_opaque CheckedPrelude({
+						names = names,
+						functions = functions
+					}))

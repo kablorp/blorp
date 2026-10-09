@@ -1,9 +1,11 @@
 import:
+	./prelude: RuntimeOperation(IntToString, StringLength)
 	check:
+		CallTarget(UserFunction, RuntimeFunction),
 		CheckedUnion,
 		ParameterShape(NoParameter, OneParameter),
 		PayloadShape(NoPayload, IntPayload),
-		TypeRef(IntType, UnionType),
+		TypeRef(IntType, StringType, UnionType),
 		UnionId,
 		VariantId,
 		function_number,
@@ -14,21 +16,33 @@ import:
 	lower:
 		CallArguments(NoArguments, OneArgument),
 		LoweredArm,
-		LoweredFunction,
 		LoweredMatch,
-		LoweredProgram,
-		LoweredTail(ReturnValue, MatchValue),
 		MatchLabel(VariantLabel, DefaultLabel),
 		ValueDefinition,
 		ValueId,
 		ValueOperation(
 			ParameterValue, IntegerValue, VariantValue, CallValue, ConstructValue, PayloadValue,
 		),
-		lowered_functions,
 		value_number,
 	option: to_result
+	own as Own:
+		OwnedArguments(UnmanagedArgument, BorrowedArgument),
+		OwnedDefinition,
+		OwnedFunction,
+		OwnedTail(UnmanagedReturn, OwnedReturn, UnmanagedMatch),
+		OwnedValueOperation(
+			ParameterDefinition, IntegerDefinition, VariantDefinition, CallDefinition,
+			ConstructDefinition, PayloadDefinition,
+		),
+		OwnerId,
+		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
+		OwnershipProgram,
+		ResultOwnership(UnmanagedResult, BorrowedResult, OwnedResult),
+		owner_number,
+	string_runtime: string_runtime
 	syntax: Diagnostic, Span
 	text: concat
+	verify: VerifiedProgram, verified_contents
 
 
 -- Checked-reference errors have no source occurrence; this marks that origin.
@@ -54,6 +68,22 @@ private pure func c_name(index: Int) -> String:
 
 private pure func c_value(id: ValueId) -> String:
 	"blorp_vl_".append_int(value_number(id))
+
+
+private pure func c_owner(id: OwnerId) -> String:
+	"blorp_owner_".append_int(owner_number(id))
+
+
+private pure func c_callable(target: CallTarget) -> String:
+	match target:
+		UserFunction(id):
+			c_name(function_number(id))
+		RuntimeFunction(operation):
+			match operation:
+				IntToString:
+					"blorp_int_to_string"
+				StringLength:
+					"blorp_string_length"
 
 
 private pure func append_integer(output: String, value: Int) -> String:
@@ -101,6 +131,8 @@ private pure func c_type(
 	match type_ref:
 		IntType:
 			Ok("int64_t")
+		StringType:
+			Ok("struct blorp_string*")
 		UnionType(id):
 			declaration ?= unions
 				.get(union_number(id))
@@ -199,7 +231,7 @@ private pure func append_operation(
 				Ok(output.concat(c_variant(id)))
 		CallValue(call, arguments):
 			prefix = output
-				.concat(c_name(function_number(call.target)))
+				.concat(c_callable(call.target))
 				.concat("(")
 			Ok(
 				match arguments:
@@ -253,21 +285,30 @@ private pure func append_definitions(
 			Ok(result)
 
 
-private pure func append_definition(
+private pure func append_value(
 	output: String,
-	definition: ValueDefinition,
+	id: ValueId,
+	value_type: TypeRef,
+	operation: ValueOperation,
 	unions: List[CheckedUnion],
 ) -> Result[String, Diagnostic]:
-	type_name ?= c_type(definition.value_type, unions)
-	name = c_value(definition.id)
+	type_name ?= c_type(value_type, unions)
+	name = c_value(id)
+
+	declaration = match value_type:
+		StringType:
+			type_name.concat(" const ")
+		_:
+			"const "
+				.concat(type_name)
+				.concat(" ")
+
 	value ?= append_operation(
 		output
-			.concat("const ")
-			.concat(type_name)
-			.concat(" ")
+			.concat(declaration)
 			.concat(name)
 			.concat("="),
-		definition.operation,
+		operation,
 		unions,
 	)
 	Ok(
@@ -276,6 +317,121 @@ private pure func append_definition(
 			.concat(name)
 			.concat(";"),
 	)
+
+
+private pure func append_definition(
+	output: String,
+	definition: ValueDefinition,
+	unions: List[CheckedUnion],
+) -> Result[String, Diagnostic]:
+	append_value(output, definition.id, definition.value_type, definition.operation, unions)
+
+
+-- The verifier has already checked borrows and results. Expression rendering
+-- only needs their value operands; retain/drop placement stays explicit below.
+private pure func expression_operation(operation: OwnedValueOperation) -> ValueOperation:
+	match operation:
+		ParameterDefinition:
+			ParameterValue
+		IntegerDefinition(value):
+			IntegerValue(value)
+		VariantDefinition(id):
+			VariantValue(id)
+		CallDefinition(call, arguments):
+			operands = match arguments:
+				Own.NoArguments:
+					NoArguments
+				UnmanagedArgument(id):
+					OneArgument(id)
+				BorrowedArgument(borrow):
+					OneArgument(borrow.value)
+
+			CallValue(call, operands)
+		ConstructDefinition(id, argument):
+			ConstructValue(id, argument)
+		PayloadDefinition(id):
+			PayloadValue(id)
+
+
+private pure func append_owner_alias(output: String, owner: OwnerId, value: ValueId) -> String:
+	name = c_owner(owner)
+	output
+		.concat("struct blorp_string* const ")
+		.concat(name)
+		.concat("=")
+		.concat(c_value(value))
+		.concat(";(void)")
+		.concat(name)
+		.concat(";")
+
+
+private pure func append_owned_definition(
+	output: String,
+	definition: OwnedDefinition,
+	unions: List[CheckedUnion],
+) -> Result[String, Diagnostic]:
+	value ?= append_value(
+		output,
+		definition.id,
+		definition.value_type,
+		expression_operation(definition.operation),
+		unions,
+	)
+	Ok(
+		match definition.result:
+			UnmanagedResult:
+				value
+			BorrowedResult:
+				value
+			OwnedResult(owner):
+				append_owner_alias(value, owner, definition.id)
+	)
+
+
+private pure func append_ownership_operation(
+	output: String,
+	operation: OwnershipOperation,
+	unions: List[CheckedUnion],
+) -> Result[String, Diagnostic]:
+	match operation:
+		DefineValue(definition):
+			append_owned_definition(output, definition, unions)
+		AcquireOwner(owner, borrowed, _):
+			retained = output
+				.concat("blorp_string_retain(")
+				.concat(c_value(borrowed.value))
+				.concat(");")
+			Ok(append_owner_alias(retained, owner, borrowed.value))
+		DropOwner(owner, _):
+			Ok(
+				output
+					.concat("blorp_string_release(")
+					.concat(c_owner(owner))
+					.concat(");"),
+			)
+
+
+private pure func append_ownership_operations(
+	output: String,
+	operations: List[OwnershipOperation],
+	unions: List[CheckedUnion],
+) -> Result[String, Diagnostic]:
+	var result = output
+	var failure: Option[Diagnostic] = None
+
+	for operation in operations:
+		match append_ownership_operation(result, operation, unions):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(emitted):
+				result = emitted
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
 
 
 private pure func append_arm(
@@ -361,7 +517,7 @@ private pure func append_match(
 
 private pure func append_signature(
 	output: String,
-	function: LoweredFunction,
+	function: OwnedFunction,
 	index: Int,
 	unions: List[CheckedUnion],
 ) -> Result[String, Diagnostic]:
@@ -378,33 +534,80 @@ private pure func append_signature(
 
 private pure func append_function(
 	output: String,
-	function: LoweredFunction,
+	function: OwnedFunction,
 	index: Int,
 	unions: List[CheckedUnion],
 ) -> Result[String, Diagnostic]:
 	header ?= append_signature(output, function, index, unions)
-	body ?= append_definitions(
+	body ?= append_ownership_operations(
 		header.concat("{"),
-		function.definitions,
+		function.operations,
 		unions,
 	)
 
 	match function.tail:
-		ReturnValue(id):
+		UnmanagedReturn(id):
 			Ok(
 				body
 					.concat("return ")
 					.concat(c_value(id))
 					.concat(";}"),
 			)
-		MatchValue(matched):
+		OwnedReturn(_, owner):
+			Ok(
+				body
+					.concat("return ")
+					.concat(c_owner(owner))
+					.concat(";}"),
+			)
+		UnmanagedMatch(matched):
 			emitted ?= append_match(body, matched, unions)
 			Ok(emitted.concat("}"))
 
 
-pure func emit(program: LoweredProgram) -> Result[String, Diagnostic]:
-	checked = program.lowered_functions()
-	var output: String = "#include <stdint.h>\n"
+private pure func is_string(type_ref: TypeRef) -> Bool:
+	match type_ref:
+		StringType:
+			True
+		_:
+			False
+
+
+private pure func needs_string_runtime(program: OwnershipProgram) -> Bool:
+	var needed = False
+
+	for function in program.functions:
+		if is_string(function.signature.return_type):
+			needed = True
+
+		match function.signature.parameters:
+			NoParameter:
+				void
+			OneParameter(type_ref):
+				if is_string(type_ref):
+					needed = True
+
+		for operation in function.operations:
+			match operation:
+				DefineValue(definition):
+					if is_string(definition.value_type):
+						needed = True
+				AcquireOwner(_, _, _):
+					needed = True
+				DropOwner(_, _):
+					needed = True
+
+	needed
+
+
+pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
+	checked = verified_contents(program)
+
+	var output: String = if needs_string_runtime(checked):
+		string_runtime()
+	else:
+		"#include <stdint.h>\n"
+
 	var index: Int = 0
 
 	for declaration in checked.unions:

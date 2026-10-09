@@ -1,0 +1,874 @@
+import:
+	check:
+		CallTarget(UserFunction, RuntimeFunction),
+		CheckedCall,
+		CheckedUnion,
+		FunctionSignature,
+		ParameterShape(NoParameter, OneParameter),
+		PayloadShape(NoPayload, IntPayload),
+		TypeRef(IntType, StringType, UnionType),
+		VariantId,
+		function_number,
+		runtime_signature,
+		same_type,
+		union_number,
+		variant_number,
+		variant_owner,
+	int as IntOps
+	lower:
+		CallArguments(OneArgument),
+		LoweredMatch,
+		MatchLabel(DefaultLabel, VariantLabel),
+		ValueDefinition,
+		ValueId,
+		ValueOperation(
+			ParameterValue, IntegerValue, VariantValue, CallValue, ConstructValue, PayloadValue,
+		),
+		value_number,
+	option: to_result
+	own:
+		BorrowSource(ParameterBorrow, OwnerBorrow),
+		BorrowedValue,
+		OwnedArguments(NoArguments, UnmanagedArgument, BorrowedArgument),
+		OwnedDefinition,
+		OwnedFunction,
+		OwnedTail(UnmanagedReturn, OwnedReturn, UnmanagedMatch),
+		OwnedValueOperation(
+			ParameterDefinition, IntegerDefinition, VariantDefinition, CallDefinition,
+			ConstructDefinition, PayloadDefinition,
+		),
+		OwnerId,
+		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
+		OwnershipProgram,
+		ResultOwnership(UnmanagedResult, BorrowedResult, OwnedResult),
+		ValueOwnership(NoOwnership, ManagedStringLeaf),
+		owner_number,
+		value_ownership,
+	syntax: Diagnostic, Span
+	text: concat
+
+
+-- This seal belongs to the exact operations and contracts checked below.
+opaque type VerifiedProgram = OwnershipProgram
+
+
+pure func verified_contents(program: VerifiedProgram) -> OwnershipProgram:
+	from_opaque VerifiedProgram(program)
+
+
+private pure func failure(span: Span, message: String) -> Diagnostic:
+	{
+		span = span,
+		message = "ownership verification failed: ".concat(message),
+		help = "report this compiler error with the input program"
+	}
+
+
+private fixed record KnownValue {
+	value_type: TypeRef,
+	span: Span
+}
+
+
+private fixed union OwnerState:
+	ActiveOwner(ValueId)
+	DischargedOwner
+
+
+private fixed record VerificationState {
+	values: List[Option[KnownValue]],
+	owners: List[OwnerState],
+	next_value: Int,
+	parameter: Option[ValueId]
+}
+
+
+private fixed union ProjectionContext:
+	NoProjection
+	PayloadProjection(ValueId, VariantId)
+
+
+private pure func value(
+	values: List[Option[KnownValue]],
+	id: ValueId,
+	span: Span,
+) -> Result[KnownValue, Diagnostic]:
+	error = failure(
+		span,
+		"value "
+			.append_int(value_number(id))
+			.concat(" is not defined before use"),
+	)
+	entry ?= values
+		.get(value_number(id))
+		.to_result(error)
+	entry.to_result(error)
+
+
+private pure func owner(
+	owners: List[OwnerState],
+	id: OwnerId,
+	span: Span,
+) -> Result[OwnerState, Diagnostic]:
+	owners
+		.get(owner_number(id))
+		.to_result(
+			failure(
+				span,
+				"owner "
+					.append_int(owner_number(id))
+					.concat(" is not defined"),
+			),
+		)
+
+
+private pure func introduce_owner(
+	owners: List[OwnerState],
+	id: OwnerId,
+	value: ValueId,
+	span: Span,
+) -> Result[List[OwnerState], Diagnostic]:
+	ordinal = owner_number(id)
+
+	if IntOps.less_than(ordinal, 0):
+		Err(failure(span, "negative owner identity"))
+	else if IntOps.less_than(ordinal, owners.length()):
+		Err(
+			failure(
+				span,
+				"owner "
+					.append_int(ordinal)
+					.concat(" is defined more than once"),
+			),
+		)
+	else if IntOps.not_equals(ordinal, owners.length()):
+		Err(failure(span, "owner identity is not the next function ordinal"))
+	else:
+		Ok(owners.append(ActiveOwner(value)))
+
+
+private pure func verify_borrow(
+	borrow: BorrowedValue,
+	state: VerificationState,
+	span: Span,
+) -> Result[Bool, Diagnostic]:
+	borrowed ?= value(state.values, borrow.value, span)
+
+	match borrowed.value_type:
+		StringType:
+			match borrow.source:
+				ParameterBorrow:
+					match state.parameter:
+						Some(parameter):
+							if IntOps.equals(value_number(parameter), value_number(borrow.value)):
+								Ok(True)
+							else:
+								Err(
+									failure(
+										span,
+										"parameter borrow does not refer to the borrowed String parameter",
+									),
+								)
+						None:
+							Err(
+								failure(
+									span,
+									"parameter borrow does not refer to the borrowed String parameter",
+								),
+							)
+				OwnerBorrow(id):
+					entry ?= owner(state.owners, id, span)
+
+					match entry:
+						DischargedOwner:
+							Err(
+								failure(
+									span,
+									"borrow refers to discharged owner ".append_int(
+										owner_number(id),
+									),
+								),
+							)
+						ActiveOwner(owned):
+							if IntOps.equals(value_number(owned), value_number(borrow.value)):
+								Ok(True)
+							else:
+								Err(
+									failure(
+										span,
+										"owner "
+											.append_int(owner_number(id))
+											.concat(" does not own value ")
+											.append_int(value_number(borrow.value)),
+									),
+								)
+		_:
+			Err(failure(span, "borrow requires a managed value"))
+
+
+private pure func call_signature(
+	call: CheckedCall,
+	functions: List[OwnedFunction],
+) -> Result[FunctionSignature, Diagnostic]:
+	match call.target:
+		RuntimeFunction(operation):
+			Ok(runtime_signature(operation))
+		UserFunction(id):
+			function ?= functions
+				.get(function_number(id))
+				.to_result(failure(call.span, "unknown called function"))
+			Ok(function.signature)
+
+
+private pure func verify_arguments(
+	arguments: OwnedArguments,
+	parameters: ParameterShape,
+	state: VerificationState,
+	unions: List[CheckedUnion],
+	span: Span,
+) -> Result[Bool, Diagnostic]:
+	match parameters:
+		NoParameter:
+			match arguments:
+				NoArguments:
+					Ok(True)
+				_:
+					Err(failure(span, "call has an unexpected argument"))
+		OneParameter(expected):
+			match arguments:
+				NoArguments:
+					Err(failure(span, "call is missing its argument"))
+				UnmanagedArgument(id):
+					argument ?= value(state.values, id, span)
+
+					if not same_type(argument.value_type, expected):
+						Err(failure(span, "call argument type does not match its contract"))
+					else:
+						plan ?= value_ownership(expected, unions)
+
+						match plan:
+							NoOwnership:
+								Ok(True)
+							ManagedStringLeaf:
+								Err(
+									failure(
+										span,
+										"managed call argument requires an owner-dependent borrow",
+									),
+								)
+				BorrowedArgument(borrow):
+					argument ?= value(state.values, borrow.value, span)
+
+					if not same_type(argument.value_type, expected):
+						Err(failure(span, "call argument type does not match its contract"))
+					else:
+						verify_borrow(borrow, state, span)
+
+
+private pure func variant_shape(
+	id: VariantId,
+	unions: List[CheckedUnion],
+	span: Span,
+) -> Result[PayloadShape, Diagnostic]:
+	declaration ?= unions
+		.get(union_number(variant_owner(id)))
+		.to_result(failure(span, "unknown variant owner"))
+	declaration.variants
+		.get(variant_number(id))
+		.to_result(failure(span, "unknown variant identity"))
+
+
+private pure func variant_type(
+	id: VariantId,
+	expected: PayloadShape,
+	unions: List[CheckedUnion],
+	span: Span,
+) -> Result[TypeRef, Diagnostic]:
+	shape ?= variant_shape(id, unions, span)
+
+	valid = match expected:
+		NoPayload:
+			match shape:
+				NoPayload:
+					True
+				_:
+					False
+		IntPayload:
+			match shape:
+				IntPayload:
+					True
+				_:
+					False
+
+	if valid:
+		Ok(UnionType(variant_owner(id)))
+	else:
+		Err(failure(span, "variant payload does not match its operation"))
+
+
+private pure func operation_type(
+	definition: OwnedDefinition,
+	state: VerificationState,
+	signature: FunctionSignature,
+	functions: List[OwnedFunction],
+	unions: List[CheckedUnion],
+	projection: ProjectionContext,
+) -> Result[TypeRef, Diagnostic]:
+	match definition.operation:
+		ParameterDefinition:
+			match state.parameter:
+				Some(_):
+					Err(failure(definition.span, "function parameter is defined more than once"))
+				None:
+					match signature.parameters:
+						NoParameter:
+							Err(
+								failure(
+									definition.span,
+									"parameter value in a zero-argument function",
+								),
+							)
+						OneParameter(value_type):
+							Ok(value_type)
+		IntegerDefinition(_):
+			Ok(IntType)
+		VariantDefinition(id):
+			variant_type(id, NoPayload, unions, definition.span)
+		CallDefinition(call, arguments):
+			contract ?= call_signature(call, functions)
+			valid ?= verify_arguments(
+				arguments,
+				contract.parameters,
+				state,
+				unions,
+				definition.span,
+			)
+
+			if same_type(contract.return_type, definition.value_type):
+				Ok(contract.return_type)
+			else:
+				Err(failure(definition.span, "call result type does not match its contract"))
+		ConstructDefinition(id, argument):
+			argument_value ?= value(state.values, argument, definition.span)
+
+			if same_type(argument_value.value_type, IntType):
+				variant_type(id, IntPayload, unions, definition.span)
+			else:
+				Err(failure(definition.span, "union constructor requires an Int payload"))
+		PayloadDefinition(source):
+			scrutinee ?= value(state.values, source, definition.span)
+
+			match projection:
+				NoProjection:
+					Err(
+						failure(
+							definition.span,
+							"payload projection outside its selected match arm",
+						),
+					)
+				PayloadProjection(expected, variant):
+					union_type ?= variant_type(variant, IntPayload, unions, definition.span)
+
+					if (
+						IntOps.equals(value_number(source), value_number(expected))
+						and same_type(scrutinee.value_type, union_type)
+					):
+						Ok(IntType)
+					else:
+						Err(
+							failure(
+								definition.span,
+								"payload projection does not belong to this match arm",
+							),
+						)
+
+
+private pure func verify_definition(
+	definition: OwnedDefinition,
+	state: VerificationState,
+	signature: FunctionSignature,
+	functions: List[OwnedFunction],
+	unions: List[CheckedUnion],
+	projection: ProjectionContext,
+) -> Result[VerificationState, Diagnostic]:
+	if IntOps.not_equals(value_number(definition.id), state.next_value):
+		Err(failure(definition.span, "value identity is not the next function ordinal"))
+	else:
+		expected ?= operation_type(definition, state, signature, functions, unions, projection)
+
+		if not same_type(expected, definition.value_type):
+			Err(failure(definition.span, "definition type does not match its operation"))
+		else:
+			plan ?= value_ownership(definition.value_type, unions)
+
+			ownership_result: Result[List[OwnerState], Diagnostic] = match plan:
+				NoOwnership:
+					match definition.result:
+						UnmanagedResult:
+							Ok(state.owners)
+						_:
+							Err(
+								failure(
+									definition.span,
+									"unmanaged value carries an ownership obligation",
+								),
+							)
+				ManagedStringLeaf:
+					match definition.operation:
+						ParameterDefinition:
+							match definition.result:
+								BorrowedResult:
+									Ok(state.owners)
+								_:
+									Err(
+										failure(
+											definition.span,
+											"managed parameter must be borrowed",
+										),
+									)
+						CallDefinition(_, _):
+							match definition.result:
+								OwnedResult(owner):
+									introduce_owner(
+										state.owners,
+										owner,
+										definition.id,
+										definition.span,
+									)
+								_:
+									Err(
+										failure(
+											definition.span,
+											"managed call result requires an owner",
+										),
+									)
+						_:
+							Err(failure(definition.span, "unsupported managed value operation"))
+
+			owners ?= ownership_result
+			var values = state.values
+
+			-- Sibling-arm identities remain function-wide while their values are
+			-- deliberately absent from the next sibling's visible environment.
+			while IntOps.less_than(values.length(), value_number(definition.id)):
+				values = values.append(None)
+
+			parameter = match definition.operation:
+				ParameterDefinition:
+					Some(definition.id)
+				_:
+					state.parameter
+
+			Ok({
+				values = values.append(Some({
+					value_type = definition.value_type,
+					span = definition.span,
+				})),
+				owners = owners,
+				next_value = IntOps.add(state.next_value, 1),
+				parameter = parameter,
+			})
+
+
+private pure func verify_operation(
+	operation: OwnershipOperation,
+	state: VerificationState,
+	signature: FunctionSignature,
+	functions: List[OwnedFunction],
+	unions: List[CheckedUnion],
+) -> Result[VerificationState, Diagnostic]:
+	match operation:
+		DefineValue(definition):
+			verify_definition(definition, state, signature, functions, unions, NoProjection)
+		AcquireOwner(id, borrow, span):
+			valid ?= verify_borrow(borrow, state, span)
+			owners ?= introduce_owner(state.owners, id, borrow.value, span)
+			Ok({ state | owners = owners })
+		DropOwner(id, span):
+			entry ?= owner(state.owners, id, span)
+
+			match entry:
+				DischargedOwner:
+					Err(
+						failure(
+							span,
+							"owner "
+								.append_int(owner_number(id))
+								.concat(" has already been discharged"),
+						),
+					)
+				ActiveOwner(_):
+					Ok({ state | owners = state.owners.set(owner_number(id), DischargedOwner) })
+
+
+private pure func complete_owners(owners: List[OwnerState], span: Span) -> Result[Bool, Diagnostic]:
+	var position: Int = 0
+	var failure_owner: Option[Int] = None
+
+	for owner in owners:
+		match owner:
+			ActiveOwner(_):
+				failure_owner = Some(position)
+				break
+			DischargedOwner:
+				void
+
+		position = IntOps.add(position, 1)
+
+	match failure_owner:
+		Some(id):
+			Err(
+				failure(
+					span,
+					"owner "
+						.append_int(id)
+						.concat(" remains live at return"),
+				),
+			)
+		None:
+			Ok(True)
+
+
+private pure func verify_return(
+	returned: ValueId,
+	returned_owner: Option[OwnerId],
+	state: VerificationState,
+	return_type: TypeRef,
+	unions: List[CheckedUnion],
+) -> Result[Bool, Diagnostic]:
+	result ?= value(
+		state.values,
+		returned,
+		{
+			start = 0,
+			end = 0
+		},
+	)
+
+	if not same_type(result.value_type, return_type):
+		Err(failure(result.span, "return type does not match its contract"))
+	else:
+		plan ?= value_ownership(return_type, unions)
+
+		ownership_result: Result[List[OwnerState], Diagnostic] = match plan:
+			NoOwnership:
+				match returned_owner:
+					None:
+						Ok(state.owners)
+					Some(_):
+						Err(failure(result.span, "unmanaged return cannot transfer an owner"))
+			ManagedStringLeaf:
+				match returned_owner:
+					None:
+						Err(failure(result.span, "managed return requires an owner transfer"))
+					Some(id):
+						entry ?= owner(state.owners, id, result.span)
+
+						match entry:
+							DischargedOwner:
+								Err(
+									failure(
+										result.span,
+										"return refers to discharged owner ".append_int(
+											owner_number(id),
+										),
+									),
+								)
+							ActiveOwner(owned):
+								if IntOps.equals(value_number(owned), value_number(returned)):
+									Ok(state.owners.set(owner_number(id), DischargedOwner))
+								else:
+									Err(
+										failure(
+											result.span,
+											"returned owner does not own the returned value",
+										),
+									)
+
+		owners ?= ownership_result
+		complete_owners(owners, result.span)
+
+
+private pure func unmanaged_definition(definition: ValueDefinition) -> OwnedDefinition:
+	operation = match definition.operation:
+		ParameterValue:
+			ParameterDefinition
+		IntegerValue(integer):
+			IntegerDefinition(integer)
+		VariantValue(id):
+			VariantDefinition(id)
+		ConstructValue(id, argument):
+			ConstructDefinition(id, argument)
+		PayloadValue(source):
+			PayloadDefinition(source)
+		CallValue(call, arguments):
+			converted = match arguments:
+				OneArgument(argument):
+					UnmanagedArgument(argument)
+				_:
+					NoArguments
+
+			CallDefinition(call, converted)
+
+	{
+		id = definition.id,
+		value_type = definition.value_type,
+		operation = operation,
+		result = UnmanagedResult,
+		span = definition.span
+	}
+
+
+private pure func verify_match(
+	matched: LoweredMatch,
+	state: VerificationState,
+	signature: FunctionSignature,
+	functions: List[OwnedFunction],
+	unions: List[CheckedUnion],
+) -> Result[Bool, Diagnostic]:
+	scrutinee ?= value(
+		state.values,
+		matched.scrutinee,
+		{
+			start = 0,
+			end = 0
+		},
+	)
+
+	if not same_type(scrutinee.value_type, UnionType(matched.owner)):
+		Err(failure(scrutinee.span, "match scrutinee does not belong to its union"))
+	else:
+		var next_value = state.next_value
+		var invalid: Option[Diagnostic] = None
+
+		for arm in matched.arms:
+			var branch = { state | next_value = next_value }
+
+			projection_result: Result[ProjectionContext, Diagnostic] = match arm.label:
+				DefaultLabel:
+					Ok(NoProjection)
+				VariantLabel(id):
+					if IntOps.not_equals(
+						union_number(variant_owner(id)),
+						union_number(matched.owner),
+					):
+						Err(failure(scrutinee.span, "match variant belongs to another union"))
+					else:
+						variant_shape(
+							id,
+							unions,
+							scrutinee.span,
+						).map(
+							pure func(
+								_: PayloadShape,
+							) -> ProjectionContext: PayloadProjection(matched.scrutinee, id),
+						)
+
+			match projection_result:
+				Err(error):
+					invalid = Some(error)
+					break
+				Ok(projection):
+					for definition in arm.body.definitions:
+						match definition.value_type:
+							StringType:
+								invalid = Some(
+									failure(
+										definition.span,
+										"managed value appears in an unmanaged match",
+									),
+								)
+								break
+							_:
+								void
+
+						match verify_definition(
+							unmanaged_definition(definition),
+							branch,
+							signature,
+							functions,
+							unions,
+							projection,
+						):
+							Ok(updated):
+								branch = updated
+							Err(error):
+								invalid = Some(error)
+								break
+
+					match invalid:
+						Some(_):
+							break
+						None:
+							match verify_return(
+								arm.body.result,
+								None,
+								branch,
+								signature.return_type,
+								unions,
+							):
+								Ok(_):
+									next_value = branch.next_value
+								Err(error):
+									invalid = Some(error)
+									break
+
+		match invalid:
+			Some(error):
+				Err(error)
+			None:
+				Ok(True)
+
+
+private pure func verify_function(
+	function: OwnedFunction,
+	functions: List[OwnedFunction],
+	unions: List[CheckedUnion],
+) -> Result[Bool, Diagnostic]:
+	var state: VerificationState = {
+		values = [],
+		owners = [],
+		next_value = 0,
+		parameter = None
+	}
+	var invalid: Option[Diagnostic] = None
+
+	for operation in function.operations:
+		match verify_operation(operation, state, function.signature, functions, unions):
+			Ok(updated):
+				state = updated
+			Err(error):
+				invalid = Some(error)
+				break
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			parameter_result: Result[Bool, Diagnostic] = match function.signature.parameters:
+				NoParameter:
+					Ok(True)
+				OneParameter(_):
+					match state.parameter:
+						Some(_):
+							Ok(True)
+						None:
+							Err(
+								failure(
+									{
+										start = 0,
+										end = 0
+									},
+									"function parameter has no value definition",
+								),
+							)
+
+			valid_parameter ?= parameter_result
+
+			match function.tail:
+				UnmanagedReturn(value):
+					verify_return(value, None, state, function.signature.return_type, unions)
+				OwnedReturn(value, owner):
+					verify_return(value, Some(owner), state, function.signature.return_type, unions)
+				UnmanagedMatch(matched):
+					-- This restriction is checked independently of the inserter,
+					-- including managed prefix values already dropped by the tail.
+					var managed: Option[Span] = None
+
+					for entry in state.values:
+						match entry:
+							Some(known):
+								match known.value_type:
+									StringType:
+										managed = Some(known.span)
+										break
+									_:
+										void
+							None:
+								void
+
+					match managed:
+						Some(span):
+							Err(failure(span, "managed value appears in an unmanaged match"))
+						None:
+							-- A malformed raw match may have no return occurrences
+							-- at all; its signature still cannot promise an owner.
+							match function.signature.return_type:
+								StringType:
+									Err(
+										failure(
+											{
+												start = 0,
+												end = 0
+											},
+											"managed return appears in an unmanaged match",
+										),
+									)
+								_:
+									verify_match(
+										matched,
+										state,
+										function.signature,
+										functions,
+										unions,
+									)
+
+
+-- C main calls the entry without arguments and consumes an Int. Enforcing
+-- that contract here prevents a transferred managed result being discarded.
+private pure func verify_entry(entry: OwnedFunction) -> Result[Bool, Diagnostic]:
+	valid = match entry.signature.parameters:
+		NoParameter:
+			same_type(entry.signature.return_type, IntType)
+		OneParameter(_):
+			False
+
+	if valid:
+		Ok(True)
+	else:
+		span: Span = match entry.operations.get(0):
+			Some(operation):
+				match operation:
+					DefineValue(definition):
+						definition.span
+					AcquireOwner(_, _, occurrence):
+						occurrence
+					DropOwner(_, occurrence):
+						occurrence
+			None:
+				{
+					start = 0,
+					end = 0
+				}
+
+		Err(failure(span, "entrypoint must take no parameters and return Int"))
+
+
+pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnostic]:
+	entry ?= program.functions
+		.get(function_number(program.entrypoint))
+		.to_result(
+			failure(
+				{
+					start = 0,
+					end = 0
+				},
+				"entrypoint function is not defined",
+			),
+		)
+	var invalid: Option[Diagnostic] = None
+
+	for function in program.functions:
+		match verify_function(function, program.functions, program.unions):
+			Ok(_):
+				void
+			Err(error):
+				invalid = Some(error)
+				break
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			valid_entry ?= verify_entry(entry)
+			Ok(into_opaque VerifiedProgram(program))

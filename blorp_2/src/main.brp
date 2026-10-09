@@ -1,21 +1,61 @@
 import:
+	./prelude: CheckedPrelude, check_prelude
 	check: check
 	emit: emit
 	int as IntOps
 	lex: lex
 	lower: lower
-	parse: parse
+	own: own
+	parse: parse, parse_prelude
+	result: map_err
 	syntax: Diagnostic
 	system: read_file, write_file
 	text: concat, equals
+	verify: verify
 
 
-pure func compile(source: String) -> Result[String, Diagnostic]:
+fixed record CompilationInputs {
+	prelude: String,
+	program: String
+}
+
+
+fixed union CompilationDiagnostic:
+	PreludeDiagnostic(Diagnostic)
+	ProgramDiagnostic(Diagnostic)
+
+
+private pure func prepare_prelude(source: String) -> Result[CheckedPrelude, Diagnostic]:
 	lexed ?= lex(source)
-	parsed ?= parse(lexed)
+	parsed ?= parse_prelude(lexed)
+	check_prelude(parsed)
+
+
+private pure func compile_program(
+	source: String,
+	prelude: CheckedPrelude,
+) -> Result[String, Diagnostic]:
+	lexed ?= lex(source)
+	parsed ?= parse(lexed, prelude)
 	checked ?= check(parsed)
 	lowered ?= lower(checked)
-	emit(lowered)
+	owned ?= own(lowered)
+	verified ?= verify(owned)
+	emit(verified)
+
+
+pure func compile(inputs: CompilationInputs) -> Result[String, CompilationDiagnostic]:
+	prelude ?= prepare_prelude(
+		inputs.prelude,
+	).map_err(
+		pure func(error: Diagnostic) -> CompilationDiagnostic: PreludeDiagnostic(error),
+	)
+	compile_program(
+		inputs.program,
+		prelude,
+	).map_err(
+		pure func(error: Diagnostic) -> CompilationDiagnostic: ProgramDiagnostic(error),
+	)
 
 
 private pure func render_diagnostic(path: String, source: String, diagnostic: Diagnostic) -> String:
@@ -48,37 +88,62 @@ private pure func render_diagnostic(path: String, source: String, diagnostic: Di
 
 func main(args: List[String]) -> Int:
 	match args:
-		[_, input_path, output_path]:
-			match read_file(input_path):
+		[_, prelude_path, input_path, output_path]:
+			match read_file(prelude_path):
 				Err(error):
-					print_error(
-						"blorp_2: error: could not read "
-							.concat(input_path)
-							.concat(": ")
-							.concat(error)
-							.concat("\nhelp: provide a readable input file"),
-					)
+					print_error(read_error(prelude_path, error))
 					1
-				Ok(source):
-					match compile(source):
-						Err(diagnostic):
-							print_error(render_diagnostic(input_path, source, diagnostic))
-							1
-						Ok(generated_c):
-							match write_file(output_path, generated_c):
-								Err(error):
-									print_error(
-										"blorp_2: error: could not write "
-											.concat(output_path)
-											.concat(": ")
-											.concat(error)
-											.concat("\nhelp: provide a writable output path"),
-									)
-									1
-								Ok(_):
-									0
+				Ok(prelude):
+					compile_file(prelude_path, prelude, input_path, output_path)
 		_:
 			print_error(
-				"blorp_2: error: expected an input path and an output path\nhelp: run blorp_2 INPUT.brp OUTPUT.c",
+				"blorp_2: error: expected prelude, input and output paths\nhelp: run blorp_2 PRELUDE.brp INPUT.brp OUTPUT.c",
 			)
 			1
+
+
+private pure func read_error(path: String, error: String) -> String:
+	"blorp_2: error: could not read "
+		.concat(path)
+		.concat(": ")
+		.concat(error)
+		.concat("\nhelp: provide a readable input file")
+
+
+private func compile_file(
+	prelude_path: String,
+	prelude: String,
+	input_path: String,
+	output_path: String,
+) -> Int:
+	match read_file(input_path):
+		Err(error):
+			print_error(read_error(input_path, error))
+			1
+		Ok(source):
+			match compile({
+				prelude = prelude,
+				program = source,
+			}):
+				Err(failure):
+					diagnostic = match failure:
+						PreludeDiagnostic(error):
+							render_diagnostic(prelude_path, prelude, error)
+						ProgramDiagnostic(error):
+							render_diagnostic(input_path, source, error)
+
+					print_error(diagnostic)
+					1
+				Ok(generated_c):
+					match write_file(output_path, generated_c):
+						Err(error):
+							print_error(
+								"blorp_2: error: could not write "
+									.concat(output_path)
+									.concat(": ")
+									.concat(error)
+									.concat("\nhelp: provide a writable output path"),
+							)
+							1
+						Ok(_):
+							0
