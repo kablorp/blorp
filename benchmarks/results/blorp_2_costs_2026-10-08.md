@@ -5,8 +5,7 @@ repository compiler. Building that code is outside the measured boundary.
 They describe the current host compiler's code generation and runtime; they
 do not predict the future self-hosted compiler's cost.
 
-The final section records Int parameters and nested calls with their predeclared
-ceilings. Earlier sections retain the initial, function-call and purity measurements.
+The sections retain each increment's measurements and predeclared ceilings.
 
 ## Initial end-to-end return-zero example
 
@@ -681,3 +680,372 @@ findings; the test-runner independently verified the gates and cache reuse.
 | Normal pilot compiler | `6a2ce338c223993aa1399fde7303fa6f0f0417c5ca0695a70f35f780694d642f` |
 | Diagnostic pilot compiler | `0d15a15c3417c23bade1a2a7687d3d80ea06dde20fbf12c3981a65e40567cde4` |
 | Cache input manifest | `ba60ca39fdcdd469e0f5ec7d7507a4cabfaeff138de7dc9c32f199172f2925be` |
+
+## UFCS increment: preimplementation guardrails
+
+The next increment adds single-line `receiver.function()` calls and chains.
+The receiver is any existing expression; it supplies the sole argument.
+Explicit method arguments, field access, imports and method-only import
+registries remain outside scope. Existing compiler checks establish a current
+lookup distinction: `identity.identity()` accepts a local parameter named
+`identity` as receiver and resolves the global function as method, while
+ordinary `identity(identity)` rejects the shadowed, non-callable parameter.
+Parsed unary calls therefore retain explicit direct/receiver notation until
+checking. The checked representation and emitter need no syntax distinction.
+
+Before implementation, ceilings are **1,650 formatted compiler-source lines**
+(current 1,429) and **3,200 suite/support lines** (current 2,819), with raw
+fixtures reported separately. The UFCS and distinguishable-order chain
+fixtures each have initial ceilings of **550 managed allocations** and
+**40,000,000 retired instructions**. All five existing fixture limits remain
+unchanged, including the purity fixture's exact 360-allocation ceiling.
+Any excess must be investigated or the implementation rescoped; tests do not
+raise limits automatically.
+
+The unchanged FRESH host and warm cached compiler passed all 12 existing
+native-suite callbacks before implementation:
+
+| Fixture | Baseline allocations | Instruction samples | Minimum |
+| --- | ---: | --- | ---: |
+| `return_zero` | 116 | 19,075,429; 18,975,487; 18,939,097 | 18,939,097 |
+| `call_one` | 225 | 19,197,741; 19,047,848; 19,045,918 | 19,045,918 |
+| `pure_calls` | 360 | 19,326,597; 19,245,999; 19,234,764 | 19,234,764 |
+| `nested_calls` | 411 | 19,409,287; 19,273,396; 19,207,368 | 19,207,368 |
+| `nested_order` | 447 | 19,420,277; 19,274,187; 19,306,690 | 19,274,187 |
+
+Commands were `make -C blorp_2 test-compiler`, followed by `bin/blorp test
+--suite --timeout 180` on the four existing native suite files. Warm preparation
+produced no generation or link output. The source/binary provenance matches
+the preceding final artifact table. Raw evidence is in
+`blorp_2/build/guardrails/ufcs-baseline.log`; the existing-compiler lookup probes
+and logs are `ufcs-shadow-probe` and `direct-shadow-probe` under the same ignored
+directory.
+
+## UFCS increment: final evidence
+
+UFCS calls, chains and mixed direct/receiver calls are implemented. The parser
+retains `DirectCall` or `ReceiverCall` with each unary callee until checking
+resolves names; the checked-call representation and emitter remain unchanged.
+Receiver names use the caller's scope. UFCS callee names select declared
+functions, even when a local parameter shadows the same name; direct calls
+continue to reject that non-callable parameter. Imports and UFCS-only import
+visibility are deferred.
+
+Formatted compiler source is **1,521 lines** (+92; ceiling 1,650), suite/support
+code is **3,147 lines** (+328; ceiling 3,200), and raw fixtures are **36 lines**
+(+12). No predeclared ceiling was raised. Tests-first validation observed 15
+expected failing callbacks before implementation, including lexical/parser
+rejection of dots, semantic UFCS examples and new native-suite callbacks.
+
+Independent final validation passed **114/114 callbacks across 15 TestSuites**
+normally, then **114/114** with UBSan and leak checking. Commands were:
+
+```bash
+make -C blorp_2 test-compiler
+make -C blorp_2 test
+bin/blorp test --suite --sanitize=undefined --leak-check --timeout 180 \
+  blorp_2/test/unit blorp_2/test/e2e blorp_2/test/test_grammar
+```
+
+The runner also verified formatting for all 24 maintained Blorp files,
+whitespace, actual emitted C and silent native exit statuses. The seven
+fixtures below exit 0, 1, 1, 1, 0, 1 and 0 respectively. All five previous
+fixtures' emitted C remains byte-identical to the preceding independent
+artifacts. `ufcs_calls` produces the same 299-byte C as `nested_calls`;
+`ufcs_chain` produces 368 bytes with `zero(one(1))` in the declared function
+identities. Exact-C tests also protect mixed prefix/postfix order and a single
+evaluation of each receiver.
+
+| Fixture | Allocations / ceiling | Change from baseline | Minimum retired instructions / ceiling |
+| --- | ---: | ---: | ---: |
+| `return_zero` | 116 / 120 | 0 | 18,960,906 / 22,000,000 |
+| `call_one` | 225 / 230 | 0 | 19,098,986 / 26,000,000 |
+| `pure_calls` | 360 / 360 | 0 | 19,274,362 / 32,000,000 |
+| `nested_calls` | 414 / 500 | +3 | 19,336,864 / 40,000,000 |
+| `nested_order` | 452 / 500 | +5 | 19,396,215 / 40,000,000 |
+| `ufcs_calls` | 418 / 550 | new | 19,380,911 / 40,000,000 |
+| `ufcs_chain` | 460 / 550 | new | 19,382,338 / 40,000,000 |
+
+The existing purity fixture remains exactly at its allocation ceiling.
+The nested-call increases accompany the notation-preserving representation;
+no separate phase-allocation attribution was performed.
+These costs measure the new compiler processing each input, including CLI
+setup, rather than building the host compiler or running the emitted program.
+
+All three normal instruction samples, in execution order:
+
+- `return_zero`: 19,120,573; 19,062,645; 18,960,906.
+- `call_one`: 20,387,105; 19,235,497; 19,098,986.
+- `pure_calls`: 19,462,775; 19,274,362; 19,289,450.
+- `nested_calls`: 19,545,653; 19,336,864; 19,448,431.
+- `nested_order`: 19,540,563; 19,458,117; 19,396,215.
+- `ufcs_calls`: 19,453,042; 19,474,068; 19,380,911.
+- `ufcs_chain`: 21,211,504; 19,398,560; 19,382,338.
+
+Samples during the UBSan/leak TestSuite run:
+
+- `return_zero`: 19,109,012; 19,005,339; 18,972,175.
+- `call_one`: 19,148,460; 19,100,029; 19,128,813.
+- `pure_calls`: 19,338,973; 19,260,245; 19,244,605.
+- `nested_calls`: 19,396,702; 19,299,303; 19,264,361.
+- `nested_order`: 19,481,259; 19,361,418; 19,307,744.
+- `ufcs_calls`: 19,447,995; 19,281,137; 19,291,985.
+- `ufcs_chain`: 19,469,717; 19,335,700; 19,350,964.
+
+UBSan instruments TestSuite code and imported pilot modules. Native cost
+samples use the shared normal `-O2` compiler; the allocation-diagnostic
+compiler checks for zero leaks without extra native UBSan flags. No elapsed
+speed improvement is claimed.
+
+Seven deliberate source mutations demonstrated negative detection:
+
+| Mutation | Failed callbacks |
+| --- | ---: |
+| Replace receiver notation with direct-call notation | 2 |
+| Consume a UFCS suffix but omit its parsed call | 2 |
+| Apply direct-call local shadowing to a UFCS target | 1 |
+| Bypass caller purity validation | 7 |
+| Bypass call arity validation | 4 |
+| Check dependencies only for the first unary wrapper | 2 |
+| Reverse emitted unary wrappers | 3 of 5 UFCS-suite callbacks |
+
+Reversed emission also changed the strictly compiled chain program's native
+exit from the required 0 to 1, with empty stdout/stderr. Sources were restored
+byte-for-byte after every probe. The restored parser/grammar tests passed
+33/33, checker tests passed 38/38, and the normal cache was rebuilt before
+independent final validation. Logs are `ufcs-mutation-*.log` and restoration
+logs under `blorp_2/build/guardrails/`.
+
+The unchanged host remained FRESH. Source/test/grammar/Makefile fingerprints
+were unchanged throughout independent validation. Warm setup and both final
+gates generated **zero compiler C files and zero links**; cached C, both
+binaries and the input manifest retained hashes, timestamps, sizes and inodes.
+Final logs and actual emitted C are retained locally under
+`blorp_2/build/guardrails/ufcs-independent-KqL8kq/`, with fingerprints under
+`/tmp/blorp-2-ufcs-validation.KqL8kq/`. Code-reviewer/documenter review approved
+source, tests and documentation with no outstanding findings.
+
+| Final artifact | SHA-256 |
+| --- | --- |
+| Host `bin/blorp` | `c67d5bb315a67999ec5d608eaa41aab83f8d75e6220b44b936ea2a4849b7ba0a` |
+| Shared compiler C | `a2cb2fe730346d7bb48b311b97f1f807b5dde81cabd73cba6a35b9e42cf73b06` |
+| Normal pilot compiler | `728ba0ca6a9f219893fe33f93df78449f1cd73dcef9cae44cd85d3c4b0b8869c` |
+| Diagnostic pilot compiler | `7d32e18ce9a77a66ee46d671463c3c3b2d1ae425933b323b16cd86ccbc625209` |
+| Cache input manifest | `518942b682a6c7710ad02453854bede8220647c13b4d7612c78ea74d93bf823c` |
+| UFCS chain emitted C | `e18d17a7a48232508b3d657f70f8ec37c8089134714032b518157c563952dc63` |
+
+## Name identity increment: preimplementation guardrails
+
+The authorized increment removes name spellings from published parsed syntax.
+One compilation owns one immutable name table. Names carry a nominal `NameId`
+and occurrence span; declaration identity remains the separate `FunctionId`.
+Semantic checks compare IDs, including parameter names and canonical `main`
+and `Int` names. Strings remain available through the owning table for
+diagnostics. Source syntax, generated C and diagnostic messages must remain
+unchanged. Imports, new language features and a general symbol framework are
+outside scope.
+
+Before implementation, formatted source is **1,521 lines**, suite/support is
+**3,147**, and raw fixtures are **36**. Ceilings are **1,700 source lines** and
+**3,500 suite/support lines**, with fixtures reported separately. Aim to keep
+source growth below 100 lines. All seven existing e2e allocation/instruction
+limits stay unchanged, and matched allocation counts must not exceed the
+fresh baseline counts. A matched candidate's minimum retired instructions
+must also remain within **2%** of each fresh baseline minimum below; any
+repeatable excess must be investigated or the implementation rescoped.
+
+Independent baseline validation passed **17/17 native-suite callbacks** using
+the unchanged FRESH host and both warm cached `-O2` compiler modes. All seven
+native exit/silence checks and exact C/CLI diagnostic oracles passed. No source,
+test or limit changed. The 34-file source/test/docs/build snapshot is retained
+under `blorp_2/build/guardrails/name-ids-baseline/`, including the four compiler
+cache artifacts. Baseline report, all samples, hashes and metadata are under
+`blorp_2/build/guardrails/name-ids-baseline-validation/`.
+
+| Fixture | Allocations | Three instruction samples | Minimum | Additional 2% instruction ceiling |
+| --- | ---: | --- | ---: | ---: |
+| `return_zero` | 116 | 19,011,301; 18,938,643; 19,288,819 | 18,938,643 | 19,317,415 |
+| `call_one` | 225 | 19,217,979; 19,061,521; 19,439,435 | 19,061,521 | 19,442,751 |
+| `pure_calls` | 360 | 19,351,458; 19,240,289; 19,230,034 | 19,230,034 | 19,614,634 |
+| `nested_calls` | 414 | 19,469,900; 19,329,696; 19,300,319 | 19,300,319 | 19,686,325 |
+| `nested_order` | 452 | 19,436,857; 19,273,314; 19,312,448 | 19,273,314 | 19,658,780 |
+| `ufcs_calls` | 418 | 19,451,298; 19,351,427; 19,326,483 | 19,326,483 | 19,713,012 |
+| `ufcs_chain` | 460 | 20,388,143; 19,292,626; 19,341,207 | 19,292,626 | 19,678,478 |
+
+The host and baseline cache hashes match the preceding UFCS final artifact
+table. Warm preparation and the baseline gates produced zero compiler C
+generations or links. Reproduction is `make -C blorp_2 test-compiler`, followed
+by `bin/blorp test --suite --timeout 180` on `test_return_zero.brp`,
+`test_call_one.brp`, `test_pure_calls.brp`, `test_nested_calls.brp` and
+`test_ufcs.brp` under `blorp_2/test/e2e/`.
+
+The pilot cannot self-compile its current implementation, whose imports,
+types and helpers exceed its supported input grammar. These seven fixed
+inputs measure its owned compilation boundary as a proxy; they do not verify
+self-compilation costs. No broader existing-host self-compilation measurement
+would establish the pilot refactor's cost. Final candidate evidence follows.
+
+### Rejected parser-local result-pair experiment
+
+The initial implementation compiled and passed the three name-table API
+callbacks after simplifying a nested diagnostic expression rejected by the
+host compiler. New API tests had first failed compilation because the names
+module did not exist; this was a structural API red check, not a behavioral
+failure. Raw evidence is `name-ids-red.log` and `name-ids-names-initial.log`.
+
+The first full native cost run passed 15 of 17 callbacks; call-one and purity
+failed their existing allocation ceilings. All seven matched allocation
+counts grew, so the model was rejected without changing any ceiling.
+
+| Fixture | Rejected allocations | Increase | Three instruction samples | Minimum |
+| --- | ---: | ---: | --- | ---: |
+| `return_zero` | 118 | +2 | 20,168,814; 18,982,892; 18,938,679 | 18,938,679 |
+| `call_one` | 231 | +6 | 19,237,609; 19,102,094; 19,103,482 | 19,102,094 |
+| `pure_calls` | 370 | +10 | 19,359,213; 19,198,130; 19,320,163 | 19,198,130 |
+| `nested_calls` | 428 | +14 | 19,427,169; 19,276,939; 19,355,572 | 19,276,939 |
+| `nested_order` | 464 | +12 | 19,420,009; 19,407,591; 19,322,101 | 19,322,101 |
+| `ufcs_calls` | 430 | +12 | 19,384,763; 19,291,153; 19,292,760 | 19,291,153 |
+| `ufcs_chain` | 468 | +8 | 19,463,422; 19,283,547; 19,310,204 | 19,283,547 |
+
+Generated C confirms that `InternedName` allocates on both the existing-name
+and new-name branches, and `NameContents` is another managed record. This
+establishes those mechanisms but does not attribute the entire process delta.
+The rejected source/C/cost log is retained under
+`blorp_2/build/guardrails/name-ids-rejected-parser-pair/`; the full gate log is
+`blorp_2/build/guardrails/name-ids-early-costs.log`.
+
+Before the next implementation, the bounded hypothesis is to remove both
+wrappers: make `NameTable` an opaque spelling list, produce canonical IDs
+once in `InitialNames`, update the table alone, and perform a fallible ID
+lookup before parser publication. The parser retains the canonical IDs as
+inline data and publishes them alongside its table. This removes redundant
+managed containers while retaining one spelling authority. The extra frontend
+scan must satisfy the same allocation and instruction limits; an impossible
+lookup miss must report an explicit internal diagnostic. No token/AST
+projection pass, lexical interning or new language feature is introduced.
+
+### Final name-ID evidence
+
+The accepted representation has one opaque `NameTable` backed by the spelling
+list. `InitialNames` supplies the table and its canonical IDs once; parser
+construction retains those identities as inline data. Interning updates the
+table alone, and ID lookup occurs before publication. Only parsing can
+construct opaque `ParsedProgram`, which binds names, canonical identities,
+functions and the end span together. Written names contain only `NameId` and
+occurrence span. `find_function`, parameter matching, and `main`/`Int` checks
+use IDs. The sole spelling lookup in checking renders UFCS arity help and
+reports an explicit internal diagnostic if it fails. Checked data, emission,
+lexer and command shell remain unchanged.
+
+Formatted source is **1,662 lines** (+141; ceiling 1,700), suite/support code
+is **3,439** (+292; ceiling 3,500), and raw fixtures remain **36**. The goal of
+source growth below 100 lines was missed; the hard ceiling held. The new name
+authority, sealed publication and explicit lookup-failure handling account
+for the required source boundary. This change does not claim a production
+line reduction. Grammar and all seven raw inputs are unchanged.
+
+Independent final validation passed **120/120 callbacks across 16 TestSuites**
+normally, then **120/120** with UBSan and leak checking: 76 unit, 26 grammar
+and 18 end-to-end callbacks per run. All previous 114 callbacks remain, with
+four name-identity tests and two checking regressions added. Commands were:
+
+```bash
+make -C blorp_2 test-compiler
+make -C blorp_2 test
+bin/blorp test --suite --sanitize=undefined --leak-check --timeout 180 \
+  blorp_2/test/unit blorp_2/test/e2e blorp_2/test/test_grammar
+```
+
+All seven actual C files compare byte-identical to the matched pre-refactor
+baseline. Strict C11/O2 native linking, exit statuses 0/1/1/1/0/1/0, empty
+stdout/stderr, exact rejected CLI diagnostics and output preservation passed.
+Formatting passed for all 26 maintained Blorp files; raw fixtures and ignored
+build files were excluded. Whitespace checks passed.
+
+| Fixture | Final allocations | Change | Normal minimum instructions | Additional ceiling |
+| --- | ---: | ---: | ---: | ---: |
+| `return_zero` | 116 | 0 | 19,067,153 | 19,317,415 |
+| `call_one` | 225 | 0 | 19,148,340 | 19,442,751 |
+| `pure_calls` | 360 | 0 | 19,262,967 | 19,614,634 |
+| `nested_calls` | 414 | 0 | 19,343,058 | 19,686,325 |
+| `nested_order` | 449 | -3 | 19,338,957 | 19,658,780 |
+| `ufcs_calls` | 416 | -2 | 19,340,184 | 19,713,012 |
+| `ufcs_chain` | 453 | -7 | 19,403,790 | 19,678,478 |
+
+No allocation count exceeds its matched baseline, and all existing e2e
+ceilings remain unchanged. Normal minimum instruction increases range from
+0.07% to 0.68%, within the predeclared 2% allowance. The purity fixture still
+uses its exact 360-allocation ceiling. No elapsed-speed or self-compilation
+improvement is claimed.
+
+All three normal instruction samples, in execution order:
+
+- `return_zero`: 19,149,045; 19,073,695; 19,067,153.
+- `call_one`: 19,174,861; 19,148,340; 19,183,991.
+- `pure_calls`: 19,480,155; 19,293,752; 19,262,967.
+- `nested_calls`: 19,487,779; 19,358,595; 19,343,058.
+- `nested_order`: 19,521,917; 19,382,283; 19,338,957.
+- `ufcs_calls`: 19,498,856; 19,340,184; 19,347,767.
+- `ufcs_chain`: 19,564,870; 19,406,023; 19,403,790.
+
+Samples during the UBSan/leak TestSuite run:
+
+- `return_zero`: 19,100,472; 18,959,120; 18,981,345.
+- `call_one`: 19,054,557; 19,027,036; 19,075,056.
+- `pure_calls`: 19,353,038; 19,570,693; 19,228,413.
+- `nested_calls`: 19,406,857; 19,245,498; 19,324,898.
+- `nested_order`: 19,440,251; 19,332,632; 19,349,931.
+- `ufcs_calls`: 19,395,899; 19,327,245; 19,306,211.
+- `ufcs_chain`: 19,417,678; 19,347,056; 19,298,263.
+
+UBSan instruments TestSuite code and imported pilot modules. Both runs
+measure retired instructions using the cached normal `-O2` compiler. The
+allocation child uses its diagnostic counterpart, which checks for zero leaks
+without extra native UBSan flags. These
+remain seven-input compilation-proxy measurements; genuine pilot
+self-compilation is unsupported.
+
+Tests preserve canonical reuse, case/prefix distinctions, independent table
+values, exact occurrence spans, names used in different roles, unknown names,
+declaration-order FunctionIds and direct/UFCS shadowing. Four deliberate
+name-module faults established negative detection:
+
+| Mutation | Failed callbacks |
+| --- | ---: |
+| Alias all name IDs | 37 (1 names, 36 checking) |
+| Append duplicate spellings | 1 |
+| Use the main ID as canonical Int | 2 |
+| Lose spelling lookup | 4 (3 names, 1 checking) |
+
+The lost-spelling probe also passed an exact internal-diagnostic assertion
+at span 46:50, with the prescribed input-report help, rather than producing
+C or default text. Source was restored byte-for-byte after every mutation;
+all 44 name/check callbacks passed after restoration. Ignored Blorp
+compile-negative probes confirmed `NameId` cannot replace `FunctionId` and
+outsiders cannot use opaque `ParsedProgram` conversions. IDs remain ordinals
+meaningful only within their owning parse/table; equality and lookup do not
+runtime-brand table ownership. Sealed construction is the integrity boundary.
+
+Mutation/rejection logs are `name-ids-mutation-*.log`,
+`name-ids-missing-internal-diagnostic.log`, `name-ids-nominal-rejection.log`,
+`name-ids-seal-rejection.log` and `name-ids-restored-tests.log` under
+`blorp_2/build/guardrails/`. The accepted early cost checkpoint is
+`name-ids-rescoped-costs.log`; final independent logs, actual C, fingerprints
+and report are under `name-ids-independent-38JDEg/`, with scratch evidence in
+`/tmp/blorp-2-name-ids-validation.38JDEg/`.
+
+The unchanged host remained FRESH. Frozen source/test/grammar/Makefile/README
+fingerprints and all cache hashes, timestamps, sizes and inodes remained
+unchanged throughout warm setup and both final runs. Those runs generated
+**zero compiler C files and zero compiler links**. Candidate cache rebuilding
+occurred only during development, before final validation. Code-reviewer and
+documenter review approved the source/tests/README with no outstanding
+findings; the independent test-runner verified the gates and comparisons.
+
+| Final artifact | SHA-256 |
+| --- | --- |
+| Host `bin/blorp` | `c67d5bb315a67999ec5d608eaa41aab83f8d75e6220b44b936ea2a4849b7ba0a` |
+| Shared compiler C | `7a2e261f9eeccf544ddbfedcd31a0725fc9ddf9b7bf848d7bc588435fa81760e` |
+| Normal pilot compiler | `b32a9aa14766d4b1e685fe34a32f83f70371de2cf059de6ac8e51bc98ab71e46` |
+| Diagnostic pilot compiler | `37ab2096c3ac3be4fd01ecf9a0859c3a5322132d8bf8af025358ce66b9232a20` |
+| Cache input manifest | `05526b05766bb07755c8d840887b39ddafaba5f05376bc97a795510c0994314d` |
