@@ -1,14 +1,17 @@
 import:
 	int as IntOps
-	option: is_some
+	option: is_some, to_result
 	syntax:
 		Diagnostic,
+		ExpressionBase(IntegerExpression, NameExpression, CallExpression),
 		IntegerValue,
+		ParameterList(EmptyParameters, SingleParameter),
 		ParsedFunction,
 		ParsedProgram,
 		Purity(Pure, Impure),
-		ReturnExpression(IntegerExpression, CallExpression),
+		ReturnExpression,
 		Span,
+		WrittenName,
 	text as Text
 
 
@@ -17,13 +20,37 @@ import:
 opaque type FunctionId = Int
 
 
-fixed union CheckedReturn:
+fixed union ParameterShape:
+	NoParameter
+	IntParameter
+
+
+fixed record CheckedCall {
+	target: FunctionId,
+	span: Span
+}
+
+
+fixed union CheckedBase:
 	ReturnInteger(IntegerValue)
-	ReturnCall(FunctionId)
+	ReturnParameter
+	ReturnCall(CheckedCall)
+
+
+fixed record CheckedReturn {
+	base: CheckedBase,
+	unary_calls: List[CheckedCall]
+}
+
+
+private fixed union ArgumentCount:
+	NoArguments
+	OneArgument
 
 
 fixed record CheckedFunction {
 	purity: Purity,
+	parameters: ParameterShape,
 	body: CheckedReturn
 }
 
@@ -98,6 +125,30 @@ private pure func validate_signatures(
 			)
 			break
 
+		match function.parameters:
+			EmptyParameters:
+				void
+			SingleParameter(parameter):
+				if Text.equals(function.function_name.spelling, "main"):
+					failure = Some(
+						rejection(
+							parameter.name.span,
+							"main cannot have a parameter",
+							"declare main() -> Int: with no parameters",
+						),
+					)
+					break
+
+				if not Text.equals(parameter.type_name.spelling, "Int"):
+					failure = Some(
+						rejection(
+							parameter.type_name.span,
+							"expected Int as the parameter type",
+							"declare the parameter as name: Int",
+						),
+					)
+					break
+
 		previous = previous.append(function)
 
 	match failure:
@@ -139,39 +190,142 @@ private pure func validate_call(
 					)
 
 
+private pure func is_parameter(parameters: ParameterList, name: String) -> Bool:
+	match parameters:
+		EmptyParameters:
+			False
+		SingleParameter(parameter):
+			Text.equals(parameter.name.spelling, name)
+
+
+private pure func parameter_shape(parameters: ParameterList) -> ParameterShape:
+	match parameters:
+		EmptyParameters:
+			NoParameter
+		SingleParameter(_):
+			IntParameter
+
+
+private pure func resolve_call(
+	purity: Purity,
+	parameters: ParameterList,
+	name: WrittenName,
+	arguments: ArgumentCount,
+	functions: List[ParsedFunction],
+) -> Result[CheckedCall, Diagnostic]:
+	if is_parameter(parameters, name.spelling):
+		Err(
+			rejection(
+				name.span,
+				"Int parameters cannot be called",
+				"use the parameter as a value, or rename it to call the function",
+			),
+		)
+	else:
+		id ?= find_function(
+			functions,
+			name.spelling,
+		).to_result(
+			rejection(
+				name.span,
+				"unknown function",
+				"declare the called function in this file",
+			),
+		)
+		callee ?= functions
+			.get(function_number(id))
+			.to_result(
+				rejection(
+					name.span,
+					"invalid resolved function identity",
+					"report this compiler error with the input program",
+				),
+			)
+
+		arity ?= match arguments:
+			NoArguments:
+				match callee.parameters:
+					EmptyParameters:
+						Ok(void)
+					SingleParameter(_):
+						Err(
+							rejection(
+								name.span,
+								"function requires one argument",
+								"pass one Int expression, such as identity(1)",
+							),
+						)
+			OneArgument:
+				match callee.parameters:
+					EmptyParameters:
+						Err(
+							rejection(
+								name.span,
+								"function takes no arguments",
+								"remove the argument and call the function with ()",
+							),
+						)
+					SingleParameter(_):
+						Ok(void)
+
+		validated ?= validate_call(purity, callee.purity, name.span)
+		Ok({
+			target = id,
+			span = name.span,
+		})
+
+
+private pure func resolve_base(
+	purity: Purity,
+	parameters: ParameterList,
+	base: ExpressionBase,
+	functions: List[ParsedFunction],
+) -> Result[CheckedBase, Diagnostic]:
+	match base:
+		IntegerExpression(value):
+			Ok(ReturnInteger(value))
+		NameExpression(name):
+			if is_parameter(parameters, name.spelling):
+				Ok(ReturnParameter)
+			else:
+				Err(
+					rejection(
+						name.span,
+						"unknown value",
+						"use this function's parameter name or a call such as one()",
+					),
+				)
+		CallExpression(name):
+			call ?= resolve_call(purity, parameters, name, NoArguments, functions)
+			Ok(ReturnCall(call))
+
+
 private pure func resolve_body(
 	purity: Purity,
+	parameters: ParameterList,
 	body: ReturnExpression,
 	functions: List[ParsedFunction],
 ) -> Result[CheckedReturn, Diagnostic]:
-	match body:
-		IntegerExpression(value):
-			Ok(ReturnInteger(value))
-		CallExpression(name):
-			match find_function(functions, name.spelling):
-				Some(id):
-					callee ?= match functions.get(function_number(id)):
-						Some(function):
-							Ok(function)
-						None:
-							Err(
-								rejection(
-									name.span,
-									"invalid resolved function identity",
-									"report this compiler error with the input program",
-								),
-							)
+	base ?= resolve_base(purity, parameters, body.base, functions)
+	var calls: List[CheckedCall] = []
+	var failure: Option[Diagnostic] = None
 
-					validated ?= validate_call(purity, callee.purity, name.span)
-					Ok(ReturnCall(id))
-				None:
-					Err(
-						rejection(
-							name.span,
-							"unknown function",
-							"declare the called function in this file",
-						),
-					)
+	for name in body.unary_calls:
+		match resolve_call(purity, parameters, name, OneArgument, functions):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(call):
+				calls = calls.append(call)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				base = base,
+				unary_calls = calls,
+			})
 
 
 private pure func resolve_functions(
@@ -181,13 +335,14 @@ private pure func resolve_functions(
 	var failure: Option[Diagnostic] = None
 
 	for function in parsed:
-		match resolve_body(function.purity, function.body, parsed):
+		match resolve_body(function.purity, function.parameters, function.body, parsed):
 			Err(error):
 				failure = Some(error)
 				break
 			Ok(body):
 				functions = functions.append({
 					purity = function.purity,
+					parameters = parameter_shape(function.parameters),
 					body = body,
 				})
 
@@ -198,66 +353,74 @@ private pure func resolve_functions(
 			Ok(functions)
 
 
-private pure func validate_acyclic(
-	functions: List[CheckedFunction],
-	parsed: List[ParsedFunction],
-	end: Span,
-) -> Result[Void, Diagnostic]:
-	-- Each function has at most one call edge. A walk longer than the function
-	-- count must repeat an identity; no graph or recursion machinery is needed.
-	var index: Int = 0
+private pure func is_settled(id: FunctionId, settled: List[FunctionId]) -> Bool:
+	var found: Bool = False
+
+	for known in settled:
+		if IntOps.equals(function_number(id), function_number(known)):
+			found = True
+			break
+
+	found
+
+
+private pure func unsettled_edge(body: CheckedReturn, settled: List[FunctionId]) -> Option[Span]:
+	var found: Option[Span] = match body.base:
+		ReturnInteger(_):
+			None
+		ReturnParameter:
+			None
+		ReturnCall(call):
+			if is_settled(call.target, settled):
+				None
+			else:
+				Some(call.span)
+
+	for call in body.unary_calls:
+		if found.is_some():
+			break
+
+		if not is_settled(call.target, settled):
+			found = Some(call.span)
+
+	found
+
+
+private pure func validate_acyclic(functions: List[CheckedFunction]) -> Result[Void, Diagnostic]:
+	-- Settle only functions whose complete base/wrapper callee set is settled.
+	-- Every successful step adds a distinct identity; leftovers contain or reach
+	-- a cycle. Repeating an acyclic callee inside one body does not form a cycle.
+	var settled: List[FunctionId] = []
+	var changed: Bool = True
+
+	while changed:
+		changed = False
+		var index: Int = 0
+
+		for function in functions:
+			id = into_opaque FunctionId(index)
+
+			if not is_settled(id, settled) and not unsettled_edge(function.body, settled).is_some():
+				settled = settled.append(id)
+				changed = True
+
+			index = IntOps.add(index, 1)
+
 	var failure: Option[Diagnostic] = None
 
-	for source in parsed:
-		var current: Option[FunctionId] = Some(into_opaque FunctionId(index))
-		var steps: Int = 0
-
-		while IntOps.less_than(steps, functions.length()) and current.is_some():
-			match current:
-				None:
-					void
-				Some(id):
-					match functions.get(function_number(id)):
-						None:
-							failure = Some(
-								rejection(
-									end,
-									"invalid checked function identity",
-									"report this compiler error with the input program",
-								),
-							)
-							break
-						Some(callee):
-							current = match callee.body:
-								ReturnInteger(_):
-									None
-								ReturnCall(next):
-									Some(next)
-
-			steps = IntOps.add(steps, 1)
-
-		if failure.is_some():
-			break
-
-		if current.is_some():
-			error: Diagnostic = match source.body:
-				CallExpression(name):
+	for function in functions:
+		match unsettled_edge(function.body, settled):
+			Some(span):
+				failure = Some(
 					rejection(
-						name.span,
+						span,
 						"call chain contains recursion",
 						"use an acyclic call chain; recursion is not supported in this increment",
-					)
-				IntegerExpression(_):
-					rejection(
-						end,
-						"invalid checked call chain",
-						"report this compiler error with the input program",
-					)
-
-			failure = Some(error)
-			break
-
-		index = IntOps.add(index, 1)
+					),
+				)
+				break
+			None:
+				void
 
 	match failure:
 		Some(error):
@@ -269,7 +432,7 @@ private pure func validate_acyclic(
 pure func check(program: ParsedProgram) -> Result[CheckedProgram, Diagnostic]:
 	entrypoint ?= validate_signatures(program.functions, program.end)
 	functions ?= resolve_functions(program.functions)
-	acyclic ?= validate_acyclic(functions, program.functions, program.end)
+	acyclic ?= validate_acyclic(functions)
 	Ok(into_opaque CheckedProgram({
 				functions = functions,
 				entrypoint = entrypoint
