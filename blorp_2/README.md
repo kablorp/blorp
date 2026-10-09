@@ -211,7 +211,7 @@ From the repository root:
 ```sh
 make                            # Build the existing compiler first.
 make -C blorp_2 example          # Compile the example to C, build it, run it.
-make -C blorp_2 test             # Run the tests written in Blorp.
+make -C blorp_2 test             # Run the Blorp TestSuite tests.
 ```
 
 `example` keeps its generated C and executable in `blorp_2/build/` for
@@ -243,6 +243,12 @@ under `test/e2e/fixtures/`. The suites use the existing compiler's `TestSuite`
 API and run with `bin/blorp test --suite`; the example
 fixture is not a test entrypoint. The host test API uses tuple-based test
 registration. The compiler source under `src/` stays within the agreed subset.
+
+Direct C unit tests of the target String runtime live under `test/runtime/`,
+with Blorp `TestSuite` orchestration. Run them with
+`bin/blorp test blorp_2/test/runtime`. They compile the same runtime fragment
+used by emission at `-O0` with ASan/UBSan. Small test-local allocator wrappers
+observe actual allocation/free calls; production runtime code has no test mode.
 Generated unit-test code uses the host command's default `-O0`; omit `--release`
 for development tests. Sanitizer builds also use `-O0`.
 
@@ -563,7 +569,10 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    an argument alive until a call has established its result owner.
 6. Independent verification checks the actual operations against representation
    and call contracts, rejecting dead/wrong owners, invalid borrows and
-   undisposed obligations. It also enforces the zero-argument Int entry ABI
+   undisposed obligations. Raw ownership IR does not preserve checking's sealed
+   match proof, so verification independently requires nonempty, exhaustive,
+   useful arms with valid unique variants and at most one final default.
+   It also enforces the zero-argument Int entry ABI
    and rejects managed matches in raw ownership IR. Only it can seal a
    `VerifiedProgram`; it neither repairs ownership nor uses insertion's
    liveness decisions as its oracle.
@@ -641,8 +650,9 @@ purity, matching, loops, `var`, `?=`, imports, and UFCS. Supporting every one
 of these in input programs is future work, not a claim about this increment.
 
 Concurrency, parallelism, tensors and dimension types, tuples, `debug:`, other
-numeric widths, traits, doctests, channels, and FFI are excluded. All tests
-are written in Blorp. Build commands may use Make and the C toolchain.
+numeric widths, traits, doctests, channels, and FFI are excluded. Compiler tests
+are written in Blorp; the target runtime has explicitly approved C unit tests
+run by Blorp `TestSuite`. Build commands may use Make and the C toolchain.
 
 The current build uses the existing compiler and its standard library,
 including host I/O and process APIs. That library contains excluded features;

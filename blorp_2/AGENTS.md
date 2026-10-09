@@ -157,8 +157,13 @@ are not implicit inputs.
 
 ## Validation for this pilot
 
-All tests are written in Blorp and use `TestSuite`, not a test `main` or
-Python. Every host-compiled source module has a matching unit suite under
+Compiler tests are written in Blorp and use `TestSuite`, not a test `main` or
+Python. The explicitly approved exception is direct C unit tests of the
+target String runtime under `test/runtime/`, compiled and run by a Blorp
+`TestSuite`. They use the same runtime fragment as emission and small
+test-local allocator wrappers that delegate to actual allocation/free.
+This does not authorize production tracing or alternate language-fixture
+entrypoints. Every host-compiled source module has a matching unit suite under
 [test/unit/](test/unit/). Grammar conformance cases live under
 [test/test_grammar/](test/test_grammar/); update them and the EBNF together.
 Check exact diagnostic text, help, and spans for rejected inputs. End-to-end

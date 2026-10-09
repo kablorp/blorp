@@ -13,7 +13,7 @@ example: host-check
 	@build/return_zero
 
 test: host-check
-	@cd .. && bin/blorp test --suite --timeout 180 blorp_2/test/unit blorp_2/test/e2e blorp_2/test/test_grammar
+	@cd .. && bin/blorp test --suite --timeout 180 blorp_2/test/unit blorp_2/test/runtime blorp_2/test/e2e blorp_2/test/test_grammar
 
 # Each e2e run builds once and passes its binary to its fixture groups.
 test-compiler: host-check

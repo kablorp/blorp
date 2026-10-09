@@ -1,14 +1,15 @@
 import:
 	../../src/check:
-		CallTarget(RuntimeFunction),
+		CallTarget(RuntimeFunction, UserFunction),
 		ParameterShape(NoParameter, OneParameter),
 		TypeRef(IntType, StringType),
 	../../src/emit: emit
 	../../src/lex: lex
-	../../src/lower: lower
+	../../src/lower: ValueId, lower
 	../../src/own:
 		BorrowSource(ParameterBorrow, OwnerBorrow),
 		OwnedArguments(UnmanagedArgument, BorrowedArgument),
+		OwnedFunction,
 		OwnedTail(UnmanagedReturn, OwnedReturn),
 		OwnedValueOperation(ParameterDefinition, IntegerDefinition, CallDefinition),
 		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
@@ -17,10 +18,11 @@ import:
 		own,
 		owner_id,
 	../../src/prelude: RuntimeOperation(IntToString, StringLength)
+	../../src/string_runtime: string_runtime
 	../../src/syntax: Diagnostic, Purity(Pure)
 	../../src/verify: verify
 	input: check, parse
-	ownership_inputs: input_ids, span
+	ownership_inputs: InputIds, input_ids, span
 	result: get_or
 	test: TestSuite
 
@@ -130,75 +132,107 @@ private pure func emit_owned(program: OwnershipProgram) -> Result[String, Diagno
 	emit(verified)
 
 
+-- The runtime prefix has separate native tests. Only that unrelated prefix is
+-- reused here: each complete declarations/functions/main suffix below is an
+-- independent oracle for the supplied operations, including unwanted ARC calls.
+private pure func emits_owned_program(program: OwnershipProgram, expected: String) -> Bool:
+	emit_owned(program).get_or("") == string_runtime() + expected
+
+
+private pure func integer_definition(id: ValueId, value: Int, at: Int) -> OwnershipOperation:
+	DefineValue({
+		id = id,
+		value_type = IntType,
+		operation = IntegerDefinition(value),
+		result = UnmanagedResult,
+		span = span(at)
+	})
+
+
+private pure func string_definition(
+	id: ValueId,
+	argument: ValueId,
+	owner: Int,
+	at: Int,
+) -> OwnershipOperation:
+	DefineValue({
+		id = id,
+		value_type = StringType,
+		operation = CallDefinition(
+			{ target = RuntimeFunction(IntToString), span = span(at) },
+			UnmanagedArgument(argument),
+		),
+		result = OwnedResult(owner_id(owner)),
+		span = span(at)
+	})
+
+
+private pure func length_definition(
+	id: ValueId,
+	argument: ValueId,
+	owner: Int,
+	at: Int,
+) -> OwnershipOperation:
+	DefineValue({
+		id = id,
+		value_type = IntType,
+		operation = CallDefinition(
+			{ target = RuntimeFunction(StringLength), span = span(at) },
+			BorrowedArgument({ value = argument, source = OwnerBorrow(owner_id(owner)) }),
+		),
+		result = UnmanagedResult,
+		span = span(at)
+	})
+
+
+private pure func main_function(operations: List[OwnershipOperation], result: ValueId) -> OwnedFunction:
+	{
+		signature = { purity = Pure, parameters = NoParameter, return_type = IntType },
+		operations = operations,
+		tail = UnmanagedReturn(result)
+	}
+
+
+private pure func borrowed_identity(ids: InputIds) -> OwnedFunction:
+	{
+		signature = { purity = Pure, parameters = OneParameter(StringType), return_type = StringType },
+		operations = [
+			DefineValue({
+				id = ids.first,
+				value_type = StringType,
+				operation = ParameterDefinition,
+				result = BorrowedResult,
+				span = span(10)
+			}),
+			AcquireOwner(owner_id(0), { value = ids.first, source = ParameterBorrow }, span(20)),
+		],
+		tail = OwnedReturn(ids.first, owner_id(0))
+	}
+
+
 pure func test_verified_operations_emit_allocation_borrow_then_drop() -> Bool:
 	match input_ids():
 		Err(_):
 			False
 		Ok(ids):
-			program: OwnershipProgram = {
-				unions = [],
-				entrypoint = ids.entrypoint,
-				functions = [
-					{
-						signature = {
-							purity = Pure,
-							parameters = NoParameter,
-							return_type = IntType
-						},
-						operations = [
-							DefineValue({
-								id = ids.first,
-								value_type = IntType,
-								operation = IntegerDefinition(7),
-								result = UnmanagedResult,
-								span = span(10),
-							}),
-							DefineValue({
-								id = ids.second,
-								value_type = StringType,
-								operation = CallDefinition(
-									{
-										target = RuntimeFunction(IntToString),
-										span = span(20)
-									},
-									UnmanagedArgument(ids.first),
-								),
-								result = OwnedResult(owner_id(0)),
-								span = span(20),
-							}),
-							DefineValue({
-								id = ids.third,
-								value_type = IntType,
-								operation = CallDefinition(
-									{
-										target = RuntimeFunction(StringLength),
-										span = span(30)
-									},
-									BorrowedArgument({
-										value = ids.second,
-										source = OwnerBorrow(owner_id(0)),
-									}),
-								),
-								result = UnmanagedResult,
-								span = span(30),
-							}),
-							DropOwner(owner_id(0), span(40)),
-						],
-						tail = UnmanagedReturn(ids.third)
-					},
-				]
-			}
-
-			match emit_owned(program):
-				Err(_):
-					False
-				Ok(code):
-					code.contains((
-							"struct blorp_string* const blorp_vl_1=blorp_int_to_string(blorp_vl_0);"
-							+ "(void)blorp_vl_1;struct blorp_string* const blorp_owner_0=blorp_vl_1;"
-							+ "(void)blorp_owner_0;const int64_t blorp_vl_2=blorp_string_length(blorp_vl_1);"
-							+ "(void)blorp_vl_2;blorp_string_release(blorp_owner_0);return blorp_vl_2;"
-						))
+			emits_owned_program(
+				{
+					unions = [], entrypoint = ids.entrypoint,
+					functions = [main_function([
+						integer_definition(ids.first, 7, 10),
+						string_definition(ids.second, ids.first, 0, 20),
+						length_definition(ids.third, ids.second, 0, 30),
+						DropOwner(owner_id(0), span(40)),
+					], ids.third)]
+				},
+				"int64_t blorp_f_0(void);int64_t blorp_f_0(void){"
+				+ "const int64_t blorp_vl_0=INT64_C(7);(void)blorp_vl_0;"
+				+ "struct blorp_string* const blorp_vl_1=blorp_int_to_string(blorp_vl_0);"
+				+ "(void)blorp_vl_1;struct blorp_string* const blorp_owner_0=blorp_vl_1;"
+				+ "(void)blorp_owner_0;const int64_t blorp_vl_2=blorp_string_length(blorp_vl_1);"
+				+ "(void)blorp_vl_2;blorp_string_release(blorp_owner_0);return blorp_vl_2;}"
+				+ "int main(void){return (int)blorp_f_0();}\n",
+			)
 
 
 pure func test_borrowed_parameter_return_emits_retain_and_owner_transfer() -> Bool:
@@ -206,68 +240,188 @@ pure func test_borrowed_parameter_return_emits_retain_and_owner_transfer() -> Bo
 		Err(_):
 			False
 		Ok(ids):
-			program: OwnershipProgram = {
-				unions = [],
-				entrypoint = ids.entrypoint,
-				functions = [
-					{
-						signature = {
-							purity = Pure,
-							parameters = NoParameter,
-							return_type = IntType
-						},
-						operations = [DefineValue({
-								id = ids.first,
-								value_type = IntType,
-								operation = IntegerDefinition(0),
-								result = UnmanagedResult,
-								span = span(10),
-							})],
-						tail = UnmanagedReturn(ids.first)
-					},
-					{
-						signature = {
-							purity = Pure,
-							parameters = OneParameter(StringType),
-							return_type = StringType
-						},
-						operations = [
-							DefineValue({
-								id = ids.first,
-								value_type = StringType,
-								operation = ParameterDefinition,
-								result = BorrowedResult,
-								span = span(10),
-							}),
-							AcquireOwner(
-								owner_id(0),
-								{
-									value = ids.first,
-									source = ParameterBorrow
-								},
-								span(20),
-							),
-						],
-						tail = OwnedReturn(ids.first, owner_id(0))
-					},
-				]
-			}
+			emits_owned_program(
+				{
+					unions = [], entrypoint = ids.entrypoint,
+					functions = [
+						main_function([integer_definition(ids.first, 0, 10)], ids.first),
+						borrowed_identity(ids),
+					]
+				},
+				"int64_t blorp_f_0(void);struct blorp_string* blorp_f_1(struct blorp_string* blorp_p_0);"
+				+ "int64_t blorp_f_0(void){const int64_t blorp_vl_0=INT64_C(0);"
+				+ "(void)blorp_vl_0;return blorp_vl_0;}"
+				+ "struct blorp_string* blorp_f_1(struct blorp_string* blorp_p_0){"
+				+ "struct blorp_string* const blorp_vl_0=blorp_p_0;(void)blorp_vl_0;"
+				+ "blorp_string_retain(blorp_vl_0);struct blorp_string* const "
+				+ "blorp_owner_0=blorp_vl_0;(void)blorp_owner_0;return blorp_owner_0;}"
+				+ "int main(void){return (int)blorp_f_0();}\n",
+			)
 
-			match emit_owned(program):
-				Err(_):
-					False
-				Ok(code):
-					code.contains("#include <stdatomic.h>\n") and code.contains((
-							"struct blorp_string* blorp_f_1(struct blorp_string* blorp_p_0){struct "
-							+ "blorp_string* const blorp_vl_0=blorp_p_0;(void)blorp_vl_0;"
-							+ "blorp_string_retain(blorp_vl_0);struct blorp_string* const "
-							+ "blorp_owner_0=blorp_vl_0;(void)blorp_owner_0;return blorp_owner_0;}"
-						))
+
+pure func test_acquire_emits_value_retain_before_old_owner_drop_and_transfer() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			helper: OwnedFunction = {
+				signature = { purity = Pure, parameters = NoParameter, return_type = StringType },
+				operations = [
+					integer_definition(ids.first, 7, 10),
+					string_definition(ids.second, ids.first, 0, 20),
+					AcquireOwner(
+						owner_id(1),
+						{ value = ids.second, source = OwnerBorrow(owner_id(0)) },
+						span(30),
+					),
+					DropOwner(owner_id(0), span(40)),
+				],
+				tail = OwnedReturn(ids.second, owner_id(1))
+			}
+			emits_owned_program(
+				{
+					unions = [], entrypoint = ids.entrypoint,
+					functions = [main_function([integer_definition(ids.first, 0, 1)], ids.first), helper]
+				},
+				"int64_t blorp_f_0(void);struct blorp_string* blorp_f_1(void);"
+				+ "int64_t blorp_f_0(void){const int64_t blorp_vl_0=INT64_C(0);"
+				+ "(void)blorp_vl_0;return blorp_vl_0;}"
+				+ "struct blorp_string* blorp_f_1(void){const int64_t blorp_vl_0=INT64_C(7);"
+				+ "(void)blorp_vl_0;struct blorp_string* const blorp_vl_1=blorp_int_to_string(blorp_vl_0);"
+				+ "(void)blorp_vl_1;struct blorp_string* const blorp_owner_0=blorp_vl_1;(void)blorp_owner_0;"
+				+ "blorp_string_retain(blorp_vl_1);struct blorp_string* const blorp_owner_1=blorp_vl_1;"
+				+ "(void)blorp_owner_1;blorp_string_release(blorp_owner_0);return blorp_owner_1;}"
+				+ "int main(void){return (int)blorp_f_0();}\n",
+			)
+
+
+pure func test_independent_owner_drops_emit_each_exact_operand_once() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			emits_owned_program(
+				{
+					unions = [], entrypoint = ids.entrypoint,
+					functions = [main_function([
+						integer_definition(ids.first, 7, 10),
+						string_definition(ids.second, ids.first, 0, 20),
+						string_definition(ids.third, ids.first, 1, 30),
+						DropOwner(owner_id(1), span(40)),
+						DropOwner(owner_id(0), span(50)),
+					], ids.first)]
+				},
+				"int64_t blorp_f_0(void);int64_t blorp_f_0(void){"
+				+ "const int64_t blorp_vl_0=INT64_C(7);(void)blorp_vl_0;"
+				+ "struct blorp_string* const blorp_vl_1=blorp_int_to_string(blorp_vl_0);"
+				+ "(void)blorp_vl_1;struct blorp_string* const blorp_owner_0=blorp_vl_1;(void)blorp_owner_0;"
+				+ "struct blorp_string* const blorp_vl_2=blorp_int_to_string(blorp_vl_0);"
+				+ "(void)blorp_vl_2;struct blorp_string* const blorp_owner_1=blorp_vl_2;(void)blorp_owner_1;"
+				+ "blorp_string_release(blorp_owner_1);blorp_string_release(blorp_owner_0);return blorp_vl_0;}"
+				+ "int main(void){return (int)blorp_f_0();}\n",
+			)
+
+
+pure func test_unused_owned_result_emits_immediate_release_without_retain() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			emits_owned_program(
+				{
+					unions = [], entrypoint = ids.entrypoint,
+					functions = [main_function([
+						integer_definition(ids.first, 7, 10),
+						string_definition(ids.second, ids.first, 0, 20),
+						DropOwner(owner_id(0), span(30)),
+					], ids.first)]
+				},
+				"int64_t blorp_f_0(void);int64_t blorp_f_0(void){"
+				+ "const int64_t blorp_vl_0=INT64_C(7);(void)blorp_vl_0;"
+				+ "struct blorp_string* const blorp_vl_1=blorp_int_to_string(blorp_vl_0);"
+				+ "(void)blorp_vl_1;struct blorp_string* const blorp_owner_0=blorp_vl_1;(void)blorp_owner_0;"
+				+ "blorp_string_release(blorp_owner_0);return blorp_vl_0;}"
+				+ "int main(void){return (int)blorp_f_0();}\n",
+			)
+
+
+pure func test_repeated_borrows_emit_no_redundant_retain_or_release() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			emits_owned_program(
+				{
+					unions = [], entrypoint = ids.entrypoint,
+					functions = [main_function([
+						integer_definition(ids.first, 7, 10),
+						string_definition(ids.second, ids.first, 0, 20),
+						length_definition(ids.third, ids.second, 0, 30),
+						length_definition(ids.fourth, ids.second, 0, 40),
+						DropOwner(owner_id(0), span(50)),
+					], ids.fourth)]
+				},
+				"int64_t blorp_f_0(void);int64_t blorp_f_0(void){"
+				+ "const int64_t blorp_vl_0=INT64_C(7);(void)blorp_vl_0;"
+				+ "struct blorp_string* const blorp_vl_1=blorp_int_to_string(blorp_vl_0);"
+				+ "(void)blorp_vl_1;struct blorp_string* const blorp_owner_0=blorp_vl_1;(void)blorp_owner_0;"
+				+ "const int64_t blorp_vl_2=blorp_string_length(blorp_vl_1);(void)blorp_vl_2;"
+				+ "const int64_t blorp_vl_3=blorp_string_length(blorp_vl_1);(void)blorp_vl_3;"
+				+ "blorp_string_release(blorp_owner_0);return blorp_vl_3;}"
+				+ "int main(void){return (int)blorp_f_0();}\n",
+			)
+
+
+pure func test_user_call_establishes_result_owner_before_releasing_argument_owner() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			called = DefineValue({
+				id = ids.third,
+				value_type = StringType,
+				operation = CallDefinition(
+					{ target = UserFunction(ids.second_function), span = span(30) },
+					BorrowedArgument({ value = ids.second, source = OwnerBorrow(owner_id(0)) }),
+				),
+				result = OwnedResult(owner_id(1)),
+				span = span(30)
+			})
+			emits_owned_program(
+				{
+					unions = [], entrypoint = ids.entrypoint,
+					functions = [
+						main_function([
+							integer_definition(ids.first, 7, 10),
+							string_definition(ids.second, ids.first, 0, 20),
+							called,
+							DropOwner(owner_id(0), span(40)),
+							length_definition(ids.fourth, ids.third, 1, 50),
+							DropOwner(owner_id(1), span(60)),
+						], ids.fourth),
+						borrowed_identity(ids),
+					]
+				},
+				"int64_t blorp_f_0(void);struct blorp_string* blorp_f_1(struct blorp_string* blorp_p_0);"
+				+ "int64_t blorp_f_0(void){const int64_t blorp_vl_0=INT64_C(7);(void)blorp_vl_0;"
+				+ "struct blorp_string* const blorp_vl_1=blorp_int_to_string(blorp_vl_0);"
+				+ "(void)blorp_vl_1;struct blorp_string* const blorp_owner_0=blorp_vl_1;(void)blorp_owner_0;"
+				+ "struct blorp_string* const blorp_vl_2=blorp_f_1(blorp_vl_1);(void)blorp_vl_2;"
+				+ "struct blorp_string* const blorp_owner_1=blorp_vl_2;(void)blorp_owner_1;"
+				+ "blorp_string_release(blorp_owner_0);"
+				+ "const int64_t blorp_vl_3=blorp_string_length(blorp_vl_2);(void)blorp_vl_3;"
+				+ "blorp_string_release(blorp_owner_1);return blorp_vl_3;}"
+				+ "struct blorp_string* blorp_f_1(struct blorp_string* blorp_p_0){"
+				+ "struct blorp_string* const blorp_vl_0=blorp_p_0;(void)blorp_vl_0;"
+				+ "blorp_string_retain(blorp_vl_0);struct blorp_string* const blorp_owner_0=blorp_vl_0;"
+				+ "(void)blorp_owner_0;return blorp_owner_0;}"
+				+ "int main(void){return (int)blorp_f_0();}\n",
+			)
 
 
 tests: TestSuite = {
 	description = "Blorp 2 C emission",
 	tests = [
+		("acquire retains the value before old-owner drop and transfer", test_acquire_emits_value_retain_before_old_owner_drop_and_transfer),
+		("independent drops release each exact owner once", test_independent_owner_drops_emit_each_exact_operand_once),
+		("unused result releases immediately without retain", test_unused_owned_result_emits_immediate_release_without_retain),
+		("repeated borrows introduce no redundant ARC calls", test_repeated_borrows_emit_no_redundant_retain_or_release),
+		("user call establishes result owner before argument release", test_user_call_establishes_result_owner_before_releasing_argument_owner),
 		(
 			"verified operations emit allocation, borrow, drop",
 			test_verified_operations_emit_allocation_borrow_then_drop,

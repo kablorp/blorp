@@ -6,6 +6,7 @@ import:
 		TypeRef(IntType, StringType, UnionType),
 	../../src/lower:
 		CallArguments(OneArgument),
+		LoweredArm,
 		MatchLabel(DefaultLabel, VariantLabel),
 		ValueId,
 		ValueOperation(VariantValue, CallValue),
@@ -104,6 +105,141 @@ private pure func rejects(input: OwnershipProgram, message: String, at: Int) -> 
 			)
 		Ok(_):
 			False
+
+
+private pure func match_program(ids: InputIds, labels: List[MatchLabel]) -> OwnershipProgram:
+	var arms: List[LoweredArm] = []
+
+	for label in labels:
+		arms = arms.append({
+			label = label,
+			body = { definitions = [], result = ids.second }
+		})
+
+	{
+		unions = ids.unions,
+		entrypoint = ids.entrypoint,
+		functions = [{
+			signature = { purity = Pure, parameters = NoParameter, return_type = IntType },
+			operations = [
+				DefineValue({
+					id = ids.first,
+					value_type = UnionType(ids.union_id),
+					operation = VariantDefinition(ids.second_variant),
+					result = UnmanagedResult,
+					span = span(10)
+				}),
+				integer(ids.second, 7, 20),
+			],
+			tail = UnmanagedMatch({ scrutinee = ids.first, owner = ids.union_id, arms = arms })
+		}],
+	}
+
+
+pure func test_rejects_a_match_without_arms() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejects(match_program(ids, []), "match has no arms", 10)
+
+
+pure func test_rejects_a_match_missing_a_variant() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			rejects(
+				match_program(ids, [VariantLabel(ids.second_variant)]),
+				"match does not cover every variant",
+				10,
+			)
+
+
+pure func test_rejects_a_repeated_match_variant() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			rejects(
+				match_program(ids, [VariantLabel(ids.second_variant), VariantLabel(ids.second_variant)]),
+				"match variant appears more than once",
+				10,
+			)
+
+
+pure func test_rejects_a_repeated_match_default() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			rejects(
+				match_program(ids, [DefaultLabel, DefaultLabel]),
+				"match default appears more than once",
+				10,
+			)
+
+
+pure func test_rejects_a_match_default_before_a_variant() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			rejects(
+				match_program(ids, [DefaultLabel, VariantLabel(ids.second_variant)]),
+				"match default must be the final arm",
+				10,
+			)
+
+
+pure func test_rejects_a_match_default_after_complete_coverage() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match ids.union_value.operation:
+				VariantValue(first):
+					rejects(
+						match_program(ids, [VariantLabel(first), VariantLabel(ids.second_variant), DefaultLabel]),
+						"match default covers no remaining variants",
+						10,
+					)
+				_: False
+
+
+pure func test_accepts_a_match_with_all_variants() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match ids.union_value.operation:
+				VariantValue(first):
+					match verify(match_program(ids, [VariantLabel(first), VariantLabel(ids.second_variant)])):
+						Ok(_): True
+						Err(_): False
+				_: False
+
+
+pure func test_accepts_a_match_with_variants_in_reverse_order() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match ids.union_value.operation:
+				VariantValue(first):
+					match verify(match_program(ids, [VariantLabel(ids.second_variant), VariantLabel(first)])):
+						Ok(_): True
+						Err(_): False
+				_: False
+
+
+pure func test_accepts_a_partial_match_with_a_final_default() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match verify(match_program(ids, [VariantLabel(ids.second_variant), DefaultLabel])):
+				Ok(_): True
+				Err(_): False
+
+
+pure func test_accepts_a_default_only_match() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match verify(match_program(ids, [DefaultLabel])):
+				Ok(_): True
+				Err(_): False
 
 
 pure func test_accepts_exact_borrow_and_cleanup() -> Bool:
@@ -919,9 +1055,122 @@ pure func test_rejects_a_managed_return_from_an_empty_unmanaged_match() -> Bool:
 				_: False
 
 
+pure func test_acquired_owner_can_transfer_after_original_owner_is_dropped() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			entry: OwnedFunction = {
+				signature = { purity = Pure, parameters = NoParameter, return_type = IntType },
+				operations = [integer(ids.first, 0, 1)],
+				tail = UnmanagedReturn(ids.first)
+			}
+			helper: OwnedFunction = {
+				signature = { purity = Pure, parameters = NoParameter, return_type = StringType },
+				operations = [
+					integer(ids.first, 7, 10),
+					string(ids),
+					AcquireOwner(
+						owner_id(1),
+						{ value = ids.second, source = OwnerBorrow(owner_id(0)) },
+						span(30),
+					),
+					DropOwner(owner_id(0), span(40)),
+				],
+				tail = OwnedReturn(ids.second, owner_id(1))
+			}
+			match verify({ unions = [], entrypoint = ids.entrypoint, functions = [entry, helper] }):
+				Ok(_): True
+				Err(_): False
+
+
+private pure func verifies_independent_cleanup(ids: InputIds, first_drop: Int, second_drop: Int) -> Bool:
+	second_string = DefineValue({
+		id = ids.fourth,
+		value_type = StringType,
+		operation = CallDefinition(
+			{ target = RuntimeFunction(IntToString), span = span(40) },
+			UnmanagedArgument(ids.first),
+		),
+		result = OwnedResult(owner_id(1)),
+		span = span(40)
+	})
+	match verify(program(ids, [
+		integer(ids.first, 7, 10), string(ids), length(ids, 0), second_string,
+		DropOwner(owner_id(first_drop), span(50)),
+		DropOwner(owner_id(second_drop), span(60)),
+	])):
+		Ok(_): True
+		Err(_): False
+
+
+pure func test_independent_owners_can_be_dropped_in_creation_order() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): verifies_independent_cleanup(ids, 0, 1)
+
+
+pure func test_independent_owners_can_be_dropped_in_reverse_order() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): verifies_independent_cleanup(ids, 1, 0)
+
+
+pure func test_acquisition_rejects_another_values_live_owner() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			other_string = DefineValue({
+				id = ids.third,
+				value_type = StringType,
+				operation = CallDefinition(
+					{ target = RuntimeFunction(IntToString), span = span(30) },
+					UnmanagedArgument(ids.first),
+				),
+				result = OwnedResult(owner_id(1)),
+				span = span(30)
+			})
+			rejects(
+				{
+					unions = [], entrypoint = ids.entrypoint,
+					functions = [{
+						signature = { purity = Pure, parameters = NoParameter, return_type = IntType },
+						operations = [
+							integer(ids.first, 7, 10), string(ids), other_string,
+							AcquireOwner(
+								owner_id(2),
+								{ value = ids.second, source = OwnerBorrow(owner_id(1)) },
+								span(40),
+							),
+							DropOwner(owner_id(0), span(50)),
+							DropOwner(owner_id(1), span(60)),
+							DropOwner(owner_id(2), span(70)),
+							integer(ids.fourth, 0, 80),
+						],
+						tail = UnmanagedReturn(ids.fourth)
+					}]
+				},
+				"owner 1 does not own value 1",
+				40,
+			)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 independent ownership verification",
 	tests = [
+		("match requires arms", test_rejects_a_match_without_arms),
+		("match requires complete variant coverage", test_rejects_a_match_missing_a_variant),
+		("match rejects repeated variants", test_rejects_a_repeated_match_variant),
+		("match rejects repeated defaults", test_rejects_a_repeated_match_default),
+		("match default must follow variants", test_rejects_a_match_default_before_a_variant),
+		("match default must cover remaining variants", test_rejects_a_match_default_after_complete_coverage),
+		("match accepts all variants", test_accepts_a_match_with_all_variants),
+		("match accepts reversed variants", test_accepts_a_match_with_variants_in_reverse_order),
+		("match accepts partial coverage and final default", test_accepts_a_partial_match_with_a_final_default),
+		("match accepts a default alone", test_accepts_a_default_only_match),
+		("acquired owner can transfer after original owner drops", test_acquired_owner_can_transfer_after_original_owner_is_dropped),
+		("independent owners drop in creation order", test_independent_owners_can_be_dropped_in_creation_order),
+		("independent owners drop in reverse order", test_independent_owners_can_be_dropped_in_reverse_order),
+		("acquisition requires the exact value's live owner", test_acquisition_rejects_another_values_live_owner),
 		("managed return cannot escape an empty unmanaged match", test_rejects_a_managed_return_from_an_empty_unmanaged_match),
 		("entrypoint cannot return String", test_rejects_a_string_returning_entrypoint),
 		("entrypoint cannot take a parameter", test_rejects_an_entrypoint_with_a_parameter),
