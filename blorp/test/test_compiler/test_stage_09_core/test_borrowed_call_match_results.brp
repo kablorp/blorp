@@ -1,0 +1,311 @@
+import:
+	../../../src/compiler/stage_09_core/ir:
+		CoreAccessor(RootAccessor),
+		CoreBinderOrigin(AuthoredBinder),
+		CoreCallKind(BuiltinCall, UserCall),
+		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(ConstructorMatchFallbackFail),
+		CoreConstructorMatchTest(UnionTagConstructorTest),
+		CoreDecl(UnionDecl),
+		CoreExpr(CallExpr, ConstructorMatchExpr, DupExpr, VarExpr, VoidExpr),
+		CoreMatchBindingMode(MatchBorrowBindingMode),
+		CoreParam,
+		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
+		CoreType(NamedType, StackResultType, UnionType, VoidType),
+		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
+		CoreUnionStorage(ManagedPayloadStorage),
+		CoreUnionTagAccess(ScalarTagAccess),
+		CoreUnionValueStorage(ScalarTagValue),
+		CoreVar,
+		CoreVariantRef(VariantById),
+		synthetic_core_source_loc,
+	../../../src/compiler/stage_09_core/perceus/borrowed:
+		BorrowedOwnerRegionKind(FunctionOwnerRegion),
+		borrowed_parameter_owner_entries,
+		normalize_borrowed_owner_entries,
+		retain_borrowed_owned_uses,
+	../../../src/compiler/stage_09_core/perceus/env: PerceusEnv, build_env
+	string as Text
+	test: TestSuite
+
+
+private pure func variable(name: String, def_id: Option[Int]) -> CoreVar:
+	{
+		name = name,
+		id = 0,
+		def_id = def_id,
+		origin = AuthoredBinder
+	}
+
+
+private pure func string_type() -> CoreType:
+	NamedType("String", [])
+
+
+private pure func result_type() -> CoreType:
+	StackResultType(
+		string_type(),
+		NamedType("Int", []),
+	)
+
+
+private pure func parameter(def_id: Option[Int]) -> CoreParam:
+	{
+		name = variable("value", def_id),
+		typ = string_type(),
+		loc = synthetic_core_source_loc()
+	}
+
+
+private pure func environment() -> PerceusEnv:
+	build_env({
+		decls = [
+			UnionDecl({
+				abi_type = None,
+				name = "Result",
+				type_params = [],
+				storage = ManagedPayloadStorage(ErasedUnionPayloadStorage),
+				variants = [
+					{
+						name = "Ok",
+						tag = 0,
+						def_id = Some(1000),
+						fields = [
+							{
+								typ = string_type(),
+								release_policy = ArcReleasePolicy
+							},
+						]
+					},
+				],
+				loc = synthetic_core_source_loc(),
+			}),
+		],
+		foreign_includes = [],
+		source_files = [],
+	})
+
+
+private pure func match_case(name: String, body: CoreExpr) -> CoreConstructorMatchCase:
+	{
+		constructor = name,
+		accessor = RootAccessor,
+		test = UnionTagConstructorTest(VariantById(1001), ScalarTagAccess),
+		bindings = [],
+		body = ConstructorMatchBodyExpr(body)
+	}
+
+
+private pure func input(owner: CoreParam) -> CoreExpr:
+	value: CoreExpr = VarExpr(owner.name, string_type(), synthetic_core_source_loc())
+	fresh: CoreExpr = CallExpr(
+		BuiltinCall("blorp_string_concat"),
+		VoidExpr(
+			VoidType,
+			synthetic_core_source_loc(),
+		),
+		[value, value],
+		string_type(),
+		synthetic_core_source_loc(),
+	)
+	CallExpr(
+		UserCall(
+			"Ok",
+			Some(1000),
+			[],
+		),
+		VoidExpr(
+			VoidType,
+			synthetic_core_source_loc(),
+		),
+		[
+			ConstructorMatchExpr(
+				VarExpr(
+					variable("choice", None),
+					UnionType("Choice", ScalarTagValue),
+					synthetic_core_source_loc(),
+				),
+				NoReleasePolicy,
+				[match_case("Keep", value), match_case("Other", value), match_case("Fresh", fresh)],
+				ConstructorMatchFallbackFail,
+				string_type(),
+				synthetic_core_source_loc(),
+			),
+		],
+		result_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+private pure func branches_are_owned_once(owner: CoreParam, rewritten: CoreExpr) -> Bool:
+	match rewritten:
+		CallExpr(_, _, [ConstructorMatchExpr(_, _, [keep, other, fresh], _, _, _)], _, _):
+			kept: Bool = match keep.body:
+				ConstructorMatchBodyExpr(DupExpr(value, _, _, VarExpr(_, _, _), _, _)):
+					value.name == owner.name.name and value.def_id == owner.name.def_id
+				_:
+					False
+
+			other_kept: Bool = match other.body:
+				ConstructorMatchBodyExpr(DupExpr(value, _, _, VarExpr(_, _, _), _, _)):
+					value.name == owner.name.name and value.def_id == owner.name.def_id
+				_:
+					False
+
+			fresh_kept: Bool = match fresh.body:
+				ConstructorMatchBodyExpr(CallExpr(_, _, [VarExpr(_, _, _), VarExpr(_, _, _)], _, _)):
+					True
+				_:
+					False
+
+			kept and other_kept and fresh_kept
+		_:
+			False
+
+
+pure func test_unresolved_binding_retains_only_alias_branches() -> Bool:
+	owner = parameter(None)
+	branches_are_owned_once(
+		owner,
+		retain_borrowed_owned_uses(environment(), owner, input(owner)),
+	)
+
+
+pure func test_resolved_binding_retains_only_alias_branches() -> Bool:
+	owner = parameter(Some(301))
+	branches_are_owned_once(
+		owner,
+		retain_borrowed_owned_uses(environment(), owner, input(owner)),
+	)
+
+
+pure func test_parameter_catalog_retains_only_alias_branches() -> Bool:
+	owner = parameter(None)
+	env = environment()
+	entries = borrowed_parameter_owner_entries(env, [owner], [])
+	rewritten = normalize_borrowed_owner_entries(
+		env,
+		entries,
+		FunctionOwnerRegion,
+		result_type(),
+		input(owner),
+	)
+	branches_are_owned_once(owner, rewritten)
+
+
+pure func test_shadowed_binding_is_not_retained_for_outer_owner() -> Bool:
+	owner = parameter(None)
+
+	match input(owner):
+		CallExpr(kind, callee, [ConstructorMatchExpr(scrutinee, policy, [keep, other, fresh], fallback, typ, loc)], call_type, call_loc):
+			shadowed = { keep | bindings = [
+					{
+						variable = variable("value", None),
+						typ = string_type(),
+						accessor = RootAccessor,
+						mode = MatchBorrowBindingMode,
+						needs_release = False
+					},
+				] }
+			body = CallExpr(
+				kind,
+				callee,
+				[
+					ConstructorMatchExpr(
+						scrutinee,
+						policy,
+						[shadowed, other, fresh],
+						fallback,
+						typ,
+						loc,
+					),
+				],
+				call_type,
+				call_loc,
+			)
+
+			match retain_borrowed_owned_uses(environment(), owner, body):
+				CallExpr(_, _, [ConstructorMatchExpr(_, _, [first, _, _], _, _, _)], _, _):
+					match first.body:
+						ConstructorMatchBodyExpr(VarExpr(_, _, _)):
+							True
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+fixed union ResultChoice:
+	Keep
+	Other
+	Append
+
+
+private pure func fresh() -> Result[String, Int]:
+	Ok(Text.add("mortal", " string"))
+
+
+private pure func transform(choice: ResultChoice) -> Result[String, Int]:
+	value ?= fresh()
+	Ok(
+		match choice:
+			Keep:
+				value
+			Other:
+				value
+			Append:
+				Text.add(value, "!")
+	)
+
+
+pure func test_keeps_mortal_result() -> Bool:
+	match transform(Keep):
+		Ok(value):
+			value == "mortal string"
+		Err(_):
+			False
+
+
+pure func test_other_mortal_result() -> Bool:
+	match transform(Other):
+		Ok(value):
+			value == "mortal string"
+		Err(_):
+			False
+
+
+pure func test_appends_to_mortal_result() -> Bool:
+	match transform(Append):
+		Ok(value):
+			value == "mortal string!"
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Borrowed call match results",
+	tests = [
+		(
+			"unresolved binding retains only alias branches",
+			test_unresolved_binding_retains_only_alias_branches,
+		),
+		(
+			"resolved binding retains only alias branches",
+			test_resolved_binding_retains_only_alias_branches,
+		),
+		(
+			"parameter catalog retains only alias branches",
+			test_parameter_catalog_retains_only_alias_branches,
+		),
+		(
+			"shadowed binding is not retained for outer owner",
+			test_shadowed_binding_is_not_retained_for_outer_owner,
+		),
+		("keeps mortal result", test_keeps_mortal_result),
+		("other mortal result", test_other_mortal_result),
+		("appends to mortal result", test_appends_to_mortal_result),
+	]
+}
