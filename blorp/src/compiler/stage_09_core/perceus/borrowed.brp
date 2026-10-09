@@ -1091,6 +1091,11 @@ private pure func retain_borrowed_aggregate_value_with_temp(
 			nested_safe_value
 		UnionConstructExpr(construct, typ, loc):
 			nested_safe_value
+		IfExpr(_, _, _, _, _) | LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | SeqExpr(_, _) | LiteralMatchExpr(_, _, _, _, _) | AccessorLiteralMatchExpr(_, _, _, _, _) | LengthMatchExpr(_, _, _, _, _) | ConstructorMatchExpr(_, _, _, _, _, _):
+			-- A transfer can select an already-owned result or a borrowed alias.
+			-- Retain only the alias branch: retaining the whole result would leak
+			-- the reference returned by a fresh-producing branch.
+			retain_borrowed_param_result(env, param, nested_safe_value)
 		_:
 			if (
 				is_managed_type(env, core_expr_type(nested_safe_value))
@@ -1661,7 +1666,7 @@ private pure func protect_borrowed_param_call_args(
 			for arg in args:
 				match contract.args.get(index):
 					Some(mode):
-						if arg_consumes_caller(mode) and borrow_expr_aliases_param(env, param, arg):
+						if arg_consumes_caller(mode):
 							temp: CoreVar = synthetic_borrowed_result_var(
 								BorrowedResultCallArg,
 								param.name,
@@ -3321,6 +3326,13 @@ private pure func normalize_borrowed_call_args(
 			SkipBorrowedCalls:
 				False
 
+		argument_mode: BorrowedChildMode = if consumes:
+			-- Each result-producing branch must supply an owner to a consuming
+			-- argument, even when the enclosing call itself has no managed result.
+			{ ordinary_mode | result_position = BorrowedResultPosition }
+		else:
+			ordinary_mode
+
 		aggregate_arg: Bool = borrowed_call_materializes_aggregate(arg)
 
 		pre_normalization_owner_id: Option[Int] = if consumes and aggregate_arg:
@@ -3364,9 +3376,9 @@ private pure func normalize_borrowed_call_args(
 							arg,
 						)
 					None:
-						normalize_borrowed_child(facts, state, ordinary_mode, arg)
+						normalize_borrowed_child(facts, state, argument_mode, arg)
 			None:
-				child: CoreExpr = normalize_borrowed_child(facts, state, ordinary_mode, arg)
+				child: CoreExpr = normalize_borrowed_child(facts, state, argument_mode, arg)
 
 				post_normalization_owner_id: Option[Int] = if consumes and not aggregate_arg:
 					first_borrowed_owner_aliasing_expr(
