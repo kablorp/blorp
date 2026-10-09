@@ -1049,3 +1049,309 @@ findings; the independent test-runner verified the gates and comparisons.
 | Normal pilot compiler | `b32a9aa14766d4b1e685fe34a32f83f70371de2cf059de6ac8e51bc98ab71e46` |
 | Diagnostic pilot compiler | `37ab2096c3ac3be4fd01ecf9a0859c3a5322132d8bf8af025358ce66b9232a20` |
 | Cache input manifest | `05526b05766bb07755c8d840887b39ddafaba5f05376bc97a795510c0994314d` |
+
+## Signed integer increment: preimplementation guardrails
+
+This increment starts at `e4fd57d54`. It replaces the `Zero`/`One` value
+union with signed 64-bit decimal literal values. The lexer owns spelling and
+token boundaries; parsing converts and validates the range before publishing
+an `Int`; checking and emission consume that value. Arithmetic operators,
+other numeric types and unary negation of expressions are outside this slice.
+
+Before implementation, the production source ceiling is **1,780 lines**
+(baseline 1,662), and the suite/support ceiling is **3,900 lines** (baseline
+3,439). Raw fixtures are counted separately (baseline 36 lines).
+All seven existing e2e allocation and instruction ceilings remain unchanged.
+The additional matched allocation ceiling is each fixture's freshly measured
+baseline; the additional retired-instruction ceiling is its three-run minimum
+plus 2%, rounded down. A repeatable failure requires investigation and a
+bounded rescope; limits are not raised during implementation.
+
+A new `return_42` fixture returning 42 has initial limits of **230
+managed allocations** and **26,000,000 retired instructions**. Native endpoint
+checks must compare full `int64_t` values against independently specified C
+constants, rather than depending on the narrowing process-exit conversion.
+All previous fixture C must remain byte-identical, and diagnostics must check
+message, help and the complete literal's source span. Tests are Blorp
+`TestSuite` callbacks, including the native C-harness orchestration.
+
+These are owned-input whole-process compiler measurements. The pilot still
+cannot compile its own source; this increment does not present the proxy as
+self-compilation or measure a newly built host compiler. Matched baseline
+artifacts, samples and cache provenance are captured before compiler edits in
+`blorp_2/build/guardrails/int-literals-baseline/`.
+
+Independent baseline validation passed **17/17 callbacks** across five native
+suites. All seven C outputs and native exit/silence checks passed. The host
+was FRESH with the same SHA-256 as the preceding increment, and warm setup
+performed zero C generations and zero links. The snapshot contains 36
+source/test/document/build-input files and all four cached compiler artifacts.
+Baseline logs and the report are in `int-literals-baseline-validation/` under
+the ignored guardrails directory; scratch artifacts are in
+`/tmp/blorp-2-int-literals-baseline.nNFQNf/`.
+
+| Fixture | Baseline allocations / additional ceiling | Three-run minimum | Additional instruction ceiling |
+| --- | ---: | ---: | ---: |
+| `return_zero` | 116 | 18,959,135 | 19,338,317 |
+| `call_one` | 225 | 19,050,621 | 19,431,633 |
+| `pure_calls` | 360 | 19,223,086 | 19,607,547 |
+| `nested_calls` | 414 | 19,301,461 | 19,687,490 |
+| `nested_order` | 449 | 19,323,208 | 19,709,672 |
+| `ufcs_calls` | 416 | 19,249,908 | 19,634,906 |
+| `ufcs_chain` | 453 | 19,278,467 | 19,664,036 |
+
+All three baseline instruction samples, in execution order:
+
+- `return_zero`: 19,043,557; 18,959,135; 18,984,905.
+- `call_one`: 19,223,530; 19,053,775; 19,050,621.
+- `pure_calls`: 19,329,808; 19,248,028; 19,223,086.
+- `nested_calls`: 19,461,659; 19,301,461; 19,305,779.
+- `nested_order`: 19,448,651; 20,250,304; 19,323,208.
+- `ufcs_calls`: 19,595,986; 19,249,908; 19,307,306.
+- `ufcs_chain`: 19,492,749; 19,278,467; 19,310,560.
+
+During design, the user requested `src/prelude_temp.brp` as the temporary
+input-program prelude boundary. This same increment may move the currently
+needed target `Int` spelling and range constants into that module, with one
+authority and a module test. Name IDs remain owned by the names module;
+the parser still owns conversion and range rejection. This is a compiler-side
+contract, not a claim that target imports, prelude loading or union declarations
+are implemented. `Bool` is planned as an ordinary union. The host standard
+library remains a temporary compiler dependency. Numerical ceilings above
+stay unchanged.
+
+### Rejected initial integer-literal candidate
+
+The behavioral test returning 42 failed before implementation (one new
+failure, four existing passes); its log is `int64-literals-red.log` under the
+ignored guardrails directory. A structural red test for the new temporary
+prelude also ran before that module existed. The first formatted source
+checkpoint was 1,788 lines, eight over the ceiling. A duplicate `text` import
+also prevented the cached build. Consolidating the import and sharing the
+range-failure branch brought production to 1,778 lines. Generated C confirmed
+short-circuiting before the guarded multiplication.
+
+The first native gate passed **17/18 callbacks**, but the candidate was rejected:
+`pure_calls` used 364 allocations, exceeding its unchanged 360 limit.
+All seven existing C outputs and native results were correct. Costs also
+exceeded every additional matched allocation ceiling by four allocations per
+written literal. Generic integer formatting, a digit substring and eager
+construction of an invalid-literal diagnostic were visible in generated C;
+the observed count change aligned with these sites. This is mechanism evidence,
+not an isolated allocation attribution experiment.
+
+| Fixture | Initial candidate allocations | Initial candidate minimum instructions |
+| --- | ---: | ---: |
+| `return_zero` | 120 | 18,997,966 |
+| `call_one` | 229 | 19,079,332 |
+| `pure_calls` | 364 | 19,205,061 |
+| `nested_calls` | 418 | 19,239,664 |
+| `nested_order` | 461 | 19,283,516 |
+| `ufcs_calls` | 420 | 19,257,061 |
+| `ufcs_chain` | 465 | 19,338,557 |
+| new `return_42` | 123 | 18,940,498 |
+
+Instruction samples, in execution order:
+
+- `return_zero`: 20,227,259; 19,015,593; 18,997,966.
+- `call_one`: 19,235,790; 19,079,332; 19,147,679.
+- `pure_calls`: 19,365,008; 19,230,845; 19,205,061.
+- `nested_calls`: 19,404,720; 19,239,664; 19,833,435.
+- `nested_order`: 19,393,222; 19,283,516; 19,320,611.
+- `ufcs_calls`: 19,437,367; 19,275,500; 19,257,061.
+- `ufcs_chain`: 19,464,365; 19,338,557; 19,343,889.
+- `return_42`: 19,168,825; 18,947,941; 18,940,498.
+
+Candidate source, C and logs were preserved before a bounded rescope: construct
+diagnostics only on errors and emit directly into the local output builder,
+instead of making intermediate integer/body strings. This does not introduce
+0/1 fast paths or preserve original spellings after parsing. All numerical
+ceilings remain unchanged.
+
+### Revised allocation policy
+
+After reviewing the initial experiment, the user instructed us not to be
+strict about small allocation changes: the priorities are doing less work
+and keeping code clean and clear. This supersedes the additional
+matched-baseline allocation rejection rule above. Matched allocation deltas
+remain evidence, not an acceptance ceiling. Existing e2e ceilings serve as
+broad regression checks; if necessary, the `pure_calls` allocation ceiling
+may deliberately move from 360 to 400, with the actual change recorded here.
+Other fixture allocation ceilings and all instruction thresholds are
+unchanged. No ceiling changes happen automatically.
+
+Lazy diagnostic construction and direct emission still remove unnecessary
+work; they are not justification for allocation-specific literal fast paths
+or less readable source. Minimum-value emission uses the standard C
+`INT64_MIN` macro rather than constructing an intermediate magnitude.
+
+The next checkpoint had **1,779 production lines**. Exact C and native
+results again passed for all eight measured inputs. Its cost suite reported
+17/18 passes only because it still used the old 360-allocation purity limit;
+that test now deliberately uses **400**, consistent with the user's revised
+policy. No other allocation limit changed. All additional instruction
+thresholds held. This checkpoint is accepted for correctness-test expansion;
+independent final validation follows after the source/tests/documents freeze.
+
+| Fixture | Allocations | Matched change | Minimum instructions |
+| --- | ---: | ---: | ---: |
+| `return_zero` | 119 | +3 | 18,972,636 |
+| `call_one` | 228 | +3 | 19,092,396 |
+| `pure_calls` | 363 | +3 | 19,223,450 |
+| `nested_calls` | 417 | +3 | 19,261,626 |
+| `nested_order` | 459 | +10 | 19,301,623 |
+| `ufcs_calls` | 419 | +3 | 19,338,959 |
+| `ufcs_chain` | 463 | +10 | 19,328,810 |
+| `return_42` | 122 | new | 18,966,031 |
+
+Checkpoint samples (`int64-builder-costs.log`), in execution order:
+
+- `return_zero`: 20,240,439; 19,033,888; 18,972,636.
+- `call_one`: 19,196,061; 19,092,396; 19,120,417.
+- `pure_calls`: 19,354,231; 19,223,450; 19,295,750.
+- `nested_calls`: 19,428,305; 19,261,626; 19,315,331.
+- `nested_order`: 19,502,894; 19,301,623; 19,601,230.
+- `ufcs_calls`: 19,435,785; 19,400,814; 19,338,959.
+- `ufcs_chain`: 19,493,518; 19,750,292; 19,328,810.
+- `return_42`: 19,050,330; 18,966,031; 18,970,966.
+
+The user then replaced the temporary string-based type-name export with the
+ordinary declaration `type Int = builtin` in `prelude_temp.brp`.
+`INT_TYPE_NAME` is removed. Parsing still seeds the known `Int` name before
+publication, as it did at the baseline; parsing/resolving target prelude
+declarations is a future increment. The proposed correction kept shared
+range bounds in the temporary module; host compatibility had not yet been
+validated. The pilot still did not read the target declaration. Source and
+tests needed to be re-frozen after this correction.
+
+The host then rejected that local builtin declaration: `'type Int = builtin'
+can only be used in the standard library` (`int64-prelude-declaration-test.log`).
+It also produced ambiguous/nominal `Int` errors when the staged module was
+imported by the compiler implementation. No host compiler change or new
+contract framework was introduced. The bounded resolution leaves
+`src/prelude_temp.brp` as the requested target-source declaration only, and
+does not import it into the host-built compiler. Parsing and emission use
+the existing host `int` module's range constants, consistent with the pilot's
+already documented temporary standard-library dependency.
+
+The staged declaration is not yet an implementation module and cannot be
+exercised by a host module-import unit test. Its failed import test was
+retained as evidence, not turned into a source-text assertion. Numeric bounds,
+name identity and full-width emitted values remain covered by their owning
+unit/native tests. Parsing/resolving/loading this target prelude is explicitly
+deferred rather than implied to work.
+
+### Final signed-integer evidence
+
+The frozen normal `make -C blorp_2 test` run passed **131/131 callbacks across
+17 TestSuites**: 85 unit, 26 grammar and 20 end-to-end callbacks. The final
+source directory contains **1,773 lines (+111)**, including the staged target
+prelude; suite/support code is **3,764 (+325)** and raw fixtures are **44 (+8)**.
+All predeclared line ceilings held. All eight host-compiled implementation
+modules retain unit suites; the target-only prelude declaration is explicitly
+uncompiled and deferred.
+
+Tests cover signed decimal values, negative zero, both endpoints, adjacent
+overflow on each side, long digit runs, malformed independently constructed
+tokens, leading zeros, sign adjacency and UFCS/direct argument composition.
+Error assertions include message, help and complete token spans. The CLI
+overflow test requires exit 1 and exact diagnostic output, and verifies that
+failure neither creates C nor overwrites an existing output file.
+
+The Blorp TestSuite in `test/e2e/test_integer_literals.brp` compiles an
+independent strict C11/O2 driver using `-fsanitize=undefined` and
+`-fno-sanitize-recover=all`. It renames the emitted C entry wrapper and compares
+helper returns directly against `INT64_MIN` and `INT64_MAX`, without narrowing
+them to process status. The valid driver exits 0 silently. A checked mutation
+replaces the actual emitted minimum with zero; the same driver must exit 1
+silently. Retained driver/program C is under the ignored guardrails directory
+as `int64-endpoint-driver.c`, `int64-endpoint-wrong-driver.c` and
+`int64-endpoints.c`. This fault proof is part of the maintained TestSuite.
+
+Normal costs (`int64-full-final.log`):
+
+| Fixture | Allocations | Change | Minimum instructions |
+| --- | ---: | ---: | ---: |
+| `return_zero` | 119 | +3 | 18,957,287 |
+| `call_one` | 228 | +3 | 19,115,564 |
+| `pure_calls` | 363 | +3 | 19,281,737 |
+| `nested_calls` | 417 | +3 | 19,355,281 |
+| `nested_order` | 459 | +10 | 19,360,344 |
+| `ufcs_calls` | 419 | +3 | 19,396,972 |
+| `ufcs_chain` | 463 | +10 | 19,352,293 |
+| `return_42` | 122 | new | 18,986,211 |
+
+All eight broad allocation/instruction ceilings held, including the revised
+400-allocation purity limit. All seven additional matched instruction
+thresholds held. Allocation deltas are reported under the revised policy;
+they are not a rejection threshold. The normal run reused the warm compiler
+cache with zero C generations or links.
+
+All three normal instruction samples, in execution order:
+
+- `return_zero`: 19,171,226; 18,957,287; 19,014,534.
+- `call_one`: 21,097,729; 19,316,182; 19,115,564.
+- `pure_calls`: 19,449,524; 19,281,737; 19,347,083.
+- `nested_calls`: 19,528,171; 19,355,281; 19,410,009.
+- `nested_order`: 19,540,119; 19,360,344; 19,425,747.
+- `ufcs_calls`: 19,464,065; 19,416,594; 19,396,972.
+- `ufcs_chain`: 19,482,152; 19,352,293; 19,410,903.
+- `return_42`: 19,200,466; 18,986,211; 19,005,599.
+
+Independent final validation audited that frozen normal run and then executed
+the complete three-root UBSan/leak suite: **131/131 callbacks across 17 suites**
+passed again, with no sanitizer or leak errors. The runner did not redundantly
+rerun the already green normal suite. The additional instruction thresholds
+and all broad e2e caps held in both runs; allocations were identical between
+them. All seven retained existing-fixture C files compare byte-identical to
+the frozen baseline, and the retained endpoint C matches its driver input.
+
+Commands for the final worker/independent gates were:
+
+```bash
+make -C blorp_2 test
+scripts/compiler-build-status
+make -C blorp_2 test-compiler
+bin/blorp test --suite --sanitize=undefined --leak-check --timeout 180 \
+  blorp_2/test/unit blorp_2/test/e2e blorp_2/test/test_grammar
+```
+
+All three instruction samples during independent sanitizer validation:
+
+- `return_zero`: 19,127,185; 18,950,927; 18,988,841.
+- `call_one`: 19,209,847; 19,127,843; 19,154,411.
+- `pure_calls`: 19,385,156; 19,246,331; 19,243,724.
+- `nested_calls`: 19,458,254; 19,369,724; 19,331,388.
+- `nested_order`: 19,529,706; 19,821,308; 19,318,651.
+- `ufcs_calls`: 19,458,517; 19,327,963; 19,335,698.
+- `ufcs_chain`: 19,522,585; 19,352,097; 19,349,611.
+- `return_42`: 19,160,797; 18,995,914; 19,016,590.
+
+UBSan instruments the host-built TestSuites and imported pilot implementation
+modules. The endpoint driver also independently instruments actual emitted C.
+The cached native compiler used for instruction children is the normal `-O2`
+build; allocation children use its diagnostic counterpart with strict
+zero-leak checks, without extra native UBSan flags. The target-only staged
+prelude is not compiled or loaded. These remain owned-input compilation
+proxies, not pilot self-compilation or elapsed-speed claims.
+
+The host remains FRESH and unchanged. Before/after source, test, README,
+grammar and Makefile fingerprints match. All four cached artifacts' SHA-256,
+timestamps, sizes and inodes are unchanged across independent warm setup and
+sanitizer execution: **zero C generations and zero compiler links**. Formatting
+passed for 28 maintained Blorp files, with raw fixtures/build files excluded;
+whitespace and diff checks passed. The obsolete-constructor scan found only
+the intentionally case-distinct user function `One` in an existing regression.
+
+Code review approved source, tests, README and grammar with zero findings.
+The full independent report, hashes, retained C and 48 final instruction
+samples are under `blorp_2/build/guardrails/int64-independent-hUuKdf/` and
+`/tmp/blorp-2-int64-validation.hUuKdf/`.
+
+| Final artifact | SHA-256 |
+| --- | --- |
+| Host `bin/blorp` | `c67d5bb315a67999ec5d608eaa41aab83f8d75e6220b44b936ea2a4849b7ba0a` |
+| Shared compiler C | `acd5665ff9cd95cc1ef1af7d6e3c084d276b46558d465ce37e1857d583b99513` |
+| Normal pilot compiler | `ae4f6c5364a14305fb80caa33da3212d25c7f2d5ba8176b4833f2e86fb7d4b29` |
+| Diagnostic pilot compiler | `cebef194dc44c8d880f0aaea78302122bf1c62f273392647f4ee2b20d94a249b` |
+| Cache input manifest | `344f814a984c63b4be6eb6f72043eb07aa79493ae25be97672ba807bb2f23d44` |
