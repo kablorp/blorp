@@ -2,8 +2,9 @@
 
 Status: scalar bindings, match-arm blocks and straight-line managed Strings
 implemented and validated with unit, grammar, native and sanitizer checks,
-2026-10-09. Exact per-object runtime observations await approval of the explicit
-test mode below. Broader host-compiler gate limitations are recorded in the
+2026-10-09. Granular compiler-stage tests and direct C runtime tests are
+implemented; production event tracing is deferred. Broader
+host-compiler gate limitations are recorded in the
 [increment evidence](../benchmarks/results/blorp_2_managed_strings_2026-10-09.md).
 Read [AGENTS.md](AGENTS.md) and the parent instructions first.
 [README.md](README.md) owns the supported scope. Examples below distinguish
@@ -162,23 +163,21 @@ growth above 25% on any existing fixture. New managed fixtures initially allow
 20,000 compiler allocations and 200 million retired instructions. Native target
 allocation/RC observations are separate from these compiler costs.
 
-Exact runtime lifetime observations need an explicit test boundary. The proposed
-boundary, awaiting user approval, is a C compile option `-DBLORP_TEST_MEMORY=1`.
-It would record allocation, retain, release and final destruction at the operation
-point, using a process-local object identity distinct from compiler OwnerIds.
-The existing Blorp TestSuite would run the unchanged fixture's normal `main`
-and assert exact stderr events. For the first example:
+The approved validation boundary separates compiler behavior from runtime
+behavior. Blorp unit tests construct small typed inputs for lowering, last-use
+analysis, ownership insertion, independent verification and emission. Emitter
+tests use independently written expectations for small ownership bodies; a
+missing or incorrectly targeted release must fail its own callback.
 
-```text
-allocate object=0 refs=1
-release object=0 refs=0
-destroy object=0
-```
-
-Normal builds would produce no events. This would add no source-language test
-intrinsics, alternate entrypoint, generated-C rewriting or native assertion
-driver. Ordinary execution plus sanitizers is the simpler existing path, but
-cannot independently observe exact nonfinal/final release behavior.
+Direct C unit tests exercise the same String runtime fragment that emission
+uses. Blorp `TestSuite` compiles that fragment with a retained C test file and
+runs named cases for decimal bytes/length, reference-count transitions, nonfinal
+release and final destruction. Small allocator wrappers confined to the C test
+delegate to real allocation/free and observe calls; sanitizers check accessed
+memory and invalid frees. Tests never inspect a value after its final release.
+This adds no production hook, event mode or general allocator framework.
+Per-object execution tracing is deferred until a concrete supported feature
+needs evidence these separate tests cannot provide.
 
 ## First managed example and conservative ABI
 
@@ -317,8 +316,8 @@ inserter's intended edits. A balanced RC total can still hide a leaked child,
 wrong owner, wrong branch or invalid order.
 
 Compiler verification relies on explicit runtime contracts; it cannot by itself
-prove their C implementation. Separate Blorp-orchestrated runtime tests must
-observe mortal per-object lifetime events, nonfinal/final release, each owned
+prove their C implementation. Separate Blorp-orchestrated C runtime tests must
+observe mortal lifetime behavior, nonfinal/final release, each owned
 child, each union variant, inline children and supported immortal storage.
 Intentionally omit a required child drop and require the destruction oracle
 and leak check to fail. Test the planner against declared shape independently
@@ -328,9 +327,8 @@ both producer and oracle agree. ASan/UBSan/leak checks supplement these tests.
 ## Phase-level test contract
 
 Status: the straight-line String slice has direct representation, ABI, use,
-ownership-insertion, verification and emission tests. Native and sanitizer
-validation passes; exact per-object runtime observations await approval of the
-explicit test mode above. The matrix also contains requirements for future
+ownership-insertion, verification and emission tests, plus direct C runtime
+tests without production tracing. The matrix also contains requirements for future
 features, including managed aggregates, branches, COW and reuse. Add those
 tests with each supported feature, before its implementation; do not build
 unused passes or placeholder suites to fill this matrix. Unmanaged union
@@ -389,15 +387,70 @@ operation/edge, rather than accepting any error. Source-facing failures also
 pin message, help and span.
 
 Compare semantic identities, ownership relationships and safety-critical order.
-Avoid whole-program text snapshots or exact retain counts where several legal
-placements exist; cost ceilings are separate checks. Runtime probes use mortal
-allocations, surviving aliases, and per-object lifetime events to check which
-object is destroyed and when. Blorp `TestSuite` suites register the tests and
-assert their exact outcomes. Prefer source fixtures compiled by the pilot and
-their normal entrypoints. A native probe outside that path needs explicit
-approval for a concrete supported ownership behavior, as required by
+Use independently expected C for small operation-specific emitter cases; avoid
+large whole-program snapshots or exact retain counts where several legal
+placements exist. Cost ceilings are separate checks. Direct C runtime tests
+use mortal allocations, surviving references and observed allocator calls to
+check nonfinal and final release. They run the actual runtime implementation;
+they do not establish that every source program emits the right operations.
+Blorp `TestSuite` suites register the tests and assert their exact outcomes.
+Source integration fixtures still compile with the pilot and use their normal
+entrypoints. Other native probes need explicit approval for a concrete supported
+ownership behavior, as required by
 [AGENTS.md](AGENTS.md#get-approval-before-adding-mechanisms-or-implicit-behavior).
-This plan does not authorize C assertion drivers in advance. No Python tests.
+The direct String-runtime C tests are the approved exception. No Python tests.
+
+The current stage tests exercise the following concrete cases independently:
+
+| Boundary | Cases and owning tests |
+| --- | --- |
+| Value lowering | Managed self-assignment creates no value; chained aliases share the original computed value. [test_lower.brp](test/unit/test_lower.brp) stops at lowering. |
+| Last-use analysis | Unused definitions remain unmarked; returns extend liveness through the tail; zero-argument calls add no operand use; malformed definition, argument and return identities have exact diagnostics. [test_own.brp](test/unit/test_own.brp) supplies definitions directly. |
+| Ownership insertion | Independent owners drop at their separate final uses; unused owners drop while a different owner transfers; repeated borrows require no acquisition. [test_own.brp](test/unit/test_own.brp) asserts complete operation sequences and dependencies. |
+| Independent verification | Acquired ownership survives the original owner's discharge and can transfer; independent owners may discharge in either legal order; acquisition from another value's owner rejects at that operation. Raw unmanaged matches independently require nonempty, exhaustive, useful arms and valid unique labels, including at most one final default. [test_verify.brp](test/unit/test_verify.brp) supplies raw ownership operations. |
+| C emission | Acquisition/drop/transfer order; exact independent-owner release operands; unused-result cleanup; repeated borrows without extra ARC; owned call result before argument cleanup. [test_emit.brp](test/unit/test_emit.brp) compares complete small ownership bodies. |
+| String runtime | Exact decimal bytes/length for zero, negative and both Int64 extrema; initial count; retain; usable storage after nonfinal release; exactly one final free; independent object lifetimes. [test_string_runtime.brp](test/runtime/test_string_runtime.brp) runs the retained C cases against the emitted runtime fragment. |
+
+The tests distinguish their authorities: minimal preparation obtains sealed
+checked inputs or opaque IDs, while later-stage semantic inputs are constructed
+directly. Runtime C tests establish primitive behavior; compiler tests establish
+which primitive calls and ownership operands emission produces. A few native
+source fixtures connect those boundaries.
+
+The memory-test validation increment added 20 Blorp unit callbacks and nine C
+runtime cases, and strengthened two existing managed emitter tests. At that
+snapshot, `make -C blorp_2 test` passed 276 unit callbacks, 57 grammar callbacks,
+all nine runtime cases and all 49 native language fixtures. The full unit suite
+also passed ASan/UBSan and strict leak checking. Five deliberate defects failed their
+targeted tests: first-use substituted for last-use, omitted emitted releases,
+skipped acquisition borrow validation, disabled final free, and retain by two.
+Production compiler/runtime sources were unchanged in that increment. Raw logs and independent
+reports are retained under `build/memory-tests-evidence/`.
+
+## Boundaries awaiting implementation
+
+The current public products support granular tests for checking, value lowering,
+straight-line uses/ownership, independent verification and C emission. Sealed
+products may require minimal preparation through their authority; that does
+not require running later compiler stages. Runtime String primitives are also
+ready for direct C tests. Unsupported managed shapes retain rejection tests.
+
+The following positive tests belong in the increment that admits their feature.
+Write them before implementation and require them before accepting support;
+do not add empty suites or speculative passes now.
+
+| Boundary not yet implemented | First required tests |
+| --- | --- |
+| Managed matches and joins | Only the selected branch runs; each edge transfers/discharges its owners; a borrowed result keeps its source owner alive. |
+| Managed fields and union payloads | Complete field plans; only active variant children are destroyed; nonfinal release preserves children; final release destroys each child exactly once. |
+| Recursive managed values | Bounded-stack destruction of a moderately deep value; every node destroyed once. Establish the destruction strategy before admitting recursion. |
+| COW and reuse | Shared updates preserve surviving aliases; unique updates use the intended path; incompatible capacity/layout falls back safely. Add with the first update/reuse operation. |
+| Collections and loops | Slot replacement/removal/growth; zero/one/many iterations; loop-carried owners and each supported exit. Add separately as those constructs enter the subset. |
+| Closures and escaping borrows | Captures keep owners alive through escape; final closure destruction releases captures. Add with closure support. |
+
+There is no separate optimization or ownership-specialization stage to test
+today. If one is introduced for a working example, test its own typed input and
+output, then rerun independent verification on the transformed operations.
 
 Each managed slice also needs a small integration fixture, generated-C
 inspection, ASan/UBSan/leak checks and a deliberate mutation that fails the

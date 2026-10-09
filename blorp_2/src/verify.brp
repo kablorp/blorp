@@ -619,6 +619,73 @@ private pure func unmanaged_definition(definition: ValueDefinition) -> OwnedDefi
 	}
 
 
+-- OwnershipProgram is public raw data: its reconstructed arms do not retain
+-- checking's sealed proof of coverage and usefulness. Re-establish that proof
+-- here so emission can project the accepted labels without repairing them.
+private pure func verify_match_arms(
+	matched: LoweredMatch,
+	unions: List[CheckedUnion],
+	span: Span,
+) -> Result[Bool, Diagnostic]:
+	nonempty ?= if IntOps.equals(matched.arms.length(), 0):
+		Err(failure(span, "match has no arms"))
+	else:
+		Ok(True)
+	declaration ?= unions
+		.get(union_number(matched.owner))
+		.to_result(failure(span, "unknown match union"))
+	var seen: List[Bool] = []
+
+	for _ in declaration.variants:
+		seen = seen.append(False)
+
+	var remaining = seen.length()
+	var has_default = False
+	var invalid: Option[Diagnostic] = None
+
+	for arm in matched.arms:
+		match arm.label:
+			DefaultLabel:
+				if has_default:
+					invalid = Some(failure(span, "match default appears more than once"))
+					break
+				else if IntOps.equals(remaining, 0):
+					invalid = Some(failure(span, "match default covers no remaining variants"))
+					break
+				else:
+					has_default = True
+			VariantLabel(id):
+				if IntOps.not_equals(union_number(variant_owner(id)), union_number(matched.owner)):
+					invalid = Some(failure(span, "match variant belongs to another union"))
+					break
+				else:
+					ordinal = variant_number(id)
+
+					match seen.get(ordinal):
+						None:
+							invalid = Some(failure(span, "unknown variant identity"))
+							break
+						Some(already_seen):
+							if already_seen:
+								invalid = Some(failure(span, "match variant appears more than once"))
+								break
+							else if has_default:
+								invalid = Some(failure(span, "match default must be the final arm"))
+								break
+							else:
+								seen = seen.set(ordinal, True)
+								remaining = IntOps.subtract(remaining, 1)
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			if not has_default and IntOps.not_equals(remaining, 0):
+				Err(failure(span, "match does not cover every variant"))
+			else:
+				Ok(True)
+
+
 private pure func verify_match(
 	matched: LoweredMatch,
 	state: VerificationState,
@@ -638,80 +705,62 @@ private pure func verify_match(
 	if not same_type(scrutinee.value_type, UnionType(matched.owner)):
 		Err(failure(scrutinee.span, "match scrutinee does not belong to its union"))
 	else:
+		valid_arms ?= verify_match_arms(matched, unions, scrutinee.span)
 		var next_value = state.next_value
 		var invalid: Option[Diagnostic] = None
 
 		for arm in matched.arms:
 			var branch = { state | next_value = next_value }
 
-			projection_result: Result[ProjectionContext, Diagnostic] = match arm.label:
+			projection = match arm.label:
 				DefaultLabel:
-					Ok(NoProjection)
+					NoProjection
 				VariantLabel(id):
-					if IntOps.not_equals(
-						union_number(variant_owner(id)),
-						union_number(matched.owner),
-					):
-						Err(failure(scrutinee.span, "match variant belongs to another union"))
-					else:
-						variant_shape(
-							id,
-							unions,
-							scrutinee.span,
-						).map(
-							pure func(
-								_: PayloadShape,
-							) -> ProjectionContext: PayloadProjection(matched.scrutinee, id),
+					PayloadProjection(matched.scrutinee, id)
+
+			for definition in arm.body.definitions:
+				match definition.value_type:
+					StringType:
+						invalid = Some(
+							failure(
+								definition.span,
+								"managed value appears in an unmanaged match",
+							),
 						)
+						break
+					_:
+						void
 
-			match projection_result:
-				Err(error):
-					invalid = Some(error)
+				match verify_definition(
+					unmanaged_definition(definition),
+					branch,
+					signature,
+					functions,
+					unions,
+					projection,
+				):
+					Ok(updated):
+						branch = updated
+					Err(error):
+						invalid = Some(error)
+						break
+
+			match invalid:
+				Some(_):
 					break
-				Ok(projection):
-					for definition in arm.body.definitions:
-						match definition.value_type:
-							StringType:
-								invalid = Some(
-									failure(
-										definition.span,
-										"managed value appears in an unmanaged match",
-									),
-								)
-								break
-							_:
-								void
-
-						match verify_definition(
-							unmanaged_definition(definition),
-							branch,
-							signature,
-							functions,
-							unions,
-							projection,
-						):
-							Ok(updated):
-								branch = updated
-							Err(error):
-								invalid = Some(error)
-								break
-
-					match invalid:
-						Some(_):
+				None:
+					match verify_return(
+						arm.body.result,
+						None,
+						branch,
+						signature.return_type,
+						unions,
+					):
+						Ok(_):
+							next_value = branch.next_value
+						Err(error):
+							invalid = Some(error)
 							break
-						None:
-							match verify_return(
-								arm.body.result,
-								None,
-								branch,
-								signature.return_type,
-								unions,
-							):
-								Ok(_):
-									next_value = branch.next_value
-								Err(error):
-									invalid = Some(error)
-									break
 
 		match invalid:
 			Some(error):

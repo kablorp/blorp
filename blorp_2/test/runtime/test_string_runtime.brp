@@ -1,0 +1,99 @@
+import:
+	../../src/string_runtime: string_runtime
+	fs: IOError, resource_path, temporary_directory
+	process: ProcessOutput, run
+	system: getenv, read_file, temp_dir, write_file
+	test: TestSuite, run_suite_result
+
+
+private func run_isolated(program: String, arguments: List[String]) -> Result[ProcessOutput, String]:
+	run(
+		"/usr/bin/env",
+		["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", program].concat(arguments),
+	)
+
+
+private func build_runtime_tests(directory: String) -> Result[String, String]:
+	runtime_written ?= write_file(directory + "/string_runtime.c", string_runtime())
+	test_source ?= read_file("blorp_2/test/runtime/fixtures/string_runtime_test.c")
+	test_written ?= write_file(directory + "/string_runtime_test.c", test_source)
+	executable = directory + "/string_runtime_test"
+	compiled ?= run_isolated(
+		getenv("BLORP_CC").get_or("clang"),
+		[
+			"-std=c11",
+			"-O0",
+			"-Wall",
+			"-Wextra",
+			"-Werror",
+			"-pedantic",
+			"-fsanitize=address,undefined",
+			"-fno-sanitize-recover=all",
+			directory + "/string_runtime_test.c",
+			"-o",
+			executable,
+		],
+	)
+	if compiled.exit_code() == 0 and compiled.stdout() == "" and compiled.stderr() == "":
+		Ok(executable)
+	else:
+		Err("String runtime C unit build failed: " + compiled.stderr())
+
+
+private func run_runtime_case(executable: String, name: String) -> Bool:
+	match run_isolated(executable, [name]):
+		Err(error):
+			print_error(error)
+			False
+		Ok(result):
+			if result.exit_code() == 0 and result.stdout() == "" and result.stderr() == "":
+				True
+			else:
+				print_error(
+					"String runtime case " + name + " exited " + result.exit_code().to_string()
+					+ "; stdout=" + result.stdout() + "; stderr=" + result.stderr(),
+				)
+				False
+
+
+private pure func runtime_suite(executable: String) -> TestSuite:
+	{
+		description = "Blorp 2 String runtime C unit invariants",
+		tests = [
+			("zero has exact decimal bytes and length", func(): run_runtime_case(executable, "zero")),
+			("negative has exact decimal bytes and length", func(): run_runtime_case(executable, "negative")),
+			("Int64 minimum has exact decimal bytes and length", func(): run_runtime_case(executable, "minimum")),
+			("Int64 maximum has exact decimal bytes and length", func(): run_runtime_case(executable, "maximum")),
+			("new String owns one reference", func(): run_runtime_case(executable, "initial_reference")),
+			("retain increments only the reference count", func(): run_runtime_case(executable, "retain")),
+			("nonfinal release preserves usable bytes", func(): run_runtime_case(executable, "nonfinal_release")),
+			("final release frees exactly one root", func(): run_runtime_case(executable, "final_release")),
+			("String objects have independent lifetimes", func(): run_runtime_case(executable, "independent_objects")),
+		]
+	}
+
+
+private func check_runtime() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp-2-runtime-"):
+		match build_runtime_tests(directory.resource_path()):
+			Err(error):
+				print_error(error)
+				Ok(False)
+			Ok(executable):
+				result = run_suite_result(runtime_suite(executable))
+				Ok(result[1] == 0)
+
+
+func test_runtime() -> Bool:
+	match check_runtime():
+		Ok(passed):
+			passed
+		Err(error):
+			print_error(error.to_string())
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 String runtime",
+	tests = [("compile runtime once and run C unit cases", test_runtime)]
+}

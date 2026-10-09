@@ -4,7 +4,7 @@ import:
 		ParameterShape(NoParameter, OneParameter),
 		TypeRef(IntType, StringType, UnionType),
 	../../src/lower:
-		CallArguments(OneArgument),
+		CallArguments(NoArguments, OneArgument),
 		LoweredTail(MatchValue),
 		MatchLabel(DefaultLabel),
 		ValueOperation(CallValue),
@@ -24,6 +24,30 @@ import:
 	../../src/prelude: RuntimeOperation(IntToString, StringLength)
 	ownership_inputs: function, input_ids, integer, parameter, runtime, span
 	test: TestSuite
+
+
+private pure func borrows_owner(
+	operation: OwnedValueOperation,
+	expected_value: Int,
+	expected_owner: Int,
+) -> Bool:
+	match operation:
+		CallDefinition(_, BorrowedArgument(borrow)):
+			match borrow.source:
+				OwnerBorrow(owner):
+					value_number(borrow.value) == expected_value and owner_number(owner) == expected_owner
+				_:
+					False
+		_:
+			False
+
+
+private pure func owns_result(result: ResultOwnership, expected_owner: Int) -> Bool:
+	match result:
+		OwnedResult(owner):
+			owner_number(owner) == expected_owner
+		_:
+			False
 
 
 pure func test_string_has_an_explicit_managed_leaf_plan() -> Bool:
@@ -76,6 +100,235 @@ pure func test_last_use_keeps_the_final_borrow_and_return() -> Bool:
 			):
 				Ok(uses):
 					uses == [Some(1), Some(3), None, Some(4)]
+				_:
+					False
+
+
+pure func test_last_use_leaves_an_unused_definition_unmarked() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match last_uses([integer(ids.first, 7, 10), integer(ids.second, 0, 20)], ids.second):
+				Ok(uses):
+					uses == [None, Some(2)]
+				_:
+					False
+
+
+pure func test_last_use_marks_a_returned_string_at_the_tail() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match last_uses(
+				[
+					integer(ids.first, 7, 10),
+					runtime(ids.second, IntToString, OneArgument(ids.first), StringType, 20),
+				],
+				ids.second,
+			):
+				Ok(uses):
+					uses == [Some(1), Some(2)]
+				_:
+					False
+
+
+pure func test_last_use_does_not_invent_a_zero_argument_operand() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			call = {
+				id = ids.second,
+				value_type = IntType,
+				operation = CallValue(
+					{ target = UserFunction(ids.second_function), span = span(20) },
+					NoArguments,
+				),
+				span = span(20)
+			}
+
+			match last_uses([integer(ids.first, 7, 10), call], ids.second):
+				Ok(uses):
+					uses == [None, Some(2)]
+				_:
+					False
+
+
+pure func test_last_use_rejects_nonconsecutive_definition_ids() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match last_uses([integer(ids.first, 7, 10), integer(ids.third, 0, 20)], ids.first):
+				Err(error):
+					(
+						error.message == "internal compiler error: nonconsecutive value identity in ownership use analysis"
+						and error.help == "report this compiler error with the input program"
+						and error.span == span(20)
+					)
+				_:
+					False
+
+
+pure func test_last_use_rejects_an_unknown_argument_id() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match last_uses(
+				[
+					integer(ids.first, 7, 10),
+					runtime(ids.second, StringLength, OneArgument(ids.third), IntType, 20),
+				],
+				ids.second,
+			):
+				Err(error):
+					(
+						error.message == "internal compiler error: invalid value identity in ownership use analysis"
+						and error.help == "report this compiler error with the input program"
+						and error.span == span(20)
+					)
+				_:
+					False
+
+
+pure func test_last_use_rejects_an_unknown_return_id() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match last_uses([integer(ids.first, 7, 10)], ids.second):
+				Err(error):
+					(
+						error.message == "internal compiler error: invalid return value in ownership use analysis"
+						and error.help == "report this compiler error with the input program"
+						and error.span == { start = 0, end = 0 }
+					)
+				_:
+					False
+
+
+pure func test_distinct_owners_drop_at_their_separate_final_uses() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match insert_function(
+				function(
+					[
+						parameter(ids.first, IntType),
+						runtime(ids.second, IntToString, OneArgument(ids.first), StringType, 20),
+						runtime(ids.third, IntToString, OneArgument(ids.first), StringType, 30),
+						runtime(ids.fourth, StringLength, OneArgument(ids.second), IntType, 40),
+						runtime(ids.fifth, StringLength, OneArgument(ids.third), IntType, 50),
+					],
+					ids.fifth,
+					OneParameter(IntType),
+					IntType,
+				),
+				[],
+			):
+				Ok(output):
+					match output.operations:
+						[DefineValue(_), DefineValue(first), DefineValue(second), DefineValue(first_length), DropOwner(first_drop, first_at), DefineValue(second_length), DropOwner(second_drop, second_at)]:
+							match output.tail:
+								UnmanagedReturn(result):
+									(
+										owns_result(first.result, 0)
+										and owns_result(second.result, 1)
+										and borrows_owner(first_length.operation, 1, 0)
+										and borrows_owner(second_length.operation, 2, 1)
+										and owner_number(first_drop) == 0
+										and first_at == span(40)
+										and owner_number(second_drop) == 1
+										and second_at == span(50)
+										and value_number(result) == 4
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_owned_return_drops_a_different_unused_owner() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match insert_function(
+				function(
+					[
+						integer(ids.first, 7, 10),
+						runtime(ids.second, IntToString, OneArgument(ids.first), StringType, 20),
+						runtime(ids.third, IntToString, OneArgument(ids.first), StringType, 30),
+					],
+					ids.third,
+					NoParameter,
+					StringType,
+				),
+				[],
+			):
+				Ok(output):
+					match output.operations:
+						[DefineValue(_), DefineValue(unused), DropOwner(dropped, at), DefineValue(returned)]:
+							match output.tail:
+								OwnedReturn(value, transferred):
+									(
+										owns_result(unused.result, 0)
+										and owner_number(dropped) == 0
+										and at == span(20)
+										and owns_result(returned.result, 1)
+										and value_number(value) == 2
+										and owner_number(transferred) == 1
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_repeated_borrows_reuse_one_owner_without_acquisition() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match insert_function(
+				function(
+					[
+						integer(ids.first, 7, 10),
+						runtime(ids.second, IntToString, OneArgument(ids.first), StringType, 20),
+						runtime(ids.third, StringLength, OneArgument(ids.second), IntType, 30),
+						runtime(ids.fourth, StringLength, OneArgument(ids.second), IntType, 40),
+					],
+					ids.fourth,
+					NoParameter,
+					IntType,
+				),
+				[],
+			):
+				Ok(output):
+					match output.operations:
+						[DefineValue(_), DefineValue(string), DefineValue(first), DefineValue(last), DropOwner(dropped, at)]:
+							match output.tail:
+								UnmanagedReturn(result):
+									(
+										owns_result(string.result, 0)
+										and borrows_owner(first.operation, 1, 0)
+										and borrows_owner(last.operation, 1, 0)
+										and owner_number(dropped) == 0
+										and at == span(40)
+										and value_number(result) == 3
+									)
+								_:
+									False
+						_:
+							False
 				_:
 					False
 
@@ -444,6 +697,15 @@ pure func test_unused_managed_match_arm_value_is_rejected() -> Bool:
 tests: TestSuite = {
 	description = "Blorp 2 ownership insertion",
 	tests = [
+		("last use leaves unused value unmarked", test_last_use_leaves_an_unused_definition_unmarked),
+		("last use extends String through return", test_last_use_marks_a_returned_string_at_the_tail),
+		("last use skips absent call operand", test_last_use_does_not_invent_a_zero_argument_operand),
+		("last use rejects nonconsecutive IDs", test_last_use_rejects_nonconsecutive_definition_ids),
+		("last use rejects unknown argument ID", test_last_use_rejects_an_unknown_argument_id),
+		("last use rejects unknown return ID", test_last_use_rejects_an_unknown_return_id),
+		("distinct owners drop at separate final uses", test_distinct_owners_drop_at_their_separate_final_uses),
+		("owned return drops other unused owner", test_owned_return_drops_a_different_unused_owner),
+		("repeated borrows never acquire owner", test_repeated_borrows_reuse_one_owner_without_acquisition),
 		("String has explicit managed leaf plan", test_string_has_an_explicit_managed_leaf_plan),
 		("scalar has no ownership", test_scalar_has_no_ownership),
 		("union plan requires declaration", test_union_plan_requires_its_declaration),
