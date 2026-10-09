@@ -1,0 +1,962 @@
+import:
+	../../src/check:
+		CallTarget(RuntimeFunction, UserFunction),
+		ParameterShape(NoParameter, OneParameter),
+		PayloadShape(NoPayload),
+		TypeRef(IntType, StringType, UnionType),
+	../../src/lower:
+		CallArguments(OneArgument),
+		MatchLabel(DefaultLabel, VariantLabel),
+		ValueId,
+		ValueOperation(VariantValue, CallValue),
+	../../src/own:
+		BorrowSource(ParameterBorrow, OwnerBorrow),
+		OwnedArguments(NoArguments, UnmanagedArgument, BorrowedArgument),
+		OwnedFunction,
+		OwnedTail(UnmanagedReturn, OwnedReturn, UnmanagedMatch),
+		OwnedValueOperation(
+			ParameterDefinition, IntegerDefinition, VariantDefinition, CallDefinition,
+			ConstructDefinition,
+		),
+		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
+		OwnershipProgram,
+		ResultOwnership(UnmanagedResult, BorrowedResult, OwnedResult),
+		owner_id,
+	../../src/prelude: RuntimeOperation(IntToString, StringLength)
+	../../src/syntax: Purity(Pure)
+	../../src/verify: verify
+	ownership_inputs: InputIds, input_ids, integer as raw_integer, span
+	test: TestSuite
+
+
+-- Hand-written ownership IR is intentionally independent of insertion.
+private pure func integer(value: ValueId, number: Int, at: Int) -> OwnershipOperation:
+	DefineValue({
+		id = value,
+		value_type = IntType,
+		operation = IntegerDefinition(number),
+		result = UnmanagedResult,
+		span = span(at),
+	})
+
+
+private pure func string(ids: InputIds) -> OwnershipOperation:
+	DefineValue({
+		id = ids.second,
+		value_type = StringType,
+		operation = CallDefinition(
+			{
+				target = RuntimeFunction(IntToString),
+				span = span(20)
+			},
+			UnmanagedArgument(ids.first),
+		),
+		result = OwnedResult(owner_id(0)),
+		span = span(20),
+	})
+
+
+private pure func length(ids: InputIds, owner: Int) -> OwnershipOperation:
+	DefineValue({
+		id = ids.third,
+		value_type = IntType,
+		operation = CallDefinition(
+			{
+				target = RuntimeFunction(StringLength),
+				span = span(30)
+			},
+			BorrowedArgument({
+				value = ids.second,
+				source = OwnerBorrow(owner_id(owner)),
+			}),
+		),
+		result = UnmanagedResult,
+		span = span(30),
+	})
+
+
+private pure func program(ids: InputIds, operations: List[OwnershipOperation]) -> OwnershipProgram:
+	{
+		unions = [],
+		entrypoint = ids.entrypoint,
+		functions = [
+			{
+				signature = {
+					purity = Pure,
+					parameters = NoParameter,
+					return_type = IntType
+				},
+				operations = operations,
+				tail = UnmanagedReturn(ids.third)
+			},
+		]
+	}
+
+
+private pure func rejects(input: OwnershipProgram, message: String, at: Int) -> Bool:
+	match verify(input):
+		Err(error):
+			(
+				error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+				and error.span.start == at
+				and error.span.end == at + 1
+			)
+		Ok(_):
+			False
+
+
+pure func test_accepts_exact_borrow_and_cleanup() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match (
+				verify(
+					program(
+						ids,
+						[
+							integer(ids.first, 7, 10),
+							string(ids),
+							length(ids, 0),
+							DropOwner(owner_id(0), span(40)),
+						],
+					),
+				)
+			):
+				Ok(_):
+					True
+				Err(_):
+					False
+
+
+pure func test_rejects_missing_drop() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			rejects(
+				program(
+					ids,
+					[integer(ids.first, 7, 10), string(ids), length(ids, 0)],
+				),
+				"owner 0 remains live at return",
+				30,
+			)
+
+
+pure func test_rejects_double_drop_at_the_second_drop() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			rejects(
+				program(
+					ids,
+					[
+						integer(ids.first, 7, 10),
+						string(ids),
+						length(ids, 0),
+						DropOwner(owner_id(0), span(40)),
+						DropOwner(owner_id(0), span(50)),
+					],
+				),
+				"owner 0 has already been discharged",
+				50,
+			)
+
+
+pure func test_rejects_borrow_after_drop() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			rejects(
+				program(
+					ids,
+					[
+						integer(ids.first, 7, 10),
+						string(ids),
+						DropOwner(owner_id(0), span(25)),
+						length(ids, 0),
+					],
+				),
+				"borrow refers to discharged owner 0",
+				30,
+			)
+
+
+pure func test_rejects_unknown_owner() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			rejects(
+				program(
+					ids,
+					[integer(ids.first, 7, 10), string(ids), length(ids, 1)],
+				),
+				"owner 1 is not defined",
+				30,
+			)
+
+
+pure func test_rejects_borrow_from_another_values_owner() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			other = DefineValue({
+				id = ids.third,
+				value_type = StringType,
+				operation = CallDefinition(
+					{
+						target = RuntimeFunction(IntToString),
+						span = span(25)
+					},
+					UnmanagedArgument(ids.first),
+				),
+				result = OwnedResult(owner_id(1)),
+				span = span(25),
+			})
+			wrong_borrow = DefineValue({
+				id = ids.fourth,
+				value_type = IntType,
+				operation = CallDefinition(
+					{
+						target = RuntimeFunction(StringLength),
+						span = span(30)
+					},
+					BorrowedArgument({
+						value = ids.third,
+						source = OwnerBorrow(owner_id(0)),
+					}),
+				),
+				result = UnmanagedResult,
+				span = span(30),
+			})
+			rejects(
+				program(
+					ids,
+					[integer(ids.first, 7, 10), string(ids), other, wrong_borrow],
+				),
+				"owner 0 does not own value 2",
+				30,
+			)
+
+
+pure func test_rejects_fabricated_parameter_borrow() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			wrong_borrow = DefineValue({
+				id = ids.third,
+				value_type = IntType,
+				operation = CallDefinition(
+					{
+						target = RuntimeFunction(StringLength),
+						span = span(30)
+					},
+					BorrowedArgument({
+						value = ids.second,
+						source = ParameterBorrow,
+					}),
+				),
+				result = UnmanagedResult,
+				span = span(30),
+			})
+			rejects(
+				program(
+					ids,
+					[integer(ids.first, 7, 10), string(ids), wrong_borrow],
+				),
+				"parameter borrow does not refer to the borrowed String parameter",
+				30,
+			)
+
+
+pure func test_rejects_reusing_an_owner_identity() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			rejects(
+				program(
+					ids,
+					[
+						integer(ids.first, 7, 10),
+						string(ids),
+						AcquireOwner(
+							owner_id(0),
+							{
+								value = ids.second,
+								source = OwnerBorrow(owner_id(0))
+							},
+							span(25),
+						),
+					],
+				),
+				"owner 0 is defined more than once",
+				25,
+			)
+
+
+pure func test_rejects_negative_owner_identity() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			rejects(
+				program(
+					ids,
+					[
+						integer(ids.first, 7, 10),
+						string(ids),
+						AcquireOwner(
+							owner_id(-1),
+							{
+								value = ids.second,
+								source = OwnerBorrow(owner_id(0))
+							},
+							span(25),
+						),
+					],
+				),
+				"negative owner identity",
+				25,
+			)
+
+
+pure func test_acquired_owner_keeps_the_same_value_live() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match (
+				verify(
+					program(
+						ids,
+						[
+							integer(ids.first, 7, 10),
+							string(ids),
+							AcquireOwner(
+								owner_id(1),
+								{
+									value = ids.second,
+									source = OwnerBorrow(owner_id(0))
+								},
+								span(25),
+							),
+							DropOwner(owner_id(0), span(26)),
+							length(ids, 1),
+							DropOwner(owner_id(1), span(40)),
+						],
+					),
+				)
+			):
+				Ok(_):
+					True
+				Err(_):
+					False
+
+
+pure func test_rejects_acquisition_from_a_dead_owner() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			rejects(
+				program(
+					ids,
+					[
+						integer(ids.first, 7, 10),
+						string(ids),
+						DropOwner(owner_id(0), span(24)),
+						AcquireOwner(
+							owner_id(1),
+							{
+								value = ids.second,
+								source = OwnerBorrow(owner_id(0))
+							},
+							span(25),
+						),
+					],
+				),
+				"borrow refers to discharged owner 0",
+				25,
+			)
+
+
+pure func test_rejects_an_unowned_managed_call_result() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			unowned = DefineValue({
+				id = ids.second,
+				value_type = StringType,
+				operation = CallDefinition(
+					{
+						target = RuntimeFunction(IntToString),
+						span = span(20)
+					},
+					UnmanagedArgument(ids.first),
+				),
+				result = UnmanagedResult,
+				span = span(20),
+			})
+			rejects(
+				program(
+					ids,
+					[integer(ids.first, 7, 10), unowned],
+				),
+				"managed call result requires an owner",
+				20,
+			)
+
+
+pure func test_rejects_an_owner_on_an_unmanaged_value() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			rejects(
+				program(ids, [DefineValue({
+							id = ids.first,
+							value_type = IntType,
+							operation = IntegerDefinition(7),
+							result = OwnedResult(owner_id(0)),
+							span = span(10),
+						})]),
+				"unmanaged value carries an ownership obligation",
+				10,
+			)
+
+
+pure func test_rejects_an_implicit_managed_argument() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			implicit = DefineValue({
+				id = ids.third,
+				value_type = IntType,
+				operation = CallDefinition(
+					{
+						target = RuntimeFunction(StringLength),
+						span = span(30)
+					},
+					UnmanagedArgument(ids.second),
+				),
+				result = UnmanagedResult,
+				span = span(30),
+			})
+			rejects(
+				program(
+					ids,
+					[integer(ids.first, 7, 10), string(ids), implicit],
+				),
+				"managed call argument requires an owner-dependent borrow",
+				30,
+			)
+
+
+pure func test_rejects_a_value_before_definition() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			undefined = DefineValue({
+				id = ids.second,
+				value_type = StringType,
+				operation = CallDefinition(
+					{
+						target = RuntimeFunction(IntToString),
+						span = span(20)
+					},
+					UnmanagedArgument(ids.fourth),
+				),
+				result = OwnedResult(owner_id(0)),
+				span = span(20),
+			})
+			rejects(
+				program(
+					ids,
+					[integer(ids.first, 7, 10), undefined],
+				),
+				"value 3 is not defined before use",
+				20,
+			)
+
+
+pure func test_borrowed_parameter_return_requires_an_acquisition() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			borrowed: OwnedFunction = {
+				signature = {
+					purity = Pure,
+					parameters = OneParameter(StringType),
+					return_type = StringType
+				},
+				operations = [DefineValue({
+						id = ids.first,
+						value_type = StringType,
+						operation = ParameterDefinition,
+						result = BorrowedResult,
+						span = span(10),
+					})],
+				tail = UnmanagedReturn(ids.first)
+			}
+			rejects(
+				{
+					unions = [],
+					entrypoint = ids.entrypoint,
+					functions = [borrowed]
+				},
+				"managed return requires an owner transfer",
+				10,
+			)
+
+
+pure func test_rejects_returning_a_dropped_owner() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			returned: OwnedFunction = {
+				signature = {
+					purity = Pure,
+					parameters = NoParameter,
+					return_type = StringType
+				},
+				operations = [
+					integer(ids.first, 7, 10),
+					string(ids),
+					DropOwner(owner_id(0), span(25)),
+				],
+				tail = OwnedReturn(ids.second, owner_id(0))
+			}
+			rejects(
+				{
+					unions = [],
+					entrypoint = ids.entrypoint,
+					functions = [returned]
+				},
+				"return refers to discharged owner 0",
+				20,
+			)
+
+
+pure func test_rejects_call_with_missing_argument() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			bad = DefineValue({
+				id = ids.first,
+				value_type = StringType,
+				operation = CallDefinition(
+					{
+						target = RuntimeFunction(IntToString),
+						span = span(20)
+					},
+					NoArguments,
+				),
+				result = OwnedResult(owner_id(0)),
+				span = span(20),
+			})
+			rejects(
+				program(ids, [bad]),
+				"call is missing its argument",
+				20,
+			)
+
+
+pure func test_rejects_call_with_wrong_argument_type() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			bad = DefineValue({
+				id = ids.third,
+				value_type = StringType,
+				operation = CallDefinition(
+					{
+						target = RuntimeFunction(IntToString),
+						span = span(30)
+					},
+					BorrowedArgument({
+						value = ids.second,
+						source = OwnerBorrow(owner_id(0)),
+					}),
+				),
+				result = OwnedResult(owner_id(1)),
+				span = span(30),
+			})
+			rejects(
+				program(
+					ids,
+					[integer(ids.first, 7, 10), string(ids), bad],
+				),
+				"call argument type does not match its contract",
+				30,
+			)
+
+
+pure func test_rejects_payload_for_a_nullary_variant() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match ids.union_value.operation:
+				VariantValue(variant):
+					bad = DefineValue({
+						id = ids.second,
+						value_type = UnionType(ids.union_id),
+						operation = ConstructDefinition(variant, ids.first),
+						result = UnmanagedResult,
+						span = span(20),
+					})
+					input = program(
+						ids,
+						[integer(ids.first, 7, 10), bad],
+					)
+					rejects(
+						{ input | unions = ids.unions },
+						"variant payload does not match its operation",
+						20,
+					)
+				_:
+					False
+
+
+pure func test_sibling_arm_values_are_not_visible() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			callee: OwnedFunction = {
+				signature = {
+					purity = Pure,
+					parameters = OneParameter(IntType),
+					return_type = IntType
+				},
+				operations = [DefineValue({
+						id = ids.first,
+						value_type = IntType,
+						operation = ParameterDefinition,
+						result = UnmanagedResult,
+						span = span(10),
+					})],
+				tail = UnmanagedReturn(ids.first)
+			}
+
+			match ids.union_value.operation:
+				VariantValue(variant):
+					main: OwnedFunction = {
+						signature = {
+							purity = Pure,
+							parameters = NoParameter,
+							return_type = IntType
+						},
+						operations = [DefineValue({
+								id = ids.first,
+								value_type = UnionType(ids.union_id),
+								operation = VariantDefinition(variant),
+								result = UnmanagedResult,
+								span = span(10),
+							})],
+						tail = UnmanagedMatch({
+							scrutinee = ids.first,
+							owner = ids.union_id,
+							arms = [
+								{
+									label = VariantLabel(variant),
+									body = {
+										definitions = [raw_integer(ids.second, 7, 20)],
+										result = ids.second
+									}
+								},
+								{
+									label = DefaultLabel,
+									body = {
+										definitions = [
+											{
+												id = ids.third,
+												value_type = IntType,
+												operation = CallValue(
+													{
+														target = UserFunction(ids.entrypoint),
+														span = span(30)
+													},
+													OneArgument(ids.second),
+												),
+												span = span(30)
+											},
+										],
+										result = ids.third
+									}
+								},
+							],
+						})
+					}
+					rejects(
+						{
+							unions = ids.unions,
+							entrypoint = ids.second_function,
+							functions = [callee, main]
+						},
+						"value 1 is not defined before use",
+						30,
+					)
+				_:
+					False
+
+
+pure func test_managed_prefix_is_rejected_even_after_drop() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match ids.union_value.operation:
+				VariantValue(variant):
+					main: OwnedFunction = {
+						signature = {
+							purity = Pure,
+							parameters = NoParameter,
+							return_type = IntType
+						},
+						operations = [
+							integer(ids.first, 7, 10),
+							string(ids),
+							length(ids, 0),
+							DropOwner(owner_id(0), span(35)),
+							DefineValue({
+								id = ids.fourth,
+								value_type = UnionType(ids.union_id),
+								operation = VariantDefinition(variant),
+								result = UnmanagedResult,
+								span = span(40),
+							}),
+						],
+						tail = UnmanagedMatch({
+							scrutinee = ids.fourth,
+							owner = ids.union_id,
+							arms = [
+								{
+									label = DefaultLabel,
+									body = {
+										definitions = [raw_integer(ids.fifth, 0, 50)],
+										result = ids.fifth
+									}
+								},
+							],
+						})
+					}
+					rejects(
+						{
+							unions = ids.unions,
+							entrypoint = ids.entrypoint,
+							functions = [main]
+						},
+						"managed value appears in an unmanaged match",
+						20,
+					)
+				_:
+					False
+
+
+pure func test_match_label_requires_its_variant_declaration() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match ids.union_value.operation:
+				VariantValue(variant):
+					main: OwnedFunction = {
+						signature = {
+							purity = Pure,
+							parameters = NoParameter,
+							return_type = IntType
+						},
+						operations = [DefineValue({
+								id = ids.first,
+								value_type = UnionType(ids.union_id),
+								operation = VariantDefinition(variant),
+								result = UnmanagedResult,
+								span = span(10),
+							})],
+						tail = UnmanagedMatch({
+							scrutinee = ids.first,
+							owner = ids.union_id,
+							arms = [
+								{
+									label = VariantLabel(ids.second_variant),
+									body = {
+										definitions = [raw_integer(ids.second, 0, 20)],
+										result = ids.second
+									}
+								},
+							],
+						})
+					}
+					rejects(
+						{
+							unions = [{variants = [NoPayload]}],
+							entrypoint = ids.entrypoint,
+							functions = [main]
+						},
+						"unknown variant identity",
+						10,
+					)
+				_:
+					False
+
+
+pure func test_rejects_a_string_returning_entrypoint() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			entry: OwnedFunction = {
+				signature = { purity = Pure, parameters = NoParameter, return_type = StringType },
+				operations = [integer(ids.first, 7, 10), string(ids)],
+				tail = OwnedReturn(ids.second, owner_id(0))
+			}
+			rejects(
+				{ unions = [], entrypoint = ids.entrypoint, functions = [entry] },
+				"entrypoint must take no parameters and return Int",
+				10,
+			)
+
+
+pure func test_rejects_an_entrypoint_with_a_parameter() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			entry: OwnedFunction = {
+				signature = { purity = Pure, parameters = OneParameter(IntType), return_type = IntType },
+				operations = [DefineValue({
+					id = ids.first,
+					value_type = IntType,
+					operation = ParameterDefinition,
+					result = UnmanagedResult,
+					span = span(10)
+				})],
+				tail = UnmanagedReturn(ids.first)
+			}
+			rejects(
+				{ unions = [], entrypoint = ids.entrypoint, functions = [entry] },
+				"entrypoint must take no parameters and return Int",
+				10,
+			)
+
+
+pure func test_rejects_returning_another_values_owner() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			entry: OwnedFunction = {
+				signature = { purity = Pure, parameters = NoParameter, return_type = IntType },
+				operations = [integer(ids.first, 0, 1)],
+				tail = UnmanagedReturn(ids.first)
+			}
+			other_string = DefineValue({
+				id = ids.third,
+				value_type = StringType,
+				operation = CallDefinition(
+					{ target = RuntimeFunction(IntToString), span = span(30) },
+					UnmanagedArgument(ids.first),
+				),
+				result = OwnedResult(owner_id(1)),
+				span = span(30)
+			})
+			helper: OwnedFunction = {
+				signature = { purity = Pure, parameters = NoParameter, return_type = StringType },
+				operations = [
+					integer(ids.first, 7, 10), string(ids), other_string,
+					DropOwner(owner_id(0), span(40)),
+				],
+				tail = OwnedReturn(ids.second, owner_id(1))
+			}
+			rejects(
+				{ unions = [], entrypoint = ids.entrypoint, functions = [entry, helper] },
+				"returned owner does not own the returned value",
+				20,
+			)
+
+
+pure func test_rejects_a_managed_return_from_an_empty_unmanaged_match() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match ids.union_value.operation:
+				VariantValue(variant):
+					entry: OwnedFunction = {
+						signature = { purity = Pure, parameters = NoParameter, return_type = IntType },
+						operations = [integer(ids.first, 0, 1)],
+						tail = UnmanagedReturn(ids.first)
+					}
+					helper: OwnedFunction = {
+						signature = { purity = Pure, parameters = NoParameter, return_type = StringType },
+						operations = [DefineValue({
+							id = ids.first,
+							value_type = UnionType(ids.union_id),
+							operation = VariantDefinition(variant),
+							result = UnmanagedResult,
+							span = span(10)
+						})],
+						tail = UnmanagedMatch({ owner = ids.union_id, scrutinee = ids.first, arms = [] })
+					}
+					match verify({ unions = ids.unions, entrypoint = ids.entrypoint, functions = [entry, helper] }):
+						Err(error):
+							(error.message == "ownership verification failed: managed return appears in an unmanaged match"
+							and error.help == "report this compiler error with the input program"
+							and error.span.start == 0 and error.span.end == 0)
+						Ok(_): False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 independent ownership verification",
+	tests = [
+		("managed return cannot escape an empty unmanaged match", test_rejects_a_managed_return_from_an_empty_unmanaged_match),
+		("entrypoint cannot return String", test_rejects_a_string_returning_entrypoint),
+		("entrypoint cannot take a parameter", test_rejects_an_entrypoint_with_a_parameter),
+		("returned owner must own the returned value", test_rejects_returning_another_values_owner),
+		(
+			"match label requires declared variant",
+			test_match_label_requires_its_variant_declaration,
+		),
+		("call missing argument", test_rejects_call_with_missing_argument),
+		("call wrong argument type", test_rejects_call_with_wrong_argument_type),
+		("nullary variant cannot take payload", test_rejects_payload_for_a_nullary_variant),
+		("sibling arm value cannot escape scope", test_sibling_arm_values_are_not_visible),
+		(
+			"dropped managed prefix still rejects match",
+			test_managed_prefix_is_rejected_even_after_drop,
+		),
+		("accept exact borrow and cleanup", test_accepts_exact_borrow_and_cleanup),
+		("missing drop", test_rejects_missing_drop),
+		("double drop at second operation", test_rejects_double_drop_at_the_second_drop),
+		("borrow after drop", test_rejects_borrow_after_drop),
+		("unknown owner", test_rejects_unknown_owner),
+		("wrong value owner", test_rejects_borrow_from_another_values_owner),
+		("fabricated parameter borrow", test_rejects_fabricated_parameter_borrow),
+		("duplicate owner identity", test_rejects_reusing_an_owner_identity),
+		("negative owner identity", test_rejects_negative_owner_identity),
+		("acquired owner keeps same value live", test_acquired_owner_keeps_the_same_value_live),
+		("acquisition from dead owner", test_rejects_acquisition_from_a_dead_owner),
+		("unowned managed call result", test_rejects_an_unowned_managed_call_result),
+		("owner on unmanaged value", test_rejects_an_owner_on_an_unmanaged_value),
+		("implicit managed argument", test_rejects_an_implicit_managed_argument),
+		("value before definition", test_rejects_a_value_before_definition),
+		(
+			"borrowed return needs acquisition",
+			test_borrowed_parameter_return_requires_an_acquisition,
+		),
+		("dropped return owner", test_rejects_returning_a_dropped_owner),
+	]
+}

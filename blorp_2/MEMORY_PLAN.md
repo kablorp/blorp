@@ -1,13 +1,13 @@
 # Memory architecture
 
-Status: scalar binding checking and value lowering, including match-arm
-blocks, implemented; managed
-responsibilities and later increments proposed, 2026-10-09. This document
-adds no runtime machinery. Read
-[AGENTS.md](AGENTS.md) and the parent instructions first. The current pilot
-has only unmanaged Int and union values; [README.md](README.md) owns its scope.
-Examples below describe the binding boundary and future managed increments
-using existing Blorp syntax.
+Status: scalar bindings, match-arm blocks and straight-line managed Strings
+implemented and validated with unit, grammar, native and sanitizer checks,
+2026-10-09. Exact per-object runtime observations await approval of the explicit
+test mode below. Broader host-compiler gate limitations are recorded in the
+[increment evidence](../benchmarks/results/blorp_2_managed_strings_2026-10-09.md).
+Read [AGENTS.md](AGENTS.md) and the parent instructions first.
+[README.md](README.md) owns the supported scope. Examples below distinguish
+the current straight-line ownership boundary from later managed increments.
 
 ## Keep the pieces distinct
 
@@ -92,8 +92,9 @@ them and invalidate the previous verification result.
   numeric ID alone. Verification evidence belongs to the exact final program
   and contracts, and cannot survive arbitrary rewrites.
 
-Initially all current target values have inline storage and no managed
-children. Do not generalize that into `inline means no ownership`: future
+Int and the current unions have inline storage and no managed children;
+String has a managed leaf allocation. Do not generalize that into
+`inline means no ownership`: future
 inline aggregates could contain managed fields. Root storage and child cleanup
 are separate questions. Boxing is an explicit representation transition with
 its own owner; it is not guessed from the semantic type at a consuming site.
@@ -120,10 +121,64 @@ drop or runtime mutable cell. Test shadowing, initializer order, use before
 definition, immutable reassignment and type mismatch. Preserve the source
 variable identity for diagnostics while downstream reads use value identity.
 
-Before branch-local assignments or non-tail matches, define typed block
+Terminating match arms already have independent value blocks; their local
+assignments require no join. Before non-tail matches, define typed block
 arguments and edge transfers. Before loops, define loop-carried values and
 exit edges. Avoid adding ownership logic to compensate for an ambiguous
 control-flow representation.
+
+## First managed slice
+
+The approved working example uses concrete functions from the explicit input
+prelude, without traits or general imports:
+
+```blorp
+func main() -> Int:
+    value = 7.to_string()
+    value.length()
+```
+
+It returns 1. `to_string(Int) -> String` creates mortal storage; `length(String)
+-> Int` borrows synchronously. The prelude source is loaded alongside the
+program, then parsing/checking resolves its closed builtin operations. Errors
+retain their source origin. Checking owns accepted types and callable identities;
+lowering owns computed values. Ownership insertion names each obligation with
+an `OwnerId`, records the owner dependency of borrowed operands, and inserts
+explicit acquisition, release and return transfer. Independent verification
+reads those actual operations before emission can receive the program.
+
+Initially String has one managed leaf representation and no owned children.
+Parameters borrow and results return owned; owned results may alias arguments.
+Straight-line aliases and rebinding are supported by value liveness, including
+acquisition before releasing an aliased call argument. Existing unmanaged tail
+matches remain supported. Functions combining managed values with a tail match
+are rejected until branch ownership is implemented and verified.
+
+Before editing, the baseline was frozen at `49d480ea5`: 4,651 production lines
+and 43 existing valid fixtures. The implementation ceiling is 8,000 production
+lines; investigate or rescope beyond it. Owned-input compilation is a proxy,
+not self-compilation. Investigate repeatable allocation or retired-instruction
+growth above 25% on any existing fixture. New managed fixtures initially allow
+20,000 compiler allocations and 200 million retired instructions. Native target
+allocation/RC observations are separate from these compiler costs.
+
+Exact runtime lifetime observations need an explicit test boundary. The proposed
+boundary, awaiting user approval, is a C compile option `-DBLORP_TEST_MEMORY=1`.
+It would record allocation, retain, release and final destruction at the operation
+point, using a process-local object identity distinct from compiler OwnerIds.
+The existing Blorp TestSuite would run the unchanged fixture's normal `main`
+and assert exact stderr events. For the first example:
+
+```text
+allocate object=0 refs=1
+release object=0 refs=0
+destroy object=0
+```
+
+Normal builds would produce no events. This would add no source-language test
+intrinsics, alternate entrypoint, generated-C rewriting or native assertion
+driver. Ordinary execution plus sanitizers is the simpler existing path, but
+cannot independently observe exact nonfinal/final release behavior.
 
 ## First managed example and conservative ABI
 
@@ -199,8 +254,9 @@ retain/release counts cannot prove ordering, owner provenance or safety.
 
 ## Dup/drop, ARC and exhaustive destruction
 
-Establish these contracts before the first managed value; scalar bindings do
-not implement them. `dup/drop` describes ownership of a complete value. Its
+The first String slice implements these contracts for a managed leaf; scalar
+bindings alone do not implement them. `dup/drop` describes ownership of a
+complete value. Its
 representation determines the physical work: an unmanaged value needs no RC
 operation, an inline aggregate may duplicate/drop owned children, and a managed
 root retains/releases its root. Retaining a managed aggregate's root does not
@@ -271,11 +327,14 @@ both producer and oracle agree. ASan/UBSan/leak checks supplement these tests.
 
 ## Phase-level test contract
 
-Status: requirements for future increments. The current pilot has no target
-ARC/COW, ownership insertion or independent ownership verifier. Existing unit
-tests of unmanaged unions do not establish managed-value safety. Add the tests
-with each supported feature, before its implementation; do not build unused
-passes or placeholder suites to fill this matrix.
+Status: the straight-line String slice has direct representation, ABI, use,
+ownership-insertion, verification and emission tests. Native and sanitizer
+validation passes; exact per-object runtime observations await approval of the
+explicit test mode above. The matrix also contains requirements for future
+features, including managed aggregates, branches, COW and reuse. Add those
+tests with each supported feature, before its implementation; do not build
+unused passes or placeholder suites to fill this matrix. Unmanaged union
+tests do not establish managed-value safety.
 
 Every affected boundary needs small Blorp `TestSuite` cases that exercise its
 public typed contract directly. Use valid minimal input builders where sealed

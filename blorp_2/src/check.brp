@@ -1,4 +1,11 @@
 import:
+	./prelude:
+		CheckedPrelude,
+		PrimitiveType(BuiltinInt, BuiltinString),
+		RuntimeOperation,
+		prelude_names,
+		runtime_contract,
+		runtime_operation,
 	int as IntOps
 	names: NameId, NameTable, SpecialNames, name_spelling, same_name
 	option: is_some, to_result
@@ -45,6 +52,7 @@ opaque type VariantId = VariantIdentity
 
 fixed union TypeRef:
 	IntType
+	StringType
 	UnionType(UnionId)
 
 
@@ -70,10 +78,32 @@ fixed record FunctionSignature {
 }
 
 
+fixed union CallTarget:
+	UserFunction(FunctionId)
+	RuntimeFunction(RuntimeOperation)
+
+
 fixed record CheckedCall {
-	target: FunctionId,
+	target: CallTarget,
 	span: Span
 }
+
+
+private pure func primitive_ref(value_type: PrimitiveType) -> TypeRef:
+	match value_type:
+		BuiltinInt:
+			IntType
+		BuiltinString:
+			StringType
+
+
+pure func runtime_signature(operation: RuntimeOperation) -> FunctionSignature:
+	contract = runtime_contract(operation)
+	{
+		purity = contract.purity,
+		parameters = OneParameter(primitive_ref(contract.parameter)),
+		return_type = primitive_ref(contract.return_type)
+	}
 
 
 -- IDs are dense ordinals owned by one sealed checked function, never roles.
@@ -201,6 +231,12 @@ pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 		IntType:
 			match right:
 				IntType:
+					True
+				_:
+					False
+		StringType:
+			match right:
+				StringType:
 					True
 				_:
 					False
@@ -355,13 +391,14 @@ private pure func validate_unions(
 	for declaration in unions:
 		if (
 			same_name(declaration.type_name.id, special.integer)
+			or same_name(declaration.type_name.id, special.string)
 			or find_union(previous, declaration.type_name.id).is_some()
 		):
 			failure = Some(
 				rejection(
 					declaration.type_name.span,
 					"duplicate union type name",
-					"give union types distinct names; Int is already built in",
+					"give union types distinct names; Int and String are declared by the prelude",
 				),
 			)
 			break
@@ -425,6 +462,8 @@ private pure func resolve_type(
 ) -> Result[TypeRef, Diagnostic]:
 	if same_name(name.id, special.integer):
 		Ok(IntType)
+	else if same_name(name.id, special.string):
+		Ok(StringType)
 	else:
 		match find_union(unions, name.id):
 			Some(id):
@@ -434,7 +473,7 @@ private pure func resolve_type(
 					rejection(
 						name.span,
 						"unknown type",
-						"use Int or a fixed union declared in this file",
+						"use Int, String, or a fixed union declared in this file",
 					),
 				)
 
@@ -600,7 +639,8 @@ private fixed record ResolutionContext {
 	signatures: List[FunctionSignature],
 	unions: List[ParsedUnion],
 	checked_unions: List[CheckedUnion],
-	names: NameTable
+	names: NameTable,
+	prelude: CheckedPrelude
 }
 
 
@@ -652,19 +692,36 @@ private pure func non_callable(binding: LocalBinding, span: Span) -> Diagnostic:
 
 private pure func resolve_function_target(
 	name: WrittenName,
-	id: FunctionId,
-	context: ResolutionContext,
+	target: CallTarget,
+	signatures: List[FunctionSignature],
 ) -> Result[ResolvedCall, Diagnostic]:
-	signature ?= context.signatures
-		.get(function_number(id))
-		.to_result(internal_error(name.span, "invalid resolved function identity"))
+	signature ?= match target:
+		UserFunction(id):
+			signatures
+				.get(function_number(id))
+				.to_result(internal_error(name.span, "invalid resolved function identity"))
+		RuntimeFunction(operation):
+			Ok(runtime_signature(operation))
+
 	Ok({
 		call = {
-			target = id,
+			target = target,
 			span = name.span
 		},
 		signature = signature,
 	})
+
+
+private pure func lookup_target(
+	functions: List[ParsedFunction],
+	prelude: CheckedPrelude,
+	name: NameId,
+) -> Option[CallTarget]:
+	match find_function(functions, name):
+		Some(id):
+			Some(UserFunction(id))
+		None:
+			runtime_operation(prelude, name).map(pure func(operation): RuntimeFunction(operation))
 
 
 private pure func unary_function(
@@ -722,9 +779,9 @@ private pure func classify_application(
 		Some(binding):
 			Err(non_callable(binding, call.callee.span))
 		None:
-			match find_function(context.functions, call.callee.id):
-				Some(id):
-					resolved ?= resolve_function_target(call.callee, id, context)
+			match lookup_target(context.functions, context.prelude, call.callee.id):
+				Some(target):
+					resolved ?= resolve_function_target(call.callee, target, context.signatures)
 					contract ?= unary_function(purity, call, resolved, context.names)
 					Ok(FunctionApplication(contract))
 				None:
@@ -745,7 +802,7 @@ private pure func classify_application(
 							rejection(
 								call.callee.span,
 								"unknown function",
-								"declare the called function in this file",
+								"declare the called function in this file or the explicit prelude",
 							),
 						)
 
@@ -806,6 +863,8 @@ private pure func type_rejection(
 	match expected_type:
 		IntType:
 			rejection(span, message, "use an expression of type Int here")
+		StringType:
+			rejection(span, message, "use an expression of type String here")
 		UnionType(id):
 			match unions.get(union_number(id)):
 				None:
@@ -840,7 +899,7 @@ private pure func contextual_constructor(
 			)
 		Some(type_ref):
 			found ?= match type_ref:
-				IntType:
+				IntType | StringType:
 					Ok(None)
 				UnionType(owner):
 					find_variant(context, owner, name)
@@ -960,7 +1019,7 @@ private pure func resolve_base(
 				Some(binding):
 					Err(non_callable(binding, name.span))
 				None:
-					match find_function(context.functions, name.id):
+					match lookup_target(context.functions, context.prelude, name.id):
 						None:
 							if contains_variant(context.unions, name.id):
 								constructor_base(name, expected_type, True, context)
@@ -969,11 +1028,11 @@ private pure func resolve_base(
 									rejection(
 										name.span,
 										"unknown function",
-										"declare the called function in this file",
+										"declare the called function in this file or the explicit prelude",
 									),
 								)
-						Some(id):
-							resolved ?= resolve_function_target(name, id, context)
+						Some(target):
+							resolved ?= resolve_function_target(name, target, context.signatures)
 
 							match resolved.signature.parameters:
 								OneParameter(_):
@@ -1372,7 +1431,7 @@ private pure func resolve_match(
 	owner ?= match scrutinee.value_type:
 		UnionType(id):
 			Ok(id)
-		IntType:
+		IntType | StringType:
 			Err(
 				rejection(
 					body.scrutinee.span,
@@ -1768,6 +1827,14 @@ private pure func is_settled(id: FunctionId, settled: List[FunctionId]) -> Bool:
 	found
 
 
+private pure func target_is_settled(target: CallTarget, settled: List[FunctionId]) -> Bool:
+	match target:
+		UserFunction(id):
+			is_settled(id, settled)
+		RuntimeFunction(_):
+			True
+
+
 private pure func unsettled_value(body: CheckedValue, settled: List[FunctionId]) -> Option[Span]:
 	var found: Option[Span] = match body.base:
 		ReturnInteger(_):
@@ -1777,7 +1844,7 @@ private pure func unsettled_value(body: CheckedValue, settled: List[FunctionId])
 		ReturnBinding(_):
 			None
 		ReturnCall(call):
-			if is_settled(call.target, settled):
+			if target_is_settled(call.target, settled):
 				None
 			else:
 				Some(call.span)
@@ -1788,7 +1855,7 @@ private pure func unsettled_value(body: CheckedValue, settled: List[FunctionId])
 
 		match operation.operation:
 			InvokeFunction(call):
-				if not is_settled(call.target, settled):
+				if not target_is_settled(call.target, settled):
 					found = Some(call.span)
 			ConstructVariant(_):
 				void
@@ -1890,16 +1957,61 @@ private pure func validate_acyclic(functions: List[CheckedFunction]) -> Result[V
 			Ok(void)
 
 
+private pure func validate_prelude_conflicts(
+	functions: List[ParsedFunction],
+	unions: List[ParsedUnion],
+	prelude: CheckedPrelude,
+) -> Result[Void, Diagnostic]:
+	var failure: Option[Diagnostic] = None
+
+	for function in functions:
+		if runtime_operation(prelude, function.function_name.id).is_some():
+			failure = Some(
+				rejection(
+					function.function_name.span,
+					"function name conflicts with the prelude",
+					"rename this function or change the explicit prelude declaration",
+				),
+			)
+			break
+
+	if not failure.is_some():
+		for declaration in unions:
+			for variant in declaration.variants:
+				if runtime_operation(prelude, variant.name.id).is_some():
+					failure = Some(
+						rejection(
+							variant.name.span,
+							"variant name conflicts with a prelude function",
+							"give functions and union variants distinct names",
+						),
+					)
+					break
+
+			if failure.is_some():
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+
 pure func check(program: ParsedProgram) -> Result[CheckedProgram, Diagnostic]:
 	parsed = parsed_contents(program)
-	unions ?= validate_unions(parsed.unions, parsed.functions, parsed.special)
-	signatures ?= validate_signatures(parsed.functions, parsed.unions, parsed.end, parsed.special)
+	prelude = parsed.prelude
+	special = prelude_names(prelude).special
+	conflicts ?= validate_prelude_conflicts(parsed.functions, parsed.unions, prelude)
+	unions ?= validate_unions(parsed.unions, parsed.functions, special)
+	signatures ?= validate_signatures(parsed.functions, parsed.unions, parsed.end, special)
 	functions ?= resolve_functions({
 		functions = parsed.functions,
 		signatures = signatures.functions,
 		unions = parsed.unions,
 		checked_unions = unions,
 		names = parsed.names,
+		prelude = prelude,
 	})
 	acyclic ?= validate_acyclic(functions)
 	Ok(into_opaque CheckedProgram({

@@ -189,6 +189,23 @@ assignment to an immutable one. Companion fixtures return the
 [other branch](test/e2e/fixtures/match_binding_empty.brp), and preserve an
 [outer value](test/e2e/fixtures/match_binding_outer.brp) across shadowing.
 
+The [mortal String example](test/e2e/fixtures/mortal_string.brp) starts the
+managed path without literals, traits or general imports:
+
+```blorp
+func main() -> Int:
+    value = 7.to_string()
+    value.length()
+```
+
+It returns 1. The explicit temporary input prelude declares concrete pure
+`to_string(Int) -> String` and `length(String) -> Int` functions. Conversion
+allocates an immutable String leaf; length borrows it; its owner is released
+after that use. The [identity companion](test/e2e/fixtures/mortal_string_identity.brp)
+returns a borrowed parameter as an owned result before replacing the caller's
+old owner. Other fixtures cover unused results, a surviving alias, and Int64
+conversion boundaries. These operations use ARC; they introduce no COW or reuse.
+
 From the repository root:
 
 ```sh
@@ -219,7 +236,7 @@ by a native `-O0` build and execution under UBSan. Allocation and instruction
 counters come from the same compilation. These checks never reuse fixture output.
 
 Every host-compiled source module has a matching unit suite under `test/unit/`.
-The staged target prelude is a future input fixture, not a host module.
+The temporary target prelude is an explicit source input, not a host module.
 Integration
 and native execution suites live under `test/e2e/`; their input programs live
 under `test/e2e/fixtures/`. The suites use the existing compiler's `TestSuite`
@@ -235,17 +252,18 @@ ceiling is exceeded. Ceilings are adjusted deliberately with retained evidence.
 
 | Example | Allocation ceiling | Retired-instruction ceiling |
 | --- | ---: | ---: |
-| return_zero | 200 | 40,000,000 |
-| call_one | 350 | 40,000,000 |
-| pure_calls | 550 | 40,000,000 |
-| nested_calls | 650 | 40,000,000 |
-| nested_order | 750 | 40,000,000 |
-| ufcs_calls | 650 | 40,000,000 |
-| ufcs_chain | 750 | 40,000,000 |
-| return_42 | 230 | 40,000,000 |
-| union_values | 2,500 | 40,000,000 |
+| return_zero | 800 | 40,000,000 |
+| call_one | 1,000 | 40,000,000 |
+| pure_calls | 1,300 | 40,000,000 |
+| nested_calls | 1,500 | 40,000,000 |
+| nested_order | 1,600 | 40,000,000 |
+| ufcs_calls | 1,500 | 40,000,000 |
+| ufcs_chain | 1,600 | 40,000,000 |
+| return_42 | 800 | 40,000,000 |
+| union_values | 3,600 | 40,000,000 |
 | match_value | 5,000 | 100,000,000 |
 | bindings | 10,000 | 100,000,000 |
+| mortal Strings | 20,000 | 200,000,000 |
 
 Small companion fixtures pass explicit limits of 10,000 allocations and
 100,000,000 instructions. The two structural stress fixtures use explicit
@@ -260,7 +278,13 @@ from `main`; its larger workload measured 2,082 allocations. The binding
 increment deliberately raises the affected allocation ceilings above those
 measurements. The later switch to a single instrumented `-O0` run rebases the
 small fixtures' instruction ceilings to 40 million; allocation ceilings stay
-unchanged. See the
+unchanged at that increment. The explicit input prelude and independent ownership
+verification now raise the affected allocation ceilings deliberately: return zero
+measures 623 allocations, including 424 for prelude processing and 33 for ownership
+insertion/verification in a phase-prefix probe. All 43 frozen prior fixtures emit
+identical C; the final matched instruction sample grows by at most 13.00%. See the
+[managed String record](../benchmarks/results/blorp_2_managed_strings_2026-10-09.md)
+for the current comparison and limitations, and the
 [binding increment record](../benchmarks/results/blorp_2_bindings_2026-10-09.md)
 for matched workloads, provenance, samples and validation.
 
@@ -380,16 +404,17 @@ Semantic rules:
 
 - Exactly one function must be named `main`, and it takes no parameters. A helper
   takes zero or one explicitly typed parameter. Helper parameter and return types
-  are `Int`, the signed 64-bit integer type, or a fixed union declared in this
+  are `Int`, the signed 64-bit integer type, `String`, or a fixed union declared in this
   file. `main` must return `Int`.
 - Union types have nominal identity. Equal variant positions or shared variant
   spellings do not make two unions interchangeable. Union type names must be
-  unique and cannot redeclare `Int`; each union's variant names must be unique.
+  unique and cannot redeclare the prelude's `Int` or `String`; each union's variant names must be unique.
   Type names occupy a separate namespace from functions and variant values, so
   a function may share a type name. A function cannot share any variant name;
   a collision highlights whichever declaration appears later in the source.
-- Function names are unique within the input file. Every callee must be declared
-  in that file; declaration order does not affect resolution. Calls supply exactly
+- Function names are unique within the input file and cannot conflict with prelude
+  functions. Every callee must be declared in that file or in the explicit
+  prelude; declaration order does not affect resolution. Calls supply exactly
   the number of arguments the callee declares.
 - A bare expression name first resolves to the nearest local binding: an
   arm capture, a body-local binding, or the containing function's parameter. Otherwise
@@ -456,6 +481,14 @@ Semantic rules:
   nullary construction initializes that unused slot to zero. A separate C `int main(void)` wrapper calls
   the checked entrypoint and converts the result to the process exit status.
 - The final expression is the return value. No explicit `return` is needed.
+- `String` is an immutable managed leaf. The temporary input prelude supplies
+  concrete pure functions `to_string(Int) -> String` and `length(String) -> Int`.
+  Both direct calls and UFCS work. Parameters borrow for the duration of a
+  synchronous call; String results transfer an owner to the caller, including
+  results that alias a borrowed parameter. Unused mortal results are released.
+  String computations currently require straight-line function bodies: a function
+  with a tail match cannot have String parameters, results or computed values.
+  String literals, String union payloads, COW and managed matches are deferred.
 - Multiple parameters or arguments, explicit UFCS arguments, parenthesized expressions,
   multiple or non-Int payload fields, nested matches,
   guards, qualified/nested/literal patterns, constructor UFCS, multiline chains,
@@ -469,10 +502,10 @@ Semantic rules:
 
 ## Architecture
 
-The command reads an input file and writes an output C file:
+The command reads the temporary input prelude and a program, then writes C:
 
 ```sh
-bin/blorp run --no-format blorp_2/src/main.brp -- input.brp output.c
+bin/blorp run --no-format blorp_2/src/main.brp -- blorp_2/src/prelude_temp.brp input.brp output.c
 ```
 
 The impure command shell owns file I/O and printing. Compilation and
@@ -522,17 +555,31 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    Every arm starts with the enclosing binding map, lowers its capture and
    binding sequence, and publishes a branch-local value block. Sibling arms
    share only the function's value allocator, preserving distinct identities.
-5. Emission consumes the lowered program and produces C. Computed values use
+5. Ownership insertion classifies each concrete value as having no ownership
+   or being a managed String leaf. It publishes ordered definitions, owner
+   acquisitions, drops and return transfers. `OwnerId` names one obligation;
+   `ValueId` still names the computed value. Borrowed operands name the owner
+   they depend on, or the function's borrowed parameter. Last-use cleanup keeps
+   an argument alive until a call has established its result owner.
+6. Independent verification checks the actual operations against representation
+   and call contracts, rejecting dead/wrong owners, invalid borrows and
+   undisposed obligations. It also enforces the zero-argument Int entry ABI
+   and rejects managed matches in raw ownership IR. Only it can seal a
+   `VerifiedProgram`; it neither repairs ownership nor uses insertion's
+   liveness decisions as its oracle.
+7. Emission consumes that verified program and produces C. Computed values use
    immutable C locals; scalar reassignment requires no runtime mutable cell.
    A match uses its evaluated scrutinee once and switches on its tag. Arm-local field
    projections occur only in the selected branch; a whole-value binder reads
    the saved value. Emission consumes resolved lowered labels and values without repeating
    resolution, arity, purity, or coverage checks. Its result can report an
    internal lowered-reference error instead of silently choosing a C layout;
-   source-language acceptance is already complete.
+   source-language acceptance is already complete. Retains/releases project the
+   explicit operations; emission does not invent owners or cleanup.
 
-The names module owns the spelling table and constructs canonical `main` and
-`Int` identities once. Parsing uses string lookup only in its local interning
+The names module owns the spelling table and constructs the entrypoint's `main`
+identity. Prelude declarations establish `Int` and `String` before program
+parsing extends the same table. Parsing uses string lookup only in its local interning
 builder, then publishes the immutable table and special identities together.
 Written names contain only a `NameId` and source span. Checking compares identities;
 spelling lookup is reserved for diagnostics and rejects a missing table entry
@@ -547,20 +594,20 @@ of spelling; reusing a spelling in sibling arms creates distinct bindings.
 `ValueId` identifies a lowered computed value within its function, separately
 from the source binding that currently refers to it. Emission uses resolved
 identities and typed operations. Integer and
-union programs with optional Int fields need no target heap allocation or ownership pass.
+union programs with optional Int fields need no target heap allocation or RC operations.
 The flat expression chain remains the single-line, zero/one-argument leaf.
 A structured body sum distinguishes that leaf from a match with ordered arms.
-Ownership and general pass infrastructure will be introduced
-when an executable example requires them.
+Managed control-flow joins and general pass infrastructure remain future work.
 
-[`src/prelude_temp.brp`](src/prelude_temp.brp) stages the target declaration
-`type Int = builtin`. It is neither imported by the host compiler nor loaded
-by Blorp 2 yet: the host permits builtin type declarations only in its standard
-library, and the pilot does not parse type declarations or imports. Until the
-next prelude-loading increment, the parser and emitter use the existing host
-`int` module's signed bounds, and the frontend seeds the known `Int` spelling
-before publishing NameIds. This is a temporary host dependency, not a loaded
-target prelude or a claim of bootstrap readiness.
+[`src/prelude_temp.brp`](src/prelude_temp.brp) is a target source input, not a
+host import. Its `type Int = builtin` and `type String = builtin` declarations
+establish the two builtin types. Its concrete functions use the closed runtime
+keys `builtin("int.to_string")` and `builtin("string.length")`. Prelude parsing
+translates those keys to typed operations once; checking validates their exact
+purity, parameter and result contracts. Program source cannot declare builtin
+types or bodies, and quoted builtin labels do not enable ordinary String
+literals. Prelude and program diagnostics retain separate source origins.
+There is no general module loader or implicit prelude lookup.
 
 C emission uses the whitespace required to separate C tokens and a final LF.
 It adds no indentation or internal line breaks for presentation.
@@ -584,8 +631,8 @@ end-to-end cost. Self-compilation is a later milestone.
 
 ## Bootstrap direction and process
 
-[MEMORY_PLAN.md](MEMORY_PLAN.md) proposes memory responsibilities and typed
-boundaries for the upcoming bindings increments; it adds no runtime support.
+[MEMORY_PLAN.md](MEMORY_PLAN.md) records the managed String slice and proposed
+later memory responsibilities, including the limits of current verification.
 
 Compiler source under `src/` stays within the agreed eventual subset: `String`, `Int`
 (64-bit), `Float` (64-bit), `Bool`, `Void`, `List`, `Option`, `Result`, `Dict`,
@@ -625,8 +672,9 @@ synthetic, and unused parameters are explicitly discarded to keep warning checks
 clean. Existing compiler internals are not pilot dependencies.
 
 The compilation pipeline is entirely pure once its source inputs have been
-loaded. `compile(source)` composes pure lexing, parsing, checking, ordered-value
-lowering and C emission;
+loaded. `compile(CompilationInputs{prelude, program})` composes pure lexing,
+parsing, checking, ordered-value lowering, ownership insertion, independent
+verification and C emission;
 diagnostic rendering is pure too. Local builders and `var` are allowed within
 pure functions. The surrounding shell owns reading and writing files, printing,
 process execution and timing. Future import loading must supply a complete source

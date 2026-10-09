@@ -1,0 +1,665 @@
+import:
+	../../src/check:
+		CallTarget(RuntimeFunction),
+		CheckedAssignment(InitializeBinding),
+		CheckedBody(CheckedValueBody),
+		CheckedOperation(InvokeFunction),
+		CheckedProgram,
+		CheckedValue,
+		check as check_program,
+		checked_functions,
+	../../src/lex: lex
+	../../src/names: find_name, intern_name, name_spelling
+	../../src/parse: parse as parse_program, parse_prelude, parsed_contents
+	../../src/prelude:
+		CheckedPrelude,
+		PrimitiveType(BuiltinInt, BuiltinString),
+		RuntimeOperation(IntToString, StringLength),
+		check_prelude,
+		runtime_contract,
+		runtime_operation,
+	../../src/syntax:
+		Diagnostic,
+		ParameterList(SingleParameter),
+		ParsedBuiltinType(IntegerBuiltin, StringBuiltin),
+		ParsedPrelude,
+		ParsedRuntimeOperation(IntegerToStringBuiltin),
+		Purity(Pure),
+	test: TestSuite
+
+
+private TYPES: String = "type Int = builtin\ntype String = builtin\n"
+
+private CONVERT: String = "pure func convert(value: Int) -> String:\n\tbuiltin(\"int.to_string\")\n"
+
+private LENGTH: String = "pure func length(value: String) -> Int:\n\tbuiltin(\"string.length\")\n"
+
+
+private pure func parsed_prelude(source: String) -> Result[ParsedPrelude, Diagnostic]:
+	tokens ?= lex(source)
+	parse_prelude(tokens)
+
+
+private pure func accepted_prelude(source: String) -> Result[CheckedPrelude, Diagnostic]:
+	parsed ?= parsed_prelude(source)
+	check_prelude(parsed)
+
+
+private pure func checked_source(
+	prelude_source: String,
+	program_source: String,
+) -> Result[CheckedProgram, Diagnostic]:
+	prelude ?= accepted_prelude(prelude_source)
+	input ?= lex(program_source)
+	program ?= parse_program(input, prelude)
+	check_program(program)
+
+
+private pure func rejects(
+	result: Result[CheckedPrelude, Diagnostic],
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+) -> Bool:
+	match result:
+		Err(error):
+			(
+				error.span.start == start
+				and error.span.end == end
+				and error.message == message
+				and error.help == help
+			)
+		Ok(_):
+			False
+
+
+private pure func program_rejects(
+	prelude: String,
+	program: String,
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+) -> Bool:
+	match checked_source(prelude, program):
+		Err(error):
+			(
+				error.span.start == start
+				and error.span.end == end
+				and error.message == message
+				and error.help == help
+			)
+		Ok(_):
+			False
+
+
+pure func test_prelude_publishes_typed_operations_and_one_name_table() -> Bool:
+	match parsed_prelude(TYPES + CONVERT):
+		Err(_):
+			False
+		Ok(prelude):
+			contents = prelude
+
+			match contents.types:
+				[IntegerBuiltin(integer), StringBuiltin(string)]:
+					match contents.functions:
+						[function]:
+							(
+								name_spelling(contents.names, integer.id) == Some("Int")
+								and name_spelling(contents.names, string.id) == Some("String")
+								and name_spelling(
+									contents.names,
+									function.header.function_name.id,
+								) == Some("convert")
+								and function.operation == IntegerToStringBuiltin
+								and function.span.start == 91
+								and function.span.end == 106
+							)
+						_:
+							False
+				_:
+					False
+
+
+private pure func runtime_operations(value: CheckedValue) -> List[RuntimeOperation]:
+	var operations: List[RuntimeOperation] = []
+
+	for step in value.operations:
+		match step.operation:
+			InvokeFunction(call):
+				match call.target:
+					RuntimeFunction(operation):
+						operations = operations.append(operation)
+					_:
+						void
+			_:
+				void
+
+	operations
+
+
+pure func test_builtin_names_come_from_the_explicit_prelude() -> Bool:
+	match checked_source(
+		TYPES + CONVERT + LENGTH,
+		"pure func main() -> Int:\n\tvalue = 7.convert()\n\tvalue.length()\n",
+	):
+		Err(_):
+			False
+		Ok(program):
+			match checked_functions(program).functions:
+				[function]:
+					converted = match function.assignments:
+						[InitializeBinding(_, value)]:
+							runtime_operations(value) == [IntToString]
+						_:
+							False
+
+					match function.body:
+						CheckedValueBody(value):
+							converted and runtime_operations(value) == [StringLength]
+						_:
+							False
+				_:
+					False
+
+
+pure func test_type_only_prelude_does_not_add_implicit_functions() -> Bool:
+	match checked_source(TYPES, "func main() -> Int:\n\t7.to_string().length()\n"):
+		Err(error):
+			(
+				error.span.start == 23
+				and error.span.end == 32
+				and error.message == "unknown function"
+				and error.help == "declare the called function in this file or the explicit prelude"
+			)
+		Ok(_):
+			False
+
+
+pure func test_missing_int_declaration_is_explicit() -> Bool:
+	rejects(
+		accepted_prelude("type String = builtin\n"),
+		22,
+		22,
+		"missing Int builtin declaration",
+		"add type Int = builtin to the prelude",
+	)
+
+
+pure func test_missing_string_declaration_is_explicit() -> Bool:
+	rejects(
+		accepted_prelude("type Int = builtin\n"),
+		19,
+		19,
+		"missing String builtin declaration",
+		"add type String = builtin to the prelude",
+	)
+
+
+pure func test_duplicate_builtin_type_is_rejected_at_second_name() -> Bool:
+	rejects(
+		accepted_prelude(TYPES + "type Int = builtin\n"),
+		46,
+		49,
+		"duplicate builtin type declaration",
+		"declare type Int = builtin exactly once",
+	)
+
+
+pure func test_runtime_contract_rejects_wrong_parameter_type() -> Bool:
+	rejects(
+		accepted_prelude(
+			TYPES + "pure func convert(value: String) -> String:\n\tbuiltin(\"int.to_string\")\n",
+		),
+		94,
+		109,
+		"builtin declaration does not match its runtime contract",
+		"declare a pure function with one Int parameter returning String",
+	)
+
+
+pure func test_runtime_contract_rejects_wrong_return_type() -> Bool:
+	rejects(
+		accepted_prelude(
+			TYPES + "pure func convert(value: Int) -> Int:\n\tbuiltin(\"int.to_string\")\n",
+		),
+		88,
+		103,
+		"builtin declaration does not match its runtime contract",
+		"declare a pure function with one Int parameter returning String",
+	)
+
+
+pure func test_runtime_contract_rejects_zero_parameters() -> Bool:
+	rejects(
+		accepted_prelude(TYPES + "pure func convert() -> String:\n\tbuiltin(\"int.to_string\")\n"),
+		81,
+		96,
+		"builtin declaration does not match its runtime contract",
+		"declare a pure function with one Int parameter returning String",
+	)
+
+
+pure func test_runtime_contract_rejects_impurity() -> Bool:
+	rejects(
+		accepted_prelude(
+			TYPES + "func convert(value: Int) -> String:\n\tbuiltin(\"int.to_string\")\n",
+		),
+		86,
+		101,
+		"builtin declaration does not match its runtime contract",
+		"declare a pure function with one Int parameter returning String",
+	)
+
+
+pure func test_program_declaration_conflicting_with_prelude_is_rejected() -> Bool:
+	match checked_source(TYPES + LENGTH, "func length() -> Int:\n\t0\nfunc main() -> Int:\n\t0\n"):
+		Err(error):
+			(
+				error.span.start == 5
+				and error.span.end == 11
+				and error.message == "function name conflicts with the prelude"
+				and error.help == "rename this function or change the explicit prelude declaration"
+			)
+		Ok(_):
+			False
+
+
+pure func test_builtin_label_is_not_a_program_string_expression() -> Bool:
+	match checked_source(TYPES, "func main() -> Int:\n\t\"int.to_string\"\n"):
+		Err(error):
+			(
+				error.span.start == 21
+				and error.span.end == 36
+				and error.message == "quoted builtin labels are only allowed in the prelude"
+				and error.help == "call a String-producing prelude function; String literals are not supported yet"
+			)
+		Ok(_):
+			False
+
+
+pure func test_runtime_contracts_publish_complete_primitive_abi() -> Bool:
+	convert = runtime_contract(IntToString)
+	length = runtime_contract(StringLength)
+	(
+		convert.purity == Pure
+		and convert.parameter == BuiltinInt
+		and convert.return_type == BuiltinString
+		and length.purity == Pure
+		and length.parameter == BuiltinString
+		and length.return_type == BuiltinInt
+	)
+
+
+pure func test_parsed_program_carries_the_accepted_prelude() -> Bool:
+	match accepted_prelude(TYPES + CONVERT):
+		Err(_):
+			False
+		Ok(prelude):
+			match lex("func main() -> Int:\n\t0\n"):
+				Err(_):
+					False
+				Ok(input):
+					match parse_program(input, prelude):
+						Err(_):
+							False
+						Ok(parsed):
+							contents = parsed_contents(parsed)
+
+							match find_name(contents.names, "convert"):
+								Some(id):
+									runtime_operation(contents.prelude, id) == Some(IntToString)
+								_:
+									False
+
+
+pure func test_unpublished_builtin_type_name_is_rejected() -> Bool:
+	match parsed_prelude(TYPES):
+		Err(_):
+			False
+		Ok(parsed):
+			match find_name(
+				intern_name(parsed.names, "foreign"),
+				"foreign",
+			):
+				None:
+					False
+				Some(unpublished):
+					match parsed.types:
+						[IntegerBuiltin(integer), string]:
+							rejects(
+								check_prelude(
+									{ parsed |
+										types = [
+											IntegerBuiltin({ integer | id = unpublished }),
+											string,
+										]
+									},
+								),
+								5,
+								8,
+								"invalid parsed prelude name identity",
+								"report this compiler error with the prelude input",
+							)
+						_:
+							False
+
+
+pure func test_unpublished_entrypoint_identity_is_rejected() -> Bool:
+	match parsed_prelude(TYPES):
+		Err(_):
+			False
+		Ok(parsed):
+			match find_name(
+				intern_name(parsed.names, "foreign"),
+				"foreign",
+			):
+				None:
+					False
+				Some(unpublished):
+					rejects(
+						check_prelude({ parsed | main = unpublished }),
+						41,
+						41,
+						"invalid parsed prelude name identity",
+						"report this compiler error with the prelude input",
+					)
+
+
+pure func test_builtin_type_identities_must_be_distinct() -> Bool:
+	match parsed_prelude(TYPES):
+		Err(_):
+			False
+		Ok(parsed):
+			match parsed.types:
+				[IntegerBuiltin(integer), StringBuiltin(string)]:
+					rejects(
+						check_prelude(
+							{ parsed |
+								types = [
+									IntegerBuiltin(integer),
+									StringBuiltin({ string | id = integer.id }),
+								]
+							},
+						),
+						41,
+						41,
+						"prelude builtin identities conflict",
+						"report this compiler error with the prelude input",
+					)
+				_:
+					False
+
+
+pure func test_unpublished_runtime_header_names_are_rejected() -> Bool:
+	match parsed_prelude(TYPES + CONVERT):
+		Err(_):
+			False
+		Ok(parsed):
+			match find_name(
+				intern_name(parsed.names, "foreign"),
+				"foreign",
+			):
+				None:
+					False
+				Some(unpublished):
+					match parsed.functions:
+						[function]:
+							header = function.header
+
+							match header.parameters:
+								SingleParameter(parameter):
+									var passed = True
+
+									for changed in [
+										{ header |
+											function_name = { header.function_name |
+												id = unpublished
+											}
+										},
+										{ header |
+											return_type = { header.return_type | id = unpublished }
+										},
+										{ header |
+											parameters = SingleParameter(
+												{ parameter |
+													name = { parameter.name | id = unpublished }
+												},
+											)
+										},
+										{ header |
+											parameters = SingleParameter(
+												{ parameter |
+													type_name = { parameter.type_name |
+														id = unpublished
+													}
+												},
+											)
+										},
+									]:
+										match check_prelude(
+											{ parsed |
+												functions = [{ function | header = changed }]
+											},
+										):
+											Err(error):
+												passed = (
+													passed
+													and error.message == "invalid parsed prelude name identity"
+													and error.help == "report this compiler error with the prelude input"
+												)
+											Ok(_):
+												passed = False
+
+									passed
+								_:
+									False
+						_:
+							False
+
+
+pure func test_duplicate_prelude_function_name_is_rejected() -> Bool:
+	rejects(
+		accepted_prelude(TYPES + CONVERT + CONVERT),
+		118,
+		125,
+		"duplicate or reserved prelude function name",
+		(
+			"give prelude functions distinct names and reserve main for the program "
+			+ "entrypoint"
+		),
+	)
+
+
+pure func test_prelude_cannot_define_the_program_entrypoint() -> Bool:
+	rejects(
+		accepted_prelude(
+			TYPES + "pure func main(value: Int) -> String:\n\tbuiltin(\"int.to_string\")\n",
+		),
+		51,
+		55,
+		"duplicate or reserved prelude function name",
+		(
+			"give prelude functions distinct names and reserve main for the program "
+			+ "entrypoint"
+		),
+	)
+
+
+pure func test_string_length_contract_rejects_an_int_parameter() -> Bool:
+	rejects(
+		accepted_prelude(
+			TYPES + "pure func length(value: Int) -> Int:\n\tbuiltin(\"string.length\")\n",
+		),
+		87,
+		102,
+		"builtin declaration does not match its runtime contract",
+		"declare a pure function with one String parameter returning Int",
+	)
+
+
+pure func test_runtime_call_requires_its_declared_argument() -> Bool:
+	program_rejects(
+		TYPES + CONVERT,
+		"func main() -> Int:\n\tconvert()\n",
+		21,
+		28,
+		"function requires one argument",
+		"pass one expression of the declared parameter type",
+	)
+
+
+pure func test_runtime_call_checks_the_string_argument_type() -> Bool:
+	program_rejects(
+		TYPES + LENGTH,
+		"func main() -> Int:\n\tlength(7)\n",
+		21,
+		27,
+		"argument type does not match the parameter type",
+		"use an expression of type String here",
+	)
+
+
+pure func test_runtime_function_names_conflict_with_variants() -> Bool:
+	program_rejects(
+		TYPES + LENGTH,
+		"fixed union Choice:\n\tlength\nfunc main() -> Int:\n\t0\n",
+		21,
+		27,
+		"variant name conflicts with a prelude function",
+		"give functions and union variants distinct names",
+	)
+
+
+pure func test_string_type_name_cannot_be_redeclared_as_a_union() -> Bool:
+	program_rejects(
+		TYPES,
+		"fixed union String:\n\tEmpty\nfunc main() -> Int:\n\t0\n",
+		12,
+		18,
+		"duplicate union type name",
+		"give union types distinct names; Int and String are declared by the prelude",
+	)
+
+
+pure func test_local_binding_shadows_a_direct_runtime_call() -> Bool:
+	program_rejects(
+		TYPES + LENGTH,
+		"func main() -> Int:\n\tlength = 7\n\tlength(0)\n",
+		33,
+		39,
+		"local bindings cannot be called",
+		"use the binding as a value, or rename it to call the function",
+	)
+
+
+pure func test_local_binding_does_not_shadow_a_runtime_ufcs_target() -> Bool:
+	match checked_source(
+		TYPES + CONVERT + LENGTH,
+		"func main() -> Int:\n\tlength = 7\n\tlength.convert().length()\n",
+	):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 explicit prelude contracts",
+	tests = [
+		(
+			"duplicate prelude function name is rejected",
+			test_duplicate_prelude_function_name_is_rejected,
+		),
+		(
+			"prelude cannot define the program entrypoint",
+			test_prelude_cannot_define_the_program_entrypoint,
+		),
+		(
+			"String length contract rejects an Int parameter",
+			test_string_length_contract_rejects_an_int_parameter,
+		),
+		(
+			"runtime call requires its declared argument",
+			test_runtime_call_requires_its_declared_argument,
+		),
+		(
+			"runtime call checks the String argument type",
+			test_runtime_call_checks_the_string_argument_type,
+		),
+		(
+			"runtime function names conflict with variants",
+			test_runtime_function_names_conflict_with_variants,
+		),
+		(
+			"String type name cannot be redeclared as a union",
+			test_string_type_name_cannot_be_redeclared_as_a_union,
+		),
+		(
+			"local binding shadows a direct runtime call",
+			test_local_binding_shadows_a_direct_runtime_call,
+		),
+		(
+			"local binding does not shadow a runtime UFCS target",
+			test_local_binding_does_not_shadow_a_runtime_ufcs_target,
+		),
+		(
+			"runtime contracts publish complete primitive ABI",
+			test_runtime_contracts_publish_complete_primitive_abi,
+		),
+		(
+			"parsed program carries the accepted prelude",
+			test_parsed_program_carries_the_accepted_prelude,
+		),
+		(
+			"unpublished builtin type name is rejected",
+			test_unpublished_builtin_type_name_is_rejected,
+		),
+		(
+			"unpublished entrypoint identity is rejected",
+			test_unpublished_entrypoint_identity_is_rejected,
+		),
+		("builtin type identities must be distinct", test_builtin_type_identities_must_be_distinct),
+		(
+			"unpublished runtime header names are rejected",
+			test_unpublished_runtime_header_names_are_rejected,
+		),
+		(
+			"prelude publishes typed operations and one name table",
+			test_prelude_publishes_typed_operations_and_one_name_table,
+		),
+		(
+			"builtin names come from the explicit prelude",
+			test_builtin_names_come_from_the_explicit_prelude,
+		),
+		(
+			"type-only prelude does not add implicit functions",
+			test_type_only_prelude_does_not_add_implicit_functions,
+		),
+		("missing Int declaration is explicit", test_missing_int_declaration_is_explicit),
+		("missing String declaration is explicit", test_missing_string_declaration_is_explicit),
+		(
+			"duplicate builtin type is rejected at second name",
+			test_duplicate_builtin_type_is_rejected_at_second_name,
+		),
+		(
+			"runtime contract rejects wrong parameter type",
+			test_runtime_contract_rejects_wrong_parameter_type,
+		),
+		(
+			"runtime contract rejects wrong return type",
+			test_runtime_contract_rejects_wrong_return_type,
+		),
+		("runtime contract rejects zero parameters", test_runtime_contract_rejects_zero_parameters),
+		("runtime contract rejects impurity", test_runtime_contract_rejects_impurity),
+		(
+			"program declaration conflicting with prelude is rejected",
+			test_program_declaration_conflicting_with_prelude_is_rejected,
+		),
+		(
+			"builtin label is not a program string expression",
+			test_builtin_label_is_not_a_program_string_expression,
+		),
+	]
+}
