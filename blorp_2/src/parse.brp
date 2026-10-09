@@ -1,12 +1,16 @@
 import:
 	int as IntOps
+	list: reverse
+	option: is_some
 	syntax:
 		Diagnostic,
+		ExpressionBase(IntegerExpression, NameExpression, CallExpression),
 		LexedProgram,
+		ParameterList(EmptyParameters, SingleParameter),
 		ParsedFunction,
 		ParsedProgram,
 		Purity(Pure, Impure),
-		ReturnExpression(IntegerExpression, CallExpression),
+		ReturnExpression,
 		Span,
 		Symbol(PureKeyword, FunctionKeyword, LeftParen, RightParen, Arrow, Colon, Newline, Indent),
 		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral),
@@ -151,13 +155,36 @@ private fixed record ParsedBody {
 }
 
 
+private fixed record ParsedParameters {
+	parameters: ParameterList,
+	next: ParserState
+}
+
+
+private fixed union ExpressionStep:
+	ReadBase(ExpressionBase, ParserState)
+	OpenedCall(WrittenName, ParserState)
+
+
 private fixed record FunctionResult {
 	function: ParsedFunction,
 	next: ParserState
 }
 
 
-private pure func consume_body(state: ParserState) -> Result[ParsedBody, Diagnostic]:
+private pure func at_symbol(state: ParserState, symbol: Symbol) -> Bool:
+	match state.input.tokens.get(state.position):
+		Some(token):
+			match token.kind:
+				SymbolToken(actual):
+					symbol_matches(actual, symbol)
+				_:
+					False
+		None:
+			False
+
+
+private pure func consume_expression_step(state: ParserState) -> Result[ExpressionStep, Diagnostic]:
 	match state.input.tokens.get(state.position):
 		Some(token):
 			next: ParserState = {
@@ -167,36 +194,33 @@ private pure func consume_body(state: ParserState) -> Result[ParsedBody, Diagnos
 
 			match token.kind:
 				IntegerLiteral(value):
-					Ok({
-						body = IntegerExpression(value),
-						next = next,
-					})
+					Ok(ReadBase(IntegerExpression(value), next))
 				IdentifierToken(spelling):
-					opened ?= consume_symbol(
-						next,
-						LeftParen,
-						"expected '(' after the called function",
-						"write a zero-argument call such as one()",
-					)
-					closed ?= consume_symbol(
-						opened,
-						RightParen,
-						"expected ')' with no arguments",
-						"calls take no arguments in this increment",
-					)
-					Ok({
-						body = CallExpression({
-							spelling = spelling,
-							span = token.span,
-						}),
-						next = closed,
-					})
+					name: WrittenName = {
+						spelling = spelling,
+						span = token.span
+					}
+
+					if not at_symbol(next, LeftParen):
+						Ok(ReadBase(NameExpression(name), next))
+					else:
+						opened: ParserState = { next | position = IntOps.add(next.position, 1) }
+
+						if at_symbol(opened, RightParen):
+							Ok(
+								ReadBase(
+									CallExpression(name),
+									{ opened | position = IntOps.add(opened.position, 1) },
+								),
+							)
+						else:
+							Ok(OpenedCall(name, opened))
 				_:
 					Err(
 						expected(
 							state,
 							"expected a return expression",
-							"use 0, 1, or a zero-argument function call as the entire body",
+							"use 0, 1, a parameter name, or a call as the entire body",
 						),
 					)
 		None:
@@ -204,9 +228,101 @@ private pure func consume_body(state: ParserState) -> Result[ParsedBody, Diagnos
 				expected(
 					state,
 					"expected a return expression",
-					"use 0, 1, or a zero-argument function call as the entire body",
+					"use 0, 1, a parameter name, or a call as the entire body",
 				),
 			)
+
+
+private pure func consume_body(start: ParserState) -> Result[ParsedBody, Diagnostic]:
+	var state: ParserState = start
+	var pending: List[WrittenName] = []
+	var base: Option[ExpressionBase] = None
+	var failure: Option[Diagnostic] = None
+
+	while not base.is_some():
+		match consume_expression_step(state):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(ReadBase(value, next)):
+				base = Some(value)
+				state = next
+			Ok(OpenedCall(name, next)):
+				pending = pending.append(name)
+				state = next
+
+	value ?= match base:
+		Some(value):
+			Ok(value)
+		None:
+			error: Diagnostic = match failure:
+				Some(error):
+					error
+				None:
+					expected(
+						state,
+						"invalid parser expression state",
+						"report this compiler error with the input program",
+					)
+
+			Err(error)
+
+	calls: List[WrittenName] = pending.reverse()
+
+	for call in calls:
+		match consume_symbol(
+			state,
+			RightParen,
+			"expected ')' after the call argument",
+			"pass at most one complete Int expression, then close the call with ')'",
+		):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(next):
+				state = next
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				body = {
+					base = value,
+					unary_calls = calls
+				},
+				next = state,
+			})
+
+
+private pure func consume_parameters(state: ParserState) -> Result[ParsedParameters, Diagnostic]:
+	if at_symbol(state, RightParen):
+		Ok({
+			parameters = EmptyParameters,
+			next = { state | position = IntOps.add(state.position, 1) },
+		})
+	else:
+		name ?= consume_name(state, "expected a parameter name or ')'")
+		after_colon ?= consume_symbol(
+			name.next,
+			Colon,
+			"expected ':' after the parameter name",
+			"write a single parameter as name: Int",
+		)
+		type_name ?= consume_name(after_colon, "expected a parameter type")
+		closed ?= consume_symbol(
+			type_name.next,
+			RightParen,
+			"expected ')' after the parameter",
+			"declare at most one parameter, written name: Int",
+		)
+		Ok({
+			parameters = SingleParameter({
+				name = name.name,
+				type_name = type_name.name,
+			}),
+			next = closed,
+		})
 
 
 private pure func consume_function(start: ParserState) -> Result[FunctionResult, Diagnostic]:
@@ -241,16 +357,11 @@ private pure func consume_function(start: ParserState) -> Result[FunctionResult,
 		function.next,
 		LeftParen,
 		"expected '(' after the function name",
-		"write main() with no parameters",
+		"write main() or helper(value: Int)",
 	)
-	after_parameters ?= consume_symbol(
-		after_open,
-		RightParen,
-		"expected ')' with no parameters",
-		"write main() with no parameters",
-	)
+	parameters ?= consume_parameters(after_open)
 	after_arrow ?= consume_symbol(
-		after_parameters,
+		parameters.next,
 		Arrow,
 		"expected '->' before the return type",
 		"write main() -> Int with adjacent arrow characters",
@@ -279,6 +390,7 @@ private pure func consume_function(start: ParserState) -> Result[FunctionResult,
 		function = {
 			purity = purity,
 			function_name = function.name,
+			parameters = parameters.parameters,
 			return_type = return_type.name,
 			body = body.body
 		},

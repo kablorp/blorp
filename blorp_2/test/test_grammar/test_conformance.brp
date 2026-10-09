@@ -3,10 +3,11 @@ import:
 	../../src/parse: parse
 	../../src/syntax:
 		Diagnostic,
+		ExpressionBase(IntegerExpression, NameExpression, CallExpression),
 		IntegerValue(Zero, One),
+		ParameterList(EmptyParameters, SingleParameter),
 		ParsedProgram,
 		Purity(Pure, Impure),
-		ReturnExpression(IntegerExpression, CallExpression),
 	test: TestSuite
 
 
@@ -19,7 +20,10 @@ private IDENTIFIER_HELP: String = (
 
 private INDENT_HELP: String = "use exactly one tab or exactly four spaces before the return expression"
 
-private CHARACTER_HELP: String = "use func main() -> Int: followed by an indented 0; keep -> adjacent"
+private CHARACTER_HELP: String = (
+	"use ASCII function declarations and 0, 1, parameter names, or calls with zero "
+	+ "or one argument; keep -> adjacent"
+)
 
 private TRAILING_HELP: String = "start each declaration at column 1 with no blank lines"
 
@@ -45,11 +49,12 @@ private pure func accepts(
 		Ok(program):
 			match program.functions:
 				[function]:
-					match function.body:
+					match function.body.base:
 						IntegerExpression(value):
 							(
 								value == Zero
 								and function.purity == Impure
+								and function.body.unary_calls.length() == 0
 								and function.function_name.spelling == name
 								and function.function_name.span.start == name_start
 								and function.function_name.span.end == name_end
@@ -156,14 +161,14 @@ pure func test_header_requires_every_term_in_order() -> Bool:
 			9,
 			10,
 			"expected '(' after the function name",
-			"write main() with no parameters",
+			"write main() or helper(value: Int)",
 		)
 		and rejects(
 			"func main( -> Int:\n\t0",
 			11,
 			13,
-			"expected ')' with no parameters",
-			"write main() with no parameters",
+			"expected a parameter name or ')'",
+			IDENTIFIER_HELP,
 		)
 		and rejects(
 			"func main() Int:\n\t0",
@@ -190,14 +195,14 @@ pure func test_header_requires_every_term_in_order() -> Bool:
 	)
 
 
-pure func test_parameters_and_separated_arrow_are_rejected() -> Bool:
+pure func test_untyped_parameter_and_separated_arrow_are_rejected() -> Bool:
 	(
 		rejects(
 			"func main(x) -> Int:\n\t0",
-			10,
 			11,
-			"expected ')' with no parameters",
-			"write main() with no parameters",
+			12,
+			"expected ':' after the parameter name",
+			"write a single parameter as name: Int",
 		)
 		and rejects("func main() - > Int:\n\t0", 12, 13, "unsupported character", CHARACTER_HELP)
 	)
@@ -309,14 +314,14 @@ pure func test_body_requires_indent_and_expression() -> Bool:
 			21,
 			21,
 			"expected a return expression",
-			"use 0, 1, or a zero-argument function call as the entire body",
+			"use 0, 1, a parameter name, or a call as the entire body",
 		)
 		and rejects(
-			HEADER + "\tx",
-			22,
-			22,
-			"expected '(' after the called function",
-			"write a zero-argument call such as one()",
+			HEADER + "\tx(",
+			23,
+			23,
+			"expected a return expression",
+			"use 0, 1, a parameter name, or a call as the entire body",
 		)
 		and rejects(
 			HEADER + "\n\t0",
@@ -335,14 +340,14 @@ pure func test_numeric_spelling_is_restricted() -> Bool:
 			21,
 			23,
 			"only the integer literals 0 and 1 are supported",
-			"use the single character 0 or 1 as the function body",
+			"use the single character 0 or 1 as an Int expression",
 		)
 		and rejects(
 			HEADER + "\t2",
 			21,
 			22,
 			"only the integer literals 0 and 1 are supported",
-			"use the single character 0 or 1 as the function body",
+			"use the single character 0 or 1 as an Int expression",
 		)
 		and rejects(HEADER + "\t-0", 21, 22, "unsupported character", CHARACTER_HELP)
 		and rejects(HEADER + "\t0.0", 22, 23, "unsupported character", CHARACTER_HELP)
@@ -394,16 +399,17 @@ pure func test_declaration_repetition_and_call_syntax() -> Bool:
 		Ok(program):
 			match program.functions:
 				[first, second]:
-					second_is_one: Bool = match second.body:
+					second_is_one: Bool = match second.body.base:
 						IntegerExpression(One):
-							True
+							second.body.unary_calls.length() == 0
 						_:
 							False
 
-					match first.body:
+					match first.body.base:
 						CallExpression(name):
 							(
 								name.spelling == "one"
+								and first.body.unary_calls.length() == 0
 								and name.span.start == 21
 								and name.span.end == 24
 								and first.function_name.spelling == "main"
@@ -428,15 +434,31 @@ pure func test_declaration_repetition_and_call_syntax() -> Bool:
 					False
 
 
-pure func test_call_arguments_and_blank_separators_are_rejected() -> Bool:
+pure func test_argument_syntax_and_blank_separator_rule() -> Bool:
+	argument_accepted: Bool = match parse_source(HEADER + "\tone(0)"):
+		Ok(program):
+			match program.functions:
+				[function]:
+					match function.body.base:
+						IntegerExpression(Zero):
+							match function.body.unary_calls:
+								[call]:
+									(
+										call.spelling == "one"
+										and call.span.start == 21
+										and call.span.end == 24
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
 	(
-		rejects(
-			HEADER + "\tone(0)",
-			25,
-			26,
-			"expected ')' with no arguments",
-			"calls take no arguments in this increment",
-		)
+		argument_accepted
 		and rejects(
 			HEADER + "\t0\n\nfunc one() -> Int:\n\t1",
 			23,
@@ -454,10 +476,11 @@ pure func test_pure_qualifier_preserves_names_and_spans() -> Bool:
 		Ok(program):
 			match program.functions:
 				[function]:
-					match function.body:
+					match function.body.base:
 						IntegerExpression(Zero):
 							(
 								function.purity == Pure
+								and function.body.unary_calls.length() == 0
 								and function.function_name.spelling == "main"
 								and function.function_name.span.start == 10
 								and function.function_name.span.end == 14
@@ -489,9 +512,126 @@ pure func test_malformed_and_reserved_pure_are_rejected() -> Bool:
 	)
 
 
+pure func test_parameter_and_nested_call_are_valid_syntax() -> Bool:
+	match parse_source("func f(value: Foo) -> Bar:\n\touter(inner(value))\n"):
+		Ok(program):
+			match program.functions:
+				[function]:
+					match function.parameters:
+						SingleParameter(parameter):
+							match function.body.base:
+								NameExpression(value):
+									match function.body.unary_calls:
+										[inner, outer]:
+											(
+												function.purity == Impure
+												and function.function_name.spelling == "f"
+												and function.function_name.span.start == 5
+												and function.function_name.span.end == 6
+												and parameter.name.spelling == "value"
+												and parameter.name.span.start == 7
+												and parameter.name.span.end == 12
+												and parameter.type_name.spelling == "Foo"
+												and parameter.type_name.span.start == 14
+												and parameter.type_name.span.end == 17
+												and function.return_type.spelling == "Bar"
+												and function.return_type.span.start == 22
+												and function.return_type.span.end == 25
+												and value.spelling == "value"
+												and value.span.start == 40
+												and value.span.end == 45
+												and inner.spelling == "inner"
+												and inner.span.start == 34
+												and inner.span.end == 39
+												and outer.spelling == "outer"
+												and outer.span.start == 28
+												and outer.span.end == 33
+												and program.end.start == 48
+												and program.end.end == 48
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_parameter_annotation_requires_colon() -> Bool:
+	rejects(
+		"func f(value) -> Int:\n\t0\n",
+		12,
+		13,
+		"expected ':' after the parameter name",
+		"write a single parameter as name: Int",
+	)
+
+
+pure func test_call_requires_one_complete_argument_and_closing_paren() -> Bool:
+	(
+		rejects(
+			HEADER + "\tone(1",
+			26,
+			26,
+			"expected ')' after the call argument",
+			"pass at most one complete Int expression, then close the call with ')'",
+		)
+		and rejects(
+			HEADER + "\tone(1))",
+			27,
+			28,
+			"expected a newline after the return expression",
+			"put each declaration on its own two lines with no blank lines",
+		)
+		and rejects(
+			HEADER + "\t(1)",
+			21,
+			22,
+			"expected a return expression",
+			"use 0, 1, a parameter name, or a call as the entire body",
+		)
+	)
+
+
+pure func test_multiple_parameters_and_arguments_are_rejected() -> Bool:
+	(
+		rejects(
+			"func f(x: Int, y: Int) -> Int:\n\tx\n",
+			13,
+			14,
+			"only zero or one parameter or argument is supported",
+			"use at most one Int parameter and one call argument",
+		)
+		and rejects(
+			HEADER + "\tone(0, 1)",
+			26,
+			27,
+			"only zero or one parameter or argument is supported",
+			"use at most one Int parameter and one call argument",
+		)
+	)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 EBNF syntax conformance",
 	tests = [
+		(
+			"call requires a complete argument and closing paren",
+			test_call_requires_one_complete_argument_and_closing_paren,
+		),
+		(
+			"multiple parameters and arguments are rejected",
+			test_multiple_parameters_and_arguments_are_rejected,
+		),
+		(
+			"parameter and nested call are valid syntax",
+			test_parameter_and_nested_call_are_valid_syntax,
+		),
+		("parameter annotation requires colon", test_parameter_annotation_requires_colon),
 		("indent alternatives and optional final LF", test_indent_alternatives_and_final_lf),
 		("identifier start alternatives", test_identifier_start_alternatives),
 		("identifier continuation repetition", test_identifier_continuation_repetition),
@@ -500,8 +640,8 @@ tests: TestSuite = {
 		("invalid identifier start and non-ASCII", test_identifier_invalid_start_and_non_ascii),
 		("header requires every term in order", test_header_requires_every_term_in_order),
 		(
-			"parameters and separated arrow are rejected",
-			test_parameters_and_separated_arrow_are_rejected,
+			"untyped parameter and separated arrow are rejected",
+			test_untyped_parameter_and_separated_arrow_are_rejected,
 		),
 		("indentation is exact", test_indentation_is_exact),
 		("header starts at column one", test_header_starts_at_column_one),
@@ -514,8 +654,8 @@ tests: TestSuite = {
 		("EOF requires full consumption", test_eof_requires_full_consumption),
 		("declaration repetition and call syntax", test_declaration_repetition_and_call_syntax),
 		(
-			"call arguments and blank separators rejected",
-			test_call_arguments_and_blank_separators_are_rejected,
+			"call argument syntax and blank separator rule",
+			test_argument_syntax_and_blank_separator_rule,
 		),
 	]
 }

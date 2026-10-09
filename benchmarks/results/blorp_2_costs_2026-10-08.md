@@ -5,8 +5,8 @@ repository compiler. Building that code is outside the measured boundary.
 They describe the current host compiler's code generation and runtime; they
 do not predict the future self-hosted compiler's cost.
 
-The final section records the purity increment with its predeclared ceilings.
-Earlier sections retain the initial and function-call measurements.
+The final section records Int parameters and nested calls with their predeclared
+ceilings. Earlier sections retain the initial, function-call and purity measurements.
 
 ## Initial end-to-end return-zero example
 
@@ -527,3 +527,157 @@ final runs. Code-reviewer and test-runner reviews completed before commit.
 | Shared compiler C | `cf9f2be568e7f6cb830d75fc4ddc04bf12a7932d3de6bfc760bae26308a23a77` |
 | Normal pilot compiler | `113d08555da7d2902e5a86735a0de313a5c36f8f218ac5db0ed17d158422b6db` |
 | Diagnostic pilot compiler | `8f87b1dc32fe203ff51a7e2100f5372114c1bdf0d083499f4a13befd6833a334` |
+
+## Int parameter and nested-call increment: preimplementation guardrails
+
+The next accepted example adds a single declared `Int` parameter, parameter
+lookup and nested zero/one-argument calls. Bodies remain one expression;
+`main` remains parameterless. Literal spelling stays restricted to 0 and 1.
+Recursion, multiple arguments, grouped expressions, bindings, imports and
+operators remain outside this increment.
+
+Before implementation, ceilings are **1,450 formatted compiler-source lines**
+(current 1,087) and **2,850 suite/support lines** (current 2,302); raw input
+fixture lines are reported separately. The new nested-call fixture and a
+distinguishable-wrapper ordering fixture each have initial ceilings of
+**500 managed allocations** and **40,000,000 retired instructions**. The
+existing fixture limits remain 120/22M, 230/26M and 360/32M. Tests cannot raise
+them automatically; any excess must be investigated or the increment rescoped.
+
+The proposed boundary represents this unary expression grammar as a typed
+base plus call wrappers in inner-to-outer order, without recursive nodes or
+a general expression arena. Parsing owns names/spans; checking resolves
+parameter scope, signatures and every call's arity/purity before publishing
+an opaque checked program. Cycle validation must read all base/wrapper call
+edges rather than relying on one outgoing edge per function. The existing
+compiler confirms lexical parameter shadowing: an Int parameter can shadow
+a global function, and attempting to call that parameter is rejected.
+
+Matched baseline command on the unchanged FRESH host and cached pilot binaries:
+
+```sh
+make -C blorp_2 test-compiler
+bin/blorp test --suite --timeout 180 \
+  blorp_2/test/e2e/test_return_zero.brp \
+  blorp_2/test/e2e/test_call_one.brp \
+  blorp_2/test/e2e/test_pure_calls.brp
+```
+
+All eight callbacks passed. Managed allocations and instruction minima were
+108 / 18,984,092; 206 / 19,120,457; 330 / 19,187,041 respectively. Setup reused
+the compiler binaries. The host/binary provenance matches the preceding final
+artifact table. Raw evidence is retained locally in
+`blorp_2/build/guardrails/nested-calls-baseline.log`. The completed increment
+and final validation follow.
+
+## Int parameters and nested calls: final validation
+
+The compiler now accepts zero or one explicitly typed `Int` parameter, a
+reference to the containing function's parameter, and nested zero/one-argument
+calls. `main` remains parameterless. The parsed body is a typed base plus unary
+wrappers in inner-to-outer order; the checked body retains resolved identities,
+call spans and a parameter slot without spelling-based backend decisions.
+All calls use the containing function's scope and purity. Local topological
+elimination checks every base and wrapper edge before opaque publication.
+
+Final formatted production source is **1,429 lines**, up **342** from 1,087,
+within the 1,450 ceiling. Suite/support source is **2,819 lines**, up **517**
+from 2,302, within 2,850. Raw fixtures total **24 lines**, up 12; the separate
+fixture boundary prevents treating input programs as test infrastructure.
+No ceiling was raised. All compiler functions after source input remain pure;
+the source operator scan found no trait-dispatched arithmetic or equality.
+
+Tests-first validation ran the three affected checker/grammar/new-native suites
+against unchanged production code: **16 new callbacks failed and 34 existing
+callbacks passed**. The finished independent runs each passed **98/98 callbacks
+across 14 suites**, normally and with UBSan/leak checking:
+
+```sh
+scripts/compiler-build-status
+make -C blorp_2 test-compiler
+make -C blorp_2 test
+bin/blorp test --suite --sanitize=undefined --leak-check --timeout 180 \
+  blorp_2/test/unit blorp_2/test/e2e blorp_2/test/test_grammar
+```
+
+| Fixture | Baseline allocations | Final allocations / ceiling | Normal instructions / ceiling | UBSan-suite instruction run | Native exit |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `return_zero` | 108 | 116 / 120 | 19,028,931 / 22,000,000 | 18,909,522 | 0 |
+| `call_one` | 206 | 225 / 230 | 19,165,613 / 26,000,000 | 19,059,011 | 1 |
+| `pure_calls` | 330 | 360 / 360 | 19,277,271 / 32,000,000 | 19,173,870 | 1 |
+| `nested_calls` | — | 411 / 500 | 19,343,049 / 40,000,000 | 19,280,201 | 1 |
+| `nested_order` | — | 447 / 500 | 19,387,484 / 40,000,000 | 19,254,385 | 0 |
+
+The representation and complete-edge validation increase allocations by 8,
+19 and 30 on the existing examples; the purity fixture meets its ceiling
+exactly, leaving no allocation headroom. Instruction counts remain within
+their unchanged limits. No elapsed-time or instruction-speed improvement is
+claimed. Each number measures the pilot compiler process, not compilation by
+the host or execution of the emitted program. All native programs passed
+strict C11/O2 warnings and produced empty stdout/stderr. The three earlier C
+outputs remain byte-identical. The retained new C shows the resolved parameter
+and wrapper order; ignored parameters receive an explicit `(void)` cast.
+
+All three normal instruction samples, in execution order:
+
+- `return_zero`: 19,138,444; 19,028,931; 19,039,883.
+- `call_one`: 20,469,744; 19,165,613; 19,265,117.
+- `pure_calls`: 19,374,925; 19,277,271; 19,304,187.
+- `nested_calls`: 19,446,559; 19,343,049; 19,365,608.
+- `nested_order`: 19,477,163; 19,387,484; 19,462,583.
+
+Samples during the UBSan/leak TestSuite run:
+
+- `return_zero`: 19,095,223; 18,914,864; 18,909,522.
+- `call_one`: 19,059,011; 19,079,903; 19,126,716.
+- `pure_calls`: 19,386,622; 19,173,870; 19,206,851.
+- `nested_calls`: 19,481,570; 19,280,201; 19,299,763.
+- `nested_order`: 19,423,054; 19,254,385; 19,338,256.
+
+UBSan instruments TestSuite code and imported pilot modules. Both sets of
+instruction samples still use the cached normal `-O2` compiler; the cached
+allocation-diagnostic compiler requires zero leaks and has no extra native
+UBSan flags. The independent logs and emitted C are retained locally under
+`blorp_2/build/guardrails/nested-independent-pgZOn7/`, with scratch evidence in
+`/tmp/blorp-2-nested-validation.pgZOn7/`.
+
+Six deliberate source mutations proved detection by Blorp tests:
+
+| Mutation | Failed callbacks |
+| --- | ---: |
+| Bypass declared purity validation | 6 |
+| Bypass call arity validation | 3 |
+| Allow parameter calls to resolve to a same-named global | 1 |
+| Omit the base call dependency | 4 |
+| Stop wrapper dependency checking after the first wrapper | 1 |
+| Reverse emitted unary wrappers | 2 of 4 native-suite callbacks |
+
+The last mutation also produced a strictly compiled native program exiting 1
+where the ordering fixture requires 0. Checker/emitter sources were restored
+byte-for-byte after every mutation; all 32 checker callbacks then passed.
+Logs are `nested-mutation-*.log`, with restored evidence in
+`nested-mutations-check-restored.log`, under `blorp_2/build/guardrails/`.
+
+One host-compiler obstacle appeared during preparation: a nested `Result`
+match in parser construction emitted an assignment from boxed `blorp_Result*`
+to `blorp_StackResult`, rejected by Clang. Selecting one typed `Diagnostic`
+in the inner match and wrapping it in one `Err` kept the parser logic intact
+and compiled correctly. The existing compiler was not modified or rebuilt.
+This observation is a bounded follow-up for host Result representation.
+
+The host remained FRESH before and after validation. Source/test/grammar/
+Makefile fingerprints were unchanged throughout both final runs. Explicit
+setup and both final gates generated **zero compiler C files and zero links**;
+cached C, both binaries and manifest retained their hashes, timestamps, sizes
+and inodes. Mutation probes and source development occurred before those
+final runs and rebuilt the pilot cache when necessary. Code-reviewer and
+documenter review approved the final code/tests/docs without outstanding
+findings; the test-runner independently verified the gates and cache reuse.
+
+| Final artifact | SHA-256 |
+| --- | --- |
+| Host `bin/blorp` | `c67d5bb315a67999ec5d608eaa41aab83f8d75e6220b44b936ea2a4849b7ba0a` |
+| Shared compiler C | `d668bb653e63d9008bd8114e10d12613a873ba1aca2f40f8b737bebb39926f36` |
+| Normal pilot compiler | `6a2ce338c223993aa1399fde7303fa6f0f0417c5ca0695a70f35f780694d642f` |
+| Diagnostic pilot compiler | `0d15a15c3417c23bade1a2a7687d3d80ea06dde20fbf12c3981a65e40567cde4` |
+| Cache input manifest | `ba60ca39fdcdd469e0f5ec7d7507a4cabfaeff138de7dc9c32f199172f2925be` |

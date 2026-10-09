@@ -28,8 +28,7 @@ func one() -> Int:
 ```
 
 The executable returns exit status 1 with empty stdout and stderr. A helper
-may appear before or after its caller. Functions still take no parameters
-or arguments; `args: List[String]`, imports and printing are future increments.
+may appear before or after its caller. Imports and printing are future increments.
 
 The third example, [`test/e2e/fixtures/pure_calls.brp`](test/e2e/fixtures/pure_calls.brp),
 adds declared purity:
@@ -47,6 +46,24 @@ A `pure func` may call only other pure functions. A plain `func` is impure
 and may call either kind. Purity is declared and checked, not inferred from a
 literal body. A pure `main` is also accepted with the same C entrypoint ABI.
 This example exits 1 with empty stdout and stderr.
+
+The fourth example, [`test/e2e/fixtures/nested_calls.brp`](test/e2e/fixtures/nested_calls.brp),
+adds one explicitly typed parameter and a nested call:
+
+```blorp
+pure func one() -> Int:
+	1
+pure func identity(value: Int) -> Int:
+	value
+func main() -> Int:
+	identity(one())
+```
+
+It exits 1 with empty stdout and stderr. Helpers may take zero or one `Int`
+parameter; `main` takes none. A call may pass one complete expression, including
+another call. The companion [`nested_order.brp`](test/e2e/fixtures/nested_order.brp)
+returns `zero(one(1))`, with both helpers ignoring their parameter. Its exit status
+0 and exact generated C distinguish the order of the two calls.
 
 From the repository root:
 
@@ -90,6 +107,8 @@ are **230 managed allocations** and **26,000,000 retired instructions**.
 The shared native/cost harness gives each fixture its own expected C, exit status
 and limits. The pure-call fixture has **360 managed allocations** and
 **32,000,000 retired instructions** as its initial ceilings.
+Both nested-call fixtures have **500 managed allocations** and **40,000,000
+retired instructions** as their initial ceilings. Earlier ceilings remain unchanged.
 
 These measure one execution of the new compiler on the example, including
 process startup, argument handling, input/output, and the compile pipeline.
@@ -106,7 +125,7 @@ The first limits were established on arm64 macOS with Apple Clang 21. See the
 [cost record](../benchmarks/results/blorp_2_costs_2026-10-08.md) for baselines,
 commands, provenance, and measurement limits.
 
-The final purity-increment run passed all 71 tests, both normally and with
+The preceding purity increment passed all 71 tests, both normally and with
 UBSan/leak checking. It measured **330 allocations** and **19,204,477 retired
 instructions** for `pure_calls`;
 the existing examples measured 108 and 206 allocations, within their unchanged
@@ -116,10 +135,11 @@ the earlier measurements and final validation provenance.
 
 ## Grammar for this increment
 
-This specification defines only the three examples' language: one or more
-zero-argument functions with explicit return types. A function body is the
-integer literal `0` or `1`, or a zero-argument function call. No other
-declarations, expressions, literals, statements, or comments are supported.
+This specification defines only the examples' language: one or more functions
+with explicit return types and zero or one explicitly typed parameter. A function
+body is the integer literal `0` or `1`, its own parameter name, or a call with zero
+or one argument. Arguments use the same expression grammar, so calls may nest.
+No other declarations, expressions, literals, statements, or comments are supported.
 
 [`grammar.ebnf`](grammar.ebnf) defines the complete restricted source grammar
 and its EBNF dialect. Whitespace is explicit: LF is `"\n"`, TAB is `"\t"`, and
@@ -130,7 +150,7 @@ exclude the reserved spellings `func` and `pure`.
 checks grammar conformance through lexing and parsing, without semantic
 checking. Named cases cover alternatives, optional/repeated terms, required
 term order, lexical/layout boundaries, and complete input consumption. Accepted
-cases check every parsed field and its byte spans; rejected cases check the
+cases check published names, expression structure and byte spans; rejected cases check the
 exact diagnostic, help, and span. These are handwritten conformance cases;
 the test runner does not interpret EBNF or generate cases from it.
 
@@ -150,8 +170,8 @@ Lexical and layout rules:
   `funcmain` is one identifier. The two characters of `->` are adjacent.
   Tabs occur only in the indentation prefix.
 - `func` and `pure` are reserved. The optional `pure` qualifier precedes `func`
-  with spaces between the two keywords. Function and type names are identifiers whose meaning is
-  checked after parsing.
+  with spaces between the two keywords. Function, parameter and type names are
+  identifiers whose meaning is checked after parsing.
 - Integer literals are the single characters `0` and `1`. Other values and
   spellings, including `00`, `-0`, and `0.0`, are outside this increment.
   Non-ASCII characters and CRLF line endings are rejected.
@@ -159,20 +179,32 @@ Lexical and layout rules:
 
 Semantic rules:
 
-- Exactly one function must be named `main`. Every function takes no parameters
-  and returns `Int`, the language's signed 64-bit integer type.
+- Exactly one function must be named `main`, and it takes no parameters. A helper
+  takes zero or one parameter, written `value: Int`. Every function returns `Int`,
+  the language's signed 64-bit integer type.
 - Function names are unique within the input file. Every callee must be declared
-  in that file; declaration order does not affect resolution. Calls take no arguments.
+  in that file; declaration order does not affect resolution. Calls supply exactly
+  the number of arguments the callee declares.
+- A bare name resolves only to the containing function's parameter. It cannot
+  refer to another function's parameter or denote a function value. A parameter
+  shadows a same-named function; calling that name rejects the non-callable `Int`.
+  Arguments use the caller's scope, even when the callee has a parameter with
+  the same spelling.
 - A pure caller may call only declared pure callees. Every function body is
   checked, including unreachable helpers, so a pure call chain cannot hide an
-  impure edge. A violation highlights the callee name and suggests marking the
-  callee pure or removing pure from the caller.
-- Call chains must be acyclic in this increment. Self and mutual recursion produce
-  a semantic diagnostic. General recursion and its resource rules are future work.
+  impure edge. Calls inside arguments obey the containing function's purity.
+  A violation highlights the callee name and suggests marking the callee pure
+  or removing pure from the caller.
+- Every call edge must be acyclic, including nested argument calls. Self and mutual
+  recursion produce a semantic diagnostic. Repeating an acyclic call, such as
+  `identity(identity(1))`, is valid. General recursion and its resource rules are
+  future work.
 - Each source function has a 64-bit C return value and a generated symbol based
   on its compilation-local identity. A separate C `int main(void)` wrapper calls
   the checked entrypoint and converts the result to the process exit status.
 - The final expression is the return value. No explicit `return` is needed.
+- Multiple parameters or arguments, parenthesized expressions, bindings, and
+  function values are outside this increment.
 - Syntax and semantic errors carry a source location, an explanation, and help.
   Rejected source produces no C output and does not overwrite an existing output.
 
@@ -188,13 +220,17 @@ The impure command shell owns file I/O and diagnostic rendering. Its pure
 pipeline publishes these complete results:
 
 1. Lexing produces tokens with source spans and an explicit end-of-source span.
-2. Parsing produces complete declarations, written names, and literal/call syntax.
+2. Parsing produces complete declarations, parameter annotations, written names,
+   and expression syntax. Each expression has a literal, name, or zero-argument
+   call base, followed by unary call wrappers in inner-to-outer order.
 3. Checking validates signatures and call chains, resolves calls to function
-   identities, and publishes an opaque checked program with its entrypoint identity.
+   identities and parameter reads to the sole parameter slot, and publishes an
+   opaque checked program with its entrypoint identity.
 4. Emission consumes that checked program and produces C.
 
-Spellings and source spans belong to syntax. Emission receives checked meaning,
-not unchecked names. These integer-only programs need no target heap allocation or ownership pass.
+Written spellings belong to syntax. Checking retains call spans for diagnostics;
+emission uses resolved identities, parameter shapes and expressions. These integer-only
+programs need no target heap allocation or ownership pass.
 Ownership, type registries, and general pass infrastructure will be introduced
 when an executable example requires them.
 
@@ -231,10 +267,14 @@ source dependencies that fit the subset.
 Each next increment adds an example, the exact grammar and semantic rules it
 needs, positive and negative tests, and independently reviewed implementation.
 Builders remain local; published results remain immutable; each semantic fact
-has one authority. Function identity is declaration-list position; checked call
-expressions contain only that identity, and the checked program owns the entrypoint.
-Each checked function retains its validated purity beside its resolved body;
-emission reads only validated facts and does not recheck purity. Existing compiler internals are not pilot dependencies.
+has one authority. Function identity is declaration-list position; checked calls
+contain resolved identities and diagnostic spans, and the checked program owns the
+entrypoint. Local topological elimination checks all base and wrapper call edges;
+no persistent graph registry is needed. Each checked function retains its validated
+purity and parameter shape beside its resolved body. Emission reads only validated
+facts and does not recheck purity or name scope. C function and parameter names are
+synthetic, and unused parameters are explicitly discarded to keep warning checks
+clean. Existing compiler internals are not pilot dependencies.
 
 The compilation pipeline is entirely pure once its source inputs have been
 loaded. `compile(source)` composes pure lexing, parsing, checking and C emission;

@@ -1,7 +1,9 @@
 import:
 	../../src/check:
+		CheckedBase(ReturnInteger, ReturnParameter, ReturnCall),
 		CheckedFunction,
-		CheckedReturn(ReturnInteger, ReturnCall),
+		CheckedProgram,
+		ParameterShape(NoParameter, IntParameter),
 		check,
 		checked_functions,
 		function_number,
@@ -9,6 +11,12 @@ import:
 	../../src/parse: parse
 	../../src/syntax: Diagnostic, IntegerValue(Zero, One), Purity(Pure, Impure)
 	test: TestSuite
+
+
+private pure func checked_source(source: String) -> Result[CheckedProgram, Diagnostic]:
+	tokens ?= lex(source)
+	parsed ?= parse(tokens)
+	check(parsed)
 
 
 private pure func diagnostic(
@@ -55,16 +63,18 @@ pure func test_resolved_forward_call_and_entrypoint() -> Bool:
 
 							match checked.functions:
 								[first, second]:
-									second_is_one: Bool = match second.body:
+									second_is_one: Bool = match second.body.base:
 										ReturnInteger(One):
 											True
 										_:
 											False
 
-									match first.body:
-										ReturnCall(id):
+									match first.body.base:
+										ReturnCall(call):
 											(
-												function_number(id) == 1
+												function_number(call.target) == 1
+												and first.body.unary_calls.length() == 0
+												and second.body.unary_calls.length() == 0
 												and second_is_one
 												and first.purity == Impure
 												and second.purity == Impure
@@ -230,9 +240,253 @@ pure func test_checked_functions_keep_declared_purity() -> Bool:
 							) == [Pure, Pure, Impure]
 
 
+pure func test_parameter_type_is_explicit_int() -> Bool:
+	diagnostic(
+		"func identity(value: Bool) -> Int:\n\tvalue\nfunc main() -> Int:\n\tidentity(1)\n",
+		21,
+		25,
+		"expected Int as the parameter type",
+		"declare the parameter as name: Int",
+	)
+
+
+pure func test_main_has_no_parameter() -> Bool:
+	diagnostic(
+		"func main(value: Int) -> Int:\n\tvalue\n",
+		10,
+		15,
+		"main cannot have a parameter",
+		"declare main() -> Int: with no parameters",
+	)
+
+
+pure func test_unknown_bare_value_is_rejected() -> Bool:
+	diagnostic(
+		"func main() -> Int:\n\tvalue\n",
+		21,
+		26,
+		"unknown value",
+		"use this function's parameter name or a call such as one()",
+	)
+
+
+pure func test_parameter_cannot_be_called_as_global_function() -> Bool:
+	diagnostic(
+		"func one() -> Int:\n\t1\nfunc use(one: Int) -> Int:\n\tone()\nfunc main() -> Int:\n\tuse(1)\n",
+		50,
+		53,
+		"Int parameters cannot be called",
+		"use the parameter as a value, or rename it to call the function",
+	)
+
+
+pure func test_call_requires_its_parameter_argument() -> Bool:
+	diagnostic(
+		"func identity(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tidentity()\n",
+		62,
+		70,
+		"function requires one argument",
+		"pass one Int expression, such as identity(1)",
+	)
+
+
+pure func test_zero_parameter_call_rejects_argument() -> Bool:
+	diagnostic(
+		"func one() -> Int:\n\t1\nfunc main() -> Int:\n\tone(1)\n",
+		43,
+		46,
+		"function takes no arguments",
+		"remove the argument and call the function with ()",
+	)
+
+
+pure func test_pure_argument_call_uses_containing_function() -> Bool:
+	diagnostic(
+		"func one() -> Int:\n\t1\npure func identity(value: Int) -> Int:\n\tvalue\npure func main() -> Int:\n\tidentity(one())\n",
+		103,
+		106,
+		"pure functions cannot call impure functions",
+		"mark the callee pure or remove pure from the caller",
+	)
+
+
+pure func test_argument_cycle_is_rejected() -> Bool:
+	diagnostic(
+		"pure func identity(value: Int) -> Int:\n\tvalue\nfunc loop() -> Int:\n\tidentity(loop())\nfunc main() -> Int:\n\tloop()\n",
+		76,
+		80,
+		"call chain contains recursion",
+		"use an acyclic call chain; recursion is not supported in this increment",
+	)
+
+
+pure func test_parameter_does_not_leak_to_other_function() -> Bool:
+	diagnostic(
+		"func helper(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tvalue\n",
+		60,
+		65,
+		"unknown value",
+		"use this function's parameter name or a call such as one()",
+	)
+
+
+pure func test_argument_does_not_use_callee_parameter_scope() -> Bool:
+	diagnostic(
+		"func identity(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tidentity(value)\n",
+		71,
+		76,
+		"unknown value",
+		"use this function's parameter name or a call such as one()",
+	)
+
+
+pure func test_parameter_slot_and_repeated_wrappers() -> Bool:
+	match checked_source(
+		"pure func one() -> Int:\n\t1\npure func identity(one: Int) -> Int:\n\tone\nfunc main() -> Int:\n\tidentity(identity(1))\n",
+	):
+		Err(_):
+			False
+		Ok(program):
+			checked = checked_functions(program)
+
+			match checked.functions:
+				[first, identity, main]:
+					parameter_is_value: Bool = match identity.body.base:
+						ReturnParameter:
+							identity.body.unary_calls.length() == 0
+						_:
+							False
+
+					match main.body.base:
+						ReturnInteger(One):
+							match main.body.unary_calls:
+								[inner, outer]:
+									(
+										parameter_is_value
+										and identity.parameters == IntParameter
+										and identity.purity == Pure
+										and first.parameters == NoParameter
+										and main.parameters == NoParameter
+										and function_number(inner.target) == 1
+										and function_number(outer.target) == 1
+										and inner.span.start == 99
+										and inner.span.end == 107
+										and outer.span.start == 90
+										and outer.span.end == 98
+										and function_number(checked.entrypoint) == 2
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_impure_caller_can_pass_impure_call_to_pure_function() -> Bool:
+	match checked_source(
+		"func one() -> Int:\n\t1\npure func identity(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tidentity(one())\n",
+	):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+pure func test_cycle_in_unary_wrapper_is_rejected() -> Bool:
+	diagnostic(
+		"func loop(value: Int) -> Int:\n\tloop(value)\nfunc main() -> Int:\n\tloop(1)\n",
+		31,
+		35,
+		"call chain contains recursion",
+		"use an acyclic call chain; recursion is not supported in this increment",
+	)
+
+
+pure func test_pure_caller_rejects_impure_unary_wrapper() -> Bool:
+	diagnostic(
+		"func identity(value: Int) -> Int:\n\tvalue\npure func main() -> Int:\n\tidentity(1)\n",
+		67,
+		75,
+		"pure functions cannot call impure functions",
+		"mark the callee pure or remove pure from the caller",
+	)
+
+
+pure func test_cycle_after_settled_inner_wrapper_is_rejected() -> Bool:
+	diagnostic(
+		"pure func identity(value: Int) -> Int:\n\tvalue\nfunc loop(value: Int) -> Int:\n\tloop(identity(value))\nfunc main() -> Int:\n\tloop(1)\n",
+		77,
+		81,
+		"call chain contains recursion",
+		"use an acyclic call chain; recursion is not supported in this increment",
+	)
+
+
+pure func test_pure_caller_checks_outer_wrapper_after_pure_inner() -> Bool:
+	diagnostic(
+		"pure func identity(value: Int) -> Int:\n\tvalue\nfunc impure(value: Int) -> Int:\n\tvalue\npure func main() -> Int:\n\timpure(identity(1))\n",
+		111,
+		117,
+		"pure functions cannot call impure functions",
+		"mark the callee pure or remove pure from the caller",
+	)
+
+
+pure func test_outer_wrapper_arity_is_checked_after_valid_inner() -> Bool:
+	diagnostic(
+		"func one() -> Int:\n\t1\npure func identity(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tone(identity(1))\n",
+		89,
+		92,
+		"function takes no arguments",
+		"remove the argument and call the function with ()",
+	)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 semantic checking",
 	tests = [
+		(
+			"outer wrapper arity is checked after valid inner",
+			test_outer_wrapper_arity_is_checked_after_valid_inner,
+		),
+		(
+			"cycle after a settled inner wrapper is rejected",
+			test_cycle_after_settled_inner_wrapper_is_rejected,
+		),
+		(
+			"pure caller checks the outer wrapper after pure inner",
+			test_pure_caller_checks_outer_wrapper_after_pure_inner,
+		),
+		("parameter slot and repeated wrappers", test_parameter_slot_and_repeated_wrappers),
+		(
+			"impure caller may pass impure call to pure function",
+			test_impure_caller_can_pass_impure_call_to_pure_function,
+		),
+		("cycle in unary wrapper is rejected", test_cycle_in_unary_wrapper_is_rejected),
+		("pure caller rejects impure unary wrapper", test_pure_caller_rejects_impure_unary_wrapper),
+		("parameter type is explicit Int", test_parameter_type_is_explicit_int),
+		("main has no parameter", test_main_has_no_parameter),
+		("unknown bare value is rejected", test_unknown_bare_value_is_rejected),
+		(
+			"parameter call cannot fall through to a global",
+			test_parameter_cannot_be_called_as_global_function,
+		),
+		("one-parameter call requires an argument", test_call_requires_its_parameter_argument),
+		("zero-parameter call rejects an argument", test_zero_parameter_call_rejects_argument),
+		(
+			"argument purity uses the containing function",
+			test_pure_argument_call_uses_containing_function,
+		),
+		("cycle inside a call argument is rejected", test_argument_cycle_is_rejected),
+		(
+			"parameter does not leak to other functions",
+			test_parameter_does_not_leak_to_other_function,
+		),
+		(
+			"argument does not use callee parameter scope",
+			test_argument_does_not_use_callee_parameter_scope,
+		),
 		("resolved forward call and entrypoint", test_resolved_forward_call_and_entrypoint),
 		("checked functions keep declared purity", test_checked_functions_keep_declared_purity),
 		("unknown callee diagnostic", test_unknown_callee_diagnostic),
