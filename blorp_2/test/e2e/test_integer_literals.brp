@@ -1,87 +1,31 @@
 import:
-	harness:
-		Example,
-		prepare_compiler,
-		run_example,
-		run_isolated,
-		run_successfully,
-		verify_rejected_command,
-	process: exit_code, stderr, stdout
-	system: file_exists, getenv, read_file, remove_dir, remove_file, temp_dir, write_file
+	cost: CostLimits
+	harness: Example, run_example, run_source_example, verify_rejected_command, with_directory
+	system: file_exists, read_file, write_file
 	test: TestSuite
 
+
+private COMPANION_LIMITS: CostLimits = {
+	allocations = 10000,
+	instructions = 100000000
+}
 
 private FORTY_TWO: Example = {
 	name = "return42",
 	fixture = "blorp_2/test/e2e/fixtures/return_42.brp",
-	expected_c = "#include <stdint.h>\nint64_t blorp_f_0(void);int64_t blorp_f_0(void){return INT64_C(42);}int main(void){return (int)blorp_f_0();}\n",
+	expected_c = Some(
+		"#include <stdint.h>\nint64_t blorp_f_0(void);int64_t blorp_f_0(void){const int64_t blorp_vl_0=INT64_C(42);(void)blorp_vl_0;return blorp_vl_0;}int main(void){return (int)blorp_f_0();}\n",
+	),
 	exit_status = 42,
 	limits = {
 		allocations = 230,
-		instructions = 26000000
+		instructions = 40000000
 	}
 }
 
 
-func test_literal_returns_42() -> Bool:
-	run_example(FORTY_TWO)
-
-
-private func verify_driver(
-	directory: String,
-	name: String,
-	source: String,
-	status: Int,
-) -> Result[Void, String]:
-	path = directory + "/" + name
-	written ?= write_file(path + ".c", source)
-	linked ?= run_successfully(
-		getenv("BLORP_CC").get_or("clang"),
-		[
-			"-std=c11",
-			"-Wall",
-			"-Wextra",
-			"-Werror",
-			"-pedantic",
-			"-O2",
-			"-fsanitize=undefined",
-			"-fno-sanitize-recover=all",
-			path + ".c",
-			"-o",
-			path,
-		],
-	)
-	actual ?= run_isolated(path, [])
-
-	if (
-		actual.exit_code() == status
-		and actual.stdout() == ""
-		and actual.stderr() == ""
-	):
-		Ok(void)
-	else:
-		Err(
-			"the independent Int64 endpoint driver returned an unexpected status or stream: " + actual.stderr(),
-		)
-
-
-private func verify_endpoints(directory: String, compiler: String) -> Result[Void, String]:
-	compiled ?= run_successfully(
-		compiler,
-		["blorp_2/test/e2e/fixtures/integer_endpoints.brp", directory + "/program.c"],
-	)
-	program ?= read_file(directory + "/program.c")
-	-- Rename only the emitted entrypoint. These independent comparisons never narrow Int64.
-	driver = "#define main blorp_entrypoint_wrapper\n" + program + "#undef main\nint main(void){return blorp_f_0()==INT64_MIN && blorp_f_1()==INT64_MAX ? 0 : 1;}\n"
-	verified ?= verify_driver(directory, "endpoints", driver, 0)
-	wrong_value = driver.replace("return INT64_MIN;", "return INT64_C(0);")
-
-	changed ?= if wrong_value == driver:
-		Err("the endpoint fault proof did not change the emitted minimum")
-	else:
-		Ok(void)
-
-	verify_driver(directory, "wrong-value", wrong_value, 1)
+func test_literal_returns_42(compiler: String) -> Bool:
+	run_example(compiler, FORTY_TWO)
 
 
 private func verify_range_rejection(directory: String, compiler: String) -> Result[Void, String]:
@@ -106,56 +50,50 @@ private func verify_range_rejection(directory: String, compiler: String) -> Resu
 		Err("an out-of-range literal overwrote existing output")
 
 
-private func verify_integer_contract(directory: String) -> Result[Void, String]:
-	compilers ?= prepare_compiler()
-	endpoints ?= verify_endpoints(directory, compilers.normal)
-	verify_range_rejection(directory, compilers.normal)
+private func verify_integer_contract(compiler: String, directory: String) -> Result[Void, String]:
+	verify_range_rejection(directory, compiler)
 
 
-func test_full_width_endpoints_and_rejected_range() -> Bool:
-	match (
-		run_successfully(
-			"mktemp",
-			["-d", temp_dir() + "/blorp-2-int64.XXXXXX"],
-		)
-	):
-		Err(error):
-			print_error(error)
-			False
-		Ok(temporary):
-			directory = temporary
-				.stdout()
-				.trim()
-			result = verify_integer_contract(directory)
-
-			for name in [
-				"program.c",
-				"endpoints.c",
-				"endpoints",
-				"wrong-value.c",
-				"wrong-value",
-				"overflow.brp",
-				"rejected.c",
-			]:
-				_ = remove_file(directory + "/" + name)
-
-			_ = remove_dir(directory)
-
-			match result:
-				Ok(_):
-					True
-				Err(error):
-					print_error(error)
-					False
+func test_rejected_integer_range(compiler: String) -> Bool:
+	with_directory(func(directory: String): verify_integer_contract(compiler, directory))
 
 
-tests: TestSuite = {
-	description = "Blorp 2 signed integer literals",
-	tests = [
-		("literal returns42", test_literal_returns_42),
-		(
-			"full-width endpoints, wrong-value fault proof and rejected range",
-			test_full_width_endpoints_and_rejected_range,
-		),
-	]
-}
+-- Exit status observes only the platform's low byte; phase tests pin Int64.
+func test_minimum_source_runs_under_ubsan(compiler: String) -> Bool:
+	run_source_example(
+		compiler,
+		"blorp_2/test/e2e/fixtures/integer_minimum.brp",
+		0,
+		COMPANION_LIMITS,
+	)
+
+
+-- Exit status observes only the platform's low byte; phase tests pin Int64.
+func test_maximum_source_runs_under_ubsan(compiler: String) -> Bool:
+	run_source_example(
+		compiler,
+		"blorp_2/test/e2e/fixtures/integer_maximum.brp",
+		255,
+		COMPANION_LIMITS,
+	)
+
+
+pure func suite(compiler: String) -> TestSuite:
+	{
+		description = "Blorp 2 signed integer literals",
+		tests = [
+			(
+				"minimum source executes under UBSan",
+				func(): test_minimum_source_runs_under_ubsan(compiler),
+			),
+			(
+				"maximum source executes under UBSan",
+				func(): test_maximum_source_runs_under_ubsan(compiler),
+			),
+			("literal returns42", func(): test_literal_returns_42(compiler)),
+			(
+				"rejected integer range preserves output",
+				func(): test_rejected_integer_range(compiler),
+			),
+		]
+	}

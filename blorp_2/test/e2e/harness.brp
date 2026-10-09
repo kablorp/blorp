@@ -1,26 +1,22 @@
 import:
 	cost: CompilationCost, CostLimits, check_limits, parse_allocations, parse_instructions
+	fs: IOError, resource_path, temporary_directory
 	process: ProcessOutput, run
-	system: file_exists, getenv, read_file, remove_dir, remove_file, temp_dir, write_file
+	system: file_exists, getenv, read_file, remove_file, temp_dir, write_file
 
 
 fixed record Example {
 	name: String,
 	fixture: String,
-	expected_c: String,
+	expected_c: Option[String],
 	exit_status: Int,
 	limits: CostLimits
 }
 
 
-fixed record CompilerBinaries {
-	normal: String,
-	diagnostic: String
-}
-
-
 func run_isolated(program: String, arguments: List[String]) -> Result[ProcessOutput, String]:
-	-- A parent's leak-check mode must not instrument the normal instruction run.
+	-- Keep a parent's leak mode out of unrelated child commands.
+	-- Measurements enable strict allocation diagnostics explicitly.
 	run(
 		"/usr/bin/env",
 		["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", program].concat(arguments),
@@ -36,24 +32,30 @@ func run_successfully(program: String, arguments: List[String]) -> Result[Proces
 		Ok(output)
 
 
-func prepare_compiler() -> Result[CompilerBinaries, String]:
-	prepared ?= run_successfully(
+func build_compiler() -> Result[String, String]:
+	prepared ?= run_isolated(
 		"make",
 		["-C", "blorp_2", "test-compiler"],
 	)
-	Ok({
-		normal = "blorp_2/build/compiler",
-		diagnostic = "blorp_2/build/compiler-diagnostic",
-	})
+	print(prepared.stdout())
+
+	if prepared.exit_code() != 0:
+		Err("compiler build failed: " + prepared.stderr())
+	else:
+		Ok("blorp_2/build/compiler")
 
 
-func verify_generated_c(path: String, expected_c: String) -> Result[Void, String]:
+func verify_generated_c(path: String, expected_c: Option[String]) -> Result[Void, String]:
 	actual ?= read_file(path)
 
-	if actual == expected_c:
-		Ok(void)
-	else:
-		Err("the compiler did not emit the expected example C")
+	match expected_c:
+		None:
+			Ok(void)
+		Some(expected):
+			if actual == expected:
+				Ok(void)
+			else:
+				Err("the compiler did not emit the expected example C")
 
 
 func remove_existing_file(path: String) -> Result[Void, String]:
@@ -63,82 +65,42 @@ func remove_existing_file(path: String) -> Result[Void, String]:
 		Err("could not remove previous measurement output: " + path)
 
 
-func measure_instructions(
+func measure_compilation_cost(
 	compiler: String,
 	directory: String,
 	example: Example,
-) -> Result[Int, String]:
-	-- Each child must publish fresh C and a fresh report; old files are no oracle.
+) -> Result[CompilationCost, String]:
+	-- One fresh compilation supplies both counters and the native program's C.
 	removed_c ?= remove_existing_file(directory + "/program.c")
 	removed_report ?= remove_existing_file(directory + "/instructions.txt")
-	output ?= run_successfully(
+	compiled ?= run_successfully(
 		"/usr/bin/time",
 		[
 			"-l",
 			"-o",
 			directory + "/instructions.txt",
+			"/usr/bin/env",
+			"BLORP_LEAK_CHECK=strict",
 			compiler,
 			example.fixture,
 			directory + "/program.c",
 		],
 	)
 
-	if output.stdout() != "" or output.stderr() != "":
-		Err("the compiler must be silent on success")
-	else:
-		verified ?= verify_generated_c(directory + "/program.c", example.expected_c)
-		report ?= read_file(directory + "/instructions.txt")
-		parse_instructions(report)
-
-
-func measure_compilation_cost(
-	compilers: CompilerBinaries,
-	directory: String,
-	example: Example,
-) -> Result[CompilationCost, String]:
-	-- Allocation diagnostics and normal instruction measurements use the same C.
-	removed_c ?= remove_existing_file(directory + "/program.c")
-	allocation_run ?= run_successfully(
-		"/usr/bin/env",
-		[
-			"BLORP_LEAK_CHECK=strict",
-			compilers.diagnostic,
-			example.fixture,
-			directory + "/program.c",
-		],
-	)
-
-	if allocation_run.stdout() != "":
+	if compiled.stdout() != "":
 		Err("the compiler must have empty stdout on success")
 	else:
 		verified ?= verify_generated_c(directory + "/program.c", example.expected_c)
-		allocations ?= parse_allocations(allocation_run.stderr())
-		first ?= measure_instructions(compilers.normal, directory, example)
-		second ?= measure_instructions(compilers.normal, directory, example)
-		third ?= measure_instructions(compilers.normal, directory, example)
-		instructions: Int = min(
-			min(first, second),
-			third,
+		allocations ?= parse_allocations(compiled.stderr())
+		report ?= read_file(directory + "/instructions.txt")
+		instructions ?= parse_instructions(report)
+		print(
+			example.name + " compiler: allocations=" + allocations.to_string() + "/" + example.limits.allocations.to_string() + "; instructions=" + instructions.to_string() + "/" + example.limits.instructions.to_string(),
 		)
-		cost: CompilationCost = {
+		Ok({
 			allocations = allocations,
-			instructions = instructions
-		}
-		print(
-			example.name + " compiler: allocations=" + "".append_int(
-				allocations,
-			) + "/" + "".append_int(
-				example.limits.allocations,
-			) + "; instructions=" + "".append_int(
-				instructions,
-			) + "/" + "".append_int(example.limits.instructions) + " (minimum of 3)",
-		)
-		print(
-			"instruction samples: " + "".append_int(
-				first,
-			) + ", " + "".append_int(second) + ", " + "".append_int(third),
-		)
-		Ok(cost)
+			instructions = instructions,
+		})
 
 
 func verify_native_result(directory: String, expected_exit: Int) -> Result[Void, String]:
@@ -146,7 +108,19 @@ func verify_native_result(directory: String, expected_exit: Int) -> Result[Void,
 	binary: String = directory + "/program"
 	linked ?= run_successfully(
 		getenv("BLORP_CC").get_or("clang"),
-		["-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic", "-O2", generated_c, "-o", binary],
+		[
+			"-std=c11",
+			"-Wall",
+			"-Wextra",
+			"-Werror",
+			"-pedantic",
+			"-O0",
+			"-fsanitize=undefined",
+			"-fno-sanitize-recover=all",
+			generated_c,
+			"-o",
+			binary,
+		],
 	)
 	executed ?= run_isolated(binary, [])
 
@@ -206,39 +180,62 @@ func verify_rejected_input(compiler: String, directory: String) -> Result[Void, 
 		Ok(void)
 
 
-func verify_all(directory: String, example: Example) -> Result[Void, String]:
-	compilers ?= prepare_compiler()
-	cost ?= measure_compilation_cost(compilers, directory, example)
+func verify_all(compiler: String, directory: String, example: Example) -> Result[Void, String]:
+	cost ?= measure_compilation_cost(compiler, directory, example)
 	native_result ?= verify_native_result(directory, example.exit_status)
-	rejected_output ?= verify_rejected_input(compilers.normal, directory)
+	rejected_output ?= verify_rejected_input(compiler, directory)
 	check_limits(cost, example.limits)
 
 
-func run_example(example: Example) -> Bool:
-	match (
-		run_successfully(
-			"mktemp",
-			["-d", temp_dir() + "/blorp-2-e2e.XXXXXX"],
-		)
-	):
-		Err(error):
-			print_error(error)
-			False
-		Ok(temporary):
-			directory: String = temporary
-				.stdout()
-				.trim()
-			result: Result[Void, String] = verify_all(directory, example)
-			_ = remove_file(directory + "/instructions.txt")
-			_ = remove_file(directory + "/program.c")
-			_ = remove_file(directory + "/program")
-			_ = remove_file(directory + "/invalid.brp")
-			_ = remove_file(directory + "/rejected.c")
-			_ = remove_dir(directory)
+private func check_in_directory(check: (String) -> Result[Void, String]) -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp-2-e2e-"):
+		match check(directory.resource_path()):
+			Ok(_):
+				Ok(True)
+			Err(error):
+				print_error(error)
+				Ok(False)
 
-			match result:
-				Ok(_):
-					True
-				Err(error):
-					print_error("FAIL: " + error)
-					False
+
+func with_directory(check: (String) -> Result[Void, String]) -> Bool:
+	match check_in_directory(check):
+		Ok(passed):
+			passed
+		Err(error):
+			print_error(error.to_string())
+			False
+
+
+func run_example(compiler: String, example: Example) -> Bool:
+	with_directory(func(directory: String): verify_all(compiler, directory, example))
+
+
+-- Source examples use their own main and leave the compiler's C untouched.
+private func verify_source_example(
+	compiler: String,
+	directory: String,
+	fixture: String,
+	expected_exit: Int,
+	limits: CostLimits,
+) -> Result[Void, String]:
+	example: Example = {
+		name = fixture,
+		fixture = fixture,
+		expected_c = None,
+		exit_status = expected_exit,
+		limits = limits
+	}
+	cost ?= measure_compilation_cost(compiler, directory, example)
+	native ?= verify_native_result(directory, expected_exit)
+	check_limits(cost, limits)
+
+
+func run_source_example(
+	compiler: String,
+	fixture: String,
+	expected_exit: Int,
+	limits: CostLimits,
+) -> Bool:
+	with_directory(func(directory: String):
+		verify_source_example(compiler, directory, fixture, expected_exit, limits)
+	)

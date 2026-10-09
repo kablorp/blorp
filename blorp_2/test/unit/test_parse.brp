@@ -2,6 +2,7 @@ import:
 	../../src/names: name_spelling
 	../../src/parse: ParsedProgram, parse, parsed_contents
 	../../src/syntax:
+		BindingSyntax(MutableBinding),
 		CallNotation(ReceiverCall),
 		Diagnostic,
 		ExpressionBase(IntegerExpression, NameExpression),
@@ -12,7 +13,10 @@ import:
 		ParsedPattern(PatternConstructor),
 		PatternFields(OnePatternField),
 		Purity(Impure),
-		Symbol(FunctionKeyword, MatchKeyword, LeftParen, RightParen, Dot, Arrow, Colon, Newline),
+		Symbol(
+			FunctionKeyword, MatchKeyword, LeftParen, RightParen, Dot, Arrow, Colon, Newline,
+			VarKeyword, Equals,
+		),
 		Token,
 		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, Indentation),
 		UnaryApplication,
@@ -628,9 +632,162 @@ pure func test_missing_match_arm_result_uses_explicit_eof_span() -> Bool:
 	)
 
 
+-- Construct binding tokens directly so lexing cannot manufacture this shape.
+private pure func binding_tokens() -> List[Token]:
+	program_tokens("main", "Int").take(9) + [
+		{
+			kind = SymbolToken(VarKeyword),
+			span = {
+				start = 21,
+				end = 24
+			}
+		},
+		{
+			kind = IdentifierToken("value"),
+			span = {
+				start = 25,
+				end = 30
+			}
+		},
+		{
+			kind = SymbolToken(Equals),
+			span = {
+				start = 31,
+				end = 32
+			}
+		},
+		{
+			kind = IntegerLiteral("42"),
+			span = {
+				start = 33,
+				end = 35
+			}
+		},
+		{
+			kind = SymbolToken(Newline),
+			span = {
+				start = 35,
+				end = 36
+			}
+		},
+		{
+			kind = Indentation(1),
+			span = {
+				start = 36,
+				end = 37
+			}
+		},
+		{
+			kind = IdentifierToken("value"),
+			span = {
+				start = 37,
+				end = 42
+			}
+		},
+	]
+
+
+pure func test_binding_prefix_from_direct_tokens() -> Bool:
+	match (
+		parse({
+			tokens = binding_tokens(),
+			end = {
+				start = 42,
+				end = 42
+			},
+		})
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			contents = parsed_contents(parsed)
+
+			match contents.functions:
+				[function]:
+					match function.bindings:
+						[binding]:
+							match binding.mutability:
+								MutableBinding:
+									match binding.initializer.base:
+										IntegerExpression(42):
+											(
+												name_spelling(
+													contents.names,
+													binding.name.id,
+												) == Some("value")
+												and binding.name.span.start == 25
+												and binding.name.span.end == 30
+												and binding.initializer.base_span.start == 33
+												and binding.initializer.base_span.end == 35
+												and value_of(
+													function,
+												).map(
+													pure func(value): value.span.start,
+												) == Some(37)
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_binding_missing_initializer_from_direct_tokens() -> Bool:
+	input = binding_tokens().take(12) + [
+		{
+			kind = SymbolToken(Newline),
+			span = {
+				start = 32,
+				end = 33
+			}
+		},
+	]
+	rejects(
+		parse({
+			tokens = input,
+			end = {
+				start = 33,
+				end = 33
+			},
+		}),
+		32,
+		33,
+		"expected a binding initializer",
+		"put one expression after '=' on the same line",
+	)
+
+
+pure func test_binding_requires_final_value_from_direct_tokens() -> Bool:
+	rejects(
+		parse({
+			tokens = binding_tokens().take(13),
+			end = {
+				start = 35,
+				end = 35
+			},
+		}),
+		35,
+		35,
+		"expected a final expression after the bindings",
+		"finish the function with a value expression or tail match",
+	)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 parser",
 	tests = [
+		("binding prefix from direct tokens", test_binding_prefix_from_direct_tokens),
+		(
+			"binding initializer required from direct tokens",
+			test_binding_missing_initializer_from_direct_tokens,
+		),
+		(
+			"binding requires final value from direct tokens",
+			test_binding_requires_final_value_from_direct_tokens,
+		),
 		(
 			"match tokens preserve structure and spans",
 			test_match_from_independent_tokens_preserves_structure_and_spans,

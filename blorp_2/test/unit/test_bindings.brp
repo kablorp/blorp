@@ -1,0 +1,307 @@
+import:
+	../../src/check:
+		BindingMutability(Immutable, Mutable),
+		BindingOrigin(ParameterBinding, BodyLocal, MatchCapture),
+		CheckedAssignment(InitializeBinding, ReassignBinding),
+		CheckedBase(ReturnBinding),
+		CheckedBody(CheckedValueBody),
+		TypeRef(IntType, UnionType),
+		binding_number,
+		check,
+		checked_functions,
+		same_type,
+	../../src/lex: lex
+	../../src/parse: parse
+	../../src/syntax: Diagnostic
+	result: get_or
+	test: TestSuite
+
+
+private pure func accepts(source: String) -> Bool:
+	match checked(source):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+private pure func checked(source: String) -> Result[Void, Diagnostic]:
+	lexed ?= lex(source)
+	parsed ?= parse(lexed)
+	accepted ?= check(parsed)
+	Ok(void)
+
+
+private pure func rejects(
+	body: String,
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+) -> Bool:
+	prefix = "func main() -> Int:\n\t"
+
+	match checked(prefix + body):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.span.start == prefix.length() + start
+				and error.span.end == prefix.length() + end
+				and error.message == message
+				and error.help == help
+			)
+
+
+pure func test_immutable_and_mutable_bindings() -> Bool:
+	accepts(
+		"pure func identity(value: Int) -> Int:\n\tvalue\npure func preserve() -> Int:\n\toriginal = 1\n\tvar current = original\n\tcurrent = identity(42)\n\toriginal\nfunc main() -> Int:\n\tpreserve()\n",
+	)
+
+
+pure func test_initializer_reads_previous_parameter_scope() -> Bool:
+	accepts(
+		"pure func preserve(value: Int) -> Int:\n\tvar value = value\n\tvalue = value\n\tvalue\nfunc main() -> Int:\n\tpreserve(42)\n",
+	)
+
+
+pure func test_immutable_assignment_is_rejected() -> Bool:
+	rejects(
+		"value = 1\n\tvalue = 2\n\tvalue\n",
+		11,
+		16,
+		"cannot assign to an immutable binding",
+		"declare the binding with var to allow reassignment",
+	)
+
+
+pure func test_duplicate_mutable_declaration_is_rejected() -> Bool:
+	rejects(
+		"var value = 1\n\tvar value = 2\n\tvalue\n",
+		19,
+		24,
+		"duplicate local binding",
+		(
+			"give each body-local declaration a distinct name; omit var to reassign a "
+			+ "mutable binding"
+		),
+	)
+
+
+pure func test_unknown_self_initializer_is_rejected() -> Bool:
+	rejects(
+		"value = value\n\tvalue\n",
+		8,
+		13,
+		"unknown value",
+		"use this function's parameter name, a declared variant, or a call",
+	)
+
+
+pure func test_unused_impure_initializer_is_rejected() -> Bool:
+	match checked(
+		"func effect() -> Int:\n\t1\npure func main() -> Int:\n\tunused = effect()\n\t0\n",
+	):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.message == "pure functions cannot call impure functions"
+				and error.help == "mark the callee pure or remove pure from the caller"
+				and error.span.start == 60
+				and error.span.end == 66
+			)
+
+
+pure func test_unused_recursive_initializer_is_rejected() -> Bool:
+	match checked("func main() -> Int:\n\tunused = main()\n\t0\n"):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.message == "call chain contains recursion"
+				and error.help == "use an acyclic call chain; recursion is not supported in this increment"
+				and error.span.start == 30
+				and error.span.end == 34
+			)
+
+
+private pure func test_binding_definitions_own_origin_mutability_type_and_span_result(
+
+) -> Result[Bool, Diagnostic]:
+	lexed ?= lex(
+		"pure func copy(value: Int) -> Int:\n\tvar value = value\n\told = value\n\tvalue = 42\n\told\nfunc main() -> Int:\n\tcopy(1)\n",
+	)
+	parsed ?= parse(lexed)
+	program ?= check(parsed)
+	Ok(
+		match checked_functions(program).functions:
+			[copy, _]:
+				match copy.bindings:
+					[parameter, mutable, old]:
+						match copy.assignments:
+							[InitializeBinding(current_id, current), InitializeBinding(old_id, previous_value), ReassignBinding(reassigned, _)]:
+								match current.base:
+									ReturnBinding(parameter_id):
+										match previous_value.base:
+											ReturnBinding(alias_id):
+												(
+													parameter.origin == ParameterBinding
+													and parameter.mutability == Immutable
+													and parameter.span.start == 15
+													and parameter.span.end == 20
+													and mutable.origin == BodyLocal
+													and mutable.mutability == Mutable
+													and mutable.span.start == 40
+													and mutable.span.end == 45
+													and old.origin == BodyLocal
+													and old.mutability == Immutable
+													and same_type(old.value_type, IntType)
+													and binding_number(parameter_id) == 0
+													and binding_number(current_id) == 1
+													and binding_number(old_id) == 2
+													and binding_number(alias_id) == 1
+													and binding_number(reassigned) == 1
+													and same_type(current.base_type, IntType)
+												)
+											_:
+												False
+									_:
+										False
+							_:
+								False
+					_:
+						False
+			_:
+				False
+	)
+
+
+pure func test_union_local_and_reassignment_use_the_established_type() -> Bool:
+	accepts(
+		"fixed union Value:\n\tEmpty\n\tNumber(Int)\npure func number() -> Value:\n\tNumber(1)\npure func copy(value: Value) -> Value:\n\tvar current = value\n\told = current\n\tcurrent = Number(42)\n\told\nfunc main() -> Int:\n\t0\n",
+	)
+
+
+private pure func test_reassignment_rejects_a_different_type_result() -> Result[Bool, Diagnostic]:
+	prefix = "fixed union Value:\n\tEmpty\npure func value() -> Value:\n\tEmpty\nfunc main() -> Int:\n\tvar current = value()\n\tcurrent = 1\n\t0\n"
+	lexed ?= lex(prefix)
+	parsed ?= parse(lexed)
+	Ok(
+		match check(parsed):
+			Ok(_):
+				False
+			Err(error):
+				(
+					error.message == "expression does not match the expected type"
+					and error.help == "use an expression of type Value here"
+					and error.span.start == 115
+					and error.span.end == 116
+				)
+	)
+
+
+private pure func test_new_union_local_requires_a_receiving_type_result(
+
+) -> Result[Bool, Diagnostic]:
+	lexed ?= lex("fixed union Value:\n\tEmpty\nfunc main() -> Int:\n\tvalue = Empty\n\t0\n")
+	parsed ?= parse(lexed)
+	Ok(
+		match check(parsed):
+			Ok(_):
+				False
+			Err(error):
+				(
+					error.message == "constructor needs an expected union type"
+					and error.help == "use a typed parameter or a call to a helper returning the union"
+					and error.span.start == 55
+					and error.span.end == 60
+				)
+	)
+
+
+pure func test_binding_definitions_own_origin_mutability_type_and_span() -> Bool:
+	test_binding_definitions_own_origin_mutability_type_and_span_result().get_or(False)
+
+
+pure func test_reassignment_rejects_a_different_type() -> Bool:
+	test_reassignment_rejects_a_different_type_result().get_or(False)
+
+
+pure func test_new_union_local_requires_a_receiving_type() -> Bool:
+	test_new_union_local_requires_a_receiving_type_result().get_or(False)
+
+
+pure func test_body_local_shadows_direct_unary_function() -> Bool:
+	match checked(
+		"pure func identity(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tidentity = 1\n\tidentity(1)\n",
+	):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.message == "local bindings cannot be called"
+				and error.help == "use the binding as a value, or rename it to call the function"
+				and error.span.start == 81
+				and error.span.end == 89
+			)
+
+
+pure func test_body_local_shadows_direct_zero_argument_function() -> Bool:
+	match checked(
+		"pure func identity(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tidentity = 1\n\tidentity()\n",
+	):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.message == "local bindings cannot be called"
+				and error.help == "use the binding as a value, or rename it to call the function"
+				and error.span.start == 81
+				and error.span.end == 89
+			)
+
+
+pure func test_body_local_does_not_shadow_ufcs_function() -> Bool:
+	accepts(
+		"pure func identity(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tidentity = 1\n\tidentity.identity()\n",
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 scalar binding checks",
+	tests = [
+		("body local shadows direct unary function", test_body_local_shadows_direct_unary_function),
+		(
+			"body local shadows direct zero argument function",
+			test_body_local_shadows_direct_zero_argument_function,
+		),
+		("body local does not shadow UFCS function", test_body_local_does_not_shadow_ufcs_function),
+		(
+			"binding definitions own facts and stable ids",
+			test_binding_definitions_own_origin_mutability_type_and_span,
+		),
+		(
+			"union locals and reassignment keep established type",
+			test_union_local_and_reassignment_use_the_established_type,
+		),
+		("reassignment rejects different type", test_reassignment_rejects_a_different_type),
+		("new union local requires receiving type", test_new_union_local_requires_a_receiving_type),
+		("immutable and mutable bindings", test_immutable_and_mutable_bindings),
+		(
+			"initializer reads previous parameter scope",
+			test_initializer_reads_previous_parameter_scope,
+		),
+		("immutable assignment is rejected", test_immutable_assignment_is_rejected),
+		(
+			"duplicate mutable declaration is rejected",
+			test_duplicate_mutable_declaration_is_rejected,
+		),
+		("unknown self initializer is rejected", test_unknown_self_initializer_is_rejected),
+		("unused impure initializer is rejected", test_unused_impure_initializer_is_rejected),
+		(
+			"unused recursive initializer is rejected",
+			test_unused_recursive_initializer_is_rejected,
+		),
+	]
+}

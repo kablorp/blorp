@@ -1,0 +1,390 @@
+import:
+	../../src/check: TypeRef(IntType, UnionType), check, function_number, same_type
+	../../src/lex: lex
+	../../src/lower:
+		CallArguments(NoArguments, OneArgument),
+		LoweredProgram,
+		LoweredTail(ReturnValue, MatchValue),
+		ValueOperation(
+			ParameterValue, IntegerValue, VariantValue, CallValue, ConstructValue, PayloadValue,
+		),
+		lower,
+		lowered_functions,
+		value_number,
+	../../src/parse: parse
+	../../src/syntax: Diagnostic
+	test: TestSuite
+
+
+-- Minimal parsed/checked fixtures preserve the seals. Tests invoke and inspect
+-- lowering itself; neither C emission nor the CLI participates in this oracle.
+private pure func fixture(source: String) -> Result[LoweredProgram, Diagnostic]:
+	lexed ?= lex(source)
+	parsed ?= parse(lexed)
+	checked ?= check(parsed)
+	lower(checked)
+
+
+pure func test_reassignment_preserves_old_alias_and_call_result() -> Bool:
+	match fixture(
+		"pure func identity(value: Int) -> Int:\n\tvalue\npure func preserve() -> Int:\n\toriginal = 1\n\tvar current = original\n\tcurrent = identity(42)\n\toriginal\nfunc main() -> Int:\n\tpreserve()\n",
+	):
+		Err(_):
+			False
+		Ok(program):
+			match lowered_functions(program).functions:
+				[_, preserve, _]:
+					match preserve.definitions:
+						[original, replacement, call]:
+							match original.operation:
+								IntegerValue(1):
+									match replacement.operation:
+										IntegerValue(42):
+											match call.operation:
+												CallValue(target, OneArgument(argument)):
+													match preserve.tail:
+														ReturnValue(id):
+															(
+																value_number(original.id) == 0
+																and value_number(
+																	replacement.id,
+																) == 1
+																and value_number(call.id) == 2
+																and value_number(argument) == 1
+																and value_number(id) == 0
+																and function_number(
+																	target.target,
+																) == 0
+															)
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_self_assignment_aliases_the_same_value() -> Bool:
+	match fixture("func main() -> Int:\n\tvar value = 42\n\tvalue = value\n\tvalue\n"):
+		Err(_):
+			False
+		Ok(program):
+			match lowered_functions(program).functions:
+				[function]:
+					match function.definitions:
+						[value]:
+							match function.tail:
+								ReturnValue(id):
+									value_number(value.id) == 0 and value_number(id) == 0
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_unused_calls_remain_in_source_order() -> Bool:
+	match fixture(
+		"func first() -> Int:\n\t1\nfunc second() -> Int:\n\t2\nfunc main() -> Int:\n\tunused = first()\n\tvar current = second()\n\tcurrent = second()\n\t0\n",
+	):
+		Err(_):
+			False
+		Ok(program):
+			match lowered_functions(program).functions:
+				[_, _, function]:
+					match function.definitions:
+						[first, second, third, result]:
+							match first.operation:
+								CallValue(first, NoArguments):
+									match second.operation:
+										CallValue(second, NoArguments):
+											match third.operation:
+												CallValue(third, NoArguments):
+													(
+														function_number(first.target) == 0
+														and function_number(second.target) == 1
+														and function_number(third.target) == 1
+														and value_number(result.id) == 3
+													)
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_parameter_shadowing_reads_the_original_value() -> Bool:
+	match fixture(
+		"pure func copy(value: Int) -> Int:\n\tvar value = value\n\told = value\n\tvalue = 42\n\told\nfunc main() -> Int:\n\tcopy(1)\n",
+	):
+		Err(_):
+			False
+		Ok(program):
+			match lowered_functions(program).functions:
+				[copy, _]:
+					match copy.definitions:
+						[parameter, replacement]:
+							match parameter.operation:
+								ParameterValue:
+									match copy.tail:
+										ReturnValue(id):
+											(
+												value_number(id) == 0
+												and value_number(replacement.id) == 1
+												and parameter.span.start == 15
+												and parameter.span.end == 20
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_match_branches_share_the_function_value_allocator() -> Bool:
+	match fixture(
+		"fixed union Value:\n\tEmpty\n\tNumber(Int)\npure func unwrap(value: Value) -> Int:\n\tlocal = value\n\tmatch local:\n\t\tEmpty: 0\n\t\tNumber(local): local\nfunc main() -> Int:\n\t0\n",
+	):
+		Err(_):
+			False
+		Ok(program):
+			match lowered_functions(program).functions:
+				[unwrap, _]:
+					match unwrap.definitions:
+						[parameter]:
+							match unwrap.tail:
+								MatchValue(matched):
+									match matched.arms:
+										[first, second]:
+											match first.body.definitions:
+												[literal]:
+													match second.body.definitions:
+														[projection]:
+															match projection.operation:
+																PayloadValue(source):
+																	(
+																		value_number(
+																			parameter.id,
+																		) == 0
+																		and value_number(
+																			matched.scrutinee,
+																		) == 0
+																		and value_number(
+																			literal.id,
+																		) == 1
+																		and value_number(
+																			projection.id,
+																		) == 2
+																		and value_number(
+																			source,
+																		) == 0
+																		and value_number(
+																			second.body.result,
+																		) == 2
+																	)
+																_:
+																	False
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_constructor_and_call_keep_each_intermediate_type_and_span() -> Bool:
+	match fixture(
+		"fixed union Value:\n\tNumber(Int)\npure func unwrap(value: Value) -> Int:\n\tmatch value:\n\t\tNumber(number): number\nfunc main() -> Int:\n\tNumber(42).unwrap()\n",
+	):
+		Err(_):
+			False
+		Ok(program):
+			match lowered_functions(program).functions:
+				[_, main]:
+					match main.definitions:
+						[literal, construction, call]:
+							match construction.value_type:
+								UnionType(_):
+									match construction.operation:
+										ConstructValue(_, argument):
+											match call.operation:
+												CallValue(_, OneArgument(receiver)):
+													(
+														same_type(literal.value_type, IntType)
+														and same_type(call.value_type, IntType)
+														and value_number(argument) == 0
+														and value_number(receiver) == 1
+														and literal.span.start == 138
+														and literal.span.end == 140
+														and construction.span.start == 131
+														and construction.span.end == 137
+														and call.span.start == 142
+														and call.span.end == 148
+													)
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_full_width_alias_retains_the_original_value() -> Bool:
+	match fixture(
+		"func main() -> Int:\n\tvar current = -9223372036854775808\n\toriginal = current\n\tcurrent = 9223372036854775807\n\toriginal\n",
+	):
+		Err(_):
+			False
+		Ok(program):
+			match lowered_functions(program).functions:
+				[function]:
+					match function.definitions:
+						[original, replacement]:
+							match original.operation:
+								IntegerValue(-9223372036854775808):
+									match replacement.operation:
+										IntegerValue(9223372036854775807):
+											match function.tail:
+												ReturnValue(id):
+													(
+														value_number(
+															id,
+														) == value_number(original.id)
+														and value_number(
+															replacement.id,
+														) != value_number(original.id)
+													)
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_match_calls_stay_inside_their_selected_branches() -> Bool:
+	match fixture(
+		"fixed union Value:\n\tEmpty\n\tNumber(Int)\nfunc choose() -> Value:\n\tNumber(42)\nfunc empty_arm() -> Int:\n\t7\nfunc selected(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tmatch choose():\n\t\tEmpty: empty_arm()\n\t\tNumber(captured): selected(captured)\n",
+	):
+		Err(_):
+			False
+		Ok(program):
+			match lowered_functions(program).functions:
+				[_, _, _, main]:
+					match main.definitions:
+						[scrutinee]:
+							match scrutinee.operation:
+								CallValue(choose, NoArguments):
+									match main.tail:
+										MatchValue(matched):
+											match matched.arms:
+												[empty, number]:
+													match empty.body.definitions:
+														[empty_value]:
+															match empty_value.operation:
+																CallValue(empty_call, NoArguments):
+																	match number.body.definitions:
+																		[payload, selected_value]:
+																			match selected_value.operation:
+																				CallValue(selected_call, OneArgument(argument)):
+																					(
+																						function_number(
+																							choose.target,
+																						) == 0
+																						and function_number(
+																							empty_call.target,
+																						) == 1
+																						and function_number(
+																							selected_call.target,
+																						) == 2
+																						and value_number(
+																							argument,
+																						) == value_number(
+																							payload.id,
+																						)
+																						and value_number(
+																							number.body.result,
+																						) == value_number(
+																							selected_value.id,
+																						)
+																					)
+																				_:
+																					False
+																		_:
+																			False
+																_:
+																	False
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 ordered value lowering",
+	tests = [
+		(
+			"full width alias retains original value",
+			test_full_width_alias_retains_the_original_value,
+		),
+		(
+			"match calls stay in selected branches",
+			test_match_calls_stay_inside_their_selected_branches,
+		),
+		(
+			"reassignment preserves old alias and call result",
+			test_reassignment_preserves_old_alias_and_call_result,
+		),
+		("self assignment aliases the same value", test_self_assignment_aliases_the_same_value),
+		("unused calls remain in source order", test_unused_calls_remain_in_source_order),
+		(
+			"parameter shadowing reads the original value",
+			test_parameter_shadowing_reads_the_original_value,
+		),
+		(
+			"match branches share function allocator",
+			test_match_branches_share_the_function_value_allocator,
+		),
+		(
+			"constructor and call keep types and spans",
+			test_constructor_and_call_keep_each_intermediate_type_and_span,
+		),
+	]
+}

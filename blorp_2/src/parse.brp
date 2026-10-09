@@ -5,6 +5,7 @@ import:
 	option: is_some, to_result
 	string: index_of
 	syntax:
+		BindingSyntax(ImmutableBinding, MutableBinding),
 		CallNotation(DirectCall, ReceiverCall),
 		DECIMAL_DIGITS,
 		Diagnostic,
@@ -12,6 +13,7 @@ import:
 		FieldPattern(FieldName, FieldWildcard),
 		LexedProgram,
 		ParameterList(EmptyParameters, SingleParameter),
+		ParsedBinding,
 		ParsedBody(ParsedValueBody, ParsedMatchBody),
 		ParsedContents,
 		ParsedFunction,
@@ -25,7 +27,7 @@ import:
 		Span,
 		Symbol(
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
-			Colon, Newline,
+			Colon, Newline, VarKeyword, Equals,
 		),
 		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, Indentation),
 		UnaryApplication,
@@ -71,6 +73,18 @@ private pure func expected(state: ParserState, message: String, help: String) ->
 
 private pure func symbol_matches(actual: Symbol, expected: Symbol) -> Bool:
 	match actual:
+		VarKeyword:
+			match expected:
+				VarKeyword:
+					True
+				_:
+					False
+		Equals:
+			match expected:
+				Equals:
+					True
+				_:
+					False
 		PureKeyword:
 			match expected:
 				PureKeyword:
@@ -155,7 +169,7 @@ private pure func consume_symbol(
 
 private pure func identifier_help() -> String:
 	"use an ASCII identifier starting with a letter or underscore; ".concat(
-		"'func', 'pure', 'match', and lone '_' are reserved",
+		"'func', 'pure', 'match', 'var', and lone '_' are reserved",
 	)
 
 
@@ -208,7 +222,7 @@ private fixed record ParsedParameters {
 
 
 private fixed union ExpressionStep:
-	ReadBase(ExpressionBase, ParserState)
+	ReadBase(ExpressionBase, Span, ParserState)
 	OpenedCall(WrittenName, ParserState)
 
 
@@ -360,7 +374,7 @@ private pure func consume_expression_step(state: ParserState) -> Result[Expressi
 			match token.kind:
 				IntegerLiteral(spelling):
 					value ?= integer_value(spelling, token.span)
-					Ok(ReadBase(IntegerExpression(value), after_token))
+					Ok(ReadBase(IntegerExpression(value), token.span, after_token))
 				IdentifierToken(spelling):
 					names = intern_name(state.names, spelling)
 
@@ -381,7 +395,7 @@ private pure func consume_expression_step(state: ParserState) -> Result[Expressi
 							}
 
 							if not at_symbol(next, LeftParen):
-								Ok(ReadBase(NameExpression(name), next))
+								Ok(ReadBase(NameExpression(name), token.span, next))
 							else:
 								opened: ParserState = { next |
 									position = IntOps.add(next.position, 1)
@@ -391,6 +405,7 @@ private pure func consume_expression_step(state: ParserState) -> Result[Expressi
 									Ok(
 										ReadBase(
 											ZeroArgumentApplication(name),
+											token.span,
 											{ opened | position = IntOps.add(opened.position, 1) },
 										),
 									)
@@ -449,6 +464,7 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 	var state: ParserState = start
 	var pending: List[WrittenName] = []
 	var base: Option[ExpressionBase] = None
+	var base_span: Span = start.input.end
 	var failure: Option[Diagnostic] = None
 
 	while not base.is_some():
@@ -456,7 +472,8 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 			Err(error):
 				failure = Some(error)
 				break
-			Ok(ReadBase(value, next)):
+			Ok(ReadBase(value, span, next)):
+				base_span = span
 				base = Some(value)
 				state = next
 			Ok(OpenedCall(name, next)):
@@ -539,6 +556,7 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 			Ok({
 				body = {
 					base = value,
+					base_span = base_span,
 					applications = calls,
 					span = {
 						start = first.span.start,
@@ -797,6 +815,113 @@ private pure func consume_function_body(state: ParserState) -> Result[BodyResult
 		})
 
 
+private fixed record BindingPrefix {
+	bindings: List[ParsedBinding],
+	next: ParserState
+}
+
+
+private pure func at_binding(state: ParserState) -> Bool:
+	if at_symbol(state, VarKeyword):
+		True
+	else:
+		match state.input.tokens.get(state.position):
+			Some(token):
+				match token.kind:
+					IdentifierToken(_):
+						at_symbol({ state | position = IntOps.add(state.position, 1) }, Equals)
+					_:
+						False
+			None:
+				False
+
+
+private fixed record BindingLine {
+	binding: ParsedBinding,
+	next: ParserState
+}
+
+
+private pure func consume_binding(state: ParserState) -> Result[BindingLine, Diagnostic]:
+	mutability = if at_symbol(state, VarKeyword):
+		MutableBinding
+	else:
+		ImmutableBinding
+
+	after_keyword = match mutability:
+		MutableBinding:
+			{ state | position = IntOps.add(state.position, 1) }
+		ImmutableBinding:
+			state
+
+	name ?= consume_name(after_keyword, "expected a binding name")
+	equals ?= consume_symbol(
+		name.next,
+		Equals,
+		"expected '=' after the binding name",
+		"write name = expression or var name = expression",
+	)
+
+	initializer ?= if (
+		at_symbol(equals, Newline)
+		or IntOps.equals(equals.position, equals.input.tokens.length())
+	):
+		Err(
+			expected(
+				equals,
+				"expected a binding initializer",
+				"put one expression after '=' on the same line",
+			),
+		)
+	else:
+		consume_value(equals)
+
+	newline ?= consume_symbol(
+		initializer.next,
+		Newline,
+		"expected a final expression after the bindings",
+		"finish the function with a value expression or tail match",
+	)
+	next ?= consume_indent(
+		newline,
+		1,
+		"expected a final expression after the bindings",
+		"finish the function with a value expression or tail match indented one level",
+	)
+	Ok({
+		binding = {
+			name = name.name,
+			mutability = mutability,
+			initializer = initializer.body
+		},
+		next = next,
+	})
+
+
+private pure func consume_bindings(start: ParserState) -> Result[BindingPrefix, Diagnostic]:
+	var state = start
+	var bindings: List[ParsedBinding] = []
+	var failure: Option[Diagnostic] = None
+
+	while at_binding(state):
+		match consume_binding(state):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(line):
+				bindings = bindings.append(line.binding)
+				state = line.next
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				bindings = bindings,
+				next = state,
+			})
+
+
 private pure func consume_function(start: ParserState) -> Result[FunctionResult, Diagnostic]:
 	purity: Purity = match start.input.tokens.get(start.position):
 		Some(token):
@@ -857,13 +982,15 @@ private pure func consume_function(start: ParserState) -> Result[FunctionResult,
 		"expected an indent of one tab or four spaces",
 		"indent the body with exactly one tab or four spaces",
 	)
-	body ?= consume_function_body(after_indent)
+	prefix ?= consume_bindings(after_indent)
+	body ?= consume_function_body(prefix.next)
 	Ok({
 		function = {
 			purity = purity,
 			function_name = function.name,
 			parameters = parameters.parameters,
 			return_type = return_type.name,
+			bindings = prefix.bindings,
 			body = body.body
 		},
 		next = body.next,

@@ -4,11 +4,13 @@ import:
 	option: is_some, to_result
 	parse: ParsedProgram, parsed_contents
 	syntax:
+		BindingSyntax(ImmutableBinding, MutableBinding),
 		CallNotation(DirectCall, ReceiverCall),
 		Diagnostic,
 		ExpressionBase(IntegerExpression, NameExpression, ZeroArgumentApplication),
 		FieldPattern(FieldName, FieldWildcard),
 		ParameterList(EmptyParameters, SingleParameter),
+		ParsedBinding,
 		ParsedBody(ParsedValueBody, ParsedMatchBody),
 		ParsedFunction,
 		ParsedMatch,
@@ -74,16 +76,30 @@ fixed record CheckedCall {
 }
 
 
--- These roles are a read-only projection; only this module constructs IDs.
-fixed union BindingRole:
-	SoleParameter
-	ArmBinding(Int)
+-- IDs are dense ordinals owned by one sealed checked function, never roles.
+opaque type BindingId = Int
 
 
-opaque type BindingId = BindingRole
+fixed union BindingOrigin:
+	ParameterBinding
+	BodyLocal
+	MatchCapture
 
 
-pure func binding_role(id: BindingId) -> BindingRole:
+fixed union BindingMutability:
+	Immutable
+	Mutable
+
+
+fixed record BindingDefinition {
+	origin: BindingOrigin,
+	mutability: BindingMutability,
+	value_type: TypeRef,
+	span: Span
+}
+
+
+pure func binding_number(id: BindingId) -> Int:
 	from_opaque BindingId(id)
 
 
@@ -99,10 +115,24 @@ fixed union CheckedOperation:
 	ConstructVariant(VariantId)
 
 
+fixed record CheckedStep {
+	operation: CheckedOperation,
+	value_type: TypeRef,
+	span: Span
+}
+
+
 fixed record CheckedValue {
 	base: CheckedBase,
-	operations: List[CheckedOperation]
+	base_type: TypeRef,
+	base_span: Span,
+	operations: List[CheckedStep]
 }
+
+
+fixed union CheckedAssignment:
+	InitializeBinding(BindingId, CheckedValue)
+	ReassignBinding(BindingId, CheckedValue)
 
 
 fixed union PayloadBinding:
@@ -137,6 +167,8 @@ fixed union CheckedBody:
 
 fixed record CheckedFunction {
 	signature: FunctionSignature,
+	bindings: List[BindingDefinition],
+	assignments: List[CheckedAssignment],
 	body: CheckedBody
 }
 
@@ -547,7 +579,7 @@ private pure func validate_call(
 private fixed record LocalBinding {
 	name: NameId,
 	id: BindingId,
-	value_type: TypeRef
+	definition: BindingDefinition
 }
 
 
@@ -591,9 +623,9 @@ private fixed union PendingApplication:
 
 
 private pure func non_callable(binding: LocalBinding, span: Span) -> Diagnostic:
-	match binding_role(binding.id):
-		SoleParameter:
-			message = if same_type(binding.value_type, IntType):
+	match binding.definition.origin:
+		ParameterBinding:
+			message = if same_type(binding.definition.value_type, IntType):
 				"Int parameters cannot be called"
 			else:
 				"parameters cannot be called"
@@ -603,10 +635,16 @@ private pure func non_callable(binding: LocalBinding, span: Span) -> Diagnostic:
 				message,
 				"use the parameter as a value, or rename it to call the function",
 			)
-		ArmBinding(_):
+		MatchCapture:
 			rejection(
 				span,
 				"match bindings cannot be called",
+				"use the binding as a value, or rename it to call the function",
+			)
+		BodyLocal:
+			rejection(
+				span,
+				"local bindings cannot be called",
 				"use the binding as a value, or rename it to call the function",
 			)
 
@@ -903,7 +941,7 @@ private pure func resolve_base(
 				Some(binding):
 					Ok({
 						base = ReturnBinding(binding.id),
-						value_type = binding.value_type,
+						value_type = binding.definition.value_type,
 					})
 				None:
 					if contains_variant(context.unions, name.id):
@@ -1003,7 +1041,7 @@ private pure func resolve_value(
 
 	base ?= resolve_base(purity, scope, body.base, expectation, context)
 	var current_type = base.value_type
-	var operations: List[CheckedOperation] = []
+	var operations: List[CheckedStep] = []
 
 	for contract in validated:
 		if not same_type(current_type, contract.parameter_type):
@@ -1018,7 +1056,11 @@ private pure func resolve_value(
 			)
 			break
 
-		operations = operations.append(contract.operation)
+		operations = operations.append({
+			operation = contract.operation,
+			value_type = contract.return_type,
+			span = contract.span,
+		})
 		current_type = contract.return_type
 
 	finished ?= match failure:
@@ -1037,7 +1079,7 @@ private pure func resolve_value(
 				Err(
 					type_rejection(
 						body.span,
-						"return expression does not match the declared type",
+						"expression does not match the expected type",
 						type_ref,
 						context.unions,
 						context.names,
@@ -1047,6 +1089,8 @@ private pure func resolve_value(
 	Ok({
 		value = {
 			base = base.base,
+			base_type = base.value_type,
+			base_span = body.base_span,
 			operations = operations
 		},
 		value_type = current_type,
@@ -1067,14 +1111,15 @@ private pure func complete_application(
 
 private fixed record ResolvedPattern {
 	pattern: CheckedPattern,
-	scope: List[LocalBinding]
+	scope: List[LocalBinding],
+	binding: Option[BindingDefinition]
 }
 
 
 private pure func bound_pattern(
 	name: WrittenName,
 	type_ref: TypeRef,
-	role: BindingRole,
+	ordinal: Int,
 	scope: List[LocalBinding],
 	pattern: CheckedPattern,
 ) -> ResolvedPattern:
@@ -1083,10 +1128,21 @@ private pure func bound_pattern(
 		scope = [
 			{
 				name = name.id,
-				id = into_opaque BindingId(role),
-				value_type = type_ref
+				id = into_opaque BindingId(ordinal),
+				definition = {
+					origin = MatchCapture,
+					mutability = Immutable,
+					value_type = type_ref,
+					span = name.span
+				}
 			},
-		].concat(scope)
+		].concat(scope),
+		binding = Some({
+			origin = MatchCapture,
+			mutability = Immutable,
+			value_type = type_ref,
+			span = name.span,
+		})
 	}
 
 
@@ -1104,6 +1160,7 @@ private pure func resolve_variant_pattern(
 					Ok({
 						pattern = VariantCase(contract.variant, NoPayloadBinding),
 						scope = scope,
+						binding = None,
 					})
 				OnePatternField(_):
 					Err(
@@ -1129,18 +1186,18 @@ private pure func resolve_variant_pattern(
 							Ok({
 								pattern = VariantCase(contract.variant, DiscardIntPayload),
 								scope = scope,
+								binding = None,
 							})
 						FieldName(name):
-							role = ArmBinding(ordinal)
 							Ok(
 								bound_pattern(
 									name,
 									IntType,
-									role,
+									ordinal,
 									scope,
 									VariantCase(
 										contract.variant,
-										BindIntPayload(into_opaque BindingId(role)),
+										BindIntPayload(into_opaque BindingId(ordinal)),
 									),
 								),
 							)
@@ -1158,6 +1215,7 @@ private pure func resolve_pattern(
 			Ok({
 				pattern = WildcardCase,
 				scope = scope,
+				binding = None,
 			})
 		PatternName(name):
 			contract ?= if lookup_binding(scope, name.id).is_some():
@@ -1169,14 +1227,13 @@ private pure func resolve_pattern(
 				Some(contract):
 					resolve_variant_pattern(contract, NoPatternFields, name.span, ordinal, scope)
 				None:
-					role = ArmBinding(ordinal)
 					Ok(
 						bound_pattern(
 							name,
 							UnionType(owner),
-							role,
+							ordinal,
 							scope,
-							BindingCase(into_opaque BindingId(role)),
+							BindingCase(into_opaque BindingId(ordinal)),
 						),
 					)
 		PatternConstructor(name, fields, span):
@@ -1295,13 +1352,20 @@ private pure func missing_variant_name(
 			Ok(name.concat("(_)"))
 
 
+private fixed record ResolvedMatch {
+	body: CheckedMatch,
+	bindings: List[BindingDefinition]
+}
+
+
 private pure func resolve_match(
 	purity: Purity,
 	return_type: TypeRef,
 	scope: List[LocalBinding],
 	body: ParsedMatch,
+	bindings: List[BindingDefinition],
 	context: ResolutionContext,
-) -> Result[CheckedMatch, Diagnostic]:
+) -> Result[ResolvedMatch, Diagnostic]:
 	scrutinee ?= resolve_value(purity, scope, body.scrutinee, None, context)
 
 	owner ?= match scrutinee.value_type:
@@ -1332,10 +1396,19 @@ private pure func resolve_match(
 
 	var arms: List[CheckedArm] = []
 	var failure: Option[Diagnostic] = None
-	var ordinal: Int = 0
+	var definitions = bindings
 
 	for arm in body.arms:
-		match resolve_arm(purity, return_type, owner, ordinal, scope, arm, remaining, context):
+		match resolve_arm(
+			purity,
+			return_type,
+			owner,
+			definitions.length(),
+			scope,
+			arm,
+			remaining,
+			context,
+		):
 			Err(error):
 				failure = Some(error)
 				break
@@ -1343,7 +1416,11 @@ private pure func resolve_match(
 				arms = arms.append(resolved.arm)
 				remaining = resolved.remaining
 
-		ordinal = IntOps.add(ordinal, 1)
+				match resolved.binding:
+					Some(definition):
+						definitions = definitions.append(definition)
+					None:
+						void
 
 	match failure:
 		Some(error):
@@ -1351,9 +1428,12 @@ private pure func resolve_match(
 		None:
 			if IntOps.equals(remaining.length(), 0):
 				Ok({
-					scrutinee = scrutinee.value,
-					owner = owner,
-					arms = arms,
+					body = {
+						scrutinee = scrutinee.value,
+						owner = owner,
+						arms = arms
+					},
+					bindings = definitions,
 				})
 			else:
 				Err(missing_coverage(remaining, body.keyword_span, context))
@@ -1361,7 +1441,8 @@ private pure func resolve_match(
 
 private fixed record ResolvedArm {
 	arm: CheckedArm,
-	remaining: List[VariantId]
+	remaining: List[VariantId],
+	binding: Option[BindingDefinition]
 }
 
 
@@ -1384,6 +1465,7 @@ private pure func resolve_arm(
 			body = value.value
 		},
 		remaining = remaining,
+		binding = pattern.binding,
 	})
 
 
@@ -1407,25 +1489,159 @@ private pure func function_scope(
 		SingleParameter(parameter):
 			match signature.parameters:
 				OneParameter(type_ref):
-					Ok(
-						[
-							{
-								name = parameter.name.id,
-								id = into_opaque BindingId(SoleParameter),
-								value_type = type_ref
-							},
-						],
-					)
+					Ok([
+						{
+							name = parameter.name.id,
+							id = into_opaque BindingId(0),
+							definition = {
+								origin = ParameterBinding,
+								mutability = Immutable,
+								value_type = type_ref,
+								span = parameter.name.span
+							}
+						},
+					])
 				NoParameter:
 					Err(internal_error(parameter.name.span, "invalid resolved parameter"))
+
+
+private fixed record ResolvedBody {
+	bindings: List[BindingDefinition],
+	assignments: List[CheckedAssignment],
+	body: CheckedBody
+}
+
+
+private fixed record ResolvedAssignment {
+	assignment: CheckedAssignment,
+	scope: List[LocalBinding],
+	definition: Option[BindingDefinition]
+}
+
+
+private pure func resolve_assignment(
+	written: ParsedBinding,
+	purity: Purity,
+	scope: List[LocalBinding],
+	ordinal: Int,
+	context: ResolutionContext,
+) -> Result[ResolvedAssignment, Diagnostic]:
+	previous = lookup_binding(scope, written.name.id)
+	empty: Option[LocalBinding] = None
+
+	decision: Result[Option[LocalBinding], Diagnostic] = match written.mutability:
+		MutableBinding:
+			match previous:
+				Some(binding):
+					match binding.definition.origin:
+						BodyLocal:
+							Err(
+								rejection(
+									written.name.span,
+									"duplicate local binding",
+									Text.concat(
+										"give each body-local declaration a distinct name; ",
+										"omit var to reassign a mutable binding",
+									),
+								),
+							)
+						_:
+							Ok(empty)
+				None:
+					Ok(empty)
+		ImmutableBinding:
+			match previous:
+				Some(binding):
+					match binding.definition.mutability:
+						Mutable:
+							Ok(Some(binding))
+						Immutable:
+							Err(
+								rejection(
+									written.name.span,
+									"cannot assign to an immutable binding",
+									"declare the binding with var to allow reassignment",
+								),
+							)
+				None:
+					Ok(empty)
+
+	reassign ?= decision
+	value ?= resolve_value(
+		purity,
+		scope,
+		written.initializer,
+		reassign.map(pure func(binding: LocalBinding) -> TypeRef: binding.definition.value_type),
+		context,
+	)
+
+	match reassign:
+		Some(binding):
+			Ok({
+				assignment = ReassignBinding(binding.id, value.value),
+				scope = scope,
+				definition = None,
+			})
+		None:
+			mutability = match written.mutability:
+				MutableBinding:
+					Mutable
+				ImmutableBinding:
+					Immutable
+
+			definition: BindingDefinition = {
+				origin = BodyLocal,
+				mutability = mutability,
+				value_type = value.value_type,
+				span = written.name.span
+			}
+			id = into_opaque BindingId(ordinal)
+			Ok({
+				assignment = InitializeBinding(id, value.value),
+				scope = [
+					{
+						name = written.name.id,
+						id = id,
+						definition = definition
+					},
+				].concat(scope),
+				definition = Some(definition),
+			})
 
 
 private pure func resolve_body(
 	function: ParsedFunction,
 	signature: FunctionSignature,
 	context: ResolutionContext,
-) -> Result[CheckedBody, Diagnostic]:
-	scope ?= function_scope(function, signature)
+) -> Result[ResolvedBody, Diagnostic]:
+	initial ?= function_scope(function, signature)
+	var scope = initial
+	var definitions = initial.map(
+		pure func(binding: LocalBinding) -> BindingDefinition: binding.definition,
+	)
+	var assignments: List[CheckedAssignment] = []
+	var failure: Option[Diagnostic] = None
+
+	for written in function.bindings:
+		match resolve_assignment(written, signature.purity, scope, definitions.length(), context):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(resolved):
+				assignments = assignments.append(resolved.assignment)
+				scope = resolved.scope
+
+				match resolved.definition:
+					Some(definition):
+						definitions = definitions.append(definition)
+					None:
+						void
+
+	accepted ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
 
 	match function.body:
 		ParsedValueBody(body):
@@ -1436,10 +1652,25 @@ private pure func resolve_body(
 				Some(signature.return_type),
 				context,
 			)
-			Ok(CheckedValueBody(value.value))
+			Ok({
+				bindings = definitions,
+				assignments = assignments,
+				body = CheckedValueBody(value.value),
+			})
 		ParsedMatchBody(body):
-			matched ?= resolve_match(signature.purity, signature.return_type, scope, body, context)
-			Ok(CheckedMatchBody(matched))
+			matched ?= resolve_match(
+				signature.purity,
+				signature.return_type,
+				scope,
+				body,
+				definitions,
+				context,
+			)
+			Ok({
+				bindings = matched.bindings,
+				assignments = assignments,
+				body = CheckedMatchBody(matched.body),
+			})
 
 
 private pure func resolve_functions(
@@ -1482,7 +1713,9 @@ private pure func resolve_function(
 	body ?= resolve_body(function, signature, context)
 	Ok({
 		signature = signature,
-		body = body,
+		bindings = body.bindings,
+		assignments = body.assignments,
+		body = body.body,
 	})
 
 
@@ -1515,7 +1748,7 @@ private pure func unsettled_value(body: CheckedValue, settled: List[FunctionId])
 		if found.is_some():
 			break
 
-		match operation:
+		match operation.operation:
 			InvokeFunction(call):
 				if not is_settled(call.target, settled):
 					found = Some(call.span)
@@ -1525,7 +1758,31 @@ private pure func unsettled_value(body: CheckedValue, settled: List[FunctionId])
 	found
 
 
-private pure func unsettled_edge(body: CheckedBody, settled: List[FunctionId]) -> Option[Span]:
+private pure func unsettled_edge(
+	function: CheckedFunction,
+	settled: List[FunctionId],
+) -> Option[Span]:
+	var found: Option[Span] = None
+
+	for assignment in function.assignments:
+		value = match assignment:
+			InitializeBinding(_, value):
+				value
+			ReassignBinding(_, value):
+				value
+
+		found = unsettled_value(value, settled)
+
+		if found.is_some():
+			break
+
+	if found.is_some():
+		found
+	else:
+		unsettled_body(function.body, settled)
+
+
+private pure func unsettled_body(body: CheckedBody, settled: List[FunctionId]) -> Option[Span]:
 	match body:
 		CheckedValueBody(value):
 			unsettled_value(value, settled)
@@ -1555,7 +1812,7 @@ private pure func validate_acyclic(functions: List[CheckedFunction]) -> Result[V
 		for function in functions:
 			id = into_opaque FunctionId(index)
 
-			if not is_settled(id, settled) and not unsettled_edge(function.body, settled).is_some():
+			if not is_settled(id, settled) and not unsettled_edge(function, settled).is_some():
 				settled = settled.append(id)
 				changed = True
 
@@ -1564,7 +1821,7 @@ private pure func validate_acyclic(functions: List[CheckedFunction]) -> Result[V
 	var failure: Option[Diagnostic] = None
 
 	for function in functions:
-		match unsettled_edge(function.body, settled):
+		match unsettled_edge(function, settled):
 			Some(span):
 				failure = Some(
 					rejection(

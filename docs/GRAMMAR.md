@@ -1,5 +1,9 @@
 # Blorp Formal Grammar
 
+The separate [Blorp 2 pilot grammar](../blorp_2/grammar.ebnf) defines that
+compiler's restricted subset, including binding prefixes before a final
+expression or tail match. The grammar below describes the full language.
+
 This document is the authoritative specification of Blorp's syntax. A parser
 implementer, a reviewer or a fuzzer should be able to decide from it alone
 whether a source text is syntactically valid and, if it is, how it is
