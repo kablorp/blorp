@@ -92,7 +92,7 @@ BLORP_CLI_C_OPTIMIZATION=-O2 scripts/test --no-build --serial \
 ```
 
 Full logs and large C artifacts remain under
-`/tmp/blorp-model-refactor-validation.uvkvrf/`; raw matched measurements above
+`/tmp/blorp-model-refactor-validation.uvkvrf/`; path-projected matched measurements above
 are retained in this directory. The broad gates ran serially and reported
 12,963 passing checks; parity reported zero mismatched files.
 
@@ -140,7 +140,7 @@ All four outputs were byte-identical: 86,912,985 bytes, SHA-256
 Accept the allocation/output evidence and measured growth-ceiling compliance;
 final correctness acceptance still requires the external combined-tree gate.
 
-Retained raw pairs: [initial baseline](compiler_data_model_refactors_current_main_2026-10-08_baseline.json),
+Retained path-projected pairs: [initial baseline](compiler_data_model_refactors_current_main_2026-10-08_baseline.json),
 [initial candidate](compiler_data_model_refactors_current_main_2026-10-08_candidate.json),
 [resample baseline](compiler_data_model_refactors_current_main_2026-10-08_baseline-resample.json),
 and [resample candidate](compiler_data_model_refactors_current_main_2026-10-08_candidate-resample.json).
@@ -170,3 +170,5 @@ failure. Main subsequently advanced to `2d1de5a6d`; its unrelated parser and
 global-table cleanup is retained. The measurements and external gate above
 describe the stated `a8413c9f3` boundary, not a fresh full gate on that newer
 main composition.
+
+Publication note: linked measurement JSONs are path-projected publication records. Machine-local checkout and per-user temporary paths use worktree and `$TMPDIR` placeholders. Measurement values, timestamps, samples, source/C/binary hashes and original nested provenance fields are unchanged; no measurements were rerun. The [projection receipt](compiler_report_path_projection_2026-10-08.json) records original versus publication hashes and the private original archive. Original fingerprints describe original bytes, not the projected JSON byte streams.

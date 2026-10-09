@@ -16,7 +16,7 @@ Production physical LOC decreases by 33 (parser −5, finalizer −26, global au
 
 - Landing base and frozen self-compile input: `a8413c9f38b22884c12fad3722c49be243ee0eeb`.
 - Source/test patch SHA-256: `6ca9e18f23e59edb4c7b3c451350b16fdf95d05a48d8e0ceb3533415af16bfab`; retained at `/tmp/blorp-lint-cleanups-a8413c9f3/reviewed-source.patch`.
-- Same checkout: `/Users/keithphilpott/.codex/worktrees/compiler-lint-cleanups/blorp`. Saved baseline binaries run from its original `bin/` paths, preserving repository-root discovery.
+- Same checkout: `<worktree:compiler-lint-cleanups>`. Saved baseline binaries run from its original `bin/` paths, preserving repository-root discovery.
 - Baseline and candidate normal/diagnostic builds were `FRESH` at capture: bootstrap `dev-0e1598ed616e`, CLI/runtime `-O2`, split 8, Apple clang 21.0.0 (`clang-2100.3.34.2`), aarch64 macOS. Only diagnostics mode differs within each pair (0 vs 1).
 - Baseline-repeat checkout metadata reports `compiler_dirty=True` because the candidate source had been reapplied. The saved baseline executable and diagnostic binary hashes are unchanged, and their embedded toolchain commit remains the clean baseline; this checkout-state flag does not describe rebuilt baseline binaries.
 - Separate diagnostic allocations and normal instruction samples. All normal samples emit the same C as their diagnostic pair and baseline. Small-program input hash captured before edits and verified before candidate measurement.
@@ -202,3 +202,5 @@ Logs, generated C, build/freshness records and source patch remain in `/tmp/blor
 - Latest-base source and measurement/report reviews: zero blockers, should-fix findings or nits. Final precommit review approves all 15 intended files with zero issues.
 - `git diff --check`: passes.
 - Existing formatter import ordering/line-wrap drift was confirmed on baseline. Introduced formatting corrected; whole-file formatter conformance is not claimed.
+
+Publication note: linked measurement JSONs are path-projected publication records. Machine-local checkout and per-user temporary paths use worktree and `$TMPDIR` placeholders. Measurement values, timestamps, samples, source/C/binary hashes and original nested provenance fields are unchanged; no measurements were rerun. The [projection receipt](compiler_report_path_projection_2026-10-08.json) records original versus publication hashes and the private original archive. Original fingerprints describe original bytes, not the projected JSON byte streams.
