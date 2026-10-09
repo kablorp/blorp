@@ -2,7 +2,9 @@
 
 Status: implemented and validated, 2026-10-09. The
 [binding increment record](../benchmarks/results/blorp_2_bindings_2026-10-09.md)
-retains costs, provenance and passing gates.
+retains costs, provenance and passing gates. The
+[arm-binding extension record](../benchmarks/results/blorp_2_arm_bindings_2026-10-09.md)
+retains the next increment's evidence.
 Read [AGENTS.md](AGENTS.md) and
 the parent instructions first. The [architecture review](../benchmarks/results/blorp_2_architecture_review_2026-10-09.md)
 and [memory plan](MEMORY_PLAN.md) establish the intended boundaries.
@@ -32,8 +34,9 @@ A function contains zero or more depth-one binding lines followed by its
 mandatory existing final expression or tail match. Each RHS uses the current
 single-line expression grammar. Add `=` and the whole-word reserved keyword
 `var`. Prefix lines are `name = expression` or `var name = expression`.
-No annotations, discards, expression statements, block-arm bindings, nested
-matches, loops, closures, imports or arithmetic operators are added.
+The initial increment adds no annotations, discards, expression statements,
+block-arm bindings, nested matches, loops, closures, imports or arithmetic
+operators. The arm-block extension below composes bindings with tail matches.
 
 Checking resolves an ordinary `name = rhs` to a new immutable binding when
 there is no visible local, or to reassignment of the nearest visible mutable
@@ -165,3 +168,43 @@ criterion; native behavior and the specified golden output are required.
 No speedup is claimed. Interning and cycle-check optimizations remain separate
 slices. Managed representations, dup/drop, ARC/COW and destructors remain
 future work with the memory plan's independent proof and runtime-test contracts.
+
+## Match-arm binding extension
+
+The arm-block working example is
+[match_binding_original.brp](test/e2e/fixtures/match_binding_original.brp):
+the `Number(payload)` arm declares `var current = payload`, saves
+`original = current`, reassigns `current = identity(42)`, and returns
+`original`. `main` passes `Number(7)`, so the executable exits 7.
+Companions return 42 and 0, and exercise shadowing of an outer body local.
+
+An arm keeps its inline expression form or opens a depth-three block with
+zero or more existing binding lines and one final single-line expression.
+Nested matches and non-tail matches remain outside this increment.
+Parsed arms publish their binding prefix; checked arms publish ordered
+assignments; lowering uses the existing branch-local `ValueBlock`.
+All binding and value identities remain function-owned.
+
+Current-block membership is explicit during checking. A block's first local
+ordinal distinguishes its declarations from enclosing locals; a capture is
+introduced before that boundary. An explicit `var` may shadow an enclosing
+local or capture, while a duplicate declaration in the same block is rejected.
+Ordinary `=` keeps its nearest-binding behavior. Every arm starts from the
+enclosing scope and binding map; siblings propagate identity allocation only.
+All arm initializers participate in purity and cycle checking.
+
+Direct phase tests cover parsing and spans, block indentation and final-result
+errors, capture/local shadowing, sibling isolation, immutable/type/purity/cycle
+rejections, ordered branch definitions, alias preservation and independent
+branch mappings. Native fixtures use their real `main`, unchanged emitted C,
+strict C11 at `-O0`, and UBSan. Deliberately corrupt a lowering mapping and
+require the regression test to fail before restoring the source.
+
+Freeze the existing 39-fixture workload before editing. This feature's
+ceilings are +25% allocations and +10% retired instructions per existing
+fixture, 10,000 allocations / 100,000,000 instructions per new fixture, and
+5,000 physical production lines. Compare identical `-O0` diagnostic toolchains
+and require byte-identical emitted C for existing fixtures. Until self-hosting,
+these owned-input costs remain proxies. The baseline default e2e command
+passes 53 cases in 25.61 seconds; raw evidence is under the ignored
+`build/arm-bindings-evidence/` directory.

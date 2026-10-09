@@ -3,6 +3,7 @@ import:
 		BindingDefinition,
 		BindingId,
 		BindingOrigin(ParameterBinding, BodyLocal, MatchCapture),
+		CheckedArm,
 		CheckedAssignment(InitializeBinding, ReassignBinding),
 		CheckedBase(ReturnInteger, ReturnVariant, ReturnBinding, ReturnCall),
 		CheckedBody(CheckedValueBody, CheckedMatchBody),
@@ -246,32 +247,32 @@ private pure func lower_capture(
 
 private pure func lower_arm(
 	builder: ValueBuilder,
-	pattern: CheckedPattern,
-	value: CheckedValue,
+	arm: CheckedArm,
 	scrutinee: ValueId,
 	bindings: List[BindingDefinition],
 ) -> Result[BuiltArm, Diagnostic]:
 	var branch = { builder | definitions = [] }
 
-	label = match pattern:
+	label = match arm.pattern:
 		VariantCase(id, _):
 			VariantLabel(id)
 		_:
 			DefaultLabel
 
-	bound ?= match pattern:
+	bound ?= match arm.pattern:
 		BindingCase(id):
-			assign_value(branch, id, scrutinee, value.base_span)
+			assign_value(branch, id, scrutinee, arm.body.base_span)
 		VariantCase(_, payload):
 			match payload:
 				BindIntPayload(id):
-					lower_capture(branch, id, scrutinee, bindings, value.base_span)
+					lower_capture(branch, id, scrutinee, bindings, arm.body.base_span)
 				_:
 					Ok(branch)
 		WildcardCase:
 			Ok(branch)
 
-	result ?= lower_value(bound, value)
+	prefix ?= lower_assignments(bound, arm.assignments)
+	result ?= lower_value(prefix, arm.body)
 	Ok({
 		arm = {
 			label = label,
@@ -295,7 +296,7 @@ private pure func lower_match(
 	var failure: Option[Diagnostic] = None
 
 	for arm in matched.arms:
-		match lower_arm(current, arm.pattern, arm.body, scrutinee.value, bindings):
+		match lower_arm(current, arm, scrutinee.value, bindings):
 			Err(error):
 				failure = Some(error)
 				break
@@ -330,6 +331,28 @@ private pure func lower_assignment(
 			assign_value(result.builder, id, result.value, value.base_span)
 
 
+private pure func lower_assignments(
+	initial: ValueBuilder,
+	assignments: List[CheckedAssignment],
+) -> Result[ValueBuilder, Diagnostic]:
+	var builder = initial
+	var failure: Option[Diagnostic] = None
+
+	for assignment in assignments:
+		match lower_assignment(builder, assignment):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(assigned):
+				builder = assigned
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(builder)
+
+
 private pure func lower_function(function: CheckedFunction) -> Result[LoweredFunction, Diagnostic]:
 	var builder: ValueBuilder = {
 		next_value = 0,
@@ -356,32 +379,18 @@ private pure func lower_function(function: CheckedFunction) -> Result[LoweredFun
 
 		ordinal = IntOps.add(ordinal, 1)
 
-	var failure: Option[Diagnostic] = None
-
-	for assignment in function.assignments:
-		match lower_assignment(builder, assignment):
-			Err(error):
-				failure = Some(error)
-				break
-			Ok(assigned):
-				builder = assigned
-
-	accepted ?= match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(void)
+	prefix ?= lower_assignments(builder, function.assignments)
 
 	match function.body:
 		CheckedValueBody(value):
-			result ?= lower_value(builder, value)
+			result ?= lower_value(prefix, value)
 			Ok({
 				signature = function.signature,
 				definitions = result.builder.definitions,
 				tail = ReturnValue(result.value),
 			})
 		CheckedMatchBody(matched):
-			result ?= lower_match(builder, matched, function.bindings)
+			result ?= lower_match(prefix, matched, function.bindings)
 			Ok({
 				signature = function.signature,
 				definitions = result.builder.definitions,

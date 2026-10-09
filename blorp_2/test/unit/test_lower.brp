@@ -357,9 +357,222 @@ pure func test_match_calls_stay_inside_their_selected_branches() -> Bool:
 					False
 
 
+pure func test_block_arm_reassignment_preserves_payload_alias() -> Bool:
+	prefix = "fixed union Value:\n\tEmpty\n\tNumber(Int)\npure func identity(value: Int) -> Int:\n\tvalue\npure func inspect(value: Value) -> Int:\n\tmatch value:\n\t\tEmpty: 0\n\t\tNumber(payload):\n\t\t\tvar current = payload\n\t\t\toriginal = current\n\t\t\tcurrent = identity("
+
+	match fixture(prefix + "42)\n\t\t\toriginal\nfunc main() -> Int:\n\tinspect(Number(7))\n"):
+		Err(_):
+			False
+		Ok(program):
+			match lowered_functions(program).functions:
+				[_, inspect, _]:
+					match inspect.definitions:
+						[parameter]:
+							match inspect.tail:
+								MatchValue(matched):
+									match matched.arms:
+										[_, number]:
+											match number.body.definitions:
+												[payload, replacement, call]:
+													match payload.operation:
+														PayloadValue(owner):
+															match replacement.operation:
+																IntegerValue(42):
+																	match call.operation:
+																		CallValue(target, OneArgument(argument)):
+																			(
+																				value_number(
+																					owner,
+																				) == value_number(
+																					parameter.id,
+																				)
+																				and value_number(
+																					payload.id,
+																				) == 2
+																				and value_number(
+																					replacement.id,
+																				) == 3
+																				and value_number(
+																					call.id,
+																				) == 4
+																				and value_number(
+																					argument,
+																				) == 3
+																				and value_number(
+																					number.body.result,
+																				) == 2
+																				and function_number(
+																					target.target,
+																				) == 0
+																				and same_type(
+																					payload.value_type,
+																					IntType,
+																				)
+																				and same_type(
+																					replacement.value_type,
+																					IntType,
+																				)
+																				and same_type(
+																					call.value_type,
+																					IntType,
+																				)
+																				and replacement.span.start == prefix.length()
+																				and replacement.span.end == prefix.length() + 2
+																				and call.span.start == prefix.length() - 9
+																				and call.span.end == prefix.length() - 1
+																			)
+																		_:
+																			False
+																_:
+																	False
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_arm_reassignment_does_not_change_sibling_outer_value() -> Bool:
+	match fixture(
+		"fixed union Value:\n\tEmpty\n\tNumber(Int)\npure func inspect(value: Value) -> Int:\n\tvar current = 7\n\tmatch value:\n\t\tEmpty:\n\t\t\tcurrent = 42\n\t\t\tcurrent\n\t\tNumber(_):\n\t\t\toriginal = current\n\t\t\tcurrent = 1\n\t\t\toriginal\nfunc main() -> Int:\n\tinspect(Number(0))\n",
+	):
+		Err(_):
+			False
+		Ok(program):
+			match lowered_functions(program).functions:
+				[inspect, _]:
+					match inspect.definitions:
+						[_, original]:
+							match inspect.tail:
+								MatchValue(matched):
+									match matched.arms:
+										[first, second]:
+											match first.body.definitions:
+												[first_replacement]:
+													match second.body.definitions:
+														[second_replacement]:
+															(
+																value_number(original.id) == 1
+																and value_number(
+																	first_replacement.id,
+																) == 2
+																and value_number(
+																	second_replacement.id,
+																) == 3
+																and value_number(
+																	first.body.result,
+																) == 2
+																and value_number(
+																	second.body.result,
+																) == 1
+															)
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_arm_unused_calls_remain_ordered_inside_the_branch() -> Bool:
+	match fixture(
+		"fixed union Value:\n\tEmpty\n\tNumber(Int)\nfunc first() -> Int:\n\t1\nfunc second() -> Int:\n\t2\nfunc inspect(value: Value) -> Int:\n\tmatch value:\n\t\tEmpty:\n\t\t\tunused = first()\n\t\t\tvar current = second()\n\t\t\tcurrent = first()\n\t\t\tcurrent\n\t\tNumber(payload): payload\nfunc main() -> Int:\n\tinspect(Empty)\n",
+	):
+		Err(_):
+			False
+		Ok(program):
+			match lowered_functions(program).functions:
+				[_, _, inspect, _]:
+					match inspect.definitions:
+						[parameter]:
+							match inspect.tail:
+								MatchValue(matched):
+									match matched.arms:
+										[empty, number]:
+											match empty.body.definitions:
+												[first, second, third]:
+													match first.operation:
+														CallValue(first_call, NoArguments):
+															match second.operation:
+																CallValue(second_call, NoArguments):
+																	match third.operation:
+																		CallValue(third_call, NoArguments):
+																			(
+																				function_number(
+																					first_call.target,
+																				) == 0
+																				and function_number(
+																					second_call.target,
+																				) == 1
+																				and function_number(
+																					third_call.target,
+																				) == 0
+																				and value_number(
+																					parameter.id,
+																				) == 0
+																				and value_number(
+																					first.id,
+																				) == 1
+																				and value_number(
+																					second.id,
+																				) == 2
+																				and value_number(
+																					third.id,
+																				) == 3
+																				and value_number(
+																					empty.body.result,
+																				) == 3
+																				and number.body.definitions.length() == 1
+																				and value_number(
+																					number.body.result,
+																				) == 4
+																			)
+																		_:
+																			False
+																_:
+																	False
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 ordered value lowering",
 	tests = [
+		(
+			"block arm reassignment preserves payload alias",
+			test_block_arm_reassignment_preserves_payload_alias,
+		),
+		(
+			"arm reassignment preserves sibling outer value",
+			test_arm_reassignment_does_not_change_sibling_outer_value,
+		),
+		(
+			"arm unused calls remain ordered inside branch",
+			test_arm_unused_calls_remain_ordered_inside_the_branch,
+		),
 		(
 			"full width alias retains original value",
 			test_full_width_alias_retains_the_original_value,

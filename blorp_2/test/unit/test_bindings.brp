@@ -4,7 +4,7 @@ import:
 		BindingOrigin(ParameterBinding, BodyLocal, MatchCapture),
 		CheckedAssignment(InitializeBinding, ReassignBinding),
 		CheckedBase(ReturnBinding),
-		CheckedBody(CheckedValueBody),
+		CheckedBody(CheckedValueBody, CheckedMatchBody),
 		TypeRef(IntType, UnionType),
 		binding_number,
 		check,
@@ -268,9 +268,264 @@ pure func test_body_local_does_not_shadow_ufcs_function() -> Bool:
 	)
 
 
+private ARM_PREFIX: String = "fixed union Value:\n\tEmpty\n\tNumber(Int)\npure func inspect(value: Value) -> Int:\n\tmatch value:\n"
+
+
+private pure func rejects_arm(
+	before: String,
+	spelling: String,
+	after: String,
+	message: String,
+	help: String,
+) -> Bool:
+	match checked(
+		ARM_PREFIX + before + spelling + after + "func main() -> Int:\n\tinspect(Number(7))\n",
+	):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.span.start == ARM_PREFIX.length() + before.length()
+				and error.span.end == ARM_PREFIX.length() + before.length() + spelling.length()
+				and error.message == message
+				and error.help == help
+			)
+
+
+pure func test_arm_local_mutation_is_pure() -> Bool:
+	accepts(
+		ARM_PREFIX + "\t\tEmpty: 0\n\t\tNumber(payload):\n\t\t\tvar current = payload\n\t\t\toriginal = current\n\t\t\tcurrent = 42\n\t\t\toriginal\nfunc main() -> Int:\n\tinspect(Number(7))\n",
+	)
+
+
+pure func test_arm_var_initializer_reads_capture_before_shadowing() -> Bool:
+	accepts(
+		ARM_PREFIX + "\t\tEmpty: 0\n\t\tNumber(payload):\n\t\t\tvar payload = payload\n\t\t\tpayload = 42\n\t\t\tpayload\nfunc main() -> Int:\n\tinspect(Number(7))\n",
+	)
+
+
+pure func test_arm_var_can_shadow_an_enclosing_body_local() -> Bool:
+	accepts(
+		"fixed union Value:\n\tEmpty\n\tNumber(Int)\npure func inspect(value: Value) -> Int:\n\tlocal = 7\n\tmatch value:\n\t\tEmpty:\n\t\t\tvar local = local\n\t\t\tlocal = 42\n\t\t\tlocal\n\t\tNumber(_): local\nfunc main() -> Int:\n\tinspect(Empty)\n",
+	)
+
+
+pure func test_sibling_arms_can_declare_the_same_local_name() -> Bool:
+	accepts(
+		ARM_PREFIX + "\t\tEmpty:\n\t\t\tvar local = 0\n\t\t\tlocal\n\t\tNumber(payload):\n\t\t\tvar local = payload\n\t\t\tlocal\nfunc main() -> Int:\n\tinspect(Number(7))\n",
+	)
+
+
+pure func test_arm_local_does_not_escape_to_a_sibling() -> Bool:
+	rejects_arm(
+		"\t\tEmpty:\n\t\t\tlocal = 0\n\t\t\tlocal\n\t\tNumber(_): ",
+		"local",
+		"\n",
+		"unknown value",
+		"use this function's parameter name, a declared variant, or a call",
+	)
+
+
+pure func test_arm_capture_assignment_is_rejected() -> Bool:
+	rejects_arm(
+		"\t\tEmpty: 0\n\t\tNumber(payload):\n\t\t\t",
+		"payload",
+		" = 42\n\t\t\tpayload\n",
+		"cannot assign to an immutable binding",
+		"declare the binding with var to allow reassignment",
+	)
+
+
+pure func test_arm_immutable_local_assignment_is_rejected() -> Bool:
+	rejects_arm(
+		"\t\tEmpty: 0\n\t\tNumber(payload):\n\t\t\tlocal = payload\n\t\t\t",
+		"local",
+		" = 42\n\t\t\tlocal\n",
+		"cannot assign to an immutable binding",
+		"declare the binding with var to allow reassignment",
+	)
+
+
+pure func test_arm_duplicate_mutable_declaration_is_rejected() -> Bool:
+	rejects_arm(
+		"\t\tEmpty: 0\n\t\tNumber(payload):\n\t\t\tvar local = payload\n\t\t\tvar ",
+		"local",
+		" = 42\n\t\t\tlocal\n",
+		"duplicate local binding",
+		(
+			"give each body-local declaration a distinct name; omit var to reassign a "
+			+ "mutable binding"
+		),
+	)
+
+
+pure func test_arm_self_initializer_is_not_visible() -> Bool:
+	rejects_arm(
+		"\t\tEmpty: 0\n\t\tNumber(_):\n\t\t\tvar local = ",
+		"local",
+		"\n\t\t\tlocal\n",
+		"unknown value",
+		"use this function's parameter name, a declared variant, or a call",
+	)
+
+
+pure func test_arm_reassignment_keeps_its_established_type() -> Bool:
+	rejects_arm(
+		"\t\tEmpty: 0\n\t\tNumber(payload):\n\t\t\tvar local = value\n\t\t\tlocal = ",
+		"payload",
+		"\n\t\t\t0\n",
+		"expression does not match the expected type",
+		"use an expression of type Value here",
+	)
+
+
+pure func test_unused_unselected_arm_impure_initializer_is_rejected() -> Bool:
+	rejects_arm(
+		"\t\tEmpty:\n\t\t\tunused = ",
+		"effect",
+		"()\n\t\t\t0\n\t\tNumber(payload): payload\nfunc effect() -> Int:\n\t1\n",
+		"pure functions cannot call impure functions",
+		"mark the callee pure or remove pure from the caller",
+	)
+
+
+pure func test_unused_unselected_arm_recursive_initializer_is_rejected() -> Bool:
+	rejects_arm(
+		"\t\tEmpty:\n\t\t\tunused = ",
+		"inspect",
+		"(value)\n\t\t\t0\n\t\tNumber(payload): payload\n",
+		"call chain contains recursion",
+		"use an acyclic call chain; recursion is not supported in this increment",
+	)
+
+
+pure func test_arm_final_value_must_match_the_function_return_type() -> Bool:
+	rejects_arm(
+		"\t\tEmpty: 0\n\t\tNumber(_):\n\t\t\tlocal = value\n\t\t\t",
+		"local",
+		"\n",
+		"expression does not match the expected type",
+		"use an expression of type Int here",
+	)
+
+
+private pure func arm_definitions_result() -> Result[Bool, Diagnostic]:
+	first_prefix = ARM_PREFIX + "\t\tEmpty:\n\t\t\tvar "
+	second_prefix = first_prefix + "local = 0\n\t\t\tlocal\n\t\tNumber(payload):\n\t\t\tvar "
+	lexed ?= lex(
+		second_prefix + "local = payload\n\t\t\tlocal = 42\n\t\t\tlocal\nfunc main() -> Int:\n\tinspect(Number(7))\n",
+	)
+	parsed ?= parse(lexed)
+	program ?= check(parsed)
+	Ok(
+		match checked_functions(program).functions:
+			[inspect, _]:
+				match inspect.bindings:
+					[parameter, first, capture, second]:
+						match inspect.body:
+							CheckedMatchBody(matched):
+								match matched.arms:
+									[first_arm, second_arm]:
+										match first_arm.assignments:
+											[InitializeBinding(first_id, _)]:
+												match second_arm.assignments:
+													[InitializeBinding(second_id, initializer), ReassignBinding(reassigned, _)]:
+														match initializer.base:
+															ReturnBinding(captured):
+																(
+																	parameter.origin == ParameterBinding
+																	and first.origin == BodyLocal
+																	and second.origin == BodyLocal
+																	and first.mutability == Mutable
+																	and second.mutability == Mutable
+																	and capture.origin == MatchCapture
+																	and capture.mutability == Immutable
+																	and same_type(
+																		capture.value_type,
+																		IntType,
+																	)
+																	and binding_number(
+																		first_id,
+																	) == 1
+																	and binding_number(
+																		captured,
+																	) == 2
+																	and binding_number(
+																		second_id,
+																	) == 3
+																	and binding_number(
+																		reassigned,
+																	) == 3
+																	and first.span.start == first_prefix.length()
+																	and first.span.end == first_prefix.length() + 5
+																	and second.span.start == second_prefix.length()
+																	and second.span.end == second_prefix.length() + 5
+																)
+															_:
+																False
+													_:
+														False
+											_:
+												False
+									_:
+										False
+							_:
+								False
+					_:
+						False
+			_:
+				False
+	)
+
+
+pure func test_arm_definitions_have_function_owned_ids_and_exact_facts() -> Bool:
+	arm_definitions_result().get_or(False)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 scalar binding checks",
 	tests = [
+		(
+			"arm definitions have function ids and exact facts",
+			test_arm_definitions_have_function_owned_ids_and_exact_facts,
+		),
+		(
+			"arm final value matches function return type",
+			test_arm_final_value_must_match_the_function_return_type,
+		),
+		("arm local mutation is pure", test_arm_local_mutation_is_pure),
+		(
+			"arm var initializer reads capture before shadowing",
+			test_arm_var_initializer_reads_capture_before_shadowing,
+		),
+		("arm var shadows enclosing body local", test_arm_var_can_shadow_an_enclosing_body_local),
+		(
+			"sibling arms may declare same local name",
+			test_sibling_arms_can_declare_the_same_local_name,
+		),
+		("arm local cannot escape to sibling", test_arm_local_does_not_escape_to_a_sibling),
+		("arm capture assignment rejected", test_arm_capture_assignment_is_rejected),
+		(
+			"arm immutable local assignment rejected",
+			test_arm_immutable_local_assignment_is_rejected,
+		),
+		(
+			"arm duplicate mutable declaration rejected",
+			test_arm_duplicate_mutable_declaration_is_rejected,
+		),
+		("arm self initializer is not visible", test_arm_self_initializer_is_not_visible),
+		(
+			"arm reassignment keeps established type",
+			test_arm_reassignment_keeps_its_established_type,
+		),
+		(
+			"unused unselected arm impure initializer rejected",
+			test_unused_unselected_arm_impure_initializer_is_rejected,
+		),
+		(
+			"unused unselected arm recursive initializer rejected",
+			test_unused_unselected_arm_recursive_initializer_is_rejected,
+		),
 		("body local shadows direct unary function", test_body_local_shadows_direct_unary_function),
 		(
 			"body local shadows direct zero argument function",

@@ -158,6 +158,37 @@ the reassigned current value, 42. Separate small fixtures cover self-assignment,
 parameter shadowing and union values. Phase tests check exact full-width values
 and evaluation order.
 
+Bindings also compose with match arms. The
+[arm-binding example](test/e2e/fixtures/match_binding_original.brp) returns 7:
+
+```blorp
+fixed union Choice:
+    Empty
+    Number(Int)
+pure func identity(value: Int) -> Int:
+    value
+pure func inspect(choice: Choice) -> Int:
+    match choice:
+        Empty: 0
+        Number(payload):
+            var current = payload
+            original = current
+            current = identity(42)
+            original
+func main() -> Int:
+    inspect(Number(7))
+```
+
+An arm block contains zero or more binding lines and a final expression,
+indented one level deeper than its pattern. Inline and block arms can coexist.
+Each arm has its own scope; sibling arms can declare the same name. An explicit
+`var` may shadow an enclosing binding, and its initializer sees the earlier
+binding. Ordinary `=` still reassigns the nearest mutable binding or rejects
+assignment to an immutable one. Companion fixtures return the
+[updated value](test/e2e/fixtures/match_binding_current.brp), exercise the
+[other branch](test/e2e/fixtures/match_binding_empty.brp), and preserve an
+[outer value](test/e2e/fixtures/match_binding_outer.brp) across shadowing.
+
 From the repository root:
 
 ```sh
@@ -269,7 +300,7 @@ This specification defines only the examples' language: functions with explicit
 return types and zero or one explicitly typed parameter, and fixed union
 declarations whose variants have zero fields or one `Int` field. A function
 body has zero or more binding lines followed by a single expression or a tail
-match with inline arm results. Expressions
+match with inline arm results or binding blocks. Expressions
 start with a signed Int64 literal, a binding or variant name, or an application
 with zero or one argument. UFCS suffixes may follow that expression.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
@@ -302,7 +333,8 @@ Lexical and layout rules:
   The final line may end at EOF or with one LF.
 - The entire indentation prefix uses tabs only or spaces in groups of four.
   Body and variant lines require depth one: one tab or four spaces. Match arms
-  require depth two: two tabs or eight spaces. Mixed indentation is invalid;
+  require depth two: two tabs or eight spaces. Arm-block lines require depth
+  three: three tabs or twelve spaces. Mixed indentation is invalid;
   parsing rejects a valid depth in the wrong position. No indentation stack
   or synthetic dedent tokens are needed for this restricted layout.
 - Spaces may separate tokens and trail each line. They are required between
@@ -311,7 +343,7 @@ Lexical and layout rules:
   `funcmain` is one identifier. The two characters of `->` are adjacent.
   Spaces may surround a UFCS dot and its parentheses, as in `1 . one ( )`.
   Tabs occur only in the indentation prefix. Each expression stays on one line,
-  including match scrutinees and arm results.
+  including match scrutinees, binding initializers and final arm results.
 - `func`, `pure`, `match`, `var`, and lone `_` are reserved. The optional `pure` qualifier precedes `func`
   with spaces between the two keywords. Function, parameter and type names are
   identifiers whose meaning is checked after parsing.
@@ -322,15 +354,19 @@ Lexical and layout rules:
   Empty declaration parentheses, multiple fields and generic type parameters
   are unsupported.
 - `match expression:` starts a nonempty sequence of depth-two arms written
-  `Pattern: expression`. A pattern is a bare name, `_`, or a constructor name
+  `Pattern: expression` or `Pattern:` followed by a depth-three block of
+  binding lines and a mandatory final expression. A pattern is a bare name,
+  `_`, or a constructor name
   followed by parentheses containing zero or one field pattern. A field
   pattern is a binder or `_`; literal and nested field patterns are unsupported.
   A nullary constructor pattern may be written `Empty` or `Empty()`. `Number()`
   is valid syntax but fails semantic arity checking for a one-field constructor.
 - A binding line is `name = expression` or `var name = expression`, at depth
-  one. Its initializer occupies the same line. Bindings must precede the
-  mandatory final expression or tail match; bindings inside arguments or match
-  arms, annotations, and standalone expression statements are unsupported.
+  one in a function or depth three in an arm block. Its initializer occupies
+  the same line. Function bindings precede the mandatory final expression or
+  tail match; arm bindings precede a mandatory final single-line expression.
+  Bindings inside arguments, annotations, and standalone expression statements
+  are unsupported. An arm block cannot contain a nested match.
 - Integer literals are decimal values from `-9223372036854775808` through
   `9223372036854775807`, with an optional adjacent minus. `-0` is accepted
   and has value zero. Leading zeros (`00`, `-01`), plus signs, separated minus
@@ -369,13 +405,17 @@ Semantic rules:
   the same spelling.
 - `name = expression` declares an immutable binding when the name is absent,
   reassigns an existing mutable binding, and rejects an existing immutable
-  binding. `var` declares a fresh mutable binding and may shadow a parameter;
-  redeclaring a body-local name is rejected. The initializer sees the earlier
+  binding. `var` declares a fresh mutable binding and may shadow a parameter,
+  an arm capture, or a local from an enclosing block; redeclaring a local in
+  the same block is rejected. The initializer sees the earlier
   scope, so `var value = value` can initialize from a parameter. New bindings
   infer their type from the initializer; reassignment checks the established
   type. Bare constructors need a receiving union type, supplied by a call,
   return or reassignment; a new local initializer does not guess that type.
-  All initializers are checked for purity and call cycles, even when unused.
+  All initializers are checked for purity and call cycles, even when unused or
+  in an arm a constant scrutinee cannot select. Arm locals stay within their
+  arm. Reassignment of an enclosing mutable binding affects only the selected
+  arm's computation; matches remain in the function tail.
 - `receiver.function()` resolves its target from the file's declared functions,
   independently of parameter shadowing. The receiver still uses the caller's scope.
   A parameter named `identity` can therefore be read and passed to the declared
@@ -417,9 +457,9 @@ Semantic rules:
   the checked entrypoint and converts the result to the process exit status.
 - The final expression is the return value. No explicit `return` is needed.
 - Multiple parameters or arguments, explicit UFCS arguments, parenthesized expressions,
-  multiple or non-Int payload fields, nested matches, block arm results,
+  multiple or non-Int payload fields, nested matches,
   guards, qualified/nested/literal patterns, constructor UFCS, multiline chains,
-  bindings inside arms, generics, and function
+  non-tail matches, generics, and function
   values are outside this increment. `Bool` has no special treatment: a written
   `fixed union Bool` follows the ordinary union path, and an undeclared `Bool` is unknown.
   Imports and UFCS-only import visibility are deferred; every function in this
@@ -468,6 +508,9 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    origin and declaration span; typed expression occurrences retain their own
    spans. Match checking resolves patterns and result types,
    and establishes usefulness and exhaustiveness before publishing checked arms.
+   Each arm publishes its ordered assignments and result. The current block's
+   first local ordinal establishes which declarations belong to that block;
+   semantic origin alone does not determine scope membership.
    Constructors retain their owning union and variant identities. Checking
    publishes an opaque program with its entrypoint identity. Call notation is erased
    after target resolution; lowering receives the same checked calls for both forms.
@@ -476,6 +519,9 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    its current value. An alias uses the same value; reassignment updates that
    map after evaluating the right-hand side. Every computed value retains its
    type and source span. Match-arm computations remain in their branches.
+   Every arm starts with the enclosing binding map, lowers its capture and
+   binding sequence, and publishes a branch-local value block. Sibling arms
+   share only the function's value allocator, preserving distinct identities.
 5. Emission consumes the lowered program and produces C. Computed values use
    immutable C locals; scalar reassignment requires no runtime mutable cell.
    A match uses its evaluated scrutinee once and switches on its tag. Arm-local field
