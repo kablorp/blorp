@@ -1,13 +1,15 @@
 import:
 	int as IntOps
+	names: NameId, NameTable, SpecialNames, name_spelling, same_name
 	option: is_some, to_result
+	parse: ParsedProgram, parsed_contents
 	syntax:
+		CallNotation(DirectCall, ReceiverCall),
 		Diagnostic,
 		ExpressionBase(IntegerExpression, NameExpression, CallExpression),
 		IntegerValue,
 		ParameterList(EmptyParameters, SingleParameter),
 		ParsedFunction,
-		ParsedProgram,
 		Purity(Pure, Impure),
 		ReturnExpression,
 		Span,
@@ -45,7 +47,7 @@ fixed record CheckedReturn {
 
 private fixed union ArgumentCount:
 	NoArguments
-	OneArgument
+	OneArgument(CallNotation)
 
 
 fixed record CheckedFunction {
@@ -74,13 +76,13 @@ pure func checked_functions(program: CheckedProgram) -> CheckedFunctions:
 
 private pure func find_function(
 	functions: List[ParsedFunction],
-	name: String,
+	name: NameId,
 ) -> Option[FunctionId]:
 	var index: Int = 0
 	var found: Option[FunctionId] = None
 
 	for function in functions:
-		if Text.equals(function.function_name.spelling, name):
+		if same_name(function.function_name.id, name):
 			found = Some(into_opaque FunctionId(index))
 			break
 
@@ -100,12 +102,13 @@ private pure func rejection(span: Span, message: String, help: String) -> Diagno
 private pure func validate_signatures(
 	functions: List[ParsedFunction],
 	end: Span,
+	special: SpecialNames,
 ) -> Result[FunctionId, Diagnostic]:
 	var previous: List[ParsedFunction] = []
 	var failure: Option[Diagnostic] = None
 
 	for function in functions:
-		if find_function(previous, function.function_name.spelling).is_some():
+		if find_function(previous, function.function_name.id).is_some():
 			failure = Some(
 				rejection(
 					function.function_name.span,
@@ -115,7 +118,7 @@ private pure func validate_signatures(
 			)
 			break
 
-		if not Text.equals(function.return_type.spelling, "Int"):
+		if not same_name(function.return_type.id, special.integer):
 			failure = Some(
 				rejection(
 					function.return_type.span,
@@ -129,7 +132,7 @@ private pure func validate_signatures(
 			EmptyParameters:
 				void
 			SingleParameter(parameter):
-				if Text.equals(function.function_name.spelling, "main"):
+				if same_name(function.function_name.id, special.main):
 					failure = Some(
 						rejection(
 							parameter.name.span,
@@ -139,7 +142,7 @@ private pure func validate_signatures(
 					)
 					break
 
-				if not Text.equals(parameter.type_name.spelling, "Int"):
+				if not same_name(parameter.type_name.id, special.integer):
 					failure = Some(
 						rejection(
 							parameter.type_name.span,
@@ -155,7 +158,7 @@ private pure func validate_signatures(
 		Some(error):
 			Err(error)
 		None:
-			match find_function(functions, "main"):
+			match find_function(functions, special.main):
 				Some(id):
 					Ok(id)
 				None:
@@ -190,12 +193,12 @@ private pure func validate_call(
 					)
 
 
-private pure func is_parameter(parameters: ParameterList, name: String) -> Bool:
+private pure func is_parameter(parameters: ParameterList, name: NameId) -> Bool:
 	match parameters:
 		EmptyParameters:
 			False
 		SingleParameter(parameter):
-			Text.equals(parameter.name.spelling, name)
+			same_name(parameter.name.id, name)
 
 
 private pure func parameter_shape(parameters: ParameterList) -> ParameterShape:
@@ -212,8 +215,19 @@ private pure func resolve_call(
 	name: WrittenName,
 	arguments: ArgumentCount,
 	functions: List[ParsedFunction],
+	names: NameTable,
 ) -> Result[CheckedCall, Diagnostic]:
-	if is_parameter(parameters, name.spelling):
+	uses_local_name: Bool = match arguments:
+		NoArguments:
+			True
+		OneArgument(notation):
+			match notation:
+				DirectCall:
+					True
+				ReceiverCall:
+					False
+
+	if uses_local_name and is_parameter(parameters, name.id):
 		Err(
 			rejection(
 				name.span,
@@ -224,7 +238,7 @@ private pure func resolve_call(
 	else:
 		id ?= find_function(
 			functions,
-			name.spelling,
+			name.id,
 		).to_result(
 			rejection(
 				name.span,
@@ -255,16 +269,36 @@ private pure func resolve_call(
 								"pass one Int expression, such as identity(1)",
 							),
 						)
-			OneArgument:
+			OneArgument(notation):
 				match callee.parameters:
 					EmptyParameters:
-						Err(
-							rejection(
-								name.span,
-								"function takes no arguments",
-								"remove the argument and call the function with ()",
-							),
-						)
+						error: Diagnostic = match notation:
+							DirectCall:
+								rejection(
+									name.span,
+									"function takes no arguments",
+									"remove the argument and call the function with ()",
+								)
+							ReceiverCall:
+								match name_spelling(names, name.id):
+									None:
+										rejection(
+											name.span,
+											"invalid parsed name identity",
+											"report this compiler error with the input program",
+										)
+									Some(spelling):
+										rejection(
+											name.span,
+											"function takes no arguments",
+											Text
+												.concat("call ", spelling)
+												.concat(
+													"() directly, or choose a function with one Int parameter",
+												),
+										)
+
+						Err(error)
 					SingleParameter(_):
 						Ok(void)
 
@@ -280,12 +314,13 @@ private pure func resolve_base(
 	parameters: ParameterList,
 	base: ExpressionBase,
 	functions: List[ParsedFunction],
+	names: NameTable,
 ) -> Result[CheckedBase, Diagnostic]:
 	match base:
 		IntegerExpression(value):
 			Ok(ReturnInteger(value))
 		NameExpression(name):
-			if is_parameter(parameters, name.spelling):
+			if is_parameter(parameters, name.id):
 				Ok(ReturnParameter)
 			else:
 				Err(
@@ -296,7 +331,7 @@ private pure func resolve_base(
 					),
 				)
 		CallExpression(name):
-			call ?= resolve_call(purity, parameters, name, NoArguments, functions)
+			call ?= resolve_call(purity, parameters, name, NoArguments, functions, names)
 			Ok(ReturnCall(call))
 
 
@@ -305,13 +340,21 @@ private pure func resolve_body(
 	parameters: ParameterList,
 	body: ReturnExpression,
 	functions: List[ParsedFunction],
+	names: NameTable,
 ) -> Result[CheckedReturn, Diagnostic]:
-	base ?= resolve_base(purity, parameters, body.base, functions)
+	base ?= resolve_base(purity, parameters, body.base, functions, names)
 	var calls: List[CheckedCall] = []
 	var failure: Option[Diagnostic] = None
 
-	for name in body.unary_calls:
-		match resolve_call(purity, parameters, name, OneArgument, functions):
+	for call in body.unary_calls:
+		match resolve_call(
+			purity,
+			parameters,
+			call.callee,
+			OneArgument(call.notation),
+			functions,
+			names,
+		):
 			Err(error):
 				failure = Some(error)
 				break
@@ -330,12 +373,13 @@ private pure func resolve_body(
 
 private pure func resolve_functions(
 	parsed: List[ParsedFunction],
+	names: NameTable,
 ) -> Result[List[CheckedFunction], Diagnostic]:
 	var functions: List[CheckedFunction] = []
 	var failure: Option[Diagnostic] = None
 
 	for function in parsed:
-		match resolve_body(function.purity, function.parameters, function.body, parsed):
+		match resolve_body(function.purity, function.parameters, function.body, parsed, names):
 			Err(error):
 				failure = Some(error)
 				break
@@ -430,8 +474,9 @@ private pure func validate_acyclic(functions: List[CheckedFunction]) -> Result[V
 
 
 pure func check(program: ParsedProgram) -> Result[CheckedProgram, Diagnostic]:
-	entrypoint ?= validate_signatures(program.functions, program.end)
-	functions ?= resolve_functions(program.functions)
+	parsed = parsed_contents(program)
+	entrypoint ?= validate_signatures(parsed.functions, parsed.end, parsed.special)
+	functions ?= resolve_functions(parsed.functions, parsed.names)
 	acyclic ?= validate_acyclic(functions)
 	Ok(into_opaque CheckedProgram({
 				functions = functions,

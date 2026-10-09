@@ -65,6 +65,26 @@ another call. The companion [`nested_order.brp`](test/e2e/fixtures/nested_order.
 returns `zero(one(1))`, with both helpers ignoring their parameter. Its exit status
 0 and exact generated C distinguish the order of the two calls.
 
+The UFCS example, [`ufcs_calls.brp`](test/e2e/fixtures/ufcs_calls.brp), calls the
+same helpers with `one().identity()`. This is equivalent to `identity(one())`
+and exits 1. A receiver supplies the function's single argument; the method's
+parentheses stay empty in this increment. The companion
+[`ufcs_chain.brp`](test/e2e/fixtures/ufcs_chain.brp) demonstrates chaining:
+
+```blorp
+pure func one(value: Int) -> Int:
+	1
+pure func zero(value: Int) -> Int:
+	0
+func main() -> Int:
+	1.one().zero()
+```
+
+This exits 0. Chains run left to right, so the body is equivalent to
+`zero(one(1))`. Direct calls and UFCS can mix: `zero(identity(1).one()).identity()`
+is equivalent to `identity(zero(one(identity(1))))`. The tests specify the exact
+generated C and parsed call order for this mixed expression.
+
 From the repository root:
 
 ```sh
@@ -109,6 +129,8 @@ and limits. The pure-call fixture has **360 managed allocations** and
 **32,000,000 retired instructions** as its initial ceilings.
 Both nested-call fixtures have **500 managed allocations** and **40,000,000
 retired instructions** as their initial ceilings. Earlier ceilings remain unchanged.
+Both UFCS fixtures have **550 managed allocations** and **40,000,000 retired
+instructions** as their initial ceilings; the five earlier examples keep their limits.
 
 These measure one execution of the new compiler on the example, including
 process startup, argument handling, input/output, and the compile pipeline.
@@ -125,7 +147,7 @@ The first limits were established on arm64 macOS with Apple Clang 21. See the
 [cost record](../benchmarks/results/blorp_2_costs_2026-10-08.md) for baselines,
 commands, provenance, and measurement limits.
 
-The preceding purity increment passed all 71 tests, both normally and with
+The purity increment passed all 71 tests, both normally and with
 UBSan/leak checking. It measured **330 allocations** and **19,204,477 retired
 instructions** for `pure_calls`;
 the existing examples measured 108 and 206 allocations, within their unchanged
@@ -137,8 +159,9 @@ the earlier measurements and final validation provenance.
 
 This specification defines only the examples' language: one or more functions
 with explicit return types and zero or one explicitly typed parameter. A function
-body is the integer literal `0` or `1`, its own parameter name, or a call with zero
-or one argument. Arguments use the same expression grammar, so calls may nest.
+body starts with the integer literal `0` or `1`, its own parameter name, or a
+direct call with zero or one argument. UFCS suffixes may follow that expression.
+Arguments use the same expression grammar, so direct and receiver calls may nest.
 No other declarations, expressions, literals, statements, or comments are supported.
 
 [`grammar.ebnf`](grammar.ebnf) defines the complete restricted source grammar
@@ -168,7 +191,8 @@ Lexical and layout rules:
 - Spaces may separate tokens and trail either line. They are required between
   `func` and the function name. Identifiers are scanned as whole words, so
   `funcmain` is one identifier. The two characters of `->` are adjacent.
-  Tabs occur only in the indentation prefix.
+  Spaces may surround a UFCS dot and its parentheses, as in `1 . one ( )`.
+  Tabs occur only in the indentation prefix. Calls stay on the single body line.
 - `func` and `pure` are reserved. The optional `pure` qualifier precedes `func`
   with spaces between the two keywords. Function, parameter and type names are
   identifiers whose meaning is checked after parsing.
@@ -187,9 +211,14 @@ Semantic rules:
   the number of arguments the callee declares.
 - A bare name resolves only to the containing function's parameter. It cannot
   refer to another function's parameter or denote a function value. A parameter
-  shadows a same-named function; calling that name rejects the non-callable `Int`.
+  shadows a same-named direct call; calling that name rejects the non-callable `Int`.
   Arguments use the caller's scope, even when the callee has a parameter with
   the same spelling.
+- `receiver.function()` resolves its target from the file's declared functions,
+  independently of parameter shadowing. The receiver still uses the caller's scope.
+  A parameter named `identity` can therefore be read and passed to the declared
+  function with `identity.identity()`; the direct call `identity(identity)` tries
+  to call the parameter and is rejected. UFCS targets require one `Int` parameter.
 - A pure caller may call only declared pure callees. Every function body is
   checked, including unreachable helpers, so a pure call chain cannot hide an
   impure edge. Calls inside arguments obey the containing function's purity.
@@ -203,8 +232,10 @@ Semantic rules:
   on its compilation-local identity. A separate C `int main(void)` wrapper calls
   the checked entrypoint and converts the result to the process exit status.
 - The final expression is the return value. No explicit `return` is needed.
-- Multiple parameters or arguments, parenthesized expressions, bindings, and
-  function values are outside this increment.
+- Multiple parameters or arguments, explicit UFCS arguments, parenthesized expressions,
+  fields, multiline chains, bindings, and function values are outside this increment.
+  Imports and UFCS-only import visibility are deferred; every function in this
+  input file is available to either call notation.
 - Syntax and semantic errors carry a source location, an explanation, and help.
   Rejected source produces no C output and does not overwrite an existing output.
 
@@ -222,13 +253,25 @@ pipeline publishes these complete results:
 1. Lexing produces tokens with source spans and an explicit end-of-source span.
 2. Parsing produces complete declarations, parameter annotations, written names,
    and expression syntax. Each expression has a literal, name, or zero-argument
-   call base, followed by unary call wrappers in inner-to-outer order.
+   call base, followed by unary call wrappers in evaluation order. Each wrapper
+   retains explicit direct or receiver notation because their target lookup differs.
+   A local interning builder assigns one opaque `NameId` per spelling. Parsing
+   seals the complete syntax and immutable name table in an opaque `ParsedProgram`.
 3. Checking validates signatures and call chains, resolves calls to function
    identities and parameter reads to the sole parameter slot, and publishes an
-   opaque checked program with its entrypoint identity.
+   opaque checked program with its entrypoint identity. Call notation is erased
+   after target resolution; emission receives the same checked calls for both forms.
 4. Emission consumes that checked program and produces C.
 
-Written spellings belong to syntax. Checking retains call spans for diagnostics;
+The names module owns the spelling table and constructs canonical `main` and
+`Int` identities once. Parsing uses string lookup only in its local interning
+builder, then publishes the immutable table and special identities together.
+Written names contain only a `NameId` and source span. Checking compares identities;
+spelling lookup is reserved for diagnostics and rejects a missing table entry
+as an internal compiler error. IDs are meaningful only within their owning
+parse and table; equality and lookup do not validate table ownership. Only the
+parser can construct the sealed program that checking accepts. `FunctionId` remains a separate
+nominal identity assigned in declaration order. Checking retains call spans;
 emission uses resolved identities, parameter shapes and expressions. These integer-only
 programs need no target heap allocation or ownership pass.
 Ownership, type registries, and general pass infrastructure will be introduced

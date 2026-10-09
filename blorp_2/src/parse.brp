@@ -1,27 +1,41 @@
 import:
 	int as IntOps
 	list: reverse
+	names: NameTable, find_name, initial_names, intern_name
 	option: is_some
 	syntax:
+		CallNotation(DirectCall, ReceiverCall),
 		Diagnostic,
 		ExpressionBase(IntegerExpression, NameExpression, CallExpression),
 		LexedProgram,
 		ParameterList(EmptyParameters, SingleParameter),
+		ParsedContents,
 		ParsedFunction,
-		ParsedProgram,
 		Purity(Pure, Impure),
 		ReturnExpression,
 		Span,
-		Symbol(PureKeyword, FunctionKeyword, LeftParen, RightParen, Arrow, Colon, Newline, Indent),
+		Symbol(
+			PureKeyword, FunctionKeyword, LeftParen, RightParen, Dot, Arrow, Colon, Newline, Indent,
+		),
 		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral),
+		UnaryCall,
 		WrittenName,
 	text: concat
 
 
 private fixed record ParserState {
 	input: LexedProgram,
-	position: Int
+	position: Int,
+	names: NameTable
 }
+
+
+-- Only parsing can pair the ID-bearing syntax with its complete name table.
+opaque type ParsedProgram = ParsedContents
+
+
+pure func parsed_contents(program: ParsedProgram) -> ParsedContents:
+	from_opaque ParsedProgram(program)
 
 
 private fixed record ParsedName {
@@ -70,6 +84,12 @@ private pure func symbol_matches(actual: Symbol, expected: Symbol) -> Bool:
 					True
 				_:
 					False
+		Dot:
+			match expected:
+				Dot:
+					True
+				_:
+					False
 		Arrow:
 			match expected:
 				Arrow:
@@ -107,10 +127,7 @@ private pure func consume_symbol(
 			match token.kind:
 				SymbolToken(actual):
 					if symbol_matches(actual, symbol):
-						Ok({
-							input = state.input,
-							position = IntOps.add(state.position, 1),
-						})
+						Ok({ state | position = IntOps.add(state.position, 1) })
 					else:
 						Err(expected(state, message, help))
 				_:
@@ -133,16 +150,28 @@ private pure func consume_name(
 		Some(token):
 			match token.kind:
 				IdentifierToken(spelling):
-					Ok({
-						name = {
-							spelling = spelling,
-							span = token.span
-						},
-						next = {
-							input = state.input,
-							position = IntOps.add(state.position, 1)
-						},
-					})
+					names = intern_name(state.names, spelling)
+
+					match find_name(names, spelling):
+						None:
+							Err(
+								expected(
+									state,
+									"invalid parsed name identity",
+									"report this compiler error with the input program",
+								),
+							)
+						Some(id):
+							Ok({
+								name = {
+									id = id,
+									span = token.span
+								},
+								next = { state |
+									position = IntOps.add(state.position, 1),
+									names = names
+								},
+							})
 				_:
 					Err(expected(state, message, identifier_help()))
 		None:
@@ -187,34 +216,46 @@ private pure func at_symbol(state: ParserState, symbol: Symbol) -> Bool:
 private pure func consume_expression_step(state: ParserState) -> Result[ExpressionStep, Diagnostic]:
 	match state.input.tokens.get(state.position):
 		Some(token):
-			next: ParserState = {
-				input = state.input,
-				position = IntOps.add(state.position, 1)
-			}
+			after_token: ParserState = { state | position = IntOps.add(state.position, 1) }
 
 			match token.kind:
 				IntegerLiteral(value):
-					Ok(ReadBase(IntegerExpression(value), next))
+					Ok(ReadBase(IntegerExpression(value), after_token))
 				IdentifierToken(spelling):
-					name: WrittenName = {
-						spelling = spelling,
-						span = token.span
-					}
+					names = intern_name(state.names, spelling)
 
-					if not at_symbol(next, LeftParen):
-						Ok(ReadBase(NameExpression(name), next))
-					else:
-						opened: ParserState = { next | position = IntOps.add(next.position, 1) }
-
-						if at_symbol(opened, RightParen):
-							Ok(
-								ReadBase(
-									CallExpression(name),
-									{ opened | position = IntOps.add(opened.position, 1) },
+					match find_name(names, spelling):
+						None:
+							Err(
+								expected(
+									state,
+									"invalid parsed name identity",
+									"report this compiler error with the input program",
 								),
 							)
-						else:
-							Ok(OpenedCall(name, opened))
+						Some(id):
+							next: ParserState = { after_token | names = names }
+							name: WrittenName = {
+								id = id,
+								span = token.span
+							}
+
+							if not at_symbol(next, LeftParen):
+								Ok(ReadBase(NameExpression(name), next))
+							else:
+								opened: ParserState = { next |
+									position = IntOps.add(next.position, 1)
+								}
+
+								if at_symbol(opened, RightParen):
+									Ok(
+										ReadBase(
+											CallExpression(name),
+											{ opened | position = IntOps.add(opened.position, 1) },
+										),
+									)
+								else:
+									Ok(OpenedCall(name, opened))
 				_:
 					Err(
 						expected(
@@ -231,6 +272,37 @@ private pure func consume_expression_step(state: ParserState) -> Result[Expressi
 					"use 0, 1, a parameter name, or a call as the entire body",
 				),
 			)
+
+
+private fixed record ParsedUnaryCall {
+	call: UnaryCall,
+	next: ParserState
+}
+
+
+private pure func consume_receiver_call(
+	after_dot: ParserState,
+) -> Result[ParsedUnaryCall, Diagnostic]:
+	name ?= consume_name(after_dot, "expected a function name after '.'")
+	after_open ?= consume_symbol(
+		name.next,
+		LeftParen,
+		"expected '(' after the UFCS function name",
+		"write receiver.function()",
+	)
+	closed ?= consume_symbol(
+		after_open,
+		RightParen,
+		"UFCS calls take no explicit arguments",
+		"the receiver supplies the single Int argument; write receiver.function()",
+	)
+	Ok({
+		call = {
+			callee = name.name,
+			notation = ReceiverCall
+		},
+		next = closed,
+	})
 
 
 private pure func consume_body(start: ParserState) -> Result[ParsedBody, Diagnostic]:
@@ -267,20 +339,40 @@ private pure func consume_body(start: ParserState) -> Result[ParsedBody, Diagnos
 
 			Err(error)
 
-	calls: List[WrittenName] = pending.reverse()
+	closers: List[WrittenName] = pending.reverse()
+	var next_closer: Int = 0
+	var calls: List[UnaryCall] = []
 
-	for call in calls:
-		match consume_symbol(
-			state,
-			RightParen,
-			"expected ')' after the call argument",
-			"pass at most one complete Int expression, then close the call with ')'",
-		):
-			Err(error):
-				failure = Some(error)
-				break
-			Ok(next):
-				state = next
+	while True:
+		if at_symbol(state, Dot):
+			match consume_receiver_call({ state | position = IntOps.add(state.position, 1) }):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(parsed):
+					calls = calls.append(parsed.call)
+					state = parsed.next
+		else:
+			match closers.get(next_closer):
+				None:
+					break
+				Some(call):
+					match consume_symbol(
+						state,
+						RightParen,
+						"expected ')' after the call argument",
+						"pass at most one complete Int expression, then close the call with ')'",
+					):
+						Err(error):
+							failure = Some(error)
+							break
+						Ok(next):
+							calls = calls.append({
+								callee = call,
+								notation = DirectCall,
+							})
+							next_closer = IntOps.add(next_closer, 1)
+							state = next
 
 	match failure:
 		Some(error):
@@ -399,9 +491,12 @@ private pure func consume_function(start: ParserState) -> Result[FunctionResult,
 
 
 pure func parse(input: LexedProgram) -> Result[ParsedProgram, Diagnostic]:
+	initial = initial_names()
+	special = initial.special
 	var state: ParserState = {
 		input = input,
-		position = 0
+		position = 0,
+		names = initial.names
 	}
 	var functions: List[ParsedFunction] = []
 	var failure: Option[Diagnostic] = None
@@ -437,7 +532,9 @@ pure func parse(input: LexedProgram) -> Result[ParsedProgram, Diagnostic]:
 		Some(error):
 			Err(error)
 		None:
-			Ok({
-				functions = functions,
-				end = input.end,
-			})
+			Ok(into_opaque ParsedProgram({
+						names = state.names,
+						special = special,
+						functions = functions,
+						end = input.end
+					}))
