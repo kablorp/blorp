@@ -1,83 +1,261 @@
 import:
-	../../src/check: CheckedProgram, CheckedReturn(ReturnZero), check, checked_return
-	../../src/syntax: Diagnostic, ParsedProgram, ReturnExpression(ZeroExpression)
+	../../src/check:
+		CheckedFunction,
+		CheckedReturn(ReturnInteger, ReturnCall),
+		check,
+		checked_functions,
+		function_number,
+	../../src/lex: lex
+	../../src/parse: parse
+	../../src/syntax: Diagnostic, IntegerValue(Zero, One), Purity(Pure, Impure)
 	test: TestSuite
 
 
-private pure func parsed_program(function_name: String, return_type: String) -> ParsedProgram:
-	{
-		function_name = {
-			spelling = function_name,
-			span = {
-				start = 5,
-				end = 9
-			}
-		},
-		return_type = {
-			spelling = return_type,
-			span = {
-				start = 15,
-				end = 18
-			}
-		},
-		body = ZeroExpression
-	}
-
-
-private pure func rejects(
-	result: Result[CheckedProgram, Diagnostic],
+private pure func diagnostic(
+	source: String,
 	start: Int,
 	end: Int,
 	message: String,
 	help: String,
 ) -> Bool:
-	match result:
-		Err(diagnostic):
-			(
-				diagnostic.span.start == start
-				and diagnostic.span.end == end
-				and diagnostic.message == message
-				and diagnostic.help == help
-			)
-		Ok(_):
-			False
-
-
-pure func test_valid_entrypoint_produces_checked_zero() -> Bool:
-	match check(parsed_program("main", "Int")):
+	match lex(source):
 		Err(_):
 			False
-		Ok(program):
-			match program.checked_return():
-				ReturnZero:
-					True
+		Ok(tokens):
+			match parse(tokens):
+				Err(_):
+					False
+				Ok(parsed):
+					match check(parsed):
+						Ok(_):
+							False
+						Err(error):
+							(
+								error.span.start == start
+								and error.span.end == end
+								and error.message == message
+								and error.help == help
+							)
 
 
-pure func test_wrong_entrypoint_diagnostic() -> Bool:
-	rejects(
-		check(parsed_program("nope", "Int")),
-		5,
-		9,
-		"expected exactly one main function",
-		"name the entrypoint main",
+pure func test_resolved_forward_call_and_entrypoint() -> Bool:
+	match lex("func main() -> Int:\n\tone()\nfunc one() -> Int:\n\t1\n"):
+		Err(_):
+			False
+		Ok(tokens):
+			match parse(tokens):
+				Err(_):
+					False
+				Ok(parsed):
+					match check(parsed):
+						Err(_):
+							False
+						Ok(program):
+							checked = checked_functions(program)
+
+							match checked.functions:
+								[first, second]:
+									second_is_one: Bool = match second.body:
+										ReturnInteger(One):
+											True
+										_:
+											False
+
+									match first.body:
+										ReturnCall(id):
+											(
+												function_number(id) == 1
+												and second_is_one
+												and first.purity == Impure
+												and second.purity == Impure
+												and function_number(checked.entrypoint) == 0
+											)
+										_:
+											False
+								_:
+									False
+
+
+pure func test_unknown_callee_diagnostic() -> Bool:
+	diagnostic(
+		"func main() -> Int:\n\tmissing()\n",
+		21,
+		28,
+		"unknown function",
+		"declare the called function in this file",
+	)
+
+
+pure func test_duplicate_function_diagnostic() -> Bool:
+	diagnostic(
+		"func main() -> Int:\n\t0\nfunc main() -> Int:\n\t1\n",
+		28,
+		32,
+		"duplicate function name",
+		"give every function a distinct name",
+	)
+
+
+pure func test_missing_main_diagnostic() -> Bool:
+	diagnostic(
+		"func nope() -> Int:\n\t0\n",
+		23,
+		23,
+		"expected a main function",
+		"declare func main() -> Int: as the entrypoint",
 	)
 
 
 pure func test_wrong_return_type_diagnostic() -> Bool:
-	rejects(
-		check(parsed_program("main", "Foo")),
+	diagnostic(
+		"func main() -> Foo:\n\t0\n",
 		15,
 		18,
-		"expected Int as the main return type",
-		"declare func main() -> Int:",
+		"expected Int as the function return type",
+		"declare every function with -> Int:",
 	)
+
+
+pure func test_self_recursion_diagnostic() -> Bool:
+	diagnostic(
+		"func main() -> Int:\n\tmain()\n",
+		21,
+		25,
+		"call chain contains recursion",
+		"use an acyclic call chain; recursion is not supported in this increment",
+	)
+
+
+pure func test_mutual_recursion_diagnostic() -> Bool:
+	diagnostic(
+		"func main() -> Int:\n\tone()\nfunc one() -> Int:\n\tmain()\n",
+		21,
+		24,
+		"call chain contains recursion",
+		"use an acyclic call chain; recursion is not supported in this increment",
+	)
+
+
+pure func test_duplicate_helper_diagnostic() -> Bool:
+	diagnostic(
+		"func main() -> Int:\n\t0\nfunc one() -> Int:\n\t1\nfunc one() -> Int:\n\t0\n",
+		50,
+		53,
+		"duplicate function name",
+		"give every function a distinct name",
+	)
+
+
+pure func test_non_integer_helper_diagnostic() -> Bool:
+	diagnostic(
+		"func main() -> Int:\n\t0\nfunc one() -> Bool:\n\t1\n",
+		37,
+		41,
+		"expected Int as the function return type",
+		"declare every function with -> Int:",
+	)
+
+
+pure func test_unreachable_cyclic_helper_diagnostic() -> Bool:
+	diagnostic(
+		"func main() -> Int:\n\t0\nfunc one() -> Int:\n\tone()\n",
+		43,
+		46,
+		"call chain contains recursion",
+		"use an acyclic call chain; recursion is not supported in this increment",
+	)
+
+
+pure func test_unreachable_unknown_callee_diagnostic() -> Bool:
+	diagnostic(
+		"func main() -> Int:\n\t0\nfunc one() -> Int:\n\tmissing()\n",
+		43,
+		50,
+		"unknown function",
+		"declare the called function in this file",
+	)
+
+
+pure func test_pure_caller_rejects_default_impure_callee() -> Bool:
+	diagnostic(
+		"pure func main() -> Int:\n\tone()\nfunc one() -> Int:\n\t1\n",
+		26,
+		29,
+		"pure functions cannot call impure functions",
+		"mark the callee pure or remove pure from the caller",
+	)
+
+
+pure func test_transitive_pure_chain_rejects_its_impure_edge() -> Bool:
+	diagnostic(
+		"pure func main() -> Int:\n\tanswer()\npure func answer() -> Int:\n\tone()\nfunc one() -> Int:\n\t1\n",
+		63,
+		66,
+		"pure functions cannot call impure functions",
+		"mark the callee pure or remove pure from the caller",
+	)
+
+
+pure func test_unreachable_pure_caller_rejects_impure_callee() -> Bool:
+	diagnostic(
+		"func main() -> Int:\n\t0\npure func helper() -> Int:\n\tone()\nfunc one() -> Int:\n\t1\n",
+		51,
+		54,
+		"pure functions cannot call impure functions",
+		"mark the callee pure or remove pure from the caller",
+	)
+
+
+pure func test_checked_functions_keep_declared_purity() -> Bool:
+	match lex(
+		"pure func one() -> Int:\n\t1\npure func answer() -> Int:\n\tone()\nfunc main() -> Int:\n\tanswer()\n",
+	):
+		Err(_):
+			False
+		Ok(tokens):
+			match parse(tokens):
+				Err(_):
+					False
+				Ok(parsed):
+					match check(parsed):
+						Err(_):
+							False
+						Ok(program):
+							checked_functions(
+								program,
+							).functions.map(
+								pure func(
+									function: CheckedFunction,
+								) -> Purity: function.purity,
+							) == [Pure, Pure, Impure]
 
 
 tests: TestSuite = {
 	description = "Blorp 2 semantic checking",
 	tests = [
-		("valid entrypoint produces checked zero", test_valid_entrypoint_produces_checked_zero),
-		("wrong entrypoint diagnostic", test_wrong_entrypoint_diagnostic),
+		("resolved forward call and entrypoint", test_resolved_forward_call_and_entrypoint),
+		("checked functions keep declared purity", test_checked_functions_keep_declared_purity),
+		("unknown callee diagnostic", test_unknown_callee_diagnostic),
+		(
+			"pure caller rejects default impure callee",
+			test_pure_caller_rejects_default_impure_callee,
+		),
+		(
+			"transitive pure chain rejects its impure edge",
+			test_transitive_pure_chain_rejects_its_impure_edge,
+		),
+		(
+			"unreachable pure caller rejects impure callee",
+			test_unreachable_pure_caller_rejects_impure_callee,
+		),
+		("duplicate helper diagnostic", test_duplicate_helper_diagnostic),
+		("non-integer helper diagnostic", test_non_integer_helper_diagnostic),
+		("unreachable cyclic helper diagnostic", test_unreachable_cyclic_helper_diagnostic),
+		("unreachable unknown callee diagnostic", test_unreachable_unknown_callee_diagnostic),
+		("duplicate function diagnostic", test_duplicate_function_diagnostic),
+		("missing main diagnostic", test_missing_main_diagnostic),
 		("wrong return type diagnostic", test_wrong_return_type_diagnostic),
+		("self recursion diagnostic", test_self_recursion_diagnostic),
+		("mutual recursion diagnostic", test_mutual_recursion_diagnostic),
 	]
 }

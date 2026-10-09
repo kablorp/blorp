@@ -1,11 +1,14 @@
-# Blorp 2 initial cost limits and lexer cleanup
+# Blorp 2 cost limits and measured increments
 
 These measurements run native code for the new compiler, built by the existing
 repository compiler. Building that code is outside the measured boundary.
 They describe the current host compiler's code generation and runtime; they
 do not predict the future self-hosted compiler's cost.
 
-## End-to-end return-zero example
+The final section records the purity increment with its predeclared ceilings.
+Earlier sections retain the initial and function-call measurements.
+
+## Initial end-to-end return-zero example
 
 The input is the 23-byte file `blorp_2/test/e2e/fixtures/return_zero.brp`:
 
@@ -270,3 +273,257 @@ func main(args: List[String]) -> Int:
 	print("allocations=" + "".append_int(after - before))
 	0
 ```
+
+## Function-call increment and deliberate ceiling update
+
+The sections above record the original return-zero increment. Its constant C
+string and 90-allocation ceiling are historical. The current compiler supports
+multiple zero-argument functions, the literals 0 and 1, and resolved acyclic
+calls. All functions return 64-bit values; a separate C entrypoint wrapper
+converts the checked main result into the process exit status. Prototypes and
+symbols come from compilation-local function identities, not written names.
+Compiler source also now calls concrete operations directly instead of using
+trait-dispatched operators.
+
+The same whole-process boundary and normal/diagnostic build separation remain.
+Two reviewed allocation ceilings replace the initial estimates; instruction
+ceilings remain unchanged. Measured samples from the first valid fixture run:
+
+| Fixture | Managed allocations | Allocation ceiling | Retired instructions, minimum of three | Instruction ceiling |
+| --- | ---: | ---: | ---: | ---: |
+| return_zero | 107 | 120 | 18,938,270 | 22,000,000 |
+| call_one | 204 | 230 | 19,002,845 | 26,000,000 |
+
+Return-zero instruction samples: **20,304,272; 18,938,270; 18,948,831**.
+Call-one instruction samples: **20,420,810; 19,106,600; 19,002,845**.
+The original estimates (90 and 180 allocations) failed before being changed.
+Both diagnostic compiler processes had equal allocations/releases and no leaks.
+A cost excess still fails the test after native behavior and rejected-output
+preservation are verified; missing/malformed measurements fail immediately.
+
+A separate Blorp `TestSuite` probe brackets the four unchanged stage APIs with
+`read_memory_counter(ManagedAllocations)`. Scalar counter reads allocate no
+report records. Reporting happens after the final stage read. The old sources
+are exact copies from commit `8bfd6a13f78d4b443ed95c86f222ea01056e0de3`, compiled
+with the same current host compiler as the candidate. Its input is the same
+23-byte return-zero source. The candidate is also probed on the call fixture.
+
+| Compiler/input | Lex | Parse | Check | Emit | Pipeline total | Generated C bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original/zero | 57 | 17 | 0 | 0 | 74 | 26 |
+| Candidate/zero | 59 | 22 | 4 | 14 | 99 | 128 |
+| Candidate/call | 121 | 44 | 5 | 26 | 196 | 196 |
+
+The zero pipeline's **25 additional allocations** account exactly for the
+whole-process increase from 82 to 107; both retain eight shell/startup/I/O
+allocations outside the stage interval. Lexing adds two allocations after
+introducing the closed integer-literal payload and constructing the combined
+identifier character set locally (the host CTFE cannot evaluate its concrete
+concatenation call as a global initializer). Parsing publishes a function list,
+function/body results and complete program rather than one function's fields,
+adding five. Checking builds four objects for the validated collection and
+resolved integer meaning, replacing its old immediate zero variant. Emission
+now constructs prototypes, function bodies and the entrypoint wrapper, adding
+14 rather than returning one static string. This is a representation and
+working-example expansion, not an allocation optimization. The reviewed
+ceilings provide about 12% headroom around those observed costs. There is no
+return-zero special case in the parser, checker or emitter.
+
+Reproduction from the repository root:
+
+```sh
+bin/blorp test --suite --timeout 180 blorp_2/test/e2e/test_return_zero.brp
+bin/blorp test --suite --timeout 180 blorp_2/test/e2e/test_call_one.brp
+bin/blorp test --suite --leak-check --timeout 180 \
+  blorp_2/build/guardrails/test_phase_allocations.brp
+```
+
+The last probe and old-source copies are local ignored artifacts; retain them
+when reproducing exact phase attribution. Raw output is in
+`blorp_2/build/guardrails/phase-allocations.log` and
+`blorp_2/build/guardrails/function-calls-e2e.log`. The e2e suites and their shared
+harness are retained source. Format suite files, not raw fixtures: the host
+formatter inserts blank lines between declarations, outside this increment's
+explicit grammar.
+
+Provenance: arm64 macOS, Apple Clang 21.0.0, repository HEAD `8bfd6a13f78d4`,
+with the working function-call/trait-free sources. All compiled commands ran
+serially. The FRESH host executable also contains the independent coverage
+feasibility changes; the stage probe's baseline and candidate use that same
+executable. SHA-256:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Host `bin/blorp` | `33f0a827dea39ac77b48d081393582966f2263114faa95fa9158782c9cbe9957` |
+| Phase probe | `33c130658846799d5e6b95190d18ae934dafaa034f5b10a90e4ef9587dd38041` |
+| Return-zero input | `51f11cef22e25bf44d65a974bd75b598e845fedf7209838c97a8c863746092e9` |
+| Call-one input | `3628492b67f2f6224cb09ada608b9763b8f64aad999d3ea70c2fb8a93b4efd31` |
+| Candidate `check.brp` | `db42f837535841821ae67d2f9c30a65619b389774c3c693c8b0f4e0640408578` |
+| Candidate `emit.brp` | `fde7a813f0ebb9750eb155ee0c627a327115b655a680677aa10ef5e457d17a50` |
+| Candidate `lex.brp` | `3af0a2263226d0dc45dd6d50fd06e677524d30bb0448938d02e92a401bbbcbe3` |
+| Candidate `main.brp` | `fc84573a765ec7ef31740f449bc0bc6ab0605bb1d4839433c8aa083cb1560657` |
+| Candidate `parse.brp` | `d8a3b4e477b317f8c1cd12291573ed569787ba6f311789829e1fced8b7b00f4b` |
+| Candidate `syntax.brp` | `40bacff05cf22c228d2b868fe05cadcabbd9aa88a7d46a597918df53d15120de` |
+| Candidate `text.brp` | `866aaa837a5b6ea81785f3efaeb6b8c0e2d8c354e0ae20003cb0424f9ceebd89` |
+
+The function-call checkpoint totals **1,009 formatted production lines**, up 441 from the
+original six-module compiler. This includes the required concrete-operation
+foundation, typed declaration/call boundaries, signature/cycle validation, C
+symbol projection and entrypoint wrapper. Its accepted ceiling was deliberately
+respecified to 1,020 after the explicit no-traits requirement and host loop
+propagation constraint were accounted for; no compressed formatting was used.
+
+## Pure-function increment
+
+The next fixture is the 91-byte `blorp_2/test/e2e/fixtures/pure_calls.brp`:
+
+```blorp
+pure func one() -> Int:
+	1
+pure func answer() -> Int:
+	one()
+func main() -> Int:
+	answer()
+```
+
+Purity is declared, not inferred: an unannotated function is impure. Each
+published checked function retains its validated purity beside its resolved
+body. Checking rejects a pure-to-impure call at the callee name, including
+edges in unreachable helpers. Checking every edge also protects transitive
+pure chains. A pure main is accepted; emission uses the same C ABI and adds no
+purity attributes or semantic checks.
+
+The fixture's ceilings were declared before implementation: 360 managed
+allocations and 32,000,000 retired instructions. Existing ceilings stay at
+120/22,000,000 for return-zero and 230/26,000,000 for call-one.
+The first complete run, `make -C blorp_2 test`, passed **71 of 71 tests**:
+
+| Fixture | Managed allocations | Allocation ceiling | Retired instructions, minimum of three | Instruction ceiling |
+| --- | ---: | ---: | ---: | ---: |
+| return_zero | 108 | 120 | 18,848,149 | 22,000,000 |
+| call_one | 206 | 230 | 19,001,936 | 26,000,000 |
+| pure_calls | 330 | 360 | 19,146,615 | 32,000,000 |
+
+Pure-call instruction samples: **20,393,773; 19,146,615; 19,160,868**.
+The normal and diagnostic native compiler builds use the same generated C;
+diagnostic processes require equal allocations/releases and zero leaks. Native
+execution of the emitted pure-call C returned 1 with empty stdout/stderr.
+The shared harness checked the exact compact C, compiled it as strict C11,
+and verified rejected-input output preservation before enforcing the budgets.
+These are whole-process costs at the same boundary as the preceding increments;
+there was no new phase-attribution probe or optimization claim.
+
+Final formatted source totals **1,087 production lines**, a net addition of
+78 to the function-call checkpoint, below the predeclared ceiling of 1,129.
+Test suite/support source totals **2,302 lines**, excluding 12 input-fixture
+lines (2,314 total test `.brp` lines), a net addition of 158, below 2,324. The
+production addition covers declared purity, parser handling, retained checked
+function data and edge validation. The tests cover reserved/maximal identifiers,
+malformed qualifiers, default impurity, checked purity publication, direct,
+transitive and unreachable violations, pure main, and native/cost behavior.
+
+The first complete run was recorded in the integration tool transcript, not a
+saved log. After that run, review caught the host formatter splitting long
+diagnostic help into trait-dispatched string `+` operations. The final source
+uses a small concrete `concat` helper with the same diagnostic bytes. The final
+source was formatted and scanned for excluded operators, then independently
+passed 71/71 normal and 71/71 UBSan/leak tests. After separating coverage onto
+its own branch and rebuilding the existing compiler, another final pair passed
+71/71 with the shared compiler preparation below. Retained logs are
+`blorp_2/build/guardrails/pilot-branch-final-test.log` and
+`blorp_2/build/guardrails/pilot-branch-final-sanitize.log`. The older
+`pilot-complete-test.log` records the prior 61-test increment and must not be
+used as purity evidence.
+
+Reproduction after building a FRESH repository compiler:
+
+```sh
+bin/blorp test --suite --timeout 180 blorp_2/test/e2e/test_pure_calls.brp
+make -C blorp_2 test
+```
+
+First-run provenance: arm64 macOS, Apple Clang 21.0.0, repository HEAD
+`8bfd6a13f78d4b443ed95c86f222ea01056e0de3` with uncommitted pilot and independent
+host coverage changes. The host was FRESH for the 71-test run; all compiled
+commands were serialized. SHA-256 distinguishes the measured parser from its
+equivalent final diagnostic correction:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Host `bin/blorp` at measured run | `85ee8dbb179dbb8b793eae090bb506777eae4b545d16434208e2decfbada95f3` |
+| `check.brp` | `713a6e937d0f39e65984c3d38c6afb4438ea1a41041485fa4f76f1429d6d718a` |
+| `emit.brp` | `c25ddf7e81370a216cfe29d8e9ca7d3cd27a110ad4ddce7fc89f29e937568011` |
+| `lex.brp` | `f944d2573fec942af7d229a92fd8a5da26b5b804189e9b69d541daa7a5eaf1ef` |
+| `main.brp` | `fc84573a765ec7ef31740f449bc0bc6ab0605bb1d4839433c8aa083cb1560657` |
+| `parse.brp` at measured run | `103b5ce48b3e77c4b2272cd925f587de6d0fddd155e3f31274c713665e35f8b4` |
+| Final `parse.brp` | `8c2bc7f0f52e0208a32019af4fa3b6606accdea5c910080919305c2d9913d743` |
+| `syntax.brp` | `fb1982f4a9453577118614b9de071838dfa359720036300754d0917b53acbb00` |
+| `text.brp` | `866aaa837a5b6ea81785f3efaeb6b8c0e2d8c354e0ae20003cb0424f9ceebd89` |
+| Grammar | `af6d3af40b6d523eb9c620a70228703d70f8ec453738d31b78bf012f03b4d424` |
+| Pure-call input | `d02ec1eb550e4d87cb2d0f3ac65ea6f264755f5acb22197809449028d896e9d4` |
+| Pure-call suite | `22f5cf52ad852fd5eeb90ba756dfdb1a298b7482bef6d4830bc237a88ca3ffa7` |
+
+## Shared end-to-end compiler preparation and final validation
+
+The native harness previously regenerated and linked the same pilot compiler
+for each of the three fixtures. `make -C blorp_2 test-compiler` now owns one
+generated C file and normal/diagnostic binaries under the ignored build
+directory. Its manifest includes source and host-executable hashes, the
+Makefile, the resolved C compiler path/version and both modes' flags. Each
+fixture obtains immutable binary paths through the cached target and retains
+its own temporary C, native execution, allocation check and three instruction
+samples. The formatted harness shrank from 260 to 244 lines; the Makefile
+grew by 40 lines for cache configuration/preparation, outside the compiler-source
+count.
+
+The cold target generated C once and linked the two modes once. The warm target
+produced no output and left C, binaries and manifest timestamps unchanged.
+Source and flag changes separately forced regeneration and both links.
+Review found that a failed second link could leave an old manifest beside a
+new normal binary; restoring the original source then falsely reused that
+binary. The actual failure probe disabled purity checking, forced the second
+link to fail, restored the source and demonstrated acceptance of an invalid
+pure call. The corrected refresh removes the previous manifest before any
+artifact replacement. Repeating the probe left no manifest, forced both links
+after source restoration, and rejected the invalid call with its exact purity
+diagnostic. All temporary source changes were restored byte-for-byte.
+
+Independently validated final runs on the `blorp-2` branch, with coverage
+changes excluded:
+
+| Fixture | Managed allocations / ceiling | Normal instructions, minimum / ceiling | UBSan/leak-run instructions, minimum | Native exit |
+| --- | ---: | ---: | ---: | ---: |
+| return_zero | 108 / 120 | 18,957,348 / 22,000,000 | 18,936,354 | 0 |
+| call_one | 206 / 230 | 19,144,165 / 26,000,000 | 19,066,760 | 1 |
+| pure_calls | 330 / 360 | 19,204,477 / 32,000,000 | 19,200,943 | 1 |
+
+Normal samples, in fixture order: return-zero 19,144,063; 18,957,348;
+19,023,368. Call-one 19,171,780; 19,169,059; 19,144,165. Pure-calls
+19,447,387; 19,204,477; 19,287,294. Both runs passed **71/71 callbacks across
+13 suites**, with no UBSan failures or leaked objects. The native fixture
+checks retained exact compact C, strict C11/O2 compilation, expected exits,
+empty stdout/stderr and rejected-output preservation. Neither run generated
+or linked the shared compiler; all four cached artifacts retained their
+hashes, timestamps, sizes and inodes. No elapsed-time improvement is claimed.
+UBSan covers the TestSuite executables and their imported pilot code; the
+shared native pilot binaries retain their normal `-O2` and allocation-diagnostic
+build modes, with strict leak checks rather than additional native UBSan flags.
+
+The explicit purity-edge mutation also removed validation, causing exactly the
+direct, transitive and unreachable-call negative tests to fail; byte-exact
+restoration passed all 15 checker tests. The retained logs are
+`purity-edge-mutation.log` and `purity-edge-restored.log` under
+`blorp_2/build/guardrails`.
+
+Final host provenance: FRESH before/after, arm64 macOS, Apple Clang 21.0.0,
+bootstrap `dev-0e1598ed616e`, CLI `-O0`/runtime `-O2`, eight-way split.
+Pilot binaries use `-O2` with explicit memory-diagnostic modes 0 and 1.
+Source/test/grammar/Makefile fingerprints stayed unchanged throughout both
+final runs. Code-reviewer and test-runner reviews completed before commit.
+
+| Final artifact | SHA-256 |
+| --- | --- |
+| Host `bin/blorp` | `c67d5bb315a67999ec5d608eaa41aab83f8d75e6220b44b936ea2a4849b7ba0a` |
+| Shared compiler C | `cf9f2be568e7f6cb830d75fc4ddc04bf12a7932d3de6bfc760bae26308a23a77` |
+| Normal pilot compiler | `113d08555da7d2902e5a86735a0de313a5c36f8f218ac5db0ed17d158422b6db` |
+| Diagnostic pilot compiler | `8f87b1dc32fe203ff51a7e2100f5372114c1bdf0d083499f4a13befd6833a334` |

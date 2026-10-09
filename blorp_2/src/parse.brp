@@ -1,13 +1,17 @@
 import:
+	int as IntOps
 	syntax:
 		Diagnostic,
 		LexedProgram,
+		ParsedFunction,
 		ParsedProgram,
-		ReturnExpression(ZeroExpression),
+		Purity(Pure, Impure),
+		ReturnExpression(IntegerExpression, CallExpression),
 		Span,
-		Symbol(FunctionKeyword, LeftParen, RightParen, Arrow, Colon, Newline, Indent),
-		TokenKind(IdentifierToken, SymbolToken, ZeroLiteral),
+		Symbol(PureKeyword, FunctionKeyword, LeftParen, RightParen, Arrow, Colon, Newline, Indent),
+		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral),
 		WrittenName,
+	text: concat
 
 
 private fixed record ParserState {
@@ -36,6 +40,58 @@ private pure func expected(state: ParserState, message: String, help: String) ->
 	}
 
 
+private pure func symbol_matches(actual: Symbol, expected: Symbol) -> Bool:
+	match actual:
+		PureKeyword:
+			match expected:
+				PureKeyword:
+					True
+				_:
+					False
+		FunctionKeyword:
+			match expected:
+				FunctionKeyword:
+					True
+				_:
+					False
+		LeftParen:
+			match expected:
+				LeftParen:
+					True
+				_:
+					False
+		RightParen:
+			match expected:
+				RightParen:
+					True
+				_:
+					False
+		Arrow:
+			match expected:
+				Arrow:
+					True
+				_:
+					False
+		Colon:
+			match expected:
+				Colon:
+					True
+				_:
+					False
+		Newline:
+			match expected:
+				Newline:
+					True
+				_:
+					False
+		Indent:
+			match expected:
+				Indent:
+					True
+				_:
+					False
+
+
 private pure func consume_symbol(
 	state: ParserState,
 	symbol: Symbol,
@@ -46,10 +102,10 @@ private pure func consume_symbol(
 		Some(token):
 			match token.kind:
 				SymbolToken(actual):
-					if actual == symbol:
+					if symbol_matches(actual, symbol):
 						Ok({
 							input = state.input,
-							position = state.position + 1,
+							position = IntOps.add(state.position, 1),
 						})
 					else:
 						Err(expected(state, message, help))
@@ -57,6 +113,12 @@ private pure func consume_symbol(
 					Err(expected(state, message, help))
 		None:
 			Err(expected(state, message, help))
+
+
+private pure func identifier_help() -> String:
+	"use an ASCII identifier starting with a letter or underscore; ".concat(
+		"'func' and 'pure' are reserved",
+	)
 
 
 private pure func consume_name(
@@ -74,66 +136,106 @@ private pure func consume_name(
 						},
 						next = {
 							input = state.input,
-							position = state.position + 1
+							position = IntOps.add(state.position, 1)
 						},
 					})
 				_:
-					Err(
-						expected(
-							state,
-							message,
-							"use an ASCII identifier starting with a letter or underscore",
-						),
-					)
+					Err(expected(state, message, identifier_help()))
 		None:
-			Err(
-				expected(
-					state,
-					message,
-					"use an ASCII identifier starting with a letter or underscore",
-				),
-			)
+			Err(expected(state, message, identifier_help()))
 
 
--- This is the expression boundary for the only currently supported expression.
-private pure func consume_zero(state: ParserState) -> Result[ParserState, Diagnostic]:
+private fixed record ParsedBody {
+	body: ReturnExpression,
+	next: ParserState
+}
+
+
+private fixed record FunctionResult {
+	function: ParsedFunction,
+	next: ParserState
+}
+
+
+private pure func consume_body(state: ParserState) -> Result[ParsedBody, Diagnostic]:
 	match state.input.tokens.get(state.position):
 		Some(token):
+			next: ParserState = {
+				input = state.input,
+				position = IntOps.add(state.position, 1)
+			}
+
 			match token.kind:
-				ZeroLiteral:
+				IntegerLiteral(value):
 					Ok({
-						input = state.input,
-						position = state.position + 1,
+						body = IntegerExpression(value),
+						next = next,
+					})
+				IdentifierToken(spelling):
+					opened ?= consume_symbol(
+						next,
+						LeftParen,
+						"expected '(' after the called function",
+						"write a zero-argument call such as one()",
+					)
+					closed ?= consume_symbol(
+						opened,
+						RightParen,
+						"expected ')' with no arguments",
+						"calls take no arguments in this increment",
+					)
+					Ok({
+						body = CallExpression({
+							spelling = spelling,
+							span = token.span,
+						}),
+						next = closed,
 					})
 				_:
 					Err(
 						expected(
 							state,
-							"expected the integer literal 0",
-							"use 0 as the entire function body",
+							"expected a return expression",
+							"use 0, 1, or a zero-argument function call as the entire body",
 						),
 					)
 		None:
 			Err(
 				expected(
 					state,
-					"expected the integer literal 0",
-					"use 0 as the entire function body",
+					"expected a return expression",
+					"use 0, 1, or a zero-argument function call as the entire body",
 				),
 			)
 
 
-pure func parse(input: LexedProgram) -> Result[ParsedProgram, Diagnostic]:
-	start: ParserState = {
-		input = input,
-		position = 0
-	}
-	after_func ?= consume_symbol(
-		start,
-		FunctionKeyword,
-		"expected a function declaration at column 1",
-		"start with func main() -> Int:",
-	)
+private pure func consume_function(start: ParserState) -> Result[FunctionResult, Diagnostic]:
+	purity: Purity = match start.input.tokens.get(start.position):
+		Some(token):
+			match token.kind:
+				SymbolToken(PureKeyword):
+					Pure
+				_:
+					Impure
+		None:
+			Impure
+
+	after_func ?= match purity:
+		Pure:
+			consume_symbol(
+				{ start | position = IntOps.add(start.position, 1) },
+				FunctionKeyword,
+				"expected 'func' after 'pure'",
+				"write pure func name() -> Int:",
+			)
+		Impure:
+			consume_symbol(
+				start,
+				FunctionKeyword,
+				"expected a function declaration at column 1",
+				"start with func main() -> Int:",
+			)
+
 	function ?= consume_name(after_func, "expected a function name")
 	after_open ?= consume_symbol(
 		function.next,
@@ -158,47 +260,72 @@ pure func parse(input: LexedProgram) -> Result[ParsedProgram, Diagnostic]:
 		return_type.next,
 		Colon,
 		"expected ':' after the function header",
-		"end the header with ':' and put 0 on the next line",
+		"end the header with ':' and put the return expression on the next line",
 	)
 	after_newline ?= consume_symbol(
 		after_header,
 		Newline,
 		"expected a newline after the function header",
-		"put 0 on the next line",
+		"put the return expression on the next line",
 	)
 	after_indent ?= consume_symbol(
 		after_newline,
 		Indent,
 		"expected an indent of one tab or four spaces",
-		"indent 0 with exactly one tab or four spaces",
+		"indent the body with exactly one tab or four spaces",
 	)
-	after_body ?= consume_zero(after_indent)
-	var end: ParserState = after_body
-
-	match input.tokens.get(end.position):
-		Some(token):
-			match token.kind:
-				SymbolToken(Newline):
-					end = {
-						input = input,
-						position = end.position + 1
-					}
-				_:
-					void
-		None:
-			void
-
-	if end.position != input.tokens.length():
-		Err(
-			expected(
-				end,
-				"unexpected input after the zero expression",
-				"keep exactly one function with only 0 as its body and no extra blank lines",
-			),
-		)
-	else:
-		Ok({
+	body ?= consume_body(after_indent)
+	Ok({
+		function = {
+			purity = purity,
 			function_name = function.name,
 			return_type = return_type.name,
-			body = ZeroExpression,
-		})
+			body = body.body
+		},
+		next = body.next,
+	})
+
+
+pure func parse(input: LexedProgram) -> Result[ParsedProgram, Diagnostic]:
+	var state: ParserState = {
+		input = input,
+		position = 0
+	}
+	var functions: List[ParsedFunction] = []
+	var failure: Option[Diagnostic] = None
+
+	while True:
+		match consume_function(state):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(parsed):
+				functions = functions.append(parsed.function)
+				state = parsed.next
+
+		if IntOps.equals(state.position, input.tokens.length()):
+			break
+
+		match consume_symbol(
+			state,
+			Newline,
+			"expected a newline after the return expression",
+			"put each declaration on its own two lines with no blank lines",
+		):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(next):
+				state = next
+
+		if IntOps.equals(state.position, input.tokens.length()):
+			break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				functions = functions,
+				end = input.end,
+			})

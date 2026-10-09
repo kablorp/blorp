@@ -16,19 +16,61 @@ func main() -> Int:
 
 The executable returns exit status 0 with empty stdout and stderr. This first
 increment needs no imports, prelude, builtin functions, or target runtime.
-Hello world is the next example.
+The next example adds a call to a zero-argument function:
+
+[`test/e2e/fixtures/call_one.brp`](test/e2e/fixtures/call_one.brp):
+
+```blorp
+func main() -> Int:
+	one()
+func one() -> Int:
+	1
+```
+
+The executable returns exit status 1 with empty stdout and stderr. A helper
+may appear before or after its caller. Functions still take no parameters
+or arguments; `args: List[String]`, imports and printing are future increments.
+
+The third example, [`test/e2e/fixtures/pure_calls.brp`](test/e2e/fixtures/pure_calls.brp),
+adds declared purity:
+
+```blorp
+pure func one() -> Int:
+	1
+pure func answer() -> Int:
+	one()
+func main() -> Int:
+	answer()
+```
+
+A `pure func` may call only other pure functions. A plain `func` is impure
+and may call either kind. Purity is declared and checked, not inferred from a
+literal body. A pure `main` is also accepted with the same C entrypoint ABI.
+This example exits 1 with empty stdout and stderr.
 
 From the repository root:
 
 ```sh
 make                            # Build the existing compiler first.
 make -C blorp_2 example          # Compile the example to C, build it, run it.
+make -C blorp_2 test-compiler    # Prepare or reuse the shared test compiler binaries.
 make -C blorp_2 test             # Run the tests written in Blorp.
 ```
 
 `example` keeps its generated C and executable in `blorp_2/build/` for
 inspection. The tests use temporary directories. `BLORP_CC` selects a C
 compiler executable (default `clang`).
+
+`test-compiler` caches one `build/compiler.c` and its normal and diagnostic
+`-O2` binaries. Its input manifest records the pilot sources, host executable,
+Makefile, resolved C compiler path and version, and both modes' flags. A cold
+setup generates C once and links twice; unchanged setup reuses all three
+artifacts. Direct `bin/blorp test` runs check the same cache through Make.
+Refresh discards the previous manifest before replacing artifacts and publishes
+a new manifest after both links succeed, so a failed build cannot become a cache
+hit when its source changes are reverted.
+Each fixture still owns fresh temporary output, native execution, allocation
+checks and three instruction samples. These checks never reuse fixture output.
 
 Every source module has a matching unit suite under `test/unit/`. Integration
 and native execution suites live under `test/e2e/`; their input programs live
@@ -40,9 +82,14 @@ registration. The compiler source under `src/` stays within the agreed subset.
 Each executable example defines allocation and instruction ceilings in its
 end-to-end test. The test prints actual costs and ceilings, then fails when a
 ceiling is exceeded. The return-zero limits in
-[`test/e2e/test_return_zero.brp`](test/e2e/test_return_zero.brp) are **90 managed
+[`test/e2e/test_return_zero.brp`](test/e2e/test_return_zero.brp) are **120 managed
 allocations** and **22,000,000 retired instructions**. Ceilings may be changed
 deliberately as examples and the compiler grow; tests never raise them automatically.
+The call-one limits in [`test/e2e/test_call_one.brp`](test/e2e/test_call_one.brp)
+are **230 managed allocations** and **26,000,000 retired instructions**.
+The shared native/cost harness gives each fixture its own expected C, exit status
+and limits. The pure-call fixture has **360 managed allocations** and
+**32,000,000 retired instructions** as its initial ceilings.
 
 These measure one execution of the new compiler on the example, including
 process startup, argument handling, input/output, and the compile pipeline.
@@ -59,51 +106,72 @@ The first limits were established on arm64 macOS with Apple Clang 21. See the
 [cost record](../benchmarks/results/blorp_2_costs_2026-10-08.md) for baselines,
 commands, provenance, and measurement limits.
 
+The final purity-increment run passed all 71 tests, both normally and with
+UBSan/leak checking. It measured **330 allocations** and **19,204,477 retired
+instructions** for `pure_calls`;
+the existing examples measured 108 and 206 allocations, within their unchanged
+ceilings. The native purity example exited 1 with empty stdout and stderr.
+Neither final run rebuilt the shared compiler binaries. The cost record retains
+the earlier measurements and final validation provenance.
+
 ## Grammar for this increment
 
-This specification defines only the first example's language. There is one
-function, no parameters, an explicit return type, and the integer literal
-`0` as its body. No other declarations, expressions, literals, types,
-statements, or comments are supported.
+This specification defines only the three examples' language: one or more
+zero-argument functions with explicit return types. A function body is the
+integer literal `0` or `1`, or a zero-argument function call. No other
+declarations, expressions, literals, statements, or comments are supported.
 
-The grammar below is EBNF: braces mean repetition, brackets mean optional,
-and quoted text denotes a terminal.
+[`grammar.ebnf`](grammar.ebnf) defines the complete restricted source grammar
+and its EBNF dialect. Whitespace is explicit: LF is `"\n"`, TAB is `"\t"`, and
+the header/body spacing and EOF rules are productions. Identifier rules
+exclude the reserved spellings `func` and `pure`.
 
-```ebnf
-letter         = "A".."Z" | "a".."z" ;
-digit          = "0".."9" ;
-identifier     = (letter | "_") {letter | digit | "_"} ;
-newline        = (* LF, U+000A *) ;
-indent         = (* one TAB, U+0009, or exactly four spaces, U+0020 *) ;
+[`test/test_grammar/test_conformance.brp`](test/test_grammar/test_conformance.brp)
+checks grammar conformance through lexing and parsing, without semantic
+checking. Named cases cover alternatives, optional/repeated terms, required
+term order, lexical/layout boundaries, and complete input consumption. Accepted
+cases check every parsed field and its byte spans; rejected cases check the
+exact diagnostic, help, and span. These are handwritten conformance cases;
+the test runner does not interpret EBNF or generate cases from it.
 
-program        = "func" identifier "(" ")" "->" identifier ":" newline
-                 indent "0" [newline] EOF ;
+```sh
+bin/blorp test --suite --timeout 180 blorp_2/test/test_grammar
 ```
 
 Lexical and layout rules:
 
 - The header starts at column 1. No blank lines precede, separate, or follow
-  the two lines. The final line may end at EOF or with one LF.
-- The entire indentation prefix on the second line is one tab or four spaces.
+  declarations or their two lines. Exactly one LF separates declarations.
+  The final line may end at EOF or with one LF.
+- The entire indentation prefix on each body line is one tab or four spaces.
   Mixed indentation and additional leading whitespace are errors.
 - Spaces may separate tokens and trail either line. They are required between
   `func` and the function name. Identifiers are scanned as whole words, so
   `funcmain` is one identifier. The two characters of `->` are adjacent.
   Tabs occur only in the indentation prefix.
-- `func` is reserved. Function and type names are identifiers whose meaning is
+- `func` and `pure` are reserved. The optional `pure` qualifier precedes `func`
+  with spaces between the two keywords. Function and type names are identifiers whose meaning is
   checked after parsing.
-- The only integer literal is the single character `0`. Other values and
+- Integer literals are the single characters `0` and `1`. Other values and
   spellings, including `00`, `-0`, and `0.0`, are outside this increment.
   Non-ASCII characters and CRLF line endings are rejected.
-- Every token must be consumed. Extra expressions or trailing declarations
-  are errors.
+- Every token must be consumed. Extra expressions and malformed declarations are errors.
 
 Semantic rules:
 
-- The function must be named `main`, take no parameters, and return `Int`.
-  `Int` denotes the language's signed 64-bit integer type; it maps to the C
-  entrypoint's exit status here. This is one entrypoint signature, not
-  support for general functions or return types.
+- Exactly one function must be named `main`. Every function takes no parameters
+  and returns `Int`, the language's signed 64-bit integer type.
+- Function names are unique within the input file. Every callee must be declared
+  in that file; declaration order does not affect resolution. Calls take no arguments.
+- A pure caller may call only declared pure callees. Every function body is
+  checked, including unreachable helpers, so a pure call chain cannot hide an
+  impure edge. A violation highlights the callee name and suggests marking the
+  callee pure or removing pure from the caller.
+- Call chains must be acyclic in this increment. Self and mutual recursion produce
+  a semantic diagnostic. General recursion and its resource rules are future work.
+- Each source function has a 64-bit C return value and a generated symbol based
+  on its compilation-local identity. A separate C `int main(void)` wrapper calls
+  the checked entrypoint and converts the result to the process exit status.
 - The final expression is the return value. No explicit `return` is needed.
 - Syntax and semantic errors carry a source location, an explanation, and help.
   Rejected source produces no C output and does not overwrite an existing output.
@@ -120,12 +188,13 @@ The impure command shell owns file I/O and diagnostic rendering. Its pure
 pipeline publishes these complete results:
 
 1. Lexing produces tokens with source spans and an explicit end-of-source span.
-2. Parsing produces the complete syntax of the function and its return value.
-3. Checking validates the entrypoint and publishes an opaque checked program.
+2. Parsing produces complete declarations, written names, and literal/call syntax.
+3. Checking validates signatures and call chains, resolves calls to function
+   identities, and publishes an opaque checked program with its entrypoint identity.
 4. Emission consumes that checked program and produces C.
 
 Spellings and source spans belong to syntax. Emission receives checked meaning,
-not unchecked names. Returning zero needs no heap allocation or ownership pass.
+not unchecked names. These integer-only programs need no target heap allocation or ownership pass.
 Ownership, type registries, and general pass infrastructure will be introduced
 when an executable example requires them.
 
@@ -162,4 +231,24 @@ source dependencies that fit the subset.
 Each next increment adds an example, the exact grammar and semantic rules it
 needs, positive and negative tests, and independently reviewed implementation.
 Builders remain local; published results remain immutable; each semantic fact
-has one authority. Existing compiler internals are not pilot dependencies.
+has one authority. Function identity is declaration-list position; checked call
+expressions contain only that identity, and the checked program owns the entrypoint.
+Each checked function retains its validated purity beside its resolved body;
+emission reads only validated facts and does not recheck purity. Existing compiler internals are not pilot dependencies.
+
+The compilation pipeline is entirely pure once its source inputs have been
+loaded. `compile(source)` composes pure lexing, parsing, checking and C emission;
+diagnostic rendering is pure too. Local builders and `var` are allowed within
+pure functions. The surrounding shell owns reading and writing files, printing,
+process execution and timing. Future import loading must supply a complete source
+bundle and explicit configuration to the pure pipeline. Compiler phases must not
+consult the filesystem, environment, clock or shared mutable caches. Any reports
+or measurements produced by a phase are returned as data for the shell to present.
+
+Compiler source calls concrete arithmetic, comparison and concatenation functions;
+it does not use trait-dispatched operators. Future traits and operator syntax can
+select these same functions, keeping one implementation per operation. The current
+host library declares some concrete functions inside trait implementations; the
+future subset library will expose ordinary function declarations instead.
+`src/text.brp` supplies exact string equality using equal byte lengths and an exact
+prefix check because the host library has no ordinary string-equality function.

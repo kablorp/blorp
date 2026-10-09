@@ -1,32 +1,276 @@
 import:
-	syntax: Diagnostic, ParsedProgram, ReturnExpression(ZeroExpression)
+	int as IntOps
+	option: is_some
+	syntax:
+		Diagnostic,
+		IntegerValue,
+		ParsedFunction,
+		ParsedProgram,
+		Purity(Pure, Impure),
+		ReturnExpression(IntegerExpression, CallExpression),
+		Span,
+	text as Text
+
+
+-- A function's position in the parsed and checked lists is its identity.
+-- Both lists retain declaration order; no second numbering table is published.
+opaque type FunctionId = Int
 
 
 fixed union CheckedReturn:
-	ReturnZero
+	ReturnInteger(IntegerValue)
+	ReturnCall(FunctionId)
 
 
-opaque type CheckedProgram = CheckedReturn
+fixed record CheckedFunction {
+	purity: Purity,
+	body: CheckedReturn
+}
 
 
-pure func checked_return(program: CheckedProgram) -> CheckedReturn:
+fixed record CheckedFunctions {
+	functions: List[CheckedFunction],
+	entrypoint: FunctionId
+}
+
+
+opaque type CheckedProgram = CheckedFunctions
+
+
+pure func function_number(id: FunctionId) -> Int:
+	from_opaque FunctionId(id)
+
+
+pure func checked_functions(program: CheckedProgram) -> CheckedFunctions:
 	from_opaque CheckedProgram(program)
 
 
+private pure func find_function(
+	functions: List[ParsedFunction],
+	name: String,
+) -> Option[FunctionId]:
+	var index: Int = 0
+	var found: Option[FunctionId] = None
+
+	for function in functions:
+		if Text.equals(function.function_name.spelling, name):
+			found = Some(into_opaque FunctionId(index))
+			break
+
+		index = IntOps.add(index, 1)
+
+	found
+
+
+private pure func rejection(span: Span, message: String, help: String) -> Diagnostic:
+	{
+		span = span,
+		message = message,
+		help = help
+	}
+
+
+private pure func validate_signatures(
+	functions: List[ParsedFunction],
+	end: Span,
+) -> Result[FunctionId, Diagnostic]:
+	var previous: List[ParsedFunction] = []
+	var failure: Option[Diagnostic] = None
+
+	for function in functions:
+		if find_function(previous, function.function_name.spelling).is_some():
+			failure = Some(
+				rejection(
+					function.function_name.span,
+					"duplicate function name",
+					"give every function a distinct name",
+				),
+			)
+			break
+
+		if not Text.equals(function.return_type.spelling, "Int"):
+			failure = Some(
+				rejection(
+					function.return_type.span,
+					"expected Int as the function return type",
+					"declare every function with -> Int:",
+				),
+			)
+			break
+
+		previous = previous.append(function)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			match find_function(functions, "main"):
+				Some(id):
+					Ok(id)
+				None:
+					Err(
+						rejection(
+							end,
+							"expected a main function",
+							"declare func main() -> Int: as the entrypoint",
+						),
+					)
+
+
+private pure func validate_call(
+	caller: Purity,
+	callee: Purity,
+	span: Span,
+) -> Result[Void, Diagnostic]:
+	match caller:
+		Impure:
+			Ok(void)
+		Pure:
+			match callee:
+				Pure:
+					Ok(void)
+				Impure:
+					Err(
+						rejection(
+							span,
+							"pure functions cannot call impure functions",
+							"mark the callee pure or remove pure from the caller",
+						),
+					)
+
+
+private pure func resolve_body(
+	purity: Purity,
+	body: ReturnExpression,
+	functions: List[ParsedFunction],
+) -> Result[CheckedReturn, Diagnostic]:
+	match body:
+		IntegerExpression(value):
+			Ok(ReturnInteger(value))
+		CallExpression(name):
+			match find_function(functions, name.spelling):
+				Some(id):
+					callee ?= match functions.get(function_number(id)):
+						Some(function):
+							Ok(function)
+						None:
+							Err(
+								rejection(
+									name.span,
+									"invalid resolved function identity",
+									"report this compiler error with the input program",
+								),
+							)
+
+					validated ?= validate_call(purity, callee.purity, name.span)
+					Ok(ReturnCall(id))
+				None:
+					Err(
+						rejection(
+							name.span,
+							"unknown function",
+							"declare the called function in this file",
+						),
+					)
+
+
+private pure func resolve_functions(
+	parsed: List[ParsedFunction],
+) -> Result[List[CheckedFunction], Diagnostic]:
+	var functions: List[CheckedFunction] = []
+	var failure: Option[Diagnostic] = None
+
+	for function in parsed:
+		match resolve_body(function.purity, function.body, parsed):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(body):
+				functions = functions.append({
+					purity = function.purity,
+					body = body,
+				})
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(functions)
+
+
+private pure func validate_acyclic(
+	functions: List[CheckedFunction],
+	parsed: List[ParsedFunction],
+	end: Span,
+) -> Result[Void, Diagnostic]:
+	-- Each function has at most one call edge. A walk longer than the function
+	-- count must repeat an identity; no graph or recursion machinery is needed.
+	var index: Int = 0
+	var failure: Option[Diagnostic] = None
+
+	for source in parsed:
+		var current: Option[FunctionId] = Some(into_opaque FunctionId(index))
+		var steps: Int = 0
+
+		while IntOps.less_than(steps, functions.length()) and current.is_some():
+			match current:
+				None:
+					void
+				Some(id):
+					match functions.get(function_number(id)):
+						None:
+							failure = Some(
+								rejection(
+									end,
+									"invalid checked function identity",
+									"report this compiler error with the input program",
+								),
+							)
+							break
+						Some(callee):
+							current = match callee.body:
+								ReturnInteger(_):
+									None
+								ReturnCall(next):
+									Some(next)
+
+			steps = IntOps.add(steps, 1)
+
+		if failure.is_some():
+			break
+
+		if current.is_some():
+			error: Diagnostic = match source.body:
+				CallExpression(name):
+					rejection(
+						name.span,
+						"call chain contains recursion",
+						"use an acyclic call chain; recursion is not supported in this increment",
+					)
+				IntegerExpression(_):
+					rejection(
+						end,
+						"invalid checked call chain",
+						"report this compiler error with the input program",
+					)
+
+			failure = Some(error)
+			break
+
+		index = IntOps.add(index, 1)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+
 pure func check(program: ParsedProgram) -> Result[CheckedProgram, Diagnostic]:
-	if program.function_name.spelling != "main":
-		Err({
-			span = program.function_name.span,
-			message = "expected exactly one main function",
-			help = "name the entrypoint main",
-		})
-	else if program.return_type.spelling != "Int":
-		Err({
-			span = program.return_type.span,
-			message = "expected Int as the main return type",
-			help = "declare func main() -> Int:",
-		})
-	else:
-		match program.body:
-			ZeroExpression:
-				Ok(into_opaque CheckedProgram(ReturnZero))
+	entrypoint ?= validate_signatures(program.functions, program.end)
+	functions ?= resolve_functions(program.functions)
+	acyclic ?= validate_acyclic(functions, program.functions, program.end)
+	Ok(into_opaque CheckedProgram({
+				functions = functions,
+				entrypoint = entrypoint
+			}))
