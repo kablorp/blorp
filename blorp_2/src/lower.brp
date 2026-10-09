@@ -1,0 +1,413 @@
+import:
+	check:
+		BindingDefinition,
+		BindingId,
+		BindingOrigin(ParameterBinding, BodyLocal, MatchCapture),
+		CheckedAssignment(InitializeBinding, ReassignBinding),
+		CheckedBase(ReturnInteger, ReturnVariant, ReturnBinding, ReturnCall),
+		CheckedBody(CheckedValueBody, CheckedMatchBody),
+		CheckedCall,
+		CheckedFunction,
+		CheckedMatch,
+		CheckedOperation(InvokeFunction, ConstructVariant),
+		CheckedPattern(VariantCase, WildcardCase, BindingCase),
+		CheckedProgram,
+		CheckedUnion,
+		CheckedValue,
+		FunctionId,
+		FunctionSignature,
+		PayloadBinding(NoPayloadBinding, DiscardIntPayload, BindIntPayload),
+		TypeRef(IntType),
+		UnionId,
+		VariantId,
+		binding_number,
+		checked_functions,
+	int as IntOps
+	list: set_index
+	option: to_result
+	syntax: Diagnostic, Span
+
+
+-- A value identity belongs to one lowered function, including its branches.
+opaque type ValueId = Int
+
+
+pure func value_number(id: ValueId) -> Int:
+	from_opaque ValueId(id)
+
+
+fixed union CallArguments:
+	NoArguments
+	OneArgument(ValueId)
+
+
+fixed union ValueOperation:
+	ParameterValue
+	IntegerValue(Int)
+	VariantValue(VariantId)
+	CallValue(CheckedCall, CallArguments)
+	ConstructValue(VariantId, ValueId)
+	PayloadValue(ValueId)
+
+
+fixed record ValueDefinition {
+	id: ValueId,
+	value_type: TypeRef,
+	operation: ValueOperation,
+	span: Span
+}
+
+
+fixed record ValueBlock {
+	definitions: List[ValueDefinition],
+	result: ValueId
+}
+
+
+fixed union MatchLabel:
+	VariantLabel(VariantId)
+	DefaultLabel
+
+
+fixed record LoweredArm {
+	label: MatchLabel,
+	body: ValueBlock
+}
+
+
+fixed record LoweredMatch {
+	scrutinee: ValueId,
+	owner: UnionId,
+	arms: List[LoweredArm]
+}
+
+
+fixed union LoweredTail:
+	ReturnValue(ValueId)
+	MatchValue(LoweredMatch)
+
+
+fixed record LoweredFunction {
+	signature: FunctionSignature,
+	definitions: List[ValueDefinition],
+	tail: LoweredTail
+}
+
+
+fixed record LoweredFunctions {
+	unions: List[CheckedUnion],
+	functions: List[LoweredFunction],
+	entrypoint: FunctionId
+}
+
+
+-- Only lowering can publish ordered definitions with resolved value uses.
+opaque type LoweredProgram = LoweredFunctions
+
+
+pure func lowered_functions(program: LoweredProgram) -> LoweredFunctions:
+	from_opaque LoweredProgram(program)
+
+
+private fixed record ValueBuilder {
+	next_value: Int,
+	definitions: List[ValueDefinition],
+	bindings: List[Option[ValueId]]
+}
+
+
+private fixed record BuiltValue {
+	builder: ValueBuilder,
+	value: ValueId
+}
+
+
+private pure func invalid_binding(span: Span) -> Diagnostic:
+	{
+		span = span,
+		message = "internal compiler error: invalid checked binding identity",
+		help = "report this compiler error with the input program"
+	}
+
+
+private pure func define_value(
+	builder: ValueBuilder,
+	operation: ValueOperation,
+	value_type: TypeRef,
+	span: Span,
+) -> BuiltValue:
+	id = into_opaque ValueId(builder.next_value)
+	{
+		builder = { builder |
+			next_value = IntOps.add(builder.next_value, 1),
+			definitions = builder.definitions.append({
+				id = id,
+				operation = operation,
+				value_type = value_type,
+				span = span,
+			})
+		},
+		value = id
+	}
+
+
+private pure func read_binding(
+	bindings: List[Option[ValueId]],
+	id: BindingId,
+	span: Span,
+) -> Result[ValueId, Diagnostic]:
+	entry ?= bindings
+		.get(binding_number(id))
+		.to_result(invalid_binding(span))
+	entry.to_result(invalid_binding(span))
+
+
+private pure func lower_value(
+	builder: ValueBuilder,
+	value: CheckedValue,
+) -> Result[BuiltValue, Diagnostic]:
+	base ?= match value.base:
+		ReturnBinding(id):
+			read_binding(
+				builder.bindings,
+				id,
+				value.base_span,
+			).map(
+				pure func(id: ValueId) -> BuiltValue: {
+					builder = builder,
+					value = id
+				},
+			)
+		ReturnInteger(integer):
+			Ok(define_value(builder, IntegerValue(integer), value.base_type, value.base_span))
+		ReturnVariant(id):
+			Ok(define_value(builder, VariantValue(id), value.base_type, value.base_span))
+		ReturnCall(call):
+			Ok(
+				define_value(
+					builder,
+					CallValue(call, NoArguments),
+					value.base_type,
+					value.base_span,
+				),
+			)
+
+	var built = base
+
+	for step in value.operations:
+		operation = match step.operation:
+			InvokeFunction(call):
+				CallValue(call, OneArgument(built.value))
+			ConstructVariant(id):
+				ConstructValue(id, built.value)
+
+		built = define_value(built.builder, operation, step.value_type, step.span)
+
+	Ok(built)
+
+
+private pure func assign_value(
+	builder: ValueBuilder,
+	id: BindingId,
+	value: ValueId,
+	span: Span,
+) -> Result[ValueBuilder, Diagnostic]:
+	bindings ?= builder.bindings
+		.set_index(binding_number(id), Some(value))
+		.to_result(invalid_binding(span))
+	Ok({ builder | bindings = bindings })
+
+
+private fixed record BuiltMatch {
+	builder: ValueBuilder,
+	matched: LoweredMatch
+}
+
+
+private fixed record BuiltArm {
+	arm: LoweredArm,
+	next_value: Int
+}
+
+
+private pure func lower_capture(
+	builder: ValueBuilder,
+	id: BindingId,
+	scrutinee: ValueId,
+	bindings: List[BindingDefinition],
+	span: Span,
+) -> Result[ValueBuilder, Diagnostic]:
+	definition ?= bindings
+		.get(binding_number(id))
+		.to_result(invalid_binding(span))
+	projection = define_value(builder, PayloadValue(scrutinee), IntType, definition.span)
+	assign_value(projection.builder, id, projection.value, definition.span)
+
+
+private pure func lower_arm(
+	builder: ValueBuilder,
+	pattern: CheckedPattern,
+	value: CheckedValue,
+	scrutinee: ValueId,
+	bindings: List[BindingDefinition],
+) -> Result[BuiltArm, Diagnostic]:
+	var branch = { builder | definitions = [] }
+
+	label = match pattern:
+		VariantCase(id, _):
+			VariantLabel(id)
+		_:
+			DefaultLabel
+
+	bound ?= match pattern:
+		BindingCase(id):
+			assign_value(branch, id, scrutinee, value.base_span)
+		VariantCase(_, payload):
+			match payload:
+				BindIntPayload(id):
+					lower_capture(branch, id, scrutinee, bindings, value.base_span)
+				_:
+					Ok(branch)
+		WildcardCase:
+			Ok(branch)
+
+	result ?= lower_value(bound, value)
+	Ok({
+		arm = {
+			label = label,
+			body = {
+				definitions = result.builder.definitions,
+				result = result.value
+			}
+		},
+		next_value = result.builder.next_value,
+	})
+
+
+private pure func lower_match(
+	builder: ValueBuilder,
+	matched: CheckedMatch,
+	bindings: List[BindingDefinition],
+) -> Result[BuiltMatch, Diagnostic]:
+	scrutinee ?= lower_value(builder, matched.scrutinee)
+	var current = scrutinee.builder
+	var arms: List[LoweredArm] = []
+	var failure: Option[Diagnostic] = None
+
+	for arm in matched.arms:
+		match lower_arm(current, arm.pattern, arm.body, scrutinee.value, bindings):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(lowered):
+				arms = arms.append(lowered.arm)
+				current = { current | next_value = lowered.next_value }
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				builder = current,
+				matched = {
+					scrutinee = scrutinee.value,
+					owner = matched.owner,
+					arms = arms
+				},
+			})
+
+
+private pure func lower_assignment(
+	builder: ValueBuilder,
+	assignment: CheckedAssignment,
+) -> Result[ValueBuilder, Diagnostic]:
+	match assignment:
+		InitializeBinding(id, value):
+			result ?= lower_value(builder, value)
+			assign_value(result.builder, id, result.value, value.base_span)
+		ReassignBinding(id, value):
+			result ?= lower_value(builder, value)
+			assign_value(result.builder, id, result.value, value.base_span)
+
+
+private pure func lower_function(function: CheckedFunction) -> Result[LoweredFunction, Diagnostic]:
+	var builder: ValueBuilder = {
+		next_value = 0,
+		definitions = [],
+		bindings = function.bindings.map(pure func(_: BindingDefinition) -> Option[ValueId]: None)
+	}
+	var ordinal: Int = 0
+
+	-- The checked definition table owns parameter identity and its source span.
+	for definition in function.bindings:
+		match definition.origin:
+			ParameterBinding:
+				parameter = define_value(
+					builder,
+					ParameterValue,
+					definition.value_type,
+					definition.span,
+				)
+				builder = { parameter.builder |
+					bindings = parameter.builder.bindings.set(ordinal, Some(parameter.value))
+				}
+			_:
+				void
+
+		ordinal = IntOps.add(ordinal, 1)
+
+	var failure: Option[Diagnostic] = None
+
+	for assignment in function.assignments:
+		match lower_assignment(builder, assignment):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(assigned):
+				builder = assigned
+
+	accepted ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	match function.body:
+		CheckedValueBody(value):
+			result ?= lower_value(builder, value)
+			Ok({
+				signature = function.signature,
+				definitions = result.builder.definitions,
+				tail = ReturnValue(result.value),
+			})
+		CheckedMatchBody(matched):
+			result ?= lower_match(builder, matched, function.bindings)
+			Ok({
+				signature = function.signature,
+				definitions = result.builder.definitions,
+				tail = MatchValue(result.matched),
+			})
+
+
+pure func lower(program: CheckedProgram) -> Result[LoweredProgram, Diagnostic]:
+	checked = checked_functions(program)
+	var functions: List[LoweredFunction] = []
+	var failure: Option[Diagnostic] = None
+
+	for function in checked.functions:
+		match lower_function(function):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(lowered):
+				functions = functions.append(lowered)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(into_opaque LoweredProgram({
+						unions = checked.unions,
+						functions = functions,
+						entrypoint = checked.entrypoint
+					}))

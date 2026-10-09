@@ -3,6 +3,7 @@ import:
 	../../src/names: NameTable, name_spelling
 	../../src/parse: ParsedProgram, parse, parsed_contents
 	../../src/syntax:
+		BindingSyntax(ImmutableBinding, MutableBinding),
 		CallNotation(DirectCall, ReceiverCall),
 		Diagnostic,
 		ExpressionBase(IntegerExpression, NameExpression, ZeroArgumentApplication),
@@ -27,7 +28,7 @@ private MATCH_HEADER: String = "func f(value: V) -> Int:\n\tmatch value:\n"
 
 private IDENTIFIER_HELP: String = (
 	"use an ASCII identifier starting with a letter or underscore; 'func', 'pure', "
-	+ "'match', and lone '_' are reserved"
+	+ "'match', 'var', and lone '_' are reserved"
 )
 
 private INDENT_HELP: String = "use tabs only, or spaces in groups of four; do not mix tabs and spaces"
@@ -1682,9 +1683,142 @@ pure func test_match_arms_require_colon_and_inline_result() -> Bool:
 	)
 
 
+pure func test_binding_prefix_and_final_value_shape() -> Bool:
+	match parse_source(HEADER + "\tfirst=1\n\tvar current = first\n\tcurrent=42\n\tfirst"):
+		Err(_):
+			False
+		Ok(parsed):
+			program = parsed_contents(parsed)
+
+			match program.functions:
+				[function]:
+					match function.bindings:
+						[first, current, update]:
+							(
+								first.mutability == ImmutableBinding
+								and current.mutability == MutableBinding
+								and update.mutability == ImmutableBinding
+								and written_name_is(program.names, first.name, "first", 21, 26)
+								and expression_integer_is(first.initializer, 1, 27, 28)
+								and current.name.span.start == 34
+								and current.initializer.span.start == 44
+								and value_body_name_is(
+									program.names,
+									function.body,
+									"first",
+									63,
+									68,
+								)
+							)
+						_:
+							False
+				_:
+					False
+
+
+private pure func value_body_name_is(
+	names: NameTable,
+	body: ParsedBody,
+	name: String,
+	start: Int,
+	end: Int,
+) -> Bool:
+	match body:
+		ParsedValueBody(value):
+			expression_name_is(names, value, name, start, end)
+		_:
+			False
+
+
+pure func test_binding_spaces_and_tail_match() -> Bool:
+	match parse_source(
+		"func f(value: V) -> Int:\n    local = value  \n    match local:\n        _: 0\n",
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			match parsed_contents(parsed).functions:
+				[function]:
+					match function.body:
+						ParsedMatchBody(_):
+							function.bindings.length() == 1
+						_:
+							False
+				_:
+					False
+
+
+pure func test_binding_initializer_is_required_on_its_line() -> Bool:
+	rejects(
+		HEADER + "\tvalue =\n\t0\n",
+		28,
+		29,
+		"expected a binding initializer",
+		"put one expression after '=' on the same line",
+	)
+
+
+pure func test_binding_requires_a_final_expression() -> Bool:
+	(
+		rejects(
+			HEADER + "\tvalue = 1",
+			30,
+			30,
+			"expected a final expression after the bindings",
+			"finish the function with a value expression or tail match",
+		)
+		and rejects(
+			HEADER + "\tvalue = 1\n",
+			31,
+			31,
+			"expected a final expression after the bindings",
+			"finish the function with a value expression or tail match indented one level",
+		)
+	)
+
+
+pure func test_var_is_reserved_but_longer_names_are_identifiers() -> Bool:
+	(
+		rejects_identifier("func var() -> Int:\n\t0\n", 5, 8, "expected a function name")
+		and accepts("func variable()->Int:\n\t0", "variable", 5, 13, "Int", 17, 20)
+		and rejects(HEADER + "\tvar = 1\n\t0\n", 25, 26, "expected a binding name", IDENTIFIER_HELP)
+	)
+
+
+pure func test_binding_annotations_and_discards_remain_unsupported() -> Bool:
+	(
+		rejects(
+			HEADER + "\tvar value: Int = 1\n\tvalue\n",
+			30,
+			31,
+			"expected '=' after the binding name",
+			"write name = expression or var name = expression",
+		)
+		and rejects(
+			HEADER + "\t_ = 1\n\t0\n",
+			21,
+			22,
+			"expected a return expression",
+			EXPRESSION_HELP,
+		)
+	)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 EBNF syntax conformance",
 	tests = [
+		("binding prefix and final value shape", test_binding_prefix_and_final_value_shape),
+		("binding spaces and tail match", test_binding_spaces_and_tail_match),
+		(
+			"binding initializer required on its line",
+			test_binding_initializer_is_required_on_its_line,
+		),
+		("binding requires final expression", test_binding_requires_a_final_expression),
+		("var reserved and word boundaries", test_var_is_reserved_but_longer_names_are_identifiers),
+		(
+			"binding annotations and discards unsupported",
+			test_binding_annotations_and_discards_remain_unsupported,
+		),
 		("payload and tail-match syntax", test_payload_and_match_syntax),
 		(
 			"pattern alternatives, space layout and following union",

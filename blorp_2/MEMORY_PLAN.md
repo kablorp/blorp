@@ -1,10 +1,12 @@
-# Memory architecture before bindings
+# Memory architecture
 
-Status: proposed responsibilities and increment sequence, 2026-10-09.
-This document adds no input-language support or runtime machinery. Read
+Status: scalar binding checking and value lowering implemented; managed
+responsibilities and later increments proposed, 2026-10-09. This document
+adds no runtime machinery. Read
 [AGENTS.md](AGENTS.md) and the parent instructions first. The current pilot
 has only unmanaged Int and union values; [README.md](README.md) owns its scope.
-Examples below describe future increments using existing Blorp syntax.
+Examples below describe the binding boundary and future managed increments
+using existing Blorp syntax.
 
 ## Keep the pieces distinct
 
@@ -22,6 +24,13 @@ These pieces cooperate; none substitutes for the others. The
 starts from explicit control flow and separates precise reference counting from
 reuse and specialization; that is useful guidance, not a claim that our
 implementation inherits its proof.
+
+Knowing a reference's last use does not establish that it is the allocation's
+last owner. A `drop` of shared storage decrements its count; the final release
+destroys its owned children and frees its root. Where exclusive ownership is
+proven, specialization may eliminate retain/release and destroy or reuse the
+allocation directly. Such a proof belongs to an operation and program point;
+an allocation's original freshness is not a permanent uniqueness guarantee.
 
 Keep all planning/transformation/verification pure after source loading.
 Allocation, RC changes and uniqueness checks described here happen in the
@@ -65,7 +74,7 @@ them and invalidate the previous verification result.
 
 - `BindingId` belongs to a source function and identifies a lexical binding,
   even when another binding uses the same spelling. Mutability is checked here.
-- A future `ValueId` identifies one computed value in one lowered function.
+- `ValueId` identifies one computed value in one lowered function.
   Reassigning a source variable changes its current value mapping, not that
   value's identity. Two source bindings may refer to the same `ValueId`.
 - Future block identities and typed block parameters describe control-flow
@@ -186,6 +195,156 @@ expensive COW in compiler builders. Treat them as regression ideas, not claims
 that those bugs remain. Tests should cover borrowed child escape, self-aliasing
 reassignment, surviving aliases and selected-branch cleanup. Equal total
 retain/release counts cannot prove ordering, owner provenance or safety.
+
+## Dup/drop, ARC and exhaustive destruction
+
+Establish these contracts before the first managed value; scalar bindings do
+not implement them. `dup/drop` describes ownership of a complete value. Its
+representation determines the physical work: an unmanaged value needs no RC
+operation, an inline aggregate may duplicate/drop owned children, and a managed
+root retains/releases its root. Retaining a managed aggregate's root does not
+retain every child again; those children belong to the aggregate's lifetime.
+
+An exhaustive compiler-side ownership-plan union can expose these operational
+cases without treating Perceus as a storage category:
+
+```text
+ValueOwnership = NoOwnership
+               | InlineOwnedFields(InlineOwnershipPlan)
+               | ManagedRoot(ManagedLayoutId)
+```
+
+This is a derived view of the complete representation authority, not a second
+field inventory or a tag added to every runtime value. Stack-local storage
+can contain owned managed references. Borrowed versus owned describes a use's
+obligation and lifetime, separately from whether its representation is managed.
+
+The concrete layout authority must classify every field, not merely list the
+ones a separate traversal happened to recognize as managed. An illustrative
+field classification is:
+
+```text
+FieldOwnership = NoOwnedValue | OwnsValue(LayoutId)
+
+RecordLayout:
+    every declared storage field has an explicit FieldOwnership
+
+UnionLayout:
+    every variant has a complete field layout
+```
+
+Root storage and child ownership are independent. Derive destruction from this
+complete layout; do not maintain a second hand-written owned-field inventory.
+Validate field/variant identity and totality against the canonical concrete
+shape at plan construction. No missing entry, unknown layout or unsupported
+field may default to `NoOwnedValue`. An explicit leaf with no children is a
+valid plan, distinct from a missing plan. Specialization must resolve generic
+fields before this boundary.
+
+For a mortal managed root, final release invokes the active layout's child
+cleanup and frees the root exactly once. Specify one authority for root
+deallocation in the runtime ABI; child destruction and ARC must not both free
+it. Nonfinal release must not destroy children. Union destruction visits only
+the active variant's fields. Inline aggregates perform child cleanup without
+releasing a nonexistent managed root. Immortal storage, when supported, has an
+explicit lifetime contract rather than a fabricated uniqueness/freshness fact.
+Require iterative or otherwise bounded-stack destruction before admitting
+recursive managed values.
+
+Ownership insertion must account for each owner created, duplicated, consumed,
+returned or dropped, including the owner's borrow dependencies. Every supported
+exit transfers or discharges each obligation. Reassignment establishes the RHS
+owner before retiring the old one. The independent verifier checks the actual
+final operations and the complete layout/call contracts, independently of the
+inserter's intended edits. A balanced RC total can still hide a leaked child,
+wrong owner, wrong branch or invalid order.
+
+Compiler verification relies on explicit runtime contracts; it cannot by itself
+prove their C implementation. Separate Blorp-orchestrated runtime tests must
+observe mortal per-object lifetime events, nonfinal/final release, each owned
+child, each union variant, inline children and supported immortal storage.
+Intentionally omit a required child drop and require the destruction oracle
+and leak check to fail. Test the planner against declared shape independently
+of the destructor generated from that plan, so the same omission cannot make
+both producer and oracle agree. ASan/UBSan/leak checks supplement these tests.
+
+## Phase-level test contract
+
+Status: requirements for future increments. The current pilot has no target
+ARC/COW, ownership insertion or independent ownership verifier. Existing unit
+tests of unmanaged unions do not establish managed-value safety. Add the tests
+with each supported feature, before its implementation; do not build unused
+passes or placeholder suites to fill this matrix.
+
+Every affected boundary needs small Blorp `TestSuite` cases that exercise its
+public typed contract directly. Use valid minimal input builders where sealed
+products require them. Parsing source is appropriate for syntax/checking and
+integration tests; a liveness or ownership test should not need to parse and
+compile an entire program. Keep setup outside the operation being tested.
+Use one named callback per invariant or failure mode so failures identify the
+responsible phase; shared setup and data-driven helpers remain useful.
+
+| Boundary | Granular cases required when supported |
+| --- | --- |
+| Checking and binding identity | Immutable assignment rejected with exact diagnostic; local mutation allowed in pure functions; shadowed bindings remain distinct; initializer reads the previous binding where permitted; incompatible assignment rejected. |
+| Value/control-flow lowering | Rebinding creates a new value version; old aliases still read the old value; RHS and call arguments execute in source order exactly once; joins and loop edges carry the correct typed versions. No ARC or runtime mutable cell for unmanaged bindings. |
+| Representation and cleanup plans | Root storage and owned children distinguished; every admitted constructor/field has construction, copy, projection and destruction behavior; inline aggregates with managed children covered; inactive union fields never destroyed; missing layouts and cross-authority identities rejected. |
+| Call ownership ABI | Borrowed arguments survive calls; consumed owners transfer once; owned returns may alias inputs; borrowed projections retain their owner relationship; each runtime operation's contract agrees with its implementation. Reject invalid argument/result relationships. |
+| Uses, liveness and borrow dependencies | Last use distinguished from last spelling occurrence; branch-local uses stay on their edges; aliases and projected borrows keep owners live; unused results identified; rewrites cannot reuse analysis or verification from an earlier body revision. |
+| Ownership insertion | Required duplication before borrowed escape; unused owners dropped; returns/consuming calls transfer without a second drop; reassignment establishes the RHS owner before releasing the old one; selected branches discharge their obligations. |
+| Independent ownership verification | Accept valid minimal programs; reject missing acquisition, leaked owner, double drop, use after drop/transfer, borrowed escape, wrong borrow owner, and missing edge transfer. Reject unsupported shapes and stale/mismatched contracts. Equal total dup/drop counts must not hide invalid order or branch provenance. |
+| COW and allocation reuse | Shared update preserves all surviving aliases; unique update uses the permitted path; uniqueness checked at use; insufficient capacity and incompatible layouts use a correct fallback; managed children transferred/retained/destroyed correctly. Reuse disabled gives the same observable values and safe cleanup. |
+| C emission | Verified operations preserve evaluation and acquire/drop/transfer order; projections occur only in the selected branch; emission introduces no hidden managed owner or cleanup. Native execution independently checks the emitted behavior. |
+| Target runtime ARC and destruction | Retain keeps storage alive; releasing a nonfinal owner does not destroy it; final release destroys exactly once; owned children released exactly once; mortal and supported immortal storage handled explicitly; uniqueness changes with owner count. Require bounded-stack destruction before recursive managed data. |
+
+Collections additionally need slot insertion, replacement, removal and storage
+growth tests. Loops need zero/one/many iterations, loop-carried owners and every
+supported exit. Closures and resources need capture/escape and cleanup tests
+when admitted. Concurrency, channels and FFI remain excluded. Each new managed
+operation or storage form adds its own contract cases before acceptance; this
+matrix is not proof of exhaustive future coverage.
+
+For example, the following are separate proposed tests of different owners,
+using illustrative IR notation rather than new Blorp syntax:
+
+```text
+insertion: borrowed parameter returned as owned
+    input:    return borrowed p0
+    expect:   acquire an owner for p0 before transferring the return
+
+verifier: returning a borrowed parameter without acquisition
+    input:    return_owned borrowed p0
+    expect:   reject borrowed escape at that return
+
+verifier: balanced counts with invalid ordering
+    input:    drop v0; v1 = dup v0; return move v1
+    expect:   reject use after drop despite balanced ownership totals
+```
+
+Verifier negatives must feed deliberately malformed ownership IR directly,
+independently of the inserter. Keep any internal test builders separate from
+published verified products; never weaken production construction guarantees
+to make invalid fixtures convenient. Assert the exact violated obligation and
+operation/edge, rather than accepting any error. Source-facing failures also
+pin message, help and span.
+
+Compare semantic identities, ownership relationships and safety-critical order.
+Avoid whole-program text snapshots or exact retain counts where several legal
+placements exist; cost ceilings are separate checks. Runtime probes use mortal
+allocations, surviving aliases, and per-object lifetime events to check which
+object is destroyed and when. Blorp `TestSuite` suites register the tests and
+assert their exact outcomes. Prefer source fixtures compiled by the pilot and
+their normal entrypoints. A native probe outside that path needs explicit
+approval for a concrete supported ownership behavior, as required by
+[AGENTS.md](AGENTS.md#get-approval-before-adding-mechanisms-or-implicit-behavior).
+This plan does not authorize C assertion drivers in advance. No Python tests.
+
+Each managed slice also needs a small integration fixture, generated-C
+inspection, ASan/UBSan/leak checks and a deliberate mutation that fails the
+protected oracle. Where shared/unique paths matter, prove both were exercised.
+Keep compiler-process allocations and target-program ownership measurements
+separate. Unsupported verification remains rejection; neither sanitizer silence
+nor code coverage promotes it to verified support.
 
 ## Increment sequence and evidence
 

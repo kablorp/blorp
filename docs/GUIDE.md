@@ -2,6 +2,10 @@
 
 A comprehensive reference for the blorp programming language.
 
+The separate [Blorp 2 pilot](../blorp_2/README.md) implements a restricted
+subset. Its current examples include immutable bindings and local `var`
+reassignment; the pilot reference states the supported scope and restrictions.
+
 ---
 
 ## 1. Quick Start

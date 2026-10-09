@@ -26,6 +26,32 @@ of trait-dispatched operators. Existing host-library dependencies and the
 host TestSuite API are temporary dependencies; they do not establish
 bootstrap readiness or expand the input language.
 
+## Get approval before adding mechanisms or implicit behavior
+
+Use the smallest direct implementation that satisfies the agreed working
+example. A request for tests, robustness, or an architectural foundation does
+not authorize additional infrastructure by itself.
+
+Get explicit user approval before adding a mechanism beyond the agreed design
+that introduces any of the following:
+
+- Another framework, pipeline layer, registry, cache, controller, or parallel
+  implementation path.
+- Test execution that bypasses the fixture's normal entrypoint, rewrites emitted
+  code, calls generated internal symbols, or adds a second assertion
+  program in another language.
+- Hidden inputs, automatic fallback or repair, environment-dependent semantics,
+  or conventions that a consumer must infer instead of receiving as explicit
+  typed data or configuration.
+
+Before asking, give a concrete example of the need, the simpler direct option,
+and the proposed mechanism's scope, cost and validation. Approval must cover
+that mechanism; do not infer it from a general desire for quality or possible
+future requirements. Existing explicit authorization still counts. Small local
+helpers, direct phase tests and routine changes within the approved design do
+not need repeated approval. If no approved mechanism can meet the requirement,
+report the limitation instead of silently adding one.
+
 ## Establish identity, authority, and lifetime first
 
 Before changing a fact's representation or moving it between phases, state:
@@ -137,15 +163,33 @@ Python. Every host-compiled source module has a matching unit suite under
 [test/test_grammar/](test/test_grammar/); update them and the EBNF together.
 Check exact diagnostic text, help, and spans for rejected inputs. End-to-end
 suites live under [test/e2e/](test/e2e/), with input programs in
-[test/e2e/fixtures/](test/e2e/fixtures/). Native C drivers may be orchestrated
-by these Blorp suites.
+[test/e2e/fixtures/](test/e2e/fixtures/). Their default path is explicit: the
+pilot compiles a small Blorp fixture, the C compiler builds its unmodified
+output, and the host TestSuite runs the fixture's real `main` and checks its
+exit status, stdout and stderr. Each fixture should expose its tested behavior
+through that entrypoint. Precise phase facts belong in direct unit tests;
+native probes outside this path require approval under the rule above.
+
+Memory-management increments require granular unit tests at every affected
+phase boundary, including intermediate analyses, and separate runtime tests.
+Test each invariant with a named `TestSuite` callback using small typed inputs
+and observable outputs; do not make every phase test run the whole compiler.
+Test ownership insertion and independent verification separately, including
+malformed ownership IR that the verifier must reject. End-to-end success,
+sanitizers, balanced RC totals and line coverage do not replace these tests.
+The [memory test matrix](MEMORY_PLAN.md#phase-level-test-contract) defines the
+required cases as each feature enters the supported subset; future rows are
+requirements, not claims of implemented coverage.
 
 Use the narrowest repeatable check while iterating, then the relevant
 integration and sanitizer checks. Follow the parent instructions for host
-build freshness. Reuse the shared test compiler via
-`make -C blorp_2 test-compiler`; do not rebuild it separately for each fixture.
-The README owns runnable commands and the cache contract. Keep generated artifacts
-under the ignored `build/` directory or temporary directories.
+build freshness. Build the pilot once at the beginning of each end-to-end run
+via `make -C blorp_2 test-compiler`, then pass its executable path explicitly
+to the tests. Do not add a persistent compiler cache or prepare the compiler
+separately for each fixture. The README owns runnable commands. Keep generated
+artifacts under the ignored `build/` directory or temporary directories. Build the pilot
+and fixture programs at `-O0` for these development tests. Compile each valid
+fixture once, collecting allocation and instruction counters from that run.
 
 End-to-end tests own their allocation and retired-instruction ceilings.
 Adjust limits deliberately with retained evidence. Prioritize doing less
