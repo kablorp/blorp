@@ -1,0 +1,168 @@
+import:
+	harness:
+		Example,
+		prepare_compiler,
+		run_example,
+		run_isolated,
+		run_successfully,
+		verify_rejected_command,
+	process: exit_code, stderr, stdout
+	system: file_exists, getenv, read_file, remove_dir, remove_file, temp_dir, write_file
+	test: TestSuite
+
+
+private UNION_VALUES: Example = {
+	name = "union_values",
+	fixture = "blorp_2/test/e2e/fixtures/union_values.brp",
+	expected_c = "#include <stdint.h>\nenum blorp_u_0{blorp_v_0_0,blorp_v_0_1};enum blorp_u_0 blorp_f_0(void);enum blorp_u_0 blorp_f_1(void);enum blorp_u_0 blorp_f_2(enum blorp_u_0 blorp_p_0);enum blorp_u_0 blorp_f_3(void);enum blorp_u_0 blorp_f_4(void);int64_t blorp_f_5(void);enum blorp_u_0 blorp_f_0(void){return blorp_v_0_0;}enum blorp_u_0 blorp_f_1(void){return blorp_v_0_1;}enum blorp_u_0 blorp_f_2(enum blorp_u_0 blorp_p_0){return blorp_p_0;}enum blorp_u_0 blorp_f_3(void){return blorp_f_2(blorp_v_0_1);}enum blorp_u_0 blorp_f_4(void){return blorp_f_2(blorp_v_0_0);}int64_t blorp_f_5(void){return INT64_C(0);}int main(void){return (int)blorp_f_5();}\n",
+	exit_status = 0,
+	limits = {
+		allocations = 1150,
+		instructions = 40000000
+	}
+}
+
+
+func test_union_native_and_cost() -> Bool:
+	run_example(UNION_VALUES)
+
+
+private func verify_driver(
+	directory: String,
+	name: String,
+	source: String,
+	status: Int,
+) -> Result[Void, String]:
+	path = directory + "/" + name
+	written ?= write_file(path + ".c", source)
+	linked ?= run_successfully(
+		getenv("BLORP_CC").get_or("clang"),
+		[
+			"-std=c11",
+			"-Wall",
+			"-Wextra",
+			"-Werror",
+			"-pedantic",
+			"-O2",
+			"-fsanitize=undefined",
+			"-fno-sanitize-recover=all",
+			path + ".c",
+			"-o",
+			path,
+		],
+	)
+	actual ?= run_isolated(path, [])
+
+	if (
+		actual.exit_code() == status
+		and actual.stdout() == ""
+		and actual.stderr() == ""
+	):
+		Ok(void)
+	else:
+		Err(
+			"the independent union driver returned an unexpected status or stream: " + actual.stderr(),
+		)
+
+
+private func verify_values(directory: String, compiler: String) -> Result[Void, String]:
+	compiled ?= run_successfully(
+		compiler,
+		[UNION_VALUES.fixture, directory + "/program.c"],
+	)
+	program ?= read_file(directory + "/program.c")
+	-- Compare actual values, including both source-level call notations. main's
+	-- constant zero cannot establish any of these constructor/call properties.
+	driver = "#define main blorp_entrypoint_wrapper\n" + program + "#undef main\nint main(void){return blorp_v_0_0!=blorp_v_0_1 && blorp_f_0()==blorp_v_0_0 && blorp_f_1()==blorp_v_0_1 && blorp_f_0()!=blorp_f_1() && blorp_f_2(blorp_v_0_0)==blorp_v_0_0 && blorp_f_2(blorp_v_0_1)==blorp_v_0_1 && blorp_f_3()==blorp_v_0_1 && blorp_f_4()==blorp_v_0_0 ? 0 : 1;}\n"
+	verified ?= verify_driver(directory, "values", driver, 0)
+	-- Collapse the emitted Second-returning function, leaving the oracle intact.
+	collapsed = driver.replace("return blorp_v_0_1;", "return blorp_v_0_0;")
+
+	changed ?= if collapsed == driver:
+		Err("the constructor-collapse proof did not change the emitted program")
+	else:
+		Ok(void)
+
+	verify_driver(directory, "collapsed", collapsed, 1)
+
+
+private func verify_nominal_rejection(directory: String, compiler: String) -> Result[Void, String]:
+	input = directory + "/nominal.brp"
+	output = directory + "/rejected.c"
+	written ?= write_file(
+		input,
+		"fixed union Left:\n\tSame\nfixed union Right:\n\tSame\nfunc take(value: Right) -> Int:\n\t0\nfunc left() -> Left:\n\tSame\nfunc main() -> Int:\n\ttake(left())\n",
+	)
+	-- Both constructors have ordinal zero. C's enum conversion rules cannot
+	-- establish the language's nominal type rule; the compiler must reject it.
+	expected = input + ":10:2: error: argument type does not match the parameter type\nhelp: use an expression of type Right here\n"
+	rejected_missing ?= verify_rejected_command(compiler, input, output, expected)
+
+	unpublished ?= if file_exists(output):
+		Err("a nominal union mismatch published C")
+	else:
+		Ok(void)
+
+	sentinel ?= write_file(output, "preserve this output")
+	rejected_existing ?= verify_rejected_command(compiler, input, output, expected)
+	actual ?= read_file(output)
+
+	if actual == "preserve this output":
+		Ok(void)
+	else:
+		Err("a nominal union mismatch overwrote existing output")
+
+
+private func verify_union_contract(directory: String) -> Result[Void, String]:
+	compilers ?= prepare_compiler()
+	values ?= verify_values(directory, compilers.normal)
+	verify_nominal_rejection(directory, compilers.normal)
+
+
+func test_values_and_rejected_cross_union_call() -> Bool:
+	match (
+		run_successfully(
+			"mktemp",
+			["-d", temp_dir() + "/blorp-2-unions.XXXXXX"],
+		)
+	):
+		Err(error):
+			print_error(error)
+			False
+		Ok(temporary):
+			directory = temporary
+				.stdout()
+				.trim()
+			result = verify_union_contract(directory)
+
+			for name in [
+				"program.c",
+				"values.c",
+				"values",
+				"collapsed.c",
+				"collapsed",
+				"nominal.brp",
+				"rejected.c",
+			]:
+				_ = remove_file(directory + "/" + name)
+
+			_ = remove_dir(directory)
+
+			match result:
+				Ok(_):
+					True
+				Err(error):
+					print_error(error)
+					False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 payload-free fixed unions",
+	tests = [
+		("union native execution and cost", test_union_native_and_cost),
+		(
+			"distinct values, constructor-collapse proof and nominal rejection",
+			test_values_and_rejected_cross_union_call,
+		),
+	]
+}

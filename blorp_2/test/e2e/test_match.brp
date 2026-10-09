@@ -1,0 +1,476 @@
+import:
+	cost: check_limits
+	harness:
+		Example,
+		measure_compilation_cost,
+		prepare_compiler,
+		remove_existing_file,
+		run_isolated,
+		run_successfully,
+		verify_native_result,
+		verify_rejected_command,
+	process: exit_code, stderr, stdout
+	system: file_exists, getenv, read_file, temp_dir, write_file
+	test: TestSuite
+
+
+private FIXTURE: String = "blorp_2/test/e2e/fixtures/match_value.brp"
+
+private VALUE_HEADER: String = "fixed union Value:\n\tEmpty\n\tNumber(Int)\n"
+
+
+private func compile_fresh(compiler: String, input: String, output: String) -> Result[Void, String]:
+	removed ?= remove_existing_file(output)
+	compiled ?= run_successfully(
+		compiler,
+		[input, output],
+	)
+
+	if (
+		file_exists(output)
+		and compiled.stdout() == ""
+		and compiled.stderr() == ""
+	):
+		Ok(void)
+	else:
+		Err("successful compilation must publish fresh C with empty streams")
+
+
+private func verify_fixture(directory: String) -> Result[Void, String]:
+	compilers ?= prepare_compiler()
+	compiled ?= compile_fresh(compilers.normal, FIXTURE, directory + "/program.c")
+	program ?= read_file(directory + "/program.c")
+	-- Native behavior is the independent oracle. The first successful C output
+	-- also freezes bytes for the diagnostic/normal measurement pair below.
+	example: Example = {
+		name = "match_value",
+		fixture = FIXTURE,
+		expected_c = program,
+		exit_status = 42,
+		limits = {
+			allocations = 5000,
+			instructions = 100000000
+		}
+	}
+	native ?= verify_native_result(directory, example.exit_status)
+	cost ?= measure_compilation_cost(compilers, directory, example)
+	check_limits(cost, example.limits)
+
+
+private func verify_driver(directory: String, source: String, status: Int) -> Result[Void, String]:
+	path = directory + "/driver"
+	written ?= write_file(path + ".c", source)
+	linked ?= run_successfully(
+		getenv("BLORP_CC").get_or("clang"),
+		[
+			"-std=c11",
+			"-Wall",
+			"-Wextra",
+			"-Werror",
+			"-pedantic",
+			"-O2",
+			"-fsanitize=undefined",
+			"-fno-sanitize-recover=all",
+			path + ".c",
+			"-o",
+			path,
+		],
+	)
+	actual ?= run_isolated(path, [])
+
+	if (
+		actual.exit_code() == status
+		and actual.stdout() == ""
+		and actual.stderr() == ""
+	):
+		Ok(void)
+	else:
+		Err("native match oracle returned an unexpected status or stream: " + actual.stderr())
+
+
+private pure func driver(program: String, assertion: String) -> String:
+	"#define main blorp_entrypoint_wrapper\n" + program + "#undef main\nint main(void){return (" + assertion + ")?0:1;}\n"
+
+
+private pure func replace_once(
+	source: String,
+	old: String,
+	replacement: String,
+) -> Result[String, String]:
+	if source.count(old) == 1:
+		Ok(source.replace(old, replacement))
+	else:
+		Err("native fault instrumentation did not identify exactly one helper: " + old)
+
+
+private func verify_fault(
+	directory: String,
+	program: String,
+	assertion: String,
+	opening: String,
+	injected: String,
+) -> Result[Void, String]:
+	changed ?= replace_once(program, opening, opening + injected)
+	verify_driver(
+		directory,
+		driver(changed, assertion),
+		1,
+	)
+
+
+private func verify_faults(
+	directory: String,
+	program: String,
+	assertion: String,
+	faults: List[(String, String)],
+) -> Result[Void, String]:
+	var result: Result[Void, String] = Ok(void)
+
+	for (opening, injected) in faults:
+		result = verify_fault(directory, program, assertion, opening, injected)
+
+		match result:
+			Err(_):
+				break
+			Ok(_):
+				void
+
+	result
+
+
+private func verify_values(directory: String) -> Result[Void, String]:
+	compilers ?= prepare_compiler()
+	compiled ?= compile_fresh(
+		compilers.normal,
+		"blorp_2/test/e2e/fixtures/match_values.brp",
+		directory + "/program.c",
+	)
+	program ?= read_file(directory + "/program.c")
+	-- Compare tags and fields separately; never rely on struct padding bytes,
+	-- C enum conversion, or a narrowed process exit value for payload equality.
+	assertion = (
+		"blorp_f_1(INT64_MIN).tag==blorp_v_0_1 && blorp_f_1(INT64_MIN)."
+		+ "payload==INT64_MIN && blorp_f_1(INT64_MAX).payload==INT64_MAX && blorp_f_1(-7)."
+		+ "payload==-7 && blorp_f_1(0).payload==0 && blorp_f_2().tag==blorp_v_0_0 && "
+		+ "blorp_f_2().payload==0 && blorp_f_0(blorp_f_1(INT64_MIN))==INT64_MIN && "
+		+ "blorp_f_0(blorp_f_2())==0 && blorp_f_3(blorp_f_1(-7)).tag==blorp_v_0_1 && "
+		+ "blorp_f_3(blorp_f_1(-7)).payload==-7 && blorp_f_3(blorp_f_2()).tag==blorp_v_0_0 "
+		+ "&& blorp_f_4(blorp_f_1(42))==-7 && blorp_f_5()==INT64_MIN && "
+		+ "blorp_f_6()==INT64_MAX && blorp_f_13(-123)==42 && blorp_f_14(blorp_f_1(17))==17 "
+		+ "&& blorp_f_14(blorp_f_2())==3"
+	)
+	verified ?= verify_driver(
+		directory,
+		driver(program, assertion),
+		0,
+	)
+	-- Keep the independent assertions unchanged for every injected fault.
+	verify_faults(
+		directory,
+		program,
+		assertion,
+		[
+			("struct blorp_u_0 blorp_f_1(int64_t blorp_p_0){", "blorp_p_0=0;"),
+			(
+				"struct blorp_u_0 blorp_f_1(int64_t blorp_p_0){",
+				"return (struct blorp_u_0){blorp_v_0_0,blorp_p_0};",
+			),
+			("int64_t blorp_f_0(struct blorp_u_0 blorp_p_0){", "return INT64_C(0);"),
+			("int64_t blorp_f_13(int64_t blorp_p_0){", "return blorp_p_0;"),
+		],
+	)
+
+
+private pure func instrument_helpers(program: String) -> Result[String, String]:
+	var instrumented: Result[String, String] = Ok(
+		"static int scrutinee_calls,unselected_calls,selected_calls,scalar_calls,argument_calls;\n" + program,
+	)
+
+	for (opening, counter) in [
+		("struct blorp_u_0 blorp_f_7(void){", "scrutinee_calls"),
+		("int64_t blorp_f_9(void){", "unselected_calls"),
+		("int64_t blorp_f_10(int64_t blorp_p_0){", "selected_calls"),
+		("enum blorp_u_1 blorp_f_11(void){", "scalar_calls"),
+		("int64_t blorp_f_15(void){", "argument_calls"),
+	]:
+		match instrumented:
+			Err(_):
+				break
+			Ok(source):
+				instrumented = replace_once(source, opening, opening + "++" + counter + ";")
+
+	instrumented
+
+
+private func verify_evaluation(directory: String) -> Result[Void, String]:
+	compilers ?= prepare_compiler()
+	compiled ?= compile_fresh(
+		compilers.normal,
+		"blorp_2/test/e2e/fixtures/match_values.brp",
+		directory + "/program.c",
+	)
+	program ?= read_file(directory + "/program.c")
+	instrumented ?= instrument_helpers(program)
+
+	assertion = (
+		"blorp_f_8()==42 && scrutinee_calls==1 && selected_calls==1 && "
+		+ "unselected_calls==0 && blorp_f_12()==blorp_v_1_1 && scalar_calls==1 && "
+		+ "blorp_f_16().payload==42 && argument_calls==1"
+	)
+	verified ?= verify_driver(
+		directory,
+		driver(instrumented, assertion),
+		0,
+	)
+
+	verify_faults(
+		directory,
+		instrumented,
+		assertion,
+		[
+			("int64_t blorp_f_8(void){", "(void)blorp_f_7();"),
+			("int64_t blorp_f_8(void){", "(void)blorp_f_9();"),
+			("enum blorp_u_1 blorp_f_12(void){", "(void)blorp_f_11();"),
+			("struct blorp_u_0 blorp_f_16(void){", "(void)blorp_f_15();"),
+		],
+	)
+
+
+private pure func maximum_brace_depth(program: String) -> Int:
+	var depth = 0
+	var maximum = 0
+
+	for position in 0..program.length():
+		byte = program.substring(position, 1)
+
+		if byte == "{":
+			depth += 1
+			maximum = max(maximum, depth)
+		else if byte == "}":
+			depth -= 1
+
+	maximum
+
+
+private func verify_size(directory: String, compiler: String, size: Int) -> Result[Void, String]:
+	var source = "fixed union Choice:\n"
+	var assertion = "1"
+
+	for position in 0..size:
+		source = source + "\tChoice".append_int(position) + "(Int)\n"
+		payload = position * 17 - 99
+
+		sign = if payload < 0:
+			"*-1"
+		else:
+			""
+
+		assertion = assertion + " && blorp_f_0((struct blorp_u_0){blorp_v_0_".append_int(
+			position,
+		) + ",INT64_C(".append_int(abs(payload)) + ")" + sign + "})==".append_int(payload)
+
+	source += "pure func unwrap(value: Choice) -> Int:\n\tmatch value:\n"
+
+	for position in 0..size:
+		source = source + "\t\tChoice".append_int(position) + "(payload): payload\n"
+
+	source += "func main() -> Int:\n\tunwrap(Choice0(42))\n"
+	written ?= write_file(directory + "/stress.brp", source)
+	compiled ?= compile_fresh(compiler, directory + "/stress.brp", directory + "/program.c")
+	program ?= read_file(directory + "/program.c")
+	depth = maximum_brace_depth(program)
+	var complete_labels = program.count("case ") == size
+
+	for position in 0..size:
+		label = "case blorp_v_0_".append_int(position) + ":"
+		complete_labels = complete_labels and program.count(label) == 1
+
+	labels ?= if complete_labels:
+		Ok(void)
+	else:
+		Err("match C must retain every explicit constructor case exactly once")
+
+	flat ?= if depth <= 3:
+		Ok(void)
+	else:
+		Err("match C nesting grows with its arm count")
+
+	verified ?= verify_driver(
+		directory,
+		driver(program, assertion),
+		0,
+	)
+	print(
+		"match variants=".append_int(
+			size,
+		) + "; C bytes=".append_int(program.length()) + "; brace depth=".append_int(depth),
+	)
+
+	Ok(void)
+
+
+private func verify_structure(directory: String) -> Result[Void, String]:
+	compilers ?= prepare_compiler()
+	var result: Result[Void, String] = Ok(void)
+
+	for size in [16, 64, 256]:
+		result = verify_size(directory, compilers.normal, size)
+
+		match result:
+			Err(_):
+				break
+			Ok(_):
+				void
+
+	verified_sizes ?= result
+
+	-- Construction and function application share one iterative unary spine.
+	var expression = "42"
+
+	for position in 0..32:
+		expression = "unwrap(Number(" + expression + "))"
+
+	written ?= write_file(
+		directory + "/spine.brp",
+		"fixed union Value:\n\tNumber(Int)\npure func unwrap(value: Value) -> Int:\n\tmatch value:\n\t\tNumber(payload): payload\nfunc main() -> Int:\n\t" + expression + "\n",
+	)
+	compiled ?= compile_fresh(compilers.normal, directory + "/spine.brp", directory + "/program.c")
+	verify_native_result(directory, 42)
+
+
+private func verify_rejection(
+	directory: String,
+	compiler: String,
+	source: String,
+	expected: String,
+) -> Result[Void, String]:
+	input = directory + "/invalid.brp"
+	output = directory + "/rejected.c"
+	written ?= write_file(input, source)
+	removed ?= remove_existing_file(output)
+	rejected ?= verify_rejected_command(compiler, input, output, input + expected)
+
+	unpublished ?= if file_exists(output):
+		Err("rejected match or construction published C")
+	else:
+		Ok(void)
+
+	sentinel ?= write_file(output, "preserve this output")
+	rejected_existing ?= verify_rejected_command(compiler, input, output, input + expected)
+	actual ?= read_file(output)
+
+	if actual == "preserve this output":
+		Ok(void)
+	else:
+		Err("rejected match or construction overwrote existing C")
+
+
+private func verify_rejections(directory: String) -> Result[Void, String]:
+	compilers ?= prepare_compiler()
+	choose = VALUE_HEADER + "pure func choose() -> Value:\n\tEmpty\nfunc main() -> Int:\n\tmatch choose():\n"
+	unwrap = VALUE_HEADER + "pure func unwrap(value: Value) -> Int:\n\tmatch value:\n\t\tEmpty: 0\n\t\tNumber(number): number\nfunc main() -> Int:\n\tunwrap(Number())\n"
+	var result: Result[Void, String] = Ok(void)
+
+	for (source, expected) in [
+		(
+			choose + "\t\tEmpty: 0\n",
+			":7:2: error: non-exhaustive match\nhelp: add an arm for the missing variant: Number(_)\n",
+		),
+		(
+			choose + "\t\tEmpty: 0\n\t\tEmpty: 1\n\t\tNumber(number): number\n",
+			":9:3: error: match arm is unreachable\nhelp: remove this arm; earlier arms already cover all values it could match\n",
+		),
+		(
+			unwrap,
+			":9:9: error: constructor requires one Int argument\nhelp: pass one Int expression, such as Number(42)\n",
+		),
+		(
+			VALUE_HEADER + "func effect() -> Int:\n\t9\npure func unwrap(value: Value) -> Int:\n\tmatch value:\n\t\tEmpty: effect()\n\t\tNumber(number): number\nfunc main() -> Int:\n\tunwrap(Number(42))\n",
+			":8:10: error: pure functions cannot call impure functions\nhelp: mark the callee pure or remove pure from the caller\n",
+		),
+	]:
+		result = verify_rejection(directory, compilers.normal, source, expected)
+
+		match result:
+			Err(_):
+				break
+			Ok(_):
+				void
+
+	result
+
+
+private func with_directory(check: (String) -> Result[Void, String]) -> Bool:
+	match (
+		run_successfully(
+			"mktemp",
+			["-d", temp_dir() + "/blorp-2-match.XXXXXX"],
+		)
+	):
+		Err(error):
+			print_error(error)
+			False
+		Ok(created):
+			directory = created
+				.stdout()
+				.trim()
+			result = check(directory)
+			-- Every file below belongs to this newly created test directory.
+			removed = run_successfully(
+				"rm",
+				["-rf", "--", directory],
+			)
+
+			match result:
+				Ok(_):
+					removed.is_ok()
+				Err(error):
+					print_error(error)
+					False
+
+
+func test_match_returns_payload() -> Bool:
+	with_directory(verify_fixture)
+
+
+func test_full_width_values_and_captures() -> Bool:
+	with_directory(verify_values)
+
+
+func test_evaluation_once_and_selected_arm() -> Bool:
+	with_directory(verify_evaluation)
+
+
+func test_match_structure() -> Bool:
+	with_directory(verify_structure)
+
+
+func test_rejected_matches_preserve_output() -> Bool:
+	with_directory(verify_rejections)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 payload construction and matching",
+	tests = [
+		(
+			"match returns its captured Int payload and stays within cost limits",
+			test_match_returns_payload,
+		),
+		(
+			"full-width payload values, whole-value copies, and capture shadowing",
+			test_full_width_values_and_captures,
+		),
+		(
+			"scrutinees and constructor arguments run once, only the selected arm runs",
+			test_evaluation_once_and_selected_arm,
+		),
+		(
+			"flat C structure for 16/64/256 arms and a constructor/function spine",
+			test_match_structure,
+		),
+		(
+			"rejected matches and constructions preserve output with exact diagnostics",
+			test_rejected_matches_preserve_output,
+		),
+	]
+}

@@ -1,20 +1,65 @@
 import:
 	check:
-		CheckedBase(ReturnInteger, ReturnParameter, ReturnCall),
+		BindingId,
+		BindingRole(SoleParameter, ArmBinding),
+		CheckedArm,
+		CheckedBase(ReturnInteger, ReturnVariant, ReturnBinding, ReturnCall),
+		CheckedBody(CheckedValueBody, CheckedMatchBody),
+		CheckedFunction,
+		CheckedMatch,
+		CheckedOperation(InvokeFunction, ConstructVariant),
+		CheckedPattern(VariantCase, WildcardCase, BindingCase),
 		CheckedProgram,
-		ParameterShape(NoParameter, IntParameter),
+		CheckedUnion,
+		CheckedValue,
+		ParameterShape(NoParameter, OneParameter),
+		PayloadBinding(NoPayloadBinding, DiscardIntPayload, BindIntPayload),
+		PayloadShape(NoPayload, IntPayload),
+		TypeRef(IntType, UnionType),
+		UnionId,
+		VariantId,
+		binding_role,
 		checked_functions,
 		function_number,
+		union_number,
+		variant_number,
+		variant_owner,
 	int as IntOps
 	list: reverse
+	option: to_result
+	syntax: Diagnostic, Span
 	text: concat
+
+
+-- Checked-reference errors have no source occurrence; this marks that origin.
+private INTERNAL_SPAN: Span = {
+	start = 0,
+	end = 0
+}
+
+private C_PARAMETER: String = "blorp_p_0"
+
+private C_SCRUTINEE: String = "blorp_m_0"
+
+
+private pure func internal_error() -> Diagnostic:
+	{
+		span = INTERNAL_SPAN,
+		message = "internal compiler error: invalid checked union identity",
+		help = "report this compiler error with the input program"
+	}
 
 
 private pure func c_name(index: Int) -> String:
 	"blorp_f_".append_int(index)
 
 
-private C_PARAMETER: String = "blorp_p_0"
+private pure func c_binding(id: BindingId) -> String:
+	match binding_role(id):
+		SoleParameter:
+			C_PARAMETER
+		ArmBinding(ordinal):
+			"blorp_b_".append_int(ordinal)
 
 
 private pure func append_integer(output: String, value: Int) -> String:
@@ -32,75 +77,438 @@ private pure func append_integer(output: String, value: Int) -> String:
 			.concat(")")
 
 
-private pure func c_parameters(parameters: ParameterShape) -> String:
+private pure func has_payload(declaration: CheckedUnion) -> Bool:
+	var found = False
+
+	for shape in declaration.variants:
+		match shape:
+			NoPayload:
+				void
+			IntPayload:
+				found = True
+				break
+
+	found
+
+
+private pure func union_c_type(id: UnionId, declaration: CheckedUnion) -> String:
+	prefix = if has_payload(declaration):
+		"struct blorp_u_"
+	else:
+		"enum blorp_u_"
+
+	prefix.append_int(union_number(id))
+
+
+private pure func c_type(
+	type_ref: TypeRef,
+	unions: List[CheckedUnion],
+) -> Result[String, Diagnostic]:
+	match type_ref:
+		IntType:
+			Ok("int64_t")
+		UnionType(id):
+			declaration ?= unions
+				.get(union_number(id))
+				.to_result(internal_error())
+			Ok(union_c_type(id, declaration))
+
+
+private pure func c_variant(id: VariantId) -> String:
+	"blorp_v_"
+		.append_int(union_number(variant_owner(id)))
+		.concat("_")
+		.append_int(variant_number(id))
+
+
+private pure func c_parameters(
+	parameters: ParameterShape,
+	unions: List[CheckedUnion],
+) -> Result[String, Diagnostic]:
 	match parameters:
 		NoParameter:
-			"(void)"
-		IntParameter:
-			"(int64_t "
-				.concat(C_PARAMETER)
-				.concat(")")
+			Ok("(void)")
+		OneParameter(type_ref):
+			type_name ?= c_type(type_ref, unions)
+			Ok(
+				"("
+					.concat(type_name)
+					.concat(" ")
+					.concat(C_PARAMETER)
+					.concat(")"),
+			)
 
 
-pure func emit(program: CheckedProgram) -> String:
+private pure func append_union(output: String, declaration: CheckedUnion, index: Int) -> String:
+	payload = has_payload(declaration)
+
+	prefix = if payload:
+		"enum blorp_tag_"
+	else:
+		"enum blorp_u_"
+
+	var result = output
+		.concat(prefix)
+		.append_int(index)
+		.concat("{")
+	var position: Int = 0
+
+	for shape in declaration.variants:
+		if IntOps.not_equals(position, 0):
+			result = result.concat(",")
+
+		result = result
+			.concat("blorp_v_")
+			.append_int(index)
+			.concat("_")
+			.append_int(position)
+		position = IntOps.add(position, 1)
+
+	result = result.concat("};")
+
+	if payload:
+		result
+			.concat("struct blorp_u_")
+			.append_int(index)
+			.concat("{enum blorp_tag_")
+			.append_int(index)
+			.concat(" tag;int64_t payload;};")
+	else:
+		result
+
+
+private pure func append_base(
+	output: String,
+	base: CheckedBase,
+	unions: List[CheckedUnion],
+) -> Result[String, Diagnostic]:
+	match base:
+		ReturnInteger(value):
+			Ok(append_integer(output, value))
+		ReturnVariant(id):
+			declaration ?= unions
+				.get(union_number(variant_owner(id)))
+				.to_result(internal_error())
+
+			if has_payload(declaration):
+				Ok(
+					output
+						.concat("((")
+						.concat(union_c_type(variant_owner(id), declaration))
+						.concat("){.tag=")
+						.concat(c_variant(id))
+						.concat(",.payload=INT64_C(0)})"),
+				)
+			else:
+				Ok(output.concat(c_variant(id)))
+		ReturnBinding(id):
+			Ok(output.concat(c_binding(id)))
+		ReturnCall(call):
+			Ok(
+				output
+					.concat(c_name(function_number(call.target)))
+					.concat("()"),
+			)
+
+
+private pure func append_operation_open(
+	output: String,
+	operation: CheckedOperation,
+	unions: List[CheckedUnion],
+) -> Result[String, Diagnostic]:
+	match operation:
+		InvokeFunction(call):
+			Ok(
+				output
+					.concat(c_name(function_number(call.target)))
+					.concat("("),
+			)
+		ConstructVariant(id):
+			type_name ?= c_type(UnionType(variant_owner(id)), unions)
+			Ok(
+				output
+					.concat("((")
+					.concat(type_name)
+					.concat("){.tag=")
+					.concat(c_variant(id))
+					.concat(",.payload="),
+			)
+
+
+private pure func append_value(
+	output: String,
+	value: CheckedValue,
+	unions: List[CheckedUnion],
+) -> Result[String, Diagnostic]:
+	var result = output
+	var failure: Option[Diagnostic] = None
+
+	for operation in value.operations.reverse():
+		match append_operation_open(result, operation, unions):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(opened):
+				result = opened
+
+	opened ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+	base_output ?= append_base(opened, value.base, unions)
+	var finished = base_output
+
+	for operation in value.operations:
+		finished = finished.concat(
+			match operation:
+				InvokeFunction(_):
+					")"
+				ConstructVariant(_):
+					"})"
+		)
+
+	Ok(finished)
+
+
+private pure func append_binding(
+	output: String,
+	id: BindingId,
+	type_name: String,
+	value: String,
+) -> String:
+	name = c_binding(id)
+	output
+		.concat("const ")
+		.concat(type_name)
+		.concat(" ")
+		.concat(name)
+		.concat("=")
+		.concat(value)
+		.concat(";(void)")
+		.concat(name)
+		.concat(";")
+
+
+private pure func append_arm(
+	output: String,
+	arm: CheckedArm,
+	final_default: Bool,
+	owner: UnionId,
+	declaration: CheckedUnion,
+	unions: List[CheckedUnion],
+) -> Result[String, Diagnostic]:
+	var result = output
+
+	match arm.pattern:
+		VariantCase(id, _):
+			result = result
+				.concat("case ")
+				.concat(c_variant(id))
+				.concat(":")
+
+			if final_default:
+				result = result.concat("default:")
+		WildcardCase:
+			result = result.concat("default:")
+		BindingCase(_):
+			result = result.concat("default:")
+
+	result = result.concat("{")
+
+	match arm.pattern:
+		VariantCase(_, binding):
+			match binding:
+				BindIntPayload(id):
+					result = append_binding(
+						result,
+						id,
+						"int64_t",
+						C_SCRUTINEE.concat(".payload"),
+					)
+				_:
+					void
+		BindingCase(id):
+			result = append_binding(
+				result,
+				id,
+				union_c_type(owner, declaration),
+				C_SCRUTINEE,
+			)
+		WildcardCase:
+			void
+
+	value ?= append_value(
+		result.concat("return "),
+		arm.body,
+		unions,
+	)
+	Ok(value.concat(";}"))
+
+
+private pure func append_match(
+	output: String,
+	matched: CheckedMatch,
+	unions: List[CheckedUnion],
+) -> Result[String, Diagnostic]:
+	declaration ?= unions
+		.get(union_number(matched.owner))
+		.to_result(internal_error())
+	value ?= append_value(
+		output
+			.concat(union_c_type(matched.owner, declaration))
+			.concat(" ")
+			.concat(C_SCRUTINEE)
+			.concat("="),
+		matched.scrutinee,
+		unions,
+	)
+	var result = value
+		.concat(";switch(")
+		.concat(C_SCRUTINEE)
+
+	if has_payload(declaration):
+		result = result.concat(".tag")
+
+	result = result.concat("){")
+	var has_catch_all = False
+
+	for arm in matched.arms:
+		match arm.pattern:
+			VariantCase(_, _):
+				void
+			_:
+				has_catch_all = True
+
+	var position: Int = 0
+	var failure: Option[Diagnostic] = None
+
+	for arm in matched.arms:
+		final_default = not has_catch_all and IntOps.equals(
+			IntOps.add(position, 1),
+			matched.arms.length(),
+		)
+
+		match append_arm(result, arm, final_default, matched.owner, declaration, unions):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(emitted):
+				result = emitted
+
+		position = IntOps.add(position, 1)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result.concat("}"))
+
+
+private pure func append_signature(
+	output: String,
+	function: CheckedFunction,
+	index: Int,
+	unions: List[CheckedUnion],
+) -> Result[String, Diagnostic]:
+	type_name ?= c_type(function.signature.return_type, unions)
+	parameters ?= c_parameters(function.signature.parameters, unions)
+	Ok(
+		output
+			.concat(type_name)
+			.concat(" ")
+			.concat(c_name(index))
+			.concat(parameters),
+	)
+
+
+private pure func unused_parameter(body: CheckedBody) -> String:
+	match body:
+		CheckedValueBody(value):
+			match value.base:
+				ReturnBinding(id):
+					match binding_role(id):
+						SoleParameter:
+							""
+						ArmBinding(_):
+							"(void)blorp_p_0;"
+				_:
+					"(void)blorp_p_0;"
+		CheckedMatchBody(_):
+			"(void)blorp_p_0;"
+
+
+private pure func append_function(
+	output: String,
+	function: CheckedFunction,
+	index: Int,
+	unions: List[CheckedUnion],
+) -> Result[String, Diagnostic]:
+	header ?= append_signature(output, function, index, unions)
+	var result = header.concat("{")
+
+	match function.signature.parameters:
+		NoParameter:
+			void
+		OneParameter(_):
+			result = result.concat(unused_parameter(function.body))
+
+	match function.body:
+		CheckedValueBody(value):
+			emitted ?= append_value(
+				result.concat("return "),
+				value,
+				unions,
+			)
+			Ok(emitted.concat(";}"))
+		CheckedMatchBody(matched):
+			emitted ?= append_match(result, matched, unions)
+			Ok(emitted.concat("}"))
+
+
+pure func emit(program: CheckedProgram) -> Result[String, Diagnostic]:
 	checked = program.checked_functions()
 	var output: String = "#include <stdint.h>\n"
 	var index: Int = 0
 
-	for function in checked.functions:
-		output = output
-			.concat("int64_t ")
-			.concat(c_name(index))
-			.concat(c_parameters(function.parameters))
-			.concat(";")
+	for declaration in checked.unions:
+		output = append_union(output, declaration, index)
 		index = IntOps.add(index, 1)
 
+	var failure: Option[Diagnostic] = None
 	index = 0
 
 	for function in checked.functions:
-		unused_parameter: String = match function.parameters:
-			NoParameter:
-				""
-			IntParameter:
-				match function.body.base:
-					ReturnParameter:
-						""
-					_:
-						"(void)"
-							.concat(C_PARAMETER)
-							.concat(";")
-
-		output = output
-			.concat("int64_t ")
-			.concat(c_name(index))
-			.concat(c_parameters(function.parameters))
-			.concat("{")
-			.concat(unused_parameter)
-			.concat("return ")
-
-		for call in function.body.unary_calls.reverse():
-			output = output
-				.concat(c_name(function_number(call.target)))
-				.concat("(")
-
-		output = match function.body.base:
-			ReturnInteger(value):
-				append_integer(output, value)
-			ReturnParameter:
-				output.concat(C_PARAMETER)
-			ReturnCall(call):
-				output
-					.concat(c_name(function_number(call.target)))
-					.concat("()")
-
-		for call in function.body.unary_calls:
-			output = output.concat(")")
-
-		output = output.concat(";}")
+		match append_signature(output, function, index, checked.unions):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(signature):
+				output = signature.concat(";")
 
 		index = IntOps.add(index, 1)
 
-	output
-		.concat("int main(void){return (int)")
-		.concat(c_name(function_number(checked.entrypoint)))
-		.concat("();}\n")
+	if not failure.is_some():
+		index = 0
+
+		for function in checked.functions:
+			match append_function(output, function, index, checked.unions):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(function_code):
+					output = function_code
+
+			index = IntOps.add(index, 1)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(
+				output
+					.concat("int main(void){return (int)")
+					.concat(c_name(function_number(checked.entrypoint)))
+					.concat("();}\n"),
+			)
