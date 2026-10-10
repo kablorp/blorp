@@ -15,7 +15,6 @@ import:
 		BindingSyntax(ImmutableBinding, MutableBinding),
 		CallNotation(DirectCall, ReceiverCall),
 		Diagnostic,
-		DiagnosticNote(NoDiagnosticNote),
 		Diagnostics,
 		ExpressionBase(IntegerExpression, NameExpression, DirectApplication),
 		FieldPattern(FieldName, FieldWildcard),
@@ -27,8 +26,6 @@ import:
 		ParsedParameter,
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
 		ParsedUnion,
-		PatternFields(NoPatternFields, OnePatternField),
-		PayloadSyntax(NoPayloadSyntax, OnePayloadSyntax),
 		Purity(Pure, Impure),
 		ReceiverApplication,
 		Span,
@@ -79,14 +76,9 @@ fixed union TypeRef:
 	ParameterType(TypeParameterId)
 
 
-fixed union PayloadShape:
-	NoPayload
-	Payload(TypeUse)
-
-
 fixed record CheckedUnion {
 	type_parameters: TypeParameters,
-	variants: List[PayloadShape]
+	variants: List[Option[TypeUse]]
 }
 
 
@@ -652,15 +644,15 @@ private pure func resolve_payloads(
 	declaration: ParsedUnion,
 	type_parameter: Option[LocalTypeParameter],
 	special: SpecialNames,
-) -> Result[List[PayloadShape], CheckError]:
-	var shapes: List[PayloadShape] = []
+) -> Result[List[Option[TypeUse]], CheckError]:
+	var shapes: List[Option[TypeUse]] = []
 	var failure: Option[CheckError] = None
 
 	for variant in declaration.variants:
 		match variant.payload:
-			NoPayloadSyntax:
-				shapes = shapes.append(NoPayload)
-			OnePayloadSyntax(name):
+			None:
+				shapes = shapes.append(None)
+			Some(name):
 				parameter = match type_parameter:
 					Some(parameter):
 						if same_name(name.id, parameter.name):
@@ -693,7 +685,7 @@ private pure func resolve_payloads(
 
 				match value_result:
 					Ok(value):
-						shapes = shapes.append(Payload({
+						shapes = shapes.append(Some({
 							value_type = value,
 							span = name.span,
 						}))
@@ -1129,7 +1121,7 @@ private pure func function_contract(
 private fixed record VariantContract {
 	variant: VariantId,
 	result_type: TypeRef,
-	payload: PayloadShape
+	payload: Option[TypeUse]
 }
 
 
@@ -1144,31 +1136,23 @@ private pure func type_union_owner(value: TypeRef) -> Option[UnionId]:
 
 
 private pure func occurrence_payload(
-	payload: PayloadShape,
+	payload: Option[TypeUse],
 	parameters: TypeParameters,
 	union_type: TypeRef,
-) -> PayloadShape:
-	match payload:
-		NoPayload:
-			NoPayload
-		Payload(written):
-			match parameters:
-				NoTypeParameter:
+) -> Option[TypeUse]:
+	match parameters:
+		NoTypeParameter:
+			payload
+		OneTypeParameter(parameter):
+			match union_type:
+				AppliedUnionType(_, argument):
+					payload.map(pure func(written):
+						{ written |
+							value_type = substitute_type(written.value_type, parameter, argument)
+						}
+					)
+				_:
 					payload
-				OneTypeParameter(parameter):
-					match union_type:
-						AppliedUnionType(_, argument):
-							Payload(
-								{ written |
-									value_type = substitute_type(
-										written.value_type,
-										parameter,
-										argument,
-									)
-								},
-							)
-						_:
-							payload
 
 
 private pure func find_variant(
@@ -1264,9 +1248,9 @@ private pure func unary_constructor(
 	contract ?= contextual_constructor(name, expected_type, context)
 
 	match contract.payload:
-		NoPayload:
+		None:
 			Err(check_rejection(name.span, PayloadFreeVariantCalled(contract.variant)))
-		Payload(payload):
+		Some(payload):
 			Ok({
 				type_parameters = NoTypeParameter,
 				operation = ConstructVariant(contract.variant),
@@ -1291,14 +1275,14 @@ private pure func constructor_base(
 	contract ?= contextual_constructor(name, expected_type, context)
 
 	match contract.payload:
-		Payload(payload):
+		Some(payload):
 			Err(
 				check_rejection(
 					name.span,
 					MissingConstructorPayload(contract.variant, payload.value_type),
 				),
 			)
-		NoPayload:
+		None:
 			if called:
 				Err(check_rejection(name.span, PayloadFreeVariantCalled(contract.variant)))
 			else:
@@ -1833,32 +1817,32 @@ private pure func bound_pattern(
 
 private pure func resolve_variant_pattern(
 	contract: VariantContract,
-	fields: PatternFields,
+	fields: Option[FieldPattern],
 	span: Span,
 	ordinal: Int,
 	scope: List[LocalBinding],
 ) -> Result[ResolvedPattern, CheckError]:
 	match contract.payload:
-		NoPayload:
+		None:
 			match fields:
-				NoPatternFields:
+				None:
 					Ok({
 						pattern = VariantCase(contract.variant, NoPayloadBinding),
 						scope = scope,
 						binding = None,
 					})
-				OnePatternField(_):
+				Some(_):
 					Err(check_rejection(span, PatternUnexpectedField(contract.variant)))
-		Payload(payload):
+		Some(payload):
 			match fields:
-				NoPatternFields:
+				None:
 					Err(
 						check_rejection(
 							span,
 							PatternMissingField(contract.variant, payload.value_type),
 						),
 					)
-				OnePatternField(field):
+				Some(field):
 					match field:
 						FieldWildcard(_):
 							Ok({
@@ -1903,7 +1887,7 @@ private pure func resolve_pattern(
 
 			match contract:
 				Some(contract):
-					resolve_variant_pattern(contract, NoPatternFields, name.span, ordinal, scope)
+					resolve_variant_pattern(contract, None, name.span, ordinal, scope)
 				None:
 					Ok(
 						bound_pattern(
@@ -2866,7 +2850,7 @@ private pure func invariant_message(invariant: CheckerInvariant) -> String:
 private pure func rendered(span: Span, message: String, help: String) -> Diagnostic:
 	{
 		span = span,
-		note = NoDiagnosticNote,
+		note = None,
 		message = message,
 		help = help
 	}
@@ -3299,9 +3283,9 @@ private pure func missing_variant_name(
 	).to_result(render_fault(span, InvalidParsedName(variant.name.id)))
 
 	match variant.payload:
-		NoPayloadSyntax:
+		None:
 			Ok(name)
-		OnePayloadSyntax(_):
+		Some(_):
 			Ok(name.concat("(_)"))
 
 

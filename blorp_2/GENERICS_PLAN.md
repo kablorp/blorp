@@ -134,7 +134,7 @@ proxies, not self-compilation results. Do not advance the baseline between steps
 ## Progress
 
 - [x] Multiple runtime arguments, one type parameter.
-- [ ] Typed checking errors and direct error-data/renderer tests.
+- [x] Typed checking errors and direct error-data/renderer tests (independent code and test reviews approved).
 - [ ] Multiple function type parameters.
 - [ ] Multiple union type parameters.
 - [ ] Written nested applications.
