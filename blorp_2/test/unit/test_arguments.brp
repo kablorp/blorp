@@ -1,0 +1,868 @@
+import:
+	../../src/check as Checked
+	../../src/lex: lex
+	../../src/lower as Lower
+	../../src/own as Own
+	../../src/parse: parsed_contents
+	../../src/prelude: RuntimeOperation(IntToString)
+	../../src/specialize as Concrete
+	../../src/syntax as Syntax
+	../../src/text: concat
+	../../src/verify: verify
+	input: check, parse
+	ownership_inputs: InputIds, function, input_ids, integer, parameter, runtime, span
+	test: TestSuite
+
+
+private FIRST: String = "pure func first[T](left: T, right: T) -> T:\n\tleft\n"
+
+private SECOND: String = "pure func second[T](left: T, right: T) -> T:\n\tright\n"
+
+private MAIN: String = "func main() -> Int:\n\t0\n"
+
+
+private pure func checked(source: String) -> Result[Checked.CheckedProgram, Syntax.Diagnostic]:
+	tokens ?= lex(source)
+	parsed ?= parse(tokens)
+	check(parsed)
+
+
+private pure func lowered(source: String) -> Result[Lower.LoweredFunctions, Syntax.Diagnostic]:
+	program ?= checked(source)
+	concrete ?= Concrete.specialize(program)
+	lowered ?= Lower.lower(concrete)
+	Ok(Lower.lowered_functions(lowered))
+
+
+private pure func rejects(
+	prefix: String,
+	marked: String,
+	suffix: String,
+	message: String,
+	help: String,
+) -> Bool:
+	match (
+		checked(
+			prefix
+				.concat(marked)
+				.concat(suffix),
+		)
+	):
+		Err(error):
+			(
+				error.span.start == prefix.length()
+				and error.span.end == prefix.length() + marked.length()
+				and error.message == message
+				and error.help == help
+			)
+		Ok(_):
+			False
+
+
+pure func test_recursive_arguments_and_receiver_preserve_source_order() -> Bool:
+	match lex(
+		FIRST + "func main() -> Int:\n\tfirst(1, first(2, 3)).first(4)\n",
+	).and_then(
+		pure func(tokens): parse(tokens),
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			match parsed_contents(parsed).functions:
+				[_, main]:
+					match main.body:
+						Syntax.ParsedValueBody(value):
+							match value.base:
+								Syntax.DirectApplication(_, [first, nested]):
+									match first.base:
+										Syntax.IntegerExpression(1):
+											match nested.base:
+												Syntax.DirectApplication(_, [second, third]):
+													match value.applications:
+														[receiver]:
+															match receiver.arguments:
+																[fourth]:
+																	match second.base:
+																		Syntax.IntegerExpression(2):
+																			match third.base:
+																				Syntax.IntegerExpression(3):
+																					match fourth.base:
+																						Syntax.IntegerExpression(4):
+																							True
+																						_:
+																							False
+																				_:
+																					False
+																		_:
+																			False
+																_:
+																	False
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_parameter_bindings_have_distinct_explicit_positions() -> Bool:
+	match checked(SECOND + MAIN):
+		Err(_):
+			False
+		Ok(program):
+			match Checked.checked_functions(program).functions:
+				[helper, _]:
+					match helper.bindings:
+						[first, second]:
+							match first.origin:
+								Checked.ParameterBinding(0):
+									match second.origin:
+										Checked.ParameterBinding(1):
+											match helper.body:
+												Checked.CheckedValueBody(value):
+													match value.base:
+														Checked.ReturnBinding(id):
+															Checked.binding_number(id) == 1
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_later_parameter_infers_the_single_type_argument() -> Bool:
+	checked(
+		"pure func later[T](ignored: Int, value: T) -> T:\n\tvalue\nfunc main() -> Int:\n\tlater(0, 42)\n",
+	).is_ok()
+
+
+pure func test_repeated_structural_parameter_infers_consistently() -> Bool:
+	checked(
+		"fixed union Box[T]:\n\tValue(T)\npure func box() -> Box[Int]:\n\tValue(7)\npure func first[T](left: Box[T], right: Box[T]) -> Box[T]:\n\tleft\nfunc main() -> Int:\n\tunused = first(box(), box())\n\t0\n",
+	).is_ok()
+
+
+pure func test_inconsistent_argument_reports_the_disagreeing_occurrence() -> Bool:
+	rejects(
+		FIRST + "func main() -> Int:\n\tfirst(7, ",
+		"9.to_string()",
+		")\n",
+		"argument type does not match the parameter type",
+		"use an expression of type Int here",
+	)
+
+
+pure func test_concrete_argument_does_not_hide_later_uninferable_type() -> Bool:
+	rejects(
+		"pure func unused[T](first: Int, second: Int) -> Int:\n\tfirst\nfunc main() -> Int:\n\t",
+		"unused",
+		"(7, 9)\n",
+		"cannot infer the type parameter from the argument",
+		(
+			"pass a value whose type determines the declared type parameter; use a concrete "
+			+ "helper when no argument can determine it"
+		),
+	)
+
+
+pure func test_duplicate_parameter_reports_the_second_declaration() -> Bool:
+	rejects(
+		"pure func bad(first: Int, ",
+		"first",
+		": Int) -> Int:\n\tfirst\n" + MAIN,
+		"duplicate parameter name",
+		"give each parameter a distinct name",
+	)
+
+
+pure func test_wrong_argument_count_reports_the_callee() -> Bool:
+	rejects(
+		FIRST + "func main() -> Int:\n\t",
+		"first",
+		"(7)\n",
+		"argument count does not match the function parameters",
+		(
+			"pass one expression for each declared parameter; UFCS supplies the receiver "
+			+ "first"
+		),
+	)
+
+
+pure func test_hidden_second_argument_cycle_is_rejected() -> Bool:
+	rejects(
+		FIRST + "func main() -> Int:\n\tfirst(7, ",
+		"main",
+		"())\n",
+		"call chain contains recursion",
+		"use an acyclic call chain; recursion is not supported in this increment",
+	)
+
+
+pure func test_all_arguments_lower_before_the_call() -> Bool:
+	match lowered(
+		"pure func choose(first: Int, second: Int, third: Int) -> Int:\n\tsecond\nfunc main() -> Int:\n\tchoose(7, 9, 42)\n",
+	):
+		Err(_):
+			False
+		Ok(program):
+			match program.functions:
+				[helper, main]:
+					match helper.definitions:
+						[first, second, third]:
+							match main.definitions:
+								[seven, nine, answer, call]:
+									match call.operation:
+										Lower.CallValue(_, [left, middle, right]):
+											(
+												Lower.value_number(first.id) == 0
+												and Lower.value_number(second.id) == 1
+												and Lower.value_number(third.id) == 2
+												and Lower.value_number(
+													left,
+												) == Lower.value_number(seven.id)
+												and Lower.value_number(
+													middle,
+												) == Lower.value_number(nine.id)
+												and Lower.value_number(
+													right,
+												) == Lower.value_number(answer.id)
+												and Lower.value_number(call.id) == 3
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+private pure func returning_second(ids: InputIds) -> Own.OwnedFunction:
+	{
+		signature = {
+			purity = Syntax.Pure,
+			parameters = [Concrete.StringType, Concrete.StringType],
+			return_type = Concrete.StringType
+		},
+		operations = [
+			Own.DefineValue({
+				id = ids.first,
+				value_type = Concrete.StringType,
+				operation = Own.ParameterDefinition(0),
+				result = Own.BorrowedResult,
+				span = span(10),
+			}),
+			Own.DefineValue({
+				id = ids.second,
+				value_type = Concrete.StringType,
+				operation = Own.ParameterDefinition(1),
+				result = Own.BorrowedResult,
+				span = span(20),
+			}),
+			Own.AcquireOwner(
+				Own.owner_id(0),
+				{
+					value = ids.second,
+					source = Own.ParameterBorrow(ids.second)
+				},
+				span(30),
+			),
+		],
+		tail = Own.ReturnTail(Own.OwnedReturn(ids.second, Own.owner_id(0)))
+	}
+
+
+private pure func standalone(ids: InputIds, helper: Own.OwnedFunction) -> Own.OwnershipProgram:
+	{
+		unions = [],
+		functions = [
+			helper,
+			{
+				signature = {
+					purity = Syntax.Pure,
+					parameters = [],
+					return_type = Concrete.IntType
+				},
+				operations = [Own.DefineValue({
+						id = ids.first,
+						value_type = Concrete.IntType,
+						operation = Own.IntegerDefinition(0),
+						result = Own.UnmanagedResult,
+						span = span(40),
+					})],
+				tail = Own.ReturnTail(Own.UnmanagedReturn(ids.first))
+			},
+		],
+		entrypoint = ids.second_function
+	}
+
+
+pure func test_ownership_acquires_the_exact_second_parameter() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			direct = function(
+				[
+					parameter(ids.first, Concrete.StringType),
+					{ parameter(ids.second, Concrete.StringType) |
+						operation = Lower.ParameterValue(1)
+					},
+				],
+				ids.second,
+				[Concrete.StringType, Concrete.StringType],
+				Concrete.StringType,
+			)
+
+			match Own.insert_function(direct, []):
+				Err(_):
+					False
+				Ok(owned):
+					match owned.operations:
+						[_, _, Own.AcquireOwner(_, borrow, _)]:
+							match borrow.source:
+								Own.ParameterBorrow(source):
+									(
+										Lower.value_number(source) == 1
+										and Lower.value_number(borrow.value) == 1
+									)
+								_:
+									False
+						_:
+							False
+
+
+pure func test_repeated_owned_argument_drops_only_after_the_call() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			direct = function(
+				[
+					integer(ids.first, 7, 10),
+					runtime(ids.second, IntToString, [ids.first], Concrete.StringType, 20),
+					{
+						id = ids.third,
+						value_type = Concrete.IntType,
+						operation = Lower.CallValue(
+							{
+								target = Concrete.UserFunction(ids.entrypoint),
+								span = span(30)
+							},
+							[ids.second, ids.second],
+						),
+						span = span(30)
+					},
+				],
+				ids.third,
+				[],
+				Concrete.IntType,
+			)
+
+			match Own.insert_function(direct, []):
+				Err(_):
+					False
+				Ok(owned):
+					match owned.operations:
+						[_, _, Own.DefineValue(call), Own.DropOwner(owner, _)]:
+							match call.operation:
+								Own.CallDefinition(_, [Own.BorrowedArgument(first), Own.BorrowedArgument(second)]):
+									(
+										Lower.value_number(first.value) == 1
+										and Lower.value_number(second.value) == 1
+										and Own.owner_number(owner) == 0
+									)
+								_:
+									False
+						_:
+							False
+
+
+pure func test_verifier_accepts_second_parameter_provenance() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			verify(standalone(ids, returning_second(ids))).is_ok()
+
+
+pure func test_verifier_rejects_swapped_same_typed_parameter_provenance() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			helper = returning_second(ids)
+			changed = { helper | operations = helper.operations
+					.take(2)
+					.append(
+						Own.AcquireOwner(
+							Own.owner_id(0),
+							{
+								value = ids.second,
+								source = Own.ParameterBorrow(ids.first)
+							},
+							span(30),
+						),
+					) }
+
+			match verify(standalone(ids, changed)):
+				Err(error):
+					error.span.start == 30 and error.message == (
+						"ownership verification failed: parameter borrow does not refer to the borrowed "
+						+ "String parameter"
+					)
+				Ok(_):
+					False
+
+
+pure func test_verifier_rejects_duplicate_parameter_position() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			helper = returning_second(ids)
+			changed = { helper | operations = [Own.DefineValue({
+						id = ids.first,
+						value_type = Concrete.StringType,
+						operation = Own.ParameterDefinition(0),
+						result = Own.BorrowedResult,
+						span = span(10),
+					}), Own.DefineValue({
+						id = ids.second,
+						value_type = Concrete.StringType,
+						operation = Own.ParameterDefinition(0),
+						result = Own.BorrowedResult,
+						span = span(20),
+					})] }
+
+			match verify(standalone(ids, changed)):
+				Err(error):
+					(
+						error.span.start == 20
+						and error.message == "ownership verification failed: function parameter is defined more than once"
+					)
+				Ok(_):
+					False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 multiple runtime arguments",
+	tests = [
+		(
+			"distinct arguments remain live through call",
+			test_distinct_arguments_remain_live_through_call,
+		),
+		(
+			"later invalid argument is rejected by liveness",
+			test_liveness_rejects_invalid_later_argument,
+		),
+		(
+			"verifier rejects another parameter's owner",
+			test_verifier_rejects_second_parameter_with_first_values_owner,
+		),
+		(
+			"specialization translates every parameter",
+			test_specialization_translates_every_parameter_type,
+		),
+		(
+			"nested arguments lower left to right",
+			test_nested_arguments_lower_in_left_to_right_order,
+		),
+		("verifier rejects missing parameter", test_verifier_rejects_missing_parameter_position),
+		(
+			"verifier rejects out of order parameter",
+			test_verifier_rejects_out_of_order_parameter_position,
+		),
+		(
+			"verifier rejects swapped heterogeneous arguments",
+			test_verifier_rejects_swapped_heterogeneous_arguments,
+		),
+		(
+			"recursive arguments and receiver preserve source order",
+			test_recursive_arguments_and_receiver_preserve_source_order,
+		),
+		(
+			"parameter bindings have distinct explicit positions",
+			test_parameter_bindings_have_distinct_explicit_positions,
+		),
+		(
+			"later parameter infers type argument",
+			test_later_parameter_infers_the_single_type_argument,
+		),
+		(
+			"repeated structural parameter infers consistently",
+			test_repeated_structural_parameter_infers_consistently,
+		),
+		(
+			"disagreeing occurrence has precise diagnostic",
+			test_inconsistent_argument_reports_the_disagreeing_occurrence,
+		),
+		(
+			"concrete argument cannot infer unused type parameter",
+			test_concrete_argument_does_not_hide_later_uninferable_type,
+		),
+		(
+			"duplicate parameter reports second declaration",
+			test_duplicate_parameter_reports_the_second_declaration,
+		),
+		("wrong argument count reports callee", test_wrong_argument_count_reports_the_callee),
+		("hidden second argument cycle rejects", test_hidden_second_argument_cycle_is_rejected),
+		("all arguments lower before the call", test_all_arguments_lower_before_the_call),
+		(
+			"ownership acquires exact second parameter",
+			test_ownership_acquires_the_exact_second_parameter,
+		),
+		(
+			"repeated owned argument drops after call",
+			test_repeated_owned_argument_drops_only_after_the_call,
+		),
+		(
+			"verifier accepts second parameter provenance",
+			test_verifier_accepts_second_parameter_provenance,
+		),
+		(
+			"verifier rejects swapped parameter provenance",
+			test_verifier_rejects_swapped_same_typed_parameter_provenance,
+		),
+		(
+			"verifier rejects duplicate parameter position",
+			test_verifier_rejects_duplicate_parameter_position,
+		),
+	]
+}
+
+
+pure func test_specialization_translates_every_parameter_type() -> Bool:
+	match checked(
+		FIRST + "func main() -> Int:\n\tinteger = first(7, 9)\n\ttext = first(integer.to_string(), 123.to_string())\n\ttext.length()\n",
+	).and_then(
+		pure func(program): Concrete.specialize(program),
+	):
+		Err(_):
+			False
+		Ok(program):
+			match Concrete.specialized_contents(program).functions:
+				[_, integer, text]:
+					match integer.signature.parameters:
+						[Concrete.IntType, Concrete.IntType]:
+							match text.signature.parameters:
+								[Concrete.StringType, Concrete.StringType]:
+									True
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_nested_arguments_lower_in_left_to_right_order() -> Bool:
+	match lowered(
+		"pure func first(value: Int) -> Int:\n\tvalue\npure func second(value: Int) -> Int:\n\tvalue\npure func third(value: Int) -> Int:\n\tvalue\npure func choose(first: Int, second: Int, third: Int) -> Int:\n\tsecond\nfunc main() -> Int:\n\tchoose(7.first(), 9.second(), 42.third())\n",
+	):
+		Err(_):
+			False
+		Ok(program):
+			match program.functions:
+				[_, _, _, _, main]:
+					match main.definitions:
+						[_, first, _, second, _, third, call]:
+							match first.operation:
+								Lower.CallValue(first_call, [_]):
+									match second.operation:
+										Lower.CallValue(second_call, [_]):
+											match third.operation:
+												Lower.CallValue(third_call, [_]):
+													match call.operation:
+														Lower.CallValue(_, [left, middle, right]):
+															match first_call.target:
+																Concrete.UserFunction(first_id):
+																	match second_call.target:
+																		Concrete.UserFunction(second_id):
+																			match third_call.target:
+																				Concrete.UserFunction(third_id):
+																					(
+																						Concrete.function_number(
+																							first_id,
+																						) == 0
+																						and Concrete.function_number(
+																							second_id,
+																						) == 1
+																						and Concrete.function_number(
+																							third_id,
+																						) == 2
+																						and Lower.value_number(
+																							left,
+																						) == 1
+																						and Lower.value_number(
+																							middle,
+																						) == 3
+																						and Lower.value_number(
+																							right,
+																						) == 5
+																					)
+																				_:
+																					False
+																		_:
+																			False
+																_:
+																	False
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_verifier_rejects_missing_parameter_position() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			helper = returning_second(ids)
+			changed = { helper |
+				operations = helper.operations.take(1),
+				tail = Own.ReturnTail(Own.OwnedReturn(ids.first, Own.owner_id(0)))
+			}
+
+			match verify(standalone(ids, changed)):
+				Err(error):
+					error.message == "ownership verification failed: function parameter has no value definition"
+				Ok(_):
+					False
+
+
+pure func test_verifier_rejects_out_of_order_parameter_position() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			helper = returning_second(ids)
+			changed = { helper | operations = [Own.DefineValue({
+						id = ids.first,
+						value_type = Concrete.StringType,
+						operation = Own.ParameterDefinition(1),
+						result = Own.BorrowedResult,
+						span = span(10),
+					})] }
+
+			match verify(standalone(ids, changed)):
+				Err(error):
+					error.span.start == 10 and error.message == (
+						"ownership verification failed: function parameter position is not the next "
+						+ "signature position"
+					)
+				Ok(_):
+					False
+
+
+pure func test_verifier_rejects_swapped_heterogeneous_arguments() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			helper: Own.OwnedFunction = {
+				signature = {
+					purity = Syntax.Pure,
+					parameters = [Concrete.IntType, Concrete.StringType],
+					return_type = Concrete.IntType
+				},
+				operations = [Own.DefineValue({
+						id = ids.first,
+						value_type = Concrete.IntType,
+						operation = Own.ParameterDefinition(0),
+						result = Own.UnmanagedResult,
+						span = span(10),
+					}), Own.DefineValue({
+						id = ids.second,
+						value_type = Concrete.StringType,
+						operation = Own.ParameterDefinition(1),
+						result = Own.BorrowedResult,
+						span = span(20),
+					})],
+				tail = Own.ReturnTail(Own.UnmanagedReturn(ids.first))
+			}
+			caller: Own.OwnedFunction = {
+				signature = {
+					purity = Syntax.Pure,
+					parameters = [],
+					return_type = Concrete.IntType
+				},
+				operations = [
+					Own.DefineValue({
+						id = ids.first,
+						value_type = Concrete.IntType,
+						operation = Own.IntegerDefinition(7),
+						result = Own.UnmanagedResult,
+						span = span(30),
+					}),
+					Own.DefineValue({
+						id = ids.second,
+						value_type = Concrete.StringType,
+						operation = Own.CallDefinition(
+							{
+								target = Concrete.RuntimeFunction(IntToString),
+								span = span(40)
+							},
+							[Own.UnmanagedArgument(ids.first)],
+						),
+						result = Own.OwnedResult(Own.owner_id(0)),
+						span = span(40),
+					}),
+					Own.DefineValue({
+						id = ids.third,
+						value_type = Concrete.IntType,
+						operation = Own.CallDefinition(
+							{
+								target = Concrete.UserFunction(ids.entrypoint),
+								span = span(50)
+							},
+							[Own.BorrowedArgument({
+									value = ids.second,
+									source = Own.OwnerBorrow(Own.owner_id(0)),
+								}), Own.UnmanagedArgument(ids.first)],
+						),
+						result = Own.UnmanagedResult,
+						span = span(50),
+					}),
+					Own.DropOwner(
+						Own.owner_id(0),
+						span(60),
+					),
+				],
+				tail = Own.ReturnTail(Own.UnmanagedReturn(ids.third))
+			}
+
+			match (
+				verify({
+					unions = [],
+					functions = [helper, caller],
+					entrypoint = ids.second_function,
+				})
+			):
+				Err(error):
+					(
+						error.span.start == 50
+						and error.message == "ownership verification failed: call argument type does not match its contract"
+					)
+				Ok(_):
+					False
+
+
+pure func test_verifier_rejects_second_parameter_with_first_values_owner() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			helper = returning_second(ids)
+			changed = { helper |
+				operations = helper.operations
+					.take(2)
+					.concat([
+						Own.AcquireOwner(
+							Own.owner_id(0),
+							{
+								value = ids.first,
+								source = Own.ParameterBorrow(ids.first)
+							},
+							span(30),
+						),
+						Own.AcquireOwner(
+							Own.owner_id(1),
+							{
+								value = ids.second,
+								source = Own.OwnerBorrow(Own.owner_id(0))
+							},
+							span(40),
+						),
+					]),
+				tail = Own.ReturnTail(Own.OwnedReturn(ids.second, Own.owner_id(1)))
+			}
+
+			match verify(standalone(ids, changed)):
+				Err(error):
+					(
+						error.span.start == 40
+						and error.message == "ownership verification failed: owner 0 does not own value 1"
+					)
+				Ok(_):
+					False
+
+
+private pure func distinct_argument_definitions(
+	ids: InputIds,
+	later: Lower.ValueId,
+) -> List[Lower.ValueDefinition]:
+	[
+		integer(ids.first, 7, 10),
+		runtime(ids.second, IntToString, [ids.first], Concrete.StringType, 20),
+		runtime(ids.third, IntToString, [ids.first], Concrete.StringType, 30),
+		{
+			id = ids.fourth,
+			value_type = Concrete.IntType,
+			operation = Lower.CallValue(
+				{
+					target = Concrete.UserFunction(ids.entrypoint),
+					span = span(40)
+				},
+				[ids.second, later],
+			),
+			span = span(40)
+		},
+	]
+
+
+pure func test_distinct_arguments_remain_live_through_call() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match Own.last_uses(
+				distinct_argument_definitions(ids, ids.third),
+				ids.fourth,
+			):
+				Ok(uses):
+					uses == [Some(2), Some(3), Some(3), Some(4)]
+				Err(_):
+					False
+
+
+pure func test_liveness_rejects_invalid_later_argument() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match Own.block_last_uses(
+				distinct_argument_definitions(ids, ids.fifth),
+				ids.fourth,
+				0,
+				0,
+			):
+				Err(error):
+					(
+						error.span.start == 40
+						and error.message == "internal compiler error: invalid value identity in ownership use analysis"
+					)
+				Ok(_):
+					False

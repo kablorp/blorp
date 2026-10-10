@@ -12,16 +12,16 @@ import:
 		DECIMAL_DIGITS,
 		Diagnostic,
 		DiagnosticNote(NoDiagnosticNote),
-		ExpressionBase(IntegerExpression, NameExpression, ZeroArgumentApplication),
+		ExpressionBase(IntegerExpression, NameExpression, DirectApplication),
 		FieldPattern(FieldName, FieldWildcard),
 		FunctionHeader,
 		LexedProgram,
-		ParameterList(EmptyParameters, SingleParameter),
 		ParsedBinding,
 		ParsedBody(ParsedValueBody, ParsedMatchBody),
 		ParsedBuiltinType(IntegerBuiltin, StringBuiltin),
 		ParsedFunction,
 		ParsedMatchArm,
+		ParsedParameter,
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
 		ParsedPrelude,
 		ParsedRuntimeFunction,
@@ -31,15 +31,15 @@ import:
 		PatternFields(NoPatternFields, OnePatternField),
 		PayloadSyntax(NoPayloadSyntax, OnePayloadSyntax),
 		Purity(Pure, Impure),
+		ReceiverApplication,
 		Span,
 		Symbol(
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
-			Colon, Newline, VarKeyword, Equals, LeftBracket, RightBracket,
+			Colon, Newline, VarKeyword, Equals, LeftBracket, RightBracket, Comma,
 		),
 		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, BuiltinLabel, Indentation),
 		TypeParameterSyntax(NoTypeParameterSyntax, OneTypeParameterSyntax),
 		TypeSyntax(AtomicType, AppliedType),
-		UnaryApplication,
 		ValueExpression,
 		WrittenName,
 	text as Text
@@ -137,6 +137,12 @@ private pure func symbol_matches(actual: Symbol, expected: Symbol) -> Bool:
 		RightBracket:
 			match expected:
 				RightBracket:
+					True
+				_:
+					False
+		Comma:
+			match expected:
+				Comma:
 					True
 				_:
 					False
@@ -247,14 +253,9 @@ private fixed record ParsedValue {
 
 
 private fixed record ParsedParameters {
-	parameters: ParameterList,
+	parameters: List[ParsedParameter],
 	next: ParserState
 }
-
-
-private fixed union ExpressionStep:
-	ReadBase(ExpressionBase, Span, ParserState)
-	OpenedCall(WrittenName, ParserState)
 
 
 private fixed record FunctionResult {
@@ -417,215 +418,176 @@ private pure func reject_function_type_arguments(state: ParserState) -> Result[V
 		Ok(void)
 
 
-private pure func consume_expression_step(state: ParserState) -> Result[ExpressionStep, Diagnostic]:
-	match state.input.tokens.get(state.position):
-		Some(token):
-			after_token: ParserState = { state | position = IntOps.add(state.position, 1) }
-
-			match token.kind:
-				IntegerLiteral(spelling):
-					value ?= integer_value(spelling, token.span)
-					Ok(ReadBase(IntegerExpression(value), token.span, after_token))
-				BuiltinLabel(_):
-					Err(
-						expected(
-							state,
-							"quoted builtin labels are only allowed in the prelude",
-							"call a String-producing prelude function; String literals are not supported yet",
-						),
-					)
-				IdentifierToken(spelling):
-					names = intern_name(state.names, spelling)
-
-					match find_name(names, spelling):
-						None:
-							Err(
-								expected(
-									state,
-									"invalid parsed name identity",
-									"report this compiler error with the input program",
-								),
-							)
-						Some(id):
-							next: ParserState = { after_token | names = names }
-							name: WrittenName = {
-								id = id,
-								span = token.span
-							}
-							implicit_arguments ?= reject_function_type_arguments(next)
-
-							if not at_symbol(next, LeftParen):
-								Ok(ReadBase(NameExpression(name), token.span, next))
-							else:
-								opened: ParserState = { next |
-									position = IntOps.add(next.position, 1)
-								}
-
-								if at_symbol(opened, RightParen):
-									Ok(
-										ReadBase(
-											ZeroArgumentApplication(name),
-											token.span,
-											{ opened | position = IntOps.add(opened.position, 1) },
-										),
-									)
-								else:
-									Ok(OpenedCall(name, opened))
-				_:
-					Err(
-						expected(
-							state,
-							"expected a return expression",
-							"use a literal, a parameter or variant name, or a call as the entire body",
-						),
-					)
-		None:
-			Err(
-				expected(
-					state,
-					"expected a return expression",
-					"use a literal, a parameter or variant name, or a call as the entire body",
-				),
-			)
-
-
-private fixed record ParsedUnaryApplication {
-	call: UnaryApplication,
+private fixed record ParsedArguments {
+	arguments: List[ValueExpression],
 	next: ParserState
 }
 
 
-private pure func consume_receiver_call(
-	after_dot: ParserState,
-) -> Result[ParsedUnaryApplication, Diagnostic]:
-	name ?= consume_name(after_dot, "expected a function name after '.'")
-	implicit_arguments ?= reject_function_type_arguments(name.next)
-	after_open ?= consume_symbol(
-		name.next,
-		LeftParen,
-		"expected '(' after the UFCS function name",
-		"write receiver.function()",
-	)
+private pure func consume_arguments(start: ParserState) -> Result[ParsedArguments, Diagnostic]:
+	var state = start
+	var arguments: List[ValueExpression] = []
+	var failure: Option[Diagnostic] = None
+
+	if not at_symbol(state, RightParen):
+		while True:
+			match consume_value(state):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(value):
+					arguments = arguments.append(value.body)
+					state = value.next
+
+			if not at_symbol(state, Comma):
+				break
+
+			state = { state | position = IntOps.add(state.position, 1) }
+
+	ready ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
 	closed ?= consume_symbol(
-		after_open,
+		state,
 		RightParen,
-		"UFCS calls take no explicit arguments",
-		"the receiver supplies the single argument; write receiver.function()",
+		"expected ')' after the call arguments",
+		"separate complete expressions with commas, then close the call with ')'",
 	)
 	Ok({
-		call = {
-			callee = name.name,
-			notation = ReceiverCall
-		},
+		arguments = arguments,
 		next = closed,
 	})
 
 
 private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagnostic]:
-	var state: ParserState = start
-	var pending: List[WrittenName] = []
-	var base: Option[ExpressionBase] = None
-	var base_span: Span = start.input.end
+	token ?= start.input.tokens
+		.get(start.position)
+		.to_result(
+			expected(
+				start,
+				"expected a return expression",
+				"use a literal, a parameter or variant name, or a call as the entire body",
+			),
+		)
+	after_token = { start | position = IntOps.add(start.position, 1) }
+
+	base_result: Result[ParsedValue, Diagnostic] = match token.kind:
+		IntegerLiteral(spelling):
+			integer ?= integer_value(spelling, token.span)
+			Ok({
+				body = {
+					base = IntegerExpression(integer),
+					base_span = token.span,
+					applications = [],
+					span = token.span
+				},
+				next = after_token,
+			})
+		IdentifierToken(_):
+			name ?= consume_name(start, "expected a value name")
+			implicit_arguments ?= reject_function_type_arguments(name.next)
+
+			if at_symbol(name.next, LeftParen):
+				arguments ?= consume_arguments(
+					{ name.next | position = IntOps.add(name.next.position, 1) },
+				)
+				Ok({
+					body = {
+						base = DirectApplication(name.name, arguments.arguments),
+						base_span = token.span,
+						applications = [],
+						span = token.span
+					},
+					next = arguments.next,
+				})
+			else:
+				Ok({
+					body = {
+						base = NameExpression(name.name),
+						base_span = token.span,
+						applications = [],
+						span = token.span
+					},
+					next = name.next,
+				})
+		BuiltinLabel(_):
+			Err(
+				expected(
+					start,
+					"quoted builtin labels are only allowed in the prelude",
+					"call a String-producing prelude function; String literals are not supported yet",
+				),
+			)
+		_:
+			Err(
+				expected(
+					start,
+					"expected a return expression",
+					"use a literal, a parameter or variant name, or a call as the entire body",
+				),
+			)
+
+	parsed ?= base_result
+	var state = parsed.next
+	var applications: List[ReceiverApplication] = []
 	var failure: Option[Diagnostic] = None
 
-	while not base.is_some():
-		match consume_expression_step(state):
+	while at_symbol(state, Dot):
+		name_result = consume_name(
+			{ state | position = IntOps.add(state.position, 1) },
+			"expected a function name after '.'",
+		)
+
+		result: Result[ParsedArguments, Diagnostic] = match name_result:
+			Err(error):
+				Err(error)
+			Ok(name):
+				consume_receiver_arguments(name)
+
+		match result:
 			Err(error):
 				failure = Some(error)
 				break
-			Ok(ReadBase(value, span, next)):
-				base_span = span
-				base = Some(value)
-				state = next
-			Ok(OpenedCall(name, next)):
-				pending = pending.append(name)
-				state = next
+			Ok(arguments):
+				match name_result:
+					Ok(name):
+						applications = applications.append({
+							callee = name.name,
+							arguments = arguments.arguments,
+						})
+					Err(_):
+						void
 
-	value ?= match base:
-		Some(value):
-			Ok(value)
-		None:
-			error: Diagnostic = match failure:
-				Some(error):
-					error
-				None:
-					expected(
-						state,
-						"invalid parser expression state",
-						"report this compiler error with the input program",
-					)
+				state = arguments.next
 
-			Err(error)
-
-	closers: List[WrittenName] = pending.reverse()
-	var next_closer: Int = 0
-	var calls: List[UnaryApplication] = []
-
-	while True:
-		if at_symbol(state, Dot):
-			match consume_receiver_call({ state | position = IntOps.add(state.position, 1) }):
-				Err(error):
-					failure = Some(error)
-					break
-				Ok(parsed):
-					calls = calls.append(parsed.call)
-					state = parsed.next
-		else:
-			match closers.get(next_closer):
-				None:
-					break
-				Some(call):
-					match consume_symbol(
-						state,
-						RightParen,
-						"expected ')' after the call argument",
-						"pass at most one complete expression, then close the call with ')'",
-					):
-						Err(error):
-							failure = Some(error)
-							break
-						Ok(next):
-							calls = calls.append({
-								callee = call,
-								notation = DirectCall,
-							})
-							next_closer = IntOps.add(next_closer, 1)
-							state = next
-
-	match failure:
+	ready ?= match failure:
 		Some(error):
 			Err(error)
 		None:
-			first ?= start.input.tokens
-				.get(start.position)
-				.to_result(
-					expected(
-						start,
-						"invalid expression span",
-						"report this compiler error with the input program",
-					),
-				)
-			last ?= state.input.tokens
-				.get(IntOps.subtract(state.position, 1))
-				.to_result(
-					expected(
-						state,
-						"invalid expression span",
-						"report this compiler error with the input program",
-					),
-				)
-			Ok({
-				body = {
-					base = value,
-					base_span = base_span,
-					applications = calls,
-					span = {
-						start = first.span.start,
-						end = last.span.end
-					}
-				},
-				next = state,
-			})
+			Ok(void)
+
+	last ?= state.input.tokens
+		.get(IntOps.subtract(state.position, 1))
+		.to_result(
+			expected(
+				state,
+				"invalid expression span",
+				"report this compiler error with the input program",
+			),
+		)
+	Ok({
+		body = { parsed.body |
+			applications = applications,
+			span = {
+				start = token.span.start,
+				end = last.span.end
+			}
+		},
+		next = state,
+	})
 
 
 private fixed record ParsedType {
@@ -692,34 +654,51 @@ private pure func consume_type(
 		})
 
 
-private pure func consume_parameters(state: ParserState) -> Result[ParsedParameters, Diagnostic]:
-	if at_symbol(state, RightParen):
-		Ok({
-			parameters = EmptyParameters,
-			next = { state | position = IntOps.add(state.position, 1) },
-		})
-	else:
-		name ?= consume_name(state, "expected a parameter name or ')'")
-		after_colon ?= consume_symbol(
-			name.next,
-			Colon,
-			"expected ':' after the parameter name",
-			"write a single parameter as name: Int",
-		)
-		type_name ?= consume_type(after_colon, "expected a parameter type")
-		closed ?= consume_symbol(
-			type_name.next,
-			RightParen,
-			"expected ')' after the parameter",
-			"declare at most one parameter with an explicit type",
-		)
-		Ok({
-			parameters = SingleParameter({
-				name = name.name,
-				type_name = type_name.written,
-			}),
-			next = closed,
-		})
+private pure func consume_parameters(start: ParserState) -> Result[ParsedParameters, Diagnostic]:
+	var state = start
+	var parameters: List[ParsedParameter] = []
+	var failure: Option[Diagnostic] = None
+
+	if not at_symbol(state, RightParen):
+		while True:
+			result: Result[ParsedParameterResult, Diagnostic] = match consume_name(
+				state,
+				"expected a parameter name or ')'",
+			):
+				Err(error):
+					Err(error)
+				Ok(name):
+					consume_parameter_type(name)
+
+			match result:
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(next):
+					parameters = parameters.append(next.parameter)
+					state = next.next
+
+			if not at_symbol(state, Comma):
+				break
+
+			state = { state | position = IntOps.add(state.position, 1) }
+
+	ready ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	closed ?= consume_symbol(
+		state,
+		RightParen,
+		"expected ')' after the parameters",
+		"separate explicitly typed parameters with commas, then close with ')'",
+	)
+	Ok({
+		parameters = parameters,
+		next = closed,
+	})
 
 
 private fixed record PatternResult {
@@ -1658,3 +1637,41 @@ pure func parse(input: LexedProgram, prelude: CheckedPrelude) -> Result[ParsedPr
 						unions = unions,
 						end = input.end
 					}))
+
+
+private pure func consume_receiver_arguments(
+	name: ParsedName,
+) -> Result[ParsedArguments, Diagnostic]:
+	implicit_arguments ?= reject_function_type_arguments(name.next)
+	opened ?= consume_symbol(
+		name.next,
+		LeftParen,
+		"expected '(' after the UFCS function name",
+		"write receiver.function(arguments)",
+	)
+	consume_arguments(opened)
+
+
+private fixed record ParsedParameterResult {
+	parameter: ParsedParameter,
+	next: ParserState
+}
+
+
+private pure func consume_parameter_type(
+	name: ParsedName,
+) -> Result[ParsedParameterResult, Diagnostic]:
+	after_colon ?= consume_symbol(
+		name.next,
+		Colon,
+		"expected ':' after the parameter name",
+		"write each parameter as name: Type",
+	)
+	type_name ?= consume_type(after_colon, "expected a parameter type")
+	Ok({
+		parameter = {
+			name = name.name,
+			type_name = type_name.written
+		},
+		next = type_name.next,
+	})

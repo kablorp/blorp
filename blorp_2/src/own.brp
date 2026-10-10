@@ -2,7 +2,6 @@ import:
 	int as IntOps
 	list: set_index
 	lower:
-		CallArguments(OneArgument),
 		LoweredFunction,
 		LoweredMatch,
 		LoweredProgram,
@@ -21,7 +20,6 @@ import:
 		ConcreteUnion,
 		FunctionInstanceId,
 		FunctionSignature,
-		ParameterShape(NoParameter, OneParameter),
 		TypeRef(IntType, StringType, UnionType),
 		UnionInstanceId,
 		VariantInstanceId,
@@ -49,7 +47,7 @@ pure func owner_number(id: OwnerId) -> Int:
 
 
 fixed union BorrowSource:
-	ParameterBorrow
+	ParameterBorrow(ValueId)
 	OwnerBorrow(OwnerId)
 
 
@@ -59,8 +57,7 @@ fixed record BorrowedValue {
 }
 
 
-fixed union OwnedArguments:
-	NoArguments
+fixed union OwnedArgument:
 	UnmanagedArgument(ValueId)
 	BorrowedArgument(BorrowedValue)
 
@@ -72,10 +69,10 @@ fixed union ResultOwnership:
 
 
 fixed union OwnedValueOperation:
-	ParameterDefinition
+	ParameterDefinition(Int)
 	IntegerDefinition(Int)
 	VariantDefinition(VariantInstanceId)
-	CallDefinition(ConcreteCall, OwnedArguments)
+	CallDefinition(ConcreteCall, List[OwnedArgument])
 	ConstructDefinition(VariantInstanceId, ValueId)
 	PayloadDefinition(ValueId)
 
@@ -220,18 +217,29 @@ pure func block_last_uses(
 
 		updated = match definition.operation:
 			CallValue(_, arguments):
-				match arguments:
-					OneArgument(value):
-						record_use(
-							uses,
-							value,
-							position,
-							prefix_count,
-							first_value,
-							definition.span,
-						)
-					_:
-						Ok(uses)
+				var current = uses
+				var failure: Option[Diagnostic] = None
+
+				for argument in arguments:
+					match record_use(
+						current,
+						argument,
+						position,
+						prefix_count,
+						first_value,
+						definition.span,
+					):
+						Err(error):
+							failure = Some(error)
+							break
+						Ok(recorded):
+							current = recorded
+
+				match failure:
+					Some(error):
+						Err(error)
+					None:
+						Ok(current)
 			ConstructValue(_, value):
 				record_use(uses, value, position, prefix_count, first_value, definition.span)
 			PayloadValue(value):
@@ -314,7 +322,7 @@ private pure func arguments(
 	prefix: List[ValueSource],
 	first_value: Int,
 	span: Span,
-) -> Result[OwnedArguments, Diagnostic]:
+) -> Result[OwnedArgument, Diagnostic]:
 	source ?= value_source(value, sources, prefix, first_value, span)
 	Ok(
 		match source:
@@ -323,7 +331,7 @@ private pure func arguments(
 			BorrowedSource:
 				BorrowedArgument({
 					value = value,
-					source = ParameterBorrow,
+					source = ParameterBorrow(value),
 				})
 			OwnedSource(owner):
 				BorrowedArgument({
@@ -344,8 +352,8 @@ private pure func build_definition(
 	plan ?= value_ownership(definition.value_type, unions)
 
 	operation_result: Result[OwnedValueOperation, Diagnostic] = match definition.operation:
-		ParameterValue:
-			Ok(ParameterDefinition)
+		ParameterValue(index):
+			Ok(ParameterDefinition(index))
 		IntegerValue(value):
 			Ok(IntegerDefinition(value))
 		VariantValue(id):
@@ -355,17 +363,22 @@ private pure func build_definition(
 		PayloadValue(value):
 			Ok(PayloadDefinition(value))
 		CallValue(call, written):
-			converted = match written:
-				OneArgument(value):
-					arguments(value, sources, prefix, first_value, definition.span)
-				_:
-					Ok(NoArguments)
+			var converted: List[OwnedArgument] = []
+			var failure: Option[Diagnostic] = None
 
-			converted.map(
-				pure func(
-					arguments: OwnedArguments,
-				) -> OwnedValueOperation: CallDefinition(call, arguments),
-			)
+			for value in written:
+				match arguments(value, sources, prefix, first_value, definition.span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(argument):
+						converted = converted.append(argument)
+
+			match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(CallDefinition(call, converted))
 
 	operation ?= operation_result
 
@@ -374,7 +387,7 @@ private pure func build_definition(
 			Ok(UnmanagedResult)
 		ManagedStringLeaf:
 			match operation:
-				ParameterDefinition:
+				ParameterDefinition(_):
 					Ok(BorrowedResult)
 				CallDefinition(_, _):
 					Ok(OwnedResult(owner_id(next_owner)))
@@ -580,7 +593,7 @@ private pure func insert_block(
 							owner,
 							{
 								value = result,
-								source = ParameterBorrow
+								source = ParameterBorrow(result)
 							},
 							span,
 						),

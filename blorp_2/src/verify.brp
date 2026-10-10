@@ -5,7 +5,7 @@ import:
 	own:
 		BorrowSource(ParameterBorrow, OwnerBorrow),
 		BorrowedValue,
-		OwnedArguments(NoArguments, UnmanagedArgument, BorrowedArgument),
+		OwnedArgument(UnmanagedArgument, BorrowedArgument),
 		OwnedDefinition,
 		OwnedFunction,
 		OwnedMatch,
@@ -27,7 +27,6 @@ import:
 		ConcreteCall,
 		ConcreteUnion,
 		FunctionSignature,
-		ParameterShape(NoParameter, OneParameter),
 		PayloadShape(NoPayload, IntPayload),
 		TypeRef(IntType, StringType, UnionType),
 		VariantInstanceId,
@@ -74,7 +73,7 @@ private fixed record VerificationState {
 	values: List[Option[KnownValue]],
 	owners: List[OwnerState],
 	next_value: Int,
-	parameter: Option[ValueId]
+	parameters: List[ValueId]
 }
 
 
@@ -165,25 +164,26 @@ private pure func verify_borrow(
 	match borrowed.value_type:
 		StringType:
 			match borrow.source:
-				ParameterBorrow:
-					match state.parameter:
-						Some(parameter):
-							if IntOps.equals(value_number(parameter), value_number(borrow.value)):
-								Ok(True)
-							else:
-								Err(
-									failure(
-										span,
-										"parameter borrow does not refer to the borrowed String parameter",
-									),
-								)
-						None:
-							Err(
-								failure(
-									span,
-									"parameter borrow does not refer to the borrowed String parameter",
-								),
-							)
+				ParameterBorrow(source):
+					if (
+						IntOps.equals(value_number(source), value_number(borrow.value))
+						and state.parameters.any(
+							pure func(
+								parameter: ValueId,
+							) -> Bool: IntOps.equals(
+								value_number(parameter),
+								value_number(borrow.value),
+							),
+						)
+					):
+						Ok(True)
+					else:
+						Err(
+							failure(
+								span,
+								"parameter borrow does not refer to the borrowed String parameter",
+							),
+						)
 				OwnerBorrow(id):
 					entry ?= owner(state.owners, id, span)
 
@@ -230,49 +230,77 @@ private pure func call_signature(
 			Ok(function.signature)
 
 
-private pure func verify_arguments(
-	arguments: OwnedArguments,
-	parameters: ParameterShape,
+private pure func verify_argument(
+	argument: OwnedArgument,
+	expected: TypeRef,
 	state: VerificationState,
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[Bool, Diagnostic]:
-	match parameters:
-		NoParameter:
-			match arguments:
-				NoArguments:
-					Ok(True)
-				_:
-					Err(failure(span, "call has an unexpected argument"))
-		OneParameter(expected):
-			match arguments:
-				NoArguments:
-					Err(failure(span, "call is missing its argument"))
-				UnmanagedArgument(id):
-					argument ?= value(state.values, id, span)
+	id = match argument:
+		UnmanagedArgument(id):
+			id
+		BorrowedArgument(borrow):
+			borrow.value
 
-					if not same_type(argument.value_type, expected):
-						Err(failure(span, "call argument type does not match its contract"))
-					else:
-						plan ?= value_ownership(expected, unions)
+	known ?= value(state.values, id, span)
 
-						match plan:
-							NoOwnership:
-								Ok(True)
-							ManagedStringLeaf:
-								Err(
-									failure(
-										span,
-										"managed call argument requires an owner-dependent borrow",
-									),
-								)
-				BorrowedArgument(borrow):
-					argument ?= value(state.values, borrow.value, span)
+	if not same_type(known.value_type, expected):
+		Err(failure(span, "call argument type does not match its contract"))
+	else:
+		match argument:
+			UnmanagedArgument(_):
+				plan ?= value_ownership(expected, unions)
 
-					if not same_type(argument.value_type, expected):
-						Err(failure(span, "call argument type does not match its contract"))
-					else:
-						verify_borrow(borrow, state, span)
+				match plan:
+					NoOwnership:
+						Ok(True)
+					ManagedStringLeaf:
+						Err(
+							failure(
+								span,
+								"managed call argument requires an owner-dependent borrow",
+							),
+						)
+			BorrowedArgument(borrow):
+				verify_borrow(borrow, state, span)
+
+
+private pure func verify_arguments(
+	arguments: List[OwnedArgument],
+	parameters: List[TypeRef],
+	state: VerificationState,
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[Bool, Diagnostic]:
+	if IntOps.less_than(arguments.length(), parameters.length()):
+		Err(failure(span, "call is missing its argument"))
+	else if IntOps.greater_than(arguments.length(), parameters.length()):
+		Err(failure(span, "call has an unexpected argument"))
+	else:
+		var index: Int = 0
+		var invalid: Option[Diagnostic] = None
+
+		for argument in arguments:
+			match parameters.get(index):
+				None:
+					invalid = Some(failure(span, "missing call parameter contract"))
+					break
+				Some(expected):
+					match verify_argument(argument, expected, state, unions, span):
+						Err(error):
+							invalid = Some(error)
+							break
+						Ok(_):
+							void
+
+			index = IntOps.add(index, 1)
+
+		match invalid:
+			Some(error):
+				Err(error)
+			None:
+				Ok(True)
 
 
 private pure func variant_shape(
@@ -325,21 +353,25 @@ private pure func operation_type(
 	projection: ProjectionContext,
 ) -> Result[TypeRef, Diagnostic]:
 	match definition.operation:
-		ParameterDefinition:
-			match state.parameter:
-				Some(_):
-					Err(failure(definition.span, "function parameter is defined more than once"))
-				None:
-					match signature.parameters:
-						NoParameter:
-							Err(
-								failure(
-									definition.span,
-									"parameter value in a zero-argument function",
-								),
-							)
-						OneParameter(value_type):
-							Ok(value_type)
+		ParameterDefinition(index):
+			if IntOps.less_than(index, state.parameters.length()):
+				Err(failure(definition.span, "function parameter is defined more than once"))
+			else if IntOps.not_equals(index, state.parameters.length()):
+				Err(
+					failure(
+						definition.span,
+						"function parameter position is not the next signature position",
+					),
+				)
+			else:
+				signature.parameters
+					.get(index)
+					.to_result(
+						failure(
+							definition.span,
+							"parameter value in a zero-argument function",
+						),
+					)
 		IntegerDefinition(_):
 			Ok(IntType)
 		VariantDefinition(id):
@@ -425,7 +457,7 @@ private pure func verify_definition(
 							)
 				ManagedStringLeaf:
 					match definition.operation:
-						ParameterDefinition:
+						ParameterDefinition(_):
 							match definition.result:
 								BorrowedResult:
 									Ok(state.owners)
@@ -463,11 +495,11 @@ private pure func verify_definition(
 			while IntOps.less_than(values.length(), value_number(definition.id)):
 				values = values.append(None)
 
-			parameter = match definition.operation:
-				ParameterDefinition:
-					Some(definition.id)
+			parameters = match definition.operation:
+				ParameterDefinition(_):
+					state.parameters.append(definition.id)
 				_:
-					state.parameter
+					state.parameters
 
 			Ok({
 				values = values.append(Some({
@@ -476,7 +508,7 @@ private pure func verify_definition(
 				})),
 				owners = owners,
 				next_value = IntOps.add(state.next_value, 1),
-				parameter = parameter,
+				parameters = parameters,
 			})
 
 
@@ -769,7 +801,7 @@ private pure func verify_function(
 		values = [],
 		owners = [],
 		next_value = 0,
-		parameter = None
+		parameters = []
 	}
 	var invalid: Option[Diagnostic] = None
 
@@ -792,25 +824,21 @@ private pure func verify_function(
 		Some(error):
 			Err(error)
 		None:
-			parameter_result: Result[Bool, Diagnostic] = match function.signature.parameters:
-				NoParameter:
-					Ok(True)
-				OneParameter(_):
-					match state.parameter:
-						Some(_):
-							Ok(True)
-						None:
-							Err(
-								failure(
-									{
-										start = 0,
-										end = 0
-									},
-									"function parameter has no value definition",
-								),
-							)
-
-			valid_parameter ?= parameter_result
+			valid_parameter ?= if IntOps.equals(
+				state.parameters.length(),
+				function.signature.parameters.length(),
+			):
+				Ok(True)
+			else:
+				Err(
+					failure(
+						{
+							start = 0,
+							end = 0
+						},
+						"function parameter has no value definition",
+					),
+				)
 
 			match function.tail:
 				ReturnTail(result):
@@ -842,11 +870,10 @@ private pure func verify_function(
 -- C main calls the entry without arguments and consumes an Int. Enforcing
 -- that contract here prevents a transferred managed result being discarded.
 private pure func verify_entry(entry: OwnedFunction) -> Result[Bool, Diagnostic]:
-	valid = match entry.signature.parameters:
-		NoParameter:
-			same_type(entry.signature.return_type, IntType)
-		OneParameter(_):
-			False
+	valid = (
+		IntOps.equals(entry.signature.parameters.length(), 0)
+		and same_type(entry.signature.return_type, IntType)
+	)
 
 	if valid:
 		Ok(True)
