@@ -1,0 +1,373 @@
+import:
+	../../src/check as Checked
+	../../src/lex: lex
+	../../src/parse: ParsedProgram
+	../../src/syntax: CallNotation(DirectCall), Diagnostic
+	../../src/text: concat
+	input: parse
+	test: TestSuite
+
+
+-- The host's pipe strings keep complete input programs readable. Their contents
+-- are pilot source: no multiline-string syntax is added to the pilot language.
+private pure func parsed_source(source: String) -> Result[ParsedProgram, Diagnostic]:
+	tokens ?= lex(source.concat("\n"))
+	parse(tokens)
+
+
+private pure func accepts(source: String) -> Bool:
+	match parsed_source(source):
+		Err(_):
+			False
+		Ok(parsed):
+			Checked
+				.check(parsed)
+				.is_ok()
+
+
+private pure func rejects(
+	source: String,
+	expected: pure (Checked.CheckError) -> Bool,
+) -> Bool:
+	match parsed_source(source):
+		Err(_):
+			False
+		Ok(parsed):
+			match Checked.check(parsed):
+				Ok(_):
+					False
+				Err(failure):
+					errors = Checked.check_errors(failure)
+
+					match errors.remaining:
+						[]:
+							expected(errors.first)
+						_:
+							False
+
+
+private pure func function_parameter(parameter: Checked.TypeParameterId, owner: Int) -> Bool:
+	match Checked.parameter_owner(parameter):
+		Checked.FunctionDeclaration(function):
+			Checked.function_number(function) == owner
+		Checked.UnionDeclaration(_):
+			False
+
+
+pure func test_return_zero() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	0
+	accepts(source)
+
+
+pure func test_forward_function_call() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	one()
+		|pure func one() -> Int:
+		|	1
+	accepts(source)
+
+
+pure func test_pure_function_call() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|func main() -> Int:
+		|	identity(7)
+	accepts(source)
+
+
+pure func test_multiple_arguments() -> Bool:
+	source: String =
+		|pure func second(first: Int, second: Int) -> Int:
+		|	second
+		|func main() -> Int:
+		|	second(7, 9)
+	accepts(source)
+
+
+pure func test_ufcs_with_an_explicit_argument() -> Bool:
+	source: String =
+		|pure func first(left: Int, right: Int) -> Int:
+		|	left
+		|func main() -> Int:
+		|	7.first(9)
+	accepts(source)
+
+
+pure func test_immutable_local_binding() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	value = 7
+		|	value
+	accepts(source)
+
+
+pure func test_local_mutation_in_a_pure_function() -> Bool:
+	source: String =
+		|pure func replace(value: Int) -> Int:
+		|	var current = value
+		|	current = 7
+		|	current
+		|func main() -> Int:
+		|	replace(1)
+	accepts(source)
+
+
+pure func test_union_constructor_and_exhaustive_match() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|	Empty
+		|	Number(Int)
+		|pure func read(choice: Choice) -> Int:
+		|	match choice:
+		|		Empty:
+		|			0
+		|		Number(value):
+		|			value
+		|func main() -> Int:
+		|	read(Number(7))
+	accepts(source)
+
+
+pure func test_generic_function_at_two_types() -> Bool:
+	source: String =
+		|pure func identity[T](value: T) -> T:
+		|	value
+		|func main() -> Int:
+		|	integer = identity(7)
+		|	text = identity(integer.to_string())
+		|	text.length()
+	accepts(source)
+
+
+pure func test_generic_union_payload() -> Bool:
+	source: String =
+		|fixed union Box[T]:
+		|	Box(T)
+		|pure func wrap[T](value: T) -> Box[T]:
+		|	Box(value)
+		|pure func unwrap[T](value: Box[T]) -> T:
+		|	match value:
+		|		Box(payload):
+		|			payload
+		|func main() -> Int:
+		|	unwrap(wrap(7))
+	accepts(source)
+
+
+pure func test_unknown_function() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	missing()
+	rejects(source, pure func(error):
+		match error.kind:
+			Checked.UnknownFunction(_):
+				error.span.end - error.span.start == "missing".length()
+			_:
+				False
+	)
+
+
+pure func test_unknown_value() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	missing
+	rejects(source, pure func(error):
+		match error.kind:
+			Checked.UnknownValue(_):
+				error.span.end - error.span.start == "missing".length()
+			_:
+				False
+	)
+
+
+pure func test_pure_caller_rejects_impure_callee() -> Bool:
+	source: String =
+		|pure func caller() -> Int:
+		|	callee()
+		|func callee() -> Int:
+		|	1
+		|func main() -> Int:
+		|	caller()
+	rejects(source, pure func(error):
+		match error.kind:
+			Checked.ImpureCall(caller, Checked.UserFunction(callee, _)):
+				Checked.function_number(caller) == 0 and Checked.function_number(callee) == 1
+			_:
+				False
+	)
+
+
+pure func test_argument_count() -> Bool:
+	source: String =
+		|pure func first(left: Int, right: Int) -> Int:
+		|	left
+		|func main() -> Int:
+		|	first(7)
+	rejects(source, pure func(error):
+		match error.kind:
+			Checked.ArgumentCountMismatch(mismatch):
+				mismatch.expected == 2 and mismatch.actual == 1 and mismatch.notation == DirectCall
+			_:
+				False
+	)
+
+
+pure func test_second_argument_type() -> Bool:
+	source: String =
+		|pure func first(left: Int, right: Int) -> Int:
+		|	left
+		|func main() -> Int:
+		|	first(7, 8.to_string())
+	rejects(source, pure func(error):
+		match error.kind:
+			Checked.ArgumentTypeMismatch(mismatch):
+				(
+					mismatch.argument_position == 1
+					and Checked.same_type(mismatch.expected, Checked.IntType)
+					and Checked.same_type(mismatch.actual.value_type, Checked.StringType)
+					and error.span.start == mismatch.actual.span.start
+					and error.span.end == mismatch.actual.span.end
+				)
+			_:
+				False
+	)
+
+
+pure func test_immutable_reassignment() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	value = 7
+		|	value = 9
+		|	value
+	rejects(source, pure func(error):
+		match error.kind:
+			Checked.ImmutableAssignment(binding):
+				(
+					Checked.function_number(binding.function) == 0
+					and Checked.binding_number(binding.binding) == 0
+					and binding.span.start < error.span.start
+				)
+			_:
+				False
+	)
+
+
+pure func test_mutable_binding_keeps_its_type() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	var value = 7
+		|	value = 8.to_string()
+		|	value
+	rejects(source, pure func(error):
+		match error.kind:
+			Checked.ExpressionTypeMismatch(mismatch):
+				match mismatch.expected_site:
+					Checked.InferredBindingDeclaration(binding):
+						(
+							Checked.same_type(mismatch.expected, Checked.IntType)
+							and Checked.same_type(mismatch.actual.value_type, Checked.StringType)
+							and Checked.function_number(binding.function) == 0
+							and Checked.binding_number(binding.binding) == 0
+						)
+					_:
+						False
+			_:
+				False
+	)
+
+
+pure func test_generic_body_keeps_its_parameter_rigid() -> Bool:
+	source: String =
+		|pure func bad[T](value: T) -> T:
+		|	7
+		|func main() -> Int:
+		|	bad(1)
+	rejects(source, pure func(error):
+		match error.kind:
+			Checked.ExpressionTypeMismatch(mismatch):
+				match mismatch.expected:
+					Checked.ParameterType(parameter):
+						(
+							function_parameter(parameter, 0)
+							and Checked.same_type(mismatch.actual.value_type, Checked.IntType)
+						)
+					_:
+						False
+			_:
+				False
+	)
+
+
+pure func test_conflicting_generic_arguments() -> Bool:
+	source: String =
+		|pure func first[T](left: T, right: T) -> T:
+		|	left
+		|func main() -> Int:
+		|	first(7, 8.to_string())
+	rejects(source, pure func(error):
+		match error.kind:
+			Checked.GenericArgumentConflict(conflict):
+				(
+					function_parameter(conflict.parameter, 0)
+					and conflict.mismatch.argument_position == 1
+					and Checked.same_type(conflict.previous.value_type, Checked.IntType)
+					and Checked.same_type(conflict.current.value_type, Checked.StringType)
+					and conflict.previous.span.start < conflict.current.span.start
+				)
+			_:
+				False
+	)
+
+
+pure func test_missing_match_variant() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|	Number(Int)
+		|	Empty
+		|pure func read(choice: Choice) -> Int:
+		|	match choice:
+		|		Number(value):
+		|			value
+		|func main() -> Int:
+		|	0
+	rejects(source, pure func(error):
+		match error.kind:
+			Checked.NonExhaustiveMatch([missing]):
+				(
+					Checked.union_number(Checked.variant_owner(missing)) == 0
+					and Checked.variant_number(missing) == 1
+				)
+			_:
+				False
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 typecheck programs",
+	tests = [
+		("return zero", test_return_zero),
+		("forward function call", test_forward_function_call),
+		("pure function call", test_pure_function_call),
+		("multiple arguments", test_multiple_arguments),
+		("UFCS with an explicit argument", test_ufcs_with_an_explicit_argument),
+		("immutable local binding", test_immutable_local_binding),
+		("local mutation in a pure function", test_local_mutation_in_a_pure_function),
+		("union constructor and exhaustive match", test_union_constructor_and_exhaustive_match),
+		("generic function at two types", test_generic_function_at_two_types),
+		("generic union payload", test_generic_union_payload),
+		("unknown function", test_unknown_function),
+		("unknown value", test_unknown_value),
+		("pure caller rejects impure callee", test_pure_caller_rejects_impure_callee),
+		("argument count", test_argument_count),
+		("second argument type", test_second_argument_type),
+		("immutable reassignment", test_immutable_reassignment),
+		("mutable binding keeps its type", test_mutable_binding_keeps_its_type),
+		("generic body keeps its parameter rigid", test_generic_body_keeps_its_parameter_rigid),
+		("conflicting generic arguments", test_conflicting_generic_arguments),
+		("missing match variant", test_missing_match_variant),
+	]
+}

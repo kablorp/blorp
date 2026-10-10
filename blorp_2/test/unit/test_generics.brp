@@ -5,7 +5,7 @@ import:
 	../../src/prelude: check_prelude
 	../../src/syntax: Diagnostic
 	compilation: compile
-	input: parse
+	input: check_failure, parse, setup_diagnostic
 	test: TestSuite
 
 
@@ -26,26 +26,26 @@ private COLLISION_HELP: String = "choose a distinct type parameter name, such as
 private pure func checked(source: String) -> Result[Checked.CheckedProgram, Diagnostic]:
 	tokens ?= lex(source)
 	parsed ?= parse(tokens)
-	Checked.check(parsed)
+	Checked
+		.check(parsed)
+		.map_err(setup_diagnostic)
 
 
 private pure func rejects(
 	prefix: String,
 	marked: String,
 	suffix: String,
-	message: String,
-	help: String,
+	matches: pure (Checked.CheckErrorKind) -> Bool,
 ) -> Bool:
-	match checked(prefix + marked + suffix):
-		Err(error):
+	match check_failure(prefix + marked + suffix):
+		None:
+			False
+		Some(error):
 			(
 				error.span.start == prefix.length()
 				and error.span.end == prefix.length() + marked.length()
-				and error.message == message
-				and error.help == help
+				and matches(error.kind)
 			)
-		Ok(_):
-			False
 
 
 pure func test_one_declaration_accepts_int_and_string() -> Bool:
@@ -61,154 +61,181 @@ pure func test_generic_forwarding_preserves_the_caller_parameter() -> Bool:
 
 
 pure func test_unused_invalid_rigid_body_rejects() -> Bool:
-	rejects(
-		"pure func bad[T](value: T) -> T:\n\t",
-		"42",
-		"\n" + MAIN,
-		"expression does not match the expected type",
-		"use a value already typed as this declaration's type parameter",
+	rejects("pure func bad[T](value: T) -> T:\n\t", "42", "\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.ExpressionTypeMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_int_only_use_does_not_recheck_invalid_body_as_int() -> Bool:
-	rejects(
-		"pure func bad[T](value: T) -> T:\n\t",
-		"42",
-		"\nfunc main() -> Int:\n\tbad(7)\n",
-		"expression does not match the expected type",
-		"use a value already typed as this declaration's type parameter",
+	rejects("pure func bad[T](value: T) -> T:\n\t", "42", "\nfunc main() -> Int:\n\tbad(7)\n", pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.ExpressionTypeMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_arbitrary_parameter_cannot_call_string_runtime() -> Bool:
-	rejects(
-		"pure func bad[T](value: T) -> Int:\n\tvalue.",
-		"length",
-		"()\n" + MAIN,
-		"argument type does not match the parameter type",
-		"use an expression of type String here",
+	rejects("pure func bad[T](value: T) -> Int:\n\tvalue.", "length", "()\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.ArgumentTypeMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_arbitrary_parameter_cannot_call_integer_runtime() -> Bool:
-	rejects(
-		"pure func bad[T](value: T) -> String:\n\t",
-		"to_string",
-		"(value)\n" + MAIN,
-		"argument type does not match the parameter type",
-		"use an expression of type Int here",
+	rejects("pure func bad[T](value: T) -> String:\n\t", "to_string", "(value)\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.ArgumentTypeMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_generic_main_rejects_at_parameter_declaration() -> Bool:
-	rejects(
-		"func main[",
-		"T",
-		"]() -> Int:\n\t0\n",
-		"main cannot be generic",
-		"declare main() -> Int: without type parameters",
+	rejects("func main[", "T", "]() -> Int:\n\t0\n", pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.GenericMain(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_builtin_type_parameter_collision_rejects() -> Bool:
 	(
-		rejects(
-			"pure func identity[",
-			"Int",
-			"](value: Int) -> Int:\n\tvalue\n" + MAIN,
-			"type parameter conflicts with a type name",
-			COLLISION_HELP,
+		rejects("pure func identity[", "Int", "](value: Int) -> Int:\n\tvalue\n" + MAIN, pure func(
+			kind: Checked.CheckErrorKind,
+		) -> Bool:
+			match kind:
+				Checked.TypeParameterTypeNameConflict(_):
+					True
+				_:
+					False
 		)
-		and rejects(
-			"pure func identity[",
-			"String",
-			"](value: String) -> String:\n\tvalue\n" + MAIN,
-			"type parameter conflicts with a type name",
-			COLLISION_HELP,
+		and rejects("pure func identity[", "String", "](value: String) -> String:\n\tvalue\n" + MAIN, pure func(
+			kind: Checked.CheckErrorKind,
+		) -> Bool:
+			match kind:
+				Checked.TypeParameterTypeNameConflict(_):
+					True
+				_:
+					False
 		)
 	)
 
 
 pure func test_forward_declared_union_type_parameter_collision_rejects() -> Bool:
-	rejects(
-		"pure func identity[",
-		"Choice",
-		"](value: Choice) -> Choice:\n\tvalue\nfixed union Choice:\n\tFirst\n" + MAIN,
-		"type parameter conflicts with a type name",
-		COLLISION_HELP,
+	rejects("pure func identity[", "Choice", "](value: Choice) -> Choice:\n\tvalue\nfixed union Choice:\n\tFirst\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.TypeParameterTypeNameConflict(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_phantom_parameter_call_has_no_default() -> Bool:
-	rejects(
-		"pure func phantom[T](value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\t",
-		"phantom",
-		"(7)\n",
-		"cannot infer the type parameter from the argument",
-		INFERENCE_HELP,
+	rejects("pure func phantom[T](value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\t", "phantom", "(7)\n", pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.UninferableTypeParameter(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_zero_argument_generic_call_has_no_default() -> Bool:
-	rejects(
-		"pure func phantom[T]() -> Int:\n\t7\nfunc main() -> Int:\n\t",
-		"phantom",
-		"()\n",
-		"cannot infer the type parameter from the argument",
-		INFERENCE_HELP,
+	rejects("pure func phantom[T]() -> Int:\n\t7\nfunc main() -> Int:\n\t", "phantom", "()\n", pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.UninferableTypeParameter(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_generic_unary_call_still_requires_argument() -> Bool:
-	rejects(
-		IDENTITY + "func main() -> Int:\n\t",
-		"identity",
-		"()\n",
-		"function requires one argument",
-		"pass one expression of the declared parameter type",
+	rejects(IDENTITY + "func main() -> Int:\n\t", "identity", "()\n", pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.ArgumentCountMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_generic_call_preserves_purity() -> Bool:
-	rejects(
-		"func identity[T](value: T) -> T:\n\tvalue\npure func use() -> Int:\n\t",
-		"identity",
-		"(7)\n" + MAIN,
-		"pure functions cannot call impure functions",
-		"mark the callee pure or remove pure from the caller",
+	rejects("func identity[T](value: T) -> T:\n\tvalue\npure func use() -> Int:\n\t", "identity", "(7)\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.ImpureCall(_, _):
+				True
+			_:
+				False
 	)
 
 
 pure func test_generic_recursion_rejects_even_when_unused() -> Bool:
-	rejects(
-		"pure func recurse[T](value: T) -> T:\n\t",
-		"recurse",
-		"(value)\n" + MAIN,
-		"call chain contains recursion",
-		"use an acyclic call chain; recursion is not supported in this increment",
+	rejects("pure func recurse[T](value: T) -> T:\n\t", "recurse", "(value)\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.RecursiveCallChain:
+				True
+			_:
+				False
 	)
 
 
 pure func test_undeclared_parameter_name_rejects() -> Bool:
-	rejects(
-		"pure func identity(value: ",
-		"T",
-		") -> Int:\n\t7\n" + MAIN,
-		"unknown type",
-		(
-			"use Int, String, a declared type parameter, or a fixed union declared in this "
-			+ "file"
-		),
+	rejects("pure func identity(value: ", "T", ") -> Int:\n\t7\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.UnknownType(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_local_parameter_shadows_direct_generic_call() -> Bool:
-	rejects(
-		IDENTITY + "pure func use[T](identity: T) -> T:\n\t",
-		"identity",
-		"(identity)\n" + MAIN,
-		"parameters cannot be called",
-		"use the parameter as a value, or rename it to call the function",
+	rejects(IDENTITY + "pure func use[T](identity: T) -> T:\n\t", "identity", "(identity)\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.UncallableBinding(_, Checked.ParameterBinding(_), _):
+				True
+			_:
+				False
 	)
 
 
@@ -222,42 +249,50 @@ private CHOICE: String = "fixed union Choice:\n\tFirst\n\tNumber(Int)\n"
 
 
 pure func test_direct_nullary_constructor_cannot_infer_from_return_context() -> Bool:
-	rejects(
-		CHOICE + IDENTITY + "pure func use() -> Choice:\n\tidentity(",
-		"First",
-		")\n" + MAIN,
-		"constructor needs an expected union type",
-		CONSTRUCTOR_HELP,
+	rejects(CHOICE + IDENTITY + "pure func use() -> Choice:\n\tidentity(", "First", ")\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.ConstructorNeedsExpectedType(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_ufcs_nullary_constructor_cannot_infer_from_return_context() -> Bool:
-	rejects(
-		CHOICE + IDENTITY + "pure func use() -> Choice:\n\t",
-		"First",
-		".identity()\n" + MAIN,
-		"constructor needs an expected union type",
-		CONSTRUCTOR_HELP,
+	rejects(CHOICE + IDENTITY + "pure func use() -> Choice:\n\t", "First", ".identity()\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.ConstructorNeedsExpectedType(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_direct_payload_constructor_cannot_infer_from_return_context() -> Bool:
-	rejects(
-		CHOICE + IDENTITY + "pure func use() -> Choice:\n\tidentity(",
-		"Number",
-		"(7))\n" + MAIN,
-		"constructor needs an expected union type",
-		CONSTRUCTOR_HELP,
+	rejects(CHOICE + IDENTITY + "pure func use() -> Choice:\n\tidentity(", "Number", "(7))\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.ConstructorNeedsExpectedType(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_ufcs_payload_constructor_cannot_infer_from_return_context() -> Bool:
-	rejects(
-		CHOICE + IDENTITY + "pure func use() -> Choice:\n\t",
-		"Number",
-		"(7).identity()\n" + MAIN,
-		"constructor needs an expected union type",
-		CONSTRUCTOR_HELP,
+	rejects(CHOICE + IDENTITY + "pure func use() -> Choice:\n\t", "Number", "(7).identity()\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.ConstructorNeedsExpectedType(_):
+				True
+			_:
+				False
 	)
 
 

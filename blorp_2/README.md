@@ -695,6 +695,17 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    after target resolution. A user call carries its checked substitution in its
    target variant; a runtime call cannot carry one. Rigid type parameters have
    explicit function-declaration or union-declaration owners.
+   Checking returns either the complete `CheckedProgram` or an opaque
+   `CheckFailure` retaining the original parsed program and a nonempty
+   `CheckErrors` collection. The current checker stops at the first error, so
+   that collection is a singleton. Failures contain closed semantic variants,
+   types, owner-qualified identities, argument positions and source occurrences;
+   temporary builders do not escape. `render_failure` separately produces every
+   diagnostic using the same parsed name authority. The CLI preserves the entire
+   rendered collection. Semantic unit tests inspect typed facts directly;
+   renderer and pipeline tests pin wording independently. UFCS receiver mismatch
+   occurrences retain the existing call-span limitation. Inference remains
+   one-way; bidirectional checking and structural unification are later work.
 4. Pure specialization expands instances from every ordinary function, preserving
    unused ordinary functions and unions. Generic declarations emit only when
    requested by those roots or another instance. One local instance list reuses

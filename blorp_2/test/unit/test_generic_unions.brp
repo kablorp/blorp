@@ -4,14 +4,16 @@ import:
 	../../src/specialize as Concrete
 	../../src/syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration)
 	compilation: compile
-	input: parse
+	input: check_failure, parse, setup_diagnostic
 	test: TestSuite
 
 
 private pure func checked(source: String) -> Result[Checked.CheckedProgram, Diagnostic]:
 	tokens ?= lex(source)
 	parsed ?= parse(tokens)
-	Checked.check(parsed)
+	Checked
+		.check(parsed)
+		.map_err(setup_diagnostic)
 
 
 private BOX: String = "fixed union Box[T]:\n\tBox(T)\npure func box[T](value: T) -> Box[T]:\n\tBox(value)\npure func unbox[T](value: Box[T]) -> T:\n\tmatch value:\n\t\tBox(payload):\n\t\t\tpayload\n"
@@ -69,34 +71,38 @@ private pure func rejects(
 	prefix: String,
 	marked: String,
 	suffix: String,
-	message: String,
-	help: String,
+	matches: pure (Checked.CheckErrorKind) -> Bool,
 ) -> Bool:
-	match compile(prefix + marked + suffix):
-		Err(error):
+	match check_failure(prefix + marked + suffix):
+		None:
+			False
+		Some(error):
 			(
 				error.span.start == prefix.length()
 				and error.span.end == prefix.length() + marked.length()
-				and error.message == message
-				and error.help == help
+				and matches(error.kind)
 			)
-		Ok(_):
-			False
 
 
 private pure func rejects_layout(prefix: String, marked: String, suffix: String) -> Bool:
 	match compile(prefix + marked + suffix):
-		Err(error):
-			match error.note:
-				UnionPayloadDeclaration(span):
-					(
-						error.span.start == prefix.length()
-						and error.span.end == prefix.length() + marked.length()
-						and span.start == PAYLOAD_START
-						and span.end == PAYLOAD_START + 1
-						and error.message == "specialized union payload must be Int"
-						and error.help == "use Int for this payload; String and union payloads are not supported"
-					)
+		Err(errors):
+			match errors.remaining:
+				[]:
+					error = errors.first
+
+					match error.note:
+						UnionPayloadDeclaration(span):
+							(
+								error.span.start == prefix.length()
+								and error.span.end == prefix.length() + marked.length()
+								and span.start == PAYLOAD_START
+								and span.end == PAYLOAD_START + 1
+								and error.message == "specialized union payload must be Int"
+								and error.help == "use Int for this payload; String and union payloads are not supported"
+							)
+						_:
+							False
 				_:
 					False
 		Ok(_):
@@ -104,52 +110,62 @@ private pure func rejects_layout(prefix: String, marked: String, suffix: String)
 
 
 pure func test_generic_constructor_checks_its_rigid_payload_once() -> Bool:
-	rejects(
-		"fixed union Box[T]:\n\tBox(T)\npure func bad[T](value: T) -> Box[T]:\n\t",
-		"Box",
-		"(7)\n" + MAIN,
-		"argument type does not match the parameter type",
-		"use a value already typed as this declaration's type parameter",
+	rejects("fixed union Box[T]:\n\tBox(T)\npure func bad[T](value: T) -> Box[T]:\n\t", "Box", "(7)\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.ArgumentTypeMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_generic_pattern_payload_remains_rigid() -> Bool:
-	rejects(
-		"fixed union Box[T]:\n\tBox(T)\npure func bad[T](value: Box[T]) -> Int:\n\tmatch value:\n\t\tBox(payload):\n\t\t\t",
-		"payload",
-		"\n" + MAIN,
-		"expression does not match the expected type",
-		"use an expression of type Int here",
+	rejects("fixed union Box[T]:\n\tBox(T)\npure func bad[T](value: Box[T]) -> Int:\n\tmatch value:\n\t\tBox(payload):\n\t\t\t", "payload", "\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.ExpressionTypeMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_constructor_missing_rigid_payload_has_type_correct_help() -> Bool:
-	rejects(
-		"fixed union Box[T]:\n\tBox(T)\npure func bad[T](value: T) -> Box[T]:\n\t",
-		"Box",
-		"\n" + MAIN,
-		"constructor requires one payload argument",
-		"pass a value of the constructor's declared payload type",
+	rejects("fixed union Box[T]:\n\tBox(T)\npure func bad[T](value: T) -> Box[T]:\n\t", "Box", "\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.ConstructorPayloadArity(_, _) | Checked.MissingConstructorPayload(_, _):
+				True
+			_:
+				False
 	)
 
 
 pure func test_pattern_missing_rigid_payload_has_type_correct_help() -> Bool:
-	rejects(
-		"fixed union Box[T]:\n\tBox(T)\npure func bad[T](value: Box[T]) -> Int:\n\tmatch value:\n\t\t",
-		"Box",
-		": 0\n" + MAIN,
-		"constructor pattern requires one field",
-		"write Variant(name) to bind the payload, or Variant(_) to ignore it",
+	rejects("fixed union Box[T]:\n\tBox(T)\npure func bad[T](value: Box[T]) -> Int:\n\tmatch value:\n\t\t", "Box", ": 0\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.PatternMissingField(_, _):
+				True
+			_:
+				False
 	)
 
 
 pure func test_applied_type_mismatch_renders_the_complete_expected_type() -> Bool:
-	rejects(
-		"fixed union P[T]:\n\tOnly\npure func wrong(value: P[Int]) -> P[String]:\n\t",
-		"value",
-		"\n" + MAIN,
-		"expression does not match the expected type",
-		"use an expression of type P[String] here",
+	rejects("fixed union P[T]:\n\tOnly\npure func wrong(value: P[Int]) -> P[String]:\n\t", "value", "\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.ExpressionTypeMismatch(_):
+				True
+			_:
+				False
 	)
 
 
@@ -188,37 +204,43 @@ pure func test_phantom_string_application_has_no_managed_payload() -> Bool:
 
 
 pure func test_generic_union_requires_an_argument() -> Bool:
-	rejects(
-		"fixed union Box[T]:\n\tBox(T)\npure func bad(value: ",
-		"Box",
-		") -> Int:\n\t0\n" + MAIN,
-		"generic union requires one type argument",
-		"write a concrete or symbolic application, such as Box[Int] or Box[T]",
+	rejects("fixed union Box[T]:\n\tBox(T)\npure func bad(value: ", "Box", ") -> Int:\n\t0\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.MissingUnionTypeArguments(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_ordinary_union_rejects_an_argument() -> Bool:
-	rejects(
-		"fixed union Value:\n\tOnly\npure func bad(value: ",
-		"Value[Int]",
-		") -> Int:\n\t0\n" + MAIN,
-		"ordinary union does not accept a type argument",
-		"remove the type argument from this union type",
+	rejects("fixed union Value:\n\tOnly\npure func bad(value: ", "Value[Int]", ") -> Int:\n\t0\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.OrdinaryUnionApplied(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_builtin_type_rejects_application() -> Bool:
-	rejects(
-		"pure func bad(value: ",
-		"Int",
-		"[String]) -> Int:\n\t0\n" + MAIN,
-		"type does not accept a type argument",
-		"apply a declared generic union, such as Box[Int]",
+	rejects("pure func bad(value: ", "Int", "[String]) -> Int:\n\t0\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.NonApplicableType(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_written_nested_application_is_explicitly_unsupported() -> Bool:
-	rejects(
+	rejects_parse(
 		"fixed union Box[T]:\n\tBox(T)\npure func bad(value: Box[Box",
 		"[",
 		"Int]]) -> Int:\n\t0\n" + MAIN,
@@ -231,25 +253,26 @@ pure func test_written_nested_application_is_explicitly_unsupported() -> Bool:
 
 
 pure func test_union_parameter_collision_rejects_at_the_parameter_name() -> Bool:
-	rejects(
-		"fixed union Box[",
-		"Box",
-		"]:\n\tOnly\n" + MAIN,
-		"type parameter conflicts with a type name",
-		"choose a distinct type parameter name, such as T",
+	rejects("fixed union Box[", "Box", "]:\n\tOnly\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.TypeParameterTypeNameConflict(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_union_payload_must_be_int_or_its_own_parameter() -> Bool:
-	rejects(
-		"fixed union Box[T]:\n\tBox(",
-		"String",
-		")\n" + MAIN,
-		"only Int or the union's type parameter may be payloads",
-		(
-			"declare no field, one Int field, or one field using this union's declared type "
-			+ "parameter"
-		),
+	rejects("fixed union Box[T]:\n\tBox(", "String", ")\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.UnsupportedPayloadAnnotation(_, Checked.IntegerOrParameterPayload):
+				True
+			_:
+				False
 	)
 
 
@@ -616,3 +639,22 @@ tests: TestSuite = {
 		),
 	]
 }
+
+
+private pure func rejects_parse(
+	prefix: String,
+	marked: String,
+	suffix: String,
+	message: String,
+	help: String,
+) -> Bool:
+	match lex(prefix + marked + suffix).and_then(pure func(tokens): parse(tokens)):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.span.start == prefix.length()
+				and error.span.end == prefix.length() + marked.length()
+				and error.message == message
+				and error.help == help
+			)

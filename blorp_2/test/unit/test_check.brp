@@ -1,19 +1,27 @@
 import:
 	../../src/check:
+		BindingOrigin(ParameterBinding),
 		CallTarget(UserFunction, RuntimeFunction),
+		CheckErrorKind(
+			UnknownFunction, UnknownValue, RecursiveCallChain, ImpureCall, ArgumentCountMismatch,
+			UncallableBinding, MainHasParameters, UnknownType, DuplicateFunction, MissingMain,
+		),
 		CheckedBase(ReturnInteger, ReturnBinding, ReturnCall),
 		CheckedBody(CheckedValueBody),
 		CheckedFunction,
 		CheckedOperation(InvokeFunction),
 		CheckedProgram,
-		TypeRef(IntType),
+		ExpectedTypeSite(SourceAnnotation),
+		TypeRef(IntType, StringType),
 		TypeUse,
+		check_errors,
 		checked_functions,
 		function_number,
 		same_type,
 	../../src/lex: lex
 	../../src/syntax: Diagnostic, Purity(Pure, Impure)
-	input: check, parse
+	../../src/text: concat
+	input: check, check_failure, parse, setup_diagnostic, singleton_check_error
 	test: TestSuite
 
 
@@ -62,34 +70,20 @@ private pure func no_parameter(shape: List[TypeUse]) -> Bool:
 private pure func checked_source(source: String) -> Result[CheckedProgram, Diagnostic]:
 	tokens ?= lex(source)
 	parsed ?= parse(tokens)
-	check(parsed)
+	check(parsed).map_err(setup_diagnostic)
 
 
 private pure func diagnostic(
 	source: String,
 	start: Int,
 	end: Int,
-	message: String,
-	help: String,
+	matches: pure (CheckErrorKind) -> Bool,
 ) -> Bool:
-	match lex(source):
-		Err(_):
+	match check_failure(source):
+		None:
 			False
-		Ok(tokens):
-			match parse(tokens):
-				Err(_):
-					False
-				Ok(parsed):
-					match check(parsed):
-						Ok(_):
-							False
-						Err(error):
-							(
-								error.span.start == start
-								and error.span.end == end
-								and error.message == message
-								and error.help == help
-							)
+		Some(error):
+			error.span.start == start and error.span.end == end and matches(error.kind)
 
 
 pure func test_resolved_forward_call_and_entrypoint() -> Bool:
@@ -141,138 +135,152 @@ pure func test_resolved_forward_call_and_entrypoint() -> Bool:
 
 
 pure func test_unknown_callee_diagnostic() -> Bool:
-	diagnostic(
-		"func main() -> Int:\n\tmissing()\n",
-		21,
-		28,
-		"unknown function",
-		"declare the called function in this file or the explicit prelude",
+	diagnostic("func main() -> Int:\n\tmissing()\n", 21, 28, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			UnknownFunction(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_duplicate_function_diagnostic() -> Bool:
-	diagnostic(
-		"func main() -> Int:\n\t0\nfunc main() -> Int:\n\t1\n",
-		28,
-		32,
-		"duplicate function name",
-		"give every function a distinct name",
+	diagnostic("func main() -> Int:\n\t0\nfunc main() -> Int:\n\t1\n", 28, 32, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			DuplicateFunction(_, _):
+				True
+			_:
+				False
 	)
 
 
 pure func test_missing_main_diagnostic() -> Bool:
-	diagnostic(
-		"func nope() -> Int:\n\t0\n",
-		23,
-		23,
-		"expected a main function",
-		"declare func main() -> Int: as the entrypoint",
+	diagnostic("func nope() -> Int:\n\t0\n", 23, 23, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			MissingMain:
+				True
+			_:
+				False
 	)
 
 
 pure func test_wrong_return_type_diagnostic() -> Bool:
-	diagnostic(
-		"func main() -> Foo:\n\t0\n",
-		15,
-		18,
-		"unknown type",
-		(
-			"use Int, String, a declared type parameter, or a fixed union declared in this "
-			+ "file"
-		),
+	diagnostic("func main() -> Foo:\n\t0\n", 15, 18, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			UnknownType(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_self_recursion_diagnostic() -> Bool:
-	diagnostic(
-		"func main() -> Int:\n\tmain()\n",
-		21,
-		25,
-		"call chain contains recursion",
-		"use an acyclic call chain; recursion is not supported in this increment",
+	diagnostic("func main() -> Int:\n\tmain()\n", 21, 25, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			RecursiveCallChain:
+				True
+			_:
+				False
 	)
 
 
 pure func test_mutual_recursion_diagnostic() -> Bool:
-	diagnostic(
-		"func main() -> Int:\n\tone()\nfunc one() -> Int:\n\tmain()\n",
-		21,
-		24,
-		"call chain contains recursion",
-		"use an acyclic call chain; recursion is not supported in this increment",
+	diagnostic("func main() -> Int:\n\tone()\nfunc one() -> Int:\n\tmain()\n", 21, 24, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			RecursiveCallChain:
+				True
+			_:
+				False
 	)
 
 
 pure func test_duplicate_helper_diagnostic() -> Bool:
-	diagnostic(
-		"func main() -> Int:\n\t0\nfunc one() -> Int:\n\t1\nfunc one() -> Int:\n\t0\n",
-		50,
-		53,
-		"duplicate function name",
-		"give every function a distinct name",
+	diagnostic("func main() -> Int:\n\t0\nfunc one() -> Int:\n\t1\nfunc one() -> Int:\n\t0\n", 50, 53, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			DuplicateFunction(_, _):
+				True
+			_:
+				False
 	)
 
 
 pure func test_non_integer_helper_diagnostic() -> Bool:
-	diagnostic(
-		"func main() -> Int:\n\t0\nfunc one() -> Bool:\n\t1\n",
-		37,
-		41,
-		"unknown type",
-		(
-			"use Int, String, a declared type parameter, or a fixed union declared in this "
-			+ "file"
-		),
+	diagnostic("func main() -> Int:\n\t0\nfunc one() -> Bool:\n\t1\n", 37, 41, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			UnknownType(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_unreachable_cyclic_helper_diagnostic() -> Bool:
-	diagnostic(
-		"func main() -> Int:\n\t0\nfunc one() -> Int:\n\tone()\n",
-		43,
-		46,
-		"call chain contains recursion",
-		"use an acyclic call chain; recursion is not supported in this increment",
+	diagnostic("func main() -> Int:\n\t0\nfunc one() -> Int:\n\tone()\n", 43, 46, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			RecursiveCallChain:
+				True
+			_:
+				False
 	)
 
 
 pure func test_unreachable_unknown_callee_diagnostic() -> Bool:
-	diagnostic(
-		"func main() -> Int:\n\t0\nfunc one() -> Int:\n\tmissing()\n",
-		43,
-		50,
-		"unknown function",
-		"declare the called function in this file or the explicit prelude",
+	diagnostic("func main() -> Int:\n\t0\nfunc one() -> Int:\n\tmissing()\n", 43, 50, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			UnknownFunction(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_pure_caller_rejects_default_impure_callee() -> Bool:
-	diagnostic(
-		"pure func main() -> Int:\n\tone()\nfunc one() -> Int:\n\t1\n",
-		26,
-		29,
-		"pure functions cannot call impure functions",
-		"mark the callee pure or remove pure from the caller",
+	diagnostic("pure func main() -> Int:\n\tone()\nfunc one() -> Int:\n\t1\n", 26, 29, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ImpureCall(_, _):
+				True
+			_:
+				False
 	)
 
 
 pure func test_transitive_pure_chain_rejects_its_impure_edge() -> Bool:
-	diagnostic(
-		"pure func main() -> Int:\n\tanswer()\npure func answer() -> Int:\n\tone()\nfunc one() -> Int:\n\t1\n",
-		63,
-		66,
-		"pure functions cannot call impure functions",
-		"mark the callee pure or remove pure from the caller",
+	diagnostic("pure func main() -> Int:\n\tanswer()\npure func answer() -> Int:\n\tone()\nfunc one() -> Int:\n\t1\n", 63, 66, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ImpureCall(_, _):
+				True
+			_:
+				False
 	)
 
 
 pure func test_unreachable_pure_caller_rejects_impure_callee() -> Bool:
-	diagnostic(
-		"func main() -> Int:\n\t0\npure func helper() -> Int:\n\tone()\nfunc one() -> Int:\n\t1\n",
-		51,
-		54,
-		"pure functions cannot call impure functions",
-		"mark the callee pure or remove pure from the caller",
+	diagnostic("func main() -> Int:\n\t0\npure func helper() -> Int:\n\tone()\nfunc one() -> Int:\n\t1\n", 51, 54, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ImpureCall(_, _):
+				True
+			_:
+				False
 	)
 
 
@@ -301,105 +309,120 @@ pure func test_checked_functions_keep_declared_purity() -> Bool:
 
 
 pure func test_parameter_type_is_explicit_int() -> Bool:
-	diagnostic(
-		"func identity(value: Bool) -> Int:\n\tvalue\nfunc main() -> Int:\n\tidentity(1)\n",
-		21,
-		25,
-		"unknown type",
-		(
-			"use Int, String, a declared type parameter, or a fixed union declared in this "
-			+ "file"
-		),
+	diagnostic("func identity(value: Bool) -> Int:\n\tvalue\nfunc main() -> Int:\n\tidentity(1)\n", 21, 25, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			UnknownType(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_main_has_no_parameter() -> Bool:
-	diagnostic(
-		"func main(value: Int) -> Int:\n\tvalue\n",
-		10,
-		15,
-		"main cannot have a parameter",
-		"declare main() -> Int: with no parameters",
+	diagnostic("func main(value: Int) -> Int:\n\tvalue\n", 10, 15, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			MainHasParameters(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_unknown_bare_value_is_rejected() -> Bool:
-	diagnostic(
-		"func main() -> Int:\n\tvalue\n",
-		21,
-		26,
-		"unknown value",
-		"use this function's parameter name, a declared variant, or a call",
+	diagnostic("func main() -> Int:\n\tvalue\n", 21, 26, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			UnknownValue(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_parameter_cannot_be_called_as_global_function() -> Bool:
-	diagnostic(
-		"func one() -> Int:\n\t1\nfunc use(one: Int) -> Int:\n\tone()\nfunc main() -> Int:\n\tuse(1)\n",
-		50,
-		53,
-		"Int parameters cannot be called",
-		"use the parameter as a value, or rename it to call the function",
+	diagnostic("func one() -> Int:\n\t1\nfunc use(one: Int) -> Int:\n\tone()\nfunc main() -> Int:\n\tuse(1)\n", 50, 53, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			UncallableBinding(_, ParameterBinding(_), IntType):
+				True
+			_:
+				False
 	)
 
 
 pure func test_call_requires_its_parameter_argument() -> Bool:
-	diagnostic(
-		"func identity(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tidentity()\n",
-		62,
-		70,
-		"function requires one argument",
-		"pass one expression of the declared parameter type",
+	diagnostic("func identity(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tidentity()\n", 62, 70, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ArgumentCountMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_zero_parameter_call_rejects_argument() -> Bool:
-	diagnostic(
-		"func one() -> Int:\n\t1\nfunc main() -> Int:\n\tone(1)\n",
-		43,
-		46,
-		"function takes no arguments",
-		"remove the argument and call the function with ()",
+	diagnostic("func one() -> Int:\n\t1\nfunc main() -> Int:\n\tone(1)\n", 43, 46, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ArgumentCountMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_pure_argument_call_uses_containing_function() -> Bool:
-	diagnostic(
-		"func one() -> Int:\n\t1\npure func identity(value: Int) -> Int:\n\tvalue\npure func main() -> Int:\n\tidentity(one())\n",
-		103,
-		106,
-		"pure functions cannot call impure functions",
-		"mark the callee pure or remove pure from the caller",
+	diagnostic("func one() -> Int:\n\t1\npure func identity(value: Int) -> Int:\n\tvalue\npure func main() -> Int:\n\tidentity(one())\n", 103, 106, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ImpureCall(_, _):
+				True
+			_:
+				False
 	)
 
 
 pure func test_argument_cycle_is_rejected() -> Bool:
-	diagnostic(
-		"pure func identity(value: Int) -> Int:\n\tvalue\nfunc loop() -> Int:\n\tidentity(loop())\nfunc main() -> Int:\n\tloop()\n",
-		76,
-		80,
-		"call chain contains recursion",
-		"use an acyclic call chain; recursion is not supported in this increment",
+	diagnostic("pure func identity(value: Int) -> Int:\n\tvalue\nfunc loop() -> Int:\n\tidentity(loop())\nfunc main() -> Int:\n\tloop()\n", 76, 80, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			RecursiveCallChain:
+				True
+			_:
+				False
 	)
 
 
 pure func test_parameter_does_not_leak_to_other_function() -> Bool:
-	diagnostic(
-		"func helper(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tvalue\n",
-		60,
-		65,
-		"unknown value",
-		"use this function's parameter name, a declared variant, or a call",
+	diagnostic("func helper(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tvalue\n", 60, 65, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			UnknownValue(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_argument_does_not_use_callee_parameter_scope() -> Bool:
-	diagnostic(
-		"func identity(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tidentity(value)\n",
-		71,
-		76,
-		"unknown value",
-		"use this function's parameter name, a declared variant, or a call",
+	diagnostic("func identity(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tidentity(value)\n", 71, 76, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			UnknownValue(_):
+				True
+			_:
+				False
 	)
 
 
@@ -465,52 +488,62 @@ pure func test_impure_caller_can_pass_impure_call_to_pure_function() -> Bool:
 
 
 pure func test_cycle_in_unary_wrapper_is_rejected() -> Bool:
-	diagnostic(
-		"func loop(value: Int) -> Int:\n\tloop(value)\nfunc main() -> Int:\n\tloop(1)\n",
-		31,
-		35,
-		"call chain contains recursion",
-		"use an acyclic call chain; recursion is not supported in this increment",
+	diagnostic("func loop(value: Int) -> Int:\n\tloop(value)\nfunc main() -> Int:\n\tloop(1)\n", 31, 35, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			RecursiveCallChain:
+				True
+			_:
+				False
 	)
 
 
 pure func test_pure_caller_rejects_impure_unary_wrapper() -> Bool:
-	diagnostic(
-		"func identity(value: Int) -> Int:\n\tvalue\npure func main() -> Int:\n\tidentity(1)\n",
-		67,
-		75,
-		"pure functions cannot call impure functions",
-		"mark the callee pure or remove pure from the caller",
+	diagnostic("func identity(value: Int) -> Int:\n\tvalue\npure func main() -> Int:\n\tidentity(1)\n", 67, 75, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ImpureCall(_, _):
+				True
+			_:
+				False
 	)
 
 
 pure func test_cycle_after_settled_inner_wrapper_is_rejected() -> Bool:
-	diagnostic(
-		"pure func identity(value: Int) -> Int:\n\tvalue\nfunc loop(value: Int) -> Int:\n\tloop(identity(value))\nfunc main() -> Int:\n\tloop(1)\n",
-		77,
-		81,
-		"call chain contains recursion",
-		"use an acyclic call chain; recursion is not supported in this increment",
+	diagnostic("pure func identity(value: Int) -> Int:\n\tvalue\nfunc loop(value: Int) -> Int:\n\tloop(identity(value))\nfunc main() -> Int:\n\tloop(1)\n", 77, 81, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			RecursiveCallChain:
+				True
+			_:
+				False
 	)
 
 
 pure func test_pure_caller_checks_outer_wrapper_after_pure_inner() -> Bool:
-	diagnostic(
-		"pure func identity(value: Int) -> Int:\n\tvalue\nfunc impure(value: Int) -> Int:\n\tvalue\npure func main() -> Int:\n\timpure(identity(1))\n",
-		111,
-		117,
-		"pure functions cannot call impure functions",
-		"mark the callee pure or remove pure from the caller",
+	diagnostic("pure func identity(value: Int) -> Int:\n\tvalue\nfunc impure(value: Int) -> Int:\n\tvalue\npure func main() -> Int:\n\timpure(identity(1))\n", 111, 117, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ImpureCall(_, _):
+				True
+			_:
+				False
 	)
 
 
 pure func test_outer_wrapper_arity_is_checked_after_valid_inner() -> Bool:
-	diagnostic(
-		"func one() -> Int:\n\t1\npure func identity(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tone(identity(1))\n",
-		89,
-		92,
-		"function takes no arguments",
-		"remove the argument and call the function with ()",
+	diagnostic("func one() -> Int:\n\t1\npure func identity(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tone(identity(1))\n", 89, 92, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ArgumentCountMismatch(_):
+				True
+			_:
+				False
 	)
 
 
@@ -537,52 +570,62 @@ pure func test_parameter_does_not_shadow_ufcs_target() -> Bool:
 
 
 pure func test_parameter_still_shadows_direct_unary_target() -> Bool:
-	diagnostic(
-		"pure func identity(value: Int) -> Int:\n\tvalue\npure func use(identity: Int) -> Int:\n\tidentity(identity)\nfunc main() -> Int:\n\tuse(1)\n",
-		84,
-		92,
-		"Int parameters cannot be called",
-		"use the parameter as a value, or rename it to call the function",
+	diagnostic("pure func identity(value: Int) -> Int:\n\tvalue\npure func use(identity: Int) -> Int:\n\tidentity(identity)\nfunc main() -> Int:\n\tuse(1)\n", 84, 92, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			UncallableBinding(_, ParameterBinding(_), IntType):
+				True
+			_:
+				False
 	)
 
 
 pure func test_ufcs_zero_parameter_target_teaches_direct_call() -> Bool:
-	diagnostic(
-		"pure func identity(value: Int) -> Int:\n\tvalue\nfunc zero() -> Int:\n\t0\nfunc main() -> Int:\n\t1.identity().zero()\n",
-		103,
-		107,
-		"function takes no arguments",
-		"call zero() directly, or choose a function with one parameter",
+	diagnostic("pure func identity(value: Int) -> Int:\n\tvalue\nfunc zero() -> Int:\n\t0\nfunc main() -> Int:\n\t1.identity().zero()\n", 103, 107, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ArgumentCountMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_ufcs_uses_containing_purity() -> Bool:
-	diagnostic(
-		"pure func identity(value: Int) -> Int:\n\tvalue\nfunc impure(value: Int) -> Int:\n\tvalue\npure func main() -> Int:\n\t1.identity().impure()\n",
-		124,
-		130,
-		"pure functions cannot call impure functions",
-		"mark the callee pure or remove pure from the caller",
+	diagnostic("pure func identity(value: Int) -> Int:\n\tvalue\nfunc impure(value: Int) -> Int:\n\tvalue\npure func main() -> Int:\n\t1.identity().impure()\n", 124, 130, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ImpureCall(_, _):
+				True
+			_:
+				False
 	)
 
 
 pure func test_ufcs_cycle_is_rejected() -> Bool:
-	diagnostic(
-		"pure func identity(value: Int) -> Int:\n\tvalue\npure func loop(value: Int) -> Int:\n\tvalue.identity().loop()\nfunc main() -> Int:\n\t1.loop()\n",
-		99,
-		103,
-		"call chain contains recursion",
-		"use an acyclic call chain; recursion is not supported in this increment",
+	diagnostic("pure func identity(value: Int) -> Int:\n\tvalue\npure func loop(value: Int) -> Int:\n\tvalue.identity().loop()\nfunc main() -> Int:\n\t1.loop()\n", 99, 103, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			RecursiveCallChain:
+				True
+			_:
+				False
 	)
 
 
 pure func test_ufcs_receiver_uses_caller_parameter_scope() -> Bool:
-	diagnostic(
-		"pure func identity(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tvalue.identity()\n",
-		67,
-		72,
-		"unknown value",
-		"use this function's parameter name, a declared variant, or a call",
+	diagnostic("pure func identity(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\tvalue.identity()\n", 67, 72, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			UnknownValue(_):
+				True
+			_:
+				False
 	)
 
 
@@ -614,12 +657,14 @@ pure func test_special_spellings_resolve_by_role_and_declaration_order() -> Bool
 
 
 pure func test_case_distinct_interned_name_is_not_a_declaration() -> Bool:
-	diagnostic(
-		"pure func One() -> Int:\n\t1\nfunc main() -> Int:\n\tone()\n",
-		48,
-		51,
-		"unknown function",
-		"declare the called function in this file or the explicit prelude",
+	diagnostic("pure func One() -> Int:\n\t1\nfunc main() -> Int:\n\tone()\n", 48, 51, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			UnknownFunction(_):
+				True
+			_:
+				False
 	)
 
 
@@ -652,6 +697,7 @@ pure func test_payload_match_example_is_accepted() -> Bool:
 tests: TestSuite = {
 	description = "Blorp 2 semantic checking",
 	tests = [
+		("typed second argument mismatch", test_typed_second_argument_mismatch),
 		("payload match example is accepted", test_payload_match_example_is_accepted),
 		("signed integer value survives checking", test_signed_integer_value_survives_checking),
 		(
@@ -744,3 +790,49 @@ tests: TestSuite = {
 		("mutual recursion diagnostic", test_mutual_recursion_diagnostic),
 	]
 }
+
+
+pure func test_typed_second_argument_mismatch() -> Bool:
+	prefix = "pure func first(left: Int, right: Int) -> Int:\n\tleft\nfunc main() -> Int:\n\tfirst(7, "
+	argument = "8.to_string()"
+
+	match (
+		lex(
+			prefix
+				.concat(argument)
+				.concat(")\n"),
+		).and_then(pure func(tokens): parse(tokens))
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_):
+					False
+				Err(failure):
+					match singleton_check_error(check_errors(failure)):
+						None:
+							False
+						Some(error):
+							match error.kind:
+								ArgumentTypeMismatch(mismatch):
+									match mismatch.expected_site:
+										SourceAnnotation(annotation):
+											(
+												same_type(mismatch.expected, IntType)
+												and same_type(
+													mismatch.actual.value_type,
+													StringType,
+												)
+												and error.span.start == prefix.length()
+												and error.span.end == prefix.length() + argument.length()
+												and mismatch.argument_position == 1
+												and mismatch.actual.span.start == prefix.length()
+												and mismatch.actual.span.end == prefix.length() + argument.length()
+												and annotation.start == "pure func first(left: Int, right: ".length()
+												and annotation.end == annotation.start + 3
+											)
+										_:
+											False
+								_:
+									False

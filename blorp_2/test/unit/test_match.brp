@@ -1,6 +1,12 @@
 import:
 	../../src/check:
 		BindingOrigin(ParameterBinding, MatchCapture),
+		CheckErrorKind(
+			ArgumentCountMismatch, RecursiveCallChain, ImpureCall, ArgumentTypeMismatch,
+			GenericArgumentConflict, UnsupportedPayloadAnnotation, NonExhaustiveMatch,
+			UnreachableArm, UnknownConstructorPattern, PatternUnexpectedField, PatternMissingField,
+			MatchRequiresUnion, ConstructorNeedsExpectedType, UnknownValue, UncallableBinding,
+		),
 		CheckedArm,
 		CheckedBase(ReturnBinding),
 		CheckedBody(CheckedMatchBody, CheckedValueBody),
@@ -9,6 +15,7 @@ import:
 		CheckedPattern(VariantCase, BindingCase),
 		CheckedProgram,
 		PayloadBinding(BindPayload),
+		PayloadRule(IntegerPayload),
 		PayloadShape(Payload),
 		TypeRef(IntType),
 		binding_number,
@@ -18,7 +25,7 @@ import:
 		variant_owner,
 	../../src/lex: lex
 	../../src/syntax: Diagnostic
-	input: check, parse
+	input: check, check_failure, parse, setup_diagnostic
 	test: TestSuite
 
 
@@ -34,7 +41,7 @@ private IDENTITY: String = "pure func identity(value: Int) -> Int:\n\tvalue\n"
 private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
 	input ?= lex(source)
 	parsed ?= parse(input)
-	check(parsed)
+	check(parsed).map_err(setup_diagnostic)
 
 
 private pure func accepts(source: String) -> Bool:
@@ -50,18 +57,16 @@ private pure func rejects(
 	text: String,
 	start: Int,
 	end: Int,
-	message: String,
-	help: String,
+	matches: pure (CheckErrorKind) -> Bool,
 ) -> Bool:
-	match checked(prefix + text + MAIN):
-		Ok(_):
+	match check_failure(prefix + text + MAIN):
+		None:
 			False
-		Err(error):
+		Some(error):
 			(
 				error.span.start == prefix.length() + start
 				and error.span.end == prefix.length() + end
-				and error.message == message
-				and error.help == help
+				and matches(error.kind)
 			)
 
 
@@ -213,23 +218,18 @@ pure func test_field_scope_shadowing_and_receiver_function_lookup() -> Bool:
 pure func test_bindings_cannot_call_or_leak_to_siblings() -> Bool:
 	prefix = VALUE + IDENTITY + UNWRAP + "match value:\n\t\tEmpty: 0\n\t\tNumber(identity): "
 	leak = VALUE + UNWRAP + "match value:\n\t\tNumber(item): item\n\t\tEmpty: "
-	(
-		rejects(
-			prefix,
-			"identity(identity)\n",
-			0,
-			8,
-			"match bindings cannot be called",
-			"use the binding as a value, or rename it to call the function",
-		)
-		and rejects(
-			leak,
-			"item\n",
-			0,
-			4,
-			"unknown value",
-			"use this function's parameter name, a declared variant, or a call",
-		)
+	rejects(prefix, "identity(identity)\n", 0, 8, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			UncallableBinding(_, MatchCapture, _):
+				True
+			_:
+				False
+	) and rejects(leak, "item\n", 0, 4, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			UnknownValue(_):
+				True
+			_:
+				False
 	)
 
 
@@ -247,72 +247,70 @@ pure func test_expected_type_flows_through_function_and_constructor_spines() -> 
 pure func test_constructor_scrutinee_needs_context_not_function_result() -> Bool:
 	prefix = VALUE + "pure func copy() -> Value:\n\tmatch "
 	(
-		rejects(
-			prefix,
-			"Number(42):\n\t\twhole: whole\n",
-			0,
-			6,
-			"constructor needs an expected union type",
-			"pass an already-typed union value or call a concrete helper returning the union",
+		rejects(prefix, "Number(42):\n\t\twhole: whole\n", 0, 6, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				ConstructorNeedsExpectedType(_):
+					True
+				_:
+					False
 		)
-		and rejects(
-			prefix,
-			"Empty:\n\t\twhole: whole\n",
-			0,
-			5,
-			"constructor needs an expected union type",
-			"pass an already-typed union value or call a concrete helper returning the union",
+		and rejects(prefix, "Empty:\n\t\twhole: whole\n", 0, 5, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				ConstructorNeedsExpectedType(_):
+					True
+				_:
+					False
 		)
 	)
 
 
 pure func test_int_scrutinee_is_rejected_even_with_wildcard() -> Bool:
-	rejects(
-		VALUE + UNWRAP + "match ",
-		"42:\n\t\t_: 0\n",
-		0,
-		2,
-		"match requires a union value",
-		"match a typed union parameter or a call returning a declared union",
+	rejects(VALUE + UNWRAP + "match ", "42:\n\t\t_: 0\n", 0, 2, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			MatchRequiresUnion(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_pattern_arity_and_constructor_shadowing() -> Bool:
 	prefix = VALUE + UNWRAP + "match value:\n\t\t"
 	shadow = VALUE + "pure func unwrap(Number: Value) -> Int:\n\tmatch Number:\n\t\tEmpty: 0\n\t\t"
-	(
-		rejects(
-			prefix,
-			"Number(): 0\n\t\tEmpty: 0\n",
-			0,
-			8,
-			"constructor pattern requires one field",
-			"write Variant(name) to bind the Int field, or Variant(_) to ignore it",
-		)
-		and rejects(
-			prefix,
-			"Number: 0\n\t\tEmpty: 0\n",
-			0,
-			6,
-			"constructor pattern requires one field",
-			"write Variant(name) to bind the Int field, or Variant(_) to ignore it",
-		)
-		and rejects(
-			prefix,
-			"Empty(_): 0\n\t\tNumber(_): 0\n",
-			0,
-			8,
-			"constructor pattern takes no fields",
-			"use the bare variant name or Variant() without field patterns",
-		)
-		and rejects(
-			shadow,
-			"Number(item): item\n",
-			0,
-			12,
-			"unknown constructor pattern",
-			"use an unshadowed variant of the matched union; rename a shadowing local binding",
-		)
+	rejects(prefix, "Number(): 0\n\t\tEmpty: 0\n", 0, 8, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			PatternMissingField(_, _):
+				True
+			_:
+				False
+	) and rejects(prefix, "Number: 0\n\t\tEmpty: 0\n", 0, 6, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			PatternMissingField(_, _):
+				True
+			_:
+				False
+	) and rejects(prefix, "Empty(_): 0\n\t\tNumber(_): 0\n", 0, 8, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			PatternUnexpectedField(_):
+				True
+			_:
+				False
+	) and rejects(shadow, "Number(item): item\n", 0, 12, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			UnknownConstructorPattern(_, _):
+				True
+			_:
+				False
 	)
 
 
@@ -322,51 +320,58 @@ pure func test_usefulness_checks_variants_and_whole_catchalls() -> Bool:
 	covered = VALUE + UNWRAP + "match value:\n\t\tEmpty: 0\n\t\tNumber(_): 0\n\t\t"
 	help = "remove this arm; earlier arms already cover all values it could match"
 	(
-		rejects(
-			prefix,
-			"Number(second): second\n\t\tEmpty: 0\n",
-			0,
-			14,
-			"match arm is unreachable",
-			help,
+		rejects(prefix, "Number(second): second\n\t\tEmpty: 0\n", 0, 14, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				UnreachableArm:
+					True
+				_:
+					False
 		)
-		and rejects(catchall, "Empty: 0\n", 0, 5, "match arm is unreachable", help)
-		and rejects(covered, "_: 0\n", 0, 1, "match arm is unreachable", help)
+		and rejects(catchall, "Empty: 0\n", 0, 5, pure func(kind: CheckErrorKind) -> Bool:
+			match kind:
+				UnreachableArm:
+					True
+				_:
+					False
+		)
+		and rejects(covered, "_: 0\n", 0, 1, pure func(kind: CheckErrorKind) -> Bool:
+			match kind:
+				UnreachableArm:
+					True
+				_:
+					False
+		)
 	)
 
 
 pure func test_missing_coverage_uses_keyword_span_and_payload_witness() -> Bool:
 	prefix = VALUE + UNWRAP
-	rejects(
-		prefix,
-		"match value:\n\t\tEmpty: 0\n",
-		0,
-		5,
-		"non-exhaustive match",
-		"add an arm for the missing variant: Number(_)",
+	rejects(prefix, "match value:\n\t\tEmpty: 0\n", 0, 5, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			NonExhaustiveMatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_payload_type_and_value_mismatches() -> Bool:
 	prefix = "fixed union Value:\n\tNumber("
 	argument = VALUE + "pure func empty() -> Value:\n\tEmpty\npure func make() -> Value:\n\t"
-	(
-		rejects(
-			prefix,
-			"Float)\n",
-			0,
-			5,
-			"only Int payloads are supported",
-			"declare a variant with no fields or one Int field, written Variant(Int)",
-		)
-		and rejects(
-			argument,
-			"Number(empty())\n",
-			0,
-			6,
-			"argument type does not match the parameter type",
-			"use an expression of type Int here",
-		)
+	rejects(prefix, "Float)\n", 0, 5, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			UnsupportedPayloadAnnotation(_, IntegerPayload):
+				True
+			_:
+				False
+	) and rejects(argument, "Number(empty())\n", 0, 6, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			ArgumentTypeMismatch(_):
+				True
+			_:
+				False
 	)
 
 
@@ -375,51 +380,43 @@ pure func test_purity_and_cycles_include_construction_arguments_and_hidden_arms(
 	arm = VALUE + "func impure(value: Int) -> Int:\n\tvalue\n" + UNWRAP + "match value:\n\t\tEmpty: 0\n\t\tNumber(item): "
 	cycle = VALUE + UNWRAP + "match value:\n\t\tEmpty: 0\n\t\tNumber(item): "
 	scrutinee = VALUE + "pure func copy(value: Value) -> Value:\n\tmatch "
-	(
-		rejects(
-			argument,
-			"impure())\n",
-			0,
-			6,
-			"pure functions cannot call impure functions",
-			"mark the callee pure or remove pure from the caller",
-		)
-		and rejects(
-			arm,
-			"impure(item)\n",
-			0,
-			6,
-			"pure functions cannot call impure functions",
-			"mark the callee pure or remove pure from the caller",
-		)
-		and rejects(
-			cycle,
-			"unwrap(Number(item))\n",
-			0,
-			6,
-			"call chain contains recursion",
-			"use an acyclic call chain; recursion is not supported in this increment",
-		)
-		and rejects(
-			scrutinee,
-			"copy(value):\n\t\twhole: whole\n",
-			0,
-			4,
-			"call chain contains recursion",
-			"use an acyclic call chain; recursion is not supported in this increment",
-		)
+	rejects(argument, "impure())\n", 0, 6, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			ImpureCall(_, _):
+				True
+			_:
+				False
+	) and rejects(arm, "impure(item)\n", 0, 6, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			ImpureCall(_, _):
+				True
+			_:
+				False
+	) and rejects(cycle, "unwrap(Number(item))\n", 0, 6, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			RecursiveCallChain:
+				True
+			_:
+				False
+	) and rejects(scrutinee, "copy(value):\n\t\twhole: whole\n", 0, 4, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			RecursiveCallChain:
+				True
+			_:
+				False
 	)
 
 
 pure func test_function_contract_diagnostics_precede_base_and_purity() -> Bool:
 	prefix = VALUE + "func impure() -> Int:\n\t0\n" + UNWRAP + "match value:\n\t\tEmpty: 0\n\t\tNumber(_): "
-	rejects(
-		prefix,
-		"impure(missing)\n",
-		0,
-		6,
-		"function takes no arguments",
-		"remove the argument and call the function with ()",
+	rejects(prefix, "impure(missing)\n", 0, 6, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			ArgumentCountMismatch(_):
+				True
+			_:
+				False
 	)
 
 
