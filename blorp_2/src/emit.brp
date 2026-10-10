@@ -6,6 +6,7 @@ import:
 		ValueId,
 		ValueOperation(
 			ParameterValue, IntegerValue, VariantValue, CallValue, ConstructValue, PayloadValue,
+			ConstructRecordValue, ReadRecordFieldValue,
 		),
 		value_number,
 	option: to_result
@@ -18,7 +19,8 @@ import:
 		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(
 			ParameterDefinition, IntegerDefinition, VariantDefinition, CallDefinition,
-			ConstructDefinition, PayloadDefinition,
+			ConstructDefinition, PayloadDefinition, ConstructRecordDefinition,
+			ReadRecordFieldDefinition,
 		),
 		OwnerId,
 		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
@@ -28,12 +30,18 @@ import:
 		owner_number,
 	specialize:
 		CallTarget(UserFunction, RuntimeFunction),
+		ConcreteRecord,
 		ConcreteUnion,
+		FieldInstanceId,
 		PayloadShape(NoPayload, IntPayload),
-		TypeRef(IntType, StringType, UnionType),
+		RecordInstanceId,
+		TypeRef(IntType, StringType, UnionType, RecordType),
 		UnionInstanceId,
 		VariantInstanceId,
+		field_number,
+		field_owner,
 		function_number,
+		record_number,
 		union_number,
 		variant_number,
 		variant_owner,
@@ -125,11 +133,43 @@ private pure func union_c_type(id: UnionInstanceId, declaration: ConcreteUnion) 
 	prefix.append_int(union_number(id))
 
 
+private pure func record_c_type(id: RecordInstanceId) -> String:
+	"struct blorp_r_".append_int(record_number(id))
+
+
+private pure func c_field(id: FieldInstanceId) -> String:
+	"blorp_rf_"
+		.append_int(record_number(field_owner(id)))
+		.concat("_")
+		.append_int(field_number(id))
+
+
+private pure func append_record(output: String, layout: ConcreteRecord, index: Int) -> String:
+	var result = output
+		.concat("struct blorp_r_")
+		.append_int(index)
+		.concat("{")
+	var position = 0
+
+	for _ in layout.fields:
+		result = result
+			.concat("int64_t blorp_rf_")
+			.append_int(index)
+			.concat("_")
+			.append_int(position)
+			.concat(";")
+		position = IntOps.add(position, 1)
+
+	result.concat("};")
+
+
 private pure func c_type(
 	type_ref: TypeRef,
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	match type_ref:
+		RecordType(id):
+			Ok(record_c_type(id))
 		IntType:
 			Ok("int64_t")
 		StringType:
@@ -226,6 +266,32 @@ private pure func append_operation(
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	match operation:
+		ConstructRecordValue(owner, fields):
+			var result = output
+				.concat("((")
+				.concat(record_c_type(owner))
+				.concat("){")
+			var position = 0
+
+			for field in fields:
+				if position > 0:
+					result = result.concat(",")
+
+				result = result
+					.concat(".")
+					.concat(c_field(field.field))
+					.concat("=")
+					.concat(c_value(field.value))
+				position = IntOps.add(position, 1)
+
+			Ok(result.concat("})"))
+		ReadRecordFieldValue(field, value):
+			Ok(
+				output
+					.concat(c_value(value))
+					.concat(".")
+					.concat(c_field(field)),
+			)
 		ParameterValue(index):
 			Ok(output.concat(c_parameter(index)))
 		IntegerValue(value):
@@ -316,6 +382,10 @@ private pure func append_value(
 
 private pure func expression_operation(operation: OwnedValueOperation) -> ValueOperation:
 	match operation:
+		ConstructRecordDefinition(owner, fields):
+			ConstructRecordValue(owner, fields)
+		ReadRecordFieldDefinition(field, value):
+			ReadRecordFieldValue(field, value)
 		ParameterDefinition(index):
 			ParameterValue(index)
 		IntegerDefinition(value):
@@ -604,6 +674,12 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 		"#include <stdint.h>\n"
 
 	var index: Int = 0
+
+	for declaration in checked.records:
+		output = append_record(output, declaration, index)
+		index = IntOps.add(index, 1)
+
+	index = 0
 
 	for declaration in checked.unions:
 		output = append_union(output, declaration, index)

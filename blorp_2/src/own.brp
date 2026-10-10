@@ -7,22 +7,29 @@ import:
 		LoweredProgram,
 		LoweredTail(ReturnValue, MatchValue),
 		MatchLabel,
+		RecordFieldValue,
 		ValueDefinition,
 		ValueId,
 		ValueOperation(
 			ParameterValue, IntegerValue, VariantValue, CallValue, ConstructValue, PayloadValue,
+			ConstructRecordValue, ReadRecordFieldValue,
 		),
 		lowered_functions,
 		value_number,
 	option: to_result
 	specialize:
 		ConcreteCall,
+		ConcreteRecord,
 		ConcreteUnion,
+		FieldInstanceId,
 		FunctionInstanceId,
 		FunctionSignature,
-		TypeRef(IntType, StringType, UnionType),
+		RecordInstanceId,
+		TypeRef(IntType, StringType, UnionType, RecordType),
 		UnionInstanceId,
 		VariantInstanceId,
+		record_number,
+		same_type,
 		union_number,
 	syntax: Diagnostic, Span
 	text: concat
@@ -69,6 +76,8 @@ fixed union ResultOwnership:
 
 
 fixed union OwnedValueOperation:
+	ConstructRecordDefinition(RecordInstanceId, List[RecordFieldValue])
+	ReadRecordFieldDefinition(FieldInstanceId, ValueId)
 	ParameterDefinition(Int)
 	IntegerDefinition(Int)
 	VariantDefinition(VariantInstanceId)
@@ -124,6 +133,7 @@ fixed record OwnedFunction {
 
 
 fixed record OwnershipProgram {
+	records: List[ConcreteRecord],
 	unions: List[ConcreteUnion],
 	functions: List[OwnedFunction],
 	entrypoint: FunctionInstanceId
@@ -142,8 +152,38 @@ private pure func internal_error(span: Span, message: String) -> Diagnostic:
 pure func value_ownership(
 	type_ref: TypeRef,
 	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
 ) -> Result[ValueOwnership, Diagnostic]:
 	match type_ref:
+		RecordType(id):
+			layout ?= records
+				.get(record_number(id))
+				.to_result(
+					internal_error(
+						{
+							start = 0,
+							end = 0
+						},
+						"invalid record identity in ownership representation",
+					),
+				)
+			var valid = layout.fields.length() > 0
+
+			for field in layout.fields:
+				valid = valid and same_type(field, IntType)
+
+			if valid:
+				Ok(NoOwnership)
+			else:
+				Err(
+					internal_error(
+						{
+							start = 0,
+							end = 0
+						},
+						"unsupported record layout in ownership representation",
+					),
+				)
 		IntType:
 			Ok(NoOwnership)
 		StringType:
@@ -216,6 +256,32 @@ pure func block_last_uses(
 			break
 
 		updated = match definition.operation:
+			ConstructRecordValue(_, fields):
+				var current = uses
+				var error: Option[Diagnostic] = None
+
+				for field in fields:
+					match record_use(
+						current,
+						field.value,
+						position,
+						prefix_count,
+						first_value,
+						definition.span,
+					):
+						Ok(recorded):
+							current = recorded
+						Err(failure):
+							error = Some(failure)
+							break
+
+				match error:
+					Some(error):
+						Err(error)
+					None:
+						Ok(current)
+			ReadRecordFieldValue(_, value):
+				record_use(uses, value, position, prefix_count, first_value, definition.span)
 			CallValue(_, arguments):
 				var current = uses
 				var failure: Option[Diagnostic] = None
@@ -348,10 +414,15 @@ private pure func build_definition(
 	first_value: Int,
 	next_owner: Int,
 	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
 ) -> Result[BuiltDefinition, Diagnostic]:
-	plan ?= value_ownership(definition.value_type, unions)
+	plan ?= value_ownership(definition.value_type, unions, records)
 
 	operation_result: Result[OwnedValueOperation, Diagnostic] = match definition.operation:
+		ConstructRecordValue(owner, fields):
+			Ok(ConstructRecordDefinition(owner, fields))
+		ReadRecordFieldValue(field, value):
+			Ok(ReadRecordFieldDefinition(field, value))
 		ParameterValue(index):
 			Ok(ParameterDefinition(index))
 		IntegerValue(value):
@@ -439,11 +510,12 @@ private pure func managed_match(span: Span) -> Diagnostic:
 private pure func require_unmanaged(
 	definitions: List[ValueDefinition],
 	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
 ) -> Result[Bool, Diagnostic]:
 	var failure: Option[Diagnostic] = None
 
 	for definition in definitions:
-		match value_ownership(definition.value_type, unions):
+		match value_ownership(definition.value_type, unions, records):
 			Err(error):
 				failure = Some({ error | span = definition.span })
 				break
@@ -519,6 +591,7 @@ private pure func insert_block(
 	first_value: Int,
 	initial_owner: Int,
 	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
 ) -> Result[InsertedBlock, Diagnostic]:
 	uses ?= block_last_uses(definitions, result, prefix.length(), first_value)
 	var drops = definitions.map(pure func(_: ValueDefinition) -> List[ScheduledDrop]: [])
@@ -529,7 +602,15 @@ private pure func insert_block(
 	var failure: Option[Diagnostic] = None
 
 	for definition in definitions:
-		match build_definition(definition, sources, prefix, first_value, next_owner, unions):
+		match build_definition(
+			definition,
+			sources,
+			prefix,
+			first_value,
+			next_owner,
+			unions,
+			records,
+		):
 			Err(error):
 				failure = Some(error)
 				break
@@ -612,8 +693,9 @@ private pure func insert_match(
 	function: LoweredFunction,
 	matched: LoweredMatch,
 	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
 ) -> Result[OwnedFunction, Diagnostic]:
-	valid_prefix ?= require_unmanaged(function.definitions, unions)
+	valid_prefix ?= require_unmanaged(function.definitions, unions, records)
 	var operations: List[OwnershipOperation] = []
 	var sources: List[ValueSource] = []
 	var next_value = function.definitions.length()
@@ -622,7 +704,7 @@ private pure func insert_match(
 	var failure: Option[Diagnostic] = None
 
 	for definition in function.definitions:
-		match build_definition(definition, sources, [], 0, 0, unions):
+		match build_definition(definition, sources, [], 0, 0, unions, records):
 			Ok(built):
 				operations = operations.append(DefineValue(built.definition))
 				sources = sources.append(built.source)
@@ -638,6 +720,7 @@ private pure func insert_match(
 			next_value,
 			next_owner,
 			unions,
+			records,
 		):
 			Ok(built):
 				arms = arms.append({
@@ -669,17 +752,18 @@ private pure func insert_match(
 pure func insert_function(
 	function: LoweredFunction,
 	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
 ) -> Result[OwnedFunction, Diagnostic]:
 	match function.tail:
 		ReturnValue(result):
-			built ?= insert_block(function.definitions, result, [], 0, 0, unions)
+			built ?= insert_block(function.definitions, result, [], 0, 0, unions, records)
 			Ok({
 				signature = function.signature,
 				operations = built.operations,
 				tail = ReturnTail(built.result),
 			})
 		MatchValue(matched):
-			insert_match(function, matched, unions)
+			insert_match(function, matched, unions, records)
 
 
 pure func own(program: LoweredProgram) -> Result[OwnershipProgram, Diagnostic]:
@@ -688,7 +772,7 @@ pure func own(program: LoweredProgram) -> Result[OwnershipProgram, Diagnostic]:
 	var failure: Option[Diagnostic] = None
 
 	for function in contents.functions:
-		match insert_function(function, contents.unions):
+		match insert_function(function, contents.unions, contents.records):
 			Ok(owned):
 				functions = functions.append(owned)
 			Err(error):
@@ -700,6 +784,7 @@ pure func own(program: LoweredProgram) -> Result[OwnershipProgram, Diagnostic]:
 			Err(error)
 		None:
 			Ok({
+				records = contents.records,
 				unions = contents.unions,
 				functions = functions,
 				entrypoint = contents.entrypoint,

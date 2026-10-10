@@ -1,0 +1,269 @@
+import:
+	../../src/lex: lex
+	../../src/names: name_spelling
+	../../src/parse: parsed_contents
+	../../src/syntax:
+		ExpressionBase(RecordExpression, DirectApplication),
+		ParsedBody(ParsedValueBody),
+		PostfixOperation(FieldAccess, ReceiverInvocation),
+	../unit/input: parse
+	option: is_none
+	test: TestSuite
+
+
+private IDENTIFIER_HELP: String = (
+	"use an ASCII identifier starting with a letter or underscore; 'func', 'pure', "
+	+ "'match', 'var', and lone '_' are reserved"
+)
+
+private MAIN: String =
+	|func main() -> Int:
+	|	0
+	|
+
+
+private pure func accepts(source: String) -> Bool:
+	match lex(source).and_then(pure func(tokens): parse(tokens)):
+		Ok(_):
+			True
+		_:
+			False
+
+
+private pure func rejects(
+	prefix: String,
+	marked: String,
+	suffix: String,
+	message: String,
+	help: String,
+) -> Bool:
+	match lex(prefix + marked + suffix).and_then(pure func(tokens): parse(tokens)):
+		Err(error):
+			(
+				error.span.start == prefix.length()
+				and error.span.end == prefix.length() + marked.length()
+				and error.message == message
+				and error.help == help
+				and error.note.is_none()
+			)
+		_:
+			False
+
+
+pure func test_contextual_words_remain_ordinary_names() -> Bool:
+	source: String =
+		|fixed record fixed { record: Int, union: Int }
+		|pure func record(fixed: fixed) -> Int:
+		|	fixed.record
+		|func main() -> Int:
+		|	record({ union = 9, record = 7 })
+		|
+	accepts(source)
+
+
+pure func test_nested_calls_and_literal_arguments() -> Bool:
+	source: String =
+		|fixed record Pair { first: Int, second: Int }
+		|func main() -> Int:
+		|	outer({ second = inner(9), first = 7 }).first.to_string().length()
+		|
+	accepts(source)
+
+
+pure func test_record_literal_and_projection_spans() -> Bool:
+	prefix = "func main() -> Int:\n\t"
+	literal = "{ second = inner(9), first = 7 }"
+	source = prefix + literal + ".first\n"
+
+	match lex(source).and_then(pure func(tokens): parse(tokens)):
+		Ok(program):
+			parsed = parsed_contents(program)
+
+			match parsed.functions:
+				[function]:
+					match function.body:
+						ParsedValueBody(value):
+							match value.base:
+								RecordExpression([second, first]):
+									match second.value.base:
+										DirectApplication(_, [child]):
+											match value.applications:
+												[FieldAccess(field)]:
+													(
+														value.base_span.start == prefix.length()
+														and value.base_span.end == prefix.length() + literal.length()
+														and value.span.end == prefix.length() + literal.length() + 6
+														and second.name.span.start == prefix.length() + 2
+														and second.name.span.end == prefix.length() + 8
+														and second.value.span.start == prefix.length() + 11
+														and second.value.span.end == prefix.length() + 19
+														and child.span.start == prefix.length() + 17
+														and child.span.end == prefix.length() + 18
+														and first.value.span.start == prefix.length() + 29
+														and field.span.start == prefix.length() + literal.length() + 1
+														and field.span.end == prefix.length() + literal.length() + 6
+														and name_spelling(
+															parsed.names,
+															field.id,
+														) == Some("first")
+													)
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_empty_literal_is_syntax_but_empty_declaration_is_not() -> Bool:
+	(
+		accepts("func main() -> Int:\n\t{}\n")
+		and rejects(
+			"fixed record Empty { ",
+			"}",
+			"\n" + MAIN,
+			"expected a record field name",
+			IDENTIFIER_HELP,
+		)
+	)
+
+
+pure func test_declaration_requires_opening_brace() -> Bool:
+	rejects(
+		"fixed record Pair ",
+		":",
+		"\n" + MAIN,
+		"expected '{' after the record type name",
+		"write fixed record Name { field: Int }",
+	)
+
+
+pure func test_generic_record_declaration_is_deferred() -> Bool:
+	rejects(
+		"fixed record Pair",
+		"[",
+		"T] { first: Int }\n" + MAIN,
+		"expected '{' after the record type name",
+		"write fixed record Name { field: Int }",
+	)
+
+
+pure func test_missing_literal_equals() -> Bool:
+	rejects(
+		"func main() -> Int:\n\t{ first ",
+		":",
+		" 7 }\n",
+		"expected '=' after the record field name",
+		"write field = expression",
+	)
+
+
+pure func test_literal_requires_comma() -> Bool:
+	rejects(
+		"func main() -> Int:\n\t{ first = 7 ",
+		"second",
+		" = 9 }\n",
+		"expected '}' after the record fields",
+		"keep record fields on one line, separated by commas",
+	)
+
+
+pure func test_declaration_requires_comma() -> Bool:
+	rejects(
+		"fixed record Pair { first: Int ",
+		"second",
+		": Int }\n" + MAIN,
+		"expected '}' after the record declaration",
+		"keep nonempty record fields on one line, separated by commas",
+	)
+
+
+pure func test_literal_trailing_comma_is_rejected() -> Bool:
+	rejects(
+		"func main() -> Int:\n\t{ first = 7, ",
+		"}",
+		"\n",
+		"expected a record field name",
+		IDENTIFIER_HELP,
+	)
+
+
+pure func test_declaration_trailing_comma_is_rejected() -> Bool:
+	rejects(
+		"fixed record Pair { first: Int, ",
+		"}",
+		"\n" + MAIN,
+		"expected a record field name",
+		IDENTIFIER_HELP,
+	)
+
+
+pure func test_multiline_literal_is_deferred() -> Bool:
+	rejects(
+		"func main() -> Int:\n\t{ first = 7,",
+		"\n",
+		"\tsecond = 9 }\n",
+		"expected a record field name",
+		IDENTIFIER_HELP,
+	)
+
+
+pure func test_multiline_declaration_is_deferred() -> Bool:
+	rejects(
+		"fixed record Pair { first: Int,",
+		"\n",
+		"second: Int }\n" + MAIN,
+		"expected a record field name",
+		IDENTIFIER_HELP,
+	)
+
+
+pure func test_missing_literal_closing_brace() -> Bool:
+	rejects(
+		"func main() -> Int:\n\t{ first = 7",
+		"",
+		"",
+		"expected '}' after the record fields",
+		"keep record fields on one line, separated by commas",
+	)
+
+
+pure func test_missing_declaration_closing_brace() -> Bool:
+	rejects(
+		"fixed record Pair { first: Int",
+		"",
+		"",
+		"expected '}' after the record declaration",
+		"keep nonempty record fields on one line, separated by commas",
+	)
+
+
+tests: TestSuite = {
+	description = "Fixed record grammar",
+	tests = [
+		("contextual fixed record union names", test_contextual_words_remain_ordinary_names),
+		("nested calls and concrete literal arguments", test_nested_calls_and_literal_arguments),
+		("literal name child and projection byte spans", test_record_literal_and_projection_spans),
+		(
+			"empty literal parses and empty declaration rejects",
+			test_empty_literal_is_syntax_but_empty_declaration_is_not,
+		),
+		("declaration opening brace", test_declaration_requires_opening_brace),
+		("generic record declaration deferred", test_generic_record_declaration_is_deferred),
+		("literal equals", test_missing_literal_equals),
+		("literal comma", test_literal_requires_comma),
+		("declaration comma", test_declaration_requires_comma),
+		("literal trailing comma", test_literal_trailing_comma_is_rejected),
+		("declaration trailing comma", test_declaration_trailing_comma_is_rejected),
+		("multiline literal deferred", test_multiline_literal_is_deferred),
+		("multiline declaration deferred", test_multiline_declaration_is_deferred),
+		("literal closing brace", test_missing_literal_closing_brace),
+		("declaration closing brace", test_missing_declaration_closing_brace),
+	]
+}

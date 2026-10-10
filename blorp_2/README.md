@@ -299,7 +299,7 @@ ceiling is exceeded. Ceilings are adjusted deliberately with retained evidence.
 | ufcs_calls | 1,500 | 40,000,000 |
 | ufcs_chain | 1,600 | 40,000,000 |
 | return_42 | 800 | 40,000,000 |
-| union_values | 4,000 | 40,000,000 |
+| union_values | 4,000 | 45,000,000 |
 | match_value | 5,000 | 100,000,000 |
 | bindings | 10,000 | 100,000,000 |
 | mortal Strings | 20,000 | 200,000,000 |
@@ -312,9 +312,21 @@ same single-compilation measurement path as the primary examples.
 The multiple-argument increment deliberately raises only `union_values` from
 3,600 to 4,000 allocations. Its frozen baseline uses 3,574 allocations and the
 candidate uses 3,641 (+1.87%); matched instruction medians increase 0.50%.
-The 40-million instruction limit is unchanged. Removing redundant parameter
+At that increment the 40-million instruction limit was unchanged. Removing redundant parameter
 type copies and temporary traversal lists reduced the initial overhead; further
 special cases to recover the remaining 41 allocations are not justified.
+
+The fixed-record validation deliberately raises only the `union_values`
+instruction ceiling from 40M to 45M after coordinator and independent review.
+The first full gate used 40,111,881 instructions (3,668/4,000 allocations).
+Historical cleanup baseline/final measurements already used 40,031,543 and
+40,052,080; an unchanged gate failed at 40,004,573 then passed at 39,920,129.
+The current matched minima are 39,210,111 → 39,359,584 (+0.381%), with candidate
+maximum 39,382,264. This establishes marginal process-startup headroom rather
+than repeatable growth above 5%. The 4,000 allocation limit, all other fixture
+ceilings, and the separate 10% allocation/5% minimum-instruction investigation
+stops are unchanged. The [fixed-record report](../benchmarks/results/blorp_2_fixed_records_2026-10-10.md)
+preserves the failed full gate and final rerun.
 
 Historical matched `-O2` measurements of ordered-value lowering increased
 allocations on the ten frozen prior inputs
@@ -494,13 +506,15 @@ managed payloads remain deferred.
 
 This specification defines only the examples' language: functions with explicit
 return types, an ordered list of explicitly typed parameters, an optional ordered list of type
-parameters on functions and fixed unions. Union variants have zero fields or
+parameters on functions and fixed unions, plus nongeneric fixed records with
+one or more `Int` fields. Union variants have zero fields or
 one field annotated `Int` or one of the union's own parameters; concrete fields
 specialize to Int. A function
 body has zero or more binding lines followed by a single expression or a tail
 match with inline arm results or binding blocks. Expressions
-start with a signed Int64 literal, a binding or variant name, or an application
-with an ordered list of arguments. UFCS suffixes may follow that expression.
+start with a signed Int64 literal, a binding or variant name, a record literal,
+or an application with an ordered list of arguments. UFCS calls and record
+field suffixes may follow that expression.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
 No other declarations, expressions, literals, statements, or comments are supported.
 
@@ -558,6 +572,23 @@ Lexical and layout rules:
   Function parameter and return annotations accept a nonempty list of atomic arguments,
   such as `Box[Int]` or `Result[T, E]`. Empty declaration parentheses, multiple fields
   and nested written applications are unsupported.
+- `fixed record Pair { first: Int, second: Int }` declares a nominal record
+  on one line. Field names must be distinct and every field must be `Int`.
+  `record` remains a contextual header word. Generic, empty, recursive and
+  managed record types are outside this increment.
+- `{ second = 9, first = 7 }` constructs the concrete record required by a
+  helper return type, concrete parameter or existing binding reassignment.
+  Every field appears exactly once. Expressions evaluate in written order;
+  field order in the literal may differ from declaration order. A new inferred
+  binding alone supplies no record context. `{}` parses and reports the first
+  missing field. Declarations and literals stay on one line; trailing commas,
+  updates and field assignments are unsupported.
+- `pair.first` reads a declared field; `pair.read_first()` remains a UFCS call.
+  An immediate nongeneric UFCS receiver parameter may supply literal context.
+  A field read or generic call supplies none, and later operations never infer
+  a literal's type through an earlier field read. Records pass and return by
+  value, including through existing generic functions whose arguments infer
+  a concrete record. Copies and whole-binding reassignment preserve old aliases.
 - `match expression:` starts a nonempty sequence of depth-two arms written
   `Pattern: expression` or `Pattern:` followed by a depth-three block of
   binding lines and a mandatory final expression. A pattern is a bare name,
@@ -893,8 +924,12 @@ end-to-end cost. Self-compilation is a later milestone.
 
 [MEMORY_PLAN.md](MEMORY_PLAN.md) records the managed String slice and proposed
 later memory responsibilities, including the limits of current verification.
-The next [fixed-record increment](RECORDS_PLAN.md) specifies unmanaged `Int`
-fields, construction and field reads; it is not implemented yet.
+The [fixed-record increment](RECORDS_PLAN.md) adds unmanaged `Int` fields,
+construction and field reads. Its working
+[Pair example](test/e2e/fixtures/record/basic.brp) returns 7 with empty streams;
+the generated record is a C struct passed by value without heap allocation or
+reference counting. The [managed-record proposal](MANAGED_RECORDS_PLAN.md)
+describes a separate next increment and is not implemented or authorized here.
 
 Compiler source under `src/` stays within the agreed eventual subset: `String`, `Int`
 (64-bit), `Float` (64-bit), `Bool`, `Void`, `List`, `Option`, `Result`, `Dict`,

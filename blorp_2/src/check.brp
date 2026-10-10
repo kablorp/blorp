@@ -8,13 +8,13 @@ import:
 		runtime_operation,
 	int as IntOps
 	names: NameId, SpecialNames, same_name
-	option: is_some
+	option: is_some, to_result
 	parse: ParsedContents, ParsedProgram, parsed_contents
 	result: and_then
 	syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
 		CallNotation(DirectCall, ReceiverCall),
-		ExpressionBase(IntegerExpression, NameExpression, DirectApplication),
+		ExpressionBase(IntegerExpression, NameExpression, DirectApplication, RecordExpression),
 		FieldPattern(FieldName, FieldWildcard),
 		ParsedBinding,
 		ParsedBody(ParsedValueBody, ParsedMatchBody),
@@ -23,7 +23,10 @@ import:
 		ParsedMatchArm,
 		ParsedParameter,
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
+		ParsedRecord,
+		ParsedRecordField,
 		ParsedUnion,
+		PostfixOperation(ReceiverInvocation, FieldAccess),
 		Purity(Pure, Impure),
 		ReceiverApplication,
 		Span,
@@ -38,6 +41,22 @@ import:
 opaque type FunctionId = Int
 
 opaque type UnionId = Int
+
+opaque type RecordId = Int
+
+
+private fixed record FieldIdentity {
+	owner: RecordId,
+	position: Int
+}
+
+
+opaque type FieldId = FieldIdentity
+
+
+fixed record CheckedRecord {
+	fields: List[TypeUse]
+}
 
 
 fixed union TypeParameterOwner:
@@ -67,6 +86,7 @@ opaque type VariantId = VariantIdentity
 fixed union TypeRef:
 	IntType
 	StringType
+	RecordType(RecordId)
 	UnionType(UnionId)
 	AppliedUnionType(UnionId, List[TypeRef])
 	ParameterType(TypeParameterId)
@@ -156,7 +176,15 @@ pure func binding_number(id: BindingId) -> Int:
 	from_opaque BindingId(id)
 
 
+fixed record CheckedRecordField {
+	field: FieldId,
+	value: CheckedValue,
+	span: Span
+}
+
+
 fixed union CheckedBase:
+	ReturnRecord(RecordId, List[CheckedRecordField])
 	ReturnInteger(Int)
 	ReturnVariant(VariantId)
 	ReturnBinding(BindingId)
@@ -166,6 +194,7 @@ fixed union CheckedBase:
 fixed union CheckedOperation:
 	InvokeFunction(CheckedCall, List[CheckedValue])
 	ConstructVariant(VariantId)
+	ReadRecordField(FieldId)
 
 
 fixed record CheckedStep {
@@ -228,6 +257,7 @@ fixed record CheckedFunction {
 
 
 fixed record CheckedFunctions {
+	records: List[CheckedRecord],
 	unions: List[CheckedUnion],
 	functions: List[CheckedFunction],
 	entrypoint: FunctionId
@@ -235,6 +265,18 @@ fixed record CheckedFunctions {
 
 
 opaque type CheckedProgram = CheckedFunctions
+
+
+pure func record_number(id: RecordId) -> Int:
+	from_opaque RecordId(id)
+
+
+pure func field_owner(id: FieldId) -> RecordId:
+	from_opaque FieldId(id).owner
+
+
+pure func field_number(id: FieldId) -> Int:
+	from_opaque FieldId(id).position
 
 
 pure func union_number(id: UnionId) -> Int:
@@ -251,6 +293,12 @@ pure func variant_number(id: VariantId) -> Int:
 
 pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 	match left:
+		RecordType(left):
+			match right:
+				RecordType(right):
+					IntOps.equals(record_number(left), record_number(right))
+				_:
+					False
 		AppliedUnionType(left_owner, left_argument):
 			match right:
 				AppliedUnionType(right_owner, right_argument):
@@ -345,6 +393,12 @@ pure func declaration_id(program: CheckedProgram, position: Int) -> Option[Funct
 		.map(pure func(_): into_opaque FunctionId(position))
 
 
+pure func record_declaration_id(program: CheckedProgram, position: Int) -> Option[RecordId]:
+	from_opaque CheckedProgram(program).records
+		.get(position)
+		.map(pure func(_): into_opaque RecordId(position))
+
+
 pure func union_declaration_id(program: CheckedProgram, position: Int) -> Option[UnionId]:
 	from_opaque CheckedProgram(program).unions
 		.get(position)
@@ -425,6 +479,15 @@ fixed union PreviousTypeDeclaration:
 
 
 fixed union CheckErrorKind:
+	DuplicateRecordType(NameId, PreviousTypeDeclaration)
+	DuplicateRecordField(NameId, Span)
+	UnsupportedRecordField(TypeRef)
+	RecordNeedsExpectedType
+	UnknownRecordField(NameId, RecordId)
+	DuplicateLiteralField(NameId, Span)
+	MissingRecordField(FieldId, Span)
+	RecordFieldTypeMismatch(FieldId, TypeUse, Span)
+	FieldRequiresRecord(TypeRef)
 	DuplicateVariant(NameId, Span)
 	DuplicateUnion(NameId, PreviousTypeDeclaration)
 	DuplicateFunction(NameId, Span)
@@ -498,6 +561,20 @@ private fixed record ExpectedValue {
 }
 
 
+private pure func find_record(records: List[ParsedRecord], name: NameId) -> Option[RecordId]:
+	var found: Option[RecordId] = None
+	var position = 0
+
+	for declaration in records:
+		if same_name(declaration.type_name.id, name):
+			found = Some(into_opaque RecordId(position))
+			break
+
+		position = IntOps.add(position, 1)
+
+	found
+
+
 private pure func find_union(unions: List[ParsedUnion], name: NameId) -> Option[UnionId]:
 	var index: Int = 0
 	var found: Option[UnionId] = None
@@ -530,7 +607,13 @@ private pure func contains_variant(unions: List[ParsedUnion], name: NameId) -> B
 private pure func validate_union(
 	declaration: ParsedUnion,
 	functions: List[ParsedFunction],
-) -> Result[Void, CheckError]:
+	owner: UnionId,
+	type_names: List[PreviousDeclaration],
+	unions: List[ParsedUnion],
+	records: List[ParsedRecord],
+	special: SpecialNames,
+) -> Result[CheckedDeclaration, CheckError]:
+	unique ?= validate_type_name(declaration.type_name, type_names, UnionKind, special)
 	var previous: List[WrittenName] = []
 	var failure: Option[CheckError] = None
 
@@ -582,80 +665,244 @@ private pure func validate_union(
 
 		previous = previous.append(variant)
 
-	match failure:
+	valid ?= match failure:
 		Some(error):
 			Err(error)
 		None:
 			Ok(void)
 
+	parameters ?= local_type_parameters(
+		declaration.type_parameters,
+		UnionDeclaration(owner),
+		unions,
+		records,
+		special,
+	)
+	shapes ?= resolve_payloads(declaration, parameters, special)
+	Ok(
+		UnionDeclarationResult(
+			declaration.type_name,
+			{
+				type_parameters = declared_parameters(parameters),
+				variants = shapes
+			},
+		),
+	)
 
-private pure func validate_unions(
+
+private fixed record CheckedDeclarations {
+	unions: List[CheckedUnion],
+	records: List[CheckedRecord]
+}
+
+
+private fixed union CheckedDeclaration:
+	UnionDeclarationResult(WrittenName, CheckedUnion)
+	RecordDeclarationResult(WrittenName, CheckedRecord)
+
+
+private fixed union DeclarationKind:
+	UnionKind
+	RecordKind
+
+
+private fixed record PreviousDeclaration {
+	name: WrittenName,
+	kind: DeclarationKind
+}
+
+
+private pure func validate_type_name(
+	name: WrittenName,
+	previous: List[PreviousDeclaration],
+	kind: DeclarationKind,
+	special: SpecialNames,
+) -> Result[Void, CheckError]:
+	var earlier: Option[PreviousDeclaration] = None
+
+	for declaration in previous:
+		if same_name(name.id, declaration.name.id):
+			earlier = Some(declaration)
+			break
+
+	previous_type = if same_name(name.id, special.integer) or same_name(name.id, special.string):
+		Some(PreludeTypeDeclaration(name.id))
+	else:
+		earlier.map(pure func(declaration): SourceTypeDeclaration(declaration.name.span))
+
+	match previous_type:
+		Some(first):
+			record_conflict = match kind:
+				RecordKind:
+					True
+				UnionKind:
+					match earlier:
+						Some(declaration):
+							match declaration.kind:
+								RecordKind:
+									True
+								UnionKind:
+									False
+						_:
+							False
+
+			if record_conflict:
+				Err(check_rejection(name.span, DuplicateRecordType(name.id, first)))
+			else:
+				Err(check_rejection(name.span, DuplicateUnion(name.id, first)))
+		None:
+			Ok(void)
+
+
+private pure func validate_declarations(
 	unions: List[ParsedUnion],
+	records: List[ParsedRecord],
 	functions: List[ParsedFunction],
 	special: SpecialNames,
-) -> Result[List[CheckedUnion], CheckError]:
-	var previous: List[WrittenName] = []
-	var checked: List[CheckedUnion] = []
+) -> Result[CheckedDeclarations, CheckError]:
+	var previous: List[PreviousDeclaration] = []
+	var checked_unions: List[CheckedUnion] = []
+	var checked_records: List[CheckedRecord] = []
+	var union_position = 0
+	var record_position = 0
 	var failure: Option[CheckError] = None
 
-	for declaration in unions:
-		earlier = previous_declaration(previous, declaration.type_name.id)
+	while union_position < unions.length() or record_position < records.length():
+		union_next = unions.get(union_position)
+		record_next = records.get(record_position)
 
-		duplicate: Option[PreviousTypeDeclaration] = if (
-			same_name(declaration.type_name.id, special.integer)
-			or same_name(declaration.type_name.id, special.string)
-		):
-			Some(PreludeTypeDeclaration(declaration.type_name.id))
-		else:
-			earlier.map(pure func(known): SourceTypeDeclaration(known.span))
-
-		match duplicate:
-			Some(first):
-				failure = Some(
-					check_rejection(
-						declaration.type_name.span,
-						DuplicateUnion(declaration.type_name.id, first),
-					),
-				)
-				break
+		use_record = match record_next:
+			Some(declaration):
+				match union_next:
+					Some(other):
+						declaration.type_name.span.start < other.type_name.span.start
+					None:
+						True
 			None:
-				void
+				False
 
-		match validate_union(declaration, functions):
+		result: Result[CheckedDeclaration, CheckError] = if use_record:
+			match record_next:
+				Some(declaration):
+					check_record_declaration(declaration, previous, unions, records, special)
+				None:
+					Err(
+						checker_invariant(
+							{
+								start = 0,
+								end = 0
+							},
+							InvalidRecordDeclaration(into_opaque RecordId(record_position)),
+						),
+					)
+		else:
+			match union_next:
+				Some(declaration):
+					validate_union(
+						declaration,
+						functions,
+						into_opaque UnionId(union_position),
+						previous,
+						unions,
+						records,
+						special,
+					)
+				None:
+					Err(
+						checker_invariant(
+							{
+								start = 0,
+								end = 0
+							},
+							InvalidUnionDeclaration(into_opaque UnionId(union_position)),
+						),
+					)
+
+		match result:
 			Err(error):
 				failure = Some(error)
 				break
-			Ok(_):
-				parameter_result = local_type_parameters(
-					declaration.type_parameters,
-					UnionDeclaration(into_opaque UnionId(checked.length())),
-					unions,
-					special,
-				)
-
-				match parameter_result.and_then(
-					pure func(parameter): resolve_payloads(declaration, parameter, special),
-				):
-					Err(error):
-						failure = Some(error)
-						break
-					Ok(shapes):
-						match parameter_result:
-							Ok(parameter):
-								checked = checked.append({
-									type_parameters = declared_parameters(parameter),
-									variants = shapes,
-								})
-							Err(error):
-								failure = Some(error)
-
-		previous = previous.append(declaration.type_name)
+			Ok(RecordDeclarationResult(name, declaration)):
+				checked_records = checked_records.append(declaration)
+				previous = previous.append({
+					name = name,
+					kind = RecordKind,
+				})
+				record_position = IntOps.add(record_position, 1)
+			Ok(UnionDeclarationResult(name, declaration)):
+				checked_unions = checked_unions.append(declaration)
+				previous = previous.append({
+					name = name,
+					kind = UnionKind,
+				})
+				union_position = IntOps.add(union_position, 1)
 
 	match failure:
 		Some(error):
 			Err(error)
 		None:
-			Ok(checked)
+			Ok({
+				unions = checked_unions,
+				records = checked_records,
+			})
+
+
+private pure func check_record_declaration(
+	declaration: ParsedRecord,
+	type_names: List[PreviousDeclaration],
+	unions: List[ParsedUnion],
+	records: List[ParsedRecord],
+	special: SpecialNames,
+) -> Result[CheckedDeclaration, CheckError]:
+	unique ?= validate_type_name(declaration.type_name, type_names, RecordKind, special)
+	var previous: List[WrittenName] = []
+	var fields: List[TypeUse] = []
+	var failure: Option[CheckError] = None
+
+	for field in declaration.fields:
+		result: Result[TypeUse, CheckError] = match previous_declaration(previous, field.name.id):
+			Some(first):
+				Err(
+					check_rejection(
+						field.name.span,
+						DuplicateRecordField(field.name.id, first.span),
+					),
+				)
+			None:
+				resolve_type(
+					unions,
+					records,
+					special,
+					field.type_name,
+					[],
+				).and_then(pure func(value_type: TypeRef) -> Result[TypeUse, CheckError]:
+					if same_type(value_type, IntType):
+						Ok({
+							value_type = value_type,
+							span = type_span(field.type_name),
+						})
+					else:
+						Err(
+							check_rejection(
+								type_span(field.type_name),
+								UnsupportedRecordField(value_type),
+							),
+						)
+				)
+
+		match result:
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(field_type):
+				fields = fields.append(field_type)
+				previous = previous.append(field.name)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(RecordDeclarationResult(declaration.type_name, {fields = fields}))
 
 
 private pure func resolve_payloads(
@@ -740,6 +987,7 @@ private pure func local_type_parameters(
 	written: List[WrittenName],
 	owner: TypeParameterOwner,
 	unions: List[ParsedUnion],
+	records: List[ParsedRecord],
 	special: SpecialNames,
 ) -> Result[List[LocalTypeParameter], CheckError]:
 	var parameters: List[LocalTypeParameter] = []
@@ -764,6 +1012,7 @@ private pure func local_type_parameters(
 					same_name(name.id, special.integer)
 					or same_name(name.id, special.string)
 					or find_union(unions, name.id).is_some()
+					or find_record(records, name.id).is_some()
 				):
 					failure = Some(
 						check_rejection(
@@ -791,6 +1040,7 @@ private pure func resolve_type_parameters(
 	function: ParsedFunction,
 	id: FunctionId,
 	unions: List[ParsedUnion],
+	records: List[ParsedRecord],
 	special: SpecialNames,
 ) -> Result[List[LocalTypeParameter], CheckError]:
 	valid_main ?= match function.type_parameters.get(0):
@@ -805,7 +1055,13 @@ private pure func resolve_type_parameters(
 		None:
 			Ok(void)
 
-	local_type_parameters(function.type_parameters, FunctionDeclaration(id), unions, special)
+	local_type_parameters(
+		function.type_parameters,
+		FunctionDeclaration(id),
+		unions,
+		records,
+		special,
+	)
 
 
 private pure func declared_parameters(
@@ -816,6 +1072,7 @@ private pure func declared_parameters(
 
 private pure func resolve_atomic_type(
 	unions: List[ParsedUnion],
+	records: List[ParsedRecord],
 	special: SpecialNames,
 	name: WrittenName,
 	type_parameters: List[LocalTypeParameter],
@@ -858,18 +1115,23 @@ private pure func resolve_atomic_type(
 									),
 								)
 					None:
-						Err(check_rejection(name.span, UnknownType(name.id)))
+						match find_record(records, name.id):
+							Some(id):
+								Ok(RecordType(id))
+							None:
+								Err(check_rejection(name.span, UnknownType(name.id)))
 
 
 private pure func resolve_type(
 	unions: List[ParsedUnion],
+	records: List[ParsedRecord],
 	special: SpecialNames,
 	written: TypeSyntax,
 	type_parameters: List[LocalTypeParameter],
 ) -> Result[TypeRef, CheckError]:
 	match written:
 		AtomicType(name):
-			resolve_atomic_type(unions, special, name, type_parameters)
+			resolve_atomic_type(unions, records, special, name, type_parameters)
 		AppliedType(name, arguments, span):
 			owner ?= match find_union(unions, name.id):
 				Some(owner):
@@ -905,7 +1167,7 @@ private pure func resolve_type(
 			var failure: Option[CheckError] = None
 
 			for argument in arguments:
-				match resolve_atomic_type(unions, special, argument, type_parameters):
+				match resolve_atomic_type(unions, records, special, argument, type_parameters):
 					Ok(value):
 						values = values.append(value)
 					Err(error):
@@ -929,6 +1191,7 @@ private pure func resolve_parameters(
 	parameters: List[ParsedParameter],
 	function_name: NameId,
 	unions: List[ParsedUnion],
+	records: List[ParsedRecord],
 	special: SpecialNames,
 	type_parameters: List[LocalTypeParameter],
 ) -> Result[List[TypeUse], CheckError]:
@@ -949,7 +1212,7 @@ private pure func resolve_parameters(
 						),
 					)
 				None:
-					resolve_type(unions, special, parameter.type_name, type_parameters)
+					resolve_type(unions, records, special, parameter.type_name, type_parameters)
 
 		match result:
 			Err(error):
@@ -973,10 +1236,11 @@ private pure func resolve_signature(
 	function: ParsedFunction,
 	id: FunctionId,
 	unions: List[ParsedUnion],
+	records: List[ParsedRecord],
 	special: SpecialNames,
 ) -> Result[FunctionSignature, CheckError]:
-	local_parameters ?= resolve_type_parameters(function, id, unions, special)
-	return_type ?= resolve_type(unions, special, function.return_type, local_parameters)
+	local_parameters ?= resolve_type_parameters(function, id, unions, records, special)
+	return_type ?= resolve_type(unions, records, special, function.return_type, local_parameters)
 
 	main_type ?= if (
 		same_name(function.function_name.id, special.main)
@@ -990,6 +1254,7 @@ private pure func resolve_signature(
 		function.parameters,
 		function.function_name.id,
 		unions,
+		records,
 		special,
 		local_parameters,
 	)
@@ -1010,6 +1275,7 @@ private pure func resolve_signature(
 private pure func validate_signatures(
 	functions: List[ParsedFunction],
 	unions: List[ParsedUnion],
+	records: List[ParsedRecord],
 	end: Span,
 	special: SpecialNames,
 ) -> Result[CheckedSignatures, CheckError]:
@@ -1034,6 +1300,7 @@ private pure func validate_signatures(
 			function,
 			into_opaque FunctionId(previous.length()),
 			unions,
+			records,
 			special,
 		):
 			Err(error):
@@ -1100,6 +1367,7 @@ private fixed record ResolutionContext {
 	signatures: List[FunctionSignature],
 	unions: List[ParsedUnion],
 	checked_unions: List[CheckedUnion],
+	records: List[ParsedRecord],
 	prelude: CheckedPrelude
 }
 
@@ -1110,13 +1378,23 @@ private fixed record ResolvedCall {
 }
 
 
+private fixed union CallOperation:
+	FunctionCall(CheckedCall)
+	VariantConstruction(VariantId)
+
+
 private fixed record CallContract {
 	type_parameters: List[TypeParameterId],
-	operation: CheckedOperation,
+	operation: CallOperation,
 	parameter_types: List[TypeUse],
 	return_type: TypeRef,
 	span: Span
 }
+
+
+private fixed union ResolvedPostfix:
+	InvokeReceiver(ReceiverApplication, CallContract)
+	ReadField(WrittenName)
 
 
 private fixed union ResolvedApplication:
@@ -1193,7 +1471,7 @@ private pure func function_contract(
 	)
 	Ok({
 		type_parameters = resolved.signature.type_parameters,
-		operation = InvokeFunction(resolved.call, []),
+		operation = FunctionCall(resolved.call),
 		parameter_types = resolved.signature.parameters,
 		return_type = resolved.signature.return_type.value_type,
 		span = name.span,
@@ -1366,7 +1644,7 @@ private pure func contextual_constructor(
 			Err(check_rejection(name.span, ConstructorNeedsExpectedType(name.id)))
 		Some(type_ref):
 			found ?= match type_ref:
-				IntType | StringType | ParameterType(_):
+				IntType | StringType | RecordType(_) | ParameterType(_):
 					Ok(None)
 				AppliedUnionType(owner, _):
 					find_variant(context, type_ref, name)
@@ -1393,7 +1671,7 @@ private pure func unary_constructor(
 		Some(payload):
 			Ok({
 				type_parameters = [],
-				operation = ConstructVariant(contract.variant),
+				operation = VariantConstruction(contract.variant),
 				parameter_types = [payload],
 				return_type = contract.result_type,
 				span = name.span,
@@ -1436,10 +1714,13 @@ private pure func resolve_base(
 	purity: Purity,
 	scope: List[LocalBinding],
 	base: ExpressionBase,
+	span: Span,
 	expected_type: Option[TypeRef],
 	context: ResolutionContext,
 ) -> Result[ResolvedBase, CheckError]:
 	match base:
+		RecordExpression(fields):
+			check_record_literal(purity, scope, fields, span, expected_type, context)
 		IntegerExpression(value):
 			Ok({
 				base = ReturnInteger(value),
@@ -1459,6 +1740,198 @@ private pure func resolve_base(
 						Err(check_rejection(name.span, UnknownValue(name.id)))
 		DirectApplication(name, _):
 			Err(checker_invariant(name.span, DirectCallInSimpleBase(name.id)))
+
+
+private pure func resolve_record_field(
+	name: WrittenName,
+	owner: RecordId,
+	context: ResolutionContext,
+) -> Result[FieldId, CheckError]:
+	declaration ?= context.records
+		.get(record_number(owner))
+		.to_result(checker_invariant(name.span, InvalidRecordDeclaration(owner)))
+	var position = 0
+	var found: Option[FieldId] = None
+
+	for field in declaration.fields:
+		if same_name(field.name.id, name.id):
+			found = Some(into_opaque FieldId({
+						owner = owner,
+						position = position
+					}))
+			break
+
+		position = IntOps.add(position, 1)
+
+	found.to_result(check_rejection(name.span, UnknownRecordField(name.id, owner)))
+
+
+private pure func resolve_field_read(
+	name: WrittenName,
+	current: ResolvedValue,
+	context: ResolutionContext,
+) -> Result[ResolvedValue, CheckError]:
+	owner ?= match current.value_type:
+		RecordType(owner):
+			Ok(owner)
+		_:
+			Err(check_rejection(name.span, FieldRequiresRecord(current.value_type)))
+
+	field ?= resolve_record_field(name, owner, context)
+	Ok({
+		value = { current.value | operations = current.value.operations.append({
+				operation = ReadRecordField(field),
+				value_type = IntType,
+				span = name.span,
+			}) },
+		value_type = IntType,
+	})
+
+
+private fixed record ResolvedLiteralField {
+	field: FieldId,
+	written: ParsedRecordField
+}
+
+
+private pure func check_record_literal(
+	purity: Purity,
+	scope: List[LocalBinding],
+	written: List[ParsedRecordField],
+	span: Span,
+	expectation: Option[TypeRef],
+	context: ResolutionContext,
+) -> Result[ResolvedBase, CheckError]:
+	owner ?= match expectation:
+		Some(RecordType(owner)):
+			Ok(owner)
+		_:
+			Err(check_rejection(span, RecordNeedsExpectedType))
+
+	declaration ?= context.records
+		.get(record_number(owner))
+		.to_result(checker_invariant(span, InvalidRecordDeclaration(owner)))
+	var resolved: List[ResolvedLiteralField] = []
+	var previous: List[WrittenName] = []
+	var failure: Option[CheckError] = None
+
+	for field in written:
+		known_names = previous
+		result = resolve_record_field(
+			field.name,
+			owner,
+			context,
+		).and_then(pure func(id: FieldId) -> Result[ResolvedLiteralField, CheckError]:
+			match previous_declaration(known_names, field.name.id):
+				Some(first):
+					Err(
+						check_rejection(
+							field.name.span,
+							DuplicateLiteralField(field.name.id, first.span),
+						),
+					)
+				None:
+					Ok({
+						field = id,
+						written = field,
+					})
+		)
+
+		match result:
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(field):
+				resolved = resolved.append(field)
+				previous = previous.append(field.written.name)
+
+	names_ready ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	var position = 0
+
+	for field in declaration.fields:
+		if not previous_declaration(previous, field.name.id).is_some():
+			failure = Some(
+				check_rejection(
+					span,
+					MissingRecordField(
+						into_opaque FieldId({
+								owner = owner,
+								position = position
+							}),
+						field.name.span,
+					),
+				),
+			)
+			break
+
+		position = IntOps.add(position, 1)
+
+	complete ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	var fields: List[CheckedRecordField] = []
+	var obligation: Option[CheckError] = None
+
+	for field in resolved:
+		match synthesize_value(purity, scope, field.written.value, Some(IntType), context):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(value):
+				fields = fields.append({
+					field = field.field,
+					value = value.value,
+					span = field.written.value.span,
+				})
+
+				if not same_type(value.value_type, IntType) and not obligation.is_some():
+					match declaration.fields.get(field_number(field.field)):
+						Some(annotation):
+							obligation = Some(
+								check_rejection(
+									field.written.value.span,
+									RecordFieldTypeMismatch(
+										field.field,
+										{
+											value_type = value.value_type,
+											span = field.written.value.span
+										},
+										type_span(annotation.type_name),
+									),
+								),
+							)
+						None:
+							failure = Some(
+								checker_invariant(
+									field.written.value.span,
+									InvalidRecordField(field.field),
+								),
+							)
+
+	children_ready ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	valid ?= match obligation:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	Ok({
+		base = ReturnRecord(owner, fields),
+		value_type = RecordType(owner),
+	})
 
 
 private fixed record ResolvedValue {
@@ -1574,26 +2047,30 @@ private pure func synthesize_value(
 ) -> Result[ResolvedValue, CheckError]:
 	-- Constructor context selects variants; callers validate expression/argument obligations.
 	-- Resolve complete outer contracts once before checking their children.
-	var contracts: List[CallContract] = []
+	var contracts: List[ResolvedPostfix] = []
 	var failure: Option[CheckError] = None
 
-	for application in body.applications:
-		match classify_call(
-			purity,
-			application.callee,
-			ReceiverCall,
-			IntOps.add(application.arguments.length(), 1),
-			scope,
-			context,
-		):
-			Err(error):
-				failure = Some(error)
-				break
-			Ok(FunctionApplication(contract)):
-				contracts = contracts.append(contract)
-			Ok(ConstructorApplication(name)):
-				failure = Some(checker_invariant(name.span, ConstructorReceiver(name.id)))
-				break
+	for postfix in body.applications:
+		match postfix:
+			FieldAccess(name):
+				contracts = contracts.append(ReadField(name))
+			ReceiverInvocation(application):
+				match classify_call(
+					purity,
+					application.callee,
+					ReceiverCall,
+					IntOps.add(application.arguments.length(), 1),
+					scope,
+					context,
+				):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(FunctionApplication(contract)):
+						contracts = contracts.append(InvokeReceiver(application, contract))
+					Ok(ConstructorApplication(name)):
+						failure = Some(checker_invariant(name.span, ConstructorReceiver(name.id)))
+						break
 
 	ready ?= match failure:
 		Some(error):
@@ -1602,7 +2079,7 @@ private pure func synthesize_value(
 			Ok(void)
 
 	base_expectation = match contracts.get(0):
-		Some(contract):
+		Some(InvokeReceiver(_, contract)):
 			match contract.type_parameters:
 				[]:
 					contract.parameter_types
@@ -1610,6 +2087,8 @@ private pure func synthesize_value(
 						.map(pure func(value: TypeUse): value.value_type)
 				_:
 					None
+		Some(ReadField(_)):
+			None
 		None:
 			constructor_type
 
@@ -1653,9 +2132,9 @@ private pure func synthesize_value(
 								check_rejection(
 									name.span,
 									match contract.operation:
-										ConstructVariant(id):
+										VariantConstruction(id):
 											ConstructorPayloadArity(id, arguments.length())
-										InvokeFunction(_, _):
+										FunctionCall(_):
 											InternalInvariant(InvalidFunctionContract)
 								),
 							)
@@ -1680,9 +2159,15 @@ private pure func synthesize_value(
 									),
 								)
 
+						operation ?= match contract.operation:
+							VariantConstruction(id):
+								Ok(ConstructVariant(id))
+							FunctionCall(_):
+								Err(checker_invariant(name.span, InvalidFunctionContract))
+
 						Ok({
 							value = { value | operations = value.operations.append({
-									operation = contract.operation,
+									operation = operation,
 									value_type = contract.return_type,
 									span = name.span,
 								}) },
@@ -1692,7 +2177,7 @@ private pure func synthesize_value(
 					resolved ?= check_arguments(purity, scope, arguments, None, contract, context)
 
 					call ?= match resolved.contract.operation:
-						InvokeFunction(call, _):
+						FunctionCall(call):
 							Ok(call)
 						_:
 							Err(checker_invariant(name.span, InvalidFunctionContract))
@@ -1707,7 +2192,14 @@ private pure func synthesize_value(
 						value_type = resolved.contract.return_type,
 					})
 		_:
-			base ?= resolve_base(purity, scope, body.base, base_expectation, context)
+			base ?= resolve_base(
+				purity,
+				scope,
+				body.base,
+				body.base_span,
+				base_expectation,
+				context,
+			)
 			Ok({
 				value = {
 					base = base.base,
@@ -1720,34 +2212,20 @@ private pure func synthesize_value(
 
 	base ?= base_result
 	var current = base
-	var index: Int = 0
 
-	for application in body.applications:
-		match contracts.get(index):
-			None:
-				failure = Some(
-					checker_invariant(
-						application.callee.span,
-						MissingReceiverContract(index),
-					),
-				)
+	for postfix in contracts:
+		result = match postfix:
+			InvokeReceiver(application, contract):
+				resolve_receiver(purity, scope, current, application.arguments, contract, context)
+			ReadField(name):
+				resolve_field_read(name, current, context)
+
+		match result:
+			Err(error):
+				failure = Some(error)
 				break
-			Some(contract):
-				match resolve_receiver(
-					purity,
-					scope,
-					current,
-					application.arguments,
-					contract,
-					context,
-				):
-					Err(error):
-						failure = Some(error)
-						break
-					Ok(value):
-						current = value
-
-		index = IntOps.add(index, 1)
+			Ok(value):
+				current = value
 
 	ready ?= match failure:
 		Some(error):
@@ -2032,13 +2510,13 @@ private pure func instantiate_contract(
 		return_type ?= substitute_type(contract.return_type, arguments, contract.span)
 
 		operation ?= match contract.operation:
-			InvokeFunction(call, values):
+			FunctionCall(call):
 				match call.target:
 					UserFunction(id, _):
-						Ok(InvokeFunction({ call | target = UserFunction(id, types) }, values))
+						Ok(FunctionCall({ call | target = UserFunction(id, types) }))
 					RuntimeFunction(_):
 						Err(checker_invariant(contract.span, RuntimeGenericContract))
-			ConstructVariant(_):
+			VariantConstruction(_):
 				Err(checker_invariant(contract.span, GenericConstructorContract))
 
 		Ok({ contract |
@@ -2236,7 +2714,7 @@ private pure func resolve_match(
 			Ok(id)
 		UnionType(id):
 			Ok(id)
-		IntType | StringType | ParameterType(_):
+		IntType | StringType | RecordType(_) | ParameterType(_):
 			Err(check_rejection(body.scrutinee.span, MatchRequiresUnion(scrutinee.value_type)))
 
 	owner ?= owner_result
@@ -2614,7 +3092,7 @@ private pure func resolve_body(
 private pure func resolve_functions(
 	parsed: ParsedContents,
 	signatures: List[FunctionSignature],
-	unions: List[CheckedUnion],
+	declarations: CheckedDeclarations,
 ) -> Result[List[CheckedFunction], CheckError]:
 	var functions: List[CheckedFunction] = []
 	var failure: Option[CheckError] = None
@@ -2626,7 +3104,8 @@ private pure func resolve_functions(
 			functions = parsed.functions,
 			signatures = signatures,
 			unions = parsed.unions,
-			checked_unions = unions,
+			checked_unions = declarations.unions,
+			records = parsed.records,
 			prelude = parsed.prelude
 		}
 
@@ -2692,6 +3171,8 @@ private pure func target_is_settled(target: CallTarget, settled: List[FunctionId
 
 private pure func unsettled_value(body: CheckedValue, settled: List[FunctionId]) -> Option[Span]:
 	var found: Option[Span] = match body.base:
+		ReturnRecord(_, _):
+			None
 		ReturnInteger(_):
 			None
 		ReturnVariant(_):
@@ -2703,6 +3184,14 @@ private pure func unsettled_value(body: CheckedValue, settled: List[FunctionId])
 				None
 			else:
 				Some(call.span)
+
+	match body.base:
+		ReturnRecord(_, fields):
+			for field in fields:
+				if not found.is_some():
+					found = unsettled_value(field.value, settled)
+		_:
+			void
 
 	children: List[CheckedValue] = match body.base:
 		ReturnCall(_, arguments):
@@ -2727,6 +3216,8 @@ private pure func unsettled_value(body: CheckedValue, settled: List[FunctionId])
 				if not target_is_settled(call.target, settled):
 					found = Some(call.span)
 			ConstructVariant(_):
+				void
+			ReadRecordField(_):
 				void
 
 	found
@@ -2864,12 +3355,19 @@ private pure func check_program(program: ParsedProgram) -> Result[CheckedProgram
 	prelude = parsed.prelude
 	special = prelude_names(prelude).special
 	conflicts ?= validate_prelude_conflicts(parsed.functions, parsed.unions, prelude)
-	unions ?= validate_unions(parsed.unions, parsed.functions, special)
-	signatures ?= validate_signatures(parsed.functions, parsed.unions, parsed.end, special)
-	functions ?= resolve_functions(parsed, signatures.functions, unions)
+	declarations ?= validate_declarations(parsed.unions, parsed.records, parsed.functions, special)
+	signatures ?= validate_signatures(
+		parsed.functions,
+		parsed.unions,
+		parsed.records,
+		parsed.end,
+		special,
+	)
+	functions ?= resolve_functions(parsed, signatures.functions, declarations)
 	acyclic ?= validate_acyclic(functions)
 	Ok(into_opaque CheckedProgram({
-				unions = unions,
+				unions = declarations.unions,
+				records = declarations.records,
 				functions = functions,
 				entrypoint = signatures.entrypoint
 			}))
@@ -2886,7 +3384,7 @@ private pure func resolve_receiver(
 	resolved ?= check_arguments(purity, scope, arguments, Some(current), contract, context)
 
 	operation ?= match resolved.contract.operation:
-		InvokeFunction(call, _):
+		FunctionCall(call):
 			Ok(InvokeFunction(call, resolved.values))
 		_:
 			Err(checker_invariant(contract.span, InvalidReceiverContract))
@@ -3019,13 +3517,13 @@ private pure func binding_site(function: FunctionId, binding: LocalBinding) -> B
 
 private pure func parameter_site(contract: CallContract, parameter: TypeUse) -> ExpectedTypeSite:
 	match contract.operation:
-		InvokeFunction(call, _):
+		FunctionCall(call):
 			match call.target:
 				RuntimeFunction(operation):
 					RuntimeContract(operation)
 				UserFunction(_, _):
 					SourceAnnotation(parameter.span)
-		ConstructVariant(_):
+		VariantConstruction(_):
 			SourceAnnotation(parameter.span)
 
 
@@ -3045,6 +3543,8 @@ private pure func non_callable(
 
 
 fixed union CheckerInvariant:
+	InvalidRecordDeclaration(RecordId)
+	InvalidRecordField(FieldId)
 	InvalidResolvedFunction(FunctionId)
 	InvalidUnionDeclaration(UnionId)
 	VariantOccurrenceWithoutUnion(TypeRef)
@@ -3060,7 +3560,6 @@ fixed union CheckerInvariant:
 	ConstructorReceiver(NameId)
 	MissingConstructorArgument(NameId)
 	InvalidFunctionContract
-	MissingReceiverContract(Int)
 	MissingGenericParameter(Int)
 	RuntimeGenericContract
 	GenericConstructorContract

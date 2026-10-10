@@ -6,19 +6,23 @@ import:
 	specialize:
 		ConcreteArm,
 		ConcreteAssignment(InitializeBinding, ReassignBinding),
-		ConcreteBase(ReturnInteger, ReturnVariant, ReturnBinding, ReturnCall),
+		ConcreteBase(ReturnInteger, ReturnVariant, ReturnBinding, ReturnCall, ReturnRecord),
 		ConcreteBinding,
 		ConcreteBody(ConcreteValueBody, ConcreteMatchBody),
 		ConcreteCall,
 		ConcreteFunction,
 		ConcreteMatch,
-		ConcreteOperation(InvokeFunction, ConstructVariant),
+		ConcreteOperation(InvokeFunction, ConstructVariant, ReadRecordField),
 		ConcretePattern(VariantCase, WildcardCase, BindingCase),
+		ConcreteRecord,
+		ConcreteRecordField,
 		ConcreteUnion,
 		ConcreteValue,
+		FieldInstanceId,
 		FunctionInstanceId,
 		FunctionSignature,
 		PayloadBinding(NoPayloadBinding, DiscardIntPayload, BindIntPayload),
+		RecordInstanceId,
 		SpecializedProgram,
 		TypeRef(IntType),
 		UnionInstanceId,
@@ -35,7 +39,15 @@ pure func value_number(id: ValueId) -> Int:
 	from_opaque ValueId(id)
 
 
+fixed record RecordFieldValue {
+	field: FieldInstanceId,
+	value: ValueId
+}
+
+
 fixed union ValueOperation:
+	ConstructRecordValue(RecordInstanceId, List[RecordFieldValue])
+	ReadRecordFieldValue(FieldInstanceId, ValueId)
 	ParameterValue(Int)
 	IntegerValue(Int)
 	VariantValue(VariantInstanceId)
@@ -89,6 +101,7 @@ fixed record LoweredFunction {
 
 
 fixed record LoweredFunctions {
+	records: List[ConcreteRecord],
 	unions: List[ConcreteUnion],
 	functions: List[LoweredFunction],
 	entrypoint: FunctionInstanceId
@@ -191,11 +204,43 @@ private pure func lower_arguments(
 			})
 
 
+private pure func lower_record(
+	builder: ValueBuilder,
+	fields: List[ConcreteRecordField],
+	owner: RecordInstanceId,
+	value_type: TypeRef,
+	span: Span,
+) -> Result[BuiltValue, Diagnostic]:
+	var current = builder
+	var values: List[RecordFieldValue] = []
+	var failure: Option[Diagnostic] = None
+
+	for field in fields:
+		match lower_value(current, field.value):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(child):
+				current = child.builder
+				values = values.append({
+					field = field.field,
+					value = child.value,
+				})
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(define_value(current, ConstructRecordValue(owner, values), value_type, span))
+
+
 private pure func lower_value(
 	builder: ValueBuilder,
 	value: ConcreteValue,
 ) -> Result[BuiltValue, Diagnostic]:
 	base ?= match value.base:
+		ReturnRecord(owner, fields):
+			lower_record(builder, fields, owner, value.base_type, value.base_span)
 		ReturnBinding(id):
 			read_binding(
 				builder.bindings,
@@ -242,6 +287,13 @@ private pure func lower_value(
 							step.value_type,
 							step.span,
 						)
+			ReadRecordField(field):
+				built = define_value(
+					built.builder,
+					ReadRecordFieldValue(field, built.value),
+					step.value_type,
+					step.span,
+				)
 			ConstructVariant(id):
 				built = define_value(
 					built.builder,
@@ -466,6 +518,7 @@ pure func lower(program: SpecializedProgram) -> Result[LoweredProgram, Diagnosti
 			Err(error)
 		None:
 			Ok(into_opaque LoweredProgram({
+						records = checked.records,
 						unions = checked.unions,
 						functions = functions,
 						entrypoint = checked.entrypoint
