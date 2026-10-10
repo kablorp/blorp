@@ -1,0 +1,420 @@
+import:
+	../../src/check as Checked
+	../../src/lex: lex
+	../../src/parse: parse_prelude
+	../../src/prelude: check_prelude
+	../../src/syntax: Diagnostic
+	compilation: compile
+	input: parse
+	test: TestSuite
+
+
+private IDENTITY: String = "pure func identity[T](value: T) -> T:\n\tvalue\n"
+
+private MAIN: String = "func main() -> Int:\n\t0\n"
+
+private INFERENCE_HELP: String = (
+	"pass a value whose type determines the declared type parameter; use a concrete "
+	+ "helper when no argument can determine it"
+)
+
+private CONSTRUCTOR_HELP: String = "pass an already-typed union value or call a concrete helper returning the union"
+
+private COLLISION_HELP: String = "choose a distinct type parameter name, such as T"
+
+
+private pure func checked(source: String) -> Result[Checked.CheckedProgram, Diagnostic]:
+	tokens ?= lex(source)
+	parsed ?= parse(tokens)
+	Checked.check(parsed)
+
+
+private pure func rejects(
+	prefix: String,
+	marked: String,
+	suffix: String,
+	message: String,
+	help: String,
+) -> Bool:
+	match checked(prefix + marked + suffix):
+		Err(error):
+			(
+				error.span.start == prefix.length()
+				and error.span.end == prefix.length() + marked.length()
+				and error.message == message
+				and error.help == help
+			)
+		Ok(_):
+			False
+
+
+pure func test_one_declaration_accepts_int_and_string() -> Bool:
+	compile(
+		"pure func identity[T](value: T) -> T:\n\tvalue\nfunc main() -> Int:\n\tinteger = identity(7)\n\ttext = integer.to_string().identity()\n\tidentity(text).length()\n",
+	).is_ok()
+
+
+pure func test_generic_forwarding_preserves_the_caller_parameter() -> Bool:
+	compile(
+		"pure func identity[T](value: T) -> T:\n\tvalue\npure func forward[Element](value: Element) -> Element:\n\tidentity(value)\nfunc main() -> Int:\n\tforward(42)\n",
+	).is_ok()
+
+
+pure func test_unused_invalid_rigid_body_rejects() -> Bool:
+	rejects(
+		"pure func bad[T](value: T) -> T:\n\t",
+		"42",
+		"\n" + MAIN,
+		"expression does not match the expected type",
+		"use a value already typed as this declaration's type parameter",
+	)
+
+
+pure func test_int_only_use_does_not_recheck_invalid_body_as_int() -> Bool:
+	rejects(
+		"pure func bad[T](value: T) -> T:\n\t",
+		"42",
+		"\nfunc main() -> Int:\n\tbad(7)\n",
+		"expression does not match the expected type",
+		"use a value already typed as this declaration's type parameter",
+	)
+
+
+pure func test_arbitrary_parameter_cannot_call_string_runtime() -> Bool:
+	rejects(
+		"pure func bad[T](value: T) -> Int:\n\tvalue.",
+		"length",
+		"()\n" + MAIN,
+		"argument type does not match the parameter type",
+		"use an expression of type String here",
+	)
+
+
+pure func test_arbitrary_parameter_cannot_call_integer_runtime() -> Bool:
+	rejects(
+		"pure func bad[T](value: T) -> String:\n\t",
+		"to_string",
+		"(value)\n" + MAIN,
+		"argument type does not match the parameter type",
+		"use an expression of type Int here",
+	)
+
+
+pure func test_generic_main_rejects_at_parameter_declaration() -> Bool:
+	rejects(
+		"func main[",
+		"T",
+		"]() -> Int:\n\t0\n",
+		"main cannot be generic",
+		"declare main() -> Int: without type parameters",
+	)
+
+
+pure func test_builtin_type_parameter_collision_rejects() -> Bool:
+	(
+		rejects(
+			"pure func identity[",
+			"Int",
+			"](value: Int) -> Int:\n\tvalue\n" + MAIN,
+			"type parameter conflicts with a type name",
+			COLLISION_HELP,
+		)
+		and rejects(
+			"pure func identity[",
+			"String",
+			"](value: String) -> String:\n\tvalue\n" + MAIN,
+			"type parameter conflicts with a type name",
+			COLLISION_HELP,
+		)
+	)
+
+
+pure func test_forward_declared_union_type_parameter_collision_rejects() -> Bool:
+	rejects(
+		"pure func identity[",
+		"Choice",
+		"](value: Choice) -> Choice:\n\tvalue\nfixed union Choice:\n\tFirst\n" + MAIN,
+		"type parameter conflicts with a type name",
+		COLLISION_HELP,
+	)
+
+
+pure func test_phantom_parameter_call_has_no_default() -> Bool:
+	rejects(
+		"pure func phantom[T](value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\t",
+		"phantom",
+		"(7)\n",
+		"cannot infer the type parameter from the argument",
+		INFERENCE_HELP,
+	)
+
+
+pure func test_zero_argument_generic_call_has_no_default() -> Bool:
+	rejects(
+		"pure func phantom[T]() -> Int:\n\t7\nfunc main() -> Int:\n\t",
+		"phantom",
+		"()\n",
+		"cannot infer the type parameter from the argument",
+		INFERENCE_HELP,
+	)
+
+
+pure func test_generic_unary_call_still_requires_argument() -> Bool:
+	rejects(
+		IDENTITY + "func main() -> Int:\n\t",
+		"identity",
+		"()\n",
+		"function requires one argument",
+		"pass one expression of the declared parameter type",
+	)
+
+
+pure func test_generic_call_preserves_purity() -> Bool:
+	rejects(
+		"func identity[T](value: T) -> T:\n\tvalue\npure func use() -> Int:\n\t",
+		"identity",
+		"(7)\n" + MAIN,
+		"pure functions cannot call impure functions",
+		"mark the callee pure or remove pure from the caller",
+	)
+
+
+pure func test_generic_recursion_rejects_even_when_unused() -> Bool:
+	rejects(
+		"pure func recurse[T](value: T) -> T:\n\t",
+		"recurse",
+		"(value)\n" + MAIN,
+		"call chain contains recursion",
+		"use an acyclic call chain; recursion is not supported in this increment",
+	)
+
+
+pure func test_undeclared_parameter_name_rejects() -> Bool:
+	rejects(
+		"pure func identity(value: ",
+		"T",
+		") -> Int:\n\t7\n" + MAIN,
+		"unknown type",
+		(
+			"use Int, String, a declared type parameter, or a fixed union declared in this "
+			+ "file"
+		),
+	)
+
+
+pure func test_local_parameter_shadows_direct_generic_call() -> Bool:
+	rejects(
+		IDENTITY + "pure func use[T](identity: T) -> T:\n\t",
+		"identity",
+		"(identity)\n" + MAIN,
+		"parameters cannot be called",
+		"use the parameter as a value, or rename it to call the function",
+	)
+
+
+pure func test_local_parameter_does_not_shadow_generic_ufcs() -> Bool:
+	checked(
+		IDENTITY + "pure func use[T](identity: T) -> T:\n\tidentity.identity()\nfunc main() -> Int:\n\tuse(7)\n",
+	).is_ok()
+
+
+private CHOICE: String = "fixed union Choice:\n\tFirst\n\tNumber(Int)\n"
+
+
+pure func test_direct_nullary_constructor_cannot_infer_from_return_context() -> Bool:
+	rejects(
+		CHOICE + IDENTITY + "pure func use() -> Choice:\n\tidentity(",
+		"First",
+		")\n" + MAIN,
+		"constructor needs an expected union type",
+		CONSTRUCTOR_HELP,
+	)
+
+
+pure func test_ufcs_nullary_constructor_cannot_infer_from_return_context() -> Bool:
+	rejects(
+		CHOICE + IDENTITY + "pure func use() -> Choice:\n\t",
+		"First",
+		".identity()\n" + MAIN,
+		"constructor needs an expected union type",
+		CONSTRUCTOR_HELP,
+	)
+
+
+pure func test_direct_payload_constructor_cannot_infer_from_return_context() -> Bool:
+	rejects(
+		CHOICE + IDENTITY + "pure func use() -> Choice:\n\tidentity(",
+		"Number",
+		"(7))\n" + MAIN,
+		"constructor needs an expected union type",
+		CONSTRUCTOR_HELP,
+	)
+
+
+pure func test_ufcs_payload_constructor_cannot_infer_from_return_context() -> Bool:
+	rejects(
+		CHOICE + IDENTITY + "pure func use() -> Choice:\n\t",
+		"Number",
+		"(7).identity()\n" + MAIN,
+		"constructor needs an expected union type",
+		CONSTRUCTOR_HELP,
+	)
+
+
+pure func test_concrete_parameter_still_contextualizes_constructor() -> Bool:
+	checked(
+		CHOICE + IDENTITY + "pure func take(value: Choice) -> Choice:\n\tvalue\npure func use() -> Choice:\n\tidentity(take(Number(7)))\n" + MAIN,
+	).is_ok()
+
+
+private pure func symbolic_argument(
+	function: Checked.CheckedFunction,
+) -> Option[Checked.TypeParameterId]:
+	match function.body:
+		Checked.CheckedValueBody(value):
+			match value.operations:
+				[step]:
+					match step.operation:
+						Checked.InvokeFunction(call):
+							match call.target:
+								Checked.UserFunction(_, Checked.InstantiateWith(Checked.ParameterType(argument))):
+									Some(argument)
+								_:
+									None
+						_:
+							None
+				_:
+					None
+		_:
+			None
+
+
+pure func test_forwarding_publishes_caller_owned_symbolic_substitution() -> Bool:
+	match checked(IDENTITY + "pure func forward[T](value: T) -> T:\n\tidentity(value)\n" + MAIN):
+		Ok(program):
+			match Checked.checked_functions(program).functions:
+				[identity, forward, _]:
+					match identity.signature.type_parameters:
+						Checked.OneTypeParameter(callee_parameter):
+							match forward.signature.type_parameters:
+								Checked.OneTypeParameter(caller_parameter):
+									match symbolic_argument(forward):
+										Some(argument):
+											(
+												not Checked.same_parameter(
+													callee_parameter,
+													caller_parameter,
+												)
+												and Checked.same_parameter(
+													argument,
+													caller_parameter,
+												)
+											)
+										None:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private pure func accepted_prelude(source: String) -> Result[Void, Diagnostic]:
+	tokens ?= lex(source)
+	parsed ?= parse_prelude(tokens)
+	accepted ?= check_prelude(parsed)
+	Ok(void)
+
+
+pure func test_generic_runtime_prelude_rejects() -> Bool:
+	prefix = "type Int = builtin\ntype String = builtin\npure func convert["
+
+	match accepted_prelude(prefix + "T](value: Int) -> String:\n\tbuiltin(\"int.to_string\")\n"):
+		Err(error):
+			(
+				error.span.start == prefix.length()
+				and error.span.end == prefix.length() + 1
+				and error.message == "prelude builtin functions cannot be generic"
+				and error.help == "remove the type parameter and use the runtime operation's concrete signature"
+			)
+		Ok(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 generic functions",
+	tests = [
+		("one declaration accepts Int and String", test_one_declaration_accepts_int_and_string),
+		(
+			"generic forwarding preserves caller parameter",
+			test_generic_forwarding_preserves_the_caller_parameter,
+		),
+		("unused rigid invalid body rejects", test_unused_invalid_rigid_body_rejects),
+		(
+			"Int only use does not recheck rigid invalid body",
+			test_int_only_use_does_not_recheck_invalid_body_as_int,
+		),
+		(
+			"arbitrary parameter cannot call String runtime",
+			test_arbitrary_parameter_cannot_call_string_runtime,
+		),
+		(
+			"arbitrary parameter cannot call Int runtime",
+			test_arbitrary_parameter_cannot_call_integer_runtime,
+		),
+		(
+			"generic main rejects at parameter declaration",
+			test_generic_main_rejects_at_parameter_declaration,
+		),
+		("builtin type parameter collision rejects", test_builtin_type_parameter_collision_rejects),
+		(
+			"forward declared union parameter collision rejects",
+			test_forward_declared_union_type_parameter_collision_rejects,
+		),
+		("phantom parameter call has no default", test_phantom_parameter_call_has_no_default),
+		(
+			"zero argument generic call has no default",
+			test_zero_argument_generic_call_has_no_default,
+		),
+		("generic unary call requires argument", test_generic_unary_call_still_requires_argument),
+		("generic call preserves purity", test_generic_call_preserves_purity),
+		("unused generic recursion rejects", test_generic_recursion_rejects_even_when_unused),
+		("undeclared parameter name rejects", test_undeclared_parameter_name_rejects),
+		(
+			"local parameter shadows direct generic call",
+			test_local_parameter_shadows_direct_generic_call,
+		),
+		(
+			"local parameter does not shadow generic UFCS",
+			test_local_parameter_does_not_shadow_generic_ufcs,
+		),
+		(
+			"direct nullary constructor cannot infer from return context",
+			test_direct_nullary_constructor_cannot_infer_from_return_context,
+		),
+		(
+			"UFCS nullary constructor cannot infer from return context",
+			test_ufcs_nullary_constructor_cannot_infer_from_return_context,
+		),
+		(
+			"direct payload constructor cannot infer from return context",
+			test_direct_payload_constructor_cannot_infer_from_return_context,
+		),
+		(
+			"UFCS payload constructor cannot infer from return context",
+			test_ufcs_payload_constructor_cannot_infer_from_return_context,
+		),
+		(
+			"concrete parameter contextualizes constructor",
+			test_concrete_parameter_still_contextualizes_constructor,
+		),
+		(
+			"forwarding publishes caller owned symbolic substitution",
+			test_forwarding_publishes_caller_owned_symbolic_substitution,
+		),
+		("generic runtime prelude rejects", test_generic_runtime_prelude_rejects),
+	]
+}

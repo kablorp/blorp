@@ -1,0 +1,607 @@
+import:
+	../../src/check as Checked
+	../../src/lex: lex
+	../../src/specialize as Concrete
+	../../src/syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration)
+	compilation: compile
+	input: parse
+	test: TestSuite
+
+
+private pure func checked(source: String) -> Result[Checked.CheckedProgram, Diagnostic]:
+	tokens ?= lex(source)
+	parsed ?= parse(tokens)
+	Checked.check(parsed)
+
+
+private BOX: String = "fixed union Box[T]:\n\tBox(T)\npure func box[T](value: T) -> Box[T]:\n\tBox(value)\npure func unbox[T](value: Box[T]) -> T:\n\tmatch value:\n\t\tBox(payload):\n\t\t\tpayload\n"
+
+
+pure func test_box_and_unbox_specialize_from_the_argument() -> Bool:
+	compile(BOX + "func main() -> Int:\n\tunbox(box(7))\n").is_ok()
+
+
+pure func test_applied_type_equality_preserves_the_complete_argument_and_owner() -> Bool:
+	match checked(
+		"fixed union First:\n\tValue\nfixed union Second:\n\tValue\npure func first() -> First:\n\tValue\npure func second() -> Second:\n\tValue\nfunc main() -> Int:\n\t0\n",
+	):
+		Ok(program):
+			match Checked.checked_functions(program).functions:
+				[first, second, _]:
+					match first.signature.return_type.value_type:
+						Checked.UnionType(first):
+							match second.signature.return_type.value_type:
+								Checked.UnionType(second):
+									integer = Checked.AppliedUnionType(first, Checked.IntType)
+									text = Checked.AppliedUnionType(first, Checked.StringType)
+									(
+										Checked.same_type(integer, integer)
+										and not Checked.same_type(integer, text)
+										and not Checked.same_type(
+											integer,
+											Checked.UnionType(first),
+										)
+										and not Checked.same_type(
+											integer,
+											Checked.AppliedUnionType(second, Checked.IntType),
+										)
+										and not Checked.same_type(
+											Checked.AppliedUnionType(first, integer),
+											Checked.AppliedUnionType(first, text),
+										)
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private MAIN: String = "func main() -> Int:\n\t0\n"
+
+private PAYLOAD_START: Int = "fixed union Box[T]:\n\tBox(".length()
+
+
+private pure func rejects(
+	prefix: String,
+	marked: String,
+	suffix: String,
+	message: String,
+	help: String,
+) -> Bool:
+	match compile(prefix + marked + suffix):
+		Err(error):
+			(
+				error.span.start == prefix.length()
+				and error.span.end == prefix.length() + marked.length()
+				and error.message == message
+				and error.help == help
+			)
+		Ok(_):
+			False
+
+
+private pure func rejects_layout(prefix: String, marked: String, suffix: String) -> Bool:
+	match compile(prefix + marked + suffix):
+		Err(error):
+			match error.note:
+				UnionPayloadDeclaration(span):
+					(
+						error.span.start == prefix.length()
+						and error.span.end == prefix.length() + marked.length()
+						and span.start == PAYLOAD_START
+						and span.end == PAYLOAD_START + 1
+						and error.message == "specialized union payload must be Int"
+						and error.help == "use Int for this payload; String and union payloads are not supported"
+					)
+				_:
+					False
+		Ok(_):
+			False
+
+
+pure func test_generic_constructor_checks_its_rigid_payload_once() -> Bool:
+	rejects(
+		"fixed union Box[T]:\n\tBox(T)\npure func bad[T](value: T) -> Box[T]:\n\t",
+		"Box",
+		"(7)\n" + MAIN,
+		"argument type does not match the parameter type",
+		"use a value already typed as this declaration's type parameter",
+	)
+
+
+pure func test_generic_pattern_payload_remains_rigid() -> Bool:
+	rejects(
+		"fixed union Box[T]:\n\tBox(T)\npure func bad[T](value: Box[T]) -> Int:\n\tmatch value:\n\t\tBox(payload):\n\t\t\t",
+		"payload",
+		"\n" + MAIN,
+		"expression does not match the expected type",
+		"use an expression of type Int here",
+	)
+
+
+pure func test_constructor_missing_rigid_payload_has_type_correct_help() -> Bool:
+	rejects(
+		"fixed union Box[T]:\n\tBox(T)\npure func bad[T](value: T) -> Box[T]:\n\t",
+		"Box",
+		"\n" + MAIN,
+		"constructor requires one payload argument",
+		"pass a value of the constructor's declared payload type",
+	)
+
+
+pure func test_pattern_missing_rigid_payload_has_type_correct_help() -> Bool:
+	rejects(
+		"fixed union Box[T]:\n\tBox(T)\npure func bad[T](value: Box[T]) -> Int:\n\tmatch value:\n\t\t",
+		"Box",
+		": 0\n" + MAIN,
+		"constructor pattern requires one field",
+		"write Variant(name) to bind the payload, or Variant(_) to ignore it",
+	)
+
+
+pure func test_applied_type_mismatch_renders_the_complete_expected_type() -> Bool:
+	rejects(
+		"fixed union P[T]:\n\tOnly\npure func wrong(value: P[Int]) -> P[String]:\n\t",
+		"value",
+		"\n" + MAIN,
+		"expression does not match the expected type",
+		"use an expression of type P[String] here",
+	)
+
+
+pure func test_concrete_written_layout_rejection_uses_application_and_payload_spans() -> Bool:
+	rejects_layout(BOX + "pure func bad(value: ", "Box[String]", ") -> Int:\n\t0\n" + MAIN)
+
+
+pure func test_forwarded_symbolic_layout_rejection_preserves_the_initiating_request() -> Bool:
+	rejects_layout(
+		BOX + "pure func wrap[T](value: T) -> T:\n\tignored = box(value)\n\tvalue\npure func middle[U](value: U) -> U:\n\twrap(value)\nfunc main() -> Int:\n\t",
+		"middle",
+		"(7.to_string()).length()\n",
+	)
+
+
+pure func test_inferred_binding_rejection_uses_the_producer_call_not_binding_name() -> Bool:
+	rejects_layout(BOX + "func main() -> Int:\n\tbad = ", "box", "(7.to_string())\n\t0\n")
+
+
+pure func test_semantic_nested_application_rejects_at_the_outer_payload_layout() -> Bool:
+	rejects_layout(BOX + "func main() -> Int:\n\tbad = ", "box", "(box(7))\n\t0\n")
+
+
+pure func test_wrapping_an_already_typed_nominal_union_rejects_at_payload_layout() -> Bool:
+	rejects_layout(
+		BOX + "fixed union Value:\n\tOnly\npure func value() -> Value:\n\tOnly\nfunc main() -> Int:\n\tbad = ",
+		"box",
+		"(value())\n\t0\n",
+	)
+
+
+pure func test_phantom_string_application_has_no_managed_payload() -> Bool:
+	compile(
+		"fixed union Marker[T]:\n\tOnly\npure func text() -> Marker[String]:\n\tOnly\nfunc main() -> Int:\n\tvalue = text()\n\t0\n",
+	).is_ok()
+
+
+pure func test_generic_union_requires_an_argument() -> Bool:
+	rejects(
+		"fixed union Box[T]:\n\tBox(T)\npure func bad(value: ",
+		"Box",
+		") -> Int:\n\t0\n" + MAIN,
+		"generic union requires one type argument",
+		"write a concrete or symbolic application, such as Box[Int] or Box[T]",
+	)
+
+
+pure func test_ordinary_union_rejects_an_argument() -> Bool:
+	rejects(
+		"fixed union Value:\n\tOnly\npure func bad(value: ",
+		"Value[Int]",
+		") -> Int:\n\t0\n" + MAIN,
+		"ordinary union does not accept a type argument",
+		"remove the type argument from this union type",
+	)
+
+
+pure func test_builtin_type_rejects_application() -> Bool:
+	rejects(
+		"pure func bad(value: ",
+		"Int",
+		"[String]) -> Int:\n\t0\n" + MAIN,
+		"type does not accept a type argument",
+		"apply a declared generic union, such as Box[Int]",
+	)
+
+
+pure func test_written_nested_application_is_explicitly_unsupported() -> Bool:
+	rejects(
+		"fixed union Box[T]:\n\tBox(T)\npure func bad(value: Box[Box",
+		"[",
+		"Int]]) -> Int:\n\t0\n" + MAIN,
+		"nested type applications are not supported",
+		(
+			"use Int, String, a declared parameter, or an ordinary union as the written "
+			+ "argument"
+		),
+	)
+
+
+pure func test_union_parameter_collision_rejects_at_the_parameter_name() -> Bool:
+	rejects(
+		"fixed union Box[",
+		"Box",
+		"]:\n\tOnly\n" + MAIN,
+		"type parameter conflicts with a type name",
+		"choose a distinct type parameter name, such as T",
+	)
+
+
+pure func test_union_payload_must_be_int_or_its_own_parameter() -> Bool:
+	rejects(
+		"fixed union Box[T]:\n\tBox(",
+		"String",
+		")\n" + MAIN,
+		"only Int or the union's type parameter may be payloads",
+		(
+			"declare no field, one Int field, or one field using this union's declared type "
+			+ "parameter"
+		),
+	)
+
+
+private pure func specialized(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	program ?= checked(source)
+	program ?= Concrete.specialize(program)
+	Ok(Concrete.specialized_contents(program))
+
+
+private pure func rigid_pattern(function: Checked.CheckedFunction) -> Bool:
+	match function.signature.type_parameters:
+		Checked.OneTypeParameter(parameter):
+			match function.body:
+				Checked.CheckedMatchBody(matched):
+					match matched.arms:
+						[arm]:
+							match arm.pattern:
+								Checked.VariantCase(_, Checked.BindPayload(id)):
+									match function.bindings:
+										[_, payload]:
+											Checked.binding_number(id) == 1 and Checked.same_type(
+												payload.value_type,
+												Checked.ParameterType(parameter),
+											) and Checked.same_type(
+												function.signature.return_type.value_type,
+												payload.value_type,
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_pattern_payload_uses_the_function_owned_rigid_parameter() -> Bool:
+	match checked(BOX + MAIN):
+		Ok(program):
+			rows = Checked.checked_functions(program)
+
+			match rows.unions:
+				[declaration]:
+					match declaration.type_parameters:
+						Checked.OneTypeParameter(union_parameter):
+							match rows.functions:
+								[box, unbox, _]:
+									match box.signature.type_parameters:
+										Checked.OneTypeParameter(box_parameter):
+											match unbox.signature.type_parameters:
+												Checked.OneTypeParameter(unbox_parameter):
+													match Checked.parameter_owner(union_parameter):
+														Checked.UnionDeclaration(_):
+															(
+																not Checked.same_parameter(
+																	union_parameter,
+																	box_parameter,
+																)
+																and not Checked.same_parameter(
+																	box_parameter,
+																	unbox_parameter,
+																)
+																and rigid_pattern(unbox)
+															)
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private pure func construction_owner(function: Concrete.ConcreteFunction) -> Option[Int]:
+	match function.body:
+		Concrete.ConcreteValueBody(value):
+			match value.base:
+				Concrete.ReturnVariant(id):
+					Some(Concrete.union_number(Concrete.variant_owner(id)))
+				_:
+					None
+		_:
+			None
+
+
+private pure func operation_targets(value: Concrete.ConcreteValue, expected: List[Int]) -> Bool:
+	var valid = value.operations.length() == expected.length()
+	var position = 0
+
+	for step in value.operations:
+		match step.operation:
+			Concrete.InvokeFunction(call):
+				match call.target:
+					Concrete.UserFunction(id):
+						match expected.get(position):
+							Some(expected):
+								valid = valid and Concrete.function_number(id) == expected
+							None:
+								valid = False
+					_:
+						valid = False
+			_:
+				valid = False
+
+		position += 1
+
+	valid
+
+
+pure func test_phantom_instances_keep_nominal_arguments_and_reuse_direct_ufcs_requests() -> Bool:
+	match specialized(
+		"fixed union Marker[T]:\n\tOnly\npure func identity[T](value: T) -> T:\n\tvalue\npure func integer() -> Marker[Int]:\n\tOnly\npure func text() -> Marker[String]:\n\tOnly\nfunc main() -> Int:\n\tfirst = integer().identity().identity()\n\tagain = identity(integer())\n\tother = text().identity()\n\t0\n",
+	):
+		Ok(program):
+			match program.unions:
+				[first_union, second_union]:
+					match first_union.variants:
+						[Concrete.NoPayload]:
+							match second_union.variants:
+								[Concrete.NoPayload]:
+									match program.functions:
+										[integer, text, main, first_identity, second_identity]:
+											match main.assignments:
+												[Concrete.InitializeBinding(_, first), Concrete.InitializeBinding(_, again), Concrete.InitializeBinding(_, other)]:
+													match main.bindings:
+														[first_binding, again_binding, other_binding]:
+															(
+																construction_owner(
+																	integer,
+																) == Some(0)
+																and construction_owner(
+																	text,
+																) == Some(1)
+																and not Concrete.same_type(
+																	integer.signature.return_type,
+																	text.signature.return_type,
+																)
+																and Concrete.same_type(
+																	first_identity.signature.return_type,
+																	integer.signature.return_type,
+																)
+																and Concrete.same_type(
+																	second_identity.signature.return_type,
+																	text.signature.return_type,
+																)
+																and operation_targets(
+																	first,
+																	[3, 3],
+																)
+																and operation_targets(again, [3])
+																and operation_targets(other, [4])
+																and Concrete.same_type(
+																	first_binding.value_type,
+																	integer.signature.return_type,
+																)
+																and Concrete.same_type(
+																	again_binding.value_type,
+																	integer.signature.return_type,
+																)
+																and Concrete.same_type(
+																	other_binding.value_type,
+																	text.signature.return_type,
+																)
+															)
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_box_instance_translates_constructor_pattern_and_binding_types() -> Bool:
+	match specialized(
+		BOX + "pure func identity[T](value: T) -> T:\n\tvalue\nfunc main() -> Int:\n\tunbox(identity(box(7)))\n",
+	):
+		Ok(program):
+			match program.unions:
+				[declaration]:
+					match declaration.variants:
+						[Concrete.IntPayload]:
+							match program.functions:
+								[_, box, identity, unbox]:
+									match box.body:
+										Concrete.ConcreteValueBody(value):
+											match value.operations:
+												[step]:
+													match step.operation:
+														Concrete.ConstructVariant(id):
+															match unbox.body:
+																Concrete.ConcreteMatchBody(matched):
+																	match matched.arms:
+																		[arm]:
+																			match arm.pattern:
+																				Concrete.VariantCase(pattern, Concrete.BindIntPayload(binding)):
+																					match unbox.bindings:
+																						[_, payload]:
+																							(
+																								Concrete.union_number(
+																									Concrete.variant_owner(
+																										id,
+																									),
+																								) == 0
+																								and Concrete.union_number(
+																									matched.owner,
+																								) == 0
+																								and Concrete.union_number(
+																									Concrete.variant_owner(
+																										pattern,
+																									),
+																								) == 0
+																								and Concrete.variant_number(
+																									pattern,
+																								) == Concrete.variant_number(
+																									id,
+																								)
+																								and Checked.binding_number(
+																									binding,
+																								) == 1
+																								and Concrete.same_type(
+																									payload.value_type,
+																									Concrete.IntType,
+																								)
+																								and Concrete.same_type(
+																									unbox.signature.return_type,
+																									Concrete.IntType,
+																								)
+																								and Concrete.same_type(
+																									identity.signature.return_type,
+																									box.signature.return_type,
+																								)
+																							)
+																						_:
+																							False
+																				_:
+																					False
+																		_:
+																			False
+																_:
+																	False
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 generic unions",
+	tests = [
+		(
+			"pattern payload uses the function owned rigid parameter",
+			test_pattern_payload_uses_the_function_owned_rigid_parameter,
+		),
+		(
+			"phantom instances keep nominal arguments and reuse direct ufcs requests",
+			test_phantom_instances_keep_nominal_arguments_and_reuse_direct_ufcs_requests,
+		),
+		(
+			"box instance translates constructor pattern and binding types",
+			test_box_instance_translates_constructor_pattern_and_binding_types,
+		),
+		(
+			"generic constructor checks its rigid payload once",
+			test_generic_constructor_checks_its_rigid_payload_once,
+		),
+		("generic pattern payload remains rigid", test_generic_pattern_payload_remains_rigid),
+		(
+			"constructor missing rigid payload has type correct help",
+			test_constructor_missing_rigid_payload_has_type_correct_help,
+		),
+		(
+			"pattern missing rigid payload has type correct help",
+			test_pattern_missing_rigid_payload_has_type_correct_help,
+		),
+		(
+			"applied type mismatch renders the complete expected type",
+			test_applied_type_mismatch_renders_the_complete_expected_type,
+		),
+		(
+			"concrete written layout rejection uses application and payload spans",
+			test_concrete_written_layout_rejection_uses_application_and_payload_spans,
+		),
+		(
+			"forwarded symbolic layout rejection preserves the initiating request",
+			test_forwarded_symbolic_layout_rejection_preserves_the_initiating_request,
+		),
+		(
+			"inferred binding rejection uses the producer call not binding name",
+			test_inferred_binding_rejection_uses_the_producer_call_not_binding_name,
+		),
+		(
+			"semantic nested application rejects at the outer payload layout",
+			test_semantic_nested_application_rejects_at_the_outer_payload_layout,
+		),
+		(
+			"wrapping an already typed nominal union rejects at payload layout",
+			test_wrapping_an_already_typed_nominal_union_rejects_at_payload_layout,
+		),
+		(
+			"phantom string application has no managed payload",
+			test_phantom_string_application_has_no_managed_payload,
+		),
+		("generic union requires an argument", test_generic_union_requires_an_argument),
+		("ordinary union rejects an argument", test_ordinary_union_rejects_an_argument),
+		("builtin type rejects application", test_builtin_type_rejects_application),
+		(
+			"written nested application is explicitly unsupported",
+			test_written_nested_application_is_explicitly_unsupported,
+		),
+		(
+			"union parameter collision rejects at the parameter name",
+			test_union_parameter_collision_rejects_at_the_parameter_name,
+		),
+		(
+			"union payload must be int or its own parameter",
+			test_union_payload_must_be_int_or_its_own_parameter,
+		),
+		(
+			"box and unbox specialize from the argument",
+			test_box_and_unbox_specialize_from_the_argument,
+		),
+		(
+			"applied type equality preserves complete argument and owner",
+			test_applied_type_equality_preserves_the_complete_argument_and_owner,
+		),
+	]
+}

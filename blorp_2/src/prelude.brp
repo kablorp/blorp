@@ -3,6 +3,7 @@ import:
 	option: is_some, to_result
 	syntax:
 		Diagnostic,
+		DiagnosticNote(NoDiagnosticNote),
 		FunctionHeader,
 		ParameterList(EmptyParameters, SingleParameter),
 		ParsedBuiltinType(IntegerBuiltin, StringBuiltin),
@@ -10,6 +11,8 @@ import:
 		ParsedRuntimeOperation(IntegerToStringBuiltin, StringLengthBuiltin),
 		Purity(Pure, Impure),
 		Span,
+		TypeParameterSyntax(NoTypeParameterSyntax, OneTypeParameterSyntax),
+		TypeSyntax(AtomicType, AppliedType),
 		WrittenName,
 	text as Text
 
@@ -82,6 +85,7 @@ pure func runtime_operation(prelude: CheckedPrelude, name: NameId) -> Option[Run
 private pure func rejection(span: Span, message: String, help: String) -> Diagnostic:
 	{
 		span = span,
+		note = NoDiagnosticNote,
 		message = message,
 		help = help
 	}
@@ -220,6 +224,20 @@ private pure func matches_type(actual: Option[PrimitiveType], expected: Primitiv
 					False
 
 
+private pure func runtime_type_name(written: TypeSyntax) -> Result[WrittenName, Diagnostic]:
+	match written:
+		AtomicType(name):
+			Ok(name)
+		AppliedType(_, _, span):
+			Err(
+				rejection(
+					span,
+					"prelude builtin types cannot be applied",
+					"use the concrete Int or String runtime type without an argument",
+				),
+			)
+
+
 private pure func validate_runtime_parameter(
 	parameters: ParameterList,
 	expected: PrimitiveType,
@@ -230,8 +248,9 @@ private pure func validate_runtime_parameter(
 			Ok(False)
 		SingleParameter(parameter):
 			parameter_name ?= validate_name(parameter.name, names.names)
-			type_name ?= validate_name(parameter.type_name, names.names)
-			Ok(matches_type(primitive_type(parameter.type_name.id, names.special), expected))
+			written ?= runtime_type_name(parameter.type_name)
+			type_name ?= validate_name(written, names.names)
+			Ok(matches_type(primitive_type(written.id, names.special), expected))
 
 
 private pure func validate_runtime_header(
@@ -239,8 +258,21 @@ private pure func validate_runtime_header(
 	contract: RuntimeContract,
 	names: InitialNames,
 ) -> Result[Bool, Diagnostic]:
+	generic_header ?= match header.type_parameters:
+		NoTypeParameterSyntax:
+			Ok(void)
+		OneTypeParameterSyntax(name):
+			Err(
+				rejection(
+					name.span,
+					"prelude builtin functions cannot be generic",
+					"remove the type parameter and use the runtime operation's concrete signature",
+				),
+			)
+
 	function_name ?= validate_name(header.function_name, names.names)
-	return_name ?= validate_name(header.return_type, names.names)
+	return_type ?= runtime_type_name(header.return_type)
+	return_name ?= validate_name(return_type, names.names)
 	parameter_matches ?= validate_runtime_parameter(header.parameters, contract.parameter, names)
 
 	purity_matches = match contract.purity:
@@ -258,7 +290,7 @@ private pure func validate_runtime_header(
 					False
 
 	Ok(purity_matches and parameter_matches and matches_type(
-			primitive_type(header.return_type.id, names.special),
+			primitive_type(return_type.id, names.special),
 			contract.return_type,
 		))
 

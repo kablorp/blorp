@@ -1,9 +1,4 @@
 import:
-	../../src/check:
-		CallTarget(UserFunction, RuntimeFunction),
-		TypeRef(IntType, StringType, UnionType),
-		function_number,
-		same_type,
 	../../src/lex: lex
 	../../src/lower:
 		CallArguments(NoArguments, OneArgument),
@@ -16,6 +11,12 @@ import:
 		lowered_functions,
 		value_number,
 	../../src/prelude: RuntimeOperation(StringLength)
+	../../src/specialize:
+		CallTarget(UserFunction, RuntimeFunction),
+		TypeRef(IntType, StringType, UnionType),
+		function_number,
+		same_type,
+		specialize,
 	../../src/syntax: Diagnostic
 	input: check, parse
 	test: TestSuite
@@ -35,7 +36,7 @@ private pure func fixture(source: String) -> Result[LoweredProgram, Diagnostic]:
 	lexed ?= lex(source)
 	parsed ?= parse(lexed)
 	checked ?= check(parsed)
-	lower(checked)
+	specialize(checked).and_then(pure func(program): lower(program))
 
 
 pure func test_reassignment_preserves_old_alias_and_call_result() -> Bool:
@@ -634,7 +635,10 @@ pure func test_managed_self_assignment_creates_no_new_value() -> Bool:
 																value_number(literal.id) == 0
 																and value_number(number) == 0
 																and value_number(string.id) == 1
-																and same_type(string.value_type, StringType)
+																and same_type(
+																	string.value_type,
+																	StringType,
+																)
 																and value_number(receiver) == 1
 																and value_number(length.id) == 2
 																and value_number(result) == 2
@@ -691,10 +695,127 @@ pure func test_two_managed_aliases_share_the_computed_value() -> Bool:
 					False
 
 
+pure func test_string_arm_computations_remain_branch_local() -> Bool:
+	match fixture(
+		"fixed union Choice:\n\tFirst\n\tSecond\npure func choose(choice: Choice) -> String:\n\tmatch choice:\n\t\tFirst: 7.to_string()\n\t\tSecond: 42.to_string()\nfunc main() -> Int:\n\tchoose(Second).length()\n",
+	):
+		Err(_):
+			False
+		Ok(program):
+			match lowered_functions(program).functions:
+				[choose, _]:
+					match choose.definitions:
+						[parameter]:
+							match choose.tail:
+								MatchValue(matched):
+									match matched.arms:
+										[first, second]:
+											match first.body.definitions:
+												[first_number, first_string]:
+													match second.body.definitions:
+														[second_number, second_string]:
+															match first_string.operation:
+																CallValue(_, OneArgument(first_argument)):
+																	match second_string.operation:
+																		CallValue(_, OneArgument(second_argument)):
+																			(
+																				value_number(
+																					parameter.id,
+																				) == 0
+																				and value_number(
+																					first_number.id,
+																				) == 1
+																				and value_number(
+																					first_string.id,
+																				) == 2
+																				and value_number(
+																					first_argument,
+																				) == 1
+																				and value_number(
+																					first.body.result,
+																				) == 2
+																				and value_number(
+																					second_number.id,
+																				) == 3
+																				and value_number(
+																					second_string.id,
+																				) == 4
+																				and value_number(
+																					second_argument,
+																				) == 3
+																				and value_number(
+																					second.body.result,
+																				) == 4
+																				and same_type(
+																					first_string.value_type,
+																					StringType,
+																				)
+																				and same_type(
+																					second_string.value_type,
+																					StringType,
+																				)
+																			)
+																		_:
+																			False
+																_:
+																	False
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_arm_string_alias_survives_a_replacement() -> Bool:
+	match fixture(
+		"fixed union Choice:\n\tFirst\n\tSecond\npure func choose(choice: Choice) -> String:\n\tmatch choice:\n\t\tFirst:\n\t\t\tunused = 99.to_string()\n\t\t\tvar current = 7.to_string()\n\t\t\toriginal = current\n\t\t\tcurrent = 42.to_string()\n\t\t\toriginal\n\t\tSecond: 42.to_string()\nfunc main() -> Int:\n\tchoose(First).length()\n",
+	):
+		Err(_):
+			False
+		Ok(program):
+			match lowered_functions(program).functions:
+				[choose, _]:
+					match choose.tail:
+						MatchValue(matched):
+							match matched.arms:
+								[first, _]:
+									match first.body.definitions:
+										[_, unused, _, original, _, replacement]:
+											(
+												value_number(unused.id) == 2
+												and value_number(original.id) == 4
+												and value_number(replacement.id) == 6
+												and value_number(first.body.result) == 4
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 ordered value lowering",
 	tests = [
-		("managed self assignment creates no value", test_managed_self_assignment_creates_no_new_value),
+		("arm String alias survives replacement", test_arm_string_alias_survives_a_replacement),
+		(
+			"String computations stay inside distinct arms",
+			test_string_arm_computations_remain_branch_local,
+		),
+		(
+			"managed self assignment creates no value",
+			test_managed_self_assignment_creates_no_new_value,
+		),
 		("managed aliases share computed value", test_two_managed_aliases_share_the_computed_value),
 		(
 			"managed alias retains original value identity",
