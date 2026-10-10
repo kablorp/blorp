@@ -889,7 +889,8 @@ later memory responsibilities, including the limits of current verification.
 Compiler source under `src/` stays within the agreed eventual subset: `String`, `Int`
 (64-bit), `Float` (64-bit), `Bool`, `Void`, `List`, `Option`, `Result`, `Dict`,
 `Set`, records/unions and their fixed spellings, opaque types, generics,
-purity, matching, loops, `var`, `?=`, imports, and UFCS. Supporting every one
+purity, matching, loops, `var`, `?=`, imports, UFCS, and quoted and multiline
+String literals. Supporting every one
 of these in input programs is future work, not a claim about this increment.
 
 Concurrency, parallelism, tensors and dimension types, tuples, `debug:`, other

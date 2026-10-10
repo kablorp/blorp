@@ -161,7 +161,12 @@ are not implicit inputs.
 ## Validation for this pilot
 
 Compiler tests are written in Blorp and use `TestSuite`, not a test `main` or
-Python. The explicitly approved exception is direct C unit tests of the
+Python. Prefer aligned multiline strings for embedded source programs. Preserve
+their exact contents, including indentation and final newlines. Keep quoted
+escapes when they make the bytes under test clearer, such as CRLF or malformed
+indentation. Multiline String literals belong to the eventual bootstrap subset;
+using the host syntax in tests does not add them to the pilot input grammar.
+The explicitly approved exception is direct C unit tests of the
 target String runtime under `test/runtime/`, compiled and run by a Blorp
 `TestSuite`. They use the same runtime fragment as emission and small
 test-local allocator wrappers that delegate to actual allocation/free.
