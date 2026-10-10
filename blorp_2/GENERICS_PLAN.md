@@ -119,7 +119,14 @@ semantic facts and spans, without references to live inference state.
    `Ok(T)` and `Err(E)`. Begin native examples with Int payloads. Check written
    application arity, declaration-owned parameter positions, constructor/pattern
    substitution and complete nominal instance keys separately from function
-   inference. Retain the managed-payload restriction until its own increment.
+   inference. A single union argument may constrain multiple function parameters;
+   visit its type arguments in declaration order and preserve the first inference
+   occurrence. At the first conflict, the diagnostic expectation uses established
+   candidates and retains not-yet-inferred declaration-owned rigid parameters.
+   This error snapshot is separate from strict complete successful substitution;
+   it does not infer later constraints or publish a tentative builder.
+   Written arguments remain atomic, and each variant still has zero or one field.
+   Retain the managed-payload restriction until its own increment.
 
 5. **Nested types and unmanaged union payloads.** First admit written nested
    applications, then execute `box(box(7))` and extract the nested value. Publish
@@ -198,6 +205,15 @@ carriers. Keep the same six comparison workloads and require identical C for
 all 68 preexisting valid fixtures. These investigation stops do not authorize
 raising fixture caps or adding special cases to hide a host-compiler cost.
 
+The union-parameter increment starts from `276250fb8`, with the same toolchain
+and six comparison workloads. Freeze that immediate baseline before changing
+applied-type cardinality, and require identical C for all 73 preexisting valid
+fixtures. Investigate net formatted production growth above 300 lines or
+repeatable per-workload allocation/instruction increases above 10% against
+this immediate baseline; the original cumulative 25% threshold still applies.
+These stops do not authorize raising fixture caps. Retain complete ordered
+arguments while removing the unary representation in the same slice.
+
 Freeze the accepted starting revision `da8fa4c71`, toolchain and unchanged
 workloads for baseline/candidate comparison. Change fixture ceilings only with
 retained measurements and an explicit explanation. The argument increment raises
@@ -215,7 +231,7 @@ proxies, not self-compilation results. Do not advance the baseline between steps
 - [x] Typed checking errors and direct error-data/renderer tests (independent code and test reviews approved).
 - [x] Explicit checking/synthesis boundary with preserved behavior (independent compiler and test reviews approved).
 - [x] Multiple function type parameters (independent compiler and test reviews approved).
-- [ ] Multiple union type parameters.
+- [x] Multiple union type parameters (independent compiler and test reviews approved).
 - [ ] Written nested applications.
 - [ ] Unmanaged union payloads.
 - [ ] Managed String union payloads and exhaustive destruction.

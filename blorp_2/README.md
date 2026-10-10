@@ -401,7 +401,8 @@ separate rigid parameters. Specialization translates constructor and pattern
 identities, payload bindings and calls together. Generic functions can also
 receive concrete union values, including through direct calls and UFCS.
 
-Written annotations admit one atomic argument, such as `Box[Int]` or `Box[T]`;
+Written annotations admit ordered atomic arguments, such as `Box[Int]` or
+`Result[Int, Int]`;
 nested written `Box[Box[Int]]` is unsupported. Semantic calls can produce a
 nested type, but `box(box(7))` fails when its outer payload specializes to a
 union. Concrete payloads must be Int. Unsupported payload diagnostics point
@@ -426,7 +427,8 @@ position; call substitutions and specialization keys retain every argument in
 declaration order. Repeated concrete instances are reused, while changing even
 an unused later parameter creates a distinct instance. Substitution preserves
 caller-owned rigid types during forwarding. A known result type does not infer
-missing parameters. Unions still declare at most one type parameter.
+missing parameters. Fixed unions also support ordered declaration parameters,
+as in `Result[T, E]`.
 
 
 The [multiple-argument example](test/e2e/fixtures/generic/arguments.brp) adds
@@ -450,12 +452,42 @@ returns length 3. Passing the same managed value twice preserves both borrows
 through the call and drops its owner once after the result owner exists.
 
 
+The [two-parameter union example](test/e2e/fixtures/generic/union_parameters/ok.brp)
+adds independently positioned payload types:
+
+```blorp
+fixed union Result[T, E]:
+    Ok(T)
+    Err(E)
+pure func success() -> Result[Int, Int]:
+    Ok(7)
+pure func unwrap_or[T, E](value: Result[T, E], fallback: T) -> T:
+    match value:
+        Ok(item): item
+        Err(_): fallback
+func main() -> Int:
+    success().unwrap_or(3)
+```
+
+It exits 7. Written applications must supply exactly the declared number of
+atomic arguments in order. A known `Result[T, E]` argument can infer both
+function parameters; matching visits runtime arguments first, then each type
+argument from left to right. Conflicts retain the earliest inferred occurrence.
+At a conflict, diagnostic expectations retain any uninferred callee parameters
+as rigid types. Accepted calls still require every parameter to be inferred.
+Constructors and patterns substitute the union's own parameter identities.
+Phantom arguments still distinguish instances even when layouts match.
+`Result[Int, String]` is rejected because its Err payload would be String,
+even when the program constructs only Ok. Nested written applications and
+managed payloads remain deferred.
+
+
 ## Grammar for this increment
 
 This specification defines only the examples' language: functions with explicit
-return types, an ordered list of explicitly typed parameters, an optional single type
-parameter on functions and fixed unions. Union variants have zero fields or
-one field annotated `Int` or the union's own parameter; concrete fields
+return types, an ordered list of explicitly typed parameters, an optional ordered list of type
+parameters on functions and fixed unions. Union variants have zero fields or
+one field annotated `Int` or one of the union's own parameters; concrete fields
 specialize to Int. A function
 body has zero or more binding lines followed by a single expression or a tail
 match with inline arm results or binding blocks. Expressions
@@ -513,10 +545,10 @@ Lexical and layout rules:
 - `fixed union Type:` introduces one or more variants on indented
   lines. `fixed` and `union` are contextual header words and remain valid names
   elsewhere. A variant is bare or has one type-name annotation, as in
-  `Number(Int)` or `Box(T)`. A union may declare one parameter with
-  `fixed union Box[T]:`; payload annotations are `Int` or its own parameter.
-  Function parameter and return annotations accept one atomic application,
-  such as `Box[Int]` or `Box[T]`. Empty declaration parentheses, multiple fields
+  `Number(Int)` or `Box(T)`. A union may declare ordered parameters with
+  `fixed union Result[T, E]:`; payload annotations are `Int` or one of its own parameters.
+  Function parameter and return annotations accept a nonempty list of atomic arguments,
+  such as `Box[Int]` or `Result[T, E]`. Empty declaration parentheses, multiple fields
   and nested written applications are unsupported.
 - `match expression:` starts a nonempty sequence of depth-two arms written
   `Pattern: expression` or `Pattern:` followed by a depth-three block of
@@ -661,7 +693,7 @@ Semantic rules:
 - Parenthesized expressions,
   multiple or non-Int payload fields, nested matches,
   guards, qualified/nested/literal patterns, constructor UFCS, multiline chains,
-  non-tail matches, multiple type parameters, and function
+  non-tail matches, and function
   values are outside this increment. `Bool` has no special treatment: a written
   `fixed union Bool` follows the ordinary union path, and an undeclared `Bool` is unknown.
   Imports and UFCS-only import visibility are deferred; every function in this

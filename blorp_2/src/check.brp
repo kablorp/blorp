@@ -71,7 +71,7 @@ fixed union TypeRef:
 	IntType
 	StringType
 	UnionType(UnionId)
-	AppliedUnionType(UnionId, TypeRef)
+	AppliedUnionType(UnionId, List[TypeRef])
 	ParameterType(TypeParameterId)
 
 
@@ -259,7 +259,7 @@ pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 				AppliedUnionType(right_owner, right_argument):
 					(
 						IntOps.equals(union_number(left_owner), union_number(right_owner))
-						and same_type(left_argument, right_argument)
+						and same_types(left_argument, right_argument)
 					)
 				_:
 					False
@@ -287,6 +287,25 @@ pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 					IntOps.equals(union_number(left), union_number(right))
 				_:
 					False
+
+
+private pure func same_types(left: List[TypeRef], right: List[TypeRef]) -> Bool:
+	var matches = IntOps.equals(left.length(), right.length())
+	var index: Int = 0
+
+	for value in left:
+		match right.get(index):
+			Some(other):
+				matches = matches and same_type(value, other)
+			None:
+				matches = False
+
+		if not matches:
+			break
+
+		index = IntOps.add(index, 1)
+
+	matches
 
 
 pure func function_number(id: FunctionId) -> Int:
@@ -423,7 +442,8 @@ fixed union CheckErrorKind:
 	MainReturnType(TypeRef)
 	MissingMain
 	UnknownType(NameId)
-	MissingUnionTypeArguments(UnionId)
+	MissingUnionTypeArguments(UnionId, Int)
+	UnionTypeArgumentCountMismatch(UnionId, Int, Int)
 	OrdinaryUnionApplied(UnionId)
 	NonApplicableType(NameId)
 	TypeParameterTypeNameConflict(NameId)
@@ -831,7 +851,15 @@ private pure func resolve_atomic_type(
 							[]:
 								Ok(UnionType(id))
 							_:
-								Err(check_rejection(name.span, MissingUnionTypeArguments(id)))
+								Err(
+									check_rejection(
+										name.span,
+										MissingUnionTypeArguments(
+											id,
+											declaration.type_parameters.length(),
+										),
+									),
+								)
 					None:
 						Err(check_rejection(name.span, UnknownType(name.id)))
 
@@ -845,7 +873,7 @@ private pure func resolve_type(
 	match written:
 		AtomicType(name):
 			resolve_atomic_type(unions, special, name, type_parameters)
-		AppliedType(name, argument, span):
+		AppliedType(name, arguments, span):
 			owner ?= match find_union(unions, name.id):
 				Some(owner):
 					Ok(owner)
@@ -862,10 +890,36 @@ private pure func resolve_type(
 				[]:
 					Err(check_rejection(span, OrdinaryUnionApplied(owner)))
 				_:
-					Ok(void)
+					if IntOps.equals(declaration.type_parameters.length(), arguments.length()):
+						Ok(void)
+					else:
+						Err(
+							check_rejection(
+								span,
+								UnionTypeArgumentCountMismatch(
+									owner,
+									declaration.type_parameters.length(),
+									arguments.length(),
+								),
+							),
+						)
 
-			value ?= resolve_atomic_type(unions, special, argument, type_parameters)
-			Ok(AppliedUnionType(owner, value))
+			var values: List[TypeRef] = []
+			var failure: Option[CheckError] = None
+
+			for argument in arguments:
+				match resolve_atomic_type(unions, special, argument, type_parameters):
+					Ok(value):
+						values = values.append(value)
+					Err(error):
+						failure = Some(error)
+						break
+
+			match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(AppliedUnionType(owner, values))
 
 
 private fixed record CheckedSignatures {
@@ -1175,32 +1229,69 @@ private pure func occurrence_payload(
 		None:
 			Ok(None)
 		Some(written):
-			match parameters:
-				[]:
-					Ok(payload)
-				[parameter]:
-					match union_type:
-						AppliedUnionType(_, argument):
-							value ?= substitute_type(
-								written.value_type,
-								[
-									{
-										parameter = parameter,
-										value_type = argument
-									},
-								],
-								written.span,
-							)
-							Ok(Some({ written | value_type = value }))
+			owner ?= match type_union_owner(union_type):
+				Some(owner):
+					Ok(owner)
+				None:
+					Err(checker_invariant(written.span, VariantOccurrenceWithoutUnion(union_type)))
+
+			values: List[TypeRef] = match union_type:
+				AppliedUnionType(_, values):
+					values
+				_:
+					[]
+
+			if not IntOps.equals(parameters.length(), values.length()):
+				Err(checker_invariant(written.span, GenericConstructorContract))
+			else:
+				var arguments: List[ParameterArgument] = []
+				var failure: Option[CheckError] = None
+				var position: Int = 0
+
+				for parameter in parameters:
+					owner_matches = match parameter_owner(parameter):
+						UnionDeclaration(declaration):
+							IntOps.equals(union_number(declaration), union_number(owner))
 						_:
-							Err(
+							False
+
+					if (
+						not owner_matches
+						or not IntOps.equals(parameter_position(parameter), position)
+					):
+						failure = Some(
+							checker_invariant(
+								written.span,
+								InvalidParameterDeclaration(parameter),
+							),
+						)
+						break
+
+					match values.get(position):
+						Some(value):
+							arguments = arguments.append({
+								parameter = parameter,
+								value_type = value,
+							})
+						None:
+							failure = Some(
 								checker_invariant(
 									written.span,
 									InvalidParameterDeclaration(parameter),
 								),
 							)
-				_:
-					Err(checker_invariant(written.span, GenericConstructorContract))
+							break
+
+					position = IntOps.add(position, 1)
+
+				ready ?= match failure:
+					Some(error):
+						Err(error)
+					None:
+						Ok(void)
+
+				value ?= substitute_type(written.value_type, arguments, written.span)
+				Ok(Some({ written | value_type = value }))
 
 
 private pure func find_variant(
@@ -1682,9 +1773,23 @@ private pure func substitute_type(
 	span: Span,
 ) -> Result[TypeRef, CheckError]:
 	match value_type:
-		AppliedUnionType(owner, value):
-			argument ?= substitute_type(value, arguments, span)
-			Ok(AppliedUnionType(owner, argument))
+		AppliedUnionType(owner, values):
+			var substituted: List[TypeRef] = []
+			var failure: Option[CheckError] = None
+
+			for value in values:
+				match substitute_type(value, arguments, span):
+					Ok(value):
+						substituted = substituted.append(value)
+					Err(error):
+						failure = Some(error)
+						break
+
+			match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(AppliedUnionType(owner, substituted))
 		ParameterType(id):
 			var replacement: Option[TypeRef] = None
 
@@ -1703,36 +1808,58 @@ private pure func substitute_type(
 			Ok(value_type)
 
 
-private pure func infer_type_argument(
+private pure func infer_type_arguments(
 	expected: TypeRef,
 	actual: TypeRef,
-) -> Option[ParameterArgument]:
+) -> List[ParameterArgument]:
 	match expected:
 		ParameterType(id):
-			Some({
-				parameter = id,
-				value_type = actual,
-			})
-		AppliedUnionType(owner, expected_argument):
+			[
+				{
+					parameter = id,
+					value_type = actual
+				},
+			]
+		AppliedUnionType(owner, expected_arguments):
 			match actual:
-				AppliedUnionType(actual_owner, actual_argument):
-					if IntOps.equals(union_number(owner), union_number(actual_owner)):
-						infer_type_argument(expected_argument, actual_argument)
-					else:
-						None
+				AppliedUnionType(actual_owner, actual_arguments):
+					var constraints: List[ParameterArgument] = []
+					var position: Int = 0
+
+					if (
+						IntOps.equals(union_number(owner), union_number(actual_owner))
+						and IntOps.equals(expected_arguments.length(), actual_arguments.length())
+					):
+						for argument in expected_arguments:
+							match actual_arguments.get(position):
+								Some(actual):
+									constraints = constraints.concat(
+										infer_type_arguments(
+											argument,
+											actual,
+										),
+									)
+								None:
+									void
+
+							position = IntOps.add(position, 1)
+
+					constraints
 				_:
-					None
+					[]
 		_:
-			None
+			[]
 
 
 private pure func constrain_argument(
-	declared: Option[TypeParameterId],
+	parameters: List[TypeParameterId],
+	inferred: List[Option[TypeUse]],
 	constraint: ParameterArgument,
-	previous: Option[Option[TypeUse]],
 	obligation: ArgumentMismatch,
 ) -> Result[TypeUse, CheckError]:
-	parameter ?= match declared:
+	position = parameter_position(constraint.parameter)
+
+	parameter ?= match parameters.get(position):
 		Some(parameter):
 			if same_parameter(parameter, constraint.parameter):
 				Ok(parameter)
@@ -1756,18 +1883,42 @@ private pure func constrain_argument(
 		span = obligation.actual.span
 	}
 
-	match previous:
+	match inferred.get(position):
 		Some(None):
 			Ok(current)
 		Some(Some(first)):
 			if same_type(first.value_type, current.value_type):
 				Ok(first)
 			else:
-				expected ?= substitute_type(
-					obligation.expected,
-					[{ constraint | value_type = first.value_type }],
-					obligation.actual.span,
-				)
+				-- Error-only expectation: uninferred accepted callee parameters stay rigid.
+				var snapshot: List[ParameterArgument] = []
+				var failure: Option[CheckError] = None
+
+				for declared in parameters:
+					match inferred.get(parameter_position(declared)):
+						Some(candidate):
+							snapshot = snapshot.append({
+								parameter = declared,
+								value_type = candidate
+									.map(pure func(value: TypeUse): value.value_type)
+									.get_or(ParameterType(declared)),
+							})
+						None:
+							failure = Some(
+								checker_invariant(
+									current.span,
+									InvalidParameterDeclaration(declared),
+								),
+							)
+							break
+
+				ready ?= match failure:
+					Some(error):
+						Err(error)
+					None:
+						Ok(void)
+
+				expected ?= substitute_type(obligation.expected, snapshot, current.span)
 				Err(check_rejection(
 					current.span,
 					GenericArgumentConflict({
@@ -1801,29 +1952,27 @@ private pure func instantiate_contract(
 				None:
 					failure = Some(checker_invariant(contract.span, MissingGenericParameter(index)))
 				Some(written):
-					match infer_type_argument(written.value_type, value.value_type):
-						None:
-							void
-						Some(argument):
-							position = parameter_position(argument.parameter)
+					for argument in infer_type_arguments(written.value_type, value.value_type):
+						position = parameter_position(argument.parameter)
 
-							match (
-								constrain_argument(
-									contract.type_parameters.get(position),
-									argument,
-									inferred.get(position),
-									{
-										expected = written.value_type,
-										actual = value,
-										argument_position = index,
-										expected_site = parameter_site(contract, written)
-									},
-								)
-							):
-								Ok(value):
-									inferred = inferred.set(position, Some(value))
-								Err(error):
-									failure = Some(error)
+						match (
+							constrain_argument(
+								contract.type_parameters,
+								inferred,
+								argument,
+								{
+									expected = written.value_type,
+									actual = value,
+									argument_position = index,
+									expected_site = parameter_site(contract, written)
+								},
+							)
+						):
+							Ok(value):
+								inferred = inferred.set(position, Some(value))
+							Err(error):
+								failure = Some(error)
+								break
 
 			if failure.is_some():
 				break
@@ -2798,8 +2947,15 @@ private pure func contains_parameter(value_type: TypeRef) -> Bool:
 	match value_type:
 		ParameterType(_):
 			True
-		AppliedUnionType(_, argument):
-			contains_parameter(argument)
+		AppliedUnionType(_, arguments):
+			var found = False
+
+			for argument in arguments:
+				if contains_parameter(argument):
+					found = True
+					break
+
+			found
 		_:
 			False
 
@@ -3047,11 +3203,30 @@ private pure func render_error(error: CheckError, context: ParsedContents) -> Di
 				"main cannot be generic",
 				"declare main() -> Int: without type parameters",
 			)
-		MissingUnionTypeArguments(_):
+		MissingUnionTypeArguments(_, count):
+			if IntOps.equals(count, 1):
+				rendered(
+					error.span,
+					"generic union requires one type argument",
+					"write a concrete or symbolic application, such as Box[Int] or Box[T]",
+				)
+			else:
+				rendered(
+					error.span,
+					"generic union requires type arguments",
+					"write "
+						.concat(IntOps.to_string(count))
+						.concat(" atomic type arguments in declaration order"),
+				)
+		UnionTypeArgumentCountMismatch(_, expected, actual):
 			rendered(
 				error.span,
-				"generic union requires one type argument",
-				"write a concrete or symbolic application, such as Box[Int] or Box[T]",
+				"union type argument count does not match its declaration",
+				"expected "
+					.concat(IntOps.to_string(expected))
+					.concat(" type arguments, got ")
+					.concat(IntOps.to_string(actual))
+					.concat("; supply atomic types in declaration order"),
 			)
 		UnknownType(_):
 			rendered(
@@ -3385,15 +3560,30 @@ private pure func type_spelling(
 				context.names,
 				declaration.type_name.id,
 			).to_result(render_fault(span, InvalidParsedName(declaration.type_name.id)))
-		AppliedUnionType(id, argument):
+		AppliedUnionType(id, arguments):
 			name ?= type_spelling(UnionType(id), context, span)
-			argument ?= type_spelling(argument, context, span)
-			Ok(
-				name
-					.concat("[")
-					.concat(argument)
-					.concat("]"),
-			)
+			var spelling = name.concat("[")
+			var failure: Option[Diagnostic] = None
+			var position: Int = 0
+
+			for argument in arguments:
+				match type_spelling(argument, context, span):
+					Ok(value):
+						if not IntOps.equals(position, 0):
+							spelling = spelling.concat(", ")
+
+						spelling = spelling.concat(value)
+					Err(error):
+						failure = Some(error)
+						break
+
+				position = IntOps.add(position, 1)
+
+			match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(spelling.concat("]"))
 
 
 private pure func missing_variant_name(

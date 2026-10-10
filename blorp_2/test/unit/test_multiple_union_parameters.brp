@@ -1,0 +1,1280 @@
+import:
+	../../src/check as Checked
+	../../src/lex: lex
+	../../src/names: name_spelling
+	../../src/parse: parsed_contents
+	../../src/specialize as Concrete
+	../../src/syntax:
+		Diagnostic,
+		DiagnosticNote(UnionPayloadDeclaration),
+		Span,
+		TypeSyntax(AppliedType),
+	../../src/text: concat
+	input: check_failure, parse, setup_diagnostic
+	test: TestSuite
+
+
+private pure func checked(source: String) -> Result[Checked.CheckedProgram, Diagnostic]:
+	tokens ?= lex(source.concat("\n"))
+	parsed ?= parse(tokens)
+	Checked
+		.check(parsed)
+		.map_err(setup_diagnostic)
+
+
+pure func test_two_union_parameters_accept_int_constructor_and_pattern() -> Bool:
+	source: String =
+		|fixed union Result[T, E]:
+		|    Ok(T)
+		|    Err(E)
+		|pure func success() -> Result[Int, Int]:
+		|    Ok(7)
+		|pure func read(value: Result[Int, Int]) -> Int:
+		|    match value:
+		|        Ok(item): item
+		|        Err(item): item
+		|func main() -> Int:
+		|    success().read()
+	checked(source).is_ok()
+
+
+pure func test_one_union_parameter_remains_accepted() -> Bool:
+	source: String =
+		|fixed union Box[T]:
+		|    Box(T)
+		|pure func box(value: Int) -> Box[Int]:
+		|    Box(value)
+		|pure func unbox[T](value: Box[T]) -> T:
+		|    match value:
+		|        Box(item): item
+		|func main() -> Int:
+		|    box(7).unbox()
+	checked(source).is_ok()
+
+
+private MAIN: String = "func main() -> Int:\n\t0"
+
+private MARKER: String = "fixed union Marker[A,B]:\n\tOnly\n"
+
+private TRI: String = "fixed union Tri[X,Y,Z]:\n\tEmpty\n"
+
+
+private pure func rejected(source: String) -> Option[Checked.CheckError]:
+	check_failure(source.concat("\n"))
+
+
+private pure func function_parameter(
+	id: Checked.TypeParameterId,
+	owner: Int,
+	position: Int,
+) -> Bool:
+	match Checked.parameter_owner(id):
+		Checked.FunctionDeclaration(function):
+			(
+				Checked.function_number(function) == owner
+				and Checked.parameter_position(id) == position
+			)
+		_:
+			False
+
+
+private pure func union_parameter(id: Checked.TypeParameterId, owner: Int, position: Int) -> Bool:
+	match Checked.parameter_owner(id):
+		Checked.UnionDeclaration(declaration):
+			(
+				Checked.union_number(declaration) == owner
+				and Checked.parameter_position(id) == position
+			)
+		_:
+			False
+
+
+private pure func span_is(value: Span, start: Int, end: Int) -> Bool:
+	value.start == start and value.end == end
+
+
+pure func test_union_duplicates_preserve_owner_positions_and_both_spans() -> Bool:
+	prefix = "fixed union Pair[A,"
+
+	match (
+		rejected(
+			prefix
+				.concat("A]:\n\tOnly\n")
+				.concat(MAIN),
+		)
+	):
+		Some(error):
+			match error.kind:
+				Checked.DuplicateTypeParameter(current, previous, first):
+					(
+						union_parameter(current, 0, 1)
+						and union_parameter(previous, 0, 0)
+						and span_is(error.span, prefix.length(), prefix.length() + 1)
+						and span_is(
+							first,
+							"fixed union Pair[".length(),
+							"fixed union Pair[A".length(),
+						)
+					)
+				_:
+					False
+		None:
+			False
+
+
+private pure func arity_is(arguments: String, actual: Int) -> Bool:
+	prefix = MARKER.concat("pure func bad(value:")
+	written = "Marker["
+		.concat(arguments)
+		.concat("]")
+
+	match (
+		rejected(
+			prefix
+				.concat(written)
+				.concat(")->Int:\n\t0\n")
+				.concat(MAIN),
+		)
+	):
+		Some(error):
+			match error.kind:
+				Checked.UnionTypeArgumentCountMismatch(owner, 2, count):
+					(
+						Checked.union_number(owner) == 0
+						and count == actual
+						and span_is(error.span, prefix.length(), prefix.length() + written.length())
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_too_few_and_too_many_arguments_have_typed_counts() -> Bool:
+	arity_is("Int", 1) and arity_is("Int,String,Int", 3) and arity_is("Missing", 1)
+
+
+pure func test_bare_application_retains_required_count() -> Bool:
+	prefix = MARKER.concat("pure func bad(value:")
+
+	match (
+		rejected(
+			prefix
+				.concat("Marker)->Int:\n\t0\n")
+				.concat(MAIN),
+		)
+	):
+		Some(error):
+			match error.kind:
+				Checked.MissingUnionTypeArguments(owner, 2):
+					(
+						Checked.union_number(owner) == 0
+						and span_is(error.span, prefix.length(), prefix.length() + 6)
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_later_unknown_argument_type_has_its_own_span() -> Bool:
+	prefix = MARKER.concat("pure func bad(value:Marker[Int,")
+
+	match (
+		rejected(
+			prefix
+				.concat("Missing])->Int:\n\t0\n")
+				.concat(MAIN),
+		)
+	):
+		Some(error):
+			match error.kind:
+				Checked.UnknownType(_):
+					span_is(error.span, prefix.length(), prefix.length() + 7)
+				_:
+					False
+		None:
+			False
+
+
+private pure func constructed_parameter(
+	function: Checked.CheckedFunction,
+	owner: Int,
+	position: Int,
+) -> Bool:
+	match function.body:
+		Checked.CheckedValueBody(value):
+			match (value.base_type, value.operations):
+				(Checked.ParameterType(payload), [step]):
+					match (step.operation, step.value_type):
+						(Checked.ConstructVariant(variant), Checked.AppliedUnionType(union_id, [Checked.ParameterType(a), Checked.ParameterType(b), Checked.ParameterType(c)])):
+							(
+								function_parameter(payload, owner, position)
+								and function_parameter(a, owner, 0)
+								and function_parameter(b, owner, 1)
+								and function_parameter(c, owner, 2)
+								and Checked.union_number(union_id) == 0
+								and Checked.union_number(Checked.variant_owner(variant)) == 0
+								and Checked.variant_number(variant) == position
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_three_payload_positions_keep_union_and_function_authorities() -> Bool:
+	source: String =
+		|fixed union Triple[A,B,C]:
+		|    First(A)
+		|    Second(B)
+		|    Third(C)
+		|pure func first[X,Y,Z](value:X)->Triple[X,Y,Z]:
+		|    First(value)
+		|pure func second[X,Y,Z](value:Y)->Triple[X,Y,Z]:
+		|    Second(value)
+		|pure func third[X,Y,Z](value:Z)->Triple[X,Y,Z]:
+		|    Third(value)
+		|pure func select[X,Y,Z](value:Triple[X,Y,Z],fallback:Z)->Z:
+		|    match value:
+		|        First(first): fallback
+		|        Second(second): fallback
+		|        Third(third): third
+		|func main()->Int:
+		|    0
+
+	match checked(source):
+		Ok(program):
+			facts = Checked.checked_functions(program)
+
+			match (facts.unions, facts.functions):
+				([declaration], [first, second, third, selection, _]):
+					match (declaration.variants, selection.body, selection.bindings):
+						([Some(a), Some(b), Some(c)], Checked.CheckedMatchBody(matched), [_, _, first_binding, second_binding, third_binding]):
+							match (
+								(a.value_type, b.value_type, c.value_type),
+								(
+									first_binding.value_type,
+									second_binding.value_type,
+									third_binding.value_type,
+									matched.arms,
+								),
+							):
+								((Checked.ParameterType(a), Checked.ParameterType(b), Checked.ParameterType(c)), (Checked.ParameterType(x), Checked.ParameterType(y), Checked.ParameterType(z), [first_arm, second_arm, third_arm])):
+									match (
+										first_arm.pattern,
+										second_arm.pattern,
+										third_arm.pattern,
+									):
+										(Checked.VariantCase(first_variant, Checked.BindPayload(first_id)), Checked.VariantCase(second_variant, Checked.BindPayload(second_id)), Checked.VariantCase(third_variant, Checked.BindPayload(third_id))):
+											(
+												constructed_parameter(first, 0, 0)
+												and constructed_parameter(second, 1, 1)
+												and constructed_parameter(third, 2, 2)
+												and union_parameter(a, 0, 0)
+												and union_parameter(b, 0, 1)
+												and union_parameter(c, 0, 2)
+												and function_parameter(x, 3, 0)
+												and function_parameter(y, 3, 1)
+												and function_parameter(z, 3, 2)
+												and Checked.variant_number(first_variant) == 0
+												and Checked.variant_number(second_variant) == 1
+												and Checked.variant_number(third_variant) == 2
+												and Checked.union_number(
+													Checked.variant_owner(third_variant),
+												) == 0
+												and Checked.binding_number(first_id) == 2
+												and Checked.binding_number(second_id) == 3
+												and Checked.binding_number(third_id) == 4
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_unused_body_cannot_choose_a_rigid_union_parameter() -> Bool:
+	declaration = "fixed union Result[X,Y]:\n\tOk(X)\n\tErr(Y)\n"
+	prefix = declaration.concat("pure func bad[A,B](value:Result[A,B])->")
+	body_prefix = prefix.concat("A:\n\tmatch value:\n\t\tOk(item):item\n\t\tErr(item):")
+
+	match (
+		rejected(
+			body_prefix
+				.concat("item\n")
+				.concat(MAIN),
+		)
+	):
+		Some(error):
+			match error.kind:
+				Checked.ExpressionTypeMismatch(mismatch):
+					match (mismatch.expected, mismatch.actual.value_type, mismatch.expected_site):
+						(Checked.ParameterType(expected), Checked.ParameterType(actual), Checked.SourceAnnotation(site)):
+							(
+								function_parameter(expected, 0, 0)
+								and function_parameter(actual, 0, 1)
+								and span_is(site, prefix.length(), prefix.length() + 1)
+								and span_is(
+									error.span,
+									body_prefix.length(),
+									body_prefix.length() + 4,
+								)
+								and span_is(
+									mismatch.actual.span,
+									body_prefix.length(),
+									body_prefix.length() + 4,
+								)
+							)
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_one_runtime_argument_infers_three_function_parameters() -> Bool:
+	source = TRI.concat(
+		"pure func producer()->Tri[Int,String,Int]:\n\tEmpty\npure func take[A,B,C](value:Tri[A,B,C])->Int:\n\t0\nfunc main()->Int:\n\ttake(producer())",
+	)
+
+	match checked(source):
+		Ok(program):
+			match Checked.checked_functions(program).functions:
+				[_, _, main]:
+					match main.body:
+						Checked.CheckedValueBody(value):
+							match value.base:
+								Checked.ReturnCall(call, _):
+									match call.target:
+										Checked.UserFunction(id, [Checked.IntType, Checked.StringType, Checked.IntType]):
+											match Concrete.specialize(program):
+												Ok(concrete):
+													(
+														Checked.function_number(id) == 1
+														and Concrete.specialized_contents(
+															concrete,
+														).functions.length() == 3
+													)
+												Err(_):
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_conflict_before_unseen_parameter_retains_a_rigid_snapshot() -> Bool:
+	declarations = MARKER.concat(
+		"pure func producer()->Marker[String,Int]:\n\tOnly\npure func take[A,B](first:A,value:",
+	)
+	annotation = "Marker[A,B]"
+	prefix = declarations
+		.concat(annotation)
+		.concat(")->Int:\n\t0\nfunc main()->Int:\n\ttake(7,")
+
+	match rejected(prefix.concat("producer())")):
+		Some(error):
+			match error.kind:
+				Checked.GenericArgumentConflict(conflict):
+					match (
+						(conflict.mismatch.expected, conflict.mismatch.actual.value_type),
+						(
+							conflict.previous.value_type,
+							conflict.current.value_type,
+							conflict.mismatch.expected_site,
+						),
+					):
+						((Checked.AppliedUnionType(expected_owner, [Checked.IntType, Checked.ParameterType(unseen)]), Checked.AppliedUnionType(actual_owner, [Checked.StringType, Checked.IntType])), (Checked.IntType, Checked.StringType, Checked.SourceAnnotation(site))):
+							(
+								function_parameter(conflict.parameter, 1, 0)
+								and function_parameter(unseen, 1, 1)
+								and Checked.union_number(expected_owner) == 0
+								and Checked.union_number(actual_owner) == 0
+								and conflict.mismatch.argument_position == 1
+								and span_is(
+									conflict.previous.span,
+									prefix.length() - 2,
+									prefix.length() - 1,
+								)
+								and span_is(
+									conflict.current.span,
+									prefix.length(),
+									prefix.length() + 10,
+								)
+								and span_is(
+									conflict.mismatch.actual.span,
+									prefix.length(),
+									prefix.length() + 10,
+								)
+								and span_is(error.span, prefix.length(), prefix.length() + 10)
+								and span_is(
+									site,
+									declarations.length(),
+									declarations.length() + annotation.length(),
+								)
+							)
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_repeated_parameter_in_one_argument_conflicts_before_later_inference() -> Bool:
+	declarations = TRI.concat(
+		"pure func producer()->Tri[Int,String,Int]:\n\tEmpty\npure func repeated[A,B](value:",
+	)
+	annotation = "Tri[A,A,B]"
+	prefix = declarations
+		.concat(annotation)
+		.concat(")->Int:\n\t0\nfunc main()->Int:\n\trepeated(")
+
+	match rejected(prefix.concat("producer())")):
+		Some(error):
+			match error.kind:
+				Checked.GenericArgumentConflict(conflict):
+					match (
+						(conflict.mismatch.expected, conflict.mismatch.actual.value_type),
+						(
+							conflict.previous.value_type,
+							conflict.current.value_type,
+							conflict.mismatch.expected_site,
+						),
+					):
+						((Checked.AppliedUnionType(expected_owner, [Checked.IntType, Checked.IntType, Checked.ParameterType(unseen)]), Checked.AppliedUnionType(actual_owner, [Checked.IntType, Checked.StringType, Checked.IntType])), (Checked.IntType, Checked.StringType, Checked.SourceAnnotation(site))):
+							(
+								function_parameter(conflict.parameter, 1, 0)
+								and function_parameter(unseen, 1, 1)
+								and Checked.union_number(expected_owner) == 0
+								and Checked.union_number(actual_owner) == 0
+								and conflict.mismatch.argument_position == 0
+								and span_is(
+									conflict.previous.span,
+									prefix.length(),
+									prefix.length() + 10,
+								)
+								and span_is(
+									conflict.current.span,
+									prefix.length(),
+									prefix.length() + 10,
+								)
+								and span_is(
+									conflict.mismatch.actual.span,
+									prefix.length(),
+									prefix.length() + 10,
+								)
+								and span_is(error.span, prefix.length(), prefix.length() + 10)
+								and span_is(
+									site,
+									declarations.length(),
+									declarations.length() + annotation.length(),
+								)
+							)
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_conflicting_children_follow_annotation_order_not_parameter_order() -> Bool:
+	prefix = MARKER.concat(
+		"pure func producer()->Marker[String,String]:\n\tOnly\npure func take[A,B](first:A,second:B,value:Marker[B,A])->Int:\n\t0\nfunc main()->Int:\n\ttake(7,8,",
+	)
+
+	match rejected(prefix.concat("producer())")):
+		Some(error):
+			match error.kind:
+				Checked.GenericArgumentConflict(conflict):
+					(
+						function_parameter(conflict.parameter, 1, 1)
+						and conflict.mismatch.argument_position == 2
+						and span_is(
+							conflict.previous.span,
+							prefix.length() - 2,
+							prefix.length() - 1,
+						)
+						and span_is(error.span, prefix.length(), prefix.length() + 10)
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_agreeing_children_preserve_the_first_candidate_occurrence() -> Bool:
+	prefix = MARKER.concat(
+		"pure func agreeing()->Marker[Int,Int]:\n\tOnly\npure func disagreeing()->Marker[Int,String]:\n\tOnly\npure func take[A](first:A,agree:Marker[A,A],bad:Marker[A,A])->Int:\n\t0\nfunc main()->Int:\n\ttake(7,agreeing(),",
+	)
+
+	match rejected(prefix.concat("disagreeing())")):
+		Some(error):
+			match error.kind:
+				Checked.GenericArgumentConflict(conflict):
+					(
+						function_parameter(conflict.parameter, 2, 0)
+						and conflict.mismatch.argument_position == 2
+						and span_is(
+							conflict.previous.span,
+							prefix.length() - 13,
+							prefix.length() - 12,
+						)
+						and span_is(conflict.current.span, prefix.length(), prefix.length() + 13)
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_missing_inference_precedes_an_ordinary_mismatch() -> Bool:
+	prefix = MARKER.concat(
+		"pure func take[A,B](wrong:Int,value:Marker[A,A])->Int:\n\t0\npure func producer()->Marker[Int,Int]:\n\tOnly\nfunc main()->Int:\n\t",
+	)
+
+	match rejected(prefix.concat("take(8.to_string(),producer())")):
+		Some(error):
+			match error.kind:
+				Checked.UninferableTypeParameter(parameter):
+					(
+						function_parameter(parameter, 0, 1)
+						and span_is(error.span, prefix.length(), prefix.length() + 4)
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_conflict_precedes_an_ordinary_mismatch() -> Bool:
+	prefix = MARKER.concat(
+		"pure func take[A](wrong:Int,value:Marker[A,A])->Int:\n\t0\npure func producer()->Marker[Int,String]:\n\tOnly\nfunc main()->Int:\n\ttake(8.to_string(),",
+	)
+
+	match rejected(prefix.concat("producer())")):
+		Some(error):
+			match error.kind:
+				Checked.GenericArgumentConflict(conflict):
+					(
+						function_parameter(conflict.parameter, 0, 0)
+						and conflict.mismatch.argument_position == 1
+						and span_is(error.span, prefix.length(), prefix.length() + 10)
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_later_child_error_precedes_structural_conflict() -> Bool:
+	prefix = MARKER.concat(
+		"pure func take[A](value:Marker[A,A],last:Int)->Int:\n\t0\npure func producer()->Marker[Int,String]:\n\tOnly\nfunc main()->Int:\n\ttake(producer(),",
+	)
+
+	match rejected(prefix.concat("missing)")):
+		Some(error):
+			match error.kind:
+				Checked.UnknownValue(_):
+					span_is(error.span, prefix.length(), prefix.length() + 7)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_expected_result_does_not_fill_a_later_union_argument() -> Bool:
+	prefix = MARKER.concat(
+		"pure func empty[A,B](value:A)->Marker[A,B]:\n\tOnly\npure func use()->Marker[Int,String]:\n\t",
+	)
+
+	match (
+		rejected(
+			prefix
+				.concat("empty(7)\n")
+				.concat(MAIN),
+		)
+	):
+		Some(error):
+			match error.kind:
+				Checked.UninferableTypeParameter(parameter):
+					(
+						function_parameter(parameter, 0, 1)
+						and span_is(error.span, prefix.length(), prefix.length() + 5)
+					)
+				_:
+					False
+		None:
+			False
+
+
+private pure func variant_return_matches(function: Concrete.ConcreteFunction) -> Bool:
+	match (function.signature.return_type, function.body):
+		(Concrete.UnionType(owner), Concrete.ConcreteValueBody(value)):
+			match value.base:
+				Concrete.ReturnVariant(variant):
+					Concrete.union_number(
+						owner,
+					) == Concrete.union_number(Concrete.variant_owner(variant))
+				_:
+					False
+		_:
+			False
+
+
+pure func test_phantom_keys_include_every_argument_and_nominal_owner() -> Bool:
+	source = MARKER
+		.concat(
+			"fixed union Other[A,B]:\n\tOnly\npure func first()->Marker[Int,Int]:\n\tOnly\npure func second()->Marker[Int,String]:\n\tOnly\npure func third()->Marker[String,Int]:\n\tOnly\npure func other()->Other[Int,Int]:\n\tOnly\npure func again()->Marker[Int,Int]:\n\tOnly\n",
+		)
+		.concat(MAIN)
+
+	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
+		Ok(program):
+			facts = Concrete.specialized_contents(program)
+
+			match facts.functions:
+				[first, second, third, other, again, _]:
+					match (
+						(
+							first.signature.return_type,
+							second.signature.return_type,
+							third.signature.return_type,
+						),
+						(other.signature.return_type, again.signature.return_type),
+					):
+						((Concrete.UnionType(a), Concrete.UnionType(b), Concrete.UnionType(c)), (Concrete.UnionType(d), Concrete.UnionType(repeated))):
+							(
+								variant_return_matches(first)
+								and variant_return_matches(second)
+								and variant_return_matches(third)
+								and variant_return_matches(other)
+								and variant_return_matches(again)
+								and facts.unions.length() == 4
+								and Concrete.union_number(a) == 0
+								and Concrete.union_number(b) == 1
+								and Concrete.union_number(c) == 2
+								and Concrete.union_number(d) == 3
+								and Concrete.union_number(repeated) == 0
+							)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func call_target(function: Checked.CheckedFunction) -> Option[Checked.CallTarget]:
+	match function.body:
+		Checked.CheckedValueBody(value):
+			match value.base:
+				Checked.ReturnCall(call, _):
+					Some(call.target)
+				_:
+					None
+		_:
+			None
+
+
+private pure func concrete_target(
+	function: Concrete.ConcreteFunction,
+) -> Option[Concrete.CallTarget]:
+	match function.body:
+		Concrete.ConcreteValueBody(value):
+			match value.base:
+				Concrete.ReturnCall(call, _):
+					Some(call.target)
+				_:
+					None
+		_:
+			None
+
+
+pure func test_permuted_forwarding_preserves_caller_ids_and_concrete_target() -> Bool:
+	source = MARKER.concat(
+		"pure func first[L,R](value:Marker[L,R])->Marker[R,L]:\n\tOnly\npure func forward[X,Y](value:Marker[Y,X])->Marker[X,Y]:\n\tfirst(value)\npure func producer()->Marker[Int,String]:\n\tOnly\npure func witness()->Marker[String,Int]:\n\tOnly\nfunc main()->Int:\n\tsaved = forward(producer())\n\t0",
+	)
+
+	match checked(source):
+		Ok(program):
+			match Checked.checked_functions(program).functions:
+				[_, forward, _, _, _]:
+					match call_target(forward):
+						Some(Checked.UserFunction(target, [Checked.ParameterType(y), Checked.ParameterType(x)])):
+							match Concrete.specialize(program):
+								Ok(concrete):
+									match Concrete.specialized_contents(concrete).functions:
+										[producer, witness, _, concrete_forward, concrete_first]:
+											match (
+												concrete_target(concrete_forward),
+												concrete_first.signature.parameters,
+											):
+												(Some(Concrete.UserFunction(id)), [input]):
+													(
+														function_parameter(x, 1, 0)
+														and function_parameter(y, 1, 1)
+														and Checked.function_number(target) == 0
+														and Concrete.function_number(id) == 4
+														and Concrete.same_type(
+															producer.signature.return_type,
+															input,
+														)
+														and Concrete.same_type(
+															concrete_forward.signature.return_type,
+															concrete_first.signature.return_type,
+														)
+														and Concrete.same_type(
+															concrete_forward.signature.return_type,
+															witness.signature.return_type,
+														)
+														and Concrete.same_type(
+															concrete_first.signature.return_type,
+															witness.signature.return_type,
+														)
+														and not Concrete.same_type(
+															producer.signature.return_type,
+															concrete_forward.signature.return_type,
+														)
+													)
+												_:
+													False
+										_:
+											False
+								Err(_):
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func rejects_later_payload(source: String, start: Int, end: Int) -> Bool:
+	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
+		Err(error):
+			match error.note:
+				Some(UnionPayloadDeclaration(note)):
+					(
+						span_is(error.span, start, end)
+						and span_is(
+							note,
+							"fixed union Result[T,E]:\n\tOk(T)\n\tErr(".length(),
+							"fixed union Result[T,E]:\n\tOk(T)\n\tErr(E".length(),
+						)
+						and error.message == "specialized union payload must be Int"
+						and error.help == "use Int for this payload; String and union payloads are not supported"
+					)
+				_:
+					False
+		Ok(_):
+			False
+
+
+pure func test_later_string_payload_rejects_even_when_only_first_variant_is_constructed() -> Bool:
+	declaration = "fixed union Result[T,E]:\n\tOk(T)\n\tErr(E)\n"
+	prefix = declaration.concat("pure func success()->")
+	annotation = "Result[Int,String]"
+	call_prefix = declaration.concat(
+		"pure func make[E](value:E)->Result[Int,E]:\n\tOk(7)\nfunc main()->Int:\n\tsaved = ",
+	)
+	rejects_later_payload(
+		prefix
+			.concat(annotation)
+			.concat(":\n\tOk(7)\n")
+			.concat(MAIN),
+		prefix.length(),
+		prefix.length() + annotation.length(),
+	) and rejects_later_payload(
+		call_prefix.concat("make(42.to_string())\n\t0"),
+		call_prefix.length(),
+		call_prefix.length() + 4,
+	)
+
+
+pure func test_arity_renderer_uses_complete_typed_counts_without_rechecking() -> Bool:
+	source = MARKER.concat(MAIN)
+
+	match lex(source.concat("\n")).and_then(pure func(tokens): parse(tokens)):
+		Ok(parsed):
+			match Checked.check(parsed):
+				Ok(program):
+					match Checked.union_declaration_id(program, 0):
+						Some(owner):
+							location: Span = {
+								start = 3,
+								end = 14
+							}
+							diagnostic = Checked.render_check_error(
+								parsed,
+								{
+									span = location,
+									kind = Checked.UnionTypeArgumentCountMismatch(owner, 4, 3)
+								},
+							)
+							missing = Checked.render_check_error(
+								parsed,
+								{
+									span = location,
+									kind = Checked.MissingUnionTypeArguments(owner, 4)
+								},
+							)
+							(
+								span_is(diagnostic.span, 3, 14)
+								and diagnostic.note.is_none()
+								and diagnostic.message == "union type argument count does not match its declaration"
+								and diagnostic.help == "expected 4 type arguments, got 3; supply atomic types in declaration order"
+								and missing.message == "generic union requires type arguments"
+								and missing.help == "write 4 atomic type arguments in declaration order"
+							)
+						None:
+							False
+				Err(_):
+					False
+		Err(_):
+			False
+
+
+pure func test_declaration_and_application_lists_preserve_all_names_and_spans() -> Bool:
+	before_three = "fixed union Plain:\n\tOnly\nfixed union One[A]:\n\tOnly\nfixed union Two[A,B]:\n\tOnly\n"
+	header_prefix = before_three.concat("fixed union Three[")
+	declarations = header_prefix.concat("A,B,C]:\n\tOnly\n")
+	prefix = declarations.concat("pure func inspect(value:")
+	annotation = "Three[ Int, String, Plain ]"
+	source = prefix
+		.concat(annotation)
+		.concat(")->Int:\n\t0")
+
+	match lex(source.concat("\n")).and_then(pure func(tokens): parse(tokens)):
+		Ok(parsed):
+			facts = parsed_contents(parsed)
+
+			match (facts.unions, facts.functions):
+				([plain, one, two, three], [function]):
+					match (three.type_parameters, function.parameters):
+						([a, b, c], [parameter]):
+							match parameter.type_name:
+								AppliedType(head, [first, second, last], whole):
+									match (
+										name_spelling(facts.names, head.id),
+										name_spelling(facts.names, first.id),
+										name_spelling(facts.names, second.id),
+										name_spelling(facts.names, last.id),
+									):
+										(Some("Three"), Some("Int"), Some("String"), Some("Plain")):
+											(
+												plain.type_parameters.length() == 0
+												and one.type_parameters.length() == 1
+												and two.type_parameters.length() == 2
+												and span_is(
+													a.span,
+													header_prefix.length(),
+													header_prefix.length() + 1,
+												)
+												and span_is(
+													b.span,
+													header_prefix.length() + 2,
+													header_prefix.length() + 3,
+												)
+												and span_is(
+													c.span,
+													header_prefix.length() + 4,
+													header_prefix.length() + 5,
+												)
+												and span_is(
+													head.span,
+													prefix.length(),
+													prefix.length() + 5,
+												)
+												and span_is(
+													first.span,
+													prefix.length() + 7,
+													prefix.length() + 10,
+												)
+												and span_is(
+													second.span,
+													prefix.length() + 12,
+													prefix.length() + 18,
+												)
+												and span_is(
+													last.span,
+													prefix.length() + 20,
+													prefix.length() + 25,
+												)
+												and span_is(
+													whole,
+													prefix.length(),
+													prefix.length() + annotation.length(),
+												)
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func parser_rejects(
+	prefix: String,
+	marked: String,
+	suffix: String,
+	message: String,
+	help: String,
+) -> Bool:
+	match (
+		lex(
+			prefix
+				.concat(marked)
+				.concat(suffix),
+		).and_then(pure func(tokens): parse(tokens))
+	):
+		Err(error):
+			(
+				span_is(error.span, prefix.length(), prefix.length() + marked.length())
+				and error.message == message
+				and error.help == help
+				and error.note.is_none()
+			)
+		Ok(_):
+			False
+
+
+pure func test_empty_and_malformed_application_lists_reject_exactly() -> Bool:
+	help = (
+		"use an ASCII identifier starting with a letter or underscore; 'func', 'pure', "
+		+ "'match', 'var', and lone '_' are reserved"
+	)
+	(
+		parser_rejects(
+			"pure func f(value:Pair[",
+			"]",
+			")->Int:\n\t0",
+			"expected a type argument",
+			help,
+		)
+		and parser_rejects(
+			"pure func f(value:Pair[Int,",
+			"]",
+			")->Int:\n\t0",
+			"expected a type argument",
+			help,
+		)
+		and parser_rejects(
+			"pure func f(value:Pair[Int,",
+			",",
+			"String])->Int:\n\t0",
+			"expected a type argument",
+			help,
+		)
+		and parser_rejects(
+			"pure func f(value:Pair[Int ",
+			"String",
+			"])->Int:\n\t0",
+			"expected ']' after the type arguments",
+			"write comma-separated atomic type arguments, such as Result[Int, Int]",
+		)
+	)
+
+
+pure func test_nested_later_type_argument_stays_rejected() -> Bool:
+	parser_rejects(
+		"pure func f(value:Pair[Int,Box",
+		"[",
+		"Int]])->Int:\n\t0",
+		"nested type applications are not supported",
+		(
+			"use Int, String, a declared parameter, or an ordinary union as the written "
+			+ "argument"
+		),
+	)
+
+
+pure func test_third_concrete_payload_uses_the_third_argument() -> Bool:
+	source = "fixed union Triple[A,B,C]:\n\tEmpty\n\tThird(C)\npure func third()->Triple[String,String,Int]:\n\tThird(11)\npure func read(value:Triple[String,String,Int])->Int:\n\tmatch value:\n\t\tEmpty:0\n\t\tThird(item):item\nfunc main()->Int:\n\tthird().read()"
+
+	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
+		Ok(program):
+			facts = Concrete.specialized_contents(program)
+
+			match (facts.unions, facts.functions):
+				([declaration], [third, read, _]):
+					match (
+						declaration.variants,
+						third.signature.return_type,
+						read.signature.parameters,
+						read.body,
+					):
+						([Concrete.NoPayload, Concrete.IntPayload], Concrete.UnionType(owner), [Concrete.UnionType(parameter)], Concrete.ConcreteMatchBody(matched)):
+							match (read.bindings, matched.arms):
+								([_, capture], [_, arm]):
+									match (capture.value_type, arm.pattern):
+										(Concrete.IntType, Concrete.VariantCase(variant, Concrete.BindIntPayload(binding))):
+											(
+												Concrete.union_number(owner) == 0
+												and Concrete.union_number(parameter) == 0
+												and Concrete.union_number(matched.owner) == 0
+												and Concrete.union_number(
+													Concrete.variant_owner(variant),
+												) == 0
+												and Concrete.variant_number(variant) == 1
+												and Checked.binding_number(binding) == 1
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_conflict_renderer_spells_all_established_and_rigid_children() -> Bool:
+	source = TRI
+		.concat("pure func take[A,B](first:A,second:B)->Int:\n\t0\n")
+		.concat(MAIN)
+
+	match lex(source.concat("\n")).and_then(pure func(tokens): parse(tokens)):
+		Ok(parsed):
+			match Checked.check(parsed):
+				Ok(program):
+					match (
+						Checked.union_declaration_id(program, 0),
+						Checked.checked_functions(program).functions,
+					):
+						(Some(owner), [function, _]):
+							match function.signature.type_parameters:
+								[a, b]:
+									location: Span = {
+										start = 5,
+										end = 15
+									}
+									error: Checked.CheckError = {
+										span = location,
+										kind = Checked.GenericArgumentConflict({
+											parameter = a,
+											previous = {
+												value_type = Checked.IntType,
+												span = location
+											},
+											current = {
+												value_type = Checked.StringType,
+												span = location
+											},
+											mismatch = {
+												expected = Checked.AppliedUnionType(
+													owner,
+													[
+														Checked.IntType,
+														Checked.IntType,
+														Checked.ParameterType(b),
+													],
+												),
+												actual = {
+													value_type = Checked.AppliedUnionType(
+														owner,
+														[
+															Checked.IntType,
+															Checked.StringType,
+															Checked.IntType,
+														],
+													),
+													span = location
+												},
+												argument_position = 0,
+												expected_site = Checked.SourceAnnotation({
+													start = 20,
+													end = 30,
+												})
+											},
+										})
+									}
+									diagnostic = Checked.render_check_error(parsed, error)
+									(
+										span_is(diagnostic.span, 5, 15)
+										and diagnostic.note.is_none()
+										and diagnostic.message == "argument type does not match the parameter type"
+										and diagnostic.help == "use an expression of type Tri[Int, Int, B] here"
+									)
+								_:
+									False
+						_:
+							False
+				Err(_):
+					False
+		Err(_):
+			False
+
+
+pure func test_later_argument_prepares_a_nested_semantic_dependency() -> Bool:
+	source: String =
+		|fixed union Marker[A,B]:
+		|    Only
+		|pure func mark[T](value:T)->Marker[Int,T]:
+		|    Only
+		|func main()->Int:
+		|    saved = mark(mark(7))
+		|    0
+
+	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
+		Ok(program):
+			facts = Concrete.specialized_contents(program)
+
+			match (facts.unions, facts.functions):
+				([inner_union, outer_union], [main, inner, outer]):
+					match (main.bindings, inner.signature.parameters, outer.signature.parameters):
+						([saved], [Concrete.IntType], [Concrete.UnionType(input)]):
+							match (
+								saved.value_type,
+								inner.signature.return_type,
+								outer.signature.return_type,
+							):
+								(Concrete.UnionType(saved_owner), Concrete.UnionType(inner_owner), Concrete.UnionType(outer_owner)):
+									(
+										inner_union.variants == [Concrete.NoPayload]
+										and outer_union.variants == [Concrete.NoPayload]
+										and Concrete.union_number(inner_owner) == 0
+										and Concrete.union_number(outer_owner) == 1
+										and Concrete.union_number(saved_owner) == 1
+										and Concrete.union_number(input) == 0
+										and variant_return_matches(inner)
+										and variant_return_matches(outer)
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 multiple union parameters",
+	tests = [
+		(
+			"later argument prepares a nested semantic dependency",
+			test_later_argument_prepares_a_nested_semantic_dependency,
+		),
+		(
+			"two union parameters accept int constructor and pattern",
+			test_two_union_parameters_accept_int_constructor_and_pattern,
+		),
+		("one union parameter remains accepted", test_one_union_parameter_remains_accepted),
+		(
+			"union duplicates preserve owner positions and both spans",
+			test_union_duplicates_preserve_owner_positions_and_both_spans,
+		),
+		(
+			"too few and too many arguments have typed counts",
+			test_too_few_and_too_many_arguments_have_typed_counts,
+		),
+		("bare application retains required count", test_bare_application_retains_required_count),
+		(
+			"later unknown argument type has its own span",
+			test_later_unknown_argument_type_has_its_own_span,
+		),
+		(
+			"three payload positions keep union and function authorities",
+			test_three_payload_positions_keep_union_and_function_authorities,
+		),
+		(
+			"unused body cannot choose a rigid union parameter",
+			test_unused_body_cannot_choose_a_rigid_union_parameter,
+		),
+		(
+			"one runtime argument infers three function parameters",
+			test_one_runtime_argument_infers_three_function_parameters,
+		),
+		(
+			"conflict before unseen parameter retains a rigid snapshot",
+			test_conflict_before_unseen_parameter_retains_a_rigid_snapshot,
+		),
+		(
+			"repeated parameter in one argument conflicts before later inference",
+			test_repeated_parameter_in_one_argument_conflicts_before_later_inference,
+		),
+		(
+			"conflicting children follow annotation order not parameter order",
+			test_conflicting_children_follow_annotation_order_not_parameter_order,
+		),
+		(
+			"agreeing children preserve the first candidate occurrence",
+			test_agreeing_children_preserve_the_first_candidate_occurrence,
+		),
+		(
+			"missing inference precedes an ordinary mismatch",
+			test_missing_inference_precedes_an_ordinary_mismatch,
+		),
+		("conflict precedes an ordinary mismatch", test_conflict_precedes_an_ordinary_mismatch),
+		(
+			"later child error precedes structural conflict",
+			test_later_child_error_precedes_structural_conflict,
+		),
+		(
+			"expected result does not fill a later union argument",
+			test_expected_result_does_not_fill_a_later_union_argument,
+		),
+		(
+			"phantom keys include every argument and nominal owner",
+			test_phantom_keys_include_every_argument_and_nominal_owner,
+		),
+		(
+			"permuted forwarding preserves caller ids and concrete target",
+			test_permuted_forwarding_preserves_caller_ids_and_concrete_target,
+		),
+		(
+			"later string payload rejects even when only first variant is constructed",
+			test_later_string_payload_rejects_even_when_only_first_variant_is_constructed,
+		),
+		(
+			"arity renderer uses complete typed counts without rechecking",
+			test_arity_renderer_uses_complete_typed_counts_without_rechecking,
+		),
+		(
+			"declaration and application lists preserve all names and spans",
+			test_declaration_and_application_lists_preserve_all_names_and_spans,
+		),
+		(
+			"empty and malformed application lists reject exactly",
+			test_empty_and_malformed_application_lists_reject_exactly,
+		),
+		(
+			"nested later type argument stays rejected",
+			test_nested_later_type_argument_stays_rejected,
+		),
+		(
+			"third concrete payload uses the third argument",
+			test_third_concrete_payload_uses_the_third_argument,
+		),
+		(
+			"conflict renderer spells all established and rigid children",
+			test_conflict_renderer_spells_all_established_and_rigid_children,
+		),
+	]
+}
