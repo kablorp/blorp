@@ -16,23 +16,23 @@ import:
 		CallNotation(DirectCall, ReceiverCall),
 		Diagnostic,
 		DiagnosticNote(NoDiagnosticNote),
-		ExpressionBase(IntegerExpression, NameExpression, ZeroArgumentApplication),
+		ExpressionBase(IntegerExpression, NameExpression, DirectApplication),
 		FieldPattern(FieldName, FieldWildcard),
-		ParameterList(EmptyParameters, SingleParameter),
 		ParsedBinding,
 		ParsedBody(ParsedValueBody, ParsedMatchBody),
 		ParsedFunction,
 		ParsedMatch,
 		ParsedMatchArm,
+		ParsedParameter,
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
 		ParsedUnion,
 		PatternFields(NoPatternFields, OnePatternField),
 		PayloadSyntax(NoPayloadSyntax, OnePayloadSyntax),
 		Purity(Pure, Impure),
+		ReceiverApplication,
 		Span,
 		TypeParameterSyntax(NoTypeParameterSyntax, OneTypeParameterSyntax),
 		TypeSyntax(AtomicType, AppliedType),
-		UnaryApplication,
 		ValueExpression,
 		WrittenName,
 		type_span,
@@ -95,15 +95,10 @@ fixed record TypeUse {
 }
 
 
-fixed union ParameterShape:
-	NoParameter
-	OneParameter(TypeUse)
-
-
 fixed record FunctionSignature {
 	type_parameters: TypeParameters,
 	purity: Purity,
-	parameters: ParameterShape,
+	parameters: List[TypeUse],
 	return_type: TypeUse
 }
 
@@ -137,10 +132,12 @@ private pure func runtime_signature(operation: RuntimeOperation, span: Span) -> 
 	{
 		type_parameters = NoTypeParameter,
 		purity = contract.purity,
-		parameters = OneParameter({
-			value_type = primitive_ref(contract.parameter),
-			span = span,
-		}),
+		parameters = [
+			{
+				value_type = primitive_ref(contract.parameter),
+				span = span
+			},
+		],
 		return_type = {
 			value_type = primitive_ref(contract.return_type),
 			span = span
@@ -153,7 +150,7 @@ opaque type BindingId = Int
 
 
 fixed union BindingOrigin:
-	ParameterBinding
+	ParameterBinding(Int)
 	BodyLocal
 	MatchCapture
 
@@ -179,11 +176,11 @@ fixed union CheckedBase:
 	ReturnInteger(Int)
 	ReturnVariant(VariantId)
 	ReturnBinding(BindingId)
-	ReturnCall(CheckedCall)
+	ReturnCall(CheckedCall, List[CheckedValue])
 
 
 fixed union CheckedOperation:
-	InvokeFunction(CheckedCall)
+	InvokeFunction(CheckedCall, List[CheckedValue])
 	ConstructVariant(VariantId)
 
 
@@ -530,12 +527,25 @@ private pure func validate_unions(
 			Ok(checked)
 
 
-private pure func payload_type_error(span: Span, parameter: Option[LocalTypeParameter]) -> Diagnostic:
+private pure func payload_type_error(
+	span: Span,
+	parameter: Option[LocalTypeParameter],
+) -> Diagnostic:
 	match parameter:
 		None:
-			rejection(span, "only Int payloads are supported", "declare a variant with no fields or one Int field, written Variant(Int)")
+			rejection(
+				span,
+				"only Int payloads are supported",
+				"declare a variant with no fields or one Int field, written Variant(Int)",
+			)
 		Some(_):
-			rejection(span, "only Int or the union's type parameter may be payloads", "declare no field, one Int field, or one field using this union's declared type ".concat("parameter"))
+			rejection(
+				span,
+				"only Int or the union's type parameter may be payloads",
+				"declare no field, one Int field, or one field using this union's declared type ".concat(
+					"parameter",
+				),
+			)
 
 
 private pure func resolve_payloads(
@@ -699,8 +709,8 @@ private pure func resolve_atomic_type(
 							rejection(
 								name.span,
 								"unknown type",
-								(
-									"use Int, String, a declared type parameter, or a fixed union declared in this ".concat("file")
+								"use Int, String, a declared type parameter, or a fixed union declared in this ".concat(
+									"file",
 								),
 							),
 						)
@@ -753,32 +763,52 @@ private fixed record CheckedSignatures {
 
 
 private pure func resolve_parameters(
-	parameters: ParameterList,
+	parameters: List[ParsedParameter],
 	function_name: NameId,
 	unions: List[ParsedUnion],
 	special: SpecialNames,
 	type_parameter: Option[LocalTypeParameter],
-) -> Result[ParameterShape, Diagnostic]:
-	match parameters:
-		EmptyParameters:
-			Ok(NoParameter)
-		SingleParameter(parameter):
-			main_parameter ?= if same_name(function_name, special.main):
-				Err(
-					rejection(
-						parameter.name.span,
-						"main cannot have a parameter",
-						"declare main() -> Int: with no parameters",
-					),
-				)
-			else:
-				Ok(void)
+) -> Result[List[TypeUse], Diagnostic]:
+	var resolved: List[TypeUse] = []
+	var seen: List[NameId] = []
+	var failure: Option[Diagnostic] = None
 
-			parameter_type ?= resolve_type(unions, special, parameter.type_name, type_parameter)
-			Ok(OneParameter({
-				value_type = parameter_type,
-				span = type_span(parameter.type_name),
-			}))
+	for parameter in parameters:
+		result: Result[TypeRef, Diagnostic] = if same_name(function_name, special.main):
+			Err(
+				rejection(
+					parameter.name.span,
+					"main cannot have a parameter",
+					"declare main() -> Int: with no parameters",
+				),
+			)
+		else if seen.any(pure func(name: NameId) -> Bool: same_name(name, parameter.name.id)):
+			Err(
+				rejection(
+					parameter.name.span,
+					"duplicate parameter name",
+					"give each parameter a distinct name",
+				),
+			)
+		else:
+			resolve_type(unions, special, parameter.type_name, type_parameter)
+
+		match result:
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(value_type):
+				resolved = resolved.append({
+					value_type = value_type,
+					span = type_span(parameter.type_name),
+				})
+				seen = seen.append(parameter.name.id)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(resolved)
 
 
 private pure func resolve_signature(
@@ -940,23 +970,23 @@ private fixed record ResolvedCall {
 }
 
 
-private fixed record UnaryContract {
+private fixed record CallContract {
 	type_parameters: TypeParameters,
 	operation: CheckedOperation,
-	parameter_type: TypeRef,
+	parameter_types: List[TypeUse],
 	return_type: TypeRef,
 	span: Span
 }
 
 
-private fixed union PendingApplication:
-	FunctionApplication(UnaryContract)
+private fixed union ResolvedApplication:
+	FunctionApplication(CallContract)
 	ConstructorApplication(WrittenName)
 
 
 private pure func non_callable(binding: LocalBinding, span: Span) -> Diagnostic:
 	match binding.definition.origin:
-		ParameterBinding:
+		ParameterBinding(_):
 			message = if same_type(binding.definition.value_type, IntType):
 				"Int parameters cannot be called"
 			else:
@@ -1015,88 +1045,76 @@ private pure func lookup_target(
 			runtime_operation(prelude, name).map(pure func(operation): RuntimeFunction(operation))
 
 
-private pure func unary_function(
+private pure func function_contract(
 	purity: Purity,
-	call: UnaryApplication,
+	name: WrittenName,
+	notation: CallNotation,
+	arity: Int,
 	resolved: ResolvedCall,
-	names: NameTable,
-) -> Result[UnaryContract, Diagnostic]:
-	match resolved.signature.parameters:
-		OneParameter(parameter_type):
-			pure_call ?= validate_call(purity, resolved.signature.purity, call.callee.span)
-			Ok({
-				type_parameters = resolved.signature.type_parameters,
-				operation = InvokeFunction(resolved.call),
-				parameter_type = parameter_type.value_type,
-				return_type = resolved.signature.return_type.value_type,
-				span = call.callee.span,
-			})
-		NoParameter:
-			error: Diagnostic = match call.notation:
-				DirectCall:
+	context: ResolutionContext,
+) -> Result[CallContract, Diagnostic]:
+	count = resolved.signature.parameters.length()
+
+	arity_diagnostic: Option[Diagnostic] = if IntOps.equals(count, arity):
+		None
+	else if IntOps.equals(count, 0):
+		match notation:
+			DirectCall:
+				Some(
 					rejection(
-						call.callee.span,
+						name.span,
 						"function takes no arguments",
 						"remove the argument and call the function with ()",
-					)
-				ReceiverCall:
-					match name_spelling(names, call.callee.id):
-						None:
-							internal_error(call.callee.span, "invalid parsed name identity")
-						Some(spelling):
+					),
+				)
+			ReceiverCall:
+				match name_spelling(context.names, name.id):
+					Some(spelling):
+						Some(
 							rejection(
-								call.callee.span,
+								name.span,
 								"function takes no arguments",
 								Text
 									.concat("call ", spelling)
 									.concat("() directly, or choose a function with one parameter"),
-							)
-
-			Err(error)
-
-
-private pure func classify_application(
-	purity: Purity,
-	scope: List[LocalBinding],
-	call: UnaryApplication,
-	context: ResolutionContext,
-) -> Result[PendingApplication, Diagnostic]:
-	local = match call.notation:
-		DirectCall:
-			lookup_binding(scope, call.callee.id)
-		ReceiverCall:
-			None
-
-	match local:
-		Some(binding):
-			Err(non_callable(binding, call.callee.span))
-		None:
-			match lookup_target(context.functions, context.prelude, call.callee.id):
-				Some(target):
-					resolved ?= resolve_function_target(call.callee, target, context.signatures)
-					contract ?= unary_function(purity, call, resolved, context.names)
-					Ok(FunctionApplication(contract))
-				None:
-					if contains_variant(context.unions, call.callee.id):
-						match call.notation:
-							DirectCall:
-								Ok(ConstructorApplication(call.callee))
-							ReceiverCall:
-								Err(
-									rejection(
-										call.callee.span,
-										"constructors do not support UFCS in this increment",
-										"write the constructor directly, such as Number(value)",
-									),
-								)
-					else:
-						Err(
-							rejection(
-								call.callee.span,
-								"unknown function",
-								"declare the called function in this file or the explicit prelude",
 							),
 						)
+					None:
+						Some(internal_error(name.span, "invalid call name identity"))
+	else if IntOps.equals(count, 1):
+		Some(
+			rejection(
+				name.span,
+				"function requires one argument",
+				"pass one expression of the declared parameter type",
+			),
+		)
+	else:
+		Some(
+			rejection(
+				name.span,
+				"argument count does not match the function parameters",
+				Text.concat(
+					"pass one expression for each declared parameter; UFCS supplies the receiver ",
+					"first",
+				),
+			),
+		)
+
+	arity_check ?= match arity_diagnostic:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	pure_call ?= validate_call(purity, resolved.signature.purity, name.span)
+	Ok({
+		type_parameters = resolved.signature.type_parameters,
+		operation = InvokeFunction(resolved.call, []),
+		parameter_types = resolved.signature.parameters,
+		return_type = resolved.signature.return_type.value_type,
+		span = name.span,
+	})
 
 
 private fixed record VariantContract {
@@ -1314,7 +1332,7 @@ private pure func unary_constructor(
 	name: WrittenName,
 	expected_type: Option[TypeRef],
 	context: ResolutionContext,
-) -> Result[UnaryContract, Diagnostic]:
+) -> Result[CallContract, Diagnostic]:
 	contract ?= contextual_constructor(name, expected_type, context)
 
 	match contract.payload:
@@ -1330,7 +1348,7 @@ private pure func unary_constructor(
 			Ok({
 				type_parameters = NoTypeParameter,
 				operation = ConstructVariant(contract.variant),
-				parameter_type = payload.value_type,
+				parameter_types = [payload],
 				return_type = contract.result_type,
 				span = name.span,
 			})
@@ -1410,51 +1428,8 @@ private pure func resolve_base(
 								"use this function's parameter name, a declared variant, or a call",
 							),
 						)
-		ZeroArgumentApplication(name):
-			match lookup_binding(scope, name.id):
-				Some(binding):
-					Err(non_callable(binding, name.span))
-				None:
-					match lookup_target(context.functions, context.prelude, name.id):
-						None:
-							if contains_variant(context.unions, name.id):
-								constructor_base(name, expected_type, True, context)
-							else:
-								Err(
-									rejection(
-										name.span,
-										"unknown function",
-										"declare the called function in this file or the explicit prelude",
-									),
-								)
-						Some(target):
-							resolved ?= resolve_function_target(name, target, context.signatures)
-
-							match resolved.signature.parameters:
-								OneParameter(_):
-									Err(
-										rejection(
-											name.span,
-											"function requires one argument",
-											"pass one expression of the declared parameter type",
-										),
-									)
-								NoParameter:
-									inferred ?= match resolved.signature.type_parameters:
-										NoTypeParameter:
-											Ok(void)
-										OneTypeParameter(_):
-											Err(uninferable(name.span))
-
-									pure_call ?= validate_call(
-										purity,
-										resolved.signature.purity,
-										name.span,
-									)
-									Ok({
-										base = ReturnCall(resolved.call),
-										value_type = resolved.signature.return_type.value_type,
-									})
+		DirectApplication(name, _):
+			Err(internal_error(name.span, "call reached simple base checking"))
 
 
 private fixed record ResolvedValue {
@@ -1463,108 +1438,275 @@ private fixed record ResolvedValue {
 }
 
 
-private pure func resolve_value(
+private fixed record ResolvedArguments {
+	values: List[CheckedValue],
+	contract: CallContract
+}
+
+
+private pure func resolve_arguments(
+	purity: Purity,
+	scope: List[LocalBinding],
+	arguments: List[ValueExpression],
+	receiver: Option[ResolvedValue],
+	contract: CallContract,
+	context: ResolutionContext,
+) -> Result[ResolvedArguments, Diagnostic]:
+	var types: List[TypeUse] = []
+	var values: List[CheckedValue] = []
+
+	match receiver:
+		Some(value):
+			types = [
+				{
+					value_type = value.value_type,
+					span = contract.span
+				},
+			]
+		None:
+			void
+
+	var failure: Option[Diagnostic] = None
+
+	for argument in arguments:
+		expectation = match contract.parameter_types.get(types.length()):
+			Some(value_type):
+				if contains_parameter(value_type.value_type):
+					None
+				else:
+					Some(value_type.value_type)
+			None:
+				None
+
+		match resolve_expression(purity, scope, argument, expectation, context):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(value):
+				types = types.append({
+					value_type = value.value_type,
+					span = argument.span,
+				})
+				values = values.append(value.value)
+
+	ready ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	instantiated ?= instantiate_contract(contract, types, context)
+	var index: Int = 0
+
+	for actual in types:
+		match instantiated.parameter_types.get(index):
+			None:
+				failure = Some(internal_error(contract.span, "missing call parameter"))
+				break
+			Some(expected):
+				span = if IntOps.equals(types.length(), 1):
+					contract.span
+				else:
+					actual.span
+
+				if not same_type(actual.value_type, expected.value_type):
+					failure = Some(
+						type_rejection(
+							span,
+							"argument type does not match the parameter type",
+							expected.value_type,
+							context,
+						),
+					)
+					break
+
+		index = IntOps.add(index, 1)
+
+	ready ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	Ok({
+		values = values,
+		contract = instantiated,
+	})
+
+
+private pure func resolve_expression(
 	purity: Purity,
 	scope: List[LocalBinding],
 	body: ValueExpression,
 	expected_type: Option[TypeRef],
 	context: ResolutionContext,
 ) -> Result[ResolvedValue, Diagnostic]:
-	-- Preserve the established function-contract diagnostic order before the base.
-	var pending: List[PendingApplication] = []
+	-- Resolve complete outer contracts once before checking their children.
+	var contracts: List[CallContract] = []
 	var failure: Option[Diagnostic] = None
 
-	for call in body.applications:
-		match classify_application(purity, scope, call, context):
+	for application in body.applications:
+		match classify_call(
+			purity,
+			application.callee,
+			ReceiverCall,
+			IntOps.add(application.arguments.length(), 1),
+			scope,
+			context,
+		):
 			Err(error):
 				failure = Some(error)
 				break
-			Ok(application):
-				pending = pending.append(application)
+			Ok(FunctionApplication(contract)):
+				contracts = contracts.append(contract)
+			Ok(ConstructorApplication(name)):
+				failure = Some(internal_error(name.span, "constructor receiver passed resolution"))
+				break
 
-	var expectation = expected_type
-	var outside_in: List[UnaryContract] = []
-
-	if not failure.is_some():
-		for application in pending.reverse():
-			match complete_application(application, expectation, context):
-				Err(error):
-					failure = Some(error)
-					break
-				Ok(contract):
-					outside_in = outside_in.append(contract)
-
-					expectation = match contract.type_parameters:
-						NoTypeParameter:
-							Some(contract.parameter_type)
-						OneTypeParameter(_):
-							None
-
-	validated ?= match failure:
+	ready ?= match failure:
 		Some(error):
 			Err(error)
 		None:
-			Ok(outside_in.reverse())
+			Ok(void)
 
-	base ?= resolve_base(purity, scope, body.base, expectation, context)
-	var current_type = base.value_type
-	var operations: List[CheckedStep] = []
+	base_expectation = match contracts.get(0):
+		Some(contract):
+			match contract.type_parameters:
+				NoTypeParameter:
+					contract.parameter_types
+						.get(0)
+						.map(pure func(value: TypeUse): value.value_type)
+				OneTypeParameter(_):
+					None
+		None:
+			expected_type
 
-	for pending_contract in validated:
-		match instantiate_contract(pending_contract, current_type):
-			Err(error):
-				failure = Some(error)
-				break
-			Ok(contract):
-				if not same_type(current_type, contract.parameter_type):
-					failure = Some(
-						type_rejection(
-							contract.span,
-							"argument type does not match the parameter type",
-							contract.parameter_type,
+	base_result: Result[ResolvedValue, Diagnostic] = match body.base:
+		DirectApplication(name, arguments):
+			classified ?= classify_call(
+				purity,
+				name,
+				DirectCall,
+				arguments.length(),
+				scope,
+				context,
+			)
+
+			match classified:
+				ConstructorApplication(name):
+					if IntOps.equals(arguments.length(), 0):
+						constructor_base(
+							name,
+							base_expectation,
+							True,
 							context,
-						),
-					)
-					break
+						).map(
+							pure func(base: ResolvedBase) -> ResolvedValue: {
+								value = {
+									base = base.base,
+									base_type = base.value_type,
+									base_span = body.base_span,
+									operations = []
+								},
+								value_type = base.value_type
+							},
+						)
+					else:
+						contract ?= unary_constructor(name, base_expectation, context)
 
-				operations = operations.append({
-					operation = contract.operation,
-					value_type = contract.return_type,
-					span = contract.span,
-				})
-				current_type = contract.return_type
+						arity ?= if IntOps.equals(arguments.length(), 1):
+							Ok(void)
+						else:
+							Err(
+								rejection(
+									name.span,
+									"constructor requires one payload argument",
+									"pass exactly one expression of the declared payload type",
+								),
+							)
 
-	finished ?= match failure:
+						resolved ?= resolve_arguments(
+							purity,
+							scope,
+							arguments,
+							None,
+							contract,
+							context,
+						)
+						value ?= resolved.values
+							.get(0)
+							.to_result(internal_error(name.span, "missing constructor argument"))
+						Ok({
+							value = { value | operations = value.operations.append({
+									operation = contract.operation,
+									value_type = contract.return_type,
+									span = name.span,
+								}) },
+							value_type = contract.return_type,
+						})
+				FunctionApplication(contract):
+					resolved ?= resolve_arguments(purity, scope, arguments, None, contract, context)
+
+					call ?= match resolved.contract.operation:
+						InvokeFunction(call, _):
+							Ok(call)
+						_:
+							Err(internal_error(name.span, "invalid function contract"))
+
+					Ok({
+						value = {
+							base = ReturnCall(call, resolved.values),
+							base_type = resolved.contract.return_type,
+							base_span = body.base_span,
+							operations = []
+						},
+						value_type = resolved.contract.return_type,
+					})
+		_:
+			base ?= resolve_base(purity, scope, body.base, base_expectation, context)
+			Ok({
+				value = {
+					base = base.base,
+					base_type = base.value_type,
+					base_span = body.base_span,
+					operations = []
+				},
+				value_type = base.value_type,
+			})
+
+	base ?= base_result
+	var current = base
+	var index: Int = 0
+
+	for application in body.applications:
+		match contracts.get(index):
+			None:
+				failure = Some(internal_error(application.callee.span, "missing receiver contract"))
+				break
+			Some(contract):
+				match resolve_receiver(
+					purity,
+					scope,
+					current,
+					application.arguments,
+					contract,
+					context,
+				):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(value):
+						current = value
+
+		index = IntOps.add(index, 1)
+
+	ready ?= match failure:
 		Some(error):
 			Err(error)
 		None:
 			Ok(void)
 
-	accepted ?= match expected_type:
-		None:
-			Ok(void)
-		Some(type_ref):
-			if same_type(current_type, type_ref):
-				Ok(void)
-			else:
-				Err(
-					type_rejection(
-						body.span,
-						"expression does not match the expected type",
-						type_ref,
-						context,
-					),
-				)
-
-	Ok({
-		value = {
-			base = base.base,
-			base_type = base.value_type,
-			base_span = body.base_span,
-			operations = operations
-		},
-		value_type = current_type,
-	})
+	Ok(current)
 
 
 private pure func uninferable(span: Span) -> Diagnostic:
@@ -1623,28 +1765,65 @@ private pure func infer_type_argument(
 
 
 private pure func instantiate_contract(
-	contract: UnaryContract,
-	actual: TypeRef,
-) -> Result[UnaryContract, Diagnostic]:
+	contract: CallContract,
+	actual: List[TypeUse],
+	context: ResolutionContext,
+) -> Result[CallContract, Diagnostic]:
 	match contract.type_parameters:
 		NoTypeParameter:
 			Ok(contract)
 		OneTypeParameter(parameter):
-			argument ?= infer_type_argument(
-				contract.parameter_type,
-				actual,
-				parameter,
-			).to_result(uninferable(contract.span))
+			var inferred: Option[TypeRef] = None
+			var index: Int = 0
+			var failure: Option[Diagnostic] = None
+
+			for value in actual:
+				match contract.parameter_types.get(index):
+					None:
+						failure = Some(internal_error(contract.span, "missing generic parameter"))
+						break
+					Some(written):
+						match infer_type_argument(written.value_type, value.value_type, parameter):
+							None:
+								void
+							Some(argument):
+								match inferred:
+									None:
+										inferred = Some(argument)
+									Some(previous):
+										if not same_type(argument, previous):
+											failure = Some(
+												type_rejection(
+													value.span,
+													"argument type does not match the parameter type",
+													substitute_type(
+														written.value_type,
+														parameter,
+														previous,
+													),
+													context,
+												),
+											)
+											break
+
+				index = IntOps.add(index, 1)
+
+			ready ?= match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(void)
+
+			argument ?= inferred.to_result(uninferable(contract.span))
 
 			operation ?= match contract.operation:
-				InvokeFunction(call):
+				InvokeFunction(call, arguments):
 					match call.target:
 						UserFunction(id, _):
 							Ok(
 								InvokeFunction(
-									{ call |
-										target = UserFunction(id, InstantiateWith(argument))
-									},
+									{ call | target = UserFunction(id, InstantiateWith(argument)) },
+									arguments,
 								),
 							)
 						RuntimeFunction(_):
@@ -1655,21 +1834,15 @@ private pure func instantiate_contract(
 			Ok({ contract |
 					type_parameters = NoTypeParameter,
 					operation = operation,
-					parameter_type = substitute_type(contract.parameter_type, parameter, argument),
+					parameter_types = contract.parameter_types.map(
+						pure func(
+							written: TypeUse,
+						) -> TypeUse: { written |
+							value_type = substitute_type(written.value_type, parameter, argument)
+						},
+					),
 					return_type = substitute_type(contract.return_type, parameter, argument)
 				})
-
-
-private pure func complete_application(
-	application: PendingApplication,
-	expected_type: Option[TypeRef],
-	context: ResolutionContext,
-) -> Result[UnaryContract, Diagnostic]:
-	match application:
-		FunctionApplication(contract):
-			Ok(contract)
-		ConstructorApplication(name):
-			unary_constructor(name, expected_type, context)
 
 
 private fixed record ResolvedPattern {
@@ -2053,26 +2226,34 @@ private pure func function_scope(
 	function: ParsedFunction,
 	signature: FunctionSignature,
 ) -> Result[List[LocalBinding], Diagnostic]:
-	match function.parameters:
-		EmptyParameters:
-			Ok([])
-		SingleParameter(parameter):
-			match signature.parameters:
-				OneParameter(type_ref):
-					Ok([
-						{
-							name = parameter.name.id,
-							id = into_opaque BindingId(0),
-							definition = {
-								origin = ParameterBinding,
-								mutability = Immutable,
-								value_type = type_ref.value_type,
-								span = parameter.name.span
-							}
-						},
-					])
-				NoParameter:
-					Err(internal_error(parameter.name.span, "invalid resolved parameter"))
+	var scope: List[LocalBinding] = []
+	var index: Int = 0
+	var failure: Option[Diagnostic] = None
+
+	for parameter in function.parameters:
+		match signature.parameters.get(index):
+			None:
+				failure = Some(internal_error(parameter.name.span, "invalid resolved parameter"))
+				break
+			Some(value_type):
+				scope = scope.append({
+					name = parameter.name.id,
+					id = into_opaque BindingId(index),
+					definition = {
+						origin = ParameterBinding(index),
+						mutability = Immutable,
+						value_type = value_type.value_type,
+						span = parameter.name.span
+					},
+				})
+
+		index = IntOps.add(index, 1)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(scope)
 
 
 private fixed record ResolvedBody {
@@ -2357,18 +2538,32 @@ private pure func unsettled_value(body: CheckedValue, settled: List[FunctionId])
 			None
 		ReturnBinding(_):
 			None
-		ReturnCall(call):
+		ReturnCall(call, arguments):
 			if target_is_settled(call.target, settled):
 				None
 			else:
 				Some(call.span)
+
+	children: List[CheckedValue] = match body.base:
+		ReturnCall(_, arguments):
+			arguments
+		_:
+			[]
+
+	for child in children:
+		if not found.is_some():
+			found = unsettled_value(child, settled)
 
 	for operation in body.operations:
 		if found.is_some():
 			break
 
 		match operation.operation:
-			InvokeFunction(call):
+			InvokeFunction(call, arguments):
+				for child in arguments:
+					if not found.is_some():
+						found = unsettled_value(child, settled)
+
 				if not target_is_settled(call.target, settled):
 					found = Some(call.span)
 			ConstructVariant(_):
@@ -2533,3 +2728,115 @@ pure func check(program: ParsedProgram) -> Result[CheckedProgram, Diagnostic]:
 				functions = functions,
 				entrypoint = signatures.entrypoint
 			}))
+
+
+private pure func resolve_receiver(
+	purity: Purity,
+	scope: List[LocalBinding],
+	current: ResolvedValue,
+	arguments: List[ValueExpression],
+	contract: CallContract,
+	context: ResolutionContext,
+) -> Result[ResolvedValue, Diagnostic]:
+	resolved ?= resolve_arguments(purity, scope, arguments, Some(current), contract, context)
+
+	operation ?= match resolved.contract.operation:
+		InvokeFunction(call, _):
+			Ok(InvokeFunction(call, resolved.values))
+		_:
+			Err(internal_error(contract.span, "invalid receiver contract"))
+
+	Ok({
+		value = { current.value | operations = current.value.operations.append({
+				operation = operation,
+				value_type = resolved.contract.return_type,
+				span = contract.span,
+			}) },
+		value_type = resolved.contract.return_type,
+	})
+
+
+private pure func classify_call(
+	purity: Purity,
+	name: WrittenName,
+	notation: CallNotation,
+	arity: Int,
+	scope: List[LocalBinding],
+	context: ResolutionContext,
+) -> Result[ResolvedApplication, Diagnostic]:
+	local = match notation:
+		DirectCall:
+			lookup_binding(scope, name.id)
+		ReceiverCall:
+			None
+
+	callable ?= match local:
+		Some(binding):
+			Err(non_callable(binding, name.span))
+		None:
+			Ok(void)
+
+	match lookup_target(context.functions, context.prelude, name.id):
+		Some(target):
+			resolved ?= resolve_function_target(name, target, context.signatures)
+			contract ?= function_contract(purity, name, notation, arity, resolved, context)
+			Ok(FunctionApplication(contract))
+		None:
+			if contains_variant(context.unions, name.id):
+				match notation:
+					DirectCall:
+						Ok(ConstructorApplication(name))
+					ReceiverCall:
+						Err(
+							rejection(
+								name.span,
+								"constructors do not support UFCS in this increment",
+								"write the constructor directly, such as Number(value)",
+							),
+						)
+			else:
+				Err(
+					rejection(
+						name.span,
+						"unknown function",
+						"declare the called function in this file or the explicit prelude",
+					),
+				)
+
+
+private pure func contains_parameter(value_type: TypeRef) -> Bool:
+	match value_type:
+		ParameterType(_):
+			True
+		AppliedUnionType(_, argument):
+			contains_parameter(argument)
+		_:
+			False
+
+
+private pure func resolve_value(
+	purity: Purity,
+	scope: List[LocalBinding],
+	body: ValueExpression,
+	expected_type: Option[TypeRef],
+	context: ResolutionContext,
+) -> Result[ResolvedValue, Diagnostic]:
+	value ?= resolve_expression(purity, scope, body, expected_type, context)
+
+	accepted ?= match expected_type:
+		None:
+			Ok(void)
+		Some(expected):
+			if same_type(value.value_type, expected):
+				Ok(void)
+			else:
+				Err(
+					type_rejection(
+						body.span,
+						"expression does not match the expected type",
+						expected,
+						context,
+					),
+				)
+
+	Ok(value)

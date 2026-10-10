@@ -59,16 +59,15 @@ func main() -> Int:
 	identity(one())
 ```
 
-It exits 1 with empty stdout and stderr. Helpers may take zero or one `Int`
-parameter; `main` takes none. A call may pass one complete expression, including
+It exits 1 with empty stdout and stderr. Helpers may take any number of typed runtime parameters; `main` takes none. A call may pass one complete expression, including
 another call. The companion [`nested_order.brp`](test/e2e/fixtures/nested_order.brp)
 returns `zero(one(1))`, with both helpers ignoring their parameter. Its exit status
 0 and exact generated C distinguish the order of the two calls.
 
 The UFCS example, [`ufcs_calls.brp`](test/e2e/fixtures/ufcs_calls.brp), calls the
 same helpers with `one().identity()`. This is equivalent to `identity(one())`
-and exits 1. A receiver supplies the function's single argument; the method's
-parentheses stay empty in this increment. The companion
+and exits 1. A receiver supplies the first argument; explicit arguments in the method's
+parentheses follow it. The companion
 [`ufcs_chain.brp`](test/e2e/fixtures/ufcs_chain.brp) demonstrates chaining:
 
 ```blorp
@@ -290,7 +289,7 @@ ceiling is exceeded. Ceilings are adjusted deliberately with retained evidence.
 | ufcs_calls | 1,500 | 40,000,000 |
 | ufcs_chain | 1,600 | 40,000,000 |
 | return_42 | 800 | 40,000,000 |
-| union_values | 3,600 | 40,000,000 |
+| union_values | 4,000 | 40,000,000 |
 | match_value | 5,000 | 100,000,000 |
 | bindings | 10,000 | 100,000,000 |
 | mortal Strings | 20,000 | 200,000,000 |
@@ -299,6 +298,13 @@ Small companion fixtures pass explicit limits of 10,000 allocations and
 100,000,000 instructions. The two structural stress fixtures use explicit
 limits of 100,000 allocations and 500,000,000 instructions. They reuse the
 same single-compilation measurement path as the primary examples.
+
+The multiple-argument increment deliberately raises only `union_values` from
+3,600 to 4,000 allocations. Its frozen baseline uses 3,574 allocations and the
+candidate uses 3,641 (+1.87%); matched instruction medians increase 0.50%.
+The 40-million instruction limit is unchanged. Removing redundant parameter
+type copies and temporary traversal lists reduced the initial overhead; further
+special cases to recover the remaining 41 allocations are not justified.
 
 Historical matched `-O2` measurements of ordered-value lowering increased
 allocations on the ten frozen prior inputs
@@ -403,17 +409,38 @@ A phantom `Marker[String]` with no parameter payload remains valid, as does
 nominal instance identities.
 
 
+The [multiple-argument example](test/e2e/fixtures/generic_arguments.brp) adds
+ordered runtime parameters while retaining one type parameter:
+
+```blorp
+pure func keep_first[T](first: T, second: T) -> T:
+    first
+func main() -> Int:
+    keep_first(7, 9)
+```
+
+It exits 7. `value.keep_first(other)` supplies `value` first and `other`
+second. Arguments evaluate left to right exactly once; lowering saves every
+computed argument in an immutable local before emitting a C call. A helper
+may return either borrowed String parameter as an owned result. The
+[first String fixture](test/e2e/fixtures/generic_arguments_first_string.brp)
+returns length 1 after replacement of the caller's old value; the
+[second String fixture](test/e2e/fixtures/generic_arguments_second_string.brp)
+returns length 3. Passing the same managed value twice preserves both borrows
+through the call and drops its owner once after the result owner exists.
+
+
 ## Grammar for this increment
 
 This specification defines only the examples' language: functions with explicit
-return types, zero or one explicitly typed parameter, an optional single type
+return types, an ordered list of explicitly typed parameters, an optional single type
 parameter on functions and fixed unions. Union variants have zero fields or
 one field annotated `Int` or the union's own parameter; concrete fields
 specialize to Int. A function
 body has zero or more binding lines followed by a single expression or a tail
 match with inline arm results or binding blocks. Expressions
 start with a signed Int64 literal, a binding or variant name, or an application
-with zero or one argument. UFCS suffixes may follow that expression.
+with an ordered list of arguments. UFCS suffixes may follow that expression.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
 No other declarations, expressions, literals, statements, or comments are supported.
 
@@ -496,7 +523,7 @@ Lexical and layout rules:
 Semantic rules:
 
 - Exactly one function must be named `main`, and it takes no parameters. A helper
-  takes zero or one explicitly typed parameter. Helper parameter and return types
+  takes zero or more explicitly typed parameters with distinct names. Helper parameter and return types
   are `Int`, the signed 64-bit integer type, `String`, or a fixed union declared in this
   file, including an application of a generic union, or the function's declared
   rigid parameter. `main` must return `Int`.
@@ -513,7 +540,7 @@ Semantic rules:
 - A bare expression name first resolves to the nearest local binding: an
   arm capture, a body-local binding, or the containing function's parameter. Otherwise
   it resolves to a variant in the expected union: the innermost call's parameter
-  type, or the containing function's return type when there is no unary call.
+  type, or the containing function's return type when there is no enclosing call.
   Variants in different unions may share a spelling; expected type chooses the
   owner. `First()` is invalid because a payload-free constructor is a value;
   `Number(expression)` supplies the one `Int` field of a payload constructor.
@@ -535,13 +562,16 @@ Semantic rules:
   in an arm a constant scrutinee cannot select. Arm locals stay within their
   arm. Reassignment of an enclosing mutable binding affects only the selected
   arm's computation; matches remain in the function tail.
-- `receiver.function()` resolves its target from the file's declared functions,
+- `receiver.function(arguments)` resolves its target from the file's declared functions,
   independently of parameter shadowing. The receiver still uses the caller's scope.
   A parameter named `identity` can therefore be read and passed to the declared
   function with `identity.identity()`; the direct call `identity(identity)` tries
-  to call the parameter and is rejected. UFCS targets require one parameter.
+  to call the parameter and is rejected. UFCS supplies the receiver first, followed
+  by the explicitly written arguments. Every argument is evaluated left to right
+  exactly once before the call.
 - Each argument and final return expression must match its receiving type.
-  Resolved call-edge mismatches highlight the callee name at the call site;
+  Unary call-edge mismatches highlight the callee name; multiple-argument
+  mismatches highlight the disagreeing argument occurrence;
   constructor lookup errors highlight the variant name. Return mismatches highlight
   the complete expression, excluding indentation and trailing spaces.
 - A match scrutinee must synthesize a declared union type from a binding or
@@ -573,7 +603,10 @@ Semantic rules:
   concrete Int/String runtime operation. Parameters cannot share a name with
   `Int`, `String`, or any declared union; separate declarations may reuse `T`.
   `main` and runtime prelude functions cannot declare type parameters.
-  Direct and UFCS calls infer the parameter from their synthesized sole argument.
+  Direct and UFCS calls infer the sole type parameter consistently from every
+  synthesized argument type. A later argument can determine it when an earlier
+  parameter is concrete. Repeated occurrences, including structural `Box[T]`
+  occurrences, must agree.
   Generic forwarding preserves the caller's rigid parameter until specialization.
   Expected return types never infer a generic substitution: `identity(First)`
   and `identity(Number(7))` reject even in a union-returning body. Pass an
@@ -602,7 +635,7 @@ Semantic rules:
   transfers its owner. The function's parameters and binding/scrutinee prefix
   must remain unmanaged. String literals, String union payloads, managed outer
   dependencies, COW and joins are deferred.
-- Multiple parameters or arguments, explicit UFCS arguments, parenthesized expressions,
+- Parenthesized expressions,
   multiple or non-Int payload fields, nested matches,
   guards, qualified/nested/literal patterns, constructor UFCS, multiline chains,
   non-tail matches, multiple type parameters, and function
@@ -631,9 +664,9 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    annotations, written names, ordered binding syntax, expression syntax, and structured match bodies.
    Match patterns preserve names and field syntax without deciding whether a
    bare name denotes a constructor or binding. Each expression has a literal,
-   name, or zero-argument application base, followed by unary application
-   wrappers in evaluation order. Each wrapper
-   retains explicit direct or receiver notation because their target lookup differs.
+   name, or direct application base with ordered recursive arguments, followed by
+   receiver applications with ordered explicit arguments. Direct and receiver
+   syntax stay distinct because their target lookup differs.
    Every expression records its consumed token span directly, without reconstructing
    locations from names or literal values.
    A local interning builder assigns one opaque `NameId` per spelling. Parsing
@@ -643,15 +676,15 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
 3. Checking resolves nominal union and owned variant identities, then publishes
    one authoritative signature per function. A private resolution context holds
    the aligned declarations and signatures. Target resolution returns a complete
-   call and signature after one lookup. The zero-argument and unary boundaries
-   prove arity once, check purity afterward, and publish complete transient contracts.
-   Unary contracts retain parameter and return types while the body validates every
-   edge; they are erased to checked calls only after validation. Published function
+   call and signature after one lookup. Call boundaries prove complete arity once,
+   check purity afterward, and publish transient contracts with every ordered
+   parameter type and the result type. Checking infers one consistent substitution
+   across all argument positions before validating every edge; they are erased to checked calls only after validation. Published function
    signatures remain the sole signature authority. Constructor operations are
    distinct from function calls and use the owning variant's declared field shape.
    Local reads carry a function-owned `BindingId`, distinguishing the parameter,
    body locals and each arm's binding. Binding definitions own type, mutability,
-   origin and declaration span; typed expression occurrences retain their own
+   origin (including each parameter's explicit signature position) and declaration span; typed expression occurrences retain their own
    spans. Match checking resolves patterns and result types,
    and establishes usefulness and exhaustiveness before publishing checked arms.
    Each arm publishes its ordered assignments and result. The current block's
@@ -688,7 +721,7 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    or being a managed String leaf. It publishes ordered definitions, owner
    acquisitions, drops and return transfers. `OwnerId` names one obligation;
    `ValueId` still names the computed value. Borrowed operands name the owner
-   they depend on, or the function's borrowed parameter. Last-use cleanup keeps
+   they depend on, or the exact borrowed parameter value identity. Last-use cleanup keeps
    an argument alive until a call has established its result owner. Tail-match
    arms publish the same ownership operations and typed return transfers as a
    straight-line block. Value and owner identities remain function-wide; sibling
@@ -734,7 +767,7 @@ are not comparable; downstream readers never fall back to the checked table.
 from the source binding that currently refers to it. Emission uses resolved
 identities and typed operations. Integer and
 union programs with optional Int fields need no target heap allocation or RC operations.
-The flat expression chain remains the single-line, zero/one-argument leaf.
+Recursive direct arguments and postfix receiver calls remain single-line values.
 A structured body sum distinguishes that leaf from a match with ordered arms.
 Managed control-flow joins and general pass infrastructure remain future work.
 
@@ -804,7 +837,7 @@ Builders remain local; published results remain immutable; each semantic fact
 has one authority. Function identity is declaration-list position; checked calls
 contain resolved identities and diagnostic spans, and the checked program owns the
 entrypoint. Local topological elimination checks all base and wrapper call edges,
-including binding initializers;
+including every recursive argument and binding initializer;
 no persistent graph registry is needed. Each checked function retains its validated
 signature beside its resolved body. Emission reads only validated
 facts and does not recheck purity or name scope. C function and parameter names are

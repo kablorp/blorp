@@ -35,16 +35,11 @@ pure func value_number(id: ValueId) -> Int:
 	from_opaque ValueId(id)
 
 
-fixed union CallArguments:
-	NoArguments
-	OneArgument(ValueId)
-
-
 fixed union ValueOperation:
-	ParameterValue
+	ParameterValue(Int)
 	IntegerValue(Int)
 	VariantValue(VariantInstanceId)
-	CallValue(ConcreteCall, CallArguments)
+	CallValue(ConcreteCall, List[ValueId])
 	ConstructValue(VariantInstanceId, ValueId)
 	PayloadValue(ValueId)
 
@@ -162,6 +157,40 @@ private pure func read_binding(
 	entry.to_result(invalid_binding(span))
 
 
+private fixed record BuiltArguments {
+	builder: ValueBuilder,
+	values: List[ValueId]
+}
+
+
+private pure func lower_arguments(
+	builder: ValueBuilder,
+	arguments: List[ConcreteValue],
+	prefix: List[ValueId],
+) -> Result[BuiltArguments, Diagnostic]:
+	var current = builder
+	var values = prefix
+	var failure: Option[Diagnostic] = None
+
+	for argument in arguments:
+		match lower_value(current, argument):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(built):
+				current = built.builder
+				values = values.append(built.value)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				builder = current,
+				values = values,
+			})
+
+
 private pure func lower_value(
 	builder: ValueBuilder,
 	value: ConcreteValue,
@@ -182,28 +211,50 @@ private pure func lower_value(
 			Ok(define_value(builder, IntegerValue(integer), value.base_type, value.base_span))
 		ReturnVariant(id):
 			Ok(define_value(builder, VariantValue(id), value.base_type, value.base_span))
-		ReturnCall(call):
-			Ok(
-				define_value(
-					builder,
-					CallValue(call, NoArguments),
+		ReturnCall(call, arguments):
+			lower_arguments(
+				builder,
+				arguments,
+				[],
+			).map(
+				pure func(children: BuiltArguments) -> BuiltValue: define_value(
+					children.builder,
+					CallValue(call, children.values),
 					value.base_type,
 					value.base_span,
 				),
 			)
 
 	var built = base
+	var failure: Option[Diagnostic] = None
 
 	for step in value.operations:
-		operation = match step.operation:
-			InvokeFunction(call):
-				CallValue(call, OneArgument(built.value))
+		match step.operation:
+			InvokeFunction(call, arguments):
+				match lower_arguments(built.builder, arguments, [built.value]):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(children):
+						built = define_value(
+							children.builder,
+							CallValue(call, children.values),
+							step.value_type,
+							step.span,
+						)
 			ConstructVariant(id):
-				ConstructValue(id, built.value)
+				built = define_value(
+					built.builder,
+					ConstructValue(id, built.value),
+					step.value_type,
+					step.span,
+				)
 
-		built = define_value(built.builder, operation, step.value_type, step.span)
-
-	Ok(built)
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(built)
 
 
 private pure func assign_value(
@@ -363,10 +414,10 @@ private pure func lower_function(function: ConcreteFunction) -> Result[LoweredFu
 	-- The checked definition table owns parameter identity and its source span.
 	for definition in function.bindings:
 		match definition.origin:
-			ParameterBinding:
+			ParameterBinding(index):
 				parameter = define_value(
 					builder,
-					ParameterValue,
+					ParameterValue(index),
 					definition.value_type,
 					definition.span,
 				)

@@ -6,9 +6,8 @@ import:
 		BindingSyntax(ImmutableBinding, MutableBinding),
 		CallNotation(DirectCall, ReceiverCall),
 		Diagnostic,
-		ExpressionBase(IntegerExpression, NameExpression, ZeroArgumentApplication),
+		ExpressionBase(IntegerExpression, NameExpression, DirectApplication),
 		FieldPattern(FieldName, FieldWildcard),
-		ParameterList(EmptyParameters, SingleParameter),
 		ParsedBody(ParsedValueBody, ParsedMatchBody),
 		ParsedBuiltinType(IntegerBuiltin, StringBuiltin),
 		ParsedFunction,
@@ -40,8 +39,8 @@ private IDENTIFIER_HELP: String = (
 private INDENT_HELP: String = "use tabs only, or spaces in groups of four; do not mix tabs and spaces"
 
 private CHARACTER_HELP: String = (
-	"use ASCII function declarations and Int literals, parameter names, or calls "
-	+ "with zero or one argument; keep -> adjacent"
+	"use ASCII function declarations and Int literals, parameter names, or calls; "
+	+ "keep -> adjacent"
 )
 
 private TRAILING_HELP: String = "start each declaration at column 1 with no blank lines"
@@ -197,12 +196,12 @@ private pure func accepts(
 				[function]:
 					match function.body:
 						ParsedValueBody(body):
-							match body.base:
+							match first_base(body):
 								IntegerExpression(value):
 									(
 										value == 0
 										and function.purity == Impure
-										and body.applications.length() == 0
+										and call_occurrences(body).length() == 0
 										and name_spelling(
 											program.names,
 											function.function_name.id,
@@ -288,11 +287,11 @@ private pure func expression_name_is(
 	start: Int,
 	end: Int,
 ) -> Bool:
-	match expression.base:
+	match first_base(expression):
 		NameExpression(name):
 			(
 				written_name_is(names, name, spelling, start, end)
-				and expression.applications.length() == 0
+				and call_occurrences(expression).length() == 0
 				and expression.span.start == start
 				and expression.span.end == end
 			)
@@ -306,11 +305,11 @@ private pure func expression_integer_is(
 	start: Int,
 	end: Int,
 ) -> Bool:
-	match expression.base:
+	match first_base(expression):
 		IntegerExpression(actual):
 			(
 				actual == value
-				and expression.applications.length() == 0
+				and call_occurrences(expression).length() == 0
 				and expression.span.start == start
 				and expression.span.end == end
 			)
@@ -433,7 +432,7 @@ pure func test_untyped_parameter_and_separated_arrow_are_rejected() -> Bool:
 			11,
 			12,
 			"expected ':' after the parameter name",
-			"write a single parameter as name: Int",
+			"write each parameter as name: Type",
 		)
 		and rejects(
 			"func main() - > Int:\n\t0",
@@ -617,9 +616,9 @@ pure func test_declaration_repetition_and_call_syntax() -> Bool:
 				[first, second]:
 					second_is_one: Bool = match second.body:
 						ParsedValueBody(body):
-							match body.base:
+							match first_base(body):
 								IntegerExpression(1):
-									body.applications.length() == 0
+									call_occurrences(body).length() == 0
 								_:
 									False
 						_:
@@ -627,11 +626,11 @@ pure func test_declaration_repetition_and_call_syntax() -> Bool:
 
 					match first.body:
 						ParsedValueBody(body):
-							match body.base:
-								ZeroArgumentApplication(name):
+							match first_base(body):
+								DirectApplication(name, []):
 									(
 										name_spelling(program.names, name.id) == Some("one")
-										and body.applications.length() == 0
+										and call_occurrences(body).length() == 0
 										and name.span.start == 21
 										and name.span.end == 24
 										and name_spelling(
@@ -681,9 +680,9 @@ pure func test_argument_syntax_and_blank_separator_rule() -> Bool:
 				[function]:
 					match function.body:
 						ParsedValueBody(body):
-							match body.base:
+							match first_base(body):
 								IntegerExpression(0):
-									match body.applications:
+									match call_occurrences(body):
 										[call]:
 											(
 												name_spelling(
@@ -728,11 +727,11 @@ pure func test_pure_qualifier_preserves_names_and_spans() -> Bool:
 				[function]:
 					match function.body:
 						ParsedValueBody(body):
-							match body.base:
+							match first_base(body):
 								IntegerExpression(0):
 									(
 										function.purity == Pure
-										and body.applications.length() == 0
+										and call_occurrences(body).length() == 0
 										and name_spelling(
 											program.names,
 											function.function_name.id,
@@ -781,12 +780,12 @@ pure func test_parameter_and_nested_call_are_valid_syntax() -> Bool:
 			match program.functions:
 				[function]:
 					match function.parameters:
-						SingleParameter(parameter):
+						[parameter]:
 							match function.body:
 								ParsedValueBody(body):
-									match body.base:
+									match first_base(body):
 										NameExpression(value):
-											match body.applications:
+											match call_occurrences(body):
 												[inner, outer]:
 													(
 														function.purity == Impure
@@ -859,7 +858,7 @@ pure func test_parameter_annotation_requires_colon() -> Bool:
 		12,
 		13,
 		"expected ':' after the parameter name",
-		"write a single parameter as name: Int",
+		"write each parameter as name: Type",
 	)
 
 
@@ -869,8 +868,8 @@ pure func test_call_requires_one_complete_argument_and_closing_paren() -> Bool:
 			HEADER + "\tone(1",
 			26,
 			26,
-			"expected ')' after the call argument",
-			"pass at most one complete expression, then close the call with ')'",
+			"expected ')' after the call arguments",
+			"separate complete expressions with commas, then close the call with ')'",
 		)
 		and rejects(
 			HEADER + "\tone(1))",
@@ -889,22 +888,10 @@ pure func test_call_requires_one_complete_argument_and_closing_paren() -> Bool:
 	)
 
 
-pure func test_multiple_parameters_and_arguments_are_rejected() -> Bool:
+pure func test_multiple_parameters_and_arguments_are_accepted() -> Bool:
 	(
-		rejects(
-			"func f(x: Int, y: Int) -> Int:\n\tx\n",
-			13,
-			14,
-			"only zero or one parameter or argument is supported",
-			"use at most one typed parameter and one call argument",
-		)
-		and rejects(
-			HEADER + "\tone(0, 1)",
-			26,
-			27,
-			"only zero or one parameter or argument is supported",
-			"use at most one typed parameter and one call argument",
-		)
+		parse_source("func f(x: Int, y: Int) -> Int:\n\tf(x, y)\n").is_ok()
+		and parse_source(HEADER + "\tone(0, 1)").is_ok()
 	)
 
 
@@ -919,9 +906,9 @@ pure func test_ufcs_interleaves_with_pending_direct_calls() -> Bool:
 				[function]:
 					match function.body:
 						ParsedValueBody(body):
-							match body.base:
+							match first_base(body):
 								NameExpression(value):
-									match body.applications:
+									match call_occurrences(body):
 										[first, second, third, fourth]:
 											(
 												name_spelling(
@@ -986,22 +973,16 @@ pure func test_ufcs_requires_name_and_empty_parentheses() -> Bool:
 			26,
 			26,
 			"expected '(' after the UFCS function name",
-			"write receiver.function()",
+			"write receiver.function(arguments)",
 		)
 		and rejects(
 			HEADER + "\t1.one(",
 			27,
 			27,
-			"UFCS calls take no explicit arguments",
-			"the receiver supplies the single argument; write receiver.function()",
+			"expected a return expression",
+			"use a literal, a parameter or variant name, or a call as the entire body",
 		)
-		and rejects(
-			HEADER + "\t1.one(0)",
-			27,
-			28,
-			"UFCS calls take no explicit arguments",
-			"the receiver supplies the single argument; write receiver.function()",
-		)
+		and parse_source(HEADER + "\t1.one(0)").is_ok()
 	)
 
 
@@ -1032,7 +1013,7 @@ pure func test_union_names_variants_and_expression_spans() -> Bool:
 								[function]:
 									match function.body:
 										ParsedValueBody(body):
-											match body.base:
+											match first_base(body):
 												NameExpression(name):
 													(
 														name_spelling(
@@ -1074,7 +1055,7 @@ pure func test_union_names_variants_and_expression_spans() -> Bool:
 														and name.span.end == 65
 														and body.span.start == 60
 														and body.span.end == 65
-														and body.applications.length() == 0
+														and call_occurrences(body).length() == 0
 														and program.end.start == 69
 														and program.end.end == 69
 													)
@@ -1213,7 +1194,7 @@ private pure func unwrap_match_shape(names: NameTable, body: ParsedMatch) -> Boo
 				PatternName(empty_name):
 					match number.pattern:
 						PatternConstructor(number_name, OnePatternField(FieldName(field)), span):
-							match empty.body.base:
+							match first_base(empty.body):
 								IntegerExpression(0):
 									(
 										expression_name_is(names, body.scrutinee, "value", 85, 90)
@@ -1226,7 +1207,7 @@ private pure func unwrap_match_shape(names: NameTable, body: ParsedMatch) -> Boo
 										and empty.span.end == 102
 										and empty.body.span.start == 101
 										and empty.body.span.end == 102
-										and empty.body.applications.length() == 0
+										and call_occurrences(empty.body).length() == 0
 										and written_name_is(names, number_name, "Number", 105, 111)
 										and written_name_is(names, field, "number", 112, 118)
 										and span.start == 105
@@ -1253,7 +1234,7 @@ private pure func unwrap_match_shape(names: NameTable, body: ParsedMatch) -> Boo
 
 private pure func unwrap_function_shape(names: NameTable, function: ParsedFunction) -> Bool:
 	match function.parameters:
-		SingleParameter(parameter):
+		[parameter]:
 			match function.body:
 				ParsedMatchBody(body):
 					(
@@ -1272,16 +1253,16 @@ private pure func unwrap_function_shape(names: NameTable, function: ParsedFuncti
 
 private pure func constructed_main_shape(names: NameTable, function: ParsedFunction) -> Bool:
 	no_parameters: Bool = match function.parameters:
-		EmptyParameters:
+		[]:
 			True
-		SingleParameter(_):
+		_:
 			False
 
 	match function.body:
 		ParsedValueBody(body):
-			match body.base:
+			match first_base(body):
 				IntegerExpression(42):
-					match body.applications:
+					match call_occurrences(body):
 						[number, call]:
 							(
 								function.purity == Impure
@@ -1368,7 +1349,7 @@ pure func test_pattern_alternatives_space_layout_and_following_union() -> Bool:
 			match program.functions:
 				[function]:
 					header_ok: Bool = match function.parameters:
-						SingleParameter(parameter):
+						[parameter]:
 							(
 								function.purity == Impure
 								and written_name_is(
@@ -1395,9 +1376,9 @@ pure func test_pattern_alternatives_space_layout_and_following_union() -> Bool:
 						ParsedMatchBody(body):
 							match body.arms:
 								[empty, number, whole, wildcard]:
-									empty_body_ok: Bool = match empty.body.base:
+									empty_body_ok: Bool = match first_base(empty.body):
 										IntegerExpression(1):
-											match empty.body.applications:
+											match call_occurrences(empty.body):
 												[zero, identity]:
 													(
 														written_name_is(
@@ -1521,7 +1502,7 @@ private pure func single_wildcard_match_is(source: String, eof: Int) -> Bool:
 			match program.functions:
 				[function]:
 					match function.parameters:
-						SingleParameter(parameter):
+						[parameter]:
 							match function.body:
 								ParsedMatchBody(body):
 									match body.arms:
@@ -2328,7 +2309,7 @@ pure func test_generic_union_and_atomic_application_spans() -> Bool:
 											match program.functions:
 												[function]:
 													match function.parameters:
-														SingleParameter(value):
+														[value]:
 															(
 																written_name_is(
 																	program.names,
@@ -2549,8 +2530,8 @@ tests: TestSuite = {
 			test_call_requires_one_complete_argument_and_closing_paren,
 		),
 		(
-			"multiple parameters and arguments are rejected",
-			test_multiple_parameters_and_arguments_are_rejected,
+			"multiple parameters and arguments are accepted",
+			test_multiple_parameters_and_arguments_are_accepted,
 		),
 		(
 			"parameter and nested call are valid syntax",
@@ -2584,3 +2565,48 @@ tests: TestSuite = {
 		),
 	]
 }
+
+
+-- Trace lexical call occurrences in evaluation order. The recursive tree is
+-- checked directly by the multiple-argument phase tests; these older unary
+-- examples pin names, notation and exact written spans independently of shape.
+private fixed record CallOccurrence {
+	callee: WrittenName,
+	notation: CallNotation
+}
+
+
+private pure func first_base(value: ValueExpression) -> ExpressionBase:
+	match value.base:
+		DirectApplication(_, [argument]):
+			first_base(argument)
+		_:
+			value.base
+
+
+private pure func call_occurrences(value: ValueExpression) -> List[CallOccurrence]:
+	var calls: List[CallOccurrence] = []
+
+	match value.base:
+		DirectApplication(name, arguments):
+			for argument in arguments:
+				calls = calls.concat(call_occurrences(argument))
+
+			if arguments.length() > 0:
+				calls = calls.append({
+					callee = name,
+					notation = DirectCall,
+				})
+		_:
+			void
+
+	for application in value.applications:
+		for argument in application.arguments:
+			calls = calls.concat(call_occurrences(argument))
+
+		calls = calls.append({
+			callee = application.callee,
+			notation = ReceiverCall,
+		})
+
+	calls

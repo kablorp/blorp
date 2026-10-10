@@ -38,14 +38,9 @@ fixed record ConcreteUnion {
 }
 
 
-fixed union ParameterShape:
-	NoParameter
-	OneParameter(TypeRef)
-
-
 fixed record FunctionSignature {
 	purity: Purity,
-	parameters: ParameterShape,
+	parameters: List[TypeRef],
 	return_type: TypeRef
 }
 
@@ -73,7 +68,7 @@ pure func runtime_signature(operation: RuntimeOperation) -> FunctionSignature:
 	contract = runtime_contract(operation)
 	{
 		purity = contract.purity,
-		parameters = OneParameter(primitive_ref(contract.parameter)),
+		parameters = [primitive_ref(contract.parameter)],
 		return_type = primitive_ref(contract.return_type)
 	}
 
@@ -82,11 +77,11 @@ fixed union ConcreteBase:
 	ReturnInteger(Int)
 	ReturnVariant(VariantInstanceId)
 	ReturnBinding(Checked.BindingId)
-	ReturnCall(ConcreteCall)
+	ReturnCall(ConcreteCall, List[ConcreteValue])
 
 
 fixed union ConcreteOperation:
-	InvokeFunction(ConcreteCall)
+	InvokeFunction(ConcreteCall, List[ConcreteValue])
 	ConstructVariant(VariantInstanceId)
 
 
@@ -385,15 +380,30 @@ private pure func call_key(
 
 
 private pure func value_calls(value: Checked.CheckedValue) -> List[Checked.CheckedCall]:
-	var calls: List[Checked.CheckedCall] = match value.base:
-		Checked.ReturnCall(call):
-			[call]
+	append_value_calls([], value)
+
+
+private pure func append_value_calls(
+	collected: List[Checked.CheckedCall],
+	value: Checked.CheckedValue,
+) -> List[Checked.CheckedCall]:
+	var calls = collected
+
+	match value.base:
+		Checked.ReturnCall(call, arguments):
+			for argument in arguments:
+				calls = append_value_calls(calls, argument)
+
+			calls = calls.append(call)
 		_:
-			[]
+			void
 
 	for step in value.operations:
 		match step.operation:
-			Checked.InvokeFunction(call):
+			Checked.InvokeFunction(call, arguments):
+				for argument in arguments:
+					calls = append_value_calls(calls, argument)
+
 				calls = calls.append(call)
 			_:
 				void
@@ -600,19 +610,39 @@ private pure func prepare_type(
 
 
 private pure func value_types(value: Checked.CheckedValue) -> List[Checked.TypeUse]:
-	[
-		{
-			value_type = value.base_type,
-			span = value.base_span
-		},
-	].concat(
-		value.operations.map(pure func(step: Checked.CheckedStep) -> Checked.TypeUse:
-			{
-				value_type = step.value_type,
-				span = step.span
-			}
-		),
-	)
+	append_value_types([], value)
+
+
+private pure func append_value_types(
+	collected: List[Checked.TypeUse],
+	value: Checked.CheckedValue,
+) -> List[Checked.TypeUse]:
+	var types = collected.append({
+		value_type = value.base_type,
+		span = value.base_span,
+	})
+
+	match value.base:
+		Checked.ReturnCall(_, children):
+			for child in children:
+				types = append_value_types(types, child)
+		_:
+			void
+
+	for step in value.operations:
+		types = types.append({
+			value_type = step.value_type,
+			span = step.span,
+		})
+
+		match step.operation:
+			Checked.InvokeFunction(_, arguments):
+				for child in arguments:
+					types = append_value_types(types, child)
+			_:
+				void
+
+	types
 
 
 private pure func assignment_types(
@@ -633,11 +663,7 @@ private pure func assignment_types(
 
 
 private pure func function_types(function: Checked.CheckedFunction) -> List[Checked.TypeUse]:
-	var types: List[Checked.TypeUse] = match function.signature.parameters:
-		Checked.NoParameter:
-			[]
-		Checked.OneParameter(value):
-			[value]
+	var types: List[Checked.TypeUse] = function.signature.parameters
 
 	types = types
 		.append(function.signature.return_type)
@@ -882,9 +908,20 @@ private pure func translate_value(
 			owner ?= concrete_union_owner(base_type, value.base_span)
 			concrete ?= translate_variant(id, owner, unions, value.base_span)
 			Ok(ReturnVariant(concrete))
-		Checked.ReturnCall(call):
+		Checked.ReturnCall(call, arguments):
 			concrete ?= translate_call(call, substitution, keys, unions)
-			Ok(ReturnCall(concrete))
+			values ?= translated_list(
+				arguments,
+				pure func(
+					argument: Checked.CheckedValue,
+				) -> Result[ConcreteValue, Diagnostic]: translate_value(
+					argument,
+					substitution,
+					keys,
+					unions,
+				),
+			)
+			Ok(ReturnCall(concrete, values))
 
 	base ?= base_result
 	steps ?= translated_list(value.operations, pure func(
@@ -893,9 +930,20 @@ private pure func translate_value(
 		value_type ?= concrete_type(step.value_type, substitution, unions, step.span)
 
 		operation_result: Result[ConcreteOperation, Diagnostic] = match step.operation:
-			Checked.InvokeFunction(call):
+			Checked.InvokeFunction(call, arguments):
 				concrete ?= translate_call(call, substitution, keys, unions)
-				Ok(InvokeFunction(concrete))
+				values ?= translated_list(
+					arguments,
+					pure func(
+						argument: Checked.CheckedValue,
+					) -> Result[ConcreteValue, Diagnostic]: translate_value(
+						argument,
+						substitution,
+						keys,
+						unions,
+					),
+				)
+				Ok(InvokeFunction(concrete, values))
 			Checked.ConstructVariant(id):
 				owner ?= concrete_union_owner(value_type, step.span)
 				concrete ?= translate_variant(id, owner, unions, step.span)
@@ -969,14 +1017,18 @@ private pure func translate_function(
 	span = function.signature.return_type.span
 	substitution ?= instance_substitution(function.signature, key.argument, span)
 
-	parameter_result: Result[ParameterShape, Diagnostic] = match function.signature.parameters:
-		Checked.NoParameter:
-			Ok(NoParameter)
-		Checked.OneParameter(value):
-			concrete ?= concrete_type(value.value_type, substitution, unions, value.span)
-			Ok(OneParameter(concrete))
+	parameters ?= translated_list(
+		function.signature.parameters,
+		pure func(
+			value: Checked.TypeUse,
+		) -> Result[TypeRef, Diagnostic]: concrete_type(
+			value.value_type,
+			substitution,
+			unions,
+			value.span,
+		),
+	)
 
-	parameters ?= parameter_result
 	return_type ?= concrete_type(
 		function.signature.return_type.value_type,
 		substitution,

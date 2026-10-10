@@ -2,7 +2,6 @@ import:
 	./prelude: RuntimeOperation(IntToString, StringLength)
 	int as IntOps
 	lower:
-		CallArguments(NoArguments, OneArgument),
 		MatchLabel(VariantLabel, DefaultLabel),
 		ValueId,
 		ValueOperation(
@@ -11,7 +10,7 @@ import:
 		value_number,
 	option: to_result
 	own as Own:
-		OwnedArguments(UnmanagedArgument, BorrowedArgument),
+		OwnedArgument(UnmanagedArgument, BorrowedArgument),
 		OwnedArm,
 		OwnedDefinition,
 		OwnedFunction,
@@ -30,7 +29,6 @@ import:
 	specialize:
 		CallTarget(UserFunction, RuntimeFunction),
 		ConcreteUnion,
-		ParameterShape(NoParameter, OneParameter),
 		PayloadShape(NoPayload, IntPayload),
 		TypeRef(IntType, StringType, UnionType),
 		UnionInstanceId,
@@ -51,7 +49,9 @@ private INTERNAL_SPAN: Span = {
 	end = 0
 }
 
-private C_PARAMETER: String = "blorp_p_0"
+
+private pure func c_parameter(index: Int) -> String:
+	"blorp_p_".append_int(index)
 
 
 private pure func internal_error() -> Diagnostic:
@@ -149,21 +149,37 @@ private pure func c_variant(id: VariantInstanceId) -> String:
 
 
 private pure func c_parameters(
-	parameters: ParameterShape,
+	parameters: List[TypeRef],
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
-	match parameters:
-		NoParameter:
-			Ok("(void)")
-		OneParameter(type_ref):
-			type_name ?= c_type(type_ref, unions)
-			Ok(
-				"("
-					.concat(type_name)
-					.concat(" ")
-					.concat(C_PARAMETER)
-					.concat(")"),
-			)
+	if IntOps.equals(parameters.length(), 0):
+		Ok("(void)")
+	else:
+		var output: String = "("
+		var index: Int = 0
+		var invalid: Option[Diagnostic] = None
+
+		for parameter in parameters:
+			match c_type(parameter, unions):
+				Err(error):
+					invalid = Some(error)
+					break
+				Ok(name):
+					if IntOps.greater_than(index, 0):
+						output = output.concat(",")
+
+					output = output
+						.concat(name)
+						.concat(" ")
+						.concat(c_parameter(index))
+
+			index = IntOps.add(index, 1)
+
+		match invalid:
+			Some(error):
+				Err(error)
+			None:
+				Ok(output.concat(")"))
 
 
 private pure func append_union(output: String, declaration: ConcreteUnion, index: Int) -> String:
@@ -210,8 +226,8 @@ private pure func append_operation(
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	match operation:
-		ParameterValue:
-			Ok(output.concat(C_PARAMETER))
+		ParameterValue(index):
+			Ok(output.concat(c_parameter(index)))
 		IntegerValue(value):
 			Ok(append_integer(output, value))
 		VariantValue(id):
@@ -231,18 +247,19 @@ private pure func append_operation(
 			else:
 				Ok(output.concat(c_variant(id)))
 		CallValue(call, arguments):
-			prefix = output
+			var prefix = output
 				.concat(c_callable(call.target))
 				.concat("(")
-			Ok(
-				match arguments:
-					NoArguments:
-						prefix.concat(")")
-					OneArgument(id):
-						prefix
-							.concat(c_value(id))
-							.concat(")")
-			)
+			var index: Int = 0
+
+			for argument in arguments:
+				if IntOps.greater_than(index, 0):
+					prefix = prefix.concat(",")
+
+				prefix = prefix.concat(c_value(argument))
+				index = IntOps.add(index, 1)
+
+			Ok(prefix.concat(")"))
 		ConstructValue(id, argument):
 			type_name ?= c_type(UnionType(variant_owner(id)), unions)
 			Ok(
@@ -299,20 +316,20 @@ private pure func append_value(
 
 private pure func expression_operation(operation: OwnedValueOperation) -> ValueOperation:
 	match operation:
-		ParameterDefinition:
-			ParameterValue
+		ParameterDefinition(index):
+			ParameterValue(index)
 		IntegerDefinition(value):
 			IntegerValue(value)
 		VariantDefinition(id):
 			VariantValue(id)
 		CallDefinition(call, arguments):
-			operands = match arguments:
-				Own.NoArguments:
-					NoArguments
-				UnmanagedArgument(id):
-					OneArgument(id)
-				BorrowedArgument(borrow):
-					OneArgument(borrow.value)
+			operands = arguments.map(pure func(argument: OwnedArgument) -> ValueId:
+				match argument:
+					UnmanagedArgument(id):
+						id
+					BorrowedArgument(borrow):
+						borrow.value
+			)
 
 			CallValue(call, operands)
 		ConstructDefinition(id, argument):
@@ -560,12 +577,9 @@ private pure func needs_string_runtime(program: OwnershipProgram) -> Bool:
 		if is_string(function.signature.return_type):
 			needed = True
 
-		match function.signature.parameters:
-			NoParameter:
-				void
-			OneParameter(type_ref):
-				if is_string(type_ref):
-					needed = True
+		for parameter in function.signature.parameters:
+			if is_string(parameter):
+				needed = True
 
 		if operations_need_strings(function.operations):
 			needed = True
