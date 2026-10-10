@@ -411,6 +411,24 @@ A phantom `Marker[String]` with no parameter payload remains valid, as does
 nominal instance identities.
 
 
+The [multiple-type-parameter example](test/e2e/fixtures/generic/function_parameters/second.brp)
+adds independent declaration parameters:
+
+```blorp
+pure func second[A, B](first: A, second: B) -> B:
+    second
+func main() -> Int:
+    second(7, 42.to_string()).length()
+```
+
+It exits 2. Parameter identity includes its declaring function or union and
+position; call substitutions and specialization keys retain every argument in
+declaration order. Repeated concrete instances are reused, while changing even
+an unused later parameter creates a distinct instance. Substitution preserves
+caller-owned rigid types during forwarding. A known result type does not infer
+missing parameters. Unions still declare at most one type parameter.
+
+
 The [multiple-argument example](test/e2e/fixtures/generic/arguments.brp) adds
 ordered runtime parameters while retaining one type parameter:
 
@@ -487,10 +505,11 @@ Lexical and layout rules:
 - `func`, `pure`, `match`, `var`, and lone `_` are reserved. The optional `pure` qualifier precedes `func`
   with spaces between the two keywords. Function, parameter and type names are
   identifiers whose meaning is checked after parsing.
-- A function may declare one type parameter, as in
-  `pure func identity[T](value: T) -> T:`. Its name starts with a capital ASCII
-  letter and contains only ASCII letters and digits. Multiple type parameters
-  and explicit function type arguments at calls are unsupported.
+- A function may declare ordered type parameters, as in
+  `pure func second[A, B](first: A, second: B) -> B:`. Each name starts with a
+  capital ASCII letter and contains only ASCII letters and digits. Names must
+  be distinct within a declaration. Explicit function type arguments at calls
+  are unsupported; argument types determine the type parameters.
 - `fixed union Type:` introduces one or more variants on indented
   lines. `fixed` and `union` are contextual header words and remain valid names
   elsewhere. A variant is bare or has one type-name annotation, as in
@@ -600,20 +619,22 @@ Semantic rules:
   recursion produce a semantic diagnostic. Repeating an acyclic call, such as
   `identity(identity(1))`, is valid. General recursion and its resource rules are
   future work.
-- Generic declarations are checked once with a rigid type parameter, including
+- Generic declarations are checked once with distinct rigid type parameters, including
   unused bodies. An arbitrary `T` cannot return an Int literal or call a
   concrete Int/String runtime operation. Parameters cannot share a name with
   `Int`, `String`, or any declared union; separate declarations may reuse `T`.
   `main` and runtime prelude functions cannot declare type parameters.
-  Direct and UFCS calls infer the sole type parameter consistently from every
-  synthesized argument type. A later argument can determine it when an earlier
-  parameter is concrete. Repeated occurrences, including structural `Box[T]`
+  Direct and UFCS calls infer each type parameter consistently from synthesized
+  argument types in source order. A later argument can determine a parameter
+  when earlier annotations do not constrain it. Repeated occurrences, including structural `Box[T]`
   occurrences, must agree.
   Generic forwarding preserves the caller's rigid parameter until specialization.
   Expected return types never infer a generic substitution: `identity(First)`
   and `identity(Number(7))` reject even in a union-returning body. Pass an
-  already-typed union value or call a concrete helper instead. A concrete
-  nongeneric parameter still contextualizes constructors. Phantom parameters
+  already-typed union value or call a concrete helper instead. Each explicit argument with a concrete annotation contextualizes constructors,
+  including in a generic function. A generic UFCS receiver receives no such
+  hint even when its first annotation is concrete. This existing distinction
+  remains until contextual inference is implemented. Phantom parameters
   and zero-argument generic calls diagnose uninferable parameters; no default
   type is chosen. A parameter in a union argument, as in `unbox(Box[T])`,
   is inferred structurally from the complete synthesized argument type.
@@ -706,8 +727,14 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    diagnostic using the same parsed name authority. The CLI preserves the entire
    rendered collection. Semantic unit tests inspect typed facts directly;
    renderer and pipeline tests pin wording independently. UFCS receiver mismatch
-   occurrences retain the existing call-span limitation. Inference remains
-   one-way; bidirectional checking and structural unification are later work.
+   occurrences retain the existing call-span limitation. Expression synthesis
+   owns one shared traversal with optional constructor-only context. New bindings
+   and match scrutinees synthesize their types; returns, arms and reassignment
+   explicitly check a known type and its source. Argument checking elaborates all
+   children before instantiation and mismatch validation, preserving error order.
+   Complete outer receiver contracts are resolved before their children. Generic
+   argument inference remains one-way; contextual inference and structural
+   unification are later work.
 4. Pure specialization expands instances from every ordinary function, preserving
    unused ordinary functions and unions. Generic declarations emit only when
    requested by those roots or another instance. One local instance list reuses

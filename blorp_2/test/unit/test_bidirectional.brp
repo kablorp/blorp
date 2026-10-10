@@ -1,0 +1,408 @@
+import:
+	../../src/check as Checked
+	../../src/lex: lex
+	../../src/syntax: Diagnostic
+	../../src/text: concat
+	input: check_failure, parse, setup_diagnostic
+	int as IntOps
+	test: TestSuite
+
+
+private CHOICE: String = "fixed union Choice:\n\tEmpty\n\tNumber(Int)\n"
+
+private MAIN: String = "func main() -> Int:\n\t0\n"
+
+
+private pure func checked_source(source: String) -> Result[Checked.CheckedProgram, Diagnostic]:
+	tokens ?= lex(source)
+	program ?= parse(tokens)
+	Checked
+		.check(program)
+		.map_err(setup_diagnostic)
+
+
+private pure func rejects_at(
+	prefix: String,
+	marked: String,
+	suffix: String,
+	expected: pure (Checked.CheckErrorKind) -> Bool,
+) -> Bool:
+	match (
+		check_failure(
+			prefix
+				.concat(marked)
+				.concat(suffix),
+		)
+	):
+		None:
+			False
+		Some(error):
+			(
+				error.span.start == prefix.length()
+				and error.span.end == IntOps.add(prefix.length(), marked.length())
+				and expected(error.kind)
+			)
+
+
+pure func test_binding_and_scrutinee_synthesize_the_same_nominal_type() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|	Empty
+		|	Number(Int)
+		|pure func choose() -> Choice:
+		|	Number(7)
+		|pure func inspect() -> Int:
+		|	value = choose()
+		|	match value:
+		|		Empty: 0
+		|		Number(item): item
+		|func main() -> Int:
+		|	inspect()
+
+	match checked_source(source.concat("\n")):
+		Err(_):
+			False
+		Ok(program):
+			match Checked.checked_functions(program).functions:
+				[choose, inspect, _]:
+					match inspect.bindings:
+						[local, _]:
+							match inspect.body:
+								Checked.CheckedMatchBody(body):
+									match body.scrutinee.base:
+										Checked.ReturnBinding(binding):
+											(
+												Checked.binding_number(binding) == 0
+												and Checked.same_type(
+													local.value_type,
+													choose.signature.return_type.value_type,
+												)
+												and Checked.same_type(
+													body.union_type,
+													local.value_type,
+												)
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_checked_return_provides_constructor_type() -> Bool:
+	checked_source(
+		CHOICE
+			.concat("pure func choose() -> Choice:\n\tNumber(7)\n")
+			.concat(MAIN),
+	).is_ok()
+
+
+pure func test_checked_arm_provides_constructor_type() -> Bool:
+	checked_source(
+		CHOICE
+			.concat(
+				"pure func choose(value: Choice) -> Choice:\n\tmatch value:\n\t\tEmpty: Number(7)\n\t\tNumber(item): Empty\n",
+			)
+			.concat(MAIN),
+	).is_ok()
+
+
+pure func test_concrete_direct_argument_provides_constructor_type() -> Bool:
+	checked_source(
+		CHOICE
+			.concat(
+				"pure func keep(value: Choice) -> Choice:\n\tvalue\npure func choose() -> Choice:\n\tkeep(Number(7))\n",
+			)
+			.concat(MAIN),
+	).is_ok()
+
+
+pure func test_concrete_receiver_provides_constructor_type() -> Bool:
+	checked_source(
+		CHOICE
+			.concat(
+				"pure func keep(value: Choice) -> Choice:\n\tvalue\npure func choose() -> Choice:\n\tNumber(7).keep()\n",
+			)
+			.concat(MAIN),
+	).is_ok()
+
+
+pure func test_generic_return_context_keeps_rigid_payload_identity() -> Bool:
+	source: String =
+		|fixed union Box[T]:
+		|	Box(T)
+		|pure func box[T](value: T) -> Box[T]:
+		|	Box(value)
+		|func main() -> Int:
+		|	0
+
+	match checked_source(source.concat("\n")):
+		Err(_):
+			False
+		Ok(program):
+			match Checked.checked_functions(program).functions:
+				[box, _]:
+					match box.signature.type_parameters:
+						[parameter]:
+							match box.body:
+								Checked.CheckedValueBody(value):
+									match value.base_type:
+										Checked.ParameterType(payload_parameter):
+											match value.operations:
+												[step]:
+													match step.operation:
+														Checked.ConstructVariant(variant):
+															(
+																Checked.same_parameter(
+																	parameter,
+																	payload_parameter,
+																)
+																and Checked.union_number(
+																	Checked.variant_owner(
+																		variant,
+																	),
+																) == 0
+																and Checked.same_type(
+																	step.value_type,
+																	box.signature.return_type.value_type,
+																)
+															)
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_synthesized_binding_does_not_inherit_return_context() -> Bool:
+	rejects_at(CHOICE.concat(
+		"pure func choose() -> Choice:\n\tvalue = ",
+	), "Number", "(7)\n\tvalue\n".concat(MAIN), pure func(kind):
+		match kind:
+			Checked.ConstructorNeedsExpectedType(_):
+				True
+			_:
+				False
+	)
+
+
+pure func test_synthesized_scrutinee_does_not_inherit_return_context() -> Bool:
+	rejects_at(CHOICE.concat(
+		"func main() -> Int:\n\tmatch ",
+	), "Number", "(7):\n\t\tEmpty: 0\n\t\tNumber(item): item\n", pure func(kind):
+		match kind:
+			Checked.ConstructorNeedsExpectedType(_):
+				True
+			_:
+				False
+	)
+
+
+pure func test_generic_receiver_does_not_supply_constructor_context() -> Bool:
+	rejects_at(CHOICE.concat(
+		"pure func keep[T](value: T) -> T:\n\tvalue\npure func choose() -> Choice:\n\t",
+	), "Number", "(7).keep()\n".concat(MAIN), pure func(kind):
+		match kind:
+			Checked.ConstructorNeedsExpectedType(_):
+				True
+			_:
+				False
+	)
+
+
+pure func test_unused_generic_return_is_checked_rigidly() -> Bool:
+	prefix = "pure func wrong[T](value: T) -> T:\n\t"
+	rejects_at(prefix, "7", "\n".concat(MAIN), pure func(kind):
+		match kind:
+			Checked.ExpressionTypeMismatch(mismatch):
+				match mismatch.expected:
+					Checked.ParameterType(parameter):
+						match Checked.parameter_owner(parameter):
+							Checked.FunctionDeclaration(owner):
+								match mismatch.expected_site:
+									Checked.SourceAnnotation(annotation):
+										(
+											Checked.function_number(owner) == 0
+											and annotation.start == 32
+											and annotation.end == 33
+											and Checked.same_type(
+												mismatch.actual.value_type,
+												Checked.IntType,
+											)
+											and mismatch.actual.span.start == prefix.length()
+										)
+									_:
+										False
+							_:
+								False
+					_:
+						False
+			_:
+				False
+	)
+
+
+pure func test_later_direct_child_error_precedes_earlier_type_mismatch() -> Bool:
+	rejects_at("pure func first(left: Int, right: Int) -> Int:\n\tleft\nfunc main() -> Int:\n\tfirst(7.to_string(), ", "missing", ")\n", pure func(
+		kind,
+	):
+		match kind:
+			Checked.UnknownValue(_):
+				True
+			_:
+				False
+	)
+
+
+pure func test_later_ufcs_child_error_precedes_receiver_type_mismatch() -> Bool:
+	rejects_at("pure func first(left: Int, right: Int) -> Int:\n\tleft\nfunc main() -> Int:\n\t7.to_string().first(", "missing", ")\n", pure func(
+		kind,
+	):
+		match kind:
+			Checked.UnknownValue(_):
+				True
+			_:
+				False
+	)
+
+
+pure func test_postfix_contract_error_precedes_base_error() -> Bool:
+	rejects_at("func main() -> Int:\n\tmissing.", "absent", "()\n", pure func(kind):
+		match kind:
+			Checked.UnknownFunction(_):
+				True
+			_:
+				False
+	)
+
+
+pure func test_later_child_error_precedes_generic_conflict() -> Bool:
+	rejects_at("pure func first[T](left: T, right: T, last: Int) -> T:\n\tleft\nfunc main() -> Int:\n\tfirst(7, 8.to_string(), ", "missing", ")\n", pure func(
+		kind,
+	):
+		match kind:
+			Checked.UnknownValue(_):
+				True
+			_:
+				False
+	)
+
+
+pure func test_checked_arm_mismatch_keeps_expression_and_annotation_spans() -> Bool:
+	prefix = CHOICE.concat("pure func inspect(value: Choice) -> Int:\n\tmatch value:\n\t\tEmpty: ")
+	body = "8.to_string()"
+	rejects_at(prefix, body, "\n\t\tNumber(item): item\n".concat(MAIN), pure func(kind):
+		match kind:
+			Checked.ExpressionTypeMismatch(mismatch):
+				match mismatch.expected_site:
+					Checked.SourceAnnotation(annotation):
+						(
+							Checked.same_type(mismatch.expected, Checked.IntType)
+							and Checked.same_type(mismatch.actual.value_type, Checked.StringType)
+							and mismatch.actual.span.start == prefix.length()
+							and mismatch.actual.span.end == IntOps.add(
+								prefix.length(),
+								body.length(),
+							)
+							and annotation.start == 76
+							and annotation.end == 79
+						)
+					_:
+						False
+			_:
+				False
+	)
+
+
+pure func test_checked_reassignment_keeps_binding_owner_and_occurrences() -> Bool:
+	prefix = "pure func spare() -> Int:\n\t0\nfunc main() -> Int:\n\tvar current = 7\n\tcurrent = "
+	body = "8.to_string()"
+	rejects_at(prefix, body, "\n\t0\n", pure func(kind):
+		match kind:
+			Checked.ExpressionTypeMismatch(mismatch):
+				match mismatch.expected_site:
+					Checked.InferredBindingDeclaration(binding):
+						(
+							Checked.same_type(mismatch.expected, Checked.IntType)
+							and Checked.same_type(mismatch.actual.value_type, Checked.StringType)
+							and mismatch.actual.span.start == prefix.length()
+							and mismatch.actual.span.end == IntOps.add(
+								prefix.length(),
+								body.length(),
+							)
+							and Checked.function_number(binding.function) == 1
+							and Checked.binding_number(binding.binding) == 0
+							and binding.span.start == 54
+							and binding.span.end == 61
+						)
+					_:
+						False
+			_:
+				False
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 synthesis and checking contracts",
+	tests = [
+		(
+			"later child error precedes generic conflict",
+			test_later_child_error_precedes_generic_conflict,
+		),
+		(
+			"checked arm mismatch preserves provenance",
+			test_checked_arm_mismatch_keeps_expression_and_annotation_spans,
+		),
+		(
+			"checked reassignment preserves binding identity",
+			test_checked_reassignment_keeps_binding_owner_and_occurrences,
+		),
+		(
+			"binding and scrutinee synthesize nominal type",
+			test_binding_and_scrutinee_synthesize_the_same_nominal_type,
+		),
+		("checked return directs constructor", test_checked_return_provides_constructor_type),
+		("checked arm directs constructor", test_checked_arm_provides_constructor_type),
+		(
+			"concrete direct argument directs constructor",
+			test_concrete_direct_argument_provides_constructor_type,
+		),
+		("concrete receiver directs constructor", test_concrete_receiver_provides_constructor_type),
+		(
+			"generic return keeps rigid payload identity",
+			test_generic_return_context_keeps_rigid_payload_identity,
+		),
+		(
+			"binding synthesis has no return context",
+			test_synthesized_binding_does_not_inherit_return_context,
+		),
+		(
+			"scrutinee synthesis has no return context",
+			test_synthesized_scrutinee_does_not_inherit_return_context,
+		),
+		(
+			"generic receiver has no constructor context",
+			test_generic_receiver_does_not_supply_constructor_context,
+		),
+		("unused generic return remains rigid", test_unused_generic_return_is_checked_rigidly),
+		(
+			"later direct child error has precedence",
+			test_later_direct_child_error_precedes_earlier_type_mismatch,
+		),
+		(
+			"later UFCS child error has precedence",
+			test_later_ufcs_child_error_precedes_receiver_type_mismatch,
+		),
+		("postfix contract error has precedence", test_postfix_contract_error_precedes_base_error),
+	]
+}

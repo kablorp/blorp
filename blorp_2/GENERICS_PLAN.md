@@ -29,6 +29,26 @@ publish complete substitutions with no unresolved inference variables. Purity,
 name resolution and exhaustiveness remain separate checks. Implicit let
 polymorphism is outside the current scope.
 
+The checking/synthesis distinction follows Dunfield and Krishnaswami's
+[Bidirectional Typing](https://arxiv.org/abs/1908.05839). The
+[Rust compiler's inference guide](https://rustc-dev-guide.rust-lang.org/type-inference.html)
+provides implementation precedent for local inference variables and constraints
+that retain their origin. These inform the design; each mechanism enters only
+when the next supported example requires it.
+
+For specialization identity, the Rust compiler's
+[Instance](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.Instance.html)
+couples a definition with its generic arguments. Adopt that complete-key idea
+while retaining this pilot's immutable `SpecializedProgram`; Rust's on-the-fly
+MIR substitution does not dictate this pipeline's boundaries.
+
+The publication boundary remains `Result[CheckedProgram, CheckFailure]`.
+Temporary inference variables, tentative substitutions and mutable builders stay
+private. A checked generic body may contain its declaration-owned rigid
+parameters, and a checked call may substitute a caller's rigid parameter.
+Specialization is responsible for producing concrete types. Errors retain stable
+semantic facts and spans, without references to live inference state.
+
 ## Ordered examples
 
 1. **Multiple runtime arguments; one type parameter.**
@@ -63,18 +83,50 @@ polymorphism is outside the current scope.
    Bidirectional checking and structural unification remain a separate follow-up
    before extending generic inference.
 
-2. **Multiple type parameters.** First independent function parameters, then
-   `fixed union Result[T, E]` with `Ok(T)` and `Err(E)`. Begin with Int payloads.
+2. **Explicit checking and synthesis.** Preserve current accepted programs and
+   diagnostics while making the two expression operations explicit. A function
+   return, known argument or match arm checks against its receiving type; a
+   binding initializer or match scrutinee synthesizes where no receiving type is
+   available. Share the recursive implementation, preserve constructor-directed
+   context and resolve each call contract once. Argument checking retains its
+   current delayed obligation boundary and error priority. This is bounded
+   preparation, not expected-result inference for generic calls. Protect the
+   behavior with direct typed-fact/error tests and demonstrate their failure
+   under a relevant mutation before changing production code.
+
+3. **Multiple function type parameters.** Use independent ordered parameters:
+
+   ```blorp
+   pure func second[A, B](first: A, second: B) -> B:
+       second
+   func main() -> Int:
+       second(7, 42.to_string()).length()
+   ```
+
+   Expected exit: 2. Replace zero/one type-parameter and call-substitution
+   carriers with ordered collections; keep one-way argument inference for this
+   slice. Check each generic declaration once, including unused bodies.
    Parameter identity gains its position within the declaring owner. Preserve
    order in substitutions and instance keys; duplicate declarations, incomplete
    inference, cross-owner parameters and swapped substitutions need exact tests.
+   Substitution is simultaneous: replacing a callee parameter preserves the
+   supplied caller-owned type without applying callee substitutions inside it.
+   Preserve the existing constructor-context distinction: explicit arguments
+   use their individual concrete annotations, while a generic UFCS receiver
+   receives no constructor hint. Contextual inference changes remain separate.
 
-3. **Nested types and unmanaged union payloads.** First admit written nested
+4. **Multiple union type parameters.** Add `fixed union Result[T, E]` with
+   `Ok(T)` and `Err(E)`. Begin native examples with Int payloads. Check written
+   application arity, declaration-owned parameter positions, constructor/pattern
+   substitution and complete nominal instance keys separately from function
+   inference. Retain the managed-payload restriction until its own increment.
+
+5. **Nested types and unmanaged union payloads.** First admit written nested
    applications, then execute `box(box(7))` and extract the nested value. Publish
    concrete payload types and dependency-ordered inline layouts once. Retain
    complete nominal identities even when two instances share a layout shape.
 
-4. **Managed union payloads.** Start with `Box[String]` and a borrowed payload
+6. **Managed union payloads.** Start with `Box[String]` and a borrowed payload
    returned owned. Then replace an enclosing binding while a saved result stays
    live. State root storage, owned-child destruction, projection dependencies,
    acquisition and return transfer explicitly. Check only active variant children
@@ -90,13 +142,18 @@ polymorphism is outside the current scope.
    planned checked-fixed restriction remains a separate future language decision.
    Recursive aggregates and COW remain separate work.
 
-5. **Contextual inference.** Let known parameter and expected-result types guide
+7. **Contextual inference.** Let known parameter and expected-result types guide
    constructors and constrain call substitutions. Check all constraints for
    consistency and diagnose remaining ambiguity without a default type. Keep
    rigid declaration checking separate. Explicit call type arguments require a
    separate surface-language decision and are not implied by this plan.
+   Start with a declared `Choice[Int]` return constraining a call to
+   `empty[T]() -> Choice[T]`, then cover nested calls and conflicting argument
+   and result constraints. Introduce private fresh call variables and structural
+   unification here. Test rigid parameters, variable independence, substitution
+   chains, nominal mismatch, occurs checks and unresolved ambiguity directly.
 
-6. **Subsequent language features.** Add generic records alongside record support.
+8. **Subsequent language features.** Add generic records alongside record support.
    Establish ordinary recursion before recursion through generic instances that
    reuse a finite set of concrete keys. A recursion policy must distinguish that
    case from continually creating different instances; do not hide it behind an
@@ -120,6 +177,27 @@ Review emitted C for evaluation order, layout and cleanup. Keep evidence under
 ignored `build/generic-expansion/` and retain a concise results document for
 completed increments. Every increment receives code and test-runner review.
 
+Compiler-expert review examines the design before implementation and the full
+producer-to-consumer change afterward, including the adequacy of test oracles.
+Keep dependent increments sequential and validate each before building on it.
+The first checking/synthesis slice starts from `a121b61b7`; its immediate
+baseline must produce identical C for all 68 existing native fixtures. Target
+flat or reduced production line count; investigate growth above 80 production
+lines or repeatable per-workload allocation/instruction increases above 2%.
+These are investigation thresholds, not an efficiency budget. Retain matched
+immediate-baseline evidence alongside the cumulative baseline below, and set
+similarly explicit costs before each following implementation.
+
+The function-parameter increment uses the accepted checking/synthesis source
+as its immediate baseline. Freeze that source and toolchain before changing
+the cardinality. Investigate net production growth above 300 formatted lines
+or repeatable per-existing-workload allocation/instruction increases above 10%
+against this immediate baseline; the cumulative 25% threshold below still
+applies. Target flat or reduced production size through removal of unary
+carriers. Keep the same six comparison workloads and require identical C for
+all 68 preexisting valid fixtures. These investigation stops do not authorize
+raising fixture caps or adding special cases to hide a host-compiler cost.
+
 Freeze the accepted starting revision `da8fa4c71`, toolchain and unchanged
 workloads for baseline/candidate comparison. Change fixture ceilings only with
 retained measurements and an explicit explanation. The argument increment raises
@@ -135,7 +213,8 @@ proxies, not self-compilation results. Do not advance the baseline between steps
 
 - [x] Multiple runtime arguments, one type parameter.
 - [x] Typed checking errors and direct error-data/renderer tests (independent code and test reviews approved).
-- [ ] Multiple function type parameters.
+- [x] Explicit checking/synthesis boundary with preserved behavior (independent compiler and test reviews approved).
+- [x] Multiple function type parameters (independent compiler and test reviews approved).
 - [ ] Multiple union type parameters.
 - [ ] Written nested applications.
 - [ ] Unmanaged union payloads.

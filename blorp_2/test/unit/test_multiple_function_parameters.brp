@@ -1,0 +1,730 @@
+import:
+	../../src/check as Checked
+	../../src/lex: lex
+	../../src/specialize as Concrete
+	../../src/syntax: Diagnostic, Span
+	input: check_failure, parse, setup_diagnostic
+	test: TestSuite
+
+
+private CHOICE: String = "fixed union Choice:\n\tNumber(Int)\n"
+
+
+private pure func checked(source: String) -> Result[Checked.CheckedProgram, Diagnostic]:
+	tokens ?= lex(source)
+	parsed ?= parse(tokens)
+	Checked
+		.check(parsed)
+		.map_err(setup_diagnostic)
+
+
+pure func test_two_parameters_accept_independent_int_and_string_arguments() -> Bool:
+	checked(
+		"pure func second[A, B](first: A, second: B) -> B:\n\tsecond\nfunc main() -> Int:\n\tsecond(7, 42.to_string()).length()\n",
+	).is_ok()
+
+
+pure func test_generic_explicit_concrete_annotation_supplies_constructor_hint() -> Bool:
+	checked(
+		CHOICE + "pure func receiver[T](choice: Choice, value: T) -> T:\n\tvalue\nfunc main() -> Int:\n\treceiver(Number(8), 7)\n",
+	).is_ok()
+
+
+pure func test_generic_concrete_receiver_still_has_no_constructor_hint() -> Bool:
+	prefix = CHOICE + "pure func receiver[T](choice: Choice, value: T) -> T:\n\tvalue\nfunc main() -> Int:\n\t"
+
+	match check_failure(prefix + "Number(8).receiver(7)\n"):
+		Some(error):
+			match error.kind:
+				Checked.ConstructorNeedsExpectedType(_):
+					error.span.start == prefix.length() and error.span.end == prefix.length() + 6
+				_:
+					False
+		None:
+			False
+
+
+private MAIN: String = "func main() -> Int:\n\t0\n"
+
+private SECOND: String = "pure func second[A, B](first: A, second: B) -> B:\n\tsecond\n"
+
+
+private pure func parameter_is(id: Checked.TypeParameterId, owner: Int, position: Int) -> Bool:
+	match Checked.parameter_owner(id):
+		Checked.FunctionDeclaration(function):
+			(
+				Checked.function_number(function) == owner
+				and Checked.parameter_position(id) == position
+			)
+		_:
+			False
+
+
+private pure func arguments(value: Checked.CheckedValue) -> Option[List[Checked.TypeRef]]:
+	match value.base:
+		Checked.ReturnCall(call, _):
+			match call.target:
+				Checked.UserFunction(_, arguments):
+					Some(arguments)
+				_:
+					None
+		_:
+			None
+
+
+private pure func specialized(source: String) -> Result[Concrete.SpecializedProgram, Diagnostic]:
+	program ?= checked(source)
+	Concrete.specialize(program)
+
+
+pure func test_three_parameters_reach_concrete_signatures_and_bindings() -> Bool:
+	source = CHOICE + "pure func choice() -> Choice:\n\tNumber(7)\npure func third[A,B,C](first:A,second:B,third:C)->C:\n\tsaved = third\n\tsaved\nfunc main() -> Int:\n\tsaved = third(7, 8.to_string(), choice())\n\t0\n"
+
+	match checked(source):
+		Ok(program):
+			match Checked.checked_functions(program).functions:
+				[_, third, main]:
+					match third.signature.type_parameters:
+						[first, second, last]:
+							match main.assignments:
+								[Checked.InitializeBinding(_, value)]:
+									match arguments(value):
+										Some([Checked.IntType, Checked.StringType, Checked.UnionType(owner)]):
+											match Concrete.specialize(program):
+												Ok(concrete):
+													match Concrete.specialized_contents(
+														concrete,
+													).functions:
+														[choice, _, instance]:
+															match instance.signature.parameters:
+																[Concrete.IntType, Concrete.StringType, nominal]:
+																	match instance.bindings:
+																		[_, _, parameter, saved]:
+																			(
+																				parameter_is(
+																					first,
+																					1,
+																					0,
+																				)
+																				and parameter_is(
+																					second,
+																					1,
+																					1,
+																				)
+																				and parameter_is(
+																					last,
+																					1,
+																					2,
+																				)
+																				and not Checked.same_parameter(
+																					first,
+																					last,
+																				)
+																				and Checked.union_number(
+																					owner,
+																				) == 0
+																				and Concrete.same_type(
+																					nominal,
+																					choice.signature.return_type,
+																				)
+																				and Concrete.same_type(
+																					instance.signature.return_type,
+																					nominal,
+																				)
+																				and Concrete.same_type(
+																					parameter.value_type,
+																					nominal,
+																				)
+																				and Concrete.same_type(
+																					saved.value_type,
+																					nominal,
+																				)
+																			)
+																		_:
+																			False
+																_:
+																	False
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_unused_body_keeps_distinct_rigid_parameter_positions() -> Bool:
+	prefix = "pure func bad[A,B](first:A,second:B)->A:\n\t"
+
+	match check_failure(prefix + "second\n" + MAIN):
+		Some(error):
+			match error.kind:
+				Checked.ExpressionTypeMismatch(mismatch):
+					match mismatch.expected:
+						Checked.ParameterType(first):
+							match mismatch.actual.value_type:
+								Checked.ParameterType(second):
+									(
+										parameter_is(first, 0, 0)
+										and parameter_is(second, 0, 1)
+										and not Checked.same_parameter(first, second)
+										and error.span.start == prefix.length()
+										and error.span.end == prefix.length() + 6
+										and mismatch.actual.span == error.span
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_duplicate_parameters_are_owned_semantic_errors() -> Bool:
+	prefix = "pure func bad[A, B, "
+
+	match check_failure(prefix + "A](value:A)->A:\n\tvalue\n" + MAIN):
+		Some(error):
+			match error.kind:
+				Checked.DuplicateTypeParameter(current, previous, first):
+					(
+						parameter_is(current, 0, 2)
+						and parameter_is(previous, 0, 0)
+						and not Checked.same_parameter(current, previous)
+						and first.start == 14
+						and first.end == 15
+						and error.span.start == prefix.length()
+						and error.span.end == prefix.length() + 1
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_first_missing_parameter_precedes_an_ordinary_mismatch() -> Bool:
+	prefix = "pure func first[A,B,C](ordinary:Int,value:A)->A:\n\tvalue\nfunc main() -> Int:\n\t"
+
+	match check_failure(prefix + "first(8.to_string(), 7)\n"):
+		Some(error):
+			match error.kind:
+				Checked.UninferableTypeParameter(parameter):
+					(
+						parameter_is(parameter, 0, 1)
+						and error.span.start == prefix.length()
+						and error.span.end == prefix.length() + 5
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_expected_result_does_not_infer_missing_parameters() -> Bool:
+	prefix = "fixed union Phantom[T]:\n\tEmpty\npure func empty[A,B](value:A)->Phantom[B]:\n\tEmpty\npure func use()->Phantom[Int]:\n\t"
+
+	match check_failure(prefix + "empty(7)\n" + MAIN):
+		Some(error):
+			match error.kind:
+				Checked.UninferableTypeParameter(parameter):
+					(
+						parameter_is(parameter, 0, 1)
+						and error.span.start == prefix.length()
+						and error.span.end == prefix.length() + 5
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_runtime_order_selects_conflict_across_parameters() -> Bool:
+	prefix = "pure func first[A,B](a:A,b:B,again_b:B,again_a:A)->A:\n\ta\nfunc main() -> Int:\n\tfirst(7, "
+
+	match check_failure(prefix + "8.to_string(), 9, 10.to_string())\n"):
+		Some(error):
+			match error.kind:
+				Checked.GenericArgumentConflict(conflict):
+					(
+						parameter_is(conflict.parameter, 0, 1)
+						and conflict.mismatch.argument_position == 2
+						and Checked.same_type(conflict.previous.value_type, Checked.StringType)
+						and Checked.same_type(conflict.current.value_type, Checked.IntType)
+						and conflict.previous.span.start == prefix.length()
+						and conflict.previous.span.end == prefix.length() + 13
+						and error.span.start == prefix.length() + 15
+						and error.span.end == prefix.length() + 16
+						and conflict.current.span == error.span
+						and conflict.mismatch.actual.span == error.span
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_generic_conflict_precedes_earlier_ordinary_mismatch() -> Bool:
+	prefix = "pure func first[A,B](ordinary:Int,a:A,again:A,b:B)->A:\n\ta\nfunc main() -> Int:\n\tfirst(1.to_string(), 7, "
+
+	match check_failure(prefix + "8.to_string(), 9)\n"):
+		Some(error):
+			match error.kind:
+				Checked.GenericArgumentConflict(conflict):
+					(
+						parameter_is(conflict.parameter, 0, 0)
+						and conflict.mismatch.argument_position == 2
+						and Checked.same_type(conflict.previous.value_type, Checked.IntType)
+						and Checked.same_type(conflict.current.value_type, Checked.StringType)
+						and error.span.start == prefix.length()
+						and error.span.end == prefix.length() + 13
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_unknown_later_child_precedes_generic_conflict() -> Bool:
+	prefix = "pure func first[A,B](a:A,again:A,b:B)->A:\n\ta\nfunc main() -> Int:\n\tfirst(7, 8.to_string(), "
+
+	match check_failure(prefix + "missing)\n"):
+		Some(error):
+			match error.kind:
+				Checked.UnknownValue(_):
+					error.span.start == prefix.length() and error.span.end == prefix.length() + 7
+				_:
+					False
+		None:
+			False
+
+
+pure func test_structural_conflict_keeps_first_candidate_and_annotation_origin() -> Bool:
+	annotation_prefix = "fixed union Marker[T]:\n\tOnly\npure func integer()->Marker[Int]:\n\tOnly\npure func text()->Marker[String]:\n\tOnly\npure func first[A,B](a:Marker[A],b:B,agree:Marker[A],bad:"
+	declarations = annotation_prefix + "Marker[A])->B:\n\tb\nfunc main() -> Int:\n\tfirst("
+	prefix = declarations + "integer(), 7, integer(), "
+
+	match check_failure(prefix + "text())\n"):
+		Some(error):
+			match error.kind:
+				Checked.GenericArgumentConflict(conflict):
+					match conflict.mismatch.expected:
+						Checked.AppliedUnionType(expected_owner, Checked.IntType):
+							match conflict.mismatch.actual.value_type:
+								Checked.AppliedUnionType(actual_owner, Checked.StringType):
+									match conflict.mismatch.expected_site:
+										Checked.SourceAnnotation(annotation):
+											(
+												parameter_is(conflict.parameter, 2, 0)
+												and conflict.mismatch.argument_position == 3
+												and Checked.union_number(expected_owner) == 0
+												and Checked.union_number(actual_owner) == 0
+												and Checked.same_type(
+													conflict.previous.value_type,
+													Checked.IntType,
+												)
+												and Checked.same_type(
+													conflict.current.value_type,
+													Checked.StringType,
+												)
+												and conflict.previous.span.start == declarations.length()
+												and conflict.previous.span.end == declarations.length() + 9
+												and error.span.start == prefix.length()
+												and error.span.end == prefix.length() + 6
+												and conflict.current.span == error.span
+												and conflict.mismatch.actual.span == error.span
+												and annotation.end == annotation_prefix.length() + 9
+												and annotation.start == annotation_prefix.length()
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+private pure func forwards_to(function: Concrete.ConcreteFunction, expected: Int) -> Bool:
+	match function.body:
+		Concrete.ConcreteValueBody(value):
+			concrete_target(value) == Some(expected)
+		_:
+			False
+
+
+pure func test_forwarding_substitution_is_permuted_and_caller_owned() -> Bool:
+	source = SECOND + "pure func forward[Left,Right](left:Left,right:Right)->Left:\n\tsecond(right,left)\nfunc main() -> Int:\n\tforward(42.to_string(),7).length()\n"
+
+	match checked(source):
+		Ok(program):
+			match Checked.checked_functions(program).functions:
+				[second, forward, _]:
+					match forward.signature.type_parameters:
+						[left, right]:
+							match forward.body:
+								Checked.CheckedValueBody(value):
+									match arguments(value):
+										Some([Checked.ParameterType(first), Checked.ParameterType(last)]):
+											match Concrete.specialize(program):
+												Ok(concrete):
+													match Concrete.specialized_contents(
+														concrete,
+													).functions:
+														[_, concrete_forward, concrete_second]:
+															match concrete_forward.signature.parameters:
+																[Concrete.StringType, Concrete.IntType]:
+																	match concrete_second.signature.parameters:
+																		[Concrete.IntType, Concrete.StringType]:
+																			(
+																				parameter_is(
+																					first,
+																					1,
+																					1,
+																				)
+																				and parameter_is(
+																					last,
+																					1,
+																					0,
+																				)
+																				and Checked.same_parameter(
+																					first,
+																					right,
+																				)
+																				and Checked.same_parameter(
+																					last,
+																					left,
+																				)
+																				and forwards_to(
+																					concrete_forward,
+																					2,
+																				)
+																				and Concrete.same_type(
+																					concrete_second.signature.return_type,
+																					Concrete.StringType,
+																				)
+																				and Concrete.same_type(
+																					concrete_forward.signature.return_type,
+																					Concrete.StringType,
+																				)
+																			)
+																		_:
+																			False
+																_:
+																	False
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private pure func concrete_target(value: Concrete.ConcreteValue) -> Option[Int]:
+	match value.base:
+		Concrete.ReturnCall(call, _):
+			match call.target:
+				Concrete.UserFunction(id):
+					Some(Concrete.function_number(id))
+				_:
+					None
+		_:
+			None
+
+
+pure func test_unused_later_parameter_still_distinguishes_instance_keys() -> Bool:
+	match specialized(
+		"pure func first[A,B](a:A,b:B)->A:\n\ta\nfunc main() -> Int:\n\ta = first(7,8)\n\tb = first(7,8.to_string())\n\tc = first(9,10)\n\td = first(9,10.to_string())\n\t0\n",
+	):
+		Ok(program):
+			match Concrete.specialized_contents(program).functions:
+				[main, integer, text]:
+					match main.assignments:
+						[Concrete.InitializeBinding(_, a), Concrete.InitializeBinding(_, b), Concrete.InitializeBinding(_, c), Concrete.InitializeBinding(_, d)]:
+							match integer.signature.parameters:
+								[Concrete.IntType, Concrete.IntType]:
+									match text.signature.parameters:
+										[Concrete.IntType, Concrete.StringType]:
+											(
+												concrete_target(a) == Some(1)
+												and concrete_target(b) == Some(2)
+												and concrete_target(c) == Some(1)
+												and concrete_target(d) == Some(2)
+												and Concrete.same_type(
+													integer.signature.return_type,
+													Concrete.IntType,
+												)
+												and Concrete.same_type(
+													integer.signature.return_type,
+													text.signature.return_type,
+												)
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private pure func parser_rejects(
+	prefix: String,
+	marked: String,
+	suffix: String,
+	message: String,
+	help: String,
+) -> Bool:
+	match lex(prefix + marked + suffix).and_then(pure func(tokens): parse(tokens)):
+		Err(error):
+			(
+				error.span.start == prefix.length()
+				and error.span.end == prefix.length() + marked.length()
+				and error.message == message
+				and error.help == help
+			)
+		Ok(_):
+			False
+
+
+pure func test_malformed_parameter_lists_have_exact_parser_diagnostics() -> Bool:
+	name_help = "declare type parameters separated by commas, such as [A, B]"
+	close_help = "separate type parameters with commas and close the list with ']'"
+	(
+		parser_rejects(
+			"func f[",
+			"]",
+			"()->Int:\n\t0\n",
+			"expected a type parameter name",
+			name_help,
+		)
+		and parser_rejects(
+			"func f[A,",
+			"]",
+			"()->Int:\n\t0\n",
+			"expected a type parameter name",
+			name_help,
+		)
+		and parser_rejects(
+			"func f[A,",
+			",",
+			"B]()->Int:\n\t0\n",
+			"expected a type parameter name",
+			name_help,
+		)
+		and parser_rejects(
+			"func f[A ",
+			"B",
+			"]()->Int:\n\t0\n",
+			"expected ',' or ']' after a type parameter",
+			close_help,
+		)
+		and parser_rejects(
+			"func f[A",
+			"",
+			"",
+			"expected ',' or ']' after a type parameter",
+			close_help,
+		)
+	)
+
+
+pure func test_union_parameter_arity_stays_unary() -> Bool:
+	parser_rejects(
+		"fixed union Pair[A,",
+		"B",
+		"]:\n\tOnly\n",
+		"fixed unions support one type parameter",
+		(
+			"declare one type parameter, such as [T]; multiple union parameters are not "
+			+ "supported yet"
+		),
+	)
+
+
+pure func test_ordered_calls_and_instances_preserve_int_string_permutation() -> Bool:
+	match checked(
+		SECOND + "func main() -> Int:\n\tfirst = second(7,8.to_string())\n\tsecond = 8.to_string().second(7)\n\tsecond\n",
+	):
+		Ok(program):
+			match Checked.checked_functions(program).functions:
+				[_, main]:
+					match main.assignments:
+						[Checked.InitializeBinding(_, first), Checked.InitializeBinding(_, second)]:
+							match (arguments(first), second.operations):
+								(Some([Checked.IntType, Checked.StringType]), [_, step]):
+									match step.operation:
+										Checked.InvokeFunction(call, _):
+											match call.target:
+												Checked.UserFunction(_, [Checked.StringType, Checked.IntType]):
+													match Concrete.specialize(program):
+														Ok(concrete):
+															match Concrete.specialized_contents(
+																concrete,
+															).functions:
+																[_, first, second]:
+																	(
+																		Concrete.same_type(
+																			first.signature.return_type,
+																			Concrete.StringType,
+																		)
+																		and Concrete.same_type(
+																			second.signature.return_type,
+																			Concrete.IntType,
+																		)
+																	)
+																_:
+																	False
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_duplicate_renderer_uses_typed_error_without_rechecking() -> Bool:
+	match lex(SECOND + MAIN).and_then(pure func(tokens): parse(tokens)):
+		Ok(parsed):
+			match Checked.check(parsed):
+				Ok(program):
+					match Checked.checked_functions(program).functions:
+						[function, _]:
+							match function.signature.type_parameters:
+								[first, second]:
+									primary: Span = {
+										start = 26,
+										end = 27
+									}
+									error: Checked.CheckError = {
+										span = primary,
+										kind = Checked.DuplicateTypeParameter(
+											second,
+											first,
+											{
+												start = 23,
+												end = 24
+											},
+										)
+									}
+									rendered = Checked.render_check_error(parsed, error)
+									(
+										rendered.span == primary
+										and not rendered.note.is_some()
+										and rendered.message == "duplicate type parameter name"
+										and rendered.help == "choose a distinct name for each type parameter, such as A and B"
+									)
+								_:
+									False
+						_:
+							False
+				Err(_):
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Multiple function type parameters",
+	tests = [
+		(
+			"two parameters accept independent int and string arguments",
+			test_two_parameters_accept_independent_int_and_string_arguments,
+		),
+		(
+			"generic explicit concrete annotation supplies constructor hint",
+			test_generic_explicit_concrete_annotation_supplies_constructor_hint,
+		),
+		(
+			"generic concrete receiver still has no constructor hint",
+			test_generic_concrete_receiver_still_has_no_constructor_hint,
+		),
+		(
+			"three parameters reach concrete signatures and bindings",
+			test_three_parameters_reach_concrete_signatures_and_bindings,
+		),
+		(
+			"unused body keeps distinct rigid parameter positions",
+			test_unused_body_keeps_distinct_rigid_parameter_positions,
+		),
+		(
+			"duplicate parameters are owned semantic errors",
+			test_duplicate_parameters_are_owned_semantic_errors,
+		),
+		(
+			"first missing parameter precedes an ordinary mismatch",
+			test_first_missing_parameter_precedes_an_ordinary_mismatch,
+		),
+		(
+			"expected result does not infer missing parameters",
+			test_expected_result_does_not_infer_missing_parameters,
+		),
+		(
+			"runtime order selects conflict across parameters",
+			test_runtime_order_selects_conflict_across_parameters,
+		),
+		(
+			"generic conflict precedes earlier ordinary mismatch",
+			test_generic_conflict_precedes_earlier_ordinary_mismatch,
+		),
+		(
+			"unknown later child precedes generic conflict",
+			test_unknown_later_child_precedes_generic_conflict,
+		),
+		(
+			"structural conflict keeps first candidate and annotation origin",
+			test_structural_conflict_keeps_first_candidate_and_annotation_origin,
+		),
+		(
+			"forwarding substitution is permuted and caller owned",
+			test_forwarding_substitution_is_permuted_and_caller_owned,
+		),
+		(
+			"unused later parameter still distinguishes instance keys",
+			test_unused_later_parameter_still_distinguishes_instance_keys,
+		),
+		(
+			"malformed parameter lists have exact parser diagnostics",
+			test_malformed_parameter_lists_have_exact_parser_diagnostics,
+		),
+		("union parameter arity stays unary", test_union_parameter_arity_stays_unary),
+		(
+			"ordered calls and instances preserve int string permutation",
+			test_ordered_calls_and_instances_preserve_int_string_permutation,
+		),
+		(
+			"duplicate renderer uses typed error without rechecking",
+			test_duplicate_renderer_uses_typed_error_without_rechecking,
+		),
+	]
+}
