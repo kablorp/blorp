@@ -893,6 +893,8 @@ end-to-end cost. Self-compilation is a later milestone.
 
 [MEMORY_PLAN.md](MEMORY_PLAN.md) records the managed String slice and proposed
 later memory responsibilities, including the limits of current verification.
+The next [fixed-record increment](RECORDS_PLAN.md) specifies unmanaged `Int`
+fields, construction and field reads; it is not implemented yet.
 
 Compiler source under `src/` stays within the agreed eventual subset: `String`, `Int`
 (64-bit), `Float` (64-bit), `Bool`, `Void`, `List`, `Option`, `Result`, `Dict`,
