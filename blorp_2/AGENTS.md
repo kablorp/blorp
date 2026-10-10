@@ -140,9 +140,12 @@ Apply these lessons to every increment:
     worktree's provenance explicit. Serialize measurements on the shared
     machine and assess both the targeted boundary and whole compilation.
     Record source, binary, flags, inputs, raw samples, and output identity.
-    Extend repository-owned
-    validation with explicit fingerprints, component results, and reuse
-    rules instead of building bespoke controllers or publication machinery.
+    Use `scripts/record-validation` for validation commands and one clearly
+    named local results entrypoint linking source snapshots, binaries, raw
+    samples and recorder packets by purpose. Summarize results and limitations
+    in a retained report. Reuse an artifact only after checking its inputs and
+    toolchain; rerun matched measurements together. Avoid overlapping manifests
+    and bespoke controllers or publication machinery.
     Run cheap publication checks early when publication is in scope.
 
 ## Keep the pipeline pure

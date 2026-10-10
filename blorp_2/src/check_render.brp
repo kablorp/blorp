@@ -1,0 +1,610 @@
+import:
+	./prelude: prelude_names
+	check as Check
+	int as IntOps
+	names: NameId, NameTable, name_spelling
+	option: to_result
+	parse: ParsedContents, ParsedProgram, parsed_contents
+	syntax: CallNotation(DirectCall, ReceiverCall), Diagnostic, Diagnostics, Span
+	text as Text
+
+
+pure func render_failure(failure: Check.CheckFailure) -> Diagnostics:
+	render_check_errors(
+		Check.failure_program(failure),
+		Check.check_errors(failure),
+	)
+
+
+pure func render_check_errors(program: ParsedProgram, errors: Check.CheckErrors) -> Diagnostics:
+	var remaining: List[Diagnostic] = []
+
+	for error in errors.remaining:
+		remaining = remaining.append(render_check_error(program, error))
+
+	{
+		first = render_check_error(program, errors.first),
+		remaining = remaining
+	}
+
+
+private pure func invariant_message(invariant: Check.CheckerInvariant) -> String:
+	match invariant:
+		Check.InvalidResolvedFunction(_):
+			"invalid resolved function identity"
+		Check.InvalidUnionDeclaration(_):
+			"invalid union declaration"
+		Check.VariantOccurrenceWithoutUnion(_):
+			"variant occurrence has no union type"
+		Check.InvalidResolvedUnion(_):
+			"invalid resolved union identity"
+		Check.InvalidCheckedUnion(_):
+			"invalid checked union identity"
+		Check.InvalidResolvedVariant(_):
+			"invalid resolved variant identity"
+		Check.InvalidParameterDeclaration(_):
+			"invalid parameter declaration"
+		Check.InvalidParameterName(_):
+			"invalid parameter name"
+		Check.ParameterOwnerWithoutParameter(_):
+			"parameter owner has no parameter"
+		Check.InvalidParsedName(_):
+			"invalid parsed name identity"
+		Check.DirectCallInSimpleBase(_):
+			"call reached simple base checking"
+		Check.MissingCallParameter(_):
+			"missing call parameter"
+		Check.ConstructorReceiver(_):
+			"constructor receiver passed resolution"
+		Check.MissingConstructorArgument(_):
+			"missing constructor argument"
+		Check.InvalidFunctionContract:
+			"invalid function contract"
+		Check.MissingReceiverContract(_):
+			"missing receiver contract"
+		Check.MissingGenericParameter(_):
+			"missing generic parameter"
+		Check.RuntimeGenericContract:
+			"runtime call has a type parameter"
+		Check.GenericConstructorContract:
+			"generic constructor contract"
+		Check.InvalidResolvedParameter(_):
+			"invalid resolved parameter"
+		Check.InvalidReceiverContract:
+			"invalid receiver contract"
+		Check.InvalidCallName(_):
+			"invalid call name identity"
+
+
+private pure func rendered(span: Span, message: String, help: String) -> Diagnostic:
+	{
+		span = span,
+		note = None,
+		message = message,
+		help = help
+	}
+
+
+private pure func render_fault(span: Span, invariant: Check.CheckerInvariant) -> Diagnostic:
+	rendered(
+		span,
+		invariant_message(invariant),
+		"report this compiler error with the input program",
+	)
+
+
+private pure func parsed_spelling(
+	name: NameId,
+	names: NameTable,
+	span: Span,
+) -> Result[String, Diagnostic]:
+	name_spelling(names, name).to_result(render_fault(span, Check.InvalidParsedName(name)))
+
+
+pure func render_check_error(program: ParsedProgram, error: Check.CheckError) -> Diagnostic:
+	context = parsed_contents(program)
+
+	match error.kind:
+		Check.DuplicateVariant(_, _):
+			rendered(
+				error.span,
+				"duplicate variant name",
+				"give each variant in a union a distinct name",
+			)
+		Check.VariantFunctionConflict(_, _, _):
+			rendered(
+				error.span,
+				"variant name conflicts with a function",
+				"give functions and union variants distinct names",
+			)
+		Check.DuplicateUnion(_, _):
+			rendered(
+				error.span,
+				"duplicate union type name",
+				"give union types distinct names; Int and String are declared by the prelude",
+			)
+		Check.DuplicateTypeParameter(_, _, _):
+			rendered(
+				error.span,
+				"duplicate type parameter name",
+				"choose a distinct name for each type parameter, such as A and B",
+			)
+		Check.TypeParameterTypeNameConflict(_):
+			rendered(
+				error.span,
+				"type parameter conflicts with a type name",
+				"choose a distinct type parameter name, such as T",
+			)
+		Check.GenericMain(_):
+			rendered(
+				error.span,
+				"main cannot be generic",
+				"declare main() -> Int: without type parameters",
+			)
+		Check.MissingUnionTypeArguments(_, count):
+			if IntOps.equals(count, 1):
+				rendered(
+					error.span,
+					"generic union requires one type argument",
+					"write a concrete or symbolic application, such as Box[Int] or Box[T]",
+				)
+			else:
+				rendered(
+					error.span,
+					"generic union requires type arguments",
+					"write "
+						.concat(IntOps.to_string(count))
+						.concat(" atomic type arguments in declaration order"),
+				)
+		Check.UnionTypeArgumentCountMismatch(_, expected, actual):
+			rendered(
+				error.span,
+				"union type argument count does not match its declaration",
+				"expected "
+					.concat(IntOps.to_string(expected))
+					.concat(" type arguments, got ")
+					.concat(IntOps.to_string(actual))
+					.concat("; supply atomic types in declaration order"),
+			)
+		Check.UnknownType(_):
+			rendered(
+				error.span,
+				"unknown type",
+				"use Int, String, a declared type parameter, or a fixed union declared in this ".concat(
+					"file",
+				),
+			)
+		Check.NonApplicableType(_):
+			rendered(
+				error.span,
+				"type does not accept a type argument",
+				"apply a declared generic union, such as Box[Int]",
+			)
+		Check.OrdinaryUnionApplied(_):
+			rendered(
+				error.span,
+				"ordinary union does not accept a type argument",
+				"remove the type argument from this union type",
+			)
+		Check.MainHasParameters(_):
+			rendered(
+				error.span,
+				"main cannot have a parameter",
+				"declare main() -> Int: with no parameters",
+			)
+		Check.DuplicateParameter(_, _):
+			rendered(error.span, "duplicate parameter name", "give each parameter a distinct name")
+		Check.MainReturnType(_):
+			rendered(error.span, "main must return Int", "declare main() -> Int: as the entrypoint")
+		Check.DuplicateFunction(_, _):
+			rendered(error.span, "duplicate function name", "give every function a distinct name")
+		Check.MissingMain:
+			rendered(
+				error.span,
+				"expected a main function",
+				"declare func main() -> Int: as the entrypoint",
+			)
+		Check.ImpureCall(_, _):
+			rendered(
+				error.span,
+				"pure functions cannot call impure functions",
+				"mark the callee pure or remove pure from the caller",
+			)
+		Check.ConstructorNeedsExpectedType(_):
+			rendered(
+				error.span,
+				"constructor needs an expected union type",
+				"pass an already-typed union value or call a concrete helper returning the union",
+			)
+		Check.PayloadFreeVariantCalled(_):
+			rendered(
+				error.span,
+				"payload-free variants cannot be called",
+				"use the bare variant name without parentheses",
+			)
+		Check.UnknownValue(_):
+			rendered(
+				error.span,
+				"unknown value",
+				"use this function's parameter name, a declared variant, or a call",
+			)
+		Check.ConstructorPayloadArity(_, _):
+			rendered(
+				error.span,
+				"constructor requires one payload argument",
+				"pass exactly one expression of the declared payload type",
+			)
+		Check.PatternUnexpectedField(_):
+			rendered(
+				error.span,
+				"constructor pattern takes no fields",
+				"use the bare variant name or Variant() without field patterns",
+			)
+		Check.UnknownConstructorPattern(_, _):
+			rendered(
+				error.span,
+				"unknown constructor pattern",
+				"use an unshadowed variant of the matched union; rename a shadowing local binding",
+			)
+		Check.UnreachableArm:
+			rendered(
+				error.span,
+				"match arm is unreachable",
+				"remove this arm; earlier arms already cover all values it could match",
+			)
+		Check.MatchRequiresUnion(_):
+			rendered(
+				error.span,
+				"match requires a union value",
+				"match a typed union parameter or a call returning a declared union",
+			)
+		Check.DuplicateLocal(_):
+			rendered(
+				error.span,
+				"duplicate local binding",
+				Text.concat(
+					"give each body-local declaration a distinct name; ",
+					"omit var to reassign a mutable binding",
+				),
+			)
+		Check.ImmutableAssignment(_):
+			rendered(
+				error.span,
+				"cannot assign to an immutable binding",
+				"declare the binding with var to allow reassignment",
+			)
+		Check.RecursiveCallChain:
+			rendered(
+				error.span,
+				"call chain contains recursion",
+				"use an acyclic call chain; recursion is not supported in this increment",
+			)
+		Check.FunctionPreludeConflict(_):
+			rendered(
+				error.span,
+				"function name conflicts with the prelude",
+				"rename this function or change the explicit prelude declaration",
+			)
+		Check.VariantPreludeConflict(_):
+			rendered(
+				error.span,
+				"variant name conflicts with a prelude function",
+				"give functions and union variants distinct names",
+			)
+		Check.ConstructorUFCS(_):
+			rendered(
+				error.span,
+				"constructors do not support UFCS in this increment",
+				"write the constructor directly, such as Number(value)",
+			)
+		Check.UnknownFunction(_):
+			rendered(
+				error.span,
+				"unknown function",
+				"declare the called function in this file or the explicit prelude",
+			)
+		Check.ArgumentTypeMismatch(mismatch):
+			type_diagnostic(
+				error.span,
+				"argument type does not match the parameter type",
+				mismatch.expected,
+				context,
+			)
+		Check.GenericArgumentConflict(conflict):
+			type_diagnostic(
+				error.span,
+				"argument type does not match the parameter type",
+				conflict.mismatch.expected,
+				context,
+			)
+		Check.ExpressionTypeMismatch(mismatch):
+			type_diagnostic(
+				error.span,
+				"expression does not match the expected type",
+				mismatch.expected,
+				context,
+			)
+		Check.VariantNotInExpectedType(_, expected):
+			type_diagnostic(
+				error.span,
+				"variant does not belong to the expected type",
+				expected,
+				context,
+			)
+		Check.UnsupportedPayloadAnnotation(_, rule):
+			match rule:
+				Check.IntegerPayload:
+					rendered(
+						error.span,
+						"only Int payloads are supported",
+						"declare a variant with no fields or one Int field, written Variant(Int)",
+					)
+				Check.IntegerOrParameterPayload:
+					rendered(
+						error.span,
+						"only Int or the union's type parameter may be payloads",
+						(
+							"declare no field, one Int field, or one field using this union's declared type "
+							+ "parameter"
+						),
+					)
+		Check.UncallableBinding(_, origin, value_type):
+			match origin:
+				Check.ParameterBinding(_):
+					message = if Check.same_type(value_type, Check.IntType):
+						"Int parameters cannot be called"
+					else:
+						"parameters cannot be called"
+
+					rendered(
+						error.span,
+						message,
+						"use the parameter as a value, or rename it to call the function",
+					)
+				Check.MatchCapture:
+					rendered(
+						error.span,
+						"match bindings cannot be called",
+						"use the binding as a value, or rename it to call the function",
+					)
+				Check.BodyLocal:
+					rendered(
+						error.span,
+						"local bindings cannot be called",
+						"use the binding as a value, or rename it to call the function",
+					)
+		Check.ArgumentCountMismatch(arity):
+			if IntOps.equals(arity.expected, 0):
+				match arity.notation:
+					DirectCall:
+						rendered(
+							error.span,
+							"function takes no arguments",
+							"remove the argument and call the function with ()",
+						)
+					ReceiverCall:
+						match name_spelling(context.names, arity.callee):
+							Some(name):
+								rendered(
+									error.span,
+									"function takes no arguments",
+									Text
+										.concat("call ", name)
+										.concat(
+											"() directly, or choose a function with one parameter",
+										),
+								)
+							None:
+								render_fault(
+									error.span,
+									Check.InvalidCallName(arity.callee),
+								)
+			else if IntOps.equals(arity.expected, 1):
+				rendered(
+					error.span,
+					"function requires one argument",
+					"pass one expression of the declared parameter type",
+				)
+			else:
+				rendered(
+					error.span,
+					"argument count does not match the function parameters",
+					(
+						"pass one expression for each declared parameter; UFCS supplies the receiver "
+						+ "first"
+					),
+				)
+		Check.MissingConstructorPayload(_, payload):
+			if Check.same_type(payload, Check.IntType):
+				rendered(
+					error.span,
+					"constructor requires one Int argument",
+					"pass one Int expression, such as Number(42)",
+				)
+			else:
+				rendered(
+					error.span,
+					"constructor requires one payload argument",
+					"pass a value of the constructor's declared payload type",
+				)
+		Check.PatternMissingField(_, payload):
+			help = if Check.same_type(payload, Check.IntType):
+				"write Variant(name) to bind the Int field, or Variant(_) to ignore it"
+			else:
+				"write Variant(name) to bind the payload, or Variant(_) to ignore it"
+
+			rendered(error.span, "constructor pattern requires one field", help)
+		Check.UninferableTypeParameter(_):
+			rendered(
+				error.span,
+				"cannot infer the type parameter from the argument",
+				(
+					"pass a value whose type determines the declared type parameter; use a concrete "
+					+ "helper when no argument can determine it"
+				),
+			)
+		Check.NonExhaustiveMatch(missing):
+			missing_coverage(missing, error.span, context)
+		Check.InternalInvariant(invariant):
+			render_fault(error.span, invariant)
+
+
+private pure func parameter_spelling(
+	id: Check.TypeParameterId,
+	context: ParsedContents,
+	span: Span,
+) -> Result[String, Diagnostic]:
+	parameters = match Check.parameter_owner(id):
+		Check.FunctionDeclaration(owner):
+			context.functions
+				.get(Check.function_number(owner))
+				.map(pure func(declaration): declaration.type_parameters)
+		Check.UnionDeclaration(owner):
+			context.unions
+				.get(Check.union_number(owner))
+				.map(pure func(declaration): declaration.type_parameters)
+
+	written ?= match parameters:
+		Some(parameters):
+			match parameters.get(Check.parameter_position(id)):
+				Some(written):
+					Ok(written)
+				None:
+					Err(render_fault(span, Check.ParameterOwnerWithoutParameter(id)))
+		None:
+			Err(render_fault(span, Check.InvalidParameterDeclaration(id)))
+
+	match name_spelling(context.names, written.id):
+		Some(spelling):
+			Ok(spelling)
+		None:
+			Err(render_fault(span, Check.InvalidParameterName(id)))
+
+
+private pure func type_spelling(
+	value: Check.TypeRef,
+	context: ParsedContents,
+	span: Span,
+) -> Result[String, Diagnostic]:
+	match value:
+		Check.IntType:
+			parsed_spelling(prelude_names(context.prelude).special.integer, context.names, span)
+		Check.StringType:
+			parsed_spelling(prelude_names(context.prelude).special.string, context.names, span)
+		Check.ParameterType(id):
+			parameter_spelling(id, context, span)
+		Check.UnionType(id):
+			declaration ?= context.unions
+				.get(Check.union_number(id))
+				.to_result(render_fault(span, Check.InvalidResolvedUnion(id)))
+			parsed_spelling(declaration.type_name.id, context.names, span)
+		Check.AppliedUnionType(id, arguments):
+			name ?= type_spelling(
+				Check.UnionType(id),
+				context,
+				span,
+			)
+			var spelling = name.concat("[")
+			var failure: Option[Diagnostic] = None
+			var position: Int = 0
+
+			for argument in arguments:
+				match type_spelling(argument, context, span):
+					Ok(value):
+						if not IntOps.equals(position, 0):
+							spelling = spelling.concat(", ")
+
+						spelling = spelling.concat(value)
+					Err(error):
+						failure = Some(error)
+						break
+
+				position = IntOps.add(position, 1)
+
+			match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(spelling.concat("]"))
+
+
+private pure func missing_variant_name(
+	id: Check.VariantId,
+	span: Span,
+	context: ParsedContents,
+) -> Result[String, Diagnostic]:
+	declaration ?= context.unions
+		.get(Check.union_number(Check.variant_owner(id)))
+		.to_result(render_fault(span, Check.InvalidResolvedUnion(Check.variant_owner(id))))
+	variant ?= declaration.variants
+		.get(Check.variant_number(id))
+		.to_result(render_fault(span, Check.InvalidResolvedVariant(id)))
+	name ?= parsed_spelling(variant.name.id, context.names, span)
+
+	match variant.payload:
+		None:
+			Ok(name)
+		Some(_):
+			Ok(name.concat("(_)"))
+
+
+private pure func missing_coverage(
+	remaining: List[Check.VariantId],
+	span: Span,
+	context: ParsedContents,
+) -> Diagnostic:
+	var names: String = ""
+	var failure: Option[Diagnostic] = None
+
+	for id in remaining:
+		match missing_variant_name(id, span, context):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(name):
+				if not IntOps.equals(names.length(), 0):
+					names = names.concat(", ")
+
+				names = names.concat(name)
+
+	match failure:
+		Some(error):
+			error
+		None:
+			prefix = if IntOps.equals(remaining.length(), 1):
+				"add an arm for the missing variant: "
+			else:
+				"add arms for the missing variants: "
+
+			rendered(
+				span,
+				"non-exhaustive match",
+				Text.concat(prefix, names),
+			)
+
+
+private pure func type_diagnostic(
+	span: Span,
+	message: String,
+	expected_type: Check.TypeRef,
+	context: ParsedContents,
+) -> Diagnostic:
+	match expected_type:
+		Check.ParameterType(_):
+			rendered(
+				span,
+				message,
+				"use a value already typed as this declaration's type parameter",
+			)
+		_:
+			match type_spelling(expected_type, context, span):
+				Err(error):
+					error
+				Ok(spelling):
+					rendered(
+						span,
+						message,
+						"use an expression of type "
+							.concat(spelling)
+							.concat(" here"),
+					)

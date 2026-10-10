@@ -1,0 +1,297 @@
+import:
+	../../src/check as Checker
+	../../src/lex: lex
+	../../src/text: concat
+	input: check_failure, parse
+	int as IntOps
+	test: TestSuite
+
+
+private pure func wide_source(width: Int, distinct: Bool) -> String:
+	var names: String = ""
+	var expected: String = ""
+	var actual: String = ""
+	var integer: Bool = True
+
+	for position in 0..width:
+		separator = if IntOps.equals(position, 0):
+			""
+		else:
+			","
+
+		names = names
+			.concat(separator)
+			.concat("P")
+			.concat(IntOps.to_string(position))
+		expected = expected
+			.concat(separator)
+			.concat("T")
+
+		if distinct:
+			expected = expected.concat(IntOps.to_string(position))
+
+		value = if integer or not distinct:
+			"Int"
+		else:
+			"String"
+
+		actual = actual
+			.concat(separator)
+			.concat(value)
+		integer = not integer
+
+	parameters = if distinct:
+		expected
+	else:
+		"T"
+
+	"fixed union Wide["
+		.concat(names)
+		.concat("]:\n\tOnly\npure func consume[")
+		.concat(parameters)
+		.concat("](value:Wide[")
+		.concat(expected)
+		.concat("])->Int:\n\t0\npure func producer()->Wide[")
+		.concat(actual)
+		.concat("]:\n\tOnly\nfunc main()->Int:\n\tconsume(producer())\n")
+
+
+private pure func inferred_arguments(source: String) -> Option[List[Checker.TypeRef]]:
+	match lex(source).and_then(pure func(tokens): parse(tokens)):
+		Err(_):
+			None
+		Ok(parsed):
+			match Checker.check(parsed):
+				Err(_):
+					None
+				Ok(program):
+					match Checker.checked_functions(program).functions:
+						[_, _, main]:
+							match main.body:
+								Checker.CheckedValueBody(value):
+									match value.base:
+										Checker.ReturnCall(call, _):
+											match call.target:
+												Checker.UserFunction(id, arguments):
+													if IntOps.equals(
+														Checker.function_number(id),
+														0,
+													):
+														Some(arguments)
+													else:
+														None
+												_:
+													None
+										_:
+											None
+								_:
+									None
+						_:
+							None
+
+
+private pure func repeated_width(width: Int) -> Bool:
+	match inferred_arguments(wide_source(width, False)):
+		Some([Checker.IntType]):
+			True
+		_:
+			False
+
+
+pure func test_sixteen_structural_constraints_infer_one_complete_argument() -> Bool:
+	repeated_width(16)
+
+
+pure func test_sixty_four_structural_constraints_infer_one_complete_argument() -> Bool:
+	repeated_width(64)
+
+
+pure func test_two_hundred_fifty_six_constraints_infer_one_complete_argument() -> Bool:
+	repeated_width(256)
+
+
+pure func test_distinct_slots_keep_ordered_mixed_arguments() -> Bool:
+	match inferred_arguments(wide_source(16, True)):
+		Some(arguments):
+			var integer: Bool = True
+			var correct = IntOps.equals(arguments.length(), 16)
+
+			for argument in arguments:
+				expected = if integer:
+					Checker.IntType
+				else:
+					Checker.StringType
+
+				correct = correct and Checker.same_type(argument, expected)
+				integer = not integer
+
+			correct
+		None:
+			False
+
+
+private pure func owned_parameter(parameter: Checker.TypeParameterId, position: Int) -> Bool:
+	match Checker.parameter_owner(parameter):
+		Checker.FunctionDeclaration(owner):
+			IntOps.equals(
+				Checker.function_number(owner),
+				0,
+			) and IntOps.equals(
+				Checker.parameter_position(parameter),
+				position,
+			)
+		_:
+			False
+
+
+pure func test_nominal_mismatch_does_not_constrain_its_children() -> Bool:
+	prefix = "fixed union Pair[A,B]:\n\tOnly\nfixed union Other[A,B]:\n\tOnlyOther\npure func take[T](value:Pair[T,T],last:T)->T:\n\tlast\npure func producer()->Other[Int,String]:\n\tOnlyOther\nfunc main()->Int:\n\ttake("
+
+	match check_failure(prefix.concat("producer(),7)\n")):
+		Some(error):
+			match error.kind:
+				Checker.ArgumentTypeMismatch(mismatch):
+					match (mismatch.expected, mismatch.actual.value_type):
+						(Checker.AppliedUnionType(expected_owner, [Checker.IntType, Checker.IntType]), Checker.AppliedUnionType(actual_owner, [Checker.IntType, Checker.StringType])):
+							(
+								Checker.union_number(expected_owner) == 0
+								and Checker.union_number(actual_owner) == 1
+								and mismatch.argument_position == 0
+								and mismatch.actual.span.start == prefix.length()
+							)
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_first_origin_and_unseen_rigid_snapshot_survive_an_agreeing_child() -> Bool:
+	declarations = "fixed union Tri[X,Y,Z]:\n\tOnly\npure func take[A,B](ordinary:Int,seed:A,value:"
+	annotation = "Tri[A,A,B]"
+	prefix = declarations
+		.concat(annotation)
+		.concat(
+			")->Int:\n\t0\npure func producer()->Tri[Int,String,Int]:\n\tOnly\nfunc main()->Int:\n\ttake(7.to_string(),",
+		)
+	actual_start = IntOps.add(prefix.length(), 2)
+
+	match check_failure(prefix.concat("7,producer())\n")):
+		Some(error):
+			match error.kind:
+				Checker.GenericArgumentConflict(conflict):
+					match (
+						conflict.mismatch.expected,
+						conflict.mismatch.actual.value_type,
+						conflict.mismatch.expected_site,
+					):
+						(Checker.AppliedUnionType(expected_owner, [Checker.IntType, Checker.IntType, Checker.ParameterType(unseen)]), Checker.AppliedUnionType(actual_owner, [Checker.IntType, Checker.StringType, Checker.IntType]), Checker.SourceAnnotation(site)):
+							(
+								owned_parameter(conflict.parameter, 0)
+								and owned_parameter(unseen, 1)
+								and Checker.union_number(expected_owner) == 0
+								and Checker.union_number(actual_owner) == 0
+								and Checker.same_type(conflict.previous.value_type, Checker.IntType)
+								and Checker.same_type(
+									conflict.current.value_type,
+									Checker.StringType,
+								)
+								and conflict.previous.span.start == prefix.length()
+								and conflict.previous.span.end == IntOps.add(prefix.length(), 1)
+								and conflict.current.span.start == actual_start
+								and conflict.current.span.end == IntOps.add(actual_start, 10)
+								and conflict.mismatch.actual.span.start == actual_start
+								and conflict.mismatch.actual.span.end == IntOps.add(
+									actual_start,
+									10,
+								)
+								and error.span.start == actual_start
+								and error.span.end == IntOps.add(actual_start, 10)
+								and conflict.mismatch.argument_position == 2
+								and site.start == declarations.length()
+								and site.end == IntOps.add(
+									declarations.length(),
+									annotation.length(),
+								)
+							)
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_later_child_error_still_precedes_a_structural_conflict() -> Bool:
+	prefix = "fixed union Pair[X,Y]:\n\tOnly\npure func take[A](value:Pair[A,A],last:Int)->Int:\n\t0\npure func producer()->Pair[Int,String]:\n\tOnly\nfunc main()->Int:\n\ttake(producer(),"
+
+	match check_failure(prefix.concat("missing)\n")):
+		Some(error):
+			match error.kind:
+				Checker.UnknownValue(_):
+					(
+						error.span.start == prefix.length()
+						and error.span.end == IntOps.add(prefix.length(), 7)
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_missing_slot_still_precedes_an_ordinary_mismatch() -> Bool:
+	declarations = "fixed union Pair[X,Y]:\n\tOnly\npure func take[A,B](value:Pair[A,A],last:Int)->Int:\n\t0\npure func producer()->Pair[Int,Int]:\n\tOnly\nfunc main()->Int:\n\t"
+
+	match check_failure(declarations.concat("take(producer(),7.to_string())\n")):
+		Some(error):
+			match error.kind:
+				Checker.UninferableTypeParameter(parameter):
+					(
+						owned_parameter(parameter, 1)
+						and error.span.start == declarations.length()
+						and error.span.end == IntOps.add(declarations.length(), 4)
+					)
+				_:
+					False
+		None:
+			False
+
+
+tests: TestSuite = {
+	description = "Inference collection contracts",
+	tests = [
+		(
+			"sixteen structural constraints infer one complete argument",
+			test_sixteen_structural_constraints_infer_one_complete_argument,
+		),
+		(
+			"sixty four structural constraints infer one complete argument",
+			test_sixty_four_structural_constraints_infer_one_complete_argument,
+		),
+		(
+			"two hundred fifty six constraints infer one complete argument",
+			test_two_hundred_fifty_six_constraints_infer_one_complete_argument,
+		),
+		(
+			"distinct slots keep ordered mixed arguments",
+			test_distinct_slots_keep_ordered_mixed_arguments,
+		),
+		(
+			"nominal mismatch does not constrain its children",
+			test_nominal_mismatch_does_not_constrain_its_children,
+		),
+		(
+			"first origin and unseen rigid snapshot survive an agreeing child",
+			test_first_origin_and_unseen_rigid_snapshot_survive_an_agreeing_child,
+		),
+		(
+			"later child error still precedes a structural conflict",
+			test_later_child_error_still_precedes_a_structural_conflict,
+		),
+		(
+			"missing slot still precedes an ordinary mismatch",
+			test_missing_slot_still_precedes_an_ordinary_mismatch,
+		),
+	]
+}

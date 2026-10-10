@@ -755,8 +755,10 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    `CheckErrors` collection. The current checker stops at the first error, so
    that collection is a singleton. Failures contain closed semantic variants,
    types, owner-qualified identities, argument positions and source occurrences;
-   temporary builders do not escape. `render_failure` separately produces every
-   diagnostic using the same parsed name authority. The CLI preserves the entire
+   temporary builders do not escape. [check_render.brp](src/check_render.brp)
+   keeps pure presentation outside the checker. Its `render_failure` produces
+   every diagnostic using the failure's original parsed name authority.
+   The CLI preserves the entire
    rendered collection. Semantic unit tests inspect typed facts directly;
    renderer and pipeline tests pin wording independently. UFCS receiver mismatch
    occurrences retain the existing call-span limitation. Expression synthesis

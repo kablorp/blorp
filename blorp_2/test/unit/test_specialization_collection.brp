@@ -1,0 +1,256 @@
+import:
+	../../src/check as Checked
+	../../src/lex: lex
+	../../src/specialize as Concrete
+	../../src/syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration)
+	../../src/text: concat
+	input: parse, setup_diagnostic
+	test: TestSuite
+
+
+private pure func specialize(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	tokens ?= lex(source)
+	parsed ?= parse(tokens)
+	checked ?= Checked
+		.check(parsed)
+		.map_err(setup_diagnostic)
+	program ?= Concrete.specialize(checked)
+	Ok(Concrete.specialized_contents(program))
+
+
+private pure func target_is(call: Concrete.ConcreteCall, expected: Int) -> Bool:
+	match call.target:
+		Concrete.UserFunction(id):
+			Concrete.function_number(id) == expected
+		_:
+			False
+
+
+pure func test_direct_nested_calls_request_distinct_children_before_the_parent() -> Bool:
+	source: String =
+		|pure func left[T](value:T)->T:
+		|    value
+		|pure func right[T](value:T)->T:
+		|    value
+		|pure func outer[T](first:T,second:T)->T:
+		|    first
+		|func main()->Int:
+		|    outer(left(7),right(8))
+
+	match specialize(source.concat("\n")):
+		Ok(contents):
+			match contents.functions:
+				[main, left, right, outer]:
+					match main.body:
+						Concrete.ConcreteValueBody(value):
+							match value.base:
+								Concrete.ReturnCall(parent, [first, second]):
+									match (first.base, second.base):
+										(Concrete.ReturnCall(first_call, [_]), Concrete.ReturnCall(second_call, [_])):
+											(
+												target_is(first_call, 1)
+												and target_is(second_call, 2)
+												and target_is(parent, 3)
+												and left.signature.parameters.length() == 1
+												and right.signature.parameters.length() == 1
+												and outer.signature.parameters.length() == 2
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_direct_children_and_ufcs_arguments_precede_their_parent_requests() -> Bool:
+	source: String =
+		|pure func left[T](value:T)->T:
+		|    value
+		|pure func right[T](value:T)->T:
+		|    value
+		|pure func outer[T](first:T,second:T)->T:
+		|    first
+		|func main()->Int:
+		|    left(7).outer(right(8))
+
+	match specialize(source.concat("\n")):
+		Ok(contents):
+			match contents.functions:
+				[main, left, right, outer]:
+					match main.body:
+						Concrete.ConcreteValueBody(value):
+							match (value.base, value.operations):
+								(Concrete.ReturnCall(left_call, [_]), [step]):
+									match step.operation:
+										Concrete.InvokeFunction(outer_call, [argument]):
+											match argument.base:
+												Concrete.ReturnCall(right_call, [_]):
+													(
+														target_is(left_call, 1)
+														and target_is(right_call, 2)
+														and target_is(outer_call, 3)
+														and left.signature.parameters.length() == 1
+														and right.signature.parameters.length() == 1
+														and outer.signature.parameters.length() == 2
+													)
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func union_is(value: Concrete.TypeRef, expected: Int) -> Bool:
+	match value:
+		Concrete.UnionType(id):
+			Concrete.union_number(id) == expected
+		_:
+			False
+
+
+pure func test_each_match_arm_prepares_its_assignments_and_nested_dependencies() -> Bool:
+	source: String =
+		|fixed union Flag:
+		|    Off
+		|    On
+		|fixed union Marker[A,B]:
+		|    Only
+		|pure func flag()->Flag:
+		|    On
+		|pure func mark[T](value:T)->Marker[Int,T]:
+		|    Only
+		|pure func choose[T](value:T)->Int:
+		|    match flag():
+		|        Off:
+		|            first = mark(value)
+		|            1
+		|        On:
+		|            second = mark(mark(value))
+		|            2
+		|func main()->Int:
+		|    choose(7)
+
+	match specialize(source.concat("\n")):
+		Ok(contents):
+			match (contents.unions, contents.functions):
+				([_, inner_union, outer_union], [_, _, choose, inner, outer]):
+					match (choose.bindings, choose.body, outer.signature.parameters):
+						([_, first, second], Concrete.ConcreteMatchBody(matched), [input]):
+							match matched.arms:
+								[first_arm, second_arm]:
+									(
+										union_is(first.value_type, 1)
+										and union_is(second.value_type, 2)
+										and union_is(inner.signature.return_type, 1)
+										and union_is(outer.signature.return_type, 2)
+										and union_is(input, 1)
+										and inner_union.variants == [Concrete.NoPayload]
+										and outer_union.variants == [Concrete.NoPayload]
+										and first_arm.assignments.length() == 1
+										and second_arm.assignments.length() == 1
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+private BOX: String = "fixed union Box[T]:\n\tBox(T)\n"
+
+private BOX_FUNCTION: String = "pure func box[T](value:T)->Box[T]:\n\tBox(value)\n"
+
+
+private pure func payload_error_is(error: Diagnostic, start: Int, note_start: Int) -> Bool:
+	match error.note:
+		Some(UnionPayloadDeclaration(note)):
+			(
+				error.span.start == start
+				and error.span.end == start + 3
+				and note.start == note_start
+				and note.end == note_start + 1
+				and error.message == "specialized union payload must be Int"
+				and error.help == "use Int for this payload; String and union payloads are not supported"
+			)
+		_:
+			False
+
+
+pure func test_parent_type_error_precedes_a_nested_child_and_binding_spans() -> Bool:
+	prefix = BOX
+		.concat(BOX_FUNCTION)
+		.concat("func main()->Int:\n\tsaved = ")
+
+	match specialize(prefix.concat("box(box(7.to_string()))\n\t0\n")):
+		Err(error):
+			payload_error_is(error, prefix.length(), "fixed union Box[T]:\n\tBox(".length())
+		Ok(_):
+			False
+
+
+pure func test_earlier_assignment_error_keeps_the_initiating_forwarded_request() -> Bool:
+	prefix = BOX
+		.concat("fixed union Other[T]:\n\tOther(T)\n")
+		.concat(BOX_FUNCTION)
+		.concat(
+			"pure func other[T](value:T)->Other[T]:\n\tOther(value)\npure func forward[T](value:T)->T:\n\tfirst = box(value)\n\tsecond = other(value)\n\tvalue\nfunc main()->Int:\n\t",
+		)
+
+	match specialize(prefix.concat("forward(7.to_string()).length()\n")):
+		Err(error):
+			match error.note:
+				Some(UnionPayloadDeclaration(note)):
+					(
+						error.span.start == prefix.length()
+						and error.span.end == prefix.length() + "forward".length()
+						and note.start == "fixed union Box[T]:\n\tBox(".length()
+						and note.end == "fixed union Box[T]:\n\tBox(T".length()
+						and error.message == "specialized union payload must be Int"
+						and error.help == "use Int for this payload; String and union payloads are not supported"
+					)
+				_:
+					False
+		Ok(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 specialization collection ordering",
+	tests = [
+		(
+			"direct nested calls request distinct children before parent",
+			test_direct_nested_calls_request_distinct_children_before_the_parent,
+		),
+		(
+			"direct children and ufcs arguments precede parent requests",
+			test_direct_children_and_ufcs_arguments_precede_their_parent_requests,
+		),
+		(
+			"every match arm prepares assignments and nested dependencies",
+			test_each_match_arm_prepares_its_assignments_and_nested_dependencies,
+		),
+		(
+			"parent type error precedes nested child and binding spans",
+			test_parent_type_error_precedes_a_nested_child_and_binding_spans,
+		),
+		(
+			"earlier assignment keeps initiating forwarded request",
+			test_earlier_assignment_error_keeps_the_initiating_forwarded_request,
+		),
+	]
+}
