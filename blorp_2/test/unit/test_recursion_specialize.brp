@@ -1,0 +1,223 @@
+import:
+	../../src/check as Check
+	../../src/lex: lex
+	../../src/specialize as Concrete
+	../../src/syntax: Diagnostic
+	input: parse, setup_diagnostic
+	test: TestSuite
+
+
+private pure func specialize(source: String) -> Result[List[Concrete.ConcreteFunction], Diagnostic]:
+	tokens ?= lex(source)
+	parsed ?= parse(tokens)
+	checked ?= Check
+		.check(parsed)
+		.map_err(setup_diagnostic)
+	program ?= Concrete.specialize(checked)
+	Ok(Concrete.specialized_contents(program).functions)
+
+
+private pure func target(function: Concrete.ConcreteFunction) -> Option[Int]:
+	match function.body:
+		Concrete.ConcreteValueBody(value):
+			match value.base:
+				Concrete.ReturnCall(call, _):
+					match call.target:
+						Concrete.UserFunction(id):
+							Some(Concrete.function_number(id))
+						_:
+							None
+				_:
+					None
+		_:
+			None
+
+
+private pure func same_types(left: List[Concrete.TypeRef], right: List[Concrete.TypeRef]) -> Bool:
+	var valid = left.length() == right.length()
+	var position = 0
+
+	for value_type in left:
+		match right.get(position):
+			Some(expected):
+				valid = valid and Concrete.same_type(value_type, expected)
+			None:
+				valid = False
+
+		position += 1
+
+	valid
+
+
+pure func test_self_call_reuses_its_existing_instance() -> Bool:
+	source: String =
+		|pure func recurse[T](value: T) -> T:
+		|	recurse(value)
+		|func main() -> Int:
+		|	recurse(7)
+		|
+
+	match specialize(source):
+		Ok([main, recurse]):
+			target(main) == Some(1) and target(recurse) == Some(1)
+		_:
+			False
+
+
+pure func test_mutual_calls_reuse_both_existing_instances() -> Bool:
+	source: String =
+		|pure func first[T](value: T) -> T:
+		|	second(value)
+		|pure func second[U](value: U) -> U:
+		|	first(value)
+		|func main() -> Int:
+		|	first(7)
+		|
+
+	match specialize(source):
+		Ok([main, first, second]):
+			target(main) == Some(1) and target(first) == Some(2) and target(second) == Some(1)
+		_:
+			False
+
+
+pure func test_parameter_permutation_stops_after_two_keys() -> Bool:
+	source: String =
+		|pure func rotate[A, B](left: A, right: B) -> Int:
+		|	rotate(right, left)
+		|func main() -> Int:
+		|	rotate(7, to_string(42))
+		|
+
+	match specialize(source):
+		Ok([main, first, second]):
+			(
+				target(main) == Some(1)
+				and target(first) == Some(2)
+				and target(second) == Some(1)
+				and same_types(
+					first.signature.parameters,
+					[Concrete.IntType, Concrete.StringType],
+				)
+				and same_types(
+					second.signature.parameters,
+					[Concrete.StringType, Concrete.IntType],
+				)
+			)
+		_:
+			False
+
+
+pure func test_distinct_concrete_self_calls_remain_distinct() -> Bool:
+	source: String =
+		|pure func recurse[T](value: T) -> T:
+		|	recurse(value)
+		|func main() -> Int:
+		|	integer = recurse(7)
+		|	recurse(to_string(integer)).length()
+		|
+
+	match specialize(source):
+		Ok([_, integer, text]):
+			(
+				target(integer) == Some(1)
+				and target(text) == Some(2)
+				and same_types(integer.signature.parameters, [Concrete.IntType])
+				and same_types(text.signature.parameters, [Concrete.StringType])
+			)
+		_:
+			False
+
+
+pure func test_unused_generic_cycle_creates_no_concrete_instance() -> Bool:
+	source: String =
+		|pure func recurse[T](value: T) -> T:
+		|	recurse(value)
+		|func main() -> Int:
+		|	7
+		|
+
+	match specialize(source):
+		Ok([main]):
+			target(main).is_none()
+		_:
+			False
+
+
+pure func test_concrete_reset_stops_after_four_keys() -> Bool:
+	source: String =
+		|fixed union Token[T]:
+		|	Only
+		|pure func token[T](value: T) -> Token[T]:
+		|	Only
+		|pure func first[T](value: T) -> Int:
+		|	second(token(value))
+		|pure func second[U](value: U) -> Int:
+		|	first(7)
+		|func main() -> Int:
+		|	first(7)
+		|
+
+	match specialize(source):
+		Ok([main, first, token, second]):
+			(
+				target(main) == Some(1)
+				and target(first) == Some(3)
+				and target(token).is_none()
+				and target(second) == Some(1)
+			)
+		_:
+			False
+
+
+pure func test_parameter_merge_stops_after_two_keys() -> Bool:
+	source: String =
+		|pure func merge[A, B](left: A, right: B) -> Int:
+		|	merge(left, left)
+		|func main() -> Int:
+		|	merge(7, to_string(42))
+		|
+
+	match specialize(source):
+		Ok([main, first, second]):
+			(
+				target(main) == Some(1)
+				and target(first) == Some(2)
+				and target(second) == Some(2)
+				and same_types(
+					first.signature.parameters,
+					[Concrete.IntType, Concrete.StringType],
+				)
+				and same_types(
+					second.signature.parameters,
+					[Concrete.IntType, Concrete.IntType],
+				)
+			)
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Recursive concrete instance identity",
+	tests = [
+		("parameter merge stops after two keys", test_parameter_merge_stops_after_two_keys),
+		("self call reuses its existing instance", test_self_call_reuses_its_existing_instance),
+		(
+			"mutual calls reuse both existing instances",
+			test_mutual_calls_reuse_both_existing_instances,
+		),
+		(
+			"parameter permutation stops after two keys",
+			test_parameter_permutation_stops_after_two_keys,
+		),
+		(
+			"distinct concrete self calls remain distinct",
+			test_distinct_concrete_self_calls_remain_distinct,
+		),
+		(
+			"unused generic cycle creates no instance",
+			test_unused_generic_cycle_creates_no_concrete_instance,
+		),
+		("concrete reset stops after four keys", test_concrete_reset_stops_after_four_keys),
+	]
+}
