@@ -240,8 +240,16 @@ make -C blorp_2 test             # Run the Blorp TestSuite tests.
 `example` keeps its generated C and executable in `blorp_2/build/` for
 inspection. The tests use temporary directories. `BLORP_CC` selects a C
 compiler executable (default `clang`).
-To run only end-to-end tests, use `bin/blorp test blorp_2/test/e2e` with the
-command's default timeout.
+To run only end-to-end tests, use:
+
+```sh
+bin/blorp test --timeout 0 blorp_2/test/e2e
+```
+
+The host test runner's default 30-second deadline applies to the entire
+generated suite, including the pilot build and every fixture. End-to-end runs
+disable that deadline. `make -C blorp_2 test` runs e2e separately with
+`--timeout 0`; the other suites retain their 180-second deadline.
 
 Each end-to-end run builds the pilot at the beginning: the host compiler
 generates `build/compiler.c` once, then the C compiler links one `-O0` executable

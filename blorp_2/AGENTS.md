@@ -196,7 +196,10 @@ requirements, not claims of implemented coverage.
 
 Use the narrowest repeatable check while iterating, then the relevant
 integration and sanitizer checks. Follow the parent instructions for host
-build freshness. Build the pilot once at the beginning of each end-to-end run
+build freshness. Run end-to-end suites with `bin/blorp test --timeout 0
+blorp_2/test/e2e`: the wrapper includes the pilot build and every fixture, so
+the host test runner's default 30-second deadline does not apply.
+Build the pilot once at the beginning of each end-to-end run
 via `make -C blorp_2 test-compiler`, then pass its executable path explicitly
 to the tests. Do not add a persistent compiler cache or prepare the compiler
 separately for each fixture. The README owns runnable commands. Keep generated
