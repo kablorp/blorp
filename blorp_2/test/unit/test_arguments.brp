@@ -9,7 +9,7 @@ import:
 	../../src/syntax as Syntax
 	../../src/text: concat
 	../../src/verify: verify
-	input: check, parse
+	input: check, check_failure, parse, setup_diagnostic
 	ownership_inputs: InputIds, function, input_ids, integer, parameter, runtime, span
 	test: TestSuite
 
@@ -24,7 +24,7 @@ private MAIN: String = "func main() -> Int:\n\t0\n"
 private pure func checked(source: String) -> Result[Checked.CheckedProgram, Syntax.Diagnostic]:
 	tokens ?= lex(source)
 	parsed ?= parse(tokens)
-	check(parsed)
+	check(parsed).map_err(setup_diagnostic)
 
 
 private pure func lowered(source: String) -> Result[Lower.LoweredFunctions, Syntax.Diagnostic]:
@@ -38,25 +38,17 @@ private pure func rejects(
 	prefix: String,
 	marked: String,
 	suffix: String,
-	message: String,
-	help: String,
+	matches: pure (Checked.CheckErrorKind) -> Bool,
 ) -> Bool:
-	match (
-		checked(
-			prefix
-				.concat(marked)
-				.concat(suffix),
-		)
-	):
-		Err(error):
+	match check_failure(prefix + marked + suffix):
+		None:
+			False
+		Some(error):
 			(
 				error.span.start == prefix.length()
 				and error.span.end == prefix.length() + marked.length()
-				and error.message == message
-				and error.help == help
+				and matches(error.kind)
 			)
-		Ok(_):
-			False
 
 
 pure func test_recursive_arguments_and_receiver_preserve_source_order() -> Bool:
@@ -156,58 +148,62 @@ pure func test_repeated_structural_parameter_infers_consistently() -> Bool:
 
 
 pure func test_inconsistent_argument_reports_the_disagreeing_occurrence() -> Bool:
-	rejects(
-		FIRST + "func main() -> Int:\n\tfirst(7, ",
-		"9.to_string()",
-		")\n",
-		"argument type does not match the parameter type",
-		"use an expression of type Int here",
+	rejects(FIRST + "func main() -> Int:\n\tfirst(7, ", "9.to_string()", ")\n", pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.GenericArgumentConflict(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_concrete_argument_does_not_hide_later_uninferable_type() -> Bool:
-	rejects(
-		"pure func unused[T](first: Int, second: Int) -> Int:\n\tfirst\nfunc main() -> Int:\n\t",
-		"unused",
-		"(7, 9)\n",
-		"cannot infer the type parameter from the argument",
-		(
-			"pass a value whose type determines the declared type parameter; use a concrete "
-			+ "helper when no argument can determine it"
-		),
+	rejects("pure func unused[T](first: Int, second: Int) -> Int:\n\tfirst\nfunc main() -> Int:\n\t", "unused", "(7, 9)\n", pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.UninferableTypeParameter(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_duplicate_parameter_reports_the_second_declaration() -> Bool:
-	rejects(
-		"pure func bad(first: Int, ",
-		"first",
-		": Int) -> Int:\n\tfirst\n" + MAIN,
-		"duplicate parameter name",
-		"give each parameter a distinct name",
+	rejects("pure func bad(first: Int, ", "first", ": Int) -> Int:\n\tfirst\n" + MAIN, pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.DuplicateParameter(_, _):
+				True
+			_:
+				False
 	)
 
 
 pure func test_wrong_argument_count_reports_the_callee() -> Bool:
-	rejects(
-		FIRST + "func main() -> Int:\n\t",
-		"first",
-		"(7)\n",
-		"argument count does not match the function parameters",
-		(
-			"pass one expression for each declared parameter; UFCS supplies the receiver "
-			+ "first"
-		),
+	rejects(FIRST + "func main() -> Int:\n\t", "first", "(7)\n", pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.ArgumentCountMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_hidden_second_argument_cycle_is_rejected() -> Bool:
-	rejects(
-		FIRST + "func main() -> Int:\n\tfirst(7, ",
-		"main",
-		"())\n",
-		"call chain contains recursion",
-		"use an acyclic call chain; recursion is not supported in this increment",
+	rejects(FIRST + "func main() -> Int:\n\tfirst(7, ", "main", "())\n", pure func(
+		kind: Checked.CheckErrorKind,
+	) -> Bool:
+		match kind:
+			Checked.RecursiveCallChain:
+				True
+			_:
+				False
 	)
 
 

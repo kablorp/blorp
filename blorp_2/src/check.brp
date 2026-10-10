@@ -7,15 +7,16 @@ import:
 		runtime_contract,
 		runtime_operation,
 	int as IntOps
-	names: NameId, NameTable, SpecialNames, name_spelling, same_name
+	names: NameId, SpecialNames, name_spelling, same_name
 	option: is_some, to_result
-	parse: ParsedProgram, parsed_contents
+	parse: ParsedContents, ParsedProgram, parsed_contents
 	result: and_then
 	syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
 		CallNotation(DirectCall, ReceiverCall),
 		Diagnostic,
 		DiagnosticNote(NoDiagnosticNote),
+		Diagnostics,
 		ExpressionBase(IntegerExpression, NameExpression, DirectApplication),
 		FieldPattern(FieldName, FieldWildcard),
 		ParsedBinding,
@@ -359,17 +360,132 @@ private pure func find_function(
 	found
 
 
-private pure func rejection(span: Span, message: String, help: String) -> Diagnostic:
-	{
-		span = span,
-		note = NoDiagnosticNote,
-		message = message,
-		help = help
-	}
+fixed record BindingSite {
+	function: FunctionId,
+	binding: BindingId,
+	name: NameId,
+	span: Span
+}
 
 
-private pure func internal_error(span: Span, message: String) -> Diagnostic:
-	rejection(span, message, "report this compiler error with the input program")
+fixed union ExpectedTypeSite:
+	SourceAnnotation(Span)
+	InferredBindingDeclaration(BindingSite)
+	RuntimeContract(RuntimeOperation)
+
+
+fixed record ArgumentMismatch {
+	expected: TypeRef,
+	actual: TypeUse,
+	argument_position: Int,
+	expected_site: ExpectedTypeSite
+}
+
+
+fixed record ExpressionMismatch {
+	expected: TypeRef,
+	actual: TypeUse,
+	expected_site: ExpectedTypeSite
+}
+
+
+fixed record GenericConflict {
+	mismatch: ArgumentMismatch,
+	parameter: TypeParameterId,
+	previous: TypeUse,
+	current: TypeUse
+}
+
+
+fixed record ArityMismatch {
+	callee: NameId,
+	expected: Int,
+	actual: Int,
+	notation: CallNotation,
+	target: CallTarget
+}
+
+
+fixed union PayloadRule:
+	IntegerPayload
+	IntegerOrParameterPayload
+
+
+fixed union PreviousTypeDeclaration:
+	SourceTypeDeclaration(Span)
+	PreludeTypeDeclaration(NameId)
+
+
+fixed union CheckErrorKind:
+	DuplicateVariant(NameId, Span)
+	DuplicateUnion(NameId, PreviousTypeDeclaration)
+	DuplicateFunction(NameId, Span)
+	DuplicateParameter(NameId, Span)
+	DuplicateLocal(BindingSite)
+	VariantFunctionConflict(NameId, Span, Span)
+	FunctionPreludeConflict(NameId)
+	VariantPreludeConflict(NameId)
+	GenericMain(TypeParameterId)
+	MainHasParameters(Int)
+	MainReturnType(TypeRef)
+	MissingMain
+	UnknownType(NameId)
+	MissingUnionTypeArguments(UnionId)
+	OrdinaryUnionApplied(UnionId)
+	NonApplicableType(NameId)
+	TypeParameterTypeNameConflict(NameId)
+	UnsupportedPayloadAnnotation(NameId, PayloadRule)
+	UnknownValue(NameId)
+	UnknownFunction(NameId)
+	UncallableBinding(BindingSite, BindingOrigin, TypeRef)
+	ArgumentCountMismatch(ArityMismatch)
+	ImpureCall(FunctionId, CallTarget)
+	ConstructorUFCS(NameId)
+	ArgumentTypeMismatch(ArgumentMismatch)
+	ExpressionTypeMismatch(ExpressionMismatch)
+	GenericArgumentConflict(GenericConflict)
+	UninferableTypeParameter(TypeParameterId)
+	ConstructorNeedsExpectedType(NameId)
+	VariantNotInExpectedType(NameId, TypeRef)
+	PayloadFreeVariantCalled(VariantId)
+	MissingConstructorPayload(VariantId, TypeRef)
+	ConstructorPayloadArity(VariantId, Int)
+	PatternUnexpectedField(VariantId)
+	PatternMissingField(VariantId, TypeRef)
+	UnknownConstructorPattern(NameId, TypeRef)
+	UnreachableArm
+	NonExhaustiveMatch(List[VariantId])
+	MatchRequiresUnion(TypeRef)
+	ImmutableAssignment(BindingSite)
+	RecursiveCallChain
+	InternalInvariant(CheckerInvariant)
+
+
+fixed record CheckError {
+	span: Span,
+	kind: CheckErrorKind
+}
+
+
+fixed record CheckErrors {
+	first: CheckError,
+	remaining: List[CheckError]
+}
+
+
+private fixed record FailureContents {
+	program: ParsedProgram,
+	errors: CheckErrors
+}
+
+
+opaque type CheckFailure = FailureContents
+
+
+private fixed record ExpectedValue {
+	value_type: TypeRef,
+	site: ExpectedTypeSite
+}
 
 
 private pure func find_union(unions: List[ParsedUnion], name: NameId) -> Option[UnionId]:
@@ -404,9 +520,9 @@ private pure func contains_variant(unions: List[ParsedUnion], name: NameId) -> B
 private pure func validate_union(
 	declaration: ParsedUnion,
 	functions: List[ParsedFunction],
-) -> Result[Void, Diagnostic]:
+) -> Result[Void, CheckError]:
 	var previous: List[WrittenName] = []
-	var failure: Option[Diagnostic] = None
+	var failure: Option[CheckError] = None
 
 	for written in declaration.variants:
 		variant = written.name
@@ -414,10 +530,9 @@ private pure func validate_union(
 		for known in previous:
 			if same_name(known.id, variant.id):
 				failure = Some(
-					rejection(
+					check_rejection(
 						variant.span,
-						"duplicate variant name",
-						"give each variant in a union a distinct name",
+						DuplicateVariant(variant.id, known.span),
 					),
 				)
 				break
@@ -431,12 +546,7 @@ private pure func validate_union(
 			Some(id):
 				match functions.get(function_number(id)):
 					None:
-						failure = Some(
-							internal_error(
-								variant.span,
-								"invalid resolved function identity",
-							),
-						)
+						failure = Some(checker_invariant(variant.span, InvalidResolvedFunction(id)))
 					Some(function):
 						span = if IntOps.less_than(
 							variant.span.start,
@@ -447,10 +557,13 @@ private pure func validate_union(
 							variant.span
 
 						failure = Some(
-							rejection(
+							check_rejection(
 								span,
-								"variant name conflicts with a function",
-								"give functions and union variants distinct names",
+								VariantFunctionConflict(
+									variant.id,
+									variant.span,
+									function.function_name.span,
+								),
 							),
 						)
 
@@ -470,25 +583,33 @@ private pure func validate_unions(
 	unions: List[ParsedUnion],
 	functions: List[ParsedFunction],
 	special: SpecialNames,
-) -> Result[List[CheckedUnion], Diagnostic]:
-	var previous: List[ParsedUnion] = []
+) -> Result[List[CheckedUnion], CheckError]:
+	var previous: List[WrittenName] = []
 	var checked: List[CheckedUnion] = []
-	var failure: Option[Diagnostic] = None
+	var failure: Option[CheckError] = None
 
 	for declaration in unions:
-		if (
+		earlier = previous_declaration(previous, declaration.type_name.id)
+
+		duplicate: Option[PreviousTypeDeclaration] = if (
 			same_name(declaration.type_name.id, special.integer)
 			or same_name(declaration.type_name.id, special.string)
-			or find_union(previous, declaration.type_name.id).is_some()
 		):
-			failure = Some(
-				rejection(
-					declaration.type_name.span,
-					"duplicate union type name",
-					"give union types distinct names; Int and String are declared by the prelude",
-				),
-			)
-			break
+			Some(PreludeTypeDeclaration(declaration.type_name.id))
+		else:
+			earlier.map(pure func(known): SourceTypeDeclaration(known.span))
+
+		match duplicate:
+			Some(first):
+				failure = Some(
+					check_rejection(
+						declaration.type_name.span,
+						DuplicateUnion(declaration.type_name.id, first),
+					),
+				)
+				break
+			None:
+				void
 
 		match validate_union(declaration, functions):
 			Err(error):
@@ -518,7 +639,7 @@ private pure func validate_unions(
 							Err(error):
 								failure = Some(error)
 
-		previous = previous.append(declaration)
+		previous = previous.append(declaration.type_name)
 
 	match failure:
 		Some(error):
@@ -527,34 +648,13 @@ private pure func validate_unions(
 			Ok(checked)
 
 
-private pure func payload_type_error(
-	span: Span,
-	parameter: Option[LocalTypeParameter],
-) -> Diagnostic:
-	match parameter:
-		None:
-			rejection(
-				span,
-				"only Int payloads are supported",
-				"declare a variant with no fields or one Int field, written Variant(Int)",
-			)
-		Some(_):
-			rejection(
-				span,
-				"only Int or the union's type parameter may be payloads",
-				"declare no field, one Int field, or one field using this union's declared type ".concat(
-					"parameter",
-				),
-			)
-
-
 private pure func resolve_payloads(
 	declaration: ParsedUnion,
 	type_parameter: Option[LocalTypeParameter],
 	special: SpecialNames,
-) -> Result[List[PayloadShape], Diagnostic]:
+) -> Result[List[PayloadShape], CheckError]:
 	var shapes: List[PayloadShape] = []
-	var failure: Option[Diagnostic] = None
+	var failure: Option[CheckError] = None
 
 	for variant in declaration.variants:
 		match variant.payload:
@@ -570,14 +670,26 @@ private pure func resolve_payloads(
 					None:
 						None
 
-				value_result: Result[TypeRef, Diagnostic] = if same_name(name.id, special.integer):
+				value_result: Result[TypeRef, CheckError] = if same_name(name.id, special.integer):
 					Ok(IntType)
 				else:
 					match parameter:
 						Some(id):
 							Ok(ParameterType(id))
 						None:
-							Err(payload_type_error(name.span, type_parameter))
+							Err(
+								check_rejection(
+									name.span,
+									UnsupportedPayloadAnnotation(
+										name.id,
+										match type_parameter:
+											None:
+												IntegerPayload
+											Some(_):
+												IntegerOrParameterPayload
+									),
+								),
+							)
 
 				match value_result:
 					Ok(value):
@@ -607,7 +719,7 @@ private pure func local_type_parameter(
 	owner: TypeParameterOwner,
 	unions: List[ParsedUnion],
 	special: SpecialNames,
-) -> Result[Option[LocalTypeParameter], Diagnostic]:
+) -> Result[Option[LocalTypeParameter], CheckError]:
 	match written:
 		NoTypeParameterSyntax:
 			Ok(None)
@@ -617,13 +729,7 @@ private pure func local_type_parameter(
 				or same_name(name.id, special.string)
 				or find_union(unions, name.id).is_some()
 			):
-				Err(
-					rejection(
-						name.span,
-						"type parameter conflicts with a type name",
-						"choose a distinct type parameter name, such as T",
-					),
-				)
+				Err(check_rejection(name.span, TypeParameterTypeNameConflict(name.id)))
 			else:
 				Ok(Some({
 					name = name.id,
@@ -636,15 +742,14 @@ private pure func resolve_type_parameter(
 	id: FunctionId,
 	unions: List[ParsedUnion],
 	special: SpecialNames,
-) -> Result[Option[LocalTypeParameter], Diagnostic]:
+) -> Result[Option[LocalTypeParameter], CheckError]:
 	valid_main ?= match function.type_parameters:
 		OneTypeParameterSyntax(name):
 			if same_name(function.function_name.id, special.main):
 				Err(
-					rejection(
+					check_rejection(
 						name.span,
-						"main cannot be generic",
-						"declare main() -> Int: without type parameters",
+						GenericMain(into_opaque TypeParameterId(FunctionDeclaration(id))),
 					),
 				)
 			else:
@@ -668,7 +773,7 @@ private pure func resolve_atomic_type(
 	special: SpecialNames,
 	name: WrittenName,
 	type_parameter: Option[LocalTypeParameter],
-) -> Result[TypeRef, Diagnostic]:
+) -> Result[TypeRef, CheckError]:
 	local = match type_parameter:
 		Some(parameter):
 			if same_name(name.id, parameter.name):
@@ -689,31 +794,19 @@ private pure func resolve_atomic_type(
 			else:
 				match find_union(unions, name.id):
 					Some(id):
-						declaration ?= unions
-							.get(union_number(id))
-							.to_result(internal_error(name.span, "invalid union declaration"))
+						declaration ?= match unions.get(union_number(id)):
+							Some(declaration):
+								Ok(declaration)
+							None:
+								Err(checker_invariant(name.span, InvalidUnionDeclaration(id)))
 
 						match declaration.type_parameters:
 							NoTypeParameterSyntax:
 								Ok(UnionType(id))
 							OneTypeParameterSyntax(_):
-								Err(
-									rejection(
-										name.span,
-										"generic union requires one type argument",
-										"write a concrete or symbolic application, such as Box[Int] or Box[T]",
-									),
-								)
+								Err(check_rejection(name.span, MissingUnionTypeArguments(id)))
 					None:
-						Err(
-							rejection(
-								name.span,
-								"unknown type",
-								"use Int, String, a declared type parameter, or a fixed union declared in this ".concat(
-									"file",
-								),
-							),
-						)
+						Err(check_rejection(name.span, UnknownType(name.id)))
 
 
 private pure func resolve_type(
@@ -721,36 +814,28 @@ private pure func resolve_type(
 	special: SpecialNames,
 	written: TypeSyntax,
 	type_parameter: Option[LocalTypeParameter],
-) -> Result[TypeRef, Diagnostic]:
+) -> Result[TypeRef, CheckError]:
 	match written:
 		AtomicType(name):
 			resolve_atomic_type(unions, special, name, type_parameter)
 		AppliedType(name, argument, span):
-			owner ?= find_union(
-				unions,
-				name.id,
-			).to_result(
-				rejection(
-					name.span,
-					"type does not accept a type argument",
-					"apply a declared generic union, such as Box[Int]",
-				),
-			)
-			declaration ?= unions
-				.get(union_number(owner))
-				.to_result(internal_error(span, "invalid union declaration"))
+			owner ?= match find_union(unions, name.id):
+				Some(owner):
+					Ok(owner)
+				None:
+					Err(check_rejection(name.span, NonApplicableType(name.id)))
+
+			declaration ?= match unions.get(union_number(owner)):
+				Some(declaration):
+					Ok(declaration)
+				None:
+					Err(checker_invariant(span, InvalidUnionDeclaration(owner)))
 
 			arity ?= match declaration.type_parameters:
 				OneTypeParameterSyntax(_):
 					Ok(void)
 				NoTypeParameterSyntax:
-					Err(
-						rejection(
-							span,
-							"ordinary union does not accept a type argument",
-							"remove the type argument from this union type",
-						),
-					)
+					Err(check_rejection(span, OrdinaryUnionApplied(owner)))
 
 			value ?= resolve_atomic_type(unions, special, argument, type_parameter)
 			Ok(AppliedUnionType(owner, value))
@@ -768,30 +853,25 @@ private pure func resolve_parameters(
 	unions: List[ParsedUnion],
 	special: SpecialNames,
 	type_parameter: Option[LocalTypeParameter],
-) -> Result[List[TypeUse], Diagnostic]:
+) -> Result[List[TypeUse], CheckError]:
 	var resolved: List[TypeUse] = []
-	var seen: List[NameId] = []
-	var failure: Option[Diagnostic] = None
+	var seen: List[WrittenName] = []
+	var failure: Option[CheckError] = None
 
 	for parameter in parameters:
-		result: Result[TypeRef, Diagnostic] = if same_name(function_name, special.main):
-			Err(
-				rejection(
-					parameter.name.span,
-					"main cannot have a parameter",
-					"declare main() -> Int: with no parameters",
-				),
-			)
-		else if seen.any(pure func(name: NameId) -> Bool: same_name(name, parameter.name.id)):
-			Err(
-				rejection(
-					parameter.name.span,
-					"duplicate parameter name",
-					"give each parameter a distinct name",
-				),
-			)
+		result: Result[TypeRef, CheckError] = if same_name(function_name, special.main):
+			Err(check_rejection(parameter.name.span, MainHasParameters(parameters.length())))
 		else:
-			resolve_type(unions, special, parameter.type_name, type_parameter)
+			match previous_declaration(seen, parameter.name.id):
+				Some(first):
+					Err(
+						check_rejection(
+							parameter.name.span,
+							DuplicateParameter(parameter.name.id, first.span),
+						),
+					)
+				None:
+					resolve_type(unions, special, parameter.type_name, type_parameter)
 
 		match result:
 			Err(error):
@@ -802,7 +882,7 @@ private pure func resolve_parameters(
 					value_type = value_type,
 					span = type_span(parameter.type_name),
 				})
-				seen = seen.append(parameter.name.id)
+				seen = seen.append(parameter.name)
 
 	match failure:
 		Some(error):
@@ -816,7 +896,7 @@ private pure func resolve_signature(
 	id: FunctionId,
 	unions: List[ParsedUnion],
 	special: SpecialNames,
-) -> Result[FunctionSignature, Diagnostic]:
+) -> Result[FunctionSignature, CheckError]:
 	type_parameter ?= resolve_type_parameter(function, id, unions, special)
 	return_type ?= resolve_type(unions, special, function.return_type, type_parameter)
 
@@ -824,13 +904,7 @@ private pure func resolve_signature(
 		same_name(function.function_name.id, special.main)
 		and not same_type(return_type, IntType)
 	):
-		Err(
-			rejection(
-				type_span(function.return_type),
-				"main must return Int",
-				"declare main() -> Int: as the entrypoint",
-			),
-		)
+		Err(check_rejection(type_span(function.return_type), MainReturnType(return_type)))
 	else:
 		Ok(void)
 
@@ -864,21 +938,23 @@ private pure func validate_signatures(
 	unions: List[ParsedUnion],
 	end: Span,
 	special: SpecialNames,
-) -> Result[CheckedSignatures, Diagnostic]:
-	var previous: List[ParsedFunction] = []
+) -> Result[CheckedSignatures, CheckError]:
+	var previous: List[WrittenName] = []
 	var signatures: List[FunctionSignature] = []
-	var failure: Option[Diagnostic] = None
+	var failure: Option[CheckError] = None
 
 	for function in functions:
-		if find_function(previous, function.function_name.id).is_some():
-			failure = Some(
-				rejection(
-					function.function_name.span,
-					"duplicate function name",
-					"give every function a distinct name",
-				),
-			)
-			break
+		match previous_declaration(previous, function.function_name.id):
+			Some(first):
+				failure = Some(
+					check_rejection(
+						function.function_name.span,
+						DuplicateFunction(function.function_name.id, first.span),
+					),
+				)
+				break
+			None:
+				void
 
 		match resolve_signature(
 			function,
@@ -892,7 +968,7 @@ private pure func validate_signatures(
 			Ok(signature):
 				signatures = signatures.append(signature)
 
-		previous = previous.append(function)
+		previous = previous.append(function.function_name)
 
 	match failure:
 		Some(error):
@@ -905,20 +981,16 @@ private pure func validate_signatures(
 						entrypoint = id,
 					})
 				None:
-					Err(
-						rejection(
-							end,
-							"expected a main function",
-							"declare func main() -> Int: as the entrypoint",
-						),
-					)
+					Err(check_rejection(end, MissingMain))
 
 
 private pure func validate_call(
 	caller: Purity,
 	callee: Purity,
 	span: Span,
-) -> Result[Void, Diagnostic]:
+	function: FunctionId,
+	target: CallTarget,
+) -> Result[Void, CheckError]:
 	match caller:
 		Impure:
 			Ok(void)
@@ -927,13 +999,7 @@ private pure func validate_call(
 				Pure:
 					Ok(void)
 				Impure:
-					Err(
-						rejection(
-							span,
-							"pure functions cannot call impure functions",
-							"mark the callee pure or remove pure from the caller",
-						),
-					)
+					Err(check_rejection(span, ImpureCall(function, target)))
 
 
 private fixed record LocalBinding {
@@ -955,11 +1021,11 @@ private pure func lookup_binding(scope: List[LocalBinding], name: NameId) -> Opt
 
 
 private fixed record ResolutionContext {
+	function: FunctionId,
 	functions: List[ParsedFunction],
 	signatures: List[FunctionSignature],
 	unions: List[ParsedUnion],
 	checked_unions: List[CheckedUnion],
-	names: NameTable,
 	prelude: CheckedPrelude
 }
 
@@ -984,43 +1050,18 @@ private fixed union ResolvedApplication:
 	ConstructorApplication(WrittenName)
 
 
-private pure func non_callable(binding: LocalBinding, span: Span) -> Diagnostic:
-	match binding.definition.origin:
-		ParameterBinding(_):
-			message = if same_type(binding.definition.value_type, IntType):
-				"Int parameters cannot be called"
-			else:
-				"parameters cannot be called"
-
-			rejection(
-				span,
-				message,
-				"use the parameter as a value, or rename it to call the function",
-			)
-		MatchCapture:
-			rejection(
-				span,
-				"match bindings cannot be called",
-				"use the binding as a value, or rename it to call the function",
-			)
-		BodyLocal:
-			rejection(
-				span,
-				"local bindings cannot be called",
-				"use the binding as a value, or rename it to call the function",
-			)
-
-
 private pure func resolve_function_target(
 	name: WrittenName,
 	target: CallTarget,
 	signatures: List[FunctionSignature],
-) -> Result[ResolvedCall, Diagnostic]:
+) -> Result[ResolvedCall, CheckError]:
 	signature ?= match target:
 		UserFunction(id, _):
-			signatures
-				.get(function_number(id))
-				.to_result(internal_error(name.span, "invalid resolved function identity"))
+			match signatures.get(function_number(id)):
+				Some(signature):
+					Ok(signature)
+				None:
+					Err(checker_invariant(name.span, InvalidResolvedFunction(id)))
 		RuntimeFunction(operation):
 			Ok(runtime_signature(operation, name.span))
 
@@ -1052,62 +1093,30 @@ private pure func function_contract(
 	arity: Int,
 	resolved: ResolvedCall,
 	context: ResolutionContext,
-) -> Result[CallContract, Diagnostic]:
+) -> Result[CallContract, CheckError]:
 	count = resolved.signature.parameters.length()
 
-	arity_diagnostic: Option[Diagnostic] = if IntOps.equals(count, arity):
-		None
-	else if IntOps.equals(count, 0):
-		match notation:
-			DirectCall:
-				Some(
-					rejection(
-						name.span,
-						"function takes no arguments",
-						"remove the argument and call the function with ()",
-					),
-				)
-			ReceiverCall:
-				match name_spelling(context.names, name.id):
-					Some(spelling):
-						Some(
-							rejection(
-								name.span,
-								"function takes no arguments",
-								Text
-									.concat("call ", spelling)
-									.concat("() directly, or choose a function with one parameter"),
-							),
-						)
-					None:
-						Some(internal_error(name.span, "invalid call name identity"))
-	else if IntOps.equals(count, 1):
-		Some(
-			rejection(
-				name.span,
-				"function requires one argument",
-				"pass one expression of the declared parameter type",
-			),
-		)
+	arity_check ?= if IntOps.equals(count, arity):
+		Ok(void)
 	else:
-		Some(
-			rejection(
-				name.span,
-				"argument count does not match the function parameters",
-				Text.concat(
-					"pass one expression for each declared parameter; UFCS supplies the receiver ",
-					"first",
-				),
-			),
-		)
+		Err(check_rejection(
+			name.span,
+			ArgumentCountMismatch({
+				callee = name.id,
+				expected = count,
+				actual = arity,
+				notation = notation,
+				target = resolved.call.target,
+			}),
+		))
 
-	arity_check ?= match arity_diagnostic:
-		Some(error):
-			Err(error)
-		None:
-			Ok(void)
-
-	pure_call ?= validate_call(purity, resolved.signature.purity, name.span)
+	pure_call ?= validate_call(
+		purity,
+		resolved.signature.purity,
+		name.span,
+		context.function,
+		resolved.call.target,
+	)
 	Ok({
 		type_parameters = resolved.signature.type_parameters,
 		operation = InvokeFunction(resolved.call, []),
@@ -1166,25 +1175,42 @@ private pure func find_variant(
 	context: ResolutionContext,
 	union_type: TypeRef,
 	name: WrittenName,
-) -> Result[Option[VariantContract], Diagnostic]:
-	owner ?= type_union_owner(
-		union_type,
-	).to_result(internal_error(name.span, "variant occurrence has no union type"))
-	declaration ?= context.unions
-		.get(union_number(owner))
-		.to_result(internal_error(name.span, "invalid resolved union identity"))
-	checked ?= context.checked_unions
-		.get(union_number(owner))
-		.to_result(internal_error(name.span, "invalid checked union identity"))
+) -> Result[Option[VariantContract], CheckError]:
+	owner ?= match type_union_owner(union_type):
+		Some(owner):
+			Ok(owner)
+		None:
+			Err(checker_invariant(name.span, VariantOccurrenceWithoutUnion(union_type)))
+
+	declaration ?= match context.unions.get(union_number(owner)):
+		Some(declaration):
+			Ok(declaration)
+		None:
+			Err(checker_invariant(name.span, InvalidResolvedUnion(owner)))
+
+	checked ?= match context.checked_unions.get(union_number(owner)):
+		Some(checked):
+			Ok(checked)
+		None:
+			Err(checker_invariant(name.span, InvalidCheckedUnion(owner)))
+
 	var found: Option[VariantContract] = None
 	var position: Int = 0
-	var failure: Option[Diagnostic] = None
+	var failure: Option[CheckError] = None
 
 	for variant in declaration.variants:
 		if same_name(variant.name.id, name.id):
 			match checked.variants.get(position):
 				None:
-					failure = Some(internal_error(name.span, "invalid resolved variant identity"))
+					failure = Some(
+						checker_invariant(
+							name.span,
+							InvalidResolvedVariant(into_opaque VariantId({
+										owner = owner,
+										position = position
+									})),
+						),
+					)
 				Some(payload):
 					found = Some({
 						variant = into_opaque VariantId({
@@ -1206,105 +1232,14 @@ private pure func find_variant(
 			Ok(found)
 
 
-private pure func parameter_spelling(
-	id: TypeParameterId,
-	context: ResolutionContext,
-	span: Span,
-) -> Result[String, Diagnostic]:
-	written ?= match parameter_owner(id):
-		FunctionDeclaration(id):
-			context.functions
-				.get(function_number(id))
-				.map(pure func(declaration): declaration.type_parameters)
-				.to_result(internal_error(span, "invalid parameter declaration"))
-		UnionDeclaration(id):
-			context.unions
-				.get(union_number(id))
-				.map(pure func(declaration): declaration.type_parameters)
-				.to_result(internal_error(span, "invalid parameter declaration"))
-
-	match written:
-		OneTypeParameterSyntax(name):
-			name_spelling(
-				context.names,
-				name.id,
-			).to_result(internal_error(span, "invalid parameter name"))
-		NoTypeParameterSyntax:
-			Err(internal_error(span, "parameter owner has no parameter"))
-
-
-private pure func type_spelling(
-	value: TypeRef,
-	context: ResolutionContext,
-	span: Span,
-) -> Result[String, Diagnostic]:
-	match value:
-		IntType:
-			Ok("Int")
-		StringType:
-			Ok("String")
-		ParameterType(id):
-			parameter_spelling(id, context, span)
-		UnionType(id):
-			declaration ?= context.unions
-				.get(union_number(id))
-				.to_result(internal_error(span, "invalid resolved union identity"))
-			name_spelling(
-				context.names,
-				declaration.type_name.id,
-			).to_result(internal_error(span, "invalid parsed name identity"))
-		AppliedUnionType(id, argument):
-			name ?= type_spelling(UnionType(id), context, span)
-			argument ?= type_spelling(argument, context, span)
-			Ok(
-				name
-					.concat("[")
-					.concat(argument)
-					.concat("]"),
-			)
-
-
-private pure func type_rejection(
-	span: Span,
-	message: String,
-	expected_type: TypeRef,
-	context: ResolutionContext,
-) -> Diagnostic:
-	match expected_type:
-		ParameterType(_):
-			rejection(
-				span,
-				message,
-				"use a value already typed as this declaration's type parameter",
-			)
-		_:
-			match type_spelling(expected_type, context, span):
-				Err(error):
-					error
-				Ok(spelling):
-					rejection(
-						span,
-						message,
-						"use an expression of type "
-							.concat(spelling)
-							.concat(" here"),
-					)
-
-
 private pure func contextual_constructor(
 	name: WrittenName,
 	expected_type: Option[TypeRef],
 	context: ResolutionContext,
-) -> Result[VariantContract, Diagnostic]:
+) -> Result[VariantContract, CheckError]:
 	match expected_type:
 		None:
-			Err(
-				rejection(
-					name.span,
-					"constructor needs an expected union type",
-					"pass an already-typed union value or call a concrete helper returning the union",
-				),
-			)
+			Err(check_rejection(name.span, ConstructorNeedsExpectedType(name.id)))
 		Some(type_ref):
 			found ?= match type_ref:
 				IntType | StringType | ParameterType(_):
@@ -1318,32 +1253,19 @@ private pure func contextual_constructor(
 				Some(contract):
 					Ok(contract)
 				None:
-					Err(
-						type_rejection(
-							name.span,
-							"variant does not belong to the expected type",
-							type_ref,
-							context,
-						),
-					)
+					Err(check_rejection(name.span, VariantNotInExpectedType(name.id, type_ref)))
 
 
 private pure func unary_constructor(
 	name: WrittenName,
 	expected_type: Option[TypeRef],
 	context: ResolutionContext,
-) -> Result[CallContract, Diagnostic]:
+) -> Result[CallContract, CheckError]:
 	contract ?= contextual_constructor(name, expected_type, context)
 
 	match contract.payload:
 		NoPayload:
-			Err(
-				rejection(
-					name.span,
-					"payload-free variants cannot be called",
-					"use the bare variant name without parentheses",
-				),
-			)
+			Err(check_rejection(name.span, PayloadFreeVariantCalled(contract.variant)))
 		Payload(payload):
 			Ok({
 				type_parameters = NoTypeParameter,
@@ -1365,31 +1287,20 @@ private pure func constructor_base(
 	expected_type: Option[TypeRef],
 	called: Bool,
 	context: ResolutionContext,
-) -> Result[ResolvedBase, Diagnostic]:
+) -> Result[ResolvedBase, CheckError]:
 	contract ?= contextual_constructor(name, expected_type, context)
 
 	match contract.payload:
 		Payload(payload):
-			message = if same_type(payload.value_type, IntType):
-				"constructor requires one Int argument"
-			else:
-				"constructor requires one payload argument"
-
-			help = if same_type(payload.value_type, IntType):
-				"pass one Int expression, such as Number(42)"
-			else:
-				"pass a value of the constructor's declared payload type"
-
-			Err(rejection(name.span, message, help))
+			Err(
+				check_rejection(
+					name.span,
+					MissingConstructorPayload(contract.variant, payload.value_type),
+				),
+			)
 		NoPayload:
 			if called:
-				Err(
-					rejection(
-						name.span,
-						"payload-free variants cannot be called",
-						"use the bare variant name without parentheses",
-					),
-				)
+				Err(check_rejection(name.span, PayloadFreeVariantCalled(contract.variant)))
 			else:
 				Ok({
 					base = ReturnVariant(contract.variant),
@@ -1403,7 +1314,7 @@ private pure func resolve_base(
 	base: ExpressionBase,
 	expected_type: Option[TypeRef],
 	context: ResolutionContext,
-) -> Result[ResolvedBase, Diagnostic]:
+) -> Result[ResolvedBase, CheckError]:
 	match base:
 		IntegerExpression(value):
 			Ok({
@@ -1421,15 +1332,9 @@ private pure func resolve_base(
 					if contains_variant(context.unions, name.id):
 						constructor_base(name, expected_type, False, context)
 					else:
-						Err(
-							rejection(
-								name.span,
-								"unknown value",
-								"use this function's parameter name, a declared variant, or a call",
-							),
-						)
+						Err(check_rejection(name.span, UnknownValue(name.id)))
 		DirectApplication(name, _):
-			Err(internal_error(name.span, "call reached simple base checking"))
+			Err(checker_invariant(name.span, DirectCallInSimpleBase(name.id)))
 
 
 private fixed record ResolvedValue {
@@ -1451,7 +1356,7 @@ private pure func resolve_arguments(
 	receiver: Option[ResolvedValue],
 	contract: CallContract,
 	context: ResolutionContext,
-) -> Result[ResolvedArguments, Diagnostic]:
+) -> Result[ResolvedArguments, CheckError]:
 	var types: List[TypeUse] = []
 	var values: List[CheckedValue] = []
 
@@ -1466,7 +1371,7 @@ private pure func resolve_arguments(
 		None:
 			void
 
-	var failure: Option[Diagnostic] = None
+	var failure: Option[CheckError] = None
 
 	for argument in arguments:
 		expectation = match contract.parameter_types.get(types.length()):
@@ -1501,7 +1406,7 @@ private pure func resolve_arguments(
 	for actual in types:
 		match instantiated.parameter_types.get(index):
 			None:
-				failure = Some(internal_error(contract.span, "missing call parameter"))
+				failure = Some(checker_invariant(contract.span, MissingCallParameter(index)))
 				break
 			Some(expected):
 				span = if IntOps.equals(types.length(), 1):
@@ -1510,14 +1415,15 @@ private pure func resolve_arguments(
 					actual.span
 
 				if not same_type(actual.value_type, expected.value_type):
-					failure = Some(
-						type_rejection(
-							span,
-							"argument type does not match the parameter type",
-							expected.value_type,
-							context,
-						),
-					)
+					failure = Some(check_rejection(
+						span,
+						ArgumentTypeMismatch({
+							expected = expected.value_type,
+							actual = actual,
+							argument_position = index,
+							expected_site = parameter_site(instantiated, expected),
+						}),
+					))
 					break
 
 		index = IntOps.add(index, 1)
@@ -1540,10 +1446,10 @@ private pure func resolve_expression(
 	body: ValueExpression,
 	expected_type: Option[TypeRef],
 	context: ResolutionContext,
-) -> Result[ResolvedValue, Diagnostic]:
+) -> Result[ResolvedValue, CheckError]:
 	-- Resolve complete outer contracts once before checking their children.
 	var contracts: List[CallContract] = []
-	var failure: Option[Diagnostic] = None
+	var failure: Option[CheckError] = None
 
 	for application in body.applications:
 		match classify_call(
@@ -1560,7 +1466,7 @@ private pure func resolve_expression(
 			Ok(FunctionApplication(contract)):
 				contracts = contracts.append(contract)
 			Ok(ConstructorApplication(name)):
-				failure = Some(internal_error(name.span, "constructor receiver passed resolution"))
+				failure = Some(checker_invariant(name.span, ConstructorReceiver(name.id)))
 				break
 
 	ready ?= match failure:
@@ -1581,7 +1487,7 @@ private pure func resolve_expression(
 		None:
 			expected_type
 
-	base_result: Result[ResolvedValue, Diagnostic] = match body.base:
+	base_result: Result[ResolvedValue, CheckError] = match body.base:
 		DirectApplication(name, arguments):
 			classified ?= classify_call(
 				purity,
@@ -1618,10 +1524,13 @@ private pure func resolve_expression(
 							Ok(void)
 						else:
 							Err(
-								rejection(
+								check_rejection(
 									name.span,
-									"constructor requires one payload argument",
-									"pass exactly one expression of the declared payload type",
+									match contract.operation:
+										ConstructVariant(id):
+											ConstructorPayloadArity(id, arguments.length())
+										InvokeFunction(_, _):
+											InternalInvariant(InvalidFunctionContract)
 								),
 							)
 
@@ -1633,9 +1542,18 @@ private pure func resolve_expression(
 							contract,
 							context,
 						)
-						value ?= resolved.values
-							.get(0)
-							.to_result(internal_error(name.span, "missing constructor argument"))
+
+						value ?= match resolved.values.get(0):
+							Some(value):
+								Ok(value)
+							None:
+								Err(
+									checker_invariant(
+										name.span,
+										MissingConstructorArgument(name.id),
+									),
+								)
+
 						Ok({
 							value = { value | operations = value.operations.append({
 									operation = contract.operation,
@@ -1651,7 +1569,7 @@ private pure func resolve_expression(
 						InvokeFunction(call, _):
 							Ok(call)
 						_:
-							Err(internal_error(name.span, "invalid function contract"))
+							Err(checker_invariant(name.span, InvalidFunctionContract))
 
 					Ok({
 						value = {
@@ -1681,7 +1599,12 @@ private pure func resolve_expression(
 	for application in body.applications:
 		match contracts.get(index):
 			None:
-				failure = Some(internal_error(application.callee.span, "missing receiver contract"))
+				failure = Some(
+					checker_invariant(
+						application.callee.span,
+						MissingReceiverContract(index),
+					),
+				)
 				break
 			Some(contract):
 				match resolve_receiver(
@@ -1707,17 +1630,6 @@ private pure func resolve_expression(
 			Ok(void)
 
 	Ok(current)
-
-
-private pure func uninferable(span: Span) -> Diagnostic:
-	rejection(
-		span,
-		"cannot infer the type parameter from the argument",
-		Text.concat(
-			"pass a value whose type determines the declared type parameter; use a concrete ",
-			"helper when no argument can determine it",
-		),
-	)
 
 
 private pure func substitute_type(
@@ -1768,19 +1680,24 @@ private pure func instantiate_contract(
 	contract: CallContract,
 	actual: List[TypeUse],
 	context: ResolutionContext,
-) -> Result[CallContract, Diagnostic]:
+) -> Result[CallContract, CheckError]:
 	match contract.type_parameters:
 		NoTypeParameter:
 			Ok(contract)
 		OneTypeParameter(parameter):
-			var inferred: Option[TypeRef] = None
+			var inferred: Option[TypeUse] = None
 			var index: Int = 0
-			var failure: Option[Diagnostic] = None
+			var failure: Option[CheckError] = None
 
 			for value in actual:
 				match contract.parameter_types.get(index):
 					None:
-						failure = Some(internal_error(contract.span, "missing generic parameter"))
+						failure = Some(
+							checker_invariant(
+								contract.span,
+								MissingGenericParameter(index),
+							),
+						)
 						break
 					Some(written):
 						match infer_type_argument(written.value_type, value.value_type, parameter):
@@ -1789,21 +1706,36 @@ private pure func instantiate_contract(
 							Some(argument):
 								match inferred:
 									None:
-										inferred = Some(argument)
+										inferred = Some({
+											value_type = argument,
+											span = value.span,
+										})
 									Some(previous):
-										if not same_type(argument, previous):
-											failure = Some(
-												type_rejection(
-													value.span,
-													"argument type does not match the parameter type",
-													substitute_type(
-														written.value_type,
-														parameter,
-														previous,
-													),
-													context,
-												),
-											)
+										if not same_type(argument, previous.value_type):
+											failure = Some(check_rejection(
+												value.span,
+												GenericArgumentConflict({
+													parameter = parameter,
+													previous = previous,
+													current = {
+														value_type = argument,
+														span = value.span
+													},
+													mismatch = {
+														expected = substitute_type(
+															written.value_type,
+															parameter,
+															previous.value_type,
+														),
+														actual = value,
+														argument_position = index,
+														expected_site = parameter_site(
+															contract,
+															written,
+														)
+													},
+												}),
+											))
 											break
 
 				index = IntOps.add(index, 1)
@@ -1814,7 +1746,11 @@ private pure func instantiate_contract(
 				None:
 					Ok(void)
 
-			argument ?= inferred.to_result(uninferable(contract.span))
+			argument ?= match inferred:
+				Some(argument):
+					Ok(argument)
+				None:
+					Err(check_rejection(contract.span, UninferableTypeParameter(parameter)))
 
 			operation ?= match contract.operation:
 				InvokeFunction(call, arguments):
@@ -1822,14 +1758,19 @@ private pure func instantiate_contract(
 						UserFunction(id, _):
 							Ok(
 								InvokeFunction(
-									{ call | target = UserFunction(id, InstantiateWith(argument)) },
+									{ call |
+										target = UserFunction(
+											id,
+											InstantiateWith(argument.value_type),
+										)
+									},
 									arguments,
 								),
 							)
 						RuntimeFunction(_):
-							Err(internal_error(contract.span, "runtime call has a type parameter"))
+							Err(checker_invariant(contract.span, RuntimeGenericContract))
 				ConstructVariant(_):
-					Err(internal_error(contract.span, "generic constructor contract"))
+					Err(checker_invariant(contract.span, GenericConstructorContract))
 
 			Ok({ contract |
 					type_parameters = NoTypeParameter,
@@ -1838,10 +1779,18 @@ private pure func instantiate_contract(
 						pure func(
 							written: TypeUse,
 						) -> TypeUse: { written |
-							value_type = substitute_type(written.value_type, parameter, argument)
+							value_type = substitute_type(
+								written.value_type,
+								parameter,
+								argument.value_type,
+							)
 						},
 					),
-					return_type = substitute_type(contract.return_type, parameter, argument)
+					return_type = substitute_type(
+						contract.return_type,
+						parameter,
+						argument.value_type,
+					)
 				})
 
 
@@ -1888,7 +1837,7 @@ private pure func resolve_variant_pattern(
 	span: Span,
 	ordinal: Int,
 	scope: List[LocalBinding],
-) -> Result[ResolvedPattern, Diagnostic]:
+) -> Result[ResolvedPattern, CheckError]:
 	match contract.payload:
 		NoPayload:
 			match fields:
@@ -1899,22 +1848,16 @@ private pure func resolve_variant_pattern(
 						binding = None,
 					})
 				OnePatternField(_):
-					Err(
-						rejection(
-							span,
-							"constructor pattern takes no fields",
-							"use the bare variant name or Variant() without field patterns",
-						),
-					)
+					Err(check_rejection(span, PatternUnexpectedField(contract.variant)))
 		Payload(payload):
 			match fields:
 				NoPatternFields:
-					help = if same_type(payload.value_type, IntType):
-						"write Variant(name) to bind the Int field, or Variant(_) to ignore it"
-					else:
-						"write Variant(name) to bind the payload, or Variant(_) to ignore it"
-
-					Err(rejection(span, "constructor pattern requires one field", help))
+					Err(
+						check_rejection(
+							span,
+							PatternMissingField(contract.variant, payload.value_type),
+						),
+					)
 				OnePatternField(field):
 					match field:
 						FieldWildcard(_):
@@ -1944,7 +1887,7 @@ private pure func resolve_pattern(
 	ordinal: Int,
 	scope: List[LocalBinding],
 	context: ResolutionContext,
-) -> Result[ResolvedPattern, Diagnostic]:
+) -> Result[ResolvedPattern, CheckError]:
 	match pattern:
 		PatternWildcard(_):
 			Ok({
@@ -1981,13 +1924,7 @@ private pure func resolve_pattern(
 				Some(contract):
 					resolve_variant_pattern(contract, fields, span, ordinal, scope)
 				None:
-					Err(
-						rejection(
-							span,
-							"unknown constructor pattern",
-							"use an unshadowed variant of the matched union; rename a shadowing local binding",
-						),
-					)
+					Err(check_rejection(span, UnknownConstructorPattern(name.id, union_type)))
 
 
 private pure func same_variant(left: VariantId, right: VariantId) -> Bool:
@@ -2001,7 +1938,7 @@ private pure func remaining_after(
 	pattern: CheckedPattern,
 	remaining: List[VariantId],
 	span: Span,
-) -> Result[List[VariantId], Diagnostic]:
+) -> Result[List[VariantId], CheckError]:
 	var next: List[VariantId] = []
 	var useful = False
 
@@ -2020,71 +1957,7 @@ private pure func remaining_after(
 	if useful:
 		Ok(next)
 	else:
-		Err(
-			rejection(
-				span,
-				"match arm is unreachable",
-				"remove this arm; earlier arms already cover all values it could match",
-			),
-		)
-
-
-private pure func missing_coverage(
-	remaining: List[VariantId],
-	span: Span,
-	context: ResolutionContext,
-) -> Diagnostic:
-	var names: String = ""
-	var failure: Option[Diagnostic] = None
-
-	for id in remaining:
-		match missing_variant_name(id, span, context):
-			Err(error):
-				failure = Some(error)
-				break
-			Ok(name):
-				if not IntOps.equals(names.length(), 0):
-					names = names.concat(", ")
-
-				names = names.concat(name)
-
-	match failure:
-		Some(error):
-			error
-		None:
-			prefix = if IntOps.equals(remaining.length(), 1):
-				"add an arm for the missing variant: "
-			else:
-				"add arms for the missing variants: "
-
-			rejection(
-				span,
-				"non-exhaustive match",
-				Text.concat(prefix, names),
-			)
-
-
-private pure func missing_variant_name(
-	id: VariantId,
-	span: Span,
-	context: ResolutionContext,
-) -> Result[String, Diagnostic]:
-	declaration ?= context.unions
-		.get(union_number(variant_owner(id)))
-		.to_result(internal_error(span, "invalid resolved union identity"))
-	variant ?= declaration.variants
-		.get(variant_number(id))
-		.to_result(internal_error(span, "invalid resolved variant identity"))
-	name ?= name_spelling(
-		context.names,
-		variant.name.id,
-	).to_result(internal_error(span, "invalid parsed name identity"))
-
-	match variant.payload:
-		NoPayloadSyntax:
-			Ok(name)
-		OnePayloadSyntax(_):
-			Ok(name.concat("(_)"))
+		Err(check_rejection(span, UnreachableArm))
 
 
 private fixed record ResolvedMatch {
@@ -2095,32 +1968,30 @@ private fixed record ResolvedMatch {
 
 private pure func resolve_match(
 	purity: Purity,
-	return_type: TypeRef,
+	return_type: TypeUse,
 	scope: List[LocalBinding],
 	body: ParsedMatch,
 	bindings: List[BindingDefinition],
 	context: ResolutionContext,
-) -> Result[ResolvedMatch, Diagnostic]:
+) -> Result[ResolvedMatch, CheckError]:
 	scrutinee ?= resolve_value(purity, scope, body.scrutinee, None, context)
 
-	owner_result: Result[UnionId, Diagnostic] = match scrutinee.value_type:
+	owner_result: Result[UnionId, CheckError] = match scrutinee.value_type:
 		AppliedUnionType(id, _):
 			Ok(id)
 		UnionType(id):
 			Ok(id)
 		IntType | StringType | ParameterType(_):
-			Err(
-				rejection(
-					body.scrutinee.span,
-					"match requires a union value",
-					"match a typed union parameter or a call returning a declared union",
-				),
-			)
+			Err(check_rejection(body.scrutinee.span, MatchRequiresUnion(scrutinee.value_type)))
 
 	owner ?= owner_result
-	declaration ?= context.checked_unions
-		.get(union_number(owner))
-		.to_result(internal_error(body.keyword_span, "invalid checked union identity"))
+
+	declaration ?= match context.checked_unions.get(union_number(owner)):
+		Some(declaration):
+			Ok(declaration)
+		None:
+			Err(checker_invariant(body.keyword_span, InvalidCheckedUnion(owner)))
+
 	var remaining: List[VariantId] = []
 	var position: Int = 0
 
@@ -2133,7 +2004,7 @@ private pure func resolve_match(
 		position = IntOps.add(position, 1)
 
 	var arms: List[CheckedArm] = []
-	var failure: Option[Diagnostic] = None
+	var failure: Option[CheckError] = None
 	var definitions = bindings
 
 	for arm in body.arms:
@@ -2170,7 +2041,7 @@ private pure func resolve_match(
 					bindings = definitions,
 				})
 			else:
-				Err(missing_coverage(remaining, body.keyword_span, context))
+				Err(check_rejection(body.keyword_span, NonExhaustiveMatch(remaining)))
 
 
 private fixed record ResolvedArm {
@@ -2182,14 +2053,14 @@ private fixed record ResolvedArm {
 
 private pure func resolve_arm(
 	purity: Purity,
-	return_type: TypeRef,
+	return_type: TypeUse,
 	union_type: TypeRef,
 	bindings: List[BindingDefinition],
 	scope: List[LocalBinding],
 	arm: ParsedMatchArm,
 	remaining: List[VariantId],
 	context: ResolutionContext,
-) -> Result[ResolvedArm, Diagnostic]:
+) -> Result[ResolvedArm, CheckError]:
 	pattern ?= resolve_pattern(arm.pattern, union_type, bindings.length(), scope, context)
 	remaining ?= remaining_after(pattern.pattern, remaining, pattern_span(arm.pattern))
 
@@ -2200,7 +2071,10 @@ private pure func resolve_arm(
 			bindings
 
 	prefix ?= resolve_bindings(arm.bindings, purity, pattern.scope, definitions, context)
-	value ?= resolve_value(purity, prefix.scope, arm.body, Some(return_type), context)
+	value ?= resolve_value(purity, prefix.scope, arm.body, Some({
+			value_type = return_type.value_type,
+			site = SourceAnnotation(return_type.span),
+		}), context)
 	Ok({
 		arm = {
 			pattern = pattern.pattern,
@@ -2225,15 +2099,20 @@ private pure func pattern_span(pattern: ParsedPattern) -> Span:
 private pure func function_scope(
 	function: ParsedFunction,
 	signature: FunctionSignature,
-) -> Result[List[LocalBinding], Diagnostic]:
+) -> Result[List[LocalBinding], CheckError]:
 	var scope: List[LocalBinding] = []
 	var index: Int = 0
-	var failure: Option[Diagnostic] = None
+	var failure: Option[CheckError] = None
 
 	for parameter in function.parameters:
 		match signature.parameters.get(index):
 			None:
-				failure = Some(internal_error(parameter.name.span, "invalid resolved parameter"))
+				failure = Some(
+					checker_invariant(
+						parameter.name.span,
+						InvalidResolvedParameter(index),
+					),
+				)
 				break
 			Some(value_type):
 				scope = scope.append({
@@ -2277,11 +2156,11 @@ private pure func resolve_assignment(
 	ordinal: Int,
 	block_start: Int,
 	context: ResolutionContext,
-) -> Result[ResolvedAssignment, Diagnostic]:
+) -> Result[ResolvedAssignment, CheckError]:
 	previous = lookup_binding(scope, written.name.id)
 	empty: Option[LocalBinding] = None
 
-	decision: Result[Option[LocalBinding], Diagnostic] = match written.mutability:
+	decision: Result[Option[LocalBinding], CheckError] = match written.mutability:
 		MutableBinding:
 			match previous:
 				Some(binding):
@@ -2292,13 +2171,9 @@ private pure func resolve_assignment(
 								block_start,
 							):
 								Err(
-									rejection(
+									check_rejection(
 										written.name.span,
-										"duplicate local binding",
-										Text.concat(
-											"give each body-local declaration a distinct name; ",
-											"omit var to reassign a mutable binding",
-										),
+										DuplicateLocal(binding_site(context.function, binding)),
 									),
 								)
 							else:
@@ -2315,10 +2190,9 @@ private pure func resolve_assignment(
 							Ok(Some(binding))
 						Immutable:
 							Err(
-								rejection(
+								check_rejection(
 									written.name.span,
-									"cannot assign to an immutable binding",
-									"declare the binding with var to allow reassignment",
+									ImmutableAssignment(binding_site(context.function, binding)),
 								),
 							)
 				None:
@@ -2329,7 +2203,10 @@ private pure func resolve_assignment(
 		purity,
 		scope,
 		written.initializer,
-		reassign.map(pure func(binding: LocalBinding) -> TypeRef: binding.definition.value_type),
+		reassign.map(pure func(binding: LocalBinding) -> ExpectedValue: {
+				value_type = binding.definition.value_type,
+				site = InferredBindingDeclaration(binding_site(context.function, binding))
+			}),
 		context,
 	)
 
@@ -2380,11 +2257,11 @@ private pure func resolve_bindings(
 	initial: List[LocalBinding],
 	bindings: List[BindingDefinition],
 	context: ResolutionContext,
-) -> Result[ResolvedBindings, Diagnostic]:
+) -> Result[ResolvedBindings, CheckError]:
 	var scope = initial
 	var definitions = bindings
 	var assignments: List[CheckedAssignment] = []
-	var failure: Option[Diagnostic] = None
+	var failure: Option[CheckError] = None
 
 	-- Function-owned ordinals distinguish this block's declarations from outer
 	-- bindings and the arm capture. Only explicit var may shadow those bindings.
@@ -2425,7 +2302,7 @@ private pure func resolve_body(
 	function: ParsedFunction,
 	signature: FunctionSignature,
 	context: ResolutionContext,
-) -> Result[ResolvedBody, Diagnostic]:
+) -> Result[ResolvedBody, CheckError]:
 	initial ?= function_scope(function, signature)
 	prefix ?= resolve_bindings(
 		function.bindings,
@@ -2437,13 +2314,10 @@ private pure func resolve_body(
 
 	match function.body:
 		ParsedValueBody(body):
-			value ?= resolve_value(
-				signature.purity,
-				prefix.scope,
-				body,
-				Some(signature.return_type.value_type),
-				context,
-			)
+			value ?= resolve_value(signature.purity, prefix.scope, body, Some({
+					value_type = signature.return_type.value_type,
+					site = SourceAnnotation(signature.return_type.span),
+				}), context)
 			Ok({
 				bindings = prefix.bindings,
 				assignments = prefix.assignments,
@@ -2452,7 +2326,7 @@ private pure func resolve_body(
 		ParsedMatchBody(body):
 			matched ?= resolve_match(
 				signature.purity,
-				signature.return_type.value_type,
+				signature.return_type,
 				prefix.scope,
 				body,
 				prefix.bindings,
@@ -2466,13 +2340,24 @@ private pure func resolve_body(
 
 
 private pure func resolve_functions(
-	context: ResolutionContext,
-) -> Result[List[CheckedFunction], Diagnostic]:
+	parsed: ParsedContents,
+	signatures: List[FunctionSignature],
+	unions: List[CheckedUnion],
+) -> Result[List[CheckedFunction], CheckError]:
 	var functions: List[CheckedFunction] = []
-	var failure: Option[Diagnostic] = None
+	var failure: Option[CheckError] = None
 	var index: Int = 0
 
-	for function in context.functions:
+	for function in parsed.functions:
+		context: ResolutionContext = {
+			function = into_opaque FunctionId(index),
+			functions = parsed.functions,
+			signatures = signatures,
+			unions = parsed.unions,
+			checked_unions = unions,
+			prelude = parsed.prelude
+		}
+
 		match resolve_function(function, index, context):
 			Err(error):
 				failure = Some(error)
@@ -2493,15 +2378,18 @@ private pure func resolve_function(
 	function: ParsedFunction,
 	index: Int,
 	context: ResolutionContext,
-) -> Result[CheckedFunction, Diagnostic]:
-	signature ?= context.signatures
-		.get(index)
-		.to_result(
-			internal_error(
-				function.function_name.span,
-				"invalid resolved function identity",
-			),
-		)
+) -> Result[CheckedFunction, CheckError]:
+	signature ?= match context.signatures.get(index):
+		Some(signature):
+			Ok(signature)
+		None:
+			Err(
+				checker_invariant(
+					function.function_name.span,
+					InvalidResolvedFunction(context.function),
+				),
+			)
+
 	body ?= resolve_body(function, signature, context)
 	Ok({
 		signature = signature,
@@ -2623,7 +2511,7 @@ private pure func unsettled_body(body: CheckedBody, settled: List[FunctionId]) -
 			found
 
 
-private pure func validate_acyclic(functions: List[CheckedFunction]) -> Result[Void, Diagnostic]:
+private pure func validate_acyclic(functions: List[CheckedFunction]) -> Result[Void, CheckError]:
 	-- Settle only functions whose complete base/wrapper callee set is settled.
 	-- Every successful step adds a distinct identity; leftovers contain or reach
 	-- a cycle. Repeating an acyclic callee inside one body does not form a cycle.
@@ -2643,18 +2531,12 @@ private pure func validate_acyclic(functions: List[CheckedFunction]) -> Result[V
 
 			index = IntOps.add(index, 1)
 
-	var failure: Option[Diagnostic] = None
+	var failure: Option[CheckError] = None
 
 	for function in functions:
 		match unsettled_edge(function, settled):
 			Some(span):
-				failure = Some(
-					rejection(
-						span,
-						"call chain contains recursion",
-						"use an acyclic call chain; recursion is not supported in this increment",
-					),
-				)
+				failure = Some(check_rejection(span, RecursiveCallChain))
 				break
 			None:
 				void
@@ -2670,16 +2552,15 @@ private pure func validate_prelude_conflicts(
 	functions: List[ParsedFunction],
 	unions: List[ParsedUnion],
 	prelude: CheckedPrelude,
-) -> Result[Void, Diagnostic]:
-	var failure: Option[Diagnostic] = None
+) -> Result[Void, CheckError]:
+	var failure: Option[CheckError] = None
 
 	for function in functions:
 		if runtime_operation(prelude, function.function_name.id).is_some():
 			failure = Some(
-				rejection(
+				check_rejection(
 					function.function_name.span,
-					"function name conflicts with the prelude",
-					"rename this function or change the explicit prelude declaration",
+					FunctionPreludeConflict(function.function_name.id),
 				),
 			)
 			break
@@ -2689,10 +2570,9 @@ private pure func validate_prelude_conflicts(
 			for variant in declaration.variants:
 				if runtime_operation(prelude, variant.name.id).is_some():
 					failure = Some(
-						rejection(
+						check_rejection(
 							variant.name.span,
-							"variant name conflicts with a prelude function",
-							"give functions and union variants distinct names",
+							VariantPreludeConflict(variant.name.id),
 						),
 					)
 					break
@@ -2707,21 +2587,14 @@ private pure func validate_prelude_conflicts(
 			Ok(void)
 
 
-pure func check(program: ParsedProgram) -> Result[CheckedProgram, Diagnostic]:
+private pure func check_program(program: ParsedProgram) -> Result[CheckedProgram, CheckError]:
 	parsed = parsed_contents(program)
 	prelude = parsed.prelude
 	special = prelude_names(prelude).special
 	conflicts ?= validate_prelude_conflicts(parsed.functions, parsed.unions, prelude)
 	unions ?= validate_unions(parsed.unions, parsed.functions, special)
 	signatures ?= validate_signatures(parsed.functions, parsed.unions, parsed.end, special)
-	functions ?= resolve_functions({
-		functions = parsed.functions,
-		signatures = signatures.functions,
-		unions = parsed.unions,
-		checked_unions = unions,
-		names = parsed.names,
-		prelude = prelude,
-	})
+	functions ?= resolve_functions(parsed, signatures.functions, unions)
 	acyclic ?= validate_acyclic(functions)
 	Ok(into_opaque CheckedProgram({
 				unions = unions,
@@ -2737,14 +2610,14 @@ private pure func resolve_receiver(
 	arguments: List[ValueExpression],
 	contract: CallContract,
 	context: ResolutionContext,
-) -> Result[ResolvedValue, Diagnostic]:
+) -> Result[ResolvedValue, CheckError]:
 	resolved ?= resolve_arguments(purity, scope, arguments, Some(current), contract, context)
 
 	operation ?= match resolved.contract.operation:
 		InvokeFunction(call, _):
 			Ok(InvokeFunction(call, resolved.values))
 		_:
-			Err(internal_error(contract.span, "invalid receiver contract"))
+			Err(checker_invariant(contract.span, InvalidReceiverContract))
 
 	Ok({
 		value = { current.value | operations = current.value.operations.append({
@@ -2763,7 +2636,7 @@ private pure func classify_call(
 	arity: Int,
 	scope: List[LocalBinding],
 	context: ResolutionContext,
-) -> Result[ResolvedApplication, Diagnostic]:
+) -> Result[ResolvedApplication, CheckError]:
 	local = match notation:
 		DirectCall:
 			lookup_binding(scope, name.id)
@@ -2772,7 +2645,7 @@ private pure func classify_call(
 
 	callable ?= match local:
 		Some(binding):
-			Err(non_callable(binding, name.span))
+			Err(non_callable(binding, name.span, context.function))
 		None:
 			Ok(void)
 
@@ -2787,21 +2660,9 @@ private pure func classify_call(
 					DirectCall:
 						Ok(ConstructorApplication(name))
 					ReceiverCall:
-						Err(
-							rejection(
-								name.span,
-								"constructors do not support UFCS in this increment",
-								"write the constructor directly, such as Number(value)",
-							),
-						)
+						Err(check_rejection(name.span, ConstructorUFCS(name.id)))
 			else:
-				Err(
-					rejection(
-						name.span,
-						"unknown function",
-						"declare the called function in this file or the explicit prelude",
-					),
-				)
+				Err(check_rejection(name.span, UnknownFunction(name.id)))
 
 
 private pure func contains_parameter(value_type: TypeRef) -> Bool:
@@ -2818,25 +2679,707 @@ private pure func resolve_value(
 	purity: Purity,
 	scope: List[LocalBinding],
 	body: ValueExpression,
-	expected_type: Option[TypeRef],
+	expected_type: Option[ExpectedValue],
 	context: ResolutionContext,
-) -> Result[ResolvedValue, Diagnostic]:
-	value ?= resolve_expression(purity, scope, body, expected_type, context)
+) -> Result[ResolvedValue, CheckError]:
+	value ?= resolve_expression(
+		purity,
+		scope,
+		body,
+		expected_type.map(pure func(expected): expected.value_type),
+		context,
+	)
 
 	accepted ?= match expected_type:
 		None:
 			Ok(void)
 		Some(expected):
-			if same_type(value.value_type, expected):
+			if same_type(value.value_type, expected.value_type):
 				Ok(void)
 			else:
-				Err(
-					type_rejection(
-						body.span,
-						"expression does not match the expected type",
-						expected,
-						context,
+				Err(check_rejection(
+					body.span,
+					ExpressionTypeMismatch({
+						expected = expected.value_type,
+						actual = {
+							value_type = value.value_type,
+							span = body.span
+						},
+						expected_site = expected.site,
+					}),
+				))
+
+	Ok(value)
+
+
+pure func check(program: ParsedProgram) -> Result[CheckedProgram, CheckFailure]:
+	match check_program(program):
+		Ok(checked):
+			Ok(checked)
+		Err(error):
+			Err(into_opaque CheckFailure({
+						program = program,
+						errors = {
+							first = error,
+							remaining = []
+						}
+					}))
+
+
+pure func check_errors(failure: CheckFailure) -> CheckErrors:
+	from_opaque CheckFailure(failure).errors
+
+
+pure func render_failure(failure: CheckFailure) -> Diagnostics:
+	contents = from_opaque CheckFailure(failure)
+	render_check_errors(contents.program, contents.errors)
+
+
+pure func render_check_errors(program: ParsedProgram, errors: CheckErrors) -> Diagnostics:
+	var remaining: List[Diagnostic] = []
+
+	for error in errors.remaining:
+		remaining = remaining.append(render_check_error(program, error))
+
+	{
+		first = render_check_error(program, errors.first),
+		remaining = remaining
+	}
+
+
+private pure func check_rejection(span: Span, kind: CheckErrorKind) -> CheckError:
+	{
+		span = span,
+		kind = kind
+	}
+
+
+private pure func binding_site(function: FunctionId, binding: LocalBinding) -> BindingSite:
+	{
+		function = function,
+		binding = binding.id,
+		name = binding.name,
+		span = binding.definition.span
+	}
+
+
+private pure func parameter_site(contract: CallContract, parameter: TypeUse) -> ExpectedTypeSite:
+	match contract.operation:
+		InvokeFunction(call, _):
+			match call.target:
+				RuntimeFunction(operation):
+					RuntimeContract(operation)
+				UserFunction(_, _):
+					SourceAnnotation(parameter.span)
+		ConstructVariant(_):
+			SourceAnnotation(parameter.span)
+
+
+private pure func non_callable(
+	binding: LocalBinding,
+	span: Span,
+	function: FunctionId,
+) -> CheckError:
+	check_rejection(
+		span,
+		UncallableBinding(
+			binding_site(function, binding),
+			binding.definition.origin,
+			binding.definition.value_type,
+		),
+	)
+
+
+fixed union CheckerInvariant:
+	InvalidResolvedFunction(FunctionId)
+	InvalidUnionDeclaration(UnionId)
+	VariantOccurrenceWithoutUnion(TypeRef)
+	InvalidResolvedUnion(UnionId)
+	InvalidCheckedUnion(UnionId)
+	InvalidResolvedVariant(VariantId)
+	InvalidParameterDeclaration(TypeParameterId)
+	InvalidParameterName(TypeParameterId)
+	ParameterOwnerWithoutParameter(TypeParameterId)
+	InvalidParsedName(NameId)
+	DirectCallInSimpleBase(NameId)
+	MissingCallParameter(Int)
+	ConstructorReceiver(NameId)
+	MissingConstructorArgument(NameId)
+	InvalidFunctionContract
+	MissingReceiverContract(Int)
+	MissingGenericParameter(Int)
+	RuntimeGenericContract
+	GenericConstructorContract
+	InvalidResolvedParameter(Int)
+	InvalidReceiverContract
+	InvalidCallName(NameId)
+
+
+private pure func invariant_message(invariant: CheckerInvariant) -> String:
+	match invariant:
+		InvalidResolvedFunction(_):
+			"invalid resolved function identity"
+		InvalidUnionDeclaration(_):
+			"invalid union declaration"
+		VariantOccurrenceWithoutUnion(_):
+			"variant occurrence has no union type"
+		InvalidResolvedUnion(_):
+			"invalid resolved union identity"
+		InvalidCheckedUnion(_):
+			"invalid checked union identity"
+		InvalidResolvedVariant(_):
+			"invalid resolved variant identity"
+		InvalidParameterDeclaration(_):
+			"invalid parameter declaration"
+		InvalidParameterName(_):
+			"invalid parameter name"
+		ParameterOwnerWithoutParameter(_):
+			"parameter owner has no parameter"
+		InvalidParsedName(_):
+			"invalid parsed name identity"
+		DirectCallInSimpleBase(_):
+			"call reached simple base checking"
+		MissingCallParameter(_):
+			"missing call parameter"
+		ConstructorReceiver(_):
+			"constructor receiver passed resolution"
+		MissingConstructorArgument(_):
+			"missing constructor argument"
+		InvalidFunctionContract:
+			"invalid function contract"
+		MissingReceiverContract(_):
+			"missing receiver contract"
+		MissingGenericParameter(_):
+			"missing generic parameter"
+		RuntimeGenericContract:
+			"runtime call has a type parameter"
+		GenericConstructorContract:
+			"generic constructor contract"
+		InvalidResolvedParameter(_):
+			"invalid resolved parameter"
+		InvalidReceiverContract:
+			"invalid receiver contract"
+		InvalidCallName(_):
+			"invalid call name identity"
+
+
+private pure func rendered(span: Span, message: String, help: String) -> Diagnostic:
+	{
+		span = span,
+		note = NoDiagnosticNote,
+		message = message,
+		help = help
+	}
+
+
+private pure func render_fault(span: Span, invariant: CheckerInvariant) -> Diagnostic:
+	rendered(
+		span,
+		invariant_message(invariant),
+		"report this compiler error with the input program",
+	)
+
+
+private pure func builtin_spelling(
+	name: NameId,
+	context: ParsedContents,
+	span: Span,
+) -> Result[String, Diagnostic]:
+	name_spelling(context.names, name).to_result(render_fault(span, InvalidParsedName(name)))
+
+
+pure func render_check_error(program: ParsedProgram, error: CheckError) -> Diagnostic:
+	render_error(error, parsed_contents(program))
+
+
+private pure func render_error(error: CheckError, context: ParsedContents) -> Diagnostic:
+	match error.kind:
+		DuplicateVariant(_, _):
+			rendered(
+				error.span,
+				"duplicate variant name",
+				"give each variant in a union a distinct name",
+			)
+		VariantFunctionConflict(_, _, _):
+			rendered(
+				error.span,
+				"variant name conflicts with a function",
+				"give functions and union variants distinct names",
+			)
+		DuplicateUnion(_, _):
+			rendered(
+				error.span,
+				"duplicate union type name",
+				"give union types distinct names; Int and String are declared by the prelude",
+			)
+		TypeParameterTypeNameConflict(_):
+			rendered(
+				error.span,
+				"type parameter conflicts with a type name",
+				"choose a distinct type parameter name, such as T",
+			)
+		GenericMain(_):
+			rendered(
+				error.span,
+				"main cannot be generic",
+				"declare main() -> Int: without type parameters",
+			)
+		MissingUnionTypeArguments(_):
+			rendered(
+				error.span,
+				"generic union requires one type argument",
+				"write a concrete or symbolic application, such as Box[Int] or Box[T]",
+			)
+		UnknownType(_):
+			rendered(
+				error.span,
+				"unknown type",
+				"use Int, String, a declared type parameter, or a fixed union declared in this ".concat(
+					"file",
+				),
+			)
+		NonApplicableType(_):
+			rendered(
+				error.span,
+				"type does not accept a type argument",
+				"apply a declared generic union, such as Box[Int]",
+			)
+		OrdinaryUnionApplied(_):
+			rendered(
+				error.span,
+				"ordinary union does not accept a type argument",
+				"remove the type argument from this union type",
+			)
+		MainHasParameters(_):
+			rendered(
+				error.span,
+				"main cannot have a parameter",
+				"declare main() -> Int: with no parameters",
+			)
+		DuplicateParameter(_, _):
+			rendered(error.span, "duplicate parameter name", "give each parameter a distinct name")
+		MainReturnType(_):
+			rendered(error.span, "main must return Int", "declare main() -> Int: as the entrypoint")
+		DuplicateFunction(_, _):
+			rendered(error.span, "duplicate function name", "give every function a distinct name")
+		MissingMain:
+			rendered(
+				error.span,
+				"expected a main function",
+				"declare func main() -> Int: as the entrypoint",
+			)
+		ImpureCall(_, _):
+			rendered(
+				error.span,
+				"pure functions cannot call impure functions",
+				"mark the callee pure or remove pure from the caller",
+			)
+		ConstructorNeedsExpectedType(_):
+			rendered(
+				error.span,
+				"constructor needs an expected union type",
+				"pass an already-typed union value or call a concrete helper returning the union",
+			)
+		PayloadFreeVariantCalled(_):
+			rendered(
+				error.span,
+				"payload-free variants cannot be called",
+				"use the bare variant name without parentheses",
+			)
+		UnknownValue(_):
+			rendered(
+				error.span,
+				"unknown value",
+				"use this function's parameter name, a declared variant, or a call",
+			)
+		ConstructorPayloadArity(_, _):
+			rendered(
+				error.span,
+				"constructor requires one payload argument",
+				"pass exactly one expression of the declared payload type",
+			)
+		PatternUnexpectedField(_):
+			rendered(
+				error.span,
+				"constructor pattern takes no fields",
+				"use the bare variant name or Variant() without field patterns",
+			)
+		UnknownConstructorPattern(_, _):
+			rendered(
+				error.span,
+				"unknown constructor pattern",
+				"use an unshadowed variant of the matched union; rename a shadowing local binding",
+			)
+		UnreachableArm:
+			rendered(
+				error.span,
+				"match arm is unreachable",
+				"remove this arm; earlier arms already cover all values it could match",
+			)
+		MatchRequiresUnion(_):
+			rendered(
+				error.span,
+				"match requires a union value",
+				"match a typed union parameter or a call returning a declared union",
+			)
+		DuplicateLocal(_):
+			rendered(
+				error.span,
+				"duplicate local binding",
+				Text.concat(
+					"give each body-local declaration a distinct name; ",
+					"omit var to reassign a mutable binding",
+				),
+			)
+		ImmutableAssignment(_):
+			rendered(
+				error.span,
+				"cannot assign to an immutable binding",
+				"declare the binding with var to allow reassignment",
+			)
+		RecursiveCallChain:
+			rendered(
+				error.span,
+				"call chain contains recursion",
+				"use an acyclic call chain; recursion is not supported in this increment",
+			)
+		FunctionPreludeConflict(_):
+			rendered(
+				error.span,
+				"function name conflicts with the prelude",
+				"rename this function or change the explicit prelude declaration",
+			)
+		VariantPreludeConflict(_):
+			rendered(
+				error.span,
+				"variant name conflicts with a prelude function",
+				"give functions and union variants distinct names",
+			)
+		ConstructorUFCS(_):
+			rendered(
+				error.span,
+				"constructors do not support UFCS in this increment",
+				"write the constructor directly, such as Number(value)",
+			)
+		UnknownFunction(_):
+			rendered(
+				error.span,
+				"unknown function",
+				"declare the called function in this file or the explicit prelude",
+			)
+		ArgumentTypeMismatch(mismatch):
+			type_diagnostic(
+				error.span,
+				"argument type does not match the parameter type",
+				mismatch.expected,
+				context,
+			)
+		GenericArgumentConflict(conflict):
+			type_diagnostic(
+				error.span,
+				"argument type does not match the parameter type",
+				conflict.mismatch.expected,
+				context,
+			)
+		ExpressionTypeMismatch(mismatch):
+			type_diagnostic(
+				error.span,
+				"expression does not match the expected type",
+				mismatch.expected,
+				context,
+			)
+		VariantNotInExpectedType(_, expected):
+			type_diagnostic(
+				error.span,
+				"variant does not belong to the expected type",
+				expected,
+				context,
+			)
+		UnsupportedPayloadAnnotation(_, rule):
+			match rule:
+				IntegerPayload:
+					rendered(
+						error.span,
+						"only Int payloads are supported",
+						"declare a variant with no fields or one Int field, written Variant(Int)",
+					)
+				IntegerOrParameterPayload:
+					rendered(
+						error.span,
+						"only Int or the union's type parameter may be payloads",
+						(
+							"declare no field, one Int field, or one field using this union's declared type "
+							+ "parameter"
+						),
+					)
+		UncallableBinding(_, origin, value_type):
+			match origin:
+				ParameterBinding(_):
+					message = if same_type(value_type, IntType):
+						"Int parameters cannot be called"
+					else:
+						"parameters cannot be called"
+
+					rendered(
+						error.span,
+						message,
+						"use the parameter as a value, or rename it to call the function",
+					)
+				MatchCapture:
+					rendered(
+						error.span,
+						"match bindings cannot be called",
+						"use the binding as a value, or rename it to call the function",
+					)
+				BodyLocal:
+					rendered(
+						error.span,
+						"local bindings cannot be called",
+						"use the binding as a value, or rename it to call the function",
+					)
+		ArgumentCountMismatch(arity):
+			if IntOps.equals(arity.expected, 0):
+				match arity.notation:
+					DirectCall:
+						rendered(
+							error.span,
+							"function takes no arguments",
+							"remove the argument and call the function with ()",
+						)
+					ReceiverCall:
+						match name_spelling(context.names, arity.callee):
+							Some(name):
+								rendered(
+									error.span,
+									"function takes no arguments",
+									Text
+										.concat("call ", name)
+										.concat(
+											"() directly, or choose a function with one parameter",
+										),
+								)
+							None:
+								render_fault(error.span, InvalidCallName(arity.callee))
+			else if IntOps.equals(arity.expected, 1):
+				rendered(
+					error.span,
+					"function requires one argument",
+					"pass one expression of the declared parameter type",
+				)
+			else:
+				rendered(
+					error.span,
+					"argument count does not match the function parameters",
+					(
+						"pass one expression for each declared parameter; UFCS supplies the receiver "
+						+ "first"
+					),
+				)
+		MissingConstructorPayload(_, payload):
+			if same_type(payload, IntType):
+				rendered(
+					error.span,
+					"constructor requires one Int argument",
+					"pass one Int expression, such as Number(42)",
+				)
+			else:
+				rendered(
+					error.span,
+					"constructor requires one payload argument",
+					"pass a value of the constructor's declared payload type",
+				)
+		PatternMissingField(_, payload):
+			help = if same_type(payload, IntType):
+				"write Variant(name) to bind the Int field, or Variant(_) to ignore it"
+			else:
+				"write Variant(name) to bind the payload, or Variant(_) to ignore it"
+
+			rendered(error.span, "constructor pattern requires one field", help)
+		UninferableTypeParameter(_):
+			rendered(
+				error.span,
+				"cannot infer the type parameter from the argument",
+				(
+					"pass a value whose type determines the declared type parameter; use a concrete "
+					+ "helper when no argument can determine it"
+				),
+			)
+		NonExhaustiveMatch(missing):
+			missing_coverage(missing, error.span, context)
+		InternalInvariant(invariant):
+			render_fault(error.span, invariant)
+
+
+private pure func parameter_spelling(
+	id: TypeParameterId,
+	context: ParsedContents,
+	span: Span,
+) -> Result[String, Diagnostic]:
+	written ?= match parameter_owner(id):
+		FunctionDeclaration(id):
+			context.functions
+				.get(function_number(id))
+				.map(pure func(declaration): declaration.type_parameters)
+				.to_result(
+					render_fault(
+						span,
+						InvalidParameterDeclaration(
+							into_opaque TypeParameterId(FunctionDeclaration(id)),
+						),
+					),
+				)
+		UnionDeclaration(id):
+			context.unions
+				.get(union_number(id))
+				.map(pure func(declaration): declaration.type_parameters)
+				.to_result(
+					render_fault(
+						span,
+						InvalidParameterDeclaration(
+							into_opaque TypeParameterId(UnionDeclaration(id)),
+						),
 					),
 				)
 
-	Ok(value)
+	match written:
+		OneTypeParameterSyntax(name):
+			name_spelling(
+				context.names,
+				name.id,
+			).to_result(render_fault(span, InvalidParameterName(id)))
+		NoTypeParameterSyntax:
+			Err(render_fault(span, ParameterOwnerWithoutParameter(id)))
+
+
+private pure func type_spelling(
+	value: TypeRef,
+	context: ParsedContents,
+	span: Span,
+) -> Result[String, Diagnostic]:
+	match value:
+		IntType:
+			builtin_spelling(prelude_names(context.prelude).special.integer, context, span)
+		StringType:
+			builtin_spelling(prelude_names(context.prelude).special.string, context, span)
+		ParameterType(id):
+			parameter_spelling(id, context, span)
+		UnionType(id):
+			declaration ?= context.unions
+				.get(union_number(id))
+				.to_result(render_fault(span, InvalidResolvedUnion(id)))
+			name_spelling(
+				context.names,
+				declaration.type_name.id,
+			).to_result(render_fault(span, InvalidParsedName(declaration.type_name.id)))
+		AppliedUnionType(id, argument):
+			name ?= type_spelling(UnionType(id), context, span)
+			argument ?= type_spelling(argument, context, span)
+			Ok(
+				name
+					.concat("[")
+					.concat(argument)
+					.concat("]"),
+			)
+
+
+private pure func missing_variant_name(
+	id: VariantId,
+	span: Span,
+	context: ParsedContents,
+) -> Result[String, Diagnostic]:
+	declaration ?= context.unions
+		.get(union_number(variant_owner(id)))
+		.to_result(render_fault(span, InvalidResolvedUnion(variant_owner(id))))
+	variant ?= declaration.variants
+		.get(variant_number(id))
+		.to_result(render_fault(span, InvalidResolvedVariant(id)))
+	name ?= name_spelling(
+		context.names,
+		variant.name.id,
+	).to_result(render_fault(span, InvalidParsedName(variant.name.id)))
+
+	match variant.payload:
+		NoPayloadSyntax:
+			Ok(name)
+		OnePayloadSyntax(_):
+			Ok(name.concat("(_)"))
+
+
+private pure func missing_coverage(
+	remaining: List[VariantId],
+	span: Span,
+	context: ParsedContents,
+) -> Diagnostic:
+	var names: String = ""
+	var failure: Option[Diagnostic] = None
+
+	for id in remaining:
+		match missing_variant_name(id, span, context):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(name):
+				if not IntOps.equals(names.length(), 0):
+					names = names.concat(", ")
+
+				names = names.concat(name)
+
+	match failure:
+		Some(error):
+			error
+		None:
+			prefix = if IntOps.equals(remaining.length(), 1):
+				"add an arm for the missing variant: "
+			else:
+				"add arms for the missing variants: "
+
+			rendered(
+				span,
+				"non-exhaustive match",
+				Text.concat(prefix, names),
+			)
+
+
+private pure func type_diagnostic(
+	span: Span,
+	message: String,
+	expected_type: TypeRef,
+	context: ParsedContents,
+) -> Diagnostic:
+	match expected_type:
+		ParameterType(_):
+			rendered(
+				span,
+				message,
+				"use a value already typed as this declaration's type parameter",
+			)
+		_:
+			match type_spelling(expected_type, context, span):
+				Err(error):
+					error
+				Ok(spelling):
+					rendered(
+						span,
+						message,
+						"use an expression of type "
+							.concat(spelling)
+							.concat(" here"),
+					)
+
+
+private pure func checker_invariant(span: Span, invariant: CheckerInvariant) -> CheckError:
+	check_rejection(span, InternalInvariant(invariant))
+
+
+private pure func previous_declaration(
+	previous: List[WrittenName],
+	name: NameId,
+) -> Option[WrittenName]:
+	var found: Option[WrittenName] = None
+
+	for known in previous:
+		if same_name(known.id, name):
+			found = Some(known)
+			break
+
+	found

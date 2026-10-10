@@ -1,5 +1,12 @@
 import:
 	../../src/check:
+		BindingOrigin(ParameterBinding),
+		CheckErrorKind(
+			RecursiveCallChain, ArgumentCountMismatch, ImpureCall, VariantFunctionConflict,
+			DuplicateVariant, DuplicateUnion, MainReturnType, UnknownType, ExpressionTypeMismatch,
+			ArgumentTypeMismatch, GenericArgumentConflict, VariantNotInExpectedType,
+			PayloadFreeVariantCalled, UncallableBinding,
+		),
 		CheckedBase(ReturnVariant),
 		CheckedBody(CheckedValueBody),
 		CheckedFunction,
@@ -12,7 +19,7 @@ import:
 		variant_owner,
 	../../src/lex: lex
 	../../src/syntax: Diagnostic
-	input: check, parse
+	input: check, check_failure, parse, setup_diagnostic
 	test: TestSuite
 
 
@@ -36,7 +43,7 @@ private IDENTITY: String = "pure func identity(value: Choice) -> Choice:\n\tvalu
 private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
 	input ?= lex(source)
 	parsed ?= parse(input)
-	check(parsed)
+	check(parsed).map_err(setup_diagnostic)
 
 
 private pure func accepts(source: String) -> Bool:
@@ -51,19 +58,13 @@ private pure func rejects(
 	source: String,
 	start: Int,
 	end: Int,
-	message: String,
-	help: String,
+	matches: pure (CheckErrorKind) -> Bool,
 ) -> Bool:
-	match checked(source):
-		Ok(_):
+	match check_failure(source):
+		None:
 			False
-		Err(error):
-			(
-				error.span.start == start
-				and error.span.end == end
-				and error.message == message
-				and error.help == help
-			)
+		Some(error):
+			error.span.start == start and error.span.end == end and matches(error.kind)
 
 
 pure func test_context_assigns_nominal_constructor_and_type_identities() -> Bool:
@@ -119,12 +120,14 @@ pure func test_type_and_value_names_and_contextual_words_are_independent() -> Bo
 pure func test_parameter_shadows_constructor_without_type_fallback() -> Bool:
 	prefix = CHOICE + "func wrong(First: Int) -> Choice:\n\t"
 	(
-		rejects(
-			prefix + "First\n" + MAIN,
-			prefix.length(),
-			prefix.length() + 5,
-			"expression does not match the expected type",
-			"use an expression of type Choice here",
+		rejects(prefix + "First\n" + MAIN, prefix.length(), prefix.length() + 5, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				ExpressionTypeMismatch(_):
+					True
+				_:
+					False
 		)
 		and accepts(CHOICE + "func value(First: Int) -> Int:\n\tFirst\n" + MAIN)
 	)
@@ -133,12 +136,14 @@ pure func test_parameter_shadows_constructor_without_type_fallback() -> Bool:
 pure func test_union_parameter_shadows_direct_call_but_not_receiver_target() -> Bool:
 	prefix = CHOICE + IDENTITY + "func use(identity: Choice) -> Choice:\n\t"
 	(
-		rejects(
-			prefix + "identity(identity)\n" + MAIN,
-			prefix.length(),
-			prefix.length() + 8,
-			"parameters cannot be called",
-			"use the parameter as a value, or rename it to call the function",
+		rejects(prefix + "identity(identity)\n" + MAIN, prefix.length(), prefix.length() + 8, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				UncallableBinding(_, ParameterBinding(_), _):
+					True
+				_:
+					False
 		)
 		and accepts(prefix + "identity.identity()\n" + MAIN)
 	)
@@ -149,131 +154,154 @@ pure func test_constructor_is_a_value_not_a_function() -> Bool:
 	integer_call = CHOICE + "func number(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\t"
 	other = CHOICE + "fixed union Other:\n\tThird\nfunc value() -> Choice:\n\t"
 	(
-		rejects(
-			prefix + "First()\n" + MAIN,
-			prefix.length(),
-			prefix.length() + 5,
-			"payload-free variants cannot be called",
-			"use the bare variant name without parentheses",
+		rejects(prefix + "First()\n" + MAIN, prefix.length(), prefix.length() + 5, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				PayloadFreeVariantCalled(_):
+					True
+				_:
+					False
 		)
-		and rejects(
-			CHOICE + "func value() -> Int:\n\tFirst\n" + MAIN,
-			CHOICE.length() + 22,
-			CHOICE.length() + 27,
-			"variant does not belong to the expected type",
-			"use an expression of type Int here",
+		and rejects(CHOICE + "func value() -> Int:\n\tFirst\n" + MAIN, CHOICE.length() + 22, CHOICE.length() + 27, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				VariantNotInExpectedType(_, _):
+					True
+				_:
+					False
 		)
-		and rejects(
-			integer_call + "number(First)\n",
-			integer_call.length() + 7,
-			integer_call.length() + 12,
-			"variant does not belong to the expected type",
-			"use an expression of type Int here",
+		and rejects(integer_call + "number(First)\n", integer_call.length() + 7, integer_call.length() + 12, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				VariantNotInExpectedType(_, _):
+					True
+				_:
+					False
 		)
-		and rejects(
-			other + "Third\n" + MAIN,
-			other.length(),
-			other.length() + 5,
-			"variant does not belong to the expected type",
-			"use an expression of type Choice here",
+		and rejects(other + "Third\n" + MAIN, other.length(), other.length() + 5, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				VariantNotInExpectedType(_, _):
+					True
+				_:
+					False
 		)
 	)
 
 
 pure func test_cross_union_call_rejects_equal_variant_positions() -> Bool:
 	prefix = CHOICE + OTHER + IDENTITY + "pure func other() -> Other:\n\tFirst\nfunc bad() -> Choice:\n\t"
-	rejects(
-		prefix + "identity(other())\n" + MAIN,
-		prefix.length(),
-		prefix.length() + 8,
-		"argument type does not match the parameter type",
-		"use an expression of type Choice here",
+	rejects(prefix + "identity(other())\n" + MAIN, prefix.length(), prefix.length() + 8, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ArgumentTypeMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_literal_argument_mismatch_highlights_call_site() -> Bool:
 	prefix = CHOICE + IDENTITY + "func bad() -> Choice:\n\t"
-	rejects(
-		prefix + "identity(42)\n" + MAIN,
-		prefix.length(),
-		prefix.length() + 8,
-		"argument type does not match the parameter type",
-		"use an expression of type Choice here",
+	rejects(prefix + "identity(42)\n" + MAIN, prefix.length(), prefix.length() + 8, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ArgumentTypeMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_later_direct_and_receiver_edges_check_result_type() -> Bool:
 	prefix = CHOICE + IDENTITY + "pure func number(value: Int) -> Int:\n\tvalue\nfunc bad() -> Int:\n\t"
 	(
-		rejects(
-			prefix + "number(identity(First))\n" + MAIN,
-			prefix.length(),
-			prefix.length() + 6,
-			"argument type does not match the parameter type",
-			"use an expression of type Int here",
+		rejects(prefix + "number(identity(First))\n" + MAIN, prefix.length(), prefix.length() + 6, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				ArgumentTypeMismatch(_):
+					True
+				_:
+					False
 		)
-		and rejects(
-			prefix + "First.identity().number()\n" + MAIN,
-			prefix.length() + 17,
-			prefix.length() + 23,
-			"argument type does not match the parameter type",
-			"use an expression of type Int here",
+		and rejects(prefix + "First.identity().number()\n" + MAIN, prefix.length() + 17, prefix.length() + 23, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				ArgumentTypeMismatch(_):
+					True
+				_:
+					False
 		)
 	)
 
 
 pure func test_return_mismatch_uses_exact_complete_expression_span() -> Bool:
 	prefix = CHOICE + IDENTITY + "func bad() -> Int:\n\t"
-	rejects(
-		prefix + "identity(First)   \n" + MAIN,
-		prefix.length(),
-		prefix.length() + 15,
-		"expression does not match the expected type",
-		"use an expression of type Int here",
+	rejects(prefix + "identity(First)   \n" + MAIN, prefix.length(), prefix.length() + 15, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ExpressionTypeMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_unknown_type_and_main_return_type_are_distinct() -> Bool:
-	rejects(
-		"func main() -> Bool:\n\t0\n",
-		15,
-		19,
-		"unknown type",
-		(
-			"use Int, String, a declared type parameter, or a fixed union declared in this "
-			+ "file"
-		),
-	) and rejects(
-		CHOICE + "func main() -> Choice:\n\tFirst\n",
-		CHOICE.length() + 15,
-		CHOICE.length() + 21,
-		"main must return Int",
-		"declare main() -> Int: as the entrypoint",
+	rejects("func main() -> Bool:\n\t0\n", 15, 19, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			UnknownType(_):
+				True
+			_:
+				False
+	) and rejects(CHOICE + "func main() -> Choice:\n\tFirst\n", CHOICE.length() + 15, CHOICE.length() + 21, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			MainReturnType(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_duplicate_types_and_variants_are_rejected() -> Bool:
 	(
-		rejects(
-			CHOICE + CHOICE + MAIN,
-			CHOICE.length() + 12,
-			CHOICE.length() + 18,
-			"duplicate union type name",
-			"give union types distinct names; Int and String are declared by the prelude",
+		rejects(CHOICE + CHOICE + MAIN, CHOICE.length() + 12, CHOICE.length() + 18, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				DuplicateUnion(_, _):
+					True
+				_:
+					False
 		)
-		and rejects(
-			"fixed union Int:\n\tOther\n" + MAIN,
-			12,
-			15,
-			"duplicate union type name",
-			"give union types distinct names; Int and String are declared by the prelude",
+		and rejects("fixed union Int:\n\tOther\n" + MAIN, 12, 15, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				DuplicateUnion(_, _):
+					True
+				_:
+					False
 		)
-		and rejects(
-			"fixed union Choice:\n\tFirst\n\tFirst\n" + MAIN,
-			28,
-			33,
-			"duplicate variant name",
-			"give each variant in a union a distinct name",
+		and rejects("fixed union Choice:\n\tFirst\n\tFirst\n" + MAIN, 28, 33, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				DuplicateVariant(_, _):
+					True
+				_:
+					False
 		)
 	)
 
@@ -281,19 +309,23 @@ pure func test_duplicate_types_and_variants_are_rejected() -> Bool:
 pure func test_function_constructor_collision_highlights_later_declaration() -> Bool:
 	function = "func First() -> Int:\n\t0\n"
 	(
-		rejects(
-			CHOICE + function + MAIN,
-			CHOICE.length() + 5,
-			CHOICE.length() + 10,
-			"variant name conflicts with a function",
-			"give functions and union variants distinct names",
+		rejects(CHOICE + function + MAIN, CHOICE.length() + 5, CHOICE.length() + 10, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				VariantFunctionConflict(_, _, _):
+					True
+				_:
+					False
 		)
-		and rejects(
-			function + CHOICE + MAIN,
-			function.length() + 21,
-			function.length() + 26,
-			"variant name conflicts with a function",
-			"give functions and union variants distinct names",
+		and rejects(function + CHOICE + MAIN, function.length() + 21, function.length() + 26, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				VariantFunctionConflict(_, _, _):
+					True
+				_:
+					False
 		)
 	)
 
@@ -301,26 +333,32 @@ pure func test_function_constructor_collision_highlights_later_declaration() -> 
 pure func test_union_purity_cycles_and_arity_precedence_are_preserved() -> Bool:
 	prefix = CHOICE + "func value() -> Choice:\n\tFirst\npure func use() -> Choice:\n\t"
 	(
-		rejects(
-			prefix + "value()\n" + MAIN,
-			prefix.length(),
-			prefix.length() + 5,
-			"pure functions cannot call impure functions",
-			"mark the callee pure or remove pure from the caller",
+		rejects(prefix + "value()\n" + MAIN, prefix.length(), prefix.length() + 5, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				ImpureCall(_, _):
+					True
+				_:
+					False
 		)
-		and rejects(
-			prefix + "value(First)\n" + MAIN,
-			prefix.length(),
-			prefix.length() + 5,
-			"function takes no arguments",
-			"remove the argument and call the function with ()",
+		and rejects(prefix + "value(First)\n" + MAIN, prefix.length(), prefix.length() + 5, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				ArgumentCountMismatch(_):
+					True
+				_:
+					False
 		)
-		and rejects(
-			CHOICE + "func loop(value: Choice) -> Choice:\n\tvalue.loop()\n" + MAIN,
-			CHOICE.length() + 43,
-			CHOICE.length() + 47,
-			"call chain contains recursion",
-			"use an acyclic call chain; recursion is not supported in this increment",
+		and rejects(CHOICE + "func loop(value: Choice) -> Choice:\n\tvalue.loop()\n" + MAIN, CHOICE.length() + 43, CHOICE.length() + 47, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				RecursiveCallChain:
+					True
+				_:
+					False
 		)
 	)
 

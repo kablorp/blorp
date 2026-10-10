@@ -20,6 +20,15 @@ Replace the old representation in the same slice; do not maintain a unary path
 beside a general argument path. Add no persistent cache, registry or new pipeline
 layer. Target ownership is independent of whether a declaration was generic.
 
+Use bidirectional checking: synthesize expression types and check expressions
+against known expected types. Declaration-owned type parameters are rigid;
+inference variables introduced for calls are local and solvable. Current
+argument inference uses one-way structural matching. Introduce structural
+unification, including an occurs check, when contextual inference needs it;
+publish complete substitutions with no unresolved inference variables. Purity,
+name resolution and exhaustiveness remain separate checks. Implicit let
+polymorphism is outside the current scope.
+
 ## Ordered examples
 
 1. **Multiple runtime arguments; one type parameter.**
@@ -46,7 +55,13 @@ layer. Target ownership is independent of whether a declaration was generic.
    applicable. Render diagnostic text separately. Test error data directly and
    keep dedicated exact message/help/span tests for rendering. Do not classify
    errors by message strings or maintain text as a second semantic authority.
-   This is a separate bounded increment after argument support is validated.
+   The bounded implementation returns a complete checked program or an opaque
+   failure with a nonempty typed error collection and the original sealed parsed
+   authority. Checking currently stops at the first error; collecting independent
+   failures requires a later explicit recovery policy. The renderer and CLI
+   preserve the full collection. No temporary inference or builder state escapes.
+   Bidirectional checking and structural unification remain a separate follow-up
+   before extending generic inference.
 
 2. **Multiple type parameters.** First independent function parameters, then
    `fixed union Result[T, E]` with `Ok(T)` and `Err(E)`. Begin with Int payloads.
@@ -118,7 +133,7 @@ proxies, not self-compilation results. Do not advance the baseline between steps
 
 ## Progress
 
-- [ ] Multiple runtime arguments, one type parameter.
+- [x] Multiple runtime arguments, one type parameter.
 - [ ] Typed checking errors and direct error-data/renderer tests.
 - [ ] Multiple function type parameters.
 - [ ] Multiple union type parameters.

@@ -1,16 +1,22 @@
 import:
 	../../src/check:
 		CallTarget(RuntimeFunction),
+		CheckError,
+		CheckErrorKind(
+			UnknownFunction, FunctionPreludeConflict, ArgumentCountMismatch, ArgumentTypeMismatch,
+			VariantPreludeConflict, DuplicateUnion, UncallableBinding,
+		),
 		CheckedAssignment(InitializeBinding),
 		CheckedBody(CheckedValueBody),
 		CheckedOperation(InvokeFunction),
 		CheckedProgram,
 		CheckedValue,
 		check as check_program,
+		check_errors,
 		checked_functions,
 	../../src/lex: lex
 	../../src/names: NameId, find_name, intern_name, name_spelling
-	../../src/parse: parse as parse_program, parse_prelude, parsed_contents
+	../../src/parse: ParsedProgram, parse as parse_program, parse_prelude, parsed_contents
 	../../src/prelude:
 		CheckedPrelude,
 		PrimitiveType(BuiltinInt, BuiltinString),
@@ -25,6 +31,7 @@ import:
 		ParsedRuntimeOperation(IntegerToStringBuiltin),
 		Purity(Pure),
 		TypeSyntax(AtomicType, AppliedType),
+	input: setup_diagnostic, singleton_check_error
 	test: TestSuite
 
 
@@ -53,14 +60,36 @@ private pure func accepted_prelude(source: String) -> Result[CheckedPrelude, Dia
 	check_prelude(parsed)
 
 
+private pure func parsed_source(
+	prelude_source: String,
+	program_source: String,
+) -> Result[ParsedProgram, Diagnostic]:
+	prelude ?= accepted_prelude(prelude_source)
+	input ?= lex(program_source)
+	parse_program(input, prelude)
+
+
 private pure func checked_source(
 	prelude_source: String,
 	program_source: String,
 ) -> Result[CheckedProgram, Diagnostic]:
-	prelude ?= accepted_prelude(prelude_source)
-	input ?= lex(program_source)
-	program ?= parse_program(input, prelude)
-	check_program(program)
+	program ?= parsed_source(prelude_source, program_source)
+	check_program(program).map_err(setup_diagnostic)
+
+
+private pure func failed_source(
+	prelude_source: String,
+	program_source: String,
+) -> Option[CheckError]:
+	match parsed_source(prelude_source, program_source):
+		Err(_):
+			None
+		Ok(program):
+			match check_program(program):
+				Ok(_):
+					None
+				Err(failure):
+					singleton_check_error(check_errors(failure))
 
 
 private pure func rejects(
@@ -87,19 +116,13 @@ private pure func program_rejects(
 	program: String,
 	start: Int,
 	end: Int,
-	message: String,
-	help: String,
+	matches: pure (CheckErrorKind) -> Bool,
 ) -> Bool:
-	match checked_source(prelude, program):
-		Err(error):
-			(
-				error.span.start == start
-				and error.span.end == end
-				and error.message == message
-				and error.help == help
-			)
-		Ok(_):
+	match failed_source(prelude, program):
+		None:
 			False
+		Some(error):
+			error.span.start == start and error.span.end == end and matches(error.kind)
 
 
 pure func test_prelude_publishes_typed_operations_and_one_name_table() -> Bool:
@@ -173,15 +196,16 @@ pure func test_builtin_names_come_from_the_explicit_prelude() -> Bool:
 
 
 pure func test_type_only_prelude_does_not_add_implicit_functions() -> Bool:
-	match checked_source(TYPES, "func main() -> Int:\n\t7.to_string().length()\n"):
-		Err(error):
-			(
-				error.span.start == 23
-				and error.span.end == 32
-				and error.message == "unknown function"
-				and error.help == "declare the called function in this file or the explicit prelude"
-			)
-		Ok(_):
+	match failed_source(TYPES, "func main() -> Int:\n\t7.to_string().length()\n"):
+		Some(error):
+			matching = match error.kind:
+				UnknownFunction(_):
+					True
+				_:
+					False
+
+			error.span.start == 23 and error.span.end == 32 and matching
+		None:
 			False
 
 
@@ -262,15 +286,16 @@ pure func test_runtime_contract_rejects_impurity() -> Bool:
 
 
 pure func test_program_declaration_conflicting_with_prelude_is_rejected() -> Bool:
-	match checked_source(TYPES + LENGTH, "func length() -> Int:\n\t0\nfunc main() -> Int:\n\t0\n"):
-		Err(error):
-			(
-				error.span.start == 5
-				and error.span.end == 11
-				and error.message == "function name conflicts with the prelude"
-				and error.help == "rename this function or change the explicit prelude declaration"
-			)
-		Ok(_):
+	match failed_source(TYPES + LENGTH, "func length() -> Int:\n\t0\nfunc main() -> Int:\n\t0\n"):
+		Some(error):
+			matching = match error.kind:
+				FunctionPreludeConflict(_):
+					True
+				_:
+					False
+
+			error.span.start == 5 and error.span.end == 11 and matching
+		None:
 			False
 
 
@@ -512,57 +537,62 @@ pure func test_string_length_contract_rejects_an_int_parameter() -> Bool:
 
 
 pure func test_runtime_call_requires_its_declared_argument() -> Bool:
-	program_rejects(
-		TYPES + CONVERT,
-		"func main() -> Int:\n\tconvert()\n",
-		21,
-		28,
-		"function requires one argument",
-		"pass one expression of the declared parameter type",
+	program_rejects(TYPES + CONVERT, "func main() -> Int:\n\tconvert()\n", 21, 28, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ArgumentCountMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_runtime_call_checks_the_string_argument_type() -> Bool:
-	program_rejects(
-		TYPES + LENGTH,
-		"func main() -> Int:\n\tlength(7)\n",
-		21,
-		27,
-		"argument type does not match the parameter type",
-		"use an expression of type String here",
+	program_rejects(TYPES + LENGTH, "func main() -> Int:\n\tlength(7)\n", 21, 27, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ArgumentTypeMismatch(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_runtime_function_names_conflict_with_variants() -> Bool:
-	program_rejects(
-		TYPES + LENGTH,
-		"fixed union Choice:\n\tlength\nfunc main() -> Int:\n\t0\n",
-		21,
-		27,
-		"variant name conflicts with a prelude function",
-		"give functions and union variants distinct names",
+	program_rejects(TYPES + LENGTH, "fixed union Choice:\n\tlength\nfunc main() -> Int:\n\t0\n", 21, 27, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			VariantPreludeConflict(_):
+				True
+			_:
+				False
 	)
 
 
 pure func test_string_type_name_cannot_be_redeclared_as_a_union() -> Bool:
-	program_rejects(
-		TYPES,
-		"fixed union String:\n\tEmpty\nfunc main() -> Int:\n\t0\n",
-		12,
-		18,
-		"duplicate union type name",
-		"give union types distinct names; Int and String are declared by the prelude",
+	program_rejects(TYPES, "fixed union String:\n\tEmpty\nfunc main() -> Int:\n\t0\n", 12, 18, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			DuplicateUnion(_, _):
+				True
+			_:
+				False
 	)
 
 
 pure func test_local_binding_shadows_a_direct_runtime_call() -> Bool:
-	program_rejects(
-		TYPES + LENGTH,
-		"func main() -> Int:\n\tlength = 7\n\tlength(0)\n",
-		33,
-		39,
-		"local bindings cannot be called",
-		"use the binding as a value, or rename it to call the function",
+	program_rejects(TYPES + LENGTH, "func main() -> Int:\n\tlength = 7\n\tlength(0)\n", 33, 39, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			UncallableBinding(_, _, _):
+				True
+			_:
+				False
 	)
 
 

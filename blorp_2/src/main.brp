@@ -1,6 +1,6 @@
 import:
 	./prelude: CheckedPrelude, check_prelude
-	check: check
+	check: check, render_failure
 	emit: emit
 	int as IntOps
 	lex: lex
@@ -9,7 +9,12 @@ import:
 	parse: parse, parse_prelude
 	result: map_err
 	specialize: specialize
-	syntax: Diagnostic, DiagnosticNote(NoDiagnosticNote, UnionPayloadDeclaration), Span
+	syntax:
+		Diagnostic,
+		DiagnosticNote(NoDiagnosticNote, UnionPayloadDeclaration),
+		Diagnostics,
+		Span,
+		singleton_diagnostic,
 	system: read_file, write_file
 	text: concat, equals
 	verify: verify
@@ -22,8 +27,8 @@ fixed record CompilationInputs {
 
 
 fixed union CompilationDiagnostic:
-	PreludeDiagnostic(Diagnostic)
-	ProgramDiagnostic(Diagnostic)
+	PreludeDiagnostics(Diagnostics)
+	ProgramDiagnostics(Diagnostics)
 
 
 private pure func prepare_prelude(source: String) -> Result[CheckedPrelude, Diagnostic]:
@@ -35,28 +40,30 @@ private pure func prepare_prelude(source: String) -> Result[CheckedPrelude, Diag
 private pure func compile_program(
 	source: String,
 	prelude: CheckedPrelude,
-) -> Result[String, Diagnostic]:
-	lexed ?= lex(source)
-	parsed ?= parse(lexed, prelude)
-	checked ?= check(parsed)
-	specialized ?= specialize(checked)
-	lowered ?= lower(specialized)
-	owned ?= own(lowered)
-	verified ?= verify(owned)
-	emit(verified)
+) -> Result[String, Diagnostics]:
+	lexed ?= lex(source).map_err(singleton_diagnostic)
+	parsed ?= parse(lexed, prelude).map_err(singleton_diagnostic)
+	checked ?= check(parsed).map_err(render_failure)
+	specialized ?= specialize(checked).map_err(singleton_diagnostic)
+	lowered ?= lower(specialized).map_err(singleton_diagnostic)
+	owned ?= own(lowered).map_err(singleton_diagnostic)
+	verified ?= verify(owned).map_err(singleton_diagnostic)
+	emit(verified).map_err(singleton_diagnostic)
 
 
 pure func compile(inputs: CompilationInputs) -> Result[String, CompilationDiagnostic]:
 	prelude ?= prepare_prelude(
 		inputs.prelude,
 	).map_err(
-		pure func(error: Diagnostic) -> CompilationDiagnostic: PreludeDiagnostic(error),
+		pure func(
+			error: Diagnostic,
+		) -> CompilationDiagnostic: PreludeDiagnostics(singleton_diagnostic(error)),
 	)
 	compile_program(
 		inputs.program,
 		prelude,
 	).map_err(
-		pure func(error: Diagnostic) -> CompilationDiagnostic: ProgramDiagnostic(error),
+		pure func(errors: Diagnostics) -> CompilationDiagnostic: ProgramDiagnostics(errors),
 	)
 
 
@@ -141,13 +148,12 @@ private func compile_file(
 				program = source,
 			}):
 				Err(failure):
-					diagnostic = match failure:
-						PreludeDiagnostic(error):
-							render_diagnostic(prelude_path, prelude, error)
-						ProgramDiagnostic(error):
-							render_diagnostic(input_path, source, error)
+					match failure:
+						PreludeDiagnostics(errors):
+							print_error(render_diagnostics(prelude_path, prelude, errors))
+						ProgramDiagnostics(errors):
+							print_error(render_diagnostics(input_path, source, errors))
 
-					print_error(diagnostic)
 					1
 				Ok(generated_c):
 					match write_file(output_path, generated_c):
@@ -162,3 +168,14 @@ private func compile_file(
 							1
 						Ok(_):
 							0
+
+
+pure func render_diagnostics(path: String, source: String, errors: Diagnostics) -> String:
+	var output = render_diagnostic(path, source, errors.first)
+
+	for error in errors.remaining:
+		output = output
+			.concat("\n")
+			.concat(render_diagnostic(path, source, error))
+
+	output
