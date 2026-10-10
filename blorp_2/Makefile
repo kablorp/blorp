@@ -7,7 +7,7 @@ TEST_COMPILER_LIBRARIES := -lm -lpthread
 example: host-check
 	@mkdir -p build
 	@cd .. && bin/blorp run --no-format blorp_2/src/main.brp -- \
-		blorp_2/src/prelude_temp.brp blorp_2/test/e2e/fixtures/return_zero.brp blorp_2/build/return_zero.c
+		blorp_2/src/prelude_temp.brp blorp_2/test/e2e/fixtures/return/zero.brp blorp_2/build/return_zero.c
 	@$(BLORP_CC) -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
 		build/return_zero.c -o build/return_zero
 	@build/return_zero

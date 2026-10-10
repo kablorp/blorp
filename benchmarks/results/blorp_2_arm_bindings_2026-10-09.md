@@ -4,7 +4,7 @@
 
 Block-bodied tail-match arms now compose the existing binding, reassignment,
 call, purity and union rules. The primary fixture
-[`match_binding_original.brp`](../../blorp_2/test/e2e/fixtures/match_binding_original.brp)
+[`match/binding_original.brp`](../../blorp_2/test/e2e/fixtures/match/binding_original.brp)
 passes `Number(7)`, saves an alias of the payload, reassigns the current value
 through `identity(42)`, and returns the saved 7. Companions return 42 and 0
 and preserve an enclosing value across arm-local shadowing.

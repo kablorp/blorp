@@ -15,7 +15,7 @@ emission consumes those facts without repeating resolution or semantic checks.
 The retained [design](../../blorp_2/MATCH_PLAN.md) compares the implementation
 strategies in Haskell, OCaml, Rust, Scala and Elm.
 
-The first example is [match_value.brp](../../blorp_2/test/e2e/fixtures/match_value.brp):
+The first example is [match/value.brp](../../blorp_2/test/e2e/fixtures/match/value.brp):
 `main` constructs `Number(42)`, calls `unwrap`, and returns 42. Unions can have
 zero fields or one `Int` field. Tail matches have inline value leaves, constructor
 patterns, field binders/discards and whole-value binders/discards. Checking owns

@@ -9,7 +9,7 @@ The sections retain each increment's measurements and predeclared ceilings.
 
 ## Initial end-to-end return-zero example
 
-The input is the 23-byte file `blorp_2/test/e2e/fixtures/return_zero.brp`:
+The input is the 23-byte file `blorp_2/test/e2e/fixtures/return/zero.brp`:
 
 ```blorp
 func main() -> Int:
@@ -61,10 +61,10 @@ clang -O2 -DBLORP_MEMORY_DIAGNOSTICS=1 "$scratch/compiler.c" \
   -o "$scratch/compiler-diagnostic" -lm -lpthread
 env -u BLORP_LEAK_CHECK -u BLORP_MEMORY_STATS \
   BLORP_LEAK_CHECK=strict "$scratch/compiler-diagnostic" \
-  blorp_2/test/e2e/fixtures/return_zero.brp "$scratch/program.c"
+  blorp_2/test/e2e/fixtures/return/zero.brp "$scratch/program.c"
 env -u BLORP_LEAK_CHECK -u BLORP_MEMORY_STATS \
   /usr/bin/time -l -o "$scratch/instructions.txt" "$scratch/compiler" \
-  blorp_2/test/e2e/fixtures/return_zero.brp "$scratch/program.c"
+  blorp_2/test/e2e/fixtures/return/zero.brp "$scratch/program.c"
 ```
 
 Here `scratch` is the test's unique temporary directory. The TestSuite removes
@@ -374,7 +374,7 @@ propagation constraint were accounted for; no compressed formatting was used.
 
 ## Pure-function increment
 
-The next fixture is the 91-byte `blorp_2/test/e2e/fixtures/pure_calls.brp`:
+The next fixture is the 91-byte `blorp_2/test/e2e/fixtures/pure/calls.brp`:
 
 ```blorp
 pure func one() -> Int:

@@ -11,7 +11,7 @@ own the current supported language and contracts.
 
 ## Working example and scope
 
-Proposed first fixture, `test/e2e/fixtures/match_value.brp`:
+Proposed first fixture, `test/e2e/fixtures/match/value.brp`:
 
 ```blorp
 fixed union Value:
