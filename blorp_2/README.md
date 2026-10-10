@@ -714,6 +714,12 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    without checking bodies or resolving names again, then seals a
    `SpecializedProgram`. Concrete types cannot contain type parameters; concrete
    function, union and variant identities have separate instance domains.
+   Parsed payload annotations, parsed pattern fields and checked payloads use
+   `Option` directly. An absent pattern field stays distinct from an explicit
+   wildcard or named binding. Optional diagnostics retain their typed note and
+   exact declaration span. Concrete union layouts retain their separate
+   payload-free/Int alternatives.
+
    Checked signatures retain one `TypeUse` per annotation, preserving its span.
    Concrete signatures belong to their separate immutable phase. Union instance
    keys preserve complete nominal arguments; checked occurrence types translate
