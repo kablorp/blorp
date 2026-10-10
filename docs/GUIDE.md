@@ -3365,6 +3365,8 @@ uses the same naming rules and runs only TestSuite tests.
 
 `blorp test` defaults to a 30-second budget for each generated test artifact.
 Use `--timeout N` to change that artifact budget or `--timeout 0` to disable it.
+Leak-checked suite batches scale positive budgets with the number of test sources;
+an explicit zero still disables the deadline.
 Without an explicit flag, `BLORP_TEST_TIMEOUT` overrides the test default and
 `BLORP_TIMEOUT` serves as the generic fallback.
 

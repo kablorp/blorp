@@ -376,12 +376,13 @@ Timeouts:
   artifact, which defaults to 60 seconds. Ordinary artifacts default to 30
   seconds.
 - `BLORP_LEAK_TEST_TIMEOUT` overrides only the consolidated leak-check corpus,
-  which also defaults to 60 seconds. That value is a floor per suite batch:
+  which also defaults to 60 seconds. A positive value is a floor per suite batch:
   `bin/blorp test --leak-check` grants each batch the larger of the floor and
   5 seconds (`LEAK_CHECKED_SOURCE_TIMEOUT_SECONDS` in
   `blorp/src/test/plan.brp`) times the number of test sources in it, so a
   large batch on a loaded host does not time out while a hung test still fails
-  in bounded time. A timeout failure lists every test source in the batch.
+  in bounded time. An explicit zero disables the deadline, including for
+  leak-checked batches. A timeout failure lists every test source in the batch.
 - `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations. The
   grouped compiler-owned Blorp suites default to 360 seconds; individual
   compiler fixtures and codegen audits default to 30 seconds.
