@@ -1,0 +1,141 @@
+import:
+	../../src/check as Checked
+	../../src/check_render as Renderer
+	../../src/lex: lex
+	../../src/parse: ParsedProgram
+	../../src/syntax: Diagnostic, Span
+	../../src/text: concat
+	input: parse
+	test: TestSuite
+
+
+private pure func parsed(source: String) -> Result[ParsedProgram, Diagnostic]:
+	lex(source).and_then(pure func(tokens): parse(tokens))
+
+
+private pure func span(start: Int, end: Int) -> Span:
+	{
+		start = start,
+		end = end
+	}
+
+
+pure func test_failure_retains_original_parsed_authority() -> Bool:
+	prefix = "fixed union Original:\n\tOriginalValue\npure func accept(value: Original) -> Int:\n\t0\nfunc main() -> Int:\n\t"
+
+	match parsed(prefix.concat("accept(7)\n")):
+		Err(_):
+			False
+		Ok(program):
+			match Checked.check(program):
+				Ok(_):
+					False
+				Err(failure):
+					match parsed(
+						"fixed union Substitute:\n\tSubstituteValue\nfunc main() -> Int:\n\t0\n",
+					):
+						Err(_):
+							False
+						Ok(unrelated):
+							diagnostics = Renderer.render_failure(failure)
+							other = Renderer.render_check_errors(
+								unrelated,
+								Checked.check_errors(failure),
+							)
+							(
+								diagnostics.first.span == span(prefix.length(), prefix.length() + 6)
+								and diagnostics.first.note.is_none()
+								and diagnostics.first.message == "argument type does not match the parameter type"
+								and diagnostics.first.help == "use an expression of type Original here"
+								and diagnostics.remaining.is_empty()
+								and other.first.help == "use an expression of type Substitute here"
+							)
+
+
+pure func test_error_uses_supplied_frozen_arity() -> Bool:
+	match parsed("fixed union Pair[A, B]:\n\tPairValue\nfunc main() -> Int:\n\t0\n"):
+		Err(_):
+			False
+		Ok(program):
+			match Checked.check(program):
+				Err(_):
+					False
+				Ok(checked):
+					match Checked.union_declaration_id(checked, 0):
+						None:
+							False
+						Some(owner):
+							diagnostic = Renderer.render_check_error(
+								program,
+								{
+									span = span(3, 14),
+									kind = Checked.UnionTypeArgumentCountMismatch(owner, 4, 3)
+								},
+							)
+							(
+								diagnostic.span == span(3, 14)
+								and diagnostic.note.is_none()
+								and diagnostic.message == "union type argument count does not match its declaration"
+								and diagnostic.help == "expected 4 type arguments, got 3; supply atomic types in declaration order"
+							)
+
+
+pure func test_collection_retains_order_spans_help_and_notes() -> Bool:
+	match parsed("func main() -> Int:\n\t0\n"):
+		Err(_):
+			False
+		Ok(program):
+			diagnostics = Renderer.render_check_errors(
+				program,
+				{
+					first = {
+						span = span(0, 4),
+						kind = Checked.MissingMain
+					},
+					remaining = [
+						{
+							span = span(8, 12),
+							kind = Checked.RecursiveCallChain
+						},
+						{
+							span = span(16, 20),
+							kind = Checked.UnreachableArm
+						},
+					]
+				},
+			)
+
+			match diagnostics.remaining:
+				[second, third]:
+					(
+						diagnostics.first.span == span(0, 4)
+						and diagnostics.first.note.is_none()
+						and diagnostics.first.message == "expected a main function"
+						and diagnostics.first.help == "declare func main() -> Int: as the entrypoint"
+						and second.span == span(8, 12)
+						and second.note.is_none()
+						and second.message == "call chain contains recursion"
+						and second.help == "use an acyclic call chain; recursion is not supported in this increment"
+						and third.span == span(16, 20)
+						and third.note.is_none()
+						and third.message == "match arm is unreachable"
+						and third.help == "remove this arm; earlier arms already cover all values it could match"
+					)
+				_:
+					False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 checker diagnostic rendering boundary",
+	tests = [
+		(
+			"failure retains original parsed authority",
+			test_failure_retains_original_parsed_authority,
+		),
+		("error uses supplied frozen arity", test_error_uses_supplied_frozen_arity),
+		(
+			"collection retains order spans help and notes",
+			test_collection_retains_order_spans_help_and_notes,
+		),
+	]
+}
