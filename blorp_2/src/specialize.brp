@@ -258,13 +258,18 @@ private pure func concrete_type(
 			Ok(IntType)
 		Checked.StringType:
 			Ok(StringType)
-		Checked.AppliedUnionType(id, argument):
-			argument ?= concrete_type(argument, substitution, unions, span)
+		Checked.AppliedUnionType(id, arguments):
+			arguments ?= translated_list(
+				arguments,
+				pure func(
+					value: Checked.TypeRef,
+				): concrete_type(value, substitution, unions, span),
+			)
 			id ?= find_union_instance(
 				unions,
 				{
 					declaration = id,
-					arguments = [argument]
+					arguments = arguments
 				},
 			).to_result(invalid(span, "unprepared generic union instance"))
 			Ok(UnionType(id))
@@ -531,8 +536,15 @@ private pure func contains_parameter(value: Checked.TypeRef) -> Bool:
 	match value:
 		Checked.ParameterType(_):
 			True
-		Checked.AppliedUnionType(_, argument):
-			contains_parameter(argument)
+		Checked.AppliedUnionType(_, arguments):
+			var found = False
+
+			for argument in arguments:
+				if contains_parameter(argument):
+					found = True
+					break
+
+			found
 		_:
 			False
 
@@ -642,15 +654,33 @@ private pure func prepare_type(
 				unions,
 				span,
 			)
-		Checked.AppliedUnionType(id, argument):
-			prepared ?= prepare_type(argument, substitution, declarations, unions, span)
+		Checked.AppliedUnionType(id, arguments):
+			var types: List[TypeRef] = []
+			var dependencies = unions
+			var failure: Option[Diagnostic] = None
+
+			for argument in arguments:
+				match prepare_type(argument, substitution, declarations, dependencies, span):
+					Ok(prepared):
+						types = types.append(prepared.value_type)
+						dependencies = prepared.unions
+					Err(error):
+						failure = Some(error)
+						break
+
+			ready ?= match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(void)
+
 			ensure_union(
 				{
 					declaration = id,
-					arguments = [prepared.value_type]
+					arguments = types
 				},
 				declarations,
-				prepared.unions,
+				dependencies,
 				span,
 			)
 		_:
