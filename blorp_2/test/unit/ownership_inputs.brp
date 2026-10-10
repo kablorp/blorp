@@ -6,14 +6,17 @@ import:
 		MatchLabel(VariantLabel),
 		ValueDefinition,
 		ValueId,
-		ValueOperation(IntegerValue, ParameterValue, CallValue),
+		ValueOperation(IntegerValue, ParameterValue, CallValue, ConstructRecordValue),
 		lower,
 		lowered_functions,
 	../../src/prelude: RuntimeOperation
 	../../src/specialize:
 		CallTarget(RuntimeFunction, UserFunction),
+		ConcreteRecord,
 		ConcreteUnion,
+		FieldInstanceId,
 		FunctionInstanceId,
+		RecordInstanceId,
 		TypeRef(IntType, UnionType),
 		UnionInstanceId,
 		VariantInstanceId,
@@ -228,4 +231,96 @@ pure func function(
 		},
 		definitions = definitions,
 		tail = ReturnValue(result)
+	}
+
+
+fixed record RecordIds {
+	first: ValueId,
+	second: ValueId,
+	third: ValueId,
+	fourth: ValueId,
+	fifth: ValueId,
+	entrypoint: FunctionInstanceId,
+	helper: FunctionInstanceId,
+	record_id: RecordInstanceId,
+	other_record: RecordInstanceId,
+	first_field: FieldInstanceId,
+	second_field: FieldInstanceId,
+	other_field: FieldInstanceId,
+	records: List[ConcreteRecord]
+}
+
+
+-- A separate producer-issued seed supplies record identities, never ownership facts.
+pure func record_ids() -> Result[RecordIds, Diagnostic]:
+	source: String =
+		|fixed record Pair { first: Int, second: Int }
+		|fixed record Other { first: Int, second: Int }
+		|func main() -> Int:
+		|	first = 1
+		|	second = 2
+		|	third = 3
+		|	fourth = 4
+		|	unused = make_pair()
+		|	5
+		|pure func make_pair() -> Pair:
+		|	{ first = 7, second = 9 }
+		|pure func make_other() -> Other:
+		|	{ first = 1, second = 2 }
+		|
+	tokens ?= lex(source)
+	parsed ?= parse(tokens)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	lowered ?= specialize(checked).and_then(pure func(program): lower(program))
+	program = lowered_functions(lowered)
+
+	match program.functions:
+		[main_function, pair, other]:
+			match main_function.definitions:
+				[first, second, third, fourth, fifth, _]:
+					helper ?= seed_function_id(fifth)
+
+					match pair.definitions:
+						[_, _, constructed]:
+							match other.definitions:
+								[_, _, other_constructed]:
+									match constructed.operation:
+										ConstructRecordValue(owner, [left, right]):
+											match other_constructed.operation:
+												ConstructRecordValue(other_owner, [other_field, _]):
+													Ok({
+														first = first.id,
+														second = second.id,
+														third = third.id,
+														fourth = fourth.id,
+														fifth = fifth.id,
+														entrypoint = program.entrypoint,
+														helper = helper,
+														record_id = owner,
+														other_record = other_owner,
+														first_field = left.field,
+														second_field = right.field,
+														other_field = other_field.field,
+														records = program.records,
+													})
+												_:
+													Err(record_seed_error())
+										_:
+											Err(record_seed_error())
+								_:
+									Err(record_seed_error())
+						_:
+							Err(record_seed_error())
+				_:
+					Err(record_seed_error())
+		_:
+			Err(record_seed_error())
+
+
+private pure func record_seed_error() -> Diagnostic:
+	{
+		span = span(0),
+		note = None,
+		message = "invalid record identity seed",
+		help = "fix the record test seed"
 	}

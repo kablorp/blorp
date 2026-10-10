@@ -1,0 +1,88 @@
+import:
+	../../src/emit: emit
+	../../src/lex: lex
+	../../src/lower: lower
+	../../src/own: own
+	../../src/specialize: specialize
+	../../src/syntax: Diagnostic
+	../../src/verify: verify
+	input: check, parse, setup_diagnostic
+	test: TestSuite
+
+
+private pure func emitted(source: String) -> Result[String, Diagnostic]:
+	tokens ?= lex(source)
+	parsed ?= parse(tokens)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	lowered ?= specialize(checked).and_then(pure func(program): lower(program))
+	owned ?= own(lowered)
+	verified ?= verify(owned)
+	emit(verified)
+
+
+pure func test_nominal_struct_layout_and_by_value_signature() -> Bool:
+	source: String =
+		|fixed record Pair { first: Int, second: Int }
+		|fixed record Other { first: Int, second: Int }
+		|pure func make() -> Other:
+		|	{ second = 9, first = 7 }
+		|pure func read(value: Other) -> Int:
+		|	value.first
+		|func main() -> Int:
+		|	read(make())
+		|
+
+	match emitted(source):
+		Err(_):
+			False
+		Ok(code):
+			(
+				code.starts_with(
+					"#include <stdint.h>\nstruct blorp_r_0{int64_t blorp_rf_0_0;int64_t blorp_rf_0_1;};struct blorp_r_1{int64_t blorp_rf_1_0;int64_t blorp_rf_1_1;};struct blorp_r_1 blorp_f_0(void);int64_t blorp_f_1(struct blorp_r_1 blorp_p_0);",
+				)
+				and code.contains("const int64_t blorp_vl_0=INT64_C(9);")
+				and code.contains("const int64_t blorp_vl_1=INT64_C(7);")
+				and code.contains(
+					"((struct blorp_r_1){.blorp_rf_1_1=blorp_vl_0,.blorp_rf_1_0=blorp_vl_1})",
+				)
+				and code.contains("blorp_vl_0.blorp_rf_1_0")
+				and not code.contains("malloc")
+				and not code.contains("retain")
+				and not code.contains("release")
+			)
+
+
+pure func test_full_width_record_literals_use_portable_c_constants() -> Bool:
+	source: String =
+		|fixed record Pair { first: Int, second: Int }
+		|pure func make() -> Pair:
+		|	{ first = -9223372036854775808, second = 9223372036854775807 }
+		|func main() -> Int:
+		|	unused = make()
+		|	0
+		|
+
+	match emitted(source):
+		Err(_):
+			False
+		Ok(code):
+			(
+				code.contains("const int64_t blorp_vl_0=INT64_MIN;")
+				and code.contains("const int64_t blorp_vl_1=INT64_C(9223372036854775807);")
+				and code.contains("const struct blorp_r_0 blorp_vl_0=blorp_f_0();")
+			)
+
+
+tests: TestSuite = {
+	description = "Fixed record C emission",
+	tests = [
+		(
+			"nominal struct layout and by value calls",
+			test_nominal_struct_layout_and_by_value_signature,
+		),
+		(
+			"portable full width fields and unused initializer",
+			test_full_width_record_literals_use_portable_c_constants,
+		),
+	]
+}

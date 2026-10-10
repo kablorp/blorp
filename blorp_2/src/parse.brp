@@ -11,7 +11,7 @@ import:
 		CallNotation(DirectCall, ReceiverCall),
 		DECIMAL_DIGITS,
 		Diagnostic,
-		ExpressionBase(IntegerExpression, NameExpression, DirectApplication),
+		ExpressionBase(IntegerExpression, NameExpression, DirectApplication, RecordExpression),
 		FieldPattern(FieldName, FieldWildcard),
 		FunctionHeader,
 		LexedProgram,
@@ -23,16 +23,20 @@ import:
 		ParsedParameter,
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
 		ParsedPrelude,
+		ParsedRecord,
+		ParsedRecordField,
 		ParsedRuntimeFunction,
 		ParsedRuntimeOperation(IntegerToStringBuiltin, StringLengthBuiltin),
 		ParsedUnion,
 		ParsedVariant,
+		PostfixOperation(ReceiverInvocation, FieldAccess),
 		Purity(Pure, Impure),
 		ReceiverApplication,
 		Span,
 		Symbol(
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
-			Colon, Newline, VarKeyword, Equals, LeftBracket, RightBracket, Comma,
+			Colon, Newline, VarKeyword, Equals, LeftBracket, RightBracket, LeftBrace, RightBrace,
+			Comma,
 		),
 		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, BuiltinLabel, Indentation),
 		TypeSyntax(AtomicType, AppliedType),
@@ -53,6 +57,7 @@ fixed record ParsedContents {
 	prelude: CheckedPrelude,
 	functions: List[ParsedFunction],
 	unions: List[ParsedUnion],
+	records: List[ParsedRecord],
 	end: Span
 }
 
@@ -88,6 +93,18 @@ private pure func expected(state: ParserState, message: String, help: String) ->
 
 private pure func symbol_matches(actual: Symbol, expected: Symbol) -> Bool:
 	match actual:
+		LeftBrace:
+			match expected:
+				LeftBrace:
+					True
+				_:
+					False
+		RightBrace:
+			match expected:
+				RightBrace:
+					True
+				_:
+					False
 		VarKeyword:
 			match expected:
 				VarKeyword:
@@ -509,6 +526,8 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 					},
 					next = name.next,
 				})
+		SymbolToken(LeftBrace):
+			consume_record_literal(after_token, token.span)
 		BuiltinLabel(_):
 			Err(
 				expected(
@@ -528,36 +547,19 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 
 	parsed ?= base_result
 	var state = parsed.next
-	var applications: List[ReceiverApplication] = []
+	var applications: List[PostfixOperation] = []
 	var failure: Option[Diagnostic] = None
 
 	while at_symbol(state, Dot):
-		name_result = consume_name(
-			{ state | position = IntOps.add(state.position, 1) },
-			"expected a function name after '.'",
-		)
-
-		result: Result[ParsedArguments, Diagnostic] = match name_result:
-			Err(error):
-				Err(error)
-			Ok(name):
-				consume_receiver_arguments(name)
+		result = consume_postfix({ state | position = IntOps.add(state.position, 1) })
 
 		match result:
 			Err(error):
 				failure = Some(error)
 				break
-			Ok(arguments):
-				match name_result:
-					Ok(name):
-						applications = applications.append({
-							callee = name.name,
-							arguments = arguments.arguments,
-						})
-					Err(_):
-						void
-
-				state = arguments.next
+			Ok(postfix):
+				applications = applications.append(postfix.operation)
+				state = postfix.next
 
 	ready ?= match failure:
 		Some(error):
@@ -1627,10 +1629,22 @@ pure func parse(input: LexedProgram, prelude: CheckedPrelude) -> Result[ParsedPr
 	}
 	var functions: List[ParsedFunction] = []
 	var unions: List[ParsedUnion] = []
+	var records: List[ParsedRecord] = []
 	var failure: Option[Diagnostic] = None
 
 	while True:
-		if at_word(state, "fixed"):
+		if (
+			at_word(state, "fixed")
+			and at_word({ state | position = IntOps.add(state.position, 1) }, "record")
+		):
+			match consume_record(state):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(parsed):
+					records = records.append(parsed.declaration)
+					state = parsed.next
+		else if at_word(state, "fixed"):
 			match consume_union(state):
 				Err(error):
 					failure = Some(error)
@@ -1674,21 +1688,118 @@ pure func parse(input: LexedProgram, prelude: CheckedPrelude) -> Result[ParsedPr
 						prelude = prelude,
 						functions = functions,
 						unions = unions,
+						records = records,
 						end = input.end
 					}))
 
 
-private pure func consume_receiver_arguments(
-	name: ParsedName,
-) -> Result[ParsedArguments, Diagnostic]:
+private fixed record ParsedPostfix {
+	operation: PostfixOperation,
+	next: ParserState
+}
+
+
+private pure func consume_postfix(state: ParserState) -> Result[ParsedPostfix, Diagnostic]:
+	name ?= consume_name(state, "expected a field or function name after '.'")
 	implicit_arguments ?= reject_function_type_arguments(name.next)
-	opened ?= consume_symbol(
-		name.next,
-		LeftParen,
-		"expected '(' after the UFCS function name",
-		"write receiver.function(arguments)",
+
+	if at_symbol(name.next, LeftParen):
+		arguments ?= consume_arguments({ name.next | position = IntOps.add(name.next.position, 1) })
+		Ok({
+			operation = ReceiverInvocation({
+				callee = name.name,
+				arguments = arguments.arguments,
+			}),
+			next = arguments.next,
+		})
+	else:
+		Ok({
+			operation = FieldAccess(name.name),
+			next = name.next,
+		})
+
+
+private pure func consume_record_literal(
+	start: ParserState,
+	opening: Span,
+) -> Result[ParsedValue, Diagnostic]:
+	var state = start
+	var fields: List[ParsedRecordField] = []
+	var failure: Option[Diagnostic] = None
+
+	if not at_symbol(state, RightBrace):
+		while True:
+			result: Result[ParsedLiteralField, Diagnostic] = consume_name(
+				state,
+				"expected a record field name",
+			).and_then(pure func(name: ParsedName) -> Result[ParsedLiteralField, Diagnostic]:
+				after_equals ?= consume_symbol(
+					name.next,
+					Equals,
+					"expected '=' after the record field name",
+					"write field = expression",
+				)
+				value ?= consume_value(after_equals)
+				Ok({
+					field = {
+						name = name.name,
+						value = value.body
+					},
+					next = value.next,
+				})
+			)
+
+			match result:
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(field):
+					fields = fields.append(field.field)
+					state = field.next
+
+			if not at_symbol(state, Comma):
+				break
+
+			state = { state | position = IntOps.add(state.position, 1) }
+
+	ready ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	closed ?= consume_symbol(
+		state,
+		RightBrace,
+		"expected '}' after the record fields",
+		"keep record fields on one line, separated by commas",
 	)
-	consume_arguments(opened)
+
+	last = match state.input.tokens.get(state.position):
+		Some(token):
+			token.span.end
+		None:
+			opening.end
+
+	span: Span = {
+		start = opening.start,
+		end = last
+	}
+	Ok({
+		body = {
+			base = RecordExpression(fields),
+			base_span = span,
+			applications = [],
+			span = span
+		},
+		next = closed,
+	})
+
+
+private fixed record ParsedLiteralField {
+	field: ParsedRecordField,
+	next: ParserState
+}
 
 
 private fixed record ParsedParameterResult {
@@ -1713,4 +1824,67 @@ private pure func consume_parameter_type(
 			type_name = type_name.written
 		},
 		next = type_name.next,
+	})
+
+
+private fixed record ParsedRecordResult {
+	declaration: ParsedRecord,
+	next: ParserState
+}
+
+
+private pure func consume_record(start: ParserState) -> Result[ParsedRecordResult, Diagnostic]:
+	name ?= consume_name(
+		{ start | position = IntOps.add(start.position, 2) },
+		"expected a record type name",
+	)
+	opened ?= consume_symbol(
+		name.next,
+		LeftBrace,
+		"expected '{' after the record type name",
+		"write fixed record Name { field: Int }",
+	)
+	var state = opened
+	var fields: List[ParsedParameter] = []
+	var failure: Option[Diagnostic] = None
+
+	while True:
+		result = consume_name(
+			state,
+			"expected a record field name",
+		).and_then(
+			pure func(field): consume_parameter_type(field),
+		)
+
+		match result:
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(field):
+				fields = fields.append(field.parameter)
+				state = field.next
+
+		if not at_symbol(state, Comma):
+			break
+
+		state = { state | position = IntOps.add(state.position, 1) }
+
+	ready ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	closed ?= consume_symbol(
+		state,
+		RightBrace,
+		"expected '}' after the record declaration",
+		"keep nonempty record fields on one line, separated by commas",
+	)
+	Ok({
+		declaration = {
+			type_name = name.name,
+			fields = fields
+		},
+		next = closed,
 	})

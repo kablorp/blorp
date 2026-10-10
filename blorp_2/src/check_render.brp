@@ -5,7 +5,12 @@ import:
 	names: NameId, NameTable, name_spelling
 	option: to_result
 	parse: ParsedContents, ParsedProgram, parsed_contents
-	syntax: CallNotation(DirectCall, ReceiverCall), Diagnostic, Diagnostics, Span
+	syntax:
+		CallNotation(DirectCall, ReceiverCall),
+		Diagnostic,
+		DiagnosticNote(TypeDeclaration, RecordFieldDeclaration, PreviousField),
+		Diagnostics,
+		Span,
 	text as Text
 
 
@@ -30,6 +35,10 @@ pure func render_check_errors(program: ParsedProgram, errors: Check.CheckErrors)
 
 private pure func invariant_message(invariant: Check.CheckerInvariant) -> String:
 	match invariant:
+		Check.InvalidRecordDeclaration(_):
+			"invalid record declaration"
+		Check.InvalidRecordField(_):
+			"invalid record field identity"
 		Check.InvalidResolvedFunction(_):
 			"invalid resolved function identity"
 		Check.InvalidUnionDeclaration(_):
@@ -60,8 +69,6 @@ private pure func invariant_message(invariant: Check.CheckerInvariant) -> String
 			"missing constructor argument"
 		Check.InvalidFunctionContract:
 			"invalid function contract"
-		Check.MissingReceiverContract(_):
-			"missing receiver contract"
 		Check.MissingGenericParameter(_):
 			"missing generic parameter"
 		Check.RuntimeGenericContract:
@@ -105,6 +112,98 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 	context = parsed_contents(program)
 
 	match error.kind:
+		Check.DuplicateRecordType(_, previous):
+			note = match previous:
+				Check.SourceTypeDeclaration(span):
+					Some(TypeDeclaration(span))
+				Check.PreludeTypeDeclaration(_):
+					None
+
+			{ rendered(
+				error.span,
+				"duplicate type name",
+				"give record, union and prelude types distinct names",
+			) |
+				note = note
+			}
+		Check.DuplicateRecordField(_, first):
+			{ rendered(
+				error.span,
+				"duplicate record field name",
+				"give each field in a record a distinct name",
+			) |
+				note = Some(PreviousField(first))
+			}
+		Check.UnsupportedRecordField(_):
+			rendered(
+				error.span,
+				"fixed record fields must be Int",
+				"use Int fields; other record field types are not supported yet",
+			)
+		Check.RecordNeedsExpectedType:
+			rendered(
+				error.span,
+				"record literal needs a concrete expected record type",
+				(
+					"pass the literal to a concrete record parameter or return it from a helper "
+					+ "declaring that record"
+				),
+			)
+		Check.UnknownRecordField(name, owner):
+			result = parsed_spelling(
+				name,
+				context.names,
+				error.span,
+			).and_then(
+				pure func(field): type_spelling(
+					Check.RecordType(owner),
+					context,
+					error.span,
+				).map(pure func(record_name): rendered(
+						error.span,
+						"unknown field '"
+							.concat(field)
+							.concat("' in ")
+							.concat(record_name),
+						"use a field declared by the receiving record",
+					)),
+			)
+
+			match result:
+				Ok(diagnostic):
+					diagnostic
+				Err(diagnostic):
+					diagnostic
+		Check.DuplicateLiteralField(_, first):
+			{ rendered(
+				error.span,
+				"duplicate field in record literal",
+				"write each record field exactly once",
+			) |
+				note = Some(PreviousField(first))
+			}
+		Check.MissingRecordField(_, declaration):
+			{ rendered(
+				error.span,
+				"missing field in record literal",
+				"provide every declared record field exactly once",
+			) |
+				note = Some(RecordFieldDeclaration(declaration))
+			}
+		Check.RecordFieldTypeMismatch(_, _, annotation):
+			{ rendered(
+				error.span,
+				"record field requires Int",
+				"use an expression of type Int here",
+			) |
+				note = Some(RecordFieldDeclaration(annotation))
+			}
+		Check.FieldRequiresRecord(_):
+			rendered(
+				error.span,
+				"field access requires a record value",
+				"read a declared record field, or use parentheses for a UFCS function call",
+			)
 		Check.DuplicateVariant(_, _):
 			rendered(
 				error.span,
@@ -487,6 +586,11 @@ private pure func type_spelling(
 	span: Span,
 ) -> Result[String, Diagnostic]:
 	match value:
+		Check.RecordType(id):
+			declaration ?= context.records
+				.get(Check.record_number(id))
+				.to_result(render_fault(span, Check.InvalidRecordDeclaration(id)))
+			parsed_spelling(declaration.type_name.id, context.names, span)
 		Check.IntType:
 			parsed_spelling(prelude_names(context.prelude).special.integer, context.names, span)
 		Check.StringType:

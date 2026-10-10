@@ -1,7 +1,8 @@
 import:
 	int as IntOps
+	list: contains
 	lower: MatchLabel(DefaultLabel, VariantLabel), ValueId, value_number
-	option: to_result
+	option: is_some, to_result
 	own:
 		BorrowSource(ParameterBorrow, OwnerBorrow),
 		BorrowedValue,
@@ -12,7 +13,8 @@ import:
 		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(
 			ParameterDefinition, IntegerDefinition, VariantDefinition, CallDefinition,
-			ConstructDefinition, PayloadDefinition,
+			ConstructDefinition, PayloadDefinition, ConstructRecordDefinition,
+			ReadRecordFieldDefinition,
 		),
 		OwnerId,
 		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
@@ -25,12 +27,18 @@ import:
 	specialize:
 		CallTarget(UserFunction, RuntimeFunction),
 		ConcreteCall,
+		ConcreteRecord,
 		ConcreteUnion,
+		FieldInstanceId,
 		FunctionSignature,
 		PayloadShape(NoPayload, IntPayload),
-		TypeRef(IntType, StringType, UnionType),
+		RecordInstanceId,
+		TypeRef(IntType, StringType, UnionType, RecordType),
 		VariantInstanceId,
+		field_number,
+		field_owner,
 		function_number,
+		record_number,
 		runtime_signature,
 		same_type,
 		union_number,
@@ -236,6 +244,7 @@ private pure func verify_argument(
 	state: VerificationState,
 	unions: List[ConcreteUnion],
 	span: Span,
+	records: List[ConcreteRecord],
 ) -> Result[Bool, Diagnostic]:
 	id = match argument:
 		UnmanagedArgument(id):
@@ -250,7 +259,7 @@ private pure func verify_argument(
 	else:
 		match argument:
 			UnmanagedArgument(_):
-				plan ?= value_ownership(expected, unions)
+				plan ?= value_ownership(expected, unions, records)
 
 				match plan:
 					NoOwnership:
@@ -272,6 +281,7 @@ private pure func verify_arguments(
 	state: VerificationState,
 	unions: List[ConcreteUnion],
 	span: Span,
+	records: List[ConcreteRecord],
 ) -> Result[Bool, Diagnostic]:
 	if IntOps.less_than(arguments.length(), parameters.length()):
 		Err(failure(span, "call is missing its argument"))
@@ -287,7 +297,7 @@ private pure func verify_arguments(
 					invalid = Some(failure(span, "missing call parameter contract"))
 					break
 				Some(expected):
-					match verify_argument(argument, expected, state, unions, span):
+					match verify_argument(argument, expected, state, unions, span, records):
 						Err(error):
 							invalid = Some(error)
 							break
@@ -344,6 +354,46 @@ private pure func variant_type(
 		Err(failure(span, "variant payload does not match its operation"))
 
 
+private pure func valid_record_layout(
+	layout: ConcreteRecord,
+	span: Span,
+) -> Result[ConcreteRecord, Diagnostic]:
+	var valid = layout.fields.length() > 0
+
+	for field in layout.fields:
+		valid = valid and same_type(field, IntType)
+
+	if valid:
+		Ok(layout)
+	else:
+		Err(failure(span, "record layout must contain one or more Int fields"))
+
+
+private pure func record_layout(
+	owner: RecordInstanceId,
+	records: List[ConcreteRecord],
+	span: Span,
+) -> Result[ConcreteRecord, Diagnostic]:
+	layout ?= records
+		.get(record_number(owner))
+		.to_result(failure(span, "unknown record layout"))
+	valid_record_layout(layout, span)
+
+
+private pure func record_field_type(
+	field: FieldInstanceId,
+	owner: RecordInstanceId,
+	layout: ConcreteRecord,
+	span: Span,
+) -> Result[TypeRef, Diagnostic]:
+	if not IntOps.equals(record_number(field_owner(field)), record_number(owner)):
+		Err(failure(span, "field belongs to a different record layout"))
+	else:
+		layout.fields
+			.get(field_number(field))
+			.to_result(failure(span, "unknown record field"))
+
+
 private pure func operation_type(
 	definition: OwnedDefinition,
 	state: VerificationState,
@@ -351,8 +401,72 @@ private pure func operation_type(
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	projection: ProjectionContext,
+	records: List[ConcreteRecord],
 ) -> Result[TypeRef, Diagnostic]:
 	match definition.operation:
+		ConstructRecordDefinition(owner, fields):
+			layout ?= record_layout(owner, records, definition.span)
+
+			complete ?= if IntOps.equals(fields.length(), layout.fields.length()):
+				Ok(void)
+			else:
+				Err(
+					failure(
+						definition.span,
+						"record construction must provide every field exactly once",
+					),
+				)
+
+			var seen: List[Int] = []
+			var invalid: Option[Diagnostic] = None
+
+			for field in fields:
+				if seen.contains(field_number(field.field)):
+					invalid = Some(failure(definition.span, "record construction repeats a field"))
+					break
+
+				result = record_field_type(
+					field.field,
+					owner,
+					layout,
+					definition.span,
+				).and_then(pure func(expected: TypeRef) -> Result[Bool, Diagnostic]:
+					known ?= value(state.values, field.value, definition.span)
+
+					if same_type(known.value_type, expected):
+						Ok(True)
+					else:
+						Err(
+							failure(
+								definition.span,
+								"record field value type does not match its layout",
+							),
+						)
+				)
+
+				match result:
+					Err(error):
+						invalid = Some(error)
+						break
+					Ok(_):
+						seen = seen.append(field_number(field.field))
+
+			match invalid:
+				Some(error):
+					Err(error)
+				None:
+					Ok(RecordType(owner))
+		ReadRecordFieldDefinition(field, source):
+			known ?= value(state.values, source, definition.span)
+
+			owner ?= match known.value_type:
+				RecordType(owner):
+					Ok(owner)
+				_:
+					Err(failure(definition.span, "field projection requires a record value"))
+
+			layout ?= record_layout(owner, records, definition.span)
+			record_field_type(field, owner, layout, definition.span)
 		ParameterDefinition(index):
 			if IntOps.less_than(index, state.parameters.length()):
 				Err(failure(definition.span, "function parameter is defined more than once"))
@@ -384,6 +498,7 @@ private pure func operation_type(
 				state,
 				unions,
 				definition.span,
+				records,
 			)
 
 			if same_type(contract.return_type, definition.value_type):
@@ -432,16 +547,29 @@ private pure func verify_definition(
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	projection: ProjectionContext,
+	records: List[ConcreteRecord],
 ) -> Result[VerificationState, Diagnostic]:
 	if IntOps.not_equals(value_number(definition.id), state.next_value):
 		Err(failure(definition.span, "value identity is not the next function ordinal"))
 	else:
-		expected ?= operation_type(definition, state, signature, functions, unions, projection)
+		expected ?= operation_type(
+			definition,
+			state,
+			signature,
+			functions,
+			unions,
+			projection,
+			records,
+		)
 
 		if not same_type(expected, definition.value_type):
 			Err(failure(definition.span, "definition type does not match its operation"))
 		else:
-			plan ?= value_ownership(definition.value_type, unions)
+			plan ?= match definition.value_type:
+				RecordType(owner):
+					record_layout(owner, records, definition.span).map(pure func(_): NoOwnership)
+				_:
+					value_ownership(definition.value_type, unions, records)
 
 			ownership_result: Result[List[OwnerState], Diagnostic] = match plan:
 				NoOwnership:
@@ -519,10 +647,11 @@ private pure func verify_operation(
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	projection: ProjectionContext,
+	records: List[ConcreteRecord],
 ) -> Result[VerificationState, Diagnostic]:
 	match operation:
 		DefineValue(definition):
-			verify_definition(definition, state, signature, functions, unions, projection)
+			verify_definition(definition, state, signature, functions, unions, projection, records)
 		AcquireOwner(id, borrow, span):
 			valid ?= verify_borrow(borrow, state, span)
 			owners ?= introduce_owner(state.owners, id, borrow.value, span)
@@ -582,6 +711,7 @@ private pure func verify_return(
 	state: VerificationState,
 	return_type: TypeRef,
 	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
 ) -> Result[Bool, Diagnostic]:
 	result ?= value(
 		state.values,
@@ -595,7 +725,7 @@ private pure func verify_return(
 	if not same_type(result.value_type, return_type):
 		Err(failure(result.span, "return type does not match its contract"))
 	else:
-		plan ?= value_ownership(return_type, unions)
+		plan ?= value_ownership(return_type, unions, records)
 
 		ownership_result: Result[List[OwnerState], Diagnostic] = match plan:
 			NoOwnership:
@@ -643,12 +773,13 @@ private pure func verify_transfer(
 	state: VerificationState,
 	return_type: TypeRef,
 	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
 ) -> Result[Bool, Diagnostic]:
 	match result:
 		UnmanagedReturn(value):
-			verify_return(value, None, state, return_type, unions)
+			verify_return(value, None, state, return_type, unions, records)
 		OwnedReturn(value, owner):
-			verify_return(value, Some(owner), state, return_type, unions)
+			verify_return(value, Some(owner), state, return_type, unions, records)
 
 
 -- OwnershipProgram is public raw data: its reconstructed arms do not retain
@@ -730,6 +861,7 @@ private pure func verify_match(
 	signature: FunctionSignature,
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
 ) -> Result[Bool, Diagnostic]:
 	scrutinee ?= value(
 		state.values,
@@ -766,7 +898,15 @@ private pure func verify_match(
 					PayloadProjection(matched.scrutinee, id)
 
 			for operation in arm.operations:
-				match verify_operation(operation, branch, signature, functions, unions, projection):
+				match verify_operation(
+					operation,
+					branch,
+					signature,
+					functions,
+					unions,
+					projection,
+					records,
+				):
 					Ok(updated):
 						branch = updated
 					Err(error):
@@ -777,7 +917,13 @@ private pure func verify_match(
 				Some(_):
 					break
 				None:
-					match verify_transfer(arm.result, branch, signature.return_type, unions):
+					match verify_transfer(
+						arm.result,
+						branch,
+						signature.return_type,
+						unions,
+						records,
+					):
 						Ok(_):
 							next_value = branch.next_value
 							next_owner = branch.owners.length()
@@ -796,6 +942,7 @@ private pure func verify_function(
 	function: OwnedFunction,
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
 ) -> Result[Bool, Diagnostic]:
 	var state: VerificationState = {
 		values = [],
@@ -813,6 +960,7 @@ private pure func verify_function(
 			functions,
 			unions,
 			NoProjection,
+			records,
 		):
 			Ok(updated):
 				state = updated
@@ -842,7 +990,7 @@ private pure func verify_function(
 
 			match function.tail:
 				ReturnTail(result):
-					verify_transfer(result, state, function.signature.return_type, unions)
+					verify_transfer(result, state, function.signature.return_type, unions, records)
 				MatchTail(matched):
 					-- This restriction is checked independently of the inserter,
 					-- including managed prefix values already dropped by the tail.
@@ -864,7 +1012,14 @@ private pure func verify_function(
 						Some(span):
 							Err(failure(span, "managed value appears before a tail match"))
 						None:
-							verify_match(matched, state, function.signature, functions, unions)
+							verify_match(
+								matched,
+								state,
+								function.signature,
+								functions,
+								unions,
+								records,
+							)
 
 
 -- C main calls the entry without arguments and consumes an Int. Enforcing
@@ -910,8 +1065,27 @@ pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnosti
 		)
 	var invalid: Option[Diagnostic] = None
 
+	for layout in program.records:
+		match (
+			valid_record_layout(
+				layout,
+				{
+					start = 0,
+					end = 0
+				},
+			)
+		):
+			Ok(_):
+				void
+			Err(error):
+				invalid = Some(error)
+				break
+
 	for function in program.functions:
-		match verify_function(function, program.functions, program.unions):
+		if invalid.is_some():
+			break
+
+		match verify_function(function, program.functions, program.unions, program.records):
 			Ok(_):
 				void
 			Err(error):

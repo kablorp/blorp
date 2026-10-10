@@ -12,6 +12,28 @@ opaque type FunctionInstanceId = Int
 
 opaque type UnionInstanceId = Int
 
+opaque type RecordInstanceId = Int
+
+
+private fixed record FieldIdentity {
+	owner: RecordInstanceId,
+	position: Int
+}
+
+
+opaque type FieldInstanceId = FieldIdentity
+
+
+fixed record ConcreteRecord {
+	fields: List[TypeRef]
+}
+
+
+private fixed record RecordInstance {
+	declaration: Checked.RecordId,
+	layout: ConcreteRecord
+}
+
 
 private fixed record VariantIdentity {
 	owner: UnionInstanceId,
@@ -25,6 +47,7 @@ opaque type VariantInstanceId = VariantIdentity
 fixed union TypeRef:
 	IntType
 	StringType
+	RecordType(RecordInstanceId)
 	UnionType(UnionInstanceId)
 
 
@@ -73,7 +96,15 @@ pure func runtime_signature(operation: RuntimeOperation) -> FunctionSignature:
 	}
 
 
+fixed record ConcreteRecordField {
+	field: FieldInstanceId,
+	value: ConcreteValue,
+	span: Span
+}
+
+
 fixed union ConcreteBase:
+	ReturnRecord(RecordInstanceId, List[ConcreteRecordField])
 	ReturnInteger(Int)
 	ReturnVariant(VariantInstanceId)
 	ReturnBinding(Checked.BindingId)
@@ -83,6 +114,7 @@ fixed union ConcreteBase:
 fixed union ConcreteOperation:
 	InvokeFunction(ConcreteCall, List[ConcreteValue])
 	ConstructVariant(VariantInstanceId)
+	ReadRecordField(FieldInstanceId)
 
 
 fixed record ConcreteStep {
@@ -145,6 +177,7 @@ fixed record ConcreteFunction {
 
 
 fixed record SpecializedContents {
+	records: List[ConcreteRecord],
 	unions: List[ConcreteUnion],
 	functions: List[ConcreteFunction],
 	entrypoint: FunctionInstanceId
@@ -152,6 +185,18 @@ fixed record SpecializedContents {
 
 
 opaque type SpecializedProgram = SpecializedContents
+
+
+pure func record_number(id: RecordInstanceId) -> Int:
+	from_opaque RecordInstanceId(id)
+
+
+pure func field_owner(id: FieldInstanceId) -> RecordInstanceId:
+	from_opaque FieldInstanceId(id).owner
+
+
+pure func field_number(id: FieldInstanceId) -> Int:
+	from_opaque FieldInstanceId(id).position
 
 
 pure func union_number(id: UnionInstanceId) -> Int:
@@ -168,6 +213,12 @@ pure func variant_number(id: VariantInstanceId) -> Int:
 
 pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 	match left:
+		RecordType(left):
+			match right:
+				RecordType(right):
+					IntOps.equals(record_number(left), record_number(right))
+				_:
+					False
 		IntType:
 			match right:
 				IntType:
@@ -247,13 +298,59 @@ private pure func translated_list[T, U](
 			Ok(translated)
 
 
+private pure func find_record_instance(
+	records: List[RecordInstance],
+	declaration: Checked.RecordId,
+) -> Option[RecordInstanceId]:
+	var found: Option[RecordInstanceId] = None
+	var position = 0
+
+	for instance in records:
+		if IntOps.equals(
+			Checked.record_number(instance.declaration),
+			Checked.record_number(declaration),
+		):
+			found = Some(into_opaque RecordInstanceId(position))
+			break
+
+		position = IntOps.add(position, 1)
+
+	found
+
+
+private pure func translate_field(
+	field: Checked.FieldId,
+	records: List[RecordInstance],
+	span: Span,
+) -> Result[FieldInstanceId, Diagnostic]:
+	owner ?= find_record_instance(
+		records,
+		Checked.field_owner(field),
+	).to_result(invalid(span, "unknown record declaration for field"))
+	instance ?= records
+		.get(record_number(owner))
+		.to_result(invalid(span, "unknown concrete record"))
+	member ?= instance.layout.fields
+		.get(Checked.field_number(field))
+		.to_result(invalid(span, "unknown record field"))
+	Ok(into_opaque FieldInstanceId({
+				owner = owner,
+				position = Checked.field_number(field)
+			}))
+
+
 private pure func concrete_type(
 	value_type: Checked.TypeRef,
 	substitution: List[TypeSubstitution],
 	unions: List[UnionInstance],
 	span: Span,
+	records: List[RecordInstance],
 ) -> Result[TypeRef, Diagnostic]:
 	match value_type:
+		Checked.RecordType(id):
+			find_record_instance(records, id)
+				.map(pure func(owner): RecordType(owner))
+				.to_result(invalid(span, "unprepared record instance"))
 		Checked.IntType:
 			Ok(IntType)
 		Checked.StringType:
@@ -263,7 +360,7 @@ private pure func concrete_type(
 				arguments,
 				pure func(
 					value: Checked.TypeRef,
-				): concrete_type(value, substitution, unions, span),
+				): concrete_type(value, substitution, unions, span, records),
 			)
 			id ?= find_union_instance(
 				unions,
@@ -414,6 +511,7 @@ private pure func call_key(
 	call: Checked.CheckedCall,
 	substitution: List[TypeSubstitution],
 	unions: List[UnionInstance],
+	records: List[RecordInstance],
 ) -> Result[Option[InstanceKey], Diagnostic]:
 	match call.target:
 		Checked.RuntimeFunction(_):
@@ -423,7 +521,7 @@ private pure func call_key(
 				arguments,
 				pure func(
 					value: Checked.TypeRef,
-				): concrete_type(value, substitution, unions, call.span),
+				): concrete_type(value, substitution, unions, call.span, records),
 			)
 			Ok(Some({
 				declaration = declaration,
@@ -442,6 +540,9 @@ private pure func append_value_calls(
 	var calls = collected
 
 	match value.base:
+		Checked.ReturnRecord(_, fields):
+			for field in fields:
+				calls = append_value_calls(calls, field.value)
 		Checked.ReturnCall(call, arguments):
 			for argument in arguments:
 				calls = append_value_calls(calls, argument)
@@ -589,6 +690,7 @@ private pure func ensure_union(
 	declarations: List[Checked.CheckedUnion],
 	unions: List[UnionInstance],
 	span: Span,
+	records: List[RecordInstance],
 ) -> Result[PreparedType, Diagnostic]:
 	match find_union_instance(unions, key):
 		Some(id):
@@ -613,7 +715,13 @@ private pure func ensure_union(
 					None:
 						Ok(NoPayload)
 					Some(written):
-						value ?= concrete_type(written.value_type, substitution, unions, span)
+						value ?= concrete_type(
+							written.value_type,
+							substitution,
+							unions,
+							span,
+							records,
+						)
 
 						match value:
 							IntType:
@@ -642,6 +750,7 @@ private pure func prepare_type(
 	declarations: List[Checked.CheckedUnion],
 	unions: List[UnionInstance],
 	span: Span,
+	records: List[RecordInstance],
 ) -> Result[PreparedType, Diagnostic]:
 	match value:
 		Checked.UnionType(id):
@@ -653,6 +762,7 @@ private pure func prepare_type(
 				declarations,
 				unions,
 				span,
+				records,
 			)
 		Checked.AppliedUnionType(id, arguments):
 			var types: List[TypeRef] = []
@@ -660,7 +770,14 @@ private pure func prepare_type(
 			var failure: Option[Diagnostic] = None
 
 			for argument in arguments:
-				match prepare_type(argument, substitution, declarations, dependencies, span):
+				match prepare_type(
+					argument,
+					substitution,
+					declarations,
+					dependencies,
+					span,
+					records,
+				):
 					Ok(prepared):
 						types = types.append(prepared.value_type)
 						dependencies = prepared.unions
@@ -682,9 +799,10 @@ private pure func prepare_type(
 				declarations,
 				dependencies,
 				span,
+				records,
 			)
 		_:
-			concrete ?= concrete_type(value, substitution, unions, span)
+			concrete ?= concrete_type(value, substitution, unions, span, records)
 			Ok({
 				value_type = concrete,
 				unions = unions,
@@ -705,6 +823,9 @@ private pure func append_value_types(
 	})
 
 	match value.base:
+		Checked.ReturnRecord(_, fields):
+			for field in fields:
+				types = append_value_types(types, field.value)
 		Checked.ReturnCall(_, children):
 			for child in children:
 				types = append_value_types(types, child)
@@ -781,6 +902,7 @@ private pure func prepare_function(
 	request: FunctionRequest,
 	declarations: List[Checked.CheckedUnion],
 	initial: PreparedInstances,
+	records: List[RecordInstance],
 ) -> Result[PreparedInstances, Diagnostic]:
 	substitution ?= instance_substitution(
 		function.signature,
@@ -797,6 +919,7 @@ private pure func prepare_function(
 			declarations,
 			prepared.unions,
 			request_span(written.value_type, request.source, written.span),
+			records,
 		):
 			Ok(value):
 				prepared = { prepared | unions = value.unions }
@@ -819,6 +942,7 @@ private pure func prepare_function(
 							declarations,
 							prepared.unions,
 							request_span(argument, request.source, call.span),
+							records,
 						):
 							Ok(value):
 								prepared = { prepared | unions = value.unions }
@@ -858,6 +982,7 @@ private pure func expand_instances(
 	functions: List[Checked.CheckedFunction],
 	declarations: List[Checked.CheckedUnion],
 	initial: PreparedInstances,
+	records: List[RecordInstance],
 ) -> Result[PreparedInstances, Diagnostic]:
 	var prepared = initial
 	var cursor: Int = 0
@@ -889,7 +1014,7 @@ private pure func expand_instances(
 							),
 						)
 					Some(function):
-						match prepare_function(function, request, declarations, prepared):
+						match prepare_function(function, request, declarations, prepared, records):
 							Ok(value):
 								prepared = value
 							Err(error):
@@ -912,12 +1037,13 @@ private pure func translate_call(
 	substitution: List[TypeSubstitution],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
+	records: List[RecordInstance],
 ) -> Result[ConcreteCall, Diagnostic]:
 	target_result: Result[CallTarget, Diagnostic] = match call.target:
 		Checked.RuntimeFunction(operation):
 			Ok(RuntimeFunction(operation))
 		Checked.UserFunction(_, _):
-			request ?= call_key(call, substitution, unions)
+			request ?= call_key(call, substitution, unions, records)
 			key ?= request.to_result(invalid(call.span, "missing user instance key"))
 			id ?= find_instance(
 				keys,
@@ -976,10 +1102,28 @@ private pure func translate_value(
 	substitution: List[TypeSubstitution],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
+	records: List[RecordInstance],
 ) -> Result[ConcreteValue, Diagnostic]:
-	base_type ?= concrete_type(value.base_type, substitution, unions, value.base_span)
+	base_type ?= concrete_type(value.base_type, substitution, unions, value.base_span, records)
 
 	base_result: Result[ConcreteBase, Diagnostic] = match value.base:
+		Checked.ReturnRecord(id, fields):
+			owner ?= find_record_instance(
+				records,
+				id,
+			).to_result(invalid(value.base_span, "unknown record declaration"))
+			concrete ?= translated_list(fields, pure func(
+				field: Checked.CheckedRecordField,
+			) -> Result[ConcreteRecordField, Diagnostic]:
+				id ?= translate_field(field.field, records, field.span)
+				child ?= translate_value(field.value, substitution, keys, unions, records)
+				Ok({
+					field = id,
+					value = child,
+					span = field.span,
+				})
+			)
+			Ok(ReturnRecord(owner, concrete))
 		Checked.ReturnInteger(value):
 			Ok(ReturnInteger(value))
 		Checked.ReturnBinding(id):
@@ -989,7 +1133,7 @@ private pure func translate_value(
 			concrete ?= translate_variant(id, owner, unions, value.base_span)
 			Ok(ReturnVariant(concrete))
 		Checked.ReturnCall(call, arguments):
-			concrete ?= translate_call(call, substitution, keys, unions)
+			concrete ?= translate_call(call, substitution, keys, unions, records)
 			values ?= translated_list(
 				arguments,
 				pure func(
@@ -999,6 +1143,7 @@ private pure func translate_value(
 					substitution,
 					keys,
 					unions,
+					records,
 				),
 			)
 			Ok(ReturnCall(concrete, values))
@@ -1007,11 +1152,13 @@ private pure func translate_value(
 	steps ?= translated_list(value.operations, pure func(
 		step: Checked.CheckedStep,
 	) -> Result[ConcreteStep, Diagnostic]:
-		value_type ?= concrete_type(step.value_type, substitution, unions, step.span)
+		value_type ?= concrete_type(step.value_type, substitution, unions, step.span, records)
 
 		operation_result: Result[ConcreteOperation, Diagnostic] = match step.operation:
+			Checked.ReadRecordField(field):
+				translate_field(field, records, step.span).map(pure func(id): ReadRecordField(id))
 			Checked.InvokeFunction(call, arguments):
-				concrete ?= translate_call(call, substitution, keys, unions)
+				concrete ?= translate_call(call, substitution, keys, unions, records)
 				values ?= translated_list(
 					arguments,
 					pure func(
@@ -1021,6 +1168,7 @@ private pure func translate_value(
 						substitution,
 						keys,
 						unions,
+						records,
 					),
 				)
 				Ok(InvokeFunction(concrete, values))
@@ -1049,16 +1197,17 @@ private pure func translate_assignments(
 	substitution: List[TypeSubstitution],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
+	records: List[RecordInstance],
 ) -> Result[List[ConcreteAssignment], Diagnostic]:
 	translated_list(assignments, pure func(
 		assignment: Checked.CheckedAssignment,
 	) -> Result[ConcreteAssignment, Diagnostic]:
 		match assignment:
 			Checked.InitializeBinding(id, value):
-				value ?= translate_value(value, substitution, keys, unions)
+				value ?= translate_value(value, substitution, keys, unions, records)
 				Ok(InitializeBinding(id, value))
 			Checked.ReassignBinding(id, value):
-				value ?= translate_value(value, substitution, keys, unions)
+				value ?= translate_value(value, substitution, keys, unions, records)
 				Ok(ReassignBinding(id, value))
 	)
 
@@ -1093,6 +1242,7 @@ private pure func translate_function(
 	key: InstanceKey,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
+	records: List[RecordInstance],
 ) -> Result[ConcreteFunction, Diagnostic]:
 	span = function.signature.return_type.span
 	substitution ?= instance_substitution(function.signature, key, span)
@@ -1106,6 +1256,7 @@ private pure func translate_function(
 			substitution,
 			unions,
 			value.span,
+			records,
 		),
 	)
 
@@ -1114,11 +1265,12 @@ private pure func translate_function(
 		substitution,
 		unions,
 		function.signature.return_type.span,
+		records,
 	)
 	bindings ?= translated_list(function.bindings, pure func(
 		binding: Checked.BindingDefinition,
 	) -> Result[ConcreteBinding, Diagnostic]:
-		value_type ?= concrete_type(binding.value_type, substitution, unions, binding.span)
+		value_type ?= concrete_type(binding.value_type, substitution, unions, binding.span, records)
 		Ok({
 			origin = binding.origin,
 			mutability = binding.mutability,
@@ -1126,22 +1278,28 @@ private pure func translate_function(
 			span = binding.span,
 		})
 	)
-	assignments ?= translate_assignments(function.assignments, substitution, keys, unions)
+	assignments ?= translate_assignments(function.assignments, substitution, keys, unions, records)
 
 	body_result: Result[ConcreteBody, Diagnostic] = match function.body:
 		Checked.CheckedValueBody(value):
-			concrete ?= translate_value(value, substitution, keys, unions)
+			concrete ?= translate_value(value, substitution, keys, unions, records)
 			Ok(ConcreteValueBody(concrete))
 		Checked.CheckedMatchBody(matched):
-			scrutinee ?= translate_value(matched.scrutinee, substitution, keys, unions)
-			union_type ?= concrete_type(matched.union_type, substitution, unions, span)
+			scrutinee ?= translate_value(matched.scrutinee, substitution, keys, unions, records)
+			union_type ?= concrete_type(matched.union_type, substitution, unions, span, records)
 			owner ?= concrete_union_owner(union_type, span)
 			arms ?= translated_list(matched.arms, pure func(
 				arm: Checked.CheckedArm,
 			) -> Result[ConcreteArm, Diagnostic]:
 				pattern ?= translate_pattern(arm.pattern, owner, span, unions)
-				assignments ?= translate_assignments(arm.assignments, substitution, keys, unions)
-				body ?= translate_value(arm.body, substitution, keys, unions)
+				assignments ?= translate_assignments(
+					arm.assignments,
+					substitution,
+					keys,
+					unions,
+					records,
+				)
+				body ?= translate_value(arm.body, substitution, keys, unions, records)
 				Ok({
 					pattern = pattern,
 					assignments = assignments,
@@ -1176,6 +1334,33 @@ pure func specialize(program: Checked.CheckedProgram) -> Result[SpecializedProgr
 	var position: Int = 0
 	var failure: Option[Diagnostic] = None
 
+	var record_instances: List[RecordInstance] = []
+
+	for declaration in checked.records:
+		match Checked.record_declaration_id(program, record_instances.length()):
+			Some(id):
+				record_instances = record_instances.append({
+					declaration = id,
+					layout = {
+						fields = declaration.fields.map(
+							pure func(field: Checked.TypeUse): IntType,
+						),
+					},
+				})
+			None:
+				failure = Some(
+					invalid(
+						{
+							start = 0,
+							end = 0
+						},
+						"unknown record root",
+					),
+				)
+				break
+
+	records = record_instances
+
 	for declaration in checked.unions:
 		match declaration.type_parameters:
 			[]:
@@ -1204,6 +1389,7 @@ pure func specialize(program: Checked.CheckedProgram) -> Result[SpecializedProgr
 									start = 0,
 									end = 0
 								},
+								records,
 							))
 				):
 					Ok(value):
@@ -1247,7 +1433,7 @@ pure func specialize(program: Checked.CheckedProgram) -> Result[SpecializedProgr
 		None:
 			Ok(void)
 
-	prepared ?= expand_instances(checked.functions, checked.unions, initial)
+	prepared ?= expand_instances(checked.functions, checked.unions, initial, records)
 	functions ?= translated_list(prepared.functions, pure func(
 		request: FunctionRequest,
 	) -> Result[ConcreteFunction, Diagnostic]:
@@ -1262,7 +1448,7 @@ pure func specialize(program: Checked.CheckedProgram) -> Result[SpecializedProgr
 					"unknown function declaration",
 				),
 			)
-		translate_function(function, request.key, prepared.functions, prepared.unions)
+		translate_function(function, request.key, prepared.functions, prepared.unions, records)
 	)
 	entrypoint ?= find_instance(
 		prepared.functions,
@@ -1280,6 +1466,7 @@ pure func specialize(program: Checked.CheckedProgram) -> Result[SpecializedProgr
 		),
 	)
 	Ok(into_opaque SpecializedProgram({
+				records = records.map(pure func(instance: RecordInstance): instance.layout),
 				unions = prepared.unions.map(pure func(instance: UnionInstance): instance.layout),
 				functions = functions,
 				entrypoint = entrypoint

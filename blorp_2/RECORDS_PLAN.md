@@ -1,14 +1,15 @@
 # Fixed records: the first increment
 
-Status: specified for implementation. Read [AGENTS.md](AGENTS.md) and the
-parent instructions first. [README.md](README.md) describes the supported
+Status: Int-only implementation complete, validated and independently reviewed.
+Read [AGENTS.md](AGENTS.md) and the parent instructions first.
+[README.md](README.md) describes the supported
 pilot, [grammar.ebnf](grammar.ebnf) owns its syntax, and
 [MEMORY_PLAN.md](MEMORY_PLAN.md) owns the memory contracts.
 
 ## Problem and working example
 
-The pilot has nominal unions and managed String leaves, but no product type.
-It cannot compile the following program. This increment establishes record
+At the frozen e553b5c04 baseline, the pilot has nominal unions and managed String
+leaves, but no product type. It cannot compile the following program. This increment establishes record
 identity, construction, projection, and value semantics before adding managed
 fields or recursive data.
 
@@ -171,9 +172,11 @@ duplicating signatures or field types in competing catalogues. Reuse current
 sealed construction APIs; do not expose unchecked products to make tests easy.
 Use Option for a true optional value rather than inventing a two-case carrier.
 
-## Current code and proposed carriers
+## Baseline code and carrier design
 
-Current `src/syntax.brp:114-125` has a call-only postfix list:
+The excerpts and line references in this section describe frozen baseline
+`e553b5c04`; the carrier sketches record the implementation design.
+At that baseline, `src/syntax.brp:114-125` has a call-only postfix list:
 
 ```blorp
 fixed record ReceiverApplication {
@@ -203,7 +206,7 @@ children, in written postfix order. Resolve fields once their receivers have
 types. A transient closed call-or-pending-field variant avoids parallel lists
 of optional contracts. Existing call-only error priority must stay unchanged.
 
-Current `src/check.brp:159-169`:
+Baseline `src/check.brp:159-169`:
 
 ```blorp
 fixed union CheckedBase:
@@ -221,7 +224,7 @@ Add `ReturnRecord(RecordId, List[CheckedRecordField])` and
 checked child and source span. Existing CheckedValue/CheckedStep types remain
 the occurrence type/span authorities; field types belong to declarations.
 
-One bounded preparation is part of this design. Current
+One bounded preparation is part of this design. Baseline
 `src/check.brp:1113-1119` allows any checked step in a transient call contract:
 
 ```blorp
@@ -412,12 +415,15 @@ compiler allocations and 100,000,000 retired instructions, with strict zero
 compiler leaks. Target record operations have zero heap allocation by design;
 inspect generated C to establish that separate claim. Track production/test
 formatted physical lines separately; stop for coordinator review if production
-growth exceeds 900 lines. These are scope/investigation stops, not permission
+growth exceeds the final reviewed 1450-line threshold below. These are scope/investigation stops, not permission
 to compress code, remove coverage, or increase ceilings silently.
 
 The existing union_values instruction ceiling has marginal headroom and
-previously needed one unchanged rerun. Preserve any failure and follow the
-repository's bounded triage; do not label a retry proof of a robust ceiling.
+previously needed one unchanged rerun. Final validation preserved another
+40M failure; coordinator and independent review explicitly approved a
+union_values-only 45M ceiling, with its 4000 allocation limit and all other
+caps unchanged. The retained report records historical and current matched
+evidence; the separate 10%/5% investigation stops remain unchanged.
 
 ## Handoff and completion
 
@@ -437,3 +443,33 @@ Independent compiler-expert code-reviewer and test-runner approval is required,
 including an explicit judgment that the project is better. Do not commit or
 push without a later user request. Managed fields are a separate next spec;
 do not quietly begin them after this slice passes.
+
+
+Implementation size review (2026-10-10): the original +900 formatted physical
+production-line stop was invoked at the parser/checker checkpoint (+802 at
+initial review). The coordinator and independent compiler reviewer reviewed
+the necessary typed diagnostics, source-order/error priority, explicit Result
+loops, cross-phase identity translation, and independent public-layout checks.
+They approved investigation stops of +1250, then +1350, and finally +1450
+formatted physical production lines relative to e553b5c04. The downstream
+forecast underestimated the verifier and carrier growth; this does not add
+functionality or waive measured regressions. Scope, formatting, coverage,
+mechanisms, allocation/instruction investigation stops, new record fixture
+ceilings and leak thresholds are unchanged. The explicit union-only fixture
+budget review above is separate. Final actual counts
+and validation belong in the retained implementation report.
+
+Current implementation and focused/mutation/cost evidence are retained in
+[the fixed-record report](../benchmarks/results/blorp_2_fixed_records_2026-10-10.md).
+The local [evidence navigator](build/records/README.md) links all raw packets,
+source snapshots, samples and mutation receipts.
+
+Independent validation passes 657/657 strict unit/grammar callbacks and
+667/667 normal unit/runtime/grammar callbacks. The first full Makefile gate
+failed on the retained frontend oracle and union budget issues documented
+above. After their reviewed e2e-only corrections, the
+[final end-to-end packet](build/records/validation/final-independent-e2e-corrected/metadata.json)
+passes 104/104 including its wrapper. The unchanged green unit/grammar results
+are reused; all required gate components now pass. Independent compiler/code
+and test-runner reviews approve the completed increment. No commits or pushes
+were made.
