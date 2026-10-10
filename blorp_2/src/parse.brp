@@ -35,7 +35,6 @@ import:
 			Colon, Newline, VarKeyword, Equals, LeftBracket, RightBracket, Comma,
 		),
 		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, BuiltinLabel, Indentation),
-		TypeParameterSyntax(NoTypeParameterSyntax, OneTypeParameterSyntax),
 		TypeSyntax(AtomicType, AppliedType),
 		ValueExpression,
 		WrittenName,
@@ -408,7 +407,7 @@ private pure func reject_function_type_arguments(state: ParserState) -> Result[V
 			expected(
 				state,
 				"explicit function type arguments are unsupported",
-				"omit the brackets at calls; the sole argument determines the type parameter",
+				"omit the brackets at calls; argument types determine the type parameters",
 			),
 		)
 	else:
@@ -1074,8 +1073,8 @@ private pure func consume_bindings(
 			})
 
 
-private fixed record ParsedTypeParameter {
-	parameters: TypeParameterSyntax,
+private fixed record ParsedTypeParameters {
+	parameters: List[WrittenName],
 	next: ParserState
 }
 
@@ -1099,61 +1098,84 @@ private pure func valid_type_parameter_name(spelling: String) -> Bool:
 	accepted
 
 
-private pure func consume_type_parameter(
+private pure func consume_type_parameters(
 	state: ParserState,
-) -> Result[ParsedTypeParameter, Diagnostic]:
+) -> Result[ParsedTypeParameters, Diagnostic]:
 	if not at_symbol(state, LeftBracket):
 		Ok({
-			parameters = NoTypeParameterSyntax,
+			parameters = [],
 			next = state,
 		})
 	else:
-		opened: ParserState = { state | position = IntOps.add(state.position, 1) }
-		name ?= consume_name(opened, "expected a type parameter name")
+		var current: ParserState = { state | position = IntOps.add(state.position, 1) }
+		var parameters: List[WrittenName] = []
+		var failure: Option[Diagnostic] = None
 
-		valid ?= match opened.input.tokens.get(opened.position):
-			Some(token):
-				match token.kind:
-					IdentifierToken(spelling):
-						if valid_type_parameter_name(spelling):
-							Ok(void)
-						else:
-							Err({
-								span = token.span,
-								note = None,
-								message = "invalid type parameter name",
-								help = Text.concat(
-									"start with a capital ASCII letter and use only ASCII letters and digits, such ",
-									"as T or Element2",
+		while True:
+			name_result = match current.input.tokens.get(current.position):
+				Some(token):
+					match token.kind:
+						IdentifierToken(spelling):
+							if valid_type_parameter_name(spelling):
+								consume_name(current, "expected a type parameter name")
+							else:
+								Err({
+									span = token.span,
+									note = None,
+									message = "invalid type parameter name",
+									help = (
+										"start with a capital ASCII letter and use only ASCII letters and digits, such "
+										+ "as T or Element2"
+									),
+								})
+						_:
+							Err(
+								expected(
+									current,
+									"expected a type parameter name",
+									"declare type parameters separated by commas, such as [A, B]",
 								),
-							})
-					_:
-						Err(
-							expected(
-								opened,
-								"expected a type parameter name",
-								"declare one type parameter, such as [T]",
-							),
-						)
-			None:
-				Err(
+							)
+				None:
+					Err(
+						expected(
+							current,
+							"expected a type parameter name",
+							"declare type parameters separated by commas, such as [A, B]",
+						),
+					)
+
+			match name_result:
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(name):
+					parameters = parameters.append(name.name)
+					current = name.next
+
+			if at_symbol(current, RightBracket):
+				current = { current | position = IntOps.add(current.position, 1) }
+				break
+			else if at_symbol(current, Comma):
+				current = { current | position = IntOps.add(current.position, 1) }
+			else:
+				failure = Some(
 					expected(
-						opened,
-						"expected a type parameter name",
-						"declare one type parameter, such as [T]",
+						current,
+						"expected ',' or ']' after a type parameter",
+						"separate type parameters with commas and close the list with ']'",
 					),
 				)
+				break
 
-		closed ?= consume_symbol(
-			name.next,
-			RightBracket,
-			"expected ']' after the type parameter",
-			"declare exactly one type parameter in brackets, such as [T]",
-		)
-		Ok({
-			parameters = OneTypeParameterSyntax(name.name),
-			next = closed,
-		})
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok({
+					parameters = parameters,
+					next = current,
+				})
 
 
 private pure func consume_header(start: ParserState) -> Result[HeaderResult, Diagnostic]:
@@ -1184,7 +1206,7 @@ private pure func consume_header(start: ParserState) -> Result[HeaderResult, Dia
 			)
 
 	function ?= consume_name(after_func, "expected a function name")
-	type_parameters ?= consume_type_parameter(function.next)
+	type_parameters ?= consume_type_parameters(function.next)
 	after_open ?= consume_symbol(
 		type_parameters.next,
 		LeftParen,
@@ -1323,7 +1345,22 @@ private pure func consume_union(start: ParserState) -> Result[UnionResult, Diagn
 		)
 
 	name ?= consume_name(word, "expected a union type name")
-	type_parameters ?= consume_type_parameter(name.next)
+	type_parameters ?= consume_type_parameters(name.next)
+
+	arity ?= match type_parameters.parameters.get(1):
+		Some(parameter):
+			Err({
+				span = parameter.span,
+				note = None,
+				message = "fixed unions support one type parameter",
+				help = (
+					"declare one type parameter, such as [T]; multiple union parameters are not "
+					+ "supported yet"
+				),
+			})
+		None:
+			Ok(void)
+
 	colon ?= consume_symbol(
 		type_parameters.next,
 		Colon,

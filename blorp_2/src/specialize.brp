@@ -204,20 +204,16 @@ fixed record ConcreteBinding {
 }
 
 
-private fixed union ConcreteInstantiation:
-	NoConcreteArgument
-	ConcreteArgument(TypeRef)
-
-
 private fixed record InstanceKey {
 	declaration: Checked.FunctionId,
-	argument: ConcreteInstantiation
+	arguments: List[TypeRef]
 }
 
 
-private fixed union Substitution:
-	NoSubstitution
-	TypeSubstitution(Checked.TypeParameterId, TypeRef)
+private fixed record TypeSubstitution {
+	parameter: Checked.TypeParameterId,
+	value_type: TypeRef
+}
 
 
 private pure func invalid(span: Span, message: String) -> Diagnostic:
@@ -253,7 +249,7 @@ private pure func translated_list[T, U](
 
 private pure func concrete_type(
 	value_type: Checked.TypeRef,
-	substitution: Substitution,
+	substitution: List[TypeSubstitution],
 	unions: List[UnionInstance],
 	span: Span,
 ) -> Result[TypeRef, Diagnostic]:
@@ -268,7 +264,7 @@ private pure func concrete_type(
 				unions,
 				{
 					declaration = id,
-					argument = ConcreteArgument(argument)
+					arguments = [argument]
 				},
 			).to_result(invalid(span, "unprepared generic union instance"))
 			Ok(UnionType(id))
@@ -277,35 +273,43 @@ private pure func concrete_type(
 				unions,
 				{
 					declaration = id,
-					argument = NoConcreteArgument
+					arguments = []
 				},
 			).to_result(invalid(span, "unprepared ordinary union instance"))
 			Ok(UnionType(id))
 		Checked.ParameterType(id):
-			match substitution:
-				TypeSubstitution(parameter, argument):
-					if Checked.same_parameter(id, parameter):
-						Ok(argument)
-					else:
-						Err(invalid(span, "parameter belongs to a different declaration"))
-				NoSubstitution:
-					Err(invalid(span, "unresolved type parameter"))
+			var replacement: Option[TypeRef] = None
+
+			for argument in substitution:
+				if Checked.same_parameter(id, argument.parameter):
+					-- A supplied concrete replacement is terminal.
+					replacement = Some(argument.value_type)
+					break
+
+			match replacement:
+				Some(value):
+					Ok(value)
+				None:
+					Err(invalid(span, "unresolved or foreign type parameter"))
 
 
-private pure func same_argument(left: ConcreteInstantiation, right: ConcreteInstantiation) -> Bool:
-	match left:
-		NoConcreteArgument:
-			match right:
-				NoConcreteArgument:
-					True
-				_:
-					False
-		ConcreteArgument(left):
-			match right:
-				ConcreteArgument(right):
-					same_type(left, right)
-				_:
-					False
+private pure func same_arguments(left: List[TypeRef], right: List[TypeRef]) -> Bool:
+	var matches = IntOps.equals(left.length(), right.length())
+	var position: Int = 0
+
+	for value in left:
+		match right.get(position):
+			Some(other):
+				matches = matches and same_type(value, other)
+			None:
+				matches = False
+
+		if not matches:
+			break
+
+		position = IntOps.add(position, 1)
+
+	matches
 
 
 private pure func find_instance(
@@ -319,7 +323,7 @@ private pure func find_instance(
 		if IntOps.equals(
 			Checked.function_number(known.key.declaration),
 			Checked.function_number(key.declaration),
-		) and same_argument(known.key.argument, key.argument):
+		) and same_arguments(known.key.arguments, key.arguments):
 			found = Some(into_opaque FunctionInstanceId(position))
 			break
 
@@ -329,53 +333,96 @@ private pure func find_instance(
 
 
 private pure func parameter_substitution(
-	parameters: Checked.TypeParameters,
-	argument: ConcreteInstantiation,
+	parameters: List[Checked.TypeParameterId],
+	arguments: List[TypeRef],
+	owner: Checked.TypeParameterOwner,
 	span: Span,
-) -> Result[Substitution, Diagnostic]:
-	match parameters:
-		Checked.NoTypeParameter:
-			match argument:
-				NoConcreteArgument:
-					Ok(NoSubstitution)
-				_:
-					Err(invalid(span, "ordinary declaration has a type argument"))
-		Checked.OneTypeParameter(parameter):
-			match argument:
-				ConcreteArgument(value):
-					Ok(TypeSubstitution(parameter, value))
-				_:
-					Err(invalid(span, "generic declaration has no type argument"))
+) -> Result[List[TypeSubstitution], Diagnostic]:
+	var substitution: List[TypeSubstitution] = []
+	var failure: Option[Diagnostic] = None
+	var position: Int = 0
+
+	if not IntOps.equals(parameters.length(), arguments.length()):
+		Err(invalid(span, "type argument count differs from the declaration"))
+	else:
+		for parameter in parameters:
+			owner_matches = match Checked.parameter_owner(parameter):
+				Checked.FunctionDeclaration(id):
+					match owner:
+						Checked.FunctionDeclaration(expected):
+							IntOps.equals(
+								Checked.function_number(id),
+								Checked.function_number(expected),
+							)
+						_:
+							False
+				Checked.UnionDeclaration(id):
+					match owner:
+						Checked.UnionDeclaration(expected):
+							IntOps.equals(
+								Checked.union_number(id),
+								Checked.union_number(expected),
+							)
+						_:
+							False
+
+			if not owner_matches or not IntOps.equals(
+				Checked.parameter_position(parameter),
+				position,
+			):
+				failure = Some(invalid(span, "invalid declaration type parameter"))
+				break
+
+			match arguments.get(position):
+				Some(value):
+					substitution = substitution.append({
+						parameter = parameter,
+						value_type = value,
+					})
+				None:
+					failure = Some(invalid(span, "missing concrete type argument"))
+					break
+
+			position = IntOps.add(position, 1)
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok(substitution)
 
 
 private pure func instance_substitution(
 	signature: Checked.FunctionSignature,
-	argument: ConcreteInstantiation,
+	key: InstanceKey,
 	span: Span,
-) -> Result[Substitution, Diagnostic]:
-	parameter_substitution(signature.type_parameters, argument, span)
+) -> Result[List[TypeSubstitution], Diagnostic]:
+	parameter_substitution(
+		signature.type_parameters,
+		key.arguments,
+		Checked.FunctionDeclaration(key.declaration),
+		span,
+	)
 
 
 private pure func call_key(
 	call: Checked.CheckedCall,
-	substitution: Substitution,
+	substitution: List[TypeSubstitution],
 	unions: List[UnionInstance],
 ) -> Result[Option[InstanceKey], Diagnostic]:
 	match call.target:
 		Checked.RuntimeFunction(_):
 			Ok(None)
-		Checked.UserFunction(id, instantiation):
-			argument_result: Result[ConcreteInstantiation, Diagnostic] = match instantiation:
-				Checked.NoInstantiation:
-					Ok(NoConcreteArgument)
-				Checked.InstantiateWith(value):
-					concrete ?= concrete_type(value, substitution, unions, call.span)
-					Ok(ConcreteArgument(concrete))
-
-			argument ?= argument_result
+		Checked.UserFunction(declaration, arguments):
+			concrete ?= translated_list(
+				arguments,
+				pure func(
+					value: Checked.TypeRef,
+				): concrete_type(value, substitution, unions, call.span),
+			)
 			Ok(Some({
-				declaration = id,
-				argument = argument,
+				declaration = declaration,
+				arguments = concrete,
 			}))
 
 
@@ -447,7 +494,7 @@ private pure func function_calls(function: Checked.CheckedFunction) -> List[Chec
 
 private fixed record UnionKey {
 	declaration: Checked.UnionId,
-	argument: ConcreteInstantiation
+	arguments: List[TypeRef]
 }
 
 
@@ -516,7 +563,7 @@ private pure func find_union_instance(
 		if IntOps.equals(
 			Checked.union_number(known.key.declaration),
 			Checked.union_number(key.declaration),
-		) and same_argument(known.key.argument, key.argument):
+		) and same_arguments(known.key.arguments, key.arguments):
 			found = Some(into_opaque UnionInstanceId(position))
 			break
 
@@ -541,7 +588,12 @@ private pure func ensure_union(
 			declaration ?= declarations
 				.get(Checked.union_number(key.declaration))
 				.to_result(invalid(span, "unknown union declaration"))
-			substitution ?= parameter_substitution(declaration.type_parameters, key.argument, span)
+			substitution ?= parameter_substitution(
+				declaration.type_parameters,
+				key.arguments,
+				Checked.UnionDeclaration(key.declaration),
+				span,
+			)
 			variants ?= translated_list(declaration.variants, pure func(
 				payload: Option[Checked.TypeUse],
 			) -> Result[PayloadShape, Diagnostic]:
@@ -574,7 +626,7 @@ private pure func ensure_union(
 
 private pure func prepare_type(
 	value: Checked.TypeRef,
-	substitution: Substitution,
+	substitution: List[TypeSubstitution],
 	declarations: List[Checked.CheckedUnion],
 	unions: List[UnionInstance],
 	span: Span,
@@ -584,7 +636,7 @@ private pure func prepare_type(
 			ensure_union(
 				{
 					declaration = id,
-					argument = NoConcreteArgument
+					arguments = []
 				},
 				declarations,
 				unions,
@@ -595,7 +647,7 @@ private pure func prepare_type(
 			ensure_union(
 				{
 					declaration = id,
-					argument = ConcreteArgument(prepared.value_type)
+					arguments = [prepared.value_type]
 				},
 				declarations,
 				prepared.unions,
@@ -702,7 +754,7 @@ private pure func prepare_function(
 ) -> Result[PreparedInstances, Diagnostic]:
 	substitution ?= instance_substitution(
 		function.signature,
-		request.key.argument,
+		request.key,
 		function.signature.return_type.span,
 	)
 	var prepared = initial
@@ -727,45 +779,43 @@ private pure func prepare_function(
 			match call.target:
 				Checked.RuntimeFunction(_):
 					void
-				Checked.UserFunction(declaration, instantiation):
-					argument_result: Result[ConcreteInstantiation, Diagnostic] = match instantiation:
-						Checked.NoInstantiation:
-							Ok(NoConcreteArgument)
-						Checked.InstantiateWith(value):
-							match prepare_type(
-								value,
-								substitution,
-								declarations,
-								prepared.unions,
-								request_span(value, request.source, call.span),
-							):
-								Ok(value):
-									prepared = { prepared | unions = value.unions }
-									Ok(ConcreteArgument(value.value_type))
-								Err(error):
-									Err(error)
+				Checked.UserFunction(declaration, arguments):
+					var concrete: List[TypeRef] = []
 
-					match argument_result:
-						Err(error):
-							failure = Some(error)
-							break
-						Ok(argument):
-							key: InstanceKey = {
-								declaration = declaration,
-								argument = argument
-							}
+					for argument in arguments:
+						match prepare_type(
+							argument,
+							substitution,
+							declarations,
+							prepared.unions,
+							request_span(argument, request.source, call.span),
+						):
+							Ok(value):
+								prepared = { prepared | unions = value.unions }
+								concrete = concrete.append(value.value_type)
+							Err(error):
+								failure = Some(error)
+								break
 
-							if not find_instance(prepared.functions, key).is_some():
-								source = match request.source:
-									OrdinaryRoot:
-										ConcreteRequest(call.span)
-									ConcreteRequest(span):
-										ConcreteRequest(span)
+					if failure.is_some():
+						break
 
-								prepared = { prepared | functions = prepared.functions.append({
-										key = key,
-										source = source,
-									}) }
+					key: InstanceKey = {
+						declaration = declaration,
+						arguments = concrete
+					}
+
+					if not find_instance(prepared.functions, key).is_some():
+						source = match request.source:
+							OrdinaryRoot:
+								ConcreteRequest(call.span)
+							ConcreteRequest(span):
+								ConcreteRequest(span)
+
+						prepared = { prepared | functions = prepared.functions.append({
+								key = key,
+								source = source,
+							}) }
 
 	match failure:
 		Some(error):
@@ -829,7 +879,7 @@ private pure func expand_instances(
 
 private pure func translate_call(
 	call: Checked.CheckedCall,
-	substitution: Substitution,
+	substitution: List[TypeSubstitution],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 ) -> Result[ConcreteCall, Diagnostic]:
@@ -893,7 +943,7 @@ private pure func translate_variant(
 
 private pure func translate_value(
 	value: Checked.CheckedValue,
-	substitution: Substitution,
+	substitution: List[TypeSubstitution],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 ) -> Result[ConcreteValue, Diagnostic]:
@@ -966,7 +1016,7 @@ private pure func translate_value(
 
 private pure func translate_assignments(
 	assignments: List[Checked.CheckedAssignment],
-	substitution: Substitution,
+	substitution: List[TypeSubstitution],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 ) -> Result[List[ConcreteAssignment], Diagnostic]:
@@ -1015,7 +1065,7 @@ private pure func translate_function(
 	unions: List[UnionInstance],
 ) -> Result[ConcreteFunction, Diagnostic]:
 	span = function.signature.return_type.span
-	substitution ?= instance_substitution(function.signature, key.argument, span)
+	substitution ?= instance_substitution(function.signature, key, span)
 
 	parameters ?= translated_list(
 		function.signature.parameters,
@@ -1098,9 +1148,7 @@ pure func specialize(program: Checked.CheckedProgram) -> Result[SpecializedProgr
 
 	for declaration in checked.unions:
 		match declaration.type_parameters:
-			Checked.OneTypeParameter(_):
-				void
-			Checked.NoTypeParameter:
+			[]:
 				root_unions = initial.unions
 
 				match (
@@ -1118,7 +1166,7 @@ pure func specialize(program: Checked.CheckedProgram) -> Result[SpecializedProgr
 						.and_then(pure func(id): ensure_union(
 								{
 									declaration = id,
-									argument = NoConcreteArgument
+									arguments = []
 								},
 								checked.unions,
 								root_unions,
@@ -1132,6 +1180,8 @@ pure func specialize(program: Checked.CheckedProgram) -> Result[SpecializedProgr
 						initial = { initial | unions = value.unions }
 					Err(error):
 						failure = Some(error)
+			_:
+				void
 
 		position = IntOps.add(position, 1)
 
@@ -1139,15 +1189,13 @@ pure func specialize(program: Checked.CheckedProgram) -> Result[SpecializedProgr
 
 	for function in checked.functions:
 		match function.signature.type_parameters:
-			Checked.OneTypeParameter(_):
-				void
-			Checked.NoTypeParameter:
+			[]:
 				match Checked.declaration_id(program, position):
 					Some(declaration):
 						initial = { initial | functions = initial.functions.append({
 								key = {
 									declaration = declaration,
-									argument = NoConcreteArgument
+									arguments = []
 								},
 								source = OrdinaryRoot,
 							}) }
@@ -1158,6 +1206,8 @@ pure func specialize(program: Checked.CheckedProgram) -> Result[SpecializedProgr
 								"unknown root declaration",
 							),
 						)
+			_:
+				void
 
 		position = IntOps.add(position, 1)
 
@@ -1188,7 +1238,7 @@ pure func specialize(program: Checked.CheckedProgram) -> Result[SpecializedProgr
 		prepared.functions,
 		{
 			declaration = checked.entrypoint,
-			argument = NoConcreteArgument
+			arguments = []
 		},
 	).to_result(
 		invalid(
