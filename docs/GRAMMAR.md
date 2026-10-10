@@ -4,7 +4,9 @@ The separate [Blorp 2 pilot grammar](../blorp_2/grammar.ebnf) defines that
 compiler's restricted subset, including binding prefixes before a final
 expression or tail match, depth-three binding blocks inside match arms, and a
 separate explicit input-prelude grammar for builtin types and concrete runtime
-function declarations. Ordinary program String literals remain unsupported.
+function declarations. Its ordinary call syntax also accepts self and mutual
+recursion; checking separately rejects unbounded recursive type substitutions.
+Ordinary program String literals and recursive data declarations remain unsupported.
 The grammar below describes the full language.
 
 This document is the authoritative specification of Blorp's syntax. A parser

@@ -432,6 +432,33 @@ A phantom `Marker[String]` with no parameter payload remains valid, as does
 nominal instance identities.
 
 
+The [function-recursion example](test/e2e/fixtures/recursion/self.brp) uses an
+existing union to terminate without adding arithmetic or conditional syntax:
+
+```blorp
+fixed union Step:
+    Stop
+    Once
+pure func walk(step: Step) -> Int:
+    match step:
+        Stop: 7
+        Once: walk(Stop)
+func main() -> Int:
+    walk(Once)
+```
+
+It exits 7. Companion fixtures exercise mutual calls, UFCS, nested arguments,
+bindings, record-literal children, generic calls and managed String results.
+The String fixtures return an owned result through recursive calls and preserve
+an arm-local owner across a recursive call. Each fixture runs through its real
+`main`, with unchanged generated C compiled at `-O0` under ASan/UBSan. Every
+fixture has limits of 10,000 allocations and 100,000,000 instructions. Calls
+use the C stack; tail-call optimization and constant-stack recursion are not
+part of this increment. Recursive data remains a separate ownership increment;
+cyclic runtime data is forbidden.
+The [recursion plan](RECURSION_PLAN.md) defines the independently validated
+increments and the ownership requirements for later recursive data.
+
 The [multiple-type-parameter example](test/e2e/fixtures/generic/function_parameters/second.brp)
 adds independent declaration parameters:
 
@@ -686,10 +713,20 @@ Semantic rules:
   impure edge. Calls inside arguments obey the containing function's purity.
   A violation highlights the callee name and suggests marking the callee pure
   or removing pure from the caller.
-- Every call edge must be acyclic, including nested argument calls. Self and mutual
-  recursion produce a semantic diagnostic. Repeating an acyclic call, such as
-  `identity(identity(1))`, is valid. General recursion and its resource rules are
-  future work.
+- Self and mutual function recursion are supported, including calls in arguments,
+  UFCS chains, binding initializers, record fields and match arms. Signatures are
+  established before any body is checked. Calls use the ordinary C stack; this
+  increment makes no constant-stack or tail-call optimization guarantee.
+- Generic recursion reuses a concrete instance identified by its declaration and
+  ordered type arguments. Bare-parameter forwarding, permutations and concrete
+  resets are supported. Checking rejects a parameter-dependency cycle that nests
+  a parameter inside a union application, since it could generate unbounded
+  concrete instances. This applies to unused declarations as well as called ones.
+- Recursive calls do not permit cyclic runtime data. Values remain immutable
+  graphs of already constructed values; whole-binding reassignment cannot make
+  an existing value refer back to its replacement. Recursive data declarations
+  remain deferred until their managed layouts and bounded-stack destruction are
+  supported and independently verified.
 - Generic declarations are checked once with distinct rigid type parameters, including
   unused bodies. An arbitrary `T` cannot return an Int literal or call a
   concrete Int/String runtime operation. Parameters cannot share a name with

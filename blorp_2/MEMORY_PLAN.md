@@ -70,6 +70,19 @@ rejected with application/request and payload-declaration provenance. Phantom
 String arguments do not introduce managed children. An unsolved semantic type is
 not a layout decision.
 
+Self and mutual function recursion use declared call contracts, independently of
+body order or call-graph cycles. Concrete instance keys are requested once;
+checking rejects growing recursive type substitutions before specialization.
+IR identities remain function-local; each invocation has its own runtime values
+and ownership obligations. Managed
+results transfer normally, and arm-local owners remain live across a call until
+their final use. The current C implementation uses its ordinary call stack and
+does not guarantee constant-stack tail calls. Managed arguments to a recursive
+tail match remain subject to the existing managed-outer-dependency restriction.
+Function recursion does not admit recursive heap layouts or cyclic values.
+Future recursive types must still produce acyclic value graphs, with bounded-stack
+destruction established before they enter the supported subset.
+
 The emitter must not invent managed owners or cleanup. Materialize ordered
 arguments, projections and managed temporaries before ownership insertion.
 A scalar C temporary is harmless only when its representation really has no

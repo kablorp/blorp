@@ -6,7 +6,10 @@ The separate [Blorp 2 pilot](../blorp_2/README.md) implements a restricted
 subset. Its current examples include immutable bindings and local `var`
 reassignment in function bodies and match-arm blocks, plus straight-line
 managed Strings through an explicit temporary prelude's concrete `to_string`
-and `length` functions. The pilot reference states its scope and restrictions.
+and `length` functions. Self and mutual function recursion are supported with
+ordinary C stack usage; generic recursion must have finite concrete instances,
+and cyclic runtime data remains forbidden. The pilot reference states its scope
+and restrictions.
 
 ---
 
