@@ -1,0 +1,361 @@
+import:
+	../../src/emit: emit
+	../../src/lex: lex
+	../../src/lower as Lower
+	../../src/own as Own
+	../../src/specialize as Concrete
+	../../src/syntax: Diagnostic, DiagnosticNote(NoDiagnosticNote)
+	../../src/verify: verify
+	input: check, parse
+	test: TestSuite
+
+
+private SOURCE: String = "pure func identity[T](value: T) -> T:\n\tvalue\nfunc main() -> Int:\n\tinteger = identity(7)\n\ttext = identity(integer.to_string())\n\ttext.length()\n"
+
+
+private pure func lowered(source: String) -> Result[Lower.LoweredProgram, Diagnostic]:
+	tokens ?= lex(source)
+	parsed ?= parse(tokens)
+	checked ?= check(parsed)
+	concrete ?= Concrete.specialize(checked)
+	Lower.lower(concrete)
+
+
+private pure func owned(source: String) -> Result[Own.OwnershipProgram, Diagnostic]:
+	program ?= lowered(source)
+	Own.own(program)
+
+
+private pure func parameter_return(
+	function: Lower.LoweredFunction,
+	expected: Concrete.TypeRef,
+) -> Bool:
+	match function.definitions:
+		[parameter]:
+			match parameter.operation:
+				Lower.ParameterValue:
+					match function.tail:
+						Lower.ReturnValue(result):
+							(
+								Lower.value_number(parameter.id) == 0
+								and Lower.value_number(result) == 0
+								and Concrete.same_type(parameter.value_type, expected)
+								and Concrete.same_type(function.signature.return_type, expected)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_int_and_string_instances_lower_with_independent_values() -> Bool:
+	match lowered(SOURCE):
+		Ok(program):
+			match Lower.lowered_functions(program).functions:
+				[_, integer, string]:
+					(
+						parameter_return(integer, Concrete.IntType)
+						and parameter_return(string, Concrete.StringType)
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_int_instance_returns_without_ownership() -> Bool:
+	match owned(SOURCE):
+		Ok(program):
+			match program.functions:
+				[_, integer, _]:
+					match integer.operations:
+						[Own.DefineValue(parameter)]:
+							match parameter.result:
+								Own.UnmanagedResult:
+									match integer.tail:
+										Own.ReturnTail(Own.UnmanagedReturn(value)):
+											Lower.value_number(value) == 0
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private pure func parameter_borrow(borrow: Own.BorrowedValue) -> Bool:
+	match borrow.source:
+		Own.ParameterBorrow:
+			Lower.value_number(borrow.value) == 0
+		_:
+			False
+
+
+private pure func borrowed_result(result: Own.ResultOwnership) -> Bool:
+	match result:
+		Own.BorrowedResult:
+			True
+		_:
+			False
+
+
+private pure func owns_result(result: Own.ResultOwnership) -> Bool:
+	match result:
+		Own.OwnedResult(owner):
+			Own.owner_number(owner) == 0
+		_:
+			False
+
+
+private pure func transfers(tail: Own.OwnedTail, expected_value: Int) -> Bool:
+	match tail:
+		Own.ReturnTail(Own.OwnedReturn(value, owner)):
+			Lower.value_number(value) == expected_value and Own.owner_number(owner) == 0
+		_:
+			False
+
+
+pure func test_string_instance_acquires_exact_borrowed_parameter_return() -> Bool:
+	match owned(SOURCE):
+		Ok(program):
+			match program.functions:
+				[_, _, string]:
+					match string.operations:
+						[Own.DefineValue(parameter), Own.AcquireOwner(owner, borrow, _)]:
+							(
+								borrowed_result(parameter.result)
+								and parameter_borrow(borrow)
+								and Lower.value_number(parameter.id) == 0
+								and Own.owner_number(owner) == 0
+								and transfers(string.tail, 0)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_string_forwarding_borrows_call_argument_and_transfers_call_owner() -> Bool:
+	match owned(
+		"pure func identity[T](value: T) -> T:\n\tvalue\npure func forward[T](value: T) -> T:\n\tidentity(value)\nfunc main() -> Int:\n\tforward(7.to_string()).length()\n",
+	):
+		Ok(program):
+			match program.functions:
+				[_, forward, _]:
+					match forward.operations:
+						[Own.DefineValue(_), Own.DefineValue(call)]:
+							match call.operation:
+								Own.CallDefinition(target, Own.BorrowedArgument(borrow)):
+									match target.target:
+										Concrete.UserFunction(callee):
+											(
+												Concrete.function_number(callee) == 2
+												and parameter_borrow(borrow)
+												and Lower.value_number(call.id) == 1
+												and owns_result(call.result)
+												and transfers(forward.tail, 1)
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private fixed union RawReturn:
+	AcquiredReturn
+	BorrowedReturn
+	MissingAcquisition
+
+
+-- Lowering supplies instance-local IDs and concrete signatures, never the
+-- ownership operations used to test the independent verifier.
+private pure func raw_return(kind: RawReturn) -> Result[Own.OwnershipProgram, Diagnostic]:
+	program ?= lowered(
+		"pure func identity[T](value: T) -> T:\n\tvalue\nfunc main() -> Int:\n\tidentity(7.to_string()).length()\n",
+	)
+	contents = Lower.lowered_functions(program)
+
+	match contents.functions:
+		[main, string]:
+			match main.definitions.get(0):
+				Some(integer):
+					match string.definitions:
+						[parameter]:
+							definition: Own.OwnershipOperation = Own.DefineValue({
+								id = parameter.id,
+								value_type = Concrete.StringType,
+								operation = Own.ParameterDefinition,
+								result = Own.BorrowedResult,
+								span = parameter.span,
+							})
+
+							operations = match kind:
+								AcquiredReturn:
+									[
+										definition,
+										Own.AcquireOwner(
+											Own.owner_id(0),
+											{
+												value = parameter.id,
+												source = Own.ParameterBorrow
+											},
+											parameter.span,
+										),
+									]
+								BorrowedReturn | MissingAcquisition:
+									[definition]
+
+							tail = match kind:
+								BorrowedReturn:
+									Own.UnmanagedReturn(parameter.id)
+								AcquiredReturn | MissingAcquisition:
+									Own.OwnedReturn(
+										parameter.id,
+										Own.owner_id(0),
+									)
+
+							Ok({
+								unions = contents.unions,
+								entrypoint = contents.entrypoint,
+								functions = [
+									{
+										signature = main.signature,
+										operations = [Own.DefineValue({
+												id = integer.id,
+												value_type = Concrete.IntType,
+												operation = Own.IntegerDefinition(0),
+												result = Own.UnmanagedResult,
+												span = integer.span,
+											})],
+										tail = Own.ReturnTail(Own.UnmanagedReturn(integer.id))
+									},
+									{
+										signature = string.signature,
+										operations = operations,
+										tail = Own.ReturnTail(tail)
+									},
+								],
+							})
+						_:
+							Err({
+								span = {
+									start = 0,
+									end = 0
+								},
+								note = NoDiagnosticNote,
+								message = "invalid generic parameter seed",
+								help = "fix the test seed",
+							})
+				_:
+					Err({
+						span = {
+							start = 0,
+							end = 0
+						},
+						note = NoDiagnosticNote,
+						message = "invalid generic ownership seed",
+						help = "fix the test seed",
+					})
+		_:
+			Err({
+				span = {
+					start = 0,
+					end = 0
+				},
+				note = NoDiagnosticNote,
+				message = "invalid generic function seed",
+				help = "fix the test seed",
+			})
+
+
+pure func test_independent_verifier_accepts_concrete_acquired_return() -> Bool:
+	raw_return(AcquiredReturn)
+		.and_then(pure func(program): verify(program))
+		.is_ok()
+
+
+private pure func verifier_rejects(kind: RawReturn, message: String) -> Bool:
+	match raw_return(kind).and_then(pure func(program): verify(program)):
+		Err(error):
+			(
+				error.span.start == 22
+				and error.span.end == 27
+				and error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+			)
+		Ok(_):
+			False
+
+
+pure func test_independent_verifier_rejects_unowned_specialized_string_return() -> Bool:
+	verifier_rejects(BorrowedReturn, "managed return requires an owner transfer")
+
+
+pure func test_independent_verifier_rejects_missing_specialized_acquisition() -> Bool:
+	verifier_rejects(MissingAcquisition, "owner 0 is not defined")
+
+
+pure func test_emitter_projects_distinct_int_and_string_instance_signatures() -> Bool:
+	match (
+		owned(SOURCE)
+			.and_then(pure func(program): verify(program))
+			.and_then(pure func(program): emit(program))
+	):
+		Ok(c):
+			(
+				c.contains("int64_t blorp_f_1(int64_t blorp_p_0)")
+				and c.contains("struct blorp_string* blorp_f_2(struct blorp_string* blorp_p_0)")
+				and c.contains("blorp_string_retain(blorp_vl_0);")
+			)
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 generic concrete ownership boundaries",
+	tests = [
+		(
+			"Int and String lower with independent values",
+			test_int_and_string_instances_lower_with_independent_values,
+		),
+		("Int instance returns without ownership", test_int_instance_returns_without_ownership),
+		(
+			"String instance acquires exact borrowed parameter return",
+			test_string_instance_acquires_exact_borrowed_parameter_return,
+		),
+		(
+			"String forwarding borrows argument and transfers call owner",
+			test_string_forwarding_borrows_call_argument_and_transfers_call_owner,
+		),
+		(
+			"independent verifier accepts concrete acquired return",
+			test_independent_verifier_accepts_concrete_acquired_return,
+		),
+		(
+			"independent verifier rejects unowned specialized String return",
+			test_independent_verifier_rejects_unowned_specialized_string_return,
+		),
+		(
+			"independent verifier rejects missing specialized acquisition",
+			test_independent_verifier_rejects_missing_specialized_acquisition,
+		),
+		(
+			"emitter projects distinct Int and String instance signatures",
+			test_emitter_projects_distinct_int_and_string_instance_signatures,
+		),
+	]
+}

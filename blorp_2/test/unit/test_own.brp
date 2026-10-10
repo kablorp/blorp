@@ -1,27 +1,30 @@
 import:
-	../../src/check:
-		CallTarget(UserFunction),
-		ParameterShape(NoParameter, OneParameter),
-		TypeRef(IntType, StringType, UnionType),
 	../../src/lower:
 		CallArguments(NoArguments, OneArgument),
 		LoweredTail(MatchValue),
-		MatchLabel(DefaultLabel),
+		MatchLabel(DefaultLabel, VariantLabel),
 		ValueOperation(CallValue),
 		value_number,
 	../../src/own:
 		BorrowSource(ParameterBorrow, OwnerBorrow),
 		OwnedArguments(BorrowedArgument),
-		OwnedTail(UnmanagedReturn, OwnedReturn),
+		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(CallDefinition),
 		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
 		ResultOwnership(BorrowedResult, OwnedResult),
+		ReturnTransfer(UnmanagedReturn, OwnedReturn),
 		ValueOwnership(NoOwnership, ManagedStringLeaf),
+		block_last_uses,
 		insert_function,
 		last_uses,
 		owner_number,
 		value_ownership,
 	../../src/prelude: RuntimeOperation(IntToString, StringLength)
+	../../src/specialize:
+		CallTarget(UserFunction),
+		ParameterShape(NoParameter, OneParameter),
+		TypeRef(IntType, StringType, UnionType),
+		specialize,
 	ownership_inputs: function, input_ids, integer, parameter, runtime, span
 	test: TestSuite
 
@@ -35,7 +38,10 @@ private pure func borrows_owner(
 		CallDefinition(_, BorrowedArgument(borrow)):
 			match borrow.source:
 				OwnerBorrow(owner):
-					value_number(borrow.value) == expected_value and owner_number(owner) == expected_owner
+					(
+						value_number(borrow.value) == expected_value
+						and owner_number(owner) == expected_owner
+					)
 				_:
 					False
 		_:
@@ -109,7 +115,12 @@ pure func test_last_use_leaves_an_unused_definition_unmarked() -> Bool:
 		Err(_):
 			False
 		Ok(ids):
-			match last_uses([integer(ids.first, 7, 10), integer(ids.second, 0, 20)], ids.second):
+			match (
+				last_uses(
+					[integer(ids.first, 7, 10), integer(ids.second, 0, 20)],
+					ids.second,
+				)
+			):
 				Ok(uses):
 					uses == [None, Some(2)]
 				_:
@@ -121,12 +132,14 @@ pure func test_last_use_marks_a_returned_string_at_the_tail() -> Bool:
 		Err(_):
 			False
 		Ok(ids):
-			match last_uses(
-				[
-					integer(ids.first, 7, 10),
-					runtime(ids.second, IntToString, OneArgument(ids.first), StringType, 20),
-				],
-				ids.second,
+			match (
+				last_uses(
+					[
+						integer(ids.first, 7, 10),
+						runtime(ids.second, IntToString, OneArgument(ids.first), StringType, 20),
+					],
+					ids.second,
+				)
 			):
 				Ok(uses):
 					uses == [Some(1), Some(2)]
@@ -143,13 +156,21 @@ pure func test_last_use_does_not_invent_a_zero_argument_operand() -> Bool:
 				id = ids.second,
 				value_type = IntType,
 				operation = CallValue(
-					{ target = UserFunction(ids.second_function), span = span(20) },
+					{
+						target = UserFunction(ids.second_function),
+						span = span(20)
+					},
 					NoArguments,
 				),
 				span = span(20)
 			}
 
-			match last_uses([integer(ids.first, 7, 10), call], ids.second):
+			match (
+				last_uses(
+					[integer(ids.first, 7, 10), call],
+					ids.second,
+				)
+			):
 				Ok(uses):
 					uses == [None, Some(2)]
 				_:
@@ -161,7 +182,12 @@ pure func test_last_use_rejects_nonconsecutive_definition_ids() -> Bool:
 		Err(_):
 			False
 		Ok(ids):
-			match last_uses([integer(ids.first, 7, 10), integer(ids.third, 0, 20)], ids.first):
+			match (
+				last_uses(
+					[integer(ids.first, 7, 10), integer(ids.third, 0, 20)],
+					ids.first,
+				)
+			):
 				Err(error):
 					(
 						error.message == "internal compiler error: nonconsecutive value identity in ownership use analysis"
@@ -177,12 +203,14 @@ pure func test_last_use_rejects_an_unknown_argument_id() -> Bool:
 		Err(_):
 			False
 		Ok(ids):
-			match last_uses(
-				[
-					integer(ids.first, 7, 10),
-					runtime(ids.second, StringLength, OneArgument(ids.third), IntType, 20),
-				],
-				ids.second,
+			match (
+				last_uses(
+					[
+						integer(ids.first, 7, 10),
+						runtime(ids.second, StringLength, OneArgument(ids.third), IntType, 20),
+					],
+					ids.second,
+				)
 			):
 				Err(error):
 					(
@@ -204,7 +232,10 @@ pure func test_last_use_rejects_an_unknown_return_id() -> Bool:
 					(
 						error.message == "internal compiler error: invalid return value in ownership use analysis"
 						and error.help == "report this compiler error with the input program"
-						and error.span == { start = 0, end = 0 }
+						and error.span == {
+							start = 0,
+							end = 0
+						}
 					)
 				_:
 					False
@@ -215,26 +246,34 @@ pure func test_distinct_owners_drop_at_their_separate_final_uses() -> Bool:
 		Err(_):
 			False
 		Ok(ids):
-			match insert_function(
-				function(
-					[
-						parameter(ids.first, IntType),
-						runtime(ids.second, IntToString, OneArgument(ids.first), StringType, 20),
-						runtime(ids.third, IntToString, OneArgument(ids.first), StringType, 30),
-						runtime(ids.fourth, StringLength, OneArgument(ids.second), IntType, 40),
-						runtime(ids.fifth, StringLength, OneArgument(ids.third), IntType, 50),
-					],
-					ids.fifth,
-					OneParameter(IntType),
-					IntType,
-				),
-				[],
+			match (
+				insert_function(
+					function(
+						[
+							parameter(ids.first, IntType),
+							runtime(
+								ids.second,
+								IntToString,
+								OneArgument(ids.first),
+								StringType,
+								20,
+							),
+							runtime(ids.third, IntToString, OneArgument(ids.first), StringType, 30),
+							runtime(ids.fourth, StringLength, OneArgument(ids.second), IntType, 40),
+							runtime(ids.fifth, StringLength, OneArgument(ids.third), IntType, 50),
+						],
+						ids.fifth,
+						OneParameter(IntType),
+						IntType,
+					),
+					[],
+				)
 			):
 				Ok(output):
 					match output.operations:
 						[DefineValue(_), DefineValue(first), DefineValue(second), DefineValue(first_length), DropOwner(first_drop, first_at), DefineValue(second_length), DropOwner(second_drop, second_at)]:
 							match output.tail:
-								UnmanagedReturn(result):
+								ReturnTail(UnmanagedReturn(result)):
 									(
 										owns_result(first.result, 0)
 										and owns_result(second.result, 1)
@@ -259,24 +298,38 @@ pure func test_owned_return_drops_a_different_unused_owner() -> Bool:
 		Err(_):
 			False
 		Ok(ids):
-			match insert_function(
-				function(
-					[
-						integer(ids.first, 7, 10),
-						runtime(ids.second, IntToString, OneArgument(ids.first), StringType, 20),
-						runtime(ids.third, IntToString, OneArgument(ids.first), StringType, 30),
-					],
-					ids.third,
-					NoParameter,
-					StringType,
-				),
-				[],
+			match (
+				insert_function(
+					function(
+						[
+							integer(ids.first, 7, 10),
+							runtime(
+								ids.second,
+								IntToString,
+								OneArgument(ids.first),
+								StringType,
+								20,
+							),
+							runtime(
+								ids.third,
+								IntToString,
+								OneArgument(ids.first),
+								StringType,
+								30,
+							),
+						],
+						ids.third,
+						NoParameter,
+						StringType,
+					),
+					[],
+				)
 			):
 				Ok(output):
 					match output.operations:
 						[DefineValue(_), DefineValue(unused), DropOwner(dropped, at), DefineValue(returned)]:
 							match output.tail:
-								OwnedReturn(value, transferred):
+								ReturnTail(OwnedReturn(value, transferred)):
 									(
 										owns_result(unused.result, 0)
 										and owner_number(dropped) == 0
@@ -298,25 +351,39 @@ pure func test_repeated_borrows_reuse_one_owner_without_acquisition() -> Bool:
 		Err(_):
 			False
 		Ok(ids):
-			match insert_function(
-				function(
-					[
-						integer(ids.first, 7, 10),
-						runtime(ids.second, IntToString, OneArgument(ids.first), StringType, 20),
-						runtime(ids.third, StringLength, OneArgument(ids.second), IntType, 30),
-						runtime(ids.fourth, StringLength, OneArgument(ids.second), IntType, 40),
-					],
-					ids.fourth,
-					NoParameter,
-					IntType,
-				),
-				[],
+			match (
+				insert_function(
+					function(
+						[
+							integer(ids.first, 7, 10),
+							runtime(
+								ids.second,
+								IntToString,
+								OneArgument(ids.first),
+								StringType,
+								20,
+							),
+							runtime(ids.third, StringLength, OneArgument(ids.second), IntType, 30),
+							runtime(
+								ids.fourth,
+								StringLength,
+								OneArgument(ids.second),
+								IntType,
+								40,
+							),
+						],
+						ids.fourth,
+						NoParameter,
+						IntType,
+					),
+					[],
+				)
 			):
 				Ok(output):
 					match output.operations:
 						[DefineValue(_), DefineValue(string), DefineValue(first), DefineValue(last), DropOwner(dropped, at)]:
 							match output.tail:
-								UnmanagedReturn(result):
+								ReturnTail(UnmanagedReturn(result)):
 									(
 										owns_result(string.result, 0)
 										and borrows_owner(first.operation, 1, 0)
@@ -479,7 +546,7 @@ pure func test_returning_a_borrowed_parameter_acquires_an_owner() -> Bool:
 					match output.operations:
 						[DefineValue(_), AcquireOwner(owner, borrow, _)]:
 							match output.tail:
-								OwnedReturn(value, returned):
+								ReturnTail(OwnedReturn(value, returned)):
 									match borrow.source:
 										ParameterBorrow:
 											(
@@ -527,7 +594,7 @@ pure func test_owned_return_transfers_without_dropping() -> Bool:
 					match output.operations:
 						[DefineValue(_), DefineValue(_)]:
 							match output.tail:
-								OwnedReturn(value, owner):
+								ReturnTail(OwnedReturn(value, owner)):
 									value_number(value) == 1 and owner_number(owner) == 0
 								_:
 									False
@@ -637,15 +704,18 @@ pure func test_managed_match_prefix_is_explicitly_rejected() -> Bool:
 			):
 				Err(error):
 					(
-						error.message == "managed values in match functions are not supported yet"
-						and error.help == "move String work into a separate straight-line function"
+						error.message == "managed values before a tail match are not supported yet"
+						and error.help == (
+							"create Strings inside the selected match arm or a separate straight-line "
+							+ "function"
+						)
 						and error.span.start == 20
 					)
 				_:
 					False
 
 
-pure func test_unused_managed_match_arm_value_is_rejected() -> Bool:
+pure func test_unused_managed_match_arm_value_is_dropped() -> Bool:
 	match input_ids():
 		Err(_):
 			False
@@ -684,12 +754,190 @@ pure func test_unused_managed_match_arm_value_is_rejected() -> Bool:
 					ids.unions,
 				)
 			):
+				Ok(output):
+					match output.tail:
+						MatchTail(matched):
+							match matched.arms:
+								[arm]:
+									match arm.operations:
+										[DefineValue(_), DropOwner(owner, at), DefineValue(_)]:
+											owner_number(owner) == 0 and at == span(30)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_arm_last_use_handles_offset_and_unmanaged_prefix() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match (
+				block_last_uses(
+					[
+						runtime(ids.third, IntToString, OneArgument(ids.second), StringType, 30),
+						runtime(ids.fourth, StringLength, OneArgument(ids.third), IntType, 40),
+					],
+					ids.fourth,
+					2,
+					2,
+				)
+			):
+				Ok(uses):
+					uses == [Some(1), Some(2)]
+				_:
+					False
+
+
+pure func test_arm_last_use_accepts_returning_an_unmanaged_prefix_value() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match block_last_uses([integer(ids.fourth, 7, 40)], ids.second, 2, 3):
+				Ok(uses):
+					uses == [None]
+				_:
+					False
+
+
+pure func test_arm_last_use_rejects_sibling_value_identity() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match block_last_uses(
+				[runtime(ids.fourth, IntToString, OneArgument(ids.third), StringType, 40)],
+				ids.fourth,
+				2,
+				3,
+			):
 				Err(error):
 					(
-						error.message == "managed values in match functions are not supported yet"
-						and error.help == "move String work into a separate straight-line function"
-						and error.span.start == 30
+						error.message == "internal compiler error: invalid value identity in ownership use analysis"
+						and error.help == "report this compiler error with the input program"
+						and error.span == span(40)
 					)
+				_:
+					False
+
+
+pure func test_match_arms_drop_unused_owners_and_transfer_distinct_owners() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			input = function(
+				[ids.union_value, integer(ids.second, 7, 20)],
+				ids.second,
+				NoParameter,
+				StringType,
+			)
+
+			match (
+				insert_function(
+					{ input | tail = MatchValue({
+							scrutinee = ids.first,
+							owner = ids.union_id,
+							arms = [
+								{
+									label = VariantLabel(ids.second_variant),
+									body = {
+										definitions = [
+											runtime(
+												ids.third,
+												IntToString,
+												OneArgument(ids.second),
+												StringType,
+												30,
+											),
+											runtime(
+												ids.fourth,
+												IntToString,
+												OneArgument(ids.second),
+												StringType,
+												40,
+											),
+										],
+										result = ids.fourth
+									}
+								},
+								{
+									label = DefaultLabel,
+									body = {
+										definitions = [
+											runtime(
+												ids.fifth,
+												IntToString,
+												OneArgument(ids.second),
+												StringType,
+												50,
+											),
+										],
+										result = ids.fifth
+									}
+								},
+							],
+						}) },
+					ids.unions,
+				)
+			):
+				Ok(output):
+					match output.tail:
+						MatchTail(matched):
+							match matched.arms:
+								[first, second]:
+									match first.operations:
+										[DefineValue(unused), DropOwner(dropped, at), DefineValue(returned)]:
+											match second.operations:
+												[DefineValue(other)]:
+													match first.result:
+														OwnedReturn(value, owner):
+															match second.result:
+																OwnedReturn(other_value, other_owner):
+																	(
+																		owns_result(
+																			unused.result,
+																			0,
+																		)
+																		and owner_number(
+																			dropped,
+																		) == 0
+																		and at == span(30)
+																		and owns_result(
+																			returned.result,
+																			1,
+																		)
+																		and value_number(value) == 3
+																		and owner_number(owner) == 1
+																		and owns_result(
+																			other.result,
+																			2,
+																		)
+																		and value_number(
+																			other_value,
+																		) == 4
+																		and owner_number(
+																			other_owner,
+																		) == 2
+																	)
+																_:
+																	False
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
 				_:
 					False
 
@@ -697,15 +945,49 @@ pure func test_unused_managed_match_arm_value_is_rejected() -> Bool:
 tests: TestSuite = {
 	description = "Blorp 2 ownership insertion",
 	tests = [
-		("last use leaves unused value unmarked", test_last_use_leaves_an_unused_definition_unmarked),
-		("last use extends String through return", test_last_use_marks_a_returned_string_at_the_tail),
-		("last use skips absent call operand", test_last_use_does_not_invent_a_zero_argument_operand),
-		("last use rejects nonconsecutive IDs", test_last_use_rejects_nonconsecutive_definition_ids),
+		(
+			"arm uses retain offsets and unmanaged prefix",
+			test_arm_last_use_handles_offset_and_unmanaged_prefix,
+		),
+		(
+			"arm may return an unmanaged prefix value",
+			test_arm_last_use_accepts_returning_an_unmanaged_prefix_value,
+		),
+		(
+			"arm use analysis rejects sibling values",
+			test_arm_last_use_rejects_sibling_value_identity,
+		),
+		(
+			"arm ownership drops unused and transfers distinct owners",
+			test_match_arms_drop_unused_owners_and_transfer_distinct_owners,
+		),
+		(
+			"last use leaves unused value unmarked",
+			test_last_use_leaves_an_unused_definition_unmarked,
+		),
+		(
+			"last use extends String through return",
+			test_last_use_marks_a_returned_string_at_the_tail,
+		),
+		(
+			"last use skips absent call operand",
+			test_last_use_does_not_invent_a_zero_argument_operand,
+		),
+		(
+			"last use rejects nonconsecutive IDs",
+			test_last_use_rejects_nonconsecutive_definition_ids,
+		),
 		("last use rejects unknown argument ID", test_last_use_rejects_an_unknown_argument_id),
 		("last use rejects unknown return ID", test_last_use_rejects_an_unknown_return_id),
-		("distinct owners drop at separate final uses", test_distinct_owners_drop_at_their_separate_final_uses),
+		(
+			"distinct owners drop at separate final uses",
+			test_distinct_owners_drop_at_their_separate_final_uses,
+		),
 		("owned return drops other unused owner", test_owned_return_drops_a_different_unused_owner),
-		("repeated borrows never acquire owner", test_repeated_borrows_reuse_one_owner_without_acquisition),
+		(
+			"repeated borrows never acquire owner",
+			test_repeated_borrows_reuse_one_owner_without_acquisition,
+		),
 		("String has explicit managed leaf plan", test_string_has_an_explicit_managed_leaf_plan),
 		("scalar has no ownership", test_scalar_has_no_ownership),
 		("union plan requires declaration", test_union_plan_requires_its_declaration),
@@ -729,6 +1011,6 @@ tests: TestSuite = {
 			"managed match prefix rejected explicitly",
 			test_managed_match_prefix_is_explicitly_rejected,
 		),
-		("unused managed arm value rejected", test_unused_managed_match_arm_value_is_rejected),
+		("unused managed arm value drops", test_unused_managed_match_arm_value_is_dropped),
 	]
 }

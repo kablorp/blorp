@@ -1,0 +1,1154 @@
+import:
+	./prelude: PrimitiveType(BuiltinInt, BuiltinString), RuntimeOperation, runtime_contract
+	check as Checked
+	int as IntOps
+	option: to_result
+	syntax: Diagnostic, DiagnosticNote(NoDiagnosticNote, UnionPayloadDeclaration), Purity, Span
+	text: concat
+
+
+-- Instance identities are issued only by this compilation's specialization builder.
+opaque type FunctionInstanceId = Int
+
+opaque type UnionInstanceId = Int
+
+
+private fixed record VariantIdentity {
+	owner: UnionInstanceId,
+	position: Int
+}
+
+
+opaque type VariantInstanceId = VariantIdentity
+
+
+fixed union TypeRef:
+	IntType
+	StringType
+	UnionType(UnionInstanceId)
+
+
+fixed union PayloadShape:
+	NoPayload
+	IntPayload
+
+
+fixed record ConcreteUnion {
+	variants: List[PayloadShape]
+}
+
+
+fixed union ParameterShape:
+	NoParameter
+	OneParameter(TypeRef)
+
+
+fixed record FunctionSignature {
+	purity: Purity,
+	parameters: ParameterShape,
+	return_type: TypeRef
+}
+
+
+fixed union CallTarget:
+	UserFunction(FunctionInstanceId)
+	RuntimeFunction(RuntimeOperation)
+
+
+fixed record ConcreteCall {
+	target: CallTarget,
+	span: Span
+}
+
+
+private pure func primitive_ref(value_type: PrimitiveType) -> TypeRef:
+	match value_type:
+		BuiltinInt:
+			IntType
+		BuiltinString:
+			StringType
+
+
+pure func runtime_signature(operation: RuntimeOperation) -> FunctionSignature:
+	contract = runtime_contract(operation)
+	{
+		purity = contract.purity,
+		parameters = OneParameter(primitive_ref(contract.parameter)),
+		return_type = primitive_ref(contract.return_type)
+	}
+
+
+fixed union ConcreteBase:
+	ReturnInteger(Int)
+	ReturnVariant(VariantInstanceId)
+	ReturnBinding(Checked.BindingId)
+	ReturnCall(ConcreteCall)
+
+
+fixed union ConcreteOperation:
+	InvokeFunction(ConcreteCall)
+	ConstructVariant(VariantInstanceId)
+
+
+fixed record ConcreteStep {
+	operation: ConcreteOperation,
+	value_type: TypeRef,
+	span: Span
+}
+
+
+fixed record ConcreteValue {
+	base: ConcreteBase,
+	base_type: TypeRef,
+	base_span: Span,
+	operations: List[ConcreteStep]
+}
+
+
+fixed union ConcreteAssignment:
+	InitializeBinding(Checked.BindingId, ConcreteValue)
+	ReassignBinding(Checked.BindingId, ConcreteValue)
+
+
+fixed union PayloadBinding:
+	NoPayloadBinding
+	DiscardIntPayload
+	BindIntPayload(Checked.BindingId)
+
+
+fixed union ConcretePattern:
+	VariantCase(VariantInstanceId, PayloadBinding)
+	WildcardCase
+	BindingCase(Checked.BindingId)
+
+
+fixed record ConcreteArm {
+	pattern: ConcretePattern,
+	assignments: List[ConcreteAssignment],
+	body: ConcreteValue
+}
+
+
+fixed record ConcreteMatch {
+	scrutinee: ConcreteValue,
+	owner: UnionInstanceId,
+	arms: List[ConcreteArm]
+}
+
+
+fixed union ConcreteBody:
+	ConcreteValueBody(ConcreteValue)
+	ConcreteMatchBody(ConcreteMatch)
+
+
+fixed record ConcreteFunction {
+	signature: FunctionSignature,
+	bindings: List[ConcreteBinding],
+	assignments: List[ConcreteAssignment],
+	body: ConcreteBody
+}
+
+
+fixed record SpecializedContents {
+	unions: List[ConcreteUnion],
+	functions: List[ConcreteFunction],
+	entrypoint: FunctionInstanceId
+}
+
+
+opaque type SpecializedProgram = SpecializedContents
+
+
+pure func union_number(id: UnionInstanceId) -> Int:
+	from_opaque UnionInstanceId(id)
+
+
+pure func variant_owner(id: VariantInstanceId) -> UnionInstanceId:
+	from_opaque VariantInstanceId(id).owner
+
+
+pure func variant_number(id: VariantInstanceId) -> Int:
+	from_opaque VariantInstanceId(id).position
+
+
+pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
+	match left:
+		IntType:
+			match right:
+				IntType:
+					True
+				_:
+					False
+		StringType:
+			match right:
+				StringType:
+					True
+				_:
+					False
+		UnionType(left):
+			match right:
+				UnionType(right):
+					IntOps.equals(union_number(left), union_number(right))
+				_:
+					False
+
+
+pure func function_number(id: FunctionInstanceId) -> Int:
+	from_opaque FunctionInstanceId(id)
+
+
+pure func specialized_contents(program: SpecializedProgram) -> SpecializedContents:
+	from_opaque SpecializedProgram(program)
+
+
+fixed record ConcreteBinding {
+	origin: Checked.BindingOrigin,
+	mutability: Checked.BindingMutability,
+	value_type: TypeRef,
+	span: Span
+}
+
+
+private fixed union ConcreteInstantiation:
+	NoConcreteArgument
+	ConcreteArgument(TypeRef)
+
+
+private fixed record InstanceKey {
+	declaration: Checked.FunctionId,
+	argument: ConcreteInstantiation
+}
+
+
+private fixed union Substitution:
+	NoSubstitution
+	TypeSubstitution(Checked.TypeParameterId, TypeRef)
+
+
+private pure func invalid(span: Span, message: String) -> Diagnostic:
+	{
+		span = span,
+		note = NoDiagnosticNote,
+		message = "internal specialization error: ".concat(message),
+		help = "report this compiler error with the input program"
+	}
+
+
+private pure func translated_list[T, U](
+	values: List[T],
+	translate: pure (T) -> Result[U, Diagnostic],
+) -> Result[List[U], Diagnostic]:
+	var translated: List[U] = []
+	var failure: Option[Diagnostic] = None
+
+	for value in values:
+		match translate(value):
+			Ok(value):
+				translated = translated.append(value)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(translated)
+
+
+private pure func concrete_type(
+	value_type: Checked.TypeRef,
+	substitution: Substitution,
+	unions: List[UnionInstance],
+	span: Span,
+) -> Result[TypeRef, Diagnostic]:
+	match value_type:
+		Checked.IntType:
+			Ok(IntType)
+		Checked.StringType:
+			Ok(StringType)
+		Checked.AppliedUnionType(id, argument):
+			argument ?= concrete_type(argument, substitution, unions, span)
+			id ?= find_union_instance(
+				unions,
+				{
+					declaration = id,
+					argument = ConcreteArgument(argument)
+				},
+			).to_result(invalid(span, "unprepared generic union instance"))
+			Ok(UnionType(id))
+		Checked.UnionType(id):
+			id ?= find_union_instance(
+				unions,
+				{
+					declaration = id,
+					argument = NoConcreteArgument
+				},
+			).to_result(invalid(span, "unprepared ordinary union instance"))
+			Ok(UnionType(id))
+		Checked.ParameterType(id):
+			match substitution:
+				TypeSubstitution(parameter, argument):
+					if Checked.same_parameter(id, parameter):
+						Ok(argument)
+					else:
+						Err(invalid(span, "parameter belongs to a different declaration"))
+				NoSubstitution:
+					Err(invalid(span, "unresolved type parameter"))
+
+
+private pure func same_argument(left: ConcreteInstantiation, right: ConcreteInstantiation) -> Bool:
+	match left:
+		NoConcreteArgument:
+			match right:
+				NoConcreteArgument:
+					True
+				_:
+					False
+		ConcreteArgument(left):
+			match right:
+				ConcreteArgument(right):
+					same_type(left, right)
+				_:
+					False
+
+
+private pure func find_instance(
+	keys: List[FunctionRequest],
+	key: InstanceKey,
+) -> Option[FunctionInstanceId]:
+	var found: Option[FunctionInstanceId] = None
+	var position: Int = 0
+
+	for known in keys:
+		if IntOps.equals(
+			Checked.function_number(known.key.declaration),
+			Checked.function_number(key.declaration),
+		) and same_argument(known.key.argument, key.argument):
+			found = Some(into_opaque FunctionInstanceId(position))
+			break
+
+		position = IntOps.add(position, 1)
+
+	found
+
+
+private pure func parameter_substitution(
+	parameters: Checked.TypeParameters,
+	argument: ConcreteInstantiation,
+	span: Span,
+) -> Result[Substitution, Diagnostic]:
+	match parameters:
+		Checked.NoTypeParameter:
+			match argument:
+				NoConcreteArgument:
+					Ok(NoSubstitution)
+				_:
+					Err(invalid(span, "ordinary declaration has a type argument"))
+		Checked.OneTypeParameter(parameter):
+			match argument:
+				ConcreteArgument(value):
+					Ok(TypeSubstitution(parameter, value))
+				_:
+					Err(invalid(span, "generic declaration has no type argument"))
+
+
+private pure func instance_substitution(
+	signature: Checked.FunctionSignature,
+	argument: ConcreteInstantiation,
+	span: Span,
+) -> Result[Substitution, Diagnostic]:
+	parameter_substitution(signature.type_parameters, argument, span)
+
+
+private pure func call_key(
+	call: Checked.CheckedCall,
+	substitution: Substitution,
+	unions: List[UnionInstance],
+) -> Result[Option[InstanceKey], Diagnostic]:
+	match call.target:
+		Checked.RuntimeFunction(_):
+			Ok(None)
+		Checked.UserFunction(id, instantiation):
+			argument_result: Result[ConcreteInstantiation, Diagnostic] = match instantiation:
+				Checked.NoInstantiation:
+					Ok(NoConcreteArgument)
+				Checked.InstantiateWith(value):
+					concrete ?= concrete_type(value, substitution, unions, call.span)
+					Ok(ConcreteArgument(concrete))
+
+			argument ?= argument_result
+			Ok(Some({
+				declaration = id,
+				argument = argument,
+			}))
+
+
+private pure func value_calls(value: Checked.CheckedValue) -> List[Checked.CheckedCall]:
+	var calls: List[Checked.CheckedCall] = match value.base:
+		Checked.ReturnCall(call):
+			[call]
+		_:
+			[]
+
+	for step in value.operations:
+		match step.operation:
+			Checked.InvokeFunction(call):
+				calls = calls.append(call)
+			_:
+				void
+
+	calls
+
+
+private pure func assignment_calls(
+	assignments: List[Checked.CheckedAssignment],
+) -> List[Checked.CheckedCall]:
+	var calls: List[Checked.CheckedCall] = []
+
+	for assignment in assignments:
+		value = match assignment:
+			Checked.InitializeBinding(_, value):
+				value
+			Checked.ReassignBinding(_, value):
+				value
+
+		calls = calls.concat(value_calls(value))
+
+	calls
+
+
+private pure func function_calls(function: Checked.CheckedFunction) -> List[Checked.CheckedCall]:
+	var calls = assignment_calls(function.assignments)
+
+	match function.body:
+		Checked.CheckedValueBody(value):
+			calls.concat(value_calls(value))
+		Checked.CheckedMatchBody(matched):
+			calls = calls.concat(value_calls(matched.scrutinee))
+
+			for arm in matched.arms:
+				calls = calls
+					.concat(assignment_calls(arm.assignments))
+					.concat(value_calls(arm.body))
+
+			calls
+
+
+private fixed record UnionKey {
+	declaration: Checked.UnionId,
+	argument: ConcreteInstantiation
+}
+
+
+private fixed record UnionInstance {
+	key: UnionKey,
+	layout: ConcreteUnion
+}
+
+
+private fixed union RequestSource:
+	OrdinaryRoot
+	ConcreteRequest(Span)
+
+
+private fixed record FunctionRequest {
+	key: InstanceKey,
+	source: RequestSource
+}
+
+
+private fixed record PreparedType {
+	value_type: TypeRef,
+	unions: List[UnionInstance]
+}
+
+
+private fixed record PreparedInstances {
+	functions: List[FunctionRequest],
+	unions: List[UnionInstance]
+}
+
+
+private pure func contains_parameter(value: Checked.TypeRef) -> Bool:
+	match value:
+		Checked.ParameterType(_):
+			True
+		Checked.AppliedUnionType(_, argument):
+			contains_parameter(argument)
+		_:
+			False
+
+
+private pure func request_span(
+	value: Checked.TypeRef,
+	source: RequestSource,
+	fallback: Span,
+) -> Span:
+	match source:
+		ConcreteRequest(span):
+			if contains_parameter(value):
+				span
+			else:
+				fallback
+		OrdinaryRoot:
+			fallback
+
+
+private pure func find_union_instance(
+	keys: List[UnionInstance],
+	key: UnionKey,
+) -> Option[UnionInstanceId]:
+	var found: Option[UnionInstanceId] = None
+	var position: Int = 0
+
+	for known in keys:
+		if IntOps.equals(
+			Checked.union_number(known.key.declaration),
+			Checked.union_number(key.declaration),
+		) and same_argument(known.key.argument, key.argument):
+			found = Some(into_opaque UnionInstanceId(position))
+			break
+
+		position = IntOps.add(position, 1)
+
+	found
+
+
+private pure func ensure_union(
+	key: UnionKey,
+	declarations: List[Checked.CheckedUnion],
+	unions: List[UnionInstance],
+	span: Span,
+) -> Result[PreparedType, Diagnostic]:
+	match find_union_instance(unions, key):
+		Some(id):
+			Ok({
+				value_type = UnionType(id),
+				unions = unions,
+			})
+		None:
+			declaration ?= declarations
+				.get(Checked.union_number(key.declaration))
+				.to_result(invalid(span, "unknown union declaration"))
+			substitution ?= parameter_substitution(declaration.type_parameters, key.argument, span)
+			variants ?= translated_list(declaration.variants, pure func(
+				payload: Checked.PayloadShape,
+			) -> Result[PayloadShape, Diagnostic]:
+				match payload:
+					Checked.NoPayload:
+						Ok(NoPayload)
+					Checked.Payload(written):
+						value ?= concrete_type(written.value_type, substitution, unions, span)
+
+						match value:
+							IntType:
+								Ok(IntPayload)
+							_:
+								Err({
+									span = span,
+									note = UnionPayloadDeclaration(written.span),
+									message = "specialized union payload must be Int",
+									help = "use Int for this payload; String and union payloads are not supported",
+								})
+			)
+			id: UnionInstanceId = into_opaque UnionInstanceId(unions.length())
+			Ok({
+				value_type = UnionType(id),
+				unions = unions.append({
+					key = key,
+					layout = {variants = variants},
+				}),
+			})
+
+
+private pure func prepare_type(
+	value: Checked.TypeRef,
+	substitution: Substitution,
+	declarations: List[Checked.CheckedUnion],
+	unions: List[UnionInstance],
+	span: Span,
+) -> Result[PreparedType, Diagnostic]:
+	match value:
+		Checked.UnionType(id):
+			ensure_union(
+				{
+					declaration = id,
+					argument = NoConcreteArgument
+				},
+				declarations,
+				unions,
+				span,
+			)
+		Checked.AppliedUnionType(id, argument):
+			prepared ?= prepare_type(argument, substitution, declarations, unions, span)
+			ensure_union(
+				{
+					declaration = id,
+					argument = ConcreteArgument(prepared.value_type)
+				},
+				declarations,
+				prepared.unions,
+				span,
+			)
+		_:
+			concrete ?= concrete_type(value, substitution, unions, span)
+			Ok({
+				value_type = concrete,
+				unions = unions,
+			})
+
+
+private pure func value_types(value: Checked.CheckedValue) -> List[Checked.TypeUse]:
+	[
+		{
+			value_type = value.base_type,
+			span = value.base_span
+		},
+	].concat(
+		value.operations.map(pure func(step: Checked.CheckedStep) -> Checked.TypeUse:
+			{
+				value_type = step.value_type,
+				span = step.span
+			}
+		),
+	)
+
+
+private pure func assignment_types(
+	assignments: List[Checked.CheckedAssignment],
+) -> List[Checked.TypeUse]:
+	var types: List[Checked.TypeUse] = []
+
+	for assignment in assignments:
+		value = match assignment:
+			Checked.InitializeBinding(_, value):
+				value
+			Checked.ReassignBinding(_, value):
+				value
+
+		types = types.concat(value_types(value))
+
+	types
+
+
+private pure func function_types(function: Checked.CheckedFunction) -> List[Checked.TypeUse]:
+	var types: List[Checked.TypeUse] = match function.signature.parameters:
+		Checked.NoParameter:
+			[]
+		Checked.OneParameter(value):
+			[value]
+
+	types = types
+		.append(function.signature.return_type)
+		.concat(assignment_types(function.assignments))
+
+	occurrences = match function.body:
+		Checked.CheckedValueBody(value):
+			types.concat(value_types(value))
+		Checked.CheckedMatchBody(matched):
+			types = types.concat(value_types(matched.scrutinee))
+
+			for arm in matched.arms:
+				types = types
+					.concat(assignment_types(arm.assignments))
+					.concat(value_types(arm.body))
+
+			types
+
+	-- Binding types are derived from these occurrences. Their name spans must
+	-- never replace an initializer's concrete request as diagnostic provenance.
+	occurrences.concat(
+		function.bindings.map(pure func(binding: Checked.BindingDefinition) -> Checked.TypeUse:
+			{
+				value_type = binding.value_type,
+				span = binding.span
+			}
+		),
+	)
+
+
+private pure func prepare_function(
+	function: Checked.CheckedFunction,
+	request: FunctionRequest,
+	declarations: List[Checked.CheckedUnion],
+	initial: PreparedInstances,
+) -> Result[PreparedInstances, Diagnostic]:
+	substitution ?= instance_substitution(
+		function.signature,
+		request.key.argument,
+		function.signature.return_type.span,
+	)
+	var prepared = initial
+	var failure: Option[Diagnostic] = None
+
+	for written in function_types(function):
+		match prepare_type(
+			written.value_type,
+			substitution,
+			declarations,
+			prepared.unions,
+			request_span(written.value_type, request.source, written.span),
+		):
+			Ok(value):
+				prepared = { prepared | unions = value.unions }
+			Err(error):
+				failure = Some(error)
+				break
+
+	if not failure.is_some():
+		for call in function_calls(function):
+			match call.target:
+				Checked.RuntimeFunction(_):
+					void
+				Checked.UserFunction(declaration, instantiation):
+					argument_result: Result[ConcreteInstantiation, Diagnostic] = match instantiation:
+						Checked.NoInstantiation:
+							Ok(NoConcreteArgument)
+						Checked.InstantiateWith(value):
+							match prepare_type(
+								value,
+								substitution,
+								declarations,
+								prepared.unions,
+								request_span(value, request.source, call.span),
+							):
+								Ok(value):
+									prepared = { prepared | unions = value.unions }
+									Ok(ConcreteArgument(value.value_type))
+								Err(error):
+									Err(error)
+
+					match argument_result:
+						Err(error):
+							failure = Some(error)
+							break
+						Ok(argument):
+							key: InstanceKey = {
+								declaration = declaration,
+								argument = argument
+							}
+
+							if not find_instance(prepared.functions, key).is_some():
+								source = match request.source:
+									OrdinaryRoot:
+										ConcreteRequest(call.span)
+									ConcreteRequest(span):
+										ConcreteRequest(span)
+
+								prepared = { prepared | functions = prepared.functions.append({
+										key = key,
+										source = source,
+									}) }
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(prepared)
+
+
+private pure func expand_instances(
+	functions: List[Checked.CheckedFunction],
+	declarations: List[Checked.CheckedUnion],
+	initial: PreparedInstances,
+) -> Result[PreparedInstances, Diagnostic]:
+	var prepared = initial
+	var cursor: Int = 0
+	var failure: Option[Diagnostic] = None
+
+	-- Acyclic declarations and finite checked substitution trees bound requests.
+	while IntOps.less_than(cursor, prepared.functions.length()):
+		match prepared.functions.get(cursor):
+			None:
+				failure = Some(
+					invalid(
+						{
+							start = 0,
+							end = 0
+						},
+						"missing instance request",
+					),
+				)
+			Some(request):
+				match functions.get(Checked.function_number(request.key.declaration)):
+					None:
+						failure = Some(
+							invalid(
+								{
+									start = 0,
+									end = 0
+								},
+								"unknown function declaration",
+							),
+						)
+					Some(function):
+						match prepare_function(function, request, declarations, prepared):
+							Ok(value):
+								prepared = value
+							Err(error):
+								failure = Some(error)
+
+		if failure.is_some():
+			break
+
+		cursor = IntOps.add(cursor, 1)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(prepared)
+
+
+private pure func translate_call(
+	call: Checked.CheckedCall,
+	substitution: Substitution,
+	keys: List[FunctionRequest],
+	unions: List[UnionInstance],
+) -> Result[ConcreteCall, Diagnostic]:
+	target_result: Result[CallTarget, Diagnostic] = match call.target:
+		Checked.RuntimeFunction(operation):
+			Ok(RuntimeFunction(operation))
+		Checked.UserFunction(_, _):
+			request ?= call_key(call, substitution, unions)
+			key ?= request.to_result(invalid(call.span, "missing user instance key"))
+			id ?= find_instance(
+				keys,
+				key,
+			).to_result(invalid(call.span, "unexpanded function instance"))
+			Ok(UserFunction(id))
+
+	target ?= target_result
+	Ok({
+		target = target,
+		span = call.span,
+	})
+
+
+private pure func concrete_union_owner(
+	value: TypeRef,
+	span: Span,
+) -> Result[UnionInstanceId, Diagnostic]:
+	match value:
+		UnionType(id):
+			Ok(id)
+		_:
+			Err(invalid(span, "variant occurrence has no concrete union type"))
+
+
+private pure func translate_variant(
+	id: Checked.VariantId,
+	owner: UnionInstanceId,
+	unions: List[UnionInstance],
+	span: Span,
+) -> Result[VariantInstanceId, Diagnostic]:
+	instance ?= unions
+		.get(union_number(owner))
+		.to_result(invalid(span, "unknown concrete union"))
+
+	membership ?= if IntOps.equals(
+		Checked.union_number(instance.key.declaration),
+		Checked.union_number(Checked.variant_owner(id)),
+	):
+		Ok(void)
+	else:
+		Err(invalid(span, "variant belongs to a different union declaration"))
+
+	position = Checked.variant_number(id)
+	member ?= instance.layout.variants
+		.get(position)
+		.to_result(invalid(span, "unknown union variant"))
+	Ok(into_opaque VariantInstanceId({
+				owner = owner,
+				position = position
+			}))
+
+
+private pure func translate_value(
+	value: Checked.CheckedValue,
+	substitution: Substitution,
+	keys: List[FunctionRequest],
+	unions: List[UnionInstance],
+) -> Result[ConcreteValue, Diagnostic]:
+	base_type ?= concrete_type(value.base_type, substitution, unions, value.base_span)
+
+	base_result: Result[ConcreteBase, Diagnostic] = match value.base:
+		Checked.ReturnInteger(value):
+			Ok(ReturnInteger(value))
+		Checked.ReturnBinding(id):
+			Ok(ReturnBinding(id))
+		Checked.ReturnVariant(id):
+			owner ?= concrete_union_owner(base_type, value.base_span)
+			concrete ?= translate_variant(id, owner, unions, value.base_span)
+			Ok(ReturnVariant(concrete))
+		Checked.ReturnCall(call):
+			concrete ?= translate_call(call, substitution, keys, unions)
+			Ok(ReturnCall(concrete))
+
+	base ?= base_result
+	steps ?= translated_list(value.operations, pure func(
+		step: Checked.CheckedStep,
+	) -> Result[ConcreteStep, Diagnostic]:
+		value_type ?= concrete_type(step.value_type, substitution, unions, step.span)
+
+		operation_result: Result[ConcreteOperation, Diagnostic] = match step.operation:
+			Checked.InvokeFunction(call):
+				concrete ?= translate_call(call, substitution, keys, unions)
+				Ok(InvokeFunction(concrete))
+			Checked.ConstructVariant(id):
+				owner ?= concrete_union_owner(value_type, step.span)
+				concrete ?= translate_variant(id, owner, unions, step.span)
+				Ok(ConstructVariant(concrete))
+
+		operation ?= operation_result
+		Ok({
+			operation = operation,
+			value_type = value_type,
+			span = step.span,
+		})
+	)
+	Ok({
+		base = base,
+		base_type = base_type,
+		base_span = value.base_span,
+		operations = steps,
+	})
+
+
+private pure func translate_assignments(
+	assignments: List[Checked.CheckedAssignment],
+	substitution: Substitution,
+	keys: List[FunctionRequest],
+	unions: List[UnionInstance],
+) -> Result[List[ConcreteAssignment], Diagnostic]:
+	translated_list(assignments, pure func(
+		assignment: Checked.CheckedAssignment,
+	) -> Result[ConcreteAssignment, Diagnostic]:
+		match assignment:
+			Checked.InitializeBinding(id, value):
+				value ?= translate_value(value, substitution, keys, unions)
+				Ok(InitializeBinding(id, value))
+			Checked.ReassignBinding(id, value):
+				value ?= translate_value(value, substitution, keys, unions)
+				Ok(ReassignBinding(id, value))
+	)
+
+
+private pure func translate_pattern(
+	pattern: Checked.CheckedPattern,
+	owner: UnionInstanceId,
+	span: Span,
+	unions: List[UnionInstance],
+) -> Result[ConcretePattern, Diagnostic]:
+	match pattern:
+		Checked.WildcardCase:
+			Ok(WildcardCase)
+		Checked.BindingCase(id):
+			Ok(BindingCase(id))
+		Checked.VariantCase(id, payload):
+			variant ?= translate_variant(id, owner, unions, span)
+
+			concrete_payload = match payload:
+				Checked.NoPayloadBinding:
+					NoPayloadBinding
+				Checked.DiscardPayload:
+					DiscardIntPayload
+				Checked.BindPayload(id):
+					BindIntPayload(id)
+
+			Ok(VariantCase(variant, concrete_payload))
+
+
+private pure func translate_function(
+	function: Checked.CheckedFunction,
+	key: InstanceKey,
+	keys: List[FunctionRequest],
+	unions: List[UnionInstance],
+) -> Result[ConcreteFunction, Diagnostic]:
+	span = function.signature.return_type.span
+	substitution ?= instance_substitution(function.signature, key.argument, span)
+
+	parameter_result: Result[ParameterShape, Diagnostic] = match function.signature.parameters:
+		Checked.NoParameter:
+			Ok(NoParameter)
+		Checked.OneParameter(value):
+			concrete ?= concrete_type(value.value_type, substitution, unions, value.span)
+			Ok(OneParameter(concrete))
+
+	parameters ?= parameter_result
+	return_type ?= concrete_type(
+		function.signature.return_type.value_type,
+		substitution,
+		unions,
+		function.signature.return_type.span,
+	)
+	bindings ?= translated_list(function.bindings, pure func(
+		binding: Checked.BindingDefinition,
+	) -> Result[ConcreteBinding, Diagnostic]:
+		value_type ?= concrete_type(binding.value_type, substitution, unions, binding.span)
+		Ok({
+			origin = binding.origin,
+			mutability = binding.mutability,
+			value_type = value_type,
+			span = binding.span,
+		})
+	)
+	assignments ?= translate_assignments(function.assignments, substitution, keys, unions)
+
+	body_result: Result[ConcreteBody, Diagnostic] = match function.body:
+		Checked.CheckedValueBody(value):
+			concrete ?= translate_value(value, substitution, keys, unions)
+			Ok(ConcreteValueBody(concrete))
+		Checked.CheckedMatchBody(matched):
+			scrutinee ?= translate_value(matched.scrutinee, substitution, keys, unions)
+			union_type ?= concrete_type(matched.union_type, substitution, unions, span)
+			owner ?= concrete_union_owner(union_type, span)
+			arms ?= translated_list(matched.arms, pure func(
+				arm: Checked.CheckedArm,
+			) -> Result[ConcreteArm, Diagnostic]:
+				pattern ?= translate_pattern(arm.pattern, owner, span, unions)
+				assignments ?= translate_assignments(arm.assignments, substitution, keys, unions)
+				body ?= translate_value(arm.body, substitution, keys, unions)
+				Ok({
+					pattern = pattern,
+					assignments = assignments,
+					body = body,
+				})
+			)
+			Ok(ConcreteMatchBody({
+				scrutinee = scrutinee,
+				owner = owner,
+				arms = arms,
+			}))
+
+	body ?= body_result
+	Ok({
+		signature = {
+			purity = function.signature.purity,
+			parameters = parameters,
+			return_type = return_type
+		},
+		bindings = bindings,
+		assignments = assignments,
+		body = body,
+	})
+
+
+pure func specialize(program: Checked.CheckedProgram) -> Result[SpecializedProgram, Diagnostic]:
+	checked = Checked.checked_functions(program)
+	var initial: PreparedInstances = {
+		functions = [],
+		unions = []
+	}
+	var position: Int = 0
+	var failure: Option[Diagnostic] = None
+
+	for declaration in checked.unions:
+		match declaration.type_parameters:
+			Checked.OneTypeParameter(_):
+				void
+			Checked.NoTypeParameter:
+				root_unions = initial.unions
+
+				match (
+					Checked
+						.union_declaration_id(program, position)
+						.to_result(
+							invalid(
+								{
+									start = 0,
+									end = 0
+								},
+								"unknown union root",
+							),
+						)
+						.and_then(pure func(id): ensure_union(
+								{
+									declaration = id,
+									argument = NoConcreteArgument
+								},
+								checked.unions,
+								root_unions,
+								{
+									start = 0,
+									end = 0
+								},
+							))
+				):
+					Ok(value):
+						initial = { initial | unions = value.unions }
+					Err(error):
+						failure = Some(error)
+
+		position = IntOps.add(position, 1)
+
+	position = 0
+
+	for function in checked.functions:
+		match function.signature.type_parameters:
+			Checked.OneTypeParameter(_):
+				void
+			Checked.NoTypeParameter:
+				match Checked.declaration_id(program, position):
+					Some(declaration):
+						initial = { initial | functions = initial.functions.append({
+								key = {
+									declaration = declaration,
+									argument = NoConcreteArgument
+								},
+								source = OrdinaryRoot,
+							}) }
+					None:
+						failure = Some(
+							invalid(
+								function.signature.return_type.span,
+								"unknown root declaration",
+							),
+						)
+
+		position = IntOps.add(position, 1)
+
+	valid ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	prepared ?= expand_instances(checked.functions, checked.unions, initial)
+	functions ?= translated_list(prepared.functions, pure func(
+		request: FunctionRequest,
+	) -> Result[ConcreteFunction, Diagnostic]:
+		function ?= checked.functions
+			.get(Checked.function_number(request.key.declaration))
+			.to_result(
+				invalid(
+					{
+						start = 0,
+						end = 0
+					},
+					"unknown function declaration",
+				),
+			)
+		translate_function(function, request.key, prepared.functions, prepared.unions)
+	)
+	entrypoint ?= find_instance(
+		prepared.functions,
+		{
+			declaration = checked.entrypoint,
+			argument = NoConcreteArgument
+		},
+	).to_result(
+		invalid(
+			{
+				start = 0,
+				end = 0
+			},
+			"missing entrypoint instance",
+		),
+	)
+	Ok(into_opaque SpecializedProgram({
+				unions = prepared.unions.map(pure func(instance: UnionInstance): instance.layout),
+				functions = functions,
+				entrypoint = entrypoint
+			}))

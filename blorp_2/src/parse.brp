@@ -11,6 +11,7 @@ import:
 		CallNotation(DirectCall, ReceiverCall),
 		DECIMAL_DIGITS,
 		Diagnostic,
+		DiagnosticNote(NoDiagnosticNote),
 		ExpressionBase(IntegerExpression, NameExpression, ZeroArgumentApplication),
 		FieldPattern(FieldName, FieldWildcard),
 		FunctionHeader,
@@ -33,9 +34,11 @@ import:
 		Span,
 		Symbol(
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
-			Colon, Newline, VarKeyword, Equals,
+			Colon, Newline, VarKeyword, Equals, LeftBracket, RightBracket,
 		),
 		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, BuiltinLabel, Indentation),
+		TypeParameterSyntax(NoTypeParameterSyntax, OneTypeParameterSyntax),
+		TypeSyntax(AtomicType, AppliedType),
 		UnaryApplication,
 		ValueExpression,
 		WrittenName,
@@ -81,6 +84,7 @@ private pure func expected(state: ParserState, message: String, help: String) ->
 
 	{
 		span = span,
+		note = NoDiagnosticNote,
 		message = message,
 		help = help
 	}
@@ -121,6 +125,18 @@ private pure func symbol_matches(actual: Symbol, expected: Symbol) -> Bool:
 		RightParen:
 			match expected:
 				RightParen:
+					True
+				_:
+					False
+		LeftBracket:
+			match expected:
+				LeftBracket:
+					True
+				_:
+					False
+		RightBracket:
+			match expected:
+				RightBracket:
 					True
 				_:
 					False
@@ -303,6 +319,7 @@ private DECIMAL_RADIX: Int = 10
 private pure func integer_error(span: Span, message: String, help: String) -> Diagnostic:
 	{
 		span = span,
+		note = NoDiagnosticNote,
 		message = message,
 		help = help
 	}
@@ -387,6 +404,19 @@ private pure func integer_value(spelling: String, span: Span) -> Result[Int, Dia
 					Ok(IntOps.subtract(0, value))
 
 
+private pure func reject_function_type_arguments(state: ParserState) -> Result[Void, Diagnostic]:
+	if at_symbol(state, LeftBracket):
+		Err(
+			expected(
+				state,
+				"explicit function type arguments are unsupported",
+				"omit the brackets at calls; the sole argument determines the type parameter",
+			),
+		)
+	else:
+		Ok(void)
+
+
 private pure func consume_expression_step(state: ParserState) -> Result[ExpressionStep, Diagnostic]:
 	match state.input.tokens.get(state.position):
 		Some(token):
@@ -422,6 +452,7 @@ private pure func consume_expression_step(state: ParserState) -> Result[Expressi
 								id = id,
 								span = token.span
 							}
+							implicit_arguments ?= reject_function_type_arguments(next)
 
 							if not at_symbol(next, LeftParen):
 								Ok(ReadBase(NameExpression(name), token.span, next))
@@ -468,6 +499,7 @@ private pure func consume_receiver_call(
 	after_dot: ParserState,
 ) -> Result[ParsedUnaryApplication, Diagnostic]:
 	name ?= consume_name(after_dot, "expected a function name after '.'")
+	implicit_arguments ?= reject_function_type_arguments(name.next)
 	after_open ?= consume_symbol(
 		name.next,
 		LeftParen,
@@ -596,6 +628,70 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 			})
 
 
+private fixed record ParsedType {
+	written: TypeSyntax,
+	next: ParserState
+}
+
+
+private pure func consume_type(
+	state: ParserState,
+	message: String,
+) -> Result[ParsedType, Diagnostic]:
+	name ?= consume_name(state, message)
+
+	if not at_symbol(name.next, LeftBracket):
+		Ok({
+			written = AtomicType(name.name),
+			next = name.next,
+		})
+	else:
+		argument ?= consume_name(
+			{ name.next | position = IntOps.add(name.next.position, 1) },
+			"expected one type argument",
+		)
+
+		nested ?= if at_symbol(argument.next, LeftBracket):
+			Err(
+				expected(
+					argument.next,
+					"nested type applications are not supported",
+					"use Int, String, a declared parameter, or an ordinary union as the written ".concat(
+						"argument",
+					),
+				),
+			)
+		else:
+			Ok(void)
+
+		closed ?= consume_symbol(
+			argument.next,
+			RightBracket,
+			"expected ']' after the type argument",
+			"write exactly one atomic type argument, such as Box[Int] or Box[T]",
+		)
+		closing ?= argument.next.input.tokens
+			.get(argument.next.position)
+			.to_result(
+				expected(
+					argument.next,
+					"expected ']' after the type argument",
+					"close the type application",
+				),
+			)
+		Ok({
+			written = AppliedType(
+				name.name,
+				argument.name,
+				{
+					start = name.name.span.start,
+					end = closing.span.end
+				},
+			),
+			next = closed,
+		})
+
+
 private pure func consume_parameters(state: ParserState) -> Result[ParsedParameters, Diagnostic]:
 	if at_symbol(state, RightParen):
 		Ok({
@@ -610,7 +706,7 @@ private pure func consume_parameters(state: ParserState) -> Result[ParsedParamet
 			"expected ':' after the parameter name",
 			"write a single parameter as name: Int",
 		)
-		type_name ?= consume_name(after_colon, "expected a parameter type")
+		type_name ?= consume_type(after_colon, "expected a parameter type")
 		closed ?= consume_symbol(
 			type_name.next,
 			RightParen,
@@ -620,7 +716,7 @@ private pure func consume_parameters(state: ParserState) -> Result[ParsedParamet
 		Ok({
 			parameters = SingleParameter({
 				name = name.name,
-				type_name = type_name.name,
+				type_name = type_name.written,
 			}),
 			next = closed,
 		})
@@ -1002,6 +1098,88 @@ private pure func consume_bindings(
 			})
 
 
+private fixed record ParsedTypeParameter {
+	parameters: TypeParameterSyntax,
+	next: ParserState
+}
+
+
+private pure func valid_type_parameter_name(spelling: String) -> Bool:
+	var accepted = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(spelling.substring(0, 1))
+	var position: Int = 1
+
+	while IntOps.less_than(position, spelling.length()):
+		accepted = (
+			accepted
+			and "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".contains(
+				spelling.substring(
+					position,
+					1,
+				),
+			)
+		)
+		position = IntOps.add(position, 1)
+
+	accepted
+
+
+private pure func consume_type_parameter(
+	state: ParserState,
+) -> Result[ParsedTypeParameter, Diagnostic]:
+	if not at_symbol(state, LeftBracket):
+		Ok({
+			parameters = NoTypeParameterSyntax,
+			next = state,
+		})
+	else:
+		opened: ParserState = { state | position = IntOps.add(state.position, 1) }
+		name ?= consume_name(opened, "expected a type parameter name")
+
+		valid ?= match opened.input.tokens.get(opened.position):
+			Some(token):
+				match token.kind:
+					IdentifierToken(spelling):
+						if valid_type_parameter_name(spelling):
+							Ok(void)
+						else:
+							Err({
+								span = token.span,
+								note = NoDiagnosticNote,
+								message = "invalid type parameter name",
+								help = Text.concat(
+									"start with a capital ASCII letter and use only ASCII letters and digits, such ",
+									"as T or Element2",
+								),
+							})
+					_:
+						Err(
+							expected(
+								opened,
+								"expected a type parameter name",
+								"declare one type parameter, such as [T]",
+							),
+						)
+			None:
+				Err(
+					expected(
+						opened,
+						"expected a type parameter name",
+						"declare one type parameter, such as [T]",
+					),
+				)
+
+		closed ?= consume_symbol(
+			name.next,
+			RightBracket,
+			"expected ']' after the type parameter",
+			"declare exactly one type parameter in brackets, such as [T]",
+		)
+		Ok({
+			parameters = OneTypeParameterSyntax(name.name),
+			next = closed,
+		})
+
+
 private pure func consume_header(start: ParserState) -> Result[HeaderResult, Diagnostic]:
 	purity: Purity = match start.input.tokens.get(start.position):
 		Some(token):
@@ -1030,8 +1208,9 @@ private pure func consume_header(start: ParserState) -> Result[HeaderResult, Dia
 			)
 
 	function ?= consume_name(after_func, "expected a function name")
+	type_parameters ?= consume_type_parameter(function.next)
 	after_open ?= consume_symbol(
-		function.next,
+		type_parameters.next,
 		LeftParen,
 		"expected '(' after the function name",
 		"write main() or helper(value: Int)",
@@ -1043,7 +1222,7 @@ private pure func consume_header(start: ParserState) -> Result[HeaderResult, Dia
 		"expected '->' before the return type",
 		"write main() -> Int with adjacent arrow characters",
 	)
-	return_type ?= consume_name(after_arrow, "expected a return type")
+	return_type ?= consume_type(after_arrow, "expected a return type")
 	after_header ?= consume_symbol(
 		return_type.next,
 		Colon,
@@ -1066,8 +1245,9 @@ private pure func consume_header(start: ParserState) -> Result[HeaderResult, Dia
 		header = {
 			purity = purity,
 			function_name = function.name,
+			type_parameters = type_parameters.parameters,
 			parameters = parameters.parameters,
-			return_type = return_type.name
+			return_type = return_type.written
 		},
 		next = after_indent,
 	})
@@ -1081,6 +1261,7 @@ private pure func consume_function(start: ParserState) -> Result[FunctionResult,
 		function = {
 			purity = header.header.purity,
 			function_name = header.header.function_name,
+			type_parameters = header.header.type_parameters,
 			parameters = header.header.parameters,
 			return_type = header.header.return_type,
 			bindings = prefix.bindings,
@@ -1132,7 +1313,7 @@ private pure func consume_variant(state: ParserState) -> Result[VariantResult, D
 			field.next,
 			RightParen,
 			"expected ')' after the payload type",
-			"declare zero fields or one Int field, written Variant(Int)",
+			"declare zero fields or one payload field, written Variant(Int) or Variant(T)",
 		)
 		Ok({
 			variant = {
@@ -1166,11 +1347,12 @@ private pure func consume_union(start: ParserState) -> Result[UnionResult, Diagn
 		)
 
 	name ?= consume_name(word, "expected a union type name")
+	type_parameters ?= consume_type_parameter(name.next)
 	colon ?= consume_symbol(
-		name.next,
+		type_parameters.next,
 		Colon,
 		"expected ':' after the union type name",
-		"use a fixed union without type parameters",
+		"write fixed union Choice: or fixed union Box[T]:",
 	)
 	newline ?= consume_symbol(
 		colon,
@@ -1218,6 +1400,7 @@ private pure func consume_union(start: ParserState) -> Result[UnionResult, Diagn
 			Ok({
 				declaration = {
 					type_name = name.name,
+					type_parameters = type_parameters.parameters,
 					variants = variants
 				},
 				next = state,
@@ -1377,14 +1560,16 @@ pure func parse_prelude(input: LexedProgram) -> Result[ParsedPrelude, Diagnostic
 					functions = functions.append(parsed.function)
 					state = parsed.next
 		else:
-			failure = Some(expected(
-				state,
-				"expected a builtin prelude declaration",
-				Text.concat(
-					"declare type Int = builtin, type String = builtin, ",
-					"or a pure function with a builtin(...) body",
+			failure = Some(
+				expected(
+					state,
+					"expected a builtin prelude declaration",
+					Text.concat(
+						"declare type Int = builtin, type String = builtin, ",
+						"or a pure function with a builtin(...) body",
+					),
 				),
-			))
+			)
 			break
 
 		if IntOps.equals(state.position, input.tokens.length()):

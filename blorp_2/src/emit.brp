@@ -1,24 +1,9 @@
 import:
 	./prelude: RuntimeOperation(IntToString, StringLength)
-	check:
-		CallTarget(UserFunction, RuntimeFunction),
-		CheckedUnion,
-		ParameterShape(NoParameter, OneParameter),
-		PayloadShape(NoPayload, IntPayload),
-		TypeRef(IntType, StringType, UnionType),
-		UnionId,
-		VariantId,
-		function_number,
-		union_number,
-		variant_number,
-		variant_owner,
 	int as IntOps
 	lower:
 		CallArguments(NoArguments, OneArgument),
-		LoweredArm,
-		LoweredMatch,
 		MatchLabel(VariantLabel, DefaultLabel),
-		ValueDefinition,
 		ValueId,
 		ValueOperation(
 			ParameterValue, IntegerValue, VariantValue, CallValue, ConstructValue, PayloadValue,
@@ -27,9 +12,11 @@ import:
 	option: to_result
 	own as Own:
 		OwnedArguments(UnmanagedArgument, BorrowedArgument),
+		OwnedArm,
 		OwnedDefinition,
 		OwnedFunction,
-		OwnedTail(UnmanagedReturn, OwnedReturn, UnmanagedMatch),
+		OwnedMatch,
+		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(
 			ParameterDefinition, IntegerDefinition, VariantDefinition, CallDefinition,
 			ConstructDefinition, PayloadDefinition,
@@ -38,9 +25,22 @@ import:
 		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
 		OwnershipProgram,
 		ResultOwnership(UnmanagedResult, BorrowedResult, OwnedResult),
+		ReturnTransfer(UnmanagedReturn, OwnedReturn),
 		owner_number,
+	specialize:
+		CallTarget(UserFunction, RuntimeFunction),
+		ConcreteUnion,
+		ParameterShape(NoParameter, OneParameter),
+		PayloadShape(NoPayload, IntPayload),
+		TypeRef(IntType, StringType, UnionType),
+		UnionInstanceId,
+		VariantInstanceId,
+		function_number,
+		union_number,
+		variant_number,
+		variant_owner,
 	string_runtime: string_runtime
-	syntax: Diagnostic, Span
+	syntax: Diagnostic, DiagnosticNote(NoDiagnosticNote), Span
 	text: concat
 	verify: VerifiedProgram, verified_contents
 
@@ -57,6 +57,7 @@ private C_PARAMETER: String = "blorp_p_0"
 private pure func internal_error() -> Diagnostic:
 	{
 		span = INTERNAL_SPAN,
+		note = NoDiagnosticNote,
 		message = "internal compiler error: invalid checked union identity",
 		help = "report this compiler error with the input program"
 	}
@@ -101,7 +102,7 @@ private pure func append_integer(output: String, value: Int) -> String:
 			.concat(")")
 
 
-private pure func has_payload(declaration: CheckedUnion) -> Bool:
+private pure func has_payload(declaration: ConcreteUnion) -> Bool:
 	var found = False
 
 	for shape in declaration.variants:
@@ -115,7 +116,7 @@ private pure func has_payload(declaration: CheckedUnion) -> Bool:
 	found
 
 
-private pure func union_c_type(id: UnionId, declaration: CheckedUnion) -> String:
+private pure func union_c_type(id: UnionInstanceId, declaration: ConcreteUnion) -> String:
 	prefix = if has_payload(declaration):
 		"struct blorp_u_"
 	else:
@@ -126,7 +127,7 @@ private pure func union_c_type(id: UnionId, declaration: CheckedUnion) -> String
 
 private pure func c_type(
 	type_ref: TypeRef,
-	unions: List[CheckedUnion],
+	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	match type_ref:
 		IntType:
@@ -140,7 +141,7 @@ private pure func c_type(
 			Ok(union_c_type(id, declaration))
 
 
-private pure func c_variant(id: VariantId) -> String:
+private pure func c_variant(id: VariantInstanceId) -> String:
 	"blorp_v_"
 		.append_int(union_number(variant_owner(id)))
 		.concat("_")
@@ -149,7 +150,7 @@ private pure func c_variant(id: VariantId) -> String:
 
 private pure func c_parameters(
 	parameters: ParameterShape,
-	unions: List[CheckedUnion],
+	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	match parameters:
 		NoParameter:
@@ -165,7 +166,7 @@ private pure func c_parameters(
 			)
 
 
-private pure func append_union(output: String, declaration: CheckedUnion, index: Int) -> String:
+private pure func append_union(output: String, declaration: ConcreteUnion, index: Int) -> String:
 	payload = has_payload(declaration)
 
 	prefix = if payload:
@@ -206,7 +207,7 @@ private pure func append_union(output: String, declaration: CheckedUnion, index:
 private pure func append_operation(
 	output: String,
 	operation: ValueOperation,
-	unions: List[CheckedUnion],
+	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	match operation:
 		ParameterValue:
@@ -262,35 +263,12 @@ private pure func append_operation(
 			)
 
 
-private pure func append_definitions(
-	output: String,
-	definitions: List[ValueDefinition],
-	unions: List[CheckedUnion],
-) -> Result[String, Diagnostic]:
-	var result = output
-	var failure: Option[Diagnostic] = None
-
-	for definition in definitions:
-		match append_definition(result, definition, unions):
-			Err(error):
-				failure = Some(error)
-				break
-			Ok(emitted):
-				result = emitted
-
-	match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(result)
-
-
 private pure func append_value(
 	output: String,
 	id: ValueId,
 	value_type: TypeRef,
 	operation: ValueOperation,
-	unions: List[CheckedUnion],
+	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	type_name ?= c_type(value_type, unions)
 	name = c_value(id)
@@ -319,16 +297,6 @@ private pure func append_value(
 	)
 
 
-private pure func append_definition(
-	output: String,
-	definition: ValueDefinition,
-	unions: List[CheckedUnion],
-) -> Result[String, Diagnostic]:
-	append_value(output, definition.id, definition.value_type, definition.operation, unions)
-
-
--- The verifier has already checked borrows and results. Expression rendering
--- only needs their value operands; retain/drop placement stays explicit below.
 private pure func expression_operation(operation: OwnedValueOperation) -> ValueOperation:
 	match operation:
 		ParameterDefinition:
@@ -368,7 +336,7 @@ private pure func append_owner_alias(output: String, owner: OwnerId, value: Valu
 private pure func append_owned_definition(
 	output: String,
 	definition: OwnedDefinition,
-	unions: List[CheckedUnion],
+	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	value ?= append_value(
 		output,
@@ -391,7 +359,7 @@ private pure func append_owned_definition(
 private pure func append_ownership_operation(
 	output: String,
 	operation: OwnershipOperation,
-	unions: List[CheckedUnion],
+	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	match operation:
 		DefineValue(definition):
@@ -414,7 +382,7 @@ private pure func append_ownership_operation(
 private pure func append_ownership_operations(
 	output: String,
 	operations: List[OwnershipOperation],
-	unions: List[CheckedUnion],
+	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	var result = output
 	var failure: Option[Diagnostic] = None
@@ -436,9 +404,9 @@ private pure func append_ownership_operations(
 
 private pure func append_arm(
 	output: String,
-	arm: LoweredArm,
+	arm: OwnedArm,
 	final_default: Bool,
-	unions: List[CheckedUnion],
+	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	var result = match arm.label:
 		VariantLabel(id):
@@ -452,23 +420,18 @@ private pure func append_arm(
 	if final_default:
 		result = result.concat("default:")
 
-	body ?= append_definitions(
+	body ?= append_ownership_operations(
 		result.concat("{"),
-		arm.body.definitions,
+		arm.operations,
 		unions,
 	)
-	Ok(
-		body
-			.concat("return ")
-			.concat(c_value(arm.body.result))
-			.concat(";}"),
-	)
+	Ok(append_return(body, arm.result).concat("}"))
 
 
 private pure func append_match(
 	output: String,
-	matched: LoweredMatch,
-	unions: List[CheckedUnion],
+	matched: OwnedMatch,
+	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	declaration ?= unions
 		.get(union_number(matched.owner))
@@ -519,7 +482,7 @@ private pure func append_signature(
 	output: String,
 	function: OwnedFunction,
 	index: Int,
-	unions: List[CheckedUnion],
+	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	type_name ?= c_type(function.signature.return_type, unions)
 	parameters ?= c_parameters(function.signature.parameters, unions)
@@ -532,11 +495,24 @@ private pure func append_signature(
 	)
 
 
+private pure func append_return(output: String, result: ReturnTransfer) -> String:
+	value = match result:
+		UnmanagedReturn(id):
+			c_value(id)
+		OwnedReturn(_, owner):
+			c_owner(owner)
+
+	output
+		.concat("return ")
+		.concat(value)
+		.concat(";")
+
+
 private pure func append_function(
 	output: String,
 	function: OwnedFunction,
 	index: Int,
-	unions: List[CheckedUnion],
+	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	header ?= append_signature(output, function, index, unions)
 	body ?= append_ownership_operations(
@@ -546,21 +522,9 @@ private pure func append_function(
 	)
 
 	match function.tail:
-		UnmanagedReturn(id):
-			Ok(
-				body
-					.concat("return ")
-					.concat(c_value(id))
-					.concat(";}"),
-			)
-		OwnedReturn(_, owner):
-			Ok(
-				body
-					.concat("return ")
-					.concat(c_owner(owner))
-					.concat(";}"),
-			)
-		UnmanagedMatch(matched):
+		ReturnTail(result):
+			Ok(append_return(body, result).concat("}"))
+		MatchTail(matched):
 			emitted ?= append_match(body, matched, unions)
 			Ok(emitted.concat("}"))
 
@@ -571,6 +535,22 @@ private pure func is_string(type_ref: TypeRef) -> Bool:
 			True
 		_:
 			False
+
+
+private pure func operations_need_strings(operations: List[OwnershipOperation]) -> Bool:
+	var needed = False
+
+	for operation in operations:
+		match operation:
+			DefineValue(definition):
+				if is_string(definition.value_type):
+					needed = True
+			AcquireOwner(_, _, _):
+				needed = True
+			DropOwner(_, _):
+				needed = True
+
+	needed
 
 
 private pure func needs_string_runtime(program: OwnershipProgram) -> Bool:
@@ -587,15 +567,16 @@ private pure func needs_string_runtime(program: OwnershipProgram) -> Bool:
 				if is_string(type_ref):
 					needed = True
 
-		for operation in function.operations:
-			match operation:
-				DefineValue(definition):
-					if is_string(definition.value_type):
+		if operations_need_strings(function.operations):
+			needed = True
+
+		match function.tail:
+			ReturnTail(_):
+				void
+			MatchTail(matched):
+				for arm in matched.arms:
+					if operations_need_strings(arm.operations):
 						needed = True
-				AcquireOwner(_, _, _):
-					needed = True
-				DropOwner(_, _):
-					needed = True
 
 	needed
 

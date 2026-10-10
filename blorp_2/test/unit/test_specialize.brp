@@ -1,0 +1,317 @@
+import:
+	../../src/check as Checked
+	../../src/lex: lex
+	../../src/specialize:
+		CallTarget(UserFunction, RuntimeFunction),
+		ConcreteAssignment(InitializeBinding, ReassignBinding),
+		ConcreteBody(ConcreteValueBody, ConcreteMatchBody),
+		ConcreteFunction,
+		ConcreteOperation(InvokeFunction),
+		ConcreteValue,
+		ParameterShape(OneParameter),
+		SpecializedContents,
+		TypeRef(IntType, StringType, UnionType),
+		function_number,
+		same_type,
+		specialize,
+		specialized_contents,
+	../../src/syntax: Diagnostic
+	input: parse
+	test: TestSuite
+
+
+private IDENTITY: String = "pure func identity[T](value: T) -> T:\n\tvalue\n"
+
+
+private pure func program(source: String) -> Result[SpecializedContents, Diagnostic]:
+	lexed ?= lex(source)
+	parsed ?= parse(lexed)
+	checked ?= Checked.check(parsed)
+	concrete ?= specialize(checked)
+	Ok(specialized_contents(concrete))
+
+
+private pure func fixture(source: String) -> Result[List[ConcreteFunction], Diagnostic]:
+	program(source).map(pure func(contents): contents.functions)
+
+
+private pure func target(value: ConcreteValue) -> Option[Int]:
+	match value.operations:
+		[step]:
+			match step.operation:
+				InvokeFunction(call):
+					match call.target:
+						UserFunction(id):
+							Some(function_number(id))
+						RuntimeFunction(_):
+							None
+				_:
+					None
+		_:
+			None
+
+
+private pure func body_target(function: ConcreteFunction) -> Option[Int]:
+	match function.body:
+		ConcreteValueBody(value):
+			target(value)
+		_:
+			None
+
+
+private pure func repeated_target(value: ConcreteValue, expected: Int) -> Bool:
+	match value.operations:
+		[first, second]:
+			(
+				target({ value | operations = [first] }) == Some(expected)
+				and target({ value | operations = [second] }) == Some(expected)
+			)
+		_:
+			False
+
+
+pure func test_direct_and_ufcs_reuse_one_instance() -> Bool:
+	match fixture(
+		IDENTITY + "func main() -> Int:\n\tfirst = identity(7)\n\tsecond = 8.identity()\n\tidentity(9)\n",
+	):
+		Ok([main, identity]):
+			match main.assignments:
+				[InitializeBinding(_, first), InitializeBinding(_, second)]:
+					(
+						target(first) == Some(1)
+						and target(second) == Some(1)
+						and body_target(main) == Some(1)
+						and same_type(identity.signature.return_type, IntType)
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_argument_types_create_distinct_complete_instances() -> Bool:
+	match fixture(
+		IDENTITY + "func main() -> Int:\n\tinteger = identity(7)\n\ttext = integer.to_string().identity()\n\tidentity(text).length()\n",
+	):
+		Ok([_, integer, text]):
+			match integer.signature.parameters:
+				OneParameter(integer_type):
+					match text.signature.parameters:
+						OneParameter(text_type):
+							(
+								same_type(integer_type, IntType)
+								and same_type(integer.signature.return_type, IntType)
+								and same_type(text_type, StringType)
+								and same_type(text.signature.return_type, StringType)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_forwarded_symbolic_call_is_remapped_to_concrete_callee() -> Bool:
+	match fixture(
+		IDENTITY + "pure func forward[Element](value: Element) -> Element:\n\tidentity(value)\nfunc main() -> Int:\n\tforward(42)\n",
+	):
+		Ok([main, forward, identity]):
+			(
+				body_target(main) == Some(1)
+				and body_target(forward) == Some(2)
+				and same_type(forward.signature.return_type, IntType)
+				and same_type(identity.signature.return_type, IntType)
+			)
+		_:
+			False
+
+
+pure func test_declarations_with_same_parameter_spelling_stay_distinct() -> Bool:
+	match fixture(
+		IDENTITY + "pure func other[T](value: T) -> T:\n\tvalue\nfunc main() -> Int:\n\tfirst = identity(7)\n\tother(9)\n",
+	):
+		Ok([main, _, _]):
+			match main.assignments:
+				[InitializeBinding(_, first)]:
+					target(first) == Some(1) and body_target(main) == Some(2)
+				_:
+					False
+		_:
+			False
+
+
+private pure func binding_types(function: ConcreteFunction, expected: TypeRef) -> Bool:
+	var valid = function.bindings.length() == 3
+
+	for binding in function.bindings:
+		valid = valid and same_type(binding.value_type, expected)
+
+	match function.assignments:
+		[InitializeBinding(_, first), InitializeBinding(_, second), ReassignBinding(_, replacement)]:
+			(
+				valid
+				and same_type(first.base_type, expected)
+				and same_type(second.base_type, expected)
+				and same_type(replacement.base_type, expected)
+			)
+		_:
+			False
+
+
+pure func test_bindings_and_reassignments_are_substituted_per_instance() -> Bool:
+	match fixture(
+		"pure func preserve[T](value: T) -> T:\n\tvar current = value\n\toriginal = current\n\tcurrent = value\n\toriginal\nfunc main() -> Int:\n\tinteger = preserve(7)\n\ttext = preserve(integer.to_string())\n\ttext.length()\n",
+	):
+		Ok([_, integer, text]):
+			binding_types(integer, IntType) and binding_types(text, StringType)
+		_:
+			False
+
+
+pure func test_nominal_union_arguments_do_not_merge() -> Bool:
+	match fixture(
+		"fixed union First:\n\tOnly\nfixed union Second:\n\tOnly\npure func first() -> First:\n\tOnly\npure func second() -> Second:\n\tOnly\n" + IDENTITY + "func main() -> Int:\n\ta = identity(first())\n\tb = identity(second())\n\t0\n",
+	):
+		Ok([_, _, _, first, second]):
+			match first.signature.return_type:
+				UnionType(_):
+					match second.signature.return_type:
+						UnionType(_):
+							not same_type(first.signature.return_type, second.signature.return_type)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_unused_ordinary_functions_remain_and_generic_declarations_do_not_emit() -> Bool:
+	match fixture(IDENTITY + "pure func unused() -> Int:\n\t7\nfunc main() -> Int:\n\t0\n"):
+		Ok([unused, main]):
+			(
+				same_type(unused.signature.return_type, IntType)
+				and same_type(main.signature.return_type, IntType)
+			)
+		_:
+			False
+
+
+pure func test_entrypoint_maps_after_unused_ordinary_root() -> Bool:
+	match program(IDENTITY + "pure func unused() -> Int:\n\t7\nfunc main() -> Int:\n\t0\n"):
+		Ok(contents):
+			function_number(contents.entrypoint) == 1
+		_:
+			False
+
+
+pure func test_rigid_return_types_translate_in_every_match_arm() -> Bool:
+	match fixture(
+		"fixed union Flag:\n\tOff\n\tOn\npure func flag() -> Flag:\n\tOn\npure func choose[T](value: T) -> T:\n\tmatch flag():\n\t\tOff: value\n\t\tOn: value\nfunc main() -> Int:\n\tchoose(7)\n",
+	):
+		Ok([_, _, choose]):
+			match choose.body:
+				ConcreteMatchBody(matched):
+					match matched.arms:
+						[first, second]:
+							(
+								same_type(first.body.base_type, IntType)
+								and same_type(second.body.base_type, IntType)
+								and same_type(choose.signature.return_type, IntType)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_match_scrutinee_assignments_and_results_discover_generic_instances() -> Bool:
+	match fixture(
+		"fixed union Flag:\n\tOff\n\tOn\npure func flag() -> Flag:\n\tOn\n" + IDENTITY + "pure func save[T](value: T) -> T:\n\tvalue\npure func choose[T](value: T) -> T:\n\tmatch identity(flag()):\n\t\tOff:\n\t\t\tsaved = save(value)\n\t\t\tsaved\n\t\tOn: value.identity().identity()\nfunc main() -> Int:\n\tchoose(7)\n",
+	):
+		Ok([flag, main, choose, flag_identity, save, int_identity]):
+			match choose.body:
+				ConcreteMatchBody(matched):
+					match matched.arms:
+						[first, second]:
+							match first.assignments:
+								[InitializeBinding(_, saved)]:
+									match choose.bindings:
+										[parameter, saved_binding]:
+											(
+												body_target(main) == Some(2)
+												and target(matched.scrutinee) == Some(3)
+												and target(saved) == Some(4)
+												and repeated_target(second.body, 5)
+												and same_type(
+													flag_identity.signature.return_type,
+													flag.signature.return_type,
+												)
+												and same_type(
+													matched.scrutinee.base_type,
+													flag.signature.return_type,
+												)
+												and same_type(
+													int_identity.signature.return_type,
+													IntType,
+												)
+												and same_type(parameter.value_type, IntType)
+												and same_type(save.signature.return_type, IntType)
+												and same_type(saved_binding.value_type, IntType)
+												and same_type(saved.base_type, IntType)
+												and same_type(first.body.base_type, IntType)
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 specialization",
+	tests = [
+		("direct and UFCS reuse one instance", test_direct_and_ufcs_reuse_one_instance),
+		(
+			"argument types create complete distinct instances",
+			test_argument_types_create_distinct_complete_instances,
+		),
+		(
+			"forwarded symbolic call maps to concrete callee",
+			test_forwarded_symbolic_call_is_remapped_to_concrete_callee,
+		),
+		(
+			"declarations with same parameter spelling stay distinct",
+			test_declarations_with_same_parameter_spelling_stay_distinct,
+		),
+		(
+			"binding and reassignment types substitute per instance",
+			test_bindings_and_reassignments_are_substituted_per_instance,
+		),
+		("nominal union arguments do not merge", test_nominal_union_arguments_do_not_merge),
+		(
+			"ordinary unused roots remain and generic declarations do not emit",
+			test_unused_ordinary_functions_remain_and_generic_declarations_do_not_emit,
+		),
+		(
+			"entrypoint maps after unused ordinary root",
+			test_entrypoint_maps_after_unused_ordinary_root,
+		),
+		(
+			"rigid return types translate in every match arm",
+			test_rigid_return_types_translate_in_every_match_arm,
+		),
+		(
+			"match scrutinee, assignments and results discover generic instances",
+			test_match_scrutinee_assignments_and_results_discover_generic_instances,
+		),
+	]
+}

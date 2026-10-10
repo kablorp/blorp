@@ -206,6 +206,30 @@ returns a borrowed parameter as an owned result before replacing the caller's
 old owner. Other fixtures cover unused results, a surviving alias, and Int64
 conversion boundaries. These operations use ARC; they introduce no COW or reuse.
 
+The [tail String example](test/e2e/fixtures/match_string_second.brp) returns a
+fresh String from its selected arm:
+
+```blorp
+fixed union Choice:
+    First
+    Second
+pure func choose(choice: Choice) -> String:
+    match choice:
+        First: 7.to_string()
+        Second: 42.to_string()
+func main() -> Int:
+    choose(Second).length()
+```
+
+It returns 2; the [First companion](test/e2e/fixtures/match_string_first.brp)
+returns 1. Conversion stays inside the selected case, which transfers its
+owner to the caller. The caller borrows the result for length and then drops
+its owner. Arm-local bindings, aliases and reassignment follow the same value
+rules as straight-line code; [the cleanup companion](test/e2e/fixtures/match_string_cleanup.brp)
+returns its original alias after replacing a local and dropping unused Strings.
+The function's parameters and prefix before the match must remain unmanaged.
+Managed outer dependencies, nested/non-tail matches and joins are deferred.
+
 From the repository root:
 
 ```sh
@@ -290,7 +314,9 @@ measures 623 allocations, including 424 for prelude processing and 33 for owners
 insertion/verification in a phase-prefix probe. All 43 frozen prior fixtures emit
 identical C; the final matched instruction sample grows by at most 13.00%. See the
 [managed String record](../benchmarks/results/blorp_2_managed_strings_2026-10-09.md)
-for the current comparison and limitations, and the
+for the straight-line comparison and limitations, the
+[tail String record](../benchmarks/results/blorp_2_tail_strings_2026-10-09.md)
+for branch ownership costs and unchanged C, and the
 [binding increment record](../benchmarks/results/blorp_2_bindings_2026-10-09.md)
 for matched workloads, provenance, samples and validation.
 
@@ -324,11 +350,66 @@ ceilings. The native purity example exited 1 with empty stdout and stderr.
 Neither final run rebuilt the shared compiler binaries. The cost record retains
 the earlier measurements and final validation provenance.
 
+## Generic function example
+
+[`generic_identity.brp`](test/e2e/fixtures/generic_identity.brp) uses one
+declaration with both unmanaged Int and managed String arguments:
+
+```blorp
+pure func identity[T](value: T) -> T:
+    value
+func main() -> Int:
+    integer = identity(7)
+    text = integer.to_string().identity()
+    identity(text).length()
+```
+
+Its real `main` exits 1 with empty output. The Int instance returns directly;
+the String instance borrows its parameter and acquires an owned return before
+the caller releases the earlier String obligation.
+[`generic_forward_string.brp`](test/e2e/fixtures/generic_forward_string.brp)
+forwards through a second generic declaration and preserves the saved result
+when its caller replaces the original String binding.
+
+## Generic union example
+
+[`generic_box.brp`](test/e2e/fixtures/generic_box.brp) wraps and matches an Int:
+
+```blorp
+fixed union Box[T]:
+    Box(T)
+pure func box[T](value: T) -> Box[T]:
+    Box(value)
+pure func unbox[T](value: Box[T]) -> T:
+    match value:
+        Box(payload):
+            payload
+func main() -> Int:
+    unbox(box(7))
+```
+
+Its real `main` exits 7 with empty output. The union and each function own
+separate rigid parameters. Specialization translates constructor and pattern
+identities, payload bindings and calls together. Generic functions can also
+receive concrete union values, including through direct calls and UFCS.
+
+Written annotations admit one atomic argument, such as `Box[Int]` or `Box[T]`;
+nested written `Box[Box[Int]]` is unsupported. Semantic calls can produce a
+nested type, but `box(box(7))` fails when its outer payload specializes to a
+union. Concrete payloads must be Int. Unsupported payload diagnostics point
+to the written application or initiating call and note the payload declaration.
+A phantom `Marker[String]` with no parameter payload remains valid, as does
+`Tagged[String]` whose field is explicitly Int. Equal layouts retain distinct
+nominal instance identities.
+
+
 ## Grammar for this increment
 
 This specification defines only the examples' language: functions with explicit
-return types and zero or one explicitly typed parameter, and fixed union
-declarations whose variants have zero fields or one `Int` field. A function
+return types, zero or one explicitly typed parameter, an optional single type
+parameter on functions and fixed unions. Union variants have zero fields or
+one field annotated `Int` or the union's own parameter; concrete fields
+specialize to Int. A function
 body has zero or more binding lines followed by a single expression or a tail
 match with inline arm results or binding blocks. Expressions
 start with a signed Int64 literal, a binding or variant name, or an application
@@ -377,12 +458,18 @@ Lexical and layout rules:
 - `func`, `pure`, `match`, `var`, and lone `_` are reserved. The optional `pure` qualifier precedes `func`
   with spaces between the two keywords. Function, parameter and type names are
   identifiers whose meaning is checked after parsing.
+- A function may declare one type parameter, as in
+  `pure func identity[T](value: T) -> T:`. Its name starts with a capital ASCII
+  letter and contains only ASCII letters and digits. Multiple type parameters
+  and explicit function type arguments at calls are unsupported.
 - `fixed union Type:` introduces one or more variants on indented
   lines. `fixed` and `union` are contextual header words and remain valid names
   elsewhere. A variant is bare or has one type-name annotation, as in
-  `Number(Int)`. Parsing preserves that type name; checking requires `Int`.
-  Empty declaration parentheses, multiple fields and generic type parameters
-  are unsupported.
+  `Number(Int)` or `Box(T)`. A union may declare one parameter with
+  `fixed union Box[T]:`; payload annotations are `Int` or its own parameter.
+  Function parameter and return annotations accept one atomic application,
+  such as `Box[Int]` or `Box[T]`. Empty declaration parentheses, multiple fields
+  and nested written applications are unsupported.
 - `match expression:` starts a nonempty sequence of depth-two arms written
   `Pattern: expression` or `Pattern:` followed by a depth-three block of
   binding lines and a mandatory final expression. A pattern is a bare name,
@@ -411,7 +498,8 @@ Semantic rules:
 - Exactly one function must be named `main`, and it takes no parameters. A helper
   takes zero or one explicitly typed parameter. Helper parameter and return types
   are `Int`, the signed 64-bit integer type, `String`, or a fixed union declared in this
-  file. `main` must return `Int`.
+  file, including an application of a generic union, or the function's declared
+  rigid parameter. `main` must return `Int`.
 - Union types have nominal identity. Equal variant positions or shared variant
   spellings do not make two unions interchangeable. Union type names must be
   unique and cannot redeclare the prelude's `Int` or `String`; each union's variant names must be unique.
@@ -480,7 +568,24 @@ Semantic rules:
   recursion produce a semantic diagnostic. Repeating an acyclic call, such as
   `identity(identity(1))`, is valid. General recursion and its resource rules are
   future work.
-- Each source function has its checked C return type and a generated symbol based
+- Generic declarations are checked once with a rigid type parameter, including
+  unused bodies. An arbitrary `T` cannot return an Int literal or call a
+  concrete Int/String runtime operation. Parameters cannot share a name with
+  `Int`, `String`, or any declared union; separate declarations may reuse `T`.
+  `main` and runtime prelude functions cannot declare type parameters.
+  Direct and UFCS calls infer the parameter from their synthesized sole argument.
+  Generic forwarding preserves the caller's rigid parameter until specialization.
+  Expected return types never infer a generic substitution: `identity(First)`
+  and `identity(Number(7))` reject even in a union-returning body. Pass an
+  already-typed union value or call a concrete helper instead. A concrete
+  nongeneric parameter still contextualizes constructors. Phantom parameters
+  and zero-argument generic calls diagnose uninferable parameters; no default
+  type is chosen. A parameter in a union argument, as in `unbox(Box[T])`,
+  is inferred structurally from the complete synthesized argument type.
+  Union instances are keyed by declaration and concrete argument; repeated
+  direct/UFCS requests reuse the same instance. Layout admission rejects
+  non-Int payloads before lowering, with application/request and payload spans.
+- Each concrete function has its checked C return type and a generated symbol based
   on its compilation-local identity. `Int` uses `int64_t`; each union uses its own
   synthetic enum when all its variants are nullary. A payload-bearing union
   uses a distinct struct with an enum tag and one `int64_t` payload slot;
@@ -492,13 +597,15 @@ Semantic rules:
   Both direct calls and UFCS work. Parameters borrow for the duration of a
   synchronous call; String results transfer an owner to the caller, including
   results that alias a borrowed parameter. Unused mortal results are released.
-  String computations currently require straight-line function bodies: a function
-  with a tail match cannot have String parameters, results or computed values.
-  String literals, String union payloads, COW and managed matches are deferred.
+  A tail-match arm may create, borrow, alias and return fresh arm-local Strings;
+  unused and intermediate owners are dropped on that arm, and a String result
+  transfers its owner. The function's parameters and binding/scrutinee prefix
+  must remain unmanaged. String literals, String union payloads, managed outer
+  dependencies, COW and joins are deferred.
 - Multiple parameters or arguments, explicit UFCS arguments, parenthesized expressions,
   multiple or non-Int payload fields, nested matches,
   guards, qualified/nested/literal patterns, constructor UFCS, multiline chains,
-  non-tail matches, generics, and function
+  non-tail matches, multiple type parameters, and function
   values are outside this increment. `Bool` has no special treatment: a written
   `fixed union Bool` follows the ordinary union path, and an undeclared `Bool` is unknown.
   Imports and UFCS-only import visibility are deferred; every function in this
@@ -552,8 +659,24 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    semantic origin alone does not determine scope membership.
    Constructors retain their owning union and variant identities. Checking
    publishes an opaque program with its entrypoint identity. Call notation is erased
-   after target resolution; lowering receives the same checked calls for both forms.
-4. Pure lowering publishes a sealed program of ordered value definitions and
+   after target resolution. A user call carries its checked substitution in its
+   target variant; a runtime call cannot carry one. Rigid type parameters have
+   explicit function-declaration or union-declaration owners.
+4. Pure specialization expands instances from every ordinary function, preserving
+   unused ordinary functions and unions. Generic declarations emit only when
+   requested by those roots or another instance. One local instance list reuses
+   equal declaration/type keys and distinguishes nominal union arguments. It
+   translates complete signatures, bindings, values, calls, variants and matches
+   without checking bodies or resolving names again, then seals a
+   `SpecializedProgram`. Concrete types cannot contain type parameters; concrete
+   function, union and variant identities have separate instance domains.
+   Checked signatures retain one `TypeUse` per annotation, preserving its span.
+   Concrete signatures belong to their separate immutable phase. Union instance
+   keys preserve complete nominal arguments; checked occurrence types translate
+   declaration-owned variants to the corresponding concrete union instance.
+   Initiating call provenance is carried through generic forwarding and stays
+   outside key equality. Unsupported payloads diagnose before lowering.
+5. Pure lowering publishes a sealed program of ordered value definitions and
    distinct function-owned `ValueId`s. A local builder maps each `BindingId` to
    its current value. An alias uses the same value; reassignment updates that
    map after evaluating the right-hand side. Every computed value retains its
@@ -561,22 +684,26 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    Every arm starts with the enclosing binding map, lowers its capture and
    binding sequence, and publishes a branch-local value block. Sibling arms
    share only the function's value allocator, preserving distinct identities.
-5. Ownership insertion classifies each concrete value as having no ownership
+6. Ownership insertion classifies each concrete value as having no ownership
    or being a managed String leaf. It publishes ordered definitions, owner
    acquisitions, drops and return transfers. `OwnerId` names one obligation;
    `ValueId` still names the computed value. Borrowed operands name the owner
    they depend on, or the function's borrowed parameter. Last-use cleanup keeps
-   an argument alive until a call has established its result owner.
-6. Independent verification checks the actual operations against representation
+   an argument alive until a call has established its result owner. Tail-match
+   arms publish the same ownership operations and typed return transfers as a
+   straight-line block. Value and owner identities remain function-wide; sibling
+   arms cannot observe each other's values or obligations.
+7. Independent verification checks the actual operations against representation
    and call contracts, rejecting dead/wrong owners, invalid borrows and
    undisposed obligations. Raw ownership IR does not preserve checking's sealed
    match proof, so verification independently requires nonempty, exhaustive,
    useful arms with valid unique variants and at most one final default.
-   It also enforces the zero-argument Int entry ABI
-   and rejects managed matches in raw ownership IR. Only it can seal a
+   It also enforces the zero-argument Int entry ABI, rejects managed match
+   prefixes and checks each arm's owner discharge/transfer independently.
+   Only it can seal a
    `VerifiedProgram`; it neither repairs ownership nor uses insertion's
    liveness decisions as its oracle.
-7. Emission consumes that verified program and produces C. Computed values use
+8. Emission consumes that verified program and produces C. Computed values use
    immutable C locals; scalar reassignment requires no runtime mutable cell.
    A match uses its evaluated scrutinee once and switches on its tag. Arm-local field
    projections occur only in the selected branch; a whole-value binder reads
@@ -600,6 +727,9 @@ nominal identity assigned in declaration order. Checking retains call spans;
 variant position; neither is interchangeable with a `NameId` or `FunctionId`.
 `BindingId` identifies a function-local parameter, body local or arm binding independently
 of spelling; reusing a spelling in sibling arms creates distinct bindings.
+Specialization retains those source occurrence IDs, qualified by each concrete
+instance's complete translated binding table. Equal raw IDs across instances
+are not comparable; downstream readers never fall back to the checked table.
 `ValueId` identifies a lowered computed value within its function, separately
 from the source binding that currently refers to it. Emission uses resolved
 identities and typed operations. Integer and
@@ -683,8 +813,8 @@ clean. Existing compiler internals are not pilot dependencies.
 
 The compilation pipeline is entirely pure once its source inputs have been
 loaded. `compile(CompilationInputs{prelude, program})` composes pure lexing,
-parsing, checking, ordered-value lowering, ownership insertion, independent
-verification and C emission;
+parsing, checking, specialization, ordered-value lowering, ownership insertion,
+independent verification and C emission;
 diagnostic rendering is pure too. Local builders and `var` are allowed within
 pure functions. The surrounding shell owns reading and writing files, printing,
 process execution and timing. Future import loading must supply a complete source

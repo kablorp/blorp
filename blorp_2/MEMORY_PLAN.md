@@ -1,6 +1,6 @@
 # Memory architecture
 
-Status: scalar bindings, match-arm blocks and straight-line managed Strings
+Status: scalar bindings, match-arm blocks and arm-local managed Strings
 implemented and validated with unit, grammar, native and sanitizer checks,
 2026-10-09. Granular compiler-stage tests and direct C runtime tests are
 implemented; production event tracing is deferred. Broader
@@ -49,7 +49,8 @@ contracts and observable outputs.
 | Owner | Complete inputs | Published output and guarantee |
 | --- | --- | --- |
 | Checking | Parsed bodies, scope and accepted semantic types | Typed bindings, reads, assignments and exact calls; rejects reassignment of immutable bindings and invalid scope/type/purity |
-| Value/control-flow lowering | Checked bodies and evaluation order | Ordered value definitions and explicit control flow; source rebinding becomes new value versions |
+| Specialization | Checked declarations and typed call substitutions | Complete concrete instances and instance identities; no unresolved type parameters reach lowering |
+| Value/control-flow lowering | Specialized bodies and evaluation order | Ordered value definitions and explicit control flow; source rebinding becomes new value versions |
 | Representation | Concrete semantic types and explicit storage contexts | Layout and child-ownership plans; every admitted value/slot has defined construction, copy, projection and destruction behavior |
 | Call ABI | Exact callable identities, runtime-operation contracts and supported bodies | Argument transfer/borrow and result ownership contracts; callers and callees agree, without name heuristics |
 | Ownership insertion | Lowered function, layout/call facts, use/liveness and alias dependencies | Explicit creation, duplication, transfer and drop operations on exact values and edges |
@@ -62,8 +63,11 @@ output again after an ownership-changing rewrite. Initially, accepting a
 managed program requires full verification of the supported subset; unsupported
 shapes are internal rejection, not an unchecked emission path.
 
-When generics arrive, specialization must supply the concrete types and callable
-identities before representation-sensitive work. An unsolved semantic type is
+Generic function and union specialization supplies concrete types, callable
+identities and nominal union instance layouts before representation-sensitive
+work. Concrete union payloads are absent or Int; a non-Int substitution is
+rejected with application/request and payload-declaration provenance. Phantom
+String arguments do not introduce managed children. An unsolved semantic type is
 not a layout decision.
 
 The emitter must not invent managed owners or cleanup. Materialize ordered
@@ -76,6 +80,8 @@ them and invalidate the previous verification result.
 
 - `BindingId` belongs to a source function and identifies a lexical binding,
   even when another binding uses the same spelling. Mutability is checked here.
+  In a concrete instance it is qualified by that instance's complete translated
+  binding table; readers never consult the checked declaration as a fallback.
 - `ValueId` identifies one computed value in one lowered function.
   Reassigning a source variable changes its current value mapping, not that
   value's identity. Two source bindings may refer to the same `ValueId`.
@@ -151,9 +157,12 @@ reads those actual operations before emission can receive the program.
 Initially String has one managed leaf representation and no owned children.
 Parameters borrow and results return owned; owned results may alias arguments.
 Straight-line aliases and rebinding are supported by value liveness, including
-acquisition before releasing an aliased call argument. Existing unmanaged tail
-matches remain supported. Functions combining managed values with a tail match
-are rejected until branch ownership is implemented and verified.
+acquisition before releasing an aliased call argument. Tail matches now support fresh arm-local Strings through the same inserted
+operations and return-transfer product. Each arm independently drops unused and
+intermediate owners or transfers the selected result. Function-wide value and
+owner ordinals do not make sibling facts visible. Parameters and the prefix
+before a match must remain unmanaged; outer managed dependencies and joins are
+still rejected/deferred.
 
 Before editing, the baseline was frozen at `49d480ea5`: 4,651 production lines
 and 43 existing valid fixtures. The implementation ceiling is 8,000 production
@@ -326,7 +335,7 @@ both producer and oracle agree. ASan/UBSan/leak checks supplement these tests.
 
 ## Phase-level test contract
 
-Status: the straight-line String slice has direct representation, ABI, use,
+Status: the straight-line and arm-local String slices have direct representation, ABI, use,
 ownership-insertion, verification and emission tests, plus direct C runtime
 tests without production tracing. The matrix also contains requirements for future
 features, including managed aggregates, branches, COW and reuse. Add those
@@ -405,10 +414,10 @@ The current stage tests exercise the following concrete cases independently:
 | Boundary | Cases and owning tests |
 | --- | --- |
 | Value lowering | Managed self-assignment creates no value; chained aliases share the original computed value. [test_lower.brp](test/unit/test_lower.brp) stops at lowering. |
-| Last-use analysis | Unused definitions remain unmarked; returns extend liveness through the tail; zero-argument calls add no operand use; malformed definition, argument and return identities have exact diagnostics. [test_own.brp](test/unit/test_own.brp) supplies definitions directly. |
-| Ownership insertion | Independent owners drop at their separate final uses; unused owners drop while a different owner transfers; repeated borrows require no acquisition. [test_own.brp](test/unit/test_own.brp) asserts complete operation sequences and dependencies. |
-| Independent verification | Acquired ownership survives the original owner's discharge and can transfer; independent owners may discharge in either legal order; acquisition from another value's owner rejects at that operation. Raw unmanaged matches independently require nonempty, exhaustive, useful arms and valid unique labels, including at most one final default. [test_verify.brp](test/unit/test_verify.brp) supplies raw ownership operations. |
-| C emission | Acquisition/drop/transfer order; exact independent-owner release operands; unused-result cleanup; repeated borrows without extra ARC; owned call result before argument cleanup. [test_emit.brp](test/unit/test_emit.brp) compares complete small ownership bodies. |
+| Last-use analysis | Branch-local positions retain functionwide ValueIds; unmanaged prefix references are visible and sibling values are rejected. Unused definitions remain unmarked; returns extend liveness through the tail; zero-argument calls add no operand use; malformed definition, argument and return identities have exact diagnostics. [test_own.brp](test/unit/test_own.brp) supplies definitions directly. |
+| Ownership insertion | Each arm drops unused owners and transfers its result with a distinct functionwide owner ordinal. Independent owners drop at their separate final uses; unused owners drop while a different owner transfers; repeated borrows require no acquisition. [test_own.brp](test/unit/test_own.brp) asserts complete operation sequences and dependencies. |
+| Independent verification | Arm-local transfers are checked independently; missing transfer, leaks, double drops, dead borrows and sibling value/owner escape or ordinal reuse reject. Acquired ownership survives the original owner's discharge and can transfer; independent owners may discharge in either legal order; acquisition from another value's owner rejects at that operation. Raw matches independently require nonempty, exhaustive, useful arms and valid unique labels, including at most one final default. [test_verify.brp](test/unit/test_verify.brp) supplies raw ownership operations. |
+| C emission | Exact raw match bodies allocate/transfer inside cases and release the returned caller owner; arm-only Strings still select the runtime. Acquisition/drop/transfer order; exact independent-owner release operands; unused-result cleanup; repeated borrows without extra ARC; owned call result before argument cleanup. [test_emit.brp](test/unit/test_emit.brp) compares complete small ownership bodies. |
 | String runtime | Exact decimal bytes/length for zero, negative and both Int64 extrema; initial count; retain; usable storage after nonfinal release; exactly one final free; independent object lifetimes. [test_string_runtime.brp](test/runtime/test_string_runtime.brp) runs the retained C cases against the emitted runtime fragment. |
 
 The tests distinguish their authorities: minimal preparation obtains sealed
@@ -430,7 +439,7 @@ reports are retained under `build/memory-tests-evidence/`.
 ## Boundaries awaiting implementation
 
 The current public products support granular tests for checking, value lowering,
-straight-line uses/ownership, independent verification and C emission. Sealed
+straight-line and arm-local uses/ownership, independent verification and C emission. Sealed
 products may require minimal preparation through their authority; that does
 not require running later compiler stages. Runtime String primitives are also
 ready for direct C tests. Unsupported managed shapes retain rejection tests.
@@ -441,7 +450,7 @@ do not add empty suites or speculative passes now.
 
 | Boundary not yet implemented | First required tests |
 | --- | --- |
-| Managed matches and joins | Only the selected branch runs; each edge transfers/discharges its owners; a borrowed result keeps its source owner alive. |
+| Managed outer dependencies and joins | Only the selected branch runs; each edge transfers/discharges its owners; a borrowed outer result keeps its source owner alive. Fresh arm-local String tails are implemented. |
 | Managed fields and union payloads | Complete field plans; only active variant children are destroyed; nonfinal release preserves children; final release destroys each child exactly once. |
 | Recursive managed values | Bounded-stack destruction of a moderately deep value; every node destroyed once. Establish the destruction strategy before admitting recursion. |
 | COW and reuse | Shared updates preserve surviving aliases; unique updates use the intended path; incompatible capacity/layout falls back safely. Add with the first update/reuse operation. |
