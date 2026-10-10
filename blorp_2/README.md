@@ -7,7 +7,7 @@ build itself.
 
 ## First example
 
-[`test/e2e/fixtures/return_zero.brp`](test/e2e/fixtures/return_zero.brp):
+[`test/e2e/fixtures/return/zero.brp`](test/e2e/fixtures/return/zero.brp):
 
 ```blorp
 func main() -> Int:
@@ -18,7 +18,7 @@ The executable returns exit status 0 with empty stdout and stderr. This first
 example needs no imports, builtin functions, or target runtime.
 The next example adds a call to a zero-argument function:
 
-[`test/e2e/fixtures/call_one.brp`](test/e2e/fixtures/call_one.brp):
+[`test/e2e/fixtures/call/one.brp`](test/e2e/fixtures/call/one.brp):
 
 ```blorp
 func main() -> Int:
@@ -30,7 +30,7 @@ func one() -> Int:
 The executable returns exit status 1 with empty stdout and stderr. A helper
 may appear before or after its caller. Imports and printing are future increments.
 
-The third example, [`test/e2e/fixtures/pure_calls.brp`](test/e2e/fixtures/pure_calls.brp),
+The third example, [`test/e2e/fixtures/pure/calls.brp`](test/e2e/fixtures/pure/calls.brp),
 adds declared purity:
 
 ```blorp
@@ -47,7 +47,7 @@ and may call either kind. Purity is declared and checked, not inferred from a
 literal body. A pure `main` is also accepted with the same C entrypoint ABI.
 This example exits 1 with empty stdout and stderr.
 
-The fourth example, [`test/e2e/fixtures/nested_calls.brp`](test/e2e/fixtures/nested_calls.brp),
+The fourth example, [`test/e2e/fixtures/nested/calls.brp`](test/e2e/fixtures/nested/calls.brp),
 adds one explicitly typed parameter and a nested call:
 
 ```blorp
@@ -60,15 +60,15 @@ func main() -> Int:
 ```
 
 It exits 1 with empty stdout and stderr. Helpers may take any number of typed runtime parameters; `main` takes none. A call may pass one complete expression, including
-another call. The companion [`nested_order.brp`](test/e2e/fixtures/nested_order.brp)
+another call. The companion [`nested/order.brp`](test/e2e/fixtures/nested/order.brp)
 returns `zero(one(1))`, with both helpers ignoring their parameter. Its exit status
 0 and exact generated C distinguish the order of the two calls.
 
-The UFCS example, [`ufcs_calls.brp`](test/e2e/fixtures/ufcs_calls.brp), calls the
+The UFCS example, [`ufcs/calls.brp`](test/e2e/fixtures/ufcs/calls.brp), calls the
 same helpers with `one().identity()`. This is equivalent to `identity(one())`
 and exits 1. A receiver supplies the first argument; explicit arguments in the method's
 parentheses follow it. The companion
-[`ufcs_chain.brp`](test/e2e/fixtures/ufcs_chain.brp) demonstrates chaining:
+[`ufcs/chain.brp`](test/e2e/fixtures/ufcs/chain.brp) demonstrates chaining:
 
 ```blorp
 pure func one(value: Int) -> Int:
@@ -84,7 +84,7 @@ This exits 0. Chains run left to right, so the body is equivalent to
 is equivalent to `identity(zero(one(identity(1))))`. The tests specify the exact
 generated C and parsed call order for this mixed expression.
 
-The [`union_values.brp`](test/e2e/fixtures/union_values.brp) example adds
+The [`union/values.brp`](test/e2e/fixtures/union/values.brp) example adds
 payload-free fixed unions:
 
 ```blorp
@@ -105,7 +105,7 @@ fixtures select variants through their ordinary `main` functions and match
 the results to observable exit statuses. The host TestSuite orchestrates pilot
 compilation, builds the unmodified C output and checks each executable.
 
-The match example, [`match_value.brp`](test/e2e/fixtures/match_value.brp), adds
+The match example, [`match/value.brp`](test/e2e/fixtures/match/value.brp), adds
 an optional `Int` field and a match as the complete function body:
 
 ```blorp
@@ -126,14 +126,14 @@ discards the field, and a whole-pattern `_` matches any remaining value.
 An unshadowed bare variant pattern selects that variant; another bare name
 binds the complete matched value. Matches require exhaustive, useful arms.
 The scrutinee runs once and only the first matching arm's result runs.
-The companion [`match_values.brp`](test/e2e/fixtures/match_values.brp) covers
+The companion [`match/values.brp`](test/e2e/fixtures/match/values.brp) covers
 whole-value capture and field preservation; the separate
-[`match_shadow.brp`](test/e2e/fixtures/match_shadow.brp) covers shadowing. Small
+[`match/shadow.brp`](test/e2e/fixtures/match/shadow.brp) covers shadowing. Small
 source fixtures expose these behaviors through `main`; exact full-width
 values and evaluation order are checked directly at phase boundaries.
 Pattern captures are immutable.
 
-The [bindings example](test/e2e/fixtures/bindings.brp) adds a prefix of local
+The [bindings example](test/e2e/fixtures/binding/basic.brp) adds a prefix of local
 bindings before the final expression or tail match:
 
 ```blorp
@@ -152,13 +152,13 @@ This exits 1. `original` is immutable; `current` is mutable, and reassignment
 does not change the earlier value. Local mutation is permitted in pure
 functions. Every initializer runs once in source order, including unused
 bindings. The [binding design](BINDINGS_PLAN.md) defines the phase contracts;
-the [companion fixture](test/e2e/fixtures/binding_values.brp) instead returns
+the [companion fixture](test/e2e/fixtures/binding/values.brp) instead returns
 the reassigned current value, 42. Separate small fixtures cover self-assignment,
 parameter shadowing and union values. Phase tests check exact full-width values
 and evaluation order.
 
 Bindings also compose with match arms. The
-[arm-binding example](test/e2e/fixtures/match_binding_original.brp) returns 7:
+[arm-binding example](test/e2e/fixtures/match/binding_original.brp) returns 7:
 
 ```blorp
 fixed union Choice:
@@ -184,11 +184,11 @@ Each arm has its own scope; sibling arms can declare the same name. An explicit
 `var` may shadow an enclosing binding, and its initializer sees the earlier
 binding. Ordinary `=` still reassigns the nearest mutable binding or rejects
 assignment to an immutable one. Companion fixtures return the
-[updated value](test/e2e/fixtures/match_binding_current.brp), exercise the
-[other branch](test/e2e/fixtures/match_binding_empty.brp), and preserve an
-[outer value](test/e2e/fixtures/match_binding_outer.brp) across shadowing.
+[updated value](test/e2e/fixtures/match/binding_current.brp), exercise the
+[other branch](test/e2e/fixtures/match/binding_empty.brp), and preserve an
+[outer value](test/e2e/fixtures/match/binding_outer.brp) across shadowing.
 
-The [mortal String example](test/e2e/fixtures/mortal_string.brp) starts the
+The [mortal String example](test/e2e/fixtures/mortal_string/basic.brp) starts the
 managed path without literals, traits or general imports:
 
 ```blorp
@@ -200,12 +200,12 @@ func main() -> Int:
 It returns 1. The explicit temporary input prelude declares concrete pure
 `to_string(Int) -> String` and `length(String) -> Int` functions. Conversion
 allocates an immutable String leaf; length borrows it; its owner is released
-after that use. The [identity companion](test/e2e/fixtures/mortal_string_identity.brp)
+after that use. The [identity companion](test/e2e/fixtures/mortal_string/identity.brp)
 returns a borrowed parameter as an owned result before replacing the caller's
 old owner. Other fixtures cover unused results, a surviving alias, and Int64
 conversion boundaries. These operations use ARC; they introduce no COW or reuse.
 
-The [tail String example](test/e2e/fixtures/match_string_second.brp) returns a
+The [tail String example](test/e2e/fixtures/match/string_second.brp) returns a
 fresh String from its selected arm:
 
 ```blorp
@@ -220,11 +220,11 @@ func main() -> Int:
     choose(Second).length()
 ```
 
-It returns 2; the [First companion](test/e2e/fixtures/match_string_first.brp)
+It returns 2; the [First companion](test/e2e/fixtures/match/string_first.brp)
 returns 1. Conversion stays inside the selected case, which transfers its
 owner to the caller. The caller borrows the result for length and then drops
 its owner. Arm-local bindings, aliases and reassignment follow the same value
-rules as straight-line code; [the cleanup companion](test/e2e/fixtures/match_string_cleanup.brp)
+rules as straight-line code; [the cleanup companion](test/e2e/fixtures/match/string_cleanup.brp)
 returns its original alias after replacing a local and dropping unused Strings.
 The function's parameters and prefix before the match must remain unmanaged.
 Managed outer dependencies, nested/non-tail matches and joins are deferred.
@@ -262,8 +262,10 @@ Every host-compiled source module has a matching unit suite under `test/unit/`.
 The temporary target prelude is an explicit source input, not a host module.
 Integration
 and native execution suites live under `test/e2e/`; their input programs live
-under `test/e2e/fixtures/`. The suites use the existing compiler's `TestSuite`
-API and run with `bin/blorp test --suite`; the example
+under `test/e2e/fixtures/`, grouped by feature. Folders carry the shared prefix,
+as in `match/shadow.brp` and `mortal_string/identity.brp`. Base examples without
+a distinguishing suffix use `basic.brp`. The suites use the existing compiler's
+`TestSuite` API and run with `bin/blorp test --suite`; the example
 fixture is not a test entrypoint. The host test API uses tuple-based test
 registration. The compiler source under `src/` stays within the agreed subset.
 
@@ -358,7 +360,7 @@ the earlier measurements and final validation provenance.
 
 ## Generic function example
 
-[`generic_identity.brp`](test/e2e/fixtures/generic_identity.brp) uses one
+[`generic/identity.brp`](test/e2e/fixtures/generic/identity.brp) uses one
 declaration with both unmanaged Int and managed String arguments:
 
 ```blorp
@@ -373,13 +375,13 @@ func main() -> Int:
 Its real `main` exits 1 with empty output. The Int instance returns directly;
 the String instance borrows its parameter and acquires an owned return before
 the caller releases the earlier String obligation.
-[`generic_forward_string.brp`](test/e2e/fixtures/generic_forward_string.brp)
+[`generic/forward_string.brp`](test/e2e/fixtures/generic/forward_string.brp)
 forwards through a second generic declaration and preserves the saved result
 when its caller replaces the original String binding.
 
 ## Generic union example
 
-[`generic_box.brp`](test/e2e/fixtures/generic_box.brp) wraps and matches an Int:
+[`generic/box.brp`](test/e2e/fixtures/generic/box.brp) wraps and matches an Int:
 
 ```blorp
 fixed union Box[T]:
@@ -409,7 +411,7 @@ A phantom `Marker[String]` with no parameter payload remains valid, as does
 nominal instance identities.
 
 
-The [multiple-argument example](test/e2e/fixtures/generic_arguments.brp) adds
+The [multiple-argument example](test/e2e/fixtures/generic/arguments.brp) adds
 ordered runtime parameters while retaining one type parameter:
 
 ```blorp
@@ -423,9 +425,9 @@ It exits 7. `value.keep_first(other)` supplies `value` first and `other`
 second. Arguments evaluate left to right exactly once; lowering saves every
 computed argument in an immutable local before emitting a C call. A helper
 may return either borrowed String parameter as an owned result. The
-[first String fixture](test/e2e/fixtures/generic_arguments_first_string.brp)
+[first String fixture](test/e2e/fixtures/generic/arguments_first_string.brp)
 returns length 1 after replacement of the caller's old value; the
-[second String fixture](test/e2e/fixtures/generic_arguments_second_string.brp)
+[second String fixture](test/e2e/fixtures/generic/arguments_second_string.brp)
 returns length 3. Passing the same managed value twice preserves both borrows
 through the call and drops its owner once after the result owner exists.
 
@@ -803,7 +805,7 @@ It adds no indentation or internal line breaks for presentation.
 Nonnegative literals use `INT64_C`; negative literals negate a representable
 positive magnitude. The minimum uses `<stdint.h>`'s `INT64_MIN`, avoiding an
 unrepresentable positive magnitude. The new
-[`return_42.brp`](test/e2e/fixtures/return_42.brp) example exits 42. Parser and
+[`return/42.brp`](test/e2e/fixtures/return/42.brp) example exits 42. Parser and
 emitter phase tests check full-width endpoint values and their C projection.
 Native fixtures run their normal `main` functions under UBSan. These native
 exit-status checks do not prove full-width equality because the platform

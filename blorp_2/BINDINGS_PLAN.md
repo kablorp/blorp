@@ -172,7 +172,7 @@ future work with the memory plan's independent proof and runtime-test contracts.
 ## Match-arm binding extension
 
 The arm-block working example is
-[match_binding_original.brp](test/e2e/fixtures/match_binding_original.brp):
+[match/binding_original.brp](test/e2e/fixtures/match/binding_original.brp):
 the `Number(payload)` arm declares `var current = payload`, saves
 `original = current`, reassigns `current = identity(42)`, and returns
 `original`. `main` passes `Number(7)`, so the executable exits 7.

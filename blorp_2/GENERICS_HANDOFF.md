@@ -22,7 +22,7 @@ Run the pilot directly after `make -C blorp_2 test-compiler`:
 
 ```sh
 blorp_2/build/compiler blorp_2/src/prelude_temp.brp \
-  blorp_2/test/e2e/fixtures/generic_identity.brp \
+  blorp_2/test/e2e/fixtures/generic/identity.brp \
   blorp_2/build/generic_identity.c
 ```
 
