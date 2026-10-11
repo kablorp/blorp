@@ -956,12 +956,14 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    Every arm starts with the enclosing binding map, lowers its capture and
    binding sequence, and publishes a branch-local value block. Sibling arms
    share only the function's value allocator, preserving distinct identities.
-6. Ownership insertion classifies each concrete value as having no ownership
-   or being a managed String leaf. It publishes ordered definitions, owner
-   acquisitions, drops and return transfers. `OwnerId` names one obligation;
+6. Ownership insertion classifies each concrete value as having no ownership,
+   being a managed String leaf, or containing owned inline union fields.
+   It publishes ordered definitions, owner acquisitions, drops and return
+   transfers. `OwnerId` names one obligation;
    `ValueId` still names the computed value. Borrowed operands name the owner
-   they depend on, or the exact borrowed parameter value identity. Last-use cleanup keeps
-   an argument alive until a call has established its result owner. Tail-match
+   they depend on, the exact borrowed parameter value identity, or the immediate
+   parent value of a projected payload. Last-use cleanup keeps an argument alive
+   until a call has established its result owner. Tail-match
    arms publish the same ownership operations and typed return transfers as a
    straight-line block. Value and owner identities remain function-wide; sibling
    arms cannot observe each other's values or obligations.
@@ -1127,10 +1129,11 @@ needs, positive and negative tests, and independently reviewed implementation.
 Builders remain local; published results remain immutable; each semantic fact
 has one authority. Function identity is declaration-list position; checked calls
 contain resolved identities and diagnostic spans, and the checked program owns the
-entrypoint. Local topological elimination checks all base and wrapper call edges,
-including every recursive argument and binding initializer;
-no persistent graph registry is needed. Each checked function retains its validated
-signature beside its resolved body. Emission reads only validated
+entrypoint. Checking permits ordinary self and mutual recursion, and rejects
+generic recursive cycles that grow a type parameter beneath a union application.
+The dependency analysis uses checked call substitutions and is discarded before
+publication. Each checked function retains its validated signature beside its
+resolved body. Emission reads only validated
 facts and does not recheck purity or name scope. C function and parameter names are
 synthetic, and unused parameters are explicitly discarded to keep warning checks
 clean. Existing compiler internals are not pilot dependencies.

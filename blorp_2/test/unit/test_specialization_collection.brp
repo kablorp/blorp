@@ -5,6 +5,7 @@ import:
 	../../src/syntax: Diagnostic
 	../../src/text: concat
 	input: parse, setup_diagnostic
+	string: index_of
 	test: TestSuite
 
 
@@ -126,6 +127,183 @@ private pure func union_is(value: Concrete.TypeRef, expected: Int) -> Bool:
 			Concrete.union_number(id) == expected
 		_:
 			False
+
+
+private pure func binding_at(
+	binding: Concrete.ConcreteBinding,
+	source: String,
+	name: String,
+) -> Bool:
+	(
+		Some(binding.span.start) == source.index_of(name)
+		and binding.span.end == binding.span.start + name.length()
+	)
+
+
+pure func test_unused_payload_captures_keep_complete_types_and_child_first_layouts() -> Bool:
+	source: String =
+		|fixed record Point { coordinate:Int }
+		|fixed union Box[T]:
+		|    Box(T)
+		|pure func ignore_managed(value:Box[Box[String]])->Int:
+		|    match value:
+		|        Box(unused_managed): 1
+		|pure func ignore_record(value:Box[Point])->Int:
+		|    match value:
+		|        Box(unused_record): 2
+		|func main()->Int:
+		|    0
+
+	match specialize(source.concat("\n")):
+		Err(_):
+			False
+		Ok(contents):
+			match (contents.records, contents.unions, contents.functions):
+				([point], [child, parent, record_box], [managed, with_record, _]):
+					match (
+						managed.bindings,
+						with_record.bindings,
+						parent.variants,
+						record_box.variants,
+					):
+						([managed_parameter, managed_capture], [record_parameter, record_capture], [Some(nested)], [Some(Concrete.RecordType(stored_record))]):
+							match (
+								(managed_parameter.origin, managed_capture.origin),
+								(record_parameter.origin, record_capture.origin),
+								record_capture.value_type,
+								point.fields,
+							):
+								((Checked.ParameterBinding(0), Checked.MatchCapture), (Checked.ParameterBinding(0), Checked.MatchCapture), Concrete.RecordType(captured_record), [Concrete.IntType]):
+									(
+										Concrete.function_number(contents.entrypoint) == 2
+										and owning_string_payload(child)
+										and parent.representation == Concrete.InlineOwningPayload
+										and record_box.representation == Concrete.InlineUnmanaged
+										and union_is(nested, 0)
+										and union_is(managed_parameter.value_type, 1)
+										and union_is(managed_capture.value_type, 0)
+										and union_is(record_parameter.value_type, 2)
+										and Concrete.record_number(stored_record) == 0
+										and Concrete.record_number(captured_record) == 0
+										and binding_at(managed_capture, source, "unused_managed")
+										and binding_at(record_capture, source, "unused_record")
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+private pure func nested_call_is(
+	value: Concrete.ConcreteValue,
+	parent_target: Int,
+	child_target: Int,
+	parent_layout: Int,
+	child_layout: Int,
+) -> Bool:
+	match value.base:
+		Concrete.ReturnCall(parent, [child]):
+			match child.base:
+				Concrete.ReturnCall(child_call, [_]):
+					(
+						target_is(parent, parent_target)
+						and target_is(child_call, child_target)
+						and union_is(value.base_type, parent_layout)
+						and union_is(child.base_type, child_layout)
+					)
+				_:
+					False
+		_:
+			False
+
+
+private pure func inline_integer_payload(layout: Concrete.ConcreteUnion) -> Bool:
+	match (layout.representation, layout.variants):
+		(Concrete.InlineUnmanaged, [Some(Concrete.IntType)]):
+			True
+		_:
+			False
+
+
+private pure func inline_union_payload_is(layout: Concrete.ConcreteUnion, expected: Int) -> Bool:
+	match (layout.representation, layout.variants):
+		(Concrete.InlineUnmanaged, [Some(payload)]):
+			union_is(payload, expected)
+		_:
+			False
+
+
+pure func test_unused_nested_initializers_in_both_arms_keep_nominal_request_order() -> Bool:
+	source: String =
+		|fixed union Flag:
+		|    Off
+		|    On
+		|fixed union Box[T]:
+		|    Box(T)
+		|fixed union Other[T]:
+		|    Other(T)
+		|pure func flag()->Flag:
+		|    On
+		|pure func box[T](value:T)->Box[T]:
+		|    Box(value)
+		|pure func other[T](value:T)->Other[T]:
+		|    Other(value)
+		|pure func choose[T](value:T)->Int:
+		|    match flag():
+		|        Off:
+		|            unused_first = box(box(value))
+		|            1
+		|        On:
+		|            unused_second = other(other(value))
+		|            2
+		|func main()->Int:
+		|    choose(7)
+
+	match specialize(source.concat("\n")):
+		Err(_):
+			False
+		Ok(contents):
+			match (contents.unions, contents.functions):
+				([_, box_child, box_parent, other_child, other_parent], [_, _, choose, first_child, first_parent, second_child, second_parent]):
+					match (choose.bindings, choose.body):
+						([parameter, first, second], Concrete.ConcreteMatchBody(matched)):
+							match matched.arms:
+								[first_arm, second_arm]:
+									match (first_arm.assignments, second_arm.assignments):
+										([Concrete.InitializeBinding(first_id, first_value)], [Concrete.InitializeBinding(second_id, second_value)]):
+											(
+												Concrete.function_number(contents.entrypoint) == 1
+												and Concrete.same_type(
+													parameter.value_type,
+													Concrete.IntType,
+												)
+												and union_is(first.value_type, 2)
+												and union_is(second.value_type, 4)
+												and inline_integer_payload(box_child)
+												and inline_union_payload_is(box_parent, 1)
+												and inline_integer_payload(other_child)
+												and inline_union_payload_is(other_parent, 3)
+												and union_is(first_child.signature.return_type, 1)
+												and union_is(first_parent.signature.return_type, 2)
+												and union_is(second_child.signature.return_type, 3)
+												and union_is(second_parent.signature.return_type, 4)
+												and Checked.binding_number(first_id) == 1
+												and Checked.binding_number(second_id) == 2
+												and nested_call_is(first_value, 4, 3, 2, 1)
+												and nested_call_is(second_value, 6, 5, 4, 3)
+												and binding_at(first, source, "unused_first")
+												and binding_at(second, source, "unused_second")
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
 
 
 pure func test_each_match_arm_prepares_its_assignments_and_nested_dependencies() -> Bool:
@@ -389,6 +567,14 @@ tests: TestSuite = {
 		(
 			"direct children and ufcs arguments precede parent requests",
 			test_direct_children_and_ufcs_arguments_precede_their_parent_requests,
+		),
+		(
+			"unused payload captures keep complete types and child-first layouts",
+			test_unused_payload_captures_keep_complete_types_and_child_first_layouts,
+		),
+		(
+			"unused nested initializers in both arms keep nominal request order",
+			test_unused_nested_initializers_in_both_arms_keep_nominal_request_order,
 		),
 		(
 			"every match arm prepares assignments and nested dependencies",
