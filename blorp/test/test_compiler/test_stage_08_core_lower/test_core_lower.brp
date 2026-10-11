@@ -7474,6 +7474,7 @@ func test_prepared_graph_uses_module_id_for_repeated_imports() -> Bool:
 private func synthesizes_explicit_program_entrypoint(
 	module_table: ModuleTable,
 	target_module_id: ModuleId,
+	with_source_arguments: Bool,
 ) -> Option[Bool]:
 	empty = definition_index_empty(definition_index_initial_seed(ENV_EMPTY), module_table)
 	main_result ?= insert_core_test_callable(empty, module_table, target_module_id, "main")
@@ -7482,42 +7483,51 @@ private func synthesizes_explicit_program_entrypoint(
 	definitions = definition_index_definition_table(complete)
 	main_callable ?= callable_id_from_definition_table(definitions, main_raw)
 	core_frontier = definition_index_next_def_id(complete)
-	main_decl: ParsedFunctionDecl = { parsed_function_decl() |
-		name = ident("main"),
-		params = [
+	parameter_types: List[SemanticType] = if with_source_arguments:
+		[type_list(TYPE_STRING)]
+	else:
+		[]
+	call_arguments: List[TypedExpr] = if with_source_arguments:
+		[TypedNameExpr(ident("args"), expr_info(type_list(TYPE_STRING)))]
+	else:
+		[]
+	call_info = { main_resolved_call_info(main_callable) | instantiated_params = parameter_types }
+	parameters: List[ParsedParam] = if with_source_arguments:
+		[
 			{ parsed_param("args") |
 				type_expr = Some(
-					ParsedNamedType(
-						ident("List"),
-						[parsed_type_string()],
-						fixture_source_span(),
-					),
+					ParsedNamedType(ident("List"), [parsed_type_string()], fixture_source_span()),
 				)
 			},
-		],
+		]
+	else:
+		[]
+	main_decl: ParsedFunctionDecl = { parsed_function_decl() |
+		name = ident("main"),
+		params = parameters,
 		return_type = Some(parsed_type_int())
 	}
 	main_function: TypedFunctionInfo = {
 		decl = main_decl,
 		callable_id = Some(main_raw),
 		effective_type_params = [],
-		param_types = [type_list(TYPE_STRING)],
+		param_types = parameter_types,
 		source_return_type = Some(TYPE_INT),
 		semantic_return_type = TYPE_INT,
 		body = Some(
 			TypedCallExpr(
 				TypedNameExpr(
 					ident("main"),
-					{ expr_info(main_function_type()) |
-						resolved_call = Some(main_resolved_call_info(main_callable)),
+					{ expr_info(semantic_function_type(True, parameter_types, int_type())) |
+						resolved_call = Some(call_info),
 						resolved_definition_id = Some(main_raw)
 					},
 				),
-				[TypedNameExpr(ident("args"), expr_info(type_list(TYPE_STRING)))],
+				call_arguments,
 				fixture_source_span(),
 				expr_info_with_resolved(
 					TYPE_INT,
-					main_resolved_call_info(main_callable),
+					call_info,
 				),
 			),
 		)
@@ -7542,6 +7552,37 @@ private func synthesizes_explicit_program_entrypoint(
 			Ok(prepared):
 				match prepared.program.decls:
 					[FunctionDecl(user_main), FunctionDecl(entrypoint)]:
+						expected_arity = parameters.length()
+						wrapper_calls_user_main: Bool = match entrypoint.body:
+							Some(CallExpr(DeferredTraitCall(trait_name, method_name), _, [CallExpr(SelectedDirectCall(def_id), VarExpr(variable, FunctionType(_, parameter_types, _), _), arguments, _, _)], _, _)):
+								arguments_forwarded = match entrypoint.params:
+									[]:
+										arguments.length() == 0
+									[param]:
+										match arguments:
+											[VarExpr(argument, typ, _)]:
+												(
+													argument.name == param.name.name
+													and argument.id == param.name.id
+													and argument.def_id == param.name.def_id
+													and core_types_equal(typ, param.typ)
+												)
+											_:
+												False
+									_:
+										False
+
+								(
+									trait_name == "ExitStatusAble"
+									and method_name == "resolve_exit_status"
+									and def_id == main_raw
+									and variable.def_id == Some(main_raw)
+									and arguments.length() == expected_arity
+									and parameter_types.length() == expected_arity
+									and arguments_forwarded
+								)
+							_:
+								False
 						user_main_calls_renamed_main: Bool = match user_main.body:
 							Some(CallExpr(SelectedDirectCall(def_id), VarExpr(variable, _, _), _, _, _)):
 								(
@@ -7565,6 +7606,9 @@ private func synthesizes_explicit_program_entrypoint(
 							and is_program_entrypoint_function_kind(entrypoint.function_kind)
 							and origin_is_entrypoint(entrypoint.origin, ProgramWrapperEntrypoint)
 							and user_main_calls_renamed_main
+							and user_main.params.length() == expected_arity
+							and entrypoint.params.length() == expected_arity
+							and wrapper_calls_user_main
 						)
 					_:
 						False
@@ -7647,7 +7691,15 @@ func test_module_member_prefix_spells_the_member_name_authority() -> Bool:
 func test_synthesizes_explicit_program_entrypoint() -> Bool:
 	match core_graph_test_module_domain(["main"]):
 		Some((module_table, [target_module_id])):
-			synthesizes_explicit_program_entrypoint(module_table, target_module_id).get_or(False)
+			synthesizes_explicit_program_entrypoint(module_table, target_module_id, True).get_or(False)
+		_:
+			False
+
+
+func test_synthesizes_zero_argument_program_entrypoint() -> Bool:
+	match core_graph_test_module_domain(["main"]):
+		Some((module_table, [target_module_id])):
+			synthesizes_explicit_program_entrypoint(module_table, target_module_id, False).get_or(False)
 		_:
 			False
 
@@ -8189,6 +8241,7 @@ tests: TestSuite = {
 			test_module_member_prefix_spells_the_member_name_authority,
 		),
 		("synthesizes explicit program entrypoint", test_synthesizes_explicit_program_entrypoint),
+		("synthesizes zero-argument program entrypoint", test_synthesizes_zero_argument_program_entrypoint),
 		(
 			"consumes import and builtin type metadata",
 			test_consumes_import_and_builtin_type_metadata,

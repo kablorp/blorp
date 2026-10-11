@@ -1,0 +1,262 @@
+#!/bin/zsh
+# Compare unmodified fixtures through C emission; setup and target C builds are excluded.
+set -eu
+setopt pipefail
+zmodload zsh/datetime
+export LC_ALL=C
+
+root=${0:A:h:h:h}
+cd "$root"
+fixture_root=$root/blorp_2/test/e2e/fixtures
+selection=$fixture_root
+samples=3
+output=""
+existing=$root/bin/blorp
+pilot=""
+existing_supplied=0
+
+usage() {
+    cat <<'EOF'
+Usage: blorp_2/scripts/compare-compilers --output NEW_DIRECTORY [options]
+  --fixture FILE_OR_DIRECTORY  Select within blorp_2/test/e2e/fixtures (default: all)
+  --samples POSITIVE_INTEGER   Samples per compiler and fixture (default: 3)
+  --existing-compiler PATH     Existing compiler executable (default: bin/blorp)
+  --pilot-compiler PATH        Explicit pilot executable; skip the one-time build
+  --help                      Show this help
+
+macOS only. Compilers run serially, alternating order between samples.
+Exit 0: complete comparison; 1: failed/incomplete samples; 2: setup/argument error.
+EOF
+}
+
+die() { print -u2 -r -- "error: $*"; exit 2; }
+while (( $# )); do
+    case $1 in
+        --help) usage; exit 0 ;;
+        --fixture|--samples|--output|--existing-compiler|--pilot-compiler)
+            (( $# >= 2 )) || die "missing value for $1"
+            case $1 in
+                --fixture) selection=${2:A} ;;
+                --samples) samples=$2 ;;
+                --output) output=${2:A} ;;
+                --existing-compiler) existing=${2:A}; existing_supplied=1 ;;
+                --pilot-compiler) pilot=${2:A} ;;
+            esac
+            shift 2 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+[[ $samples =~ '^[1-9][0-9]*$' ]] && (( samples > 0 )) || die "samples must be a positive integer"
+[[ $selection == $fixture_root/* || $selection == $fixture_root ]] || die "fixture must be within $fixture_root"
+[[ -n $output ]] || die "--output is required"
+[[ ! -e $output ]] || die "output directory already exists: $output"
+[[ -x $existing ]] || die "existing compiler is not executable: $existing"
+[[ -z $pilot || -x $pilot ]] || die "pilot compiler is not executable: $pilot"
+[[ $(uname -s) == Darwin ]] || die "this script requires macOS /usr/bin/time -l"
+
+typeset -a fixtures
+if [[ -d $selection ]]; then
+    fixtures=("$selection"/**/*.brp(N.))
+elif [[ -f $selection && $selection == *.brp ]]; then
+    fixtures=("$selection")
+else
+    die "fixture selection must be a .brp file or directory"
+fi
+(( ${#fixtures} )) || die "no .brp fixtures selected"
+for fixture in "${fixtures[@]}"; do
+    [[ $fixture != *$'\t'* && $fixture != *$'\n'* ]] || die "fixture paths cannot contain tabs or newlines"
+    [[ ${fixture:A} == $fixture_root/* ]] || die "fixture resolves outside the fixture root"
+done
+
+mkdir -p "$output/setup"
+sha() { shasum -a 256 "$1" | awk '{print $1}'; }
+record_command() { printf '%q ' "$@"; printf '\n'; }
+typeset -a isolated source_paths
+isolated=(/usr/bin/env -u BLORP_LEAK_CHECK -u BLORP_MEMORY_STATS
+    -u BLORP_TYPECHECK_BODY_METRICS -u BLORP_CORE_LOWERING_TYPE_METRICS -u BLORP_PERCEUS_ENGINE_METRICS
+    -u BLORP_NAME_IDENTITY -u BLORP_ORIGIN_CONTRACT -u BLORP_IDENTITY_CONTRACT -u BLORP_NODE_IDENTITY)
+source_paths=(blorp_2/src blorp/src standard_library/src blorp/build/bootstrap.env)
+# Freeze sources before building either executable; compare these bytes again
+# after sampling. COPYFILE_DISABLE excludes macOS extended metadata from tar.
+COPYFILE_DISABLE=1 tar -cf - "${source_paths[@]}" > "$output/sources.tar"
+source_hash=$(sha "$output/sources.tar")
+script_hash=$(sha "$0")
+cp "$0" "$output/setup/compare-compilers"
+setup_command() {
+    local name=$1
+    shift
+    record_command "$@" > "$output/setup/$name.command.txt"
+    "$@" > "$output/setup/$name.stdout.txt" 2> "$output/setup/$name.stderr.txt" || die "$name failed; see $output/setup"
+}
+
+if (( ! existing_supplied )); then
+    setup_command host-freshness scripts/compiler-build-status
+fi
+setup_command existing-version "${isolated[@]}" "$existing" --version
+existing_hash=$(sha "$existing")
+cp "$existing" "$output/setup/existing.bin"
+
+# The normal benchmark build uses no allocation instrumentation. Do not modify
+# the e2e compiler, which needs diagnostics for its separate cost assertions.
+pilot_origin=supplied
+cc=${BLORP_CC:-clang}
+if [[ -z $pilot ]]; then
+    pilot_origin=built
+    pilot=$output/setup/pilot
+    setup_command pilot-emit "${isolated[@]}" \
+        "$existing" compile --no-format blorp_2/src/main.brp -o "$output/setup/pilot.c"
+    setup_command pilot-link "$cc" -O0 -DBLORP_MEMORY_DIAGNOSTICS=0 \
+        "$output/setup/pilot.c" -o "$pilot" -lm -lpthread
+    setup_command cc-version "$cc" --version
+fi
+
+# Supplied executables have no verified relationship to the checkout sources.
+pilot_hash=$(sha "$pilot")
+{
+    print -r -- "revision=$(git rev-parse HEAD)"
+    print -r -- "source_snapshot_sha256=$source_hash"
+    print -r -- "script_sha256=$script_hash"
+    print -r -- "existing_binary=$existing"
+    print -r -- "existing_binary_sha256=$existing_hash"
+    print -r -- "existing_source_relationship=$([[ $existing_supplied == 0 ]] && print freshness-checked || print supplied-unverified)"
+    print -r -- "pilot_binary=$pilot"
+    print -r -- "pilot_binary_sha256=$pilot_hash"
+    print -r -- "pilot_origin=$pilot_origin"
+    if [[ $pilot_origin == built ]]; then
+        print -r -- 'pilot_optimization=-O0; memory_diagnostics=0'
+        print -r -- "pilot_generated_c_sha256=$(sha "$output/setup/pilot.c")"
+    else
+        print -r -- 'pilot_optimization=unavailable; memory_diagnostics=unavailable'
+    fi
+    print -r -- "prelude_sha256=$(sha blorp_2/src/prelude_temp.brp)"
+    print -r -- "samples=$samples"
+    print -r -- "fixture_count=${#fixtures}"
+    print -r -- 'boundary=whole compiler process through C emission, including startup and input/library loading'
+    print -r -- 'elapsed_clock=zsh EPOCHREALTIME around time/env/compiler, including wrapper overhead; seconds'
+    print -r -- 'instructions=macOS time child instructions retired, including env/exec startup; unavailable if absent'
+    print -r -- 'allocations=unavailable; allocation/leak instrumentation is disabled for measured processes'
+    print -r -- 'optimization_note=existing CLI/runtime settings are in setup/existing-version.stdout.txt; pilot runtime is built with the pilot at -O0'
+    print -r -- "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    uname -a
+    sw_vers
+} > "$output/provenance.txt"
+git diff --binary HEAD > "$output/checkout.diff"
+printf 'index\tfixture\tabsolute_input\tsha256\n' > "$output/fixtures.tsv"
+integer fixture_index=0
+for fixture in "${fixtures[@]}"; do
+    (( ++fixture_index ))
+    relative=${fixture#$fixture_root/}
+    mkdir -p "$output/inputs/${relative:h}"
+    cp "$fixture" "$output/inputs/$relative"
+    printf '%04d\t%s\t%s\t%s\n' "$fixture_index" "$relative" "$fixture" "$(sha "$fixture")" >> "$output/fixtures.tsv"
+done
+printf 'fixture\tcompiler\tsample\texit_code\tresult\telapsed_seconds\tinstructions\tallocations\tc_sha256\tc_bytes\tartifact\n' > "$output/samples.tsv"
+integer incomplete=0
+
+measure() {
+    local compiler=$1 fixture=$2 index=$3 sample=$4
+    local directory=$output/raw/$index/$compiler/$sample
+    local executable=$existing result=ok instructions c_hash=unavailable c_bytes=unavailable
+    local -a arguments
+    arguments=(compile --no-format "$fixture" -o "$directory/program.c")
+    if [[ $compiler == pilot ]]; then
+        executable=$pilot
+        arguments=("$root/blorp_2/src/prelude_temp.brp" "$fixture" "$directory/program.c")
+    fi
+    mkdir -p "$directory"
+    record_command /usr/bin/time -l -o "$directory/time.txt" "${isolated[@]}" \
+        "$executable" "${arguments[@]}" > "$directory/command.txt"
+    local -F 9 started=$EPOCHREALTIME elapsed
+    local exit_code
+    if /usr/bin/time -l -o "$directory/time.txt" "${isolated[@]}" \
+        "$executable" "${arguments[@]}" \
+        > "$directory/stdout.txt" 2> "$directory/stderr.txt"; then
+        exit_code=0
+    else
+        exit_code=$?
+        result=failed
+    fi
+    elapsed=$(( EPOCHREALTIME - started ))
+    if [[ ! -s $directory/program.c && $exit_code == 0 ]]; then result=missing-output; fi
+    if [[ $result != ok ]]; then incomplete=1; fi
+    instructions=$(awk '$2 == "instructions" && $3 == "retired" { count++; value=$1 }
+        END { if(count == 1 && value ~ /^[0-9]+$/ && value > 0) print value; else print "unavailable" }' "$directory/time.txt")
+    if [[ -f $directory/program.c ]]; then
+        c_hash=$(sha "$directory/program.c")
+        c_bytes=$(wc -c < "$directory/program.c" | tr -d ' ')
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%.6f\t%s\tunavailable\t%s\t%s\t%s\n' \
+        "${fixture#$fixture_root/}" "$compiler" "$sample" "$exit_code" "$result" "$elapsed" \
+        "$instructions" "$c_hash" "$c_bytes" "raw/$index/$compiler/$sample" >> "$output/samples.tsv"
+    print -r -- "${fixture#$fixture_root/} $compiler sample $sample: $result"
+}
+
+fixture_index=0
+for fixture in "${fixtures[@]}"; do
+    (( ++fixture_index ))
+    printf -v index '%04d' "$fixture_index"
+    for (( sample=1; sample<=samples; ++sample )); do
+        if (( sample % 2 )); then
+            measure existing "$fixture" "$index" "$sample"
+            measure pilot "$fixture" "$index" "$sample"
+        else
+            measure pilot "$fixture" "$index" "$sample"
+            measure existing "$fixture" "$index" "$sample"
+        fi
+    done
+done
+
+# A changed executable, source, or input invalidates all cross-compiler ratios.
+integer run_stable=1
+check_stable() {
+    if [[ $2 != $3 ]]; then
+        print -u2 -r -- "changed during run: $1"
+        run_stable=0
+        incomplete=1
+    fi
+}
+check_stable "$existing" "$existing_hash" "$(sha "$existing")"
+check_stable "$pilot" "$pilot_hash" "$(sha "$pilot")"
+check_stable "$0" "$script_hash" "$(sha "$0")"
+check_stable sources "$source_hash" "$(COPYFILE_DISABLE=1 tar -cf - "${source_paths[@]}" | shasum -a 256 | awk '{print $1}')"
+while IFS=$'\t' read -r index relative fixture expected_hash; do
+    [[ $index == index ]] && continue
+    check_stable "$fixture" "$expected_hash" "$(sha "$fixture")"
+done < "$output/fixtures.tsv"
+if (( ! existing_supplied )); then
+    record_command scripts/compiler-build-status > "$output/setup/host-freshness-after.command.txt"
+    if ! scripts/compiler-build-status > "$output/setup/host-freshness-after.stdout.txt" 2> "$output/setup/host-freshness-after.stderr.txt"; then
+        run_stable=0; incomplete=1
+    fi
+fi
+print -r -- "stable=$run_stable" > "$output/stability.txt"
+
+# Withhold ratios unless every paired compilation succeeded. An unsuccessful
+# checker run is not comparable to a complete C-emission run.
+awk -F '\t' -v samples="$samples" -v stable="$run_stable" '
+    NR == 1 { next }
+    !seen[$1]++ { ordered[++count]=$1 }
+    $5 == "ok" {
+        key=$1 SUBSEP $2; successes[key]++; pair[$1 SUBSEP $3]++
+        if (!(key in seconds) || $6 < seconds[key]) seconds[key]=$6
+        if ($7 != "unavailable" && (!(key in instructions) || $7 < instructions[key])) instructions[key]=$7
+        if ($7 == "unavailable") missing[key]=1
+    }
+    function value(table, key) { return key in table ? table[key] : "unavailable" }
+    END {
+        OFS="\t"
+        print "fixture", "existing_successes", "pilot_successes", "paired_successes", "existing_min_seconds", "pilot_min_seconds", "elapsed_ratio_existing_over_pilot", "existing_min_instructions", "pilot_min_instructions", "instruction_ratio_existing_over_pilot"
+        for (i=1; i<=count; i++) {
+            fixture=ordered[i]; old=fixture SUBSEP "existing"; pilot=fixture SUBSEP "pilot"; pairs=0
+            for (sample=1; sample<=samples; sample++) if(pair[fixture SUBSEP sample] == 2) pairs++
+            elapsed_ratio="unavailable"; instruction_ratio="unavailable"
+            if(stable && pairs == samples) {
+                if(seconds[pilot] > 0) elapsed_ratio=sprintf("%.3f", seconds[old]/seconds[pilot])
+                if(!missing[old] && !missing[pilot] && instructions[pilot] > 0) instruction_ratio=sprintf("%.3f", instructions[old]/instructions[pilot])
+            }
+            print fixture, successes[old]+0, successes[pilot]+0, pairs, value(seconds,old), value(seconds,pilot), elapsed_ratio, value(instructions,old), value(instructions,pilot), instruction_ratio
+        }
+    }' "$output/samples.tsv" > "$output/summary.tsv"
+
+print -r -- "Results: $output/summary.tsv (incomplete=$incomplete)"
+exit "$incomplete"

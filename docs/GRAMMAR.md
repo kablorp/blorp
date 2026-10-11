@@ -722,6 +722,11 @@ where_clause    = "where" dim_constraint { "," dim_constraint } ;
 dim_constraint  = dim_expr "==" dim_expr ;
 ```
 
+- A root program's `main` has no type parameters and accepts either `()` or
+  one parameter annotated `List[String]`. Its concrete return type implements
+  `ExitStatusAble`; `Int` and `Void` are the standard cases. Imported functions
+  named `main` are ordinary functions. These are typechecking rules; the
+  function grammar also permits other signatures for ordinary functions.
 - An annotation takes no arguments: `@name(...)` is rejected with ``function
   annotations do not take arguments``. An unknown name is rejected with the
   list of the four names (`LP:1206-1310`). Annotations must be followed by a

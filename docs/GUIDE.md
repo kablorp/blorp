@@ -22,11 +22,18 @@ func main(args: List[String]):
     print("Hello, world!")
 ```
 
-Every runnable program needs a `main` function in the root source file being compiled or run. Its return type must implement the prelude's `ExitStatusAble` trait. `Int` returns that value as the process exit code, while an omitted return type/`Void` returns 0. `args` contains `argv` including the program name at index 0. Imported modules may also export functions named `main`; those imports are ordinary functions and do not become the program entrypoint.
+Every runnable program needs a nongeneric `main` function in the root source
+file being compiled or run. Use `main()` when command-line arguments are not
+needed, or `main(args: List[String])` to receive `argv`, including the program
+name at index 0. Its concrete return type must implement the prelude's
+`ExitStatusAble` trait. `Int` returns that value as the process exit code, while
+an omitted return type/`Void` returns 0. Imported modules may also export
+functions named `main`; those imports are ordinary functions and do not become
+the program entrypoint.
 
 ```blorp
 -- same function with explicit status code 
-func main(args: List[String]) -> Int:
+func main() -> Int:
     print("Hello!")
     0
 ```
