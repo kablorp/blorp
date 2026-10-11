@@ -1,0 +1,236 @@
+import:
+	../../src/lex: lex
+	../../src/parse: parse_prelude, parsed_contents
+	../../src/syntax: Diagnostic, Symbol(AtSign), TokenKind(SymbolToken, IdentifierToken)
+	input: parse
+	test: TestSuite
+
+
+private pure func accepts_annotation(prefix: String) -> Bool:
+	match lex(
+		prefix + "pure func main() -> Int:\n\tmain()\n",
+	).and_then(
+		pure func(tokens): parse(tokens),
+	):
+		Err(_):
+			False
+		Ok(program):
+			match parsed_contents(program).functions:
+				[function]:
+					match function.tail_annotation:
+						Some(span):
+							span.start == 0 and span.end == 15
+						None:
+							False
+				_:
+					False
+
+
+pure func test_same_line_annotation() -> Bool:
+	accepts_annotation("@tail_recursive ")
+
+
+pure func test_standalone_annotation() -> Bool:
+	accepts_annotation("@tail_recursive\n")
+
+
+pure func test_at_and_identifier_tokens() -> Bool:
+	match lex("@tail_recursive"):
+		Err(_):
+			False
+		Ok(program):
+			match program.tokens:
+				[at, name]:
+					match at.kind:
+						SymbolToken(AtSign):
+							match name.kind:
+								IdentifierToken("tail_recursive"):
+									(
+										at.span.start == 0
+										and at.span.end == 1
+										and name.span.start == 1
+										and name.span.end == 15
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+private pure func rejects(
+	source: String,
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+) -> Bool:
+	match lex(source).and_then(pure func(tokens): parse(tokens)):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.span.start == start
+				and error.span.end == end
+				and error.message == message
+				and error.help == help
+			)
+
+
+pure func test_unknown_annotation() -> Bool:
+	rejects(
+		"@other func main() -> Int:\n\t0\n",
+		0,
+		6,
+		"unknown function annotation",
+		"use @tail_recursive before a function declaration",
+	)
+
+
+pure func test_duplicate_annotation() -> Bool:
+	rejects(
+		"@tail_recursive\n@tail_recursive\nfunc main() -> Int:\n\tmain()\n",
+		16,
+		17,
+		"multiple function annotations are not supported",
+		"write @tail_recursive only once before a function",
+	)
+
+
+pure func test_unknown_second_annotation() -> Bool:
+	source: String =
+		|@tail_recursive
+		|@other
+		|func main() -> Int:
+		|	main()
+		|
+	rejects(
+		source,
+		16,
+		17,
+		"multiple function annotations are not supported",
+		"write @tail_recursive only once before a function",
+	)
+
+
+pure func test_annotation_after_pure() -> Bool:
+	source: String =
+		|pure @tail_recursive func main() -> Int:
+		|	main()
+		|
+	rejects(
+		source,
+		5,
+		6,
+		"misplaced function annotation",
+		"put @tail_recursive before the optional pure and func keywords at column 1",
+	)
+
+
+pure func test_annotation_after_func() -> Bool:
+	source: String =
+		|func @tail_recursive main() -> Int:
+		|	main()
+		|
+	rejects(
+		source,
+		5,
+		6,
+		"misplaced function annotation",
+		"put @tail_recursive before the optional pure and func keywords at column 1",
+	)
+
+
+pure func test_argument_bearing_annotation() -> Bool:
+	rejects(
+		"@tail_recursive() func main() -> Int:\n\tmain()\n",
+		15,
+		16,
+		"@tail_recursive takes no arguments",
+		"write @tail_recursive before the optional pure and func keywords",
+	)
+
+
+pure func test_dangling_annotation() -> Bool:
+	rejects(
+		"@tail_recursive\n",
+		0,
+		15,
+		"@tail_recursive has no function declaration",
+		"put a function declaration immediately after @tail_recursive",
+	)
+
+
+pure func test_annotation_on_union() -> Bool:
+	rejects(
+		"@tail_recursive\nfixed union Flag:\n\tOnly\n",
+		16,
+		21,
+		"@tail_recursive requires a function declaration",
+		"put @tail_recursive before the optional pure and func keywords",
+	)
+
+
+pure func test_annotation_in_body() -> Bool:
+	rejects(
+		"func main() -> Int:\n\t@tail_recursive\n",
+		21,
+		22,
+		"misplaced function annotation",
+		"put @tail_recursive before the optional pure and func keywords at column 1",
+	)
+
+
+pure func test_annotation_in_prelude() -> Bool:
+	match lex(
+		"@tail_recursive\npure func helper() -> Int:\n\tbuiltin(\"string.length\")\n",
+	).and_then(
+		pure func(tokens): parse_prelude(tokens),
+	):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.span.start == 0
+				and error.span.end == 1
+				and error.message == "function annotations are not allowed in the prelude"
+				and error.help == "put @tail_recursive on a program function"
+			)
+
+
+pure func test_annotation_name_is_an_identifier() -> Bool:
+	match lex(
+		"func tail_recursive() -> Int:\n\t7\nfunc main() -> Int:\n\ttail_recursive()\n",
+	).and_then(
+		pure func(tokens): parse(tokens),
+	):
+		Err(_):
+			False
+		Ok(program):
+			match parsed_contents(program).functions:
+				[helper, main]:
+					helper.tail_annotation == None and main.tail_annotation == None
+				_:
+					False
+
+
+tests: TestSuite = {
+	description = "Tail-recursion annotation syntax",
+	tests = [
+		("same-line annotation span", test_same_line_annotation),
+		("standalone annotation span", test_standalone_annotation),
+		("at sign and unreserved annotation name tokens", test_at_and_identifier_tokens),
+		("unknown annotation diagnostic", test_unknown_annotation),
+		("duplicate annotation diagnostic", test_duplicate_annotation),
+		("unknown second annotation diagnostic", test_unknown_second_annotation),
+		("annotation after pure diagnostic", test_annotation_after_pure),
+		("annotation after func diagnostic", test_annotation_after_func),
+		("argument-bearing annotation diagnostic", test_argument_bearing_annotation),
+		("dangling annotation diagnostic", test_dangling_annotation),
+		("annotation requires a function", test_annotation_on_union),
+		("misplaced annotation diagnostic", test_annotation_in_body),
+		("prelude annotation diagnostic", test_annotation_in_prelude),
+		("annotation spelling remains an identifier", test_annotation_name_is_an_identifier),
+	]
+}

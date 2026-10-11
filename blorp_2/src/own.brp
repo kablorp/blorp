@@ -2,10 +2,11 @@ import:
 	int as IntOps
 	list: set_index
 	lower:
+		LoweredExit(ReturnValue, RecurValues),
 		LoweredFunction,
 		LoweredMatch,
 		LoweredProgram,
-		LoweredTail(ReturnValue, MatchValue),
+		LoweredTail(ExitValue, MatchValue),
 		MatchLabel,
 		RecordFieldValue,
 		ValueDefinition,
@@ -31,7 +32,7 @@ import:
 		record_number,
 		same_type,
 		union_number,
-	syntax: Diagnostic, Span
+	syntax: Diagnostic, FunctionExecution(OrdinaryCalls, SelfTailLoop), Span
 	text: concat
 
 
@@ -106,10 +107,15 @@ fixed union ReturnTransfer:
 	OwnedReturn(ValueId, OwnerId)
 
 
+fixed union OwnedExit:
+	ReturnResult(ReturnTransfer)
+	RecurArguments(List[ValueId], Span)
+
+
 fixed record OwnedArm {
 	label: MatchLabel,
 	operations: List[OwnershipOperation],
-	result: ReturnTransfer
+	exit: OwnedExit
 }
 
 
@@ -121,11 +127,12 @@ fixed record OwnedMatch {
 
 
 fixed union OwnedTail:
-	ReturnTail(ReturnTransfer)
+	ReturnTail(OwnedExit)
 	MatchTail(OwnedMatch)
 
 
 fixed record OwnedFunction {
+	execution: FunctionExecution,
 	signature: FunctionSignature,
 	operations: List[OwnershipOperation],
 	tail: OwnedTail
@@ -167,7 +174,7 @@ pure func value_ownership(
 						"invalid record identity in ownership representation",
 					),
 				)
-			var valid = layout.fields.length() > 0
+			var valid = IntOps.greater_than(layout.fields.length(), 0)
 
 			for field in layout.fields:
 				valid = valid and same_type(field, IntType)
@@ -232,9 +239,9 @@ private pure func record_use(
 		Err(internal_error(span, "invalid value identity in ownership use analysis"))
 
 
-pure func block_last_uses(
+pure func exit_last_uses(
 	definitions: List[ValueDefinition],
-	result: ValueId,
+	exit: LoweredExit,
 	prefix_count: Int,
 	first_value: Int,
 ) -> Result[List[Option[Int]], Diagnostic]:
@@ -326,23 +333,66 @@ pure func block_last_uses(
 		Some(error):
 			Err(error)
 		None:
-			ordinal = value_number(result)
+			operands = match exit:
+				ReturnValue(result):
+					[result]
+				RecurValues(arguments, _):
+					arguments
 
-			if IntOps.greater_than_or_equal(ordinal, 0) and IntOps.less_than(ordinal, prefix_count):
-				Ok(uses)
-			else:
-				definition ?= definitions
-					.get(IntOps.subtract(ordinal, first_value))
-					.to_result(
-						internal_error(
-							{
-								start = 0,
-								end = 0
-							},
-							"invalid return value in ownership use analysis",
-						),
-					)
-				record_use(uses, result, position, prefix_count, first_value, definition.span)
+			span_result: Result[Span, Diagnostic] = match exit:
+				RecurValues(_, span):
+					Ok(span)
+				ReturnValue(result):
+					ordinal = value_number(result)
+
+					if (
+						IntOps.greater_than_or_equal(ordinal, 0)
+						and IntOps.less_than(ordinal, prefix_count)
+					):
+						Ok({
+							start = 0,
+							end = 0,
+						})
+					else:
+						definition ?= definitions
+							.get(IntOps.subtract(ordinal, first_value))
+							.to_result(
+								internal_error(
+									{
+										start = 0,
+										end = 0
+									},
+									"invalid return value in ownership use analysis",
+								),
+							)
+						Ok(definition.span)
+
+			span ?= span_result
+			var current = uses
+			var invalid: Option[Diagnostic] = None
+
+			for operand in operands:
+				match record_use(current, operand, position, prefix_count, first_value, span):
+					Ok(recorded):
+						current = recorded
+					Err(error):
+						invalid = Some(error)
+						break
+
+			match invalid:
+				Some(error):
+					Err(error)
+				None:
+					Ok(current)
+
+
+pure func block_last_uses(
+	definitions: List[ValueDefinition],
+	result: ValueId,
+	prefix_count: Int,
+	first_value: Int,
+) -> Result[List[Option[Int]], Diagnostic]:
+	exit_last_uses(definitions, ReturnValue(result), prefix_count, first_value)
 
 
 pure func last_uses(
@@ -579,21 +629,21 @@ private pure func schedule_drop(
 
 private fixed record InsertedBlock {
 	operations: List[OwnershipOperation],
-	result: ReturnTransfer,
+	exit: OwnedExit,
 	next_owner: Int
 }
 
 
 private pure func insert_block(
 	definitions: List[ValueDefinition],
-	result: ValueId,
+	exit: LoweredExit,
 	prefix: List[ValueSource],
 	first_value: Int,
 	initial_owner: Int,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[InsertedBlock, Diagnostic]:
-	uses ?= block_last_uses(definitions, result, prefix.length(), first_value)
+	uses ?= exit_last_uses(definitions, exit, prefix.length(), first_value)
 	var drops = definitions.map(pure func(_: ValueDefinition) -> List[ScheduledDrop]: [])
 	var operations: List[OwnershipOperation] = []
 	var sources: List[ValueSource] = []
@@ -651,40 +701,52 @@ private pure func insert_block(
 		Some(error):
 			Err(error)
 		None:
-			span: Span = match definitions.get(IntOps.subtract(value_number(result), first_value)):
-				Some(definition):
-					definition.span
-				None:
-					{
-						start = 0,
-						end = 0
-					}
-
-			source ?= value_source(result, sources, prefix, first_value, span)
-
-			tail = match source:
-				UnmanagedSource:
-					UnmanagedReturn(result)
-				OwnedSource(owner):
-					OwnedReturn(result, owner)
-				BorrowedSource:
-					owner = owner_id(next_owner)
-					operations = operations.append(
-						AcquireOwner(
-							owner,
-							{
-								value = result,
-								source = ParameterBorrow(result)
-							},
-							span,
+			tail_result: Result[OwnedExit, Diagnostic] = match exit:
+				RecurValues(arguments, span):
+					Ok(RecurArguments(arguments, span))
+				ReturnValue(result):
+					span: Span = match definitions.get(
+						IntOps.subtract(
+							value_number(result),
+							first_value,
 						),
-					)
-					next_owner = IntOps.add(next_owner, 1)
-					OwnedReturn(result, owner)
+					):
+						Some(definition):
+							definition.span
+						None:
+							{
+								start = 0,
+								end = 0
+							}
 
+					source ?= value_source(result, sources, prefix, first_value, span)
+
+					tail = match source:
+						UnmanagedSource:
+							UnmanagedReturn(result)
+						OwnedSource(owner):
+							OwnedReturn(result, owner)
+						BorrowedSource:
+							owner = owner_id(next_owner)
+							operations = operations.append(
+								AcquireOwner(
+									owner,
+									{
+										value = result,
+										source = ParameterBorrow(result)
+									},
+									span,
+								),
+							)
+							next_owner = IntOps.add(next_owner, 1)
+							OwnedReturn(result, owner)
+
+					Ok(ReturnResult(tail))
+
+			tail ?= tail_result
 			Ok({
 				operations = operations,
-				result = tail,
+				exit = tail,
 				next_owner = next_owner,
 			})
 
@@ -715,7 +777,7 @@ private pure func insert_match(
 	for arm in matched.arms:
 		match insert_block(
 			arm.body.definitions,
-			arm.body.result,
+			arm.body.exit,
 			sources,
 			next_value,
 			next_owner,
@@ -726,7 +788,7 @@ private pure func insert_match(
 				arms = arms.append({
 					label = arm.label,
 					operations = built.operations,
-					result = built.result,
+					exit = built.exit,
 				})
 				next_value = IntOps.add(next_value, arm.body.definitions.length())
 				next_owner = built.next_owner
@@ -739,6 +801,7 @@ private pure func insert_match(
 			Err(error)
 		None:
 			Ok({
+				execution = function.execution,
 				signature = function.signature,
 				operations = operations,
 				tail = MatchTail({
@@ -749,18 +812,104 @@ private pure func insert_match(
 			})
 
 
+private pure func managed_loop(span: Span) -> Diagnostic:
+	{
+		span = span,
+		note = None,
+		message = "managed values in @tail_recursive functions are not supported yet",
+		help = "use an unmanaged helper, or remove @tail_recursive"
+	}
+
+
+private pure func admit_loop_values(
+	definitions: List[ValueDefinition],
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+	var invalid: Option[Diagnostic] = None
+
+	for definition in definitions:
+		match value_ownership(definition.value_type, unions, records):
+			Err(error):
+				invalid = Some(error)
+				break
+			Ok(ManagedStringLeaf):
+				invalid = Some(managed_loop(definition.span))
+				break
+			Ok(NoOwnership):
+				void
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+
+private pure func admit_loop(
+	function: LoweredFunction,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+	match function.execution:
+		OrdinaryCalls:
+			Ok(void)
+		SelfTailLoop(annotation):
+			var invalid: Option[Diagnostic] = None
+
+			for value_type in function.signature.parameters.append(function.signature.return_type):
+				match value_ownership(value_type, unions, records):
+					Err(error):
+						invalid = Some(error)
+						break
+					Ok(ManagedStringLeaf):
+						invalid = Some(managed_loop(annotation))
+						break
+					Ok(NoOwnership):
+						void
+
+			signature ?= match invalid:
+				Some(error):
+					Err(error)
+				None:
+					Ok(void)
+
+			prefix ?= admit_loop_values(function.definitions, unions, records)
+
+			match function.tail:
+				ExitValue(_):
+					Ok(void)
+				MatchValue(matched):
+					for arm in matched.arms:
+						match admit_loop_values(arm.body.definitions, unions, records):
+							Err(error):
+								invalid = Some(error)
+								break
+							Ok(_):
+								void
+
+					match invalid:
+						Some(error):
+							Err(error)
+						None:
+							Ok(void)
+
+
 pure func insert_function(
 	function: LoweredFunction,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[OwnedFunction, Diagnostic]:
+	admitted ?= admit_loop(function, unions, records)
+
 	match function.tail:
-		ReturnValue(result):
-			built ?= insert_block(function.definitions, result, [], 0, 0, unions, records)
+		ExitValue(exit):
+			built ?= insert_block(function.definitions, exit, [], 0, 0, unions, records)
 			Ok({
+				execution = function.execution,
 				signature = function.signature,
 				operations = built.operations,
-				tail = ReturnTail(built.result),
+				tail = ReturnTail(built.exit),
 			})
 		MatchValue(matched):
 			insert_match(function, matched, unions, records)

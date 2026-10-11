@@ -3,7 +3,7 @@ import:
 	check as Checked
 	int as IntOps
 	option: to_result
-	syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration), Purity, Span
+	syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration), FunctionExecution, Purity, Span
 	text: concat
 
 
@@ -152,7 +152,7 @@ fixed union ConcretePattern:
 fixed record ConcreteArm {
 	pattern: ConcretePattern,
 	assignments: List[ConcreteAssignment],
-	body: ConcreteValue
+	body: ConcreteExit
 }
 
 
@@ -163,12 +163,18 @@ fixed record ConcreteMatch {
 }
 
 
+fixed union ConcreteExit:
+	ReturnExpression(ConcreteValue)
+	RecurWith(List[ConcreteValue], Span)
+
+
 fixed union ConcreteBody:
-	ConcreteValueBody(ConcreteValue)
+	ConcreteValueBody(ConcreteExit)
 	ConcreteMatchBody(ConcreteMatch)
 
 
 fixed record ConcreteFunction {
+	execution: FunctionExecution,
 	signature: FunctionSignature,
 	bindings: List[ConcreteBinding],
 	assignments: List[ConcreteAssignment],
@@ -744,13 +750,32 @@ private pure func value_types(value: Checked.CheckedValue) -> List[Checked.TypeU
 	append_value_types([], value)
 
 
+-- Checking needs full call extents for tail-position errors. Ordinary concrete
+-- expressions retain the established callee anchors for layout and value errors;
+-- recur terminals carry their complete occurrence span separately.
+private pure func value_anchor(value: Checked.CheckedValue) -> Span:
+	match value.base:
+		Checked.ReturnCall(call, _):
+			call.span
+		_:
+			value.base_span
+
+
+private pure func step_anchor(step: Checked.CheckedStep) -> Span:
+	match step.operation:
+		Checked.InvokeFunction(call, _):
+			call.span
+		_:
+			step.span
+
+
 private pure func append_value_types(
 	collected: List[Checked.TypeUse],
 	value: Checked.CheckedValue,
 ) -> List[Checked.TypeUse]:
 	var types = collected.append({
 		value_type = value.base_type,
-		span = value.base_span,
+		span = value_anchor(value),
 	})
 
 	match value.base:
@@ -766,7 +791,7 @@ private pure func append_value_types(
 	for step in value.operations:
 		types = types.append({
 			value_type = step.value_type,
-			span = step.span,
+			span = step_anchor(step),
 		})
 
 		match step.operation:
@@ -796,6 +821,19 @@ private pure func assignment_types(
 	types
 
 
+private pure func exit_types(exit: Checked.CheckedExit) -> List[Checked.TypeUse]:
+	match exit:
+		Checked.ReturnExpression(value):
+			value_types(value)
+		Checked.RecurWith(arguments, _):
+			var types: List[Checked.TypeUse] = []
+
+			for argument in arguments:
+				types = types.concat(value_types(argument))
+
+			types
+
+
 private pure func function_types(function: Checked.CheckedFunction) -> List[Checked.TypeUse]:
 	var types: List[Checked.TypeUse] = function.signature.parameters
 
@@ -805,14 +843,14 @@ private pure func function_types(function: Checked.CheckedFunction) -> List[Chec
 
 	occurrences = match function.body:
 		Checked.CheckedValueBody(value):
-			types.concat(value_types(value))
+			types.concat(exit_types(value))
 		Checked.CheckedMatchBody(matched):
 			types = types.concat(value_types(matched.scrutinee))
 
 			for arm in matched.arms:
 				types = types
 					.concat(assignment_types(arm.assignments))
-					.concat(value_types(arm.body))
+					.concat(exit_types(arm.body))
 
 			types
 
@@ -1036,7 +1074,8 @@ private pure func translate_value(
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 ) -> Result[ConcreteValue, Diagnostic]:
-	base_type ?= concrete_type(value.base_type, substitution, unions, value.base_span, records)
+	base_span = value_anchor(value)
+	base_type ?= concrete_type(value.base_type, substitution, unions, base_span, records)
 
 	base_result: Result[ConcreteBase, Diagnostic] = match value.base:
 		Checked.ReturnRecord(id, fields):
@@ -1084,7 +1123,8 @@ private pure func translate_value(
 	steps ?= translated_list(value.operations, pure func(
 		step: Checked.CheckedStep,
 	) -> Result[ConcreteStep, Diagnostic]:
-		value_type ?= concrete_type(step.value_type, substitution, unions, step.span, records)
+		span = step_anchor(step)
+		value_type ?= concrete_type(step.value_type, substitution, unions, span, records)
 
 		operation_result: Result[ConcreteOperation, Diagnostic] = match step.operation:
 			Checked.ReadRecordField(field):
@@ -1113,13 +1153,13 @@ private pure func translate_value(
 		Ok({
 			operation = operation,
 			value_type = value_type,
-			span = step.span,
+			span = span,
 		})
 	)
 	Ok({
 		base = base,
 		base_type = base_type,
-		base_span = value.base_span,
+		base_span = base_span,
 		operations = steps,
 	})
 
@@ -1169,6 +1209,26 @@ private pure func translate_pattern(
 			Ok(VariantCase(variant, concrete_payload))
 
 
+private pure func translate_exit(
+	exit: Checked.CheckedExit,
+	substitution: List[TypeSubstitution],
+	keys: List[FunctionRequest],
+	unions: List[UnionInstance],
+	records: List[RecordInstance],
+) -> Result[ConcreteExit, Diagnostic]:
+	match exit:
+		Checked.ReturnExpression(value):
+			concrete ?= translate_value(value, substitution, keys, unions, records)
+			Ok(ReturnExpression(concrete))
+		Checked.RecurWith(arguments, span):
+			concrete ?= translated_list(arguments, pure func(
+				value: Checked.CheckedValue,
+			) -> Result[ConcreteValue, Diagnostic]:
+				translate_value(value, substitution, keys, unions, records)
+			)
+			Ok(RecurWith(concrete, span))
+
+
 private pure func translate_function(
 	function: Checked.CheckedFunction,
 	key: InstanceKey,
@@ -1214,7 +1274,7 @@ private pure func translate_function(
 
 	body_result: Result[ConcreteBody, Diagnostic] = match function.body:
 		Checked.CheckedValueBody(value):
-			concrete ?= translate_value(value, substitution, keys, unions, records)
+			concrete ?= translate_exit(value, substitution, keys, unions, records)
 			Ok(ConcreteValueBody(concrete))
 		Checked.CheckedMatchBody(matched):
 			scrutinee ?= translate_value(matched.scrutinee, substitution, keys, unions, records)
@@ -1231,7 +1291,7 @@ private pure func translate_function(
 					unions,
 					records,
 				)
-				body ?= translate_value(arm.body, substitution, keys, unions, records)
+				body ?= translate_exit(arm.body, substitution, keys, unions, records)
 				Ok({
 					pattern = pattern,
 					assignments = assignments,
@@ -1246,6 +1306,7 @@ private pure func translate_function(
 
 	body ?= body_result
 	Ok({
+		execution = function.execution,
 		signature = {
 			purity = function.signature.purity,
 			parameters = parameters,
