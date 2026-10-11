@@ -1,5 +1,10 @@
 # Blorp 2 simplification audit, 2026-10-10
 
+Implementation follow-up: all four slices now have source and independent
+semantic validation. See the [results and cost acceptance](blorp_2_simplification_results_2026-10-10.md),
+including the disclosed interning allocation exception. The audit
+below preserves the original hypotheses and proposed scope.
+
 A separate compiler-expert agent audited `blorp_2/src` read-only after the
 tail-recursion source was restored. All 16 source files matched the final
 source inventory in `blorp_2/build/tail-recursion/worker/final-source.sha256`.
