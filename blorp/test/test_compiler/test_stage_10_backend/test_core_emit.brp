@@ -75,6 +75,7 @@ import:
 			ConstructorMatchExpr,
 			CooperativeCheckpointExpr,
 			ContinueExpr,
+			DebugBlockExpr,
 			DetachExpr,
 			DictConstructExpr,
 			DupExpr,
@@ -271,7 +272,7 @@ import:
 		prepared_core_program_value,
 		run_pre_dce_tail,
 	../../../src/compiler/stage_09_core/static_string_literals: rewrite_static_string_literals
-	../../../src/compiler/stage_10_backend/c_naming: c_identifier, c_local_name, c_local_spelling, derived_temporary_spelling, encode_base62, variant_constructor_symbol, variant_tag_symbol
+	../../../src/compiler/stage_10_backend/c_naming: c_identifier, c_local_name, c_local_spelling, c_variable_spelling, derived_temporary_spelling, encode_base62, variant_constructor_symbol, variant_tag_symbol
 	../../../src/compiler/stage_10_backend/c_symbol_projection:
 		CEmissionSymbolPlan,
 		CSymbolProjectionError(MissingProjectedCallable),
@@ -280,7 +281,7 @@ import:
 		prepare_c_emission_symbols,
 		projected_callable_base_symbol,
 	../../../src/compiler/stage_10_backend/emit:
-		CoreEmitError(CallableSymbolProjectionFailed, CorePreparationFailed, InvalidUnionStorage),
+		CoreEmitError(CallableSymbolProjectionFailed, CorePreparationFailed, InvalidUnionStorage, UnsupportedGlobalInitializer),
 		core_emit_error_message,
 		try_emit_prepared_core_program_c_artifact_with_profile,
 		try_emit_core_program_c_artifact_with_profile,
@@ -299,6 +300,10 @@ import:
 
 -- This exceeds the depth that overflowed the former oversized emitter dispatcher frames.
 DEEP_EMIT_LOGICAL_DEPTH: Int = 512
+
+
+-- The former O0 dispatcher exhausted the main stack before 4096 binding edges.
+DEEP_EMIT_BINDING_DEPTH: Int = 4096
 
 
 ---
@@ -13616,6 +13621,268 @@ pure func test_emit_logical_or_expression() -> Bool:
 		artifact.c_code.contains("int logical_or(void)")
 		and artifact.c_code.contains("return (0 || 1);")
 	)
+
+
+union BindingEmitEdge:
+	LetBodyEdge
+	LetRhsEdge
+	BorrowBodyEdge
+	BorrowRhsEdge
+	DropBodyEdge
+	DiscardRhsEdge
+
+
+pure func binding_emit_var(index: Int) -> CoreVar:
+	{ named_var("binding_${index}") | id = index }
+
+
+pure func binding_emit_chain(edge: BindingEmitEdge, leaf: CoreExpr) -> CoreExpr:
+	var body: CoreExpr = leaf
+	var index: Int = DEEP_EMIT_BINDING_DEPTH
+
+	while index > 0:
+		index -= 1
+		variable: CoreVar = binding_emit_var(index)
+		value: CoreExpr = LiteralExpr(IntLiteral(index), int_type(), synthetic_core_source_loc())
+		read: CoreExpr = VarExpr(variable, int_type(), synthetic_core_source_loc())
+
+		body = match edge:
+			LetBodyEdge:
+				LetExpr(variable, False, int_type(), value, body)
+			LetRhsEdge:
+				LetExpr(variable, False, int_type(), body, read)
+			BorrowBodyEdge:
+				BorrowLetExpr(variable, int_type(), value, body)
+			BorrowRhsEdge:
+				BorrowLetExpr(variable, int_type(), body, read)
+			DropBodyEdge:
+				DropExpr(
+					variable,
+					int_type(),
+					NoReleasePolicy,
+					body,
+					int_type(),
+					synthetic_core_source_loc(),
+				)
+			DiscardRhsEdge:
+				LetExpr(named_var("_"), False, int_type(), body, value)
+
+	if edge == DropBodyEdge:
+		-- Bind every dropped scalar. Its no-op release still traverses the Drop edge.
+		binding_emit_chain(LetBodyEdge, body)
+	else:
+		body
+
+
+pure func binding_emit_function(body: CoreExpr) -> CoreFunction:
+	{ identity_function() |
+		name = "binding_chain",
+		params = [],
+		body = Some(body),
+		def_id = 1
+	}
+
+
+pure func binding_emit_artifact(body: CoreExpr, compact: Bool) -> Result[CArtifact, CoreEmitError]:
+	try_emit_prepared_fixture_c_artifact_with_indentation(prepared_core_program({
+			decls = [FunctionDecl(binding_emit_function(body))],
+			foreign_includes = [],
+			source_files = [],
+		}), FunctionProfileOff, compact)
+
+
+pure func test_emit_deep_binding_bodies_preserve_all_declarations() -> Bool:
+	var expected: String = "long " + projected_callable_base_symbol(1) + "(void) {\n"
+	var index: Int = 0
+
+	while index < DEEP_EMIT_BINDING_DEPTH:
+		expected += "long " + c_variable_spelling(binding_emit_var(index)) + " = ${index};\n"
+		index += 1
+
+	expected += "  return 7;\n}\n"
+	var matches: Bool = True
+
+	for edge in [LetBodyEdge, BorrowBodyEdge, DropBodyEdge]:
+		match binding_emit_artifact(
+			binding_emit_chain(
+				edge,
+				LiteralExpr(IntLiteral(7), int_type(), synthetic_core_source_loc()),
+			),
+			True,
+		):
+			Err(_):
+				matches = False
+				break
+			Ok(artifact):
+				if not artifact.c_code.contains(expected):
+					matches = False
+					break
+
+	matches
+
+
+pure func test_emit_deep_binding_rhs_preserves_nested_declarations() -> Bool:
+	var expected: String = "long " + projected_callable_base_symbol(1) + "(void) {\n"
+	var index: Int = 0
+
+	while index < DEEP_EMIT_BINDING_DEPTH - 1:
+		expected += "long " + c_variable_spelling(binding_emit_var(index)) + " = ({\n"
+		index += 1
+
+	expected += "long " + c_variable_spelling(binding_emit_var(index)) + " = 7;\n"
+
+	while index > 0:
+		expected += c_variable_spelling(binding_emit_var(index)) + ";\n});\n"
+		index -= 1
+
+	expected += "  return " + c_variable_spelling(binding_emit_var(0)) + ";\n}\n"
+	var matches: Bool = True
+
+	for edge in [LetRhsEdge, BorrowRhsEdge]:
+		match binding_emit_artifact(
+			binding_emit_chain(
+				edge,
+				LiteralExpr(IntLiteral(7), int_type(), synthetic_core_source_loc()),
+			),
+			True,
+		):
+			Err(_):
+				matches = False
+				break
+			Ok(artifact):
+				if not artifact.c_code.contains(expected):
+					matches = False
+					break
+
+	matches
+
+
+pure func test_emit_deep_failed_binding_discards_pending_work() -> Bool:
+	-- A raw prepared global reaches the emitter failure directly, without the
+	-- separate unsupported-function diagnostic's recursive child-path search.
+	leaf: CoreExpr = DebugBlockExpr(
+		LiteralExpr(IntLiteral(7), int_type(), synthetic_core_source_loc()),
+		int_type(),
+		synthetic_core_source_loc(),
+	)
+	base_global: CoreGlobal = dynamic_answer_global()
+	var matches: Bool = True
+
+	for edge in [
+		LetBodyEdge,
+		LetRhsEdge,
+		BorrowBodyEdge,
+		BorrowRhsEdge,
+		DropBodyEdge,
+		DiscardRhsEdge,
+	]:
+		global: CoreGlobal = { base_global |
+			name = { base_global.name | name = "FAILED_BINDING_CHAIN" },
+			init = binding_emit_chain(edge, leaf)
+		}
+
+		match try_emit_prepared_fixture_c_artifact_with_indentation(prepared_core_program({
+				decls = [GlobalDecl(global)],
+				foreign_includes = [],
+				source_files = [],
+			}), FunctionProfileOff, True):
+			Err(UnsupportedGlobalInitializer(name)):
+				if (
+					name != "FAILED_BINDING_CHAIN"
+					or core_emit_error_message(
+						UnsupportedGlobalInitializer(
+							name,
+						),
+					) != "unsupported global initializer for `FAILED_BINDING_CHAIN`"
+				):
+					matches = False
+					break
+			_:
+				matches = False
+				break
+
+	matches
+
+
+pure func test_emit_binding_context_preserves_temps_scopes_and_drop() -> Bool:
+	first: CoreVar = named_var("first")
+	second: CoreVar = named_var("second")
+	inner: CoreVar = named_var("inner")
+	owner: CoreVar = named_var("owner")
+	borrowed_owner: CoreVar = named_var("alias")
+	body: CoreExpr = LetExpr(
+		first,
+		False,
+		int_type(),
+		IfExpr(
+			LiteralExpr(BoolLiteral(True), bool_type(), synthetic_core_source_loc()),
+			SeqExpr(
+				VoidExpr(VoidType, synthetic_core_source_loc()),
+				LiteralExpr(IntLiteral(3), int_type(), synthetic_core_source_loc()),
+			),
+			LiteralExpr(IntLiteral(4), int_type(), synthetic_core_source_loc()),
+			int_type(),
+			synthetic_core_source_loc(),
+		),
+		BorrowLetExpr(
+			second,
+			int_type(),
+			LetExpr(
+				inner,
+				False,
+				int_type(),
+				IfExpr(
+					LiteralExpr(BoolLiteral(False), bool_type(), synthetic_core_source_loc()),
+					SeqExpr(
+						VoidExpr(VoidType, synthetic_core_source_loc()),
+						LiteralExpr(IntLiteral(5), int_type(), synthetic_core_source_loc()),
+					),
+					LiteralExpr(IntLiteral(6), int_type(), synthetic_core_source_loc()),
+					int_type(),
+					synthetic_core_source_loc(),
+				),
+				VarExpr(inner, int_type(), synthetic_core_source_loc()),
+			),
+			BorrowLetExpr(
+				borrowed_owner,
+				string_type(),
+				VarExpr(owner, string_type(), synthetic_core_source_loc()),
+				LetExpr(
+					named_var("_"),
+					False,
+					VoidType,
+					DropExpr(
+						owner,
+						string_type(),
+						ArcReleasePolicy,
+						VoidExpr(VoidType, synthetic_core_source_loc()),
+						VoidType,
+						synthetic_core_source_loc(),
+					),
+					VarExpr(second, int_type(), synthetic_core_source_loc()),
+				),
+			),
+		),
+	)
+	function: CoreFunction = { binding_emit_function(body) | params = [string_param("owner")] }
+	program: CoreProgram = {
+		decls = [FunctionDecl(function)],
+		foreign_includes = [],
+		source_files = []
+	}
+	expected: String = "long " + projected_callable_base_symbol(
+		1,
+	) + "(blorp_String* owner) {\n" + "  long first = ({\n    long __if_result_0;\n    if (1) {\n" + "      {\n        (void)((void)0);\n      }\n" + "      __if_result_0 = 3;\n    } else {\n      __if_result_0 = 4;\n    }\n" + "  __if_result_0;\n  });\n  long second = ({\n    long inner = ({\n" + "      long __if_result_1;\n      if (0) {\n" + "        {\n          (void)((void)0);\n        }\n        __if_result_1 = 5;\n" + "      } else {\n        __if_result_1 = 6;\n      }\n    __if_result_1;\n" + "    });\n  inner;\n  });\n  blorp_String* alias = owner;\n" + "  {\n    blorp_release(owner);\n    (void)((void)0);\n  }\n  return second;\n}\n"
+
+	match try_emit_prepared_fixture_c_artifact_with_indentation(
+		prepared_core_program(program),
+		FunctionProfileOff,
+		False,
+	):
+		Err(_):
+			False
+		Ok(artifact):
+			artifact.c_code.contains(expected)
 
 
 pure func test_emit_deep_logical_expression_is_stack_bounded() -> Bool:
@@ -31566,6 +31833,22 @@ pure func test_emit_nested_statement_if_with_distinct_temps() -> Bool:
 tests: TestSuite = {
 	description = "Blorp compiler Core emit",
 	tests = [
+		(
+			"emit deep binding bodies preserves all declarations",
+			test_emit_deep_binding_bodies_preserve_all_declarations,
+		),
+		(
+			"emit deep binding RHS preserves nested declarations",
+			test_emit_deep_binding_rhs_preserves_nested_declarations,
+		),
+		(
+			"emit deep failed binding discards pending work",
+			test_emit_deep_failed_binding_discards_pending_work,
+		),
+		(
+			"emit binding context preserves temps scopes and drop",
+			test_emit_binding_context_preserves_temps_scopes_and_drop,
+		),
 		("emit empty program artifact shape", test_emit_empty_program_artifact_shape),
 		(
 			"emit foreign includes before declarations",
