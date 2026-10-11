@@ -3,7 +3,7 @@ import:
 	check as Checked
 	int as IntOps
 	option: to_result
-	syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration), FunctionExecution, Purity, Span
+	syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration), FunctionExecution, Span
 	text: concat
 
 
@@ -64,7 +64,6 @@ fixed record ConcreteUnion {
 
 
 fixed record FunctionSignature {
-	purity: Purity,
 	parameters: List[TypeRef],
 	return_type: TypeRef
 }
@@ -92,7 +91,6 @@ private pure func primitive_ref(value_type: PrimitiveType) -> TypeRef:
 pure func runtime_signature(operation: RuntimeOperation) -> FunctionSignature:
 	contract = runtime_contract(operation)
 	{
-		purity = contract.purity,
 		parameters = [primitive_ref(contract.parameter)],
 		return_type = primitive_ref(contract.return_type)
 	}
@@ -257,7 +255,6 @@ pure func specialized_contents(program: SpecializedProgram) -> SpecializedConten
 
 fixed record ConcreteBinding {
 	origin: Checked.BindingOrigin,
-	mutability: Checked.BindingMutability,
 	value_type: TypeRef,
 	span: Span
 }
@@ -513,28 +510,6 @@ private pure func instance_substitution(
 		Checked.FunctionDeclaration(key.declaration),
 		span,
 	)
-
-
-private pure func call_key(
-	call: Checked.CheckedCall,
-	substitution: List[TypeSubstitution],
-	unions: List[UnionInstance],
-	records: List[RecordInstance],
-) -> Result[Option[InstanceKey], Diagnostic]:
-	match call.target:
-		Checked.RuntimeFunction(_):
-			Ok(None)
-		Checked.UserFunction(declaration, arguments):
-			concrete ?= translated_list(
-				arguments,
-				pure func(
-					value: Checked.TypeRef,
-				): concrete_type(value, substitution, unions, call.span, records),
-			)
-			Ok(Some({
-				declaration = declaration,
-				arguments = concrete,
-			}))
 
 
 private fixed record UnionKey {
@@ -874,7 +849,7 @@ private pure func function_types(function: Checked.CheckedFunction) -> List[Chec
 		.append(function.signature.return_type)
 		.concat(assignment_types(function.assignments))
 
-	occurrences = match function.body:
+	match function.body:
 		Checked.CheckedValueBody(value):
 			types.concat(exit_types(value))
 		Checked.CheckedMatchBody(matched):
@@ -886,17 +861,6 @@ private pure func function_types(function: Checked.CheckedFunction) -> List[Chec
 					.concat(exit_types(arm.body))
 
 			types
-
-	-- Binding types are derived from these occurrences. Their name spans must
-	-- never replace an initializer's concrete request as diagnostic provenance.
-	occurrences.concat(
-		function.bindings.map(pure func(binding: Checked.BindingDefinition) -> Checked.TypeUse:
-			{
-				value_type = binding.value_type,
-				span = binding.span
-			}
-		),
-	)
 
 
 private pure func prepare_function(
@@ -1045,12 +1009,19 @@ private pure func translate_call(
 	target_result: Result[CallTarget, Diagnostic] = match call.target:
 		Checked.RuntimeFunction(operation):
 			Ok(RuntimeFunction(operation))
-		Checked.UserFunction(_, _):
-			request ?= call_key(call, substitution, unions, records)
-			key ?= request.to_result(invalid(call.span, "missing user instance key"))
+		Checked.UserFunction(declaration, arguments):
+			concrete ?= translated_list(
+				arguments,
+				pure func(
+					value: Checked.TypeRef,
+				): concrete_type(value, substitution, unions, call.span, records),
+			)
 			id ?= find_instance(
 				keys,
-				key,
+				{
+					declaration = declaration,
+					arguments = concrete
+				},
 			).to_result(invalid(call.span, "unexpanded function instance"))
 			Ok(UserFunction(id))
 
@@ -1298,7 +1269,6 @@ private pure func translate_function(
 		value_type ?= concrete_type(binding.value_type, substitution, unions, binding.span, records)
 		Ok({
 			origin = binding.origin,
-			mutability = binding.mutability,
 			value_type = value_type,
 			span = binding.span,
 		})
@@ -1341,7 +1311,6 @@ private pure func translate_function(
 	Ok({
 		execution = function.execution,
 		signature = {
-			purity = function.signature.purity,
 			parameters = parameters,
 			return_type = return_type
 		},
