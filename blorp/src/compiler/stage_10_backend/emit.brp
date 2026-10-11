@@ -810,6 +810,23 @@ private record FunctionBodyC {
 }
 
 
+private union FunctionBodyStep:
+	EmitFunctionBodyNode(CoreExpr, Int, FunctionEmissionContext)
+	EmittedFunctionBody(FunctionBodyC)
+
+
+-- Aggregate evaluation introduces linear binding chains on both edges of a
+-- Let. Keep their pending work off the native stack, including failure cleanup.
+private union FunctionBodyContinuation:
+	FunctionBodyDone
+	FinishLetRhs(CoreVar, Bool, CoreType, CoreExpr, CoreExpr, FunctionEmissionContext, FunctionBodyContinuation)
+	FinishLetBody(CoreVar, Bool, CoreType, CoreExpr, String, CoreExpr, FunctionEmissionContext, FunctionBodyContinuation)
+	FinishBorrowRhs(CoreVar, CoreType, CoreExpr, FunctionEmissionContext, FunctionBodyContinuation)
+	FinishBorrowBody(CoreVar, CoreType, String, FunctionEmissionContext, FunctionBodyContinuation)
+	FinishDiscardedRhs(CoreExpr, CoreExpr, FunctionEmissionContext, FunctionBodyContinuation)
+	PrependBodyStatements(String, FunctionBodyContinuation)
+
+
 ---
 The symbols every emission spells from: the validated plan `prepare_c_emission_symbols`
 built. Callables, closures, task closures, closure environments and types are all
@@ -15043,7 +15060,7 @@ private pure func emit_simple_expr_leaf(
 				)
 			else if TypeLayout.is_void_type(typ):
 				-- Void has no C storage: let and match bindings of Void type are
-				-- never declared (see `emit_let_body` and
+				-- never declared (see `emit_function_body` and
 				-- `emit_match_binding_declaration`). Void has exactly one value,
 				-- so a use of any Void-typed variable is the void value itself.
 				Some("(void)0")
@@ -23176,26 +23193,6 @@ private pure func emit_resource_scope(
 		})
 
 
-private pure func emit_discarded_binding_body(
-	rhs: CoreExpr,
-	body: CoreExpr,
-	next_temp: Int,
-	emission_context: FunctionEmissionContext,
-) -> Option[FunctionBodyC]:
-	rhs_c ?= emit_function_body(rhs, next_temp, nested_emission_context(emission_context))
-	body_c ?= emit_function_body(body, rhs_c.next_temp, emission_context)
-	Some({
-		statements = scoped_discard_expr_body(
-			emission_context.indent,
-			rhs,
-			rhs_c,
-		) + body_c.statements,
-		value = body_c.value,
-		next_temp = body_c.next_temp,
-		returns = body_c.returns,
-	})
-
-
 private pure func emit_bound_let_body(
 	name: CoreVar,
 	is_mutable: Bool,
@@ -23203,10 +23200,9 @@ private pure func emit_bound_let_body(
 	rhs: CoreExpr,
 	rendered_rhs: String,
 	body: CoreExpr,
-	next_temp: Int,
+	body_c: FunctionBodyC,
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
-	body_c ?= emit_function_body(body, next_temp, emission_context)
 	cleanup_policy: CoreReleasePolicy = let_cleanup_policy(name, is_mutable, typ, rhs)
 	protection ?= cancellation_let_protection(emission_context.cleanup_plan, name)
 	protects_local_owner: Bool = activation_requires_local_owner_protection(emission_context)
@@ -23249,60 +23245,14 @@ private pure func emit_bound_let_body(
 	})
 
 
-private pure func emit_let_body(
-	name: CoreVar,
-	is_mutable: Bool,
-	typ: CoreType,
-	rhs: CoreExpr,
-	body: CoreExpr,
-	next_temp: Int,
-	emission_context: FunctionEmissionContext,
-) -> Option[FunctionBodyC]:
-	if TypeLayout.is_void_type(typ) or name.name == "_":
-		emit_discarded_binding_body(rhs, body, next_temp, emission_context)
-	else:
-		match emit_simple_expr(rhs, emission_context):
-			Some(rhs_c):
-				emit_bound_let_body(
-					name,
-					is_mutable,
-					typ,
-					rhs,
-					rhs_c,
-					body,
-					next_temp,
-					emission_context,
-				)
-			None:
-				rhs_body ?= emit_function_body(
-					rhs,
-					next_temp,
-					nested_emission_context(emission_context),
-				)
-				rhs_value ?= required_body_value(rhs_body)
-				emit_bound_let_body(
-					name,
-					is_mutable,
-					typ,
-					rhs,
-					statement_expression(emission_context.indent, rhs_body.statements, rhs_value),
-					body,
-					rhs_body.next_temp,
-					emission_context,
-				)
-
-
 private pure func emit_bound_borrow_let_body(
 	name: CoreVar,
 	typ: CoreType,
 	rendered_rhs: String,
-	body: CoreExpr,
-	next_temp: Int,
+	body_c: FunctionBodyC,
 	emission_context: FunctionEmissionContext,
-) -> Option[FunctionBodyC]:
-	body_c ?= emit_function_body(body, next_temp, emission_context)
-
-	Some({
+) -> FunctionBodyC:
+	{
 		statements = emission_context.indent + TypeLayout.c_type_name(
 			typ,
 			selected_type_symbol_lookup(
@@ -23312,38 +23262,7 @@ private pure func emit_bound_borrow_let_body(
 		value = body_c.value,
 		next_temp = body_c.next_temp,
 		returns = body_c.returns,
-	})
-
-
-private pure func emit_borrow_let_body(
-	name: CoreVar,
-	typ: CoreType,
-	rhs: CoreExpr,
-	body: CoreExpr,
-	next_temp: Int,
-	emission_context: FunctionEmissionContext,
-) -> Option[FunctionBodyC]:
-	if TypeLayout.is_void_type(typ) or name.name == "_":
-		emit_discarded_binding_body(rhs, body, next_temp, emission_context)
-	else:
-		match emit_simple_expr(rhs, emission_context):
-			Some(rhs_c):
-				emit_bound_borrow_let_body(name, typ, rhs_c, body, next_temp, emission_context)
-			None:
-				rhs_body ?= emit_function_body(
-					rhs,
-					next_temp,
-					nested_emission_context(emission_context),
-				)
-				rhs_value ?= required_body_value(rhs_body)
-				emit_bound_borrow_let_body(
-					name,
-					typ,
-					statement_expression(emission_context.indent, rhs_body.statements, rhs_value),
-					body,
-					rhs_body.next_temp,
-					emission_context,
-				)
+	}
 
 
 private pure func emit_simple_or_call_body(
@@ -23551,15 +23470,184 @@ private pure func emit_function_body(
 	next_temp: Int,
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
+	var step: FunctionBodyStep = EmitFunctionBodyNode(expr, next_temp, emission_context)
+	var continuation: FunctionBodyContinuation = FunctionBodyDone
+	var result: Option[FunctionBodyC] = None
+
+	while result.is_none():
+		match step:
+			EmitFunctionBodyNode(current, temp, context):
+				match current:
+					LetExpr(name, is_mutable, typ, rhs, body):
+						if TypeLayout.is_void_type(typ) or name.name == "_":
+							continuation = FinishDiscardedRhs(rhs, body, context, continuation)
+							step = EmitFunctionBodyNode(rhs, temp, nested_emission_context(context))
+						else:
+							match emit_simple_expr(rhs, context):
+								Some(rendered_rhs):
+									continuation = FinishLetBody(
+										name,
+										is_mutable,
+										typ,
+										rhs,
+										rendered_rhs,
+										body,
+										context,
+										continuation,
+									)
+									step = EmitFunctionBodyNode(body, temp, context)
+								None:
+									continuation = FinishLetRhs(
+										name,
+										is_mutable,
+										typ,
+										rhs,
+										body,
+										context,
+										continuation,
+									)
+									step = EmitFunctionBodyNode(
+										rhs,
+										temp,
+										nested_emission_context(context),
+									)
+					BorrowLetExpr(name, typ, rhs, body):
+						if TypeLayout.is_void_type(typ) or name.name == "_":
+							continuation = FinishDiscardedRhs(rhs, body, context, continuation)
+							step = EmitFunctionBodyNode(rhs, temp, nested_emission_context(context))
+						else:
+							match emit_simple_expr(rhs, context):
+								Some(rendered_rhs):
+									continuation = FinishBorrowBody(
+										name,
+										typ,
+										rendered_rhs,
+										context,
+										continuation,
+									)
+									step = EmitFunctionBodyNode(body, temp, context)
+								None:
+									continuation = FinishBorrowRhs(
+										name,
+										typ,
+										body,
+										context,
+										continuation,
+									)
+									step = EmitFunctionBodyNode(
+										rhs,
+										temp,
+										nested_emission_context(context),
+									)
+					DropExpr(variable, _, release_policy, body, _, _):
+						continuation = PrependBodyStatements(
+							emit_drop_statement(variable, release_policy, context),
+							continuation,
+						)
+						step = EmitFunctionBodyNode(body, temp, context)
+					_:
+						match emit_function_body_leaf(current, temp, context):
+							Some(body_c):
+								step = EmittedFunctionBody(body_c)
+							None:
+								break
+			EmittedFunctionBody(body_c):
+				match continuation:
+					FunctionBodyDone:
+						result = Some(body_c)
+					FinishLetRhs(name, is_mutable, typ, rhs, body, context, rest):
+						match required_body_value(body_c):
+							Some(rhs_value):
+								continuation = FinishLetBody(
+									name,
+									is_mutable,
+									typ,
+									rhs,
+									statement_expression(
+										context.indent,
+										body_c.statements,
+										rhs_value,
+									),
+									body,
+									context,
+									rest,
+								)
+								step = EmitFunctionBodyNode(body, body_c.next_temp, context)
+							None:
+								break
+					FinishLetBody(name, is_mutable, typ, rhs, rendered_rhs, body, context, rest):
+						match emit_bound_let_body(
+							name,
+							is_mutable,
+							typ,
+							rhs,
+							rendered_rhs,
+							body,
+							body_c,
+							context,
+						):
+							Some(bound_c):
+								continuation = rest
+								step = EmittedFunctionBody(bound_c)
+							None:
+								break
+					FinishBorrowRhs(name, typ, body, context, rest):
+						match required_body_value(body_c):
+							Some(rhs_value):
+								continuation = FinishBorrowBody(
+									name,
+									typ,
+									statement_expression(
+										context.indent,
+										body_c.statements,
+										rhs_value,
+									),
+									context,
+									rest,
+								)
+								step = EmitFunctionBodyNode(body, body_c.next_temp, context)
+							None:
+								break
+					FinishBorrowBody(name, typ, rendered_rhs, context, rest):
+						continuation = rest
+						step = EmittedFunctionBody(
+							emit_bound_borrow_let_body(
+								name,
+								typ,
+								rendered_rhs,
+								body_c,
+								context,
+							),
+						)
+					FinishDiscardedRhs(rhs, body, context, rest):
+						continuation = PrependBodyStatements(
+							scoped_discard_expr_body(context.indent, rhs, body_c),
+							rest,
+						)
+						step = EmitFunctionBodyNode(body, body_c.next_temp, context)
+					PrependBodyStatements(statements, rest):
+						continuation = rest
+						step = EmittedFunctionBody(
+							{ body_c | statements = statements + body_c.statements },
+						)
+
+	result
+
+
+-- Binding and Drop edges are handled by emit_function_body's continuation
+-- loop. Other expression families retain their existing child-emission rules.
+private pure func emit_function_body_leaf(
+	expr: CoreExpr,
+	next_temp: Int,
+	emission_context: FunctionEmissionContext,
+) -> Option[FunctionBodyC]:
 	match expr:
 		RawMatchExpr(scrutinee, cases, typ, loc):
 			None
 		SemanticMatchExpr(scrutinee, tree, typ, loc):
 			None
-		LetExpr(name, is_mutable, typ, rhs, body):
-			emit_let_body(name, is_mutable, typ, rhs, body, next_temp, emission_context)
-		BorrowLetExpr(name, typ, rhs, body):
-			emit_borrow_let_body(name, typ, rhs, body, next_temp, emission_context)
+		LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | DropExpr(_, _, _, _, _, _):
+			None
 		LiteralExpr(literal, typ, loc):
 			value ?= emit_simple_expr(expr, emission_context)
 			Some(body_value(value, next_temp))
@@ -23814,15 +23902,6 @@ private pure func emit_function_body(
 			body_c ?= emit_function_body(body, next_temp, emission_context)
 			Some({
 				statements = retain_statement + body_c.statements,
-				value = body_c.value,
-				next_temp = body_c.next_temp,
-				returns = body_c.returns,
-			})
-		DropExpr(variable, value_type, release_policy, body, typ, loc):
-			drop_statement: String = emit_drop_statement(variable, release_policy, emission_context)
-			body_c ?= emit_function_body(body, next_temp, emission_context)
-			Some({
-				statements = drop_statement + body_c.statements,
 				value = body_c.value,
 				next_temp = body_c.next_temp,
 				returns = body_c.returns,
