@@ -51,13 +51,15 @@ fixed union TypeRef:
 	UnionType(UnionInstanceId)
 
 
-fixed union PayloadShape:
-	NoPayload
-	IntPayload
+fixed union UnionRepresentation:
+	InlineUnmanaged
+	InlineOwningPayload
 
 
 fixed record ConcreteUnion {
-	variants: List[PayloadShape]
+	-- Complete inline storage; the summary is derived once from every child.
+	variants: List[Option[TypeRef]],
+	representation: UnionRepresentation
 }
 
 
@@ -139,8 +141,8 @@ fixed union ConcreteAssignment:
 
 fixed union PayloadBinding:
 	NoPayloadBinding
-	DiscardIntPayload
-	BindIntPayload(Checked.BindingId)
+	DiscardPayload
+	BindPayload(Checked.BindingId)
 
 
 fixed union ConcretePattern:
@@ -645,38 +647,69 @@ private pure func ensure_union(
 				Checked.UnionDeclaration(key.declaration),
 				span,
 			)
-			variants ?= translated_list(declaration.variants, pure func(
-				payload: Option[Checked.TypeUse],
-			) -> Result[PayloadShape, Diagnostic]:
+			var dependencies = unions
+			var variants: List[Option[TypeRef]] = []
+			var representation = InlineUnmanaged
+			var failure: Option[Diagnostic] = None
+
+			for payload in declaration.variants:
 				match payload:
 					None:
-						Ok(NoPayload)
+						variants = variants.append(None)
 					Some(written):
-						value ?= concrete_type(
+						match prepare_type(
 							written.value_type,
 							substitution,
-							unions,
+							declarations,
+							dependencies,
 							span,
 							records,
-						)
+						):
+							Err(error):
+								failure = Some(error)
+								break
+							Ok(prepared):
+								dependencies = prepared.unions
+								variants = variants.append(Some(prepared.value_type))
 
-						match value:
-							IntType:
-								Ok(IntPayload)
-							_:
-								Err({
-									span = span,
-									note = Some(UnionPayloadDeclaration(written.span)),
-									message = "specialized union payload must be Int",
-									help = "use Int for this payload; String and union payloads are not supported",
-								})
-			)
-			id: UnionInstanceId = into_opaque UnionInstanceId(unions.length())
+								match prepared.value_type:
+									StringType:
+										representation = InlineOwningPayload
+									UnionType(child):
+										match dependencies.get(union_number(child)):
+											Some(layout):
+												match layout.layout.representation:
+													InlineOwningPayload:
+														representation = InlineOwningPayload
+													InlineUnmanaged:
+														void
+											None:
+												failure = Some(
+													invalid(
+														span,
+														"missing concrete child layout",
+													),
+												)
+												break
+									_:
+										void
+
+			ready ?= match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(void)
+
+			-- Freeze dependencies first: every inline child precedes its parent.
+			id: UnionInstanceId = into_opaque UnionInstanceId(dependencies.length())
 			Ok({
 				value_type = UnionType(id),
-				unions = unions.append({
+				unions = dependencies.append({
 					key = key,
-					layout = {variants = variants},
+					layout = {
+						variants = variants,
+						representation = representation
+					},
 				}),
 			})
 
@@ -1202,9 +1235,9 @@ private pure func translate_pattern(
 				Checked.NoPayloadBinding:
 					NoPayloadBinding
 				Checked.DiscardPayload:
-					DiscardIntPayload
+					DiscardPayload
 				Checked.BindPayload(id):
-					BindIntPayload(id)
+					BindPayload(id)
 
 			Ok(VariantCase(variant, concrete_payload))
 

@@ -28,6 +28,7 @@ import:
 		RecordInstanceId,
 		TypeRef(IntType, StringType, UnionType, RecordType),
 		UnionInstanceId,
+		UnionRepresentation(InlineUnmanaged, InlineOwningPayload),
 		VariantInstanceId,
 		record_number,
 		same_type,
@@ -39,6 +40,7 @@ import:
 fixed union ValueOwnership:
 	NoOwnership
 	ManagedStringLeaf
+	InlineOwnedFields(UnionInstanceId)
 
 
 -- This identity names an obligation in an unverified function body. Only the
@@ -57,6 +59,7 @@ pure func owner_number(id: OwnerId) -> Int:
 fixed union BorrowSource:
 	ParameterBorrow(ValueId)
 	OwnerBorrow(OwnerId)
+	PayloadBorrow(ValueId)
 
 
 fixed record BorrowedValue {
@@ -72,8 +75,13 @@ fixed union OwnedArgument:
 
 fixed union ResultOwnership:
 	UnmanagedResult
-	BorrowedResult
+	BorrowedResult(BorrowSource)
 	OwnedResult(OwnerId)
+
+
+fixed union StoredPayload:
+	UnmanagedPayload(ValueId)
+	OwnedPayload(ValueId, OwnerId)
 
 
 fixed union OwnedValueOperation:
@@ -83,8 +91,8 @@ fixed union OwnedValueOperation:
 	IntegerDefinition(Int)
 	VariantDefinition(VariantInstanceId)
 	CallDefinition(ConcreteCall, List[OwnedArgument])
-	ConstructDefinition(VariantInstanceId, ValueId)
-	PayloadDefinition(ValueId)
+	ConstructDefinition(VariantInstanceId, StoredPayload)
+	PayloadDefinition(VariantInstanceId, ValueId)
 
 
 fixed record OwnedDefinition {
@@ -197,8 +205,14 @@ pure func value_ownership(
 			Ok(ManagedStringLeaf)
 		UnionType(id):
 			match unions.get(union_number(id)):
-				Some(_):
-					Ok(NoOwnership)
+				Some(layout):
+					Ok(
+						match layout.representation:
+							InlineUnmanaged:
+								NoOwnership
+							InlineOwningPayload:
+								InlineOwnedFields(id)
+					)
 				None:
 					Err(
 						internal_error(
@@ -315,7 +329,7 @@ pure func exit_last_uses(
 						Ok(current)
 			ConstructValue(_, value):
 				record_use(uses, value, position, prefix_count, first_value, definition.span)
-			PayloadValue(value):
+			PayloadValue(_, value):
 				record_use(uses, value, position, prefix_count, first_value, definition.span)
 			_:
 				Ok(uses)
@@ -402,26 +416,26 @@ pure func last_uses(
 	block_last_uses(definitions, result, 0, 0)
 
 
-private fixed union ValueSource:
-	UnmanagedSource
-	BorrowedSource
-	OwnedSource(OwnerId)
+private fixed record ChildAcquisition {
+	owner: OwnerId,
+	borrow: BorrowedValue
+}
 
 
 private fixed record BuiltDefinition {
 	definition: OwnedDefinition,
-	source: ValueSource,
-	next_owner: Int
+	next_owner: Int,
+	acquisition: Option[ChildAcquisition]
 }
 
 
 private pure func value_source(
 	value: ValueId,
-	sources: List[ValueSource],
-	prefix: List[ValueSource],
+	sources: List[ResultOwnership],
+	prefix: List[ResultOwnership],
 	first_value: Int,
 	span: Span,
-) -> Result[ValueSource, Diagnostic]:
+) -> Result[ResultOwnership, Diagnostic]:
 	ordinal = value_number(value)
 
 	entry = if IntOps.less_than(ordinal, prefix.length()):
@@ -434,22 +448,22 @@ private pure func value_source(
 
 private pure func arguments(
 	value: ValueId,
-	sources: List[ValueSource],
-	prefix: List[ValueSource],
+	sources: List[ResultOwnership],
+	prefix: List[ResultOwnership],
 	first_value: Int,
 	span: Span,
 ) -> Result[OwnedArgument, Diagnostic]:
 	source ?= value_source(value, sources, prefix, first_value, span)
 	Ok(
 		match source:
-			UnmanagedSource:
+			UnmanagedResult:
 				UnmanagedArgument(value)
-			BorrowedSource:
+			BorrowedResult(source):
 				BorrowedArgument({
 					value = value,
-					source = ParameterBorrow(value),
+					source = source,
 				})
-			OwnedSource(owner):
+			OwnedResult(owner):
 				BorrowedArgument({
 					value = value,
 					source = OwnerBorrow(owner),
@@ -459,14 +473,18 @@ private pure func arguments(
 
 private pure func build_definition(
 	definition: ValueDefinition,
-	sources: List[ValueSource],
-	prefix: List[ValueSource],
+	sources: List[ResultOwnership],
+	prefix: List[ResultOwnership],
 	first_value: Int,
 	next_owner: Int,
+	uses: List[Option[Int]],
+	position: Int,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[BuiltDefinition, Diagnostic]:
 	plan ?= value_ownership(definition.value_type, unions, records)
+	var next = next_owner
+	var acquisition: Option[ChildAcquisition] = None
 
 	operation_result: Result[OwnedValueOperation, Diagnostic] = match definition.operation:
 		ConstructRecordValue(owner, fields):
@@ -480,9 +498,58 @@ private pure func build_definition(
 		VariantValue(id):
 			Ok(VariantDefinition(id))
 		ConstructValue(id, argument):
-			Ok(ConstructDefinition(id, argument))
-		PayloadValue(value):
-			Ok(PayloadDefinition(value))
+			source ?= value_source(argument, sources, prefix, first_value, definition.span)
+
+			payload_result: Result[StoredPayload, Diagnostic] = match source:
+				UnmanagedResult:
+					Ok(UnmanagedPayload(argument))
+				_:
+					last = uses.get(IntOps.subtract(value_number(argument), first_value))
+
+					transferred = match source:
+						OwnedResult(owner):
+							match last:
+								Some(Some(last)):
+									if IntOps.equals(last, position):
+										Some(owner)
+									else:
+										None
+								_:
+									None
+						_:
+							None
+
+					match transferred:
+						Some(owner):
+							Ok(OwnedPayload(argument, owner))
+						None:
+							borrowed ?= arguments(
+								argument,
+								sources,
+								prefix,
+								first_value,
+								definition.span,
+							)
+
+							borrow_result: Result[BorrowedValue, Diagnostic] = match borrowed:
+								BorrowedArgument(borrow):
+									Ok(borrow)
+								_:
+									Err(internal_error(definition.span, "missing child borrow"))
+
+							borrow ?= borrow_result
+							owner = owner_id(next)
+							next = IntOps.add(next, 1)
+							acquisition = Some({
+								owner = owner,
+								borrow = borrow,
+							})
+							Ok(OwnedPayload(argument, owner))
+
+			payload ?= payload_result
+			Ok(ConstructDefinition(id, payload))
+		PayloadValue(variant, value):
+			Ok(PayloadDefinition(variant, value))
 		CallValue(call, written):
 			var converted: List[OwnedArgument] = []
 			var failure: Option[Diagnostic] = None
@@ -506,30 +573,24 @@ private pure func build_definition(
 	ownership_result: Result[ResultOwnership, Diagnostic] = match plan:
 		NoOwnership:
 			Ok(UnmanagedResult)
-		ManagedStringLeaf:
+		ManagedStringLeaf | InlineOwnedFields(_):
 			match operation:
 				ParameterDefinition(_):
-					Ok(BorrowedResult)
-				CallDefinition(_, _):
-					Ok(OwnedResult(owner_id(next_owner)))
+					Ok(BorrowedResult(ParameterBorrow(definition.id)))
+				PayloadDefinition(_, source):
+					Ok(BorrowedResult(PayloadBorrow(source)))
+				CallDefinition(_, _) | ConstructDefinition(_, _) | VariantDefinition(_):
+					Ok(OwnedResult(owner_id(next)))
 				_:
 					Err(internal_error(definition.span, "unsupported managed value operation"))
 
 	result ?= ownership_result
 
-	source = match result:
-		UnmanagedResult:
-			UnmanagedSource
-		BorrowedResult:
-			BorrowedSource
-		OwnedResult(owner):
-			OwnedSource(owner)
-
 	updated_owner = match result:
 		OwnedResult(_):
-			IntOps.add(next_owner, 1)
+			IntOps.add(next, 1)
 		_:
-			next_owner
+			next
 
 	Ok({
 		definition = {
@@ -539,8 +600,8 @@ private pure func build_definition(
 			result = result,
 			span = definition.span
 		},
-		source = source,
 		next_owner = updated_owner,
+		acquisition = acquisition,
 	})
 
 
@@ -548,38 +609,12 @@ private pure func managed_match(span: Span) -> Diagnostic:
 	{
 		span = span,
 		note = None,
-		message = "managed values before a tail match are not supported yet",
+		message = "owned managed values before a tail match are not supported yet",
 		help = concat(
-			"create Strings inside the selected match arm or a separate straight-line ",
+			"create managed values inside the selected match arm or a separate straight-line ",
 			"function",
 		)
 	}
-
-
--- Prefix owners and borrowed parameters need edge dependencies beyond this slice.
-private pure func require_unmanaged(
-	definitions: List[ValueDefinition],
-	unions: List[ConcreteUnion],
-	records: List[ConcreteRecord],
-) -> Result[Void, Diagnostic]:
-	var failure: Option[Diagnostic] = None
-
-	for definition in definitions:
-		match value_ownership(definition.value_type, unions, records):
-			Err(error):
-				failure = Some({ error | span = definition.span })
-				break
-			Ok(ManagedStringLeaf):
-				failure = Some(managed_match(definition.span))
-				break
-			Ok(NoOwnership):
-				void
-
-	match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(void)
 
 
 private fixed record ScheduledDrop {
@@ -637,7 +672,7 @@ private fixed record InsertedBlock {
 private pure func insert_block(
 	definitions: List[ValueDefinition],
 	exit: LoweredExit,
-	prefix: List[ValueSource],
+	prefix: List[ResultOwnership],
 	first_value: Int,
 	initial_owner: Int,
 	unions: List[ConcreteUnion],
@@ -646,18 +681,22 @@ private pure func insert_block(
 	uses ?= exit_last_uses(definitions, exit, prefix.length(), first_value)
 	var drops = definitions.map(pure func(_: ValueDefinition) -> List[ScheduledDrop]: [])
 	var operations: List[OwnershipOperation] = []
-	var sources: List[ValueSource] = []
+	var sources: List[ResultOwnership] = []
 	var next_owner = initial_owner
 	var position: Int = 0
 	var failure: Option[Diagnostic] = None
 
 	for definition in definitions:
+		var consumed: Option[OwnerId] = None
+
 		match build_definition(
 			definition,
 			sources,
 			prefix,
 			first_value,
 			next_owner,
+			uses,
+			position,
 			unions,
 			records,
 		):
@@ -665,12 +704,31 @@ private pure func insert_block(
 				failure = Some(error)
 				break
 			Ok(built):
+				match built.acquisition:
+					Some(acquired):
+						operations = operations.append(
+							AcquireOwner(
+								acquired.owner,
+								acquired.borrow,
+								definition.span,
+							),
+						)
+					None:
+						void
+
 				operations = operations.append(DefineValue(built.definition))
-				sources = sources.append(built.source)
+
+				consumed = match built.definition.operation:
+					ConstructDefinition(_, OwnedPayload(_, owner)):
+						Some(owner)
+					_:
+						None
+
+				sources = sources.append(built.definition.result)
 				next_owner = built.next_owner
 
-				match built.source:
-					OwnedSource(owner):
+				match built.definition.result:
+					OwnedResult(owner):
 						match schedule_drop(
 							drops,
 							owner,
@@ -690,7 +748,14 @@ private pure func insert_block(
 		match drops.get(position):
 			Some(bucket):
 				for dropped in bucket:
-					operations = operations.append(DropOwner(dropped.owner, dropped.span))
+					transferred = match consumed:
+						Some(owner):
+							IntOps.equals(owner_number(owner), owner_number(dropped.owner))
+						None:
+							False
+
+					if not transferred:
+						operations = operations.append(DropOwner(dropped.owner, dropped.span))
 			None:
 				failure = Some(internal_error(definition.span, "missing drop schedule row"))
 				break
@@ -722,18 +787,18 @@ private pure func insert_block(
 					source ?= value_source(result, sources, prefix, first_value, span)
 
 					tail = match source:
-						UnmanagedSource:
+						UnmanagedResult:
 							UnmanagedReturn(result)
-						OwnedSource(owner):
+						OwnedResult(owner):
 							OwnedReturn(result, owner)
-						BorrowedSource:
+						BorrowedResult(source):
 							owner = owner_id(next_owner)
 							operations = operations.append(
 								AcquireOwner(
 									owner,
 									{
 										value = result,
-										source = ParameterBorrow(result)
+										source = source
 									},
 									span,
 								),
@@ -757,22 +822,32 @@ private pure func insert_match(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[OwnedFunction, Diagnostic]:
-	valid_prefix ?= require_unmanaged(function.definitions, unions, records)
 	var operations: List[OwnershipOperation] = []
-	var sources: List[ValueSource] = []
+	var sources: List[ResultOwnership] = []
 	var next_value = function.definitions.length()
 	var next_owner: Int = 0
 	var arms: List[OwnedArm] = []
 	var failure: Option[Diagnostic] = None
 
 	for definition in function.definitions:
-		match build_definition(definition, sources, [], 0, 0, unions, records):
+		match build_definition(definition, sources, [], 0, 0, [], 0, unions, records):
 			Ok(built):
-				operations = operations.append(DefineValue(built.definition))
-				sources = sources.append(built.source)
+				match built.definition.result:
+					OwnedResult(_):
+						failure = Some(managed_match(definition.span))
+						break
+					_:
+						operations = operations.append(DefineValue(built.definition))
+						sources = sources.append(built.definition.result)
 			Err(error):
 				failure = Some(error)
 				break
+
+	valid_prefix ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
 
 	for arm in matched.arms:
 		match insert_block(
@@ -833,7 +908,7 @@ private pure func admit_loop_values(
 			Err(error):
 				invalid = Some(error)
 				break
-			Ok(ManagedStringLeaf):
+			Ok(ManagedStringLeaf) | Ok(InlineOwnedFields(_)):
 				invalid = Some(managed_loop(definition.span))
 				break
 			Ok(NoOwnership):
@@ -862,7 +937,7 @@ private pure func admit_loop(
 					Err(error):
 						invalid = Some(error)
 						break
-					Ok(ManagedStringLeaf):
+					Ok(ManagedStringLeaf) | Ok(InlineOwnedFields(_)):
 						invalid = Some(managed_loop(annotation))
 						break
 					Ok(NoOwnership):

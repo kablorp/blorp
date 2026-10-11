@@ -140,7 +140,7 @@ semantic facts and spans, without references to live inference state.
    during destruction. Use [MEMORY_PLAN.md](MEMORY_PLAN.md) for granular tests;
    sanitizer silence or balanced totals alone do not establish correctness.
    Payload extraction uses a tail match: admit a borrowed managed parameter as
-   its scrutinee, preserve the projection's dependency on that parameter, and
+   its scrutinee, preserve the projection's dependency on its immediate value, and
    acquire/transfer returned children independently in each selected arm. Extend
    independent verification with the same admitted shapes. Owned managed prefix
    values still require separate edge-cleanup support; do not remove that guard
@@ -227,16 +227,59 @@ proxies, not self-compilation results. Do not advance the baseline between steps
 
 ## Progress
 
+The nested-application/unmanaged-payload increment starts from `1a8c37390`.
+Freeze all 110 existing valid fixtures and the FRESH host toolchain before
+implementation. Accept at most 10% aggregate allocation or retired-instruction
+growth, and 15% for any existing fixture, against that immediate baseline;
+existing e2e ceilings remain unchanged. Stop and investigate or rescope above
+400 net formatted production lines. Report production and test growth separately.
+Compare three serial matched pairs and inspect concrete layout dependency order
+and variant-specific payload types. Use one tagged C union representation for
+all payload-bearing unions, including prior Int-only examples; avoid a separate
+scalar-storage path solely to preserve old C text. Retain the resulting C diffs,
+exact new emission assertions, and all 110 existing native outcomes under the
+unchanged sanitizer gates. Payload-free output should remain byte-identical.
+The working examples are inferred and written `Box[Box[Int]]`, heterogeneous
+unmanaged variant payloads, and nested extraction through generic helpers.
+Managed payloads and contextual inference remain subsequent increments.
+Declaration payload annotations remain Int or their union's own type parameter;
+nested payload types enter through generic substitution. Direct declaration
+references, recursive data and dependency-cycle handling remain separate work.
+
 - [x] Multiple runtime arguments, one type parameter.
 - [x] Typed checking errors and direct error-data/renderer tests (independent code and test reviews approved).
 - [x] Explicit checking/synthesis boundary with preserved behavior (independent compiler and test reviews approved).
 - [x] Multiple function type parameters (independent compiler and test reviews approved).
 - [x] Multiple union type parameters (independent compiler and test reviews approved).
-- [ ] Written nested applications.
-- [ ] Unmanaged union payloads.
-- [ ] Managed String union payloads and exhaustive destruction.
+- [x] Written nested applications.
+- [x] Unmanaged union payloads.
+- [x] Managed String union payloads and exhaustive destruction.
 - [ ] Contextual inference.
+
+The nested/unmanaged increment passes its affected strict phase/verifier suites,
+the full ordinary pilot gate, unchanged fixture budgets, matched cost ceilings
+and independent compiler/test reviews. Its initial strict whole-unit gate failed
+five unchanged tail-checker callbacks, reproduced on `1a8c37390` and reduced to
+a host Perceus temporary-projection double retain. The subsequent
+[host projection repair](../benchmarks/results/compiler_nested_temporary_projection_2026-10-11.md)
+passed all 815 pilot callbacks under strict leak checking. No pilot test workaround
+was introduced. See the
+[increment report](../benchmarks/results/blorp_2_generic_nested_2026-10-10.md)
+for passing and failing evidence and the bounded host follow-up.
 
 Record later record/recursion increments when their concrete example and scope
 are established. Do not mark an item complete until its affected phase tests,
 native checks and independent reviews pass.
+
+Managed payload implementation follows the approved [step-6 handoff](GENERICS_HANDOFF.md).
+Its first red pins the former String rejection. The complete path passes all
+82 granular phase callbacks, 1,021 combined strict checks and 134 real-main
+native fixtures, including twelve managed examples and a depth-20 case. Eight
+deliberate producer/verifier/emitter faults fail their intended assertions and
+exact restorations pass. The canonical `Ok(match ...)` form is retained after
+the bounded host branch-drop repair. Final-hash matched costs pass unchanged
+10% aggregate/15% individual ceilings; all 121 existing outputs are byte-identical.
+Host fixpoint, standard leak and codegen checks pass. Independent compiler and
+test-runner reviews accept the source, fault checks and final matched evidence.
+The [step-6 report](../benchmarks/results/blorp_2_managed_union_payloads_2026-10-11.md)
+keeps the separate host Core failures and unsupported source shapes explicit.

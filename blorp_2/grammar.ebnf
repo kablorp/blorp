@@ -6,8 +6,9 @@
    {...} is zero or more occurrences; quoted strings are literal bytes;
    "A".."Z" is an inclusive single-byte range; comments use parentheses
    around asterisks. X - Y excludes the complete strings of Y from X.
-   Grammar literal escapes are \n = LF (0x0A), \t = TAB (0x09),
-   and \" = double quote (0x22). These do not introduce source escapes.
+   Grammar literal escapes are \n = LF (0x0A), \r = CR (0x0D), \t = TAB (0x09),
+   \" = double quote (0x22), and \xNN = the byte with hexadecimal value NN.
+   These grammar-literal escapes do not introduce source escapes.
    EOF succeeds only at the exact end of the source, consuming no byte.
 
    Lexical contracts:
@@ -20,7 +21,12 @@
    - Plus signs, separated minus signs, floats and arithmetic are unsupported.
      A dot starts UFCS, so `42.identity()` is a call and `42.5` is invalid.
    - Arrow bytes stay adjacent. Spaces occur only where these rules permit.
-   - All source bytes are ASCII; CR, comments and other bytes are unsupported.
+   - All source bytes are ASCII; CR is unsupported, including in comments.
+   - `--` starts a single-line comment ending before LF or EOF. It takes
+     precedence over a signed integer; `->` still forms an arrow.
+   - Blank, whitespace-only and comment-only lines are lexical trivia. Their
+     indentation has no layout meaning. Only lines containing code produce
+     indentation and newline tokens, retaining their original byte offsets.
 
    Syntax accepts any unreserved function, parameter and type identifier.
    `fixed`, `union`, and `record` are contextual words in declaration headers, and remain
@@ -40,9 +46,12 @@
    generic calls cannot infer all their parameters. Main and runtime prelude
    declarations cannot be generic. Explicit call type arguments are deferred.
    Fixed unions may declare ordered type parameters. Written applications take ordered
-   atomic arguments: Int, String, in-scope parameters or ordinary unions.
-   Nested written applications are unsupported. Payload annotations are Int
-   or one of the union's own parameters; concrete payloads must specialize to Int.
+   recursive type arguments: Int, String, in-scope parameters, records, ordinary
+   unions or further applications. Payload annotations are Int or one of the
+   union's own parameters; concrete payloads specialize to Int, String, an existing
+   inline record, or another finite inline union with an earlier concrete layout.
+   String-bearing inline unions own their active child path without an allocated
+   aggregate root. Recursive layouts and managed record fields remain unsupported.
    Phantom String applications remain valid. Instance identity includes the
    declaration and complete ordered concrete arguments, independently of layout.
    Type names occupy a separate namespace from function and variant names.
@@ -107,9 +116,12 @@
    string.length. Program functions and variants cannot conflict with prelude
    functions. No prelude function is inserted when its declaration is absent.
    Quoted labels are not general String values and cannot appear in programs.
-   Ownership admits fresh arm-local Strings in a tail match; its parameters and
-   prefix must remain unmanaged. Each arm drops its unused/intermediate owners
-   or transfers a String result. Managed outer dependencies and joins are deferred.
+   Ownership admits borrowed managed parameters and fresh arm-local managed values
+   in a tail match. Prefix definitions introduce no owned obligation, even one
+   discharged before the match. Each arm drops its unused/intermediate owners
+   or transfers its managed result. Payload extraction borrows the selected
+   immutable parent value and acquires returned children independently. Owned
+   outer dependencies, nested/non-tail matches and joins remain deferred.
 *)
 
 letter           = "A".."Z" | "a".."z" ;
@@ -121,17 +133,25 @@ identifier       = (identifier_start { identifier_byte }) - ("func" | "pure" | "
 space            = " " ;
 spaces           = { space } ;
 required_spaces  = space spaces ;
-newline          = "\n" ;
+ascii_byte       = "\x00".."\x7F" ;
+comment_byte     = ascii_byte - ("\n" | "\r") ;
+line_comment     = "--" { comment_byte } ;
+horizontal       = space | "\t" ;
+trivia_line      = { horizontal } [ line_comment ] "\n" ;
+newline          = [ line_comment ] "\n" { trivia_line } ;
+source_end       = [ line_comment ] EOF
+                 | newline { horizontal } [ line_comment ] EOF ;
 indent_one       = "\t" | "    " ;
 indent_two       = "\t\t" | "        " ;
 indent_three     = "\t\t\t" | "            " ;
 
 (* A function has one header followed by zero or more binding lines and a
    mandatory expression line or tail match.
-   A union has one header and one or more variant lines. A single LF
-   separates declarations; the final line may omit its LF.
-   Blank lines and trailing whitespace after the
-   final LF are unsupported. Spaces in a call are explicit, including f ( )
+   A union has one header and one or more variant lines. Code lines are
+   separated by LF and any number of complete trivia lines. Final code may
+   omit its LF; trailing trivia may also end at EOF. An inline comment does
+   not continue an expression onto a later code line. Spaces in a call are
+   explicit, including f ( )
    and 1 . f ( ). UFCS supplies its receiver as the first argument, followed
    by the ordered explicit arguments in its parentheses. All expressions stay on one
    line, including scrutinees and arm results. Indentation prefixes are entirely
@@ -148,7 +168,7 @@ primary          = integer | identifier | direct_call | record_literal ;
 receiver_call    = spaces "." spaces identifier spaces "(" spaces [ arguments ] spaces ")" ;
 field_read       = spaces "." spaces identifier ;
 expression       = primary { receiver_call | field_read } ;
-type_annotation  = identifier spaces [ "[" spaces identifier { spaces "," spaces identifier } spaces "]" ] ;
+type_annotation  = identifier spaces [ "[" spaces type_annotation { spaces "," spaces type_annotation } spaces "]" ] ;
 parameter        = identifier spaces ":" spaces type_annotation ;
 type_parameter   = "A".."Z" { letter | digit } ;
 type_parameters = "[" spaces type_parameter { spaces "," spaces type_parameter } spaces "]" spaces ;
@@ -173,9 +193,9 @@ fixed_union      = "fixed" required_spaces "union" required_spaces identifier sp
                    newline variant { newline variant } ;
 record_member    = identifier spaces ":" spaces type_annotation ;
 fixed_record     = "fixed" required_spaces "record" required_spaces identifier spaces "{" spaces
-                   record_member { spaces "," spaces record_member } spaces "}" ;
+                   record_member { spaces "," spaces record_member } spaces "}" spaces ;
 declaration      = function | fixed_union | fixed_record ;
-program          = declaration { newline declaration } [ newline ] EOF ;
+program          = { trivia_line } declaration { newline declaration } source_end ;
 
 (* The prelude uses the same lexical and header rules as the input program.
    An empty prelude parses but fails the required builtin-type checks. *)
@@ -183,4 +203,6 @@ builtin_type     = "type" required_spaces ("Int" | "String") spaces "=" spaces "
 builtin_label    = "\"int.to_string\"" | "\"string.length\"" ;
 runtime_function = function_header indent_one "builtin" spaces "(" spaces builtin_label spaces ")" spaces ;
 prelude_declaration = builtin_type | runtime_function ;
-prelude          = [ prelude_declaration { newline prelude_declaration } [ newline ] ] EOF ;
+prelude          = { trivia_line }
+                   (prelude_declaration { newline prelude_declaration } source_end
+                    | { horizontal } [ line_comment ] EOF) ;

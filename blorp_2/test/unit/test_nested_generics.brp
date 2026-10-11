@@ -1,0 +1,571 @@
+import:
+	../../src/check as Checked
+	../../src/lex: lex
+	../../src/lower as Lower
+	../../src/names: name_spelling
+	../../src/own as Owned
+	../../src/parse: parsed_contents
+	../../src/specialize as Concrete
+	../../src/syntax: Diagnostic, TypeSyntax(AtomicType, AppliedType)
+	compilation: compile
+	input: check_failure, parse, setup_diagnostic
+	test: TestSuite
+
+
+private BOX: String =
+	|fixed union Box[T]:
+	|	Box(T)
+	|pure func box[T](value: T) -> Box[T]:
+	|	Box(value)
+	|pure func unbox[T](value: Box[T]) -> T:
+	|	match value:
+	|		Box(payload): payload
+	|
+
+
+private pure func specialized(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	tokens ?= lex(source)
+	parsed ?= parse(tokens)
+	checked ?= Checked
+		.check(parsed)
+		.map_err(setup_diagnostic)
+	program ?= Concrete.specialize(checked)
+	Ok(Concrete.specialized_contents(program))
+
+
+pure func test_inferred_nested_payload_compiles_through_every_phase() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	unbox(unbox(box(box(7))))
+		|
+	compile(BOX + source).is_ok()
+
+
+pure func test_written_nested_payload_and_ufcs_compile() -> Bool:
+	source: String =
+		|pure func read(value: Box[Box[Int]]) -> Int:
+		|	value.unbox().unbox()
+		|func main() -> Int:
+		|	read(box(box(7)))
+		|
+	compile(BOX + source).is_ok()
+
+
+pure func test_existing_inline_record_can_be_boxed_and_projected() -> Bool:
+	source: String =
+		|fixed record Pair { first: Int, second: Int }
+		|pure func pair() -> Pair:
+		|	{ second = 9, first = 7 }
+		|func main() -> Int:
+		|	unbox(box(pair())).first
+		|
+	compile(BOX + source).is_ok()
+
+
+private MAIN: String =
+	|func main() -> Int:
+	|	unbox(unbox(box(box(7))))
+	|
+
+
+pure func test_parser_preserves_nested_tree_and_inner_spans() -> Bool:
+	prefix = "pure func read(value: Result[Int, Box["
+	source = prefix + "Int]]) -> Int:\n\t0\n"
+
+	match lex(source).and_then(pure func(tokens): parse(tokens)):
+		Err(_):
+			False
+		Ok(parsed):
+			facts = parsed_contents(parsed)
+
+			match facts.functions:
+				[function]:
+					match function.parameters:
+						[parameter]:
+							match parameter.type_name:
+								AppliedType(head, [AtomicType(first), AppliedType(inner, [AtomicType(last)], nested)], whole):
+									(
+										name_spelling(facts.names, head.id) == Some("Result")
+										and name_spelling(facts.names, first.id) == Some("Int")
+										and name_spelling(facts.names, inner.id) == Some("Box")
+										and name_spelling(facts.names, last.id) == Some("Int")
+										and last.span.start == prefix.length()
+										and last.span.end == prefix.length() + 3
+										and nested.start == prefix.length() - 4
+										and nested.end == prefix.length() + 4
+										and whole.end == prefix.length() + 5
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_unknown_nested_argument_reports_its_own_name_span() -> Bool:
+	prefix = BOX + "pure func read(value: Box[Box["
+
+	match check_failure(prefix + "Missing]]) -> Int:\n\t0\n" + MAIN):
+		Some(error):
+			match error.kind:
+				Checked.UnknownType(_):
+					error.span.start == prefix.length() and error.span.end == prefix.length() + 7
+				_:
+					False
+		None:
+			False
+
+
+pure func test_inner_application_arity_reports_the_inner_application_span() -> Bool:
+	prefix = BOX + "pure func read(value: Box["
+	marked = "Box[Int, Int]"
+
+	match check_failure(prefix + marked + "]) -> Int:\n\t0\n" + MAIN):
+		Some(error):
+			match error.kind:
+				Checked.UnionTypeArgumentCountMismatch(_, 1, 2):
+					(
+						error.span.start == prefix.length()
+						and error.span.end == prefix.length() + marked.length()
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_nested_rigid_annotation_substitutes_at_specialization() -> Bool:
+	source: String =
+		|pure func double_box[T](value: T) -> Box[Box[T]]:
+		|	box(box(value))
+		|func main() -> Int:
+		|	unbox(unbox(double_box(7)))
+		|
+
+	match specialized(BOX + source):
+		Ok(program):
+			match program.unions:
+				[inner, outer]:
+					match (inner.variants, outer.variants):
+						([Some(Concrete.IntType)], [Some(Concrete.UnionType(child))]):
+							Concrete.union_number(child) == 0
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+private CHOICE: String =
+	|fixed union Choice[A,B]:
+	|	Left(A)
+	|	Right(B)
+	|pure func left() -> Choice[Box[Int], Int]:
+	|	Left(box(7))
+	|pure func read(value: Choice[Box[Int], Int]) -> Int:
+	|	match value:
+	|		Left(item): unbox(item)
+	|		Right(item): item
+	|func main() -> Int:
+	|	read(left())
+	|
+
+
+pure func test_every_heterogeneous_variant_has_its_concrete_payload() -> Bool:
+	match specialized(BOX + CHOICE):
+		Ok(program):
+			match program.unions:
+				[inner, outer]:
+					match (inner.variants, outer.variants):
+						([Some(Concrete.IntType)], [Some(Concrete.UnionType(child)), Some(Concrete.IntType)]):
+							Concrete.union_number(child) == 0
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func lowered(source: String) -> Result[Lower.LoweredProgram, Diagnostic]:
+	tokens ?= lex(source)
+	parsed ?= parse(tokens)
+	checked ?= Checked
+		.check(parsed)
+		.map_err(setup_diagnostic)
+	program ?= Concrete.specialize(checked)
+	Lower.lower(program)
+
+
+pure func test_lowered_projection_preserves_selected_variant_and_aggregate_type() -> Bool:
+	match lowered(BOX + MAIN):
+		Err(_):
+			False
+		Ok(lowered):
+			program = Lower.lowered_functions(lowered)
+			var found = False
+
+			for function in program.functions:
+				match function.tail:
+					Lower.MatchValue(matched):
+						match matched.arms:
+							[arm]:
+								match (arm.label, arm.body.definitions):
+									(Lower.VariantLabel(selected), [projection]):
+										match (projection.operation, projection.value_type):
+											(Lower.PayloadValue(variant, source), Concrete.UnionType(child)):
+												found = (
+													Concrete.union_number(
+														Concrete.variant_owner(variant),
+													) == 1
+													and Concrete.union_number(
+														Concrete.variant_owner(selected),
+													) == 1
+													and Concrete.variant_number(
+														variant,
+													) == Concrete.variant_number(selected)
+													and Lower.value_number(
+														source,
+													) == Lower.value_number(matched.scrutinee)
+													and Concrete.union_number(child) == 0
+												)
+											_:
+												void
+									_:
+										void
+							_:
+								void
+					_:
+						void
+
+			found
+
+
+pure func test_ownership_preserves_unmanaged_projection_without_rc_operations() -> Bool:
+	match lowered(BOX + MAIN).and_then(pure func(program): Owned.own(program)):
+		Err(_):
+			False
+		Ok(program):
+			var found = False
+
+			for function in program.functions:
+				match function.tail:
+					Owned.MatchTail(matched):
+						match matched.arms:
+							[arm]:
+								match arm.operations:
+									[Owned.DefineValue(projection)]:
+										match (
+											projection.operation,
+											projection.value_type,
+											projection.result,
+										):
+											(Owned.PayloadDefinition(variant, source), Concrete.UnionType(child), Owned.UnmanagedResult):
+												found = (
+													Concrete.union_number(
+														Concrete.variant_owner(variant),
+													) == 1
+													and Lower.value_number(
+														source,
+													) == Lower.value_number(matched.scrutinee)
+													and Concrete.union_number(child) == 0
+												)
+											_:
+												void
+									_:
+										void
+							_:
+								void
+					_:
+						void
+
+			found
+
+
+pure func test_emission_defines_children_before_variant_specific_payload_storage() -> Bool:
+	match compile(BOX + CHOICE):
+		Err(_):
+			False
+		Ok(output):
+			output.contains((
+					"struct blorp_u_0{enum blorp_tag_0 tag;union{int64_t blorp_up_0;}payload;};enum "
+					+ "blorp_tag_1"
+				)) and output.contains(
+				"union{struct blorp_u_0 blorp_up_0;int64_t blorp_up_1;}payload;}",
+			) and output.contains(".payload.blorp_up_0") and output.contains(".payload.blorp_up_1")
+
+
+pure func test_nested_complete_keys_reuse_identical_and_distinguish_swapped_arguments() -> Bool:
+	source: String =
+		|fixed union Marker[T]:
+		|	Only
+		|fixed union Choice[A,B]:
+		|	Left(A)
+		|	Right(B)
+		|pure func first() -> Choice[Marker[Int], Marker[String]]:
+		|	Left(Only)
+		|pure func second() -> Choice[Marker[String], Marker[Int]]:
+		|	Right(Only)
+		|func main() -> Int:
+		|	first_value = first()
+		|	again = first()
+		|	other = second()
+		|	0
+		|
+
+	match specialized(source):
+		Ok(program):
+			match (program.unions, program.functions):
+				([integer, text, first_layout, second_layout], [first, second, _]):
+					match (
+						integer.variants,
+						text.variants,
+						first_layout.variants,
+						second_layout.variants,
+					):
+						([None], [None], [Some(Concrete.UnionType(a)), Some(Concrete.UnionType(b))], [Some(Concrete.UnionType(c)), Some(Concrete.UnionType(d))]):
+							(
+								Concrete.union_number(a) == 0
+								and Concrete.union_number(b) == 1
+								and Concrete.union_number(c) == 1
+								and Concrete.union_number(d) == 0
+								and not Concrete.same_type(
+									first.signature.return_type,
+									second.signature.return_type,
+								)
+							)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_nongeneric_tail_loop_accepts_nested_unmanaged_values() -> Bool:
+	source: String =
+		|fixed union Step:
+		|	Stop
+		|	Once
+		|@tail_recursive
+		|pure func walk(step: Step, value: Box[Box[Int]]) -> Int:
+		|	match step:
+		|		Stop: unbox(unbox(value))
+		|		Once: walk(Stop, value)
+		|func main() -> Int:
+		|	walk(Once, box(box(7)))
+		|
+	compile(BOX + source).is_ok()
+
+
+pure func test_missing_inner_bracket_points_to_its_terminator() -> Bool:
+	prefix = "pure func read(value: Box[Box[Int"
+
+	match lex(prefix + ") -> Int:\n\t0\n").and_then(pure func(tokens): parse(tokens)):
+		Err(error):
+			(
+				error.span.start == prefix.length()
+				and error.span.end == prefix.length() + 1
+				and error.message == "expected ']' after the type arguments"
+				and error.help == "write comma-separated type arguments, such as Result[Box[Int], Int]"
+			)
+		Ok(_):
+			False
+
+
+pure func test_ownership_preserves_each_heterogeneous_arm_variant_position() -> Bool:
+	match lowered(BOX + CHOICE).and_then(pure func(program): Owned.own(program)):
+		Err(_):
+			False
+		Ok(program):
+			var observed = 0
+			var valid = True
+
+			for function in program.functions:
+				match function.tail:
+					Owned.MatchTail(matched):
+						if Concrete.union_number(matched.owner) == 1:
+							for arm in matched.arms:
+								match (arm.label, arm.operations.get(0)):
+									(Lower.VariantLabel(label), Some(Owned.DefineValue(projection))):
+										match (projection.operation, projection.result):
+											(Owned.PayloadDefinition(variant, source), Owned.UnmanagedResult):
+												valid = (
+													valid
+													and Concrete.union_number(
+														Concrete.variant_owner(
+															variant,
+														),
+													) == Concrete.union_number(
+														Concrete.variant_owner(label),
+													)
+													and Concrete.variant_number(
+														variant,
+													) == Concrete.variant_number(label)
+													and Lower.value_number(
+														source,
+													) == Lower.value_number(matched.scrutinee)
+												)
+
+												match projection.value_type:
+													Concrete.UnionType(child):
+														valid = (
+															valid
+															and Concrete.variant_number(label) == 0
+															and Concrete.union_number(child) == 0
+														)
+													Concrete.IntType:
+														valid = (
+															valid
+															and Concrete.variant_number(label) == 1
+														)
+													_:
+														valid = False
+
+												observed += 1
+											_:
+												valid = False
+									_:
+										valid = False
+
+								for operation in arm.operations:
+									match operation:
+										Owned.DefineValue(_):
+											void
+										_:
+											valid = False
+					_:
+						void
+
+			valid and observed == 2
+
+
+pure func test_lowering_preserves_the_second_variant_projection_identity() -> Bool:
+	match lowered(BOX + CHOICE):
+		Err(_):
+			False
+		Ok(lowered):
+			var found = False
+
+			for function in Lower.lowered_functions(lowered).functions:
+				match function.tail:
+					Lower.MatchValue(matched):
+						match matched.arms:
+							[_, arm]:
+								match (arm.label, arm.body.definitions):
+									(Lower.VariantLabel(label), [projection]):
+										match (projection.operation, projection.value_type):
+											(Lower.PayloadValue(variant, source), Concrete.IntType):
+												found = (
+													Concrete.variant_number(label) == 1
+													and Concrete.variant_number(variant) == 1
+													and Concrete.union_number(
+														Concrete.variant_owner(
+															variant,
+														),
+													) == Concrete.union_number(matched.owner)
+													and Lower.value_number(
+														source,
+													) == Lower.value_number(matched.scrutinee)
+												)
+											_:
+												void
+									_:
+										void
+							_:
+								void
+					_:
+						void
+
+			found
+
+
+pure func test_nested_expected_result_does_not_add_contextual_inference() -> Bool:
+	source: String =
+		|fixed union Marker[T]:
+		|	Only
+		|pure func empty[T]() -> Marker[T]:
+		|	Only
+		|pure func expected() -> Box[Marker[Int]]:
+		|	box(empty())
+		|func main() -> Int:
+		|	0
+		|
+
+	match check_failure(BOX + source):
+		Some(error):
+			match error.kind:
+				Checked.UninferableTypeParameter(_):
+					True
+				_:
+					False
+		None:
+			False
+
+
+tests: TestSuite = {
+	description = "Nested generic types and unmanaged union payloads",
+	tests = [
+		(
+			"lowering preserves second variant identity",
+			test_lowering_preserves_the_second_variant_projection_identity,
+		),
+		(
+			"nested result does not add contextual inference",
+			test_nested_expected_result_does_not_add_contextual_inference,
+		),
+		(
+			"ownership preserves both heterogeneous arm variants",
+			test_ownership_preserves_each_heterogeneous_arm_variant_position,
+		),
+		(
+			"nested complete keys reuse and preserve ordered nominal arguments",
+			test_nested_complete_keys_reuse_identical_and_distinguish_swapped_arguments,
+		),
+		(
+			"nongeneric loop accepts nested unmanaged values",
+			test_nongeneric_tail_loop_accepts_nested_unmanaged_values,
+		),
+		(
+			"missing inner bracket exact diagnostic",
+			test_missing_inner_bracket_points_to_its_terminator,
+		),
+		(
+			"recursive parsed tree and inner spans",
+			test_parser_preserves_nested_tree_and_inner_spans,
+		),
+		("unknown nested argument span", test_unknown_nested_argument_reports_its_own_name_span),
+		(
+			"inner application arity span",
+			test_inner_application_arity_reports_the_inner_application_span,
+		),
+		(
+			"nested rigid annotation specializes once",
+			test_nested_rigid_annotation_substitutes_at_specialization,
+		),
+		(
+			"every heterogeneous variant has precise payload",
+			test_every_heterogeneous_variant_has_its_concrete_payload,
+		),
+		(
+			"lower preserves aggregate projection facts",
+			test_lowered_projection_preserves_selected_variant_and_aggregate_type,
+		),
+		(
+			"ownership keeps unmanaged projection without RC",
+			test_ownership_preserves_unmanaged_projection_without_rc_operations,
+		),
+		(
+			"emission dependencies and variant storage",
+			test_emission_defines_children_before_variant_specific_payload_storage,
+		),
+		(
+			"inferred nested payload through the pipeline",
+			test_inferred_nested_payload_compiles_through_every_phase,
+		),
+		("written nested payload and UFCS", test_written_nested_payload_and_ufcs_compile),
+		("existing inline record payload", test_existing_inline_record_can_be_boxed_and_projected),
+	]
+}

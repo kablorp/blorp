@@ -226,10 +226,15 @@ owner to the caller. The caller borrows the result for length and then drops
 its owner. Arm-local bindings, aliases and reassignment follow the same value
 rules as straight-line code; [the cleanup companion](test/e2e/fixtures/match/string_cleanup.brp)
 returns its original alias after replacing a local and dropping unused Strings.
-The function's parameters and prefix before the match must remain unmanaged.
-Managed outer dependencies, nested/non-tail matches and joins are deferred.
+Borrowed managed parameters are admitted before the match. Prefix definitions
+must introduce no owned obligation; an unused owned prefix still rejects.
+Owned outer dependencies, nested/non-tail matches and joins are deferred.
 
 From the repository root:
+
+Blank lines and `--` single-line comments are accepted in pilot fixtures.
+Format host compiler/tests separately: the host formatter also supports syntax
+outside this pilot's restricted grammar.
 
 ```sh
 make                            # Build the existing compiler first.
@@ -421,15 +426,36 @@ separate rigid parameters. Specialization translates constructor and pattern
 identities, payload bindings and calls together. Generic functions can also
 receive concrete union values, including through direct calls and UFCS.
 
-Written annotations admit ordered atomic arguments, such as `Box[Int]` or
-`Result[Int, Int]`;
-nested written `Box[Box[Int]]` is unsupported. Semantic calls can produce a
-nested type, but `box(box(7))` fails when its outer payload specializes to a
-union. Concrete payloads must be Int. Unsupported payload diagnostics point
-to the written application or initiating call and note the payload declaration.
+Written annotations admit nested ordered arguments, such as `Box[Box[Int]]`
+or `Result[Box[Int], Int]`. The [nested example](test/e2e/fixtures/generic/nested/written.brp)
+declares `double_box[T](value: T) -> Box[Box[T]]` and extracts the result
+through ordinary `unbox` calls; its real `main` exits 7. Concrete payloads may
+be `Int`, `String`, an existing inline record, or another finite inline union. Specialization
+publishes complete payload types and defines child layouts before parents.
+Constructors and projections carry the selected variant identity through
+lowering, ownership and independent verification. Heterogeneous variants use
+distinct members of a tagged C union. String-bearing unions remain inline and
+own only their active variant's children. Their generated dup/drop helpers visit
+that child path; the union root has no heap allocation or reference count.
+Nullary and unmanaged active variants keep the same aggregate obligation while
+performing no child ownership work. Finite nesting composes through child-first
+helpers; recursive layouts and managed record fields remain unsupported.
 A phantom `Marker[String]` with no parameter payload remains valid, as does
 `Tagged[String]` whose field is explicitly Int. Equal layouts retain distinct
 nominal instance identities.
+
+The [managed payload example](test/e2e/fixtures/generic/managed/basic.brp) runs
+`unbox(box(42.to_string())).length()` and exits 2. Its tail match borrows the
+Box parameter and acquires an independent owner for the returned String. The
+[saved extraction](test/e2e/fixtures/generic/managed/saved.brp) still exits 2 after
+replacing the caller's Box; the [current value](test/e2e/fixtures/generic/managed/current.brp)
+exits 1. A [shared Box](test/e2e/fixtures/generic/managed/shared_box.brp) returned
+through generic identity also survives replacement. Calls borrow arguments and
+return owned managed values; constructors explicitly transfer child obligations.
+Strict phase/full pilot tests, all twelve native examples, eight ownership fault
+checks and final-hash matched costs pass independent review. The
+[increment report](../benchmarks/results/blorp_2_managed_union_payloads_2026-10-11.md)
+records the evidence, current limits and separate host Core failures.
 
 
 The [function-recursion example](test/e2e/fixtures/recursion/self.brp) uses an
@@ -557,16 +583,17 @@ func main() -> Int:
 ```
 
 It exits 7. Written applications must supply exactly the declared number of
-atomic arguments in order. A known `Result[T, E]` argument can infer both
+type arguments in order. A known `Result[T, E]` argument can infer both
 function parameters; matching visits runtime arguments first, then each type
 argument from left to right. Conflicts retain the earliest inferred occurrence.
 At a conflict, diagnostic expectations retain any uninferred callee parameters
 as rigid types. Accepted calls still require every parameter to be inferred.
 Constructors and patterns substitute the union's own parameter identities.
 Phantom arguments still distinguish instances even when layouts match.
-`Result[Int, String]` is rejected because its Err payload would be String,
-even when the program constructs only Ok. Nested written applications and
-managed payloads remain deferred.
+`Result[Int, String]` has an owning layout even when the program constructs only
+Ok: its complete variant inventory includes a String child. The Ok tag requires
+no child work, while Err dup/drop visits its String. Written applications and
+finite String-bearing payloads may nest.
 
 
 ## Grammar for this increment
@@ -576,14 +603,15 @@ return types, an ordered list of explicitly typed parameters, an optional ordere
 parameters on functions and fixed unions, plus nongeneric fixed records with
 one or more `Int` fields. Union variants have zero fields or
 one field annotated `Int` or one of the union's own parameters; concrete fields
-specialize to Int. A function
+specialize to Int, String, an existing inline record, or another finite inline union. A function
 body has zero or more binding lines followed by a single expression or a tail
 match with inline arm results or binding blocks. Expressions
 start with a signed Int64 literal, a binding or variant name, a record literal,
 or an application with an ordered list of arguments. UFCS calls and record
 field suffixes may follow that expression.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
-No other declarations, expressions, literals, statements, or comments are supported.
+No other declarations, expressions, literals, or statements are supported.
+Single-line comments begin with `--`; docstrings remain deferred.
 
 [`grammar.ebnf`](grammar.ebnf) defines the complete restricted source grammar
 and its EBNF dialect. Whitespace is explicit: LF is `"\n"`, TAB is `"\t"`, and
@@ -607,10 +635,17 @@ Lexical and layout rules:
 
 - Every declaration header starts at column 1. A function has one header,
   optional binding lines, and a final expression line or tail match; a union
-  has one header and at least one variant line. No blank
-  lines precede, separate, or follow declarations. Exactly one LF separates declarations.
-  The final line may end at EOF or with one LF.
-- The entire indentation prefix uses tabs only or spaces in groups of four.
+  has one header and at least one variant line. Blank, whitespace-only and
+  comment-only lines may appear before, between, and after code lines. Their
+  incidental indentation has no layout meaning. Real code lines require LF
+  separation; the final line may end at EOF.
+- `--` begins a comment anywhere outside a quoted builtin label and consumes
+  bytes up to LF or EOF. Inline comments preserve the code line's newline;
+  comments cannot continue expressions across lines. `---` is also an ordinary
+  line comment. Comments permit ASCII bytes, including tabs; CR and non-ASCII
+  bytes are rejected at their original byte offsets. There is no docstring
+  metadata or documentation fence syntax yet.
+- The entire indentation prefix of a real code line uses tabs only or spaces in groups of four.
   Body and variant lines require depth one: one tab or four spaces. Match arms
   require depth two: two tabs or eight spaces. Arm-block lines require depth
   three: three tabs or twelve spaces. Mixed indentation is invalid;
@@ -621,7 +656,7 @@ Lexical and layout rules:
   Identifiers are scanned as whole words, so
   `funcmain` is one identifier. The two characters of `->` are adjacent.
   Spaces may surround a UFCS dot and its parentheses, as in `1 . one ( )`.
-  Tabs occur only in the indentation prefix. Each expression stays on one line,
+  Outside comments, tabs occur only in the indentation prefix. Each expression stays on one line,
   including match scrutinees, binding initializers and final arm results.
 - `func`, `pure`, `match`, `var`, and lone `_` are reserved. The optional `pure` qualifier precedes `func`
   with spaces between the two keywords. Function, parameter and type names are
@@ -636,9 +671,10 @@ Lexical and layout rules:
   elsewhere. A variant is bare or has one type-name annotation, as in
   `Number(Int)` or `Box(T)`. A union may declare ordered parameters with
   `fixed union Result[T, E]:`; payload annotations are `Int` or one of its own parameters.
-  Function parameter and return annotations accept a nonempty list of atomic arguments,
-  such as `Box[Int]` or `Result[T, E]`. Empty declaration parentheses, multiple fields
-  and nested written applications are unsupported.
+  Function parameter and return annotations accept a nonempty list of recursive type arguments,
+  such as `Box[Box[Int]]` or `Result[T, Box[E]]`. Empty declaration parentheses and multiple fields
+  are unsupported. Payload annotations remain `Int` or the union's own parameter;
+  instantiated payloads may also be String, finite inline unions or existing inline records.
 - `fixed record Pair { first: Int, second: Int }` declares a nominal record
   on one line. Field names must be distinct and every field must be `Int`.
   `record` remains a contextual header word. Generic, empty, recursive and
@@ -702,7 +738,8 @@ Semantic rules:
   type, or the containing function's return type when there is no enclosing call.
   Variants in different unions may share a spelling; expected type chooses the
   owner. `First()` is invalid because a payload-free constructor is a value;
-  `Number(expression)` supplies the one `Int` field of a payload constructor.
+  `Number(expression)` supplies its one payload field, whose complete type is
+  established by the receiving union instance.
   A name cannot refer to another function's parameter or denote a function value.
   A local binding shadows a same-named constructor or direct call; its established type
   is preserved, with no fallback to a constructor when that type is wrong.
@@ -786,28 +823,31 @@ Semantic rules:
   and zero-argument generic calls diagnose uninferable parameters; no default
   type is chosen. A parameter in a union argument, as in `unbox(Box[T])`,
   is inferred structurally from the complete synthesized argument type.
-  Union instances are keyed by declaration and concrete argument; repeated
-  direct/UFCS requests reuse the same instance. Layout admission rejects
-  non-Int payloads before lowering, with application/request and payload spans.
+  Union instances are keyed by declaration and all ordered concrete arguments; repeated
+  direct/UFCS requests reuse the same instance. Layout admission accepts finite
+  String-bearing inline unions before lowering. Recursive declaration forms and
+  managed record fields remain unsupported.
 - Each concrete function has its checked C return type and a generated symbol based
   on its compilation-local identity. `Int` uses `int64_t`; each union uses its own
   synthetic enum when all its variants are nullary. A payload-bearing union
-  uses a distinct struct with an enum tag and one `int64_t` payload slot;
-  nullary construction initializes that unused slot to zero. A separate C `int main(void)` wrapper calls
+  uses a distinct struct with an enum tag and a C union containing a correctly
+  typed member for each payload-bearing variant. Nullary construction supplies
+  only its tag; omitted storage is zero-initialized. A separate C `int main(void)` wrapper calls
   the checked entrypoint and converts the result to the process exit status.
 - The final expression is the return value. No explicit `return` is needed.
 - `String` is an immutable managed leaf. The temporary input prelude supplies
   concrete pure functions `to_string(Int) -> String` and `length(String) -> Int`.
   Both direct calls and UFCS work. Parameters borrow for the duration of a
-  synchronous call; String results transfer an owner to the caller, including
+  synchronous call; managed results transfer an owner to the caller, including
   results that alias a borrowed parameter. Unused mortal results are released.
-  A tail-match arm may create, borrow, alias and return fresh arm-local Strings;
-  unused and intermediate owners are dropped on that arm, and a String result
-  transfers its owner. The function's parameters and binding/scrutinee prefix
-  must remain unmanaged. String literals, String union payloads, managed outer
-  dependencies, COW and joins are deferred.
+  String-bearing unions store their root inline and own their active children.
+  A tail-match arm may create, borrow, alias and return arm-local managed values;
+  unused and intermediate owners are dropped on that arm, and a managed result
+  transfers its owner. Borrowed managed parameters are admitted before a match;
+  its prefix must introduce no owned obligation, even one already dropped.
+  String literals, owned outer dependencies, COW and joins are deferred.
 - Parenthesized expressions,
-  multiple or non-Int payload fields, nested matches,
+  multiple payload fields, managed record fields, recursive layouts, nested matches,
   guards, qualified/nested/literal patterns, constructor UFCS, multiline chains,
   non-tail matches, and function
   values are outside this increment. `Bool` has no special treatment: a written
@@ -830,7 +870,8 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
 
 1. Lexing produces tokens with source spans and an explicit end-of-source span.
    Integer tokens retain their complete raw spelling; indentation tokens retain
-   their depth and the entire prefix span.
+   their depth and the entire prefix span. Trivia is skipped over the original
+   source bytes; no rewritten source or comment metadata crosses the boundary.
 2. Parsing produces function and union declarations, payload and parameter
    annotations, written names, ordered binding syntax, expression syntax, and structured match bodies.
    Match patterns preserve names and field syntax without deciding whether a
@@ -896,8 +937,10 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    Parsed payload annotations, parsed pattern fields and checked payloads use
    `Option` directly. An absent pattern field stays distinct from an explicit
    wildcard or named binding. Optional diagnostics retain their typed note and
-   exact declaration span. Concrete union layouts retain their separate
-   payload-free/Int alternatives.
+   exact declaration span. Concrete union layouts use `Option[TypeRef]` for
+   each variant; inline child layouts precede their parents. Projections retain
+   the selected variant identity through lowering and ownership so independent
+   verification checks the exact member and emission uses its typed C storage.
 
    Checked signatures retain one `TypeUse` per annotation, preserving its span.
    Concrete signatures belong to their separate immutable phase. Union instance

@@ -1,0 +1,555 @@
+import:
+	../../src/check as Checked
+	../../src/lex: lex
+	../../src/lower as Lower
+	../../src/own as Owned
+	../../src/specialize as Concrete
+	../../src/syntax: Diagnostic, FunctionExecution(OrdinaryCalls), Purity(Pure), Span
+	../../src/verify: verify
+	input: parse, setup_diagnostic
+	ownership_inputs: InputIds, input_ids, span
+	test: TestSuite
+
+
+private fixed record LayoutIds {
+	inner: Concrete.UnionInstanceId,
+	another_inner: Concrete.UnionInstanceId,
+	outer: Concrete.UnionInstanceId,
+	first: Concrete.VariantInstanceId,
+	second: Concrete.VariantInstanceId,
+	other: Concrete.VariantInstanceId,
+	record_id: Concrete.RecordInstanceId,
+	unions: List[Concrete.ConcreteUnion],
+	records: List[Concrete.ConcreteRecord]
+}
+
+
+-- The seed mints opaque identities through lowering. All tested ownership
+-- operations and layouts below are independently constructed, never inserted.
+private pure func layout_ids() -> Result[LayoutIds, Diagnostic]:
+	source: String =
+		|fixed union Box[T]:
+		|	Box(T)
+		|fixed union Choice[A,B]:
+		|	Left(A)
+		|	Right(B)
+		|fixed union Other[A,B]:
+		|	Left(A)
+		|	Right(B)
+		|fixed union OtherBox[T]:
+		|	Wrap(T)
+		|fixed record Pair { first: Int, second: Int }
+		|pure func first(value: Choice[Box[Int],Box[Int]]) -> Box[Int]:
+		|	match value:
+		|		Left(item): item
+		|		Right(item): item
+		|pure func other(value: Other[Box[Int],Box[Int]]) -> Box[Int]:
+		|	match value:
+		|		Left(item): item
+		|		Right(item): item
+		|pure func pair() -> Pair:
+		|	{ first = 7, second = 9 }
+		|pure func other_box(value: OtherBox[Int]) -> OtherBox[Int]:
+		|	value
+		|func main() -> Int:
+		|	0
+		|
+	tokens ?= lex(source)
+	parsed ?= parse(tokens)
+	checked ?= Checked
+		.check(parsed)
+		.map_err(setup_diagnostic)
+	concrete ?= Concrete.specialize(checked)
+	lowered ?= Lower.lower(concrete)
+	program = Lower.lowered_functions(lowered)
+
+	match program.functions:
+		[first, other, pair, other_box, _]:
+			match (
+				first.tail,
+				other.tail,
+				pair.signature.return_type,
+				other_box.signature.return_type,
+			):
+				(Lower.MatchValue(matched), Lower.MatchValue(another), Concrete.RecordType(record_id), Concrete.UnionType(another_inner)):
+					match (matched.arms, another.arms):
+						([left, right], [other, _]):
+							match (
+								left.label,
+								right.label,
+								other.label,
+								first.signature.return_type,
+							):
+								(Lower.VariantLabel(first), Lower.VariantLabel(second), Lower.VariantLabel(other), Concrete.UnionType(inner)):
+									Ok({
+										inner = inner,
+										another_inner = another_inner,
+										outer = matched.owner,
+										first = first,
+										second = second,
+										other = other,
+										record_id = record_id,
+										unions = program.unions,
+										records = program.records,
+									})
+								_:
+									Err({
+										span = span(0),
+										note = None,
+										message = "missing variant seed",
+										help = "fix seed",
+									})
+						_:
+							Err({
+								span = span(0),
+								note = None,
+								message = "missing arm seed",
+								help = "fix seed",
+							})
+				_:
+					Err({
+						span = span(0),
+						note = None,
+						message = "missing match seed",
+						help = "fix seed",
+					})
+		_:
+			Err({
+				span = span(0),
+				note = None,
+				message = "missing function seed",
+				help = "fix seed",
+			})
+
+
+private pure func main_function(ids: InputIds) -> Owned.OwnedFunction:
+	{
+		execution = OrdinaryCalls,
+		signature = {
+			purity = Pure,
+			parameters = [],
+			return_type = Concrete.IntType
+		},
+		operations = [Owned.DefineValue({
+				id = ids.first,
+				operation = Owned.IntegerDefinition(0),
+				value_type = Concrete.IntType,
+				result = Owned.UnmanagedResult,
+				span = span(0),
+			})],
+		tail = Owned.ReturnTail(Owned.ReturnResult(Owned.UnmanagedReturn(ids.first)))
+	}
+
+
+private pure func projection_program(ids: InputIds, layout: LayoutIds) -> Owned.OwnershipProgram:
+	{
+		entrypoint = ids.entrypoint,
+		records = layout.records,
+		unions = layout.unions,
+		functions = [
+			main_function(ids),
+			{
+				execution = OrdinaryCalls,
+				signature = {
+					purity = Pure,
+					parameters = [
+						Concrete.UnionType(layout.outer),
+						Concrete.UnionType(layout.outer),
+					],
+					return_type = Concrete.UnionType(layout.inner)
+				},
+				operations = [Owned.DefineValue({
+						id = ids.first,
+						operation = Owned.ParameterDefinition(0),
+						value_type = Concrete.UnionType(layout.outer),
+						result = Owned.UnmanagedResult,
+						span = span(10),
+					}), Owned.DefineValue({
+						id = ids.second,
+						operation = Owned.ParameterDefinition(1),
+						value_type = Concrete.UnionType(layout.outer),
+						result = Owned.UnmanagedResult,
+						span = span(11),
+					})],
+				tail = Owned.MatchTail({
+					scrutinee = ids.first,
+					owner = layout.outer,
+					arms = [
+						{
+							label = Lower.VariantLabel(layout.first),
+							operations = [Owned.DefineValue({
+									id = ids.third,
+									operation = Owned.PayloadDefinition(layout.first, ids.first),
+									value_type = Concrete.UnionType(layout.inner),
+									result = Owned.UnmanagedResult,
+									span = span(20),
+								})],
+							exit = Owned.ReturnResult(Owned.UnmanagedReturn(ids.third))
+						},
+						{
+							label = Lower.VariantLabel(layout.second),
+							operations = [Owned.DefineValue({
+									id = ids.fourth,
+									operation = Owned.PayloadDefinition(layout.second, ids.first),
+									value_type = Concrete.UnionType(layout.inner),
+									result = Owned.UnmanagedResult,
+									span = span(30),
+								})],
+							exit = Owned.ReturnResult(Owned.UnmanagedReturn(ids.fourth))
+						},
+					],
+				})
+			},
+		]
+	}
+
+
+private pure func rejects(input: Owned.OwnershipProgram, message: String, location: Span) -> Bool:
+	match verify(input):
+		Err(error):
+			(
+				error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+				and error.span.start == location.start
+				and error.span.end == location.end
+				and error.note.is_none()
+			)
+		Ok(_):
+			False
+
+
+private pure func replace_projection(
+	input: Owned.OwnershipProgram,
+	operation: Owned.OwnedValueOperation,
+	value_type: Concrete.TypeRef,
+) -> Owned.OwnershipProgram:
+	match input.functions:
+		[main, function]:
+			match function.tail:
+				Owned.MatchTail(matched):
+					match matched.arms:
+						[first, second]:
+							match first.operations:
+								[Owned.DefineValue(definition)]:
+									{ input | functions = [
+											main,
+											{ function | tail = Owned.MatchTail(
+													{ matched |
+														arms = [
+															{ first |
+																operations = [
+																	Owned.DefineValue({ definition |
+																			operation = operation,
+																			value_type = value_type
+																		}),
+																]
+															},
+															second,
+														]
+													},
+												) },
+										] }
+								_:
+									input
+						_:
+							input
+				_:
+					input
+		_:
+			input
+
+
+pure func test_accepts_precise_unmanaged_projection() -> Bool:
+	match (input_ids(), layout_ids()):
+		(Ok(ids), Ok(layout)):
+			verify(projection_program(ids, layout)).is_ok()
+		_:
+			False
+
+
+private pure func rejects_projection(
+	choose_variant: pure (LayoutIds) -> Concrete.VariantInstanceId,
+	second_source: Bool,
+	wrong_type: Bool,
+) -> Bool:
+	match (input_ids(), layout_ids()):
+		(Ok(ids), Ok(layout)):
+			source = if second_source:
+				ids.second
+			else:
+				ids.first
+
+			value_type = if wrong_type:
+				Concrete.UnionType(layout.another_inner)
+			else:
+				Concrete.UnionType(layout.inner)
+
+			input = replace_projection(
+				projection_program(ids, layout),
+				Owned.PayloadDefinition(choose_variant(layout), source),
+				value_type,
+			)
+
+			message = if wrong_type:
+				"definition type does not match its operation"
+			else:
+				"payload projection does not belong to this match arm"
+
+			rejects(input, message, span(20))
+		_:
+			False
+
+
+pure func test_rejects_sibling_variant_with_identical_payload_type() -> Bool:
+	rejects_projection(
+		pure func(layout): layout.second,
+		False,
+		False,
+	)
+
+
+pure func test_rejects_equal_shaped_other_variant_owner() -> Bool:
+	rejects_projection(
+		pure func(layout): layout.other,
+		False,
+		False,
+	)
+
+
+pure func test_rejects_another_scrutinee_of_the_same_union_type() -> Bool:
+	rejects_projection(
+		pure func(layout): layout.first,
+		True,
+		False,
+	)
+
+
+pure func test_rejects_wrong_declared_projection_type() -> Bool:
+	rejects_projection(
+		pure func(layout): layout.first,
+		False,
+		True,
+	)
+
+
+private pure func rejects_layout(
+	payload: pure (LayoutIds) -> Concrete.TypeRef,
+	first_row: Bool,
+	expected: String,
+) -> Bool:
+	match (input_ids(), layout_ids()):
+		(Ok(ids), Ok(layout)):
+			row: Concrete.ConcreteUnion = {
+				variants = [None, Some(payload(layout))],
+				representation = Concrete.InlineUnmanaged
+			}
+
+			unions = if first_row:
+				[row]
+			else:
+				layout.unions.append(row)
+
+			rejects(
+				{ projection_program(ids, layout) |
+					functions = [main_function(ids)],
+					unions = unions
+				},
+				expected,
+				{
+					start = 0,
+					end = 0
+				},
+			)
+		_:
+			False
+
+
+pure func test_rejects_false_unmanaged_summary_for_unused_string() -> Bool:
+	rejects_layout(
+		pure func(_): Concrete.StringType,
+		False,
+		"union ownership summary does not match its payloads",
+	)
+
+
+pure func test_rejects_unused_self_union_payload() -> Bool:
+	rejects_layout(
+		pure func(layout): Concrete.UnionType(layout.inner),
+		True,
+		"union payload must reference a supported, earlier layout",
+	)
+
+
+pure func test_rejects_unused_forward_union_payload() -> Bool:
+	match (input_ids(), layout_ids()):
+		(Ok(ids), Ok(layout)):
+			input = projection_program(ids, layout)
+			rejects(
+				{ input |
+					functions = [main_function(ids)],
+					unions = [
+						{
+							variants = [Some(Concrete.UnionType(layout.outer))],
+							representation = Concrete.InlineUnmanaged
+						},
+						{
+							variants = [None],
+							representation = Concrete.InlineUnmanaged
+						},
+					]
+				},
+				"union payload must reference a supported, earlier layout",
+				{
+					start = 0,
+					end = 0
+				},
+			)
+		_:
+			False
+
+
+pure func test_rejects_out_of_range_union_payload() -> Bool:
+	rejects_layout(
+		pure func(layout): Concrete.UnionType(Concrete.variant_owner(layout.other)),
+		True,
+		"union payload must reference a supported, earlier layout",
+	)
+
+
+pure func test_rejects_unknown_record_payload() -> Bool:
+	match (input_ids(), layout_ids()):
+		(Ok(ids), Ok(layout)):
+			input = projection_program(ids, layout)
+			rejects(
+				{ input |
+					functions = [main_function(ids)],
+					records = [],
+					unions = [
+						{
+							variants = [Some(Concrete.RecordType(layout.record_id))],
+							representation = Concrete.InlineUnmanaged
+						},
+					]
+				},
+				"union payload must reference a supported, earlier layout",
+				{
+					start = 0,
+					end = 0
+				},
+			)
+		_:
+			False
+
+
+pure func test_accepts_unused_known_record_payload() -> Bool:
+	match (input_ids(), layout_ids()):
+		(Ok(ids), Ok(layout)):
+			input = projection_program(ids, layout)
+			verify({ input |
+					functions = [main_function(ids)],
+					unions = layout.unions.append({
+						variants = [Some(Concrete.RecordType(layout.record_id))],
+						representation = Concrete.InlineUnmanaged,
+					})
+				}).is_ok()
+		_:
+			False
+
+
+pure func test_rejects_projection_from_a_nullary_selected_variant() -> Bool:
+	match (input_ids(), layout_ids()):
+		(Ok(ids), Ok(layout)):
+			input = projection_program(ids, layout)
+			unions = [
+				{
+					variants = [Some(Concrete.IntType)],
+					representation = Concrete.InlineUnmanaged
+				},
+				{
+					variants = [None, Some(Concrete.UnionType(layout.inner))],
+					representation = Concrete.InlineUnmanaged
+				},
+				{
+					variants = [
+						Some(Concrete.UnionType(layout.inner)),
+						Some(Concrete.UnionType(layout.inner)),
+					],
+					representation = Concrete.InlineUnmanaged
+				},
+				{
+					variants = [Some(Concrete.IntType)],
+					representation = Concrete.InlineUnmanaged
+				},
+			]
+			rejects({ input | unions = unions }, "selected variant has no payload", span(20))
+		_:
+			False
+
+
+pure func test_constructor_rejects_equal_shaped_nominal_child() -> Bool:
+	match (input_ids(), layout_ids()):
+		(Ok(ids), Ok(layout)):
+			function: Owned.OwnedFunction = {
+				execution = OrdinaryCalls,
+				signature = {
+					purity = Pure,
+					parameters = [Concrete.UnionType(layout.another_inner)],
+					return_type = Concrete.UnionType(layout.outer)
+				},
+				operations = [Owned.DefineValue({
+						id = ids.first,
+						operation = Owned.ParameterDefinition(0),
+						value_type = Concrete.UnionType(layout.another_inner),
+						result = Owned.UnmanagedResult,
+						span = span(10),
+					}), Owned.DefineValue({
+						id = ids.second,
+						operation = Owned.ConstructDefinition(
+							layout.first,
+							Owned.UnmanagedPayload(ids.first),
+						),
+						value_type = Concrete.UnionType(layout.outer),
+						result = Owned.UnmanagedResult,
+						span = span(20),
+					})],
+				tail = Owned.ReturnTail(Owned.ReturnResult(Owned.UnmanagedReturn(ids.second)))
+			}
+			rejects(
+				{ projection_program(ids, layout) | functions = [main_function(ids), function] },
+				"variant payload does not match its operation",
+				span(20),
+			)
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Independent nested union layout and projection verification",
+	tests = [
+		(
+			"nullary selected variant has no projection",
+			test_rejects_projection_from_a_nullary_selected_variant,
+		),
+		(
+			"constructor rejects equal shaped nominal child",
+			test_constructor_rejects_equal_shaped_nominal_child,
+		),
+		("precise unmanaged projection", test_accepts_precise_unmanaged_projection),
+		(
+			"wrong sibling with identical payload",
+			test_rejects_sibling_variant_with_identical_payload_type,
+		),
+		("wrong equal shaped variant owner", test_rejects_equal_shaped_other_variant_owner),
+		("wrong same typed scrutinee", test_rejects_another_scrutinee_of_the_same_union_type),
+		("wrong declared projection type", test_rejects_wrong_declared_projection_type),
+		(
+			"false unmanaged summary for unused String after nullary variant",
+			test_rejects_false_unmanaged_summary_for_unused_string,
+		),
+		("unused self union dependency", test_rejects_unused_self_union_payload),
+		("unused forward union dependency", test_rejects_unused_forward_union_payload),
+		("out of range union dependency", test_rejects_out_of_range_union_payload),
+		("unknown record payload", test_rejects_unknown_record_payload),
+		("known unused record payload", test_accepts_unused_known_record_payload),
+	]
+}

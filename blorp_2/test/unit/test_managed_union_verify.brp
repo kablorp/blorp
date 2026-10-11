@@ -1,0 +1,1651 @@
+import:
+	../../src/lex: lex
+	../../src/lower as Lower
+	../../src/own as Owned
+	../../src/specialize as Concrete
+	../../src/syntax: Diagnostic, FunctionExecution(OrdinaryCalls, SelfTailLoop), Purity(Pure), Span
+	../../src/text: concat
+	../../src/verify: verify
+	input: check, parse, setup_diagnostic
+	int as IntOps
+	managed_union_inputs: lowered
+	ownership_inputs: InputIds, input_ids, span
+	system: read_file
+	test: TestSuite
+
+
+private fixed record LayoutIds {
+	box: Concrete.UnionInstanceId,
+	boxed: Concrete.VariantInstanceId,
+	choice: Concrete.UnionInstanceId,
+	left: Concrete.VariantInstanceId,
+	right: Concrete.VariantInstanceId,
+	other: Concrete.UnionInstanceId,
+	othered: Concrete.VariantInstanceId,
+	outer: Concrete.UnionInstanceId,
+	wrapped: Concrete.VariantInstanceId
+}
+
+
+private pure func seed_error() -> Diagnostic:
+	{
+		span = span(0),
+		note = None,
+		message = "missing managed union verifier identity seed",
+		help = "fix the verifier test seed"
+	}
+
+
+private pure func seed_variant(
+	arm: Lower.LoweredArm,
+) -> Result[Concrete.VariantInstanceId, Diagnostic]:
+	match arm.label:
+		Lower.VariantLabel(id):
+			Ok(id)
+		_:
+			Err(seed_error())
+
+
+-- Lowering supplies opaque identities only. These tests independently declare
+-- every layout, operation, ownership obligation and borrow edge they verify.
+private pure func layout_ids() -> Result[LayoutIds, Diagnostic]:
+	source: String =
+		|fixed union Box[T]:
+		|    Box(T)
+		|fixed union Choice[T]:
+		|    Left(T)
+		|    Right(T)
+		|fixed union Other[T]:
+		|    Other(T)
+		|fixed union Outer[T]:
+		|    Outer(T)
+		|pure func box(value: Box[Int]) -> Int:
+		|    match value:
+		|        Box(item): item
+		|pure func choice(value: Choice[Int]) -> Int:
+		|    match value:
+		|        Left(item): item
+		|        Right(item): item
+		|pure func other(value: Other[Int]) -> Int:
+		|    match value:
+		|        Other(item): item
+		|pure func outer(value: Outer[Box[Int]]) -> Box[Int]:
+		|    match value:
+		|        Outer(item): item
+		|func main() -> Int:
+		|    0
+		|
+	tokens ?= lex(source)
+	parsed ?= parse(tokens)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	concrete ?= Concrete.specialize(checked)
+	lowered ?= Lower.lower(concrete)
+	program = Lower.lowered_functions(lowered)
+
+	match program.functions:
+		[box, choice, other, outer, _]:
+			match (box.tail, choice.tail, other.tail, outer.tail):
+				(Lower.MatchValue(box), Lower.MatchValue(choice), Lower.MatchValue(other), Lower.MatchValue(outer)):
+					match (box.arms, choice.arms, other.arms, outer.arms):
+						([boxed], [left, right], [othered], [wrapped]):
+							boxed ?= seed_variant(boxed)
+							left ?= seed_variant(left)
+							right ?= seed_variant(right)
+							othered ?= seed_variant(othered)
+							wrapped ?= seed_variant(wrapped)
+
+							-- Raw catalog rows below use this explicit producer-issued order.
+							if (
+								IntOps.equals(
+									Concrete.union_number(box.owner),
+									0,
+								)
+								and IntOps.equals(
+									Concrete.union_number(choice.owner),
+									1,
+								)
+								and IntOps.equals(
+									Concrete.union_number(other.owner),
+									2,
+								)
+								and IntOps.equals(
+									Concrete.union_number(outer.owner),
+									3,
+								)
+								and IntOps.equals(
+									Concrete.variant_number(boxed),
+									0,
+								)
+								and IntOps.equals(
+									Concrete.variant_number(left),
+									0,
+								)
+								and IntOps.equals(
+									Concrete.variant_number(right),
+									1,
+								)
+								and IntOps.equals(
+									Concrete.variant_number(othered),
+									0,
+								)
+								and IntOps.equals(
+									Concrete.variant_number(wrapped),
+									0,
+								)
+							):
+								Ok({
+									box = box.owner,
+									boxed = boxed,
+									choice = choice.owner,
+									left = left,
+									right = right,
+									other = other.owner,
+									othered = othered,
+									outer = outer.owner,
+									wrapped = wrapped,
+								})
+							else:
+								Err(seed_error())
+						_:
+							Err(seed_error())
+				_:
+					Err(seed_error())
+		_:
+			Err(seed_error())
+
+
+private pure func run(test: pure (InputIds, LayoutIds) -> Bool) -> Bool:
+	match (input_ids(), layout_ids()):
+		(Ok(ids), Ok(layout)):
+			IntOps.equals(
+				Lower.value_number(ids.first),
+				0,
+			) and IntOps.equals(
+				Lower.value_number(ids.second),
+				1,
+			) and IntOps.equals(
+				Lower.value_number(ids.third),
+				2,
+			) and IntOps.equals(
+				Lower.value_number(ids.fourth),
+				3,
+			) and IntOps.equals(
+				Lower.value_number(ids.fifth),
+				4,
+			) and IntOps.equals(
+				Concrete.function_number(ids.entrypoint),
+				0,
+			) and test(ids, layout)
+		_:
+			False
+
+
+private pure func layouts(layout: LayoutIds) -> List[Concrete.ConcreteUnion]:
+	[
+		{
+			variants = [Some(Concrete.StringType)],
+			representation = Concrete.InlineOwningPayload
+		},
+		{
+			variants = [Some(Concrete.StringType), Some(Concrete.StringType)],
+			representation = Concrete.InlineOwningPayload
+		},
+		{
+			variants = [Some(Concrete.StringType)],
+			representation = Concrete.InlineOwningPayload
+		},
+		{
+			variants = [Some(Concrete.UnionType(layout.box))],
+			representation = Concrete.InlineOwningPayload
+		},
+	]
+
+
+private pure func parameter(
+	id: Lower.ValueId,
+	position: Int,
+	value_type: Concrete.TypeRef,
+	at: Int,
+) -> Owned.OwnershipOperation:
+	Owned.DefineValue({
+		id = id,
+		value_type = value_type,
+		operation = Owned.ParameterDefinition(position),
+		result = Owned.BorrowedResult(Owned.ParameterBorrow(id)),
+		span = span(at),
+	})
+
+
+private pure func acquire(
+	owner: Int,
+	value: Lower.ValueId,
+	source: Owned.BorrowSource,
+	at: Int,
+) -> Owned.OwnershipOperation:
+	Owned.AcquireOwner(
+		Owned.owner_id(owner),
+		{
+			value = value,
+			source = source
+		},
+		span(at),
+	)
+
+
+private pure func constructed(
+	id: Lower.ValueId,
+	variant: Concrete.VariantInstanceId,
+	payload: Owned.StoredPayload,
+	result: Owned.ResultOwnership,
+	at: Int,
+) -> Owned.OwnershipOperation:
+	Owned.DefineValue({
+		id = id,
+		value_type = Concrete.UnionType(Concrete.variant_owner(variant)),
+		operation = Owned.ConstructDefinition(variant, payload),
+		result = result,
+		span = span(at),
+	})
+
+
+private pure func integer(id: Lower.ValueId, at: Int) -> Owned.OwnershipOperation:
+	Owned.DefineValue({
+		id = id,
+		value_type = Concrete.IntType,
+		operation = Owned.IntegerDefinition(7),
+		result = Owned.UnmanagedResult,
+		span = span(at),
+	})
+
+
+private pure func function(
+	parameters: List[Concrete.TypeRef],
+	return_type: Concrete.TypeRef,
+	operations: List[Owned.OwnershipOperation],
+	returned: Owned.ReturnTransfer,
+) -> Owned.OwnedFunction:
+	{
+		execution = OrdinaryCalls,
+		signature = {
+			purity = Pure,
+			parameters = parameters,
+			return_type = return_type
+		},
+		operations = operations,
+		tail = Owned.ReturnTail(Owned.ReturnResult(returned))
+	}
+
+
+private pure func main_function(ids: InputIds) -> Owned.OwnedFunction:
+	function(
+		[],
+		Concrete.IntType,
+		[integer(ids.first, 0)],
+		Owned.UnmanagedReturn(ids.first),
+	)
+
+
+private pure func program(
+	ids: InputIds,
+	layout: LayoutIds,
+	helper: Owned.OwnedFunction,
+) -> Owned.OwnershipProgram:
+	{
+		records = [],
+		unions = layouts(layout),
+		functions = [main_function(ids), helper],
+		entrypoint = ids.entrypoint
+	}
+
+
+private pure func rejects(input: Owned.OwnershipProgram, message: String, expected: Span) -> Bool:
+	match verify(input):
+		Err(error):
+			(
+				error.message == "ownership verification failed: ".concat(message)
+				and error.help == "report this compiler error with the input program"
+				and error.span.start == expected.start
+				and error.span.end == expected.end
+				and error.note.is_none()
+			)
+		Ok(_):
+			False
+
+
+private pure func constructor_program(
+	ids: InputIds,
+	layout: LayoutIds,
+	payload: Owned.StoredPayload,
+	result: Owned.ResultOwnership,
+	before: List[Owned.OwnershipOperation],
+	after: List[Owned.OwnershipOperation],
+) -> Owned.OwnershipProgram:
+	program(
+		ids,
+		layout,
+		function(
+			[Concrete.StringType, Concrete.StringType],
+			Concrete.UnionType(layout.box),
+			[
+				parameter(ids.first, 0, Concrete.StringType, 10),
+				parameter(ids.second, 1, Concrete.StringType, 11),
+			]
+				.concat(before)
+				.append(constructed(ids.third, layout.boxed, payload, result, 20))
+				.concat(after),
+			Owned.OwnedReturn(
+				ids.third,
+				Owned.owner_id(1),
+			),
+		),
+	)
+
+
+private pure func child_acquisition(ids: InputIds) -> Owned.OwnershipOperation:
+	acquire(
+		0,
+		ids.first,
+		Owned.ParameterBorrow(ids.first),
+		12,
+	)
+
+
+pure func test_constructor_consumes_child_and_returns_aggregate() -> Bool:
+	run(pure func(ids, layout):
+		verify(
+			constructor_program(
+				ids,
+				layout,
+				Owned.OwnedPayload(
+					ids.first,
+					Owned.owner_id(0),
+				),
+				Owned.OwnedResult(Owned.owner_id(1)),
+				[child_acquisition(ids)],
+				[],
+			),
+		).is_ok()
+	)
+
+
+pure func test_constructor_requires_child_transfer() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			constructor_program(
+				ids,
+				layout,
+				Owned.UnmanagedPayload(ids.first),
+				Owned.OwnedResult(Owned.owner_id(1)),
+				[child_acquisition(ids)],
+				[],
+			),
+			"managed payload requires an owner transfer",
+			span(20),
+		)
+	)
+
+
+pure func test_constructor_rejects_owner_of_another_value() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			constructor_program(
+				ids,
+				layout,
+				Owned.OwnedPayload(
+					ids.first,
+					Owned.owner_id(1),
+				),
+				Owned.OwnedResult(Owned.owner_id(2)),
+				[child_acquisition(ids), acquire(
+						1,
+						ids.second,
+						Owned.ParameterBorrow(ids.second),
+						13,
+					)],
+				[],
+			),
+			"payload owner does not own the stored value",
+			span(20),
+		)
+	)
+
+
+pure func test_constructor_rejects_discharged_child() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			constructor_program(
+				ids,
+				layout,
+				Owned.OwnedPayload(
+					ids.first,
+					Owned.owner_id(0),
+				),
+				Owned.OwnedResult(Owned.owner_id(1)),
+				[child_acquisition(ids), Owned.DropOwner(
+						Owned.owner_id(0),
+						span(13),
+					)],
+				[],
+			),
+			"payload owner has already been discharged",
+			span(20),
+		)
+	)
+
+
+pure func test_constructor_rejects_repeated_child_transfer() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			constructor_program(
+				ids,
+				layout,
+				Owned.OwnedPayload(
+					ids.first,
+					Owned.owner_id(0),
+				),
+				Owned.OwnedResult(Owned.owner_id(1)),
+				[child_acquisition(ids)],
+				[constructed(
+						ids.fourth,
+						layout.boxed,
+						Owned.OwnedPayload(
+							ids.first,
+							Owned.owner_id(0),
+						),
+						Owned.OwnedResult(Owned.owner_id(2)),
+						21,
+					)],
+			),
+			"payload owner has already been discharged",
+			span(21),
+		)
+	)
+
+
+pure func test_constructor_requires_aggregate_owner() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			constructor_program(
+				ids,
+				layout,
+				Owned.OwnedPayload(
+					ids.first,
+					Owned.owner_id(0),
+				),
+				Owned.UnmanagedResult,
+				[child_acquisition(ids)],
+				[],
+			),
+			"managed result requires an owner",
+			span(20),
+		)
+	)
+
+
+pure func test_constructor_rejects_equal_shaped_nominal_child() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			program(
+				ids,
+				layout,
+				function(
+					[Concrete.UnionType(layout.other)],
+					Concrete.UnionType(layout.outer),
+					[parameter(
+							ids.first,
+							0,
+							Concrete.UnionType(layout.other),
+							10,
+						), acquire(
+							0,
+							ids.first,
+							Owned.ParameterBorrow(ids.first),
+							11,
+						), constructed(
+							ids.second,
+							layout.wrapped,
+							Owned.OwnedPayload(
+								ids.first,
+								Owned.owner_id(0),
+							),
+							Owned.OwnedResult(Owned.owner_id(1)),
+							20,
+						)],
+					Owned.OwnedReturn(
+						ids.second,
+						Owned.owner_id(1),
+					),
+				),
+			),
+			"variant payload does not match its operation",
+			span(20),
+		)
+	)
+
+
+private pure func aliased_aggregate(
+	ids: InputIds,
+	layout: LayoutIds,
+	after: List[Owned.OwnershipOperation],
+) -> Owned.OwnershipProgram:
+	program(
+		ids,
+		layout,
+		function(
+			[Concrete.StringType],
+			Concrete.UnionType(layout.box),
+			[parameter(ids.first, 0, Concrete.StringType, 10), child_acquisition(ids), constructed(
+					ids.second,
+					layout.boxed,
+					Owned.OwnedPayload(
+						ids.first,
+						Owned.owner_id(0),
+					),
+					Owned.OwnedResult(Owned.owner_id(1)),
+					20,
+				), acquire(
+					2,
+					ids.second,
+					Owned.OwnerBorrow(Owned.owner_id(1)),
+					21,
+				)].concat(after),
+			Owned.OwnedReturn(
+				ids.second,
+				Owned.owner_id(2),
+			),
+		),
+	)
+
+
+pure func test_independent_aggregate_owner_survives_original_drop() -> Bool:
+	run(pure func(ids, layout):
+		verify(aliased_aggregate(ids, layout, [Owned.DropOwner(
+						Owned.owner_id(1),
+						span(22),
+					)])).is_ok()
+	)
+
+
+pure func test_extra_acquisition_does_not_reactivate_original_owner() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			aliased_aggregate(
+				ids,
+				layout,
+				[Owned.DropOwner(
+						Owned.owner_id(1),
+						span(22),
+					), acquire(
+						3,
+						ids.second,
+						Owned.OwnerBorrow(Owned.owner_id(1)),
+						23,
+					)],
+			),
+			"borrow refers to discharged owner 1",
+			span(23),
+		)
+	)
+
+
+private pure func variant_program(
+	ids: InputIds,
+	layout: LayoutIds,
+	payload: Option[Concrete.TypeRef],
+	result: Owned.ResultOwnership,
+) -> Owned.OwnershipProgram:
+	operation = match payload:
+		None:
+			Owned.DefineValue({
+				id = ids.second,
+				value_type = Concrete.UnionType(layout.choice),
+				operation = Owned.VariantDefinition(layout.left),
+				result = result,
+				span = span(20),
+			})
+		Some(_):
+			constructed(
+				ids.second,
+				layout.left,
+				Owned.UnmanagedPayload(ids.first),
+				result,
+				20,
+			)
+
+	input = program(
+		ids,
+		layout,
+		function(
+			[],
+			Concrete.UnionType(layout.choice),
+			[integer(ids.first, 10), operation],
+			Owned.OwnedReturn(
+				ids.second,
+				Owned.owner_id(0),
+			),
+		),
+	)
+	{ input | unions = layouts(layout).set(
+			1,
+			{
+				variants = [payload, Some(Concrete.StringType)],
+				representation = Concrete.InlineOwningPayload
+			},
+		) }
+
+
+pure func test_nullary_variant_has_aggregate_owner() -> Bool:
+	run(pure func(ids, layout):
+		verify(variant_program(ids, layout, None, Owned.OwnedResult(Owned.owner_id(0)))).is_ok()
+	)
+
+
+pure func test_nullary_variant_requires_aggregate_owner() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			variant_program(ids, layout, None, Owned.UnmanagedResult),
+			"managed result requires an owner",
+			span(20),
+		)
+	)
+
+
+pure func test_unmanaged_active_variant_has_aggregate_owner() -> Bool:
+	run(pure func(ids, layout):
+		verify(
+			variant_program(
+				ids,
+				layout,
+				Some(Concrete.IntType),
+				Owned.OwnedResult(Owned.owner_id(0)),
+			),
+		).is_ok()
+	)
+
+
+pure func test_unmanaged_active_variant_requires_aggregate_owner() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			variant_program(ids, layout, Some(Concrete.IntType), Owned.UnmanagedResult),
+			"managed result requires an owner",
+			span(20),
+		)
+	)
+
+
+pure func test_unmanaged_payload_cannot_transfer_owner() -> Bool:
+	run(pure func(ids, layout):
+		input = variant_program(
+			ids,
+			layout,
+			Some(Concrete.IntType),
+			Owned.OwnedResult(Owned.owner_id(0)),
+		)
+		bad = function(
+			[],
+			Concrete.UnionType(layout.choice),
+			[integer(ids.first, 10), constructed(
+					ids.second,
+					layout.left,
+					Owned.OwnedPayload(
+						ids.first,
+						Owned.owner_id(0),
+					),
+					Owned.OwnedResult(Owned.owner_id(1)),
+					20,
+				)],
+			Owned.OwnedReturn(
+				ids.second,
+				Owned.owner_id(1),
+			),
+		)
+		rejects(
+			{ input | functions = [main_function(ids), bad] },
+			"unmanaged payload cannot transfer an owner",
+			span(20),
+		)
+	)
+
+
+private pure func projected(
+	id: Lower.ValueId,
+	variant: Concrete.VariantInstanceId,
+	parent: Lower.ValueId,
+	source: Owned.BorrowSource,
+	at: Int,
+) -> Owned.OwnershipOperation:
+	Owned.DefineValue({
+		id = id,
+		value_type = Concrete.StringType,
+		operation = Owned.PayloadDefinition(variant, parent),
+		result = Owned.BorrowedResult(source),
+		span = span(at),
+	})
+
+
+private pure func projection_program(
+	ids: InputIds,
+	layout: LayoutIds,
+	first_operations: List[Owned.OwnershipOperation],
+	returned: Owned.ReturnTransfer,
+	prefix: List[Owned.OwnershipOperation],
+) -> Owned.OwnershipProgram:
+	program(
+		ids,
+		layout,
+		{
+			execution = OrdinaryCalls,
+			signature = {
+				purity = Pure,
+				parameters = [Concrete.UnionType(layout.choice), Concrete.UnionType(layout.choice)],
+				return_type = Concrete.StringType
+			},
+			operations = [parameter(
+					ids.first,
+					0,
+					Concrete.UnionType(layout.choice),
+					10,
+				), parameter(
+					ids.second,
+					1,
+					Concrete.UnionType(layout.choice),
+					11,
+				)].concat(prefix),
+			tail = Owned.MatchTail({
+				scrutinee = ids.first,
+				owner = layout.choice,
+				arms = [
+					{
+						label = Lower.VariantLabel(layout.left),
+						operations = first_operations,
+						exit = Owned.ReturnResult(returned)
+					},
+					{
+						label = Lower.VariantLabel(layout.right),
+						operations = [projected(
+								ids.fourth,
+								layout.right,
+								ids.first,
+								Owned.PayloadBorrow(ids.first),
+								30,
+							), acquire(
+								1,
+								ids.fourth,
+								Owned.PayloadBorrow(ids.first),
+								31,
+							)],
+						exit = Owned.ReturnResult(Owned.OwnedReturn(ids.fourth, Owned.owner_id(1)))
+					},
+				],
+			})
+		},
+	)
+
+
+private pure func projection(
+	ids: InputIds,
+	layout: LayoutIds,
+	variant: Concrete.VariantInstanceId,
+	parent: Lower.ValueId,
+	source: Owned.BorrowSource,
+) -> Owned.OwnershipProgram:
+	projection_program(
+		ids,
+		layout,
+		[projected(ids.third, variant, parent, source, 20), acquire(
+				0,
+				ids.third,
+				Owned.PayloadBorrow(ids.first),
+				21,
+			)],
+		Owned.OwnedReturn(
+			ids.third,
+			Owned.owner_id(0),
+		),
+		[],
+	)
+
+
+pure func test_selected_payload_returns_independent_owner() -> Bool:
+	run(pure func(ids, layout):
+		verify(
+			projection(
+				ids,
+				layout,
+				layout.left,
+				ids.first,
+				Owned.PayloadBorrow(ids.first),
+			),
+		).is_ok()
+	)
+
+
+pure func test_selected_nested_aggregate_returns_independent_owner() -> Bool:
+	run(pure func(ids, layout):
+		verify(
+			program(
+				ids,
+				layout,
+				{
+					execution = OrdinaryCalls,
+					signature = {
+						purity = Pure,
+						parameters = [Concrete.UnionType(layout.outer)],
+						return_type = Concrete.UnionType(layout.box)
+					},
+					operations = [parameter(
+							ids.first,
+							0,
+							Concrete.UnionType(layout.outer),
+							10,
+						)],
+					tail = Owned.MatchTail({
+						scrutinee = ids.first,
+						owner = layout.outer,
+						arms = [
+							{
+								label = Lower.VariantLabel(layout.wrapped),
+								operations = [Owned.DefineValue({
+										id = ids.second,
+										value_type = Concrete.UnionType(layout.box),
+										operation = Owned.PayloadDefinition(
+											layout.wrapped,
+											ids.first,
+										),
+										result = Owned.BorrowedResult(
+											Owned.PayloadBorrow(ids.first),
+										),
+										span = span(20),
+									}), acquire(
+										0,
+										ids.second,
+										Owned.PayloadBorrow(ids.first),
+										21,
+									)],
+								exit = Owned.ReturnResult(
+									Owned.OwnedReturn(
+										ids.second,
+										Owned.owner_id(0),
+									),
+								)
+							},
+						],
+					})
+				},
+			),
+		).is_ok()
+	)
+
+
+pure func test_projection_rejects_wrong_immediate_parent() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection(
+				ids,
+				layout,
+				layout.left,
+				ids.first,
+				Owned.PayloadBorrow(ids.second),
+			),
+			"payload borrow has the wrong parent value",
+			span(20),
+		)
+	)
+
+
+pure func test_projection_rejects_sibling_variant_with_same_payload() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection(
+				ids,
+				layout,
+				layout.right,
+				ids.first,
+				Owned.PayloadBorrow(ids.first),
+			),
+			"payload projection does not belong to this match arm",
+			span(20),
+		)
+	)
+
+
+pure func test_projection_rejects_equal_shaped_other_union() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection(
+				ids,
+				layout,
+				layout.othered,
+				ids.first,
+				Owned.PayloadBorrow(ids.first),
+			),
+			"payload projection does not belong to this match arm",
+			span(20),
+		)
+	)
+
+
+pure func test_projection_rejects_another_same_typed_scrutinee() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection(
+				ids,
+				layout,
+				layout.left,
+				ids.second,
+				Owned.PayloadBorrow(ids.second),
+			),
+			"payload projection does not belong to this match arm",
+			span(20),
+		)
+	)
+
+
+pure func test_projection_rejects_forward_source() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection(
+				ids,
+				layout,
+				layout.left,
+				ids.fourth,
+				Owned.PayloadBorrow(ids.fourth),
+			),
+			"value 3 is not defined before use",
+			span(20),
+		)
+	)
+
+
+pure func test_projection_rejects_self_parent_edge() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection(
+				ids,
+				layout,
+				layout.left,
+				ids.first,
+				Owned.PayloadBorrow(ids.third),
+			),
+			"payload borrow has the wrong parent value",
+			span(20),
+		)
+	)
+
+
+pure func test_projection_requires_parent_borrow_kind() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection(
+				ids,
+				layout,
+				layout.left,
+				ids.first,
+				Owned.ParameterBorrow(ids.third),
+			),
+			"managed projection requires its parent borrow",
+			span(20),
+		)
+	)
+
+
+pure func test_acquisition_rejects_wrong_payload_ancestry() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection_program(
+				ids,
+				layout,
+				[projected(
+						ids.third,
+						layout.left,
+						ids.first,
+						Owned.PayloadBorrow(ids.first),
+						20,
+					), acquire(
+						0,
+						ids.third,
+						Owned.PayloadBorrow(ids.second),
+						21,
+					)],
+				Owned.OwnedReturn(
+					ids.third,
+					Owned.owner_id(0),
+				),
+				[],
+			),
+			"payload borrow has the wrong parent value",
+			span(21),
+		)
+	)
+
+
+pure func test_acquisition_rejects_inactive_owner() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection_program(
+				ids,
+				layout,
+				[projected(
+						ids.third,
+						layout.left,
+						ids.first,
+						Owned.PayloadBorrow(ids.first),
+						20,
+					), acquire(
+						0,
+						ids.third,
+						Owned.OwnerBorrow(Owned.owner_id(0)),
+						21,
+					)],
+				Owned.OwnedReturn(
+					ids.third,
+					Owned.owner_id(0),
+				),
+				[],
+			),
+			"owner 0 is not defined",
+			span(21),
+		)
+	)
+
+
+pure func test_acquisition_rejects_active_owner_of_parent() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection_program(
+				ids,
+				layout,
+				[projected(
+						ids.third,
+						layout.left,
+						ids.first,
+						Owned.PayloadBorrow(ids.first),
+						20,
+					), acquire(
+						0,
+						ids.first,
+						Owned.ParameterBorrow(ids.first),
+						21,
+					), acquire(
+						1,
+						ids.third,
+						Owned.OwnerBorrow(Owned.owner_id(0)),
+						22,
+					)],
+				Owned.OwnedReturn(
+					ids.third,
+					Owned.owner_id(1),
+				),
+				[],
+			),
+			"owner 0 does not own value 2",
+			span(22),
+		)
+	)
+
+
+pure func test_returned_payload_requires_acquisition() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection_program(
+				ids,
+				layout,
+				[projected(
+						ids.third,
+						layout.left,
+						ids.first,
+						Owned.PayloadBorrow(ids.first),
+						20,
+					)],
+				Owned.UnmanagedReturn(ids.third),
+				[],
+			),
+			"managed return requires an owner transfer",
+			span(20),
+		)
+	)
+
+
+pure func test_returned_payload_cannot_name_unacquired_owner() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection_program(
+				ids,
+				layout,
+				[projected(
+						ids.third,
+						layout.left,
+						ids.first,
+						Owned.PayloadBorrow(ids.first),
+						20,
+					)],
+				Owned.OwnedReturn(
+					ids.third,
+					Owned.owner_id(0),
+				),
+				[],
+			),
+			"owner 0 is not defined",
+			span(20),
+		)
+	)
+
+
+pure func test_payload_owner_leak_is_rejected() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection_program(
+				ids,
+				layout,
+				[projected(
+						ids.third,
+						layout.left,
+						ids.first,
+						Owned.PayloadBorrow(ids.first),
+						20,
+					), acquire(
+						0,
+						ids.third,
+						Owned.PayloadBorrow(ids.first),
+						21,
+					), acquire(
+						1,
+						ids.third,
+						Owned.PayloadBorrow(ids.first),
+						22,
+					)],
+				Owned.OwnedReturn(
+					ids.third,
+					Owned.owner_id(1),
+				),
+				[],
+			),
+			"owner 0 remains live at return",
+			span(20),
+		)
+	)
+
+
+pure func test_payload_owner_double_drop_is_rejected() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection_program(
+				ids,
+				layout,
+				[projected(
+						ids.third,
+						layout.left,
+						ids.first,
+						Owned.PayloadBorrow(ids.first),
+						20,
+					), acquire(
+						0,
+						ids.third,
+						Owned.PayloadBorrow(ids.first),
+						21,
+					), Owned.DropOwner(
+						Owned.owner_id(0),
+						span(22),
+					), Owned.DropOwner(
+						Owned.owner_id(0),
+						span(23),
+					)],
+				Owned.OwnedReturn(
+					ids.third,
+					Owned.owner_id(0),
+				),
+				[],
+			),
+			"owner 0 has already been discharged",
+			span(23),
+		)
+	)
+
+
+pure func test_prefix_acquisition_is_rejected_before_match() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection_program(
+				ids,
+				layout,
+				[],
+				Owned.UnmanagedReturn(ids.first),
+				[acquire(
+						0,
+						ids.first,
+						Owned.ParameterBorrow(ids.first),
+						12,
+					)],
+			),
+			"managed value appears before a tail match",
+			span(10),
+		)
+	)
+
+
+pure func test_discharged_prefix_acquisition_still_rejects_match() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			projection_program(
+				ids,
+				layout,
+				[],
+				Owned.UnmanagedReturn(ids.first),
+				[acquire(
+						0,
+						ids.first,
+						Owned.ParameterBorrow(ids.first),
+						12,
+					), Owned.DropOwner(
+						Owned.owner_id(0),
+						span(13),
+					)],
+			),
+			"managed value appears before a tail match",
+			span(10),
+		)
+	)
+
+
+pure func test_discharged_owned_prefix_still_rejects_match() -> Bool:
+	run(pure func(ids, layout):
+		input = variant_program(
+			ids,
+			layout,
+			None,
+			Owned.OwnedResult(Owned.owner_id(0)),
+		)
+
+		match input.functions:
+			[main, helper]:
+				bad = { helper |
+					signature = {
+						purity = Pure,
+						parameters = [],
+						return_type = Concrete.IntType
+					},
+					operations = helper.operations.append(
+						Owned.DropOwner(
+							Owned.owner_id(0),
+							span(21),
+						),
+					),
+					tail = Owned.MatchTail({
+						scrutinee = ids.second,
+						owner = layout.choice,
+						arms = [
+							{
+								label = Lower.DefaultLabel,
+								operations = [],
+								exit = Owned.ReturnResult(Owned.UnmanagedReturn(ids.first))
+							},
+						],
+					})
+				}
+				rejects(
+					{ input | functions = [main, bad] },
+					"managed value appears before a tail match",
+					span(20),
+				)
+			_:
+				False
+	)
+
+
+private pure func unused_layout_program(
+	ids: InputIds,
+	layout: LayoutIds,
+	unions: List[Concrete.ConcreteUnion],
+) -> Owned.OwnershipProgram:
+	{
+		records = [],
+		unions = unions,
+		functions = [main_function(ids)],
+		entrypoint = ids.entrypoint
+	}
+
+
+private pure func layout_span() -> Span:
+	{
+		start = 0,
+		end = 0
+	}
+
+
+pure func test_unused_nested_owning_layout_is_accepted() -> Bool:
+	run(pure func(ids, layout):
+		verify(unused_layout_program(ids, layout, layouts(layout))).is_ok()
+	)
+
+
+pure func test_unused_string_layout_cannot_be_unmanaged() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			unused_layout_program(
+				ids,
+				layout,
+				[
+					{
+						variants = [None, Some(Concrete.StringType)],
+						representation = Concrete.InlineUnmanaged
+					},
+				],
+			),
+			"union ownership summary does not match its payloads",
+			layout_span(),
+		)
+	)
+
+
+pure func test_unused_unmanaged_layout_cannot_claim_ownership() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			unused_layout_program(
+				ids,
+				layout,
+				[
+					{
+						variants = [None, Some(Concrete.IntType)],
+						representation = Concrete.InlineOwningPayload
+					},
+				],
+			),
+			"union ownership summary does not match its payloads",
+			layout_span(),
+		)
+	)
+
+
+pure func test_unused_parent_cannot_hide_owning_child() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			unused_layout_program(
+				ids,
+				layout,
+				layouts(layout).set(
+					3,
+					{
+						variants = [Some(Concrete.UnionType(layout.box))],
+						representation = Concrete.InlineUnmanaged
+					},
+				),
+			),
+			"union ownership summary does not match its payloads",
+			layout_span(),
+		)
+	)
+
+
+pure func test_unused_self_layout_reference_is_rejected() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			unused_layout_program(
+				ids,
+				layout,
+				[
+					{
+						variants = [Some(Concrete.UnionType(layout.box))],
+						representation = Concrete.InlineOwningPayload
+					},
+				],
+			),
+			"union payload must reference a supported, earlier layout",
+			layout_span(),
+		)
+	)
+
+
+pure func test_unused_existing_forward_layout_reference_is_rejected() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			unused_layout_program(
+				ids,
+				layout,
+				layouts(layout).set(
+					0,
+					{
+						variants = [Some(Concrete.UnionType(layout.choice))],
+						representation = Concrete.InlineOwningPayload
+					},
+				),
+			),
+			"union payload must reference a supported, earlier layout",
+			layout_span(),
+		)
+	)
+
+
+pure func test_unused_unknown_layout_reference_is_rejected() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			unused_layout_program(
+				ids,
+				layout,
+				[
+					{
+						variants = [Some(Concrete.UnionType(layout.outer))],
+						representation = Concrete.InlineOwningPayload
+					},
+				],
+			),
+			"union payload must reference a supported, earlier layout",
+			layout_span(),
+		)
+	)
+
+
+pure func test_unused_empty_layout_is_rejected() -> Bool:
+	run(pure func(ids, layout):
+		rejects(
+			unused_layout_program(
+				ids,
+				layout,
+				[
+					{
+						variants = [],
+						representation = Concrete.InlineUnmanaged
+					},
+				],
+			),
+			"union layout must contain one or more variants",
+			layout_span(),
+		)
+	)
+
+
+pure func test_inline_owning_signature_is_rejected_in_a_self_tail_loop() -> Bool:
+	run(pure func(ids, layout):
+		input = variant_program(
+			ids,
+			layout,
+			None,
+			Owned.OwnedResult(Owned.owner_id(0)),
+		)
+
+		match input.functions:
+			[main, helper]:
+				rejects(
+					{ input | functions = [
+							main,
+							{ helper |
+								execution = SelfTailLoop(span(90)),
+								tail = Owned.ReturnTail(Owned.RecurArguments([], span(80)))
+							},
+						] },
+					"managed signature in a self-tail loop",
+					span(90),
+				)
+			_:
+				False
+	)
+
+
+pure func test_inline_owning_intermediate_is_rejected_even_after_drop() -> Bool:
+	run(pure func(ids, layout):
+		input = variant_program(
+			ids,
+			layout,
+			None,
+			Owned.OwnedResult(Owned.owner_id(0)),
+		)
+
+		match input.functions:
+			[main, helper]:
+				rejects(
+					{ input | functions = [
+							main,
+							{ helper |
+								execution = SelfTailLoop(span(90)),
+								signature = { helper.signature | return_type = Concrete.IntType },
+								operations = helper.operations.append(
+									Owned.DropOwner(
+										Owned.owner_id(0),
+										span(40),
+									),
+								),
+								tail = Owned.ReturnTail(Owned.RecurArguments([], span(80)))
+							},
+						] },
+					"managed value appears in a self-tail loop",
+					span(20),
+				)
+			_:
+				False
+	)
+
+
+-- Supplementary integration/lifetime probe; it supplies no expected raw facts.
+-- Reading the actual fixture prevents CTFE from erasing the stage lifetimes.
+func test_dynamic_fixture_reaches_verified_ownership() -> Bool:
+	match read_file("blorp_2/test/e2e/fixtures/generic/managed/basic.brp"):
+		Err(error):
+			print_error(error)
+			False
+		Ok(source):
+			match (
+				lowered(source)
+					.and_then(pure func(program): Owned.own(program))
+					.and_then(verify)
+			):
+				Err(error):
+					print_error(error.message)
+					False
+				Ok(_):
+					True
+
+
+tests: TestSuite = {
+	description = "Independent managed union ownership verification",
+	tests = [
+		(
+			"inline owning self-tail signature rejected",
+			test_inline_owning_signature_is_rejected_in_a_self_tail_loop,
+		),
+		(
+			"dropped inline owning self-tail intermediate rejected",
+			test_inline_owning_intermediate_is_rejected_even_after_drop,
+		),
+		(
+			"dynamic fixture stage lifetime integration",
+			test_dynamic_fixture_reaches_verified_ownership,
+		),
+		(
+			"constructor consumes exact child owner",
+			test_constructor_consumes_child_and_returns_aggregate,
+		),
+		("constructor requires child transfer", test_constructor_requires_child_transfer),
+		(
+			"constructor rejects another value owner",
+			test_constructor_rejects_owner_of_another_value,
+		),
+		("constructor rejects discharged child", test_constructor_rejects_discharged_child),
+		(
+			"constructor rejects repeated child transfer",
+			test_constructor_rejects_repeated_child_transfer,
+		),
+		("constructor requires aggregate owner", test_constructor_requires_aggregate_owner),
+		(
+			"constructor rejects equal shaped nominal child",
+			test_constructor_rejects_equal_shaped_nominal_child,
+		),
+		(
+			"independent aggregate owner survives original drop",
+			test_independent_aggregate_owner_survives_original_drop,
+		),
+		(
+			"extra acquisition cannot reactivate original owner",
+			test_extra_acquisition_does_not_reactivate_original_owner,
+		),
+		("nullary variant has aggregate owner", test_nullary_variant_has_aggregate_owner),
+		("nullary variant requires aggregate owner", test_nullary_variant_requires_aggregate_owner),
+		("Int variant has aggregate owner", test_unmanaged_active_variant_has_aggregate_owner),
+		(
+			"Int variant requires aggregate owner",
+			test_unmanaged_active_variant_requires_aggregate_owner,
+		),
+		("Int payload cannot transfer owner", test_unmanaged_payload_cannot_transfer_owner),
+		(
+			"selected payload returns independent owner",
+			test_selected_payload_returns_independent_owner,
+		),
+		(
+			"selected nested aggregate returns independent owner",
+			test_selected_nested_aggregate_returns_independent_owner,
+		),
+		(
+			"projection rejects wrong immediate parent",
+			test_projection_rejects_wrong_immediate_parent,
+		),
+		(
+			"projection rejects sibling variant",
+			test_projection_rejects_sibling_variant_with_same_payload,
+		),
+		(
+			"projection rejects other nominal union",
+			test_projection_rejects_equal_shaped_other_union,
+		),
+		(
+			"projection rejects other same typed scrutinee",
+			test_projection_rejects_another_same_typed_scrutinee,
+		),
+		("projection rejects forward source", test_projection_rejects_forward_source),
+		("projection rejects self parent edge", test_projection_rejects_self_parent_edge),
+		("projection requires parent borrow kind", test_projection_requires_parent_borrow_kind),
+		(
+			"acquisition rejects wrong payload ancestry",
+			test_acquisition_rejects_wrong_payload_ancestry,
+		),
+		("acquisition rejects inactive owner", test_acquisition_rejects_inactive_owner),
+		(
+			"acquisition rejects active parent owner",
+			test_acquisition_rejects_active_owner_of_parent,
+		),
+		("returned payload requires acquisition", test_returned_payload_requires_acquisition),
+		(
+			"returned payload cannot name unacquired owner",
+			test_returned_payload_cannot_name_unacquired_owner,
+		),
+		("payload owner leak rejected", test_payload_owner_leak_is_rejected),
+		("payload owner double drop rejected", test_payload_owner_double_drop_is_rejected),
+		("prefix acquisition rejects match", test_prefix_acquisition_is_rejected_before_match),
+		(
+			"dropped prefix acquisition still rejects match",
+			test_discharged_prefix_acquisition_still_rejects_match,
+		),
+		(
+			"dropped owned prefix still rejects match",
+			test_discharged_owned_prefix_still_rejects_match,
+		),
+		("unused nested owning layout accepted", test_unused_nested_owning_layout_is_accepted),
+		("unused String layout cannot be unmanaged", test_unused_string_layout_cannot_be_unmanaged),
+		("unused Int layout cannot own", test_unused_unmanaged_layout_cannot_claim_ownership),
+		("unused parent cannot hide owning child", test_unused_parent_cannot_hide_owning_child),
+		("unused self layout rejected", test_unused_self_layout_reference_is_rejected),
+		(
+			"unused existing forward layout rejected",
+			test_unused_existing_forward_layout_reference_is_rejected,
+		),
+		("unused unknown layout rejected", test_unused_unknown_layout_reference_is_rejected),
+		("unused empty layout rejected", test_unused_empty_layout_is_rejected),
+	]
+}

@@ -5,14 +5,18 @@ import:
 	../../src/names: name_spelling
 	../../src/parse: parsed_contents
 	../../src/specialize as Concrete
-	../../src/syntax:
-		Diagnostic,
-		DiagnosticNote(UnionPayloadDeclaration),
-		Span,
-		TypeSyntax(AppliedType),
+	../../src/syntax: Diagnostic, Span, TypeSyntax(AppliedType, AtomicType)
 	../../src/text: concat
 	input: check_failure, parse, setup_diagnostic
 	test: TestSuite
+
+
+private pure func payload_free(variants: List[Option[Concrete.TypeRef]]) -> Bool:
+	match variants:
+		[None]:
+			True
+		_:
+			False
 
 
 private pure func checked(source: String) -> Result[Checked.CheckedProgram, Diagnostic]:
@@ -854,55 +858,48 @@ pure func test_permuted_forwarding_preserves_caller_ids_and_concrete_target() ->
 			False
 
 
-private pure func rejects_later_payload(source: String, start: Int, end: Int) -> Bool:
+private pure func admits_later_payload(source: String) -> Bool:
 	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
-		Err(error):
-			match error.note:
-				Some(UnionPayloadDeclaration(note)):
-					(
-						span_is(error.span, start, end)
-						and span_is(
-							note,
-							"fixed union Result[T,E]:\n\tOk(T)\n\tErr(".length(),
-							"fixed union Result[T,E]:\n\tOk(T)\n\tErr(E".length(),
-						)
-						and error.message == "specialized union payload must be Int"
-						and error.help == "use Int for this payload; String and union payloads are not supported"
-					)
+		Ok(program):
+			match Concrete.specialized_contents(program).unions:
+				[row]:
+					match row.variants:
+						[Some(Concrete.IntType), Some(Concrete.StringType)]:
+							match row.representation:
+								Concrete.InlineOwningPayload:
+									True
+								_:
+									False
+						_:
+							False
 				_:
 					False
-		Ok(_):
+		Err(_):
 			False
 
 
-pure func test_later_string_payload_rejects_even_when_only_first_variant_is_constructed() -> Bool:
-	source: String =
-		|pure func make[E](value:E)->Result[Int,E]:
-		|	Ok(7)
-		|func main()->Int:
-		|	saved =
-	call_suffix: String =
-		|make(42.to_string())
-		|	0
+pure func test_unused_later_string_payload_gives_the_layout_an_obligation() -> Bool:
 	declaration: String =
 		|fixed union Result[T,E]:
 		|	Ok(T)
 		|	Err(E)
 		|
-	prefix = declaration.concat("pure func success()->")
-	annotation = "Result[Int,String]"
-	call_prefix = declaration.concat(source + " ")
-	rejects_later_payload(
-		prefix
-			.concat(annotation)
-			.concat(":\n\tOk(7)\n")
-			.concat(MAIN),
-		prefix.length(),
-		prefix.length() + annotation.length(),
-	) and rejects_later_payload(
-		call_prefix.concat(call_suffix),
-		call_prefix.length(),
-		call_prefix.length() + 4,
+	written: String =
+		|pure func success()->Result[Int,String]:
+		|	Ok(7)
+		|func main()->Int:
+		|	0
+		|
+	inferred: String =
+		|pure func make[E](value:E)->Result[Int,E]:
+		|	Ok(7)
+		|func main()->Int:
+		|	saved = make(42.to_string())
+		|	0
+		|
+	(
+		admits_later_payload(declaration.concat(written))
+		and admits_later_payload(declaration.concat(inferred))
 	)
 
 
@@ -937,9 +934,9 @@ pure func test_arity_renderer_uses_complete_typed_counts_without_rechecking() ->
 								span_is(diagnostic.span, 3, 14)
 								and diagnostic.note.is_none()
 								and diagnostic.message == "union type argument count does not match its declaration"
-								and diagnostic.help == "expected 4 type arguments, got 3; supply atomic types in declaration order"
+								and diagnostic.help == "expected 4 type arguments, got 3; supply types in declaration order"
 								and missing.message == "generic union requires type arguments"
-								and missing.help == "write 4 atomic type arguments in declaration order"
+								and missing.help == "write 4 type arguments in declaration order"
 							)
 						None:
 							False
@@ -975,7 +972,7 @@ pure func test_declaration_and_application_lists_preserve_all_names_and_spans() 
 					match (three.type_parameters, function.parameters):
 						([a, b, c], [parameter]):
 							match parameter.type_name:
-								AppliedType(head, [first, second, last], whole):
+								AppliedType(head, [AtomicType(first), AtomicType(second), AtomicType(last)], whole):
 									match (
 										name_spelling(facts.names, head.id),
 										name_spelling(facts.names, first.id),
@@ -1097,22 +1094,15 @@ pure func test_empty_and_malformed_application_lists_reject_exactly() -> Bool:
 			"String",
 			"])->Int:\n\t0",
 			"expected ']' after the type arguments",
-			"write comma-separated atomic type arguments, such as Result[Int, Int]",
+			"write comma-separated type arguments, such as Result[Box[Int], Int]",
 		)
 	)
 
 
-pure func test_nested_later_type_argument_stays_rejected() -> Bool:
-	parser_rejects(
-		"pure func f(value:Pair[Int,Box",
-		"[",
-		"Int]])->Int:\n\t0",
-		"nested type applications are not supported",
-		(
-			"use Int, String, a declared parameter, or an ordinary union as the written "
-			+ "argument"
-		),
-	)
+pure func test_nested_later_type_argument_parses() -> Bool:
+	lex("pure func f(value:Pair[Int,Box[Int]])->Int:\n\t0\n")
+		.and_then(pure func(tokens): parse(tokens))
+		.is_ok()
 
 
 pure func test_third_concrete_payload_uses_the_third_argument() -> Bool:
@@ -1141,11 +1131,11 @@ pure func test_third_concrete_payload_uses_the_third_argument() -> Bool:
 						read.signature.parameters,
 						read.body,
 					):
-						([Concrete.NoPayload, Concrete.IntPayload], Concrete.UnionType(owner), [Concrete.UnionType(parameter)], Concrete.ConcreteMatchBody(matched)):
+						([None, Some(Concrete.IntType)], Concrete.UnionType(owner), [Concrete.UnionType(parameter)], Concrete.ConcreteMatchBody(matched)):
 							match (read.bindings, matched.arms):
 								([_, capture], [_, arm]):
 									match (capture.value_type, arm.pattern):
-										(Concrete.IntType, Concrete.VariantCase(variant, Concrete.BindIntPayload(binding))):
+										(Concrete.IntType, Concrete.VariantCase(variant, Concrete.BindPayload(binding))):
 											(
 												Concrete.union_number(owner) == 0
 												and Concrete.union_number(parameter) == 0
@@ -1274,8 +1264,8 @@ pure func test_later_argument_prepares_a_nested_semantic_dependency() -> Bool:
 							):
 								(Concrete.UnionType(saved_owner), Concrete.UnionType(inner_owner), Concrete.UnionType(outer_owner)):
 									(
-										inner_union.variants == [Concrete.NoPayload]
-										and outer_union.variants == [Concrete.NoPayload]
+										payload_free(inner_union.variants)
+										and payload_free(outer_union.variants)
 										and Concrete.union_number(inner_owner) == 0
 										and Concrete.union_number(outer_owner) == 1
 										and Concrete.union_number(saved_owner) == 1
@@ -1368,8 +1358,8 @@ tests: TestSuite = {
 			test_permuted_forwarding_preserves_caller_ids_and_concrete_target,
 		),
 		(
-			"later string payload rejects even when only first variant is constructed",
-			test_later_string_payload_rejects_even_when_only_first_variant_is_constructed,
+			"unused later String payload gives the layout an obligation",
+			test_unused_later_string_payload_gives_the_layout_an_obligation,
 		),
 		(
 			"arity renderer uses complete typed counts without rechecking",
@@ -1383,10 +1373,7 @@ tests: TestSuite = {
 			"empty and malformed application lists reject exactly",
 			test_empty_and_malformed_application_lists_reject_exactly,
 		),
-		(
-			"nested later type argument stays rejected",
-			test_nested_later_type_argument_stays_rejected,
-		),
+		("nested later type argument parses", test_nested_later_type_argument_parses),
 		(
 			"third concrete payload uses the third argument",
 			test_third_concrete_payload_uses_the_third_argument,
