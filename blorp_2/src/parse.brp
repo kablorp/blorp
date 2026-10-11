@@ -36,7 +36,7 @@ import:
 		Symbol(
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
 			Colon, Newline, VarKeyword, Equals, LeftBracket, RightBracket, LeftBrace, RightBrace,
-			Comma,
+			Comma, AtSign,
 		),
 		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, BuiltinLabel, Indentation),
 		TypeSyntax(AtomicType, AppliedType),
@@ -93,6 +93,12 @@ private pure func expected(state: ParserState, message: String, help: String) ->
 
 private pure func symbol_matches(actual: Symbol, expected: Symbol) -> Bool:
 	match actual:
+		AtSign:
+			match expected:
+				AtSign:
+					True
+				_:
+					False
 		LeftBrace:
 			match expected:
 				LeftBrace:
@@ -209,6 +215,14 @@ private pure func consume_symbol(
 				SymbolToken(actual):
 					if symbol_matches(actual, symbol):
 						Ok({ state | position = IntOps.add(state.position, 1) })
+					else if symbol_matches(actual, AtSign):
+						Err(
+							expected(
+								state,
+								"misplaced function annotation",
+								"put @tail_recursive before the optional pure and func keywords at column 1",
+							),
+						)
 					else:
 						Err(expected(state, message, help))
 				_:
@@ -253,6 +267,14 @@ private pure func consume_name(
 									names = names
 								},
 							})
+				SymbolToken(AtSign):
+					Err(
+						expected(
+							state,
+							"misplaced function annotation",
+							"put @tail_recursive before the optional pure and func keywords at column 1",
+						),
+					)
 				_:
 					Err(expected(state, message, identifier_help()))
 		None:
@@ -488,6 +510,14 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 	after_token = { start | position = IntOps.add(start.position, 1) }
 
 	base_result: Result[ParsedValue, Diagnostic] = match token.kind:
+		SymbolToken(AtSign):
+			Err(
+				expected(
+					start,
+					"misplaced function annotation",
+					"put @tail_recursive before the optional pure and func keywords at column 1",
+				),
+			)
 		IntegerLiteral(spelling):
 			integer ?= integer_value(spelling, token.span)
 			Ok({
@@ -507,10 +537,22 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 				arguments ?= consume_arguments(
 					{ name.next | position = IntOps.add(name.next.position, 1) },
 				)
+				closing ?= arguments.next.input.tokens
+					.get(IntOps.subtract(arguments.next.position, 1))
+					.to_result(
+						expected(
+							arguments.next,
+							"invalid call span",
+							"report this compiler error with the input program",
+						),
+					)
 				Ok({
 					body = {
 						base = DirectApplication(name.name, arguments.arguments),
-						base_span = token.span,
+						base_span = {
+							start = token.span.start,
+							end = closing.span.end
+						},
 						applications = [],
 						span = token.span
 					},
@@ -1144,9 +1186,9 @@ private pure func consume_type_parameters(
 									span = token.span,
 									note = None,
 									message = "invalid type parameter name",
-									help = (
-										"start with a capital ASCII letter and use only ASCII letters and digits, such "
-										+ "as T or Element2"
+									help = Text.concat(
+										"start with a capital ASCII letter and use only ASCII letters and digits, such ",
+										"as T or Element2",
 									),
 								})
 						_:
@@ -1272,12 +1314,113 @@ private pure func consume_header(start: ParserState) -> Result[HeaderResult, Dia
 	})
 
 
+private fixed record ParsedAnnotation {
+	span: Option[Span],
+	next: ParserState
+}
+
+
+private pure func consume_annotation(start: ParserState) -> Result[ParsedAnnotation, Diagnostic]:
+	if not at_symbol(start, AtSign):
+		Ok({
+			span = None,
+			next = start,
+		})
+	else:
+		opening ?= start.input.tokens
+			.get(start.position)
+			.to_result(
+				expected(
+					start,
+					"expected a function annotation",
+					"write @tail_recursive before a function declaration",
+				),
+			)
+		after_at = { start | position = IntOps.add(start.position, 1) }
+		name ?= after_at.input.tokens
+			.get(after_at.position)
+			.to_result(
+				expected(
+					start,
+					"expected a function annotation",
+					"write @tail_recursive before a function declaration",
+				),
+			)
+
+		valid = match name.kind:
+			IdentifierToken(spelling):
+				(
+					Text.equals(spelling, "tail_recursive")
+					and IntOps.equals(opening.span.end, name.span.start)
+				)
+			_:
+				False
+
+		span: Span = {
+			start = opening.span.start,
+			end = name.span.end
+		}
+
+		if not valid:
+			Err({
+				span = span,
+				note = None,
+				message = "unknown function annotation",
+				help = "use @tail_recursive before a function declaration",
+			})
+		else:
+			var next = { after_at | position = IntOps.add(after_at.position, 1) }
+
+			if at_symbol(next, LeftParen):
+				Err(
+					expected(
+						next,
+						"@tail_recursive takes no arguments",
+						"write @tail_recursive before the optional pure and func keywords",
+					),
+				)
+			else:
+				if at_symbol(next, Newline):
+					next = { next | position = IntOps.add(next.position, 1) }
+
+				if at_symbol(next, AtSign):
+					Err(
+						expected(
+							next,
+							"multiple function annotations are not supported",
+							"write @tail_recursive only once before a function",
+						),
+					)
+				else if IntOps.equals(next.position, next.input.tokens.length()):
+					Err({
+						span = span,
+						note = None,
+						message = "@tail_recursive has no function declaration",
+						help = "put a function declaration immediately after @tail_recursive",
+					})
+				else if not at_symbol(next, PureKeyword) and not at_symbol(next, FunctionKeyword):
+					Err(
+						expected(
+							next,
+							"@tail_recursive requires a function declaration",
+							"put @tail_recursive before the optional pure and func keywords",
+						),
+					)
+				else:
+					Ok({
+						span = Some(span),
+						next = next,
+					})
+
+
 private pure func consume_function(start: ParserState) -> Result[FunctionResult, Diagnostic]:
-	header ?= consume_header(start)
+	annotation ?= consume_annotation(start)
+	header ?= consume_header(annotation.next)
 	prefix ?= consume_bindings(header.next, FunctionBindings)
 	body ?= consume_function_body(prefix.next)
 	Ok({
 		function = {
+			tail_annotation = annotation.span,
 			purity = header.header.purity,
 			function_name = header.header.function_name,
 			type_parameters = header.header.type_parameters,
@@ -1563,7 +1706,16 @@ pure func parse_prelude(input: LexedProgram) -> Result[ParsedPrelude, Diagnostic
 	var failure: Option[Diagnostic] = None
 
 	while IntOps.less_than(state.position, input.tokens.length()):
-		if at_word(state, "type"):
+		if at_symbol(state, AtSign):
+			failure = Some(
+				expected(
+					state,
+					"function annotations are not allowed in the prelude",
+					"put @tail_recursive on a program function",
+				),
+			)
+			break
+		else if at_word(state, "type"):
 			match consume_builtin_type(state):
 				Err(error):
 					failure = Some(error)
@@ -1705,8 +1857,21 @@ private pure func consume_postfix(state: ParserState) -> Result[ParsedPostfix, D
 
 	if at_symbol(name.next, LeftParen):
 		arguments ?= consume_arguments({ name.next | position = IntOps.add(name.next.position, 1) })
+		closing ?= arguments.next.input.tokens
+			.get(IntOps.subtract(arguments.next.position, 1))
+			.to_result(
+				expected(
+					arguments.next,
+					"invalid call span",
+					"report this compiler error with the input program",
+				),
+			)
 		Ok({
 			operation = ReceiverInvocation({
+				span = {
+					start = name.name.span.start,
+					end = closing.span.end
+				},
 				callee = name.name,
 				arguments = arguments.arguments,
 			}),

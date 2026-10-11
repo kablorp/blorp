@@ -1,0 +1,218 @@
+import:
+	../../src/check as Checked
+	../../src/lex: lex
+	input: check, parse
+	int as IntOps
+	system: read_file
+	test: TestSuite
+
+
+-- Check the unchanged workload and inspect its published helper facts. These
+-- assertions complement the direct helper truth tables and native real main.
+private func helper(index: Int) -> Option[Checked.CheckedMatch]:
+	match read_file("blorp_2/test/e2e/fixtures/tail_recursion/countdown.brp"):
+		Err(_):
+			None
+		Ok(source):
+			match lex(source).and_then(pure func(tokens): parse(tokens)):
+				Err(_):
+					None
+				Ok(parsed):
+					match check(parsed):
+						Err(_):
+							None
+						Ok(program):
+							match Checked.checked_functions(program).functions.get(index):
+								Some(function):
+									match function.body:
+										Checked.CheckedMatchBody(matched):
+											Some(matched)
+										_:
+											None
+								None:
+									None
+
+
+private pure func variant(id: Checked.VariantId, owner: Int, ordinal: Int) -> Bool:
+	(
+		Checked.union_number(Checked.variant_owner(id)) == owner
+		and Checked.variant_number(id) == ordinal
+	)
+
+
+private pure func case_is(arm: Checked.CheckedArm, owner: Int, ordinal: Int) -> Bool:
+	match arm.pattern:
+		Checked.VariantCase(id, Checked.NoPayloadBinding):
+			variant(id, owner, ordinal)
+		_:
+			False
+
+
+private pure func wildcard(arm: Checked.CheckedArm) -> Bool:
+	match arm.pattern:
+		Checked.WildcardCase:
+			True
+		_:
+			False
+
+
+private pure func returns_variant(arm: Checked.CheckedArm, owner: Int, ordinal: Int) -> Bool:
+	match arm.body:
+		Checked.ReturnExpression(value):
+			match value.base:
+				Checked.ReturnVariant(id):
+					variant(id, owner, ordinal) and value.operations.length() == 0
+				_:
+					False
+		_:
+			False
+
+
+private pure func binding(value: Checked.CheckedValue, ordinal: Int) -> Bool:
+	match value.base:
+		Checked.ReturnBinding(id):
+			Checked.binding_number(id) == ordinal and value.operations.length() == 0
+		_:
+			False
+
+
+private pure func returns_binding(arm: Checked.CheckedArm, ordinal: Int) -> Bool:
+	match arm.body:
+		Checked.ReturnExpression(value):
+			binding(value, ordinal)
+		_:
+			False
+
+
+func test_predecessor_has_every_resolved_edge() -> Bool:
+	match helper(0):
+		None:
+			False
+		Some(matched):
+			var passed = matched.arms.length() == 16 and binding(matched.scrutinee, 0)
+			var ordinal = 0
+
+			for arm in matched.arms:
+				expected = if ordinal == 0:
+					15
+				else:
+					IntOps.subtract(ordinal, 1)
+
+				passed = passed and case_is(arm, 0, ordinal) and returns_variant(arm, 0, expected)
+				ordinal = IntOps.add(ordinal, 1)
+
+			passed
+
+
+func test_borrow_propagates_only_at_zero() -> Bool:
+	match helper(1):
+		Some(matched):
+			match matched.arms:
+				[zero, nonzero]:
+					(
+						binding(matched.scrutinee, 0) and case_is(zero, 0, 0)
+						and returns_binding(zero, 1)
+						and wildcard(nonzero)
+						and returns_variant(nonzero, 1, 1)
+					)
+				_:
+					False
+		None:
+			False
+
+
+func test_adjust_decrement_calls_predecessor_with_original_digit() -> Bool:
+	match helper(2):
+		Some(matched):
+			match matched.arms:
+				[decrement, _]:
+					match decrement.body:
+						Checked.ReturnExpression(value):
+							match value.base:
+								Checked.ReturnCall(call, [argument]):
+									match call.target:
+										Checked.UserFunction(id, []):
+											(
+												binding(matched.scrutinee, 1) and case_is(decrement, 1, 0)
+												and Checked.function_number(id) == 0
+												and binding(argument, 0)
+												and value.operations.length() == 0
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+func test_adjust_keep_returns_original_digit() -> Bool:
+	match helper(2):
+		Some(matched):
+			match matched.arms:
+				[_, keep]:
+					binding(matched.scrutinee, 1) and case_is(keep, 1, 1) and returns_binding(keep, 0)
+				_:
+					False
+		None:
+			False
+
+
+func test_nonzero_has_zero_and_nonzero_results() -> Bool:
+	match helper(3):
+		Some(matched):
+			match matched.arms:
+				[zero, nonzero]:
+					(
+						binding(matched.scrutinee, 0) and case_is(zero, 0, 0)
+						and returns_variant(zero, 1, 1)
+						and wildcard(nonzero)
+						and returns_variant(nonzero, 1, 0)
+					)
+				_:
+					False
+		None:
+			False
+
+
+func test_either_selects_active_left_or_right_binding() -> Bool:
+	match helper(4):
+		Some(matched):
+			match matched.arms:
+				[decrement, keep]:
+					(
+						binding(matched.scrutinee, 0) and case_is(decrement, 1, 0)
+						and returns_variant(decrement, 1, 0)
+						and case_is(keep, 1, 1)
+						and returns_binding(keep, 1)
+					)
+				_:
+					False
+		None:
+			False
+
+
+tests: TestSuite = {
+	description = "Checked countdown helper facts",
+	tests = [
+		(
+			"all sixteen predecessor edges use resolved variant IDs",
+			test_predecessor_has_every_resolved_edge,
+		),
+		("borrow propagates incoming binding only at zero", test_borrow_propagates_only_at_zero),
+		(
+			"adjust decrement resolves predecessor and original digit",
+			test_adjust_decrement_calls_predecessor_with_original_digit,
+		),
+		("adjust keep returns original digit", test_adjust_keep_returns_original_digit),
+		("nonzero publishes exact branch results", test_nonzero_has_zero_and_nonzero_results),
+		(
+			"either selects active left or right binding",
+			test_either_selects_active_left_or_right_binding,
+		),
+	]
+}

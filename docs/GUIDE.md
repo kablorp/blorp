@@ -116,6 +116,16 @@ func factorial(n: Int, acc: Int) -> Int:
 - `@tail_recursive` verifies all recursive calls are in tail position. The Core pipeline lowers unmanaged scalar self-recursion to explicit loops, and lowers common list-consumer patterns like `[x, ...rest]` into cursor loops instead of allocating a tail list on every step
 - `builtin("module.name")` as a standard-library function body names a compiler-provided intrinsic; `builtin("c_name")` binds standard-library/runtime wrappers to a named C helper. Bare function-body `builtin` is not used in standard-library source. The marker is static string-token text: interpolation holes are not evaluated. Write a concrete quoted helper name.
 
+The separate [Blorp 2 pilot](../blorp_2/README.md) gives `@tail_recursive` a
+stricter direct-self lowering guarantee: annotated functions must be
+nongeneric, contain a direct self call, and use only unmanaged parameters,
+results and evaluated intermediates. Every self call must be a whole function
+or match-arm tail, including a final UFCS invocation. Accepted self edges emit
+ordinary C loops even at `-O0`, including zero-argument functions and `main`.
+The guarantee bounds stack growth from those self edges; it does not prove
+termination or cover mutual recursion. These pilot restrictions do not change
+the existing compiler's annotation contract.
+
 ### Lambdas (Anonymous Functions)
 
 The canonical lambda syntax uses the `func` keyword. This avoids ambiguity with

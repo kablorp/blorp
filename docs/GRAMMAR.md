@@ -722,6 +722,14 @@ where_clause    = "where" dim_constraint { "," dim_constraint } ;
 dim_constraint  = dim_expr "==" dim_expr ;
 ```
 
+The [Blorp 2 restricted grammar](../blorp_2/grammar.ebnf) accepts only one
+optional `@tail_recursive`, before optional `pure` and `func`, on the same line
+or immediately preceding line. It takes no arguments and is forbidden in the
+runtime prelude. The pilot checks a direct-self loop guarantee for nongeneric
+functions with unmanaged values; it rejects annotations without a direct
+self call and self calls outside supported function or match-arm tails.
+This separate pilot grammar does not narrow the declarations above.
+
 - A root program's `main` has no type parameters and accepts either `()` or
   one parameter annotated `List[String]`. Its concrete return type implements
   `ExitStatusAble`; `Int` and `Void` are the standard cases. Imported functions

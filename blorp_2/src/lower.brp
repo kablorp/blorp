@@ -10,6 +10,7 @@ import:
 		ConcreteBinding,
 		ConcreteBody(ConcreteValueBody, ConcreteMatchBody),
 		ConcreteCall,
+		ConcreteExit(ReturnExpression, RecurWith),
 		ConcreteFunction,
 		ConcreteMatch,
 		ConcreteOperation(InvokeFunction, ConstructVariant, ReadRecordField),
@@ -28,7 +29,7 @@ import:
 		UnionInstanceId,
 		VariantInstanceId,
 		specialized_contents,
-	syntax: Diagnostic, Span
+	syntax: Diagnostic, FunctionExecution, Span
 
 
 -- A value identity belongs to one lowered function, including its branches.
@@ -66,7 +67,7 @@ fixed record ValueDefinition {
 
 fixed record ValueBlock {
 	definitions: List[ValueDefinition],
-	result: ValueId
+	exit: LoweredExit
 }
 
 
@@ -88,12 +89,18 @@ fixed record LoweredMatch {
 }
 
 
-fixed union LoweredTail:
+fixed union LoweredExit:
 	ReturnValue(ValueId)
+	RecurValues(List[ValueId], Span)
+
+
+fixed union LoweredTail:
+	ExitValue(LoweredExit)
 	MatchValue(LoweredMatch)
 
 
 fixed record LoweredFunction {
+	execution: FunctionExecution,
 	signature: FunctionSignature,
 	definitions: List[ValueDefinition],
 	tail: LoweredTail
@@ -347,6 +354,39 @@ private pure func lower_capture(
 	assign_value(projection.builder, id, projection.value, definition.span)
 
 
+private pure func exit_span(exit: ConcreteExit) -> Span:
+	match exit:
+		ReturnExpression(value):
+			value.base_span
+		RecurWith(_, span):
+			span
+
+
+private fixed record BuiltExit {
+	builder: ValueBuilder,
+	exit: LoweredExit
+}
+
+
+private pure func lower_exit(
+	builder: ValueBuilder,
+	exit: ConcreteExit,
+) -> Result[BuiltExit, Diagnostic]:
+	match exit:
+		ReturnExpression(value):
+			result ?= lower_value(builder, value)
+			Ok({
+				builder = result.builder,
+				exit = ReturnValue(result.value),
+			})
+		RecurWith(arguments, span):
+			result ?= lower_arguments(builder, arguments, [])
+			Ok({
+				builder = result.builder,
+				exit = RecurValues(result.values, span),
+			})
+
+
 private pure func lower_arm(
 	builder: ValueBuilder,
 	arm: ConcreteArm,
@@ -363,24 +403,24 @@ private pure func lower_arm(
 
 	bound ?= match arm.pattern:
 		BindingCase(id):
-			assign_value(branch, id, scrutinee, arm.body.base_span)
+			assign_value(branch, id, scrutinee, exit_span(arm.body))
 		VariantCase(_, payload):
 			match payload:
 				BindIntPayload(id):
-					lower_capture(branch, id, scrutinee, bindings, arm.body.base_span)
+					lower_capture(branch, id, scrutinee, bindings, exit_span(arm.body))
 				_:
 					Ok(branch)
 		WildcardCase:
 			Ok(branch)
 
 	prefix ?= lower_assignments(bound, arm.assignments)
-	result ?= lower_value(prefix, arm.body)
+	result ?= lower_exit(prefix, arm.body)
 	Ok({
 		arm = {
 			label = label,
 			body = {
 				definitions = result.builder.definitions,
-				result = result.value
+				exit = result.exit
 			}
 		},
 		next_value = result.builder.next_value,
@@ -485,15 +525,17 @@ private pure func lower_function(function: ConcreteFunction) -> Result[LoweredFu
 
 	match function.body:
 		ConcreteValueBody(value):
-			result ?= lower_value(prefix, value)
+			result ?= lower_exit(prefix, value)
 			Ok({
+				execution = function.execution,
 				signature = function.signature,
 				definitions = result.builder.definitions,
-				tail = ReturnValue(result.value),
+				tail = ExitValue(result.exit),
 			})
 		ConcreteMatchBody(matched):
 			result ?= lower_match(prefix, matched, function.bindings)
 			Ok({
+				execution = function.execution,
 				signature = function.signature,
 				definitions = result.builder.definitions,
 				tail = MatchValue(result.matched),

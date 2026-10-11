@@ -453,11 +453,51 @@ The String fixtures return an owned result through recursive calls and preserve
 an arm-local owner across a recursive call. Each fixture runs through its real
 `main`, with unchanged generated C compiled at `-O0` under ASan/UBSan. Every
 fixture has limits of 10,000 allocations and 100,000,000 instructions. Calls
-use the C stack; tail-call optimization and constant-stack recursion are not
+use the C stack; automatic tail-call optimization and constant-stack recursion are not
 part of this increment. Recursive data remains a separate ownership increment;
 cyclic runtime data is forbidden.
 The [recursion plan](RECURSION_PLAN.md) defines the independently validated
 increments and the ownership requirements for later recursive data.
+An explicit `@tail_recursive` function has a checked direct-self loop guarantee:
+
+```blorp
+fixed union Step:
+    Stop
+    Once
+@tail_recursive
+pure func walk(step: Step, left: Int, right: Int) -> Int:
+    match step:
+        Stop: right
+        Once: walk(Stop, right, left)
+func main() -> Int:
+    walk(Once, 7, 9)
+```
+
+This [swap fixture](test/e2e/fixtures/tail_recursion/swap_right.brp) exits 7.
+The annotation may also share a line with `pure func` or `func`. Every direct
+self call must be the complete final function expression or match-arm result;
+a final UFCS self call qualifies. Receivers, explicit arguments, binding
+initializers, scrutinees, constructor payloads, record fields and earlier
+postfix calls remain non-tail. A saved call result returned later is rejected.
+Name, arity, type and purity errors are checked first.
+
+Annotated functions must be nongeneric and contain a direct self call. Their
+concrete parameters, result and every evaluated intermediate must be unmanaged,
+even an unused String initializer. Int, supported fixed records and fixed unions
+are allowed; an unmanaged phantom `Marker[String]` carries no String value.
+A helper's internal managed values are allowed when the annotated caller sees
+only unmanaged values. Zero-argument helpers and `main` may be annotated, with
+no promise of termination. Generic, managed and mutual-only guarantees are
+future increments.
+
+Lowering evaluates all next arguments in source order before replacing any
+parameter. Immutable value snapshots and all prefix work execute inside the
+loop on every iteration. The emitted C guarantees bounded stack growth for
+these direct self edges at `-O0`; other calls and mutual recursion retain their
+ordinary stack behavior. The annotation does not bound heap use or prove
+termination. Unannotated C output is preserved. The
+[tail-recursion plan](TAIL_RECURSION_PLAN.md) defines the phase invariants,
+malformed-IR tests and native stack-exhaustion mutation oracle.
 
 The [multiple-type-parameter example](test/e2e/fixtures/generic/function_parameters/second.brp)
 adds independent declaration parameters:
@@ -715,7 +755,7 @@ Semantic rules:
   or removing pure from the caller.
 - Self and mutual function recursion are supported, including calls in arguments,
   UFCS chains, binding initializers, record fields and match arms. Signatures are
-  established before any body is checked. Calls use the ordinary C stack; this
+  established before any body is checked. Unannotated calls use the ordinary C stack; this
   increment makes no constant-stack or tail-call optimization guarantee.
 - Generic recursion reuses a concrete instance identified by its declaration and
   ordered type arguments. Bare-parameter forwarding, permutations and concrete

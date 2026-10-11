@@ -14,6 +14,7 @@ import:
 		OwnedArgument(UnmanagedArgument, BorrowedArgument),
 		OwnedArm,
 		OwnedDefinition,
+		OwnedExit(ReturnResult, RecurArguments),
 		OwnedFunction,
 		OwnedMatch,
 		OwnedTail(ReturnTail, MatchTail),
@@ -46,7 +47,7 @@ import:
 		variant_number,
 		variant_owner,
 	string_runtime: string_runtime
-	syntax: Diagnostic, Span
+	syntax: Diagnostic, FunctionExecution(OrdinaryCalls, SelfTailLoop), Span
 	text: concat
 	verify: VerifiedProgram, verified_contents
 
@@ -274,7 +275,7 @@ private pure func append_operation(
 			var position = 0
 
 			for field in fields:
-				if position > 0:
+				if IntOps.greater_than(position, 0):
 					result = result.concat(",")
 
 				result = result
@@ -512,7 +513,7 @@ private pure func append_arm(
 		arm.operations,
 		unions,
 	)
-	Ok(append_return(body, arm.result).concat("}"))
+	Ok(append_exit(body, arm.exit).concat("}"))
 
 
 private pure func append_match(
@@ -595,6 +596,27 @@ private pure func append_return(output: String, result: ReturnTransfer) -> Strin
 		.concat(";")
 
 
+private pure func append_exit(output: String, exit: OwnedExit) -> String:
+	match exit:
+		ReturnResult(result):
+			append_return(output, result)
+		RecurArguments(arguments, _):
+			var result = output
+			var position: Int = 0
+
+			-- Every operand is already an immutable value local. Replacing slots
+			-- from these captures preserves swaps and repeated arguments.
+			for argument in arguments:
+				result = result
+					.concat(c_parameter(position))
+					.concat("=")
+					.concat(c_value(argument))
+					.concat(";")
+				position = IntOps.add(position, 1)
+
+			result.concat("continue;")
+
+
 private pure func append_function(
 	output: String,
 	function: OwnedFunction,
@@ -602,18 +624,28 @@ private pure func append_function(
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	header ?= append_signature(output, function, index, unions)
-	body ?= append_ownership_operations(
-		header.concat("{"),
-		function.operations,
-		unions,
-	)
 
-	match function.tail:
-		ReturnTail(result):
-			Ok(append_return(body, result).concat("}"))
+	opening = match function.execution:
+		OrdinaryCalls:
+			header.concat("{")
+		SelfTailLoop(_):
+			header.concat("{while (1){")
+
+	body ?= append_ownership_operations(opening, function.operations, unions)
+
+	emitted ?= match function.tail:
+		ReturnTail(exit):
+			Ok(append_exit(body, exit))
 		MatchTail(matched):
-			emitted ?= append_match(body, matched, unions)
-			Ok(emitted.concat("}"))
+			append_match(body, matched, unions)
+
+	closing = match function.execution:
+		OrdinaryCalls:
+			"}"
+		SelfTailLoop(_):
+			"}}"
+
+	Ok(emitted.concat(closing))
 
 
 private pure func is_string(type_ref: TypeRef) -> Bool:

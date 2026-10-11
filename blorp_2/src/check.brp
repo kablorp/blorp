@@ -16,6 +16,7 @@ import:
 		CallNotation(DirectCall, ReceiverCall),
 		ExpressionBase(IntegerExpression, NameExpression, DirectApplication, RecordExpression),
 		FieldPattern(FieldName, FieldWildcard),
+		FunctionExecution(OrdinaryCalls, SelfTailLoop),
 		ParsedBinding,
 		ParsedBody(ParsedValueBody, ParsedMatchBody),
 		ParsedFunction,
@@ -232,7 +233,7 @@ fixed union CheckedPattern:
 fixed record CheckedArm {
 	pattern: CheckedPattern,
 	assignments: List[CheckedAssignment],
-	body: CheckedValue
+	body: CheckedExit
 }
 
 
@@ -243,12 +244,18 @@ fixed record CheckedMatch {
 }
 
 
+fixed union CheckedExit:
+	ReturnExpression(CheckedValue)
+	RecurWith(List[CheckedValue], Span)
+
+
 fixed union CheckedBody:
-	CheckedValueBody(CheckedValue)
+	CheckedValueBody(CheckedExit)
 	CheckedMatchBody(CheckedMatch)
 
 
 fixed record CheckedFunction {
+	execution: FunctionExecution,
 	signature: FunctionSignature,
 	bindings: List[BindingDefinition],
 	assignments: List[CheckedAssignment],
@@ -531,6 +538,9 @@ fixed union CheckErrorKind:
 	MatchRequiresUnion(TypeRef)
 	ImmutableAssignment(BindingSite)
 	GrowingRecursiveInstantiation
+	NonTailSelfCall(FunctionId)
+	NoSelfRecursion
+	GenericTailRecursionUnsupported
 	InternalInvariant(CheckerInvariant)
 
 
@@ -767,7 +777,10 @@ private pure func validate_declarations(
 	var record_position = 0
 	var failure: Option[CheckError] = None
 
-	while union_position < unions.length() or record_position < records.length():
+	while (
+		IntOps.less_than(union_position, unions.length())
+		or IntOps.less_than(record_position, records.length())
+	):
 		union_next = unions.get(union_position)
 		record_next = records.get(record_position)
 
@@ -775,7 +788,10 @@ private pure func validate_declarations(
 			Some(declaration):
 				match union_next:
 					Some(other):
-						declaration.type_name.span.start < other.type_name.span.start
+						IntOps.less_than(
+							declaration.type_name.span.start,
+							other.type_name.span.start,
+						)
 					None:
 						True
 			None:
@@ -2216,7 +2232,18 @@ private pure func synthesize_value(
 	for postfix in contracts:
 		result = match postfix:
 			InvokeReceiver(application, contract):
-				resolve_receiver(purity, scope, current, application.arguments, contract, context)
+				resolve_receiver(
+					purity,
+					scope,
+					current,
+					application.arguments,
+					contract,
+					context,
+					{
+						start = body.base_span.start,
+						end = application.span.end
+					},
+				)
 			ReadField(name):
 				resolve_field_read(name, current, context)
 
@@ -2818,7 +2845,7 @@ private pure func resolve_arm(
 		arm = {
 			pattern = pattern.pattern,
 			assignments = prefix.assignments,
-			body = value.value
+			body = ReturnExpression(value.value)
 		},
 		remaining = remaining,
 		bindings = prefix.bindings,
@@ -3071,7 +3098,7 @@ private pure func resolve_body(
 			Ok({
 				bindings = prefix.bindings,
 				assignments = prefix.assignments,
-				body = CheckedValueBody(value.value),
+				body = CheckedValueBody(ReturnExpression(value.value)),
 			})
 		ParsedMatchBody(body):
 			matched ?= resolve_match(
@@ -3142,12 +3169,243 @@ private pure func resolve_function(
 			)
 
 	body ?= resolve_body(function, signature, context)
+	checked ?= check_execution(function, body, context.function)
 	Ok({
+		execution = checked.execution,
 		signature = signature,
 		bindings = body.bindings,
 		assignments = body.assignments,
-		body = body.body,
+		body = checked.body,
 	})
+
+
+private pure func is_self_call(call: CheckedCall, current: FunctionId) -> Bool:
+	match call.target:
+		UserFunction(id, _):
+			IntOps.equals(function_number(id), function_number(current))
+		RuntimeFunction(_):
+			False
+
+
+-- These checks traverse evaluated children, never recovering identity from names.
+private pure func reject_self_value(
+	value: CheckedValue,
+	current: FunctionId,
+) -> Result[Void, CheckError]:
+	base_valid ?= match value.base:
+		ReturnCall(call, arguments):
+			if is_self_call(call, current):
+				Err(check_rejection(value.base_span, NonTailSelfCall(current)))
+			else:
+				reject_self_arguments(arguments, current)
+		ReturnRecord(_, fields):
+			reject_self_arguments(
+				fields.map(pure func(field: CheckedRecordField) -> CheckedValue: field.value),
+				current,
+			)
+		_:
+			Ok(void)
+
+	var invalid: Option[CheckError] = None
+
+	for step in value.operations:
+		match step.operation:
+			InvokeFunction(call, arguments):
+				result = if is_self_call(call, current):
+					Err(check_rejection(step.span, NonTailSelfCall(current)))
+				else:
+					reject_self_arguments(arguments, current)
+
+				match result:
+					Err(error):
+						invalid = Some(error)
+						break
+					Ok(_):
+						void
+			_:
+				void
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+
+private pure func reject_self_arguments(
+	arguments: List[CheckedValue],
+	current: FunctionId,
+) -> Result[Void, CheckError]:
+	var invalid: Option[CheckError] = None
+
+	for argument in arguments:
+		match reject_self_value(argument, current):
+			Err(error):
+				invalid = Some(error)
+				break
+			Ok(_):
+				void
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+
+private pure func reject_self_assignments(
+	assignments: List[CheckedAssignment],
+	current: FunctionId,
+) -> Result[Void, CheckError]:
+	reject_self_arguments(
+		assignments.map(pure func(assignment: CheckedAssignment) -> CheckedValue:
+			match assignment:
+				InitializeBinding(_, value):
+					value
+				ReassignBinding(_, value):
+					value
+		),
+		current,
+	)
+
+
+private pure func tail_exit(
+	exit: CheckedExit,
+	current: FunctionId,
+) -> Result[CheckedExit, CheckError]:
+	match exit:
+		RecurWith(_, _):
+			Ok(exit)
+		ReturnExpression(value):
+			last = value.operations.get(IntOps.subtract(value.operations.length(), 1))
+
+			match last:
+				Some(step):
+					match step.operation:
+						InvokeFunction(call, arguments):
+							if is_self_call(call, current):
+								receiver = { value |
+									operations = value.operations.take(
+										IntOps.subtract(
+											value.operations.length(),
+											1,
+										),
+									)
+								}
+								next = [receiver].concat(arguments)
+								valid ?= reject_self_arguments(next, current)
+								Ok(RecurWith(next, step.span))
+							else:
+								valid ?= reject_self_value(value, current)
+								Ok(exit)
+						_:
+							valid ?= reject_self_value(value, current)
+							Ok(exit)
+				None:
+					match value.base:
+						ReturnCall(call, arguments):
+							if is_self_call(call, current):
+								valid ?= reject_self_arguments(arguments, current)
+								Ok(RecurWith(arguments, value.base_span))
+							else:
+								valid ?= reject_self_value(value, current)
+								Ok(exit)
+						_:
+							valid ?= reject_self_value(value, current)
+							Ok(exit)
+
+
+private pure func recurs(exit: CheckedExit) -> Bool:
+	match exit:
+		RecurWith(_, _):
+			True
+		ReturnExpression(_):
+			False
+
+
+private pure func check_arm_exit(
+	arm: CheckedArm,
+	current: FunctionId,
+) -> Result[CheckedExit, CheckError]:
+	prefix ?= reject_self_assignments(arm.assignments, current)
+	tail_exit(arm.body, current)
+
+
+private fixed record CheckedExecution {
+	execution: FunctionExecution,
+	body: CheckedBody
+}
+
+
+private pure func check_execution(
+	function: ParsedFunction,
+	resolved: ResolvedBody,
+	current: FunctionId,
+) -> Result[CheckedExecution, CheckError]:
+	match function.tail_annotation:
+		None:
+			Ok({
+				execution = OrdinaryCalls,
+				body = resolved.body,
+			})
+		Some(annotation):
+			nongeneric ?= if IntOps.equals(function.type_parameters.length(), 0):
+				Ok(void)
+			else:
+				Err(check_rejection(annotation, GenericTailRecursionUnsupported))
+
+			prefix ?= reject_self_assignments(resolved.assignments, current)
+			var found = False
+
+			body_result: Result[CheckedBody, CheckError] = match resolved.body:
+				CheckedValueBody(value):
+					exit ?= tail_exit(value, current)
+					found = recurs(exit)
+					Ok(CheckedValueBody(exit))
+				CheckedMatchBody(matched):
+					scrutinee ?= reject_self_value(matched.scrutinee, current)
+					var arms: List[CheckedArm] = []
+					var invalid: Option[CheckError] = None
+
+					for arm in matched.arms:
+						result = check_arm_exit(arm, current)
+
+						match result:
+							Err(error):
+								invalid = Some(error)
+								break
+							Ok(exit):
+								found = found or recurs(exit)
+								arms = arms.append({ arm | body = exit })
+
+					match invalid:
+						Some(error):
+							Err(error)
+						None:
+							Ok(CheckedMatchBody({ matched | arms = arms }))
+
+			body ?= body_result
+
+			if found:
+				Ok({
+					execution = SelfTailLoop(annotation),
+					body = body,
+				})
+			else:
+				Err(check_rejection(annotation, NoSelfRecursion))
+
+
+private pure func exit_calls(exit: CheckedExit) -> List[CheckedCall]:
+	match exit:
+		ReturnExpression(value):
+			value_calls(value)
+		RecurWith(arguments, _):
+			var calls: List[CheckedCall] = []
+
+			for argument in arguments:
+				calls = calls.concat(value_calls(argument))
+
+			calls
 
 
 private pure func value_calls(value: CheckedValue) -> List[CheckedCall]:
@@ -3205,14 +3463,14 @@ pure func function_calls(function: CheckedFunction) -> List[CheckedCall]:
 
 	match function.body:
 		CheckedValueBody(value):
-			calls.concat(value_calls(value))
+			calls.concat(exit_calls(value))
 		CheckedMatchBody(matched):
 			calls = calls.concat(value_calls(matched.scrutinee))
 
 			for arm in matched.arms:
 				calls = calls
 					.concat(assignment_calls(arm.assignments))
-					.concat(value_calls(arm.body))
+					.concat(exit_calls(arm.body))
 
 			calls
 
@@ -3445,6 +3703,7 @@ private pure func resolve_receiver(
 	arguments: List[ValueExpression],
 	contract: CallContract,
 	context: ResolutionContext,
+	span: Span,
 ) -> Result[ResolvedValue, CheckError]:
 	resolved ?= check_arguments(purity, scope, arguments, Some(current), contract, context)
 
@@ -3458,7 +3717,7 @@ private pure func resolve_receiver(
 		value = { current.value | operations = current.value.operations.append({
 				operation = operation,
 				value_type = resolved.contract.return_type,
-				span = contract.span,
+				span = span,
 			}) },
 		value_type = resolved.contract.return_type,
 	})
