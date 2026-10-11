@@ -1,0 +1,192 @@
+import:
+	../../src/check as Checked
+	../../src/lex: lex
+	../../src/specialize as Concrete
+	../../src/syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration)
+	../../src/text: concat
+	input: parse, setup_diagnostic
+	test: TestSuite
+
+
+private SOURCE: String =
+	|fixed union Box[T]:
+	|	Box(T)
+	|pure func box[T](value: T) -> Box[T]:
+	|	Box(value)
+	|pure func unbox[T](value: Box[T]) -> T:
+	|	match value:
+	|		Box(payload): payload
+	|func main() -> Int:
+	|	unbox(box(42.to_string())).length()
+	|
+
+
+private pure func specialized(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	tokens ?= lex(source)
+	parsed ?= parse(tokens)
+	checked ?= Checked
+		.check(parsed)
+		.map_err(setup_diagnostic)
+	program ?= Concrete.specialize(checked)
+	Ok(Concrete.specialized_contents(program))
+
+
+-- Retain the exact first-red diagnostic in the recorded TestSuite output.
+-- This remains useful failure output after String payload support is admitted.
+private func report(error: Diagnostic) -> Bool:
+	print_error(error.message)
+	print_error(error.help)
+	print_error(
+		"span="
+			.append_int(error.span.start)
+			.concat("..")
+			.append_int(error.span.end),
+	)
+
+	match error.note:
+		Some(UnionPayloadDeclaration(span)):
+			print_error(
+				"payload="
+					.append_int(span.start)
+					.concat("..")
+					.append_int(span.end),
+			)
+		None:
+			print_error("payload=none")
+
+	False
+
+
+func test_string_union_payload_has_concrete_string_type() -> Bool:
+	match specialized(SOURCE):
+		Err(error):
+			report(error)
+		Ok(program):
+			match program.unions:
+				[box]:
+					match box.variants:
+						[Some(Concrete.StringType)]:
+							True
+						_:
+							False
+				_:
+					False
+
+
+func test_unused_managed_variant_controls_the_complete_summary() -> Bool:
+	source: String =
+		|fixed union Choice[T]:
+		|	Empty
+		|	Text(T)
+		|	Number(Int)
+		|pure func ignore(value: Choice[String]) -> Int:
+		|	0
+		|func main() -> Int:
+		|	0
+		|
+
+	match specialized(source):
+		Err(error):
+			report(error)
+		Ok(program):
+			match program.unions:
+				[row]:
+					match row.representation:
+						Concrete.InlineOwningPayload:
+							match row.variants:
+								[None, Some(Concrete.StringType), Some(Concrete.IntType)]:
+									True
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+func test_nested_summary_uses_the_earlier_child_layout() -> Bool:
+	source: String =
+		|fixed union Choice[T]:
+		|	Empty
+		|	Text(T)
+		|fixed union Box[T]:
+		|	Box(T)
+		|pure func ignore(value: Box[Choice[String]]) -> Int:
+		|	0
+		|func main() -> Int:
+		|	0
+		|
+
+	match specialized(source):
+		Err(error):
+			report(error)
+		Ok(program):
+			match program.unions:
+				[child, parent]:
+					match child.representation:
+						Concrete.InlineOwningPayload:
+							match parent.representation:
+								Concrete.InlineOwningPayload:
+									match parent.variants:
+										[Some(Concrete.UnionType(id))]:
+											Concrete.union_number(id) == 0
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+func test_phantom_string_argument_creates_no_stored_obligation() -> Bool:
+	source: String =
+		|fixed union Phantom[T]:
+		|	Empty
+		|pure func ignore(value: Phantom[String]) -> Int:
+		|	0
+		|func main() -> Int:
+		|	0
+		|
+
+	match specialized(source):
+		Err(error):
+			report(error)
+		Ok(program):
+			match program.unions:
+				[row]:
+					match row.representation:
+						Concrete.InlineUnmanaged:
+							match row.variants:
+								[None]:
+									True
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 managed union specialization",
+	tests = [
+		(
+			"String union payload has its exact concrete type",
+			test_string_union_payload_has_concrete_string_type,
+		),
+		(
+			"unused managed variant controls complete summary",
+			test_unused_managed_variant_controls_the_complete_summary,
+		),
+		(
+			"nested summary uses earlier child layout",
+			test_nested_summary_uses_the_earlier_child_layout,
+		),
+		(
+			"phantom String argument creates no stored obligation",
+			test_phantom_string_argument_creates_no_stored_obligation,
+		),
+	]
+}

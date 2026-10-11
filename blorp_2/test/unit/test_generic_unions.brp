@@ -2,7 +2,7 @@ import:
 	../../src/check as Checked
 	../../src/lex: lex
 	../../src/specialize as Concrete
-	../../src/syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration)
+	../../src/syntax: Diagnostic
 	compilation: compile
 	input: check_failure, parse, setup_diagnostic
 	test: TestSuite
@@ -91,8 +91,6 @@ private MAIN: String =
 	|	0
 	|
 
-private PAYLOAD_START: Int = "fixed union Box[T]:\n\tBox(".length()
-
 
 private pure func rejects(
 	prefix: String,
@@ -111,29 +109,8 @@ private pure func rejects(
 			)
 
 
-private pure func rejects_layout(prefix: String, marked: String, suffix: String) -> Bool:
-	match compile(prefix + marked + suffix):
-		Err(errors):
-			match errors.remaining:
-				[]:
-					error = errors.first
-
-					match error.note:
-						Some(UnionPayloadDeclaration(span)):
-							(
-								error.span.start == prefix.length()
-								and error.span.end == prefix.length() + marked.length()
-								and span.start == PAYLOAD_START
-								and span.end == PAYLOAD_START + 1
-								and error.message == "specialized union payload must be Int"
-								and error.help == "use Int for this payload; String and union payloads are not supported"
-							)
-						_:
-							False
-				_:
-					False
-		Ok(_):
-			False
+private pure func admits_layout(prefix: String, application: String, suffix: String) -> Bool:
+	compile(prefix + application + suffix).is_ok()
 
 
 pure func test_generic_constructor_checks_its_rigid_payload_once() -> Bool:
@@ -219,11 +196,11 @@ pure func test_applied_type_mismatch_renders_the_complete_expected_type() -> Boo
 	)
 
 
-pure func test_concrete_written_layout_rejection_uses_application_and_payload_spans() -> Bool:
-	rejects_layout(BOX + "pure func bad(value: ", "Box[String]", ") -> Int:\n\t0\n" + MAIN)
+pure func test_concrete_written_string_layout_is_admitted() -> Bool:
+	admits_layout(BOX + "pure func bad(value: ", "Box[String]", ") -> Int:\n\t0\n" + MAIN)
 
 
-pure func test_forwarded_symbolic_layout_rejection_preserves_the_initiating_request() -> Bool:
+pure func test_forwarded_symbolic_string_layout_is_admitted() -> Bool:
 	source: String =
 		|pure func wrap[T](value: T) -> T:
 		|	ignored = box(value)
@@ -231,24 +208,24 @@ pure func test_forwarded_symbolic_layout_rejection_preserves_the_initiating_requ
 		|pure func middle[U](value: U) -> U:
 		|	wrap(value)
 		|func main() -> Int:
-	rejects_layout(BOX + source + "\n\t", "middle", "(7.to_string()).length()\n")
+	admits_layout(BOX + source + "\n\t", "middle", "(7.to_string()).length()\n")
 
 
-pure func test_inferred_binding_rejection_uses_the_producer_call_not_binding_name() -> Bool:
+pure func test_inferred_binding_string_layout_is_admitted() -> Bool:
 	main_source: String =
 		|func main() -> Int:
 		|	bad =
-	rejects_layout(BOX + main_source + " ", "box", "(7.to_string())\n\t0\n")
+	admits_layout(BOX + main_source + " ", "box", "(7.to_string())\n\t0\n")
 
 
-pure func test_semantic_nested_application_rejects_at_the_outer_payload_layout() -> Bool:
+pure func test_semantic_nested_application_has_unmanaged_payload_layout() -> Bool:
 	main_source: String =
 		|func main() -> Int:
 		|	bad =
-	rejects_layout(BOX + main_source + " ", "box", "(box(7))\n\t0\n")
+	compile(BOX + main_source + " box(box(7))\n\t0\n").is_ok()
 
 
-pure func test_wrapping_an_already_typed_nominal_union_rejects_at_payload_layout() -> Bool:
+pure func test_wrapping_an_already_typed_nominal_union_compiles() -> Bool:
 	source: String =
 		|fixed union Value:
 		|	Only
@@ -256,7 +233,7 @@ pure func test_wrapping_an_already_typed_nominal_union_rejects_at_payload_layout
 		|	Only
 		|func main() -> Int:
 		|	bad =
-	rejects_layout(BOX + source + " ", "box", "(value())\n\t0\n")
+	compile(BOX + source + " box(value())\n\t0\n").is_ok()
 
 
 pure func test_phantom_string_application_has_no_managed_payload() -> Bool:
@@ -320,21 +297,12 @@ pure func test_builtin_type_rejects_application() -> Bool:
 	)
 
 
-pure func test_written_nested_application_is_explicitly_unsupported() -> Bool:
-	box_source: String =
-		|fixed union Box[T]:
-		|	Box(T)
-		|pure func bad(value: Box[Box
-	rejects_parse(
-		box_source,
-		"[",
-		"Int]]) -> Int:\n\t0\n" + MAIN,
-		"nested type applications are not supported",
-		(
-			"use Int, String, a declared parameter, or an ordinary union as the written "
-			+ "argument"
-		),
-	)
+pure func test_written_nested_application_checks() -> Bool:
+	source: String =
+		|pure func keep(value: Box[Box[Int]]) -> Box[Box[Int]]:
+		|	value
+		|
+	checked(BOX + source + MAIN).is_ok()
 
 
 pure func test_union_parameter_collision_rejects_at_the_parameter_name() -> Bool:
@@ -511,9 +479,9 @@ pure func test_phantom_instances_keep_nominal_arguments_and_reuse_direct_ufcs_re
 			match program.unions:
 				[first_union, second_union]:
 					match first_union.variants:
-						[Concrete.NoPayload]:
+						[None]:
 							match second_union.variants:
-								[Concrete.NoPayload]:
+								[None]:
 									match program.functions:
 										[integer, text, main, first_identity, second_identity]:
 											match main.assignments:
@@ -587,7 +555,7 @@ pure func test_box_instance_translates_constructor_pattern_and_binding_types() -
 			match program.unions:
 				[declaration]:
 					match declaration.variants:
-						[Concrete.IntPayload]:
+						[Some(Concrete.IntType)]:
 							match program.functions:
 								[_, box, identity, unbox]:
 									match box.body:
@@ -601,7 +569,7 @@ pure func test_box_instance_translates_constructor_pattern_and_binding_types() -
 																	match matched.arms:
 																		[arm]:
 																			match arm.pattern:
-																				Concrete.VariantCase(pattern, Concrete.BindIntPayload(binding)):
+																				Concrete.VariantCase(pattern, Concrete.BindPayload(binding)):
 																					match unbox.bindings:
 																						[_, payload]:
 																							(
@@ -696,24 +664,24 @@ tests: TestSuite = {
 			test_applied_type_mismatch_renders_the_complete_expected_type,
 		),
 		(
-			"concrete written layout rejection uses application and payload spans",
-			test_concrete_written_layout_rejection_uses_application_and_payload_spans,
+			"concrete written String layout is admitted",
+			test_concrete_written_string_layout_is_admitted,
 		),
 		(
-			"forwarded symbolic layout rejection preserves the initiating request",
-			test_forwarded_symbolic_layout_rejection_preserves_the_initiating_request,
+			"forwarded symbolic String layout is admitted",
+			test_forwarded_symbolic_string_layout_is_admitted,
 		),
 		(
-			"inferred binding rejection uses the producer call not binding name",
-			test_inferred_binding_rejection_uses_the_producer_call_not_binding_name,
+			"inferred binding String layout is admitted",
+			test_inferred_binding_string_layout_is_admitted,
 		),
 		(
-			"semantic nested application rejects at the outer payload layout",
-			test_semantic_nested_application_rejects_at_the_outer_payload_layout,
+			"semantic nested application has unmanaged payload layout",
+			test_semantic_nested_application_has_unmanaged_payload_layout,
 		),
 		(
-			"wrapping an already typed nominal union rejects at payload layout",
-			test_wrapping_an_already_typed_nominal_union_rejects_at_payload_layout,
+			"wrapping an already typed nominal union compiles",
+			test_wrapping_an_already_typed_nominal_union_compiles,
 		),
 		(
 			"phantom string application has no managed payload",
@@ -722,10 +690,7 @@ tests: TestSuite = {
 		("generic union requires an argument", test_generic_union_requires_an_argument),
 		("ordinary union rejects an argument", test_ordinary_union_rejects_an_argument),
 		("builtin type rejects application", test_builtin_type_rejects_application),
-		(
-			"written nested application is explicitly unsupported",
-			test_written_nested_application_is_explicitly_unsupported,
-		),
+		("written nested application checks", test_written_nested_application_checks),
 		(
 			"union parameter collision rejects at the parameter name",
 			test_union_parameter_collision_rejects_at_the_parameter_name,
@@ -744,22 +709,3 @@ tests: TestSuite = {
 		),
 	]
 }
-
-
-private pure func rejects_parse(
-	prefix: String,
-	marked: String,
-	suffix: String,
-	message: String,
-	help: String,
-) -> Bool:
-	match lex(prefix + marked + suffix).and_then(pure func(tokens): parse(tokens)):
-		Ok(_):
-			False
-		Err(error):
-			(
-				error.span.start == prefix.length()
-				and error.span.end == prefix.length() + marked.length()
-				and error.message == message
-				and error.help == help
-			)

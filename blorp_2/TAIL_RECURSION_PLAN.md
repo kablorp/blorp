@@ -362,6 +362,15 @@ producer-to-consumer path before committing implementation.
 
 ## Subsequent bounded increments
 
+Pending follow-up: extend the existing base-16 countdown from four digits
+(65,535 recursive calls) to five, seeded with `0xF4240`, for exactly 1,000,000
+iterations. Run its real main at `-O0` with the default stack limit, an exact
+result and empty streams; pair that outcome with the existing explicit-backedge
+emission oracle to establish bounded self-edge stack use. An optional eight-digit
+`0x3B9ACA00` case may exercise 1,000,000,000 iterations as a separate long stress
+run. This needs no new language feature, stack instrumentation or test controller.
+Neither larger case is implemented or covered by current gates.
+
 1. **Same-instance generics.** Accept a self call only when its substitution
    preserves every enclosing declaration-owned type parameter in order. A
    source declaration recurring at different concrete arguments cannot jump

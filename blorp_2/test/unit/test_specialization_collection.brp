@@ -2,10 +2,18 @@ import:
 	../../src/check as Checked
 	../../src/lex: lex
 	../../src/specialize as Concrete
-	../../src/syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration)
+	../../src/syntax: Diagnostic
 	../../src/text: concat
 	input: parse, setup_diagnostic
 	test: TestSuite
+
+
+private pure func payload_free(variants: List[Option[Concrete.TypeRef]]) -> Bool:
+	match variants:
+		[None]:
+			True
+		_:
+			False
 
 
 private pure func specialize(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
@@ -156,8 +164,8 @@ pure func test_each_match_arm_prepares_its_assignments_and_nested_dependencies()
 										and union_is(inner.signature.return_type, 1)
 										and union_is(outer.signature.return_type, 2)
 										and union_is(input, 1)
-										and inner_union.variants == [Concrete.NoPayload]
-										and outer_union.variants == [Concrete.NoPayload]
+										and payload_free(inner_union.variants)
+										and payload_free(outer_union.variants)
 										and first_arm.assignments.length() == 1
 										and second_arm.assignments.length() == 1
 									)
@@ -182,22 +190,29 @@ private BOX_FUNCTION: String =
 	|
 
 
-private pure func payload_error_is(error: Diagnostic, start: Int, note_start: Int) -> Bool:
-	match error.note:
-		Some(UnionPayloadDeclaration(note)):
-			(
-				error.span.start == start
-				and error.span.end == start + 3
-				and note.start == note_start
-				and note.end == note_start + 1
-				and error.message == "specialized union payload must be Int"
-				and error.help == "use Int for this payload; String and union payloads are not supported"
-			)
+private pure func call_at(
+	call: Concrete.ConcreteCall,
+	target: Int,
+	start: Int,
+	width: Int,
+) -> Bool:
+	target_is(call, target) and call.span == {
+		start = start,
+		end = start + width
+	}
+
+
+private pure func owning_string_payload(layout: Concrete.ConcreteUnion) -> Bool:
+	match (layout.representation, layout.variants):
+		(Concrete.InlineOwningPayload, [Some(Concrete.StringType)]):
+			True
 		_:
 			False
 
 
-pure func test_parent_type_error_precedes_a_nested_child_and_binding_spans() -> Bool:
+-- String payloads are admitted; the old unsupported-payload error ordering
+-- is retired. Published child layouts and call requests retain these orders.
+pure func test_managed_nested_layout_and_request_order() -> Bool:
 	main_source: String =
 		|func main()->Int:
 		|	saved =
@@ -207,49 +222,161 @@ pure func test_parent_type_error_precedes_a_nested_child_and_binding_spans() -> 
 		|
 	prefix = BOX
 		.concat(BOX_FUNCTION)
-		.concat(main_source + " ")
+		.concat(main_source.concat(" "))
+	binding_start = BOX
+		.concat(BOX_FUNCTION)
+		.concat("func main()->Int:\n\t")
+		.length()
 
 	match specialize(prefix.concat(call_suffix)):
-		Err(error):
-			payload_error_is(error, prefix.length(), "fixed union Box[T]:\n\tBox(".length())
-		Ok(_):
+		Err(_):
 			False
+		Ok(contents):
+			match (contents.unions, contents.functions):
+				([child_layout, parent_layout], [main, child_function, parent_function]):
+					match (
+						parent_layout.representation,
+						parent_layout.variants,
+						child_function.signature.parameters,
+						parent_function.signature.parameters,
+					):
+						(Concrete.InlineOwningPayload, [Some(Concrete.UnionType(stored_child))], [Concrete.StringType], [Concrete.UnionType(input_child)]):
+							match (main.assignments, main.bindings):
+								([Concrete.InitializeBinding(binding, parent)], [saved]):
+									match parent.base:
+										Concrete.ReturnCall(parent_call, [child]):
+											match child.base:
+												Concrete.ReturnCall(child_call, [_]):
+													(
+														Concrete.function_number(
+															contents.entrypoint,
+														) == 0
+														and owning_string_payload(child_layout)
+														and Concrete.union_number(stored_child) == 0
+														and Concrete.union_number(input_child) == 0
+														and union_is(
+															child_function.signature.return_type,
+															0,
+														)
+														and union_is(
+															parent_function.signature.return_type,
+															1,
+														)
+														and main.signature.parameters.length() == 0
+														and Concrete.same_type(
+															main.signature.return_type,
+															Concrete.IntType,
+														)
+														and call_at(
+															parent_call,
+															2,
+															prefix.length(),
+															3,
+														)
+														and call_at(
+															child_call,
+															1,
+															prefix.length() + 4,
+															3,
+														)
+														and union_is(parent.base_type, 1)
+														and union_is(child.base_type, 0)
+														and Checked.binding_number(binding) == 0
+														and union_is(saved.value_type, 1)
+														and saved.span == {
+															start = binding_start,
+															end = binding_start + 5
+														}
+													)
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
 
 
-pure func test_earlier_assignment_error_keeps_the_initiating_forwarded_request() -> Bool:
+pure func test_forwarded_assignments_keep_nominal_request_order() -> Bool:
 	other_source: String =
 		|fixed union Other[T]:
 		|	Other(T)
 		|
-	source: String =
+	first_source: String =
 		|pure func other[T](value:T)->Other[T]:
 		|	Other(value)
 		|pure func forward[T](value:T)->T:
-		|	first = box(value)
+		|	first =
+	later_source: String =
+		|box(value)
 		|	second = other(value)
 		|	value
 		|func main()->Int:
-	prefix = BOX
+	first_prefix = BOX
 		.concat(other_source)
 		.concat(BOX_FUNCTION)
-		.concat(source + "\n\t")
+		.concat(first_source)
+		.concat(" ")
+	prefix = first_prefix
+		.concat(later_source)
+		.concat("\n\t")
+	second_start = first_prefix.length() + "box(value)\n\tsecond = ".length()
 
 	match specialize(prefix.concat("forward(7.to_string()).length()\n")):
-		Err(error):
-			match error.note:
-				Some(UnionPayloadDeclaration(note)):
-					(
-						error.span.start == prefix.length()
-						and error.span.end == prefix.length() + "forward".length()
-						and note.start == "fixed union Box[T]:\n\tBox(".length()
-						and note.end == "fixed union Box[T]:\n\tBox(T".length()
-						and error.message == "specialized union payload must be Int"
-						and error.help == "use Int for this payload; String and union payloads are not supported"
-					)
+		Err(_):
+			False
+		Ok(contents):
+			match (contents.unions, contents.functions):
+				([box_layout, other_layout], [main, forward, box, other]):
+					match (
+						forward.signature.parameters,
+						box.signature.parameters,
+						other.signature.parameters,
+						forward.assignments,
+					):
+						([Concrete.StringType], [Concrete.StringType], [Concrete.StringType], [Concrete.InitializeBinding(first_binding, first), Concrete.InitializeBinding(second_binding, second)]):
+							match (first.base, second.base, main.body):
+								(Concrete.ReturnCall(first_call, [_]), Concrete.ReturnCall(second_call, [_]), Concrete.ConcreteValueBody(Concrete.ReturnExpression(main_value))):
+									match main_value.base:
+										Concrete.ReturnCall(main_call, [_]):
+											(
+												Concrete.function_number(contents.entrypoint) == 0
+												and owning_string_payload(box_layout)
+												and owning_string_payload(other_layout)
+												and Concrete.same_type(
+													forward.signature.return_type,
+													Concrete.StringType,
+												)
+												and union_is(box.signature.return_type, 0)
+												and union_is(other.signature.return_type, 1)
+												and main.signature.parameters.length() == 0
+												and Concrete.same_type(
+													main.signature.return_type,
+													Concrete.IntType,
+												)
+												and call_at(first_call, 2, first_prefix.length(), 3)
+												and call_at(second_call, 3, second_start, 5)
+												and call_at(main_call, 1, prefix.length(), 7)
+												and Checked.binding_number(first_binding) == 1
+												and Checked.binding_number(second_binding) == 2
+												and union_is(first.base_type, 0)
+												and union_is(second.base_type, 1)
+												and Concrete.same_type(
+													main_value.base_type,
+													Concrete.StringType,
+												)
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
 				_:
 					False
-		Ok(_):
-			False
 
 
 tests: TestSuite = {
@@ -268,12 +395,12 @@ tests: TestSuite = {
 			test_each_match_arm_prepares_its_assignments_and_nested_dependencies,
 		),
 		(
-			"parent type error precedes nested child and binding spans",
-			test_parent_type_error_precedes_a_nested_child_and_binding_spans,
+			"managed child layout and request precede parent",
+			test_managed_nested_layout_and_request_order,
 		),
 		(
-			"earlier assignment keeps initiating forwarded request",
-			test_earlier_assignment_error_keeps_the_initiating_forwarded_request,
+			"forwarded assignments preserve distinct nominal request order",
+			test_forwarded_assignments_keep_nominal_request_order,
 		),
 	]
 }

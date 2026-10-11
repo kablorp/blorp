@@ -1,0 +1,687 @@
+import:
+	../../src/lower as Lower
+	../../src/own as Own
+	../../src/specialize as Concrete
+	../../src/syntax: FunctionExecution(SelfTailLoop)
+	int as IntOps
+	list: find
+	managed_union_inputs: BOX_SOURCE, lowered
+	system: read_file
+	test: TestSuite
+
+
+private FRESH_SOURCE: String =
+	|fixed union Box[T]:
+	|	Box(T)
+	|pure func fresh() -> Box[String]:
+	|	Box(42.to_string())
+	|pure func unbox[T](value: Box[T]) -> T:
+	|	match value:
+	|		Box(payload): payload
+	|func main() -> Int:
+	|	unused = 0
+	|	unbox(fresh()).length()
+	|
+
+
+private pure func same_value(left: Lower.ValueId, right: Lower.ValueId) -> Bool:
+	IntOps.equals(
+		Lower.value_number(left),
+		Lower.value_number(right),
+	)
+
+
+private pure func same_owner(left: Own.OwnerId, right: Own.OwnerId) -> Bool:
+	IntOps.equals(
+		Own.owner_number(left),
+		Own.owner_number(right),
+	)
+
+
+private pure func owns(result: Own.ResultOwnership, expected: Int) -> Bool:
+	match result:
+		Own.OwnedResult(owner):
+			IntOps.equals(
+				Own.owner_number(owner),
+				expected,
+			)
+		_:
+			False
+
+
+private func contains_function(
+	source: String,
+	accepts: pure (Own.OwnedFunction) -> Bool,
+) -> Bool:
+	match lowered(source).and_then(pure func(program): Own.own(program)):
+		Err(error):
+			print_error(error.message)
+			False
+		Ok(program):
+			program.functions.any(accepts)
+
+
+private pure func constructor_transfers_child(function: Own.OwnedFunction) -> Bool:
+	match function.operations:
+		[Own.DefineValue(parameter), Own.AcquireOwner(child, borrow, _), Own.DefineValue(box)]:
+			match box.operation:
+				Own.ConstructDefinition(_, Own.OwnedPayload(value, transferred)):
+					match box.result:
+						Own.OwnedResult(parent):
+							match function.tail:
+								Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(result, returned))):
+									IntOps.equals(
+										Lower.value_number(value),
+										Lower.value_number(parameter.id),
+									) and IntOps.equals(
+										Lower.value_number(borrow.value),
+										Lower.value_number(value),
+									) and IntOps.equals(
+										Lower.value_number(result),
+										Lower.value_number(box.id),
+									) and IntOps.equals(
+										Own.owner_number(child),
+										0,
+									) and IntOps.equals(
+										Own.owner_number(transferred),
+										Own.owner_number(child),
+									) and IntOps.equals(
+										Own.owner_number(parent),
+										1,
+									) and IntOps.equals(
+										Own.owner_number(returned),
+										Own.owner_number(parent),
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+func test_borrowed_child_acquisition_is_transferred_to_the_inline_owner() -> Bool:
+	-- Read the real fixture so host CTFE cannot hide runtime compiler lifetimes.
+	match read_file("blorp_2/test/e2e/fixtures/generic/managed/basic.brp"):
+		Err(error):
+			print_error(error)
+			False
+		Ok(source):
+			match lowered(source).and_then(pure func(program): Own.own(program)):
+				Err(error):
+					print_error(error.message)
+					False
+				Ok(program):
+					program.functions.any(constructor_transfers_child)
+
+
+func test_constant_source_has_the_same_child_transfer() -> Bool:
+	match lowered(BOX_SOURCE).and_then(pure func(program): Own.own(program)):
+		Err(error):
+			print_error(error.message)
+			False
+		Ok(program):
+			program.functions.any(constructor_transfers_child)
+
+
+private pure func fresh_transfers_final_owner(function: Own.OwnedFunction) -> Bool:
+	match function.operations:
+		[Own.DefineValue(_), Own.DefineValue(text), Own.DefineValue(box)]:
+			match box.operation:
+				Own.ConstructDefinition(_, Own.OwnedPayload(value, child)):
+					match function.tail:
+						Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(result, parent))):
+							(
+								same_value(value, text.id)
+								and same_value(result, box.id)
+								and IntOps.equals(
+									Own.owner_number(child),
+									0,
+								)
+								and IntOps.equals(
+									Own.owner_number(parent),
+									1,
+								)
+								and owns(text.result, 0)
+								and owns(box.result, 1)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+func test_final_constructor_use_transfers_without_acquire_or_child_drop() -> Bool:
+	contains_function(FRESH_SOURCE, fresh_transfers_final_owner)
+
+
+private pure func fresh_function(function: Lower.LoweredFunction) -> Bool:
+	match function.definitions:
+		[_, _, constructed]:
+			match constructed.operation:
+				Lower.ConstructValue(_, _):
+					True
+				_:
+					False
+		_:
+			False
+
+
+private pure func later_use_input(program: Lower.LoweredProgram) -> Option[Lower.LoweredFunction]:
+	contents = Lower.lowered_functions(program)
+
+	match contents.functions.find(fresh_function):
+		Some(function):
+			match contents.functions.get(Concrete.function_number(contents.entrypoint)):
+				Some(main):
+					match main.definitions:
+						[_, _, _, length]:
+							match function.definitions:
+								[integer, text, box]:
+									match length.operation:
+										Lower.CallValue(call, _):
+											Some(
+												{ function |
+													definitions = [
+														integer,
+														text,
+														box,
+														{ length |
+															operation = Lower.CallValue(
+																call,
+																[text.id],
+															)
+														},
+													]
+												},
+											)
+										_:
+											None
+								_:
+									None
+						_:
+							None
+				_:
+					None
+		None:
+			None
+
+
+private pure func later_use_acquires(function: Own.OwnedFunction) -> Bool:
+	match function.operations:
+		[Own.DefineValue(_), Own.DefineValue(text), Own.AcquireOwner(child, borrow, _), Own.DefineValue(box), Own.DefineValue(length), Own.DropOwner(original, _)]:
+			match box.operation:
+				Own.ConstructDefinition(_, Own.OwnedPayload(value, transferred)):
+					match borrow.source:
+						Own.OwnerBorrow(source):
+							(
+								same_value(value, text.id)
+								and same_value(borrow.value, text.id)
+								and IntOps.equals(
+									Own.owner_number(source),
+									0,
+								)
+								and same_owner(source, original)
+								and owns(text.result, 0)
+								and IntOps.equals(
+									Own.owner_number(child),
+									1,
+								)
+								and same_owner(child, transferred)
+								and owns(box.result, 2)
+								and Concrete.same_type(length.value_type, Concrete.IntType)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+func test_later_child_use_acquires_a_separate_obligation_before_construction() -> Bool:
+	match lowered(FRESH_SOURCE):
+		Err(_):
+			False
+		Ok(program):
+			match later_use_input(program):
+				None:
+					False
+				Some(function):
+					contents = Lower.lowered_functions(program)
+
+					match Own.insert_function(function, contents.unions, contents.records):
+						Err(error):
+							print_error(error.message)
+							False
+						Ok(result):
+							later_use_acquires(result)
+
+
+func test_last_uses_keep_constructor_and_later_child_use_distinct() -> Bool:
+	match lowered(FRESH_SOURCE):
+		Err(_):
+			False
+		Ok(program):
+			match later_use_input(program):
+				None:
+					False
+				Some(function):
+					match function.tail:
+						Lower.ExitValue(Lower.ReturnValue(result)):
+							match Own.last_uses(function.definitions, result):
+								Ok(uses):
+									-- Int is read at 1; String at 2 and 3; Box returns at 4.
+									-- The appended length result is unused.
+									uses == [Some(1), Some(3), Some(4), None]
+								Err(error):
+									print_error(error.message)
+									False
+						_:
+							False
+
+
+private pure func projection_borrows_immediate_parent(function: Own.OwnedFunction) -> Bool:
+	match function.operations:
+		[Own.DefineValue(parameter)]:
+			match function.tail:
+				Own.MatchTail(matched):
+					match matched.arms:
+						[arm]:
+							match arm.operations:
+								[Own.DefineValue(payload), Own.AcquireOwner(owner, borrow, _)]:
+									match payload.result:
+										Own.BorrowedResult(Own.PayloadBorrow(parent)):
+											match borrow.source:
+												Own.PayloadBorrow(acquired_parent):
+													(
+														same_value(parent, parameter.id)
+														and same_value(parent, matched.scrutinee)
+														and same_value(acquired_parent, parent)
+														and same_value(borrow.value, payload.id)
+														and IntOps.equals(
+															Own.owner_number(owner),
+															0,
+														)
+													)
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+func test_extraction_acquires_through_the_immediate_parent_value() -> Bool:
+	contains_function(BOX_SOURCE, projection_borrows_immediate_parent)
+
+
+private func contains_fixture(
+	path: String,
+	accepts: pure (Own.OwnedFunction) -> Bool,
+) -> Bool:
+	match read_file(path):
+		Err(error):
+			print_error(error)
+			False
+		Ok(source):
+			contains_function(source, accepts)
+
+
+private pure func nullary_owns(function: Own.OwnedFunction) -> Bool:
+	match function.operations:
+		[Own.DefineValue(value)]:
+			match value.operation:
+				Own.VariantDefinition(_):
+					match function.tail:
+						Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(result, owner))):
+							(
+								same_value(result, value.id)
+								and owns(value.result, 0)
+								and IntOps.equals(
+									Own.owner_number(owner),
+									0,
+								)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+func test_nullary_variant_definition_has_the_uniform_aggregate_obligation() -> Bool:
+	contains_fixture("blorp_2/test/e2e/fixtures/generic/managed/nullary_variant.brp", nullary_owns)
+
+
+private pure func unmanaged_payload_owns(function: Own.OwnedFunction) -> Bool:
+	match function.operations:
+		[Own.DefineValue(parameter), Own.DefineValue(value)]:
+			match value.operation:
+				Own.ConstructDefinition(_, Own.UnmanagedPayload(child)):
+					(
+						same_value(child, parameter.id)
+						and owns(value.result, 0)
+						and Concrete.same_type(parameter.value_type, Concrete.IntType)
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_unmanaged_active_payload_still_has_the_aggregate_obligation() -> Bool:
+	contains_fixture(
+		"blorp_2/test/e2e/fixtures/generic/managed/unmanaged_variant.brp",
+		unmanaged_payload_owns,
+	)
+
+
+func test_representation_query_names_the_inline_owned_layout() -> Bool:
+	match lowered(BOX_SOURCE):
+		Err(_):
+			False
+		Ok(program):
+			contents = Lower.lowered_functions(program)
+			contents.functions.any(pure func(function):
+				match function.signature.return_type:
+					Concrete.UnionType(id):
+						match Own.value_ownership(
+							function.signature.return_type,
+							contents.unions,
+							contents.records,
+						):
+							Ok(Own.InlineOwnedFields(layout)):
+								IntOps.equals(
+									Concrete.union_number(layout),
+									Concrete.union_number(id),
+								)
+							_:
+								False
+					_:
+						False
+			)
+
+
+private pure func loop_rejects(source: String, signature: Bool) -> Bool:
+	match lowered(source):
+		Err(_):
+			False
+		Ok(program):
+			contents = Lower.lowered_functions(program)
+			contents.functions.any(pure func(function):
+				match function.execution:
+					SelfTailLoop(annotation):
+						match function.definitions.get(0):
+							Some(first):
+								expected = if signature:
+									annotation
+								else:
+									first.span
+
+								match Own.insert_function(
+									function,
+									contents.unions,
+									contents.records,
+								):
+									Err(error):
+										(
+											error.message == "managed values in @tail_recursive functions are not supported yet"
+											and error.help == "use an unmanaged helper, or remove @tail_recursive"
+											and error.span == expected
+											and error.note.is_none()
+										)
+									Ok(_):
+										False
+							_:
+								False
+					_:
+						False
+			)
+
+
+func test_inline_owning_signature_is_rejected_at_the_loop_annotation() -> Bool:
+	source: String =
+		|fixed union Box[T]:
+		|	Box(T)
+		|@tail_recursive
+		|pure func loop(value: Box[String]) -> Box[String]:
+		|	loop(value)
+		|func main() -> Int:
+		|	0
+		|
+	loop_rejects(source, True)
+
+
+func test_inline_owning_intermediate_is_rejected_at_its_definition() -> Bool:
+	source: String =
+		|fixed union Choice[T]:
+		|	Empty
+		|	Text(T)
+		|pure func empty() -> Choice[String]:
+		|	Empty
+		|@tail_recursive
+		|pure func loop() -> Int:
+		|	unused = empty()
+		|	loop()
+		|func main() -> Int:
+		|	0
+		|
+	loop_rejects(source, False)
+
+
+func test_owned_prefix_keeps_the_existing_match_rejection() -> Bool:
+	source: String =
+		|fixed union Box[T]:
+		|	Box(T)
+		|pure func inspect(value: Box[String]) -> String:
+		|	unused = 42.to_string()
+		|	match value:
+		|		Box(payload): payload
+		|func main() -> Int:
+		|	0
+		|
+
+	match lowered(source):
+		Err(_):
+			False
+		Ok(program):
+			contents = Lower.lowered_functions(program)
+			contents.functions.any(pure func(function):
+				match function.definitions:
+					[_, _, text]:
+						match Own.insert_function(function, contents.unions, contents.records):
+							Err(error):
+								(
+									error.message == "owned managed values before a tail match are not supported yet"
+									and error.help == (
+										"create managed values inside the selected match arm or a separate straight-line "
+										+ "function"
+									)
+									and error.span == text.span
+									and error.note.is_none()
+								)
+							Ok(_):
+								False
+					_:
+						False
+			)
+
+
+private pure func aggregate_identity_acquires(function: Own.OwnedFunction) -> Bool:
+	match (function.operations, function.tail):
+		([Own.DefineValue(parameter), Own.AcquireOwner(owner, borrow, _)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(result, returned)))):
+			match (parameter.value_type, parameter.result, borrow.source):
+				(Concrete.UnionType(_), Own.BorrowedResult(Own.ParameterBorrow(parent)), Own.ParameterBorrow(source)):
+					(
+						same_value(result, parameter.id)
+						and same_value(borrow.value, parameter.id)
+						and same_value(parent, parameter.id)
+						and same_value(source, parameter.id)
+						and same_owner(owner, returned)
+						and IntOps.equals(
+							Own.owner_number(owner),
+							0,
+						)
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_aggregate_identity_acquires_an_independent_returned_owner() -> Bool:
+	contains_fixture(
+		"blorp_2/test/e2e/fixtures/generic/managed/shared_box.brp",
+		aggregate_identity_acquires,
+	)
+
+
+private pure func unused_aggregate_drops(function: Own.OwnedFunction) -> Bool:
+	match (function.operations, function.tail):
+		([Own.DefineValue(_), Own.DefineValue(text), Own.DefineValue(box), Own.DropOwner(child, _), Own.DropOwner(parent, _), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(returned)))):
+			match box.value_type:
+				Concrete.UnionType(_):
+					owns(text.result, 0) and owns(box.result, 1) and IntOps.equals(
+						Own.owner_number(child),
+						0,
+					) and IntOps.equals(
+						Own.owner_number(parent),
+						1,
+					) and same_value(returned, result.id)
+				_:
+					False
+		_:
+			False
+
+
+func test_unused_aggregate_drops_its_owner_after_the_call_argument_owner() -> Bool:
+	contains_fixture("blorp_2/test/e2e/fixtures/generic/managed/unused.brp", unused_aggregate_drops)
+
+
+private pure func unused_constructor_drops_only_parent(function: Own.OwnedFunction) -> Bool:
+	match (function.operations, function.tail):
+		([Own.DefineValue(_), Own.DefineValue(text), Own.DefineValue(box), Own.DropOwner(parent, _), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(returned)))):
+			match box.operation:
+				Own.ConstructDefinition(_, Own.OwnedPayload(value, transferred)):
+					same_value(value, text.id) and owns(text.result, 0) and IntOps.equals(
+						Own.owner_number(transferred),
+						0,
+					) and owns(box.result, 1) and IntOps.equals(
+						Own.owner_number(parent),
+						1,
+					) and same_value(returned, result.id)
+				_:
+					False
+		_:
+			False
+
+
+func test_unused_constructor_drops_only_its_new_parent_obligation() -> Bool:
+	match lowered(FRESH_SOURCE):
+		Err(_):
+			False
+		Ok(program):
+			match later_use_input(program):
+				Some(function):
+					match function.definitions:
+						[integer, text, box, last]:
+							-- Reuse only this compilation's opaque identities and typed child.
+							result = { last |
+								operation = Lower.IntegerValue(0),
+								value_type = Concrete.IntType
+							}
+							unused = { function |
+								signature = { function.signature | return_type = Concrete.IntType },
+								definitions = [integer, text, box, result],
+								tail = Lower.ExitValue(Lower.ReturnValue(result.id))
+							}
+							contents = Lower.lowered_functions(program)
+
+							match Own.insert_function(unused, contents.unions, contents.records):
+								Ok(owned):
+									unused_constructor_drops_only_parent(owned)
+								Err(_):
+									False
+						_:
+							False
+				None:
+					False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 managed union ownership insertion",
+	tests = [
+		(
+			"borrowed child acquisition transfers into the inline owner",
+			test_borrowed_child_acquisition_is_transferred_to_the_inline_owner,
+		),
+		(
+			"constant source has the same child transfer",
+			test_constant_source_has_the_same_child_transfer,
+		),
+		(
+			"final constructor use transfers without acquire or child drop",
+			test_final_constructor_use_transfers_without_acquire_or_child_drop,
+		),
+		(
+			"later child use acquires a separate obligation",
+			test_later_child_use_acquires_a_separate_obligation_before_construction,
+		),
+		(
+			"last uses keep construction and later child use distinct",
+			test_last_uses_keep_constructor_and_later_child_use_distinct,
+		),
+		(
+			"extraction acquires through immediate parent ValueId",
+			test_extraction_acquires_through_the_immediate_parent_value,
+		),
+		(
+			"nullary VariantDefinition has uniform aggregate obligation",
+			test_nullary_variant_definition_has_the_uniform_aggregate_obligation,
+		),
+		(
+			"unmanaged active payload keeps aggregate obligation",
+			test_unmanaged_active_payload_still_has_the_aggregate_obligation,
+		),
+		(
+			"representation query names inline owned layout",
+			test_representation_query_names_the_inline_owned_layout,
+		),
+		(
+			"inline owning signature rejects at loop annotation",
+			test_inline_owning_signature_is_rejected_at_the_loop_annotation,
+		),
+		(
+			"inline owning intermediate rejects at its definition",
+			test_inline_owning_intermediate_is_rejected_at_its_definition,
+		),
+		(
+			"owned match prefix preserves existing rejection",
+			test_owned_prefix_keeps_the_existing_match_rejection,
+		),
+		(
+			"aggregate identity acquires independent returned owner",
+			test_aggregate_identity_acquires_an_independent_returned_owner,
+		),
+		(
+			"unused aggregate drops after call argument owner",
+			test_unused_aggregate_drops_its_owner_after_the_call_argument_owner,
+		),
+		(
+			"unused constructor drops only its new parent obligation",
+			test_unused_constructor_drops_only_its_new_parent_obligation,
+		),
+	]
+}

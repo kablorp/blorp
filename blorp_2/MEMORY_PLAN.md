@@ -65,10 +65,25 @@ shapes are internal rejection, not an unchecked emission path.
 
 Generic function and union specialization supplies concrete types, callable
 identities and nominal union instance layouts before representation-sensitive
-work. Concrete union payloads are absent or Int; a non-Int substitution is
-rejected with application/request and payload-declaration provenance. Phantom
-String arguments do not introduce managed children. An unsolved semantic type is
-not a layout decision.
+work. Concrete union payloads are absent or contain Int, String, an existing inline
+record, or another finite inline union. Each variant publishes `Option[TypeRef]`,
+with child union layouts before parents. One bottom-up `UnionRepresentation`
+classifies each complete layout; the verifier independently checks every row,
+including unused variants. Owning inline unions have no allocated ARC root:
+their uniform aggregate obligation owns the active child path. Empty/unmanaged
+active variants require no child work. Phantom String arguments do not introduce managed children. An
+unsolved semantic type is not a layout decision.
+
+Construction explicitly transfers a child obligation through `StoredPayload`.
+At its final use, an owned child transfers directly; otherwise acquisition creates
+a separate obligation before construction. Projections use `PayloadBorrow(ValueId)`
+to name the immediate immutable parent, following accepted `ResultOwnership`
+facts rather than copying ancestry. A returned managed child acquires its own
+owner. Rebinding changes the source binding's current value, never the earlier
+value identity. The owned-prefix match guard remains until transitive borrow-use
+scheduling and edge cleanup are supported; even an already-dropped owned prefix
+is excluded. Managed self-tail-loop signatures/intermediates also remain excluded.
+Step-6 validation status and cost stops live in [GENERICS_HANDOFF.md](GENERICS_HANDOFF.md).
 
 Self and mutual function recursion use declared call contracts, independently of
 body order or call-graph cycles. Concrete instance keys are requested once;

@@ -39,19 +39,19 @@ import:
 			AccessorLiteralMatchExpr, AssignExpr, BinaryExpr, BorrowLetExpr, BoxExpr, BreakExpr,
 			CallExpr, CastExpr, ClosureCreateExpr, ConcurrentExpr, ConcurrentlyLoopExpr,
 			ConstructorMatchExpr, DebugBlockExpr, DetachExpr, DictConstructExpr, DropExpr, DupExpr,
-			ForChannelExpr, ForDictExpr, ForListExpr, ForRangeExpr,
-			ForResourceSourceExpr, ForSetExpr, ForStreamExpr, ForStringExpr, ForTensorExpr, IfExpr,
-			LambdaExpr, LetExpr, ListConstructExpr, ListAllocExpr, ListGetExpr, ListHandoffExpr,
-			ListHandoffSetOwnedExpr, ListHandoffSetSourceSlotExpr, ListRetainExpr, ListSetExpr,
-			ListSwapExpr, LiteralExpr, LogicalExpr, PreClosureConcurrentExpr,
-			PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr, ProductExpr,
-			RecordCowUpdateExpr, RecordReuseExpr, RecordUpdateExpr, ResourceCleanupExitExpr,
-			ResourceScopeExpr, SelectExpr, SeqExpr, StaticStringLiteralExpr, StringByteCopyExpr,
-			StringByteReadExpr, StringByteWriteExpr, StringSetLenExpr, TailrecListSpreadLoopExpr,
-			TailrecListSpreadRecurExpr, TailrecLoopExpr, TailrecRecurExpr, TensorBoxedLiteralExpr,
-			TensorRawFillExpr, TensorRawReadExpr, TensorRawViewLetExpr, TensorRawWriteExpr,
-			TupleExpr, UnaryExpr, UnboxExpr, UnionConstructExpr,
-			VarExpr, VectorExpr, VoidExpr, WhileExpr, LiteralMatchExpr, LengthMatchExpr,
+			ForChannelExpr, ForDictExpr, ForListExpr, ForRangeExpr, ForResourceSourceExpr,
+			ForSetExpr, ForStreamExpr, ForStringExpr, ForTensorExpr, IfExpr, LambdaExpr, LetExpr,
+			ListConstructExpr, ListAllocExpr, ListGetExpr, ListHandoffExpr, ListHandoffSetOwnedExpr,
+			ListHandoffSetSourceSlotExpr, ListRetainExpr, ListSetExpr, ListSwapExpr, LiteralExpr,
+			LogicalExpr, PreClosureConcurrentExpr, PreClosureConcurrentlyLoopExpr,
+			PreClosureDetachExpr, ProductExpr, RecordCowUpdateExpr, RecordReuseExpr,
+			RecordUpdateExpr, ResourceCleanupExitExpr, ResourceScopeExpr, SelectExpr, SeqExpr,
+			StaticStringLiteralExpr, StringByteCopyExpr, StringByteReadExpr, StringByteWriteExpr,
+			StringSetLenExpr, TailrecListSpreadLoopExpr, TailrecListSpreadRecurExpr,
+			TailrecLoopExpr, TailrecRecurExpr, TensorBoxedLiteralExpr, TensorRawFillExpr,
+			TensorRawReadExpr, TensorRawViewLetExpr, TensorRawWriteExpr, TupleExpr, UnaryExpr,
+			UnboxExpr, UnionConstructExpr, VarExpr, VectorExpr, VoidExpr, WhileExpr,
+			LiteralMatchExpr, LengthMatchExpr,
 		),
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(
@@ -70,9 +70,11 @@ import:
 		DerivedTempKind(DropTemp),
 		core_expr_type,
 		synthetic_core_source_loc,
+	../ownership: arg_consumes_caller
 	../traverse as CoreTraverse
 	env:
 		PerceusEnv,
+		contract_for_call,
 		is_managed_type,
 		release_policy_for_type,
 		retain_policy_for_type,
@@ -556,6 +558,29 @@ private pure func literal_match_has_divergent_nested_branch_ownership(
 	divergent
 
 
+-- A sole transferred argument is an ownership region when evaluating the
+-- callee cannot touch the owner. Multiple arguments need separate scheduling.
+private pure func can_balance_call_argument(
+	env: PerceusEnv,
+	name: String,
+	kind: CoreCallKind,
+	callee: CoreExpr,
+	typ: CoreType,
+) -> Bool:
+	match contract_for_call(env, kind, 1, typ):
+		Some(contract):
+			match contract.args:
+				[mode]:
+					(
+						arg_consumes_caller(mode)
+						and not summarize_linear_ownership_uses(env, name, callee).touched
+					)
+				_:
+					False
+		None:
+			False
+
+
 pure func balanced_path_has_divergent_constructor_match(
 	env: PerceusEnv,
 	name: String,
@@ -576,6 +601,11 @@ private pure func balanced_path_has_divergent_constructor_match_impl(
 	expr: CoreExpr,
 ) -> Bool:
 	match expr:
+		CallExpr(kind, callee, [argument], typ, loc):
+			(
+				balanced_path_has_divergent_constructor_match(env, name, argument)
+				and can_balance_call_argument(env, name, kind, callee, typ)
+			)
 		SeqExpr(first, second):
 			(
 				balanced_path_has_divergent_constructor_match(env, name, second)
@@ -1144,6 +1174,22 @@ private pure func balance_nested_branch_body(
 	body: CoreExpr,
 ) -> Option[CoreExpr]:
 	match body:
+		CallExpr(kind, callee, [argument], typ, loc):
+			if (
+				balanced_path_has_divergent_constructor_match(env, variable.name, argument)
+				and can_balance_call_argument(env, variable.name, kind, callee, typ)
+			):
+				balance_nested_branch_body(
+					env,
+					variable,
+					value_type,
+					available_refs,
+					argument,
+				).map(
+					func(balanced): CallExpr(kind, callee, [balanced], typ, loc),
+				)
+			else:
+				None
 		SeqExpr(first, second):
 			first_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
 				env,

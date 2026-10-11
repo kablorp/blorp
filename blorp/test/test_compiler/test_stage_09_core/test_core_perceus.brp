@@ -93,6 +93,7 @@ import:
 		CoreFunctionKind(ClosureBodyFunction, UserFunction),
 		CoreFunctionOrigin(ConsumingClone),
 		core_function_declared_origin,
+		core_expr_type,
 		CoreListAccessBounds(ProvenListAccess),
 		CoreListHandoffMode(BorrowFreshHandoff),
 		CoreListHandoffWriteOrder(ForwardCompactingHandoff),
@@ -194,6 +195,7 @@ import:
 		insert_drops_program_with_facts,
 	../../../src/compiler/stage_09_core/perceus/balance:
 		balance_branch_body,
+		balanced_path_has_divergent_constructor_match,
 		freshen_shadowed_match_bindings,
 	../../../src/compiler/stage_09_core/perceus/borrowed: normalize_lambda_result_aliases, retain_borrowed_owned_uses
 	../../../src/compiler/stage_09_core/perceus/protect: protect_repeated_consumes
@@ -4230,6 +4232,195 @@ pure func test_nested_owned_temporary_field_owners_are_released() -> Bool:
 				and drop_count_for("__owned_field_owner_0_1", body) == 1
 			)
 		None:
+			False
+
+
+private pure func nested_binding_projection(
+	depth: Int,
+	root: CoreExpr,
+	leaf_type: CoreType,
+) -> CoreExpr:
+	var owner = root
+
+	for level in 1..depth:
+		owner = ProductFieldExpr(
+			owner,
+			core_field_ordinal(1),
+			HeapRecordType("ProjectionParent${level}"),
+			pack_core_source_loc(0, level, 2, level, 8),
+		)
+
+	ProductFieldExpr(
+		owner,
+		core_field_ordinal(2),
+		leaf_type,
+		pack_core_source_loc(0, depth, 3, depth, 12),
+	)
+
+
+private pure func temporary_projection_match_is_balanced(depth: Int) -> Bool:
+	parent_type = HeapRecordType("ProjectionParent0")
+	tag_type = UnionType("Tag", ManagedUnionValue)
+	projection = nested_binding_projection(
+		depth,
+		user_call_expr("make_parent", Some(247), [], [], parent_type),
+		tag_type,
+	)
+	rewritten = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		LetExpr(
+			named_var("matched"),
+			False,
+			tag_type,
+			projection,
+			ConstructorMatchExpr(
+				var_expr("matched", tag_type),
+				ArcReleasePolicy,
+				[constructor_case("Known", [], bool_expr(True))],
+				ConstructorMatchFallbackBody(bool_expr(False)),
+				bool_type(),
+				synthetic_core_source_loc(),
+			),
+		),
+	)
+
+	match rewritten:
+		LetExpr(bound, False, _, rhs, ConstructorMatchExpr(VarExpr(scrutinee, _, _), ArcReleasePolicy, _, _, _, _)):
+			match ownership_events(rhs):
+				Ok(events):
+					var valid = (
+						bound.name == "matched"
+						and scrutinee.name == bound.name
+						and events.length() == 2 * depth
+					)
+					var position = 0
+
+					for event in events:
+						-- Each child is acquired before its parent is released. The
+						-- final union is acquired once, after all intermediate levels.
+						expected_type = if position == 2 * (depth - 1):
+							tag_type
+						else if position % 2 == 0:
+							HeapRecordType("ProjectionParent${position / 2 + 1}")
+						else:
+							HeapRecordType("ProjectionParent${position / 2}")
+
+						operation_matches = match event.operation:
+							OwnershipRetainEvent(ArcRetainPolicy):
+								position % 2 == 0
+							OwnershipReleaseEvent(ArcReleasePolicy):
+								position % 2 == 1
+							_:
+								False
+
+						valid = (
+							valid
+							and core_type_equal(event.value_type, expected_type)
+							and operation_matches
+						)
+						position += 1
+
+					valid
+				Err(_):
+					False
+		_:
+			False
+
+
+pure func test_one_temporary_projection_match_acquires_child_once() -> Bool:
+	temporary_projection_match_is_balanced(1)
+
+
+pure func test_two_temporary_projection_match_acquires_child_once() -> Bool:
+	temporary_projection_match_is_balanced(2)
+
+
+pure func test_three_temporary_projection_match_acquires_child_once() -> Bool:
+	temporary_projection_match_is_balanced(3)
+
+
+pure func test_nested_borrowed_projection_binding_retains_only_child() -> Bool:
+	parent_type = HeapRecordType("ProjectionParent0")
+	tag_type = UnionType("Tag", ManagedUnionValue)
+	projection = nested_binding_projection(
+		3,
+		var_expr("root", parent_type),
+		tag_type,
+	)
+	rewritten = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		LetExpr(
+			named_var("child"),
+			False,
+			tag_type,
+			projection,
+			var_expr("child", tag_type),
+		),
+	)
+
+	match ownership_events(rewritten):
+		Ok([event]):
+			core_type_equal(event.value_type, tag_type) and match event.operation:
+				OwnershipRetainEvent(ArcRetainPolicy):
+					dup_count_for("root", rewritten) == 0 and drop_count_for("root", rewritten) == 0
+				_:
+					False
+		_:
+			False
+
+
+pure func test_nested_unmanaged_projection_binding_drops_all_parents() -> Bool:
+	parent_type = HeapRecordType("ProjectionParent0")
+	projection = nested_binding_projection(
+		3,
+		user_call_expr("make_parent", Some(247), [], [], parent_type),
+		int_type(),
+	)
+	rewritten = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		LetExpr(
+			named_var("leaf"),
+			False,
+			int_type(),
+			projection,
+			var_expr("leaf", int_type()),
+		),
+	)
+
+	match ownership_events(rewritten):
+		Ok(events):
+			var valid = events.length() == 5
+			var position = 0
+
+			for event in events:
+				expected_parent = match position:
+					0 | 3:
+						1
+					1:
+						0
+					_:
+						2
+
+				operation_matches = match event.operation:
+					OwnershipRetainEvent(ArcRetainPolicy):
+						position == 0 or position == 2
+					OwnershipReleaseEvent(ArcReleasePolicy):
+						position == 1 or position == 3 or position == 4
+					_:
+						False
+
+				valid = (
+					valid
+					and core_type_equal(
+						event.value_type,
+						HeapRecordType("ProjectionParent${expected_parent}"),
+					)
+					and operation_matches
+				)
+				position += 1
+
+			valid
+		Err(_):
 			False
 
 
@@ -21161,9 +21352,255 @@ pure func test_lambda_body_is_not_walked_for_borrowed_payload() -> Bool:
 	retained_text_dups(lambda) == 0
 
 
+-- A consuming wrapper transfers its argument's result, but each argument arm
+-- must still discharge the original String obligation independently.
+private pure func consuming_branch_env() -> PerceusEnv:
+	base: PerceusEnv = build_env({
+		decls = [result_union_decl(63020, 63021, string_type(), int_type())],
+		foreign_includes = [],
+		source_files = [],
+	})
+	{ base | balance_strategy = BranchAwareOwnershipBalance }
+
+
+private pure func mixed_string_branch() -> CoreExpr:
+	constructor_match_expr(
+		[
+			constructor_case(
+				"Some",
+				[],
+				call_expr(
+					"blorp_string_concat",
+					[
+						var_expr("output", string_type()),
+						LiteralExpr(
+							StringLiteral("suffix"),
+							string_type(),
+							synthetic_core_source_loc(),
+						),
+					],
+					string_type(),
+				),
+			),
+		],
+		var_expr(
+			"output",
+			string_type(),
+		),
+		string_type(),
+	)
+
+
+private pure func consuming_branch_wrapper(argument: CoreExpr) -> CoreExpr:
+	CallExpr(
+		UserCall("Ok", Some(63020), []),
+		var_expr(
+			"Ok",
+			NamedType("Function", []),
+		),
+		[argument],
+		StackResultType(core_expr_type(argument), int_type()),
+		pack_core_source_loc(0, 61, 2, 66, 3),
+	)
+
+
+private pure func balance_consuming_branch(expr: CoreExpr) -> CoreExpr:
+	env: PerceusEnv = consuming_branch_env()
+	balance_branch_body(
+		env,
+		named_var("output"),
+		string_type(),
+		1,
+		summarize_linear_ownership_uses(env, "output", expr),
+		expr,
+	)
+
+
+private pure func balanced_consuming_branch_matches(source: CoreExpr, actual: CoreExpr) -> Bool:
+	match (source, actual):
+		(CallExpr(UserCall(name, id, consumed), callee, [source_arg], typ, loc), CallExpr(UserCall(actual_name, actual_id, actual_consumed), actual_callee, [actual_arg], actual_type, actual_loc)):
+			(
+				name == actual_name
+				and id == actual_id
+				and consumed == actual_consumed
+				and same_object(callee, actual_callee)
+				and core_type_equal(typ, actual_type)
+				and core_source_loc_equal(loc, actual_loc)
+				and balanced_consuming_branch_matches(source_arg, actual_arg)
+			)
+		(ConstructorMatchExpr(scrutinee, policy, [source_case], source_fallback, typ, loc), ConstructorMatchExpr(actual_scrutinee, actual_policy, [actual_case], actual_fallback, actual_type, actual_loc)):
+			match (source_case.body, actual_case.body, source_fallback, actual_fallback):
+				(ConstructorMatchBodyExpr(source_body), ConstructorMatchBodyExpr(LetExpr(temp, False, temp_type, rhs, DropExpr(dropped, value_type, ArcReleasePolicy, VarExpr(result, result_type, _), drop_type, _))), ConstructorMatchFallbackBody(source_return), ConstructorMatchFallbackBody(actual_return)):
+					(
+						same_object(source_body, rhs)
+						and exact_core_var_equal(dropped, named_var("output"))
+						and exact_core_var_equal(temp, result)
+						and core_type_equal(value_type, string_type())
+						and core_type_equal(temp_type, result_type)
+						and core_type_equal(drop_type, result_type)
+						and same_object(source_return, actual_return)
+						and same_object(scrutinee, actual_scrutinee)
+						and policy == actual_policy
+						and core_type_equal(typ, actual_type)
+						and core_source_loc_equal(loc, actual_loc)
+						and drop_count_for("output", actual) == 1
+						and dup_count_for("output", actual) == 0
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_consuming_call_balances_nested_branch_argument() -> Bool:
+	expr: CoreExpr = consuming_branch_wrapper(mixed_string_branch())
+	balanced_consuming_branch_matches(expr, balance_consuming_branch(expr))
+
+
+pure func test_nested_consuming_calls_balance_innermost_branch() -> Bool:
+	expr: CoreExpr = consuming_branch_wrapper(consuming_branch_wrapper(mixed_string_branch()))
+	balanced_consuming_branch_matches(expr, balance_consuming_branch(expr))
+
+
+pure func test_local_owner_balances_nested_consuming_argument() -> Bool:
+	expr: CoreExpr = consuming_branch_wrapper(mixed_string_branch())
+	rewritten: CoreExpr = insert_drops_expr(
+		consuming_branch_env(),
+		LetExpr(
+			named_var("output"),
+			False,
+			string_type(),
+			var_expr("source", string_type()),
+			expr,
+		),
+	)
+
+	match rewritten:
+		LetExpr(owner, False, _, DupExpr(source, source_type, ArcRetainPolicy, VarExpr(acquired, acquired_type, _), dup_type, _), body):
+			match body:
+				CallExpr(UserCall("Ok", Some(63020), []), _, [ConstructorMatchExpr(_, NoReleasePolicy, [arm], ConstructorMatchFallbackBody(VarExpr(transferred, _, _)), _, _)], _, _):
+					match arm.body:
+						ConstructorMatchBodyExpr(LetExpr(result, False, result_type, rhs, DropExpr(dropped, value_type, ArcReleasePolicy, VarExpr(returned, _, _), _, _))):
+							borrow = summarize_linear_ownership_uses(
+								consuming_branch_env(),
+								"output",
+								rhs,
+							)
+							(
+								exact_core_var_equal(owner, named_var("output"))
+								and exact_core_var_equal(source, named_var("source"))
+								and exact_core_var_equal(source, acquired)
+								and core_type_equal(source_type, string_type())
+								and core_type_equal(acquired_type, string_type())
+								and core_type_equal(dup_type, string_type())
+								and dup_count_for("source", rewritten) == 1
+								and borrow.required_refs == 1
+								and borrow.consumed_refs == 0
+								and not borrow.returns_alias
+								and core_type_equal(core_expr_type(rhs), string_type())
+								and core_type_equal(result_type, string_type())
+								and drop_count_for("output", rhs) == 0
+								and dup_count_for("output", rhs) == 0
+								and exact_core_var_equal(owner, dropped)
+								and exact_core_var_equal(owner, transferred)
+								and exact_core_var_equal(result, returned)
+								and core_type_equal(value_type, string_type())
+								and drop_count_for("output", body) == 1
+								and dup_count_for("output", body) == 0
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_consuming_call_exposes_divergent_argument() -> Bool:
+	balanced_path_has_divergent_constructor_match(
+		consuming_branch_env(),
+		"output",
+		consuming_branch_wrapper(mixed_string_branch()),
+	)
+
+
+private pure func call_balancing_keeps_argument_region(expr: CoreExpr) -> Bool:
+	match balance_consuming_branch(expr):
+		LetExpr(_, _, _, rhs, _):
+			same_object(expr, rhs)
+		actual:
+			same_object(expr, actual)
+
+
+pure func test_borrowing_call_does_not_expose_argument_region() -> Bool:
+	expr: CoreExpr = call_expr("blorp_string_length", [mixed_string_branch()], int_type())
+	(
+		not balanced_path_has_divergent_constructor_match(consuming_branch_env(), "output", expr)
+		and call_balancing_keeps_argument_region(expr)
+	)
+
+
+pure func test_consuming_call_with_callee_use_does_not_expose_argument_region() -> Bool:
+	expr: CoreExpr = CallExpr(
+		UserCall("Ok", Some(63020), []),
+		SeqExpr(
+			var_expr("output", string_type()),
+			var_expr(
+				"Ok",
+				NamedType("Function", []),
+			),
+		),
+		[mixed_string_branch()],
+		StackResultType(string_type(), int_type()),
+		synthetic_core_source_loc(),
+	)
+	(
+		not balanced_path_has_divergent_constructor_match(consuming_branch_env(), "output", expr)
+		and call_balancing_keeps_argument_region(expr)
+	)
+
+
+pure func test_multiple_call_arguments_keep_separate_scheduling() -> Bool:
+	expr: CoreExpr = user_call_expr(
+		"consume_two",
+		Some(63022),
+		[0, 1],
+		[mixed_string_branch(), var_expr("output", string_type())],
+		string_type(),
+	)
+	(
+		not balanced_path_has_divergent_constructor_match(consuming_branch_env(), "output", expr)
+		and call_balancing_keeps_argument_region(expr)
+	)
+
+
+pure func test_constructor_spelling_without_identity_does_not_expose_argument_region() -> Bool:
+	expr: CoreExpr = user_call_expr(
+		"Ok",
+		Some(63099),
+		[],
+		[mixed_string_branch()],
+		StackResultType(string_type(), int_type()),
+	)
+	not balanced_path_has_divergent_constructor_match(consuming_branch_env(), "output", expr)
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core Perceus",
 	tests = [
+		("local owner balances nested consuming argument", test_local_owner_balances_nested_consuming_argument),
+		("one temporary projection match acquires child once", test_one_temporary_projection_match_acquires_child_once),
+		("two temporary projection match acquires child once", test_two_temporary_projection_match_acquires_child_once),
+		("three temporary projection match acquires child once", test_three_temporary_projection_match_acquires_child_once),
+		("nested borrowed projection binding retains only child", test_nested_borrowed_projection_binding_retains_only_child),
+		("nested unmanaged projection binding drops all parents", test_nested_unmanaged_projection_binding_drops_all_parents),
+		("consuming call balances nested branch argument", test_consuming_call_balances_nested_branch_argument),
+		("nested consuming calls balance innermost branch", test_nested_consuming_calls_balance_innermost_branch),
+		("consuming call exposes divergent argument", test_consuming_call_exposes_divergent_argument),
+		("borrowing call does not expose argument region", test_borrowing_call_does_not_expose_argument_region),
+		("consuming call with callee use does not expose argument region", test_consuming_call_with_callee_use_does_not_expose_argument_region),
+		("multiple call arguments keep separate scheduling", test_multiple_call_arguments_keep_separate_scheduling),
+		("constructor spelling without identity does not expose argument region", test_constructor_spelling_without_identity_does_not_expose_argument_region),
 		("borrowed payload in binary operand keeps record reference", test_borrowed_payload_in_binary_operand_keeps_record_reference),
 		("borrowed payload in logical operand keeps record reference", test_borrowed_payload_in_logical_operand_keeps_record_reference),
 		("borrowed payload in unary operand keeps record reference", test_borrowed_payload_in_unary_operand_keeps_record_reference),

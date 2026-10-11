@@ -1,0 +1,235 @@
+import:
+	../../src/lex: lex
+	../../src/parse: ParsedProgram, parse_prelude, parsed_contents
+	../../src/syntax: Diagnostic
+	../unit/input: parse
+	test: TestSuite
+
+
+private pure func parse_source(source: String) -> Result[ParsedProgram, Diagnostic]:
+	lex(source).and_then(pure func(tokens): parse(tokens))
+
+
+private pure func rejects(
+	source: String,
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+) -> Bool:
+	match parse_source(source):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.span.start == start
+				and error.span.end == end
+				and error.message == message
+				and error.help == help
+				and error.note.is_none()
+			)
+
+
+pure func test_blank_and_comment_lines_surround_real_main() -> Bool:
+	source: String =
+		|
+		|-- leading comment
+		|
+		|func main() -> Int: -- header
+		|-- shallow comment inside body
+		|
+		|    0 -- return
+		|
+		|-- final comment
+	parse_source(source).is_ok()
+
+
+pure func test_trivia_is_transparent_across_all_block_depths() -> Bool:
+	source: String =
+		|fixed union Choice: -- union header
+		|    -- before first variant
+		|
+		|    First -- first variant
+		|-- between variants
+		|    Second
+		|
+		|fixed record Pair { value: Int } -- record declaration
+		|
+		|pure func choose(value: Choice) -> Int:
+		|    var saved = 0 -- binding
+		|        -- comment is deeper than the binding
+		|
+		|    match value: -- match header
+		|-- comment is shallower than the arm
+		|        First: -- block arm header
+		|
+		|            saved = 1 -- assignment
+		|    -- comment is shallower than the arm block
+		|            saved -- block result
+		|
+		|        Second: 0 -- inline arm
+		|
+		|func main() -> Int:
+		|    choose(First)
+		|
+
+	match parse_source(source):
+		Err(_):
+			False
+		Ok(parsed):
+			program = parsed_contents(parsed)
+			(
+				program.functions.length() == 2
+				and program.unions.length() == 1
+				and program.records.length() == 1
+			)
+
+
+pure func test_annotation_associates_across_trivia() -> Bool:
+	source: String =
+		|@tail_recursive -- annotation
+		|
+		|  	-- incidental mixed indentation
+		|pure func again() -> Int:
+		|    again()
+		|
+
+	match parse_source(source):
+		Err(_):
+			False
+		Ok(parsed):
+			match parsed_contents(parsed).functions:
+				[function]:
+					match function.tail_annotation:
+						Some(span):
+							span.start == 0 and span.end == 15
+						None:
+							False
+				_:
+					False
+
+
+pure func test_prelude_uses_the_same_trivia_rules() -> Bool:
+	source: String =
+		|
+		|-- builtin declaration
+		|type Int = builtin -- Int
+		|
+		|type String = builtin
+		|-- function separator
+		|pure func to_string(value: Int) -> String: -- function
+		|    -- runtime body
+		|    builtin("int.to_string") -- operation
+		|
+	lex(source)
+		.and_then(pure func(tokens): parse_prelude(tokens))
+		.is_ok()
+
+
+pure func test_prelude_still_requires_real_line_separators() -> Bool:
+	match lex(
+		"type Int = builtin type String = builtin",
+	).and_then(
+		pure func(tokens): parse_prelude(tokens),
+	):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.span.start == 19
+				and error.span.end == 23
+				and error.message == "expected a newline after the prelude declaration"
+				and error.help == "put each prelude declaration on its own line"
+				and error.note.is_none()
+			)
+
+
+pure func test_trivia_does_not_supply_a_required_body() -> Bool:
+	rejects(
+		"func main() -> Int:\n--x\n \t\n",
+		27,
+		27,
+		"expected an indent of one tab or four spaces",
+		"indent the body with exactly one tab or four spaces",
+	)
+
+
+pure func test_trivia_does_not_supply_a_declaration() -> Bool:
+	rejects(
+		"--\n \t\n",
+		6,
+		6,
+		"expected a function declaration at column 1",
+		"start with func main() -> Int:",
+	)
+
+
+pure func test_trivia_does_not_supply_a_union_variant() -> Bool:
+	rejects(
+		"fixed union Empty:\n--\n",
+		22,
+		22,
+		"expected an indented union variant",
+		"declare at least one variant, indented with one tab or four spaces",
+	)
+
+
+pure func test_annotation_trivia_still_requires_a_function() -> Bool:
+	rejects(
+		"@tail_recursive\n--\n",
+		0,
+		15,
+		"@tail_recursive has no function declaration",
+		"put a function declaration immediately after @tail_recursive",
+	)
+
+
+pure func test_comment_cannot_continue_an_expression() -> Bool:
+	rejects(
+		"func main() -> Int:\n    one(-- argument\n    0)\n",
+		39,
+		40,
+		"expected a return expression",
+		"use a literal, a parameter or variant name, or a call as the entire body",
+	)
+
+
+pure func test_following_real_dedent_starts_a_new_declaration() -> Bool:
+	source: String =
+		|func first() -> Int:
+		|    1
+		|            -- deep comment after first body
+		|
+		|func main() -> Int:
+		|    first()
+		|
+
+	match parse_source(source):
+		Err(_):
+			False
+		Ok(parsed):
+			parsed_contents(parsed).functions.length() == 2
+
+
+tests: TestSuite = {
+	description = "Restricted lexical trivia grammar",
+	tests = [
+		("blank and comment lines around main", test_blank_and_comment_lines_surround_real_main),
+		(
+			"trivia across declarations and block depths",
+			test_trivia_is_transparent_across_all_block_depths,
+		),
+		("annotation associates across trivia", test_annotation_associates_across_trivia),
+		("prelude shares the trivia rules", test_prelude_uses_the_same_trivia_rules),
+		("prelude needs real line separators", test_prelude_still_requires_real_line_separators),
+		("trivia cannot supply a required body", test_trivia_does_not_supply_a_required_body),
+		("trivia cannot supply a declaration", test_trivia_does_not_supply_a_declaration),
+		("trivia cannot supply a union variant", test_trivia_does_not_supply_a_union_variant),
+		(
+			"annotation trivia still needs a function",
+			test_annotation_trivia_still_requires_a_function,
+		),
+		("comment cannot continue an expression", test_comment_cannot_continue_an_expression),
+		("real dedent after deep comment", test_following_real_dedent_starts_a_new_declaration),
+	]
+}

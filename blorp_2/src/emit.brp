@@ -1,10 +1,7 @@
 import:
 	./prelude: RuntimeOperation(IntToString, StringLength)
 	int as IntOps
-	lower:
-		MatchLabel(VariantLabel, DefaultLabel),
-		ValueId,
-		value_number,
+	lower: MatchLabel(VariantLabel, DefaultLabel), ValueId, value_number
 	option: to_result
 	own as Own:
 		OwnedArgument(UnmanagedArgument, BorrowedArgument),
@@ -24,16 +21,17 @@ import:
 		OwnershipProgram,
 		ResultOwnership(UnmanagedResult, BorrowedResult, OwnedResult),
 		ReturnTransfer(UnmanagedReturn, OwnedReturn),
+		StoredPayload(UnmanagedPayload, OwnedPayload),
 		owner_number,
 	specialize:
 		CallTarget(UserFunction, RuntimeFunction),
 		ConcreteRecord,
 		ConcreteUnion,
 		FieldInstanceId,
-		PayloadShape(NoPayload, IntPayload),
 		RecordInstanceId,
 		TypeRef(IntType, StringType, UnionType, RecordType),
 		UnionInstanceId,
+		UnionRepresentation(InlineUnmanaged, InlineOwningPayload),
 		VariantInstanceId,
 		field_number,
 		field_owner,
@@ -112,9 +110,9 @@ private pure func has_payload(declaration: ConcreteUnion) -> Bool:
 
 	for shape in declaration.variants:
 		match shape:
-			NoPayload:
+			None:
 				void
-			IntPayload:
+			Some(_):
 				found = True
 				break
 
@@ -219,7 +217,16 @@ private pure func c_parameters(
 				Ok(output.concat(")"))
 
 
-private pure func append_union(output: String, declaration: ConcreteUnion, index: Int) -> String:
+private pure func c_payload(id: VariantInstanceId) -> String:
+	"blorp_up_".append_int(variant_number(id))
+
+
+private pure func append_union(
+	output: String,
+	declaration: ConcreteUnion,
+	index: Int,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
 	payload = has_payload(declaration)
 
 	prefix = if payload:
@@ -247,14 +254,45 @@ private pure func append_union(output: String, declaration: ConcreteUnion, index
 	result = result.concat("};")
 
 	if payload:
-		result
+		result = result
 			.concat("struct blorp_u_")
 			.append_int(index)
 			.concat("{enum blorp_tag_")
 			.append_int(index)
-			.concat(" tag;int64_t payload;};")
+			.concat(" tag;union{")
+		position = 0
+		var failure: Option[Diagnostic] = None
+
+		for shape in declaration.variants:
+			match shape:
+				None:
+					void
+				Some(value_type):
+					match c_type(value_type, unions):
+						Err(error):
+							failure = Some(error)
+							break
+						Ok(name):
+							result = result
+								.concat(name)
+								.concat(" blorp_up_")
+								.append_int(position)
+								.concat(";")
+
+			position = IntOps.add(position, 1)
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				append_union_ownership(
+					result.concat("}payload;};"),
+					declaration,
+					index,
+					unions,
+				)
 	else:
-		result
+		Ok(result)
 
 
 private pure func append_operation(
@@ -305,7 +343,7 @@ private pure func append_operation(
 						.concat(union_c_type(variant_owner(id), declaration))
 						.concat("){.tag=")
 						.concat(c_variant(id))
-						.concat(",.payload=INT64_C(0)})"),
+						.concat("})"),
 				)
 			else:
 				Ok(output.concat(c_variant(id)))
@@ -331,21 +369,31 @@ private pure func append_operation(
 			Ok(prefix.concat(")"))
 		ConstructDefinition(id, argument):
 			type_name ?= c_type(UnionType(variant_owner(id)), unions)
+
+			stored = match argument:
+				UnmanagedPayload(value):
+					c_value(value)
+				OwnedPayload(_, owner):
+					c_owner(owner)
+
 			Ok(
 				output
 					.concat("((")
 					.concat(type_name)
 					.concat("){.tag=")
 					.concat(c_variant(id))
-					.concat(",.payload=")
-					.concat(c_value(argument))
+					.concat(",.payload.")
+					.concat(c_payload(id))
+					.concat("=")
+					.concat(stored)
 					.concat("})"),
 			)
-		PayloadDefinition(id):
+		PayloadDefinition(variant, id):
 			Ok(
 				output
 					.concat(c_value(id))
-					.concat(".payload"),
+					.concat(".payload.")
+					.concat(c_payload(variant)),
 			)
 
 
@@ -383,16 +431,34 @@ private pure func append_value(
 	)
 
 
-private pure func append_owner_alias(output: String, owner: OwnerId, value: ValueId) -> String:
+private pure func append_owner_alias(
+	output: String,
+	owner: OwnerId,
+	value: ValueId,
+	value_type: TypeRef,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
 	name = c_owner(owner)
-	output
-		.concat("struct blorp_string* const ")
-		.concat(name)
-		.concat("=")
-		.concat(c_value(value))
-		.concat(";(void)")
-		.concat(name)
-		.concat(";")
+	type_name ?= c_type(value_type, unions)
+
+	declaration = match value_type:
+		StringType:
+			type_name.concat(" const ")
+		_:
+			"const "
+				.concat(type_name)
+				.concat(" ")
+
+	Ok(
+		output
+			.concat(declaration)
+			.concat(name)
+			.concat("=")
+			.concat(c_value(value))
+			.concat(";(void)")
+			.concat(name)
+			.concat(";"),
+	)
 
 
 private pure func append_owned_definition(
@@ -407,50 +473,227 @@ private pure func append_owned_definition(
 		definition.operation,
 		unions,
 	)
+
+	match definition.result:
+		UnmanagedResult | BorrowedResult(_):
+			Ok(value)
+		OwnedResult(owner):
+			append_owner_alias(value, owner, definition.id, definition.value_type, unions)
+
+
+-- Disposable owner-type projection of accepted IR; value types stay local.
+private pure func owner_types(function: OwnedFunction) -> Result[List[TypeRef], Diagnostic]:
+	var blocks = [function.operations]
+
+	match function.tail:
+		ReturnTail(_):
+			void
+		MatchTail(matched):
+			for arm in matched.arms:
+				blocks = blocks.append(arm.operations)
+
+	var values: List[TypeRef] = []
+	var owners: List[TypeRef] = []
+	var failure: Option[Diagnostic] = None
+
+	for operations in blocks:
+		for operation in operations:
+			match operation:
+				DefineValue(definition):
+					values = values.append(definition.value_type)
+
+					match definition.result:
+						OwnedResult(_):
+							owners = owners.append(definition.value_type)
+						_:
+							void
+				AcquireOwner(_, borrowed, _):
+					match values.get(value_number(borrowed.value)):
+						Some(value_type):
+							owners = owners.append(value_type)
+						None:
+							failure = Some(internal_error())
+							break
+				DropOwner(_, _):
+					void
+
+		if failure.is_some():
+			break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(owners)
+
+
+private fixed union OwnershipAction:
+	DuplicateValue
+	DestroyValue
+
+
+private pure func append_storage_operation(
+	output: String,
+	value_type: TypeRef,
+	action: OwnershipAction,
+	expression: String,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	name_result: Result[Option[String], Diagnostic] = match value_type:
+		StringType:
+			Ok(
+				Some(
+					match action:
+						DuplicateValue:
+							"blorp_string_retain"
+						DestroyValue:
+							"blorp_string_release"
+				),
+			)
+		UnionType(id):
+			layout ?= unions
+				.get(union_number(id))
+				.to_result(internal_error())
+			Ok(
+				match layout.representation:
+					InlineUnmanaged:
+						None
+					InlineOwningPayload:
+						prefix = match action:
+							DuplicateValue:
+								"blorp_union_dup_"
+							DestroyValue:
+								"blorp_union_drop_"
+
+						Some(prefix.append_int(union_number(id)))
+			)
+		_:
+			Ok(None)
+
+	name ?= name_result
 	Ok(
-		match definition.result:
-			UnmanagedResult:
-				value
-			BorrowedResult:
-				value
-			OwnedResult(owner):
-				append_owner_alias(value, owner, definition.id)
+		match name:
+			Some(name):
+				output
+					.concat(name)
+					.concat("(")
+					.concat(expression)
+					.concat(");")
+			None:
+				output
 	)
+
+
+private pure func append_union_action(
+	output: String,
+	layout: ConcreteUnion,
+	index: Int,
+	unions: List[ConcreteUnion],
+	action: OwnershipAction,
+) -> Result[String, Diagnostic]:
+	prefix = match action:
+		DuplicateValue:
+			"void blorp_union_dup_"
+		DestroyValue:
+			"void blorp_union_drop_"
+
+	var result = output
+		.concat(prefix)
+		.append_int(index)
+		.concat("(struct blorp_u_")
+		.append_int(index)
+		.concat(" value){switch(value.tag){")
+	var position = 0
+	var failure: Option[Diagnostic] = None
+
+	for payload in layout.variants:
+		result = result
+			.concat("case blorp_v_")
+			.append_int(index)
+			.concat("_")
+			.append_int(position)
+			.concat(":")
+
+		match payload:
+			Some(value_type):
+				match append_storage_operation(
+					result,
+					value_type,
+					action,
+					"value.payload.blorp_up_".append_int(position),
+					unions,
+				):
+					Ok(updated):
+						result = updated
+					Err(error):
+						failure = Some(error)
+						break
+			None:
+				void
+
+		result = result.concat("break;")
+		position = IntOps.add(position, 1)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result.concat("}}"))
+
+
+private pure func append_union_ownership(
+	output: String,
+	layout: ConcreteUnion,
+	index: Int,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	match layout.representation:
+		InlineUnmanaged:
+			Ok(output)
+		InlineOwningPayload:
+			duplicated ?= append_union_action(output, layout, index, unions, DuplicateValue)
+			append_union_action(duplicated, layout, index, unions, DestroyValue)
 
 
 private pure func append_ownership_operation(
 	output: String,
 	operation: OwnershipOperation,
 	unions: List[ConcreteUnion],
+	types: List[TypeRef],
 ) -> Result[String, Diagnostic]:
 	match operation:
 		DefineValue(definition):
 			append_owned_definition(output, definition, unions)
 		AcquireOwner(owner, borrowed, _):
-			retained = output
-				.concat("blorp_string_retain(")
-				.concat(c_value(borrowed.value))
-				.concat(");")
-			Ok(append_owner_alias(retained, owner, borrowed.value))
-		DropOwner(owner, _):
-			Ok(
-				output
-					.concat("blorp_string_release(")
-					.concat(c_owner(owner))
-					.concat(");"),
+			value_type ?= types
+				.get(owner_number(owner))
+				.to_result(internal_error())
+			retained ?= append_storage_operation(
+				output,
+				value_type,
+				DuplicateValue,
+				c_value(borrowed.value),
+				unions,
 			)
+			append_owner_alias(retained, owner, borrowed.value, value_type, unions)
+		DropOwner(owner, _):
+			value_type ?= types
+				.get(owner_number(owner))
+				.to_result(internal_error())
+			append_storage_operation(output, value_type, DestroyValue, c_owner(owner), unions)
 
 
 private pure func append_ownership_operations(
 	output: String,
 	operations: List[OwnershipOperation],
 	unions: List[ConcreteUnion],
+	types: List[TypeRef],
 ) -> Result[String, Diagnostic]:
 	var result = output
 	var failure: Option[Diagnostic] = None
 
 	for operation in operations:
-		match append_ownership_operation(result, operation, unions):
+		match append_ownership_operation(result, operation, unions, types):
 			Err(error):
 				failure = Some(error)
 				break
@@ -469,6 +712,7 @@ private pure func append_arm(
 	arm: OwnedArm,
 	final_default: Bool,
 	unions: List[ConcreteUnion],
+	types: List[TypeRef],
 ) -> Result[String, Diagnostic]:
 	var result = match arm.label:
 		VariantLabel(id):
@@ -486,6 +730,7 @@ private pure func append_arm(
 		result.concat("{"),
 		arm.operations,
 		unions,
+		types,
 	)
 	Ok(append_exit(body, arm.exit).concat("}"))
 
@@ -494,6 +739,7 @@ private pure func append_match(
 	output: String,
 	matched: OwnedMatch,
 	unions: List[ConcreteUnion],
+	types: List[TypeRef],
 ) -> Result[String, Diagnostic]:
 	declaration ?= unions
 		.get(union_number(matched.owner))
@@ -524,7 +770,7 @@ private pure func append_match(
 			matched.arms.length(),
 		)
 
-		match append_arm(result, arm, final_default, unions):
+		match append_arm(result, arm, final_default, unions, types):
 			Err(error):
 				failure = Some(error)
 				break
@@ -598,6 +844,7 @@ private pure func append_function(
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	header ?= append_signature(output, function, index, unions)
+	types ?= owner_types(function)
 
 	opening = match function.execution:
 		OrdinaryCalls:
@@ -605,13 +852,13 @@ private pure func append_function(
 		SelfTailLoop(_):
 			header.concat("{while (1){")
 
-	body ?= append_ownership_operations(opening, function.operations, unions)
+	body ?= append_ownership_operations(opening, function.operations, unions, types)
 
 	emitted ?= match function.tail:
 		ReturnTail(exit):
 			Ok(append_exit(body, exit))
 		MatchTail(matched):
-			append_match(body, matched, unions)
+			append_match(body, matched, unions, types)
 
 	closing = match function.execution:
 		OrdinaryCalls:
@@ -673,8 +920,16 @@ private pure func needs_string_runtime(program: OwnershipProgram) -> Bool:
 
 pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	checked = verified_contents(program)
+	var owns_children = False
 
-	var output: String = if needs_string_runtime(checked):
+	for layout in checked.unions:
+		match layout.representation:
+			InlineOwningPayload:
+				owns_children = True
+			InlineUnmanaged:
+				void
+
+	var output: String = if owns_children or needs_string_runtime(checked):
 		string_runtime()
 	else:
 		"#include <stdint.h>\n"
@@ -686,12 +941,24 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 		index = IntOps.add(index, 1)
 
 	index = 0
+	var failure: Option[Diagnostic] = None
 
 	for declaration in checked.unions:
-		output = append_union(output, declaration, index)
+		match append_union(output, declaration, index, checked.unions):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(updated):
+				output = updated
+
 		index = IntOps.add(index, 1)
 
-	var failure: Option[Diagnostic] = None
+	ready ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
 	index = 0
 
 	for function in checked.functions:

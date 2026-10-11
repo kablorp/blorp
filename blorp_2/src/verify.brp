@@ -4,7 +4,7 @@ import:
 	lower: MatchLabel(DefaultLabel, VariantLabel), ValueId, value_number
 	option: is_some, to_result
 	own:
-		BorrowSource(ParameterBorrow, OwnerBorrow),
+		BorrowSource(ParameterBorrow, OwnerBorrow, PayloadBorrow),
 		BorrowedValue,
 		OwnedArgument(UnmanagedArgument, BorrowedArgument),
 		OwnedDefinition,
@@ -22,7 +22,8 @@ import:
 		OwnershipProgram,
 		ResultOwnership(UnmanagedResult, BorrowedResult, OwnedResult),
 		ReturnTransfer(UnmanagedReturn, OwnedReturn),
-		ValueOwnership(NoOwnership, ManagedStringLeaf),
+		StoredPayload(UnmanagedPayload, OwnedPayload),
+		ValueOwnership(NoOwnership, ManagedStringLeaf, InlineOwnedFields),
 		owner_number,
 		value_ownership,
 	specialize:
@@ -32,9 +33,9 @@ import:
 		ConcreteUnion,
 		FieldInstanceId,
 		FunctionSignature,
-		PayloadShape(NoPayload, IntPayload),
 		RecordInstanceId,
 		TypeRef(IntType, StringType, UnionType, RecordType),
+		UnionRepresentation(InlineUnmanaged, InlineOwningPayload),
 		VariantInstanceId,
 		field_number,
 		field_owner,
@@ -68,7 +69,8 @@ private pure func failure(span: Span, message: String) -> Diagnostic:
 
 private fixed record KnownValue {
 	value_type: TypeRef,
-	span: Span
+	span: Span,
+	result: ResultOwnership
 }
 
 
@@ -176,6 +178,28 @@ private pure func introduce_owner(
 		Ok(state.owners.append(ActiveOwner(value)))
 
 
+private pure func borrowed_value(
+	id: ValueId,
+	state: VerificationState,
+	span: Span,
+) -> Result[BorrowedValue, Diagnostic]:
+	known ?= value(state, id, span)
+
+	source_result: Result[BorrowSource, Diagnostic] = match known.result:
+		BorrowedResult(source):
+			Ok(source)
+		OwnedResult(owner):
+			Ok(OwnerBorrow(owner))
+		UnmanagedResult:
+			Err(failure(span, "borrow requires a managed value"))
+
+	source ?= source_result
+	Ok({
+		value = id,
+		source = source,
+	})
+
+
 private pure func verify_borrow(
 	borrow: BorrowedValue,
 	state: VerificationState,
@@ -183,57 +207,61 @@ private pure func verify_borrow(
 ) -> Result[Void, Diagnostic]:
 	borrowed ?= value(state, borrow.value, span)
 
-	match borrowed.value_type:
-		StringType:
-			match borrow.source:
-				ParameterBorrow(source):
-					if (
-						IntOps.equals(value_number(source), value_number(borrow.value))
-						and state.parameters.any(
-							pure func(
-								parameter: ValueId,
-							) -> Bool: IntOps.equals(
-								value_number(parameter),
-								value_number(borrow.value),
-							),
-						)
-					):
+	managed ?= match borrowed.result:
+		UnmanagedResult:
+			Err(failure(span, "borrow requires a managed value"))
+		_:
+			Ok(void)
+
+	match borrow.source:
+		ParameterBorrow(source):
+			if (
+				IntOps.equals(value_number(source), value_number(borrow.value))
+				and state.parameters.any(
+					pure func(
+						parameter: ValueId,
+					) -> Bool: IntOps.equals(value_number(parameter), value_number(source)),
+				)
+			):
+				Ok(void)
+			else:
+				Err(failure(span, "parameter borrow does not refer to the borrowed parameter"))
+		OwnerBorrow(id):
+			entry ?= owner(state, id, span)
+
+			match entry:
+				DischargedOwner:
+					Err(
+						failure(
+							span,
+							"borrow refers to discharged owner ".append_int(owner_number(id)),
+						),
+					)
+				ActiveOwner(owned):
+					if IntOps.equals(value_number(owned), value_number(borrow.value)):
 						Ok(void)
 					else:
 						Err(
 							failure(
 								span,
-								"parameter borrow does not refer to the borrowed String parameter",
+								"owner "
+									.append_int(owner_number(id))
+									.concat(" does not own value ")
+									.append_int(value_number(borrow.value)),
 							),
 						)
-				OwnerBorrow(id):
-					entry ?= owner(state, id, span)
+		PayloadBorrow(parent):
+			valid ?= match borrowed.result:
+				BorrowedResult(PayloadBorrow(expected)):
+					if IntOps.equals(value_number(parent), value_number(expected)):
+						Ok(void)
+					else:
+						Err(failure(span, "payload borrow has the wrong parent value"))
+				_:
+					Err(failure(span, "payload borrow requires a borrowed projection"))
 
-					match entry:
-						DischargedOwner:
-							Err(
-								failure(
-									span,
-									"borrow refers to discharged owner ".append_int(
-										owner_number(id),
-									),
-								),
-							)
-						ActiveOwner(owned):
-							if IntOps.equals(value_number(owned), value_number(borrow.value)):
-								Ok(void)
-							else:
-								Err(
-									failure(
-										span,
-										"owner "
-											.append_int(owner_number(id))
-											.concat(" does not own value ")
-											.append_int(value_number(borrow.value)),
-									),
-								)
-		_:
-			Err(failure(span, "borrow requires a managed value"))
+			ancestor ?= borrowed_value(parent, state, span)
+			verify_borrow(ancestor, state, span)
 
 
 private pure func call_signature(
@@ -276,7 +304,7 @@ private pure func verify_argument(
 				match plan:
 					NoOwnership:
 						Ok(void)
-					ManagedStringLeaf:
+					ManagedStringLeaf | InlineOwnedFields(_):
 						Err(
 							failure(
 								span,
@@ -329,7 +357,7 @@ private pure func variant_shape(
 	id: VariantInstanceId,
 	unions: List[ConcreteUnion],
 	span: Span,
-) -> Result[PayloadShape, Diagnostic]:
+) -> Result[Option[TypeRef], Diagnostic]:
 	declaration ?= unions
 		.get(union_number(variant_owner(id)))
 		.to_result(failure(span, "unknown variant owner"))
@@ -340,23 +368,23 @@ private pure func variant_shape(
 
 private pure func variant_type(
 	id: VariantInstanceId,
-	expected: PayloadShape,
+	expected: Option[TypeRef],
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[TypeRef, Diagnostic]:
 	shape ?= variant_shape(id, unions, span)
 
 	valid = match expected:
-		NoPayload:
+		None:
 			match shape:
-				NoPayload:
+				None:
 					True
 				_:
 					False
-		IntPayload:
+		Some(expected):
 			match shape:
-				IntPayload:
-					True
+				Some(actual):
+					same_type(expected, actual)
 				_:
 					False
 
@@ -364,6 +392,84 @@ private pure func variant_type(
 		Ok(UnionType(variant_owner(id)))
 	else:
 		Err(failure(span, "variant payload does not match its operation"))
+
+
+private pure func valid_union_layout(
+	layout: ConcreteUnion,
+	position: Int,
+	records: List[ConcreteRecord],
+	unions: List[ConcreteUnion],
+) -> Result[Void, Diagnostic]:
+	span: Span = {
+		start = 0,
+		end = 0
+	}
+
+	if IntOps.equals(layout.variants.length(), 0):
+		Err(failure(span, "union layout must contain one or more variants"))
+	else:
+		var invalid: Option[Diagnostic] = None
+		var owning = False
+
+		for payload in layout.variants:
+			valid = match payload:
+				None:
+					True
+				Some(value_type):
+					match value_type:
+						IntType:
+							True
+						RecordType(id):
+							records
+								.get(record_number(id))
+								.is_some()
+						UnionType(id):
+							valid = (
+								IntOps.greater_than_or_equal(union_number(id), 0)
+								and IntOps.less_than(union_number(id), position)
+							)
+
+							if valid:
+								match unions.get(union_number(id)):
+									Some(child):
+										match child.representation:
+											InlineOwningPayload:
+												owning = True
+											InlineUnmanaged:
+												void
+
+										True
+									None:
+										False
+							else:
+								False
+						StringType:
+							owning = True
+							True
+
+			if not valid:
+				invalid = Some(
+					failure(
+						span,
+						"union payload must reference a supported, earlier layout",
+					),
+				)
+				break
+
+		match invalid:
+			Some(error):
+				Err(error)
+			None:
+				matches = match layout.representation:
+					InlineUnmanaged:
+						not owning
+					InlineOwningPayload:
+						owning
+
+				if matches:
+					Ok(void)
+				else:
+					Err(failure(span, "union ownership summary does not match its payloads"))
 
 
 private pure func valid_record_layout(
@@ -501,7 +607,7 @@ private pure func operation_type(
 		IntegerDefinition(_):
 			Ok(IntType)
 		VariantDefinition(id):
-			variant_type(id, NoPayload, unions, definition.span)
+			variant_type(id, None, unions, definition.span)
 		CallDefinition(call, arguments):
 			contract ?= call_signature(call, functions)
 			valid ?= verify_arguments(
@@ -518,13 +624,16 @@ private pure func operation_type(
 			else:
 				Err(failure(definition.span, "call result type does not match its contract"))
 		ConstructDefinition(id, argument):
-			argument_value ?= value(state, argument, definition.span)
+			argument_id = match argument:
+				UnmanagedPayload(id):
+					id
+				OwnedPayload(id, _):
+					id
 
-			if same_type(argument_value.value_type, IntType):
-				variant_type(id, IntPayload, unions, definition.span)
-			else:
-				Err(failure(definition.span, "union constructor requires an Int payload"))
-		PayloadDefinition(source):
+			argument_value ?= value(state, argument_id, definition.span)
+
+			variant_type(id, Some(argument_value.value_type), unions, definition.span)
+		PayloadDefinition(selected, source):
 			scrutinee ?= value(state, source, definition.span)
 
 			match projection:
@@ -536,13 +645,24 @@ private pure func operation_type(
 						),
 					)
 				PayloadProjection(expected, variant):
-					union_type ?= variant_type(variant, IntPayload, unions, definition.span)
+					payload ?= variant_shape(variant, unions, definition.span)
+					payload_type ?= payload.to_result(
+						failure(
+							definition.span,
+							"selected variant has no payload",
+						),
+					)
 
 					if (
 						IntOps.equals(value_number(source), value_number(expected))
-						and same_type(scrutinee.value_type, union_type)
+						and same_type(scrutinee.value_type, UnionType(variant_owner(variant)))
+						and IntOps.equals(
+							union_number(variant_owner(selected)),
+							union_number(variant_owner(variant)),
+						)
+						and IntOps.equals(variant_number(selected), variant_number(variant))
 					):
-						Ok(IntType)
+						Ok(payload_type)
 					else:
 						Err(
 							failure(
@@ -550,6 +670,51 @@ private pure func operation_type(
 								"payload projection does not belong to this match arm",
 							),
 						)
+
+
+private pure func verify_stored_payload(
+	payload: StoredPayload,
+	state: VerificationState,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+	span: Span,
+) -> Result[VerificationState, Diagnostic]:
+	id = match payload:
+		UnmanagedPayload(id):
+			id
+		OwnedPayload(id, _):
+			id
+
+	known ?= value(state, id, span)
+	plan ?= value_ownership(known.value_type, unions, records)
+
+	match payload:
+		UnmanagedPayload(_):
+			match plan:
+				NoOwnership:
+					Ok(state)
+				_:
+					Err(failure(span, "managed payload requires an owner transfer"))
+		OwnedPayload(value, transferred):
+			managed ?= match plan:
+				NoOwnership:
+					Err(failure(span, "unmanaged payload cannot transfer an owner"))
+				_:
+					Ok(void)
+
+			entry ?= owner(state, transferred, span)
+
+			match entry:
+				DischargedOwner:
+					Err(failure(span, "payload owner has already been discharged"))
+				ActiveOwner(owned):
+					if IntOps.equals(value_number(value), value_number(owned)):
+						Ok({ state | owners = state.owners.set(
+									IntOps.subtract(owner_number(transferred), state.first_owner),
+									DischargedOwner,
+								) })
+					else:
+						Err(failure(span, "payload owner does not own the stored value"))
 
 
 private pure func verify_definition(
@@ -580,6 +745,12 @@ private pure func verify_definition(
 		if not same_type(expected, definition.value_type):
 			Err(failure(definition.span, "definition type does not match its operation"))
 		else:
+			ready ?= match definition.operation:
+				ConstructDefinition(_, payload):
+					verify_stored_payload(payload, state, unions, records, definition.span)
+				_:
+					Ok(state)
+
 			plan ?= match definition.value_type:
 				RecordType(owner):
 					record_layout(owner, records, definition.span).map(pure func(_): NoOwnership)
@@ -590,7 +761,7 @@ private pure func verify_definition(
 				NoOwnership:
 					match definition.result:
 						UnmanagedResult:
-							Ok(state.owners)
+							Ok(ready.owners)
 						_:
 							Err(
 								failure(
@@ -598,12 +769,23 @@ private pure func verify_definition(
 									"unmanaged value carries an ownership obligation",
 								),
 							)
-				ManagedStringLeaf:
+				ManagedStringLeaf | InlineOwnedFields(_):
 					match definition.operation:
 						ParameterDefinition(_):
 							match definition.result:
-								BorrowedResult:
-									Ok(state.owners)
+								BorrowedResult(ParameterBorrow(source)):
+									if IntOps.equals(
+										value_number(source),
+										value_number(definition.id),
+									):
+										Ok(ready.owners)
+									else:
+										Err(
+											failure(
+												definition.span,
+												"managed parameter has the wrong borrow source",
+											),
+										)
 								_:
 									Err(
 										failure(
@@ -611,15 +793,36 @@ private pure func verify_definition(
 											"managed parameter must be borrowed",
 										),
 									)
-						CallDefinition(_, _):
+						PayloadDefinition(_, parent):
 							match definition.result:
-								OwnedResult(owner):
-									introduce_owner(state, owner, definition.id, definition.span)
+								BorrowedResult(PayloadBorrow(source)):
+									if IntOps.equals(value_number(parent), value_number(source)):
+										ancestor ?= borrowed_value(parent, ready, definition.span)
+										valid ?= verify_borrow(ancestor, ready, definition.span)
+										Ok(ready.owners)
+									else:
+										Err(
+											failure(
+												definition.span,
+												"payload borrow has the wrong parent value",
+											),
+										)
 								_:
 									Err(
 										failure(
 											definition.span,
-											"managed call result requires an owner",
+											"managed projection requires its parent borrow",
+										),
+									)
+						CallDefinition(_, _) | ConstructDefinition(_, _) | VariantDefinition(_):
+							match definition.result:
+								OwnedResult(owner):
+									introduce_owner(ready, owner, definition.id, definition.span)
+								_:
+									Err(
+										failure(
+											definition.span,
+											"managed result requires an owner",
 										),
 									)
 						_:
@@ -637,6 +840,7 @@ private pure func verify_definition(
 					values = state.values.append({
 						value_type = definition.value_type,
 						span = definition.span,
+						result = definition.result,
 					}),
 					owners = owners,
 					parameters = parameters
@@ -740,7 +944,7 @@ private pure func verify_return(
 						Ok(state.owners)
 					Some(_):
 						Err(failure(result.span, "unmanaged return cannot transfer an owner"))
-			ManagedStringLeaf:
+			ManagedStringLeaf | InlineOwnedFields(_):
 				match returned_owner:
 					None:
 						Err(failure(result.span, "managed return requires an owner transfer"))
@@ -836,7 +1040,7 @@ private pure func verify_exit(
 						match plan:
 							NoOwnership:
 								Ok(void)
-							ManagedStringLeaf:
+							ManagedStringLeaf | InlineOwnedFields(_):
 								Err(failure(span, "managed value on a recursive backedge"))
 				)
 
@@ -878,7 +1082,7 @@ private pure func verify_loop_operations(
 				match value_ownership(definition.value_type, unions, records):
 					Err(error):
 						invalid = Some(error)
-					Ok(ManagedStringLeaf):
+					Ok(ManagedStringLeaf) | Ok(InlineOwnedFields(_)):
 						invalid = Some(
 							failure(
 								definition.span,
@@ -938,7 +1142,7 @@ private pure func verify_execution(
 					Err(error):
 						invalid = Some(error)
 						break
-					Ok(ManagedStringLeaf):
+					Ok(ManagedStringLeaf) | Ok(InlineOwnedFields(_)):
 						invalid = Some(failure(annotation, "managed signature in a self-tail loop"))
 						break
 					Ok(NoOwnership):
@@ -1198,8 +1402,8 @@ private pure func verify_function(
 					var managed: Option[Span] = None
 
 					for known in state.values:
-						match known.value_type:
-							StringType:
+						match known.result:
+							OwnedResult(_):
 								managed = Some(known.span)
 								break
 							_:
@@ -1209,15 +1413,31 @@ private pure func verify_function(
 						Some(span):
 							Err(failure(span, "managed value appears before a tail match"))
 						None:
-							verify_match(
-								matched,
-								function.execution,
-								state,
-								function.signature,
-								functions,
-								unions,
-								records,
-							)
+							if IntOps.greater_than(state.owners.length(), 0):
+								scrutinee ?= value(
+									state,
+									matched.scrutinee,
+									{
+										start = 0,
+										end = 0
+									},
+								)
+								Err(
+									failure(
+										scrutinee.span,
+										"managed value appears before a tail match",
+									),
+								)
+							else:
+								verify_match(
+									matched,
+									function.execution,
+									state,
+									function.signature,
+									functions,
+									unions,
+									records,
+								)
 
 
 -- C main calls the entry without arguments and consumes an Int. Enforcing
@@ -1279,21 +1499,18 @@ pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnosti
 				invalid = Some(error)
 				break
 
+	var union_position = 0
+
 	for layout in program.unions:
 		if invalid.is_some():
 			break
 
-		if IntOps.equals(layout.variants.length(), 0):
-			invalid = Some(
-				failure(
-					{
-						start = 0,
-						end = 0
-					},
-					"union layout must contain one or more variants",
-				),
-			)
-			break
+		match valid_union_layout(layout, union_position, program.records, program.unions):
+			Err(error):
+				invalid = Some(error)
+				break
+			Ok(_):
+				union_position = IntOps.add(union_position, 1)
 
 	var current: Int = 0
 
