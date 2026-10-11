@@ -4254,8 +4254,9 @@ private pure func check_function_like_body_result(
 
 
 private MAIN_SIGNATURE_MESSAGE: String = (
-	"main must have one parameter of type List[String] and a concrete return type "
-	+ "implementing ExitStatusAble"
+	"main must have zero parameters or one parameter of type List[String], "
+	+ "and a concrete return type implementing ExitStatusAble\n"
+	+ "help: Use main() or main(args: List[String])"
 )
 
 private MAIN_GENERIC_MESSAGE: String = "main cannot be generic\n" + "help: Program entrypoint main must not declare type parameters"
@@ -4266,12 +4267,43 @@ fixed union MainValidationPolicy:
 	IgnoreMainName
 
 
-private pure func main_param_type_valid(param: ParsedParam) -> Bool:
-	match param.type_expr.map(type_from_parsed_type_expr):
-		Some(typ):
-			types_equal(typ, type_list(TYPE_STRING))
-		None:
-			False
+private pure func main_parameter_error(params: List[ParsedParam]) -> Option[String]:
+	match params:
+		[]:
+			None
+		[param]:
+			match param.type_expr.map(type_from_parsed_type_expr):
+				Some(typ):
+					if types_equal(typ, type_list(TYPE_STRING)):
+						None
+					else:
+						Some("main parameter must be List[String], got " + type_to_string(typ) + "\nhelp: Use main() or main(args: List[String])")
+				None:
+					Some("main parameter must be List[String], got untyped\nhelp: Use main() or main(args: List[String])")
+		_:
+			Some(MAIN_SIGNATURE_MESSAGE)
+
+
+private pure func main_return_type_valid(state: TypecheckState, return_type: SemanticType) -> Bool:
+	-- Int and Void are the two standard implementations. Keep this intrinsic
+	-- fallback for graph clients that omit source-level std modules; custom
+	-- return types still require real trait evidence, for either main arity.
+	if types_equal(return_type, TYPE_INT) or types_equal(return_type, TYPE_VOID):
+		True
+	else:
+		-- Resolve ExitStatusAble from the visible standard-library declaration.
+		match typecheck_find_trait(state, EXIT_STATUS_TRAIT_NAME):
+			Some(exit_status_trait):
+				match typecheck_resolve_trait_obligation(
+					state,
+					trait_obligation(return_type, exit_status_trait.trait_id),
+				):
+					TraitObligationSatisfied:
+						True
+					TraitObligationDeferred | TraitObligationUnsatisfied:
+						False
+			None:
+				False
 
 
 private pure func check_main_signature(
@@ -4296,64 +4328,20 @@ private pure func check_main_signature_for_program(
 		state
 	else if function_decl.type_params.length() != 0:
 		typecheck_state_add_error(state, MAIN_GENERIC_MESSAGE)
-	else if function_decl.params.length() != 1:
-		typecheck_state_add_error(state, MAIN_SIGNATURE_MESSAGE)
 	else:
-		match function_decl.params.get(0):
-			Some(param):
-				param_valid = main_param_type_valid(param)
-
-				-- Int and Void are the two standard implementations. Keep this
-				-- intrinsic fallback for graph clients that omit source-level std
-				-- modules; custom return types still require real trait evidence.
-				return_valid = if (
-					types_equal(return_type, TYPE_INT)
-					or types_equal(return_type, TYPE_VOID)
-				):
-					True
+		match main_parameter_error(function_decl.params):
+			Some(error):
+				typecheck_state_add_error(state, error)
+			None:
+				if main_return_type_valid(state, return_type):
+					state
 				else:
-					-- ExitStatusAble is a standard-library trait, so its identity comes
-					-- from the declaration the module can see; a module that cannot see
-					-- it has no evidence for a custom return type.
-					match typecheck_find_trait(state, EXIT_STATUS_TRAIT_NAME):
-						Some(exit_status_trait):
-							match typecheck_resolve_trait_obligation(
-								state,
-								trait_obligation(return_type, exit_status_trait.trait_id),
-							):
-								TraitObligationSatisfied:
-									True
-								TraitObligationDeferred:
-									False
-								TraitObligationUnsatisfied:
-									False
-						None:
-							False
-
-				if not param_valid and not return_valid:
-					typecheck_state_add_error(state, MAIN_SIGNATURE_MESSAGE)
-				else if not return_valid:
 					typecheck_state_add_error(
 						state,
 						"main return type '" + type_to_string(
 							return_type,
 						) + "' does not implement ExitStatusAble\nhelp: Return Int or Void, or implement ExitStatusAble for a type owned by this module",
 					)
-				else if not param_valid:
-					param_text = match param.type_expr.map(type_from_parsed_type_expr):
-						Some(typ):
-							type_to_string(typ)
-						None:
-							"untyped"
-
-					typecheck_state_add_error(
-						state,
-						"main parameter must be List[String], got " + param_text,
-					)
-				else:
-					state
-			None:
-				typecheck_state_add_error(state, MAIN_SIGNATURE_MESSAGE)
 
 
 private pure func check_pure_function_like_body_calls(

@@ -1,0 +1,274 @@
+import:
+	fs: IOError, resource_path, temporary_directory
+	process: ProcessOutput, run
+	system: file_exists, mkdir, read_file, temp_dir, write_file
+	test: TestSuite
+
+
+private SCRIPT: String = "blorp_2/scripts/compare-compilers"
+
+private FIXTURE: String = "blorp_2/test/e2e/fixtures/return/zero.brp"
+
+-- Columns in the public summary.tsv format, counted from zero.
+private ELAPSED_RATIO_COLUMN: Int = 6
+
+private INSTRUCTION_RATIO_COLUMN: Int = 9
+
+
+private func invoke(arguments: List[String]) -> Result[ProcessOutput, String]:
+	run(
+		"/usr/bin/env",
+		["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", SCRIPT].concat(arguments),
+	)
+
+
+private func test_arguments() -> Bool:
+	match invoke(["--help"]):
+		Err(_):
+			False
+		Ok(help):
+			var valid = (
+				help.exit_code() == 0
+				and help
+					.stdout()
+					.contains("--samples")
+			)
+
+			for arguments in (
+				[
+					["--samples", "0"],
+					["--samples", "abc"],
+					["--unknown"],
+					["--fixture", "blorp_2/src/main.brp"],
+				]
+			):
+				match invoke(arguments):
+					Err(_):
+						valid = False
+					Ok(rejected):
+						valid = (
+							valid
+							and rejected.exit_code() == 2
+							and rejected
+								.stderr()
+								.contains("error:")
+						)
+
+			valid
+
+
+private func fake_compiler(
+	directory: String,
+	name: String,
+	behavior: String,
+) -> Result[String, String]:
+	path = directory + "/" + name
+	source: String =
+		|#!/bin/sh
+		|if [ "$1" = --version ]; then
+		|    printf '%s\n' 'test compiler; optimization: unavailable'
+		|    exit 0
+		|fi
+		|printf '%s\n' "$@" >> "$0.calls"
+		|printf '%s\n' "$(basename "$0")" >> "$(dirname "$0")/order.log"
+		|if [ "$1" = compile ]; then
+		|    [ "$2" = --no-format ] && [ "$4" = -o ] || exit 9
+		|    input=$3; output=$5
+		|else
+		|    [ "$1" = "$PWD/blorp_2/src/prelude_temp.brp" ] || exit 9
+		|    input=$2; output=$3
+		|fi
+		|
+	written ?= write_file(path, source + behavior + "\n")
+	changed ?= run(
+		"/bin/chmod",
+		["+x", path],
+	)
+
+	if changed.exit_code() == 0:
+		Ok(path)
+	else:
+		Err(changed.stderr())
+
+
+private func arguments(directory: String, existing: String, pilot: String) -> List[String]:
+	[
+		"--fixture",
+		FIXTURE,
+		"--samples",
+		"3",
+		"--existing-compiler",
+		existing,
+		"--pilot-compiler",
+		pilot,
+		"--output",
+		directory + "/results",
+	]
+
+
+private pure func summary_cell(summary: String, column: Int) -> Option[String]:
+	match (
+		summary
+			.trim()
+			.lines()
+			.get(1)
+	):
+		Some(row):
+			row
+				.split("\t")
+				.get(column)
+		None:
+			None
+
+
+private func check_samples(directory: String) -> Result[Bool, String]:
+	existing ?= fake_compiler(directory, "existing compiler", "cp \"$input\" \"$output\"")
+	pilot ?= fake_compiler(directory, "pilot compiler", "cp \"$input\" \"$output\"")
+	result ?= invoke(arguments(directory, existing, pilot))
+
+	if result.exit_code() != 0:
+		print_error(result.stderr())
+
+	samples ?= read_file(directory + "/results/samples.tsv")
+	summary ?= read_file(directory + "/results/summary.tsv")
+	order ?= read_file(directory + "/order.log")
+	commands ?= read_file(directory + "/existing compiler.calls")
+	Ok((
+			result.exit_code() == 0
+			and samples
+				.trim()
+				.lines()
+				.length() == 7
+			and samples.contains("\tunavailable\t")
+			and summary.contains("return/zero.brp\t3\t3\t3\t")
+			and summary_cell(summary, ELAPSED_RATIO_COLUMN)
+				.get_or("")
+				.parse_float()
+				.is_some()
+			and order == "existing compiler\npilot compiler\npilot compiler\nexisting compiler\nexisting compiler\npilot compiler\n"
+			and commands.contains("compile\n--no-format\n")
+			and commands.contains("/" + FIXTURE + "\n-o\n")
+			and file_exists(directory + "/results/raw/0001/existing/1/command.txt")
+			and file_exists(directory + "/results/fixtures.tsv")
+			and file_exists(directory + "/results/provenance.txt")
+		))
+
+
+private func check_failure(directory: String) -> Result[Bool, String]:
+	existing ?= fake_compiler(
+		directory,
+		"existing",
+		"printf '%s\\n' 'rejected fixture' >&2; exit 7",
+	)
+	pilot ?= fake_compiler(directory, "pilot", "cp \"$input\" \"$output\"")
+	result ?= invoke(arguments(directory, existing, pilot))
+	samples ?= read_file(directory + "/results/samples.tsv")
+	summary ?= read_file(directory + "/results/summary.tsv")
+	error ?= read_file(directory + "/results/raw/0001/existing/1/stderr.txt")
+	Ok((
+			result.exit_code() == 1
+			and samples
+				.trim()
+				.lines()
+				.length() == 7
+			and samples.contains("\texisting\t1\t7\tfailed\t")
+			and summary.contains("return/zero.brp\t0\t3\t0\tunavailable\t")
+			and summary_cell(summary, ELAPSED_RATIO_COLUMN) == Some("unavailable")
+			and summary_cell(summary, INSTRUCTION_RATIO_COLUMN) == Some("unavailable")
+			and error == "rejected fixture\n"
+		))
+
+
+private func check_missing_output(directory: String) -> Result[Bool, String]:
+	existing ?= fake_compiler(directory, "existing", "exit 0")
+	pilot ?= fake_compiler(directory, "pilot", "cp \"$input\" \"$output\"")
+	result ?= invoke(arguments(directory, existing, pilot))
+	samples ?= read_file(directory + "/results/samples.tsv")
+	Ok(result.exit_code() == 1 and samples.contains("\t0\tmissing-output\t"))
+
+
+private func check_empty_output(directory: String) -> Result[Bool, String]:
+	existing ?= fake_compiler(directory, "existing", ": > \"$output\"")
+	pilot ?= fake_compiler(directory, "pilot", "cp \"$input\" \"$output\"")
+	result ?= invoke(arguments(directory, existing, pilot))
+	samples ?= read_file(directory + "/results/samples.tsv")
+	Ok(result.exit_code() == 1 and samples.contains("\t0\tmissing-output\t"))
+
+
+private func check_changed_binary(directory: String) -> Result[Bool, String]:
+	existing ?= fake_compiler(
+		directory,
+		"existing",
+		"cp \"$input\" \"$output\"; printf '\\n# changed\\n' >> \"$0\"",
+	)
+	pilot ?= fake_compiler(directory, "pilot", "cp \"$input\" \"$output\"")
+	result ?= invoke(arguments(directory, existing, pilot))
+	stability ?= read_file(directory + "/results/stability.txt")
+	summary ?= read_file(directory + "/results/summary.tsv")
+	Ok((
+			result.exit_code() == 1
+			and stability == "stable=0\n"
+			and result
+				.stderr()
+				.contains("changed during run:")
+			and summary.contains("return/zero.brp\t3\t3\t3\t")
+			and summary_cell(summary, ELAPSED_RATIO_COLUMN) == Some("unavailable")
+			and summary_cell(summary, INSTRUCTION_RATIO_COLUMN) == Some("unavailable")
+		))
+
+
+private func check_existing_output(directory: String) -> Result[Bool, String]:
+	existing ?= fake_compiler(directory, "existing", "exit 0")
+	pilot ?= fake_compiler(directory, "pilot", "exit 0")
+	created = mkdir(directory + "/results")
+	result ?= invoke(arguments(directory, existing, pilot))
+	Ok((
+			created
+			and result.exit_code() == 2
+			and result
+				.stderr()
+				.contains("output directory already exists")
+			and not file_exists(existing + ".calls")
+		))
+
+
+private func in_directory(check: (String) -> Result[Bool, String]) -> Bool:
+	match scoped_directory(check):
+		Ok(passed):
+			passed
+		Err(error):
+			print_error(error.to_string())
+			False
+
+
+private func scoped_directory(check: (String) -> Result[Bool, String]) -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp-2-compare "):
+		match check(directory.resource_path()):
+			Ok(passed):
+				Ok(passed)
+			Err(error):
+				print_error(error)
+				Ok(False)
+
+
+tests: TestSuite = {
+	description = "Compiler comparison command",
+	tests = [
+		("reject invalid arguments before setup", test_arguments),
+		(
+			"record exact inputs and alternate paired sample order",
+			func(): in_directory(check_samples),
+		),
+		(
+			"retain failed samples and withhold comparison ratios",
+			func(): in_directory(check_failure),
+		),
+		("successful command must actually emit C", func(): in_directory(check_missing_output)),
+		("empty C is an incomplete compilation", func(): in_directory(check_empty_output)),
+		(
+			"changed compiler invalidates all comparison ratios",
+			func(): in_directory(check_changed_binary),
+		),
+		("preserve an existing output directory", func(): in_directory(check_existing_output)),
+	]
+}
