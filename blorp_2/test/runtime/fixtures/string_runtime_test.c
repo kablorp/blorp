@@ -23,21 +23,11 @@ static void runtime_test_deallocate(void *value) {
     free(value);
 }
 
-static void *runtime_test_reallocate(void *previous, size_t bytes) {
-    const int first_allocation = previous == NULL;
-    void *result = realloc(previous, bytes);
-    assert(result != NULL);
-    if (first_allocation) allocation_count += 1;
-    return result;
-}
-
 /* Use the exact fragment supplied by string_runtime(), with real allocation
  * and destruction. The aliases affect only this include, never libc headers. */
 #define malloc runtime_test_allocate
 #define free runtime_test_deallocate
-#define realloc runtime_test_reallocate
 #include "string_runtime.c"
-#undef realloc
 #undef free
 #undef malloc
 
@@ -324,75 +314,6 @@ static void test_parse_whitespace(void) {
     assert_parse("\t42", 3, 0, 0);
 }
 
-static FILE *input_stream(const char *bytes, size_t length) {
-    FILE *stream = tmpfile();
-    assert(stream != NULL);
-    assert(fwrite(bytes, 1, length, stream) == length);
-    rewind(stream);
-    return stream;
-}
-
-static void test_line_eof(void) {
-    FILE *stream = input_stream("", 0);
-    assert(blorp_read_line_from(stream) == NULL);
-    assert(blorp_read_line_from(stream) == NULL);
-    assert(allocation_count == 0);
-    assert(destruction_count == 0);
-    assert(fclose(stream) == 0);
-}
-
-static void test_line_empty(void) {
-    FILE *stream = input_stream("\n", 1);
-    struct blorp_string *value = blorp_read_line_from(stream);
-    assert(value != NULL);
-    assert_bytes(value, "", 0);
-    assert(atomic_load(&value->references) == 1);
-    assert(allocation_count == 1);
-    assert(destruction_count == 0);
-    blorp_string_release(value);
-    assert(blorp_read_line_from(stream) == NULL);
-    assert(fclose(stream) == 0);
-}
-
-static void test_line_bytes(void) {
-    const char bytes[] = {(char)0xc3, (char)0xa9, '\0', '1', '2', '3', '\r', '\n'};
-    FILE *stream = input_stream(bytes, sizeof bytes);
-    struct blorp_string *value = blorp_read_line_from(stream);
-    assert(value != NULL);
-    assert_bytes(value, bytes, (int64_t)sizeof bytes - 1);
-    assert(atomic_load(&value->references) == 1);
-    assert(allocation_count == 2);
-    assert(destruction_count == 1);
-    blorp_string_release(value);
-    assert(fclose(stream) == 0);
-}
-
-static void test_line_final_bytes(void) {
-    FILE *stream = input_stream("42", 2);
-    struct blorp_string *value = blorp_read_line_from(stream);
-    assert(value != NULL);
-    assert_bytes(value, "42", 2);
-    assert(atomic_load(&value->references) == 1);
-    blorp_string_release(value);
-    assert(blorp_read_line_from(stream) == NULL);
-    assert(fclose(stream) == 0);
-}
-
-static void test_line_growth(void) {
-    char bytes[257];
-    memset(bytes, 'x', sizeof bytes);
-    FILE *stream = input_stream(bytes, sizeof bytes);
-    struct blorp_string *value = blorp_read_line_from(stream);
-    assert(value != NULL);
-    assert_bytes(value, bytes, (int64_t)sizeof bytes);
-    assert(atomic_load(&value->references) == 1);
-    assert(allocation_count == 2);
-    assert(destruction_count == 1);
-    blorp_string_release(value);
-    assert(blorp_read_line_from(stream) == NULL);
-    assert(fclose(stream) == 0);
-}
-
 static void assert_equality(const char *left_bytes, int64_t left_length,
                             const char *right_bytes, int64_t right_length,
                             uint8_t expected) {
@@ -453,16 +374,6 @@ int main(int argc, char **argv) {
         test_parse_counted_bytes();
     } else if (strcmp(argv[1], "parse_whitespace") == 0) {
         test_parse_whitespace();
-    } else if (strcmp(argv[1], "line_eof") == 0) {
-        test_line_eof();
-    } else if (strcmp(argv[1], "line_empty") == 0) {
-        test_line_empty();
-    } else if (strcmp(argv[1], "line_bytes") == 0) {
-        test_line_bytes();
-    } else if (strcmp(argv[1], "line_final_bytes") == 0) {
-        test_line_final_bytes();
-    } else if (strcmp(argv[1], "line_growth") == 0) {
-        test_line_growth();
     } else if (strcmp(argv[1], "print_borrow") == 0) {
         test_print_borrow();
     } else if (strcmp(argv[1], "print_bytes") == 0) {

@@ -1,0 +1,281 @@
+import:
+	../../src/check as Checked
+	../../src/check_render: render_failure
+	../../src/lex: lex
+	../../src/main: compile
+	../../src/source: module_source, root_module_id
+	../../src/specialize as Concrete
+	../../src/syntax: Diagnostic, Entrypoint(WithArguments), entry_function, same_span
+	input: parse, setup_diagnostic
+	test: TestSuite
+
+
+private UNREACHABLE_CYCLE: String =
+	|pure func first(value: Int) -> Int:
+	|    second(value)
+	|pure func second(value: Int) -> Int:
+	|    first(value)
+	|func main() -> Int:
+	|    0
+	|
+
+
+private REACHABLE_CYCLE: String =
+	|pure func first(value: Int) -> Int:
+	|    second(value)
+	|pure func second(value: Int) -> Int:
+	|    first(value)
+	|func main() -> Int:
+	|    first(7)
+	|
+
+
+private ORDINARY_CALLS: String =
+	|pure func unused() -> String:
+	|    "unused"
+	|pure func identity(value: Int) -> Int:
+	|    value
+	|func main() -> Int:
+	|    unused = identity(7)
+	|    9.identity()
+	|
+
+
+private DISCARDED_CALLS: String =
+	|func output(value: String) -> Void:
+	|    builtin("string.print")
+	|func announce() -> Void:
+	|    output("kept")
+	|pure func unused() -> Int:
+	|    99
+	|func main() -> Int:
+	|    announce()
+	|    0
+	|
+
+
+private RECORD_LAYOUT: String =
+	|fixed record Unused { ignored: Int }
+	|fixed record Point { first: Int, second: Int }
+	|pure func make_point() -> Point:
+	|    { first = 7, second = 42 }
+	|func main() -> Int:
+	|    point = make_point()
+	|    point.second
+	|
+
+
+private PAYLOAD_LAYOUTS: String =
+	|fixed record Unused { ignored: Int }
+	|fixed record Stored { value: Int }
+	|fixed union UnusedUnion:
+	|    Text(Int)
+	|fixed union Choice[T]:
+	|    Empty
+	|    Record(T)
+	|fixed union Outer[T]:
+	|    Wrap(T)
+	|pure func empty() -> Outer[Choice[Stored]]:
+	|    Wrap(Empty)
+	|func main() -> Int:
+	|    unused = empty()
+	|    0
+	|
+
+
+private ZERO_C: String =
+	|fixed record UnusedRecord { value: Int }
+	|fixed union UnusedUnion:
+	|    Text(Int)
+	|pure func unused_text() -> String:
+	|    "unused"
+	|pure func unused_float() -> Float:
+	|    1.5
+	|pure func unused_list(values: List[String]) -> Int:
+	|    builtin("list.length")
+	|func main() -> Int:
+	|    0
+	|
+
+
+private pure func checked(source: String) -> Result[Checked.CheckedProgram, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source)
+	parsed ?= parse(tokens)
+	Checked.check(parsed).map_err(setup_diagnostic)
+
+
+private pure func specialized(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	program ?= checked(source)
+	concrete ?= Concrete.specialize(program)
+	Ok(Concrete.specialized_contents(concrete))
+
+
+private pure func target_is(call: Concrete.ConcreteCall, expected: Int) -> Bool:
+	match call.target:
+		Concrete.UserFunction(id): Concrete.function_number(id) == expected
+		_: False
+
+
+private pure func value_calls(value: Concrete.ConcreteValue, expected: Int) -> Bool:
+	match value.base:
+		Concrete.ReturnCall(call, _): target_is(call, expected)
+		_: False
+
+
+private pure func body_calls(function: Concrete.ConcreteFunction, expected: Int) -> Bool:
+	match function.body:
+		Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)): value_calls(value, expected)
+		_: False
+
+
+pure func test_unreachable_ordinary_mutual_cycle_is_not_requested() -> Bool:
+	source = UNREACHABLE_CYCLE
+	match specialized(source):
+		Ok(contents): contents.functions.length() == 1
+		_: False
+
+
+pure func test_reachable_ordinary_mutual_cycle_reuses_original_keys() -> Bool:
+	source = REACHABLE_CYCLE
+	match specialized(source):
+		Ok(contents):
+			match contents.functions:
+				[main, first, second]:
+					body_calls(main, 1) and body_calls(first, 2) and body_calls(second, 1)
+				_: False
+		_: False
+
+
+pure func test_direct_and_receiver_calls_reuse_an_ordinary_instance() -> Bool:
+	source = ORDINARY_CALLS
+	match specialized(source):
+		Ok(contents):
+			match contents.functions:
+				[main, _]:
+					match (main.statements, main.body):
+						([Concrete.InitializeBinding(_, first)], Concrete.ConcreteValueBody(Concrete.ReturnExpression(last))):
+							match last.operations:
+								[step]:
+									match step.operation:
+										Concrete.InvokeFunction(call, []): value_calls(first, 1) and target_is(call, 1)
+										_: False
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+pure func test_discarded_impure_calls_keep_their_transitive_callee() -> Bool:
+	source = DISCARDED_CALLS
+	match specialized(source):
+		Ok(contents):
+			match contents.functions:
+				[main, announce, output]:
+					match main.statements:
+						[Concrete.DiscardExpression(value)]:
+							value_calls(value, 1) and body_calls(announce, 2) and Concrete.same_type(output.signature.return_type, Concrete.VoidType)
+						_: False
+				_: False
+		_: False
+
+
+pure func test_unused_record_declarations_do_not_reserve_concrete_identity() -> Bool:
+	source = RECORD_LAYOUT
+	match specialized(source):
+		Ok(contents):
+			match (contents.records, contents.functions):
+				([layout], [main, make]):
+					match (layout.fields, make.body, main.body):
+						([Concrete.IntType, Concrete.IntType], Concrete.ConcreteValueBody(Concrete.ReturnExpression(point)), Concrete.ConcreteValueBody(Concrete.ReturnExpression(value))):
+							match (point.base, value.operations):
+								(Concrete.ReturnRecord(owner, [first, second]), [step]):
+									match step.operation:
+										Concrete.ReadRecordField(field):
+											(
+												Concrete.record_number(owner) == 0
+												and Concrete.record_number(Concrete.field_owner(first.field)) == 0
+												and Concrete.record_number(Concrete.field_owner(second.field)) == 0
+												and Concrete.record_number(Concrete.field_owner(field)) == 0
+												and Concrete.field_number(field) == 1
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+pure func test_inactive_variants_keep_required_transitive_record_and_union_layouts() -> Bool:
+	source = PAYLOAD_LAYOUTS
+	match specialized(source):
+		Ok(contents):
+			match (contents.records, contents.unions, contents.functions):
+				([stored], [choice, outer], [_, _]):
+					match (stored.fields, choice.variants, outer.variants):
+						([Concrete.IntType], [None, Some(Concrete.RecordType(stored_record))], [Some(Concrete.UnionType(child))]):
+							(
+								Concrete.record_number(stored_record) == 0
+								and Concrete.union_number(child) == 0
+								and choice.representation == Concrete.InlineUnmanaged
+								and outer.representation == Concrete.InlineUnmanaged
+							)
+						_: False
+				_: False
+		_: False
+
+
+pure func test_unused_types_and_runtime_operations_are_absent_from_zero_c() -> Bool:
+	source = ZERO_C
+	match lex(module_source(root_module_id()), source).and_then(parse):
+		Err(_): False
+		Ok(parsed):
+			match compile(parsed):
+				Ok(code):
+					code == "#include <stdint.h>\nint64_t blorp_f_0(void);int64_t blorp_f_0(void){const int64_t blorp_vl_0=INT64_C(0);(void)blorp_vl_0;return blorp_vl_0;}int main(void){return (int)blorp_f_0();}\n"
+				Err(_): False
+
+
+pure func test_unreachable_declaration_type_errors_still_reject_before_specializing() -> Bool:
+	prefix = "pure func unused(value: "
+	source = prefix + "Missing) -> Int:\n    0\nfunc main() -> Int:\n    0\n"
+	match lex(module_source(root_module_id()), source).and_then(parse):
+		Err(_): False
+		Ok(parsed):
+			match Checked.check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = render_failure(failure)
+					(
+						errors.remaining.is_empty()
+						and errors.first.message == "unknown type"
+						and errors.first.help == "declare or import this type; builtin types and declared type parameters are also available"
+						and same_span(errors.first.span, { source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + 7 })
+					)
+
+
+private pure func accepted(source: String) -> Bool:
+	match checked(source):
+		Ok(_): True
+		Err(_): False
+
+
+tests: TestSuite = {
+	description = "Entrypoint rooted specialization and layout pruning",
+	tests = [
+		("unreachable cycle input passes checking", pure func(): accepted(UNREACHABLE_CYCLE)),
+		("reachable cycle input passes checking", pure func(): accepted(REACHABLE_CYCLE)),
+		("ordinary call input passes checking", pure func(): accepted(ORDINARY_CALLS)),
+		("discarded call input passes checking", pure func(): accepted(DISCARDED_CALLS)),
+		("record layout input passes checking", pure func(): accepted(RECORD_LAYOUT)),
+		("payload layouts input passes checking", pure func(): accepted(PAYLOAD_LAYOUTS)),
+		("zero C input passes checking", pure func(): accepted(ZERO_C)),
+		("unreachable ordinary mutual cycle creates no request", test_unreachable_ordinary_mutual_cycle_is_not_requested),
+		("reachable ordinary mutual cycle reuses complete keys", test_reachable_ordinary_mutual_cycle_reuses_original_keys),
+		("direct and receiver calls reuse ordinary identity", test_direct_and_receiver_calls_reuse_an_ordinary_instance),
+		("discarded impure call keeps transitive callee", test_discarded_impure_calls_keep_their_transitive_callee),
+		("unused records do not reserve concrete identities", test_unused_record_declarations_do_not_reserve_concrete_identity),
+		("inactive payloads keep required transitive layouts", test_inactive_variants_keep_required_transitive_record_and_union_layouts),
+		("return zero C omits unused types and runtime", test_unused_types_and_runtime_operations_are_absent_from_zero_c),
+		("unreachable type error rejects before specialization", test_unreachable_declaration_type_errors_still_reject_before_specializing),
+	]
+}

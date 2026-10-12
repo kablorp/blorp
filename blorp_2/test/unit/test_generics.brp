@@ -1,12 +1,11 @@
 import:
-	../../src/source: PRELUDE_SOURCE, module_source, root_module_id
+	../../src/source: module_source, root_module_id
 	../../src/check as Checked
 	../../src/lex: lex
-	../../src/parse: parse_prelude
-	../../src/prelude: check_prelude
 	../../src/syntax: Diagnostic
-	compilation: compile
-	input: check_failure, parse, setup_diagnostic
+	compilation: compile, compile_modules
+	input: check_failure, parse, setup_diagnostic, check_modules_failure
+	module_input: PRIMITIVE_BASE, INTEGER_OPERATIONS, STRING_OPERATIONS, ModuleInput
 	test: TestSuite
 
 
@@ -55,8 +54,28 @@ private pure func rejects(
 			)
 
 
+private pure func rejects_modules(
+	inputs: List[ModuleInput],
+	prefix: String,
+	marked: String,
+	matches: pure (Checked.CheckErrorKind) -> Bool,
+) -> Bool:
+	match check_modules_failure(inputs, PRIMITIVE_BASE):
+		None:
+			False
+		Some(error):
+			(
+				error.span.start == prefix.length()
+				and error.span.end == prefix.length() + marked.length()
+				and matches(error.kind)
+			)
+
+
 pure func test_one_declaration_accepts_int_and_string() -> Bool:
 	source: String =
+		|import:
+		|    int: Int
+		|    string: String
 		|pure func identity[T](value: T) -> T:
 		|	value
 		|func main() -> Int:
@@ -64,7 +83,11 @@ pure func test_one_declaration_accepts_int_and_string() -> Bool:
 		|	text = integer.to_string().identity()
 		|	identity(text).length()
 		|
-	compile(source).is_ok()
+	compile_modules([
+		{ source = source, targets = [1, 2] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+		{ source = STRING_OPERATIONS, targets = [] },
+	], PRIMITIVE_BASE).is_ok()
 
 
 pure func test_generic_forwarding_preserves_the_caller_parameter() -> Bool:
@@ -110,9 +133,14 @@ pure func test_int_only_use_does_not_recheck_invalid_body_as_int() -> Bool:
 
 pure func test_arbitrary_parameter_cannot_call_string_runtime() -> Bool:
 	bad_source: String =
+		|import:
+		|    string: length
 		|pure func bad[T](value: T) -> Int:
 		|	value.
-	rejects(bad_source, "length", "()\n" + MAIN, pure func(kind: Checked.CheckErrorKind) -> Bool:
+	rejects_modules([
+		{ source = (bad_source) + "length" + ("()\n" + MAIN), targets = [1] },
+		{ source = STRING_OPERATIONS, targets = [] },
+	], bad_source, "length", pure func(kind: Checked.CheckErrorKind) -> Bool:
 		match kind:
 			Checked.ArgumentTypeMismatch(_):
 				True
@@ -122,7 +150,10 @@ pure func test_arbitrary_parameter_cannot_call_string_runtime() -> Bool:
 
 
 pure func test_arbitrary_parameter_cannot_call_integer_runtime() -> Bool:
-	rejects("pure func bad[T](value: T) -> String:\n\t", "to_string", "(value)\n" + MAIN, pure func(
+	rejects_modules([
+		{ source = ("import:\n    int: to_string\npure func bad[T](value: T) -> String:\n\t") + "to_string" + ("(value)\n" + MAIN), targets = [1] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+	], "import:\n    int: to_string\npure func bad[T](value: T) -> String:\n\t", "to_string", pure func(
 		kind: Checked.CheckErrorKind,
 	) -> Bool:
 		match kind:
@@ -390,7 +421,7 @@ pure func test_forwarding_publishes_caller_owned_symbolic_substitution() -> Bool
 	match checked(IDENTITY + forward_source + MAIN):
 		Ok(program):
 			match Checked.checked_functions(program).functions:
-				[identity, forward, _]:
+				[identity, forward, _, ..._]:
 					match identity.signature.type_parameters:
 						[callee_parameter]:
 							match forward.signature.type_parameters:
@@ -419,35 +450,20 @@ pure func test_forwarding_publishes_caller_owned_symbolic_substitution() -> Bool
 			False
 
 
-private pure func accepted_prelude(source: String) -> Result[Void, Diagnostic]:
-	tokens ?= lex(PRELUDE_SOURCE, source)
-	parsed ?= parse_prelude(tokens)
-	accepted ?= check_prelude(parsed)
-	Ok(void)
-
-
-pure func test_generic_runtime_prelude_rejects() -> Bool:
-	declaration_suffix: String =
-		|T](value: Int) -> String:
-		|	builtin("int.to_string")
-		|
+pure func test_generic_runtime_module_rejects() -> Bool:
 	prefix: String =
-		|type Int = builtin
-		|type String = builtin
-		|type Float = builtin
-		|type Void = builtin
-		|pure func convert[
-
-	match accepted_prelude(prefix + declaration_suffix):
+		|pure func convert[T](value: Int) -> String:
+		|    builtin(
+	source = prefix + "\"int.to_string\")\nfunc main() -> Int:\n    0\n"
+	match checked(source):
 		Err(error):
 			(
 				error.span.start == prefix.length()
-				and error.span.end == prefix.length() + 1
-				and error.message == "prelude builtin functions cannot be generic"
-				and error.help == "remove the type parameter and use the runtime operation's concrete signature"
+				and error.span.end == prefix.length() + 15
+				and error.message == "builtin declaration does not match its runtime contract"
+				and error.help == "declare a pure function with one Int parameter returning String"
 			)
-		Ok(_):
-			False
+		Ok(_): False
 
 
 tests: TestSuite = {
@@ -521,6 +537,6 @@ tests: TestSuite = {
 			"forwarding publishes caller owned symbolic substitution",
 			test_forwarding_publishes_caller_owned_symbolic_substitution,
 		),
-		("generic runtime prelude rejects", test_generic_runtime_prelude_rejects),
+		("generic runtime module rejects", test_generic_runtime_module_rejects),
 	]
 }

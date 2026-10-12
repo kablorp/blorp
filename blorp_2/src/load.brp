@@ -1,5 +1,4 @@
 import:
-	./prelude: CheckedPrelude, check_prelude
 	int as IntOps
 	lex: lex
 	names: NameTable, name_spelling
@@ -7,13 +6,22 @@ import:
 	result: and_then
 	parse:
 		ParsedProgram, ParsedModule, ParsedImport, ImportOrigin(RelativeImport, LibraryImport), append_module, assembly_names, begin_program, module_imports, module_names,
-		parse_module, parse_prelude, seal_program
+		parse_module, seal_program
 	path as Path
 	source:
-		COMPILER_SOURCE, PRELUDE_SOURCE, ModuleId, SourceId, module_id, module_source, root_module_id, same_module
+		COMPILER_SOURCE, ModuleId, ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule), SourceId, module_id, module_source, root_module_id, same_module
 	syntax: Diagnostic, Span
 	system: getcwd, read_file
 	text as Text
+
+
+private FOUNDATION_TYPES_PATH: String = "_base/types.brp"
+
+private FOUNDATION_PRELUDE_PATH: String = "_base/prelude.brp"
+
+private FOUNDATION_TYPES_ORDINAL: Int = 1
+
+private FOUNDATION_PRELUDE_ORDINAL: Int = 2
 
 
 fixed record SourceFile {
@@ -24,7 +32,6 @@ fixed record SourceFile {
 
 -- Module source rows use the same order as the parser's module inventory.
 fixed record SourceInputs {
-	prelude: SourceFile,
 	modules: List[SourceFile]
 }
 
@@ -53,34 +60,24 @@ private pure func internal_error(message: String) -> Diagnostic:
 	)
 
 
-pure func prepare_prelude(contents: String) -> Result[CheckedPrelude, Diagnostic]:
-	lexed ?= lex(PRELUDE_SOURCE, contents)
-	parsed ?= parse_prelude(lexed)
-	check_prelude(parsed)
-
-
 -- This projection belongs to source loading, where filesystem paths are needed.
 -- Semantic import resolution receives ModuleId targets instead of these strings.
 pure func import_path(
 	importer: String,
 	request: ParsedImport,
 	names: NameTable,
-	library_root: Option[String],
+	library_root: String,
 ) -> Result[String, Diagnostic]:
-	base ?= match request.path.origin:
+	base = match request.path.origin:
 		LibraryImport:
-			library_root.to_result(rejection(
-				request.span,
-				"library import requires an explicit library root",
-				"pass --library-root DIRECTORY containing the target library modules",
-			))
+			library_root
 		RelativeImport(parents):
 			var directory = Path.dirname(importer)
 			var remaining = parents
 			while IntOps.greater_than(remaining, 0):
 				directory = Path.dirname(directory)
 				remaining = IntOps.subtract(remaining, 1)
-			Ok(directory)
+			directory
 	var directory = base
 
 	var failure: Option[Diagnostic] = None
@@ -100,6 +97,7 @@ pure func import_path(
 private fixed record RequestedModule {
 	id: ModuleId,
 	path: String,
+	role: ModuleKind,
 	site: Option[Span]
 }
 
@@ -115,14 +113,14 @@ private pure func known_module(requests: List[RequestedModule], path: String) ->
 	found
 
 
-private func read_module(path: String, site: Option[Span]) -> Result[String, Diagnostic]:
+private func read_module(path: String, id: ModuleId, site: Option[Span]) -> Result[String, Diagnostic]:
 	match read_file(path):
 		Ok(contents):
 			Ok(contents)
 		Err(error):
 			span = match site:
 				Some(span): span
-				None: { source = COMPILER_SOURCE, start = 0, end = 0 }
+				None: { source = module_source(id), start = 0, end = 0 }
 			Err(rejection(
 				span,
 				Text.concat("could not read module ", path).concat(": ").concat(error),
@@ -135,19 +133,32 @@ private fixed union ImportTarget:
 	DiscoveredTarget(RequestedModule)
 
 
+-- Both paths are normalized. Designated inputs receive their kinds when seeded;
+-- discovered dependencies use the configured directory boundary.
+pure func dependency_kind(path: String, library_root: String) -> ModuleKind:
+	if path.starts_with(Path.join(library_root, "")):
+		LibraryModule
+	else:
+		UserModule
+
+
 private pure func resolve_request(
 	importer: String,
 	request: ParsedImport,
 	names: NameTable,
 	requests: List[RequestedModule],
-	library_root: Option[String],
+	library_root: String,
 ) -> Result[ImportTarget, Diagnostic]:
 	path ?= import_path(importer, request, names, library_root)
+	reserved ?= if Text.equals(path, Path.join(library_root, FOUNDATION_TYPES_PATH)) or Text.equals(path, Path.join(library_root, FOUNDATION_PRELUDE_PATH)):
+		Err(rejection(request.span, "foundation modules cannot be imported explicitly", "remove this import; foundation types and the prelude are supplied by --library-root"))
+	else:
+		Ok(void)
 	match known_module(requests, path):
 		Some(id): Ok(KnownTarget(id))
 		None:
 			id ?= module_id(requests.length()).to_result(internal_error("module inventory is too large"))
-			Ok(DiscoveredTarget({ id = id, path = path, site = Some(request.span) }))
+			Ok(DiscoveredTarget({ id = id, path = path, role = dependency_kind(path, library_root), site = Some(request.span) }))
 
 
 private fixed record ReadModule {
@@ -158,7 +169,7 @@ private fixed record ReadModule {
 
 
 -- Preserve readable bytes even on a parse failure so its diagnostic has a source.
--- The queue and name table are borrowed; builders stay local to load_checked.
+-- The queue and name table are borrowed; builders stay local to load_program.
 private func read_requested(
 	requests: List[RequestedModule],
 	position: Int,
@@ -166,7 +177,7 @@ private func read_requested(
 	root_path: String,
 ) -> Result[ReadModule, Diagnostic]:
 	current ?= requests.get(position).to_result(internal_error("missing queued module"))
-	contents ?= read_module(current.path, current.site)
+	contents ?= read_module(current.path, current.id, current.site)
 	display_path = if same_module(current.id, root_module_id()):
 		root_path
 	else:
@@ -177,29 +188,37 @@ private func read_requested(
 	Ok({ request = current, file = { path = display_path, contents = contents }, parsed = parsed })
 
 
-private func load_checked(
-	prelude: SourceFile,
-	root_path: String,
-	checked: CheckedPrelude,
-	library_root: Option[String],
-) -> Result[LoadedProgram, LoadFailure]:
+-- Every queued path has one identity, policy role, read, and parse in this invocation.
+func load_program(root_path: String, library_root: String) -> Result[LoadedProgram, LoadFailure]:
 	working_directory = getcwd()
-	normalized_library = match library_root:
-		None: None
-		Some(root): Some(Path.normalize(Path.join(working_directory, root)))
+	normalized_library = Path.normalize(Path.join(working_directory, library_root))
 	var modules: List[SourceFile] = []
-	var assembly = begin_program(checked)
+	var assembly = begin_program()
+	types_id ?= module_id(FOUNDATION_TYPES_ORDINAL).to_result({ sources = { modules = [] }, diagnostic = internal_error("foundation type module identity is unavailable") })
+	prelude_id ?= module_id(FOUNDATION_PRELUDE_ORDINAL).to_result({ sources = { modules = [] }, diagnostic = internal_error("foundation prelude module identity is unavailable") })
 	var requests: List[RequestedModule] = [{
 		id = root_module_id(),
 		path = Path.normalize(Path.join(working_directory, root_path)),
+		role = UserModule,
 		site = None
 	}]
+	root_request ?= requests.get(0).to_result({ sources = { modules = [] }, diagnostic = internal_error("root module request is unavailable") })
+	root_input ?= if Text.equals(root_request.path, Path.join(normalized_library, FOUNDATION_TYPES_PATH)) or Text.equals(root_request.path, Path.join(normalized_library, FOUNDATION_PRELUDE_PATH)):
+		Err({ sources = { modules = [{ path = root_path, contents = "" }] }, diagnostic = rejection({ source = module_source(root_module_id()), start = 0, end = 0 }, "foundation modules cannot be application roots", "choose an application module; foundation inputs are supplied by --library-root") })
+	else:
+		Ok(void)
+	requests = requests.append({ id = types_id, path = Path.join(normalized_library, FOUNDATION_TYPES_PATH), role = FoundationTypesModule, site = None })
+	requests = requests.append({ id = prelude_id, path = Path.join(normalized_library, FOUNDATION_PRELUDE_PATH), role = FoundationPreludeModule, site = None })
 	var position = 0
 	var failure: Option[Diagnostic] = None
 
 	while IntOps.less_than(position, requests.length()):
 		match read_requested(requests, position, assembly_names(assembly), root_path):
 			Err(error):
+				-- Missing designated inputs still have a path for source-aware diagnostics.
+				match requests.get(position):
+					Some(request): modules = modules.append({ path = request.path, contents = "" })
+					None: void
 				failure = Some(error)
 				break
 			Ok(loaded):
@@ -222,7 +241,7 @@ private func load_checked(
 									targets = targets.append(next.id)
 						if failure.is_some():
 							break
-						match append_module(assembly, parsed, targets):
+						match append_module(assembly, parsed, targets, loaded.request.role):
 							Err(error):
 								failure = Some(error)
 								break
@@ -230,18 +249,10 @@ private func load_checked(
 								assembly = next
 		position = IntOps.add(position, 1)
 
-	sources: SourceInputs = { prelude = prelude, modules = modules }
+	sources: SourceInputs = { modules = modules }
 	match failure:
 		Some(error): Err({ sources = sources, diagnostic = error })
 		None:
 			match seal_program(assembly):
 				Err(error): Err({ sources = sources, diagnostic = error })
 				Ok(program): Ok({ sources = sources, program = program })
-
-
-func load_program(prelude: SourceFile, root_path: String, library_root: Option[String]) -> Result[LoadedProgram, LoadFailure]:
-	match prepare_prelude(prelude.contents):
-		Err(error):
-			Err({ sources = { prelude = prelude, modules = [] }, diagnostic = error })
-		Ok(checked):
-			load_checked(prelude, root_path, checked, library_root)

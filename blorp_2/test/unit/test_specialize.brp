@@ -1,5 +1,6 @@
 import:
 	../../src/check as Checked
+	../../src/declarations as Declaration
 	../../src/lex: lex
 	../../src/source: module_source, root_module_id
 	../../src/specialize:
@@ -17,7 +18,7 @@ import:
 		same_type,
 		specialize,
 		specialized_contents,
-	../../src/syntax: Diagnostic
+	../../src/syntax: Diagnostic, Entrypoint(NoArguments), entry_function
 	input: parse, setup_diagnostic
 	test: TestSuite
 
@@ -133,8 +134,9 @@ pure func test_argument_types_create_distinct_complete_instances() -> Bool:
 	main_source: String =
 		|func main() -> Int:
 		|	integer = identity(7)
-		|	text = integer.to_string().identity()
-		|	identity(text).length()
+		|	text = "7".identity()
+		|	ignored = identity(text)
+		|	0
 		|
 
 	match fixture(IDENTITY + main_source):
@@ -224,8 +226,8 @@ pure func test_bindings_and_reassignments_are_substituted_per_instance() -> Bool
 		|	original
 		|func main() -> Int:
 		|	integer = preserve(7)
-		|	text = preserve(integer.to_string())
-		|	text.length()
+		|	text = preserve("7")
+		|	0
 		|
 
 	match fixture(source):
@@ -254,7 +256,7 @@ pure func test_nominal_union_arguments_do_not_merge() -> Bool:
 		|
 
 	match fixture(first_source + IDENTITY + main_source):
-		Ok([_, _, _, first, second]):
+		Ok([_, _, first, _, second]):
 			match first.signature.return_type:
 				UnionType(_):
 					match second.signature.return_type:
@@ -268,37 +270,41 @@ pure func test_nominal_union_arguments_do_not_merge() -> Bool:
 			False
 
 
-pure func test_unused_ordinary_functions_remain_and_generic_declarations_do_not_emit() -> Bool:
+pure func test_unused_functions_create_no_concrete_instance() -> Bool:
 	source: String =
-		|pure func unused() -> Int:
-		|	7
+		|pure func unused() -> String:
+		|    "unused"
 		|func main() -> Int:
-		|	0
+		|    0
 		|
-
 	match fixture(IDENTITY + source):
-		Ok([unused, main]):
-			(
-				same_type(unused.signature.return_type, IntType)
-				and same_type(main.signature.return_type, IntType)
-			)
+		Ok([main]):
+			same_type(main.signature.return_type, IntType)
 		_:
 			False
 
 
-pure func test_entrypoint_maps_after_unused_ordinary_root() -> Bool:
+pure func test_entrypoint_translates_original_declaration_to_first_instance() -> Bool:
 	source: String =
 		|pure func unused() -> Int:
-		|	7
+		|    7
 		|func main() -> Int:
-		|	0
+		|    0
 		|
-
-	match program(IDENTITY + source):
-		Ok(contents):
-			function_number(contents.entrypoint) == 1
-		_:
-			False
+	match lex(module_source(root_module_id()), IDENTITY + source).and_then(parse):
+		Err(_): False
+		Ok(parsed):
+			match Checked.check(parsed):
+				Err(_): False
+				Ok(checked):
+					match specialize(checked):
+						Err(_): False
+						Ok(concrete):
+							(
+								Declaration.function_number(entry_function(Checked.checked_functions(checked).entrypoint)) == 2
+								and function_number(entry_function(specialized_contents(concrete).entrypoint)) == 0
+								and specialized_contents(concrete).functions.length() == 1
+							)
 
 
 pure func test_rigid_return_types_translate_in_every_match_arm() -> Bool:
@@ -317,7 +323,7 @@ pure func test_rigid_return_types_translate_in_every_match_arm() -> Bool:
 		|
 
 	match fixture(source):
-		Ok([_, _, choose]):
+		Ok([_, choose, _]):
 			match choose.body:
 				ConcreteMatchBody(matched):
 					match matched.arms:
@@ -357,7 +363,7 @@ pure func test_match_scrutinee_assignments_and_results_discover_generic_instance
 		|
 
 	match fixture(flag_source + IDENTITY + source):
-		Ok([flag, main, choose, flag_identity, save, int_identity]):
+		Ok([main, choose, flag, flag_identity, save, int_identity]):
 			match choose.body:
 				ConcreteMatchBody(matched):
 					match matched.arms:
@@ -367,7 +373,7 @@ pure func test_match_scrutinee_assignments_and_results_discover_generic_instance
 									match choose.bindings:
 										[parameter, saved_binding]:
 											(
-												body_target(main) == Some(2)
+												body_target(main) == Some(1)
 												and target(matched.scrutinee) == Some(3)
 												and target(saved) == Some(4)
 												and returns_repeated_target(second.body, 5)
@@ -423,12 +429,12 @@ tests: TestSuite = {
 		),
 		("nominal union arguments do not merge", test_nominal_union_arguments_do_not_merge),
 		(
-			"ordinary unused roots remain and generic declarations do not emit",
-			test_unused_ordinary_functions_remain_and_generic_declarations_do_not_emit,
+			"unused functions create no concrete instance",
+			test_unused_functions_create_no_concrete_instance,
 		),
 		(
-			"entrypoint maps after unused ordinary root",
-			test_entrypoint_maps_after_unused_ordinary_root,
+			"entrypoint translates original declaration to first instance",
+			test_entrypoint_translates_original_declaration_to_first_instance,
 		),
 		(
 			"rigid return types translate in every match arm",

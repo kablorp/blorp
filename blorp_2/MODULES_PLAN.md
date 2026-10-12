@@ -1,8 +1,16 @@
-# Local modules and selective function imports
+# Local modules and selective function imports (historical increment)
 
 Status: implemented and validated. The [results report](../benchmarks/results/blorp_2_modules_2026-10-11.md)
 records independent gates, mutation oracles, matched costs and current limits.
 Baseline: `42b723ac5dcf5af60f5b0e641f962dfcf654af4a`.
+
+This document records the first local-module increment and its baseline
+validation. The current implementation follows the
+[imports and prelude design](IMPORTS_AND_PRELUDE_PLAN.md): type selections,
+transparent type forwarding, `methods_only`, and the configured base/prelude
+replace the visibility restrictions below. The scope and byte-identity gates
+below describe this historical increment; see the [README](README.md#local-modules)
+for current syntax and configuration.
 
 ## Working example and scope
 

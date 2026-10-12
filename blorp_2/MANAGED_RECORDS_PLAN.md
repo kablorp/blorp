@@ -36,7 +36,7 @@ group and retain its initial rejection:
 
 ```sh
 make -C blorp_2 test-compiler
-blorp_2/build/compiler blorp_2/src/prelude_temp.brp \
+blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
   blorp_2/test/e2e/fixtures/record/string_field.brp \
   blorp_2/build/record-string-field.c
 ```

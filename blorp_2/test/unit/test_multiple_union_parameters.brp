@@ -9,7 +9,8 @@ import:
 	../../src/specialize as Concrete
 	../../src/syntax: Diagnostic, Span, TypeSyntax(AppliedType, AtomicType)
 	../../src/text: concat
-	input: check_failure, parse, setup_diagnostic
+	input: check_failure, parse, setup_diagnostic, check_modules_failure
+	module_input: PRIMITIVE_BASE, INTEGER_OPERATIONS
 	test: TestSuite
 
 
@@ -31,12 +32,12 @@ private pure func checked(source: String) -> Result[Checked.CheckedProgram, Diag
 
 pure func test_two_union_parameters_accept_int_constructor_and_pattern() -> Bool:
 	source: String =
-		|fixed union Result[T, E]:
+		|fixed union Either[T, E]:
 		|    Ok(T)
 		|    Err(E)
-		|pure func success() -> Result[Int, Int]:
+		|pure func success() -> Either[Int, Int]:
 		|    Ok(7)
-		|pure func read(value: Result[Int, Int]) -> Int:
+		|pure func read(value: Either[Int, Int]) -> Int:
 		|    match value:
 		|        Ok(item): item
 		|        Err(item): item
@@ -323,11 +324,11 @@ pure func test_unused_body_cannot_choose_a_rigid_union_parameter() -> Bool:
 		|		Ok(item):item
 		|		Err(item):
 	declaration: String =
-		|fixed union Result[X,Y]:
+		|fixed union Either[X,Y]:
 		|	Ok(X)
 		|	Err(Y)
 		|
-	prefix = declaration.concat("pure func bad[A,B](value:Result[A,B])->")
+	prefix = declaration.concat("pure func bad[A,B](value:Either[A,B])->")
 	body_prefix = prefix.concat(match_body_prefix)
 
 	match (
@@ -606,9 +607,12 @@ pure func test_missing_inference_precedes_an_ordinary_mismatch() -> Bool:
 		|pure func producer()->Marker[Int,Int]:
 		|	Only
 		|func main()->Int:
-	prefix = MARKER.concat(source + "\n\t")
+	prefix = "import:\n    int: to_string\n".concat(MARKER).concat(source + "\n\t")
 
-	match rejected(prefix.concat("take(8.to_string(),producer())")):
+	match check_modules_failure([
+		{ source = (prefix.concat("take(8.to_string(),producer())")).concat("\n"), targets = [1] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+	], PRIMITIVE_BASE):
 		Some(error):
 			match error.kind:
 				Checked.UninferableTypeParameter(parameter):
@@ -630,9 +634,12 @@ pure func test_conflict_precedes_an_ordinary_mismatch() -> Bool:
 		|	Only
 		|func main()->Int:
 		|	take(8.to_string(),
-	prefix = MARKER.concat(source)
+	prefix = "import:\n    int: to_string\n".concat(MARKER).concat(source)
 
-	match rejected(prefix.concat("producer())")):
+	match check_modules_failure([
+		{ source = (prefix.concat("producer())")).concat("\n"), targets = [1] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+	], PRIMITIVE_BASE):
 		Some(error):
 			match error.kind:
 				Checked.GenericArgumentConflict(conflict):
@@ -726,14 +733,22 @@ pure func test_phantom_keys_include_every_argument_and_nominal_owner() -> Bool:
 		|
 	source = MARKER
 		.concat(other_source)
-		.concat(MAIN)
+		.concat(
+			|func main()->Int:
+			|    a = first()
+			|    b = second()
+			|    c = third()
+			|    d = other()
+			|    e = again()
+			|    0
+		)
 
 	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
 		Ok(program):
 			facts = Concrete.specialized_contents(program)
 
 			match facts.functions:
-				[first, second, third, other, again, _]:
+				[_, first, second, third, other, again]:
 					match (
 						(
 							first.signature.return_type,
@@ -802,6 +817,7 @@ pure func test_permuted_forwarding_preserves_caller_ids_and_concrete_target() ->
 		|	Only
 		|func main()->Int:
 		|	saved = forward(producer())
+		|	compared = witness()
 		|	0
 	source = MARKER.concat(forwarding_source)
 
@@ -814,7 +830,7 @@ pure func test_permuted_forwarding_preserves_caller_ids_and_concrete_target() ->
 							match Concrete.specialize(program):
 								Ok(concrete):
 									match Concrete.specialized_contents(concrete).functions:
-										[producer, witness, _, concrete_forward, concrete_first]:
+										[_, producer, concrete_forward, witness, concrete_first]:
 											match (
 												concrete_target(concrete_forward),
 												concrete_first.signature.parameters,
@@ -882,21 +898,22 @@ private pure func admits_later_payload(source: String) -> Bool:
 
 pure func test_unused_later_string_payload_gives_the_layout_an_obligation() -> Bool:
 	declaration: String =
-		|fixed union Result[T,E]:
+		|fixed union Either[T,E]:
 		|	Ok(T)
 		|	Err(E)
 		|
 	written: String =
-		|pure func success()->Result[Int,String]:
+		|pure func success()->Either[Int,String]:
 		|	Ok(7)
 		|func main()->Int:
+		|	unused = success()
 		|	0
 		|
 	inferred: String =
-		|pure func make[E](value:E)->Result[Int,E]:
+		|pure func make[E](value:E)->Either[Int,E]:
 		|	Ok(7)
 		|func main()->Int:
-		|	saved = make(42.to_string())
+		|	saved = make("42")
 		|	0
 		|
 	(
@@ -1128,7 +1145,7 @@ pure func test_third_concrete_payload_uses_the_third_argument() -> Bool:
 			facts = Concrete.specialized_contents(program)
 
 			match (facts.unions, facts.functions):
-				([declaration], [third, read, _]):
+				([declaration], [_, third, read]):
 					match (
 						declaration.variants,
 						third.signature.return_type,

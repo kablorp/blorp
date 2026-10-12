@@ -1,10 +1,21 @@
 import:
-	../../src/source: PRELUDE_SOURCE, module_source, root_module_id
+	../../src/source: module_source, root_module_id, same_module
 	../../src/lex: lex
-	../../src/parse: ParsedProgram, parse_prelude, parsed_contents
+	../../src/names: program_names
+	../../src/parse: ParsedProgram, ParsedContents, parse_module, parsed_contents as program_contents
 	../../src/syntax: Diagnostic
 	../unit/input: parse
 	test: TestSuite
+
+
+-- Observe root declarations while the ordinary test prelude remains in the inventory.
+private pure func root_contents(program: ParsedProgram) -> ParsedContents:
+	contents = program_contents(program)
+	{ contents |
+		functions = contents.functions.filter(pure func(row): same_module(row.module, root_module_id())),
+		unions = contents.unions.filter(pure func(row): same_module(row.module, root_module_id())),
+		records = contents.records.filter(pure func(row): same_module(row.module, root_module_id())),
+	}
 
 
 private pure func parse_source(source: String) -> Result[ParsedProgram, Diagnostic]:
@@ -78,7 +89,7 @@ pure func test_trivia_is_transparent_across_all_block_depths() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 			(
 				program.functions.length() == 2
 				and program.unions.length() == 1
@@ -99,7 +110,7 @@ pure func test_annotation_associates_across_trivia() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			match parsed_contents(parsed).functions:
+			match root_contents(parsed).functions:
 				[function]:
 					match function.tail_annotation:
 						Some(span):
@@ -110,7 +121,7 @@ pure func test_annotation_associates_across_trivia() -> Bool:
 					False
 
 
-pure func test_prelude_uses_the_same_trivia_rules() -> Bool:
+pure func test_builtin_module_uses_the_same_trivia_rules() -> Bool:
 	source: String =
 		|
 		|-- builtin declaration
@@ -124,17 +135,17 @@ pure func test_prelude_uses_the_same_trivia_rules() -> Bool:
 		|    -- runtime body
 		|    builtin("int.to_string") -- operation
 		|
-	lex(PRELUDE_SOURCE, source)
-		.and_then(pure func(tokens): parse_prelude(tokens))
+	lex(module_source(root_module_id()), source)
+		.and_then(pure func(tokens): parse_module(tokens, root_module_id(), program_names().names))
 		.is_ok()
 
 
-pure func test_prelude_still_requires_real_line_separators() -> Bool:
+pure func test_builtin_module_requires_real_line_separators() -> Bool:
 	match lex(
-		PRELUDE_SOURCE,
+		module_source(root_module_id()),
 		"type Int = builtin type String = builtin",
 	).and_then(
-		pure func(tokens): parse_prelude(tokens),
+		pure func(tokens): parse_module(tokens, root_module_id(), program_names().names),
 	):
 		Ok(_):
 			False
@@ -142,8 +153,8 @@ pure func test_prelude_still_requires_real_line_separators() -> Bool:
 			(
 				error.span.start == 19
 				and error.span.end == 23
-				and error.message == "expected a newline after the prelude declaration"
-				and error.help == "put each prelude declaration on its own line"
+				and error.message == "expected a newline after the return expression"
+				and error.help == "put each declaration on a new line"
 				and error.note.is_none()
 			)
 
@@ -158,14 +169,12 @@ pure func test_trivia_does_not_supply_a_required_body() -> Bool:
 	)
 
 
-pure func test_trivia_does_not_supply_a_declaration() -> Bool:
-	rejects(
-		"--\n \t\n",
-		6,
-		6,
-		"expected a function declaration at column 1",
-		"start with func main() -> Int:",
-	)
+pure func test_comment_only_module_has_no_declarations() -> Bool:
+	match parse_source("--\n \t\n"):
+		Err(_): False
+		Ok(parsed):
+			contents = root_contents(parsed)
+			contents.functions.length() == 0 and contents.unions.length() == 0 and contents.records.length() == 0
 
 
 pure func test_trivia_does_not_supply_a_union_variant() -> Bool:
@@ -212,7 +221,7 @@ pure func test_following_real_dedent_starts_a_new_declaration() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			parsed_contents(parsed).functions.length() == 2
+			root_contents(parsed).functions.length() == 2
 
 
 tests: TestSuite = {
@@ -224,10 +233,10 @@ tests: TestSuite = {
 			test_trivia_is_transparent_across_all_block_depths,
 		),
 		("annotation associates across trivia", test_annotation_associates_across_trivia),
-		("prelude shares the trivia rules", test_prelude_uses_the_same_trivia_rules),
-		("prelude needs real line separators", test_prelude_still_requires_real_line_separators),
+		("builtin modules share the trivia rules", test_builtin_module_uses_the_same_trivia_rules),
+		("builtin modules need real line separators", test_builtin_module_requires_real_line_separators),
 		("trivia cannot supply a required body", test_trivia_does_not_supply_a_required_body),
-		("trivia cannot supply a declaration", test_trivia_does_not_supply_a_declaration),
+		("comment-only module is empty", test_comment_only_module_has_no_declarations),
 		("trivia cannot supply a union variant", test_trivia_does_not_supply_a_union_variant),
 		(
 			"annotation trivia still needs a function",

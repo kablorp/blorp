@@ -1,5 +1,10 @@
 # Completing the calculator
 
+The original stdin/read_line design below is retained as the completed
+historical increment. [ARGUMENTS_PLAN.md](ARGUMENTS_PLAN.md) supersedes its input
+protocol and impure parser helpers with explicit List[String] arguments and
+pure Result-returning evaluation. The pilot no longer exposes read_line.
+
 Status: steps 5–9 complete. Independent review, strict component tests, all
 native calculator cases, deliberate mutations and the predeclared cost/size
 criteria pass. [Retained results](../benchmarks/results/blorp_2_calculator_2026-10-12.md)
@@ -13,15 +18,14 @@ framework is needed. The existing compiler remains the host.
 
 ## Library results and input
 
-`Option[T]` and `Bool` are ordinary library fixed unions. Selective imports can
-select a type and explicitly select its constructors: `Option(Some, None)`.
-`Option()` selects the type alone; a bare name continues to select a function.
-There are no aliases,
-wildcards, implicit constructors, reexports or qualified module expressions.
+`Option[T]`, `Result[Value, Error]` and `Bool` are ordinary fixed unions owned by
+`standard_library_temp/_base/types.brp`. Their types and constructors are available
+in every module without imports. Separate Option and Result operation modules
+are deferred until operations need them. The
+[imports design](IMPORTS_AND_PRELUDE_PLAN.md) defines explicit selections for
+other types and their operations.
 
 ```blorp
-import:
-    option: Option(Some, None)
 pure func parse_int(text: String) -> Option[Int]:
     builtin("string.parse_int", Some, None)
 ```
@@ -36,12 +40,13 @@ determines meaning. Bool comparison follows the same boundary with its own
 precise two-empty-constructor role carrier:
 `builtin("string.equals", True, False)`.
 
-Visible ordinary function declarations and explicit imports take precedence over
-prelude functions through the existing namespace lookup. This permits importing
-`float: to_string` while the temporary prelude still supplies Int formatting.
-It introduces no type-based overloading: two explicit same-name function imports
-remain a conflict, and an unimported module function does not enter another
-module's scope. Prelude builtin type identities remain unique.
+Named function imports permit direct and UFCS calls. Prelude type selections
+supply UFCS-only candidates. Checking selects applicable UFCS functions using
+accepted receiver types and arity; ambiguous applicable candidates are rejected.
+For example, `float: to_string` supports direct Float formatting while
+`1.to_string()` resolves through the Int prelude methods. An unimported module's
+functions do not enter another module's scope. Base builtin type identities
+remain unique.
 
 `parse_int` borrows its String, accepts an optional ASCII sign followed by one
 or more ASCII decimal digits, and consumes the complete byte sequence. Leading

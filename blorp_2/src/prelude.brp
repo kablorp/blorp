@@ -1,26 +1,21 @@
 import:
-	declarations: VariantId
-	int as IntOps
 	names: InitialNames, NameId, NameTable, SpecialNames, name_spelling, same_name
 	option: is_some, to_result
+	parse: ParsedProgram, ParsedBuiltinDeclaration, parsed_contents
+	source: same_module
 	syntax:
 		Diagnostic,
-		FunctionHeader,
-		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin),
-		ParsedParameter,
-		ParsedPrelude,
+		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
 		ParsedRuntimeOperation(
 			IntegerAddBuiltin, IntegerSubtractBuiltin, IntegerMultiplyBuiltin, IntegerDivideBuiltin,
 			IntegerRemainderBuiltin, IntegerToStringBuiltin, StringLengthBuiltin,
 			FloatAddBuiltin, FloatSubtractBuiltin, FloatMultiplyBuiltin, FloatDivideBuiltin,
 			FloatRemainderBuiltin, FloatToStringBuiltin, StringParseFloatBuiltin,
-			StringPrintBuiltin, StringParseIntBuiltin, IoReadLineBuiltin, StringEqualsBuiltin,
+			StringPrintBuiltin, StringParseIntBuiltin, ListLengthBuiltin, ListGetBuiltin, StringEqualsBuiltin, IntegerEqualsBuiltin,
 		),
 		Purity(Pure, Impure),
 		Span,
-		TypeSyntax(AtomicType, AppliedType),
 		WrittenName,
-		same_purity,
 	text as Text
 
 
@@ -53,8 +48,10 @@ fixed union RuntimeOperation[Variant]:
 	StringPrint
 	StringParseInt(OptionalRoles[Variant])
 	StringParseFloat(OptionalRoles[Variant])
-	IoReadLine(OptionalRoles[Variant])
+	ListLength
+	ListGet(OptionalRoles[Variant])
 	StringEquals(BooleanRoles[Variant])
+	IntEquals(BooleanRoles[Variant])
 
 
 fixed union PrimitiveType:
@@ -70,9 +67,16 @@ fixed union RuntimeResult[Variant]:
 	BooleanResult(BooleanRoles[Variant])
 
 
+-- These closed operations need one concrete container parameter, not generic
+-- runtime functions or arbitrary element descriptors.
+fixed union RuntimeParameter:
+	PrimitiveParameter(PrimitiveType)
+	StringListParameter
+
+
 fixed record RuntimeContract[Variant] {
 	purity: Purity,
-	parameters: List[PrimitiveType],
+	parameters: List[RuntimeParameter],
 	return_type: RuntimeResult[Variant]
 }
 
@@ -85,49 +89,57 @@ pure func runtime_contract[Variant](
 		StringPrint:
 			{
 				purity = Impure,
-				parameters = [BuiltinString],
+				parameters = [PrimitiveParameter(BuiltinString)],
 				return_type = PrimitiveResult(BuiltinVoid)
 			}
 		IntAdd | IntSubtract | IntMultiply | IntDivide | IntRemainder:
 			{
 				purity = Pure,
-				parameters = [BuiltinInt, BuiltinInt],
+				parameters = [PrimitiveParameter(BuiltinInt), PrimitiveParameter(BuiltinInt)],
 				return_type = PrimitiveResult(BuiltinInt)
 			}
 		FloatAdd | FloatSubtract | FloatMultiply | FloatDivide | FloatRemainder:
-			{ purity = Pure, parameters = [BuiltinFloat, BuiltinFloat], return_type = PrimitiveResult(BuiltinFloat) }
+			{ purity = Pure, parameters = [PrimitiveParameter(BuiltinFloat), PrimitiveParameter(BuiltinFloat)], return_type = PrimitiveResult(BuiltinFloat) }
 		FloatToString:
-			{ purity = Pure, parameters = [BuiltinFloat], return_type = PrimitiveResult(BuiltinString) }
+			{ purity = Pure, parameters = [PrimitiveParameter(BuiltinFloat)], return_type = PrimitiveResult(BuiltinString) }
 		IntToString:
 			{
 				purity = Pure,
-				parameters = [BuiltinInt],
+				parameters = [PrimitiveParameter(BuiltinInt)],
 				return_type = PrimitiveResult(BuiltinString)
 			}
 		StringLength:
 			{
 				purity = Pure,
-				parameters = [BuiltinString],
+				parameters = [PrimitiveParameter(BuiltinString)],
 				return_type = PrimitiveResult(BuiltinInt)
 			}
 		StringParseInt(roles):
 			{
 				purity = Pure,
-				parameters = [BuiltinString],
+				parameters = [PrimitiveParameter(BuiltinString)],
 				return_type = OptionalResult(BuiltinInt, roles)
 			}
 		StringParseFloat(roles):
-			{ purity = Pure, parameters = [BuiltinString], return_type = OptionalResult(BuiltinFloat, roles) }
-		IoReadLine(roles):
+			{ purity = Pure, parameters = [PrimitiveParameter(BuiltinString)], return_type = OptionalResult(BuiltinFloat, roles) }
+		ListLength:
+			{ purity = Pure, parameters = [StringListParameter], return_type = PrimitiveResult(BuiltinInt) }
+		ListGet(roles):
 			{
-				purity = Impure,
-				parameters = [],
+				purity = Pure,
+				parameters = [StringListParameter, PrimitiveParameter(BuiltinInt)],
 				return_type = OptionalResult(BuiltinString, roles)
+			}
+		IntEquals(roles):
+			{
+				purity = Pure,
+				parameters = [PrimitiveParameter(BuiltinInt), PrimitiveParameter(BuiltinInt)],
+				return_type = BooleanResult(roles)
 			}
 		StringEquals(roles):
 			{
 				purity = Pure,
-				parameters = [BuiltinString, BuiltinString],
+				parameters = [PrimitiveParameter(BuiltinString), PrimitiveParameter(BuiltinString)],
 				return_type = BooleanResult(roles)
 			}
 
@@ -169,19 +181,23 @@ pure func builtin_operation(parsed: ParsedRuntimeOperation) -> RuntimeOperation[
 			})
 		StringParseFloatBuiltin(present, absent):
 			StringParseFloat({ present = present, absent = absent })
-		IoReadLineBuiltin(present, absent):
-			IoReadLine({
+		ListGetBuiltin(present, absent):
+			ListGet({
 				present = present,
 				absent = absent,
 			})
+		ListLengthBuiltin:
+			ListLength
 		StringEqualsBuiltin(equal, different):
 			StringEquals({
 				equal = equal,
 				different = different,
 			})
+		IntegerEqualsBuiltin(equal, different):
+			IntEquals({ equal = equal, different = different })
 
 
--- A prelude has no union declarations and therefore cannot bind union roles.
+-- Generic callers of this helper admit only operations without constructor roles.
 pure func primitive_operation[Variant](
 	parsed: ParsedRuntimeOperation,
 ) -> Option[RuntimeOperation[Variant]]:
@@ -214,7 +230,9 @@ pure func primitive_operation[Variant](
 			Some(StringLength)
 		StringPrintBuiltin:
 			Some(StringPrint)
-		StringParseIntBuiltin(_, _) | StringParseFloatBuiltin(_, _) | IoReadLineBuiltin(_, _) | StringEqualsBuiltin(_, _):
+		ListLengthBuiltin:
+			Some(ListLength)
+		StringParseIntBuiltin(_, _) | StringParseFloatBuiltin(_, _) | ListGetBuiltin(_, _) | StringEqualsBuiltin(_, _) | IntegerEqualsBuiltin(_, _):
 			None
 
 
@@ -239,11 +257,12 @@ pure func runtime_declaration_help[Variant](operation: RuntimeOperation[Variant]
 			)
 		StringParseFloat(_):
 			"declare a pure nongeneric function with one String parameter returning a two-variant union of Float and an empty case"
-		IoReadLine(_):
-			(
-				"declare an impure nongeneric function without parameters returning a two-"
-				+ "variant union of String and an empty case"
-			)
+		ListGet(_):
+			"declare a pure nongeneric function with List[String] and Int parameters returning a two-variant union of String and an empty case"
+		ListLength:
+			"declare a pure function with one List[String] parameter returning Int"
+		IntEquals(_):
+			"declare a pure nongeneric function with two Int parameters returning a union of two empty variants"
 		StringEquals(_):
 			(
 				"declare a pure nongeneric function with two String parameters returning a union "
@@ -251,398 +270,186 @@ pure func runtime_declaration_help[Variant](operation: RuntimeOperation[Variant]
 			)
 
 
-private fixed record RuntimeBinding {
-	name: NameId,
-	operation: RuntimeOperation[VariantId]
+fixed union BuiltinTypeRole:
+	IntegerType
+	FloatType
+	StringType
+	VoidType
+	ListType
+
+
+fixed union BuiltinTypeErrorKind:
+	InvalidBuiltinName
+	InvalidEntrypointName
+	DuplicateBuiltinType(BuiltinTypeRole)
+	MissingBuiltinType(BuiltinTypeRole)
+	ConflictingBuiltinIdentities
+	BuiltinOutsideFoundation
+	FoundationImports
+	FoundationFunctions
+	FoundationTypeConflict(BuiltinTypeRole)
+
+
+fixed record BuiltinTypeError {
+	span: Span,
+	kind: BuiltinTypeErrorKind
 }
 
 
-private fixed record PreludeAuthority {
-	names: InitialNames,
-	functions: List[RuntimeBinding]
-}
+private pure func builtin_type_error(span: Span, kind: BuiltinTypeErrorKind) -> BuiltinTypeError:
+	{ span = span, kind = kind }
 
 
-opaque type CheckedPrelude = PreludeAuthority
+pure func builtin_type_name(declaration: ParsedBuiltinType) -> WrittenName:
+	match declaration:
+		IntegerBuiltin(name): name
+		FloatBuiltin(name): name
+		StringBuiltin(name): name
+		VoidBuiltin(name): name
+		ListBuiltin(name): name
 
 
-pure func prelude_names(prelude: CheckedPrelude) -> InitialNames:
-	from_opaque CheckedPrelude(prelude).names
+private pure func builtin_type_role(declaration: ParsedBuiltinType) -> BuiltinTypeRole:
+	match declaration:
+		IntegerBuiltin(_): IntegerType
+		FloatBuiltin(_): FloatType
+		StringBuiltin(_): StringType
+		VoidBuiltin(_): VoidType
+		ListBuiltin(_): ListType
 
 
-pure func runtime_operation(
-	prelude: CheckedPrelude,
-	name: NameId,
-) -> Option[RuntimeOperation[VariantId]]:
-	var found: Option[RuntimeOperation[VariantId]] = None
-
-	for function in from_opaque CheckedPrelude(prelude).functions:
-		if same_name(function.name, name):
-			found = Some(function.operation)
+private pure func foundation_type_conflict(
+	name: WrittenName,
+	builtins: List[ParsedBuiltinDeclaration],
+) -> Option[BuiltinTypeError]:
+	var conflict: Option[BuiltinTypeError] = None
+	for row in builtins:
+		if same_name(name.id, builtin_type_name(row.declaration).id):
+			conflict = Some(builtin_type_error(name.span, FoundationTypeConflict(builtin_type_role(row.declaration))))
 			break
-
-	found
-
-
-private pure func rejection(span: Span, message: String, help: String) -> Diagnostic:
-	{
-		span = span,
-		note = None,
-		message = message,
-		help = help
-	}
+	conflict
 
 
-private pure func validate_name(name: WrittenName, names: NameTable) -> Result[Void, Diagnostic]:
-	if name_spelling(names, name.id).is_some():
-		Ok(void)
-	else:
-		Err(
-			rejection(
-				name.span,
-				"invalid parsed prelude name identity",
-				"report this compiler error with the prelude input",
-			),
-		)
-
-
-private pure func resolve_builtin_types(parsed: ParsedPrelude) -> Result[SpecialNames, Diagnostic]:
-	main ?= validate_name(
-		{
-			id = parsed.main,
-			span = parsed.end
-		},
-		parsed.names,
-	)
+-- Primitive names are checked once from the sealed designated source inventory.
+-- Ordinary unions remain nominal declarations owned by the normal namespace.
+pure func check_builtin_types(program: ParsedProgram) -> Result[InitialNames, BuiltinTypeError]:
+	parsed = parsed_contents(program)
+	base = parsed.foundation.types
+	var end = parsed.end
+	var failure: Option[BuiltinTypeError] = None
+	for row in parsed.modules:
+		if same_module(row.module, base):
+			end = row.end
+			match row.imports.get(0):
+				Some(request): failure = Some(builtin_type_error(request.span, FoundationImports))
+				None: void
+	for function in parsed.functions:
+		if same_module(function.module, base):
+			failure = Some(builtin_type_error(function.function_name.span, FoundationFunctions))
+			break
+	if not name_spelling(parsed.names, parsed.entrypoint).is_some():
+		failure = Some(builtin_type_error(parsed.end, InvalidEntrypointName))
 	var integer: Option[NameId] = None
 	var float: Option[NameId] = None
 	var string: Option[NameId] = None
 	var unit: Option[NameId] = None
-	var failure: Option[Diagnostic] = None
-
-	for declaration in parsed.types:
-		name = match declaration:
-			IntegerBuiltin(name):
-				name
-			FloatBuiltin(name):
-				name
-			StringBuiltin(name):
-				name
-			VoidBuiltin(name):
-				name
-
-		match validate_name(name, parsed.names):
-			Err(error):
-				failure = Some(error)
-				break
-			Ok(_):
-				void
-
-		match declaration:
-			IntegerBuiltin(name):
-				if integer.is_some():
-					failure = Some(
-						rejection(
-							name.span,
-							"duplicate builtin type declaration",
-							"declare type Int = builtin exactly once",
-						),
-					)
-					break
-
-				integer = Some(name.id)
-			FloatBuiltin(name):
-				if float.is_some():
-					failure = Some(rejection(name.span, "duplicate builtin type declaration", "declare type Float = builtin exactly once"))
-					break
-				float = Some(name.id)
-			StringBuiltin(name):
-				if string.is_some():
-					failure = Some(
-						rejection(
-							name.span,
-							"duplicate builtin type declaration",
-							"declare type String = builtin exactly once",
-						),
-					)
-					break
-
-				string = Some(name.id)
-			VoidBuiltin(name):
-				if unit.is_some():
-					failure = Some(
-						rejection(
-							name.span,
-							"duplicate builtin type declaration",
-							"declare type Void = builtin exactly once",
-						),
-					)
-					break
-
-				unit = Some(name.id)
-
-	types ?= match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(void)
-
-	integer_id ?= integer.to_result(
-		rejection(
-			parsed.end,
-			"missing Int builtin declaration",
-			"add type Int = builtin to the prelude",
-		),
-	)
-	string_id ?= string.to_result(
-		rejection(
-			parsed.end,
-			"missing String builtin declaration",
-			"add type String = builtin to the prelude",
-		),
-	)
-
-	unit_id ?= unit.to_result(
-		rejection(
-			parsed.end,
-			"missing Void builtin declaration",
-			"add type Void = builtin to the prelude",
-		),
-	)
-
-	float_id ?= float.to_result(rejection(parsed.end, "missing Float builtin declaration", "add type Float = builtin to the prelude"))
-
-	if (
-		same_name(integer_id, float_id)
-		or same_name(string_id, float_id)
-		or same_name(unit_id, float_id)
-		or same_name(parsed.main, float_id)
-		or same_name(integer_id, string_id)
-		or same_name(integer_id, unit_id)
-		or same_name(string_id, unit_id)
-		or same_name(parsed.main, unit_id)
-		or same_name(parsed.main, integer_id)
-		or same_name(parsed.main, string_id)
-	):
-		Err(
-			rejection(
-				parsed.end,
-				"prelude builtin identities conflict",
-				"report this compiler error with the prelude input",
-			),
-		)
-	else:
-		Ok({
-			main = parsed.main,
-			integer = integer_id,
-			float = float_id,
-			string = string_id,
-			unit = unit_id,
-		})
-
-
-private pure func primitive_type(name: NameId, special: SpecialNames) -> Option[PrimitiveType]:
-	if same_name(name, special.integer):
-		Some(BuiltinInt)
-	else if same_name(name, special.float):
-		Some(BuiltinFloat)
-	else if same_name(name, special.string):
-		Some(BuiltinString)
-	else if same_name(name, special.unit):
-		Some(BuiltinVoid)
-	else:
-		None
-
-
-private pure func matches_type(actual: Option[PrimitiveType], expected: PrimitiveType) -> Bool:
-	match actual:
-		None:
-			False
-		Some(BuiltinInt):
-			match expected:
-				BuiltinInt:
-					True
-				BuiltinFloat | BuiltinString | BuiltinVoid:
-					False
-		Some(BuiltinFloat):
-			match expected:
-				BuiltinFloat: True
-				BuiltinInt | BuiltinString | BuiltinVoid: False
-		Some(BuiltinString):
-			match expected:
-				BuiltinString:
-					True
-				BuiltinInt | BuiltinFloat | BuiltinVoid:
-					False
-		Some(BuiltinVoid):
-			match expected:
-				BuiltinVoid:
-					True
-				BuiltinInt | BuiltinFloat | BuiltinString:
-					False
-
-
-private pure func runtime_type_name(written: TypeSyntax) -> Result[WrittenName, Diagnostic]:
-	match written:
-		AtomicType(name):
-			Ok(name)
-		AppliedType(_, _, span):
-			Err(
-				rejection(
-					span,
-					"prelude builtin types cannot be applied",
-					"use the concrete Int, Float, String or Void runtime type without an argument",
-				),
-			)
-
-
-private pure func validate_runtime_parameter(
-	parameter: ParsedParameter,
-	expected: PrimitiveType,
-	names: InitialNames,
-) -> Result[Bool, Diagnostic]:
-	parameter_name ?= validate_name(parameter.name, names.names)
-	written ?= runtime_type_name(parameter.type_name)
-	type_name ?= validate_name(written, names.names)
-	Ok(matches_type(primitive_type(written.id, names.special), expected))
-
-
-private pure func validate_runtime_parameters(
-	parameters: List[ParsedParameter],
-	expected: List[PrimitiveType],
-	names: InitialNames,
-) -> Result[Bool, Diagnostic]:
-	if IntOps.not_equals(parameters.length(), expected.length()):
-		Ok(False)
-	else:
-		var matching = True
-		var failure: Option[Diagnostic] = None
-		var position = 0
-
-		for parameter in parameters:
-			match expected.get(position):
-				None:
-					matching = False
-				Some(value_type):
-					match validate_runtime_parameter(parameter, value_type, names):
-						Err(error):
-							failure = Some(error)
-							break
-						Ok(matches):
-							matching = matching and matches
-
-			position = IntOps.add(position, 1)
-
-		match failure:
-			Some(error): Err(error)
-			None: Ok(matching)
-
-
-private pure func validate_runtime_header(
-	header: FunctionHeader,
-	contract: RuntimeContract[VariantId],
-	names: InitialNames,
-) -> Result[Bool, Diagnostic]:
-	generic_header ?= match header.type_parameters.get(0):
-		None:
-			Ok(void)
-		Some(name):
-			Err(
-				rejection(
-					name.span,
-					"prelude builtin functions cannot be generic",
-					"remove the type parameter and use the runtime operation's concrete signature",
-				),
-			)
-
-	function_name ?= validate_name(header.function_name, names.names)
-	return_type ?= runtime_type_name(header.return_type)
-	return_name ?= validate_name(return_type, names.names)
-	parameter_matches ?= validate_runtime_parameters(header.parameters, contract.parameters, names)
-
-	result_matches = match contract.return_type:
-		PrimitiveResult(expected):
-			matches_type(
-				primitive_type(return_type.id, names.special),
-				expected,
-			)
-		OptionalResult(_, _) | BooleanResult(_):
-			False
-
-	Ok(same_purity(header.purity, contract.purity) and parameter_matches and result_matches)
-
-
-pure func check_prelude(parsed: ParsedPrelude) -> Result[CheckedPrelude, Diagnostic]:
-	special ?= resolve_builtin_types(parsed)
-	names: InitialNames = {
-		names = parsed.names,
-		special = special
-	}
-	var functions: List[RuntimeBinding] = []
-	var failure: Option[Diagnostic] = None
-
-	for function in parsed.functions:
-		function_name = function.header.function_name
-		var duplicate = same_name(function_name.id, special.main)
-
-		for known in functions:
-			if same_name(known.name, function_name.id):
-				duplicate = True
-				break
-
-		if duplicate:
-			failure = Some(
-				rejection(
-					function_name.span,
-					"duplicate or reserved prelude function name",
-					Text.concat(
-						"give prelude functions distinct names and reserve main for the program ",
-						"entrypoint",
-					),
-				),
-			)
+	var list: Option[NameId] = None
+	for row in parsed.builtin_types:
+		if failure.is_some():
 			break
-
-		operation_result: Option[RuntimeOperation[VariantId]] = primitive_operation(
-			function.operation,
-		)
-
-		match operation_result:
-			None:
-				failure = Some(
-					rejection(
-						function.span,
-						"union-result builtins belong in ordinary modules",
-						"declare the union and its builtin wrapper in a module, then import the wrapper",
-					),
-				)
+		name = builtin_type_name(row.declaration)
+		if not same_module(row.module, base):
+			failure = Some(builtin_type_error(name.span, BuiltinOutsideFoundation))
+			break
+		if not name_spelling(parsed.names, name.id).is_some():
+			failure = Some(builtin_type_error(name.span, InvalidBuiltinName))
+			break
+		previous = match row.declaration:
+			IntegerBuiltin(_): integer
+			FloatBuiltin(_): float
+			StringBuiltin(_): string
+			VoidBuiltin(_): unit
+			ListBuiltin(_): list
+		if previous.is_some():
+			failure = Some(builtin_type_error(name.span, DuplicateBuiltinType(builtin_type_role(row.declaration))))
+			break
+		match row.declaration:
+			IntegerBuiltin(_): integer = Some(name.id)
+			FloatBuiltin(_): float = Some(name.id)
+			StringBuiltin(_): string = Some(name.id)
+			VoidBuiltin(_): unit = Some(name.id)
+			ListBuiltin(_): list = Some(name.id)
+	valid ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	integer_id ?= integer.to_result(builtin_type_error(end, MissingBuiltinType(IntegerType)))
+	string_id ?= string.to_result(builtin_type_error(end, MissingBuiltinType(StringType)))
+	unit_id ?= unit.to_result(builtin_type_error(end, MissingBuiltinType(VoidType)))
+	float_id ?= float.to_result(builtin_type_error(end, MissingBuiltinType(FloatType)))
+	list_id ?= list.to_result(builtin_type_error(end, MissingBuiltinType(ListType)))
+	var known: List[NameId] = [parsed.entrypoint]
+	var conflict = False
+	for id in [integer_id, float_id, string_id, unit_id, list_id]:
+		for previous in known:
+			conflict = conflict or same_name(previous, id)
+		known = known.append(id)
+	-- Base declarations share the same type namespace as these primitive heads.
+	-- Other modules see the base through their implicit namespace; the base
+	-- itself needs this check before its own declarations are published.
+	for declaration in parsed.unions:
+		if same_module(declaration.module, base):
+			failure = foundation_type_conflict(declaration.type_name, parsed.builtin_types)
+			if failure.is_some():
 				break
-			Some(operation):
-				match validate_runtime_header(function.header, runtime_contract(operation), names):
-					Err(error):
-						failure = Some(error)
-						break
-					Ok(matches):
-						if not matches:
-							failure = Some(
-								rejection(
-									function.span,
-									"builtin declaration does not match its runtime contract",
-									runtime_declaration_help(operation),
-								),
-							)
-							break
+	for declaration in parsed.records:
+		if failure.is_some():
+			break
+		if same_module(declaration.module, base):
+			failure = foundation_type_conflict(declaration.type_name, parsed.builtin_types)
+	valid_nominals ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	if conflict:
+		Err(builtin_type_error(end, ConflictingBuiltinIdentities))
+	else:
+		Ok({ names = parsed.names, special = {
+			main = parsed.entrypoint, integer = integer_id, float = float_id, string = string_id,
+			unit = unit_id, list = list_id,
+		} })
 
-				functions = functions.append({
-					name = function_name.id,
-					operation = operation,
-				})
 
-	match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(into_opaque CheckedPrelude({
-						names = names,
-						functions = functions
-					}))
+private pure func builtin_type_spelling(role: BuiltinTypeRole) -> String:
+	match role:
+		IntegerType: "Int"
+		FloatType: "Float"
+		StringType: "String"
+		VoidType: "Void"
+		ListType: "List"
+
+
+private pure func builtin_type_declaration(role: BuiltinTypeRole) -> String:
+	match role:
+		ListType: "type List[T] = builtin"
+		_: Text.concat("type ", builtin_type_spelling(role)).concat(" = builtin")
+
+
+pure func render_builtin_type_error(error: BuiltinTypeError) -> Diagnostic:
+	message = match error.kind:
+		InvalidBuiltinName: "invalid parsed builtin name identity"
+		InvalidEntrypointName: "invalid parsed entrypoint name identity"
+		DuplicateBuiltinType(_): "duplicate builtin type declaration"
+		MissingBuiltinType(role): Text.concat("missing ", builtin_type_spelling(role)).concat(" builtin declaration")
+		ConflictingBuiltinIdentities: "foundation builtin identities conflict"
+		BuiltinOutsideFoundation: "builtin type declarations belong in the configured foundation module"
+		FoundationImports: "foundation types cannot import modules"
+		FoundationFunctions: "foundation types cannot declare functions"
+		FoundationTypeConflict(_): "foundation type conflicts with a builtin declaration"
+	help = match error.kind:
+		DuplicateBuiltinType(role): Text.concat("declare ", builtin_type_declaration(role)).concat(" exactly once")
+		MissingBuiltinType(role): Text.concat("add ", builtin_type_declaration(role)).concat(" to _base/types.brp")
+		BuiltinOutsideFoundation: "remove this declaration; builtin types are supplied by _base/types.brp under --library-root"
+		FoundationImports: "keep _base/types.brp independent; put operation imports in _base/prelude.brp"
+		FoundationFunctions: "move functions to a library operation module and select its type in _base/prelude.brp"
+		FoundationTypeConflict(role): Text.concat("remove or rename this fixed union or record; ", builtin_type_spelling(role)).concat(" is owned by its builtin declaration")
+		InvalidBuiltinName | InvalidEntrypointName | ConflictingBuiltinIdentities: "report this compiler error with the foundation input"
+	{ span = error.span, note = None, message = message, help = help }

@@ -1,5 +1,5 @@
 import:
-	./prelude: prelude_names, runtime_declaration_help
+	./prelude: builtin_type_name, render_builtin_type_error, runtime_declaration_help
 	check as Check
 	declarations:
 		VariantId,
@@ -12,17 +12,22 @@ import:
 	names: NameId, NameTable, name_spelling
 	namespace:
 		ImportProblem(
-			RepeatedModuleImport, MissingImportedFunction, UnsupportedTypeImport,
-			MissingImportedUnion, AmbiguousImportedUnion, MissingImportedVariant,
-			RepeatedImportedVariant, ImportedTypeConflict,
+			RepeatedModuleImport, MissingImportedFunction, RepeatedImportedFunction,
+			AmbiguousImportSelection, MissingImportedType, AmbiguousImportedType,
+			MethodTypeNotVisible, MissingImportedUnion, AmbiguousImportedUnion,
+			MissingImportedVariant, RepeatedImportedVariant, ImportedTypeConflict,
 		),
 	option: to_result
 	parse: ParsedContents, ParsedProgram, parsed_contents
 	syntax:
 		CallNotation(DirectCall, ReceiverCall),
 		Diagnostic,
-		DiagnosticNote(TypeDeclaration, RecordFieldDeclaration, PreviousField, PreviousDeclaration),
+		DiagnosticNote(
+			TypeDeclaration, RecordFieldDeclaration, PreviousField, PreviousDeclaration,
+			CompetingDeclarations,
+		),
 		Diagnostics,
+		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
 		Span,
 	text as Text
 
@@ -127,17 +132,64 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 	context = parsed_contents(program)
 
 	match error.kind:
+		Check.BuiltinTypesRejected(error):
+			render_builtin_type_error(error)
+		Check.AmbiguousMethod(_, _, sites):
+			method_diagnostic(
+				error.span,
+				sites,
+				"ambiguous method call",
+				(
+					"rename one method or call a uniquely imported function directly; receiver type "
+					+ "and argument count must identify one function"
+				),
+			)
+		Check.NoApplicableMethod(_, _, sites):
+			method_diagnostic(
+				error.span,
+				sites,
+				"no method accepts this receiver type",
+				(
+					"use a value of a declared receiver type, or import a function accepting this "
+					+ "type"
+				),
+			)
+		Check.MethodReceiverNeedsType(_, sites):
+			method_diagnostic(
+				error.span,
+				sites,
+				"method receiver needs an explicit type",
+				(
+					"bind the receiver through a typed helper, or call a uniquely imported function "
+					+ "directly"
+				),
+			)
+		Check.MethodArgumentCounts(_, _, counts, sites):
+			var expected = ""
+
+			for count in counts:
+				if not expected.is_empty():
+					expected = expected.concat(", ")
+
+				expected = expected.concat(IntOps.to_string(count))
+
+			method_diagnostic(
+				error.span,
+				sites,
+				"method argument count does not match any receiver-compatible function",
+				"pass one of these total argument counts, including the receiver: ".concat(
+					expected,
+				),
+			)
 		Check.DuplicateRecordType(_, previous):
 			note = match previous:
 				Check.SourceTypeDeclaration(span):
 					Some(TypeDeclaration(span))
-				Check.PreludeTypeDeclaration(_):
-					None
 
 			{ rendered(
 				error.span,
 				"duplicate type name",
-				"give record, union and prelude types distinct names",
+				"give record and union types distinct names",
 			) |
 				note = note
 			}
@@ -236,8 +288,8 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 				error.span,
 				"duplicate union type name",
 				(
-					"give union types distinct names; Int, Float, String and Void are declared by the "
-					+ "prelude"
+					"give union types distinct names; foundational types are declared by the base "
+					+ "module"
 				),
 			)
 		Check.DuplicateTypeParameter(_, _, _):
@@ -287,10 +339,7 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 			rendered(
 				error.span,
 				"unknown type",
-				(
-					"use Int, Float, String, Void, a declared type parameter, or a fixed union declared in "
-					+ "this "
-				).concat("file"),
+				"declare or import this type; builtin types and declared type parameters are also available",
 			)
 		Check.NonApplicableType(_):
 			rendered(
@@ -307,8 +356,26 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 		Check.MainHasParameters(_):
 			rendered(
 				error.span,
-				"main cannot have a parameter",
-				"declare main() -> Int: with no parameters",
+				"main accepts at most one parameter",
+				"declare main() -> Int: or main(arguments: List[String]) -> Int:",
+			)
+		Check.MainParameterType:
+			rendered(
+				error.span,
+				"main parameter must have type List[String]",
+				"declare main() -> Int: or main(arguments: List[String]) -> Int:",
+			)
+		Check.ListTypeArgumentCount:
+			rendered(
+				error.span,
+				"List requires one type argument",
+				"write List[String] for a list of Strings",
+			)
+		Check.UnsupportedListElement:
+			rendered(
+				error.span,
+				"List currently supports only String elements",
+				"use List[String]; other concrete element types are not supported yet",
 			)
 		Check.DuplicateParameter(_, _):
 			rendered(error.span, "duplicate parameter name", "give each parameter a distinct name")
@@ -332,23 +399,43 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 						"unknown imported function",
 						"select a function declared directly in that module; imports are not reexported",
 					)
-				UnsupportedTypeImport(_, _):
+				RepeatedImportedFunction(_, previous):
+					{ rendered(
+						error.span,
+						"function selected more than once",
+						"list each selected function once",
+					) |
+						note = Some(PreviousDeclaration(previous))
+					}
+				AmbiguousImportSelection(_, _):
 					rendered(
 						error.span,
-						"type imports require an explicit selector",
-						(
-							"write Option(Some, None) to import constructors, or Option() to import only the "
-							+ "type"
-						),
+						"import selection names both a type and a function",
+						"rename the function or select through a module with an unambiguous surface",
+					)
+				MissingImportedType(_, _):
+					rendered(
+						error.span,
+						"unknown imported type",
+						"select a type declared or ordinarily imported by that module",
+					)
+				AmbiguousImportedType(_, _):
+					rendered(
+						error.span,
+						"ambiguous imported type",
+						"give distinct type declarations distinct names",
+					)
+				MethodTypeNotVisible(_):
+					rendered(
+						error.span,
+						"method receiver type is not independently visible",
+						"import the exact type with an ordinary type selection before using methods_only",
 					)
 				MissingImportedUnion(_):
 					rendered(
 						error.span,
 						"unknown imported union",
-						(
-							"select a fixed union declared directly in that module; imports are not "
-							+ "reexported"
-						),
+						"select a fixed union declared or ordinarily imported by that module",
 					)
 				AmbiguousImportedUnion(_):
 					rendered(
@@ -424,7 +511,10 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 			rendered(
 				error.span,
 				"builtin result must be an ordinary union",
-				"return an ordinary two-variant union and bind the constructors required by this operation",
+				(
+					"return an ordinary two-variant union and bind the constructors required by this "
+					+ "operation"
+				),
 			)
 		Check.BuiltinRoleNotInResult(_, _):
 			rendered(
@@ -555,12 +645,6 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 					"concrete types",
 				),
 			)
-		Check.VariantPreludeConflict(_):
-			rendered(
-				error.span,
-				"variant name conflicts with a prelude function",
-				"give functions and union variants distinct names",
-			)
 		Check.ConstructorUFCS(_):
 			rendered(
 				error.span,
@@ -571,7 +655,10 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 			rendered(
 				error.span,
 				"unknown function",
-				"declare the called function in this file or the explicit prelude",
+				(
+					"declare the function locally or import it by name; type selections enable "
+					+ "receiver calls only"
+				),
 			)
 		Check.ArgumentTypeMismatch(mismatch):
 			type_diagnostic(
@@ -719,6 +806,60 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 			render_fault(error.span, invariant)
 
 
+private pure func method_diagnostic(
+	span: Span,
+	sites: List[Check.MethodCandidateSite],
+	message: String,
+	help: String,
+) -> Diagnostic:
+	var locations: List[Span] = []
+
+	for site in sites:
+		locations = locations.append(site.declaration)
+
+		match site.import_site:
+			Some(import_site):
+				locations = locations.append(import_site)
+			None:
+				void
+
+	{ rendered(span, message, help) | note = Some(CompetingDeclarations(locations)) }
+
+
+private pure func builtin_spelling(
+	value: Check.TypeRef,
+	context: ParsedContents,
+	span: Span,
+) -> Result[String, Diagnostic]:
+	var name: Option[NameId] = None
+
+	for declaration in context.builtin_types:
+		selected = match declaration.declaration:
+			IntegerBuiltin(_): Check.same_type(value, Check.IntType)
+			FloatBuiltin(_): Check.same_type(value, Check.FloatType)
+			StringBuiltin(_): Check.same_type(value, Check.StringType)
+			VoidBuiltin(_): Check.same_type(value, Check.VoidType)
+			ListBuiltin(_):
+				match value:
+					Check.ListType(_): True
+					_: False
+		if selected:
+			name = Some(builtin_type_name(declaration.declaration).id)
+			break
+
+	match name:
+		Some(name):
+			parsed_spelling(name, context.names, span)
+		None:
+			Err(
+				rendered(
+					span,
+					"missing builtin type declaration",
+					"report this compiler error with the input program",
+				),
+			)
+
+
 private pure func parameter_spelling(
 	id: Check.TypeParameterId,
 	context: ParsedContents,
@@ -763,13 +904,22 @@ private pure func type_spelling(
 				.to_result(render_fault(span, Check.InvalidRecordDeclaration(id)))
 			parsed_spelling(declaration.type_name.id, context.names, span)
 		Check.IntType:
-			parsed_spelling(prelude_names(context.prelude).special.integer, context.names, span)
+			builtin_spelling(Check.IntType, context, span)
 		Check.FloatType:
-			parsed_spelling(prelude_names(context.prelude).special.float, context.names, span)
+			builtin_spelling(Check.FloatType, context, span)
 		Check.VoidType:
-			parsed_spelling(prelude_names(context.prelude).special.unit, context.names, span)
+			builtin_spelling(Check.VoidType, context, span)
 		Check.StringType:
-			parsed_spelling(prelude_names(context.prelude).special.string, context.names, span)
+			builtin_spelling(Check.StringType, context, span)
+		Check.ListType(element):
+			name ?= builtin_spelling(value, context, span)
+			child ?= type_spelling(element, context, span)
+			Ok(
+				name
+					.concat("[")
+					.concat(child)
+					.concat("]"),
+			)
 		Check.ParameterType(id):
 			parameter_spelling(id, context, span)
 		Check.UnionType(id):

@@ -1,12 +1,11 @@
 import:
-	./prelude: CheckedPrelude, prelude_names
 	float as FloatOps
 	int as IntOps
 	list: reverse
 	names: NameId, NameTable, intern_name, program_names, same_name_table
 	option: is_some, to_result
 	result: and_then
-	source: COMPILER_SOURCE, ModuleId, module_number, module_source, root_module_id, same_source
+	source: COMPILER_SOURCE, ModuleId, ModuleKind(FoundationTypesModule, FoundationPreludeModule, LibraryModule, UserModule), module_number, module_source, root_module_id, same_source
 	string as StringOps: index_of
 	syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
@@ -22,18 +21,16 @@ import:
 		LexedProgram,
 		ParsedBinding,
 		ParsedBody(ParsedBuiltinBody, ParsedValueBody, ParsedMatchBody),
-		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin),
+		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
 		ParsedFunction,
 		ParsedMatchArm,
 		ParsedParameter,
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
-		ParsedPrelude,
 		ParsedRecord,
 		ParsedRecordField,
-		ParsedRuntimeFunction,
 		ParsedRuntimeOperation(
 			IntegerAddBuiltin, IntegerToStringBuiltin, StringLengthBuiltin, StringPrintBuiltin,
-			StringParseIntBuiltin, IoReadLineBuiltin, StringEqualsBuiltin, IntegerSubtractBuiltin,
+			StringParseIntBuiltin, ListLengthBuiltin, ListGetBuiltin, StringEqualsBuiltin, IntegerEqualsBuiltin, IntegerSubtractBuiltin,
 			IntegerMultiplyBuiltin, IntegerDivideBuiltin, IntegerRemainderBuiltin,
 			FloatAddBuiltin, FloatSubtractBuiltin, FloatMultiplyBuiltin, FloatDivideBuiltin,
 			FloatRemainderBuiltin, FloatToStringBuiltin, StringParseFloatBuiltin,
@@ -66,7 +63,9 @@ private fixed record ParserState {
 
 fixed record ParsedContents {
 	names: NameTable,
-	prelude: CheckedPrelude,
+	entrypoint: NameId,
+	foundation: FoundationModules,
+	builtin_types: List[ParsedBuiltinDeclaration],
 	modules: List[ParsedModuleRow],
 	functions: List[ParsedFunction],
 	unions: List[ParsedUnion],
@@ -87,8 +86,9 @@ fixed record ModulePath {
 
 
 fixed union ImportSelection:
-	FunctionSelection(WrittenName)
-	UnionSelection(WrittenName, List[WrittenName])
+	NamedSelection(WrittenName)
+	ConstructorSelection(WrittenName, List[WrittenName])
+	MethodsOnlySelection(WrittenName, Span)
 
 
 fixed record ParsedImport {
@@ -105,8 +105,21 @@ fixed record ModuleImport {
 }
 
 
+fixed record FoundationModules {
+	types: ModuleId,
+	prelude: ModuleId
+}
+
+
+fixed record ParsedBuiltinDeclaration {
+	module: ModuleId,
+	declaration: ParsedBuiltinType
+}
+
+
 fixed record ParsedModuleRow {
 	module: ModuleId,
+	role: ModuleKind,
 	imports: List[ModuleImport],
 	end: Span
 }
@@ -117,6 +130,7 @@ private fixed record ParsedModuleContents {
 	names: NameTable,
 	module: ModuleId,
 	imports: List[ParsedImport],
+	builtin_types: List[ParsedBuiltinType],
 	functions: List[ParsedFunction],
 	unions: List[ParsedUnion],
 	records: List[ParsedRecord],
@@ -129,7 +143,8 @@ opaque type ParsedModule = ParsedModuleContents
 
 private fixed record ProgramBuilder {
 	names: NameTable,
-	prelude: CheckedPrelude,
+	entrypoint: NameId,
+	builtin_types: List[ParsedBuiltinDeclaration],
 	modules: List[ParsedModuleRow],
 	functions: List[ParsedFunction],
 	unions: List[ParsedUnion],
@@ -139,7 +154,7 @@ private fixed record ProgramBuilder {
 
 opaque type ParsedAssembly = ProgramBuilder
 
--- Parsing carries its accepted prelude authority with its complete name table.
+-- All module syntax shares one complete spelling authority per compilation.
 opaque type ParsedProgram = ParsedContents
 
 
@@ -2091,7 +2106,7 @@ private pure func consume_word(state: ParserState, word: String) -> Result[Parse
 				Text
 					.concat("expected '", word)
 					.concat("'"),
-				"use the temporary prelude declaration syntax",
+				"use the ordinary declaration syntax, such as type Int = builtin or builtin(\"int.add\")",
 			),
 		)
 
@@ -2100,6 +2115,12 @@ private fixed record BuiltinTypeResult {
 	declaration: ParsedBuiltinType,
 	next: ParserState
 }
+
+
+private pure func consume_list_parameter(state: ParserState) -> Result[ParserState, Diagnostic]:
+	opened ?= consume_symbol(state, LeftBracket, "List requires one type parameter", "write type List[T] = builtin")
+	parameter ?= consume_name(opened, "expected the List type parameter")
+	consume_symbol(parameter.next, RightBracket, "List requires exactly one type parameter", "write type List[T] = builtin")
 
 
 private pure func consume_builtin_type(start: ParserState) -> Result[BuiltinTypeResult, Diagnostic]:
@@ -2111,6 +2132,7 @@ private pure func consume_builtin_type(start: ParserState) -> Result[BuiltinType
 		or at_word(after_type, "Float")
 		or at_word(after_type, "String")
 		or at_word(after_type, "Void")
+		or at_word(after_type, "List")
 	):
 		Ok(void)
 	else:
@@ -2118,20 +2140,26 @@ private pure func consume_builtin_type(start: ParserState) -> Result[BuiltinType
 			expected(
 				after_type,
 				"unknown builtin type",
-				"declare type Int = builtin, type Float = builtin, type String = builtin or type Void = builtin",
+				"declare type Int = builtin, type Float = builtin, type String = builtin, type Void = builtin or type List[T] = builtin",
 			),
 		)
 
 	name ?= consume_name(after_type, "expected a builtin type name")
+	after_name ?= if at_word(after_type, "List"):
+		consume_list_parameter(name.next)
+	else:
+		Ok(name.next)
 	equals ?= consume_symbol(
-		name.next,
+		after_name,
 		Equals,
 		"expected '=' after the builtin type name",
-		"write type Int = builtin, type Float = builtin, type String = builtin or type Void = builtin",
+		"write type Int = builtin, type Float = builtin, type String = builtin, type Void = builtin or type List[T] = builtin",
 	)
 	end ?= consume_word(equals, "builtin")
 
-	declaration = if integer:
+	declaration = if at_word(after_type, "List"):
+		ListBuiltin(name.name)
+	else if integer:
 		IntegerBuiltin(name.name)
 	else if at_word(after_type, "Float"):
 		FloatBuiltin(name.name)
@@ -2147,39 +2175,12 @@ private pure func consume_builtin_type(start: ParserState) -> Result[BuiltinType
 	})
 
 
-private fixed record RuntimeFunctionResult {
-	function: ParsedRuntimeFunction,
-	next: ParserState
-}
-
-
-private pure func consume_runtime_function(
-	start: ParserState,
-) -> Result[RuntimeFunctionResult, Diagnostic]:
-	header ?= consume_header(start)
-	body ?= consume_builtin_body(header.next)
-
-	match body.body:
-		ParsedBuiltinBody(operation, span):
-			Ok({
-				function = { header = header.header, operation = operation, span = span },
-				next = body.next,
-			})
-		_:
-			Err(
-				expected(
-					header.next,
-					"expected a builtin body",
-					"use builtin with one quoted operation label",
-				),
-			)
-
-
 private fixed union UnionBuiltinKind:
 	IntegerParseRoles
 	FloatParseRoles
-	LineReadRoles
+	ListGetRoles
 	StringEqualityRoles
+	IntegerEqualityRoles
 
 
 private fixed record BuiltinOperationResult {
@@ -2189,9 +2190,8 @@ private fixed record BuiltinOperationResult {
 
 
 private BUILTIN_LABEL_HELP: String = (
-	"use int.add, int.subtract, int.multiply, int.divide, int.remainder, int."
-	+ "to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals or io."
-	+ "read_line"
+	"use int.equals, int.add, int.subtract, int.multiply, int.divide, int.remainder, int."
+	+ "to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals, list.length or list.get"
 )
 
 
@@ -2219,10 +2219,12 @@ private pure func consume_builtin_roles(
 			StringParseFloatBuiltin(present.name, absent.name)
 		IntegerParseRoles:
 			StringParseIntBuiltin(present.name, absent.name)
-		LineReadRoles:
-			IoReadLineBuiltin(present.name, absent.name)
+		ListGetRoles:
+			ListGetBuiltin(present.name, absent.name)
 		StringEqualityRoles:
 			StringEqualsBuiltin(present.name, absent.name)
+		IntegerEqualityRoles:
+			IntegerEqualsBuiltin(present.name, absent.name)
 
 	Ok({
 		operation = operation,
@@ -2257,11 +2259,13 @@ private pure func consume_builtin_body(start: ParserState) -> Result[BodyResult,
 				)
 			else if Text.equals(spelling, "string.parse_float"):
 				consume_builtin_roles(shifted(opened, 1), FloatParseRoles)
-			else if Text.equals(spelling, "io.read_line"):
+			else if Text.equals(spelling, "list.get"):
 				consume_builtin_roles(
 					shifted(opened, 1),
-					LineReadRoles,
+					ListGetRoles,
 				)
+			else if Text.equals(spelling, "int.equals"):
+				consume_builtin_roles(shifted(opened, 1), IntegerEqualityRoles)
 			else if Text.equals(spelling, "string.equals"):
 				consume_builtin_roles(
 					shifted(opened, 1),
@@ -2297,6 +2301,8 @@ private pure func consume_builtin_body(start: ParserState) -> Result[BodyResult,
 					Ok(FloatRemainderBuiltin)
 				else if Text.equals(spelling, "float.to_string"):
 					Ok(FloatToStringBuiltin)
+				else if Text.equals(spelling, "list.length"):
+					Ok(ListLengthBuiltin)
 				else if Text.equals(spelling, "string.length"):
 					Ok(StringLengthBuiltin)
 				else:
@@ -2325,86 +2331,6 @@ private pure func consume_builtin_body(start: ParserState) -> Result[BodyResult,
 		body = ParsedBuiltinBody(operation.operation, label.span),
 		next = closed,
 	})
-
-
--- Prelude parsing uses the same tokens, headers and name authority as programs.
--- Only this entrypoint admits compiler-known type declarations.
-pure func parse_prelude(input: LexedProgram) -> Result[ParsedPrelude, Diagnostic]:
-	seed = program_names()
-	var state: ParserState = {
-		input = input,
-		position = 0,
-		names = seed.names
-	}
-	var types: List[ParsedBuiltinType] = []
-	var functions: List[ParsedRuntimeFunction] = []
-	var failure: Option[Diagnostic] = None
-
-	while IntOps.less_than(state.position, input.tokens.length()):
-		if at_symbol(state, AtSign):
-			failure = Some(
-				expected(
-					state,
-					"function annotations are not allowed in the prelude",
-					"put @tail_recursive on a program function",
-				),
-			)
-			break
-		else if at_word(state, "type"):
-			match consume_builtin_type(state):
-				Err(error):
-					failure = Some(error)
-					break
-				Ok(parsed):
-					types = types.append(parsed.declaration)
-					state = parsed.next
-		else if at_symbol(state, FunctionKeyword) or at_symbol(state, PureKeyword):
-			match consume_runtime_function(state):
-				Err(error):
-					failure = Some(error)
-					break
-				Ok(parsed):
-					functions = functions.append(parsed.function)
-					state = parsed.next
-		else:
-			failure = Some(
-				expected(
-					state,
-					"expected a builtin prelude declaration",
-					Text.concat(
-						"declare type Int = builtin, type Float = builtin, type String = builtin, type Void = builtin, ",
-						"or a function with a builtin(...) body",
-					),
-				),
-			)
-			break
-
-		if IntOps.equals(state.position, input.tokens.length()):
-			break
-
-		match consume_symbol(
-			state,
-			Newline,
-			"expected a newline after the prelude declaration",
-			"put each prelude declaration on its own line",
-		):
-			Err(error):
-				failure = Some(error)
-				break
-			Ok(next):
-				state = next
-
-	match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok({
-				names = state.names,
-				main = seed.main,
-				types = types,
-				functions = functions,
-				end = input.end,
-			})
 
 
 private pure func shifted(state: ParserState, count: Int) -> ParserState:
@@ -2530,7 +2456,7 @@ private pure func consume_import_symbol(
 	if at_symbol(state, Star):
 		Err(expected(state, "wildcard imports are not supported", "list the functions you need, such as ./helper: answer"))
 	else:
-		name ?= consume_name(state, "expected an imported function or union name")
+		name ?= consume_name(state, "expected an imported function or type name")
 
 		if at_word(name.next, "as"):
 			Err(expected(name.next, "import aliases are not supported yet", "select the function by its declared name, such as ./helper: answer"))
@@ -2576,14 +2502,28 @@ private pure func consume_import_symbol(
 				"expected ')' after selected constructors",
 				"write Option(Some, None) or Option() on one line",
 			)
+			modifier ?= if at_word(closed, "methods_only"):
+				Err(expected(closed, "constructor selection cannot be combined with methods_only", "write Foo(First) to import the type and constructors, or Foo methods_only to import only methods"))
+			else:
+				Ok(void)
 			Ok({
-				selection = UnionSelection(name.name, variants),
+				selection = ConstructorSelection(name.name, variants),
 				span = { name.name.span | end = end.end },
 				next = closed,
 			})
+		else if at_word(name.next, "methods_only"):
+			modifier = parser_span(name.next)
+			after_modifier = shifted(name.next, 1)
+			valid ?= if at_symbol(after_modifier, LeftParen):
+				Err(expected(after_modifier, "methods_only cannot include constructor selection", "write Foo(First) to import the type and constructors, or Foo methods_only to import only methods"))
+			else if at_word(after_modifier, "methods_only"):
+				Err(expected(after_modifier, "methods_only must appear once after a type name", "write ops: Foo methods_only without constructors or another modifier"))
+			else:
+				Ok(void)
+			Ok({ selection = MethodsOnlySelection(name.name, modifier), span = { name.name.span | end = modifier.end }, next = after_modifier })
 		else:
 			Ok({
-				selection = FunctionSelection(name.name),
+				selection = NamedSelection(name.name),
 				span = name.name.span,
 				next = name.next,
 			})
@@ -2691,10 +2631,12 @@ private pure func consume_import_block(start: ParserState) -> Result[ImportBlock
 			Ok({ imports = imports, next = state })
 
 
-pure func begin_program(prelude: CheckedPrelude) -> ParsedAssembly:
+pure func begin_program() -> ParsedAssembly:
+	seed = program_names()
 	into_opaque ParsedAssembly({
-			names = prelude_names(prelude).names,
-			prelude = prelude,
+			names = seed.names,
+			entrypoint = seed.main,
+			builtin_types = [],
 			modules = [],
 			functions = [],
 			unions = [],
@@ -2714,6 +2656,14 @@ pure func module_imports(parsed: ParsedModule) -> List[ParsedImport]:
 	from_opaque ParsedModule(parsed).imports
 
 
+pure func module_builtin_types(parsed: ParsedModule) -> List[ParsedBuiltinType]:
+	from_opaque ParsedModule(parsed).builtin_types
+
+
+pure func module_functions(parsed: ParsedModule) -> List[ParsedFunction]:
+	from_opaque ParsedModule(parsed).functions
+
+
 private pure func bundle_error(message: String) -> Diagnostic:
 	{
 		span = { source = COMPILER_SOURCE, start = 0, end = 0 },
@@ -2727,6 +2677,7 @@ pure func append_module(
 	assembly: ParsedAssembly,
 	parsed: ParsedModule,
 	targets: List[ModuleId],
+	role: ModuleKind,
 ) -> Result[ParsedAssembly, Diagnostic]:
 	builder = from_opaque ParsedAssembly(assembly)
 	contents = from_opaque ParsedModule(parsed)
@@ -2759,11 +2710,17 @@ pure func append_module(
 		None:
 			Ok(void)
 
+	var builtin_types = builder.builtin_types
+	for declaration in contents.builtin_types:
+		builtin_types = builtin_types.append({ module = contents.module, declaration = declaration })
+
 	Ok(into_opaque ParsedAssembly({
 				names = contents.names,
-				prelude = builder.prelude,
+				entrypoint = builder.entrypoint,
+				builtin_types = builtin_types,
 				modules = builder.modules.append({
 					module = contents.module,
+					role = role,
 					imports = imports,
 					end = contents.end,
 				}),
@@ -2790,22 +2747,41 @@ pure func seal_program(assembly: ParsedAssembly) -> Result[ParsedProgram, Diagno
 	else:
 		Err(bundle_error("source bundle is missing an imported module"))
 
+	var types: Option[ModuleId] = None
+	var prelude: Option[ModuleId] = None
+	var role_error: Option[Diagnostic] = None
+	for row in builder.modules:
+		match row.role:
+			FoundationTypesModule:
+				if types.is_some():
+					role_error = Some({ bundle_error("source bundle has more than one foundation types module") | span = row.end })
+				types = Some(row.module)
+			FoundationPreludeModule:
+				if prelude.is_some():
+					role_error = Some({ bundle_error("source bundle has more than one foundation prelude module") | span = row.end })
+				prelude = Some(row.module)
+			LibraryModule | UserModule:
+				void
+	roles ?= match role_error:
+		Some(error): Err(error)
+		None: Ok(void)
+	types_id ?= types.to_result({ bundle_error("source bundle has no foundation types module") | span = root.end })
+	prelude_id ?= prelude.to_result({ bundle_error("source bundle has no foundation prelude module") | span = root.end })
+	root_role ?= match root.role:
+		UserModule: Ok(void)
+		_: Err({ bundle_error("source bundle root must be a user module") | span = root.end })
+
 	Ok(into_opaque ParsedProgram({
 				names = builder.names,
-				prelude = builder.prelude,
+				entrypoint = builder.entrypoint,
+				foundation = { types = types_id, prelude = prelude_id },
+				builtin_types = builder.builtin_types,
 				modules = builder.modules,
 				functions = builder.functions,
 				unions = builder.unions,
 				records = builder.records,
 				end = root.end
 			}))
-
-
-pure func parse(input: LexedProgram, prelude: CheckedPrelude) -> Result[ParsedProgram, Diagnostic]:
-	assembly = begin_program(prelude)
-	parsed ?= parse_module(input, root_module_id(), assembly_names(assembly))
-	linked ?= append_module(assembly, parsed, [])
-	seal_program(linked)
 
 
 pure func parse_module(
@@ -2829,18 +2805,20 @@ pure func parse_module(
 		names = names
 	}
 	var imports: List[ParsedImport] = []
+	var builtin_types: List[ParsedBuiltinType] = []
 	var functions: List[ParsedFunction] = []
 	var unions: List[ParsedUnion] = []
 	var records: List[ParsedRecord] = []
 	var failure: Option[Diagnostic] = None
 
-	while True:
+	while IntOps.less_than(state.position, input.tokens.length()):
 		if (
 			at_word(state, "import")
 			and ((
 				not IntOps.equals(functions.length(), 0)
 				or not IntOps.equals(unions.length(), 0)
 				or not IntOps.equals(records.length(), 0)
+				or not IntOps.equals(builtin_types.length(), 0)
 			))
 		):
 			failure = Some(
@@ -2862,6 +2840,14 @@ pure func parse_module(
 				Ok(block):
 					imports = imports.concat(block.imports)
 					state = block.next
+		else if at_word(state, "type"):
+			match consume_builtin_type(state):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(parsed):
+					builtin_types = builtin_types.append(parsed.declaration)
+					state = parsed.next
 		else if at_word(state, "private"):
 			failure = Some(expected(state, "private declarations are not supported yet", "omit private; local module declarations are public by default"))
 			break
@@ -2919,6 +2905,7 @@ pure func parse_module(
 						base_names = names,
 						module = module,
 						imports = imports,
+						builtin_types = builtin_types,
 						names = state.names,
 						functions = functions,
 						unions = unions,

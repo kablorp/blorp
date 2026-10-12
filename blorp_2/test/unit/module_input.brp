@@ -1,18 +1,44 @@
 import:
 	../../src/lex: lex
 	../../src/parse:
-		ParsedAssembly,
-		ParsedProgram,
-		append_module,
-		assembly_names,
-		begin_program,
-		parse_module,
-		seal_program,
-	../../src/source: COMPILER_SOURCE, ModuleId, module_id, module_source
-	../../src/syntax: Diagnostic
-	input: checked_prelude
+		ParsedAssembly, ParsedProgram,
+		append_module, assembly_names, begin_program, parse_module, seal_program,
+	../../src/source:
+		COMPILER_SOURCE, ModuleId, ModuleKind(FoundationTypesModule, FoundationPreludeModule, UserModule),
+		module_id, module_source, root_module_id,
+	../../src/syntax: Diagnostic, LexedProgram
 	int as IntOps
 	option: to_result
+	result: and_then, map
+
+
+-- Raw downstream phase tests need only the primitive foundation contract.
+PRIMITIVE_BASE: String =
+	|type Int = builtin
+	|type Float = builtin
+	|type String = builtin
+	|type Void = builtin
+	|type List[T] = builtin
+	|
+
+
+-- Namespace tests also exercise the ordinary nominal base declarations.
+TEST_BASE: String =
+	|type Int = builtin
+	|type Float = builtin
+	|type String = builtin
+	|type Void = builtin
+	|type List[T] = builtin
+	|fixed union Bool:
+	|    True
+	|    False
+	|fixed union Option[A]:
+	|    Some(A)
+	|    None
+	|fixed union Result[Value, Error]:
+	|    Ok(Value)
+	|    Err(Error)
+	|
 
 
 fixed record ModuleInput {
@@ -25,49 +51,77 @@ private pure func invalid_identity() -> Diagnostic:
 	{
 		span = { source = COMPILER_SOURCE, start = 0, end = 0 },
 		note = None,
-		message = "invalid test module identity",
-		help = "supply nonnegative module ordinals in source inventory order"
+		message = "invalid test module inventory",
+		help = "supply module ordinals from this explicit input list and one resolved target per written import"
 	}
 
 
-private pure func append_input(assembly: ParsedAssembly, input: ModuleInput, position: Int) -> Result[ParsedAssembly, Diagnostic]:
+private pure func append_input(assembly: ParsedAssembly, input: ModuleInput, position: Int, role: ModuleKind) -> Result[ParsedAssembly, Diagnostic]:
 	module ?= module_id(position).to_result(invalid_identity())
 	tokens ?= lex(module_source(module), input.source)
 	parsed ?= parse_module(tokens, module, assembly_names(assembly))
-	var targets: List[ModuleId] = []
-	var failure: Option[Diagnostic] = None
+	var resolved: Result[List[ModuleId], Diagnostic] = Ok([])
 	for ordinal in input.targets:
-		match module_id(ordinal):
-			None:
-				failure = Some(invalid_identity())
-				break
-			Some(target):
-				targets = targets.append(target)
-	valid ?= match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(void)
-	append_module(assembly, parsed, targets)
+		resolved = resolved.and_then(pure func(targets): module_id(ordinal).to_result(invalid_identity()).map(pure func(target): targets.append(target)))
+	targets ?= resolved
+	append_module(assembly, parsed, targets, role)
 
 
--- Tests supply already resolved edges, so this helper performs no path lookup.
-pure func parse_modules(inputs: List[ModuleInput]) -> Result[ParsedProgram, Diagnostic]:
-	prelude ?= checked_prelude()
-	var assembly = begin_program(prelude)
-	var position: Int = 0
-	var failure: Option[Diagnostic] = None
+private pure func append_foundation(assembly: ParsedAssembly, position: Int, base: String) -> Result[ParsedProgram, Diagnostic]:
+	types ?= append_input(assembly, { source = base, targets = [] }, position, FoundationTypesModule)
+	prelude ?= append_input(types, { source = "", targets = [] }, IntOps.add(position, 1), FoundationPreludeModule)
+	seal_program(prelude)
+
+
+-- Already resolved edges preserve user declaration ordinals. The empty test
+-- prelude adds no operation functions; production defaults have separate e2e tests.
+pure func parse_modules_with_base(inputs: List[ModuleInput], base: String) -> Result[ParsedProgram, Diagnostic]:
+	var valid_targets = True
 	for input in inputs:
-		match append_input(assembly, input, position):
-			Err(error):
-				failure = Some(error)
-				break
-			Ok(linked):
-				assembly = linked
+		for ordinal in input.targets:
+			valid_targets = valid_targets and IntOps.greater_than_or_equal(ordinal, 0) and IntOps.less_than(ordinal, inputs.length())
+	targets ?= if valid_targets:
+		Ok(void)
+	else:
+		Err(invalid_identity())
+	var assembly: Result[ParsedAssembly, Diagnostic] = Ok(begin_program())
+	var position: Int = 0
+	for input in inputs:
+		ordinal = position
+		assembly = assembly.and_then(pure func(builder): append_input(builder, input, ordinal, UserModule))
 		position = IntOps.add(position, 1)
-	valid ?= match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(void)
-	seal_program(assembly)
+	complete ?= assembly
+	append_foundation(complete, position, base)
+
+
+pure func parse_modules(inputs: List[ModuleInput]) -> Result[ParsedProgram, Diagnostic]:
+	parse_modules_with_base(inputs, TEST_BASE)
+
+
+-- Callers select these small source inputs explicitly, together with their edges.
+INTEGER_OPERATIONS: String =
+	|pure func to_string(value: Int) -> String:
+	|    builtin("int.to_string")
+	|pure func add(left: Int, right: Int) -> Int:
+	|    builtin("int.add")
+	|
+
+
+STRING_OPERATIONS: String =
+	|pure func length(value: String) -> Int:
+	|    builtin("string.length")
+	|
+
+
+FLOAT_OPERATIONS: String =
+	|pure func to_string(value: Float) -> String:
+	|    builtin("float.to_string")
+	|
+
+
+-- Source-only phase tests have no implicit operation dependencies.
+pure func parse_root(input: LexedProgram) -> Result[ParsedProgram, Diagnostic]:
+	assembly = begin_program()
+	parsed ?= parse_module(input, root_module_id(), assembly_names(assembly))
+	root ?= append_module(assembly, parsed, [], UserModule)
+	append_foundation(root, 1, PRIMITIVE_BASE)

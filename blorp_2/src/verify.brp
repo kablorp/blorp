@@ -27,7 +27,7 @@ import:
 		ResultOwnership(UnmanagedResult, BorrowedResult, OwnedResult),
 		ReturnTransfer(UnmanagedReturn, OwnedReturn),
 		StoredPayload(UnmanagedPayload, OwnedPayload),
-		ValueOwnership(NoOwnership, ManagedStringLeaf, InlineOwnedFields),
+		ValueOwnership(NoOwnership, ManagedStringLeaf, ManagedStringListRoot, InlineOwnedFields),
 		owner_number,
 		value_ownership,
 	source: COMPILER_SOURCE
@@ -38,8 +38,9 @@ import:
 		ConcreteUnion,
 		FieldInstanceId,
 		FunctionSignature,
+		FunctionInstanceId,
 		RecordInstanceId,
-		TypeRef(VoidType, IntType, FloatType, StringType, UnionType, RecordType),
+		TypeRef(VoidType, IntType, FloatType, StringType, ListType, UnionType, RecordType),
 		UnionRepresentation(InlineUnmanaged, InlineOwningPayload),
 		VariantInstanceId,
 		field_number,
@@ -51,7 +52,7 @@ import:
 		union_number,
 		variant_number,
 		variant_owner,
-	syntax: Diagnostic, FunctionExecution(OrdinaryCalls, SelfTailLoop), Span
+	syntax: Diagnostic, Entrypoint(NoArguments, WithArguments), entry_function, FunctionExecution(OrdinaryCalls, SelfTailLoop), Span
 	text: concat
 
 
@@ -372,7 +373,7 @@ private pure func verify_argument(
 				match plan:
 					NoOwnership:
 						Ok(void)
-					ManagedStringLeaf | InlineOwnedFields(_):
+					ManagedStringLeaf | ManagedStringListRoot | InlineOwnedFields(_):
 						Err(
 							failure(
 								span,
@@ -515,6 +516,9 @@ private pure func valid_union_layout(
 						StringType:
 							owning = True
 							True
+						ListType(element):
+							owning = True
+							same_type(element, StringType)
 
 			if not valid:
 				invalid = Some(
@@ -847,7 +851,7 @@ private pure func verify_definition(
 									"unmanaged value carries an ownership obligation",
 								),
 							)
-				ManagedStringLeaf | InlineOwnedFields(_):
+				ManagedStringLeaf | ManagedStringListRoot | InlineOwnedFields(_):
 					match definition.operation:
 						ParameterDefinition(_):
 							match definition.result:
@@ -1023,7 +1027,7 @@ private pure func verify_return(
 						Ok(state.owners)
 					Some(_):
 						Err(failure(result.span, "unmanaged return cannot transfer an owner"))
-			ManagedStringLeaf | InlineOwnedFields(_):
+			ManagedStringLeaf | ManagedStringListRoot | InlineOwnedFields(_):
 				match returned_owner:
 					None:
 						Err(failure(result.span, "managed return requires an owner transfer"))
@@ -1119,7 +1123,7 @@ private pure func verify_exit(
 						match plan:
 							NoOwnership:
 								Ok(void)
-							ManagedStringLeaf | InlineOwnedFields(_):
+							ManagedStringLeaf | ManagedStringListRoot | InlineOwnedFields(_):
 								Err(failure(span, "managed value on a recursive backedge"))
 				)
 
@@ -1161,7 +1165,7 @@ private pure func verify_loop_operations(
 				match value_ownership(definition.value_type, unions, records):
 					Err(error):
 						invalid = Some(error)
-					Ok(ManagedStringLeaf) | Ok(InlineOwnedFields(_)):
+					Ok(ManagedStringLeaf) | Ok(ManagedStringListRoot) | Ok(InlineOwnedFields(_)):
 						invalid = Some(
 							failure(
 								definition.span,
@@ -1221,7 +1225,7 @@ private pure func verify_execution(
 					Err(error):
 						invalid = Some(error)
 						break
-					Ok(ManagedStringLeaf) | Ok(InlineOwnedFields(_)):
+					Ok(ManagedStringLeaf) | Ok(ManagedStringListRoot) | Ok(InlineOwnedFields(_)):
 						invalid = Some(failure(annotation, "managed signature in a self-tail loop"))
 						break
 					Ok(NoOwnership):
@@ -1522,13 +1526,15 @@ private pure func verify_function(
 								)
 
 
--- C main calls the entry without arguments and consumes an Int. Enforcing
--- that contract here prevents a transferred managed result being discarded.
-private pure func verify_entry(entry: OwnedFunction) -> Result[Void, Diagnostic]:
-	valid = (
-		IntOps.equals(entry.signature.parameters.length(), 0)
-		and same_type(entry.signature.return_type, IntType)
-	)
+-- Independently check the accepted wrapper convention against its target signature.
+private pure func verify_entry(entry: OwnedFunction, convention: Entrypoint[FunctionInstanceId]) -> Result[Void, Diagnostic]:
+	parameters_match = match convention:
+		NoArguments(_): entry.signature.parameters.is_empty()
+		WithArguments(_):
+			match entry.signature.parameters:
+				[value]: same_type(value, ListType(StringType))
+				_: False
+	valid = parameters_match and same_type(entry.signature.return_type, IntType)
 
 	if valid:
 		Ok(void)
@@ -1549,12 +1555,12 @@ private pure func verify_entry(entry: OwnedFunction) -> Result[Void, Diagnostic]
 					end = 0
 				}
 
-		Err(failure(span, "entrypoint must take no parameters and return Int"))
+		Err(failure(span, "entrypoint signature does not match its accepted argument convention"))
 
 
 pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnostic]:
 	entry ?= program.functions
-		.get(function_number(program.entrypoint))
+		.get(function_number(entry_function(program.entrypoint)))
 		.to_result(
 			failure(
 				{
@@ -1600,6 +1606,10 @@ pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnosti
 	var current: Int = 0
 
 	for function in program.functions:
+		for value_type in function.signature.parameters.append(function.signature.return_type):
+			match value_ownership(value_type, program.unions, program.records):
+				Ok(_): void
+				Err(error): invalid = Some(error)
 		if invalid.is_some():
 			break
 
@@ -1620,5 +1630,5 @@ pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnosti
 		Some(error):
 			Err(error)
 		None:
-			valid_entry ?= verify_entry(entry)
+			valid_entry ?= verify_entry(entry, program.entrypoint)
 			Ok(into_opaque VerifiedProgram(program))

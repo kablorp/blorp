@@ -1,17 +1,16 @@
 import:
 	../../src/check as Check
 	../../src/check_render: render_failure
-	../../src/lex: lex
 	../../src/lower as Lower
-	../../src/parse: ParsedProgram, parse_prelude, parsed_contents
+	../../src/parse: ParsedProgram, parsed_contents
 	../../src/prelude as Prelude
-	../../src/source: PRELUDE_SOURCE, module_source, root_module_id, same_source
+	../../src/source: module_source, root_module_id, same_source
 	../../src/specialize as Concrete
 	../../src/syntax: Diagnostic, ExpressionBase(FloatExpression), ParsedBody(ParsedValueBody)
-	compilation: compile
+	compilation: compile, compile_modules
 	float as FloatOps
-	input: parse, setup_diagnostic
-	module_input: parse_modules
+	input: setup_diagnostic
+	module_input: parse_modules, parse_modules_with_base, PRIMITIVE_BASE, STRING_OPERATIONS
 	test: TestSuite
 
 
@@ -124,13 +123,18 @@ pure func test_remainder_uses_closed_float_contract() -> Bool:
 
 pure func test_format_selects_fresh_string_runtime() -> Bool:
 	source: String =
+		|import:
+		|    string: length
 		|pure func format_number(value: Float) -> String:
 		|    builtin("float.to_string")
 		|func main() -> Int:
 		|    length(format_number(0.1))
 		|
 
-	match compile(source):
+	match compile_modules([
+		{ source = source, targets = [1] },
+		{ source = STRING_OPERATIONS, targets = [] },
+	], PRIMITIVE_BASE):
 		Ok(output):
 			(
 				output.contains("=blorp_float_to_string(")
@@ -175,8 +179,9 @@ pure func test_integer_only_program_has_no_float_runtime() -> Bool:
 
 
 private pure func parsed_number() -> Result[ParsedProgram, Diagnostic]:
-	tokens ?= lex(module_source(root_module_id()), literal_source("-0.0"))
-	parse(tokens)
+	parse_modules([
+		{ source = literal_source("-0.0"), targets = [] },
+	])
 
 
 private pure func checked_number() -> Result[Check.CheckedProgram, Diagnostic]:
@@ -242,7 +247,7 @@ pure func test_specialization_preserves_unboxed_native_leaf() -> Bool:
 			False
 		Ok(program):
 			match Concrete.specialized_contents(program).functions:
-				[number, _]:
+				[_, number]:
 					match number.body:
 						Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
 							match value.base:
@@ -273,7 +278,7 @@ pure func test_lowering_publishes_one_float_definition() -> Bool:
 			False
 		Ok(program):
 			match Lower.lowered_functions(program).functions:
-				[number, _]:
+				[_, number]:
 					match (number.definitions, number.tail):
 						([definition], Lower.ExitValue(Lower.ReturnValue(returned))):
 							match definition.operation:
@@ -373,6 +378,7 @@ pure func test_checked_parse_roles_use_float_payload_not_int() -> Bool:
 		|pure func parse_number(text: String) -> Maybe[Float]:
 		|    builtin("string.parse_float", Full, Empty)
 		|func main() -> Int:
+		|    parsed = parse_number("1.25")
 		|    0
 		|
 
@@ -396,7 +402,7 @@ pure func test_checked_parse_roles_use_float_payload_not_int() -> Bool:
 			contents = Concrete.specialized_contents(program)
 
 			match contents.functions:
-				[parser, _]:
+				[_, parser]:
 					match parser.body:
 						Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
 							match value.base:
@@ -449,45 +455,56 @@ private BASE_TYPES: String =
 	|
 
 
-private pure func prelude_rejects(
+private pure func foundation_rejects(
 	source: String,
+	expected_kind: Prelude.BuiltinTypeErrorKind,
 	start: Int,
 	end: Int,
 	message: String,
 	help: String,
 ) -> Bool:
-	match (
-		lex(PRELUDE_SOURCE, source)
-			.and_then(pure func(tokens): parse_prelude(tokens))
-			.and_then(pure func(parsed): Prelude.check_prelude(parsed))
-	):
-		Ok(_):
-			False
-		Err(error):
-			(
-				same_source(error.span.source, PRELUDE_SOURCE)
-				and error.span.start == start
-				and error.span.end == end
-				and error.message == message
-				and error.help == help
-				and error.note.is_none()
-			)
+	root: String =
+		|func main() -> Int:
+		|    parsed = parse_number("1.25")
+		|    0
+		|
+	match parse_modules_with_base([
+		{ source = root, targets = [] },
+	], source):
+		Err(_): False
+		Ok(program):
+			match Prelude.check_builtin_types(program):
+				Ok(_): False
+				Err(failure):
+					error = Prelude.render_builtin_type_error(failure)
+					kind_matches = match (failure.kind, expected_kind):
+						(Prelude.MissingBuiltinType(Prelude.FloatType), Prelude.MissingBuiltinType(Prelude.FloatType)): True
+						(Prelude.DuplicateBuiltinType(Prelude.FloatType), Prelude.DuplicateBuiltinType(Prelude.FloatType)): True
+						_: False
+					(
+						kind_matches and same_source(error.span.source, module_source(parsed_contents(program).foundation.types))
+						and error.span.start == start and error.span.end == end
+						and error.message == message and error.help == help
+						and error.note.is_none()
+					)
 
 
-pure func test_float_prelude_role_is_required_without_fallback() -> Bool:
-	prelude_rejects(
+pure func test_float_foundation_role_is_required_without_fallback() -> Bool:
+	foundation_rejects(
 		BASE_TYPES,
+		Prelude.MissingBuiltinType(Prelude.FloatType),
 		BASE_TYPES.length(),
 		BASE_TYPES.length(),
 		"missing Float builtin declaration",
-		"add type Float = builtin to the prelude",
+		"add type Float = builtin to _base/types.brp",
 	)
 
 
-pure func test_duplicate_float_prelude_role_has_exact_occurrence() -> Bool:
+pure func test_duplicate_float_foundation_role_has_exact_occurrence() -> Bool:
 	prefix = BASE_TYPES + "type Float = builtin\n"
-	prelude_rejects(
+	foundation_rejects(
 		prefix + "type Float = builtin\n",
+		Prelude.DuplicateBuiltinType(Prelude.FloatType),
 		prefix.length() + 5,
 		prefix.length() + 10,
 		"duplicate builtin type declaration",
@@ -667,12 +684,12 @@ tests: TestSuite = {
 	description = "Blorp 2 Float producer-to-consumer boundary",
 	tests = [
 		(
-			"Float prelude role required without fallback",
-			test_float_prelude_role_is_required_without_fallback,
+			"Float foundation role required without fallback",
+			test_float_foundation_role_is_required_without_fallback,
 		),
 		(
-			"duplicate Float prelude has exact occurrence",
-			test_duplicate_float_prelude_role_has_exact_occurrence,
+			"duplicate Float foundation has exact occurrence",
+			test_duplicate_float_foundation_role_has_exact_occurrence,
 		),
 		("Float main rejected before body", test_float_main_is_rejected_before_body),
 		(

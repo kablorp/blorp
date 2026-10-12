@@ -24,9 +24,10 @@ import:
 		TypeRef(IntType, StringType, UnionType),
 		specialize,
 	../../src/string_runtime: string_runtime
-	../../src/syntax: Diagnostic, FunctionExecution(OrdinaryCalls)
+	../../src/syntax: Diagnostic, FunctionExecution(OrdinaryCalls), Entrypoint(NoArguments), entry_function
 	../../src/verify: verify
 	input: check, parse, setup_diagnostic
+	module_input: PRIMITIVE_BASE, parse_modules_with_base, ModuleInput, INTEGER_OPERATIONS
 	ownership_inputs: InputIds, input_ids, span
 	result: get_or
 	test: TestSuite
@@ -37,16 +38,15 @@ pure func test_compact_c_from_ordered_program() -> Bool:
 		|func main() -> Int:
 		|	0
 		|
-	emitted(
-		source,
-	).get_or(
+	emitted_minimal(source).get_or(
 		"",
 	) == "#include <stdint.h>\nint64_t blorp_f_0(void);int64_t blorp_f_0(void){const int64_t blorp_vl_0=INT64_C(0);(void)blorp_vl_0;return blorp_vl_0;}int main(void){return (int)blorp_f_0();}\n"
 
 
 private pure func emits_literal(spelling: String, expected: String) -> Result[Bool, Diagnostic]:
-	lexed ?= lex(module_source(root_module_id()), "func main() -> Int:\n\t" + spelling + "\n")
-	parsed ?= parse(lexed)
+	parsed ?= parse_modules_with_base([
+		{ source = "func main() -> Int:\n\t" + spelling + "\n", targets = [] },
+	], PRIMITIVE_BASE)
 	checked ?= check(parsed).map_err(setup_diagnostic)
 	lowered ?= specialize(checked).and_then(pure func(program): lower(program))
 	owned ?= own(lowered)
@@ -80,6 +80,7 @@ private pure func emits_nominal_unions() -> Result[Bool, Diagnostic]:
 		|pure func unused(value: Choice) -> Other:
 		|	Second
 		|func main() -> Int:
+		|	result = unused(First)
 		|	0
 		|
 	lexed ?= lex(module_source(root_module_id()), source)
@@ -93,7 +94,7 @@ private pure func emits_nominal_unions() -> Result[Bool, Diagnostic]:
 			verified,
 		).get_or(
 			"",
-		) == "#include <stdint.h>\nenum blorp_u_0{blorp_v_0_0,blorp_v_0_1};enum blorp_u_1{blorp_v_1_0,blorp_v_1_1};enum blorp_u_1 blorp_f_0(enum blorp_u_0 blorp_p_0);int64_t blorp_f_1(void);enum blorp_u_1 blorp_f_0(enum blorp_u_0 blorp_p_0){const enum blorp_u_0 blorp_vl_0=blorp_p_0;(void)blorp_vl_0;const enum blorp_u_1 blorp_vl_1=blorp_v_1_1;(void)blorp_vl_1;return blorp_vl_1;}int64_t blorp_f_1(void){const int64_t blorp_vl_0=INT64_C(0);(void)blorp_vl_0;return blorp_vl_0;}int main(void){return (int)blorp_f_1();}\n",
+		) == "#include <stdint.h>\nenum blorp_u_0{blorp_v_0_0,blorp_v_0_1};enum blorp_u_1{blorp_v_1_0,blorp_v_1_1};int64_t blorp_f_0(void);enum blorp_u_0 blorp_f_1(enum blorp_u_1 blorp_p_0);int64_t blorp_f_0(void){const enum blorp_u_1 blorp_vl_0=blorp_v_1_0;(void)blorp_vl_0;const enum blorp_u_0 blorp_vl_1=blorp_f_1(blorp_vl_0);(void)blorp_vl_1;const int64_t blorp_vl_2=INT64_C(0);(void)blorp_vl_2;return blorp_vl_2;}enum blorp_u_0 blorp_f_1(enum blorp_u_1 blorp_p_0){const enum blorp_u_1 blorp_vl_0=blorp_p_0;(void)blorp_vl_0;const enum blorp_u_0 blorp_vl_1=blorp_v_0_1;(void)blorp_vl_1;return blorp_vl_1;}int main(void){return (int)blorp_f_0();}\n",
 	)
 
 
@@ -111,20 +112,34 @@ private pure func emitted(source: String) -> Result[String, Diagnostic]:
 	emit(verified)
 
 
+private pure func emitted_modules(inputs: List[ModuleInput]) -> Result[String, Diagnostic]:
+	parsed ?= parse_modules_with_base(inputs, PRIMITIVE_BASE)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	lowered ?= specialize(checked).and_then(pure func(program): lower(program))
+	owned ?= own(lowered)
+	verified ?= verify(owned)
+	emit(verified)
+
+
 pure func test_mixed_call_arguments_preserve_order_and_value_identity() -> Bool:
 	source: String =
+		|import:
+		|	int: Int
 		|pure func select(first: String, second: Int, third: String, fourth: Int) -> Int:
 		|	fourth
 		|func main() -> Int:
 		|	select(7.to_string(), 11, 9.to_string(), 13)
 		|
 
-	match emitted(source):
+	match emitted_modules([
+		{ source = source, targets = [1] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+	]):
 		Err(_):
 			False
 		Ok(code):
 			code.contains(
-				"const int64_t blorp_vl_6=blorp_f_0(blorp_vl_1,blorp_vl_2,blorp_vl_4,blorp_vl_5);",
+				"const int64_t blorp_vl_6=blorp_f_2(blorp_vl_1,blorp_vl_2,blorp_vl_4,blorp_vl_5);",
 			)
 
 
@@ -144,7 +159,7 @@ pure func test_payload_match_saves_scrutinee_and_extracts_inside_case() -> Bool:
 		source,
 	).get_or(
 		"",
-	) == "#include <stdint.h>\nenum blorp_tag_0{blorp_v_0_0,blorp_v_0_1};struct blorp_u_0{enum blorp_tag_0 tag;union{int64_t blorp_up_1;}payload;};int64_t blorp_f_0(struct blorp_u_0 blorp_p_0);int64_t blorp_f_1(void);int64_t blorp_f_0(struct blorp_u_0 blorp_p_0){const struct blorp_u_0 blorp_vl_0=blorp_p_0;(void)blorp_vl_0;switch(blorp_vl_0.tag){case blorp_v_0_0:{const int64_t blorp_vl_1=INT64_C(0);(void)blorp_vl_1;return blorp_vl_1;}case blorp_v_0_1:default:{const int64_t blorp_vl_2=blorp_vl_0.payload.blorp_up_1;(void)blorp_vl_2;return blorp_vl_2;}}}int64_t blorp_f_1(void){const int64_t blorp_vl_0=INT64_C(42);(void)blorp_vl_0;const struct blorp_u_0 blorp_vl_1=((struct blorp_u_0){.tag=blorp_v_0_1,.payload.blorp_up_1=blorp_vl_0});(void)blorp_vl_1;const int64_t blorp_vl_2=blorp_f_0(blorp_vl_1);(void)blorp_vl_2;return blorp_vl_2;}int main(void){return (int)blorp_f_1();}\n"
+	) == "#include <stdint.h>\nenum blorp_tag_0{blorp_v_0_0,blorp_v_0_1};struct blorp_u_0{enum blorp_tag_0 tag;union{int64_t blorp_up_1;}payload;};int64_t blorp_f_0(void);int64_t blorp_f_1(struct blorp_u_0 blorp_p_0);int64_t blorp_f_0(void){const int64_t blorp_vl_0=INT64_C(42);(void)blorp_vl_0;const struct blorp_u_0 blorp_vl_1=((struct blorp_u_0){.tag=blorp_v_0_1,.payload.blorp_up_1=blorp_vl_0});(void)blorp_vl_1;const int64_t blorp_vl_2=blorp_f_1(blorp_vl_1);(void)blorp_vl_2;return blorp_vl_2;}int64_t blorp_f_1(struct blorp_u_0 blorp_p_0){const struct blorp_u_0 blorp_vl_0=blorp_p_0;(void)blorp_vl_0;switch(blorp_vl_0.tag){case blorp_v_0_0:{const int64_t blorp_vl_1=INT64_C(0);(void)blorp_vl_1;return blorp_vl_1;}case blorp_v_0_1:default:{const int64_t blorp_vl_2=blorp_vl_0.payload.blorp_up_1;(void)blorp_vl_2;return blorp_vl_2;}}}int main(void){return (int)blorp_f_0();}\n"
 
 
 pure func test_scalar_whole_capture_saves_value_and_owns_default() -> Bool:
@@ -156,6 +171,7 @@ pure func test_scalar_whole_capture_saves_value_and_owns_default() -> Bool:
 		|	match value:
 		|		captured: captured
 		|func main() -> Int:
+		|	result = copy(First)
 		|	0
 		|
 
@@ -316,7 +332,7 @@ pure func test_verified_operations_emit_allocation_borrow_then_drop() -> Bool:
 				{
 					records = [],
 					unions = [],
-					entrypoint = ids.entrypoint,
+					entrypoint = NoArguments(ids.entrypoint),
 					functions = [
 						main_function(
 							[
@@ -349,7 +365,7 @@ pure func test_borrowed_parameter_return_emits_retain_and_owner_transfer() -> Bo
 				{
 					records = [],
 					unions = [],
-					entrypoint = ids.entrypoint,
+					entrypoint = NoArguments(ids.entrypoint),
 					functions = [
 						main_function([integer_definition(ids.first, 0, 10)], ids.first),
 						borrowed_identity(ids),
@@ -396,7 +412,7 @@ pure func test_acquire_emits_value_retain_before_old_owner_drop_and_transfer() -
 				{
 					records = [],
 					unions = [],
-					entrypoint = ids.entrypoint,
+					entrypoint = NoArguments(ids.entrypoint),
 					functions = [
 						main_function([integer_definition(ids.first, 0, 1)], ids.first),
 						helper,
@@ -425,7 +441,7 @@ pure func test_independent_owner_drops_emit_each_exact_operand_once() -> Bool:
 				{
 					records = [],
 					unions = [],
-					entrypoint = ids.entrypoint,
+					entrypoint = NoArguments(ids.entrypoint),
 					functions = [
 						main_function(
 							[
@@ -461,7 +477,7 @@ pure func test_unused_owned_result_emits_immediate_release_without_retain() -> B
 				{
 					records = [],
 					unions = [],
-					entrypoint = ids.entrypoint,
+					entrypoint = NoArguments(ids.entrypoint),
 					functions = [
 						main_function(
 							[
@@ -492,7 +508,7 @@ pure func test_repeated_borrows_emit_no_redundant_retain_or_release() -> Bool:
 				{
 					records = [],
 					unions = [],
-					entrypoint = ids.entrypoint,
+					entrypoint = NoArguments(ids.entrypoint),
 					functions = [
 						main_function(
 							[
@@ -543,7 +559,7 @@ pure func test_user_call_establishes_result_owner_before_releasing_argument_owne
 				{
 					records = [],
 					unions = [],
-					entrypoint = ids.entrypoint,
+					entrypoint = NoArguments(ids.entrypoint),
 					functions = [
 						main_function(
 							[
@@ -641,7 +657,7 @@ pure func test_raw_managed_match_transfers_inside_cases_and_caller_drops() -> Bo
 				{
 					records = [],
 					unions = ids.unions,
-					entrypoint = ids.entrypoint,
+					entrypoint = NoArguments(ids.entrypoint),
 					functions = [main, helper]
 				},
 				(
@@ -698,7 +714,7 @@ pure func test_arm_only_string_work_emits_runtime_and_exact_cleanup() -> Bool:
 				{
 					records = [],
 					unions = ids.unions,
-					entrypoint = ids.entrypoint,
+					entrypoint = NoArguments(ids.entrypoint),
 					functions = [main]
 				},
 				(
@@ -774,3 +790,15 @@ tests: TestSuite = {
 		("portable signed C literals", test_portable_signed_c_literals),
 	]
 }
+
+
+-- Formatting assertions isolate emission from the separately tested default scope.
+private pure func emitted_minimal(source: String) -> Result[String, Diagnostic]:
+	parsed ?= parse_modules_with_base([
+		{ source = source, targets = [] },
+	], PRIMITIVE_BASE)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	lowered ?= specialize(checked).and_then(pure func(program): lower(program))
+	owned ?= own(lowered)
+	verified ?= verify(owned)
+	emit(verified)

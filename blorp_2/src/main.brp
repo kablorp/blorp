@@ -9,17 +9,17 @@ import:
 	parse: ParsedProgram
 	result: map_err
 	source:
-		SourceRole(CompilerRole, PreludeRole, ModuleRole, InvalidRole), module_number, source_module,
+		SourceRole(CompilerRole, ModuleRole, InvalidRole), module_number, source_module,
 		source_role
 	specialize: specialize
 	syntax:
 		Diagnostic,
 		DiagnosticNote(
 			UnionPayloadDeclaration, TypeDeclaration, RecordFieldDeclaration, PreviousField,
-			PreviousDeclaration,
+			PreviousDeclaration, CompetingDeclarations,
 		),
 		Diagnostics, Span, singleton_diagnostic
-	system: read_file, write_file
+	system: write_file
 	text: concat, equals
 	verify: verify
 
@@ -55,8 +55,6 @@ private pure func render_location(inputs: SourceInputs, span: Span) -> Result[St
 	match source_role(span.source):
 		CompilerRole:
 			Ok("blorp_2")
-		PreludeRole:
-			Ok(render_file_location(inputs.prelude, span))
 		ModuleRole:
 			match source_module(span.source):
 				Some(id):
@@ -69,13 +67,14 @@ private pure func render_location(inputs: SourceInputs, span: Span) -> Result[St
 			Err("invalid source identity in diagnostic")
 
 
-private pure func note_span(note: DiagnosticNote) -> Span:
+private pure func note_spans(note: DiagnosticNote) -> List[Span]:
 	match note:
-		UnionPayloadDeclaration(span): span
-		TypeDeclaration(span): span
-		RecordFieldDeclaration(span): span
-		PreviousField(span): span
-		PreviousDeclaration(span): span
+		UnionPayloadDeclaration(span): [span]
+		TypeDeclaration(span): [span]
+		RecordFieldDeclaration(span): [span]
+		PreviousField(span): [span]
+		PreviousDeclaration(span): [span]
+		CompetingDeclarations(spans): spans
 
 
 private pure func note_text(note: DiagnosticNote) -> String:
@@ -85,6 +84,7 @@ private pure func note_text(note: DiagnosticNote) -> String:
 		RecordFieldDeclaration(_): ": note: record field declared here"
 		PreviousField(_): ": note: previous field written here"
 		PreviousDeclaration(_): ": note: previous declaration or import here"
+		CompetingDeclarations(_): ": note: candidate declaration or import here"
 
 
 private pure func render_diagnostic(inputs: SourceInputs, diagnostic: Diagnostic) -> Result[String, String]:
@@ -95,8 +95,18 @@ private pure func render_diagnostic(inputs: SourceInputs, diagnostic: Diagnostic
 		None:
 			Ok(message)
 		Some(note):
-			location ?= render_location(inputs, note_span(note))
-			Ok(message.concat("\n").concat(location).concat(note_text(note)))
+			var rendered = message
+			var failure: Option[String] = None
+			for span in note_spans(note):
+				match render_location(inputs, span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(location):
+						rendered = rendered.concat("\n").concat(location).concat(note_text(note))
+			match failure:
+				Some(error): Err(error)
+				None: Ok(rendered)
 
 
 pure func render_diagnostics(inputs: SourceInputs, errors: Diagnostics) -> String:
@@ -119,33 +129,15 @@ pure func render_diagnostics(inputs: SourceInputs, errors: Diagnostics) -> Strin
 
 func main(args: List[String]) -> Int:
 	match args:
-		[_, prelude_path, input_path, output_path]:
-			if equals(prelude_path, "--library-root"):
-				usage_error()
-			else:
-				compile_paths(prelude_path, input_path, output_path, None)
-		[_, "--library-root", library_root, prelude_path, input_path, output_path]:
-			compile_paths(prelude_path, input_path, output_path, Some(library_root))
+		[_, "--library-root", library_root, input_path, output_path]:
+			compile_file(input_path, output_path, library_root)
 		_:
 			usage_error()
 
 
 private func usage_error() -> Int:
-	print_error("blorp_2: error: expected optional library root, prelude, input and output paths\nhelp: run blorp_2 [--library-root DIRECTORY] PRELUDE.brp INPUT.brp OUTPUT.c")
+	print_error("blorp_2: error: expected a library root, input and output paths\nhelp: run blorp_2 --library-root DIRECTORY INPUT.brp OUTPUT.c")
 	1
-
-
-private func compile_paths(prelude_path: String, input_path: String, output_path: String, library_root: Option[String]) -> Int:
-	match read_file(prelude_path):
-		Err(error):
-			print_error(read_error(prelude_path, error))
-			1
-		Ok(contents):
-			compile_file({ path = prelude_path, contents = contents }, input_path, output_path, library_root)
-
-
-private pure func read_error(path: String, error: String) -> String:
-	"blorp_2: error: could not read ".concat(path).concat(": ").concat(error).concat("\nhelp: provide a readable input file")
 
 
 private func publish(path: String, generated_c: String) -> Int:
@@ -157,8 +149,8 @@ private func publish(path: String, generated_c: String) -> Int:
 			0
 
 
-private func compile_file(prelude: SourceFile, input_path: String, output_path: String, library_root: Option[String]) -> Int:
-	match load_program(prelude, input_path, library_root):
+private func compile_file(input_path: String, output_path: String, library_root: String) -> Int:
+	match load_program(input_path, library_root):
 		Err(failure):
 			print_error(render_diagnostics(failure.sources, singleton_diagnostic(failure.diagnostic)))
 			1

@@ -1,16 +1,22 @@
 import:
-	../../src/source: module_source, root_module_id
 	../../src/check as Checked
 	../../src/lex: lex
 	../../src/lower as Lower
 	../../src/own as Own
 	../../src/parse: parsed_contents
 	../../src/prelude as Prelude: RuntimeOperation(IntToString)
+	../../src/source: module_source, root_module_id
 	../../src/specialize as Concrete
 	../../src/syntax as Syntax
 	../../src/text: concat
 	../../src/verify: verify
-	input: check, check_failure, parse, setup_diagnostic
+	input: check, check_failure, check_modules_failure, parse, setup_diagnostic
+	module_input:
+		INTEGER_OPERATIONS,
+		ModuleInput,
+		PRIMITIVE_BASE,
+		STRING_OPERATIONS,
+		parse_modules_with_base,
 	ownership_inputs: InputIds, function, input_ids, integer, parameter, runtime, span
 	test: TestSuite
 
@@ -61,13 +67,35 @@ private pure func rejects(
 			)
 
 
+private pure func rejects_modules(
+	inputs: List[ModuleInput],
+	prefix: String,
+	marked: String,
+	matches: pure (Checked.CheckErrorKind) -> Bool,
+) -> Bool:
+	match check_modules_failure(inputs, PRIMITIVE_BASE):
+		None:
+			False
+		Some(error):
+			(
+				error.span.start == prefix.length()
+				and error.span.end == prefix.length() + marked.length()
+				and matches(error.kind)
+			)
+
+
 pure func test_recursive_arguments_and_receiver_preserve_source_order() -> Bool:
 	main_source: String =
 		|func main() -> Int:
 		|	first(1, first(2, 3)).first(4)
 		|
 
-	match lex(module_source(root_module_id()), FIRST + main_source).and_then(pure func(tokens): parse(tokens)):
+	match lex(
+		module_source(root_module_id()),
+		FIRST + main_source,
+	).and_then(
+		pure func(tokens): parse(tokens),
+	):
 		Err(_):
 			False
 		Ok(parsed):
@@ -175,7 +203,16 @@ pure func test_inconsistent_argument_reports_the_disagreeing_occurrence() -> Boo
 	main_source: String =
 		|func main() -> Int:
 		|	first(7,
-	rejects(FIRST + main_source + " ", "9.to_string()", ")\n", pure func(
+	rejects_modules([
+		{
+			source = "import:\n\tint: Int\n" + FIRST + main_source + " " + "9.to_string()" + ")\n",
+			targets = [1]
+		},
+		{
+			source = INTEGER_OPERATIONS,
+			targets = []
+		},
+	], "import:\n\tint: Int\n" + FIRST + main_source + " ", "9.to_string()", pure func(
 		kind: Checked.CheckErrorKind,
 	) -> Bool:
 		match kind:
@@ -248,7 +285,7 @@ pure func test_all_arguments_lower_before_the_call() -> Bool:
 			False
 		Ok(program):
 			match program.functions:
-				[helper, main]:
+				[main, helper]:
 					match helper.definitions:
 						[first, second, third]:
 							match main.definitions:
@@ -337,7 +374,7 @@ private pure func standalone(ids: InputIds, helper: Own.OwnedFunction) -> Own.Ow
 				tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.first)))
 			},
 		],
-		entrypoint = ids.second_function
+		entrypoint = Syntax.NoArguments(ids.second_function)
 	}
 
 
@@ -584,12 +621,32 @@ pure func test_specialization_translates_every_parameter_type() -> Bool:
 		|	text.length()
 		|
 
-	match checked(FIRST + main_source).and_then(pure func(program): Concrete.specialize(program)):
+	match (
+		parse_modules_with_base(
+			[
+				{
+					source = "import:\n\tint: Int\n\tstring: String\n" + FIRST + main_source,
+					targets = [1, 2]
+				},
+				{
+					source = INTEGER_OPERATIONS,
+					targets = []
+				},
+				{
+					source = STRING_OPERATIONS,
+					targets = []
+				},
+			],
+			PRIMITIVE_BASE,
+		)
+			.and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic))
+			.and_then(pure func(program): Concrete.specialize(program))
+	):
 		Err(_):
 			False
 		Ok(program):
 			match Concrete.specialized_contents(program).functions:
-				[_, integer, text]:
+				[_, integer, _, text, _]:
 					match integer.signature.parameters:
 						[Concrete.IntType, Concrete.IntType]:
 							match text.signature.parameters:
@@ -622,7 +679,7 @@ pure func test_nested_arguments_lower_in_left_to_right_order() -> Bool:
 			False
 		Ok(program):
 			match program.functions:
-				[_, _, _, _, main]:
+				[main, _, _, _, _]:
 					match main.definitions:
 						[_, first, _, second, _, third, call]:
 							match first.operation:
@@ -642,13 +699,13 @@ pure func test_nested_arguments_lower_in_left_to_right_order() -> Bool:
 																					(
 																						Concrete.function_number(
 																							first_id,
-																						) == 0
-																						and Concrete.function_number(
-																							second_id,
 																						) == 1
 																						and Concrete.function_number(
-																							third_id,
+																							second_id,
 																						) == 2
+																						and Concrete.function_number(
+																							third_id,
+																						) == 3
 																						and Lower.value_number(
 																							left,
 																						) == 1
@@ -803,7 +860,7 @@ pure func test_verifier_rejects_swapped_heterogeneous_arguments() -> Bool:
 					records = [],
 					unions = [],
 					functions = [helper, caller],
-					entrypoint = ids.second_function,
+					entrypoint = Syntax.NoArguments(ids.second_function),
 				})
 			):
 				Err(error):

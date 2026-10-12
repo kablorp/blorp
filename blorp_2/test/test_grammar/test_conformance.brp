@@ -1,8 +1,8 @@
 import:
 	../../src/lex: lex
-	../../src/names: NameTable, name_spelling
-	../../src/parse: ParsedProgram, parse_prelude, parsed_contents
-	../../src/source: PRELUDE_SOURCE, module_source, root_module_id
+	../../src/names: NameTable, name_spelling, program_names
+	../../src/parse: ParsedProgram, ParsedContents, module_builtin_types, module_functions, module_names, parse_module, parsed_contents
+	../../src/source: module_source, root_module_id, same_module
 	../../src/syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
 		CallNotation(DirectCall, ReceiverCall),
@@ -10,12 +10,11 @@ import:
 		ExpressionBase(IntegerExpression, NameExpression, DirectApplication),
 		FieldPattern(FieldName, FieldWildcard),
 		ParsedBody(ParsedBuiltinBody, ParsedValueBody, ParsedMatchBody),
-		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin),
+		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
 		ParsedFunction,
 		ParsedMatch,
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
-		ParsedPrelude,
-		ParsedRuntimeOperation(IntegerAddBuiltin, IntegerToStringBuiltin, StringLengthBuiltin),
+		ParsedRuntimeOperation(IntegerAddBuiltin, IntegerToStringBuiltin, StringLengthBuiltin, ListLengthBuiltin, ListGetBuiltin),
 		ParsedStatement(BindingStatement),
 		ParsedUnion,
 		PostfixOperation(ReceiverInvocation, FieldAccess),
@@ -50,24 +49,42 @@ private EXPRESSION_HELP: String = "use a literal, a parameter or variant name, o
 private PATTERN_CLOSE_HELP: String = "write Variant(name), Variant(_), or a nullary Variant()"
 
 
+-- Parser assertions observe root declarations while the parsed program retains the full inventory.
+private pure func root_contents(program: ParsedProgram) -> ParsedContents:
+	contents = parsed_contents(program)
+	{ contents |
+		functions = contents.functions.filter(pure func(row): same_module(row.module, root_module_id())),
+		unions = contents.unions.filter(pure func(row): same_module(row.module, root_module_id())),
+		records = contents.records.filter(pure func(row): same_module(row.module, root_module_id())),
+	}
+
+
 private pure func parse_source(source: String) -> Result[ParsedProgram, Diagnostic]:
 	input ?= lex(module_source(root_module_id()), source)
 	parse(input)
 
 
-private pure func prelude_syntax(source: String) -> Result[ParsedPrelude, Diagnostic]:
-	input ?= lex(PRELUDE_SOURCE, source)
-	parse_prelude(input)
+private fixed record ModuleSyntax {
+	names: NameTable,
+	types: List[ParsedBuiltinType],
+	functions: List[ParsedFunction]
+}
 
 
-private pure func prelude_rejects(
+private pure func module_syntax(source: String) -> Result[ModuleSyntax, Diagnostic]:
+	input ?= lex(module_source(root_module_id()), source)
+	parsed ?= parse_module(input, root_module_id(), program_names().names)
+	Ok({ names = module_names(parsed), types = module_builtin_types(parsed), functions = module_functions(parsed) })
+
+
+private pure func module_rejects(
 	source: String,
 	start: Int,
 	end: Int,
 	message: String,
 	help: String,
 ) -> Bool:
-	match prelude_syntax(source):
+	match module_syntax(source):
 		Err(error):
 			(
 				error.span.start == start
@@ -79,33 +96,62 @@ private pure func prelude_rejects(
 			False
 
 
-pure func test_prelude_builtin_type_alternatives_and_spaces() -> Bool:
+pure func test_builtin_module_builtin_type_alternatives_and_spaces() -> Bool:
 	source: String =
 		|type Int=builtin
 		|type String = builtin
 		|type Float = builtin
 		|type Void = builtin
+		|type List [ Element ] = builtin
 
-	match prelude_syntax(source):
+	match module_syntax(source):
 		Err(_):
 			False
 		Ok(parsed):
 			contents = parsed
 
 			match contents.types:
-				[IntegerBuiltin(integer), StringBuiltin(string), FloatBuiltin(float), VoidBuiltin(unit)]:
+				[IntegerBuiltin(integer), StringBuiltin(string), FloatBuiltin(float), VoidBuiltin(unit), ListBuiltin(list)]:
 					(
 						name_spelling(contents.names, integer.id) == Some("Int")
 						and name_spelling(contents.names, string.id) == Some("String")
 						and name_spelling(contents.names, float.id) == Some("Float")
 						and name_spelling(contents.names, unit.id) == Some("Void")
+						and name_spelling(contents.names, list.id) == Some("List")
 						and contents.functions.length() == 0
 					)
 				_:
 					False
 
 
-pure func test_prelude_runtime_labels_and_shared_header_syntax() -> Bool:
+pure func test_list_builtin_type_requires_one_parameter() -> Bool:
+	(
+		module_rejects("type List = builtin", 10, 11, "List requires one type parameter", "write type List[T] = builtin")
+		and module_rejects("type List[] = builtin", 10, 11, "expected the List type parameter", IDENTIFIER_HELP)
+		and module_rejects("type List[T, U] = builtin", 11, 12, "List requires exactly one type parameter", "write type List[T] = builtin")
+	)
+
+
+pure func test_list_runtime_labels_preserve_explicit_result_roles() -> Bool:
+	source: String =
+		|pure func length(values: List[String]) -> Int:
+		|    builtin("list.length")
+		|pure func get(values: List[String], index: Int) -> Option[String]:
+		|    builtin("list.get", Some, None)
+		|
+	match module_syntax(source):
+		Ok(parsed):
+			match parsed.functions:
+				[length, get]:
+					match (length.body, get.body):
+						(ParsedBuiltinBody(ListLengthBuiltin, _), ParsedBuiltinBody(ListGetBuiltin(present, absent), _)):
+							name_spelling(parsed.names, present.id) == Some("Some") and name_spelling(parsed.names, absent.id) == Some("None")
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_builtin_module_runtime_labels_and_shared_header_syntax() -> Bool:
 	source: String =
 		|pure func convert(value: Int) -> String:
 		|    builtin ( "int.to_string" )
@@ -113,72 +159,71 @@ pure func test_prelude_runtime_labels_and_shared_header_syntax() -> Bool:
 		|	builtin("string.length")
 		|
 
-	match prelude_syntax(source):
+	match module_syntax(source):
 		Err(_):
 			False
 		Ok(parsed):
 			match parsed.functions:
 				[first, second]:
-					operations_match = match (first.operation, second.operation):
-						(IntegerToStringBuiltin, StringLengthBuiltin): True
+					operations_match = match (first.body, second.body):
+						(ParsedBuiltinBody(IntegerToStringBuiltin, _), ParsedBuiltinBody(StringLengthBuiltin, _)): True
 						_: False
 					(
 						operations_match
-						and first.header.purity == Pure
-						and second.header.purity == Impure
+						and first.purity == Pure
+						and second.purity == Impure
 					)
 				_:
 					False
 
 
-pure func test_prelude_unknown_type_and_operation_are_closed_syntax() -> Bool:
+pure func test_builtin_module_unknown_type_and_operation_are_closed_syntax() -> Bool:
 	(
-		prelude_rejects(
+		module_rejects(
 			"type Bool = builtin",
 			5,
 			9,
 			"unknown builtin type",
-			"declare type Int = builtin, type Float = builtin, type String = builtin or type Void = builtin",
+			"declare type Int = builtin, type Float = builtin, type String = builtin, type Void = builtin or type List[T] = builtin",
 		)
-		and prelude_rejects(
+		and module_rejects(
 			"pure func f(value: Int) -> String:\n\tbuiltin(\"unknown\")",
 			44,
 			53,
 			"unknown builtin operation",
-			"use int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals or io.read_line",
+			"use int.equals, int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals, list.length or list.get",
 		)
 	)
 
 
-pure func test_prelude_requires_quoted_label_and_closing_parenthesis() -> Bool:
-	(
-		prelude_rejects(
-			"pure func f(value: Int) -> String:\n\tbuiltin(int.to_string)",
-			44,
-			47,
-			"expected a quoted builtin label",
-			"use int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals or io.read_line",
-		)
-		and prelude_rejects(
-			"pure func f(value: Int) -> String:\n\tbuiltin(\"int.to_string\"",
-			59,
-			59,
-			"expected ')' after the builtin label",
-			"give primitive builtins one quoted label, or bind both constructors of a union result",
-		)
+pure func test_builtin_labels_are_quoted_and_closed_while_calls_remain_contextual() -> Bool:
+	ordinary = match module_syntax("pure func f(value: Int) -> String:\n\tbuiltin(int.to_string)"):
+		Err(_): False
+		Ok(parsed):
+			match parsed.functions:
+				[function]:
+					match function.body:
+						ParsedValueBody(value):
+							match value.base:
+								DirectApplication(name, [_]): name_spelling(parsed.names, name.id) == Some("builtin")
+								_: False
+						_: False
+				_: False
+	ordinary and module_rejects(
+		"pure func f(value: Int) -> String:\n\tbuiltin(\"int.to_string\"",
+		59,
+		59,
+		"expected ')' after the builtin label",
+		"give primitive builtins one quoted label, or bind both constructors of a union result",
 	)
 
 
-pure func test_prelude_rejects_general_body_and_accepts_blank_separator() -> Bool:
+pure func test_foundation_and_operations_use_one_module_parser() -> Bool:
 	(
-		prelude_rejects(
-			"pure func f(value: Int) -> Int:\n\tvalue",
-			33,
-			38,
-			"expected 'builtin'",
-			"use the temporary prelude declaration syntax",
-		)
-		and prelude_syntax("type Int = builtin\n\n").is_ok()
+		module_syntax("pure func f(value: Int) -> Int:\n\tvalue").is_ok()
+		and module_syntax("type Int = builtin\n\n").is_ok()
+		and module_syntax("").is_ok()
+		and module_syntax("-- no operations yet\n").is_ok()
 	)
 
 
@@ -196,7 +241,7 @@ private pure func accepts(
 		Err(_):
 			False
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			match program.functions:
 				[function]:
@@ -384,14 +429,7 @@ pure func test_identifier_invalid_start_and_non_ascii() -> Bool:
 
 pure func test_header_requires_every_term_in_order() -> Bool:
 	(
-		rejects(
-			"",
-			0,
-			0,
-			"expected a function declaration at column 1",
-			"start with func main() -> Int:",
-		)
-		and rejects("func () -> Int:\n\t0", 5, 6, "expected a function name", IDENTIFIER_HELP)
+		rejects("func () -> Int:\n\t0", 5, 6, "expected a function name", IDENTIFIER_HELP)
 		and rejects(
 			"func main) -> Int:\n\t0",
 			9,
@@ -595,7 +633,7 @@ pure func test_declaration_repetition_and_call_syntax() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			match program.functions:
 				[first, second]:
@@ -659,7 +697,7 @@ pure func test_declaration_repetition_and_call_syntax() -> Bool:
 pure func test_argument_syntax_and_blank_separators() -> Bool:
 	argument_accepted: Bool = match parse_source(HEADER + "\tone(0)"):
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			match program.functions:
 				[function]:
@@ -701,7 +739,7 @@ pure func test_pure_qualifier_preserves_names_and_spans() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			match program.functions:
 				[function]:
@@ -760,7 +798,7 @@ pure func test_parameter_and_nested_call_are_valid_syntax() -> Bool:
 
 	match parse_source(source):
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			match program.functions:
 				[function]:
@@ -891,7 +929,7 @@ pure func test_ufcs_interleaves_with_pending_direct_calls() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			match program.functions:
 				[function]:
@@ -994,7 +1032,7 @@ pure func test_union_names_variants_and_expression_spans() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			match program.unions:
 				[declaration]:
@@ -1067,7 +1105,7 @@ pure func test_union_layout_variants_and_optional_lf() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 			(
 				program.functions.length() == 1
 				and program.unions.length() == 1
@@ -1286,7 +1324,7 @@ pure func test_payload_and_match_syntax() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			match program.unions:
 				[declaration]:
@@ -1343,7 +1381,7 @@ pure func test_pattern_alternatives_space_layout_and_following_union() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			union_ok: Bool = match program.unions:
 				[declaration]:
@@ -1502,7 +1540,7 @@ private pure func single_wildcard_match_is(source: String, eof: Int) -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			match program.functions:
 				[function]:
@@ -1828,7 +1866,7 @@ pure func test_binding_prefix_and_final_value_shape() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			match program.functions:
 				[function]:
@@ -1877,7 +1915,7 @@ pure func test_binding_spaces_and_tail_match() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			match parsed_contents(parsed).functions:
+			match root_contents(parsed).functions:
 				[function]:
 					match function.body:
 						ParsedMatchBody(_):
@@ -1959,7 +1997,7 @@ pure func test_arm_block_bindings_and_inline_sibling_spans() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			match program.functions:
 				[function]:
@@ -2048,7 +2086,7 @@ pure func test_arm_block_without_bindings_and_optional_final_lf() -> Bool:
 			Err(_):
 				accepted = False
 			Ok(parsed):
-				match parsed_contents(parsed).functions:
+				match root_contents(parsed).functions:
 					[function]:
 						match function.body:
 							ParsedMatchBody(body):
@@ -2084,7 +2122,7 @@ pure func test_arm_block_spaces_and_following_declaration() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			match program.functions:
 				[first, second]:
@@ -2200,7 +2238,7 @@ pure func test_function_type_parameter_list_preserves_order_and_spans() -> Bool:
 
 	match parse_source(prefix + "A, B, C](a:A,b:B,c:C)->C:\n\tc\n"):
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			match program.functions:
 				[function]:
@@ -2242,7 +2280,7 @@ pure func test_generic_parameter_name_and_annotation_spans() -> Bool:
 
 	match parse_source(prefix + "Element2](value: Element2) -> Element2:\n\tvalue\n"):
 		Ok(program):
-			contents = parsed_contents(program)
+			contents = root_contents(program)
 
 			match contents.functions:
 				[function]:
@@ -2384,7 +2422,7 @@ pure func test_generic_union_and_atomic_application_spans() -> Bool:
 
 	match parse_source(source):
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			match program.unions:
 				[declaration]:
@@ -2508,7 +2546,7 @@ pure func test_multiple_union_parameters_and_arguments_preserve_order_and_spans(
 
 	match parse_source(prefix + "Result[Int, String])->Int:\n\t0"):
 		Ok(parsed):
-			program = parsed_contents(parsed)
+			program = root_contents(parsed)
 
 			match (program.unions, program.functions):
 				([declaration], [function]):
@@ -2579,7 +2617,7 @@ pure func test_builtin_is_contextual_and_is_the_entire_body() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			match parsed_contents(parsed).functions:
+			match root_contents(parsed).functions:
 				[_, added, main]:
 					match (added.body, main.body):
 						(ParsedBuiltinBody(IntegerAddBuiltin, _), ParsedValueBody(_)):
@@ -2647,24 +2685,26 @@ tests: TestSuite = {
 			test_explicit_function_type_arguments_are_rejected,
 		),
 		(
-			"prelude builtin type alternatives and spaces",
-			test_prelude_builtin_type_alternatives_and_spaces,
+			"builtin module type alternatives and spaces",
+			test_builtin_module_builtin_type_alternatives_and_spaces,
+		),
+		("List builtin type requires one parameter", test_list_builtin_type_requires_one_parameter),
+		("List runtime labels preserve result roles", test_list_runtime_labels_preserve_explicit_result_roles),
+		(
+			"builtin module runtime labels and shared header syntax",
+			test_builtin_module_runtime_labels_and_shared_header_syntax,
 		),
 		(
-			"prelude runtime labels and shared header syntax",
-			test_prelude_runtime_labels_and_shared_header_syntax,
+			"builtin module unknown type and operation are closed syntax",
+			test_builtin_module_unknown_type_and_operation_are_closed_syntax,
 		),
 		(
-			"prelude unknown type and operation are closed syntax",
-			test_prelude_unknown_type_and_operation_are_closed_syntax,
+			"builtin labels close and ordinary calls remain contextual",
+			test_builtin_labels_are_quoted_and_closed_while_calls_remain_contextual,
 		),
 		(
-			"prelude requires quoted label and closing parenthesis",
-			test_prelude_requires_quoted_label_and_closing_parenthesis,
-		),
-		(
-			"prelude rejects general body and accepts blank separator",
-			test_prelude_rejects_general_body_and_accepts_blank_separator,
+			"foundation and operations share the module parser",
+			test_foundation_and_operations_use_one_module_parser,
 		),
 		("arm block binding and sibling spans", test_arm_block_bindings_and_inline_sibling_spans),
 		(

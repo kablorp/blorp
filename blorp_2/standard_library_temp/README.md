@@ -3,39 +3,70 @@
 These modules are compiled by Blorp 2 for input programs. They are separate
 from the host library that builds the pilot compiler.
 
-`int.brp` retains a commented copy of `standard_library/src/int.brp`, with its
-revision and SHA256 recorded in the file. Concrete `add`, `subtract`, `multiply`,
-`divide`, `remainder` and `to_string` are active, lifted from trait implementations
-where needed. The Float adapter exposes those same concrete names for Float64.
-`Int` and `Float` remain declared once in `src/prelude_temp.brp`. Other
-declarations are enabled only as their features enter the supported subset.
-One plus/minus glyph in an upstream comment is
-transliterated to `+/-` because pilot comment text is currently ASCII.
+The library root contains two designated foundation modules:
 
-Pass this directory explicitly with `--library-root
-blorp_2/standard_library_temp`. Bare `int: add` imports resolve here; relative
+- `_base/types.brp` owns Int, Float, String, Void, List, Bool, Option and Result.
+  Their types and constructors are available in every module.
+- `_base/prelude.brp` imports the operation modules by type. Those selections
+  supply UFCS operations to application roots and ordinary user helper modules.
+  Library operation modules receive base types and their written imports.
+
+For example, `42.add(1).to_string().length()` needs no imports. Direct calls
+still require named imports such as `int: add`. IO remains explicit.
+The [imports design](../IMPORTS_AND_PRELUDE_PLAN.md) defines the full rules.
+
+`int.brp` records the revision and SHA256 of its
+[upstream reference](../reference/standard_library/int.brp). Concrete `add`, `subtract`, `multiply`,
+`divide`, `remainder`, `equals` and `to_string` are active, lifted from trait implementations
+where needed. The Float adapter exposes those same concrete names for Float64.
+`Int` and `Float` are declared once in `_base/types.brp`. Other
+declarations are enabled only as their features enter the supported subset.
+Byte-for-byte upstream references live outside compilation inputs under
+[reference/standard_library](../reference/standard_library/README.md).
+
+Pass `blorp_2/standard_library_temp` explicitly as the argument to `--library-root`. Bare `int: add` imports resolve here; relative
 imports still resolve beside their importer. There is no host-library fallback.
 
 `io.brp` retains the upstream `standard_library/src/io.brp` revision and SHA256
-beside its commented source. Its active `print(String) -> Void` is concrete and
+beside a link to its reference copy. Its active `print(String) -> Void` is concrete and
 impure, mapped to the closed `string.print` operation. It borrows the String,
-writes every byte and appends LF. `read_line() -> Option[String]` is impure,
-removes one LF and preserves other bytes, returning an owned String on success.
-Other IO declarations remain commented out. `Void` is declared once in the
-target prelude.
+writes every byte and appends LF. Program input arrives explicitly through
+`main(args: List[String])`, including the executable name at index 0.
+Other IO declarations remain in the reference copy. `Void` is declared once in the
+foundation types module.
 
-The io adapter also transliterates the upstream em dash in a comment to ASCII;
-the recorded upstream SHA256 still identifies the unmodified original.
+The small List adapter follows `standard_library/src/list.brp`'s `length` and
+safe `get` APIs, with concrete List[String] signatures for this increment.
+List is declared once in `_base/types.brp` as a unary builtin. A successful get
+returns an owned String inside ordinary Option, independently of the list's
+lifetime; invalid indexes return None. No list literals, append or mutation are
+enabled yet. The base module provides the ordinary generic Result union with Ok/Err for
+pure calculator parsing and evaluation; it has no compiler-specific behavior.
 
-`option.brp` and `bool.brp` provide ordinary fixed unions. Select constructors
-explicitly with `Option(Some, None)` or `Bool(True, False)`. The String adapter
+Bool, Option and Result are ordinary fixed unions owned by `_base/types.brp`;
+their types and constructors are available in every module. Separate Bool,
+Option and Result operation modules are deferred until operations need them. The String adapter
 exposes strict counted-byte `parse_int`, `parse_float` and `equals` operations.
 Their builtin bodies explicitly bind the ordinary result constructors; names
 and declaration order have no hidden runtime meaning. Copied upstream source
-remains commented, with provenance beside each adapter. Traits and FFI remain
-inactive.
+is reference material outside this input library, with provenance beside each
+adapter. Traits and FFI remain inactive.
 
 The [calculator plan](../CALCULATOR_COMPLETION_PLAN.md) and
 [Float design](../FLOAT_PLAN.md) define deliberate conversion and arithmetic
 adaptations. The copied host implementation is a reference, not an implicit
 source of semantics or runtime dependencies.
+
+A type selection also supplies only that module's local receiver functions:
+
+```blorp
+import:
+    ./foo: Foo
+    ./foo_ops: Foo methods_only
+```
+
+`Foo methods_only` requires the exact Foo type independently visible in the
+caller. It imports no type or constructors and cannot make bare function calls
+available. Type forwarding follows the original declaration; it does not
+forward another module's imported methods. The designated `_base` modules are
+compiler inputs and cannot be imported explicitly.
