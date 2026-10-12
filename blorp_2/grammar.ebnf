@@ -1,5 +1,5 @@
 (* Blorp 2: local selective function imports, scalar bindings, fixed unions and
-   records, tail matches and a small input prelude.
+   records, tail matches, ordinary type selections and an explicit target library.
 
    This is a byte-level source grammar. No whitespace is implicit.
    Dialect: `=` defines a rule; `;` ends it; juxtaposition concatenates;
@@ -48,14 +48,17 @@
    Paths omit .brp and contain adjacent identifier components; interior
    dot segments, aliases, wildcards and reexports are unsupported. Explicit
    Union(First, Second) imports select a union and named constructors; Union()
-   selects its type alone. Bare names select functions, regardless of capitalization.
-   All declarations are public. Local module names and selected functions form
-   each module's scope; prelude functions remain available in every module.
+   selects its type alone. Bare names resolve functions or visible types without capitalization rules.
+   A type selection supplies target-local receiver functions for UFCS. The contextual
+   suffix methods_only supplies receiver functions without importing the type or constructors.
+   All declarations are public. Foundation types and constructors are implicit in
+   every module. User modules also receive the ordinary foundation prelude's
+   selected UFCS operations; library operations receive only base and written imports.
    Every declaration has a program-wide identity and a defining module. Imports
    preserve that identity. Bodies and annotations resolve in their defining
    module. Import dependency cycles are accepted. Each source is loaded once.
-   The checker requires exactly one root-local zero-parameter `main` returning Int.
-   Helper parameter and return types are `Int`, `Float`, `String`, `Void`, a declared fixed union,
+   The checker requires exactly one nongeneric root-local `main` returning Int, with no parameters or one List[String] parameter. Index 0 is the executable name.
+   Helper parameter and return types are `Int`, `Float`, `String`, `Void`, List[String] (or List[T] in a generic helper), a declared fixed union,
    a declared fixed record, or one of the function's declared rigid type parameters. Type parameters start
    with a capital ASCII letter and contain only ASCII letters and digits.
    Their names cannot collide with builtin or declared union/record type names.
@@ -98,8 +101,8 @@
    every evaluated value must be unmanaged, including unused initializers.
    Phantom String type arguments without managed payload are allowed.
    Zero-argument annotated helpers and main are allowed; termination is not proved.
-   Annotations without direct self calls, generic annotations, and prelude
-   annotations are rejected. Mutual calls remain ordinary calls. Recursive
+   Annotations without direct self calls, generic annotations, and annotations
+   on builtin bodies are rejected. Mutual calls remain ordinary calls. Recursive
    data declarations remain unsupported; cyclic runtime value graphs are forbidden.
    Functions without pure are impure. Nullary variants are bare values. A
    variant with one declared field uses unary construction syntax. Constructor
@@ -135,19 +138,15 @@
    contextualize a later explicit argument. Copies and whole-value reassignment
    retain value semantics. Managed/recursive/generic/empty record declarations,
    record updates, field assignment and multiline braces remain unsupported.
-   The separately supplied prelude admits only the builtin type declarations
-   and runtime-backed function declarations below. It must declare Int, Float, String
-   and Void exactly once. Names of its functions are ordinary declared names;
-   the closed builtin label establishes the operation identity. Checking
-   requires pure unary Int -> String for int.to_string, String -> Int for
-   string.length, binary (Int, Int) -> Int for int.add, and impure String -> Void
-   for string.print. Print borrows the String's exact bytes and appends LF.
-   Closed builtin
-   bodies are also allowed as the sole body of nongeneric module functions,
-   without statements or tail annotations. Visible local/imported ordinary functions
-   take precedence over prelude function fallback; conflicting explicit function
-   imports still fail. Variants cannot conflict with prelude functions. Builtin
-   type identities remain unique. No prelude function is inserted when its declaration is absent.
+   Compiler-known builtin type syntax is parsed in ordinary modules and checked
+   only in the configured _base/types.brp foundation role. That module owns Int,
+   Float, String, Void and unary List exactly once, plus ordinary Bool/Option/Result
+   unions. It imports nothing and declares no functions. _base/prelude.brp is an
+   ordinary module of type imports. These designated inputs cannot be imported
+   explicitly. No runtime-name fallback or positional prelude input remains.
+   Closed builtin bodies are allowed as the sole body of nongeneric module
+   functions, without statements or tail annotations. A closed builtin label
+   establishes the operation identity and ordinary checking validates its contract.
    Ordinary quoted expressions construct fresh owned String values. Builtin
    declarations match their quoted raw label exactly, without escape decoding.
    In module bodies, builtin is contextual: builtin followed by an opening
@@ -263,31 +262,30 @@ fixed_union      = "fixed" required_spaces "union" required_spaces identifier sp
 record_member    = identifier spaces ":" spaces type_annotation ;
 fixed_record     = "fixed" required_spaces "record" required_spaces identifier spaces "{" spaces
                    record_member { spaces "," spaces record_member } spaces "}" spaces ;
-declaration      = function | fixed_union | fixed_record ;
+declaration      = function | fixed_union | fixed_record | builtin_type ;
 relative_prefix  = "./" | "../" { "../" } ;
 module_components = identifier { "/" identifier } ;
 module_path      = [ relative_prefix ] module_components ;
-import_symbol    = identifier [ spaces "(" spaces [ identifier { spaces "," spaces identifier } ] spaces ")" ] ;
+constructor_selection = spaces "(" spaces [ identifier { spaces "," spaces identifier } ] spaces ")" ;
+import_symbol    = identifier [ constructor_selection | required_spaces "methods_only" ] ;
 import_selection = import_symbol { spaces "," spaces import_symbol } ;
 import_row       = indent_one module_path spaces ":" spaces import_selection spaces ;
 import_block     = "import" spaces ":" spaces newline import_row { newline import_row } ;
 program          = { trivia_line }
-                   (import_block { newline import_block } [ newline declaration { newline declaration } ]
-                    | declaration { newline declaration }) source_end ;
+                   ((import_block { newline import_block } [ newline declaration { newline declaration } ]
+                    | declaration { newline declaration }) source_end
+                    | { horizontal } [ line_comment ] EOF) ;
 
-(* The prelude uses the same lexical and header rules as the input program.
-   An empty prelude parses but fails the required builtin-type checks. *)
-builtin_type     = "type" required_spaces ("Int" | "Float" | "String" | "Void") spaces "=" spaces "builtin" spaces ;
+(* Foundation declarations use the ordinary module parser.
+   An empty module parses; designated foundation validation requires five builtins. *)
+builtin_type     = "type" required_spaces (("Int" | "Float" | "String" | "Void") spaces
+                   | "List" spaces "[" spaces identifier spaces "]" spaces) "=" spaces "builtin" spaces ;
 builtin_label    = "\"int.to_string\"" | "\"string.length\"" | "\"string.print\""
                    | "\"int.add\"" | "\"int.subtract\"" | "\"int.multiply\""
                    | "\"int.divide\"" | "\"int.remainder\""
                    | "\"float.add\"" | "\"float.subtract\"" | "\"float.multiply\""
-                   | "\"float.divide\"" | "\"float.remainder\"" | "\"float.to_string\"" ;
-union_builtin    = ("\"string.parse_int\"" | "\"string.parse_float\"" | "\"io.read_line\"" | "\"string.equals\"")
+                   | "\"float.divide\"" | "\"float.remainder\"" | "\"float.to_string\""
+                   | "\"list.length\"" ;
+union_builtin    = ("\"string.parse_int\"" | "\"string.parse_float\"" | "\"list.get\"" | "\"int.equals\"" | "\"string.equals\"")
                    spaces "," spaces identifier spaces "," spaces identifier ;
 builtin_body     = indent_one "builtin" spaces "(" spaces (builtin_label | union_builtin) spaces ")" spaces ;
-runtime_function = function_header builtin_body ;
-prelude_declaration = builtin_type | runtime_function ;
-prelude          = { trivia_line }
-                   (prelude_declaration { newline prelude_declaration } source_end
-                    | { horizontal } [ line_comment ] EOF) ;

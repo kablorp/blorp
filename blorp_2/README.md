@@ -5,6 +5,15 @@ small program, defines the grammar it needs, and tests that program through
 native execution. The existing compiler builds this compiler until it can
 build itself.
 
+The [imports and prelude roadmap](IMPORTS_AND_PRELUDE_PLAN.md) defines explicit
+type/method visibility and a shared base/prelude for the temporary target
+library. Its syntax and layout are implemented in this pilot.
+
+The [scaffolding cleanup report](../benchmarks/results/blorp_2_cleanup_2026-10-12.md)
+records explicit unit inputs, reachable specialization, the slim target library,
+matched costs and validation limits. Its measurements supersede earlier cost
+examples for this implementation; older increment reports retain their history.
+
 ## First example
 
 [`test/e2e/fixtures/return/zero.brp`](test/e2e/fixtures/return/zero.brp):
@@ -60,7 +69,7 @@ func main() -> Int:
 	identity(one())
 ```
 
-It exits 1 with empty stdout and stderr. Helpers may take any number of typed runtime parameters; `main` takes none. A call may pass one complete expression, including
+It exits 1 with empty stdout and stderr. Helpers may take any number of typed runtime parameters; this example's `main` takes none. A call may pass one complete expression, including
 another call. The companion [`nested/order.brp`](test/e2e/fixtures/nested/order.brp)
 returns `zero(one(1))`, with both helpers ignoring their parameter. Its exit status
 0 and exact generated C distinguish the order of the two calls.
@@ -198,7 +207,7 @@ func main() -> Int:
     value.length()
 ```
 
-It returns 1. The explicit temporary input prelude declares concrete pure
+It returns 1. The default prelude selects concrete pure
 `to_string(Int) -> String` and `length(String) -> Int` functions. Conversion
 allocates an immutable String leaf; length borrows it; its owner is released
 after that use. The [identity companion](test/e2e/fixtures/mortal_string/identity.brp)
@@ -270,7 +279,7 @@ entrypoint; the other case modules provide groups to it and are not standalone
 runnable suites.
 Each fixture owns fresh temporary output and one measured compilation, followed
 by one strict C11 native `-O0` build under ASan and UBSan. Explicit native cases
-reuse that binary with byte stdin and exact exit status, stdout and stderr
+reuse that binary with explicit argument vectors, byte stdin and exact exit status, stdout and stderr
 assertions. Every example has a first case and a list of remaining cases;
 existing examples have one case. Failures identify the case and mismatched
 channel, with output shown as hex so embedded NUL and UTF-8 bytes remain visible.
@@ -278,7 +287,7 @@ Allocation and instruction counters come from the same compilation, once per
 fixture. These checks never reuse output from an earlier fixture compilation.
 
 Every host-compiled source module has a matching unit suite under `test/unit/`.
-The temporary target prelude is an explicit source input, not a host module.
+The designated target base/prelude are loaded from the explicit library root; they are not host modules.
 Integration
 and native execution suites live under `test/e2e/`; their input programs live
 under `test/e2e/fixtures/`, grouped by feature. Folders carry the shared prefix,
@@ -531,6 +540,29 @@ termination. Unannotated C output is preserved. The
 [tail-recursion plan](TAIL_RECURSION_PLAN.md) defines the phase invariants,
 malformed-IR tests and native stack-exhaustion mutation oracle.
 
+The [numeric accumulator](test/e2e/fixtures/tail_recursion/accumulator.brp)
+decrements an Int while adding one to a second Int. The regular suite checks
+exact stdout for zero, one, seventeen and one million iterations under `-O0`
+and sanitizers. This observes the completed count independently of the process
+exit status. The older hexadecimal countdown remains a separate carry/borrow
+case; its constant result alone does not prove the iteration count.
+
+For a longer stress run, compile the same fixture and run its normal entrypoint
+with a nonnegative iteration argument:
+
+```sh
+blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
+  blorp_2/test/e2e/fixtures/tail_recursion/accumulator.brp \
+  blorp_2/build/tail-accumulator.c
+clang -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
+  blorp_2/build/tail-accumulator.c -lm -o blorp_2/build/tail-accumulator
+blorp_2/build/tail-accumulator 1000000000
+```
+
+Expected stdout is `1000000000` followed by LF, with status zero and empty
+stderr. The fixture's manual argument must be nonnegative; it does not validate
+negative iteration counts. The one-billion run stays outside the routine suite.
+
 The [multiple-type-parameter example](test/e2e/fixtures/generic/function_parameters/second.brp)
 adds independent declaration parameters:
 
@@ -724,21 +756,23 @@ Lexical and layout rules:
 
 Semantic rules:
 
-- Exactly one function must be named `main`, and it takes no parameters. A helper
+- Exactly one root function must be named `main`. It takes no parameters or one
+  `List[String]` parameter, and returns `Int`. The argument list includes the
+  executable name at index zero. A helper
   takes zero or more explicitly typed parameters with distinct names. Helper parameter and return types
   are `Int`, the signed 64-bit integer type, `String`, or a fixed union declared in this
   file, including an application of a generic union, or the function's declared
   rigid parameter. `main` must return `Int`.
 - Union types have nominal identity. Equal variant positions or shared variant
   spellings do not make two unions interchangeable. Union type names must be
-  unique and cannot redeclare the prelude's `Int` or `String`; each union's variant names must be unique.
+  unique in their module and cannot replace implicitly visible base types; each union's variant names must be unique.
   Type names occupy a separate namespace from functions and variant values, so
   a function may share a type name. A function cannot share any variant name;
   a collision highlights whichever declaration appears later in the source.
-- Function names are unique within the input file and cannot conflict with prelude
-  functions. Every callee must be declared in that file or in the explicit
-  prelude; declaration order does not affect resolution. Calls supply exactly
-  the number of arguments the callee declares.
+- Function names are unique within each module. Direct calls use local declarations
+  and explicit function imports. UFCS also uses type-selected functions and the
+  default prelude. Declaration order does not affect resolution. Calls supply
+  exactly the number of arguments the callee declares.
 - A bare expression name first resolves to the nearest local binding: an
   arm capture, a body-local binding, or the containing function's parameter. Otherwise
   it resolves to a variant in the expected union: the innermost call's parameter
@@ -815,7 +849,7 @@ Semantic rules:
   unused bodies. An arbitrary `T` cannot return an Int literal or call a
   concrete Int/String runtime operation. Parameters cannot share a name with
   `Int`, `String`, or any declared union; separate declarations may reuse `T`.
-  `main` and runtime prelude functions cannot declare type parameters.
+  `main` and functions with closed builtin bodies cannot declare type parameters.
   Direct and UFCS calls infer each type parameter consistently from synthesized
   argument types in source order. A later argument can determine a parameter
   when earlier annotations do not constrain it. Repeated occurrences, including structural `Box[T]`
@@ -839,12 +873,14 @@ Semantic rules:
   synthetic enum when all its variants are nullary. A payload-bearing union
   uses a distinct struct with an enum tag and a C union containing a correctly
   typed member for each payload-bearing variant. Nullary construction supplies
-  only its tag; omitted storage is zero-initialized. A separate C `int main(void)` wrapper calls
+  only its tag; omitted storage is zero-initialized. A separate C wrapper calls
   the checked entrypoint and converts the result to the process exit status.
+  A nullary entrypoint uses `int main(void)`; an argument-taking entrypoint
+  uses `int main(int argc,char **argv)` and owns the argument list for the call.
 - The final expression is the return value. No explicit `return` is needed.
-- `String` is an immutable managed leaf. The temporary input prelude supplies
-  concrete pure functions `to_string(Int) -> String` and `length(String) -> Int`.
-  Both direct calls and UFCS work. Parameters borrow for the duration of a
+- `String` is an immutable managed leaf. The default prelude supplies UFCS
+  operations such as `to_string(Int) -> String` and `length(String) -> Int`.
+  Direct calls require named function imports. Parameters borrow for the duration of a
   synchronous call; managed results transfer an owner to the caller, including
   results that alias a borrowed parameter. Unused mortal results are released.
   String-bearing unions store their root inline and own their active children.
@@ -858,10 +894,10 @@ Semantic rules:
   multiple payload fields, managed record fields, recursive layouts, nested matches,
   guards, qualified/nested/literal patterns, constructor UFCS, multiline chains,
   non-tail matches, and function
-  values are outside this increment. `Bool` has no special treatment: a written
-  `fixed union Bool` follows the ordinary union path, and an undeclared `Bool` is unknown.
-  Local functions and explicitly imported functions are available to either call
-  notation. UFCS-only import visibility remains deferred.
+  values are outside this increment. `Bool` is an ordinary fixed union declared
+  once in the base module, alongside Option and Result. Local functions and
+  explicitly imported functions support both call notations; type selections
+  expose receiver functions only through UFCS.
 - Syntax and semantic errors carry a source location, an explanation, and help.
   Rejected source produces no C output and does not overwrite an existing output.
 
@@ -886,11 +922,15 @@ pure func answer() -> Int:
 
 The executable exits 42. Each import row starts with `./`
 or leading `../` segments, omits `.brp`, and selects local functions or fixed
-unions. A bare selector selects a function; `Option(Some, None)` selects a
-union and those constructors, while `Option()` selects only the union type.
+unions. A bare selector selects a local function or a visible type; if both
+exist, the selection is ambiguous. `Option(Some, None)` selects a union and those
+constructors, while `Option()` selects the union without constructors. Both
+forms also enable local receiver functions. `Foo methods_only` adds receiver
+functions and requires the exact type independently visible in the caller.
 Imports precede declarations. Bare paths select target-library modules when
-an explicit library root is supplied. Aliases, wildcards, reexports, record
-imports, qualified calls and `private` are deferred.
+the required explicit library root is supplied. Record type imports and type
+forwarding are supported. Aliases, wildcards, explicit reexport syntax, qualified
+calls and `private` are deferred.
 
 Each module owns its declarations; same-spelled declarations in different
 modules have distinct identities. Imported functions resolve their annotations
@@ -932,7 +972,7 @@ Supply the target library explicitly:
 
 ```sh
 blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
-  blorp_2/src/prelude_temp.brp blorp_2/test/e2e/fixtures/int/add.brp \
+  blorp_2/test/e2e/fixtures/int/add.brp \
   blorp_2/build/add.c
 ```
 
@@ -941,14 +981,15 @@ beside their importer, including inside library modules. Missing roots and files
 produce diagnostics; there is no local-file or host-library fallback. Library
 modules use the ordinary module pipeline and preserve declaration identities.
 
-The [temporary library](standard_library_temp/README.md) retains commented
-upstream source with provenance. Its active declarations provide the calculator's
+The [temporary library](standard_library_temp/README.md) retains upstream
+provenance; full [reference copies](reference/standard_library/README.md) live
+outside compilation inputs. Its active declarations provide the calculator's
 ordinary unions and concrete numeric, conversion and IO functions.
 Their explicit builtin bodies select closed compiler-known operations. Module functions
 may declare these builtin bodies with the exact concrete runtime signature,
 without statement prefixes, generic parameters or tail annotations. Unknown
 labels and signature mismatches are errors. There is no arbitrary foreign
-symbol binding. The prelude remains the sole owner of `Int`, `Float`, `String` and `Void`.
+symbol binding. The base types module owns `Int`, `Float`, `String`, `Void` and unary `List`.
 The [increment design](INT_ADD_PLAN.md) records phase contracts; the
 [validation report](../benchmarks/results/blorp_2_int_add_2026-10-11.md) records
 strict tests, native fixtures, matched costs and the existing compiler's
@@ -1048,14 +1089,15 @@ records phase tests, native output, ownership checks and matched costs.
 
 ## Calculator input and results
 
-The [calculator completion plan](CALCULATOR_COMPLETION_PLAN.md) defines the
-numeric and input contracts. `Option[T]` and `Bool` come from ordinary
-target-library fixed unions; neither spelling receives a compiler-specific
-representation. Import their constructors explicitly:
+The [argument input plan](ARGUMENTS_PLAN.md) defines the current input contract;
+the [calculator completion plan](CALCULATOR_COMPLETION_PLAN.md) retains the
+numeric contracts. `Option[T]`, `Result[Value, Error]` and `Bool` come from ordinary
+fixed unions in `standard_library_temp/_base/types.brp`; neither spelling receives
+a compiler-specific representation. Their types and constructors are implicitly
+available in every module:
 
 ```blorp
 import:
-    option: Option(Some, None)
     string: parse_int
 pure func number(text: String) -> Option[Int]:
     parse_int(text)
@@ -1066,32 +1108,43 @@ sign and one or more decimal digits, including leading zeros. It returns None
 for empty input, whitespace, embedded NUL, non-ASCII digits, suffixes or values
 outside Int64. No partial conversion or whitespace trimming is implicit.
 
-`io.read_line() -> Option[String]` is impure. It removes one LF and preserves
-all other bytes, including CR, NUL and non-UTF-8 bytes. An empty line is
-Some(""); EOF before any bytes is None. A final nonempty unterminated line is
-Some. Source literals require valid UTF-8, but runtime Strings remain counted
-byte sequences. Each successful read introduces one String owner; borrowing
-and exhaustive union destruction discharge its ownership normally.
+Input enters through `main(args: List[String])`. The C wrapper copies the
+argument bytes into an immutable owned list, including the executable name at
+index zero; `main` borrows it. The `list` adapter exposes pure `length` and
+`get`. `get` returns ordinary `Option[String]`: a present result owns a retained
+String, while negative or out-of-range indices return None. No trimming or
+splitting is implicit. OS argument strings cannot contain NUL; source-literal
+tests cover counted NUL bytes separately. Only concrete `List[String]` is
+supported in this increment; generic helpers may abstract over it.
+
+The [argument design](ARGUMENTS_PLAN.md) and
+[validation report](../benchmarks/results/blorp_2_arguments_2026-10-12.md)
+record the entrypoint contract, ownership checks, native tests and matched costs.
 
 `string.equals(first, second) -> Bool` compares complete byte sequences.
 `int` exposes concrete `add`, `subtract`, `multiply`, `divide`, `remainder`
-and `to_string`. The first three wrap at Int64 bounds. Division and remainder
+and `to_string`, plus `equals(Int, Int) -> Bool`. Equality uses the complete
+signed 64-bit values and ordinary explicitly bound Bool constructors.
+The first three arithmetic operations wrap at Int64 bounds. Division and remainder
 return zero for a zero divisor; minimum Int divided by -1 wraps to minimum,
 with zero remainder. These operations avoid signed C overflow.
 
 The [addition calculator](test/e2e/fixtures/calculator/addition.brp) consumes two
-lines and prints their sum. The [integer calculator](test/e2e/fixtures/calculator/integer.brp)
-consumes an operation followed by two operand lines. Operations are exactly
+arguments and prints their sum. The [integer calculator](test/e2e/fixtures/calculator/integer.brp)
+consumes an operation followed by two operand arguments. Operations are exactly
 `add`, `subtract`, `multiply`, `divide` and `remainder`, selected through ordinary
 String equality and union matching. It prints the result followed by LF and
 exits zero; stderr is empty.
 
-Invalid operands print `invalid integer`, missing required lines print
+Pure helpers decode, parse and calculate, returning `Result` values. A small
+reporting helper prints the result or error and chooses the exit status.
+
+Invalid operands print `invalid integer`, missing required arguments print
 `missing input`, and unknown operations print `unknown operation`, followed by
-LF and exit status one. The operation is decoded before operands are read,
-and the first operand is validated before reading the second. Extra lines
-are ignored. CR is preserved, so CRLF numeric and operation input fails strict
-validation. The final operand may be unterminated.
+LF and exit status one. The operation is decoded before operands are parsed,
+and the first operand is validated before the second. Extra arguments are
+ignored. Empty, spaced, CR-containing and newline-containing arguments remain
+intact and fail strict numeric validation.
 
 Runtime declarations explicitly bind result roles, for example
 `builtin("string.parse_int", Some, None)`. Checking accepts the exact nominal
@@ -1101,7 +1154,7 @@ those roles directly; constructor names and ordering carry no hidden semantics.
 
 ## Float64 calculator
 
-The temporary prelude owns `Float`, a binary64 unmanaged value. Decimal source
+The designated foundation `_base/types.brp` owns `Float`, a binary64 unmanaged value. Decimal source
 literals require a decimal point with digits on both sides, an exponent, or
 both: `6.5`, `1e2`, `-0.0`, `2.5e-3`. Leading plus, leading-zero integer parts,
 `.5`, `1.`, hexadecimal literals and separators are rejected. Source literals
@@ -1119,10 +1172,11 @@ func main() -> Int:
 ```
 
 This prints `13\n`. The concrete Float module provides the same five arithmetic
-function names as Int, plus `to_string`. Imports choose declarations explicitly;
-there is no type-based overload resolution. A visible ordinary function or
-explicit import takes precedence over the temporary prelude's same-name
-function. Importing both Int and Float `to_string` into one scope is an error.
+function names as Int, plus `to_string`. Named function imports permit direct
+calls and UFCS; type imports expose the module's associated functions through
+UFCS. Receiver types distinguish Int and Float methods. Importing both Int and
+Float `to_string` for direct calls is an error; neither declaration takes
+precedence.
 Following the pilot's infallible arithmetic rule, Float division and remainder
 by either signed zero return positive zero. Other arithmetic can produce
 infinity or NaN. Remainder uses a quotient truncated toward zero. The existing
@@ -1145,7 +1199,7 @@ decimal strings. Literal emission projects the parsed value as an exact C
 hexadecimal literal rather than retaining its source spelling.
 
 The [Float calculator](test/e2e/fixtures/calculator/float.brp) uses the integer
-calculator's three-line protocol and error precedence, with `invalid float`
+calculator's three-argument protocol and error precedence, with `invalid float`
 for rejected operands. Its native cases exercise precision, signed zero,
 subnormals, arithmetic overflow and invalid conversion.
 
@@ -1154,11 +1208,11 @@ Build and run it from the repository root:
 ```sh
 make -C blorp_2 test-compiler
 blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
-  blorp_2/src/prelude_temp.brp blorp_2/test/e2e/fixtures/calculator/float.brp \
+  blorp_2/test/e2e/fixtures/calculator/float.brp \
   blorp_2/build/calculator.c
 clang -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
   blorp_2/build/calculator.c -lm -o blorp_2/build/calculator-program
-printf 'multiply\n6.5\n2\n' | blorp_2/build/calculator-program
+blorp_2/build/calculator-program multiply 6.5 2
 ```
 
 The output is `13` followed by LF. Float programs link the C math library.
@@ -1183,10 +1237,11 @@ e2e executions, independent reviews and matched cost measurements.
 
 ## Architecture
 
-The command reads the temporary input prelude, a root program and its module dependencies, then writes C:
+The command reads the root program, the configured foundation and ordinary
+prelude, and their dependencies once per normalized path, then writes C:
 
 ```sh
-bin/blorp run --no-format blorp_2/src/main.brp -- blorp_2/src/prelude_temp.brp input.brp output.c
+bin/blorp run --no-format blorp_2/src/main.brp -- --library-root blorp_2/standard_library_temp input.brp output.c
 ```
 
 The impure command shell owns file I/O and printing. Compilation and
@@ -1252,9 +1307,12 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    Complete outer receiver contracts are resolved before their children. Generic
    argument inference remains one-way; contextual inference and structural
    unification are later work.
-4. Pure specialization expands instances from every ordinary function, preserving
-   unused ordinary functions and unions. Generic declarations emit only when
-   requested by those roots or another instance. One local instance list reuses
+4. Pure specialization starts from the accepted `main` identity and expands
+   its complete call graph through the existing instance worklist. Checking
+   still validates every declaration, including unreachable functions. Only
+   reachable function instances and their required record and union layouts
+   are published. Every variant's payload layout is retained when its union is
+   required, even if the program never constructs that variant. One local instance list reuses
    equal declaration/type keys and distinguishes nominal union arguments. It
    translates complete signatures, bindings, statements, values, calls, variants and matches
    without checking bodies or resolving names again, then seals a
@@ -1314,9 +1372,11 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    explicit operations; emission does not invent owners or cleanup.
 
 The names module owns the spelling table and constructs the entrypoint's `main`
-identity. Prelude declarations establish `Int` and `String` before program
-parsing extends the same table. Parsing uses string lookup only in its local interning
-builder, then publishes the immutable table and special identities together.
+identity. Every module parse extends that shared authority, including the
+designated foundation's five builtin declarations. The sealed program retains
+the entrypoint spelling identity and designated module identities; checking
+validates builtin authority once before constructing the namespace. Parsing uses
+string lookup only in its local interning builder and publishes the immutable table.
 Written names contain only a `NameId` and source span. Checking compares identities;
 spelling lookup is reserved for diagnostics and rejects a missing table entry
 as an internal compiler error. IDs are meaningful only within their owning
@@ -1338,18 +1398,47 @@ Recursive direct arguments and postfix receiver calls remain single-line values.
 A structured body sum distinguishes that leaf from a match with ordered arms.
 Managed control-flow joins and general pass infrastructure remain future work.
 
-[`src/prelude_temp.brp`](src/prelude_temp.brp) is a target source input, not a
-host import. Its `type Int = builtin`, `type Float = builtin`,
-`type String = builtin` and `type Void = builtin` declarations establish the
-four builtin type identities. Its concrete functions use the closed runtime
-keys `builtin("int.to_string")` and `builtin("string.length")`. Prelude parsing
-translates those keys to typed operations once; checking validates their exact
-purity, parameter and result contracts. Module source can declare closed builtin
-bodies with those same contracts, but cannot redeclare builtin types. Quoted
-builtin labels use raw token contents; ordinary String expressions decode
-escapes once in parsing. Prelude and program diagnostics retain separate source origins.
-The shell loads relative local modules and bare imports under an optional,
-explicit target-library root. Prelude input remains explicit.
+The target library's [`_base/types.brp`](standard_library_temp/_base/types.brp)
+owns the builtin Int, Float, String, Void and List identities, and the ordinary
+Bool, Option and Result unions. Those types and constructors are available in
+every module. [`_base/prelude.brp`](standard_library_temp/_base/prelude.brp)
+supplies its written import scope to application roots and user helper modules.
+Library operation modules receive base types plus their own written imports.
+Neither foundation module can be explicitly imported. The compiler requires
+`--library-root DIRECTORY INPUT.brp OUTPUT.c`; there is no separate prelude
+input or host-library fallback.
+
+```blorp
+import:
+    ./foo: Foo
+    ./foo_ops: Foo methods_only
+    int: add
+
+func main() -> Int:
+    add(20, 22).to_string().length()
+```
+
+`module: Type` imports the type and enables the selected module's locally
+declared receiver functions through UFCS. `Type methods_only` enables those
+functions when the exact type is independently visible; it imports no type or
+constructors. Named function imports enable both direct and receiver calls.
+Forwarded types retain their original declaration identity. Constructor
+selection through a forwarding module resolves the original union's variants.
+Imported and implicit methods are never forwarded by ordinary modules.
+
+The checker associates receiver functions after accepting signatures, using
+type identities and full applied arguments. It merges overlapping exposures of
+the same function, distinguishes direct/UFCS availability in scope-owned typed
+bindings, and reports competing applicable declarations without ranking by
+import order. An unconstrained generic receiver is available through an
+explicit named function import; it is not associated with every type.
+[The imports design](IMPORTS_AND_PRELUDE_PLAN.md) specifies rejection behavior
+and the tested namespace/checker boundary.
+
+Closed builtin bodies remain ordinary module declarations. Parsing translates
+quoted runtime keys to typed operations; checking validates their purity,
+parameter and result contracts. Builtin type declarations belong only in the
+designated base module. All diagnostics retain the source module and byte span.
 
 C emission uses the whitespace required to separate C tokens and a final LF.
 It adds no indentation or internal line breaks for presentation.

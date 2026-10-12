@@ -5,14 +5,19 @@ A comprehensive reference for the blorp programming language.
 The separate [Blorp 2 pilot](../blorp_2/README.md) implements a restricted
 subset. Its current examples include immutable bindings and local `var`
 reassignment in function bodies and match-arm blocks, plus straight-line
-managed Strings through an explicit temporary prelude's concrete `to_string`
-and `length` functions. Self and mutual function recursion are supported with
+managed Strings through target-library `to_string` and `length` operations
+selected by an ordinary source-defined prelude. Self and mutual function recursion are supported with
 ordinary C stack usage; generic recursion must have finite concrete instances,
 and cyclic runtime data remains forbidden. Local selective function imports use
 explicit `./` or leading `../` paths; callees retain their defining module's
-scope, and only a root-local `main() -> Int` supplies the entrypoint. An explicit
-`--library-root` enables bare target-library imports; its temporary `int` module
-provides concrete wrapping `add`, also callable with UFCS. Closed builtin bodies
+scope, and only a root-local main supplies the entrypoint. It accepts either
+`main() -> Int` or `main(args: List[String]) -> Int`; argument index 0 is the
+executable name. The required `--library-root` supplies the foundation types
+and constructors, an ordinary prelude, and bare target-library imports. User
+helper modules receive the same defaults; library operation modules receive
+only the base. Type selections enable the selected module's receiver functions
+through UFCS; direct calls to imported functions require named function imports. Its temporary `int`
+module provides concrete wrapping `add`. Closed builtin bodies
 require their exact runtime signature. Quoted String literals accept valid UTF-8
 and Unicode scalar escapes; String length and source locations count bytes.
 Literal construction, copies and returns use ordinary managed ownership.
@@ -21,14 +26,20 @@ ordered binding and Void expression statements, and explicitly imported
 concrete `io.print(String) -> Void`. Print borrows its String, writes all bytes
 followed by LF, and is forbidden in pure callers. Every block retains an
 explicit final expression; main still returns Int. Selective union imports
-such as `option: Option(Some, None)` preserve ordinary nominal type and
-constructor identities. Concrete `string.parse_int` consumes complete ASCII
-decimal input within Int64 bounds; `io.read_line` returns an owned counted-byte
-String inside Option, removing LF and preserving all other bytes. String
-equality returns the library's ordinary Bool union. Concrete integer arithmetic
+preserve ordinary nominal type and constructor identities. Base already supplies
+Bool, Option, Result and their constructors in every module. Concrete
+`string.parse_int` consumes complete ASCII
+decimal input within Int64 bounds. Concrete `list.get` returns an owned
+Option[String], retaining a successful child independently of its list, and
+`list.length` counts arguments including the executable name. String
+and Int equality return the library's ordinary Bool union. Concrete integer arithmetic
 supports wrapping add/subtract/multiply and safe divide/remainder. The
 [calculator fixtures](../blorp_2/test/e2e/fixtures/calculator/) exercise these
-through normal main entrypoints with exact stdin, stdout, stderr and exit status.
+through normal main entrypoints with explicit process arguments and exact
+stdout, stderr and exit status. Their parsing and evaluation are pure and return
+ordinary Result values; only the output boundary prints. List[String] is the
+first supported concrete List instantiation; list construction and mutation
+remain deferred. The pilot no longer exposes read_line.
 Float64 literals and concrete arithmetic/formatting preserve typed numeric
 values through the pilot pipeline. Strict `string.parse_float` returns ordinary
 Option[Float]; source literals require finite values, while arithmetic may

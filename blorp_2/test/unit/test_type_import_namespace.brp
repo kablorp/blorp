@@ -1,0 +1,1130 @@
+import:
+	../../src/declarations: record_number, union_number, variant_number, variant_owner
+	../../src/names: find_name
+	../../src/namespace:
+		ImportProblem(
+			AmbiguousImportSelection, AmbiguousImportedType, MissingImportedType, MethodTypeNotVisible,
+			MissingImportedFunction, ImportedTypeConflict, RepeatedImportedVariant,
+		),
+		Namespace,
+		TypeCandidate(PrimitiveCandidate, ListCandidate, UnionCandidate, RecordCandidate),
+		build_namespace,
+		function_candidates,
+		import_problems,
+		method_selection_requests,
+		same_type_candidate,
+		type_candidates,
+		variant_candidates,
+	../../src/lex: lex
+	../../src/parse:
+		ParsedAssembly, ParsedProgram, append_module, assembly_names,
+		begin_program, parse_module, parsed_contents, seal_program,
+	../../src/prelude: PrimitiveType(BuiltinInt)
+	../../src/source:
+		COMPILER_SOURCE, ModuleId, ModuleKind(FoundationTypesModule, FoundationPreludeModule, LibraryModule, UserModule),
+		module_id, module_source, root_module_id, same_module,
+	../../src/syntax: Diagnostic
+	module_input: ModuleInput, TEST_BASE, parse_modules
+	int as IntOps
+	option: to_result
+	result: and_then, map
+	test: TestSuite
+
+
+private fixed record NamespaceInput {
+	program: ParsedProgram,
+	namespace: Namespace
+}
+
+
+private fixed record RoleModuleInput {
+	source: String,
+	targets: List[Int],
+	role: ModuleKind
+}
+
+
+private INVENTORY_ERROR: Diagnostic = {
+	span = { source = COMPILER_SOURCE, start = 0, end = 0 },
+	note = None,
+	message = "invalid namespace test inventory",
+	help = "supply nonnegative module ordinals and one target for each written import"
+}
+
+
+private pure func append_role_module(
+	assembly: ParsedAssembly,
+	input: RoleModuleInput,
+	position: Int,
+) -> Result[ParsedAssembly, Diagnostic]:
+	module ?= module_id(position).to_result(INVENTORY_ERROR)
+	tokens ?= lex(module_source(module), input.source)
+	parsed ?= parse_module(tokens, module, assembly_names(assembly))
+	var resolved: Result[List[ModuleId], Diagnostic] = Ok([])
+	for ordinal in input.targets:
+		resolved = resolved.and_then(pure func(targets): module_id(ordinal).to_result(INVENTORY_ERROR).map(pure func(target): targets.append(target)))
+	targets ?= resolved
+	append_module(assembly, parsed, targets, input.role)
+
+
+private pure func role_namespace(inputs: List[RoleModuleInput]) -> Result[NamespaceInput, Diagnostic]:
+	var assembly: Result[ParsedAssembly, Diagnostic] = Ok(begin_program())
+	var position: Int = 0
+	for input in inputs:
+		ordinal = position
+		assembly = assembly.and_then(pure func(builder): append_role_module(builder, input, ordinal))
+		position = IntOps.add(position, 1)
+	complete ?= assembly
+	program ?= seal_program(complete)
+	Ok({ program = program, namespace = build_namespace(program) })
+
+
+private pure func namespace_input(inputs: List[ModuleInput]) -> Result[NamespaceInput, Diagnostic]:
+	program ?= parse_modules(inputs)
+	Ok({
+		program = program,
+		namespace = build_namespace(program),
+	})
+
+
+private pure func candidates(
+	input: NamespaceInput,
+	ordinal: Int,
+	spelling: String,
+) -> List[TypeCandidate]:
+	match (module_id(ordinal), find_name(parsed_contents(input.program).names, spelling)):
+		(Some(module), Some(name)):
+			type_candidates(input.namespace, module, name)
+		_:
+			[]
+
+
+private pure func same_visible_type(
+	input: NamespaceInput,
+	left: Int,
+	right: Int,
+	spelling: String,
+) -> Bool:
+	match (candidates(input, left, spelling), candidates(input, right, spelling)):
+		([first], [second]):
+			same_type_candidate(first, second)
+		_:
+			False
+
+
+pure func test_bare_record_import_retains_owner_and_publishes_method_request() -> Bool:
+	root: String =
+		|import:
+		|    ./foo: Foo
+		|func main() -> Int:
+		|    0
+		|
+	owner: String =
+		|fixed record Foo { value: Int }
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = owner,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			match (
+				candidates(input, 0, "Foo"),
+				method_selection_requests(input.namespace),
+				module_id(1),
+			):
+				([RecordCandidate(receiver)], [request], Some(target)):
+					(
+						record_number(receiver) == 0
+						and same_visible_type(input, 0, 1, "Foo")
+						and same_module(request.module, root_module_id())
+						and same_module(request.target, target)
+						and same_type_candidate(request.receiver, RecordCandidate(receiver))
+						and request.name.span.start == 19
+						and request.name.span.end == 22
+						and import_problems(input.namespace).is_empty()
+					)
+				_:
+					False
+
+
+pure func test_bare_union_import_adds_type_without_constructors() -> Bool:
+	root: String =
+		|import:
+		|    ./choice: Choice
+		|func main() -> Int:
+		|    0
+		|
+	owner: String =
+		|fixed union Choice:
+		|    One
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = owner,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			match find_name(parsed_contents(input.program).names, "One"):
+				Some(name):
+					(
+						same_visible_type(input, 0, 1, "Choice")
+						and variant_candidates(input.namespace, root_module_id(), name).is_empty()
+					)
+				None:
+					False
+
+
+pure func test_builtin_types_forward_through_empty_operation_modules() -> Bool:
+	root: String =
+		|import:
+		|    ./operations: Int, List
+		|func main() -> Int:
+		|    0
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = "",
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			match (candidates(input, 0, "Int"), candidates(input, 0, "List")):
+				([PrimitiveCandidate(BuiltinInt)], [ListCandidate]):
+					(
+						same_visible_type(input, 0, 1, "Int")
+						and method_selection_requests(input.namespace).length() == 2
+						and import_problems(input.namespace).is_empty()
+					)
+				_:
+					False
+
+
+pure func test_forwarded_record_keeps_original_identity() -> Bool:
+	root: String =
+		|import:
+		|    ./facade: Foo
+		|func main() -> Int:
+		|    0
+		|
+	facade: String =
+		|import:
+		|    ./owner: Foo
+		|
+	owner: String =
+		|fixed record Foo { value: Int }
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = facade,
+				targets = [2]
+			},
+			{
+				source = owner,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			(
+				same_visible_type(input, 0, 2, "Foo")
+				and same_visible_type(input, 1, 2, "Foo")
+				and import_problems(input.namespace).is_empty()
+			)
+
+
+pure func test_diamond_forwarding_is_idempotent() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Foo
+		|    ./right: Foo
+		|func main() -> Int:
+		|    0
+		|
+	forward: String =
+		|import:
+		|    ./owner: Foo
+		|
+	owner: String =
+		|fixed record Foo { value: Int }
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1, 2]
+			},
+			{
+				source = forward,
+				targets = [3]
+			},
+			{
+				source = forward,
+				targets = [3]
+			},
+			{
+				source = owner,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			same_visible_type(input, 0, 3, "Foo") and import_problems(input.namespace).is_empty()
+
+
+pure func test_seeded_forwarding_cycle_converges() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Foo
+		|func main() -> Int:
+		|    0
+		|
+	left: String =
+		|import:
+		|    ./right: Foo
+		|
+	right: String =
+		|import:
+		|    ./left: Foo
+		|fixed record Foo { value: Int }
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = left,
+				targets = [2]
+			},
+			{
+				source = right,
+				targets = [1]
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			same_visible_type(input, 0, 2, "Foo") and import_problems(input.namespace).is_empty()
+
+
+pure func test_unseeded_forwarding_cycle_reports_missing_origin() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Foo
+		|func main() -> Int:
+		|    0
+		|
+	forward: String =
+		|import:
+		|    ./next: Foo
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = forward,
+				targets = [2]
+			},
+			{
+				source = forward,
+				targets = [1]
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			match import_problems(input.namespace):
+				[MissingImportedFunction(_, _), MissingImportedFunction(_, _), MissingImportedFunction(_, _)]:
+					candidates(input, 0, "Foo").is_empty()
+				_:
+					False
+
+
+pure func test_same_spelled_distinct_types_conflict() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Foo
+		|    ./right: Foo
+		|func main() -> Int:
+		|    0
+		|
+	owner: String =
+		|fixed record Foo { value: Int }
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1, 2]
+			},
+			{
+				source = owner,
+				targets = []
+			},
+			{
+				source = owner,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			match import_problems(input.namespace):
+				[ImportedTypeConflict(written, previous)]:
+					(
+						candidates(input, 0, "Foo").length() == 2
+						and written.span.start == 37
+						and previous.start == 20
+					)
+				_:
+					False
+
+
+pure func test_bare_type_and_local_function_selector_is_ambiguous() -> Bool:
+	root: String =
+		|import:
+		|    ./owner: Foo
+		|func main() -> Int:
+		|    0
+		|
+	owner: String =
+		|fixed record Foo { value: Int }
+		|pure func Foo() -> Int:
+		|    1
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = owner,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			match (
+				import_problems(input.namespace),
+				find_name(parsed_contents(input.program).names, "Foo"),
+			):
+				([AmbiguousImportSelection(_, written)], Some(name)):
+					(
+						written.span.start == 21
+						and candidates(input, 0, "Foo").is_empty()
+						and function_candidates(input.namespace, root_module_id(), name).is_empty()
+					)
+				_:
+					False
+
+
+pure func test_methods_only_requires_independent_caller_type() -> Bool:
+	root: String =
+		|import:
+		|    ./operations: Foo methods_only
+		|func main() -> Int:
+		|    0
+		|
+	operations: String =
+		|import:
+		|    ./owner: Foo
+		|
+	owner: String =
+		|fixed record Foo { value: Int }
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = operations,
+				targets = [2]
+			},
+			{
+				source = owner,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			match import_problems(input.namespace):
+				[MethodTypeNotVisible(written)]:
+					written.span.start == 26 and candidates(input, 0, "Foo").is_empty()
+				_:
+					False
+
+
+pure func test_methods_only_rejects_unrelated_same_named_caller_type() -> Bool:
+	root: String =
+		|import:
+		|    ./operations: Foo methods_only
+		|fixed record Foo { value: Int }
+		|func main() -> Int:
+		|    0
+		|
+	operations: String =
+		|fixed record Foo { value: Int }
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = operations,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			match import_problems(input.namespace):
+				[MethodTypeNotVisible(_)]:
+					(
+						not same_visible_type(input, 0, 1, "Foo")
+						and method_selection_requests(input.namespace).is_empty()
+					)
+				_:
+					False
+
+
+pure func test_methods_only_accepts_caller_local_declaration() -> Bool:
+	root: String =
+		|import:
+		|    ./operations: Foo methods_only
+		|fixed record Foo { value: Int }
+		|func main() -> Int:
+		|    0
+		|
+	operations: String =
+		|import:
+		|    ./root: Foo
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = operations,
+				targets = [0]
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			(
+				same_visible_type(input, 0, 1, "Foo")
+				and method_selection_requests(input.namespace).length() == 2
+				and import_problems(input.namespace).is_empty()
+			)
+
+
+private pure func reordered_methods_valid(root: String, targets: List[Int]) -> Bool:
+	operations: String =
+		|import:
+		|    ./owner: Foo
+		|
+	owner: String =
+		|fixed record Foo { value: Int }
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = targets
+			},
+			{
+				source = operations,
+				targets = [2]
+			},
+			{
+				source = owner,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			(
+				same_visible_type(input, 0, 2, "Foo")
+				and method_selection_requests(input.namespace).length() == 3
+				and import_problems(input.namespace).is_empty()
+			)
+
+
+pure func test_methods_only_is_independent_of_import_row_order() -> Bool:
+	first: String =
+		|import:
+		|    ./operations: Foo methods_only
+		|    ./owner: Foo
+		|func main() -> Int:
+		|    0
+		|
+	last: String =
+		|import:
+		|    ./owner: Foo
+		|    ./operations: Foo methods_only
+		|func main() -> Int:
+		|    0
+		|
+	reordered_methods_valid(
+		first,
+		[1, 2],
+	) and reordered_methods_valid(
+		last,
+		[2, 1],
+	)
+
+
+pure func test_methods_only_unknown_target_type_is_typed() -> Bool:
+	root: String =
+		|import:
+		|    ./operations: Foo methods_only
+		|func main() -> Int:
+		|    0
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = "",
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			match import_problems(input.namespace):
+				[MissingImportedType(_, written)]:
+					written.span.start == 26
+				_:
+					False
+
+
+pure func test_forwarded_constructor_uses_original_union_owner() -> Bool:
+	root: String =
+		|import:
+		|    ./facade: Choice(One)
+		|func main() -> Int:
+		|    0
+		|
+	facade: String =
+		|import:
+		|    ./owner: Choice()
+		|
+	owner: String =
+		|fixed union Choice:
+		|    One(Int)
+		|    Two
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = facade,
+				targets = [2]
+			},
+			{
+				source = owner,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			match (
+				candidates(input, 0, "Choice"),
+				find_name(parsed_contents(input.program).names, "One"),
+				module_id(1),
+			):
+				([UnionCandidate(owner_id)], Some(name), Some(forwarder)):
+					match variant_candidates(input.namespace, root_module_id(), name):
+						[variant]:
+							(
+								union_number(variant_owner(variant)) == union_number(owner_id)
+								and variant_number(variant) == 0
+								and variant_candidates(input.namespace, forwarder, name).is_empty()
+								and import_problems(input.namespace).is_empty()
+							)
+						_:
+							False
+				_:
+					False
+
+
+pure func test_constructor_overlap_is_idempotent() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Choice(One)
+		|    ./right: Choice(One)
+		|func main() -> Int:
+		|    0
+		|
+	forward: String =
+		|import:
+		|    ./owner: Choice()
+		|
+	owner: String =
+		|fixed union Choice:
+		|    One
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1, 2]
+			},
+			{
+				source = forward,
+				targets = [3]
+			},
+			{
+				source = forward,
+				targets = [3]
+			},
+			{
+				source = owner,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			match find_name(parsed_contents(input.program).names, "One"):
+				Some(name):
+					(
+						variant_candidates(input.namespace, root_module_id(), name).length() == 1
+						and import_problems(input.namespace).is_empty()
+					)
+				None:
+					False
+
+
+pure func test_repeated_explicit_constructor_selection_still_rejects() -> Bool:
+	root: String =
+		|import:
+		|    ./owner: Choice(One, One)
+		|func main() -> Int:
+		|    0
+		|
+	owner: String =
+		|fixed union Choice:
+		|    One
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = owner,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			match import_problems(input.namespace):
+				[RepeatedImportedVariant(_, _)]:
+					True
+				_:
+					False
+
+
+pure func test_function_import_does_not_forward_types_or_dependency_functions() -> Bool:
+	root: String =
+		|import:
+		|    ./facade: make, hidden
+		|func main() -> Int:
+		|    0
+		|
+	facade: String =
+		|import:
+		|    ./owner: Foo, hidden
+		|pure func make(value: Foo) -> Foo:
+		|    value
+		|
+	owner: String =
+		|fixed record Foo { value: Int }
+		|pure func hidden() -> Int:
+		|    1
+		|
+
+	match (
+		namespace_input([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = facade,
+				targets = [2]
+			},
+			{
+				source = owner,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(input):
+			match import_problems(input.namespace):
+				[MissingImportedFunction(_, _)]:
+					candidates(input, 0, "Foo").is_empty()
+				_:
+					False
+
+
+pure func test_base_type_conflicts_with_distinct_local_declaration() -> Bool:
+	root: String =
+		|fixed record Int { value: String }
+		|func main() -> Int:
+		|    0
+		|
+
+	match (
+		namespace_input(
+			[
+				{
+					source = root,
+					targets = []
+				},
+			],
+		)
+	):
+		Err(_):
+			False
+		Ok(input):
+			match import_problems(input.namespace):
+				[ImportedTypeConflict(written, _)]:
+					written.span.start == 13 and candidates(input, 0, "Int").length() == 2
+				_:
+					False
+
+
+pure func test_prelude_selected_scope_obeys_explicit_module_roles() -> Bool:
+	root: String =
+		|func main() -> Int:
+		|    0
+		|
+	operations: String =
+		|fixed union Choice:
+		|    One(Int)
+		|pure func number(value: Choice) -> Int:
+		|    42
+		|pure func answer() -> Int:
+		|    42
+		|
+	prelude: String =
+		|import:
+		|    ./operations: Choice(One), answer
+		|
+	match role_namespace([
+		{ source = root, targets = [], role = UserModule },
+		{ source = "", targets = [], role = UserModule },
+		{ source = "", targets = [], role = LibraryModule },
+		{ source = operations, targets = [], role = LibraryModule },
+		{ source = TEST_BASE, targets = [], role = FoundationTypesModule },
+		{ source = prelude, targets = [3], role = FoundationPreludeModule },
+	]):
+		Err(_): False
+		Ok(input):
+			match (
+				find_name(parsed_contents(input.program).names, "One"),
+				find_name(parsed_contents(input.program).names, "answer"),
+				module_id(1), module_id(2),
+			):
+				(Some(one), Some(answer), Some(helper), Some(library)):
+					(
+						same_visible_type(input, 0, 3, "Choice")
+						and same_visible_type(input, 1, 3, "Choice")
+						and candidates(input, 2, "Choice").is_empty()
+						and candidates(input, 4, "Choice").is_empty()
+						and candidates(input, 2, "Int").length() == 1
+						and variant_candidates(input.namespace, root_module_id(), one).length() == 1
+						and variant_candidates(input.namespace, helper, one).length() == 1
+						and variant_candidates(input.namespace, library, one).is_empty()
+						and function_candidates(input.namespace, root_module_id(), answer).length() == 1
+						and function_candidates(input.namespace, helper, answer).length() == 1
+						and function_candidates(input.namespace, library, answer).is_empty()
+						and method_selection_requests(input.namespace).length() == 3
+						and import_problems(input.namespace).is_empty()
+					)
+				_: False
+
+
+pure func test_local_prelude_declarations_do_not_supply_implicit_scope() -> Bool:
+	root: String =
+		|func main() -> Int:
+		|    0
+		|
+	prelude: String =
+		|fixed record Local { value: Int }
+		|pure func hidden() -> Int:
+		|    42
+		|
+	match role_namespace([
+		{ source = root, targets = [], role = UserModule },
+		{ source = TEST_BASE, targets = [], role = FoundationTypesModule },
+		{ source = prelude, targets = [], role = FoundationPreludeModule },
+	]):
+		Err(_): False
+		Ok(input):
+			match find_name(parsed_contents(input.program).names, "hidden"):
+				Some(hidden):
+					(
+						candidates(input, 0, "Local").is_empty()
+						and candidates(input, 2, "Local").length() == 1
+						and function_candidates(input.namespace, root_module_id(), hidden).is_empty()
+						and method_selection_requests(input.namespace).is_empty()
+						and import_problems(input.namespace).is_empty()
+					)
+				None: False
+
+
+pure func test_explicit_and_prelude_function_overlap_is_idempotent() -> Bool:
+	root: String =
+		|import:
+		|    ./operations: answer
+		|func main() -> Int:
+		|    answer()
+		|
+	operations: String =
+		|pure func answer() -> Int:
+		|    42
+		|
+	prelude: String =
+		|import:
+		|    ./operations: answer
+		|
+	match role_namespace([
+		{ source = root, targets = [1], role = UserModule },
+		{ source = operations, targets = [], role = LibraryModule },
+		{ source = TEST_BASE, targets = [], role = FoundationTypesModule },
+		{ source = prelude, targets = [1], role = FoundationPreludeModule },
+	]):
+		Err(_): False
+		Ok(input):
+			match find_name(parsed_contents(input.program).names, "answer"):
+				Some(answer): function_candidates(input.namespace, root_module_id(), answer).length() == 1 and import_problems(input.namespace).is_empty()
+				None: False
+
+
+pure func test_methods_only_adds_no_constructor_bindings() -> Bool:
+	root: String =
+		|import:
+		|    ./owner: Choice()
+		|    ./operations: Choice methods_only
+		|func main() -> Int:
+		|    0
+		|
+	operations: String =
+		|import:
+		|    ./owner: Choice(One)
+		|
+	owner: String =
+		|fixed union Choice:
+		|    One
+		|
+	match namespace_input([
+		{ source = root, targets = [2, 1] },
+		{ source = operations, targets = [2] },
+		{ source = owner, targets = [] },
+	]):
+		Err(_): False
+		Ok(input):
+			match (find_name(parsed_contents(input.program).names, "One"), module_id(1)):
+				(Some(one), Some(operations_module)):
+					(
+						variant_candidates(input.namespace, root_module_id(), one).is_empty()
+						and variant_candidates(input.namespace, operations_module, one).length() == 1
+						and same_visible_type(input, 0, 2, "Choice")
+						and import_problems(input.namespace).is_empty()
+					)
+				_: False
+
+
+pure func test_ambiguous_forwarded_type_keeps_both_identities_and_rejects_selection() -> Bool:
+	root: String =
+		|import:
+		|    ./facade: Foo
+		|func main() -> Int:
+		|    0
+		|
+	facade: String =
+		|import:
+		|    ./left: Foo
+		|    ./right: Foo
+		|
+	owner: String =
+		|fixed record Foo { value: Int }
+		|
+	match namespace_input([
+		{ source = root, targets = [1] },
+		{ source = facade, targets = [2, 3] },
+		{ source = owner, targets = [] },
+		{ source = owner, targets = [] },
+	]):
+		Err(_): False
+		Ok(input):
+			match import_problems(input.namespace):
+				[AmbiguousImportedType(_, _), ImportedTypeConflict(_, _)]: candidates(input, 0, "Foo").length() == 2
+				_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 type import identities and complete visibility closure",
+	tests = [
+		("prelude selected scope obeys explicit module roles", test_prelude_selected_scope_obeys_explicit_module_roles),
+		("local prelude declarations do not supply implicit scope", test_local_prelude_declarations_do_not_supply_implicit_scope),
+		("explicit and prelude function overlap is idempotent", test_explicit_and_prelude_function_overlap_is_idempotent),
+		("methods only adds no constructor bindings", test_methods_only_adds_no_constructor_bindings),
+		("ambiguous forwarded type keeps identities and rejects selection", test_ambiguous_forwarded_type_keeps_both_identities_and_rejects_selection),
+		(
+			"bare record import retains owner and publishes method request",
+			test_bare_record_import_retains_owner_and_publishes_method_request,
+		),
+		(
+			"bare union import adds type without constructors",
+			test_bare_union_import_adds_type_without_constructors,
+		),
+		(
+			"builtin types forward through empty operation modules",
+			test_builtin_types_forward_through_empty_operation_modules,
+		),
+		("forwarded record keeps original identity", test_forwarded_record_keeps_original_identity),
+		("diamond forwarding is idempotent", test_diamond_forwarding_is_idempotent),
+		("seeded forwarding cycle converges", test_seeded_forwarding_cycle_converges),
+		(
+			"unseeded forwarding cycle reports missing origin",
+			test_unseeded_forwarding_cycle_reports_missing_origin,
+		),
+		("same spelled distinct types conflict", test_same_spelled_distinct_types_conflict),
+		(
+			"bare type and local function selector is ambiguous",
+			test_bare_type_and_local_function_selector_is_ambiguous,
+		),
+		(
+			"methods only requires independent caller type",
+			test_methods_only_requires_independent_caller_type,
+		),
+		(
+			"methods only rejects unrelated same named caller type",
+			test_methods_only_rejects_unrelated_same_named_caller_type,
+		),
+		(
+			"methods only accepts caller local declaration",
+			test_methods_only_accepts_caller_local_declaration,
+		),
+		(
+			"methods only is independent of import row order",
+			test_methods_only_is_independent_of_import_row_order,
+		),
+		(
+			"methods only unknown target type is typed",
+			test_methods_only_unknown_target_type_is_typed,
+		),
+		(
+			"forwarded constructor uses original union owner",
+			test_forwarded_constructor_uses_original_union_owner,
+		),
+		("constructor overlap is idempotent", test_constructor_overlap_is_idempotent),
+		(
+			"repeated explicit constructor selection still rejects",
+			test_repeated_explicit_constructor_selection_still_rejects,
+		),
+		(
+			"function import does not forward types or dependency functions",
+			test_function_import_does_not_forward_types_or_dependency_functions,
+		),
+		(
+			"base type conflicts with distinct local declaration",
+			test_base_type_conflicts_with_distinct_local_declaration,
+		),
+	]
+}

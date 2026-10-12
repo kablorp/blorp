@@ -1,16 +1,16 @@
 import:
 	./prelude as Prelude:
 		BooleanRoles,
-		CheckedPrelude,
+		BuiltinTypeError,
 		OptionalRoles,
 		PrimitiveType(BuiltinInt, BuiltinFloat, BuiltinString, BuiltinVoid),
 		RuntimeOperation,
+		RuntimeParameter(PrimitiveParameter, StringListParameter),
 		RuntimeResult(PrimitiveResult, OptionalResult, BooleanResult),
 		builtin_operation,
-		prelude_names,
+		check_builtin_types,
 		primitive_operation,
 		runtime_contract,
-		runtime_operation,
 	declarations:
 		FunctionId,
 		RecordId,
@@ -26,23 +26,23 @@ import:
 		variant_number,
 		variant_owner,
 	int as IntOps
-	names: NameId, SpecialNames, same_name
+	list: contains
+	names: NameId, same_name
 	namespace:
 		FunctionOrigin(LocalFunction, ImportedFunction),
-		ImportProblem(
-			RepeatedModuleImport, MissingImportedFunction, UnsupportedTypeImport,
-			MissingImportedUnion, AmbiguousImportedUnion, MissingImportedVariant,
-			RepeatedImportedVariant, ImportedTypeConflict,
-		),
+		ImportProblem,
 		ImportedFunctionBinding,
 		Namespace,
-		TypeCandidate(UnionCandidate, RecordCandidate),
+		TypeCandidate(PrimitiveCandidate, ListCandidate, UnionCandidate, RecordCandidate),
 		build_namespace,
 		function_candidates,
+		import_problem_span,
 		import_problems,
 		imported_functions,
 		imported_variants,
 		local_function_candidates,
+		method_selection_requests,
+		same_type_candidate,
 		type_candidates,
 		variant_candidates,
 	option: is_some, to_result
@@ -52,9 +52,10 @@ import:
 	syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
 		CallNotation(DirectCall, ReceiverCall),
+		Entrypoint(NoArguments, WithArguments),
 		ExpressionBase(
-			VoidExpression, IntegerExpression, FloatExpression, StringExpression, NameExpression, DirectApplication,
-			RecordExpression,
+			VoidExpression, IntegerExpression, FloatExpression, StringExpression, NameExpression,
+			DirectApplication, RecordExpression,
 		),
 		FieldPattern(FieldName, FieldWildcard),
 		FunctionExecution(OrdinaryCalls, SelfTailLoop),
@@ -67,7 +68,10 @@ import:
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
 		ParsedRecord,
 		ParsedRecordField,
-		ParsedRuntimeOperation(StringParseIntBuiltin, StringParseFloatBuiltin, IoReadLineBuiltin, StringEqualsBuiltin),
+		ParsedRuntimeOperation(
+			StringParseIntBuiltin, StringParseFloatBuiltin, ListGetBuiltin, StringEqualsBuiltin,
+			IntegerEqualsBuiltin,
+		),
 		ParsedStatement(BindingStatement, ExpressionStatement),
 		ParsedUnion,
 		PostfixOperation(ReceiverInvocation, FieldAccess),
@@ -78,6 +82,7 @@ import:
 		ValueExpression,
 		WrittenName,
 		same_purity,
+		same_span,
 		type_span,
 
 
@@ -115,6 +120,7 @@ fixed union TypeRef:
 	IntType
 	FloatType
 	StringType
+	ListType(TypeRef)
 	RecordType(RecordId)
 	UnionType(UnionId)
 	AppliedUnionType(UnionId, List[TypeRef])
@@ -164,33 +170,12 @@ private pure func primitive_ref(value_type: PrimitiveType) -> TypeRef:
 			StringType
 
 
-private pure func runtime_signature(
-	operation: RuntimeOperation[VariantId],
-	span: Span,
-) -> Result[FunctionSignature, CheckError]:
-	contract = runtime_contract(operation)
-
-	result_type ?= match contract.return_type:
-		PrimitiveResult(primitive):
-			Ok(primitive_ref(primitive))
-		OptionalResult(_, _) | BooleanResult(_):
-			Err(checker_invariant(span, RuntimeGenericContract))
-
-	parameters = contract.parameters.map(pure func(parameter: PrimitiveType) -> TypeUse:
-		{
-			value_type = primitive_ref(parameter),
-			span = span
-		}
-	)
-	Ok({
-		type_parameters = [],
-		purity = contract.purity,
-		parameters = parameters,
-		return_type = {
-			value_type = result_type,
-			span = span
-		},
-	})
+private pure func runtime_parameter_ref(parameter: RuntimeParameter) -> TypeRef:
+	match parameter:
+		PrimitiveParameter(primitive):
+			primitive_ref(primitive)
+		StringListParameter:
+			ListType(StringType)
 
 
 -- IDs are dense ordinals owned by one sealed checked function, never roles.
@@ -314,7 +299,7 @@ fixed record CheckedFunctions {
 	records: List[CheckedRecord],
 	unions: List[CheckedUnion],
 	functions: List[CheckedFunction],
-	entrypoint: FunctionId
+	entrypoint: Entrypoint[FunctionId]
 }
 
 
@@ -331,6 +316,12 @@ pure func field_number(id: FieldId) -> Int:
 
 pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 	match left:
+		ListType(left):
+			match right:
+				ListType(right):
+					same_type(left, right)
+				_:
+					False
 		RecordType(left):
 			match right:
 				RecordType(right):
@@ -514,11 +505,23 @@ fixed union PayloadRule:
 
 fixed union PreviousTypeDeclaration:
 	SourceTypeDeclaration(Span)
-	PreludeTypeDeclaration(NameId)
+
+
+-- Source locations explain candidates; availability remains scope-owned.
+fixed record MethodCandidateSite {
+	function: FunctionId,
+	declaration: Span,
+	import_site: Option[Span]
+}
 
 
 fixed union CheckErrorKind:
 	NonVoidStatement(TypeRef)
+	BuiltinTypesRejected(BuiltinTypeError)
+	AmbiguousMethod(NameId, TypeRef, List[MethodCandidateSite])
+	NoApplicableMethod(NameId, TypeRef, List[MethodCandidateSite])
+	MethodArgumentCounts(NameId, Int, List[Int], List[MethodCandidateSite])
+	MethodReceiverNeedsType(NameId, List[MethodCandidateSite])
 	BuiltinContractMismatch(RuntimeOperation[WrittenName])
 	BuiltinResultUnion
 	BuiltinRoleNotInResult(NameId, TypeRef)
@@ -542,13 +545,15 @@ fixed union CheckErrorKind:
 	DuplicateTypeParameter(TypeParameterId, TypeParameterId, Span)
 	DuplicateLocal(BindingSite)
 	VariantFunctionConflict(NameId, Span, Span)
-	VariantPreludeConflict(NameId)
 	ImportRejected(ImportProblem)
 	ImportedFunctionConflict(NameId, Span)
 	ImportedVariantConflict(NameId, Span)
 	ImportedConstructorConflict(NameId, Span)
 	GenericMain(TypeParameterId)
 	MainHasParameters(Int)
+	MainParameterType
+	ListTypeArgumentCount
+	UnsupportedListElement
 	MainReturnType(TypeRef)
 	MissingMain
 	UnknownType(NameId)
@@ -614,21 +619,11 @@ private fixed record ExpectedValue {
 }
 
 
-private pure func find_record(namespace: Namespace, module: ModuleId, name: NameId) -> Option[RecordId]:
-	var found: Option[RecordId] = None
-
-	for candidate in type_candidates(namespace, module, name):
-		match candidate:
-			RecordCandidate(id):
-				found = Some(id)
-				break
-			UnionCandidate(_):
-				void
-
-	found
-
-
-private pure func find_union(namespace: Namespace, module: ModuleId, name: NameId) -> Option[UnionId]:
+private pure func find_union(
+	namespace: Namespace,
+	module: ModuleId,
+	name: NameId,
+) -> Option[UnionId]:
 	var found: Option[UnionId] = None
 
 	for candidate in type_candidates(namespace, module, name):
@@ -636,14 +631,16 @@ private pure func find_union(namespace: Namespace, module: ModuleId, name: NameI
 			UnionCandidate(id):
 				found = Some(id)
 				break
-			RecordCandidate(_):
+			RecordCandidate(_) | PrimitiveCandidate(_) | ListCandidate:
 				void
 
 	found
 
 
 private pure func contains_variant(namespace: Namespace, module: ModuleId, name: NameId) -> Bool:
-	variant_candidates(namespace, module, name).get(0).is_some()
+	variant_candidates(namespace, module, name)
+		.get(0)
+		.is_some()
 
 
 private pure func validate_union(
@@ -651,10 +648,9 @@ private pure func validate_union(
 	functions: List[ParsedFunction],
 	owner: UnionId,
 	type_names: List[PreviousDeclaration],
-	special: SpecialNames,
 	namespace: Namespace,
 ) -> Result[CheckedDeclaration, CheckError]:
-	unique ?= validate_type_name(declaration.type_name, type_names, UnionKind, special, declaration.module)
+	unique ?= validate_type_name(declaration.type_name, type_names, UnionKind, declaration.module)
 	var previous: List[WrittenName] = []
 	var failure: Option[CheckError] = None
 
@@ -715,11 +711,10 @@ private pure func validate_union(
 	parameters ?= local_type_parameters(
 		declaration.type_parameters,
 		UnionDeclaration(owner),
-		special,
 		namespace,
 		declaration.module,
 	)
-	shapes ?= resolve_payloads(declaration, parameters, special)
+	shapes ?= resolve_payloads(declaration, parameters, namespace)
 	Ok(
 		UnionDeclarationResult(
 			declaration.module,
@@ -759,7 +754,6 @@ private pure func validate_type_name(
 	name: WrittenName,
 	previous: List[PreviousDeclaration],
 	kind: DeclarationKind,
-	special: SpecialNames,
 	module: ModuleId,
 ) -> Result[Void, CheckError]:
 	var earlier: Option[PreviousDeclaration] = None
@@ -769,15 +763,9 @@ private pure func validate_type_name(
 			earlier = Some(declaration)
 			break
 
-	previous_type = if (
-		same_name(name.id, special.integer)
-		or same_name(name.id, special.float)
-		or same_name(name.id, special.string)
-		or same_name(name.id, special.unit)
-	):
-		Some(PreludeTypeDeclaration(name.id))
-	else:
-		earlier.map(pure func(declaration): SourceTypeDeclaration(declaration.name.span))
+	previous_type = earlier.map(
+		pure func(declaration): SourceTypeDeclaration(declaration.name.span),
+	)
 
 	match previous_type:
 		Some(first):
@@ -807,7 +795,6 @@ private pure func validate_declarations(
 	unions: List[ParsedUnion],
 	records: List[ParsedRecord],
 	functions: List[ParsedFunction],
-	special: SpecialNames,
 	namespace: Namespace,
 ) -> Result[CheckedDeclarations, CheckError]:
 	var previous: List[PreviousDeclaration] = []
@@ -829,9 +816,15 @@ private pure func validate_declarations(
 				match union_next:
 					Some(other):
 						if same_module(declaration.module, other.module):
-							IntOps.less_than(declaration.type_name.span.start, other.type_name.span.start)
+							IntOps.less_than(
+								declaration.type_name.span.start,
+								other.type_name.span.start,
+							)
 						else:
-							IntOps.less_than(module_number(declaration.module), module_number(other.module))
+							IntOps.less_than(
+								module_number(declaration.module),
+								module_number(other.module),
+							)
 					None:
 						True
 			None:
@@ -840,7 +833,7 @@ private pure func validate_declarations(
 		result: Result[CheckedDeclaration, CheckError] = if use_record:
 			match record_next:
 				Some(declaration):
-					check_record_declaration(declaration, previous, unions, special, namespace)
+					check_record_declaration(declaration, previous, unions, namespace)
 				None:
 					Err(
 						checker_invariant(
@@ -860,7 +853,6 @@ private pure func validate_declarations(
 						functions,
 						union_id(union_position),
 						previous,
-						special,
 						namespace,
 					)
 				None:
@@ -910,10 +902,9 @@ private pure func check_record_declaration(
 	declaration: ParsedRecord,
 	type_names: List[PreviousDeclaration],
 	unions: List[ParsedUnion],
-	special: SpecialNames,
 	namespace: Namespace,
 ) -> Result[CheckedDeclaration, CheckError]:
-	unique ?= validate_type_name(declaration.type_name, type_names, RecordKind, special, declaration.module)
+	unique ?= validate_type_name(declaration.type_name, type_names, RecordKind, declaration.module)
 	var previous: List[WrittenName] = []
 	var fields: List[TypeUse] = []
 	var failure: Option[CheckError] = None
@@ -930,7 +921,6 @@ private pure func check_record_declaration(
 			None:
 				resolve_type(
 					unions,
-					special,
 					field.type_name,
 					[],
 					namespace,
@@ -962,13 +952,19 @@ private pure func check_record_declaration(
 		Some(error):
 			Err(error)
 		None:
-			Ok(RecordDeclarationResult(declaration.module, declaration.type_name, {fields = fields}))
+			Ok(
+				RecordDeclarationResult(
+					declaration.module,
+					declaration.type_name,
+					{fields = fields},
+				),
+			)
 
 
 private pure func resolve_payloads(
 	declaration: ParsedUnion,
 	type_parameters: List[LocalTypeParameter],
-	special: SpecialNames,
+	namespace: Namespace,
 ) -> Result[List[Option[TypeUse]], CheckError]:
 	var shapes: List[Option[TypeUse]] = []
 	var failure: Option[CheckError] = None
@@ -985,7 +981,12 @@ private pure func resolve_payloads(
 					pure func(parameter: LocalTypeParameter): parameter.id,
 				)
 
-				value_result: Result[TypeRef, CheckError] = if same_name(name.id, special.integer):
+				value_result: Result[TypeRef, CheckError] = if visible_primitive(
+					namespace,
+					declaration.module,
+					name.id,
+					BuiltinInt,
+				):
 					Ok(IntType)
 				else:
 					match parameter:
@@ -1046,7 +1047,6 @@ private pure func lookup_type_parameter(
 private pure func local_type_parameters(
 	written: List[WrittenName],
 	owner: TypeParameterOwner,
-	special: SpecialNames,
 	namespace: Namespace,
 	module: ModuleId,
 ) -> Result[List[LocalTypeParameter], CheckError]:
@@ -1068,14 +1068,7 @@ private pure func local_type_parameters(
 					),
 				)
 			None:
-				if (
-					same_name(name.id, special.integer)
-					or same_name(name.id, special.float)
-					or same_name(name.id, special.string)
-					or same_name(name.id, special.unit)
-					or find_union(namespace, module, name.id).is_some()
-					or find_record(namespace, module, name.id).is_some()
-				):
+				if not type_candidates(namespace, module, name.id).is_empty():
 					failure = Some(
 						check_rejection(
 							name.span,
@@ -1106,7 +1099,6 @@ private fixed union FunctionRole:
 private pure func resolve_type_parameters(
 	function: ParsedFunction,
 	id: FunctionId,
-	special: SpecialNames,
 	namespace: Namespace,
 	role: FunctionRole,
 ) -> Result[List[LocalTypeParameter], CheckError]:
@@ -1126,7 +1118,6 @@ private pure func resolve_type_parameters(
 	local_type_parameters(
 		function.type_parameters,
 		FunctionDeclaration(id),
-		special,
 		namespace,
 		function.module,
 	)
@@ -1138,9 +1129,29 @@ private pure func declared_parameters(
 	parameters.map(pure func(parameter: LocalTypeParameter): parameter.id)
 
 
+private pure func visible_primitive(
+	namespace: Namespace,
+	module: ModuleId,
+	name: NameId,
+	primitive: PrimitiveType,
+) -> Bool:
+	match type_candidates(namespace, module, name):
+		[PrimitiveCandidate(candidate)]:
+			same_type(primitive_ref(candidate), primitive_ref(primitive))
+		_:
+			False
+
+
+private pure func visible_list(namespace: Namespace, module: ModuleId, name: NameId) -> Bool:
+	match type_candidates(namespace, module, name):
+		[ListCandidate]:
+			True
+		_:
+			False
+
+
 private pure func resolve_atomic_type(
 	unions: List[ParsedUnion],
-	special: SpecialNames,
 	name: WrittenName,
 	type_parameters: List[LocalTypeParameter],
 	namespace: Namespace,
@@ -1157,47 +1168,37 @@ private pure func resolve_atomic_type(
 		Some(id):
 			Ok(ParameterType(id))
 		None:
-			if same_name(name.id, special.integer):
-				Ok(IntType)
-			else if same_name(name.id, special.float):
-				Ok(FloatType)
-			else if same_name(name.id, special.unit):
-				Ok(VoidType)
-			else if same_name(name.id, special.string):
-				Ok(StringType)
-			else:
-				match find_union(namespace, module, name.id):
-					Some(id):
-						declaration ?= match unions.get(union_number(id)):
-							Some(declaration):
-								Ok(declaration)
-							None:
-								Err(checker_invariant(name.span, InvalidUnionDeclaration(id)))
+			match type_candidates(namespace, module, name.id):
+				[PrimitiveCandidate(primitive)]:
+					Ok(primitive_ref(primitive))
+				[ListCandidate]:
+					Err(check_rejection(name.span, ListTypeArgumentCount))
+				[RecordCandidate(id)]:
+					Ok(RecordType(id))
+				[UnionCandidate(id)]:
+					declaration ?= unions
+						.get(union_number(id))
+						.to_result(checker_invariant(name.span, InvalidUnionDeclaration(id)))
 
-						match declaration.type_parameters:
-							[]:
-								Ok(UnionType(id))
-							_:
-								Err(
-									check_rejection(
-										name.span,
-										MissingUnionTypeArguments(
-											id,
-											declaration.type_parameters.length(),
-										),
+					match declaration.type_parameters:
+						[]:
+							Ok(UnionType(id))
+						_:
+							Err(
+								check_rejection(
+									name.span,
+									MissingUnionTypeArguments(
+										id,
+										declaration.type_parameters.length(),
 									),
-								)
-					None:
-						match find_record(namespace, module, name.id):
-							Some(id):
-								Ok(RecordType(id))
-							None:
-								Err(check_rejection(name.span, UnknownType(name.id)))
+								),
+							)
+				_:
+					Err(check_rejection(name.span, UnknownType(name.id)))
 
 
 private pure func resolve_type(
 	unions: List[ParsedUnion],
-	special: SpecialNames,
 	written: TypeSyntax,
 	type_parameters: List[LocalTypeParameter],
 	namespace: Namespace,
@@ -1205,54 +1206,67 @@ private pure func resolve_type(
 ) -> Result[TypeRef, CheckError]:
 	match written:
 		AtomicType(name):
-			resolve_atomic_type(unions, special, name, type_parameters, namespace, module)
+			resolve_atomic_type(unions, name, type_parameters, namespace, module)
 		AppliedType(name, arguments, span):
-			owner ?= match find_union(namespace, module, name.id):
-				Some(owner):
-					Ok(owner)
-				None:
-					Err(check_rejection(name.span, NonApplicableType(name.id)))
+			if visible_list(namespace, module, name.id):
+				match arguments:
+					[element]:
+						value ?= resolve_type(unions, element, type_parameters, namespace, module)
 
-			declaration ?= match unions.get(union_number(owner)):
-				Some(declaration):
-					Ok(declaration)
-				None:
-					Err(checker_invariant(span, InvalidUnionDeclaration(owner)))
+						match value:
+							StringType | ParameterType(_):
+								Ok(ListType(value))
+							_:
+								Err(check_rejection(type_span(element), UnsupportedListElement))
+					_:
+						Err(check_rejection(span, ListTypeArgumentCount))
+			else:
+				owner ?= match find_union(namespace, module, name.id):
+					Some(owner):
+						Ok(owner)
+					None:
+						Err(check_rejection(name.span, NonApplicableType(name.id)))
 
-			arity ?= match declaration.type_parameters:
-				[]:
-					Err(check_rejection(span, OrdinaryUnionApplied(owner)))
-				_:
-					if IntOps.equals(declaration.type_parameters.length(), arguments.length()):
-						Ok(void)
-					else:
-						Err(
-							check_rejection(
-								span,
-								UnionTypeArgumentCountMismatch(
-									owner,
-									declaration.type_parameters.length(),
-									arguments.length(),
+				declaration ?= match unions.get(union_number(owner)):
+					Some(declaration):
+						Ok(declaration)
+					None:
+						Err(checker_invariant(span, InvalidUnionDeclaration(owner)))
+
+				arity ?= match declaration.type_parameters:
+					[]:
+						Err(check_rejection(span, OrdinaryUnionApplied(owner)))
+					_:
+						if IntOps.equals(declaration.type_parameters.length(), arguments.length()):
+							Ok(void)
+						else:
+							Err(
+								check_rejection(
+									span,
+									UnionTypeArgumentCountMismatch(
+										owner,
+										declaration.type_parameters.length(),
+										arguments.length(),
+									),
 								),
-							),
-						)
+							)
 
-			var values: List[TypeRef] = []
-			var failure: Option[CheckError] = None
+				var values: List[TypeRef] = []
+				var failure: Option[CheckError] = None
 
-			for argument in arguments:
-				match resolve_type(unions, special, argument, type_parameters, namespace, module):
-					Ok(value):
-						values = values.append(value)
-					Err(error):
-						failure = Some(error)
-						break
+				for argument in arguments:
+					match resolve_type(unions, argument, type_parameters, namespace, module):
+						Ok(value):
+							values = values.append(value)
+						Err(error):
+							failure = Some(error)
+							break
 
-			match failure:
-				Some(error):
-					Err(error)
-				None:
-					Ok(AppliedUnionType(owner, values))
+				match failure:
+					Some(error):
+						Err(error)
+					None:
+						Ok(AppliedUnionType(owner, values))
 
 
 private fixed record AcceptedFunctionDeclaration {
@@ -1263,7 +1277,7 @@ private fixed record AcceptedFunctionDeclaration {
 
 private fixed record CheckedSignatures {
 	functions: List[AcceptedFunctionDeclaration],
-	entrypoint: FunctionId
+	entrypoint: Entrypoint[FunctionId]
 }
 
 
@@ -1271,7 +1285,6 @@ private pure func resolve_parameters(
 	parameters: List[ParsedParameter],
 	role: FunctionRole,
 	unions: List[ParsedUnion],
-	special: SpecialNames,
 	type_parameters: List[LocalTypeParameter],
 	namespace: Namespace,
 	module: ModuleId,
@@ -1280,27 +1293,55 @@ private pure func resolve_parameters(
 	var seen: List[WrittenName] = []
 	var failure: Option[CheckError] = None
 
-	for parameter in parameters:
-		result: Result[TypeRef, CheckError] = match role:
+	if IntOps.greater_than(parameters.length(), 1):
+		match role:
 			EntryFunction:
-				Err(check_rejection(parameter.name.span, MainHasParameters(parameters.length())))
-			HelperFunction:
-				match previous_declaration(seen, parameter.name.id):
-					Some(first):
-						Err(
+				match parameters.get(1):
+					Some(parameter):
+						failure = Some(
 							check_rejection(
 								parameter.name.span,
-								DuplicateParameter(parameter.name.id, first.span),
+								MainHasParameters(parameters.length()),
 							),
 						)
 					None:
-						resolve_type(unions, special, parameter.type_name, type_parameters, namespace, module)
+						void
+			HelperFunction:
+				void
+
+	for parameter in parameters:
+		if failure.is_some():
+			break
+
+		result = match previous_declaration(seen, parameter.name.id):
+			Some(first):
+				Err(
+					check_rejection(
+						parameter.name.span,
+						DuplicateParameter(parameter.name.id, first.span),
+					),
+				)
+			None:
+				resolve_type(unions, parameter.type_name, type_parameters, namespace, module)
 
 		match result:
 			Err(error):
 				failure = Some(error)
 				break
 			Ok(value_type):
+				match role:
+					EntryFunction:
+						if not same_type(value_type, ListType(StringType)):
+							failure = Some(
+								check_rejection(
+									type_span(parameter.type_name),
+									MainParameterType,
+								),
+							)
+							break
+					HelperFunction:
+						void
+
 				resolved = resolved.append({
 					value_type = value_type,
 					span = type_span(parameter.type_name),
@@ -1318,13 +1359,18 @@ private pure func resolve_signature(
 	function: ParsedFunction,
 	id: FunctionId,
 	unions: List[ParsedUnion],
-	special: SpecialNames,
 	namespace: Namespace,
 	role: FunctionRole,
 	checked_unions: List[CheckedUnion],
 ) -> Result[AcceptedFunctionDeclaration, CheckError]:
-	local_parameters ?= resolve_type_parameters(function, id, special, namespace, role)
-	return_type ?= resolve_type(unions, special, function.return_type, local_parameters, namespace, function.module)
+	local_parameters ?= resolve_type_parameters(function, id, namespace, role)
+	return_type ?= resolve_type(
+		unions,
+		function.return_type,
+		local_parameters,
+		namespace,
+		function.module,
+	)
 
 	main_type ?= match role:
 		EntryFunction:
@@ -1339,7 +1385,6 @@ private pure func resolve_signature(
 		function.parameters,
 		role,
 		unions,
-		special,
 		local_parameters,
 		namespace,
 		function.module,
@@ -1382,14 +1427,14 @@ private pure func validate_signatures(
 	functions: List[ParsedFunction],
 	unions: List[ParsedUnion],
 	end: Span,
-	special: SpecialNames,
+	entrypoint_name: NameId,
 	namespace: Namespace,
 	checked_unions: List[CheckedUnion],
 ) -> Result[CheckedSignatures, CheckError]:
 	var previous: List[PreviousFunction] = []
 	var signatures: List[AcceptedFunctionDeclaration] = []
 	var failure: Option[CheckError] = None
-	entrypoint = find_function(namespace, root_module_id(), special.main)
+	entrypoint = find_function(namespace, root_module_id(), entrypoint_name)
 
 	for function in functions:
 		match previous_function(previous, function.module, function.function_name.id):
@@ -1415,14 +1460,17 @@ private pure func validate_signatures(
 			None:
 				HelperFunction
 
-		match resolve_signature(function, id, unions, special, namespace, role, checked_unions):
+		match resolve_signature(function, id, unions, namespace, role, checked_unions):
 			Err(error):
 				failure = Some(error)
 				break
 			Ok(signature):
 				signatures = signatures.append(signature)
 
-		previous = previous.append({module = function.module, name = function.function_name})
+		previous = previous.append({
+			module = function.module,
+			name = function.function_name,
+		})
 
 	match failure:
 		Some(error):
@@ -1430,9 +1478,19 @@ private pure func validate_signatures(
 		None:
 			match entrypoint:
 				Some(id):
+					declaration ?= signatures
+						.get(function_number(id))
+						.to_result(checker_invariant(end, InvalidResolvedFunction(id)))
+
+					accepted: Entrypoint[FunctionId] = match declaration.signature.parameters:
+						[]:
+							NoArguments(id)
+						_:
+							WithArguments(id)
+
 					Ok({
 						functions = signatures,
-						entrypoint = id,
+						entrypoint = accepted,
 					})
 				None:
 					Err(check_rejection(end, MissingMain))
@@ -1503,7 +1561,8 @@ private fixed record ResolutionContext {
 	unions: List[ParsedUnion],
 	checked_unions: List[CheckedUnion],
 	records: List[ParsedRecord],
-	prelude: CheckedPrelude
+	callables: List[CallableBinding],
+	function_declarations: List[ParsedFunction]
 }
 
 
@@ -1527,8 +1586,13 @@ private fixed record CallContract {
 }
 
 
+private fixed union ResolvedReceiver:
+	UniqueReceiver(CallContract)
+	ReceiverCandidates(List[CallableBinding])
+
+
 private fixed union ResolvedPostfix:
-	InvokeReceiver(ReceiverApplication, CallContract)
+	InvokeReceiver(ReceiverApplication, ResolvedReceiver)
 	ReadField(WrittenName)
 
 
@@ -1539,41 +1603,499 @@ private fixed union ResolvedApplication:
 
 private pure func resolve_function_target(
 	name: WrittenName,
-	target: CallTarget,
+	id: FunctionId,
 	signatures: List[AcceptedFunctionDeclaration],
 ) -> Result[ResolvedCall, CheckError]:
-	signature ?= match target:
-		UserFunction(id, _):
-			match signatures.get(function_number(id)):
-				Some(signature):
-					Ok(signature.signature)
-				None:
-					Err(checker_invariant(name.span, InvalidResolvedFunction(id)))
-		RuntimeFunction(operation):
-			runtime_signature(operation, name.span)
-
+	accepted ?= signatures
+		.get(function_number(id))
+		.to_result(checker_invariant(name.span, InvalidResolvedFunction(id)))
 	Ok({
 		call = {
-			target = target,
+			target = UserFunction(id, []),
 			span = name.span
 		},
-		signature = signature,
+		signature = accepted.signature,
 	})
 
 
-private pure func lookup_target(
-	namespace: Namespace,
+private fixed union CallableVisibility:
+	DirectAndUfcs
+	UfcsOnly
+
+
+private fixed record CallableBinding {
 	module: ModuleId,
-	prelude: CheckedPrelude,
+	name: NameId,
+	function: FunctionId,
+	visibility: CallableVisibility,
+	origin: FunctionOrigin
+}
+
+
+private pure func callable_candidates(
+	bindings: List[CallableBinding],
+	module: ModuleId,
+	name: NameId,
+	notation: CallNotation,
+) -> List[CallableBinding]:
+	var candidates: List[CallableBinding] = []
+
+	for binding in bindings:
+		visible = match notation:
+			ReceiverCall:
+				True
+			DirectCall:
+				match binding.visibility:
+					DirectAndUfcs:
+						True
+					UfcsOnly:
+						False
+
+		if (
+			visible
+			and same_module(binding.module, module)
+			and same_name(binding.name, name)
+		):
+			candidates = candidates.append(binding)
+
+	candidates
+
+
+private pure func lookup_target(
+	context: ResolutionContext,
 	name: WrittenName,
-) -> Result[Option[CallTarget], CheckError]:
-	match function_candidates(namespace, module, name.id):
+) -> Result[Option[FunctionId], CheckError]:
+	match callable_candidates(context.callables, context.module, name.id, DirectCall):
 		[]:
-			Ok(runtime_operation(prelude, name.id).map(pure func(operation): RuntimeFunction(operation)))
+			Ok(None)
 		[candidate]:
-			Ok(Some(UserFunction(candidate.function, [])))
+			Ok(Some(candidate.function))
 		[_, _, ..._]:
 			Err(checker_invariant(name.span, AmbiguousResolvedFunction(name.id)))
+
+
+private pure func receiver_head(value_type: TypeRef) -> Option[TypeCandidate]:
+	match value_type:
+		VoidType:
+			Some(PrimitiveCandidate(BuiltinVoid))
+		IntType:
+			Some(PrimitiveCandidate(BuiltinInt))
+		FloatType:
+			Some(PrimitiveCandidate(BuiltinFloat))
+		StringType:
+			Some(PrimitiveCandidate(BuiltinString))
+		ListType(_):
+			Some(ListCandidate)
+		RecordType(id):
+			Some(RecordCandidate(id))
+		UnionType(id):
+			Some(UnionCandidate(id))
+		AppliedUnionType(id, _):
+			Some(UnionCandidate(id))
+		ParameterType(_):
+			None
+
+
+private pure func append_callable(
+	bindings: List[CallableBinding],
+	incoming: CallableBinding,
+) -> List[CallableBinding]:
+	var result = bindings
+	var position = 0
+	var found = False
+
+	for binding in bindings:
+		if (
+			same_module(binding.module, incoming.module)
+			and IntOps.equals(function_number(binding.function), function_number(incoming.function))
+		):
+			-- Availability belongs to this scope. A named exposure promotes the
+			-- existing identity without creating another overload candidate.
+			match incoming.visibility:
+				DirectAndUfcs:
+					result = result.set(position, { incoming | visibility = DirectAndUfcs })
+				UfcsOnly:
+					void
+
+			found = True
+			break
+
+		position = IntOps.add(position, 1)
+
+	if found:
+		result
+	else:
+		result.append(incoming)
+
+
+private pure func build_callables(
+	functions: List[ParsedFunction],
+	namespace: Namespace,
+	signatures: List[AcceptedFunctionDeclaration],
+) -> Result[List[CallableBinding], CheckError]:
+	-- Derived once after accepted signatures. Bindings retain only declaration
+	-- identity, scope availability and provenance; signatures have one authority.
+	var bindings: List[CallableBinding] = []
+	var position = 0
+
+	for function in functions:
+		bindings = append_callable(
+			bindings,
+			{
+				module = function.module,
+				name = function.function_name.id,
+				function = function_id(position),
+				visibility = DirectAndUfcs,
+				origin = LocalFunction
+			},
+		)
+		position = IntOps.add(position, 1)
+
+	for binding in imported_functions(namespace):
+		bindings = append_callable(
+			bindings,
+			{
+				module = binding.module,
+				name = binding.name.id,
+				function = binding.function,
+				visibility = DirectAndUfcs,
+				origin = ImportedFunction(binding.name.span)
+			},
+		)
+
+	var failure: Option[CheckError] = None
+
+	for request in method_selection_requests(namespace):
+		position = 0
+
+		for function in functions:
+			if same_module(function.module, request.target):
+				match signatures.get(position):
+					None:
+						failure = Some(
+							checker_invariant(
+								request.name.span,
+								InvalidResolvedFunction(function_id(position)),
+							),
+						)
+						break
+					Some(accepted):
+						match (
+							accepted.signature.parameters
+								.get(0)
+								.and_then(pure func(parameter): receiver_head(parameter.value_type))
+						):
+							Some(head):
+								if same_type_candidate(head, request.receiver):
+									bindings = append_callable(
+										bindings,
+										{
+											module = request.module,
+											name = function.function_name.id,
+											function = function_id(position),
+											visibility = UfcsOnly,
+											origin = ImportedFunction(request.name.span)
+										},
+									)
+							None:
+								void
+
+			position = IntOps.add(position, 1)
+
+		if failure.is_some():
+			break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(bindings)
+
+
+private pure func method_sites(
+	candidates: List[CallableBinding],
+	functions: List[ParsedFunction],
+	span: Span,
+) -> Result[List[MethodCandidateSite], CheckError]:
+	var sites: List[MethodCandidateSite] = []
+	var failure: Option[CheckError] = None
+
+	for candidate in candidates:
+		match functions.get(function_number(candidate.function)):
+			None:
+				failure = Some(checker_invariant(span, InvalidResolvedFunction(candidate.function)))
+				break
+			Some(declaration):
+				import_site = match candidate.origin:
+					LocalFunction:
+						None
+					ImportedFunction(site):
+						Some(site)
+
+				sites = sites.append({
+					function = candidate.function,
+					declaration = declaration.function_name.span,
+					import_site = import_site,
+				})
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(sites)
+
+
+private pure func classify_receiver(
+	purity: Purity,
+	application: ReceiverApplication,
+	context: ResolutionContext,
+) -> Result[ResolvedReceiver, CheckError]:
+	name = application.callee
+
+	match callable_candidates(context.callables, context.module, name.id, ReceiverCall):
+		[]:
+			if contains_variant(context.namespace, context.module, name.id):
+				Err(check_rejection(name.span, ConstructorUFCS(name.id)))
+			else:
+				Err(check_rejection(name.span, UnknownFunction(name.id)))
+		[candidate]:
+			resolved ?= resolve_function_target(name, candidate.function, context.signatures)
+			contract ?= function_contract(
+				purity,
+				name,
+				ReceiverCall,
+				IntOps.add(application.arguments.length(), 1),
+				resolved,
+				context.function,
+			)
+			Ok(UniqueReceiver(contract))
+		candidates:
+			Ok(ReceiverCandidates(candidates))
+
+
+private pure func receiver_expectation(
+	receiver: ResolvedReceiver,
+	signatures: List[AcceptedFunctionDeclaration],
+	span: Span,
+) -> Result[Option[TypeRef], CheckError]:
+	match receiver:
+		UniqueReceiver(contract):
+			Ok(
+				contract.parameter_types
+					.get(0)
+					.and_then(pure func(parameter):
+						if not contract.type_parameters.is_empty() or contains_parameter(parameter.value_type):
+							None
+						else:
+							Some(parameter.value_type)
+					),
+			)
+		ReceiverCandidates(candidates):
+			var expectation: Option[TypeRef] = None
+			var common = True
+			var failure: Option[CheckError] = None
+
+			for candidate in candidates:
+				match signatures.get(function_number(candidate.function)):
+					None:
+						failure = Some(
+							checker_invariant(
+								span,
+								InvalidResolvedFunction(candidate.function),
+							),
+						)
+						break
+					Some(accepted):
+						match accepted.signature.parameters.get(0):
+							None:
+								common = False
+							Some(parameter):
+								if not accepted.signature.type_parameters.is_empty() or contains_parameter(parameter.value_type):
+									common = False
+								else:
+									match expectation:
+										None:
+											expectation = Some(parameter.value_type)
+										Some(previous):
+											common = (
+												common
+												and same_type(previous, parameter.value_type)
+											)
+
+			match failure:
+				Some(error):
+					Err(error)
+				None:
+					if common:
+						Ok(expectation)
+					else:
+						Ok(None)
+
+
+private pure func receiver_matches(
+	signature: FunctionSignature,
+	parameter: TypeUse,
+	actual: TypeUse,
+) -> Bool:
+	if signature.type_parameters.is_empty():
+		same_type(parameter.value_type, actual.value_type)
+	else:
+		inferred = signature.type_parameters.map(
+			pure func(_: TypeParameterId) -> Option[TypeUse]: None,
+		)
+
+		match (
+			infer_arguments(
+				parameter.value_type,
+				actual.value_type,
+				signature.type_parameters,
+				inferred,
+				{
+					expected = parameter.value_type,
+					actual = actual,
+					argument_position = 0,
+					expected_site = SourceAnnotation(parameter.span)
+				},
+			)
+		):
+			Err(_):
+				False
+			Ok(inferred):
+				var substitutions: List[ParameterArgument] = []
+
+				for declared in signature.type_parameters:
+					value = inferred
+						.get(parameter_position(declared))
+						.get_or(None)
+					substitutions = substitutions.append({
+						parameter = declared,
+						value_type = value
+							.map(pure func(value): value.value_type)
+							.get_or(ParameterType(declared)),
+					})
+
+				match substitute_type(parameter.value_type, substitutions, actual.span):
+					Err(_):
+						False
+					Ok(expected):
+						same_type(expected, actual.value_type)
+
+
+private pure func select_receiver_contract(
+	purity: Purity,
+	application: ReceiverApplication,
+	receiver: ResolvedReceiver,
+	actual: TypeUse,
+	context: ResolutionContext,
+) -> Result[CallContract, CheckError]:
+	match receiver:
+		UniqueReceiver(contract):
+			Ok(contract)
+		ReceiverCandidates(candidates):
+			var compatible: List[CallableBinding] = []
+			var matching_arity: List[CallableBinding] = []
+			var counts: List[Int] = []
+			var failure: Option[CheckError] = None
+			arity = IntOps.add(application.arguments.length(), 1)
+
+			for candidate in candidates:
+				match context.signatures.get(function_number(candidate.function)):
+					None:
+						failure = Some(
+							checker_invariant(
+								application.callee.span,
+								InvalidResolvedFunction(candidate.function),
+							),
+						)
+						break
+					Some(accepted):
+						match accepted.signature.parameters.get(0):
+							Some(parameter):
+								if receiver_matches(accepted.signature, parameter, actual):
+									compatible = compatible.append(candidate)
+									count = accepted.signature.parameters.length()
+
+									if IntOps.equals(count, arity):
+										matching_arity = matching_arity.append(candidate)
+
+									if not counts.contains(count):
+										counts = counts.append(count)
+							None:
+								void
+
+			ready ?= match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(void)
+
+			selection: Result[CallableBinding, CheckError] = match compatible:
+				[]:
+					sites ?= method_sites(
+						candidates,
+						context.function_declarations,
+						application.callee.span,
+					)
+					Err(
+						check_rejection(
+							application.callee.span,
+							NoApplicableMethod(application.callee.id, actual.value_type, sites),
+						),
+					)
+				[candidate]:
+					Ok(candidate)
+				_:
+					match matching_arity:
+						[candidate]:
+							Ok(candidate)
+						[]:
+							sites ?= method_sites(
+								compatible,
+								context.function_declarations,
+								application.callee.span,
+							)
+							Err(
+								check_rejection(
+									application.callee.span,
+									MethodArgumentCounts(
+										application.callee.id,
+										arity,
+										counts,
+										sites,
+									),
+								),
+							)
+						applicable:
+							sites ?= method_sites(
+								applicable,
+								context.function_declarations,
+								application.callee.span,
+							)
+							Err(
+								check_rejection(
+									application.callee.span,
+									AmbiguousMethod(
+										application.callee.id,
+										actual.value_type,
+										sites,
+									),
+								),
+							)
+
+			chosen ?= selection
+			resolved ?= resolve_function_target(
+				application.callee,
+				chosen.function,
+				context.signatures,
+			)
+			function_contract(
+				purity,
+				application.callee,
+				ReceiverCall,
+				arity,
+				resolved,
+				context.function,
+			)
 
 
 private pure func function_contract(
@@ -1582,7 +2104,7 @@ private pure func function_contract(
 	notation: CallNotation,
 	arity: Int,
 	resolved: ResolvedCall,
-	context: ResolutionContext,
+	function: FunctionId,
 ) -> Result[CallContract, CheckError]:
 	count = resolved.signature.parameters.length()
 
@@ -1604,7 +2126,7 @@ private pure func function_contract(
 		purity,
 		resolved.signature.purity,
 		name.span,
-		context.function,
+		function,
 		resolved.call.target,
 	)
 	Ok({
@@ -1786,7 +2308,7 @@ private pure func contextual_constructor(
 			Err(check_rejection(name.span, ConstructorNeedsExpectedType(name.id)))
 		Some(type_ref):
 			found ?= match type_ref:
-				VoidType | IntType | FloatType | StringType | RecordType(_) | ParameterType(_):
+				VoidType | IntType | FloatType | StringType | ListType(_) | RecordType(_) | ParameterType(_):
 					Ok(None)
 				AppliedUnionType(owner, _):
 					find_variant(context, type_ref, name)
@@ -1879,7 +2401,10 @@ private pure func resolve_base(
 				value_type = IntType,
 			})
 		FloatExpression(value):
-			Ok({ base = ReturnFloat(value), value_type = FloatType })
+			Ok({
+				base = ReturnFloat(value),
+				value_type = FloatType,
+			})
 		NameExpression(name):
 			match lookup_binding(scope, name.id):
 				Some(binding):
@@ -2192,70 +2717,18 @@ private pure func check_arguments(
 	})
 
 
-private pure func synthesize_value(
+private pure func synthesize_base(
 	purity: Purity,
 	scope: List[LocalBinding],
 	body: ValueExpression,
-	constructor_type: Option[TypeRef],
+	base_expectation: Option[TypeRef],
 	context: ResolutionContext,
 ) -> Result[ResolvedValue, CheckError]:
-	-- Constructor context selects variants; callers validate expression/argument obligations.
-	-- Resolve complete outer contracts once before checking their children.
-	var contracts: List[ResolvedPostfix] = []
-	var failure: Option[CheckError] = None
-
-	for postfix in body.applications:
-		match postfix:
-			FieldAccess(name):
-				contracts = contracts.append(ReadField(name))
-			ReceiverInvocation(application):
-				match classify_call(
-					purity,
-					application.callee,
-					ReceiverCall,
-					IntOps.add(application.arguments.length(), 1),
-					scope,
-					context,
-				):
-					Err(error):
-						failure = Some(error)
-						break
-					Ok(FunctionApplication(contract)):
-						contracts = contracts.append(InvokeReceiver(application, contract))
-					Ok(ConstructorApplication(name)):
-						failure = Some(checker_invariant(name.span, ConstructorReceiver(name.id)))
-						break
-
-	ready ?= match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(void)
-
-	base_expectation = match contracts.get(0):
-		Some(InvokeReceiver(_, contract)):
-			match contract.type_parameters:
-				[]:
-					contract.parameter_types
-						.get(0)
-						.map(pure func(value: TypeUse): value.value_type)
-				_:
-					None
-		Some(ReadField(_)):
-			None
-		None:
-			constructor_type
-
-	base_result: Result[ResolvedValue, CheckError] = match body.base:
+	-- Keep child failures inside this result boundary so the caller can explain
+	-- a missing receiver context without intercepting errors in nested values.
+	match body.base:
 		DirectApplication(name, arguments):
-			classified ?= classify_call(
-				purity,
-				name,
-				DirectCall,
-				arguments.length(),
-				scope,
-				context,
-			)
+			classified ?= classify_direct_call(purity, name, arguments.length(), scope, context)
 
 			match classified:
 				ConstructorApplication(name):
@@ -2364,18 +2837,94 @@ private pure func synthesize_value(
 				value_type = base.value_type,
 			})
 
-	base ?= base_result
+
+
+private pure func synthesize_value(
+	purity: Purity,
+	scope: List[LocalBinding],
+	body: ValueExpression,
+	constructor_type: Option[TypeRef],
+	context: ResolutionContext,
+) -> Result[ResolvedValue, CheckError]:
+	-- Constructor context selects variants; callers validate expression/argument obligations.
+	-- Resolve complete outer contracts once before checking their children.
+	var contracts: List[ResolvedPostfix] = []
+	var failure: Option[CheckError] = None
+
+	for postfix in body.applications:
+		match postfix:
+			FieldAccess(name):
+				contracts = contracts.append(ReadField(name))
+			ReceiverInvocation(application):
+				match classify_receiver(purity, application, context):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(receiver):
+						contracts = contracts.append(InvokeReceiver(application, receiver))
+
+	ready ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	base_expectation ?= match contracts.get(0):
+		Some(InvokeReceiver(application, receiver)):
+			receiver_expectation(receiver, context.signatures, application.callee.span)
+		Some(ReadField(_)):
+			Ok(None)
+		None:
+			Ok(constructor_type)
+
+	base_result = synthesize_base(purity, scope, body, base_expectation, context)
+
+	contextual_base: Result[ResolvedValue, CheckError] = match base_result:
+		Ok(base):
+			Ok(base)
+		Err(error):
+			needs_context = match error.kind:
+				ConstructorNeedsExpectedType(_):
+					match body.base:
+						NameExpression(name): same_span(error.span, name.span)
+						DirectApplication(name, _): same_span(error.span, name.span)
+						_: False
+				RecordNeedsExpectedType:
+					match body.base:
+						RecordExpression(_): same_span(error.span, body.base_span)
+						_: False
+				_:
+					False
+			if needs_context:
+				match contracts.get(0):
+					Some(InvokeReceiver(application, receiver)):
+						match receiver:
+							ReceiverCandidates(candidates):
+								sites ?= method_sites(
+									candidates,
+									context.function_declarations,
+									application.callee.span,
+								)
+								Err(check_rejection(application.callee.span, MethodReceiverNeedsType(application.callee.id, sites)))
+							UniqueReceiver(_):
+								Err(error)
+					_:
+						Err(error)
+			else:
+				Err(error)
+
+	base ?= contextual_base
 	var current = base
 
 	for postfix in contracts:
 		result = match postfix:
-			InvokeReceiver(application, contract):
+			InvokeReceiver(application, receiver):
 				resolve_receiver(
 					purity,
 					scope,
 					current,
-					application.arguments,
-					contract,
+					application,
+					receiver,
 					context,
 					{
 						source = body.base_span.source,
@@ -2414,6 +2963,14 @@ private pure func substitute_type(
 	span: Span,
 ) -> Result[TypeRef, CheckError]:
 	match value_type:
+		ListType(element):
+			value ?= substitute_type(element, arguments, span)
+
+			match value:
+				StringType | ParameterType(_):
+					Ok(ListType(value))
+				_:
+					Err(check_rejection(span, UnsupportedListElement))
 		AppliedUnionType(owner, values):
 			var substituted: List[TypeRef] = []
 			var failure: Option[CheckError] = None
@@ -2457,6 +3014,12 @@ private pure func infer_arguments(
 	obligation: ArgumentMismatch,
 ) -> Result[List[Option[TypeUse]], CheckError]:
 	match expected:
+		ListType(element):
+			match actual:
+				ListType(actual):
+					infer_arguments(element, actual, parameters, inferred, obligation)
+				_:
+					Ok(inferred)
 		ParameterType(parameter):
 			constrain_argument(parameters, inferred, parameter, actual, obligation)
 		AppliedUnionType(owner, expected_arguments):
@@ -2880,7 +3443,7 @@ private pure func resolve_match(
 			Ok(id)
 		UnionType(id):
 			Ok(id)
-		VoidType | IntType | FloatType | StringType | RecordType(_) | ParameterType(_):
+		VoidType | IntType | FloatType | StringType | ListType(_) | RecordType(_) | ParameterType(_):
 			Err(check_rejection(body.scrutinee.span, MatchRequiresUnion(scrutinee.value_type)))
 
 	owner ?= owner_result
@@ -3273,7 +3836,9 @@ private pure func validate_builtin_body(
 				pure func(parameter: TypeUse) -> TypeRef: parameter.value_type,
 			),
 			contract.parameters.map(
-				pure func(parameter: PrimitiveType) -> TypeRef: primitive_ref(parameter),
+				pure func(
+					parameter: RuntimeParameter,
+				) -> TypeRef: runtime_parameter_ref(parameter),
 			),
 		)
 	):
@@ -3343,8 +3908,8 @@ private pure func validate_builtin_body(
 					Ok(Prelude.StringParseInt(roles))
 				StringParseFloatBuiltin(_, _):
 					Ok(Prelude.StringParseFloat(roles))
-				IoReadLineBuiltin(_, _):
-					Ok(Prelude.IoReadLine(roles))
+				ListGetBuiltin(_, _):
+					Ok(Prelude.ListGet(roles))
 				_:
 					Err(checker_invariant(span, RuntimeGenericContract))
 		BooleanResult(written_roles):
@@ -3381,7 +3946,14 @@ private pure func validate_builtin_body(
 				equal = equal_id,
 				different = different_id
 			}
-			Ok(Prelude.StringEquals(roles))
+
+			match parsed:
+				StringEqualsBuiltin(_, _):
+					Ok(Prelude.StringEquals(roles))
+				IntegerEqualsBuiltin(_, _):
+					Ok(Prelude.IntEquals(roles))
+				_:
+					Err(checker_invariant(span, RuntimeGenericContract))
 
 
 private pure func validate_boolean_role(
@@ -3480,6 +4052,7 @@ private pure func resolve_functions(
 	signatures: List[AcceptedFunctionDeclaration],
 	declarations: CheckedDeclarations,
 	namespace: Namespace,
+	callables: List[CallableBinding],
 ) -> Result[List[CheckedFunction], CheckError]:
 	var functions: List[CheckedFunction] = []
 	var failure: Option[CheckError] = None
@@ -3494,7 +4067,8 @@ private pure func resolve_functions(
 			unions = parsed.unions,
 			checked_unions = declarations.unions,
 			records = parsed.records,
-			prelude = parsed.prelude
+			callables = callables,
+			function_declarations = parsed.functions
 		}
 
 		match resolve_function(function, index, context):
@@ -3870,6 +4444,8 @@ private pure func append_dependencies(
 				growth = growth,
 				span = span,
 			})
+		ListType(element):
+			collected = append_dependencies(collected, element, target, NestedParameter, span)
 		AppliedUnionType(_, arguments):
 			for child in arguments:
 				collected = append_dependencies(collected, child, target, NestedParameter, span)
@@ -3999,57 +4575,33 @@ private pure func validate_recursive_instantiation(
 			Ok(void)
 
 
-private pure func validate_prelude_conflicts(
-	unions: List[ParsedUnion],
-	prelude: CheckedPrelude,
-) -> Result[Void, CheckError]:
-	var failure: Option[CheckError] = None
-
-	if not failure.is_some():
-		for declaration in unions:
-			for variant in declaration.variants:
-				if runtime_operation(prelude, variant.name.id).is_some():
-					failure = Some(
-						check_rejection(
-							variant.name.span,
-							VariantPreludeConflict(variant.name.id),
-						),
-					)
-					break
-
-			if failure.is_some():
-				break
-
-	match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(void)
-
-
 private pure func check_program(program: ParsedProgram) -> Result[CheckedProgram, CheckError]:
 	parsed = parsed_contents(program)
+
+	builtins ?= match check_builtin_types(program):
+		Ok(_):
+			Ok(void)
+		Err(error):
+			Err(check_rejection(error.span, BuiltinTypesRejected(error)))
+
 	namespace = build_namespace(program)
-	prelude = parsed.prelude
-	special = prelude_names(prelude).special
-	conflicts ?= validate_prelude_conflicts(parsed.unions, prelude)
+	imports ?= validate_imports(parsed, namespace)
 	declarations ?= validate_declarations(
 		parsed.unions,
 		parsed.records,
 		parsed.functions,
-		special,
 		namespace,
 	)
-	imports ?= validate_imports(parsed, namespace)
 	signatures ?= validate_signatures(
 		parsed.functions,
 		parsed.unions,
 		parsed.end,
-		special,
+		parsed.entrypoint,
 		namespace,
 		declarations.unions,
 	)
-	functions ?= resolve_functions(parsed, signatures.functions, declarations, namespace)
+	callables ?= build_callables(parsed.functions, namespace, signatures.functions)
+	functions ?= resolve_functions(parsed, signatures.functions, declarations, namespace, callables)
 	finite ?= validate_recursive_instantiation(functions)
 	Ok(into_opaque CheckedProgram({
 				unions = declarations.unions,
@@ -4067,15 +4619,37 @@ private pure func validate_import_binding(
 	var failure: Option[CheckError] = None
 
 	for candidate in function_candidates(namespace, binding.module, binding.name.id):
+		if IntOps.equals(function_number(candidate.function), function_number(binding.function)):
+			-- Namespace candidates preserve declaration/import order. Once this
+			-- identity is reached, later imports will validate their own conflicts.
+			break
+
 		match candidate.origin:
 			LocalFunction:
-				failure = Some(match parsed.functions.get(function_number(candidate.function)):
-					Some(function): check_rejection(binding.name.span, ImportedFunctionConflict(binding.name.id, function.function_name.span))
-					None: checker_invariant(binding.name.span, InvalidResolvedFunction(candidate.function))
+				failure = Some(
+					match parsed.functions.get(function_number(candidate.function)):
+						Some(function):
+							check_rejection(
+								binding.name.span,
+								ImportedFunctionConflict(
+									binding.name.id,
+									function.function_name.span,
+								),
+							)
+						None:
+							checker_invariant(
+								binding.name.span,
+								InvalidResolvedFunction(candidate.function),
+							)
 				)
 			ImportedFunction(span):
-				if IntOps.less_than(span.start, binding.name.span.start):
-					failure = Some(check_rejection(binding.name.span, ImportedFunctionConflict(binding.name.id, span)))
+				failure = Some(
+					check_rejection(
+						binding.name.span,
+						ImportedFunctionConflict(binding.name.id, span),
+					),
+				)
+
 		if failure.is_some():
 			break
 
@@ -4112,26 +4686,13 @@ private pure func validate_import_binding(
 					)
 
 
-private pure func validate_imports(parsed: ParsedContents, namespace: Namespace) -> Result[Void, CheckError]:
+private pure func validate_imports(
+	parsed: ParsedContents,
+	namespace: Namespace,
+) -> Result[Void, CheckError]:
 	match import_problems(namespace).get(0):
 		Some(problem):
-			span = match problem:
-				RepeatedModuleImport(_, _, occurrence):
-					occurrence
-				MissingImportedFunction(_, name):
-					name.span
-				UnsupportedTypeImport(_, name):
-					name.span
-				MissingImportedUnion(name):
-					name.span
-				AmbiguousImportedUnion(name):
-					name.span
-				MissingImportedVariant(name):
-					name.span
-				RepeatedImportedVariant(name, _):
-					name.span
-				ImportedTypeConflict(name, _):
-					name.span
+			span = import_problem_span(problem)
 
 			Err(check_rejection(span, ImportRejected(problem)))
 		None:
@@ -4185,20 +4746,29 @@ private pure func validate_imports(parsed: ParsedContents, namespace: Namespace)
 						void
 
 			match failure:
-				Some(error): Err(error)
-				None: Ok(void)
+				Some(error):
+					Err(error)
+				None:
+					Ok(void)
 
 
 private pure func resolve_receiver(
 	purity: Purity,
 	scope: List[LocalBinding],
 	current: ResolvedValue,
-	arguments: List[ValueExpression],
-	contract: CallContract,
+	application: ReceiverApplication,
+	receiver: ResolvedReceiver,
 	context: ResolutionContext,
 	span: Span,
 ) -> Result[ResolvedValue, CheckError]:
-	resolved ?= check_arguments(purity, scope, arguments, Some(current), contract, context)
+	contract ?= select_receiver_contract(
+		purity,
+		application,
+		receiver,
+		{value_type = current.value_type, span = current.value.base_span},
+		context,
+	)
+	resolved ?= check_arguments(purity, scope, application.arguments, Some(current), contract, context)
 
 	operation ?= match resolved.contract.operation:
 		FunctionCall(call):
@@ -4216,46 +4786,44 @@ private pure func resolve_receiver(
 	})
 
 
-private pure func classify_call(
+private pure func classify_direct_call(
 	purity: Purity,
 	name: WrittenName,
-	notation: CallNotation,
 	arity: Int,
 	scope: List[LocalBinding],
 	context: ResolutionContext,
 ) -> Result[ResolvedApplication, CheckError]:
-	local = match notation:
-		DirectCall:
-			lookup_binding(scope, name.id)
-		ReceiverCall:
-			None
-
-	callable ?= match local:
+	callable ?= match lookup_binding(scope, name.id):
 		Some(binding):
 			Err(non_callable(binding, name.span, context.function))
 		None:
 			Ok(void)
 
-	target ?= lookup_target(context.namespace, context.module, context.prelude, name)
+	target ?= lookup_target(context, name)
 
 	match target:
 		Some(target):
 			resolved ?= resolve_function_target(name, target, context.signatures)
-			contract ?= function_contract(purity, name, notation, arity, resolved, context)
+			contract ?= function_contract(
+				purity,
+				name,
+				DirectCall,
+				arity,
+				resolved,
+				context.function,
+			)
 			Ok(FunctionApplication(contract))
 		None:
 			if contains_variant(context.namespace, context.module, name.id):
-				match notation:
-					DirectCall:
-						Ok(ConstructorApplication(name))
-					ReceiverCall:
-						Err(check_rejection(name.span, ConstructorUFCS(name.id)))
+				Ok(ConstructorApplication(name))
 			else:
 				Err(check_rejection(name.span, UnknownFunction(name.id)))
 
 
 private pure func contains_parameter(value_type: TypeRef) -> Bool:
 	match value_type:
+		ListType(element):
+			contains_parameter(element)
 		ParameterType(_):
 			True
 		AppliedUnionType(_, arguments):

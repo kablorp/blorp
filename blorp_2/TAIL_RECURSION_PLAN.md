@@ -38,6 +38,15 @@ the new left value, expecting 9. A smaller companion
 uses `walk(step: Step)` and returns 7, as in the existing recursion fixture.
 Place the new real-main inputs under `test/e2e/fixtures/tail_recursion/`.
 
+The numeric follow-up, `accumulator.brp`, uses ordinary `int.equals` Bool roles,
+subtract and add to count down and accumulate an exact total. Its normal main
+prints the total; zero, one, seventeen and one million iterations belong to the
+regular suite. A nonnegative argument selects the count for the documented
+one-billion stress run. This checks completed work beyond the older
+hexadecimal countdown's constant result. Inspect its emitted loop at `-O0`
+and deliberately disable tail lowering to require the million-case oracle to
+fail. Negative counts are outside this fixture's manual contract.
+
 ### First increment
 
 - Support direct calls and UFCS self calls, both pure and impure functions,

@@ -1,9 +1,11 @@
 import:
+	../../src/syntax: Entrypoint(NoArguments), entry_function
 	../../src/lower as Lower
 	../../src/prelude as Prelude: RuntimeOperation(StringLength)
 	../../src/specialize as Concrete
 	int as IntOps
-	managed_union_inputs: lowered
+	managed_union_inputs: lowered_modules
+	module_input: INTEGER_OPERATIONS, STRING_OPERATIONS
 	system: read_file
 	test: TestSuite
 
@@ -37,7 +39,11 @@ private func fixture(
 			print_error(error)
 			False
 		Ok(source):
-			match lowered(source):
+			match lowered_modules([
+				{ source = source, targets = [1, 2] },
+				{ source = INTEGER_OPERATIONS, targets = [] },
+				{ source = STRING_OPERATIONS, targets = [] },
+			]):
 				Err(error):
 					print_error(error.message)
 					False
@@ -127,12 +133,36 @@ private pure func reads(definition: Lower.ValueDefinition, expected: Lower.Value
 			False
 
 
-private pure func length_reads(definition: Lower.ValueDefinition, expected: Lower.ValueId) -> Bool:
+private pure func is_string_length(program: Lower.LoweredFunctions, id: Concrete.FunctionInstanceId) -> Bool:
+	match program.functions.get(Concrete.function_number(id)):
+		Some(function):
+			match (function.signature.parameters, function.definitions, function.tail):
+				([Concrete.StringType], [parameter, result], Lower.ExitValue(Lower.ReturnValue(returned))):
+					match result.operation:
+						Lower.CallValue(call, [argument]):
+							match call.target:
+								Concrete.RuntimeFunction(Prelude.StringLength):
+									(
+										Concrete.same_type(function.signature.return_type, Concrete.IntType)
+										and same_value(argument, parameter.id)
+										and same_value(returned, result.id)
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+private pure func length_reads(program: Lower.LoweredFunctions, definition: Lower.ValueDefinition, expected: Lower.ValueId) -> Bool:
 	match definition.operation:
 		Lower.CallValue(call, [argument]):
 			match call.target:
-				Concrete.RuntimeFunction(Prelude.StringLength):
-					same_value(argument, expected)
+				Concrete.UserFunction(id):
+					same_value(argument, expected) and is_string_length(program, id)
 				_:
 					False
 		_:
@@ -148,13 +178,13 @@ private pure func returns(function: Lower.LoweredFunction, expected: Lower.Value
 
 
 private pure func saved_reads_original(program: Lower.LoweredFunctions) -> Bool:
-	match program.functions.get(Concrete.function_number(program.entrypoint)):
+	match program.functions.get(Concrete.function_number(entry_function(program.entrypoint))):
 		Some(main):
 			match main.definitions:
 				[_, _, original, saved, _, _, replacement, length]:
 					(
 						reads(saved, original.id)
-						and length_reads(length, saved.id)
+						and length_reads(program, length, saved.id)
 						and not same_value(original.id, replacement.id)
 						and Concrete.same_type(original.value_type, replacement.value_type)
 						and returns(main, length.id)
@@ -170,14 +200,14 @@ func test_saved_extraction_keeps_the_original_value_after_rebinding() -> Bool:
 
 
 private pure func current_reads_replacement(program: Lower.LoweredFunctions) -> Bool:
-	match program.functions.get(Concrete.function_number(program.entrypoint)):
+	match program.functions.get(Concrete.function_number(entry_function(program.entrypoint))):
 		Some(main):
 			match main.definitions:
 				[_, _, original, saved, _, _, replacement, current, length]:
 					(
 						reads(saved, original.id)
 						and reads(current, replacement.id)
-						and length_reads(length, current.id)
+						and length_reads(program, length, current.id)
 						and not same_value(saved.id, current.id)
 						and not same_value(original.id, replacement.id)
 						and returns(main, length.id)

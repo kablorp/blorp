@@ -1,5 +1,9 @@
 # Library unions for conversion and input
 
+The read_line portions of this historical plan are superseded by
+[ARGUMENTS_PLAN.md](ARGUMENTS_PLAN.md). Conversion and constructor-role contracts
+remain current; List get now supplies owned Option[String] values for input.
+
 Status: steps 5–7 are implemented, independently reviewed and validated by
 granular phase/ownership tests and native calculator inputs. See the
 [completion results](../benchmarks/results/blorp_2_calculator_2026-10-12.md)
@@ -19,7 +23,6 @@ The desired step-5 program, compiled through the ordinary pilot entrypoint, is:
 
 ```blorp
 import:
-    option: Option(Some, None)
     string: parse_int
 pure func parse_or_zero(text: String) -> Int:
     match parse_int(text):
@@ -80,20 +83,16 @@ carrying two `WrittenName` constructor references for ADT-valued operations.
 These are references only in builtin syntax, not general function values:
 
 ```blorp
--- standard_library_temp/option.brp: adapted ordinary declaration
+-- standard_library_temp/_base/types.brp: ordinary foundation declaration
 fixed union Option[T]:
     Some(T)
     None
 
 -- standard_library_temp/string.brp
-import:
-    option: Option(Some, None)
 pure func parse_int(text: String) -> Option[Int]:
     builtin("string.parse_int", Some, None)
 
 -- step 6, standard_library_temp/io.brp
-import:
-    option: Option(Some, None)
 func read_line() -> Option[String]:
     builtin("io.read_line", Some, None)
 
@@ -170,10 +169,11 @@ fixed union ImportSelection:
     UnionSelection(WrittenName, List[WrittenName])
 ```
 
-`option: Option(Some, None)` imports the union and only those constructors;
-`option: Option()` imports its type alone. Bare identifiers keep their current
-function meaning; capitalization does not decide semantics. This avoids a
-function/type ambiguity when both namespaces contain the same spelling.
+For a user-defined union, `./maybe: Maybe(Just, Nothing)` imports the union and
+only those constructors; `./maybe: Maybe()` imports its type alone. Option and
+its constructors are now provided by `_base/types.brp` without an import. The
+[imports design](IMPORTS_AND_PRELUDE_PLAN.md) supersedes this initial selector
+design and defines bare type selections and UFCS visibility.
 No aliases, wildcards, reexports, nested selectors, multiline selectors,
 module-qualified value paths, or new record imports are required.
 
@@ -230,8 +230,8 @@ ordinary Option; `string.brp:372` and `io.brp:45` expose conversion/input. Host
 `runtime.c:10155` uses strtol and does not meet this strict counted-byte/overflow
 contract; `runtime.c:8915` uses getline plus terminal-specific EOF behavior.
 Neither implementation is copied blindly. Target adapters retain upstream
-revision/hash and comment out deferred declarations, transliterating non-ASCII
-comment punctuation as in the existing io adapter.
+revision/hash; deferred declarations remain in byte-for-byte reference copies
+under `reference/standard_library/`, outside compilation inputs.
 
 ## Scope, dependencies and risks
 

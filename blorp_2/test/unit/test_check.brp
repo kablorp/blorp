@@ -6,7 +6,7 @@ import:
 		CallTarget(UserFunction, RuntimeFunction),
 		CheckErrorKind(
 			UnknownFunction, UnknownValue, ImpureCall, ArgumentCountMismatch, UncallableBinding,
-			MainHasParameters, UnknownType, DuplicateFunction, MissingMain,
+			MainHasParameters, MainParameterType, UnknownType, DuplicateFunction, MissingMain,
 		),
 		CheckedBase(ReturnInteger, ReturnBinding, ReturnCall),
 		CheckedBody(CheckedValueBody),
@@ -21,9 +21,10 @@ import:
 		checked_functions,
 		same_type,
 	../../src/lex: lex
-	../../src/syntax: Diagnostic, Purity(Pure, Impure)
+	../../src/syntax: Diagnostic, Purity(Pure, Impure), Entrypoint(NoArguments), entry_function
 	../../src/text: concat
 	input: check, check_failure, parse, setup_diagnostic, singleton_check_error
+	module_input: PRIMITIVE_BASE, INTEGER_OPERATIONS, parse_modules_with_base
 	test: TestSuite
 
 
@@ -135,7 +136,7 @@ pure func test_resolved_forward_call_and_entrypoint() -> Bool:
 												and second_is_one
 												and first.signature.purity == Impure
 												and second.signature.purity == Impure
-												and function_number(checked.entrypoint) == 0
+												and function_number(entry_function(checked.entrypoint)) == 0
 											)
 										_:
 											False
@@ -237,11 +238,11 @@ pure func test_duplicate_helper_diagnostic() -> Bool:
 	)
 
 
-pure func test_non_integer_helper_diagnostic() -> Bool:
+pure func test_unknown_helper_return_type_diagnostic() -> Bool:
 	source: String =
 		|func main() -> Int:
 		|	0
-		|func one() -> Bool:
+		|func one() -> Nope:
 		|	1
 		|
 	diagnostic(source, 37, 41, pure func(kind: CheckErrorKind) -> Bool:
@@ -353,18 +354,20 @@ pure func test_checked_functions_keep_declared_purity() -> Bool:
 						Err(_):
 							False
 						Ok(program):
-							checked_functions(
-								program,
-							).functions.map(
-								pure func(
-									function: CheckedFunction,
-								) -> Purity: function.signature.purity,
-							) == [Pure, Pure, Impure]
+							match checked_functions(program).functions:
+								[one, answer, main]:
+									(
+										one.signature.purity == Pure
+										and answer.signature.purity == Pure
+										and main.signature.purity == Impure
+									)
+								_:
+									False
 
 
-pure func test_parameter_type_is_explicit_int() -> Bool:
+pure func test_unknown_parameter_type_diagnostic() -> Bool:
 	source: String =
-		|func identity(value: Bool) -> Int:
+		|func identity(value: Nope) -> Int:
 		|	value
 		|func main() -> Int:
 		|	identity(1)
@@ -378,18 +381,32 @@ pure func test_parameter_type_is_explicit_int() -> Bool:
 	)
 
 
-pure func test_main_has_no_parameter() -> Bool:
+pure func test_wrong_main_parameter_type_is_rejected() -> Bool:
 	source: String =
 		|func main(value: Int) -> Int:
 		|	value
 		|
-	diagnostic(source, 10, 15, pure func(kind: CheckErrorKind) -> Bool:
+	diagnostic(source, 17, 20, pure func(kind: CheckErrorKind) -> Bool:
 		match kind:
-			MainHasParameters(_):
+			MainParameterType:
 				True
 			_:
 				False
 	)
+
+
+pure func test_main_rejects_two_parameters_with_teaching_diagnostic() -> Bool:
+	prefix = "func main(arguments: List[String], "
+	match checked_source(prefix + "extra: Int) -> Int:\n    0\n"):
+		Err(error):
+			(
+				error.span.start == prefix.length()
+				and error.span.end == prefix.length() + "extra".length()
+				and error.message == "main accepts at most one parameter"
+				and error.help == "declare main() -> Int: or main(arguments: List[String]) -> Int:"
+				and error.note.is_none()
+			)
+		Ok(_): False
 
 
 pure func test_unknown_bare_value_is_rejected() -> Bool:
@@ -564,7 +581,7 @@ pure func test_parameter_slot_and_repeated_wrappers() -> Bool:
 												and inner.span.end == 107
 												and outer.span.start == 90
 												and outer.span.end == 98
-												and function_number(checked.entrypoint) == 2
+												and function_number(entry_function(checked.entrypoint)) == 2
 											)
 										_:
 											False
@@ -799,7 +816,7 @@ pure func test_special_spellings_resolve_by_role_and_declaration_order() -> Bool
 							match base_of(entrypoint):
 								Some(ReturnCall(call, [_])):
 									(
-										function_number(checked.entrypoint) == 1
+										function_number(entry_function(checked.entrypoint)) == 1
 										and user_function_number(call.target) == Some(0)
 									)
 								_:
@@ -915,8 +932,9 @@ tests: TestSuite = {
 		),
 		("unary recursion is checked", test_unary_recursion_is_checked),
 		("pure caller rejects impure unary wrapper", test_pure_caller_rejects_impure_unary_wrapper),
-		("parameter type is explicit Int", test_parameter_type_is_explicit_int),
-		("main has no parameter", test_main_has_no_parameter),
+		("unknown parameter type diagnostic", test_unknown_parameter_type_diagnostic),
+		("wrong main parameter type is rejected", test_wrong_main_parameter_type_is_rejected),
+		("main rejects two parameters with teaching diagnostic", test_main_rejects_two_parameters_with_teaching_diagnostic),
 		("unknown bare value is rejected", test_unknown_bare_value_is_rejected),
 		(
 			"parameter call cannot fall through to a global",
@@ -953,7 +971,7 @@ tests: TestSuite = {
 			test_unreachable_pure_caller_rejects_impure_callee,
 		),
 		("duplicate helper diagnostic", test_duplicate_helper_diagnostic),
-		("non-integer helper diagnostic", test_non_integer_helper_diagnostic),
+		("unknown helper return type diagnostic", test_unknown_helper_return_type_diagnostic),
 		("unused recursive helper is checked", test_unused_recursive_helper_is_checked),
 		("unreachable unknown callee diagnostic", test_unreachable_unknown_callee_diagnostic),
 		("duplicate function diagnostic", test_duplicate_function_diagnostic),
@@ -966,16 +984,16 @@ tests: TestSuite = {
 
 
 pure func test_typed_second_argument_mismatch() -> Bool:
-	prefix = "pure func first(left: Int, right: Int) -> Int:\n\tleft\nfunc main() -> Int:\n\tfirst(7, "
+	prefix = "import:\n\tint: to_string\npure func first(left: Int, right: Int) -> Int:\n\tleft\nfunc main() -> Int:\n\tfirst(7, "
 	argument = "8.to_string()"
 
 	match (
-		lex(
-			module_source(root_module_id()),
-			prefix
+		parse_modules_with_base([
+			{ source = prefix
 				.concat(argument)
-				.concat(")\n"),
-		).and_then(pure func(tokens): parse(tokens))
+				.concat(")\n"), targets = [1] },
+			{ source = INTEGER_OPERATIONS, targets = [] },
+		], PRIMITIVE_BASE)
 	):
 		Err(_):
 			False
@@ -1003,7 +1021,7 @@ pure func test_typed_second_argument_mismatch() -> Bool:
 												and mismatch.argument_position == 1
 												and mismatch.actual.span.start == prefix.length()
 												and mismatch.actual.span.end == prefix.length() + argument.length()
-												and annotation.start == "pure func first(left: Int, right: ".length()
+												and annotation.start == "import:\n\tint: to_string\npure func first(left: Int, right: ".length()
 												and annotation.end == annotation.start + 3
 											)
 										_:

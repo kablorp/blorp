@@ -3,26 +3,41 @@
 The separate [Blorp 2 pilot grammar](../blorp_2/grammar.ebnf) defines that
 compiler's restricted subset, including ordered binding and expression
 statements before a final expression or tail match, depth-three statement
-blocks inside match arms, and a separate explicit input-prelude grammar for
-builtin types and concrete runtime function declarations. Its ordinary call syntax also accepts self and mutual
-recursion; checking separately rejects unbounded recursive type substitutions.
-Local selective function imports precede declarations and use explicit `./` or
-leading `../` paths without a `.brp` suffix. Bare paths resolve under an explicit
-target-library root. Concrete module functions may use a sole closed builtin
-body, including `builtin("int.add")`, with an exact runtime signature.
-Imports preserve declaration identities;
-only the root module's local zero-argument `main` is the entrypoint. Ordinary
-program String literals accept valid UTF-8 and the full language's fixed and
-Unicode scalar escapes, with single-line quoted syntax and byte-counted spans.
-The reserved literal `void` has the prelude-owned Void type; non-final bare
-expressions must return Void. The temporary target io module provides concrete
-impure String printing through the closed `string.print` builtin operation.
-A bare import selector selects a function; `Option(Some, None)` selects a
-fixed union and explicit constructors, and `Option()` selects its type alone.
-Closed runtime bodies can explicitly bind constructor roles, as in
+blocks inside match arms, builtin type declarations in the configured foundation,
+and concrete runtime function declarations in ordinary modules. Its ordinary
+call syntax also accepts self and mutual recursion; checking separately rejects
+unbounded recursive type substitutions. Imports precede declarations. Relative
+paths use explicit `./` or leading `../` without a `.brp` suffix; bare paths
+resolve under the required target-library root. Each normalized source path is
+loaded and parsed once, including the designated `_base/types.brp` and ordinary
+`_base/prelude.brp`. Concrete functions may use a sole closed builtin body,
+including `builtin("int.add")`, with an exact runtime signature.
+Imports preserve declaration identities; only the root module's local `main`
+is the entrypoint. It takes either no parameters or one List[String] parameter
+and returns Int. The foundation declares the unary builtin type with
+`type List[T] = builtin`; other concrete List elements remain unsupported.
+Ordinary program String literals accept valid UTF-8 and the full language's
+fixed and Unicode scalar escapes, with single-line quoted syntax and
+byte-counted spans. The reserved literal `void` has the foundation-owned Void
+type; non-final bare expressions must return Void. The temporary target io
+module provides explicitly imported impure String printing through the closed
+`string.print` builtin operation.
+A bare import selector selects an unambiguous type or function. Type selections
+enable the selected module's local receiver functions through UFCS; named
+function imports enable direct calls and UFCS. `Option(Some, None)` selects a
+fixed union and explicit constructors, while `Option()` selects its type alone.
+`Foo methods_only` enables receiver functions for an independently visible,
+exact Foo type without importing that type or its constructors. The foundation's
+ordinary Bool, Option and Result types and constructors are implicit. User
+modules also receive the ordinary prelude's selected methods; library operation
+modules receive the base alone. Explicit and implicit exposures of the same
+function are idempotent; different applicable functions remain ambiguous.
+Closed runtime bodies can bind constructor roles, as in
 `builtin("string.parse_int", Some, None)`; semantic checking validates the
-ordinary union's exact result contract. There are no implicit constructor
-imports, aliases, wildcards or reexports in the pilot.
+ordinary union's exact result contract. Constructors of other imported types
+require explicit selection. Aliases, wildcards and function reexports remain unsupported.
+`builtin("int.equals", True, False)` binds the equal and different roles of an
+ordinary two-variant empty union and requires two Int parameters.
 Decimal Float tokens carry an optional minus, a decimal fraction or exponent,
 or both. Parsing checks canonical source spelling and finite binary64 range;
 `1.identity()` remains an Int receiver call. The restricted EBNF owns the exact
@@ -745,8 +760,8 @@ dim_constraint  = dim_expr "==" dim_expr ;
 
 The [Blorp 2 restricted grammar](../blorp_2/grammar.ebnf) accepts only one
 optional `@tail_recursive`, before optional `pure` and `func`, on the same line
-or immediately preceding line. It takes no arguments and is forbidden in the
-runtime prelude. The pilot checks a direct-self loop guarantee for nongeneric
+or immediately preceding line. It takes no arguments and is forbidden on functions with closed builtin
+bodies. The pilot checks a direct-self loop guarantee for nongeneric
 functions with unmanaged values; it rejects annotations without a direct
 self call and self calls outside supported function or match-arm tails.
 This separate pilot grammar does not narrow the declarations above.

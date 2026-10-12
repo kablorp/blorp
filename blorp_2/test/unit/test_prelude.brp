@@ -1,895 +1,245 @@
 import:
-	../../src/declarations: VariantId
-	../../src/check:
-		CallTarget(RuntimeFunction),
-		CheckError,
-		CheckErrorKind(
-			UnknownFunction, ArgumentCountMismatch, ArgumentTypeMismatch,
-			VariantPreludeConflict, DuplicateUnion, UncallableBinding,
-		),
-		CheckedBody(CheckedValueBody),
-		CheckedExit(ReturnExpression),
-		CheckedOperation(InvokeFunction),
-		CheckedProgram,
-		CheckedStatement(InitializeBinding),
-		CheckedValue,
-		check as check_program,
-		check_errors,
-		checked_functions,
-	../../src/lex: lex
-	../../src/names: NameId, find_name, intern_name, name_spelling
-	../../src/parse: ParsedProgram, parse as parse_program, parse_prelude, parsed_contents
-	../../src/prelude as Prelude:
-		CheckedPrelude,
-		PrimitiveType(BuiltinInt, BuiltinString),
-		RuntimeOperation(IntToString, StringLength),
-		RuntimeResult(PrimitiveResult),
-		check_prelude,
-		runtime_contract,
-		runtime_operation,
-	../../src/source: PRELUDE_SOURCE, module_source, root_module_id
-	../../src/syntax:
-		Diagnostic,
-		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin),
-		ParsedPrelude,
-		ParsedRuntimeOperation(IntegerToStringBuiltin),
-		Purity(Pure),
-		TypeSyntax(AtomicType, AppliedType),
-	input: setup_diagnostic, singleton_check_error
-	test: TestSuite
-
-
-private pure func renamed_type(written: TypeSyntax, id: NameId) -> TypeSyntax:
-	match written:
-		AtomicType(name):
-			AtomicType({ name | id = id })
-		AppliedType(name, argument, span):
-			AppliedType({ name | id = id }, argument, span)
+    ../../src/lex: lex
+    ../../src/names: NameTable, NameId, find_name, same_name
+    ../../src/parse: ParsedProgram, append_module, assembly_names, begin_program, parse_module, parsed_contents, seal_program
+    ../../src/prelude:
+        BuiltinTypeErrorKind(MissingBuiltinType, DuplicateBuiltinType, BuiltinOutsideFoundation, FoundationImports, FoundationFunctions, FoundationTypeConflict),
+        BuiltinTypeRole(IntegerType, StringType, FloatType, VoidType, ListType),
+        check_builtin_types, render_builtin_type_error
+    ../../src/source:
+        ModuleId, ModuleKind(UserModule, FoundationTypesModule, FoundationPreludeModule),
+        module_id, module_source, root_module_id, same_source
+    ../../src/syntax: Diagnostic
+    option: to_result, is_none
+    ../../src/text: concat
+    test: TestSuite
 
 
 private TYPES: String =
-	|type Int = builtin
-	|type String = builtin
-	|type Void = builtin
-	|type Float = builtin
-	|
-
-private CONVERT: String =
-	|pure func convert(value: Int) -> String:
-	|	builtin("int.to_string")
-	|
-
-private LENGTH: String =
-	|pure func length(value: String) -> Int:
-	|	builtin("string.length")
-	|
-
-
-private pure func parsed_prelude(source: String) -> Result[ParsedPrelude, Diagnostic]:
-	tokens ?= lex(PRELUDE_SOURCE, source)
-	parse_prelude(tokens)
-
-
-private pure func accepted_prelude(source: String) -> Result[CheckedPrelude, Diagnostic]:
-	parsed ?= parsed_prelude(source)
-	check_prelude(parsed)
-
-
-private pure func parsed_source(
-	prelude_source: String,
-	program_source: String,
-) -> Result[ParsedProgram, Diagnostic]:
-	prelude ?= accepted_prelude(prelude_source)
-	input ?= lex(module_source(root_module_id()), program_source)
-	parse_program(input, prelude)
-
-
-private pure func checked_source(
-	prelude_source: String,
-	program_source: String,
-) -> Result[CheckedProgram, Diagnostic]:
-	program ?= parsed_source(prelude_source, program_source)
-	check_program(program).map_err(setup_diagnostic)
-
-
-private pure func failed_source(
-	prelude_source: String,
-	program_source: String,
-) -> Option[CheckError]:
-	match parsed_source(prelude_source, program_source):
-		Err(_):
-			None
-		Ok(program):
-			match check_program(program):
-				Ok(_):
-					None
-				Err(failure):
-					singleton_check_error(check_errors(failure))
-
-
-private pure func rejects(
-	result: Result[CheckedPrelude, Diagnostic],
-	start: Int,
-	end: Int,
-	message: String,
-	help: String,
-) -> Bool:
-	match result:
-		Err(error):
-			(
-				error.span.start == start
-				and error.span.end == end
-				and error.message == message
-				and error.help == help
-			)
-		Ok(_):
-			False
-
-
-private pure func program_rejects(
-	prelude: String,
-	program: String,
-	start: Int,
-	end: Int,
-	matches: pure (CheckErrorKind) -> Bool,
-) -> Bool:
-	match failed_source(prelude, program):
-		None:
-			False
-		Some(error):
-			error.span.start == start and error.span.end == end and matches(error.kind)
-
-
-pure func test_prelude_publishes_typed_operations_and_one_name_table() -> Bool:
-	match parsed_prelude(TYPES + CONVERT):
-		Err(_):
-			False
-		Ok(prelude):
-			contents = prelude
-
-			match contents.types:
-				[IntegerBuiltin(integer), StringBuiltin(string), unit, float]:
-					match contents.functions:
-						[function]:
-							operation_matches = match function.operation:
-								IntegerToStringBuiltin: True
-								_: False
-							(
-								name_spelling(contents.names, integer.id) == Some("Int")
-								and name_spelling(contents.names, string.id) == Some("String")
-								and name_spelling(
-									contents.names,
-									function.header.function_name.id,
-								) == Some("convert")
-								and operation_matches
-								and function.span.start == 132
-								and function.span.end == 147
-							)
-						_:
-							False
-				_:
-					False
-
-
-private pure func runtime_operations(value: CheckedValue) -> List[RuntimeOperation[VariantId]]:
-	var operations: List[RuntimeOperation[VariantId]] = []
-
-	for step in value.operations:
-		match step.operation:
-			InvokeFunction(call, _):
-				match call.target:
-					RuntimeFunction(operation):
-						operations = operations.append(operation)
-					_:
-						void
-			_:
-				void
-
-	operations
-
-
-pure func test_builtin_names_come_from_the_explicit_prelude() -> Bool:
-	source: String =
-		|pure func main() -> Int:
-		|	value = 7.convert()
-		|	value.length()
-		|
-
-	match checked_source(TYPES + CONVERT + LENGTH, source):
-		Err(_):
-			False
-		Ok(program):
-			match checked_functions(program).functions:
-				[function]:
-					converted = match function.statements:
-						[InitializeBinding(_, value)]:
-							match runtime_operations(value):
-								[Prelude.IntToString]: True
-								_: False
-						_:
-							False
-
-					match function.body:
-						CheckedValueBody(ReturnExpression(value)):
-							match runtime_operations(value):
-								[Prelude.StringLength]: converted
-								_: False
-						_:
-							False
-				_:
-					False
-
-
-pure func test_type_only_prelude_does_not_add_implicit_functions() -> Bool:
-	source: String =
-		|func main() -> Int:
-		|	7.to_string().length()
-		|
-
-	match failed_source(TYPES, source):
-		Some(error):
-			matching = match error.kind:
-				UnknownFunction(_):
-					True
-				_:
-					False
-
-			error.span.start == 23 and error.span.end == 32 and matching
-		None:
-			False
-
-
-pure func test_missing_int_declaration_is_explicit() -> Bool:
-	rejects(
-		accepted_prelude("type String = builtin\n"),
-		22,
-		22,
-		"missing Int builtin declaration",
-		"add type Int = builtin to the prelude",
-	)
-
-
-pure func test_missing_string_declaration_is_explicit() -> Bool:
-	rejects(
-		accepted_prelude("type Int = builtin\n"),
-		19,
-		19,
-		"missing String builtin declaration",
-		"add type String = builtin to the prelude",
-	)
-
-
-pure func test_missing_void_declaration_is_explicit() -> Bool:
-	source: String =
-		|type Int = builtin
-		|type String = builtin
-		|
-	rejects(
-		accepted_prelude(source),
-		41,
-		41,
-		"missing Void builtin declaration",
-		"add type Void = builtin to the prelude",
-	)
-
-
-pure func test_duplicate_void_declaration_is_rejected() -> Bool:
-	rejects(
-		accepted_prelude(TYPES + "type Void = builtin\n"),
-		87,
-		91,
-		"duplicate builtin type declaration",
-		"declare type Void = builtin exactly once",
-	)
-
-
-pure func test_void_identity_must_be_distinct_from_both_builtin_types() -> Bool:
-	match parsed_prelude(TYPES):
-		Ok(parsed):
-			match parsed.types:
-				[IntegerBuiltin(integer), StringBuiltin(string), VoidBuiltin(unit), float]:
-					[integer.id, string.id].all(pure func(id: NameId) -> Bool:
-						rejects(
-							check_prelude(
-								{ parsed |
-									types = [
-										IntegerBuiltin(integer),
-										StringBuiltin(string),
-										VoidBuiltin({ unit | id = id }),
-									float,
-									]
-								},
-							),
-							82,
-							82,
-							"prelude builtin identities conflict",
-							"report this compiler error with the prelude input",
-						)
-					)
-				_:
-					False
-		Err(_):
-			False
-
-
-pure func test_duplicate_builtin_type_is_rejected_at_second_name() -> Bool:
-	rejects(
-		accepted_prelude(TYPES + "type Int = builtin\n"),
-		87,
-		90,
-		"duplicate builtin type declaration",
-		"declare type Int = builtin exactly once",
-	)
-
-
-pure func test_runtime_contract_rejects_wrong_parameter_type() -> Bool:
-	declaration: String =
-		|pure func convert(value: String) -> String:
-		|	builtin("int.to_string")
-		|
-	rejects(
-		accepted_prelude(TYPES + declaration),
-		135,
-		150,
-		"builtin declaration does not match its runtime contract",
-		"declare a pure function with one Int parameter returning String",
-	)
-
-
-pure func test_runtime_contract_rejects_wrong_return_type() -> Bool:
-	declaration: String =
-		|pure func convert(value: Int) -> Int:
-		|	builtin("int.to_string")
-		|
-	rejects(
-		accepted_prelude(TYPES + declaration),
-		129,
-		144,
-		"builtin declaration does not match its runtime contract",
-		"declare a pure function with one Int parameter returning String",
-	)
-
-
-pure func test_runtime_contract_rejects_zero_parameters() -> Bool:
-	declaration: String =
-		|pure func convert() -> String:
-		|	builtin("int.to_string")
-		|
-	rejects(
-		accepted_prelude(TYPES + declaration),
-		122,
-		137,
-		"builtin declaration does not match its runtime contract",
-		"declare a pure function with one Int parameter returning String",
-	)
-
-
-pure func test_runtime_contract_rejects_impurity() -> Bool:
-	declaration: String =
-		|func convert(value: Int) -> String:
-		|	builtin("int.to_string")
-		|
-	rejects(
-		accepted_prelude(TYPES + declaration),
-		127,
-		142,
-		"builtin declaration does not match its runtime contract",
-		"declare a pure function with one Int parameter returning String",
-	)
-
-
-pure func test_program_function_shadows_prelude_fallback() -> Bool:
-	source: String =
-		|func length() -> Int:
-		|    42
-		|func main() -> Int:
-		|    length()
-		|
-	checked_source(TYPES + LENGTH, source).is_ok()
-
-
-
-pure func test_builtin_label_is_an_ordinary_string_expression() -> Bool:
-	source: String =
-		|func label() -> String:
-		|	"int.to_string"
-		|func main() -> Int:
-		|	0
-		|
-	checked_source(TYPES, source).is_ok()
-
-
-pure func test_runtime_contracts_publish_complete_primitive_abi() -> Bool:
-	convert_operation: RuntimeOperation[VariantId] = Prelude.IntToString
-	length_operation: RuntimeOperation[VariantId] = Prelude.StringLength
-	convert = runtime_contract(convert_operation)
-	length = runtime_contract(length_operation)
-	results_match = match (convert.return_type, length.return_type):
-		(PrimitiveResult(BuiltinString), PrimitiveResult(BuiltinInt)): True
-		_: False
-	(
-		convert.purity == Pure
-		and convert.parameters == [BuiltinInt]
-		and results_match
-		and length.purity == Pure
-		and length.parameters == [BuiltinString]
-	)
-
-
-private pure func binary_header_rejects(header: String) -> Bool:
-	declaration = header + "\n    builtin(\"int.add\")\n"
-	label = TYPES.length() + header.length() + "\n    builtin(".length()
-	rejects(
-		accepted_prelude(TYPES + declaration),
-		label,
-		label + "\"int.add\"".length(),
-		"builtin declaration does not match its runtime contract",
-		"declare a pure function with two Int parameters returning Int",
-	)
-
-
-pure func test_binary_builtin_prelude_header_is_accepted() -> Bool:
-	declaration: String =
-		|pure func add(first: Int, second: Int) -> Int:
-		|    builtin("int.add")
-		|
-	accepted_prelude(TYPES + declaration).is_ok()
-
-
-pure func test_binary_builtin_prelude_requires_two_parameters() -> Bool:
-	binary_header_rejects("pure func add(first: Int) -> Int:")
-
-
-pure func test_binary_builtin_prelude_checks_second_parameter_type() -> Bool:
-	binary_header_rejects("pure func add(first: Int, second: String) -> Int:")
-
-
-pure func test_binary_builtin_prelude_checks_result_type() -> Bool:
-	binary_header_rejects("pure func add(first: Int, second: Int) -> String:")
-
-
-pure func test_parsed_program_carries_the_accepted_prelude() -> Bool:
-	source: String =
-		|func main() -> Int:
-		|	0
-		|
-
-	match accepted_prelude(TYPES + CONVERT):
-		Err(_):
-			False
-		Ok(prelude):
-			match lex(module_source(root_module_id()), source):
-				Err(_):
-					False
-				Ok(input):
-					match parse_program(input, prelude):
-						Err(_):
-							False
-						Ok(parsed):
-							contents = parsed_contents(parsed)
-
-							match find_name(contents.names, "convert"):
-								Some(id):
-									match runtime_operation(contents.prelude, id):
-										Some(Prelude.IntToString): True
-										_: False
-								_:
-									False
-
-
-pure func test_unpublished_builtin_type_name_is_rejected() -> Bool:
-	match parsed_prelude(TYPES):
-		Err(_):
-			False
-		Ok(parsed):
-			unpublished = intern_name(parsed.names, "foreign").id
-
-			match parsed.types:
-				[IntegerBuiltin(integer), string, unit, float]:
-					rejects(
-						check_prelude(
-							{ parsed |
-								types = [
-									IntegerBuiltin({ integer | id = unpublished }),
-									string,
-									unit,
-									float,
-								]
-							},
-						),
-						5,
-						8,
-						"invalid parsed prelude name identity",
-						"report this compiler error with the prelude input",
-					)
-				_:
-					False
-
-
-pure func test_unpublished_entrypoint_identity_is_rejected() -> Bool:
-	match parsed_prelude(TYPES):
-		Err(_):
-			False
-		Ok(parsed):
-			unpublished = intern_name(parsed.names, "foreign").id
-			rejects(
-				check_prelude({ parsed | main = unpublished }),
-				82,
-				82,
-				"invalid parsed prelude name identity",
-				"report this compiler error with the prelude input",
-			)
-
-
-pure func test_builtin_type_identities_must_be_distinct() -> Bool:
-	match parsed_prelude(TYPES):
-		Err(_):
-			False
-		Ok(parsed):
-			match parsed.types:
-				[IntegerBuiltin(integer), StringBuiltin(string), unit, float]:
-					rejects(
-						check_prelude(
-							{ parsed |
-								types = [
-									IntegerBuiltin(integer),
-									StringBuiltin({ string | id = integer.id }),
-									unit,
-									float,
-								]
-							},
-						),
-						82,
-						82,
-						"prelude builtin identities conflict",
-						"report this compiler error with the prelude input",
-					)
-				_:
-					False
-
-
-pure func test_unpublished_runtime_header_names_are_rejected() -> Bool:
-	match parsed_prelude(TYPES + CONVERT):
-		Err(_):
-			False
-		Ok(parsed):
-			unpublished = intern_name(parsed.names, "foreign").id
-
-			match parsed.functions:
-				[function]:
-					header = function.header
-
-					match header.parameters:
-						[parameter]:
-							var passed = True
-
-							for changed in [
-								{ header |
-									function_name = { header.function_name | id = unpublished }
-								},
-								{ header |
-									return_type = renamed_type(header.return_type, unpublished)
-								},
-								{ header |
-									parameters = [
-										{ parameter |
-											name = { parameter.name | id = unpublished }
-										},
-									]
-								},
-								{ header |
-									parameters = [
-										{ parameter |
-											type_name = renamed_type(
-												parameter.type_name,
-												unpublished,
-											)
-										},
-									]
-								},
-							]:
-								match check_prelude(
-									{ parsed | functions = [{ function | header = changed }] },
-								):
-									Err(error):
-										passed = (
-											passed
-											and error.message == "invalid parsed prelude name identity"
-											and error.help == "report this compiler error with the prelude input"
-										)
-									Ok(_):
-										passed = False
-
-							passed
-						_:
-							False
-				_:
-					False
-
-
-pure func test_duplicate_prelude_function_name_is_rejected() -> Bool:
-	rejects(
-		accepted_prelude(TYPES + CONVERT + CONVERT),
-		159,
-		166,
-		"duplicate or reserved prelude function name",
-		(
-			"give prelude functions distinct names and reserve main for the program "
-			+ "entrypoint"
-		),
-	)
-
-
-pure func test_prelude_cannot_define_the_program_entrypoint() -> Bool:
-	declaration: String =
-		|pure func main(value: Int) -> String:
-		|	builtin("int.to_string")
-		|
-	rejects(
-		accepted_prelude(TYPES + declaration),
-		92,
-		96,
-		"duplicate or reserved prelude function name",
-		(
-			"give prelude functions distinct names and reserve main for the program "
-			+ "entrypoint"
-		),
-	)
-
-
-pure func test_string_length_contract_rejects_an_int_parameter() -> Bool:
-	declaration: String =
-		|pure func length(value: Int) -> Int:
-		|	builtin("string.length")
-		|
-	rejects(
-		accepted_prelude(TYPES + declaration),
-		128,
-		143,
-		"builtin declaration does not match its runtime contract",
-		"declare a pure function with one String parameter returning Int",
-	)
-
-
-pure func test_runtime_call_requires_its_declared_argument() -> Bool:
-	source: String =
-		|func main() -> Int:
-		|	convert()
-		|
-	program_rejects(TYPES + CONVERT, source, 21, 28, pure func(kind: CheckErrorKind) -> Bool:
-		match kind:
-			ArgumentCountMismatch(_):
-				True
-			_:
-				False
-	)
-
-
-pure func test_runtime_call_checks_the_string_argument_type() -> Bool:
-	source: String =
-		|func main() -> Int:
-		|	length(7)
-		|
-	program_rejects(TYPES + LENGTH, source, 21, 27, pure func(kind: CheckErrorKind) -> Bool:
-		match kind:
-			ArgumentTypeMismatch(_):
-				True
-			_:
-				False
-	)
-
-
-pure func test_runtime_function_names_conflict_with_variants() -> Bool:
-	source: String =
-		|fixed union Choice:
-		|	length
-		|func main() -> Int:
-		|	0
-		|
-	program_rejects(TYPES + LENGTH, source, 21, 27, pure func(kind: CheckErrorKind) -> Bool:
-		match kind:
-			VariantPreludeConflict(_):
-				True
-			_:
-				False
-	)
-
-
-pure func test_string_type_name_cannot_be_redeclared_as_a_union() -> Bool:
-	source: String =
-		|fixed union String:
-		|	Empty
-		|func main() -> Int:
-		|	0
-		|
-	program_rejects(TYPES, source, 12, 18, pure func(kind: CheckErrorKind) -> Bool:
-		match kind:
-			DuplicateUnion(_, _):
-				True
-			_:
-				False
-	)
-
-
-pure func test_local_binding_shadows_a_direct_runtime_call() -> Bool:
-	source: String =
-		|func main() -> Int:
-		|	length = 7
-		|	length(0)
-		|
-	program_rejects(TYPES + LENGTH, source, 33, 39, pure func(kind: CheckErrorKind) -> Bool:
-		match kind:
-			UncallableBinding(_, _, _):
-				True
-			_:
-				False
-	)
-
-
-pure func test_local_binding_does_not_shadow_a_runtime_ufcs_target() -> Bool:
-	source: String =
-		|func main() -> Int:
-		|	length = 7
-		|	length.convert().length()
-		|
-
-	match checked_source(TYPES + CONVERT + LENGTH, source):
-		Ok(_):
-			True
-		Err(_):
-			False
-
-
-pure func test_runtime_parameter_rejects_an_applied_builtin_type() -> Bool:
-	declaration: String =
-		|pure func convert(value: Int[String]) -> String:
-		|	builtin("int.to_string")
-		|
-	rejects(
-		accepted_prelude(TYPES + declaration),
-		107,
-		118,
-		"prelude builtin types cannot be applied",
-		"use the concrete Int, Float, String or Void runtime type without an argument",
-	)
-
-
-pure func test_runtime_return_rejects_an_applied_builtin_type() -> Bool:
-	declaration: String =
-		|pure func convert(value: Int) -> String[Int]:
-		|	builtin("int.to_string")
-		|
-	rejects(
-		accepted_prelude(TYPES + declaration),
-		115,
-		126,
-		"prelude builtin types cannot be applied",
-		"use the concrete Int, Float, String or Void runtime type without an argument",
-	)
+    |type Int = builtin
+    |type Float = builtin
+    |type String = builtin
+    |type Void = builtin
+    |type List[T] = builtin
+    |
+
+
+private pure func program(base: String, root: String, prelude: String, base_targets: List[Int]) -> Result[ParsedProgram, Diagnostic]:
+    setup: Diagnostic = { span = { source = module_source(root_module_id()), start = 0, end = 0 }, note = None, message = "test setup", help = "test setup" }
+    base_id ?= module_id(1).to_result(setup)
+    prelude_id ?= module_id(2).to_result(setup)
+    initial = begin_program()
+    root_tokens ?= lex(module_source(root_module_id()), root)
+    root_parsed ?= parse_module(root_tokens, root_module_id(), assembly_names(initial))
+    root_assembly ?= append_module(initial, root_parsed, [], UserModule)
+    base_tokens ?= lex(module_source(base_id), base)
+    base_parsed ?= parse_module(base_tokens, base_id, assembly_names(root_assembly))
+    var targets: List[ModuleId] = []
+    var failure: Option[Diagnostic] = None
+    for target in base_targets:
+        match module_id(target):
+            Some(id): targets = targets.append(id)
+            None: failure = Some(setup)
+    valid ?= match failure:
+        Some(error): Err(error)
+        None: Ok(void)
+    base_assembly ?= append_module(root_assembly, base_parsed, targets, FoundationTypesModule)
+    prelude_tokens ?= lex(module_source(prelude_id), prelude)
+    prelude_parsed ?= parse_module(prelude_tokens, prelude_id, assembly_names(base_assembly))
+    complete ?= append_module(base_assembly, prelude_parsed, [], FoundationPreludeModule)
+    seal_program(complete)
+
+
+private pure func same_role(left: BuiltinTypeRole, right: BuiltinTypeRole) -> Bool:
+    match (left, right):
+        (IntegerType, IntegerType) | (StringType, StringType) | (FloatType, FloatType) | (VoidType, VoidType) | (ListType, ListType): True
+        _: False
+
+
+private pure func same_error_kind(left: BuiltinTypeErrorKind, right: BuiltinTypeErrorKind) -> Bool:
+    match (left, right):
+        (MissingBuiltinType(a), MissingBuiltinType(b)): same_role(a, b)
+        (DuplicateBuiltinType(a), DuplicateBuiltinType(b)): same_role(a, b)
+        (FoundationTypeConflict(a), FoundationTypeConflict(b)): same_role(a, b)
+        (BuiltinOutsideFoundation, BuiltinOutsideFoundation) | (FoundationImports, FoundationImports) | (FoundationFunctions, FoundationFunctions): True
+        _: False
+
+
+private pure func spelling_is(names: NameTable, spelling: String, expected: NameId) -> Bool:
+    match find_name(names, spelling):
+        Some(actual): same_name(actual, expected)
+        None: False
+
+
+private pure func rejected(base: String, kind: BuiltinTypeErrorKind, message: String, help: String) -> Bool:
+    match program(base, "func main() -> Int:\n    0\n", "", []):
+        Err(_): False
+        Ok(parsed):
+            match check_builtin_types(parsed):
+                Ok(_): False
+                Err(error):
+                    rendered = render_builtin_type_error(error)
+                    (
+                        same_error_kind(error.kind, kind) and rendered.message == message and rendered.help == help
+                        and rendered.note.is_none() and same_source(error.span.source, module_source(parsed_contents(parsed).foundation.types))
+                    )
+
+
+pure func test_one_primitive_authority_uses_complete_program_names() -> Bool:
+    match program(TYPES, "func main() -> Int:\n    0\n", "", []):
+        Err(_): False
+        Ok(parsed):
+            match check_builtin_types(parsed):
+                Err(_): False
+                Ok(initial):
+                    names = parsed_contents(parsed).names
+                    (
+                        spelling_is(names, "Int", initial.special.integer)
+                        and spelling_is(names, "Float", initial.special.float)
+                        and spelling_is(names, "String", initial.special.string)
+                        and spelling_is(names, "Void", initial.special.unit)
+                        and spelling_is(names, "List", initial.special.list)
+                        and same_name(initial.special.main, parsed_contents(parsed).entrypoint)
+                    )
+
+
+pure func test_missing_int_has_typed_error_and_teaching_diagnostic() -> Bool:
+    rejected("", MissingBuiltinType(IntegerType), "missing Int builtin declaration", "add type Int = builtin to _base/types.brp")
+
+
+pure func test_missing_string_has_typed_error_and_teaching_diagnostic() -> Bool:
+    rejected("type Int = builtin\n", MissingBuiltinType(StringType), "missing String builtin declaration", "add type String = builtin to _base/types.brp")
+
+
+pure func test_missing_void_has_typed_error() -> Bool:
+    rejected("type Int = builtin\ntype String = builtin\n", MissingBuiltinType(VoidType), "missing Void builtin declaration", "add type Void = builtin to _base/types.brp")
+
+
+pure func test_missing_float_has_typed_error() -> Bool:
+    rejected("type Int = builtin\ntype String = builtin\ntype Void = builtin\n", MissingBuiltinType(FloatType), "missing Float builtin declaration", "add type Float = builtin to _base/types.brp")
+
+
+pure func test_missing_list_has_typed_error() -> Bool:
+    rejected("type Int = builtin\ntype String = builtin\ntype Void = builtin\ntype Float = builtin\n", MissingBuiltinType(ListType), "missing List builtin declaration", "add type List[T] = builtin to _base/types.brp")
+
+
+pure func test_duplicate_int_has_typed_error() -> Bool:
+    rejected(TYPES.concat("type Int = builtin\n"), DuplicateBuiltinType(IntegerType), "duplicate builtin type declaration", "declare type Int = builtin exactly once")
+
+
+pure func test_duplicate_float_has_typed_error() -> Bool:
+    rejected(TYPES.concat("type Float = builtin\n"), DuplicateBuiltinType(FloatType), "duplicate builtin type declaration", "declare type Float = builtin exactly once")
+
+
+pure func test_duplicate_string_has_typed_error() -> Bool:
+    rejected(TYPES.concat("type String = builtin\n"), DuplicateBuiltinType(StringType), "duplicate builtin type declaration", "declare type String = builtin exactly once")
+
+
+pure func test_duplicate_void_has_typed_error() -> Bool:
+    rejected(TYPES.concat("type Void = builtin\n"), DuplicateBuiltinType(VoidType), "duplicate builtin type declaration", "declare type Void = builtin exactly once")
+
+
+pure func test_duplicate_list_has_typed_error() -> Bool:
+    rejected(TYPES.concat("type List[T] = builtin\n"), DuplicateBuiltinType(ListType), "duplicate builtin type declaration", "declare type List[T] = builtin exactly once")
+
+
+pure func test_builtin_declaration_outside_foundation_is_rejected_at_its_name() -> Bool:
+    match program(TYPES, "type Int = builtin\nfunc main() -> Int:\n    0\n", "", []):
+        Err(_): False
+        Ok(parsed):
+            match check_builtin_types(parsed):
+                Ok(_): False
+                Err(error):
+                    (
+                        same_error_kind(error.kind, BuiltinOutsideFoundation) and same_source(error.span.source, module_source(root_module_id()))
+                        and error.span.start == 5 and error.span.end == 8
+                        and render_builtin_type_error(error).help == "remove this declaration; builtin types are supplied by _base/types.brp under --library-root"
+                    )
+
+
+pure func test_foundation_cannot_declare_functions() -> Bool:
+    rejected(TYPES.concat("pure func helper() -> Int:\n    0\n"), FoundationFunctions,
+        "foundation types cannot declare functions", "move functions to a library operation module and select its type in _base/prelude.brp")
+
+
+pure func test_foundation_cannot_import_modules() -> Bool:
+    match program("import:\n    ./ops: helper\n".concat(TYPES), "func main() -> Int:\n    0\n", "", [0]):
+        Err(_): False
+        Ok(parsed):
+            match check_builtin_types(parsed):
+                Ok(_): False
+                Err(error):
+                    (
+                        same_error_kind(error.kind, FoundationImports) and error.span.start == 12 and error.span.end == 25
+                        and render_builtin_type_error(error).message == "foundation types cannot import modules"
+                    )
+
+
+pure func test_ordinary_base_unions_are_preserved() -> Bool:
+    unions: String =
+        |fixed union Bool:
+        |    True
+        |    False
+        |fixed union Option[A]:
+        |    Some(A)
+        |    None
+        |fixed union Result[Value, Error]:
+        |    Ok(Value)
+        |    Err(Error)
+        |
+    match program(TYPES.concat(unions), "func main() -> Int:\n    0\n", "", []):
+        Err(_): False
+        Ok(parsed):
+            match check_builtin_types(parsed):
+                Err(_): False
+                Ok(_): parsed_contents(parsed).unions.length() == 3 and parsed_contents(parsed).builtin_types.length() == 5
+
+
+private pure func foundation_nominal_conflict_rejected(prefix: String, name: String, suffix: String, role: BuiltinTypeRole) -> Bool:
+    base = TYPES.concat(prefix).concat(name).concat(suffix)
+    match program(base, "func main() -> Int:\n    0\n", "", []):
+        Err(_): False
+        Ok(parsed):
+            match check_builtin_types(parsed):
+                Ok(_): False
+                Err(error):
+                    rendered = render_builtin_type_error(error)
+                    (
+                        same_error_kind(error.kind, FoundationTypeConflict(role))
+                        and same_source(error.span.source, module_source(parsed_contents(parsed).foundation.types))
+                        and error.span.start == TYPES.length() + prefix.length()
+                        and error.span.end == TYPES.length() + prefix.length() + name.length()
+                        and rendered.message == "foundation type conflicts with a builtin declaration"
+                        and rendered.help == "remove or rename this fixed union or record; ".concat(name).concat(" is owned by its builtin declaration")
+                        and rendered.note.is_none()
+                    )
+
+pure func test_foundation_record_cannot_redeclare_builtin_type() -> Bool:
+    foundation_nominal_conflict_rejected("fixed record ", "Float", " { value: Int }\n", FloatType)
+
+pure func test_foundation_union_cannot_redeclare_builtin_type() -> Bool:
+    foundation_nominal_conflict_rejected("fixed union ", "Int", ":\n    Value\n", IntegerType)
 
 
 tests: TestSuite = {
-	description = "Blorp 2 explicit prelude contracts",
-	tests = [
-		("binary builtin prelude header accepted", test_binary_builtin_prelude_header_is_accepted),
-		(
-			"binary builtin prelude requires two parameters",
-			test_binary_builtin_prelude_requires_two_parameters,
-		),
-		(
-			"binary builtin prelude checks second parameter",
-			test_binary_builtin_prelude_checks_second_parameter_type,
-		),
-		(
-			"binary builtin prelude checks result type",
-			test_binary_builtin_prelude_checks_result_type,
-		),
-		(
-			"runtime parameter rejects an applied builtin type",
-			test_runtime_parameter_rejects_an_applied_builtin_type,
-		),
-		(
-			"runtime return rejects an applied builtin type",
-			test_runtime_return_rejects_an_applied_builtin_type,
-		),
-		(
-			"duplicate prelude function name is rejected",
-			test_duplicate_prelude_function_name_is_rejected,
-		),
-		(
-			"prelude cannot define the program entrypoint",
-			test_prelude_cannot_define_the_program_entrypoint,
-		),
-		(
-			"String length contract rejects an Int parameter",
-			test_string_length_contract_rejects_an_int_parameter,
-		),
-		(
-			"runtime call requires its declared argument",
-			test_runtime_call_requires_its_declared_argument,
-		),
-		(
-			"runtime call checks the String argument type",
-			test_runtime_call_checks_the_string_argument_type,
-		),
-		(
-			"runtime function names conflict with variants",
-			test_runtime_function_names_conflict_with_variants,
-		),
-		(
-			"String type name cannot be redeclared as a union",
-			test_string_type_name_cannot_be_redeclared_as_a_union,
-		),
-		(
-			"local binding shadows a direct runtime call",
-			test_local_binding_shadows_a_direct_runtime_call,
-		),
-		(
-			"local binding does not shadow a runtime UFCS target",
-			test_local_binding_does_not_shadow_a_runtime_ufcs_target,
-		),
-		(
-			"runtime contracts publish complete primitive ABI",
-			test_runtime_contracts_publish_complete_primitive_abi,
-		),
-		(
-			"parsed program carries the accepted prelude",
-			test_parsed_program_carries_the_accepted_prelude,
-		),
-		(
-			"unpublished builtin type name is rejected",
-			test_unpublished_builtin_type_name_is_rejected,
-		),
-		(
-			"unpublished entrypoint identity is rejected",
-			test_unpublished_entrypoint_identity_is_rejected,
-		),
-		("builtin type identities must be distinct", test_builtin_type_identities_must_be_distinct),
-		(
-			"unpublished runtime header names are rejected",
-			test_unpublished_runtime_header_names_are_rejected,
-		),
-		(
-			"prelude publishes typed operations and one name table",
-			test_prelude_publishes_typed_operations_and_one_name_table,
-		),
-		(
-			"builtin names come from the explicit prelude",
-			test_builtin_names_come_from_the_explicit_prelude,
-		),
-		(
-			"type-only prelude does not add implicit functions",
-			test_type_only_prelude_does_not_add_implicit_functions,
-		),
-		("missing Int declaration is explicit", test_missing_int_declaration_is_explicit),
-		("missing String declaration is explicit", test_missing_string_declaration_is_explicit),
-		("missing Void declaration is explicit", test_missing_void_declaration_is_explicit),
-		("duplicate Void declaration is rejected", test_duplicate_void_declaration_is_rejected),
-		(
-			"Void identity distinct from both builtin types",
-			test_void_identity_must_be_distinct_from_both_builtin_types,
-		),
-		(
-			"duplicate builtin type is rejected at second name",
-			test_duplicate_builtin_type_is_rejected_at_second_name,
-		),
-		(
-			"runtime contract rejects wrong parameter type",
-			test_runtime_contract_rejects_wrong_parameter_type,
-		),
-		(
-			"runtime contract rejects wrong return type",
-			test_runtime_contract_rejects_wrong_return_type,
-		),
-		("runtime contract rejects zero parameters", test_runtime_contract_rejects_zero_parameters),
-		("runtime contract rejects impurity", test_runtime_contract_rejects_impurity),
-		(
-			"program function shadows prelude fallback",
-			test_program_function_shadows_prelude_fallback,
-		),
-		(
-			"builtin spelling is an ordinary String expression",
-			test_builtin_label_is_an_ordinary_string_expression,
-		),
-	]
+    description = "Blorp 2 foundation builtin authority",
+    tests = [
+        ("one authority uses complete names", test_one_primitive_authority_uses_complete_program_names),
+        ("missing Int diagnostic", test_missing_int_has_typed_error_and_teaching_diagnostic),
+        ("missing String diagnostic", test_missing_string_has_typed_error_and_teaching_diagnostic),
+        ("missing Void diagnostic", test_missing_void_has_typed_error),
+        ("missing Float diagnostic", test_missing_float_has_typed_error),
+        ("missing List diagnostic", test_missing_list_has_typed_error),
+        ("duplicate Int diagnostic", test_duplicate_int_has_typed_error),
+        ("duplicate Float diagnostic", test_duplicate_float_has_typed_error),
+        ("duplicate String diagnostic", test_duplicate_string_has_typed_error),
+        ("duplicate Void diagnostic", test_duplicate_void_has_typed_error),
+        ("duplicate List diagnostic", test_duplicate_list_has_typed_error),
+        ("builtin outside foundation", test_builtin_declaration_outside_foundation_is_rejected_at_its_name),
+        ("foundation functions rejected", test_foundation_cannot_declare_functions),
+        ("foundation imports rejected", test_foundation_cannot_import_modules),
+        ("ordinary base unions retained", test_ordinary_base_unions_are_preserved),
+        ("foundation record cannot redeclare builtin", test_foundation_record_cannot_redeclare_builtin_type),
+        ("foundation union cannot redeclare builtin", test_foundation_union_cannot_redeclare_builtin_type),
+    ]
 }

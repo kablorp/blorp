@@ -5,7 +5,7 @@ import:
 	../../src/prelude as Prelude
 	../../src/source: module_source, root_module_id, same_source
 	../../src/specialize as Concrete
-	../../src/syntax: Diagnostic, FunctionExecution(OrdinaryCalls)
+	../../src/syntax: Diagnostic, FunctionExecution(OrdinaryCalls), Entrypoint(NoArguments), entry_function
 	../../src/verify: verify
 	input: setup_diagnostic
 	list: set_index
@@ -59,9 +59,12 @@ private pure func seed() -> Result[Seed, Diagnostic]:
 		|    builtin("string.parse_int", Present, Missing)
 		|pure func parse_other(text: String) -> Other[Int]:
 		|    builtin("string.parse_int", Found, Absent)
-		|func read_text() -> Maybe[String]:
-		|    builtin("io.read_line", Present, Missing)
-		|func main() -> Int:
+		|pure func read_text(values: List[String], index: Int) -> Maybe[String]:
+		|    builtin("list.get", Present, Missing)
+		|func main(arguments: List[String]) -> Int:
+		|    parsed = parse_number("42")
+		|    other = parse_other("42")
+		|    read = read_text(arguments, 0)
 		|    0
 		|
 	ids ?= input_ids()
@@ -71,15 +74,15 @@ private pure func seed() -> Result[Seed, Diagnostic]:
 	lowered ?= Lower.lower(concrete)
 	contents = Lower.lowered_functions(lowered)
 	match contents.functions:
-		[parser, other, reader, _]:
+		[_, parser, other, reader]:
 			integer_roles ?= parse_roles(parser)
 			other_roles ?= parse_roles(other)
 			match reader.definitions:
-				[result]:
+				[_, _, result]:
 					match result.operation:
-						Lower.CallValue(call, []):
+						Lower.CallValue(call, [_, _]):
 							match call.target:
-								Concrete.RuntimeFunction(Prelude.IoReadLine(string_roles)):
+								Concrete.RuntimeFunction(Prelude.ListGet(string_roles)):
 									Ok({ ids = ids, parse_function = parser, integer_roles = integer_roles, other_roles = other_roles, string_roles = string_roles, unions = contents.unions })
 								_: Err(seed_error())
 						_: Err(seed_error())
@@ -163,36 +166,39 @@ pure func test_parse_owned_input_drops_after_final_borrow() -> Bool:
 
 
 private pure func read_function(seed: Seed, returned: Bool) -> Lower.LoweredFunction:
-	read = runtime(seed.ids.first, Prelude.IoReadLine(seed.string_roles), [], result_type(seed.string_roles), 30)
+	ids = seed.ids
+	list_type = Concrete.ListType(Concrete.StringType)
+	read = runtime(ids.third, Prelude.ListGet(seed.string_roles), [ids.first, ids.second], result_type(seed.string_roles), 30)
+	inputs = [parameter(ids.first, list_type), integer(ids.second, 0, 20), read]
 	if returned:
-		function([read], seed.ids.first, [], result_type(seed.string_roles))
+		function(inputs, ids.third, [list_type], result_type(seed.string_roles))
 	else:
-		function([read, integer(seed.ids.second, 0, 50)], seed.ids.second, [], Concrete.IntType)
+		function(inputs.append(integer(ids.fourth, 0, 50)), ids.fourth, [list_type], Concrete.IntType)
 
 
-pure func test_unused_read_line_fresh_owner_is_dropped_once() -> Bool:
+pure func test_unused_list_get_fresh_owner_is_dropped_once() -> Bool:
 	match seed():
 		Err(_): False
 		Ok(seed):
 			match Own.insert_function(read_function(seed, False), seed.unions, []):
 				Ok(function):
 					match function.operations:
-						[Own.DefineValue(read), Own.DropOwner(owner, at), Own.DefineValue(_)]:
+						[Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(read), Own.DropOwner(owner, at), Own.DefineValue(_)]:
 							match (read.operation, read.result):
-								(Own.CallDefinition(_, []), Own.OwnedResult(fresh)): Own.owner_number(fresh) == 0 and Own.owner_number(owner) == 0 and at.start == 30
+								(Own.CallDefinition(_, [Own.BorrowedArgument(_), Own.UnmanagedArgument(_)]), Own.OwnedResult(fresh)): Own.owner_number(fresh) == 0 and Own.owner_number(owner) == 0 and at.start == 30
 								_: False
 						_: False
 				Err(_): False
 
 
-pure func test_returned_read_line_transfers_fresh_owner() -> Bool:
+pure func test_returned_list_get_transfers_fresh_owner() -> Bool:
 	match seed():
 		Err(_): False
 		Ok(seed):
 			match Own.insert_function(read_function(seed, True), seed.unions, []):
 				Ok(function):
 					match (function.operations, function.tail):
-						([Own.DefineValue(read)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, owner)))):
+						([Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(read)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, owner)))):
 							match read.result:
 								Own.OwnedResult(fresh): Own.owner_number(fresh) == 0 and Own.owner_number(owner) == 0 and Lower.value_number(value) == Lower.value_number(read.id)
 								_: False
@@ -240,16 +246,26 @@ pure func test_returned_child_acquires_only_its_selected_arm_borrow() -> Bool:
 						_: False
 
 
-pure func test_inserter_keeps_owned_read_line_out_of_match_prefix() -> Bool:
+pure func test_inserter_keeps_owned_list_get_out_of_match_prefix() -> Bool:
 	match seed():
-		Err(_): False
-		Ok(seed):
-			borrowed = child_function(seed)
-			read = runtime(seed.ids.first, Prelude.IoReadLine(seed.string_roles), [], result_type(seed.string_roles), 30)
-			owned = { borrowed | signature = { parameters = [], return_type = Concrete.StringType }, definitions = [read] }
-			match Own.insert_function(owned, seed.unions, []):
-				Err(error): error.span.start == 30 and error.span.end == 31 and error.message == "owned managed values before a tail match are not supported yet" and error.help == "create managed values inside the selected match arm or a separate straight-line function" and error.note.is_none()
-				Ok(_): False
+			Err(_): False
+			Ok(seed):
+				ids = seed.ids
+				list_type = Concrete.ListType(Concrete.StringType)
+				roles = seed.integer_roles
+				owned: Lower.LoweredFunction = {
+					execution = OrdinaryCalls,
+					signature = { parameters = [list_type, result_type(roles)], return_type = Concrete.IntType },
+					definitions = [parameter(ids.first, list_type), { parameter(ids.second, result_type(roles)) | operation = Lower.ParameterValue(1) }, integer(ids.third, 0, 20), runtime(ids.fourth, Prelude.ListGet(seed.string_roles), [ids.first, ids.third], result_type(seed.string_roles), 30), integer(ids.fifth, 0, 50)],
+					tail = Lower.MatchValue({ scrutinee = ids.second, owner = Concrete.variant_owner(roles.present), arms = [
+						{ label = Lower.VariantLabel(roles.absent), body = { definitions = [], exit = Lower.ReturnValue(ids.fifth) } },
+						{ label = Lower.VariantLabel(roles.present), body = { definitions = [], exit = Lower.ReturnValue(ids.fifth) } }
+					] })
+				}
+				match Own.insert_function(owned, seed.unions, []):
+					Err(error): error.span.start == 30 and error.span.end == 31 and error.message == "owned managed values before a tail match are not supported yet" and error.help == "create managed values inside the selected match arm or a separate straight-line function" and error.note.is_none()
+					Ok(_): False
+
 
 
 private pure func define(id: Lower.ValueId, value_type: Concrete.TypeRef, operation: Own.OwnedValueOperation, result: Own.ResultOwnership, at: Int) -> Own.OwnershipOperation:
@@ -263,7 +279,7 @@ private pure func raw_function(operations: List[Own.OwnershipOperation], tail: O
 private pure func raw_program(seed: Seed, tested: Own.OwnedFunction) -> Own.OwnershipProgram:
 	ids = seed.ids
 	entry = raw_function([define(ids.first, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 1)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.first))), [], Concrete.IntType)
-	{ records = [], unions = seed.unions, functions = [entry, tested], entrypoint = ids.entrypoint }
+	{ records = [], unions = seed.unions, functions = [entry, tested], entrypoint = NoArguments(ids.entrypoint) }
 
 
 private pure func raw_parse(seed: Seed, roles: Prelude.OptionalRoles[Concrete.VariantInstanceId], value_type: Concrete.TypeRef, result: Own.ResultOwnership, argument: Own.OwnedArgument) -> Own.OwnershipProgram:
@@ -396,9 +412,14 @@ pure func test_verifier_rejects_parse_borrow_after_input_drop() -> Bool:
 
 private pure func raw_read(seed: Seed, result: Own.ResultOwnership, drops: List[Own.OwnershipOperation]) -> Own.OwnershipProgram:
 	ids = seed.ids
-	call: Concrete.ConcreteCall = { target = Concrete.RuntimeFunction(Prelude.IoReadLine(seed.string_roles)), span = span(30) }
-	operations = [define(ids.first, result_type(seed.string_roles), Own.CallDefinition(call, []), result, 30)] + drops + [define(ids.second, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 50)]
-	raw_program(seed, raw_function(operations, Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.second))), [], Concrete.IntType))
+	list_type = Concrete.ListType(Concrete.StringType)
+	call: Concrete.ConcreteCall = { target = Concrete.RuntimeFunction(Prelude.ListGet(seed.string_roles)), span = span(30) }
+	operations = [
+		define(ids.first, list_type, Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(ids.first)), 10),
+		define(ids.second, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 20),
+		define(ids.third, result_type(seed.string_roles), Own.CallDefinition(call, [Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) }), Own.UnmanagedArgument(ids.second)]), result, 30)
+	] + drops + [define(ids.fourth, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 50)]
+	raw_program(seed, raw_function(operations, Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.fourth))), [list_type], Concrete.IntType))
 
 
 pure func test_raw_read_fresh_result_and_single_drop_are_valid() -> Bool:
@@ -407,25 +428,25 @@ pure func test_raw_read_fresh_result_and_single_drop_are_valid() -> Bool:
 		Err(_): False
 
 
-pure func test_verifier_rejects_unmanaged_read_line_result() -> Bool:
+pure func test_verifier_rejects_unmanaged_list_get_result() -> Bool:
 	match seed():
 		Ok(seed): rejects(raw_read(seed, Own.UnmanagedResult, []), "managed result requires an owner", 30)
 		Err(_): False
 
 
-pure func test_verifier_rejects_borrowed_read_line_result() -> Bool:
+pure func test_verifier_rejects_borrowed_list_get_result() -> Bool:
 	match seed():
 		Ok(seed): rejects(raw_read(seed, Own.BorrowedResult(Own.ParameterBorrow(seed.ids.first)), []), "managed result requires an owner", 30)
 		Err(_): False
 
 
-pure func test_verifier_rejects_undropped_read_line_result() -> Bool:
+pure func test_verifier_rejects_undropped_list_get_result() -> Bool:
 	match seed():
 		Ok(seed): rejects(raw_read(seed, Own.OwnedResult(Own.owner_id(0)), []), "owner 0 remains live at return", 50)
 		Err(_): False
 
 
-pure func test_verifier_rejects_double_drop_of_read_line_result() -> Bool:
+pure func test_verifier_rejects_double_drop_of_list_get_result() -> Bool:
 	match seed():
 		Ok(seed): rejects(raw_read(seed, Own.OwnedResult(Own.owner_id(0)), [Own.DropOwner(Own.owner_id(0), span(40)), Own.DropOwner(Own.owner_id(0), span(45))]), "owner 0 has already been discharged", 45)
 		Err(_): False
@@ -474,18 +495,28 @@ pure func test_verifier_rejects_unmanaged_borrowed_child_return() -> Bool:
 		Err(_): False
 
 
-pure func test_verifier_rejects_dropped_read_line_before_tail_match() -> Bool:
+pure func test_verifier_rejects_dropped_list_get_before_tail_match() -> Bool:
 	match seed():
 		Err(_): False
 		Ok(seed):
-			program = raw_child(seed, True, True)
-			match program.functions:
-				[entry, child]:
-					call: Concrete.ConcreteCall = { target = Concrete.RuntimeFunction(Prelude.IoReadLine(seed.string_roles)), span = span(30) }
-					read = define(seed.ids.first, result_type(seed.string_roles), Own.CallDefinition(call, []), Own.OwnedResult(Own.owner_id(0)), 30)
-					owned = { child | signature = { parameters = [], return_type = Concrete.StringType }, operations = [read, Own.DropOwner(Own.owner_id(0), span(40))] }
-					rejects({ program | functions = [entry, owned] }, "managed value appears before a tail match", 30)
-				_: False
+			ids = seed.ids
+			list_type = Concrete.ListType(Concrete.StringType)
+			roles = seed.integer_roles
+			call: Concrete.ConcreteCall = { target = Concrete.RuntimeFunction(Prelude.ListGet(seed.string_roles)), span = span(30) }
+			matched: Own.OwnedMatch = { scrutinee = ids.second, owner = Concrete.variant_owner(roles.present), arms = [
+				{ label = Lower.VariantLabel(roles.absent), operations = [], exit = Own.ReturnResult(Own.UnmanagedReturn(ids.fifth)) },
+				{ label = Lower.VariantLabel(roles.present), operations = [], exit = Own.ReturnResult(Own.UnmanagedReturn(ids.fifth)) }
+			] }
+			owned = raw_function([
+				define(ids.first, list_type, Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(ids.first)), 10),
+				define(ids.second, result_type(roles), Own.ParameterDefinition(1), Own.UnmanagedResult, 15),
+				define(ids.third, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 20),
+				define(ids.fourth, result_type(seed.string_roles), Own.CallDefinition(call, [Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) }), Own.UnmanagedArgument(ids.third)]), Own.OwnedResult(Own.owner_id(0)), 30),
+				Own.DropOwner(Own.owner_id(0), span(40)),
+				define(ids.fifth, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 50)
+			], Own.MatchTail(matched), [list_type, result_type(roles)], Concrete.IntType)
+			rejects(raw_program(seed, owned), "managed value appears before a tail match", 30)
+
 
 
 tests: TestSuite = {
@@ -496,10 +527,10 @@ tests: TestSuite = {
 		("parse last uses include borrow and return", test_parse_last_uses_include_borrow_and_unmanaged_return),
 		("parse borrows parameter without result acquisition", test_parse_borrows_parameter_without_acquiring_result),
 		("parse owned input drops after final borrow", test_parse_owned_input_drops_after_final_borrow),
-		("unused read line fresh owner drops once", test_unused_read_line_fresh_owner_is_dropped_once),
-		("returned read line transfers fresh owner", test_returned_read_line_transfers_fresh_owner),
+		("unused list get fresh owner drops once", test_unused_list_get_fresh_owner_is_dropped_once),
+		("returned list get transfers fresh owner", test_returned_list_get_transfers_fresh_owner),
 		("returned child acquires selected arm borrow", test_returned_child_acquires_only_its_selected_arm_borrow),
-		("owned read line stays out of match prefix", test_inserter_keeps_owned_read_line_out_of_match_prefix),
+		("owned list get stays out of match prefix", test_inserter_keeps_owned_list_get_out_of_match_prefix),
 		("raw parse borrow and unmanaged result valid", test_raw_parse_borrow_and_unmanaged_result_are_valid),
 		("runtime roles require one owner", test_verifier_rejects_runtime_roles_from_different_owners),
 		("runtime roles reject swapped roles", test_verifier_rejects_swapped_runtime_roles),
@@ -514,13 +545,13 @@ tests: TestSuite = {
 		("parse String argument requires borrow", test_verifier_rejects_unmanaged_parse_string_argument),
 		("parse borrow cannot outlive input owner", test_verifier_rejects_parse_borrow_after_input_drop),
 		("raw read fresh result and single drop valid", test_raw_read_fresh_result_and_single_drop_are_valid),
-		("read line cannot be unmanaged", test_verifier_rejects_unmanaged_read_line_result),
-		("read line cannot borrow fresh result", test_verifier_rejects_borrowed_read_line_result),
-		("read line owner cannot remain live", test_verifier_rejects_undropped_read_line_result),
-		("read line owner cannot drop twice", test_verifier_rejects_double_drop_of_read_line_result),
+		("list get cannot be unmanaged", test_verifier_rejects_unmanaged_list_get_result),
+		("list get cannot borrow fresh result", test_verifier_rejects_borrowed_list_get_result),
+		("list get owner cannot remain live", test_verifier_rejects_undropped_list_get_result),
+		("list get owner cannot drop twice", test_verifier_rejects_double_drop_of_list_get_result),
 		("raw selected child acquisition valid", test_raw_selected_child_acquisition_and_transfer_are_valid),
 		("child transfer needs acquisition", test_verifier_rejects_child_transfer_without_acquisition),
 		("borrowed child return needs owner transfer", test_verifier_rejects_unmanaged_borrowed_child_return),
-		("dropped read line still forbidden before match", test_verifier_rejects_dropped_read_line_before_tail_match),
+		("dropped list get still forbidden before match", test_verifier_rejects_dropped_list_get_before_tail_match),
 	]
 }

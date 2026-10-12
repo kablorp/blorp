@@ -18,8 +18,9 @@ func main() -> Int:
 ```
 
 The exact stdout is `0.30000000000000004\n`, with exit zero and empty stderr.
-The final calculator accepts `multiply\n6.5\n2\n` and prints `13\n` through
-its ordinary main. Exit status cannot observe a Float value precisely.
+The calculator now receives arguments `multiply 6.5 2` and prints `13\n` through
+`main(args: List[String])`; [ARGUMENTS_PLAN.md](ARGUMENTS_PLAN.md) supersedes
+the original stdin protocol below. Exit status cannot observe a Float value precisely.
 
 ## Identity, representation and phase boundaries
 

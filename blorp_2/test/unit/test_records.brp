@@ -1,14 +1,19 @@
 import:
 	../../src/declarations as Declaration
 	../../src/source: module_source, root_module_id
+	../../src/namespace: ImportProblem(ImportedTypeConflict)
 	../../src/check as Check
 	../../src/check_render: render_failure
 	../../src/lex: lex
 	../../src/syntax:
 		Diagnostic,
 		DiagnosticNote(PreviousField, RecordFieldDeclaration, TypeDeclaration),
-	input: check, check_failure, parse, setup_diagnostic
+	input: check, check_failure, parse, setup_diagnostic, check_modules_failure
+	module_input: ModuleInput, PRIMITIVE_BASE, INTEGER_OPERATIONS, STRING_OPERATIONS, parse_modules_with_base
 	test: TestSuite
+
+
+private INT_IMPORT: String = "import:\n\tint: to_string\n"
 
 
 private PAIR: String =
@@ -56,6 +61,23 @@ private pure func rejects(
 	matches: pure (Check.CheckErrorKind) -> Bool,
 ) -> Bool:
 	match check_failure(prefix + marked + suffix):
+		Some(error):
+			(
+				error.span.start == prefix.length()
+				and error.span.end == prefix.length() + marked.length()
+				and matches(error.kind)
+			)
+		_:
+			False
+
+
+private pure func rejects_modules(
+	inputs: List[ModuleInput],
+	prefix: String,
+	marked: String,
+	matches: pure (Check.CheckErrorKind) -> Bool,
+) -> Bool:
+	match check_modules_failure(inputs, PRIMITIVE_BASE):
 		Some(error):
 			(
 				error.span.start == prefix.length()
@@ -301,7 +323,10 @@ pure func test_child_errors_precede_sibling_type_mismatch() -> Bool:
 	helper_prefix: String =
 		|pure func bad() -> Pair:
 		|
-	rejects(PAIR + helper_prefix + "\t{ first = 1.to_string(), second = ", "missing", " }\n" + MAIN, pure func(
+	rejects_modules([
+		{ source = (INT_IMPORT + PAIR + helper_prefix + "\t{ first = 1.to_string(), second = ") + "missing" + (" }\n" + MAIN), targets = [1] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+	], INT_IMPORT + PAIR + helper_prefix + "\t{ first = 1.to_string(), second = ", "missing", pure func(
 		kind,
 	):
 		match kind:
@@ -316,15 +341,18 @@ pure func test_field_type_error_covers_complete_child_and_annotation() -> Bool:
 	helper_prefix: String =
 		|pure func bad() -> Pair:
 		|
-	rejects(PAIR + helper_prefix + "\t{ first = ", "1.to_string()", ", second = 9 }\n" + MAIN, pure func(
+	rejects_modules([
+		{ source = (INT_IMPORT + PAIR + helper_prefix + "\t{ first = ") + "1.to_string()" + (", second = 9 }\n" + MAIN), targets = [1] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+	], INT_IMPORT + PAIR + helper_prefix + "\t{ first = ", "1.to_string()", pure func(
 		kind,
 	):
 		match kind:
 			Check.RecordFieldTypeMismatch(field, actual, annotation):
 				(
 					Check.field_number(field) == 0
-					and annotation.start == 27
-					and annotation.end == 30
+					and annotation.start == INT_IMPORT.length() + 27
+					and annotation.end == INT_IMPORT.length() + 30
 					and Check.same_type(actual.value_type, Check.StringType)
 				)
 			_:
@@ -447,6 +475,18 @@ private pure func diagnostic(source: String) -> Option[Diagnostic]:
 			None
 
 
+private pure func diagnostic_modules(inputs: List[ModuleInput]) -> Option[Diagnostic]:
+	match parse_modules_with_base(inputs, PRIMITIVE_BASE):
+		Ok(parsed):
+			match check(parsed):
+				Err(failure):
+					Some(render_failure(failure).first)
+				Ok(_):
+					None
+		Err(_):
+			None
+
+
 private pure func rendered_as(source: String, message: String, help: String) -> Bool:
 	match diagnostic(source):
 		Some(error):
@@ -470,17 +510,17 @@ pure func test_duplicate_declaration_field_reports_previous_name() -> Bool:
 	)
 
 
-pure func test_record_name_conflicts_with_prelude() -> Bool:
+pure func test_record_name_conflicts_with_base() -> Bool:
 	rejects("fixed record ", "Int", " { first: Int }\n" + MAIN, pure func(kind):
 		match kind:
-			Check.DuplicateRecordType(_, Check.PreludeTypeDeclaration(_)):
+			Check.ImportRejected(ImportedTypeConflict(_, _)):
 				True
 			_:
 				False
 	) and rendered_as(
 		"fixed record Int { first: Int }\n" + MAIN,
-		"duplicate type name",
-		"give record, union and prelude types distinct names",
+		"imported type conflicts with another type",
+		"give the types distinct names or remove the duplicate import",
 	)
 
 
@@ -528,15 +568,18 @@ pure func test_duplicate_literal_render_notes_first_written_name() -> Bool:
 
 
 pure func test_field_mismatch_render_notes_annotation() -> Bool:
-	match diagnostic(PAIR + BAD_PREFIX + "\t{ first = 1.to_string(), second = 9 }\n" + MAIN):
+	match diagnostic_modules([
+		{ source = INT_IMPORT + PAIR + BAD_PREFIX + "\t{ first = 1.to_string(), second = 9 }\n" + MAIN, targets = [1] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+	]):
 		Some(error):
 			match error.note:
 				Some(RecordFieldDeclaration(annotation)):
 					(
 						error.message == "record field requires Int"
 						and error.help == "use an expression of type Int here"
-						and annotation.start == 27
-						and annotation.end == 30
+						and annotation.start == INT_IMPORT.length() + 27
+						and annotation.end == INT_IMPORT.length() + 30
 					)
 				_:
 					False
@@ -575,7 +618,7 @@ tests: TestSuite = {
 			"duplicate declaration field and previous name",
 			test_duplicate_declaration_field_reports_previous_name,
 		),
-		("record prelude type conflict", test_record_name_conflicts_with_prelude),
+		("record base type conflict", test_record_name_conflicts_with_base),
 		("unknown field renders nominal owner", test_unknown_field_render_names_nominal_owner),
 		("literal context help", test_literal_without_context_teaches_concrete_helper),
 		(

@@ -1,11 +1,20 @@
 import:
-	../../src/source: PRELUDE_SOURCE, module_source, root_module_id
+	../../src/source: module_source, root_module_id, same_module
 	../../src/lex: lex
-	../../src/parse: parse_prelude, parsed_contents
-	../../src/syntax: Diagnostic, Symbol(AtSign), TokenKind(SymbolToken, IdentifierToken)
+	../../src/parse: ParsedProgram, ParsedContents, parsed_contents as program_contents
+	../../src/syntax: Diagnostic, ParsedBody(ParsedBuiltinBody), Symbol(AtSign), TokenKind(SymbolToken, IdentifierToken)
 	input: parse
 	option: is_none
 	test: TestSuite
+
+
+-- These assertions inspect root declarations in the complete program inventory.
+private pure func root_contents(program: ParsedProgram) -> ParsedContents:
+	contents = program_contents(program)
+	{ contents |
+		functions = contents.functions.filter(pure func(row): same_module(row.module, root_module_id())),
+		records = contents.records.filter(pure func(row): same_module(row.module, root_module_id())),
+	}
 
 
 private pure func accepts_annotation(prefix: String) -> Bool:
@@ -18,7 +27,7 @@ private pure func accepts_annotation(prefix: String) -> Bool:
 		Err(_):
 			False
 		Ok(program):
-			match parsed_contents(program).functions:
+			match root_contents(program).functions:
 				[function]:
 					match function.tail_annotation:
 						Some(span):
@@ -185,22 +194,17 @@ pure func test_annotation_in_body() -> Bool:
 	)
 
 
-pure func test_annotation_in_prelude() -> Bool:
-	match lex(
-		PRELUDE_SOURCE,
-		"@tail_recursive\npure func helper() -> Int:\n\tbuiltin(\"string.length\")\n",
-	).and_then(
-		pure func(tokens): parse_prelude(tokens),
-	):
-		Ok(_):
-			False
-		Err(error):
-			(
-				error.span.start == 0
-				and error.span.end == 1
-				and error.message == "function annotations are not allowed in the prelude"
-				and error.help == "put @tail_recursive on a program function"
-			)
+pure func test_builtin_annotation_parses_for_semantic_validation() -> Bool:
+	source = "@tail_recursive\npure func helper(value: String) -> Int:\n\tbuiltin(\"string.length\")\n"
+	match lex(module_source(root_module_id()), source).and_then(parse):
+		Err(_): False
+		Ok(program):
+			match root_contents(program).functions:
+				[function]:
+					match (function.tail_annotation, function.body):
+						(Some(span), ParsedBuiltinBody(_, _)): span.start == 0 and span.end == 15
+						_: False
+				_: False
 
 
 pure func test_annotation_name_is_an_identifier() -> Bool:
@@ -213,7 +217,7 @@ pure func test_annotation_name_is_an_identifier() -> Bool:
 		Err(_):
 			False
 		Ok(program):
-			match parsed_contents(program).functions:
+			match root_contents(program).functions:
 				[helper, main]:
 					helper.tail_annotation.is_none() and main.tail_annotation.is_none()
 				_:
@@ -235,7 +239,7 @@ tests: TestSuite = {
 		("dangling annotation diagnostic", test_dangling_annotation),
 		("annotation requires a function", test_annotation_on_union),
 		("misplaced annotation diagnostic", test_annotation_in_body),
-		("prelude annotation diagnostic", test_annotation_in_prelude),
+		("builtin annotation syntax retained", test_builtin_annotation_parses_for_semantic_validation),
 		("annotation spelling remains an identifier", test_annotation_name_is_an_identifier),
 	]
 }

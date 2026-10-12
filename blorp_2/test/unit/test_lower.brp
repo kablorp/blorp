@@ -3,7 +3,7 @@ import:
 	../../src/lex: lex
 	../../src/lower:
 		LoweredExit(ReturnValue),
-		LoweredProgram,
+		LoweredProgram, LoweredFunction,
 		LoweredTail(ExitValue, MatchValue),
 		ValueOperation(
 			ParameterValue, IntegerValue, VariantValue, CallValue, ConstructValue, PayloadValue,
@@ -13,13 +13,14 @@ import:
 		value_number,
 	../../src/prelude as Prelude: RuntimeOperation(StringLength)
 	../../src/specialize:
-		CallTarget(UserFunction, RuntimeFunction),
+		CallTarget(UserFunction, RuntimeFunction), FunctionInstanceId,
 		TypeRef(IntType, StringType, UnionType),
 		function_number,
 		same_type,
 		specialize,
 	../../src/syntax: Diagnostic
 	input: check, parse, setup_diagnostic
+	module_input: ModuleInput, PRIMITIVE_BASE, INTEGER_OPERATIONS, STRING_OPERATIONS, parse_modules_with_base
 	test: TestSuite
 
 
@@ -39,11 +40,41 @@ private pure func is_function(target: CallTarget, expected: Int) -> Bool:
 			False
 
 
+private pure func is_string_length(functions: List[LoweredFunction], id: FunctionInstanceId) -> Bool:
+	match functions.get(function_number(id)):
+		Some(function):
+			match (function.signature.parameters, function.definitions, function.tail):
+				([StringType], [parameter, result], ExitValue(ReturnValue(returned))):
+					match result.operation:
+						CallValue(call, [argument]):
+							match call.target:
+								RuntimeFunction(Prelude.StringLength):
+									(
+										same_type(function.signature.return_type, IntType)
+										and value_number(argument) == value_number(parameter.id)
+										and value_number(returned) == value_number(result.id)
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
 -- Minimal parsed/checked fixtures preserve the seals. Tests invoke and inspect
 -- lowering itself; neither C emission nor the CLI participates in this oracle.
 private pure func fixture(source: String) -> Result[LoweredProgram, Diagnostic]:
 	lexed ?= lex(module_source(root_module_id()), source)
 	parsed ?= parse(lexed)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	specialize(checked).and_then(pure func(program): lower(program))
+
+
+private pure func fixture_modules(inputs: List[ModuleInput]) -> Result[LoweredProgram, Diagnostic]:
+	parsed ?= parse_modules_with_base(inputs, PRIMITIVE_BASE)
 	checked ?= check(parsed).map_err(setup_diagnostic)
 	specialize(checked).and_then(pure func(program): lower(program))
 
@@ -85,7 +116,7 @@ pure func test_reassignment_preserves_old_alias_and_call_result() -> Bool:
 																and value_number(call.id) == 2
 																and value_number(argument) == 1
 																and value_number(id) == 0
-																and is_function(target.target, 0)
+																and is_function(target.target, 2)
 															)
 														_:
 															False
@@ -146,7 +177,7 @@ pure func test_unused_calls_remain_in_source_order() -> Bool:
 			False
 		Ok(program):
 			match lowered_functions(program).functions:
-				[_, _, function]:
+				[function, _, _]:
 					match function.definitions:
 						[first, second, third, result]:
 							match first.operation:
@@ -156,9 +187,9 @@ pure func test_unused_calls_remain_in_source_order() -> Bool:
 											match third.operation:
 												CallValue(third, []):
 													(
-														is_function(first.target, 0)
-														and is_function(second.target, 1)
-														and is_function(third.target, 1)
+														is_function(first.target, 1)
+														and is_function(second.target, 2)
+														and is_function(third.target, 2)
 														and value_number(result.id) == 3
 													)
 												_:
@@ -189,7 +220,7 @@ pure func test_parameter_shadowing_reads_the_original_value() -> Bool:
 			False
 		Ok(program):
 			match lowered_functions(program).functions:
-				[copy, _]:
+				[_, copy]:
 					match copy.definitions:
 						[parameter, replacement]:
 							match parameter.operation:
@@ -223,7 +254,7 @@ pure func test_match_branches_share_the_function_value_allocator() -> Bool:
 		|		Empty: 0
 		|		Number(local): local
 		|func main() -> Int:
-		|	0
+		|	unwrap(Number(0))
 		|
 
 	match fixture(source):
@@ -231,7 +262,7 @@ pure func test_match_branches_share_the_function_value_allocator() -> Bool:
 			False
 		Ok(program):
 			match lowered_functions(program).functions:
-				[unwrap, _]:
+				[_, unwrap]:
 					match unwrap.definitions:
 						[parameter]:
 							match unwrap.tail:
@@ -297,7 +328,7 @@ pure func test_constructor_and_call_keep_each_intermediate_type_and_span() -> Bo
 			False
 		Ok(program):
 			match lowered_functions(program).functions:
-				[_, main]:
+				[main, _]:
 					match main.definitions:
 						[literal, construction, call]:
 							match construction.value_type:
@@ -395,7 +426,7 @@ pure func test_match_calls_stay_inside_their_selected_branches() -> Bool:
 			False
 		Ok(program):
 			match lowered_functions(program).functions:
-				[_, _, _, main]:
+				[main, _, _, _]:
 					match main.definitions:
 						[scrutinee]:
 							match scrutinee.operation:
@@ -415,15 +446,15 @@ pure func test_match_calls_stay_inside_their_selected_branches() -> Bool:
 																					(
 																						is_function(
 																							choose.target,
-																							0,
-																						)
-																						and is_function(
-																							empty_call.target,
 																							1,
 																						)
 																						and is_function(
-																							selected_call.target,
+																							empty_call.target,
 																							2,
+																						)
+																						and is_function(
+																							selected_call.target,
+																							3,
 																						)
 																						and value_number(
 																							argument,
@@ -516,7 +547,7 @@ pure func test_block_arm_reassignment_preserves_payload_alias() -> Bool:
 																				)
 																				and is_function(
 																					target.target,
-																					0,
+																					2,
 																				)
 																				and same_type(
 																					payload.value_type,
@@ -577,7 +608,7 @@ pure func test_arm_reassignment_does_not_change_sibling_outer_value() -> Bool:
 			False
 		Ok(program):
 			match lowered_functions(program).functions:
-				[inspect, _]:
+				[_, inspect]:
 					match inspect.definitions:
 						[_, original]:
 							match inspect.tail:
@@ -645,7 +676,7 @@ pure func test_arm_unused_calls_remain_ordered_inside_the_branch() -> Bool:
 			False
 		Ok(program):
 			match lowered_functions(program).functions:
-				[_, _, inspect, _]:
+				[_, inspect, _, _]:
 					match inspect.definitions:
 						[parameter]:
 							match inspect.tail:
@@ -663,15 +694,15 @@ pure func test_arm_unused_calls_remain_ordered_inside_the_branch() -> Bool:
 																			(
 																				is_function(
 																					first_call.target,
-																					0,
+																					2,
 																				)
 																				and is_function(
 																					second_call.target,
-																					1,
+																					3,
 																				)
 																				and is_function(
 																					third_call.target,
-																					0,
+																					2,
 																				)
 																				and value_number(
 																					parameter.id,
@@ -715,6 +746,9 @@ pure func test_arm_unused_calls_remain_ordered_inside_the_branch() -> Bool:
 
 pure func test_managed_alias_uses_original_value_after_replacement() -> Bool:
 	source: String =
+		|import:
+		|	int: Int
+		|	string: String
 		|func main() -> Int:
 		|	var current = 7.to_string()
 		|	original = current
@@ -722,20 +756,25 @@ pure func test_managed_alias_uses_original_value_after_replacement() -> Bool:
 		|	original.length()
 		|
 
-	match fixture(source):
+	match fixture_modules([
+		{ source = source, targets = [1, 2] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+		{ source = STRING_OPERATIONS, targets = [] },
+	]):
 		Err(_):
 			False
 		Ok(program):
 			match lowered_functions(program).functions:
-				[function]:
+				[function, _, _]:
 					match function.definitions:
 						[_, original, _, replacement, length]:
 							match length.operation:
 								CallValue(call, [argument]):
 									match call.target:
-										RuntimeFunction(Prelude.StringLength):
+										UserFunction(id):
 											(
-												same_type(original.value_type, StringType)
+												is_string_length(lowered_functions(program).functions, id)
+												and same_type(original.value_type, StringType)
 												and same_type(replacement.value_type, StringType)
 												and value_number(
 													argument,
@@ -756,18 +795,25 @@ pure func test_managed_alias_uses_original_value_after_replacement() -> Bool:
 
 pure func test_managed_self_assignment_creates_no_new_value() -> Bool:
 	source: String =
+		|import:
+		|	int: Int
+		|	string: String
 		|func main() -> Int:
 		|	var value = 7.to_string()
 		|	value = value
 		|	value.length()
 		|
 
-	match fixture(source):
+	match fixture_modules([
+		{ source = source, targets = [1, 2] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+		{ source = STRING_OPERATIONS, targets = [] },
+	]):
 		Err(_):
 			False
 		Ok(program):
 			match lowered_functions(program).functions:
-				[function]:
+				[function, _, _]:
 					match function.definitions:
 						[literal, string, length]:
 							match string.operation:
@@ -775,11 +821,12 @@ pure func test_managed_self_assignment_creates_no_new_value() -> Bool:
 									match length.operation:
 										CallValue(call, [receiver]):
 											match call.target:
-												RuntimeFunction(Prelude.StringLength):
+												UserFunction(id):
 													match function.tail:
 														ExitValue(ReturnValue(result)):
 															(
-																value_number(literal.id) == 0
+																is_string_length(lowered_functions(program).functions, id)
+															and value_number(literal.id) == 0
 																and value_number(number) == 0
 																and value_number(string.id) == 1
 																and same_type(
@@ -806,6 +853,9 @@ pure func test_managed_self_assignment_creates_no_new_value() -> Bool:
 
 pure func test_two_managed_aliases_share_the_computed_value() -> Bool:
 	source: String =
+		|import:
+		|	int: Int
+		|	string: String
 		|func main() -> Int:
 		|	value = 7.to_string()
 		|	first = value
@@ -814,12 +864,16 @@ pure func test_two_managed_aliases_share_the_computed_value() -> Bool:
 		|	second.length()
 		|
 
-	match fixture(source):
+	match fixture_modules([
+		{ source = source, targets = [1, 2] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+		{ source = STRING_OPERATIONS, targets = [] },
+	]):
 		Err(_):
 			False
 		Ok(program):
 			match lowered_functions(program).functions:
-				[function]:
+				[function, _, _]:
 					match function.definitions:
 						[_, string, first_length, second_length]:
 							match first_length.operation:
@@ -851,6 +905,9 @@ pure func test_two_managed_aliases_share_the_computed_value() -> Bool:
 
 pure func test_string_arm_computations_remain_branch_local() -> Bool:
 	source: String =
+		|import:
+		|	int: Int
+		|	string: String
 		|fixed union Choice:
 		|	First
 		|	Second
@@ -862,12 +919,16 @@ pure func test_string_arm_computations_remain_branch_local() -> Bool:
 		|	choose(Second).length()
 		|
 
-	match fixture(source):
+	match fixture_modules([
+		{ source = source, targets = [1, 2] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+		{ source = STRING_OPERATIONS, targets = [] },
+	]):
 		Err(_):
 			False
 		Ok(program):
 			match lowered_functions(program).functions:
-				[choose, _]:
+				[_, choose, _, _]:
 					match choose.definitions:
 						[parameter]:
 							match choose.tail:
@@ -941,6 +1002,9 @@ pure func test_string_arm_computations_remain_branch_local() -> Bool:
 
 pure func test_arm_string_alias_survives_a_replacement() -> Bool:
 	source: String =
+		|import:
+		|	int: Int
+		|	string: String
 		|fixed union Choice:
 		|	First
 		|	Second
@@ -957,12 +1021,16 @@ pure func test_arm_string_alias_survives_a_replacement() -> Bool:
 		|	choose(First).length()
 		|
 
-	match fixture(source):
+	match fixture_modules([
+		{ source = source, targets = [1, 2] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+		{ source = STRING_OPERATIONS, targets = [] },
+	]):
 		Err(_):
 			False
 		Ok(program):
 			match lowered_functions(program).functions:
-				[choose, _]:
+				[_, choose, _, _]:
 					match choose.tail:
 						MatchValue(matched):
 							match matched.arms:

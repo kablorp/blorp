@@ -5,17 +5,18 @@ import:
 		PrimitiveType(BuiltinInt, BuiltinFloat, BuiltinString, BuiltinVoid),
 		RuntimeOperation(
 			IntAdd, IntSubtract, IntMultiply, IntDivide, IntRemainder, IntToString, StringLength,
-			StringPrint, StringParseInt, StringParseFloat, IoReadLine, StringEquals,
+			StringPrint, StringParseInt, StringParseFloat, ListLength, ListGet, StringEquals, IntEquals,
 			FloatAdd, FloatSubtract, FloatMultiply, FloatDivide, FloatRemainder, FloatToString,
 		),
 		RuntimeResult(PrimitiveResult, OptionalResult, BooleanResult),
+		RuntimeParameter(PrimitiveParameter, StringListParameter),
 		runtime_contract,
 	check as Checked
 	declarations as Declaration
 	int as IntOps
 	option: to_result
 	source: COMPILER_SOURCE
-	syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration), FunctionExecution, Span
+	syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration), Entrypoint(NoArguments, WithArguments), entry_function, FunctionExecution, Span
 	text: concat
 
 
@@ -61,6 +62,7 @@ fixed union TypeRef:
 	IntType
 	FloatType
 	StringType
+	ListType(TypeRef)
 	RecordType(RecordInstanceId)
 	UnionType(UnionInstanceId)
 
@@ -106,6 +108,12 @@ private pure func primitive_ref(value_type: PrimitiveType) -> TypeRef:
 			StringType
 
 
+private pure func runtime_parameter_ref(parameter: RuntimeParameter) -> TypeRef:
+	match parameter:
+		PrimitiveParameter(primitive): primitive_ref(primitive)
+		StringListParameter: ListType(StringType)
+
+
 pure func runtime_signature(operation: RuntimeOperation[VariantInstanceId]) -> FunctionSignature:
 	contract = runtime_contract(operation)
 
@@ -119,7 +127,7 @@ pure func runtime_signature(operation: RuntimeOperation[VariantInstanceId]) -> F
 
 	{
 		parameters = contract.parameters.map(
-			pure func(parameter: PrimitiveType) -> TypeRef: primitive_ref(parameter),
+			pure func(parameter: RuntimeParameter) -> TypeRef: runtime_parameter_ref(parameter),
 		),
 		return_type = result
 	}
@@ -219,7 +227,7 @@ fixed record SpecializedContents {
 	records: List[ConcreteRecord],
 	unions: List[ConcreteUnion],
 	functions: List[ConcreteFunction],
-	entrypoint: FunctionInstanceId
+	entrypoint: Entrypoint[FunctionInstanceId]
 }
 
 
@@ -252,6 +260,10 @@ pure func variant_number(id: VariantInstanceId) -> Int:
 
 pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 	match left:
+		ListType(left):
+			match right:
+				ListType(right): same_type(left, right)
+				_: False
 		RecordType(left):
 			match right:
 				RecordType(right):
@@ -409,6 +421,12 @@ private pure func concrete_type(
 			Ok(FloatType)
 		Checked.StringType:
 			Ok(StringType)
+		Checked.ListType(element):
+			concrete ?= concrete_type(element, substitution, unions, span, records)
+			if same_type(concrete, StringType):
+				Ok(ListType(concrete))
+			else:
+				Err({ span = span, note = None, message = "List currently supports only String elements", help = "use List[String]; other concrete element types are not supported yet" })
 		Checked.AppliedUnionType(id, arguments):
 			arguments ?= translated_list(
 				arguments,
@@ -574,7 +592,7 @@ private fixed record UnionInstance {
 
 
 private fixed union RequestSource:
-	OrdinaryRoot
+	EntrypointRoot
 	ConcreteRequest(Span)
 
 
@@ -586,18 +604,21 @@ private fixed record FunctionRequest {
 
 private fixed record PreparedType {
 	value_type: TypeRef,
-	unions: List[UnionInstance]
+	unions: List[UnionInstance],
+	records: List[RecordInstance]
 }
 
 
 private fixed record PreparedInstances {
 	functions: List[FunctionRequest],
-	unions: List[UnionInstance]
+	unions: List[UnionInstance],
+	records: List[RecordInstance]
 }
 
 
 private pure func contains_parameter(value: Checked.TypeRef) -> Bool:
 	match value:
+		Checked.ListType(element): contains_parameter(element)
 		Checked.ParameterType(_):
 			True
 		Checked.AppliedUnionType(_, arguments):
@@ -624,7 +645,7 @@ private pure func request_span(
 				span
 			else:
 				fallback
-		OrdinaryRoot:
+		EntrypointRoot:
 			fallback
 
 
@@ -650,7 +671,7 @@ private pure func find_union_instance(
 
 private pure func ensure_union(
 	key: UnionKey,
-	declarations: List[Checked.CheckedUnion],
+	checked: Checked.CheckedFunctions,
 	unions: List[UnionInstance],
 	span: Span,
 	records: List[RecordInstance],
@@ -660,9 +681,10 @@ private pure func ensure_union(
 			Ok({
 				value_type = UnionType(id),
 				unions = unions,
+				records = records,
 			})
 		None:
-			declaration ?= declarations
+			declaration ?= checked.unions
 				.get(Declaration.union_number(key.declaration))
 				.to_result(invalid(span, "unknown union declaration"))
 			substitution ?= parameter_substitution(
@@ -672,6 +694,7 @@ private pure func ensure_union(
 				span,
 			)
 			var dependencies = unions
+			var record_dependencies = records
 			var variants: List[Option[TypeRef]] = []
 			var representation = InlineUnmanaged
 			var failure: Option[Diagnostic] = None
@@ -684,20 +707,21 @@ private pure func ensure_union(
 						match prepare_type(
 							written.value_type,
 							substitution,
-							declarations,
+							checked,
 							dependencies,
 							span,
-							records,
+							record_dependencies,
 						):
 							Err(error):
 								failure = Some(error)
 								break
 							Ok(prepared):
 								dependencies = prepared.unions
+								record_dependencies = prepared.records
 								variants = variants.append(Some(prepared.value_type))
 
 								match prepared.value_type:
-									StringType:
+									StringType | ListType(_):
 										representation = InlineOwningPayload
 									UnionType(child):
 										match dependencies.get(union_number(child)):
@@ -735,25 +759,46 @@ private pure func ensure_union(
 						representation = representation
 					},
 				}),
+				records = record_dependencies,
 			})
 
 
 private pure func prepare_type(
 	value: Checked.TypeRef,
 	substitution: List[TypeSubstitution],
-	declarations: List[Checked.CheckedUnion],
+	checked: Checked.CheckedFunctions,
 	unions: List[UnionInstance],
 	span: Span,
 	records: List[RecordInstance],
 ) -> Result[PreparedType, Diagnostic]:
 	match value:
+		Checked.RecordType(id):
+			match find_record_instance(records, id):
+				Some(instance):
+					Ok({ value_type = RecordType(instance), unions = unions, records = records })
+				None:
+					declaration ?= checked.records
+						.get(Declaration.record_number(id))
+						.to_result(invalid(span, "unknown record declaration"))
+					instance: RecordInstanceId = into_opaque RecordInstanceId(records.length())
+					Ok({
+						value_type = RecordType(instance),
+						unions = unions,
+						records = records.append({
+							declaration = id,
+							layout = {
+								-- Checking currently accepts only Int record fields.
+								fields = declaration.fields.map(pure func(field: Checked.TypeUse): IntType),
+							},
+						}),
+					})
 		Checked.UnionType(id):
 			ensure_union(
 				{
 					declaration = id,
 					arguments = []
 				},
-				declarations,
+				checked,
 				unions,
 				span,
 				records,
@@ -761,20 +806,22 @@ private pure func prepare_type(
 		Checked.AppliedUnionType(id, arguments):
 			var types: List[TypeRef] = []
 			var dependencies = unions
+			var record_dependencies = records
 			var failure: Option[Diagnostic] = None
 
 			for argument in arguments:
 				match prepare_type(
 					argument,
 					substitution,
-					declarations,
+					checked,
 					dependencies,
 					span,
-					records,
+					record_dependencies,
 				):
 					Ok(prepared):
 						types = types.append(prepared.value_type)
 						dependencies = prepared.unions
+						record_dependencies = prepared.records
 					Err(error):
 						failure = Some(error)
 						break
@@ -790,16 +837,17 @@ private pure func prepare_type(
 					declaration = id,
 					arguments = types
 				},
-				declarations,
+				checked,
 				dependencies,
 				span,
-				records,
+				record_dependencies,
 			)
 		_:
 			concrete ?= concrete_type(value, substitution, unions, span, records)
 			Ok({
 				value_type = concrete,
 				unions = unions,
+				records = records,
 			})
 
 
@@ -917,9 +965,8 @@ private pure func function_types(function: Checked.CheckedFunction) -> List[Chec
 private pure func prepare_function(
 	function: Checked.CheckedFunction,
 	request: FunctionRequest,
-	declarations: List[Checked.CheckedUnion],
+	checked: Checked.CheckedFunctions,
 	initial: PreparedInstances,
-	records: List[RecordInstance],
 ) -> Result[PreparedInstances, Diagnostic]:
 	substitution ?= instance_substitution(
 		function.signature,
@@ -933,13 +980,13 @@ private pure func prepare_function(
 		match prepare_type(
 			written.value_type,
 			substitution,
-			declarations,
+			checked,
 			prepared.unions,
 			request_span(written.value_type, request.source, written.span),
-			records,
+			prepared.records,
 		):
 			Ok(value):
-				prepared = { prepared | unions = value.unions }
+				prepared = { prepared | unions = value.unions, records = value.records }
 			Err(error):
 				failure = Some(error)
 				break
@@ -956,13 +1003,13 @@ private pure func prepare_function(
 						match prepare_type(
 							argument,
 							substitution,
-							declarations,
+							checked,
 							prepared.unions,
 							request_span(argument, request.source, call.span),
-							records,
+							prepared.records,
 						):
 							Ok(value):
-								prepared = { prepared | unions = value.unions }
+								prepared = { prepared | unions = value.unions, records = value.records }
 								concrete = concrete.append(value.value_type)
 							Err(error):
 								failure = Some(error)
@@ -978,7 +1025,7 @@ private pure func prepare_function(
 
 					if not find_instance(prepared.functions, key).is_some():
 						source = match request.source:
-							OrdinaryRoot:
+							EntrypointRoot:
 								ConcreteRequest(call.span)
 							ConcreteRequest(span):
 								ConcreteRequest(span)
@@ -996,10 +1043,8 @@ private pure func prepare_function(
 
 
 private pure func expand_instances(
-	functions: List[Checked.CheckedFunction],
-	declarations: List[Checked.CheckedUnion],
+	checked: Checked.CheckedFunctions,
 	initial: PreparedInstances,
-	records: List[RecordInstance],
 ) -> Result[PreparedInstances, Diagnostic]:
 	var prepared = initial
 	var cursor: Int = 0
@@ -1021,7 +1066,7 @@ private pure func expand_instances(
 					),
 				)
 			Some(request):
-				match functions.get(Declaration.function_number(request.key.declaration)):
+				match checked.functions.get(Declaration.function_number(request.key.declaration)):
 					None:
 						failure = Some(
 							invalid(
@@ -1034,7 +1079,7 @@ private pure func expand_instances(
 							),
 						)
 					Some(function):
-						match prepare_function(function, request, declarations, prepared, records):
+						match prepare_function(function, request, checked, prepared):
 							Ok(value):
 								prepared = value
 							Err(error):
@@ -1114,6 +1159,9 @@ private pure func translate_call(
 				FloatToString:
 					accepted: RuntimeOperation[VariantInstanceId] = Prelude.FloatToString
 					Ok(accepted)
+				ListLength:
+					accepted: RuntimeOperation[VariantInstanceId] = Prelude.ListLength
+					Ok(accepted)
 				StringLength:
 					accepted: RuntimeOperation[VariantInstanceId] = Prelude.StringLength
 					Ok(accepted)
@@ -1126,17 +1174,19 @@ private pure func translate_call(
 				StringParseFloat(roles):
 					translated ?= translate_optional_roles(roles, result_type, unions, call.span)
 					Ok(Prelude.StringParseFloat(translated))
-				IoReadLine(roles):
+				ListGet(roles):
 					translated ?= translate_optional_roles(roles, result_type, unions, call.span)
-					Ok(Prelude.IoReadLine(translated))
+					Ok(Prelude.ListGet(translated))
+				IntEquals(roles):
+					owner ?= concrete_union_owner(result_type, call.span)
+					equal ?= translate_variant(roles.equal, owner, unions, call.span)
+					different ?= translate_variant(roles.different, owner, unions, call.span)
+					Ok(Prelude.IntEquals({ equal = equal, different = different }))
 				StringEquals(roles):
 					owner ?= concrete_union_owner(result_type, call.span)
 					equal ?= translate_variant(roles.equal, owner, unions, call.span)
 					different ?= translate_variant(roles.different, owner, unions, call.span)
-					Ok(Prelude.StringEquals({
-						equal = equal,
-						different = different,
-					}))
+					Ok(Prelude.StringEquals({ equal = equal, different = different }))
 
 			concrete ?= concrete_result
 			Ok(RuntimeFunction(concrete))
@@ -1462,116 +1512,17 @@ private pure func translate_function(
 
 pure func specialize(program: Checked.CheckedProgram) -> Result[SpecializedProgram, Diagnostic]:
 	checked = Checked.checked_functions(program)
-	var initial: PreparedInstances = {
-		functions = [],
-		unions = []
+	-- Checked entrypoint identity is the only root. Requests discover complete
+	-- callees and layouts before this local builder freezes into the concrete program.
+	initial: PreparedInstances = {
+		functions = [{
+			key = { declaration = entry_function(checked.entrypoint), arguments = [] },
+			source = EntrypointRoot,
+		}],
+		unions = [],
+		records = [],
 	}
-	var position: Int = 0
-	var failure: Option[Diagnostic] = None
-
-	var record_instances: List[RecordInstance] = []
-
-	for declaration in checked.records:
-		match Checked.record_declaration_id(program, record_instances.length()):
-			Some(id):
-				record_instances = record_instances.append({
-					declaration = id,
-					layout = {
-						fields = declaration.fields.map(
-							pure func(field: Checked.TypeUse): IntType,
-						),
-					},
-				})
-			None:
-				failure = Some(
-					invalid(
-						{
-							source = COMPILER_SOURCE,
-							start = 0,
-							end = 0
-						},
-						"unknown record root",
-					),
-				)
-				break
-
-	records = record_instances
-
-	for declaration in checked.unions:
-		match declaration.type_parameters:
-			[]:
-				root_unions = initial.unions
-
-				match (
-					Checked
-						.union_declaration_id(program, position)
-						.to_result(
-							invalid(
-								{
-									source = COMPILER_SOURCE,
-									start = 0,
-									end = 0
-								},
-								"unknown union root",
-							),
-						)
-						.and_then(pure func(id): ensure_union(
-								{
-									declaration = id,
-									arguments = []
-								},
-								checked.unions,
-								root_unions,
-								{
-									source = COMPILER_SOURCE,
-									start = 0,
-									end = 0
-								},
-								records,
-							))
-				):
-					Ok(value):
-						initial = { initial | unions = value.unions }
-					Err(error):
-						failure = Some(error)
-			_:
-				void
-
-		position = IntOps.add(position, 1)
-
-	position = 0
-
-	for function in checked.functions:
-		match function.signature.type_parameters:
-			[]:
-				match Checked.declaration_id(program, position):
-					Some(declaration):
-						initial = { initial | functions = initial.functions.append({
-								key = {
-									declaration = declaration,
-									arguments = []
-								},
-								source = OrdinaryRoot,
-							}) }
-					None:
-						failure = Some(
-							invalid(
-								function.signature.return_type.span,
-								"unknown root declaration",
-							),
-						)
-			_:
-				void
-
-		position = IntOps.add(position, 1)
-
-	valid ?= match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(void)
-
-	prepared ?= expand_instances(checked.functions, checked.unions, initial, records)
+	prepared ?= expand_instances(checked, initial)
 	functions ?= translated_list(prepared.functions, pure func(
 		request: FunctionRequest,
 	) -> Result[ConcreteFunction, Diagnostic]:
@@ -1587,12 +1538,12 @@ pure func specialize(program: Checked.CheckedProgram) -> Result[SpecializedProgr
 					"unknown function declaration",
 				),
 			)
-		translate_function(function, request.key, prepared.functions, prepared.unions, records)
+		translate_function(function, request.key, prepared.functions, prepared.unions, prepared.records)
 	)
 	entrypoint ?= find_instance(
 		prepared.functions,
 		{
-			declaration = checked.entrypoint,
+			declaration = entry_function(checked.entrypoint),
 			arguments = []
 		},
 	).to_result(
@@ -1605,9 +1556,12 @@ pure func specialize(program: Checked.CheckedProgram) -> Result[SpecializedProgr
 			"missing entrypoint instance",
 		),
 	)
+	accepted: Entrypoint[FunctionInstanceId] = match checked.entrypoint:
+		NoArguments(_): NoArguments(entrypoint)
+		WithArguments(_): WithArguments(entrypoint)
 	Ok(into_opaque SpecializedProgram({
-				records = records.map(pure func(instance: RecordInstance): instance.layout),
+				records = prepared.records.map(pure func(instance: RecordInstance): instance.layout),
 				unions = prepared.unions.map(pure func(instance: UnionInstance): instance.layout),
 				functions = functions,
-				entrypoint = entrypoint
+				entrypoint = accepted
 			}))

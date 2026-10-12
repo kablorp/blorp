@@ -30,7 +30,7 @@ func main() -> Int:
 After building the pilot once, the direct reproduction is:
 
 ```sh
-blorp_2/build/compiler blorp_2/src/prelude_temp.brp \
+blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
   blorp_2/test/e2e/fixtures/generic/managed/basic.brp \
   blorp_2/build/managed-union/basic.c
 ```

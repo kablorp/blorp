@@ -34,7 +34,7 @@ After adding the fixture, reproduce from the repository root:
 
 ```sh
 make -C blorp_2 test-compiler
-blorp_2/build/compiler blorp_2/src/prelude_temp.brp \
+blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
   blorp_2/test/e2e/fixtures/record/basic.brp blorp_2/build/record-basic.c
 ```
 
@@ -403,7 +403,7 @@ For each frozen baseline/candidate pair, run the same command three times:
 
 ```sh
 /usr/bin/time -l -o SAMPLE.time env BLORP_LEAK_CHECK=strict \
-  COMPILER blorp_2/src/prelude_temp.brp FIXTURE OUTPUT.c
+  COMPILER --library-root blorp_2/standard_library_temp FIXTURE OUTPUT.c
 ```
 
 Record source/binary/input hashes, compiler flags and toolchain with raw

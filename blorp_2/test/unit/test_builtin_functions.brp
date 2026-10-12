@@ -3,19 +3,20 @@ import:
 	../../src/check_render: render_failure
 	../../src/declarations: function_number
 	../../src/emit: emit
-	../../src/lex: lex
 	../../src/lower: MatchLabel(DefaultLabel), lower, value_number
 	../../src/own as Own
-	../../src/parse: parse_prelude, parsed_contents
+	../../src/parse: parsed_contents
 	../../src/prelude as Prelude:
 		PrimitiveType(BuiltinInt),
 		RuntimeOperation(IntAdd, IntToString, StringLength),
 		RuntimeResult(PrimitiveResult),
-		check_prelude,
+		BuiltinTypeErrorKind(FoundationFunctions),
+		check_builtin_types,
 		runtime_contract,
-	../../src/source: PRELUDE_SOURCE, module_id, module_source, same_source
+	../../src/source: module_id, module_source, same_source
 	../../src/specialize as Concrete
 	../../src/syntax:
+		Entrypoint(NoArguments), entry_function,
 		Diagnostic,
 		FunctionExecution(OrdinaryCalls),
 		ParsedBody(ParsedBuiltinBody),
@@ -23,7 +24,7 @@ import:
 		Purity(Pure),
 	../../src/verify: verify
 	input: setup_diagnostic
-	module_input: ModuleInput, parse_modules
+	module_input: ModuleInput, PRIMITIVE_BASE, TEST_BASE, parse_modules, parse_modules_with_base
 	ownership_inputs: InputIds, input_ids, span
 	test: TestSuite
 
@@ -172,21 +173,32 @@ pure func test_binary_runtime_contract_is_complete() -> Bool:
 	result_matches = match contract.return_type:
 		PrimitiveResult(BuiltinInt): True
 		_: False
+	parameters_match = match contract.parameters:
+		[Prelude.PrimitiveParameter(BuiltinInt), Prelude.PrimitiveParameter(BuiltinInt)]: True
+		_: False
 	(
 		contract.purity == Pure
-		and contract.parameters == [BuiltinInt, BuiltinInt]
+		and parameters_match
 		and result_matches
 	)
 
 
-pure func test_prelude_and_module_share_binary_builtin_syntax() -> Bool:
-	source = "type Int = builtin\ntype String = builtin\ntype Void = builtin\ntype Float = builtin\n" + ADD
-
-	match lex(PRELUDE_SOURCE, source).and_then(pure func(tokens): parse_prelude(tokens)):
-		Err(_):
-			False
-		Ok(parsed):
-			check_prelude(parsed).is_ok()
+pure func test_foundation_builtin_function_uses_ordinary_parser_and_rejects_at_role_boundary() -> Bool:
+	root: String =
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules_with_base([{ source = root, targets = [] }], TEST_BASE + ADD):
+		Err(_): False
+		Ok(program):
+			parsed = parsed_contents(program)
+			match (parsed.functions.get(1), check_builtin_types(program)):
+				(Some(function), Err(error)):
+					match (function.body, error.kind):
+						(ParsedBuiltinBody(IntegerAddBuiltin, occurrence), FoundationFunctions):
+							same_source(occurrence.source, module_source(parsed.foundation.types)) and error.span.start == TEST_BASE.length() + "pure func ".length()
+						_: False
+				_: False
 
 
 pure func test_unknown_builtin_label_is_rejected_before_checking() -> Bool:
@@ -213,7 +225,7 @@ pure func test_unknown_builtin_label_is_rejected_before_checking() -> Bool:
 				error.span.start == start
 				and error.span.end == start + "\"int.unknown\"".length()
 				and error.message == "unknown builtin operation"
-				and error.help == "use int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals or io.read_line"
+				and error.help == "use int.equals, int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals, list.length or list.get"
 			)
 
 
@@ -395,7 +407,7 @@ private pure func owned_add(
 	{
 		records = [],
 		unions = [],
-		entrypoint = ids.entrypoint,
+		entrypoint = NoArguments(ids.entrypoint),
 		functions = [
 			{
 				execution = OrdinaryCalls,
@@ -689,7 +701,7 @@ pure func test_verifier_checks_second_runtime_argument_type() -> Bool:
 
 private UNARY_ROOT: String =
 	|import:
-	|    ./string: count
+	|    ./string: count, to_string
 	|func main() -> Int:
 	|    count(42.to_string())
 	|
@@ -697,6 +709,8 @@ private UNARY_ROOT: String =
 private UNARY_HELPER: String =
 	|pure func count(value: String) -> Int:
 	|    builtin("string.length")
+	|pure func to_string(value: Int) -> String:
+	|    builtin("int.to_string")
 	|
 
 
@@ -739,7 +753,7 @@ pure func test_unary_module_builtin_preserves_managed_parameter_borrow() -> Bool
 			False
 		Ok(program):
 			match program.functions:
-				[caller, helper]:
+				[caller, _, helper]:
 					var dropped = False
 
 					for operation in caller.operations:
@@ -780,13 +794,15 @@ pure func test_unary_module_builtin_emits_caller_cleanup() -> Bool:
 pure func test_module_builtin_transfers_its_fresh_string_result() -> Bool:
 	root: String =
 		|import:
-		|    ./int: format
+		|    ./int: format, length
 		|func main() -> Int:
 		|    format(42).length()
 		|
 	helper: String =
 		|pure func format(value: Int) -> String:
 		|    builtin("int.to_string")
+		|pure func length(value: String) -> Int:
+		|    builtin("string.length")
 		|
 	sources: List[ModuleInput] = [
 		{
@@ -840,7 +856,7 @@ pure func test_module_builtin_transfers_its_fresh_string_result() -> Bool:
 					False
 				Ok(program):
 					match program.functions:
-						[caller, helper]:
+						[caller, helper, _]:
 							match (caller.operations, helper.operations, helper.tail):
 								([Own.DefineValue(_), Own.DefineValue(formatted), Own.DefineValue(_), Own.DropOwner(dropped, _)], [Own.DefineValue(parameter), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, transferred)))):
 									match (
@@ -946,16 +962,15 @@ pure func test_addition_helper_is_absent_without_runtime_calls() -> Bool:
 		|    42
 		|
 
-	match (
-		emitted_sources(
-			[
-				{
-					source = source,
-					targets = []
-				},
-			],
-		)
-	):
+	-- Exact minimal output requires only primitive types, with no nominal catalog.
+	code = parse_modules_with_base([{ source = source, targets = [] }], PRIMITIVE_BASE)
+		.and_then(pure func(parsed): Checked.check(parsed).map_err(setup_diagnostic))
+		.and_then(pure func(program): Concrete.specialize(program))
+		.and_then(lower)
+		.and_then(pure func(program): Own.own(program))
+		.and_then(verify)
+		.and_then(emit)
+	match code:
 		Err(_):
 			False
 		Ok(code):
@@ -1041,7 +1056,7 @@ pure func test_emitter_finds_runtime_addition_inside_a_match_arm() -> Bool:
 					False
 
 
-pure func test_unused_builtin_declaration_keeps_its_required_helper() -> Bool:
+pure func test_unused_builtin_declaration_omits_its_runtime_helper() -> Bool:
 	source = ADD + "func main() -> Int:\n    42\n"
 
 	match (
@@ -1058,8 +1073,9 @@ pure func test_unused_builtin_declaration_keeps_its_required_helper() -> Bool:
 			False
 		Ok(code):
 			(
-				code.contains("static int64_t blorp_int_add(")
-				and code.contains("blorp_int_add(blorp_vl_0,blorp_vl_1)")
+				not code.contains("blorp_int_add")
+				and not code.contains("blorp_f_1")
+				and code.contains("return (int)blorp_f_0();")
 			)
 
 
@@ -1073,8 +1089,8 @@ tests: TestSuite = {
 		),
 		("binary runtime contract is complete", test_binary_runtime_contract_is_complete),
 		(
-			"prelude and module share binary syntax",
-			test_prelude_and_module_share_binary_builtin_syntax,
+			"foundation function parses ordinarily then rejects at role boundary",
+			test_foundation_builtin_function_uses_ordinary_parser_and_rejects_at_role_boundary,
 		),
 		(
 			"unknown builtin label is rejected by parser",
@@ -1160,8 +1176,8 @@ tests: TestSuite = {
 			test_emitter_finds_runtime_addition_inside_a_match_arm,
 		),
 		(
-			"unused builtin retains required helper",
-			test_unused_builtin_declaration_keeps_its_required_helper,
+			"unused builtin omits runtime helper",
+			test_unused_builtin_declaration_omits_its_runtime_helper,
 		),
 	]
 }
