@@ -6,7 +6,7 @@ import:
 	option: is_some, to_result
 	result: and_then
 	parse:
-		ParsedProgram, ParsedModule, ParsedImport, RelativeModulePath, append_module, assembly_names, begin_program, module_imports, module_names,
+		ParsedProgram, ParsedModule, ParsedImport, ImportOrigin(RelativeImport, LibraryImport), append_module, assembly_names, begin_program, module_imports, module_names,
 		parse_module, parse_prelude, seal_program
 	path as Path
 	source:
@@ -63,18 +63,28 @@ pure func prepare_prelude(contents: String) -> Result[CheckedPrelude, Diagnostic
 -- Semantic import resolution receives ModuleId targets instead of these strings.
 pure func import_path(
 	importer: String,
-	request: RelativeModulePath,
+	request: ParsedImport,
 	names: NameTable,
+	library_root: Option[String],
 ) -> Result[String, Diagnostic]:
-	var directory = Path.dirname(importer)
-	var parents = request.parents
-
-	while IntOps.greater_than(parents, 0):
-		directory = Path.dirname(directory)
-		parents = IntOps.subtract(parents, 1)
+	base ?= match request.path.origin:
+		LibraryImport:
+			library_root.to_result(rejection(
+				request.span,
+				"library import requires an explicit library root",
+				"pass --library-root DIRECTORY containing the target library modules",
+			))
+		RelativeImport(parents):
+			var directory = Path.dirname(importer)
+			var remaining = parents
+			while IntOps.greater_than(remaining, 0):
+				directory = Path.dirname(directory)
+				remaining = IntOps.subtract(remaining, 1)
+			Ok(directory)
+	var directory = base
 
 	var failure: Option[Diagnostic] = None
-	for part in request.parts:
+	for part in request.path.parts:
 		match name_spelling(names, part):
 			None:
 				failure = Some(internal_error("import path references an invalid spelling identity"))
@@ -116,7 +126,7 @@ private func read_module(path: String, site: Option[Span]) -> Result[String, Dia
 			Err(rejection(
 				span,
 				Text.concat("could not read module ", path).concat(": ").concat(error),
-				"check the relative import path and provide a readable .brp file",
+				"check the import path and provide a readable .brp file under its source root",
 			))
 
 
@@ -130,8 +140,9 @@ private pure func resolve_request(
 	request: ParsedImport,
 	names: NameTable,
 	requests: List[RequestedModule],
+	library_root: Option[String],
 ) -> Result[ImportTarget, Diagnostic]:
-	path ?= import_path(importer, request.path, names)
+	path ?= import_path(importer, request, names, library_root)
 	match known_module(requests, path):
 		Some(id): Ok(KnownTarget(id))
 		None:
@@ -166,12 +177,21 @@ private func read_requested(
 	Ok({ request = current, file = { path = display_path, contents = contents }, parsed = parsed })
 
 
-private func load_checked(prelude: SourceFile, root_path: String, checked: CheckedPrelude) -> Result[LoadedProgram, LoadFailure]:
+private func load_checked(
+	prelude: SourceFile,
+	root_path: String,
+	checked: CheckedPrelude,
+	library_root: Option[String],
+) -> Result[LoadedProgram, LoadFailure]:
+	working_directory = getcwd()
+	normalized_library = match library_root:
+		None: None
+		Some(root): Some(Path.normalize(Path.join(working_directory, root)))
 	var modules: List[SourceFile] = []
 	var assembly = begin_program(checked)
 	var requests: List[RequestedModule] = [{
 		id = root_module_id(),
-		path = Path.normalize(Path.join(getcwd(), root_path)),
+		path = Path.normalize(Path.join(working_directory, root_path)),
 		site = None
 	}]
 	var position = 0
@@ -191,7 +211,7 @@ private func load_checked(prelude: SourceFile, root_path: String, checked: Check
 					Ok(parsed):
 						var targets: List[ModuleId] = []
 						for request in module_imports(parsed):
-							match resolve_request(loaded.request.path, request, module_names(parsed), requests):
+							match resolve_request(loaded.request.path, request, module_names(parsed), requests, normalized_library):
 								Err(error):
 									failure = Some(error)
 									break
@@ -219,9 +239,9 @@ private func load_checked(prelude: SourceFile, root_path: String, checked: Check
 				Ok(program): Ok({ sources = sources, program = program })
 
 
-func load_program(prelude: SourceFile, root_path: String) -> Result[LoadedProgram, LoadFailure]:
+func load_program(prelude: SourceFile, root_path: String, library_root: Option[String]) -> Result[LoadedProgram, LoadFailure]:
 	match prepare_prelude(prelude.contents):
 		Err(error):
 			Err({ sources = { prelude = prelude, modules = [] }, diagnostic = error })
 		Ok(checked):
-			load_checked(prelude, root_path, checked)
+			load_checked(prelude, root_path, checked, library_root)

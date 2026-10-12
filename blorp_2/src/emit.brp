@@ -1,6 +1,6 @@
 import:
 	source: COMPILER_SOURCE
-	./prelude: RuntimeOperation(IntToString, StringLength)
+	./prelude: RuntimeOperation(IntAdd, IntToString, StringLength)
 	int as IntOps
 	lower: MatchLabel(VariantLabel, DefaultLabel), ValueId, value_number
 	option: to_result
@@ -86,6 +86,8 @@ private pure func c_callable(target: CallTarget) -> String:
 			c_name(function_number(id))
 		RuntimeFunction(operation):
 			match operation:
+				IntAdd:
+					"blorp_int_add"
 				IntToString:
 					"blorp_int_to_string"
 				StringLength:
@@ -895,6 +897,47 @@ private pure func operations_need_strings(operations: List[OwnershipOperation]) 
 	needed
 
 
+private pure func operations_need_integer_add(operations: List[OwnershipOperation]) -> Bool:
+	var needed = False
+	for operation in operations:
+		match operation:
+			DefineValue(definition):
+				match definition.operation:
+					CallDefinition(call, _):
+						match call.target:
+							RuntimeFunction(IntAdd):
+								needed = True
+							_:
+								void
+					_:
+						void
+			_:
+				void
+	needed
+
+
+private pure func needs_integer_add(program: OwnershipProgram) -> Bool:
+	var needed = False
+	for function in program.functions:
+		if operations_need_integer_add(function.operations):
+			needed = True
+		match function.tail:
+			ReturnTail(_):
+				void
+			MatchTail(matched):
+				for arm in matched.arms:
+					if operations_need_integer_add(arm.operations):
+						needed = True
+	needed
+
+
+-- Unsigned addition wraps. Both signed casts below receive representable values;
+-- the negative branch also stays within Int64 at UINT64_MAX - sum == INT64_MAX.
+private INTEGER_ADD_RUNTIME: String =
+	|static int64_t blorp_int_add(int64_t first,int64_t second){uint64_t sum=(uint64_t)first+(uint64_t)second;return sum<=INT64_MAX?(int64_t)sum:-INT64_C(1)-(int64_t)(UINT64_MAX-sum);}
+	|
+
+
 private pure func needs_string_runtime(program: OwnershipProgram) -> Bool:
 	var needed = False
 
@@ -935,6 +978,8 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 		string_runtime()
 	else:
 		"#include <stdint.h>\n"
+	if needs_integer_add(checked):
+		output = output.concat(INTEGER_ADD_RUNTIME)
 
 	var index: Int = 0
 

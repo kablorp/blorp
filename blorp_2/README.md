@@ -878,8 +878,9 @@ pure func answer() -> Int:
 
 The executable exits 42. Each import row starts with `./`
 or leading `../` segments, omits `.brp`, and selects one or more local function
-names. Imports precede declarations. Bare standard-library paths, aliases,
-wildcards, type/constructor imports, qualified calls and `private` are deferred.
+names. Imports precede declarations. Bare paths select target-library modules
+when an explicit library root is supplied. Aliases, wildcards, type/constructor
+imports, qualified calls and `private` are deferred.
 
 Each module owns its declarations; same-spelled declarations in different
 modules have distinct identities. Imported functions resolve their annotations
@@ -899,11 +900,52 @@ retain the source file for primary errors and secondary notes independently.
 The [module design](MODULES_PLAN.md) records implementation research, identity
 ownership, tests and cost ceilings; the [validation report](../benchmarks/results/blorp_2_modules_2026-10-11.md)
 retains the independent reviews and measurements. The [calculator roadmap](CALCULATOR_PLAN.md)
-places standard-library integration and numeric/IO operations in later slices.
+places String literals and numeric/IO operations in later slices.
+
+## Temporary target library and Int addition
+
+[`int/add.brp`](test/e2e/fixtures/int/add.brp) imports a concrete function:
+
+```blorp
+import:
+    int: add
+
+func main() -> Int:
+    add(20, 22)
+```
+
+It exits 42. `20.add(22)` uses the same declaration through UFCS. Int addition
+wraps at the signed 64-bit limits. Arithmetic operators and traits remain
+unsupported.
+
+Supply the target library explicitly:
+
+```sh
+blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
+  blorp_2/src/prelude_temp.brp blorp_2/test/e2e/fixtures/int/add.brp \
+  blorp_2/build/add.c
+```
+
+Bare import paths resolve only under that directory. Relative imports resolve
+beside their importer, including inside library modules. Missing roots and files
+produce diagnostics; there is no local-file or host-library fallback. Library
+modules use the ordinary module pipeline and preserve declaration identities.
+
+The [temporary library](standard_library_temp/README.md) retains commented
+upstream source with provenance. Only `add` is active. Its explicit body
+`builtin("int.add")` selects a closed compiler-known operation. Module functions
+may declare these builtin bodies with the exact concrete runtime signature,
+without binding prefixes, generic parameters or tail annotations. Unknown
+labels and signature mismatches are errors. There is no arbitrary foreign
+symbol binding. The prelude remains the sole owner of `Int` and `String`.
+The [increment design](INT_ADD_PLAN.md) records phase contracts; the
+[validation report](../benchmarks/results/blorp_2_int_add_2026-10-11.md) records
+strict tests, native fixtures, matched costs and the existing compiler's
+different trait-based `add` import surface.
 
 ## Architecture
 
-The command reads the temporary input prelude, a root program and its local module dependencies, then writes C:
+The command reads the temporary input prelude, a root program and its module dependencies, then writes C:
 
 ```sh
 bin/blorp run --no-format blorp_2/src/main.brp -- blorp_2/src/prelude_temp.brp input.brp output.c
@@ -1063,10 +1105,12 @@ host import. Its `type Int = builtin` and `type String = builtin` declarations
 establish the two builtin types. Its concrete functions use the closed runtime
 keys `builtin("int.to_string")` and `builtin("string.length")`. Prelude parsing
 translates those keys to typed operations once; checking validates their exact
-purity, parameter and result contracts. Program source cannot declare builtin
-types or bodies, and quoted builtin labels do not enable ordinary String
+purity, parameter and result contracts. Module source can declare closed builtin
+bodies with those same contracts, but cannot redeclare builtin types. Quoted
+builtin labels do not enable ordinary String
 literals. Prelude and program diagnostics retain separate source origins.
-The shell loads relative local modules. Prelude input remains explicit; standard-library loading is a later increment.
+The shell loads relative local modules and bare imports under an optional,
+explicit target-library root. Prelude input remains explicit.
 
 C emission uses the whitespace required to separate C tokens and a final LF.
 It adds no indentation or internal line breaks for presentation.
@@ -1143,6 +1187,9 @@ or executes their programs. `--fixture` also accepts a directory. Explicit
 the latter skips the pilot build. Supplied executables' source correspondence
 and optimization settings are unverified unless provided by their version
 output.
+
+Pilot samples receive `standard_library_temp` as an explicit library root,
+recorded with its source snapshot.
 
 `summary.tsv` reports minimum elapsed seconds and retired instructions across
 samples, with existing/pilot ratios; values above one favor the pilot.

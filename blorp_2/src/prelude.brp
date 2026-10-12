@@ -8,15 +8,17 @@ import:
 		ParsedBuiltinType(IntegerBuiltin, StringBuiltin),
 		ParsedParameter,
 		ParsedPrelude,
-		ParsedRuntimeOperation(IntegerToStringBuiltin, StringLengthBuiltin),
-		Purity(Pure, Impure),
+		ParsedRuntimeOperation(IntegerAddBuiltin, IntegerToStringBuiltin, StringLengthBuiltin),
+		Purity(Pure),
 		Span,
 		TypeSyntax(AtomicType, AppliedType),
 		WrittenName,
+		same_purity,
 	text as Text
 
 
 fixed union RuntimeOperation:
+	IntAdd
 	IntToString
 	StringLength
 
@@ -28,7 +30,7 @@ fixed union PrimitiveType:
 
 fixed record RuntimeContract {
 	purity: Purity,
-	parameter: PrimitiveType,
+	parameters: List[PrimitiveType],
 	return_type: PrimitiveType
 }
 
@@ -37,18 +39,41 @@ fixed record RuntimeContract {
 -- to its TypeRef without deciding the contract again.
 pure func runtime_contract(operation: RuntimeOperation) -> RuntimeContract:
 	match operation:
+		IntAdd:
+			{
+				purity = Pure,
+				parameters = [BuiltinInt, BuiltinInt],
+				return_type = BuiltinInt
+			}
 		IntToString:
 			{
 				purity = Pure,
-				parameter = BuiltinInt,
+				parameters = [BuiltinInt],
 				return_type = BuiltinString
 			}
 		StringLength:
 			{
 				purity = Pure,
-				parameter = BuiltinString,
+				parameters = [BuiltinString],
 				return_type = BuiltinInt
 			}
+
+
+pure func builtin_operation(parsed: ParsedRuntimeOperation) -> RuntimeOperation:
+	match parsed:
+		IntegerAddBuiltin: IntAdd
+		IntegerToStringBuiltin: IntToString
+		StringLengthBuiltin: StringLength
+
+
+pure func runtime_declaration_help(operation: RuntimeOperation) -> String:
+	match operation:
+		IntAdd:
+			"declare a pure function with two Int parameters returning Int"
+		IntToString:
+			"declare a pure function with one Int parameter returning String"
+		StringLength:
+			"declare a pure function with one String parameter returning Int"
 
 
 private fixed record RuntimeBinding {
@@ -238,21 +263,42 @@ private pure func runtime_type_name(written: TypeSyntax) -> Result[WrittenName, 
 
 
 private pure func validate_runtime_parameter(
-	parameters: List[ParsedParameter],
+	parameter: ParsedParameter,
 	expected: PrimitiveType,
 	names: InitialNames,
 ) -> Result[Bool, Diagnostic]:
-	if IntOps.not_equals(parameters.length(), 1):
+	parameter_name ?= validate_name(parameter.name, names.names)
+	written ?= runtime_type_name(parameter.type_name)
+	type_name ?= validate_name(written, names.names)
+	Ok(matches_type(primitive_type(written.id, names.special), expected))
+
+
+private pure func validate_runtime_parameters(
+	parameters: List[ParsedParameter],
+	expected: List[PrimitiveType],
+	names: InitialNames,
+) -> Result[Bool, Diagnostic]:
+	if IntOps.not_equals(parameters.length(), expected.length()):
 		Ok(False)
 	else:
-		match parameters.get(0):
-			None:
-				Ok(False)
-			Some(parameter):
-				parameter_name ?= validate_name(parameter.name, names.names)
-				written ?= runtime_type_name(parameter.type_name)
-				type_name ?= validate_name(written, names.names)
-				Ok(matches_type(primitive_type(written.id, names.special), expected))
+		var matching = True
+		var failure: Option[Diagnostic] = None
+		var position = 0
+		for parameter in parameters:
+			match expected.get(position):
+				None:
+					matching = False
+				Some(value_type):
+					match validate_runtime_parameter(parameter, value_type, names):
+						Err(error):
+							failure = Some(error)
+							break
+						Ok(matches):
+							matching = matching and matches
+			position = IntOps.add(position, 1)
+		match failure:
+			Some(error): Err(error)
+			None: Ok(matching)
 
 
 private pure func validate_runtime_header(
@@ -275,23 +321,9 @@ private pure func validate_runtime_header(
 	function_name ?= validate_name(header.function_name, names.names)
 	return_type ?= runtime_type_name(header.return_type)
 	return_name ?= validate_name(return_type, names.names)
-	parameter_matches ?= validate_runtime_parameter(header.parameters, contract.parameter, names)
+	parameter_matches ?= validate_runtime_parameters(header.parameters, contract.parameters, names)
 
-	purity_matches = match contract.purity:
-		Pure:
-			match header.purity:
-				Pure:
-					True
-				Impure:
-					False
-		Impure:
-			match header.purity:
-				Impure:
-					True
-				Pure:
-					False
-
-	Ok(purity_matches and parameter_matches and matches_type(
+	Ok(same_purity(header.purity, contract.purity) and parameter_matches and matches_type(
 			primitive_type(return_type.id, names.special),
 			contract.return_type,
 		))
@@ -328,11 +360,7 @@ pure func check_prelude(parsed: ParsedPrelude) -> Result[CheckedPrelude, Diagnos
 			)
 			break
 
-		operation = match function.operation:
-			IntegerToStringBuiltin:
-				IntToString
-			StringLengthBuiltin:
-				StringLength
+		operation = builtin_operation(function.operation)
 
 		match validate_runtime_header(function.header, runtime_contract(operation), names):
 			Err(error):
@@ -340,17 +368,11 @@ pure func check_prelude(parsed: ParsedPrelude) -> Result[CheckedPrelude, Diagnos
 				break
 			Ok(matches):
 				if not matches:
-					help = match operation:
-						IntToString:
-							"declare a pure function with one Int parameter returning String"
-						StringLength:
-							"declare a pure function with one String parameter returning Int"
-
 					failure = Some(
 						rejection(
 							function.span,
 							"builtin declaration does not match its runtime contract",
-							help,
+							runtime_declaration_help(operation),
 						),
 					)
 					break

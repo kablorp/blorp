@@ -17,7 +17,7 @@ import:
 		FunctionHeader,
 		LexedProgram,
 		ParsedBinding,
-		ParsedBody(ParsedValueBody, ParsedMatchBody),
+		ParsedBody(ParsedBuiltinBody, ParsedValueBody, ParsedMatchBody),
 		ParsedBuiltinType(IntegerBuiltin, StringBuiltin),
 		ParsedFunction,
 		ParsedMatchArm,
@@ -27,7 +27,7 @@ import:
 		ParsedRecord,
 		ParsedRecordField,
 		ParsedRuntimeFunction,
-		ParsedRuntimeOperation(IntegerToStringBuiltin, StringLengthBuiltin),
+		ParsedRuntimeOperation(IntegerAddBuiltin, IntegerToStringBuiltin, StringLengthBuiltin),
 		ParsedUnion,
 		ParsedVariant,
 		PostfixOperation(ReceiverInvocation, FieldAccess),
@@ -64,14 +64,19 @@ fixed record ParsedContents {
 }
 
 
-fixed record RelativeModulePath {
-	parents: Int,
+fixed union ImportOrigin:
+	RelativeImport(Int)
+	LibraryImport
+
+
+fixed record ModulePath {
+	origin: ImportOrigin,
 	parts: List[NameId]
 }
 
 
 fixed record ParsedImport {
-	path: RelativeModulePath,
+	path: ModulePath,
 	symbols: List[WrittenName],
 	span: Span
 }
@@ -637,7 +642,7 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 			Err(
 				expected(
 					start,
-					"quoted builtin labels are only allowed in the prelude",
+					"quoted builtin labels are only allowed in builtin bodies",
 					"call a String-producing prelude function; String literals are not supported yet",
 				),
 			)
@@ -1039,9 +1044,23 @@ private pure func consume_arm(state: ParserState) -> Result[ArmResult, Diagnosti
 	})
 
 
+private pure func at_builtin_body(state: ParserState) -> Bool:
+	if at_word(state, "builtin") and at_symbol({ state | position = IntOps.add(state.position, 1) }, LeftParen):
+		match state.input.tokens.get(IntOps.add(state.position, 2)):
+			Some(token):
+				match token.kind:
+					BuiltinLabel(_): True
+					_: False
+			None: False
+	else:
+		False
+
+
 private pure func consume_function_body(state: ParserState) -> Result[BodyResult, Diagnostic]:
 	if at_symbol(state, MatchKeyword):
 		consume_match(state)
+	else if at_builtin_body(state):
+		consume_builtin_body(state)
 	else:
 		value ?= consume_value(state)
 		Ok({
@@ -1474,6 +1493,18 @@ private pure func consume_function(start: ParserState, module: ModuleId) -> Resu
 	header ?= consume_header(annotation.next)
 	prefix ?= consume_bindings(header.next, FunctionBindings)
 	body ?= consume_function_body(prefix.next)
+	sole_body ?= match body.body:
+		ParsedBuiltinBody(_, _):
+			match prefix.bindings.get(0):
+				Some(binding):
+					Err({
+						span = binding.name.span,
+						note = None,
+						message = "builtin bodies cannot have local bindings",
+						help = "use builtin as the entire function body; put other work in an ordinary wrapper function"
+					})
+				None: Ok(void)
+		_: Ok(void)
 	Ok({
 		function = {
 			module = module,
@@ -1694,12 +1725,24 @@ private pure func consume_runtime_function(
 	start: ParserState,
 ) -> Result[RuntimeFunctionResult, Diagnostic]:
 	header ?= consume_header(start)
-	after_builtin ?= consume_word(header.next, "builtin")
+	body ?= consume_builtin_body(header.next)
+	match body.body:
+		ParsedBuiltinBody(operation, span):
+			Ok({
+				function = { header = header.header, operation = operation, span = span },
+				next = body.next,
+			})
+		_:
+			Err(expected(header.next, "expected a builtin body", "use builtin with one quoted operation label"))
+
+
+private pure func consume_builtin_body(start: ParserState) -> Result[BodyResult, Diagnostic]:
+	after_builtin ?= consume_word(start, "builtin")
 	opened ?= consume_symbol(
 		after_builtin,
 		LeftParen,
 		"expected '(' after builtin",
-		"write builtin(\"int.to_string\") or builtin(\"string.length\")",
+		"write builtin(\"int.add\"), builtin(\"int.to_string\") or builtin(\"string.length\")",
 	)
 	label ?= opened.input.tokens
 		.get(opened.position)
@@ -1707,13 +1750,15 @@ private pure func consume_runtime_function(
 			expected(
 				opened,
 				"expected a builtin label",
-				"use \"int.to_string\" or \"string.length\"",
+				"use \"int.add\", \"int.to_string\" or \"string.length\"",
 			),
 		)
 
 	operation ?= match label.kind:
 		BuiltinLabel(spelling):
-			if Text.equals(spelling, "int.to_string"):
+			if Text.equals(spelling, "int.add"):
+				Ok(IntegerAddBuiltin)
+			else if Text.equals(spelling, "int.to_string"):
 				Ok(IntegerToStringBuiltin)
 			else if Text.equals(spelling, "string.length"):
 				Ok(StringLengthBuiltin)
@@ -1722,7 +1767,7 @@ private pure func consume_runtime_function(
 					expected(
 						opened,
 						"unknown builtin operation",
-						"use \"int.to_string\" or \"string.length\"",
+						"use \"int.add\", \"int.to_string\" or \"string.length\"",
 					),
 				)
 		_:
@@ -1730,7 +1775,7 @@ private pure func consume_runtime_function(
 				expected(
 					opened,
 					"expected a quoted builtin label",
-					"use \"int.to_string\" or \"string.length\"",
+					"use \"int.add\", \"int.to_string\" or \"string.length\"",
 				),
 			)
 
@@ -1741,17 +1786,13 @@ private pure func consume_runtime_function(
 		"give builtin exactly one quoted operation label",
 	)
 	Ok({
-		function = {
-			header = header.header,
-			operation = operation,
-			span = label.span
-		},
+		body = ParsedBuiltinBody(operation, label.span),
 		next = closed,
 	})
 
 
 -- Prelude parsing uses the same tokens, headers and name authority as programs.
--- Only this entrypoint admits compiler-known type and operation declarations.
+-- Only this entrypoint admits compiler-known type declarations.
 pure func parse_prelude(input: LexedProgram) -> Result[ParsedPrelude, Diagnostic]:
 	seed = program_names()
 	var state: ParserState = {
@@ -1843,7 +1884,7 @@ private pure func parser_span(state: ParserState) -> Span:
 
 
 private fixed record ParsedPath {
-	path: RelativeModulePath,
+	path: ModulePath,
 	span: Span,
 	next: ParserState
 }
@@ -1853,17 +1894,22 @@ private pure func parent_prefix(state: ParserState) -> Bool:
 	at_symbol(state, Dot) and at_symbol(shifted(state, 1), Dot) and at_symbol(shifted(state, 2), Slash)
 
 
-private pure func consume_relative_path(start: ParserState) -> Result[ParsedPath, Diagnostic]:
+private pure func consume_module_path(start: ParserState) -> Result[ParsedPath, Diagnostic]:
 	var state = start
-	var parents: Int = 0
+	var origin: ImportOrigin = LibraryImport
 	if at_symbol(state, Dot) and at_symbol(shifted(state, 1), Slash):
+		origin = RelativeImport(0)
 		state = shifted(state, 2)
 	else if parent_prefix(state):
+		var parents: Int = 0
 		while parent_prefix(state):
 			parents = IntOps.add(parents, 1)
 			state = shifted(state, 3)
-	prefix ?= if IntOps.equals(state.position, start.position):
-		Err(expected(state, "expected an explicit relative import path", "write ./helper: answer or ../shared/helper: answer; bare and package imports are not supported yet"))
+		origin = RelativeImport(parents)
+	prefix ?= if at_symbol(start, Slash):
+		Err(expected(start, "absolute import paths are not supported", "write int: add for the target library or ./helper: answer for a local module"))
+	else if IntOps.equals(state.position, start.position) and at_symbol(start, Dot):
+		Err(expected(start, "expected './' or '../' before a relative import path", "write ./helper: answer or ../shared/helper: answer"))
 	else:
 		Ok(void)
 	var parts: List[NameId] = []
@@ -1910,7 +1956,7 @@ private pure func consume_relative_path(start: ParserState) -> Result[ParsedPath
 			Ok(void)
 	first = parser_span(start)
 	Ok({
-		path = { parents = parents, parts = parts },
+		path = { origin = origin, parts = parts },
 		span = { source = first.source, start = first.start, end = last.end },
 		next = state
 	})
@@ -1937,7 +1983,7 @@ private fixed record ImportResult {
 
 private pure func consume_import_row(start: ParserState) -> Result[ImportResult, Diagnostic]:
 	indented ?= consume_indent(start, 1, "expected an indented import", "indent each ./helper: answer line with one tab or four spaces")
-	path ?= consume_relative_path(indented)
+	path ?= consume_module_path(indented)
 	selection ?= if at_word(path.next, "as"):
 		Err(expected(path.next, "import aliases are not supported yet", "select functions directly, such as ./helper: answer"))
 	else if at_symbol(path.next, Dot):

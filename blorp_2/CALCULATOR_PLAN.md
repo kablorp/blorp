@@ -1,7 +1,8 @@
 # A calculator through small executable increments
 
-Status: approved sequence; local imports are implemented and validated.
-Temporary target-library integration and concrete Int addition are next.
+Status: local imports, temporary target-library integration and concrete Int
+addition are implemented and validated under
+[their bounded design](INT_ADD_PLAN.md). String literals are next.
 
 Read [AGENTS.md](AGENTS.md) and the parent instructions. The supported language
 is described by [README.md](README.md) and [grammar.ebnf](grammar.ebnf); this plan
