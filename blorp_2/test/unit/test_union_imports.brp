@@ -1,0 +1,431 @@
+import:
+	../../src/check as Check
+	../../src/check_render: render_failure
+	../../src/declarations: function_number, union_number, variant_number, variant_owner
+	../../src/names: find_name
+	../../src/namespace:
+		ImportProblem(MissingImportedUnion, AmbiguousImportedUnion, MissingImportedVariant, RepeatedImportedVariant, ImportedTypeConflict),
+		TypeCandidate(UnionCandidate),
+		build_namespace,
+		import_problems,
+		type_candidates,
+		variant_candidates,
+		function_candidates,
+	../../src/parse: ParsedProgram, parsed_contents
+	../../src/prelude as Prelude
+	../../src/source: module_id, module_source, root_module_id, same_source
+	../../src/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration)
+	module_input: parse_modules
+	test: TestSuite
+
+
+private OPTION: String =
+	|fixed union Option[T]:
+	|    Some(T)
+	|    None
+	|
+
+
+private pure func modules(root: String, dependency: String) -> Result[ParsedProgram, Diagnostic]:
+	parse_modules([{ source = root, targets = [1] }, { source = dependency, targets = [] }])
+
+
+private pure func rejected(root: String, dependency: String) -> Option[Check.CheckFailure]:
+	match modules(root, dependency):
+		Err(_): None
+		Ok(parsed):
+			match Check.check(parsed):
+				Ok(_): None
+				Err(failure): Some(failure)
+
+
+private pure func rendered_is(
+	failure: Check.CheckFailure,
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+	previous: Option[(Int, Int)],
+) -> Bool:
+	rendered = render_failure(failure)
+	error = rendered.first
+	note_matches = match (error.note, previous):
+		(None, None): True
+		(Some(PreviousDeclaration(span)), Some(expected)):
+			same_source(span.source, module_source(root_module_id())) and span.start == expected[0] and span.end == expected[1]
+		_: False
+	(
+		Check.check_errors(failure).remaining.is_empty()
+		and rendered.remaining.is_empty()
+		and same_source(error.span.source, module_source(root_module_id()))
+		and error.span.start == start and error.span.end == end
+		and error.message == message and error.help == help
+		and note_matches
+	)
+
+
+pure func test_selected_union_and_variants_keep_defining_identities() -> Bool:
+	root: String =
+		|import:
+		|    ./option: Option(Some, None)
+		|func main() -> Int:
+		|    0
+		|
+	match (modules(root, OPTION), module_id(1)):
+		(Ok(parsed), Some(dependency)):
+			namespace = build_namespace(parsed)
+			match (find_name(parsed_contents(parsed).names, "Option"), find_name(parsed_contents(parsed).names, "Some")):
+				(Some(type_name), Some(constructor)):
+					match (
+						type_candidates(namespace, root_module_id(), type_name),
+						type_candidates(namespace, dependency, type_name),
+						variant_candidates(namespace, root_module_id(), constructor),
+						variant_candidates(namespace, dependency, constructor),
+					):
+						([UnionCandidate(imported)], [UnionCandidate(local)], [selected], [defined]):
+							(
+								union_number(imported) == union_number(local)
+								and union_number(variant_owner(selected)) == union_number(local)
+								and union_number(variant_owner(defined)) == union_number(local)
+								and variant_number(selected) == variant_number(defined)
+								and variant_number(selected) == 0
+								and import_problems(namespace).is_empty()
+							)
+						_: False
+				_: False
+		_: False
+
+
+pure func test_type_only_import_hides_constructors() -> Bool:
+	root: String =
+		|import:
+		|    ./option: Option()
+		|func main() -> Int:
+		|    0
+		|
+	match modules(root, OPTION):
+		Err(_): False
+		Ok(parsed):
+			namespace = build_namespace(parsed)
+			match (find_name(parsed_contents(parsed).names, "Option"), find_name(parsed_contents(parsed).names, "Some")):
+				(Some(type_name), Some(constructor)):
+					type_candidates(namespace, root_module_id(), type_name).length() == 1 and variant_candidates(namespace, root_module_id(), constructor).is_empty()
+				_: False
+
+
+pure func test_unselected_constructor_is_not_visible() -> Bool:
+	root: String =
+		|import:
+		|    ./option: Option(Some)
+		|func main() -> Int:
+		|    0
+		|
+	match modules(root, OPTION):
+		Err(_): False
+		Ok(parsed):
+			namespace = build_namespace(parsed)
+			match find_name(parsed_contents(parsed).names, "None"):
+				Some(name): variant_candidates(namespace, root_module_id(), name).is_empty()
+				None: False
+
+
+pure func test_same_spelling_constructors_keep_distinct_union_owners() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Left(Same)
+		|    ./right: Right(Same)
+		|pure func left() -> Left:
+		|    Same
+		|pure func right() -> Right:
+		|    Same
+		|func main() -> Int:
+		|    0
+		|
+	left: String =
+		|fixed union Left:
+		|    Same
+		|
+	right: String =
+		|fixed union Right:
+		|    Same
+		|
+	match parse_modules([
+		{ source = root, targets = [1, 2] },
+		{ source = left, targets = [] },
+		{ source = right, targets = [] },
+	]):
+		Err(_): False
+		Ok(parsed):
+			namespace = build_namespace(parsed)
+			match find_name(parsed_contents(parsed).names, "Same"):
+				Some(name):
+					match variant_candidates(namespace, root_module_id(), name):
+						[left, right]:
+							union_number(variant_owner(left)) != union_number(variant_owner(right)) and variant_number(left) == 0 and variant_number(right) == 0 and Check.check(parsed).is_ok()
+						_: False
+				None: False
+
+
+pure func test_missing_union_has_typed_error_and_exact_diagnostic() -> Bool:
+	prefix = "import:\n    ./option: "
+	match rejected(prefix + "Missing()\nfunc main() -> Int:\n    0\n", OPTION):
+		Some(failure):
+			match Check.check_errors(failure).first.kind:
+				Check.ImportRejected(MissingImportedUnion(_)):
+					rendered_is(failure, prefix.length(), prefix.length() + 7, "unknown imported union", "select a fixed union declared directly in that module; imports are not reexported", None)
+				_: False
+		None: False
+
+
+pure func test_wrong_union_member_has_typed_error_and_exact_diagnostic() -> Bool:
+	prefix = "import:\n    ./option: Option("
+	dependency = OPTION + "fixed union Other:\n    Elsewhere\n"
+	match rejected(prefix + "Elsewhere)\nfunc main() -> Int:\n    0\n", dependency):
+		Some(failure):
+			match Check.check_errors(failure).first.kind:
+				Check.ImportRejected(MissingImportedVariant(_)):
+					rendered_is(failure, prefix.length(), prefix.length() + 9, "constructor does not belong to the selected union", "select a constructor declared inside that union", None)
+				_: False
+		None: False
+
+
+pure func test_repeated_constructor_retains_both_occurrence_spans() -> Bool:
+	prefix = "import:\n    ./option: Option("
+	current = prefix + "Some, "
+	match rejected(current + "Some)\nfunc main() -> Int:\n    0\n", OPTION):
+		Some(failure):
+			match Check.check_errors(failure).first.kind:
+				Check.ImportRejected(RepeatedImportedVariant(_, previous)):
+					previous.start == prefix.length() and previous.end == prefix.length() + 4 and rendered_is(failure, current.length(), current.length() + 4, "constructor selected more than once", "list each selected constructor once", Some((prefix.length(), prefix.length() + 4)))
+				_: False
+		None: False
+
+
+pure func test_repeated_type_selector_retains_both_occurrence_spans() -> Bool:
+	prefix = "import:\n    ./option: "
+	current = prefix + "Option(), "
+	match rejected(current + "Option()\nfunc main() -> Int:\n    0\n", OPTION):
+		Some(failure):
+			match Check.check_errors(failure).first.kind:
+				Check.ImportRejected(ImportedTypeConflict(_, previous)):
+					previous.start == prefix.length() and rendered_is(failure, current.length(), current.length() + 6, "imported type conflicts with another type", "give the types distinct names or remove the duplicate import", Some((prefix.length(), prefix.length() + 6)))
+				_: False
+		None: False
+
+
+pure func test_local_type_conflict_is_rejected_before_signatures() -> Bool:
+	prefix = "import:\n    ./option: "
+	declaration = prefix + "Option()\nfixed union "
+	root = declaration + "Option:\n    Local\nfunc main() -> Int:\n    0\n"
+	match rejected(root, OPTION):
+		Some(failure):
+			match Check.check_errors(failure).first.kind:
+				Check.ImportRejected(ImportedTypeConflict(_, previous)):
+					previous.start == declaration.length() and rendered_is(failure, prefix.length(), prefix.length() + 6, "imported type conflicts with another type", "give the types distinct names or remove the duplicate import", Some((declaration.length(), declaration.length() + 6)))
+				_: False
+		None: False
+
+
+pure func test_ambiguous_source_type_is_not_chosen_arbitrarily() -> Bool:
+	prefix = "import:\n    ./option: "
+	dependency = OPTION + "fixed union Option:\n    Another\n"
+	match modules(prefix + "Option()\nfunc main() -> Int:\n    0\n", dependency):
+		Ok(parsed):
+			match import_problems(build_namespace(parsed)):
+				[AmbiguousImportedUnion(name)]: name.span.start == prefix.length() and name.span.end == prefix.length() + "Option".length()
+				_: False
+		Err(_): False
+
+
+pure func test_duplicate_dependency_union_is_rejected_before_import_validation() -> Bool:
+	root: String =
+		|import:
+		|    ./option: Option()
+		|func main() -> Int:
+		|    0
+		|
+	declaration = OPTION + "fixed union "
+	match (rejected(root, declaration + "Option:\n    Another\n"), module_id(1)):
+		(Some(failure), Some(dependency)):
+			match Check.check_errors(failure).first.kind:
+				Check.DuplicateUnion(_, Check.SourceTypeDeclaration(previous)):
+					rendered = render_failure(failure)
+					Check.check_errors(failure).remaining.is_empty() and rendered.remaining.is_empty() and same_source(previous.source, module_source(dependency)) and previous.start == "fixed union ".length() and same_source(rendered.first.span.source, module_source(dependency)) and rendered.first.span.start == declaration.length() and rendered.first.span.end == declaration.length() + "Option".length() and rendered.first.message == "duplicate union type name" and rendered.first.help == "give union types distinct names; Int, Float, String and Void are declared by the prelude" and rendered.first.note.is_none()
+				_: False
+		_: False
+
+
+pure func test_imported_types_are_not_reexported() -> Bool:
+	root: String =
+		|import:
+		|    ./facade: Option()
+		|func main() -> Int:
+		|    0
+		|
+	facade: String =
+		|import:
+		|    ./option: Option()
+		|
+	match parse_modules([{ source = root, targets = [1] }, { source = facade, targets = [2] }, { source = OPTION, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match import_problems(build_namespace(parsed)):
+				[MissingImportedUnion(name)]: name.span.start == "import:\n    ./facade: ".length()
+				_: False
+
+
+pure func test_constructor_function_conflict_notes_import_selector() -> Bool:
+	previous = "import:\n    ./value: "
+	current = previous + "Some\n    ./option: Option("
+	root = current + "Some)\nfunc main() -> Int:\n    0\n"
+	value: String =
+		|pure func Some() -> Int:
+		|    1
+		|
+	match parse_modules([
+		{ source = root, targets = [1, 2] },
+		{ source = value, targets = [] },
+		{ source = OPTION, targets = [] },
+	]):
+		Err(_): False
+		Ok(parsed):
+			match Check.check(parsed):
+				Ok(_): False
+				Err(failure):
+					match Check.check_errors(failure).first.kind:
+						Check.ImportedConstructorConflict(_, origin):
+							same_source(origin.source, module_source(root_module_id())) and rendered_is(failure, current.length(), current.length() + 4, "imported constructor conflicts with a function", "give the constructor and function distinct names", Some((previous.length(), previous.length() + 4)))
+						_: False
+
+
+pure func test_constructor_function_conflict_notes_local_declaration() -> Bool:
+	prefix = "import:\n    ./option: Option("
+	declaration = prefix + "Some)\npure func "
+	root = declaration + "Some() -> Int:\n    1\nfunc main() -> Int:\n    0\n"
+	match rejected(root, OPTION):
+		Some(failure):
+			match Check.check_errors(failure).first.kind:
+				Check.ImportedConstructorConflict(_, origin):
+					origin.start == declaration.length() and rendered_is(failure, prefix.length(), prefix.length() + 4, "imported constructor conflicts with a function", "give the constructor and function distinct names", Some((declaration.length(), declaration.length() + 4)))
+				_: False
+		None: False
+
+
+pure func test_missing_selector_close_has_exact_parse_error() -> Bool:
+	prefix = "import:\n    ./option: Option(Some"
+	match modules(prefix + "\n", OPTION):
+		Err(error):
+			error.span.start == prefix.length() and error.span.end == prefix.length() + 1 and error.message == "expected ')' after selected constructors" and error.help == "write Option(Some, None) or Option() on one line"
+		Ok(_): False
+
+
+pure func test_trailing_constructor_comma_has_exact_parse_error() -> Bool:
+	prefix = "import:\n    ./option: Option(Some,"
+	match modules(prefix + ")\n", OPTION):
+		Err(error):
+			error.span.start == prefix.length() and error.span.end == prefix.length() + 1 and error.message == "expected a constructor after ','" and error.help == "omit the trailing comma in Option(Some, None)"
+		Ok(_): False
+
+
+private FORMATTER: String =
+	|pure func to_string(value: Int) -> String:
+	|    "selected"
+	|
+
+
+pure func test_imported_formatter_shadows_prelude_fallback() -> Bool:
+	root: String =
+		|import:
+		|    ./format: to_string
+		|pure func use() -> String:
+		|    to_string(42)
+		|func main() -> Int:
+		|    0
+		|
+	match (modules(root, FORMATTER), module_id(1)):
+		(Ok(parsed), Some(dependency)):
+			match (Check.check(parsed), find_name(parsed_contents(parsed).names, "to_string")):
+				(Ok(checked), Some(name)):
+					match (Check.checked_functions(checked).functions.get(0), function_candidates(build_namespace(parsed), dependency, name)):
+						(Some(function), [declared]):
+							match function.body:
+								Check.CheckedValueBody(Check.ReturnExpression(value)):
+									match value.base:
+										Check.ReturnCall(call, [_]):
+											match call.target:
+												Check.UserFunction(id, []): function_number(id) == function_number(declared.function)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+pure func test_unimported_loaded_formatter_does_not_shadow_root_fallback() -> Bool:
+	root: String =
+		|pure func use() -> String:
+		|    to_string(42)
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules([{ source = root, targets = [] }, { source = FORMATTER, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match Check.check(parsed):
+				Err(_): False
+				Ok(checked):
+					match Check.checked_functions(checked).functions.get(0):
+						Some(function):
+							match function.body:
+								Check.CheckedValueBody(Check.ReturnExpression(value)):
+									match value.base:
+										Check.ReturnCall(call, [_]):
+											match call.target:
+												Check.RuntimeFunction(Prelude.IntToString): True
+												_: False
+										_: False
+								_: False
+						None: False
+
+
+pure func test_two_explicit_formatter_imports_keep_exact_conflict_diagnostic() -> Bool:
+	previous = "import:\n    ./left: "
+	current = previous + "to_string\n    ./right: "
+	root = current + "to_string\nfunc main() -> Int:\n    0\n"
+	match parse_modules([{ source = root, targets = [1, 2] }, { source = FORMATTER, targets = [] }, { source = FORMATTER, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match Check.check(parsed):
+				Ok(_): False
+				Err(failure):
+					match Check.check_errors(failure).first.kind:
+						Check.ImportedFunctionConflict(_, origin):
+							origin.start == previous.length() and rendered_is(failure, current.length(), current.length() + "to_string".length(), "imported function conflicts with another function", "give the functions distinct names or remove the duplicate import", Some((previous.length(), previous.length() + "to_string".length())))
+						_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 selective union import facts",
+	tests = [
+		("selected union and variants keep defining identities", test_selected_union_and_variants_keep_defining_identities),
+		("type only import hides constructors", test_type_only_import_hides_constructors),
+		("unselected constructor is not visible", test_unselected_constructor_is_not_visible),
+		("same spelling constructors keep distinct owners", test_same_spelling_constructors_keep_distinct_union_owners),
+		("missing union exact diagnostic", test_missing_union_has_typed_error_and_exact_diagnostic),
+		("wrong union member exact diagnostic", test_wrong_union_member_has_typed_error_and_exact_diagnostic),
+		("repeated constructor occurrence spans", test_repeated_constructor_retains_both_occurrence_spans),
+		("repeated type selector occurrence spans", test_repeated_type_selector_retains_both_occurrence_spans),
+		("local type conflict before signatures", test_local_type_conflict_is_rejected_before_signatures),
+		("ambiguous source type is not chosen", test_ambiguous_source_type_is_not_chosen_arbitrarily),
+		("duplicate dependency union precedes import validation", test_duplicate_dependency_union_is_rejected_before_import_validation),
+		("types are not reexported", test_imported_types_are_not_reexported),
+		("constructor conflict notes function import selector", test_constructor_function_conflict_notes_import_selector),
+		("constructor conflict notes local function declaration", test_constructor_function_conflict_notes_local_declaration),
+		("missing selector close exact parse error", test_missing_selector_close_has_exact_parse_error),
+		("trailing constructor comma exact parse error", test_trailing_constructor_comma_has_exact_parse_error),
+		("imported formatter shadows prelude fallback", test_imported_formatter_shadows_prelude_fallback),
+		("unimported formatter does not shadow root fallback", test_unimported_loaded_formatter_does_not_shadow_root_fallback),
+		("two formatter imports retain exact conflict", test_two_explicit_formatter_imports_keep_exact_conflict_diagnostic),
+	]
+}

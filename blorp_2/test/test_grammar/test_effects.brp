@@ -1,0 +1,127 @@
+import:
+	../../src/lex: lex
+	../../src/parse: parsed_contents
+	../../src/source: module_source, root_module_id
+	../../src/syntax:
+		ExpressionBase(VoidExpression),
+		ParsedBody(ParsedValueBody),
+		ParsedStatement(BindingStatement, ExpressionStatement),
+		ValueExpression,
+	../unit/input: parse
+	test: TestSuite
+
+
+private pure func is_unit(value: ValueExpression) -> Bool:
+	match value.base:
+		VoidExpression:
+			True
+		_:
+			False
+
+
+pure func test_statements_have_one_source_order() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    first = void
+		|    void -- discarded unit
+		|
+		|    -- trivia does not end a block
+		|    var second = first
+		|    second = void
+		|    0
+		|
+
+	match lex(module_source(root_module_id()), source).and_then(pure func(tokens): parse(tokens)):
+		Ok(program):
+			match parsed_contents(program).functions:
+				[function]:
+					match function.statements:
+						[BindingStatement(first), ExpressionStatement(unit), BindingStatement(second), BindingStatement(reassigned)]:
+							(
+								is_unit(first.initializer)
+								and is_unit(unit)
+								and is_unit(reassigned.initializer)
+								and first.name.span.start < unit.span.start
+								and unit.span.start < second.name.span.start
+								and second.name.span.start < reassigned.name.span.start
+							)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func builtin_rejects(prefix: String, suffix: String) -> Bool:
+	header = "func print(value: String) -> Void:\n"
+	body = "    builtin(\"string.print\")"
+	source = header + prefix + body + suffix
+
+	match lex(module_source(root_module_id()), source).and_then(pure func(tokens): parse(tokens)):
+		Err(error):
+			error.message == "builtin must be the entire function body" and error.help == (
+				"use builtin as the entire function body; put other work in an ordinary wrapper "
+				+ "function"
+			) and error.span.start == header.length() + prefix.length() + 4 and error.span.end == error.span.start + 7
+		Ok(_):
+			False
+
+
+pure func test_builtin_rejects_a_binding_prefix() -> Bool:
+	builtin_rejects("    value = 1\n", "\n")
+
+
+pure func test_builtin_rejects_an_expression_prefix() -> Bool:
+	builtin_rejects("    void\n", "\n")
+
+
+pure func test_builtin_rejects_a_following_statement() -> Bool:
+	builtin_rejects("", "\n    void\n")
+
+
+pure func test_void_does_not_imply_a_missing_result() -> Bool:
+	match lex(
+		module_source(root_module_id()),
+		"func unit() -> Void:\n    value = void\n",
+	).and_then(
+		pure func(tokens): parse(tokens),
+	):
+		Err(error):
+			(
+				error.message == "expected a final expression after the bindings"
+				and error.help == "finish the function with a value expression or tail match indented one level"
+				and error.span.start == 38
+				and error.span.end == 38
+			)
+		Ok(_):
+			False
+
+
+pure func test_void_is_reserved_but_void_prefix_is_a_name() -> Bool:
+	valid = "func void_value() -> Void:\n    void\nfunc main() -> Int:\n    0\n"
+	invalid = "func void() -> Int:\n    0\n"
+	(
+		lex(module_source(root_module_id()), valid)
+			.and_then(pure func(tokens): parse(tokens))
+			.is_ok()
+		and lex(module_source(root_module_id()), invalid)
+			.and_then(pure func(tokens): parse(tokens))
+			.is_err()
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 ordered statements and Void grammar",
+	tests = [
+		("one source order through trivia", test_statements_have_one_source_order),
+		("builtin rejects binding prefix", test_builtin_rejects_a_binding_prefix),
+		("builtin rejects expression prefix", test_builtin_rejects_an_expression_prefix),
+		("builtin rejects following statement", test_builtin_rejects_a_following_statement),
+		("Void does not imply a missing result", test_void_does_not_imply_a_missing_result),
+		(
+			"void reserved with identifier boundary",
+			test_void_is_reserved_but_void_prefix_is_a_name,
+		),
+	]
+}

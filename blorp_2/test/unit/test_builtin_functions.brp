@@ -7,9 +7,10 @@ import:
 	../../src/lower: MatchLabel(DefaultLabel), lower, value_number
 	../../src/own as Own
 	../../src/parse: parse_prelude, parsed_contents
-	../../src/prelude:
+	../../src/prelude as Prelude:
 		PrimitiveType(BuiltinInt),
 		RuntimeOperation(IntAdd, IntToString, StringLength),
+		RuntimeResult(PrimitiveResult),
 		check_prelude,
 		runtime_contract,
 	../../src/source: PRELUDE_SOURCE, module_id, module_source, same_source
@@ -155,7 +156,7 @@ pure func test_parser_publishes_typed_builtin_and_source_span() -> Bool:
 								same_source(occurrence.source, module_source(module))
 								and occurrence.start == start
 								and occurrence.end == start + "\"int.add\"".length()
-								and function.bindings.is_empty()
+								and function.statements.is_empty()
 							)
 						_:
 							False
@@ -166,16 +167,20 @@ pure func test_parser_publishes_typed_builtin_and_source_span() -> Bool:
 
 
 pure func test_binary_runtime_contract_is_complete() -> Bool:
-	contract = runtime_contract(IntAdd)
+	operation: RuntimeOperation[Void] = Prelude.IntAdd
+	contract = runtime_contract(operation)
+	result_matches = match contract.return_type:
+		PrimitiveResult(BuiltinInt): True
+		_: False
 	(
 		contract.purity == Pure
 		and contract.parameters == [BuiltinInt, BuiltinInt]
-		and contract.return_type == BuiltinInt
+		and result_matches
 	)
 
 
 pure func test_prelude_and_module_share_binary_builtin_syntax() -> Bool:
-	source = "type Int = builtin\ntype String = builtin\n" + ADD
+	source = "type Int = builtin\ntype String = builtin\ntype Void = builtin\ntype Float = builtin\n" + ADD
 
 	match lex(PRELUDE_SOURCE, source).and_then(pure func(tokens): parse_prelude(tokens)):
 		Err(_):
@@ -187,7 +192,7 @@ pure func test_prelude_and_module_share_binary_builtin_syntax() -> Bool:
 pure func test_unknown_builtin_label_is_rejected_before_checking() -> Bool:
 	source: String =
 		|pure func add(first: Int, second: Int) -> Int:
-		|    builtin("int.subtract")
+		|    builtin("int.unknown")
 		|
 	start = "pure func add(first: Int, second: Int) -> Int:\n    builtin(".length()
 
@@ -206,9 +211,9 @@ pure func test_unknown_builtin_label_is_rejected_before_checking() -> Bool:
 		Err(error):
 			(
 				error.span.start == start
-				and error.span.end == start + "\"int.subtract\"".length()
+				and error.span.end == start + "\"int.unknown\"".length()
 				and error.message == "unknown builtin operation"
-				and error.help == "use \"int.add\", \"int.to_string\" or \"string.length\""
+				and error.help == "use int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals or io.read_line"
 			)
 
 
@@ -278,7 +283,7 @@ pure func test_builtin_rejects_prefix_bindings() -> Bool:
 		|    local = first
 		|    builtin("int.add")
 		|
-	start = "pure func add(first: Int, second: Int) -> Int:\n    ".length()
+	start = "pure func add(first: Int, second: Int) -> Int:\n    local = first\n    ".length()
 
 	match (
 		parse_modules(
@@ -295,8 +300,8 @@ pure func test_builtin_rejects_prefix_bindings() -> Bool:
 		Err(error):
 			(
 				error.span.start == start
-				and error.span.end == start + "local".length()
-				and error.message == "builtin bodies cannot have local bindings"
+				and error.span.end == start + "builtin".length()
+				and error.message == "builtin must be the entire function body"
 				and error.help == (
 					"use builtin as the entire function body; put other work in an ordinary wrapper "
 					+ "function"
@@ -329,12 +334,12 @@ pure func test_checked_builtin_reads_its_ordered_parameter_identities() -> Bool:
 							match value.base:
 								Checked.ReturnCall(call, [first, second]):
 									match (call.target, first.base, second.base):
-										(Checked.RuntimeFunction(IntAdd), Checked.ReturnBinding(first_id), Checked.ReturnBinding(second_id)):
+										(Checked.RuntimeFunction(Prelude.IntAdd), Checked.ReturnBinding(first_id), Checked.ReturnBinding(second_id)):
 											(
 												Checked.binding_number(first_id) == 0
 												and Checked.binding_number(second_id) == 1
 												and function.bindings.length() == 2
-												and function.assignments.is_empty()
+												and function.statements.is_empty()
 												and Checked.same_type(
 													value.base_type,
 													Checked.IntType,
@@ -351,7 +356,7 @@ pure func test_checked_builtin_reads_its_ordered_parameter_identities() -> Bool:
 
 
 pure func test_specialization_keeps_binary_runtime_contract() -> Bool:
-	contract = Concrete.runtime_signature(IntAdd)
+	contract = Concrete.runtime_signature(Prelude.IntAdd)
 
 	match checked_add(ADD).and_then(pure func(checked): Concrete.specialize(checked)):
 		Err(_):
@@ -368,7 +373,7 @@ pure func test_specialization_keeps_binary_runtime_contract() -> Bool:
 										contract.parameters,
 										function.signature.parameters,
 									):
-										(Concrete.RuntimeFunction(IntAdd), [Concrete.IntType, Concrete.IntType], [Concrete.IntType, Concrete.IntType]):
+										(Concrete.RuntimeFunction(Prelude.IntAdd), [Concrete.IntType, Concrete.IntType], [Concrete.IntType, Concrete.IntType]):
 											Concrete.same_type(
 												contract.return_type,
 												Concrete.IntType,
@@ -418,7 +423,7 @@ private pure func owned_add(
 						value_type = Concrete.IntType,
 						operation = Own.CallDefinition(
 							{
-								target = Concrete.RuntimeFunction(IntAdd),
+								target = Concrete.RuntimeFunction(Prelude.IntAdd),
 								span = span(30)
 							},
 							arguments,
@@ -573,7 +578,7 @@ pure func test_label_selects_operation_for_a_renamed_local_function() -> Bool:
 									match value.base:
 										Checked.ReturnCall(call, [_, _]):
 											match call.target:
-												Checked.RuntimeFunction(IntAdd):
+												Checked.RuntimeFunction(Prelude.IntAdd):
 													True
 												_:
 													False
@@ -650,7 +655,7 @@ pure func test_verifier_checks_second_runtime_argument_type() -> Bool:
 								value_type = Concrete.IntType,
 								operation = Own.CallDefinition(
 									{
-										target = Concrete.RuntimeFunction(IntAdd),
+										target = Concrete.RuntimeFunction(Prelude.IntAdd),
 										span = span(30)
 									},
 									[Own.UnmanagedArgument(ids.first), Own.BorrowedArgument({
@@ -701,7 +706,7 @@ private pure func borrows_parameter(function: Own.OwnedFunction) -> Bool:
 			match (parameter.operation, parameter.result, result.operation):
 				(Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(source)), Own.CallDefinition(call, [Own.BorrowedArgument(argument)])):
 					match (call.target, argument.source, result.result):
-						(Concrete.RuntimeFunction(StringLength), Own.ParameterBorrow(argument_source), Own.UnmanagedResult):
+						(Concrete.RuntimeFunction(Prelude.StringLength), Own.ParameterBorrow(argument_source), Own.UnmanagedResult):
 							(
 								value_number(source) == value_number(parameter.id)
 								and value_number(argument.value) == value_number(parameter.id)
@@ -809,7 +814,7 @@ pure func test_module_builtin_transfers_its_fresh_string_result() -> Bool:
 							match value.base:
 								Checked.ReturnCall(call, [argument]):
 									match (call.target, argument.base):
-										(Checked.RuntimeFunction(IntToString), Checked.ReturnBinding(parameter)):
+										(Checked.RuntimeFunction(Prelude.IntToString), Checked.ReturnBinding(parameter)):
 											checked_result = (
 												Checked.same_type(
 													value.base_type,
@@ -846,7 +851,7 @@ pure func test_module_builtin_transfers_its_fresh_string_result() -> Bool:
 									):
 										(Own.ParameterDefinition(0), Own.CallDefinition(call, [Own.UnmanagedArgument(argument)]), Own.OwnedResult(created), Own.OwnedResult(caller_owner)):
 											match call.target:
-												Concrete.RuntimeFunction(IntToString):
+												Concrete.RuntimeFunction(Prelude.IntToString):
 													(
 														checked_result
 														and Concrete.same_type(
@@ -929,7 +934,7 @@ pure func test_builtin_signature_error_precedes_unrelated_caller_body() -> Bool:
 					False
 				Err(failure):
 					match Checked.check_errors(failure).first.kind:
-						Checked.BuiltinContractMismatch(IntAdd):
+						Checked.BuiltinContractMismatch(Prelude.IntAdd):
 							True
 						_:
 							False
@@ -1003,7 +1008,7 @@ pure func test_emitter_finds_runtime_addition_inside_a_match_arm() -> Bool:
 											value_type = Concrete.IntType,
 											operation = Own.CallDefinition(
 												{
-													target = Concrete.RuntimeFunction(IntAdd),
+													target = Concrete.RuntimeFunction(Prelude.IntAdd),
 													span = span(30)
 												},
 												[

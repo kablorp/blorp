@@ -3,10 +3,19 @@ import:
 	check as Check
 	declarations:
 		VariantId,
-		function_number, union_number, record_number, variant_owner, variant_number
+		function_number,
+		record_number,
+		union_number,
+		variant_number,
+		variant_owner,
 	int as IntOps
 	names: NameId, NameTable, name_spelling
-	namespace: ImportProblem(RepeatedModuleImport, MissingImportedFunction, UnsupportedTypeImport)
+	namespace:
+		ImportProblem(
+			RepeatedModuleImport, MissingImportedFunction, UnsupportedTypeImport,
+			MissingImportedUnion, AmbiguousImportedUnion, MissingImportedVariant,
+			RepeatedImportedVariant, ImportedTypeConflict,
+		),
 	option: to_result
 	parse: ParsedContents, ParsedProgram, parsed_contents
 	syntax:
@@ -226,7 +235,10 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 			rendered(
 				error.span,
 				"duplicate union type name",
-				"give union types distinct names; Int and String are declared by the prelude",
+				(
+					"give union types distinct names; Int, Float, String and Void are declared by the "
+					+ "prelude"
+				),
 			)
 		Check.DuplicateTypeParameter(_, _, _):
 			rendered(
@@ -275,9 +287,10 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 			rendered(
 				error.span,
 				"unknown type",
-				"use Int, String, a declared type parameter, or a fixed union declared in this ".concat(
-					"file",
-				),
+				(
+					"use Int, Float, String, Void, a declared type parameter, or a fixed union declared in "
+					+ "this "
+				).concat("file"),
 			)
 		Check.NonApplicableType(_):
 			rendered(
@@ -306,19 +319,87 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 		Check.ImportRejected(problem):
 			match problem:
 				RepeatedModuleImport(_, previous, _):
-					{ rendered(error.span, "module imported more than once", "combine the selected function names into one import") |
+					{ rendered(
+						error.span,
+						"module imported more than once",
+						"combine the selected function names into one import",
+					) |
 						note = Some(PreviousDeclaration(previous))
 					}
 				MissingImportedFunction(_, _):
-					rendered(error.span, "unknown imported function", "select a function declared directly in that module; imports are not reexported")
+					rendered(
+						error.span,
+						"unknown imported function",
+						"select a function declared directly in that module; imports are not reexported",
+					)
 				UnsupportedTypeImport(_, _):
-					rendered(error.span, "only functions can be imported in this increment", "keep type and variant declarations in their defining module; import a function that uses them")
+					rendered(
+						error.span,
+						"type imports require an explicit selector",
+						(
+							"write Option(Some, None) to import constructors, or Option() to import only the "
+							+ "type"
+						),
+					)
+				MissingImportedUnion(_):
+					rendered(
+						error.span,
+						"unknown imported union",
+						(
+							"select a fixed union declared directly in that module; imports are not "
+							+ "reexported"
+						),
+					)
+				AmbiguousImportedUnion(_):
+					rendered(
+						error.span,
+						"ambiguous imported union",
+						"give each type declared in the selected module a distinct name",
+					)
+				MissingImportedVariant(_):
+					rendered(
+						error.span,
+						"constructor does not belong to the selected union",
+						"select a constructor declared inside that union",
+					)
+				RepeatedImportedVariant(_, previous):
+					{ rendered(
+						error.span,
+						"constructor selected more than once",
+						"list each selected constructor once",
+					) |
+						note = Some(PreviousDeclaration(previous))
+					}
+				ImportedTypeConflict(_, previous):
+					{ rendered(
+						error.span,
+						"imported type conflicts with another type",
+						"give the types distinct names or remove the duplicate import",
+					) |
+						note = Some(PreviousDeclaration(previous))
+					}
 		Check.ImportedFunctionConflict(_, previous):
-			{ rendered(error.span, "imported function conflicts with another function", "give the functions distinct names or remove the duplicate import") |
+			{ rendered(
+				error.span,
+				"imported function conflicts with another function",
+				"give the functions distinct names or remove the duplicate import",
+			) |
+				note = Some(PreviousDeclaration(previous))
+			}
+		Check.ImportedConstructorConflict(_, previous):
+			{ rendered(
+				error.span,
+				"imported constructor conflicts with a function",
+				"give the constructor and function distinct names",
+			) |
 				note = Some(PreviousDeclaration(previous))
 			}
 		Check.ImportedVariantConflict(_, previous):
-			{ rendered(error.span, "imported function conflicts with a local variant", "give the imported function and local variant distinct names") |
+			{ rendered(
+				error.span,
+				"imported function conflicts with a local variant",
+				"give the imported function and local variant distinct names",
+			) |
 				note = Some(PreviousDeclaration(previous))
 			}
 		Check.MissingMain:
@@ -327,10 +408,57 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 				"expected a main function",
 				"declare func main() -> Int: as the entrypoint",
 			)
+		Check.NonVoidStatement(_):
+			rendered(
+				error.span,
+				"expression statement must return Void",
+				"bind this value with name = expression, or make it the final expression",
+			)
 		Check.BuiltinContractMismatch(operation):
-			rendered(error.span, "builtin declaration does not match its runtime contract", runtime_declaration_help(operation))
+			rendered(
+				error.span,
+				"builtin declaration does not match its runtime contract",
+				runtime_declaration_help(operation),
+			)
+		Check.BuiltinResultUnion:
+			rendered(
+				error.span,
+				"builtin result must be an ordinary union",
+				"return an ordinary two-variant union and bind the constructors required by this operation",
+			)
+		Check.BuiltinRoleNotInResult(_, _):
+			rendered(
+				error.span,
+				"builtin constructor does not belong to its result type",
+				"import or declare this constructor in the annotated result union",
+			)
+		Check.BuiltinRolePayload:
+			rendered(
+				error.span,
+				"builtin constructor has the wrong payload",
+				"bind the required payload constructor first and the empty constructor second",
+			)
+		Check.BuiltinBooleanPayload:
+			rendered(
+				error.span,
+				"comparison constructors must be empty",
+				(
+					"declare two empty variants and bind the equal constructor first and the "
+					+ "different constructor second"
+				),
+			)
+		Check.BuiltinRoleCoverage:
+			rendered(
+				error.span,
+				"builtin constructors must cover the complete result union",
+				"bind two distinct constructors and declare exactly those two variants",
+			)
 		Check.BuiltinTailAnnotation:
-			rendered(error.span, "builtin bodies cannot have a tail-recursion annotation", "remove @tail_recursive from the builtin declaration")
+			rendered(
+				error.span,
+				"builtin bodies cannot have a tail-recursion annotation",
+				"remove @tail_recursive from the builtin declaration",
+			)
 		Check.ImpureCall(_, _):
 			rendered(
 				error.span,
@@ -426,12 +554,6 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 					"pass recursive type arguments unchanged, permute them, or reset them to ",
 					"concrete types",
 				),
-			)
-		Check.FunctionPreludeConflict(_):
-			rendered(
-				error.span,
-				"function name conflicts with the prelude",
-				"rename this function or change the explicit prelude declaration",
 			)
 		Check.VariantPreludeConflict(_):
 			rendered(
@@ -642,6 +764,10 @@ private pure func type_spelling(
 			parsed_spelling(declaration.type_name.id, context.names, span)
 		Check.IntType:
 			parsed_spelling(prelude_names(context.prelude).special.integer, context.names, span)
+		Check.FloatType:
+			parsed_spelling(prelude_names(context.prelude).special.float, context.names, span)
+		Check.VoidType:
+			parsed_spelling(prelude_names(context.prelude).special.unit, context.names, span)
 		Check.StringType:
 			parsed_spelling(prelude_names(context.prelude).special.string, context.names, span)
 		Check.ParameterType(id):

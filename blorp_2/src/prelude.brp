@@ -1,15 +1,22 @@
 import:
+	declarations: VariantId
 	int as IntOps
 	names: InitialNames, NameId, NameTable, SpecialNames, name_spelling, same_name
 	option: is_some, to_result
 	syntax:
 		Diagnostic,
 		FunctionHeader,
-		ParsedBuiltinType(IntegerBuiltin, StringBuiltin),
+		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin),
 		ParsedParameter,
 		ParsedPrelude,
-		ParsedRuntimeOperation(IntegerAddBuiltin, IntegerToStringBuiltin, StringLengthBuiltin),
-		Purity(Pure),
+		ParsedRuntimeOperation(
+			IntegerAddBuiltin, IntegerSubtractBuiltin, IntegerMultiplyBuiltin, IntegerDivideBuiltin,
+			IntegerRemainderBuiltin, IntegerToStringBuiltin, StringLengthBuiltin,
+			FloatAddBuiltin, FloatSubtractBuiltin, FloatMultiplyBuiltin, FloatDivideBuiltin,
+			FloatRemainderBuiltin, FloatToStringBuiltin, StringParseFloatBuiltin,
+			StringPrintBuiltin, StringParseIntBuiltin, IoReadLineBuiltin, StringEqualsBuiltin,
+		),
+		Purity(Pure, Impure),
 		Span,
 		TypeSyntax(AtomicType, AppliedType),
 		WrittenName,
@@ -17,68 +24,236 @@ import:
 	text as Text
 
 
-fixed union RuntimeOperation:
+fixed record OptionalRoles[Variant] {
+	present: Variant,
+	absent: Variant
+}
+
+
+fixed record BooleanRoles[Variant] {
+	equal: Variant,
+	different: Variant
+}
+
+
+fixed union RuntimeOperation[Variant]:
 	IntAdd
+	IntSubtract
+	IntMultiply
+	IntDivide
+	IntRemainder
 	IntToString
+	FloatAdd
+	FloatSubtract
+	FloatMultiply
+	FloatDivide
+	FloatRemainder
+	FloatToString
 	StringLength
+	StringPrint
+	StringParseInt(OptionalRoles[Variant])
+	StringParseFloat(OptionalRoles[Variant])
+	IoReadLine(OptionalRoles[Variant])
+	StringEquals(BooleanRoles[Variant])
 
 
 fixed union PrimitiveType:
 	BuiltinInt
+	BuiltinFloat
 	BuiltinString
+	BuiltinVoid
 
 
-fixed record RuntimeContract {
+fixed union RuntimeResult[Variant]:
+	PrimitiveResult(PrimitiveType)
+	OptionalResult(PrimitiveType, OptionalRoles[Variant])
+	BooleanResult(BooleanRoles[Variant])
+
+
+fixed record RuntimeContract[Variant] {
 	purity: Purity,
 	parameters: List[PrimitiveType],
-	return_type: PrimitiveType
+	return_type: RuntimeResult[Variant]
 }
 
 
--- The runtime ABI has one authority. Checking translates these primitive types
--- to its TypeRef without deciding the contract again.
-pure func runtime_contract(operation: RuntimeOperation) -> RuntimeContract:
+-- One closed contract authority, shared across declaration and instance roles.
+pure func runtime_contract[Variant](
+	operation: RuntimeOperation[Variant],
+) -> RuntimeContract[Variant]:
 	match operation:
-		IntAdd:
+		StringPrint:
+			{
+				purity = Impure,
+				parameters = [BuiltinString],
+				return_type = PrimitiveResult(BuiltinVoid)
+			}
+		IntAdd | IntSubtract | IntMultiply | IntDivide | IntRemainder:
 			{
 				purity = Pure,
 				parameters = [BuiltinInt, BuiltinInt],
-				return_type = BuiltinInt
+				return_type = PrimitiveResult(BuiltinInt)
 			}
+		FloatAdd | FloatSubtract | FloatMultiply | FloatDivide | FloatRemainder:
+			{ purity = Pure, parameters = [BuiltinFloat, BuiltinFloat], return_type = PrimitiveResult(BuiltinFloat) }
+		FloatToString:
+			{ purity = Pure, parameters = [BuiltinFloat], return_type = PrimitiveResult(BuiltinString) }
 		IntToString:
 			{
 				purity = Pure,
 				parameters = [BuiltinInt],
-				return_type = BuiltinString
+				return_type = PrimitiveResult(BuiltinString)
 			}
 		StringLength:
 			{
 				purity = Pure,
 				parameters = [BuiltinString],
-				return_type = BuiltinInt
+				return_type = PrimitiveResult(BuiltinInt)
+			}
+		StringParseInt(roles):
+			{
+				purity = Pure,
+				parameters = [BuiltinString],
+				return_type = OptionalResult(BuiltinInt, roles)
+			}
+		StringParseFloat(roles):
+			{ purity = Pure, parameters = [BuiltinString], return_type = OptionalResult(BuiltinFloat, roles) }
+		IoReadLine(roles):
+			{
+				purity = Impure,
+				parameters = [],
+				return_type = OptionalResult(BuiltinString, roles)
+			}
+		StringEquals(roles):
+			{
+				purity = Pure,
+				parameters = [BuiltinString, BuiltinString],
+				return_type = BooleanResult(roles)
 			}
 
 
-pure func builtin_operation(parsed: ParsedRuntimeOperation) -> RuntimeOperation:
+pure func builtin_operation(parsed: ParsedRuntimeOperation) -> RuntimeOperation[WrittenName]:
 	match parsed:
-		IntegerAddBuiltin: IntAdd
-		IntegerToStringBuiltin: IntToString
-		StringLengthBuiltin: StringLength
+		IntegerAddBuiltin:
+			IntAdd
+		IntegerSubtractBuiltin:
+			IntSubtract
+		IntegerMultiplyBuiltin:
+			IntMultiply
+		IntegerDivideBuiltin:
+			IntDivide
+		IntegerRemainderBuiltin:
+			IntRemainder
+		FloatAddBuiltin:
+			FloatAdd
+		FloatSubtractBuiltin:
+			FloatSubtract
+		FloatMultiplyBuiltin:
+			FloatMultiply
+		FloatDivideBuiltin:
+			FloatDivide
+		FloatRemainderBuiltin:
+			FloatRemainder
+		FloatToStringBuiltin:
+			FloatToString
+		IntegerToStringBuiltin:
+			IntToString
+		StringLengthBuiltin:
+			StringLength
+		StringPrintBuiltin:
+			StringPrint
+		StringParseIntBuiltin(present, absent):
+			StringParseInt({
+				present = present,
+				absent = absent,
+			})
+		StringParseFloatBuiltin(present, absent):
+			StringParseFloat({ present = present, absent = absent })
+		IoReadLineBuiltin(present, absent):
+			IoReadLine({
+				present = present,
+				absent = absent,
+			})
+		StringEqualsBuiltin(equal, different):
+			StringEquals({
+				equal = equal,
+				different = different,
+			})
 
 
-pure func runtime_declaration_help(operation: RuntimeOperation) -> String:
+-- A prelude has no union declarations and therefore cannot bind union roles.
+pure func primitive_operation[Variant](
+	parsed: ParsedRuntimeOperation,
+) -> Option[RuntimeOperation[Variant]]:
+	match parsed:
+		IntegerAddBuiltin:
+			Some(IntAdd)
+		IntegerSubtractBuiltin:
+			Some(IntSubtract)
+		IntegerMultiplyBuiltin:
+			Some(IntMultiply)
+		IntegerDivideBuiltin:
+			Some(IntDivide)
+		IntegerRemainderBuiltin:
+			Some(IntRemainder)
+		FloatAddBuiltin:
+			Some(FloatAdd)
+		FloatSubtractBuiltin:
+			Some(FloatSubtract)
+		FloatMultiplyBuiltin:
+			Some(FloatMultiply)
+		FloatDivideBuiltin:
+			Some(FloatDivide)
+		FloatRemainderBuiltin:
+			Some(FloatRemainder)
+		FloatToStringBuiltin:
+			Some(FloatToString)
+		IntegerToStringBuiltin:
+			Some(IntToString)
+		StringLengthBuiltin:
+			Some(StringLength)
+		StringPrintBuiltin:
+			Some(StringPrint)
+		StringParseIntBuiltin(_, _) | StringParseFloatBuiltin(_, _) | IoReadLineBuiltin(_, _) | StringEqualsBuiltin(_, _):
+			None
+
+
+pure func runtime_declaration_help[Variant](operation: RuntimeOperation[Variant]) -> String:
 	match operation:
-		IntAdd:
+		StringPrint:
+			"declare an impure function with one String parameter returning Void"
+		IntAdd | IntSubtract | IntMultiply | IntDivide | IntRemainder:
 			"declare a pure function with two Int parameters returning Int"
+		FloatAdd | FloatSubtract | FloatMultiply | FloatDivide | FloatRemainder:
+			"declare a pure function with two Float parameters returning Float"
+		FloatToString:
+			"declare a pure function with one Float parameter returning String"
 		IntToString:
 			"declare a pure function with one Int parameter returning String"
 		StringLength:
 			"declare a pure function with one String parameter returning Int"
+		StringParseInt(_):
+			(
+				"declare a pure nongeneric function with one String parameter returning a two-"
+				+ "variant union of Int and an empty case"
+			)
+		StringParseFloat(_):
+			"declare a pure nongeneric function with one String parameter returning a two-variant union of Float and an empty case"
+		IoReadLine(_):
+			(
+				"declare an impure nongeneric function without parameters returning a two-"
+				+ "variant union of String and an empty case"
+			)
+		StringEquals(_):
+			(
+				"declare a pure nongeneric function with two String parameters returning a union "
+				+ "of two empty variants"
+			)
 
 
 private fixed record RuntimeBinding {
 	name: NameId,
-	operation: RuntimeOperation
+	operation: RuntimeOperation[VariantId]
 }
 
 
@@ -95,8 +270,11 @@ pure func prelude_names(prelude: CheckedPrelude) -> InitialNames:
 	from_opaque CheckedPrelude(prelude).names
 
 
-pure func runtime_operation(prelude: CheckedPrelude, name: NameId) -> Option[RuntimeOperation]:
-	var found: Option[RuntimeOperation] = None
+pure func runtime_operation(
+	prelude: CheckedPrelude,
+	name: NameId,
+) -> Option[RuntimeOperation[VariantId]]:
+	var found: Option[RuntimeOperation[VariantId]] = None
 
 	for function in from_opaque CheckedPrelude(prelude).functions:
 		if same_name(function.name, name):
@@ -137,14 +315,20 @@ private pure func resolve_builtin_types(parsed: ParsedPrelude) -> Result[Special
 		parsed.names,
 	)
 	var integer: Option[NameId] = None
+	var float: Option[NameId] = None
 	var string: Option[NameId] = None
+	var unit: Option[NameId] = None
 	var failure: Option[Diagnostic] = None
 
 	for declaration in parsed.types:
 		name = match declaration:
 			IntegerBuiltin(name):
 				name
+			FloatBuiltin(name):
+				name
 			StringBuiltin(name):
+				name
+			VoidBuiltin(name):
 				name
 
 		match validate_name(name, parsed.names):
@@ -167,6 +351,11 @@ private pure func resolve_builtin_types(parsed: ParsedPrelude) -> Result[Special
 					break
 
 				integer = Some(name.id)
+			FloatBuiltin(name):
+				if float.is_some():
+					failure = Some(rejection(name.span, "duplicate builtin type declaration", "declare type Float = builtin exactly once"))
+					break
+				float = Some(name.id)
 			StringBuiltin(name):
 				if string.is_some():
 					failure = Some(
@@ -179,6 +368,18 @@ private pure func resolve_builtin_types(parsed: ParsedPrelude) -> Result[Special
 					break
 
 				string = Some(name.id)
+			VoidBuiltin(name):
+				if unit.is_some():
+					failure = Some(
+						rejection(
+							name.span,
+							"duplicate builtin type declaration",
+							"declare type Void = builtin exactly once",
+						),
+					)
+					break
+
+				unit = Some(name.id)
 
 	types ?= match failure:
 		Some(error):
@@ -201,8 +402,25 @@ private pure func resolve_builtin_types(parsed: ParsedPrelude) -> Result[Special
 		),
 	)
 
+	unit_id ?= unit.to_result(
+		rejection(
+			parsed.end,
+			"missing Void builtin declaration",
+			"add type Void = builtin to the prelude",
+		),
+	)
+
+	float_id ?= float.to_result(rejection(parsed.end, "missing Float builtin declaration", "add type Float = builtin to the prelude"))
+
 	if (
-		same_name(integer_id, string_id)
+		same_name(integer_id, float_id)
+		or same_name(string_id, float_id)
+		or same_name(unit_id, float_id)
+		or same_name(parsed.main, float_id)
+		or same_name(integer_id, string_id)
+		or same_name(integer_id, unit_id)
+		or same_name(string_id, unit_id)
+		or same_name(parsed.main, unit_id)
 		or same_name(parsed.main, integer_id)
 		or same_name(parsed.main, string_id)
 	):
@@ -217,15 +435,21 @@ private pure func resolve_builtin_types(parsed: ParsedPrelude) -> Result[Special
 		Ok({
 			main = parsed.main,
 			integer = integer_id,
+			float = float_id,
 			string = string_id,
+			unit = unit_id,
 		})
 
 
 private pure func primitive_type(name: NameId, special: SpecialNames) -> Option[PrimitiveType]:
 	if same_name(name, special.integer):
 		Some(BuiltinInt)
+	else if same_name(name, special.float):
+		Some(BuiltinFloat)
 	else if same_name(name, special.string):
 		Some(BuiltinString)
+	else if same_name(name, special.unit):
+		Some(BuiltinVoid)
 	else:
 		None
 
@@ -238,13 +462,23 @@ private pure func matches_type(actual: Option[PrimitiveType], expected: Primitiv
 			match expected:
 				BuiltinInt:
 					True
-				BuiltinString:
+				BuiltinFloat | BuiltinString | BuiltinVoid:
 					False
+		Some(BuiltinFloat):
+			match expected:
+				BuiltinFloat: True
+				BuiltinInt | BuiltinString | BuiltinVoid: False
 		Some(BuiltinString):
 			match expected:
 				BuiltinString:
 					True
-				BuiltinInt:
+				BuiltinInt | BuiltinFloat | BuiltinVoid:
+					False
+		Some(BuiltinVoid):
+			match expected:
+				BuiltinVoid:
+					True
+				BuiltinInt | BuiltinFloat | BuiltinString:
 					False
 
 
@@ -257,7 +491,7 @@ private pure func runtime_type_name(written: TypeSyntax) -> Result[WrittenName, 
 				rejection(
 					span,
 					"prelude builtin types cannot be applied",
-					"use the concrete Int or String runtime type without an argument",
+					"use the concrete Int, Float, String or Void runtime type without an argument",
 				),
 			)
 
@@ -284,6 +518,7 @@ private pure func validate_runtime_parameters(
 		var matching = True
 		var failure: Option[Diagnostic] = None
 		var position = 0
+
 		for parameter in parameters:
 			match expected.get(position):
 				None:
@@ -295,7 +530,9 @@ private pure func validate_runtime_parameters(
 							break
 						Ok(matches):
 							matching = matching and matches
+
 			position = IntOps.add(position, 1)
+
 		match failure:
 			Some(error): Err(error)
 			None: Ok(matching)
@@ -303,7 +540,7 @@ private pure func validate_runtime_parameters(
 
 private pure func validate_runtime_header(
 	header: FunctionHeader,
-	contract: RuntimeContract,
+	contract: RuntimeContract[VariantId],
 	names: InitialNames,
 ) -> Result[Bool, Diagnostic]:
 	generic_header ?= match header.type_parameters.get(0):
@@ -323,10 +560,16 @@ private pure func validate_runtime_header(
 	return_name ?= validate_name(return_type, names.names)
 	parameter_matches ?= validate_runtime_parameters(header.parameters, contract.parameters, names)
 
-	Ok(same_purity(header.purity, contract.purity) and parameter_matches and matches_type(
-			primitive_type(return_type.id, names.special),
-			contract.return_type,
-		))
+	result_matches = match contract.return_type:
+		PrimitiveResult(expected):
+			matches_type(
+				primitive_type(return_type.id, names.special),
+				expected,
+			)
+		OptionalResult(_, _) | BooleanResult(_):
+			False
+
+	Ok(same_purity(header.purity, contract.purity) and parameter_matches and result_matches)
 
 
 pure func check_prelude(parsed: ParsedPrelude) -> Result[CheckedPrelude, Diagnostic]:
@@ -360,27 +603,40 @@ pure func check_prelude(parsed: ParsedPrelude) -> Result[CheckedPrelude, Diagnos
 			)
 			break
 
-		operation = builtin_operation(function.operation)
+		operation_result: Option[RuntimeOperation[VariantId]] = primitive_operation(
+			function.operation,
+		)
 
-		match validate_runtime_header(function.header, runtime_contract(operation), names):
-			Err(error):
-				failure = Some(error)
+		match operation_result:
+			None:
+				failure = Some(
+					rejection(
+						function.span,
+						"union-result builtins belong in ordinary modules",
+						"declare the union and its builtin wrapper in a module, then import the wrapper",
+					),
+				)
 				break
-			Ok(matches):
-				if not matches:
-					failure = Some(
-						rejection(
-							function.span,
-							"builtin declaration does not match its runtime contract",
-							runtime_declaration_help(operation),
-						),
-					)
-					break
+			Some(operation):
+				match validate_runtime_header(function.header, runtime_contract(operation), names):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(matches):
+						if not matches:
+							failure = Some(
+								rejection(
+									function.span,
+									"builtin declaration does not match its runtime contract",
+									runtime_declaration_help(operation),
+								),
+							)
+							break
 
-		functions = functions.append({
-			name = function_name.id,
-			operation = operation,
-		})
+				functions = functions.append({
+					name = function_name.id,
+					operation = operation,
+				})
 
 	match failure:
 		Some(error):

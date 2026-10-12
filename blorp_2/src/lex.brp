@@ -1,24 +1,223 @@
 import:
 	int as IntOps
-	string as StringOps
+	option: to_result
 	source: SourceId
+	string as StringOps
 	syntax:
 		DECIMAL_DIGITS,
 		Diagnostic,
 		LexedProgram,
 		Symbol(
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
-			Colon, Newline, VarKeyword, Equals, LeftBracket, RightBracket, LeftBrace, RightBrace,
-			Comma, AtSign, Slash, Star,
+			Colon, Newline, VarKeyword, VoidKeyword, Equals, LeftBracket, RightBracket, LeftBrace,
+			RightBrace, Comma, AtSign, Slash, Star,
 		),
 		Token,
-		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, BuiltinLabel, Indentation),
+		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, Indentation),
 	text as Text
 
 
 private SPACE_INDENT_WIDTH: Int = 4
 
 private IDENTIFIER_START: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
+
+private ASCII_SPACE: Int = 32
+
+private ASCII_DEL: Int = 127
+
+private UTF8_CONTINUATION_START: Int = 128
+
+private UTF8_CONTINUATION_END: Int = 191
+
+private UNICODE_SURROGATE_START: Int = 55296
+
+private UNICODE_SURROGATE_END: Int = 57343
+
+private UNICODE_MAX: Int = 1114111
+
+
+private pure func invalid_utf8(origin: SourceId, start: Int, end: Int) -> Diagnostic:
+	diagnostic(
+		origin,
+		start,
+		end,
+		"invalid UTF-8 in String literal",
+		"use valid UTF-8 text or a Unicode escape such as \\u{E9}; surrogate code points are not Unicode scalars",
+	)
+
+
+-- RFC 3629 section 4: widths, shortest encoding, and Unicode scalar range.
+-- Byte access does not decode or re-encode the source; the token retains it.
+private pure func utf8_end(origin: SourceId, source: String, start: Int) -> Result[Int, Diagnostic]:
+	first ?= StringOps
+		.get(source, start)
+		.to_result(invalid_utf8(origin, start, source.length()))
+	lead = to_int(first)
+
+	width = if IntOps.greater_than_or_equal(lead, 194) and IntOps.less_than_or_equal(lead, 223):
+		2
+	else if IntOps.greater_than_or_equal(lead, 224) and IntOps.less_than_or_equal(lead, 239):
+		3
+	else if IntOps.greater_than_or_equal(lead, 240) and IntOps.less_than_or_equal(lead, 244):
+		4
+	else:
+		0
+
+	if IntOps.equals(width, 0):
+		Err(invalid_utf8(origin, start, IntOps.add(start, 1)))
+	else:
+		end = IntOps.add(start, width)
+
+		prefix = if IntOps.equals(width, 2):
+			192
+		else if IntOps.equals(width, 3):
+			224
+		else:
+			240
+
+		minimum = if IntOps.equals(width, 2):
+			128
+		else if IntOps.equals(width, 3):
+			2048
+		else:
+			65536
+
+		var scalar = IntOps.subtract(lead, prefix)
+		var cursor = IntOps.add(start, 1)
+		var failure: Option[Diagnostic] = None
+
+		while IntOps.less_than(cursor, end):
+			match StringOps.get(source, cursor):
+				None:
+					failure = Some(invalid_utf8(origin, start, source.length()))
+					break
+				Some(character):
+					byte = to_int(character)
+
+					if (
+						IntOps.less_than(byte, UTF8_CONTINUATION_START)
+						or IntOps.greater_than(byte, UTF8_CONTINUATION_END)
+					):
+						failure = Some(invalid_utf8(origin, cursor, IntOps.add(cursor, 1)))
+						break
+
+					scalar = IntOps.add(
+						IntOps.multiply(scalar, 64),
+						IntOps.subtract(byte, UTF8_CONTINUATION_START),
+					)
+
+			cursor = IntOps.add(cursor, 1)
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				if (
+					IntOps.less_than(scalar, minimum)
+					or IntOps.greater_than(scalar, UNICODE_MAX)
+					or (
+						IntOps.greater_than_or_equal(scalar, UNICODE_SURROGATE_START)
+						and IntOps.less_than_or_equal(scalar, UNICODE_SURROGATE_END)
+					)
+				):
+					Err(invalid_utf8(origin, start, end))
+				else:
+					Ok(end)
+
+
+private pure func quoted_end(
+	origin: SourceId,
+	source: String,
+	start: Int,
+) -> Result[Int, Diagnostic]:
+	var cursor = IntOps.add(start, 1)
+	var escaped = False
+	var failure: Option[Diagnostic] = None
+	var closing: Option[Int] = None
+
+	while IntOps.less_than(cursor, source.length()):
+		match StringOps.get(source, cursor):
+			None:
+				failure = Some(invalid_utf8(origin, cursor, source.length()))
+				break
+			Some(character):
+				byte = to_int(character)
+
+				if IntOps.equals(byte, 10):
+					failure = Some(
+						diagnostic(
+							origin,
+							cursor,
+							IntOps.add(cursor, 1),
+							"String literals must stay on one line",
+							"close the quote before LF; write \\n for a newline byte",
+						),
+					)
+					break
+				else if IntOps.less_than(byte, ASCII_SPACE) or IntOps.equals(byte, ASCII_DEL):
+					failure = Some(
+						diagnostic(
+							origin,
+							cursor,
+							IntOps.add(cursor, 1),
+							"unsupported raw byte in String literal",
+							"use printable text and fixed escapes for control bytes",
+						),
+					)
+					break
+				else if IntOps.greater_than(byte, ASCII_DEL):
+					match utf8_end(origin, source, cursor):
+						Ok(end):
+							cursor = end
+						Err(error):
+							failure = Some(error)
+							break
+
+					escaped = False
+				else if escaped:
+					escaped = False
+					cursor = IntOps.add(cursor, 1)
+				else if Text.equals(
+					source.substring(cursor, 1),
+					"\"",
+				):
+					closing = Some(cursor)
+					break
+				else:
+					escaped = Text.equals(
+						source.substring(cursor, 1),
+						"\\",
+					)
+					cursor = IntOps.add(cursor, 1)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			match closing:
+				Some(end):
+					Ok(end)
+				None:
+					if escaped:
+						Err(
+							diagnostic(
+								origin,
+								IntOps.subtract(cursor, 1),
+								cursor,
+								"unterminated String escape",
+								"complete the escape and close the double quote on the same line",
+							),
+						)
+					else:
+						Err(
+							diagnostic(
+								origin,
+								start,
+								cursor,
+								"unterminated String literal",
+								"add a closing double quote on the same line",
+							),
+						)
 
 
 private fixed union LinePosition:
@@ -67,6 +266,74 @@ private pure func run_end(source: String, byte_offset: Int, accepted_bytes: Stri
 		end = IntOps.add(end, 1)
 
 	end
+
+
+private pure func decimal_digit_at(source: String, position: Int) -> Bool:
+	(IntOps.less_than(position, source.length())
+		and DECIMAL_DIGITS.contains(source.substring(position, 1))
+	)
+
+
+private pure func numeric_result(origin: SourceId, source: String, start: Int, end: Int, is_float: Bool) -> Result[Token, Diagnostic]:
+	suffix = source.substring(end, 1)
+	if not suffix.is_empty() and IDENTIFIER_START.contains(suffix):
+		finish = run_end(source, IntOps.add(end, 1), IDENTIFIER_START.concat(DECIMAL_DIGITS))
+		Err(diagnostic(origin, start, finish, "numeric literals cannot have suffixes or separators", "write decimal digits with an optional fractional part or exponent; use no underscores or type suffixes"))
+	else:
+		spelling = source.substring(start, IntOps.subtract(end, start))
+		kind = if is_float:
+			FloatLiteral(spelling)
+		else:
+			IntegerLiteral(spelling)
+		Ok(token(origin, kind, start, end))
+
+
+-- Only a dot followed immediately by a digit belongs to a number. An integer
+-- or Float receiver's UFCS dot therefore remains an ordinary symbol token.
+private pure func numeric_token(origin: SourceId, source: String, start: Int) -> Result[Token, Diagnostic]:
+	digit_start = if Text.equals(source.substring(start, 1), "-"):
+		IntOps.add(start, 1)
+	else:
+		start
+
+	if not decimal_digit_at(source, digit_start):
+		Err(diagnostic(
+			origin,
+			start,
+			IntOps.add(start, 1),
+			"expected decimal digits immediately after '-'",
+			"write a signed number such as -42 or -0.5; '-' is not an operator",
+		))
+	else:
+		var end = run_end(source, IntOps.add(digit_start, 1), DECIMAL_DIGITS)
+		var is_float = False
+
+		if Text.equals(source.substring(end, 1), ".") and decimal_digit_at(source, IntOps.add(end, 1)):
+			is_float = True
+			end = run_end(source, IntOps.add(end, 2), DECIMAL_DIGITS)
+
+		exponent = source.substring(end, 1)
+		if Text.equals(exponent, "e") or Text.equals(exponent, "E"):
+			is_float = True
+			end = IntOps.add(end, 1)
+			sign = source.substring(end, 1)
+
+			if Text.equals(sign, "+") or Text.equals(sign, "-"):
+				end = IntOps.add(end, 1)
+
+			if not decimal_digit_at(source, end):
+				Err(diagnostic(
+					origin,
+					start,
+					end,
+					"expected decimal digits in Float exponent",
+					"write a decimal Float such as 1.0, 0.5 or 1e2; an exponent needs at least one digit",
+				))
+			else:
+				end = run_end(source, IntOps.add(end, 1), DECIMAL_DIGITS)
+				numeric_result(origin, source, start, end, True)
+		else:
+			numeric_result(origin, source, start, end, is_float)
 
 
 pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnostic]:
@@ -226,48 +493,26 @@ pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnost
 				)
 				break
 			else if Text.equals(byte_slice, "\""):
-				label_start = IntOps.add(cursor, 1)
-				label_end = run_end(
-					source,
-					label_start,
-					Text.concat(identifier_continue, "."),
-				)
-
-				if not Text.equals(
-					source.substring(label_end, 1),
-					"\"",
-				):
-					failure = Some(
-						diagnostic(
-							origin,
-							cursor,
-							IntOps.min(
-								IntOps.add(label_end, 1),
-								source.length(),
+				match quoted_end(origin, source, cursor):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(end):
+						contents_start = IntOps.add(cursor, 1)
+						tokens = tokens.append(
+							token(
+								origin,
+								QuotedString(
+									source.substring(
+										contents_start,
+										IntOps.subtract(end, contents_start),
+									),
+								),
+								cursor,
+								IntOps.add(end, 1),
 							),
-							"invalid builtin label",
-							Text.concat(
-								"use a quoted ASCII builtin label with letters, digits, underscores and dots; ",
-								"escapes are unsupported",
-							),
-						),
-					)
-					break
-
-				tokens = tokens.append(
-					token(
-						origin,
-						BuiltinLabel(
-							source.substring(
-								label_start,
-								IntOps.subtract(label_end, label_start),
-							),
-						),
-						cursor,
-						IntOps.add(label_end, 1),
-					),
-				)
-				cursor = IntOps.add(label_end, 1)
+						)
+						cursor = IntOps.add(end, 1)
 			else if IDENTIFIER_START.contains(byte_slice):
 				identifier_end: Int = run_end(
 					source,
@@ -283,6 +528,8 @@ pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnost
 					SymbolToken(FunctionKeyword)
 				else if Text.equals(spelling, "pure"):
 					SymbolToken(PureKeyword)
+				else if Text.equals(spelling, "void"):
+					SymbolToken(VoidKeyword)
 				else if Text.equals(spelling, "var"):
 					SymbolToken(VarKeyword)
 				else if Text.equals(spelling, "match"):
@@ -298,47 +545,26 @@ pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnost
 				source.substring(cursor, 2),
 				"->",
 			):
-				tokens = tokens.append(token(origin, SymbolToken(Arrow), cursor, IntOps.add(cursor, 2)))
+				tokens = tokens.append(
+					token(
+						origin,
+						SymbolToken(Arrow),
+						cursor,
+						IntOps.add(cursor, 2),
+					),
+				)
 				cursor = IntOps.add(cursor, 2)
+			else if Text.equals(byte_slice, "+"):
+				failure = Some(diagnostic(origin, cursor, IntOps.add(cursor, 1), "source numeric literals cannot start with '+'", "remove the leading '+'; use an adjacent '-' for a negative literal"))
+				break
 			else if DECIMAL_DIGITS.contains(byte_slice) or Text.equals(byte_slice, "-"):
-				digit_start: Int = if Text.equals(byte_slice, "-"):
-					IntOps.add(cursor, 1)
-				else:
-					cursor
-
-				first_digit: String = if IntOps.equals(digit_start, cursor):
-					byte_slice
-				else:
-					source.substring(digit_start, 1)
-
-				if (
-					IntOps.equals(first_digit.length(), 0)
-					or not DECIMAL_DIGITS.contains(first_digit)
-				):
-					failure = Some(
-						diagnostic(
-							origin,
-							cursor,
-							IntOps.add(cursor, 1),
-							"expected decimal digits immediately after '-'",
-							"write a signed integer such as -42; '-' is not an operator",
-						),
-					)
-					break
-
-				number_end: Int = run_end(
-					source,
-					IntOps.add(digit_start, 1),
-					DECIMAL_DIGITS,
-				)
-
-				spelling: String = source.substring(
-					cursor,
-					IntOps.subtract(number_end, cursor),
-				)
-
-				tokens = tokens.append(token(origin, IntegerLiteral(spelling), cursor, number_end))
-				cursor = number_end
+				match numeric_token(origin, source, cursor):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(number):
+						tokens = tokens.append(number)
+						cursor = number.span.end
 			else:
 				symbol: Option[Symbol] = match byte_slice:
 					"@":
@@ -384,11 +610,19 @@ pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnost
 					None:
 						message: String = "unsupported character"
 						help: String = Text.concat(
-							"use ASCII function declarations and Int literals, parameter names, or calls; ",
+							"use ASCII function declarations and numeric literals, parameter names, or calls; ",
 							"keep -> adjacent",
 						)
 
-						failure = Some(diagnostic(origin, cursor, IntOps.add(cursor, 1), message, help))
+						failure = Some(
+							diagnostic(
+								origin,
+								cursor,
+								IntOps.add(cursor, 1),
+								message,
+								help,
+							),
+						)
 						break
 
 	match failure:

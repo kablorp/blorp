@@ -1,6 +1,14 @@
 import:
-	source: COMPILER_SOURCE
-	./prelude: RuntimeOperation(IntAdd, IntToString, StringLength)
+	./prelude:
+		BooleanRoles,
+		OptionalRoles,
+		RuntimeOperation(
+			IntAdd, IntSubtract, IntMultiply, IntDivide, IntRemainder, IntToString, StringLength,
+			StringPrint, StringParseInt, StringParseFloat, IoReadLine, StringEquals,
+			FloatAdd, FloatSubtract, FloatMultiply, FloatDivide, FloatRemainder, FloatToString,
+		),
+	float_literal: c_float_literal
+	float_runtime: float_runtime, float_string_runtime, float_parse_runtime
 	int as IntOps
 	lower: MatchLabel(VariantLabel, DefaultLabel), ValueId, value_number
 	option: to_result
@@ -13,9 +21,9 @@ import:
 		OwnedMatch,
 		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(
-			ParameterDefinition, IntegerDefinition, VariantDefinition, CallDefinition,
-			ConstructDefinition, PayloadDefinition, ConstructRecordDefinition,
-			ReadRecordFieldDefinition,
+			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition, StringDefinition,
+			VariantDefinition, CallDefinition, ConstructDefinition, PayloadDefinition,
+			ConstructRecordDefinition, ReadRecordFieldDefinition,
 		),
 		OwnerId,
 		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
@@ -24,13 +32,14 @@ import:
 		ReturnTransfer(UnmanagedReturn, OwnedReturn),
 		StoredPayload(UnmanagedPayload, OwnedPayload),
 		owner_number,
+	source: COMPILER_SOURCE
 	specialize:
 		CallTarget(UserFunction, RuntimeFunction),
 		ConcreteRecord,
 		ConcreteUnion,
 		FieldInstanceId,
 		RecordInstanceId,
-		TypeRef(IntType, StringType, UnionType, RecordType),
+		TypeRef(VoidType, IntType, FloatType, StringType, UnionType, RecordType),
 		UnionInstanceId,
 		UnionRepresentation(InlineUnmanaged, InlineOwningPayload),
 		VariantInstanceId,
@@ -41,7 +50,13 @@ import:
 		union_number,
 		variant_number,
 		variant_owner,
-	string_runtime: string_runtime
+	string as StringOps
+	string_runtime:
+		io_read_line_runtime,
+		string_equals_runtime,
+		string_parse_int_runtime,
+		string_print_runtime,
+		string_runtime,
 	syntax: Diagnostic, FunctionExecution(OrdinaryCalls, SelfTailLoop), Span
 	text: concat
 	verify: VerifiedProgram, verified_contents
@@ -86,12 +101,42 @@ private pure func c_callable(target: CallTarget) -> String:
 			c_name(function_number(id))
 		RuntimeFunction(operation):
 			match operation:
+				StringPrint:
+					"blorp_string_print"
 				IntAdd:
 					"blorp_int_add"
+				IntSubtract:
+					"blorp_int_subtract"
+				IntMultiply:
+					"blorp_int_multiply"
+				IntDivide:
+					"blorp_int_divide"
+				IntRemainder:
+					"blorp_int_remainder"
 				IntToString:
 					"blorp_int_to_string"
+				FloatAdd:
+					"blorp_float_add"
+				FloatSubtract:
+					"blorp_float_subtract"
+				FloatMultiply:
+					"blorp_float_multiply"
+				FloatDivide:
+					"blorp_float_divide"
+				FloatRemainder:
+					"blorp_float_remainder"
+				FloatToString:
+					"blorp_float_to_string"
 				StringLength:
 					"blorp_string_length"
+				StringParseInt(_):
+					"blorp_string_parse_int"
+				StringParseFloat(_):
+					"blorp_string_parse_float"
+				IoReadLine(_):
+					"blorp_io_read_line"
+				StringEquals(_):
+					"blorp_string_equals"
 
 
 private pure func append_integer(output: String, value: Int) -> String:
@@ -107,6 +152,34 @@ private pure func append_integer(output: String, value: Int) -> String:
 			.concat("INT64_C(")
 			.append_int(value)
 			.concat(")")
+
+
+-- Function-local static data has fixed syntactic depth and no C string-token
+-- length limit or automatic array storage. Existing ValueIds distinguish the
+-- backing bytes; each evaluation still constructs an ordinary fresh String.
+private pure func c_literal_bytes(id: ValueId) -> String:
+	"blorp_bytes_".append_int(value_number(id))
+
+
+private pure func append_string_bytes(output: String, id: ValueId, bytes: String) -> String:
+	var projected = output
+		.concat("static const unsigned char ")
+		.concat(c_literal_bytes(id))
+		.concat("[]={")
+	var position = 0
+
+	for character in StringOps.chars(bytes):
+		if IntOps.greater_than(position, 0):
+			projected = projected.concat(",")
+
+		projected = projected.append_int(to_int(character))
+		position = IntOps.add(position, 1)
+
+	if IntOps.equals(position, 0):
+		-- ISO C forbids an empty initializer; logical length remains zero.
+		projected = projected.concat("0")
+
+	projected.concat("};")
 
 
 private pure func has_payload(declaration: ConcreteUnion) -> Bool:
@@ -169,8 +242,12 @@ private pure func c_type(
 	match type_ref:
 		RecordType(id):
 			Ok(record_c_type(id))
+		VoidType:
+			Ok("uint8_t")
 		IntType:
 			Ok("int64_t")
+		FloatType:
+			Ok("double")
 		StringType:
 			Ok("struct blorp_string*")
 		UnionType(id):
@@ -301,6 +378,7 @@ private pure func append_union(
 
 private pure func append_operation(
 	output: String,
+	id: ValueId,
 	operation: OwnedValueOperation,
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
@@ -333,8 +411,21 @@ private pure func append_operation(
 			)
 		ParameterDefinition(index):
 			Ok(output.concat(c_parameter(index)))
+		VoidDefinition:
+			Ok(output.concat("((uint8_t)0)"))
 		IntegerDefinition(value):
 			Ok(append_integer(output, value))
+		FloatDefinition(value):
+			Ok(output.concat(c_float_literal(value)))
+		StringDefinition(bytes):
+			constructor = output
+				.concat("blorp_string_from_bytes((const char *)")
+				.concat(c_literal_bytes(id))
+			length = append_integer(
+				constructor.concat(","),
+				bytes.length(),
+			)
+			Ok(length.concat(")"))
 		VariantDefinition(id):
 			declaration ?= unions
 				.get(union_number(variant_owner(id)))
@@ -401,7 +492,167 @@ private pure func append_operation(
 			)
 
 
+private pure func argument_value(argument: OwnedArgument) -> ValueId:
+	match argument:
+		UnmanagedArgument(id):
+			id
+		BorrowedArgument(borrow):
+			borrow.value
+
+
+private pure func append_optional_value(
+	output: String,
+	id: ValueId,
+	roles: OptionalRoles[VariantInstanceId],
+	condition: String,
+	payload: String,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	type_name ?= c_type(UnionType(variant_owner(roles.present)), unions)
+	name = c_value(id)
+	Ok(
+		output
+			.concat("const ")
+			.concat(type_name)
+			.concat(" ")
+			.concat(name)
+			.concat("=")
+			.concat(condition)
+			.concat("?((")
+			.concat(type_name)
+			.concat("){.tag=")
+			.concat(c_variant(roles.present))
+			.concat(",.payload.")
+			.concat(c_payload(roles.present))
+			.concat("=")
+			.concat(payload)
+			.concat("}):((")
+			.concat(type_name)
+			.concat("){.tag=")
+			.concat(c_variant(roles.absent))
+			.concat("});(void)")
+			.concat(name)
+			.concat(";"),
+	)
+
+
+private pure func append_parse_number(
+	output: String,
+	id: ValueId,
+	roles: OptionalRoles[VariantInstanceId],
+	arguments: List[OwnedArgument],
+	unions: List[ConcreteUnion],
+	scalar_type: String,
+	runtime: String,
+) -> Result[String, Diagnostic]:
+	argument ?= arguments
+		.get(0)
+		.to_result(internal_error())
+	scratch = "blorp_runtime_".append_int(value_number(id))
+	prefix = output
+		.concat(scalar_type)
+		.concat(" ")
+		.concat(scratch)
+		.concat("=0;const uint8_t ")
+		.concat(scratch)
+		.concat("_some=")
+		.concat(runtime)
+		.concat("(")
+		.concat(c_value(argument_value(argument)))
+		.concat(",&")
+		.concat(scratch)
+		.concat(");")
+	append_optional_value(
+		prefix,
+		id,
+		roles,
+		scratch.concat("_some"),
+		scratch,
+		unions,
+	)
+
+
+private pure func append_read_line(
+	output: String,
+	id: ValueId,
+	roles: OptionalRoles[VariantInstanceId],
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	scratch = "blorp_runtime_".append_int(value_number(id))
+	prefix = output
+		.concat("struct blorp_string *const ")
+		.concat(scratch)
+		.concat("=blorp_io_read_line();")
+	append_optional_value(
+		prefix,
+		id,
+		roles,
+		scratch.concat("!=NULL"),
+		scratch,
+		unions,
+	)
+
+
 private pure func append_value(
+	output: String,
+	id: ValueId,
+	value_type: TypeRef,
+	operation: OwnedValueOperation,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	match operation:
+		CallDefinition(call, arguments):
+			match call.target:
+				RuntimeFunction(StringParseInt(roles)):
+					append_parse_number(output, id, roles, arguments, unions, "int64_t", "blorp_string_parse_int")
+				RuntimeFunction(StringParseFloat(roles)):
+					append_parse_number(output, id, roles, arguments, unions, "double", "blorp_string_parse_float")
+				RuntimeFunction(IoReadLine(roles)):
+					append_read_line(output, id, roles, unions)
+				RuntimeFunction(StringEquals(roles)):
+					append_string_equals(output, id, roles, arguments, unions)
+				_:
+					append_regular_value(output, id, value_type, operation, unions)
+		_:
+			append_regular_value(output, id, value_type, operation, unions)
+
+
+private pure func append_string_equals(
+	output: String,
+	id: ValueId,
+	roles: BooleanRoles[VariantInstanceId],
+	arguments: List[OwnedArgument],
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	left ?= arguments
+		.get(0)
+		.to_result(internal_error())
+	right ?= arguments
+		.get(1)
+		.to_result(internal_error())
+	type_name ?= c_type(UnionType(variant_owner(roles.equal)), unions)
+	name = c_value(id)
+	Ok(
+		output
+			.concat("const ")
+			.concat(type_name)
+			.concat(" ")
+			.concat(name)
+			.concat("=blorp_string_equals(")
+			.concat(c_value(argument_value(left)))
+			.concat(",")
+			.concat(c_value(argument_value(right)))
+			.concat(")?")
+			.concat(c_variant(roles.equal))
+			.concat(":")
+			.concat(c_variant(roles.different))
+			.concat(";(void)")
+			.concat(name)
+			.concat(";"),
+	)
+
+
+private pure func append_regular_value(
 	output: String,
 	id: ValueId,
 	value_type: TypeRef,
@@ -410,6 +661,12 @@ private pure func append_value(
 ) -> Result[String, Diagnostic]:
 	type_name ?= c_type(value_type, unions)
 	name = c_value(id)
+
+	prepared = match operation:
+		StringDefinition(bytes):
+			append_string_bytes(output, id, bytes)
+		_:
+			output
 
 	declaration = match value_type:
 		StringType:
@@ -420,10 +677,11 @@ private pure func append_value(
 				.concat(" ")
 
 	value ?= append_operation(
-		output
+		prepared
 			.concat(declaration)
 			.concat(name)
 			.concat("="),
+		id,
 		operation,
 		unions,
 	)
@@ -897,37 +1155,109 @@ private pure func operations_need_strings(operations: List[OwnershipOperation]) 
 	needed
 
 
-private pure func operations_need_integer_add(operations: List[OwnershipOperation]) -> Bool:
+private fixed union RuntimeFeature:
+	IntegerAddition
+	IntegerArithmetic
+	StringOutput
+	IntegerParsing
+	LineInput
+	StringEquality
+	FloatFormatting
+	FloatParsing
+
+
+private pure func runtime_matches(
+	actual: RuntimeOperation[VariantInstanceId],
+	expected: RuntimeFeature,
+) -> Bool:
+	match actual:
+		IntAdd:
+			match expected:
+				IntegerAddition:
+					True
+				_:
+					False
+		IntSubtract | IntMultiply | IntDivide | IntRemainder:
+			match expected:
+				IntegerArithmetic:
+					True
+				_:
+					False
+		StringPrint:
+			match expected:
+				StringOutput:
+					True
+				_:
+					False
+		StringParseInt(_):
+			match expected:
+				IntegerParsing:
+					True
+				_:
+					False
+		IoReadLine(_):
+			match expected:
+				LineInput:
+					True
+				_:
+					False
+		StringEquals(_):
+			match expected:
+				StringEquality:
+					True
+				_:
+					False
+		FloatToString:
+			match expected:
+				FloatFormatting: True
+				_: False
+		StringParseFloat(_):
+			match expected:
+				FloatParsing: True
+				_: False
+		FloatAdd | FloatSubtract | FloatMultiply | FloatDivide | FloatRemainder | IntToString | StringLength:
+			False
+
+
+private pure func operations_need_runtime(
+	operations: List[OwnershipOperation],
+	expected: RuntimeFeature,
+) -> Bool:
 	var needed = False
+
 	for operation in operations:
 		match operation:
 			DefineValue(definition):
 				match definition.operation:
 					CallDefinition(call, _):
 						match call.target:
-							RuntimeFunction(IntAdd):
-								needed = True
+							RuntimeFunction(actual):
+								needed = runtime_matches(actual, expected) or needed
 							_:
 								void
 					_:
 						void
 			_:
 				void
+
 	needed
 
 
-private pure func needs_integer_add(program: OwnershipProgram) -> Bool:
+private pure func needs_runtime(program: OwnershipProgram, expected: RuntimeFeature) -> Bool:
 	var needed = False
+
 	for function in program.functions:
-		if operations_need_integer_add(function.operations):
+		if operations_need_runtime(function.operations, expected):
 			needed = True
+
 		match function.tail:
 			ReturnTail(_):
 				void
 			MatchTail(matched):
 				for arm in matched.arms:
-					if operations_need_integer_add(arm.operations):
+					if operations_need_runtime(arm.operations, expected):
 						needed = True
+
 	needed
 
 
@@ -935,6 +1265,16 @@ private pure func needs_integer_add(program: OwnershipProgram) -> Bool:
 -- the negative branch also stays within Int64 at UINT64_MAX - sum == INT64_MAX.
 private INTEGER_ADD_RUNTIME: String =
 	|static int64_t blorp_int_add(int64_t first,int64_t second){uint64_t sum=(uint64_t)first+(uint64_t)second;return sum<=INT64_MAX?(int64_t)sum:-INT64_C(1)-(int64_t)(UINT64_MAX-sum);}
+	|
+
+-- Convert wrapped unsigned bits using only representable signed casts. Division
+-- and remainder guard both zero and the sole overflowing signed quotient.
+private INTEGER_ARITHMETIC_RUNTIME: String =
+	|int64_t blorp_int_signed(uint64_t value){return value<=INT64_MAX?(int64_t)value:-INT64_C(1)-(int64_t)(UINT64_MAX-value);}
+	|int64_t blorp_int_subtract(int64_t first,int64_t second){return blorp_int_signed((uint64_t)first-(uint64_t)second);}
+	|int64_t blorp_int_multiply(int64_t first,int64_t second){return blorp_int_signed((uint64_t)first*(uint64_t)second);}
+	|int64_t blorp_int_divide(int64_t first,int64_t second){if(second==0)return 0;if(first==INT64_MIN&&second==-1)return INT64_MIN;return first/second;}
+	|int64_t blorp_int_remainder(int64_t first,int64_t second){if(second==0||(first==INT64_MIN&&second==-1))return 0;return first%second;}
 	|
 
 
@@ -963,6 +1303,42 @@ private pure func needs_string_runtime(program: OwnershipProgram) -> Bool:
 	needed
 
 
+-- Typed Float facts, including generic union payload layouts, select the ABI
+-- guard. This follows the existing loaded-module policy; it is not reachability.
+private pure func is_float(value_type: TypeRef) -> Bool:
+	match value_type:
+		FloatType: True
+		_: False
+
+
+private pure func operations_need_floats(operations: List[OwnershipOperation]) -> Bool:
+	operations.any(pure func(operation):
+		match operation:
+			DefineValue(definition): is_float(definition.value_type)
+			_: False
+	)
+
+
+private pure func needs_float_runtime(program: OwnershipProgram) -> Bool:
+	var needed = False
+	for layout in program.unions:
+		for payload in layout.variants:
+			match payload:
+				Some(value_type): needed = is_float(value_type) or needed
+				None: void
+	for function in program.functions:
+		needed = is_float(function.signature.return_type) or needed
+		for parameter in function.signature.parameters:
+			needed = is_float(parameter) or needed
+		needed = operations_need_floats(function.operations) or needed
+		match function.tail:
+			ReturnTail(_): void
+			MatchTail(matched):
+				for arm in matched.arms:
+					needed = operations_need_floats(arm.operations) or needed
+	needed
+
+
 pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	checked = verified_contents(program)
 	var owns_children = False
@@ -978,8 +1354,33 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 		string_runtime()
 	else:
 		"#include <stdint.h>\n"
-	if needs_integer_add(checked):
+
+	if needs_float_runtime(checked):
+		output = output.concat(float_runtime())
+
+	if needs_runtime(checked, FloatFormatting):
+		output = output.concat(float_string_runtime())
+
+	if needs_runtime(checked, FloatParsing):
+		output = output.concat(float_parse_runtime())
+
+	if needs_runtime(checked, IntegerAddition):
 		output = output.concat(INTEGER_ADD_RUNTIME)
+
+	if needs_runtime(checked, IntegerArithmetic):
+		output = output.concat(INTEGER_ARITHMETIC_RUNTIME)
+
+	if needs_runtime(checked, StringOutput):
+		output = output.concat(string_print_runtime())
+
+	if needs_runtime(checked, IntegerParsing):
+		output = output.concat(string_parse_int_runtime())
+
+	if needs_runtime(checked, LineInput):
+		output = output.concat(io_read_line_runtime())
+
+	if needs_runtime(checked, StringEquality):
+		output = output.concat(string_equals_runtime())
 
 	var index: Int = 0
 

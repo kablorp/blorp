@@ -1,0 +1,126 @@
+import:
+	../../src/lex: lex
+	../../src/parse: parsed_contents
+	../../src/source: module_source, root_module_id
+	../../src/syntax:
+		ExpressionBase(StringExpression),
+		ParsedBody(ParsedValueBody),
+		PostfixOperation(ReceiverInvocation),
+	../unit/input: parse
+	test: TestSuite
+
+
+private pure func accepts(source: String) -> Bool:
+	lex(module_source(root_module_id()), source)
+		.and_then(pure func(tokens): parse(tokens))
+		.is_ok()
+
+
+pure func test_quoted_values_compose_with_bindings_calls_and_returns() -> Bool:
+	source: String =
+		|pure func text() -> String:
+		|    "é😀"
+		|pure func identity(value: String) -> String:
+		|    value
+		|func main() -> Int:
+		|    original = "hello -- data"
+		|    var current = original
+		|    current = identity(text())
+		|    current.length()
+		|
+	accepts(source)
+
+
+pure func test_string_primary_and_ufcs_retain_byte_spans() -> Bool:
+	source = "func main() -> Int:\n    \"é😀\".length()\n"
+
+	match lex(module_source(root_module_id()), source).and_then(pure func(tokens): parse(tokens)):
+		Err(_):
+			False
+		Ok(parsed):
+			match parsed_contents(parsed).functions:
+				[function]:
+					match function.body:
+						ParsedValueBody(value):
+							match (value.base, value.applications):
+								(StringExpression(bytes), [ReceiverInvocation(call)]):
+									(
+										bytes == "é😀"
+										and value.base_span.start == 24
+										and value.base_span.end == 32
+										and call.span.start == 33
+										and call.span.end == 41
+										and value.span.end == 41
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_escaped_brace_allows_literal_interpolation_text() -> Bool:
+	accepts("func main() -> String:\n    \"$\\{name}\\n\\u{1F600}\"\n")
+
+
+pure func test_builtin_remains_contextual_for_unquoted_calls() -> Bool:
+	source: String =
+		|pure func builtin(value: String) -> Int:
+		|    value.length()
+		|func main() -> Int:
+		|    value = "hello"
+		|    builtin(value)
+		|
+	nullary: String =
+		|pure func builtin() -> String:
+		|    "hello"
+		|func main() -> Int:
+		|    builtin().length()
+		|
+	accepts(source) and accepts(nullary)
+
+
+pure func test_raw_interpolation_remains_rejected_with_teaching_help() -> Bool:
+	match lex(
+		module_source(root_module_id()),
+		"func main() -> String:\n    \"$" + "{name}\"\n",
+	).and_then(
+		pure func(tokens): parse(tokens),
+	):
+		Err(error):
+			(
+				error.message == "String interpolation is not supported yet"
+				and error.help == "escape the opening brace as \\{ for literal $" + "{ text"
+				and error.span.start == 28
+				and error.span.end == 30
+			)
+		Ok(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 quoted String grammar",
+	tests = [
+		(
+			"quoted values compose with bindings calls and returns",
+			test_quoted_values_compose_with_bindings_calls_and_returns,
+		),
+		(
+			"String primary and UFCS retain byte spans",
+			test_string_primary_and_ufcs_retain_byte_spans,
+		),
+		(
+			"escaped brace permits literal interpolation text",
+			test_escaped_brace_allows_literal_interpolation_text,
+		),
+		(
+			"builtin remains contextual for unquoted calls",
+			test_builtin_remains_contextual_for_unquoted_calls,
+		),
+		(
+			"raw interpolation remains rejected with teaching help",
+			test_raw_interpolation_remains_rejected_with_teaching_help,
+		),
+	]
+}

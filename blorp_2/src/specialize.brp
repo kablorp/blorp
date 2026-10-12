@@ -1,10 +1,20 @@
 import:
-	declarations as Declaration
-	source: COMPILER_SOURCE
-	./prelude: PrimitiveType(BuiltinInt, BuiltinString), RuntimeOperation, runtime_contract
+	./prelude as Prelude:
+		BooleanRoles,
+		OptionalRoles,
+		PrimitiveType(BuiltinInt, BuiltinFloat, BuiltinString, BuiltinVoid),
+		RuntimeOperation(
+			IntAdd, IntSubtract, IntMultiply, IntDivide, IntRemainder, IntToString, StringLength,
+			StringPrint, StringParseInt, StringParseFloat, IoReadLine, StringEquals,
+			FloatAdd, FloatSubtract, FloatMultiply, FloatDivide, FloatRemainder, FloatToString,
+		),
+		RuntimeResult(PrimitiveResult, OptionalResult, BooleanResult),
+		runtime_contract,
 	check as Checked
+	declarations as Declaration
 	int as IntOps
 	option: to_result
+	source: COMPILER_SOURCE
 	syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration), FunctionExecution, Span
 	text: concat
 
@@ -47,7 +57,9 @@ opaque type VariantInstanceId = VariantIdentity
 
 
 fixed union TypeRef:
+	VoidType
 	IntType
+	FloatType
 	StringType
 	RecordType(RecordInstanceId)
 	UnionType(UnionInstanceId)
@@ -73,7 +85,7 @@ fixed record FunctionSignature {
 
 fixed union CallTarget:
 	UserFunction(FunctionInstanceId)
-	RuntimeFunction(RuntimeOperation)
+	RuntimeFunction(RuntimeOperation[VariantInstanceId])
 
 
 fixed record ConcreteCall {
@@ -84,17 +96,32 @@ fixed record ConcreteCall {
 
 private pure func primitive_ref(value_type: PrimitiveType) -> TypeRef:
 	match value_type:
+		BuiltinVoid:
+			VoidType
 		BuiltinInt:
 			IntType
+		BuiltinFloat:
+			FloatType
 		BuiltinString:
 			StringType
 
 
-pure func runtime_signature(operation: RuntimeOperation) -> FunctionSignature:
+pure func runtime_signature(operation: RuntimeOperation[VariantInstanceId]) -> FunctionSignature:
 	contract = runtime_contract(operation)
+
+	result = match contract.return_type:
+		PrimitiveResult(primitive):
+			primitive_ref(primitive)
+		OptionalResult(_, roles):
+			UnionType(variant_owner(roles.present))
+		BooleanResult(roles):
+			UnionType(variant_owner(roles.equal))
+
 	{
-		parameters = contract.parameters.map(pure func(parameter: PrimitiveType) -> TypeRef: primitive_ref(parameter)),
-		return_type = primitive_ref(contract.return_type)
+		parameters = contract.parameters.map(
+			pure func(parameter: PrimitiveType) -> TypeRef: primitive_ref(parameter),
+		),
+		return_type = result
 	}
 
 
@@ -107,7 +134,10 @@ fixed record ConcreteRecordField {
 
 fixed union ConcreteBase:
 	ReturnRecord(RecordInstanceId, List[ConcreteRecordField])
+	ReturnVoid
 	ReturnInteger(Int)
+	ReturnFloat(Float)
+	ReturnString(String)
 	ReturnVariant(VariantInstanceId)
 	ReturnBinding(Checked.BindingId)
 	ReturnCall(ConcreteCall, List[ConcreteValue])
@@ -134,9 +164,10 @@ fixed record ConcreteValue {
 }
 
 
-fixed union ConcreteAssignment:
+fixed union ConcreteStatement:
 	InitializeBinding(Checked.BindingId, ConcreteValue)
 	ReassignBinding(Checked.BindingId, ConcreteValue)
+	DiscardExpression(ConcreteValue)
 
 
 fixed union PayloadBinding:
@@ -153,7 +184,7 @@ fixed union ConcretePattern:
 
 fixed record ConcreteArm {
 	pattern: ConcretePattern,
-	assignments: List[ConcreteAssignment],
+	statements: List[ConcreteStatement],
 	body: ConcreteExit
 }
 
@@ -179,7 +210,7 @@ fixed record ConcreteFunction {
 	execution: FunctionExecution,
 	signature: FunctionSignature,
 	bindings: List[ConcreteBinding],
-	assignments: List[ConcreteAssignment],
+	statements: List[ConcreteStatement],
 	body: ConcreteBody
 }
 
@@ -227,9 +258,21 @@ pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 					IntOps.equals(record_number(left), record_number(right))
 				_:
 					False
+		VoidType:
+			match right:
+				VoidType:
+					True
+				_:
+					False
 		IntType:
 			match right:
 				IntType:
+					True
+				_:
+					False
+		FloatType:
+			match right:
+				FloatType:
 					True
 				_:
 					False
@@ -358,8 +401,12 @@ private pure func concrete_type(
 			find_record_instance(records, id)
 				.map(pure func(owner): RecordType(owner))
 				.to_result(invalid(span, "unprepared record instance"))
+		Checked.VoidType:
+			Ok(VoidType)
 		Checked.IntType:
 			Ok(IntType)
+		Checked.FloatType:
+			Ok(FloatType)
 		Checked.StringType:
 			Ok(StringType)
 		Checked.AppliedUnionType(id, arguments):
@@ -814,14 +861,16 @@ private pure func append_value_types(
 	types
 
 
-private pure func assignment_types(
-	assignments: List[Checked.CheckedAssignment],
+private pure func statement_types(
+	statements: List[Checked.CheckedStatement],
 ) -> List[Checked.TypeUse]:
 	var types: List[Checked.TypeUse] = []
 
-	for assignment in assignments:
-		value = match assignment:
+	for statement in statements:
+		value = match statement:
 			Checked.InitializeBinding(_, value):
+				value
+			Checked.DiscardExpression(value):
 				value
 			Checked.ReassignBinding(_, value):
 				value
@@ -849,7 +898,7 @@ private pure func function_types(function: Checked.CheckedFunction) -> List[Chec
 
 	types = types
 		.append(function.signature.return_type)
-		.concat(assignment_types(function.assignments))
+		.concat(statement_types(function.statements))
 
 	match function.body:
 		Checked.CheckedValueBody(value):
@@ -859,7 +908,7 @@ private pure func function_types(function: Checked.CheckedFunction) -> List[Chec
 
 			for arm in matched.arms:
 				types = types
-					.concat(assignment_types(arm.assignments))
+					.concat(statement_types(arm.statements))
 					.concat(exit_types(arm.body))
 
 			types
@@ -1003,16 +1052,94 @@ private pure func expand_instances(
 			Ok(prepared)
 
 
+private pure func translate_optional_roles(
+	roles: OptionalRoles[Declaration.VariantId],
+	result_type: TypeRef,
+	unions: List[UnionInstance],
+	span: Span,
+) -> Result[OptionalRoles[VariantInstanceId], Diagnostic]:
+	owner ?= concrete_union_owner(result_type, span)
+	present ?= translate_variant(roles.present, owner, unions, span)
+	absent ?= translate_variant(roles.absent, owner, unions, span)
+	Ok({
+		present = present,
+		absent = absent,
+	})
+
+
 private pure func translate_call(
 	call: Checked.CheckedCall,
 	substitution: List[TypeSubstitution],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
+	result_type: TypeRef,
 ) -> Result[ConcreteCall, Diagnostic]:
 	target_result: Result[CallTarget, Diagnostic] = match call.target:
 		Checked.RuntimeFunction(operation):
-			Ok(RuntimeFunction(operation))
+			concrete_result: Result[RuntimeOperation[VariantInstanceId], Diagnostic] = match operation:
+				IntAdd:
+					accepted: RuntimeOperation[VariantInstanceId] = Prelude.IntAdd
+					Ok(accepted)
+				IntSubtract:
+					accepted: RuntimeOperation[VariantInstanceId] = Prelude.IntSubtract
+					Ok(accepted)
+				IntMultiply:
+					accepted: RuntimeOperation[VariantInstanceId] = Prelude.IntMultiply
+					Ok(accepted)
+				IntDivide:
+					accepted: RuntimeOperation[VariantInstanceId] = Prelude.IntDivide
+					Ok(accepted)
+				IntRemainder:
+					accepted: RuntimeOperation[VariantInstanceId] = Prelude.IntRemainder
+					Ok(accepted)
+				IntToString:
+					accepted: RuntimeOperation[VariantInstanceId] = Prelude.IntToString
+					Ok(accepted)
+				FloatAdd:
+					accepted: RuntimeOperation[VariantInstanceId] = Prelude.FloatAdd
+					Ok(accepted)
+				FloatSubtract:
+					accepted: RuntimeOperation[VariantInstanceId] = Prelude.FloatSubtract
+					Ok(accepted)
+				FloatMultiply:
+					accepted: RuntimeOperation[VariantInstanceId] = Prelude.FloatMultiply
+					Ok(accepted)
+				FloatDivide:
+					accepted: RuntimeOperation[VariantInstanceId] = Prelude.FloatDivide
+					Ok(accepted)
+				FloatRemainder:
+					accepted: RuntimeOperation[VariantInstanceId] = Prelude.FloatRemainder
+					Ok(accepted)
+				FloatToString:
+					accepted: RuntimeOperation[VariantInstanceId] = Prelude.FloatToString
+					Ok(accepted)
+				StringLength:
+					accepted: RuntimeOperation[VariantInstanceId] = Prelude.StringLength
+					Ok(accepted)
+				StringPrint:
+					accepted: RuntimeOperation[VariantInstanceId] = Prelude.StringPrint
+					Ok(accepted)
+				StringParseInt(roles):
+					translated ?= translate_optional_roles(roles, result_type, unions, call.span)
+					Ok(Prelude.StringParseInt(translated))
+				StringParseFloat(roles):
+					translated ?= translate_optional_roles(roles, result_type, unions, call.span)
+					Ok(Prelude.StringParseFloat(translated))
+				IoReadLine(roles):
+					translated ?= translate_optional_roles(roles, result_type, unions, call.span)
+					Ok(Prelude.IoReadLine(translated))
+				StringEquals(roles):
+					owner ?= concrete_union_owner(result_type, call.span)
+					equal ?= translate_variant(roles.equal, owner, unions, call.span)
+					different ?= translate_variant(roles.different, owner, unions, call.span)
+					Ok(Prelude.StringEquals({
+						equal = equal,
+						different = different,
+					}))
+
+			concrete ?= concrete_result
+			Ok(RuntimeFunction(concrete))
 		Checked.UserFunction(declaration, arguments):
 			concrete ?= translated_list(
 				arguments,
@@ -1103,8 +1230,14 @@ private pure func translate_value(
 				})
 			)
 			Ok(ReturnRecord(owner, concrete))
+		Checked.ReturnVoid:
+			Ok(ReturnVoid)
+		Checked.ReturnString(value):
+			Ok(ReturnString(value))
 		Checked.ReturnInteger(value):
 			Ok(ReturnInteger(value))
+		Checked.ReturnFloat(value):
+			Ok(ReturnFloat(value))
 		Checked.ReturnBinding(id):
 			Ok(ReturnBinding(id))
 		Checked.ReturnVariant(id):
@@ -1112,7 +1245,7 @@ private pure func translate_value(
 			concrete ?= translate_variant(id, owner, unions, value.base_span)
 			Ok(ReturnVariant(concrete))
 		Checked.ReturnCall(call, arguments):
-			concrete ?= translate_call(call, substitution, keys, unions, records)
+			concrete ?= translate_call(call, substitution, keys, unions, records, base_type)
 			values ?= translated_list(
 				arguments,
 				pure func(
@@ -1138,7 +1271,7 @@ private pure func translate_value(
 			Checked.ReadRecordField(field):
 				translate_field(field, records, step.span).map(pure func(id): ReadRecordField(id))
 			Checked.InvokeFunction(call, arguments):
-				concrete ?= translate_call(call, substitution, keys, unions, records)
+				concrete ?= translate_call(call, substitution, keys, unions, records, value_type)
 				values ?= translated_list(
 					arguments,
 					pure func(
@@ -1172,20 +1305,23 @@ private pure func translate_value(
 	})
 
 
-private pure func translate_assignments(
-	assignments: List[Checked.CheckedAssignment],
+private pure func translate_statements(
+	statements: List[Checked.CheckedStatement],
 	substitution: List[TypeSubstitution],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
-) -> Result[List[ConcreteAssignment], Diagnostic]:
-	translated_list(assignments, pure func(
-		assignment: Checked.CheckedAssignment,
-	) -> Result[ConcreteAssignment, Diagnostic]:
-		match assignment:
+) -> Result[List[ConcreteStatement], Diagnostic]:
+	translated_list(statements, pure func(
+		statement: Checked.CheckedStatement,
+	) -> Result[ConcreteStatement, Diagnostic]:
+		match statement:
 			Checked.InitializeBinding(id, value):
 				value ?= translate_value(value, substitution, keys, unions, records)
 				Ok(InitializeBinding(id, value))
+			Checked.DiscardExpression(value):
+				value ?= translate_value(value, substitution, keys, unions, records)
+				Ok(DiscardExpression(value))
 			Checked.ReassignBinding(id, value):
 				value ?= translate_value(value, substitution, keys, unions, records)
 				Ok(ReassignBinding(id, value))
@@ -1277,7 +1413,7 @@ private pure func translate_function(
 			span = binding.span,
 		})
 	)
-	assignments ?= translate_assignments(function.assignments, substitution, keys, unions, records)
+	statements ?= translate_statements(function.statements, substitution, keys, unions, records)
 
 	body_result: Result[ConcreteBody, Diagnostic] = match function.body:
 		Checked.CheckedValueBody(value):
@@ -1291,8 +1427,8 @@ private pure func translate_function(
 				arm: Checked.CheckedArm,
 			) -> Result[ConcreteArm, Diagnostic]:
 				pattern ?= translate_pattern(arm.pattern, owner, span, unions)
-				assignments ?= translate_assignments(
-					arm.assignments,
+				statements ?= translate_statements(
+					arm.statements,
 					substitution,
 					keys,
 					unions,
@@ -1301,7 +1437,7 @@ private pure func translate_function(
 				body ?= translate_exit(arm.body, substitution, keys, unions, records)
 				Ok({
 					pattern = pattern,
-					assignments = assignments,
+					statements = statements,
 					body = body,
 				})
 			)
@@ -1319,7 +1455,7 @@ private pure func translate_function(
 			return_type = return_type
 		},
 		bindings = bindings,
-		assignments = assignments,
+		statements = statements,
 		body = body,
 	})
 

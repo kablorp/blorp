@@ -1,17 +1,77 @@
 import:
+	bytes: to_hex
 	cost: CompilationCost, CostLimits, check_limits, parse_allocations, parse_instructions
 	fs: IOError, resource_path, temporary_directory
-	process: ProcessOutput, run
+	process:
+		ProcessCommand,
+		ProcessExit(Exited, Signaled, TimedOut),
+		ProcessOutput,
+		ProcessResult,
+		ProcessStdin(BytesStdin),
+		command,
+		run,
+		run_command,
 	system: file_exists, getenv, read_file, remove_file, temp_dir, write_file
+	test: TestSuite, run_suite_result
+
+
+fixed record NativeCase {
+	name: String,
+	stdin: Bytes,
+	exit_status: Int,
+	stdout: Bytes,
+	stderr: Bytes
+}
 
 
 fixed record Example {
 	name: String,
 	fixture: String,
 	expected_c: Option[String],
-	exit_status: Int,
+	first_case: NativeCase,
+	remaining_cases: List[NativeCase],
 	limits: CostLimits
 }
+
+
+pure func native_case(name: String, stdin: String, exit_status: Int, stdout: String) -> NativeCase:
+	{
+		name = name,
+		stdin = stdin.to_bytes(),
+		exit_status = exit_status,
+		stdout = stdout.to_bytes(),
+		stderr = "".to_bytes()
+	}
+
+
+pure func native_command(binary: String, expected: NativeCase) -> ProcessCommand:
+	{ command(binary, []) |
+		stdin = BytesStdin(expected.stdin),
+		environment = [
+			{ name = "BLORP_LEAK_CHECK", value = None },
+			{ name = "BLORP_MEMORY_STATS", value = None },
+		]
+	}
+
+
+pure func verify_native_case_result(expected: NativeCase, actual: ProcessResult) -> Result[Void, String]:
+	status ?= match actual.exit:
+		Exited(code):
+			if code == expected.exit_status:
+				Ok(void)
+			else:
+				Err("expected exit " + expected.exit_status.to_string() + ", got exit " + code.to_string())
+		Signaled(signal):
+			Err("expected exit " + expected.exit_status.to_string() + ", got signal " + signal.to_string())
+		TimedOut:
+			Err("expected exit " + expected.exit_status.to_string() + ", got timeout")
+
+	if actual.stdout != expected.stdout:
+		Err("stdout: expected hex " + expected.stdout.to_hex() + ", got " + actual.stdout.to_hex())
+	else if actual.stderr != expected.stderr:
+		Err("stderr: expected hex " + expected.stderr.to_hex() + ", got " + actual.stderr.to_hex())
+	else:
+		Ok(void)
 
 
 func run_isolated(program: String, arguments: List[String]) -> Result[ProcessOutput, String]:
@@ -107,6 +167,19 @@ func measure_compilation_cost(
 
 
 func verify_native_result(directory: String, expected_exit: Int) -> Result[Void, String]:
+	verify_native_output(directory, expected_exit, "")
+
+
+func verify_native_output(
+	directory: String,
+	expected_exit: Int,
+	expected_stdout: String,
+) -> Result[Void, String]:
+	binary ?= link_native(directory)
+	run_native_case(binary, native_case("native output", "", expected_exit, expected_stdout))
+
+
+private func link_native(directory: String) -> Result[String, String]:
 	generated_c: String = directory + "/program.c"
 	binary: String = directory + "/program"
 	linked ?= run_successfully(
@@ -121,23 +194,51 @@ func verify_native_result(directory: String, expected_exit: Int) -> Result[Void,
 			"-fsanitize=address,undefined",
 			"-fno-sanitize-recover=all",
 			generated_c,
+			"-lm",
 			"-o",
 			binary,
 		],
 	)
-	executed ?= run_isolated(binary, [])
+	Ok(binary)
 
-	if (
-		executed.exit_code() != expected_exit
-		or executed.stdout() != ""
-		or executed.stderr() != ""
-	):
-		Err((
-				"the generated program must return the expected status with empty stdout and "
-				+ "stderr"
-			))
-	else:
+
+private func run_native_case(binary: String, expected: NativeCase) -> Result[Void, String]:
+	match run_command(native_command(binary, expected)):
+		Err(error):
+			Err(error.to_string())
+		Ok(actual):
+			verify_native_case_result(expected, actual)
+
+
+private func native_case_passed(binary: String, expected: NativeCase) -> Bool:
+	match run_native_case(binary, expected):
+		Ok(_):
+			True
+		Err(error):
+			print_error(expected.name + ": " + error)
+			False
+
+
+private func verify_native_cases(directory: String, example: Example) -> Result[Void, String]:
+	-- Link once; every explicit input case runs this same unmodified binary.
+	binary ?= link_native(directory)
+	cases = [example.first_case].concat(example.remaining_cases)
+	callbacks = cases.map(func(expected: NativeCase):
+		(
+			expected.name,
+			func(): native_case_passed(binary, expected),
+		)
+	)
+	suite: TestSuite = {
+		description = example.name + " native inputs",
+		tests = callbacks
+	}
+	result = run_suite_result(suite)
+
+	if result[1] == 0:
 		Ok(void)
+	else:
+		Err("native input cases failed")
 
 
 func verify_rejected_command(
@@ -189,7 +290,7 @@ func verify_rejected_input(compiler: String, directory: String) -> Result[Void, 
 
 func verify_all(compiler: String, directory: String, example: Example) -> Result[Void, String]:
 	cost ?= measure_compilation_cost(compiler, directory, example)
-	native_result ?= verify_native_result(directory, example.exit_status)
+	native_result ?= verify_native_cases(directory, example)
 	check_limits(cost, example.limits)
 
 
@@ -229,7 +330,27 @@ func run_source_example(
 			name = fixture,
 			fixture = fixture,
 			expected_c = None,
-			exit_status = expected_exit,
+			first_case = native_case("native output", "", expected_exit, ""),
+			remaining_cases = [],
+			limits = limits
+		},
+	)
+
+
+func run_output_example(
+	compiler: String,
+	fixture: String,
+	expected_stdout: String,
+	limits: CostLimits,
+) -> Bool:
+	run_example(
+		compiler,
+		{
+			name = fixture,
+			fixture = fixture,
+			expected_c = None,
+			first_case = native_case("native output", "", 0, expected_stdout),
+			remaining_cases = [],
 			limits = limits
 		},
 	)

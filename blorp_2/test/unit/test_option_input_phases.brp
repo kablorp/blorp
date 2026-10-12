@@ -1,0 +1,241 @@
+import:
+	../../src/check as Checked
+	../../src/declarations as Declaration
+	../../src/lex: lex
+	../../src/lower as Lower
+	../../src/main: compile as compile_program
+	../../src/own as Own
+	../../src/prelude as Prelude
+	../../src/source: module_source, root_module_id
+	../../src/specialize as Concrete
+	../../src/syntax: Diagnostic
+	compilation: compile
+	input: check, parse, setup_diagnostic
+	module_input: parse_modules
+	test: TestSuite
+
+
+private SOURCE: String =
+	|fixed union Maybe[T]:
+	|    Missing
+	|    Present(T)
+	|pure func parse_number(text: String) -> Maybe[Int]:
+	|    builtin("string.parse_int", Present, Missing)
+	|pure func unwrap(text: String) -> Int:
+	|    match parse_number(text):
+	|        Present(value): value
+	|        Missing: 0
+	|func main() -> Int:
+	|    unwrap("42")
+	|
+
+
+pure func test_explicit_roles_accept_reversed_ordinary_union() -> Bool:
+	match compile(SOURCE):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+pure func test_selected_union_import_preserves_original_declaration() -> Bool:
+	-- A typed helper provides the constructor's expected union type.
+	typed: String =
+		|import:
+		|    ./option: Option(Some, None)
+		|pure func unwrap(value: Option[Int]) -> Int:
+		|    match value:
+		|        Some(number): number
+		|        None: 0
+		|func main() -> Int:
+		|    unwrap(Some(42))
+		|
+	option: String =
+		|fixed union Option[T]:
+		|    Some(T)
+		|    None
+		|
+
+	match (
+		parse_modules([
+			{
+				source = typed,
+				targets = [1]
+			},
+			{
+				source = option,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			match compile_program(parsed):
+				Ok(_):
+					True
+				Err(_):
+					False
+
+
+pure func test_counted_parse_runtime_is_emitted() -> Bool:
+	match compile(SOURCE):
+		Ok(output):
+			output.contains("blorp_string_parse_int")
+		Err(_):
+			False
+
+
+private pure func checked_source() -> Result[Checked.CheckedProgram, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), SOURCE)
+	parsed ?= parse(tokens)
+	check(parsed).map_err(setup_diagnostic)
+
+
+private pure func concrete_source() -> Result[Concrete.SpecializedProgram, Diagnostic]:
+	checked_source().and_then(pure func(program): Concrete.specialize(program))
+
+
+private pure func lowered_source() -> Result[Lower.LoweredProgram, Diagnostic]:
+	concrete_source().and_then(pure func(program): Lower.lower(program))
+
+
+pure func test_checked_roles_are_reversed_declaration_ids() -> Bool:
+	match checked_source():
+		Err(_):
+			False
+		Ok(program):
+			match Checked.checked_functions(program).functions:
+				[parser, _, _]:
+					match parser.body:
+						Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+							match (value.base, value.base_type):
+								(Checked.ReturnCall(call, [_]), Checked.AppliedUnionType(owner, [Checked.IntType])):
+									match call.target:
+										Checked.RuntimeFunction(Prelude.StringParseInt(roles)):
+											(
+												Declaration.variant_number(roles.present) == 1
+												and Declaration.variant_number(roles.absent) == 0
+												and Declaration.union_number(
+													Declaration.variant_owner(
+														roles.present,
+													),
+												) == Declaration.union_number(owner)
+												and Declaration.union_number(
+													Declaration.variant_owner(
+														roles.absent,
+													),
+												) == Declaration.union_number(owner)
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_concrete_roles_are_translated_to_the_result_instance() -> Bool:
+	match concrete_source():
+		Err(_):
+			False
+		Ok(program):
+			match Concrete.specialized_contents(program).functions:
+				[parser, _, _]:
+					match parser.body:
+						Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+							match (value.base, value.base_type):
+								(Concrete.ReturnCall(call, [_]), Concrete.UnionType(owner)):
+									match call.target:
+										Concrete.RuntimeFunction(Prelude.StringParseInt(roles)):
+											(
+												Concrete.variant_number(roles.present) == 1
+												and Concrete.variant_number(roles.absent) == 0
+												and Concrete.union_number(
+													Concrete.variant_owner(
+														roles.present,
+													),
+												) == Concrete.union_number(owner)
+												and Concrete.union_number(
+													Concrete.variant_owner(
+														roles.absent,
+													),
+												) == Concrete.union_number(owner)
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_lowering_preserves_roles_and_borrowed_parameter_argument() -> Bool:
+	match lowered_source():
+		Err(_):
+			False
+		Ok(program):
+			match Lower.lowered_functions(program).functions:
+				[parser, _, _]:
+					match parser.definitions:
+						[parameter, result]:
+							match (parameter.operation, result.operation):
+								(Lower.ParameterValue(0), Lower.CallValue(call, [argument])):
+									match call.target:
+										Concrete.RuntimeFunction(Prelude.StringParseInt(roles)):
+											(
+												Lower.value_number(
+													parameter.id,
+												) == Lower.value_number(argument)
+												and Lower.value_number(result.id) == 1
+												and Concrete.variant_number(roles.present) == 1
+												and Concrete.variant_number(roles.absent) == 0
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_emission_projects_explicit_tags_with_flat_scratch_values() -> Bool:
+	match compile(SOURCE):
+		Err(_):
+			False
+		Ok(output):
+			(
+				output.contains("int64_t blorp_runtime_1=0;const uint8_t blorp_runtime_1_some=")
+				and output.contains(".tag=blorp_v_0_1,.payload.blorp_up_1=blorp_runtime_1")
+				and output.contains(".tag=blorp_v_0_0}")
+				and not output.contains("blorp_string_print")
+			)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 accepted library result contracts",
+	tests = [
+		("explicit reversed roles", test_explicit_roles_accept_reversed_ordinary_union),
+		("selected union identity", test_selected_union_import_preserves_original_declaration),
+		("counted parser emission", test_counted_parse_runtime_is_emitted),
+		("checked role declaration identities", test_checked_roles_are_reversed_declaration_ids),
+		(
+			"concrete role instance identities",
+			test_concrete_roles_are_translated_to_the_result_instance,
+		),
+		(
+			"lowered role and argument identities",
+			test_lowering_preserves_roles_and_borrowed_parameter_argument,
+		),
+		(
+			"flat explicit tag projection",
+			test_emission_projects_explicit_tags_with_flat_scratch_values,
+		),
+	]
+}

@@ -28,7 +28,8 @@ func one() -> Int:
 ```
 
 The executable returns exit status 1 with empty stdout and stderr. A helper
-may appear before or after its caller. Local selective imports are supported; printing is a future increment.
+may appear before or after its caller. Local selective imports and concrete
+String printing are supported.
 
 The third example, [`test/e2e/fixtures/pure/calls.brp`](test/e2e/fixtures/pure/calls.brp),
 adds declared purity:
@@ -178,7 +179,7 @@ func main() -> Int:
     inspect(Number(7))
 ```
 
-An arm block contains zero or more binding lines and a final expression,
+An arm block contains zero or more binding or Void expression statements and a final expression,
 indented one level deeper than its pattern. Inline and block arms can coexist.
 Each arm has its own scope; sibling arms can declare the same name. An explicit
 `var` may shadow an enclosing binding, and its initializer sees the earlier
@@ -268,8 +269,13 @@ not a prerequisite for running the tests.
 entrypoint; the other case modules provide groups to it and are not standalone
 runnable suites.
 Each fixture owns fresh temporary output and one measured compilation, followed
-by a native `-O0` build and execution under UBSan. Allocation and instruction
-counters come from the same compilation. These checks never reuse fixture output.
+by one strict C11 native `-O0` build under ASan and UBSan. Explicit native cases
+reuse that binary with byte stdin and exact exit status, stdout and stderr
+assertions. Every example has a first case and a list of remaining cases;
+existing examples have one case. Failures identify the case and mismatched
+channel, with output shown as hex so embedded NUL and UTF-8 bytes remain visible.
+Allocation and instruction counters come from the same compilation, once per
+fixture. These checks never reuse output from an earlier fixture compilation.
 
 Every host-compiled source module has a matching unit suite under `test/unit/`.
 The temporary target prelude is an explicit source input, not a host module.
@@ -603,10 +609,10 @@ return types, an ordered list of explicitly typed parameters, an optional ordere
 parameters on functions and fixed unions, plus nongeneric fixed records with
 one or more `Int` fields. Union variants have zero fields or
 one field annotated `Int` or one of the union's own parameters; concrete fields
-specialize to Int, String, an existing inline record, or another finite inline union. A function
-body has zero or more binding lines followed by a single expression or a tail
-match with inline arm results or binding blocks. Expressions
-start with a signed Int64 literal, a binding or variant name, a record literal,
+specialize to Int, Float, String, Void, an existing inline record, or another finite inline union. A function
+body has zero or more ordered binding or Void expression statements followed
+by a final expression or a tail match with inline arm results or statement blocks. Expressions
+start with `void`, a signed Int64 or decimal Float64 literal, a quoted UTF-8 String literal, a binding or variant name, a record literal,
 or an application with an ordered list of arguments. UFCS calls and record
 field suffixes may follow that expression.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
@@ -616,7 +622,7 @@ Single-line comments begin with `--`; docstrings remain deferred.
 [`grammar.ebnf`](grammar.ebnf) defines the complete restricted source grammar
 and its EBNF dialect. Whitespace is explicit: LF is `"\n"`, TAB is `"\t"`, and
 the header/body spacing and EOF rules are productions. Identifier rules
-exclude the reserved spellings `func`, `pure`, `match`, `var`, and lone `_`.
+exclude the reserved spellings `func`, `pure`, `match`, `var`, `void`, and lone `_`.
 Names beginning with underscore, such as `_value`, remain identifiers.
 
 [`test/test_grammar/test_conformance.brp`](test/test_grammar/test_conformance.brp)
@@ -634,12 +640,12 @@ bin/blorp test --suite --timeout 180 blorp_2/test/test_grammar
 Lexical and layout rules:
 
 - Every declaration header starts at column 1. A function has one header,
-  optional binding lines, and a final expression line or tail match; a union
+  optional ordered statements, and a final expression line or tail match; a union
   has one header and at least one variant line. Blank, whitespace-only and
   comment-only lines may appear before, between, and after code lines. Their
   incidental indentation has no layout meaning. Real code lines require LF
   separation; the final line may end at EOF.
-- `--` begins a comment anywhere outside a quoted builtin label and consumes
+- `--` begins a comment anywhere outside a quoted String or builtin label and consumes
   bytes up to LF or EOF. Inline comments preserve the code line's newline;
   comments cannot continue expressions across lines. `---` is also an ordinary
   line comment. Comments permit ASCII bytes, including tabs; CR and non-ASCII
@@ -658,7 +664,7 @@ Lexical and layout rules:
   Spaces may surround a UFCS dot and its parentheses, as in `1 . one ( )`.
   Outside comments, tabs occur only in the indentation prefix. Each expression stays on one line,
   including match scrutinees, binding initializers and final arm results.
-- `func`, `pure`, `match`, `var`, and lone `_` are reserved. The optional `pure` qualifier precedes `func`
+- `func`, `pure`, `match`, `var`, `void`, and lone `_` are reserved. The optional `pure` qualifier precedes `func`
   with spaces between the two keywords. Function, parameter and type names are
   identifiers whose meaning is checked after parsing.
 - A function may declare ordered type parameters, as in
@@ -674,7 +680,7 @@ Lexical and layout rules:
   Function parameter and return annotations accept a nonempty list of recursive type arguments,
   such as `Box[Box[Int]]` or `Result[T, Box[E]]`. Empty declaration parentheses and multiple fields
   are unsupported. Payload annotations remain `Int` or the union's own parameter;
-  instantiated payloads may also be String, finite inline unions or existing inline records.
+  instantiated payloads may also be Float, String, Void, finite inline unions or existing inline records.
 - `fixed record Pair { first: Int, second: Int }` declares a nominal record
   on one line. Field names must be distinct and every field must be `Int`.
   `record` remains a contextual header word. Generic, empty, recursive and
@@ -694,7 +700,7 @@ Lexical and layout rules:
   a concrete record. Copies and whole-binding reassignment preserve old aliases.
 - `match expression:` starts a nonempty sequence of depth-two arms written
   `Pattern: expression` or `Pattern:` followed by a depth-three block of
-  binding lines and a mandatory final expression. A pattern is a bare name,
+  ordered binding or Void expression statements and a mandatory final expression. A pattern is a bare name,
   `_`, or a constructor name
   followed by parentheses containing zero or one field pattern. A field
   pattern is a binder or `_`; literal and nested field patterns are unsupported.
@@ -702,18 +708,19 @@ Lexical and layout rules:
   is valid syntax but fails semantic arity checking for a one-field constructor.
 - A binding line is `name = expression` or `var name = expression`, at depth
   one in a function or depth three in an arm block. Its initializer occupies
-  the same line. Function bindings precede the mandatory final expression or
-  tail match; arm bindings precede a mandatory final single-line expression.
-  Bindings inside arguments, annotations, and standalone expression statements
-  are unsupported. An arm block cannot contain a nested match.
+  the same line. Bindings and bare expression statements may interleave before
+  the mandatory final expression or function tail match. A non-final bare
+  expression must return Void; bind or return other values. Bindings inside
+  arguments and annotations are unsupported. An arm block cannot contain a
+  nested match.
 - Integer literals are decimal values from `-9223372036854775808` through
   `9223372036854775807`, with an optional adjacent minus. `-0` is accepted
   and has value zero. Leading zeros (`00`, `-01`), plus signs, separated minus
   signs and arithmetic operators are rejected. The lexer preserves the whole
   digit run; the parser validates spelling and range before converting it.
   A dot starts UFCS: `42.identity()` is a call, while `42.5` is invalid.
-  Non-ASCII characters and CRLF line endings are rejected.
-- Every token must be consumed. Extra expressions and malformed declarations are errors.
+  Non-ASCII bytes outside quoted Strings and CRLF source line endings are rejected.
+- Every token must be consumed. Malformed declarations and statements are errors.
 
 Semantic rules:
 
@@ -845,7 +852,8 @@ Semantic rules:
   unused and intermediate owners are dropped on that arm, and a managed result
   transfers its owner. Borrowed managed parameters are admitted before a match;
   its prefix must introduce no owned obligation, even one already dropped.
-  String literals, owned outer dependencies, COW and joins are deferred.
+  Literal construction creates a fresh ordinary String owner. Owned outer
+  dependencies, COW and joins are deferred.
 - Parenthesized expressions,
   multiple payload fields, managed record fields, recursive layouts, nested matches,
   guards, qualified/nested/literal patterns, constructor UFCS, multiline chains,
@@ -877,9 +885,11 @@ pure func answer() -> Int:
 ```
 
 The executable exits 42. Each import row starts with `./`
-or leading `../` segments, omits `.brp`, and selects one or more local function
-names. Imports precede declarations. Bare paths select target-library modules
-when an explicit library root is supplied. Aliases, wildcards, type/constructor
+or leading `../` segments, omits `.brp`, and selects local functions or fixed
+unions. A bare selector selects a function; `Option(Some, None)` selects a
+union and those constructors, while `Option()` selects only the union type.
+Imports precede declarations. Bare paths select target-library modules when
+an explicit library root is supplied. Aliases, wildcards, reexports, record
 imports, qualified calls and `private` are deferred.
 
 Each module owns its declarations; same-spelled declarations in different
@@ -900,7 +910,7 @@ retain the source file for primary errors and secondary notes independently.
 The [module design](MODULES_PLAN.md) records implementation research, identity
 ownership, tests and cost ceilings; the [validation report](../benchmarks/results/blorp_2_modules_2026-10-11.md)
 retains the independent reviews and measurements. The [calculator roadmap](CALCULATOR_PLAN.md)
-places String literals and numeric/IO operations in later slices.
+places String literals and numeric/IO operations in successive slices.
 
 ## Temporary target library and Int addition
 
@@ -932,16 +942,244 @@ produce diagnostics; there is no local-file or host-library fallback. Library
 modules use the ordinary module pipeline and preserve declaration identities.
 
 The [temporary library](standard_library_temp/README.md) retains commented
-upstream source with provenance. Only `add` is active. Its explicit body
-`builtin("int.add")` selects a closed compiler-known operation. Module functions
+upstream source with provenance. Its active declarations provide the calculator's
+ordinary unions and concrete numeric, conversion and IO functions.
+Their explicit builtin bodies select closed compiler-known operations. Module functions
 may declare these builtin bodies with the exact concrete runtime signature,
-without binding prefixes, generic parameters or tail annotations. Unknown
+without statement prefixes, generic parameters or tail annotations. Unknown
 labels and signature mismatches are errors. There is no arbitrary foreign
-symbol binding. The prelude remains the sole owner of `Int` and `String`.
+symbol binding. The prelude remains the sole owner of `Int`, `Float`, `String` and `Void`.
 The [increment design](INT_ADD_PLAN.md) records phase contracts; the
 [validation report](../benchmarks/results/blorp_2_int_add_2026-10-11.md) records
 strict tests, native fixtures, matched costs and the existing compiler's
 different trait-based `add` import surface.
+
+## Quoted UTF-8 String literals
+
+Literal construction uses the same immutable managed String representation as
+integer conversion:
+
+```blorp
+pure func greeting() -> String:
+    "hello"
+
+func main() -> Int:
+    greeting().length()
+```
+
+It exits 5. A literal may also appear directly in calls, bindings, supported
+union payloads and match arms. Copies, returns, reassignment and unused values
+follow the existing ownership rules. Each evaluated literal creates one mortal
+String allocation; a borrowed result acquires its own ownership obligation.
+
+Quoted contents accept valid UTF-8. `length` counts UTF-8 bytes, matching the
+existing library: `"é".length()` is 2 and `"🙂".length()` is 4. Composed and
+decomposed text is preserved without normalization. Source spans and diagnostic
+columns continue to count bytes; identifier and comment syntax retains its
+current ASCII restriction.
+
+The fixed escapes are `\n`, `\r`, `\t`, `\0`, `\\`, `\"`, `\'`, `\{` and
+`\}`. A Unicode escape `\u{X...}` has one to six hexadecimal digits and names a
+valid scalar from U+0000 through U+10FFFF, excluding U+D800 through U+DFFF.
+Embedded NUL counts toward length and is preserved. Raw ASCII control bytes,
+DEL, malformed UTF-8, invalid escapes and missing quotes are errors with help.
+Quoted literals stay on one source line. Interpolation, raw strings and
+multiline literals are deferred; write `"$\{"` to preserve literal `${` text.
+
+Builtin declaration labels retain their exact raw spelling; String escape
+decoding does not create aliases for closed runtime operations. The
+[increment design](STRINGS_PLAN.md) records construction and validation contracts.
+Emission uses flat static byte arrays scoped to their function and named from
+existing value identities. Backing bytes require no stack initialization and
+avoid C string-token length limits; the runtime copies them into an ordinary
+owned String on each evaluation.
+
+[Retained validation and costs](../benchmarks/results/blorp_2_strings_2026-10-11.md)
+cover the 15 new native fixtures, exact byte/lifetime tests, full suites and
+frozen existing-workload comparison. Long-literal probes also identify a
+bounded follow-up: the current host concat helper copies growing buffers in
+byte emission and repeated escape decoding.
+
+## Void, ordered statements and print
+
+The [Hello World fixture](test/e2e/fixtures/effects/hello.brp) imports concrete
+printing from the temporary target library:
+
+```blorp
+import:
+    io: print
+func main() -> Int:
+    print("Hello, World!")
+    0
+```
+
+Its stdout is exactly `Hello, World!\n`, stderr is empty and exit status is 0.
+`print(value: String) -> Void` writes every String byte and adds LF. UTF-8 and
+embedded NUL are preserved. It borrows its argument; an owned temporary is
+released after its last use. Print is impure, so a pure caller receives a
+purity error. Import it explicitly with the configured target-library root;
+it is not automatically available from the prelude.
+
+`Void` has one value, `void`, and requires no ownership. Helpers may take and
+return it; locals and generic union payloads may contain it. Existing Int-only
+record fields and direct union payload rules remain. Internally C uses a
+canonical zero `uint8_t` carrier for all Void values; this does not add another
+surface numeric type.
+
+Bindings, reassignment and bare Void expressions execute in source order. A
+non-final bare expression of another type is rejected with help to bind or
+return its result. Every block still needs a final expression. A Void-returning
+helper may finish with `void` or a call returning Void, while main still returns
+Int. Both function prefixes and match-arm blocks use the same statement rules.
+
+Managed prefixes before a tail match and managed temporaries in annotated tail
+loops retain their existing restrictions. Printing a literal before a tail
+match therefore remains rejected; printing inside its selected arm works. A
+Void-only helper call introduces no managed prefix.
+
+One ordered statement list carries evaluation order through parsing, checking
+and specialization. Discards create no synthetic binding; lowering retains
+their ordinary value definitions so unused Void results still execute calls.
+Emission selects a small print runtime fragment only when its typed operation
+is used. The [increment design](VOID_PRINT_PLAN.md) defines its contracts and
+acceptance cases; the
+[validation report](../benchmarks/results/blorp_2_void_print_2026-10-12.md)
+records phase tests, native output, ownership checks and matched costs.
+
+## Calculator input and results
+
+The [calculator completion plan](CALCULATOR_COMPLETION_PLAN.md) defines the
+numeric and input contracts. `Option[T]` and `Bool` come from ordinary
+target-library fixed unions; neither spelling receives a compiler-specific
+representation. Import their constructors explicitly:
+
+```blorp
+import:
+    option: Option(Some, None)
+    string: parse_int
+pure func number(text: String) -> Option[Int]:
+    parse_int(text)
+```
+
+`parse_int` borrows the complete counted String. It accepts an optional ASCII
+sign and one or more decimal digits, including leading zeros. It returns None
+for empty input, whitespace, embedded NUL, non-ASCII digits, suffixes or values
+outside Int64. No partial conversion or whitespace trimming is implicit.
+
+`io.read_line() -> Option[String]` is impure. It removes one LF and preserves
+all other bytes, including CR, NUL and non-UTF-8 bytes. An empty line is
+Some(""); EOF before any bytes is None. A final nonempty unterminated line is
+Some. Source literals require valid UTF-8, but runtime Strings remain counted
+byte sequences. Each successful read introduces one String owner; borrowing
+and exhaustive union destruction discharge its ownership normally.
+
+`string.equals(first, second) -> Bool` compares complete byte sequences.
+`int` exposes concrete `add`, `subtract`, `multiply`, `divide`, `remainder`
+and `to_string`. The first three wrap at Int64 bounds. Division and remainder
+return zero for a zero divisor; minimum Int divided by -1 wraps to minimum,
+with zero remainder. These operations avoid signed C overflow.
+
+The [addition calculator](test/e2e/fixtures/calculator/addition.brp) consumes two
+lines and prints their sum. The [integer calculator](test/e2e/fixtures/calculator/integer.brp)
+consumes an operation followed by two operand lines. Operations are exactly
+`add`, `subtract`, `multiply`, `divide` and `remainder`, selected through ordinary
+String equality and union matching. It prints the result followed by LF and
+exits zero; stderr is empty.
+
+Invalid operands print `invalid integer`, missing required lines print
+`missing input`, and unknown operations print `unknown operation`, followed by
+LF and exit status one. The operation is decoded before operands are read,
+and the first operand is validated before reading the second. Extra lines
+are ignored. CR is preserved, so CRLF numeric and operation input fails strict
+validation. The final operand may be unterminated.
+
+Runtime declarations explicitly bind result roles, for example
+`builtin("string.parse_int", Some, None)`. Checking accepts the exact nominal
+union, constructor payloads, arity and purity once. Specialization translates
+declaration identities to concrete constructor identities. Emission receives
+those roles directly; constructor names and ordering carry no hidden semantics.
+
+## Float64 calculator
+
+The temporary prelude owns `Float`, a binary64 unmanaged value. Decimal source
+literals require a decimal point with digits on both sides, an exponent, or
+both: `6.5`, `1e2`, `-0.0`, `2.5e-3`. Leading plus, leading-zero integer parts,
+`.5`, `1.`, hexadecimal literals and separators are rejected. Source literals
+must round to a finite Float; subnormals and underflow to signed zero are
+accepted. Integer literals retain Int type; there is no implicit Int-to-Float
+conversion. Integer UFCS such as `1.identity()` remains unambiguous.
+
+```blorp
+import:
+    float: multiply, to_string
+    io: print
+func main() -> Int:
+    print(to_string(multiply(6.5, 2.0)))
+    0
+```
+
+This prints `13\n`. The concrete Float module provides the same five arithmetic
+function names as Int, plus `to_string`. Imports choose declarations explicitly;
+there is no type-based overload resolution. A visible ordinary function or
+explicit import takes precedence over the temporary prelude's same-name
+function. Importing both Int and Float `to_string` into one scope is an error.
+Following the pilot's infallible arithmetic rule, Float division and remainder
+by either signed zero return positive zero. Other arithmetic can produce
+infinity or NaN. Remainder uses a quotient truncated toward zero. The existing
+host Float library currently uses IEEE division by zero; the pilot's explicit
+rule is recorded in its Float design rather than inherited from that library.
+
+`string.parse_float` borrows a complete String and returns ordinary
+`Option[Float]`. It accepts an optional ASCII sign, digits, an optional decimal
+point with following digits, and an optional signed exponent. Integer-only
+mantissas and leading zeros are allowed in runtime input. Whitespace, CR, NUL,
+suffixes, non-ASCII, hex, `nan`, `inf` and overflow are rejected. Underflow
+and subnormals use binary64 rounding and preserve the sign of zero.
+
+Formatting spells nonfinite values `nan`, `inf` and `-inf`, and preserves `-0`.
+Finite values use six significant decimal digits when those digits round-trip
+to the exact value, otherwise the first successful precision from seven
+through seventeen. Thus `0.1 + 0.2`, expressed through `add`, prints
+`0.30000000000000004`; this contract does not promise universally shortest
+decimal strings. Literal emission projects the parsed value as an exact C
+hexadecimal literal rather than retaining its source spelling.
+
+The [Float calculator](test/e2e/fixtures/calculator/float.brp) uses the integer
+calculator's three-line protocol and error precedence, with `invalid float`
+for rejected operands. Its native cases exercise precision, signed zero,
+subnormals, arithmetic overflow and invalid conversion.
+
+Build and run it from the repository root:
+
+```sh
+make -C blorp_2 test-compiler
+blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
+  blorp_2/src/prelude_temp.brp blorp_2/test/e2e/fixtures/calculator/float.brp \
+  blorp_2/build/calculator.c
+clang -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
+  blorp_2/build/calculator.c -lm -o blorp_2/build/calculator-program
+printf 'multiply\n6.5\n2\n' | blorp_2/build/calculator-program
+```
+
+The output is `13` followed by LF. Float programs link the C math library.
+
+The native model is binary64 with subnormals, ordinary arithmetic without fast
+math or contraction, C startup locale and default rounding. Generated code
+checks representation requirements; target programs cannot change locale or
+rounding in this subset. Float remains unmanaged in parameters, locals and
+generic union payloads. Direct union payload annotations and fixed-record
+fields retain their existing Int-only restriction.
+
+The [Float design](FLOAT_PLAN.md) records conversion and arithmetic details.
+The [calculator component tests](test/unit/test_option_contracts.brp),
+[input ownership tests](test/unit/test_option_ownership.brp),
+[Float projection tests](test/unit/test_float_literal.brp) and normal-main
+fixtures protect different boundaries independently.
+
+All nine calculator increments are complete. The
+[validation report](../benchmarks/results/blorp_2_calculator_2026-10-12.md)
+records 1,456 passing Blorp component checks, 40 native runtime cases, 299 native
+e2e executions, independent reviews and matched cost measurements.
 
 ## Architecture
 
@@ -959,7 +1197,7 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    their depth and the entire prefix span. Trivia is skipped over the original
    source bytes; no rewritten source or comment metadata crosses the boundary.
 2. Parsing produces function and union declarations, payload and parameter
-   annotations, written names, ordered binding syntax, expression syntax, and structured match bodies.
+   annotations, written names, ordered statement syntax, expression syntax, and structured match bodies.
    Match patterns preserve names and field syntax without deciding whether a
    bare name denotes a constructor or binding. Each expression has a literal,
    name, or direct application base with ordered recursive arguments, followed by
@@ -987,7 +1225,7 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    origin (including each parameter's explicit signature position) and declaration span; typed expression occurrences retain their own
    spans. Match checking resolves patterns and result types,
    and establishes usefulness and exhaustiveness before publishing checked arms.
-   Each arm publishes its ordered assignments and result. The current block's
+   Each arm publishes its ordered statements and result. The current block's
    first local ordinal establishes which declarations belong to that block;
    semantic origin alone does not determine scope membership.
    Constructors retain their owning union and variant identities. Checking
@@ -1018,7 +1256,7 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    unused ordinary functions and unions. Generic declarations emit only when
    requested by those roots or another instance. One local instance list reuses
    equal declaration/type keys and distinguishes nominal union arguments. It
-   translates complete signatures, bindings, values, calls, variants and matches
+   translates complete signatures, bindings, statements, values, calls, variants and matches
    without checking bodies or resolving names again, then seals a
    `SpecializedProgram`. Concrete types cannot contain type parameters; concrete
    function, union and variant identities have separate instance domains.
@@ -1042,7 +1280,7 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    map after evaluating the right-hand side. Every computed value retains its
    type and source span. Match-arm computations remain in their branches.
    Every arm starts with the enclosing binding map, lowers its capture and
-   binding sequence, and publishes a branch-local value block. Sibling arms
+   statement sequence, and publishes a branch-local value block. Sibling arms
    share only the function's value allocator, preserving distinct identities.
 6. Ownership insertion classifies each concrete value as having no ownership,
    being a managed String leaf, or containing owned inline union fields.
@@ -1101,14 +1339,15 @@ A structured body sum distinguishes that leaf from a match with ordered arms.
 Managed control-flow joins and general pass infrastructure remain future work.
 
 [`src/prelude_temp.brp`](src/prelude_temp.brp) is a target source input, not a
-host import. Its `type Int = builtin` and `type String = builtin` declarations
-establish the two builtin types. Its concrete functions use the closed runtime
+host import. Its `type Int = builtin`, `type Float = builtin`,
+`type String = builtin` and `type Void = builtin` declarations establish the
+four builtin type identities. Its concrete functions use the closed runtime
 keys `builtin("int.to_string")` and `builtin("string.length")`. Prelude parsing
 translates those keys to typed operations once; checking validates their exact
 purity, parameter and result contracts. Module source can declare closed builtin
 bodies with those same contracts, but cannot redeclare builtin types. Quoted
-builtin labels do not enable ordinary String
-literals. Prelude and program diagnostics retain separate source origins.
+builtin labels use raw token contents; ordinary String expressions decode
+escapes once in parsing. Prelude and program diagnostics retain separate source origins.
 The shell loads relative local modules and bare imports under an optional,
 explicit target-library root. Prelude input remains explicit.
 
