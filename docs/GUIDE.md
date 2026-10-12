@@ -13,8 +13,29 @@ explicit `./` or leading `../` paths; callees retain their defining module's
 scope, and only a root-local `main() -> Int` supplies the entrypoint. An explicit
 `--library-root` enables bare target-library imports; its temporary `int` module
 provides concrete wrapping `add`, also callable with UFCS. Closed builtin bodies
-require their exact runtime signature; arbitrary FFI and traits remain excluded. The pilot
-reference states its scope and restrictions.
+require their exact runtime signature. Quoted String literals accept valid UTF-8
+and Unicode scalar escapes; String length and source locations count bytes.
+Literal construction, copies and returns use ordinary managed ownership.
+The pilot also supports the single-value `Void` type and `void` literal,
+ordered binding and Void expression statements, and explicitly imported
+concrete `io.print(String) -> Void`. Print borrows its String, writes all bytes
+followed by LF, and is forbidden in pure callers. Every block retains an
+explicit final expression; main still returns Int. Selective union imports
+such as `option: Option(Some, None)` preserve ordinary nominal type and
+constructor identities. Concrete `string.parse_int` consumes complete ASCII
+decimal input within Int64 bounds; `io.read_line` returns an owned counted-byte
+String inside Option, removing LF and preserving all other bytes. String
+equality returns the library's ordinary Bool union. Concrete integer arithmetic
+supports wrapping add/subtract/multiply and safe divide/remainder. The
+[calculator fixtures](../blorp_2/test/e2e/fixtures/calculator/) exercise these
+through normal main entrypoints with exact stdin, stdout, stderr and exit status.
+Float64 literals and concrete arithmetic/formatting preserve typed numeric
+values through the pilot pipeline. Strict `string.parse_float` returns ordinary
+Option[Float]; source literals require finite values, while arithmetic may
+produce canonical infinity/NaN output. The pilot reference specifies decimal
+input, rounding, formatting, signed zero and native execution requirements.
+Interpolation and multiline literals remain deferred; arbitrary FFI and traits
+remain excluded. The pilot reference states its scope and restrictions.
 
 ---
 

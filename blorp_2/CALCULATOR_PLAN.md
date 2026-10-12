@@ -2,7 +2,17 @@
 
 Status: local imports, temporary target-library integration and concrete Int
 addition are implemented and validated under
-[their bounded design](INT_ADD_PLAN.md). String literals are next.
+[their bounded design](INT_ADD_PLAN.md). UTF-8 String literals complete step 3
+under [STRINGS_PLAN.md](STRINGS_PLAN.md), with
+[retained validation](../benchmarks/results/blorp_2_strings_2026-10-11.md).
+Step 4, Void, ordered statements and concrete print, is complete under
+[VOID_PRINT_PLAN.md](VOID_PRINT_PLAN.md), with
+[retained validation](../benchmarks/results/blorp_2_void_print_2026-10-12.md).
+Steps 5–9 are complete: ordinary library Option/Bool imports, strict numeric
+conversion, line input, integer and Float calculators. The
+[completion design](CALCULATOR_COMPLETION_PLAN.md) and
+[retained validation](../benchmarks/results/blorp_2_calculator_2026-10-12.md)
+cover granular tests, native outcomes, independent reviews and matched costs.
 
 Read [AGENTS.md](AGENTS.md) and the parent instructions. The supported language
 is described by [README.md](README.md) and [grammar.ebnf](grammar.ebnf); this plan
@@ -12,7 +22,7 @@ does not make its future features supported.
 | --- | --- | --- |
 | 1 | Local selective function imports | A root calls an imported pure helper and exits 42. |
 | 2 | Temporary target library and concrete Int addition | Import `add`; `add(20, 22)` exits 42. |
-| 3 | Quoted String literals | `length("hello")` exits 5; literal copies and returns preserve ownership. |
+| 3 | Quoted UTF-8 String literals | `length("hello")` exits 5; Unicode contents, literal copies and returns preserve ownership. |
 | 4 | Void, effect sequencing and concrete print | Print `Hello, World!` and exit 0; pure callers cannot print. |
 | 5 | Library Option and integer conversion | Match `parse_int("42")`; invalid and out-of-range inputs produce None. |
 | 6 | Line input and an integer addition calculator | Input `20\n22\n` produces `42\n`; invalid input and EOF have specified results. |

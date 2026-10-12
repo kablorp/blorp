@@ -1,10 +1,10 @@
 # Blorp Formal Grammar
 
 The separate [Blorp 2 pilot grammar](../blorp_2/grammar.ebnf) defines that
-compiler's restricted subset, including binding prefixes before a final
-expression or tail match, depth-three binding blocks inside match arms, and a
-separate explicit input-prelude grammar for builtin types and concrete runtime
-function declarations. Its ordinary call syntax also accepts self and mutual
+compiler's restricted subset, including ordered binding and expression
+statements before a final expression or tail match, depth-three statement
+blocks inside match arms, and a separate explicit input-prelude grammar for
+builtin types and concrete runtime function declarations. Its ordinary call syntax also accepts self and mutual
 recursion; checking separately rejects unbounded recursive type substitutions.
 Local selective function imports precede declarations and use explicit `./` or
 leading `../` paths without a `.brp` suffix. Bare paths resolve under an explicit
@@ -12,7 +12,22 @@ target-library root. Concrete module functions may use a sole closed builtin
 body, including `builtin("int.add")`, with an exact runtime signature.
 Imports preserve declaration identities;
 only the root module's local zero-argument `main` is the entrypoint. Ordinary
-program String literals and recursive data declarations remain unsupported.
+program String literals accept valid UTF-8 and the full language's fixed and
+Unicode scalar escapes, with single-line quoted syntax and byte-counted spans.
+The reserved literal `void` has the prelude-owned Void type; non-final bare
+expressions must return Void. The temporary target io module provides concrete
+impure String printing through the closed `string.print` builtin operation.
+A bare import selector selects a function; `Option(Some, None)` selects a
+fixed union and explicit constructors, and `Option()` selects its type alone.
+Closed runtime bodies can explicitly bind constructor roles, as in
+`builtin("string.parse_int", Some, None)`; semantic checking validates the
+ordinary union's exact result contract. There are no implicit constructor
+imports, aliases, wildcards or reexports in the pilot.
+Decimal Float tokens carry an optional minus, a decimal fraction or exponent,
+or both. Parsing checks canonical source spelling and finite binary64 range;
+`1.identity()` remains an Int receiver call. The restricted EBNF owns the exact
+Float syntax and runtime builtin label set. Interpolation, raw/multiline literals
+and recursive data declarations remain unsupported.
 The grammar below describes the full language.
 
 This document is the authoritative specification of Blorp's syntax. A parser

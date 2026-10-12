@@ -1,5 +1,6 @@
 -- String is currently one immutable managed leaf: its bytes are inline in the
 -- root allocation, so final release has no child ownership to traverse.
+-- Its validated length counts bytes, including embedded NUL and UTF-8 bytes.
 pure func string_runtime() -> String:
 	raw
 		|#include <inttypes.h>
@@ -14,17 +15,21 @@ pure func string_runtime() -> String:
 		|int64_t length;
 		|char bytes[];
 		|};
+		|struct blorp_string *blorp_string_from_bytes(const char *bytes,int64_t length) {
+		|struct blorp_string *result=malloc(sizeof *result+(size_t)length+1);
+		|if(result==NULL){abort();}
+		|atomic_init(&result->references,1);
+		|result->length=length;
+		|memcpy(result->bytes,bytes,(size_t)length);
+		|result->bytes[length]='\0';
+		|return result;
+		|}
 		|/* Int64 decimal needs at most one sign, 19 digits and a trailing NUL. */
 		|enum {BLORP_INT64_DECIMAL_CAPACITY=21};
 		|struct blorp_string *blorp_int_to_string(int64_t value) {
 		|char buffer[BLORP_INT64_DECIMAL_CAPACITY];
 		|const int length=snprintf(buffer,sizeof buffer,"%" PRId64,value);
-		|struct blorp_string *result=malloc(sizeof *result+(size_t)length+1);
-		|if(result==NULL){abort();}
-		|atomic_init(&result->references,1);
-		|result->length=(int64_t)length;
-		|memcpy(result->bytes,buffer,(size_t)length+1);
-		|return result;
+		|return blorp_string_from_bytes(buffer,(int64_t)length);
 		|}
 		|int64_t blorp_string_length(const struct blorp_string *value) {
 		|return value->length;
@@ -38,3 +43,76 @@ pure func string_runtime() -> String:
 		|}
 		|}
 		|
+
+
+-- Counted output preserves embedded NUL and UTF-8 bytes; the String is borrowed.
+pure func string_print_runtime() -> String:
+	raw
+		|uint8_t blorp_string_print(const struct blorp_string *value) {
+		|(void)fwrite(value->bytes,1,(size_t)value->length,stdout);
+		|(void)fputc('\n',stdout);
+		|return (uint8_t)0;
+		|}
+		|
+
+
+-- Strict counted ASCII decimal; the String is borrowed and failure allocates nothing.
+pure func string_parse_int_runtime() -> String:
+	raw
+		|uint8_t blorp_string_parse_int(const struct blorp_string *value,int64_t *result) {
+		|int64_t position=0;
+		|uint8_t negative=0;
+		|uint64_t magnitude=0;
+		|if(value->length==0){return (uint8_t)0;}
+		|if(value->bytes[0]=='-'||value->bytes[0]=='+'){
+		|negative=(uint8_t)(value->bytes[0]=='-');position=1;
+		|}
+		|if(position==value->length){return (uint8_t)0;}
+		|const uint64_t limit=(uint64_t)INT64_MAX+(uint64_t)negative;
+		|for(;position<value->length;position++){
+		|const unsigned char byte=(unsigned char)value->bytes[position];
+		|if(byte<'0'||byte>'9'){return (uint8_t)0;}
+		|const uint64_t digit=(uint64_t)(byte-'0');
+		|if(magnitude>(limit-digit)/UINT64_C(10)){return (uint8_t)0;}
+		|magnitude=magnitude*UINT64_C(10)+digit;
+		|}
+		|*result=negative?(magnitude==(uint64_t)INT64_MAX+UINT64_C(1)?INT64_MIN:-(int64_t)magnitude):(int64_t)magnitude;
+		|return (uint8_t)1;
+		|}
+		|
+
+
+-- Only the selected runtime fragment exposes stdin; the stream helper also lets
+-- the existing component suite verify bytes and ownership without redirecting IO.
+pure func io_read_line_runtime() -> String:
+	raw
+		|enum {BLORP_LINE_INITIAL_CAPACITY=64};
+		|static struct blorp_string *blorp_read_line_from(FILE *stream) {
+		|char *buffer=NULL;
+		|size_t length=0,capacity=0;
+		|int byte;
+		|while((byte=fgetc(stream))!=EOF&&byte!='\n'){
+		|if(length==capacity){
+		|const size_t next=capacity==0?BLORP_LINE_INITIAL_CAPACITY:capacity*2;
+		|if(next<=capacity||next>(size_t)INT64_MAX){free(buffer);abort();}
+		|char *grown=realloc(buffer,next);
+		|if(grown==NULL){free(buffer);abort();}
+		|buffer=grown;capacity=next;
+		|}
+		|buffer[length++]=(char)(unsigned char)byte;
+		|}
+		|if(byte==EOF&&(ferror(stream)||length==0)){free(buffer);return NULL;}
+		|struct blorp_string *result=blorp_string_from_bytes(buffer==NULL?"":buffer,(int64_t)length);
+		|free(buffer);
+		|return result;
+		|}
+		|struct blorp_string *blorp_io_read_line(void) {
+		|return blorp_read_line_from(stdin);
+		|}
+		|
+
+
+-- Counted equality borrows both inputs, including bytes following embedded NUL.
+pure func string_equals_runtime() -> String:
+	|static uint8_t blorp_string_equals(const struct blorp_string *left,const struct blorp_string *right){return left->length==right->length&&(left->length==0||memcmp(left->bytes,right->bytes,(size_t)left->length)==0);}
+	|

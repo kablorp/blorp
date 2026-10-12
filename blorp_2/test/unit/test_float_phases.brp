@@ -1,0 +1,737 @@
+import:
+	../../src/check as Check
+	../../src/check_render: render_failure
+	../../src/lex: lex
+	../../src/lower as Lower
+	../../src/parse: ParsedProgram, parse_prelude, parsed_contents
+	../../src/prelude as Prelude
+	../../src/source: PRELUDE_SOURCE, module_source, root_module_id, same_source
+	../../src/specialize as Concrete
+	../../src/syntax: Diagnostic, ExpressionBase(FloatExpression), ParsedBody(ParsedValueBody)
+	compilation: compile
+	float as FloatOps
+	input: parse, setup_diagnostic
+	module_input: parse_modules
+	test: TestSuite
+
+
+private pure func literal_source(literal: String) -> String:
+	header: String =
+		|pure func number() -> Float:
+		|
+	tail: String =
+		|func main() -> Int:
+		|    saved = number()
+		|    0
+		|
+	header + "    " + literal + "\n" + tail
+
+
+private pure func emits_literal(literal: String, expected: String) -> Bool:
+	match compile(literal_source(literal)):
+		Ok(output):
+			output.contains(expected) and output.contains("DBL_MANT_DIG==53")
+		Err(_):
+			False
+
+
+pure func test_fraction_reaches_exact_c_bits() -> Bool:
+	emits_literal("0.1", "0x1.999999999999ap-4")
+
+
+pure func test_negative_zero_reaches_signed_c_zero() -> Bool:
+	emits_literal("-0.0", "-0x0p+0")
+
+
+pure func test_subnormal_reaches_exact_c_exponent() -> Bool:
+	emits_literal("5e-324", "0x1.0000000000000p-1074")
+
+
+pure func test_inferred_generic_float_argument_and_return() -> Bool:
+	source: String =
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|pure func number() -> Float:
+		|    identity(1.25)
+		|func main() -> Int:
+		|    saved = number()
+		|    0
+		|
+
+	match compile(source):
+		Ok(output):
+			output.contains("double") and output.contains("0x1.4000000000000p+0")
+		Err(_):
+			False
+
+
+pure func test_empty_generic_float_payload_still_selects_binary64_guard() -> Bool:
+	source: String =
+		|fixed union Maybe[T]:
+		|    Empty
+		|    Full(T)
+		|pure func empty() -> Maybe[Float]:
+		|    Empty
+		|func main() -> Int:
+		|    saved = empty()
+		|    0
+		|
+
+	match compile(source):
+		Ok(output):
+			output.contains("double") and output.contains("DBL_HAS_SUBNORM==1")
+		Err(_):
+			False
+
+
+private pure func emits_binary_call(operation: String) -> Bool:
+	header: String =
+		|pure func calculate(first: Float, second: Float) -> Float:
+		|
+	tail: String =
+		|func main() -> Int:
+		|    saved = calculate(1.25, 2.0)
+		|    0
+		|
+	source = header + "    builtin(\"float." + operation + "\")\n" + tail
+
+	match compile(source):
+		Ok(output):
+			output.contains("=blorp_float_" + operation + "(")
+		Err(_):
+			False
+
+
+pure func test_add_uses_closed_float_contract() -> Bool:
+	emits_binary_call("add")
+
+
+pure func test_subtract_uses_closed_float_contract() -> Bool:
+	emits_binary_call("subtract")
+
+
+pure func test_multiply_uses_closed_float_contract() -> Bool:
+	emits_binary_call("multiply")
+
+
+pure func test_divide_uses_closed_float_contract() -> Bool:
+	emits_binary_call("divide")
+
+
+pure func test_remainder_uses_closed_float_contract() -> Bool:
+	emits_binary_call("remainder")
+
+
+pure func test_format_selects_fresh_string_runtime() -> Bool:
+	source: String =
+		|pure func format_number(value: Float) -> String:
+		|    builtin("float.to_string")
+		|func main() -> Int:
+		|    length(format_number(0.1))
+		|
+
+	match compile(source):
+		Ok(output):
+			(
+				output.contains("=blorp_float_to_string(")
+				and output.contains("BLORP_FLOAT_DEFAULT_PRECISION=6")
+				and output.contains("blorp_string_release")
+			)
+		Err(_):
+			False
+
+
+pure func test_parse_float_uses_ordinary_reversed_constructor_roles() -> Bool:
+	source: String =
+		|fixed union Maybe[T]:
+		|    Empty
+		|    Full(T)
+		|pure func parse_number(text: String) -> Maybe[Float]:
+		|    builtin("string.parse_float", Full, Empty)
+		|pure func consume(text: String) -> Int:
+		|    match parse_number(text):
+		|        Full(value): 0
+		|        Empty: 1
+		|func main() -> Int:
+		|    consume("6.5")
+		|
+
+	match compile(source):
+		Ok(output):
+			(
+				output.contains("double blorp_runtime_")
+				and output.contains("=blorp_string_parse_float(")
+			)
+		Err(_):
+			False
+
+
+pure func test_integer_only_program_has_no_float_runtime() -> Bool:
+	match compile("func main() -> Int:\n    42\n"):
+		Ok(output):
+			not output.contains("blorp_float_") and not output.contains("DBL_MANT_DIG")
+		Err(_):
+			False
+
+
+private pure func parsed_number() -> Result[ParsedProgram, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), literal_source("-0.0"))
+	parse(tokens)
+
+
+private pure func checked_number() -> Result[Check.CheckedProgram, Diagnostic]:
+	parsed ?= parsed_number()
+	Check
+		.check(parsed)
+		.map_err(setup_diagnostic)
+
+
+pure func test_parser_carries_native_signed_zero_once() -> Bool:
+	match parsed_number():
+		Err(_):
+			False
+		Ok(program):
+			match parsed_contents(program).functions:
+				[number, _]:
+					match number.body:
+						ParsedValueBody(value):
+							match value.base:
+								FloatExpression(number):
+									FloatOps.equals(number, 0.0) and FloatOps.less_than(
+										FloatOps.copysign(1.0, number),
+										0.0,
+									) and value.applications.is_empty()
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_checker_publishes_float_leaf_and_type() -> Bool:
+	match checked_number():
+		Err(_):
+			False
+		Ok(program):
+			match Check.checked_functions(program).functions:
+				[number, _]:
+					match number.body:
+						Check.CheckedValueBody(Check.ReturnExpression(value)):
+							match value.base:
+								Check.ReturnFloat(number):
+									(
+										Check.same_type(value.base_type, Check.FloatType)
+										and value.operations.is_empty()
+										and FloatOps.less_than(
+											FloatOps.copysign(1.0, number),
+											0.0,
+										)
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_specialization_preserves_unboxed_native_leaf() -> Bool:
+	match checked_number().and_then(pure func(program): Concrete.specialize(program)):
+		Err(_):
+			False
+		Ok(program):
+			match Concrete.specialized_contents(program).functions:
+				[number, _]:
+					match number.body:
+						Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+							match value.base:
+								Concrete.ReturnFloat(number):
+									(
+										Concrete.same_type(value.base_type, Concrete.FloatType)
+										and value.operations.is_empty()
+										and FloatOps.less_than(
+											FloatOps.copysign(1.0, number),
+											0.0,
+										)
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_lowering_publishes_one_float_definition() -> Bool:
+	match (
+		checked_number()
+			.and_then(pure func(program): Concrete.specialize(program))
+			.and_then(pure func(program): Lower.lower(program))
+	):
+		Err(_):
+			False
+		Ok(program):
+			match Lower.lowered_functions(program).functions:
+				[number, _]:
+					match (number.definitions, number.tail):
+						([definition], Lower.ExitValue(Lower.ReturnValue(returned))):
+							match definition.operation:
+								Lower.FloatValue(number):
+									(
+										Concrete.same_type(
+											definition.value_type,
+											Concrete.FloatType,
+										)
+										and Lower.value_number(
+											definition.id,
+										) == Lower.value_number(returned)
+										and FloatOps.less_than(
+											FloatOps.copysign(1.0, number),
+											0.0,
+										)
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_checker_never_coerces_int_into_float() -> Bool:
+	source: String =
+		|pure func number() -> Float:
+		|    1
+		|func main() -> Int:
+		|    0
+		|
+
+	match (
+		parse_modules(
+			[
+				{
+					source = source,
+					targets = []
+				},
+			],
+		)
+	):
+		Err(_):
+			False
+		Ok(program):
+			match Check.check(program):
+				Ok(_):
+					False
+				Err(failure):
+					error = Check.check_errors(failure).first
+					rendered = render_failure(failure).first
+
+					match error.kind:
+						Check.ExpressionTypeMismatch(mismatch):
+							(
+								Check.same_type(mismatch.expected, Check.FloatType)
+								and Check.same_type(mismatch.actual.value_type, Check.IntType)
+								and rendered.message == "expression does not match the expected type"
+								and rendered.help == "use an expression of type Float here"
+								and rendered.span.start == "pure func number() -> Float:\n    ".length()
+								and rendered.span.end == "pure func number() -> Float:\n    1".length()
+								and same_source(
+									rendered.span.source,
+									module_source(root_module_id()),
+								)
+							)
+						_:
+							False
+
+
+pure func test_arithmetic_only_source_selects_no_string_float_fragment() -> Bool:
+	source: String =
+		|pure func add(first: Float, second: Float) -> Float:
+		|    builtin("float.add")
+		|func main() -> Int:
+		|    saved = add(1.25, 2.0)
+		|    0
+		|
+
+	match compile(source):
+		Ok(output):
+			(
+				output.contains("DBL_MANT_DIG==53")
+				and not output.contains("BLORP_FLOAT_TEXT_CAPACITY")
+				and not output.contains("blorp_string_parse_float")
+			)
+		Err(_):
+			False
+
+
+pure func test_checked_parse_roles_use_float_payload_not_int() -> Bool:
+	source: String =
+		|fixed union Maybe[T]:
+		|    Empty
+		|    Full(T)
+		|pure func parse_number(text: String) -> Maybe[Float]:
+		|    builtin("string.parse_float", Full, Empty)
+		|func main() -> Int:
+		|    0
+		|
+
+	match (
+		parse_modules(
+			[
+				{
+					source = source,
+					targets = []
+				},
+			],
+		)
+			.and_then(pure func(program): Check
+					.check(program)
+					.map_err(setup_diagnostic))
+			.and_then(pure func(program): Concrete.specialize(program))
+	):
+		Err(_):
+			False
+		Ok(program):
+			contents = Concrete.specialized_contents(program)
+
+			match contents.functions:
+				[parser, _]:
+					match parser.body:
+						Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+							match value.base:
+								Concrete.ReturnCall(call, [_]):
+									match call.target:
+										Concrete.RuntimeFunction(Prelude.StringParseFloat(roles)):
+											owner = Concrete.variant_owner(roles.present)
+
+											match contents.unions.get(Concrete.union_number(owner)):
+												Some(layout):
+													match (layout.variants, layout.representation):
+														([None, Some(Concrete.FloatType)], Concrete.InlineUnmanaged):
+															(
+																Concrete.variant_number(
+																	roles.present,
+																) == 1
+																and Concrete.variant_number(
+																	roles.absent,
+																) == 0
+																and Concrete.union_number(
+																	owner,
+																) == Concrete.union_number(
+																	Concrete.variant_owner(
+																		roles.absent,
+																	),
+																)
+																and Concrete.same_type(
+																	value.base_type,
+																	Concrete.UnionType(owner),
+																)
+															)
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+private BASE_TYPES: String =
+	|type Int = builtin
+	|type String = builtin
+	|type Void = builtin
+	|
+
+
+private pure func prelude_rejects(
+	source: String,
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+) -> Bool:
+	match (
+		lex(PRELUDE_SOURCE, source)
+			.and_then(pure func(tokens): parse_prelude(tokens))
+			.and_then(pure func(parsed): Prelude.check_prelude(parsed))
+	):
+		Ok(_):
+			False
+		Err(error):
+			(
+				same_source(error.span.source, PRELUDE_SOURCE)
+				and error.span.start == start
+				and error.span.end == end
+				and error.message == message
+				and error.help == help
+				and error.note.is_none()
+			)
+
+
+pure func test_float_prelude_role_is_required_without_fallback() -> Bool:
+	prelude_rejects(
+		BASE_TYPES,
+		BASE_TYPES.length(),
+		BASE_TYPES.length(),
+		"missing Float builtin declaration",
+		"add type Float = builtin to the prelude",
+	)
+
+
+pure func test_duplicate_float_prelude_role_has_exact_occurrence() -> Bool:
+	prefix = BASE_TYPES + "type Float = builtin\n"
+	prelude_rejects(
+		prefix + "type Float = builtin\n",
+		prefix.length() + 5,
+		prefix.length() + 10,
+		"duplicate builtin type declaration",
+		"declare type Float = builtin exactly once",
+	)
+
+
+private fixed union RejectionKind:
+	MainType
+	RecordField
+	DirectPayload
+	RuntimeContract
+	RolePayload
+
+
+private pure func check_rejects(
+	source: String,
+	kind: RejectionKind,
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+) -> Bool:
+	match (
+		parse_modules(
+			[
+				{
+					source = source,
+					targets = []
+				},
+			],
+		)
+	):
+		Err(_):
+			False
+		Ok(program):
+			match Check.check(program):
+				Ok(_):
+					False
+				Err(failure):
+					errors = Check.check_errors(failure)
+					rendered = render_failure(failure)
+
+					kind_matches = match (errors.first.kind, kind):
+						(Check.MainReturnType(Check.FloatType), MainType):
+							True
+						(Check.UnsupportedRecordField(Check.FloatType), RecordField):
+							True
+						(Check.UnsupportedPayloadAnnotation(_, Check.IntegerPayload), DirectPayload):
+							True
+						(Check.BuiltinContractMismatch(_), RuntimeContract):
+							True
+						(Check.BuiltinRolePayload, RolePayload):
+							True
+						_:
+							False
+
+					(
+						kind_matches
+						and errors.remaining.is_empty()
+						and rendered.remaining.is_empty()
+						and same_source(rendered.first.span.source, module_source(root_module_id()))
+						and rendered.first.span.start == start
+						and rendered.first.span.end == end
+						and rendered.first.message == message
+						and rendered.first.help == help
+						and rendered.first.note.is_none()
+					)
+
+
+pure func test_float_main_is_rejected_before_body() -> Bool:
+	source: String =
+		|func main() -> Float:
+		|    0.0
+		|
+	check_rejects(
+		source,
+		MainType,
+		15,
+		20,
+		"main must return Int",
+		"declare main() -> Int: as the entrypoint",
+	)
+
+
+pure func test_direct_float_record_field_stays_out_of_scope() -> Bool:
+	source: String =
+		|fixed record Point { value: Float }
+		|func main() -> Int:
+		|    0
+		|
+	start = "fixed record Point { value: ".length()
+	check_rejects(
+		source,
+		RecordField,
+		start,
+		start + 5,
+		"fixed record fields must be Int",
+		"use Int fields; other record field types are not supported yet",
+	)
+
+
+pure func test_direct_float_union_payload_stays_out_of_scope() -> Bool:
+	source: String =
+		|fixed union Raw:
+		|    Full(Float)
+		|func main() -> Int:
+		|    0
+		|
+	start = "fixed union Raw:\n    Full(".length()
+	check_rejects(
+		source,
+		DirectPayload,
+		start,
+		start + 5,
+		"only Int payloads are supported",
+		"declare a variant with no fields or one Int field, written Variant(Int)",
+	)
+
+
+private pure func rejects_runtime(header: String, label: String, help: String) -> Bool:
+	tail: String =
+		|func main() -> Int:
+		|    0
+		|
+	prefix = header + "\n    builtin("
+	check_rejects(
+		prefix + label + ")\n" + tail,
+		RuntimeContract,
+		prefix.length(),
+		prefix.length() + label.length(),
+		"builtin declaration does not match its runtime contract",
+		help,
+	)
+
+
+pure func test_float_binary_contract_rejects_int_parameter() -> Bool:
+	rejects_runtime(
+		"pure func add(first: Int, second: Float) -> Float:",
+		"\"float.add\"",
+		"declare a pure function with two Float parameters returning Float",
+	)
+
+
+pure func test_float_formatter_contract_rejects_int_parameter() -> Bool:
+	rejects_runtime(
+		"pure func format_number(value: Int) -> String:",
+		"\"float.to_string\"",
+		"declare a pure function with one Float parameter returning String",
+	)
+
+
+pure func test_parse_float_checker_rejects_int_option_payload() -> Bool:
+	prefix: String =
+		|fixed union Maybe[T]:
+		|    Empty
+		|    Full(T)
+		|pure func parse_number(text: String) -> Maybe[Int]:
+		|
+	tail: String =
+		|func main() -> Int:
+		|    0
+		|
+	body = "    builtin(\"string.parse_float\", "
+	start = prefix.length() + body.length()
+	check_rejects(
+		prefix + body + "Full, Empty)\n" + tail,
+		RolePayload,
+		start,
+		start + 4,
+		"builtin constructor has the wrong payload",
+		"bind the required payload constructor first and the empty constructor second",
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 Float producer-to-consumer boundary",
+	tests = [
+		(
+			"Float prelude role required without fallback",
+			test_float_prelude_role_is_required_without_fallback,
+		),
+		(
+			"duplicate Float prelude has exact occurrence",
+			test_duplicate_float_prelude_role_has_exact_occurrence,
+		),
+		("Float main rejected before body", test_float_main_is_rejected_before_body),
+		(
+			"direct Float record field stays out of scope",
+			test_direct_float_record_field_stays_out_of_scope,
+		),
+		(
+			"direct Float union payload stays out of scope",
+			test_direct_float_union_payload_stays_out_of_scope,
+		),
+		("Float binary rejects Int parameter", test_float_binary_contract_rejects_int_parameter),
+		(
+			"Float formatter rejects Int parameter",
+			test_float_formatter_contract_rejects_int_parameter,
+		),
+		(
+			"parse Float checker rejects Int payload",
+			test_parse_float_checker_rejects_int_option_payload,
+		),
+		("parser carries native signed zero once", test_parser_carries_native_signed_zero_once),
+		("checker publishes Float leaf and type", test_checker_publishes_float_leaf_and_type),
+		(
+			"specialization preserves native Float leaf",
+			test_specialization_preserves_unboxed_native_leaf,
+		),
+		("lowering publishes one Float definition", test_lowering_publishes_one_float_definition),
+		("checker never coerces Int into Float", test_checker_never_coerces_int_into_float),
+		(
+			"arithmetic-only source has no String Float fragment",
+			test_arithmetic_only_source_selects_no_string_float_fragment,
+		),
+		(
+			"parse roles use concrete Float payload",
+			test_checked_parse_roles_use_float_payload_not_int,
+		),
+		("fraction reaches exact C bits", test_fraction_reaches_exact_c_bits),
+		("negative zero reaches signed C zero", test_negative_zero_reaches_signed_c_zero),
+		("subnormal reaches exact C exponent", test_subnormal_reaches_exact_c_exponent),
+		(
+			"inferred generic Float argument and return",
+			test_inferred_generic_float_argument_and_return,
+		),
+		(
+			"empty generic Float payload selects binary64 guard",
+			test_empty_generic_float_payload_still_selects_binary64_guard,
+		),
+		("add uses closed Float contract", test_add_uses_closed_float_contract),
+		("subtract uses closed Float contract", test_subtract_uses_closed_float_contract),
+		("multiply uses closed Float contract", test_multiply_uses_closed_float_contract),
+		("divide uses closed Float contract", test_divide_uses_closed_float_contract),
+		("remainder uses closed Float contract", test_remainder_uses_closed_float_contract),
+		("format selects fresh String runtime", test_format_selects_fresh_string_runtime),
+		(
+			"parse Float uses reversed ordinary roles",
+			test_parse_float_uses_ordinary_reversed_constructor_roles,
+		),
+		(
+			"integer-only program has no Float runtime",
+			test_integer_only_program_has_no_float_runtime,
+		),
+	]
+}

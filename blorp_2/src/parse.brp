@@ -1,24 +1,28 @@
 import:
 	./prelude: CheckedPrelude, prelude_names
+	float as FloatOps
 	int as IntOps
 	list: reverse
 	names: NameId, NameTable, intern_name, program_names, same_name_table
 	option: is_some, to_result
 	result: and_then
-	string: index_of
 	source: COMPILER_SOURCE, ModuleId, module_number, module_source, root_module_id, same_source
+	string as StringOps: index_of
 	syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
 		CallNotation(DirectCall, ReceiverCall),
 		DECIMAL_DIGITS,
 		Diagnostic,
-		ExpressionBase(IntegerExpression, NameExpression, DirectApplication, RecordExpression),
+		ExpressionBase(
+			VoidExpression, IntegerExpression, FloatExpression, StringExpression, NameExpression, DirectApplication,
+			RecordExpression,
+		),
 		FieldPattern(FieldName, FieldWildcard),
 		FunctionHeader,
 		LexedProgram,
 		ParsedBinding,
 		ParsedBody(ParsedBuiltinBody, ParsedValueBody, ParsedMatchBody),
-		ParsedBuiltinType(IntegerBuiltin, StringBuiltin),
+		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin),
 		ParsedFunction,
 		ParsedMatchArm,
 		ParsedParameter,
@@ -27,7 +31,14 @@ import:
 		ParsedRecord,
 		ParsedRecordField,
 		ParsedRuntimeFunction,
-		ParsedRuntimeOperation(IntegerAddBuiltin, IntegerToStringBuiltin, StringLengthBuiltin),
+		ParsedRuntimeOperation(
+			IntegerAddBuiltin, IntegerToStringBuiltin, StringLengthBuiltin, StringPrintBuiltin,
+			StringParseIntBuiltin, IoReadLineBuiltin, StringEqualsBuiltin, IntegerSubtractBuiltin,
+			IntegerMultiplyBuiltin, IntegerDivideBuiltin, IntegerRemainderBuiltin,
+			FloatAddBuiltin, FloatSubtractBuiltin, FloatMultiplyBuiltin, FloatDivideBuiltin,
+			FloatRemainderBuiltin, FloatToStringBuiltin, StringParseFloatBuiltin,
+		),
+		ParsedStatement(BindingStatement, ExpressionStatement),
 		ParsedUnion,
 		ParsedVariant,
 		PostfixOperation(ReceiverInvocation, FieldAccess),
@@ -36,14 +47,14 @@ import:
 		Span,
 		Symbol(
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
-			Colon, Newline, VarKeyword, Equals, LeftBracket, RightBracket, LeftBrace, RightBrace,
-			Comma, AtSign, Slash, Star,
+			Colon, Newline, VarKeyword, VoidKeyword, Equals, LeftBracket, RightBracket, LeftBrace,
+			RightBrace, Comma, AtSign, Slash, Star,
 		),
-		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, BuiltinLabel, Indentation),
+		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, Indentation),
 		TypeSyntax(AtomicType, AppliedType),
 		ValueExpression,
 		WrittenName,
-	text as Text
+	text as Text: concat
 
 
 private fixed record ParserState {
@@ -75,16 +86,21 @@ fixed record ModulePath {
 }
 
 
+fixed union ImportSelection:
+	FunctionSelection(WrittenName)
+	UnionSelection(WrittenName, List[WrittenName])
+
+
 fixed record ParsedImport {
 	path: ModulePath,
-	symbols: List[WrittenName],
+	symbols: List[ImportSelection],
 	span: Span
 }
 
 
 fixed record ModuleImport {
 	target: ModuleId,
-	symbols: List[WrittenName],
+	symbols: List[ImportSelection],
 	span: Span
 }
 
@@ -122,7 +138,6 @@ private fixed record ProgramBuilder {
 
 
 opaque type ParsedAssembly = ProgramBuilder
-
 
 -- Parsing carries its accepted prelude authority with its complete name table.
 opaque type ParsedProgram = ParsedContents
@@ -170,6 +185,12 @@ private pure func symbol_matches(actual: Symbol, expected: Symbol) -> Bool:
 		RightBrace:
 			match expected:
 				RightBrace:
+					True
+				_:
+					False
+		VoidKeyword:
+			match expected:
+				VoidKeyword:
 					True
 				_:
 					False
@@ -560,11 +581,293 @@ private pure func consume_arguments(start: ParserState) -> Result[ParsedArgument
 	})
 
 
+private STRING_ESCAPE_HELP: String = "use \\n, \\r, \\t, \\0, \\\\, \\\", \\', \\{, \\}, or a Unicode scalar escape such as \\u{E9}"
+
+private UNICODE_ESCAPE_HELP: String = "write \\u{H} with one to six hexadecimal digits for a scalar from 0 to 10FFFF, excluding D800 through DFFF"
+
+private HEX_DIGITS: String = "0123456789abcdef"
+
+private MAX_UNICODE_HEX_DIGITS: Int = 6
+
+private HEX_RADIX: Int = 16
+
+private UNICODE_MAX: Int = 1114111
+
+private SURROGATE_START: Int = 55296
+
+private SURROGATE_END: Int = 57343
+
+
+private fixed record DecodedEscape {
+	bytes: String,
+	next: Int
+}
+
+
+private pure func string_error(
+	span: Span,
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+) -> Diagnostic:
+	{
+		span = { span |
+			start = IntOps.add(
+				IntOps.add(span.start, 1),
+				start,
+			),
+			end = IntOps.add(
+				IntOps.add(span.start, 1),
+				end,
+			)
+		},
+		note = None,
+		message = message,
+		help = help
+	}
+
+
+-- The lexer has validated UTF-8; this only finds one scalar's byte extent for
+-- diagnostics, without decoding or validating its contents again.
+private pure func character_end(raw: String, start: Int) -> Int:
+	var end = IntOps.min(
+		IntOps.add(start, 1),
+		raw.length(),
+	)
+
+	while IntOps.less_than(end, raw.length()):
+		match StringOps.get(raw, end):
+			Some(character):
+				byte = to_int(character)
+
+				if IntOps.greater_than_or_equal(byte, 128) and IntOps.less_than_or_equal(byte, 191):
+					end = IntOps.add(end, 1)
+				else:
+					break
+			None:
+				break
+
+	end
+
+
+private pure func unicode_escape(
+	raw: String,
+	start: Int,
+	span: Span,
+) -> Result[DecodedEscape, Diagnostic]:
+	var cursor = IntOps.add(start, 2)
+
+	if not Text.equals(
+		raw.substring(cursor, 1),
+		"{",
+	):
+		Err(
+			string_error(
+				span,
+				start,
+				character_end(raw, cursor),
+				"invalid Unicode escape",
+				UNICODE_ESCAPE_HELP,
+			),
+		)
+	else:
+		cursor = IntOps.add(cursor, 1)
+		digits_start = cursor
+		var scalar = 0
+		var invalid = False
+
+		while IntOps.less_than(cursor, raw.length()) and not Text.equals(
+			raw.substring(cursor, 1),
+			"}",
+		):
+			if IntOps.greater_than_or_equal(
+				IntOps.subtract(cursor, digits_start),
+				MAX_UNICODE_HEX_DIGITS,
+			):
+				invalid = True
+				break
+
+			match HEX_DIGITS.index_of(StringOps.lower(raw.substring(cursor, 1))):
+				None:
+					invalid = True
+					break
+				Some(digit):
+					scalar = IntOps.add(
+						IntOps.multiply(scalar, HEX_RADIX),
+						digit,
+					)
+
+			cursor = IntOps.add(cursor, 1)
+
+		if (
+			invalid
+			or IntOps.equals(cursor, digits_start)
+			or not Text.equals(
+				raw.substring(cursor, 1),
+				"}",
+			)
+			or IntOps.greater_than(scalar, UNICODE_MAX)
+			or (
+				IntOps.greater_than_or_equal(scalar, SURROGATE_START)
+				and IntOps.less_than_or_equal(scalar, SURROGATE_END)
+			)
+		):
+			Err(
+				string_error(
+					span,
+					start,
+					character_end(raw, cursor),
+					"invalid Unicode escape",
+					UNICODE_ESCAPE_HELP,
+				),
+			)
+		else:
+			Ok({
+				bytes = StringOps.from_char(to_char(scalar)),
+				next = IntOps.add(cursor, 1),
+			})
+
+
+private pure func decode_escape(
+	raw: String,
+	start: Int,
+	span: Span,
+) -> Result[DecodedEscape, Diagnostic]:
+	code = raw.substring(
+		IntOps.add(start, 1),
+		1,
+	)
+
+	if Text.equals(code, "u"):
+		unicode_escape(raw, start, span)
+	else:
+		bytes: Option[String] = match code:
+			"n":
+				Some("\n")
+			"r":
+				Some("\r")
+			"t":
+				Some("\t")
+			"0":
+				Some("\0")
+			"\\":
+				Some("\\")
+			"\"":
+				Some("\"")
+			"'":
+				Some("'")
+			"{":
+				Some("{")
+			"}":
+				Some("}")
+			_:
+				None
+
+		match bytes:
+			Some(value):
+				Ok({
+					bytes = value,
+					next = IntOps.add(start, 2),
+				})
+			None:
+				Err(
+					string_error(
+						span,
+						start,
+						character_end(
+							raw,
+							IntOps.add(start, 1),
+						),
+						"unknown String escape",
+						STRING_ESCAPE_HELP,
+					),
+				)
+
+
+-- Copy raw runs intact. Only escape values are encoded; UTF-8 source bytes are
+-- never reconstructed as characters or normalized.
+private pure func string_value(raw: String, span: Span) -> Result[String, Diagnostic]:
+	var cursor = 0
+	var run_start = 0
+	var decoded = ""
+	var failure: Option[Diagnostic] = None
+
+	while IntOps.less_than(cursor, raw.length()):
+		if Text.equals(
+			raw.substring(cursor, 2),
+			"$".concat("{"),
+		):
+			failure = Some(
+				string_error(
+					span,
+					cursor,
+					IntOps.add(cursor, 2),
+					"String interpolation is not supported yet",
+					"escape the opening brace as \\{ for literal $".concat("{ text"),
+				),
+			)
+			break
+		else if Text.equals(
+			raw.substring(cursor, 1),
+			"\\",
+		):
+			match decode_escape(raw, cursor, span):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(escape):
+					decoded = decoded
+						.concat(raw.substring(run_start, IntOps.subtract(cursor, run_start)))
+						.concat(escape.bytes)
+					cursor = escape.next
+					run_start = cursor
+		else:
+			cursor = IntOps.add(cursor, 1)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(decoded.concat(raw.substring(run_start, IntOps.subtract(cursor, run_start))))
+
+
+private pure func float_value(spelling: String, span: Span) -> Result[Float, Diagnostic]:
+	start = if spelling.starts_with("-"):
+		1
+	else:
+		0
+	if Text.equals(spelling.substring(start, 1), "0") and DECIMAL_DIGITS.contains(spelling.substring(IntOps.add(start, 1), 1)):
+		Err(integer_error(span, "Float literals cannot have leading zeros", "write 0.5 or remove the leading zeros from the integer part"))
+	else:
+		match StringOps.parse_float(spelling):
+			Some(value):
+				if FloatOps.is_finite(value):
+					Ok(value)
+				else:
+					Err(integer_error(span, "Float literal is outside the finite Float64 range", "use a smaller magnitude or exponent; infinities are produced by arithmetic, not literals"))
+			None:
+				Err(integer_error(span, "invalid decimal Float literal", "write a decimal Float such as 1.0, 0.5 or 1e2"))
+
+
 private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagnostic]:
-	scope ?= if at_word(start, "import") and at_symbol(shifted(start, 1), Colon):
-		Err(expected(start, "imports belong at module scope", "move import: and its selected functions before the module's declarations at column 1"))
+	scope ?= if at_word(start, "import") and at_symbol(
+		shifted(start, 1),
+		Colon,
+	):
+		Err(
+			expected(
+				start,
+				"imports belong at module scope",
+				(
+					"move import: and its selected functions before the module's declarations at "
+					+ "column 1"
+				),
+			),
+		)
 	else:
 		Ok(void)
+
 	token ?= start.input.tokens
 		.get(start.position)
 		.to_result(
@@ -585,6 +888,24 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 					"put @tail_recursive before the optional pure and func keywords at column 1",
 				),
 			)
+		SymbolToken(VoidKeyword):
+			Ok({
+				body = {
+					base = VoidExpression,
+					base_span = token.span,
+					applications = [],
+					span = token.span
+				},
+				next = after_token,
+			})
+		SymbolToken(Dot):
+			end = match after_token.input.tokens.get(after_token.position):
+				Some(next): next.span.end
+				None: token.span.end
+			Err(integer_error({ token.span | end = end }, "Float literals need digits before the decimal point", "write 0.5; a source Float literal needs an integer part"))
+		FloatLiteral(spelling):
+			value ?= float_value(spelling, token.span)
+			Ok({ body = { base = FloatExpression(value), base_span = token.span, applications = [], span = token.span }, next = after_token })
 		IntegerLiteral(spelling):
 			integer ?= integer_value(spelling, token.span)
 			Ok({
@@ -638,14 +959,17 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 				})
 		SymbolToken(LeftBrace):
 			consume_record_literal(after_token, token.span)
-		BuiltinLabel(_):
-			Err(
-				expected(
-					start,
-					"quoted builtin labels are only allowed in builtin bodies",
-					"call a String-producing prelude function; String literals are not supported yet",
-				),
-			)
+		QuotedString(raw):
+			bytes ?= string_value(raw, token.span)
+			Ok({
+				body = {
+					base = StringExpression(bytes),
+					base_span = token.span,
+					applications = [],
+					span = token.span
+				},
+				next = after_token,
+			})
 		_:
 			Err(
 				expected(
@@ -661,6 +985,21 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 	var failure: Option[Diagnostic] = None
 
 	while at_symbol(state, Dot):
+		numeric = match token.kind:
+			IntegerLiteral(_) | FloatLiteral(_): True
+			_: False
+		missing_fraction = match state.input.tokens.get(IntOps.add(state.position, 1)):
+			Some(next):
+				match next.kind:
+					SymbolToken(Newline) | SymbolToken(RightParen) | SymbolToken(Comma) | SymbolToken(RightBrace) | SymbolToken(RightBracket): True
+					_: False
+			None: True
+		if numeric and missing_fraction:
+			end = match state.input.tokens.get(state.position):
+				Some(dot): dot.span.end
+				None: token.span.end
+			failure = Some(integer_error({ token.span | end = end }, "Float literals need digits after the decimal point", "write 1.0; otherwise use a UFCS function call after '.'"))
+			break
 		result = consume_postfix({ state | position = IntOps.add(state.position, 1) })
 
 		match result:
@@ -1013,43 +1352,58 @@ private pure func consume_arm(state: ParserState) -> Result[ArmResult, Diagnosti
 		"write Pattern: expression, or put the arm body on the next indented line",
 	)
 
-	prefix ?= if at_symbol(colon, Newline):
-		consume_binding_indent(
+	block ?= if at_symbol(colon, Newline):
+		consume_block_indent(
 			{ colon | position = IntOps.add(colon.position, 1) },
-			ArmBindings,
+			ArmBlock,
 		).and_then(
 			pure func(
 				indented: ParserState,
-			) -> Result[BindingPrefix, Diagnostic]: consume_bindings(indented, ArmBindings),
+			) -> Result[StatementBlock, Diagnostic]: consume_block(indented, ArmBlock),
 		)
 	else:
-		Ok({
-			bindings = [],
-			next = colon,
-		})
+		consume_value(colon).map(pure func(value: ParsedValue) -> StatementBlock: {
+				statements = [],
+				body = ParsedValueBody(value.body),
+				next = value.next
+			})
 
-	body ?= consume_value(prefix.next)
+	value ?= match block.body:
+		ParsedValueBody(value):
+			Ok(value)
+		_:
+			Err(
+				expected(
+					colon,
+					"expected a match arm result",
+					"finish the arm with a value expression",
+				),
+			)
+
 	Ok({
 		arm = {
 			pattern = pattern.pattern,
-			bindings = prefix.bindings,
-			body = body.body,
+			statements = block.statements,
+			body = value,
 			span = {
 				source = pattern.span.source,
 				start = pattern.span.start,
-				end = body.body.span.end
+				end = value.span.end
 			}
 		},
-		next = body.next,
+		next = block.next,
 	})
 
 
 private pure func at_builtin_body(state: ParserState) -> Bool:
-	if at_word(state, "builtin") and at_symbol({ state | position = IntOps.add(state.position, 1) }, LeftParen):
+	if (
+		at_word(state, "builtin")
+		and at_symbol({ state | position = IntOps.add(state.position, 1) }, LeftParen)
+	):
 		match state.input.tokens.get(IntOps.add(state.position, 2)):
 			Some(token):
 				match token.kind:
-					BuiltinLabel(_): True
+					QuotedString(_): True
 					_: False
 			None: False
 	else:
@@ -1069,30 +1423,31 @@ private pure func consume_function_body(state: ParserState) -> Result[BodyResult
 		})
 
 
-private fixed record BindingPrefix {
-	bindings: List[ParsedBinding],
+private fixed record StatementBlock {
+	statements: List[ParsedStatement],
+	body: ParsedBody,
 	next: ParserState
 }
 
 
-private fixed union BindingBlock:
-	FunctionBindings
-	ArmBindings
+private fixed union BlockScope:
+	FunctionBlock
+	ArmBlock
 
 
-private pure func consume_binding_indent(
+private pure func consume_block_indent(
 	state: ParserState,
-	block: BindingBlock,
+	block: BlockScope,
 ) -> Result[ParserState, Diagnostic]:
 	match block:
-		FunctionBindings:
+		FunctionBlock:
 			consume_indent(
 				state,
 				1,
 				"expected a final expression after the bindings",
 				"finish the function with a value expression or tail match indented one level",
 			)
-		ArmBindings:
+		ArmBlock:
 			consume_indent(
 				state,
 				3,
@@ -1124,7 +1479,7 @@ private fixed record BindingLine {
 
 private pure func consume_binding(
 	state: ParserState,
-	block: BindingBlock,
+	block: BlockScope,
 ) -> Result[BindingLine, Diagnostic]:
 	mutability = if at_symbol(state, VarKeyword):
 		MutableBinding
@@ -1160,19 +1515,19 @@ private pure func consume_binding(
 		consume_value(equals)
 
 	message = match block:
-		FunctionBindings:
+		FunctionBlock:
 			"expected a final expression after the bindings"
-		ArmBindings:
+		ArmBlock:
 			"expected a final expression after the arm bindings"
 
 	help = match block:
-		FunctionBindings:
+		FunctionBlock:
 			"finish the function with a value expression or tail match"
-		ArmBindings:
+		ArmBlock:
 			"finish the arm with a value expression on its own indented line"
 
 	newline ?= consume_symbol(initializer.next, Newline, message, help)
-	next ?= consume_binding_indent(newline, block)
+	next ?= consume_block_indent(newline, block)
 	Ok({
 		binding = {
 			name = name.name,
@@ -1183,31 +1538,108 @@ private pure func consume_binding(
 	})
 
 
-private pure func consume_bindings(
+-- Code-line indentation decides whether an expression is final. The lexer has
+-- already removed blank/comment-only lines, so those never alter sequencing.
+private pure func following_statement(state: ParserState, block: BlockScope) -> Bool:
+	if at_symbol(state, Newline):
+		match state.input.tokens.get(IntOps.add(state.position, 1)):
+			Some(token):
+				match token.kind:
+					Indentation(depth):
+						IntOps.equals(
+							depth,
+							match block:
+								FunctionBlock:
+									1
+								ArmBlock:
+									3
+						)
+					_:
+						False
+			None:
+				False
+	else:
+		False
+
+
+private pure func consume_block(
 	start: ParserState,
-	block: BindingBlock,
-) -> Result[BindingPrefix, Diagnostic]:
+	block: BlockScope,
+) -> Result[StatementBlock, Diagnostic]:
 	var state = start
-	var bindings: List[ParsedBinding] = []
-	var failure: Option[Diagnostic] = None
+	var statements: List[ParsedStatement] = []
+	var result: Option[Result[StatementBlock, Diagnostic]] = None
 
-	while at_binding(state):
-		match consume_binding(state, block):
-			Err(error):
-				failure = Some(error)
-				break
-			Ok(line):
-				bindings = bindings.append(line.binding)
-				state = line.next
+	while True:
+		if at_binding(state):
+			match consume_binding(state, block):
+				Err(error):
+					result = Some(Err(error))
+					break
+				Ok(line):
+					statements = statements.append(BindingStatement(line.binding))
+					state = line.next
+		else:
+			parsed = match block:
+				FunctionBlock:
+					consume_function_body(state)
+				ArmBlock:
+					consume_value(state).map(pure func(value: ParsedValue) -> BodyResult: {
+							body = ParsedValueBody(value.body),
+							next = value.next
+						})
 
-	match failure:
-		Some(error):
-			Err(error)
+			match parsed:
+				Err(error):
+					result = Some(Err(error))
+					break
+				Ok(line):
+					match line.body:
+						ParsedValueBody(value):
+							if following_statement(line.next, block):
+								statements = statements.append(ExpressionStatement(value))
+								-- following_statement validated the Newline + Indentation token pair.
+								state = shifted(line.next, 2)
+								continue
+						ParsedBuiltinBody(_, at):
+							if (
+								IntOps.greater_than(statements.length(), 0)
+								or following_statement(line.next, block)
+							):
+								result = Some(
+									Err(
+										expected(
+											state,
+											"builtin must be the entire function body",
+											(
+												"use builtin as the entire function body; put other work in an ordinary wrapper "
+												+ "function"
+											),
+										),
+									),
+								)
+								break
+						ParsedMatchBody(_):
+							void
+
+					result = Some(Ok({
+						statements = statements,
+						body = line.body,
+						next = line.next,
+					}))
+					break
+
+	match result:
+		Some(value):
+			value
 		None:
-			Ok({
-				bindings = bindings,
-				next = state,
-			})
+			Err(
+				expected(
+					state,
+					"expected a final expression",
+					"finish the block with a value expression",
+				),
+			)
 
 
 private fixed record ParsedTypeParameters {
@@ -1488,23 +1920,13 @@ private pure func consume_annotation(start: ParserState) -> Result[ParsedAnnotat
 					})
 
 
-private pure func consume_function(start: ParserState, module: ModuleId) -> Result[FunctionResult, Diagnostic]:
+private pure func consume_function(
+	start: ParserState,
+	module: ModuleId,
+) -> Result[FunctionResult, Diagnostic]:
 	annotation ?= consume_annotation(start)
 	header ?= consume_header(annotation.next)
-	prefix ?= consume_bindings(header.next, FunctionBindings)
-	body ?= consume_function_body(prefix.next)
-	sole_body ?= match body.body:
-		ParsedBuiltinBody(_, _):
-			match prefix.bindings.get(0):
-				Some(binding):
-					Err({
-						span = binding.name.span,
-						note = None,
-						message = "builtin bodies cannot have local bindings",
-						help = "use builtin as the entire function body; put other work in an ordinary wrapper function"
-					})
-				None: Ok(void)
-		_: Ok(void)
+	body ?= consume_block(header.next, FunctionBlock)
 	Ok({
 		function = {
 			module = module,
@@ -1514,7 +1936,7 @@ private pure func consume_function(start: ParserState, module: ModuleId) -> Resu
 			type_parameters = header.header.type_parameters,
 			parameters = header.header.parameters,
 			return_type = header.header.return_type,
-			bindings = prefix.bindings,
+			statements = body.statements,
 			body = body.body
 		},
 		next = body.next,
@@ -1684,14 +2106,19 @@ private pure func consume_builtin_type(start: ParserState) -> Result[BuiltinType
 	after_type ?= consume_word(start, "type")
 	integer = at_word(after_type, "Int")
 
-	known ?= if integer or at_word(after_type, "String"):
+	known ?= if (
+		integer
+		or at_word(after_type, "Float")
+		or at_word(after_type, "String")
+		or at_word(after_type, "Void")
+	):
 		Ok(void)
 	else:
 		Err(
 			expected(
 				after_type,
 				"unknown builtin type",
-				"declare type Int = builtin or type String = builtin",
+				"declare type Int = builtin, type Float = builtin, type String = builtin or type Void = builtin",
 			),
 		)
 
@@ -1700,14 +2127,19 @@ private pure func consume_builtin_type(start: ParserState) -> Result[BuiltinType
 		name.next,
 		Equals,
 		"expected '=' after the builtin type name",
-		"write type Int = builtin or type String = builtin",
+		"write type Int = builtin, type Float = builtin, type String = builtin or type Void = builtin",
 	)
 	end ?= consume_word(equals, "builtin")
 
 	declaration = if integer:
 		IntegerBuiltin(name.name)
+	else if at_word(after_type, "Float"):
+		FloatBuiltin(name.name)
 	else:
-		StringBuiltin(name.name)
+		if at_word(after_type, "Void"):
+			VoidBuiltin(name.name)
+		else:
+			StringBuiltin(name.name)
 
 	Ok({
 		declaration = declaration,
@@ -1726,6 +2158,7 @@ private pure func consume_runtime_function(
 ) -> Result[RuntimeFunctionResult, Diagnostic]:
 	header ?= consume_header(start)
 	body ?= consume_builtin_body(header.next)
+
 	match body.body:
 		ParsedBuiltinBody(operation, span):
 			Ok({
@@ -1733,7 +2166,68 @@ private pure func consume_runtime_function(
 				next = body.next,
 			})
 		_:
-			Err(expected(header.next, "expected a builtin body", "use builtin with one quoted operation label"))
+			Err(
+				expected(
+					header.next,
+					"expected a builtin body",
+					"use builtin with one quoted operation label",
+				),
+			)
+
+
+private fixed union UnionBuiltinKind:
+	IntegerParseRoles
+	FloatParseRoles
+	LineReadRoles
+	StringEqualityRoles
+
+
+private fixed record BuiltinOperationResult {
+	operation: ParsedRuntimeOperation,
+	next: ParserState
+}
+
+
+private BUILTIN_LABEL_HELP: String = (
+	"use int.add, int.subtract, int.multiply, int.divide, int.remainder, int."
+	+ "to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals or io."
+	+ "read_line"
+)
+
+
+private pure func consume_builtin_roles(
+	state: ParserState,
+	kind: UnionBuiltinKind,
+) -> Result[BuiltinOperationResult, Diagnostic]:
+	present_start ?= consume_symbol(
+		state,
+		Comma,
+		"expected constructor roles after the builtin label",
+		"bind the two result constructors after the quoted label",
+	)
+	present ?= consume_name(present_start, "expected the first result constructor")
+	absent_start ?= consume_symbol(
+		present.next,
+		Comma,
+		"expected ',' between constructor roles",
+		"separate the two result constructors with a comma",
+	)
+	absent ?= consume_name(absent_start, "expected the second result constructor")
+
+	operation = match kind:
+		FloatParseRoles:
+			StringParseFloatBuiltin(present.name, absent.name)
+		IntegerParseRoles:
+			StringParseIntBuiltin(present.name, absent.name)
+		LineReadRoles:
+			IoReadLineBuiltin(present.name, absent.name)
+		StringEqualityRoles:
+			StringEqualsBuiltin(present.name, absent.name)
+
+	Ok({
+		operation = operation,
+		next = absent.next,
+	})
 
 
 private pure func consume_builtin_body(start: ParserState) -> Result[BodyResult, Diagnostic]:
@@ -1742,7 +2236,7 @@ private pure func consume_builtin_body(start: ParserState) -> Result[BodyResult,
 		after_builtin,
 		LeftParen,
 		"expected '(' after builtin",
-		"write builtin(\"int.add\"), builtin(\"int.to_string\") or builtin(\"string.length\")",
+		"write builtin(\"int.add\") or bind union constructors as builtin(\"string.parse_int\", Some, None)",
 	)
 	label ?= opened.input.tokens
 		.get(opened.position)
@@ -1750,43 +2244,85 @@ private pure func consume_builtin_body(start: ParserState) -> Result[BodyResult,
 			expected(
 				opened,
 				"expected a builtin label",
-				"use \"int.add\", \"int.to_string\" or \"string.length\"",
+				"use a quoted closed operation label",
 			),
 		)
 
-	operation ?= match label.kind:
-		BuiltinLabel(spelling):
-			if Text.equals(spelling, "int.add"):
-				Ok(IntegerAddBuiltin)
-			else if Text.equals(spelling, "int.to_string"):
-				Ok(IntegerToStringBuiltin)
-			else if Text.equals(spelling, "string.length"):
-				Ok(StringLengthBuiltin)
-			else:
-				Err(
-					expected(
-						opened,
-						"unknown builtin operation",
-						"use \"int.add\", \"int.to_string\" or \"string.length\"",
-					),
+	operation_result: Result[BuiltinOperationResult, Diagnostic] = match label.kind:
+		QuotedString(spelling):
+			if Text.equals(spelling, "string.parse_int"):
+				consume_builtin_roles(
+					shifted(opened, 1),
+					IntegerParseRoles,
 				)
-		_:
-			Err(
-				expected(
-					opened,
-					"expected a quoted builtin label",
-					"use \"int.add\", \"int.to_string\" or \"string.length\"",
-				),
-			)
+			else if Text.equals(spelling, "string.parse_float"):
+				consume_builtin_roles(shifted(opened, 1), FloatParseRoles)
+			else if Text.equals(spelling, "io.read_line"):
+				consume_builtin_roles(
+					shifted(opened, 1),
+					LineReadRoles,
+				)
+			else if Text.equals(spelling, "string.equals"):
+				consume_builtin_roles(
+					shifted(opened, 1),
+					StringEqualityRoles,
+				)
+			else:
+				primitive_result: Result[ParsedRuntimeOperation, Diagnostic] = if Text.equals(
+					spelling,
+					"string.print",
+				):
+					Ok(StringPrintBuiltin)
+				else if Text.equals(spelling, "int.add"):
+					Ok(IntegerAddBuiltin)
+				else if Text.equals(spelling, "int.subtract"):
+					Ok(IntegerSubtractBuiltin)
+				else if Text.equals(spelling, "int.multiply"):
+					Ok(IntegerMultiplyBuiltin)
+				else if Text.equals(spelling, "int.divide"):
+					Ok(IntegerDivideBuiltin)
+				else if Text.equals(spelling, "int.remainder"):
+					Ok(IntegerRemainderBuiltin)
+				else if Text.equals(spelling, "int.to_string"):
+					Ok(IntegerToStringBuiltin)
+				else if Text.equals(spelling, "float.add"):
+					Ok(FloatAddBuiltin)
+				else if Text.equals(spelling, "float.subtract"):
+					Ok(FloatSubtractBuiltin)
+				else if Text.equals(spelling, "float.multiply"):
+					Ok(FloatMultiplyBuiltin)
+				else if Text.equals(spelling, "float.divide"):
+					Ok(FloatDivideBuiltin)
+				else if Text.equals(spelling, "float.remainder"):
+					Ok(FloatRemainderBuiltin)
+				else if Text.equals(spelling, "float.to_string"):
+					Ok(FloatToStringBuiltin)
+				else if Text.equals(spelling, "string.length"):
+					Ok(StringLengthBuiltin)
+				else:
+					Err(expected(opened, "unknown builtin operation", BUILTIN_LABEL_HELP))
 
+				primitive ?= primitive_result
+				parsed: BuiltinOperationResult = {
+					operation = primitive,
+					next = shifted(opened, 1)
+				}
+				Ok(parsed)
+		_:
+			Err(expected(opened, "expected a quoted builtin label", BUILTIN_LABEL_HELP))
+
+	operation ?= operation_result
 	closed ?= consume_symbol(
-		{ opened | position = IntOps.add(opened.position, 1) },
+		operation.next,
 		RightParen,
 		"expected ')' after the builtin label",
-		"give builtin exactly one quoted operation label",
+		(
+			"give primitive builtins one quoted label, or bind both constructors of a union "
+			+ "result"
+		),
 	)
 	Ok({
-		body = ParsedBuiltinBody(operation, label.span),
+		body = ParsedBuiltinBody(operation.operation, label.span),
 		next = closed,
 	})
 
@@ -1836,8 +2372,8 @@ pure func parse_prelude(input: LexedProgram) -> Result[ParsedPrelude, Diagnostic
 					state,
 					"expected a builtin prelude declaration",
 					Text.concat(
-						"declare type Int = builtin, type String = builtin, ",
-						"or a pure function with a builtin(...) body",
+						"declare type Int = builtin, type Float = builtin, type String = builtin, type Void = builtin, ",
+						"or a function with a builtin(...) body",
 					),
 				),
 			)
@@ -1897,28 +2433,38 @@ private pure func parent_prefix(state: ParserState) -> Bool:
 private pure func consume_module_path(start: ParserState) -> Result[ParsedPath, Diagnostic]:
 	var state = start
 	var origin: ImportOrigin = LibraryImport
-	if at_symbol(state, Dot) and at_symbol(shifted(state, 1), Slash):
+
+	if at_symbol(state, Dot) and at_symbol(
+		shifted(state, 1),
+		Slash,
+	):
 		origin = RelativeImport(0)
 		state = shifted(state, 2)
 	else if parent_prefix(state):
 		var parents: Int = 0
+
 		while parent_prefix(state):
 			parents = IntOps.add(parents, 1)
 			state = shifted(state, 3)
+
 		origin = RelativeImport(parents)
+
 	prefix ?= if at_symbol(start, Slash):
 		Err(expected(start, "absolute import paths are not supported", "write int: add for the target library or ./helper: answer for a local module"))
 	else if IntOps.equals(state.position, start.position) and at_symbol(start, Dot):
 		Err(expected(start, "expected './' or '../' before a relative import path", "write ./helper: answer or ../shared/helper: answer"))
 	else:
 		Ok(void)
+
 	var parts: List[NameId] = []
 	var failure: Option[Diagnostic] = None
 	var last = parser_span(state)
+
 	while True:
 		if at_symbol(state, Dot):
 			failure = Some(expected(state, "'.' and '..' may only begin an import path", "write ../shared/helper or ./shared/helper without interior dot segments"))
 			break
+
 		match consume_name(state, "expected a module name in the import path"):
 			Err(error):
 				failure = Some(error)
@@ -1927,17 +2473,22 @@ private pure func consume_module_path(start: ParserState) -> Result[ParsedPath, 
 				parts = parts.append(part.name.id)
 				last = part.name.span
 				state = part.next
+
 		if not at_symbol(state, Slash):
 			break
+
 		state = shifted(state, 1)
+
 	valid ?= match failure:
 		Some(error):
 			Err(error)
 		None:
 			Ok(void)
+
 	-- The lexer skips spaces. Path characters must still be adjacent bytes.
 	var position = start.position
 	var previous_end = parser_span(start).start
+
 	while IntOps.less_than(position, state.position):
 		match state.input.tokens.get(position):
 			None:
@@ -1947,13 +2498,17 @@ private pure func consume_module_path(start: ParserState) -> Result[ParsedPath, 
 				if not IntOps.equals(token.span.start, previous_end):
 					failure = Some(expected({ state | position = position }, "import paths cannot contain spaces", "write adjacent path characters, such as ./helper or ../shared/helper"))
 					break
+
 				previous_end = token.span.end
+
 		position = IntOps.add(position, 1)
+
 	spaced ?= match failure:
 		Some(error):
 			Err(error)
 		None:
 			Ok(void)
+
 	first = parser_span(start)
 	Ok({
 		path = { origin = origin, parts = parts },
@@ -1962,17 +2517,76 @@ private pure func consume_module_path(start: ParserState) -> Result[ParsedPath, 
 	})
 
 
-private pure func consume_import_symbol(state: ParserState) -> Result[ParsedName, Diagnostic]:
+private fixed record ImportSelectionResult {
+	selection: ImportSelection,
+	span: Span,
+	next: ParserState
+}
+
+
+private pure func consume_import_symbol(
+	state: ParserState,
+) -> Result[ImportSelectionResult, Diagnostic]:
 	if at_symbol(state, Star):
 		Err(expected(state, "wildcard imports are not supported", "list the functions you need, such as ./helper: answer"))
 	else:
-		name ?= consume_name(state, "expected an imported function name")
+		name ?= consume_name(state, "expected an imported function or union name")
+
 		if at_word(name.next, "as"):
 			Err(expected(name.next, "import aliases are not supported yet", "select the function by its declared name, such as ./helper: answer"))
 		else if at_symbol(name.next, LeftParen):
-			Err(expected(name.next, "constructor imports are not supported yet", "select function names only, such as ./helper: answer"))
+			var next = shifted(name.next, 1)
+			var variants: List[WrittenName] = []
+			var failure: Option[Diagnostic] = None
+
+			while not at_symbol(next, RightParen):
+				match consume_name(next, "expected an imported constructor name"):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(variant):
+						variants = variants.append(variant.name)
+						next = variant.next
+
+				if not at_symbol(next, Comma):
+					break
+
+				next = shifted(next, 1)
+
+				if at_symbol(next, RightParen):
+					failure = Some(
+						expected(
+							next,
+							"expected a constructor after ','",
+							"omit the trailing comma in Option(Some, None)",
+						),
+					)
+					break
+
+			valid ?= match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(void)
+
+			end = parser_span(next)
+			closed ?= consume_symbol(
+				next,
+				RightParen,
+				"expected ')' after selected constructors",
+				"write Option(Some, None) or Option() on one line",
+			)
+			Ok({
+				selection = UnionSelection(name.name, variants),
+				span = { name.name.span | end = end.end },
+				next = closed,
+			})
 		else:
-			Ok(name)
+			Ok({
+				selection = FunctionSelection(name.name),
+				span = name.name.span,
+				next = name.next,
+			})
 
 
 private fixed record ImportResult {
@@ -1984,34 +2598,52 @@ private fixed record ImportResult {
 private pure func consume_import_row(start: ParserState) -> Result[ImportResult, Diagnostic]:
 	indented ?= consume_indent(start, 1, "expected an indented import", "indent each ./helper: answer line with one tab or four spaces")
 	path ?= consume_module_path(indented)
+
 	selection ?= if at_word(path.next, "as"):
 		Err(expected(path.next, "import aliases are not supported yet", "select functions directly, such as ./helper: answer"))
 	else if at_symbol(path.next, Dot):
 		Err(expected(path.next, "import paths omit file extensions", "write ./helper: answer instead of ./helper.brp: answer"))
 	else:
-		consume_symbol(path.next, Colon, "expected ':' and selected function names after the import path", "write ./helper: answer; module aliases and whole-module imports are not supported yet")
+		consume_symbol(
+			path.next,
+			Colon,
+			"expected ':' and selected function names after the import path",
+			(
+				"write ./helper: answer; module aliases and whole-module imports are not "
+				+ "supported yet"
+			),
+		)
+
 	var state = selection
-	var symbols: List[WrittenName] = []
+	var symbols: List[ImportSelection] = []
 	var last = path.span
 	var failure: Option[Diagnostic] = None
+
 	while True:
 		match consume_import_symbol(state):
 			Err(error):
 				failure = Some(error)
 				break
 			Ok(symbol):
-				symbols = symbols.append(symbol.name)
-				last = symbol.name.span
+				symbols = symbols.append(symbol.selection)
+				last = symbol.span
 				state = symbol.next
+
 		if not at_symbol(state, Comma):
 			break
+
 		state = shifted(state, 1)
+
 	valid ?= match failure:
 		Some(error):
 			Err(error)
 		None:
 			Ok(void)
-	complete ?= if at_symbol(state, Newline) or IntOps.equals(state.position, state.input.tokens.length()):
+
+	complete ?= if (
+		at_symbol(state, Newline)
+		or IntOps.equals(state.position, state.input.tokens.length())
+	):
 		Ok(void)
 	else:
 		Err(expected(state, "expected ',' between imported function names", "write ./helper: answer, other on one line"))
@@ -2021,7 +2653,7 @@ private pure func consume_import_row(start: ParserState) -> Result[ImportResult,
 			symbols = symbols,
 			span = { source = path.span.source, start = path.span.start, end = last.end }
 		},
-		next = state
+		next = state,
 	})
 
 
@@ -2037,6 +2669,7 @@ private pure func consume_import_block(start: ParserState) -> Result[ImportBlock
 	var state = newline
 	var imports: List[ParsedImport] = []
 	var failure: Option[Diagnostic] = None
+
 	while True:
 		match consume_import_row(state):
 			Err(error):
@@ -2045,9 +2678,12 @@ private pure func consume_import_block(start: ParserState) -> Result[ImportBlock
 			Ok(row):
 				imports = imports.append(row.request)
 				state = row.next
+
 		if not at_symbol(state, Newline) or not at_indent(shifted(state, 1)):
 			break
+
 		state = shifted(state, 1)
+
 	match failure:
 		Some(error):
 			Err(error)
@@ -2057,13 +2693,13 @@ private pure func consume_import_block(start: ParserState) -> Result[ImportBlock
 
 pure func begin_program(prelude: CheckedPrelude) -> ParsedAssembly:
 	into_opaque ParsedAssembly({
-		names = prelude_names(prelude).names,
-		prelude = prelude,
-		modules = [],
-		functions = [],
-		unions = [],
-		records = []
-	})
+			names = prelude_names(prelude).names,
+			prelude = prelude,
+			modules = [],
+			functions = [],
+			unions = [],
+			records = []
+		})
 
 
 pure func assembly_names(assembly: ParsedAssembly) -> NameTable:
@@ -2094,6 +2730,7 @@ pure func append_module(
 ) -> Result[ParsedAssembly, Diagnostic]:
 	builder = from_opaque ParsedAssembly(assembly)
 	contents = from_opaque ParsedModule(parsed)
+
 	valid ?= if not same_name_table(builder.names, contents.base_names):
 		Err(bundle_error("parsed module does not extend this source bundle's name authority"))
 	else if not IntOps.equals(module_number(contents.module), builder.modules.length()):
@@ -2102,9 +2739,11 @@ pure func append_module(
 		Err(bundle_error("source bundle does not supply exactly one target per import"))
 	else:
 		Ok(void)
+
 	var imports: List[ModuleImport] = []
 	var position: Int = 0
 	var failure: Option[Diagnostic] = None
+
 	for request in contents.imports:
 		match targets.get(position):
 			None:
@@ -2113,41 +2752,53 @@ pure func append_module(
 			Some(target):
 				imports = imports.append({ target = target, symbols = request.symbols, span = request.span })
 		position = IntOps.add(position, 1)
+
 	linked ?= match failure:
 		Some(error):
 			Err(error)
 		None:
 			Ok(void)
+
 	Ok(into_opaque ParsedAssembly({
-		names = contents.names,
-		prelude = builder.prelude,
-		modules = builder.modules.append({ module = contents.module, imports = imports, end = contents.end }),
-		functions = builder.functions.concat(contents.functions),
-		unions = builder.unions.concat(contents.unions),
-		records = builder.records.concat(contents.records)
-	}))
+				names = contents.names,
+				prelude = builder.prelude,
+				modules = builder.modules.append({
+					module = contents.module,
+					imports = imports,
+					end = contents.end,
+				}),
+				functions = builder.functions.concat(contents.functions),
+				unions = builder.unions.concat(contents.unions),
+				records = builder.records.concat(contents.records)
+			}))
 
 
 pure func seal_program(assembly: ParsedAssembly) -> Result[ParsedProgram, Diagnostic]:
 	builder = from_opaque ParsedAssembly(assembly)
 	root ?= builder.modules.get(0).to_result(bundle_error("source bundle has no root module"))
 	var complete: Bool = True
+
 	for module in builder.modules:
 		for request in module.imports:
-			complete = complete and IntOps.less_than(module_number(request.target), builder.modules.length())
+			complete = (
+				complete
+				and IntOps.less_than(module_number(request.target), builder.modules.length())
+			)
+
 	valid ?= if complete:
 		Ok(void)
 	else:
 		Err(bundle_error("source bundle is missing an imported module"))
+
 	Ok(into_opaque ParsedProgram({
-		names = builder.names,
-		prelude = builder.prelude,
-		modules = builder.modules,
-		functions = builder.functions,
-		unions = builder.unions,
-		records = builder.records,
-		end = root.end
-	}))
+				names = builder.names,
+				prelude = builder.prelude,
+				modules = builder.modules,
+				functions = builder.functions,
+				unions = builder.unions,
+				records = builder.records,
+				end = root.end
+			}))
 
 
 pure func parse(input: LexedProgram, prelude: CheckedPrelude) -> Result[ParsedProgram, Diagnostic]:
@@ -2163,12 +2814,15 @@ pure func parse_module(
 	names: NameTable,
 ) -> Result[ParsedModule, Diagnostic]:
 	var correct_source = same_source(input.end.source, module_source(module))
+
 	for token in input.tokens:
 		correct_source = correct_source and same_source(token.span.source, module_source(module))
+
 	origin ?= if correct_source:
 		Ok(void)
 	else:
 		Err(bundle_error("parsed module's source does not match its module identity"))
+
 	var state: ParserState = {
 		input = input,
 		position = 0,
@@ -2181,12 +2835,24 @@ pure func parse_module(
 	var failure: Option[Diagnostic] = None
 
 	while True:
-		if at_word(state, "import") and (
-			not IntOps.equals(functions.length(), 0)
-			or not IntOps.equals(unions.length(), 0)
-			or not IntOps.equals(records.length(), 0)
+		if (
+			at_word(state, "import")
+			and ((
+				not IntOps.equals(functions.length(), 0)
+				or not IntOps.equals(unions.length(), 0)
+				or not IntOps.equals(records.length(), 0)
+			))
 		):
-			failure = Some(expected(state, "imports must precede declarations", "move every import: block before the module's functions, fixed unions, and fixed records"))
+			failure = Some(
+				expected(
+					state,
+					"imports must precede declarations",
+					(
+						"move every import: block before the module's functions, fixed unions, and fixed "
+						+ "records"
+					),
+				),
+			)
 			break
 		else if at_word(state, "import"):
 			match consume_import_block(state):

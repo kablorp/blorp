@@ -7,10 +7,16 @@ import:
 		function_id,
 		record_id,
 		union_id,
+		union_number,
 		variant_id,
+		variant_owner,
 	int as IntOps
 	names: NameId, same_name
-	parse: ModuleImport, ParsedProgram, parsed_contents
+	parse:
+		ImportSelection(FunctionSelection, UnionSelection),
+		ModuleImport,
+		ParsedProgram,
+		parsed_contents,
 	source: ModuleId, same_module
 	syntax: Span, WrittenName
 
@@ -33,6 +39,13 @@ fixed record ImportedFunctionBinding {
 }
 
 
+fixed record ImportedVariantBinding {
+	module: ModuleId,
+	name: WrittenName,
+	variant: VariantId
+}
+
+
 fixed union TypeCandidate:
 	UnionCandidate(UnionId)
 	RecordCandidate(RecordId)
@@ -42,6 +55,11 @@ fixed union ImportProblem:
 	RepeatedModuleImport(ModuleId, Span, Span)
 	MissingImportedFunction(ModuleId, WrittenName)
 	UnsupportedTypeImport(ModuleId, WrittenName)
+	MissingImportedUnion(WrittenName)
+	AmbiguousImportedUnion(WrittenName)
+	MissingImportedVariant(WrittenName)
+	RepeatedImportedVariant(WrittenName, Span)
+	ImportedTypeConflict(WrittenName, Span)
 
 
 private fixed record LocalFunctionBinding {
@@ -53,7 +71,7 @@ private fixed record LocalFunctionBinding {
 
 private fixed record LocalTypeBinding {
 	module: ModuleId,
-	name: NameId,
+	name: WrittenName,
 	target: TypeCandidate
 }
 
@@ -68,6 +86,7 @@ private fixed record LocalVariantBinding {
 private fixed record NamespaceContents {
 	functions: List[LocalFunctionBinding],
 	imports: List[ImportedFunctionBinding],
+	constructors: List[ImportedVariantBinding],
 	types: List[LocalTypeBinding],
 	variants: List[LocalVariantBinding],
 	problems: List[ImportProblem]
@@ -85,9 +104,11 @@ pure func local_function_candidates(
 	name: NameId,
 ) -> List[FunctionId]:
 	var candidates: List[FunctionId] = []
+
 	for binding in from_opaque Namespace(namespace).functions:
 		if same_module(binding.module, module) and same_name(binding.name, name):
 			candidates = candidates.append(binding.function)
+
 	candidates
 
 
@@ -97,14 +118,16 @@ pure func function_candidates(
 	name: NameId,
 ) -> List[FunctionCandidate]:
 	var candidates: List[FunctionCandidate] = []
+
 	for function in local_function_candidates(namespace, module, name):
 		candidates = candidates.append({ function = function, origin = LocalFunction })
 	for binding in from_opaque Namespace(namespace).imports:
 		if same_module(binding.module, module) and same_name(binding.name.id, name):
 			candidates = candidates.append({
 				function = binding.function,
-				origin = ImportedFunction(binding.name.span)
+				origin = ImportedFunction(binding.name.span),
 			})
+
 	candidates
 
 
@@ -114,9 +137,11 @@ pure func type_candidates(
 	name: NameId,
 ) -> List[TypeCandidate]:
 	var candidates: List[TypeCandidate] = []
+
 	for binding in from_opaque Namespace(namespace).types:
-		if same_module(binding.module, module) and same_name(binding.name, name):
+		if same_module(binding.module, module) and same_name(binding.name.id, name):
 			candidates = candidates.append(binding.target)
+
 	candidates
 
 
@@ -126,10 +151,20 @@ pure func variant_candidates(
 	name: NameId,
 ) -> List[VariantId]:
 	var candidates: List[VariantId] = []
+
 	for binding in from_opaque Namespace(namespace).variants:
 		if same_module(binding.module, module) and same_name(binding.name, name):
 			candidates = candidates.append(binding.variant)
+
+	for binding in from_opaque Namespace(namespace).constructors:
+		if same_module(binding.module, module) and same_name(binding.name.id, name):
+			candidates = candidates.append(binding.variant)
+
 	candidates
+
+
+pure func imported_variants(namespace: Namespace) -> List[ImportedVariantBinding]:
+	from_opaque Namespace(namespace).constructors
 
 
 pure func imported_functions(namespace: Namespace) -> List[ImportedFunctionBinding]:
@@ -146,71 +181,165 @@ pure func build_namespace(program: ParsedProgram) -> Namespace:
 	var types: List[LocalTypeBinding] = []
 	var variants: List[LocalVariantBinding] = []
 	var position: Int = 0
+
 	for function in parsed.functions:
 		functions = functions.append({
 			module = function.module,
 			name = function.function_name.id,
-			function = function_id(position)
+			function = function_id(position),
 		})
 		position = IntOps.add(position, 1)
+
 	position = 0
+
 	for declaration in parsed.unions:
 		owner = union_id(position)
 		types = types.append({
 			module = declaration.module,
-			name = declaration.type_name.id,
-			target = UnionCandidate(owner)
+			name = declaration.type_name,
+			target = UnionCandidate(owner),
 		})
 		var variant_position: Int = 0
+
 		for variant in declaration.variants:
 			variants = variants.append({
 				module = declaration.module,
 				name = variant.name.id,
-				variant = variant_id(owner, variant_position)
+				variant = variant_id(owner, variant_position),
 			})
 			variant_position = IntOps.add(variant_position, 1)
+
 		position = IntOps.add(position, 1)
+
 	position = 0
+
 	for declaration in parsed.records:
 		types = types.append({
 			module = declaration.module,
-			name = declaration.type_name.id,
-			target = RecordCandidate(record_id(position))
+			name = declaration.type_name,
+			target = RecordCandidate(record_id(position)),
 		})
 		position = IntOps.add(position, 1)
+
 	local = into_opaque Namespace({
-		functions = functions,
-		imports = [],
-		types = types,
-		variants = variants,
-		problems = []
-	})
+			functions = functions,
+			imports = [],
+			constructors = [],
+			types = types,
+			variants = variants,
+			problems = []
+		})
 	var imports: List[ImportedFunctionBinding] = []
+	var constructors: List[ImportedVariantBinding] = []
 	var problems: List[ImportProblem] = []
+
 	for module in parsed.modules:
 		var previous: List[ModuleImport] = []
+
 		for request in module.imports:
 			for first in previous:
 				if same_module(first.target, request.target):
 					problems = problems.append(RepeatedModuleImport(request.target, first.span, request.span))
 					break
+
 			previous = previous.append(request)
-			for symbol in request.symbols:
-				candidates = local_function_candidates(local, request.target, symbol.id)
-				match candidates:
-					[]:
-						problem = match type_candidates(local, request.target, symbol.id):
+
+			for selection in request.symbols:
+				match selection:
+					FunctionSelection(symbol):
+						candidates = local_function_candidates(local, request.target, symbol.id)
+
+						match candidates:
 							[]:
-								MissingImportedFunction(request.target, symbol)
+								problem = match type_candidates(local, request.target, symbol.id):
+									[]:
+										MissingImportedFunction(request.target, symbol)
+									_:
+										UnsupportedTypeImport(request.target, symbol)
+
+								problems = problems.append(problem)
 							_:
-								UnsupportedTypeImport(request.target, symbol)
-						problems = problems.append(problem)
-					_:
-						for function in candidates:
-							imports = imports.append({
-								module = module.module,
-								name = symbol,
-								function = function
-							})
+								for function in candidates:
+									imports = imports.append({
+										module = module.module,
+										name = symbol,
+										function = function,
+									})
+					UnionSelection(name, selected):
+						owner_result: Result[UnionId, ImportProblem] = match type_candidates(
+							local,
+							request.target,
+							name.id,
+						):
+							[UnionCandidate(owner)]:
+								Ok(owner)
+							[] | [RecordCandidate(_)]:
+								Err(MissingImportedUnion(name))
+							_:
+								Err(AmbiguousImportedUnion(name))
+
+						match owner_result:
+							Err(problem):
+								problems = problems.append(problem)
+							Ok(owner):
+								for previous_type in types:
+									if (
+										same_module(previous_type.module, module.module)
+										and same_name(previous_type.name.id, name.id)
+									):
+										problems = problems.append(
+											ImportedTypeConflict(
+												name,
+												previous_type.name.span,
+											),
+										)
+										break
+
+								types = types.append({
+									module = module.module,
+									name = name,
+									target = UnionCandidate(owner),
+								})
+								var previous_variants: List[WrittenName] = []
+
+								for written in selected:
+									for previous_variant in previous_variants:
+										if same_name(previous_variant.id, written.id):
+											problems = problems.append(
+												RepeatedImportedVariant(
+													written,
+													previous_variant.span,
+												),
+											)
+											break
+
+									previous_variants = previous_variants.append(written)
+									var found = False
+
+									for variant in variant_candidates(
+										local,
+										request.target,
+										written.id,
+									):
+										if IntOps.equals(
+											union_number(variant_owner(variant)),
+											union_number(owner),
+										):
+											constructors = constructors.append({
+												module = module.module,
+												name = written,
+												variant = variant,
+											})
+											found = True
+											break
+
+									if not found:
+										problems = problems.append(MissingImportedVariant(written))
+
 	contents = from_opaque Namespace(local)
-	into_opaque Namespace({ contents | imports = imports, problems = problems })
+	into_opaque Namespace({ contents |
+			imports = imports,
+			constructors = constructors,
+			types = types,
+			problems = problems
+		})

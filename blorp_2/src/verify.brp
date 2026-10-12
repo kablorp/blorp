@@ -1,5 +1,8 @@
 import:
-	source: COMPILER_SOURCE
+	./prelude as Prelude:
+		RuntimeResult(PrimitiveResult, OptionalResult, BooleanResult),
+		runtime_contract,
+	float as FloatOps
 	int as IntOps
 	list: contains
 	lower: MatchLabel(DefaultLabel, VariantLabel), ValueId, value_number
@@ -14,9 +17,9 @@ import:
 		OwnedMatch,
 		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(
-			ParameterDefinition, IntegerDefinition, VariantDefinition, CallDefinition,
-			ConstructDefinition, PayloadDefinition, ConstructRecordDefinition,
-			ReadRecordFieldDefinition,
+			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition, StringDefinition,
+			VariantDefinition, CallDefinition, ConstructDefinition, PayloadDefinition,
+			ConstructRecordDefinition, ReadRecordFieldDefinition,
 		),
 		OwnerId,
 		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
@@ -27,6 +30,7 @@ import:
 		ValueOwnership(NoOwnership, ManagedStringLeaf, InlineOwnedFields),
 		owner_number,
 		value_ownership,
+	source: COMPILER_SOURCE
 	specialize:
 		CallTarget(UserFunction, RuntimeFunction),
 		ConcreteCall,
@@ -35,7 +39,7 @@ import:
 		FieldInstanceId,
 		FunctionSignature,
 		RecordInstanceId,
-		TypeRef(IntType, StringType, UnionType, RecordType),
+		TypeRef(VoidType, IntType, FloatType, StringType, UnionType, RecordType),
 		UnionRepresentation(InlineUnmanaged, InlineOwningPayload),
 		VariantInstanceId,
 		field_number,
@@ -268,9 +272,72 @@ private pure func verify_borrow(
 private pure func call_signature(
 	call: ConcreteCall,
 	functions: List[OwnedFunction],
+	unions: List[ConcreteUnion],
 ) -> Result[FunctionSignature, Diagnostic]:
 	match call.target:
 		RuntimeFunction(operation):
+			validation: Result[Void, Diagnostic] = match runtime_contract(operation).return_type:
+				PrimitiveResult(_):
+					Ok(void)
+				OptionalResult(payload, roles):
+					expected_payload = match payload:
+						Prelude.BuiltinInt:
+							IntType
+						Prelude.BuiltinFloat:
+							FloatType
+						Prelude.BuiltinString:
+							StringType
+						Prelude.BuiltinVoid:
+							VoidType
+
+					present ?= variant_type(
+						roles.present,
+						Some(expected_payload),
+						unions,
+						call.span,
+					)
+					absent ?= variant_type(roles.absent, None, unions, call.span)
+					owner = variant_owner(roles.present)
+					layout ?= unions
+						.get(union_number(owner))
+						.to_result(failure(call.span, "unknown runtime result union"))
+
+					if (
+						same_type(present, absent)
+						and layout.variants.length() == 2
+						and variant_number(roles.present) != variant_number(roles.absent)
+					):
+						Ok(void)
+					else:
+						Err(
+							failure(
+								call.span,
+								"runtime constructor roles do not cover one result union",
+							),
+						)
+				BooleanResult(roles):
+					equal ?= variant_type(roles.equal, None, unions, call.span)
+					different ?= variant_type(roles.different, None, unions, call.span)
+					owner = variant_owner(roles.equal)
+					layout ?= unions
+						.get(union_number(owner))
+						.to_result(failure(call.span, "unknown runtime result union"))
+
+					if (
+						same_type(equal, different)
+						and layout.variants.length() == 2
+						and variant_number(roles.equal) != variant_number(roles.different)
+					):
+						Ok(void)
+					else:
+						Err(
+							failure(
+								call.span,
+								"runtime comparison roles do not cover one result union",
+							),
+						)
+
+			valid ?= validation
 			Ok(runtime_signature(operation))
 		UserFunction(id):
 			function ?= functions
@@ -419,7 +486,7 @@ private pure func valid_union_layout(
 					True
 				Some(value_type):
 					match value_type:
-						IntType:
+						VoidType | IntType | FloatType:
 							True
 						RecordType(id):
 							records
@@ -606,12 +673,21 @@ private pure func operation_type(
 							"parameter value in a zero-argument function",
 						),
 					)
+		VoidDefinition:
+			Ok(VoidType)
+		StringDefinition(_):
+			Ok(StringType)
 		IntegerDefinition(_):
 			Ok(IntType)
+		FloatDefinition(value):
+			if FloatOps.is_finite(value):
+				Ok(FloatType)
+			else:
+				Err(failure(definition.span, "Float literal must be finite"))
 		VariantDefinition(id):
 			variant_type(id, None, unions, definition.span)
 		CallDefinition(call, arguments):
-			contract ?= call_signature(call, functions)
+			contract ?= call_signature(call, functions, unions)
 			valid ?= verify_arguments(
 				arguments,
 				contract.parameters,
@@ -816,7 +892,7 @@ private pure func verify_definition(
 											"managed projection requires its parent borrow",
 										),
 									)
-						CallDefinition(_, _) | ConstructDefinition(_, _) | VariantDefinition(_):
+						StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | VariantDefinition(_):
 							match definition.result:
 								OwnedResult(owner):
 									introduce_owner(ready, owner, definition.id, definition.span)

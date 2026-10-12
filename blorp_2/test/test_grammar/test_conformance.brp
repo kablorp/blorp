@@ -1,8 +1,8 @@
 import:
-	../../src/source: PRELUDE_SOURCE, module_source, root_module_id
 	../../src/lex: lex
 	../../src/names: NameTable, name_spelling
 	../../src/parse: ParsedProgram, parse_prelude, parsed_contents
+	../../src/source: PRELUDE_SOURCE, module_source, root_module_id
 	../../src/syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
 		CallNotation(DirectCall, ReceiverCall),
@@ -10,12 +10,13 @@ import:
 		ExpressionBase(IntegerExpression, NameExpression, DirectApplication),
 		FieldPattern(FieldName, FieldWildcard),
 		ParsedBody(ParsedBuiltinBody, ParsedValueBody, ParsedMatchBody),
-		ParsedBuiltinType(IntegerBuiltin, StringBuiltin),
+		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin),
 		ParsedFunction,
 		ParsedMatch,
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
 		ParsedPrelude,
 		ParsedRuntimeOperation(IntegerAddBuiltin, IntegerToStringBuiltin, StringLengthBuiltin),
+		ParsedStatement(BindingStatement),
 		ParsedUnion,
 		PostfixOperation(ReceiverInvocation, FieldAccess),
 		Purity(Pure, Impure),
@@ -38,7 +39,7 @@ private IDENTIFIER_HELP: String = (
 private INDENT_HELP: String = "use tabs only, or spaces in groups of four; do not mix tabs and spaces"
 
 private CHARACTER_HELP: String = (
-	"use ASCII function declarations and Int literals, parameter names, or calls; "
+	"use ASCII function declarations and numeric literals, parameter names, or calls; "
 	+ "keep -> adjacent"
 )
 
@@ -82,6 +83,8 @@ pure func test_prelude_builtin_type_alternatives_and_spaces() -> Bool:
 	source: String =
 		|type Int=builtin
 		|type String = builtin
+		|type Float = builtin
+		|type Void = builtin
 
 	match prelude_syntax(source):
 		Err(_):
@@ -90,10 +93,12 @@ pure func test_prelude_builtin_type_alternatives_and_spaces() -> Bool:
 			contents = parsed
 
 			match contents.types:
-				[IntegerBuiltin(integer), StringBuiltin(string)]:
+				[IntegerBuiltin(integer), StringBuiltin(string), FloatBuiltin(float), VoidBuiltin(unit)]:
 					(
 						name_spelling(contents.names, integer.id) == Some("Int")
 						and name_spelling(contents.names, string.id) == Some("String")
+						and name_spelling(contents.names, float.id) == Some("Float")
+						and name_spelling(contents.names, unit.id) == Some("Void")
 						and contents.functions.length() == 0
 					)
 				_:
@@ -114,10 +119,12 @@ pure func test_prelude_runtime_labels_and_shared_header_syntax() -> Bool:
 		Ok(parsed):
 			match parsed.functions:
 				[first, second]:
+					operations_match = match (first.operation, second.operation):
+						(IntegerToStringBuiltin, StringLengthBuiltin): True
+						_: False
 					(
-						first.operation == IntegerToStringBuiltin
+						operations_match
 						and first.header.purity == Pure
-						and second.operation == StringLengthBuiltin
 						and second.header.purity == Impure
 					)
 				_:
@@ -127,18 +134,18 @@ pure func test_prelude_runtime_labels_and_shared_header_syntax() -> Bool:
 pure func test_prelude_unknown_type_and_operation_are_closed_syntax() -> Bool:
 	(
 		prelude_rejects(
-			"type Float = builtin",
+			"type Bool = builtin",
 			5,
-			10,
+			9,
 			"unknown builtin type",
-			"declare type Int = builtin or type String = builtin",
+			"declare type Int = builtin, type Float = builtin, type String = builtin or type Void = builtin",
 		)
 		and prelude_rejects(
 			"pure func f(value: Int) -> String:\n\tbuiltin(\"unknown\")",
 			44,
 			53,
 			"unknown builtin operation",
-			"use \"int.add\", \"int.to_string\" or \"string.length\"",
+			"use int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals or io.read_line",
 		)
 	)
 
@@ -150,14 +157,14 @@ pure func test_prelude_requires_quoted_label_and_closing_parenthesis() -> Bool:
 			44,
 			47,
 			"expected a quoted builtin label",
-			"use \"int.add\", \"int.to_string\" or \"string.length\"",
+			"use int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals or io.read_line",
 		)
 		and prelude_rejects(
 			"pure func f(value: Int) -> String:\n\tbuiltin(\"int.to_string\"",
 			59,
 			59,
 			"expected ')' after the builtin label",
-			"give builtin exactly one quoted operation label",
+			"give primitive builtins one quoted label, or bind both constructors of a union result",
 		)
 	)
 
@@ -438,7 +445,7 @@ pure func test_untyped_parameter_and_separated_arrow_are_rejected() -> Bool:
 			12,
 			13,
 			"expected decimal digits immediately after '-'",
-			"write a signed integer such as -42; '-' is not an operator",
+			"write a signed number such as -42 or -0.5; '-' is not an operator",
 		)
 	)
 
@@ -548,15 +555,9 @@ pure func test_numeric_spelling_is_restricted() -> Bool:
 			"integer literals cannot have leading zeros",
 			"write 0 or -0, or remove the leading zeros",
 		)
-		and rejects(HEADER + "\t+1", 21, 22, "unsupported character", CHARACTER_HELP)
+		and rejects(HEADER + "\t+1", 21, 22, "source numeric literals cannot start with '+'", "remove the leading '+'; use an adjacent '-' for a negative literal")
 		and accepts(HEADER + "\t-0", "main", 5, 9, "Int", 15, 18)
-		and rejects(
-			HEADER + "\t0.0",
-			23,
-			24,
-			"expected a field or function name after '.'",
-			IDENTIFIER_HELP,
-		)
+		and parse_source(HEADER + "\t0.0").is_ok()
 	)
 
 
@@ -952,10 +953,10 @@ pure func test_postfix_requires_name_and_distinguishes_parentheses() -> Bool:
 	(
 		rejects(
 			HEADER + "\t1.",
+			21,
 			23,
-			23,
-			"expected a field or function name after '.'",
-			IDENTIFIER_HELP,
+			"Float literals need digits after the decimal point",
+			"write 1.0; otherwise use a UFCS function call after '.'",
 		)
 		and rejects(
 			HEADER + "\t1..one()",
@@ -1831,8 +1832,8 @@ pure func test_binding_prefix_and_final_value_shape() -> Bool:
 
 			match program.functions:
 				[function]:
-					match function.bindings:
-						[first, current, update]:
+					match function.statements:
+						[BindingStatement(first), BindingStatement(current), BindingStatement(update)]:
 							(
 								first.mutability == ImmutableBinding
 								and current.mutability == MutableBinding
@@ -1880,7 +1881,7 @@ pure func test_binding_spaces_and_tail_match() -> Bool:
 				[function]:
 					match function.body:
 						ParsedMatchBody(_):
-							function.bindings.length() == 1
+							function.statements.length() == 1
 						_:
 							False
 				_:
@@ -1966,8 +1967,8 @@ pure func test_arm_block_bindings_and_inline_sibling_spans() -> Bool:
 						ParsedMatchBody(body):
 							match body.arms:
 								[first, second]:
-									match first.bindings:
-										[current, original, reassigned]:
+									match first.statements:
+										[BindingStatement(current), BindingStatement(original), BindingStatement(reassigned)]:
 											(
 												current.mutability == MutableBinding
 												and written_name_is(
@@ -2022,7 +2023,7 @@ pure func test_arm_block_bindings_and_inline_sibling_spans() -> Bool:
 												)
 												and first.span.start == 41
 												and first.span.end == 116
-												and second.bindings.length() == 0
+												and second.statements.length() == 0
 												and second.span.start == 119
 												and second.span.end == 123
 												and expression_integer_is(second.body, 0, 122, 123)
@@ -2055,7 +2056,7 @@ pure func test_arm_block_without_bindings_and_optional_final_lf() -> Bool:
 									[arm]:
 										accepted = (
 											accepted
-											and arm.bindings.length() == 0
+											and arm.statements.length() == 0
 											and expression_integer_is(arm.body, 7, 48, 49)
 										)
 									_:
@@ -2091,8 +2092,8 @@ pure func test_arm_block_spaces_and_following_declaration() -> Bool:
 						ParsedMatchBody(body):
 							match body.arms:
 								[block, inline]:
-									match block.bindings:
-										[binding]:
+									match block.statements:
+										[BindingStatement(binding)]:
 											(
 												written_name_is(
 													program.names,
@@ -2114,7 +2115,7 @@ pure func test_arm_block_spaces_and_following_declaration() -> Bool:
 													83,
 													84,
 												)
-												and inline.bindings.length() == 0
+												and inline.statements.length() == 0
 												and expression_integer_is(inline.body, 0, 96, 97)
 												and written_name_is(
 													program.names,
@@ -2573,27 +2574,36 @@ pure func test_builtin_is_contextual_and_is_the_entire_body() -> Bool:
 		|func main() -> Int:
 		|    builtin(20, 22)
 		|
+
 	accepted = match parse_source(source):
-		Err(_): False
+		Err(_):
+			False
 		Ok(parsed):
 			match parsed_contents(parsed).functions:
 				[_, added, main]:
 					match (added.body, main.body):
-						(ParsedBuiltinBody(IntegerAddBuiltin, _), ParsedValueBody(_)): True
-						_: False
-				_: False
+						(ParsedBuiltinBody(IntegerAddBuiltin, _), ParsedValueBody(_)):
+							True
+						_:
+							False
+				_:
+					False
+
 	with_binding: String =
 		|pure func add(first: Int, second: Int) -> Int:
 		|    local = first
 		|    builtin("int.add")
 		|
-	start = "pure func add(first: Int, second: Int) -> Int:\n    ".length()
+	start = "pure func add(first: Int, second: Int) -> Int:\n    local = first\n    ".length()
 	accepted and rejects(
 		with_binding,
 		start,
-		start + "local".length(),
-		"builtin bodies cannot have local bindings",
-		"use builtin as the entire function body; put other work in an ordinary wrapper function",
+		start + "builtin".length(),
+		"builtin must be the entire function body",
+		(
+			"use builtin as the entire function body; put other work in an ordinary wrapper "
+			+ "function"
+		),
 	)
 
 
