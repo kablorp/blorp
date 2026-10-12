@@ -10,7 +10,10 @@ and `length` functions. Self and mutual function recursion are supported with
 ordinary C stack usage; generic recursion must have finite concrete instances,
 and cyclic runtime data remains forbidden. Local selective function imports use
 explicit `./` or leading `../` paths; callees retain their defining module's
-scope, and only a root-local `main() -> Int` supplies the entrypoint. The pilot
+scope, and only a root-local `main() -> Int` supplies the entrypoint. An explicit
+`--library-root` enables bare target-library imports; its temporary `int` module
+provides concrete wrapping `add`, also callable with UFCS. Closed builtin bodies
+require their exact runtime signature; arbitrary FFI and traits remain excluded. The pilot
 reference states its scope and restrictions.
 
 ---

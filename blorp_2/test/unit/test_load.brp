@@ -1,7 +1,7 @@
 import:
 	../../src/load: SourceFile, import_path, load_program, prepare_prelude
 	../../src/names: NameId, intern_name, program_names
-	../../src/parse: parsed_contents
+	../../src/parse: ImportOrigin(RelativeImport, LibraryImport), parsed_contents
 	../../src/source:
 		COMPILER_SOURCE,
 		PRELUDE_SOURCE,
@@ -21,7 +21,7 @@ import:
 	test: TestSuite
 
 
-private READ_HELP: String = "check the relative import path and provide a readable .brp file"
+private READ_HELP: String = "check the import path and provide a readable .brp file under its source root"
 
 
 private pure func prelude() -> SourceFile:
@@ -60,7 +60,12 @@ private pure func projects_to(
 		names = interned.names
 		ids = ids.append(interned.id)
 
-	match import_path(importer, { parents = parents, parts = ids }, names):
+	request = {
+		path = { origin = RelativeImport(parents), parts = ids },
+		symbols = [],
+		span = { source = COMPILER_SOURCE, start = 0, end = 0 }
+	}
+	match import_path(importer, request, names, None):
 		Err(_):
 			False
 		Ok(actual):
@@ -84,7 +89,12 @@ pure func test_import_path_rejects_a_spelling_outside_its_name_authority() -> Bo
 	initial = program_names()
 	part = intern_name(initial.names, "helper")
 
-	match import_path("/project/main.brp", { parents = 0, parts = [part.id] }, initial.names):
+	request = {
+		path = { origin = RelativeImport(0), parts = [part.id] },
+		symbols = [],
+		span = { source = COMPILER_SOURCE, start = 0, end = 0 }
+	}
+	match import_path("/project/main.brp", request, initial.names, None):
 		Ok(_):
 			False
 		Err(error):
@@ -146,7 +156,7 @@ private func diamond(directory: String) -> Result[Bool, String]:
 	right_path ?= write_module(directory, "right.brp", right)
 	leaf_path ?= write_module(directory, "leaf.brp", leaf)
 
-	Ok(match load_program(prelude(), root_path):
+	Ok(match load_program(prelude(), root_path, None):
 		Err(_):
 			False
 		Ok(loaded):
@@ -193,7 +203,7 @@ private func cycle(directory: String) -> Result[Bool, String]:
 	root_path ?= write_module(directory, "main.brp", root)
 	helper_path ?= write_module(directory, "helper.brp", helper)
 
-	Ok(match load_program(prelude(), root_path):
+	Ok(match load_program(prelude(), root_path, None):
 		Err(_):
 			False
 		Ok(loaded):
@@ -220,19 +230,19 @@ private func cycle(directory: String) -> Result[Bool, String]:
 
 private func imported_parse_error(directory: String) -> Result[Bool, String]:
 	root = "import:\n    ./helper: answer\nfunc main() -> Int:\n    0\n"
-	helper = "import:\n    helper: answer\n"
+	helper = "import:\n    ./helper.brp: answer\n"
 	root_path ?= write_module(directory, "main.brp", root)
 	helper_path ?= write_module(directory, "helper.brp", helper)
 
-	Ok(match (module_id(module_number(root_module_id()) + 1), load_program(prelude(), root_path)):
+	Ok(match (module_id(module_number(root_module_id()) + 1), load_program(prelude(), root_path, None)):
 		(Some(dependency), Err(failure)):
 			(
 				failure.sources.modules.map(pure func(file): file.path) == [root_path, helper_path]
 				and failure.sources.modules.map(pure func(file): file.contents) == [root, helper]
 				and exact_error(
-					failure.diagnostic, module_source(dependency), 12, 18,
-					"expected an explicit relative import path",
-					"write ./helper: answer or ../shared/helper: answer; bare and package imports are not supported yet",
+					failure.diagnostic, module_source(dependency), 20, 21,
+					"import paths omit file extensions",
+					"write ./helper: answer instead of ./helper.brp: answer",
 				)
 			)
 		_:
@@ -249,7 +259,7 @@ private func missing_transitive_module(directory: String) -> Result[Bool, String
 
 	Ok(match (module_id(module_number(root_module_id()) + 1), read_file(missing_path)):
 		(Some(dependency), Err(read_error)):
-			match load_program(prelude(), root_path):
+			match load_program(prelude(), root_path, None):
 				Ok(_):
 					False
 				Err(failure):
@@ -273,7 +283,7 @@ private func missing_root(directory: String) -> Result[Bool, String]:
 		Ok(_):
 			False
 		Err(read_error):
-			match load_program(prelude(), root_path):
+			match load_program(prelude(), root_path, None):
 				Ok(_):
 					False
 				Err(failure):
@@ -288,7 +298,7 @@ private func missing_root(directory: String) -> Result[Bool, String]:
 private func invalid_prelude(directory: String) -> Result[Bool, String]:
 	contents = "type Int = builtin\n"
 	root_path = Path.join(directory, "missing.brp")
-	Ok(match load_program({ path = "invalid-prelude.brp", contents = contents }, root_path):
+	Ok(match load_program({ path = "invalid-prelude.brp", contents = contents }, root_path, None):
 		Ok(_):
 			False
 		Err(failure):
@@ -302,6 +312,106 @@ private func invalid_prelude(directory: String) -> Result[Bool, String]:
 					"add type String = builtin to the prelude",
 				)
 			)
+	)
+
+
+pure func test_library_path_uses_only_the_explicit_root() -> Bool:
+	initial = program_names()
+	part = intern_name(initial.names, "int")
+	request = {
+		path = { origin = LibraryImport, parts = [part.id] },
+		symbols = [],
+		span = { source = module_source(root_module_id()), start = 12, end = 20 }
+	}
+	match import_path("/project/main.brp", request, part.names, Some("/target/library")):
+		Ok(path): path == "/target/library/int.brp"
+		Err(_): False
+
+
+private func missing_library_root(directory: String) -> Result[Bool, String]:
+	root: String =
+		|import:
+		|    int: add
+		|func main() -> Int:
+		|    0
+		|
+	root_path ?= write_module(directory, "main.brp", root)
+	local ?= write_module(directory, "int.brp", "pure func add() -> Int:\n    42\n")
+	Ok(match load_program(prelude(), root_path, None):
+		Ok(_): False
+		Err(failure):
+			failure.sources.modules.length() == 1 and exact_error(
+				failure.diagnostic, module_source(root_module_id()), 12, 20,
+				"library import requires an explicit library root",
+				"pass --library-root DIRECTORY containing the target library modules",
+			)
+	)
+
+
+private func no_local_library_fallback(directory: String) -> Result[Bool, String]:
+	root: String =
+		|import:
+		|    int: add
+		|func main() -> Int:
+		|    0
+		|
+	root_path ?= write_module(directory, "main.brp", root)
+	local ?= write_module(directory, "int.brp", "pure func add() -> Int:\n    42\n")
+	library = Path.join(directory, "library")
+	missing_path = Path.join(library, "int.brp")
+	Ok(match read_file(missing_path):
+		Ok(_): False
+		Err(read_error):
+			match load_program(prelude(), root_path, Some(library)):
+				Ok(_): False
+				Err(failure):
+					failure.sources.modules.length() == 1 and exact_error(
+						failure.diagnostic, module_source(root_module_id()), 12, 20,
+						"could not read module " + missing_path + ": " + read_error,
+						READ_HELP,
+					)
+	)
+
+
+private func library_relative_dependency(directory: String) -> Result[Bool, String]:
+	library = Path.join(directory, "library")
+	created ?= if mkdir(library):
+		Ok(void)
+	else:
+		Err("could not create target library directory")
+	root: String =
+		|import:
+		|    int: answer
+		|    ./library/helper: helper
+		|func main() -> Int:
+		|    answer()
+		|
+	integer: String =
+		|import:
+		|    ./helper: helper
+		|pure func answer() -> Int:
+		|    helper()
+		|
+	helper = "pure func helper() -> Int:\n    42\n"
+	root_path ?= write_module(directory, "main.brp", root)
+	int_path ?= write_module(library, "int.brp", integer)
+	helper_path ?= write_module(library, "helper.brp", helper)
+	-- This decoy would break the inventory assertion if bare paths searched locally.
+	local ?= write_module(directory, "int.brp", "pure func answer() -> Int:\n    1\n")
+	Ok(match load_program(prelude(), root_path, Some(library)):
+		Err(_): False
+		Ok(loaded):
+			program = parsed_contents(loaded.program)
+			match program.modules:
+				[root_row, int_row, helper_row]:
+					match (root_row.imports, int_row.imports):
+						([root_int, root_helper], [int_helper]):
+							(loaded.sources.modules.map(pure func(file): file.path) == [root_path, int_path, helper_path]
+								and same_module(root_int.target, int_row.module)
+								and same_module(root_helper.target, helper_row.module)
+								and same_module(int_helper.target, helper_row.module))
+						_: False
+				_: False
 	)
 
 
@@ -336,5 +446,9 @@ tests: TestSuite = {
 		("missing transitive module identifies the importing site", func(): in_directory(missing_transitive_module)),
 		("missing root reports compiler origin", func(): in_directory(missing_root)),
 		("invalid prelude precedes root file access", func(): in_directory(invalid_prelude)),
+		("library path uses only the explicit root", test_library_path_uses_only_the_explicit_root),
+		("library import without a root does not search local files", func(): in_directory(missing_library_root)),
+		("missing library files do not fall back to local files", func(): in_directory(no_local_library_fallback)),
+		("library relative dependencies share ordinary module identities", func(): in_directory(library_relative_dependency)),
 	]
 }

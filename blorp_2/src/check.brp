@@ -4,6 +4,7 @@ import:
 		CheckedPrelude,
 		PrimitiveType(BuiltinInt, BuiltinString),
 		RuntimeOperation,
+		builtin_operation,
 		prelude_names,
 		runtime_contract,
 		runtime_operation,
@@ -30,7 +31,7 @@ import:
 		FieldPattern(FieldName, FieldWildcard),
 		FunctionExecution(OrdinaryCalls, SelfTailLoop),
 		ParsedBinding,
-		ParsedBody(ParsedValueBody, ParsedMatchBody),
+		ParsedBody(ParsedBuiltinBody, ParsedValueBody, ParsedMatchBody),
 		ParsedFunction,
 		ParsedMatch,
 		ParsedMatchArm,
@@ -38,6 +39,7 @@ import:
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
 		ParsedRecord,
 		ParsedRecordField,
+		ParsedRuntimeOperation,
 		ParsedUnion,
 		PostfixOperation(ReceiverInvocation, FieldAccess),
 		Purity(Pure, Impure),
@@ -47,6 +49,7 @@ import:
 		ValueExpression,
 		WrittenName,
 		type_span,
+		same_purity,
 
 
 private fixed record FieldIdentity {
@@ -128,15 +131,16 @@ private pure func primitive_ref(value_type: PrimitiveType) -> TypeRef:
 
 private pure func runtime_signature(operation: RuntimeOperation, span: Span) -> FunctionSignature:
 	contract = runtime_contract(operation)
+	parameters = contract.parameters.map(pure func(parameter: PrimitiveType) -> TypeUse:
+		{
+			value_type = primitive_ref(parameter),
+			span = span
+		}
+	)
 	{
 		type_parameters = [],
 		purity = contract.purity,
-		parameters = [
-			{
-				value_type = primitive_ref(contract.parameter),
-				span = span
-			},
-		],
+		parameters = parameters,
 		return_type = {
 			value_type = primitive_ref(contract.return_type),
 			span = span
@@ -453,6 +457,8 @@ fixed union PreviousTypeDeclaration:
 
 
 fixed union CheckErrorKind:
+	BuiltinContractMismatch(RuntimeOperation)
+	BuiltinTailAnnotation
 	DuplicateRecordType(NameId, PreviousTypeDeclaration)
 	DuplicateRecordField(NameId, Span)
 	UnsupportedRecordField(TypeRef)
@@ -1256,7 +1262,7 @@ private pure func resolve_signature(
 
 	type_parameters = declared_parameters(local_parameters)
 
-	Ok({
+	signature: FunctionSignature = {
 		type_parameters = type_parameters,
 		purity = function.purity,
 		parameters = parameters,
@@ -1264,7 +1270,11 @@ private pure func resolve_signature(
 			value_type = return_type,
 			span = type_span(function.return_type)
 		},
-	})
+	}
+	validated_builtin ?= match function.body:
+		ParsedBuiltinBody(operation, span): validate_builtin_body(function, signature, operation, span)
+		_: Ok(void)
+	Ok(signature)
 
 
 private pure func validate_signatures(
@@ -3082,6 +3092,31 @@ private pure func resolve_bindings(
 			})
 
 
+private pure func validate_builtin_body(
+	function: ParsedFunction,
+	signature: FunctionSignature,
+	parsed: ParsedRuntimeOperation,
+	span: Span,
+) -> Result[Void, CheckError]:
+	annotation ?= match function.tail_annotation:
+		Some(annotation): Err(check_rejection(annotation, BuiltinTailAnnotation))
+		None: Ok(void)
+	operation = builtin_operation(parsed)
+	expected = runtime_signature(operation, span)
+	if (
+		signature.type_parameters.is_empty()
+		and same_purity(signature.purity, expected.purity)
+		and same_types(
+			signature.parameters.map(pure func(parameter: TypeUse) -> TypeRef: parameter.value_type),
+			expected.parameters.map(pure func(parameter: TypeUse) -> TypeRef: parameter.value_type),
+		)
+		and same_type(signature.return_type.value_type, expected.return_type.value_type)
+	):
+		Ok(void)
+	else:
+		Err(check_rejection(span, BuiltinContractMismatch(operation)))
+
+
 private pure func resolve_body(
 	function: ParsedFunction,
 	signature: FunctionSignature,
@@ -3097,6 +3132,26 @@ private pure func resolve_body(
 	)
 
 	match function.body:
+		ParsedBuiltinBody(operation, span):
+			-- Read the scope's actual binding identities, as ordinary parameter uses do.
+			arguments = initial.map(pure func(binding: LocalBinding) -> CheckedValue:
+				{
+					base = ReturnBinding(binding.id),
+					base_type = binding.definition.value_type,
+					base_span = binding.definition.span,
+					operations = []
+				}
+			)
+			Ok({
+				bindings = prefix.bindings,
+				assignments = prefix.assignments,
+				body = CheckedValueBody(ReturnExpression({
+					base = ReturnCall({target = RuntimeFunction(builtin_operation(operation)), span = span}, arguments),
+					base_type = signature.return_type.value_type,
+					base_span = span,
+					operations = []
+				})),
+			})
 		ParsedValueBody(body):
 			value ?= check_value(
 				signature.purity,

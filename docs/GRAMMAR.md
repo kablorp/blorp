@@ -7,7 +7,10 @@ separate explicit input-prelude grammar for builtin types and concrete runtime
 function declarations. Its ordinary call syntax also accepts self and mutual
 recursion; checking separately rejects unbounded recursive type substitutions.
 Local selective function imports precede declarations and use explicit `./` or
-leading `../` paths without a `.brp` suffix. They preserve declaration identities;
+leading `../` paths without a `.brp` suffix. Bare paths resolve under an explicit
+target-library root. Concrete module functions may use a sole closed builtin
+body, including `builtin("int.add")`, with an exact runtime signature.
+Imports preserve declaration identities;
 only the root module's local zero-argument `main` is the entrypoint. Ordinary
 program String literals and recursive data declarations remain unsupported.
 The grammar below describes the full language.

@@ -1,0 +1,1162 @@
+import:
+	../../src/check as Checked
+	../../src/check_render: render_failure
+	../../src/declarations: function_number
+	../../src/emit: emit
+	../../src/lex: lex
+	../../src/lower: MatchLabel(DefaultLabel), lower, value_number
+	../../src/own as Own
+	../../src/parse: parse_prelude, parsed_contents
+	../../src/prelude:
+		PrimitiveType(BuiltinInt),
+		RuntimeOperation(IntAdd, IntToString, StringLength),
+		check_prelude,
+		runtime_contract,
+	../../src/source: PRELUDE_SOURCE, module_id, module_source, same_source
+	../../src/specialize as Concrete
+	../../src/syntax:
+		Diagnostic,
+		FunctionExecution(OrdinaryCalls),
+		ParsedBody(ParsedBuiltinBody),
+		ParsedRuntimeOperation(IntegerAddBuiltin),
+		Purity(Pure),
+	../../src/verify: verify
+	input: setup_diagnostic
+	module_input: ModuleInput, parse_modules
+	ownership_inputs: InputIds, input_ids, span
+	test: TestSuite
+
+
+private ROOT: String =
+	|import:
+	|    ./int: add
+	|func main() -> Int:
+	|    add(20, 22)
+	|
+
+private ADD: String =
+	|pure func add(first: Int, second: Int) -> Int:
+	|    builtin("int.add")
+	|
+
+
+private pure func checked_add(helper: String) -> Result[Checked.CheckedProgram, Diagnostic]:
+	parsed ?= parse_modules([
+		{
+			source = ROOT,
+			targets = [1]
+		},
+		{
+			source = helper,
+			targets = []
+		},
+	])
+	Checked
+		.check(parsed)
+		.map_err(setup_diagnostic)
+
+
+private pure func owned_sources(
+	sources: List[ModuleInput],
+) -> Result[Own.OwnershipProgram, Diagnostic]:
+	parsed ?= parse_modules(sources)
+	checked ?= Checked
+		.check(parsed)
+		.map_err(setup_diagnostic)
+	concrete ?= Concrete.specialize(checked)
+	lowered ?= lower(concrete)
+	Own.own(lowered)
+
+
+private pure func emitted_sources(sources: List[ModuleInput]) -> Result[String, Diagnostic]:
+	owned ?= owned_sources(sources)
+	verified ?= verify(owned)
+	emit(verified)
+
+
+private pure func rejects_header(header: String) -> Bool:
+	helper = header + "\n    builtin(\"int.add\")\n"
+	label = header.length() + "\n    builtin(".length()
+
+	match (
+		parse_modules([
+			{
+				source = ROOT,
+				targets = [1]
+			},
+			{
+				source = helper,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			match (Checked.check(parsed), module_id(1)):
+				(Err(failure), Some(helper_module)):
+					diagnostics = render_failure(failure)
+					error = diagnostics.first
+					(
+						diagnostics.remaining.is_empty()
+						and same_source(error.span.source, module_source(helper_module))
+						and error.span.start == label
+						and error.span.end == label + "\"int.add\"".length()
+						and error.note.is_none()
+						and error.message == "builtin declaration does not match its runtime contract"
+						and error.help == "declare a pure function with two Int parameters returning Int"
+					)
+				_:
+					False
+
+
+pure func test_module_builtin_add_is_accepted() -> Bool:
+	match (
+		parse_modules([
+			{
+				source = ROOT,
+				targets = [1]
+			},
+			{
+				source = ADD,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			Checked
+				.check(parsed)
+				.is_ok()
+
+
+pure func test_parser_publishes_typed_builtin_and_source_span() -> Bool:
+	match (
+		(
+			parse_modules(
+				[
+					{
+						source = ADD,
+						targets = []
+					},
+				],
+			),
+			module_id(0),
+		)
+	):
+		(Ok(program), Some(module)):
+			match parsed_contents(program).functions:
+				[function]:
+					match function.body:
+						ParsedBuiltinBody(IntegerAddBuiltin, occurrence):
+							start = "pure func add(first: Int, second: Int) -> Int:\n    builtin(".length()
+							(
+								same_source(occurrence.source, module_source(module))
+								and occurrence.start == start
+								and occurrence.end == start + "\"int.add\"".length()
+								and function.bindings.is_empty()
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_binary_runtime_contract_is_complete() -> Bool:
+	contract = runtime_contract(IntAdd)
+	(
+		contract.purity == Pure
+		and contract.parameters == [BuiltinInt, BuiltinInt]
+		and contract.return_type == BuiltinInt
+	)
+
+
+pure func test_prelude_and_module_share_binary_builtin_syntax() -> Bool:
+	source = "type Int = builtin\ntype String = builtin\n" + ADD
+
+	match lex(PRELUDE_SOURCE, source).and_then(pure func(tokens): parse_prelude(tokens)):
+		Err(_):
+			False
+		Ok(parsed):
+			check_prelude(parsed).is_ok()
+
+
+pure func test_unknown_builtin_label_is_rejected_before_checking() -> Bool:
+	source: String =
+		|pure func add(first: Int, second: Int) -> Int:
+		|    builtin("int.subtract")
+		|
+	start = "pure func add(first: Int, second: Int) -> Int:\n    builtin(".length()
+
+	match (
+		parse_modules(
+			[
+				{
+					source = source,
+					targets = []
+				},
+			],
+		)
+	):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.span.start == start
+				and error.span.end == start + "\"int.subtract\"".length()
+				and error.message == "unknown builtin operation"
+				and error.help == "use \"int.add\", \"int.to_string\" or \"string.length\""
+			)
+
+
+pure func test_builtin_body_cannot_have_a_trailing_expression() -> Bool:
+	source: String =
+		|pure func add(first: Int, second: Int) -> Int:
+		|    builtin("int.add").length()
+		|
+	start = "pure func add(first: Int, second: Int) -> Int:\n    builtin(\"int.add\")".length()
+
+	match (
+		parse_modules(
+			[
+				{
+					source = source,
+					targets = []
+				},
+			],
+		)
+	):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.span.start == start
+				and error.span.end == start + 1
+				and error.message == "expected a newline after the return expression"
+				and error.help == "put each declaration on a new line"
+			)
+
+
+pure func test_builtin_rejects_impurity() -> Bool:
+	rejects_header("func add(first: Int, second: Int) -> Int:")
+
+
+pure func test_builtin_rejects_zero_parameters() -> Bool:
+	rejects_header("pure func add() -> Int:")
+
+
+pure func test_builtin_rejects_one_parameter() -> Bool:
+	rejects_header("pure func add(first: Int) -> Int:")
+
+
+pure func test_builtin_rejects_extra_parameter() -> Bool:
+	rejects_header("pure func add(first: Int, second: Int, third: Int) -> Int:")
+
+
+pure func test_builtin_rejects_wrong_first_type() -> Bool:
+	rejects_header("pure func add(first: String, second: Int) -> Int:")
+
+
+pure func test_builtin_rejects_wrong_second_type() -> Bool:
+	rejects_header("pure func add(first: Int, second: String) -> Int:")
+
+
+pure func test_builtin_rejects_wrong_result_type() -> Bool:
+	rejects_header("pure func add(first: Int, second: Int) -> String:")
+
+
+pure func test_builtin_rejects_generic_header() -> Bool:
+	rejects_header("pure func add[T](first: Int, second: Int) -> Int:")
+
+
+pure func test_builtin_rejects_prefix_bindings() -> Bool:
+	helper: String =
+		|pure func add(first: Int, second: Int) -> Int:
+		|    local = first
+		|    builtin("int.add")
+		|
+	start = "pure func add(first: Int, second: Int) -> Int:\n    ".length()
+
+	match (
+		parse_modules(
+			[
+				{
+					source = helper,
+					targets = []
+				},
+			],
+		)
+	):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.span.start == start
+				and error.span.end == start + "local".length()
+				and error.message == "builtin bodies cannot have local bindings"
+				and error.help == (
+					"use builtin as the entire function body; put other work in an ordinary wrapper "
+					+ "function"
+				)
+			)
+
+
+pure func test_builtin_rejects_tail_annotation() -> Bool:
+	match checked_add("@tail_recursive\n" + ADD):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.span.start == 0
+				and error.span.end == "@tail_recursive".length()
+				and error.message == "builtin bodies cannot have a tail-recursion annotation"
+				and error.help == "remove @tail_recursive from the builtin declaration"
+			)
+
+
+pure func test_checked_builtin_reads_its_ordered_parameter_identities() -> Bool:
+	match checked_add(ADD):
+		Err(_):
+			False
+		Ok(program):
+			match Checked.checked_functions(program).functions.get(1):
+				Some(function):
+					match function.body:
+						Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+							match value.base:
+								Checked.ReturnCall(call, [first, second]):
+									match (call.target, first.base, second.base):
+										(Checked.RuntimeFunction(IntAdd), Checked.ReturnBinding(first_id), Checked.ReturnBinding(second_id)):
+											(
+												Checked.binding_number(first_id) == 0
+												and Checked.binding_number(second_id) == 1
+												and function.bindings.length() == 2
+												and function.assignments.is_empty()
+												and Checked.same_type(
+													value.base_type,
+													Checked.IntType,
+												)
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				None:
+					False
+
+
+pure func test_specialization_keeps_binary_runtime_contract() -> Bool:
+	contract = Concrete.runtime_signature(IntAdd)
+
+	match checked_add(ADD).and_then(pure func(checked): Concrete.specialize(checked)):
+		Err(_):
+			False
+		Ok(program):
+			match Concrete.specialized_contents(program).functions.get(1):
+				Some(function):
+					match function.body:
+						Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+							match value.base:
+								Concrete.ReturnCall(call, [_, _]):
+									match (
+										call.target,
+										contract.parameters,
+										function.signature.parameters,
+									):
+										(Concrete.RuntimeFunction(IntAdd), [Concrete.IntType, Concrete.IntType], [Concrete.IntType, Concrete.IntType]):
+											Concrete.same_type(
+												contract.return_type,
+												Concrete.IntType,
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				None:
+					False
+
+
+private pure func owned_add(
+	ids: InputIds,
+	arguments: List[Own.OwnedArgument],
+) -> Own.OwnershipProgram:
+	{
+		records = [],
+		unions = [],
+		entrypoint = ids.entrypoint,
+		functions = [
+			{
+				execution = OrdinaryCalls,
+				signature = {
+					parameters = [],
+					return_type = Concrete.IntType
+				},
+				operations = [
+					Own.DefineValue({
+						id = ids.first,
+						value_type = Concrete.IntType,
+						operation = Own.IntegerDefinition(20),
+						result = Own.UnmanagedResult,
+						span = span(10),
+					}),
+					Own.DefineValue({
+						id = ids.second,
+						value_type = Concrete.IntType,
+						operation = Own.IntegerDefinition(22),
+						result = Own.UnmanagedResult,
+						span = span(20),
+					}),
+					Own.DefineValue({
+						id = ids.third,
+						value_type = Concrete.IntType,
+						operation = Own.CallDefinition(
+							{
+								target = Concrete.RuntimeFunction(IntAdd),
+								span = span(30)
+							},
+							arguments,
+						),
+						result = Own.UnmanagedResult,
+						span = span(30),
+					}),
+				],
+				tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.third)))
+			},
+		]
+	}
+
+
+pure func test_verifier_accepts_two_unmanaged_runtime_arguments() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			verify(
+				owned_add(
+					ids,
+					[Own.UnmanagedArgument(ids.first), Own.UnmanagedArgument(ids.second)],
+				),
+			).is_ok()
+
+
+pure func test_verifier_rejects_a_missing_runtime_argument() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match verify(owned_add(ids, [Own.UnmanagedArgument(ids.first)])):
+				Ok(_):
+					False
+				Err(error):
+					(
+						error.span.start == 30
+						and error.span.end == 31
+						and error.message == "ownership verification failed: call is missing its argument"
+						and error.help == "report this compiler error with the input program"
+					)
+
+
+pure func test_emitter_includes_portable_addition_only_for_runtime_calls() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match (
+				verify(
+					owned_add(
+						ids,
+						[Own.UnmanagedArgument(ids.first), Own.UnmanagedArgument(ids.second)],
+					),
+				).and_then(pure func(program): emit(program))
+			):
+				Err(_):
+					False
+				Ok(code):
+					(
+						code.contains("uint64_t sum=(uint64_t)first+(uint64_t)second;")
+						and code.contains(
+							"sum<=INT64_MAX?(int64_t)sum:-INT64_C(1)-(int64_t)(UINT64_MAX-sum)",
+						)
+						and code.contains("blorp_int_add(blorp_vl_0,blorp_vl_1)")
+						and not code.contains("blorp_int_to_string")
+					)
+
+
+pure func test_ordinary_zero_argument_function_named_builtin_remains_callable() -> Bool:
+	source: String =
+		|pure func builtin() -> Int:
+		|    42
+		|func main() -> Int:
+		|    builtin()
+		|
+
+	match (
+		parse_modules(
+			[
+				{
+					source = source,
+					targets = []
+				},
+			],
+		)
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			Checked
+				.check(parsed)
+				.is_ok()
+
+
+pure func test_ordinary_binary_function_named_builtin_remains_callable() -> Bool:
+	source: String =
+		|pure func builtin(first: Int, second: Int) -> Int:
+		|    second
+		|func main() -> Int:
+		|    builtin(20, 22)
+		|
+
+	match (
+		parse_modules(
+			[
+				{
+					source = source,
+					targets = []
+				},
+			],
+		)
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			Checked
+				.check(parsed)
+				.is_ok()
+
+
+pure func test_label_selects_operation_for_a_renamed_local_function() -> Bool:
+	source: String =
+		|pure func combine(first: Int, second: Int) -> Int:
+		|    builtin("int.add")
+		|func main() -> Int:
+		|    combine(20, 22)
+		|
+
+	match (
+		parse_modules(
+			[
+				{
+					source = source,
+					targets = []
+				},
+			],
+		)
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			match Checked.check(parsed):
+				Err(_):
+					False
+				Ok(program):
+					match Checked.checked_functions(program).functions.get(0):
+						Some(function):
+							match function.body:
+								Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+									match value.base:
+										Checked.ReturnCall(call, [_, _]):
+											match call.target:
+												Checked.RuntimeFunction(IntAdd):
+													True
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						None:
+							False
+
+
+pure func test_imported_builtin_uses_normal_ufcs() -> Bool:
+	root: String =
+		|import:
+		|    ./int: add
+		|func main() -> Int:
+		|    20.add(22)
+		|
+
+	match (
+		parse_modules([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = ADD,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			Checked
+				.check(parsed)
+				.is_ok()
+
+
+pure func test_verifier_checks_second_runtime_argument_type() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			original = owned_add(
+				ids,
+				[Own.UnmanagedArgument(ids.first), Own.UnmanagedArgument(ids.second)],
+			)
+
+			match original.functions:
+				[function]:
+					wrong = { function |
+						signature = {
+							parameters = [Concrete.StringType],
+							return_type = Concrete.IntType
+						},
+						operations = [
+							Own.DefineValue({
+								id = ids.first,
+								value_type = Concrete.IntType,
+								operation = Own.IntegerDefinition(20),
+								result = Own.UnmanagedResult,
+								span = span(10),
+							}),
+							Own.DefineValue({
+								id = ids.second,
+								value_type = Concrete.StringType,
+								operation = Own.ParameterDefinition(0),
+								result = Own.BorrowedResult(Own.ParameterBorrow(ids.second)),
+								span = span(20),
+							}),
+							Own.DefineValue({
+								id = ids.third,
+								value_type = Concrete.IntType,
+								operation = Own.CallDefinition(
+									{
+										target = Concrete.RuntimeFunction(IntAdd),
+										span = span(30)
+									},
+									[Own.UnmanagedArgument(ids.first), Own.BorrowedArgument({
+											value = ids.second,
+											source = Own.ParameterBorrow(ids.second),
+										})],
+								),
+								result = Own.UnmanagedResult,
+								span = span(30),
+							}),
+						]
+					}
+
+					match (
+						verify(
+							{ original | functions = [function, wrong] },
+						)
+					):
+						Ok(_):
+							False
+						Err(error):
+							(
+								error.span.start == 30
+								and error.span.end == 31
+								and error.message == "ownership verification failed: call argument type does not match its contract"
+								and error.help == "report this compiler error with the input program"
+							)
+				_:
+					False
+
+
+private UNARY_ROOT: String =
+	|import:
+	|    ./string: count
+	|func main() -> Int:
+	|    count(42.to_string())
+	|
+
+private UNARY_HELPER: String =
+	|pure func count(value: String) -> Int:
+	|    builtin("string.length")
+	|
+
+
+private pure func borrows_parameter(function: Own.OwnedFunction) -> Bool:
+	match function.operations:
+		[Own.DefineValue(parameter), Own.DefineValue(result)]:
+			match (parameter.operation, parameter.result, result.operation):
+				(Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(source)), Own.CallDefinition(call, [Own.BorrowedArgument(argument)])):
+					match (call.target, argument.source, result.result):
+						(Concrete.RuntimeFunction(StringLength), Own.ParameterBorrow(argument_source), Own.UnmanagedResult):
+							(
+								value_number(source) == value_number(parameter.id)
+								and value_number(argument.value) == value_number(parameter.id)
+								and value_number(argument_source) == value_number(parameter.id)
+								and Concrete.same_type(parameter.value_type, Concrete.StringType)
+								and Concrete.same_type(result.value_type, Concrete.IntType)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_unary_module_builtin_preserves_managed_parameter_borrow() -> Bool:
+	match (
+		owned_sources([
+			{
+				source = UNARY_ROOT,
+				targets = [1]
+			},
+			{
+				source = UNARY_HELPER,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(program):
+			match program.functions:
+				[caller, helper]:
+					var dropped = False
+
+					for operation in caller.operations:
+						match operation:
+							Own.DropOwner(owner, _):
+								dropped = dropped or Own.owner_number(owner) == 0
+							_:
+								void
+
+					borrows_parameter(helper) and dropped and verify(program).is_ok()
+				_:
+					False
+
+
+pure func test_unary_module_builtin_emits_caller_cleanup() -> Bool:
+	match (
+		emitted_sources([
+			{
+				source = UNARY_ROOT,
+				targets = [1]
+			},
+			{
+				source = UNARY_HELPER,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(code):
+			(
+				code.contains("blorp_string_length(blorp_vl_0)")
+				and code.contains("blorp_string_release(blorp_owner_0);")
+				and not code.contains("blorp_int_add")
+			)
+
+
+pure func test_module_builtin_transfers_its_fresh_string_result() -> Bool:
+	root: String =
+		|import:
+		|    ./int: format
+		|func main() -> Int:
+		|    format(42).length()
+		|
+	helper: String =
+		|pure func format(value: Int) -> String:
+		|    builtin("int.to_string")
+		|
+	sources: List[ModuleInput] = [
+		{
+			source = root,
+			targets = [1]
+		},
+		{
+			source = helper,
+			targets = []
+		},
+	]
+
+	match parse_modules(sources).and_then(pure func(parsed): Checked
+			.check(parsed)
+			.map_err(setup_diagnostic)):
+		Err(_):
+			False
+		Ok(checked):
+			var checked_result = False
+
+			match Checked.checked_functions(checked).functions.get(1):
+				Some(function):
+					match function.body:
+						Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+							match value.base:
+								Checked.ReturnCall(call, [argument]):
+									match (call.target, argument.base):
+										(Checked.RuntimeFunction(IntToString), Checked.ReturnBinding(parameter)):
+											checked_result = (
+												Checked.same_type(
+													value.base_type,
+													Checked.StringType,
+												)
+												and Checked.same_type(
+													argument.base_type,
+													Checked.IntType,
+												)
+												and Checked.binding_number(parameter) == 0
+											)
+										_:
+											void
+								_:
+									void
+						_:
+							void
+				None:
+					void
+
+			match owned_sources(sources):
+				Err(_):
+					False
+				Ok(program):
+					match program.functions:
+						[caller, helper]:
+							match (caller.operations, helper.operations, helper.tail):
+								([Own.DefineValue(_), Own.DefineValue(formatted), Own.DefineValue(_), Own.DropOwner(dropped, _)], [Own.DefineValue(parameter), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, transferred)))):
+									match (
+										parameter.operation,
+										result.operation,
+										result.result,
+										formatted.result,
+									):
+										(Own.ParameterDefinition(0), Own.CallDefinition(call, [Own.UnmanagedArgument(argument)]), Own.OwnedResult(created), Own.OwnedResult(caller_owner)):
+											match call.target:
+												Concrete.RuntimeFunction(IntToString):
+													(
+														checked_result
+														and Concrete.same_type(
+															result.value_type,
+															Concrete.StringType,
+														)
+														and value_number(
+															argument,
+														) == value_number(parameter.id)
+														and value_number(
+															value,
+														) == value_number(result.id)
+														and Own.owner_number(
+															created,
+														) == Own.owner_number(transferred)
+														and Own.owner_number(
+															caller_owner,
+														) == Own.owner_number(dropped)
+														and verify(program).is_ok()
+													)
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+
+
+pure func test_imported_builtin_call_keeps_ordinary_declaration_identity() -> Bool:
+	match checked_add(ADD):
+		Err(_):
+			False
+		Ok(program):
+			match Checked.checked_functions(program).functions.get(0):
+				None:
+					False
+				Some(caller):
+					match Checked.function_calls(caller):
+						[call]:
+							match call.target:
+								Checked.UserFunction(id, []):
+									function_number(id) == 1
+								_:
+									False
+						_:
+							False
+
+
+pure func test_builtin_signature_error_precedes_unrelated_caller_body() -> Bool:
+	root: String =
+		|import:
+		|    ./int: add
+		|func main() -> Int:
+		|    missing()
+		|
+	helper: String =
+		|pure func add(first: Int, second: String) -> Int:
+		|    builtin("int.add")
+		|
+
+	match (
+		parse_modules([
+			{
+				source = root,
+				targets = [1]
+			},
+			{
+				source = helper,
+				targets = []
+			},
+		])
+	):
+		Err(_):
+			False
+		Ok(parsed):
+			match Checked.check(parsed):
+				Ok(_):
+					False
+				Err(failure):
+					match Checked.check_errors(failure).first.kind:
+						Checked.BuiltinContractMismatch(IntAdd):
+							True
+						_:
+							False
+
+
+pure func test_addition_helper_is_absent_without_runtime_calls() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    42
+		|
+
+	match (
+		emitted_sources(
+			[
+				{
+					source = source,
+					targets = []
+				},
+			],
+		)
+	):
+		Err(_):
+			False
+		Ok(code):
+			code == "#include <stdint.h>\nint64_t blorp_f_0(void);int64_t blorp_f_0(void){const int64_t blorp_vl_0=INT64_C(42);(void)blorp_vl_0;return blorp_vl_0;}int main(void){return (int)blorp_f_0();}\n"
+
+
+pure func test_emitter_finds_runtime_addition_inside_a_match_arm() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			original = owned_add(
+				ids,
+				[Own.UnmanagedArgument(ids.first), Own.UnmanagedArgument(ids.second)],
+			)
+
+			match original.functions:
+				[function]:
+					matched = { function |
+						operations = [Own.DefineValue({
+								id = ids.first,
+								value_type = Concrete.UnionType(ids.union_id),
+								operation = Own.VariantDefinition(ids.second_variant),
+								result = Own.UnmanagedResult,
+								span = span(1),
+							})],
+						tail = Own.MatchTail({
+							scrutinee = ids.first,
+							owner = ids.union_id,
+							arms = [
+								{
+									label = DefaultLabel,
+									operations = [
+										Own.DefineValue({
+											id = ids.second,
+											value_type = Concrete.IntType,
+											operation = Own.IntegerDefinition(20),
+											result = Own.UnmanagedResult,
+											span = span(10),
+										}),
+										Own.DefineValue({
+											id = ids.third,
+											value_type = Concrete.IntType,
+											operation = Own.IntegerDefinition(22),
+											result = Own.UnmanagedResult,
+											span = span(20),
+										}),
+										Own.DefineValue({
+											id = ids.fourth,
+											value_type = Concrete.IntType,
+											operation = Own.CallDefinition(
+												{
+													target = Concrete.RuntimeFunction(IntAdd),
+													span = span(30)
+												},
+												[
+													Own.UnmanagedArgument(ids.second),
+													Own.UnmanagedArgument(ids.third),
+												],
+											),
+											result = Own.UnmanagedResult,
+											span = span(30),
+										}),
+									],
+									exit = Own.ReturnResult(Own.UnmanagedReturn(ids.fourth))
+								},
+							],
+						})
+					}
+
+					match verify({ original |
+							unions = ids.unions,
+							functions = [matched]
+						}).and_then(pure func(program): emit(program)):
+						Err(_):
+							False
+						Ok(code):
+							(
+								code.contains("static int64_t blorp_int_add(")
+								and code.contains("blorp_int_add(blorp_vl_1,blorp_vl_2)")
+							)
+				_:
+					False
+
+
+pure func test_unused_builtin_declaration_keeps_its_required_helper() -> Bool:
+	source = ADD + "func main() -> Int:\n    42\n"
+
+	match (
+		emitted_sources(
+			[
+				{
+					source = source,
+					targets = []
+				},
+			],
+		)
+	):
+		Err(_):
+			False
+		Ok(code):
+			(
+				code.contains("static int64_t blorp_int_add(")
+				and code.contains("blorp_int_add(blorp_vl_0,blorp_vl_1)")
+			)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 builtin function declarations",
+	tests = [
+		("module builtin addition is accepted", test_module_builtin_add_is_accepted),
+		(
+			"parser publishes typed builtin source span",
+			test_parser_publishes_typed_builtin_and_source_span,
+		),
+		("binary runtime contract is complete", test_binary_runtime_contract_is_complete),
+		(
+			"prelude and module share binary syntax",
+			test_prelude_and_module_share_binary_builtin_syntax,
+		),
+		(
+			"unknown builtin label is rejected by parser",
+			test_unknown_builtin_label_is_rejected_before_checking,
+		),
+		(
+			"builtin body rejects trailing expression",
+			test_builtin_body_cannot_have_a_trailing_expression,
+		),
+		("builtin rejects impurity", test_builtin_rejects_impurity),
+		("builtin rejects zero parameters", test_builtin_rejects_zero_parameters),
+		("builtin rejects one parameter", test_builtin_rejects_one_parameter),
+		("builtin rejects extra parameter", test_builtin_rejects_extra_parameter),
+		("builtin rejects wrong first type", test_builtin_rejects_wrong_first_type),
+		("builtin rejects wrong second type", test_builtin_rejects_wrong_second_type),
+		("builtin rejects wrong result type", test_builtin_rejects_wrong_result_type),
+		("builtin rejects generic header", test_builtin_rejects_generic_header),
+		("builtin rejects prefix bindings", test_builtin_rejects_prefix_bindings),
+		("builtin rejects tail annotation", test_builtin_rejects_tail_annotation),
+		(
+			"checker reads ordered parameter identities",
+			test_checked_builtin_reads_its_ordered_parameter_identities,
+		),
+		(
+			"specialization keeps binary runtime contract",
+			test_specialization_keeps_binary_runtime_contract,
+		),
+		(
+			"verifier accepts two unmanaged runtime arguments",
+			test_verifier_accepts_two_unmanaged_runtime_arguments,
+		),
+		(
+			"verifier rejects missing runtime argument",
+			test_verifier_rejects_a_missing_runtime_argument,
+		),
+		(
+			"emitter includes portable addition helper",
+			test_emitter_includes_portable_addition_only_for_runtime_calls,
+		),
+		(
+			"ordinary zero argument builtin remains callable",
+			test_ordinary_zero_argument_function_named_builtin_remains_callable,
+		),
+		(
+			"ordinary binary builtin remains callable",
+			test_ordinary_binary_function_named_builtin_remains_callable,
+		),
+		(
+			"label selects renamed local operation",
+			test_label_selects_operation_for_a_renamed_local_function,
+		),
+		("imported builtin uses normal UFCS", test_imported_builtin_uses_normal_ufcs),
+		(
+			"verifier checks second runtime argument type",
+			test_verifier_checks_second_runtime_argument_type,
+		),
+		(
+			"unary module builtin borrows managed parameter",
+			test_unary_module_builtin_preserves_managed_parameter_borrow,
+		),
+		(
+			"unary module builtin emits caller cleanup",
+			test_unary_module_builtin_emits_caller_cleanup,
+		),
+		(
+			"module builtin transfers fresh String result",
+			test_module_builtin_transfers_its_fresh_string_result,
+		),
+		(
+			"imported builtin keeps ordinary declaration identity",
+			test_imported_builtin_call_keeps_ordinary_declaration_identity,
+		),
+		(
+			"builtin signature error precedes caller body",
+			test_builtin_signature_error_precedes_unrelated_caller_body,
+		),
+		(
+			"addition helper absent without runtime calls",
+			test_addition_helper_is_absent_without_runtime_calls,
+		),
+		(
+			"emitter finds addition inside match arm",
+			test_emitter_finds_runtime_addition_inside_a_match_arm,
+		),
+		(
+			"unused builtin retains required helper",
+			test_unused_builtin_declaration_keeps_its_required_helper,
+		),
+	]
+}
