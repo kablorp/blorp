@@ -1,14 +1,18 @@
 import:
 	./prelude: prelude_names
 	check as Check
+	declarations:
+		VariantId,
+		function_number, union_number, record_number, variant_owner, variant_number
 	int as IntOps
 	names: NameId, NameTable, name_spelling
+	namespace: ImportProblem(RepeatedModuleImport, MissingImportedFunction, UnsupportedTypeImport)
 	option: to_result
 	parse: ParsedContents, ParsedProgram, parsed_contents
 	syntax:
 		CallNotation(DirectCall, ReceiverCall),
 		Diagnostic,
-		DiagnosticNote(TypeDeclaration, RecordFieldDeclaration, PreviousField),
+		DiagnosticNote(TypeDeclaration, RecordFieldDeclaration, PreviousField, PreviousDeclaration),
 		Diagnostics,
 		Span,
 	text as Text
@@ -41,6 +45,8 @@ private pure func invariant_message(invariant: Check.CheckerInvariant) -> String
 			"invalid record field identity"
 		Check.InvalidResolvedFunction(_):
 			"invalid resolved function identity"
+		Check.AmbiguousResolvedFunction(_):
+			"ambiguous function survived declaration and import validation"
 		Check.InvalidUnionDeclaration(_):
 			"invalid union declaration"
 		Check.VariantOccurrenceWithoutUnion(_):
@@ -297,6 +303,24 @@ pure func render_check_error(program: ParsedProgram, error: Check.CheckError) ->
 			rendered(error.span, "main must return Int", "declare main() -> Int: as the entrypoint")
 		Check.DuplicateFunction(_, _):
 			rendered(error.span, "duplicate function name", "give every function a distinct name")
+		Check.ImportRejected(problem):
+			match problem:
+				RepeatedModuleImport(_, previous, _):
+					{ rendered(error.span, "module imported more than once", "combine the selected function names into one import") |
+						note = Some(PreviousDeclaration(previous))
+					}
+				MissingImportedFunction(_, _):
+					rendered(error.span, "unknown imported function", "select a function declared directly in that module; imports are not reexported")
+				UnsupportedTypeImport(_, _):
+					rendered(error.span, "only functions can be imported in this increment", "keep type and variant declarations in their defining module; import a function that uses them")
+		Check.ImportedFunctionConflict(_, previous):
+			{ rendered(error.span, "imported function conflicts with another function", "give the functions distinct names or remove the duplicate import") |
+				note = Some(PreviousDeclaration(previous))
+			}
+		Check.ImportedVariantConflict(_, previous):
+			{ rendered(error.span, "imported function conflicts with a local variant", "give the imported function and local variant distinct names") |
+				note = Some(PreviousDeclaration(previous))
+			}
 		Check.MissingMain:
 			rendered(
 				error.span,
@@ -577,11 +601,11 @@ private pure func parameter_spelling(
 	parameters = match Check.parameter_owner(id):
 		Check.FunctionDeclaration(owner):
 			context.functions
-				.get(Check.function_number(owner))
+				.get(function_number(owner))
 				.map(pure func(declaration): declaration.type_parameters)
 		Check.UnionDeclaration(owner):
 			context.unions
-				.get(Check.union_number(owner))
+				.get(union_number(owner))
 				.map(pure func(declaration): declaration.type_parameters)
 
 	written ?= match parameters:
@@ -609,7 +633,7 @@ private pure func type_spelling(
 	match value:
 		Check.RecordType(id):
 			declaration ?= context.records
-				.get(Check.record_number(id))
+				.get(record_number(id))
 				.to_result(render_fault(span, Check.InvalidRecordDeclaration(id)))
 			parsed_spelling(declaration.type_name.id, context.names, span)
 		Check.IntType:
@@ -620,7 +644,7 @@ private pure func type_spelling(
 			parameter_spelling(id, context, span)
 		Check.UnionType(id):
 			declaration ?= context.unions
-				.get(Check.union_number(id))
+				.get(union_number(id))
 				.to_result(render_fault(span, Check.InvalidResolvedUnion(id)))
 			parsed_spelling(declaration.type_name.id, context.names, span)
 		Check.AppliedUnionType(id, arguments):
@@ -654,15 +678,15 @@ private pure func type_spelling(
 
 
 private pure func missing_variant_name(
-	id: Check.VariantId,
+	id: VariantId,
 	span: Span,
 	context: ParsedContents,
 ) -> Result[String, Diagnostic]:
 	declaration ?= context.unions
-		.get(Check.union_number(Check.variant_owner(id)))
-		.to_result(render_fault(span, Check.InvalidResolvedUnion(Check.variant_owner(id))))
+		.get(union_number(variant_owner(id)))
+		.to_result(render_fault(span, Check.InvalidResolvedUnion(variant_owner(id))))
 	variant ?= declaration.variants
-		.get(Check.variant_number(id))
+		.get(variant_number(id))
 		.to_result(render_fault(span, Check.InvalidResolvedVariant(id)))
 	name ?= parsed_spelling(variant.name.id, context.names, span)
 
@@ -674,7 +698,7 @@ private pure func missing_variant_name(
 
 
 private pure func missing_coverage(
-	remaining: List[Check.VariantId],
+	remaining: List[VariantId],
 	span: Span,
 	context: ParsedContents,
 ) -> Diagnostic:

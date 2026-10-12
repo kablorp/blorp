@@ -1,0 +1,216 @@
+import:
+	declarations:
+		FunctionId,
+		RecordId,
+		UnionId,
+		VariantId,
+		function_id,
+		record_id,
+		union_id,
+		variant_id,
+	int as IntOps
+	names: NameId, same_name
+	parse: ModuleImport, ParsedProgram, parsed_contents
+	source: ModuleId, same_module
+	syntax: Span, WrittenName
+
+
+fixed union FunctionOrigin:
+	LocalFunction
+	ImportedFunction(Span)
+
+
+fixed record FunctionCandidate {
+	function: FunctionId,
+	origin: FunctionOrigin
+}
+
+
+fixed record ImportedFunctionBinding {
+	module: ModuleId,
+	name: WrittenName,
+	function: FunctionId
+}
+
+
+fixed union TypeCandidate:
+	UnionCandidate(UnionId)
+	RecordCandidate(RecordId)
+
+
+fixed union ImportProblem:
+	RepeatedModuleImport(ModuleId, Span, Span)
+	MissingImportedFunction(ModuleId, WrittenName)
+	UnsupportedTypeImport(ModuleId, WrittenName)
+
+
+private fixed record LocalFunctionBinding {
+	module: ModuleId,
+	name: NameId,
+	function: FunctionId
+}
+
+
+private fixed record LocalTypeBinding {
+	module: ModuleId,
+	name: NameId,
+	target: TypeCandidate
+}
+
+
+private fixed record LocalVariantBinding {
+	module: ModuleId,
+	name: NameId,
+	variant: VariantId
+}
+
+
+private fixed record NamespaceContents {
+	functions: List[LocalFunctionBinding],
+	imports: List[ImportedFunctionBinding],
+	types: List[LocalTypeBinding],
+	variants: List[LocalVariantBinding],
+	problems: List[ImportProblem]
+}
+
+
+-- Derived solely from one parsed program. Complete candidate sets preserve
+-- conflicts for the checker without publishing any accepted semantic types.
+opaque type Namespace = NamespaceContents
+
+
+pure func local_function_candidates(
+	namespace: Namespace,
+	module: ModuleId,
+	name: NameId,
+) -> List[FunctionId]:
+	var candidates: List[FunctionId] = []
+	for binding in from_opaque Namespace(namespace).functions:
+		if same_module(binding.module, module) and same_name(binding.name, name):
+			candidates = candidates.append(binding.function)
+	candidates
+
+
+pure func function_candidates(
+	namespace: Namespace,
+	module: ModuleId,
+	name: NameId,
+) -> List[FunctionCandidate]:
+	var candidates: List[FunctionCandidate] = []
+	for function in local_function_candidates(namespace, module, name):
+		candidates = candidates.append({ function = function, origin = LocalFunction })
+	for binding in from_opaque Namespace(namespace).imports:
+		if same_module(binding.module, module) and same_name(binding.name.id, name):
+			candidates = candidates.append({
+				function = binding.function,
+				origin = ImportedFunction(binding.name.span)
+			})
+	candidates
+
+
+pure func type_candidates(
+	namespace: Namespace,
+	module: ModuleId,
+	name: NameId,
+) -> List[TypeCandidate]:
+	var candidates: List[TypeCandidate] = []
+	for binding in from_opaque Namespace(namespace).types:
+		if same_module(binding.module, module) and same_name(binding.name, name):
+			candidates = candidates.append(binding.target)
+	candidates
+
+
+pure func variant_candidates(
+	namespace: Namespace,
+	module: ModuleId,
+	name: NameId,
+) -> List[VariantId]:
+	var candidates: List[VariantId] = []
+	for binding in from_opaque Namespace(namespace).variants:
+		if same_module(binding.module, module) and same_name(binding.name, name):
+			candidates = candidates.append(binding.variant)
+	candidates
+
+
+pure func imported_functions(namespace: Namespace) -> List[ImportedFunctionBinding]:
+	from_opaque Namespace(namespace).imports
+
+
+pure func import_problems(namespace: Namespace) -> List[ImportProblem]:
+	from_opaque Namespace(namespace).problems
+
+
+pure func build_namespace(program: ParsedProgram) -> Namespace:
+	parsed = parsed_contents(program)
+	var functions: List[LocalFunctionBinding] = []
+	var types: List[LocalTypeBinding] = []
+	var variants: List[LocalVariantBinding] = []
+	var position: Int = 0
+	for function in parsed.functions:
+		functions = functions.append({
+			module = function.module,
+			name = function.function_name.id,
+			function = function_id(position)
+		})
+		position = IntOps.add(position, 1)
+	position = 0
+	for declaration in parsed.unions:
+		owner = union_id(position)
+		types = types.append({
+			module = declaration.module,
+			name = declaration.type_name.id,
+			target = UnionCandidate(owner)
+		})
+		var variant_position: Int = 0
+		for variant in declaration.variants:
+			variants = variants.append({
+				module = declaration.module,
+				name = variant.name.id,
+				variant = variant_id(owner, variant_position)
+			})
+			variant_position = IntOps.add(variant_position, 1)
+		position = IntOps.add(position, 1)
+	position = 0
+	for declaration in parsed.records:
+		types = types.append({
+			module = declaration.module,
+			name = declaration.type_name.id,
+			target = RecordCandidate(record_id(position))
+		})
+		position = IntOps.add(position, 1)
+	local = into_opaque Namespace({
+		functions = functions,
+		imports = [],
+		types = types,
+		variants = variants,
+		problems = []
+	})
+	var imports: List[ImportedFunctionBinding] = []
+	var problems: List[ImportProblem] = []
+	for module in parsed.modules:
+		var previous: List[ModuleImport] = []
+		for request in module.imports:
+			for first in previous:
+				if same_module(first.target, request.target):
+					problems = problems.append(RepeatedModuleImport(request.target, first.span, request.span))
+					break
+			previous = previous.append(request)
+			for symbol in request.symbols:
+				candidates = local_function_candidates(local, request.target, symbol.id)
+				match candidates:
+					[]:
+						problem = match type_candidates(local, request.target, symbol.id):
+							[]:
+								MissingImportedFunction(request.target, symbol)
+							_:
+								UnsupportedTypeImport(request.target, symbol)
+						problems = problems.append(problem)
+					_:
+						for function in candidates:
+							imports = imports.append({
+								module = module.module,
+								name = symbol,
+								function = function
+							})
+	contents = from_opaque Namespace(local)
+	into_opaque Namespace({ contents | imports = imports, problems = problems })

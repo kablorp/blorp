@@ -153,8 +153,8 @@ Apply these lessons to every increment:
 After loading all source inputs and explicit configuration, the entire
 compilation pipeline, including diagnostic rendering, is pure. Local `var`
 and builders are allowed. The surrounding shell owns filesystem access,
-environment reads, clocks, process execution, and printing. Future import
-loading supplies a complete source bundle to the pipeline. Reports and
+environment reads, clocks, process execution, and printing. Module loading
+publishes a complete parsed program and explicit source inventory. Reports and
 measurements produced inside a phase return as data; shared mutable caches
 are not implicit inputs.
 

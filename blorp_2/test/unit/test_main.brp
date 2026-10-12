@@ -1,10 +1,16 @@
 import:
-	../../src/main:
-		CompilationDiagnostic(PreludeDiagnostics, ProgramDiagnostics),
-		compile as compile_inputs,
-		render_diagnostics,
+	../../src/load: SourceInputs, prepare_prelude
+	../../src/main: render_diagnostics
+	../../src/source:
+		COMPILER_SOURCE,
+		PRELUDE_SOURCE,
+		module_id,
+		module_number,
+		module_source,
+		root_module_id,
+		same_source,
 	../../src/syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration), singleton_diagnostic
-	compilation: compile
+	compilation: compile, diagnostic_sources
 	input: TEST_PRELUDE
 	test: TestSuite
 
@@ -18,20 +24,21 @@ private LEXICAL_HELP: String = (
 pure func test_optional_note_renders_its_meaning_and_declaration_location() -> Bool:
 	error: Diagnostic = {
 		span = {
+			source = module_source(root_module_id()),
 			start = 8,
 			end = 21
 		},
 		note = Some(UnionPayloadDeclaration({
+			source = module_source(root_module_id()),
 			start = 0,
 			end = 7,
 		})),
 		message = "unsupported payload",
 		help = "use Int"
 	}
-	with_note = render_diagnostics("demo", "payload\ninstantiation\n", singleton_diagnostic(error))
+	with_note = render_diagnostics(diagnostic_sources("demo", "payload\ninstantiation\n"), singleton_diagnostic(error))
 	without_note = render_diagnostics(
-		"demo",
-		"payload\ninstantiation\n",
+		diagnostic_sources("demo", "payload\ninstantiation\n"),
 		singleton_diagnostic({ error | note = None }),
 	)
 	(
@@ -41,77 +48,131 @@ pure func test_optional_note_renders_its_meaning_and_declaration_location() -> B
 
 
 pure func test_missing_prelude_type_keeps_prelude_origin() -> Bool:
-	source: String =
-		|func main() -> Int:
-		|	0
-		|
 	prelude = "type Int = builtin\n"
 
-	match compile_inputs({
-		prelude = prelude,
-		program = source,
-	}):
-		Err(PreludeDiagnostics(errors)):
-			match errors.remaining:
-				[]:
-					error = errors.first
-					(
-						error.span.start == prelude.length()
-						and error.span.end == prelude.length()
-						and error.message == "missing String builtin declaration"
-						and error.help == "add type String = builtin to the prelude"
-					)
-				_:
-					False
-		_:
+	match prepare_prelude(prelude):
+		Err(error):
+			(
+				same_source(error.span.source, PRELUDE_SOURCE)
+				and error.span.start == prelude.length()
+				and error.span.end == prelude.length()
+				and error.message == "missing String builtin declaration"
+				and error.help == "add type String = builtin to the prelude"
+			)
+		Ok(_):
 			False
 
 
 pure func test_program_error_keeps_program_origin() -> Bool:
-	match compile_inputs({
-		prelude = TEST_PRELUDE,
-		program = "$",
-	}):
-		Err(ProgramDiagnostics(errors)):
+	match compile("$"):
+		Err(errors):
 			match errors.remaining:
 				[]:
 					error = errors.first
 					(
-						error.span.start == 0
+						same_source(error.span.source, module_source(root_module_id()))
+						and error.span.start == 0
 						and error.span.end == 1
 						and error.message == "unsupported character"
 						and error.help == LEXICAL_HELP
 					)
 				_:
 					False
-		_:
+		Ok(_):
 			False
 
 
 pure func test_invalid_prelude_is_not_rendered_as_program_error() -> Bool:
-	source: String =
-		|func main() -> Int:
-		|	0
-		|
+	inputs: SourceInputs = {
+		prelude = { path = "prelude.brp", contents = "$" },
+		modules = [{ path = "main.brp", contents = "func main() -> Int:\n\t0\n" }]
+	}
 
-	match compile_inputs({
-		prelude = "$",
-		program = source,
-	}):
-		Err(PreludeDiagnostics(errors)):
-			match errors.remaining:
-				[]:
-					error = errors.first
-					(
-						error.span.start == 0
-						and error.span.end == 1
-						and error.message == "unsupported character"
-						and error.help == LEXICAL_HELP
-					)
-				_:
-					False
-		_:
+	match prepare_prelude(inputs.prelude.contents):
+		Err(error):
+			(
+				same_source(error.span.source, PRELUDE_SOURCE)
+				and error.span.start == 0
+				and error.span.end == 1
+				and error.message == "unsupported character"
+				and error.help == LEXICAL_HELP
+				and render_diagnostics(inputs, singleton_diagnostic(error)) == (
+					"prelude.brp:1:1: error: unsupported character\nhelp: " + LEXICAL_HELP
+				)
+			)
+		Ok(_):
 			False
+
+
+pure func test_primary_and_note_use_their_own_module_sources() -> Bool:
+	match module_id(module_number(root_module_id()) + 1):
+		None:
+			False
+		Some(dependency):
+			inputs: SourceInputs = {
+				prelude = { path = "prelude.brp", contents = TEST_PRELUDE },
+				modules = [
+					{ path = "main.brp", contents = "lead\ncall()\n" },
+					{ path = "library.brp", contents = "one\ntwo\npayload\n" },
+				]
+			}
+			error: Diagnostic = {
+				span = { source = module_source(root_module_id()), start = 5, end = 11 },
+				note = Some(UnionPayloadDeclaration({
+					source = module_source(dependency), start = 8, end = 15
+				})),
+				message = "unsupported payload",
+				help = "use Int"
+			}
+			render_diagnostics(inputs, singleton_diagnostic(error)) == (
+				"main.brp:2:1: error: unsupported payload\nhelp: use Int\nlibrary.brp:3:1: note: union payload declared here"
+			)
+
+
+private pure func missing_source_error(note_is_missing: Bool) -> Bool:
+	match module_id(module_number(root_module_id()) + 1):
+		None:
+			False
+		Some(absent):
+			root_span = { source = module_source(root_module_id()), start = 0, end = 1 }
+			missing_span = { root_span | source = module_source(absent) }
+			primary = if note_is_missing:
+				root_span
+			else:
+				missing_span
+			note = if note_is_missing:
+				Some(UnionPayloadDeclaration(missing_span))
+			else:
+				None
+			error: Diagnostic = {
+				span = primary,
+				note = note,
+				message = "original diagnostic",
+				help = "original help"
+			}
+			render_diagnostics(diagnostic_sources("main.brp", "0"), singleton_diagnostic(error)) == (
+				"blorp_2: error: diagnostic references a missing module source\nhelp: report this compiler error with the input files"
+			)
+
+
+pure func test_missing_primary_source_is_an_explicit_error() -> Bool:
+	missing_source_error(False)
+
+
+pure func test_missing_note_source_is_an_explicit_error() -> Bool:
+	missing_source_error(True)
+
+
+pure func test_compiler_origin_has_no_user_file_location() -> Bool:
+	error: Diagnostic = {
+		span = { source = COMPILER_SOURCE, start = 0, end = 0 },
+		note = None,
+		message = "internal compiler error",
+		help = "report the input files"
+	}
+	render_diagnostics(diagnostic_sources("main.brp", "0"), singleton_diagnostic(error)) == (
+		"blorp_2: error: internal compiler error\nhelp: report the input files"
+	)
 
 
 pure func test_complete_pipeline_emits_c() -> Bool:
@@ -285,6 +346,10 @@ tests: TestSuite = {
 			test_missing_prelude_type_keeps_prelude_origin,
 		),
 		("program error keeps program origin", test_program_error_keeps_program_origin),
+		("primary and note use their own module sources", test_primary_and_note_use_their_own_module_sources),
+		("missing primary source is an explicit error", test_missing_primary_source_is_an_explicit_error),
+		("missing note source is an explicit error", test_missing_note_source_is_an_explicit_error),
+		("compiler origin has no user file location", test_compiler_origin_has_no_user_file_location),
 		(
 			"invalid prelude retains source origin",
 			test_invalid_prelude_is_not_rendered_as_program_error,

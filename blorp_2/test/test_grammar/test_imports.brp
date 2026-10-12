@@ -1,0 +1,160 @@
+import:
+	../../src/lex: lex
+	../../src/parse: ParsedModule, assembly_names, begin_program, parse_module
+	../../src/source: module_source, root_module_id
+	../../src/syntax: Diagnostic
+	../unit/input: checked_prelude
+	option: is_none
+	test: TestSuite
+
+
+private IDENTIFIER_HELP: String = (
+	"use an ASCII identifier starting with a letter or underscore; 'func', 'pure', "
+	+ "'match', 'var', and lone '_' are reserved"
+)
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	prelude ?= checked_prelude()
+	assembly = begin_program(prelude)
+	tokens ?= lex(module_source(root_module_id()), source)
+	parse_module(tokens, root_module_id(), assembly_names(assembly))
+
+
+private pure func accepts(source: String) -> Bool:
+	match parse_source(source):
+		Ok(_):
+			True
+		_:
+			False
+
+
+private pure func rejects(prefix: String, marked: String, suffix: String, message: String, help: String) -> Bool:
+	match parse_source(prefix + marked + suffix):
+		Err(error):
+			(
+				error.span.start == prefix.length()
+					and error.span.end == prefix.length() + marked.length()
+					and error.message == message and error.help == help and error.note.is_none()
+			)
+		_:
+			False
+
+
+pure func test_relative_imports_with_comments_and_declarations() -> Bool:
+	source: String =
+		|-- module comment
+		|import: -- selections
+		|    ./helper: answer, other -- first target
+		|
+		|    ../../shared/math: third
+		|import:
+		|    ../last: fourth
+		|func main() -> Int:
+		|    answer()
+		|
+	accepts(source)
+
+
+pure func test_import_word_remains_a_function_and_local_name() -> Bool:
+	source: String =
+		|pure func import(import: Int) -> Int:
+		|    import
+		|func main() -> Int:
+		|    import(42)
+		|
+	accepts(source)
+
+
+pure func test_bare_paths_require_relative_prefix() -> Bool:
+	rejects("import:\n    ", "helper", ": answer\n", "expected an explicit relative import path", "write ./helper: answer or ../shared/helper: answer; bare and package imports are not supported yet")
+
+
+pure func test_interior_dot_segments_are_rejected() -> Bool:
+	rejects("import:\n    ./shared/", ".", "/helper: answer\n", "'.' and '..' may only begin an import path", "write ../shared/helper or ./shared/helper without interior dot segments")
+
+
+pure func test_spaced_path_characters_are_rejected() -> Bool:
+	rejects("import:\n    . ", "/", "helper: answer\n", "import paths cannot contain spaces", "write adjacent path characters, such as ./helper or ../shared/helper")
+
+
+pure func test_file_extensions_are_rejected() -> Bool:
+	rejects("import:\n    ./helper", ".", "brp: answer\n", "import paths omit file extensions", "write ./helper: answer instead of ./helper.brp: answer")
+
+
+pure func test_module_aliases_are_rejected() -> Bool:
+	rejects("import:\n    ./helper ", "as", " Helpers\n", "import aliases are not supported yet", "select functions directly, such as ./helper: answer")
+
+
+pure func test_function_aliases_are_rejected() -> Bool:
+	rejects("import:\n    ./helper: answer ", "as", " value\n", "import aliases are not supported yet", "select the function by its declared name, such as ./helper: answer")
+
+
+pure func test_wildcard_selections_are_rejected() -> Bool:
+	rejects("import:\n    ./helper: ", "*", "\n", "wildcard imports are not supported", "list the functions you need, such as ./helper: answer")
+
+
+pure func test_constructor_selections_are_rejected() -> Bool:
+	rejects("import:\n    ./helper: Choice", "(", "One)\n", "constructor imports are not supported yet", "select function names only, such as ./helper: answer")
+
+
+pure func test_missing_selections_are_rejected() -> Bool:
+	rejects("import:\n    ./helper:", "\n", "", "expected an imported function name", IDENTIFIER_HELP)
+
+
+pure func test_whole_module_imports_are_rejected() -> Bool:
+	rejects("import:\n    ./helper", "\n", "", "expected ':' and selected function names after the import path", "write ./helper: answer; module aliases and whole-module imports are not supported yet")
+
+
+pure func test_trailing_comma_requires_a_name() -> Bool:
+	rejects("import:\n    ./helper: answer,", "\n", "", "expected an imported function name", IDENTIFIER_HELP)
+
+
+pure func test_import_block_requires_indented_rows() -> Bool:
+	rejects("import:\n", "func", " main() -> Int:\n    0\n", "expected an indented import", "indent each ./helper: answer line with one tab or four spaces")
+
+
+pure func test_imports_in_function_bodies_teach_module_scope() -> Bool:
+	rejects("func main() -> Int:\n    ", "import", ":\n        ./helper: answer\n", "imports belong at module scope", "move import: and its selected functions before the module's declarations at column 1")
+
+
+pure func test_imports_after_functions_are_rejected() -> Bool:
+	rejects("func main() -> Int:\n    0\n", "import", ":\n    ./helper: answer\n", "imports must precede declarations", "move every import: block before the module's functions, fixed unions, and fixed records")
+
+
+pure func test_imports_after_unions_are_rejected() -> Bool:
+	rejects("fixed union Choice:\n    One\n", "import", ":\n    ./helper: answer\n", "imports must precede declarations", "move every import: block before the module's functions, fixed unions, and fixed records")
+
+
+pure func test_imports_after_records_are_rejected() -> Bool:
+	rejects("fixed record Pair { first: Int }\n", "import", ":\n    ./helper: answer\n", "imports must precede declarations", "move every import: block before the module's functions, fixed unions, and fixed records")
+
+
+pure func test_private_declarations_teach_public_default() -> Bool:
+	rejects("", "private", " func answer() -> Int:\n    42\n", "private declarations are not supported yet", "omit private; local module declarations are public by default")
+
+
+tests: TestSuite = {
+	description = "Blorp 2 import grammar",
+	tests = [
+		("relative imports with comments and declarations", test_relative_imports_with_comments_and_declarations),
+		("import word remains a function and local name", test_import_word_remains_a_function_and_local_name),
+		("bare paths require relative prefix", test_bare_paths_require_relative_prefix),
+		("interior dot segments are rejected", test_interior_dot_segments_are_rejected),
+		("spaced path characters are rejected", test_spaced_path_characters_are_rejected),
+		("file extensions are rejected", test_file_extensions_are_rejected),
+		("module aliases are rejected", test_module_aliases_are_rejected),
+		("function aliases are rejected", test_function_aliases_are_rejected),
+		("wildcard selections are rejected", test_wildcard_selections_are_rejected),
+		("constructor selections are rejected", test_constructor_selections_are_rejected),
+		("missing selections are rejected", test_missing_selections_are_rejected),
+		("whole module imports are rejected", test_whole_module_imports_are_rejected),
+		("trailing comma requires a name", test_trailing_comma_requires_a_name),
+		("import block requires indented rows", test_import_block_requires_indented_rows),
+		("imports in function bodies teach module scope", test_imports_in_function_bodies_teach_module_scope),
+		("imports after functions are rejected", test_imports_after_functions_are_rejected),
+		("imports after unions are rejected", test_imports_after_unions_are_rejected),
+		("imports after records are rejected", test_imports_after_records_are_rejected),
+		("private declarations teach public default", test_private_declarations_teach_public_default),
+	]
+}

@@ -1,0 +1,58 @@
+import:
+	harness: run_source_example, verify_rejected_command, with_directory
+	system: file_exists, read_file, write_file
+	test: TestSuite
+
+
+private func example(compiler: String, directory: String, expected: Int) -> Bool:
+	run_source_example(
+		compiler,
+		"blorp_2/test/e2e/fixtures/import/" + directory + "/main.brp",
+		expected,
+		{ allocations = 10000, instructions = 150000000 },
+	)
+
+
+private func rejected_field(compiler: String, directory: String) -> Result[Void, String]:
+	root: String =
+		|import:
+		|    ./helper: take
+		|func main() -> Int:
+		|    take({ number = 42.to_string() })
+		|
+	helper: String =
+		|fixed record Holder { number: Int }
+		|pure func take(value: Holder) -> Int:
+		|    value.number
+		|
+	input = directory + "/main.brp"
+	output = directory + "/rejected.c"
+	written_root ?= write_file(input, root)
+	written_helper ?= write_file(directory + "/helper.brp", helper)
+	expected = input + ":4:21: error: record field requires Int\nhelp: use an expression of type Int here\n" + directory + "/helper.brp:1:31: note: record field declared here\n"
+	rejected ?= verify_rejected_command(compiler, input, output, expected)
+	absent ?= if file_exists(output):
+		Err("rejected module program created C")
+	else:
+		Ok(void)
+	written_output ?= write_file(output, "preserve this output")
+	rejected_again ?= verify_rejected_command(compiler, input, output, expected)
+	actual ?= read_file(output)
+	if actual == "preserve this output":
+		Ok(void)
+	else:
+		Err("rejected module program overwrote existing C")
+
+
+pure func suite(compiler: String) -> TestSuite:
+	{
+		description = "Blorp 2 local modules",
+		tests = [
+			("selective import executes", func(): example(compiler, "basic", 42)),
+			("callee keeps its defining scope", func(): example(compiler, "home", 42)),
+			("diamond shares one module", func(): example(compiler, "diamond", 42)),
+			("dependency cycle loads once", func(): example(compiler, "cycle", 42)),
+			("foreign nominal value through generic UFCS", func(): example(compiler, "managed", 2)),
+			("cross-file field diagnostic preserves output", func(): with_directory(func(directory: String): rejected_field(compiler, directory))),
+		]
+	}

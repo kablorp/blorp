@@ -1,52 +1,32 @@
 import:
-	./prelude: CheckedPrelude, check_prelude
 	check: check
 	check_render: render_failure
 	emit: emit
 	int as IntOps
-	lex: lex
+	load: SourceFile, SourceInputs, load_program
 	lower: lower
 	own: own
-	parse: parse, parse_prelude
+	parse: ParsedProgram
 	result: map_err
+	source:
+		SourceRole(CompilerRole, PreludeRole, ModuleRole, InvalidRole), module_number, source_module,
+		source_role
 	specialize: specialize
 	syntax:
 		Diagnostic,
 		DiagnosticNote(
 			UnionPayloadDeclaration, TypeDeclaration, RecordFieldDeclaration, PreviousField,
+			PreviousDeclaration,
 		),
-		Diagnostics,
-		Span,
-		singleton_diagnostic,
+		Diagnostics, Span, singleton_diagnostic
 	system: read_file, write_file
 	text: concat, equals
 	verify: verify
 
 
-fixed record CompilationInputs {
-	prelude: String,
-	program: String
-}
-
-
-fixed union CompilationDiagnostic:
-	PreludeDiagnostics(Diagnostics)
-	ProgramDiagnostics(Diagnostics)
-
-
-private pure func prepare_prelude(source: String) -> Result[CheckedPrelude, Diagnostic]:
-	lexed ?= lex(source)
-	parsed ?= parse_prelude(lexed)
-	check_prelude(parsed)
-
-
-private pure func compile_program(
-	source: String,
-	prelude: CheckedPrelude,
-) -> Result[String, Diagnostics]:
-	lexed ?= lex(source).map_err(singleton_diagnostic)
-	parsed ?= parse(lexed, prelude).map_err(singleton_diagnostic)
-	checked ?= check(parsed).map_err(render_failure)
+-- Source loading publishes complete syntax and identities. Every stage here is pure.
+pure func compile(program: ParsedProgram) -> Result[String, Diagnostics]:
+	checked ?= check(program).map_err(render_failure)
 	specialized ?= specialize(checked).map_err(singleton_diagnostic)
 	lowered ?= lower(specialized).map_err(singleton_diagnostic)
 	owned ?= own(lowered).map_err(singleton_diagnostic)
@@ -54,32 +34,13 @@ private pure func compile_program(
 	emit(verified).map_err(singleton_diagnostic)
 
 
-pure func compile(inputs: CompilationInputs) -> Result[String, CompilationDiagnostic]:
-	prelude ?= prepare_prelude(
-		inputs.prelude,
-	).map_err(
-		pure func(
-			error: Diagnostic,
-		) -> CompilationDiagnostic: PreludeDiagnostics(singleton_diagnostic(error)),
-	)
-	compile_program(
-		inputs.program,
-		prelude,
-	).map_err(
-		pure func(errors: Diagnostics) -> CompilationDiagnostic: ProgramDiagnostics(errors),
-	)
-
-
-private pure func render_location(path: String, source: String, span: Span) -> String:
+private pure func render_file_location(file: SourceFile, span: Span) -> String:
 	var line: Int = 1
 	var column: Int = 1
 	var cursor: Int = 0
 
 	while IntOps.less_than(cursor, span.start):
-		if equals(
-			source.substring(cursor, 1),
-			"\n",
-		):
+		if equals(file.contents.substring(cursor, 1), "\n"):
 			line = IntOps.add(line, 1)
 			column = 1
 		else:
@@ -87,48 +48,73 @@ private pure func render_location(path: String, source: String, span: Span) -> S
 
 		cursor = IntOps.add(cursor, 1)
 
-	path
-		.concat(":")
-		.concat("".append_int(line))
-		.concat(":")
-		.concat("".append_int(column))
+	file.path.concat(":").concat("".append_int(line)).concat(":").concat("".append_int(column))
 
 
-private pure func render_diagnostic(path: String, source: String, diagnostic: Diagnostic) -> String:
-	message = render_location(path, source, diagnostic.span)
-		.concat(": error: ")
-		.concat(diagnostic.message)
-		.concat("\nhelp: ")
-		.concat(diagnostic.help)
+private pure func render_location(inputs: SourceInputs, span: Span) -> Result[String, String]:
+	match source_role(span.source):
+		CompilerRole:
+			Ok("blorp_2")
+		PreludeRole:
+			Ok(render_file_location(inputs.prelude, span))
+		ModuleRole:
+			match source_module(span.source):
+				Some(id):
+					match inputs.modules.get(module_number(id)):
+						Some(file): Ok(render_file_location(file, span))
+						None: Err("diagnostic references a missing module source")
+				None:
+					Err("invalid module source identity in diagnostic")
+		InvalidRole:
+			Err("invalid source identity in diagnostic")
+
+
+private pure func note_span(note: DiagnosticNote) -> Span:
+	match note:
+		UnionPayloadDeclaration(span): span
+		TypeDeclaration(span): span
+		RecordFieldDeclaration(span): span
+		PreviousField(span): span
+		PreviousDeclaration(span): span
+
+
+private pure func note_text(note: DiagnosticNote) -> String:
+	match note:
+		UnionPayloadDeclaration(_): ": note: union payload declared here"
+		TypeDeclaration(_): ": note: type declared here"
+		RecordFieldDeclaration(_): ": note: record field declared here"
+		PreviousField(_): ": note: previous field written here"
+		PreviousDeclaration(_): ": note: previous declaration or import here"
+
+
+private pure func render_diagnostic(inputs: SourceInputs, diagnostic: Diagnostic) -> Result[String, String]:
+	location ?= render_location(inputs, diagnostic.span)
+	message = location.concat(": error: ").concat(diagnostic.message).concat("\nhelp: ").concat(diagnostic.help)
 
 	match diagnostic.note:
 		None:
-			message
+			Ok(message)
 		Some(note):
-			span = match note:
-				UnionPayloadDeclaration(span):
-					span
-				TypeDeclaration(span):
-					span
-				RecordFieldDeclaration(span):
-					span
-				PreviousField(span):
-					span
+			location ?= render_location(inputs, note_span(note))
+			Ok(message.concat("\n").concat(location).concat(note_text(note)))
 
-			text = match note:
-				UnionPayloadDeclaration(_):
-					": note: union payload declared here"
-				TypeDeclaration(_):
-					": note: previous type declared here"
-				RecordFieldDeclaration(_):
-					": note: record field declared here"
-				PreviousField(_):
-					": note: previous field written here"
 
-			message
-				.concat("\n")
-				.concat(render_location(path, source, span))
-				.concat(text)
+pure func render_diagnostics(inputs: SourceInputs, errors: Diagnostics) -> String:
+	var rendered: List[String] = []
+	var failure: Option[String] = None
+
+	for error in [errors.first].concat(errors.remaining):
+		match render_diagnostic(inputs, error):
+			Ok(text): rendered = rendered.append(text)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			"blorp_2: error: ".concat(error).concat("\nhelp: report this compiler error with the input files")
+		None:
+			rendered.join("\n")
 
 
 func main(args: List[String]) -> Int:
@@ -138,67 +124,35 @@ func main(args: List[String]) -> Int:
 				Err(error):
 					print_error(read_error(prelude_path, error))
 					1
-				Ok(prelude):
-					compile_file(prelude_path, prelude, input_path, output_path)
+				Ok(contents):
+					compile_file({ path = prelude_path, contents = contents }, input_path, output_path)
 		_:
-			print_error(
-				"blorp_2: error: expected prelude, input and output paths\nhelp: run blorp_2 PRELUDE.brp INPUT.brp OUTPUT.c",
-			)
+			print_error("blorp_2: error: expected prelude, input and output paths\nhelp: run blorp_2 PRELUDE.brp INPUT.brp OUTPUT.c")
 			1
 
 
 private pure func read_error(path: String, error: String) -> String:
-	"blorp_2: error: could not read "
-		.concat(path)
-		.concat(": ")
-		.concat(error)
-		.concat("\nhelp: provide a readable input file")
+	"blorp_2: error: could not read ".concat(path).concat(": ").concat(error).concat("\nhelp: provide a readable input file")
 
 
-private func compile_file(
-	prelude_path: String,
-	prelude: String,
-	input_path: String,
-	output_path: String,
-) -> Int:
-	match read_file(input_path):
+private func publish(path: String, generated_c: String) -> Int:
+	match write_file(path, generated_c):
 		Err(error):
-			print_error(read_error(input_path, error))
+			print_error("blorp_2: error: could not write ".concat(path).concat(": ").concat(error).concat("\nhelp: provide a writable output path"))
 			1
-		Ok(source):
-			match compile({
-				prelude = prelude,
-				program = source,
-			}):
-				Err(failure):
-					match failure:
-						PreludeDiagnostics(errors):
-							print_error(render_diagnostics(prelude_path, prelude, errors))
-						ProgramDiagnostics(errors):
-							print_error(render_diagnostics(input_path, source, errors))
+		Ok(_):
+			0
 
+
+private func compile_file(prelude: SourceFile, input_path: String, output_path: String) -> Int:
+	match load_program(prelude, input_path):
+		Err(failure):
+			print_error(render_diagnostics(failure.sources, singleton_diagnostic(failure.diagnostic)))
+			1
+		Ok(loaded):
+			match compile(loaded.program):
+				Err(errors):
+					print_error(render_diagnostics(loaded.sources, errors))
 					1
 				Ok(generated_c):
-					match write_file(output_path, generated_c):
-						Err(error):
-							print_error(
-								"blorp_2: error: could not write "
-									.concat(output_path)
-									.concat(": ")
-									.concat(error)
-									.concat("\nhelp: provide a writable output path"),
-							)
-							1
-						Ok(_):
-							0
-
-
-pure func render_diagnostics(path: String, source: String, errors: Diagnostics) -> String:
-	var output = render_diagnostic(path, source, errors.first)
-
-	for error in errors.remaining:
-		output = output
-			.concat("\n")
-			.concat(render_diagnostic(path, source, error))
-
-	output
+					publish(output_path, generated_c)
