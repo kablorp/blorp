@@ -2,10 +2,11 @@ import:
 	./prelude: CheckedPrelude, prelude_names
 	int as IntOps
 	list: reverse
-	names: NameTable, intern_name, program_names
+	names: NameId, NameTable, intern_name, program_names, same_name_table
 	option: is_some, to_result
 	result: and_then
 	string: index_of
+	source: COMPILER_SOURCE, ModuleId, module_number, module_source, root_module_id, same_source
 	syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
 		CallNotation(DirectCall, ReceiverCall),
@@ -36,7 +37,7 @@ import:
 		Symbol(
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
 			Colon, Newline, VarKeyword, Equals, LeftBracket, RightBracket, LeftBrace, RightBrace,
-			Comma, AtSign,
+			Comma, AtSign, Slash, Star,
 		),
 		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, BuiltinLabel, Indentation),
 		TypeSyntax(AtomicType, AppliedType),
@@ -55,11 +56,67 @@ private fixed record ParserState {
 fixed record ParsedContents {
 	names: NameTable,
 	prelude: CheckedPrelude,
+	modules: List[ParsedModuleRow],
 	functions: List[ParsedFunction],
 	unions: List[ParsedUnion],
 	records: List[ParsedRecord],
 	end: Span
 }
+
+
+fixed record RelativeModulePath {
+	parents: Int,
+	parts: List[NameId]
+}
+
+
+fixed record ParsedImport {
+	path: RelativeModulePath,
+	symbols: List[WrittenName],
+	span: Span
+}
+
+
+fixed record ModuleImport {
+	target: ModuleId,
+	symbols: List[WrittenName],
+	span: Span
+}
+
+
+fixed record ParsedModuleRow {
+	module: ModuleId,
+	imports: List[ModuleImport],
+	end: Span
+}
+
+
+private fixed record ParsedModuleContents {
+	base_names: NameTable,
+	names: NameTable,
+	module: ModuleId,
+	imports: List[ParsedImport],
+	functions: List[ParsedFunction],
+	unions: List[ParsedUnion],
+	records: List[ParsedRecord],
+	end: Span
+}
+
+
+opaque type ParsedModule = ParsedModuleContents
+
+
+private fixed record ProgramBuilder {
+	names: NameTable,
+	prelude: CheckedPrelude,
+	modules: List[ParsedModuleRow],
+	functions: List[ParsedFunction],
+	unions: List[ParsedUnion],
+	records: List[ParsedRecord]
+}
+
+
+opaque type ParsedAssembly = ProgramBuilder
 
 
 -- Parsing carries its accepted prelude authority with its complete name table.
@@ -162,6 +219,18 @@ private pure func symbol_matches(actual: Symbol, expected: Symbol) -> Bool:
 		Comma:
 			match expected:
 				Comma:
+					True
+				_:
+					False
+		Slash:
+			match expected:
+				Slash:
+					True
+				_:
+					False
+		Star:
+			match expected:
+				Star:
 					True
 				_:
 					False
@@ -487,6 +556,10 @@ private pure func consume_arguments(start: ParserState) -> Result[ParsedArgument
 
 
 private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	scope ?= if at_word(start, "import") and at_symbol(shifted(start, 1), Colon):
+		Err(expected(start, "imports belong at module scope", "move import: and its selected functions before the module's declarations at column 1"))
+	else:
+		Ok(void)
 	token ?= start.input.tokens
 		.get(start.position)
 		.to_result(
@@ -539,6 +612,7 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 					body = {
 						base = DirectApplication(name.name, arguments.arguments),
 						base_span = {
+							source = token.span.source,
 							start = token.span.start,
 							end = closing.span.end
 						},
@@ -611,6 +685,7 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 		body = { parsed.body |
 			applications = applications,
 			span = {
+				source = token.span.source,
 				start = token.span.start,
 				end = last.span.end
 			}
@@ -681,6 +756,7 @@ private pure func consume_type(
 				name.name,
 				arguments,
 				{
+					source = name.name.span.source,
 					start = name.name.span.start,
 					end = closing.span.end
 				},
@@ -775,6 +851,7 @@ private pure func consume_pattern(state: ParserState) -> Result[PatternResult, D
 				.get(field.next.position)
 				.to_result(expected(field.next, "expected ')'", "close the constructor pattern"))
 			span: Span = {
+				source = name.name.span.source,
 				start = name.name.span.start,
 				end = last.span.end
 			}
@@ -901,6 +978,7 @@ private pure func consume_match(start: ParserState) -> Result[BodyResult, Diagno
 					arms = arms,
 					keyword_span = keyword.span,
 					span = {
+						source = keyword.span.source,
 						start = keyword.span.start,
 						end = end
 					},
@@ -952,6 +1030,7 @@ private pure func consume_arm(state: ParserState) -> Result[ArmResult, Diagnosti
 			bindings = prefix.bindings,
 			body = body.body,
 			span = {
+				source = pattern.span.source,
 				start = pattern.span.start,
 				end = body.body.span.end
 			}
@@ -1333,6 +1412,7 @@ private pure func consume_annotation(start: ParserState) -> Result[ParsedAnnotat
 				False
 
 		span: Span = {
+			source = opening.span.source,
 			start = opening.span.start,
 			end = name.span.end
 		}
@@ -1389,13 +1469,14 @@ private pure func consume_annotation(start: ParserState) -> Result[ParsedAnnotat
 					})
 
 
-private pure func consume_function(start: ParserState) -> Result[FunctionResult, Diagnostic]:
+private pure func consume_function(start: ParserState, module: ModuleId) -> Result[FunctionResult, Diagnostic]:
 	annotation ?= consume_annotation(start)
 	header ?= consume_header(annotation.next)
 	prefix ?= consume_bindings(header.next, FunctionBindings)
 	body ?= consume_function_body(prefix.next)
 	Ok({
 		function = {
+			module = module,
 			tail_annotation = annotation.span,
 			purity = header.header.purity,
 			function_name = header.header.function_name,
@@ -1470,7 +1551,7 @@ private pure func consume_variant(state: ParserState) -> Result[VariantResult, D
 		})
 
 
-private pure func consume_union(start: ParserState) -> Result[UnionResult, Diagnostic]:
+private pure func consume_union(start: ParserState, module: ModuleId) -> Result[UnionResult, Diagnostic]:
 	after_fixed: ParserState = { start | position = IntOps.add(start.position, 1) }
 
 	word ?= if at_word(after_fixed, "union"):
@@ -1538,6 +1619,7 @@ private pure func consume_union(start: ParserState) -> Result[UnionResult, Diagn
 		None:
 			Ok({
 				declaration = {
+					module = module,
 					type_name = name.name,
 					type_parameters = type_parameters.parameters,
 					variants = variants
@@ -1748,24 +1830,334 @@ pure func parse_prelude(input: LexedProgram) -> Result[ParsedPrelude, Diagnostic
 			})
 
 
+private pure func shifted(state: ParserState, count: Int) -> ParserState:
+	{ state | position = IntOps.add(state.position, count) }
+
+
+private pure func parser_span(state: ParserState) -> Span:
+	match state.input.tokens.get(state.position):
+		Some(token):
+			token.span
+		None:
+			state.input.end
+
+
+private fixed record ParsedPath {
+	path: RelativeModulePath,
+	span: Span,
+	next: ParserState
+}
+
+
+private pure func parent_prefix(state: ParserState) -> Bool:
+	at_symbol(state, Dot) and at_symbol(shifted(state, 1), Dot) and at_symbol(shifted(state, 2), Slash)
+
+
+private pure func consume_relative_path(start: ParserState) -> Result[ParsedPath, Diagnostic]:
+	var state = start
+	var parents: Int = 0
+	if at_symbol(state, Dot) and at_symbol(shifted(state, 1), Slash):
+		state = shifted(state, 2)
+	else if parent_prefix(state):
+		while parent_prefix(state):
+			parents = IntOps.add(parents, 1)
+			state = shifted(state, 3)
+	prefix ?= if IntOps.equals(state.position, start.position):
+		Err(expected(state, "expected an explicit relative import path", "write ./helper: answer or ../shared/helper: answer; bare and package imports are not supported yet"))
+	else:
+		Ok(void)
+	var parts: List[NameId] = []
+	var failure: Option[Diagnostic] = None
+	var last = parser_span(state)
+	while True:
+		if at_symbol(state, Dot):
+			failure = Some(expected(state, "'.' and '..' may only begin an import path", "write ../shared/helper or ./shared/helper without interior dot segments"))
+			break
+		match consume_name(state, "expected a module name in the import path"):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(part):
+				parts = parts.append(part.name.id)
+				last = part.name.span
+				state = part.next
+		if not at_symbol(state, Slash):
+			break
+		state = shifted(state, 1)
+	valid ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+	-- The lexer skips spaces. Path characters must still be adjacent bytes.
+	var position = start.position
+	var previous_end = parser_span(start).start
+	while IntOps.less_than(position, state.position):
+		match state.input.tokens.get(position):
+			None:
+				failure = Some(expected(state, "incomplete import path", "write ./helper or ../shared/helper"))
+				break
+			Some(token):
+				if not IntOps.equals(token.span.start, previous_end):
+					failure = Some(expected({ state | position = position }, "import paths cannot contain spaces", "write adjacent path characters, such as ./helper or ../shared/helper"))
+					break
+				previous_end = token.span.end
+		position = IntOps.add(position, 1)
+	spaced ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+	first = parser_span(start)
+	Ok({
+		path = { parents = parents, parts = parts },
+		span = { source = first.source, start = first.start, end = last.end },
+		next = state
+	})
+
+
+private pure func consume_import_symbol(state: ParserState) -> Result[ParsedName, Diagnostic]:
+	if at_symbol(state, Star):
+		Err(expected(state, "wildcard imports are not supported", "list the functions you need, such as ./helper: answer"))
+	else:
+		name ?= consume_name(state, "expected an imported function name")
+		if at_word(name.next, "as"):
+			Err(expected(name.next, "import aliases are not supported yet", "select the function by its declared name, such as ./helper: answer"))
+		else if at_symbol(name.next, LeftParen):
+			Err(expected(name.next, "constructor imports are not supported yet", "select function names only, such as ./helper: answer"))
+		else:
+			Ok(name)
+
+
+private fixed record ImportResult {
+	request: ParsedImport,
+	next: ParserState
+}
+
+
+private pure func consume_import_row(start: ParserState) -> Result[ImportResult, Diagnostic]:
+	indented ?= consume_indent(start, 1, "expected an indented import", "indent each ./helper: answer line with one tab or four spaces")
+	path ?= consume_relative_path(indented)
+	selection ?= if at_word(path.next, "as"):
+		Err(expected(path.next, "import aliases are not supported yet", "select functions directly, such as ./helper: answer"))
+	else if at_symbol(path.next, Dot):
+		Err(expected(path.next, "import paths omit file extensions", "write ./helper: answer instead of ./helper.brp: answer"))
+	else:
+		consume_symbol(path.next, Colon, "expected ':' and selected function names after the import path", "write ./helper: answer; module aliases and whole-module imports are not supported yet")
+	var state = selection
+	var symbols: List[WrittenName] = []
+	var last = path.span
+	var failure: Option[Diagnostic] = None
+	while True:
+		match consume_import_symbol(state):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(symbol):
+				symbols = symbols.append(symbol.name)
+				last = symbol.name.span
+				state = symbol.next
+		if not at_symbol(state, Comma):
+			break
+		state = shifted(state, 1)
+	valid ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+	complete ?= if at_symbol(state, Newline) or IntOps.equals(state.position, state.input.tokens.length()):
+		Ok(void)
+	else:
+		Err(expected(state, "expected ',' between imported function names", "write ./helper: answer, other on one line"))
+	Ok({
+		request = {
+			path = path.path,
+			symbols = symbols,
+			span = { source = path.span.source, start = path.span.start, end = last.end }
+		},
+		next = state
+	})
+
+
+private fixed record ImportBlockResult {
+	imports: List[ParsedImport],
+	next: ParserState
+}
+
+
+private pure func consume_import_block(start: ParserState) -> Result[ImportBlockResult, Diagnostic]:
+	colon ?= consume_symbol(shifted(start, 1), Colon, "expected ':' after 'import'", "write import: followed by indented relative imports")
+	newline ?= consume_symbol(colon, Newline, "expected a newline after 'import:'", "put each ./helper: answer import on its own indented line")
+	var state = newline
+	var imports: List[ParsedImport] = []
+	var failure: Option[Diagnostic] = None
+	while True:
+		match consume_import_row(state):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(row):
+				imports = imports.append(row.request)
+				state = row.next
+		if not at_symbol(state, Newline) or not at_indent(shifted(state, 1)):
+			break
+		state = shifted(state, 1)
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({ imports = imports, next = state })
+
+
+pure func begin_program(prelude: CheckedPrelude) -> ParsedAssembly:
+	into_opaque ParsedAssembly({
+		names = prelude_names(prelude).names,
+		prelude = prelude,
+		modules = [],
+		functions = [],
+		unions = [],
+		records = []
+	})
+
+
+pure func assembly_names(assembly: ParsedAssembly) -> NameTable:
+	from_opaque ParsedAssembly(assembly).names
+
+
+pure func module_names(parsed: ParsedModule) -> NameTable:
+	from_opaque ParsedModule(parsed).names
+
+
+pure func module_imports(parsed: ParsedModule) -> List[ParsedImport]:
+	from_opaque ParsedModule(parsed).imports
+
+
+private pure func bundle_error(message: String) -> Diagnostic:
+	{
+		span = { source = COMPILER_SOURCE, start = 0, end = 0 },
+		note = None,
+		message = message,
+		help = "load each module once in inventory order and supply every import target"
+	}
+
+
+pure func append_module(
+	assembly: ParsedAssembly,
+	parsed: ParsedModule,
+	targets: List[ModuleId],
+) -> Result[ParsedAssembly, Diagnostic]:
+	builder = from_opaque ParsedAssembly(assembly)
+	contents = from_opaque ParsedModule(parsed)
+	valid ?= if not same_name_table(builder.names, contents.base_names):
+		Err(bundle_error("parsed module does not extend this source bundle's name authority"))
+	else if not IntOps.equals(module_number(contents.module), builder.modules.length()):
+		Err(bundle_error("parsed module does not have the next source bundle identity"))
+	else if not IntOps.equals(contents.imports.length(), targets.length()):
+		Err(bundle_error("source bundle does not supply exactly one target per import"))
+	else:
+		Ok(void)
+	var imports: List[ModuleImport] = []
+	var position: Int = 0
+	var failure: Option[Diagnostic] = None
+	for request in contents.imports:
+		match targets.get(position):
+			None:
+				failure = Some(bundle_error("source bundle is missing an import target"))
+				break
+			Some(target):
+				imports = imports.append({ target = target, symbols = request.symbols, span = request.span })
+		position = IntOps.add(position, 1)
+	linked ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+	Ok(into_opaque ParsedAssembly({
+		names = contents.names,
+		prelude = builder.prelude,
+		modules = builder.modules.append({ module = contents.module, imports = imports, end = contents.end }),
+		functions = builder.functions.concat(contents.functions),
+		unions = builder.unions.concat(contents.unions),
+		records = builder.records.concat(contents.records)
+	}))
+
+
+pure func seal_program(assembly: ParsedAssembly) -> Result[ParsedProgram, Diagnostic]:
+	builder = from_opaque ParsedAssembly(assembly)
+	root ?= builder.modules.get(0).to_result(bundle_error("source bundle has no root module"))
+	var complete: Bool = True
+	for module in builder.modules:
+		for request in module.imports:
+			complete = complete and IntOps.less_than(module_number(request.target), builder.modules.length())
+	valid ?= if complete:
+		Ok(void)
+	else:
+		Err(bundle_error("source bundle is missing an imported module"))
+	Ok(into_opaque ParsedProgram({
+		names = builder.names,
+		prelude = builder.prelude,
+		modules = builder.modules,
+		functions = builder.functions,
+		unions = builder.unions,
+		records = builder.records,
+		end = root.end
+	}))
+
+
 pure func parse(input: LexedProgram, prelude: CheckedPrelude) -> Result[ParsedProgram, Diagnostic]:
-	initial = prelude_names(prelude)
+	assembly = begin_program(prelude)
+	parsed ?= parse_module(input, root_module_id(), assembly_names(assembly))
+	linked ?= append_module(assembly, parsed, [])
+	seal_program(linked)
+
+
+pure func parse_module(
+	input: LexedProgram,
+	module: ModuleId,
+	names: NameTable,
+) -> Result[ParsedModule, Diagnostic]:
+	var correct_source = same_source(input.end.source, module_source(module))
+	for token in input.tokens:
+		correct_source = correct_source and same_source(token.span.source, module_source(module))
+	origin ?= if correct_source:
+		Ok(void)
+	else:
+		Err(bundle_error("parsed module's source does not match its module identity"))
 	var state: ParserState = {
 		input = input,
 		position = 0,
-		names = initial.names
+		names = names
 	}
+	var imports: List[ParsedImport] = []
 	var functions: List[ParsedFunction] = []
 	var unions: List[ParsedUnion] = []
 	var records: List[ParsedRecord] = []
 	var failure: Option[Diagnostic] = None
 
 	while True:
-		if (
+		if at_word(state, "import") and (
+			not IntOps.equals(functions.length(), 0)
+			or not IntOps.equals(unions.length(), 0)
+			or not IntOps.equals(records.length(), 0)
+		):
+			failure = Some(expected(state, "imports must precede declarations", "move every import: block before the module's functions, fixed unions, and fixed records"))
+			break
+		else if at_word(state, "import"):
+			match consume_import_block(state):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(block):
+					imports = imports.concat(block.imports)
+					state = block.next
+		else if at_word(state, "private"):
+			failure = Some(expected(state, "private declarations are not supported yet", "omit private; local module declarations are public by default"))
+			break
+		else if (
 			at_word(state, "fixed")
 			and at_word({ state | position = IntOps.add(state.position, 1) }, "record")
 		):
-			match consume_record(state):
+			match consume_record(state, module):
 				Err(error):
 					failure = Some(error)
 					break
@@ -1773,7 +2165,7 @@ pure func parse(input: LexedProgram, prelude: CheckedPrelude) -> Result[ParsedPr
 					records = records.append(parsed.declaration)
 					state = parsed.next
 		else if at_word(state, "fixed"):
-			match consume_union(state):
+			match consume_union(state, module):
 				Err(error):
 					failure = Some(error)
 					break
@@ -1781,7 +2173,7 @@ pure func parse(input: LexedProgram, prelude: CheckedPrelude) -> Result[ParsedPr
 					unions = unions.append(parsed.declaration)
 					state = parsed.next
 		else:
-			match consume_function(state):
+			match consume_function(state, module):
 				Err(error):
 					failure = Some(error)
 					break
@@ -1811,9 +2203,11 @@ pure func parse(input: LexedProgram, prelude: CheckedPrelude) -> Result[ParsedPr
 		Some(error):
 			Err(error)
 		None:
-			Ok(into_opaque ParsedProgram({
+			Ok(into_opaque ParsedModule({
+						base_names = names,
+						module = module,
+						imports = imports,
 						names = state.names,
-						prelude = prelude,
 						functions = functions,
 						unions = unions,
 						records = records,
@@ -1845,6 +2239,7 @@ private pure func consume_postfix(state: ParserState) -> Result[ParsedPostfix, D
 		Ok({
 			operation = ReceiverInvocation({
 				span = {
+					source = name.name.span.source,
 					start = name.name.span.start,
 					end = closing.span.end
 				},
@@ -1923,6 +2318,7 @@ private pure func consume_record_literal(
 			opening.end
 
 	span: Span = {
+		source = opening.source,
 		start = opening.start,
 		end = last
 	}
@@ -1974,7 +2370,7 @@ private fixed record ParsedRecordResult {
 }
 
 
-private pure func consume_record(start: ParserState) -> Result[ParsedRecordResult, Diagnostic]:
+private pure func consume_record(start: ParserState, module: ModuleId) -> Result[ParsedRecordResult, Diagnostic]:
 	name ?= consume_name(
 		{ start | position = IntOps.add(start.position, 2) },
 		"expected a record type name",
@@ -2024,6 +2420,7 @@ private pure func consume_record(start: ParserState) -> Result[ParsedRecordResul
 	)
 	Ok({
 		declaration = {
+			module = module,
 			type_name = name.name,
 			fields = fields
 		},

@@ -28,7 +28,7 @@ func one() -> Int:
 ```
 
 The executable returns exit status 1 with empty stdout and stderr. A helper
-may appear before or after its caller. Imports and printing are future increments.
+may appear before or after its caller. Local selective imports are supported; printing is a future increment.
 
 The third example, [`test/e2e/fixtures/pure/calls.brp`](test/e2e/fixtures/pure/calls.brp),
 adds declared purity:
@@ -852,14 +852,58 @@ Semantic rules:
   non-tail matches, and function
   values are outside this increment. `Bool` has no special treatment: a written
   `fixed union Bool` follows the ordinary union path, and an undeclared `Bool` is unknown.
-  Imports and UFCS-only import visibility are deferred; every function in this
-  input file is available to either call notation.
+  Local functions and explicitly imported functions are available to either call
+  notation. UFCS-only import visibility remains deferred.
 - Syntax and semantic errors carry a source location, an explanation, and help.
   Rejected source produces no C output and does not overwrite an existing output.
 
+## Local modules
+
+[`import/basic/main.brp`](test/e2e/fixtures/import/basic/main.brp) selects a function
+from its sibling `helper.brp`:
+
+```blorp
+import:
+    ./helper: answer
+func main() -> Int:
+    answer()
+```
+
+Its sibling `helper.brp` declares:
+
+```blorp
+pure func answer() -> Int:
+    42
+```
+
+The executable exits 42. Each import row starts with `./`
+or leading `../` segments, omits `.brp`, and selects one or more local function
+names. Imports precede declarations. Bare standard-library paths, aliases,
+wildcards, type/constructor imports, qualified calls and `private` are deferred.
+
+Each module owns its declarations; same-spelled declarations in different
+modules have distinct identities. Imported functions resolve their annotations
+and calls in their defining module, and importing them does not expose their
+siblings or types. Their nominal signature types remain usable as inferred
+values. Direct calls and UFCS use the caller's visible functions. Only a local
+`main` in the root file provides the entrypoint; another module's `main` is an
+ordinary function.
+
+Paths are normalized absolute logical paths for one invocation; symlink aliases
+are not canonicalized. A diamond loads a shared path once. Dependency cycles
+are allowed because annotated declarations can be inventoried before checking
+bodies and there is no module initialization. This does not permit cyclic runtime
+data. Every loaded module is checked, including unused declarations. Diagnostics
+retain the source file for primary errors and secondary notes independently.
+
+The [module design](MODULES_PLAN.md) records implementation research, identity
+ownership, tests and cost ceilings; the [validation report](../benchmarks/results/blorp_2_modules_2026-10-11.md)
+retains the independent reviews and measurements. The [calculator roadmap](CALCULATOR_PLAN.md)
+places standard-library integration and numeric/IO operations in later slices.
+
 ## Architecture
 
-The command reads the temporary input prelude and a program, then writes C:
+The command reads the temporary input prelude, a root program and its local module dependencies, then writes C:
 
 ```sh
 bin/blorp run --no-format blorp_2/src/main.brp -- blorp_2/src/prelude_temp.brp input.brp output.c
@@ -881,11 +925,13 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    syntax stay distinct because their target lookup differs.
    Every expression records its consumed token span directly, without reconstructing
    locations from names or literal values.
-   A local interning builder assigns one opaque `NameId` per spelling. Parsing
+   A shared interning builder assigns one opaque `NameId` per spelling across the module inventory. Parsing
    seals the complete syntax and immutable name table in an opaque `ParsedProgram`.
    Integer conversion accumulates negatively against derived range cutoffs,
    checking before multiplication so even the minimum is represented safely.
-3. Checking resolves nominal union and owned variant identities, then publishes
+3. A frozen namespace maps each module's visible function names to original
+   declaration IDs. Selective imports do not reexport imported names, and an
+   imported function retains its defining scope. Checking resolves nominal union and owned variant identities, then publishes
    one authoritative signature per function. A private resolution context holds
    the aligned declarations and signatures. Target resolution returns a complete
    call and signature after one lookup. Call boundaries prove complete arity once,
@@ -1020,7 +1066,7 @@ translates those keys to typed operations once; checking validates their exact
 purity, parameter and result contracts. Program source cannot declare builtin
 types or bodies, and quoted builtin labels do not enable ordinary String
 literals. Prelude and program diagnostics retain separate source origins.
-There is no general module loader or implicit prelude lookup.
+The shell loads relative local modules. Prelude input remains explicit; standard-library loading is a later increment.
 
 C emission uses the whitespace required to separate C tokens and a final LF.
 It adds no indentation or internal line breaks for presentation.
@@ -1139,13 +1185,14 @@ synthetic, and unused parameters are explicitly discarded to keep warning checks
 clean. Existing compiler internals are not pilot dependencies.
 
 The compilation pipeline is entirely pure once its source inputs have been
-loaded. `compile(CompilationInputs{prelude, program})` composes pure lexing,
-parsing, checking, specialization, ordered-value lowering, ownership insertion,
-independent verification and C emission;
+loaded. `load_program` reads dependencies and invokes pure lexing and parsing to
+assemble one complete `ParsedProgram` with shared names and module identities.
+`compile(ParsedProgram)` composes pure checking, specialization, ordered-value
+lowering, ownership insertion, independent verification and C emission;
 diagnostic rendering is pure too. Local builders and `var` are allowed within
 pure functions. The surrounding shell owns reading and writing files, printing,
-process execution and timing. Future import loading must supply a complete source
-bundle and explicit configuration to the pure pipeline. Compiler phases must not
+process execution and timing. Loading publishes the complete parsed program and
+source inventory explicitly to the pure pipeline and diagnostic renderer. Compiler phases must not
 consult the filesystem, environment, clock or shared mutable caches. Any reports
 or measurements produced by a phase are returned as data for the shell to present.
 

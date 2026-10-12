@@ -1,0 +1,198 @@
+import:
+	../../src/declarations: function_number, union_number, variant_number, variant_owner
+	../../src/names: find_name
+	../../src/namespace:
+		FunctionOrigin(ImportedFunction),
+		ImportProblem(RepeatedModuleImport, MissingImportedFunction, UnsupportedTypeImport),
+		TypeCandidate(UnionCandidate),
+		build_namespace,
+		function_candidates,
+		import_problems,
+		local_function_candidates,
+		type_candidates,
+		variant_candidates,
+	../../src/parse: parsed_contents
+	../../src/source: module_id, root_module_id, same_module, same_source, module_source
+	module_input: parse_modules
+	test: TestSuite
+
+
+pure func test_selected_functions_preserve_identity_and_import_origin() -> Bool:
+	main: String =
+		|import:
+		|    ./helper: answer
+		|func main() -> Int:
+		|    answer()
+		|
+	helper: String =
+		|pure func answer() -> Int:
+		|    42
+		|pure func hidden() -> Int:
+		|    7
+		|
+	match parse_modules([{ source = main, targets = [1] }, { source = helper, targets = [] }]):
+		Err(_):
+			False
+		Ok(program):
+			parsed = parsed_contents(program)
+			namespace = build_namespace(program)
+			match (find_name(parsed.names, "answer"), find_name(parsed.names, "hidden"), module_id(1)):
+				(Some(answer), Some(hidden), Some(dependency)):
+					match (function_candidates(namespace, root_module_id(), answer), local_function_candidates(namespace, dependency, answer)):
+						([imported], [local]):
+							match imported.origin:
+								ImportedFunction(span):
+									(
+										function_number(imported.function) == 1 and function_number(local) == 1
+											and span.start == 22 and span.end == 28
+											and same_source(span.source, module_source(root_module_id()))
+											and local_function_candidates(namespace, root_module_id(), answer).length() == 0
+											and function_candidates(namespace, root_module_id(), hidden).length() == 0
+											and import_problems(namespace).length() == 0
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_same_named_candidates_from_different_owners_remain_complete() -> Bool:
+	main: String =
+		|import:
+		|    ./left: answer
+		|    ./right: answer
+		|func main() -> Int:
+		|    answer()
+		|
+	helper = "pure func answer() -> Int:\n    42\n"
+	match parse_modules([{ source = main, targets = [1, 2] }, { source = helper, targets = [] }, { source = helper, targets = [] }]):
+		Err(_):
+			False
+		Ok(program):
+			parsed = parsed_contents(program)
+			namespace = build_namespace(program)
+			match find_name(parsed.names, "answer"):
+				None:
+					False
+				Some(answer):
+					match function_candidates(namespace, root_module_id(), answer):
+						[left, right]:
+							function_number(left.function) == 1 and function_number(right.function) == 2
+						_:
+							False
+
+
+pure func test_types_and_variants_stay_local_to_the_defining_module() -> Bool:
+	main = "import:\n    ./helper: make\nfunc main() -> Int:\n    0\n"
+	helper: String =
+		|fixed union Choice:
+		|    One(Int)
+		|pure func make() -> Choice:
+		|    One(42)
+		|
+	match parse_modules([{ source = main, targets = [1] }, { source = helper, targets = [] }]):
+		Err(_):
+			False
+		Ok(program):
+			parsed = parsed_contents(program)
+			namespace = build_namespace(program)
+			match (find_name(parsed.names, "Choice"), find_name(parsed.names, "One"), module_id(1)):
+				(Some(choice), Some(one), Some(dependency)):
+					match (type_candidates(namespace, dependency, choice), variant_candidates(namespace, dependency, one)):
+						([UnionCandidate(owner)], [variant]):
+							(
+								union_number(owner) == 0 and union_number(variant_owner(variant)) == 0
+									and variant_number(variant) == 0
+									and type_candidates(namespace, root_module_id(), choice).length() == 0
+									and variant_candidates(namespace, root_module_id(), one).length() == 0
+							)
+						_:
+							False
+				_:
+					False
+
+
+pure func test_imported_functions_are_not_reexported() -> Bool:
+	main = "import:\n    ./facade: answer\nfunc main() -> Int:\n    0\n"
+	facade = "import:\n    ./helper: answer\n"
+	helper = "pure func answer() -> Int:\n    42\n"
+	match parse_modules([{ source = main, targets = [1] }, { source = facade, targets = [2] }, { source = helper, targets = [] }]):
+		Err(_):
+			False
+		Ok(program):
+			parsed = parsed_contents(program)
+			namespace = build_namespace(program)
+			match (find_name(parsed.names, "answer"), module_id(1), import_problems(namespace)):
+				(Some(answer), Some(facade_id), [MissingImportedFunction(target, written)]):
+					(
+						function_candidates(namespace, root_module_id(), answer).length() == 0
+							and function_candidates(namespace, facade_id, answer).length() == 1
+							and same_module(target, facade_id)
+							and same_source(written.span.source, module_source(root_module_id()))
+					)
+				_:
+					False
+
+
+pure func test_import_problems_preserve_repeated_missing_and_type_facts() -> Bool:
+	main: String =
+		|import:
+		|    ./helper: Choice, missing
+		|    ./again: answer
+		|func main() -> Int:
+		|    0
+		|
+	helper: String =
+		|fixed union Choice:
+		|    One
+		|pure func answer() -> Int:
+		|    42
+		|
+	match parse_modules([{ source = main, targets = [1, 1] }, { source = helper, targets = [] }]):
+		Err(_):
+			False
+		Ok(program):
+			namespace = build_namespace(program)
+			match import_problems(namespace):
+				[UnsupportedTypeImport(first, _), MissingImportedFunction(second, _), RepeatedModuleImport(third, previous, current)]:
+					(
+						same_module(first, second) and same_module(second, third)
+							and previous.start == 12 and current.start == 42
+					)
+				_:
+					False
+
+
+pure func test_duplicate_local_declarations_remain_multiple_candidates() -> Bool:
+	main = "import:\n    ./helper: answer\nfunc main() -> Int:\n    0\n"
+	helper = "pure func answer() -> Int:\n    42\npure func answer() -> Int:\n    7\n"
+	match parse_modules([{ source = main, targets = [1] }, { source = helper, targets = [] }]):
+		Err(_):
+			False
+		Ok(program):
+			parsed = parsed_contents(program)
+			namespace = build_namespace(program)
+			match find_name(parsed.names, "answer"):
+				None:
+					False
+				Some(answer):
+					match function_candidates(namespace, root_module_id(), answer):
+						[first, second]:
+							function_number(first.function) == 1 and function_number(second.function) == 2
+						_:
+							False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 complete module namespaces",
+	tests = [
+		("selected functions preserve identity and import origin", test_selected_functions_preserve_identity_and_import_origin),
+		("same named candidates from different owners remain complete", test_same_named_candidates_from_different_owners_remain_complete),
+		("types and variants stay local to the defining module", test_types_and_variants_stay_local_to_the_defining_module),
+		("imported functions are not reexported", test_imported_functions_are_not_reexported),
+		("import problems preserve repeated missing and type facts", test_import_problems_preserve_repeated_missing_and_type_facts),
+		("duplicate local declarations remain multiple candidates", test_duplicate_local_declarations_remain_multiple_candidates),
+	]
+}

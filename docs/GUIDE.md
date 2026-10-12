@@ -8,8 +8,10 @@ reassignment in function bodies and match-arm blocks, plus straight-line
 managed Strings through an explicit temporary prelude's concrete `to_string`
 and `length` functions. Self and mutual function recursion are supported with
 ordinary C stack usage; generic recursion must have finite concrete instances,
-and cyclic runtime data remains forbidden. The pilot reference states its scope
-and restrictions.
+and cyclic runtime data remains forbidden. Local selective function imports use
+explicit `./` or leading `../` paths; callees retain their defining module's
+scope, and only a root-local `main() -> Int` supplies the entrypoint. The pilot
+reference states its scope and restrictions.
 
 ---
 

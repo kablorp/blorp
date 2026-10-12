@@ -1,0 +1,227 @@
+import:
+	./prelude: CheckedPrelude, check_prelude
+	int as IntOps
+	lex: lex
+	names: NameTable, name_spelling
+	option: is_some, to_result
+	result: and_then
+	parse:
+		ParsedProgram, ParsedModule, ParsedImport, RelativeModulePath, append_module, assembly_names, begin_program, module_imports, module_names,
+		parse_module, parse_prelude, seal_program
+	path as Path
+	source:
+		COMPILER_SOURCE, PRELUDE_SOURCE, ModuleId, SourceId, module_id, module_source, root_module_id, same_module
+	syntax: Diagnostic, Span
+	system: getcwd, read_file
+	text as Text
+
+
+fixed record SourceFile {
+	path: String,
+	contents: String
+}
+
+
+-- Module source rows use the same order as the parser's module inventory.
+fixed record SourceInputs {
+	prelude: SourceFile,
+	modules: List[SourceFile]
+}
+
+
+fixed record LoadedProgram {
+	sources: SourceInputs,
+	program: ParsedProgram
+}
+
+
+fixed record LoadFailure {
+	sources: SourceInputs,
+	diagnostic: Diagnostic
+}
+
+
+private pure func rejection(span: Span, message: String, help: String) -> Diagnostic:
+	{ span = span, note = None, message = message, help = help }
+
+
+private pure func internal_error(message: String) -> Diagnostic:
+	rejection(
+		{ source = COMPILER_SOURCE, start = 0, end = 0 },
+		message,
+		"report this compiler error with the input files",
+	)
+
+
+pure func prepare_prelude(contents: String) -> Result[CheckedPrelude, Diagnostic]:
+	lexed ?= lex(PRELUDE_SOURCE, contents)
+	parsed ?= parse_prelude(lexed)
+	check_prelude(parsed)
+
+
+-- This projection belongs to source loading, where filesystem paths are needed.
+-- Semantic import resolution receives ModuleId targets instead of these strings.
+pure func import_path(
+	importer: String,
+	request: RelativeModulePath,
+	names: NameTable,
+) -> Result[String, Diagnostic]:
+	var directory = Path.dirname(importer)
+	var parents = request.parents
+
+	while IntOps.greater_than(parents, 0):
+		directory = Path.dirname(directory)
+		parents = IntOps.subtract(parents, 1)
+
+	var failure: Option[Diagnostic] = None
+	for part in request.parts:
+		match name_spelling(names, part):
+			None:
+				failure = Some(internal_error("import path references an invalid spelling identity"))
+				break
+			Some(spelling):
+				directory = Path.join(directory, spelling)
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(Path.normalize(Text.concat(directory, ".brp")))
+
+
+private fixed record RequestedModule {
+	id: ModuleId,
+	path: String,
+	site: Option[Span]
+}
+
+
+private pure func known_module(requests: List[RequestedModule], path: String) -> Option[ModuleId]:
+	var found: Option[ModuleId] = None
+
+	for request in requests:
+		if Text.equals(request.path, path):
+			found = Some(request.id)
+			break
+
+	found
+
+
+private func read_module(path: String, site: Option[Span]) -> Result[String, Diagnostic]:
+	match read_file(path):
+		Ok(contents):
+			Ok(contents)
+		Err(error):
+			span = match site:
+				Some(span): span
+				None: { source = COMPILER_SOURCE, start = 0, end = 0 }
+			Err(rejection(
+				span,
+				Text.concat("could not read module ", path).concat(": ").concat(error),
+				"check the relative import path and provide a readable .brp file",
+			))
+
+
+private fixed union ImportTarget:
+	KnownTarget(ModuleId)
+	DiscoveredTarget(RequestedModule)
+
+
+private pure func resolve_request(
+	importer: String,
+	request: ParsedImport,
+	names: NameTable,
+	requests: List[RequestedModule],
+) -> Result[ImportTarget, Diagnostic]:
+	path ?= import_path(importer, request.path, names)
+	match known_module(requests, path):
+		Some(id): Ok(KnownTarget(id))
+		None:
+			id ?= module_id(requests.length()).to_result(internal_error("module inventory is too large"))
+			Ok(DiscoveredTarget({ id = id, path = path, site = Some(request.span) }))
+
+
+private fixed record ReadModule {
+	request: RequestedModule,
+	file: SourceFile,
+	parsed: Result[ParsedModule, Diagnostic]
+}
+
+
+-- Preserve readable bytes even on a parse failure so its diagnostic has a source.
+-- The queue and name table are borrowed; builders stay local to load_checked.
+private func read_requested(
+	requests: List[RequestedModule],
+	position: Int,
+	names: NameTable,
+	root_path: String,
+) -> Result[ReadModule, Diagnostic]:
+	current ?= requests.get(position).to_result(internal_error("missing queued module"))
+	contents ?= read_module(current.path, current.site)
+	display_path = if same_module(current.id, root_module_id()):
+		root_path
+	else:
+		current.path
+	parsed = lex(module_source(current.id), contents).and_then(
+		pure func(lexed): parse_module(lexed, current.id, names),
+	)
+	Ok({ request = current, file = { path = display_path, contents = contents }, parsed = parsed })
+
+
+private func load_checked(prelude: SourceFile, root_path: String, checked: CheckedPrelude) -> Result[LoadedProgram, LoadFailure]:
+	var modules: List[SourceFile] = []
+	var assembly = begin_program(checked)
+	var requests: List[RequestedModule] = [{
+		id = root_module_id(),
+		path = Path.normalize(Path.join(getcwd(), root_path)),
+		site = None
+	}]
+	var position = 0
+	var failure: Option[Diagnostic] = None
+
+	while IntOps.less_than(position, requests.length()):
+		match read_requested(requests, position, assembly_names(assembly), root_path):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(loaded):
+				modules = modules.append(loaded.file)
+				match loaded.parsed:
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(parsed):
+						var targets: List[ModuleId] = []
+						for request in module_imports(parsed):
+							match resolve_request(loaded.request.path, request, module_names(parsed), requests):
+								Err(error):
+									failure = Some(error)
+									break
+								Ok(KnownTarget(id)):
+									targets = targets.append(id)
+								Ok(DiscoveredTarget(next)):
+									requests = requests.append(next)
+									targets = targets.append(next.id)
+						if failure.is_some():
+							break
+						match append_module(assembly, parsed, targets):
+							Err(error):
+								failure = Some(error)
+								break
+							Ok(next):
+								assembly = next
+		position = IntOps.add(position, 1)
+
+	sources: SourceInputs = { prelude = prelude, modules = modules }
+	match failure:
+		Some(error): Err({ sources = sources, diagnostic = error })
+		None:
+			match seal_program(assembly):
+				Err(error): Err({ sources = sources, diagnostic = error })
+				Ok(program): Ok({ sources = sources, program = program })
+
+
+func load_program(prelude: SourceFile, root_path: String) -> Result[LoadedProgram, LoadFailure]:
+	match prepare_prelude(prelude.contents):
+		Err(error):
+			Err({ sources = { prelude = prelude, modules = [] }, diagnostic = error })
+		Ok(checked):
+			load_checked(prelude, root_path, checked)
