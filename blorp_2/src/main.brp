@@ -56,13 +56,9 @@ private pure func render_location(inputs: SourceInputs, span: Span) -> Result[St
 		CompilerRole:
 			Ok("blorp_2")
 		ModuleRole:
-			match source_module(span.source):
-				Some(id):
-					match inputs.modules.get(module_number(id)):
-						Some(file): Ok(render_file_location(file, span))
-						None: Err("diagnostic references a missing module source")
-				None:
-					Err("invalid module source identity in diagnostic")
+			id ?= source_module(span.source).to_result("invalid module source identity in diagnostic")
+			file ?= inputs.modules.get(module_number(id)).to_result("diagnostic references a missing module source")
+			Ok(render_file_location(file, span))
 		InvalidRole:
 			Err("invalid source identity in diagnostic")
 
@@ -87,44 +83,46 @@ private pure func note_text(note: DiagnosticNote) -> String:
 		CompetingDeclarations(_): ": note: candidate declaration or import here"
 
 
-private pure func render_diagnostic(inputs: SourceInputs, diagnostic: Diagnostic) -> Result[String, String]:
-	location ?= render_location(inputs, diagnostic.span)
-	message = location.concat(": error: ").concat(diagnostic.message).concat("\nhelp: ").concat(diagnostic.help)
+-- Every rendered line is a source location followed by its text, so a diagnostic
+-- and its notes render the same way.
+private fixed record LocatedText {
+	span: Span,
+	text: String
+}
 
+
+private pure func located_texts(diagnostic: Diagnostic) -> List[LocatedText]:
+	headline = ": error: ".concat(diagnostic.message).concat("\nhelp: ").concat(diagnostic.help)
+	var lines: List[LocatedText] = [{ span = diagnostic.span, text = headline }]
 	match diagnostic.note:
-		None:
-			Ok(message)
+		None: void
 		Some(note):
-			var rendered = message
-			var failure: Option[String] = None
 			for span in note_spans(note):
-				match render_location(inputs, span):
-					Err(error):
-						failure = Some(error)
-						break
-					Ok(location):
-						rendered = rendered.concat("\n").concat(location).concat(note_text(note))
-			match failure:
-				Some(error): Err(error)
-				None: Ok(rendered)
+				lines = lines.append({ span = span, text = note_text(note) })
+	lines
+
+
+-- Recursion depth is the line count: each phase reports its first error, so a
+-- compilation yields a handful. The host handles tens of thousands of frames
+-- (30,000 ran, 50,000 overflowed the stack).
+private pure func render_lines(inputs: SourceInputs, lines: List[LocatedText], rendered: List[String]) -> Result[List[String], String]:
+	match lines.get(rendered.length()):
+		None:
+			Ok(rendered)
+		Some(line):
+			location ?= render_location(inputs, line.span)
+			render_lines(inputs, lines, rendered.append(location.concat(line.text)))
 
 
 pure func render_diagnostics(inputs: SourceInputs, errors: Diagnostics) -> String:
-	var rendered: List[String] = []
-	var failure: Option[String] = None
-
+	var lines: List[LocatedText] = []
 	for error in [errors.first].concat(errors.remaining):
-		match render_diagnostic(inputs, error):
-			Ok(text): rendered = rendered.append(text)
-			Err(error):
-				failure = Some(error)
-				break
-
-	match failure:
-		Some(error):
-			"blorp_2: error: ".concat(error).concat("\nhelp: report this compiler error with the input files")
-		None:
+		lines = lines.concat(located_texts(error))
+	match render_lines(inputs, lines, []):
+		Ok(rendered):
 			rendered.join("\n")
+		Err(error):
+			"blorp_2: error: ".concat(error).concat("\nhelp: report this compiler error with the input files")
 
 
 func main(args: List[String]) -> Int:
