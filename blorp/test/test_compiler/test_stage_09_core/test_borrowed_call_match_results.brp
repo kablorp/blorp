@@ -195,12 +195,43 @@ pure func test_parameter_catalog_retains_only_alias_branches() -> Bool:
 	branches_are_owned_once(owner, rewritten)
 
 
+-- Where the conditional sits inside the consumed argument.
+private fixed union ConditionalWrapper:
+	BareConditional
+	ConditionalUnderDrop
+	ConditionalUnderDup
+
+
+private pure func wrap_conditional(wrapper: ConditionalWrapper, conditional: CoreExpr) -> CoreExpr:
+	match wrapper:
+		BareConditional:
+			conditional
+		ConditionalUnderDrop:
+			DropExpr(
+				variable("tmp", None),
+				string_type(),
+				ArcReleasePolicy,
+				conditional,
+				string_type(),
+				synthetic_core_source_loc(),
+			)
+		ConditionalUnderDup:
+			DupExpr(
+				variable("tmp", None),
+				string_type(),
+				ArcRetainPolicy,
+				conditional,
+				string_type(),
+				synthetic_core_source_loc(),
+			)
+
+
 -- `Ok(wrap(if flag: value else: value + value))`: a conditional selecting
 -- between the borrowed parameter and a fresh string, under a wrapper that
 -- passes its body's value through.
 private pure func wrapped_conditional_input(
 	owner: CoreParam,
-	wrap: pure (CoreExpr) -> CoreExpr,
+	wrapper: ConditionalWrapper,
 ) -> CoreExpr:
 	value: CoreExpr = VarExpr(owner.name, string_type(), synthetic_core_source_loc())
 	fresh: CoreExpr = CallExpr(
@@ -227,31 +258,34 @@ private pure func wrapped_conditional_input(
 	CallExpr(
 		UserCall("Ok", Some(1000), []),
 		VoidExpr(VoidType, synthetic_core_source_loc()),
-		[wrap(conditional)],
+		[wrap_conditional(wrapper, conditional)],
 		result_type(),
 		synthetic_core_source_loc(),
 	)
 
 
-private pure func unwrapped_body(expr: CoreExpr) -> CoreExpr:
-	match expr:
-		DropExpr(_, _, _, body, _, _):
+-- Looks through exactly the layer the fixture added. Any other layer, such as
+-- a retain of the whole selected value, is left in place and fails the check.
+private pure func conditional_inside(wrapper: ConditionalWrapper, argument: CoreExpr) -> CoreExpr:
+	match (wrapper, argument):
+		(ConditionalUnderDrop, DropExpr(_, _, _, body, _, _)):
 			body
-		DupExpr(_, _, _, body, _, _):
+		(ConditionalUnderDup, DupExpr(_, _, _, body, _, _)):
 			body
 		_:
-			expr
+			argument
 
 
 -- Only the branch that aliases the parameter is retained; the fresh branch
 -- already owns its result, and nothing retains the selected value as a whole.
 private pure func retains_only_conditional_alias_branch(
 	owner: CoreParam,
+	wrapper: ConditionalWrapper,
 	rewritten: CoreExpr,
 ) -> Bool:
 	match rewritten:
 		CallExpr(_, _, [argument], _, _):
-			match unwrapped_body(argument):
+			match conditional_inside(wrapper, argument):
 				IfExpr(_, DupExpr(value, _, _, VarExpr(_, _, _), _, _), CallExpr(_, _, [VarExpr(_, _, _), VarExpr(_, _, _)], _, _), _, _):
 					value.name == owner.name.name and value.def_id == owner.name.def_id
 				_:
@@ -262,7 +296,7 @@ private pure func retains_only_conditional_alias_branch(
 
 private pure func catalog_retains_only_conditional_alias_branch(
 	owner: CoreParam,
-	wrap: pure (CoreExpr) -> CoreExpr,
+	wrapper: ConditionalWrapper,
 ) -> Bool:
 	env = environment()
 	entries = borrowed_parameter_owner_entries(env, [owner], [])
@@ -271,43 +305,17 @@ private pure func catalog_retains_only_conditional_alias_branch(
 		entries,
 		FunctionOwnerRegion,
 		result_type(),
-		wrapped_conditional_input(owner, wrap),
+		wrapped_conditional_input(owner, wrapper),
 	)
-	retains_only_conditional_alias_branch(owner, rewritten)
-
-
-private pure func unwrapped(body: CoreExpr) -> CoreExpr:
-	body
-
-
-private pure func under_drop(body: CoreExpr) -> CoreExpr:
-	DropExpr(
-		variable("tmp", None),
-		string_type(),
-		ArcReleasePolicy,
-		body,
-		string_type(),
-		synthetic_core_source_loc(),
-	)
-
-
-private pure func under_dup(body: CoreExpr) -> CoreExpr:
-	DupExpr(
-		variable("tmp", None),
-		string_type(),
-		ArcRetainPolicy,
-		body,
-		string_type(),
-		synthetic_core_source_loc(),
-	)
+	retains_only_conditional_alias_branch(owner, wrapper, rewritten)
 
 
 pure func test_parameter_catalog_retains_only_wrapped_conditional_alias_branch() -> Bool:
 	var holds: Bool = True
 
 	for owner in [parameter(None), parameter(Some(301))]:
-		for wrap in [unwrapped, under_drop, under_dup]:
-			holds = holds and catalog_retains_only_conditional_alias_branch(owner, wrap)
+		for wrapper in [BareConditional, ConditionalUnderDrop, ConditionalUnderDup]:
+			holds = holds and catalog_retains_only_conditional_alias_branch(owner, wrapper)
 
 	holds
 
