@@ -9,9 +9,12 @@ call syntax also accepts self and mutual recursion; checking separately rejects
 unbounded recursive type substitutions. Imports precede declarations. Relative
 paths use explicit `./` or leading `../` without a `.brp` suffix; bare paths
 resolve under the required target-library root. Each normalized source path is
-loaded and parsed once, including the designated `_base/types.brp` and ordinary
-`_base/prelude.brp`. Concrete functions may use a sole closed builtin body,
-including `builtin("int.add")`, with an exact runtime signature.
+loaded and parsed once, including the designated `_base.brp` and ordinary
+`prelude.brp`; the prelude is the only implicit import, and only user modules
+receive it. Import cycles, including self-imports, are rejected, and modules
+under the library root cannot import user modules. Concrete
+functions may use a sole closed builtin body, including `builtin("int.add")`,
+with an exact runtime signature.
 Imports preserve declaration identities; only the root module's local `main`
 is the entrypoint. It takes either no parameters or one List[String] parameter
 and returns Int or Void. Omitting a function's return annotation means Void.

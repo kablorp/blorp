@@ -338,16 +338,6 @@ private pure func user_modules(parsed: ParsedContents) -> List[ModuleId]:
 	users
 
 
--- Every module except the foundation types module itself sees its types.
-private pure func foundation_types_in(parsed: ParsedContents, bindings: List[TypeBinding], module: ModuleId) -> List[TypeBinding]:
-	var rows: List[TypeBinding] = []
-	if not same_module(module, parsed.foundation.types):
-		for binding in bindings:
-			if same_module(binding.module, parsed.foundation.types):
-				rows = rows.append({ binding | module = module })
-	rows
-
-
 -- The finite set is (scope, name, original head). Each round only adds a new
 -- member, so forwarding cycles converge and cannot manufacture an origin.
 private pure func complete_types(
@@ -357,9 +347,6 @@ private pure func complete_types(
 ) -> List[TypeBinding]:
 	users = user_modules(parsed)
 	var types = local
-	-- Rows from other modules never repeat: a declaration's target is distinct per declaration.
-	for module in parsed.modules:
-		types = types.concat(foundation_types_in(parsed, local, module.module))
 	var changed = True
 	while changed:
 		before = types.length()
@@ -380,11 +367,8 @@ private pure func implicit_types(
 	requests: List[TypeImportRequest],
 	types: List[TypeBinding],
 ) -> List[TypeBinding]:
-	users = user_modules(parsed)
 	var implicit: List[TypeBinding] = []
-	for module in parsed.modules:
-		implicit = implicit.concat(foundation_types_in(parsed, types, module.module))
-	for user in users:
+	for user in user_modules(parsed):
 		for request in requests:
 			if same_module(request.module, parsed.foundation.prelude):
 				for candidate in visible_types(types, request.target, request.name.id):
@@ -426,14 +410,13 @@ private pure func selected_type(
 				_: Err(AmbiguousImportedType(target, name))
 
 
--- The first four fields are read-only scope that selections resolve against; the
+-- The first three fields are read-only scope that selections resolve against; the
 -- rest accumulate rows and problems in source order. bound_types is the importing
 -- scopes' type view, used only to detect conflicting type names.
 private fixed record ImportScan {
 	functions: List[LocalFunctionBinding],
 	variants: List[VariantBinding],
 	types: List[TypeBinding],
-	base: ModuleId,
 	imports: List[ImportedFunctionBinding],
 	constructors: List[VariantBinding],
 	methods: List[MethodSelectionRequest],
@@ -455,18 +438,17 @@ private pure func import_receiver(scan: ImportScan, site: ImportSite, receiver: 
 	name = written_name(site.selection)
 	row: TypeBinding = { module = site.module, name = name, target = receiver }
 	request: MethodSelectionRequest = { module = site.module, target = site.target, name = name, receiver = receiver }
-	with_method = { scan | methods = scan.methods.append(request) }
 	match site.selection:
 		MethodsOnlySelection(_, _):
 			if contains_type(scan.types, row):
-				with_method
+				{ scan | methods = scan.methods.append(request) }
 			else:
 				{ scan | problems = scan.problems.append(MethodTypeNotVisible(name)) }
 		NamedSelection(_) | ConstructorSelection(_, _):
-			checked = match type_conflict(scan.bound_types, row):
-				Some(first): { with_method | problems = with_method.problems.append(ImportedTypeConflict(name, first)) }
-				None: with_method
-			{ checked | bound_types = with_type(checked.bound_types, row) }
+			problems = match type_conflict(scan.bound_types, row):
+				Some(first): scan.problems.append(ImportedTypeConflict(name, first))
+				None: scan.problems
+			{ scan | methods = scan.methods.append(request), problems = problems, bound_types = with_type(scan.bound_types, row) }
 
 
 -- Find the union's variant the selection names and import it.
@@ -532,10 +514,6 @@ private pure func import_selection(scan: ImportScan, site: ImportSite) -> Import
 
 private pure func import_module(scan: ImportScan, row: ParsedModuleRow) -> ImportScan:
 	var next = scan
-	if not same_module(row.module, scan.base):
-		for binding in scan.variants:
-			if same_module(binding.module, scan.base):
-				next = { next | constructors = next.constructors.append({ binding | module = row.module }) }
 	var previous: List[ModuleImport] = []
 	for request in row.imports:
 		var earlier: Option[Span] = None
@@ -608,7 +586,6 @@ pure func build_namespace(program: ParsedProgram) -> Namespace:
 		functions = functions,
 		variants = variants,
 		types = types,
-		base = parsed.foundation.types,
 		imports = [],
 		constructors = [],
 		methods = [],

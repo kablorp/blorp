@@ -93,7 +93,7 @@ not prohibit same-spelled local type/function declarations. Constructor and
 method-only selectors already identify their relevant namespace explicitly.
 
 An ordinary type import is required for a user-defined receiver type unless
-that exact declaration is already supplied by base/prelude. A method-only
+that exact declaration is already supplied by the prelude. A method-only
 selector does not satisfy this requirement, even if its target module knows
 the type. Resolve all ordinary type bindings before method-only requests;
 reordering import rows must not change the result. A same-spelled declaration
@@ -102,12 +102,13 @@ A type declared in the importing module itself is independently visible too;
 it does not need a self-import. Existing local UFCS keeps working.
 
 An ordinary type selector may follow a type binding already visible in its
-target module to the original declaration. Thus `int: Int` works even though
-the foundational module owns Int, and `foo_1: Foo` may explicitly import the
+target module to the original declaration. Thus `int: Int` works because `int`
+imports Int from `_base`, and `foo_1: Foo` may explicitly import the
 Foo that `foo_1` imported. This is type forwarding by identity, not a new
 declaration or a `reexport` feature. Type forwarding must terminate and report
-missing/conflicting bindings, including an import cycle with no declaration
-at its origin. Importing a function continues to expose none of its signature
+missing/conflicting bindings. The loader bans import cycles, but the namespace
+still rejects a forwarding cycle with no declaration at its origin rather than
+inventing an identity. Importing a function continues to expose none of its signature
 types, sibling functions, or constructors as names.
 
 Method selection considers only functions declared in the selected module.
@@ -152,9 +153,8 @@ distinct outcomes.
 ```text
 blorp_2/standard_library_temp/
     README.md
-    _base/
-        types.brp
-        prelude.brp
+    _base.brp
+    prelude.brp
     int.brp
     float.brp
     string.brp
@@ -162,7 +162,8 @@ blorp_2/standard_library_temp/
     io.brp
 ```
 
-`_base/types.brp` is the sole declaration owner:
+`_base.brp` is the sole declaration owner, and the only module that may
+declare builtin types:
 
 ```blorp
 type Int = builtin
@@ -190,23 +191,27 @@ Bool, Option, and Result remain ordinary nominal unions. They acquire no
 primitive representation or name-based runtime recognition. Builtin operations
 continue to receive explicit, checked constructor roles.
 
-The base scope includes its type declarations and their constructors:
-True, False, Some, None, Ok, and Err. This explicitly lets library operation
-modules name those constructors without importing a higher-level operation
-module. Base declares no functions and imports nothing. Base type names share
-the module's type namespace with normal imports: a distinct module-level type
-declaration cannot replace an implicitly visible base type. Test this rule
-and migrate local test declarations to names such as Maybe where appropriate;
-ordinary local value shadowing retains its existing rules.
+Base declares no functions and imports nothing. Any module may import it as
+`_base`, selecting types and constructors like any other module, for example
+`_base: Int, Bool(True, False)` in `int.brp`. Library operation modules name
+base types and constructors only through such imports; this keeps every
+dependency written where it is used. Base type names share the module's type
+namespace with normal imports: a distinct module-level type declaration cannot
+replace a base type visible in that module. Test this rule and migrate local
+test declarations to names such as Maybe where appropriate; ordinary local
+value shadowing retains its existing rules.
 
-`_base/prelude.brp` selects operations through the same import mechanism:
+`prelude.brp` selects base types and operations through the same import mechanism.
+Each type comes from base, where it is declared; each operation module adds only
+its receiver methods, so no reader is told that `Int` comes from `int`:
 
 ```blorp
 import:
-    int: Int
-    float: Float
-    string: String
-    list: List
+    _base: Int, Float, String, List, Void, Bool(True, False), Option(Some, None), Result(Ok, Err)
+    int: Int methods_only
+    float: Float methods_only
+    string: String methods_only
+    list: List methods_only
 ```
 
 These imports supply UFCS functions; they do not make bare `add`, `length`,
@@ -214,15 +219,19 @@ or `to_string` calls available. A bare function call needs a named function
 import. IO remains explicit (`io: print`). Prelude imports define its supplied
 scope directly; no `reexport` syntax or wrapper declarations are required.
 
-Bool, Option and Result need no operation modules yet. Their types and constructors
-are supplied by base; add separate modules when operations need them.
+Bool, Option and Result need no operation modules yet. The prelude selects their
+types and constructors from base; add separate modules when operations need them.
 
-| Source role | Implicit scope |
+The prelude is the only implicit import, and only user modules receive it.
+Following GHC's `NoImplicitPrelude` for `base`, everything under the library
+root, the prelude included, sees only its own declarations and written imports.
+
+| Source role | Scope |
 | --- | --- |
-| Foundation types | Its own declarations; no prelude or operation imports. |
-| Foundation prelude | Base plus its written imports; no implicit self-prelude. |
-| Target-library operation module | Base plus its written imports. |
-| Application root or ordinary user library/helper module | Base, prelude, and its written imports. |
+| Foundation types (`_base.brp`) | Its own declarations. |
+| Foundation prelude (`prelude.brp`) | Its written imports; no implicit self-prelude. |
+| Target-library module | Its written imports, including any base types it uses. |
+| Application root or ordinary user library/helper module | The prelude's selections and its written imports. |
 
 Module role is explicit input-inventory data derived from the configured
 target library and designated foundation inputs. Do not guess it from an
@@ -231,8 +240,10 @@ relative dependency within the target library has the same scope policy as a
 bare-loaded library module. Moving user code out of main into a helper must
 not change its implicit scope.
 
-`_base` is reserved compiler input: users cannot import these designated
-modules explicitly, via either bare or relative paths. No opt-out is included.
+The prelude is reserved compiler input: no module can import it explicitly, via
+either a bare or a relative path. No opt-out is included. Base is an ordinary
+import target; importing it explicitly from a user module overlaps the
+prelude's selections idempotently.
 The shell receives an explicit library root; there is no host-library or
 working-directory fallback. The compiler command is:
 
@@ -245,10 +256,64 @@ blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
 The positional legacy prelude input and `src/prelude_temp.brp` are removed;
 all callers use the configured library root. Missing foundation files produce
 source-aware load diagnostics.
-Keep the general module-cycle policy unchanged in this work: the pilot
-currently accepts cycles without initialization. The target library's
-base/operations/prelude dependency structure must be acyclic. A general cycle
-ban is a separate language decision, not a side effect of this migration.
+
+## Module layering and placement
+
+Import cycles are banned, and the compiler enforces it. After loading, when
+every module's import targets are resolved, a pure depth-first walk in load
+order reports the first cycle at the import that closes it. A module importing
+itself is a cycle too. For a root given as `main.brp` in `/project`:
+
+```text
+/project/helper.brp:2:5: error: import cycle: main.brp -> /project/helper.brp -> main.brp
+help: move the declarations both modules need into a third module that both import
+```
+
+The walk names modules by their display paths, as other load diagnostics do:
+the root keeps its command-line spelling and dependencies show their normalized
+absolute paths. It runs before checking, so a cyclic program reports the cycle rather than a
+later error. The host standard library, this target library and the pilot's own
+sources had no import cycles when the ban was introduced. The
+[cost report](../benchmarks/results/blorp_2_imports_prelude_cycles_2026-10-13.md)
+records the matched cost of the explicit base imports and of the walk.
+
+Acyclicity is a loader guarantee, not yet a type: a sealed `ParsedProgram` can
+still be cyclic, and `LoadedProgram` is an ordinary record. A follow-up moves
+the check into program sealing so that only an acyclic program can be sealed;
+it needs `parse.brp` and is sequenced after the layout branch.
+
+The target library is layered so that it is acyclic by construction:
+
+1. `_base` declares the builtin and base types and imports nothing.
+2. Operation modules (`int`, `float`, `string`, `list`, `io`) import base
+   types from `_base` and, where needed, other operation modules.
+3. The prelude imports base types and operation methods.
+4. User modules receive the prelude implicitly and import anything else.
+
+The library stays acyclic because library modules never receive the prelude
+and never import user modules. A user module's dependency on the prelude is
+implicit, so the walk over written imports cannot see it; the loader instead
+rejects any module under the library root, the prelude included, that imports
+a user module:
+
+```text
+a library module cannot import a user module
+help: library modules may import only other library modules and _base
+```
+
+The application root is a user module wherever it lives, even under the
+library root.
+
+Library functions are placed by these rules:
+
+- A function lives in its receiver's module: `split(String) -> List[String]`
+  belongs in `string`, and `join(List[String])` in `list`.
+- It moves to a higher module only when staying would create a cycle over a
+  module-defined type.
+- Mutually recursive module-defined types share a module.
+
+Builtin types never force an import: they are declared in `_base`, which is the
+one import a module is expected to need for naming them.
 
 ## Phase responsibilities and immutable facts
 
@@ -315,12 +380,12 @@ path, or backend import repair is needed.
 | Boundary | Required cases and observable results |
 | --- | --- |
 | Parser / EBNF | Exact suffix; constructor syntax unchanged; mixed selections; malformed placement/combinations; empty/comment-only modules. Inspect typed selectors and exact error/help/spans. |
-| Loader / roles | One load/parse per normalized module path, including shared prelude/base; reserved foundation imports reject; root/helper/library roles remain distinct; missing foundation files preserve output files. |
+| Loader / roles | One load/parse per normalized module path, including shared prelude/base; explicit prelude imports reject and explicit base imports reach the designated base; import cycles, including self-imports, reject at the closing import while diamonds load; library modules importing user modules reject; root/helper/library roles remain distinct; missing foundation files preserve output files. |
 | Namespace | Forwarded types retain original IDs; type/constructor overlap is idempotent; missing/conflicting types and ambiguous bare type/function selectors reject; method-only imports add no type/constructor binding; import order is irrelevant. |
 | Accepted signatures / UFCS visibility | Local module functions only; no dependency/prelude method forwarding; zero-parameter functions excluded; exact and applied receiver matching; unconstrained T excluded from type selection. |
 | Call checking | Two operation modules compose; DirectCall/ReceiverCall obey explicit binding availability; named import upgrades the same function's availability without duplication; distinct applicable methods are ambiguous; wrong receiver/arity/purity rejects with typed errors. |
 | Contextual inference | Bare constructor plus unique method context; competing contexts require annotation; multi-step receiver chains, field access followed by UFCS, and contextual generic receivers preserve existing behavior. |
-| Prelude / library | Same defaults in root and user helper; stdlib does not acquire prelude; Int/Float `add`, String/List `length`, and numeric `to_string` resolve by type; Option/Result/Bool remain ordinary unions. |
+| Prelude / library | Same defaults in root and user helper; stdlib acquires neither prelude nor base implicitly; Int/Float `add`, String/List `length`, and numeric `to_string` resolve by type; Option/Result/Bool remain ordinary unions. |
 | Ownership / backend | Imported managed Strings/unions and existing inline records retain checked, concrete, lowered, ownership and verifier contracts; generated C references the selected function; real fixtures remain sanitizer-clean. |
 
 The direct suites for [import syntax](test/unit/test_import_syntax.brp),

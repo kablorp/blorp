@@ -782,7 +782,7 @@ Semantic rules:
   cannot return `Void`, including concrete generic instances.
 - Union types have nominal identity. Equal variant positions or shared variant
   spellings do not make two unions interchangeable. Union type names must be
-  unique in their module and cannot replace implicitly visible base types; each union's variant names must be unique.
+  unique in their module and cannot replace a base type visible in that module; each union's variant names must be unique.
   Type names occupy a separate namespace from functions and variant values, so
   a function may share a type name. A function cannot share any variant name;
   a collision highlights whichever declaration appears later in the source.
@@ -966,10 +966,11 @@ values. Direct calls and UFCS use the caller's visible functions. Only a local
 ordinary function.
 
 Paths are normalized absolute logical paths for one invocation; symlink aliases
-are not canonicalized. A diamond loads a shared path once. Dependency cycles
-are allowed because annotated declarations can be inventoried before checking
-bodies and there is no module initialization. This does not permit cyclic runtime
-data. Every loaded module is checked, including unused declarations. Diagnostics
+are not canonicalized. A diamond loads a shared path once. Import cycles,
+including a module importing itself, are rejected after loading and before
+checking: a depth-first walk over resolved targets in load order reports the
+first cycle at the import that closes it, naming its modules by display path.
+Every loaded module is checked, including unused declarations. Diagnostics
 retain the source file for primary errors and secondary notes independently.
 
 The [module validation report](../benchmarks/results/blorp_2_modules_2026-10-11.md)
@@ -1134,9 +1135,9 @@ records phase tests, native output, ownership checks and matched costs.
 ## Calculator input and results
 
 `Option[T]`, `Result[Value, Error]` and `Bool` come from ordinary
-fixed unions in `standard_library_temp/_base/types.brp`; neither spelling receives
-a compiler-specific representation. Their types and constructors are implicitly
-available in every module:
+fixed unions in `standard_library_temp/_base.brp`; neither spelling receives
+a compiler-specific representation. The prelude supplies their types and
+constructors to user modules; library modules import them from `_base`:
 
 ```blorp
 import:
@@ -1195,7 +1196,7 @@ those roles directly; constructor names and ordering carry no hidden semantics.
 
 ## Float64 calculator
 
-The designated foundation `_base/types.brp` owns `Float`, a binary64 unmanaged value. Decimal source
+The designated foundation `_base.brp` owns `Float`, a binary64 unmanaged value. Decimal source
 literals require a decimal point with digits on both sides, an exponent, or
 both: `6.5`, `1e2`, `-0.0`, `2.5e-3`. Leading plus, leading-zero integer parts,
 `.5`, `1.`, hexadecimal literals and separators are rejected. Source literals
@@ -1442,13 +1443,14 @@ Recursive direct arguments and postfix receiver calls remain single-line values.
 A structured body sum distinguishes that leaf from a match with ordered arms.
 Managed control-flow joins and general pass infrastructure remain future work.
 
-The target library's [`_base/types.brp`](standard_library_temp/_base/types.brp)
+The target library's [`_base.brp`](standard_library_temp/_base.brp)
 owns the builtin Int, Float, String, Void and List identities, and the ordinary
-Bool, Option and Result unions. Those types and constructors are available in
-every module. [`_base/prelude.brp`](standard_library_temp/_base/prelude.brp)
-supplies its written import scope to application roots and user helper modules.
-Library operation modules receive base types plus their own written imports.
-Neither foundation module can be explicitly imported. The compiler requires
+Bool, Option and Result unions. It is the only module that may declare builtin
+types, and any module may import it as `_base`. [`prelude.brp`](standard_library_temp/prelude.brp)
+is the only implicit import: it supplies its written import scope to application
+roots and user helper modules, and cannot be imported explicitly. Library
+modules receive nothing implicitly; each imports what it uses, including base
+types, and none may import a user module. The compiler requires
 `--library-root DIRECTORY INPUT.brp OUTPUT.c`; there is no separate prelude
 input or host-library fallback.
 

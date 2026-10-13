@@ -6,6 +6,7 @@ import:
 			AmbiguousImportSelection, AmbiguousImportedType, MissingImportedType, MethodTypeNotVisible,
 			MissingImportedFunction, ImportedTypeConflict, RepeatedImportedVariant,
 		),
+		MethodSelectionRequest,
 		Namespace,
 		TypeCandidate(PrimitiveCandidate, ListCandidate, UnionCandidate, RecordCandidate),
 		build_namespace,
@@ -15,6 +16,8 @@ import:
 		same_type_candidate,
 		type_candidates,
 		variant_candidates,
+	../../src/check: check
+	../../src/check_render: render_failure
 	../../src/lex: lex
 	../../src/assemble:
 		ParsedAssembly,
@@ -28,7 +31,7 @@ import:
 	../../src/builtins: PrimitiveType(BuiltinInt)
 	../../src/source:
 		COMPILER_SOURCE, ModuleId, ModuleKind(FoundationTypesModule, FoundationPreludeModule, LibraryModule, UserModule),
-		module_id, module_source, root_module_id, same_module,
+		module_id, module_source, root_module_id, same_module, same_source,
 	../../src/syntax: Diagnostic
 	module_input: ModuleInput, TEST_BASE, parse_modules
 	int as IntOps
@@ -118,6 +121,13 @@ private pure func same_visible_type(
 			False
 
 
+-- Method requests that select from operation modules. Every user module also
+-- receives the test prelude's selections from the base, whose method set is empty.
+private pure func operation_requests(input: NamespaceInput) -> List[MethodSelectionRequest]:
+	base = parsed_contents(input.program).foundation.types
+	method_selection_requests(input.namespace).filter(pure func(request): not same_module(request.target, base))
+
+
 pure func test_bare_record_import_retains_owner_and_publishes_method_request() -> Bool:
 	root: String =
 		|import:
@@ -146,7 +156,7 @@ pure func test_bare_record_import_retains_owner_and_publishes_method_request() -
 		Ok(input):
 			match (
 				candidates(input, 0, "Foo"),
-				method_selection_requests(input.namespace),
+				operation_requests(input),
 				module_id(1),
 			):
 				([RecordCandidate(receiver)], [request], Some(target)):
@@ -228,7 +238,7 @@ pure func test_builtin_types_forward_through_empty_operation_modules() -> Bool:
 				([PrimitiveCandidate(BuiltinInt)], [ListCandidate]):
 					(
 						same_visible_type(input, 0, 1, "Int")
-						and method_selection_requests(input.namespace).length() == 2
+						and operation_requests(input).length() == 2
 						and import_problems(input.namespace).is_empty()
 					)
 				_:
@@ -551,7 +561,7 @@ pure func test_methods_only_rejects_unrelated_same_named_caller_type() -> Bool:
 				[MethodTypeNotVisible(_)]:
 					(
 						not same_visible_type(input, 0, 1, "Foo")
-						and method_selection_requests(input.namespace).is_empty()
+						and operation_requests(input).is_empty()
 					)
 				_:
 					False
@@ -587,7 +597,7 @@ pure func test_methods_only_accepts_caller_local_declaration() -> Bool:
 		Ok(input):
 			(
 				same_visible_type(input, 0, 1, "Foo")
-				and method_selection_requests(input.namespace).length() == 2
+				and operation_requests(input).length() == 2
 				and import_problems(input.namespace).is_empty()
 			)
 
@@ -622,7 +632,7 @@ private pure func reordered_methods_valid(root: String, targets: List[Int]) -> B
 		Ok(input):
 			(
 				same_visible_type(input, 0, 2, "Foo")
-				and method_selection_requests(input.namespace).length() == 3
+				and operation_requests(input).length() == 3
 				and import_problems(input.namespace).is_empty()
 			)
 
@@ -899,6 +909,8 @@ pure func test_prelude_selected_scope_obeys_explicit_module_roles() -> Bool:
 		|    0
 		|
 	operations: String =
+		|import:
+		|    _base: Int
 		|fixed union Choice:
 		|    One(Int)
 		|pure func number(value: Choice) -> Int:
@@ -908,15 +920,16 @@ pure func test_prelude_selected_scope_obeys_explicit_module_roles() -> Bool:
 		|
 	prelude: String =
 		|import:
+		|    _base: Int
 		|    ./operations: Choice(One), answer
 		|
 	match role_namespace([
 		{ source = root, targets = [], role = UserModule },
 		{ source = "", targets = [], role = UserModule },
 		{ source = "", targets = [], role = LibraryModule },
-		{ source = operations, targets = [], role = LibraryModule },
-		{ source = TEST_BASE, targets = [], role = FoundationTypesModule },
-		{ source = prelude, targets = [3], role = FoundationPreludeModule },
+		{ source = operations, targets = [4], role = LibraryModule },
+		{ source = TEST_BASE.types, targets = [], role = FoundationTypesModule },
+		{ source = prelude, targets = [4, 3], role = FoundationPreludeModule },
 	]):
 		Err(_): False
 		Ok(input):
@@ -931,14 +944,16 @@ pure func test_prelude_selected_scope_obeys_explicit_module_roles() -> Bool:
 						and same_visible_type(input, 1, 3, "Choice")
 						and candidates(input, 2, "Choice").is_empty()
 						and candidates(input, 4, "Choice").is_empty()
-						and candidates(input, 2, "Int").length() == 1
+						and candidates(input, 1, "Int").length() == 1
+						and candidates(input, 2, "Int").is_empty()
+						and candidates(input, 3, "Int").length() == 1
 						and variant_candidates(input.namespace, root_module_id(), one).length() == 1
 						and variant_candidates(input.namespace, helper, one).length() == 1
 						and variant_candidates(input.namespace, library, one).is_empty()
 						and function_candidates(input.namespace, root_module_id(), answer).length() == 1
 						and function_candidates(input.namespace, helper, answer).length() == 1
 						and function_candidates(input.namespace, library, answer).is_empty()
-						and method_selection_requests(input.namespace).length() == 3
+						and operation_requests(input).length() == 3
 						and import_problems(input.namespace).is_empty()
 					)
 				_: False
@@ -956,7 +971,7 @@ pure func test_local_prelude_declarations_do_not_supply_implicit_scope() -> Bool
 		|
 	match role_namespace([
 		{ source = root, targets = [], role = UserModule },
-		{ source = TEST_BASE, targets = [], role = FoundationTypesModule },
+		{ source = TEST_BASE.types, targets = [], role = FoundationTypesModule },
 		{ source = prelude, targets = [], role = FoundationPreludeModule },
 	]):
 		Err(_): False
@@ -991,7 +1006,7 @@ pure func test_explicit_and_prelude_function_overlap_is_idempotent() -> Bool:
 	match role_namespace([
 		{ source = root, targets = [1], role = UserModule },
 		{ source = operations, targets = [], role = LibraryModule },
-		{ source = TEST_BASE, targets = [], role = FoundationTypesModule },
+		{ source = TEST_BASE.types, targets = [], role = FoundationTypesModule },
 		{ source = prelude, targets = [1], role = FoundationPreludeModule },
 	]):
 		Err(_): False
@@ -1063,10 +1078,127 @@ pure func test_ambiguous_forwarded_type_keeps_both_identities_and_rejects_select
 				_: False
 
 
+-- Base declarations reach a library module only through its own imports, and a
+-- user module only through the prelude's selections.
+pure func test_base_scope_comes_only_from_imports() -> Bool:
+	root: String =
+		|func main() -> Int:
+		|    0
+		|
+	importing: String =
+		|import:
+		|    _base: Int, Option(Some, None)
+		|
+	prelude: String =
+		|import:
+		|    _base: Int
+		|
+	match role_namespace([
+		{ source = root, targets = [], role = UserModule },
+		{ source = "", targets = [], role = LibraryModule },
+		{ source = importing, targets = [3], role = LibraryModule },
+		{ source = TEST_BASE.types, targets = [], role = FoundationTypesModule },
+		{ source = prelude, targets = [3], role = FoundationPreludeModule },
+	]):
+		Err(_): False
+		Ok(input):
+			match (find_name(parsed_contents(input.program).names, "Some"), module_id(1), module_id(2), module_id(4)):
+				(Some(some), Some(silent), Some(importing_module), Some(prelude_module)):
+					(
+						candidates(input, 1, "Int").is_empty() and candidates(input, 1, "Option").is_empty()
+						and variant_candidates(input.namespace, silent, some).is_empty()
+						and same_visible_type(input, 2, 3, "Int") and same_visible_type(input, 2, 3, "Option")
+						and variant_candidates(input.namespace, importing_module, some).length() == 1
+						and same_visible_type(input, 0, 3, "Int") and same_visible_type(input, 4, 3, "Int")
+						and candidates(input, 0, "Option").is_empty() and candidates(input, 4, "Option").is_empty()
+						and variant_candidates(input.namespace, root_module_id(), some).is_empty()
+						and variant_candidates(input.namespace, prelude_module, some).is_empty()
+						and import_problems(input.namespace).is_empty()
+					)
+				_: False
+
+
+-- The prelude's shape: types come from base, and an operation module adds only
+-- its receiver methods. User modules receive both; library modules neither.
+pure func test_prelude_methods_only_selection_reaches_user_modules() -> Bool:
+	root: String =
+		|func main() -> Int:
+		|    0
+		|
+	operations: String =
+		|import:
+		|    _base: Int
+		|pure func doubled(value: Int) -> Int:
+		|    value
+		|
+	prelude: String =
+		|import:
+		|    _base: Int
+		|    ./operations: Int methods_only
+		|
+	match role_namespace([
+		{ source = root, targets = [], role = UserModule },
+		{ source = operations, targets = [2], role = LibraryModule },
+		{ source = TEST_BASE.types, targets = [], role = FoundationTypesModule },
+		{ source = prelude, targets = [2, 1], role = FoundationPreludeModule },
+	]):
+		Err(_): False
+		Ok(input):
+			match (operation_requests(input), module_id(1)):
+				([from_prelude, for_root], Some(operations_module)):
+					(
+						same_module(from_prelude.module, module_id(3).get_or(root_module_id()))
+						and same_module(for_root.module, root_module_id())
+						and same_module(for_root.target, operations_module)
+						and same_type_candidate(for_root.receiver, PrimitiveCandidate(BuiltinInt))
+						and same_visible_type(input, 0, 2, "Int")
+						and import_problems(input.namespace).is_empty()
+					)
+				_: False
+
+
+pure func test_library_module_without_base_import_cannot_name_int() -> Bool:
+	root: String =
+		|import:
+		|    ops: answer
+		|func main() -> Int:
+		|    answer()
+		|
+	operations: String =
+		|pure func answer() -> Int:
+		|    42
+		|
+	prelude: String =
+		|import:
+		|    _base: Int
+		|
+	match role_namespace([
+		{ source = root, targets = [1], role = UserModule },
+		{ source = operations, targets = [], role = LibraryModule },
+		{ source = TEST_BASE.types, targets = [], role = FoundationTypesModule },
+		{ source = prelude, targets = [2], role = FoundationPreludeModule },
+	]):
+		Err(_): False
+		Ok(input):
+			match check(input.program):
+				Ok(_): False
+				Err(failure):
+					diagnostic = render_failure(failure).first
+					(
+						same_source(diagnostic.span.source, module_source(module_id(1).get_or(root_module_id())))
+						and diagnostic.span.start == 22 and diagnostic.span.end == 25
+						and diagnostic.message == "unknown type"
+						and diagnostic.help == "declare or import this type; builtin types and declared type parameters are also available"
+					)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 type import identities and complete visibility closure",
 	tests = [
 		("prelude selected scope obeys explicit module roles", test_prelude_selected_scope_obeys_explicit_module_roles),
+		("base scope comes only from imports", test_base_scope_comes_only_from_imports),
+		("library module without base import cannot name Int", test_library_module_without_base_import_cannot_name_int),
+		("prelude methods only selection reaches user modules", test_prelude_methods_only_selection_reaches_user_modules),
 		("local prelude declarations do not supply implicit scope", test_local_prelude_declarations_do_not_supply_implicit_scope),
 		("explicit and prelude function overlap is idempotent", test_explicit_and_prelude_function_overlap_is_idempotent),
 		("methods only adds no constructor bindings", test_methods_only_adds_no_constructor_bindings),
