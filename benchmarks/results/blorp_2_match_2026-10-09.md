@@ -1,6 +1,6 @@
 # Blorp 2: Int payloads and tail match
 
-Date: 2026-10-09. Worktree: `/Users/keithphilpott/.codex/worktrees/1332/blorp`,
+Date: 2026-10-09. Worktree: `<worktree:1332>`,
 branch `blorp-2`, starting HEAD `275fd3b530473f306b683dd91a64134a53a34898`.
 The baseline includes the uncommitted payload-free union increment; HEAD alone
 is not its source identity. Its complete source/test snapshot, patch, fingerprints,
@@ -181,7 +181,7 @@ An explicitly typed local `VariantId` preserves the pilot's intended identity
 and unblocks this build. This is not a relaxation of generic type checking.
 
 The user authorized a separate bounded host repair. It is prepared in
-`/Users/keithphilpott/.codex/worktrees/opaque-append-fix/blorp`: retain the nominal
+`<worktree:opaque-append-fix>`: retain the nominal
 opaque conversion with the existing `CastExpr`, then let runtime projection erase
 its physical identity cast. The production change is +3 lines. Host validation
 and evidence belong to that separate worktree and `/tmp/blorp-opaque-append/`;

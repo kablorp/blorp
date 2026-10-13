@@ -2,7 +2,7 @@
 
 Date: 2026-10-09. Reviewed production revision:
 `afe38d0465a353146423dab8140feeef0e4134b8`, branch `blorp-2`, worktree
-`/Users/keithphilpott/.codex/worktrees/1332/blorp`.
+`<worktree:1332>`.
 Production and tracked test source were unchanged during this review.
 Pending documentation adds granular memory-test requirements to
 [AGENTS.md](../../blorp_2/AGENTS.md) and the
