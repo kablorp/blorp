@@ -1,19 +1,15 @@
 import:
 	../../src/lex: lex
 	../../src/names: NameTable, name_spelling
+	../../src/assemble: assembly_names, begin_program, parsed_contents
 	../../src/parse:
 		ImportOrigin(RelativeImport, LibraryImport),
 		ImportSelection(NamedSelection),
-		ParsedModule, ParsedProgram,
-		append_module,
-		assembly_names,
-		begin_program,
+		ParsedModule,
 		module_imports,
 		module_names,
 		parse_module,
-		parsed_contents,
-		seal_program,
-	../../src/source: COMPILER_SOURCE, ModuleKind(UserModule, FoundationTypesModule, FoundationPreludeModule, LibraryModule), ModuleId, module_id, module_source, root_module_id, same_module, same_source
+	../../src/source: ModuleId, module_id, module_source, root_module_id, same_module, same_source
 	../../src/syntax: Diagnostic, Token
 	module_input: parse_modules
 	test: TestSuite
@@ -168,37 +164,6 @@ pure func test_imports_and_declarations_keep_module_ownership() -> Bool:
 					False
 
 
-pure func test_sealing_requires_root_and_complete_targets() -> Bool:
-	empty = match seal_program(begin_program()):
-		Err(error): error.message == "source bundle has no root module" and same_source(error.span.source, COMPILER_SOURCE)
-		_: False
-	missing = match (root_module("import:\n    ./helper: answer\n"), module_id(3)):
-		(Ok(parsed), Some(target)):
-			match append_module(begin_program(), parsed, [target], UserModule).and_then(seal_program):
-				Err(error):
-					(
-						error.message == "source bundle is missing an imported module"
-						and same_source(error.span.source, COMPILER_SOURCE)
-						and error.help == "load each module once in inventory order and supply every import target"
-					)
-				_: False
-		_: False
-	empty and missing
-
-
-pure func test_assembly_rejects_wrong_target_count() -> Bool:
-	match parse_modules([{ source = "import:\n    ./helper: answer\n", targets = [] }]):
-		Err(error):
-			(
-				(
-				    error.message == "source bundle does not supply exactly one target per import"
-				    and error.help == "load each module once in inventory order and supply every import target"
-				)
-			)
-		_:
-			False
-
-
 private pure func parse_at(source: String, module: ModuleId, names: NameTable) -> Result[ParsedModule, Diagnostic]:
 	tokens ?= lex(module_source(module), source)
 	parse_module(tokens, module, names)
@@ -210,46 +175,6 @@ private pure func succeeded(result: Result[Bool, Diagnostic]) -> Bool:
 			value
 		Err(_):
 			False
-
-
-private pure func rejects_stale_extension(next_id: ModuleId) -> Result[Bool, Diagnostic]:
-	assembly = begin_program()
-	first ?= parse_at("func first() -> Int:\n    1\n", root_module_id(), assembly_names(assembly))
-	extended ?= append_module(assembly, first, [], UserModule)
-	stale ?= parse_at("func second() -> Int:\n    2\n", next_id, assembly_names(assembly))
-	Ok(match append_module(extended, stale, [], UserModule):
-		Err(error):
-			error.message == "parsed module does not extend this source bundle's name authority"
-		_:
-			False
-	)
-
-
-pure func test_assembly_rejects_stale_name_authority() -> Bool:
-	match module_id(1):
-		None:
-			False
-		Some(next_id):
-			succeeded(rejects_stale_extension(next_id))
-
-
-private pure func rejects_wrong_identity(other: ModuleId) -> Result[Bool, Diagnostic]:
-	assembly = begin_program()
-	parsed ?= parse_at("func main() -> Int:\n    0\n", other, assembly_names(assembly))
-	Ok(match append_module(assembly, parsed, [], UserModule):
-		Err(error):
-			error.message == "parsed module does not have the next source bundle identity"
-		_:
-			False
-	)
-
-
-pure func test_assembly_rejects_wrong_module_identity() -> Bool:
-	match module_id(1):
-		None:
-			False
-		Some(other):
-			succeeded(rejects_wrong_identity(other))
 
 
 private pure func rejects_wrong_source(other: ModuleId) -> Result[Bool, Diagnostic]:
@@ -294,87 +219,14 @@ pure func test_parsing_rejects_mixed_token_origins() -> Bool:
 			succeeded(rejects_mixed_source(other))
 
 
-private pure func assemble_roles(roles: List[ModuleKind]) -> Result[ParsedProgram, Diagnostic]:
-	var assembly = begin_program()
-	var ordinal = 0
-	var failure: Option[Diagnostic] = None
-	for role in roles:
-		match module_id(ordinal):
-			None:
-				failure = Some({ span = { source = COMPILER_SOURCE, start = 0, end = 0 }, note = None, message = "test inventory too large", help = "test setup" })
-			Some(id):
-				match parse_at("-- module\n", id, assembly_names(assembly)):
-					Err(error): failure = Some(error)
-					Ok(parsed):
-						match append_module(assembly, parsed, [], role):
-							Err(error): failure = Some(error)
-							Ok(next): assembly = next
-		ordinal = ordinal + 1
-	match failure:
-		Some(error): Err(error)
-		None: seal_program(assembly)
-
-
-private pure func roles_reject(roles: List[ModuleKind], message: String, source_ordinal: Int) -> Bool:
-	match assemble_roles(roles):
-		Ok(_): False
-		Err(error):
-		    (
-		        error.message == message
-		        and same_source(error.span.source, module_source(module_id(source_ordinal).get_or(root_module_id())))
-		        and error.span.start == 10 and error.span.end == 10
-		        and error.help == "load each module once in inventory order and supply every import target"
-		    )
-
-
-pure func test_sealing_requires_designated_types_role() -> Bool:
-	roles_reject([UserModule, FoundationPreludeModule], "source bundle has no foundation types module", 0)
-
-
-pure func test_sealing_requires_designated_prelude_role() -> Bool:
-	roles_reject([UserModule, FoundationTypesModule], "source bundle has no foundation prelude module", 0)
-
-
-pure func test_sealing_rejects_duplicate_types_role() -> Bool:
-	roles_reject([UserModule, FoundationTypesModule, FoundationTypesModule, FoundationPreludeModule], "source bundle has more than one foundation types module", 2)
-
-
-pure func test_sealing_rejects_duplicate_prelude_role() -> Bool:
-	roles_reject([UserModule, FoundationTypesModule, FoundationPreludeModule, FoundationPreludeModule], "source bundle has more than one foundation prelude module", 3)
-
-
-pure func test_sealing_requires_user_root_role() -> Bool:
-	roles_reject([FoundationTypesModule, UserModule, FoundationPreludeModule], "source bundle root must be a user module", 0)
-
-
-pure func test_sealing_publishes_actual_designated_module_identities() -> Bool:
-	match assemble_roles([UserModule, LibraryModule, FoundationPreludeModule, FoundationTypesModule]):
-		Err(_): False
-		Ok(program):
-			contents = parsed_contents(program)
-			match (module_id(2), module_id(3)):
-				(Some(prelude), Some(types)): same_module(contents.foundation.prelude, prelude) and same_module(contents.foundation.types, types)
-				_: False
-
-
 tests: TestSuite = {
 	description = "Blorp 2 import syntax",
 	tests = [
-		("sealing requires types role", test_sealing_requires_designated_types_role),
-		("sealing requires prelude role", test_sealing_requires_designated_prelude_role),
-		("sealing rejects duplicate types role", test_sealing_rejects_duplicate_types_role),
-		("sealing rejects duplicate prelude role", test_sealing_rejects_duplicate_prelude_role),
-		("sealing requires user root", test_sealing_requires_user_root_role),
-		("sealing publishes designated IDs", test_sealing_publishes_actual_designated_module_identities),
 		("relative import path is lexed", test_relative_import_path_is_lexed),
 		("relative paths retain components and selectors", test_relative_paths_retain_components_and_selectors),
 		("bare library path retains origin and selection spans", test_bare_library_path_retains_origin_and_selection_spans),
 		("nested library path retains named components", test_nested_library_path_retains_named_components),
 		("imports and declarations keep module ownership", test_imports_and_declarations_keep_module_ownership),
-		("sealing requires root and complete targets", test_sealing_requires_root_and_complete_targets),
-		("assembly rejects wrong target count", test_assembly_rejects_wrong_target_count),
-		("assembly rejects stale name authority", test_assembly_rejects_stale_name_authority),
-		("assembly rejects wrong module identity", test_assembly_rejects_wrong_module_identity),
 		("parsing rejects wrong source origin", test_parsing_rejects_wrong_source_origin),
 		("parsing rejects mixed token origins", test_parsing_rejects_mixed_token_origins),
 	]

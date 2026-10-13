@@ -1300,8 +1300,8 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    syntax stay distinct because their target lookup differs.
    Every expression records its consumed token span directly, without reconstructing
    locations from names or literal values.
-   A shared interning builder assigns one opaque `NameId` per spelling across the module inventory. Parsing
-   seals the complete syntax and immutable name table in an opaque `ParsedProgram`.
+   A shared interning builder assigns one opaque `NameId` per spelling across the module inventory. Program
+   assembly ([assemble.brp](src/assemble.brp)) seals the complete syntax and immutable name table in an opaque `ParsedProgram`.
    Integer conversion accumulates negatively against derived range cutoffs,
    checking before multiplication so even the minimum is represented safely.
 3. A frozen namespace maps each module's visible function names to original
@@ -1422,8 +1422,8 @@ string lookup only in its local interning builder and publishes the immutable ta
 Written names contain only a `NameId` and source span. Checking compares identities;
 spelling lookup is reserved for diagnostics and rejects a missing table entry
 as an internal compiler error. IDs are meaningful only within their owning
-parse and table; equality and lookup do not validate table ownership. Only the
-parser can construct the sealed program that checking accepts. `FunctionId` remains a separate
+parse and table; equality and lookup do not validate table ownership. Only
+assembly can construct the sealed program that checking accepts. `FunctionId` remains a separate
 nominal identity assigned in declaration order. Checking retains call spans;
 `UnionId` identifies a declared type and `VariantId` records both its owner and
 variant position; neither is interchangeable with a `NameId` or `FunctionId`.

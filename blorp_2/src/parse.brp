@@ -2,10 +2,10 @@ import:
 	float as FloatOps
 	int as IntOps
 	list: reverse
-	names: NameId, NameTable, intern_name, program_names, same_name_table
+	names: NameId, NameTable, intern_name
 	option: is_some, to_result
 	result: and_then
-	source: COMPILER_SOURCE, ModuleId, ModuleKind(FoundationTypesModule, FoundationPreludeModule, LibraryModule, UserModule), module_number, module_source, root_module_id, same_source
+	source: ModuleId, module_source, same_source
 	string as StringOps: index_of
 	syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
@@ -51,6 +51,7 @@ import:
 		TypeSyntax(AtomicType, AppliedType),
 		ValueExpression,
 		WrittenName,
+		source_bundle_error,
 	text as Text: concat
 
 
@@ -58,19 +59,6 @@ private fixed record ParserState {
 	input: LexedProgram,
 	position: Int,
 	names: NameTable
-}
-
-
-fixed record ParsedContents {
-	names: NameTable,
-	entrypoint: NameId,
-	foundation: FoundationModules,
-	builtin_types: List[ParsedBuiltinDeclaration],
-	modules: List[ParsedModuleRow],
-	functions: List[ParsedFunction],
-	unions: List[ParsedUnion],
-	records: List[ParsedRecord],
-	end: Span
 }
 
 
@@ -98,34 +86,8 @@ fixed record ParsedImport {
 }
 
 
-fixed record ModuleImport {
-	target: ModuleId,
-	symbols: List[ImportSelection],
-	span: Span
-}
-
-
-fixed record FoundationModules {
-	types: ModuleId,
-	prelude: ModuleId
-}
-
-
-fixed record ParsedBuiltinDeclaration {
-	module: ModuleId,
-	declaration: ParsedBuiltinType
-}
-
-
-fixed record ParsedModuleRow {
-	module: ModuleId,
-	role: ModuleKind,
-	imports: List[ModuleImport],
-	end: Span
-}
-
-
-private fixed record ParsedModuleContents {
+-- `base_names` is the table this parse extended; `names` adds its spellings.
+fixed record ParsedModuleContents {
 	base_names: NameTable,
 	names: NameTable,
 	module: ModuleId,
@@ -138,28 +100,12 @@ private fixed record ParsedModuleContents {
 }
 
 
+-- Only `parse_module` constructs a module's syntax; readers see its contents.
 opaque type ParsedModule = ParsedModuleContents
 
 
-private fixed record ProgramBuilder {
-	names: NameTable,
-	entrypoint: NameId,
-	builtin_types: List[ParsedBuiltinDeclaration],
-	modules: List[ParsedModuleRow],
-	functions: List[ParsedFunction],
-	unions: List[ParsedUnion],
-	records: List[ParsedRecord]
-}
-
-
-opaque type ParsedAssembly = ProgramBuilder
-
--- All module syntax shares one complete spelling authority per compilation.
-opaque type ParsedProgram = ParsedContents
-
-
-pure func parsed_contents(program: ParsedProgram) -> ParsedContents:
-	from_opaque ParsedProgram(program)
+pure func module_contents(parsed: ParsedModule) -> ParsedModuleContents:
+	from_opaque ParsedModule(parsed)
 
 
 private fixed record ParsedName {
@@ -2645,157 +2591,12 @@ private pure func consume_import_block(start: ParserState) -> Result[ImportBlock
 			Ok({ imports = imports, next = state })
 
 
-pure func begin_program() -> ParsedAssembly:
-	seed = program_names()
-	into_opaque ParsedAssembly({
-			names = seed.names,
-			entrypoint = seed.main,
-			builtin_types = [],
-			modules = [],
-			functions = [],
-			unions = [],
-			records = []
-		})
-
-
-pure func assembly_names(assembly: ParsedAssembly) -> NameTable:
-	from_opaque ParsedAssembly(assembly).names
-
-
 pure func module_names(parsed: ParsedModule) -> NameTable:
 	from_opaque ParsedModule(parsed).names
 
 
 pure func module_imports(parsed: ParsedModule) -> List[ParsedImport]:
 	from_opaque ParsedModule(parsed).imports
-
-
-pure func module_builtin_types(parsed: ParsedModule) -> List[ParsedBuiltinType]:
-	from_opaque ParsedModule(parsed).builtin_types
-
-
-pure func module_functions(parsed: ParsedModule) -> List[ParsedFunction]:
-	from_opaque ParsedModule(parsed).functions
-
-
-private pure func bundle_error(message: String) -> Diagnostic:
-	{
-		span = { source = COMPILER_SOURCE, start = 0, end = 0 },
-		note = None,
-		message = message,
-		help = "load each module once in inventory order and supply every import target"
-	}
-
-
-pure func append_module(
-	assembly: ParsedAssembly,
-	parsed: ParsedModule,
-	targets: List[ModuleId],
-	role: ModuleKind,
-) -> Result[ParsedAssembly, Diagnostic]:
-	builder = from_opaque ParsedAssembly(assembly)
-	contents = from_opaque ParsedModule(parsed)
-
-	valid ?= if not same_name_table(builder.names, contents.base_names):
-		Err(bundle_error("parsed module does not extend this source bundle's name authority"))
-	else if not IntOps.equals(module_number(contents.module), builder.modules.length()):
-		Err(bundle_error("parsed module does not have the next source bundle identity"))
-	else if not IntOps.equals(contents.imports.length(), targets.length()):
-		Err(bundle_error("source bundle does not supply exactly one target per import"))
-	else:
-		Ok(void)
-
-	var imports: List[ModuleImport] = []
-	var position: Int = 0
-	var failure: Option[Diagnostic] = None
-
-	for request in contents.imports:
-		match targets.get(position):
-			None:
-				failure = Some(bundle_error("source bundle is missing an import target"))
-				break
-			Some(target):
-				imports = imports.append({ target = target, symbols = request.symbols, span = request.span })
-		position = IntOps.add(position, 1)
-
-	linked ?= match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(void)
-
-	var builtin_types = builder.builtin_types
-	for declaration in contents.builtin_types:
-		builtin_types = builtin_types.append({ module = contents.module, declaration = declaration })
-
-	Ok(into_opaque ParsedAssembly({
-				names = contents.names,
-				entrypoint = builder.entrypoint,
-				builtin_types = builtin_types,
-				modules = builder.modules.append({
-					module = contents.module,
-					role = role,
-					imports = imports,
-					end = contents.end,
-				}),
-				functions = builder.functions.concat(contents.functions),
-				unions = builder.unions.concat(contents.unions),
-				records = builder.records.concat(contents.records)
-			}))
-
-
-pure func seal_program(assembly: ParsedAssembly) -> Result[ParsedProgram, Diagnostic]:
-	builder = from_opaque ParsedAssembly(assembly)
-	root ?= builder.modules.get(0).to_result(bundle_error("source bundle has no root module"))
-	var complete: Bool = True
-
-	for module in builder.modules:
-		for request in module.imports:
-			complete = (
-				complete
-				and IntOps.less_than(module_number(request.target), builder.modules.length())
-			)
-
-	valid ?= if complete:
-		Ok(void)
-	else:
-		Err(bundle_error("source bundle is missing an imported module"))
-
-	var types: Option[ModuleId] = None
-	var prelude: Option[ModuleId] = None
-	var role_error: Option[Diagnostic] = None
-	for row in builder.modules:
-		match row.role:
-			FoundationTypesModule:
-				if types.is_some():
-					role_error = Some({ bundle_error("source bundle has more than one foundation types module") | span = row.end })
-				types = Some(row.module)
-			FoundationPreludeModule:
-				if prelude.is_some():
-					role_error = Some({ bundle_error("source bundle has more than one foundation prelude module") | span = row.end })
-				prelude = Some(row.module)
-			LibraryModule | UserModule:
-				void
-	roles ?= match role_error:
-		Some(error): Err(error)
-		None: Ok(void)
-	types_id ?= types.to_result({ bundle_error("source bundle has no foundation types module") | span = root.end })
-	prelude_id ?= prelude.to_result({ bundle_error("source bundle has no foundation prelude module") | span = root.end })
-	root_role ?= match root.role:
-		UserModule: Ok(void)
-		_: Err({ bundle_error("source bundle root must be a user module") | span = root.end })
-
-	Ok(into_opaque ParsedProgram({
-				names = builder.names,
-				entrypoint = builder.entrypoint,
-				foundation = { types = types_id, prelude = prelude_id },
-				builtin_types = builder.builtin_types,
-				modules = builder.modules,
-				functions = builder.functions,
-				unions = builder.unions,
-				records = builder.records,
-				end = root.end
-			}))
 
 
 pure func parse_module(
@@ -2811,7 +2612,7 @@ pure func parse_module(
 	origin ?= if correct_source:
 		Ok(void)
 	else:
-		Err(bundle_error("parsed module's source does not match its module identity"))
+		Err(source_bundle_error("parsed module's source does not match its module identity"))
 
 	var state: ParserState = {
 		input = input,
