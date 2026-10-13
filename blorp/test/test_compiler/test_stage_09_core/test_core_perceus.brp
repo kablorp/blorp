@@ -200,6 +200,7 @@ import:
 	../../../src/compiler/stage_09_core/perceus/borrowed: normalize_lambda_result_aliases, retain_borrowed_owned_uses
 	../../../src/compiler/stage_09_core/perceus/protect: protect_repeated_consumes
 	../../../src/compiler/stage_09_core/resolve: resolve_global_value_refs
+	../../../src/compiler/stage_09_core/traverse as CoreTraverse
 	../../../src/compiler/stage_09_core/perceus/short_circuit:
 		balance_short_circuit_operands,
 		consumed_parameter_balancing_is_identity,
@@ -13953,6 +13954,86 @@ pure func test_consuming_set_equality_field_gets_owned_alias() -> Bool:
 			False
 
 
+-- The retains and releases one execution path of a Core expression performs.
+record OwnershipPathCounts {
+	retains: Int,
+	releases: Int
+}
+
+
+---
+Retains and releases along every execution path of `expr`: an `if` takes
+either branch, and the other forms these fixtures produce run their children
+in order. Any other form answers no paths, so a check built on this fails
+closed instead of miscounting alternatives it does not model.
+---
+pure func ownership_path_counts(expr: CoreExpr) -> List[OwnershipPathCounts]:
+	match expr:
+		IfExpr(condition, then_branch, else_branch, _, _):
+			var paths: List[OwnershipPathCounts] = []
+
+			for before in ownership_path_counts(condition):
+				for branch in ownership_path_counts(then_branch).concat(ownership_path_counts(else_branch)):
+					paths = paths.append({
+						retains = before.retains + branch.retains,
+						releases = before.releases + branch.releases
+					})
+
+			paths
+		CallExpr(_, _, _, _, _) | LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | SeqExpr(_, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _) | ProductExpr(_, _, _) | ProductFieldExpr(_, _, _, _) | VarExpr(_, _, _) | LiteralExpr(_, _, _) | VoidExpr(_, _):
+			own: OwnershipPathCounts = match expr:
+				DupExpr(_, _, _, _, _, _):
+					{retains = 1, releases = 0}
+				DropExpr(_, _, _, _, _, _):
+					{retains = 0, releases = 1}
+				_:
+					{retains = 0, releases = 0}
+			var paths: List[OwnershipPathCounts] = [own]
+
+			for child in CoreTraverse.immediate_core_expr_children(expr):
+				var extended: List[OwnershipPathCounts] = []
+
+				for before in paths:
+					for after in ownership_path_counts(child):
+						extended = extended.append({
+							retains = before.retains + after.retains,
+							releases = before.releases + after.releases
+						})
+
+				paths = extended
+
+			paths
+		_:
+			[]
+
+
+pure func every_path_counts(
+	paths: List[OwnershipPathCounts],
+	path_count: Int,
+	retains: Int,
+	releases: Int,
+) -> Bool:
+	(
+		paths.length() == path_count
+		and paths.all(func(path): path.retains == retains and path.releases == releases)
+	)
+
+
+-- The arguments of the first call in `expr`, searching in evaluation order.
+pure func first_call_args(expr: CoreExpr) -> Option[List[CoreExpr]]:
+	match expr:
+		CallExpr(_, _, args, _, _):
+			Some(args)
+		_:
+			var found: Option[List[CoreExpr]] = None
+
+			for child in CoreTraverse.immediate_core_expr_children(expr):
+				if found.is_none():
+					found = first_call_args(child)
+
+			found
+
+
 pure func test_multi_owner_conditional_call_argument_is_retained_once() -> Bool:
 	record_type: CoreType = HeapRecordType("Pair")
 	value_type: CoreType = list_int_type()
@@ -13993,12 +14074,18 @@ pure func test_multi_owner_conditional_call_argument_is_retained_once() -> Bool:
 		source_files = []
 	})
 
+	-- Both owners are borrowed: whichever field the condition selects, the
+	-- consuming call needs exactly one owned reference and nothing is released.
 	match function_body(program, "consume_selected_items"):
 		Some(rewritten):
-			(
-				dup_count_for("__borrowed_result_left_call_arg_0_0", rewritten) == 1
-				and dup_count_for("__borrowed_result_right_call_arg_0_0", rewritten) == 0
-			)
+			match first_call_args(rewritten):
+				Some([consumed]):
+					(
+						every_path_counts(ownership_path_counts(consumed), 2, 1, 0)
+						and every_path_counts(ownership_path_counts(rewritten), 2, 1, 0)
+					)
+				_:
+					False
 		None:
 			False
 
@@ -14119,12 +14206,19 @@ pure func test_existing_drop_preserves_nested_consuming_call_retain() -> Bool:
 		source_files = []
 	})
 
+	-- The consumed projection is retained exactly once, inside the argument,
+	-- and the only release on the path is the existing drop.
 	match function_body(program, "pack_consumed_projection_under_drop"):
 		Some(rewritten):
-			(
-				drop_count_for("incoming_owner", rewritten) == 1
-				and dup_count_for("__borrowed_result_owner_call_arg_0_0", rewritten) == 1
-			)
+			match first_call_args(rewritten):
+				Some([consumed]):
+					(
+						drop_count_for("incoming_owner", rewritten) == 1
+						and every_path_counts(ownership_path_counts(consumed), 1, 1, 0)
+						and every_path_counts(ownership_path_counts(rewritten), 1, 1, 1)
+					)
+				_:
+					False
 		None:
 			False
 

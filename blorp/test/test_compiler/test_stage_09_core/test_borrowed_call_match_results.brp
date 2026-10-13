@@ -8,10 +8,11 @@ import:
 		CoreConstructorMatchFallback(ConstructorMatchFallbackFail),
 		CoreConstructorMatchTest(UnionTagConstructorTest),
 		CoreDecl(UnionDecl),
-		CoreExpr(CallExpr, ConstructorMatchExpr, DupExpr, VarExpr, VoidExpr),
+		CoreExpr(CallExpr, ConstructorMatchExpr, DropExpr, DupExpr, IfExpr, VarExpr, VoidExpr),
 		CoreMatchBindingMode(MatchBorrowBindingMode),
 		CoreParam,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
+		CoreRetainPolicy(ArcRetainPolicy),
 		CoreType(NamedType, StackResultType, UnionType, VoidType),
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
 		CoreUnionStorage(ManagedPayloadStorage),
@@ -194,6 +195,123 @@ pure func test_parameter_catalog_retains_only_alias_branches() -> Bool:
 	branches_are_owned_once(owner, rewritten)
 
 
+-- `Ok(wrap(if flag: value else: value + value))`: a conditional selecting
+-- between the borrowed parameter and a fresh string, under a wrapper that
+-- passes its body's value through.
+private pure func wrapped_conditional_input(
+	owner: CoreParam,
+	wrap: pure (CoreExpr) -> CoreExpr,
+) -> CoreExpr:
+	value: CoreExpr = VarExpr(owner.name, string_type(), synthetic_core_source_loc())
+	fresh: CoreExpr = CallExpr(
+		BuiltinCall("blorp_string_concat"),
+		VoidExpr(
+			VoidType,
+			synthetic_core_source_loc(),
+		),
+		[value, value],
+		string_type(),
+		synthetic_core_source_loc(),
+	)
+	conditional: CoreExpr = IfExpr(
+		VarExpr(
+			variable("flag", None),
+			NamedType("Bool", []),
+			synthetic_core_source_loc(),
+		),
+		value,
+		fresh,
+		string_type(),
+		synthetic_core_source_loc(),
+	)
+	CallExpr(
+		UserCall("Ok", Some(1000), []),
+		VoidExpr(VoidType, synthetic_core_source_loc()),
+		[wrap(conditional)],
+		result_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+private pure func unwrapped_body(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		DropExpr(_, _, _, body, _, _):
+			body
+		DupExpr(_, _, _, body, _, _):
+			body
+		_:
+			expr
+
+
+-- Only the branch that aliases the parameter is retained; the fresh branch
+-- already owns its result, and nothing retains the selected value as a whole.
+private pure func retains_only_conditional_alias_branch(
+	owner: CoreParam,
+	rewritten: CoreExpr,
+) -> Bool:
+	match rewritten:
+		CallExpr(_, _, [argument], _, _):
+			match unwrapped_body(argument):
+				IfExpr(_, DupExpr(value, _, _, VarExpr(_, _, _), _, _), CallExpr(_, _, [VarExpr(_, _, _), VarExpr(_, _, _)], _, _), _, _):
+					value.name == owner.name.name and value.def_id == owner.name.def_id
+				_:
+					False
+		_:
+			False
+
+
+private pure func catalog_retains_only_conditional_alias_branch(
+	owner: CoreParam,
+	wrap: pure (CoreExpr) -> CoreExpr,
+) -> Bool:
+	env = environment()
+	entries = borrowed_parameter_owner_entries(env, [owner], [])
+	rewritten = normalize_borrowed_owner_entries(
+		env,
+		entries,
+		FunctionOwnerRegion,
+		result_type(),
+		wrapped_conditional_input(owner, wrap),
+	)
+	retains_only_conditional_alias_branch(owner, rewritten)
+
+
+private pure func unwrapped(body: CoreExpr) -> CoreExpr:
+	body
+
+
+private pure func under_drop(body: CoreExpr) -> CoreExpr:
+	DropExpr(
+		variable("tmp", None),
+		string_type(),
+		ArcReleasePolicy,
+		body,
+		string_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+private pure func under_dup(body: CoreExpr) -> CoreExpr:
+	DupExpr(
+		variable("tmp", None),
+		string_type(),
+		ArcRetainPolicy,
+		body,
+		string_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+pure func test_parameter_catalog_retains_only_wrapped_conditional_alias_branch() -> Bool:
+	var holds: Bool = True
+
+	for owner in [parameter(None), parameter(Some(301))]:
+		for wrap in [unwrapped, under_drop, under_dup]:
+			holds = holds and catalog_retains_only_conditional_alias_branch(owner, wrap)
+
+	holds
+
+
 pure func test_shadowed_binding_is_not_retained_for_outer_owner() -> Bool:
 	owner = parameter(None)
 
@@ -299,6 +417,10 @@ tests: TestSuite = {
 		(
 			"parameter catalog retains only alias branches",
 			test_parameter_catalog_retains_only_alias_branches,
+		),
+		(
+			"parameter catalog retains only wrapped conditional alias branch",
+			test_parameter_catalog_retains_only_wrapped_conditional_alias_branch,
 		),
 		(
 			"shadowed binding is not retained for outer owner",
