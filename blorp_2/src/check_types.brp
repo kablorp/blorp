@@ -1,0 +1,696 @@
+---
+Checks union and record declarations and resolves written type terms
+against the frozen namespace, including declared type parameters.
+---
+import:
+	./check_errors:
+		CheckError,
+		CheckerInvariant(
+			InvalidParameterDeclaration, InvalidResolvedFunction, InvalidUnionDeclaration,
+		),
+		PayloadRule(IntegerOrParameterPayload, IntegerPayload),
+		PreviousTypeDeclaration(SourceTypeDeclaration),
+		TypeDeclarationError(
+			DuplicateRecordField, DuplicateRecordType, DuplicateTypeParameter, DuplicateUnion,
+			DuplicateVariant, TypeParameterTypeNameConflict, UnsupportedPayloadAnnotation,
+			UnsupportedRecordField, VariantFunctionConflict,
+		),
+		TypeTermError(
+			ListTypeArgumentCount, MissingUnionTypeArguments, NonApplicableType,
+			OrdinaryUnionApplied, UnionTypeArgumentCountMismatch, UnknownType,
+			UnsupportedListElement,
+		),
+		checker_invariant,
+		type_declaration_error,
+		type_term_error,
+	./check_model:
+		CheckedField,
+		CheckedRecord,
+		CheckedUnion,
+		CheckedVariant,
+		TypeParameterId,
+		TypeParameterOwner(UnionDeclaration),
+		TypeRef(
+			AppliedUnionType, IntType, ListType, ParameterType, RecordType, StringType, UnionType,
+		),
+		TypeUse,
+		UnionOccurrence,
+		field_id,
+		parameter_owner,
+		parameter_position,
+		primitive_ref,
+		same_owner,
+		same_type,
+		type_parameter_id,
+	declarations:
+		FunctionId,
+		RecordId,
+		UnionId,
+		function_number,
+		record_id,
+		union_id,
+		union_number,
+		variant_id,
+	int as IntOps
+	names: NameId, same_name
+	namespace:
+		Namespace,
+		TypeCandidate(PrimitiveCandidate, ListCandidate, UnionCandidate, RecordCandidate),
+		local_function_candidates,
+		type_candidates,
+	option: to_result
+	assemble: ParsedContents
+	source: ModuleId, module_number, same_module
+	syntax:
+		ParsedFunction,
+		ParsedRecord,
+		ParsedUnion,
+		Span,
+		TypeSyntax(AtomicType, AppliedType),
+		WrittenName,
+		type_span,
+
+
+pure func find_function(namespace: Namespace, module: ModuleId, name: NameId) -> Option[FunctionId]:
+	-- Declaration validation retains the first source occurrence for diagnostics.
+	-- Accepted call lookup requires a unique namespace candidate instead.
+	local_function_candidates(namespace, module, name).get(0)
+
+
+pure func previous_declaration(previous: List[WrittenName], name: NameId) -> Option[WrittenName]:
+	var found: Option[WrittenName] = None
+
+	for known in previous:
+		if same_name(known.id, name):
+			found = Some(known)
+			break
+
+	found
+
+
+-- The type names visible where a type is written: the module's namespace, the
+-- declared unions and the enclosing declaration's own type parameters.
+fixed record TypeScope {
+	unions: List[ParsedUnion],
+	namespace: Namespace,
+	module: ModuleId,
+	parameters: List[LocalTypeParameter]
+}
+
+
+fixed record LocalTypeParameter {
+	name: WrittenName,
+	id: TypeParameterId
+}
+
+
+private pure func lookup_type_parameter(
+	parameters: List[LocalTypeParameter],
+	name: NameId,
+) -> Option[LocalTypeParameter]:
+	var found: Option[LocalTypeParameter] = None
+
+	for parameter in parameters:
+		if same_name(parameter.name.id, name):
+			found = Some(parameter)
+			break
+
+	found
+
+
+-- Declares a declaration's own type parameters in the scope of its module.
+pure func local_type_parameters(
+	written: List[WrittenName],
+	owner: TypeParameterOwner,
+	module_scope: TypeScope,
+) -> Result[TypeScope, CheckError]:
+	declare_type_parameters(written, owner, { module_scope | parameters = [] })
+
+
+-- Declares the type parameters in order; each name is new and is not already
+-- a visible type.
+private pure func declare_type_parameters(
+	written: List[WrittenName],
+	owner: TypeParameterOwner,
+	scope: TypeScope,
+) -> Result[TypeScope, CheckError]:
+	match written.get(scope.parameters.length()):
+		None:
+			Ok(scope)
+		Some(name):
+			id = type_parameter_id(owner, scope.parameters.length())
+
+			unique ?= match lookup_type_parameter(scope.parameters, name.id):
+				Some(previous):
+					Err(
+						type_declaration_error(
+							name.span,
+							DuplicateTypeParameter(id, previous.id, previous.name.span),
+						),
+					)
+				None:
+					if type_candidates(scope.namespace, scope.module, name.id).is_empty():
+						Ok(void)
+					else:
+						Err(
+							type_declaration_error(
+								name.span,
+								TypeParameterTypeNameConflict(name.id),
+							),
+						)
+
+			declare_type_parameters(written, owner, { scope | parameters = scope.parameters.append({
+						name = name,
+						id = id,
+					}) })
+
+
+pure func declared_parameters(scope: TypeScope) -> List[TypeParameterId]:
+	scope.parameters.map(pure func(parameter: LocalTypeParameter): parameter.id)
+
+
+private pure func find_union(scope: TypeScope, name: NameId) -> Option[UnionId]:
+	var found: Option[UnionId] = None
+
+	for candidate in type_candidates(scope.namespace, scope.module, name):
+		match candidate:
+			UnionCandidate(id):
+				found = Some(id)
+				break
+			RecordCandidate(_) | PrimitiveCandidate(_) | ListCandidate:
+				void
+
+	found
+
+
+private pure func union_arity(
+	scope: TypeScope,
+	owner: UnionId,
+	span: Span,
+) -> Result[Int, CheckError]:
+	declaration ?= scope.unions
+		.get(union_number(owner))
+		.to_result(checker_invariant(span, InvalidUnionDeclaration(owner)))
+	Ok(declaration.type_parameters.length())
+
+
+private pure func resolve_atomic_type(
+	scope: TypeScope,
+	name: WrittenName,
+) -> Result[TypeRef, CheckError]:
+	match lookup_type_parameter(scope.parameters, name.id):
+		Some(parameter):
+			Ok(ParameterType(parameter.id))
+		None:
+			match type_candidates(scope.namespace, scope.module, name.id):
+				[PrimitiveCandidate(primitive)]:
+					Ok(primitive_ref(primitive))
+				[ListCandidate]:
+					Err(type_term_error(name.span, ListTypeArgumentCount))
+				[RecordCandidate(id)]:
+					Ok(RecordType(id))
+				[UnionCandidate(id)]:
+					arity ?= union_arity(scope, id, name.span)
+
+					if IntOps.equals(arity, 0):
+						Ok(UnionType(id))
+					else:
+						Err(type_term_error(name.span, MissingUnionTypeArguments(id, arity)))
+				_:
+					Err(type_term_error(name.span, UnknownType(name.id)))
+
+
+pure func resolve_type(scope: TypeScope, written: TypeSyntax) -> Result[TypeRef, CheckError]:
+	match written:
+		AtomicType(name):
+			resolve_atomic_type(scope, name)
+		AppliedType(name, arguments, span):
+			match type_candidates(scope.namespace, scope.module, name.id):
+				[ListCandidate]:
+					match arguments:
+						[element]:
+							value ?= resolve_type(scope, element)
+
+							match value:
+								StringType | ParameterType(_):
+									Ok(ListType(value))
+								_:
+									Err(type_term_error(type_span(element), UnsupportedListElement))
+						_:
+							Err(type_term_error(span, ListTypeArgumentCount))
+				_:
+					owner ?= find_union(
+						scope,
+						name.id,
+					).to_result(type_term_error(name.span, NonApplicableType(name.id)))
+					arity ?= union_arity(scope, owner, span)
+
+					applicable ?= if IntOps.equals(arity, 0):
+						Err(type_term_error(span, OrdinaryUnionApplied(owner)))
+					else if IntOps.equals(arity, arguments.length()):
+						Ok(void)
+					else:
+						Err(
+							type_term_error(
+								span,
+								UnionTypeArgumentCountMismatch(owner, arity, arguments.length()),
+							),
+						)
+
+					values ?= resolve_types(scope, arguments, [])
+					Ok(AppliedUnionType(owner, values))
+
+
+private pure func resolve_types(
+	scope: TypeScope,
+	written: List[TypeSyntax],
+	resolved: List[TypeRef],
+) -> Result[List[TypeRef], CheckError]:
+	match written.get(resolved.length()):
+		None:
+			Ok(resolved)
+		Some(argument):
+			value ?= resolve_type(scope, argument)
+			resolve_types(
+				scope,
+				written,
+				resolved.append(value),
+			)
+
+
+fixed record CheckedDeclarations {
+	unions: List[CheckedUnion],
+	records: List[CheckedRecord]
+}
+
+
+-- A union or record declaration. Both kinds are checked together in source
+-- order: by module, then by position within the module.
+private fixed union DeclaredType:
+	DeclaredUnion(ParsedUnion)
+	DeclaredRecord(ParsedRecord)
+
+
+private pure func declared_name(declaration: DeclaredType) -> WrittenName:
+	match declaration:
+		DeclaredUnion(parsed_union):
+			parsed_union.type_name
+		DeclaredRecord(parsed_record):
+			parsed_record.type_name
+
+
+private pure func declared_module(declaration: DeclaredType) -> ModuleId:
+	match declaration:
+		DeclaredUnion(parsed_union):
+			parsed_union.module
+		DeclaredRecord(parsed_record):
+			parsed_record.module
+
+
+-- A type name is unique within its module; a clash involving a record is
+-- reported as a duplicate type, otherwise as a duplicate union.
+private pure func validate_type_name(
+	declaration: DeclaredType,
+	previous: List[DeclaredType],
+) -> Result[Void, CheckError]:
+	name = declared_name(declaration)
+	module = declared_module(declaration)
+	var earlier: Option[DeclaredType] = None
+
+	for candidate in previous:
+		if (
+			same_module(module, declared_module(candidate))
+			and same_name(name.id, declared_name(candidate).id)
+		):
+			earlier = Some(candidate)
+			break
+
+	match earlier:
+		None:
+			Ok(void)
+		Some(first):
+			conflict = SourceTypeDeclaration(declared_name(first).span)
+			duplicate_type = DuplicateRecordType(name.id, conflict)
+
+			match declaration:
+				DeclaredRecord(_):
+					Err(type_declaration_error(name.span, duplicate_type))
+				DeclaredUnion(_):
+					match first:
+						DeclaredRecord(_):
+							Err(type_declaration_error(name.span, duplicate_type))
+						DeclaredUnion(_):
+							Err(
+								type_declaration_error(
+									name.span,
+									DuplicateUnion(name.id, conflict),
+								),
+							)
+
+
+private pure func next_declaration(
+	parsed: ParsedContents,
+	checked: CheckedDeclarations,
+) -> Option[DeclaredType]:
+	match parsed.records.get(checked.records.length()):
+		None:
+			match parsed.unions.get(checked.unions.length()):
+				Some(parsed_union):
+					Some(DeclaredUnion(parsed_union))
+				None:
+					None
+		Some(parsed_record):
+			match parsed.unions.get(checked.unions.length()):
+				None:
+					Some(DeclaredRecord(parsed_record))
+				Some(parsed_union):
+					record_first = if same_module(parsed_record.module, parsed_union.module):
+						IntOps.less_than(
+							parsed_record.type_name.span.start,
+							parsed_union.type_name.span.start,
+						)
+					else:
+						IntOps.less_than(
+							module_number(parsed_record.module),
+							module_number(parsed_union.module),
+						)
+
+					if record_first:
+						Some(DeclaredRecord(parsed_record))
+					else:
+						Some(DeclaredUnion(parsed_union))
+
+
+pure func validate_declarations(
+	parsed: ParsedContents,
+	namespace: Namespace,
+) -> Result[CheckedDeclarations, CheckError]:
+	declare_types(
+		parsed,
+		namespace,
+		{
+			unions = [],
+			records = []
+		},
+		[],
+	)
+
+
+private pure func declare_types(
+	parsed: ParsedContents,
+	namespace: Namespace,
+	checked: CheckedDeclarations,
+	previous: List[DeclaredType],
+) -> Result[CheckedDeclarations, CheckError]:
+	match next_declaration(parsed, checked):
+		None:
+			Ok(checked)
+		Some(declaration):
+			unique ?= validate_type_name(declaration, previous)
+			scope: TypeScope = {
+				unions = parsed.unions,
+				namespace = namespace,
+				module = declared_module(declaration),
+				parameters = []
+			}
+
+			declared: Result[CheckedDeclarations, CheckError] = match declaration:
+				DeclaredUnion(parsed_union):
+					owner = union_id(checked.unions.length())
+					names ?= validate_variant_names(parsed_union, parsed.functions, namespace, [])
+					parameters ?= local_type_parameters(
+						parsed_union.type_parameters,
+						UnionDeclaration(owner),
+						scope,
+					)
+					variants ?= declared_variants(parsed_union, owner, parameters, [])
+					Ok({ checked | unions = checked.unions.append({
+								type_parameters = declared_parameters(parameters),
+								variants = variants,
+							}) })
+				DeclaredRecord(parsed_record):
+					fields ?= declared_fields(
+						parsed_record,
+						record_id(checked.records.length()),
+						scope,
+						[],
+					)
+					Ok({ checked | records = checked.records.append({fields = fields}) })
+
+			updated ?= declared
+			declare_types(
+				parsed,
+				namespace,
+				updated,
+				previous.append(declaration),
+			)
+
+
+-- Variant names are distinct within their union and from the module's functions.
+private pure func validate_variant_names(
+	declaration: ParsedUnion,
+	functions: List[ParsedFunction],
+	namespace: Namespace,
+	seen: List[WrittenName],
+) -> Result[Void, CheckError]:
+	match declaration.variants.get(seen.length()):
+		None:
+			Ok(void)
+		Some(written):
+			variant = written.name
+
+			unique ?= match previous_declaration(seen, variant.id):
+				Some(known):
+					Err(
+						type_declaration_error(
+							variant.span,
+							DuplicateVariant(variant.id, known.span),
+						),
+					)
+				None:
+					Ok(void)
+
+			distinct ?= match find_function(namespace, declaration.module, variant.id):
+				None:
+					Ok(void)
+				Some(id):
+					variant_function_conflict(variant, id, functions)
+
+			validate_variant_names(
+				declaration,
+				functions,
+				namespace,
+				seen.append(variant),
+			)
+
+
+-- The conflict is reported at whichever of the two names is written later.
+private pure func variant_function_conflict(
+	variant: WrittenName,
+	id: FunctionId,
+	functions: List[ParsedFunction],
+) -> Result[Void, CheckError]:
+	function ?= functions
+		.get(function_number(id))
+		.to_result(checker_invariant(variant.span, InvalidResolvedFunction(id)))
+	declared = function.function_name.span
+
+	span = if IntOps.less_than(variant.span.start, declared.start):
+		declared
+	else:
+		variant.span
+
+	Err(type_declaration_error(span, VariantFunctionConflict(variant.id, variant.span, declared)))
+
+
+-- Resolves each variant's payload annotation, in declaration order.
+private pure func declared_variants(
+	declaration: ParsedUnion,
+	owner: UnionId,
+	scope: TypeScope,
+	declared: List[CheckedVariant],
+) -> Result[List[CheckedVariant], CheckError]:
+	match declaration.variants.get(declared.length()):
+		None:
+			Ok(declared)
+		Some(variant):
+			payload: Result[Option[TypeUse], CheckError] = match variant.payload:
+				None:
+					Ok(None)
+				Some(name):
+					annotation ?= payload_annotation(name, scope)
+					Ok(Some(annotation))
+
+			resolved ?= payload
+			declared_variants(
+				declaration,
+				owner,
+				scope,
+				declared.append({
+					id = variant_id(owner, declared.length()),
+					name = variant.name,
+					payload = resolved,
+				}),
+			)
+
+
+-- A payload is Int or one of the union's own type parameters.
+private pure func payload_annotation(
+	name: WrittenName,
+	scope: TypeScope,
+) -> Result[TypeUse, CheckError]:
+	integer = match type_candidates(scope.namespace, scope.module, name.id):
+		[PrimitiveCandidate(candidate)]:
+			same_type(primitive_ref(candidate), IntType)
+		_:
+			False
+
+	if integer:
+		Ok({
+			value_type = IntType,
+			span = name.span,
+		})
+	else:
+		match lookup_type_parameter(scope.parameters, name.id):
+			Some(parameter):
+				Ok({
+					value_type = ParameterType(parameter.id),
+					span = name.span,
+				})
+			None:
+				rule = match scope.parameters:
+					[]:
+						IntegerPayload
+					_:
+						IntegerOrParameterPayload
+
+				Err(type_declaration_error(name.span, UnsupportedPayloadAnnotation(name.id, rule)))
+
+
+-- Resolves each field's annotation in declaration order; fields are Int.
+private pure func declared_fields(
+	declaration: ParsedRecord,
+	owner: RecordId,
+	scope: TypeScope,
+	declared: List[CheckedField],
+) -> Result[List[CheckedField], CheckError]:
+	match declaration.fields.get(declared.length()):
+		None:
+			Ok(declared)
+		Some(field):
+			unique ?= match find_field(declared, field.name.id):
+				Some(first):
+					Err(
+						type_declaration_error(
+							field.name.span,
+							DuplicateRecordField(field.name.id, first.name.span),
+						),
+					)
+				None:
+					Ok(void)
+
+			value_type ?= resolve_type(scope, field.type_name)
+			span = type_span(field.type_name)
+
+			supported ?= if same_type(value_type, IntType):
+				Ok(void)
+			else:
+				Err(type_declaration_error(span, UnsupportedRecordField(value_type)))
+
+			declared_fields(
+				declaration,
+				owner,
+				scope,
+				declared.append({
+					id = field_id(owner, declared.length()),
+					name = field.name,
+					value_type = {
+						value_type = value_type,
+						span = span
+					},
+				}),
+			)
+
+
+pure func find_field(fields: List[CheckedField], name: NameId) -> Option[CheckedField]:
+	var found: Option[CheckedField] = None
+
+	for field in fields:
+		if same_name(field.name.id, name):
+			found = Some(field)
+			break
+
+	found
+
+
+-- A variant's payload as it appears in one occurrence of its union type.
+pure func occurrence_payload(
+	payload: Option[TypeUse],
+	occurrence: UnionOccurrence,
+) -> Result[Option[TypeUse], CheckError]:
+	match payload:
+		None:
+			Ok(None)
+		Some(written):
+			substitution: Substitution = {
+				owner = UnionDeclaration(occurrence.owner),
+				values = occurrence.arguments
+			}
+			value ?= substitute_type(written.value_type, substitution, written.span)
+			Ok(Some({ written | value_type = value }))
+
+
+-- One declaration's rigid type parameters replaced simultaneously, by
+-- declaration position. Replacements are terminal: they are never substituted
+-- again, so a caller's own parameters may appear among them.
+fixed record Substitution {
+	owner: TypeParameterOwner,
+	values: List[TypeRef]
+}
+
+
+pure func substitute_type(
+	value_type: TypeRef,
+	substitution: Substitution,
+	span: Span,
+) -> Result[TypeRef, CheckError]:
+	match value_type:
+		ListType(element):
+			value ?= substitute_type(element, substitution, span)
+
+			match value:
+				StringType | ParameterType(_):
+					Ok(ListType(value))
+				_:
+					Err(type_term_error(span, UnsupportedListElement))
+		AppliedUnionType(owner, values):
+			arguments ?= substitute_types(values, substitution, span, [])
+			Ok(AppliedUnionType(owner, arguments))
+		ParameterType(id):
+			replacement = if same_owner(parameter_owner(id), substitution.owner):
+				substitution.values.get(parameter_position(id))
+			else:
+				None
+
+			replacement.to_result(checker_invariant(span, InvalidParameterDeclaration(id)))
+		_:
+			Ok(value_type)
+
+
+private pure func substitute_types(
+	values: List[TypeRef],
+	substitution: Substitution,
+	span: Span,
+	substituted: List[TypeRef],
+) -> Result[List[TypeRef], CheckError]:
+	match values.get(substituted.length()):
+		None:
+			Ok(substituted)
+		Some(value):
+			replaced ?= substitute_type(value, substitution, span)
+			substitute_types(
+				values,
+				substitution,
+				span,
+				substituted.append(replaced),
+			)

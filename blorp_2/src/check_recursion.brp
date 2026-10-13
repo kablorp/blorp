@@ -1,0 +1,382 @@
+---
+Recursion analyses over checked bodies: guaranteed self tail calls, and the
+rejection of recursive calls that grow type arguments without bound.
+---
+import:
+	./check_errors:
+		CheckError,
+		RecursionError(
+			GenericTailRecursionUnsupported, GrowingRecursiveInstantiation, NoSelfRecursion,
+			NonTailSelfCall,
+		),
+		recursion_error,
+	./check_model:
+		CallTarget(RuntimeFunction, UserFunction),
+		CheckedArm,
+		CheckedBase(ReturnCall, ReturnRecord),
+		CheckedBody(CheckedMatchBody, CheckedValueBody),
+		CheckedCall,
+		CheckedExit(RecurWith, ReturnExpression),
+		CheckedFunction,
+		CheckedOperation(InvokeFunction),
+		CheckedRecordField,
+		CheckedStatement(DiscardExpression, InitializeBinding, ReassignBinding),
+		CheckedValue,
+		TypeParameterId,
+		TypeParameterOwner(FunctionDeclaration),
+		TypeRef(AppliedUnionType, ListType, ParameterType),
+		function_calls,
+		same_parameter,
+		type_parameter_id,
+	declarations: FunctionId, function_number
+	int as IntOps
+	option: is_some
+	syntax: FunctionExecution(OrdinaryCalls, SelfTailLoop), ParsedFunction, Span
+
+
+private pure func is_self_call(call: CheckedCall, current: FunctionId) -> Bool:
+	match call.target:
+		UserFunction(id, _):
+			IntOps.equals(function_number(id), function_number(current))
+		RuntimeFunction(_):
+			False
+
+
+-- The first direct self call among evaluated values, in evaluation order.
+-- These checks traverse evaluated children, never recovering identity from names.
+private pure func first_self_call(values: List[CheckedValue], current: FunctionId) -> Option[Span]:
+	var found: Option[Span] = None
+
+	for value in values:
+		found = self_call_in(value, current)
+
+		if found.is_some():
+			break
+
+	found
+
+
+private pure func self_call_in(value: CheckedValue, current: FunctionId) -> Option[Span]:
+	var found = match value.base:
+		ReturnCall(call, arguments):
+			if is_self_call(call, current):
+				Some(value.base_span)
+			else:
+				first_self_call(arguments, current)
+		ReturnRecord(_, fields):
+			first_self_call(
+				fields.map(pure func(field: CheckedRecordField) -> CheckedValue: field.value),
+				current,
+			)
+		_:
+			None
+
+	for step in value.operations:
+		if found.is_some():
+			break
+
+		match step.operation:
+			InvokeFunction(call, arguments):
+				found = if is_self_call(call, current):
+					Some(step.span)
+				else:
+					first_self_call(arguments, current)
+			_:
+				void
+
+	found
+
+
+private pure func reject_self_calls(
+	values: List[CheckedValue],
+	current: FunctionId,
+) -> Result[Void, CheckError]:
+	match first_self_call(values, current):
+		Some(span):
+			Err(recursion_error(span, NonTailSelfCall(current)))
+		None:
+			Ok(void)
+
+
+private pure func statement_values(statements: List[CheckedStatement]) -> List[CheckedValue]:
+	statements.map(pure func(statement: CheckedStatement) -> CheckedValue:
+		match statement:
+			InitializeBinding(_, value):
+				value
+			DiscardExpression(value):
+				value
+			ReassignBinding(_, value):
+				value
+	)
+
+
+-- A returned value's final call when it is a direct self call: its last
+-- operation, or its call base when it has no operations.
+private fixed record TailCall {
+	arguments: List[CheckedValue],
+	span: Span
+}
+
+
+private pure func tail_call(value: CheckedValue, current: FunctionId) -> Option[TailCall]:
+	last = IntOps.subtract(value.operations.length(), 1)
+
+	match value.operations.get(last):
+		Some(step):
+			match step.operation:
+				InvokeFunction(call, arguments):
+					if is_self_call(call, current):
+						receiver = { value | operations = value.operations.take(last) }
+						Some({
+							arguments = [receiver].concat(arguments),
+							span = step.span,
+						})
+					else:
+						None
+				_:
+					None
+		None:
+			match value.base:
+				ReturnCall(call, arguments):
+					if is_self_call(call, current):
+						Some({
+							arguments = arguments,
+							span = value.base_span,
+						})
+					else:
+						None
+				_:
+					None
+
+
+private pure func tail_exit(
+	exit: CheckedExit,
+	current: FunctionId,
+) -> Result[CheckedExit, CheckError]:
+	match exit:
+		RecurWith(_, _):
+			Ok(exit)
+		ReturnExpression(value):
+			match tail_call(value, current):
+				Some(call):
+					valid ?= reject_self_calls(call.arguments, current)
+					Ok(RecurWith(call.arguments, call.span))
+				None:
+					valid ?= reject_self_calls([value], current)
+					Ok(exit)
+
+
+private pure func tail_arms(
+	arms: List[CheckedArm],
+	current: FunctionId,
+	checked: List[CheckedArm],
+) -> Result[List[CheckedArm], CheckError]:
+	match arms.get(checked.length()):
+		None:
+			Ok(checked)
+		Some(arm):
+			prefix ?= reject_self_calls(statement_values(arm.statements), current)
+			exit ?= tail_exit(arm.body, current)
+			tail_arms(
+				arms,
+				current,
+				checked.append({ arm | body = exit }),
+			)
+
+
+private pure func recurs(exit: CheckedExit) -> Bool:
+	match exit:
+		RecurWith(_, _):
+			True
+		ReturnExpression(_):
+			False
+
+
+private pure func body_recurs(body: CheckedBody) -> Bool:
+	match body:
+		CheckedValueBody(exit):
+			recurs(exit)
+		CheckedMatchBody(matched):
+			var found = False
+
+			for arm in matched.arms:
+				found = found or recurs(arm.body)
+
+			found
+
+
+fixed record CheckedExecution {
+	execution: FunctionExecution,
+	body: CheckedBody
+}
+
+
+pure func check_execution(
+	function: ParsedFunction,
+	statements: List[CheckedStatement],
+	body: CheckedBody,
+	current: FunctionId,
+) -> Result[CheckedExecution, CheckError]:
+	match function.tail_annotation:
+		None:
+			Ok({
+				execution = OrdinaryCalls,
+				body = body,
+			})
+		Some(annotation):
+			nongeneric ?= if IntOps.equals(function.type_parameters.length(), 0):
+				Ok(void)
+			else:
+				Err(recursion_error(annotation, GenericTailRecursionUnsupported))
+
+			prefix ?= reject_self_calls(statement_values(statements), current)
+
+			tail_body: Result[CheckedBody, CheckError] = match body:
+				CheckedValueBody(value):
+					exit ?= tail_exit(value, current)
+					Ok(CheckedValueBody(exit))
+				CheckedMatchBody(matched):
+					scrutinee ?= reject_self_calls([matched.scrutinee], current)
+					arms ?= tail_arms(matched.arms, current, [])
+					Ok(CheckedMatchBody({ matched | arms = arms }))
+
+			loop_body ?= tail_body
+
+			if body_recurs(loop_body):
+				Ok({
+					execution = SelfTailLoop(annotation),
+					body = loop_body,
+				})
+			else:
+				Err(recursion_error(annotation, NoSelfRecursion))
+
+
+private fixed union ParameterGrowth:
+	PreservedParameter
+	NestedParameter
+
+
+private fixed record ParameterDependency {
+	source: TypeParameterId,
+	target: TypeParameterId,
+	growth: ParameterGrowth,
+	span: Span
+}
+
+
+private pure func append_dependencies(
+	dependencies: List[ParameterDependency],
+	argument: TypeRef,
+	target: TypeParameterId,
+	growth: ParameterGrowth,
+	span: Span,
+) -> List[ParameterDependency]:
+	var collected = dependencies
+
+	match argument:
+		ParameterType(source):
+			collected = collected.append({
+				source = source,
+				target = target,
+				growth = growth,
+				span = span,
+			})
+		ListType(element):
+			collected = append_dependencies(collected, element, target, NestedParameter, span)
+		AppliedUnionType(_, arguments):
+			for child in arguments:
+				collected = append_dependencies(collected, child, target, NestedParameter, span)
+		_:
+			void
+
+	collected
+
+
+private pure func contains_parameter_id(
+	parameters: List[TypeParameterId],
+	requested: TypeParameterId,
+) -> Bool:
+	var found = False
+
+	for parameter in parameters:
+		if same_parameter(parameter, requested):
+			found = True
+			break
+
+	found
+
+
+-- Whether a dependency path leads from `start` to `target`.
+private pure func parameter_reaches(
+	start: TypeParameterId,
+	target: TypeParameterId,
+	dependencies: List[ParameterDependency],
+) -> Bool:
+	var reached = [start]
+	var frontier = [start]
+
+	while not frontier.is_empty():
+		var next: List[TypeParameterId] = []
+
+		for current in frontier:
+			for dependency in dependencies:
+				if (
+					same_parameter(dependency.source, current)
+					and not contains_parameter_id(reached, dependency.target)
+				):
+					reached = reached.append(dependency.target)
+					next = next.append(dependency.target)
+
+		frontier = next
+
+	contains_parameter_id(reached, target)
+
+
+pure func validate_recursive_instantiation(
+	functions: List[CheckedFunction],
+) -> Result[Void, CheckError]:
+	-- These transient edges relate declaration-owned parameter identities, using
+	-- each checked call's simultaneous substitution. They are discarded before
+	-- publication; CheckedCall remains the sole authority for that substitution.
+	-- A concrete type can grow indefinitely only if a parameter flows around a
+	-- dependency cycle beneath an application. Cycles of bare parameters merely
+	-- permute finite inputs; concrete resets terminate a dependency path. Without
+	-- a growing cycle, type-term depth is bounded. Finite constructors, arities
+	-- and ground leaves therefore bound all concrete instance keys.
+	var dependencies: List[ParameterDependency] = []
+
+	for function in functions:
+		for call in function_calls(function):
+			match call.target:
+				UserFunction(declaration, arguments):
+					var position = 0
+
+					for argument in arguments:
+						target = type_parameter_id(FunctionDeclaration(declaration), position)
+						dependencies = append_dependencies(
+							dependencies,
+							argument,
+							target,
+							PreservedParameter,
+							call.span,
+						)
+						position = IntOps.add(position, 1)
+				RuntimeFunction(_):
+					void
+
+	var growing: Option[ParameterDependency] = None
+
+	for dependency in dependencies:
+		match dependency.growth:
+			NestedParameter:
+				if parameter_reaches(dependency.target, dependency.source, dependencies):
+					growing = Some(dependency)
+					break
+			PreservedParameter:
+				void
+
+	match growing:
+		Some(dependency):
+			Err(recursion_error(dependency.span, GrowingRecursiveInstantiation))
+		None:
+			Ok(void)

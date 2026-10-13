@@ -1,13 +1,15 @@
 import:
 	../../src/declarations as Declaration
 	../../src/source: module_source, root_module_id
-	../../src/check as Checked
+	../../src/check: CheckedProgram, check, checked_functions
+	../../src/check_errors as Errors
+	../../src/check_model as Checked
 	../../src/lex: lex
 	../../src/syntax: Diagnostic
 	../../src/text: concat
 	input: check_failure, parse, setup_diagnostic, check_modules_failure
 	int as IntOps
-	module_input: ModuleInput, PRIMITIVE_BASE, INTEGER_OPERATIONS, STRING_OPERATIONS
+	module_input: ModuleInput, PRIMITIVE_BASE, INTEGER_OPERATIONS
 	test: TestSuite
 
 
@@ -26,11 +28,10 @@ private MAIN: String =
 	|
 
 
-private pure func checked_source(source: String) -> Result[Checked.CheckedProgram, Diagnostic]:
+private pure func checked_source(source: String) -> Result[CheckedProgram, Diagnostic]:
 	tokens ?= lex(module_source(root_module_id()), source)
 	program ?= parse(tokens)
-	Checked
-		.check(program)
+	check(program)
 		.map_err(setup_diagnostic)
 
 
@@ -38,7 +39,7 @@ private pure func rejects_at(
 	prefix: String,
 	marked: String,
 	suffix: String,
-	expected: pure (Checked.CheckErrorKind) -> Bool,
+	expected: pure (Errors.CheckErrorKind) -> Bool,
 ) -> Bool:
 	match (
 		check_failure(
@@ -61,7 +62,7 @@ private pure func rejects_at_modules(
 	inputs: List[ModuleInput],
 	prefix: String,
 	marked: String,
-	expected: pure (Checked.CheckErrorKind) -> Bool,
+	expected: pure (Errors.CheckErrorKind) -> Bool,
 ) -> Bool:
 	match (
 		check_modules_failure(inputs, PRIMITIVE_BASE)
@@ -95,7 +96,7 @@ pure func test_binding_and_scrutinee_synthesize_the_same_nominal_type() -> Bool:
 		Err(_):
 			False
 		Ok(program):
-			match Checked.checked_functions(program).functions:
+			match checked_functions(program).functions:
 				[choose, inspect, _]:
 					match inspect.bindings:
 						[local, _]:
@@ -191,7 +192,7 @@ pure func test_generic_return_context_keeps_rigid_payload_identity() -> Bool:
 		Err(_):
 			False
 		Ok(program):
-			match Checked.checked_functions(program).functions:
+			match checked_functions(program).functions:
 				[box, _]:
 					match box.signature.type_parameters:
 						[parameter]:
@@ -240,7 +241,7 @@ pure func test_synthesized_binding_does_not_inherit_return_context() -> Bool:
 		choose_source + " ",
 	), "Number", "(7)\n\tvalue\n".concat(MAIN), pure func(kind):
 		match kind:
-			Checked.ConstructorNeedsExpectedType(_):
+			Errors.ConstructorRejection(Errors.ConstructorNeedsExpectedType(_)):
 				True
 			_:
 				False
@@ -258,7 +259,7 @@ pure func test_synthesized_scrutinee_does_not_inherit_return_context() -> Bool:
 		|
 	rejects_at(CHOICE.concat(main_source + " "), "Number", match_suffix, pure func(kind):
 		match kind:
-			Checked.ConstructorNeedsExpectedType(_):
+			Errors.ConstructorRejection(Errors.ConstructorNeedsExpectedType(_)):
 				True
 			_:
 				False
@@ -274,7 +275,7 @@ pure func test_generic_receiver_does_not_supply_constructor_context() -> Bool:
 		keep_source + "\n\t",
 	), "Number", "(7).keep()\n".concat(MAIN), pure func(kind):
 		match kind:
-			Checked.ConstructorNeedsExpectedType(_):
+			Errors.ConstructorRejection(Errors.ConstructorNeedsExpectedType(_)):
 				True
 			_:
 				False
@@ -285,13 +286,13 @@ pure func test_unused_generic_return_is_checked_rigidly() -> Bool:
 	prefix = "pure func wrong[T](value: T) -> T:\n\t"
 	rejects_at(prefix, "7", "\n".concat(MAIN), pure func(kind):
 		match kind:
-			Checked.ExpressionTypeMismatch(mismatch):
+			Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
 				match mismatch.expected:
 					Checked.ParameterType(parameter):
 						match Checked.parameter_owner(parameter):
 							Checked.FunctionDeclaration(owner):
 								match mismatch.expected_site:
-									Checked.SourceAnnotation(annotation):
+									Errors.SourceAnnotation(annotation):
 										(
 											Declaration.function_number(owner) == 0
 											and annotation.start == 32
@@ -324,7 +325,7 @@ pure func test_later_direct_child_error_precedes_earlier_type_mismatch() -> Bool
 		{ source = INTEGER_OPERATIONS, targets = [] },
 	], INT_IMPORT + source + " ", "missing", pure func(kind):
 		match kind:
-			Checked.UnknownValue(_):
+			Errors.ValueRejection(Errors.UnknownValue(_)):
 				True
 			_:
 				False
@@ -342,7 +343,7 @@ pure func test_later_ufcs_child_error_precedes_receiver_type_mismatch() -> Bool:
 		{ source = INTEGER_OPERATIONS, targets = [] },
 	], INT_IMPORT + source, "missing", pure func(kind):
 		match kind:
-			Checked.UnknownValue(_):
+			Errors.ValueRejection(Errors.UnknownValue(_)):
 				True
 			_:
 				False
@@ -355,7 +356,7 @@ pure func test_postfix_contract_error_precedes_base_error() -> Bool:
 		|	missing.
 	rejects_at(main_source, "absent", "()\n", pure func(kind):
 		match kind:
-			Checked.UnknownFunction(_):
+			Errors.CallRejection(Errors.UnknownFunction(_)):
 				True
 			_:
 				False
@@ -373,7 +374,7 @@ pure func test_later_child_error_precedes_generic_conflict() -> Bool:
 		{ source = INTEGER_OPERATIONS, targets = [] },
 	], INT_IMPORT + source + " ", "missing", pure func(kind):
 		match kind:
-			Checked.UnknownValue(_):
+			Errors.ValueRejection(Errors.UnknownValue(_)):
 				True
 			_:
 				False
@@ -392,9 +393,9 @@ pure func test_checked_arm_mismatch_keeps_expression_and_annotation_spans() -> B
 		{ source = INTEGER_OPERATIONS, targets = [] },
 	], prefix, body, pure func(kind):
 		match kind:
-			Checked.ExpressionTypeMismatch(mismatch):
+			Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
 				match mismatch.expected_site:
-					Checked.SourceAnnotation(annotation):
+					Errors.SourceAnnotation(annotation):
 						(
 							Checked.same_type(mismatch.expected, Checked.IntType)
 							and Checked.same_type(mismatch.actual.value_type, Checked.StringType)
@@ -427,9 +428,9 @@ pure func test_checked_reassignment_keeps_binding_owner_and_occurrences() -> Boo
 		{ source = INTEGER_OPERATIONS, targets = [] },
 	], prefix, body, pure func(kind):
 		match kind:
-			Checked.ExpressionTypeMismatch(mismatch):
+			Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
 				match mismatch.expected_site:
-					Checked.InferredBindingDeclaration(binding):
+					Errors.InferredBindingDeclaration(binding):
 						(
 							Checked.same_type(mismatch.expected, Checked.IntType)
 							and Checked.same_type(mismatch.actual.value_type, Checked.StringType)

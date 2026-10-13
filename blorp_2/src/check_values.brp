@@ -1,0 +1,805 @@
+---
+Expression synthesis and checking: literals, bindings, calls, receiver
+applications, constructors, record literals and field reads.
+---
+import:
+	./check_calls:
+		ArgumentObligation,
+		ArgumentSlot,
+		FunctionContract,
+		InstantiatedCall,
+		contains_parameter,
+		function_contract,
+		instantiate_contract,
+	./check_errors:
+		BindingSite,
+		CallError(ArgumentTypeMismatch, UncallableBinding, UnknownFunction),
+		CheckError,
+		CheckerInvariant(InvalidCheckedUnion, InvalidRecordDeclaration),
+		ConstructorError(
+			ConstructorNeedsExpectedType, ConstructorPayloadArity, MissingConstructorPayload,
+			PayloadFreeVariantCalled, VariantNotInExpectedType,
+		),
+		ExpectedTypeSite(SourceAnnotation),
+		MethodError(MethodReceiverNeedsType),
+		RecordError(
+			DuplicateLiteralField, FieldRequiresRecord, MissingRecordField, RecordFieldTypeMismatch,
+			RecordNeedsExpectedType, UnknownRecordField,
+		),
+		ValueError(ExpressionTypeMismatch, UnknownValue),
+		call_error,
+		checker_invariant,
+		constructor_error,
+		method_error,
+		record_error,
+		value_error,
+	./check_methods:
+		ResolutionContext,
+		ResolvedReceiver(ReceiverCandidates, UniqueReceiver),
+		classify_receiver,
+		contains_variant,
+		lookup_target,
+		method_sites,
+		receiver_expectation,
+		select_receiver_contract,
+	./check_model:
+		BindingDefinition,
+		BindingId,
+		CheckedBase(
+			ReturnBinding, ReturnCall, ReturnFloat, ReturnInteger, ReturnRecord, ReturnString,
+			ReturnVariant, ReturnVoid,
+		),
+		CheckedField,
+		CheckedOperation(ConstructVariant, InvokeFunction, ReadRecordField),
+		CheckedRecordField,
+		CheckedValue,
+		CheckedVariant,
+		TypeRef(FloatType, IntType, RecordType, StringType, VoidType),
+		TypeUse,
+		UnionOccurrence,
+		same_type,
+		same_variant,
+		union_occurrence,
+	./check_types: find_field, occurrence_payload
+	declarations: FunctionId, RecordId, VariantId, record_number, union_number, variant_number
+	names: NameId, same_name
+	namespace: variant_candidates
+	option: is_some, to_result
+	syntax:
+		ExpressionBase(
+			VoidExpression, IntegerExpression, FloatExpression, StringExpression, NameExpression,
+			DirectApplication, RecordExpression,
+		),
+		ParsedRecordField,
+		PostfixOperation(ReceiverInvocation, FieldAccess),
+		ReceiverApplication,
+		Span,
+		ValueExpression,
+		WrittenName,
+
+
+fixed record LocalBinding {
+	name: NameId,
+	id: BindingId,
+	definition: BindingDefinition
+}
+
+
+pure func lookup_binding(scope: List[LocalBinding], name: NameId) -> Option[LocalBinding]:
+	var found: Option[LocalBinding] = None
+
+	for binding in scope:
+		if same_name(binding.name, name):
+			found = Some(binding)
+			break
+
+	found
+
+
+private fixed union ResolvedPostfix:
+	InvokeReceiver(ReceiverApplication, ResolvedReceiver)
+	ReadField(WrittenName)
+
+
+private fixed union ResolvedApplication:
+	FunctionApplication(FunctionContract)
+	ConstructorApplication(WrittenName)
+
+
+-- A variant selected in one union occurrence, with its payload at that occurrence.
+fixed record VariantContract {
+	variant: VariantId,
+	payload: Option[TypeUse]
+}
+
+
+pure func find_variant(
+	context: ResolutionContext,
+	occurrence: UnionOccurrence,
+	name: WrittenName,
+) -> Result[Option[VariantContract], CheckError]:
+	declaration ?= context.unions
+		.get(union_number(occurrence.owner))
+		.to_result(checker_invariant(name.span, InvalidCheckedUnion(occurrence.owner)))
+	var found: Option[CheckedVariant] = None
+
+	-- A visible candidate of another union may share the spelling.
+	for candidate in variant_candidates(context.namespace, context.module, name.id):
+		match declaration.variants.get(variant_number(candidate)):
+			Some(variant):
+				if same_variant(candidate, variant.id) and same_name(variant.name.id, name.id):
+					found = Some(variant)
+					break
+			None:
+				void
+
+	match found:
+		None:
+			Ok(None)
+		Some(variant):
+			payload ?= occurrence_payload(variant.payload, occurrence)
+			Ok(Some({
+				variant = variant.id,
+				payload = payload,
+			}))
+
+
+private pure func contextual_constructor(
+	name: WrittenName,
+	expected_type: TypeRef,
+	context: ResolutionContext,
+) -> Result[VariantContract, CheckError]:
+	found ?= match union_occurrence(expected_type):
+		Some(occurrence):
+			find_variant(context, occurrence, name)
+		None:
+			Ok(None)
+
+	match found:
+		Some(contract):
+			Ok(contract)
+		None:
+			Err(constructor_error(name.span, VariantNotInExpectedType(name.id, expected_type)))
+
+
+private pure func resolve_record_field(
+	name: WrittenName,
+	owner: RecordId,
+	context: ResolutionContext,
+) -> Result[CheckedField, CheckError]:
+	declaration ?= context.records
+		.get(record_number(owner))
+		.to_result(checker_invariant(name.span, InvalidRecordDeclaration(owner)))
+	find_field(
+		declaration.fields,
+		name.id,
+	).to_result(record_error(name.span, UnknownRecordField(name.id, owner)))
+
+
+private pure func resolve_field_read(
+	name: WrittenName,
+	current: ResolvedValue,
+	context: ResolutionContext,
+) -> Result[ResolvedValue, CheckError]:
+	owner ?= match current.value_type:
+		RecordType(owner):
+			Ok(owner)
+		_:
+			Err(record_error(name.span, FieldRequiresRecord(current.value_type)))
+
+	field ?= resolve_record_field(name, owner, context)
+	value_type = field.value_type.value_type
+	Ok({
+		value = { current.value | operations = current.value.operations.append({
+				operation = ReadRecordField(field.id),
+				value_type = value_type,
+				span = name.span,
+			}) },
+		value_type = value_type,
+	})
+
+
+private fixed record LiteralField {
+	declared: CheckedField,
+	written: ParsedRecordField
+}
+
+
+-- A record literal writes each declared field exactly once. Field values are
+-- synthesized in written order, and a child's own error precedes any field
+-- type mismatch.
+private pure func check_record_literal(
+	scope: List[LocalBinding],
+	written: List[ParsedRecordField],
+	span: Span,
+	owner: RecordId,
+	context: ResolutionContext,
+) -> Result[List[CheckedRecordField], CheckError]:
+	declaration ?= context.records
+		.get(record_number(owner))
+		.to_result(checker_invariant(span, InvalidRecordDeclaration(owner)))
+	named ?= name_literal_fields(written, owner, declaration.fields, [])
+	var missing: Option[CheckedField] = None
+
+	for field in declaration.fields:
+		if not find_literal_field(named, field.name.id).is_some():
+			missing = Some(field)
+			break
+
+	complete ?= match missing:
+		Some(field):
+			Err(record_error(span, MissingRecordField(field.id, field.name.span)))
+		None:
+			Ok(void)
+
+	synthesize_literal_fields(scope, named, context, [], None)
+
+
+private pure func find_literal_field(
+	fields: List[LiteralField],
+	name: NameId,
+) -> Option[LiteralField]:
+	var found: Option[LiteralField] = None
+
+	for field in fields:
+		if same_name(field.written.name.id, name):
+			found = Some(field)
+			break
+
+	found
+
+
+private pure func name_literal_fields(
+	written: List[ParsedRecordField],
+	owner: RecordId,
+	fields: List[CheckedField],
+	named: List[LiteralField],
+) -> Result[List[LiteralField], CheckError]:
+	match written.get(named.length()):
+		None:
+			Ok(named)
+		Some(field):
+			declared ?= find_field(
+				fields,
+				field.name.id,
+			).to_result(record_error(field.name.span, UnknownRecordField(field.name.id, owner)))
+
+			unique ?= match find_literal_field(named, field.name.id):
+				Some(first):
+					Err(
+						record_error(
+							field.name.span,
+							DuplicateLiteralField(field.name.id, first.written.name.span),
+						),
+					)
+				None:
+					Ok(void)
+
+			name_literal_fields(
+				written,
+				owner,
+				fields,
+				named.append({
+					declared = declared,
+					written = field,
+				}),
+			)
+
+
+-- The first field type mismatch is held until every child has been checked.
+private pure func synthesize_literal_fields(
+	scope: List[LocalBinding],
+	named: List[LiteralField],
+	context: ResolutionContext,
+	fields: List[CheckedRecordField],
+	mismatch: Option[CheckError],
+) -> Result[List[CheckedRecordField], CheckError]:
+	match named.get(fields.length()):
+		None:
+			match mismatch:
+				Some(error):
+					Err(error)
+				None:
+					Ok(fields)
+		Some(field):
+			annotation = field.declared.value_type
+			child = field.written.value
+			value ?= synthesize_value(scope, child, Some(annotation.value_type), context)
+			actual: TypeUse = {
+				value_type = value.value_type,
+				span = child.span
+			}
+
+			first_mismatch = match mismatch:
+				Some(_):
+					mismatch
+				None:
+					if same_type(actual.value_type, annotation.value_type):
+						None
+					else:
+						Some(
+							record_error(
+								child.span,
+								RecordFieldTypeMismatch(field.declared.id, actual, annotation.span),
+							),
+						)
+
+			synthesize_literal_fields(
+				scope,
+				named,
+				context,
+				fields.append({
+					field = field.declared.id,
+					value = value.value,
+					span = child.span,
+				}),
+				first_mismatch,
+			)
+
+
+fixed record ResolvedValue {
+	value: CheckedValue,
+	value_type: TypeRef
+}
+
+
+private fixed record ResolvedArguments {
+	values: List[CheckedValue],
+	call: InstantiatedCall
+}
+
+
+-- Explicit arguments synthesized so far, and every obligation including any
+-- receiver's, in argument order.
+private fixed record SynthesizedArguments {
+	obligations: List[ArgumentObligation],
+	values: List[CheckedValue]
+}
+
+
+-- Child errors precede argument mismatches: every argument is synthesized
+-- before the callee is instantiated and its parameters are compared. A
+-- receiver's obligation, already checked, comes first.
+private pure func check_call(
+	scope: List[LocalBinding],
+	contract: FunctionContract,
+	receiver: Option[ArgumentObligation],
+	context: ResolutionContext,
+) -> Result[ResolvedArguments, CheckError]:
+	checked: List[ArgumentObligation] = match receiver:
+		Some(obligation):
+			[obligation]
+		None:
+			[]
+
+	synthesized ?= synthesize_arguments(
+		scope,
+		contract.arguments,
+		context,
+		{
+			obligations = checked,
+			values = []
+		},
+	)
+	call ?= instantiate_contract(contract, synthesized.obligations)
+	Ok({
+		values = synthesized.values,
+		call = call,
+	})
+
+
+-- A parameter that mentions a rigid type parameter selects no constructor.
+private pure func synthesize_arguments(
+	scope: List[LocalBinding],
+	slots: List[ArgumentSlot],
+	context: ResolutionContext,
+	synthesized: SynthesizedArguments,
+) -> Result[SynthesizedArguments, CheckError]:
+	match slots:
+		[]:
+			Ok(synthesized)
+		[slot, ...rest]:
+			parameter = slot.parameter
+
+			expectation = if contains_parameter(parameter.value_type):
+				None
+			else:
+				Some(parameter.value_type)
+
+			value ?= synthesize_value(scope, slot.argument, expectation, context)
+			synthesize_arguments(
+				scope,
+				rest,
+				context,
+				{
+					obligations = synthesized.obligations.append({
+						parameter = parameter,
+						actual = {
+							value_type = value.value_type,
+							span = slot.argument.span
+						},
+					}),
+					values = synthesized.values.append(value.value)
+				},
+			)
+
+
+-- Constructors and record literals take their type from the expected type.
+-- When the base expression itself has none, synthesis reports that fact
+-- structurally, apart from any failure of its children, so an enclosing
+-- receiver call can explain which receiver needs a type. The carried error is
+-- the one reported when no receiver can.
+private fixed union BaseSynthesis:
+	SynthesizedBase(ResolvedValue)
+	BaseNeedsExpectedType(CheckError)
+
+
+private pure func base_value(base: CheckedBase, value_type: TypeRef, span: Span) -> BaseSynthesis:
+	SynthesizedBase({
+		value = {
+			base = base,
+			base_type = value_type,
+			base_span = span,
+			operations = []
+		},
+		value_type = value_type,
+	})
+
+
+private pure func synthesize_base(
+	scope: List[LocalBinding],
+	body: ValueExpression,
+	expectation: Option[TypeRef],
+	context: ResolutionContext,
+) -> Result[BaseSynthesis, CheckError]:
+	span = body.base_span
+
+	match body.base:
+		DirectApplication(name, arguments):
+			classified ?= classify_direct_call(name, arguments, scope, context)
+
+			match classified:
+				ConstructorApplication(name):
+					construct_variant(
+						scope,
+						name,
+						CalledConstructor(arguments),
+						expectation,
+						span,
+						context,
+					)
+				FunctionApplication(contract):
+					resolved ?= check_call(scope, contract, None, context)
+					Ok(
+						base_value(
+							ReturnCall(resolved.call.call, resolved.values),
+							resolved.call.return_type,
+							span,
+						),
+					)
+		RecordExpression(fields):
+			match expectation:
+				Some(RecordType(owner)):
+					fields ?= check_record_literal(scope, fields, span, owner, context)
+					Ok(base_value(ReturnRecord(owner, fields), RecordType(owner), span))
+				_:
+					Ok(BaseNeedsExpectedType(record_error(span, RecordNeedsExpectedType)))
+		NameExpression(name):
+			match lookup_binding(scope, name.id):
+				Some(binding):
+					Ok(base_value(ReturnBinding(binding.id), binding.definition.value_type, span))
+				None:
+					if contains_variant(context.namespace, context.module, name.id):
+						construct_variant(scope, name, BareConstructor, expectation, span, context)
+					else:
+						Err(value_error(name.span, UnknownValue(name.id)))
+		VoidExpression:
+			Ok(base_value(ReturnVoid, VoidType, span))
+		StringExpression(value):
+			Ok(base_value(ReturnString(value), StringType, span))
+		IntegerExpression(value):
+			Ok(base_value(ReturnInteger(value), IntType, span))
+		FloatExpression(value):
+			Ok(base_value(ReturnFloat(value), FloatType, span))
+
+
+-- A constructor is written bare or called with its arguments.
+private fixed union ConstructorUse:
+	BareConstructor
+	CalledConstructor(List[ValueExpression])
+
+
+-- A constructor takes its union from the expected type. A bare constructor
+-- names a payload-free variant; a called one passes exactly one payload,
+-- checked at this union occurrence. Constructors are pure and never generic.
+private pure func construct_variant(
+	scope: List[LocalBinding],
+	name: WrittenName,
+	use: ConstructorUse,
+	expectation: Option[TypeRef],
+	span: Span,
+	context: ResolutionContext,
+) -> Result[BaseSynthesis, CheckError]:
+	match expectation:
+		None:
+			Ok(
+				BaseNeedsExpectedType(
+					constructor_error(
+						name.span,
+						ConstructorNeedsExpectedType(name.id),
+					),
+				),
+			)
+		Some(expected):
+			contract ?= contextual_constructor(name, expected, context)
+			variant = contract.variant
+
+			match contract.payload:
+				None:
+					match use:
+						BareConstructor:
+							Ok(base_value(ReturnVariant(variant), expected, span))
+						CalledConstructor(_):
+							Err(constructor_error(name.span, PayloadFreeVariantCalled(variant)))
+				Some(payload):
+					missing = constructor_error(
+						name.span,
+						MissingConstructorPayload(variant, payload.value_type),
+					)
+
+					match use:
+						BareConstructor:
+							Err(missing)
+						CalledConstructor([]):
+							Err(missing)
+						CalledConstructor([argument]):
+							payload_expectation = if contains_parameter(payload.value_type):
+								None
+							else:
+								Some(payload.value_type)
+
+							value ?= synthesize_value(scope, argument, payload_expectation, context)
+
+							if same_type(value.value_type, payload.value_type):
+								Ok(SynthesizedBase({
+									value = { value.value |
+										operations = value.value.operations.append({
+											operation = ConstructVariant(variant),
+											value_type = expected,
+											span = name.span,
+										})
+									},
+									value_type = expected,
+								}))
+							else:
+								Err(call_error(
+									name.span,
+									ArgumentTypeMismatch({
+										expected = payload.value_type,
+										actual = {
+											value_type = value.value_type,
+											span = argument.span
+										},
+										argument_position = 0,
+										expected_site = SourceAnnotation(payload.span),
+									}),
+								))
+						CalledConstructor(arguments):
+							Err(
+								constructor_error(
+									name.span,
+									ConstructorPayloadArity(variant, arguments.length()),
+								),
+							)
+
+
+-- Constructor context selects variants; callers validate expression and
+-- argument obligations. Complete outer receiver contracts are resolved before
+-- the base and its children are checked.
+pure func synthesize_value(
+	scope: List[LocalBinding],
+	body: ValueExpression,
+	constructor_type: Option[TypeRef],
+	context: ResolutionContext,
+) -> Result[ResolvedValue, CheckError]:
+	postfixes ?= resolve_postfixes(body.applications, context, [])
+	first = postfixes.get(0)
+
+	expectation = match first:
+		Some(InvokeReceiver(_, receiver)):
+			receiver_expectation(receiver)
+		Some(ReadField(_)):
+			None
+		None:
+			constructor_type
+
+	synthesized ?= synthesize_base(scope, body, expectation, context)
+
+	explained: Result[ResolvedValue, CheckError] = match synthesized:
+		SynthesizedBase(value):
+			Ok(value)
+		BaseNeedsExpectedType(error):
+			match first:
+				Some(InvokeReceiver(application, receiver)):
+					match receiver:
+						ReceiverCandidates(candidates):
+							callee = application.callee
+							Err(
+								method_error(
+									callee.span,
+									MethodReceiverNeedsType(callee.id, method_sites(candidates)),
+								),
+							)
+						UniqueReceiver(_):
+							Err(error)
+				_:
+					Err(error)
+
+	base ?= explained
+	apply_postfixes(scope, body.base_span, postfixes, base, context)
+
+
+private pure func resolve_postfixes(
+	applications: List[PostfixOperation],
+	context: ResolutionContext,
+	resolved: List[ResolvedPostfix],
+) -> Result[List[ResolvedPostfix], CheckError]:
+	match applications.get(resolved.length()):
+		None:
+			Ok(resolved)
+		Some(FieldAccess(name)):
+			resolve_postfixes(
+				applications,
+				context,
+				resolved.append(ReadField(name)),
+			)
+		Some(ReceiverInvocation(application)):
+			receiver ?= classify_receiver(application, context)
+			resolve_postfixes(
+				applications,
+				context,
+				resolved.append(InvokeReceiver(application, receiver)),
+			)
+
+
+-- Applies postfix operations left to right. A receiver call's span runs from
+-- the start of the base to the end of its own application.
+private pure func apply_postfixes(
+	scope: List[LocalBinding],
+	base_span: Span,
+	postfixes: List[ResolvedPostfix],
+	current: ResolvedValue,
+	context: ResolutionContext,
+) -> Result[ResolvedValue, CheckError]:
+	match postfixes:
+		[]:
+			Ok(current)
+		[postfix, ...rest]:
+			next ?= match postfix:
+				InvokeReceiver(application, receiver):
+					span: Span = {
+						source = base_span.source,
+						start = base_span.start,
+						end = application.span.end
+					}
+					resolve_receiver(scope, current, application, receiver, context, span)
+				ReadField(name):
+					resolve_field_read(name, current, context)
+
+			apply_postfixes(scope, base_span, rest, next, context)
+
+
+private pure func resolve_receiver(
+	scope: List[LocalBinding],
+	current: ResolvedValue,
+	application: ReceiverApplication,
+	receiver: ResolvedReceiver,
+	context: ResolutionContext,
+	span: Span,
+) -> Result[ResolvedValue, CheckError]:
+	contract ?= select_receiver_contract(
+		application,
+		receiver,
+		{
+			value_type = current.value_type,
+			span = current.value.base_span
+		},
+		context,
+	)
+	receiver: ArgumentObligation = {
+		parameter = contract.receiver,
+		actual = {
+			value_type = current.value_type,
+			span = contract.call.span
+		}
+	}
+	resolved ?= check_call(scope, contract.call, Some(receiver), context)
+	Ok({
+		value = { current.value | operations = current.value.operations.append({
+				operation = InvokeFunction(resolved.call.call, resolved.values),
+				value_type = resolved.call.return_type,
+				span = span,
+			}) },
+		value_type = resolved.call.return_type,
+	})
+
+
+private pure func classify_direct_call(
+	name: WrittenName,
+	arguments: List[ValueExpression],
+	scope: List[LocalBinding],
+	context: ResolutionContext,
+) -> Result[ResolvedApplication, CheckError]:
+	callable ?= match lookup_binding(scope, name.id):
+		Some(binding):
+			Err(non_callable(binding, name.span, context.caller.function))
+		None:
+			Ok(void)
+
+	target ?= lookup_target(context, name)
+
+	match target:
+		Some(target):
+			contract ?= function_contract(
+				context.caller,
+				name,
+				arguments,
+				target,
+				context.signatures,
+			)
+			Ok(FunctionApplication(contract))
+		None:
+			if contains_variant(context.namespace, context.module, name.id):
+				Ok(ConstructorApplication(name))
+			else:
+				Err(call_error(name.span, UnknownFunction(name.id)))
+
+
+-- Checks a value against a known type, naming where that type was written.
+pure func check_value(
+	scope: List[LocalBinding],
+	body: ValueExpression,
+	expected: TypeRef,
+	site: ExpectedTypeSite,
+	context: ResolutionContext,
+) -> Result[ResolvedValue, CheckError]:
+	value ?= synthesize_value(scope, body, Some(expected), context)
+
+	if same_type(value.value_type, expected):
+		Ok(value)
+	else:
+		Err(value_error(
+			body.span,
+			ExpressionTypeMismatch({
+				expected = expected,
+				actual = {
+					value_type = value.value_type,
+					span = body.span
+				},
+				expected_site = site,
+			}),
+		))
+
+
+pure func binding_site(function: FunctionId, binding: LocalBinding) -> BindingSite:
+	{
+		function = function,
+		binding = binding.id,
+		name = binding.name,
+		span = binding.definition.span
+	}
+
+
+private pure func non_callable(
+	binding: LocalBinding,
+	span: Span,
+	function: FunctionId,
+) -> CheckError:
+	call_error(
+		span,
+		UncallableBinding(
+			binding_site(function, binding),
+			binding.definition.origin,
+			binding.definition.value_type,
+		),
+	)

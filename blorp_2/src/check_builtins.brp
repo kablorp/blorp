@@ -1,0 +1,238 @@
+---
+Validates a builtin body against its closed runtime contract, publishing
+the typed runtime operation with resolved constructor roles.
+---
+import:
+	./builtins as Builtins:
+		BooleanRoles,
+		OptionalRoles,
+		PrimitiveType,
+		RuntimeOperation,
+		RuntimeParameter(PrimitiveParameter, StringListParameter),
+		RuntimeResult(PrimitiveResult, OptionalResult, BooleanResult),
+		builtin_operation,
+		primitive_operation,
+		runtime_contract,
+	./check_errors:
+		BuiltinError(
+			BuiltinBooleanPayload, BuiltinContractMismatch, BuiltinResultUnion, BuiltinRoleCoverage,
+			BuiltinRoleNotInResult, BuiltinRolePayload, BuiltinTailAnnotation,
+		),
+		CheckError,
+		CheckerInvariant(InvalidCheckedUnion, RuntimeContractMismatch),
+		builtin_error,
+		checker_invariant,
+	./check_model:
+		CheckedUnion,
+		CheckedVariant,
+		FunctionSignature,
+		TypeRef(ListType, StringType),
+		TypeUse,
+		UnionOccurrence,
+		primitive_ref,
+		same_type,
+		same_types,
+		same_variant,
+		union_occurrence,
+	./check_types: occurrence_payload
+	declarations: VariantId, union_number, variant_number
+	int as IntOps
+	namespace: Namespace, variant_candidates
+	option: to_result
+	syntax:
+		ParsedFunction,
+		ParsedRuntimeOperation(
+			StringParseIntBuiltin, StringParseFloatBuiltin, ListGetBuiltin, StringEqualsBuiltin,
+			IntegerEqualsBuiltin,
+		),
+		Span,
+		WrittenName,
+		same_purity,
+
+
+private pure func runtime_parameter_ref(parameter: RuntimeParameter) -> TypeRef:
+	match parameter:
+		PrimitiveParameter(primitive):
+			primitive_ref(primitive)
+		StringListParameter:
+			ListType(StringType)
+
+
+-- What validating one builtin body needs: its declaration and signature, and
+-- the checked unions and namespace its result constructors resolve against.
+fixed record BuiltinSite {
+	function: ParsedFunction,
+	signature: FunctionSignature,
+	unions: List[CheckedUnion],
+	namespace: Namespace,
+	span: Span
+}
+
+
+-- The two constructors a builtin result binds, resolved in its result union.
+private fixed record ResultRoles {
+	occurrence: UnionOccurrence,
+	first: CheckedVariant,
+	second: CheckedVariant
+}
+
+
+private pure func result_roles(
+	first: WrittenName,
+	second: WrittenName,
+	site: BuiltinSite,
+) -> Result[ResultRoles, CheckError]:
+	result = site.signature.return_type
+	occurrence ?= union_occurrence(
+		result.value_type,
+	).to_result(builtin_error(result.span, BuiltinResultUnion))
+	declaration ?= site.unions
+		.get(union_number(occurrence.owner))
+		.to_result(checker_invariant(site.span, InvalidCheckedUnion(occurrence.owner)))
+	first_variant ?= builtin_role(first, declaration, site)
+	second_variant ?= builtin_role(second, declaration, site)
+
+	if (
+		IntOps.equals(declaration.variants.length(), 2)
+		and not same_variant(first_variant.id, second_variant.id)
+	):
+		Ok({
+			occurrence = occurrence,
+			first = first_variant,
+			second = second_variant,
+		})
+	else:
+		Err(builtin_error(site.span, BuiltinRoleCoverage))
+
+
+private pure func builtin_role(
+	written: WrittenName,
+	declaration: CheckedUnion,
+	site: BuiltinSite,
+) -> Result[CheckedVariant, CheckError]:
+	var found: Option[CheckedVariant] = None
+
+	for candidate in variant_candidates(site.namespace, site.function.module, written.id):
+		match declaration.variants.get(variant_number(candidate)):
+			Some(variant):
+				if same_variant(candidate, variant.id):
+					found = Some(variant)
+					break
+			None:
+				void
+
+	result_type = site.signature.return_type.value_type
+	found.to_result(builtin_error(written.span, BuiltinRoleNotInResult(written.id, result_type)))
+
+
+-- The present constructor carries the operation's payload; the absent one is empty.
+private pure func optional_roles(
+	payload: PrimitiveType,
+	written: OptionalRoles[WrittenName],
+	site: BuiltinSite,
+) -> Result[OptionalRoles[VariantId], CheckError]:
+	roles ?= result_roles(written.present, written.absent, site)
+	actual ?= occurrence_payload(roles.first.payload, roles.occurrence)
+
+	present = match actual:
+		Some(actual):
+			same_type(actual.value_type, primitive_ref(payload))
+		None:
+			False
+
+	if not present:
+		Err(builtin_error(written.present.span, BuiltinRolePayload))
+	else if roles.second.payload.is_some():
+		Err(builtin_error(written.absent.span, BuiltinRolePayload))
+	else:
+		Ok({
+			present = roles.first.id,
+			absent = roles.second.id,
+		})
+
+
+-- Both comparison constructors are empty.
+private pure func boolean_roles(
+	written: BooleanRoles[WrittenName],
+	site: BuiltinSite,
+) -> Result[BooleanRoles[VariantId], CheckError]:
+	roles ?= result_roles(written.equal, written.different, site)
+
+	if roles.first.payload.is_some():
+		Err(builtin_error(written.equal.span, BuiltinBooleanPayload))
+	else if roles.second.payload.is_some():
+		Err(builtin_error(written.different.span, BuiltinBooleanPayload))
+	else:
+		Ok({
+			equal = roles.first.id,
+			different = roles.second.id,
+		})
+
+
+-- The parsed operation and its runtime contract's result kind come from one
+-- table in builtins, so a mismatch between them is a checker invariant.
+pure func validate_builtin_body(
+	parsed: ParsedRuntimeOperation,
+	site: BuiltinSite,
+) -> Result[RuntimeOperation[VariantId], CheckError]:
+	annotation ?= match site.function.tail_annotation:
+		Some(annotation):
+			Err(builtin_error(annotation, BuiltinTailAnnotation))
+		None:
+			Ok(void)
+
+	written = builtin_operation(parsed)
+	contract = runtime_contract(written)
+	signature = site.signature
+	mismatch = builtin_error(site.span, BuiltinContractMismatch(written))
+
+	valid_header ?= if (
+		signature.type_parameters.is_empty()
+		and same_purity(signature.purity, contract.purity)
+		and same_types(
+			signature.parameters.map(
+				pure func(parameter: TypeUse) -> TypeRef: parameter.value_type,
+			),
+			contract.parameters.map(
+				pure func(
+					parameter: RuntimeParameter,
+				) -> TypeRef: runtime_parameter_ref(parameter),
+			),
+		)
+	):
+		Ok(void)
+	else:
+		Err(mismatch)
+
+	disagreement = checker_invariant(site.span, RuntimeContractMismatch)
+
+	match contract.return_type:
+		PrimitiveResult(expected):
+			valid_result ?= if same_type(signature.return_type.value_type, primitive_ref(expected)):
+				Ok(void)
+			else:
+				Err(mismatch)
+
+			primitive_operation(parsed).to_result(disagreement)
+		OptionalResult(payload, written_roles):
+			roles ?= optional_roles(payload, written_roles, site)
+
+			match parsed:
+				StringParseIntBuiltin(_, _):
+					Ok(Builtins.StringParseInt(roles))
+				StringParseFloatBuiltin(_, _):
+					Ok(Builtins.StringParseFloat(roles))
+				ListGetBuiltin(_, _):
+					Ok(Builtins.ListGet(roles))
+				_:
+					Err(disagreement)
+		BooleanResult(written_roles):
+			roles ?= boolean_roles(written_roles, site)
+
+			match parsed:
+				StringEqualsBuiltin(_, _):
+					Ok(Builtins.StringEquals(roles))
+				IntegerEqualsBuiltin(_, _):
+					Ok(Builtins.IntEquals(roles))
+				_:
+					Err(disagreement)

@@ -1,7 +1,9 @@
 import:
 	../../src/declarations as Declaration
 	../../src/source: module_source, root_module_id
-	../../src/check as Checked
+	../../src/check: CheckedProgram, check, checked_functions, union_declaration_id
+	../../src/check_errors as Errors
+	../../src/check_model as Checked
 	../../src/check_render as Renderer
 	../../src/lex: lex
 	../../src/names: name_spelling
@@ -22,11 +24,10 @@ private pure func payload_free(variants: List[Option[Concrete.TypeRef]]) -> Bool
 			False
 
 
-private pure func checked(source: String) -> Result[Checked.CheckedProgram, Diagnostic]:
+private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
 	tokens ?= lex(module_source(root_module_id()), source.concat("\n"))
 	parsed ?= parse(tokens)
-	Checked
-		.check(parsed)
+	check(parsed)
 		.map_err(setup_diagnostic)
 
 
@@ -75,7 +76,7 @@ private TRI: String =
 	|
 
 
-private pure func rejected(source: String) -> Option[Checked.CheckError]:
+private pure func rejected(source: String) -> Option[Errors.CheckError]:
 	check_failure(source.concat("\n"))
 
 
@@ -121,7 +122,7 @@ pure func test_union_duplicates_preserve_owner_positions_and_both_spans() -> Boo
 	):
 		Some(error):
 			match error.kind:
-				Checked.DuplicateTypeParameter(current, previous, first):
+				Errors.TypeDeclarationRejection(Errors.DuplicateTypeParameter(current, previous, first)):
 					(
 						union_parameter(current, 0, 1)
 						and union_parameter(previous, 0, 0)
@@ -154,7 +155,7 @@ private pure func arity_is(arguments: String, actual: Int) -> Bool:
 	):
 		Some(error):
 			match error.kind:
-				Checked.UnionTypeArgumentCountMismatch(owner, 2, count):
+				Errors.TypeTermRejection(Errors.UnionTypeArgumentCountMismatch(owner, 2, count)):
 					(
 						Declaration.union_number(owner) == 0
 						and count == actual
@@ -182,7 +183,7 @@ pure func test_bare_application_retains_required_count() -> Bool:
 	):
 		Some(error):
 			match error.kind:
-				Checked.MissingUnionTypeArguments(owner, 2):
+				Errors.TypeTermRejection(Errors.MissingUnionTypeArguments(owner, 2)):
 					(
 						Declaration.union_number(owner) == 0
 						and span_is(error.span, prefix.length(), prefix.length() + 6)
@@ -205,7 +206,7 @@ pure func test_later_unknown_argument_type_has_its_own_span() -> Bool:
 	):
 		Some(error):
 			match error.kind:
-				Checked.UnknownType(_):
+				Errors.TypeTermRejection(Errors.UnknownType(_)):
 					span_is(error.span, prefix.length(), prefix.length() + 7)
 				_:
 					False
@@ -263,11 +264,11 @@ pure func test_three_payload_positions_keep_union_and_function_authorities() -> 
 
 	match checked(source):
 		Ok(program):
-			facts = Checked.checked_functions(program)
+			facts = checked_functions(program)
 
 			match (facts.unions, facts.functions):
 				([declaration], [first, second, third, selection, _]):
-					match (declaration.variants, selection.body, selection.bindings):
+					match (declaration.variants.map(pure func(variant): variant.payload), selection.body, selection.bindings):
 						([Some(a), Some(b), Some(c)], Checked.CheckedMatchBody(matched), [_, _, first_binding, second_binding, third_binding]):
 							match (
 								(a.value_type, b.value_type, c.value_type),
@@ -340,9 +341,9 @@ pure func test_unused_body_cannot_choose_a_rigid_union_parameter() -> Bool:
 	):
 		Some(error):
 			match error.kind:
-				Checked.ExpressionTypeMismatch(mismatch):
+				Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
 					match (mismatch.expected, mismatch.actual.value_type, mismatch.expected_site):
-						(Checked.ParameterType(expected), Checked.ParameterType(actual), Checked.SourceAnnotation(site)):
+						(Checked.ParameterType(expected), Checked.ParameterType(actual), Errors.SourceAnnotation(site)):
 							(
 								function_parameter(expected, 0, 0)
 								and function_parameter(actual, 0, 1)
@@ -378,7 +379,7 @@ pure func test_one_runtime_argument_infers_three_function_parameters() -> Bool:
 
 	match checked(source):
 		Ok(program):
-			match Checked.checked_functions(program).functions:
+			match checked_functions(program).functions:
 				[_, _, main]:
 					match main.body:
 						Checked.CheckedValueBody(Checked.ReturnExpression(value)):
@@ -427,7 +428,7 @@ pure func test_conflict_before_unseen_parameter_retains_a_rigid_snapshot() -> Bo
 	match rejected(prefix.concat("producer())")):
 		Some(error):
 			match error.kind:
-				Checked.GenericArgumentConflict(conflict):
+				Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
 					match (
 						(conflict.mismatch.expected, conflict.mismatch.actual.value_type),
 						(
@@ -436,7 +437,7 @@ pure func test_conflict_before_unseen_parameter_retains_a_rigid_snapshot() -> Bo
 							conflict.mismatch.expected_site,
 						),
 					):
-						((Checked.AppliedUnionType(expected_owner, [Checked.IntType, Checked.ParameterType(unseen)]), Checked.AppliedUnionType(actual_owner, [Checked.StringType, Checked.IntType])), (Checked.IntType, Checked.StringType, Checked.SourceAnnotation(site))):
+						((Checked.AppliedUnionType(expected_owner, [Checked.IntType, Checked.ParameterType(unseen)]), Checked.AppliedUnionType(actual_owner, [Checked.StringType, Checked.IntType])), (Checked.IntType, Checked.StringType, Errors.SourceAnnotation(site))):
 							(
 								function_parameter(conflict.parameter, 1, 0)
 								and function_parameter(unseen, 1, 1)
@@ -492,7 +493,7 @@ pure func test_repeated_parameter_in_one_argument_conflicts_before_later_inferen
 	match rejected(prefix.concat("producer())")):
 		Some(error):
 			match error.kind:
-				Checked.GenericArgumentConflict(conflict):
+				Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
 					match (
 						(conflict.mismatch.expected, conflict.mismatch.actual.value_type),
 						(
@@ -501,7 +502,7 @@ pure func test_repeated_parameter_in_one_argument_conflicts_before_later_inferen
 							conflict.mismatch.expected_site,
 						),
 					):
-						((Checked.AppliedUnionType(expected_owner, [Checked.IntType, Checked.IntType, Checked.ParameterType(unseen)]), Checked.AppliedUnionType(actual_owner, [Checked.IntType, Checked.StringType, Checked.IntType])), (Checked.IntType, Checked.StringType, Checked.SourceAnnotation(site))):
+						((Checked.AppliedUnionType(expected_owner, [Checked.IntType, Checked.IntType, Checked.ParameterType(unseen)]), Checked.AppliedUnionType(actual_owner, [Checked.IntType, Checked.StringType, Checked.IntType])), (Checked.IntType, Checked.StringType, Errors.SourceAnnotation(site))):
 							(
 								function_parameter(conflict.parameter, 1, 0)
 								and function_parameter(unseen, 1, 1)
@@ -551,7 +552,7 @@ pure func test_conflicting_children_follow_annotation_order_not_parameter_order(
 	match rejected(prefix.concat("producer())")):
 		Some(error):
 			match error.kind:
-				Checked.GenericArgumentConflict(conflict):
+				Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
 					(
 						function_parameter(conflict.parameter, 1, 1)
 						and conflict.mismatch.argument_position == 2
@@ -583,7 +584,7 @@ pure func test_agreeing_children_preserve_the_first_candidate_occurrence() -> Bo
 	match rejected(prefix.concat("disagreeing())")):
 		Some(error):
 			match error.kind:
-				Checked.GenericArgumentConflict(conflict):
+				Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
 					(
 						function_parameter(conflict.parameter, 2, 0)
 						and conflict.mismatch.argument_position == 2
@@ -615,7 +616,7 @@ pure func test_missing_inference_precedes_an_ordinary_mismatch() -> Bool:
 	], PRIMITIVE_BASE):
 		Some(error):
 			match error.kind:
-				Checked.UninferableTypeParameter(parameter):
+				Errors.CallRejection(Errors.UninferableTypeParameter(parameter)):
 					(
 						function_parameter(parameter, 0, 1)
 						and span_is(error.span, prefix.length(), prefix.length() + 4)
@@ -642,7 +643,7 @@ pure func test_conflict_precedes_an_ordinary_mismatch() -> Bool:
 	], PRIMITIVE_BASE):
 		Some(error):
 			match error.kind:
-				Checked.GenericArgumentConflict(conflict):
+				Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
 					(
 						function_parameter(conflict.parameter, 0, 0)
 						and conflict.mismatch.argument_position == 1
@@ -667,7 +668,7 @@ pure func test_later_child_error_precedes_structural_conflict() -> Bool:
 	match rejected(prefix.concat("missing)")):
 		Some(error):
 			match error.kind:
-				Checked.UnknownValue(_):
+				Errors.ValueRejection(Errors.UnknownValue(_)):
 					span_is(error.span, prefix.length(), prefix.length() + 7)
 				_:
 					False
@@ -691,7 +692,7 @@ pure func test_expected_result_does_not_fill_a_later_union_argument() -> Bool:
 	):
 		Some(error):
 			match error.kind:
-				Checked.UninferableTypeParameter(parameter):
+				Errors.CallRejection(Errors.UninferableTypeParameter(parameter)):
 					(
 						function_parameter(parameter, 0, 1)
 						and span_is(error.span, prefix.length(), prefix.length() + 5)
@@ -823,7 +824,7 @@ pure func test_permuted_forwarding_preserves_caller_ids_and_concrete_target() ->
 
 	match checked(source):
 		Ok(program):
-			match Checked.checked_functions(program).functions:
+			match checked_functions(program).functions:
 				[_, forward, _, _, _]:
 					match call_target(forward):
 						Some(Checked.UserFunction(target, [Checked.ParameterType(y), Checked.ParameterType(x)])):
@@ -927,9 +928,9 @@ pure func test_arity_renderer_uses_complete_typed_counts_without_rechecking() ->
 
 	match lex(module_source(root_module_id()), source.concat("\n")).and_then(pure func(tokens): parse(tokens)):
 		Ok(parsed):
-			match Checked.check(parsed):
+			match check(parsed):
 				Ok(program):
-					match Checked.union_declaration_id(program, 0):
+					match union_declaration_id(program, 0):
 						Some(owner):
 							location: Span = {
 								source = module_source(root_module_id()),
@@ -940,14 +941,14 @@ pure func test_arity_renderer_uses_complete_typed_counts_without_rechecking() ->
 								parsed,
 								{
 									span = location,
-									kind = Checked.UnionTypeArgumentCountMismatch(owner, 4, 3)
+									kind = Errors.TypeTermRejection(Errors.UnionTypeArgumentCountMismatch(owner, 4, 3))
 								},
 							)
 							missing = Renderer.render_check_error(
 								parsed,
 								{
 									span = location,
-									kind = Checked.MissingUnionTypeArguments(owner, 4)
+									kind = Errors.TypeTermRejection(Errors.MissingUnionTypeArguments(owner, 4))
 								},
 							)
 							(
@@ -1190,11 +1191,11 @@ pure func test_conflict_renderer_spells_all_established_and_rigid_children() -> 
 
 	match lex(module_source(root_module_id()), source.concat("\n")).and_then(pure func(tokens): parse(tokens)):
 		Ok(parsed):
-			match Checked.check(parsed):
+			match check(parsed):
 				Ok(program):
 					match (
-						Checked.union_declaration_id(program, 0),
-						Checked.checked_functions(program).functions,
+						union_declaration_id(program, 0),
+						checked_functions(program).functions,
 					):
 						(Some(owner), [function, _]):
 							match function.signature.type_parameters:
@@ -1204,9 +1205,9 @@ pure func test_conflict_renderer_spells_all_established_and_rigid_children() -> 
 										start = 5,
 										end = 15
 									}
-									error: Checked.CheckError = {
+									error: Errors.CheckError = {
 										span = location,
-										kind = Checked.GenericArgumentConflict({
+										kind = Errors.CallRejection(Errors.GenericArgumentConflict({
 											parameter = a,
 											previous = {
 												value_type = Checked.IntType,
@@ -1237,13 +1238,13 @@ pure func test_conflict_renderer_spells_all_established_and_rigid_children() -> 
 													span = location
 												},
 												argument_position = 0,
-												expected_site = Checked.SourceAnnotation({
+												expected_site = Errors.SourceAnnotation({
 													source = module_source(root_module_id()),
 													start = 20,
 													end = 30,
 												})
 											},
-										})
+										}))
 									}
 									diagnostic = Renderer.render_check_error(parsed, error)
 									(

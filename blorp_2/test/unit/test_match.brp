@@ -1,14 +1,23 @@
 import:
 	../../src/declarations: union_number, variant_owner
 	../../src/source: module_source, root_module_id
-	../../src/check:
-		BindingOrigin(ParameterBinding, MatchCapture),
+	../../src/check: CheckedProgram, checked_functions
+	../../src/check_errors:
+		PayloadRule(IntegerPayload),
+		CallError(ArgumentCountMismatch, ArgumentTypeMismatch, ImpureCall, UncallableBinding),
 		CheckErrorKind(
-			ArgumentCountMismatch, ImpureCall, ArgumentTypeMismatch, GenericArgumentConflict,
-			UnsupportedPayloadAnnotation, NonExhaustiveMatch, UnreachableArm,
-			UnknownConstructorPattern, PatternUnexpectedField, PatternMissingField,
-			MatchRequiresUnion, ConstructorNeedsExpectedType, UnknownValue, UncallableBinding,
+			CallRejection, ConstructorRejection, MatchRejection, TypeDeclarationRejection,
+			ValueRejection,
 		),
+		ConstructorError(ConstructorNeedsExpectedType),
+		MatchError(
+			MatchRequiresUnion, NonExhaustiveMatch, PatternMissingField, PatternUnexpectedField,
+			UnknownConstructorPattern, UnreachableArm,
+		),
+		ValueError(UnknownValue),
+		TypeDeclarationError(UnsupportedPayloadAnnotation),
+	../../src/check_model:
+		BindingOrigin(MatchCapture),
 		CheckedArm,
 		CheckedBase(ReturnBinding),
 		CheckedBody(CheckedMatchBody, CheckedValueBody),
@@ -16,12 +25,9 @@ import:
 		CheckedFunction,
 		CheckedOperation(ConstructVariant),
 		CheckedPattern(VariantCase, BindingCase),
-		CheckedProgram,
 		PayloadBinding(BindPayload),
-		PayloadRule(IntegerPayload),
 		TypeRef(IntType),
 		binding_number,
-		checked_functions,
 		same_type,
 	../../src/lex: lex
 	../../src/syntax: Diagnostic
@@ -100,9 +106,9 @@ pure func test_payload_shapes_and_contextual_constructor_owners() -> Bool:
 
 			match rows.unions:
 				[first, second]:
-					match first.variants:
+					match first.variants.map(pure func(variant): variant.payload):
 						[Some(first_type)]:
-							match second.variants:
+							match second.variants.map(pure func(variant): variant.payload):
 								[Some(second_type)]:
 									(
 										same_type(first_type.value_type, IntType)
@@ -267,13 +273,13 @@ pure func test_bindings_cannot_call_or_leak_to_siblings() -> Bool:
 	leak = VALUE + UNWRAP + "match value:\n\t\tNumber(item): item\n\t\tEmpty: "
 	rejects(prefix, "identity(identity)\n", 0, 8, pure func(kind: CheckErrorKind) -> Bool:
 		match kind:
-			UncallableBinding(_, MatchCapture, _):
+			CallRejection(UncallableBinding(_, MatchCapture, _)):
 				True
 			_:
 				False
 	) and rejects(leak, "item\n", 0, 4, pure func(kind: CheckErrorKind) -> Bool:
 		match kind:
-			UnknownValue(_):
+			ValueRejection(UnknownValue(_)):
 				True
 			_:
 				False
@@ -305,7 +311,7 @@ pure func test_constructor_scrutinee_needs_context_not_function_result() -> Bool
 			kind: CheckErrorKind,
 		) -> Bool:
 			match kind:
-				ConstructorNeedsExpectedType(_):
+				ConstructorRejection(ConstructorNeedsExpectedType(_)):
 					True
 				_:
 					False
@@ -314,7 +320,7 @@ pure func test_constructor_scrutinee_needs_context_not_function_result() -> Bool
 			kind: CheckErrorKind,
 		) -> Bool:
 			match kind:
-				ConstructorNeedsExpectedType(_):
+				ConstructorRejection(ConstructorNeedsExpectedType(_)):
 					True
 				_:
 					False
@@ -327,7 +333,7 @@ pure func test_int_scrutinee_is_rejected_even_with_wildcard() -> Bool:
 		kind: CheckErrorKind,
 	) -> Bool:
 		match kind:
-			MatchRequiresUnion(_):
+			MatchRejection(MatchRequiresUnion(_)):
 				True
 			_:
 				False
@@ -339,7 +345,7 @@ pure func test_pattern_arity_and_constructor_shadowing() -> Bool:
 	shadow = VALUE + "pure func unwrap(Number: Value) -> Int:\n\tmatch Number:\n\t\tEmpty: 0\n\t\t"
 	rejects(prefix, "Number(): 0\n\t\tEmpty: 0\n", 0, 8, pure func(kind: CheckErrorKind) -> Bool:
 		match kind:
-			PatternMissingField(_, _):
+			MatchRejection(PatternMissingField(_, _)):
 				True
 			_:
 				False
@@ -347,7 +353,7 @@ pure func test_pattern_arity_and_constructor_shadowing() -> Bool:
 		kind: CheckErrorKind,
 	) -> Bool:
 		match kind:
-			PatternMissingField(_, _):
+			MatchRejection(PatternMissingField(_, _)):
 				True
 			_:
 				False
@@ -355,13 +361,13 @@ pure func test_pattern_arity_and_constructor_shadowing() -> Bool:
 		kind: CheckErrorKind,
 	) -> Bool:
 		match kind:
-			PatternUnexpectedField(_):
+			MatchRejection(PatternUnexpectedField(_)):
 				True
 			_:
 				False
 	) and rejects(shadow, "Number(item): item\n", 0, 12, pure func(kind: CheckErrorKind) -> Bool:
 		match kind:
-			UnknownConstructorPattern(_, _):
+			MatchRejection(UnknownConstructorPattern(_, _)):
 				True
 			_:
 				False
@@ -378,21 +384,21 @@ pure func test_usefulness_checks_variants_and_whole_catchalls() -> Bool:
 			kind: CheckErrorKind,
 		) -> Bool:
 			match kind:
-				UnreachableArm:
+				MatchRejection(UnreachableArm):
 					True
 				_:
 					False
 		)
 		and rejects(catchall, "Empty: 0\n", 0, 5, pure func(kind: CheckErrorKind) -> Bool:
 			match kind:
-				UnreachableArm:
+				MatchRejection(UnreachableArm):
 					True
 				_:
 					False
 		)
 		and rejects(covered, "_: 0\n", 0, 1, pure func(kind: CheckErrorKind) -> Bool:
 			match kind:
-				UnreachableArm:
+				MatchRejection(UnreachableArm):
 					True
 				_:
 					False
@@ -408,7 +414,7 @@ pure func test_missing_coverage_uses_keyword_span_and_payload_witness() -> Bool:
 	prefix = VALUE + UNWRAP
 	rejects(prefix, body, 0, 5, pure func(kind: CheckErrorKind) -> Bool:
 		match kind:
-			NonExhaustiveMatch(_):
+			MatchRejection(NonExhaustiveMatch(_)):
 				True
 			_:
 				False
@@ -420,13 +426,13 @@ pure func test_payload_type_and_value_mismatches() -> Bool:
 	argument = VALUE + "pure func empty() -> Value:\n\tEmpty\npure func make() -> Value:\n\t"
 	rejects(prefix, "Float)\n", 0, 5, pure func(kind: CheckErrorKind) -> Bool:
 		match kind:
-			UnsupportedPayloadAnnotation(_, IntegerPayload):
+			TypeDeclarationRejection(UnsupportedPayloadAnnotation(_, IntegerPayload)):
 				True
 			_:
 				False
 	) and rejects(argument, "Number(empty())\n", 0, 6, pure func(kind: CheckErrorKind) -> Bool:
 		match kind:
-			ArgumentTypeMismatch(_):
+			CallRejection(ArgumentTypeMismatch(_)):
 				True
 			_:
 				False
@@ -444,13 +450,13 @@ pure func test_purity_and_recursion_include_construction_arguments_and_hidden_ar
 	scrutinee = VALUE + "pure func copy(value: Value) -> Value:\n\tmatch "
 	rejects(argument, "impure())\n", 0, 6, pure func(kind: CheckErrorKind) -> Bool:
 		match kind:
-			ImpureCall(_, _):
+			CallRejection(ImpureCall(_, _)):
 				True
 			_:
 				False
 	) and rejects(arm, "impure(item)\n", 0, 6, pure func(kind: CheckErrorKind) -> Bool:
 		match kind:
-			ImpureCall(_, _):
+			CallRejection(ImpureCall(_, _)):
 				True
 			_:
 				False
@@ -467,7 +473,7 @@ pure func test_function_contract_diagnostics_precede_base_and_purity() -> Bool:
 	prefix = VALUE + impure_source + UNWRAP + "match value:\n\t\tEmpty: 0\n\t\tNumber(_): "
 	rejects(prefix, "impure(missing)\n", 0, 6, pure func(kind: CheckErrorKind) -> Bool:
 		match kind:
-			ArgumentCountMismatch(_):
+			CallRejection(ArgumentCountMismatch(_)):
 				True
 			_:
 				False

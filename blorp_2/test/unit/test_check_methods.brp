@@ -1,0 +1,153 @@
+import:
+	../../src/declarations: function_number
+	../../src/check: checked_functions
+	../../src/check_errors:
+		CallError(ArgumentCountMismatch, ImpureCall),
+		CheckErrorKind(CallRejection, ValueRejection),
+		ValueError(UnknownValue),
+	../../src/check_model:
+		CallTarget(UserFunction, RuntimeFunction),
+		CheckedBase(ReturnBinding),
+		CheckedBody(CheckedValueBody),
+		CheckedExit(ReturnExpression),
+		CheckedFunction,
+		CheckedOperation(InvokeFunction),
+	input: checked_source, rejects_at
+	test: TestSuite
+
+
+private pure func user_function_number(target: CallTarget) -> Option[Int]:
+	match target:
+		UserFunction(id, _):
+			Some(function_number(id))
+		RuntimeFunction(_):
+			None
+
+
+private pure func base_of(function: CheckedFunction) -> Option[CheckedBase]:
+	match function.body:
+		CheckedValueBody(ReturnExpression(value)):
+			Some(value.base)
+		_:
+			None
+
+
+private pure func operations_of(function: CheckedFunction) -> Option[List[CheckedOperation]]:
+	match function.body:
+		CheckedValueBody(ReturnExpression(value)):
+			Some(value.operations.map(
+				pure func(step): step.operation,
+			))
+		_:
+			None
+
+
+pure func test_parameter_does_not_shadow_ufcs_target() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|pure func use(identity: Int) -> Int:
+		|	identity.identity()
+		|func main() -> Int:
+		|	use(1)
+		|
+
+	match checked_source(source):
+		Err(_):
+			False
+		Ok(program):
+			match checked_functions(program).functions:
+				[_, use, _]:
+					match base_of(use):
+						Some(ReturnBinding(_)):
+							match operations_of(use):
+								Some([InvokeFunction(call, [])]):
+									user_function_number(call.target) == Some(0)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_ufcs_zero_parameter_target_teaches_direct_call() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|func zero() -> Int:
+		|	0
+		|func main() -> Int:
+		|	1.identity().zero()
+		|
+	rejects_at(source, 103, 107, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			CallRejection(ArgumentCountMismatch(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_ufcs_uses_containing_purity() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|func impure(value: Int) -> Int:
+		|	value
+		|pure func main() -> Int:
+		|	1.identity().impure()
+		|
+	rejects_at(source, 124, 130, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			CallRejection(ImpureCall(_, _)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_ufcs_recursion_is_checked() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|pure func loop(value: Int) -> Int:
+		|	value.identity().loop()
+		|func main() -> Int:
+		|	1.loop()
+		|
+	checked_source(source).is_ok()
+
+
+pure func test_ufcs_receiver_uses_caller_parameter_scope() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|func main() -> Int:
+		|	value.identity()
+		|
+	rejects_at(source, 67, 72, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			ValueRejection(UnknownValue(_)):
+				True
+			_:
+				False
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 callable scope and UFCS targets",
+	tests = [
+		("parameter does not shadow UFCS target", test_parameter_does_not_shadow_ufcs_target),
+		(
+			"UFCS zero-parameter target teaches direct call",
+			test_ufcs_zero_parameter_target_teaches_direct_call,
+		),
+		("UFCS uses containing purity", test_ufcs_uses_containing_purity),
+		("UFCS recursion is checked", test_ufcs_recursion_is_checked),
+		(
+			"UFCS receiver uses caller parameter scope",
+			test_ufcs_receiver_uses_caller_parameter_scope,
+		),
+	]
+}

@@ -1,10 +1,15 @@
 import:
-	../../src/check as Check
+	../../src/check: CheckFailure, check, check_errors, checked_functions
+	../../src/check_errors as Errors
+	../../src/check_model as Check
 	../../src/check_render: render_failure
 	../../src/declarations: function_number, union_number, variant_number, variant_owner
 	../../src/names: find_name
 	../../src/namespace:
-		ImportProblem(MissingImportedUnion, AmbiguousImportedUnion, MissingImportedVariant, RepeatedImportedVariant, ImportedTypeConflict),
+		ImportProblem(
+			MissingImportedUnion, AmbiguousImportedUnion, MissingImportedVariant,
+			RepeatedImportedVariant, ImportedTypeConflict,
+		),
 		TypeCandidate(UnionCandidate),
 		build_namespace,
 		import_problems,
@@ -29,17 +34,17 @@ private pure func modules(root: String, dependency: String) -> Result[ParsedProg
 	parse_modules([{ source = root, targets = [1] }, { source = dependency, targets = [] }])
 
 
-private pure func rejected(root: String, dependency: String) -> Option[Check.CheckFailure]:
+private pure func rejected(root: String, dependency: String) -> Option[CheckFailure]:
 	match modules(root, dependency):
 		Err(_): None
 		Ok(parsed):
-			match Check.check(parsed):
+			match check(parsed):
 				Ok(_): None
 				Err(failure): Some(failure)
 
 
 private pure func rendered_is(
-	failure: Check.CheckFailure,
+	failure: CheckFailure,
 	start: Int,
 	end: Int,
 	message: String,
@@ -54,7 +59,7 @@ private pure func rendered_is(
 			same_source(span.source, module_source(root_module_id())) and span.start == expected[0] and span.end == expected[1]
 		_: False
 	(
-		Check.check_errors(failure).remaining.is_empty()
+		check_errors(failure).remaining.is_empty()
 		and rendered.remaining.is_empty()
 		and same_source(error.span.source, module_source(root_module_id()))
 		and error.span.start == start and error.span.end == end
@@ -160,7 +165,7 @@ pure func test_same_spelling_constructors_keep_distinct_union_owners() -> Bool:
 				Some(name):
 					match variant_candidates(namespace, root_module_id(), name):
 						[left, right]:
-							union_number(variant_owner(left)) != union_number(variant_owner(right)) and variant_number(left) == 0 and variant_number(right) == 0 and Check.check(parsed).is_ok()
+							union_number(variant_owner(left)) != union_number(variant_owner(right)) and variant_number(left) == 0 and variant_number(right) == 0 and check(parsed).is_ok()
 						_: False
 				None: False
 
@@ -169,8 +174,8 @@ pure func test_missing_union_has_typed_error_and_exact_diagnostic() -> Bool:
 	prefix = "import:\n    ./option: "
 	match rejected(prefix + "Missing()\nfunc main() -> Int:\n    0\n", OPTION):
 		Some(failure):
-			match Check.check_errors(failure).first.kind:
-				Check.ImportRejected(MissingImportedUnion(_)):
+			match check_errors(failure).first.kind:
+				Errors.ImportRejection(Errors.ImportRejected(MissingImportedUnion(_))):
 					rendered_is(failure, prefix.length(), prefix.length() + 7, "unknown imported union", "select a fixed union declared or ordinarily imported by that module", None)
 				_: False
 		None: False
@@ -181,8 +186,8 @@ pure func test_wrong_union_member_has_typed_error_and_exact_diagnostic() -> Bool
 	dependency = OPTION + "fixed union Other:\n    Elsewhere\n"
 	match rejected(prefix + "Elsewhere)\nfunc main() -> Int:\n    0\n", dependency):
 		Some(failure):
-			match Check.check_errors(failure).first.kind:
-				Check.ImportRejected(MissingImportedVariant(_)):
+			match check_errors(failure).first.kind:
+				Errors.ImportRejection(Errors.ImportRejected(MissingImportedVariant(_))):
 					rendered_is(failure, prefix.length(), prefix.length() + 9, "constructor does not belong to the selected union", "select a constructor declared inside that union", None)
 				_: False
 		None: False
@@ -193,8 +198,8 @@ pure func test_repeated_constructor_retains_both_occurrence_spans() -> Bool:
 	current = prefix + "TestSome, "
 	match rejected(current + "TestSome)\nfunc main() -> Int:\n    0\n", OPTION):
 		Some(failure):
-			match Check.check_errors(failure).first.kind:
-				Check.ImportRejected(RepeatedImportedVariant(_, previous)):
+			match check_errors(failure).first.kind:
+				Errors.ImportRejection(Errors.ImportRejected(RepeatedImportedVariant(_, previous))):
 					previous.start == prefix.length() and previous.end == prefix.length() + "TestSome".length() and rendered_is(failure, current.length(), current.length() + "TestSome".length(), "constructor selected more than once", "list each selected constructor once", Some((prefix.length(), prefix.length() + "TestSome".length())))
 				_: False
 		None: False
@@ -212,7 +217,7 @@ pure func test_repeated_type_selector_is_idempotent() -> Bool:
 		Ok(parsed):
 			namespace = build_namespace(parsed)
 			match find_name(parsed_contents(parsed).names, "TestOption"):
-				Some(name): type_candidates(namespace, root_module_id(), name).length() == 1 and import_problems(namespace).is_empty() and Check.check(parsed).is_ok()
+				Some(name): type_candidates(namespace, root_module_id(), name).length() == 1 and import_problems(namespace).is_empty() and check(parsed).is_ok()
 				None: False
 
 
@@ -222,8 +227,8 @@ pure func test_local_type_conflict_is_rejected_before_signatures() -> Bool:
 	root = declaration + "TestOption:\n    Local\nfunc main() -> Int:\n    0\n"
 	match rejected(root, OPTION):
 		Some(failure):
-			match Check.check_errors(failure).first.kind:
-				Check.ImportRejected(ImportedTypeConflict(_, previous)):
+			match check_errors(failure).first.kind:
+				Errors.ImportRejection(Errors.ImportRejected(ImportedTypeConflict(_, previous))):
 					previous.start == declaration.length() and rendered_is(failure, prefix.length(), prefix.length() + "TestOption".length(), "imported type conflicts with another type", "give the types distinct names or remove the duplicate import", Some((declaration.length(), declaration.length() + "TestOption".length())))
 				_: False
 		None: False
@@ -250,10 +255,10 @@ pure func test_duplicate_dependency_union_is_rejected_before_signatures() -> Boo
 	declaration = OPTION + "fixed union "
 	match (rejected(root, declaration + "TestOption:\n    Another\npure func make() -> Int:\n    0\n"), module_id(1)):
 		(Some(failure), Some(dependency)):
-			match Check.check_errors(failure).first.kind:
-				Check.DuplicateUnion(_, Check.SourceTypeDeclaration(previous)):
+			match check_errors(failure).first.kind:
+				Errors.TypeDeclarationRejection(Errors.DuplicateUnion(_, Errors.SourceTypeDeclaration(previous))):
 					rendered = render_failure(failure)
-					Check.check_errors(failure).remaining.is_empty() and rendered.remaining.is_empty() and same_source(previous.source, module_source(dependency)) and previous.start == "fixed union ".length() and same_source(rendered.first.span.source, module_source(dependency)) and rendered.first.span.start == declaration.length() and rendered.first.span.end == declaration.length() + "TestOption".length() and rendered.first.message == "duplicate union type name" and rendered.first.help == "give union types distinct names; foundational types are declared by the base module" and rendered.first.note.is_none()
+					check_errors(failure).remaining.is_empty() and rendered.remaining.is_empty() and same_source(previous.source, module_source(dependency)) and previous.start == "fixed union ".length() and same_source(rendered.first.span.source, module_source(dependency)) and rendered.first.span.start == declaration.length() and rendered.first.span.end == declaration.length() + "TestOption".length() and rendered.first.message == "duplicate union type name" and rendered.first.help == "give union types distinct names; foundational types are declared by the base module" and rendered.first.note.is_none()
 				_: False
 		_: False
 
@@ -293,11 +298,11 @@ pure func test_constructor_function_conflict_notes_import_selector() -> Bool:
 	]):
 		Err(_): False
 		Ok(parsed):
-			match Check.check(parsed):
+			match check(parsed):
 				Ok(_): False
 				Err(failure):
-					match Check.check_errors(failure).first.kind:
-						Check.ImportedConstructorConflict(_, origin):
+					match check_errors(failure).first.kind:
+						Errors.ImportRejection(Errors.ImportedConstructorConflict(_, origin)):
 							same_source(origin.source, module_source(root_module_id())) and rendered_is(failure, current.length(), current.length() + "TestSome".length(), "imported constructor conflicts with a function", "give the constructor and function distinct names", Some((previous.length(), previous.length() + "TestSome".length())))
 						_: False
 
@@ -308,8 +313,8 @@ pure func test_constructor_function_conflict_notes_local_declaration() -> Bool:
 	root = declaration + "TestSome() -> Int:\n    1\nfunc main() -> Int:\n    0\n"
 	match rejected(root, OPTION):
 		Some(failure):
-			match Check.check_errors(failure).first.kind:
-				Check.ImportedConstructorConflict(_, origin):
+			match check_errors(failure).first.kind:
+				Errors.ImportRejection(Errors.ImportedConstructorConflict(_, origin)):
 					origin.start == declaration.length() and rendered_is(failure, prefix.length(), prefix.length() + "TestSome".length(), "imported constructor conflicts with a function", "give the constructor and function distinct names", Some((declaration.length(), declaration.length() + "TestSome".length())))
 				_: False
 		None: False
@@ -348,9 +353,9 @@ pure func test_explicit_formatter_import_resolves_original_function() -> Bool:
 		|
 	match (modules(root, FORMATTER), module_id(1)):
 		(Ok(parsed), Some(dependency)):
-			match (Check.check(parsed), find_name(parsed_contents(parsed).names, "to_string")):
+			match (check(parsed), find_name(parsed_contents(parsed).names, "to_string")):
 				(Ok(checked), Some(name)):
-					match (Check.checked_functions(checked).functions.get(0), function_candidates(build_namespace(parsed), dependency, name)):
+					match (checked_functions(checked).functions.get(0), function_candidates(build_namespace(parsed), dependency, name)):
 						(Some(function), [declared]):
 							match function.body:
 								Check.CheckedValueBody(Check.ReturnExpression(value)):
@@ -376,11 +381,11 @@ pure func test_unimported_loaded_formatter_is_not_visible() -> Bool:
 	match parse_modules([{ source = root, targets = [] }, { source = FORMATTER, targets = [] }]):
 		Err(_): False
 		Ok(parsed):
-			match Check.check(parsed):
+			match check(parsed):
 				Ok(_): False
 				Err(failure):
-					match Check.check_errors(failure).first.kind:
-						Check.UnknownFunction(_): True
+					match check_errors(failure).first.kind:
+						Errors.CallRejection(Errors.UnknownFunction(_)): True
 						_: False
 
 
@@ -391,11 +396,11 @@ pure func test_two_explicit_formatter_imports_keep_exact_conflict_diagnostic() -
 	match parse_modules([{ source = root, targets = [1, 2] }, { source = FORMATTER, targets = [] }, { source = FORMATTER, targets = [] }]):
 		Err(_): False
 		Ok(parsed):
-			match Check.check(parsed):
+			match check(parsed):
 				Ok(_): False
 				Err(failure):
-					match Check.check_errors(failure).first.kind:
-						Check.ImportedFunctionConflict(_, origin):
+					match check_errors(failure).first.kind:
+						Errors.ImportRejection(Errors.ImportedFunctionConflict(_, origin)):
 							origin.start == previous.length() and rendered_is(failure, current.length(), current.length() + "to_string".length(), "imported function conflicts with another function", "give the functions distinct names or remove the duplicate import", Some((previous.length(), previous.length() + "to_string".length())))
 						_: False
 

@@ -2,14 +2,14 @@ import:
 	../../src/declarations as Declaration
 	../../src/source: module_source, root_module_id
 	../../src/namespace: ImportProblem(ImportedTypeConflict)
-	../../src/check as Check
+	../../src/check: CheckedProgram, checked_functions
+	../../src/check_errors as Errors
+	../../src/check_model as Check
 	../../src/check_render: render_failure
 	../../src/lex: lex
-	../../src/syntax:
-		Diagnostic,
-		DiagnosticNote(PreviousField, RecordFieldDeclaration, TypeDeclaration),
+	../../src/syntax: Diagnostic, DiagnosticNote(PreviousField, RecordFieldDeclaration)
 	input: check, check_failure, parse, setup_diagnostic, check_modules_failure
-	module_input: ModuleInput, PRIMITIVE_BASE, INTEGER_OPERATIONS, STRING_OPERATIONS, parse_modules_with_base
+	module_input: ModuleInput, PRIMITIVE_BASE, INTEGER_OPERATIONS, parse_modules_with_base
 	test: TestSuite
 
 
@@ -40,7 +40,7 @@ private BAD_PREFIX: String =
 	|
 
 
-private pure func checked(source: String) -> Result[Check.CheckedProgram, Diagnostic]:
+private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
 	tokens ?= lex(module_source(root_module_id()), source)
 	parsed ?= parse(tokens)
 	check(parsed).map_err(setup_diagnostic)
@@ -58,7 +58,7 @@ private pure func rejects(
 	prefix: String,
 	marked: String,
 	suffix: String,
-	matches: pure (Check.CheckErrorKind) -> Bool,
+	matches: pure (Errors.CheckErrorKind) -> Bool,
 ) -> Bool:
 	match check_failure(prefix + marked + suffix):
 		Some(error):
@@ -75,7 +75,7 @@ private pure func rejects_modules(
 	inputs: List[ModuleInput],
 	prefix: String,
 	marked: String,
-	matches: pure (Check.CheckErrorKind) -> Bool,
+	matches: pure (Errors.CheckErrorKind) -> Bool,
 ) -> Bool:
 	match check_modules_failure(inputs, PRIMITIVE_BASE):
 		Some(error):
@@ -91,7 +91,7 @@ private pure func rejects_modules(
 pure func test_checked_fields_keep_nominal_owner_and_written_order() -> Bool:
 	match checked(PAIR + MAKE + READ + MAIN):
 		Ok(program):
-			contents = Check.checked_functions(program)
+			contents = checked_functions(program)
 
 			match contents.records:
 				[declaration]:
@@ -185,7 +185,7 @@ pure func test_field_postfix_never_infers_literal_shape() -> Bool:
 	prefix = PAIR + main_prefix + "\t"
 	rejects(prefix, "{ first = 7, second = 9 }", ".first\n", pure func(kind):
 		match kind:
-			Check.RecordNeedsExpectedType:
+			Errors.RecordRejection(Errors.RecordNeedsExpectedType):
 				True
 			_:
 				False
@@ -204,7 +204,7 @@ pure func test_generic_ufcs_does_not_supply_context() -> Bool:
 		kind,
 	):
 		match kind:
-			Check.RecordNeedsExpectedType:
+			Errors.RecordRejection(Errors.RecordNeedsExpectedType):
 				True
 			_:
 				False
@@ -223,7 +223,7 @@ pure func test_earlier_generic_argument_does_not_contextualize_later_literal() -
 		kind,
 	):
 		match kind:
-			Check.RecordNeedsExpectedType:
+			Errors.RecordRejection(Errors.RecordNeedsExpectedType):
 				True
 			_:
 				False
@@ -248,7 +248,7 @@ pure func test_identical_layouts_are_nominally_distinct() -> Bool:
 		|
 	rejects(PAIR + MAKE + other + "\t", "make_pair()", "\n" + MAIN, pure func(kind):
 		match kind:
-			Check.ExpressionTypeMismatch(mismatch):
+			Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
 				match mismatch.actual.value_type:
 					Check.RecordType(actual):
 						match mismatch.expected:
@@ -271,7 +271,7 @@ pure func test_structural_errors_precede_children() -> Bool:
 		kind,
 	):
 		match kind:
-			Check.UnknownRecordField(_, _):
+			Errors.RecordRejection(Errors.UnknownRecordField(_, _)):
 				True
 			_:
 				False
@@ -284,7 +284,7 @@ pure func test_missing_fields_precede_children() -> Bool:
 		|
 	rejects(PAIR + helper_prefix + "\t", "{ first = missing }", "\n" + MAIN, pure func(kind):
 		match kind:
-			Check.MissingRecordField(field, _):
+			Errors.RecordRejection(Errors.MissingRecordField(field, _)):
 				Check.field_number(field) == 1
 			_:
 				False
@@ -297,7 +297,7 @@ pure func test_empty_literal_reports_first_missing_field() -> Bool:
 		|
 	rejects(PAIR + helper_prefix + "\t", "{}", "\n" + MAIN, pure func(kind):
 		match kind:
-			Check.MissingRecordField(field, _):
+			Errors.RecordRejection(Errors.MissingRecordField(field, _)):
 				Check.field_number(field) == 0
 			_:
 				False
@@ -312,7 +312,7 @@ pure func test_duplicate_literal_highlights_second_name() -> Bool:
 		kind,
 	):
 		match kind:
-			Check.DuplicateLiteralField(_, _):
+			Errors.RecordRejection(Errors.DuplicateLiteralField(_, _)):
 				True
 			_:
 				False
@@ -330,7 +330,7 @@ pure func test_child_errors_precede_sibling_type_mismatch() -> Bool:
 		kind,
 	):
 		match kind:
-			Check.UnknownValue(_):
+			Errors.ValueRejection(Errors.UnknownValue(_)):
 				True
 			_:
 				False
@@ -348,7 +348,7 @@ pure func test_field_type_error_covers_complete_child_and_annotation() -> Bool:
 		kind,
 	):
 		match kind:
-			Check.RecordFieldTypeMismatch(field, actual, annotation):
+			Errors.RecordRejection(Errors.RecordFieldTypeMismatch(field, actual, annotation)):
 				(
 					Check.field_number(field) == 0
 					and annotation.start == INT_IMPORT.length() + 27
@@ -363,7 +363,7 @@ pure func test_field_type_error_covers_complete_child_and_annotation() -> Bool:
 pure func test_unknown_projection_covers_field_name() -> Bool:
 	rejects(PAIR + MAKE + "func main() -> Int:\n\tmake_pair().", "third", "\n", pure func(kind):
 		match kind:
-			Check.UnknownRecordField(_, _):
+			Errors.RecordRejection(Errors.UnknownRecordField(_, _)):
 				True
 			_:
 				False
@@ -373,7 +373,7 @@ pure func test_unknown_projection_covers_field_name() -> Bool:
 pure func test_nonrecord_projection_requires_parentheses_for_calls() -> Bool:
 	rejects("func main() -> Int:\n\t7.", "length", "\n", pure func(kind):
 		match kind:
-			Check.FieldRequiresRecord(actual):
+			Errors.RecordRejection(Errors.FieldRequiresRecord(actual)):
 				Check.same_type(actual, Check.IntType)
 			_:
 				False
@@ -383,7 +383,7 @@ pure func test_nonrecord_projection_requires_parentheses_for_calls() -> Bool:
 pure func test_known_nonint_fields_reject_even_unused() -> Bool:
 	rejects("fixed record Bad { value: ", "String", " }\n" + MAIN, pure func(kind):
 		match kind:
-			Check.UnsupportedRecordField(actual):
+			Errors.TypeDeclarationRejection(Errors.UnsupportedRecordField(actual)):
 				Check.same_type(actual, Check.StringType)
 			_:
 				False
@@ -393,7 +393,7 @@ pure func test_known_nonint_fields_reject_even_unused() -> Bool:
 pure func test_unknown_field_annotation_remains_unknown_type() -> Bool:
 	rejects("fixed record Bad { value: ", "Unknown", " }\n" + MAIN, pure func(kind):
 		match kind:
-			Check.UnknownType(_):
+			Errors.TypeTermRejection(Errors.UnknownType(_)):
 				True
 			_:
 				False
@@ -403,7 +403,7 @@ pure func test_unknown_field_annotation_remains_unknown_type() -> Bool:
 pure func test_record_union_conflict_highlights_later_name() -> Bool:
 	rejects(PAIR + "fixed union ", "Pair", ":\n\tOnly\n" + MAIN, pure func(kind):
 		match kind:
-			Check.DuplicateRecordType(_, Check.SourceTypeDeclaration(previous)):
+			Errors.TypeDeclarationRejection(Errors.DuplicateRecordType(_, Errors.SourceTypeDeclaration(previous))):
 				previous.start == 13 and previous.end == 17
 			_:
 				False
@@ -415,7 +415,7 @@ pure func test_union_record_conflict_highlights_later_name() -> Bool:
 		kind,
 	):
 		match kind:
-			Check.DuplicateRecordType(_, Check.SourceTypeDeclaration(previous)):
+			Errors.TypeDeclarationRejection(Errors.DuplicateRecordType(_, Errors.SourceTypeDeclaration(previous))):
 				previous.start == 12 and previous.end == 16
 			_:
 				False
@@ -427,7 +427,7 @@ pure func test_type_parameter_conflicts_with_record() -> Bool:
 		kind,
 	):
 		match kind:
-			Check.TypeParameterTypeNameConflict(_):
+			Errors.TypeDeclarationRejection(Errors.TypeParameterTypeNameConflict(_)):
 				True
 			_:
 				False
@@ -499,7 +499,7 @@ pure func test_duplicate_declaration_field_reports_previous_name() -> Bool:
 	prefix = "fixed record Pair { first: Int, "
 	rejects(prefix, "first", ": Int }\n" + MAIN, pure func(kind):
 		match kind:
-			Check.DuplicateRecordField(_, previous):
+			Errors.TypeDeclarationRejection(Errors.DuplicateRecordField(_, previous)):
 				previous.start == 20 and previous.end == 25
 			_:
 				False
@@ -513,7 +513,7 @@ pure func test_duplicate_declaration_field_reports_previous_name() -> Bool:
 pure func test_record_name_conflicts_with_base() -> Bool:
 	rejects("fixed record ", "Int", " { first: Int }\n" + MAIN, pure func(kind):
 		match kind:
-			Check.ImportRejected(ImportedTypeConflict(_, _)):
+			Errors.ImportRejection(Errors.ImportRejected(ImportedTypeConflict(_, _))):
 				True
 			_:
 				False

@@ -1,7 +1,9 @@
 import:
 	../../src/declarations as Declaration
 	../../src/source: module_source, root_module_id
-	../../src/check as Checked
+	../../src/check: CheckedProgram, check, checked_functions
+	../../src/check_errors as Errors
+	../../src/check_model as Checked
 	../../src/check_render as Renderer
 	../../src/lex: lex
 	../../src/specialize as Concrete
@@ -17,11 +19,10 @@ private CHOICE: String =
 	|
 
 
-private pure func checked(source: String) -> Result[Checked.CheckedProgram, Diagnostic]:
+private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
 	tokens ?= lex(module_source(root_module_id()), source)
 	parsed ?= parse(tokens)
-	Checked
-		.check(parsed)
+	check(parsed)
 		.map_err(setup_diagnostic)
 
 
@@ -56,7 +57,7 @@ pure func test_generic_concrete_receiver_still_has_no_constructor_hint() -> Bool
 	match check_failure(prefix + "Number(8).receiver(7)\n"):
 		Some(error):
 			match error.kind:
-				Checked.ConstructorNeedsExpectedType(_):
+				Errors.ConstructorRejection(Errors.ConstructorNeedsExpectedType(_)):
 					error.span.start == prefix.length() and error.span.end == prefix.length() + 6
 				_:
 					False
@@ -118,7 +119,7 @@ pure func test_three_parameters_reach_concrete_signatures_and_bindings() -> Bool
 
 	match checked(source):
 		Ok(program):
-			match Checked.checked_functions(program).functions:
+			match checked_functions(program).functions:
 				[_, third, main]:
 					match third.signature.type_parameters:
 						[first, second, last]:
@@ -202,7 +203,7 @@ pure func test_unused_body_keeps_distinct_rigid_parameter_positions() -> Bool:
 	match check_failure(prefix + "second\n" + MAIN):
 		Some(error):
 			match error.kind:
-				Checked.ExpressionTypeMismatch(mismatch):
+				Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
 					match mismatch.expected:
 						Checked.ParameterType(first):
 							match mismatch.actual.value_type:
@@ -235,7 +236,7 @@ pure func test_duplicate_parameters_are_owned_semantic_errors() -> Bool:
 	match check_failure(prefix + declaration_source + MAIN):
 		Some(error):
 			match error.kind:
-				Checked.DuplicateTypeParameter(current, previous, first):
+				Errors.TypeDeclarationRejection(Errors.DuplicateTypeParameter(current, previous, first)):
 					(
 						parameter_is(current, 0, 2)
 						and parameter_is(previous, 0, 0)
@@ -266,7 +267,7 @@ pure func test_first_missing_parameter_precedes_an_ordinary_mismatch() -> Bool:
 	], PRIMITIVE_BASE):
 		Some(error):
 			match error.kind:
-				Checked.UninferableTypeParameter(parameter):
+				Errors.CallRejection(Errors.UninferableTypeParameter(parameter)):
 					(
 						parameter_is(parameter, 0, 1)
 						and error.span.start == prefix.length()
@@ -290,7 +291,7 @@ pure func test_expected_result_does_not_infer_missing_parameters() -> Bool:
 	match check_failure(prefix + "empty(7)\n" + MAIN):
 		Some(error):
 			match error.kind:
-				Checked.UninferableTypeParameter(parameter):
+				Errors.CallRejection(Errors.UninferableTypeParameter(parameter)):
 					(
 						parameter_is(parameter, 0, 1)
 						and error.span.start == prefix.length()
@@ -318,7 +319,7 @@ pure func test_runtime_order_selects_conflict_across_parameters() -> Bool:
 	], PRIMITIVE_BASE):
 		Some(error):
 			match error.kind:
-				Checked.GenericArgumentConflict(conflict):
+				Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
 					(
 						parameter_is(conflict.parameter, 0, 1)
 						and conflict.mismatch.argument_position == 2
@@ -353,7 +354,7 @@ pure func test_generic_conflict_precedes_earlier_ordinary_mismatch() -> Bool:
 	], PRIMITIVE_BASE):
 		Some(error):
 			match error.kind:
-				Checked.GenericArgumentConflict(conflict):
+				Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
 					(
 						parameter_is(conflict.parameter, 0, 0)
 						and conflict.mismatch.argument_position == 2
@@ -384,7 +385,7 @@ pure func test_unknown_later_child_precedes_generic_conflict() -> Bool:
 	], PRIMITIVE_BASE):
 		Some(error):
 			match error.kind:
-				Checked.UnknownValue(_):
+				Errors.ValueRejection(Errors.UnknownValue(_)):
 					error.span.start == prefix.length() and error.span.end == prefix.length() + 7
 				_:
 					False
@@ -412,13 +413,13 @@ pure func test_structural_conflict_keeps_first_candidate_and_annotation_origin()
 	match check_failure(prefix + "text())\n"):
 		Some(error):
 			match error.kind:
-				Checked.GenericArgumentConflict(conflict):
+				Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
 					match conflict.mismatch.expected:
 						Checked.AppliedUnionType(expected_owner, [Checked.IntType]):
 							match conflict.mismatch.actual.value_type:
 								Checked.AppliedUnionType(actual_owner, [Checked.StringType]):
 									match conflict.mismatch.expected_site:
-										Checked.SourceAnnotation(annotation):
+										Errors.SourceAnnotation(annotation):
 											(
 												parameter_is(conflict.parameter, 2, 0)
 												and conflict.mismatch.argument_position == 3
@@ -473,7 +474,7 @@ pure func test_forwarding_substitution_is_permuted_and_caller_owned() -> Bool:
 
 	match checked(source):
 		Ok(program):
-			match Checked.checked_functions(program).functions:
+			match checked_functions(program).functions:
 				[second, forward, _]:
 					match forward.signature.type_parameters:
 						[left, right]:
@@ -682,7 +683,7 @@ pure func test_ordered_calls_and_instances_preserve_int_string_permutation() -> 
 
 	match checked(SECOND + main_source):
 		Ok(program):
-			match Checked.checked_functions(program).functions:
+			match checked_functions(program).functions:
 				[_, main]:
 					match main.statements:
 						[Checked.InitializeBinding(_, first), Checked.InitializeBinding(_, second)]:
@@ -729,9 +730,9 @@ pure func test_ordered_calls_and_instances_preserve_int_string_permutation() -> 
 pure func test_duplicate_renderer_uses_typed_error_without_rechecking() -> Bool:
 	match lex(module_source(root_module_id()), SECOND + MAIN).and_then(pure func(tokens): parse(tokens)):
 		Ok(parsed):
-			match Checked.check(parsed):
+			match check(parsed):
 				Ok(program):
-					match Checked.checked_functions(program).functions:
+					match checked_functions(program).functions:
 						[function, _]:
 							match function.signature.type_parameters:
 								[first, second]:
@@ -740,9 +741,9 @@ pure func test_duplicate_renderer_uses_typed_error_without_rechecking() -> Bool:
 										start = 26,
 										end = 27
 									}
-									error: Checked.CheckError = {
+									error: Errors.CheckError = {
 										span = primary,
-										kind = Checked.DuplicateTypeParameter(
+										kind = Errors.TypeDeclarationRejection(Errors.DuplicateTypeParameter(
 											second,
 											first,
 											{
@@ -750,7 +751,7 @@ pure func test_duplicate_renderer_uses_typed_error_without_rechecking() -> Bool:
 												start = 23,
 												end = 24
 											},
-										)
+										))
 									}
 									rendered = Renderer.render_check_error(parsed, error)
 									(

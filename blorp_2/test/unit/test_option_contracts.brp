@@ -1,5 +1,7 @@
 import:
-	../../src/check as Check
+	../../src/check: CheckFailure, CheckedProgram, check, check_errors, checked_functions
+	../../src/check_errors as Errors
+	../../src/check_model as Check
 	../../src/check_render: render_failure
 	../../src/declarations: union_number, variant_number, variant_owner
 	../../src/lower as Lower
@@ -40,24 +42,24 @@ private READ_LABEL: String = "\"list.get\""
 private READ_BODY: String = "\n    builtin(\"list.get\", Present, Missing)\n"
 
 
-private pure func checked(source: String) -> Result[Check.CheckedProgram, Diagnostic]:
+private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
 	parsed ?= parse_modules([{ source = source, targets = [] }])
-	Check.check(parsed).map_err(setup_diagnostic)
+	check(parsed).map_err(setup_diagnostic)
 
 
-private pure func rejected(source: String) -> Option[Check.CheckFailure]:
+private pure func rejected(source: String) -> Option[CheckFailure]:
 	match parse_modules([{ source = source, targets = [] }]):
 		Err(_): None
 		Ok(parsed):
-			match Check.check(parsed):
+			match check(parsed):
 				Err(failure): Some(failure)
 				Ok(_): None
 
 
-private pure func rendered_is(failure: Check.CheckFailure, start: Int, end: Int, message: String, help: String) -> Bool:
+private pure func rendered_is(failure: CheckFailure, start: Int, end: Int, message: String, help: String) -> Bool:
 	rendered = render_failure(failure)
 	(
-		Check.check_errors(failure).remaining.is_empty()
+		check_errors(failure).remaining.is_empty()
 		and rendered.remaining.is_empty()
 		and same_source(rendered.first.span.source, module_source(root_module_id()))
 		and rendered.first.span.start == start and rendered.first.span.end == end
@@ -70,7 +72,7 @@ pure func test_checked_roles_preserve_generic_declaration_and_reversed_order() -
 	match checked(UNION + HEADER + BODY + PARSE_MAIN):
 		Err(_): False
 		Ok(program):
-			match Check.checked_functions(program).functions.get(0):
+			match checked_functions(program).functions.get(0):
 				Some(function):
 					match (function.signature.return_type.value_type, function.body):
 						(Check.AppliedUnionType(owner, [Check.IntType]), Check.CheckedValueBody(Check.ReturnExpression(value))):
@@ -140,8 +142,8 @@ private pure func rejects_header(header: String) -> Bool:
 	start = UNION.length() + header.length() + "\n    builtin(".length()
 	match rejected(UNION + header + BODY + MAIN):
 		Some(failure):
-			match Check.check_errors(failure).first.kind:
-				Check.BuiltinContractMismatch(Builtins.StringParseInt(_)):
+			match check_errors(failure).first.kind:
+				Errors.BuiltinRejection(Errors.BuiltinContractMismatch(Builtins.StringParseInt(_))):
 					rendered_is(failure, start, start + LABEL.length(), "builtin declaration does not match its runtime contract", "declare a pure nongeneric function with one String parameter returning a two-variant union of Int and an empty case")
 				_: False
 		None: False
@@ -169,7 +171,7 @@ private fixed union DiagnosticSite:
 	AbsentRole
 
 
-private pure func rejects_roles(declaration: String, present: String, absent: String, expected: Check.CheckErrorKind, message: String, help: String, site: DiagnosticSite) -> Bool:
+private pure func rejects_roles(declaration: String, present: String, absent: String, expected: Errors.CheckErrorKind, message: String, help: String, site: DiagnosticSite) -> Bool:
 	prefix = declaration + HEADER + "\n    builtin(" + LABEL
 	(start, length) = match site:
 		BuiltinLabel: (declaration.length() + HEADER.length() + "\n    builtin(".length(), LABEL.length())
@@ -177,39 +179,39 @@ private pure func rejects_roles(declaration: String, present: String, absent: St
 		AbsentRole: (prefix.length() + 2 + present.length() + 2, absent.length())
 	match rejected(prefix + ", " + present + ", " + absent + ")\n" + MAIN):
 		Some(failure):
-			kind_matches = match (Check.check_errors(failure).first.kind, expected):
-				(Check.BuiltinRolePayload, Check.BuiltinRolePayload): True
-				(Check.BuiltinRoleCoverage, Check.BuiltinRoleCoverage): True
+			kind_matches = match (check_errors(failure).first.kind, expected):
+				(Errors.BuiltinRejection(Errors.BuiltinRolePayload), Errors.BuiltinRejection(Errors.BuiltinRolePayload)): True
+				(Errors.BuiltinRejection(Errors.BuiltinRoleCoverage), Errors.BuiltinRejection(Errors.BuiltinRoleCoverage)): True
 				_: False
 			kind_matches and rendered_is(failure, start, start + length, message, help)
 		None: False
 
 
 pure func test_swapped_roles_have_exact_payload_error() -> Bool:
-	rejects_roles(UNION, "Missing", "Present", Check.BuiltinRolePayload, "builtin constructor has the wrong payload", "bind the required payload constructor first and the empty constructor second", PresentRole)
+	rejects_roles(UNION, "Missing", "Present", Errors.BuiltinRejection(Errors.BuiltinRolePayload), "builtin constructor has the wrong payload", "bind the required payload constructor first and the empty constructor second", PresentRole)
 
 pure func test_repeated_role_has_exact_coverage_error() -> Bool:
-	rejects_roles(UNION, "Present", "Present", Check.BuiltinRoleCoverage, "builtin constructors must cover the complete result union", "bind two distinct constructors and declare exactly those two variants", BuiltinLabel)
+	rejects_roles(UNION, "Present", "Present", Errors.BuiltinRejection(Errors.BuiltinRoleCoverage), "builtin constructors must cover the complete result union", "bind two distinct constructors and declare exactly those two variants", BuiltinLabel)
 
 pure func test_extra_variant_has_exact_coverage_error() -> Bool:
-	rejects_roles(UNION + "    Extra\n", "Present", "Missing", Check.BuiltinRoleCoverage, "builtin constructors must cover the complete result union", "bind two distinct constructors and declare exactly those two variants", BuiltinLabel)
+	rejects_roles(UNION + "    Extra\n", "Present", "Missing", Errors.BuiltinRejection(Errors.BuiltinRoleCoverage), "builtin constructors must cover the complete result union", "bind two distinct constructors and declare exactly those two variants", BuiltinLabel)
 
 pure func test_present_role_requires_a_payload() -> Bool:
-	rejects_roles("fixed union Maybe[T]:\n    Missing\n    Present\n", "Present", "Missing", Check.BuiltinRolePayload, "builtin constructor has the wrong payload", "bind the required payload constructor first and the empty constructor second", PresentRole)
+	rejects_roles("fixed union Maybe[T]:\n    Missing\n    Present\n", "Present", "Missing", Errors.BuiltinRejection(Errors.BuiltinRolePayload), "builtin constructor has the wrong payload", "bind the required payload constructor first and the empty constructor second", PresentRole)
 
 pure func test_present_role_requires_the_instantiated_int_payload() -> Bool:
 	header = "pure func parse_number(text: String) -> Maybe[String]:"
 	prefix = UNION + header + "\n    builtin(" + LABEL + ", "
 	match rejected(UNION + header + BODY + MAIN):
 		Some(failure):
-			match Check.check_errors(failure).first.kind:
-				Check.BuiltinRolePayload:
+			match check_errors(failure).first.kind:
+				Errors.BuiltinRejection(Errors.BuiltinRolePayload):
 					rendered_is(failure, prefix.length(), prefix.length() + "Present".length(), "builtin constructor has the wrong payload", "bind the required payload constructor first and the empty constructor second")
 				_: False
 		None: False
 
 pure func test_absent_role_requires_an_empty_variant() -> Bool:
-	rejects_roles("fixed union Maybe[T]:\n    Missing(Int)\n    Present(T)\n", "Present", "Missing", Check.BuiltinRolePayload, "builtin constructor has the wrong payload", "bind the required payload constructor first and the empty constructor second", AbsentRole)
+	rejects_roles("fixed union Maybe[T]:\n    Missing(Int)\n    Present(T)\n", "Present", "Missing", Errors.BuiltinRejection(Errors.BuiltinRolePayload), "builtin constructor has the wrong payload", "bind the required payload constructor first and the empty constructor second", AbsentRole)
 
 
 pure func test_role_from_another_union_is_rejected_by_owner() -> Bool:
@@ -217,8 +219,8 @@ pure func test_role_from_another_union_is_rejected_by_owner() -> Bool:
 	prefix = declaration + HEADER + "\n    builtin(" + LABEL + ", "
 	match rejected(prefix + "Elsewhere, Missing)\n" + MAIN):
 		Some(failure):
-			match Check.check_errors(failure).first.kind:
-				Check.BuiltinRoleNotInResult(_, Check.AppliedUnionType(_, [Check.IntType])):
+			match check_errors(failure).first.kind:
+				Errors.BuiltinRejection(Errors.BuiltinRoleNotInResult(_, Check.AppliedUnionType(_, [Check.IntType]))):
 					rendered_is(failure, prefix.length(), prefix.length() + "Elsewhere".length(), "builtin constructor does not belong to its result type", "import or declare this constructor in the annotated result union")
 				_: False
 		None: False
@@ -228,8 +230,8 @@ pure func test_primitive_result_annotation_is_rejected() -> Bool:
 	prefix = UNION + "pure func parse_number(text: String) -> "
 	match rejected(prefix + "Int:" + BODY + MAIN):
 		Some(failure):
-			match Check.check_errors(failure).first.kind:
-				Check.BuiltinResultUnion:
+			match check_errors(failure).first.kind:
+				Errors.BuiltinRejection(Errors.BuiltinResultUnion):
 					rendered_is(failure, prefix.length(), prefix.length() + 3, "builtin result must be an ordinary union", "return an ordinary two-variant union and bind the constructors required by this operation")
 				_: False
 		None: False
@@ -247,7 +249,7 @@ pure func test_list_get_checked_roles_belong_to_string_application() -> Bool:
 	match checked(UNION + READ_HEADER + READ_BODY + MAIN):
 		Err(_): False
 		Ok(program):
-			match Check.checked_functions(program).functions.get(0):
+			match checked_functions(program).functions.get(0):
 				Some(function):
 					match (function.signature.return_type.value_type, function.body):
 						(Check.AppliedUnionType(owner, [Check.StringType]), Check.CheckedValueBody(Check.ReturnExpression(value))):
@@ -285,8 +287,8 @@ private pure func rejects_read_header(header: String) -> Bool:
 	start = UNION.length() + header.length() + "\n    builtin(".length()
 	match rejected(UNION + header + READ_BODY + MAIN):
 		Some(failure):
-			match Check.check_errors(failure).first.kind:
-				Check.BuiltinContractMismatch(Builtins.ListGet(_)):
+			match check_errors(failure).first.kind:
+				Errors.BuiltinRejection(Errors.BuiltinContractMismatch(Builtins.ListGet(_))):
 					rendered_is(failure, start, start + READ_LABEL.length(), "builtin declaration does not match its runtime contract", "declare a pure nongeneric function with List[String] and Int parameters returning a two-variant union of String and an empty case")
 				_: False
 		None: False
@@ -307,8 +309,8 @@ pure func test_list_get_roles_require_instantiated_string_payload() -> Bool:
 	prefix = UNION + header + "\n    builtin(" + READ_LABEL + ", "
 	match rejected(UNION + header + READ_BODY + MAIN):
 		Some(failure):
-			match Check.check_errors(failure).first.kind:
-				Check.BuiltinRolePayload:
+			match check_errors(failure).first.kind:
+				Errors.BuiltinRejection(Errors.BuiltinRolePayload):
 					rendered_is(failure, prefix.length(), prefix.length() + "Present".length(), "builtin constructor has the wrong payload", "bind the required payload constructor first and the empty constructor second")
 				_: False
 		None: False

@@ -1,7 +1,9 @@
 import:
 	../../src/declarations as Declaration
 	../../src/source: module_source, root_module_id
-	../../src/check as Checked
+	../../src/check: check, check_errors
+	../../src/check_errors as Errors
+	../../src/check_model as Checked
 	../../src/lex: lex
 	../../src/assemble: ParsedProgram
 	../../src/syntax: CallNotation(DirectCall), Diagnostic
@@ -23,8 +25,7 @@ private pure func accepts(source: String) -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			Checked
-				.check(parsed)
+			check(parsed)
 				.is_ok()
 
 
@@ -33,24 +34,23 @@ private pure func accepts_modules(inputs: List[ModuleInput]) -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			Checked
-				.check(parsed)
+			check(parsed)
 				.is_ok()
 
 
 private pure func rejects(
 	source: String,
-	expected: pure (Checked.CheckError) -> Bool,
+	expected: pure (Errors.CheckError) -> Bool,
 ) -> Bool:
 	match parsed_source(source):
 		Err(_):
 			False
 		Ok(parsed):
-			match Checked.check(parsed):
+			match check(parsed):
 				Ok(_):
 					False
 				Err(failure):
-					errors = Checked.check_errors(failure)
+					errors = check_errors(failure)
 
 					match errors.remaining:
 						[]:
@@ -61,17 +61,17 @@ private pure func rejects(
 
 private pure func rejects_modules(
 	inputs: List[ModuleInput],
-	expected: pure (Checked.CheckError) -> Bool,
+	expected: pure (Errors.CheckError) -> Bool,
 ) -> Bool:
 	match parse_modules_with_base(inputs, PRIMITIVE_BASE):
 		Err(_):
 			False
 		Ok(parsed):
-			match Checked.check(parsed):
+			match check(parsed):
 				Ok(_):
 					False
 				Err(failure):
-					errors = Checked.check_errors(failure)
+					errors = check_errors(failure)
 
 					match errors.remaining:
 						[]:
@@ -205,7 +205,7 @@ pure func test_unknown_function() -> Bool:
 		|	missing()
 	rejects(source, pure func(error):
 		match error.kind:
-			Checked.UnknownFunction(_):
+			Errors.CallRejection(Errors.UnknownFunction(_)):
 				error.span.end - error.span.start == "missing".length()
 			_:
 				False
@@ -218,7 +218,7 @@ pure func test_unknown_value() -> Bool:
 		|	missing
 	rejects(source, pure func(error):
 		match error.kind:
-			Checked.UnknownValue(_):
+			Errors.ValueRejection(Errors.UnknownValue(_)):
 				error.span.end - error.span.start == "missing".length()
 			_:
 				False
@@ -235,7 +235,7 @@ pure func test_pure_caller_rejects_impure_callee() -> Bool:
 		|	caller()
 	rejects(source, pure func(error):
 		match error.kind:
-			Checked.ImpureCall(caller, Checked.UserFunction(callee, _)):
+			Errors.CallRejection(Errors.ImpureCall(caller, callee)):
 				Declaration.function_number(caller) == 0 and Declaration.function_number(callee) == 1
 			_:
 				False
@@ -250,7 +250,7 @@ pure func test_argument_count() -> Bool:
 		|	first(7)
 	rejects(source, pure func(error):
 		match error.kind:
-			Checked.ArgumentCountMismatch(mismatch):
+			Errors.CallRejection(Errors.ArgumentCountMismatch(mismatch)):
 				mismatch.expected == 2 and mismatch.actual == 1 and mismatch.notation == DirectCall
 			_:
 				False
@@ -270,7 +270,7 @@ pure func test_second_argument_type() -> Bool:
 		{ source = INTEGER_OPERATIONS, targets = [] },
 	], pure func(error):
 		match error.kind:
-			Checked.ArgumentTypeMismatch(mismatch):
+			Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
 				(
 					mismatch.argument_position == 1
 					and Checked.same_type(mismatch.expected, Checked.IntType)
@@ -291,7 +291,7 @@ pure func test_immutable_reassignment() -> Bool:
 		|	value
 	rejects(source, pure func(error):
 		match error.kind:
-			Checked.ImmutableAssignment(binding):
+			Errors.StatementRejection(Errors.ImmutableAssignment(binding)):
 				(
 					Declaration.function_number(binding.function) == 0
 					and Checked.binding_number(binding.binding) == 0
@@ -315,9 +315,9 @@ pure func test_mutable_binding_keeps_its_type() -> Bool:
 		{ source = INTEGER_OPERATIONS, targets = [] },
 	], pure func(error):
 		match error.kind:
-			Checked.ExpressionTypeMismatch(mismatch):
+			Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
 				match mismatch.expected_site:
-					Checked.InferredBindingDeclaration(binding):
+					Errors.InferredBindingDeclaration(binding):
 						(
 							Checked.same_type(mismatch.expected, Checked.IntType)
 							and Checked.same_type(mismatch.actual.value_type, Checked.StringType)
@@ -339,7 +339,7 @@ pure func test_generic_body_keeps_its_parameter_rigid() -> Bool:
 		|	bad(1)
 	rejects(source, pure func(error):
 		match error.kind:
-			Checked.ExpressionTypeMismatch(mismatch):
+			Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
 				match mismatch.expected:
 					Checked.ParameterType(parameter):
 						(
@@ -366,7 +366,7 @@ pure func test_conflicting_generic_arguments() -> Bool:
 		{ source = INTEGER_OPERATIONS, targets = [] },
 	], pure func(error):
 		match error.kind:
-			Checked.GenericArgumentConflict(conflict):
+			Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
 				(
 					function_parameter(conflict.parameter, 0)
 					and conflict.mismatch.argument_position == 1
@@ -392,7 +392,7 @@ pure func test_missing_match_variant() -> Bool:
 		|	0
 	rejects(source, pure func(error):
 		match error.kind:
-			Checked.NonExhaustiveMatch([missing]):
+			Errors.MatchRejection(Errors.NonExhaustiveMatch([missing])):
 				(
 					Declaration.union_number(Declaration.variant_owner(missing)) == 0
 					and Declaration.variant_number(missing) == 1

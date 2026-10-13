@@ -1,0 +1,278 @@
+import:
+	../../src/syntax: same_span
+	../../src/source: module_source, root_module_id
+	../../src/check: check, check_errors
+	../../src/check_errors as Errors
+	../../src/check_render: render_failure
+	../../src/lex: lex
+	input: parse
+	test: TestSuite
+
+
+private pure func accepts(source: String) -> Bool:
+	match lex(module_source(root_module_id()), source):
+		Err(_):
+			False
+		Ok(tokens):
+			match parse(tokens):
+				Err(_):
+					False
+				Ok(parsed):
+					check(parsed)
+						.is_ok()
+
+
+private TOKEN: String =
+	|fixed union Token[T]:
+	|	Only
+	|pure func token[T](value: T) -> Token[T]:
+	|	Only
+	|
+
+
+private MAIN: String =
+	|func main() -> Int:
+	|	0
+	|
+
+
+private pure func rejects_growth(prefix: String, call: String, suffix: String) -> Bool:
+	match lex(module_source(root_module_id()), prefix + call + suffix):
+		Err(_):
+			False
+		Ok(tokens):
+			match parse(tokens):
+				Err(_):
+					False
+				Ok(parsed):
+					match check(parsed):
+						Ok(_):
+							False
+						Err(failure):
+							error = check_errors(failure).first
+							diagnostic = render_failure(failure).first
+
+							match error.kind:
+								Errors.RecursionRejection(Errors.GrowingRecursiveInstantiation):
+									(
+										error.span.start == prefix.length()
+										and error.span.end == prefix.length() + call.length()
+										and same_span(diagnostic.span, error.span)
+										and diagnostic.message == "recursive calls grow type arguments without bound"
+										and diagnostic.help == (
+											"pass recursive type arguments unchanged, permute them, or reset them to "
+											+ "concrete types"
+										)
+									)
+								_:
+									False
+
+
+pure func test_self_recursive_type_growth_rejects() -> Bool:
+	before: String =
+		|pure func grow[T](value: T) -> Int:
+		|
+	prefix = TOKEN + before + "\t"
+	rejects_growth(prefix, "grow", "(token(value))\nfunc main() -> Int:\n\tgrow(7)\n")
+
+
+pure func test_unused_recursive_type_growth_rejects() -> Bool:
+	before: String =
+		|pure func grow[T](value: T) -> Int:
+		|
+	prefix = TOKEN + before + "\t"
+	rejects_growth(prefix, "grow", "(token(value))\n" + MAIN)
+
+
+pure func test_mutual_recursive_type_growth_rejects() -> Bool:
+	before: String =
+		|pure func first[T](value: T) -> Int:
+		|
+	prefix = TOKEN + before + "\t"
+	suffix: String =
+		|(token(value))
+		|pure func second[U](value: U) -> Int:
+		|	first(value)
+		|
+	rejects_growth(prefix, "second", suffix + MAIN)
+
+
+pure func test_growth_after_parameter_permutation_rejects() -> Bool:
+	before: String =
+		|pure func rotate[A, B](left: A, right: B) -> Int:
+		|
+	prefix = TOKEN + before + "\t"
+	rejects_growth(prefix, "rotate", "(token(right), left)\n" + MAIN)
+
+
+pure func test_plain_parameter_permutation_is_finite() -> Bool:
+	source: String =
+		|pure func rotate[A, B](left: A, right: B) -> Int:
+		|	rotate(right, left)
+		|func main() -> Int:
+		|	rotate(7, "text")
+		|
+	accepts(source)
+
+
+pure func test_wrapping_on_an_acyclic_path_is_finite() -> Bool:
+	source: String =
+		|pure func finish[T](value: T) -> Int:
+		|	7
+		|pure func forward[T](value: T) -> Int:
+		|	finish(token(value))
+		|func main() -> Int:
+		|	forward(7)
+		|
+	accepts(TOKEN + source)
+
+
+pure func test_concrete_reset_breaks_a_growing_dependency_path() -> Bool:
+	source: String =
+		|pure func first[T](value: T) -> Int:
+		|	second(token(value))
+		|pure func second[U](value: U) -> Int:
+		|	first(7)
+		|func main() -> Int:
+		|	first(7)
+		|
+	accepts(TOKEN + source)
+
+
+pure func test_noncyclic_slot_growth_is_finite() -> Bool:
+	source: String =
+		|pure func shift[A, B](left: A, right: B) -> Int:
+		|	shift(token(right), 7)
+		|func main() -> Int:
+		|	shift(7, "text")
+		|
+	accepts(TOKEN + source)
+
+
+pure func test_growth_in_unused_initializer_rejects() -> Bool:
+	before: String =
+		|pure func grow[T](value: T) -> Int:
+		|
+	prefix = TOKEN + before + "\tunused = "
+	rejects_growth(prefix, "grow", "(token(value))\n\t7\n" + MAIN)
+
+
+pure func test_growth_in_reassignment_rejects() -> Bool:
+	before: String =
+		|pure func grow[T](value: T) -> Int:
+		|	var current = 7
+		|
+	prefix = TOKEN + before + "\tcurrent = "
+	rejects_growth(prefix, "grow", "(token(value))\n\tcurrent\n" + MAIN)
+
+
+pure func test_growth_in_record_literal_child_rejects() -> Bool:
+	helpers: String =
+		|fixed record Pair { first: Int, second: Int }
+		|pure func first(pair: Pair) -> Int:
+		|	pair.first
+		|
+	before: String =
+		|pure func grow[T](value: T) -> Int:
+		|
+	prefix = TOKEN + helpers + before + "\tfirst({ first = "
+	rejects_growth(prefix, "grow", "(token(value)), second = 9 })\n" + MAIN)
+
+
+pure func test_growth_in_ufcs_receiver_rejects() -> Bool:
+	before: String =
+		|pure func grow[T](value: T) -> Int:
+		|
+	prefix = TOKEN + before + "\ttoken(value)."
+	rejects_growth(prefix, "grow", "()\n" + MAIN)
+
+
+pure func test_growth_in_ufcs_explicit_argument_rejects() -> Bool:
+	before: String =
+		|pure func grow[T](receiver: Int, value: T) -> Int:
+		|
+	prefix = TOKEN + before + "\t7."
+	rejects_growth(prefix, "grow", "(token(value))\n" + MAIN)
+
+
+pure func test_growth_in_nested_argument_rejects() -> Bool:
+	helpers: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|
+	before: String =
+		|pure func grow[T](value: T) -> Int:
+		|
+	prefix = TOKEN + helpers + before + "\tidentity("
+	rejects_growth(prefix, "grow", "(token(value)))\n" + MAIN)
+
+
+pure func test_growth_in_match_scrutinee_rejects() -> Bool:
+	before: String =
+		|pure func grow[T](value: T) -> Token[T]:
+		|
+	prefix = TOKEN + before + "\tmatch "
+	rejects_growth(prefix, "grow", "(token(value)):\n\t\tOnly: Only\n" + MAIN)
+
+
+pure func test_growth_in_match_arm_result_rejects() -> Bool:
+	before: String =
+		|pure func grow[T](value: T) -> Int:
+		|	match token(value):
+		|
+	prefix = TOKEN + before + "\t\tOnly: "
+	rejects_growth(prefix, "grow", "(token(value))\n" + MAIN)
+
+
+pure func test_growth_in_match_arm_initializer_rejects() -> Bool:
+	before: String =
+		|pure func grow[T](value: T) -> Int:
+		|	match token(value):
+		|		Only:
+		|
+	prefix = TOKEN + before + "\t\t\tunused = "
+	rejects_growth(prefix, "grow", "(token(value))\n\t\t\t7\n" + MAIN)
+
+
+pure func test_bare_parameter_copying_and_merge_is_finite() -> Bool:
+	source: String =
+		|pure func merge[A, B](left: A, right: B) -> Int:
+		|	merge(left, left)
+		|func main() -> Int:
+		|	merge(7, "text")
+		|
+	accepts(source)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 recursive instantiation growth",
+	tests = [
+		(
+			"bare parameter copying and merge is finite",
+			test_bare_parameter_copying_and_merge_is_finite,
+		),
+		("growth in unused initializer rejects", test_growth_in_unused_initializer_rejects),
+		("growth in reassignment rejects", test_growth_in_reassignment_rejects),
+		("growth in record literal child rejects", test_growth_in_record_literal_child_rejects),
+		("growth in ufcs receiver rejects", test_growth_in_ufcs_receiver_rejects),
+		("growth in ufcs explicit argument rejects", test_growth_in_ufcs_explicit_argument_rejects),
+		("growth in nested argument rejects", test_growth_in_nested_argument_rejects),
+		("growth in match scrutinee rejects", test_growth_in_match_scrutinee_rejects),
+		("growth in match arm result rejects", test_growth_in_match_arm_result_rejects),
+		("growth in match arm initializer rejects", test_growth_in_match_arm_initializer_rejects),
+		("self recursive type growth rejects", test_self_recursive_type_growth_rejects),
+		("unused recursive type growth rejects", test_unused_recursive_type_growth_rejects),
+		("mutual recursive type growth rejects", test_mutual_recursive_type_growth_rejects),
+		(
+			"growth after parameter permutation rejects",
+			test_growth_after_parameter_permutation_rejects,
+		),
+		("plain parameter permutation is finite", test_plain_parameter_permutation_is_finite),
+		("wrapping on an acyclic path is finite", test_wrapping_on_an_acyclic_path_is_finite),
+		(
+			"concrete reset breaks a growing dependency path",
+			test_concrete_reset_breaks_a_growing_dependency_path,
+		),
+		("noncyclic slot growth is finite", test_noncyclic_slot_growth_is_finite),
+	]
+}
