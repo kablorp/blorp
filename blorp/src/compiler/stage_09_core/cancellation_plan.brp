@@ -330,13 +330,24 @@ private pure func add_var(variables: List[CoreVar], variable: CoreVar) -> List[C
 		variables.append(variable)
 
 
+---
+Ownership facts are only ever tested for membership, so a repeated variable
+would be harmless; checking `right`'s members against `left` alone keeps a
+merge linear in `right` while `left` is small, as it is at each edge of a
+binding chain thousands of `let`s deep. Growing the result while scanning it
+was cubic there. An empty `left` returns `right` without copying it.
+---
 private pure func merge_vars(left: List[CoreVar], right: List[CoreVar]) -> List[CoreVar]:
-	var result: List[CoreVar] = left
+	if left.is_empty():
+		right
+	else:
+		var result: List[CoreVar] = left
 
-	for variable in right:
-		result = add_var(result, variable)
+		for variable in right:
+			if not vars_contain(left, variable):
+				result = result.append(variable)
 
-	result
+		result
 
 
 private pure func remove_var(variables: List[CoreVar], removed: CoreVar) -> List[CoreVar]:
@@ -650,7 +661,10 @@ private pure func collection_equality_vars(
 			or CoreTypePolicy.core_type_has_consuming_equality(core_expr_type(right))
 		))
 	):
-		[expr_is_var_reference(left), expr_is_var_reference(right)].flat_map(optional_var_list)
+		merge_vars(
+			optional_var_list(expr_is_var_reference(left)),
+			optional_var_list(expr_is_var_reference(right)),
+		)
 	else:
 		[]
 
@@ -1067,17 +1081,48 @@ private pure func expr_rebinds_parameter(expr: CoreExpr, parameters: List[CoreVa
 			False
 
 
-private pure func analyze_current_behavior_expr(
+---
+One expression whose children are being analyzed, with the accumulators the
+child loop of the `let`/match rules threads from one child to the next.
+`child_site` and `child_owner` number the next child's subtree.
+---
+private record CancellationAnalysisFrame {
+	parent: CancellationAnalysisStack,
 	expr: CoreExpr,
+	child_exprs: List[CoreExpr],
+	current_site: CancellationSiteId,
+	current_owner: Int,
+	is_plannable_match: Bool,
+	child_site: Int,
+	child_owner: Int,
+	child_index: Int,
+	children: List[CancellationOwnershipFacts],
+	protections: List[CancellationLetProtection],
+	match_protections: List[CancellationMatchScrutineeProtection],
+	max_live_slots: Int,
+	body_live_slots: Int,
+	match_branch_live_slots: Int,
+	match_branch_may_cancel: Bool,
+	rebinds_parameter: Bool
+}
+
+
+-- The frames waiting on a child, innermost first. Aggregate evaluation makes
+-- binding chains thousands of edges deep; linked frames keep them off the
+-- native stack, as `FunctionBodyContinuation` does for emission.
+private union CancellationAnalysisStack:
+	CancellationAnalysisRoot
+	AnalyzingChildOf(CancellationAnalysisFrame)
+
+
+private pure func start_cancellation_analysis_frame(
+	parent: CancellationAnalysisStack,
+	expr: CoreExpr,
+	child_exprs: List[CoreExpr],
 	next_site: Int,
 	next_owner: Int,
-	activation: CancellationActivationIdentity,
-	mode: CancellationPlanningMode,
-	forced_match_scrutinees: List[CoreVar],
 	parameters: List[CoreVar],
-) -> CancellationPlanAnalysis:
-	current_site: CancellationSiteId = cancellation_site_id(next_site)
-
+) -> CancellationAnalysisFrame:
 	current_is_let: Bool = match expr:
 		LetExpr(_, _, _, _, _):
 			True
@@ -1086,68 +1131,97 @@ private pure func analyze_current_behavior_expr(
 
 	current_is_plannable_match: Bool = match_expr_has_plannable_scrutinee(expr)
 
-	current_owner: Int = next_owner
-	var child_site: Int = next_site + 1
-
-	var child_owner: Int = if current_is_let or current_is_plannable_match:
+	child_owner: Int = if current_is_let or current_is_plannable_match:
 		next_owner + 1
 	else:
 		next_owner
 
-	var children: List[CancellationOwnershipFacts] = []
-	var protections: List[CancellationLetProtection] = []
-	var match_protections: List[CancellationMatchScrutineeProtection] = []
-	var max_live_slots: Int = 0
-	var body_live_slots: Int = 0
-	var match_branch_live_slots: Int = 0
-	var match_branch_may_cancel: Bool = False
-	var rebinds_parameter: Bool = expr_rebinds_parameter(expr, parameters)
-	var child_index: Int = 0
+	{
+		parent = parent,
+		expr = expr,
+		child_exprs = child_exprs,
+		current_site = cancellation_site_id(next_site),
+		current_owner = next_owner,
+		is_plannable_match = current_is_plannable_match,
+		child_site = next_site + 1,
+		child_owner = child_owner,
+		child_index = 0,
+		children = [],
+		protections = [],
+		match_protections = [],
+		max_live_slots = 0,
+		body_live_slots = 0,
+		match_branch_live_slots = 0,
+		match_branch_may_cancel = False,
+		rebinds_parameter = expr_rebinds_parameter(expr, parameters)
+	}
 
-	for child_expr in CoreTraverse.immediate_core_expr_children(expr):
-		child_analysis: CancellationPlanAnalysis = analyze_current_behavior_expr(
-			child_expr,
-			child_site,
-			child_owner,
-			activation,
-			mode,
-			forced_match_scrutinees,
-			parameters,
-		)
-		children = children.append(child_analysis.facts)
-		rebinds_parameter = rebinds_parameter or child_analysis.rebinds_parameter
-		protections = append_child_results(protections, child_analysis.let_protections)
 
-		-- Most subtrees contain no managed match scrutinee. Avoid allocating an
-		-- unchanged empty list at every edge in those trees.
-		if not child_analysis.match_scrutinee_protections.is_empty():
-			match_protections = append_child_results(
-				match_protections,
-				child_analysis.match_scrutinee_protections,
-			)
+private pure func absorb_cancellation_child_analysis(
+	frame: CancellationAnalysisFrame,
+	child_analysis: CancellationPlanAnalysis,
+) -> CancellationAnalysisFrame:
+	child_live_slots: Int = child_analysis.max_live_slots
+	-- Child zero evaluates the scrutinee before the backend temporary owns
+	-- it. Only match branches can overlap that temporary's lifetime.
+	is_match_branch: Bool = frame.is_plannable_match and frame.child_index > 0
 
-		child_site = child_analysis.next_site
-		child_owner = child_analysis.next_owner
+	-- Most subtrees contain no managed match scrutinee. Avoid allocating an
+	-- unchanged empty list at every edge in those trees.
+	match_protections: List[CancellationMatchScrutineeProtection] = if child_analysis.match_scrutinee_protections.is_empty():
+		frame.match_protections
+	else:
+		append_child_results(frame.match_protections, child_analysis.match_scrutinee_protections)
 
-		if child_analysis.max_live_slots > max_live_slots:
-			max_live_slots = child_analysis.max_live_slots
+	max_live_slots: Int = if child_live_slots > frame.max_live_slots:
+		child_live_slots
+	else:
+		frame.max_live_slots
 
-		if child_index == 1:
-			body_live_slots = child_analysis.max_live_slots
+	body_live_slots: Int = if frame.child_index == 1:
+		child_live_slots
+	else:
+		frame.body_live_slots
 
-		-- Child zero evaluates the scrutinee before the backend temporary owns
-		-- it. Only match branches can overlap that temporary's lifetime.
-		if current_is_plannable_match and child_index > 0:
-			if child_analysis.max_live_slots > match_branch_live_slots:
-				match_branch_live_slots = child_analysis.max_live_slots
+	match_branch_live_slots: Int = if (
+		is_match_branch
+		and child_live_slots > frame.match_branch_live_slots
+	):
+		child_live_slots
+	else:
+		frame.match_branch_live_slots
 
-			match_branch_may_cancel = match_branch_may_cancel or child_analysis.facts.may_cancel
+	{ frame |
+		child_site = child_analysis.next_site,
+		child_owner = child_analysis.next_owner,
+		child_index = frame.child_index + 1,
+		children = frame.children.append(child_analysis.facts),
+		protections = append_child_results(frame.protections, child_analysis.let_protections),
+		match_protections = match_protections,
+		max_live_slots = max_live_slots,
+		body_live_slots = body_live_slots,
+		match_branch_live_slots = match_branch_live_slots,
+		match_branch_may_cancel = (
+			frame.match_branch_may_cancel
+			or (is_match_branch and child_analysis.facts.may_cancel)
+		),
+		rebinds_parameter = frame.rebinds_parameter or child_analysis.rebinds_parameter
+	}
 
-		child_index += 1
 
-	match expr:
+private pure func finish_cancellation_analysis_frame(
+	frame: CancellationAnalysisFrame,
+	activation: CancellationActivationIdentity,
+	mode: CancellationPlanningMode,
+	forced_match_scrutinees: List[CoreVar],
+) -> CancellationPlanAnalysis:
+	var protections: List[CancellationLetProtection] = frame.protections
+	var match_protections: List[CancellationMatchScrutineeProtection] = frame.match_protections
+	var max_live_slots: Int = frame.max_live_slots
+
+	match frame.expr:
 		LetExpr(variable, is_mutable, typ, rhs, body):
-			body_facts: CancellationOwnershipFacts = child_facts(children, 1)
+			body_facts: CancellationOwnershipFacts = child_facts(frame.children, 1)
 			action: Option[CancellationCleanupAction] = let_cleanup_action(
 				variable,
 				is_mutable,
@@ -1183,8 +1257,8 @@ private pure func analyze_current_behavior_expr(
 				and not vars_contain(body_facts.consumed, variable)
 			)
 
-			owner_id: CancellationOwnerId = cancellation_owner_id(current_owner)
-			slot_id: CancellationSlotId = cancellation_slot_id(current_owner)
+			owner_id: CancellationOwnerId = cancellation_owner_id(frame.current_owner)
+			slot_id: CancellationSlotId = cancellation_slot_id(frame.current_owner)
 
 			protections = [
 				{
@@ -1196,8 +1270,8 @@ private pure func analyze_current_behavior_expr(
 				},
 			].concat(protections)
 
-			if tracks_cleanup and body_live_slots + 1 > max_live_slots:
-				max_live_slots = body_live_slots + 1
+			if tracks_cleanup and frame.body_live_slots + 1 > max_live_slots:
+				max_live_slots = frame.body_live_slots + 1
 		AccessorLiteralMatchExpr(VarExpr(variable, _, _), policy, _, _, _):
 			match cancellation_cleanup_action_for_release_policy(policy):
 				Some(action):
@@ -1213,16 +1287,16 @@ private pure func analyze_current_behavior_expr(
 							CurrentBehaviorCancellationPlanning:
 								True
 							RegionSensitiveCancellationPlanning(_, _):
-								match_branch_may_cancel
+								frame.match_branch_may_cancel
 
-					owner_id: CancellationOwnerId = cancellation_owner_id(current_owner)
-					slot_id: CancellationSlotId = cancellation_slot_id(current_owner)
+					owner_id: CancellationOwnerId = cancellation_owner_id(frame.current_owner)
+					slot_id: CancellationSlotId = cancellation_slot_id(frame.current_owner)
 
 					candidate: CancellationCleanupCandidate = {
 						activation = activation,
 						id = owner_id,
 						owner = BackendTemporaryCancellationOwner(
-							current_site,
+							frame.current_site,
 							MatchScrutineeTemporary,
 						),
 						slot = slot_id,
@@ -1239,8 +1313,8 @@ private pure func analyze_current_behavior_expr(
 						},
 					].concat(match_protections)
 
-					if tracks_cleanup and match_branch_live_slots + 1 > max_live_slots:
-						max_live_slots = match_branch_live_slots + 1
+					if tracks_cleanup and frame.match_branch_live_slots + 1 > max_live_slots:
+						max_live_slots = frame.match_branch_live_slots + 1
 				None:
 					void
 		LengthMatchExpr(VarExpr(variable, _, _), policy, _, _, _):
@@ -1258,16 +1332,16 @@ private pure func analyze_current_behavior_expr(
 							CurrentBehaviorCancellationPlanning:
 								True
 							RegionSensitiveCancellationPlanning(_, _):
-								match_branch_may_cancel
+								frame.match_branch_may_cancel
 
-					owner_id: CancellationOwnerId = cancellation_owner_id(current_owner)
-					slot_id: CancellationSlotId = cancellation_slot_id(current_owner)
+					owner_id: CancellationOwnerId = cancellation_owner_id(frame.current_owner)
+					slot_id: CancellationSlotId = cancellation_slot_id(frame.current_owner)
 
 					candidate: CancellationCleanupCandidate = {
 						activation = activation,
 						id = owner_id,
 						owner = BackendTemporaryCancellationOwner(
-							current_site,
+							frame.current_site,
 							MatchScrutineeTemporary,
 						),
 						slot = slot_id,
@@ -1284,8 +1358,8 @@ private pure func analyze_current_behavior_expr(
 						},
 					].concat(match_protections)
 
-					if tracks_cleanup and match_branch_live_slots + 1 > max_live_slots:
-						max_live_slots = match_branch_live_slots + 1
+					if tracks_cleanup and frame.match_branch_live_slots + 1 > max_live_slots:
+						max_live_slots = frame.match_branch_live_slots + 1
 				None:
 					void
 		ConstructorMatchExpr(VarExpr(variable, _, _), policy, _, _, _, _):
@@ -1303,16 +1377,16 @@ private pure func analyze_current_behavior_expr(
 							CurrentBehaviorCancellationPlanning:
 								True
 							RegionSensitiveCancellationPlanning(_, _):
-								match_branch_may_cancel
+								frame.match_branch_may_cancel
 
-					owner_id: CancellationOwnerId = cancellation_owner_id(current_owner)
-					slot_id: CancellationSlotId = cancellation_slot_id(current_owner)
+					owner_id: CancellationOwnerId = cancellation_owner_id(frame.current_owner)
+					slot_id: CancellationSlotId = cancellation_slot_id(frame.current_owner)
 
 					candidate: CancellationCleanupCandidate = {
 						activation = activation,
 						id = owner_id,
 						owner = BackendTemporaryCancellationOwner(
-							current_site,
+							frame.current_site,
 							MatchScrutineeTemporary,
 						),
 						slot = slot_id,
@@ -1329,32 +1403,126 @@ private pure func analyze_current_behavior_expr(
 						},
 					].concat(match_protections)
 
-					if tracks_cleanup and match_branch_live_slots + 1 > max_live_slots:
-						max_live_slots = match_branch_live_slots + 1
+					if tracks_cleanup and frame.match_branch_live_slots + 1 > max_live_slots:
+						max_live_slots = frame.match_branch_live_slots + 1
 				None:
 					void
 		_:
 			void
 
 	{
-		facts = {
-			consumed = analyzed_consumed_vars(expr, children),
-			consumed_before_suspension = analyzed_consumed_before_suspension_vars(
-				expr,
-				children,
-				mode,
-			),
-			direct_returns = analyzed_direct_returns(expr, children),
-			non_suspending_transfer = analyzed_non_suspending_transfer(expr, children),
-			may_cancel = expression_node_may_cancel(expr, mode) or child_may_cancel(children)
-		},
+		facts = analyzed_ownership_facts(frame.expr, frame.children, mode),
 		let_protections = protections,
 		match_scrutinee_protections = match_protections,
 		max_live_slots = max_live_slots,
-		next_site = child_site,
-		next_owner = child_owner,
-		rebinds_parameter = rebinds_parameter
+		next_site = frame.child_site,
+		next_owner = frame.child_owner,
+		rebinds_parameter = frame.rebinds_parameter
 	}
+
+
+private pure func analyzed_ownership_facts(
+	expr: CoreExpr,
+	children: List[CancellationOwnershipFacts],
+	mode: CancellationPlanningMode,
+) -> CancellationOwnershipFacts:
+	{
+		consumed = analyzed_consumed_vars(expr, children),
+		consumed_before_suspension = analyzed_consumed_before_suspension_vars(expr, children, mode),
+		direct_returns = analyzed_direct_returns(expr, children),
+		non_suspending_transfer = analyzed_non_suspending_transfer(expr, children),
+		may_cancel = expression_node_may_cancel(expr, mode) or child_may_cancel(children)
+	}
+
+
+---
+An expression without children. A `let` and a plannable match always have
+children, so a leaf protects nothing and contributes only its own facts;
+analyzing it directly spares the frame a parent would otherwise allocate.
+---
+private pure func leaf_cancellation_analysis(
+	expr: CoreExpr,
+	next_site: Int,
+	next_owner: Int,
+	mode: CancellationPlanningMode,
+	parameters: List[CoreVar],
+) -> CancellationPlanAnalysis:
+	{
+		facts = analyzed_ownership_facts(expr, [], mode),
+		let_protections = [],
+		match_scrutinee_protections = [],
+		max_live_slots = 0,
+		next_site = next_site + 1,
+		next_owner = next_owner,
+		rebinds_parameter = expr_rebinds_parameter(expr, parameters)
+	}
+
+
+---
+Analyzes `expr` and its subtree in evaluation order. Each child's subtree is
+numbered after its earlier siblings', so children are analyzed one at a time
+and folded into their parent's frame before the next sibling starts.
+---
+private pure func analyze_current_behavior_expr(
+	expr: CoreExpr,
+	next_site: Int,
+	next_owner: Int,
+	activation: CancellationActivationIdentity,
+	mode: CancellationPlanningMode,
+	forced_match_scrutinees: List[CoreVar],
+	parameters: List[CoreVar],
+) -> CancellationPlanAnalysis:
+	var frame: CancellationAnalysisFrame = start_cancellation_analysis_frame(
+		CancellationAnalysisRoot,
+		expr,
+		CoreTraverse.immediate_core_expr_children(expr),
+		next_site,
+		next_owner,
+		parameters,
+	)
+	var analyzing: Bool = True
+
+	while analyzing:
+		match frame.child_exprs.get(frame.child_index):
+			Some(child):
+				grandchildren: List[CoreExpr] = CoreTraverse.immediate_core_expr_children(child)
+
+				if grandchildren.is_empty():
+					frame = absorb_cancellation_child_analysis(
+						frame,
+						leaf_cancellation_analysis(
+							child,
+							frame.child_site,
+							frame.child_owner,
+							mode,
+							parameters,
+						),
+					)
+				else:
+					frame = start_cancellation_analysis_frame(
+						AnalyzingChildOf(frame),
+						child,
+						grandchildren,
+						frame.child_site,
+						frame.child_owner,
+						parameters,
+					)
+			None:
+				match frame.parent:
+					CancellationAnalysisRoot:
+						analyzing = False
+					AnalyzingChildOf(parent):
+						frame = absorb_cancellation_child_analysis(
+							parent,
+							finish_cancellation_analysis_frame(
+								frame,
+								activation,
+								mode,
+								forced_match_scrutinees,
+							),
+						)
+
+	finish_cancellation_analysis_frame(frame, activation, mode, forced_match_scrutinees)
 
 
 ---
