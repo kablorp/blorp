@@ -2,13 +2,13 @@ import:
     ../../src/lex: lex
     ../../src/names: NameTable, NameId, find_name, same_name
     ../../src/parse: ParsedProgram, append_module, assembly_names, begin_program, parse_module, parsed_contents, seal_program
-    ../../src/prelude:
+    ../../src/builtins:
         BuiltinTypeErrorKind(MissingBuiltinType, DuplicateBuiltinType, BuiltinOutsideFoundation, FoundationImports, FoundationFunctions, FoundationTypeConflict),
         BuiltinTypeRole(IntegerType, StringType, FloatType, VoidType, ListType),
         check_builtin_types, render_builtin_type_error
     ../../src/source:
         ModuleId, ModuleKind(UserModule, FoundationTypesModule, FoundationPreludeModule),
-        module_id, module_source, root_module_id, same_source
+        foundation_prelude_module_id, foundation_types_module_id, module_id, module_source, root_module_id, same_source
     ../../src/syntax: Diagnostic
     option: to_result, is_none
     ../../src/text: concat
@@ -26,8 +26,8 @@ private TYPES: String =
 
 private pure func program(base: String, root: String, prelude: String, base_targets: List[Int]) -> Result[ParsedProgram, Diagnostic]:
     setup: Diagnostic = { span = { source = module_source(root_module_id()), start = 0, end = 0 }, note = None, message = "test setup", help = "test setup" }
-    base_id ?= module_id(1).to_result(setup)
-    prelude_id ?= module_id(2).to_result(setup)
+    base_id = foundation_types_module_id()
+    prelude_id = foundation_prelude_module_id()
     initial = begin_program()
     root_tokens ?= lex(module_source(root_module_id()), root)
     root_parsed ?= parse_module(root_tokens, root_module_id(), assembly_names(initial))
@@ -221,6 +221,27 @@ pure func test_foundation_union_cannot_redeclare_builtin_type() -> Bool:
     foundation_nominal_conflict_rejected("fixed union ", "Int", ":\n    Value\n", IntegerType)
 
 
+private pure func first_error_kind(base: String, targets: List[Int], expected: BuiltinTypeErrorKind) -> Bool:
+    match program(base, "func main() -> Int:\n    0\n", "", targets):
+        Err(_): False
+        Ok(parsed):
+            match check_builtin_types(parsed):
+                Ok(_): False
+                Err(error): same_error_kind(error.kind, expected)
+
+
+-- The checks run in a fixed order and report the first failure, so a module
+-- with several problems always gets the same diagnostic.
+pure func test_foundation_functions_take_precedence_over_imports() -> Bool:
+    base = "import:\n    ./ops: helper\n".concat(TYPES).concat("pure func helper() -> Int:\n    0\n")
+    first_error_kind(base, [0], FoundationFunctions)
+
+
+pure func test_missing_builtin_takes_precedence_over_nominal_conflict() -> Bool:
+    base = "type Int = builtin\ntype String = builtin\ntype Float = builtin\ntype List[T] = builtin\nfixed record Float { value: Int }\n"
+    first_error_kind(base, [], MissingBuiltinType(VoidType))
+
+
 tests: TestSuite = {
     description = "Blorp 2 foundation builtin authority",
     tests = [
@@ -241,5 +262,7 @@ tests: TestSuite = {
         ("ordinary base unions retained", test_ordinary_base_unions_are_preserved),
         ("foundation record cannot redeclare builtin", test_foundation_record_cannot_redeclare_builtin_type),
         ("foundation union cannot redeclare builtin", test_foundation_union_cannot_redeclare_builtin_type),
+        ("foundation functions precede imports", test_foundation_functions_take_precedence_over_imports),
+        ("missing builtin precedes nominal conflict", test_missing_builtin_takes_precedence_over_nominal_conflict),
     ]
 }

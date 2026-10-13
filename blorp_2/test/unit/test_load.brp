@@ -1,5 +1,5 @@
 import:
-    ../../src/load: SourceFile, dependency_kind, import_path, load_program
+    ../../src/load: SourceFile, import_path, library_layout, load_program, module_role
     ../../src/names: NameId, intern_name, program_names
     ../../src/parse: ImportOrigin(RelativeImport, LibraryImport), ParsedModuleRow, parsed_contents
     ../../src/source:
@@ -42,7 +42,7 @@ private pure func projects_to(importer: String, parents: Int, parts: List[String
         path = { origin = RelativeImport(parents), parts = ids }, symbols = [],
         span = { source = COMPILER_SOURCE, start = 0, end = 0 }
     }
-    match import_path(importer, request, names, "/target/library"):
+    match import_path(importer, request, names, library_layout("/target/library")):
         Err(_): False
         Ok(actual): actual == expected
 
@@ -58,7 +58,7 @@ pure func test_import_path_rejects_invalid_spelling_identity() -> Bool:
     initial = program_names()
     part = intern_name(initial.names, "helper")
     request = { path = { origin = RelativeImport(0), parts = [part.id] }, symbols = [], span = { source = COMPILER_SOURCE, start = 0, end = 0 } }
-    match import_path("/project/main.brp", request, initial.names, "/target/library"):
+    match import_path("/project/main.brp", request, initial.names, library_layout("/target/library")):
         Ok(_): False
         Err(error): exact_error(error, COMPILER_SOURCE, 0, 0, "import path references an invalid spelling identity", "report this compiler error with the input files")
 
@@ -66,24 +66,45 @@ pure func test_import_path_rejects_invalid_spelling_identity() -> Bool:
 pure func test_library_path_uses_explicit_root() -> Bool:
     part = intern_name(program_names().names, "int")
     request = { path = { origin = LibraryImport, parts = [part.id] }, symbols = [], span = { source = COMPILER_SOURCE, start = 0, end = 0 } }
-    match import_path("/project/main.brp", request, part.names, "/target/library"):
+    match import_path("/project/main.brp", request, part.names, library_layout("/target/library")):
         Ok(actual): actual == "/target/library/int.brp"
         Err(_): False
 
 
-pure func test_dependency_roles_preserve_directory_boundaries() -> Bool:
+pure func test_roles_follow_the_configured_library() -> Bool:
+    layout = library_layout("/target/library")
     (
-        dependency_kind("/target/library/int.brp", "/target/library") == LibraryModule
-        and dependency_kind("/target/library/nested/ops.brp", "/target/library") == LibraryModule
-        and dependency_kind("/target/library_copy/int.brp", "/target/library") == UserModule
-        and dependency_kind("/target/helper.brp", "/target/library") == UserModule
+        module_role(layout, "/target/library/_base/types.brp") == FoundationTypesModule
+        and module_role(layout, "/target/library/_base/prelude.brp") == FoundationPreludeModule
+        and module_role(layout, "/target/library/int.brp") == LibraryModule
+        and module_role(layout, "/target/library/nested/ops.brp") == LibraryModule
+        and module_role(layout, "/target/helper.brp") == UserModule
+    )
+
+
+pure func test_roles_preserve_directory_boundaries() -> Bool:
+    layout = library_layout("/target/library")
+    (
+        module_role(layout, "/target/library_copy/int.brp") == UserModule
+        and module_role(layout, "/target/library_copy/_base/types.brp") == UserModule
+        and module_role(layout, "/target/other/library/_base/prelude.brp") == UserModule
+    )
+
+
+pure func test_layout_normalizes_its_root() -> Bool:
+    layout = library_layout("/target/./other/../library/")
+    (
+        module_role(layout, "/target/library/int.brp") == LibraryModule
+        and module_role(layout, "/target/library/_base/types.brp") == FoundationTypesModule
     )
 
 
 pure func test_filesystem_root_is_a_library_directory() -> Bool:
+    layout = library_layout("/")
     (
-        dependency_kind("/int.brp", "/") == LibraryModule
-        and dependency_kind("/nested/ops.brp", "/") == LibraryModule
+        module_role(layout, "/int.brp") == LibraryModule
+        and module_role(layout, "/nested/ops.brp") == LibraryModule
+        and module_role(layout, "/_base/types.brp") == FoundationTypesModule
     )
 
 
@@ -184,6 +205,19 @@ private func reserved(directory: String, path: String) -> Result[Bool, String]:
     )
 
 
+private func foundation_root(directory: String, file: String) -> Result[Bool, String]:
+    lib ?= library(directory, "")
+    root_path = Path.join(lib, file)
+    Ok(match load_program(root_path, lib):
+        Ok(_): False
+        Err(failure):
+            (
+                failure.diagnostic.message == "foundation modules cannot be application roots"
+                and failure.sources.modules == [{ path = root_path, contents = "" }]
+            )
+    )
+
+
 private func roles(directory: String) -> Result[Bool, String]:
     lib ?= library(directory, "import:\n    ops: Int\n")
     root_path ?= write_module(directory, "main.brp", "import:\n    ops: answer\n    ./helper: helper\n    ./library/shared: shared\nfunc main() -> Int:\n    0\n")
@@ -279,7 +313,9 @@ tests: TestSuite = {
         ("relative path projection", test_import_paths_preserve_relative_identity),
         ("invalid spelling rejected", test_import_path_rejects_invalid_spelling_identity),
         ("explicit library path", test_library_path_uses_explicit_root),
-        ("dependency roles preserve directory boundaries", test_dependency_roles_preserve_directory_boundaries),
+        ("roles follow the configured library", test_roles_follow_the_configured_library),
+        ("roles preserve directory boundaries", test_roles_preserve_directory_boundaries),
+        ("layout normalizes its root", test_layout_normalizes_its_root),
         ("filesystem root is a library directory", test_filesystem_root_is_a_library_directory),
         ("diamond loaded and parsed once", func(): in_directory(diamond)),
         ("general cycles remain accepted", func(): in_directory(cycle)),
@@ -287,6 +323,8 @@ tests: TestSuite = {
         ("relative types import reserved", func(): in_directory(func(dir): reserved(dir, "./library/_base/types"))),
         ("bare prelude import reserved", func(): in_directory(func(dir): reserved(dir, "_base/prelude"))),
         ("relative prelude import reserved", func(): in_directory(func(dir): reserved(dir, "./library/_base/prelude"))),
+        ("types cannot be the application root", func(): in_directory(func(dir): foundation_root(dir, "_base/types.brp"))),
+        ("prelude cannot be the application root", func(): in_directory(func(dir): foundation_root(dir, "_base/prelude.brp"))),
         ("roles use configured root across relative paths", func(): in_directory(roles)),
         ("missing types has source path", func(): in_directory(func(dir): missing_foundation(dir, "types.brp"))),
         ("missing prelude has source path", func(): in_directory(func(dir): missing_foundation(dir, "prelude.brp"))),
