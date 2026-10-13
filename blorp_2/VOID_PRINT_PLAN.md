@@ -17,7 +17,7 @@ func main() -> Int:
 Its stdout is exactly `Hello, World!\n`, stderr is empty and exit status is
 zero. This follows the completed UTF-8 literal increment. The existing compiler
 still builds the pilot. No input, conversion, Float, general effect system,
-implicit returns or additional control-flow form enters this increment.
+empty function bodies or additional control-flow form enters this increment.
 
 ## Semantics and precedent
 
@@ -40,8 +40,10 @@ expression must return Void. Other values must be bound or returned.
 Bindings, reassignments and expression statements may interleave. One ordered
 statement list replaces the existing binding/assignment prefix in each parsed,
 checked and concrete function or arm. A final expression remains mandatory,
-including for Void-returning functions; it can be `void` or a Void-returning
-call. Function tail matches remain terminal, and nested arm matches remain
+including for Void-returning functions. A missing return annotation means
+Void. Each Void function evaluates and discards its final expression, of any
+type, and returns canonical void; each selected match arm does the same.
+Function tail matches remain terminal, and nested arm matches remain
 outside scope. Blank lines and comments do not affect statement classification.
 
 ```blorp
@@ -57,9 +59,10 @@ func main() -> Int:
     0
 ```
 
-This prints `first\nsecond\n`. `show` returns its final print's Void value.
-Pure functions may call pure Void helpers and mutate their local variables;
-they may not call print, directly or through an impure wrapper.
+This prints `first\nsecond\n`. `show` evaluates its final print and returns
+Void. Pure functions cannot return Void, including concrete generic instances;
+they may mutate their local variables but cannot call print or any impure
+helper. Discarded final expressions still receive ordinary semantic checking.
 
 ## Facts, identity and lifetime
 
@@ -81,7 +84,10 @@ self-tail-call checks and managed intermediate-value checks.
 Void is accepted in helper parameters, returns, locals, generic instantiations
 and generic union payloads. Existing record-field and direct union-payload
 restrictions remain; Void does not implicitly widen those rules. Matching still
-requires a union, and main still takes no parameters and returns Int.
+requires a union. Main takes no parameters or one List[String] parameter and
+returns Int or Void. Int supplies its exit status; Void exits 0. Accepted
+entrypoint facts carry both conventions explicitly through specialization and
+ownership verification to C emission.
 
 The existing restrictions on managed values before a function tail match and
 inside annotated tail loops remain. Thus printing a literal before a tail match

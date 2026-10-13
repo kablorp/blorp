@@ -60,16 +60,17 @@ substitution and generic inference
 recurse through the element. Later stages never recognize a List by spelling.
 
 Signature acceptance constructs an `Entrypoint[FunctionIdentity]` variant:
-`NoArguments(id)` or `WithArguments(id)`. Both require a nongeneric Int-returning
-root function; the second requires exactly one List[String] parameter, whose
-binding name is arbitrary. Specialization translates the function identity;
+`NoArguments(id, result)` or `WithArguments(id, result)`. Both require a nongeneric
+root function returning Int or Void; `result` is the typed `IntegerExitStatus`
+or `SuccessfulExit` convention. The second requires exactly one List[String]
+parameter, whose binding name is arbitrary. Specialization translates only the function identity;
 lowering and ownership carry the accepted case. Independent verification checks
 the signature correspondence. Emission consumes it without deciding validity.
 
 The C wrapper receives argc/argv, copies each argument into a counted-byte
 String, and owns one immutable ARC list root containing those String owners.
 The target main borrows the list. The wrapper releases its root after the call,
-then returns the saved status. Final root destruction releases every child once.
+then returns the saved Int status or 0 for Void. Final root destruction releases every child once.
 The runtime uses checked allocation sizes and atomic reference counts.
 Ownership insertion and independent verification classify List ownership
 separately from inline union fields. Existing acquisition/transfer rules handle
