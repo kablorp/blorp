@@ -110,7 +110,7 @@ func main() -> Int:
 ```
 
 A variant is written as a bare value. `First.identity()` also works. Helpers
-can take and return the declared union; `main` still returns `Int`. Source
+can take and return the declared union; `main` returns `Int` or `Void`. Source
 fixtures select variants through their ordinary `main` functions and match
 the results to observable exit statuses. The host TestSuite orchestrates pilot
 compilation, builds the unmodified C output and checks each executable.
@@ -636,8 +636,8 @@ finite String-bearing payloads may nest.
 
 ## Grammar for this increment
 
-This specification defines only the examples' language: functions with explicit
-return types, an ordered list of explicitly typed parameters, an optional ordered list of type
+This specification defines only the examples' language: functions with an optional
+return annotation (omission means `Void`), an ordered list of explicitly typed parameters, an optional ordered list of type
 parameters on functions and fixed unions, plus nongeneric fixed records with
 one or more `Int` fields. Union variants have zero fields or
 one field annotated `Int` or one of the union's own parameters; concrete fields
@@ -757,12 +757,13 @@ Lexical and layout rules:
 Semantic rules:
 
 - Exactly one root function must be named `main`. It takes no parameters or one
-  `List[String]` parameter, and returns `Int`. The argument list includes the
+  `List[String]` parameter, and returns `Int` or `Void`. The argument list includes the
   executable name at index zero. A helper
   takes zero or more explicitly typed parameters with distinct names. Helper parameter and return types
   are `Int`, the signed 64-bit integer type, `String`, or a fixed union declared in this
   file, including an application of a generic union, or the function's declared
-  rigid parameter. `main` must return `Int`.
+  rigid parameter. An omitted return annotation means `Void`. Pure functions
+  cannot return `Void`, including concrete generic instances.
 - Union types have nominal identity. Equal variant positions or shared variant
   spellings do not make two unions interchangeable. Union type names must be
   unique in their module and cannot replace implicitly visible base types; each union's variant names must be unique.
@@ -806,7 +807,9 @@ Semantic rules:
   to call the parameter and is rejected. UFCS supplies the receiver first, followed
   by the explicitly written arguments. Every argument is evaluated left to right
   exactly once before the call.
-- Each argument and final return expression must match its receiving type.
+- Each argument must match its receiving type, as must the final expression
+  of a non-Void function. A Void function's final expression synthesizes its own type
+  and is evaluated and discarded.
   Unary call-edge mismatches highlight the callee name; multiple-argument
   mismatches highlight the disagreeing argument occurrence;
   constructor lookup errors highlight the variant name. Return mismatches highlight
@@ -814,9 +817,10 @@ Semantic rules:
 - A match scrutinee must synthesize a declared union type from a binding or
   function result. `match Empty:` and `match Number(42):` lack a receiving type;
   no type is guessed from patterns or the containing function's return type.
-  Integer scrutinees are outside this increment. Each arm result must match
-  the containing function's declared result type, which may differ from the
-  matched union. All arms are checked, including ones a constant scrutinee
+  Integer scrutinees are outside this increment. Each arm of a non-Void function
+  must match that function's declared result type, which may differ from
+  the matched union. Void functions evaluate and discard the selected arm's
+  result. All arms are checked, including ones a constant scrutinee
   cannot select.
 - An unshadowed constructor spelling in a bare pattern selects that variant
   of the matched union. Other bare names, including a spelling shadowed by a
@@ -874,10 +878,15 @@ Semantic rules:
   uses a distinct struct with an enum tag and a C union containing a correctly
   typed member for each payload-bearing variant. Nullary construction supplies
   only its tag; omitted storage is zero-initialized. A separate C wrapper calls
-  the checked entrypoint and converts the result to the process exit status.
+  the checked entrypoint and converts an `Int` result to the process exit status,
+  or discards a `Void` result and exits 0. Checking publishes both the argument
+  convention and result convention as typed entrypoint facts; later phases
+  preserve them rather than rediscovering them from a signature.
   A nullary entrypoint uses `int main(void)`; an argument-taking entrypoint
   uses `int main(int argc,char **argv)` and owns the argument list for the call.
-- The final expression is the return value. No explicit `return` is needed.
+- The final expression is the return value for a non-`Void` function. A `Void`
+  function evaluates and discards it, releasing any owned result, then returns
+  `void`. No explicit `return` is needed.
 - `String` is an immutable managed leaf. The default prelude supplies UFCS
   operations such as `to_string(Int) -> String` and `length(String) -> Int`.
   Direct calls require named function imports. Parameters borrow for the duration of a
@@ -1069,9 +1078,32 @@ surface numeric type.
 
 Bindings, reassignment and bare Void expressions execute in source order. A
 non-final bare expression of another type is rejected with help to bind or
-return its result. Every block still needs a final expression. A Void-returning
-helper may finish with `void` or a call returning Void, while main still returns
-Int. Both function prefixes and match-arm blocks use the same statement rules.
+return its result. Every block still needs a final expression. Omitting a
+function's return annotation means `Void`, exactly like writing `-> Void`.
+A Void-returning function evaluates and discards its final expression,
+regardless of its type, and returns `void`. A discarded managed result is
+released through the ordinary ownership pipeline. Each selected match arm
+follows the same rule, so its final expression may differ in type from other
+arms. Discarding does not suppress errors or side effects in that expression.
+
+`main` accepts either `Int` or `Void`. An Int result supplies the process exit
+status; a Void result always exits 0. Both forms accept no parameters or one
+`List[String]` parameter. A pure function cannot return Void, whether explicitly
+annotated, omitted, or established by generic instantiation.
+
+```blorp
+import:
+    io: print
+func main():
+    print("Hello, World!")
+```
+
+This has the same behavior as `func main() -> Void:`. A final `17` would also
+exit 0 after being evaluated and discarded. A `pure func main()` declaration
+is rejected; pure main must return Int. The
+[main signature fixtures](test/e2e/test_main_signatures.brp) cover pure and
+impure Int entrypoints and explicit and omitted Void entrypoints, with and
+without arguments, through their ordinary native main functions.
 
 Managed prefixes before a tail match and managed temporaries in annotated tail
 loops retain their existing restrictions. Printing a literal before a tail
@@ -1301,8 +1333,10 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    renderer and pipeline tests pin wording independently. UFCS receiver mismatch
    occurrences retain the existing call-span limitation. Expression synthesis
    owns one shared traversal with optional constructor-only context. New bindings
-   and match scrutinees synthesize their types; returns, arms and reassignment
-   explicitly check a known type and its source. Argument checking elaborates all
+   and match scrutinees synthesize their types; non-Void returns, non-Void arms
+   and reassignment explicitly check a known type and its source. Void function
+   tails synthesize and then discard their values before returning canonical
+   void. Argument checking elaborates all
    children before instantiation and mismatch validation, preserving error order.
    Complete outer receiver contracts are resolved before their children. Generic
    argument inference remains one-way; contextual inference and structural

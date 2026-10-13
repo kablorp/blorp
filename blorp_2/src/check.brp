@@ -53,6 +53,7 @@ import:
 		BindingSyntax(ImmutableBinding, MutableBinding),
 		CallNotation(DirectCall, ReceiverCall),
 		Entrypoint(NoArguments, WithArguments),
+		EntryResult(IntegerExitStatus, SuccessfulExit),
 		ExpressionBase(
 			VoidExpression, IntegerExpression, FloatExpression, StringExpression, NameExpression,
 			DirectApplication, RecordExpression,
@@ -555,6 +556,7 @@ fixed union CheckErrorKind:
 	ListTypeArgumentCount
 	UnsupportedListElement
 	MainReturnType(TypeRef)
+	PureVoidReturn
 	MissingMain
 	UnknownType(NameId)
 	MissingUnionTypeArguments(UnionId, Int)
@@ -1355,6 +1357,13 @@ private pure func resolve_parameters(
 			Ok(resolved)
 
 
+private pure func validate_pure_result(purity: Purity, value_type: TypeRef, span: Span) -> Result[Void, CheckError]:
+	if same_purity(purity, Pure) and same_type(value_type, VoidType):
+		Err(check_rejection(span, PureVoidReturn))
+	else:
+		Ok(void)
+
+
 private pure func resolve_signature(
 	function: ParsedFunction,
 	id: FunctionId,
@@ -1364,20 +1373,20 @@ private pure func resolve_signature(
 	checked_unions: List[CheckedUnion],
 ) -> Result[AcceptedFunctionDeclaration, CheckError]:
 	local_parameters ?= resolve_type_parameters(function, id, namespace, role)
-	return_type ?= resolve_type(
-		unions,
-		function.return_type,
-		local_parameters,
-		namespace,
-		function.module,
-	)
+	return_type ?= match function.return_type:
+		Some(written): resolve_type(unions, written, local_parameters, namespace, function.module)
+		None: Ok(VoidType)
+	return_span = match function.return_type:
+		Some(written): type_span(written)
+		None: function.function_name.span
+	pure_result ?= validate_pure_result(function.purity, return_type, return_span)
 
 	main_type ?= match role:
 		EntryFunction:
-			if same_type(return_type, IntType):
+			if same_type(return_type, IntType) or same_type(return_type, VoidType):
 				Ok(void)
 			else:
-				Err(check_rejection(type_span(function.return_type), MainReturnType(return_type)))
+				Err(check_rejection(return_span, MainReturnType(return_type)))
 		HelperFunction:
 			Ok(void)
 
@@ -1398,7 +1407,7 @@ private pure func resolve_signature(
 		parameters = parameters,
 		return_type = {
 			value_type = return_type,
-			span = type_span(function.return_type)
+			span = return_span
 		}
 	}
 
@@ -1482,11 +1491,15 @@ private pure func validate_signatures(
 						.get(function_number(id))
 						.to_result(checker_invariant(end, InvalidResolvedFunction(id)))
 
+					result = if same_type(declaration.signature.return_type.value_type, VoidType):
+						SuccessfulExit
+					else:
+						IntegerExitStatus
 					accepted: Entrypoint[FunctionId] = match declaration.signature.parameters:
 						[]:
-							NoArguments(id)
+							NoArguments(id, result)
 						_:
-							WithArguments(id)
+							WithArguments(id, result)
 
 					Ok({
 						functions = signatures,
@@ -1578,6 +1591,7 @@ private fixed union CallOperation:
 
 
 private fixed record CallContract {
+	purity: Purity,
 	type_parameters: List[TypeParameterId],
 	operation: CallOperation,
 	parameter_types: List[TypeUse],
@@ -2130,6 +2144,7 @@ private pure func function_contract(
 		resolved.call.target,
 	)
 	Ok({
+		purity = resolved.signature.purity,
 		type_parameters = resolved.signature.type_parameters,
 		operation = FunctionCall(resolved.call),
 		parameter_types = resolved.signature.parameters,
@@ -2334,6 +2349,7 @@ private pure func unary_constructor(
 			Err(check_rejection(name.span, PayloadFreeVariantCalled(contract.variant)))
 		Some(payload):
 			Ok({
+				purity = Pure,
 				type_parameters = [],
 				operation = VariantConstruction(contract.variant),
 				parameter_types = [payload],
@@ -3237,6 +3253,7 @@ private pure func instantiate_contract(
 				Ok(void)
 
 		return_type ?= substitute_type(contract.return_type, arguments, contract.span)
+		pure_result ?= validate_pure_result(contract.purity, return_type, contract.span)
 
 		operation ?= match contract.operation:
 			FunctionCall(call):
@@ -3530,14 +3547,11 @@ private pure func resolve_arm(
 			bindings
 
 	prefix ?= resolve_statements(arm.statements, purity, pattern.scope, definitions, context)
-	value ?= check_value(
+	value ?= resolve_return_value(
 		purity,
 		prefix.scope,
 		arm.body,
-		{
-			value_type = return_type.value_type,
-			site = SourceAnnotation(return_type.span)
-		},
+		return_type,
 		context,
 	)
 	Ok({
@@ -3972,6 +3986,24 @@ private pure func validate_boolean_role(
 			Err(check_rejection(span, BuiltinBooleanPayload))
 
 
+-- Void tails have no expected value type: each expression is still fully checked,
+-- then its value is discarded after tail-recursion analysis, before publication.
+private pure func resolve_return_value(
+	purity: Purity,
+	scope: List[LocalBinding],
+	written: ValueExpression,
+	return_type: TypeUse,
+	context: ResolutionContext,
+) -> Result[ResolvedValue, CheckError]:
+	if same_type(return_type.value_type, VoidType):
+		synthesize_value(purity, scope, written, None, context)
+	else:
+		check_value(purity, scope, written, {
+			value_type = return_type.value_type,
+			site = SourceAnnotation(return_type.span)
+		}, context)
+
+
 private pure func resolve_body(
 	function: ParsedFunction,
 	signature: FunctionSignature,
@@ -4016,14 +4048,11 @@ private pure func resolve_body(
 				})),
 			})
 		ParsedValueBody(body):
-			value ?= check_value(
+			value ?= resolve_return_value(
 				signature.purity,
 				prefix.scope,
 				body,
-				{
-					value_type = signature.return_type.value_type,
-					site = SourceAnnotation(signature.return_type.span)
-				},
+				signature.return_type,
 				context,
 			)
 			Ok({
@@ -4106,13 +4135,63 @@ private pure func resolve_function(
 	signature = declaration.signature
 	body ?= resolve_body(function, signature, context, declaration.runtime)
 	checked ?= check_execution(function, body, context.function)
+	normalized = if same_type(signature.return_type.value_type, VoidType):
+		normalize_void_body(body.statements, checked.body)
+	else:
+		{ statements = body.statements, body = checked.body }
 	Ok({
 		execution = checked.execution,
 		signature = signature,
 		bindings = body.bindings,
-		statements = body.statements,
-		body = checked.body,
+		statements = normalized.statements,
+		body = normalized.body,
 	})
+
+
+private fixed record NormalizedVoidExit {
+	statements: List[CheckedStatement],
+	exit: CheckedExit
+}
+
+
+private pure func normalize_void_exit(statements: List[CheckedStatement], exit: CheckedExit) -> NormalizedVoidExit:
+	match exit:
+		RecurWith(_, _): { statements = statements, exit = exit }
+		ReturnExpression(value):
+			canonical = match value.base:
+				ReturnVoid: value.operations.is_empty()
+				_: False
+			if canonical:
+				{ statements = statements, exit = exit }
+			else:
+				{
+					statements = statements.append(DiscardExpression(value)),
+					exit = ReturnExpression({
+						base = ReturnVoid,
+						base_type = VoidType,
+						base_span = value.base_span,
+						operations = [],
+					}),
+				}
+
+
+private fixed record NormalizedVoidBody {
+	statements: List[CheckedStatement],
+	body: CheckedBody
+}
+
+
+private pure func normalize_void_body(statements: List[CheckedStatement], body: CheckedBody) -> NormalizedVoidBody:
+	match body:
+		CheckedValueBody(exit):
+			normalized = normalize_void_exit(statements, exit)
+			{ statements = normalized.statements, body = CheckedValueBody(normalized.exit) }
+		CheckedMatchBody(matched):
+			arms = matched.arms.map(pure func(arm: CheckedArm) -> CheckedArm:
+				normalized = normalize_void_exit(arm.statements, arm.body)
+				{ arm | statements = normalized.statements, body = normalized.exit }
+			)
+			{ statements = statements, body = CheckedMatchBody({ matched | arms = arms }) }
 
 
 private pure func is_self_call(call: CheckedCall, current: FunctionId) -> Bool:

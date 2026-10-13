@@ -11,7 +11,8 @@ ordinary C stack usage; generic recursion must have finite concrete instances,
 and cyclic runtime data remains forbidden. Local selective function imports use
 explicit `./` or leading `../` paths; callees retain their defining module's
 scope, and only a root-local main supplies the entrypoint. It accepts either
-`main() -> Int` or `main(args: List[String]) -> Int`; argument index 0 is the
+no arguments or one `List[String]` argument, with an `Int` or `Void` result;
+argument index 0 is the
 executable name. The required `--library-root` supplies the foundation types
 and constructors, an ordinary prelude, and bare target-library imports. User
 helper modules receive the same defaults; library operation modules receive
@@ -25,7 +26,10 @@ The pilot also supports the single-value `Void` type and `void` literal,
 ordered binding and Void expression statements, and explicitly imported
 concrete `io.print(String) -> Void`. Print borrows its String, writes all bytes
 followed by LF, and is forbidden in pure callers. Every block retains an
-explicit final expression; main still returns Int. Selective union imports
+explicit final expression. Omitting a function's return annotation means Void;
+a Void function evaluates and discards its final expression, including any
+owned result, and Void main exits 0. Pure functions cannot return Void,
+including concrete generic instances. Selective union imports
 preserve ordinary nominal type and constructor identities. Base already supplies
 Bool, Option, Result and their constructors in every module. Concrete
 `string.parse_int` consumes complete ASCII

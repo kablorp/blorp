@@ -1,0 +1,538 @@
+import:
+	../../src/check as Check
+	../../src/lex: lex
+	../../src/lower as Lower
+	../../src/own as Own
+	../../src/parse: parsed_contents
+	../../src/source: module_source, root_module_id, same_module
+	../../src/specialize as Concrete
+	../../src/syntax as Syntax
+	../../src/verify: verify
+	compilation: compile
+	input: parse, check, check_failure, setup_diagnostic
+	test: TestSuite
+
+
+private pure func accepts(source: String) -> Bool:
+	compile(source).is_ok()
+
+
+private pure func rejects(source: String, message: String, help: String, start: Int, end: Int) -> Bool:
+	match compile(source):
+		Err(errors):
+			errors.remaining.is_empty() and errors.first.message == message and errors.first.help == help and errors.first.span.start == start and errors.first.span.end == end
+		Ok(_): False
+
+
+private pure func checked(source: String) -> Result[Check.CheckedProgram, Syntax.Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source)
+	parsed ?= parse(tokens)
+	check(parsed).map_err(setup_diagnostic)
+
+
+private pure func lowered(source: String) -> Result[Lower.LoweredProgram, Syntax.Diagnostic]:
+	checked(source)
+		.and_then(pure func(program): Concrete.specialize(program))
+		.and_then(pure func(program): Lower.lower(program))
+
+
+private pure func owned(source: String) -> Result[Own.OwnershipProgram, Syntax.Diagnostic]:
+	lowered(source).and_then(pure func(program): Own.own(program))
+
+
+private pure func rejects_pure_void(source: String, start: Int, end: Int) -> Bool:
+	typed = match check_failure(source):
+		Some(error):
+			match error.kind:
+				Check.PureVoidReturn: True
+				_: False
+		None: False
+	match compile(source):
+		Err(errors):
+			(
+				typed and errors.remaining.is_empty()
+				and errors.first.message == "pure functions cannot return Void"
+				and errors.first.help == "remove pure, or return a non-Void value"
+				and errors.first.span.start == start
+				and errors.first.span.end == end
+			)
+		Ok(_): False
+
+
+pure func test_main_can_omit_its_void_annotation() -> Bool:
+	source: String =
+		|func main():
+		|    17
+		|
+	accepts(source)
+
+
+pure func test_explicit_void_main_discards_its_integer_tail() -> Bool:
+	source: String =
+		|func main() -> Void:
+		|    17
+		|
+	accepts(source)
+
+
+pure func test_argv_main_can_omit_its_void_annotation() -> Bool:
+	source: String =
+		|func main(arguments: List[String]):
+		|    arguments
+		|
+	accepts(source)
+
+
+pure func test_void_helper_discards_its_managed_tail() -> Bool:
+	source: String =
+		|func effect():
+		|    "owned"
+		|func main() -> Int:
+		|    effect()
+		|    0
+		|
+	accepts(source)
+
+
+pure func test_void_match_discards_different_arm_types() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|    First
+		|    Second
+		|func effect(choice: Choice):
+		|    match choice:
+		|        First: 7
+		|        Second: "owned"
+		|func main() -> Int:
+		|    effect(First)
+		|    effect(Second)
+		|    0
+		|
+	accepts(source)
+
+
+pure func test_pure_explicit_void_return_is_rejected() -> Bool:
+	source: String =
+		|pure func effect() -> Void:
+		|    void
+		|func main() -> Int:
+		|    0
+		|
+	rejects_pure_void(source, 22, 26)
+
+
+pure func test_pure_omitted_return_is_rejected() -> Bool:
+	source: String =
+		|pure func effect():
+		|    7
+		|func main() -> Int:
+		|    0
+		|
+	rejects_pure_void(source, 10, 16)
+
+
+pure func test_pure_generic_void_result_is_rejected_at_the_call() -> Bool:
+	source: String =
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|func main() -> Int:
+		|    identity(void)
+		|    0
+		|
+	rejects_pure_void(source, 72, 80)
+
+
+pure func test_void_tail_recursion_keeps_its_loop_contract() -> Bool:
+	source: String =
+		|@tail_recursive func main():
+		|    main()
+		|
+	match compile(source):
+		Ok(output): output.contains("while (1)")
+		Err(_): False
+
+
+pure func test_int_main_remains_supported() -> Bool:
+	source: String =
+		|pure func main() -> Int:
+		|    17
+		|
+	accepts(source)
+
+
+pure func test_parser_preserves_an_absent_return_annotation() -> Bool:
+	source: String =
+		|func main():
+		|    0
+		|
+	match lex(module_source(root_module_id()), source).and_then(pure func(tokens): parse(tokens)):
+		Ok(program):
+			match parsed_contents(program).functions.filter(pure func(row): same_module(row.module, root_module_id())):
+				[function]: function.return_type.is_none()
+				_: False
+		Err(_): False
+
+
+pure func test_checker_publishes_discard_and_canonical_void_without_binding() -> Bool:
+	source: String =
+		|func main():
+		|    "owned"
+		|
+	match checked(source):
+		Ok(program):
+			contents = Check.checked_functions(program)
+			match (contents.entrypoint, contents.functions):
+				(Syntax.NoArguments(_, Syntax.SuccessfulExit), [function]):
+					match (function.statements, function.body):
+						([Check.DiscardExpression(value)], Check.CheckedValueBody(Check.ReturnExpression(result))):
+							match (value.base, result.base):
+								(Check.ReturnString("owned"), Check.ReturnVoid):
+									function.bindings.is_empty() and Check.same_type(value.base_type, Check.StringType) and Check.same_type(result.base_type, Check.VoidType)
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_lowering_keeps_managed_tail_before_canonical_void() -> Bool:
+	source: String =
+		|func main():
+		|    "owned"
+		|
+	match lowered(source):
+		Ok(program):
+			match Lower.lowered_functions(program).functions:
+				[function]:
+					match (function.definitions, function.tail):
+						([text, unit], Lower.ExitValue(Lower.ReturnValue(result))):
+							match (text.operation, unit.operation):
+								(Lower.StringValue("owned"), Lower.VoidValue): Lower.value_number(result) == Lower.value_number(unit.id)
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_ownership_drops_managed_string_tail() -> Bool:
+	source: String =
+		|func main():
+		|    "owned"
+		|
+	match owned(source):
+		Ok(program):
+			match program.functions:
+				[function]:
+					match (function.operations, function.tail):
+						([Own.DefineValue(text), Own.DropOwner(dropped, _), Own.DefineValue(unit)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(result)))):
+							match (text.operation, text.result, unit.operation):
+								(Own.StringDefinition("owned"), Own.OwnedResult(owner), Own.VoidDefinition):
+									Own.owner_number(owner) == Own.owner_number(dropped) and Lower.value_number(result) == Lower.value_number(unit.id) and verify(program).is_ok()
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_verifier_rejects_successful_exit_for_int_signature() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    17
+		|
+	match owned(source):
+		Ok(program):
+			match verify({ program | entrypoint = Syntax.NoArguments(Syntax.entry_function(program.entrypoint), Syntax.SuccessfulExit) }):
+				Err(error): error.message == "ownership verification failed: entrypoint signature does not match its accepted argument and result conventions"
+				Ok(_): False
+		Err(_): False
+
+
+pure func test_verifier_rejects_integer_exit_for_void_signature() -> Bool:
+	source: String =
+		|func main():
+		|    17
+		|
+	match owned(source):
+		Ok(program):
+			match verify({ program | entrypoint = Syntax.NoArguments(Syntax.entry_function(program.entrypoint), Syntax.IntegerExitStatus) }):
+				Err(error): error.message == "ownership verification failed: entrypoint signature does not match its accepted argument and result conventions"
+				Ok(_): False
+		Err(_): False
+
+
+pure func test_discarded_unknown_name_is_still_a_typed_error() -> Bool:
+	source: String =
+		|func main():
+		|    missing
+		|
+	typed = match check_failure(source):
+		Some(error):
+			match error.kind:
+				Check.UnknownValue(_): True
+				_: False
+		None: False
+	typed and rejects(source, "unknown value", "use this function's parameter name, a declared variant, or a call", 17, 24)
+
+
+pure func test_discarded_invalid_argument_is_still_a_typed_error() -> Bool:
+	source: String =
+		|pure func take(value: Int) -> Int:
+		|    value
+		|func main():
+		|    take("wrong")
+		|
+	typed = match check_failure(source):
+		Some(error):
+			match error.kind:
+				Check.ArgumentTypeMismatch(_): True
+				_: False
+		None: False
+	typed and rejects(source, "argument type does not match the parameter type", "use an expression of type Int here", 62, 66)
+
+
+pure func test_pure_void_rejection_is_typed() -> Bool:
+	source: String =
+		|pure func main():
+		|    17
+		|
+	match check_failure(source):
+		Some(error):
+			match error.kind:
+				Check.PureVoidReturn: True
+				_: False
+		None: False
+
+
+pure func test_transitive_generic_pure_void_is_rejected_on_specialization() -> Bool:
+	source: String =
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|func discard[T](value: T) -> Int:
+		|    saved = identity(value)
+		|    0
+		|func main() -> Int:
+		|    discard(void)
+		|
+	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
+		Err(error):
+			error.message == "pure functions cannot return Void" and error.help == "remove pure, or return a non-Void value" and error.span.start == 35 and error.span.end == 36
+		Ok(_): False
+
+
+pure func test_nullary_void_wrapper_discards_result_and_returns_zero() -> Bool:
+	source: String =
+		|func main():
+		|    17
+		|
+	match compile(source):
+		Ok(output): output.contains("int main(void){(void)blorp_f_0();return 0;}")
+		Err(_): False
+
+
+pure func test_argv_void_wrapper_releases_arguments_before_returning_zero() -> Bool:
+	source: String =
+		|func main(arguments: List[String]):
+		|    arguments
+		|
+	match compile(source):
+		Ok(output): output.contains("(void)blorp_f_0(blorp_arguments);blorp_string_list_release(blorp_arguments);return 0;}")
+		Err(_): False
+
+
+pure func test_ownership_drops_discarded_managed_union_result() -> Bool:
+	source: String =
+		|fixed union Box[T]:
+		|    Box(T)
+		|pure func boxed(value: String) -> Box[String]:
+		|    Box(value)
+		|func main():
+		|    boxed("owned")
+		|
+	match owned(source):
+		Ok(program):
+			match program.functions:
+				[main, _]:
+					var dropped_union = False
+					for operation in main.operations:
+						match operation:
+							Own.DefineValue(definition):
+								match (definition.value_type, definition.result):
+									(Concrete.UnionType(_), Own.OwnedResult(owner)):
+										dropped_union = main.operations.filter(pure func(operation):
+											match operation:
+												Own.DropOwner(dropped, _): Own.owner_number(owner) == Own.owner_number(dropped)
+												_: False
+										).length() == 1
+									_: void
+							_: void
+					dropped_union and verify(program).is_ok()
+				_: False
+		Err(_): False
+
+
+private pure func drop_count(operations: List[Own.OwnershipOperation]) -> Int:
+	operations.filter(pure func(operation):
+		match operation:
+			Own.DropOwner(_, _): True
+			_: False
+	).length()
+
+
+pure func test_void_match_cleanup_is_local_to_the_selected_arm() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|    First
+		|    Second
+		|func effect(choice: Choice):
+		|    match choice:
+		|        First: 7
+		|        Second: "owned"
+		|func main():
+		|    effect(First)
+		|
+	match owned(source):
+		Ok(program):
+			match program.functions:
+				[_, effect]:
+					match effect.tail:
+						Own.MatchTail(matched):
+							match matched.arms:
+								[first, second]: drop_count(first.operations) == 0 and drop_count(second.operations) == 1 and verify(program).is_ok()
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_void_match_recursion_preserves_recur_and_normalizes_terminal_arm() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|    First
+		|    Second
+		|@tail_recursive func effect(choice: Choice):
+		|    match choice:
+		|        First: 7
+		|        Second: effect(First)
+		|func main():
+		|    effect(Second)
+		|
+	match checked(source):
+		Ok(program):
+			match Check.checked_functions(program).functions:
+				[effect, _]:
+					match (effect.execution, effect.body):
+						(Syntax.SelfTailLoop(_), Check.CheckedMatchBody(matched)):
+							match matched.arms:
+								[first, second]:
+									match (first.statements, first.body, second.statements, second.body):
+										([Check.DiscardExpression(_)], Check.ReturnExpression(value), [], Check.RecurWith([_], _)):
+											match value.base:
+												Check.ReturnVoid: accepts(source)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_pure_argv_main_cannot_omit_its_return_type() -> Bool:
+	source: String =
+		|pure func main(arguments: List[String]):
+		|    arguments
+		|
+	rejects_pure_void(source, 10, 14)
+
+
+pure func test_argv_verifier_checks_the_result_convention() -> Bool:
+	source: String =
+		|func main(arguments: List[String]):
+		|    arguments
+		|
+	match owned(source):
+		Ok(program):
+			match verify({ program | entrypoint = Syntax.WithArguments(Syntax.entry_function(program.entrypoint), Syntax.IntegerExitStatus) }):
+				Err(error): error.message == "ownership verification failed: entrypoint signature does not match its accepted argument and result conventions"
+				Ok(_): False
+		Err(_): False
+
+
+pure func test_ownership_drops_the_discarded_list_result_but_not_borrowed_argv() -> Bool:
+	source: String =
+		|func alias(arguments: List[String]) -> List[String]:
+		|    arguments
+		|func main(arguments: List[String]):
+		|    alias(arguments)
+		|
+	match owned(source):
+		Ok(program):
+			match program.functions:
+				[main, _]:
+					match (main.operations, main.tail):
+						([Own.DefineValue(argv), Own.DefineValue(call), Own.DropOwner(dropped, _), Own.DefineValue(unit)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(result)))):
+							match (argv.result, (call.value_type, call.result), call.operation, unit.operation):
+								(Own.BorrowedResult(Own.ParameterBorrow(parameter)), (Concrete.ListType(Concrete.StringType), Own.OwnedResult(owner)), Own.CallDefinition(_, [Own.BorrowedArgument(argument)]), Own.VoidDefinition):
+									(
+										Lower.value_number(parameter) == Lower.value_number(argv.id)
+										and Lower.value_number(argument.value) == Lower.value_number(argv.id)
+										and Own.owner_number(owner) == Own.owner_number(dropped)
+										and drop_count(main.operations) == 1
+										and Lower.value_number(result) == Lower.value_number(unit.id)
+										and verify(program).is_ok()
+									)
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_pure_nullary_main_cannot_explicitly_return_void() -> Bool:
+	source: String =
+		|pure func main() -> Void:
+		|    17
+		|
+	rejects_pure_void(source, 20, 24)
+
+
+pure func test_pure_argv_main_cannot_explicitly_return_void() -> Bool:
+	source: String =
+		|pure func main(arguments: List[String]) -> Void:
+		|    arguments
+		|
+	rejects_pure_void(source, 43, 47)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 Void function return conventions",
+	tests = [
+		("main omits Void annotation", test_main_can_omit_its_void_annotation),
+		("explicit Void main discards Int", test_explicit_void_main_discards_its_integer_tail),
+		("argv main omits Void annotation", test_argv_main_can_omit_its_void_annotation),
+		("Void helper discards managed tail", test_void_helper_discards_its_managed_tail),
+		("Void match discards heterogeneous arms", test_void_match_discards_different_arm_types),
+		("pure explicit Void rejected", test_pure_explicit_void_return_is_rejected),
+		("pure omitted return rejected", test_pure_omitted_return_is_rejected),
+		("pure generic Void rejected", test_pure_generic_void_result_is_rejected_at_the_call),
+		("Void tail recursion remains a loop", test_void_tail_recursion_keeps_its_loop_contract),
+		("pure Int main preserved", test_int_main_remains_supported),
+		("parser retains absent annotation", test_parser_preserves_an_absent_return_annotation),
+		("checker publishes discard and canonical Void", test_checker_publishes_discard_and_canonical_void_without_binding),
+		("lowering keeps discarded String definition", test_lowering_keeps_managed_tail_before_canonical_void),
+		("ownership drops discarded String", test_ownership_drops_managed_string_tail),
+		("verifier rejects success for Int", test_verifier_rejects_successful_exit_for_int_signature),
+		("verifier rejects Int status for Void", test_verifier_rejects_integer_exit_for_void_signature),
+		("discarded unknown name still checked", test_discarded_unknown_name_is_still_a_typed_error),
+		("discarded invalid argument still checked", test_discarded_invalid_argument_is_still_a_typed_error),
+		("pure Void error is typed", test_pure_void_rejection_is_typed),
+		("transitive pure Void rejected in specialization", test_transitive_generic_pure_void_is_rejected_on_specialization),
+		("nullary Void wrapper returns zero", test_nullary_void_wrapper_discards_result_and_returns_zero),
+		("argv Void wrapper releases then returns zero", test_argv_void_wrapper_releases_arguments_before_returning_zero),
+		("ownership drops discarded managed union", test_ownership_drops_discarded_managed_union_result),
+		("Void match drops only in managed arm", test_void_match_cleanup_is_local_to_the_selected_arm),
+		("Void match preserves recur and terminal exit", test_void_match_recursion_preserves_recur_and_normalizes_terminal_arm),
+		("pure argv main needs non-Void result", test_pure_argv_main_cannot_omit_its_return_type),
+		("argv verifier checks result convention", test_argv_verifier_checks_the_result_convention),
+		("owned List tail dropped without dropping argv borrow", test_ownership_drops_the_discarded_list_result_but_not_borrowed_argv),
+		("pure nullary main rejects explicit Void", test_pure_nullary_main_cannot_explicitly_return_void),
+		("pure argv main rejects explicit Void", test_pure_argv_main_cannot_explicitly_return_void),
+	]
+}

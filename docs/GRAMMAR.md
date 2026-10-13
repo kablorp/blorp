@@ -14,7 +14,10 @@ loaded and parsed once, including the designated `_base/types.brp` and ordinary
 including `builtin("int.add")`, with an exact runtime signature.
 Imports preserve declaration identities; only the root module's local `main`
 is the entrypoint. It takes either no parameters or one List[String] parameter
-and returns Int. The foundation declares the unary builtin type with
+and returns Int or Void. Omitting a function's return annotation means Void.
+A Void function evaluates and discards its final expression, even when its
+type is not Void, and Void main always exits 0. Pure functions cannot return
+Void, including concrete generic instances. The foundation declares the unary builtin type with
 `type List[T] = builtin`; other concrete List elements remain unsupported.
 Ordinary program String literals accept valid UTF-8 and the full language's
 fixed and Unicode scalar escapes, with single-line quoted syntax and
