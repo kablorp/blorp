@@ -83,7 +83,8 @@ owner. Rebinding changes the source binding's current value, never the earlier
 value identity. The owned-prefix match guard remains until transitive borrow-use
 scheduling and edge cleanup are supported; even an already-dropped owned prefix
 is excluded. Managed self-tail-loop signatures/intermediates also remain excluded.
-Step-6 validation status and cost stops live in [GENERICS_HANDOFF.md](GENERICS_HANDOFF.md).
+Managed-payload validation and cost evidence live in the
+[increment report](../benchmarks/results/blorp_2_managed_union_payloads_2026-10-11.md).
 
 Self and mutual function recursion use declared call contracts, independently of
 body order or call-graph cycles. Concrete instance keys are requested once;

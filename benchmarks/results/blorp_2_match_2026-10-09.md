@@ -12,7 +12,7 @@ Hypothesis: a typed body sum, function-owned binding identities and explicit
 constructor contracts extend the pure unary-expression pipeline without another
 global registry or compiler pass. Syntax resolves to complete checked facts;
 emission consumes those facts without repeating resolution or semantic checks.
-The retained [design](../../blorp_2/MATCH_PLAN.md) compares the implementation
+The retained [design](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/MATCH_PLAN.md) compares the implementation
 strategies in Haskell, OCaml, Rust, Scala and Elm.
 
 The first example is [match/value.brp](../../blorp_2/test/e2e/fixtures/match/value.brp):

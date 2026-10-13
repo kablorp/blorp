@@ -2,7 +2,7 @@
 
 Validated 2026-10-12 in worktree `b630`, based on
 `45f59148cf3671faa7ed65f09a41c56f45f87b80`. Changes remain uncommitted.
-The [design](../../blorp_2/ARGUMENTS_PLAN.md) owns scope and acceptance criteria.
+The [design](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/ARGUMENTS_PLAN.md) owns scope and acceptance criteria.
 One local evidence entrypoint is `blorp_2/build/argv/README.md`.
 
 ## Behavior and authoritative facts

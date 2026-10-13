@@ -1,10 +1,10 @@
 # Blorp 2 calculator completion
 
-All nine increments of the [calculator roadmap](../../blorp_2/CALCULATOR_PLAN.md)
+All nine increments of the [calculator roadmap](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/CALCULATOR_PLAN.md)
 are implemented. This report covers steps 5–9, starting from the frozen
-String/Void/print compiler. The [completion design](../../blorp_2/CALCULATOR_COMPLETION_PLAN.md),
-[Option/input design](../../blorp_2/OPTION_INPUT_PLAN.md) and
-[Float design](../../blorp_2/FLOAT_PLAN.md) retain the contracts and acceptance criteria.
+String/Void/print compiler. The [completion design](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/CALCULATOR_COMPLETION_PLAN.md),
+[Option/input design](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/OPTION_INPUT_PLAN.md) and
+[Float design](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/FLOAT_PLAN.md) retain the contracts and acceptance criteria.
 
 The ordinary [integer](../../blorp_2/test/e2e/fixtures/calculator/integer.brp) and
 [Float](../../blorp_2/test/e2e/fixtures/calculator/float.brp) programs read an

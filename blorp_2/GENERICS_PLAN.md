@@ -271,7 +271,8 @@ Record later record/recursion increments when their concrete example and scope
 are established. Do not mark an item complete until its affected phase tests,
 native checks and independent reviews pass.
 
-Managed payload implementation follows the approved [step-6 handoff](GENERICS_HANDOFF.md).
+Managed payload implementation and its approved historical handoff are recorded
+in the [step-6 report](../benchmarks/results/blorp_2_managed_union_payloads_2026-10-11.md).
 Its first red pins the former String rejection. The complete path passes all
 82 granular phase callbacks, 1,021 combined strict checks and 134 real-main
 native fixtures, including twelve managed examples and a depth-20 case. Eight

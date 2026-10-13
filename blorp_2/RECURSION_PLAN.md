@@ -2,6 +2,8 @@
 
 The user approved this sequence on 2026-10-10. Each increment must pass its
 own phase tests and independent compiler review before the next is enabled.
+Function recursion and unmanaged direct-self tail loops are implemented.
+Recursive data, generic tail loops and managed tail loops remain unimplemented.
 The README and grammar, rather than this plan, describe implemented support.
 Read both [AGENTS.md](AGENTS.md) and the [parent AGENTS.md](../AGENTS.md).
 
@@ -232,3 +234,38 @@ A useful List needs both a head and a tail. Multiple constructor fields or an
 appropriate record payload are another explicit increment, followed by managed
 element cases and their complete destruction tests. Supporting recursion alone
 does not claim these collections or their efficient representations are ready.
+
+## Tail-recursion follow-ups
+
+The current `@tail_recursive` contract and exact million-iteration fixture are
+described in [README](README.md); the
+[argument validation report](../benchmarks/results/blorp_2_arguments_2026-10-12.md)
+also records the separate billion-iteration stress run. Those oracles are
+already implemented. The [original design](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/TAIL_RECURSION_PLAN.md)
+retains the cross-language research and delivered phase contracts.
+
+The remaining increments are:
+
+1. **Same-instance generics.** Accept a self call only when its substitution
+   preserves every enclosing declaration-owned type parameter in order. A
+   source declaration recurring at different concrete arguments cannot jump
+   into one function's parameter slots, even when C layouts happen to match.
+   Define support/rejection for managed instantiations before enabling generic
+   annotations; retain the existing growing-instantiation check separately.
+2. **Managed values.** Start with one String carrier and a terminating match
+   example after the managed match-prefix restriction is addressed. Keep the
+   external borrowed-parameter ABI; give internal loop-carried obligations
+   explicit ownership/provenance. Evaluate next arguments, acquire or transfer
+   every required next obligation, then retire old obligations, then rebind.
+   No pending cleanup may remain after the jump. Base returns transfer their
+   result and discharge all remaining obligations. Test unchanged carriers,
+   fresh replacements, aliases, duplicate/swap arguments, unused intermediates
+   and returns at every phase before adding projected aggregate children.
+3. **Recursive managed data.** Compose the validated loop transition with the
+   unary union ownership increment. Acquire a borrowed child before retiring
+   its parent; verify provenance and exact active-child destruction separately.
+   Add the deep traversal/destruction native oracles here.
+
+Mutual tail-call guarantees and tail-modulo-constructor remain separate future
+designs. An unsupported ownership shape or need for new execution/test
+infrastructure is a stop-and-report boundary under [AGENTS.md](AGENTS.md).

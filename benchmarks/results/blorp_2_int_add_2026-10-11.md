@@ -1,9 +1,9 @@
 # Blorp 2 target library and Int addition
 
 Baseline: `7cb72f355a82474c386cb95f524f6fe98612624d`, branch `blorp-2`.
-The [design](../../blorp_2/INT_ADD_PLAN.md) owns phase contracts and the
+The [design](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/INT_ADD_PLAN.md) owns phase contracts and the
 predeclared cost bounds. This completes step 2 of the
-[calculator roadmap](../../blorp_2/CALCULATOR_PLAN.md).
+[calculator roadmap](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/CALCULATOR_PLAN.md).
 
 ## Result and boundaries
 

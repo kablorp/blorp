@@ -1,7 +1,7 @@
 # Blorp 2 Void, ordered statements and print
 
-Step 4 of the [calculator roadmap](../../blorp_2/CALCULATOR_PLAN.md) is complete.
-The [design](../../blorp_2/VOID_PRINT_PLAN.md) owns the bounded semantics and
+Step 4 of the [calculator roadmap](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/CALCULATOR_PLAN.md) is complete.
+The [design](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/VOID_PRINT_PLAN.md) owns the bounded semantics and
 predeclared acceptance criteria. The normal
 [Hello World fixture](../../blorp_2/test/e2e/fixtures/effects/hello.brp) imports
 `io.print`, produces exactly `Hello, World!\n`, and exits zero.

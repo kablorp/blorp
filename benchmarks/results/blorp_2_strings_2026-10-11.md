@@ -1,9 +1,9 @@
 # Blorp 2 UTF-8 String literals
 
 Baseline: `2f5795cc7`, branch `blorp-2`. The
-[design](../../blorp_2/STRINGS_PLAN.md) owns syntax, phase contracts and cost
+[design](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/STRINGS_PLAN.md) owns syntax, phase contracts and cost
 bounds. This implements step 3 of the
-[calculator roadmap](../../blorp_2/CALCULATOR_PLAN.md).
+[calculator roadmap](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/CALCULATOR_PLAN.md).
 
 ## Behavior and architecture
 

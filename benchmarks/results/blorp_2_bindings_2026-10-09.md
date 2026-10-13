@@ -28,7 +28,7 @@ lowering defines constant 1, constant 42, and the call result, then returns the
 first value. No runtime mutable cell or target allocation is introduced.
 Branch computations stay inside their selected match arms.
 
-[BINDINGS_PLAN.md](../../blorp_2/BINDINGS_PLAN.md) records scope, contracts,
+[BINDINGS_PLAN.md](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/BINDINGS_PLAN.md) records scope, contracts,
 tests and ceilings set before implementation: each frozen old input at most
 +100% allocations and +10% minimum retired instructions; new bindings fixture
 at most 10,000 allocations/100M instructions; formatted production at most 5,500

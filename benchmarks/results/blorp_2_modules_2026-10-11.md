@@ -1,9 +1,9 @@
 # Blorp 2 local modules
 
 Baseline: `42b723ac5dcf5af60f5b0e641f962dfcf654af4a`, branch `blorp-2`.
-The [design](../../blorp_2/MODULES_PLAN.md) records the approved scope, identity
+The [design](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/MODULES_PLAN.md) records the approved scope, identity
 ownership and primary-source implementation research. This implements the first
-step of the [calculator roadmap](../../blorp_2/CALCULATOR_PLAN.md).
+step of the [calculator roadmap](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/CALCULATOR_PLAN.md).
 
 ## Result and boundaries
 
