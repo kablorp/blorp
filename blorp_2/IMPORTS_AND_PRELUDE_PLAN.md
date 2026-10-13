@@ -327,7 +327,7 @@ The direct suites for [import syntax](test/unit/test_import_syntax.brp),
 [namespace identity](test/unit/test_type_import_namespace.brp),
 [call selection](test/unit/test_import_selectors.brp),
 [module loading](test/unit/test_module_input.brp), and
-[foundation contracts](test/unit/test_builtins.brp) exercise these boundaries. `src/builtins.brp` was `prelude.brp`; `check.brp`, `specialize.brp` and `verify.brp` still import it under the alias `Prelude` and take the new name when their owners next edit them.
+[foundation contracts](test/unit/test_builtins.brp) exercise these boundaries. `src/builtins.brp` was `prelude.brp`; `check.brp` still imports it under the alias `Prelude` until the checker split replaces that import with `Builtins`.
 Grammar checks live under [test/test_grammar](test/test_grammar/), and native
 examples under [test/e2e/fixtures/import](test/e2e/fixtures/import/).
 The [validation report](../benchmarks/results/blorp_2_imports_prelude_2026-10-12.md)
