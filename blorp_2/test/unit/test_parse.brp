@@ -1,30 +1,39 @@
 import:
-	../../src/names: NameTable, name_spelling, program_names
 	../../src/assemble: ParsedProgram, ParsedContents, parsed_contents as program_contents
+	../../src/lex: lex
+	../../src/names: NameTable, name_spelling, program_names
 	../../src/parse: parse_module
 	../../src/source: module_source, root_module_id, same_module
 	../../src/syntax:
 		BindingSyntax(MutableBinding),
-		CallNotation(ReceiverCall),
 		Diagnostic,
 		ExpressionBase(IntegerExpression, NameExpression),
 		FieldPattern(FieldName, FieldWildcard),
 		ParsedBody(ParsedValueBody, ParsedMatchBody),
 		ParsedFunction,
+		ParsedMatch,
 		ParsedPattern(PatternConstructor),
 		ParsedStatement(BindingStatement),
 		PostfixOperation(ReceiverInvocation),
 		Purity(Impure),
-		Symbol(
-			FunctionKeyword, MatchKeyword, LeftParen, RightParen, Dot, Arrow, Colon, Newline,
-			VarKeyword, Equals, Wildcard,
-		),
-		Token,
-		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, Indentation),
-		TypeSyntax(AtomicType, AppliedType),
+		TokenKind(IntegerLiteral),
+		TypeSyntax(AtomicType),
 		ValueExpression,
 	input: parse
 	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+-- The arm's pattern starts at 37, its colon is at 49 and an inline value at 51.
+private MATCH_ARM: String = "func main() -> Int:\n\tmatch Choice:\n\t\tNumber(item):"
+
+private ARM_BINDING: String = MATCH_ARM + "\n\t\t\tvar current = item"
+
+
+private pure func parse_source(source: String) -> Result[ParsedProgram, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source)
+	parse(tokens)
 
 
 -- These parser assertions inspect the root while retaining the complete parsed inventory.
@@ -37,16 +46,28 @@ private pure func root_contents(program: ParsedProgram) -> ParsedContents:
 	}
 
 
-private pure func return_type_is_foo(function: ParsedFunction, names: NameTable) -> Bool:
-	match function.return_type:
-		Some(AtomicType(name)):
-			(
-				name_spelling(names, name.id) == Some("Foo")
-				and name.span.start == 15
-				and name.span.end == 18
-			)
-		_:
-			False
+private pure func only_function(source: String) -> Option[ParsedFunction]:
+	match parse_source(source):
+		Ok(parsed):
+			match root_contents(parsed).functions:
+				[function]:
+					Some(function)
+				_:
+					None
+		Err(_):
+			None
+
+
+private pure func only_match(source: String) -> Option[ParsedMatch]:
+	match only_function(source):
+		Some(function):
+			match function.body:
+				ParsedMatchBody(body):
+					Some(body)
+				_:
+					None
+		None:
+			None
 
 
 private pure func value_of(function: ParsedFunction) -> Option[ValueExpression]:
@@ -57,109 +78,15 @@ private pure func value_of(function: ParsedFunction) -> Option[ValueExpression]:
 			None
 
 
-private pure func base_of(function: ParsedFunction) -> Option[ExpressionBase]:
-	value_of(function).map(pure func(value): value.base)
+private pure func is_integer(value: ValueExpression, expected: Int) -> Bool:
+	match value.base:
+		IntegerExpression(actual):
+			actual == expected
+		_:
+			False
 
 
-private pure func applications_of(function: ParsedFunction) -> Option[List[PostfixOperation]]:
-	value_of(function).map(pure func(value): value.applications)
-
-
--- Construct the phase input directly so lexer changes cannot change this oracle.
-private pure func program_tokens(function_name: String, return_type: String) -> List[Token]:
-	[
-		{
-			kind = SymbolToken(FunctionKeyword),
-			span = {
-				source = module_source(root_module_id()),
-				start = 0,
-				end = 4
-			}
-		},
-		{
-			kind = IdentifierToken(function_name),
-			span = {
-				source = module_source(root_module_id()),
-				start = 5,
-				end = 9
-			}
-		},
-		{
-			kind = SymbolToken(LeftParen),
-			span = {
-				source = module_source(root_module_id()),
-				start = 9,
-				end = 10
-			}
-		},
-		{
-			kind = SymbolToken(RightParen),
-			span = {
-				source = module_source(root_module_id()),
-				start = 10,
-				end = 11
-			}
-		},
-		{
-			kind = SymbolToken(Arrow),
-			span = {
-				source = module_source(root_module_id()),
-				start = 12,
-				end = 14
-			}
-		},
-		{
-			kind = IdentifierToken(return_type),
-			span = {
-				source = module_source(root_module_id()),
-				start = 15,
-				end = 18
-			}
-		},
-		{
-			kind = SymbolToken(Colon),
-			span = {
-				source = module_source(root_module_id()),
-				start = 18,
-				end = 19
-			}
-		},
-		{
-			kind = SymbolToken(Newline),
-			span = {
-				source = module_source(root_module_id()),
-				start = 19,
-				end = 20
-			}
-		},
-		{
-			kind = Indentation(1),
-			span = {
-				source = module_source(root_module_id()),
-				start = 20,
-				end = 21
-			}
-		},
-		{
-			kind = IntegerLiteral("0"),
-			span = {
-				source = module_source(root_module_id()),
-				start = 21,
-				end = 22
-			}
-		},
-		{
-			kind = SymbolToken(Newline),
-			span = {
-				source = module_source(root_module_id()),
-				start = 22,
-				end = 23
-			}
-		},
-	]
-
-
-private pure func rejects(
+private pure func diagnostic_is(
 	result: Result[ParsedProgram, Diagnostic],
 	start: Int,
 	end: Int,
@@ -178,17 +105,20 @@ private pure func rejects(
 			False
 
 
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	diagnostic_is(parse_source(source), start, end, message, help)
+
+
+private pure func return_type_is_foo(function: ParsedFunction, names: NameTable) -> Bool:
+	match function.return_type:
+		Some(AtomicType(name)):
+			name_spelling(names, name.id) == Some("Foo") and name.span.start == 15 and name.span.end == 18
+		_:
+			False
+
+
 pure func test_unchecked_names_and_spans() -> Bool:
-	match (
-		parse({
-			tokens = program_tokens("nope", "Foo"),
-			end = {
-				source = module_source(root_module_id()),
-				start = 23,
-				end = 23
-			},
-		})
-	):
+	match parse_source("func nope() -> Foo:\n\t0\n"):
 		Err(_):
 			False
 		Ok(parsed):
@@ -196,300 +126,107 @@ pure func test_unchecked_names_and_spans() -> Bool:
 
 			match program.functions:
 				[function]:
-					body_is_zero: Bool = match base_of(function):
-						Some(IntegerExpression(0)):
-							applications_of(
-								function,
-							).map(
-								pure func(values): values.length(),
-							) == Some(0)
-						_:
+					match value_of(function):
+						Some(value):
+							(
+								name_spelling(program.names, function.function_name.id) == Some("nope")
+								and function.function_name.span.start == 5
+								and function.function_name.span.end == 9
+								and return_type_is_foo(function, program.names)
+								and function.parameters.length() == 0
+								and function.purity == Impure
+								and is_integer(value, 0)
+								and value.applications.length() == 0
+								and value.span.start == 21
+								and value.span.end == 22
+								and program.unions.length() == 0
+								and program.end.start == 23
+							)
+						None:
 							False
-
-					parameters_empty: Bool = match function.parameters:
-						[]:
-							True
-						_:
-							False
-
-					(
-						name_spelling(program.names, function.function_name.id) == Some("nope")
-						and function.function_name.span.start == 5
-						and function.function_name.span.end == 9
-						and return_type_is_foo(function, program.names)
-						and body_is_zero
-						and parameters_empty
-						and function.purity == Impure
-						and value_of(function).map(pure func(value): value.span.start) == Some(21)
-						and value_of(function).map(pure func(value): value.span.end) == Some(22)
-						and program.unions.length() == 0
-						and program.end.start == 23
-					)
 				_:
 					False
 
 
 pure func test_optional_final_newline() -> Bool:
-	match (
-		parse({
-			tokens = program_tokens("main", "Int").take(10),
-			end = {
-				source = module_source(root_module_id()),
-				start = 22,
-				end = 22
-			},
-		})
-	):
-		Err(_):
-			False
-		Ok(parsed):
-			program = root_contents(parsed)
-
-			program.functions.length() == 1
-
-
-private pure func replace_and_reject(
-	position: Int,
-	kind: TokenKind,
-	start: Int,
-	end: Int,
-	message: String,
-	help: String,
-) -> Bool:
-	match (
-		program_tokens("main", "Int").set_index(
-			position,
-			{
-				kind = kind,
-				span = {
-					source = module_source(root_module_id()),
-					start = start,
-					end = end
-				}
-			},
-		)
-	):
-		None:
-			False
-		Some(tokens):
-			rejects(
-				parse({
-					tokens = tokens,
-					end = {
-						source = module_source(root_module_id()),
-						start = 23,
-						end = 23
-					},
-				}),
-				start,
-				end,
-				message,
-				help,
-			)
+	only_function(HEADER + "\t0").is_some()
 
 
 pure func test_parameter_annotation_is_required() -> Bool:
-	replace_and_reject(
-		3,
-		IdentifierToken("x"),
-		12,
-		14,
-		"expected ':' after the parameter name",
-		"write each parameter as name: Type",
-	)
+	rejects("func main(x) -> Int:\n\t0", 11, 12, "expected ':' after the parameter name", "write each parameter as name: Type")
 
 
 pure func test_bare_name_is_parsed_without_scope_resolution() -> Bool:
-	match (
-		program_tokens("main", "Int").set_index(
-			9,
-			{
-				kind = IdentifierToken("x"),
-				span = {
-					source = module_source(root_module_id()),
-					start = 21,
-					end = 22
-				}
-			},
-		)
-	):
-		None:
-			False
-		Some(tokens):
-			match (
-				parse({
-					tokens = tokens,
-					end = {
-						source = module_source(root_module_id()),
-						start = 23,
-						end = 23
-					},
-				})
-			):
-				Err(_):
-					False
-				Ok(parsed):
-					program = root_contents(parsed)
-
-					match program.functions:
-						[function]:
-							match base_of(function):
-								Some(NameExpression(name)):
-									(
-										name_spelling(program.names, name.id) == Some("x")
-										and name.span.start == 21
-										and name.span.end == 22
-										and applications_of(
-											function,
-										).map(
-											pure func(values): values.length(),
-										) == Some(0)
-									)
-								_:
-									False
-						_:
-							False
-
-
-pure func test_trailing_input_is_rejected() -> Bool:
-	rejects(
-		parse({
-			tokens = program_tokens("main", "Int").append({
-				kind = IntegerLiteral("0"),
-				span = {
-					source = module_source(root_module_id()),
-					start = 23,
-					end = 24
-				},
-			}),
-			end = {
-				source = module_source(root_module_id()),
-				start = 24,
-				end = 24
-			},
-		}),
-		23,
-		24,
-		"expected a function declaration at column 1",
-		"start with func main() -> Int:",
-	)
-
-
-pure func test_missing_body_uses_explicit_eof_span() -> Bool:
-	rejects(
-		parse({
-			tokens = program_tokens("main", "Int").take(9),
-			end = {
-				source = module_source(root_module_id()),
-				start = 21,
-				end = 21
-			},
-		}),
-		21,
-		21,
-		"expected a return expression",
-		"use a literal, a parameter or variant name, or a call as the entire body",
-	)
-
-
-private pure func token(kind: TokenKind, start: Int, end: Int) -> Token:
-	{
-		kind = kind,
-		span = {
-			source = module_source(root_module_id()),
-			start = start,
-			end = end
-		}
-	}
-
-
-pure func test_ufcs_from_independent_token_spans() -> Bool:
-	match (
-		parse({
-			tokens = program_tokens("main", "Int")
-				.take(9)
-				.append(token(IntegerLiteral("1"), 21, 22))
-				.append(token(SymbolToken(Dot), 23, 24))
-				.append(token(IdentifierToken("identity"), 25, 33))
-				.append(token(SymbolToken(LeftParen), 34, 35))
-				.append(token(SymbolToken(RightParen), 36, 37))
-				.append(token(SymbolToken(Newline), 37, 38)),
-			end = {
-				source = module_source(root_module_id()),
-				start = 38,
-				end = 38
-			},
-		})
-	):
+	match parse_source(HEADER + "\tx\n"):
 		Err(_):
 			False
 		Ok(parsed):
 			program = root_contents(parsed)
 
-			match program.functions:
-				[function]:
-					match base_of(function):
-						Some(IntegerExpression(1)):
-							match applications_of(function):
-								Some([ReceiverInvocation(call)]):
-									(
-										call.arguments.length() == 0
-										and name_spelling(
-											program.names,
-											call.callee.id,
-										) == Some("identity")
-										and call.callee.span.start == 25
-										and call.callee.span.end == 33
-										and program.end.start == 38
-										and program.end.end == 38
-									)
-								_:
-									False
-						_:
-							False
-				_:
-					False
-
-
-private pure func parse_literal(spelling: String) -> Result[ParsedProgram, Diagnostic]:
-	end = 21 + spelling.length()
-	parse({
-		tokens = program_tokens("main", "Int")
-			.take(9)
-			.append(token(IntegerLiteral(spelling), 21, end)),
-		end = {
-			source = module_source(root_module_id()),
-			start = end,
-			end = end
-		},
-	})
-
-
-private pure func literal_is(spelling: String, expected: Int) -> Bool:
-	match parse_literal(spelling):
-		Err(_):
-			False
-		Ok(parsed):
-			match root_contents(parsed).functions:
-				[function]:
-					match base_of(function):
-						Some(IntegerExpression(value)):
+			match program.functions.get(0).and_then(pure func(function): value_of(function)):
+				Some(value):
+					match value.base:
+						NameExpression(name):
 							(
-								value == expected
-								and applications_of(
-									function,
-								).map(
-									pure func(values): values.length(),
-								) == Some(0)
+								name_spelling(program.names, name.id) == Some("x")
+								and name.span.start == 21
+								and name.span.end == 22
+								and value.applications.length() == 0
 							)
 						_:
 							False
-				_:
+				None:
 					False
 
 
+pure func test_trailing_input_is_rejected() -> Bool:
+	rejects(HEADER + "\t0\n0", 23, 24, "expected a function declaration at column 1", "start with func main() -> Int:")
+
+
+pure func test_missing_body_uses_explicit_eof_span() -> Bool:
+	(
+		rejects(HEADER, 20, 20, "expected an indent of one tab or four spaces", "indent the body with exactly one tab or four spaces")
+		and rejects(HEADER + "\tx(", 23, 23, "expected a return expression", "use a literal, a parameter or variant name, or a call as the entire body")
+	)
+
+
+pure func test_ufcs_from_spaced_tokens() -> Bool:
+	match parse_source(HEADER + "\t1 . identity ( )\n"):
+		Err(_):
+			False
+		Ok(parsed):
+			program = root_contents(parsed)
+
+			match program.functions.get(0).and_then(pure func(function): value_of(function)):
+				Some(value):
+					match value.applications:
+						[ReceiverInvocation(call)]:
+							(
+								is_integer(value, 1)
+								and call.arguments.length() == 0
+								and name_spelling(program.names, call.callee.id) == Some("identity")
+								and call.callee.span.start == 25
+								and call.callee.span.end == 33
+								and call.span.end == 37
+								and value.span.end == 37
+								and program.end.start == 38
+							)
+						_:
+							False
+				None:
+					False
+
+
+private pure func literal_is(spelling: String, expected: Int) -> Bool:
+	match only_function(HEADER + "\t" + spelling).and_then(pure func(function): value_of(function)):
+		Some(value):
+			is_integer(value, expected)
+		None:
+			False
+
+
 private pure func rejects_literal(spelling: String, message: String, help: String) -> Bool:
-	rejects(parse_literal(spelling), 21, 21 + spelling.length(), message, help)
+	rejects(HEADER + "\t" + spelling, 21, 21 + spelling.length(), message, help)
 
 
 pure func test_signed_literals_and_endpoints() -> Bool:
@@ -514,97 +251,46 @@ pure func test_literal_range_rejections_have_whole_token_spans() -> Bool:
 	)
 
 
-pure func test_raw_token_spelling_is_validated() -> Bool:
-	message = "invalid integer literal"
-	help = "write decimal digits, optionally preceded by an adjacent '-'"
+-- Parsing validates every integer spelling it receives, including spellings
+-- the lexer never produces, so the lexed literal at 21 is replaced here.
+private pure func rejects_integer_spelling(spelling: String) -> Bool:
+	match lex(module_source(root_module_id()), HEADER + "\t0"):
+		Err(_):
+			False
+		Ok(program):
+			match program.tokens.get(9):
+				Some(token):
+					tokens = program.tokens.set(9, { token | kind = IntegerLiteral(spelling) })
+					diagnostic_is(
+						parse({ program | tokens = tokens }),
+						21,
+						22,
+						"invalid integer literal",
+						"write decimal digits, optionally preceded by an adjacent '-'",
+					)
+				None:
+					False
+
+
+pure func test_integer_spelling_is_validated() -> Bool:
 	(
-		rejects_literal("", message, help)
-		and rejects_literal("-", message, help)
-		and rejects_literal("+1", message, help)
-		and rejects_literal("1a", message, help)
-		and rejects_literal(
-			"00",
-			"integer literals cannot have leading zeros",
-			"write 0 or -0, or remove the leading zeros",
-		)
-		and rejects_literal(
-			"-01",
-			"integer literals cannot have leading zeros",
-			"write 0 or -0, or remove the leading zeros",
-		)
+		rejects_integer_spelling("")
+		and rejects_integer_spelling("-")
+		and rejects_integer_spelling("+1")
+		and rejects_integer_spelling("1a")
+		and rejects_literal("00", "integer literals cannot have leading zeros", "write 0 or -0, or remove the leading zeros")
+		and rejects_literal("-01", "integer literals cannot have leading zeros", "write 0 or -0, or remove the leading zeros")
 	)
 
 
-private pure func match_tokens() -> List[Token]:
-	program_tokens("main", "Int")
-		.take(9)
-		.concat([
-			token(SymbolToken(MatchKeyword), 21, 26),
-			token(IdentifierToken("Choice"), 27, 33),
-			token(SymbolToken(Colon), 33, 34),
-			token(SymbolToken(Newline), 34, 35),
-			token(Indentation(2), 35, 37),
-			token(IdentifierToken("Number"), 37, 43),
-			token(SymbolToken(LeftParen), 43, 44),
-			token(IdentifierToken("item"), 44, 48),
-			token(SymbolToken(RightParen), 48, 49),
-			token(SymbolToken(Colon), 49, 50),
-			token(IntegerLiteral("42"), 51, 53),
-			token(SymbolToken(Newline), 53, 54),
-		])
-
-
-private pure func pattern_from_tokens(tokens: List[Token]) -> Option[ParsedPattern]:
-	match (
-		parse({
-			tokens = tokens,
-			end = {
-				source = module_source(root_module_id()),
-				start = 54,
-				end = 54
-			},
-		})
-	):
-		Err(_):
-			None
-		Ok(parsed):
-			match root_contents(parsed).functions:
-				[function]:
-					match function.body:
-						ParsedMatchBody(body):
-							match body.arms:
-								[arm]:
-									Some(arm.pattern)
-								_:
-									None
-						_:
-							None
-				_:
-					None
+private pure func first_pattern(source: String) -> Option[ParsedPattern]:
+	only_match(source).and_then(pure func(body): body.arms.get(0)).map(pure func(arm): arm.pattern)
 
 
 pure func test_optional_pattern_field_distinguishes_absent_from_discarded() -> Bool:
-	absent = pattern_from_tokens(match_tokens()
-		.take(16)
-		.concat([
-			token(SymbolToken(RightParen), 44, 45),
-			token(SymbolToken(Colon), 45, 46),
-			token(IntegerLiteral("42"), 47, 49),
-			token(SymbolToken(Newline), 49, 50),
-		]))
-	discarded = pattern_from_tokens(match_tokens()
-		.take(16)
-		.concat([
-			token(SymbolToken(Wildcard), 44, 45),
-			token(SymbolToken(RightParen), 45, 46),
-			token(SymbolToken(Colon), 46, 47),
-			token(IntegerLiteral("42"), 48, 50),
-			token(SymbolToken(Newline), 50, 51),
-		]))
-
-	match absent:
+	match first_pattern(HEADER + "\tmatch Choice:\n\t\tNumber(): 42\n"):
 		Some(PatternConstructor(_, None, absent_span)):
-			match discarded:
+			match first_pattern(HEADER + "\tmatch Choice:\n\t\tNumber(_): 42\n"):
 				Some(PatternConstructor(_, Some(FieldWildcard(field_span)), discarded_span)):
 					(
 						absent_span.start == 37
@@ -620,83 +306,36 @@ pure func test_optional_pattern_field_distinguishes_absent_from_discarded() -> B
 			False
 
 
-pure func test_match_from_independent_tokens_preserves_structure_and_spans() -> Bool:
-	match (
-		parse({
-			tokens = match_tokens(),
-			end = {
-				source = module_source(root_module_id()),
-				start = 54,
-				end = 54
-			},
-		})
-	):
+pure func test_match_preserves_structure_names_and_spans() -> Bool:
+	match parse_source(MATCH_ARM + " 42\n"):
 		Err(_):
 			False
 		Ok(parsed):
 			program = root_contents(parsed)
 
-			match program.functions:
-				[function]:
-					match function.body:
-						ParsedMatchBody(body):
-							scrutinee = match body.scrutinee.base:
-								NameExpression(name):
+			match program.functions.get(0).map(pure func(function): function.body):
+				Some(ParsedMatchBody(body)):
+					match body.arms:
+						[arm]:
+							match arm.pattern:
+								PatternConstructor(name, Some(FieldName(field)), span):
 									(
-										name_spelling(program.names, name.id) == Some("Choice")
-										and name.span.start == 27
-										and name.span.end == 33
-									)
-								_:
-									False
-
-							match body.arms:
-								[arm]:
-									pattern = match arm.pattern:
-										PatternConstructor(name, Some(FieldName(field)), span):
-											(
-												name_spelling(
-													program.names,
-													name.id,
-												) == Some("Number")
-												and name.span.start == 37
-												and name.span.end == 43
-												and name_spelling(
-													program.names,
-													field.id,
-												) == Some("item")
-												and field.span.start == 44
-												and field.span.end == 48
-												and span.start == 37
-												and span.end == 49
-											)
-										_:
-											False
-
-									value = match arm.body.base:
-										IntegerExpression(42):
-											True
-										_:
-											False
-
-									(
-										scrutinee
-										and pattern
-										and value
+										body.scrutinee.base_span.start == 27
+										and body.scrutinee.span.end == 33
+										and name_spelling(program.names, name.id) == Some("Number")
+										and name_spelling(program.names, field.id) == Some("item")
+										and field.span.start == 44
+										and field.span.end == 48
+										and span.start == 37
+										and span.end == 49
+										and is_integer(arm.body, 42)
 										and body.keyword_span.start == 21
 										and body.keyword_span.end == 26
 										and body.span.start == 21
 										and body.span.end == 53
-										and body.scrutinee.span.start == 27
-										and body.scrutinee.span.end == 33
-										and body.scrutinee.applications.length() == 0
 										and arm.span.start == 37
 										and arm.span.end == 53
 										and arm.body.span.start == 51
-										and arm.body.span.end == 53
-										and arm.body.applications.length() == 0
-										and program.end.start == 54
-										and program.end.end == 54
 									)
 								_:
 									False
@@ -707,464 +346,200 @@ pure func test_match_from_independent_tokens_preserves_structure_and_spans() -> 
 
 
 pure func test_match_keyword_requires_a_space_before_the_expression() -> Bool:
-	match match_tokens().set_index(
-		10,
-		token(IntegerLiteral("42"), 26, 28),
-	):
-		None:
-			False
-		Some(tokens):
-			rejects(
-				parse({
-					tokens = tokens,
-					end = {
-						source = module_source(root_module_id()),
-						start = 54,
-						end = 54
-					},
-				}),
-				26,
-				28,
-				"expected a space after 'match'",
-				"put a space between 'match' and the matched expression",
-			)
+	rejects(HEADER + "\tmatch-1:\n\t\t_: 0", 26, 28, "expected a space after 'match'", "put a space between 'match' and the matched expression")
 
 
 pure func test_missing_match_arm_result_uses_explicit_eof_span() -> Bool:
 	rejects(
-		parse({
-			tokens = match_tokens().take(19),
-			end = {
-				source = module_source(root_module_id()),
-				start = 50,
-				end = 50
-			},
-		}),
+		MATCH_ARM,
 		50,
 		50,
-		"expected a return expression",
-		"use a literal, a parameter or variant name, or a call as the entire body",
+		"expected an indented match arm result",
+		"put the arm's statements and final value one tab or four spaces deeper than its pattern",
 	)
 
 
-private pure func block_arm_tokens() -> List[Token]:
-	match_tokens()
-		.take(19)
-		.concat([
-			token(SymbolToken(Newline), 50, 51),
-			token(Indentation(3), 51, 54),
-			token(SymbolToken(VarKeyword), 54, 57),
-			token(IdentifierToken("current"), 58, 65),
-			token(SymbolToken(Equals), 66, 67),
-			token(IdentifierToken("item"), 68, 72),
-			token(SymbolToken(Newline), 72, 73),
-			token(Indentation(3), 73, 76),
-			token(IdentifierToken("current"), 76, 83),
-			token(SymbolToken(Newline), 83, 84),
-			token(Indentation(2), 84, 86),
-			token(IdentifierToken("Empty"), 86, 91),
-			token(SymbolToken(Colon), 91, 92),
-			token(IntegerLiteral("0"), 93, 94),
-		])
-
-
-pure func test_block_arm_and_inline_sibling_from_direct_tokens() -> Bool:
-	match (
-		parse({
-			tokens = block_arm_tokens(),
-			end = {
-				source = module_source(root_module_id()),
-				start = 94,
-				end = 94
-			},
-		})
-	):
-		Err(_):
-			False
-		Ok(parsed):
-			match root_contents(parsed).functions:
-				[function]:
-					match function.body:
-						ParsedMatchBody(body):
-							match body.arms:
-								[first, second]:
-									match first.statements:
-										[BindingStatement(binding)]:
-											(
-												binding.mutability == MutableBinding
-												and binding.name.span.start == 58
-												and binding.name.span.end == 65
-												and binding.initializer.span.start == 68
-												and binding.initializer.span.end == 72
-												and first.span.start == 37
-												and first.span.end == 83
-												and first.body.span.start == 76
-												and second.body.span.end == 94
-												and second.statements.length() == 0
-											)
-										_:
-											False
-								_:
-									False
+pure func test_block_arm_and_inline_sibling() -> Bool:
+	match only_match(ARM_BINDING + "\n\t\t\tcurrent\n\t\tEmpty: 0"):
+		Some(body):
+			match body.arms:
+				[first, second]:
+					match first.statements:
+						[BindingStatement(binding)]:
+							(
+								binding.mutability == MutableBinding
+								and binding.name.span.start == 58
+								and binding.name.span.end == 65
+								and binding.initializer.span.start == 68
+								and binding.initializer.span.end == 72
+								and first.span.start == 37
+								and first.span.end == 83
+								and first.body.span.start == 76
+								and second.body.span.end == 94
+								and second.statements.length() == 0
+							)
 						_:
 							False
 				_:
 					False
+		None:
+			False
 
 
 pure func test_block_arm_can_have_no_bindings() -> Bool:
-	match (
-		parse({
-			tokens = block_arm_tokens()
-				.take(21)
-				.append(token(IntegerLiteral("42"), 54, 56)),
-			end = {
-				source = module_source(root_module_id()),
-				start = 56,
-				end = 56
-			},
-		})
-	):
-		Err(_):
-			False
-		Ok(parsed):
-			match root_contents(parsed).functions:
-				[function]:
-					match function.body:
-						ParsedMatchBody(body):
-							match body.arms:
-								[arm]:
-									(
-										arm.statements.length() == 0
-										and arm.body.span.start == 54
-										and arm.body.span.end == 56
-									)
-								_:
-									False
-						_:
-							False
+	match only_match(MATCH_ARM + "\n\t\t\t42"):
+		Some(body):
+			match body.arms:
+				[arm]:
+					arm.statements.length() == 0 and arm.body.span.start == 54 and arm.body.span.end == 56
 				_:
 					False
+		None:
+			False
 
 
-pure func test_block_arm_rejects_depth_two_and_four() -> Bool:
-	var correct = True
-
-	for depth in [2, 4]:
-		tokens = block_arm_tokens().set(
-			20,
-			token(Indentation(depth), 51, 54),
+pure func test_block_arm_is_exactly_one_level_deeper() -> Bool:
+	(
+		rejects(
+			MATCH_ARM + "\n\t\t42",
+			53,
+			55,
+			"expected an indented match arm result",
+			"put the arm's statements and final value one tab or four spaces deeper than its pattern",
 		)
-		correct = correct and rejects(
-			parse({
-				tokens = tokens,
-				end = {
-					source = module_source(root_module_id()),
-					start = 94,
-					end = 94
-				},
-			}),
+		and rejects(
+			MATCH_ARM + "\n\t\t\t\t42",
 			51,
-			54,
-			"expected a match arm result indented three levels",
-			"finish the arm with a value expression indented with three tabs or twelve spaces",
+			55,
+			"indentation increases by more than one level",
+			"indent a block exactly one tab or four spaces deeper than the line that opens it",
 		)
-
-	correct
-
-
-pure func test_block_arm_missing_result_does_not_consume_sibling() -> Bool:
-	tokens = block_arm_tokens()
-		.take(26)
-		.concat([
-			token(Indentation(2), 73, 75),
-			token(IdentifierToken("Empty"), 75, 80),
-			token(SymbolToken(Colon), 80, 81),
-			token(IntegerLiteral("0"), 82, 83),
-		])
-	rejects(
-		parse({
-			tokens = tokens,
-			end = {
-				source = module_source(root_module_id()),
-				start = 83,
-				end = 83
-			},
-		}),
-		73,
-		75,
-		"expected a match arm result indented three levels",
-		"finish the arm with a value expression indented with three tabs or twelve spaces",
 	)
 
 
-pure func test_block_arm_missing_result_at_eof_after_initializer() -> Bool:
-	rejects(
-		parse({
-			tokens = block_arm_tokens().take(25),
-			end = {
-				source = module_source(root_module_id()),
-				start = 72,
-				end = 72
-			},
-		}),
-		72,
-		72,
-		"expected a final expression after the arm bindings",
-		"finish the arm with a value expression on its own indented line",
+pure func test_block_arm_without_final_value() -> Bool:
+	message = "expected a final expression after the arm bindings"
+	help = "finish the arm with a value expression on its own indented line"
+	(
+		rejects(ARM_BINDING + "\n\t\tEmpty: 0", 73, 75, message, help)
+		and rejects(ARM_BINDING, 72, 72, message, help)
+		and rejects(ARM_BINDING + "\n", 73, 73, message, help)
 	)
 
 
-pure func test_block_arm_missing_result_at_eof_after_newline() -> Bool:
-	rejects(
-		parse({
-			tokens = block_arm_tokens().take(26),
-			end = {
-				source = module_source(root_module_id()),
-				start = 73,
-				end = 73
-			},
-		}),
-		73,
-		73,
-		"expected a match arm result indented three levels",
-		"finish the arm with a value expression indented with three tabs or twelve spaces",
-	)
-
-
--- Construct binding tokens directly so lexing cannot manufacture this shape.
-private pure func binding_tokens() -> List[Token]:
-	program_tokens("main", "Int").take(9) + [
-		{
-			kind = SymbolToken(VarKeyword),
-			span = {
-				source = module_source(root_module_id()),
-				start = 21,
-				end = 24
-			}
-		},
-		{
-			kind = IdentifierToken("value"),
-			span = {
-				source = module_source(root_module_id()),
-				start = 25,
-				end = 30
-			}
-		},
-		{
-			kind = SymbolToken(Equals),
-			span = {
-				source = module_source(root_module_id()),
-				start = 31,
-				end = 32
-			}
-		},
-		{
-			kind = IntegerLiteral("42"),
-			span = {
-				source = module_source(root_module_id()),
-				start = 33,
-				end = 35
-			}
-		},
-		{
-			kind = SymbolToken(Newline),
-			span = {
-				source = module_source(root_module_id()),
-				start = 35,
-				end = 36
-			}
-		},
-		{
-			kind = Indentation(1),
-			span = {
-				source = module_source(root_module_id()),
-				start = 36,
-				end = 37
-			}
-		},
-		{
-			kind = IdentifierToken("value"),
-			span = {
-				source = module_source(root_module_id()),
-				start = 37,
-				end = 42
-			}
-		},
-	]
-
-
-pure func test_binding_prefix_from_direct_tokens() -> Bool:
-	match (
-		parse({
-			tokens = binding_tokens(),
-			end = {
-				source = module_source(root_module_id()),
-				start = 42,
-				end = 42
-			},
-		})
-	):
-		Err(_):
-			False
-		Ok(parsed):
-			contents = root_contents(parsed)
-
-			match contents.functions:
-				[function]:
-					match function.statements:
-						[BindingStatement(binding)]:
-							match binding.mutability:
-								MutableBinding:
-									match binding.initializer.base:
-										IntegerExpression(42):
-											(
-												name_spelling(
-													contents.names,
-													binding.name.id,
-												) == Some("value")
-												and binding.name.span.start == 25
-												and binding.name.span.end == 30
-												and binding.initializer.base_span.start == 33
-												and binding.initializer.base_span.end == 35
-												and value_of(
-													function,
-												).map(
-													pure func(value): value.span.start,
-												) == Some(37)
-											)
-										_:
-											False
-								_:
-									False
-						_:
-							False
+pure func test_binding_prefix() -> Bool:
+	match only_function(HEADER + "\tvar value = 42\n\tvalue"):
+		Some(function):
+			match function.statements:
+				[BindingStatement(binding)]:
+					(
+						binding.mutability == MutableBinding
+						and is_integer(binding.initializer, 42)
+						and binding.name.span.start == 25
+						and binding.name.span.end == 30
+						and binding.initializer.base_span.start == 33
+						and binding.initializer.base_span.end == 35
+						and value_of(function).map(pure func(value): value.span.start) == Some(37)
+					)
 				_:
 					False
+		None:
+			False
 
 
-pure func test_binding_missing_initializer_from_direct_tokens() -> Bool:
-	input = binding_tokens().take(12) + [
-		{
-			kind = SymbolToken(Newline),
-			span = {
-				source = module_source(root_module_id()),
-				start = 32,
-				end = 33
-			}
-		},
-	]
-	rejects(
-		parse({
-			tokens = input,
-			end = {
-				source = module_source(root_module_id()),
-				start = 33,
-				end = 33
-			},
-		}),
-		32,
-		33,
-		"expected a binding initializer",
-		"put one expression after '=' on the same line",
+pure func test_binding_requires_initializer_and_final_value() -> Bool:
+	(
+		rejects(HEADER + "\tvar value =\n\t0", 32, 33, "expected a binding initializer", "put one expression after '=' on the same line")
+		and rejects(
+			HEADER + "\tvar value = 42",
+			35,
+			35,
+			"expected a final expression after the bindings",
+			"finish the function with a value expression or tail match",
+		)
+		and rejects(HEADER + "\tvalue = 1 2\n\tvalue", 31, 32, "expected a newline after the binding", "put each statement on its own line")
 	)
 
 
-pure func test_binding_requires_final_value_from_direct_tokens() -> Bool:
+pure func test_match_ends_its_function() -> Bool:
 	rejects(
-		parse({
-			tokens = binding_tokens().take(13),
-			end = {
-				source = module_source(root_module_id()),
-				start = 35,
-				end = 35
-			},
-		}),
-		35,
-		35,
-		"expected a final expression after the bindings",
-		"finish the function with a value expression or tail match",
+		HEADER + "\tmatch Choice:\n\t\t_: 0\n\t1",
+		43,
+		44,
+		"a match must end its function",
+		"move the statements after the match before it, or indent further arms one level deeper than the match",
+	)
+
+
+pure func test_lines_outside_a_block_cannot_be_indented() -> Bool:
+	help = "indent a line only to open the block of a header ending in ':'; otherwise align it with the line above"
+	(
+		rejects(HEADER + "\tvalue = 1\n\t\tvalue", 31, 33, "unexpected indentation", help)
+		and rejects(HEADER + "\tprint(1)\n\t\t0", 30, 32, "unexpected indentation", help)
+		and rejects("fixed union V:\n\tA\n\t\tB", 18, 20, "unexpected indentation", help)
+	)
+
+
+pure func test_builtin_body_is_the_whole_function() -> Bool:
+	help = "use builtin as the entire function body; put other work in an ordinary wrapper function"
+	(
+		rejects(HEADER + "\tx = 1\n\tbuiltin(\"int.add\")", 28, 35, "builtin must be the entire function body", help)
+		and rejects(HEADER + "\tbuiltin(\"int.add\")\n\t0", 21, 28, "builtin must be the entire function body", help)
+	)
+
+
+pure func test_annotation_name_must_touch_its_at_sign() -> Bool:
+	(
+		rejects("@ tail_recursive\nfunc main() -> Int:\n\t0", 0, 16, "unknown function annotation", "use @tail_recursive before a function declaration")
+		and only_function("@tail_recursive\nfunc main() -> Int:\n\tmain()").is_some()
 	)
 
 
 pure func test_module_declaration_rejection_retains_exact_source() -> Bool:
-	origin = module_source(root_module_id())
-	match parse_module({ tokens = [{ kind = IdentifierToken("wrong"), span = { source = origin, start = 0, end = 5 } }], end = { source = origin, start = 5, end = 5 } }, root_module_id(), program_names().names):
-		Err(error):
-			(
-				error.span.start == 0 and error.span.end == 5
-				and error.message == "expected a function declaration at column 1"
-				and error.help == "start with func main() -> Int:"
-				and error.note.is_none()
-			)
-		Ok(_): False
+	match lex(module_source(root_module_id()), "wrong"):
+		Err(_):
+			False
+		Ok(tokens):
+			match parse_module(tokens, root_module_id(), program_names().names):
+				Err(error):
+					(
+						error.span.start == 0
+						and error.span.end == 5
+						and error.message == "expected a function declaration at column 1"
+						and error.help == "start with func main() -> Int:"
+						and error.note.is_none()
+					)
+				Ok(_):
+					False
 
 
 tests: TestSuite = {
 	description = "Blorp 2 parser",
 	tests = [
-		(
-			"optional field absent versus discarded",
-			test_optional_pattern_field_distinguishes_absent_from_discarded,
-		),
-		(
-			"module declaration rejection retains exact source",
-			test_module_declaration_rejection_retains_exact_source,
-		),
-		(
-			"block arm and inline sibling from direct tokens",
-			test_block_arm_and_inline_sibling_from_direct_tokens,
-		),
+		("optional field absent versus discarded", test_optional_pattern_field_distinguishes_absent_from_discarded),
+		("module declaration rejection retains exact source", test_module_declaration_rejection_retains_exact_source),
+		("block arm and inline sibling", test_block_arm_and_inline_sibling),
 		("block arm may have zero bindings", test_block_arm_can_have_no_bindings),
-		("block arm requires depth three", test_block_arm_rejects_depth_two_and_four),
-		(
-			"block arm missing result preserves sibling",
-			test_block_arm_missing_result_does_not_consume_sibling,
-		),
-		(
-			"block arm missing result at EOF after initializer",
-			test_block_arm_missing_result_at_eof_after_initializer,
-		),
-		(
-			"block arm missing result at EOF after newline",
-			test_block_arm_missing_result_at_eof_after_newline,
-		),
-		("binding prefix from direct tokens", test_binding_prefix_from_direct_tokens),
-		(
-			"binding initializer required from direct tokens",
-			test_binding_missing_initializer_from_direct_tokens,
-		),
-		(
-			"binding requires final value from direct tokens",
-			test_binding_requires_final_value_from_direct_tokens,
-		),
-		(
-			"match tokens preserve structure and spans",
-			test_match_from_independent_tokens_preserves_structure_and_spans,
-		),
-		(
-			"match keyword requires a following space",
-			test_match_keyword_requires_a_space_before_the_expression,
-		),
-		(
-			"missing match arm result uses explicit EOF",
-			test_missing_match_arm_result_uses_explicit_eof_span,
-		),
+		("block arm is exactly one level deeper", test_block_arm_is_exactly_one_level_deeper),
+		("block arm without final value", test_block_arm_without_final_value),
+		("binding prefix", test_binding_prefix),
+		("binding requires initializer and final value", test_binding_requires_initializer_and_final_value),
+		("match preserves structure, names and spans", test_match_preserves_structure_names_and_spans),
+		("match keyword requires a following space", test_match_keyword_requires_a_space_before_the_expression),
+		("missing match arm result uses explicit EOF", test_missing_match_arm_result_uses_explicit_eof_span),
+		("match ends its function", test_match_ends_its_function),
+		("lines outside a block cannot be indented", test_lines_outside_a_block_cannot_be_indented),
+		("builtin body is the whole function", test_builtin_body_is_the_whole_function),
 		("signed literals and endpoints", test_signed_literals_and_endpoints),
-		(
-			"range rejection spans cover whole token",
-			test_literal_range_rejections_have_whole_token_spans,
-		),
-		("raw token spelling is validated", test_raw_token_spelling_is_validated),
-		("UFCS from independent token spans", test_ufcs_from_independent_token_spans),
+		("range rejection spans cover whole token", test_literal_range_rejections_have_whole_token_spans),
+		("integer spelling is validated", test_integer_spelling_is_validated),
+		("UFCS from spaced tokens", test_ufcs_from_spaced_tokens),
 		("unchecked names and spans", test_unchecked_names_and_spans),
 		("optional final newline", test_optional_final_newline),
 		("parameter annotation is required", test_parameter_annotation_is_required),
-		(
-			"bare name is parsed without resolving scope",
-			test_bare_name_is_parsed_without_scope_resolution,
-		),
+		("bare name is parsed without resolving scope", test_bare_name_is_parsed_without_scope_resolution),
 		("trailing input is rejected", test_trailing_input_is_rejected),
 		("missing body uses explicit EOF span", test_missing_body_uses_explicit_eof_span),
+		("annotation name must touch its at sign", test_annotation_name_must_touch_its_at_sign),
 	]
 }

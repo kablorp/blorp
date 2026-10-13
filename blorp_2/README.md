@@ -701,9 +701,10 @@ Lexical and layout rules:
 - The entire indentation prefix of a real code line uses tabs only or spaces in groups of four.
   Body and variant lines require depth one: one tab or four spaces. Match arms
   require depth two: two tabs or eight spaces. Arm-block lines require depth
-  three: three tabs or twelve spaces. Mixed indentation is invalid;
-  parsing rejects a valid depth in the wrong position. No indentation stack
-  or synthetic dedent tokens are needed for this restricted layout.
+  three: three tabs or twelve spaces. Mixed indentation is invalid. The lexer
+  emits a newline token ending each code line, an indent token for a line one
+  level deeper and a dedent token per closed level, rejecting a deeper jump;
+  the parser reads blocks from those tokens and never compares depths.
 - Spaces may separate tokens and trail each line. They are required between
   `func` and the function name, and between `fixed`, `union` and the type name.
   Identifiers are scanned as whole words, so
@@ -1288,8 +1289,9 @@ The impure command shell owns file I/O and printing. Compilation and
 diagnostic rendering are pure. The pipeline publishes these complete results:
 
 1. Lexing produces tokens with source spans and an explicit end-of-source span.
-   Integer tokens retain their complete raw spelling; indentation tokens retain
-   their depth and the entire prefix span. Trivia is skipped over the original
+   Integer tokens retain their complete raw spelling; indent and dedent tokens
+   span the indentation prefix, and each token records whether a space precedes
+   it. Trivia is skipped over the original
    source bytes; no rewritten source or comment metadata crosses the boundary.
 2. Parsing produces function and union declarations, payload and parameter
    annotations, written names, ordered statement syntax, expression syntax, and structured match bodies.

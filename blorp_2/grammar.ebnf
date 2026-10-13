@@ -26,6 +26,8 @@
      accepted. Plus signs, separated minus signs and arithmetic operators are
      unsupported. A dot followed by a digit belongs to a Float token; other dots
      retain UFCS/field syntax, including `42.identity()` and `1.5.identity()`.
+     A dot directly after an integer must be followed by fraction digits or,
+     after optional spaces, a field or function name.
    - Arrow bytes stay adjacent. Spaces occur only where these rules permit.
    - Identifiers and comments remain ASCII; quoted values admit valid UTF-8.
      CR is unsupported as a raw byte, including in comments and quotes.
@@ -38,7 +40,7 @@
      precedence over a signed integer; `->` still forms an arrow.
    - Blank, whitespace-only and comment-only lines are lexical trivia. Their
      indentation has no layout meaning. Only lines containing code produce
-     indentation and newline tokens, retaining their original byte offsets.
+     layout tokens, retaining their original byte offsets (see Layout below).
 
    Syntax accepts any unreserved function, parameter and type identifier.
    `import`, `fixed`, `union`, and `record` are contextual words in module headers, and remain
@@ -191,29 +193,38 @@ ascii_byte       = "\x00".."\x7F" ;
 comment_byte     = ascii_byte - ("\n" | "\r") ;
 line_comment     = "--" { comment_byte } ;
 horizontal       = space | "\t" ;
-trivia_line      = { horizontal } [ line_comment ] "\n" ;
-newline          = [ line_comment ] "\n" { trivia_line } ;
-source_end       = [ line_comment ] EOF
-                 | newline { horizontal } [ line_comment ] EOF ;
-indent_one       = "\t" | "    " ;
-indent_two       = "\t\t" | "        " ;
-indent_three     = "\t\t\t" | "            " ;
+trivia_line      = { horizontal } [ line_comment ] ( "\n" | EOF ) ;
+indentation      = { "\t" } | { "    " } ;
+
+(* Layout. The lexer turns line structure into the tokens NEWLINE, INDENT and
+   DEDENT, which the rules below use instead of LF bytes and indentation.
+   - Trivia lines produce no tokens. Every other line is a code line: an
+     indentation prefix, then code. The prefix's level is its tab count or its
+     count of four-space groups; any other prefix is an error.
+   - Every code line ends with NEWLINE: its trailing spaces and optional
+     comment, then its LF, or EOF when the source ends without one.
+   - A code line one level deeper than the previous code line starts with
+     INDENT. Opening more than one level at once is an error, so the open
+     levels are always 0 through the current one. A shallower code line starts
+     with one DEDENT for each level it closes, and EOF closes every open level.
+   - INDENT and DEDENT span the line's indentation prefix; at EOF they and
+     the final NEWLINE are empty spans at the end of the source.
+   Blocks nest by INDENT and DEDENT alone; no rule names a depth. *)
+NEWLINE          = spaces [ line_comment ] ( "\n" | EOF ) ;
+INDENT           = indentation ;
+DEDENT           = indentation ;
 
 (* A function has one header followed by zero or more ordered statement lines and a
-   mandatory expression line or tail match.
-   A union has one header and one or more variant lines. Code lines are
-   separated by LF and any number of complete trivia lines. Final code may
-   omit its LF; trailing trivia may also end at EOF. An inline comment does
-   not continue an expression onto a later code line. Spaces in a call are
-   explicit, including f ( )
-   and 1 . f ( ). UFCS supplies its receiver as the first argument, followed
-   by the ordered explicit arguments in its parentheses. All expressions stay on one
-   line, including scrutinees and arm results. Indentation prefixes are entirely
-   tabs or spaces; spaces count in groups of four. Bodies and variants require
-   depth one, match arms depth two, and arm-block lines depth three.
-   Blocks finish with a single-line value; no nested matches. Non-final expression
-   statements must have Void type. Void has the sole value void. A Void function
-   evaluates and discards its final expression before returning void. *)
+   mandatory expression line or tail match. A union has one header and one or more
+   variant lines. An inline comment does not continue an expression onto a later
+   code line. Spaces in a call are explicit, including f ( ) and 1 . f ( ). UFCS
+   supplies its receiver as the first argument, followed by the ordered explicit
+   arguments in its parentheses. All expressions stay on one line, including
+   scrutinees and arm results. A match occurs only as a function's tail, and an
+   arm block holds statements and a final value, so blocks finish with a
+   single-line value and matches do not nest. Non-final expression statements
+   must have Void type. Void has the sole value void. A Void function evaluates
+   and discards its final expression before returning void. *)
 nonzero_digit    = "1".."9" ;
 integer          = [ "-" ] ("0" | nonzero_digit { digit }) ;
 exponent         = ("e" | "E") [ "+" | "-" ] digit { digit } ;
@@ -246,29 +257,25 @@ parameter        = identifier spaces ":" spaces type_annotation ;
 type_parameter   = "A".."Z" { letter | digit } ;
 type_parameters = "[" spaces type_parameter { spaces "," spaces type_parameter } spaces "]" spaces ;
 function_header  = [ "pure" required_spaces ] "func" required_spaces identifier spaces [ type_parameters ] "(" spaces
-                   [ parameter { spaces "," spaces parameter } ] spaces ")" spaces [ "->" spaces type_annotation spaces ] ":" spaces
-                   newline ;
-tail_annotation  = "@tail_recursive" (required_spaces | spaces newline) ;
-function         = [ tail_annotation ] function_header body ;
+                   [ parameter { spaces "," spaces parameter } ] spaces ")" spaces [ "->" spaces type_annotation spaces ] ":"
+                   NEWLINE ;
+tail_annotation  = "@tail_recursive" (required_spaces | NEWLINE) ;
+function         = [ tail_annotation ] function_header INDENT body DEDENT ;
 field_pattern    = "_" | identifier ;
 pattern          = "_" | identifier spaces [ "(" spaces [ field_pattern ] spaces ")" ] ;
-arm_binding      = indent_three [ "var" required_spaces ] identifier spaces "=" spaces expression spaces ;
-arm_statement    = arm_binding | indent_three expression spaces ;
-arm_block        = { arm_statement newline } indent_three expression spaces ;
-match_arm        = indent_two pattern spaces ":" spaces
-                   (expression spaces | newline arm_block) ;
-match_body       = indent_one "match" required_spaces expression spaces ":" spaces
-                   newline match_arm { newline match_arm } ;
-binding          = indent_one [ "var" required_spaces ] identifier spaces "=" spaces expression spaces ;
-tail             = indent_one expression spaces | match_body ;
-statement        = binding | indent_one expression spaces ;
-body             = { statement newline } tail | builtin_body ;
-variant          = indent_one identifier spaces [ "(" spaces identifier spaces ")" spaces ] ;
-fixed_union      = "fixed" required_spaces "union" required_spaces identifier spaces [ type_parameters ] ":" spaces
-                   newline variant { newline variant } ;
+binding          = [ "var" required_spaces ] identifier spaces "=" spaces expression NEWLINE ;
+statement        = binding | expression NEWLINE ;
+arm_block        = { statement } expression NEWLINE ;
+match_arm        = pattern spaces ":" (spaces expression NEWLINE | NEWLINE INDENT arm_block DEDENT) ;
+match_body       = "match" required_spaces expression spaces ":" NEWLINE INDENT match_arm { match_arm } DEDENT ;
+tail             = expression NEWLINE | match_body ;
+body             = { statement } tail | builtin_body ;
+variant          = identifier spaces [ "(" spaces identifier spaces ")" ] NEWLINE ;
+fixed_union      = "fixed" required_spaces "union" required_spaces identifier spaces [ type_parameters ] ":"
+                   NEWLINE INDENT variant { variant } DEDENT ;
 record_member    = identifier spaces ":" spaces type_annotation ;
 fixed_record     = "fixed" required_spaces "record" required_spaces identifier spaces "{" spaces
-                   record_member { spaces "," spaces record_member } spaces "}" spaces ;
+                   record_member { spaces "," spaces record_member } spaces "}" NEWLINE ;
 declaration      = function | fixed_union | fixed_record | builtin_type ;
 relative_prefix  = "./" | "../" { "../" } ;
 module_components = identifier { "/" identifier } ;
@@ -276,17 +283,14 @@ module_path      = [ relative_prefix ] module_components ;
 constructor_selection = spaces "(" spaces [ identifier { spaces "," spaces identifier } ] spaces ")" ;
 import_symbol    = identifier [ constructor_selection | required_spaces "methods_only" ] ;
 import_selection = import_symbol { spaces "," spaces import_symbol } ;
-import_row       = indent_one module_path spaces ":" spaces import_selection spaces ;
-import_block     = "import" spaces ":" spaces newline import_row { newline import_row } ;
-program          = { trivia_line }
-                   ((import_block { newline import_block } [ newline declaration { newline declaration } ]
-                    | declaration { newline declaration }) source_end
-                    | { horizontal } [ line_comment ] EOF) ;
+import_row       = module_path spaces ":" spaces import_selection NEWLINE ;
+import_block     = "import" spaces ":" NEWLINE INDENT import_row { import_row } DEDENT ;
+program          = { import_block } { declaration } EOF ;
 
 (* Foundation declarations use the ordinary module parser.
    An empty module parses; designated foundation validation requires five builtins. *)
 builtin_type     = "type" required_spaces (("Int" | "Float" | "String" | "Void") spaces
-                   | "List" spaces "[" spaces identifier spaces "]" spaces) "=" spaces "builtin" spaces ;
+                   | "List" spaces "[" spaces identifier spaces "]" spaces) "=" spaces "builtin" NEWLINE ;
 builtin_label    = "\"int.to_string\"" | "\"string.length\"" | "\"string.print\""
                    | "\"int.add\"" | "\"int.subtract\"" | "\"int.multiply\""
                    | "\"int.divide\"" | "\"int.remainder\""
@@ -295,4 +299,4 @@ builtin_label    = "\"int.to_string\"" | "\"string.length\"" | "\"string.print\"
                    | "\"list.length\"" ;
 union_builtin    = ("\"string.parse_int\"" | "\"string.parse_float\"" | "\"list.get\"" | "\"int.equals\"" | "\"string.equals\"")
                    spaces "," spaces identifier spaces "," spaces identifier ;
-builtin_body     = indent_one "builtin" spaces "(" spaces (builtin_label | union_builtin) spaces ")" spaces ;
+builtin_body     = "builtin" spaces "(" spaces (builtin_label | union_builtin) spaces ")" NEWLINE ;

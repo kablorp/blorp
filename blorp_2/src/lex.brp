@@ -1,33 +1,123 @@
 import:
 	int as IntOps
-	option: to_result
 	source: SourceId
 	string as StringOps
 	syntax:
-		DECIMAL_DIGITS,
 		Diagnostic,
 		LexedProgram,
+		Spacing(Adjacent, Spaced),
 		Symbol(
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
-			Colon, Newline, VarKeyword, VoidKeyword, Equals, LeftBracket, RightBracket, LeftBrace,
-			RightBrace, Comma, AtSign, Slash, Star,
+			Colon, Newline, Indent, Dedent, VarKeyword, VoidKeyword, Equals, LeftBracket,
+			RightBracket, LeftBrace, RightBrace, Comma, AtSign, Slash, Star,
 		),
 		Token,
-		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, Indentation),
-	text as Text
+		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString),
+		UTF8_CONTINUATION_END,
+		UTF8_CONTINUATION_START,
+		diagnostic,
+
+
+-- The bytes being lexed and the source identity of every span made from them.
+private fixed record SourceText {
+	origin: SourceId,
+	bytes: String
+}
+
+
+private fixed record ErrorText {
+	message: String,
+	help: String
+}
+
+
+private INVALID_INDENTATION: ErrorText = {
+	message = "invalid indentation",
+	help = "use tabs only, or spaces in groups of four; do not mix tabs and spaces"
+}
+
+private DEEP_INDENTATION: ErrorText = {
+	message = "indentation increases by more than one level",
+	help = "indent a block exactly one tab or four spaces deeper than the line that opens it"
+}
+
+private LINE_ENDING: ErrorText = {
+	message = "only LF line endings are supported",
+	help = "replace CRLF or CR line endings with LF"
+}
+
+private SEPARATING_TAB: ErrorText = {
+	message = "tabs are allowed only in the body indentation",
+	help = "separate tokens with spaces and indent the body with one tab or four spaces"
+}
+
+private COMMENT_BYTE: ErrorText = {
+	message = "unsupported byte in comment",
+	help = "use ASCII bytes in single-line comments"
+}
+
+private UNSUPPORTED_CHARACTER: ErrorText = {
+	message = "unsupported character",
+	help = "use ASCII function declarations and numeric literals, parameter names, or calls; keep -> adjacent"
+}
+
+private PLUS_SIGN: ErrorText = {
+	message = "source numeric literals cannot start with '+'",
+	help = "remove the leading '+'; use an adjacent '-' for a negative literal"
+}
+
+private SEPARATED_MINUS: ErrorText = {
+	message = "expected decimal digits immediately after '-'",
+	help = "write a signed number such as -42 or -0.5; '-' is not an operator"
+}
+
+private NUMERIC_SUFFIX: ErrorText = {
+	message = "numeric literals cannot have suffixes or separators",
+	help = "write decimal digits with an optional fractional part or exponent; use no underscores or type suffixes"
+}
+
+private MISSING_EXPONENT: ErrorText = {
+	message = "expected decimal digits in Float exponent",
+	help = "write a decimal Float such as 1.0, 0.5 or 1e2; an exponent needs at least one digit"
+}
+
+private MISSING_FRACTION: ErrorText = {
+	message = "Float literals need digits after the decimal point",
+	help = "write 1.0; otherwise use a UFCS function call after '.'"
+}
+
+private INVALID_UTF8: ErrorText = {
+	message = "invalid UTF-8 in String literal",
+	help = "use valid UTF-8 text or a Unicode escape such as \\u{E9}; surrogate code points are not Unicode scalars"
+}
+
+private STRING_LINE_BREAK: ErrorText = {
+	message = "String literals must stay on one line",
+	help = "close the quote before LF; write \\n for a newline byte"
+}
+
+private RAW_CONTROL_BYTE: ErrorText = {
+	message = "unsupported raw byte in String literal",
+	help = "use printable text and fixed escapes for control bytes"
+}
+
+private UNTERMINATED_STRING: ErrorText = {
+	message = "unterminated String literal",
+	help = "add a closing double quote on the same line"
+}
+
+private UNTERMINATED_ESCAPE: ErrorText = {
+	message = "unterminated String escape",
+	help = "complete the escape and close the double quote on the same line"
+}
 
 
 private SPACE_INDENT_WIDTH: Int = 4
 
-private IDENTIFIER_START: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
-
+-- Bytes below SPACE, and DEL, are ASCII controls.
 private ASCII_SPACE: Int = 32
 
 private ASCII_DEL: Int = 127
-
-private UTF8_CONTINUATION_START: Int = 128
-
-private UTF8_CONTINUATION_END: Int = 191
 
 private UNICODE_SURROGATE_START: Int = 55296
 
@@ -36,604 +126,535 @@ private UNICODE_SURROGATE_END: Int = 57343
 private UNICODE_MAX: Int = 1114111
 
 
-private pure func invalid_utf8(origin: SourceId, start: Int, end: Int) -> Diagnostic:
-	diagnostic(
-		origin,
-		start,
-		end,
-		"invalid UTF-8 in String literal",
-		"use valid UTF-8 text or a Unicode escape such as \\u{E9}; surrogate code points are not Unicode scalars",
-	)
+-- One UTF-8 encoding width from RFC 3629 section 4. Its lead range excludes
+-- the overlong leads C0 and C1 and every lead above F4; `minimum` rejects the
+-- remaining overlong (non-shortest) encodings of that width.
+private fixed record Utf8Form {
+	width: Int,
+	first_lead: Int,
+	last_lead: Int,
+	lead_marker: Int,
+	minimum: Int
+}
 
 
--- RFC 3629 section 4: widths, shortest encoding, and Unicode scalar range.
--- Byte access does not decode or re-encode the source; the token retains it.
-private pure func utf8_end(origin: SourceId, source: String, start: Int) -> Result[Int, Diagnostic]:
-	first ?= StringOps
-		.get(source, start)
-		.to_result(invalid_utf8(origin, start, source.length()))
-	lead = to_int(first)
+-- Leads C2..DF (110xxxxx) encode U+0080 through U+07FF.
+private UTF8_TWO_BYTES: Utf8Form = { width = 2, first_lead = 194, last_lead = 223, lead_marker = 192, minimum = 128 }
 
-	width = if IntOps.greater_than_or_equal(lead, 194) and IntOps.less_than_or_equal(lead, 223):
-		2
-	else if IntOps.greater_than_or_equal(lead, 224) and IntOps.less_than_or_equal(lead, 239):
-		3
-	else if IntOps.greater_than_or_equal(lead, 240) and IntOps.less_than_or_equal(lead, 244):
-		4
-	else:
-		0
+-- Leads E0..EF (1110xxxx) encode U+0800 through U+FFFF.
+private UTF8_THREE_BYTES: Utf8Form = { width = 3, first_lead = 224, last_lead = 239, lead_marker = 224, minimum = 2048 }
 
-	if IntOps.equals(width, 0):
-		Err(invalid_utf8(origin, start, IntOps.add(start, 1)))
-	else:
-		end = IntOps.add(start, width)
+-- Leads F0..F4 (11110xxx) encode U+10000 through U+10FFFF.
+private UTF8_FOUR_BYTES: Utf8Form = { width = 4, first_lead = 240, last_lead = 244, lead_marker = 240, minimum = 65536 }
 
-		prefix = if IntOps.equals(width, 2):
-			192
-		else if IntOps.equals(width, 3):
-			224
-		else:
-			240
-
-		minimum = if IntOps.equals(width, 2):
-			128
-		else if IntOps.equals(width, 3):
-			2048
-		else:
-			65536
-
-		var scalar = IntOps.subtract(lead, prefix)
-		var cursor = IntOps.add(start, 1)
-		var failure: Option[Diagnostic] = None
-
-		while IntOps.less_than(cursor, end):
-			match StringOps.get(source, cursor):
-				None:
-					failure = Some(invalid_utf8(origin, start, source.length()))
-					break
-				Some(character):
-					byte = to_int(character)
-
-					if (
-						IntOps.less_than(byte, UTF8_CONTINUATION_START)
-						or IntOps.greater_than(byte, UTF8_CONTINUATION_END)
-					):
-						failure = Some(invalid_utf8(origin, cursor, IntOps.add(cursor, 1)))
-						break
-
-					scalar = IntOps.add(
-						IntOps.multiply(scalar, 64),
-						IntOps.subtract(byte, UTF8_CONTINUATION_START),
-					)
-
-			cursor = IntOps.add(cursor, 1)
-
-		match failure:
-			Some(error):
-				Err(error)
-			None:
-				if (
-					IntOps.less_than(scalar, minimum)
-					or IntOps.greater_than(scalar, UNICODE_MAX)
-					or (
-						IntOps.greater_than_or_equal(scalar, UNICODE_SURROGATE_START)
-						and IntOps.less_than_or_equal(scalar, UNICODE_SURROGATE_END)
-					)
-				):
-					Err(invalid_utf8(origin, start, end))
-				else:
-					Ok(end)
+-- Each continuation byte carries six payload bits.
+private UTF8_CONTINUATION_RADIX: Int = 64
 
 
-private pure func quoted_end(
-	origin: SourceId,
-	source: String,
+-- The byte sets that runs of source bytes are scanned over.
+private fixed union ByteClass:
+	SpaceByte
+	TabByte
+	IndentationByte
+	DecimalDigit
+	IdentifierStart
+	IdentifierByte
+
+
+-- A line's start and the end of its indentation prefix.
+private fixed record LinePrefix {
 	start: Int,
-) -> Result[Int, Diagnostic]:
-	var cursor = IntOps.add(start, 1)
-	var escaped = False
-	var failure: Option[Diagnostic] = None
-	var closing: Option[Int] = None
+	end: Int
+}
 
-	while IntOps.less_than(cursor, source.length()):
-		match StringOps.get(source, cursor):
-			None:
-				failure = Some(invalid_utf8(origin, cursor, source.length()))
-				break
-			Some(character):
-				byte = to_int(character)
 
-				if IntOps.equals(byte, 10):
-					failure = Some(
-						diagnostic(
-							origin,
-							cursor,
-							IntOps.add(cursor, 1),
-							"String literals must stay on one line",
-							"close the quote before LF; write \\n for a newline byte",
-						),
-					)
-					break
-				else if IntOps.less_than(byte, ASCII_SPACE) or IntOps.equals(byte, ASCII_DEL):
-					failure = Some(
-						diagnostic(
-							origin,
-							cursor,
-							IntOps.add(cursor, 1),
-							"unsupported raw byte in String literal",
-							"use printable text and fixed escapes for control bytes",
-						),
-					)
-					break
-				else if IntOps.greater_than(byte, ASCII_DEL):
-					match utf8_end(origin, source, cursor):
-						Ok(end):
-							cursor = end
-						Err(error):
-							failure = Some(error)
-							break
+-- A code line's indentation and level. At the end of the source it is an empty
+-- line at level 0, which closes every open level. All-Int records are inline.
+private fixed record CodeLine {
+	prefix: LinePrefix,
+	level: Int
+}
 
-					escaped = False
-				else if escaped:
-					escaped = False
-					cursor = IntOps.add(cursor, 1)
-				else if Text.equals(
-					source.substring(cursor, 1),
-					"\"",
-				):
-					closing = Some(cursor)
-					break
-				else:
-					escaped = Text.equals(
-						source.substring(cursor, 1),
-						"\\",
-					)
-					cursor = IntOps.add(cursor, 1)
 
-	match failure:
-		Some(error):
-			Err(error)
+private pure func within(value: Int, first: Int, last: Int) -> Bool:
+	IntOps.greater_than_or_equal(value, first) and IntOps.less_than_or_equal(value, last)
+
+
+private pure func is_byte(code: Int, expected: Char) -> Bool:
+	IntOps.equals(code, to_int(expected))
+
+
+private pure func in_class(code: Int, class: ByteClass) -> Bool:
+	match class:
+		SpaceByte:
+			is_byte(code, ' ')
+		TabByte:
+			is_byte(code, '\t')
+		IndentationByte:
+			is_byte(code, ' ') or is_byte(code, '\t')
+		DecimalDigit:
+			within(code, to_int('0'), to_int('9'))
+		IdentifierStart:
+			within(code, to_int('a'), to_int('z')) or within(code, to_int('A'), to_int('Z')) or is_byte(code, '_')
+		IdentifierByte:
+			in_class(code, IdentifierStart) or in_class(code, DecimalDigit)
+
+
+-- Byte reads compare codes: a one-byte substring would allocate a String.
+private pure func byte_is(text: SourceText, position: Int, expected: Char) -> Bool:
+	match StringOps.get(text.bytes, position):
+		Some(character):
+			is_byte(to_int(character), expected)
 		None:
-			match closing:
-				Some(end):
-					Ok(end)
-				None:
-					if escaped:
-						Err(
-							diagnostic(
-								origin,
-								IntOps.subtract(cursor, 1),
-								cursor,
-								"unterminated String escape",
-								"complete the escape and close the double quote on the same line",
-							),
-						)
-					else:
-						Err(
-							diagnostic(
-								origin,
-								start,
-								cursor,
-								"unterminated String literal",
-								"add a closing double quote on the same line",
-							),
-						)
+			False
 
 
-private fixed union LinePosition:
-	AtLineStart
-	WithinLine
+-- Whether a byte of `class` is at `position`; there is none at the end.
+private pure func byte_in(text: SourceText, position: Int, class: ByteClass) -> Bool:
+	match StringOps.get(text.bytes, position):
+		Some(character):
+			in_class(to_int(character), class)
+		None:
+			False
 
 
-private pure func token(origin: SourceId, kind: TokenKind, start: Int, end: Int) -> Token:
-	{
-		kind = kind,
-		span = {
-			source = origin,
-			start = start,
-			end = end
-		}
-	}
+-- The first position at or after `start` whose byte is not in `class`.
+private pure func run_end(text: SourceText, start: Int, class: ByteClass) -> Int:
+	var end: Int = start
 
-
-private pure func diagnostic(
-	origin: SourceId,
-	start: Int,
-	end: Int,
-	message: String,
-	help: String,
-) -> Diagnostic:
-	{
-		span = {
-			source = origin,
-			start = start,
-			end = end
-		},
-		note = None,
-		message = message,
-		help = help
-	}
-
-
--- The preceding byte already belongs to the run; inspect the remaining bytes.
-private pure func run_end(source: String, byte_offset: Int, accepted_bytes: String) -> Int:
-	var end: Int = byte_offset
-
-	while (
-		IntOps.less_than(end, source.length())
-		and accepted_bytes.contains(source.substring(end, 1))
-	):
+	while byte_in(text, end, class):
 		end = IntOps.add(end, 1)
 
 	end
 
 
-private pure func decimal_digit_at(source: String, position: Int) -> Bool:
-	(IntOps.less_than(position, source.length())
-		and DECIMAL_DIGITS.contains(source.substring(position, 1))
-	)
+private pure func error_at(text: SourceText, start: Int, end: Int, error: ErrorText) -> Diagnostic:
+	diagnostic({ source = text.origin, start = start, end = end }, error.message, error.help)
 
 
-private pure func numeric_result(origin: SourceId, source: String, start: Int, end: Int, is_float: Bool) -> Result[Token, Diagnostic]:
-	suffix = source.substring(end, 1)
-	if not suffix.is_empty() and IDENTIFIER_START.contains(suffix):
-		finish = run_end(source, IntOps.add(end, 1), IDENTIFIER_START.concat(DECIMAL_DIGITS))
-		Err(diagnostic(origin, start, finish, "numeric literals cannot have suffixes or separators", "write decimal digits with an optional fractional part or exponent; use no underscores or type suffixes"))
+private pure func byte_error(text: SourceText, position: Int, error: ErrorText) -> Diagnostic:
+	error_at(text, position, IntOps.add(position, 1), error)
+
+
+-- Layout tokens get spacing too; no syntax reads it there.
+private pure func token(text: SourceText, kind: TokenKind, start: Int, end: Int) -> Token:
+	previous = IntOps.subtract(start, 1)
+	spacing = if byte_in(text, previous, IndentationByte):
+		Spaced
 	else:
-		spelling = source.substring(start, IntOps.subtract(end, start))
+		Adjacent
+
+	{
+		kind = kind,
+		span = { source = text.origin, start = start, end = end },
+		spacing = spacing
+	}
+
+
+private pure func symbol(text: SourceText, value: Symbol, start: Int, end: Int) -> Token:
+	token(text, SymbolToken(value), start, end)
+
+
+private pure func utf8_form(lead: Int) -> Option[Utf8Form]:
+	if within(lead, UTF8_TWO_BYTES.first_lead, UTF8_TWO_BYTES.last_lead):
+		Some(UTF8_TWO_BYTES)
+	else if within(lead, UTF8_THREE_BYTES.first_lead, UTF8_THREE_BYTES.last_lead):
+		Some(UTF8_THREE_BYTES)
+	else if within(lead, UTF8_FOUR_BYTES.first_lead, UTF8_FOUR_BYTES.last_lead):
+		Some(UTF8_FOUR_BYTES)
+	else:
+		None
+
+
+-- Partial UTF-8 decoding: `scalar` holds the payload of the bytes before `cursor`.
+private fixed record Utf8Scalar {
+	start: Int,
+	cursor: Int,
+	end: Int,
+	scalar: Int
+}
+
+
+-- Accumulates the remaining continuation bytes, at most three.
+private pure func utf8_scalar(text: SourceText, partial: Utf8Scalar) -> Result[Int, Diagnostic]:
+	if IntOps.equals(partial.cursor, partial.end):
+		Ok(partial.scalar)
+	else:
+		match StringOps.get(text.bytes, partial.cursor):
+			None:
+				Err(error_at(text, partial.start, text.bytes.length(), INVALID_UTF8))
+			Some(character):
+				byte = to_int(character)
+
+				if within(byte, UTF8_CONTINUATION_START, UTF8_CONTINUATION_END):
+					payload = IntOps.subtract(byte, UTF8_CONTINUATION_START)
+					shifted = IntOps.multiply(partial.scalar, UTF8_CONTINUATION_RADIX)
+					next = IntOps.add(partial.cursor, 1)
+					utf8_scalar(text, { partial | cursor = next, scalar = IntOps.add(shifted, payload) })
+				else:
+					Err(byte_error(text, partial.cursor, INVALID_UTF8))
+
+
+-- Validates the scalar whose lead byte is at `start` and returns its end.
+-- Byte access does not decode or re-encode the source; the token retains it.
+private pure func utf8_end(text: SourceText, start: Int, lead: Int) -> Result[Int, Diagnostic]:
+	match utf8_form(lead):
+		None:
+			Err(byte_error(text, start, INVALID_UTF8))
+		Some(form):
+			end = IntOps.add(start, form.width)
+			payload = IntOps.subtract(lead, form.lead_marker)
+			scalar ?= utf8_scalar(text, { start = start, cursor = IntOps.add(start, 1), end = end, scalar = payload })
+
+			if (
+				IntOps.less_than(scalar, form.minimum)
+				or IntOps.greater_than(scalar, UNICODE_MAX)
+				or within(scalar, UNICODE_SURROGATE_START, UNICODE_SURROGATE_END)
+			):
+				Err(error_at(text, start, end, INVALID_UTF8))
+			else:
+				Ok(end)
+
+
+-- Validates one raw String byte or UTF-8 scalar at `position`.
+private pure func raw_character_end(text: SourceText, position: Int, byte: Int) -> Result[Int, Diagnostic]:
+	if is_byte(byte, '\n'):
+		Err(byte_error(text, position, STRING_LINE_BREAK))
+	else if IntOps.less_than(byte, ASCII_SPACE) or IntOps.equals(byte, ASCII_DEL):
+		Err(byte_error(text, position, RAW_CONTROL_BYTE))
+	else if IntOps.greater_than(byte, ASCII_DEL):
+		utf8_end(text, position, byte)
+	else:
+		Ok(IntOps.add(position, 1))
+
+
+-- Validates the character or escape pair at `cursor`, which is not the
+-- closing quote, and returns where the next one starts. The parser decodes
+-- escapes; the lexer only keeps an escaped byte from closing the literal.
+private pure func quoted_character_end(text: SourceText, start: Int, cursor: Int) -> Result[Int, Diagnostic]:
+	escaped = IntOps.add(cursor, 1)
+
+	match StringOps.get(text.bytes, cursor):
+		None:
+			Err(error_at(text, start, cursor, UNTERMINATED_STRING))
+		Some(character):
+			if not is_byte(to_int(character), '\\'):
+				raw_character_end(text, cursor, to_int(character))
+			else:
+				match StringOps.get(text.bytes, escaped):
+					None:
+						Err(byte_error(text, cursor, UNTERMINATED_ESCAPE))
+					Some(escaped_character):
+						raw_character_end(text, escaped, to_int(escaped_character))
+
+
+private pure func quoted_token(text: SourceText, start: Int) -> Result[Token, Diagnostic]:
+	contents_start = IntOps.add(start, 1)
+	-- One Result carries the scan to the closing quote or to the first error.
+	var scan: Result[Int, Diagnostic] = Ok(contents_start)
+
+	while True:
+		match scan:
+			Ok(cursor):
+				if byte_is(text, cursor, '"'):
+					break
+
+				scan = quoted_character_end(text, start, cursor)
+			Err(_):
+				break
+
+	closing ?= scan
+	contents = text.bytes.substring(contents_start, IntOps.subtract(closing, contents_start))
+	Ok(token(text, QuotedString(contents), start, IntOps.add(closing, 1)))
+
+
+private pure func numeric_token_end(text: SourceText, start: Int, end: Int, is_float: Bool) -> Result[Token, Diagnostic]:
+	if byte_in(text, end, IdentifierStart):
+		Err(error_at(text, start, run_end(text, end, IdentifierByte), NUMERIC_SUFFIX))
+	else:
+		spelling = text.bytes.substring(start, IntOps.subtract(end, start))
 		kind = if is_float:
 			FloatLiteral(spelling)
 		else:
 			IntegerLiteral(spelling)
-		Ok(token(origin, kind, start, end))
+		Ok(token(text, kind, start, end))
+
+
+-- Whether a field or function name follows `position` on its line.
+private pure func name_follows(text: SourceText, position: Int) -> Bool:
+	byte_in(text, run_end(text, position, SpaceByte), IdentifierStart)
+
+
+private pure func exponent_token(text: SourceText, start: Int, marker: Int) -> Result[Token, Diagnostic]:
+	sign = IntOps.add(marker, 1)
+	digits = if byte_is(text, sign, '+') or byte_is(text, sign, '-'):
+		IntOps.add(sign, 1)
+	else:
+		sign
+
+	if byte_in(text, digits, DecimalDigit):
+		numeric_token_end(text, start, run_end(text, digits, DecimalDigit), True)
+	else:
+		Err(error_at(text, start, digits, MISSING_EXPONENT))
 
 
 -- Only a dot followed immediately by a digit belongs to a number. An integer
--- or Float receiver's UFCS dot therefore remains an ordinary symbol token.
-private pure func numeric_token(origin: SourceId, source: String, start: Int) -> Result[Token, Diagnostic]:
-	digit_start = if Text.equals(source.substring(start, 1), "-"):
+-- receiver's UFCS dot remains an ordinary symbol token when a name follows it;
+-- any other dot directly after an integer is a Float missing its fraction.
+private pure func numeric_token(text: SourceText, start: Int) -> Result[Token, Diagnostic]:
+	digit_start = if byte_is(text, start, '-'):
 		IntOps.add(start, 1)
 	else:
 		start
-
-	if not decimal_digit_at(source, digit_start):
-		Err(diagnostic(
-			origin,
-			start,
-			IntOps.add(start, 1),
-			"expected decimal digits immediately after '-'",
-			"write a signed number such as -42 or -0.5; '-' is not an operator",
-		))
+	integer_end = run_end(text, digit_start, DecimalDigit)
+	after_dot = IntOps.add(integer_end, 1)
+	dotted = byte_is(text, integer_end, '.')
+	fraction = dotted and byte_in(text, after_dot, DecimalDigit)
+	mantissa_end = if fraction:
+		run_end(text, after_dot, DecimalDigit)
 	else:
-		var end = run_end(source, IntOps.add(digit_start, 1), DECIMAL_DIGITS)
-		var is_float = False
+		integer_end
 
-		if Text.equals(source.substring(end, 1), ".") and decimal_digit_at(source, IntOps.add(end, 1)):
-			is_float = True
-			end = run_end(source, IntOps.add(end, 2), DECIMAL_DIGITS)
-
-		exponent = source.substring(end, 1)
-		if Text.equals(exponent, "e") or Text.equals(exponent, "E"):
-			is_float = True
-			end = IntOps.add(end, 1)
-			sign = source.substring(end, 1)
-
-			if Text.equals(sign, "+") or Text.equals(sign, "-"):
-				end = IntOps.add(end, 1)
-
-			if not decimal_digit_at(source, end):
-				Err(diagnostic(
-					origin,
-					start,
-					end,
-					"expected decimal digits in Float exponent",
-					"write a decimal Float such as 1.0, 0.5 or 1e2; an exponent needs at least one digit",
-				))
-			else:
-				end = run_end(source, IntOps.add(end, 1), DECIMAL_DIGITS)
-				numeric_result(origin, source, start, end, True)
-		else:
-			numeric_result(origin, source, start, end, is_float)
+	if IntOps.equals(integer_end, digit_start):
+		Err(byte_error(text, start, SEPARATED_MINUS))
+	else if byte_is(text, mantissa_end, 'e') or byte_is(text, mantissa_end, 'E'):
+		exponent_token(text, start, mantissa_end)
+	else if dotted and not fraction and not name_follows(text, after_dot):
+		Err(error_at(text, start, after_dot, MISSING_FRACTION))
+	else:
+		numeric_token_end(text, start, mantissa_end, fraction)
 
 
-pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnostic]:
-	identifier_continue: String = Text.concat(IDENTIFIER_START, DECIMAL_DIGITS)
-	var tokens: List[Token] = []
-	var cursor: Int = 0
-	var line_position: LinePosition = AtLineStart
-	var failure: Option[Diagnostic] = None
+private pure func word_kind(spelling: String) -> TokenKind:
+	match spelling:
+		"func":
+			SymbolToken(FunctionKeyword)
+		"pure":
+			SymbolToken(PureKeyword)
+		"void":
+			SymbolToken(VoidKeyword)
+		"var":
+			SymbolToken(VarKeyword)
+		"match":
+			SymbolToken(MatchKeyword)
+		"_":
+			SymbolToken(Wildcard)
+		_:
+			IdentifierToken(spelling)
 
-	while IntOps.less_than(cursor, source.length()):
-		byte_slice: String = source.substring(cursor, 1)
 
-		at_line_start: Bool = match line_position:
-			AtLineStart:
-				True
-			WithinLine:
-				False
+private pure func punctuation(byte: Char) -> Option[Symbol]:
+	match byte:
+		'@':
+			Some(AtSign)
+		'(':
+			Some(LeftParen)
+		')':
+			Some(RightParen)
+		'{':
+			Some(LeftBrace)
+		'}':
+			Some(RightBrace)
+		'[':
+			Some(LeftBracket)
+		']':
+			Some(RightBracket)
+		',':
+			Some(Comma)
+		'.':
+			Some(Dot)
+		'/':
+			Some(Slash)
+		'*':
+			Some(Star)
+		'=':
+			Some(Equals)
+		':':
+			Some(Colon)
+		_:
+			None
 
-		if at_line_start and (Text.equals(byte_slice, "\t") or Text.equals(byte_slice, " ")):
-			indentation_end = run_end(
-				source,
-				IntOps.add(cursor, 1),
-				" \t",
-			)
 
-			-- Trivia has no layout, even when its incidental prefix is irregular.
-			if (
-				IntOps.equals(indentation_end, source.length())
-				or Text.equals(
-					source.substring(indentation_end, 1),
-					"\n",
-				)
-				or Text.equals(
-					source.substring(indentation_end, 2),
-					"--",
-				)
-			):
-				cursor = indentation_end
-				continue
+-- Scans the code token at `cursor`; the caller handles spaces, comments and LF.
+private pure func code_token(text: SourceText, cursor: Int) -> Result[Token, Diagnostic]:
+	next = IntOps.add(cursor, 1)
 
-			prefix = source.substring(
-				cursor,
-				IntOps.subtract(indentation_end, cursor),
-			)
-			width = IntOps.subtract(indentation_end, cursor)
-			tabs = Text.equals(byte_slice, "\t")
+	if byte_is(text, cursor, '"'):
+		quoted_token(text, cursor)
+	else if byte_in(text, cursor, IdentifierStart):
+		end = run_end(text, next, IdentifierByte)
+		spelling = text.bytes.substring(cursor, IntOps.subtract(end, cursor))
+		Ok(token(text, word_kind(spelling), cursor, end))
+	else if byte_is(text, cursor, '-') and byte_is(text, next, '>'):
+		Ok(symbol(text, Arrow, cursor, IntOps.add(cursor, 2)))
+	else if byte_is(text, cursor, '+'):
+		Err(byte_error(text, cursor, PLUS_SIGN))
+	else if byte_in(text, cursor, DecimalDigit) or byte_is(text, cursor, '-'):
+		numeric_token(text, cursor)
+	else if byte_is(text, cursor, '\r'):
+		Err(byte_error(text, cursor, LINE_ENDING))
+	else if byte_is(text, cursor, '\t'):
+		Err(byte_error(text, cursor, SEPARATING_TAB))
+	else:
+		punctuator = match StringOps.get(text.bytes, cursor):
+			Some(byte):
+				punctuation(byte)
+			None:
+				None
 
-			if (
-				tabs and prefix.contains(" ")
-				or not tabs and (prefix.contains("\t") or IntOps.not_equals(
-					IntOps.remainder(width, SPACE_INDENT_WIDTH),
-					0,
-				))
-			):
-				failure = Some(
-					diagnostic(
-						origin,
-						cursor,
-						indentation_end,
-						"invalid indentation",
-						"use tabs only, or spaces in groups of four; do not mix tabs and spaces",
-					),
-				)
-				break
+		match punctuator:
+			Some(value):
+				Ok(symbol(text, value, cursor, next))
+			None:
+				Err(byte_error(text, cursor, UNSUPPORTED_CHARACTER))
 
-			depth = if tabs:
-				width
-			else:
-				IntOps.divide(width, SPACE_INDENT_WIDTH)
 
-			tokens = tokens.append(token(origin, Indentation(depth), cursor, indentation_end))
-			cursor = indentation_end
+-- A comment holds ASCII bytes other than CR, up to the LF or EOF ending its line.
+private pure func comment_end(text: SourceText, start: Int) -> Result[Int, Diagnostic]:
+	var end: Int = IntOps.add(start, 2)
 
-			line_position = WithinLine
-		else:
-			is_comment = Text.equals(byte_slice, "-") and Text.equals(
-				source.substring(cursor, 2),
-				"--",
-			)
+	while IntOps.less_than(end, text.bytes.length()) and comment_continues(text, end):
+		end = IntOps.add(end, 1)
 
-			if not is_comment and not Text.equals(byte_slice, "\n"):
-				line_position = WithinLine
+	if IntOps.equals(end, text.bytes.length()) or byte_is(text, end, '\n'):
+		Ok(end)
+	else if byte_is(text, end, '\r'):
+		Err(byte_error(text, end, LINE_ENDING))
+	else:
+		Err(byte_error(text, end, COMMENT_BYTE))
 
-			if is_comment:
-				cursor = IntOps.add(cursor, 2)
 
-				while IntOps.less_than(cursor, source.length()):
-					comment_byte = source.substring(cursor, 1)
-
-					if Text.equals(comment_byte, "\n"):
-						break
-					else if Text.equals(comment_byte, "\r"):
-						failure = Some(
-							diagnostic(
-								origin,
-								cursor,
-								IntOps.add(cursor, 1),
-								"only LF line endings are supported",
-								"replace CRLF or CR line endings with LF",
-							),
-						)
-						break
-					else if not StringOps.is_ascii(comment_byte):
-						failure = Some(
-							diagnostic(
-								origin,
-								cursor,
-								IntOps.add(cursor, 1),
-								"unsupported byte in comment",
-								"use ASCII bytes in single-line comments",
-							),
-						)
-						break
-
-					cursor = IntOps.add(cursor, 1)
-
-				match failure:
-					Some(_):
-						break
-					None:
-						continue
-			else if Text.equals(byte_slice, " "):
-				cursor = IntOps.add(cursor, 1)
-			else if Text.equals(byte_slice, "\n"):
-				if not at_line_start:
-					tokens = tokens.append(
-						token(
-							origin,
-							SymbolToken(Newline),
-							cursor,
-							IntOps.add(cursor, 1),
-						),
-					)
-
-				cursor = IntOps.add(cursor, 1)
-				line_position = AtLineStart
-			else if Text.equals(byte_slice, "\r"):
-				failure = Some(
-					diagnostic(
-						origin,
-						cursor,
-						IntOps.add(cursor, 1),
-						"only LF line endings are supported",
-						"replace CRLF or CR line endings with LF",
-					),
-				)
-				break
-			else if Text.equals(byte_slice, "\t"):
-				failure = Some(
-					diagnostic(
-						origin,
-						cursor,
-						IntOps.add(cursor, 1),
-						"tabs are allowed only in the body indentation",
-						"separate tokens with spaces and indent the body with one tab or four spaces",
-					),
-				)
-				break
-			else if Text.equals(byte_slice, "\""):
-				match quoted_end(origin, source, cursor):
-					Err(error):
-						failure = Some(error)
-						break
-					Ok(end):
-						contents_start = IntOps.add(cursor, 1)
-						tokens = tokens.append(
-							token(
-								origin,
-								QuotedString(
-									source.substring(
-										contents_start,
-										IntOps.subtract(end, contents_start),
-									),
-								),
-								cursor,
-								IntOps.add(end, 1),
-							),
-						)
-						cursor = IntOps.add(end, 1)
-			else if IDENTIFIER_START.contains(byte_slice):
-				identifier_end: Int = run_end(
-					source,
-					IntOps.add(cursor, 1),
-					identifier_continue,
-				)
-				spelling: String = source.substring(
-					cursor,
-					IntOps.subtract(identifier_end, cursor),
-				)
-
-				kind: TokenKind = if Text.equals(spelling, "func"):
-					SymbolToken(FunctionKeyword)
-				else if Text.equals(spelling, "pure"):
-					SymbolToken(PureKeyword)
-				else if Text.equals(spelling, "void"):
-					SymbolToken(VoidKeyword)
-				else if Text.equals(spelling, "var"):
-					SymbolToken(VarKeyword)
-				else if Text.equals(spelling, "match"):
-					SymbolToken(MatchKeyword)
-				else if Text.equals(spelling, "_"):
-					SymbolToken(Wildcard)
-				else:
-					IdentifierToken(spelling)
-
-				tokens = tokens.append(token(origin, kind, cursor, identifier_end))
-				cursor = identifier_end
-			else if Text.equals(byte_slice, "-") and Text.equals(
-				source.substring(cursor, 2),
-				"->",
-			):
-				tokens = tokens.append(
-					token(
-						origin,
-						SymbolToken(Arrow),
-						cursor,
-						IntOps.add(cursor, 2),
-					),
-				)
-				cursor = IntOps.add(cursor, 2)
-			else if Text.equals(byte_slice, "+"):
-				failure = Some(diagnostic(origin, cursor, IntOps.add(cursor, 1), "source numeric literals cannot start with '+'", "remove the leading '+'; use an adjacent '-' for a negative literal"))
-				break
-			else if DECIMAL_DIGITS.contains(byte_slice) or Text.equals(byte_slice, "-"):
-				match numeric_token(origin, source, cursor):
-					Err(error):
-						failure = Some(error)
-						break
-					Ok(number):
-						tokens = tokens.append(number)
-						cursor = number.span.end
-			else:
-				symbol: Option[Symbol] = match byte_slice:
-					"@":
-						Some(AtSign)
-					"(":
-						Some(LeftParen)
-					")":
-						Some(RightParen)
-					"{":
-						Some(LeftBrace)
-					"}":
-						Some(RightBrace)
-					"[":
-						Some(LeftBracket)
-					"]":
-						Some(RightBracket)
-					",":
-						Some(Comma)
-					".":
-						Some(Dot)
-					"/":
-						Some(Slash)
-					"*":
-						Some(Star)
-					"=":
-						Some(Equals)
-					":":
-						Some(Colon)
-					_:
-						None
-
-				match symbol:
-					Some(value):
-						tokens = tokens.append(
-							token(
-								origin,
-								SymbolToken(value),
-								cursor,
-								IntOps.add(cursor, 1),
-							),
-						)
-						cursor = IntOps.add(cursor, 1)
-					None:
-						message: String = "unsupported character"
-						help: String = Text.concat(
-							"use ASCII function declarations and numeric literals, parameter names, or calls; ",
-							"keep -> adjacent",
-						)
-
-						failure = Some(
-							diagnostic(
-								origin,
-								cursor,
-								IntOps.add(cursor, 1),
-								message,
-								help,
-							),
-						)
-						break
-
-	match failure:
-		Some(error):
-			Err(error)
+private pure func comment_continues(text: SourceText, position: Int) -> Bool:
+	match StringOps.get(text.bytes, position):
+		Some(character):
+			code = to_int(character)
+			IntOps.less_than_or_equal(code, ASCII_DEL) and not is_byte(code, '\n') and not is_byte(code, '\r')
 		None:
-			Ok({
-				tokens = tokens,
-				end = {
-					source = origin,
-					start = source.length(),
-					end = source.length()
-				},
-			})
+			False
+
+
+private pure func comment_starts(text: SourceText, cursor: Int) -> Bool:
+	byte_is(text, cursor, '-') and byte_is(text, IntOps.add(cursor, 1), '-')
+
+
+-- Returns where the trivia at `start`, which is an LF, EOF or comment, ends:
+-- `start` itself at LF or EOF, or the LF or EOF ending the comment there.
+private pure func trivia_end(text: SourceText, start: Int) -> Result[Int, Diagnostic]:
+	if byte_is(text, start, '-'):
+		comment_end(text, start)
+	else:
+		Ok(start)
+
+
+-- An indentation prefix is all tabs, or spaces in groups of four.
+private pure func indentation_level(text: SourceText, prefix: LinePrefix) -> Result[Int, Diagnostic]:
+	width = IntOps.subtract(prefix.end, prefix.start)
+	whole_groups = IntOps.equals(IntOps.remainder(width, SPACE_INDENT_WIDTH), 0)
+
+	if IntOps.equals(run_end(text, prefix.start, TabByte), prefix.end):
+		Ok(width)
+	else if IntOps.equals(run_end(text, prefix.start, SpaceByte), prefix.end) and whole_groups:
+		Ok(IntOps.divide(width, SPACE_INDENT_WIDTH))
+	else:
+		Err(error_at(text, prefix.start, prefix.end, INVALID_INDENTATION))
+
+
+private pure func line_prefix(text: SourceText, start: Int) -> LinePrefix:
+	{ start = start, end = run_end(text, start, IndentationByte) }
+
+
+-- Skips blank, whitespace-only and comment-only lines from the line at `start`
+-- to the next code line. A code line may open only one level beyond `depth`,
+-- so the open levels are always 0..depth and every dedent lands on one.
+private pure func next_code_line(text: SourceText, start: Int, depth: Int) -> Result[CodeLine, Diagnostic]:
+	-- One Result carries the line past trivia lines, or the first error.
+	var scan: Result[LinePrefix, Diagnostic] = Ok(line_prefix(text, start))
+
+	while True:
+		match scan:
+			Ok(line):
+				if IntOps.equals(line.end, text.bytes.length()) or not (byte_is(text, line.end, '\n') or comment_starts(text, line.end)):
+					break
+
+				scan = match trivia_end(text, line.end):
+					Ok(end):
+						Ok(line_prefix(text, IntOps.min(IntOps.add(end, 1), text.bytes.length())))
+					Err(error):
+						Err(error)
+			Err(_):
+				break
+
+	prefix ?= scan
+	end = text.bytes.length()
+
+	if IntOps.equals(prefix.end, end):
+		Ok({ prefix = { start = end, end = end }, level = 0 })
+	else:
+		level ?= indentation_level(text, prefix)
+
+		if IntOps.greater_than(level, IntOps.add(depth, 1)):
+			Err(error_at(text, prefix.start, prefix.end, DEEP_INDENTATION))
+		else:
+			Ok({ prefix = prefix, level = level })
+
+
+-- Each code line starts with an Indent when it is one level deeper than the
+-- last, or a Dedent for each level it closes, spanning its indentation, and
+-- ends with Newline: its LF, or empty at the end of a source without one.
+pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnostic]:
+	text: SourceText = { origin = origin, bytes = source }
+	var tokens: List[Token] = []
+	var depth = 0
+	-- One Result carries each code line to lay out, or the first error.
+	var lines: Result[CodeLine, Diagnostic] = next_code_line(text, 0, 0)
+
+	while True:
+		match lines:
+			Ok(line):
+				if IntOps.greater_than(line.level, depth):
+					tokens = tokens.append(symbol(text, Indent, line.prefix.start, line.prefix.end))
+
+				while IntOps.greater_than(depth, line.level):
+					tokens = tokens.append(symbol(text, Dedent, line.prefix.start, line.prefix.end))
+					depth = IntOps.subtract(depth, 1)
+
+				depth = line.level
+
+				if IntOps.equals(line.prefix.end, source.length()):
+					break
+
+				-- One Result carries the cursor across the line to its LF or EOF, or the first error.
+				var code: Result[Int, Diagnostic] = Ok(line.prefix.end)
+
+				while True:
+					match code:
+						Ok(cursor):
+							if IntOps.equals(cursor, source.length()) or byte_is(text, cursor, '\n'):
+								break
+
+							code = if byte_is(text, cursor, ' '):
+								Ok(IntOps.add(cursor, 1))
+							else if comment_starts(text, cursor):
+								comment_end(text, cursor)
+							else:
+								match code_token(text, cursor):
+									Ok(token):
+										tokens = tokens.append(token)
+										Ok(token.span.end)
+									Err(error):
+										Err(error)
+						Err(_):
+							break
+
+				lines = match code:
+					Ok(line_end):
+						next = IntOps.min(IntOps.add(line_end, 1), source.length())
+						tokens = tokens.append(symbol(text, Newline, line_end, next))
+						next_code_line(text, next, depth)
+					Err(error):
+						Err(error)
+			Err(_):
+				break
+
+	finished ?= lines
+	Ok({ tokens = tokens, end = { source = origin, start = source.length(), end = source.length() } })
