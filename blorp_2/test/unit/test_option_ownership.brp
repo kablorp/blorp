@@ -410,22 +410,85 @@ pure func test_verifier_rejects_parse_borrow_after_input_drop() -> Bool:
 			rejects(raw_program(seed, tested), "borrow refers to discharged owner 0", 30)
 
 
-private pure func raw_read(seed: Seed, result: Own.ResultOwnership, drops: List[Own.OwnershipOperation]) -> Own.OwnershipProgram:
+private pure func read_arguments(seed: Seed) -> List[Own.OwnedArgument]:
+	[Own.BorrowedArgument({ value = seed.ids.first, source = Own.ParameterBorrow(seed.ids.first) }), Own.UnmanagedArgument(seed.ids.second)]
+
+
+private pure func raw_read_call(seed: Seed, roles: Prelude.OptionalRoles[Concrete.VariantInstanceId], arguments: List[Own.OwnedArgument], value_type: Concrete.TypeRef, result: Own.ResultOwnership, drops: List[Own.OwnershipOperation]) -> Own.OwnershipProgram:
 	ids = seed.ids
 	list_type = Concrete.ListType(Concrete.StringType)
-	call: Concrete.ConcreteCall = { target = Concrete.RuntimeFunction(Prelude.ListGet(seed.string_roles)), span = span(30) }
+	call: Concrete.ConcreteCall = { target = Concrete.RuntimeFunction(Prelude.ListGet(roles)), span = span(30) }
 	operations = [
 		define(ids.first, list_type, Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(ids.first)), 10),
 		define(ids.second, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 20),
-		define(ids.third, result_type(seed.string_roles), Own.CallDefinition(call, [Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) }), Own.UnmanagedArgument(ids.second)]), result, 30)
+		define(ids.third, value_type, Own.CallDefinition(call, arguments), result, 30)
 	] + drops + [define(ids.fourth, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 50)]
 	raw_program(seed, raw_function(operations, Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.fourth))), [list_type], Concrete.IntType))
+
+
+private pure func raw_read(seed: Seed, result: Own.ResultOwnership, drops: List[Own.OwnershipOperation]) -> Own.OwnershipProgram:
+	raw_read_call(seed, seed.string_roles, read_arguments(seed), result_type(seed.string_roles), result, drops)
+
+
+-- Keep the rest of a valid get program fixed while varying one call fact.
+private pure func changed_read(seed: Seed, roles: Prelude.OptionalRoles[Concrete.VariantInstanceId], arguments: List[Own.OwnedArgument], value_type: Concrete.TypeRef) -> Own.OwnershipProgram:
+	raw_read_call(seed, roles, arguments, value_type, Own.OwnedResult(Own.owner_id(0)), [Own.DropOwner(Own.owner_id(0), span(40))])
 
 
 pure func test_raw_read_fresh_result_and_single_drop_are_valid() -> Bool:
 	match seed():
 		Ok(seed): verify(raw_read(seed, Own.OwnedResult(Own.owner_id(0)), [Own.DropOwner(Own.owner_id(0), span(40))])).is_ok()
 		Err(_): False
+
+
+pure func test_verifier_rejects_wrong_list_get_list_argument() -> Bool:
+	match seed():
+		Err(_): False
+		Ok(seed):
+			arguments = [Own.UnmanagedArgument(seed.ids.second), Own.UnmanagedArgument(seed.ids.second)]
+			rejects(changed_read(seed, seed.string_roles, arguments, result_type(seed.string_roles)), "call argument type does not match its contract", 30)
+
+
+pure func test_verifier_rejects_wrong_list_get_index_argument() -> Bool:
+	match seed():
+		Err(_): False
+		Ok(seed):
+			argument: Own.OwnedArgument = Own.BorrowedArgument({ value = seed.ids.first, source = Own.ParameterBorrow(seed.ids.first) })
+			rejects(changed_read(seed, seed.string_roles, [argument, argument], result_type(seed.string_roles)), "call argument type does not match its contract", 30)
+
+
+pure func test_verifier_rejects_unmanaged_list_get_argument() -> Bool:
+	match seed():
+		Err(_): False
+		Ok(seed):
+			arguments = [Own.UnmanagedArgument(seed.ids.first), Own.UnmanagedArgument(seed.ids.second)]
+			rejects(changed_read(seed, seed.string_roles, arguments, result_type(seed.string_roles)), "managed call argument requires an owner-dependent borrow", 30)
+
+
+pure func test_verifier_rejects_wrong_list_get_result_type() -> Bool:
+	match seed():
+		Err(_): False
+		Ok(seed): rejects(changed_read(seed, seed.string_roles, read_arguments(seed), Concrete.IntType), "call result type does not match its contract", 30)
+
+
+pure func test_verifier_rejects_swapped_list_get_roles() -> Bool:
+	match seed():
+		Err(_): False
+		Ok(seed):
+			roles = { present = seed.string_roles.absent, absent = seed.string_roles.present }
+			rejects(changed_read(seed, roles, read_arguments(seed), result_type(seed.string_roles)), "variant payload does not match its operation", 30)
+
+
+pure func test_list_get_last_uses_include_root_borrow_and_index() -> Bool:
+	match seed():
+		Err(_): False
+		Ok(seed):
+			function = read_function(seed, True)
+			-- Definitions 0 and 1 are the root and index; get at position 2
+			-- uses both. Its fresh result is then used by return at position 3.
+			match Own.last_uses(function.definitions, seed.ids.third):
+				Ok(uses): uses == [Some(2), Some(2), Some(3)]
+				Err(_): False
 
 
 pure func test_verifier_rejects_unmanaged_list_get_result() -> Bool:
@@ -545,6 +608,12 @@ tests: TestSuite = {
 		("parse String argument requires borrow", test_verifier_rejects_unmanaged_parse_string_argument),
 		("parse borrow cannot outlive input owner", test_verifier_rejects_parse_borrow_after_input_drop),
 		("raw read fresh result and single drop valid", test_raw_read_fresh_result_and_single_drop_are_valid),
+		("list get list argument matches contract", test_verifier_rejects_wrong_list_get_list_argument),
+		("list get index argument matches contract", test_verifier_rejects_wrong_list_get_index_argument),
+		("list get root argument requires borrow", test_verifier_rejects_unmanaged_list_get_argument),
+		("list get result type matches contract", test_verifier_rejects_wrong_list_get_result_type),
+		("list get roles preserve payload meaning", test_verifier_rejects_swapped_list_get_roles),
+		("list get last uses include root and index", test_list_get_last_uses_include_root_borrow_and_index),
 		("list get cannot be unmanaged", test_verifier_rejects_unmanaged_list_get_result),
 		("list get cannot borrow fresh result", test_verifier_rejects_borrowed_list_get_result),
 		("list get owner cannot remain live", test_verifier_rejects_undropped_list_get_result),
