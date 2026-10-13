@@ -1,8 +1,9 @@
 # One managed String field
 
 Status: proposed next increment, not implementation authorization or a claim of
-supported behavior. Complete and review [RECORDS_PLAN.md](RECORDS_PLAN.md)
-first. Read both [AGENTS.md](AGENTS.md) and the
+supported behavior. The [Int-record baseline](README.md#grammar-for-this-increment)
+is complete; refresh this proposal against its current implementation before
+starting. Read both [AGENTS.md](AGENTS.md) and the
 [parent AGENTS.md](../AGENTS.md);
 [MEMORY_PLAN.md](MEMORY_PLAN.md#dupdrop-arc-and-exhaustive-destruction) owns the
 memory contracts. Final carrier names must follow the completed Int-record
@@ -323,7 +324,7 @@ The existing e2e entrypoint builds the pilot once at O0; it runs with
 
 Freeze completed Int-record source/binaries, inputs, flags and C toolchain
 before implementation. Use the existing eleven-workload corpus and recipe
-linked in [RECORDS_PLAN.md](RECORDS_PLAN.md#feedback-performance-and-stop-rules),
+in the [committed Int-record design](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/RECORDS_PLAN.md#feedback-performance-and-stop-rules),
 with three quiet serialized baseline/candidate samples per workload. Label
 these compilation costs as owned-input proxies, not self-compilation. Retain
 all preexisting fixture C byte-identical by emitting managed record helpers

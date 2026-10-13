@@ -5,9 +5,22 @@ small program, defines the grammar it needs, and tests that program through
 native execution. The existing compiler builds this compiler until it can
 build itself.
 
-The [imports and prelude roadmap](IMPORTS_AND_PRELUDE_PLAN.md) defines explicit
+The [imports and prelude reference](IMPORTS_AND_PRELUDE_PLAN.md) defines explicit
 type/method visibility and a shared base/prelude for the temporary target
 library. Its syntax and layout are implemented in this pilot.
+
+Current language examples and limits are below; [grammar.ebnf](grammar.ebnf)
+owns the formal syntax. The [memory architecture and test matrix](MEMORY_PLAN.md)
+owns ownership contracts and required validation. Unfinished work remains in the
+[generics plan](GENERICS_PLAN.md), [recursion plan](RECURSION_PLAN.md), and
+[managed-record proposal](MANAGED_RECORDS_PLAN.md).
+
+Completed increment plans and handoffs are retained in Git; validation reports
+remain under [benchmarks/results](../benchmarks/results/). Historical research
+is available in the committed designs for
+[pattern matching across Haskell, OCaml, Rust, Scala and Elm](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/MATCH_PLAN.md#cross-language-implementation-references),
+[module identities and visibility](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/MODULES_PLAN.md#established-implementations-and-the-bounded-choice),
+and [guaranteed tail calls](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/TAIL_RECURSION_PLAN.md#established-precedents-and-deliberate-choices).
 
 The [scaffolding cleanup report](../benchmarks/results/blorp_2_cleanup_2026-10-12.md)
 records explicit unit inputs, reachable specialization, the slim target library,
@@ -161,7 +174,7 @@ func main() -> Int:
 This exits 1. `original` is immutable; `current` is mutable, and reassignment
 does not change the earlier value. Local mutation is permitted in pure
 functions. Every initializer runs once in source order, including unused
-bindings. The [binding design](BINDINGS_PLAN.md) defines the phase contracts;
+bindings. The [binding report](../benchmarks/results/blorp_2_bindings_2026-10-09.md) records phase validation;
 the [companion fixture](test/e2e/fixtures/binding/values.brp) instead returns
 the reassigned current value, 42. Separate small fixtures cover self-assignment,
 parameter shadowing and union values. Phase tests check exact full-width values
@@ -537,8 +550,10 @@ loop on every iteration. The emitted C guarantees bounded stack growth for
 these direct self edges at `-O0`; other calls and mutual recursion retain their
 ordinary stack behavior. The annotation does not bound heap use or prove
 termination. Unannotated C output is preserved. The
-[tail-recursion plan](TAIL_RECURSION_PLAN.md) defines the phase invariants,
-malformed-IR tests and native stack-exhaustion mutation oracle.
+[tail-recursion report](../benchmarks/results/blorp_2_tail_recursion_2026-10-10.md)
+records phase invariants, malformed-IR tests and the native stack-exhaustion
+mutation oracle. The [recursion plan](RECURSION_PLAN.md#tail-recursion-follow-ups)
+retains the unfinished generic and managed loop requirements.
 
 The [numeric accumulator](test/e2e/fixtures/tail_recursion/accumulator.brp)
 decrements an Int while adding one to a second Int. The regular suite checks
@@ -956,10 +971,9 @@ bodies and there is no module initialization. This does not permit cyclic runtim
 data. Every loaded module is checked, including unused declarations. Diagnostics
 retain the source file for primary errors and secondary notes independently.
 
-The [module design](MODULES_PLAN.md) records implementation research, identity
-ownership, tests and cost ceilings; the [validation report](../benchmarks/results/blorp_2_modules_2026-10-11.md)
-retains the independent reviews and measurements. The [calculator roadmap](CALCULATOR_PLAN.md)
-places String literals and numeric/IO operations in successive slices.
+The [module validation report](../benchmarks/results/blorp_2_modules_2026-10-11.md)
+retains the independent reviews and measurements; the
+[imports reference](IMPORTS_AND_PRELUDE_PLAN.md) defines the current visibility rules.
 
 ## Temporary target library and Int addition
 
@@ -999,8 +1013,7 @@ may declare these builtin bodies with the exact concrete runtime signature,
 without statement prefixes, generic parameters or tail annotations. Unknown
 labels and signature mismatches are errors. There is no arbitrary foreign
 symbol binding. The base types module owns `Int`, `Float`, `String`, `Void` and unary `List`.
-The [increment design](INT_ADD_PLAN.md) records phase contracts; the
-[validation report](../benchmarks/results/blorp_2_int_add_2026-10-11.md) records
+The [validation report](../benchmarks/results/blorp_2_int_add_2026-10-11.md) records
 strict tests, native fixtures, matched costs and the existing compiler's
 different trait-based `add` import surface.
 
@@ -1038,7 +1051,7 @@ multiline literals are deferred; write `"$\{"` to preserve literal `${` text.
 
 Builtin declaration labels retain their exact raw spelling; String escape
 decoding does not create aliases for closed runtime operations. The
-[increment design](STRINGS_PLAN.md) records construction and validation contracts.
+[String report](../benchmarks/results/blorp_2_strings_2026-10-11.md) records construction and validation evidence.
 Emission uses flat static byte arrays scoped to their function and named from
 existing value identities. Backing bytes require no stack initialization and
 avoid C string-token length limits; the runtime copies them into an ordinary
@@ -1114,16 +1127,12 @@ One ordered statement list carries evaluation order through parsing, checking
 and specialization. Discards create no synthetic binding; lowering retains
 their ordinary value definitions so unused Void results still execute calls.
 Emission selects a small print runtime fragment only when its typed operation
-is used. The [increment design](VOID_PRINT_PLAN.md) defines its contracts and
-acceptance cases; the
-[validation report](../benchmarks/results/blorp_2_void_print_2026-10-12.md)
+is used. The [validation report](../benchmarks/results/blorp_2_void_print_2026-10-12.md)
 records phase tests, native output, ownership checks and matched costs.
 
 ## Calculator input and results
 
-The [argument input plan](ARGUMENTS_PLAN.md) defines the current input contract;
-the [calculator completion plan](CALCULATOR_COMPLETION_PLAN.md) retains the
-numeric contracts. `Option[T]`, `Result[Value, Error]` and `Bool` come from ordinary
+`Option[T]`, `Result[Value, Error]` and `Bool` come from ordinary
 fixed unions in `standard_library_temp/_base/types.brp`; neither spelling receives
 a compiler-specific representation. Their types and constructors are implicitly
 available in every module:
@@ -1149,9 +1158,8 @@ splitting is implicit. OS argument strings cannot contain NUL; source-literal
 tests cover counted NUL bytes separately. Only concrete `List[String]` is
 supported in this increment; generic helpers may abstract over it.
 
-The [argument design](ARGUMENTS_PLAN.md) and
-[validation report](../benchmarks/results/blorp_2_arguments_2026-10-12.md)
-record the entrypoint contract, ownership checks, native tests and matched costs.
+The [argument validation report](../benchmarks/results/blorp_2_arguments_2026-10-12.md)
+records the entrypoint contract, ownership checks, native tests and matched costs.
 
 `string.equals(first, second) -> Bool` compares complete byte sequences.
 `int` exposes concrete `add`, `subtract`, `multiply`, `divide`, `remainder`
@@ -1211,9 +1219,10 @@ Float `to_string` for direct calls is an error; neither declaration takes
 precedence.
 Following the pilot's infallible arithmetic rule, Float division and remainder
 by either signed zero return positive zero. Other arithmetic can produce
-infinity or NaN. Remainder uses a quotient truncated toward zero. The existing
+infinity or NaN, with NaN sign and payload unspecified. Remainder uses a quotient
+truncated toward zero. The existing
 host Float library currently uses IEEE division by zero; the pilot's explicit
-rule is recorded in its Float design rather than inherited from that library.
+rule is defined here.
 
 `string.parse_float` borrows a complete String and returns ordinary
 `Option[Float]`. It accepts an optional ASCII sign, digits, an optional decimal
@@ -1250,13 +1259,12 @@ blorp_2/build/calculator-program multiply 6.5 2
 The output is `13` followed by LF. Float programs link the C math library.
 
 The native model is binary64 with subnormals, ordinary arithmetic without fast
-math or contraction, C startup locale and default rounding. Generated code
+math or contraction, C startup locale and nearest/ties-even rounding. Generated code
 checks representation requirements; target programs cannot change locale or
 rounding in this subset. Float remains unmanaged in parameters, locals and
 generic union payloads. Direct union payload annotations and fixed-record
 fields retain their existing Int-only restriction.
 
-The [Float design](FLOAT_PLAN.md) records conversion and arithmetic details.
 The [calculator component tests](test/unit/test_option_contracts.brp),
 [input ownership tests](test/unit/test_option_ownership.brp),
 [Float projection tests](test/unit/test_float_literal.brp) and normal-main
@@ -1498,8 +1506,7 @@ end-to-end cost. Self-compilation is a later milestone.
 
 [MEMORY_PLAN.md](MEMORY_PLAN.md) records the managed String slice and proposed
 later memory responsibilities, including the limits of current verification.
-The [fixed-record increment](RECORDS_PLAN.md) adds unmanaged `Int` fields,
-construction and field reads. Its working
+Fixed records support unmanaged `Int` fields, construction and field reads. The
 [Pair example](test/e2e/fixtures/record/basic.brp) returns 7 with empty streams;
 the generated record is a C struct passed by value without heap allocation or
 reference counting. The [managed-record proposal](MANAGED_RECORDS_PLAN.md)

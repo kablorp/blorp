@@ -36,7 +36,7 @@ reads the replacement and must exit 1. Existing immutable `ValueId` identities
 must survive the mutable source binding's reassignment.
 
 The owning design and source anchors are in
-[GENERICS_HANDOFF.md](../../blorp_2/GENERICS_HANDOFF.md) and
+[GENERICS_HANDOFF.md](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/GENERICS_HANDOFF.md) and
 [MEMORY_PLAN.md](../../blorp_2/MEMORY_PLAN.md). This extends their existing
 root/child distinction and borrowed synchronous call ABI.
 

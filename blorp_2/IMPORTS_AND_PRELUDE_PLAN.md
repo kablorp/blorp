@@ -1,7 +1,8 @@
 # Type imports, method visibility, and the target prelude
 
 Status: implemented in `blorp_2`, including its target library and input fixtures.
-The sections below retain the approved design and implementation sequence.
+This document records the current semantic contract. The original implementation
+sequence and cost ceilings remain in the [committed design](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/IMPORTS_AND_PRELUDE_PLAN.md).
 See [README](README.md) for current usage and the
 [validation report](../benchmarks/results/blorp_2_imports_prelude_2026-10-12.md)
 for tests, review, mutation checks, costs, and remaining limits.
@@ -304,90 +305,12 @@ without duplicating the candidate. Import provenance remains diagnostic data,
 not an implicit availability flag. Erase notation only after resolution has
 enforced these rules; later IR need not retain source notation.
 
-Two current traps require focused tests. `namespace.brp` and
-`check.brp:lookup_target` currently share candidates between direct and receiver
-calls, while `validate_import_binding` rejects conflicts before a call site.
-Those paths cannot implement method-only visibility unchanged. Also,
-`check.brp:synthesize_value` currently uses receiver contracts to contextualize
-constructor expressions before synthesizing their bases. Preserve unique
-candidate contextual typing. When competing methods cannot supply one receiver
-context, request a receiver annotation with a teaching diagnostic; do not
-silently change existing constructor inference or choose the first candidate.
-Test receiver chains and field-then-method expressions as well as single calls.
-
 Keep source loading impure and all subsequent compilation/diagnostic rendering
 pure. Use local builders and freeze once at each existing boundary. No global
 method registry, persistent cache, duplicated type authority, new ownership
 path, or backend import repair is needed.
 
-## Implementation order
-
-Each slice starts with a failing Blorp TestSuite test, includes its executable
-example when complete, and lands green after independent review.
-
-1. **Establish the contract and shortest feedback loop.** Add parser/grammar
-   cases for the agreed suffix, type/constructor selections, malformed forms,
-   comments, blank lines, and mixed selections. Record current import and
-   receiver-context tests, a frozen cost corpus, and source/binary provenance.
-   Review parser, ergonomics, and identity rules before implementation.
-
-2. **Make foundation declarations one authority.** Separate the current
-   builtin-type authority from its legacy runtime-function fallback and move
-   declarations to `_base/types.brp`, including ordinary Bool/Option/Result.
-   Keep ordinary union/record checking and source locations; allow builtin
-   declarations only for the configured foundation role. Introduce explicit
-   source roles and base visibility, then remove the replaced declaration
-   owners in the same slice. Move the old String `length` wrapper to
-   `string.brp` and retain the existing Int `to_string` wrapper. Migrate bare
-   and receiver calls that relied on legacy prelude functions to explicit
-   function imports, which are already supported; remove the runtime-name
-   fallback now. Implicit operation visibility is supplied only in step 5.
-   During these intermediate slices, the existing positional foundation input
-   points to `_base/types.brp`; this is one evolving input path, not a second
-   compatibility mode.
-   This includes local Option/Result declarations that would now conflict.
-   Parse empty/comment-only operation modules without dummy declarations.
-
-3. **Resolve ordinary type imports and forwarding.** Extend bare selectors
-   beyond functions to builtin types, records, and unions without capitalization
-   heuristics. Preserve explicit constructor selection. Complete type-binding
-   closure before declaration/signature checking; cover cycles, diamonds,
-   aliases of the same identity through several modules, and same-spelled
-   different owners. Support `foo: Foo` through an operation module's existing
-   binding. Keep function imports from forwarding signature types.
-
-4. **Implement type-enabled UFCS and `methods_only`.** Construct checker-owned
-   method visibility from accepted signatures, and enforce the independent
-   caller type requirement. Carry explicit callable visibility and preserve
-   CallNotation until target selection. Keep direct imports separate. Cover
-   builtin types, generic unions, existing nongeneric records, and the current
-   concrete List[String] receivers; no new collection or record capabilities.
-   Preserve contextual constructor inference, arity,
-   purity, argument diagnostics, and original resolved call contracts. Deliver
-   the three-module Foo fixture above, plus missing-type and ambiguity cases.
-
-5. **Supply the ordinary prelude and migrate every target module.** Load and
-   check `_base/prelude.brp` through the module pipeline and supply its selected
-   scope to all user modules. Standard-library operations get base only.
-   Remove the positional foundation input and obsolete target prelude file;
-   update Makefile, harness, commands, embedded program strings,
-   fixtures, documentation, and benchmark callers together. Restore the
-   existing convenient UFCS operations through ordinary imports. Keep IO
-   explicit. Verify that only one authority for each type/function remains.
-
-6. **Review and validate the whole migration.** Independently review identity,
-   visibility, contextual inference, generic matching, and library layering.
-   Run the full pilot suites, applicable native sanitizers, mutation oracles,
-   and matched cost measurements. Record actual costs and handwritten
-   production/test LOC separately. Remove superseded implementation/docs in
-   each slice rather than leaving a final compatibility cleanup project.
-
-Steps 2–4 are serial where their authorities depend on each other. After the
-contracts are fixed, library/fixture inventory and negative-test preparation
-can run alongside the owning implementation with disjoint file ownership.
-Do not have two agents independently redesign namespace or checker facts.
-
-## Test matrix and acceptance
+## Validation coverage
 
 | Boundary | Required cases and observable results |
 | --- | --- |
@@ -400,88 +323,23 @@ Do not have two agents independently redesign namespace or checker facts.
 | Prelude / library | Same defaults in root and user helper; stdlib does not acquire prelude; Int/Float `add`, String/List `length`, and numeric `to_string` resolve by type; Option/Result/Bool remain ordinary unions. |
 | Ownership / backend | Imported managed Strings/unions and existing inline records retain checked, concrete, lowered, ownership and verifier contracts; generated C references the selected function; real fixtures remain sanitizer-clean. |
 
-Create focused suites under `test/unit/` alongside the existing
-`test_import_syntax.brp`, `test_namespace.brp`, `test_union_imports.brp`,
-`test_module_check.brp`, `test_prelude.brp`, and `test_typecheck_programs.brp`.
-Use direct phase inputs and typed errors; avoid one subprocess per semantic
-test. Grammar cases belong in `test/test_grammar/test_conformance.brp`.
-E2e fixtures belong under `test/e2e/fixtures/import/`, exercised by the normal
-`test/e2e/test_end_to_end.brp` entrypoint and owning fixture group.
+The direct suites for [import syntax](test/unit/test_import_syntax.brp),
+[namespace identity](test/unit/test_type_import_namespace.brp),
+[call selection](test/unit/test_import_selectors.brp),
+[module loading](test/unit/test_module_input.brp), and
+[foundation contracts](test/unit/test_prelude.brp) exercise these boundaries.
+Grammar checks live under [test/test_grammar](test/test_grammar/), and native
+examples under [test/e2e/fixtures/import](test/e2e/fixtures/import/).
+The [validation report](../benchmarks/results/blorp_2_imports_prelude_2026-10-12.md)
+retains independent reviews, mutation checks and matched costs. Use the current
+[README commands](README.md) and [AGENTS.md](AGENTS.md) for validation.
 
-Negative cases include absent caller Foo despite foo_ops importing it;
-same-spelled unrelated Foo; unknown type selector; inaccessible constructor;
-direct use of a method-only function; prelude/base type conflicts; and method
-ambiguity with primary call and both declaration/import locations. Verify
-typed errors, exact rendered diagnostics, help, and source spans independently.
-Include a type and function both named Foo, unique wrong arity, a wrong-arity
-receiver match beside a different-type method with matching arity, and several
-receiver matches whose accepted counts all differ from the supplied count.
+## Scope limits
 
-Demonstrate failure when method-only bindings are deliberately admitted to
-direct lookup, when receiver identity is ignored, and when dependency methods
-are incorrectly forwarded. Restore sources before final gates. These are
-bounded oracle checks, not a new mutation-test framework.
-
-Narrow feedback starts with the affected existing unit suite. Final pilot
-commands are the existing ones:
-
-```sh
-scripts/compiler-build-status
-# Run make only if the host is STALE/UNKNOWN, then recheck freshness.
-bin/blorp test --suite --timeout 180 blorp_2/test/unit
-bin/blorp test --suite --timeout 180 blorp_2/test/runtime
-bin/blorp test --suite --timeout 180 blorp_2/test/test_grammar
-bin/blorp test --suite --timeout 0 blorp_2/test/e2e
-git diff --check
-```
-
-The e2e entrypoint builds the pilot once via `make -C blorp_2 test-compiler`;
-do not add another preparatory build or a persistent cache. Use the owning
-suite's existing sanitizer/leak modes and inspect emitted C for affected
-fixtures. Paths, syntax examples, and the pilot EBNF/README must match each
-implemented slice. Do not advertise planned syntax as supported early.
-
-For equivalent loaded workloads in preparatory refactors, use investigation
-ceilings of +15% allocations and +10% retired instructions, matching the
-existing module plan. Freeze root inputs, library/configuration, compiler
-binaries, and C flags before paired runs; investigate repeatable excess before
-acceptance. Supplying a full default prelude adds mandatory source work:
-measure that separately, identify the added modules, and set explained
-per-fixture numerical budgets before implementing that slice. Do not silently
-raise ceilings or attribute all increases to imports. Until self-compilation
-exists, these are owned-input compilation proxies, not self-compile evidence.
-Require each source to be loaded/parsed once; avoid building a whole-program
-method cross-product. Start with scans over selected modules, measure complete
-construction plus lookup, and add an index only for a demonstrated repeated
-query. Compare runtime results for every fixture; require byte-identical C
-only where declaration inventory/order and semantics are unchanged.
-
-## Scope, handoff, and completion
-
-No changes to the existing compiler, `standard_library/src`, or its language
-syntax are part of this roadmap. `blorp_2/src` and host TestSuite imports
-continue to use the host compiler's supported grammar until self-hosting;
-the new import spelling applies to pilot input modules. Target modules,
-embedded input programs, and `standard_library_temp` must all follow the new
-rules. Preserve upstream reference source and provenance when moving active
-declarations; reference copies now live outside compilation inputs under
-`reference/standard_library/`. Inactive traits/FFI and future Set/Dict stay inactive.
-
-Defer traits, general overload resolution, function reexports, private items,
-qualified calls, module aliases, wildcard imports, prelude opt-out, a general
-cycle ban, and expansion of List. No extra tooling framework is required.
-
-Use compiler-expert implementers and independent compiler-expert/code-reviewer
-and test-runner review. Each implementation brief follows
-[HANDOFF_SPEC](../docs/HANDOFF_SPEC.md), names one slice, quotes its current
-change site and intended code, supplies a failing test and runnable acceptance
-criteria, and declares disjoint file ownership when work is parallel. Return
-test counts, diagnostics/C evidence, measurement provenance, LOC, and remaining
-limits. Report an uncertain inference/identity boundary to the coordinator;
-do not guess, broaden the overload model, or alter host semantics to bypass it.
-
-Completion means the working Foo fixture and all migrated calculator/library
-fixtures pass, every listed boundary has granular tests, base/prelude are
-ordinary explicit source inputs with their designated roles, replaced
-authorities/fallbacks are gone, and independent reviews approve. Planning
-alone does not mark any of those implementation criteria complete.
+These rules apply to pilot input modules. The pilot implementation and host
+TestSuite still use the existing compiler and its library until self-hosting.
+The import backport to the existing compiler is deferred. Traits, general
+overload resolution, function reexports, private items, qualified calls, module
+aliases, wildcards, prelude opt-out and general List expansion remain outside
+this contract. Preserve the source provenance under
+[reference/standard_library](reference/standard_library/).

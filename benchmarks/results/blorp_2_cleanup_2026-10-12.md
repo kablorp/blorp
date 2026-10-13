@@ -42,7 +42,7 @@ independent exact assertions.
 The ignored local evidence root is
 `blorp_2/build/cleanup_2026-10-12/`. Its baseline is the dirty worktree before
 this cleanup, including the preceding argv and imports/prelude work, rather
-than HEAD. `blorp_2/CLEANUP_PLAN.md` fixed the slices, workloads and ceilings
+than HEAD. The [committed cleanup design](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/CLEANUP_PLAN.md) fixed the slices, workloads and ceilings
 before implementation: investigate repeatable allocation growth above 2% or
 median retired-instruction growth above 3%; compiler production lines must fall.
 

@@ -52,8 +52,8 @@ and declaration order have no hidden runtime meaning. Copied upstream source
 is reference material outside this input library, with provenance beside each
 adapter. Traits and FFI remain inactive.
 
-The [calculator plan](../CALCULATOR_COMPLETION_PLAN.md) and
-[Float design](../FLOAT_PLAN.md) define deliberate conversion and arithmetic
+The current [calculator](../README.md#calculator-input-and-results) and
+[Float contracts](../README.md#float64-calculator) define deliberate conversion and arithmetic
 adaptations. The copied host implementation is a reference, not an implicit
 source of semantics or runtime dependencies.
 

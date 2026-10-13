@@ -1,6 +1,6 @@
 # Blorp 2 guaranteed self-tail recursion, 2026-10-10
 
-Implemented the [approved MVP](../../blorp_2/TAIL_RECURSION_PLAN.md):
+Implemented the [approved MVP](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/TAIL_RECURSION_PLAN.md):
 `@tail_recursive` guarantees explicit direct-self loops for nongeneric functions
 whose signatures and evaluated values are unmanaged. The guarantee holds at
 `-O0`. Generic and managed loops, mutual tail recursion and trampolines remain
