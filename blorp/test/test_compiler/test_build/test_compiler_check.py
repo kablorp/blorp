@@ -23,6 +23,7 @@ class CompilerCheckFixture:
         (self.root / "bin").mkdir()
         shutil.copy2(COMPILER_CHECK, self.root / "scripts/compiler-check")
         shutil.copy2(COMPILER_CHECK.with_name("blorp_import_graph.py"), self.root / "scripts/blorp_import_graph.py")
+        shutil.copy2(COMPILER_CHECK.with_name("gate-timeouts.env"), self.root / "scripts/gate-timeouts.env")
         self.write("blorp/src/compiler/stage_06_typecheck/alpha.brp", "-- alpha\n")
         self.write("blorp/test/test_compiler/test_alpha.brp", "-- suite alpha\n")
         (self.root / "checks").mkdir()
