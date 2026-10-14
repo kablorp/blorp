@@ -447,19 +447,6 @@ test "$status" -ne 0
 printf '%s\n' "$output" | rg 'expected diagnostic text'
 ```
 
-### Capturing A Typecheck Request
-
-Capture the normal source graph immediately before graph typechecking:
-
-```bash
-capture=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck-graph.XXXXXX.json")
-bin/blorp check --no-format --capture-typecheck-request "$capture" \
-  blorp/src/main.brp
-```
-
-Captures contain source text and local paths. Keep them local and delete them
-when the investigation is complete.
-
 ## Timing Compiler Phases
 
 Use phase timing for a fast end-to-end orientation:
