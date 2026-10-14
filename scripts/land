@@ -1,8 +1,7 @@
 #!/bin/bash
 # Land one branch on main as a single commit and push it.
 #
-#   scripts/land <branch> --title "<title>" [--body "<text>"] \
-#       [--record <file> --record-name <name>] [--dry-run]
+#   scripts/land <branch> --title "<title>" [--body "<text>"] [--dry-run]
 #
 # 1. Merge origin/main into the branch, so any conflict is resolved on the
 #    branch. This happens in the branch's own worktree when it is checked out
@@ -13,26 +12,26 @@
 # 3. Push that commit to origin main. If origin/main moved meanwhile, repeat
 #    from 1; any other push failure stops the landing.
 #
-# It runs no gates. Validate the branch first with the CI-equivalent Docker
-# gate: `scripts/docker-gate --premerge-gate -- --no-sanitize`.
+# It runs no gates. Validate the branch first with the focused suites that own
+# the change (`scripts/compiler-check --changed --plan` names them). The Docker
+# premerge gate (`scripts/docker-gate --premerge-gate`) is optional, run on
+# request.
 set -euo pipefail
 
 usage() {
     echo "Usage: scripts/land <branch> --title TITLE [--body TEXT]" >&2
-    echo "  [--record FILE --record-name NAME] [--dry-run]" >&2
+    echo "  [--dry-run]" >&2
 }
 
 # How many times to re-merge and retry when origin/main moves between the
 # squash commit and the push.
 PUSH_ATTEMPTS=5
 
-branch="" title="" body="" record="" record_name="" dry_run=0
+branch="" title="" body="" dry_run=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --title) title="$2"; shift 2 ;;
         --body) body="$2"; shift 2 ;;
-        --record) record="$2"; shift 2 ;;
-        --record-name) record_name="$2"; shift 2 ;;
         --dry-run) dry_run=1; shift ;;
         -h|--help) usage; exit 0 ;;
         -*) echo "Unknown option: $1" >&2; usage; exit 1 ;;
@@ -46,14 +45,6 @@ case "$title" in
 esac
 printf '%s' "$title" | grep -Eq '#[0-9]+' &&
     { echo "Refusing title containing an issue reference: $title" >&2; exit 1; }
-if { [ -n "$record" ] && [ -z "$record_name" ]; } || { [ -z "$record" ] && [ -n "$record_name" ]; }; then
-    echo "--record and --record-name must be given together." >&2
-    exit 1
-fi
-if [ -n "$record" ]; then
-    [ -f "$record" ] || { echo "No such record file: $record" >&2; exit 1; }
-    record="$(cd "$(dirname "$record")" && pwd -P)/$(basename "$record")"
-fi
 git show-ref --verify --quiet "refs/heads/$branch" ||
     { echo "Not a local branch: $branch" >&2; exit 1; }
 
@@ -111,11 +102,6 @@ while :; do
     if ! git -C "$land_tree" merge -q --squash "$branch"; then
         echo "Squash-merging $branch onto origin/main failed unexpectedly after the branch was merged with it." >&2
         exit 1
-    fi
-    if [ -n "$record" ]; then
-        mkdir -p "$land_tree/benchmarks/results"
-        cp "$record" "$land_tree/benchmarks/results/$record_name"
-        git -C "$land_tree" add "benchmarks/results/$record_name"
     fi
     if git -C "$land_tree" diff --cached --quiet; then
         echo "$branch has no changes relative to origin/main." >&2

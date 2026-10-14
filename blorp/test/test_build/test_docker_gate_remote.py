@@ -292,6 +292,7 @@ class DockerGateRemoteTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn(
+            f"docker-gate: WARNING: not running on the gate host: "
             f"the Docker daemon on {FAKE_HOST} is not running; running the gate locally",
             completed.stderr,
         )

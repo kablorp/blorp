@@ -1,15 +1,38 @@
 # Scripts
 
-This directory contains the maintained shell entrypoints for local validation,
-Docker validation, and release packaging. Prefer these scripts over calling
-lower-level test runners directly.
+This directory holds the maintained shell and Python entrypoints for local
+validation, Docker validation, builds and release packaging. Prefer these
+scripts over calling lower-level test runners directly.
 
-## Test Gates
+## Validating a change
 
-`scripts/test` is the main local test entrypoint.
+Validate with the focused suites that own the change, then land. The long
+gates are optional and run on request.
 
-For the shortest manifest-owned compiler feedback loop, use
-`scripts/compiler-check`:
+1. `scripts/compiler-check --changed --plan` names the focused suites, special
+   checks and hand-back gates for the change, without building or running
+   anything.
+2. Run those suites. `bin/blorp test path/to/test.brp` is the narrow loop once
+   `scripts/compiler-build-status` reports `FRESH`; run `make` first when it
+   does not.
+3. Run the `scripts/test` gates the plan recommends for anything the focused
+   suites do not cover.
+4. `scripts/land` merges and pushes. It runs no gates.
+
+The Docker premerge gate (`scripts/docker-gate --premerge-gate`, about 35
+minutes) and `scripts/premerge-gate` are for preview and release validation
+(`docs/RELEASES.md`) and for a change whose reviewer asks for them. They are
+not required before landing.
+
+Changes under `blorp_2/` are validated with `make -C blorp_2 test`. No script in
+this directory or in CI covers that tree, and `scripts/compiler-check` selects
+nothing for it.
+
+## Focused compiler checks
+
+`scripts/compiler-check` selects checks from
+`blorp/test/test_compiler/compiler_test_ownership.json`. It does not infer
+owners from names, imports, timings or earlier failures.
 
 ```bash
 scripts/compiler-check blorp/test/test_compiler/test_pipeline/test_type_header_graph.brp
@@ -20,393 +43,166 @@ scripts/compiler-check --changed --plan
 scripts/compiler-check --validate-manifest
 ```
 
-An exact suite path runs only that registered suite. Stage and changed-source
-selection come from
-`blorp/test/test_compiler/compiler_test_ownership.json`; the command does not infer
-owners from names, imports, timings, or previous failures. `--changed` includes
-staged, unstaged, and untracked production compiler sources, while `--base`
-also includes committed changes from the merge base with the named ref.
-
-Add `--plan` to print the selected production sources, focused suites, special
-checks, exact focused commands, and manifest-owned broad-gate recommendations
-without building, running tests, creating logs, or writing generated files. A
-plan that selects nothing is a no-op explanation, not a passing validation; use
-the task-specific build, docs, or release checks for those changes.
+- An exact suite path runs only that registered suite.
+- `--changed` selects by the staged, unstaged and untracked production
+  compiler sources; `--base` adds committed changes since the merge base with
+  the named ref.
+- `--plan` prints the selected sources, suites, special checks, exact commands
+  and broad-gate recommendations without building, running tests, creating
+  logs or writing files. A plan that selects nothing is a no-op explanation,
+  not a passing validation; use the build, docs or release checks for those
+  changes.
+- Without `--plan` it prepares the compiler once, runs suites with
+  `bin/blorp test` and registered gate checks with
+  `scripts/test --no-build --log-dir`. Passing runs remove their temporary
+  logs; failing runs keep complete output and an exact rerun under the ignored
+  `logs/compiler-check-*` tree.
 
 Sources under `blorp/src/compiler_new` and suites under
-`blorp/test/test_compiler_new` (the discovery stage, which `bin/blorp` links and
-whose lexer and table parser production runs) are outside this manifest, so
-`--changed` selects no focused check for them. It instead prints
-`Hand-back gates` whenever the change set touches the discovery stage or the
-tree path (`--plan --json` carries the same under `hand_back`):
+`blorp/test/test_compiler_new` are outside the manifest, so `--changed` selects
+no focused check for them and prints `Hand-back gates` (`--plan --json`:
+`hand_back`) instead. `tree path only` (every changed path is a `compiler_new`
+module no other `blorp/src` module imports, a `compiler_new` test or data file,
+the parity script and its test, or documentation) hands back
+`scripts/compiler-build-status --quiet`, `bin/blorp test` on each registered
+suite that imports a changed file, and
+`scripts/test --no-build compiler-new compiler-new-parity`. `broad` (any other
+path, including a deleted one or one the import graph cannot place) hands back
+`scripts/test compiler-new compiler-new-parity compiler-blorp` plus the
+manifest's recommendations. The commands are not run for you.
 
-- `tree path only`: every changed path is a `compiler_new` module (or
-  `compiler/discovery_tree_projection.brp`) that no other `blorp/src` module
-  reaches through imports, a `compiler_new` test or data file, a test that
-  imports such a module (neither carrying a `RUN-BLORP-CHECK` marker, which
-  compiler-blorp runs through production), the parity script and its test, or
-  documentation. No program imports it, so `bin/blorp` stays FRESH and the
-  hand-back has no `make`: `scripts/compiler-build-status --quiet` (fails if the
-  binary is stale for another reason), `bin/blorp test` on every registered suite that
-  imports a changed Blorp file (directly or not; the manifest's suites for a
-  changed module too), the parity script's python tests when it or they
-  changed, and `scripts/test --no-build compiler-new compiler-new-parity`; the
-  full `compiler-blorp` gate is not needed.
-- `broad`: any other path in the change set, including one that was deleted or
-  renamed away, or that the import graph cannot place (an import that resolves
-  to no file, or a program root whose imports do not all resolve, as in a
-  checkout that has not run `make`, which says so): production is
-  the judge, `scripts/test compiler-new compiler-new-parity compiler-blorp`, plus
-  the manifest's recommendations above.
+## Test gates
 
-The rule is derived from the import graph each run, so a new tree module needs
-no list entry. The hand-back is guidance, like `--plan`'s recommendations; the
-commands are not run for you. The Docker premerge gate before landing is project
-policy that this command neither runs nor verifies.
-
-The command prints the selected sources, suites, and special checks before it
-prepares the compiler once. Suites then use `bin/blorp test`, and registered gate
-checks use `scripts/test --no-build --log-dir`. Passing runs remove their
-temporary logs. Failing runs retain complete output and an exact rerun under
-the ignored `logs/compiler-check-*` tree. `scripts/compiler-check` is focused
-feedback only; run the relevant broad `scripts/test` integration gates before
-merging.
+`scripts/test` is the main entrypoint. With no argument it runs the default
+gates (`compiler-blorp`, `compiler-new`, `runtime`, `leak`, `doctest`, `cli`);
+name gates to run only those.
 
 ```bash
-scripts/test                    # Blorp compiler, runtime, leak, doctest, CLI
-scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures
-scripts/test compiler-tools     # formatter/purify/lint fixtures + backend/identity tool guards
-scripts/test compiler-new       # rewritten compiler stages (blorp/src/compiler_new) TestSuites
-scripts/test compiler-new-parity # discovery stage vs the existing front end over the corpus
-scripts/test std-check          # broad standard-library source typecheck sweep
+scripts/test compiler-blorp     # Blorp TestSuites plus marked production check fixtures
+scripts/test compiler-tools     # formatter/purify/lint fixtures plus tooling guards
+scripts/test compiler-core-sanitize  # Core TestSuites under ASan (roots: compiler-core-sanitize-roots.txt)
+scripts/test compiler-blorp-sanitize # compiler suites under ASan
+scripts/test compiler-new       # TestSuites of the discovery stage (blorp/src/compiler_new)
+scripts/test compiler-new-parity # discovery stage against the existing front end over the corpus
+scripts/test std-check          # standard-library typecheck sweep
 scripts/test runtime            # runtime .brp tests
-scripts/test leak               # ownership suites, leak baselines, and diagnostics
+scripts/test leak               # ownership suites, leak baselines and diagnostics
 scripts/test doctest            # standard-library doctests
 scripts/test cli                # public CLI and LSP smoke tests
 scripts/test cli-deep           # full CLI package and formatter integration tests
 scripts/test lsp                # public LSP protocol fixtures
-scripts/test package            # focused public package lifecycle integration
-scripts/test compiler-blorp runtime  # multiple selected gates
+scripts/test package            # public package lifecycle integration
 ```
 
-Useful options:
+Options:
 
 ```bash
-scripts/test --serial           # run selected gates one at a time
-scripts/test --verbose          # stream child-runner output
-scripts/test --log-dir logs     # keep complete gate logs
-scripts/test --no-build         # test the existing installed toolchain
-scripts/test --timings          # print generated TestSuite phase timings
-scripts/test --release-compiler # build bin/blorp at -O2 for full gate runs
-scripts/test --release-artifacts # compile the test artifacts at -O2
+scripts/test --serial            # one gate at a time
+scripts/test --verbose           # stream child-runner output
+scripts/test --log-dir logs      # keep complete gate logs
+scripts/test --no-build          # test the existing installed toolchain
+scripts/test --timings           # print generated TestSuite phase timings
+scripts/test --release-compiler  # build bin/blorp at -O2 for full gate runs
+scripts/test --release-artifacts # compile test artifacts at -O2 (default -O0)
 ```
 
-`scripts/test` is quiet by default. Successful runs print a gate summary with
-per-gate timing, total wall-clock time, and setup timing; failures print focused
-excerpts and can save full logs with `--log-dir`.
-The default gate exercises the production-owned compiler implementation through
-`compiler-blorp`.
-The `compiler-new` gate runs the TestSuites registered in
-`blorp/test/test_compiler_new/compiler_new_test_ownership.json`, after checking that
-every `test_*.brp` under `blorp/test/test_compiler_new` is registered and that its
-tools and support modules type check. It is a default gate, part of the
-premerge gate and of the compiler CI lane. The layout check keeps
-`compiler_new` sources importing only `compiler_new` and `lib`. The production
-`compiler/discovery_front_end.brp` and `compiler/discovery_adapter.brp` modules
-are explicit temporary consumers (`temporary_cross_owner_imports` in
-`blorp/source_ownership.json`). The isolated test tree imports only
-`compiler_new`, `lib`, its own tree and the standard library
-(`isolated_test_owners` in that manifest).
-The `compiler-new-parity` gate (`scripts/compiler-new-parity`) holds the
-discovery stage to the existing front end across every tracked `.brp` file
-under `blorp/src`, `standard_library/src` and `blorp/test`: it compiles
-`blorp/test/test_compiler/tools/legacy_front_end_dump.brp` and
-`blorp/test/test_compiler_new/tools/corpus_dump.brp` once each, runs them
-sequentially over the file list, and compares every token (kind, byte range,
-text; the old `#` plus name is one `DimensionNameToken`), the set of files with
-lexer diagnostics and each file's accept/reject verdict. A mismatch prints the
-file and the first differing token. It also checks the stage's module graph
-(`discovery_module_order_dump.brp`) for the self-compile root and for a
-`blorp test` root: each must load at least the expected number of modules. The
-same roots run with the standard library read from the compiler's embedded
-texts, and fixture projects run with `blorp.toml` source packages and a native
-package, each of which must contribute a module with its origin. Known
-divergences are listed in the script with a reason: `KNOWN_DIVERGENCES` (today
-the two interpolation cases the existing lexer reads wrongly),
-`KNOWN_POSITION_DIVERGENCES` (parse diagnostics reported at a different
-position) and `WORDING_DIFFERENCES` (diagnostic text the stage deliberately
-words differently). An entry that stops disagreeing fails the gate until it is
-removed. The gate
-takes about 1-2 minutes (mostly the C compiler on the two dumpers), so it is not a
-default gate; it is part of the premerge gate.
-`scripts/compiler-new-parity --stop-census` is a separate, check-free mode: it
-runs only the adapter differential over the corpus and prints why the tree
-scan stopped at each module's first unread declaration, ranked by reason (the
-reasons are the tree parsers' own `StopReason` values), for choosing the next
-slice. A census over the whole corpus also stores its per-module stops in
-`stop-census.txt` under the system temporary directory (a directory per
-checkout, `compiler-new-parity-<digest of the checkout path>`; `--census-file`
-overrides it), so the next run can be narrowed:
+- `scripts/test` is quiet by default: a summary with per-gate timing, then
+  focused excerpts for failures. `--no-build` is only for a toolchain already
+  built from the intended sources; without it the script installs the current
+  compiler first. `--release-compiler` exports `BLORP_CLI_C_OPTIMIZATION=-O2`
+  for that install; see "Compiler optimization level" in `docs/DEVELOPMENT.md`.
+- `compiler-blorp` also runs every fixture marked `RUN-BLORP-CHECK` through
+  `blorp/test/test_lib/run_blorp_check_fixtures.py`; `scripts/test` pins the
+  expected fixture count (`expected_blorp_check_fixture_count`).
+- `compiler-new` runs the TestSuites registered in
+  `blorp/test/test_compiler_new/compiler_new_test_ownership.json` after
+  checking that every `test_*.brp` there is registered and that its tools and
+  support modules typecheck. It guards production code: `bin/blorp` links the
+  discovery stage through `compiler/discovery_front_end.brp` and
+  `compiler/discovery_adapter.brp`, so it is a default gate.
+- Several selected gates run in fixed waves (compiler-blorp, compiler-tools,
+  compiler-core-sanitize, compiler-blorp-sanitize, compiler-new,
+  compiler-new-parity, std-check, runtime, then leak + doctest + cli + lsp,
+  package, cli-deep); unselected gates are skipped. Use `--serial` for one at a
+  time. On macOS, many freshly compiled binaries running at once stall in
+  `syspolicyd`, so do not run compiled binaries in parallel there;
+  `scripts/premerge-gate` passes `--serial` on macOS for that reason.
 
-```bash
-scripts/compiler-new-parity --stop-census                       # full run; stores stop-census.txt
-scripts/compiler-new-parity --stop-reason multiline-call-arguments --stop-census
-scripts/compiler-new-parity --stop-reason multiline-call-arguments --adapter-only
-scripts/compiler-new-parity --files blorp/src/check/command.brp blorp/src/check/capture.brp
-```
+Timeouts (environment overrides):
 
-`--stop-reason LABEL` selects the modules whose first stop had that label (the
-table's "Modules" column; a misspelt label lists the right ones) and
-`--files PATH...` names tracked `.brp` files. A narrowed run compares only the
-selected modules, builds its dumpers with `-O0` (about 15 s of C compile instead
-of 92 s for the adapter differential; the run itself is slower, so it pays below
-about two thirds of the corpus), skips the root and graph checks and the
-corpus-wide allowance checks, and never prints `BLORP_GATE_RESULT`: it is for
-iterating, and the unchanged full run stays the gate. `--adapter-only` skips
-the token dumps, which a tree-path change cannot affect. A narrowed
-`--stop-census` never overwrites the stored census. The fixed cost of an
-iteration is then the C compile of the dumper, because it contains the tree
-parsers being edited.
+- `BLORP_TEST_TIMEOUT`: generated test artifacts. `BLORP_RUNTIME_TEST_TIMEOUT`:
+  the single runtime corpus (default 60 seconds; other artifacts 30).
+- `BLORP_LEAK_TEST_TIMEOUT`: the leak-check corpus (default 60 seconds). A
+  positive value is a floor per batch; `bin/blorp test --leak-check` grants each
+  batch the larger of the floor and 5 seconds
+  (`LEAK_CHECKED_SOURCE_TIMEOUT_SECONDS` in `blorp/src/test/plan.brp`) times its
+  test sources. Zero disables the deadline.
+- `BLORP_COMPILER_TEST_TIMEOUT`: compiler tests (grouped suites 360 seconds,
+  individual fixtures and codegen audits 30).
+  `BLORP_COMPILER_SANITIZE_TEST_TIMEOUT`: compiler sanitizer gates (180).
+- `BLORP_COMPILER_TEST_PROGRESS=1` streams per-artifact progress, as CI does.
 
-`scripts/discovery-fuzz` is the differential fuzzer for the tree path, the
-counterpart of the parity gate for inputs the corpus does not hold. It mutates
-corpus declarations (lines deleted, duplicated, swapped, joined, split or
-re-indented; tabs and spaces swapped; one token deleted, duplicated or
-inserted; a closing bracket moved), feeds every mutant to the old parser and to
-the tree path in one batched process
-(`blorp/test/test_compiler/tools/discovery_fuzz_runner.brp`, compiled once and
-cached by a digest of its inputs; it refuses to build unless `bin/blorp` is
-fresh, so run `make` first) and classifies it: the tree path must never accept
-what the old parser rejects (**WRONG ACCEPT**), must give the same projected AST
-where both accept (**AST MISMATCH**), and may reject or decline otherwise.
-Diagnostic text is not compared; the parity gate owns that. A mutant the old
-parser accepts and the tree path rejects is a **WRONG REJECT**, as in the parity
-gate. A mutant that crashes or hangs the old parser is reported apart (the old
-parser is known to hang on some chain shapes); one that crashes or hangs the
-tree path is a failure. Every hang and crash is run again alone with four times
-the timeout before it is believed, so a loaded host does not fake one.
-
-What it cannot show: when the tree path declines a mutant it has examined
-nothing. Declining is safe and only counted, and about half the mutants the old
-parser rejects end that way (a function body or global initializer the tree path
-does not read), so the run prints how much of the rejected mutants the tree path
-decided (about half today) and labels the rest "unchecked". A mutant is deterministic (mutant `i` of seed `s` is the
-same text whatever the count) only for a given corpus: any edit to a corpus
-file redraws every mutant. The fuzzer therefore finds disagreements by sampling;
-it is not a regression gate. Each bug it finds becomes a fixed case in
-`blorp/test/test_compiler/test_stage_04_modules/test_discovery_fuzz_cases.brp`
-(run by `compiler-blorp`, which also compiles the runner), where a bug not yet
-fixed is a known defect that fails when it is.
-
-```bash
-scripts/discovery-fuzz --count 20000 --minimise          # default seed 1
-scripts/discovery-fuzz --seed 7 --count 50000 --files blorp/src/format/engine/formatter.brp
-scripts/discovery-fuzz --stop-reason indented-method-chain --whole-file
-scripts/discovery-fuzz --gate                            # fixed seed and count; exits 1 on failure
-```
-
-`--files PATH...` mutates only those tracked files, and `--stop-reason LABEL`
-only the declarations where the stored `compiler-new-parity --stop-census`
-found a module's first stop with that reason. By default a mutant is one
-declaration with one edit, so each verdict is about the edit; `--whole-file`
-keeps the rest of the file around it. `--timeout SECONDS` (default 1) is how
-long one source may take before it counts as possibly hung (the process is
-killed and the batch resumes after it). Each failure is written to `--out DIR`
-(it must be new or empty; the default is a directory of this checkout under the
-system temporary directory, whose failures from the previous run are deleted)
-as `<verdict>-<mutant>/` holding `original.brp`, `mutant.brp`, `verdict.txt`
-and, with `--minimise`, `minimised.brp`, a reproducer shrunk by deleting lines
-and then tokens while the verdict holds; a failure that does not reproduce when
-run again is reported as such and not shrunk. The run prints the verdict
-counts, where the tree path stopped, the yield of each operator and the
-throughput. `--gate` is a fixed sample (seed 1, 30,000 mutants): it minimises
-the first failures and prints `BLORP_GATE_RESULT gate=discovery_fuzz`. It is not
-part of `scripts/test` yet.
-
-The `compiler-blorp` gate also runs every fixture explicitly marked
-`RUN-BLORP-CHECK` through a small runner
-(`blorp/test/test_lib/run_blorp_check_fixtures.py`) after the TestSuites have run;
-`scripts/test` pins the expected fixture count (`expected_blorp_check_fixture_count`)
-and passes it to the runner.
-Runtime sources owned by the leak gate are excluded from the normal runtime corpus.
-The remaining roots compile and run together in one runtime test invocation.
-Runtime discovery starts from explicit category roots, expanding directories
-that overlap leak ownership into named file inventories. This preserves the
-corpus under `blorp test`'s `test_*.brp` file selection and `test_*` child folder
-recursion. Repository test-bearing stage and category directories use the
-`test_` prefix; raw fixture and helper-only directories do not.
-Compiler gates supply manifest-owned suite files explicitly. The doctest gate
-uses `--doc` to scan ordinary standard-library sources recursively.
-`--no-build` is for controlled CI or local workflows that have already run the
-required build and need to preserve that exact toolchain through validation.
-Without it, `scripts/test` installs the current compiler before running gates.
-`--release-artifacts` passes `--release` to every `bin/blorp test` invocation,
-so each generated test artifact is compiled at -O2 instead of the gating -O0
-default. It does not change how `bin/blorp` itself is built.
-`--release-compiler` exports `BLORP_CLI_C_OPTIMIZATION=-O2` for that install,
-trading a slower build for a faster compiler in the gates that follow; see
-"Compiler optimization level" in `docs/DEVELOPMENT.md` for the -O0/-O2 split
-and the re-link cost of switching levels between runs.
+### Gate verdicts
 
 Every gate entry point (`scripts/test`, `scripts/compiler-check`,
-`scripts/premerge-gate`, `scripts/docker-gate`) prints exactly one machine-
-readable verdict line as the last line of stdout:
+`scripts/premerge-gate`, `scripts/docker-gate`) prints exactly one verdict line
+as the last line of stdout, and the exit status agrees with it:
 
 ```
 BLORP_GATE_RESULT gate=<entrypoint> status=PASS|FAIL passed=N failed=N tests=N
 ```
 
-`<entrypoint>` is the tool's own name (`test`, `compiler-check`, ...), and the
-counts are the aggregate across every gate that ran, matching the human
-"Total" row. Exit status always agrees with `status`. Automation should read
-this line instead of grepping prose; it is the same `BLORP_GATE_RESULT`
-format individual gates already emit for their own sub-results.
+Automation reads this line rather than prose. An interrupted or aborted
+`scripts/test`, `scripts/premerge-gate` or `scripts/docker-gate` stops its child
+processes and prints `status=FAIL`. `--help` and `premerge-gate --dry-run` print
+no verdict. `blorp/test/test_build/test_gate_verdicts.sh` covers `scripts/test`.
 
-`scripts/test`, `scripts/premerge-gate` and `scripts/docker-gate`, when
-interrupted (SIGTERM, SIGINT, SIGHUP) or aborted before they finish, print
-`status=FAIL` and exit nonzero, immediately. Each marks itself finished as its
-last statement and its EXIT trap reports FAIL otherwise; none traps a signal,
-because bash holds a trapped signal until the foreground command (a
-`docker run`, a gate) completes. `premerge-gate` reports FAIL unless its test
-run ends with exactly one valid `gate=test` aggregate. `docker-gate` also
-reports FAIL when a premerge or bare test run produced no nested verdict.
-Before reporting FAIL,
-each of the three stops its own child processes (not a process group), so an
-interrupted run leaves nothing behind that could print a late verdict;
-`docker-gate` starts its containers with `--init` so the forwarded TERM
-stops the container too. `--help` prints no verdict, and neither does
-`premerge-gate --dry-run` (a verdict would claim a validation that did not
-run); a bad `scripts/test` flag prints FAIL.
-`blorp/test/test_build/test_gate_verdicts.sh` covers `scripts/test`.
+### Discovery-stage parity
 
-## Cached Static Analysis
+`scripts/compiler-new-parity` (the `compiler-new-parity` gate, 1-2 minutes) holds
+the discovery stage to the existing front end over every tracked `.brp` file
+under `blorp/src`, `standard_library/src` and `blorp/test`: every token, each
+file's lexer diagnostics and accept/reject verdict, and the stage's module graph
+for the self-compile root and a `blorp test` root. A mismatch prints the file and
+the first differing token. Known divergences are listed in the script with a
+reason (`KNOWN_DIVERGENCES`, `KNOWN_POSITION_DIVERGENCES`,
+`WORDING_DIFFERENCES`); an entry that stops disagreeing fails the gate until it
+is removed. A syntax change lands in both parsers and this gate keeps them in
+agreement.
 
-`make c-static-analysis` runs `scripts/c-static-analysis`, which skips the
-clang analysis (about four minutes) when a passing run's stamp exists for the
-same inputs: the sources, every in-repository header `clang -M` reports, the
-clang version and target, and the flags. Stamps live in
-`$BLORP_QUALITY_CACHE_DIR`, default `blorp/build/_build/quality-cache`; a failing
-run writes none. `docker-gate` mounts the named volume `blorp-quality-cache`
-there for premerge gates; an image built before the volume existed needs
-`--rebuild` once before stamps can be recorded.
-
-## Validation Evidence Packets
-
-Use `scripts/record-validation` when a reviewer needs a reproducible packet for
-one focused check, broad gate, or benchmark. The recorder is opt-in and wraps
-one command without changing its exit status:
+The tree-path modes iterate on the unlinked tree parsers. `--stop-census` ranks
+why the tree scan stopped at each module's first unread declaration;
+`--stop-reason LABEL`, `--files PATH...` and `--adapter-only` narrow a run (no
+verdict line, dumpers built at `-O0`). `scripts/discovery-fuzz` is a
+differential fuzzer for the tree path against the old parser. It needs a `FRESH`
+`bin/blorp`, samples rather than gates, and each bug it finds becomes a fixed
+case in
+`blorp/test/test_compiler/test_stage_04_modules/test_discovery_fuzz_cases.brp`.
 
 ```bash
-scripts/record-validation --output /tmp/blorp-evidence/focused \
-  -- scripts/compiler-check --changed
-scripts/record-validation --output /tmp/blorp-evidence/gate \
-  -- scripts/test --no-build --log-dir /tmp/blorp-gate-logs compiler-blorp
+scripts/compiler-new-parity --stop-census
+scripts/discovery-fuzz --count 20000 --minimise
+scripts/discovery-fuzz --gate    # fixed seed and count; exits 1 on failure
 ```
 
-Each packet contains `metadata.json`, `stdout.log`, and `stderr.log`. Metadata
-records the exact argv, cwd, UTC start time, elapsed milliseconds, exit code,
-Git HEAD, start and end tracked/untracked worktree fingerprints, whether source
-changed during the run, `bin/blorp` hash when present, captured artifact hashes,
-and a small allowlist of known validation environment variables. If `--output`
-is inside the Git worktree, that output directory is explicitly excluded from
-source fingerprints. The recorder does not parse human output, decide that a
-benchmark is acceptable, or dump arbitrary `BLORP_*` environment values.
+## Premerge gate
 
-Existing output directories are refused by default. `--replace` updates only a
-previous `record-validation` packet with the same schema and refuses unrelated
-files or subdirectories, so an accidental path cannot be recursively deleted.
-Use `--timeout SECONDS` to terminate the wrapped process group and record exit
-`124`.
+`scripts/premerge-gate` is the broad local gate for preview and release
+validation. It composes, in order:
 
-The supported report-only typed analyzer is `blorp lint <file.brp|dir> [...]`.
-Use `--format json` for the versioned machine-readable envelope and
-`--fail-on-findings` when findings should fail CI. See
-[`docs/LINT.md`](../docs/LINT.md) for rule IDs, confidence, and failure behavior.
-
-The compiler-owned suites compile and run as one generated program. CI sets
-`BLORP_COMPILER_TEST_PROGRESS=1` to stream artifact start, source, result, and
-elapsed-time records while preserving the compact final gate output. Reproduce
-the CI compiler gate against an already-built toolchain with:
-
-```bash
-BLORP_COMPILER_TEST_PROGRESS=1 \
-scripts/test --no-build --serial compiler-blorp
-```
-
-Use `--timings` with `compiler-blorp` or `compiler-blorp-sanitize` to record
-generated TestSuite frontend, typecheck, Core, host-C, and execution phases and
-print their totals.
-After setup, multiple selected gates run in fixed waves by default:
-
-```text
-compiler-blorp
-compiler-tools
-compiler-core-sanitize
-compiler-blorp-sanitize
-compiler-new
-compiler-new-parity
-std-check
-runtime
-leak + doctest + cli + lsp
-package
-cli-deep
-```
-
-Waves skip gates you did not select. The policy is intentionally static: the
-heavy gates already do their own internal work scheduling, and a shell-level
-resource scheduler would be harder to reason about than the tests it runs. Use
-`--serial` when you need one gate at a time. `scripts/premerge-gate` passes it
-on macOS only, because of `syspolicyd` stalls, and runs the waves on Linux.
-
-CI builds one compiler candidate per platform and restores those exact bytes in
-independent test jobs. Ubuntu separates quality, Blorp-owned compiler, and
-product/runtime coverage; platform jobs retain the smaller runtime
-compatibility set. Each platform build gates only that platform's test lanes, so
-a failed or slow platform does not suppress unrelated feedback. Packaging waits
-for the matching platform lanes, then archives the shared candidate rather than
-rebuilding it; the release workflow still publishes only from a wholly
-successful CI run. The candidate carries generated CLI outputs and both embedded
-standard-library sources so fresh test checkouts use the build job's exact
-generated inputs.
-
-Timeouts:
-
-- `BLORP_TEST_TIMEOUT` overrides generated test artifact timeouts.
-- `BLORP_RUNTIME_TEST_TIMEOUT` overrides only the single runtime corpus
-  artifact, which defaults to 60 seconds. Ordinary artifacts default to 30
-  seconds.
-- `BLORP_LEAK_TEST_TIMEOUT` overrides only the consolidated leak-check corpus,
-  which also defaults to 60 seconds. A positive value is a floor per suite batch:
-  `bin/blorp test --leak-check` grants each batch the larger of the floor and
-  5 seconds (`LEAK_CHECKED_SOURCE_TIMEOUT_SECONDS` in
-  `blorp/src/test/plan.brp`) times the number of test sources in it, so a
-  large batch on a loaded host does not time out while a hung test still fails
-  in bounded time. An explicit zero disables the deadline, including for
-  leak-checked batches. A timeout failure lists every test source in the batch.
-- `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations. The
-  grouped compiler-owned Blorp suites default to 360 seconds; individual
-  compiler fixtures and codegen audits default to 30 seconds.
-- `BLORP_COMPILER_SANITIZE_TEST_TIMEOUT` sets the compiler sanitizer-gate
-  timeout (default 180 seconds, reflecting measured ASan overhead).
-## Premerge Gate
-
-`scripts/premerge-gate` is the broader local validation gate before merging or
-cutting preview builds. It composes:
-
-- clean build at `-O2` (`BLORP_CLI_C_OPTIMIZATION=-O2`; use `--no-release-compiler` for `-O0`)
+- preflight and a clean `-O2` build (`--no-release-compiler` for `-O0`)
 - `make quality`
 - `make benchmark-tooling-check`, only when the change touches benchmark tooling
-- `scripts/test --release-compiler compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp compiler-new compiler-new-parity`, with `--serial` added on macOS only (see below)
-- the direct generated-C audit in `blorp/test/test_compiler/test_pipeline/codegen_audit/` (up to 4 workers on Linux, one on macOS;
-  `--jobs N` or `BLORP_CODEGEN_AUDIT_JOBS` overrides; output stays in fixture order)
-- preview CLI/runtime smoke
+- `scripts/test --release-compiler compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp compiler-new compiler-new-parity` (with `--serial` on macOS only)
+- the generated-C audit in `blorp/test/test_compiler/test_pipeline/codegen_audit/`
+  (up to 4 workers on Linux, one on macOS; `--jobs N` or
+  `BLORP_CODEGEN_AUDIT_JOBS` overrides)
+- preview CLI/runtime smoke, guarded to leave the working tree unchanged
 - example checks and selected example runs
-- sanitizer tests
+- sanitizer tests (`make test-asan`)
 - Docker validation when Docker is available
-- lightweight secret-pattern scan
-- drift and hygiene checks, including editor TextMate metadata sync
-
-Common forms:
+- a lightweight secret-pattern scan
+- drift and hygiene checks
 
 ```bash
 scripts/premerge-gate
@@ -416,566 +212,229 @@ scripts/premerge-gate --require-docker
 scripts/premerge-gate --dry-run
 ```
 
-The gate passes `--serial` to `scripts/test` only when `uname -s` is `Darwin`:
-on macOS, many freshly compiled binaries running at once stall in `syspolicyd`.
-On Linux, including the Docker gate containers, `scripts/test` runs its fixed
-gate waves (the `leak`, `doctest`, `cli` and `lsp` gates share one wave) and
-each gate keeps its own output and `BLORP_GATE_RESULT` verdict.
+Use `--quick` for fast local confidence; use the full default gate before
+claiming a preview- or release-sensitive change is ready.
 
-### Change scope
+`scripts/gate-scope` classifies the change first and the gate prints
+`Change scope: ...`. The changed paths are those that differ from the merge
+base of `HEAD` and `origin/main` (committed, staged, unstaged and untracked
+files). The scope is `docs-only` when every path is `*.md` or under `docs/`:
+the gate then runs only preflight, the security scan and the static hygiene
+checks. Anything else, including a path no rule recognises, is `full`; every
+step runs, except benchmark tooling, which runs only when a changed path is one
+of its inputs (`BENCHMARK_TOOLING_PATH_RULES` in `scripts/gate-scope`;
+`benchmarks/results/` is data and does not count). `--full`, or a missing merge
+base, forces every step. `blorp/test/test_build/test_gate_scope.py` covers the
+rules.
 
-The gate first classifies the change with `scripts/gate-scope` and prints the
-result, for example `Change scope: docs-only (14 paths)`. The changed paths are
-those that differ from the merge base of `HEAD` and `origin/main` (committed,
-staged, unstaged and untracked files; a remote gate host, which has no
-`origin/main`, uses the base ref `scripts/docker-gate` pushes). The scope is:
+Every run ends with an aligned step table (status and seconds per step), one
+`BLORP_GATE_STEP name=<slug> status=PASS|FAIL|SKIP seconds=N` line per step, then
+the verdict. `blorp/test/test_build/test_premerge_gate_steps.py` covers the
+summary.
 
-- `docs-only`: every path is `*.md` or under `docs/`. The gate runs Preflight,
-  Security scan, and Drift and hygiene (`make hygiene-check` and
-  `make artifact-scan`; `tooling-check` needs a build). Every other step is
-  `SKIP`.
-- `full`: anything else, including any path no rule recognises. Every step
-  runs, except Benchmark tooling (`make benchmark-tooling-check`, about two
-  minutes), which runs only when a changed path is an input of those suites:
-  the benchmark scripts, workers and wrappers, the compiler modules and test
-  session they use, the benchmark policy's fingerprinted inputs, and the suites
-  themselves. Recorded measurements under `benchmarks/results/` do not count.
-- `--full` forces every step, Benchmark tooling included. So does a failure to
-  find the merge base, so a checkout without `origin/main` runs everything.
+## Docker gate
 
-The path rules are named constants in `scripts/gate-scope`;
-`blorp/test/test_build/test_gate_scope.py` covers them.
-
-Use `--quick` for fast local confidence. Use the full default gate before
-claiming a preview/release-sensitive change is ready.
-
-Every run, passing or failing, ends with one aligned step table (each step's
-status and seconds, then the total) and, before the verdict line, one
-`BLORP_GATE_STEP name=<slug> status=PASS|FAIL|SKIP seconds=N` line per step for
-tools. A step that stopped the gate is `FAIL`; steps after it were not reached
-and are not listed. `SKIP` is a step that chose not to run (its flag, or no
-Docker). `--dry-run` prints the table but no step lines or verdict. The
-`BLORP_GATE_STEP` lines are not verdicts: `docker-gate` and the other parsers
-read only `BLORP_GATE_RESULT` lines. `blorp/test/test_build/test_premerge_gate_steps.py`
-covers the summary.
-
-The preview smoke step is guarded as non-mutating: it snapshots Git status plus
-tracked and staged diffs before and after the step, and fails if validation
-rewrites the working tree.
-
-## Docker Gate
-
-`scripts/docker-gate` runs validation inside an Ubuntu 24.04 container. Like
-`scripts/premerge-gate`, it builds `bin/blorp` at `-O2` by default.
+`scripts/docker-gate` runs validation in an Ubuntu 24.04 container. Like the
+premerge gate, it builds `bin/blorp` at `-O2` by default. It is optional: use it
+to reproduce a Linux failure or when asked for the CI-equivalent run.
 
 ```bash
-scripts/docker-gate
-scripts/docker-gate --premerge-gate
+scripts/docker-gate                          # normal test gate on linux/amd64
+scripts/docker-gate --premerge-gate          # scripts/premerge-gate --no-docker inside
 scripts/docker-gate --premerge-gate --all-platforms
 scripts/docker-gate --platform linux/arm64 -- blorp/test/test_runtime/test_numeric/test_float16_vector.brp
 scripts/docker-gate --shell
 ```
 
-Modes:
-
-- Default volume mode mounts the working tree into the container.
-- `--clean` copies source into the image for a more CI-like run.
-- `--premerge-gate` runs `scripts/premerge-gate --no-docker` inside Docker.
+- The default volume mode mounts the working tree; `--clean` copies the source
+  into the image for a hermetic, CI-like run.
 - Each gate builds the compiler inside its container, which peaks at several
-  GB, so `scripts/docker-gate` limits both how many gates run and how hard each
-  builds:
-  - A gate holds one of `BLORP_DOCKER_GATE_MAX_CONCURRENT` (default 3) slots
-    for the length of its `docker run`; later gates wait in a queue and are
-    served in arrival order. Slots and queue tickets are directories made with
-    `mkdir` (atomic, so simultaneous gates cannot both take the last slot)
-    under `BLORP_DOCKER_GATE_SLOT_DIR` (default
-    `${TMPDIR:-/tmp}/blorp-docker-gate-slots`), shared by every checkout that
-    sees the same directory. Each has an owner file with the holder's pid and
-    start time; a slot left by a killed gate is reclaimed, and an interrupted
-    gate frees its slot on the way out. A `--clean` run holds its slot for the
-    image build (the memory-heavy `make`) as well as the container run. A
-    gate killed with SIGKILL leaves its slot to be reclaimed, and its
-    `docker run` container keeps running until it ends. A cap of 0 never
-    admits a gate; lowering the cap lets gates already holding a higher slot
-    finish, so briefly more than the new cap may run.
-  - Only gates running a `docker-gate` that has this mechanism are counted.
-    Containers started by an older copy (a branch that has not merged `main`)
-    cannot be governed, so merge `main` into a branch to get the limit. A
-    different `TMPDIR` is a different pool; set `BLORP_DOCKER_GATE_SLOT_DIR`
-    to share one.
-  - The build's parallel `clang` jobs (`BLORP_CLI_C_SPLIT_JOBS`) default to the
-    Docker VM's CPU count divided by the slot count, at least 2; set
-    `BLORP_DOCKER_GATE_BUILD_JOBS` to override. Fewer jobs lower a gate's peak
-    memory at some cost in build time.
+  GB, so a gate holds one of `BLORP_DOCKER_GATE_MAX_CONCURRENT` (default 3)
+  slots under `BLORP_DOCKER_GATE_SLOT_DIR` for its `docker run`, and later gates
+  queue. `BLORP_DOCKER_GATE_BUILD_JOBS` overrides the parallel `clang` jobs per
+  gate. Static-analysis stamps are cached in the `blorp-quality-cache` volume; an
+  image built before the volume existed needs `--rebuild` once.
 
 ### Remote gate host
 
-Set `BLORP_DOCKER_GATE_HOST` to an SSH host, such as an `~/.ssh/config` alias
-with key login, to run gates on that machine's Docker instead of this one's.
-Put it in a gitignored `.env` at the repository root, which every worktree of
-the checkout reads, or in the environment, which takes precedence:
+Set `BLORP_DOCKER_GATE_HOST` to an SSH host (an `~/.ssh/config` alias with key
+login) to run gates on that machine's Docker. Put it in a gitignored `.env` at
+the repository root, which every worktree reads, or in the environment, which
+wins. `.env` holds `NAME=value` lines; only `BLORP_DOCKER_GATE_*` names are
+read, and the file is parsed, not sourced.
+
+- The working tree, including uncommitted and untracked files, is sent as a
+  snapshot commit built in a private index, so the checkout is untouched. The
+  gate runs in a fresh worktree of `BLORP_DOCKER_GATE_REMOTE_REPO` (default
+  `blorp-gate` in the remote home), removed when the gate ends; a later run
+  sweeps what a cut-off run left.
+- The remote runs at most `BLORP_DOCKER_GATE_REMOTE_MAX_CONCURRENT` (default
+  10) gates at once. A remote gate that itself exits 255 is reported as 254, so
+  255 always means the connection failed.
+- If the host is unreachable, lacks git or a running Docker, has under 20 GiB
+  free, or the snapshot cannot be sent, the script prints a line starting
+  `docker-gate: WARNING: not running on the gate host:` with the reason, and
+  runs the gate locally. A gate that ran remotely and failed returns its status;
+  it is never rerun locally. `--shell` always runs locally.
+- The host needs Remote Login (SSH), git, and Docker reachable from a
+  non-interactive shell. With Docker Desktop on macOS, put its CLI directory on
+  `PATH` in `~/.zshenv`, remove `credsStore` from `~/.docker/config.json`, keep
+  a user logged in, and disable sleep.
+
+`blorp/test/test_build/test_docker_gate_remote.py` covers the remote path.
+
+## Landing a branch
+
+Validate the branch with the focused suites first (see "Validating a change").
 
 ```bash
-echo 'BLORP_DOCKER_GATE_HOST=blorp-gate' >> .env
-scripts/docker-gate --premerge-gate --platform linux/arm64 -- --no-sanitize
+scripts/land <branch> --title "<title>" [--body "<text>"] [--dry-run]
 ```
 
-`.env` holds `NAME=value` lines; only `BLORP_DOCKER_GATE_*` names are read, and
-the file is parsed, not sourced. Keep host names, user names and paths there
-or in `~/.ssh/config`, never in tracked files.
-
-- The working tree, including uncommitted and untracked files that are not
-  ignored, is sent as a snapshot commit built in a private index, so the
-  checkout's index and files are untouched. The gate runs in a fresh worktree
-  of `BLORP_DOCKER_GATE_REMOTE_REPO` (default `blorp-gate` in the remote home,
-  created on first use), removed with its ref when the gate ends. Anything a
-  cut-off run leaves behind is swept by a later run after a day.
-- A remote gate that itself exits 255 is reported as 254, so 255 always means
-  the connection failed.
-- The remote machine queues its gates like a local run, at most
-  `BLORP_DOCKER_GATE_REMOTE_MAX_CONCURRENT` (default 10) at once, in one slot
-  directory (`~/.cache/blorp-docker-gate-slots`) for every client.
-- If the host is unreachable, lacks git or a running Docker, has less than
-  20 GiB free in the remote home, or sending the snapshot fails, the gate runs
-  locally with a one-line note saying why. A gate that ran remotely and failed
-  returns its status; it is never rerun locally.
-- Each run first updates `refs/blorp-docker-gate-base/main` on the host from
-  `origin/main` (best effort), so a push after a quiet period sends only new
-  objects. The sweep never removes it.
-- Once the gate starts, `scripts/docker-gate` becomes the `ssh` client, so
-  stopping it by any signal drops the connection, and the remote run then stops
-  its gate within seconds (its container is stopped and its slot freed). A
-  connection lost mid-gate exits 255; rerun the gate.
-- `--shell` always runs locally.
-- The remote host needs Remote Login (SSH), git, and Docker reachable from a
-  non-interactive shell. With Docker Desktop on macOS, put its CLI directory
-  (`/usr/local/bin` or `~/.docker/bin`) on `PATH` in `~/.zshenv`, remove
-  `credsStore` from `~/.docker/config.json` (the keychain is unavailable over
-  SSH), keep a user logged in so Docker Desktop runs, and disable sleep.
-
-## Landing a Branch
-
-Validate a branch first with the CI-equivalent gate, the same checks CI runs on
-Ubuntu x64: from the branch's checkout or worktree run
-`scripts/docker-gate --premerge-gate -- --no-sanitize` (a clean -O2 build,
-`make quality` and the full `scripts/test` in an Ubuntu container). Gates on
-different branches may run in parallel. With `BLORP_DOCKER_GATE_HOST` set they
-run on the gate host (see "Remote gate host" above). Then land it:
-
-```bash
-scripts/land <branch> --title "<title>" [--body "<text>"] \
-    [--record <file> --record-name <name>] [--dry-run]
-```
-
-`scripts/land` merges `origin/main` into the branch, in the branch's own
-worktree if it is checked out somewhere (that worktree must be clean) and in a
-temporary worktree otherwise; a merge conflict stops it, to be resolved on the
-branch. It then squash-merges the branch onto `origin/main` as one commit with
-the given title and body in a temporary detached worktree, optionally copies a
-measurement file into `benchmarks/results/<name>`, and pushes that commit to
-`origin main`. If `main` moved before the push, it merges again and retries;
-any other push failure stops it. The caller's checkout is never touched, and
-it runs no gates. Titles starting with `Merge` or containing an `#<digits>`
-issue reference are refused so main's history stays standalone and readable.
-`--dry-run` stops after the squash commit and prints its SHA; the branch still
-gets the merge from `origin/main`.
-
-## Identifying A Binary
-
-`bin/blorp --version` is the single source of truth for what a given binary
-is: commit (plus `-dirty` for uncommitted tracked changes), target triple,
-`compiled_by` (the bootstrap tag, or `self-<commit>` for a stage-2 binary
-built by `bin/blorp` itself — see `benchmarks/build_stage2_compiler`),
-`optimization` (`cli=` and `runtime=` flags actually used), `split` (the
-translation-unit count), and `cc` (the first line of `$BLORP_CC --version`,
-default Clang). These
-values are stamped in at compile time from a small, always-freshly-rebuilt
-object (`blorp/src/lib/runtime/native/build_stamp.c`), not embedded into the
-generated compiler C, so a new commit relinks the binary instead of forcing a
-full recompile.
-
-`scripts/compiler-build-status` reads this block from the built binary — not
-ambient environment variables — to decide FRESH/STALE, so its verdict matches
-how the binary on disk was actually built regardless of the current shell's
-environment. It also flags `STALE` with reason "bootstrap pin changed" when
-`blorp/build/bootstrap.env`'s tag no longer matches a `dev-` `compiled_by`,
-and prints the version block after a `FRESH` verdict.
-
-## Build Inputs
-
-`scripts/blorp-build-inputs sources` and `headers` print what `bin/blorp` is
-built from. `make` hashes them into the build manifests and
-`scripts/compiler-build-status` recomputes the same hashes, so both call this
-one script. `sources` is the Blorp modules reached by imports from the CLI's
-entry module (`entry` prints it, and the Makefile compiles it), every module in
-`blorp/src/compiler/stage_01_generated_inputs/`, and every standard library
-module (the compiler embeds the whole library). A module no built program
-imports, such as the discovery tree parser or the formatter tool's own modules,
-is not an input: editing it leaves `bin/blorp` FRESH and `make` has nothing to
-do. A module that only a test or another tool compiles is not part of the built
-compiler either; those programs are compiled by `bin/blorp` when they run.
-
-If the import graph cannot be resolved (a generated module is missing before
-the first `make`, or an import names something the reader does not resolve, such
-as a `pkg/` request), the script prints a note on stderr and lists every
-`blorp/src` module, so an unresolvable graph can cost a rebuild but never report a
-stale binary FRESH. The import reader lives in `scripts/blorp_import_graph.py`
-and is shared with `scripts/compiler-check`'s tree-path classification.
-
-## Build Source Generation
-
-`make compiler-build-source-generator` compiles
-`blorp/tool/generate_build_sources.brp` with the pinned bootstrap compiler.
-The resulting native tool generates build metadata, embedded runtime C, and the
-embedded standard library. Production build and CI routes use this tool directly.
-
-`scripts/split-generated-c <generated.c> <out_dir> -n N` splits the compiler's single
-generated C file into a shared header and N body translation units that the Makefile
-compiles in parallel (`BLORP_CLI_C_SPLIT`). It post-processes the C file and does not
-touch the emitter.
-
-`scripts/blorp-cli-embedded-manifest` records what an installed `bin/blorp` was built
-from. `write-inputs` hashes the paths listed on stdin into a sorted input manifest,
-`write-installed` prefixes that manifest with the compiler binary's SHA-256, and
-`verify-installed` reports whether the installed compiler still matches. The Makefile
-uses it to decide whether to reinstall `bin/blorp`.
-
-## Build Lock
-
-`scripts/with-build-lock` serializes build/test gates per worktree. `scripts/test`
-and `scripts/premerge-gate` use it automatically so concurrent local runs do not
-race on generated runtime caches or std embedding. The wrapper also
-holds the shared canonical per-user host compiler contention lease. On hosts
-without the `flock` utility, the build lock uses Python 3 and a POSIX file
-lock held by the command, so termination releases it automatically. Registered
-`scripts/bench-blorp-test-session` evidence takes the exclusive side and rejects
-a run while any participating build/test gate for that user is active. The
-owner-only lease namespace rejects symlinks and foreign ownership before a gate
-or benchmark starts.
-`scripts/with-compiler-contention-lease --mode shared|exclusive --policy <file> -- <command>`
-runs a command while holding that lease; the policy file names the lease. With
-`--nonblocking` it fails instead of waiting when the lease is held.
-`scripts/with-build-lock` calls it for the shared side.
-Named runs selected with `--workload` use the same exclusive lease. The
-registered workload kind requires a candidate for comparisons and forbids one
-for characterizations; both validate their command and cache policy, while
-characterizations also validate sample count, timeout, and fingerprint inputs.
-
-Manual use:
-
-```bash
-scripts/with-build-lock make quality
-```
-
-## Blorp Test Session Feedback
-
-Use the direct command for the boundary being changed. Planner TestSuites cover
-path discovery, the shared frontend graph, and generated aggregate harnesses. A
-typecheck covers the shared execution boundary, and the rebuilt-compiler test exercises
-the production CLI route:
-
-```bash
-bin/blorp test --timeout 30 \
-  blorp/test/test_test/test_discovery.brp \
-  blorp/test/test_test/test_generated_test_harness.brp \
-  blorp/test/test_lib/test_source_graph_context.brp \
-  blorp/test/test_test/test_plan.brp
-bin/blorp check --no-format \
-  blorp/src/test/effect.brp
-blorp/test/test_cli/test_rebuilt_cli.sh --timeout 90
-```
-
-Run `bin/blorp test --timeout 30 blorp/test/test_runtime/test_sys/test_process_session.brp`
-for the session API; CLI smoke separately covers inherited stdin, stdout, and
-stderr for blocking commands. Use `scripts/bench-blorp-test-session` for
-repeatable timing or RSS evidence; its process supervisor and registered
-workloads are the single benchmark path.
-
-## Compiler Bootstrap
-
-`make install` invokes the pinned release's public `blorp compile` command
-directly to build the current compiler. Bootstrap builds do not rewrite source
-trees or prepare an intermediate compiler. The compiler is a single
-executable; tests, packages, the LSP, and releases do not prepare or install
-private workers.
-
-Local compiler builds compile generated compiler C at `-O0` by default for the
-shortest edit/build cycle. The separately cached runtime object uses `-O2` and
-is shared by fast and release compiler builds; set
-`BLORP_CLI_RUNTIME_C_OPTIMIZATION` only when debugging the runtime itself. Set
-`BLORP_CLI_C_OPTIMIZATION` to select the generated compiler C optimization
-level. Main CI and tagged release builds use `-O2` for both. Both selected
-levels participate in their respective cache identities. `make
-generate-blorp-cli-c` runs the self-hosted source-to-C phase, and `make
-prepare-blorp-cli-runtime` prepares the content-addressed runtime object. CI
-uses `make prepare-blorp-cli-c` to produce all C inputs, `make
-compile-prepared-blorp-cli` to invoke only the host C toolchain, and `make
-install-prepared-blorp-cli` to publish the result. Local `make install` still
-composes all phases safely.
-
-Normal builds use `scripts/blorp-compiler-bootstrap`, which reads the immutable
-release identity and per-target checksums from
-`blorp/build/bootstrap.env`, then downloads and verifies the release into
-`$HOME/.cache/blorp/compiler-bootstrap`, or `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
-when set. Rotate the tag, version, and all target checksums together in that
-single manifest only after release CI has published the merged revision.
-The manifest requires the `direct` binary layout. The resolver verifies the
-selected target's downloaded SHA-256 and rechecks the cached binary before
-reuse. Historical archive layouts are unsupported.
-
-Useful compiler bootstrap commands:
-
-```bash
-scripts/blorp-compiler-bootstrap --print-id
-scripts/blorp-compiler-bootstrap --print-tag
-scripts/blorp-compiler-bootstrap --print-path
-scripts/blorp-compiler-bootstrap --print-toolchain-dir
-```
-
-## Compiler Fixpoint
-
-`bin/blorp` is built from C the pinned bootstrap emitted, so a change to Core
-or the backend reaches the compiler's own code only in a later stage.
-`scripts/compiler-fixpoint` builds those stages with
-`benchmarks/build_stage2_compiler`: stage 1 (`bin/blorp`) emits the compiler's
-C and stage 2 is built from it, stage 2 emits it again and stage 3 is built
-from that, and stage 3 emits it a third time. Stage 2 and stage 3 must emit
-byte-identical C; a difference means the compiler miscompiled itself, and the
-script prints the first differing line. It also reports whether stage 1's
-output matches, as information: stage 1 was compiled by the bootstrap.
-
-Run it for every change that alters emitted C, before a bootstrap rotation
-picks the change up. It needs a `FRESH` `bin/blorp`, builds each stage at the
-optimization level `BLORP_CLI_C_OPTIMIZATION` selects, and keeps the stages
-and their C in `blorp/build/_build/fixpoint/` (or `--work-dir`). Exit status
-is 0 at a fixpoint, 1 when stage 2 and stage 3 differ, and 2 when a stage
-could not be built.
-
-```bash
-scripts/compiler-fixpoint
-BLORP_CLI_C_OPTIMIZATION=-O2 scripts/compiler-fixpoint --work-dir /tmp/blorp-fixpoint
-```
-
-## Compiler Source Cleanup Audit
-
-`scripts/audit-compiler-blorp-dead-code` builds a conservative whole-compiler
-module and declaration reachability inventory. It also reports whole unused
-import entries, globally unread field names, unused variants, and Blorp
-environment controls with no tracked reference outside compiler source.
-
-```bash
-scripts/audit-compiler-blorp-dead-code
-scripts/audit-compiler-blorp-dead-code --json
-scripts/audit-compiler-blorp-dead-code --module-identity-graph-json
-scripts/audit-compiler-blorp-dead-code --module-identity-graph-dot
-```
-
-Findings require owner review before deletion; the script intentionally does
-not fail the quality gate merely because cleanup remains queued. Do not copy
-point-in-time counts into a maintained document.
-
-### Compiler identity migration census
-
-`scripts/compiler-identity-census` emits a deterministic identity migration
-inventory from compiler stages 6, 8, 9, and 10:
-
-```bash
-scripts/compiler-identity-census --json > /tmp/identity-census.json
-scripts/compiler-identity-census --check
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp.test.test_build.test_compiler_identity_census
-```
-
-The checked-in JSON baseline caps each category, family, and directory. The
-`--check` command rejects an increase and a new unlisted C naming boundary at
-its source location. `--write-baseline PATH` writes an explicit candidate for a
-reviewed migration cut; new boundaries carry `REVIEW_REQUIRED` metadata and
-cannot pass `--check` until their rationale, owner, and oracle are filled in.
-JSON and text use the same sorted
-rows. Exact source shapes are separate from heuristic candidates: member reads,
-sparse `Option` fields, and index builders are triage inventory, not confirmed
-semantic uses. `unsupported_static` rows name the dynamic or typed oracle needed
-for classes that this source scan cannot prove.
-Pending-constructor keys include the containing brace expression and its ordinal
-among balanced brace expressions in the same scope. Blank lines, comments, and
-unrelated statements without braces leave these keys stable; inserting a brace
-expression before a site may require an explicit baseline review.
-
-### Compiler anti-pattern census
-
-`scripts/audit-compiler-antipatterns` inventories a small set of recurring
-source shapes that are useful during compiler cleanup:
-
-```bash
-scripts/audit-compiler-antipatterns
-scripts/audit-compiler-antipatterns --json > /tmp/blorp-antipatterns.json
-scripts/audit-compiler-antipatterns --rule threaded-state-record --json
-scripts/audit-compiler-antipatterns --large-file-lines 8000
-```
-
-The census reports string-keyed dictionaries, index builders, large threaded
-records, records whose optional fields and booleans may encode illegal states,
-small tuple returns, managed parameters returned unchanged from an update-like
-conditional, struct container placements whose final layout and hot read sites
-need inspection, and large source files. The complete unfiltered counts remain in
-JSON when `--rule` selects a review slice, so two revisions can be compared
-without accidentally changing the census boundary.
-
-These are review candidates, not lint failures or performance conclusions.
-JSON `confidence` describes confidence that the syntactic shape matched, not
-confidence that the code should be refactored.
-For example, `Dict[String, ...]` is correct before an identity has been
-resolved, a boolean can represent an independent fact, and a struct placement
-can remain inline. Confirm hotness and representation before changing source.
-Use allocation/instruction counters for an ownership claim, generated C for a
-layout or backend claim, and exact output identity for every performance
-experiment. Run before/after censuses with the same options and source scope.
-
-The module-identity graph modes isolate functions whose signatures or bodies
-directly carry `ResolvedModuleIdentity`, `ModuleIdentity`, `FrontendModuleId`,
-`ModuleId`, explicit `module_path`/`module_name` String bindings or fields, or a
-String-bearing function whose name contains an exact `_module_path`/
-`_module_name` token. They then walk callers transitively.
-JSON output is intended for mechanical migration inventories: every node has a
-deterministic module/function key, source location, direct-fact categories, and its
-shortest caller distance from a direct fact. DOT output renders the same node
-and edge set with direct handlers boxed.
-
-This is a conservative source dependency graph, not a typechecked call graph.
-An edge means the caller references a locally or explicitly imported compiler
-function according to the audit's import/name resolver; callbacks and other
-value references can therefore appear as calls, while unresolved dynamic or
-ambiguous references are absent. Use the graph to select and sequence a bounded
-migration, then prove each edit through compiler behavior and allocation tests.
-
-## Drift Checks
-
-`scripts/check-editor-drift` verifies that shared VSCode and IntelliJ TextMate
-metadata stay byte-for-byte synchronized, parse as JSON, and keep the IntelliJ
-plugin's required editor integration registrations in place. `make
-hygiene-check` runs it automatically.
-
-`make hygiene-check` is the seconds-long static set (layout, editor drift,
-C-symbol boundary, manifest, std builtins, magic spellings). `make tooling-check` holds the stage-2 self-compile C-symbol
-leak check (`scripts/check-c-symbol-projection-self-compile`) and the
-Python/shell suites that test the scripts, build, runtime harnesses and
-audits. `make benchmark-tooling-check` holds the benchmark-worker `check` runs
-and the suites that test the benchmark and measurement scripts; they protect
-those scripts rather than the compiler. `make quality` runs the first two, then
-`artifact-scan` for stray generated files the suites left behind. CI runs
-`benchmark-tooling-check` as its own step after Quality on every push;
-`scripts/premerge-gate` runs it as its own step only when the change touches an
-input of those suites (see "Premerge Gate").
-
-`scripts/check-blorp-layout` validates `blorp/source_ownership.json` against
-`blorp/src` and `blorp/test`: owner roots, which owners may import which (including
-the listed temporary cross-owner imports), the isolated `compiler_new` test tree,
-forbidden top-level paths, and that test modules mirror the source layout and are
-named `test_*`. `make hygiene-check` runs it.
-
-`scripts/check-c-symbol-projection-boundary` fails when a `.brp` file other than the
-backend emitter and its renderer test uses the unprojected C emission APIs
-(`*_unprojected_*_for_tests`), so emitted C always goes through symbol projection.
-`make hygiene-check` runs it.
-
-`scripts/check-c-symbol-projection-self-compile` compiles `blorp/src/main.brp` with the
-built `bin/blorp` (a stage-2 self-compile) and fails if the emitted C still spells a
-type by its pre-projection qualified name (its `_make(` and `_destroy` functions, its
-`typedef struct`, a pointer cast to it, or a `blorp_StackOption_` payload built from
-it). It needs a built `bin/blorp`. `make tooling-check` runs it.
-
-`scripts/check-magic-spellings` fails when a reader or producer of a name's
-prefix, suffix or embedded number (`starts_with`, `parse_int`, `__mono_`
-concatenation and the named accessors) appears that is not in
-`scripts/check-magic-spellings.allowlist`. An allowlist entry is keyed by file,
-role, rule, enclosing top-level declaration and the string literals and
-constants the match tests, with a count, so reformatting, rewrapping or moving
-a listed line does not make it new while changing what it tests does; the
-trailing line-text column is for review only. A new finding whose literal is
-spelled in other files is reported with a hint to share one named definition.
-`--report` prints per-family counts and the literals spelled in the most files,
-`--update` regenerates the allowlist (keeping `#` comments above entries that
-still exist) and `--strict` also fails on stale entries. The families and their
-replacements are in `benchmarks/results/magic_spelling_census_2026-09-28.md`;
-`blorp/test/test_build/test_check_magic_spellings.py` tests the identity rules.
-`make hygiene-check` runs it.
-
-`scripts/check-std-builtins` verifies that standalone standard-library function builtin
-bodies use explicit identities matching their source declaration, for example
-`builtin("list.__unsafe_list_set_index")`. Bare `builtin` function bodies are not
-allowed in `standard_library/src/`. It also requires every non-resource builtin type declaration
-to have exactly one scalar, managed-reference, or no-value storage
-classification in the compiler language-surface manifest.
-
-## Optional Native TLS Check
-
-`scripts/test-tls-openssl-local` is a manual integration check for the opt-in
-OpenSSL TLS runtime backend. It creates a local self-signed TLS endpoint and
-runs a Blorp TLS client against it with `BLORP_TLS_BACKEND=openssl`. It is not
-part of the default gate because it requires host OpenSSL headers/libraries and
-the `openssl` command-line tool.
-
-
-## Release Helpers
-
-`scripts/target-triple` prints the release target for the current machine:
-
-```bash
-scripts/target-triple
-```
-
-Supported targets:
-
-- `x86_64-unknown-linux-gnu`
-- `aarch64-unknown-linux-gnu`
-- `aarch64-apple-darwin`
-- `x86_64-apple-darwin`
-
-`scripts/package-release` copies the public `bin/blorp` command to the target-
-qualified release asset `blorp-<target>`. That binary can also become the
-immutable compiler when the release is later pinned as the bootstrap:
-
-```bash
-scripts/package-release dist
-```
-
-Useful environment variables:
-
-- `BLORP_RELEASE_BINARY` selects the binary to package.
-- `BLORP_RELEASE_TARGET` overrides the target triple in the asset name.
-
-`scripts/install-dev` downloads, validates, stages, and atomically installs that
-executable. It removes private compiler helpers left by older releases.
-
-On main, CI builds the compiler once with its final dev release metadata,
-checks the self-hosted source graph, runs the normal test gates, smokes the
-target-qualified binary, and uploads it as a workflow artifact. The dev release
-workflow downloads and publishes those exact bytes
-instead of compiling the compiler again. Explicit `v*` tags still build
-independently because the tagged version embedded in the executable differs from
-the dev version tested on main.
-
-`scripts/install-dev` installs the latest moving `dev` release:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/kablorp/blorp/main/scripts/install-dev | bash
-```
-
-It downloads the matching `blorp-<target>` executable and installs it as
-`$HOME/.local/bin/blorp` by default. `blorp` remains the only public command.
-Invalid executables are rejected before installation.
-The installer temporarily accepts the previous archive format so installing
-does not break while the moving `dev` release transitions to direct binaries.
-
-Useful options/environment:
-
-```bash
-scripts/install-dev --print-url
-scripts/install-dev --install-dir "$HOME/bin"
-BLORP_INSTALL_DIR="$HOME/bin" scripts/install-dev
-```
-
-Remove the dev binary with:
-
-```bash
-rm -f "$HOME/.local/bin/blorp"
-```
+`scripts/land` merges `origin/main` into the branch (in the branch's own
+worktree if it is checked out somewhere and clean, else in a temporary one; a
+conflict stops it, to be resolved on the branch), squash-merges the branch onto
+`origin/main` as one commit with the given title and body in a temporary
+detached worktree, and pushes it to `origin main`. If `main` moved first, it
+merges again and retries up to five times; any other push failure stops it. The
+caller's checkout is never touched and no gate runs. Titles starting with
+`Merge`, or containing an `#<digits>` issue reference, are refused. `--dry-run`
+stops after the squash commit and prints its SHA; the branch still receives the
+merge from `origin/main`.
+
+## Build and bootstrap
+
+`bin/blorp --version` is the source of truth for what a binary is: commit (plus
+`-dirty`), target triple, `compiled_by` (the bootstrap tag, or `self-<commit>`
+for a stage-2 binary), `optimization`, `split` (translation-unit count) and `cc`.
+They are stamped in from `blorp/src/lib/runtime/native/build_stamp.c`, so a new
+commit relinks rather than recompiles the compiler.
+
+- `scripts/compiler-build-status` reads that block from the binary and prints
+  `FRESH`, `STALE` or `UNKNOWN` without rebuilding. It reports `STALE` when
+  `blorp/build/bootstrap.env`'s tag no longer matches a `dev-` `compiled_by`.
+  Check it before a direct `bin/blorp` test and run `make` if it is not fresh.
+- `make compiler-build-source-generator` compiles
+  `blorp/tool/generate_build_sources.brp`, which writes the generated build
+  inputs (embedded standard library, build info, embedded runtime C) that every
+  build and CI run uses.
+- `scripts/blorp-build-inputs sources|headers|entry` print what `bin/blorp` is
+  built from: modules reached by imports from the CLI entry module, every module
+  in `blorp/src/compiler/stage_01_generated_inputs/`, and the standard library. A
+  module no built program imports is not an input, so editing it leaves
+  `bin/blorp` FRESH. If the import graph cannot be resolved, the script lists
+  every `blorp/src` module, so it can cost a rebuild but never report a stale
+  binary FRESH. The reader is `scripts/blorp_import_graph.py`.
+- `scripts/blorp-cli-embedded-manifest` records what an installed `bin/blorp` was
+  built from; the Makefile uses it to decide whether to reinstall.
+- `scripts/split-generated-c <generated.c> <out_dir> -n N` splits the compiler's
+  generated C into a shared header and N translation units that the Makefile
+  compiles in parallel (`BLORP_CLI_C_SPLIT`).
+- `scripts/with-build-lock COMMAND...` serializes build/test gates per worktree
+  (`scripts/test` and `scripts/premerge-gate` use it) so concurrent runs do not
+  race on generated caches. It uses `flock`, or a POSIX file lock in
+  `scripts/with-build-lock-fcntl` where `flock` is missing.
+- `make install` builds with the pinned release's `blorp compile`. Local builds
+  compile generated compiler C at `-O0`; `BLORP_CLI_C_OPTIMIZATION` selects the
+  level (CI and releases use `-O2`) and `BLORP_CLI_RUNTIME_C_OPTIMIZATION` the
+  runtime object's. `make generate-blorp-cli-c`, `prepare-blorp-cli-runtime`,
+  `prepare-blorp-cli-c`, `compile-prepared-blorp-cli` and
+  `install-prepared-blorp-cli` run the phases separately, as CI does.
+- `scripts/blorp-compiler-bootstrap` reads the release identity and per-target
+  checksums from `blorp/build/bootstrap.env`, downloads and verifies the release
+  into `$HOME/.cache/blorp/compiler-bootstrap` (or
+  `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`). Rotate the tag, version and all target
+  checksums together, only after release CI has published the merged revision.
+  `--print-id|tag|path|toolchain-dir` print the resolved values.
+
+### Compiler fixpoint
+
+`scripts/compiler-fixpoint` builds stage 2 from stage 1's C and stage 3 from
+stage 2's C (via `benchmarks/build_stage2_compiler`) and requires stage 2 and
+stage 3 to emit byte-identical C; a difference means the compiler miscompiled
+itself, and the first differing line is printed. Run it for every change that
+alters emitted C, before a bootstrap rotation picks it up. It needs a `FRESH`
+`bin/blorp` and keeps stages under `blorp/build/_build/fixpoint/` (or
+`--work-dir`). Exit status is 0 at a fixpoint, 1 when the stages differ, 2 when a
+stage could not be built.
+
+## Static and hygiene checks
+
+`make quality` runs `hygiene-check`, `tooling-check`, `artifact-scan` and
+`c-static-analysis`; the premerge gate and CI's Quality lane run it.
+
+- `make hygiene-check` is the seconds-long static set: layout, editor drift,
+  the C-symbol boundary, manifests, std builtins, the identity census and
+  magic spellings.
+- `make tooling-check` holds the stage-2 self-compile C-symbol leak check and
+  the Python and shell suites that test the scripts, build, runtime harnesses
+  and parity tooling.
+- `make benchmark-tooling-check` holds the benchmark-worker `check` runs and the
+  suites that test benchmark and measurement scripts. Only the premerge gate
+  runs it, and only when a change touches an input of those suites.
+- `make artifact-scan` fails on stray generated files the suites left behind.
+- `make c-static-analysis` runs `scripts/c-static-analysis`, which skips the
+  clang analysis (about four minutes) when a passing run's stamp exists for the
+  same sources, headers, clang version and flags. Stamps live in
+  `$BLORP_QUALITY_CACHE_DIR` (default `blorp/build/_build/quality-cache`); a
+  failing run writes none.
+
+The individual checks:
+
+- `scripts/check-blorp-layout` validates `blorp/source_ownership.json` against
+  `blorp/src` and `blorp/test`: owner roots, permitted cross-owner imports, the
+  isolated `compiler_new` test tree, forbidden top-level paths, and that test
+  modules mirror the source layout and are named `test_*`.
+- `scripts/check-editor-drift` verifies that the shared VSCode and IntelliJ
+  TextMate metadata stay byte-identical, parse as JSON, and keep the plugin's
+  required registrations.
+- `scripts/check-c-symbol-projection-boundary` fails when a `.brp` file other
+  than the backend emitter and its renderer test uses the unprojected C
+  emission APIs (`*_unprojected_*_for_tests`).
+- `scripts/check-c-symbol-projection-self-compile` stage-2 self-compiles
+  `blorp/src/main.brp` with `bin/blorp` and fails if the emitted C still
+  spells a type by its pre-projection qualified name. It needs a built
+  `bin/blorp` and costs a full self-compile.
+- `scripts/check-std-builtins` verifies that standalone standard-library
+  builtin bodies use explicit identities matching their declaration (for
+  example `builtin("list.__unsafe_list_set_index")`), and that every
+  non-resource builtin type has exactly one storage classification in the
+  language-surface manifest.
+- `scripts/compiler-identity-census --check` and
+  `scripts/check-magic-spellings --strict` are non-increase ratchets for the
+  identity migration: category budgets in
+  `scripts/compiler-identity-census-baseline.json`, and an allowlist of
+  prefix/suffix/name-shape reads in `scripts/check-magic-spellings.allowlist`.
+  `--write-baseline PATH` and `--update` regenerate them for a reviewed change.
+- `blorp lint <file.brp|dir>` is the report-only typed analyzer (see
+  `docs/LINT.md`).
+
+## Release helpers
+
+- `scripts/target-triple` prints the release target for this machine:
+  `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`
+  or `x86_64-apple-darwin`.
+- `scripts/package-release dist` copies `bin/blorp` to the target-qualified
+  asset `blorp-<target>`. `BLORP_RELEASE_BINARY` selects the binary and
+  `BLORP_RELEASE_TARGET` overrides the target in the asset name. That binary can
+  later become the bootstrap compiler.
+- `scripts/install-dev` downloads, validates and atomically installs the latest
+  moving `dev` release as `$HOME/.local/bin/blorp` (the only public command),
+  rejecting invalid executables before installation and removing private
+  helpers left by older releases. It accepts `--print-url`,
+  `--install-dir DIR` and `BLORP_INSTALL_DIR`.
+
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/kablorp/blorp/main/scripts/install-dev | bash
+  ```
+
+- `scripts/test-tls-openssl-local` is a manual check of the opt-in OpenSSL TLS
+  backend (`BLORP_TLS_BACKEND=openssl`) against a local self-signed endpoint. It
+  needs host OpenSSL headers and libraries plus the `openssl` command, so no
+  gate runs it.
+
+On main, CI builds the compiler once per platform with its final dev release
+metadata, runs the test gates in independent jobs, and the dev release workflow
+publishes those exact bytes. Explicit `v*` tags build independently, because the
+tagged version embedded in the executable differs. `docs/RELEASES.md` has the
+preview and release procedure.

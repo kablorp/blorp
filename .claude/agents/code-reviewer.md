@@ -26,9 +26,8 @@ Start from the repository's own standards, not from memory:
 
 - `AGENTS.md`: the language principles, the tie-break rules "For Agents", the naming
   rules and the development rules.
-- The architecture and roadmap documents for the area the change touches. Find them
-  through `docs/README.md`. Where a roadmap tracks intermediate states or deletion
-  steps, check that the change follows it and updates it.
+- The architecture and design documents for the area the change touches, found
+  through `docs/README.md`; for `blorp_2/`, its `AGENTS.md` principles.
 - Existing precedent in the surrounding code for naming, error style and structure.
 
 When the documents and the code disagree, say so as a finding.

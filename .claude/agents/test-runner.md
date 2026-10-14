@@ -23,15 +23,25 @@ need. You report results; you do not fix anything.
 
 ## Choose the gates from the repository
 
-Do not rely on a remembered list. Each time:
+The default is the focused suites that own the change, not the long gates. Do not
+rely on a remembered list. Each time:
 
-1. Read the task table in `AGENTS.md`, `scripts/README.md` and `docs/DEVELOPMENT.md`
-   to find which checks own the files the change touches, and which broader gates
-   that kind of change calls for.
-2. If the repository provides a tool that selects checks for a change, use it and
-   read its plan.
-3. Run the narrow owning checks first, then the broader gates.
-4. If the documents and the scripts disagree, say so rather than guess.
+1. Read the task table in `AGENTS.md`, `scripts/README.md` ("Validating a change")
+   and `docs/DEVELOPMENT.md` to find which checks own the files the change
+   touches.
+2. Run `scripts/compiler-check --changed --plan` and read its plan; it names the
+   owning suites, special checks and recommended `scripts/test` gates. An empty
+   plan is not a validation: pick the checks the task table gives for that kind of
+   change (docs, build, release, scripts).
+3. Run the narrow owning suites first, then only the `scripts/test` gates the plan
+   or the task table recommends.
+4. For a change under `blorp_2/`, run `make -C blorp_2 test`; no script gate covers
+   that tree.
+5. Do not run the Docker premerge gate (`scripts/docker-gate --premerge-gate`),
+   `scripts/premerge-gate` or a full `scripts/compiler-check` unless the caller
+   asks for it. They are optional, for preview and release validation or on
+   request.
+6. If the documents and the scripts disagree, say so rather than guess.
 
 Record which gates you ran, which you skipped, and why.
 

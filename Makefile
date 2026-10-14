@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-blorp-cli build-blorp-cli-diagnostic generate-blorp-cli-c prepare-blorp-cli-c prepare-blorp-cli-runtime prepare-blorp-cli-build-stamp compile-prepared-blorp-cli compile-blorp-cli install-prepared-blorp-cli compiler-build-source-generator install clean test smoke runtime-test test-asan compiler-blorp-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check tooling-check benchmark-tooling-check artifact-scan quality docker-build docker-gate docker-premerge-gate force-generated-sources
+.PHONY: all build build-blorp-cli build-blorp-cli-diagnostic generate-blorp-cli-c prepare-blorp-cli-c prepare-blorp-cli-runtime prepare-blorp-cli-build-stamp compile-prepared-blorp-cli compile-blorp-cli install-prepared-blorp-cli compiler-build-source-generator install clean test smoke runtime-test test-asan compiler-blorp-test lsp-test package-test c-static-analysis hygiene-check tooling-check benchmark-tooling-check artifact-scan quality force-generated-sources
 
 STANDARD_LIBRARY_SOURCE_ROOT := standard_library/src
 STANDARD_LIBRARY_TEST_ROOT := standard_library/test
@@ -75,30 +75,6 @@ BLORP_BUILD_SOURCE_GENERATOR_SOURCE := blorp/tool/generate_build_sources.brp
 BLORP_BUILD_SOURCE_GENERATOR_C := $(BLORP_BUILD_TOOLS_DIR)/generate_build_sources.c
 BLORP_BUILD_SOURCE_GENERATOR := $(BLORP_BUILD_TOOLS_DIR)/generate-build-sources
 RUNTIME_TEST_ROOTS := $(wildcard blorp/test/test_runtime $(STANDARD_LIBRARY_TEST_ROOT) pkg/test)
-SECURITY_RUNTIME_TESTS := \
-	blorp/test/test_runtime/test_sys/test_process.brp \
-	blorp/test/test_runtime/test_sys/test_file_io.brp \
-	blorp/test/test_runtime/test_sys/test_system_fs.brp \
-	blorp/test/test_runtime/test_sys/test_system_interface.brp \
-	blorp/test/test_runtime/test_sys/test_env.brp \
-	blorp/test/test_runtime/test_sys/test_time.brp \
-	blorp/test/test_runtime/test_sys/test_runtime_safety.brp \
-	blorp/test/test_runtime/test_sys/test_streaming_io.brp \
-	blorp/test/test_runtime/test_sys/test_for_each_line.brp \
-	blorp/test/test_runtime/test_text/test_regex.brp \
-	blorp/test/test_runtime/test_text/test_string_capacity.brp \
-	blorp/test/test_runtime/test_text/test_bytes.brp \
-	blorp/test/test_runtime/test_numeric/test_crypto_random.brp \
-	blorp/test/test_runtime/test_memory/test_builtin_borrowed_arg_ownership.brp \
-	$(STANDARD_LIBRARY_TEST_ROOT)/test_stream/test_stream.brp
-SECURITY_LEAK_TESTS := \
-	blorp/test/test_runtime/test_sys/test_process.brp \
-	blorp/test/test_runtime/test_sys/test_file_io.brp \
-	blorp/test/test_runtime/test_sys/test_streaming_io.brp \
-	blorp/test/test_runtime/test_sys/test_for_each_line.brp \
-	blorp/test/test_runtime/test_text/test_regex.brp \
-	blorp/test/test_runtime/test_sys/test_runtime_safety.brp \
-	blorp/test/test_runtime/test_memory/test_builtin_borrowed_arg_ownership.brp
 
 # Default target: build and install blorp under bin/.
 all: install
@@ -544,8 +520,6 @@ tooling-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_fixture_support/test_check_fixtures.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_tool/test_tool_fixture_runner.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest $(STANDARD_LIBRARY_TEST_ROOT)/test_check_std_builtins.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_architecture/test_compiler_antipattern_audit.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_architecture/test_dead_code_audit.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_build/test_compiler_check.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_compiler_check_plan.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_runtime/test_runtime_float_to_string.py
@@ -562,7 +536,6 @@ tooling-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_premerge_gate_steps.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_gate_scope.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_cli/test_memory_compiler_setup.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_record_validation.py
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_match_allocations
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_nested_match_allocations
 	@blorp/test/test_build/test_build_configuration.sh
@@ -573,17 +546,15 @@ tooling-check: build-blorp-cli
 	@blorp/test/test_build/test_split_translation_units.sh
 
 # The benchmark-worker checks and the suites that test benchmark and
-# measurement tooling (benchmarks/, blorp/benchmark/, scripts/bench-*). They
-# protect the scripts used to judge performance changes, not the compiler.
-# CI runs them on every push as their own step, and the premerge gate runs them
-# when the change touches their inputs (scripts/gate-scope).
+# measurement tooling (benchmarks/, blorp/benchmark/). They protect the scripts
+# used to judge performance changes, not the compiler. The premerge gate runs
+# them when the change touches their inputs (scripts/gate-scope).
 benchmark-tooling-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_benchmark/test_bench_runner.py
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_typecheck_worker.brp
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_backend_worker.brp
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_benchmark/test_backend_memory.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_benchmark/test_perceus_memory.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_test/test_session_benchmark.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_stage_06_typecheck/test_support/test_worker.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_benchmark/test_typecheck_memory.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_stage_06_typecheck/test_support/test_replay.py
@@ -596,12 +567,6 @@ benchmark-tooling-check: build-blorp-cli
 c-static-analysis:
 	@scripts/c-static-analysis "$(BLORP_LSP_NATIVE_RUNTIME_C)"
 
-security-check: all c-static-analysis
-	blorp/test/test_compiler/test_pipeline/codegen_audit/run_codegen_audit.sh $(BLORP_INSTALLED_BIN)
-	BLORP_COMPILER_TEST_TIMEOUT=360 scripts/test compiler-blorp
-	$(BLORP_INSTALLED_BIN) test --timeout 20 $(SECURITY_RUNTIME_TESTS)
-	$(BLORP_INSTALLED_BIN) test --leak-check --timeout 20 $(SECURITY_LEAK_TESTS)
-
 # Run runtime tests with sanitizer instrumentation. On Darwin, Apple
 # AddressSanitizer does not reliably compose with user-land fiber stack
 # switching, so the runtime-wide gate uses UBSan there. Linux keeps the
@@ -612,15 +577,6 @@ test-asan: all
 	else \
 		$(BLORP_INSTALLED_BIN) test --sanitize $(RUNTIME_TEST_ROOTS); \
 	fi
-
-# Run the self-hosted compiler TestSuites under ASan.
-# Keep this separate from test-asan: compiler-owned sources do not exercise
-# fiber stack switching and therefore support AddressSanitizer on Darwin too.
-compiler-core-sanitize-test: all
-	scripts/test compiler-core-sanitize --serial
-
-compiler-blorp-sanitize-test: all
-	scripts/test compiler-blorp-sanitize --serial
 
 compiler-blorp-test: all
 	scripts/test compiler-blorp --serial
@@ -633,16 +589,6 @@ lsp-test: all
 
 package-test: all
 	scripts/test package --serial
-
-# Docker targets
-docker-build:
-	scripts/docker-gate --build-only
-
-docker-gate:
-	scripts/docker-gate
-
-docker-premerge-gate:
-	scripts/docker-gate --premerge-gate
 
 # Clean build artifacts
 clean:

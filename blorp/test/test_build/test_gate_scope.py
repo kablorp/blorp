@@ -29,11 +29,10 @@ def load_gate_scope():
 gate_scope = load_gate_scope()
 Scope = gate_scope.Scope
 BenchmarkTooling = gate_scope.BenchmarkTooling
-POLICY_INPUTS = gate_scope.benchmark_policy_inputs(ROOT)
 
 
 def classify(paths, full_requested=False):
-	return gate_scope.classify(paths, POLICY_INPUTS, full_requested)
+	return gate_scope.classify(paths, full_requested)
 
 
 class ClassifyTest(unittest.TestCase):
@@ -56,14 +55,8 @@ class ClassifyTest(unittest.TestCase):
 		touched = [
 			"benchmarks/bench_runner.py",
 			"blorp/benchmark/compiler/compiler_typecheck_worker.brp",
-			"scripts/bench-blorp-test-session",
-			"scripts/with-build-lock",
-			"blorp/src/test/session.brp",
 			"blorp/src/compiler/stage_09_core/perceus.brp",
 			"blorp/test/test_compiler/test_benchmark/test_backend_memory.py",
-			"blorp/test/test_test/test_session_benchmark.py",
-			"standard_library/src/bytes.brp",
-			"blorp/test/test_runtime/test_types/test_bool.brp",
 		]
 		for path in touched:
 			with self.subTest(path=path):
@@ -111,11 +104,6 @@ class RuleReferencesExistTest(unittest.TestCase):
 		for path in sorted(gate_scope.BENCHMARK_TOOLING_PATHS):
 			with self.subTest(path=path):
 				self.assertTrue((ROOT / path).exists(), f"{path} is named by the rules but does not exist")
-
-	def test_every_benchmark_policy_input_exists(self) -> None:
-		for path in POLICY_INPUTS:
-			with self.subTest(path=path):
-				self.assertTrue((ROOT / path).exists(), f"{path} is a policy input but does not exist")
 
 
 class ChangedPathsTest(unittest.TestCase):
@@ -175,11 +163,6 @@ class ChangedPathsTest(unittest.TestCase):
 		self.assertEqual(paths, ["docs/new.md"])
 
 	def test_script_prints_the_scope_for_a_documentation_change(self) -> None:
-		policy = self.repo / gate_scope.BENCHMARK_POLICY
-		policy.parent.mkdir(parents=True, exist_ok=True)
-		policy.write_text('{"workloads": {}}\n', encoding="utf-8")
-		self.git("add", gate_scope.BENCHMARK_POLICY)
-		self.git("commit", "-q", "-m", "policy")
 		self.mark_origin_main()
 		self.commit("docs/new.md", "new\n")
 		self.commit("README.md", "readme\n")

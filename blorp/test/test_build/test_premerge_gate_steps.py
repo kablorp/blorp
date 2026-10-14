@@ -54,9 +54,6 @@ class PremergeGateStepsTest(unittest.TestCase):
 		self.write_executable(audit / "run_codegen_audit.sh", FAKE_BLORP)
 		for name in ("premerge-gate", "gate-scope"):
 			shutil.copy(ROOT / "scripts" / name, self.repo / "scripts" / name)
-		policy = self.repo / "benchmarks/blorp_test_session_policy.json"
-		policy.parent.mkdir()
-		shutil.copy(ROOT / "benchmarks/blorp_test_session_policy.json", policy)
 		(self.repo / "examples").mkdir()
 		(self.repo / "README.md").write_text("scratch\n", encoding="utf-8")
 		for command in (

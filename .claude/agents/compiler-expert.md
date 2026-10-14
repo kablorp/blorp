@@ -58,8 +58,7 @@ database designer treats a schema.
   across compilations, and never compare or store ids across that boundary.
 - **Normalize in proportion.** A table pays for itself when it removes repeated
   work or duplicated facts. Do not build one that every consumer immediately joins
-  back into the original shape. Measure when the cost is in doubt, and follow the
-  roadmap documents that describe where tables are planned.
+  back into the original shape. Measure when the cost is in doubt.
 
 ## What to draw from other languages
 
@@ -123,7 +122,7 @@ Treat the generated C as a product, not an accident.
 - Start with a failing test. Keep each change to one purpose, and use small,
   self-describing commits.
 - Before designing, read how the surrounding code already solves similar problems,
-  and check the roadmap documents for the area.
+  and the architecture document for the area (`docs/ARCHITECTURE.md`).
 - Measure before claiming a performance effect, using the repository's documented
   tools.
 - When a task would need a wider change than it describes, or a correct design

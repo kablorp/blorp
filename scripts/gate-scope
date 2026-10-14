@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
-import json
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -44,34 +43,26 @@ ROOT = Path(__file__).resolve().parent.parent
 # that scripts/docker-gate pushes (REMOTE_BASE_REF).
 DEFAULT_BASE_REFS = ("origin/main", "refs/blorp-docker-gate-base/main")
 
-BENCHMARK_POLICY = "benchmarks/blorp_test_session_policy.json"
-
 # A path is documentation when it matches one of these fnmatch patterns
 # (`*` also crosses `/`).
 DOCUMENTATION_PATH_RULES = ("*.md", "docs/*")
 
-# Inputs of `make benchmark-tooling-check` that are not named by the benchmark
-# policy: fnmatch patterns, then exact paths. Every input those suites read must
-# be matched here, so that a change that can turn them red runs them in the
-# gate. Recorded measurements under benchmarks/results/ are data, not tooling.
+# Inputs of `make benchmark-tooling-check`: fnmatch patterns, then exact paths.
+# Every input those suites read must be matched here, so that a change that can
+# turn them red runs them in the gate. Recorded measurements under
+# benchmarks/results/ are data, not tooling.
 # This is the rule scripts/land applied before it stopped running gates
 # (commit 50ad63f96), with the paths the repository uses now.
 BENCHMARK_RESULTS_PREFIX = "benchmarks/results/"
 BENCHMARK_TOOLING_PATH_RULES = (
-    # The benchmark scripts and workers, and the compiler's test session that
-    # the session benchmark runs.
+    # The benchmark scripts and workers.
     "benchmarks/*",
     "blorp/benchmark/*",
-    "scripts/bench-*",
-    "blorp/src/test/*",
     # The tests of the tooling themselves.
     "blorp/test/test_compiler/test_benchmark/*",
 )
 BENCHMARK_TOOLING_PATHS = frozenset(
     {
-        # Wrappers that the session benchmark tests drive.
-        "scripts/with-build-lock",
-        "scripts/with-compiler-contention-lease",
         # Compiler modules the benchmark workers and request generator import,
         # and the Core IR tags the Perceus benchmark vocabulary tracks.
         "blorp/src/compiler/bridge_protocol.brp",
@@ -85,17 +76,11 @@ BENCHMARK_TOOLING_PATHS = frozenset(
         "blorp/src/lib/build_artifact.brp",
         "blorp/src/lib/function_profile.brp",
         # Test files outside test_benchmark/ that the Makefile target runs.
-        "blorp/test/test_test/test_session_benchmark.py",
         "blorp/test/test_compiler/test_stage_06_typecheck/test_support/test_worker.py",
         "blorp/test/test_compiler/test_stage_06_typecheck/test_support/test_replay.py",
         "blorp/test/test_build/test_memory_diagnostics_harness.py",
     }
 )
-
-# The compiler-suite baseline fingerprints the whole compiler test tree, which
-# no benchmark-tooling suite runs and which changes in nearly every compiler
-# change, so it is not an input here.
-POLICY_INPUT_NOT_TOOLING = "blorp/test/test_compiler"
 
 
 class Scope(Enum):
@@ -123,14 +108,12 @@ def is_documentation(path: str) -> bool:
     return any(fnmatch.fnmatchcase(path, rule) for rule in DOCUMENTATION_PATH_RULES)
 
 
-def is_benchmark_tooling_input(path: str, policy_inputs: tuple[str, ...]) -> bool:
+def is_benchmark_tooling_input(path: str) -> bool:
     if path.startswith(BENCHMARK_RESULTS_PREFIX):
         return False
     if path in BENCHMARK_TOOLING_PATHS:
         return True
-    if any(fnmatch.fnmatchcase(path, rule) for rule in BENCHMARK_TOOLING_PATH_RULES):
-        return True
-    return any(path == item or path.startswith(item + "/") for item in policy_inputs)
+    return any(fnmatch.fnmatchcase(path, rule) for rule in BENCHMARK_TOOLING_PATH_RULES)
 
 
 def forced_full(reason: str) -> Classification:
@@ -139,7 +122,6 @@ def forced_full(reason: str) -> Classification:
 
 def classify(
     changed_paths: list[str] | None,
-    policy_inputs: tuple[str, ...],
     full_requested: bool,
 ) -> Classification:
     """`changed_paths` is None when the merge base could not be determined."""
@@ -153,7 +135,7 @@ def classify(
     if all(is_documentation(path) for path in changed_paths):
         return Classification(Scope.DOCS_ONLY, BenchmarkTooling.SKIP, f"docs-only ({count} paths)")
     first_tooling_path = next(
-        (path for path in changed_paths if is_benchmark_tooling_input(path, policy_inputs)),
+        (path for path in changed_paths if is_benchmark_tooling_input(path)),
         None,
     )
     if first_tooling_path is not None:
@@ -167,17 +149,6 @@ def classify(
         BenchmarkTooling.SKIP,
         f"full ({count} paths; benchmark tooling untouched)",
     )
-
-
-def benchmark_policy_inputs(root: Path) -> tuple[str, ...]:
-    """Repository inputs the benchmark policy fingerprints, from the policy file."""
-    policy = json.loads((root / BENCHMARK_POLICY).read_text(encoding="utf-8"))
-    inputs = []
-    for workload in policy["workloads"].values():
-        for path in workload.get("fingerprint_inputs", []):
-            if path != POLICY_INPUT_NOT_TOOLING:
-                inputs.append(path)
-    return tuple(inputs)
 
 
 def git_lines(root: Path, *args: str) -> list[str] | None:
@@ -232,7 +203,7 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     base_refs = tuple(args.base_refs) if args.base_refs else DEFAULT_BASE_REFS
     paths = None if args.full else changed_paths(args.root, base_refs)
-    result = classify(paths, benchmark_policy_inputs(args.root), args.full)
+    result = classify(paths, args.full)
     print(f"scope={result.scope.value}")
     print(f"benchmark_tooling={result.benchmark_tooling.value}")
     print(f"summary={result.summary}")

@@ -31,8 +31,6 @@ class BuildLockTest(unittest.TestCase):
         self.environment.update(
             PATH=str(tool_directory),
             BLORP_BUILD_LOCK_BASE=str(self.base / "build-locks"),
-            BLORP_COMPILER_CONTENTION_LOCK_BASE=str(self.base / "contention"),
-            BLORP_COMPILER_CONTENTION_ALLOW_TEST_OVERRIDE="1",
         )
 
     def run_locked(self, *command, timeout=5):
