@@ -349,3 +349,30 @@ Thus Box[T] does fixed written work while Marker[Values[T]] still rejects Int.
 No cache, extra substitution walk, proof carrier or constraint solver is needed.
 The ceiling remains unchanged, and this remedy requires fresh native and matched
 cost evidence before admission can be accepted.
+
+## Specialization preparation contract
+
+A separate compiler expert found no valid-source unprepared-instance failure.
+Parameter types come from prepared signatures; local/var types come from their
+prepared initializers; payload captures come from the complete prepared scrutinee
+layout; whole captures have that scrutinee type; projections collect their step
+types; generic request arguments are prepared before enqueueing. The existing
+unused nested-payload test already covers required layout closure. This does not
+justify replacing specialization's passes without a demonstrated gap.
+
+One missing test now exercises an unused whole capture of an inline owning generic union
+containing another String-owning generic union. It asserts complete child-first
+layouts, absence of phantom runtime fields, exactly three reachable instances,
+and the published binding's identity/type/origin/span despite no arm read.
+This adds 60 test lines and no production changes.
+
+The unchanged-producer owning suite passes 8 callbacks (`whole-capture-green`).
+Changing only copied checking's whole-capture type to Void makes exactly the new
+callback fail (`whole-capture-mutation`); byte-for-byte restoration passes
+(`whole-capture-restored`). Receipts, hashes, bounded source map and excerpts are
+retained in `build/authority-fixes/whole-capture-handback.md` and
+`preparation-review.md`. The active source was untouched during that oracle.
+An independent compiler expert approved both the test and all three receipts
+with zero findings. General List[Nominal] will require recursive element-layout
+preparation when that separate capability is introduced; current List[String]
+does not have that dependency.
