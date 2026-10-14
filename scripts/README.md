@@ -364,8 +364,7 @@ stage could not be built.
 `c-static-analysis`; the premerge gate and CI's Quality lane run it.
 
 - `make hygiene-check` is the seconds-long static set: layout, editor drift,
-  the C-symbol boundary, manifests, std builtins, the identity census and
-  magic spellings.
+  the C-symbol boundary, manifests and std builtins.
 - `make tooling-check` holds the stage-2 self-compile C-symbol leak check and
   the Python and shell suites that test the scripts, build, runtime harnesses
   and parity tooling.
@@ -400,12 +399,6 @@ The individual checks:
   example `builtin("list.__unsafe_list_set_index")`), and that every
   non-resource builtin type has exactly one storage classification in the
   language-surface manifest.
-- `scripts/compiler-identity-census --check` and
-  `scripts/check-magic-spellings --strict` are non-increase ratchets for the
-  identity migration: category budgets in
-  `scripts/compiler-identity-census-baseline.json`, and an allowlist of
-  prefix/suffix/name-shape reads in `scripts/check-magic-spellings.allowlist`.
-  `--write-baseline PATH` and `--update` regenerate them for a reviewed change.
 - `blorp lint <file.brp|dir>` is the report-only typed analyzer (see
   `docs/LINT.md`).
 

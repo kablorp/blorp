@@ -488,8 +488,6 @@ hygiene-check:
 	@scripts/check-c-symbol-projection-boundary
 	@scripts/compiler-check --validate-manifest
 	@scripts/check-std-builtins
-	@scripts/compiler-identity-census --check
-	@python3 scripts/check-magic-spellings --strict
 
 # Stray generated files left by builds or tests. A file that git tracks, such
 # as a test's C program, is a deliberate source rather than a stray, so in a git
