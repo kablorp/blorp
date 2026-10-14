@@ -3554,7 +3554,7 @@ Additional runtime and native-build controls are:
 | `BLORP_FIBER_OBJECT_CACHE_COUNT` | Maximum cached dead fiber handles; `0` disables |
 | `BLORP_OPENSSL_CFLAGS` | C compiler flags for the OpenSSL TLS backend |
 | `BLORP_OPENSSL_LIBS` | Linker flags for the OpenSSL TLS backend |
-| `BLORP_PACKAGE_CACHE` | Source-package cache root |
+| `BLORP_PACKAGE_CACHE` | Source-package cache root; default `$XDG_CACHE_HOME/blorp/packages`, else `$HOME/.cache/blorp/packages` |
 
 When OpenSSL flags are unset, the build queries `pkg-config`. Exact defaults
 remain runtime/build configuration and should be inspected through the owning

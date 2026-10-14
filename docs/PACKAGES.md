@@ -162,7 +162,8 @@ The package cache is content-addressed under:
 ~/.cache/blorp/packages/blake3/<first-16-hex>/
 ```
 
-Set `BLORP_PACKAGE_CACHE` to use a different cache root. Cache entries store the
+Set `BLORP_PACKAGE_CACHE` to use a different cache root, or `XDG_CACHE_HOME` to
+move the default base. Blank values count as unset. Cache entries store the
 full hash in `HASH`; if two full hashes ever collide on the same 16-character
 directory prefix, the cache reports the conflict instead of overwriting an
 existing package.
