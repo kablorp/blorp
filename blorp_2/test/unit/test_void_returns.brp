@@ -6,7 +6,7 @@ import:
 	../../src/lower as Lower
 	../../src/own as Own
 	../../src/assemble: parsed_contents
-	../../src/source: module_source, root_module_id, same_module
+	../../src/source: module_source, root_module_id, same_module, same_source
 	../../src/specialize as Concrete
 	../../src/syntax as Syntax
 	../../src/verify: verify
@@ -304,7 +304,7 @@ pure func test_pure_void_rejection_is_typed() -> Bool:
 		None: False
 
 
-pure func test_transitive_generic_pure_void_is_rejected_on_specialization() -> Bool:
+pure func test_transitive_generic_pure_void_reports_the_instantiating_call() -> Bool:
 	source: String =
 		|pure func identity[T](value: T) -> T:
 		|    value
@@ -316,8 +316,127 @@ pure func test_transitive_generic_pure_void_is_rejected_on_specialization() -> B
 		|
 	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
 		Err(error):
-			error.message == "pure functions cannot return Void" and error.help == "remove pure, or return a non-Void value" and error.span.start == 35 and error.span.end == 36
+			error.message == "pure functions cannot return Void" and error.help == "remove pure, or return a non-Void value" and error.span.start == 140 and error.span.end == 147
 		Ok(_): False
+
+
+pure func test_transitive_pure_void_ufcs_reports_the_concrete_receiver_call() -> Bool:
+	source: String =
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|func discard[T](value: T) -> Int:
+		|    saved = value.identity()
+		|    0
+		|func main() -> Int:
+		|    void.discard()
+		|
+	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
+		Err(error):
+			(
+				error.message == "pure functions cannot return Void"
+				and error.help == "remove pure, or return a non-Void value"
+				and error.span.start == 146 and error.span.end == 153
+			)
+		Ok(_): False
+
+
+pure func test_transitive_pure_void_preserves_the_outer_concrete_call_site() -> Bool:
+	source: String =
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|func discard[T](value: T) -> Int:
+		|    saved = identity(value)
+		|    0
+		|func forward[T](value: T) -> Int:
+		|    discard(value)
+		|func main() -> Int:
+		|    forward(void)
+		|
+	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
+		Err(error):
+			(
+				error.message == "pure functions cannot return Void"
+				and error.help == "remove pure, or return a non-Void value"
+				and error.span.start == 193 and error.span.end == 200
+			)
+		Ok(_): False
+
+
+pure func test_nongeneric_wrapper_does_not_replace_the_instantiating_call_site() -> Bool:
+	source: String =
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|func discard[T](value: T) -> Int:
+		|    saved = identity(value)
+		|    0
+		|func wrapper() -> Int:
+		|    discard(void)
+		|func main() -> Int:
+		|    wrapper()
+		|
+	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
+		Err(error):
+			(
+				error.message == "pure functions cannot return Void"
+				and error.help == "remove pure, or return a non-Void value"
+				and error.span.start == 143 and error.span.end == 150
+			)
+		Ok(_): False
+
+
+pure func test_hidden_symbolic_list_requirement_remains_guarded_in_specialization() -> Bool:
+	source: String =
+		|fixed union Values[T]:
+		|    Empty
+		|    Items(List[T])
+		|pure func make[T](value: T) -> Values[T]:
+		|    Empty
+		|func discard[T](value: T) -> Int:
+		|    saved = make(value)
+		|    0
+		|func main() -> Int:
+		|    discard(1)
+		|
+	match checked(source):
+		Err(_): False
+		Ok(program):
+			match Concrete.specialize(program):
+				Err(error):
+					(
+						error.message == "List currently supports only String elements"
+						and error.help == "use List[String]; other concrete element types are not supported yet"
+						and same_source(error.span.source, module_source(root_module_id()))
+						and error.span.start == 43 and error.span.end == 50
+						and error.note.is_none()
+					)
+				Ok(_): False
+
+
+pure func test_mixed_symbolic_arguments_retain_request_chain_root_provenance() -> Bool:
+	source: String =
+		|pure func identity[A, B](value: A, extra: B) -> A:
+		|    value
+		|func discard[A, B](value: A, extra: B) -> Int:
+		|    saved = identity(value, extra)
+		|    0
+		|func wrapper[T](extra: T) -> Int:
+		|    discard(void, extra)
+		|func main() -> Int:
+		|    wrapper(1)
+		|
+	match checked(source):
+		Err(_): False
+		Ok(program):
+			match Concrete.specialize(program):
+				Err(error):
+					(
+						error.message == "pure functions cannot return Void"
+						and error.help == "remove pure, or return a non-Void value"
+						and same_source(error.span.source, module_source(root_module_id()))
+						and error.span.start == 232 and error.span.end == 239
+						and error.note.is_none()
+					)
+				Ok(_): False
 
 
 pure func test_nullary_void_wrapper_discards_result_and_returns_zero() -> Bool:
@@ -525,7 +644,12 @@ tests: TestSuite = {
 		("discarded unknown name still checked", test_discarded_unknown_name_is_still_a_typed_error),
 		("discarded invalid argument still checked", test_discarded_invalid_argument_is_still_a_typed_error),
 		("pure Void error is typed", test_pure_void_rejection_is_typed),
-		("transitive pure Void rejected in specialization", test_transitive_generic_pure_void_is_rejected_on_specialization),
+		("transitive pure Void reports concrete call", test_transitive_generic_pure_void_reports_the_instantiating_call),
+		("transitive pure Void UFCS reports concrete call", test_transitive_pure_void_ufcs_reports_the_concrete_receiver_call),
+		("transitive pure Void preserves outer call", test_transitive_pure_void_preserves_the_outer_concrete_call_site),
+		("nongeneric wrapper preserves actual instantiating call", test_nongeneric_wrapper_does_not_replace_the_instantiating_call_site),
+		("hidden symbolic List requirement remains guarded", test_hidden_symbolic_list_requirement_remains_guarded_in_specialization),
+		("mixed symbolic arguments retain request chain root", test_mixed_symbolic_arguments_retain_request_chain_root_provenance),
 		("nullary Void wrapper returns zero", test_nullary_void_wrapper_discards_result_and_returns_zero),
 		("argv Void wrapper releases then returns zero", test_argv_void_wrapper_releases_arguments_before_returning_zero),
 		("ownership drops discarded managed union", test_ownership_drops_discarded_managed_union_result),

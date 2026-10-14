@@ -376,3 +376,65 @@ An independent compiler expert approved both the test and all three receipts
 with zero findings. General List[Nominal] will require recursive element-layout
 preparation when that separate capability is introduced; current List[String]
 does not have that dependency.
+
+## Admission component acceptance
+
+Known concrete record/union applications now reject their String-only List
+requirements during checking, even in unused signatures. The finite declaration
+walk freezes dense per-parameter requirements once. Generic call admission walks
+written signature structure paired with already-instantiated types; supplied
+parameters are terminal, including deeply nested types already accepted from
+children/context. No inference slots, second substitution walk or constraint
+solver escape. Declaration requirements use depth-first source order. Each
+request argument's caller-dependency fact is computed once for its diagnostic
+span and the request-chain origin; nongeneric callers skip that tree query.
+
+Void arguments and phantom parameters remain valid. Body-only constraints still
+become known during specialization; the retained List rejection points at its
+written field annotation. Late pure-Void diagnostics retain an instantiation
+chain's call origin, with documented mixed fixed/symbolic granularity rather
+than per-argument causal provenance. New nominal admission is child-first at
+freeze; existing direct List/pure-result readiness priority remains unchanged.
+These limitations are executable controls, not claims that a general generic
+constraint solver or argument-specific provenance was implemented.
+
+Final source `specialize.brp` is SHA-256
+`ee478f01031900af2ce4c77cc4b5664d6a827061c0cdd597f002195463292c6a`.
+Two independent compiler experts approved the complete code/test change with
+zero remaining findings. Production grows by 270 physical lines; tests grow by
+761, including 51 fixture/registration lines. Tests require typed errors plus
+exact message/help/source/span and separately exercise the requirement producer.
+The initial 18 failing cases became green; later source-order and nongeneric
+wrapper regressions were captured before their repairs. The initially wrong
+hidden-body call-span expectation was corrected only after a diagnostic probe;
+it is a deferred-behavior control, not another source bug fixed.
+
+Final focused suites pass 195 callbacks (`admission-fact-reuse-focused`); strict
+ASan/UBSan/leak unit/runtime/grammar passes 2,085 callbacks in 137 suites
+(`admission-accepted-strict`, 25.360s). Both receipts have no timeout or source
+drift. The e2e run built the compiler exactly once and passed 324/325 cases;
+the only failure was an updated test's off-by-one location, 3:23 versus actual
+3:24. Only that expectation changed. The complete direct-union group then passes
+11/11 against the same actual compiler and unchanged fixture mains
+(`admission-direct-union-e2e`). The original whole-e2e receipt remains red; a
+fresh complete combined e2e is still required after namespace integration.
+
+The actual e2e compiler, frozen as `admission-accepted-candidate/compiler`, is
+SHA-256 `82591956c1260f238d519c0a4319bdf1d6595ace1109ebd68c15dc3c7d02e662`;
+its C is `fef1d202060948d560a6d894a4390aab01fb88c15e28579fa424637250e800d3`.
+Against the original frozen a163 baseline, its final 216 samples/36 inputs are
+stable, strictly balanced and emit identical C. Maximum allocation increase is
+2.144281%; maximum minimum-instruction increase is 1.162158%, within the original
+5% ceiling and the 3% target (`admission-accepted-cost-receipt`, no source drift).
+Earlier intermediate green cost series are retained separately from this final
+source/executable evidence.
+
+A separate 24-sample proxy varies an unused generic record's List[T] fields over
+16/32/64/128. Added allocations are 189/238/335/528; maxima are 3.979% allocations
+and 2.309% instructions, within 5%, with balanced counts and identical C. This
+tests the unchanged worklist in the prior repaired binary, not the final whole
+compiler (`requirements-width`). Generated-C inspection independently shows
+consuming root transfer, no per-push root retain and geometric capacity reuse;
+it does not assert global compiler linearity. Raw inputs/samples and bounded C
+excerpts are retained with the admission handback. The rejected original
+superlinear supplied-type rescanning result remains documented above.

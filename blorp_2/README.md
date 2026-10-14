@@ -743,6 +743,23 @@ record layouts and recursively growing generic call substitutions reject before
 specialization expands them. Record-owned List[T] fields retain the current
 concrete List[String] limit.
 
+Checking validates concrete List requirements through every nested record and
+union application, including annotations on unused functions. A finite
+declaration walk records which parameters must be String once, then concrete
+annotations and inferred call signatures consult those requirements. Symbolic parameters
+remain valid until their concrete arguments are known. Phantom parameters impose
+no stored-field requirement, but their supplied types must still be valid.
+Void remains a valid type argument; the separate rule forbidding pure functions
+from returning Void still applies. When generic forwarding exposes that rule
+only during specialization, diagnostics retain a call-site origin per
+instantiation chain. Concrete written type arguments establish their own origin;
+caller-dependent arguments carry the outer origin. Mixed fixed and symbolic
+arguments can therefore retain an outer location. Argument-specific provenance
+remains future work. Requirements hidden only inside a generic function's body can still become
+known during specialization: the checker does not propagate body constraints
+through the generic call graph yet. Specialization retains that rejection guard
+at the aggregate field's written annotation.
+
 ## Grammar for this increment
 
 This specification defines only the examples' language: functions with an optional
@@ -1459,6 +1476,10 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    later siblings. Deferred descendants finish child-first after solving; a later
    fatal name error can precede their unresolved ambiguity. Publication freezes
    complete calls and discards the temporary solver.
+   Nominal requirements introduced by generic calls are checked child-first
+   during freezing; a later fatal name error can precede that new requirement
+   failure. Existing direct List and pure-result readiness checks retain their
+   established priority.
    [check.brp](src/check.brp) only composes these checks and seals their result;
    [check_model.brp](src/check_model.brp) owns published semantic data,
    [check_errors.brp](src/check_errors.brp) owns typed rejections, and

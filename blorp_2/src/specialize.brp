@@ -796,13 +796,13 @@ private pure func contains_parameter(value: Checked.TypeRef) -> Bool:
 
 
 private pure func request_span(
-	value: Checked.TypeRef,
+	depends_on_caller: Bool,
 	source: RequestSource,
 	fallback: Span,
 ) -> Span:
 	match source:
 		ConcreteRequest(span):
-			if contains_parameter(value):
+			if depends_on_caller:
 				span
 			else:
 				fallback
@@ -1256,6 +1256,7 @@ private pure func prepare_function(
 	)
 	var prepared = initial
 	var failure: Option[Diagnostic] = None
+	has_type_parameters = not function.signature.type_parameters.is_empty()
 
 	for written in function_types(function):
 		match prepare_type(
@@ -1263,7 +1264,7 @@ private pure func prepare_function(
 			substitution,
 			checked,
 			prepared.unions,
-			request_span(written.value_type, request.source, written.span),
+			request_span(has_type_parameters and contains_parameter(written.value_type), request.source, written.span),
 			prepared.records,
 		):
 			Ok(value):
@@ -1282,14 +1283,19 @@ private pure func prepare_function(
 					void
 				Checked.UserFunction(declaration, arguments):
 					var concrete: List[TypeRef] = []
+					var depends_on_caller = False
 
 					for argument in arguments:
+						-- One dependency fact serves both this argument's diagnostic
+						-- and the request chain. Nongeneric callers need no tree scan.
+						argument_depends_on_caller = has_type_parameters and contains_parameter(argument)
+						depends_on_caller = depends_on_caller or argument_depends_on_caller
 						match prepare_type(
 							argument,
 							substitution,
 							checked,
 							prepared.unions,
-							request_span(argument, request.source, call.span),
+							request_span(argument_depends_on_caller, request.source, call.span),
 							prepared.records,
 						):
 							Ok(value):
@@ -1311,11 +1317,16 @@ private pure func prepare_function(
 					}
 
 					if not find_instance(prepared.functions, key).is_some():
-						source = match request.source:
-							EntrypointRoot:
-								ConcreteRequest(call.span)
-							ConcreteRequest(span):
-								ConcreteRequest(span)
+						-- Preserve the root of a caller-dependent request chain.
+						-- This records one chain origin, not each argument's origin.
+						-- A call with already concrete arguments is its own origin,
+						-- even when a nongeneric wrapper led us to this body.
+						source = if depends_on_caller:
+							match request.source:
+								EntrypointRoot: ConcreteRequest(call.span)
+								ConcreteRequest(span): ConcreteRequest(span)
+						else:
+							ConcreteRequest(call.span)
 
 						prepared = { prepared | functions = prepared.functions.append({
 								key = key,
@@ -1732,13 +1743,13 @@ private pure func translate_exit(
 
 private pure func translate_function(
 	function: Checked.CheckedFunction,
-	key: InstanceKey,
+	request: FunctionRequest,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 ) -> Result[ConcreteFunction, Diagnostic]:
 	span = function.signature.return_type.span
-	substitution ?= instance_substitution(function.signature, key, span)
+	substitution ?= instance_substitution(function.signature, request.key, span)
 
 	parameters ?= translated_list(
 		function.signature.parameters,
@@ -1767,7 +1778,7 @@ private pure func translate_function(
 		same_purity(function.signature.purity, Pure)
 		and same_type(return_type, VoidType)
 	):
-		Err(pure_void_return(span))
+		Err(pure_void_return(request_span(contains_parameter(function.signature.return_type.value_type), request.source, span)))
 	else:
 		Ok(void)
 
@@ -1863,7 +1874,7 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
 			)
 		translate_function(
 			function,
-			request.key,
+			request,
 			prepared.functions,
 			prepared.unions,
 			prepared.records,

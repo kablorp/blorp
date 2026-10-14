@@ -240,12 +240,8 @@ pure func resolve_type(scope: TypeScope, written: TypeSyntax) -> Result[TypeRef,
 					match arguments:
 						[element]:
 							value ?= resolve_type(scope, element)
-
-							match value:
-								StringType | ParameterType(_):
-									Ok(ListType(value))
-								_:
-									Err(type_term_error(type_span(element), UnsupportedListElement))
+							valid ?= validate_list_element(value, type_span(element))
+							Ok(ListType(value))
 						_:
 							Err(type_term_error(span, ListTypeArgumentCount))
 				[RecordCandidate(owner)]:
@@ -647,12 +643,8 @@ pure func substitute_type(
 	match value_type:
 		ListType(element):
 			value ?= substitute_type(element, substitution, span)
-
-			match value:
-				StringType | ParameterType(_):
-					Ok(ListType(value))
-				_:
-					Err(type_term_error(span, UnsupportedListElement))
+			valid ?= validate_list_element(value, span)
+			Ok(ListType(value))
 		AppliedRecordType(owner, values):
 			arguments ?= substitute_types(values, substitution, span, [])
 			Ok(AppliedRecordType(owner, arguments))
@@ -689,10 +681,222 @@ private pure func substitute_types(
 			)
 
 
+-- Concrete List elements have one checking authority. Rigid parameters remain
+-- symbolic; specializing a caller may supply new facts about them later.
+pure func validate_list_element(element: TypeRef, span: Span) -> Result[Void, CheckError]:
+	match element:
+		StringType | ParameterType(_): Ok(void)
+		_: Err(type_term_error(span, UnsupportedListElement))
+
+
+private fixed record AdmissionContents {
+	records: List[List[Bool]],
+	unions: List[List[Bool]]
+}
+
+
+-- Checking-local, frozen after finite declaration validation. Each dense row
+-- marks the declaration parameters required to be String by a List field,
+-- directly or through another nominal declaration. Bodies never expand fields
+-- to recover these requirements, and the rows do not enter CheckedProgram.
+opaque type TypeAdmission = AdmissionContents
+
+
+pure func admit_type(value: TypeRef, admission: TypeAdmission, span: Span) -> Result[Void, CheckError]:
+	admit_instantiated_type(value, value, admission, span)
+
+
+-- Substitution preserves written structure. A supplied parameter replacement is
+-- terminal: its type was admitted by an annotation or child-first value freeze.
+-- A call introduces only its written List/nominal heads and their requirements.
+-- Walking the full replacement again would make nested Box[T] calls quadratic.
+pure func admit_instantiated_type(written: TypeRef, actual: TypeRef, admission: TypeAdmission, span: Span) -> Result[Void, CheckError]:
+	contents = from_opaque TypeAdmission(admission)
+	match written:
+		ListType(element):
+			match actual:
+				ListType(value):
+					child ?= admit_instantiated_type(element, value, admission, span)
+					validate_list_element(value, span)
+				_: Err(checker_invariant(span, InvalidDeclarationVisit))
+		AppliedRecordType(owner, arguments):
+			required ?= contents.records.get(record_number(owner)).to_result(checker_invariant(span, InvalidRecordDeclaration(owner)))
+			match actual:
+				AppliedRecordType(actual_owner, values):
+					if IntOps.equals(record_number(owner), record_number(actual_owner)):
+						admit_arguments(arguments, values, required, admission, span)
+					else:
+						Err(checker_invariant(span, InvalidDeclarationVisit))
+				_: Err(checker_invariant(span, InvalidDeclarationVisit))
+		AppliedUnionType(owner, arguments):
+			required ?= contents.unions.get(union_number(owner)).to_result(checker_invariant(span, InvalidUnionDeclaration(owner)))
+			match actual:
+				AppliedUnionType(actual_owner, values):
+					if IntOps.equals(union_number(owner), union_number(actual_owner)):
+						admit_arguments(arguments, values, required, admission, span)
+					else:
+						Err(checker_invariant(span, InvalidDeclarationVisit))
+				_: Err(checker_invariant(span, InvalidDeclarationVisit))
+		ParameterType(_):
+			Ok(void)
+		VoidType | IntType | FloatType | StringType | RecordType(_) | UnionType(_):
+			-- These written leaves contain no argument tree; equality is constant
+			-- work and rejects a malformed unchanged head without chasing actual T.
+			if same_type(written, actual):
+				Ok(void)
+			else:
+				Err(checker_invariant(span, InvalidDeclarationVisit))
+
+
+private pure func admit_arguments(written: List[TypeRef], actual: List[TypeRef], required: List[Bool], admission: TypeAdmission, span: Span) -> Result[Void, CheckError]:
+	var failure: Option[CheckError] = None
+	var position = 0
+	if not IntOps.equals(written.length(), actual.length()) or not IntOps.equals(written.length(), required.length()):
+		failure = Some(checker_invariant(span, InvalidDeclarationVisit))
+	for argument in written:
+		if failure.is_some():
+			break
+		match actual.get(position):
+			None:
+				failure = Some(checker_invariant(span, InvalidDeclarationVisit))
+				break
+			Some(value):
+				match admit_instantiated_type(argument, value, admission, span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(_): void
+				match required.get(position):
+					Some(True):
+						match validate_list_element(value, span):
+							Err(error): failure = Some(error)
+							Ok(_): void
+					Some(False): void
+					None: failure = Some(checker_invariant(span, InvalidDeclarationVisit))
+		position = IntOps.add(position, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+
+
 private fixed union DeclarationVisit:
 	UnvisitedDeclaration
 	VisitingDeclaration
-	CompleteDeclaration
+	CompleteDeclaration(List[Bool])
+
+
+private fixed union AdmissionWork:
+	InspectAdmission(TypeUse)
+	RequireString(TypeUse)
+
+
+private pure func push_admission_work(steps: List[AdmissionWork], depth: Int, step: AdmissionWork) -> List[AdmissionWork]:
+	if IntOps.less_than(depth, steps.length()):
+		steps.set(depth, step)
+	else:
+		steps.append(step)
+
+
+-- One local worklist and mark vector per declaration. Read completed child
+-- summaries, never expanded child field trees. Reverse pushes preserve declared
+-- field order and depth-first argument order even when nesting depths differ.
+-- Duplicate requirements set the same dense slot without a membership scan.
+private pure func declaration_requirements(
+	annotations: List[TypeUse],
+	parameters: List[TypeParameterId],
+	owner: TypeParameterOwner,
+	records: List[DeclarationVisit],
+	unions: List[DeclarationVisit],
+) -> Result[List[Bool], CheckError]:
+	var required = parameters.map(pure func(_): False)
+	var pending: List[AdmissionWork] = []
+	var pending_count = 0
+	var position = annotations.length()
+	var failure: Option[CheckError] = None
+	while IntOps.greater_than(position, 0) and not failure.is_some():
+		position = IntOps.subtract(position, 1)
+		match annotations.get(position):
+			Some(annotation):
+				match annotation.value_type:
+					ListType(_) | AppliedRecordType(_, _) | AppliedUnionType(_, _):
+						pending = push_admission_work(pending, pending_count, InspectAdmission(annotation))
+						pending_count = IntOps.add(pending_count, 1)
+					_: void
+			None: failure = Some(checker_invariant({ source = COMPILER_SOURCE, start = 0, end = 0 }, InvalidDeclarationVisit))
+	while IntOps.greater_than(pending_count, 0) and not failure.is_some():
+		pending_count = IntOps.subtract(pending_count, 1)
+		match pending.get(pending_count):
+			None: failure = Some(checker_invariant({ source = COMPILER_SOURCE, start = 0, end = 0 }, InvalidDeclarationVisit))
+			Some(RequireString(annotation)):
+				match validate_list_element(annotation.value_type, annotation.span):
+					Err(error): failure = Some(error)
+					Ok(_):
+						match annotation.value_type:
+							ParameterType(parameter):
+								if same_owner(parameter_owner(parameter), owner) and required.get(parameter_position(parameter)).is_some():
+									required = required.set(parameter_position(parameter), True)
+								else:
+									failure = Some(checker_invariant(annotation.span, InvalidParameterDeclaration(parameter)))
+							_: void
+			Some(InspectAdmission(annotation)):
+				match annotation.value_type:
+					ListType(element):
+						pending = push_admission_work(pending, pending_count, RequireString({ annotation | value_type = element }))
+						pending_count = IntOps.add(pending_count, 1)
+					AppliedRecordType(id, arguments):
+						match records.get(record_number(id)):
+							Some(CompleteDeclaration(marks)):
+								var index = arguments.length()
+								while IntOps.greater_than(index, 0) and not failure.is_some():
+									index = IntOps.subtract(index, 1)
+									match arguments.get(index):
+										None: failure = Some(checker_invariant(annotation.span, InvalidDeclarationVisit))
+										Some(argument):
+											match marks.get(index):
+												Some(True):
+													pending = push_admission_work(pending, pending_count, RequireString({ annotation | value_type = argument }))
+													pending_count = IntOps.add(pending_count, 1)
+												Some(False): void
+												None: failure = Some(checker_invariant(annotation.span, InvalidDeclarationVisit))
+											pending = push_admission_work(pending, pending_count, InspectAdmission({ annotation | value_type = argument }))
+											pending_count = IntOps.add(pending_count, 1)
+							_: failure = Some(checker_invariant(annotation.span, InvalidRecordDeclaration(id)))
+					AppliedUnionType(id, arguments):
+						match unions.get(union_number(id)):
+							Some(CompleteDeclaration(marks)):
+								var index = arguments.length()
+								while IntOps.greater_than(index, 0) and not failure.is_some():
+									index = IntOps.subtract(index, 1)
+									match arguments.get(index):
+										None: failure = Some(checker_invariant(annotation.span, InvalidDeclarationVisit))
+										Some(argument):
+											match marks.get(index):
+												Some(True):
+													pending = push_admission_work(pending, pending_count, RequireString({ annotation | value_type = argument }))
+													pending_count = IntOps.add(pending_count, 1)
+												Some(False): void
+												None: failure = Some(checker_invariant(annotation.span, InvalidDeclarationVisit))
+											pending = push_admission_work(pending, pending_count, InspectAdmission({ annotation | value_type = argument }))
+											pending_count = IntOps.add(pending_count, 1)
+							_: failure = Some(checker_invariant(annotation.span, InvalidUnionDeclaration(id)))
+					VoidType | IntType | FloatType | StringType | ParameterType(_) | RecordType(_) | UnionType(_): void
+	match failure:
+		Some(error): Err(error)
+		None: Ok(required)
+
+
+private pure func completed_requirements(visits: List[DeclarationVisit]) -> Result[List[List[Bool]], CheckError]:
+	var rows: List[List[Bool]] = []
+	var failure: Option[CheckError] = None
+	for visit in visits:
+		match visit:
+			CompleteDeclaration(required): rows = rows.append(required)
+			UnvisitedDeclaration | VisitingDeclaration:
+				failure = Some(checker_invariant({ source = COMPILER_SOURCE, start = 0, end = 0 }, InvalidDeclarationVisit))
+				break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(rows)
 
 
 private fixed union DeclarationVisitStep:
@@ -714,7 +918,7 @@ private pure func push_declaration_visit(
 
 pure func validate_finite_declarations(
 	declarations: CheckedDeclarations,
-) -> Result[Void, CheckError]:
+) -> Result[TypeAdmission, CheckError]:
 	-- These vectors stay in one local builder. Passing them through a shared
 	-- record would retain their old roots and copy the entire vector on set.
 	var records = declarations.records.map(pure func(_): UnvisitedDeclaration)
@@ -775,9 +979,24 @@ pure func validate_finite_declarations(
 			Some(step):
 				match step:
 					FinishRecordDeclaration(id):
-						records = records.set(record_number(id), CompleteDeclaration)
+						match declarations.records.get(record_number(id)):
+							None: failure = Some(checker_invariant({ source = COMPILER_SOURCE, start = 0, end = 0 }, InvalidRecordDeclaration(id)))
+							Some(declaration):
+								annotations = declaration.fields.map(pure func(field: CheckedField): field.value_type)
+								match declaration_requirements(annotations, declaration.type_parameters, RecordDeclaration(id), records, unions):
+									Ok(required): records = records.set(record_number(id), CompleteDeclaration(required))
+									Err(error): failure = Some(error)
 					FinishUnionDeclaration(id):
-						unions = unions.set(union_number(id), CompleteDeclaration)
+						match declarations.unions.get(union_number(id)):
+							None: failure = Some(checker_invariant({ source = COMPILER_SOURCE, start = 0, end = 0 }, InvalidUnionDeclaration(id)))
+							Some(declaration):
+								var annotations: List[TypeUse] = []
+								for variant in declaration.variants:
+									for field in variant.fields:
+										annotations = annotations.append(field)
+								match declaration_requirements(annotations, declaration.type_parameters, UnionDeclaration(id), records, unions):
+									Ok(required): unions = unions.set(union_number(id), CompleteDeclaration(required))
+									Err(error): failure = Some(error)
 					VisitDeclaredType(annotation):
 						match annotation.value_type:
 							VoidType | IntType | FloatType | StringType | ParameterType(_):
@@ -858,7 +1077,7 @@ pure func validate_finite_declarations(
 												InvalidRecordDeclaration(id),
 											),
 										)
-									Some(CompleteDeclaration):
+									Some(CompleteDeclaration(_)):
 										void
 									Some(VisitingDeclaration):
 										failure = Some(
@@ -920,7 +1139,7 @@ pure func validate_finite_declarations(
 												InvalidUnionDeclaration(id),
 											),
 										)
-									Some(CompleteDeclaration):
+									Some(CompleteDeclaration(_)):
 										void
 									Some(VisitingDeclaration):
 										failure = Some(
@@ -979,4 +1198,6 @@ pure func validate_finite_declarations(
 		Some(error):
 			Err(error)
 		None:
-			Ok(void)
+			record_rows ?= completed_requirements(records)
+			union_rows ?= completed_requirements(unions)
+			Ok(into_opaque TypeAdmission({ records = record_rows, unions = union_rows }))

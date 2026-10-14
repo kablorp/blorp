@@ -6,7 +6,7 @@ import:
 	./check_calls: FunctionContract, function_contract
 	./check_methods: ResolutionContext, ResolvedReceiver(ReceiverCandidates, UniqueReceiver), ReceiverCandidate, classify_receiver, contains_variant, lookup_target, receiver_expectation, method_sites, select_receiver_contract
 	./check_signatures: validate_pure_result
-	./check_types: find_field, occurrence_fields, previous_declaration
+	./check_types: TypeAdmission, admit_instantiated_type, find_field, occurrence_fields, previous_declaration, validate_list_element
 	./check_model:
 		BindingDefinition, BindingId, FieldId, CheckedBase(ReturnRecord, ReturnConstructedVariant, ReturnVoid, ReturnInteger, ReturnFloat, ReturnString, ReturnVariant, ReturnBinding, ReturnCall), CheckedRecord, CheckedField, CheckedOperation(InvokeFunction, ReadRecordField), CheckedRecordField, CheckedStep, CheckedValue, CheckedCall, TypeParameterId, TypeRef(VoidType, IntType, FloatType, StringType, ListType, RecordType, AppliedRecordType, UnionType, AppliedUnionType, ParameterType), TypeUse, UnionOccurrence, CallTarget(UserFunction), same_type, same_parameter, same_variant, field_number, parameter_position
 	./check_errors:
@@ -15,9 +15,9 @@ import:
 		CallError(ArgumentTypeMismatch, GenericArgumentConflict, UninferableTypeParameter, InfiniteTypeArgument, UnknownFunction, UncallableBinding),
 		ConstructorError(ConstructorNeedsExpectedType, VariantNotInExpectedType, PayloadFreeVariantCalled, ConstructorFieldCountMismatch),
 		RecordError(RecordNeedsExpectedType, UnknownRecordField, DuplicateLiteralField, MissingRecordField, RecordFieldTypeMismatch, FieldRequiresRecord),
-		ValueError(UnknownValue, ExpressionTypeMismatch), MethodError(MethodReceiverNeedsType), TypeTermError(UnsupportedListElement),
+		ValueError(UnknownValue, ExpressionTypeMismatch), MethodError(MethodReceiverNeedsType),
 		CheckerInvariant(InvalidCheckedUnion, InvalidRecordDeclaration, InvalidRecordField, GenericConstructorContract, InvalidInferenceVariable, InvalidInferenceWorklist, InvalidParameterDeclaration, MissingCallParameter, MissingGenericParameter, InvalidFunctionContract),
-		call_error, constructor_error, record_error, value_error, method_error, type_term_error, checker_invariant
+		call_error, constructor_error, record_error, value_error, method_error, checker_invariant
 	declarations: FunctionId, RecordId, UnionId, VariantId, record_number, union_number, variant_number
 	int as IntOps
 	names: NameId, same_name
@@ -307,13 +307,13 @@ private pure func finish_pending_record(plan: PlannedRecordLiteral, fields: List
 	Ok({ span = plan.span, readiness = readiness, base = PendingReturnRecord(plan.owner, fields), base_type = plan.value_type, base_span = plan.span, operations = NoPendingOperations })
 
 
-private pure func freeze_record_fields(fields: List[PendingRecordField], slots: List[InferenceSlot]) -> Result[List[CheckedRecordField], CheckError]:
+private pure func freeze_record_fields(fields: List[PendingRecordField], slots: List[InferenceSlot], admission: TypeAdmission) -> Result[List[CheckedRecordField], CheckError]:
 	var frozen: List[CheckedRecordField] = []
 	var failure: Option[CheckError] = None
 
 	-- All child errors precede ordinary field mismatches, including later children.
 	for field in fields:
-		match freeze_pending_value(field.value, slots):
+		match freeze_pending_value(field.value, slots, admission):
 			Ok(value): frozen = frozen.append({ field = field.field, value = value, span = field.value.span })
 			Err(error):
 				failure = Some(error)
@@ -554,15 +554,13 @@ private pure func admit_call_parameters(call: PendingCall, slots: List[Inference
 -- Called only after closed-child readiness and own-slot completion, or after
 -- child-first freeze and call publication. Rechecking completeness here
 -- would rescan every growing nested term without establishing another fact.
-private pure func validate_complete_arguments(call: PendingCall, actual: List[InferenceUse], slots: List[InferenceSlot]) -> Result[TypeRef, CheckError]:
-	parameters ?= admit_call_parameters(call, slots)
-	return_type ?= admit_call_type(call.contract.signature.return_type.value_type, call, slots, call.contract.span)
-	pure_result ?= validate_pure_result(call.contract.signature.purity, return_type, call.contract.span)
+private pure func validate_complete_arguments(contract: FunctionContract, parameters: List[TypeUse], return_type: TypeRef, actual: List[InferenceUse], slots: List[InferenceSlot]) -> Result[TypeRef, CheckError]:
+	pure_result ?= validate_pure_result(contract.signature.purity, return_type, contract.span)
 	var failure: Option[CheckError] = None
 	var position = 0
 
 	for value in actual:
-		match validate_complete_argument(call.contract, parameters, position, value, slots):
+		match validate_complete_argument(contract, parameters, position, value, slots):
 			Err(error):
 				failure = Some(error)
 				break
@@ -1343,7 +1341,9 @@ private pure func finish_pending_call(call: PendingCall, arguments: List[Pending
 			complete ?= call_inference_ready(call, slots)
 
 			if complete:
-				validate_complete_arguments(call, placed_arguments(arguments, placement, call.contract.span), slots).map(pure func(value): Some(value))
+				parameters ?= admit_call_parameters(call, slots)
+				return_type ?= admit_call_type(call.contract.signature.return_type.value_type, call, slots, call.contract.span)
+				validate_complete_arguments(call.contract, parameters, return_type, placed_arguments(arguments, placement, call.contract.span), slots).map(pure func(value): Some(value))
 			else:
 				Ok(None)
 	accepted ?= closed_result
@@ -1687,7 +1687,7 @@ private pure func elaborate_value(
 											result_state = SolvingResultInference
 									None: void
 					FreezeRoot(value):
-						match freeze_expression(value, slots, body.span):
+						match freeze_expression(value, slots, body.span, context.admission):
 							Err(error): failure = Some(error)
 							Ok(value): accepted = Some(value)
 			_: failure = Some(checker_invariant(body.span, InvalidInferenceWorklist))
@@ -1697,18 +1697,18 @@ private pure func elaborate_value(
 		None: accepted.to_result(checker_invariant(body.span, InvalidInferenceWorklist))
 
 
-private pure func freeze_expression(value: PendingValue, slots: List[InferenceSlot], span: Span) -> Result[ResolvedValue, CheckError]:
-	frozen ?= freeze_pending_value(value, slots)
+private pure func freeze_expression(value: PendingValue, slots: List[InferenceSlot], span: Span, admission: TypeAdmission) -> Result[ResolvedValue, CheckError]:
+	frozen ?= freeze_pending_value(value, slots, admission)
 	value_type ?= publish_inference_type(pending_type(value), slots, CompleteInference, span)
 	Ok({ value = frozen, value_type = value_type })
 
 
-private pure func freeze_pending_values(values: List[PendingValue], slots: List[InferenceSlot]) -> Result[List[CheckedValue], CheckError]:
+private pure func freeze_pending_values(values: List[PendingValue], slots: List[InferenceSlot], admission: TypeAdmission) -> Result[List[CheckedValue], CheckError]:
 	var frozen: List[CheckedValue] = []
 	var failure: Option[CheckError] = None
 
 	for value in values:
-		match freeze_pending_value(value, slots):
+		match freeze_pending_value(value, slots, admission):
 			Err(error):
 				failure = Some(error)
 				break
@@ -1720,8 +1720,8 @@ private pure func freeze_pending_values(values: List[PendingValue], slots: List[
 		None: Ok(frozen)
 
 
-private pure func freeze_pending_call(call: PendingCall, values: List[PendingValue], receiver: Option[InferenceUse], slots: List[InferenceSlot]) -> Result[ResolvedArguments, CheckError]:
-	arguments ?= freeze_pending_values(values, slots)
+private pure func freeze_pending_call(call: PendingCall, values: List[PendingValue], receiver: Option[InferenceUse], slots: List[InferenceSlot], admission: TypeAdmission) -> Result[ResolvedArguments, CheckError]:
+	arguments ?= freeze_pending_values(values, slots, admission)
 	checked_call ?= publish_pending_call(call, slots)
 	var actual = pending_arguments(values)
 
@@ -1729,22 +1729,46 @@ private pure func freeze_pending_call(call: PendingCall, values: List[PendingVal
 		Some(receiver): actual = [receiver].concat(actual)
 		None: void
 
-	valid ?= validate_complete_arguments(call, actual, slots)
+	parameters ?= admit_call_parameters(call, slots)
+	return_type ?= admit_call_type(call.contract.signature.return_type.value_type, call, slots, call.contract.span)
+	-- Written monomorphic signatures were admitted before body checking. Only a
+	-- completed generic call introduces new nominal argument facts here.
+	admitted ?= if call.contract.signature.type_parameters.is_empty():
+		Ok(void)
+	else:
+		var failure: Option[CheckError] = None
+		var position = 0
+		for parameter in parameters:
+			match call.contract.signature.parameters.get(position):
+				None:
+					failure = Some(checker_invariant(call.contract.span, InvalidFunctionContract))
+					break
+				Some(written):
+					match admit_instantiated_type(written.value_type, parameter.value_type, admission, call.contract.span):
+						Err(error):
+							failure = Some(error)
+							break
+						Ok(_): void
+			position = IntOps.add(position, 1)
+		match failure:
+			Some(error): Err(error)
+			None: admit_instantiated_type(call.contract.signature.return_type.value_type, return_type, admission, call.contract.span)
+	valid ?= validate_complete_arguments(call.contract, parameters, return_type, actual, slots)
 	Ok({ values = arguments, call = checked_call })
 
 
-private pure func freeze_pending_value(value: PendingValue, slots: List[InferenceSlot]) -> Result[CheckedValue, CheckError]:
+private pure func freeze_pending_value(value: PendingValue, slots: List[InferenceSlot], admission: TypeAdmission) -> Result[CheckedValue, CheckError]:
 	base_result: Result[CheckedBase, CheckError] = match value.base:
 		AcceptedBase(base): Ok(base)
 		PendingReturnRecord(owner, fields):
-			frozen ?= freeze_record_fields(fields, slots)
+			frozen ?= freeze_record_fields(fields, slots, admission)
 			Ok(ReturnRecord(owner, frozen))
 		PendingReturnVariant(contract, values):
-			frozen ?= freeze_pending_values(values, slots)
+			frozen ?= freeze_pending_values(values, slots, admission)
 			valid ?= validate_variant_fields(contract, values, slots)
 			Ok(ReturnConstructedVariant(contract.variant, frozen))
 		PendingReturnCall(call, arguments):
-			resolved ?= freeze_pending_call(call, arguments, None, slots)
+			resolved ?= freeze_pending_call(call, arguments, None, slots, admission)
 			Ok(ReturnCall(resolved.call, resolved.values))
 	base ?= base_result
 	base_type ?= publish_inference_type(value.base_type, slots, CompleteInference, value.base_span)
@@ -1773,7 +1797,7 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 				failure = Some(checker_invariant(value.span, InvalidInferenceWorklist))
 				break
 			Some(step):
-				match freeze_pending_step(step, current_type, slots):
+				match freeze_pending_step(step, current_type, slots, admission):
 					Err(error):
 						failure = Some(error)
 						break
@@ -1787,11 +1811,11 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 	Ok({ base = base, base_type = base_type, base_span = value.base_span, operations = operations })
 
 
-private pure func freeze_pending_step(step: PendingStep, receiver: InferenceType, slots: List[InferenceSlot]) -> Result[CheckedStep, CheckError]:
+private pure func freeze_pending_step(step: PendingStep, receiver: InferenceType, slots: List[InferenceSlot], admission: TypeAdmission) -> Result[CheckedStep, CheckError]:
 	operation_result: Result[CheckedOperation, CheckError] = match step.operation:
 		AcceptedOperation(operation): Ok(operation)
 		PendingInvocation(call, values):
-			resolved ?= freeze_pending_call(call, values, Some({ value_type = receiver, span = call.contract.span }), slots)
+			resolved ?= freeze_pending_call(call, values, Some({ value_type = receiver, span = call.contract.span }), slots, admission)
 			Ok(InvokeFunction(resolved.call, resolved.values))
 	operation ?= operation_result
 	value_type ?= publish_inference_type(step.value_type, slots, CompleteInference, step.span)
@@ -1799,9 +1823,8 @@ private pure func freeze_pending_step(step: PendingStep, receiver: InferenceType
 
 
 private pure func admitted_list(element: TypeRef, span: Span) -> Result[TypeRef, CheckError]:
-	match element:
-		StringType | ParameterType(_): Ok(ListType(element))
-		_: Err(type_term_error(span, UnsupportedListElement))
+	valid ?= validate_list_element(element, span)
+	Ok(ListType(element))
 
 
 -- These variables live only while one expression is elaborated. They are distinct
