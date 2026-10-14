@@ -287,6 +287,14 @@ executes. Existing artifacts are overwritten on the next run; there is no
 persistent compiler cache or input manifest. For manual inspection,
 `make -C blorp_2 test-compiler` performs the same unconditional build; it is
 not a prerequisite for running the tests.
+
+CI's macOS Blorp 2 lane waits for the existing compiler's build and restores
+that toolchain artifact. It runs unit, runtime, grammar and tooling suites,
+then the e2e suite with `--timeout 0`. The e2e suite uses that host compiler to
+build the pilot once and test every fixture. macOS supplies the
+retired-instruction counters required by the e2e cost checks. A failing suite
+blocks packaging and uploads its test log.
+
 [`test_end_to_end.brp`](test/e2e/test_end_to_end.brp) is the sole e2e test
 entrypoint; the other case modules provide groups to it and are not standalone
 runnable suites.

@@ -118,7 +118,7 @@ jobs:
           else
             make compile-prepared-blorp-cli
           fi
-          # Test jobs consume this pair without rebuilding or downloading bootstrap.
+          # Test jobs consume this pair without rebuilding the host compiler.
           make build-blorp-cli-diagnostic
 
       - name: Install
@@ -137,6 +137,7 @@ jobs:
             blorp/build/_build/blorp-cli/generated-c-inputs.sha256 \
             blorp/build/_build/blorp-cli/generated-c-build-inputs.sha256 \
             blorp/build/_build/blorp-cli/build-inputs.sha256 \
+            blorp/build/_build/blorp-cli/link-inputs.sha256 \
             blorp/build/_build/blorp-cli/install-inputs.sha256 \
             blorp/build/_build/blorp-cli/blorp.sha256 \
             blorp/build/_build/blorp-cli/blorp_cli_main.c.sha256 \
@@ -183,17 +184,21 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang libssl-dev pkg-config
 
       - name: Read bootstrap pin
-        if: matrix.run_quality_checks
+        if: matrix.run_quality_checks || matrix.scope == 'blorp-2'
         id: compiler-bootstrap
         shell: bash
         run: echo "tag=$(scripts/blorp-compiler-bootstrap --print-tag)" >> "$GITHUB_OUTPUT"
 
       - name: Cache bootstrap compiler
-        if: matrix.run_quality_checks
+        if: matrix.run_quality_checks || matrix.scope == 'blorp-2'
         uses: actions/cache@v5
         with:
           path: ~/.cache/blorp/compiler-bootstrap
           key: blorp-compiler-bootstrap-v2-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Resolve pinned bootstrap for build provenance
+        if: matrix.scope == 'blorp-2'
+        run: scripts/blorp-compiler-bootstrap --print-path
 
       - name: Assert host C compiler
         if: matrix.run_quality_checks
@@ -227,12 +232,32 @@ jobs:
         if: matrix.run_rebuilt_cli
         run: blorp/test/test_cli/test_rebuilt_cli.sh --timeout 30
 
+      - name: Run Blorp 2 unit and end-to-end tests
+        if: matrix.scope == 'blorp-2'
+        env:
+          BLORP_BUILD_VERSION: ${{ needs.build-toolchain.outputs.version }}
+          BLORP_BUILD_COMMIT: ${{ needs.build-toolchain.outputs.source_sha }}
+          BLORP_BUILD_TARGET: ${{ needs.build-toolchain.outputs.target }}
+          BLORP_BUILD_CHANNEL: ${{ needs.build-toolchain.outputs.channel }}
+          BLORP_BUILD_DIRTY: 'false'
+        run: |
+          set -euo pipefail
+          scripts/compiler-build-status
+          bin/blorp test --suite --timeout 180 \
+            blorp_2/test/unit blorp_2/test/runtime blorp_2/test/test_grammar blorp_2/test/tooling \
+            2>&1 | tee blorp_2_unit_output.txt
+          bin/blorp test --suite --timeout 0 blorp_2/test/e2e \
+            2>&1 | tee blorp_2_e2e_output.txt
+
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v6
         with:
           name: test-output-${{ needs.build-toolchain.outputs.target }}-${{ matrix.scope }}
-          path: test_output.txt
+          path: |
+            test_output.txt
+            blorp_2_unit_output.txt
+            blorp_2_e2e_output.txt
 
   package-tested-toolchain:
     name: Package

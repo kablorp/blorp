@@ -24,9 +24,16 @@ minutes) and `scripts/premerge-gate` are for preview and release validation
 (`docs/RELEASES.md`) and for a change whose reviewer asks for them. They are
 not required before landing.
 
-Changes under `blorp_2/` are validated with `make -C blorp_2 test`. No script in
-this directory or in CI covers that tree, and `scripts/compiler-check` selects
-nothing for it.
+Changes under `blorp_2/` are validated with `make -C blorp_2 test`;
+`scripts/compiler-check` selects nothing for that tree.
+
+CI's macOS Blorp 2 lane restores the existing compiler's build artifact and
+runs unit, runtime, grammar and tooling suites, then e2e tests. The e2e suite
+builds the pilot once using the restored compiler and runs every fixture.
+macOS supplies the `/usr/bin/time -l` retired-instruction counters required by
+the cost checks. E2e disables the suite timeout; the CI job retains its
+45-minute limit. Failures upload the unit and e2e logs, and packaging waits
+for the matching platform's test lanes.
 
 ## Focused compiler checks
 
