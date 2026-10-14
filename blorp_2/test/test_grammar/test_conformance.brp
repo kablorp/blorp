@@ -2,6 +2,7 @@ import:
 	../../src/lex: lex
 	../../src/names: NameTable, name_spelling, program_names
 	../../src/assemble: ParsedProgram, ParsedContents, parsed_contents
+	../../src/declarations: UnionRow, inventory_functions, inventory_unions
 	../../src/parse: module_contents, parse_module
 	../../src/source: module_source, root_module_id, same_module
 	../../src/syntax:
@@ -17,7 +18,6 @@ import:
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
 		ParsedRuntimeOperation(IntegerAddBuiltin, IntegerToStringBuiltin, StringLengthBuiltin, ListLengthBuiltin, ListGetBuiltin),
 		ParsedStatement(BindingStatement),
-		ParsedUnion,
 		PostfixOperation(ReceiverInvocation, FieldAccess),
 		Purity(Pure, Impure),
 		TypeSyntax(AtomicType, AppliedType),
@@ -56,14 +56,15 @@ private ARM_INDENT_HELP: String = "indent each arm one tab or four spaces deeper
 private ARM_RESULT_INDENT_HELP: String = "put the arm's statements and final value one tab or four spaces deeper than its pattern"
 
 
--- Parser assertions observe root declarations while the parsed program retains the full inventory.
-private pure func root_contents(program: ParsedProgram) -> ParsedContents:
-	contents = parsed_contents(program)
-	{ contents |
-		functions = contents.functions.filter(pure func(row): same_module(row.module, root_module_id())),
-		unions = contents.unions.filter(pure func(row): same_module(row.module, root_module_id())),
-		records = contents.records.filter(pure func(row): same_module(row.module, root_module_id())),
-	}
+-- Observe root syntax without republishing a partial program inventory.
+private pure func root_functions(contents: ParsedContents) -> List[ParsedFunction]:
+	inventory_functions(contents.declarations)
+		.filter(pure func(row): same_module(row.declaration.module, root_module_id()))
+		.map(pure func(row): row.declaration)
+
+
+private pure func root_unions(contents: ParsedContents) -> List[UnionRow]:
+	inventory_unions(contents.declarations).filter(pure func(row): same_module(row.module, root_module_id()))
 
 
 private pure func parse_source(source: String) -> Result[ParsedProgram, Diagnostic]:
@@ -249,9 +250,9 @@ private pure func accepts(
 		Err(_):
 			False
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			match program.functions:
+			match root_functions(program):
 				[function]:
 					match function.body:
 						ParsedValueBody(body):
@@ -635,9 +636,9 @@ pure func test_declaration_repetition_and_call_syntax() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			match program.functions:
+			match root_functions(program):
 				[first, second]:
 					second_is_one: Bool = match second.body:
 						ParsedValueBody(body):
@@ -699,9 +700,9 @@ pure func test_declaration_repetition_and_call_syntax() -> Bool:
 pure func test_argument_syntax_and_blank_separators() -> Bool:
 	argument_accepted: Bool = match parse_source(HEADER + "\tone(0)"):
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			match program.functions:
+			match root_functions(program):
 				[function]:
 					match function.body:
 						ParsedValueBody(body):
@@ -741,9 +742,9 @@ pure func test_pure_qualifier_preserves_names_and_spans() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			match program.functions:
+			match root_functions(program):
 				[function]:
 					match function.body:
 						ParsedValueBody(body):
@@ -800,9 +801,9 @@ pure func test_parameter_and_nested_call_are_valid_syntax() -> Bool:
 
 	match parse_source(source):
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			match program.functions:
+			match root_functions(program):
 				[function]:
 					match function.parameters:
 						[parameter]:
@@ -931,9 +932,9 @@ pure func test_ufcs_interleaves_with_pending_direct_calls() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			match program.functions:
+			match root_functions(program):
 				[function]:
 					match function.body:
 						ParsedValueBody(body):
@@ -1035,13 +1036,13 @@ pure func test_union_names_variants_and_expression_spans() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			match program.unions:
+			match root_unions(program):
 				[declaration]:
-					match declaration.variants:
+					match declaration.variants.map(pure func(row): row.declaration):
 						[first, second]:
-							match program.functions:
+							match root_functions(program):
 								[function]:
 									match function.body:
 										ParsedValueBody(body):
@@ -1108,11 +1109,11 @@ pure func test_union_layout_variants_and_optional_lf() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 			(
-				program.functions.length() == 1
-				and program.unions.length() == 1
-				and program.unions
+				root_functions(program).length() == 1
+				and root_unions(program).length() == 1
+				and root_unions(program)
 					.get(0)
 					.map(pure func(declaration): declaration.variants.length()) == Some(2)
 			)
@@ -1192,8 +1193,8 @@ pure func test_union_payloads_and_extra_variant_tokens_are_rejected() -> Bool:
 	)
 
 
-private pure func value_union_shape(names: NameTable, declaration: ParsedUnion) -> Bool:
-	match declaration.variants:
+private pure func value_union_shape(names: NameTable, declaration: UnionRow) -> Bool:
+	match declaration.variants.map(pure func(row): row.declaration):
 		[empty, number]:
 			match empty.fields:
 				[]:
@@ -1327,11 +1328,11 @@ pure func test_payload_and_match_syntax() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			match program.unions:
+			match root_unions(program):
 				[declaration]:
-					match program.functions:
+					match root_functions(program):
 						[unwrap, main_function]:
 							(
 								value_union_shape(program.names, declaration)
@@ -1346,8 +1347,8 @@ pure func test_payload_and_match_syntax() -> Bool:
 					False
 
 
-private pure func spaced_union_shape(names: NameTable, declaration: ParsedUnion) -> Bool:
-	match declaration.variants:
+private pure func spaced_union_shape(names: NameTable, declaration: UnionRow) -> Bool:
+	match declaration.variants.map(pure func(row): row.declaration):
 		[empty, number]:
 			match empty.fields:
 				[]:
@@ -1384,15 +1385,15 @@ pure func test_pattern_alternatives_space_layout_and_following_union() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			union_ok: Bool = match program.unions:
+			union_ok: Bool = match root_unions(program):
 				[declaration]:
 					spaced_union_shape(program.names, declaration)
 				_:
 					False
 
-			match program.functions:
+			match root_functions(program):
 				[function]:
 					header_ok: Bool = match function.parameters:
 						[parameter]:
@@ -1543,9 +1544,9 @@ private pure func single_wildcard_match_is(source: String, eof: Int) -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			match program.functions:
+			match root_functions(program):
 				[function]:
 					match function.parameters:
 						[parameter]:
@@ -1606,7 +1607,7 @@ private pure func single_wildcard_match_is(source: String, eof: Int) -> Bool:
 															44,
 															45,
 														)
-														and program.unions.length() == 0
+														and root_unions(program).length() == 0
 														and program.end.start == eof
 														and program.end.end == eof
 													)
@@ -1827,9 +1828,9 @@ pure func test_binding_prefix_and_final_value_shape() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			match program.functions:
+			match root_functions(program):
 				[function]:
 					match function.statements:
 						[BindingStatement(first), BindingStatement(current), BindingStatement(update)]:
@@ -1876,7 +1877,7 @@ pure func test_binding_spaces_and_tail_match() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			match root_contents(parsed).functions:
+			match root_functions(parsed_contents(parsed)):
 				[function]:
 					match function.body:
 						ParsedMatchBody(_):
@@ -1958,9 +1959,9 @@ pure func test_arm_block_bindings_and_inline_sibling_spans() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			match program.functions:
+			match root_functions(program):
 				[function]:
 					match function.body:
 						ParsedMatchBody(body):
@@ -2047,7 +2048,7 @@ pure func test_arm_block_without_bindings_and_optional_final_lf() -> Bool:
 			Err(_):
 				accepted = False
 			Ok(parsed):
-				match root_contents(parsed).functions:
+				match root_functions(parsed_contents(parsed)):
 					[function]:
 						match function.body:
 							ParsedMatchBody(body):
@@ -2083,9 +2084,9 @@ pure func test_arm_block_spaces_and_following_declaration() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			match program.functions:
+			match root_functions(program):
 				[first, second]:
 					match first.body:
 						ParsedMatchBody(body):
@@ -2187,9 +2188,9 @@ pure func test_function_type_parameter_list_preserves_order_and_spans() -> Bool:
 
 	match parse_source(prefix + "A, B, C](a:A,b:B,c:C)->C:\n\tc\n"):
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			match program.functions:
+			match root_functions(program):
 				[function]:
 					match function.type_parameters:
 						[first, second, third]:
@@ -2229,9 +2230,9 @@ pure func test_generic_parameter_name_and_annotation_spans() -> Bool:
 
 	match parse_source(prefix + "Element2](value: Element2) -> Element2:\n\tvalue\n"):
 		Ok(program):
-			contents = root_contents(program)
+			contents = parsed_contents(program)
 
-			match contents.functions:
+			match root_functions(contents):
 				[function]:
 					match function.type_parameters:
 						[name]:
@@ -2371,17 +2372,17 @@ pure func test_generic_union_and_atomic_application_spans() -> Bool:
 
 	match parse_source(source):
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			match program.unions:
+			match root_unions(program):
 				[declaration]:
 					match declaration.type_parameters:
 						[parameter]:
-							match declaration.variants:
+							match declaration.variants.map(pure func(row): row.declaration):
 								[variant]:
 									match variant.fields:
 										[AtomicType(payload)]:
-											match program.functions:
+											match root_functions(program):
 												[function]:
 													match function.parameters:
 														[value]:
@@ -2495,9 +2496,9 @@ pure func test_multiple_union_parameters_and_arguments_preserve_order_and_spans(
 
 	match parse_source(prefix + "Result[Int, String])->Int:\n\t0"):
 		Ok(parsed):
-			program = root_contents(parsed)
+			program = parsed_contents(parsed)
 
-			match (program.unions, program.functions):
+			match (root_unions(program), root_functions(program)):
 				([declaration], [function]):
 					match (declaration.type_parameters, function.parameters):
 						([t, e], [parameter]):
@@ -2566,7 +2567,7 @@ pure func test_builtin_is_contextual_and_is_the_entire_body() -> Bool:
 		Err(_):
 			False
 		Ok(parsed):
-			match root_contents(parsed).functions:
+			match root_functions(parsed_contents(parsed)):
 				[_, added, main]:
 					match (added.body, main.body):
 						(ParsedBuiltinBody(IntegerAddBuiltin, _), ParsedValueBody(_)):

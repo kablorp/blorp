@@ -438,3 +438,48 @@ consuming root transfer, no per-push root retain and geometric capacity reuse;
 it does not assert global compiler linearity. Raw inputs/samples and bounded C
 excerpts are retained with the admission handback. The rejected original
 superlinear supplied-type rescanning result remains documented above.
+
+## Declaration inventory acceptance (namespace part A)
+
+Assembly now issues one opaque declaration inventory from actual syntax. Its
+function, record, union and owner-qualified variant rows carry their issued IDs
+through namespace, signatures, checked bodies, nominal checking and diagnostics.
+All 17 external raw-ID construction calls are removed; the four constructors
+are private. The shared read-only nominal projection retains the previous
+module/source ordering. Visibility and rejection priority are unchanged in A;
+three frozen CLI priority controls have byte-identical diagnostics.
+
+Production grows by 81 physical lines. Tests grow by 269: the producer/model/
+assembly/namespace tests and direct syntax helper add 262, and 28 migrated
+reader files add seven while preserving all 555 registered callbacks and their
+assertions. Readers filter issued rows locally instead of manufacturing partial
+ParsedContents products. README grows by five lines. Two independent experts
+approve the final production/core-test patch; reader review is separate.
+
+The valid pre-change API probe rejects the unavailable DeclarationInventory;
+earlier test-authoring parser failures are retained and excluded. Four import
+probes change from acceptance to exact private-import diagnostics. The actual
+issuer's function-ID length changed to zero in an isolated copy makes the dense
+ID callback fail; byte-for-byte restoration passes. Five producer callbacks and
+31 focused callbacks pass. The initial source check found two loop-local `?=`
+uses, the initial focused run found one misindented test fallback, and the first
+broad check found six unmigrated grammar readers plus duplicate imports. Those
+setup failures are preserved, not counted as regression or acceptance evidence.
+The final strict ASan/UBSan/leak run passes 2,090 callbacks in 137 suites in
+27.838s, with no source drift or timeout (`namespace-a-strict-complete`).
+
+The native pilot is SHA-256
+`cba669e4e34e505e25b78e06e47f176a95113694c182e044263a34b09c3abd67`;
+its C is `88c211bfdcf97033c53864aaa104fc16c88a039125a8e220495e51cdb4e52e45`.
+Its 42 source/library artifacts are frozen separately. Against accepted admission
+compiler `82591956`, 216 samples over the same 36 frozen programs are balanced
+and emit identical C; maximum allocation increase is 0.466125%, and maximum
+minimum-instruction increase is 0.297684%, below the unchanged 3% ceiling
+(`namespace-a-cost-receipt`). These remain owned-input CLI proxies.
+
+Actual generated C maps inventory issuance to `brp_j9`: four local vector
+builders transfer their roots into capacity growth without retaining them on
+each append. The final row publication acquires its fields once. Source syntax
+rows incur the expected managed wrappers; no duplicated raw union variant vector
+is published. This supports the narrow construction claim, not global compiler
+linearity. Full normal-main e2e remains the final combined gate after part B.

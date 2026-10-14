@@ -1426,6 +1426,10 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    locations from names or literal values.
    A shared interning builder assigns one opaque `NameId` per spelling across the module inventory. Program
    assembly ([assemble.brp](src/assemble.brp)) seals the complete syntax and immutable name table in an opaque `ParsedProgram`.
+   Its [declaration inventory](src/declarations.brp) issues function, record,
+   union and owner-qualified variant IDs once from the raw syntax. Consumers
+   carry those IDs through accepted and checked rows; vector positions are
+   traversal counters, not another identity producer.
    Integer conversion accumulates negatively against derived range cutoffs,
    checking before multiplication so even the minimum is represented safely.
 3. A frozen namespace maps each module's visible function names to original
@@ -1578,8 +1582,9 @@ Written names contain only a `NameId` and source span. Checking compares identit
 spelling lookup is reserved for diagnostics and rejects a missing table entry
 as an internal compiler error. IDs are meaningful only within their owning
 parse and table; equality and lookup do not validate table ownership. Only
-assembly can construct the sealed program that checking accepts. `FunctionId` remains a separate
-nominal identity assigned in declaration order. Checking retains call spans;
+assembly can construct the sealed program that checking accepts. The declaration
+inventory's raw ID constructors are private. `FunctionId` remains a separate
+nominal identity issued in declaration order. Checking retains call spans;
 `UnionId` identifies a declared type and `VariantId` records both its owner and
 variant position; neither is interchangeable with a `NameId` or `FunctionId`.
 `BindingId` identifies a function-local parameter, body local or arm binding independently

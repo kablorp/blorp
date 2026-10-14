@@ -43,14 +43,19 @@ import:
 		type_parameter_id,
 	declarations:
 		FunctionId,
+		FunctionRow,
+		RecordRow,
+		UnionRow,
+		NominalRow(UnionDeclarationRow, RecordDeclarationRow),
+		inventory_functions,
+		inventory_records,
+		inventory_unions,
+		next_nominal,
 		RecordId,
 		UnionId,
 		function_number,
-		record_id,
 		record_number,
-		union_id,
 		union_number,
-		variant_id,
 	int as IntOps
 	names: NameId, same_name
 	namespace:
@@ -60,11 +65,9 @@ import:
 		type_candidates,
 	option: to_result
 	assemble: ParsedContents
-	source: COMPILER_SOURCE, ModuleId, module_number, same_module
+	source: COMPILER_SOURCE, ModuleId, same_module
 	syntax:
-		ParsedFunction,
 		ParsedRecord,
-		ParsedUnion,
 		Span,
 		TypeSyntax(AtomicType, AppliedType),
 		WrittenName,
@@ -91,8 +94,8 @@ pure func previous_declaration(previous: List[WrittenName], name: NameId) -> Opt
 -- The type names visible where a type is written: the module's namespace, the
 -- declared unions and the enclosing declaration's own type parameters.
 fixed record TypeScope {
-	records: List[ParsedRecord],
-	unions: List[ParsedUnion],
+	records: List[RecordRow],
+	unions: List[UnionRow],
 	namespace: Namespace,
 	module: ModuleId,
 	parameters: List[LocalTypeParameter]
@@ -197,7 +200,7 @@ private pure func union_arity(
 
 private pure func record_arity(scope: TypeScope, owner: RecordId, span: Span) -> Result[Int, CheckError]:
 	declaration ?= scope.records.get(record_number(owner)).to_result(checker_invariant(span, InvalidRecordDeclaration(owner)))
-	Ok(declaration.type_parameters.length())
+	Ok(declaration.declaration.type_parameters.length())
 
 
 private pure func resolve_atomic_type(
@@ -300,38 +303,31 @@ fixed record CheckedDeclarations {
 }
 
 
--- A union or record declaration. Both kinds are checked together in source
--- order: by module, then by position within the module.
-private fixed union DeclaredType:
-	DeclaredUnion(ParsedUnion)
-	DeclaredRecord(ParsedRecord)
-
-
-private pure func declared_name(declaration: DeclaredType) -> WrittenName:
+private pure func declared_name(declaration: NominalRow) -> WrittenName:
 	match declaration:
-		DeclaredUnion(parsed_union):
+		UnionDeclarationRow(parsed_union):
 			parsed_union.type_name
-		DeclaredRecord(parsed_record):
-			parsed_record.type_name
+		RecordDeclarationRow(parsed_record):
+			parsed_record.declaration.type_name
 
 
-private pure func declared_module(declaration: DeclaredType) -> ModuleId:
+private pure func declared_module(declaration: NominalRow) -> ModuleId:
 	match declaration:
-		DeclaredUnion(parsed_union):
+		UnionDeclarationRow(parsed_union):
 			parsed_union.module
-		DeclaredRecord(parsed_record):
-			parsed_record.module
+		RecordDeclarationRow(parsed_record):
+			parsed_record.declaration.module
 
 
 -- A type name is unique within its module; a clash involving a record is
 -- reported as a duplicate type, otherwise as a duplicate union.
 private pure func validate_type_name(
-	declaration: DeclaredType,
-	previous: List[DeclaredType],
+	declaration: NominalRow,
+	previous: List[NominalRow],
 ) -> Result[Void, CheckError]:
 	name = declared_name(declaration)
 	module = declared_module(declaration)
-	var earlier: Option[DeclaredType] = None
+	var earlier: Option[NominalRow] = None
 
 	for candidate in previous:
 		if (
@@ -349,52 +345,19 @@ private pure func validate_type_name(
 			duplicate_type = DuplicateRecordType(name.id, conflict)
 
 			match declaration:
-				DeclaredRecord(_):
+				RecordDeclarationRow(_):
 					Err(type_declaration_error(name.span, duplicate_type))
-				DeclaredUnion(_):
+				UnionDeclarationRow(_):
 					match first:
-						DeclaredRecord(_):
+						RecordDeclarationRow(_):
 							Err(type_declaration_error(name.span, duplicate_type))
-						DeclaredUnion(_):
+						UnionDeclarationRow(_):
 							Err(
 								type_declaration_error(
 									name.span,
 									DuplicateUnion(name.id, conflict),
 								),
 							)
-
-
-private pure func next_declaration(
-	parsed: ParsedContents,
-	checked: CheckedDeclarations,
-) -> Option[DeclaredType]:
-	match parsed.records.get(checked.records.length()):
-		None:
-			match parsed.unions.get(checked.unions.length()):
-				Some(parsed_union):
-					Some(DeclaredUnion(parsed_union))
-				None:
-					None
-		Some(parsed_record):
-			match parsed.unions.get(checked.unions.length()):
-				None:
-					Some(DeclaredRecord(parsed_record))
-				Some(parsed_union):
-					record_first = if same_module(parsed_record.module, parsed_union.module):
-						IntOps.less_than(
-							parsed_record.type_name.span.start,
-							parsed_union.type_name.span.start,
-						)
-					else:
-						IntOps.less_than(
-							module_number(parsed_record.module),
-							module_number(parsed_union.module),
-						)
-
-					if record_first:
-						Some(DeclaredRecord(parsed_record))
-					else:
-						Some(DeclaredUnion(parsed_union))
 
 
 pure func validate_declarations(
@@ -416,40 +379,42 @@ private pure func declare_types(
 	parsed: ParsedContents,
 	namespace: Namespace,
 	checked: CheckedDeclarations,
-	previous: List[DeclaredType],
+	previous: List[NominalRow],
 ) -> Result[CheckedDeclarations, CheckError]:
-	match next_declaration(parsed, checked):
+	match next_nominal(parsed.declarations, checked.records.length(), checked.unions.length()):
 		None:
 			Ok(checked)
 		Some(declaration):
 			unique ?= validate_type_name(declaration, previous)
 			scope: TypeScope = {
-				records = parsed.records,
-				unions = parsed.unions,
+				records = inventory_records(parsed.declarations),
+				unions = inventory_unions(parsed.declarations),
 				namespace = namespace,
 				module = declared_module(declaration),
 				parameters = []
 			}
 
 			declared: Result[CheckedDeclarations, CheckError] = match declaration:
-				DeclaredUnion(parsed_union):
-					owner = union_id(checked.unions.length())
-					names ?= validate_variant_names(parsed_union, parsed.functions, namespace, [])
+				UnionDeclarationRow(parsed_union):
+					owner = parsed_union.id
+					names ?= validate_variant_names(parsed_union, inventory_functions(parsed.declarations), namespace, [])
 					parameters ?= local_type_parameters(
 						parsed_union.type_parameters,
 						UnionDeclaration(owner),
 						scope,
 					)
-					variants ?= declared_variants(parsed_union, owner, parameters, [])
+					variants ?= declared_variants(parsed_union, parameters, [])
 					Ok({ checked | unions = checked.unions.append({
+								id = owner,
 								type_parameters = declared_parameters(parameters),
 								variants = variants,
 							}) })
-				DeclaredRecord(parsed_record):
-					owner = record_id(checked.records.length())
-					parameters ?= local_type_parameters(parsed_record.type_parameters, RecordDeclaration(owner), scope)
-					fields ?= declared_fields(parsed_record, owner, parameters, [])
+				RecordDeclarationRow(parsed_record):
+					owner = parsed_record.id
+					parameters ?= local_type_parameters(parsed_record.declaration.type_parameters, RecordDeclaration(owner), scope)
+					fields ?= declared_fields(parsed_record.declaration, owner, parameters, [])
 					Ok({ checked | records = checked.records.append({
+						id = owner,
 						type_parameters = declared_parameters(parameters),
 						fields = fields,
 					}) })
@@ -465,8 +430,8 @@ private pure func declare_types(
 
 -- Variant names are distinct within their union and from the module's functions.
 private pure func validate_variant_names(
-	declaration: ParsedUnion,
-	functions: List[ParsedFunction],
+	declaration: UnionRow,
+	functions: List[FunctionRow],
 	namespace: Namespace,
 	seen: List[WrittenName],
 ) -> Result[Void, CheckError]:
@@ -474,7 +439,7 @@ private pure func validate_variant_names(
 		None:
 			Ok(void)
 		Some(written):
-			variant = written.name
+			variant = written.declaration.name
 
 			unique ?= match previous_declaration(seen, variant.id):
 				Some(known):
@@ -505,12 +470,12 @@ private pure func validate_variant_names(
 private pure func variant_function_conflict(
 	variant: WrittenName,
 	id: FunctionId,
-	functions: List[ParsedFunction],
+	functions: List[FunctionRow],
 ) -> Result[Void, CheckError]:
 	function ?= functions
 		.get(function_number(id))
 		.to_result(checker_invariant(variant.span, InvalidResolvedFunction(id)))
-	declared = function.function_name.span
+	declared = function.declaration.function_name.span
 
 	span = if IntOps.less_than(variant.span.start, declared.start):
 		declared
@@ -522,8 +487,7 @@ private pure func variant_function_conflict(
 
 -- Resolves each variant's payload annotation, in declaration order.
 private pure func declared_variants(
-	declaration: ParsedUnion,
-	owner: UnionId,
+	declaration: UnionRow,
 	scope: TypeScope,
 	declared: List[CheckedVariant],
 ) -> Result[List[CheckedVariant], CheckError]:
@@ -531,15 +495,14 @@ private pure func declared_variants(
 		None:
 			Ok(declared)
 		Some(variant):
-			fields ?= declared_variant_fields(scope, variant.fields)
+			fields ?= declared_variant_fields(scope, variant.declaration.fields)
 
 			declared_variants(
 				declaration,
-				owner,
 				scope,
 				declared.append({
-					id = variant_id(owner, declared.length()),
-					name = variant.name,
+					id = variant.id,
+					name = variant.declaration.name,
 					fields = fields,
 				}),
 			)
@@ -925,41 +888,48 @@ pure func validate_finite_declarations(
 	var unions = declarations.unions.map(pure func(_): UnvisitedDeclaration)
 	var pending: List[DeclarationVisitStep] = []
 	var pending_count = 0
+	var failure: Option[CheckError] = None
 	-- The pending worklist is LIFO: seed unions first so records still visit
 	-- before unions, with both inventories visited in declaration order.
 	var position = declarations.unions.length()
 
 	while IntOps.greater_than(position, 0):
 		position = IntOps.subtract(position, 1)
-		pending = push_declaration_visit(
-			pending,
-			pending_count,
-			VisitDeclaredType({
-				value_type = UnionType(union_id(position)),
-				span = { source = COMPILER_SOURCE, start = 0, end = 0 },
-			}),
-		)
-		pending_count = IntOps.add(pending_count, 1)
+		match declarations.unions.get(position):
+			None:
+				failure = Some(checker_invariant({ source = COMPILER_SOURCE, start = 0, end = 0 }, InvalidDeclarationVisit))
+			Some(declaration):
+				pending = push_declaration_visit(
+					pending,
+					pending_count,
+					VisitDeclaredType({
+						value_type = UnionType(declaration.id),
+						span = { source = COMPILER_SOURCE, start = 0, end = 0 },
+					}),
+				)
+				pending_count = IntOps.add(pending_count, 1)
 
 	position = declarations.records.length()
 
 	while IntOps.greater_than(position, 0):
 		position = IntOps.subtract(position, 1)
-		pending = push_declaration_visit(
-			pending,
-			pending_count,
-			VisitDeclaredType({
-				value_type = RecordType(record_id(position)),
-				span = {
-					source = COMPILER_SOURCE,
-					start = 0,
-					end = 0
-				},
-			}),
-		)
-		pending_count = IntOps.add(pending_count, 1)
-
-	var failure: Option[CheckError] = None
+		match declarations.records.get(position):
+			None:
+				failure = Some(checker_invariant({ source = COMPILER_SOURCE, start = 0, end = 0 }, InvalidDeclarationVisit))
+			Some(declaration):
+				pending = push_declaration_visit(
+					pending,
+					pending_count,
+					VisitDeclaredType({
+						value_type = RecordType(declaration.id),
+						span = {
+							source = COMPILER_SOURCE,
+							start = 0,
+							end = 0
+						},
+					}),
+				)
+				pending_count = IntOps.add(pending_count, 1)
 
 	while IntOps.greater_than(pending_count, 0) and not failure.is_some():
 		pending_count = IntOps.subtract(pending_count, 1)
