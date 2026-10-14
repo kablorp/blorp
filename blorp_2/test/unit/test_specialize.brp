@@ -2,7 +2,7 @@ import:
 	../../src/check: check, checked_functions
 	../../src/declarations as Declaration
 	../../src/lex: lex
-	../../src/source: module_source, root_module_id
+	../../src/source: COMPILER_SOURCE, module_source, root_module_id, same_source
 	../../src/specialize:
 		CallTarget(UserFunction, RuntimeFunction),
 		ConcreteBase(ReturnCall),
@@ -12,12 +12,21 @@ import:
 		ConcreteOperation(InvokeFunction),
 		ConcreteStatement(InitializeBinding, ReassignBinding),
 		ConcreteValue,
+		RecordRepresentation(InlineRecord, ManagedRecord),
 		SpecializedContents,
-		TypeRef(IntType, StringType, UnionType),
+		TypeRef(VoidType, IntType, FloatType, StringType, ListType, RecordType, UnionType),
+		UnionRepresentation(InlineUnmanaged, InlineOwningPayload),
+		ValueOwnership(
+			NoOwnership, ManagedStringLeaf, ManagedStringListRoot, ManagedRecordRoot,
+			InlineOwnedFields,
+		),
 		function_number,
+		record_number,
 		same_type,
 		specialize,
 		specialized_contents,
+		union_number,
+		value_ownership,
 	../../src/syntax: Diagnostic, Entrypoint(NoArguments), entry_function
 	input: parse, setup_diagnostic
 	test: TestSuite
@@ -406,9 +415,350 @@ pure func test_match_scrutinee_assignments_and_results_discover_generic_instance
 			False
 
 
+private pure func ownership_rejection(
+	result: Result[ValueOwnership, Diagnostic],
+	message: String,
+) -> Bool:
+	match result:
+		Err(error):
+			(
+				error.message == "internal compiler error: " + message
+				and error.help == "report this compiler error with the input program"
+				and same_source(error.span.source, COMPILER_SOURCE)
+				and error.span.start == 0
+				and error.span.end == 0
+				and error.note.is_none()
+			)
+		Ok(_):
+			False
+
+
+pure func test_numeric_and_void_types_have_no_ownership() -> Bool:
+	var valid = True
+
+	for value_type in [IntType, FloatType, VoidType]:
+		match value_ownership(value_type, [], []):
+			Ok(NoOwnership):
+				void
+			_:
+				valid = False
+
+	valid
+
+
+pure func test_string_ownership_is_a_managed_leaf() -> Bool:
+	match value_ownership(StringType, [], []):
+		Ok(ManagedStringLeaf):
+			True
+		_:
+			False
+
+
+pure func test_string_list_ownership_is_a_managed_root() -> Bool:
+	match value_ownership(ListType(StringType), [], []):
+		Ok(ManagedStringListRoot):
+			True
+		_:
+			False
+
+
+pure func test_other_list_elements_reject_at_the_ownership_authority() -> Bool:
+	ownership_rejection(
+		value_ownership(ListType(IntType), [], []),
+		"unsupported List element in ownership representation",
+	)
+
+
+private pure func return_plan(contents: SpecializedContents) -> Result[ValueOwnership, Diagnostic]:
+	match contents.functions:
+		[_, helper]:
+			value_ownership(helper.signature.return_type, contents.unions, contents.records)
+		_:
+			Err({
+				span = {
+					source = COMPILER_SOURCE,
+					start = 0,
+					end = 0
+				},
+				note = None,
+				message = "invalid ownership producer test",
+				help = "fix the two-function producer input",
+			})
+
+
+pure func test_nested_numeric_records_remain_inline() -> Bool:
+	source: String =
+		|fixed record Inner { number: Int }
+		|fixed record Outer { child: Inner, fraction: Float }
+		|pure func make() -> Outer:
+		|    { child = { number = 7 }, fraction = 1.5 }
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match program(source):
+		Ok(contents):
+			match contents.records:
+				[inner, outer]:
+					inline_child = match inner.representation:
+						InlineRecord:
+							True
+						ManagedRecord:
+							False
+					inline_parent = match outer.representation:
+						InlineRecord:
+							True
+						ManagedRecord:
+							False
+					child_fields = match inner.fields:
+						[IntType]:
+							True
+						_:
+							False
+					parent_fields = match outer.fields:
+						[RecordType(child), FloatType]:
+							record_number(child) == 0
+						_:
+							False
+					unmanaged_parent = match return_plan(contents):
+						Ok(NoOwnership):
+							True
+						_:
+							False
+					inline_child and inline_parent and child_fields and parent_fields and unmanaged_parent
+				_:
+					False
+		Err(_):
+			False
+
+pure func test_string_record_has_one_root_and_complete_repeated_fields() -> Bool:
+	source: String =
+		|fixed record Pair { left: String, count: Int, right: String }
+		|pure func make() -> Pair:
+		|    { left = "same", count = 7, right = "same" }
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match program(source):
+		Ok(contents):
+			match contents.records:
+				[layout]:
+					complete_fields = match layout.fields:
+						[StringType, IntType, StringType]:
+							True
+						_:
+							False
+					managed_root = match return_plan(contents):
+						Ok(ManagedRecordRoot(id)):
+							record_number(id) == 0
+						_:
+							False
+					complete_fields and managed_root
+				_:
+					False
+		Err(_):
+			False
+
+pure func test_void_record_has_a_root_without_owned_children() -> Bool:
+	source: String =
+		|fixed record Unit { empty: Void }
+		|pure func make() -> Unit:
+		|    { empty = void }
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match program(source):
+		Ok(contents):
+			match return_plan(contents):
+				Ok(ManagedRecordRoot(id)):
+					record_number(id) == 0
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_unmanaged_union_field_still_requires_a_record_root() -> Bool:
+	source: String =
+		|fixed union Maybe[T]:
+		|    Missing
+		|    Present(T)
+		|fixed record Wrapped { value: Maybe[Int] }
+		|pure func make() -> Wrapped:
+		|    { value = Present(7) }
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match program(source):
+		Ok(contents):
+			match contents.records:
+				[layout]:
+					unmanaged_child = match layout.fields:
+						[UnionType(child)]:
+							match value_ownership(UnionType(child), contents.unions, contents.records):
+								Ok(NoOwnership):
+									True
+								_:
+									False
+						_:
+							False
+					managed_parent = match return_plan(contents):
+						Ok(ManagedRecordRoot(id)):
+							record_number(id) == 0
+						_:
+							False
+					unmanaged_child and managed_parent
+				_:
+					False
+		Err(_):
+			False
+
+pure func test_phantom_string_argument_creates_no_child_obligation() -> Bool:
+	source: String =
+		|fixed record Phantom[T] { number: Int }
+		|pure func make() -> Phantom[String]:
+		|    { number = 7 }
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match program(source):
+		Ok(contents):
+			match return_plan(contents):
+				Ok(NoOwnership):
+					True
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_inline_union_keeps_each_repeated_owned_field() -> Bool:
+	source: String =
+		|fixed union Payload:
+		|    Empty
+		|    Pair(String, Int, String)
+		|pure func make() -> Payload:
+		|    Pair("same", 7, "same")
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match program(source):
+		Ok(contents):
+			match contents.unions:
+				[layout]:
+					complete_fields = match layout.variants:
+						[[], [StringType, IntType, StringType]]:
+							True
+						_:
+							False
+					owning_representation = match layout.representation:
+						InlineOwningPayload:
+							True
+						InlineUnmanaged:
+							False
+					owning_fields = match return_plan(contents):
+						Ok(InlineOwnedFields(id)):
+							union_number(id) == 0
+						_:
+							False
+					complete_fields and owning_representation and owning_fields
+				_:
+					False
+		Err(_):
+			False
+
+pure func test_record_ownership_query_rejects_missing_layout() -> Bool:
+	source: String =
+		|fixed record Number { number: Int }
+		|pure func make() -> Number:
+		|    { number = 7 }
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match fixture(source):
+		Ok([_, helper]):
+			ownership_rejection(
+				value_ownership(helper.signature.return_type, [], []),
+				"invalid record identity in ownership representation",
+			)
+		_:
+			False
+
+
+pure func test_union_ownership_query_rejects_missing_layout() -> Bool:
+	source: String =
+		|fixed union Flag:
+		|    Off
+		|    On
+		|pure func make() -> Flag:
+		|    Off
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+
+	match fixture(source):
+		Ok([_, helper]):
+			ownership_rejection(
+				value_ownership(helper.signature.return_type, [], []),
+				"invalid union identity in ownership representation",
+			)
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 specialization",
 	tests = [
+		("numeric and Void ownership", test_numeric_and_void_types_have_no_ownership),
+		("String ownership authority", test_string_ownership_is_a_managed_leaf),
+		("String List ownership authority", test_string_list_ownership_is_a_managed_root),
+		(
+			"unsupported List ownership authority",
+			test_other_list_elements_reject_at_the_ownership_authority,
+		),
+		("nested numeric records stay inline", test_nested_numeric_records_remain_inline),
+		(
+			"record root retains complete repeated fields",
+			test_string_record_has_one_root_and_complete_repeated_fields,
+		),
+		(
+			"Void record root without owned children",
+			test_void_record_has_a_root_without_owned_children,
+		),
+		(
+			"unmanaged union field needs record root",
+			test_unmanaged_union_field_still_requires_a_record_root,
+		),
+		(
+			"phantom String argument owns no child",
+			test_phantom_string_argument_creates_no_child_obligation,
+		),
+		(
+			"inline union keeps repeated owned fields",
+			test_inline_union_keeps_each_repeated_owned_field,
+		),
+		(
+			"record ownership rejects missing layout",
+			test_record_ownership_query_rejects_missing_layout,
+		),
+		(
+			"union ownership rejects missing layout",
+			test_union_ownership_query_rejects_missing_layout,
+		),
 		("direct and UFCS reuse one instance", test_direct_and_ufcs_reuse_one_instance),
 		(
 			"argument types create complete distinct instances",

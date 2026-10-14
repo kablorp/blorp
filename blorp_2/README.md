@@ -1504,10 +1504,14 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    at its declared field ordinal and then its statement sequence, and publishes
    a branch-local value block. Sibling arms
    share only the function's value allocator, preserving distinct identities.
-6. Ownership insertion classifies each concrete value as having no ownership,
-   being a managed String leaf, List[String] or record root, or containing owned
-   inline union fields.
-   It publishes ordered definitions, owner acquisitions, drops and return
+6. Concrete specialization owns storage and child-ownership representation.
+   Its read-only ownership query classifies a concrete value as having no
+   ownership, being a managed String leaf, List[String] or record root, or
+   containing owned inline union fields. Ownership insertion and verification
+   both consume that upstream fact; the query does not inspect or prescribe
+   insertion's operations. Producer tests independently cover each supported
+   representation, including repeated stored children and phantom arguments.
+   Ownership insertion publishes ordered definitions, owner acquisitions, drops and return
    transfers. `OwnerId` names one obligation;
    `ValueId` still names the computed value. Borrowed operands name the owner
    they depend on, the exact borrowed parameter value identity, or the immediate
@@ -1530,7 +1534,9 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    live parent.
    Only it can seal a
    `VerifiedProgram`; it neither repairs ownership nor uses insertion's
-   liveness decisions as its oracle.
+   liveness decisions as its oracle. Type, layout, arity and coverage checks at
+   this boundary validate the actual transformed IR against accepted contracts;
+   they do not perform source-language acceptance again.
 8. Emission consumes that verified program and produces C. Computed values use
    immutable C locals; scalar reassignment requires no runtime mutable cell.
    A match uses its evaluated scrutinee once and switches on its tag. Arm-local field

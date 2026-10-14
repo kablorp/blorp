@@ -289,3 +289,63 @@ coverage or compressing formatting. Stop for review on substantial combined
 growth. Each refactor separately retains the +3% frozen-input allocation and
 instruction ceiling and identical emitted fixture C; all combined changes retain
 the original +5% ceiling.
+
+## Ownership fact boundary evidence
+
+ValueOwnership and its read-only projection now belong to specialization's
+concrete representation authority. Insertion and independent verification both
+import them there. Raw verification's operation, type, layout, arity, coverage
+and borrow checks remain intact. There is no compatibility re-export, extra
+catalogue or duplicate child inventory. Production shrinks by six physical
+lines; tests grow by 384, including twelve producer/query callbacks and one
+corrupted-insertion-output callback with an independently valid baseline.
+
+Two separate compiler experts approved the final source/test packet
+`d472abd07e3004ff5ae98d232cdb6ef768a18e5ba950fe19be9ae7473dead95a`
+with zero findings. The nine focused native suites pass 256 callbacks
+(`ownership-green`, no source drift). The String fact oracle fails exactly its
+callback when the upstream query is changed to NoOwnership in an isolated source
+copy (`ownership-fact-mutation`) and passes after restoration
+(`ownership-fact-restored`). The verifier test separately removes only the real
+insertion output's acquisition, retaining its exact transfer, and requires the
+undefined-owner diagnostic and span.
+
+An isolated ownership-only compiler was built from the committed tuple tree plus
+that reviewed patch, using the same fresh host and O0 diagnostic flags. The
+source snapshot, patch, C, binary and build receipts are retained under
+`build/authority-fixes/ownership-only*`. Its 216 paired samples against the frozen
+tuple candidate cover the same 36 input/library bytes and executed/output paths.
+Allocations are stable, balanced and unchanged; the maximum minimum-instruction
+increase is 0.125%, within the separate 3% ceiling. All emitted fixture C is
+byte-identical (`ownership-cost-receipt`). Broader combined acceptance remains
+pending.
+
+That receipt reports working-tree drift while other workers edited the active
+checker/tests. The measured executable, input files and target library were
+isolated prebuilt/frozen artifacts; active source was not compiled during the
+samples. Per-sample binary/input/C hashes and the frozen library/input manifest
+in `ownership-cost/provenance.json` are the provenance authority for this
+comparison, rather than the changing
+working-tree fingerprint. The retained recipe and build patch identify the
+measured source; this distinction does not waive any frozen-artifact check.
+All eight frozen target-library files byte-match their committed `a16328a59`
+versions; the provenance packet also fingerprints the recipe and both binaries.
+
+## Rejected initial admission measurement
+
+The initial admission implementation passed its first 59 callbacks but exceeded
+the predeclared 5% ceiling: nested wrap-128 grew 19.424% in allocations and
+8.188% in retired instructions; wrap-64 grew 14.472%/7.992%, and wrap-32
+8.897%/4.910%. Other workloads remained below 0.90%/0.60%. All 216 raw samples,
+stable balanced counts and unchanged C are retained in `combined-initial-cost`;
+this is a rejected result, not acceptance evidence.
+
+The cause is repeated admission of fully substituted nested caller arguments.
+The reviewed remedy checks written signature structure against already-created
+concrete types, treating supplied parameter replacements as terminal. Child-first
+freezing and accepted annotations establish those supplied types' validity;
+newly written nominal heads still consult the declaration's String requirements.
+Thus Box[T] does fixed written work while Marker[Values[T]] still rejects Int.
+No cache, extra substitution walk, proof carrier or constraint solver is needed.
+The ceiling remains unchanged, and this remedy requires fresh native and matched
+cost evidence before admission can be accepted.

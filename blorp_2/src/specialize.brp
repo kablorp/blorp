@@ -119,6 +119,17 @@ fixed union TypeRef:
 	UnionType(UnionInstanceId)
 
 
+-- Storage ownership belongs to this compilation's concrete layouts, before
+-- insertion chooses any owners or borrows. Stored slots remain in the complete
+-- layouts; this classification does not replace their order or multiplicity.
+fixed union ValueOwnership:
+	NoOwnership
+	ManagedStringLeaf
+	ManagedStringListRoot
+	ManagedRecordRoot(RecordInstanceId)
+	InlineOwnedFields(UnionInstanceId)
+
+
 fixed union UnionRepresentation:
 	InlineUnmanaged
 	InlineOwningPayload
@@ -386,6 +397,61 @@ private pure func invalid(span: Span, message: String) -> Diagnostic:
 		message = "internal specialization error: ".concat(message),
 		help = "report this compiler error with the input program"
 	}
+
+
+private pure func ownership_error(message: String) -> Diagnostic:
+	{
+		span = {
+			source = COMPILER_SOURCE,
+			start = 0,
+			end = 0
+		},
+		note = None,
+		message = "internal compiler error: ".concat(message),
+		help = "report this compiler error with the input program"
+	}
+
+
+-- Project the published storage fact, without rediscovering managed children.
+-- Raw ownership verification additionally checks supplied layout consistency.
+pure func value_ownership(
+	type_ref: TypeRef,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[ValueOwnership, Diagnostic]:
+	match type_ref:
+		RecordType(id):
+			layout ?= records.get(record_number(id)).to_result(
+				ownership_error("invalid record identity in ownership representation"),
+			)
+			Ok(
+				match layout.representation:
+					InlineRecord:
+						NoOwnership
+					ManagedRecord:
+						ManagedRecordRoot(id)
+			)
+		VoidType | IntType | FloatType:
+			Ok(NoOwnership)
+		StringType:
+			Ok(ManagedStringLeaf)
+		ListType(element):
+			if same_type(element, StringType):
+				Ok(ManagedStringListRoot)
+			else:
+				Err(ownership_error("unsupported List element in ownership representation"))
+		UnionType(id):
+			match unions.get(union_number(id)):
+				Some(layout):
+					Ok(
+						match layout.representation:
+							InlineUnmanaged:
+								NoOwnership
+							InlineOwningPayload:
+								InlineOwnedFields(id)
+					)
+				None:
+					Err(ownership_error("invalid union identity in ownership representation"))
 
 
 private pure func translated_list[T, U](
