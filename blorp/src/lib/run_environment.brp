@@ -1,18 +1,39 @@
 -- Resolve run-related environment variables before constructing a typed plan.
 -- CLI options always win; downstream compilation never consults these values.
 import:
-	cli_args:
-		CliRunArgs,
-		CliSanitizerMode(CliSanitizeAddressUndefined, CliSanitizeOff, CliSanitizeUndefined),
+	cli_args: CliRunArgs
 
 
 record CliRunEnvironment {
-	timeout: Option[String],
-	sanitizer: Option[String],
 	leak_check: Option[String],
-	threads: Option[String],
-	no_format: Option[String]
+	threads: Option[String]
 }
+
+
+private pure func integer_requirement_message(name: String, allow_zero: Bool) -> String:
+	if allow_zero:
+		"${name} must be a non-negative integer"
+	else:
+		"${name} must be a positive integer"
+
+
+---
+Range-checks a command-line integer, which the argument parser reads without
+checking, so that `--timeout -1` is an error rather than a timeout.
+---
+private pure func checked_integer_option(
+	name: String,
+	value: Option[Int],
+	allow_zero: Bool,
+) -> Result[Option[Int], String]:
+	match value:
+		None:
+			Ok(None)
+		Some(number):
+			if number > 0 or allow_zero and number == 0:
+				Ok(Some(number))
+			else:
+				Err(integer_requirement_message(name, allow_zero))
 
 
 private pure func environment_integer(
@@ -26,95 +47,39 @@ private pure func environment_integer(
 		Some(raw):
 			match raw.parse_int():
 				Some(parsed):
-					if parsed > 0 or allow_zero and parsed == 0:
-						Ok(Some(parsed))
-					else if allow_zero:
-						Err("${name} must be a non-negative integer")
-					else:
-						Err("${name} must be a positive integer")
+					checked_integer_option(name, Some(parsed), allow_zero)
 				None:
-					if allow_zero:
-						Err("${name} must be a non-negative integer")
-					else:
-						Err("${name} must be a positive integer")
+					Err(integer_requirement_message(name, allow_zero))
 
 
-private pure func environment_sanitizer(
-	value: Option[String],
-) -> Result[Option[CliSanitizerMode], String]:
-	match value:
-		None:
-			Ok(None)
-		Some(raw):
-			match (
-				raw
-					.trim()
-					.lower()
-			):
-				"0":
-					Ok(Some(CliSanitizeOff))
-				"off":
-					Ok(Some(CliSanitizeOff))
-				"1":
-					Ok(Some(CliSanitizeAddressUndefined))
-				"address":
-					Ok(Some(CliSanitizeAddressUndefined))
-				"asan":
-					Ok(Some(CliSanitizeAddressUndefined))
-				"undefined":
-					Ok(Some(CliSanitizeUndefined))
-				"ubsan":
-					Ok(Some(CliSanitizeUndefined))
-				_:
-					Err("BLORP_SANITIZE must be one of: 0, 1, off, address, asan, undefined, ubsan")
-
-
-private pure func resolved_integer_option(
+---
+The command-line integer when given, else the integer named by
+`environment_value`. Either source is range-checked.
+---
+pure func resolved_integer_option(
 	cli_value: Option[Int],
 	name: String,
 	environment_value: Option[String],
 	allow_zero: Bool,
 ) -> Result[Option[Int], String]:
 	match cli_value:
-		Some(value):
-			if value > 0 or allow_zero and value == 0:
-				Ok(Some(value))
-			else if allow_zero:
-				Err("${name} must be a non-negative integer")
-			else:
-				Err("${name} must be a positive integer")
+		Some(_):
+			checked_integer_option(name, cli_value, allow_zero)
 		None:
 			environment_integer(name, environment_value, allow_zero)
-
-
-private pure func resolved_sanitizer_option(
-	cli_value: Option[CliSanitizerMode],
-	environment_value: Option[String],
-) -> Result[Option[CliSanitizerMode], String]:
-	match cli_value:
-		Some(value):
-			Ok(Some(value))
-		None:
-			environment_sanitizer(environment_value)
 
 
 pure func resolve_run_args_environment(
 	options: CliRunArgs,
 	environment: CliRunEnvironment,
 ) -> Result[CliRunArgs, String]:
-	timeout ?= resolved_integer_option(
-		options.timeout,
-		"BLORP_TIMEOUT/--timeout",
-		environment.timeout,
-		True,
-	)
+	timeout ?= checked_integer_option("--timeout", options.timeout, True)
 	threads ?= resolved_integer_option(
 		options.threads,
 		"BLORP_THREADS/--threads",
 		environment.threads,
 		False,
 	)
-	sanitizer ?= resolved_sanitizer_option(options.sanitizer, environment.sanitizer)
 	-- The compiler CLI owns leak configuration for its child. Any inherited
 	-- leak mode needs a diagnostic child runtime, including strict/verbose.
 	memory_diagnostics: Bool = options.memory_diagnostics or environment.leak_check != None
@@ -122,9 +87,6 @@ pure func resolve_run_args_environment(
 	Ok({ options |
 			timeout = timeout,
 			threads = threads,
-			sanitizer = sanitizer,
 			leak_check = options.leak_check or environment.leak_check == Some("1"),
-			memory_diagnostics = memory_diagnostics,
-			memory_stats = options.memory_stats,
-			no_format = options.no_format or environment.no_format == Some("1")
+			memory_diagnostics = memory_diagnostics
 		})

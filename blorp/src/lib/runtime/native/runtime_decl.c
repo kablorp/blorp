@@ -2580,41 +2580,6 @@ blorp_MemStats blorp_get_mem_stats(void);
 long blorp_read_memory_counter(long counter);
 void blorp_reset_mem_stats(void);
 void blorp_compiler_memory_checkpoint_c(const char* phase);
-long blorp_runtime_total_allocations_c(void);
-long blorp_runtime_monotonic_microseconds_c(void);
-long blorp_typecheck_body_metrics_enabled_c(void);
-void blorp_typecheck_body_metric_record_c(
-    const char* module_path,
-    const char* callable,
-    long microseconds,
-    long allocations,
-    long source_lines,
-    long is_dependency
-);
-void blorp_typecheck_phase_metric_record_c(
-    const char* phase,
-    long microseconds,
-    long allocations
-);
-void blorp_typecheck_ctfe_metric_record_c(
-    const char* fallback,
-    const char* fallback_callable,
-    long fallback_definition_id,
-    long dependency_modules,
-    long selective_modules,
-    long eager_modules,
-    long worklist_checked_bodies,
-    long bodies_outside_plan
-);
-void blorp_typecheck_body_metrics_report_c(void);
-long blorp_core_lowering_type_metrics_enabled_c(void);
-void blorp_core_lowering_type_metric_record_c(const void* lowered_type);
-void blorp_core_lowering_type_metrics_report_c(void);
-void blorp_core_lowering_node_enter_c(void);
-void blorp_core_lowering_node_exit_c(const char* kind);
-void blorp_core_lowering_source_loc_record_c(long delta);
-void blorp_core_lowering_var_record_c(long delta);
-void blorp_core_lowering_node_kind_report_c(void);
 void blorp_print_live_object_summary(void);
 blorp_SchedulerStats blorp_get_scheduler_stats(void);
 void blorp_reset_scheduler_stats(void);

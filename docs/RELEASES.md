@@ -157,14 +157,10 @@ bin/blorp test --sanitize --timeout 5 blorp/test/test_runtime/test_types/test_bo
 bin/blorp lsp </dev/null >"$lsp_out"
 ```
 
-The environment smoke also checks the timeout, standard-library, no-format,
-and sanitizer routes:
+The preview smoke also checks the `--std-dir` route:
 
 ```bash
-env BLORP_TIMEOUT=5 bin/blorp test blorp/test/test_runtime/test_types/test_bool.brp
-env BLORP_NO_FORMAT=1 \
-  bin/blorp check --std-dir standard_library/src blorp/test/test_runtime/test_types/test_bool.brp
-env BLORP_SANITIZE=1 bin/blorp test --timeout 5 \
+bin/blorp check --no-format --std-dir standard_library/src \
   blorp/test/test_runtime/test_types/test_bool.brp
 ```
 

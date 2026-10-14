@@ -85,13 +85,8 @@ CHILD_PIDS=()
 BLORP_DIRECT_TEST_ENV=(
     env
     -u BLORP_TEST_TIMEOUT
-    -u BLORP_TIMEOUT
-    -u BLORP_SANITIZE
     -u BLORP_LEAK_CHECK
-    -u BLORP_NO_FORMAT
     -u BLORP_GATE_RESULT
-    -u BLORP_TEST_RETAIN_RUN_ARTIFACTS
-    -u BLORP_TEST_COMPILER_BIN
     -u BLORP_TEST_TIMINGS
 )
 
@@ -2433,12 +2428,8 @@ expect_output_contains "implicit test timeout succeeds" 0 \
 	"$BLORP_BIN" test --suite \
 	blorp/test/test_runtime/test_types/test_bool.brp
 expect_test_environment_stays_blorp_owned BLORP_TEST_TIMEOUT 5
-expect_test_environment_stays_blorp_owned BLORP_TIMEOUT 5
-expect_test_environment_stays_blorp_owned BLORP_SANITIZE off
 expect_test_environment_stays_blorp_owned BLORP_LEAK_CHECK 1
 expect_test_environment_stays_blorp_owned BLORP_GATE_RESULT cli-test
-expect_test_environment_stays_blorp_owned BLORP_TEST_RETAIN_RUN_ARTIFACTS 1
-expect_test_environment_stays_blorp_owned BLORP_TEST_COMPILER_BIN "$TMPDIR_CLI/alternate-compiler"
 expect_test_environment_stays_blorp_owned BLORP_TEST_TIMINGS 1
 expect_output_contains "Blorp-owned test emits requested gate summary" 0 \
 	"BLORP_GATE_RESULT gate=cli-test status=PASS passed=7 failed=0 tests=7" \

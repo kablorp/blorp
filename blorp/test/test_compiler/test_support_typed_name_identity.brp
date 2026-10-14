@@ -1,19 +1,10 @@
--- Name-identity census over typed programs.
---
--- Every `ParsedIdentifier` carries a `NameId` into the compilation's name
--- table. This census walks the identifiers a typed program stores directly and reports how
--- many resolve to their own spelling through that table, so the identifiers that still carry a placeholder id
--- (`name_id_pending_dynamic_intern`) or a wrong one are counted rather than
--- silently trusted. Report-only, like the binder identity contract: the
--- pipeline runs it only when `BLORP_NAME_IDENTITY` is set (`report` prints the
--- counts to stderr, `strict` also fails the compilation on any unresolved or
--- mismatched identifier), so an ordinary compilation pays nothing for it.
---
--- Typecheck diagnostics render an identifier by id through the graph's table whenever
--- the graph is discovery-driven. `mismatched` is exactly the shape that would render
--- the wrong spelling and must stay zero; `unresolved` (identifiers that still carry a
--- placeholder id) renders correctly through the text fallback, so it is a
--- migration count (2755 on the self-compile), not a rendering error.
+-- Test-only checker: every `ParsedIdentifier` carries a `NameId` into the
+-- compilation's name table. This census walks the identifiers a typed program
+-- stores directly and counts how many resolve to their own spelling through
+-- that table. Identifiers that still carry a placeholder id
+-- (`name_id_pending_dynamic_intern`) are `unresolved`; ids that resolve to a
+-- different spelling are `mismatched` and render the wrong name in
+-- diagnostics, so they must stay zero.
 --
 -- Coverage: the identifiers stored directly on typed expression nodes (names,
 -- field accesses and record fields, assignments, tuple destructuring,
@@ -21,19 +12,21 @@
 -- declarations) and the names of function and global declarations. Pattern
 -- binders, for-loop binders, and parameter binders are not walked.
 import:
-	../stage_02_lex/name_table:
+	../../src/compiler/stage_02_lex/name_table:
 		NameId,
 		NameTable,
 		name_id_pending_dynamic_intern,
 		name_id_unseeded_spelling,
 		name_ids_equal,
 		name_spelling,
-		name_spelling_or_text,
 		synthesized_name_id,
-	../stage_03_parse/parsed_ast: ParsedIdentifier
-	decl: TypedDecl(TypedGlobalVarDecl, TypedPrivateDecl), TypedProgram, typed_decl_function_infos
-	graph/typed_expr_children: typed_expr_children
-	infer:
+	../../src/compiler/stage_03_parse/parsed_ast: ParsedIdentifier
+	../../src/compiler/stage_06_typecheck/decl:
+		TypedDecl(TypedGlobalVarDecl, TypedPrivateDecl),
+		TypedProgram,
+		typed_decl_function_infos,
+	../../src/compiler/stage_06_typecheck/graph/typed_expr_children: typed_expr_children
+	../../src/compiler/stage_06_typecheck/infer:
 		ResolvedCallInfo,
 		ResolvedCallTarget(ResolvedClosureCall),
 		TypedExpr(
@@ -53,19 +46,15 @@ carry an id that resolves to a different spelling than their text.
 record NameIdentityCensus {
 	resolved: Int,
 	unresolved: Int,
-	mismatched: Int,
-	violation_examples: List[String]
+	mismatched: Int
 }
 
 
 NAME_IDENTITY_CENSUS_EMPTY: NameIdentityCensus = {
 	resolved = 0,
 	unresolved = 0,
-	mismatched = 0,
-	violation_examples = []
+	mismatched = 0
 }
-
-private MAX_VIOLATION_EXAMPLES: Int = 12
 
 
 pure func name_identity_census_sum(
@@ -75,20 +64,12 @@ pure func name_identity_census_sum(
 	{
 		resolved = left.resolved + right.resolved,
 		unresolved = left.unresolved + right.unresolved,
-		mismatched = left.mismatched + right.mismatched,
-		violation_examples = left.violation_examples.concat(right.violation_examples)
+		mismatched = left.mismatched + right.mismatched
 	}
 
 
 pure func name_identity_census_violations(census: NameIdentityCensus) -> Int:
 	census.unresolved + census.mismatched
-
-
-private pure func census_with_example(census: NameIdentityCensus, example: String) -> List[String]:
-	if census.violation_examples.length() < MAX_VIOLATION_EXAMPLES:
-		census.violation_examples.append(example)
-	else:
-		census.violation_examples
 
 
 private pure func census_identifier(
@@ -101,25 +82,9 @@ private pure func census_identifier(
 			if spelling == identifier.text:
 				{ census | resolved = census.resolved + 1 }
 			else:
-				{ census |
-					mismatched = census.mismatched + 1,
-					violation_examples = census_with_example(
-						census,
-						"mismatched `" + identifier.text + "` resolves to `" + spelling + "`",
-					)
-				}
+				{ census | mismatched = census.mismatched + 1 }
 		None:
-			{ census |
-				unresolved = census.unresolved + 1,
-				violation_examples = census_with_example(
-					census,
-					"unresolved `" + name_spelling_or_text(
-						names,
-						identifier.name,
-						identifier.text,
-					) + "`",
-				)
-			}
+			{ census | unresolved = census.unresolved + 1 }
 
 
 ---
@@ -168,13 +133,7 @@ private pure func census_call_spelling(
 			):
 				{ census | resolved = census.resolved + 1 }
 			else:
-				{ census |
-					mismatched = census.mismatched + 1,
-					violation_examples = census_with_example(
-						census,
-						"call source name `" + call.source_name + "` has id spelled `" + spelling + "`",
-					)
-				}
+				{ census | mismatched = census.mismatched + 1 }
 		None:
 			census
 
