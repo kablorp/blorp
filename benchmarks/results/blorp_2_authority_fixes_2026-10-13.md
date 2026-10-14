@@ -194,3 +194,36 @@ exact files, semantics, tests, red/green evidence, remaining uncertainty and cos
 Stop and consult the coordinator if a private builder would leak into public
 facts, a proposed remedy needs a new mechanism, a phase owner is ambiguous, or a
 gate/ceiling fails. Adjacent desirable changes remain separate work.
+
+## Tuple slice evidence
+
+Nine actual tuple matches were replaced; two remaining parenthesized production
+matches contain scalar calls. Closed role/type-candidate dispatch exhausts its
+left domain. Six production files grow by 54 physical lines; two test files grow
+by 55. This is the subset/correctness growth anticipated above.
+
+The seven focused native suites pass 176 callbacks (`tuple-green`). The new
+candidate matrix was independently exercised through a single-callback Blorp
+suite: changing Int self-equality to False fails exactly that callback
+(`tuple-matrix-oracle-3`); restoring the frozen source passes
+(`tuple-matrix-restored-2`). Earlier broad mutation attempts broke namespace
+closure convergence, and earlier scratch harness attempts failed authoring;
+those retained receipts are excluded from acceptance evidence.
+
+The frozen baseline binary is SHA-256
+`2f6c8a0f5188336ccb944281dcdd2d4e4a661802d80d66168f89c36b7ae3b508`;
+the host is `7c28b09440cfabed7bd4140f6dd46287f9fe82be43f1cec56cc6156ba712c900`.
+The tuple candidate was generated with that host and linked at `-O0` with
+`BLORP_MEMORY_DIAGNOSTICS=1`. Its build receipts, frozen patch/hashes, all raw
+samples and sampled process activity are under `build/authority-fixes/`.
+
+`tuple-cost-receipt` records 216 paired samples over all 36 frozen unchanged
+inputs, three per binary/input. Allocations were stable, balanced and unchanged;
+the largest minimum-retired-instruction increase was 0.139%, within the 3%
+ceiling. Every input emitted byte-identical C across both binaries and all
+samples. The command uses the same executed binary and output path on both
+sides. This measures the complete pilot CLI on owned inputs, not self-compilation.
+
+An independent compiler expert approved the exact frozen production/test patch
+with zero findings. Broader sanitized and e2e gates remain integration work for
+the combined changes; no final release acceptance is claimed by this slice.
