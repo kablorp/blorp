@@ -1,35 +1,31 @@
 ---
-Call contracts: arity and purity at the call boundary, then one-way generic
-argument inference and instantiation of the callee's signature.
+Call contracts prove arity and purity. Accepted-type matching supports method
+selection; expression-local inference and publication belong to check_values.
 ---
 import:
 	./check_errors:
 		ArgumentMismatch,
 		CallError(
-			ArgumentCountMismatch, ArgumentTypeMismatch, GenericArgumentConflict, ImpureCall,
-			UninferableTypeParameter,
+			ArgumentCountMismatch, GenericArgumentConflict, ImpureCall,
 		),
 		CheckError,
 		CheckerInvariant(InvalidParameterDeclaration, InvalidResolvedFunction),
-		ExpectedTypeSite(SourceAnnotation),
 		call_error,
 		checker_invariant,
 	./check_model:
-		CallTarget(UserFunction),
-		CheckedCall,
 		FunctionSignature,
 		TypeParameterId,
-		TypeParameterOwner(FunctionDeclaration),
-		TypeRef(AppliedUnionType, ListType, ParameterType),
+		TypeParameterOwner,
+		TypeRef(AppliedUnionType, AppliedRecordType, ListType, ParameterType),
 		TypeUse,
 		parameter_owner,
 		parameter_position,
 		same_owner,
 		same_type,
 		type_parameter_id,
-	./check_signatures: AcceptedFunction, validate_pure_result
+	./check_signatures: AcceptedFunction
 	./check_types: Substitution, substitute_type
-	declarations: FunctionId, function_number, union_number
+	declarations: FunctionId, function_number, record_number, union_number
 	int as IntOps
 	option: to_result
 	syntax:
@@ -70,20 +66,6 @@ fixed record FunctionContract {
 fixed record ReceiverContract {
 	receiver: TypeUse,
 	call: FunctionContract
-}
-
-
--- A checked argument's type and the parameter it must satisfy.
-fixed record ArgumentObligation {
-	parameter: TypeUse,
-	actual: TypeUse
-}
-
-
--- A checked call and its result type, once the callee's type arguments are known.
-fixed record InstantiatedCall {
-	call: CheckedCall,
-	return_type: TypeRef
 }
 
 
@@ -264,6 +246,24 @@ pure func infer_arguments(
 					Ok(inference)
 		ParameterType(parameter):
 			constrain_argument(inference, parameter, actual, obligation)
+		AppliedRecordType(owner, expected_arguments):
+			match actual:
+				AppliedRecordType(actual_owner, actual_arguments):
+					if (
+						IntOps.equals(record_number(owner), record_number(actual_owner))
+						and IntOps.equals(expected_arguments.length(), actual_arguments.length())
+					):
+						infer_type_arguments(
+							expected_arguments,
+							actual_arguments,
+							inference,
+							obligation,
+							0,
+						)
+					else:
+						Ok(inference)
+				_:
+					Ok(inference)
 		AppliedUnionType(owner, expected_arguments):
 			match actual:
 				AppliedUnionType(actual_owner, actual_arguments):
@@ -354,158 +354,6 @@ private pure func constrain_argument(
 				))
 
 
--- Every parameter must have been inferred before the callee is instantiated.
-private pure func inferred_arguments(
-	inference: Inference,
-	span: Span,
-	arguments: List[TypeRef],
-) -> Result[List[TypeRef], CheckError]:
-	match inference.inferred.get(arguments.length()):
-		None:
-			Ok(arguments)
-		Some(None):
-			parameter = type_parameter_id(inference.owner, arguments.length())
-			Err(call_error(span, UninferableTypeParameter(parameter)))
-		Some(Some(argument)):
-			inferred_arguments(
-				inference,
-				span,
-				arguments.append(argument.value_type),
-			)
-
-
--- Instantiates the callee for the checked argument types, a receiver first,
--- then checks each argument against its instantiated parameter. Every child
--- was checked first, so child errors precede inference and mismatches.
-pure func instantiate_contract(
-	contract: FunctionContract,
-	obligations: List[ArgumentObligation],
-) -> Result[InstantiatedCall, CheckError]:
-	signature = contract.signature
-	count = obligations.length()
-
-	if signature.type_parameters.is_empty():
-		valid ?= check_argument_types(obligations, count, contract.span, 0)
-		Ok({
-			call = {
-				target = UserFunction(contract.function, []),
-				span = contract.span
-			},
-			return_type = signature.return_type.value_type,
-		})
-	else:
-		owner = FunctionDeclaration(contract.function)
-		inferred ?= infer_call(
-			obligations,
-			start_inference(owner, signature.type_parameters),
-			0,
-		)
-		types ?= inferred_arguments(inferred, contract.span, [])
-		substitution: Substitution = {
-			owner = owner,
-			values = types
-		}
-		instantiated ?= substitute_obligations(obligations, substitution, [])
-		return_type ?= substitute_type(
-			signature.return_type.value_type,
-			substitution,
-			contract.span,
-		)
-		pure_result ?= validate_pure_result(signature.purity, return_type, contract.span)
-		valid ?= check_argument_types(instantiated, count, contract.span, 0)
-		Ok({
-			call = {
-				target = UserFunction(contract.function, types),
-				span = contract.span
-			},
-			return_type = return_type,
-		})
-
-
--- Scans arguments in order so the earliest conflicting child wins.
-private pure func infer_call(
-	obligations: List[ArgumentObligation],
-	inference: Inference,
-	position: Int,
-) -> Result[Inference, CheckError]:
-	match obligations:
-		[]:
-			Ok(inference)
-		[obligation, ...rest]:
-			mismatch: ArgumentMismatch = {
-				expected = obligation.parameter.value_type,
-				actual = obligation.actual,
-				argument_position = position,
-				expected_site = SourceAnnotation(obligation.parameter.span)
-			}
-			next ?= infer_arguments(
-				obligation.parameter.value_type,
-				obligation.actual.value_type,
-				inference,
-				mismatch,
-			)
-			infer_call(
-				rest,
-				next,
-				IntOps.add(position, 1),
-			)
-
-
-private pure func substitute_obligations(
-	obligations: List[ArgumentObligation],
-	substitution: Substitution,
-	substituted: List[ArgumentObligation],
-) -> Result[List[ArgumentObligation], CheckError]:
-	match obligations:
-		[]:
-			Ok(substituted)
-		[obligation, ...rest]:
-			parameter = obligation.parameter
-			value ?= substitute_type(parameter.value_type, substitution, parameter.span)
-			substitute_obligations(
-				rest,
-				substitution,
-				substituted.append({ obligation | parameter = { parameter | value_type = value } }),
-			)
-
-
--- A lone argument's mismatch reports at the call; with several, at the argument.
-private pure func check_argument_types(
-	obligations: List[ArgumentObligation],
-	count: Int,
-	call_span: Span,
-	position: Int,
-) -> Result[Void, CheckError]:
-	match obligations:
-		[]:
-			Ok(void)
-		[obligation, ...rest]:
-			expected = obligation.parameter
-
-			if same_type(obligation.actual.value_type, expected.value_type):
-				check_argument_types(
-					rest,
-					count,
-					call_span,
-					IntOps.add(position, 1),
-				)
-			else:
-				span = if IntOps.equals(count, 1):
-					call_span
-				else:
-					obligation.actual.span
-
-				Err(call_error(
-					span,
-					ArgumentTypeMismatch({
-						expected = expected.value_type,
-						actual = obligation.actual,
-						argument_position = position,
-						expected_site = SourceAnnotation(expected.span),
-					}),
-				))
-
-
 pure func contains_parameter(value_type: TypeRef) -> Bool:
 	match value_type:
 		ListType(element):
@@ -513,6 +361,15 @@ pure func contains_parameter(value_type: TypeRef) -> Bool:
 		ParameterType(_):
 			True
 		AppliedUnionType(_, arguments):
+			var found = False
+
+			for argument in arguments:
+				if contains_parameter(argument):
+					found = True
+					break
+
+			found
+		AppliedRecordType(_, arguments):
 			var found = False
 
 			for argument in arguments:

@@ -1,0 +1,219 @@
+import:
+	../../src/assemble: parsed_contents
+	../../src/names: NameTable, name_spelling
+	../../src/source: module_id, module_source, root_module_id, same_source
+	../../src/syntax:
+		FieldPattern(FieldName, FieldWildcard),
+		ParsedBody(ParsedMatchBody),
+		ParsedPattern(PatternConstructor, PatternName),
+		TypeSyntax(AtomicType, AppliedType), Span, type_span,
+	module_input: ModuleInput, PRIMITIVE_BASE, parse_modules_with_base
+	test: TestSuite
+
+
+private MAIN: String =
+	|func main() -> Int:
+	|    0
+	|
+
+
+private IDENTIFIER_HELP: String = "use an ASCII identifier starting with a letter or underscore; 'func', 'pure', 'match', 'var', and lone '_' are reserved"
+
+
+private pure func atomic_named(names: NameTable, annotation: TypeSyntax, spelling: String) -> Bool:
+	match annotation:
+		AtomicType(name): name_spelling(names, name.id) == Some(spelling)
+		_: False
+
+
+private pure func box_parameter(names: NameTable, annotation: TypeSyntax) -> Bool:
+	match annotation:
+		AppliedType(name, arguments, _):
+			match arguments:
+				[argument]: name_spelling(names, name.id) == Some("Box") and atomic_named(names, argument, "A")
+				_: False
+		_: False
+
+
+private pure func nested_annotation(names: NameTable, annotation: TypeSyntax, expected: Span) -> Bool:
+	match annotation:
+		AppliedType(box, arguments, outer):
+			match arguments:
+				[argument]:
+					match argument:
+						AppliedType(result, parameters, inner):
+							match parameters:
+								[left, right]:
+									(
+										name_spelling(names, box.id) == Some("Box")
+										and name_spelling(names, result.id) == Some("Result")
+										and atomic_named(names, left, "A") and atomic_named(names, right, "B")
+										and same_source(outer.source, expected.source)
+										and outer.start == expected.start and outer.end == expected.end
+										and same_source(inner.source, expected.source)
+										and inner.start == outer.start + 4 and inner.end == outer.end - 1
+									)
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+pure func test_assembly_preserves_nested_field_annotations_and_record_parameters() -> Bool:
+	beginning: String =
+		|fixed record Box[T] { value: T }
+		|fixed union Pair[A, B]:
+		|    Pair(Box[A],
+	prefix = beginning + " "
+	annotation = "Box[Result[A, B]]"
+	source = prefix + annotation + ")\n    Empty\n    Unit(Void)"
+	inputs: List[ModuleInput] = [{ source = MAIN, targets = [] }, { source = source, targets = [] }]
+	match (parse_modules_with_base(inputs, PRIMITIVE_BASE), module_id(1)):
+		(Ok(program), Some(module)):
+			contents = parsed_contents(program)
+			match (contents.records, contents.unions):
+				([parsed_record], [parsed_union]):
+					match (parsed_record.type_parameters, parsed_record.fields, parsed_union.type_parameters, parsed_union.variants):
+						([parameter], [record_field], [first_parameter, second_parameter], [pair, empty, unit]):
+							match (pair.fields, empty.fields, unit.fields):
+								([first, second], [], [unit_type]):
+									(
+										name_spelling(contents.names, parameter.id) == Some("T")
+										and name_spelling(contents.names, record_field.name.id) == Some("value")
+										and name_spelling(contents.names, first_parameter.id) == Some("A")
+										and name_spelling(contents.names, second_parameter.id) == Some("B")
+										and box_parameter(contents.names, first)
+										and nested_annotation(contents.names, second, {
+											source = module_source(module), start = prefix.length(), end = prefix.length() + annotation.length()
+										})
+										and atomic_named(contents.names, unit_type, "Void")
+										and type_span(record_field.type_name).start == 29
+										and type_span(record_field.type_name).end == 30
+									)
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+pure func test_pattern_positions_survive_trivia_and_eof_without_lf() -> Bool:
+	beginning: String =
+		|pure func second(value: Pair) -> String:
+		|    match value:
+		|
+	prefix = beginning + "        "
+	pattern = "Pair(_, second)"
+	suffix: String =
+		|: second
+		|
+		|  -- arbitrary trivia indentation
+		|        Empty: "empty"
+	source = prefix + pattern + suffix
+	match parse_modules_with_base([{ source = source, targets = [] }], PRIMITIVE_BASE):
+		Err(_): False
+		Ok(program):
+			contents = parsed_contents(program)
+			match contents.functions:
+				[function]:
+					match function.body:
+						ParsedMatchBody(matched):
+							match matched.arms:
+								[first, last]:
+									match first.pattern:
+										PatternConstructor(_, fields, span):
+											match fields:
+												[zero, one]:
+													match (zero, one, last.pattern):
+														(FieldWildcard(wildcard), FieldName(second), PatternName(empty)):
+															(
+																wildcard.start == prefix.length() + 5
+																and wildcard.end == prefix.length() + 6
+																and second.span.start == prefix.length() + 8
+																and second.span.end == prefix.length() + 14
+																and name_spelling(contents.names, second.id) == Some("second")
+																and name_spelling(contents.names, empty.id) == Some("Empty")
+																and same_source(span.source, module_source(root_module_id()))
+																and same_source(wildcard.source, span.source)
+																and same_source(second.span.source, span.source)
+																and span.start == prefix.length()
+																and span.end == prefix.length() + pattern.length()
+																and last.body.span.end == source.length()
+															)
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_variant_positions_survive_mixed_indentation_trivia() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|    First(Int, String)
+		|
+		| 	 -- trivia is not a code indentation prefix
+		|    Empty
+		|    Last(Void, Float)
+	match parse_modules_with_base([{ source = source, targets = [] }], PRIMITIVE_BASE):
+		Err(_): False
+		Ok(program):
+			contents = parsed_contents(program)
+			match contents.unions:
+				[declaration]:
+					match declaration.variants:
+						[first, empty, last]:
+							match (first.fields, empty.fields, last.fields):
+								([integer, string], [], [unit, float]):
+									(
+										name_spelling(contents.names, first.name.id) == Some("First")
+										and name_spelling(contents.names, empty.name.id) == Some("Empty")
+										and name_spelling(contents.names, last.name.id) == Some("Last")
+										and atomic_named(contents.names, integer, "Int") and atomic_named(contents.names, string, "String")
+										and atomic_named(contents.names, unit, "Void") and atomic_named(contents.names, float, "Float")
+									)
+								_: False
+						_: False
+				_: False
+
+
+private pure func rejects(prefix: String, marked: String, suffix: String, message: String, help: String) -> Bool:
+	match parse_modules_with_base([{ source = prefix + marked + suffix, targets = [] }], PRIMITIVE_BASE):
+		Ok(_): False
+		Err(error):
+			(
+				error.message == message and error.help == help
+				and same_source(error.span.source, module_source(root_module_id()))
+				and error.span.start == prefix.length()
+				and error.span.end == prefix.length() + marked.length()
+				and error.note.is_none()
+			)
+
+
+pure func test_variant_field_separators_reject_at_the_written_token() -> Bool:
+	prefix = "fixed union Pair:\n    Pair(Int, "
+	(
+		rejects(prefix, ")", "", "expected a payload type", IDENTIFIER_HELP)
+		and rejects(prefix, ",", "String)", "expected a payload type", IDENTIFIER_HELP)
+		and rejects("fixed union Pair:\n    Pair(", ")", "", "expected a payload type", "write bare Variant for no fields, or Variant(String, Int) for fields")
+	)
+
+
+pure func test_pattern_field_separators_reject_at_the_written_token() -> Bool:
+	prefix = "func main() -> Int:\n    match value:\n        Pair(_, "
+	(
+		rejects(prefix, ")", ": 0", "expected a field binding or '_'", IDENTIFIER_HELP)
+		and rejects(prefix, ",", "second): 0", "expected a field binding or '_'", IDENTIFIER_HELP)
+	)
+
+
+tests: TestSuite = {
+	description = "Aggregate syntax through structural parsing and assembly",
+	tests = [
+		("nested annotations and record parameters retain module spans", test_assembly_preserves_nested_field_annotations_and_record_parameters),
+		("pattern positions survive trivia and EOF without LF", test_pattern_positions_survive_trivia_and_eof_without_lf),
+		("variant positions survive trivia indentation", test_variant_positions_survive_mixed_indentation_trivia),
+		("variant separators retain exact diagnostic token", test_variant_field_separators_reject_at_the_written_token),
+		("pattern separators retain exact diagnostic token", test_pattern_field_separators_reject_at_the_written_token),
+	]
+}

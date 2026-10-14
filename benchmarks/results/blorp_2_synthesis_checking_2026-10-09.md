@@ -18,7 +18,7 @@ No public testing API, inference variables, unifier, syntax or generic capabilit
 was added. Contextual inference and structural unification remain later slices.
 
 Production changes are confined to `src/check.brp`; README explains the seam.
-Root owns the accompanying approved sequence in `GENERICS_PLAN.md`.
+Root owns the accompanying approved sequence in the [historical generics plan](https://github.com/kablorp/blorp/blob/79deebd455856e5955d215ff2ec36f17860feb14/blorp_2/GENERICS_PLAN.md).
 
 ## Test-first contracts
 

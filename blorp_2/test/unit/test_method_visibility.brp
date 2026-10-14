@@ -1,5 +1,7 @@
 import:
-	../../src/check: check, check_errors
+	../../src/check_model as Model
+	../../src/declarations as Declaration
+	../../src/check: check, check_errors, checked_functions
 	../../src/check_errors as Errors
 	../../src/check_render: render_failure
 	../../src/lex: lex
@@ -10,6 +12,7 @@ import:
 	../../src/syntax: Diagnostic, same_span
 	option: to_result
 	module_input: ModuleInput, TEST_BASE, parse_modules
+	input: setup_diagnostic
 	test: TestSuite
 
 
@@ -497,9 +500,121 @@ pure func test_ambiguous_forwarded_type_diagnostic_is_exact() -> Bool:
 	)
 
 
+private GENERIC_LIBRARY_PREFIX: String =
+	|import:
+	|    _base: String
+	|fixed record Box[T] { value: T, label: String }
+	|fixed union Pair[A, B]:
+	|    Pair(A,${" "}
+
+
+private pure func generic_library_program() -> Result[ParsedProgram, Diagnostic]:
+	library = module_id(1).get_or(root_module_id())
+	foundation = module_id(2).get_or(root_module_id())
+	root_source: String =
+		|import:
+		|    ./library: Box, Pair(Pair)
+		|pure func make(value: String) -> Pair[Box[String], String]:
+		|    Pair({ value = value, label = value }, value)
+		|pure func escape(value: Pair[Box[String], String]) -> String:
+		|    match value:
+		|        Pair(_, second): second
+		|func main() -> Int:
+		|    unused = escape(make("42"))
+		|    0
+		|
+	prelude_source: String =
+		|import:
+		|    _base: Int, String
+		|
+	root ?= append_role(begin_program(), root_source, 0, [library], UserModule)
+	declarations ?= append_role(root, GENERIC_LIBRARY_PREFIX + "B)\n", 1, [foundation], LibraryModule)
+	base ?= append_role(declarations, TEST_BASE.types, 2, [], FoundationTypesModule)
+	prelude ?= append_role(base, prelude_source, 3, [foundation], FoundationPreludeModule)
+	seal_program(prelude)
+
+
+private pure func second_field_escapes(
+	function: Model.CheckedFunction,
+	variant: Declaration.VariantId,
+	expected_parameter: Model.TypeRef,
+) -> Bool:
+	match (function.signature.parameters.get(0), function.body):
+		(Some(parameter), Model.CheckedMatchBody(body)):
+			match body.arms:
+				[arm]:
+					match (arm.pattern, arm.body):
+						(Model.VariantCase(selected, captures), Model.ReturnExpression(result)):
+							-- Indexed observations avoid the host's nested List[Option] pattern trap.
+							match (captures.get(0), captures.get(1), result.base):
+								(Some(None), Some(Some(captured)), Model.ReturnBinding(returned)):
+									(
+										Model.same_variant(selected, variant)
+										and captures.length() == 2
+										and Model.binding_number(captured) == 1
+										and Model.binding_number(returned) == Model.binding_number(captured)
+										and Model.same_type(result.base_type, Model.StringType)
+										and result.operations.is_empty()
+										and Model.same_type(parameter.value_type, expected_parameter)
+									)
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+private pure func library_aggregate_facts(
+	box: Model.CheckedRecord,
+	pair: Model.CheckedUnion,
+	escape: Model.CheckedFunction,
+	library: ModuleId,
+) -> Bool:
+	match (box.type_parameters, pair.type_parameters, pair.variants, box.fields.get(0)):
+		([record_parameter], [first_parameter, second_parameter], [variant], Some(field)):
+			match (Model.parameter_owner(record_parameter), Model.parameter_owner(second_parameter), variant.fields):
+				(Model.RecordDeclaration(record_owner), Model.UnionDeclaration(union_owner), [first, second]):
+					expected = Model.AppliedUnionType(union_owner, [Model.AppliedRecordType(record_owner, [Model.StringType]), Model.StringType])
+					(
+						Declaration.record_number(record_owner) == 0
+						and Declaration.union_number(union_owner) == 0
+						and Model.parameter_position(record_parameter) == 0
+						and Model.parameter_position(first_parameter) == 0
+						and Model.parameter_position(second_parameter) == 1
+						and Model.same_owner(Model.parameter_owner(first_parameter), Model.UnionDeclaration(union_owner))
+						and Model.field_number(field.id) == 0
+						and Declaration.record_number(Model.field_owner(field.id)) == 0
+						and same_source(field.name.span.source, module_source(library))
+						and Model.same_type(field.value_type.value_type, Model.ParameterType(record_parameter))
+						and Model.same_type(first.value_type, Model.ParameterType(first_parameter))
+						and Model.same_type(second.value_type, Model.ParameterType(second_parameter))
+						and not Model.same_type(second.value_type, Model.ParameterType(record_parameter))
+						and same_source(second.span.source, module_source(library))
+						and second.span.start == GENERIC_LIBRARY_PREFIX.length()
+						and second.span.end == GENERIC_LIBRARY_PREFIX.length() + 1
+						and same_source(variant.name.span.source, module_source(library))
+						and Declaration.union_number(Declaration.variant_owner(variant.id)) == 0
+						and Declaration.variant_number(variant.id) == 0
+						and second_field_escapes(escape, variant.id, expected)
+					)
+				_: False
+		_: False
+
+
+pure func test_imported_aggregate_fields_keep_owners_and_library_annotations() -> Bool:
+	match generic_library_program().and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic)):
+		Err(_): False
+		Ok(program):
+			facts = checked_functions(program)
+			match (facts.records, facts.unions.get(0), facts.functions.get(1), module_id(1)):
+				([box], Some(pair), Some(escape), Some(library)):
+					library_aggregate_facts(box, pair, escape, library)
+				_: False
+
+
 tests: TestSuite = {
 	description = "method visibility",
 	tests = [
+		("imported aggregate owners and library annotation spans", test_imported_aggregate_fields_keep_owners_and_library_annotations),
 		("type and function selection diagnostic is exact", test_type_and_function_selection_diagnostic_is_exact),
 		("missing method type diagnostic is exact", test_missing_method_type_diagnostic_is_exact),
 		("ambiguous forwarded type diagnostic is exact", test_ambiguous_forwarded_type_diagnostic_is_exact),

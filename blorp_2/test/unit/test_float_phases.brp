@@ -12,7 +12,7 @@ import:
 	compilation: compile, compile_modules
 	float as FloatOps
 	input: setup_diagnostic
-	module_input: parse_modules, parse_modules_with_base, PRIMITIVE_BASE, STRING_OPERATIONS
+	module_input: PRIMITIVE_BASE, STRING_OPERATIONS, parse_modules, parse_modules_with_base
 	test: TestSuite
 
 
@@ -133,10 +133,21 @@ pure func test_format_selects_fresh_string_runtime() -> Bool:
 		|    length(format_number(0.1))
 		|
 
-	match compile_modules([
-		{ source = source, targets = [1] },
-		{ source = STRING_OPERATIONS, targets = [] },
-	], PRIMITIVE_BASE):
+	match (
+		compile_modules(
+			[
+				{
+					source = source,
+					targets = [1]
+				},
+				{
+					source = STRING_OPERATIONS,
+					targets = []
+				},
+			],
+			PRIMITIVE_BASE,
+		)
+	):
 		Ok(output):
 			(
 				output.contains("=blorp_float_to_string(")
@@ -181,9 +192,14 @@ pure func test_integer_only_program_has_no_float_runtime() -> Bool:
 
 
 private pure func parsed_number() -> Result[ParsedProgram, Diagnostic]:
-	parse_modules([
-		{ source = literal_source("-0.0"), targets = [] },
-	])
+	parse_modules(
+		[
+			{
+				source = literal_source("-0.0"),
+				targets = []
+			},
+		],
+	)
 
 
 private pure func checked_number() -> Result[CheckedProgram, Diagnostic]:
@@ -414,7 +430,7 @@ pure func test_checked_parse_roles_use_float_payload_not_int() -> Bool:
 											match contents.unions.get(Concrete.union_number(owner)):
 												Some(layout):
 													match (layout.variants, layout.representation):
-														([None, Some(Concrete.FloatType)], Concrete.InlineUnmanaged):
+														([[], [Concrete.FloatType]], Concrete.InlineUnmanaged):
 															(
 																Concrete.variant_number(
 																	roles.present,
@@ -482,9 +498,15 @@ private pure func foundation_rejects(
 						(Builtins.DuplicateBuiltinType(Builtins.FloatType), Builtins.DuplicateBuiltinType(Builtins.FloatType)): True
 						_: False
 					(
-						kind_matches and same_source(error.span.source, module_source(parsed_contents(program).foundation.types))
-						and error.span.start == start and error.span.end == end
-						and error.message == message and error.help == help
+						kind_matches
+						and same_source(
+							error.span.source,
+							module_source(parsed_contents(program).foundation.types),
+						)
+						and error.span.start == start
+						and error.span.end == end
+						and error.message == message
+						and error.help == help
 						and error.note.is_none()
 					)
 
@@ -514,8 +536,6 @@ pure func test_duplicate_float_foundation_role_has_exact_occurrence() -> Bool:
 
 private fixed union RejectionKind:
 	MainType
-	RecordField
-	DirectPayload
 	RuntimeContract
 	RolePayload
 
@@ -550,10 +570,6 @@ private pure func check_rejects(
 
 					kind_matches = match (errors.first.kind, kind):
 						(Errors.SignatureRejection(Errors.MainReturnType(Check.FloatType)), MainType):
-							True
-						(Errors.TypeDeclarationRejection(Errors.UnsupportedRecordField(Check.FloatType)), RecordField):
-							True
-						(Errors.TypeDeclarationRejection(Errors.UnsupportedPayloadAnnotation(_, Errors.IntegerPayload)), DirectPayload):
 							True
 						(Errors.BuiltinRejection(Errors.BuiltinContractMismatch(_)), RuntimeContract):
 							True
@@ -590,39 +606,47 @@ pure func test_float_main_is_rejected_before_body() -> Bool:
 	)
 
 
-pure func test_direct_float_record_field_stays_out_of_scope() -> Bool:
+pure func test_direct_float_record_field_is_inline() -> Bool:
 	source: String =
 		|fixed record Point { value: Float }
+		|pure func make() -> Point:
+		|    { value = 2.5 }
 		|func main() -> Int:
+		|    unused = make().value
 		|    0
 		|
-	start = "fixed record Point { value: ".length()
-	check_rejects(
-		source,
-		RecordField,
-		start,
-		start + 5,
-		"fixed record fields must be Int",
-		"use Int fields; other record field types are not supported yet",
-	)
+
+	match compile(source):
+		Ok(_):
+			True
+		Err(_):
+			False
 
 
-pure func test_direct_float_union_payload_stays_out_of_scope() -> Bool:
+pure func test_direct_float_union_payload_publishes_float_type() -> Bool:
 	source: String =
 		|fixed union Raw:
 		|    Full(Float)
 		|func main() -> Int:
 		|    0
 		|
-	start = "fixed union Raw:\n    Full(".length()
-	check_rejects(
-		source,
-		DirectPayload,
-		start,
-		start + 5,
-		"only Int payloads are supported",
-		"declare a variant with no fields or one Int field, written Variant(Int)",
-	)
+	match parse_modules_with_base([{ source = source, targets = [] }], PRIMITIVE_BASE):
+		Ok(parsed):
+			match check(parsed):
+				Ok(program):
+					match checked_functions(program).unions:
+						[raw]:
+							match raw.variants:
+								[variant]:
+									match variant.fields:
+										[payload]:
+											Check.same_type(payload.value_type, Check.FloatType)
+										_:
+											False
+								_: False
+						_: False
+				Err(_): False
+		Err(_): False
 
 
 private pure func rejects_runtime(header: String, label: String, help: String) -> Bool:
@@ -692,13 +716,10 @@ tests: TestSuite = {
 			test_duplicate_float_foundation_role_has_exact_occurrence,
 		),
 		("Float main rejected before body", test_float_main_is_rejected_before_body),
+		("direct Float record field stays out of scope", test_direct_float_record_field_is_inline),
 		(
-			"direct Float record field stays out of scope",
-			test_direct_float_record_field_stays_out_of_scope,
-		),
-		(
-			"direct Float union payload stays out of scope",
-			test_direct_float_union_payload_stays_out_of_scope,
+			"direct Float union payload accepted",
+			test_direct_float_union_payload_publishes_float_type,
 		),
 		("Float binary rejects Int parameter", test_float_binary_contract_rejects_int_parameter),
 		(

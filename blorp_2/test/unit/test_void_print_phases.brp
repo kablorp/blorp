@@ -1,14 +1,15 @@
 import:
-	../../src/check: CheckedProgram, checked_functions
-	../../src/check_errors as Errors
-	../../src/check_model as Check
-	../../src/lex: lex
-	../../src/lower as Lower
 	../../src/builtins as Builtins:
 		PrimitiveType(BuiltinString, BuiltinVoid),
 		RuntimeOperation(StringPrint),
 		RuntimeResult(PrimitiveResult),
 		runtime_contract,
+	../../src/check: CheckedProgram, checked_functions
+	../../src/check_errors as Errors
+	../../src/check_model as Check
+	../../src/lex: lex
+	../../src/lower as Lower
+	../../src/own as Own
 	../../src/source: module_source, root_module_id
 	../../src/specialize as Concrete
 	../../src/syntax: Diagnostic, Purity(Impure)
@@ -63,17 +64,20 @@ private pure func rejects(
 pure func test_runtime_contract_is_impure_string_to_void() -> Bool:
 	operation: RuntimeOperation[Void] = Builtins.StringPrint
 	contract = runtime_contract(operation)
+
 	result_matches = match contract.return_type:
-		PrimitiveResult(BuiltinVoid): True
-		_: False
+		PrimitiveResult(BuiltinVoid):
+			True
+		_:
+			False
+
 	parameters_match = match contract.parameters:
-		[Builtins.PrimitiveParameter(BuiltinString)]: True
-		_: False
-	(
-		contract.purity == Impure
-		and parameters_match
-		and result_matches
-	)
+		[Builtins.PrimitiveParameter(BuiltinString)]:
+			True
+		_:
+			False
+
+	contract.purity == Impure and parameters_match and result_matches
 
 
 pure func test_checked_discard_is_void_and_does_not_create_a_binding() -> Bool:
@@ -356,21 +360,16 @@ pure func test_main_can_return_void() -> Bool:
 	compile(source).is_ok()
 
 
-pure func test_void_record_field_remains_rejected() -> Bool:
+pure func test_void_record_field_has_managed_root() -> Bool:
 	source: String =
 		|fixed record Unit { value: Void }
 		|func main() -> Int:
 		|    0
 		|
-
-	match compile(source):
-		Err(errors):
-			errors.first.message == "fixed record fields must be Int"
-		Ok(_):
-			False
+	compile(source).is_ok()
 
 
-pure func test_print_literal_before_tail_match_remains_rejected() -> Bool:
+pure func test_print_literal_prefix_drops_in_selected_arm() -> Bool:
 	source: String =
 		|fixed union Choice:
 		|    First
@@ -381,17 +380,26 @@ pure func test_print_literal_before_tail_match_remains_rejected() -> Bool:
 		|func main() -> Int:
 		|    show(First)
 		|
-	start = PRINT.length() + 74
-	rejects(
-		PRINT + source,
-		"owned managed values before a tail match are not supported yet",
-		(
-			"create managed values inside the selected match arm or a separate straight-line "
-			+ "function"
-		),
-		start,
-		start + 6,
-	)
+
+	match lowered(PRINT + source).and_then(pure func(program): Own.own(program)):
+		Err(_):
+			False
+		Ok(program):
+			program.functions.any(pure func(function):
+				match function.tail:
+					Own.MatchTail(matched):
+						match matched.arms:
+							[arm]:
+								match arm.operations:
+									[Own.DefineValue(_), Own.DropOwner(owner, _)]:
+										Own.owner_number(owner) == 0
+									_:
+										False
+							_:
+								False
+					_:
+						False
+			)
 
 
 pure func test_discarded_print_arguments_are_checked_in_tail_loops() -> Bool:
@@ -469,20 +477,31 @@ pure func test_a_discarded_generic_call_is_specialized() -> Bool:
 			False
 
 
-pure func test_direct_void_union_payload_remains_rejected() -> Bool:
+pure func test_direct_void_union_payload_publishes_void_type() -> Bool:
 	source: String =
 		|fixed union Unit:
 		|    Unit(Void)
 		|func main() -> Int:
 		|    0
 		|
-	rejects(
-		source,
-		"only Int payloads are supported",
-		"declare a variant with no fields or one Int field, written Variant(Int)",
-		27,
-		31,
-	)
+
+	match checked(source):
+		Ok(program):
+			match checked_functions(program).unions:
+				[unit]:
+					match unit.variants:
+						[variant]:
+							match variant.fields:
+								[payload]:
+									Check.same_type(payload.value_type, Check.VoidType)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
 
 
 tests: TestSuite = {
@@ -525,10 +544,10 @@ tests: TestSuite = {
 		("pure caller rejects UFCS print", test_pure_caller_rejects_ufcs_print),
 		("String statement needs binding", test_string_statement_requires_explicit_binding),
 		("main can return Void", test_main_can_return_void),
-		("Void record field remains rejected", test_void_record_field_remains_rejected),
+		("Void record field remains rejected", test_void_record_field_has_managed_root),
 		(
-			"print literal prefix remains rejected",
-			test_print_literal_before_tail_match_remains_rejected,
+			"print literal prefix drops in selected arm",
+			test_print_literal_prefix_drops_in_selected_arm,
 		),
 		(
 			"tail loops check discarded print arguments",
@@ -537,6 +556,6 @@ tests: TestSuite = {
 		("Void statement before tail match", test_a_void_only_statement_can_precede_a_tail_match),
 		("discarded self call is non-tail", test_a_discarded_self_call_is_not_a_tail_call),
 		("discarded generic call is specialized", test_a_discarded_generic_call_is_specialized),
-		("direct Void union payload rejected", test_direct_void_union_payload_remains_rejected),
+		("direct Void union payload accepted", test_direct_void_union_payload_publishes_void_type),
 	]
 }

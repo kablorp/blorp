@@ -5,7 +5,7 @@ unit/grammar/e2e and sanitizer validation complete; exact target object-lifetime
 observations await approval. Broader host validation is recorded separately below.
 
 Follow-up validation uses granular compiler-stage tests and direct C runtime
-unit tests, as recorded in the current [memory test contract](../../blorp_2/MEMORY_PLAN.md#phase-level-test-contract).
+unit tests, as recorded in the current [memory test contract](../../blorp_2/ROADMAP.md#phase-level-test-contract).
 The event tracing proposal in this historical record is deferred; the
 measurements below remain evidence for the original implementation slice.
 

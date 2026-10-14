@@ -1,6 +1,6 @@
 import:
-	../../src/source: module_source, root_module_id
 	../../src/lex: lex
+	../../src/source: module_source, root_module_id
 	../../src/specialize as Concrete
 	../../src/syntax: Diagnostic
 	input: check, parse, setup_diagnostic
@@ -39,7 +39,9 @@ pure func test_second_record_field_uses_its_concrete_owner() -> Bool:
 		|	value.first
 		|
 
-	match specialized(PAIR + OTHER + helper + "func main() -> Int:\n\tunused = make_pair()\n\tread_other(make_other())\n"):
+	match specialized(
+		PAIR + OTHER + helper + "func main() -> Int:\n\tunused = make_pair()\n\tread_other(make_other())\n",
+	):
 		Ok(program):
 			match program.functions:
 				[_, _, make, read]:
@@ -196,7 +198,7 @@ pure func test_record_payload_in_generic_union_has_concrete_record_identity() ->
 			match program.unions:
 				[boxed]:
 					match boxed.variants:
-						[Some(Concrete.RecordType(owner))]:
+						[[Concrete.RecordType(owner)]]:
 							Concrete.record_number(owner) == 0
 						_:
 							False
@@ -242,9 +244,114 @@ pure func test_full_width_field_values_survive_specialization() -> Bool:
 			False
 
 
+pure func test_mixed_fields_preserve_concrete_types() -> Bool:
+	source: String =
+		|fixed record Entry { count: Int, ratio: Float, text: String, empty: Void }
+		|pure func make() -> Entry:
+		|	{ count = 7, ratio = 2.5, text = "42", empty = void }
+		|func main() -> Int:
+		|	make().count
+		|
+
+	match specialized(source):
+		Ok(program):
+			match program.records:
+				[entry]:
+					match entry.fields:
+						[count, ratio, text, empty]:
+							(
+								Concrete.same_type(count, Concrete.IntType)
+								and Concrete.same_type(ratio, Concrete.FloatType)
+								and Concrete.same_type(text, Concrete.StringType)
+								and Concrete.same_type(empty, Concrete.VoidType)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_numeric_nested_records_are_inline_and_void_root_is_managed() -> Bool:
+	source: String =
+		|fixed record Scalar { number: Int, ratio: Float }
+		|fixed record Nested { scalar: Scalar }
+		|fixed record Unit { empty: Void }
+		|pure func scalar() -> Scalar:
+		|	{ number = 7, ratio = 2.5 }
+		|pure func nested() -> Nested:
+		|	{ scalar = scalar() }
+		|pure func unit(value: Unit) -> Unit:
+		|	value
+		|func main() -> Int:
+		|	unused = unit({ empty = void })
+		|	nested().scalar.number
+		|
+
+	match specialized(source):
+		Ok(program):
+			var inline_count = 0
+			var managed_count = 0
+
+			for layout in program.records:
+				match layout.representation:
+					Concrete.InlineRecord:
+						inline_count += 1
+					Concrete.ManagedRecord:
+						managed_count += 1
+
+			inline_count == 2 and managed_count == 1
+		Err(_):
+			False
+
+
+pure func test_union_record_payload_owns_root_while_phantom_does_not() -> Bool:
+	source: String =
+		|fixed union Box[T]:
+		|	Full(T)
+		|fixed union Token[T]:
+		|	Marker
+		|fixed record Entry { text: String }
+		|pure func entry() -> Entry:
+		|	{ text = "42" }
+		|pure func boxed() -> Box[Entry]:
+		|	Full(entry())
+		|pure func phantom() -> Token[Entry]:
+		|	Marker
+		|func main() -> Int:
+		|	first = boxed()
+		|	second = phantom()
+		|	0
+		|
+
+	match specialized(source):
+		Ok(program):
+			match (program.records, program.unions):
+				([entry], [boxed, phantom]):
+					match (entry.representation, boxed.representation, phantom.representation):
+						(Concrete.ManagedRecord, Concrete.InlineOwningPayload, Concrete.InlineUnmanaged):
+							True
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
 tests: TestSuite = {
 	description = "Concrete fixed records",
 	tests = [
+		(
+			"numeric nested storage and Void root differ",
+			test_numeric_nested_records_are_inline_and_void_root_is_managed,
+		),
+		(
+			"record payload owns root but phantom does not",
+			test_union_record_payload_owns_root_while_phantom_does_not,
+		),
+		("mixed fields retain concrete types", test_mixed_fields_preserve_concrete_types),
 		(
 			"second record field retains concrete owner",
 			test_second_record_field_uses_its_concrete_owner,

@@ -1,0 +1,507 @@
+import:
+	../../src/lower as Lower
+	../../src/own as Own
+	../../src/source: same_source
+	../../src/specialize as Concrete
+	../../src/syntax: Diagnostic, EntryResult(IntegerExitStatus), Entrypoint(NoArguments), FunctionExecution(OrdinaryCalls), Span
+	../../src/verify: verify
+	managed_union_inputs: lowered
+	ownership_inputs: InputIds, input_ids, span
+	test: TestSuite
+
+
+private fixed record LayoutIds {
+	pair: Concrete.VariantInstanceId,
+	sibling: Concrete.VariantInstanceId,
+	empty: Concrete.VariantInstanceId,
+	first: Concrete.VariantFieldInstanceId,
+	second: Concrete.VariantFieldInstanceId,
+	sibling_field: Concrete.VariantFieldInstanceId,
+	mixed: Concrete.VariantInstanceId,
+	mixed_first: Concrete.VariantFieldInstanceId,
+	mixed_second: Concrete.VariantFieldInstanceId,
+	phantom: Concrete.VariantInstanceId,
+	phantom_first: Concrete.VariantFieldInstanceId,
+	phantom_second: Concrete.VariantFieldInstanceId,
+	first_marker: Concrete.RecordInstanceId,
+	second_marker: Concrete.RecordInstanceId
+}
+
+
+private pure func seed_error() -> Diagnostic:
+	{ span = span(0), note = None, message = "invalid multiple field identity seed", help = "fix test setup" }
+
+
+private pure func variant(arm: Lower.LoweredArm) -> Result[Concrete.VariantInstanceId, Diagnostic]:
+	match arm.label:
+		Lower.VariantLabel(id): Ok(id)
+		_: Err(seed_error())
+
+
+-- Only opaque identities come from lowering. The verified layouts, operations,
+-- storage transfers, projection borrows and owner obligations below are authored
+-- independently; ownership insertion supplies none of the expected facts.
+private pure func layout_ids() -> Result[LayoutIds, Diagnostic]:
+	source: String =
+		|fixed record Marker[T] { value: Int }
+		|fixed union Slots[A, B]:
+		|    Pair(A, B)
+		|    Other(A, B)
+		|    Empty
+		|pure func text(value: Slots[String, String]) -> String:
+		|    match value:
+		|        Pair(left, _): left
+		|        Other(left, _): left
+		|        Empty: ""
+		|pure func mixed(value: Slots[Int, Void]) -> Int:
+		|    match value:
+		|        Pair(left, _): left
+		|        Other(left, _): left
+		|        Empty: 0
+		|pure func marks(value: Slots[Marker[Int], Marker[String]]) -> Marker[Int]:
+		|    match value:
+		|        Pair(left, _): left
+		|        Other(left, _): left
+		|        Empty: { value = 0 }
+		|func main() -> Int:
+		|    unused_text = text(Pair("a", "b"))
+		|    unused_mixed = mixed(Pair(7, void))
+		|    unused_marks = marks(Pair({ value = 7 }, { value = 9 }))
+		|    0
+		|
+	seed ?= lowered(source)
+	program = Lower.lowered_functions(seed)
+	match program.functions:
+		[_, text, mixed, marks]:
+			match (text.tail, mixed.tail, marks.tail):
+				(Lower.MatchValue(text), Lower.MatchValue(mixed), Lower.MatchValue(marks)):
+					match (text.arms, mixed.arms, marks.arms):
+						([pair, sibling, empty], [mixed, _, _], [phantom, _, _]):
+							pair ?= variant(pair)
+							sibling ?= variant(sibling)
+							empty ?= variant(empty)
+							mixed ?= variant(mixed)
+							phantom ?= variant(phantom)
+							first ?= Concrete.variant_field(pair, 0, program.unions, span(0))
+							second ?= Concrete.variant_field(pair, 1, program.unions, span(0))
+							sibling_field ?= Concrete.variant_field(sibling, 0, program.unions, span(0))
+							mixed_first ?= Concrete.variant_field(mixed, 0, program.unions, span(0))
+							mixed_second ?= Concrete.variant_field(mixed, 1, program.unions, span(0))
+							phantom_first ?= Concrete.variant_field(phantom, 0, program.unions, span(0))
+							phantom_second ?= Concrete.variant_field(phantom, 1, program.unions, span(0))
+							row ?= program.unions.get(Concrete.union_number(Concrete.variant_owner(phantom))).to_result(seed_error())
+							match row.variants:
+								[[Concrete.RecordType(first_marker), Concrete.RecordType(second_marker)], _, []]:
+									if (
+										Concrete.union_number(Concrete.variant_owner(pair)) == 0
+										and Concrete.union_number(Concrete.variant_owner(mixed)) == 1
+										and Concrete.union_number(Concrete.variant_owner(phantom)) == 2
+										and Concrete.record_number(first_marker) == 0
+										and Concrete.record_number(second_marker) == 1
+									):
+										Ok({ pair = pair, sibling = sibling, empty = empty, first = first, second = second, sibling_field = sibling_field, mixed = mixed, mixed_first = mixed_first, mixed_second = mixed_second, phantom = phantom, phantom_first = phantom_first, phantom_second = phantom_second, first_marker = first_marker, second_marker = second_marker })
+									else:
+										Err(seed_error())
+								_: Err(seed_error())
+						_: Err(seed_error())
+				_: Err(seed_error())
+		_: Err(seed_error())
+
+
+private pure func layouts(layout: LayoutIds) -> List[Concrete.ConcreteUnion]:
+	[
+		{ variants = [[Concrete.StringType, Concrete.StringType], [Concrete.StringType, Concrete.StringType], []], representation = Concrete.InlineOwningPayload },
+		{ variants = [[Concrete.IntType, Concrete.VoidType], [Concrete.IntType, Concrete.VoidType], []], representation = Concrete.InlineUnmanaged },
+		{ variants = [[Concrete.RecordType(layout.first_marker), Concrete.RecordType(layout.second_marker)], [Concrete.RecordType(layout.first_marker), Concrete.RecordType(layout.second_marker)], []], representation = Concrete.InlineUnmanaged },
+	]
+
+
+private pure func definition(id: Lower.ValueId, value_type: Concrete.TypeRef, operation: Own.OwnedValueOperation, result: Own.ResultOwnership, at: Int) -> Own.OwnershipOperation:
+	Own.DefineValue({ id = id, value_type = value_type, operation = operation, result = result, span = span(at) })
+
+
+private pure func parameter(id: Lower.ValueId, value_type: Concrete.TypeRef, position: Int, at: Int) -> Own.OwnershipOperation:
+	result = match value_type:
+		Concrete.StringType: Own.BorrowedResult(Own.ParameterBorrow(id))
+		Concrete.UnionType(owner):
+			if Concrete.union_number(owner) == 0:
+				Own.BorrowedResult(Own.ParameterBorrow(id))
+			else:
+				Own.UnmanagedResult
+		_: Own.UnmanagedResult
+	definition(id, value_type, Own.ParameterDefinition(position), result, at)
+
+
+private pure func acquire(owner: Int, value: Lower.ValueId, source: Own.BorrowSource, at: Int) -> Own.OwnershipOperation:
+	Own.AcquireOwner(Own.owner_id(owner), { value = value, source = source }, span(at))
+
+
+private pure func helper(parameters: List[Concrete.TypeRef], return_type: Concrete.TypeRef, operations: List[Own.OwnershipOperation], returned: Own.ReturnTransfer) -> Own.OwnedFunction:
+	{ execution = OrdinaryCalls, signature = { parameters = parameters, return_type = return_type }, operations = operations, tail = Own.ReturnTail(Own.ReturnResult(returned)) }
+
+
+private pure func program(ids: InputIds, layout: LayoutIds, body: Own.OwnedFunction) -> Own.OwnershipProgram:
+	{
+		entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus),
+		records = [
+			{ fields = [Concrete.IntType], representation = Concrete.InlineRecord },
+			{ fields = [Concrete.IntType], representation = Concrete.InlineRecord },
+		],
+		unions = layouts(layout),
+		functions = [helper([], Concrete.IntType, [definition(ids.first, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 0)], Own.UnmanagedReturn(ids.first)), body]
+	}
+
+
+private pure func rejects(input: Own.OwnershipProgram, message: String, at: Int) -> Bool:
+	match verify(input):
+		Err(error):
+			(
+				error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+				and same_source(error.span.source, span(at).source)
+				and error.span.start == at
+				and error.span.end == at + 1
+				and error.note.is_none()
+			)
+		Ok(_): False
+
+
+private pure func run(test: pure (InputIds, LayoutIds) -> Bool) -> Bool:
+	match (input_ids(), layout_ids()):
+		(Ok(ids), Ok(layout)): test(ids, layout)
+		_: False
+
+
+private pure func construction(ids: InputIds, layout: LayoutIds, payloads: List[Own.StoredPayload], acquisitions: List[Own.OwnershipOperation]) -> Own.OwnershipProgram:
+	program(ids, layout, helper(
+		[Concrete.StringType],
+		Concrete.UnionType(Concrete.variant_owner(layout.pair)),
+		[parameter(ids.first, Concrete.StringType, 0, 10)] + acquisitions + [definition(ids.second, Concrete.UnionType(Concrete.variant_owner(layout.pair)), Own.ConstructDefinition(layout.pair, payloads), Own.OwnedResult(Own.owner_id(2)), 20)],
+		Own.OwnedReturn(ids.second, Own.owner_id(2)),
+	))
+
+
+private pure func acquisitions(ids: InputIds) -> List[Own.OwnershipOperation]:
+	[acquire(0, ids.first, Own.ParameterBorrow(ids.first), 11), acquire(1, ids.first, Own.ParameterBorrow(ids.first), 12)]
+
+
+private pure func payloads(ids: InputIds) -> List[Own.StoredPayload]:
+	[Own.OwnedPayload(ids.first, Own.owner_id(0)), Own.OwnedPayload(ids.first, Own.owner_id(1))]
+
+
+pure func test_duplicate_value_has_two_independent_transfers() -> Bool:
+	run(pure func(ids, layout): verify(construction(ids, layout, payloads(ids), acquisitions(ids))).is_ok())
+
+
+pure func test_duplicate_owner_is_discharged_sequentially() -> Bool:
+	run(pure func(ids, layout):
+		(
+			verify(construction(ids, layout, payloads(ids), acquisitions(ids))).is_ok()
+			and rejects(construction(ids, layout, [Own.OwnedPayload(ids.first, Own.owner_id(0)), Own.OwnedPayload(ids.first, Own.owner_id(0))], acquisitions(ids)), "payload owner has already been discharged", 20)
+		)
+	)
+
+
+pure func test_second_slot_requires_an_owner_transfer() -> Bool:
+	run(pure func(ids, layout):
+		(
+			verify(construction(ids, layout, payloads(ids), acquisitions(ids))).is_ok()
+			and rejects(construction(ids, layout, [Own.OwnedPayload(ids.first, Own.owner_id(0)), Own.UnmanagedPayload(ids.first)], acquisitions(ids)), "managed payload requires an owner transfer", 20)
+		)
+	)
+
+
+pure func test_second_slot_requires_its_acquisition() -> Bool:
+	run(pure func(ids, layout):
+		(
+			verify(construction(ids, layout, payloads(ids), acquisitions(ids))).is_ok()
+			and rejects(construction(ids, layout, payloads(ids), [acquire(0, ids.first, Own.ParameterBorrow(ids.first), 11)]), "owner 1 is not defined", 20)
+		)
+	)
+
+
+pure func test_constructor_rejects_missing_second_slot() -> Bool:
+	run(pure func(ids, layout):
+		(
+			verify(construction(ids, layout, payloads(ids), acquisitions(ids))).is_ok()
+			and rejects(construction(ids, layout, [Own.OwnedPayload(ids.first, Own.owner_id(0))], acquisitions(ids)), "variant field count does not match its operation", 20)
+		)
+	)
+
+
+pure func test_constructor_rejects_extra_third_slot() -> Bool:
+	run(pure func(ids, layout):
+		(
+			verify(construction(ids, layout, payloads(ids), acquisitions(ids))).is_ok()
+			and rejects(construction(ids, layout, payloads(ids) + [Own.OwnedPayload(ids.first, Own.owner_id(1))], acquisitions(ids)), "variant field count does not match its operation", 20)
+		)
+	)
+
+
+private pure func nullary(ids: InputIds, layout: LayoutIds, operation: Own.OwnedValueOperation) -> Own.OwnershipProgram:
+	program(ids, layout, helper([], Concrete.UnionType(Concrete.variant_owner(layout.empty)), [definition(ids.first, Concrete.UnionType(Concrete.variant_owner(layout.empty)), operation, Own.OwnedResult(Own.owner_id(0)), 20)], Own.OwnedReturn(ids.first, Own.owner_id(0))))
+
+
+pure func test_empty_construct_is_rejected_beside_valid_nullary_leaf() -> Bool:
+	run(pure func(ids, layout):
+		(
+			verify(nullary(ids, layout, Own.VariantDefinition(layout.empty))).is_ok()
+			and rejects(nullary(ids, layout, Own.ConstructDefinition(layout.empty, [])), "constructed variant requires at least one field", 20)
+		)
+	)
+
+
+-- A same-typed different ordinal remains memory-valid. These raw arms establish
+-- the selected nominal owner and receiver, without claiming source-binder order.
+private pure func complete_projection(
+	ids: InputIds,
+	layout: LayoutIds,
+	field: Concrete.VariantFieldInstanceId,
+	value_type: Concrete.TypeRef,
+) -> Own.OwnershipProgram:
+	selected = Concrete.variant_field_variant(field)
+	owner = Concrete.variant_owner(selected)
+	managed = match value_type:
+		Concrete.StringType: True
+		_: False
+	result = if managed:
+		Own.BorrowedResult(Own.PayloadBorrow(ids.first))
+	else:
+		Own.UnmanagedResult
+	projected_id = if managed:
+		ids.second
+	else:
+		ids.third
+	returned = if managed:
+		Own.OwnedReturn(ids.second, Own.owner_id(0))
+	else:
+		Own.UnmanagedReturn(projected_id)
+	acquisitions: List[Own.OwnershipOperation] = if managed:
+		[acquire(0, ids.second, Own.PayloadBorrow(ids.first), 21)]
+	else:
+		[]
+	fallback: List[Own.OwnershipOperation] = if managed:
+		[definition(ids.third, value_type, Own.StringDefinition("fallback"), Own.OwnedResult(Own.owner_id(1)), 30)]
+	else:
+		[]
+	parameters = if managed:
+		[Concrete.UnionType(owner)]
+	else:
+		[Concrete.UnionType(owner), value_type]
+	fallback_return = if managed:
+		Own.OwnedReturn(ids.third, Own.owner_id(1))
+	else:
+		Own.UnmanagedReturn(ids.second)
+	scrutinee = if managed:
+		Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) })
+	else:
+		Own.UnmanagedArgument(ids.first)
+	prefix = if managed:
+		[parameter(ids.first, Concrete.UnionType(owner), 0, 10)]
+	else:
+		[parameter(ids.first, Concrete.UnionType(owner), 0, 10), parameter(ids.second, value_type, 1, 11)]
+	body: Own.OwnedFunction = {
+		execution = OrdinaryCalls,
+		signature = { parameters = parameters, return_type = value_type },
+		operations = prefix,
+		tail = Own.MatchTail({
+			scrutinee = scrutinee,
+			owner = owner,
+			arms = [
+				{
+					label = Lower.VariantLabel(selected),
+					operations = [definition(projected_id, value_type, Own.PayloadDefinition(field, ids.first), result, 20)] + acquisitions,
+					exit = Own.ReturnResult(returned)
+				},
+				{
+					label = Lower.DefaultLabel,
+					operations = fallback,
+					exit = Own.ReturnResult(fallback_return)
+				},
+			]
+		})
+	}
+	program(ids, layout, body)
+
+
+private pure func replace_projection(input: Own.OwnershipProgram, operation: Own.OwnedValueOperation, value_type: Concrete.TypeRef) -> Option[Own.OwnershipProgram]:
+	match input.functions:
+		[main, body]:
+			match body.tail:
+				Own.MatchTail(matched):
+					match matched.arms:
+						[first, second]:
+							match first.operations:
+								[Own.DefineValue(original), ...rest]:
+									Some({ input | functions = [main, { body | tail = Own.MatchTail({ matched | arms = [{ first | operations = [Own.DefineValue({ original | operation = operation, value_type = value_type })] + rest }, second] }) }] })
+								_: None
+						_: None
+				_: None
+		_: None
+
+
+private pure func replacement_rejected(
+	input: Own.OwnershipProgram,
+	operation: Own.OwnedValueOperation,
+	value_type: Concrete.TypeRef,
+	message: String,
+) -> Bool:
+	match replace_projection(input, operation, value_type):
+		Some(changed): rejects(changed, message, 20)
+		None: False
+
+
+pure func test_second_managed_field_projects_with_selected_parent() -> Bool:
+	run(pure func(ids, layout): verify(complete_projection(ids, layout, layout.second, Concrete.StringType)).is_ok())
+
+
+pure func test_same_typed_alternative_ordinal_is_memory_valid() -> Bool:
+	run(pure func(ids, layout):
+		input = complete_projection(ids, layout, layout.first, Concrete.StringType)
+		match replace_projection(input, Own.PayloadDefinition(layout.second, ids.first), Concrete.StringType):
+			Some(changed): verify(input).is_ok() and verify(changed).is_ok()
+			None: False
+	)
+
+
+pure func test_sibling_variant_field_is_rejected() -> Bool:
+	run(pure func(ids, layout):
+		input = complete_projection(ids, layout, layout.first, Concrete.StringType)
+		verify(input).is_ok() and replacement_rejected(input, Own.PayloadDefinition(layout.sibling_field, ids.first), Concrete.StringType, "payload projection does not belong to this match arm")
+	)
+
+
+pure func test_other_concrete_instance_field_is_rejected() -> Bool:
+	run(pure func(ids, layout):
+		input = complete_projection(ids, layout, layout.first, Concrete.StringType)
+		verify(input).is_ok() and replacement_rejected(input, Own.PayloadDefinition(layout.mixed_first, ids.first), Concrete.StringType, "payload projection does not belong to this match arm")
+	)
+
+
+pure func test_second_field_bounds_rejects_shortened_layout() -> Bool:
+	run(pure func(ids, layout):
+		input = complete_projection(ids, layout, layout.second, Concrete.StringType)
+		verify(input).is_ok() and rejects({ input | unions = input.unions.set(0, { variants = [[Concrete.StringType], [Concrete.StringType, Concrete.StringType], []], representation = Concrete.InlineOwningPayload }) }, "unknown variant field identity", 20)
+	)
+
+
+pure func test_scalar_and_void_positions_are_distinct() -> Bool:
+	run(pure func(ids, layout):
+		input = complete_projection(ids, layout, layout.mixed_first, Concrete.IntType)
+		verify(input).is_ok() and replacement_rejected(input, Own.PayloadDefinition(layout.mixed_second, ids.first), Concrete.IntType, "definition type does not match its operation")
+	)
+
+
+pure func test_void_second_slot_is_a_valid_projection() -> Bool:
+	run(pure func(ids, layout): verify(complete_projection(ids, layout, layout.mixed_second, Concrete.VoidType)).is_ok())
+
+
+pure func test_phantom_records_share_layout_but_not_slot_type() -> Bool:
+	run(pure func(ids, layout):
+		value_type = Concrete.RecordType(layout.first_marker)
+		input = complete_projection(ids, layout, layout.phantom_first, value_type)
+		verify(input).is_ok() and replacement_rejected(input, Own.PayloadDefinition(layout.phantom_second, ids.first), value_type, "definition type does not match its operation")
+	)
+
+
+private fixed union ParentCase:
+	AcquiredBeforeDrop
+	DroppedBeforeProjection
+	DroppedBeforeAcquisition
+
+
+private pure func acquired_parent_projection(ids: InputIds, layout: LayoutIds, case: ParentCase) -> Own.OwnershipProgram:
+	owner = Concrete.variant_owner(layout.pair)
+	projected = definition(ids.second, Concrete.StringType, Own.PayloadDefinition(layout.second, ids.first), Own.BorrowedResult(Own.PayloadBorrow(ids.first)), 20)
+	acquired = acquire(1, ids.second, Own.PayloadBorrow(ids.first), 21)
+	dropped = Own.DropOwner(Own.owner_id(0), span(22))
+	operations = match case:
+		AcquiredBeforeDrop: [projected, acquired, dropped]
+		DroppedBeforeProjection: [dropped, projected, acquired]
+		DroppedBeforeAcquisition: [projected, dropped, acquired]
+	program(ids, layout, {
+		execution = OrdinaryCalls,
+		signature = { parameters = [Concrete.UnionType(owner)], return_type = Concrete.StringType },
+		operations = [parameter(ids.first, Concrete.UnionType(owner), 0, 10), acquire(0, ids.first, Own.ParameterBorrow(ids.first), 11)],
+		tail = Own.MatchTail({
+			scrutinee = Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) }),
+			owner = owner,
+			arms = [
+				{ label = Lower.VariantLabel(layout.pair), operations = operations, exit = Own.ReturnResult(Own.OwnedReturn(ids.second, Own.owner_id(1))) },
+				{
+					label = Lower.DefaultLabel,
+					operations = [definition(ids.third, Concrete.StringType, Own.StringDefinition("fallback"), Own.OwnedResult(Own.owner_id(2)), 30), Own.DropOwner(Own.owner_id(0), span(31))],
+					exit = Own.ReturnResult(Own.OwnedReturn(ids.third, Own.owner_id(2)))
+				},
+			]
+		})
+	})
+
+
+pure func test_acquired_second_child_survives_parent_drop() -> Bool:
+	run(pure func(ids, layout): verify(acquired_parent_projection(ids, layout, AcquiredBeforeDrop)).is_ok())
+
+
+pure func test_second_slot_rejects_dead_parent_projection() -> Bool:
+	run(pure func(ids, layout):
+		(
+			verify(acquired_parent_projection(ids, layout, AcquiredBeforeDrop)).is_ok()
+			and rejects(acquired_parent_projection(ids, layout, DroppedBeforeProjection), "borrow refers to discharged owner 0", 20)
+		)
+	)
+
+
+pure func test_second_slot_rejects_acquisition_after_parent_drop() -> Bool:
+	run(pure func(ids, layout):
+		(
+			verify(acquired_parent_projection(ids, layout, AcquiredBeforeDrop)).is_ok()
+			and rejects(acquired_parent_projection(ids, layout, DroppedBeforeAcquisition), "borrow refers to discharged owner 0", 21)
+		)
+	)
+
+
+private pure func phantom_construction(ids: InputIds, layout: LayoutIds, payloads: List[Own.StoredPayload]) -> Own.OwnershipProgram:
+	first = Concrete.RecordType(layout.first_marker)
+	second = Concrete.RecordType(layout.second_marker)
+	union_type = Concrete.UnionType(Concrete.variant_owner(layout.phantom))
+	program(ids, layout, helper(
+		[first, second],
+		union_type,
+		[parameter(ids.first, first, 0, 10), parameter(ids.second, second, 1, 11), definition(ids.third, union_type, Own.ConstructDefinition(layout.phantom, payloads), Own.UnmanagedResult, 20)],
+		Own.UnmanagedReturn(ids.third),
+	))
+
+
+pure func test_phantom_record_construction_checks_both_nominal_slots() -> Bool:
+	run(pure func(ids, layout):
+		(
+			verify(phantom_construction(ids, layout, [Own.UnmanagedPayload(ids.first), Own.UnmanagedPayload(ids.second)])).is_ok()
+			and rejects(phantom_construction(ids, layout, [Own.UnmanagedPayload(ids.second), Own.UnmanagedPayload(ids.first)]), "variant payload does not match its operation", 20)
+		)
+	)
+
+
+tests: TestSuite = {
+	description = "Independent ordered union field ownership verification",
+	tests = [
+		("acquired second child survives parent drop", test_acquired_second_child_survives_parent_drop),
+		("second field rejects dead parent", test_second_slot_rejects_dead_parent_projection),
+		("second child acquisition requires live parent", test_second_slot_rejects_acquisition_after_parent_drop),
+		("phantom constructor checks both nominal slots", test_phantom_record_construction_checks_both_nominal_slots),
+		("duplicate value stores two independent owners", test_duplicate_value_has_two_independent_transfers),
+		("duplicate owner discharges sequentially", test_duplicate_owner_is_discharged_sequentially),
+		("second slot requires transfer", test_second_slot_requires_an_owner_transfer),
+		("second slot requires acquisition", test_second_slot_requires_its_acquisition),
+		("constructor missing slot", test_constructor_rejects_missing_second_slot),
+		("constructor extra slot", test_constructor_rejects_extra_third_slot),
+		("empty construct beside nullary leaf", test_empty_construct_is_rejected_beside_valid_nullary_leaf),
+		("second managed field projects", test_second_managed_field_projects_with_selected_parent),
+		("same typed alternate ordinal memory valid", test_same_typed_alternative_ordinal_is_memory_valid),
+		("sibling variant field rejected", test_sibling_variant_field_is_rejected),
+		("other concrete instance field rejected", test_other_concrete_instance_field_is_rejected),
+		("second field bounds checked", test_second_field_bounds_rejects_shortened_layout),
+		("scalar and Void positions distinct", test_scalar_and_void_positions_are_distinct),
+		("Void second slot projects", test_void_second_slot_is_a_valid_projection),
+		("phantom equal layout slots remain nominal", test_phantom_records_share_layout_but_not_slot_type),
+	]
+}

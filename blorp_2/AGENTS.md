@@ -111,16 +111,20 @@ Run e2e with `bin/blorp test --timeout 0 blorp_2/test/e2e`. Keep artifacts
 under the ignored `build/` or temporary directories; add no persistent
 compiler cache.
 
-**The one direct C exception.** Unit tests of the target String runtime under
-`test/runtime/` may be C, compiled and run by a Blorp `TestSuite`, using the
-emission runtime fragment and test-local allocator wrappers that delegate to
-real allocation. This authorizes no production tracing or other fixture
-entrypoint, and does not extend to other runtime types.
+**The direct C exception.** Unit tests of target runtime helpers under
+`test/runtime/` may be C, compiled and run by a Blorp `TestSuite`. This includes
+String and generated concrete aggregate helpers for supported records, unions
+and collections, as explicitly approved on 2026-10-13. Tests use the same pure
+production runtime/emission fragments as normal compilation and test-local
+allocator wrappers that delegate to actual allocation/free. Observe allocation
+occurrences independently; never dereference freed objects. This permits
+runtime-helper tests, not calls to generated language functions or a language
+fixture's alternate main, and authorizes no production tracing.
 
 **Memory management.** Each memory increment adds granular unit tests at
 every affected phase boundary, including intermediate analyses, plus
 separate runtime tests, per the
-[memory test matrix](MEMORY_PLAN.md#phase-level-test-contract). Test
+[memory test matrix](ROADMAP.md#phase-level-test-contract). Test
 ownership insertion and independent verification separately, including
 malformed ownership IR the verifier must reject. Test each invariant in a
 named `TestSuite` callback with small typed inputs and observable outputs;

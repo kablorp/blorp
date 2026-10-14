@@ -17,9 +17,9 @@ import:
 		OwnedMatch,
 		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(
-			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition, StringDefinition,
-			VariantDefinition, CallDefinition, ConstructDefinition, PayloadDefinition,
-			ConstructRecordDefinition, ReadRecordFieldDefinition,
+			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition,
+			StringDefinition, VariantDefinition, CallDefinition, ConstructDefinition,
+			PayloadDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition,
 		),
 		OwnerId,
 		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
@@ -27,7 +27,10 @@ import:
 		ResultOwnership(UnmanagedResult, BorrowedResult, OwnedResult),
 		ReturnTransfer(UnmanagedReturn, OwnedReturn),
 		StoredPayload(UnmanagedPayload, OwnedPayload),
-		ValueOwnership(NoOwnership, ManagedStringLeaf, ManagedStringListRoot, InlineOwnedFields),
+		ValueOwnership(
+			NoOwnership, ManagedStringLeaf, ManagedStringListRoot, ManagedRecordRoot,
+			InlineOwnedFields,
+		),
 		owner_number,
 		value_ownership,
 	source: COMPILER_SOURCE
@@ -37,12 +40,13 @@ import:
 		ConcreteRecord,
 		ConcreteUnion,
 		FieldInstanceId,
-		FunctionSignature,
 		FunctionInstanceId,
+		FunctionSignature,
 		RecordInstanceId,
+		RecordRepresentation(InlineRecord, ManagedRecord),
 		TypeRef(VoidType, IntType, FloatType, StringType, ListType, UnionType, RecordType),
 		UnionRepresentation(InlineUnmanaged, InlineOwningPayload),
-		VariantInstanceId,
+		VariantInstanceId, variant_field_variant, variant_field_number,
 		field_number,
 		field_owner,
 		function_number,
@@ -52,7 +56,13 @@ import:
 		union_number,
 		variant_number,
 		variant_owner,
-	syntax: Diagnostic, Entrypoint(NoArguments, WithArguments), EntryResult(IntegerExitStatus, SuccessfulExit), entry_function, FunctionExecution(OrdinaryCalls, SelfTailLoop), Span
+	syntax:
+		Diagnostic,
+		EntryResult(IntegerExitStatus, SuccessfulExit),
+		Entrypoint(NoArguments, WithArguments),
+		FunctionExecution(OrdinaryCalls, SelfTailLoop),
+		Span,
+		entry_function,
 	text: concat
 
 
@@ -76,7 +86,8 @@ private pure func failure(span: Span, message: String) -> Diagnostic:
 private fixed record KnownValue {
 	value_type: TypeRef,
 	span: Span,
-	result: ResultOwnership
+	result: ResultOwnership,
+	projection_parent: Option[BorrowedValue]
 }
 
 
@@ -85,23 +96,29 @@ private fixed union OwnerState:
 	DischargedOwner
 
 
-private fixed record VerificationState {
+private fixed record VerificationFacts {
 	prefix_values: List[KnownValue],
 	first_value: Int,
 	values: List[KnownValue],
 	first_owner: Int,
-	owners: List[OwnerState],
 	parameters: List[ValueId]
+}
+
+
+private fixed record VerificationState {
+	facts: VerificationFacts,
+	prefix_owners: List[OwnerState],
+	owners: List[OwnerState]
 }
 
 
 private fixed union ProjectionContext:
 	NoProjection
-	PayloadProjection(ValueId, VariantInstanceId)
+	PayloadProjection(OwnedArgument, VariantInstanceId)
 
 
 private pure func value(
-	state: VerificationState,
+	state: VerificationFacts,
 	id: ValueId,
 	span: Span,
 ) -> Result[KnownValue, Diagnostic]:
@@ -126,14 +143,23 @@ private pure func value(
 	entry.to_result(error)
 
 
-private pure func owner(
-	state: VerificationState,
+private fixed union OwnerSlot:
+	PrefixSlot(Int)
+	LocalSlot(Int)
+
+
+private pure func owner_slot(
+	prefix_count: Int,
+	first_owner: Int,
+	owner_count: Int,
 	id: OwnerId,
 	span: Span,
-) -> Result[OwnerState, Diagnostic]:
+) -> Result[OwnerSlot, Diagnostic]:
 	ordinal = owner_number(id)
 
-	if IntOps.greater_than_or_equal(ordinal, 0) and IntOps.less_than(ordinal, state.first_owner):
+	if IntOps.greater_than_or_equal(ordinal, 0) and IntOps.less_than(ordinal, prefix_count):
+		Ok(PrefixSlot(ordinal))
+	else if IntOps.greater_than_or_equal(ordinal, 0) and IntOps.less_than(ordinal, first_owner):
 		Err(
 			failure(
 				span,
@@ -142,13 +168,13 @@ private pure func owner(
 					.concat(" is not available in this match arm"),
 			),
 		)
+	else if IntOps.greater_than_or_equal(ordinal, first_owner) and IntOps.less_than(
+		ordinal,
+		IntOps.add(first_owner, owner_count),
+	):
+		Ok(LocalSlot(IntOps.subtract(ordinal, first_owner)))
 	else:
-		entry = if IntOps.greater_than_or_equal(ordinal, state.first_owner):
-			state.owners.get(IntOps.subtract(ordinal, state.first_owner))
-		else:
-			None
-
-		entry.to_result(
+		Err(
 			failure(
 				span,
 				"owner "
@@ -158,14 +184,39 @@ private pure func owner(
 		)
 
 
-private pure func introduce_owner(
-	state: VerificationState,
+private pure func owner(
+	prefix_owners: List[OwnerState],
+	first_owner: Int,
+	owners: List[OwnerState],
 	id: OwnerId,
-	value: ValueId,
 	span: Span,
-) -> Result[List[OwnerState], Diagnostic]:
+) -> Result[OwnerState, Diagnostic]:
+	slot ?= owner_slot(prefix_owners.length(), first_owner, owners.length(), id, span)
+
+	entry = match slot:
+		PrefixSlot(index):
+			prefix_owners.get(index)
+		LocalSlot(index):
+			owners.get(index)
+
+	entry.to_result(
+		failure(
+			span,
+			"owner "
+				.append_int(owner_number(id))
+				.concat(" is not defined"),
+		),
+	)
+
+
+private pure func validate_next_owner(
+	first_owner: Int,
+	owners: List[OwnerState],
+	id: OwnerId,
+	span: Span,
+) -> Result[Void, Diagnostic]:
 	ordinal = owner_number(id)
-	next_owner = IntOps.add(state.first_owner, state.owners.length())
+	next_owner = IntOps.add(first_owner, owners.length())
 
 	if IntOps.less_than(ordinal, 0):
 		Err(failure(span, "negative owner identity"))
@@ -181,35 +232,23 @@ private pure func introduce_owner(
 	else if IntOps.not_equals(ordinal, next_owner):
 		Err(failure(span, "owner identity is not the next function ordinal"))
 	else:
-		Ok(state.owners.append(ActiveOwner(value)))
+		Ok(void)
 
 
-private pure func borrowed_value(
-	id: ValueId,
-	state: VerificationState,
-	span: Span,
-) -> Result[BorrowedValue, Diagnostic]:
-	known ?= value(state, id, span)
-
-	source_result: Result[BorrowSource, Diagnostic] = match known.result:
-		BorrowedResult(source):
-			Ok(source)
-		OwnedResult(owner):
-			Ok(OwnerBorrow(owner))
-		UnmanagedResult:
-			Err(failure(span, "borrow requires a managed value"))
-
-	source ?= source_result
-	Ok({
-		value = id,
-		source = source,
-	})
+private pure func argument_value(argument: OwnedArgument) -> ValueId:
+	match argument:
+		UnmanagedArgument(id):
+			id
+		BorrowedArgument(borrow):
+			borrow.value
 
 
 private pure func verify_borrow(
 	borrow: BorrowedValue,
-	state: VerificationState,
+	state: VerificationFacts,
 	span: Span,
+	prefix_owners: List[OwnerState],
+	owners: List[OwnerState],
 ) -> Result[Void, Diagnostic]:
 	borrowed ?= value(state, borrow.value, span)
 
@@ -233,7 +272,7 @@ private pure func verify_borrow(
 			else:
 				Err(failure(span, "parameter borrow does not refer to the borrowed parameter"))
 		OwnerBorrow(id):
-			entry ?= owner(state, id, span)
+			entry ?= owner(prefix_owners, state.first_owner, owners, id, span)
 
 			match entry:
 				DischargedOwner:
@@ -266,8 +305,17 @@ private pure func verify_borrow(
 				_:
 					Err(failure(span, "payload borrow requires a borrowed projection"))
 
-			ancestor ?= borrowed_value(parent, state, span)
-			verify_borrow(ancestor, state, span)
+			ancestor ?= borrowed.projection_parent.to_result(
+				failure(
+					span,
+					"projection has no parent lifetime",
+				),
+			)
+
+			if IntOps.equals(value_number(ancestor.value), value_number(parent)):
+				verify_borrow(ancestor, state, span, prefix_owners, owners)
+			else:
+				Err(failure(span, "payload borrow has the wrong parent value"))
 
 
 private pure func call_signature(
@@ -293,11 +341,11 @@ private pure func call_signature(
 
 					present ?= variant_type(
 						roles.present,
-						Some(expected_payload),
+						[expected_payload],
 						unions,
 						call.span,
 					)
-					absent ?= variant_type(roles.absent, None, unions, call.span)
+					absent ?= variant_type(roles.absent, [], unions, call.span)
 					owner = variant_owner(roles.present)
 					layout ?= unions
 						.get(union_number(owner))
@@ -317,8 +365,8 @@ private pure func call_signature(
 							),
 						)
 				BooleanResult(roles):
-					equal ?= variant_type(roles.equal, None, unions, call.span)
-					different ?= variant_type(roles.different, None, unions, call.span)
+					equal ?= variant_type(roles.equal, [], unions, call.span)
+					different ?= variant_type(roles.different, [], unions, call.span)
 					owner = variant_owner(roles.equal)
 					layout ?= unions
 						.get(union_number(owner))
@@ -350,10 +398,12 @@ private pure func call_signature(
 private pure func verify_argument(
 	argument: OwnedArgument,
 	expected: TypeRef,
-	state: VerificationState,
+	state: VerificationFacts,
 	unions: List[ConcreteUnion],
 	span: Span,
 	records: List[ConcreteRecord],
+	prefix_owners: List[OwnerState],
+	owners: List[OwnerState],
 ) -> Result[Void, Diagnostic]:
 	id = match argument:
 		UnmanagedArgument(id):
@@ -373,7 +423,7 @@ private pure func verify_argument(
 				match plan:
 					NoOwnership:
 						Ok(void)
-					ManagedStringLeaf | ManagedStringListRoot | InlineOwnedFields(_):
+					ManagedStringLeaf | ManagedStringListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
 						Err(
 							failure(
 								span,
@@ -381,16 +431,18 @@ private pure func verify_argument(
 							),
 						)
 			BorrowedArgument(borrow):
-				verify_borrow(borrow, state, span)
+				verify_borrow(borrow, state, span, prefix_owners, owners)
 
 
 private pure func verify_arguments(
 	arguments: List[OwnedArgument],
 	parameters: List[TypeRef],
-	state: VerificationState,
+	state: VerificationFacts,
 	unions: List[ConcreteUnion],
 	span: Span,
 	records: List[ConcreteRecord],
+	prefix_owners: List[OwnerState],
+	owners: List[OwnerState],
 ) -> Result[Void, Diagnostic]:
 	if IntOps.less_than(arguments.length(), parameters.length()):
 		Err(failure(span, "call is missing its argument"))
@@ -406,7 +458,16 @@ private pure func verify_arguments(
 					invalid = Some(failure(span, "missing call parameter contract"))
 					break
 				Some(expected):
-					match verify_argument(argument, expected, state, unions, span, records):
+					match verify_argument(
+						argument,
+						expected,
+						state,
+						unions,
+						span,
+						records,
+						prefix_owners,
+						owners,
+					):
 						Err(error):
 							invalid = Some(error)
 							break
@@ -422,45 +483,27 @@ private pure func verify_arguments(
 				Ok(void)
 
 
-private pure func variant_shape(
-	id: VariantInstanceId,
-	unions: List[ConcreteUnion],
-	span: Span,
-) -> Result[Option[TypeRef], Diagnostic]:
-	declaration ?= unions
-		.get(union_number(variant_owner(id)))
-		.to_result(failure(span, "unknown variant owner"))
-	declaration.variants
-		.get(variant_number(id))
-		.to_result(failure(span, "unknown variant identity"))
+private pure func variant_shape(id: VariantInstanceId, unions: List[ConcreteUnion], span: Span) -> Result[List[TypeRef], Diagnostic]:
+	declaration ?= unions.get(union_number(variant_owner(id))).to_result(failure(span, "unknown variant owner"))
+	declaration.variants.get(variant_number(id)).to_result(failure(span, "unknown variant identity"))
 
 
-private pure func variant_type(
-	id: VariantInstanceId,
-	expected: Option[TypeRef],
-	unions: List[ConcreteUnion],
-	span: Span,
-) -> Result[TypeRef, Diagnostic]:
+private pure func variant_type(id: VariantInstanceId, expected: List[TypeRef], unions: List[ConcreteUnion], span: Span) -> Result[TypeRef, Diagnostic]:
 	shape ?= variant_shape(id, unions, span)
-
-	valid = match expected:
-		None:
-			match shape:
-				None:
-					True
-				_:
-					False
-		Some(expected):
-			match shape:
-				Some(actual):
-					same_type(expected, actual)
-				_:
-					False
-
-	if valid:
-		Ok(UnionType(variant_owner(id)))
+	if not IntOps.equals(shape.length(), expected.length()):
+		Err(failure(span, "variant field count does not match its operation"))
 	else:
-		Err(failure(span, "variant payload does not match its operation"))
+		var position = 0
+		var valid = True
+		for actual in expected:
+			match shape.get(position):
+				Some(field): valid = valid and same_type(field, actual)
+				None: valid = False
+			position = IntOps.add(position, 1)
+		if valid:
+			Ok(UnionType(variant_owner(id)))
+		else:
+			Err(failure(span, "variant payload does not match its operation"))
 
 
 private pure func valid_union_layout(
@@ -481,52 +524,59 @@ private pure func valid_union_layout(
 		var invalid: Option[Diagnostic] = None
 		var owning = False
 
-		for payload in layout.variants:
-			valid = match payload:
-				None:
-					True
-				Some(value_type):
-					match value_type:
-						VoidType | IntType | FloatType:
-							True
-						RecordType(id):
-							records
-								.get(record_number(id))
-								.is_some()
-						UnionType(id):
-							valid = (
-								IntOps.greater_than_or_equal(union_number(id), 0)
-								and IntOps.less_than(union_number(id), position)
-							)
+		for fields in layout.variants:
+			for value_type in fields:
+				valid = match value_type:
+					VoidType | IntType | FloatType:
+						True
+					RecordType(id):
+						match records.get(record_number(id)):
+							Some(child):
+								match child.representation:
+									ManagedRecord:
+										owning = True
+									InlineRecord:
+										void
 
-							if valid:
-								match unions.get(union_number(id)):
-									Some(child):
-										match child.representation:
-											InlineOwningPayload:
-												owning = True
-											InlineUnmanaged:
-												void
-
-										True
-									None:
-										False
-							else:
+								True
+							None:
 								False
-						StringType:
-							owning = True
-							True
-						ListType(element):
-							owning = True
-							same_type(element, StringType)
+					UnionType(id):
+						valid = (
+							IntOps.greater_than_or_equal(union_number(id), 0)
+							and IntOps.less_than(union_number(id), position)
+						)
 
-			if not valid:
-				invalid = Some(
-					failure(
-						span,
-						"union payload must reference a supported, earlier layout",
-					),
-				)
+						if valid:
+							match unions.get(union_number(id)):
+								Some(child):
+									match child.representation:
+										InlineOwningPayload:
+											owning = True
+										InlineUnmanaged:
+											void
+
+									True
+								None:
+									False
+						else:
+							False
+					StringType:
+						owning = True
+						True
+					ListType(element):
+						owning = True
+						same_type(element, StringType)
+
+				if not valid:
+					invalid = Some(
+						failure(
+							span,
+							"union payload must reference a supported, earlier layout",
+						),
+					)
+					break
+			if invalid.is_some():
 				break
 
 		match invalid:
@@ -549,15 +599,251 @@ private pure func valid_record_layout(
 	layout: ConcreteRecord,
 	span: Span,
 ) -> Result[ConcreteRecord, Diagnostic]:
-	var valid = IntOps.greater_than(layout.fields.length(), 0)
-
-	for field in layout.fields:
-		valid = valid and same_type(field, IntType)
-
-	if valid:
+	if IntOps.greater_than(layout.fields.length(), 0):
 		Ok(layout)
 	else:
-		Err(failure(span, "record layout must contain one or more Int fields"))
+		Err(failure(span, "record layout must contain one or more fields"))
+
+
+private fixed union LayoutVisit:
+	UnvisitedLayout
+	VisitingLayout
+	CompleteLayout
+
+
+private fixed union LayoutVisitStep:
+	VisitRecordLayout(Int)
+	VisitUnionLayout(Int)
+	VisitStoredType(TypeRef)
+	FinishRecordLayout(Int)
+	FinishUnionLayout(Int)
+
+
+private pure func push_layout_visit(
+	steps: List[LayoutVisitStep],
+	depth: Int,
+	step: LayoutVisitStep,
+) -> List[LayoutVisitStep]:
+	if IntOps.less_than(depth, steps.length()):
+		steps.set(depth, step)
+	else:
+		steps.append(step)
+
+
+private pure func verify_layout_graph(
+	records: List[ConcreteRecord],
+	unions: List[ConcreteUnion],
+) -> Result[Void, Diagnostic]:
+	span: Span = {
+		source = COMPILER_SOURCE,
+		start = 0,
+		end = 0
+	}
+	-- A local traversal owns each state vector throughout every update.
+	var record_visits = records.map(pure func(_): UnvisitedLayout)
+	var union_visits = unions.map(pure func(_): UnvisitedLayout)
+	var pending: List[LayoutVisitStep] = []
+	var pending_count = 0
+	var position = unions.length()
+
+	while IntOps.greater_than(position, 0):
+		position = IntOps.subtract(position, 1)
+		pending = push_layout_visit(pending, pending_count, VisitUnionLayout(position))
+		pending_count = IntOps.add(pending_count, 1)
+
+	position = records.length()
+
+	while IntOps.greater_than(position, 0):
+		position = IntOps.subtract(position, 1)
+		pending = push_layout_visit(pending, pending_count, VisitRecordLayout(position))
+		pending_count = IntOps.add(pending_count, 1)
+
+	var invalid: Option[Diagnostic] = None
+
+	while IntOps.greater_than(pending_count, 0) and not invalid.is_some():
+		pending_count = IntOps.subtract(pending_count, 1)
+
+		match pending.get(pending_count):
+			None:
+				invalid = Some(failure(span, "invalid aggregate layout traversal state"))
+			Some(step):
+				match step:
+					VisitStoredType(value_type):
+						match value_type:
+							RecordType(id):
+								pending = push_layout_visit(
+									pending,
+									pending_count,
+									VisitRecordLayout(record_number(id)),
+								)
+								pending_count = IntOps.add(pending_count, 1)
+							UnionType(id):
+								pending = push_layout_visit(
+									pending,
+									pending_count,
+									VisitUnionLayout(union_number(id)),
+								)
+								pending_count = IntOps.add(pending_count, 1)
+							ListType(element):
+								if not same_type(element, StringType):
+									invalid = Some(
+										failure(
+											span,
+											"unsupported List element in aggregate layout",
+										),
+									)
+							_:
+								void
+					VisitRecordLayout(index):
+						match record_visits.get(index):
+							None:
+								invalid = Some(failure(span, "unknown record layout"))
+							Some(CompleteLayout):
+								void
+							Some(VisitingLayout):
+								invalid = Some(
+									failure(
+										span,
+										"recursive aggregate layout is unsupported",
+									),
+								)
+							Some(UnvisitedLayout):
+								match records.get(index):
+									None:
+										invalid = Some(failure(span, "unknown record layout"))
+									Some(layout):
+										record_visits = record_visits.set(index, VisitingLayout)
+										pending = push_layout_visit(
+											pending,
+											pending_count,
+											FinishRecordLayout(index),
+										)
+										pending_count = IntOps.add(pending_count, 1)
+										var child = layout.fields.length()
+
+										while IntOps.greater_than(child, 0):
+											child = IntOps.subtract(child, 1)
+
+											match layout.fields.get(child):
+												Some(field):
+													pending = push_layout_visit(
+														pending,
+														pending_count,
+														VisitStoredType(field),
+													)
+													pending_count = IntOps.add(pending_count, 1)
+												None:
+													invalid = Some(
+														failure(
+															span,
+															"invalid aggregate layout traversal state",
+														),
+													)
+													break
+					VisitUnionLayout(index):
+						match union_visits.get(index):
+							None:
+								invalid = Some(failure(span, "unknown union layout"))
+							Some(CompleteLayout):
+								void
+							Some(VisitingLayout):
+								invalid = Some(
+									failure(
+										span,
+										"recursive aggregate layout is unsupported",
+									),
+								)
+							Some(UnvisitedLayout):
+								match unions.get(index):
+									None:
+										invalid = Some(failure(span, "unknown union layout"))
+									Some(layout):
+										union_visits = union_visits.set(index, VisitingLayout)
+										pending = push_layout_visit(
+											pending,
+											pending_count,
+											FinishUnionLayout(index),
+										)
+										pending_count = IntOps.add(pending_count, 1)
+										var child = layout.variants.length()
+
+										while IntOps.greater_than(child, 0):
+											child = IntOps.subtract(child, 1)
+
+											match layout.variants.get(child):
+												Some(fields):
+													var field_position = fields.length()
+													while IntOps.greater_than(field_position, 0):
+														field_position = IntOps.subtract(field_position, 1)
+														match fields.get(field_position):
+															Some(field):
+																pending = push_layout_visit(pending, pending_count, VisitStoredType(field))
+																pending_count = IntOps.add(pending_count, 1)
+															None:
+																invalid = Some(failure(span, "invalid aggregate layout traversal state"))
+																break
+												None:
+													invalid = Some(
+														failure(
+															span,
+															"invalid aggregate layout traversal state",
+														),
+													)
+													break
+					FinishUnionLayout(index):
+						union_visits = union_visits.set(index, CompleteLayout)
+					FinishRecordLayout(index):
+						match records.get(index):
+							None:
+								invalid = Some(failure(span, "unknown record layout"))
+							Some(layout):
+								var inline = True
+
+								for field in layout.fields:
+									match field:
+										IntType | FloatType:
+											void
+										RecordType(child):
+											match records.get(record_number(child)):
+												Some(child_layout):
+													match child_layout.representation:
+														InlineRecord:
+															void
+														ManagedRecord:
+															inline = False
+												None:
+													invalid = Some(
+														failure(
+															span,
+															"unknown record layout",
+														),
+													)
+													break
+										_:
+											inline = False
+
+								matches = match layout.representation:
+									InlineRecord:
+										inline
+									ManagedRecord:
+										not inline
+
+								if not invalid.is_some():
+									if matches:
+										record_visits = record_visits.set(index, CompleteLayout)
+									else:
+										invalid = Some(
+											failure(
+												span,
+												"record storage summary does not match its fields",
+											),
+										)
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
 
 
 private pure func record_layout(
@@ -587,12 +873,14 @@ private pure func record_field_type(
 
 private pure func operation_type(
 	definition: OwnedDefinition,
-	state: VerificationState,
+	state: VerificationFacts,
 	signature: FunctionSignature,
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	projection: ProjectionContext,
 	records: List[ConcreteRecord],
+	prefix_owners: List[OwnerState],
+	owners: List[OwnerState],
 ) -> Result[TypeRef, Diagnostic]:
 	match definition.operation:
 		ConstructRecordDefinition(owner, fields):
@@ -622,7 +910,13 @@ private pure func operation_type(
 					layout,
 					definition.span,
 				).and_then(pure func(expected: TypeRef) -> Result[Void, Diagnostic]:
-					known ?= value(state, field.value, definition.span)
+					stored = match field.value:
+						UnmanagedPayload(value):
+							value
+						OwnedPayload(value, _):
+							value
+
+					known ?= value(state, stored, definition.span)
 
 					if same_type(known.value_type, expected):
 						Ok(void)
@@ -647,7 +941,13 @@ private pure func operation_type(
 					Err(error)
 				None:
 					Ok(RecordType(owner))
-		ReadRecordFieldDefinition(field, source):
+		ReadRecordFieldDefinition(field, argument):
+			source = match argument:
+				UnmanagedArgument(value):
+					value
+				BorrowedArgument(borrow):
+					borrow.value
+
 			known ?= value(state, source, definition.span)
 
 			owner ?= match known.value_type:
@@ -657,6 +957,16 @@ private pure func operation_type(
 					Err(failure(definition.span, "field projection requires a record value"))
 
 			layout ?= record_layout(owner, records, definition.span)
+			live ?= verify_arguments(
+				[argument],
+				[known.value_type],
+				state,
+				unions,
+				definition.span,
+				records,
+				prefix_owners,
+				owners,
+			)
 			record_field_type(field, owner, layout, definition.span)
 		ParameterDefinition(index):
 			if IntOps.less_than(index, state.parameters.length()):
@@ -689,7 +999,7 @@ private pure func operation_type(
 			else:
 				Err(failure(definition.span, "Float literal must be finite"))
 		VariantDefinition(id):
-			variant_type(id, None, unions, definition.span)
+			variant_type(id, [], unions, definition.span)
 		CallDefinition(call, arguments):
 			contract ?= call_signature(call, functions, unions)
 			valid ?= verify_arguments(
@@ -699,23 +1009,36 @@ private pure func operation_type(
 				unions,
 				definition.span,
 				records,
+				prefix_owners,
+				owners,
 			)
 
 			if same_type(contract.return_type, definition.value_type):
 				Ok(contract.return_type)
 			else:
 				Err(failure(definition.span, "call result type does not match its contract"))
-		ConstructDefinition(id, argument):
-			argument_id = match argument:
-				UnmanagedPayload(id):
-					id
-				OwnedPayload(id, _):
-					id
-
-			argument_value ?= value(state, argument_id, definition.span)
-
-			variant_type(id, Some(argument_value.value_type), unions, definition.span)
-		PayloadDefinition(selected, source):
+		ConstructDefinition(id, payloads):
+			nonempty ?= if payloads.is_empty():
+				Err(failure(definition.span, "constructed variant requires at least one field"))
+			else:
+				Ok(void)
+			var types: List[TypeRef] = []
+			var error: Option[Diagnostic] = None
+			for payload in payloads:
+				argument = match payload:
+					UnmanagedPayload(value): value
+					OwnedPayload(value, _): value
+				match value(state, argument, definition.span):
+					Ok(known): types = types.append(known.value_type)
+					Err(failure):
+						error = Some(failure)
+						break
+			ready ?= match error:
+				Some(error): Err(error)
+				None: Ok(void)
+			variant_type(id, types, unions, definition.span)
+		PayloadDefinition(field, source):
+			selected = variant_field_variant(field)
 			scrutinee ?= value(state, source, definition.span)
 
 			match projection:
@@ -727,16 +1050,11 @@ private pure func operation_type(
 						),
 					)
 				PayloadProjection(expected, variant):
-					payload ?= variant_shape(variant, unions, definition.span)
-					payload_type ?= payload.to_result(
-						failure(
-							definition.span,
-							"selected variant has no payload",
-						),
-					)
+					fields ?= variant_shape(variant, unions, definition.span)
+					payload_type ?= fields.get(variant_field_number(field)).to_result(failure(definition.span, "unknown variant field identity"))
 
 					if (
-						IntOps.equals(value_number(source), value_number(expected))
+						IntOps.equals(value_number(source), value_number(argument_value(expected)))
 						and same_type(scrutinee.value_type, UnionType(variant_owner(variant)))
 						and IntOps.equals(
 							union_number(variant_owner(selected)),
@@ -744,6 +1062,15 @@ private pure func operation_type(
 						)
 						and IntOps.equals(variant_number(selected), variant_number(variant))
 					):
+						live ?= verify_match_argument(
+							expected,
+							state,
+							unions,
+							records,
+							definition.span,
+							prefix_owners,
+							owners,
+						)
 						Ok(payload_type)
 					else:
 						Err(
@@ -754,13 +1081,15 @@ private pure func operation_type(
 						)
 
 
-private pure func verify_stored_payload(
+private pure func stored_payload_transfer(
 	payload: StoredPayload,
-	state: VerificationState,
+	state: VerificationFacts,
+	prefix_owners: List[OwnerState],
+	owners: List[OwnerState],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 	span: Span,
-) -> Result[VerificationState, Diagnostic]:
+) -> Result[Option[OwnerSlot], Diagnostic]:
 	id = match payload:
 		UnmanagedPayload(id):
 			id
@@ -774,7 +1103,7 @@ private pure func verify_stored_payload(
 		UnmanagedPayload(_):
 			match plan:
 				NoOwnership:
-					Ok(state)
+					Ok(None)
 				_:
 					Err(failure(span, "managed payload requires an owner transfer"))
 		OwnedPayload(value, transferred):
@@ -784,30 +1113,163 @@ private pure func verify_stored_payload(
 				_:
 					Ok(void)
 
-			entry ?= owner(state, transferred, span)
+			entry ?= owner(prefix_owners, state.first_owner, owners, transferred, span)
 
 			match entry:
 				DischargedOwner:
 					Err(failure(span, "payload owner has already been discharged"))
 				ActiveOwner(owned):
 					if IntOps.equals(value_number(value), value_number(owned)):
-						Ok({ state | owners = state.owners.set(
-									IntOps.subtract(owner_number(transferred), state.first_owner),
-									DischargedOwner,
-								) })
+						owner_slot(
+							prefix_owners.length(),
+							state.first_owner,
+							owners.length(),
+							transferred,
+							span,
+						).map(
+							pure func(slot): Some(slot),
+						)
 					else:
 						Err(failure(span, "payload owner does not own the stored value"))
 
 
-private pure func verify_definition(
+private pure func verify_definition_result(
 	definition: OwnedDefinition,
-	state: VerificationState,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[Option[OwnerId], Diagnostic]:
+	plan ?= value_ownership(definition.value_type, unions, records)
+
+	ownership_result: Result[Option[OwnerId], Diagnostic] = match plan:
+		NoOwnership:
+			match definition.result:
+				UnmanagedResult:
+					Ok(None)
+				_:
+					Err(failure(definition.span, "unmanaged value carries an ownership obligation"))
+		ManagedStringLeaf | ManagedStringListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
+			match definition.operation:
+				ParameterDefinition(_):
+					match definition.result:
+						BorrowedResult(ParameterBorrow(source)):
+							if IntOps.equals(value_number(source), value_number(definition.id)):
+								Ok(None)
+							else:
+								Err(
+									failure(
+										definition.span,
+										"managed parameter has the wrong borrow source",
+									),
+								)
+						_:
+							Err(failure(definition.span, "managed parameter must be borrowed"))
+				PayloadDefinition(_, parent):
+					match definition.result:
+						BorrowedResult(PayloadBorrow(source)):
+							if IntOps.equals(value_number(parent), value_number(source)):
+								Ok(None)
+							else:
+								Err(
+									failure(
+										definition.span,
+										"payload borrow has the wrong parent value",
+									),
+								)
+						_:
+							Err(
+								failure(
+									definition.span,
+									"managed projection requires its parent borrow",
+								),
+							)
+				ReadRecordFieldDefinition(_, argument):
+					parent = match argument:
+						UnmanagedArgument(value):
+							value
+						BorrowedArgument(borrow):
+							borrow.value
+
+					match definition.result:
+						BorrowedResult(PayloadBorrow(source)):
+							if IntOps.equals(value_number(parent), value_number(source)):
+								Ok(None)
+							else:
+								Err(
+									failure(
+										definition.span,
+										"payload borrow has the wrong parent value",
+									),
+								)
+						_:
+							Err(
+								failure(
+									definition.span,
+									"managed projection requires its parent borrow",
+								),
+							)
+				StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | ConstructRecordDefinition(_, _) | VariantDefinition(_):
+					match definition.result:
+						OwnedResult(owner):
+							Ok(Some(owner))
+						_:
+							Err(failure(definition.span, "managed result requires an owner"))
+				_:
+					Err(failure(definition.span, "unsupported managed value operation"))
+
+	ownership_result
+
+
+private pure func verify_match_argument(
+	argument: OwnedArgument,
+	state: VerificationFacts,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+	span: Span,
+	prefix_owners: List[OwnerState],
+	owners: List[OwnerState],
+) -> Result[Void, Diagnostic]:
+	match argument:
+		BorrowedArgument(borrow):
+			verify_borrow(borrow, state, span, prefix_owners, owners)
+		UnmanagedArgument(id):
+			known ?= value(state, id, span)
+			plan ?= value_ownership(known.value_type, unions, records)
+
+			match plan:
+				NoOwnership:
+					Ok(void)
+				_:
+					Err(failure(span, "managed match scrutinee requires an owner-dependent borrow"))
+
+
+private pure func definition_parent(
+	definition: OwnedDefinition,
+	projection: ProjectionContext,
+) -> Option[BorrowedValue]:
+	match definition.operation:
+		ReadRecordFieldDefinition(_, BorrowedArgument(parent)):
+			Some(parent)
+		PayloadDefinition(_, _):
+			match projection:
+				PayloadProjection(BorrowedArgument(parent), _):
+					Some(parent)
+				_:
+					None
+		_:
+			None
+
+
+private pure func verify_definition_type(
+	definition: OwnedDefinition,
+	state: VerificationFacts,
 	signature: FunctionSignature,
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	projection: ProjectionContext,
 	records: List[ConcreteRecord],
-) -> Result[VerificationState, Diagnostic]:
+	prefix_owners: List[OwnerState],
+	owners: List[OwnerState],
+) -> Result[Void, Diagnostic]:
 	if IntOps.not_equals(
 		value_number(definition.id),
 		IntOps.add(state.first_value, state.values.length()),
@@ -822,152 +1284,234 @@ private pure func verify_definition(
 			unions,
 			projection,
 			records,
+			prefix_owners,
+			owners,
 		)
 
-		if not same_type(expected, definition.value_type):
-			Err(failure(definition.span, "definition type does not match its operation"))
+		if same_type(expected, definition.value_type):
+			Ok(void)
 		else:
-			ready ?= match definition.operation:
-				ConstructDefinition(_, payload):
-					verify_stored_payload(payload, state, unions, records, definition.span)
-				_:
-					Ok(state)
-
-			plan ?= match definition.value_type:
-				RecordType(owner):
-					record_layout(owner, records, definition.span).map(pure func(_): NoOwnership)
-				_:
-					value_ownership(definition.value_type, unions, records)
-
-			ownership_result: Result[List[OwnerState], Diagnostic] = match plan:
-				NoOwnership:
-					match definition.result:
-						UnmanagedResult:
-							Ok(ready.owners)
-						_:
-							Err(
-								failure(
-									definition.span,
-									"unmanaged value carries an ownership obligation",
-								),
-							)
-				ManagedStringLeaf | ManagedStringListRoot | InlineOwnedFields(_):
-					match definition.operation:
-						ParameterDefinition(_):
-							match definition.result:
-								BorrowedResult(ParameterBorrow(source)):
-									if IntOps.equals(
-										value_number(source),
-										value_number(definition.id),
-									):
-										Ok(ready.owners)
-									else:
-										Err(
-											failure(
-												definition.span,
-												"managed parameter has the wrong borrow source",
-											),
-										)
-								_:
-									Err(
-										failure(
-											definition.span,
-											"managed parameter must be borrowed",
-										),
-									)
-						PayloadDefinition(_, parent):
-							match definition.result:
-								BorrowedResult(PayloadBorrow(source)):
-									if IntOps.equals(value_number(parent), value_number(source)):
-										ancestor ?= borrowed_value(parent, ready, definition.span)
-										valid ?= verify_borrow(ancestor, ready, definition.span)
-										Ok(ready.owners)
-									else:
-										Err(
-											failure(
-												definition.span,
-												"payload borrow has the wrong parent value",
-											),
-										)
-								_:
-									Err(
-										failure(
-											definition.span,
-											"managed projection requires its parent borrow",
-										),
-									)
-						StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | VariantDefinition(_):
-							match definition.result:
-								OwnedResult(owner):
-									introduce_owner(ready, owner, definition.id, definition.span)
-								_:
-									Err(
-										failure(
-											definition.span,
-											"managed result requires an owner",
-										),
-									)
-						_:
-							Err(failure(definition.span, "unsupported managed value operation"))
-
-			owners ?= ownership_result
-
-			parameters = match definition.operation:
-				ParameterDefinition(_):
-					state.parameters.append(definition.id)
-				_:
-					state.parameters
-
-			Ok({ state |
-					values = state.values.append({
-						value_type = definition.value_type,
-						span = definition.span,
-						result = definition.result,
-					}),
-					owners = owners,
-					parameters = parameters
-				})
+			Err(failure(definition.span, "definition type does not match its operation"))
 
 
-private pure func verify_operation(
-	operation: OwnershipOperation,
-	state: VerificationState,
+private pure func verified_drop(
+	id: OwnerId,
+	span: Span,
+	prefix_owners: List[OwnerState],
+	first_owner: Int,
+	owners: List[OwnerState],
+) -> Result[OwnerSlot, Diagnostic]:
+	entry ?= owner(prefix_owners, first_owner, owners, id, span)
+
+	match entry:
+		DischargedOwner:
+			Err(
+				failure(
+					span,
+					"owner "
+						.append_int(owner_number(id))
+						.concat(" has already been discharged"),
+				),
+			)
+		ActiveOwner(_):
+			owner_slot(prefix_owners.length(), first_owner, owners.length(), id, span)
+
+
+-- Owner vectors belong to this traversal, not the per-definition facts carrier.
+-- Each selected arm may make one initial copy of its prefix snapshot; subsequent
+-- discharges consume the uniquely held local vectors.
+private pure func verify_operations(
+	operations: List[OwnershipOperation],
+	initial: VerificationState,
 	signature: FunctionSignature,
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	projection: ProjectionContext,
 	records: List[ConcreteRecord],
 ) -> Result[VerificationState, Diagnostic]:
-	match operation:
-		DefineValue(definition):
-			verify_definition(definition, state, signature, functions, unions, projection, records)
-		AcquireOwner(id, borrow, span):
-			valid ?= verify_borrow(borrow, state, span)
-			owners ?= introduce_owner(state, id, borrow.value, span)
-			Ok({ state | owners = owners })
-		DropOwner(id, span):
-			entry ?= owner(state, id, span)
+	var prefix_owners = initial.prefix_owners
+	var owners = initial.owners
+	var state = initial.facts
+	var invalid: Option[Diagnostic] = None
 
-			match entry:
-				DischargedOwner:
-					Err(
-						failure(
-							span,
-							"owner "
-								.append_int(owner_number(id))
-								.concat(" has already been discharged"),
-						),
-					)
-				ActiveOwner(_):
-					Ok({ state | owners = state.owners.set(
-								IntOps.subtract(owner_number(id), state.first_owner),
-								DischargedOwner,
-							) })
+	for operation in operations:
+		checked: Result[Void, Diagnostic] = match operation:
+			DefineValue(definition):
+				match verify_definition_type(
+					definition,
+					state,
+					signature,
+					functions,
+					unions,
+					projection,
+					records,
+					prefix_owners,
+					owners,
+				):
+					Err(error):
+						Err(error)
+					Ok(_):
+						stored: Result[Void, Diagnostic] = match definition.operation:
+							ConstructDefinition(_, payloads):
+								var failure_slot: Option[Diagnostic] = None
+
+								for payload in payloads:
+									match stored_payload_transfer(
+										payload,
+										state,
+										prefix_owners,
+										owners,
+										unions,
+										records,
+										definition.span,
+									):
+										Err(error):
+											failure_slot = Some(error)
+											break
+										Ok(Some(PrefixSlot(index))):
+											prefix_owners = prefix_owners.set(
+												index,
+												DischargedOwner,
+											)
+										Ok(Some(LocalSlot(index))):
+											owners = owners.set(index, DischargedOwner)
+										Ok(None):
+											void
+
+								match failure_slot:
+									Some(error):
+										Err(error)
+									None:
+										Ok(void)
+							ConstructRecordDefinition(_, fields):
+								var failure_slot: Option[Diagnostic] = None
+
+								for field in fields:
+									match stored_payload_transfer(
+										field.value,
+										state,
+										prefix_owners,
+										owners,
+										unions,
+										records,
+										definition.span,
+									):
+										Err(error):
+											failure_slot = Some(error)
+											break
+										Ok(Some(PrefixSlot(index))):
+											prefix_owners = prefix_owners.set(
+												index,
+												DischargedOwner,
+											)
+										Ok(Some(LocalSlot(index))):
+											owners = owners.set(index, DischargedOwner)
+										Ok(None):
+											void
+
+								match failure_slot:
+									Some(error):
+										Err(error)
+									None:
+										Ok(void)
+							_:
+								Ok(void)
+
+						match stored:
+							Err(error):
+								Err(error)
+							Ok(_):
+								match verify_definition_result(definition, unions, records):
+									Err(error):
+										Err(error)
+									Ok(introduced):
+										valid_owner: Result[Void, Diagnostic] = match introduced:
+											None:
+												Ok(void)
+											Some(id):
+												match validate_next_owner(
+													state.first_owner,
+													owners,
+													id,
+													definition.span,
+												):
+													Err(error):
+														Err(error)
+													Ok(_):
+														owners = owners.append(
+															ActiveOwner(definition.id),
+														)
+														Ok(void)
+
+										match valid_owner:
+											Err(error):
+												Err(error)
+											Ok(_):
+												parameters = match definition.operation:
+													ParameterDefinition(_):
+														state.parameters.append(definition.id)
+													_:
+														state.parameters
+
+												state = { state |
+													values = state.values.append({
+														value_type = definition.value_type,
+														span = definition.span,
+														result = definition.result,
+														projection_parent = definition_parent(
+															definition,
+															projection,
+														),
+													}),
+													parameters = parameters
+												}
+												Ok(void)
+			AcquireOwner(id, borrow, span):
+				match verify_borrow(borrow, state, span, prefix_owners, owners):
+					Err(error):
+						Err(error)
+					Ok(_):
+						match validate_next_owner(state.first_owner, owners, id, span):
+							Err(error):
+								Err(error)
+							Ok(_):
+								owners = owners.append(ActiveOwner(borrow.value))
+								Ok(void)
+			DropOwner(id, span):
+				match verified_drop(id, span, prefix_owners, state.first_owner, owners):
+					Err(error):
+						Err(error)
+					Ok(slot):
+						match slot:
+							PrefixSlot(index):
+								prefix_owners = prefix_owners.set(index, DischargedOwner)
+							LocalSlot(index):
+								owners = owners.set(index, DischargedOwner)
+
+						Ok(void)
+
+		match checked:
+			Ok(_):
+				void
+			Err(error):
+				invalid = Some(error)
+				break
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				facts = state,
+				prefix_owners = prefix_owners,
+				owners = owners,
+			})
 
 
 private pure func complete_owners(
 	owners: List[OwnerState],
 	first_owner: Int,
+	excluded: Option[OwnerId],
 	span: Span,
 ) -> Result[Void, Diagnostic]:
 	var position = first_owner
@@ -976,8 +1520,15 @@ private pure func complete_owners(
 	for owner in owners:
 		match owner:
 			ActiveOwner(_):
-				failure_owner = Some(position)
-				break
+				transferred = match excluded:
+					Some(id):
+						IntOps.equals(owner_number(id), position)
+					None:
+						False
+
+				if not transferred:
+					failure_owner = Some(position)
+					break
 			DischargedOwner:
 				void
 
@@ -1006,7 +1557,7 @@ private pure func verify_return(
 	records: List[ConcreteRecord],
 ) -> Result[Void, Diagnostic]:
 	result ?= value(
-		state,
+		state.facts,
 		returned,
 		{
 			source = COMPILER_SOURCE,
@@ -1020,19 +1571,25 @@ private pure func verify_return(
 	else:
 		plan ?= value_ownership(return_type, unions, records)
 
-		ownership_result: Result[List[OwnerState], Diagnostic] = match plan:
+		ownership_result: Result[Void, Diagnostic] = match plan:
 			NoOwnership:
 				match returned_owner:
 					None:
-						Ok(state.owners)
+						Ok(void)
 					Some(_):
 						Err(failure(result.span, "unmanaged return cannot transfer an owner"))
-			ManagedStringLeaf | ManagedStringListRoot | InlineOwnedFields(_):
+			ManagedStringLeaf | ManagedStringListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
 				match returned_owner:
 					None:
 						Err(failure(result.span, "managed return requires an owner transfer"))
 					Some(id):
-						entry ?= owner(state, id, result.span)
+						entry ?= owner(
+							state.prefix_owners,
+							state.facts.first_owner,
+							state.owners,
+							id,
+							result.span,
+						)
 
 						match entry:
 							DischargedOwner:
@@ -1046,12 +1603,7 @@ private pure func verify_return(
 								)
 							ActiveOwner(owned):
 								if IntOps.equals(value_number(owned), value_number(returned)):
-									Ok(
-										state.owners.set(
-											IntOps.subtract(owner_number(id), state.first_owner),
-											DischargedOwner,
-										),
-									)
+									Ok(void)
 								else:
 									Err(
 										failure(
@@ -1060,8 +1612,9 @@ private pure func verify_return(
 										),
 									)
 
-		owners ?= ownership_result
-		complete_owners(owners, state.first_owner, result.span)
+		transferred ?= ownership_result
+		prefix ?= complete_owners(state.prefix_owners, 0, returned_owner, result.span)
+		complete_owners(state.owners, state.facts.first_owner, returned_owner, result.span)
 
 
 private pure func verify_transfer(
@@ -1107,7 +1660,7 @@ private pure func verify_exit(
 			for argument in arguments:
 				parameter_position = position
 				result: Result[Void, Diagnostic] = value(
-					state,
+					state.facts,
 					argument,
 					span,
 				).and_then(pure func(known: KnownValue) -> Result[Void, Diagnostic]:
@@ -1123,7 +1676,7 @@ private pure func verify_exit(
 						match plan:
 							NoOwnership:
 								Ok(void)
-							ManagedStringLeaf | ManagedStringListRoot | InlineOwnedFields(_):
+							ManagedStringLeaf | ManagedStringListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
 								Err(failure(span, "managed value on a recursive backedge"))
 				)
 
@@ -1138,7 +1691,7 @@ private pure func verify_exit(
 				Some(error):
 					Err(error)
 				None:
-					complete_owners(state.owners, state.first_owner, span)
+					complete_owners(state.owners, state.facts.first_owner, None, span)
 
 
 private pure func is_backedge(exit: OwnedExit) -> Bool:
@@ -1165,7 +1718,7 @@ private pure func verify_loop_operations(
 				match value_ownership(definition.value_type, unions, records):
 					Err(error):
 						invalid = Some(error)
-					Ok(ManagedStringLeaf) | Ok(ManagedStringListRoot) | Ok(InlineOwnedFields(_)):
+					Ok(ManagedStringLeaf) | Ok(ManagedStringListRoot) | Ok(ManagedRecordRoot(_)) | Ok(InlineOwnedFields(_)):
 						invalid = Some(
 							failure(
 								definition.span,
@@ -1225,7 +1778,7 @@ private pure func verify_execution(
 					Err(error):
 						invalid = Some(error)
 						break
-					Ok(ManagedStringLeaf) | Ok(ManagedStringListRoot) | Ok(InlineOwnedFields(_)):
+					Ok(ManagedStringLeaf) | Ok(ManagedStringListRoot) | Ok(ManagedRecordRoot(_)) | Ok(InlineOwnedFields(_)):
 						invalid = Some(failure(annotation, "managed signature in a self-tail loop"))
 						break
 					Ok(NoOwnership):
@@ -1347,8 +1900,8 @@ private pure func verify_match(
 	records: List[ConcreteRecord],
 ) -> Result[Void, Diagnostic]:
 	scrutinee ?= value(
-		state,
-		matched.scrutinee,
+		state.facts,
+		argument_value(matched.scrutinee),
 		{
 			source = COMPILER_SOURCE,
 			start = 0,
@@ -1360,18 +1913,30 @@ private pure func verify_match(
 		Err(failure(scrutinee.span, "match scrutinee does not belong to its union"))
 	else:
 		valid_arms ?= verify_match_arms(matched, unions, scrutinee.span)
-		var next_value = IntOps.add(state.first_value, state.values.length())
-		var next_owner = IntOps.add(state.first_owner, state.owners.length())
+		live ?= verify_match_argument(
+			matched.scrutinee,
+			state.facts,
+			unions,
+			records,
+			scrutinee.span,
+			state.prefix_owners,
+			state.owners,
+		)
+		var next_value = IntOps.add(state.facts.first_value, state.facts.values.length())
+		var next_owner = IntOps.add(state.facts.first_owner, state.owners.length())
 		var invalid: Option[Diagnostic] = None
 
-		-- Arms return or recur: each borrows the function prefix and owns one local
-		-- interval. The managed-prefix rejection below guarantees no prefix owners.
+		-- Each selected arm receives an independent prefix snapshot and a disjoint
+		-- local owner interval. Sibling ordinal gaps never become visible.
 		for arm in matched.arms:
-			var branch = { state |
-				prefix_values = state.values,
-				first_value = next_value,
-				values = [],
-				first_owner = next_owner,
+			branch_start: VerificationState = {
+				facts = { state.facts |
+					prefix_values = state.facts.values,
+					first_value = next_value,
+					values = [],
+					first_owner = next_owner
+				},
+				prefix_owners = state.owners,
 				owners = []
 			}
 
@@ -1381,30 +1946,29 @@ private pure func verify_match(
 				VariantLabel(id):
 					PayloadProjection(matched.scrutinee, id)
 
-			for operation in arm.operations:
-				match verify_operation(
-					operation,
-					branch,
-					signature,
-					functions,
-					unions,
-					projection,
-					records,
-				):
-					Ok(updated):
-						branch = updated
-					Err(error):
-						invalid = Some(error)
-						break
-
-			match invalid:
-				Some(_):
+			match verify_operations(
+				arm.operations,
+				branch_start,
+				signature,
+				functions,
+				unions,
+				projection,
+				records,
+			):
+				Err(error):
+					invalid = Some(error)
 					break
-				None:
+				Ok(branch):
 					match verify_exit(arm.exit, branch, signature, execution, unions, records):
 						Ok(_):
-							next_value = IntOps.add(branch.first_value, branch.values.length())
-							next_owner = IntOps.add(branch.first_owner, branch.owners.length())
+							next_value = IntOps.add(
+								branch.facts.first_value,
+								branch.facts.values.length(),
+							)
+							next_owner = IntOps.add(
+								branch.facts.first_owner,
+								branch.owners.length(),
+							)
 						Err(error):
 							invalid = Some(error)
 							break
@@ -1424,122 +1988,86 @@ private pure func verify_function(
 	records: List[ConcreteRecord],
 ) -> Result[Void, Diagnostic]:
 	execution ?= verify_execution(function, current, unions, records)
-	var state: VerificationState = {
-		prefix_values = [],
-		first_value = 0,
-		values = [],
-		first_owner = 0,
-		owners = [],
-		parameters = []
+	initial: VerificationState = {
+		facts = {
+			prefix_values = [],
+			first_value = 0,
+			values = [],
+			first_owner = 0,
+			parameters = []
+		},
+		prefix_owners = [],
+		owners = []
 	}
-	var invalid: Option[Diagnostic] = None
+	state ?= verify_operations(
+		function.operations,
+		initial,
+		function.signature,
+		functions,
+		unions,
+		NoProjection,
+		records,
+	)
 
-	for operation in function.operations:
-		match verify_operation(
-			operation,
-			state,
-			function.signature,
-			functions,
-			unions,
-			NoProjection,
-			records,
-		):
-			Ok(updated):
-				state = updated
-			Err(error):
-				invalid = Some(error)
-				break
+	valid_parameter ?= if IntOps.equals(
+		state.facts.parameters.length(),
+		function.signature.parameters.length(),
+	):
+		Ok(void)
+	else:
+		Err(
+			failure(
+				{
+					source = COMPILER_SOURCE,
+					start = 0,
+					end = 0
+				},
+				"function parameter has no value definition",
+			),
+		)
 
-	match invalid:
-		Some(error):
-			Err(error)
-		None:
-			valid_parameter ?= if IntOps.equals(
-				state.parameters.length(),
-				function.signature.parameters.length(),
-			):
-				Ok(void)
-			else:
-				Err(
-					failure(
-						{
-							source = COMPILER_SOURCE,
-							start = 0,
-							end = 0
-						},
-						"function parameter has no value definition",
-					),
-				)
-
-			match function.tail:
-				ReturnTail(result):
-					verify_exit(
-						result,
-						state,
-						function.signature,
-						function.execution,
-						unions,
-						records,
-					)
-				MatchTail(matched):
-					-- This restriction is checked independently of the inserter,
-					-- including managed prefix values already dropped by the tail.
-					var managed: Option[Span] = None
-
-					for known in state.values:
-						match known.result:
-							OwnedResult(_):
-								managed = Some(known.span)
-								break
-							_:
-								void
-
-					match managed:
-						Some(span):
-							Err(failure(span, "managed value appears before a tail match"))
-						None:
-							if IntOps.greater_than(state.owners.length(), 0):
-								scrutinee ?= value(
-									state,
-									matched.scrutinee,
-									{
-										source = COMPILER_SOURCE,
-										start = 0,
-										end = 0
-									},
-								)
-								Err(
-									failure(
-										scrutinee.span,
-										"managed value appears before a tail match",
-									),
-								)
-							else:
-								verify_match(
-									matched,
-									function.execution,
-									state,
-									function.signature,
-									functions,
-									unions,
-									records,
-								)
+	match function.tail:
+		ReturnTail(result):
+			verify_exit(result, state, function.signature, function.execution, unions, records)
+		MatchTail(matched):
+			verify_match(
+				matched,
+				function.execution,
+				state,
+				function.signature,
+				functions,
+				unions,
+				records,
+			)
 
 
 -- Independently check the accepted wrapper convention against its target signature.
-private pure func verify_entry(entry: OwnedFunction, convention: Entrypoint[FunctionInstanceId]) -> Result[Void, Diagnostic]:
+private pure func verify_entry(
+	entry: OwnedFunction,
+	convention: Entrypoint[FunctionInstanceId],
+) -> Result[Void, Diagnostic]:
 	parameters_match = match convention:
-		NoArguments(_, _): entry.signature.parameters.is_empty()
+		NoArguments(_, _):
+			entry.signature.parameters.is_empty()
 		WithArguments(_, _):
 			match entry.signature.parameters:
-				[value]: same_type(value, ListType(StringType))
-				_: False
+				[value]:
+					same_type(value, ListType(StringType))
+				_:
+					False
+
 	result = match convention:
-		NoArguments(_, result): result
-		WithArguments(_, result): result
+		NoArguments(_, result):
+			result
+		WithArguments(_, result):
+			result
+
 	result_matches = match result:
-		IntegerExitStatus: same_type(entry.signature.return_type, IntType)
-		SuccessfulExit: same_type(entry.signature.return_type, VoidType)
+		IntegerExitStatus:
+			same_type(entry.signature.return_type, IntType)
+		SuccessfulExit:
+			same_type(entry.signature.return_type, VoidType)
+
 	valid = parameters_match and result_matches
 
 	if valid:
@@ -1561,7 +2089,12 @@ private pure func verify_entry(entry: OwnedFunction, convention: Entrypoint[Func
 					end = 0
 				}
 
-		Err(failure(span, "entrypoint signature does not match its accepted argument and result conventions"))
+		Err(
+			failure(
+				span,
+				"entrypoint signature does not match its accepted argument and result conventions",
+			),
+		)
 
 
 pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnostic]:
@@ -1609,13 +2142,22 @@ pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnosti
 			Ok(_):
 				union_position = IntOps.add(union_position, 1)
 
+	complete_layouts ?= match invalid:
+		Some(error):
+			Err(error)
+		None:
+			verify_layout_graph(program.records, program.unions)
+
 	var current: Int = 0
 
 	for function in program.functions:
 		for value_type in function.signature.parameters.append(function.signature.return_type):
 			match value_ownership(value_type, program.unions, program.records):
-				Ok(_): void
-				Err(error): invalid = Some(error)
+				Ok(_):
+					void
+				Err(error):
+					invalid = Some(error)
+
 		if invalid.is_some():
 			break
 

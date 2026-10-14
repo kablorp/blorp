@@ -205,3 +205,200 @@ if a public fact would lose target identity/provenance, a feature needs an
 unapproved mechanism, a host ownership issue prevents valid evidence, a cost
 ceiling fails or target advancement changes the contract. This integration does
 not authorize later roadmap features or automatic publication.
+
+## Prospective correction to the integration cost comparison
+
+The original whole-CLI +3% criterion above was incorrectly based on the
+pre-feature target. It measures the accepted contextual-inference feature as
+well as integration. The contextual-inference report already records substantial
+overhead against its pre-feature compiler, including +40.76% allocations and
++22.08% instructions for ufcs-128; its accepted repair ceilings used a feature
+draft, not that older compiler. The target comparison is still retained as
+feature-growth evidence. Its failed ceiling is not retroactively a pass.
+
+Before the equality repair and final measurements, the integration criterion is
+explicitly rescoped to the existing source-to-C `compilation.compile(source)`
+API against immutable accepted feature `14fc4b9c9`, with the same fresh host,
+identical benchmark driver, unchanged source inputs, O0 diagnostic link flags,
+three paired samples, stable allocations, minimum instructions and strict
+allocation balance. Keep +3% for both metrics per common input. No cap is raised.
+Both independent reviewers approved this narrower measurement scope before
+execution. Final acceptance also requires independent review of this amendment
+and the measured results; a failing corrected comparison still blocks landing.
+
+The primitive foundation implementations intentionally differ: the target
+assembles explicit prelude selections, whereas the accepted feature used its
+earlier foundation policy. That real integration work remains in the measured
+cost. This is not identical parsed input, a post-parse benchmark, or a claim
+about whole-CLI filesystem/module-loading performance. It includes source read,
+lexing, parsing, foundation construction, checking through C emission and output
+write. All 20 unchanged controls and the eight primitive-only fields-int/captures
+feature inputs must succeed on both variants. Other feature inputs are excluded
+because they require target-library operations; none are rewritten.
+
+The first additional comparison passes strict balance and C identity for all
+28 inputs but fails the corrected cost guard. Constructors-128 grows +25.49%
+allocations/+7.43% instructions; wrap-128 grows +12.73%/+4.05%. Independent
+source review and prefix probes isolate the added cost to typechecking:
+constructor allocation excess at widths 16/32/64/128 is 415/1,855/7,807/31,999,
+exactly `2*n*n - 6*n - 1`. Lexing/parsing allocate less. The target-derived
+`check_model.same_types` constructs both list tails on each recursive comparison;
+the accepted feature used indexed traversal. The bounded repair keeps the
+public model/module boundaries and restores traversal without copied tails.
+Leaf type projection is outside that repair. These failed observations remain
+under `build/roadmap-integration/phase-cost/`, separate from final repair results.
+
+## Observed integration baseline and review findings
+
+Integration is isolated on `codex/blorp-2-aggregate-integration` at the managed
+`aggregate-milestone-integration` worktree. The original feature checkout is
+clean and checkpointed. A separate local checkout owns an older `blorp-2` plus
+substantial staged work; it is untouched. The integration input is frozen
+`origin/blorp-2` at `3f98023d`.
+
+The fresh target host is FRESH (SHA `7c28b09440cfabed7bd4140f6dd46287f9fe82be43f1cec56cc6156ba712c900`),
+CLI O0/runtime O2, Apple Clang 21 arm64. Its baseline sanitized unit/runtime/
+grammar run passes 1,702 checks across 119 summaries. The O0 diagnostic pilot
+baseline is `c0213d6893744c4f2ed924864914739f04dfe518029ee069776824e1a7253a38`,
+generated C `1788efc1a50f22ece1b5934961aa4cbd05a5dc3775df2277055c092907ead4ff`.
+It compiles 16 unchanged control programs and rejects exactly the four nested
+record controls at the existing Int-only declaration rule, without publishing C.
+The baseline pilot link has 55 warnings; it is not warning-clean. These artifacts
+and all baseline packets are retained under `build/roadmap-integration/`.
+
+The focused combined frontend run passes all 125 callbacks: five new aggregate
+syntax/assembly cases, 29 load cases including three new error-order cases,
+74 conformance cases and 17 record grammar cases. The complete production entry
+source also passes host type checking. Neither result establishes the combined
+milestone until the final gates below are complete.
+
+Independent review found an actual inherited inference-policy defect in both
+record literals and union constructors. An earlier nested record argument could
+solve a shared generic variable before a later bare-parameter argument was
+planned. Following that solution selected a nominal owner that the supplied
+hint had not established. A retained red packet proves both programs were
+accepted using two positive controls while their exact rejection assertions
+failed. Restricting owner selection to the supplied structural hint restores
+the documented rule. Known nominal heads and explicit expected-result hints
+remain valid; four new callbacks cover both negative and positive forms.
+The focused generic-record suite then passes all 35 callbacks. This is a real
+semantic issue, distinct from test-authoring mistakes.
+
+Review also identified repeated closed-signature admission and an unread return
+type in call publication. The bounded remedy publishes a CheckedCall directly
+and removes duplicate admission inside publication, preserving
+child, substitution, parameter, return/purity and argument error order. It adds
+no inference state or phase. Closed-readiness validation and child-first freeze
+remain distinct boundaries; this is not a global validate-once claim. Both remedies together pass 140 focused checks
+across six suites, without source drift. Final source/evidence review and
+combined gates remain required.
+
+Two source-check repairs are recorded separately: reserved local names and a
+fallback indentation in a new parser test, and a missing Own import in an
+existing phase test. Embedded input programs and assertions are unchanged.
+The first broad integrated strict run stopped on that missing import before
+callbacks; it is a failed setup run, not a passing compiler test gate.
+
+## Final integration outcome
+
+The candidate preserves the current target's structural layout tokens,
+parse-module/assembly boundary, explicit base/prelude policy, deterministic
+loading/error order, thirteen checker modules, complete accepted declaration
+wrappers/spans and private expression-local inference. It carries the accepted
+finite aggregate/contextual-inference milestone through those boundaries.
+General lists, record updates, recursive data and broader tail-call work remain
+later increments. No host compiler, runtime, census, library or main-signature
+changes from the target are reverted. The unrelated staged local `blorp-2`
+checkout remains untouched.
+
+The final equality repair changes only `check_model.same_types`: ordered indexed
+traversal replaces recursive list-tail construction. Its public export,
+`same_type` and namespace leaf projection remain intact. Actual old generated C
+contains two `blorp_list_drop` calls, whose runtime allocates even empty tails;
+the final generated function contains zero. Direct tests cover empty/unequal
+vectors, ordering, nested record/union/List types and rigid parameter ownership.
+The retained failing cost series precedes the repair; a failing semantic test
+is not invented for this semantics-preserving performance correction.
+
+Final validation, serialized on the same FRESH target host:
+
+| Boundary | Result | Evidence packet |
+| --- | --- | --- |
+| Model/contextual/generic focused suites | 83 checks, 0 failures | `checker-equality/focused` |
+| Sanitized unit/runtime/grammar | 2,031 checks, 136 summaries, 25.269 s | `strict-final` |
+| Real-main e2e | 322 cases, 0 failures, 173.685 s | `e2e-final` |
+| Accepted-feature → integration source-to-C API | 28 inputs, 168 balanced runs, all within both +3% caps | `phase-cost-final-packet` |
+| Target → final CLI feature-growth observations | 36 inputs, 156 balanced runs; descriptive, not the integration guard | `cost-final-packet` |
+| Fresh actual host Core/C | C identical to e2e wrapper C | `final-host-core` |
+
+All packets are under `build/roadmap-integration/`. The final source-consuming
+gates have no timeout or source drift. The e2e wrapper logs exactly one Generate
+and one Link; 763 printed PASS lines across 309 nested summaries are distinct
+from its 322 grouped cases. Actual fixture C is compiled at O0 with ASan/UBSan.
+Runtime helper tests observe real allocation/free calls. Launcher strict counts,
+target runtime tests and consuming-setter proofs are different evidence; native
+LSan is unavailable here. The target's ordinary C link has 55 warnings; the
+pre-repair candidate link and final C syntax check both have 71: three discarded
+qualifier, 59 equality-parentheses and nine pointer/integer-comparison warnings.
+The increase is 16 equality-parentheses warnings. Generated C is not warning-clean;
+warning cleanup remains out of scope. Counts alone do not establish the safety
+of the inherited warning categories. `final-c-warnings` retains the final check.
+
+For the corrected API comparison, every one of the 28 unchanged inputs produces
+identical C on both compilers. Allocation counts are stable across three paired
+samples and improve by 0.37–15.31%; minimum retired instructions improve by
+0.67–19.79%. These are observed supported-input proxies, not a whole-compiler
+speedup or global linearity proof. Both reviewers independently recomputed all
+168 raw samples, checked the executed binary hashes and all 478 source-manifest
+entries. The 91-file host standard-library inventories match byte-for-byte.
+Original and final fixture hashes agree; no source or entrypoint is rewritten.
+
+The final whole-CLI comparison still reflects accepted feature overhead against
+the pre-feature target: ufcs-128 observes +34.97% allocations/+19.88% instructions,
+while constructors-128 observes -7.88%/-1.67%. It does not pass the original
+pre-feature +3% criterion, which was explicitly rescoped above. Earlier failed
+CLI and API series remain retained. Eight common CLI outputs are byte-identical;
+eight constructor/wrap outputs intentionally reflect changed aggregate layouts.
+Their native behavior and layout/ownership contracts are covered independently.
+
+Final real-main C SHA is
+`764e0912addab8a4db29dbe1c7e2e677f1e6811a019254151c570a544fa01525`;
+e2e executable SHA is
+`2f6c8a0f5188336ccb944281dcdd2d4e4a661802d80d66168f89c36b7ae3b508`;
+fresh Perceus Core SHA is
+`9568f006698bc6620ee0a91dcaeb654db5ca8ae3c45cab0d06ab4d7841b00a98`.
+The refreshed actual Core/C map retains `own.exit_last_uses` declaration 1704,
+its local roots 6806/8768 and consumed setter argument 0. Complete emitted
+`brp_ru` and `brp_14H` bodies are byte-identical before/after equality repair:
+local updates add no root retain; terminal aliasing permits one initial O(V)
+copy. `C-ownership.md` retains actual positions and extracted function evidence.
+
+Final benchmark binaries: accepted feature
+`0097cc87191559cd59dc46df8f093449e836d99ad3c20afdfdfcd944b51e9b66`,
+integrated API candidate
+`61fb9ab2f416c1052dedb119e014aa4a30090977aab2d445cb51473272c5fc06`.
+The production/test/grammar archive SHA is
+`33266cf257eeab64808c1e31780b8ff2aee3ebd7d368f005bedf0599483c5128`.
+Later report edits do not alter those frozen source inputs.
+
+Physical handwritten line totals cover `blorp_2/src` and `blorp_2/test` only,
+counting `.brp`/`.c`/`.h`, including comments and blank lines. They exclude
+`standard_library_temp`, generated build files and the rest of the repository:
+
+| Snapshot | Production | Tests/fixtures/runtime drivers |
+| --- | ---: | ---: |
+| Target `3f98023d` | 17,961 | 57,933 |
+| Accepted feature `14fc4b9c9` | 21,911 | 67,544 |
+| Integrated milestone | 21,443 | 68,460 |
+
+The integrated milestone is 468 production lines smaller than the accepted
+feature while adding 916 test lines. Relative to the pre-feature target it adds
+3,482 production and 10,527 test lines for the accepted capabilities. The narrow
+equality repair itself adds nine production and 51 test lines; the traversal
+cost is fixed rather than hidden by compressed formatting.
+
+Two independent compiler-expert reviewers approve the final source, corrected
+cost contract, tests and fresh executable/ownership evidence with zero remaining
+P0–P3 findings. Their final notes are `final-review-1.md` and `final-review-2.md`
+under the evidence root. This milestone does not authorize later roadmap work
+or automatic publication.

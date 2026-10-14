@@ -1,9 +1,9 @@
 import:
+	../../src/check_model as Model
 	../../src/declarations as Declaration
 	../../src/source: module_source, root_module_id
 	../../src/check: CheckedProgram, check, checked_functions
 	../../src/check_errors as Errors
-	../../src/check_model as Checked
 	../../src/check_render as Renderer
 	../../src/lex: lex
 	../../src/specialize as Concrete
@@ -47,22 +47,14 @@ pure func test_generic_explicit_concrete_annotation_supplies_constructor_hint() 
 	checked(CHOICE + source).is_ok()
 
 
-pure func test_generic_concrete_receiver_still_has_no_constructor_hint() -> Bool:
+pure func test_unique_generic_concrete_receiver_supplies_constructor_hint() -> Bool:
 	source: String =
 		|pure func receiver[T](choice: Choice, value: T) -> T:
-		|	value
+		|    value
 		|func main() -> Int:
-	prefix = CHOICE + source + "\n\t"
-
-	match check_failure(prefix + "Number(8).receiver(7)\n"):
-		Some(error):
-			match error.kind:
-				Errors.ConstructorRejection(Errors.ConstructorNeedsExpectedType(_)):
-					error.span.start == prefix.length() and error.span.end == prefix.length() + 6
-				_:
-					False
-		None:
-			False
+		|    Number(8).receiver(7)
+		|
+	checked(CHOICE + source).is_ok()
 
 
 private MAIN: String =
@@ -76,22 +68,22 @@ private SECOND: String =
 	|
 
 
-private pure func parameter_is(id: Checked.TypeParameterId, owner: Int, position: Int) -> Bool:
-	match Checked.parameter_owner(id):
-		Checked.FunctionDeclaration(function):
+private pure func parameter_is(id: Model.TypeParameterId, owner: Int, position: Int) -> Bool:
+	match Model.parameter_owner(id):
+		Model.FunctionDeclaration(function):
 			(
 				Declaration.function_number(function) == owner
-				and Checked.parameter_position(id) == position
+				and Model.parameter_position(id) == position
 			)
 		_:
 			False
 
 
-private pure func arguments(value: Checked.CheckedValue) -> Option[List[Checked.TypeRef]]:
+private pure func arguments(value: Model.CheckedValue) -> Option[List[Model.TypeRef]]:
 	match value.base:
-		Checked.ReturnCall(call, _):
+		Model.ReturnCall(call, _):
 			match call.target:
-				Checked.UserFunction(_, arguments):
+				Model.UserFunction(_, arguments):
 					Some(arguments)
 				_:
 					None
@@ -124,9 +116,9 @@ pure func test_three_parameters_reach_concrete_signatures_and_bindings() -> Bool
 					match third.signature.type_parameters:
 						[first, second, last]:
 							match main.statements:
-								[Checked.InitializeBinding(_, value)]:
+								[Model.InitializeBinding(_, value)]:
 									match arguments(value):
-										Some([Checked.IntType, Checked.StringType, Checked.UnionType(owner)]):
+										Some([Model.IntType, Model.StringType, Model.UnionType(owner)]):
 											match Concrete.specialize(program):
 												Ok(concrete):
 													match Concrete.specialized_contents(
@@ -153,7 +145,7 @@ pure func test_three_parameters_reach_concrete_signatures_and_bindings() -> Bool
 																					1,
 																					2,
 																				)
-																				and not Checked.same_parameter(
+																				and not Model.same_parameter(
 																					first,
 																					last,
 																				)
@@ -205,13 +197,13 @@ pure func test_unused_body_keeps_distinct_rigid_parameter_positions() -> Bool:
 			match error.kind:
 				Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
 					match mismatch.expected:
-						Checked.ParameterType(first):
+						Model.ParameterType(first):
 							match mismatch.actual.value_type:
-								Checked.ParameterType(second):
+								Model.ParameterType(second):
 									(
 										parameter_is(first, 0, 0)
 										and parameter_is(second, 0, 1)
-										and not Checked.same_parameter(first, second)
+										and not Model.same_parameter(first, second)
 										and error.span.start == prefix.length()
 										and error.span.end == prefix.length() + 6
 										and same_span(mismatch.actual.span, error.span)
@@ -240,7 +232,7 @@ pure func test_duplicate_parameters_are_owned_semantic_errors() -> Bool:
 					(
 						parameter_is(current, 0, 2)
 						and parameter_is(previous, 0, 0)
-						and not Checked.same_parameter(current, previous)
+						and not Model.same_parameter(current, previous)
 						and first.start == 14
 						and first.end == 15
 						and error.span.start == prefix.length()
@@ -279,16 +271,42 @@ pure func test_first_missing_parameter_precedes_an_ordinary_mismatch() -> Bool:
 			False
 
 
-pure func test_expected_result_does_not_infer_missing_parameters() -> Bool:
+pure func test_expected_result_completes_a_later_parameter() -> Bool:
+	source: String =
+		|fixed union Phantom[T]:
+		|    Empty
+		|pure func empty[A,B](value:A)->Phantom[B]:
+		|    Empty
+		|pure func use()->Phantom[Int]:
+		|    empty(7)
+		|
+	match checked(source + MAIN):
+		Ok(program):
+			match checked_functions(program).functions.get(1):
+				Some(function):
+					match function.body:
+						Model.CheckedValueBody(Model.ReturnExpression(value)):
+							match value.base:
+								Model.ReturnCall(call, [_]):
+									match call.target:
+										Model.UserFunction(owner, [Model.IntType, Model.IntType]): Declaration.function_number(owner) == 0
+										_: False
+								_: False
+						_: False
+				None: False
+		Err(_): False
+
+
+pure func test_binding_without_context_keeps_a_later_parameter_uninferred() -> Bool:
 	prefix_source: String =
 		|fixed union Phantom[T]:
 		|	Empty
 		|pure func empty[A,B](value:A)->Phantom[B]:
 		|	Empty
-		|pure func use()->Phantom[Int]:
-	prefix = prefix_source + "\n\t"
+		|pure func use()->Int:
+	prefix = prefix_source + "\n\tvalue = "
 
-	match check_failure(prefix + "empty(7)\n" + MAIN):
+	match check_failure(prefix + "empty(7)\n\t0\n" + MAIN):
 		Some(error):
 			match error.kind:
 				Errors.CallRejection(Errors.UninferableTypeParameter(parameter)):
@@ -323,8 +341,8 @@ pure func test_runtime_order_selects_conflict_across_parameters() -> Bool:
 					(
 						parameter_is(conflict.parameter, 0, 1)
 						and conflict.mismatch.argument_position == 2
-						and Checked.same_type(conflict.previous.value_type, Checked.StringType)
-						and Checked.same_type(conflict.current.value_type, Checked.IntType)
+						and Model.same_type(conflict.previous.value_type, Model.StringType)
+						and Model.same_type(conflict.current.value_type, Model.IntType)
 						and conflict.previous.span.start == prefix.length()
 						and conflict.previous.span.end == prefix.length() + 13
 						and error.span.start == prefix.length() + 15
@@ -358,8 +376,8 @@ pure func test_generic_conflict_precedes_earlier_ordinary_mismatch() -> Bool:
 					(
 						parameter_is(conflict.parameter, 0, 0)
 						and conflict.mismatch.argument_position == 2
-						and Checked.same_type(conflict.previous.value_type, Checked.IntType)
-						and Checked.same_type(conflict.current.value_type, Checked.StringType)
+						and Model.same_type(conflict.previous.value_type, Model.IntType)
+						and Model.same_type(conflict.current.value_type, Model.StringType)
 						and error.span.start == prefix.length()
 						and error.span.end == prefix.length() + 13
 					)
@@ -415,9 +433,9 @@ pure func test_structural_conflict_keeps_first_candidate_and_annotation_origin()
 			match error.kind:
 				Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
 					match conflict.mismatch.expected:
-						Checked.AppliedUnionType(expected_owner, [Checked.IntType]):
+						Model.AppliedUnionType(expected_owner, [Model.IntType]):
 							match conflict.mismatch.actual.value_type:
-								Checked.AppliedUnionType(actual_owner, [Checked.StringType]):
+								Model.AppliedUnionType(actual_owner, [Model.StringType]):
 									match conflict.mismatch.expected_site:
 										Errors.SourceAnnotation(annotation):
 											(
@@ -425,13 +443,13 @@ pure func test_structural_conflict_keeps_first_candidate_and_annotation_origin()
 												and conflict.mismatch.argument_position == 3
 												and Declaration.union_number(expected_owner) == 0
 												and Declaration.union_number(actual_owner) == 0
-												and Checked.same_type(
+												and Model.same_type(
 													conflict.previous.value_type,
-													Checked.IntType,
+													Model.IntType,
 												)
-												and Checked.same_type(
+												and Model.same_type(
 													conflict.current.value_type,
-													Checked.StringType,
+													Model.StringType,
 												)
 												and conflict.previous.span.start == declarations.length()
 												and conflict.previous.span.end == declarations.length() + 9
@@ -479,9 +497,9 @@ pure func test_forwarding_substitution_is_permuted_and_caller_owned() -> Bool:
 					match forward.signature.type_parameters:
 						[left, right]:
 							match forward.body:
-								Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+								Model.CheckedValueBody(Model.ReturnExpression(value)):
 									match arguments(value):
-										Some([Checked.ParameterType(first), Checked.ParameterType(last)]):
+										Some([Model.ParameterType(first), Model.ParameterType(last)]):
 											match Concrete.specialize(program):
 												Ok(concrete):
 													match Concrete.specialized_contents(
@@ -503,11 +521,11 @@ pure func test_forwarding_substitution_is_permuted_and_caller_owned() -> Bool:
 																					1,
 																					0,
 																				)
-																				and Checked.same_parameter(
+																				and Model.same_parameter(
 																					first,
 																					right,
 																				)
-																				and Checked.same_parameter(
+																				and Model.same_parameter(
 																					last,
 																					left,
 																				)
@@ -686,13 +704,13 @@ pure func test_ordered_calls_and_instances_preserve_int_string_permutation() -> 
 			match checked_functions(program).functions:
 				[_, main]:
 					match main.statements:
-						[Checked.InitializeBinding(_, first), Checked.InitializeBinding(_, second)]:
+						[Model.InitializeBinding(_, first), Model.InitializeBinding(_, second)]:
 							match (arguments(first), second.operations):
-								(Some([Checked.IntType, Checked.StringType]), [step]):
+								(Some([Model.IntType, Model.StringType]), [step]):
 									match step.operation:
-										Checked.InvokeFunction(call, _):
+										Model.InvokeFunction(call, _):
 											match call.target:
-												Checked.UserFunction(_, [Checked.StringType, Checked.IntType]):
+												Model.UserFunction(_, [Model.StringType, Model.IntType]):
 													match Concrete.specialize(program):
 														Ok(concrete):
 															match Concrete.specialized_contents(
@@ -773,6 +791,7 @@ pure func test_duplicate_renderer_uses_typed_error_without_rechecking() -> Bool:
 tests: TestSuite = {
 	description = "Multiple function type parameters",
 	tests = [
+		("binding without context keeps later parameter uninferred", test_binding_without_context_keeps_a_later_parameter_uninferred),
 		(
 			"two parameters accept independent int and string arguments",
 			test_two_parameters_accept_independent_int_and_string_arguments,
@@ -782,8 +801,8 @@ tests: TestSuite = {
 			test_generic_explicit_concrete_annotation_supplies_constructor_hint,
 		),
 		(
-			"generic concrete receiver still has no constructor hint",
-			test_generic_concrete_receiver_still_has_no_constructor_hint,
+			"unique generic concrete receiver supplies constructor hint",
+			test_unique_generic_concrete_receiver_supplies_constructor_hint,
 		),
 		(
 			"three parameters reach concrete signatures and bindings",
@@ -802,8 +821,8 @@ tests: TestSuite = {
 			test_first_missing_parameter_precedes_an_ordinary_mismatch,
 		),
 		(
-			"expected result does not infer missing parameters",
-			test_expected_result_does_not_infer_missing_parameters,
+			"expected result completes later parameter",
+			test_expected_result_completes_a_later_parameter,
 		),
 		(
 			"runtime order selects conflict across parameters",

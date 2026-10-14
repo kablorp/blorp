@@ -934,19 +934,17 @@ private fixed record PatternResult {
 
 
 private fixed record PatternFieldResult {
-	field: Option[FieldPattern],
+	field: FieldPattern,
 	next: ParserState
 }
 
 
 private pure func consume_pattern_field(state: ParserState) -> Result[PatternFieldResult, Diagnostic]:
-	if at_right_paren(state):
-		Ok({ field = None, next = state })
-	else if at_wildcard(state):
-		Ok({ field = Some(FieldWildcard(parser_span(state))), next = shifted(state, 1) })
+	if at_wildcard(state):
+		Ok({ field = FieldWildcard(parser_span(state)), next = shifted(state, 1) })
 	else:
-		name ?= consume_name(state, "expected an Int field binding or '_'")
-		Ok({ field = Some(FieldName(name.name)), next = name.next })
+		name ?= consume_name(state, "expected a field binding or '_'")
+		Ok({ field = FieldName(name.name), next = name.next })
 
 
 private pure func consume_pattern(state: ParserState) -> Result[PatternResult, Diagnostic]:
@@ -958,10 +956,30 @@ private pure func consume_pattern(state: ParserState) -> Result[PatternResult, D
 		if not at_left_paren(name.next):
 			Ok({ pattern = PatternName(name.name), span = name.name.span, next = name.next })
 		else:
-			field ?= consume_pattern_field(shifted(name.next, 1))
-			closed ?= expect(field.next, at_right_paren(field.next), "expected ')' after the constructor pattern", "write Variant(name), Variant(_), or a nullary Variant()")
-			span = { name.name.span | end = parser_span(field.next).end }
-			Ok({ pattern = PatternConstructor(name.name, field.field, span), span = span, next = closed })
+			var current = shifted(name.next, 1)
+			var fields: List[FieldPattern] = []
+			var failure: Option[Diagnostic] = None
+
+			if not at_right_paren(current):
+				while True:
+					match consume_pattern_field(current):
+						Err(error):
+							failure = Some(error)
+							break
+						Ok(field):
+							fields = fields.append(field.field)
+							current = field.next
+
+					if not at_comma(current):
+						break
+					current = shifted(current, 1)
+
+			ready ?= match failure:
+				Some(error): Err(error)
+				None: Ok(void)
+			closed ?= expect(current, at_right_paren(current), "expected ')' after the constructor pattern", "write one name or '_' per field, such as Pair(left, _)")
+			span = { name.name.span | end = parser_span(current).end }
+			Ok({ pattern = PatternConstructor(name.name, fields, span), span = span, next = closed })
 
 
 private fixed record BodyResult {
@@ -1485,11 +1503,33 @@ private pure func consume_variant(state: ParserState) -> Result[VariantResult, D
 	name ?= consume_name(state, "expected a union variant name")
 
 	if at_left_paren(name.next):
-		field ?= consume_name(shifted(name.next, 1), "expected a payload type")
-		closed ?= expect(field.next, at_right_paren(field.next), "expected ')' after the payload type", "declare zero fields or one payload field, written Variant(Int) or Variant(T)")
-		Ok({ variant = { name = name.name, payload = Some(field.name) }, next = closed })
+		var current = shifted(name.next, 1)
+		var fields: List[TypeSyntax] = []
+		var failure: Option[Diagnostic] = None
+
+		if at_right_paren(current):
+			failure = Some(expected(current, "expected a payload type", "write bare Variant for no fields, or Variant(String, Int) for fields"))
+		else:
+			while True:
+				match consume_type(current, "expected a payload type"):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(field):
+						fields = fields.append(field.written)
+						current = field.next
+
+				if not at_comma(current):
+					break
+				current = shifted(current, 1)
+
+		ready ?= match failure:
+			Some(error): Err(error)
+			None: Ok(void)
+		closed ?= expect(current, at_right_paren(current), "expected ')' after the variant fields", "write comma-separated field types, such as Pair(String, String)")
+		Ok({ variant = { name = name.name, fields = fields }, next = closed })
 	else:
-		Ok({ variant = { name = name.name, payload = None }, next = name.next })
+		Ok({ variant = { name = name.name, fields = [] }, next = name.next })
 
 
 private fixed record ParsedVariants {
@@ -1574,14 +1614,15 @@ private fixed record ParsedRecordResult {
 
 private pure func consume_record(start: ParserState, module: ModuleId) -> Result[ParsedRecordResult, Diagnostic]:
 	name ?= consume_name(shifted(start, 2), "expected a record type name")
-	opened ?= match current_symbol(name.next):
+	type_parameters ?= consume_type_parameters(name.next)
+	opened ?= match current_symbol(type_parameters.next):
 		Some(LeftBrace):
-			Ok(shifted(name.next, 1))
+			Ok(shifted(type_parameters.next, 1))
 		_:
-			Err(unexpected(name.next, "expected '{' after the record type name", "write fixed record Name { field: Int }"))
+			Err(unexpected(type_parameters.next, "expected '{' after the record type name", "write fixed record Name { field: Int }"))
 	fields ?= consume_parameter_list(opened, "expected a record field name", [])
 	closed ?= expect(fields.next, at_right_brace(fields.next), "expected '}' after the record declaration", "keep nonempty record fields on one line, separated by commas")
-	Ok({ declaration = { module = module, type_name = name.name, fields = fields.parameters }, next = closed })
+	Ok({ declaration = { module = module, type_name = name.name, type_parameters = type_parameters.names, fields = fields.parameters }, next = closed })
 
 
 private fixed record BuiltinTypeResult {

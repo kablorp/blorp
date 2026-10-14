@@ -5,11 +5,12 @@ import:
 		PrimitiveType(BuiltinInt, BuiltinFloat, BuiltinString, BuiltinVoid),
 		RuntimeOperation(
 			IntAdd, IntSubtract, IntMultiply, IntDivide, IntRemainder, IntToString, StringLength,
-			StringPrint, StringParseInt, StringParseFloat, ListLength, ListGet, StringEquals, IntEquals,
-			FloatAdd, FloatSubtract, FloatMultiply, FloatDivide, FloatRemainder, FloatToString,
+			StringPrint, StringParseInt, StringParseFloat, ListLength, ListGet, StringEquals,
+			IntEquals, FloatAdd, FloatSubtract, FloatMultiply, FloatDivide, FloatRemainder,
+			FloatToString,
 		),
-		RuntimeResult(PrimitiveResult, OptionalResult, BooleanResult),
 		RuntimeParameter(PrimitiveParameter, StringListParameter),
+		RuntimeResult(PrimitiveResult, OptionalResult, BooleanResult),
 		runtime_contract,
 	check: CheckedProgram, checked_functions
 	check_model as Checked
@@ -18,7 +19,15 @@ import:
 	int as IntOps
 	option: to_result
 	source: COMPILER_SOURCE
-	syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration), Entrypoint(NoArguments, WithArguments), entry_function, FunctionExecution, Purity(Pure), same_purity, Span
+	syntax:
+		Diagnostic,
+		DiagnosticNote(UnionPayloadDeclaration),
+		Entrypoint(NoArguments, WithArguments),
+		FunctionExecution,
+		Purity(Pure),
+		Span,
+		entry_function,
+		same_purity,
 	text: concat
 
 
@@ -39,13 +48,25 @@ private fixed record FieldIdentity {
 opaque type FieldInstanceId = FieldIdentity
 
 
+fixed union RecordRepresentation:
+	InlineRecord
+	ManagedRecord
+
+
 fixed record ConcreteRecord {
-	fields: List[TypeRef]
+	fields: List[TypeRef],
+	representation: RecordRepresentation
+}
+
+
+private fixed record RecordKey {
+	declaration: Declaration.RecordId,
+	arguments: List[TypeRef]
 }
 
 
 private fixed record RecordInstance {
-	declaration: Declaration.RecordId,
+	key: RecordKey,
 	layout: ConcreteRecord
 }
 
@@ -57,6 +78,35 @@ private fixed record VariantIdentity {
 
 
 opaque type VariantInstanceId = VariantIdentity
+
+
+private fixed record VariantFieldIdentity {
+	variant: VariantInstanceId,
+	position: Int
+}
+
+
+opaque type VariantFieldInstanceId = VariantFieldIdentity
+
+
+pure func variant_field_variant(id: VariantFieldInstanceId) -> VariantInstanceId:
+	from_opaque VariantFieldInstanceId(id).variant
+
+
+pure func variant_field_number(id: VariantFieldInstanceId) -> Int:
+	from_opaque VariantFieldInstanceId(id).position
+
+
+pure func variant_field(
+	id: VariantInstanceId,
+	position: Int,
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[VariantFieldInstanceId, Diagnostic]:
+	layout ?= unions.get(union_number(variant_owner(id))).to_result(invalid(span, "unknown variant owner"))
+	fields ?= layout.variants.get(variant_number(id)).to_result(invalid(span, "unknown variant identity"))
+	valid ?= fields.get(position).to_result(invalid(span, "unknown variant field"))
+	Ok(into_opaque VariantFieldInstanceId({ variant = id, position = position }))
 
 
 fixed union TypeRef:
@@ -76,7 +126,7 @@ fixed union UnionRepresentation:
 
 fixed record ConcreteUnion {
 	-- Complete inline storage; the summary is derived once from every child.
-	variants: List[Option[TypeRef]],
+	variants: List[List[TypeRef]],
 	representation: UnionRepresentation
 }
 
@@ -112,8 +162,10 @@ private pure func primitive_ref(value_type: PrimitiveType) -> TypeRef:
 
 private pure func runtime_parameter_ref(parameter: RuntimeParameter) -> TypeRef:
 	match parameter:
-		PrimitiveParameter(primitive): primitive_ref(primitive)
-		StringListParameter: ListType(StringType)
+		PrimitiveParameter(primitive):
+			primitive_ref(primitive)
+		StringListParameter:
+			ListType(StringType)
 
 
 pure func runtime_signature(operation: RuntimeOperation[VariantInstanceId]) -> FunctionSignature:
@@ -144,6 +196,7 @@ fixed record ConcreteRecordField {
 
 fixed union ConcreteBase:
 	ReturnRecord(RecordInstanceId, List[ConcreteRecordField])
+	ReturnConstructedVariant(VariantInstanceId, List[ConcreteValue])
 	ReturnVoid
 	ReturnInteger(Int)
 	ReturnFloat(Float)
@@ -155,7 +208,6 @@ fixed union ConcreteBase:
 
 fixed union ConcreteOperation:
 	InvokeFunction(ConcreteCall, List[ConcreteValue])
-	ConstructVariant(VariantInstanceId)
 	ReadRecordField(FieldInstanceId)
 
 
@@ -180,14 +232,8 @@ fixed union ConcreteStatement:
 	DiscardExpression(ConcreteValue)
 
 
-fixed union PayloadBinding:
-	NoPayloadBinding
-	DiscardPayload
-	BindPayload(Checked.BindingId)
-
-
 fixed union ConcretePattern:
-	VariantCase(VariantInstanceId, PayloadBinding)
+	VariantCase(VariantInstanceId, List[Option[Checked.BindingId]])
 	WildcardCase
 	BindingCase(Checked.BindingId)
 
@@ -264,8 +310,10 @@ pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 	match left:
 		ListType(left):
 			match right:
-				ListType(right): same_type(left, right)
-				_: False
+				ListType(right):
+					same_type(left, right)
+				_:
+					False
 		RecordType(left):
 			match right:
 				RecordType(right):
@@ -364,16 +412,16 @@ private pure func translated_list[T, U](
 
 private pure func find_record_instance(
 	records: List[RecordInstance],
-	declaration: Declaration.RecordId,
+	key: RecordKey,
 ) -> Option[RecordInstanceId]:
 	var found: Option[RecordInstanceId] = None
 	var position = 0
 
 	for instance in records:
 		if IntOps.equals(
-			Declaration.record_number(instance.declaration),
-			Declaration.record_number(declaration),
-		):
+			Declaration.record_number(instance.key.declaration),
+			Declaration.record_number(key.declaration),
+		) and same_arguments(instance.key.arguments, key.arguments):
 			found = Some(into_opaque RecordInstanceId(position))
 			break
 
@@ -382,25 +430,30 @@ private pure func find_record_instance(
 	found
 
 
+private pure func concrete_record_field_type(
+	field: Checked.FieldId,
+	owner: RecordInstanceId,
+	records: List[RecordInstance],
+	span: Span,
+) -> Result[TypeRef, Diagnostic]:
+	instance ?= records.get(record_number(owner)).to_result(invalid(span, "unknown concrete record"))
+	valid ?= if IntOps.equals(Declaration.record_number(instance.key.declaration), Declaration.record_number(Checked.field_owner(field))):
+		Ok(void)
+	else:
+		Err(invalid(span, "field declaration differs from concrete record"))
+	instance.layout.fields
+		.get(Checked.field_number(field))
+		.to_result(invalid(span, "unknown record field"))
+
+
 private pure func translate_field(
 	field: Checked.FieldId,
+	owner: RecordInstanceId,
 	records: List[RecordInstance],
 	span: Span,
 ) -> Result[FieldInstanceId, Diagnostic]:
-	owner ?= find_record_instance(
-		records,
-		Checked.field_owner(field),
-	).to_result(invalid(span, "unknown record declaration for field"))
-	instance ?= records
-		.get(record_number(owner))
-		.to_result(invalid(span, "unknown concrete record"))
-	member ?= instance.layout.fields
-		.get(Checked.field_number(field))
-		.to_result(invalid(span, "unknown record field"))
-	Ok(into_opaque FieldInstanceId({
-				owner = owner,
-				position = Checked.field_number(field)
-			}))
+	valid ?= concrete_record_field_type(field, owner, records, span)
+	Ok(into_opaque FieldInstanceId({ owner = owner, position = Checked.field_number(field) }))
 
 
 private pure func concrete_type(
@@ -412,7 +465,7 @@ private pure func concrete_type(
 ) -> Result[TypeRef, Diagnostic]:
 	match value_type:
 		Checked.RecordType(id):
-			find_record_instance(records, id)
+			find_record_instance(records, { declaration = id, arguments = [] })
 				.map(pure func(owner): RecordType(owner))
 				.to_result(invalid(span, "unprepared record instance"))
 		Checked.VoidType:
@@ -425,10 +478,31 @@ private pure func concrete_type(
 			Ok(StringType)
 		Checked.ListType(element):
 			concrete ?= concrete_type(element, substitution, unions, span, records)
+
 			if same_type(concrete, StringType):
 				Ok(ListType(concrete))
 			else:
-				Err({ span = span, note = None, message = "List currently supports only String elements", help = "use List[String]; other concrete element types are not supported yet" })
+				Err({
+					span = span,
+					note = None,
+					message = "List currently supports only String elements",
+					help = "use List[String]; other concrete element types are not supported yet",
+				})
+		Checked.AppliedRecordType(id, arguments):
+			arguments ?= translated_list(
+				arguments,
+				pure func(
+					value: Checked.TypeRef,
+				): concrete_type(value, substitution, unions, span, records),
+			)
+			id ?= find_record_instance(
+				records,
+				{
+					declaration = id,
+					arguments = arguments
+				},
+			).to_result(invalid(span, "unprepared generic record instance"))
+			Ok(RecordType(id))
 		Checked.AppliedUnionType(id, arguments):
 			arguments ?= translated_list(
 				arguments,
@@ -532,6 +606,15 @@ private pure func parameter_substitution(
 							)
 						_:
 							False
+				Checked.RecordDeclaration(id):
+					match owner:
+						Checked.RecordDeclaration(expected):
+							IntOps.equals(
+								Declaration.record_number(id),
+								Declaration.record_number(expected),
+							)
+						_:
+							False
 				Checked.UnionDeclaration(id):
 					match owner:
 						Checked.UnionDeclaration(expected):
@@ -620,9 +703,19 @@ private fixed record PreparedInstances {
 
 private pure func contains_parameter(value: Checked.TypeRef) -> Bool:
 	match value:
-		Checked.ListType(element): contains_parameter(element)
+		Checked.ListType(element):
+			contains_parameter(element)
 		Checked.ParameterType(_):
 			True
+		Checked.AppliedRecordType(_, arguments):
+			var found = False
+
+			for argument in arguments:
+				if contains_parameter(argument):
+					found = True
+					break
+
+			found
 		Checked.AppliedUnionType(_, arguments):
 			var found = False
 
@@ -697,52 +790,61 @@ private pure func ensure_union(
 			)
 			var dependencies = unions
 			var record_dependencies = records
-			var variants: List[Option[TypeRef]] = []
+			var variants: List[List[TypeRef]] = []
 			var representation = InlineUnmanaged
 			var failure: Option[Diagnostic] = None
 
 			for variant in declaration.variants:
-				match variant.payload:
-					None:
-						variants = variants.append(None)
-					Some(written):
-						match prepare_type(
-							written.value_type,
-							substitution,
-							checked,
-							dependencies,
-							span,
-							record_dependencies,
-						):
-							Err(error):
-								failure = Some(error)
-								break
-							Ok(prepared):
-								dependencies = prepared.unions
-								record_dependencies = prepared.records
-								variants = variants.append(Some(prepared.value_type))
-
-								match prepared.value_type:
-									StringType | ListType(_):
-										representation = InlineOwningPayload
-									UnionType(child):
-										match dependencies.get(union_number(child)):
-											Some(layout):
-												match layout.layout.representation:
-													InlineOwningPayload:
-														representation = InlineOwningPayload
-													InlineUnmanaged:
-														void
-											None:
-												failure = Some(
-													invalid(
-														span,
-														"missing concrete child layout",
-													),
-												)
-												break
-									_:
-										void
+				var fields: List[TypeRef] = []
+				for written in variant.fields:
+					match prepare_type(written.value_type, substitution, checked, dependencies, written.span, record_dependencies):
+						Err(error):
+							failure = Some(error)
+							break
+						Ok(prepared):
+							dependencies = prepared.unions
+							record_dependencies = prepared.records
+							fields = fields.append(prepared.value_type)
+							match prepared.value_type:
+								RecordType(child):
+									match record_dependencies.get(record_number(child)):
+										Some(child_layout):
+											match child_layout.layout.representation:
+												ManagedRecord:
+													representation = InlineOwningPayload
+												InlineRecord:
+													void
+										None:
+											failure = Some(
+												invalid(
+													span,
+													"missing concrete record child layout",
+												),
+											)
+											break
+								StringType | ListType(_):
+									representation = InlineOwningPayload
+								UnionType(child):
+									match dependencies.get(union_number(child)):
+										Some(layout):
+											match layout.layout.representation:
+												InlineOwningPayload:
+													representation = InlineOwningPayload
+												InlineUnmanaged:
+													void
+										None:
+											failure = Some(
+												invalid(
+													span,
+													"missing concrete child layout",
+												),
+											)
+											break
+								_:
+									void
+				if failure.is_some():
+					break
+				variants = variants.append(fields)
 
 			ready ?= match failure:
 				Some(error):
@@ -765,6 +867,93 @@ private pure func ensure_union(
 			})
 
 
+private pure func ensure_record(
+	key: RecordKey,
+	checked: Checked.CheckedFunctions,
+	unions: List[UnionInstance],
+	span: Span,
+	records: List[RecordInstance],
+) -> Result[PreparedType, Diagnostic]:
+	match find_record_instance(records, key):
+		Some(instance):
+			Ok({
+				value_type = RecordType(instance),
+				unions = unions,
+				records = records,
+			})
+		None:
+			declaration ?= checked.records
+				.get(Declaration.record_number(key.declaration))
+				.to_result(invalid(span, "unknown record declaration"))
+			substitution ?= parameter_substitution(declaration.type_parameters, key.arguments, Checked.RecordDeclaration(key.declaration), span)
+			var fields: List[TypeRef] = []
+			var dependencies = unions
+			var record_dependencies = records
+			var representation = InlineRecord
+			var error: Option[Diagnostic] = None
+
+			for checked_field in declaration.fields:
+				field = checked_field.value_type
+				match prepare_type(
+					field.value_type,
+					substitution,
+					checked,
+					dependencies,
+					field.span,
+					record_dependencies,
+				):
+					Err(failure):
+						error = Some(failure)
+						break
+					Ok(prepared):
+						dependencies = prepared.unions
+						record_dependencies = prepared.records
+						fields = fields.append(prepared.value_type)
+
+						match prepared.value_type:
+							IntType | FloatType:
+								void
+							RecordType(child):
+								match record_dependencies.get(record_number(child)):
+									Some(child_layout):
+										match child_layout.layout.representation:
+											ManagedRecord:
+												representation = ManagedRecord
+											InlineRecord:
+												void
+									None:
+										error = Some(
+											invalid(
+												field.span,
+												"missing concrete record child layout",
+											),
+										)
+										break
+							_:
+								representation = ManagedRecord
+
+			ready ?= match error:
+				Some(error):
+					Err(error)
+				None:
+					Ok(void)
+
+			instance: RecordInstanceId = into_opaque RecordInstanceId(
+				record_dependencies.length()
+			)
+			Ok({
+				value_type = RecordType(instance),
+				unions = dependencies,
+				records = record_dependencies.append({
+					key = key,
+					layout = {
+						fields = fields,
+						representation = representation
+					},
+				}),
+			})
+
+
 private pure func prepare_type(
 	value: Checked.TypeRef,
 	substitution: List[TypeSubstitution],
@@ -775,25 +964,7 @@ private pure func prepare_type(
 ) -> Result[PreparedType, Diagnostic]:
 	match value:
 		Checked.RecordType(id):
-			match find_record_instance(records, id):
-				Some(instance):
-					Ok({ value_type = RecordType(instance), unions = unions, records = records })
-				None:
-					declaration ?= checked.records
-						.get(Declaration.record_number(id))
-						.to_result(invalid(span, "unknown record declaration"))
-					instance: RecordInstanceId = into_opaque RecordInstanceId(records.length())
-					Ok({
-						value_type = RecordType(instance),
-						unions = unions,
-						records = records.append({
-							declaration = id,
-							layout = {
-								-- Checking currently accepts only Int record fields.
-								fields = declaration.fields.map(pure func(field: Checked.CheckedField): IntType),
-							},
-						}),
-					})
+			ensure_record({ declaration = id, arguments = [] }, checked, unions, span, records)
 		Checked.UnionType(id):
 			ensure_union(
 				{
@@ -804,6 +975,45 @@ private pure func prepare_type(
 				unions,
 				span,
 				records,
+			)
+		Checked.AppliedRecordType(id, arguments):
+			var types: List[TypeRef] = []
+			var dependencies = unions
+			var record_dependencies = records
+			var failure: Option[Diagnostic] = None
+
+			for argument in arguments:
+				match prepare_type(
+					argument,
+					substitution,
+					checked,
+					dependencies,
+					span,
+					record_dependencies,
+				):
+					Ok(prepared):
+						types = types.append(prepared.value_type)
+						dependencies = prepared.unions
+						record_dependencies = prepared.records
+					Err(error):
+						failure = Some(error)
+						break
+
+			ready ?= match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(void)
+
+			ensure_record(
+				{
+					declaration = id,
+					arguments = types
+				},
+				checked,
+				dependencies,
+				span,
+				record_dependencies,
 			)
 		Checked.AppliedUnionType(id, arguments):
 			var types: List[TypeRef] = []
@@ -886,6 +1096,9 @@ private pure func append_value_types(
 	})
 
 	match value.base:
+		Checked.ReturnConstructedVariant(_, children):
+			for child in children:
+				types = append_value_types(types, child)
 		Checked.ReturnRecord(_, fields):
 			for field in fields:
 				types = append_value_types(types, field.value)
@@ -988,7 +1201,10 @@ private pure func prepare_function(
 			prepared.records,
 		):
 			Ok(value):
-				prepared = { prepared | unions = value.unions, records = value.records }
+				prepared = { prepared |
+					unions = value.unions,
+					records = value.records
+				}
 			Err(error):
 				failure = Some(error)
 				break
@@ -1011,7 +1227,10 @@ private pure func prepare_function(
 							prepared.records,
 						):
 							Ok(value):
-								prepared = { prepared | unions = value.unions, records = value.records }
+								prepared = { prepared |
+									unions = value.unions,
+									records = value.records
+								}
 								concrete = concrete.append(value.value_type)
 							Err(error):
 								failure = Some(error)
@@ -1183,12 +1402,18 @@ private pure func translate_call(
 					owner ?= concrete_union_owner(result_type, call.span)
 					equal ?= translate_variant(roles.equal, owner, unions, call.span)
 					different ?= translate_variant(roles.different, owner, unions, call.span)
-					Ok(Builtins.IntEquals({ equal = equal, different = different }))
+					Ok(Builtins.IntEquals({
+						equal = equal,
+						different = different,
+					}))
 				StringEquals(roles):
 					owner ?= concrete_union_owner(result_type, call.span)
 					equal ?= translate_variant(roles.equal, owner, unions, call.span)
 					different ?= translate_variant(roles.different, owner, unions, call.span)
-					Ok(Builtins.StringEquals({ equal = equal, different = different }))
+					Ok(Builtins.StringEquals({
+						equal = equal,
+						different = different,
+					}))
 
 			concrete ?= concrete_result
 			Ok(RuntimeFunction(concrete))
@@ -1265,15 +1490,17 @@ private pure func translate_value(
 	base_type ?= concrete_type(value.base_type, substitution, unions, base_span, records)
 
 	base_result: Result[ConcreteBase, Diagnostic] = match value.base:
-		Checked.ReturnRecord(id, fields):
-			owner ?= find_record_instance(
-				records,
-				id,
-			).to_result(invalid(value.base_span, "unknown record declaration"))
+		Checked.ReturnConstructedVariant(id, children):
+			owner ?= concrete_union_owner(base_type, value.base_span)
+			variant ?= translate_variant(id, owner, unions, value.base_span)
+			values ?= translated_list(children, pure func(child): translate_value(child, substitution, keys, unions, records))
+			Ok(ReturnConstructedVariant(variant, values))
+		Checked.ReturnRecord(_, fields):
+			owner ?= concrete_record_owner(base_type, value.base_span)
 			concrete ?= translated_list(fields, pure func(
 				field: Checked.CheckedRecordField,
 			) -> Result[ConcreteRecordField, Diagnostic]:
-				id ?= translate_field(field.field, records, field.span)
+				id ?= translate_field(field.field, owner, records, field.span)
 				child ?= translate_value(field.value, substitution, keys, unions, records)
 				Ok({
 					field = id,
@@ -1313,48 +1540,69 @@ private pure func translate_value(
 			Ok(ReturnCall(concrete, values))
 
 	base ?= base_result
-	steps ?= translated_list(value.operations, pure func(
-		step: Checked.CheckedStep,
-	) -> Result[ConcreteStep, Diagnostic]:
-		span = step_anchor(step)
-		value_type ?= concrete_type(step.value_type, substitution, unions, span, records)
+	var steps: List[ConcreteStep] = []
+	var current_type = base_type
+	var failure: Option[Diagnostic] = None
+	for step in value.operations:
+		result = translate_step(step, current_type, substitution, keys, unions, records)
+		match result:
+			Ok(concrete):
+				steps = steps.append(concrete)
+				current_type = concrete.value_type
+			Err(error):
+				failure = Some(error)
+				break
+	ready ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
 
-		operation_result: Result[ConcreteOperation, Diagnostic] = match step.operation:
-			Checked.ReadRecordField(field):
-				translate_field(field, records, step.span).map(pure func(id): ReadRecordField(id))
-			Checked.InvokeFunction(call, arguments):
-				concrete ?= translate_call(call, substitution, keys, unions, records, value_type)
-				values ?= translated_list(
-					arguments,
-					pure func(
-						argument: Checked.CheckedValue,
-					) -> Result[ConcreteValue, Diagnostic]: translate_value(
-						argument,
-						substitution,
-						keys,
-						unions,
-						records,
-					),
-				)
-				Ok(InvokeFunction(concrete, values))
-			Checked.ConstructVariant(id):
-				owner ?= concrete_union_owner(value_type, step.span)
-				concrete ?= translate_variant(id, owner, unions, step.span)
-				Ok(ConstructVariant(concrete))
-
-		operation ?= operation_result
-		Ok({
-			operation = operation,
-			value_type = value_type,
-			span = span,
-		})
-	)
 	Ok({
 		base = base,
 		base_type = base_type,
 		base_span = base_span,
 		operations = steps,
 	})
+
+
+private pure func concrete_record_owner(value: TypeRef, span: Span) -> Result[RecordInstanceId, Diagnostic]:
+	match value:
+		RecordType(owner): Ok(owner)
+		_: Err(invalid(span, "record operation has a non-record receiver"))
+
+
+private pure func translate_step(
+	step: Checked.CheckedStep,
+	receiver_type: TypeRef,
+	substitution: List[TypeSubstitution],
+	keys: List[FunctionRequest],
+	unions: List[UnionInstance],
+	records: List[RecordInstance],
+) -> Result[ConcreteStep, Diagnostic]:
+	span = step_anchor(step)
+	match step.operation:
+		Checked.ReadRecordField(field):
+			owner ?= concrete_record_owner(receiver_type, step.span)
+			value_type ?= concrete_record_field_type(field, owner, records, step.span)
+			-- The prepared receiver row already owns this exact concrete field type.
+			translated_field = into_opaque FieldInstanceId({ owner = owner, position = Checked.field_number(field) })
+			Ok({ operation = ReadRecordField(translated_field), value_type = value_type, span = span })
+		Checked.InvokeFunction(call, arguments):
+			value_type ?= concrete_type(step.value_type, substitution, unions, span, records)
+			concrete ?= translate_call(call, substitution, keys, unions, records, value_type)
+			values ?= translated_list(
+				arguments,
+				pure func(
+					argument: Checked.CheckedValue,
+				) -> Result[ConcreteValue, Diagnostic]: translate_value(
+					argument,
+					substitution,
+					keys,
+					unions,
+					records,
+				),
+			)
+			Ok({ operation = InvokeFunction(concrete, values), value_type = value_type, span = span })
+
 
 
 private pure func translate_statements(
@@ -1391,18 +1639,9 @@ private pure func translate_pattern(
 			Ok(WildcardCase)
 		Checked.BindingCase(id):
 			Ok(BindingCase(id))
-		Checked.VariantCase(id, payload):
+		Checked.VariantCase(id, bindings):
 			variant ?= translate_variant(id, owner, unions, span)
-
-			concrete_payload = match payload:
-				Checked.NoPayloadBinding:
-					NoPayloadBinding
-				Checked.DiscardPayload:
-					DiscardPayload
-				Checked.BindPayload(id):
-					BindPayload(id)
-
-			Ok(VariantCase(variant, concrete_payload))
+			Ok(VariantCase(variant, bindings))
 
 
 private pure func translate_exit(
@@ -1455,12 +1694,17 @@ private pure func translate_function(
 		function.signature.return_type.span,
 		records,
 	)
+
 	-- An inner generic call may acquire its concrete Void result only when its
 	-- enclosing caller is specialized. Such instances must obey the same rule.
-	pure_result ?= if same_purity(function.signature.purity, Pure) and same_type(return_type, VoidType):
+	pure_result ?= if (
+		same_purity(function.signature.purity, Pure)
+		and same_type(return_type, VoidType)
+	):
 		Err(pure_void_return(span))
 	else:
 		Ok(void)
+
 	bindings ?= translated_list(function.bindings, pure func(
 		binding: Checked.BindingDefinition,
 	) -> Result[ConcreteBinding, Diagnostic]:
@@ -1523,12 +1767,17 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
 	-- Checked entrypoint identity is the only root. Requests discover complete
 	-- callees and layouts before this local builder freezes into the concrete program.
 	initial: PreparedInstances = {
-		functions = [{
-			key = { declaration = entry_function(checked.entrypoint), arguments = [] },
-			source = EntrypointRoot,
-		}],
+		functions = [
+			{
+				key = {
+					declaration = entry_function(checked.entrypoint),
+					arguments = []
+				},
+				source = EntrypointRoot
+			},
+		],
 		unions = [],
-		records = [],
+		records = []
 	}
 	prepared ?= expand_instances(checked, initial)
 	functions ?= translated_list(prepared.functions, pure func(
@@ -1546,7 +1795,13 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
 					"unknown function declaration",
 				),
 			)
-		translate_function(function, request.key, prepared.functions, prepared.unions, prepared.records)
+		translate_function(
+			function,
+			request.key,
+			prepared.functions,
+			prepared.unions,
+			prepared.records,
+		)
 	)
 	entrypoint ?= find_instance(
 		prepared.functions,
@@ -1564,11 +1819,17 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
 			"missing entrypoint instance",
 		),
 	)
+
 	accepted: Entrypoint[FunctionInstanceId] = match checked.entrypoint:
-		NoArguments(_, result): NoArguments(entrypoint, result)
-		WithArguments(_, result): WithArguments(entrypoint, result)
+		NoArguments(_, result):
+			NoArguments(entrypoint, result)
+		WithArguments(_, result):
+			WithArguments(entrypoint, result)
+
 	Ok(into_opaque SpecializedProgram({
-				records = prepared.records.map(pure func(instance: RecordInstance): instance.layout),
+				records = prepared.records.map(
+					pure func(instance: RecordInstance): instance.layout,
+				),
 				unions = prepared.unions.map(pure func(instance: UnionInstance): instance.layout),
 				functions = functions,
 				entrypoint = accepted

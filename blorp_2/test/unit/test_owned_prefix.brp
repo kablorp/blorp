@@ -1,0 +1,313 @@
+import:
+	../../src/emit: emit
+	../../src/lower as Lower
+	../../src/own as Own
+	../../src/syntax: Diagnostic
+	../../src/verify: verify
+	managed_union_inputs: lowered
+	test: TestSuite
+
+
+private SOURCE: String =
+	|fixed union Choice:
+	|	Yes
+	|	No
+	|fixed record Holder { text: String }
+	|pure func make() -> Holder:
+	|	{ text = "42" }
+	|pure func inspect(choice: Choice) -> String:
+	|	owned = make()
+	|	match choice:
+	|		Yes: owned.text
+	|		No: owned.text
+	|func main() -> Int:
+	|	unused = inspect(Yes)
+	|	0
+	|
+
+
+pure func test_lowering_preserves_prefix_and_disjoint_arm_values() -> Bool:
+	match lowered(SOURCE):
+		Err(_):
+			False
+		Ok(program):
+			Lower.lowered_functions(program).functions.any(pure func(function):
+				match (function.definitions, function.tail):
+					([parameter, parent], Lower.MatchValue(matched)):
+						match matched.arms:
+							[first, second]:
+								match (first.body.definitions, second.body.definitions):
+									([left], [right]):
+										(
+											Lower.value_number(parameter.id) == 0
+											and Lower.value_number(parent.id) == 1
+											and Lower.value_number(left.id) == 2
+											and Lower.value_number(right.id) == 3
+										)
+									_:
+										False
+							_:
+								False
+					_:
+						False
+			)
+
+
+pure func test_owned_prefix_child_return_is_verified() -> Bool:
+	lowered(SOURCE)
+		.and_then(pure func(program): Own.own(program))
+		.and_then(pure func(program): verify(program))
+		.is_ok()
+
+
+pure func test_each_arm_acquires_child_before_dropping_prefix() -> Bool:
+	match lowered(SOURCE).and_then(pure func(program): Own.own(program)):
+		Err(_):
+			False
+		Ok(program):
+			program.functions.any(pure func(function):
+				match function.tail:
+					Own.MatchTail(matched):
+						matched.arms.all(pure func(arm):
+							match (arm.operations, arm.exit):
+								([Own.DefineValue(child), Own.AcquireOwner(acquired, borrowed, _), Own.DropOwner(parent, _)], Own.ReturnResult(Own.OwnedReturn(returned, owner))):
+									(
+										Lower.value_number(child.id) == Lower.value_number(returned)
+										and Lower.value_number(
+											borrowed.value,
+										) == Lower.value_number(returned)
+										and Own.owner_number(acquired) == Own.owner_number(owner)
+										and Own.owner_number(parent) == 0
+									)
+								_:
+									False
+						)
+					_:
+						False
+			)
+
+
+private ROOT_SOURCE: String =
+	|fixed union Choice:
+	|	Yes
+	|	No
+	|fixed record Holder { text: String }
+	|pure func make() -> Holder:
+	|	{ text = "42" }
+	|pure func inspect(choice: Choice) -> Holder:
+	|	owned = make()
+	|	match choice:
+	|		Yes: owned
+	|		_: owned
+	|func main() -> Int:
+	|	unused = inspect(Yes)
+	|	0
+	|
+
+
+pure func test_prefix_root_return_transfers_without_drop_in_each_arm() -> Bool:
+	match lowered(ROOT_SOURCE).and_then(pure func(program): Own.own(program)):
+		Err(_):
+			False
+		Ok(program):
+			verify(program).is_ok() and program.functions.any(pure func(function):
+				match function.tail:
+					Own.MatchTail(matched):
+						matched.arms.all(pure func(arm):
+							match (arm.operations, arm.exit):
+								([], Own.ReturnResult(Own.OwnedReturn(value, owner))):
+									Lower.value_number(value) == 1 and Own.owner_number(owner) == 0
+								_:
+									False
+						)
+					_:
+						False
+			)
+
+
+private ALIAS_SOURCE: String =
+	|fixed union Choice:
+	|	Yes
+	|	No
+	|fixed record Holder { text: String }
+	|pure func make() -> Holder:
+	|	{ text = "42" }
+	|pure func inspect(choice: Choice) -> String:
+	|	var current = make()
+	|	saved = current
+	|	current = make()
+	|	match choice:
+	|		Yes: saved.text
+	|		No: current.text
+	|func main() -> Int:
+	|	unused = inspect(Yes)
+	|	0
+	|
+
+
+private pure func alias_arm(arm: Own.OwnedArm, expected_parent: Int, expected_child: Int) -> Bool:
+	match (arm.operations, arm.exit):
+		([Own.DefineValue(child), Own.AcquireOwner(acquired, _, _), Own.DropOwner(first, _), Own.DropOwner(second, _)], Own.ReturnResult(Own.OwnedReturn(returned, transferred))):
+			match child.operation:
+				Own.ReadRecordFieldDefinition(_, Own.BorrowedArgument(parent)):
+					match parent.source:
+						Own.OwnerBorrow(owner):
+							(
+								Own.owner_number(owner) == expected_parent
+								and Own.owner_number(acquired) == expected_child
+								and Own.owner_number(transferred) == expected_child
+								and Own.owner_number(first) == 0
+								and Own.owner_number(second) == 1
+								and Lower.value_number(returned) == Lower.value_number(child.id)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_reassignment_preserves_old_alias_and_both_prefix_obligations() -> Bool:
+	match lowered(ALIAS_SOURCE).and_then(pure func(program): Own.own(program)):
+		Err(_):
+			False
+		Ok(program):
+			verify(program).is_ok() and program.functions.any(pure func(function):
+				match function.tail:
+					Own.MatchTail(matched):
+						match (function.operations, matched.arms):
+							([Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(_)], [first, second]):
+								alias_arm(first, 0, 2) and alias_arm(second, 1, 3)
+							_:
+								False
+					_:
+						False
+			)
+
+
+pure func test_prefix_list_root_preserves_borrowed_parameter() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|	Yes
+		|	No
+		|pure func identity(value: List[String]) -> List[String]:
+		|	value
+		|pure func inspect(choice: Choice, value: List[String]) -> Int:
+		|	owned = identity(value)
+		|	match choice:
+		|		Yes: 7
+		|		No: 9
+		|func main(args: List[String]) -> Int:
+		|	inspect(Yes, args)
+		|
+
+	match lowered(source).and_then(pure func(program): Own.own(program)):
+		Err(_):
+			False
+		Ok(program):
+			verify(program).is_ok() and program.functions.any(pure func(function):
+				match function.tail:
+					Own.MatchTail(matched):
+						matched.arms.all(pure func(arm):
+							match arm.operations:
+								[Own.DefineValue(_), Own.DropOwner(root, _)]:
+									Own.owner_number(root) == 0
+								_:
+									False
+						)
+					_:
+						False
+			)
+
+
+pure func test_emission_acquires_child_then_drops_prefix_inside_each_case() -> Bool:
+	emitted = lowered(SOURCE)
+		.and_then(pure func(program): Own.own(program))
+		.and_then(pure func(program): verify(program))
+		.and_then(pure func(program): emit(program))
+
+	match emitted:
+		Err(_):
+			False
+		Ok(c):
+			c.contains((
+					"blorp_string_retain(blorp_vl_2);struct blorp_string* const "
+					+ "blorp_owner_1=blorp_vl_2;(void)blorp_owner_1;blorp_record_drop_0(blorp_owner_0);"
+					+ "return blorp_owner_1;"
+				)) and c.contains((
+					"blorp_string_retain(blorp_vl_3);struct blorp_string* const "
+					+ "blorp_owner_2=blorp_vl_3;(void)blorp_owner_2;blorp_record_drop_0(blorp_owner_0);"
+					+ "return blorp_owner_2;"
+				))
+
+
+pure func test_arm_use_analysis_keeps_prefix_outside_local_drop_schedule() -> Bool:
+	match lowered(SOURCE):
+		Err(_):
+			False
+		Ok(program):
+			Lower.lowered_functions(program).functions.any(pure func(function):
+				match function.tail:
+					Lower.MatchValue(matched):
+						match matched.arms:
+							[first, second]:
+								match (
+									Own.exit_last_uses(
+										first.body.definitions,
+										first.body.exit,
+										2,
+										2,
+									),
+									Own.exit_last_uses(
+										second.body.definitions,
+										second.body.exit,
+										2,
+										3,
+									),
+								):
+									(Ok(left), Ok(right)):
+										left == [Some(1)] and right == [Some(1)]
+									_:
+										False
+							_:
+								False
+					_:
+						False
+			)
+
+
+tests: TestSuite = {
+	description = "owned match prefix",
+	tests = [
+		(
+			"arm uses keep prefix outside local drops",
+			test_arm_use_analysis_keeps_prefix_outside_local_drop_schedule,
+		),
+		(
+			"C acquires child before case prefix cleanup",
+			test_emission_acquires_child_then_drops_prefix_inside_each_case,
+		),
+		(
+			"prefix root return transfers in variant/default arms",
+			test_prefix_root_return_transfers_without_drop_in_each_arm,
+		),
+		(
+			"reassignment preserves prefix aliases",
+			test_reassignment_preserves_old_alias_and_both_prefix_obligations,
+		),
+		(
+			"owned list prefix preserves borrowed parameter",
+			test_prefix_list_root_preserves_borrowed_parameter,
+		),
+		(
+			"lowering prefix and disjoint arm values",
+			test_lowering_preserves_prefix_and_disjoint_arm_values,
+		),
+		("owned prefix child return verified", test_owned_prefix_child_return_is_verified),
+		(
+			"each arm acquires child before prefix drop",
+			test_each_arm_acquires_child_before_dropping_prefix,
+		),
+	]
+}

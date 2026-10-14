@@ -37,7 +37,7 @@ must survive the mutable source binding's reassignment.
 
 The owning design and source anchors are in
 [GENERICS_HANDOFF.md](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/GENERICS_HANDOFF.md) and
-[MEMORY_PLAN.md](../../blorp_2/MEMORY_PLAN.md). This extends their existing
+[historical memory plan](https://github.com/kablorp/blorp/blob/79deebd455856e5955d215ff2ec36f17860feb14/blorp_2/MEMORY_PLAN.md). This extends their existing
 root/child distinction and borrowed synchronous call ABI.
 
 ## One layout authority and explicit child obligations

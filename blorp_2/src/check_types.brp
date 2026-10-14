@@ -6,17 +6,16 @@ import:
 	./check_errors:
 		CheckError,
 		CheckerInvariant(
-			InvalidParameterDeclaration, InvalidResolvedFunction, InvalidUnionDeclaration,
+			InvalidParameterDeclaration, InvalidResolvedFunction, InvalidUnionDeclaration, InvalidRecordDeclaration, InvalidDeclarationVisit,
 		),
-		PayloadRule(IntegerOrParameterPayload, IntegerPayload),
 		PreviousTypeDeclaration(SourceTypeDeclaration),
 		TypeDeclarationError(
 			DuplicateRecordField, DuplicateRecordType, DuplicateTypeParameter, DuplicateUnion,
-			DuplicateVariant, TypeParameterTypeNameConflict, UnsupportedPayloadAnnotation,
-			UnsupportedRecordField, VariantFunctionConflict,
+			DuplicateVariant, TypeParameterTypeNameConflict, RecursiveAggregateType,
+			VariantFunctionConflict,
 		),
 		TypeTermError(
-			ListTypeArgumentCount, MissingUnionTypeArguments, NonApplicableType,
+			ListTypeArgumentCount, MissingUnionTypeArguments, NonApplicableType, MissingRecordTypeArguments, RecordTypeArgumentCountMismatch, OrdinaryRecordApplied,
 			OrdinaryUnionApplied, UnionTypeArgumentCountMismatch, UnknownType,
 			UnsupportedListElement,
 		),
@@ -29,9 +28,9 @@ import:
 		CheckedUnion,
 		CheckedVariant,
 		TypeParameterId,
-		TypeParameterOwner(UnionDeclaration),
+		TypeParameterOwner(UnionDeclaration, RecordDeclaration),
 		TypeRef(
-			AppliedUnionType, IntType, ListType, ParameterType, RecordType, StringType, UnionType,
+			AppliedUnionType, AppliedRecordType, VoidType, FloatType, IntType, ListType, ParameterType, RecordType, StringType, UnionType,
 		),
 		TypeUse,
 		UnionOccurrence,
@@ -48,6 +47,7 @@ import:
 		UnionId,
 		function_number,
 		record_id,
+		record_number,
 		union_id,
 		union_number,
 		variant_id,
@@ -60,7 +60,7 @@ import:
 		type_candidates,
 	option: to_result
 	assemble: ParsedContents
-	source: ModuleId, module_number, same_module
+	source: COMPILER_SOURCE, ModuleId, module_number, same_module
 	syntax:
 		ParsedFunction,
 		ParsedRecord,
@@ -91,6 +91,7 @@ pure func previous_declaration(previous: List[WrittenName], name: NameId) -> Opt
 -- The type names visible where a type is written: the module's namespace, the
 -- declared unions and the enclosing declaration's own type parameters.
 fixed record TypeScope {
+	records: List[ParsedRecord],
 	unions: List[ParsedUnion],
 	namespace: Namespace,
 	module: ModuleId,
@@ -194,6 +195,11 @@ private pure func union_arity(
 	Ok(declaration.type_parameters.length())
 
 
+private pure func record_arity(scope: TypeScope, owner: RecordId, span: Span) -> Result[Int, CheckError]:
+	declaration ?= scope.records.get(record_number(owner)).to_result(checker_invariant(span, InvalidRecordDeclaration(owner)))
+	Ok(declaration.type_parameters.length())
+
+
 private pure func resolve_atomic_type(
 	scope: TypeScope,
 	name: WrittenName,
@@ -208,7 +214,11 @@ private pure func resolve_atomic_type(
 				[ListCandidate]:
 					Err(type_term_error(name.span, ListTypeArgumentCount))
 				[RecordCandidate(id)]:
-					Ok(RecordType(id))
+					arity ?= record_arity(scope, id, name.span)
+					if IntOps.equals(arity, 0):
+						Ok(RecordType(id))
+					else:
+						Err(type_term_error(name.span, MissingRecordTypeArguments(id, arity)))
 				[UnionCandidate(id)]:
 					arity ?= union_arity(scope, id, name.span)
 
@@ -238,6 +248,16 @@ pure func resolve_type(scope: TypeScope, written: TypeSyntax) -> Result[TypeRef,
 									Err(type_term_error(type_span(element), UnsupportedListElement))
 						_:
 							Err(type_term_error(span, ListTypeArgumentCount))
+				[RecordCandidate(owner)]:
+					arity ?= record_arity(scope, owner, span)
+					applicable ?= if IntOps.equals(arity, 0):
+						Err(type_term_error(span, OrdinaryRecordApplied(owner)))
+					else if IntOps.equals(arity, arguments.length()):
+						Ok(void)
+					else:
+						Err(type_term_error(span, RecordTypeArgumentCountMismatch(owner, arity, arguments.length())))
+					values ?= resolve_types(scope, arguments, [])
+					Ok(AppliedRecordType(owner, values))
 				_:
 					owner ?= find_union(
 						scope,
@@ -408,6 +428,7 @@ private pure func declare_types(
 		Some(declaration):
 			unique ?= validate_type_name(declaration, previous)
 			scope: TypeScope = {
+				records = parsed.records,
 				unions = parsed.unions,
 				namespace = namespace,
 				module = declared_module(declaration),
@@ -429,13 +450,13 @@ private pure func declare_types(
 								variants = variants,
 							}) })
 				DeclaredRecord(parsed_record):
-					fields ?= declared_fields(
-						parsed_record,
-						record_id(checked.records.length()),
-						scope,
-						[],
-					)
-					Ok({ checked | records = checked.records.append({fields = fields}) })
+					owner = record_id(checked.records.length())
+					parameters ?= local_type_parameters(parsed_record.type_parameters, RecordDeclaration(owner), scope)
+					fields ?= declared_fields(parsed_record, owner, parameters, [])
+					Ok({ checked | records = checked.records.append({
+						type_parameters = declared_parameters(parameters),
+						fields = fields,
+					}) })
 
 			updated ?= declared
 			declare_types(
@@ -514,14 +535,8 @@ private pure func declared_variants(
 		None:
 			Ok(declared)
 		Some(variant):
-			payload: Result[Option[TypeUse], CheckError] = match variant.payload:
-				None:
-					Ok(None)
-				Some(name):
-					annotation ?= payload_annotation(name, scope)
-					Ok(Some(annotation))
+			fields ?= declared_variant_fields(scope, variant.fields)
 
-			resolved ?= payload
 			declared_variants(
 				declaration,
 				owner,
@@ -529,45 +544,26 @@ private pure func declared_variants(
 				declared.append({
 					id = variant_id(owner, declared.length()),
 					name = variant.name,
-					payload = resolved,
+					fields = fields,
 				}),
 			)
 
 
--- A payload is Int or one of the union's own type parameters.
-private pure func payload_annotation(
-	name: WrittenName,
-	scope: TypeScope,
-) -> Result[TypeUse, CheckError]:
-	integer = match type_candidates(scope.namespace, scope.module, name.id):
-		[PrimitiveCandidate(candidate)]:
-			same_type(primitive_ref(candidate), IntType)
-		_:
-			False
-
-	if integer:
-		Ok({
-			value_type = IntType,
-			span = name.span,
-		})
-	else:
-		match lookup_type_parameter(scope.parameters, name.id):
-			Some(parameter):
-				Ok({
-					value_type = ParameterType(parameter.id),
-					span = name.span,
-				})
-			None:
-				rule = match scope.parameters:
-					[]:
-						IntegerPayload
-					_:
-						IntegerOrParameterPayload
-
-				Err(type_declaration_error(name.span, UnsupportedPayloadAnnotation(name.id, rule)))
+private pure func declared_variant_fields(scope: TypeScope, written: List[TypeSyntax]) -> Result[List[TypeUse], CheckError]:
+	var fields: List[TypeUse] = []
+	var failure: Option[CheckError] = None
+	for annotation in written:
+		match resolve_type(scope, annotation):
+			Ok(value): fields = fields.append({ value_type = value, span = type_span(annotation) })
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(fields)
 
 
--- Resolves each field's annotation in declaration order; fields are Int.
+-- Resolves every field annotation in declaration order, retaining its identity and name.
 private pure func declared_fields(
 	declaration: ParsedRecord,
 	owner: RecordId,
@@ -591,11 +587,6 @@ private pure func declared_fields(
 
 			value_type ?= resolve_type(scope, field.type_name)
 			span = type_span(field.type_name)
-
-			supported ?= if same_type(value_type, IntType):
-				Ok(void)
-			else:
-				Err(type_declaration_error(span, UnsupportedRecordField(value_type)))
 
 			declared_fields(
 				declaration,
@@ -623,21 +614,20 @@ pure func find_field(fields: List[CheckedField], name: NameId) -> Option[Checked
 	found
 
 
--- A variant's payload as it appears in one occurrence of its union type.
-pure func occurrence_payload(
-	payload: Option[TypeUse],
-	occurrence: UnionOccurrence,
-) -> Result[Option[TypeUse], CheckError]:
-	match payload:
-		None:
-			Ok(None)
-		Some(written):
-			substitution: Substitution = {
-				owner = UnionDeclaration(occurrence.owner),
-				values = occurrence.arguments
-			}
-			value ?= substitute_type(written.value_type, substitution, written.span)
-			Ok(Some({ written | value_type = value }))
+-- Every field at one nominal union occurrence, with simultaneous substitution.
+pure func occurrence_fields(fields: List[TypeUse], occurrence: UnionOccurrence) -> Result[List[TypeUse], CheckError]:
+	substitution: Substitution = { owner = UnionDeclaration(occurrence.owner), values = occurrence.arguments }
+	var resolved: List[TypeUse] = []
+	var failure: Option[CheckError] = None
+	for written in fields:
+		match substitute_type(written.value_type, substitution, written.span):
+			Ok(value): resolved = resolved.append({ written | value_type = value })
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(resolved)
 
 
 -- One declaration's rigid type parameters replaced simultaneously, by
@@ -663,6 +653,9 @@ pure func substitute_type(
 					Ok(ListType(value))
 				_:
 					Err(type_term_error(span, UnsupportedListElement))
+		AppliedRecordType(owner, values):
+			arguments ?= substitute_types(values, substitution, span, [])
+			Ok(AppliedRecordType(owner, arguments))
 		AppliedUnionType(owner, values):
 			arguments ?= substitute_types(values, substitution, span, [])
 			Ok(AppliedUnionType(owner, arguments))
@@ -694,3 +687,296 @@ private pure func substitute_types(
 				span,
 				substituted.append(replaced),
 			)
+
+
+private fixed union DeclarationVisit:
+	UnvisitedDeclaration
+	VisitingDeclaration
+	CompleteDeclaration
+
+
+private fixed union DeclarationVisitStep:
+	VisitDeclaredType(TypeUse)
+	FinishRecordDeclaration(RecordId)
+	FinishUnionDeclaration(UnionId)
+
+
+private pure func push_declaration_visit(
+	steps: List[DeclarationVisitStep],
+	depth: Int,
+	step: DeclarationVisitStep,
+) -> List[DeclarationVisitStep]:
+	if IntOps.less_than(depth, steps.length()):
+		steps.set(depth, step)
+	else:
+		steps.append(step)
+
+
+pure func validate_finite_declarations(
+	declarations: CheckedDeclarations,
+) -> Result[Void, CheckError]:
+	-- These vectors stay in one local builder. Passing them through a shared
+	-- record would retain their old roots and copy the entire vector on set.
+	var records = declarations.records.map(pure func(_): UnvisitedDeclaration)
+	var unions = declarations.unions.map(pure func(_): UnvisitedDeclaration)
+	var pending: List[DeclarationVisitStep] = []
+	var pending_count = 0
+	-- The pending worklist is LIFO: seed unions first so records still visit
+	-- before unions, with both inventories visited in declaration order.
+	var position = declarations.unions.length()
+
+	while IntOps.greater_than(position, 0):
+		position = IntOps.subtract(position, 1)
+		pending = push_declaration_visit(
+			pending,
+			pending_count,
+			VisitDeclaredType({
+				value_type = UnionType(union_id(position)),
+				span = { source = COMPILER_SOURCE, start = 0, end = 0 },
+			}),
+		)
+		pending_count = IntOps.add(pending_count, 1)
+
+	position = declarations.records.length()
+
+	while IntOps.greater_than(position, 0):
+		position = IntOps.subtract(position, 1)
+		pending = push_declaration_visit(
+			pending,
+			pending_count,
+			VisitDeclaredType({
+				value_type = RecordType(record_id(position)),
+				span = {
+					source = COMPILER_SOURCE,
+					start = 0,
+					end = 0
+				},
+			}),
+		)
+		pending_count = IntOps.add(pending_count, 1)
+
+	var failure: Option[CheckError] = None
+
+	while IntOps.greater_than(pending_count, 0) and not failure.is_some():
+		pending_count = IntOps.subtract(pending_count, 1)
+
+		match pending.get(pending_count):
+			None:
+				failure = Some(
+					checker_invariant(
+						{
+							source = COMPILER_SOURCE,
+							start = 0,
+							end = 0
+						},
+						InvalidDeclarationVisit,
+					),
+				)
+			Some(step):
+				match step:
+					FinishRecordDeclaration(id):
+						records = records.set(record_number(id), CompleteDeclaration)
+					FinishUnionDeclaration(id):
+						unions = unions.set(union_number(id), CompleteDeclaration)
+					VisitDeclaredType(annotation):
+						match annotation.value_type:
+							VoidType | IntType | FloatType | StringType | ParameterType(_):
+								void
+							ListType(element):
+								pending = push_declaration_visit(
+									pending,
+									pending_count,
+									VisitDeclaredType({ annotation | value_type = element }),
+								)
+								pending_count = IntOps.add(pending_count, 1)
+							AppliedRecordType(id, arguments):
+								pending = push_declaration_visit(
+									pending,
+									pending_count,
+									VisitDeclaredType({ annotation | value_type = RecordType(id) }),
+								)
+								pending_count = IntOps.add(pending_count, 1)
+								var index = arguments.length()
+
+								while IntOps.greater_than(index, 0):
+									index = IntOps.subtract(index, 1)
+
+									match arguments.get(index):
+										Some(argument):
+											pending = push_declaration_visit(
+												pending,
+												pending_count,
+												VisitDeclaredType(
+													{ annotation | value_type = argument },
+												),
+											)
+											pending_count = IntOps.add(pending_count, 1)
+										None:
+											failure = Some(
+												checker_invariant(
+													annotation.span,
+													InvalidDeclarationVisit,
+												),
+											)
+											break
+							AppliedUnionType(id, arguments):
+								pending = push_declaration_visit(
+									pending,
+									pending_count,
+									VisitDeclaredType({ annotation | value_type = UnionType(id) }),
+								)
+								pending_count = IntOps.add(pending_count, 1)
+								var index = arguments.length()
+
+								while IntOps.greater_than(index, 0):
+									index = IntOps.subtract(index, 1)
+
+									match arguments.get(index):
+										Some(argument):
+											pending = push_declaration_visit(
+												pending,
+												pending_count,
+												VisitDeclaredType(
+													{ annotation | value_type = argument },
+												),
+											)
+											pending_count = IntOps.add(pending_count, 1)
+										None:
+											failure = Some(
+												checker_invariant(
+													annotation.span,
+													InvalidDeclarationVisit,
+												),
+											)
+											break
+							RecordType(id):
+								match records.get(record_number(id)):
+									None:
+										failure = Some(
+											checker_invariant(
+												annotation.span,
+												InvalidRecordDeclaration(id),
+											),
+										)
+									Some(CompleteDeclaration):
+										void
+									Some(VisitingDeclaration):
+										failure = Some(
+											type_declaration_error(
+												annotation.span,
+												RecursiveAggregateType(annotation.value_type),
+											),
+										)
+									Some(UnvisitedDeclaration):
+										match declarations.records.get(record_number(id)):
+											None:
+												failure = Some(
+													checker_invariant(
+														annotation.span,
+														InvalidRecordDeclaration(id),
+													),
+												)
+											Some(declaration):
+												records = records.set(
+													record_number(id),
+													VisitingDeclaration,
+												)
+												pending = push_declaration_visit(
+													pending,
+													pending_count,
+													FinishRecordDeclaration(id),
+												)
+												pending_count = IntOps.add(pending_count, 1)
+												var index = declaration.fields.length()
+
+												while IntOps.greater_than(index, 0):
+													index = IntOps.subtract(index, 1)
+
+													match declaration.fields.get(index):
+														Some(field):
+															pending = push_declaration_visit(
+																pending,
+																pending_count,
+																VisitDeclaredType(field.value_type),
+															)
+															pending_count = IntOps.add(
+																pending_count,
+																1,
+															)
+														None:
+															failure = Some(
+																checker_invariant(
+																	annotation.span,
+																	InvalidDeclarationVisit,
+																),
+															)
+															break
+							UnionType(id):
+								match unions.get(union_number(id)):
+									None:
+										failure = Some(
+											checker_invariant(
+												annotation.span,
+												InvalidUnionDeclaration(id),
+											),
+										)
+									Some(CompleteDeclaration):
+										void
+									Some(VisitingDeclaration):
+										failure = Some(
+											type_declaration_error(
+												annotation.span,
+												RecursiveAggregateType(annotation.value_type),
+											),
+										)
+									Some(UnvisitedDeclaration):
+										match declarations.unions.get(union_number(id)):
+											None:
+												failure = Some(
+													checker_invariant(
+														annotation.span,
+														InvalidUnionDeclaration(id),
+													),
+												)
+											Some(declaration):
+												unions = unions.set(
+													union_number(id),
+													VisitingDeclaration,
+												)
+												pending = push_declaration_visit(
+													pending,
+													pending_count,
+													FinishUnionDeclaration(id),
+												)
+												pending_count = IntOps.add(pending_count, 1)
+												var index = declaration.variants.length()
+
+												while IntOps.greater_than(index, 0):
+													index = IntOps.subtract(index, 1)
+
+													match declaration.variants.get(index):
+														Some(variant):
+															var field_position = variant.fields.length()
+															while IntOps.greater_than(field_position, 0):
+																field_position = IntOps.subtract(field_position, 1)
+																match variant.fields.get(field_position):
+																	Some(field):
+																		pending = push_declaration_visit(pending, pending_count, VisitDeclaredType(field))
+																		pending_count = IntOps.add(pending_count, 1)
+																	None:
+																		failure = Some(checker_invariant(annotation.span, InvalidDeclarationVisit))
+																		break
+														None:
+															failure = Some(
+																checker_invariant(
+																	annotation.span,
+																	InvalidDeclarationVisit,
+																),
+															)
+															break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)

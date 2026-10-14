@@ -3,7 +3,7 @@
 The pilot now compiles inferred and written `Box[Box[Int]]`, including a rigid
 `double_box[T](value:T)->Box[Box[T]]` declaration, heterogeneous generic union
 payloads, and existing inline records carried by generic unions. This is step 5
-of `blorp_2/GENERICS_PLAN.md`, starting from `1a8c37390`.
+of the [historical generics plan](https://github.com/kablorp/blorp/blob/79deebd455856e5955d215ff2ec36f17860feb14/blorp_2/GENERICS_PLAN.md), starting from `1a8c37390`.
 
 ## Boundaries and representation
 

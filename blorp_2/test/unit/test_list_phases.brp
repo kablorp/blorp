@@ -132,7 +132,7 @@ pure func test_specialization_translates_accepted_entrypoint_and_list_layout() -
 			match (facts.entrypoint, facts.unions):
 				(WithArguments(entry, _), [layout]):
 					match (layout.variants, layout.representation):
-						([Some(Concrete.ListType(Concrete.StringType))], Concrete.InlineOwningPayload): Concrete.function_number(entry) == 0
+						([[Concrete.ListType(Concrete.StringType)]], Concrete.InlineOwningPayload): Concrete.function_number(entry) == 0
 						_: False
 				_: False
 
@@ -304,6 +304,7 @@ private fixed record NestedSeed {
 	ids: InputIds,
 	unions: List[Concrete.ConcreteUnion],
 	variant: Concrete.VariantInstanceId,
+	field: Concrete.VariantFieldInstanceId,
 	lowered: Lower.LoweredFunction
 }
 
@@ -321,7 +322,9 @@ private pure func nested_seed() -> Result[NestedSeed, Diagnostic]:
 					match matched.arms:
 						[arm]:
 							match arm.label:
-								Lower.VariantLabel(variant): Ok({ ids = ids, unions = facts.unions, variant = variant, lowered = unbox })
+								Lower.VariantLabel(variant):
+									field ?= Concrete.variant_field(variant, 0, facts.unions, span(0))
+									Ok({ ids = ids, unions = facts.unions, variant = variant, field = field, lowered = unbox })
 								_: Err({ span = span(0), note = None, message = "expected Box variant", help = "fix phase identity seed" })
 						_: Err({ span = span(0), note = None, message = "expected one Box arm", help = "fix phase identity seed" })
 				_: Err({ span = span(0), note = None, message = "expected Box match", help = "fix phase identity seed" })
@@ -353,12 +356,12 @@ private pure func nested_projection(seed: NestedSeed, acquire: Bool) -> Own.Owne
 	ids = seed.ids
 	union_type = Concrete.UnionType(Concrete.variant_owner(seed.variant))
 	parameter = definition(ids, union_type)
-	child: Own.OwnershipOperation = Own.DefineValue({ id = ids.second, value_type = Concrete.ListType(Concrete.StringType), operation = Own.PayloadDefinition(seed.variant, ids.first), result = Own.BorrowedResult(Own.PayloadBorrow(ids.first)), span = span(20) })
+	child: Own.OwnershipOperation = Own.DefineValue({ id = ids.second, value_type = Concrete.ListType(Concrete.StringType), operation = Own.PayloadDefinition(seed.field, ids.first), result = Own.BorrowedResult(Own.PayloadBorrow(ids.first)), span = span(20) })
 	operations = if acquire:
 		[child, Own.AcquireOwner(Own.owner_id(0), { value = ids.second, source = Own.PayloadBorrow(ids.first) }, span(20))]
 	else:
 		[child]
-	matched: Own.OwnedMatch = { scrutinee = ids.first, owner = Concrete.variant_owner(seed.variant), arms = [{ label = Lower.VariantLabel(seed.variant), operations = operations, exit = Own.ReturnResult(Own.OwnedReturn(ids.second, Own.owner_id(0))) }] }
+	matched: Own.OwnedMatch = { scrutinee = Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) }), owner = Concrete.variant_owner(seed.variant), arms = [{ label = Lower.VariantLabel(seed.variant), operations = operations, exit = Own.ReturnResult(Own.OwnedReturn(ids.second, Own.owner_id(0))) }] }
 	{ execution = OrdinaryCalls, signature = { parameters = [union_type], return_type = Concrete.ListType(Concrete.StringType) }, operations = [parameter], tail = Own.MatchTail(matched) }
 
 
@@ -387,7 +390,7 @@ pure func test_inline_list_union_acquisition_and_drop_emit_root_dispatch() -> Bo
 			cleanup: Own.OwnedFunction = { execution = OrdinaryCalls, signature = { parameters = [union_type], return_type = Concrete.IntType }, operations = [definition(ids, union_type), Own.AcquireOwner(Own.owner_id(0), borrow, span(20)), Own.DropOwner(Own.owner_id(0), span(30)), Own.DefineValue({ id = ids.second, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(40) })], tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.second))) }
 			program: Own.OwnershipProgram = { records = [], unions = seed.unions, functions = [zero(ids), cleanup], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }
 			match verify(program).and_then(emit):
-				Ok(output): output.contains("blorp_string_list_retain(value.payload.blorp_up_0)") and output.contains("blorp_string_list_release(value.payload.blorp_up_0)") and output.contains("blorp_union_dup_0(blorp_vl_0)") and output.contains("blorp_union_drop_0(blorp_owner_0)")
+				Ok(output): output.contains("blorp_string_list_retain(value.payload.blorp_up_0.blorp_uf_0)") and output.contains("blorp_string_list_release(value.payload.blorp_up_0.blorp_uf_0)") and output.contains("blorp_union_dup_0(blorp_vl_0)") and output.contains("blorp_union_drop_0(blorp_owner_0)")
 				Err(_): False
 
 
@@ -416,8 +419,8 @@ pure func test_option_list_cleanup_dispatches_present_and_empty_cases() -> Bool:
 	match result:
 		Ok(output):
 			(
-				output.contains("void blorp_union_dup_0(struct blorp_u_0 value){switch(value.tag){case blorp_v_0_0:blorp_string_list_retain(value.payload.blorp_up_0);break;case blorp_v_0_1:break;}}")
-				and output.contains("void blorp_union_drop_0(struct blorp_u_0 value){switch(value.tag){case blorp_v_0_0:blorp_string_list_release(value.payload.blorp_up_0);break;case blorp_v_0_1:break;}}")
+				output.contains("void blorp_union_dup_0(struct blorp_u_0 value){switch(value.tag){case blorp_v_0_0:blorp_string_list_retain(value.payload.blorp_up_0.blorp_uf_0);break;case blorp_v_0_1:break;}}")
+				and output.contains("void blorp_union_drop_0(struct blorp_u_0 value){switch(value.tag){case blorp_v_0_0:blorp_string_list_release(value.payload.blorp_up_0.blorp_uf_0);break;case blorp_v_0_1:break;}}")
 				and output.contains("blorp_union_dup_0(blorp_vl_0)")
 				and output.contains("blorp_union_drop_0(blorp_owner_0)")
 				and output.contains("blorp_union_drop_0(blorp_owner_1)")
@@ -439,7 +442,7 @@ pure func test_verifier_rejects_unsupported_list_union_child() -> Bool:
 	match nested_seed():
 		Err(_): False
 		Ok(seed):
-			layout: Concrete.ConcreteUnion = { variants = [Some(Concrete.ListType(Concrete.IntType))], representation = Concrete.InlineOwningPayload }
+			layout: Concrete.ConcreteUnion = { variants = [[Concrete.ListType(Concrete.IntType)]], representation = Concrete.InlineOwningPayload }
 			match verify({ records = [], unions = [layout], functions = [zero(seed.ids)], entrypoint = NoArguments(seed.ids.entrypoint, IntegerExitStatus) }):
 				Err(error): error.message == "ownership verification failed: union payload must reference a supported, earlier layout"
 				Ok(_): False

@@ -1,0 +1,98 @@
+import:
+	cost: CostLimits
+	harness: run_output_example, run_source_example, verify_rejected_command, with_directory
+	system: file_exists, read_file, write_file
+	test: TestSuite
+
+
+private FIELD_LIMITS: CostLimits = {
+	allocations = 140000,
+	instructions = 500000000
+}
+private FIXTURES: String = "blorp_2/test/e2e/fixtures/union/multiple/"
+
+
+private func verify_diagnostic(
+	compiler: String,
+	directory: String,
+	fixture: String,
+	location: String,
+	message: String,
+	help: String,
+	previous: Option[String],
+) -> Result[Void, String]:
+	input = FIXTURES + fixture + ".brp"
+	output = directory + "/rejected.c"
+	prior = match previous:
+		None: ""
+		Some(location): input + ":" + location + ": note: previous declaration or import here\n"
+	expected = input + ":" + location + ": error: " + message + "\nhelp: " + help + "\n" + prior
+	rejected ?= verify_rejected_command(compiler, input, output, expected)
+	unpublished ?= if file_exists(output):
+		Err("invalid multiple union fields published C output")
+	else:
+		Ok(void)
+	sentinel ?= write_file(output, "preserve multiple union field output")
+	rejected_existing ?= verify_rejected_command(compiler, input, output, expected)
+	actual ?= read_file(output)
+	if actual == "preserve multiple union field output":
+		Ok(void)
+	else:
+		Err("invalid multiple union fields overwrote existing C output")
+
+
+pure func suite(compiler: String) -> TestSuite:
+	{
+		description = "Multiple union fields",
+		tests = [
+			("one mortal String stored twice survives field-zero escape", func(): run_source_example(
+				compiler, FIXTURES + "pair_duplicate_escape.brp", 2, FIELD_LIMITS,
+			)),
+			("distinct second child escapes after field-zero wildcard", func(): run_output_example(
+				compiler, FIXTURES + "distinct_second_escape.brp", "42\n", FIELD_LIMITS,
+			)),
+			("mixed Int Float String and Void fields keep their positions", func(): run_output_example(
+				compiler, FIXTURES + "mixed_positions.brp", "7\n2.5\n42\n", FIELD_LIMITS,
+			)),
+			("ignored field still evaluates once in written order", func(): run_output_example(
+				compiler, FIXTURES + "written_argument_effects.brp", "left\nright\n42\n", FIELD_LIMITS,
+			)),
+			("generic instances swap managed and unmanaged field positions", func(): run_output_example(
+				compiler, FIXTURES + "generic_swapped.brp", "42\n42\n", FIELD_LIMITS,
+			)),
+			("whole binding and both acquired children survive reassignment", func(): run_output_example(
+				compiler, FIXTURES + "alias_whole_reassignment.brp", "7\n42\n7\n42\n9\n3\n", FIELD_LIMITS,
+			)),
+			("equal-layout phantom records preserve distinct stored values", func(): run_output_example(
+				compiler, FIXTURES + "phantom_instances.brp", "7\n42\n", FIELD_LIMITS,
+			)),
+			("constructor arity rejects without publishing C", func(): with_directory(
+				func(directory: String): verify_diagnostic(
+					compiler, directory, "reject_constructor_arity", "4:5",
+					"constructor field count does not match its declaration",
+					"expected 2 fields, got 1; pass one expression per declared field", None,
+				),
+			)),
+			("duplicate capture rejects at second name with first-site note", func(): with_directory(
+				func(directory: String): verify_diagnostic(
+					compiler, directory, "reject_duplicate_capture", "5:20",
+					"duplicate binding in constructor pattern",
+					"give each captured field a distinct name, or ignore it with '_'", Some("5:14"),
+				),
+			)),
+			("unused type growth hidden in constructor child rejects", func(): with_directory(
+				func(directory: String): verify_diagnostic(
+					compiler, directory, "growth_hidden_in_constructor_child", "9:15",
+					"recursive calls grow type arguments without bound",
+					"pass recursive type arguments unchanged, permute them, or reset them to concrete types", None,
+				),
+			)),
+			("non-tail self call hidden in constructor child rejects", func(): with_directory(
+				func(directory: String): verify_diagnostic(
+					compiler, directory, "nontail_self_hidden_in_constructor_child", "7:15",
+					"recursive call is not in tail position",
+					"return this call directly, or remove @tail_recursive", None,
+				),
+			)),
+		]
+	}

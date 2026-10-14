@@ -88,7 +88,7 @@ private pure func constructor_transfers_child(function: Own.OwnedFunction) -> Bo
 	match function.operations:
 		[Own.DefineValue(parameter), Own.AcquireOwner(child, borrow, _), Own.DefineValue(box)]:
 			match box.operation:
-				Own.ConstructDefinition(_, Own.OwnedPayload(value, transferred)):
+				Own.ConstructDefinition(_, [Own.OwnedPayload(value, transferred)]):
 					match box.result:
 						Own.OwnedResult(parent):
 							match function.tail:
@@ -164,44 +164,36 @@ func test_constant_source_has_the_same_child_transfer() -> Bool:
 			program.functions.any(constructor_transfers_child)
 
 
-private pure func fresh_transfers_final_owner(function: Own.OwnedFunction) -> Bool:
+private pure func fresh_acquires_child_before_dropping_original(function: Own.OwnedFunction) -> Bool:
 	match function.operations:
-		[Own.DefineValue(_), Own.DefineValue(text), Own.DefineValue(box)]:
-			match box.operation:
-				Own.ConstructDefinition(_, Own.OwnedPayload(value, child)):
-					match function.tail:
-						Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(result, parent))):
-							(
-								same_value(value, text.id)
-								and same_value(result, box.id)
-								and IntOps.equals(
-									Own.owner_number(child),
-									0,
-								)
-								and IntOps.equals(
-									Own.owner_number(parent),
-									1,
-								)
-								and owns(text.result, 0)
-								and owns(box.result, 1)
-							)
-						_:
-							False
-				_:
-					False
-		_:
-			False
+		[Own.DefineValue(_), Own.DefineValue(text), Own.AcquireOwner(acquired, borrow, _), Own.DefineValue(box), Own.DropOwner(original, _)]:
+			match (box.operation, borrow.source, function.tail):
+				(Own.ConstructDefinition(_, [Own.OwnedPayload(value, child)]), Own.OwnerBorrow(backing), Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(result, parent)))):
+					(
+						same_value(value, text.id)
+						and same_value(borrow.value, text.id)
+						and same_value(result, box.id)
+						and same_owner(child, acquired)
+						and same_owner(backing, original)
+						and Own.owner_number(original) == 0
+						and Own.owner_number(child) == 1
+						and Own.owner_number(parent) == 2
+						and owns(text.result, 0)
+						and owns(box.result, 2)
+					)
+				_: False
+		_: False
 
 
-func test_final_constructor_use_transfers_without_acquire_or_child_drop() -> Bool:
-	contains_function(FRESH_INPUTS, fresh_transfers_final_owner)
+func test_final_constructor_use_acquires_child_and_drops_original() -> Bool:
+	contains_function(FRESH_INPUTS, fresh_acquires_child_before_dropping_original)
 
 
 private pure func fresh_function(function: Lower.LoweredFunction) -> Bool:
 	match function.definitions:
 		[_, _, constructed]:
 			match constructed.operation:
-				Lower.ConstructValue(_, _):
+				Lower.ConstructValue(_, [_]):
 					True
 				_:
 					False
@@ -255,7 +247,7 @@ private pure func later_use_acquires(function: Own.OwnedFunction) -> Bool:
 	match function.operations:
 		[Own.DefineValue(_), Own.DefineValue(text), Own.AcquireOwner(child, borrow, _), Own.DefineValue(box), Own.DefineValue(length), Own.DropOwner(original, _)]:
 			match box.operation:
-				Own.ConstructDefinition(_, Own.OwnedPayload(value, transferred)):
+				Own.ConstructDefinition(_, [Own.OwnedPayload(value, transferred)]):
 					match borrow.source:
 						Own.OwnerBorrow(source):
 							(
@@ -325,6 +317,18 @@ func test_last_uses_keep_constructor_and_later_child_use_distinct() -> Bool:
 							False
 
 
+private pure func parameter_scrutinee(argument: Own.OwnedArgument, expected: Lower.ValueId) -> Bool:
+	match argument:
+		Own.BorrowedArgument(borrow):
+			match borrow.source:
+				Own.ParameterBorrow(source):
+					same_value(borrow.value, expected) and same_value(source, expected)
+				_:
+					False
+		_:
+			False
+
+
 private pure func projection_borrows_immediate_parent(function: Own.OwnedFunction) -> Bool:
 	match function.operations:
 		[Own.DefineValue(parameter)]:
@@ -340,7 +344,7 @@ private pure func projection_borrows_immediate_parent(function: Own.OwnedFunctio
 												Own.PayloadBorrow(acquired_parent):
 													(
 														same_value(parent, parameter.id)
-														and same_value(parent, matched.scrutinee)
+														and parameter_scrutinee(matched.scrutinee, parent)
 														and same_value(acquired_parent, parent)
 														and same_value(borrow.value, payload.id)
 														and IntOps.equals(
@@ -433,7 +437,7 @@ private pure func unmanaged_payload_owns(function: Own.OwnedFunction) -> Bool:
 	match function.operations:
 		[Own.DefineValue(parameter), Own.DefineValue(value)]:
 			match value.operation:
-				Own.ConstructDefinition(_, Own.UnmanagedPayload(child)):
+				Own.ConstructDefinition(_, [Own.UnmanagedPayload(child)]):
 					(
 						same_value(child, parameter.id)
 						and owns(value.result, 0)
@@ -557,7 +561,7 @@ func test_inline_owning_intermediate_is_rejected_at_its_definition() -> Bool:
 	loop_rejects(source, False)
 
 
-func test_owned_prefix_keeps_the_existing_match_rejection() -> Bool:
+func test_owned_prefix_drops_after_return_acquisition() -> Bool:
 	source: String =
 		|import:
 		|	int: Int
@@ -592,17 +596,28 @@ func test_owned_prefix_keeps_the_existing_match_rejection() -> Bool:
 				match function.definitions:
 					[_, _, text]:
 						match Own.insert_function(function, contents.unions, contents.records):
-							Err(error):
-								(
-									error.message == "owned managed values before a tail match are not supported yet"
-									and error.help == (
-										"create managed values inside the selected match arm or a separate straight-line "
-										+ "function"
-									)
-									and same_span(error.span, text.span)
-									and error.note.is_none()
-								)
-							Ok(_):
+							Ok(owned):
+								match owned.tail:
+									Own.MatchTail(matched):
+										match matched.arms:
+											[arm]:
+												match (arm.operations, arm.exit):
+													([Own.DefineValue(child), Own.AcquireOwner(acquired, borrow, _), Own.DropOwner(prefix, at)], Own.ReturnResult(Own.OwnedReturn(returned, transfer))):
+														(
+															same_value(child.id, returned)
+															and same_value(borrow.value, returned)
+															and Own.owner_number(acquired) == 1
+															and Own.owner_number(transfer) == 1
+															and Own.owner_number(prefix) == 0
+															and same_span(at, text.span)
+														)
+													_:
+														False
+											_:
+												False
+									_:
+										False
+							Err(_):
 								False
 					_:
 						False
@@ -681,25 +696,26 @@ func test_unused_aggregate_drops_its_owner_after_the_call_argument_owner() -> Bo
 	)
 
 
-private pure func unused_constructor_drops_only_parent(function: Own.OwnedFunction) -> Bool:
+private pure func unused_constructor_retires_original_and_parent(function: Own.OwnedFunction) -> Bool:
 	match (function.operations, function.tail):
-		([Own.DefineValue(_), Own.DefineValue(text), Own.DefineValue(box), Own.DropOwner(parent, _), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(returned)))):
+		([Own.DefineValue(_), Own.DefineValue(text), Own.AcquireOwner(child, borrow, _), Own.DefineValue(box), Own.DropOwner(original, _), Own.DropOwner(parent, _), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(returned)))):
 			match box.operation:
-				Own.ConstructDefinition(_, Own.OwnedPayload(value, transferred)):
-					same_value(value, text.id) and owns(text.result, 0) and IntOps.equals(
-						Own.owner_number(transferred),
-						0,
-					) and owns(box.result, 1) and IntOps.equals(
-						Own.owner_number(parent),
-						1,
-					) and same_value(returned, result.id)
-				_:
-					False
-		_:
-			False
+				Own.ConstructDefinition(_, [Own.OwnedPayload(value, transferred)]):
+					(
+						same_value(value, text.id)
+						and same_value(borrow.value, text.id)
+						and owns(text.result, 0)
+						and Own.owner_number(original) == 0
+						and Own.owner_number(child) == 1
+						and same_owner(child, transferred)
+						and owns(box.result, 2)
+						and Own.owner_number(parent) == 2
+						and same_value(returned, result.id)
+					)
+				_: False
+		_: False
 
-
-func test_unused_constructor_drops_only_its_new_parent_obligation() -> Bool:
+func test_unused_constructor_retires_original_and_parent_obligations() -> Bool:
 	match lowered_modules(FRESH_INPUTS):
 		Err(_):
 			False
@@ -722,7 +738,7 @@ func test_unused_constructor_drops_only_its_new_parent_obligation() -> Bool:
 
 							match Own.insert_function(unused, contents.unions, contents.records):
 								Ok(owned):
-									unused_constructor_drops_only_parent(owned)
+									unused_constructor_retires_original_and_parent(owned)
 								Err(_):
 									False
 						_:
@@ -743,8 +759,8 @@ tests: TestSuite = {
 			test_constant_source_has_the_same_child_transfer,
 		),
 		(
-			"final constructor use transfers without acquire or child drop",
-			test_final_constructor_use_transfers_without_acquire_or_child_drop,
+			"final constructor use acquires child and drops original",
+			test_final_constructor_use_acquires_child_and_drops_original,
 		),
 		(
 			"later child use acquires a separate obligation",
@@ -779,8 +795,8 @@ tests: TestSuite = {
 			test_inline_owning_intermediate_is_rejected_at_its_definition,
 		),
 		(
-			"owned match prefix preserves existing rejection",
-			test_owned_prefix_keeps_the_existing_match_rejection,
+			"owned match prefix drops after return acquisition",
+			test_owned_prefix_drops_after_return_acquisition,
 		),
 		(
 			"aggregate identity acquires independent returned owner",
@@ -791,8 +807,8 @@ tests: TestSuite = {
 			test_unused_aggregate_drops_its_owner_after_the_call_argument_owner,
 		),
 		(
-			"unused constructor drops only its new parent obligation",
-			test_unused_constructor_drops_only_its_new_parent_obligation,
+			"unused constructor retires original and parent obligations",
+			test_unused_constructor_retires_original_and_parent_obligations,
 		),
 	]
 }

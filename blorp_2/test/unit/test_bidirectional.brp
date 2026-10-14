@@ -1,9 +1,9 @@
 import:
+	../../src/check_model as Model
 	../../src/declarations as Declaration
 	../../src/source: module_source, root_module_id
 	../../src/check: CheckedProgram, check, checked_functions
 	../../src/check_errors as Errors
-	../../src/check_model as Checked
 	../../src/lex: lex
 	../../src/syntax: Diagnostic
 	../../src/text: concat
@@ -101,16 +101,16 @@ pure func test_binding_and_scrutinee_synthesize_the_same_nominal_type() -> Bool:
 					match inspect.bindings:
 						[local, _]:
 							match inspect.body:
-								Checked.CheckedMatchBody(body):
+								Model.CheckedMatchBody(body):
 									match body.scrutinee.base:
-										Checked.ReturnBinding(binding):
+										Model.ReturnBinding(binding):
 											(
-												Checked.binding_number(binding) == 0
-												and Checked.same_type(
+												Model.binding_number(binding) == 0
+												and Model.same_type(
 													local.value_type,
 													choose.signature.return_type.value_type,
 												)
-												and Checked.same_type(
+												and Model.same_type(
 													body.union_type,
 													local.value_type,
 												)
@@ -182,56 +182,33 @@ pure func test_concrete_receiver_provides_constructor_type() -> Bool:
 pure func test_generic_return_context_keeps_rigid_payload_identity() -> Bool:
 	source: String =
 		|fixed union Box[T]:
-		|	Box(T)
+		|    Box(T)
 		|pure func box[T](value: T) -> Box[T]:
-		|	Box(value)
+		|    Box(value)
 		|func main() -> Int:
-		|	0
-
-	match checked_source(source.concat("\n")):
-		Err(_):
-			False
+		|    0
+		|
+	match checked_source(source):
 		Ok(program):
 			match checked_functions(program).functions:
 				[box, _]:
-					match box.signature.type_parameters:
-						[parameter]:
-							match box.body:
-								Checked.CheckedValueBody(Checked.ReturnExpression(value)):
-									match value.base_type:
-										Checked.ParameterType(payload_parameter):
-											match value.operations:
-												[step]:
-													match step.operation:
-														Checked.ConstructVariant(variant):
-															(
-																Checked.same_parameter(
-																	parameter,
-																	payload_parameter,
-																)
-																and Declaration.union_number(
-																	Declaration.variant_owner(
-																		variant,
-																	),
-																) == 0
-																and Checked.same_type(
-																	step.value_type,
-																	box.signature.return_type.value_type,
-																)
-															)
-														_:
-															False
-												_:
-													False
-										_:
-											False
-								_:
-									False
-						_:
-							False
-				_:
-					False
-
+					match (box.body, box.signature.type_parameters):
+						(Model.CheckedValueBody(Model.ReturnExpression(value)), [parameter]):
+							match value.base:
+								Model.ReturnConstructedVariant(variant, [payload]):
+									match payload.base_type:
+										Model.ParameterType(payload_parameter):
+											(
+												Model.same_parameter(parameter, payload_parameter)
+												and Declaration.union_number(Declaration.variant_owner(variant)) == 0
+												and Model.same_type(value.base_type, box.signature.return_type.value_type)
+												and value.operations.is_empty()
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+		Err(_): False
 
 pure func test_synthesized_binding_does_not_inherit_return_context() -> Bool:
 	choose_source: String =
@@ -266,20 +243,14 @@ pure func test_synthesized_scrutinee_does_not_inherit_return_context() -> Bool:
 	)
 
 
-pure func test_generic_receiver_does_not_supply_constructor_context() -> Bool:
+pure func test_unique_generic_receiver_receives_return_context() -> Bool:
 	keep_source: String =
 		|pure func keep[T](value: T) -> T:
-		|	value
+		|    value
 		|pure func choose() -> Choice:
-	rejects_at(CHOICE.concat(
-		keep_source + "\n\t",
-	), "Number", "(7).keep()\n".concat(MAIN), pure func(kind):
-		match kind:
-			Errors.ConstructorRejection(Errors.ConstructorNeedsExpectedType(_)):
-				True
-			_:
-				False
-	)
+		|    Number(7).keep()
+		|
+	checked_source(CHOICE + keep_source + MAIN).is_ok()
 
 
 pure func test_unused_generic_return_is_checked_rigidly() -> Bool:
@@ -288,18 +259,18 @@ pure func test_unused_generic_return_is_checked_rigidly() -> Bool:
 		match kind:
 			Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
 				match mismatch.expected:
-					Checked.ParameterType(parameter):
-						match Checked.parameter_owner(parameter):
-							Checked.FunctionDeclaration(owner):
+					Model.ParameterType(parameter):
+						match Model.parameter_owner(parameter):
+							Model.FunctionDeclaration(owner):
 								match mismatch.expected_site:
 									Errors.SourceAnnotation(annotation):
 										(
 											Declaration.function_number(owner) == 0
 											and annotation.start == 32
 											and annotation.end == 33
-											and Checked.same_type(
+											and Model.same_type(
 												mismatch.actual.value_type,
-												Checked.IntType,
+												Model.IntType,
 											)
 											and mismatch.actual.span.start == prefix.length()
 										)
@@ -397,8 +368,8 @@ pure func test_checked_arm_mismatch_keeps_expression_and_annotation_spans() -> B
 				match mismatch.expected_site:
 					Errors.SourceAnnotation(annotation):
 						(
-							Checked.same_type(mismatch.expected, Checked.IntType)
-							and Checked.same_type(mismatch.actual.value_type, Checked.StringType)
+							Model.same_type(mismatch.expected, Model.IntType)
+							and Model.same_type(mismatch.actual.value_type, Model.StringType)
 							and mismatch.actual.span.start == prefix.length()
 							and mismatch.actual.span.end == IntOps.add(
 								prefix.length(),
@@ -432,15 +403,15 @@ pure func test_checked_reassignment_keeps_binding_owner_and_occurrences() -> Boo
 				match mismatch.expected_site:
 					Errors.InferredBindingDeclaration(binding):
 						(
-							Checked.same_type(mismatch.expected, Checked.IntType)
-							and Checked.same_type(mismatch.actual.value_type, Checked.StringType)
+							Model.same_type(mismatch.expected, Model.IntType)
+							and Model.same_type(mismatch.actual.value_type, Model.StringType)
 							and mismatch.actual.span.start == prefix.length()
 							and mismatch.actual.span.end == IntOps.add(
 								prefix.length(),
 								body.length(),
 							)
 							and Declaration.function_number(binding.function) == 1
-							and Checked.binding_number(binding.binding) == 0
+							and Model.binding_number(binding.binding) == 0
 							and binding.span.start == INT_IMPORT.length() + 54
 							and binding.span.end == INT_IMPORT.length() + 61
 						)
@@ -490,8 +461,8 @@ tests: TestSuite = {
 			test_synthesized_scrutinee_does_not_inherit_return_context,
 		),
 		(
-			"generic receiver has no constructor context",
-			test_generic_receiver_does_not_supply_constructor_context,
+			"unique generic receiver receives return context",
+			test_unique_generic_receiver_receives_return_context,
 		),
 		("unused generic return remains rigid", test_unused_generic_return_is_checked_rigidly),
 		(

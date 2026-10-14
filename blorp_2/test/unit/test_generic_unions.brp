@@ -1,8 +1,8 @@
 import:
+	../../src/check_model as Model
 	../../src/source: module_source, root_module_id
 	../../src/check: CheckedProgram, check, checked_functions
 	../../src/check_errors as Errors
-	../../src/check_model as Checked
 	../../src/lex: lex
 	../../src/specialize as Concrete
 	../../src/syntax: Diagnostic
@@ -58,25 +58,25 @@ pure func test_applied_type_equality_preserves_the_complete_argument_and_owner()
 			match checked_functions(program).functions:
 				[first, second, _]:
 					match first.signature.return_type.value_type:
-						Checked.UnionType(first):
+						Model.UnionType(first):
 							match second.signature.return_type.value_type:
-								Checked.UnionType(second):
-									integer = Checked.AppliedUnionType(first, [Checked.IntType])
-									text = Checked.AppliedUnionType(first, [Checked.StringType])
+								Model.UnionType(second):
+									integer = Model.AppliedUnionType(first, [Model.IntType])
+									text = Model.AppliedUnionType(first, [Model.StringType])
 									(
-										Checked.same_type(integer, integer)
-										and not Checked.same_type(integer, text)
-										and not Checked.same_type(
+										Model.same_type(integer, integer)
+										and not Model.same_type(integer, text)
+										and not Model.same_type(
 											integer,
-											Checked.UnionType(first),
+											Model.UnionType(first),
 										)
-										and not Checked.same_type(
+										and not Model.same_type(
 											integer,
-											Checked.AppliedUnionType(second, [Checked.IntType]),
+											Model.AppliedUnionType(second, [Model.IntType]),
 										)
-										and not Checked.same_type(
-											Checked.AppliedUnionType(first, [integer]),
-											Checked.AppliedUnionType(first, [text]),
+										and not Model.same_type(
+											Model.AppliedUnionType(first, [integer]),
+											Model.AppliedUnionType(first, [text]),
 										)
 									)
 								_:
@@ -159,7 +159,7 @@ pure func test_constructor_missing_rigid_payload_has_type_correct_help() -> Bool
 		kind: Errors.CheckErrorKind,
 	) -> Bool:
 		match kind:
-			Errors.ConstructorRejection(Errors.ConstructorPayloadArity(_, _)) | Errors.ConstructorRejection(Errors.MissingConstructorPayload(_, _)):
+			Errors.ConstructorRejection(Errors.ConstructorFieldCountMismatch(_, 1, 0)):
 				True
 			_:
 				False
@@ -176,7 +176,7 @@ pure func test_pattern_missing_rigid_payload_has_type_correct_help() -> Bool:
 		kind: Errors.CheckErrorKind,
 	) -> Bool:
 		match kind:
-			Errors.MatchRejection(Errors.PatternMissingField(_, _)):
+			Errors.MatchRejection(Errors.PatternFieldCountMismatch(_, 1, 0)):
 				True
 			_:
 				False
@@ -323,17 +323,17 @@ pure func test_union_parameter_collision_rejects_at_the_parameter_name() -> Bool
 	)
 
 
-pure func test_union_payload_must_be_int_or_its_own_parameter() -> Bool:
-	box_source: String =
-		|fixed union Box[T]:
-		|	Box(
-	rejects(box_source, "String", ")\n" + MAIN, pure func(kind: Errors.CheckErrorKind) -> Bool:
-		match kind:
-			Errors.TypeDeclarationRejection(Errors.UnsupportedPayloadAnnotation(_, Errors.IntegerOrParameterPayload)):
-				True
-			_:
-				False
-	)
+pure func test_generic_union_admits_direct_string_payload() -> Bool:
+	match checked("fixed union Box[T]:\n    Box(String)\n" + MAIN):
+		Ok(program):
+			match checked_functions(program).unions:
+				[box]:
+					match box.variants.map(pure func(variant): variant.fields):
+						[[payload]]:
+							Model.same_type(payload.value_type, Model.StringType)
+						_: False
+				_: False
+		Err(_): False
 
 
 private pure func specialized(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
@@ -342,26 +342,36 @@ private pure func specialized(source: String) -> Result[Concrete.SpecializedCont
 	Ok(Concrete.specialized_contents(program))
 
 
-private pure func rigid_pattern(function: Checked.CheckedFunction) -> Bool:
+private pure func single_capture(captures: List[Option[Model.BindingId]]) -> Option[Model.BindingId]:
+	if captures.length() == 1:
+		captures.get(0).and_then(pure func(capture): capture)
+	else:
+		None
+
+
+private pure func rigid_pattern(function: Model.CheckedFunction) -> Bool:
 	match function.signature.type_parameters:
 		[parameter]:
 			match function.body:
-				Checked.CheckedMatchBody(matched):
+				Model.CheckedMatchBody(matched):
 					match matched.arms:
 						[arm]:
 							match arm.pattern:
-								Checked.VariantCase(_, Checked.BindPayload(id)):
-									match function.bindings:
-										[_, payload]:
-											Checked.binding_number(id) == 1 and Checked.same_type(
-												payload.value_type,
-												Checked.ParameterType(parameter),
-											) and Checked.same_type(
-												function.signature.return_type.value_type,
-												payload.value_type,
-											)
-										_:
-											False
+								Model.VariantCase(_, captures):
+									match single_capture(captures):
+										Some(id):
+											match function.bindings:
+												[_, payload]:
+													Model.binding_number(id) == 1 and Model.same_type(
+														payload.value_type,
+														Model.ParameterType(parameter),
+													) and Model.same_type(
+														function.signature.return_type.value_type,
+														payload.value_type,
+													)
+												_:
+													False
+										None: False
 								_:
 									False
 						_:
@@ -387,14 +397,14 @@ pure func test_pattern_payload_uses_the_function_owned_rigid_parameter() -> Bool
 										[box_parameter]:
 											match unbox.signature.type_parameters:
 												[unbox_parameter]:
-													match Checked.parameter_owner(union_parameter):
-														Checked.UnionDeclaration(_):
+													match Model.parameter_owner(union_parameter):
+														Model.UnionDeclaration(_):
 															(
-																not Checked.same_parameter(
+																not Model.same_parameter(
 																	union_parameter,
 																	box_parameter,
 																)
-																and not Checked.same_parameter(
+																and not Model.same_parameter(
 																	box_parameter,
 																	unbox_parameter,
 																)
@@ -485,9 +495,9 @@ pure func test_phantom_instances_keep_nominal_arguments_and_reuse_direct_ufcs_re
 			match program.unions:
 				[first_union, second_union]:
 					match first_union.variants:
-						[None]:
+						[[]]:
 							match second_union.variants:
-								[None]:
+								[[]]:
 									match program.functions:
 										[main, integer, first_identity, text, second_identity]:
 											match main.statements:
@@ -551,91 +561,43 @@ pure func test_phantom_instances_keep_nominal_arguments_and_reuse_direct_ufcs_re
 pure func test_box_instance_translates_constructor_pattern_and_binding_types() -> Bool:
 	source: String =
 		|pure func identity[T](value: T) -> T:
-		|	value
+		|    value
 		|func main() -> Int:
-		|	unbox(identity(box(7)))
+		|    unbox(identity(box(7)))
 		|
-
 	match specialized(BOX + source):
 		Ok(program):
-			match program.unions:
-				[declaration]:
-					match declaration.variants:
-						[Some(Concrete.IntType)]:
-							match program.functions:
-								[_, box, identity, unbox]:
-									match box.body:
-										Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
-											match value.operations:
-												[step]:
-													match step.operation:
-														Concrete.ConstructVariant(id):
-															match unbox.body:
-																Concrete.ConcreteMatchBody(matched):
-																	match matched.arms:
-																		[arm]:
-																			match arm.pattern:
-																				Concrete.VariantCase(pattern, Concrete.BindPayload(binding)):
-																					match unbox.bindings:
-																						[_, payload]:
-																							(
-																								Concrete.union_number(
-																									Concrete.variant_owner(
-																										id,
-																									),
-																								) == 0
-																								and Concrete.union_number(
-																									matched.owner,
-																								) == 0
-																								and Concrete.union_number(
-																									Concrete.variant_owner(
-																										pattern,
-																									),
-																								) == 0
-																								and Concrete.variant_number(
-																									pattern,
-																								) == Concrete.variant_number(
-																									id,
-																								)
-																								and Checked.binding_number(
-																									binding,
-																								) == 1
-																								and Concrete.same_type(
-																									payload.value_type,
-																									Concrete.IntType,
-																								)
-																								and Concrete.same_type(
-																									unbox.signature.return_type,
-																									Concrete.IntType,
-																								)
-																								and Concrete.same_type(
-																									identity.signature.return_type,
-																									box.signature.return_type,
-																								)
-																							)
-																						_:
-																							False
-																				_:
-																					False
-																		_:
-																			False
-																_:
-																	False
-														_:
-															False
-												_:
-													False
-										_:
-											False
-								_:
-									False
-						_:
-							False
-				_:
-					False
-		_:
-			False
-
+			match (program.unions, program.functions):
+				([declaration], [_, box, identity, unbox]):
+					layout = match declaration.variants:
+						[[Concrete.IntType]]: True
+						_: False
+					match (box.body, unbox.body):
+						(Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)), Concrete.ConcreteMatchBody(matched)):
+							match (value.base, matched.arms, unbox.bindings):
+								(Concrete.ReturnConstructedVariant(id, [child]), [arm], [_, payload]):
+									match arm.pattern:
+										Concrete.VariantCase(pattern, captures):
+											match single_capture(captures):
+												Some(binding):
+													(
+														layout
+														and Concrete.union_number(Concrete.variant_owner(id)) == 0
+														and Concrete.union_number(matched.owner) == 0
+														and Concrete.union_number(Concrete.variant_owner(pattern)) == 0
+														and Concrete.variant_number(pattern) == Concrete.variant_number(id)
+														and Model.binding_number(binding) == 1
+														and Concrete.same_type(child.base_type, Concrete.IntType)
+														and Concrete.same_type(payload.value_type, Concrete.IntType)
+														and Concrete.same_type(unbox.signature.return_type, Concrete.IntType)
+														and Concrete.same_type(identity.signature.return_type, box.signature.return_type)
+													)
+												None: False
+										_: False
+								_: False
+						_: False
+				_: False
+		Err(_): False
 
 tests: TestSuite = {
 	description = "Blorp 2 generic unions",
@@ -702,8 +664,8 @@ tests: TestSuite = {
 			test_union_parameter_collision_rejects_at_the_parameter_name,
 		),
 		(
-			"union payload must be int or its own parameter",
-			test_union_payload_must_be_int_or_its_own_parameter,
+			"generic union admits direct String payload",
+			test_generic_union_admits_direct_string_payload,
 		),
 		(
 			"box and unbox specialize from the argument",

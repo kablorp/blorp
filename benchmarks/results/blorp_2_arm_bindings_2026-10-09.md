@@ -168,7 +168,7 @@ discarded call in this subset.
 
 The agreed next order is value identity versus ownership obligations, borrow
 dependencies, then independent verification, integrated through small executable
-examples with granular phase tests. The [memory plan](../../blorp_2/MEMORY_PLAN.md)
+examples with granular phase tests. The [historical memory plan](https://github.com/kablorp/blorp/blob/79deebd455856e5955d215ff2ec36f17860feb14/blorp_2/MEMORY_PLAN.md)
 records that order and forbids unchecked managed emission or speculative
 frameworks. Each future managed increment must exercise mortal storage and its
 runtime destruction contract.

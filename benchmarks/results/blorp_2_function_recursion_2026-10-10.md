@@ -2,7 +2,7 @@
 
 The first recursion increment is implemented and independently reviewed: self
 and mutual function calls, including finite generic instantiations. Recursive
-heap data remains the next increment in the [recursion plan](../../blorp_2/RECURSION_PLAN.md).
+heap data remains the next increment in the [historical recursion plan](https://github.com/kablorp/blorp/blob/79deebd455856e5955d215ff2ec36f17860feb14/blorp_2/RECURSION_PLAN.md).
 That plan maps decisions to primary Rust, Lean, OCaml and Perceus sources and
 separates established techniques from pilot-specific restrictions.
 

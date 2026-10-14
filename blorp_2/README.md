@@ -10,10 +10,9 @@ type/method visibility and a shared base/prelude for the temporary target
 library. Its syntax and layout are implemented in this pilot.
 
 Current language examples and limits are below; [grammar.ebnf](grammar.ebnf)
-owns the formal syntax. The [memory architecture and test matrix](MEMORY_PLAN.md)
-owns ownership contracts and required validation. Unfinished work remains in the
-[generics plan](GENERICS_PLAN.md), [recursion plan](RECURSION_PLAN.md), and
-[managed-record proposal](MANAGED_RECORDS_PLAN.md).
+owns the formal syntax. The [roadmap](ROADMAP.md) owns planned increments,
+immutable-fact and ownership contracts, and required validation. It consolidates
+the earlier memory, aggregate, generics and recursion plans.
 
 Completed increment plans and handoffs are retained in Git; validation reports
 remain under [benchmarks/results](../benchmarks/results/). Historical research
@@ -249,9 +248,13 @@ owner to the caller. The caller borrows the result for length and then drops
 its owner. Arm-local bindings, aliases and reassignment follow the same value
 rules as straight-line code; [the cleanup companion](test/e2e/fixtures/match/string_cleanup.brp)
 returns its original alias after replacing a local and dropping unused Strings.
-Borrowed managed parameters are admitted before the match. Prefix definitions
-must introduce no owned obligation; an unused owned prefix still rejects.
-Owned outer dependencies, nested/non-tail matches and joins are deferred.
+Borrowed managed parameters and locally owned values are admitted before an
+ordinary terminating tail match. Each selected arm either transfers a returned
+prefix owner or drops it after securing the result. Prefix roots and acquired
+projections remain alive through the selected arm; sibling arms share no local
+obligations. The [owned-prefix examples](test/e2e/test_owned_prefix.brp) cover
+aliases, reassignment, projected payloads and selected-arm effects.
+Nested/non-tail matches and joins are deferred.
 
 From the repository root:
 
@@ -466,7 +469,7 @@ Written annotations admit nested ordered arguments, such as `Box[Box[Int]]`
 or `Result[Box[Int], Int]`. The [nested example](test/e2e/fixtures/generic/nested/written.brp)
 declares `double_box[T](value: T) -> Box[Box[T]]` and extracts the result
 through ordinary `unbox` calls; its real `main` exits 7. Concrete payloads may
-be `Int`, `String`, an existing inline record, or another finite inline union. Specialization
+be Int, Float, String, Void, List[String], a finite record, or another finite inline union. Specialization
 publishes complete payload types and defines child layouts before parents.
 Constructors and projections carry the selected variant identity through
 lowering, ownership and independent verification. Heterogeneous variants use
@@ -475,10 +478,30 @@ own only their active variant's children. Their generated dup/drop helpers visit
 that child path; the union root has no heap allocation or reference count.
 Nullary and unmanaged active variants keep the same aggregate obligation while
 performing no child ownership work. Finite nesting composes through child-first
-helpers; recursive layouts and managed record fields remain unsupported.
+helpers and managed record roots; recursive layouts remain unsupported.
 A phantom `Marker[String]` with no parameter payload remains valid, as does
 `Tagged[String]` whose field is explicitly Int. Equal layouts retain distinct
 nominal instance identities.
+
+Union field annotations use the same type syntax as parameters and
+record fields. `Text(String)`, `Floating(Float)`, `Wrapped(Box[String])` and
+`Items(List[String])` name one complete payload type. The annotation resolves
+in the union declaration's module and type-parameter scope. Nested arguments
+retain nominal identity and declaration-owned parameters. All declared aggregate
+types must be finite, including unused unions.
+
+A nullary variant is bare `Empty`. `Unit(Void)` is unary and is constructed as
+`Unit(void)`; it remains distinct from an empty variant. `Variant()` is invalid,
+and `Variant(Int, String)` declares two ordered fields. `Variant(Pair[Int, String])` names one payload and is valid. Lists retain
+the existing String-only concrete element restriction.
+
+Constructors evaluate each field expression once in written order. Patterns
+write one distinct binder or `_` for each position, such as `Pair(left, _)`.
+Each managed stored occurrence acquires an independent obligation, including
+`Pair(text, text)`; an escaped managed child remains live after its parent retires.
+Nonempty variants use inline C field structs, while nullary variants have no
+payload member. Lists, nested patterns and recursive aggregate types retain
+their existing restrictions.
 
 The [managed payload example](test/e2e/fixtures/generic/managed/basic.brp) runs
 `unbox(box(42.to_string())).length()` and exits 2. Its tail match borrows the
@@ -518,7 +541,7 @@ fixture has limits of 10,000 allocations and 100,000,000 instructions. Calls
 use the C stack; automatic tail-call optimization and constant-stack recursion are not
 part of this increment. Recursive data remains a separate ownership increment;
 cyclic runtime data is forbidden.
-The [recursion plan](RECURSION_PLAN.md) defines the independently validated
+The [recursive-data roadmap](ROADMAP.md#recursive-data) defines the independently validated
 increments and the ownership requirements for later recursive data.
 An explicit `@tail_recursive` function has a checked direct-self loop guarantee:
 
@@ -560,7 +583,7 @@ ordinary stack behavior. The annotation does not bound heap use or prove
 termination. Unannotated C output is preserved. The
 [tail-recursion report](../benchmarks/results/blorp_2_tail_recursion_2026-10-10.md)
 records phase invariants, malformed-IR tests and the native stack-exhaustion
-mutation oracle. The [recursion plan](RECURSION_PLAN.md#tail-recursion-follow-ups)
+mutation oracle. The [tail-loop roadmap](ROADMAP.md#tail-recursion-follow-ups)
 retains the unfinished generic and managed loop requirements.
 
 The [numeric accumulator](test/e2e/fixtures/tail_recursion/accumulator.brp)
@@ -600,8 +623,9 @@ It exits 2. Parameter identity includes its declaring function or union and
 position; call substitutions and specialization keys retain every argument in
 declaration order. Repeated concrete instances are reused, while changing even
 an unused later parameter creates a distinct instance. Substitution preserves
-caller-owned rigid types during forwarding. A known result type does not infer
-missing parameters. Fixed unions also support ordered declaration parameters,
+caller-owned rigid types during forwarding. A declared expected result can solve
+parameters represented in the result; unrelated phantom parameters remain
+ambiguous. Fixed unions also support ordered declaration parameters,
 as in `Result[T, E]`.
 
 
@@ -657,14 +681,75 @@ no child work, while Err dup/drop visits its String. Written applications and
 finite String-bearing payloads may nest.
 
 
+## Finite mixed records
+
+Fixed records can contain any currently supported finite concrete type, including
+Float, String, Void, List[String], other records and instantiated unions:
+
+```blorp
+fixed record Entry { count: Int, ratio: Float, text: String }
+pure func make_entry() -> Entry:
+    { count = 7, ratio = 2.5, text = 42.to_string() }
+pure func escaped_text(value: Entry) -> String:
+    value.text
+func main() -> Int:
+    escaped_text(make_entry()).length()
+```
+
+The [mixed fixture](test/e2e/fixtures/record/mixed.brp) exits 2. The returned
+String has its own owner before the temporary Entry is destroyed. A repeated
+child stored in two fields contributes two independent ownership obligations.
+Parameters borrow; managed results return owned. Field expressions execute once
+in written order, independently of declaration order.
+
+Fixed records whose fields are Int, Float or recursively eligible inline fixed
+records stay inline. Other fixed records use an ARC root, including a record
+whose Void or unmanaged-union fields need no child cleanup. Root retention
+changes only the root count. Final root release destroys every owned stored
+occurrence; inline owning union fields drop their active payload paths.
+Acquired managed projections remain valid after their parent is destroyed.
+
+Whole-variable reassignment preserves old aliases. Empty record
+declarations, recursive data, field assignment and record-update syntax remain
+unsupported. Recursive declaration references reject before layout expansion.
+The [roadmap](ROADMAP.md#first-increment-mixed-finite-records) tracks final
+integrated acceptance and later aggregate extensions.
+
+## Generic records
+
+```blorp
+fixed record Box[T] { value: T }
+pure func box[T](value: T) -> Box[T]:
+    { value = value }
+pure func unbox[T](value: Box[T]) -> T:
+    value.value
+func main() -> Int:
+    unbox(box(7))
+```
+
+The example exits 7. Generic bodies are checked once with declaration-owned rigid
+parameters. Specialization preserves the record declaration and every ordered
+concrete argument, including phantom arguments. Box[Int] and Box[Float] are
+inline; Box[String] and Box[Void] are managed roots under the existing field
+policy. Void fields have no child ownership obligation. A projected managed
+child remains valid after its parent dies.
+
+A receiving Box[T] annotation establishes the literal's nominal owner even while
+T is unresolved: `inspect[T](value: Box[T])` can accept `{ value = 7 }` and infer
+Int from the field. Nested record fields and uniquely resolved UFCS contracts use
+the same rule. An unannotated literal or `identity[T](value: T)` alone supplies no
+record owner. Fields are checked and evaluated in written order. Recursive
+record layouts and recursively growing generic call substitutions reject before
+specialization expands them. Record-owned List[T] fields retain the current
+concrete List[String] limit.
+
 ## Grammar for this increment
 
 This specification defines only the examples' language: functions with an optional
 return annotation (omission means `Void`), an ordered list of explicitly typed parameters, an optional ordered list of type
-parameters on functions and fixed unions, plus nongeneric fixed records with
-one or more `Int` fields. Union variants have zero fields or
-one field annotated `Int` or one of the union's own parameters; concrete fields
-specialize to Int, Float, String, Void, an existing inline record, or another finite inline union. A function
+parameters on functions, fixed unions and fixed records with
+one or more finite fields after substitution. Union variants have zero or more ordered fields using ordinary type annotations; concrete fields
+specialize to Int, Float, String, Void, List[String], a finite record, or another finite inline union. A function
 body has zero or more ordered binding or Void expression statements followed
 by a final expression or a tail match with inline arm results or statement blocks. Expressions
 start with `void`, a signed Int64 or decimal Float64 literal, a quoted UTF-8 String literal, a binding or variant name, a record literal,
@@ -727,38 +812,45 @@ Lexical and layout rules:
   `pure func second[A, B](first: A, second: B) -> B:`. Each name starts with a
   capital ASCII letter and contains only ASCII letters and digits. Names must
   be distinct within a declaration. Explicit function type arguments at calls
-  are unsupported; argument types determine the type parameters.
+  are unsupported; argument types and known expected results constrain the type
+  parameters.
 - `fixed union Type:` introduces one or more variants on indented
   lines. `fixed` and `union` are contextual header words and remain valid names
-  elsewhere. A variant is bare or has one type-name annotation, as in
-  `Number(Int)` or `Box(T)`. A union may declare ordered parameters with
-  `fixed union Result[T, E]:`; payload annotations are `Int` or one of its own parameters.
-  Function parameter and return annotations accept a nonempty list of recursive type arguments,
-  such as `Box[Box[Int]]` or `Result[T, Box[E]]`. Empty declaration parentheses and multiple fields
-  are unsupported. Payload annotations remain `Int` or the union's own parameter;
-  instantiated payloads may also be Float, String, Void, finite inline unions or existing inline records.
+  elsewhere. A variant is bare or declares an ordered list of field types, as in
+  `Number(Int)`, `Box(T)` or `Pair(String, String)`. A union may declare ordered
+  parameters with `fixed union Result[T, E]:`. Every field annotation uses ordinary
+  type syntax in the union declaration's module and parameter scope, including
+  recursive type arguments such as `Box[Box[Int]]` or `Result[T, Box[E]]`.
+  Empty declaration parentheses remain unsupported. Concrete field layouts may
+  contain Int, Float, String, Void, List[String], finite inline unions or records.
 - `fixed record Pair { first: Int, second: Int }` declares a nominal record
-  on one line. Field names must be distinct and every field must be `Int`.
-  `record` remains a contextual header word. Generic, empty, recursive and
-  managed record types are outside this increment.
-- `{ second = 9, first = 7 }` constructs the concrete record required by a
-  helper return type, concrete parameter or existing binding reassignment.
+  on one line. Field names must be distinct and have supported finite concrete
+  types after specialization. `fixed record Box[T] { value: T }` declares ordered
+  type parameters; their identity belongs to this record. `record` remains a
+  contextual header word. Empty and recursive records remain unsupported. Representation follows the
+  inline-versus-managed field policy described above.
+- `{ second = 9, first = 7 }` constructs the nominal record required by a
+  helper return type, receiving parameter or existing binding reassignment.
   Every field appears exactly once. Expressions evaluate in written order;
   field order in the literal may differ from declaration order. A new inferred
   binding alone supplies no record context. `{}` parses and reports the first
   missing field. Declarations and literals stay on one line; trailing commas,
   updates and field assignments are unsupported.
 - `pair.first` reads a declared field; `pair.read_first()` remains a UFCS call.
-  An immediate nongeneric UFCS receiver parameter may supply literal context.
-  A field read or generic call supplies none, and later operations never infer
-  a literal's type through an earlier field read. Records pass and return by
+  A uniquely resolved immediate UFCS receiver parameter may supply a nominal
+  literal context, including a head with unresolved generic arguments.
+  Literal fields constrain those arguments on the same expression-local inference
+  state. A field read supplies
+  none, and later operations never infer a literal's type through an earlier
+  field read. Earlier generic sibling evidence alone does not choose a record
+  literal's owner. Records pass and return by
   value, including through existing generic functions whose arguments infer
   a concrete record. Copies and whole-binding reassignment preserve old aliases.
 - `match expression:` starts a nonempty sequence of depth-two arms written
   `Pattern: expression` or `Pattern:` followed by a depth-three block of
   ordered binding or Void expression statements and a mandatory final expression. A pattern is a bare name,
   `_`, or a constructor name
-  followed by parentheses containing zero or one field pattern. A field
+  followed by parentheses containing zero or more comma-separated field patterns. A field
   pattern is a binder or `_`; literal and nested field patterns are unsupported.
   A nullary constructor pattern may be written `Empty` or `Empty()`. `Number()`
   is valid syntax but fails semantic arity checking for a one-field constructor.
@@ -774,7 +866,8 @@ Lexical and layout rules:
   and has value zero. Leading zeros (`00`, `-01`), plus signs, separated minus
   signs and arithmetic operators are rejected. The lexer preserves the whole
   digit run; the parser validates spelling and range before converting it.
-  A dot starts UFCS: `42.identity()` is a call, while `42.5` is invalid.
+  A dot followed by a function name starts UFCS: `42.identity()` is a call;
+  `42.5` is a Float literal.
   Non-ASCII bytes outside quoted Strings and CRLF source line endings are rejected.
 - Every token must be consumed. Malformed declarations and statements are errors.
 
@@ -783,10 +876,10 @@ Semantic rules:
 - Exactly one root function must be named `main`. It takes no parameters or one
   `List[String]` parameter, and returns `Int` or `Void`. The argument list includes the
   executable name at index zero. A helper
-  takes zero or more explicitly typed parameters with distinct names. Helper parameter and return types
-  are `Int`, the signed 64-bit integer type, `String`, or a fixed union declared in this
-  file, including an application of a generic union, or the function's declared
-  rigid parameter. An omitted return annotation means `Void`. Pure functions
+  takes zero or more explicitly typed parameters with distinct names. Helper
+  annotations use the supported scalar, finite record/union, List[String] or
+  declaration-owned generic types described above. An omitted return annotation
+  means `Void`. Pure functions
   cannot return `Void`, including concrete generic instances.
 - Union types have nominal identity. Equal variant positions or shared variant
   spellings do not make two unions interchangeable. Union type names must be
@@ -804,8 +897,8 @@ Semantic rules:
   type, or the containing function's return type when there is no enclosing call.
   Variants in different unions may share a spelling; expected type chooses the
   owner. `First()` is invalid because a payload-free constructor is a value;
-  `Number(expression)` supplies its one payload field, whose complete type is
-  established by the receiving union instance.
+  `Number(expression)` supplies its one field; `Pair(left, right)` supplies two.
+  Each complete field type is established by the receiving union instance.
   A name cannot refer to another function's parameter or denote a function value.
   A local binding shadows a same-named constructor or direct call; its established type
   is preserved, with no fallback to a constructor when that type is wrong.
@@ -878,30 +971,35 @@ Semantic rules:
   concrete Int/String runtime operation. Parameters cannot share a name with
   `Int`, `String`, or any declared union; separate declarations may reuse `T`.
   `main` and functions with closed builtin bodies cannot declare type parameters.
-  Direct and UFCS calls infer each type parameter consistently from synthesized
-  argument types in source order. A later argument can determine a parameter
-  when earlier annotations do not constrain it. Repeated occurrences, including structural `Box[T]`
-  occurrences, must agree.
+  Direct and UFCS calls solve private call variables structurally, processing
+  argument constraints before a declared expected result. Later sibling evidence
+  can solve an earlier pending call. Repeated occurrences, including structural
+  `Box[T]` occurrences, must agree; infinitely nested type equations are rejected.
   Generic forwarding preserves the caller's rigid parameter until specialization.
-  Expected return types never infer a generic substitution: `identity(First)`
-  and `identity(Number(7))` reject even in a union-returning body. Pass an
-  already-typed union value or call a concrete helper instead. Each explicit argument with a concrete annotation contextualizes constructors,
-  including in a generic function. A generic UFCS receiver receives no such
-  hint even when its first annotation is concrete. This existing distinction
-  remains until contextual inference is implemented. Phantom parameters
-  and zero-argument generic calls diagnose uninferable parameters; no default
-  type is chosen. A parameter in a union argument, as in `unbox(Box[T])`,
-  is inferred structurally from the complete synthesized argument type.
+  Expected results can contextualize nested calls and constructors. A known
+  nominal union head also supplies constructor context while its arguments are
+  still being solved: `inspect[T](value: Choice[T])` accepts `inspect(Value(7))`.
+  Uniquely resolved UFCS contracts supply the same reverse hints. Variant spelling
+  alone never chooses a union; overloads remain receiver-directed and are not
+  ranked by expected returns or later arguments. Field reads never choose a
+  record owner. New bindings and match scrutinees receive no containing-function
+  return context; discarded Void tails impose no result constraint.
+  A zero-argument call can infer parameters represented in an expected result.
+  Any remaining phantom or unconstrained parameter diagnoses ambiguity, with no
+  default type. Every accepted call publishes complete ordered substitutions;
+  private variables and tentative facts never escape checking.
   Union instances are keyed by declaration and all ordered concrete arguments; repeated
   direct/UFCS requests reuse the same instance. Layout admission accepts finite
-  String-bearing inline unions before lowering. Recursive declaration forms and
-  managed record fields remain unsupported.
+  owning inline unions and managed records before lowering. Recursive declaration
+  forms remain unsupported.
 - Each concrete function has its checked C return type and a generated symbol based
   on its compilation-local identity. `Int` uses `int64_t`; each union uses its own
   synthetic enum when all its variants are nullary. A payload-bearing union
   uses a distinct struct with an enum tag and a C union containing a correctly
-  typed member for each payload-bearing variant. Nullary construction supplies
-  only its tag; omitted storage is zero-initialized. A separate C wrapper calls
+  typed field struct for every nonempty variant, including unary variants.
+  Nullary variants have no member and create no empty C struct. Construction
+  supplies its tag and ordered fields; omitted storage is zero-initialized.
+  A separate C wrapper calls
   the checked entrypoint and converts an `Int` result to the process exit status,
   or discards a `Void` result and exits 0. Checking publishes both the argument
   convention and result convention as typed entrypoint facts; later phases
@@ -919,12 +1017,11 @@ Semantic rules:
   String-bearing unions store their root inline and own their active children.
   A tail-match arm may create, borrow, alias and return arm-local managed values;
   unused and intermediate owners are dropped on that arm, and a managed result
-  transfers its owner. Borrowed managed parameters are admitted before a match;
-  its prefix must introduce no owned obligation, even one already dropped.
-  Literal construction creates a fresh ordinary String owner. Owned outer
-  dependencies, COW and joins are deferred.
-- Parenthesized expressions,
-  multiple payload fields, managed record fields, recursive layouts, nested matches,
+  transfers its owner. Borrowed managed parameters and locally owned prefixes
+  are admitted before an ordinary terminating match. Each selected arm discharges
+  prefix obligations after securing its result. Literal construction creates a
+  fresh ordinary String owner. COW, joins and managed annotated loops are deferred.
+- Parenthesized expressions, recursive layouts, nested matches,
   guards, qualified/nested/literal patterns, constructor UFCS, multiline chains,
   non-tail matches, and function
   values are outside this increment. `Bool` is an ordinary fixed union declared
@@ -1094,8 +1191,8 @@ purity error. Import it explicitly with the configured target-library root;
 it is not automatically available from the prelude.
 
 `Void` has one value, `void`, and requires no ownership. Helpers may take and
-return it; locals and generic union payloads may contain it. Existing Int-only
-record fields and direct union payload rules remain. Internally C uses a
+return it; locals, record fields and ordinary union fields may contain it.
+Internally C uses a
 canonical zero `uint8_t` carrier for all Void values; this does not add another
 surface numeric type.
 
@@ -1128,10 +1225,10 @@ is rejected; pure main must return Int. The
 impure Int entrypoints and explicit and omitted Void entrypoints, with and
 without arguments, through their ordinary native main functions.
 
-Managed prefixes before a tail match and managed temporaries in annotated tail
-loops retain their existing restrictions. Printing a literal before a tail
-match therefore remains rejected; printing inside its selected arm works. A
-Void-only helper call introduces no managed prefix.
+Managed prefixes, including printing a literal before an ordinary terminating
+tail match, are supported. Managed temporaries in annotated tail loops retain
+their existing restrictions. A Void-only helper call introduces no managed
+prefix.
 
 One ordered statement list carries evaluation order through parsing, checking
 and specialization. Discards create no synthetic binding; lowering retains
@@ -1272,8 +1369,7 @@ The native model is binary64 with subnormals, ordinary arithmetic without fast
 math or contraction, C startup locale and nearest/ties-even rounding. Generated code
 checks representation requirements; target programs cannot change locale or
 rounding in this subset. Float remains unmanaged in parameters, locals and
-generic union payloads. Direct union payload annotations and fixed-record
-fields retain their existing Int-only restriction.
+ordinary union fields and fixed-record fields.
 
 The [calculator component tests](test/unit/test_option_contracts.brp),
 [input ownership tests](test/unit/test_option_ownership.brp),
@@ -1318,8 +1414,8 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
 3. A frozen namespace maps each module's visible function names to original
    declaration IDs. Selective imports do not reexport imported names, and an
    imported function retains its defining scope. Checking resolves nominal union and owned variant identities, then publishes
-   one authoritative signature per function. A private resolution context holds
-   the aligned declarations and signatures. Target resolution returns a complete
+   one authoritative signature per function. A private resolution context borrows
+   accepted declarations, signatures and namespace facts. Target resolution returns a complete
    call and signature after one lookup. Call boundaries prove complete arity once,
    check purity afterward, and publish transient contracts with every ordered
    parameter type and the result type. Checking infers one consistent substitution
@@ -1338,7 +1434,7 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    publishes an opaque program with its entrypoint identity. Call notation is erased
    after target resolution. A user call carries its checked substitution in its
    target variant; a runtime call cannot carry one. Rigid type parameters have
-   explicit function-declaration or union-declaration owners.
+   explicit function-, union- or record-declaration owners.
    Checking returns either the complete `CheckedProgram` or an opaque
    `CheckFailure` retaining the original parsed program and a nonempty
    `CheckErrors` collection. The current checker stops at the first error, so
@@ -1351,15 +1447,25 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    rendered collection. Semantic unit tests inspect typed facts directly;
    renderer and pipeline tests pin wording independently. UFCS receiver mismatch
    occurrences retain the existing call-span limitation. Expression synthesis
-   owns one shared traversal with optional constructor-only context. New bindings
+   owns one private expression-local work loop with structural constraints. New bindings
    and match scrutinees synthesize their types; non-Void returns, non-Void arms
    and reassignment explicitly check a known type and its source. Void function
    tails synthesize and then discard their values before returning canonical
    void. Argument checking elaborates all
    children before instantiation and mismatch validation, preserving error order.
-   Complete outer receiver contracts are resolved before their children. Generic
-   argument inference remains one-way; contextual inference and structural
-   unification are later work.
+   Complete outer receiver contracts are resolved before their children. Private
+   call variables unify argument-first, then use the declared expected result;
+   caller-owned parameters stay rigid. Closed nested errors are checked before
+   later siblings. Deferred descendants finish child-first after solving; a later
+   fatal name error can precede their unresolved ambiguity. Publication freezes
+   complete calls and discards the temporary solver.
+   [check.brp](src/check.brp) only composes these checks and seals their result;
+   [check_model.brp](src/check_model.brp) owns published semantic data,
+   [check_errors.brp](src/check_errors.brp) owns typed rejections, and
+   [check_values.brp](src/check_values.brp) privately owns expression inference.
+   Accepted record fields and variants retain their declaration identities and
+   written names alongside complete field annotations, so later checking does
+   not rejoin parsed declarations to recover those facts.
 4. Pure specialization starts from the accepted `main` identity and expands
    its complete call graph through the existing instance worklist. Checking
    still validates every declaration, including unreachable functions. Only
@@ -1371,13 +1477,17 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    without checking bodies or resolving names again, then seals a
    `SpecializedProgram`. Concrete types cannot contain type parameters; concrete
    function, union and variant identities have separate instance domains.
-   Parsed payload annotations, parsed pattern fields and checked payloads use
-   `Option` directly. An absent pattern field stays distinct from an explicit
-   wildcard or named binding. Optional diagnostics retain their typed note and
-   exact declaration span. Concrete union layouts use `Option[TypeRef]` for
-   each variant; inline child layouts precede their parents. Projections retain
-   the selected variant identity through lowering and ownership so independent
-   verification checks the exact member and emission uses its typed C storage.
+   Parsed variant annotations and constructor patterns retain ordered field
+   vectors. Each checked variant publishes one `List[TypeUse]`; each checked
+   pattern retains every position as an optional `BindingId`, with `None` for a
+   wildcard. A zero-field vector remains distinct from a wildcard position.
+   Concrete union layouts publish one `List[TypeRef]` per variant; inline child
+   layouts precede their parents. Construction carries the concrete variant
+   owner and positional child values. Standalone projections retain a validated
+   `VariantFieldInstanceId`, pairing the complete variant instance with its field
+   ordinal through lowering and ownership. Independent verification checks the
+   exact receiver, selected variant and field type; emission uses that identity's
+   C storage. Optional diagnostics retain their typed note and declaration span.
 
    Checked signatures retain one `TypeUse` per annotation, preserving its span.
    Concrete signatures belong to their separate immutable phase. Union instance
@@ -1390,16 +1500,20 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    its current value. An alias uses the same value; reassignment updates that
    map after evaluating the right-hand side. Every computed value retains its
    type and source span. Match-arm computations remain in their branches.
-   Every arm starts with the enclosing binding map, lowers its capture and
-   statement sequence, and publishes a branch-local value block. Sibling arms
+   Every arm starts with the enclosing binding map, lowers each named capture
+   at its declared field ordinal and then its statement sequence, and publishes
+   a branch-local value block. Sibling arms
    share only the function's value allocator, preserving distinct identities.
 6. Ownership insertion classifies each concrete value as having no ownership,
-   being a managed String leaf, or containing owned inline union fields.
+   being a managed String leaf, List[String] or record root, or containing owned
+   inline union fields.
    It publishes ordered definitions, owner acquisitions, drops and return
    transfers. `OwnerId` names one obligation;
    `ValueId` still names the computed value. Borrowed operands name the owner
    they depend on, the exact borrowed parameter value identity, or the immediate
-   parent value of a projected payload. Last-use cleanup keeps an argument alive
+   parent value of a projected field. Every managed stored occurrence acquires
+   a fresh child obligation, even when two slots contain the same value; construction
+   transfers those obligations sequentially. Last-use cleanup keeps an argument alive
    until a call has established its result owner. Tail-match
    arms publish the same ownership operations and typed return transfers as a
    straight-line block. Value and owner identities remain function-wide; sibling
@@ -1409,8 +1523,11 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    undisposed obligations. Raw ownership IR does not preserve checking's sealed
    match proof, so verification independently requires nonempty, exhaustive,
    useful arms with valid unique variants and at most one final default.
-   It also enforces the zero-argument Int entry ABI, rejects managed match
-   prefixes and checks each arm's owner discharge/transfer independently.
+   It also enforces the accepted entry argument/result conventions, rejects
+   invalid prefix/arm owner identities and checks each arm's prefix and local
+   owner discharge/transfer independently. Payload reads validate the actual
+   scrutinee backing, including unmanaged payloads whose read still needs a
+   live parent.
    Only it can seal a
    `VerifiedProgram`; it neither repairs ownership nor uses insertion's
    liveness decisions as its oracle.
@@ -1516,13 +1633,15 @@ end-to-end cost. Self-compilation is a later milestone.
 
 ## Bootstrap direction and process
 
-[MEMORY_PLAN.md](MEMORY_PLAN.md) records the managed String slice and proposed
-later memory responsibilities, including the limits of current verification.
-Fixed records support unmanaged `Int` fields, construction and field reads. The
+The [roadmap](ROADMAP.md) records upcoming language and memory responsibilities,
+including the limits of current verification and required per-phase tests.
+Fixed records support finite mixed fields, construction and field reads. The
 [Pair example](test/e2e/fixtures/record/basic.brp) returns 7 with empty streams;
 the generated record is a C struct passed by value without heap allocation or
-reference counting. The [managed-record proposal](MANAGED_RECORDS_PLAN.md)
-describes a separate next increment and is not implemented or authorized here.
+reference counting. The [aggregate composition roadmap](ROADMAP.md#status-and-order)
+tracks accepted mixed/generic records and plans general collections and recursive
+data. Those later increments are not implemented here; correctness comes before
+memory optimization.
 
 Compiler source under `src/` stays within the agreed eventual subset: `String`, `Int`
 (64-bit), `Float` (64-bit), `Bool`, `Void`, `List`, `Option`, `Result`, `Dict`,

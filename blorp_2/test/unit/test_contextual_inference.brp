@@ -1,0 +1,932 @@
+import:
+	../../src/check_errors as Errors
+	../../src/check_model as Model
+	../../src/check as API
+	../../src/declarations as Declaration
+	../../src/lex: lex
+	../../src/source: module_source, root_module_id
+	../../src/syntax: Diagnostic
+	input: check_failure, parse, setup_diagnostic
+	test: TestSuite
+
+
+private CHOICE: String =
+	|fixed union Choice[T]:
+	|    Empty
+	|    Value(T)
+	|pure func empty[T]() -> Choice[T]:
+	|    Empty
+	|pure func identity[T](value: T) -> T:
+	|    value
+	|
+
+private MAIN: String =
+	|func main() -> Int:
+	|    0
+	|
+
+
+private pure func checked(source: String) -> Result[API.CheckedProgram, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source)
+	parsed ?= parse(tokens)
+	API.check(parsed).map_err(setup_diagnostic)
+
+
+private pure func body_value(function: Model.CheckedFunction) -> Option[Model.CheckedValue]:
+	match function.body:
+		Model.CheckedValueBody(Model.ReturnExpression(value)):
+			Some(value)
+		_:
+			None
+
+
+private pure func one_type_argument(call: Model.CheckedCall, expected: Model.TypeRef) -> Bool:
+	match call.target:
+		Model.UserFunction(_, [actual]):
+			Model.same_type(actual, expected)
+		_:
+			False
+
+
+pure func test_annotated_result_publishes_complete_zero_argument_substitution() -> Bool:
+	source: String =
+		|pure func choose() -> Choice[Int]:
+		|    empty()
+		|
+	match checked(CHOICE + source + MAIN):
+		Ok(program):
+			match API.checked_functions(program).functions.get(2).and_then(body_value):
+				Some(value):
+					match value.base:
+						Model.ReturnCall(call, []):
+							one_type_argument(call, Model.IntType)
+						_:
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
+pure func test_result_context_flows_through_a_nested_generic_call() -> Bool:
+	source: String =
+		|pure func choose() -> Choice[Int]:
+		|    identity(empty())
+		|
+	match checked(CHOICE + source + MAIN):
+		Ok(program):
+			match API.checked_functions(program).functions.get(2):
+				Some(function):
+					match body_value(function):
+						Some(value):
+							match value.base:
+								Model.ReturnCall(outer, [inner]):
+									match inner.base:
+										Model.ReturnCall(call, []):
+											(
+												one_type_argument(outer, function.signature.return_type.value_type)
+												and one_type_argument(call, Model.IntType)
+											)
+										_:
+											False
+								_:
+									False
+						None:
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
+pure func test_concrete_argument_context_solves_a_nested_empty_call() -> Bool:
+	source: String =
+		|pure func inspect(value: Choice[Int]) -> Int:
+		|    7
+		|func main() -> Int:
+		|    inspect(empty())
+		|
+	match checked(CHOICE + source):
+		Ok(program):
+			match API.checked_functions(program).functions.get(3).and_then(body_value):
+				Some(value):
+					match value.base:
+						Model.ReturnCall(_, [inner]):
+							match inner.base:
+								Model.ReturnCall(call, []):
+									one_type_argument(call, Model.IntType)
+								_:
+									False
+						_:
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
+pure func test_later_sibling_evidence_solves_an_earlier_nested_call() -> Bool:
+	source: String =
+		|pure func integer() -> Choice[Int]:
+		|    Value(7)
+		|pure func first[T](left: T, right: T) -> T:
+		|    left
+		|func main() -> Int:
+		|    selected = first(empty(), integer())
+		|    0
+		|
+	match checked(CHOICE + source):
+		Ok(program):
+			match API.checked_functions(program).functions.get(4):
+				Some(function):
+					match function.statements:
+						[Model.InitializeBinding(_, value)]:
+							match value.base:
+								Model.ReturnCall(outer, [inner, _]):
+									match inner.base:
+										Model.ReturnCall(call, []):
+											(
+												one_type_argument(call, Model.IntType)
+												and one_type_argument(outer, value.base_type)
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
+pure func test_generic_result_context_preserves_the_caller_rigid_parameter() -> Bool:
+	source: String =
+		|pure func forward[Element]() -> Choice[Element]:
+		|    empty()
+		|
+	match checked(CHOICE + source + MAIN):
+		Ok(program):
+			match API.checked_functions(program).functions.get(2):
+				Some(function):
+					match (function.signature.type_parameters, body_value(function)):
+						([parameter], Some(value)):
+							match value.base:
+								Model.ReturnCall(call, []):
+									one_type_argument(call, Model.ParameterType(parameter))
+								_:
+									False
+						_:
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
+pure func test_result_context_provides_a_nominal_head_to_a_direct_constructor() -> Bool:
+	source: String =
+		|pure func choose() -> Choice[Int]:
+		|    identity(Value(7))
+		|
+	checked(CHOICE + source + MAIN).is_ok()
+
+
+pure func test_result_context_provides_a_nominal_head_to_a_unique_ufcs_receiver() -> Bool:
+	source: String =
+		|pure func choose() -> Choice[Int]:
+		|    Value(7).identity()
+		|
+	checked(CHOICE + source + MAIN).is_ok()
+
+
+pure func test_uncontextualized_binding_does_not_inherit_function_result() -> Bool:
+	prefix = CHOICE + "func main() -> Int:\n    value = "
+	match check_failure(prefix + "empty()\n    0\n"):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.UninferableTypeParameter(parameter)):
+					match Model.parameter_owner(parameter):
+						Model.FunctionDeclaration(owner):
+							(
+								Declaration.function_number(owner) == 0
+								and Model.parameter_position(parameter) == 0
+								and error.span.start == prefix.length()
+								and error.span.end == prefix.length() + 5
+							)
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_phantom_parameter_stays_uninferred_despite_result_context() -> Bool:
+	declarations: String =
+		|pure func phantom[T]() -> Int:
+		|    7
+		|func main() -> Int:
+	prefix = declarations + "\n    "
+	match check_failure(prefix + "phantom()\n"):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.UninferableTypeParameter(parameter)):
+					(
+						Model.parameter_position(parameter) == 0
+						and error.span.start == prefix.length()
+						and error.span.end == prefix.length() + 7
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_later_child_name_error_precedes_argument_and_result_conflicts() -> Bool:
+	source: String =
+		|pure func first[T](left: T, right: T, last: Int) -> T:
+		|    left
+		|pure func choose() -> Choice[Int]:
+		|    first(7, 8.0,
+	prefix = CHOICE + source + " "
+	match check_failure(prefix + "missing)\n" + MAIN):
+		Some(error):
+			match error.kind:
+				Errors.ValueRejection(Errors.UnknownValue(_)):
+					(
+						error.span.start == prefix.length()
+						and error.span.end == prefix.length() + 7
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_phantom_ambiguity_precedes_an_expected_result_mismatch() -> Bool:
+	declarations: String =
+		|pure func ignore[T](value: Int) -> Int:
+		|    value
+		|pure func text() -> String:
+	prefix = declarations + "\n    "
+	match check_failure(prefix + "ignore(1)\n" + MAIN):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.UninferableTypeParameter(_)):
+					(
+						error.span.start == prefix.length()
+						and error.span.end == prefix.length() + 6
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_discarded_void_tail_supplies_no_result_constraint() -> Bool:
+	prefix = CHOICE + "func main() -> Void:\n    "
+	match check_failure(prefix + "empty()\n"):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.UninferableTypeParameter(_)):
+					(
+						error.span.start == prefix.length()
+						and error.span.end == prefix.length() + 5
+					)
+				_:
+					False
+		None:
+			False
+
+
+private pure func ambiguity_at(source: String, owner: Int, start: Int, end: Int) -> Bool:
+	match check_failure(source):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.UninferableTypeParameter(parameter)):
+					match Model.parameter_owner(parameter):
+						Model.FunctionDeclaration(declaration):
+							Declaration.function_number(declaration) == owner and Model.parameter_position(parameter) == 0 and error.span.start == start and error.span.end == end
+						_: False
+				_: False
+		None: False
+
+
+pure func test_closed_nested_mismatch_precedes_a_later_unknown_child() -> Bool:
+	declarations: String =
+		|pure func take_int(value: Int) -> Int:
+		|    value
+		|pure func outer(left: Int, right: Int) -> Int:
+		|    left
+		|func main() -> Int:
+	prefix = declarations + "\n    outer("
+	match check_failure(prefix + "take_int(\"bad\"), missing)\n"):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+					error.span.start == prefix.length() and error.span.end == prefix.length() + 8 and Model.same_type(mismatch.expected, Model.IntType) and Model.same_type(mismatch.actual.value_type, Model.StringType)
+				_: False
+		None: False
+
+
+pure func test_deferred_nested_mismatch_allows_a_later_unknown_child() -> Bool:
+	declarations: String =
+		|fixed union Other[T]:
+		|    Nothing
+		|pure func create[T]() -> Other[T]:
+		|    Nothing
+		|pure func take_int(value: Int) -> Int:
+		|    value
+		|pure func outer(left: Int, right: Int) -> Int:
+		|    left
+		|func main() -> Int:
+	prefix = declarations + "\n    outer(take_int(create()), "
+	match check_failure(prefix + "missing)\n"):
+		Some(error):
+			match error.kind:
+				Errors.ValueRejection(Errors.UnknownValue(_)): error.span.start == prefix.length() and error.span.end == prefix.length() + 7
+				_: False
+		None: False
+
+
+pure func test_deferred_child_ambiguity_precedes_every_outer_ordinary_mismatch() -> Bool:
+	declarations: String =
+		|fixed union Box[T]:
+		|    Boxed
+		|fixed union Other[T]:
+		|    Nothing
+		|pure func create[T]() -> Other[T]:
+		|    Nothing
+		|pure func inspect(left: Box[Int], right: Int) -> Int:
+		|    7
+		|func main() -> Int:
+	prefix = declarations + "\n    inspect("
+	ambiguity_at(prefix + "create(), \"bad\")\n", 0, prefix.length(), prefix.length() + 6)
+
+
+pure func test_discarded_nested_result_reports_the_child_parameter() -> Bool:
+	declarations: String =
+		|pure func discard[T](value: T) -> Int:
+		|    7
+		|func main() -> Int:
+	prefix = CHOICE + declarations + "\n    discard("
+	ambiguity_at(prefix + "empty())\n", 0, prefix.length(), prefix.length() + 5)
+
+
+pure func test_merged_variable_ambiguity_preserves_the_queried_child_origin() -> Bool:
+	declarations: String =
+		|pure func create[T]() -> T:
+		|    create()
+		|pure func discard[T](value: T) -> Int:
+		|    7
+		|func main() -> Int:
+	prefix = declarations + "\n    discard("
+	ambiguity_at(prefix + "create())\n", 0, prefix.length(), prefix.length() + 6)
+
+
+pure func test_true_nested_phantom_precedes_a_later_unknown_child() -> Bool:
+	declarations: String =
+		|pure func phantom[T]() -> Int:
+		|    7
+		|pure func outer(left: Int, right: Int) -> Int:
+		|    left
+		|func main() -> Int:
+	prefix = declarations + "\n    outer("
+	ambiguity_at(prefix + "phantom(), missing)\n", 0, prefix.length(), prefix.length() + 7)
+
+
+pure func test_partial_nominal_argument_hint_solves_constructor_payload() -> Bool:
+	declarations: String =
+		|pure func inspect[T](value: Choice[T]) -> Int:
+		|    7
+		|func main() -> Int:
+		|    inspect(Value(1))
+		|
+	match checked(CHOICE + declarations):
+		Ok(program):
+			match API.checked_functions(program).functions.get(3).and_then(body_value):
+				Some(value):
+					match value.base:
+						Model.ReturnCall(call, [argument]):
+							match argument.base:
+								Model.ReturnConstructedVariant(_, [child]):
+									one_type_argument(call, Model.IntType) and Model.same_type(child.base_type, Model.IntType)
+								_: False
+						_: False
+				None: False
+		Err(_): False
+
+
+pure func test_partial_nullary_constructor_resolves_owner_before_ambiguity() -> Bool:
+	declarations: String =
+		|pure func inspect[T](value: Choice[T]) -> Int:
+		|    7
+		|func main() -> Int:
+	prefix = CHOICE + declarations + "\n    "
+	ambiguity_at(prefix + "inspect(Empty)\n", 2, prefix.length(), prefix.length() + 7)
+
+
+pure func test_partial_constructor_payload_accepts_a_pending_nested_call() -> Bool:
+	declarations: String =
+		|pure func inspect[T](value: Choice[Choice[T]], evidence: T) -> Int:
+		|    7
+		|func main() -> Int:
+		|    inspect(Value(empty()), 1)
+		|
+	checked(CHOICE + declarations).is_ok()
+
+
+pure func test_no_nominal_hint_never_guesses_a_constructor_owner() -> Bool:
+	prefix = CHOICE + "func main() -> Int:\n    value = identity("
+	match check_failure(prefix + "Value(1))\n    0\n"):
+		Some(error):
+			match error.kind:
+				Errors.ConstructorRejection(Errors.ConstructorNeedsExpectedType(_)): error.span.start == prefix.length() and error.span.end == prefix.length() + 5
+				_: False
+		None: False
+
+
+pure func test_known_constructor_payload_mismatch_precedes_later_unknown() -> Bool:
+	declarations: String =
+		|pure func outer(value: Choice[Int], other: Int) -> Int:
+		|    other
+		|func main() -> Int:
+	prefix = CHOICE + declarations + "\n    outer("
+	match check_failure(prefix + "Value(\"bad\"), missing)\n"):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)): error.span.start == prefix.length() and error.span.end == prefix.length() + 5 and Model.same_type(mismatch.expected, Model.IntType) and Model.same_type(mismatch.actual.value_type, Model.StringType)
+				_: False
+		None: False
+
+
+private pure func occurs_at(source: String, owner: Int, call_start: Int, actual_start: Int, actual_end: Int, annotation_start: Int) -> Bool:
+	match check_failure(source):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.InfiniteTypeArgument(infinite)):
+					parameter_matches = match Model.parameter_owner(infinite.parameter):
+						Model.FunctionDeclaration(declaration): Declaration.function_number(declaration) == owner and Model.parameter_position(infinite.parameter) == 0
+						_: False
+					snapshot_matches = match infinite.recursive_type:
+						Model.AppliedUnionType(box, [Model.ParameterType(parameter)]): Declaration.union_number(box) == 0 and Model.same_parameter(parameter, infinite.parameter)
+						_: False
+					site_matches = match infinite.expected_site:
+						Errors.SourceAnnotation(span): span.start == annotation_start and span.end == annotation_start + 9
+						_: False
+					parameter_matches and snapshot_matches and site_matches and infinite.call_span.start == call_start and infinite.call_span.end == call_start + 8 and error.span.start == actual_start and error.span.end == actual_end
+				_: False
+		None: False
+
+
+private OCCURS_TYPES: String =
+	|fixed union Box[T]:
+	|    Boxed
+	|fixed union Pair[A,B]:
+	|    Paired
+	|
+
+
+pure func test_repeated_nested_create_reports_a_finite_occurs_diagnostic() -> Bool:
+	create: String =
+		|pure func create[T]() -> Pair[T,Box[T]]:
+		|    Paired
+		|pure func repeated[T](value:
+	annotation_prefix = OCCURS_TYPES + create + " "
+	declarations = annotation_prefix + "Pair[T,T])->Int:\n    7\nfunc main()->Int:\n    "
+	source = declarations + "repeated(create())\n"
+	facts = occurs_at(source, 1, declarations.length(), declarations.length() + 9, declarations.length() + 17, annotation_prefix.length())
+	rendered = match checked(source):
+		Err(diagnostic): diagnostic.message == "inferred type would contain itself" and diagnostic.help == "pass a value with a finite type, or use a concrete helper"
+		Ok(_): False
+	facts and rendered
+
+
+pure func test_occurs_origin_is_independent_of_a_different_calls_rank_root() -> Bool:
+	create: String =
+		|pure func seed[T]() -> T:
+		|    seed()
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|pure func pair_from[T](value: T) -> Pair[T,Box[T]]:
+		|    Paired
+		|pure func repeated[T](value:
+	annotation_prefix = OCCURS_TYPES + create + " "
+	declarations = annotation_prefix + "Pair[T,T])->Int:\n    7\nfunc main()->Int:\n    "
+	actual = "pair_from(identity(seed()))"
+	occurs_at(declarations + "repeated(" + actual + ")\n", 3, declarations.length(), declarations.length() + 9, declarations.length() + 9 + actual.length(), annotation_prefix.length())
+
+
+pure func test_unique_ufcs_partial_nominal_receiver_solves_payload() -> Bool:
+	declarations: String =
+		|pure func inspect[T](value: Choice[T]) -> Int:
+		|    7
+		|func main() -> Int:
+		|    Value(1).inspect()
+		|
+	match checked(CHOICE + declarations):
+		Ok(program):
+			match API.checked_functions(program).functions.get(3).and_then(body_value):
+				Some(value):
+					match value.operations.last():
+						Some(step):
+							match step.operation:
+								Model.InvokeFunction(call, []): one_type_argument(call, Model.IntType)
+								_: False
+						None: False
+				None: False
+		Err(_): False
+
+
+pure func test_unique_ufcs_partial_nullary_receiver_retains_ambiguity() -> Bool:
+	declarations: String =
+		|pure func inspect[T](value: Choice[T]) -> Int:
+		|    7
+		|func main() -> Int:
+	prefix = CHOICE + declarations + "\n    Empty."
+	ambiguity_at(prefix + "inspect()\n", 2, prefix.length(), prefix.length() + 7)
+
+
+pure func test_two_independent_pending_calls_keep_distinct_fresh_variables() -> Bool:
+	declarations: String =
+		|pure func inspect[T](value: Choice[T], evidence: T) -> Int:
+		|    7
+		|pure func outer(left: Int, right: Int) -> Int:
+		|    left
+		|func main() -> Int:
+		|    outer(inspect(empty(), 1), inspect(empty(), "text"))
+		|
+	match checked(CHOICE + declarations):
+		Ok(program):
+			match API.checked_functions(program).functions.get(4).and_then(body_value):
+				Some(value):
+					match value.base:
+						Model.ReturnCall(_, [left, right]): independent_inspection(left, Model.IntType) and independent_inspection(right, Model.StringType)
+						_: False
+				None: False
+		Err(_): False
+
+
+private pure func independent_inspection(value: Model.CheckedValue, expected: Model.TypeRef) -> Bool:
+	match value.base:
+		Model.ReturnCall(call, [inner, _]):
+			match inner.base:
+				Model.ReturnCall(nested, []): one_type_argument(call, expected) and one_type_argument(nested, expected)
+				_: False
+		_: False
+
+
+private REPEATED: String =
+	|fixed union Pair[A,B]:
+	|    Paired
+	|pure func repeat[T](value: T) -> Pair[T,T]:
+	|    Paired
+	|
+
+
+pure func test_repeated_result_projection_keeps_a_common_partial_nominal_head() -> Bool:
+	source: String =
+		|pure func take[A,B](value: Pair[Choice[A],Choice[B]], a:A, b:B) -> Int:
+		|    7
+		|func main() -> Int:
+		|    take(repeat(Value(1)), 1, 1)
+		|
+	match checked(CHOICE + REPEATED + source):
+		Ok(program): API.checked_functions(program).functions.get(4).and_then(body_value).map(repeated_result_substitutions).get_or(False)
+		Err(_): False
+
+
+private pure func repeated_result_substitutions(value: Model.CheckedValue) -> Bool:
+	match value.base:
+		Model.ReturnCall(call, [repeated, _, _]):
+			outer = match call.target:
+				Model.UserFunction(owner, [Model.IntType, Model.IntType]): Declaration.function_number(owner) == 3
+				_: False
+			outer and repeated_argument_substitution(repeated)
+		_: False
+
+
+private pure func repeated_argument_substitution(value: Model.CheckedValue) -> Bool:
+	match value.base:
+		Model.ReturnCall(call, [payload]):
+			match (call.target, payload.base, value.base_type):
+				(Model.UserFunction(owner, [argument]), Model.ReturnConstructedVariant(variant, [child]), Model.AppliedUnionType(pair, [first, second])):
+					match payload.base_type:
+						Model.AppliedUnionType(choice, [Model.IntType]):
+							(
+								Declaration.function_number(owner) == 2
+								and Declaration.union_number(pair) == 1
+								and Declaration.union_number(choice) == 0
+								and Declaration.union_number(Declaration.variant_owner(variant)) == 0
+								and Declaration.variant_number(variant) == 1
+								and Model.same_type(child.base_type, Model.IntType)
+								and Model.same_type(argument, payload.base_type)
+								and Model.same_type(first, argument)
+								and Model.same_type(second, argument)
+							)
+						_: False
+				_: False
+		_: False
+
+pure func test_repeated_projection_prefers_known_descendants_over_fresh_variables() -> Bool:
+	source: String =
+		|pure func take[A](value: Pair[Choice[A],Choice[Int]], a:A) -> Int:
+		|    7
+		|func main() -> Int:
+		|    take(repeat(Value(1)), 1)
+		|
+	checked(CHOICE + REPEATED + source).is_ok()
+
+
+pure func test_repeated_projection_preserves_the_source_first_parameter_origin() -> Bool:
+	declarations: String =
+		|pure func take[A,B](value: Pair[Choice[A],Choice[B]]) -> Int:
+		|    7
+		|func main() -> Int:
+	prefix = CHOICE + REPEATED + declarations + "\n    "
+	ambiguity_at(prefix + "take(repeat(Empty))\n", 3, prefix.length(), prefix.length() + 4)
+
+
+pure func test_merged_hint_does_not_mask_a_later_authoritative_sibling_conflict() -> Bool:
+	take_source: String =
+		|pure func take[A,B](value: Pair[Choice[A],Choice[B]], a:A, b:
+	annotation_prefix = CHOICE + REPEATED + take_source + " "
+	declarations = annotation_prefix + "B) -> Int:\n    7\nfunc main() -> Int:\n    take("
+	first = "repeat(Value(1))"
+	prefix = declarations + first + ", 1, "
+	match check_failure(prefix + "\"bad\")\n"):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
+					owner_matches = match Model.parameter_owner(conflict.parameter):
+						Model.FunctionDeclaration(owner): Declaration.function_number(owner) == 3 and Model.parameter_position(conflict.parameter) == 1
+						_: False
+					site_matches = match conflict.mismatch.expected_site:
+						Errors.SourceAnnotation(span): span.start == annotation_prefix.length() and span.end == annotation_prefix.length() + 1
+						_: False
+					owner_matches and site_matches and error.span.start == prefix.length() and error.span.end == prefix.length() + 5 and conflict.previous.span.start == declarations.length() and conflict.previous.span.end == declarations.length() + first.length() and conflict.current.span.start == prefix.length() and conflict.current.span.end == prefix.length() + 5 and Model.same_type(conflict.previous.value_type, Model.IntType) and Model.same_type(conflict.current.value_type, Model.StringType) and Model.same_type(conflict.mismatch.expected, Model.IntType) and conflict.mismatch.argument_position == 2
+				_: False
+		None: False
+
+
+pure func test_repeated_projection_never_guesses_between_different_nominal_heads() -> Bool:
+	declarations: String =
+		|fixed union Other[T]:
+		|    OtherValue(T)
+		|pure func take[A,B](value: Pair[Choice[A],Other[B]], a:A, b:B) -> Int:
+		|    7
+		|func main() -> Int:
+	prefix = CHOICE + REPEATED + declarations + "\n    take(repeat("
+	match check_failure(prefix + "Value(1)), 1, 1)\n"):
+		Some(error):
+			match error.kind:
+				Errors.ConstructorRejection(Errors.ConstructorNeedsExpectedType(_)): error.span.start == prefix.length() and error.span.end == prefix.length() + 5
+				_: False
+		None: False
+
+
+pure func test_deferred_merged_hint_payload_allows_later_unknown_child() -> Bool:
+	declarations: String =
+		|pure func take[A,B](value: Pair[Choice[Choice[A]],Choice[Choice[B]]], a:A, b:B) -> Int:
+		|    7
+		|func main() -> Int:
+	prefix = CHOICE + REPEATED + declarations + "\n    take(repeat(Value(empty())), 1, "
+	match check_failure(prefix + "missing)\n"):
+		Some(error):
+			match error.kind:
+				Errors.ValueRejection(Errors.UnknownValue(_)): error.span.start == prefix.length() and error.span.end == prefix.length() + 7
+				_: False
+		None: False
+
+
+pure func test_merged_hint_normalizes_a_bound_descendant_before_payload_checking() -> Bool:
+	declarations: String =
+		|pure func take[A,B](first:Choice[A], value:Pair[Choice[B],Choice[A]], last:Int)->Int:
+		|    7
+		|func main() -> Int:
+	prefix = CHOICE + REPEATED + declarations + "\n    take(Value(1), repeat("
+	match check_failure(prefix + "Value(\"bad\")), missing)\n"):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)): error.span.start == prefix.length() and error.span.end == prefix.length() + 5 and Model.same_type(mismatch.expected, Model.IntType) and Model.same_type(mismatch.actual.value_type, Model.StringType)
+				_: False
+		None: False
+
+
+pure func test_repeated_projection_keeps_caller_rigid_atoms_exact() -> Bool:
+	source: String =
+		|pure func forward[T](value:T)->Pair[Choice[T],Choice[T]]:
+		|    repeat(Value(value))
+		|
+	checked(CHOICE + REPEATED + source + MAIN).is_ok()
+
+
+
+private REUSE_INSPECT: String =
+	|pure func inspect[T](value:Choice[T], item:T)->T:
+	|    item
+	|
+
+
+pure func test_direct_result_hint_rebuilds_the_substituted_compound() -> Bool:
+	source: String =
+		|func main()->Int:
+		|    inspect(Value(1), 2)
+		|
+	match checked(CHOICE + REUSE_INSPECT + source):
+		Ok(program):
+			match API.checked_functions(program).functions.get(3).and_then(body_value):
+				Some(value):
+					match value.base:
+						Model.ReturnCall(call, [constructor, _]):
+							one_type_argument(call, Model.IntType) and choice_argument_is_int(constructor)
+						_: False
+				None: False
+		Err(_): False
+
+
+pure func test_ufcs_result_hint_rebuilds_the_substituted_receiver_compound() -> Bool:
+	source: String =
+		|func main()->Int:
+		|    Value(1).inspect(2)
+		|
+	match checked(CHOICE + REUSE_INSPECT + source):
+		Ok(program):
+			match API.checked_functions(program).functions.get(3).and_then(body_value):
+				Some(value):
+					match value.operations.last():
+						Some(step):
+							match step.operation:
+								Model.InvokeFunction(call, [_]): one_type_argument(call, Model.IntType) and Model.same_type(step.value_type, Model.IntType)
+								_: False
+						None: False
+				None: False
+		Err(_): False
+
+
+private pure func choice_argument_is_int(value: Model.CheckedValue) -> Bool:
+	value_type = match value.operations.last():
+		Some(step): step.value_type
+		None: value.base_type
+
+	match value_type:
+		Model.AppliedUnionType(owner, [argument]): Declaration.union_number(owner) == 0 and Model.same_type(argument, Model.IntType)
+		_: False
+
+
+pure func test_known_list_context_opens_only_the_mixed_inference_shape() -> Bool:
+	source: String =
+		|pure func list_empty[T]()->Choice[List[T]]:
+		|    Empty
+		|pure func choose()->Choice[List[String]]:
+		|    list_empty()
+		|
+	match checked(CHOICE + source + MAIN):
+		Ok(program):
+			match API.checked_functions(program).functions.get(3).and_then(body_value):
+				Some(value):
+					match value.base:
+						Model.ReturnCall(call, []): one_type_argument(call, Model.StringType)
+						_: False
+				None: False
+		Err(_): False
+
+
+pure func test_closed_nested_results_publish_complete_nominal_ancestry() -> Bool:
+	source: String =
+		|fixed union Box[T]:
+		|    Full(T)
+		|pure func wrap[T](value:T)->Box[T]:
+		|    Full(value)
+		|func main()->Int:
+		|    saved = wrap(wrap(1))
+		|    0
+		|
+	match checked(source):
+		Ok(program):
+			match API.checked_functions(program).functions.get(1):
+				Some(function):
+					match function.statements:
+						[Model.InitializeBinding(_, value)]:
+							match value.base:
+								Model.ReturnCall(outer, [inner]):
+									match inner.base:
+										Model.ReturnCall(call, [_]):
+											match value.base_type:
+												Model.AppliedUnionType(owner, [child]): Declaration.union_number(owner) == 0 and Model.same_type(child, inner.base_type) and one_type_argument(outer, inner.base_type) and one_type_argument(call, Model.IntType)
+												_: False
+										_: False
+								_: False
+						_: False
+				None: False
+		Err(_): False
+
+pure func test_closed_unsupported_list_result_precedes_a_later_unknown_child() -> Bool:
+	declarations: String =
+		|pure func make[T](value: T) -> List[T]:
+		|    make(value)
+		|pure func outer(left: List[String], right: Int) -> Int:
+		|    0
+		|func main() -> Int:
+	prefix = declarations + "\n    outer("
+	source = prefix + "make(1), missing)\n"
+	facts = match check_failure(source):
+		Some(error):
+			match error.kind:
+				Errors.TypeTermRejection(Errors.UnsupportedListElement):
+					error.span.start == prefix.length() and error.span.end == prefix.length() + 4
+				_: False
+		None: False
+	rendered = match checked(source):
+		Err(error):
+			error.message == "List currently supports only String elements" and error.help == "use List[String]; other concrete element types are not supported yet" and error.span.start == prefix.length() and error.span.end == prefix.length() + 4
+		Ok(_): False
+	facts and rendered
+
+
+
+private pure func unsupported_list_at(source: String, start: Int, end: Int) -> Bool:
+	facts = match check_failure(source):
+		Some(error):
+			match error.kind:
+				Errors.TypeTermRejection(Errors.UnsupportedListElement): error.span.start == start and error.span.end == end
+				_: False
+		None: False
+	rendered = match checked(source):
+		Err(error): error.message == "List currently supports only String elements" and error.help == "use List[String]; other concrete element types are not supported yet" and error.span.start == start and error.span.end == end
+		Ok(_): False
+	facts and rendered
+
+
+pure func test_substituted_list_parameter_admission_precedes_an_ordinary_mismatch() -> Bool:
+	prefix = "pure func choose[T](witness:T, values: "
+	suffix: String =
+		|List[T])->Int:
+		|    0
+		|func main()->Int:
+		|    choose(1, "bad")
+		|
+	unsupported_list_at(prefix + suffix, prefix.length(), prefix.length() + 7)
+
+
+pure func test_substituted_list_parameter_admission_precedes_pure_void_result() -> Bool:
+	prefix = "pure func choose[T](witness:T, values: "
+	suffix: String =
+		|List[T])->T:
+		|    witness
+		|func main()->Int:
+		|    choose(void, "bad")
+		|
+	unsupported_list_at(prefix + suffix, prefix.length(), prefix.length() + 7)
+
+tests: TestSuite = {
+	description = "Contextual generic-call inference",
+	tests = [
+		("substituted List admission precedes ordinary mismatch", test_substituted_list_parameter_admission_precedes_an_ordinary_mismatch),
+		("substituted List admission precedes pure Void result", test_substituted_list_parameter_admission_precedes_pure_void_result),
+		("closed unsupported List result precedes later unknown", test_closed_unsupported_list_result_precedes_a_later_unknown_child),
+		("known List context opens mixed structural terms", test_known_list_context_opens_only_the_mixed_inference_shape),
+		("closed nested calls retain complete nominal ancestry", test_closed_nested_results_publish_complete_nominal_ancestry),
+		("direct hint rebuilds substituted accepted compound", test_direct_result_hint_rebuilds_the_substituted_compound),
+		("UFCS hint rebuilds substituted accepted receiver", test_ufcs_result_hint_rebuilds_the_substituted_receiver_compound),
+		("repeated result retains common partial nominal head", test_repeated_result_projection_keeps_a_common_partial_nominal_head),
+		("repeated result prefers concrete descendant guidance", test_repeated_projection_prefers_known_descendants_over_fresh_variables),
+		("repeated projection origin is source-first", test_repeated_projection_preserves_the_source_first_parameter_origin),
+		("merged hint retains exact authoritative sibling conflict", test_merged_hint_does_not_mask_a_later_authoritative_sibling_conflict),
+		("repeated result never guesses incompatible nominal heads", test_repeated_projection_never_guesses_between_different_nominal_heads),
+		("deferred merged payload permits later unknown", test_deferred_merged_hint_payload_allows_later_unknown_child),
+		("merged hint normalizes bound descendant before checking payload", test_merged_hint_normalizes_a_bound_descendant_before_payload_checking),
+		("repeated projection preserves caller rigid atoms", test_repeated_projection_keeps_caller_rigid_atoms_exact),
+
+		("unique UFCS partial nominal head solves payload", test_unique_ufcs_partial_nominal_receiver_solves_payload),
+		("unique UFCS partial nullary receiver retains ambiguity", test_unique_ufcs_partial_nullary_receiver_retains_ambiguity),
+		("independent nested calls use distinct fresh variables", test_two_independent_pending_calls_keep_distinct_fresh_variables),
+		("nested repeated create produces finite occurs diagnostic", test_repeated_nested_create_reports_a_finite_occurs_diagnostic),
+		("occurs origin remains stable after rank-changing merges", test_occurs_origin_is_independent_of_a_different_calls_rank_root),
+		("partial nominal head solves constructor payload", test_partial_nominal_argument_hint_solves_constructor_payload),
+		("partial nullary constructor rejects only remaining ambiguity", test_partial_nullary_constructor_resolves_owner_before_ambiguity),
+		("partial constructor payload accepts pending nested call", test_partial_constructor_payload_accepts_a_pending_nested_call),
+		("no nominal hint never guesses constructor owner", test_no_nominal_hint_never_guesses_a_constructor_owner),
+		("known constructor payload mismatch precedes later unknown", test_known_constructor_payload_mismatch_precedes_later_unknown),
+		("closed nested mismatch precedes later unknown", test_closed_nested_mismatch_precedes_a_later_unknown_child),
+		("deferred nested call permits later unknown", test_deferred_nested_mismatch_allows_a_later_unknown_child),
+		("descendant ambiguity precedes all outer ordinary mismatches", test_deferred_child_ambiguity_precedes_every_outer_ordinary_mismatch),
+		("discard reports nested empty parameter", test_discarded_nested_result_reports_the_child_parameter),
+		("merged ambiguity preserves queried child origin", test_merged_variable_ambiguity_preserves_the_queried_child_origin),
+		("true phantom precedes later unknown", test_true_nested_phantom_precedes_a_later_unknown_child),
+		("phantom ambiguity precedes result mismatch", test_phantom_ambiguity_precedes_an_expected_result_mismatch),
+		("discarded Void tail supplies no result constraint", test_discarded_void_tail_supplies_no_result_constraint),
+		("annotated result completes zero-argument substitution", test_annotated_result_publishes_complete_zero_argument_substitution),
+		("result context flows through nested generic calls", test_result_context_flows_through_a_nested_generic_call),
+		("concrete argument solves nested empty call", test_concrete_argument_context_solves_a_nested_empty_call),
+		("later sibling solves earlier nested call", test_later_sibling_evidence_solves_an_earlier_nested_call),
+		("generic result preserves caller rigid parameter", test_generic_result_context_preserves_the_caller_rigid_parameter),
+		("direct constructor receives nominal result context", test_result_context_provides_a_nominal_head_to_a_direct_constructor),
+		("unique UFCS receiver receives nominal result context", test_result_context_provides_a_nominal_head_to_a_unique_ufcs_receiver),
+		("binding does not inherit function result context", test_uncontextualized_binding_does_not_inherit_function_result),
+		("phantom parameter remains uninferred", test_phantom_parameter_stays_uninferred_despite_result_context),
+		("later child name error retains precedence", test_later_child_name_error_precedes_argument_and_result_conflicts),
+	]
+}

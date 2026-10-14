@@ -6,7 +6,7 @@ Date: 2026-10-09. Reviewed production revision:
 Production and tracked test source were unchanged during this review.
 Pending documentation adds granular memory-test requirements to
 [AGENTS.md](../../blorp_2/AGENTS.md) and the
-[memory plan](../../blorp_2/MEMORY_PLAN.md#phase-level-test-contract).
+[historical memory plan](https://github.com/kablorp/blorp/blob/79deebd455856e5955d215ff2ec36f17860feb14/blorp_2/MEMORY_PLAN.md#phase-level-test-contract).
 
 ## Verdict and scope
 

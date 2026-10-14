@@ -1,8 +1,8 @@
 import:
+	../../src/check_model as Model
 	../../src/source: module_source, root_module_id
 	../../src/check: CheckedProgram, check, checked_functions
 	../../src/check_errors as Errors
-	../../src/check_model as Checked
 	../../src/lex: lex
 	../../src/syntax: Diagnostic
 	compilation: compile, compile_modules
@@ -307,7 +307,7 @@ pure func test_local_parameter_shadows_direct_generic_call() -> Bool:
 		kind: Errors.CheckErrorKind,
 	) -> Bool:
 		match kind:
-			Errors.CallRejection(Errors.UncallableBinding(_, Checked.ParameterBinding(_), _)):
+			Errors.CallRejection(Errors.UncallableBinding(_, Model.ParameterBinding(_), _)):
 				True
 			_:
 				False
@@ -331,11 +331,44 @@ private CHOICE: String =
 	|
 
 
-pure func test_direct_nullary_constructor_cannot_infer_from_return_context() -> Bool:
+private pure func expected_identity_has_complete_substitution(expression: String) -> Bool:
+	source = CHOICE + IDENTITY + "pure func use() -> Choice:\n    " + expression + "\n" + MAIN
+
+	match checked(source):
+		Ok(program):
+			match checked_functions(program).functions.get(1):
+				Some(function):
+					match function.body:
+						Model.CheckedValueBody(Model.ReturnExpression(value)):
+							match value.operations.last():
+								Some(step):
+									match step.operation:
+										Model.InvokeFunction(call, []): identity_target_matches(call, function.signature.return_type.value_type)
+										_: False
+								None:
+									match value.base:
+										Model.ReturnCall(call, [_]): identity_target_matches(call, function.signature.return_type.value_type)
+										_: False
+						_: False
+				None: False
+		Err(_): False
+
+
+private pure func identity_target_matches(call: Model.CheckedCall, expected: Model.TypeRef) -> Bool:
+	match call.target:
+		Model.UserFunction(_, [argument]): Model.same_type(argument, expected)
+		_: False
+
+
+pure func test_direct_nullary_constructor_uses_return_context() -> Bool:
+	expected_identity_has_complete_substitution("identity(First)")
+
+
+pure func test_direct_nullary_constructor_without_context_still_rejects() -> Bool:
 	use_source: String =
-		|pure func use() -> Choice:
-		|	identity(
-	rejects(CHOICE + IDENTITY + use_source, "First", ")\n" + MAIN, pure func(
+		|pure func use() -> Int:
+		|	value = identity(
+	rejects(CHOICE + IDENTITY + use_source, "First", ")\n\t0\n" + MAIN, pure func(
 		kind: Errors.CheckErrorKind,
 	) -> Bool:
 		match kind:
@@ -346,8 +379,12 @@ pure func test_direct_nullary_constructor_cannot_infer_from_return_context() -> 
 	)
 
 
-pure func test_ufcs_nullary_constructor_cannot_infer_from_return_context() -> Bool:
-	rejects(CHOICE + IDENTITY + "pure func use() -> Choice:\n\t", "First", ".identity()\n" + MAIN, pure func(
+pure func test_ufcs_nullary_constructor_uses_return_context() -> Bool:
+	expected_identity_has_complete_substitution("First.identity()")
+
+
+pure func test_ufcs_nullary_constructor_without_context_still_rejects() -> Bool:
+	rejects(CHOICE + IDENTITY + "pure func use() -> Int:\n\tvalue = ", "First", ".identity()\n\t0\n" + MAIN, pure func(
 		kind: Errors.CheckErrorKind,
 	) -> Bool:
 		match kind:
@@ -358,11 +395,15 @@ pure func test_ufcs_nullary_constructor_cannot_infer_from_return_context() -> Bo
 	)
 
 
-pure func test_direct_payload_constructor_cannot_infer_from_return_context() -> Bool:
+pure func test_direct_payload_constructor_uses_return_context() -> Bool:
+	expected_identity_has_complete_substitution("identity(Number(7))")
+
+
+pure func test_direct_payload_constructor_without_context_still_rejects() -> Bool:
 	use_source: String =
-		|pure func use() -> Choice:
-		|	identity(
-	rejects(CHOICE + IDENTITY + use_source, "Number", "(7))\n" + MAIN, pure func(
+		|pure func use() -> Int:
+		|	value = identity(
+	rejects(CHOICE + IDENTITY + use_source, "Number", "(7))\n\t0\n" + MAIN, pure func(
 		kind: Errors.CheckErrorKind,
 	) -> Bool:
 		match kind:
@@ -373,8 +414,12 @@ pure func test_direct_payload_constructor_cannot_infer_from_return_context() -> 
 	)
 
 
-pure func test_ufcs_payload_constructor_cannot_infer_from_return_context() -> Bool:
-	rejects(CHOICE + IDENTITY + "pure func use() -> Choice:\n\t", "Number", "(7).identity()\n" + MAIN, pure func(
+pure func test_ufcs_payload_constructor_uses_return_context() -> Bool:
+	expected_identity_has_complete_substitution("Number(7).identity()")
+
+
+pure func test_ufcs_payload_constructor_without_context_still_rejects() -> Bool:
+	rejects(CHOICE + IDENTITY + "pure func use() -> Int:\n\tvalue = ", "Number", "(7).identity()\n\t0\n" + MAIN, pure func(
 		kind: Errors.CheckErrorKind,
 	) -> Bool:
 		match kind:
@@ -383,6 +428,8 @@ pure func test_ufcs_payload_constructor_cannot_infer_from_return_context() -> Bo
 			_:
 				False
 	)
+
+
 
 
 pure func test_concrete_parameter_still_contextualizes_constructor() -> Bool:
@@ -396,14 +443,14 @@ pure func test_concrete_parameter_still_contextualizes_constructor() -> Bool:
 
 
 private pure func symbolic_argument(
-	function: Checked.CheckedFunction,
-) -> Option[Checked.TypeParameterId]:
+	function: Model.CheckedFunction,
+) -> Option[Model.TypeParameterId]:
 	match function.body:
-		Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+		Model.CheckedValueBody(Model.ReturnExpression(value)):
 			match value.base:
-				Checked.ReturnCall(call, [_]):
+				Model.ReturnCall(call, [_]):
 					match call.target:
-						Checked.UserFunction(_, [Checked.ParameterType(argument)]):
+						Model.UserFunction(_, [Model.ParameterType(argument)]):
 							Some(argument)
 						_:
 							None
@@ -430,11 +477,11 @@ pure func test_forwarding_publishes_caller_owned_symbolic_substitution() -> Bool
 									match symbolic_argument(forward):
 										Some(argument):
 											(
-												not Checked.same_parameter(
+												not Model.same_parameter(
 													callee_parameter,
 													caller_parameter,
 												)
-												and Checked.same_parameter(
+												and Model.same_parameter(
 													argument,
 													caller_parameter,
 												)
@@ -470,6 +517,10 @@ pure func test_generic_runtime_module_rejects() -> Bool:
 tests: TestSuite = {
 	description = "Blorp 2 generic functions",
 	tests = [
+		("ufcs payload constructor without context still rejects", test_ufcs_payload_constructor_without_context_still_rejects),
+		("direct payload constructor without context still rejects", test_direct_payload_constructor_without_context_still_rejects),
+		("ufcs nullary constructor without context still rejects", test_ufcs_nullary_constructor_without_context_still_rejects),
+		("direct nullary constructor without context still rejects", test_direct_nullary_constructor_without_context_still_rejects),
 		("one declaration accepts Int and String", test_one_declaration_accepts_int_and_string),
 		(
 			"generic forwarding preserves caller parameter",
@@ -515,20 +566,20 @@ tests: TestSuite = {
 			test_local_parameter_does_not_shadow_generic_ufcs,
 		),
 		(
-			"direct nullary constructor cannot infer from return context",
-			test_direct_nullary_constructor_cannot_infer_from_return_context,
+			"direct nullary constructor uses return context",
+			test_direct_nullary_constructor_uses_return_context,
 		),
 		(
-			"UFCS nullary constructor cannot infer from return context",
-			test_ufcs_nullary_constructor_cannot_infer_from_return_context,
+			"UFCS nullary constructor uses return context",
+			test_ufcs_nullary_constructor_uses_return_context,
 		),
 		(
-			"direct payload constructor cannot infer from return context",
-			test_direct_payload_constructor_cannot_infer_from_return_context,
+			"direct payload constructor uses return context",
+			test_direct_payload_constructor_uses_return_context,
 		),
 		(
-			"UFCS payload constructor cannot infer from return context",
-			test_ufcs_payload_constructor_cannot_infer_from_return_context,
+			"UFCS payload constructor uses return context",
+			test_ufcs_payload_constructor_uses_return_context,
 		),
 		(
 			"concrete parameter contextualizes constructor",

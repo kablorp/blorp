@@ -1,11 +1,12 @@
 import:
-	../../src/syntax: same_span
+	../../src/syntax: Diagnostic, Span, same_span
 	../../src/source: COMPILER_SOURCE
 	../../src/lower:
-		LoweredExit(ReturnValue),
-		LoweredTail(MatchValue),
+		LoweredExit(ReturnValue, RecurValues),
+		LoweredTail(ExitValue, MatchValue),
 		MatchLabel(DefaultLabel, VariantLabel),
-		ValueOperation(CallValue),
+		ValueOperation(CallValue, ConstructValue),
+		lowered_functions,
 		value_number,
 	../../src/own:
 		BorrowSource(ParameterBorrow, OwnerBorrow),
@@ -18,6 +19,7 @@ import:
 		ReturnTransfer(UnmanagedReturn, OwnedReturn),
 		ValueOwnership(NoOwnership, ManagedStringLeaf),
 		block_last_uses,
+		exit_last_uses,
 		insert_function,
 		last_uses,
 		owner_number,
@@ -28,6 +30,7 @@ import:
 		TypeRef(IntType, StringType, UnionType),
 		specialize,
 	ownership_inputs: function, input_ids, integer, parameter, runtime, span
+	managed_union_inputs: lowered
 	test: TestSuite
 
 
@@ -88,6 +91,237 @@ pure func test_union_plan_requires_its_declaration() -> Bool:
 							False
 				_:
 					False
+
+
+private pure func last_use_rejection(
+	result: Result[List[Option[Int]], Diagnostic],
+	message: String,
+	expected_span: Span,
+) -> Bool:
+	match result:
+		Err(error):
+			(
+				error.message == "internal compiler error: " + message
+				and error.help == "report this compiler error with the input program"
+				and same_span(error.span, expected_span)
+				and error.note.is_none()
+			)
+		Ok(_):
+			False
+
+
+pure func test_last_use_records_repeated_call_operands_with_a_prefix_and_offset() -> Bool:
+	source: String =
+		|pure func helper(spare: Int, left: Int, right: Int) -> Int:
+		|    spare
+		|pure func caller(ignored: Int, spare: Int) -> Int:
+		|    local = 7
+		|    helper(spare, local, local)
+		|func main() -> Int:
+		|    caller(1, 2)
+		|
+	match lowered(source):
+		Err(_):
+			False
+		Ok(program):
+			lowered_functions(program).functions.any(pure func(function):
+				match function.definitions:
+					[ignored, spare, local, call]:
+						match call.operation:
+							CallValue(_, arguments):
+								match function.tail:
+									ExitValue(ReturnValue(result)):
+										match block_last_uses([local, call], result, 2, 2):
+											Ok(uses):
+												definition_ids = function.definitions.map(
+													pure func(definition): value_number(definition.id),
+												)
+												argument_ids = arguments.map(value_number)
+												local_id = value_number(local.id)
+												(
+													definition_ids == [0, 1, 2, 3]
+													and argument_ids == [value_number(spare.id), local_id, local_id]
+													and uses == [Some(1), Some(2)]
+												)
+											Err(_):
+												False
+									_:
+										False
+							_:
+								False
+					_:
+						False
+			)
+
+
+pure func test_repeated_constructor_children_share_one_last_use_slot() -> Bool:
+	source: String =
+		|fixed union Pair:
+		|    Pair(Int, Int)
+		|pure func pair(value: Int) -> Pair:
+		|    Pair(value, value)
+		|func main() -> Int:
+		|    unused = pair(7)
+		|    0
+		|
+	match lowered(source):
+		Err(_):
+			False
+		Ok(program):
+			lowered_functions(program).functions.any(pure func(function):
+				match function.definitions:
+					[parameter, construction]:
+						match construction.operation:
+							ConstructValue(_, arguments):
+								match function.tail:
+									ExitValue(ReturnValue(result)):
+										match last_uses(function.definitions, result):
+											Ok(uses):
+												(
+													arguments.map(value_number) == [
+														value_number(parameter.id),
+														value_number(parameter.id),
+													]
+													and uses == [Some(1), Some(2)]
+												)
+											Err(_):
+												False
+									_:
+										False
+							_:
+								False
+					_:
+						False
+			)
+
+
+pure func test_last_use_accepts_an_empty_block_returning_a_prefix() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match block_last_uses([], ids.second, 2, 3):
+				Ok(uses):
+					uses.is_empty()
+				Err(_):
+					False
+
+
+pure func test_last_use_rejects_a_definition_reading_itself() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			last_use_rejection(
+				last_uses(
+					[runtime(ids.first, Builtins.StringLength, [ids.first], IntType, 10)],
+					ids.first,
+				),
+				"invalid value identity in ownership use analysis",
+				span(10),
+			)
+
+
+pure func test_last_use_rejects_a_forward_read_of_an_existing_definition() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			last_use_rejection(
+				last_uses(
+					[
+						runtime(ids.first, Builtins.StringLength, [ids.second], IntType, 10),
+						integer(ids.second, 7, 20),
+					],
+					ids.second,
+				),
+				"invalid value identity in ownership use analysis",
+				span(10),
+			)
+
+
+pure func test_recur_last_use_records_terminal_position_with_repeats_prefix_and_offset() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match exit_last_uses(
+				[integer(ids.fourth, 7, 40), integer(ids.fifth, 9, 50)],
+				RecurValues([ids.fifth, ids.second, ids.fourth, ids.fifth], span(60)),
+				2,
+				3,
+			):
+				Ok(uses):
+					uses == [Some(2), Some(2)]
+				Err(_):
+					False
+
+
+pure func test_recur_last_use_does_not_invent_an_empty_terminal_operand() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			match exit_last_uses(
+				[integer(ids.first, 7, 10)],
+				RecurValues([], span(20)),
+				0,
+				0,
+			):
+				Ok(uses):
+					uses == [None]
+				Err(_):
+					False
+
+
+pure func test_recur_last_use_rejects_a_sibling_at_the_explicit_terminal_span() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			last_use_rejection(
+				exit_last_uses(
+					[integer(ids.fourth, 7, 40)],
+					RecurValues([ids.third], span(60)),
+					2,
+					3,
+				),
+				"invalid value identity in ownership use analysis",
+				span(60),
+			)
+
+
+pure func test_last_use_checks_definition_identity_before_its_operands() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			last_use_rejection(
+				last_uses(
+					[runtime(ids.second, Builtins.StringLength, [ids.fifth], IntType, 20)],
+					ids.fifth,
+				),
+				"nonconsecutive value identity in ownership use analysis",
+				span(20),
+			)
+
+
+pure func test_last_use_reports_the_first_operand_error_before_later_definitions_and_exit() -> Bool:
+	match input_ids():
+		Err(_):
+			False
+		Ok(ids):
+			last_use_rejection(
+				last_uses(
+					[
+						runtime(ids.first, Builtins.StringLength, [ids.third], IntType, 10),
+						runtime(ids.third, Builtins.StringLength, [ids.fifth], IntType, 30),
+					],
+					ids.fifth,
+				),
+				"invalid value identity in ownership use analysis",
+				span(10),
+			)
 
 
 pure func test_last_use_keeps_the_final_borrow_and_return() -> Bool:
@@ -614,7 +848,7 @@ pure func test_replacement_result_precedes_old_owner_drop() -> Bool:
 					False
 
 
-pure func test_managed_match_prefix_is_explicitly_rejected() -> Bool:
+pure func test_managed_match_prefix_drops_in_selected_arm() -> Bool:
 	match input_ids():
 		Err(_):
 			False
@@ -649,16 +883,27 @@ pure func test_managed_match_prefix_is_explicitly_rejected() -> Bool:
 					[],
 				)
 			):
-				Err(error):
-					(
-						error.message == "owned managed values before a tail match are not supported yet"
-						and error.help == (
-							"create managed values inside the selected match arm or a separate straight-line "
-							+ "function"
-						)
-						and error.span.start == 20
-					)
-				_:
+				Ok(owned):
+					match owned.tail:
+						MatchTail(matched):
+							match matched.arms:
+								[arm]:
+									match (arm.operations, arm.exit):
+										([DropOwner(owner, at)], ReturnResult(UnmanagedReturn(returned))):
+											(
+												owner_number(owner) == 0
+												and at.start == 20
+												and value_number(
+													returned,
+												) == value_number(ids.second)
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				Err(_):
 					False
 
 
@@ -895,6 +1140,46 @@ tests: TestSuite = {
 	description = "Blorp 2 ownership insertion",
 	tests = [
 		(
+			"repeated call uses preserve prefix and offset",
+			test_last_use_records_repeated_call_operands_with_a_prefix_and_offset,
+		),
+		(
+			"repeated constructor child uses one last-use slot",
+			test_repeated_constructor_children_share_one_last_use_slot,
+		),
+		(
+			"empty block may return a prefix",
+			test_last_use_accepts_an_empty_block_returning_a_prefix,
+		),
+		(
+			"definition cannot read itself",
+			test_last_use_rejects_a_definition_reading_itself,
+		),
+		(
+			"definition cannot read an existing later value",
+			test_last_use_rejects_a_forward_read_of_an_existing_definition,
+		),
+		(
+			"recur uses terminal position and local slots",
+			test_recur_last_use_records_terminal_position_with_repeats_prefix_and_offset,
+		),
+		(
+			"empty recur has no operands",
+			test_recur_last_use_does_not_invent_an_empty_terminal_operand,
+		),
+		(
+			"invalid recur uses explicit span",
+			test_recur_last_use_rejects_a_sibling_at_the_explicit_terminal_span,
+		),
+		(
+			"definition identity precedes operand validation",
+			test_last_use_checks_definition_identity_before_its_operands,
+		),
+		(
+			"first definition operand error precedes later errors",
+			test_last_use_reports_the_first_operand_error_before_later_definitions_and_exit,
+		),
+		(
 			"arm uses retain offsets and unmanaged prefix",
 			test_arm_last_use_handles_offset_and_unmanaged_prefix,
 		),
@@ -957,8 +1242,8 @@ tests: TestSuite = {
 		("owned return transfers without drop", test_owned_return_transfers_without_dropping),
 		("replacement result precedes old drop", test_replacement_result_precedes_old_owner_drop),
 		(
-			"managed match prefix rejected explicitly",
-			test_managed_match_prefix_is_explicitly_rejected,
+			"managed match prefix drops in selected arm",
+			test_managed_match_prefix_drops_in_selected_arm,
 		),
 		("unused managed arm value drops", test_unused_managed_match_arm_value_is_dropped),
 	]

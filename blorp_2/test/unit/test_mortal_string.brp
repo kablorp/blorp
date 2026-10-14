@@ -1,4 +1,6 @@
 import:
+	../../src/own as Own
+	managed_union_inputs: lowered_modules
 	../../src/syntax: same_span
 	../../src/source: module_source, root_module_id
 	../../src/text: concat
@@ -55,7 +57,7 @@ pure func test_tail_match_returns_a_fresh_string() -> Bool:
 			False
 
 
-pure func test_tail_match_rejects_managed_prefix() -> Bool:
+pure func test_tail_match_drops_managed_prefix_in_each_arm() -> Bool:
 	source: String =
 		|import:
 		|	int: Int
@@ -71,30 +73,25 @@ pure func test_tail_match_rejects_managed_prefix() -> Bool:
 		|	choose(First)
 		|
 
-	match compile_modules([
-		{ source = source, targets = [1] },
-		{ source = INTEGER_OPERATIONS, targets = [] },
-	], PRIMITIVE_BASE):
-		Err(errors):
-			match errors.remaining:
-				[]:
-					error = errors.first
-					(
-						error.message == "owned managed values before a tail match are not supported yet"
-						and error.help == (
-							"create managed values inside the selected match arm or a separate straight-line "
-							+ "function"
-						)
-						and same_span(error.span, {
-							source = module_source(root_module_id()),
-							start = "import:\n\tint: Int\n".length() + 88,
-							end = "import:\n\tint: Int\n".length() + 97
-						})
-					)
-				_:
-					False
-		Ok(_):
+	match (
+		compile_modules(
+			[
+				{
+					source = source,
+					targets = [1]
+				},
+				{
+					source = INTEGER_OPERATIONS,
+					targets = []
+				},
+			],
+			PRIMITIVE_BASE,
+		)
+	):
+		Err(_):
 			False
+		Ok(c):
+			c.count("blorp_string_release(blorp_owner_0);") == 2
 
 
 pure func test_tail_match_accepts_borrowed_parameter_with_mortal_string() -> Bool:
@@ -126,7 +123,7 @@ pure func test_tail_match_accepts_borrowed_parameter_with_mortal_string() -> Boo
 			False
 
 
-func test_tail_match_rejects_owned_union_prefix_with_borrowed_string_parameter() -> Bool:
+func test_owned_union_prefix_drops_without_retiring_borrowed_parameter() -> Bool:
 	before_call: String =
 		|import:
 		|	int: Int
@@ -151,56 +148,47 @@ func test_tail_match_rejects_owned_union_prefix_with_borrowed_string_parameter()
 		|	choose(42.to_string())
 		|
 
-	match compile_modules([
-		{ source = prefix.concat(suffix), targets = [1] },
-		{ source = INTEGER_OPERATIONS, targets = [] },
-	], PRIMITIVE_BASE):
-		Ok(_):
+	match (
+		lowered_modules([
+			{
+				source = prefix.concat(suffix),
+				targets = [1]
+			},
+			{
+				source = INTEGER_OPERATIONS,
+				targets = []
+			},
+		]).and_then(pure func(program): Own.own(program))
+	):
+		Err(_):
 			False
-		Err(errors):
-			match errors.remaining:
-				[]:
-					error = errors.first
-					matches = (
-						error.message == "owned managed values before a tail match are not supported yet"
-						and error.help == "create managed values inside the selected match arm or a separate straight-line ".concat(
-							"function",
+		Ok(program):
+			program.functions.any(pure func(function):
+				match function.tail:
+					Own.MatchTail(matched):
+						matched.arms.all(pure func(arm):
+							match arm.operations:
+								[Own.DefineValue(_), Own.DropOwner(owner, _)]:
+									Own.owner_number(owner) == 0
+								_:
+									False
 						)
-						and same_span(error.span, {
-							source = module_source(root_module_id()),
-							start = prefix.length(),
-							end = prefix.length() + "box".length()
-						})
-						and error.note.is_none()
-					)
-
-					if matches:
-						True
-					else:
-						print_error(error.message)
-						print_error(error.help)
-						print_error(
-							"span="
-								.append_int(error.span.start)
-								.concat("..")
-								.append_int(error.span.end),
-						)
+					_:
 						False
-				_:
-					False
+			)
 
 
 tests: TestSuite = {
 	description = "Blorp 2 first managed value",
 	tests = [
-		("tail match rejects managed_prefix", test_tail_match_rejects_managed_prefix),
+		("tail match drops managed prefix in each arm", test_tail_match_drops_managed_prefix_in_each_arm),
 		(
 			"tail match accepts borrowed parameter with mortal String",
 			test_tail_match_accepts_borrowed_parameter_with_mortal_string,
 		),
 		(
-			"tail match rejects owned union prefix with borrowed String parameter",
-			test_tail_match_rejects_owned_union_prefix_with_borrowed_string_parameter,
+			"owned union prefix preserves borrowed String parameter",
+			test_owned_union_prefix_drops_without_retiring_borrowed_parameter,
 		),
 		("mortal String reaches C emission", test_mortal_string_reaches_c_emission),
 		("tail match returns fresh String", test_tail_match_returns_a_fresh_string),

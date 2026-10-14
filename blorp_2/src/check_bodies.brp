@@ -8,7 +8,7 @@ import:
 		CheckerInvariant(InvalidCheckedUnion, InvalidResolvedParameter),
 		ExpectedTypeSite(InferredBindingDeclaration, SourceAnnotation),
 		MatchError(
-			MatchRequiresUnion, NonExhaustiveMatch, PatternMissingField, PatternUnexpectedField,
+			MatchRequiresUnion, NonExhaustiveMatch, PatternFieldCountMismatch, DuplicatePatternBinding,
 			UnknownConstructorPattern, UnreachableArm,
 		),
 		StatementError(DuplicateLocal, ImmutableAssignment, NonVoidStatement),
@@ -18,6 +18,7 @@ import:
 	./check_methods: CallableBinding, ResolutionContext
 	./check_model:
 		BindingDefinition,
+		BindingId,
 		BindingMutability(Immutable, Mutable),
 		BindingOrigin(BodyLocal, MatchCapture, ParameterBinding),
 		CallTarget(RuntimeFunction),
@@ -30,7 +31,6 @@ import:
 		CheckedPattern(BindingCase, VariantCase, WildcardCase),
 		CheckedStatement(DiscardExpression, InitializeBinding, ReassignBinding),
 		CheckedValue,
-		PayloadBinding(BindPayload, DiscardPayload, NoPayloadBinding),
 		TypeRef(VoidType),
 		TypeUse,
 		UnionOccurrence,
@@ -41,7 +41,7 @@ import:
 		union_occurrence,
 	./check_recursion: check_execution
 	./check_signatures: AcceptedBody(BuiltinBody, MatchBody, ValueBody), AcceptedFunction
-	./check_types: CheckedDeclarations
+	./check_types: CheckedDeclarations, previous_declaration
 	./check_values:
 		LocalBinding,
 		ResolvedValue,
@@ -72,7 +72,7 @@ import:
 private fixed record ResolvedPattern {
 	pattern: CheckedPattern,
 	scope: List[LocalBinding],
-	binding: Option[BindingDefinition]
+	bindings: List[BindingDefinition]
 }
 
 
@@ -99,7 +99,7 @@ private pure func bound_pattern(
 				definition = definition
 			},
 		].concat(scope),
-		binding = Some(definition)
+		bindings = [definition]
 	}
 
 
@@ -108,35 +108,58 @@ private pure func unbound(pattern: CheckedPattern, scope: List[LocalBinding]) ->
 	{
 		pattern = pattern,
 		scope = scope,
-		binding = None
+		bindings = []
 	}
 
 
 private pure func resolve_variant_pattern(
 	contract: VariantContract,
-	fields: Option[FieldPattern],
+	fields: List[FieldPattern],
 	span: Span,
 	ordinal: Int,
 	scope: List[LocalBinding],
 ) -> Result[ResolvedPattern, CheckError]:
-	variant = contract.variant
-
-	match contract.payload:
-		None:
-			match fields:
-				None:
-					Ok(unbound(VariantCase(variant, NoPayloadBinding), scope))
-				Some(_):
-					Err(match_error(span, PatternUnexpectedField(variant)))
-		Some(payload):
-			match fields:
-				None:
-					Err(match_error(span, PatternMissingField(variant, payload.value_type)))
-				Some(FieldWildcard(_)):
-					Ok(unbound(VariantCase(variant, DiscardPayload), scope))
-				Some(FieldName(name)):
-					pattern = VariantCase(variant, BindPayload(binding_id(ordinal)))
-					Ok(bound_pattern(name, payload.value_type, ordinal, scope, pattern))
+	if not IntOps.equals(contract.fields.length(), fields.length()):
+		Err(match_error(span, PatternFieldCountMismatch(contract.variant, contract.fields.length(), fields.length())))
+	else:
+		var bindings: List[BindingDefinition] = []
+		var captures: List[Option[BindingId]] = []
+		var locals: List[LocalBinding] = []
+		var previous: List[WrittenName] = []
+		var position = 0
+		var failure: Option[CheckError] = None
+		for field in fields:
+			match (field, contract.fields.get(position)):
+				(FieldWildcard(_), Some(_)): captures = captures.append(None)
+				(FieldName(name), Some(annotation)):
+					match previous_declaration(previous, name.id):
+						Some(first):
+							failure = Some(match_error(name.span, DuplicatePatternBinding(name.id, first.span)))
+							break
+						None: void
+					id = binding_id(IntOps.add(ordinal, bindings.length()))
+					definition: BindingDefinition = {
+						origin = MatchCapture,
+						mutability = Immutable,
+						value_type = annotation.value_type,
+						span = name.span,
+					}
+					locals = locals.append({ name = name.id, id = id, definition = definition })
+					bindings = bindings.append(definition)
+					captures = captures.append(Some(id))
+					previous = previous.append(name)
+				_: failure = Some(checker_invariant(span, GenericConstructorContract))
+			if failure.is_some():
+				break
+			position = IntOps.add(position, 1)
+		match failure:
+			Some(error): Err(error)
+			None:
+				Ok({
+					pattern = VariantCase(contract.variant, captures),
+					scope = locals.concat(scope),
+					bindings = bindings,
+				})
 
 
 -- What every arm of one match shares: the scrutinee's union type and
@@ -166,7 +189,7 @@ private pure func resolve_pattern(
 
 			match contract:
 				Some(contract):
-					resolve_variant_pattern(contract, None, name.span, ordinal, scope)
+					resolve_variant_pattern(contract, [], name.span, ordinal, scope)
 				None:
 					capture = BindingCase(binding_id(ordinal))
 					Ok(bound_pattern(name, match_context.union_type, ordinal, scope, capture))
@@ -301,11 +324,7 @@ private pure func resolve_arms(
 				pattern_span(arm.pattern),
 			)
 
-			definitions = match pattern.binding:
-				Some(definition):
-					progress.bindings.append(definition)
-				None:
-					progress.bindings
+			definitions = progress.bindings.concat(pattern.bindings)
 
 			prefix ?= resolve_statements(
 				arm.statements,

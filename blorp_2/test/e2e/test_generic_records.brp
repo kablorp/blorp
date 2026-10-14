@@ -1,0 +1,147 @@
+import:
+	cost: CostLimits
+	harness: argv_case, run_example, run_output_example, run_source_example, verify_rejected_command, with_directory
+	system: file_exists, read_file, write_file
+	test: TestSuite
+
+
+private RECORD_LIMITS: CostLimits = {
+	allocations = 140000,
+	instructions = 500000000
+}
+private FIXTURES: String = "blorp_2/test/e2e/fixtures/record/generic/"
+
+
+private func verify_diagnostic(
+	compiler: String,
+	directory: String,
+	fixture: String,
+	location: String,
+	message: String,
+	help: String,
+) -> Result[Void, String]:
+	input = FIXTURES + fixture + ".brp"
+	output = directory + "/rejected.c"
+	expected = input + ":" + location + ": error: " + message + "\nhelp: " + help + "\n"
+	rejected ?= verify_rejected_command(compiler, input, output, expected)
+
+	unpublished ?= if file_exists(output):
+		Err("invalid generic record published C output")
+	else:
+		Ok(void)
+
+	sentinel ?= write_file(output, "preserve generic record output")
+	rejected_existing ?= verify_rejected_command(compiler, input, output, expected)
+	actual ?= read_file(output)
+
+	if actual == "preserve generic record output":
+		Ok(void)
+	else:
+		Err("invalid generic record overwrote existing C output")
+
+
+private func test_list_field(compiler: String) -> Bool:
+	run_example(
+		compiler,
+		{
+			name = "generic record List field and owned element",
+			fixture = FIXTURES + "box_list.brp",
+			expected_c = None,
+			first_case = argv_case("List and element preserve Unicode bytes", ["kept é🙂", "unused"], 0, "3\nkept é🙂\n"),
+			remaining_cases = [
+				argv_case("empty argument remains present", [""], 0, "2\n\n"),
+				argv_case("missing argument remains absent", [], 1, "1\nmissing\n"),
+			],
+			limits = RECORD_LIMITS
+		},
+	)
+
+
+pure func suite(compiler: String) -> TestSuite:
+	{
+		description = "Generic records",
+		tests = [
+			("generic Int field returns its stored value", func(): run_source_example(
+				compiler, FIXTURES + "box_int.brp", 7, RECORD_LIMITS,
+			)),
+			("generic String field escapes its temporary root", func(): run_output_example(
+				compiler, FIXTURES + "box_string.brp", "42\n", RECORD_LIMITS,
+			)),
+			("one reader declaration handles String then Int", func(): run_output_example(
+				compiler, FIXTURES + "same_reader_twice.brp", "42\n7\n", RECORD_LIMITS,
+			)),
+			("ordered type arguments preserve both Pair applications", func(): run_output_example(
+				compiler, FIXTURES + "swapped_pair.brp", "7\n42\n9\n3\n", RECORD_LIMITS,
+			)),
+			("phantom applications preserve independent stored values", func(): run_output_example(
+				compiler, FIXTURES + "phantom_arguments.brp", "7\n9\n", RECORD_LIMITS,
+			)),
+			("String escapes two generic temporary parents", func(): run_output_example(
+				compiler, FIXTURES + "nested_managed_escape.brp", "42\n", RECORD_LIMITS,
+			)),
+			("generic aliases and acquired child survive reassignment", func(): run_output_example(
+				compiler, FIXTURES + "managed_alias_reassignment.brp", "42\n42\n7\n", RECORD_LIMITS,
+			)),
+			("generic record carries an existing owning union", func(): run_output_example(
+				compiler, FIXTURES + "generic_union_field.brp", "42\n", RECORD_LIMITS,
+			)),
+			("result context completes phantom record arguments", func(): run_source_example(
+				compiler, FIXTURES + "result_context.brp", 7, RECORD_LIMITS,
+			)),
+			("function and record parameter owners substitute independently", func(): run_source_example(
+				compiler, FIXTURES + "rigid_owner_positions.brp", 7, RECORD_LIMITS,
+			)),
+			("unused generic reader and concrete identity stay valid", func(): run_source_example(
+				compiler, FIXTURES + "unused_generic_and_passthrough.brp", 7, RECORD_LIMITS,
+			)),
+			("nested generic literals and projections preserve String", func(): run_output_example(
+				compiler, FIXTURES + "nested_projection.brp", "42\n", RECORD_LIMITS,
+			)),
+			("partial direct literal infers Int from its field", func(): run_source_example(
+				compiler, FIXTURES + "partial_direct_int.brp", 7, RECORD_LIMITS,
+			)),
+			("partial direct literal infers String from its field", func(): run_output_example(
+				compiler, FIXTURES + "partial_direct_string.brp", "42\n", RECORD_LIMITS,
+			)),
+			("unique UFCS literal uses the partial receiver contract", func(): run_source_example(
+				compiler, FIXTURES + "partial_ufcs.brp", 7, RECORD_LIMITS,
+			)),
+			("nested partial literals share their inferred argument", func(): run_source_example(
+				compiler, FIXTURES + "partial_nested.brp", 7, RECORD_LIMITS,
+			)),
+			("partial repeated argument evaluates fields once in written order", func(): run_output_example(
+				compiler, FIXTURES + "partial_pair_order.brp", "7\n9\n9\n7\n", RECORD_LIMITS,
+			)),
+			("constructor child solves the record and union argument", func(): run_source_example(
+				compiler, FIXTURES + "partial_union_child.brp", 7, RECORD_LIMITS,
+			)),
+			("generic Float field preserves its numeric value", func(): run_output_example(
+				compiler, FIXTURES + "box_float.brp", "2.5\n", RECORD_LIMITS,
+			)),
+			("Void and String applications share one constructor declaration", func(): run_output_example(
+				compiler, FIXTURES + "box_void.brp", "42\n", RECORD_LIMITS,
+			)),
+			("generic List field and owned lookup survive temporary roots", func(): test_list_field(compiler)),
+			("missing record arguments reject without publishing C", func(): with_directory(
+				func(directory: String): verify_diagnostic(
+					compiler, directory, "reject_missing_arguments", "2:22",
+					"generic record requires one type argument",
+					"write a concrete or symbolic application, such as Box[Int] or Box[T]",
+				),
+			)),
+			("record argument count rejects and preserves existing output", func(): with_directory(
+				func(directory: String): verify_diagnostic(
+					compiler, directory, "reject_too_few_arguments", "2:22",
+					"record type argument count does not match its declaration",
+					"expected 2 type arguments, got 1; supply types in declaration order",
+				),
+			)),
+			("unused growing generic call rejects with exact help", func(): with_directory(
+				func(directory: String): verify_diagnostic(
+					compiler, directory, "reject_growing_unused", "5:5",
+					"recursive calls grow type arguments without bound",
+					"pass recursive type arguments unchanged, permute them, or reset them to concrete types",
+				),
+			)),
+		]
+	}

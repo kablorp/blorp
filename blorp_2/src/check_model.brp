@@ -12,6 +12,7 @@ import:
 		UnionId,
 		VariantId,
 		function_number,
+		record_number,
 		union_number,
 		variant_number,
 		variant_owner,
@@ -40,6 +41,7 @@ fixed record CheckedField {
 
 
 fixed record CheckedRecord {
+	type_parameters: List[TypeParameterId],
 	fields: List[CheckedField]
 }
 
@@ -47,6 +49,7 @@ fixed record CheckedRecord {
 fixed union TypeParameterOwner:
 	FunctionDeclaration(FunctionId)
 	UnionDeclaration(UnionId)
+	RecordDeclaration(RecordId)
 
 
 -- Owner and declaration position identify a rigid parameter within this compilation.
@@ -66,16 +69,17 @@ fixed union TypeRef:
 	StringType
 	ListType(TypeRef)
 	RecordType(RecordId)
+	AppliedRecordType(RecordId, List[TypeRef])
 	UnionType(UnionId)
 	AppliedUnionType(UnionId, List[TypeRef])
 	ParameterType(TypeParameterId)
 
 
--- A declared variant: its identity, written name and optional payload annotation.
+-- A declared variant: its identity, written name and ordered field annotations.
 fixed record CheckedVariant {
 	id: VariantId,
 	name: WrittenName,
-	payload: Option[TypeUse]
+	fields: List[TypeUse]
 }
 
 
@@ -160,6 +164,7 @@ fixed record CheckedRecordField {
 
 fixed union CheckedBase:
 	ReturnRecord(RecordId, List[CheckedRecordField])
+	ReturnConstructedVariant(VariantId, List[CheckedValue])
 	ReturnVoid
 	ReturnInteger(Int)
 	ReturnFloat(Float)
@@ -171,7 +176,6 @@ fixed union CheckedBase:
 
 fixed union CheckedOperation:
 	InvokeFunction(CheckedCall, List[CheckedValue])
-	ConstructVariant(VariantId)
 	ReadRecordField(FieldId)
 
 
@@ -196,14 +200,8 @@ fixed union CheckedStatement:
 	DiscardExpression(CheckedValue)
 
 
-fixed union PayloadBinding:
-	NoPayloadBinding
-	DiscardPayload
-	BindPayload(BindingId)
-
-
 fixed union CheckedPattern:
-	VariantCase(VariantId, PayloadBinding)
+	VariantCase(VariantId, List[Option[BindingId]])
 	WildcardCase
 	BindingCase(BindingId)
 
@@ -273,6 +271,8 @@ pure func type_head(value_type: TypeRef) -> Option[TypeCandidate]:
 			Some(ListCandidate)
 		RecordType(id):
 			Some(RecordCandidate(id))
+		AppliedRecordType(id, _):
+			Some(RecordCandidate(id))
 		UnionType(id):
 			Some(UnionCandidate(id))
 		AppliedUnionType(id, _):
@@ -289,6 +289,15 @@ pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 			match right:
 				ListType(other):
 					same_type(element, other)
+				_:
+					False
+		AppliedRecordType(owner, arguments):
+			match right:
+				AppliedRecordType(other_owner, others):
+					(
+						IntOps.equals(record_number(owner), record_number(other_owner))
+						and same_types(arguments, others)
+					)
 				_:
 					False
 		AppliedUnionType(owner, arguments):
@@ -308,7 +317,7 @@ pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 					False
 		_:
 			match right:
-				ListType(_) | AppliedUnionType(_, _) | ParameterType(_):
+				ListType(_) | AppliedRecordType(_, _) | AppliedUnionType(_, _) | ParameterType(_):
 					False
 				_:
 					match type_head(left):
@@ -322,16 +331,25 @@ pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 							False
 
 
+-- Compare ordered children without materializing list-pattern tails. Nested
+-- nominal equality visits this boundary at every application depth.
 pure func same_types(left: List[TypeRef], right: List[TypeRef]) -> Bool:
-	match left:
-		[]:
-			right.is_empty()
-		[first, ...rest]:
-			match right:
-				[other, ...others]:
-					same_type(first, other) and same_types(rest, others)
-				[]:
-					False
+	var matches = IntOps.equals(left.length(), right.length())
+	var index: Int = 0
+
+	for value in left:
+		match right.get(index):
+			Some(other):
+				matches = matches and same_type(value, other)
+			None:
+				matches = False
+
+		if not matches:
+			break
+
+		index = IntOps.add(index, 1)
+
+	matches
 
 
 pure func parameter_owner(id: TypeParameterId) -> TypeParameterOwner:
@@ -356,7 +374,12 @@ pure func same_owner(left: TypeParameterOwner, right: TypeParameterOwner) -> Boo
 					IntOps.equals(union_number(left), union_number(right))
 				_:
 					False
-
+		RecordDeclaration(left):
+			match right:
+				RecordDeclaration(right):
+					IntOps.equals(record_number(left), record_number(right))
+				_:
+					False
 
 pure func same_parameter(left: TypeParameterId, right: TypeParameterId) -> Bool:
 	(
@@ -422,6 +445,9 @@ private pure func append_value_calls(
 		ReturnRecord(_, fields):
 			for field in fields:
 				calls = append_value_calls(calls, field.value)
+		ReturnConstructedVariant(_, fields):
+			for field in fields:
+				calls = append_value_calls(calls, field)
 		ReturnCall(call, arguments):
 			for argument in arguments:
 				calls = append_value_calls(calls, argument)
