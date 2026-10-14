@@ -1,5 +1,7 @@
 # Core lowering allocation attribution (2026-09-22)
 
+> Raw data removed: the samples, logs and harnesses this report names were deleted from the repository; Git history keeps them.
+
 Model: `benchmarks/compiler_dce_facts_builder_allocations` plus
 `benchmarks/blorp/profiles/dce_facts_builder_allocations.brp` (landed in
 94d34bdc). This is the same idea applied to `lower_typed_program`

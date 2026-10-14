@@ -2,7 +2,7 @@
 
 `MAX_SYNTAX_NESTING` in `blorp/src/compiler_new/stage_01_discovery/parse/parse_state.brp`
 is **128**. This record is the measurement behind it
-(`docs/DISCOVERY_REDESIGN.md` section 3.14): the limit is the largest depth every
+(the typed-tree discovery redesign, since retired): the limit is the largest depth every
 walker survives with margin on both platforms at the declared stack size, kept
 clear of what the rest of the pipeline takes.
 

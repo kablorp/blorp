@@ -1296,7 +1296,7 @@ such fixed records is stored inline: a by-value C struct that construction,
 copies, field reads, updates, parameters and results never allocate, and that
 needs no reference counting. A generic fixed record qualifies per
 instantiation, so `Pair[Float]` can be inline while `Pair[String]` is not.
-`Bool` fields do not qualify yet; they will with fixed unions.
+`Bool` fields do not qualify.
 
 Inline storage is not yet a checked guarantee. A fixed record with any other
 field silently uses the ordinary managed representation, and some positions

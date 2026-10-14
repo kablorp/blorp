@@ -1,5 +1,7 @@
 # Splitting the generated CLI C into multiple translation units: does it help?
 
+> Raw data removed: the samples, logs and harnesses this report names were deleted from the repository; Git history keeps them.
+
 2026-09-17. Measurement study only -- the Blorp emitter
 (`blorp/src/compiler/stage_10_backend/`) was not touched. All splitting is a
 post-processing step on the already-generated

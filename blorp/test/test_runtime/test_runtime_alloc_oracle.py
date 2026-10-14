@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Contract test for the runtime allocation oracle (allocation-contract
-roadmap milestone 6): every backing allocator path the oracle claims to
-count actually moves its counter when exercised, and every counter stays
+"""Contract test for the runtime allocation oracle: every backing allocator path the
+oracle claims to count actually moves its counter when exercised, and every counter stays
 at zero when its path is never touched. Follows
 test_runtime_allocator_stats.py's small-C-harness-under-BLORP_MEMORY_STATS
 model.

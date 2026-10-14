@@ -5,9 +5,8 @@ This is the contract of the implemented discovery stage under
 The graph seam in [`lib/source_graph.brp`](../blorp/src/lib/source_graph.brp)
 runs it and the legacy adapter by default before typecheck. Source and tests
 own the exact schema; this document explains its invariants and boundaries.
-The [typed-tree redesign](DISCOVERY_REDESIGN.md) remains an active,
-unimplemented proposal. The [acceptance roadmap](DISCOVERY_ACCEPTANCE_ROADMAP.md)
-owns parity, hardening and old-front-end retirement work.
+The old lexer and parser stay beside the stage; [Architecture](ARCHITECTURE.md#the-front-end)
+states the rules that keep the two in agreement.
 
 ## Owners and entry points
 
@@ -254,34 +253,16 @@ preserves the graph service's program diagnostic.
 compares full old-parser/adapted ASTs, spans included, over corpus/root projects.
 Generated C must be identical, allowing normalization only for ID-derived names.
 
-As typecheck reads discovery directly, each migration deletes matching adapter
-work. Later phases own reference/type/impl facts keyed by discovery IDs and
-never write facts into syntax. Legacy-consumer retirement is independent of
-whether the tree proposal lands; the acceptance roadmap holds its blockers.
+Later phases own reference/type/impl facts keyed by discovery IDs and never
+write facts into syntax.
 
-## Cost evidence and remaining representation debt
+## Cost evidence
 
 Use the [Worker Checklist](WORKER_CHECKLIST.md) and
 [measurement protocol](../benchmarks/README.md#self-compile-measurement-protocol).
 Discovery's workload is the graph from `blorp/src/main.brp`, including implicit
 modules. Distinguish stage-only from adapter/finalization cost and require
-module/AST and generated-C identity. Historical evidence lives in the
-[declaration report](../benchmarks/results/discovery_adapter_declarations_2026-10-01.md),
-[body report](../benchmarks/results/discovery_adapter_bodies_2026-10-01.md) and
-[default-stage report](../benchmarks/results/discovery_stage_switched_on_2026-10-01.md).
-They include the temporary graph memory peak, not a current matched baseline.
-The tree proposal owns its future ceiling.
-
-Remaining debt includes predicted IDs/close-once discipline, freeze-only
-signature cardinality, last-node-attached name/else spans, legacy dimension
-sigil caches, seeded missing names, lexer sentinels (`EMPTY_SLOT`, `NO_ROW`/
-`NOT_INTERNED`, `NO_DEDENT`, `NO_PLAIN_STRING_CLOSE`) whose scalar `Option`
-replacement needs measurement, and release fallback rows. Constraint end spans
-are still read by position rather than returned with parse state. Nesting
-output tables under the builder would remove the explicit sealing field map,
-but needs fresh append-cost evidence after compiler handoff fixes, rather
-than assuming an old compiler blocker persists. Root/implicit handling may
-be unified if a third request kind or reader justifies it.
+module/AST and generated-C identity.
 
 Parallel parsing/incremental rediscovery are outside this implemented design.
 Name resolution and types belong to later phases.

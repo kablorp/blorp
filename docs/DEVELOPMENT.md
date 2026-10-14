@@ -168,27 +168,6 @@ Preserve the complete artifact for a reviewer if the identity claim depends
 on it. A quiet successful gate saves reading time and tokens; it does **not**
 replace focused failure diagnosis or final integration coverage.
 
-For handoffs that need reproducible validation evidence, wrap the exact command
-with the optional recorder:
-
-```bash
-scripts/record-validation --output /tmp/blorp-evidence/focused \
-  -- scripts/compiler-check --changed
-scripts/record-validation --output /tmp/blorp-evidence/default \
-  -- scripts/test --no-build --log-dir /tmp/blorp-gate-logs compiler-blorp
-```
-
-The packet keeps `metadata.json`, stdout, stderr, hashes of captured logs, the
-current Git revision, start and end tracked/untracked worktree fingerprints,
-whether source changed during the run, the `bin/blorp` hash when present, and
-only a small allowlist of known validation environment variables such as
-`BLORP_COMPILER_TEST_TIMEOUT` and `BLORP_CC`. If the packet output is inside the Git
-worktree, that output directory is explicitly excluded from source
-fingerprints. The recorder returns the wrapped command's status, refuses
-arbitrary existing output directories, and never decides whether a passing
-benchmark is an acceptable optimization. The handoff summary should still state
-the hypothesis, result, caveats, and requested reviewer decision.
-
 When delegating or handing off, give a bounded task brief rather than a copy
 of the entire investigation transcript:
 
@@ -240,7 +219,7 @@ its legacy adapter (`blorp/src/compiler/discovery_adapter.brp`, composed by
 and the user-visible diagnostic boundaries are in
 [Discovery Tables](DISCOVERY_TABLES_DESIGN.md). The formatter, the LSP, `compile --ast`
 and `blorp test` discovery still use the old lexer and parser
-(`docs/DISCOVERY_ACCEPTANCE_ROADMAP.md`).
+(see [Architecture](ARCHITECTURE.md#the-front-end)).
 
 ## Test Placement
 
@@ -373,13 +352,15 @@ BLORP_COMPILER_TEST_PROGRESS=1 \
 scripts/test --no-build --serial compiler-blorp
 ```
 
-Run the local premerge gate:
+The premerge gate is for release validation and runs on request; routine
+changes land after the focused suites that own them (find them with
+`scripts/compiler-check --changed --plan`). To run the local premerge gate:
 
 ```bash
 scripts/premerge-gate --no-docker
 ```
 
-Use Docker for Linux and architecture parity:
+Docker gives Linux and architecture parity, also on request:
 
 ```bash
 scripts/docker-gate --premerge-gate --platform linux/amd64
@@ -592,81 +573,22 @@ making a speed claim. `benchmarks/compiler_pass_compare` alternates two already
 executable pass benchmarks, preserves raw pairs, reports binary/source/fixture
 provenance, and fails closed when semantic checksums differ. See
 [`benchmarks/README.md`](../benchmarks/README.md#paired-production-pass-comparison)
-for the Core consume-specialization and typecheck-phase pilot commands.
+for the command template.
 
-## Compiler Benchmarks
+## Measuring The Compiler
 
 Compiler benchmark wrappers live in `benchmarks/`; fixtures and workers live in
 `blorp/benchmark/compiler/`. Use the exact arguments and measurement window in
-[`benchmarks/README.md`](../benchmarks/README.md). Its skip-build controls are
+[`benchmarks/README.md`](../benchmarks/README.md); its skip-build controls are
 valid only when the executable and all imported sources match the revision
-being measured.
-
-## Production Typecheck Replay
-
-Use the captured replay harness to measure compiler-on-compiler typechecking:
-
-```bash
-capture=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck-graph.XXXXXX.json")
-bin/blorp check --no-format --capture-typecheck-request "$capture" \
-  blorp/src/main.brp
-
-benchmarks/compiler_typecheck_replay "$capture" \
-  --target-only --timeout 180 --memory-limit 4G \
-  --no-inventory --json
-
-benchmarks/compiler_typecheck_replay "$capture" \
-  --timeout 180 --memory-limit 4G --no-inventory --json
-```
-
-`--target-only` retains the complete prepared graph but emits only the request
-target. It is usually the practical compiler-development feedback loop. Use the
-full replay when the change affects graph-wide materialization or output.
-
-Keep headline latency and RSS runs uninstrumented. Run allocation attribution
-separately because `--allocator-stats` adds atomic traffic to managed
-allocations and includes worker-startup counters:
-
-```bash
-benchmarks/compiler_typecheck_replay "$capture" \
-  --target-only --timeout 180 --memory-limit 4G \
-  --allocator-stats --no-inventory --json
-```
-
-The replay harness always samples child RSS. On macOS this invokes `ps` every
-20 milliseconds and perturbs elapsed time, so treat macOS latency as diagnostic
-or confirm it on Linux before making a headline claim. Use the same platform
-and sampling mode for every baseline/candidate pair.
-
-For a baseline/candidate comparison, create one clean checkout or worktree per
-revision, run `make` in each, and build an explicitly retained worker from each
-checkout:
-
-```bash
-cd /tmp/baseline-checkout
-make
-PYTHONPATH=benchmarks python3 -c \
-  'from pathlib import Path; from compiler_typecheck_worker import prepare_typecheck_worker; print(prepare_typecheck_worker(Path.cwd(), Path("/tmp/baseline-worker"), None))'
-
-cd /tmp/candidate-checkout
-make
-PYTHONPATH=benchmarks python3 -c \
-  'from pathlib import Path; from compiler_typecheck_worker import prepare_typecheck_worker; print(prepare_typecheck_worker(Path.cwd(), Path("/tmp/candidate-worker"), None))'
-```
-
-Record each checkout commit and worker SHA-256. Then pass the matching worker
-to replay from the checkout whose benchmark scripts are being used:
-
-```bash
-benchmarks/compiler_typecheck_replay "$capture" \
-  --bridge /tmp/candidate-worker/compiler_typecheck_worker \
-  --target-only --timeout 180 --memory-limit 4G \
-  --no-inventory --json
-```
-
-Run the same command separately with
-`/tmp/baseline-worker/compiler_typecheck_worker`, alternate execution order,
-and use a separate `--allocator-stats` matrix for allocation attribution.
+being measured. To measure compiler-on-compiler typechecking, capture one
+`typecheck_graph` request with `bin/blorp check --no-format
+--capture-typecheck-request FILE blorp/src/main.brp` and replay it with
+`benchmarks/compiler_typecheck_replay` (see
+[Captured Typecheck Replay](../benchmarks/README.md#captured-typecheck-replay)).
+Keep headline latency and RSS runs uninstrumented, run allocation attribution
+(`--allocator-stats`) separately, and on macOS treat latency as diagnostic
+because RSS sampling perturbs it.
 
 Trustworthy performance evidence requires:
 
@@ -701,9 +623,11 @@ A microbenchmark can prove a mechanism and expose an exponent. It cannot by
 itself prove that compiling the compiler became faster. Use production replay
 or a CI-shaped gate before accepting a broad optimization.
 
-Store durable raw performance evidence under `benchmarks/results/` and state
-the host, commands, source revisions, input hash, run order, sample count, and
-known caveats.
+Summarize durable performance evidence in one markdown file under
+`benchmarks/results/` and state the host, commands, source revisions, input
+hash, run order, sample count, and known caveats. Do not commit raw samples:
+keep them under the ignored `build/` directory, and delete the report when the
+decision it supports is superseded.
 
 ## Memory And Ownership Diagnostics
 

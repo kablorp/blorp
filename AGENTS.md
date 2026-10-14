@@ -10,11 +10,12 @@ file, or test log. [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) owns detailed
 commands and efficient investigation/handoff examples; [`docs/README.md`](docs/README.md)
 routes the maintained references. Performance and other compiler tasks should
 start with [`docs/WORKER_CHECKLIST.md`](docs/WORKER_CHECKLIST.md) for the
-setup/measure/land loop before reading a roadmap.
+setup/measure/land loop. `blorp_2/` holds the successor compiler; read
+[`blorp_2/AGENTS.md`](blorp_2/AGENTS.md) before working there.
 
 | Task | Start with | First feedback |
 | --- | --- | --- |
-| Syntax or diagnostic | `blorp/src/compiler_new/stage_01_discovery/parse/` (lexer in `lex/`, message text in `diagnostics/render.brp`; also `blorp/src/compiler/stage_03_parse/` while it exists, since a syntax change lands in both), matching fixture under `blorp/test/test_compiler_new/test_stage_01_discovery/test_parse/fixtures/`, [`GRAMMAR`](docs/GRAMMAR.md) | `parse/test_parser_fixtures.brp`; then `scripts/compiler-check --changed --plan` names the hand-back gates (tree path only: `make`, the suites importing the changed modules, `scripts/test compiler-new compiler-new-parity`; anything else production runs: add `compiler-blorp`) |
+| Syntax or diagnostic | `blorp/src/compiler_new/stage_01_discovery/parse/` (lexer in `lex/`, message text in `diagnostics/render.brp`; also `blorp/src/compiler/stage_03_parse/`, since a syntax change lands in both parsers), matching fixture under `blorp/test/test_compiler_new/test_stage_01_discovery/test_parse/fixtures/`, [`GRAMMAR`](docs/GRAMMAR.md) | `parse/test_parser_fixtures.brp`; then `scripts/compiler-check --changed --plan` names the hand-back gates |
 | Inference or typecheck | `blorp/src/compiler/stage_06_typecheck/`, matching compiler fixture | Exact suite; then `scripts/compiler-check --stage typecheck` |
 | Core/ownership | [`pipeline.brp`](blorp/src/compiler/stage_09_core/pipeline.brp), [`ARCHITECTURE`](docs/ARCHITECTURE.md), owning Core suite | Before/after Core, focused suite, relevant sanitizer |
 | Backend/runtime | `blorp/src/compiler/stage_10_backend/`, `blorp/src/lib/runtime/native/`, codegen audit | Focused emitter/runtime test and generated C |
@@ -192,19 +193,21 @@ main. Review (rule 12) checks this.
 
 Do not bend a design to avoid a cost the compiler imposes today. Measure the
 cost instead (allocations and retired instructions, per rule 9). Record it in
-the change's design document or in `benchmarks/results/`, so that compiler
-work can remove it. A change still stays within any cost ceiling its spec
-sets.
+the change's design document or as one markdown summary in
+`benchmarks/results/`, so that compiler work can remove it. Raw samples stay
+under the ignored `build/` directory, and a report is deleted when the decision
+it supports is superseded. A change still stays within any cost ceiling its
+spec sets.
 
-For compiler data-model refactors, require matched before/after self-compile
-allocations and retired instructions, plus production/test line counts reported
-separately. Significant regressions in allocations, retired instructions, or
-production line count are not acceptable merely because the model is cleaner or
-another metric improves. Necessary correctness-test growth is allowed. Aim to
-reduce production lines; do not hide growth through compressed formatting or
-deleted coverage.
-Set numerical cost ceilings before implementation, investigate repeatable
-increases at the owning phase, and reject or rescope a change that exceeds them.
+Any compiler data-model refactor, in `blorp/src` or `blorp_2/`, requires matched
+before/after self-compile allocations and retired instructions, with
+production and test line counts reported separately. Significant regressions
+in allocations, retired instructions, or production line count are not
+acceptable merely because the model is cleaner or another metric improves.
+Necessary correctness-test growth is allowed; do not hide growth through
+compressed formatting or deleted coverage. Set numerical cost ceilings before
+implementation, investigate repeatable increases at the owning phase, and
+reject or rescope a change that exceeds them.
 
 ### Naming
 

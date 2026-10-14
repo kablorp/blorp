@@ -271,9 +271,8 @@ static pthread_mutex_t __process_spawn_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 // ============================================================================
-// Allocation oracle: raw allocation-path counters (allocation-contract
-// roadmap milestone 6). MemStats/blorp_alloc only ever counted managed
-// object requests; every OTHER libc/OS allocation call this runtime makes
+// Allocation oracle: raw allocation-path counters. MemStats/blorp_alloc only ever counted
+// managed object requests; every OTHER libc/OS allocation call this runtime makes
 // (managed-object mallocs, malloc/calloc/realloc-backed raw buffers, aligned
 // SIMD buffers, generated cleanup scratch growth, fiber stack mmaps) was
 // invisible to a Blorp test doing a before/after MemStats snapshot. These
@@ -501,9 +500,8 @@ typedef void (*blorp_destructor_fn)(void*);
 // on. allocator_bytes_in_use is a different quantity: the
 // whole process's allocator-reported bytes (-1 where the platform has no
 // query), which includes raw buffers and everything else the program
-// allocated. The remaining fields are the allocation oracle's counters
-// (allocation-contract roadmap milestone 6): every OTHER heap/OS allocation
-// path this runtime has, so a zero-delta MemStats snapshot pair is actual
+// allocated. The remaining fields are the allocation oracle's counters:
+// every other heap/OS allocation path this runtime has, so a zero-delta MemStats snapshot pair is actual
 // evidence of "no heap activity" rather than just "no managed objects".
 // They are populated only while the counters gate has been on since before
 // the snapshot (see oracle_stats_active); a snapshot taken while the gate
@@ -1176,8 +1174,8 @@ static size_t __blorp_typecheck_body_metric_capacity = 0;
 // Not an allocation the oracle observes, because this is compiler
 // self-profiling instrumentation gated by BLORP_TYPECHECK_BODY_METRICS
 // (__blorp_typecheck_body_metrics_enabled), independent of and orthogonal
-// to the subject program's own execution; see the roadmap's "optional
-// profiler/leak/sanitizer bookkeeping" exclusion.
+// to the subject program's own execution; it is optional
+// profiler/leak/sanitizer bookkeeping, which the oracle excludes.
 static char* __blorp_typecheck_body_metric_text(const char* text) {
     const char* source = text ? text : "";
     size_t length = strlen(source);
@@ -2910,9 +2908,7 @@ static long __blorp_perceus_summary_external_repeated_calls = 0;
 static long __blorp_perceus_summary_repeated_inclusive_allocations = 0;
 
 // ----------------------------------------------------------------------
-// Second-attempt measurement of the Perceus summary memo (docs/IDENTITY_ROADMAP.md,
-// "Perceus summaries by node id",
-// worktree core/n3b-summary-entry-memo): a second, wider-scoped duplicate
+// Second-attempt measurement of the Perceus summary memo: a second, wider-scoped duplicate
 // check alongside the census above. The census above resets its "seen"
 // list per `rebuild_managed_let` invocation and keys on raw pointer
 // identity of `name`/`expr`; it found only 2.60% of the walk's own
@@ -5500,8 +5496,8 @@ void blorp_release_arc_only_slow_extern(void* obj) {
 // release of a deeply nested recursive union walks children with an
 // explicit stack instead of C recursion, and that stack is grown with this
 // helper instead of a bare realloc() so the allocation oracle can see it;
-// see docs/ALLOCATION_CONTRACT_ROADMAP.md's "Final release of recursive
-// union" acceptance row.
+// the final release of a recursive union is an acceptance case for the
+// allocation oracle.
 void* blorp_union_destroy_stack_grow(void* old_stack, size_t new_size) {
     __blorp_oracle_count(&__blorp_oracle_stats.cleanup_scratch_events);
     return realloc(old_stack, new_size);
@@ -40011,8 +40007,8 @@ static blorp_ProfileExecutionState* blorp_profile_current_execution_state(
     }
 
     // Not an allocation the oracle observes, because this is the optional
-    // sampling/call profiler subsystem (BLORP_PROFILE), excluded by the
-    // roadmap's "optional profiler/leak/sanitizer bookkeeping" clause.
+    // sampling/call profiler subsystem (BLORP_PROFILE), excluded as optional
+    // profiler/leak/sanitizer bookkeeping.
     blorp_ProfileExecutionState* state = calloc(1, sizeof(*state));
     if (!state || pthread_setspecific(profile_root_execution_key, state) != 0) {
         free(state);
@@ -40087,8 +40083,8 @@ static bool blorp_profile_execution_push(
             return false;
         }
         // Not an allocation the oracle observes, because this is the optional
-        // sampling/call profiler subsystem (BLORP_PROFILE), excluded by the
-        // roadmap's "optional profiler/leak/sanitizer bookkeeping" clause.
+        // sampling/call profiler subsystem (BLORP_PROFILE), excluded as optional
+        // profiler/leak/sanitizer bookkeeping.
         blorp_ProfileFrame* frames = realloc(
             state->frames, capacity * sizeof(blorp_ProfileFrame));
         if (!frames) {
@@ -40491,8 +40487,8 @@ int blorp_profile_enable(
     blorp_ProfileEntry* entries = NULL;
     if (function_count > 0) {
         // Not an allocation the oracle observes, because this is the optional
-        // sampling/call profiler subsystem (BLORP_PROFILE), excluded by the
-        // roadmap's "optional profiler/leak/sanitizer bookkeeping" clause.
+        // sampling/call profiler subsystem (BLORP_PROFILE), excluded as optional
+        // profiler/leak/sanitizer bookkeeping.
         entries = calloc(function_count, sizeof(blorp_ProfileEntry));
         if (!entries) {
             atomic_fetch_add_explicit(
@@ -40878,8 +40874,8 @@ static void blorp_profile_report_with_abandonment_cause(
             return;
         }
         // Not an allocation the oracle observes, because this is the optional
-        // sampling/call profiler subsystem (BLORP_PROFILE), excluded by the
-        // roadmap's "optional profiler/leak/sanitizer bookkeeping" clause.
+        // sampling/call profiler subsystem (BLORP_PROFILE), excluded as optional
+        // profiler/leak/sanitizer bookkeeping.
         entries = malloc(profile_function_count * sizeof(blorp_ProfileSnapshot));
         if (!entries) {
             fprintf(stderr,

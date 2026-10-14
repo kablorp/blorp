@@ -179,7 +179,7 @@ and fixpoint remain unvalidated by this bounded follow-up.
 
 Source base `535096f01` is being merged with `origin/main` at `7ab679600`.
 The current immutable bootstrap is `dev-dbc23276a2a6`; historical retained-host
-proofs in [checkpoint.md](checkpoint.md) are not proof of this integrated tree.
+proofs in the earlier checkpoint report (since removed) are not proof of this integrated tree.
 The third normal-pin O2 build passes and reports FRESH; native gates are still
 pending, with no overall acceptance claimed. Actual compiled_by is
 `dev-dbc23276a2a6`, source version `535096f01-dirty`. Binary SHA
@@ -307,7 +307,7 @@ failures are not waived by static census acceptance. Match-access/DirectoryEntry
 hardening, migration costs, full payload/generic default equality and checked
 fixed-union guarantees remain separate pending work.
 
-The earlier [Linux publication failure](../scalar_union_bootstrap.md#integrated-publication-state)
+The earlier Linux publication failure (recorded in a since-removed report)
 remains separate:18696 passed/zero counted failures did not mean gate success.
 Clang18/aarch64 sanitizer failed with function-type callback UBSan followed by
 ASan CHECK/SIGSEGV in the runtime Int128/UInt128 hash suite; baseline classification

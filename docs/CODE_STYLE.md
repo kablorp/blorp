@@ -2,8 +2,7 @@
 
 How compiler code should be shaped: what a function takes, when a function or
 binding earns its place, and how long names should be. These rules apply to
-new code and to reviews. The discovery stage gets a cleanup pass against them
-once its redesign (`DISCOVERY_REDESIGN.md`) lands.
+new code and to reviews.
 
 ## 1. Narrowest parameters
 

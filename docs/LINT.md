@@ -81,5 +81,5 @@ broader compiler integration gates.
 Generated compiler build-info and embedded-standard-library modules are
 excluded through an exact module inventory. TestSuite and other callback
 functions are suppressed through resolved callable identity. Corpus counts and
-performance measurements belong under `benchmarks/results/`, not in this rule
-contract.
+performance measurements belong in a markdown summary under
+`benchmarks/results/`, not in this rule contract.

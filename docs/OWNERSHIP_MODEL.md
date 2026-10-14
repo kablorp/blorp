@@ -562,11 +562,10 @@ Stable inexpensive checks run at their owning phase boundary. Broader graph and
 event checks run under `--check-invariants`, compiler ownership suites, and
 sanitizer gates.
 
-## Active Boundaries
+## Changing This Document
 
-Proposed ownership and representation changes are routed through the
-[open work index](README.md#open-issues-and-plans). This document changes only
-when the resulting ABI becomes authoritative.
+This document changes only when a new ownership or representation ABI becomes
+authoritative.
 
 ## Debugging Ownership Bugs
 

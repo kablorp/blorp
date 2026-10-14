@@ -16,8 +16,8 @@ scripts/compiler-build-status     # FRESH / STALE / UNKNOWN, no rebuild
 
 `bin/blorp --version` and `scripts/compiler-build-status` are the two ways to
 confirm which binary you actually have (commit, who/what compiled it,
-optimization level, generated-C split); both are being extended to print
-more provenance, so check `--help` rather than assume a fixed field set. The
+optimization level, generated-C split); check `--help` rather than assume a
+fixed field set. The
 `cc:` line in `--version` and the harness's toolchain fingerprint both record
 whatever `BLORP_CC` (default Clang) was set to when the binary was built.
 Never `git stash` in a worktree — worktrees share one stash list and a pop
@@ -43,90 +43,21 @@ scripts/compiler-check --changed          # build once, run manifest-owned check
 Use the smallest program and the narrowest snapshot that exercises the
 behavior under investigation before reaching for a broad gate.
 
-## Hand-Back Gates For Discovery Parser Work
+## Hand-Back Gates
 
-The discovery stage's tree path (the `tree_*` parse modules and what only they
-use under `compiler_new`, and `compiler/discovery_tree_projection.brp`, which
-projects trees to the old parser's AST) is imported by no program: not
-`bin/blorp`, not the formatter, not a bridge or benchmark root. Only tests and
-the parity tools run it, so it is not compiled into `bin/blorp`. Before handing
-back, ask the script instead of judging:
-
-```bash
-scripts/compiler-check --changed --plan   # prints "Hand-back gates: tree path only" or "broad"
-```
-
-- **Tree path only** (every changed path is tree path; docs and
-  `benchmarks/results` do not count): `bin/blorp test` on the suites that
-  import any changed Blorp file (the plan prints them), then
-  `scripts/test --no-build compiler-new compiler-new-parity`. No full
-  `compiler-blorp`, and no `make`: the tree code is not a build input
-  (`scripts/blorp-build-inputs sources` lists the inputs), so a tree edit
-  leaves `scripts/compiler-build-status` FRESH. The plan starts the hand-back
-  with `scripts/compiler-build-status --quiet`, which fails if the binary is
-  stale for another reason (a rebase onto new compiler sources, a checkout never
-  built); run `make` then.
-- **Broad** (anything else: the old parser, the adapter, the lexer, diagnostics,
-  a path the import graph cannot place): `scripts/test compiler-new
-  compiler-new-parity compiler-blorp`, plus the focused checks the same plan lists.
-
-The Docker premerge gate is not part of either hand-back. Running it once on the
-final change before landing is project policy, not something the script knows
-or verifies.
-
-The rule is the import graph, not a list. A module under `blorp/src/compiler_new`
-(or the tree projection) is tree path when no other `blorp/src` module reaches
-it; any other `blorp/src` module may be a program's entry and counts as
-production. A `blorp/test/test_compiler_new` file, or a test that imports a
-tree-path module, is tree path too unless it carries a `RUN-BLORP-CHECK` marker,
-which sends it through production `bin/blorp check` in compiler-blorp. What the
-graph cannot resolve counts as production, and a mixed change set is broad. A
-deleted path, and both sides of a rename, count (`parse/recipes.brp` and any new
-tree module need no list entry). After merging main, rerun the plan.
-
-To iterate on one stop reason, do not rerun the corpus: after one full
-`scripts/compiler-new-parity --stop-census`, `--stop-reason LABEL` (or
-`--files PATH...`) with `--stop-census` or `--adapter-only` runs only those
-modules. These runs are not the gate; the full parity run still is. Details in
+Before handing back, ask the script instead of judging which gates the change
+owns: `scripts/compiler-check --changed --plan` is read-only and prints the
+hand-back gates and the suites to run. Run the focused suites that own the
+change. The Docker premerge gate is optional and runs on request. Details are in
 [`scripts/README.md`](../scripts/README.md#test-gates).
 
 ## Measure
 
 Full protocol: [`benchmarks/README.md`](../benchmarks/README.md#self-compile-measurement-protocol).
+Allocation counts and retired instructions are evidence; wall time is not.
+Compare only against a baseline built with the same toolchain (clang version,
+bootstrap pin, `-O` level).
 
-```bash
-# Record this revision before editing; use it as the input for both runs.
-frozen_input_rev=$(git rev-parse HEAD)
-export BLORP_CLI_C_OPTIMIZATION=-O2
-make
-scripts/compiler-build-status        # must say FRESH
-benchmarks/self_compile_measure --stage2 --label baseline \
-  --input-rev "$frozen_input_rev" --output /tmp/baseline.json
-
-# After editing, rebuild at the same optimization level and compare.
-export BLORP_CLI_C_OPTIMIZATION=-O2
-make
-scripts/compiler-build-status        # must say FRESH
-benchmarks/self_compile_measure --stage2 --label candidate \
-  --input-rev "$frozen_input_rev" --baseline /tmp/baseline.json \
-  --output /tmp/candidate.json --require-identical
-```
-
-- `--stage2` builds and measures the matching normal and diagnostic compiler
-  executables. If using external binaries instead, pass both `--compiler` and
-  `--diagnostic-compiler` from the same build. Record the frozen input revision
-  and verify baseline/candidate toolchain provenance before comparing.
-- For the `--program small` guard, compare the SHA-256 of checkout-local
-  `benchmarks/self_compile/small.brp` before measuring candidate against
-  baseline; `--input-rev` freezes the self-compile input only. The full protocol
-  shows `shasum -a 256` and its check command.
-- Compare only against a baseline built with the same toolchain (clang
-  version, bootstrap pin, `-O` level); wall time is not evidence, allocation
-  counts and retired instructions are.
-- `--require-identical` applies to semantics-preserving source refactors.
-  Intentional codegen changes instead require generated-C review, behavioral
-  and ownership gates, and the fixpoint check below; keep the normal and
-  diagnostic executables' output identical within each measured pair.
 - **Stage-2 rule**: `bin/blorp` is linked by the pinned bootstrap
   (`blorp/build/bootstrap.env`), so a backend or
   `blorp/src/lib/runtime/native` change does not affect `bin/blorp`'s own
@@ -138,6 +69,9 @@ benchmarks/self_compile_measure --stage2 --label candidate \
   runs `scripts/compiler-fixpoint` before review: stage 2 and stage 3 must
   emit identical C. It is not in the premerge gate because it builds two
   more compilers; the worker who changes code generation runs it once.
+- `--require-identical` applies to semantics-preserving source refactors.
+  Intentional codegen changes instead require generated-C review, behavioral
+  and ownership gates, and the fixpoint check above.
 - Run gate commands directly (`scripts/test`, `scripts/compiler-check`, etc.);
   do not spawn many compiled test binaries in parallel yourself (macOS
   `syspolicyd` stalls). Measurement noise from concurrent work is accepted;

@@ -114,14 +114,15 @@ listed in [section 8.2](#82-old-parser-and-discovery-stage-disagreements).
 
 ### 0.2 The implementations
 
-Three implementations, holding four parsers, read this grammar today:
+Three implementations read this grammar today:
 
 - the **discovery stage** under `blorp/src/compiler_new/stage_01_discovery/`,
   which the compiler runs (`check`, `compile`, `run`, `test`). It has one lexer
-  (`lex/`) and two parsers (`parse/`): the **tree path** (`parse/tree_*.brp`),
-  which reads what it supports and declines the rest, and the **table path**
-  (`parse/body_parser.brp`, `parse/declaration_parser.brp`,
-  `parse/block_layout.brp`), which reads everything the tree path declines;
+  (`lex/`) and one **table parser** (`parse/body_parser.brp`,
+  `parse/declaration_parser.brp`, `parse/type_parser.brp`,
+  `parse/block_layout.brp`). The stage also holds an unfinished typed-tree
+  parser (`parse/tree_*.brp`); `bin/blorp` does not compile it and this document
+  does not describe it;
 - the **old lexer and parser** under `blorp/src/compiler/stage_02_lex/` and
   `stage_03_parse/`, which still serve `compile --ast`, test discovery and the
   LSP, and which defined today's behaviour;
@@ -152,10 +153,7 @@ Paths in the table are relative to `blorp/src/`; `DISC/` stands for
 | `SCAN` | `DISC/lex/scan_support.brp` |
 | `BODY` | `DISC/parse/body_parser.brp` |
 | `BLK` | `DISC/parse/block_layout.brp` |
-| `QRK` | `DISC/parse/layout_quirks.brp` |
 | `STOP` | `DISC/parse/stop_reason.brp` |
-| `TREE` | `DISC/parse/tree_body_parser.brp` |
-| `TTYPE` | `DISC/parse/tree_type_parser.brp` |
 | `TYPE` | `DISC/parse/type_parser.brp` |
 | `TOK` | `DISC/tables/token.brp` |
 | `LIM` | `DISC/tables/limits.brp` |
@@ -1374,14 +1372,14 @@ spread_target  = name | "_" ;
 The token stream carries most layout, but a few rules compare the line and
 column of tokens. Each is named here, with its exact statement, the old
 parser's evidence, and whether the token grammar can express it. The discovery
-stage keeps these rules in `parse/layout_quirks.brp` (`QRK`) and the
-continuation helpers of `parse/block_layout.brp` (`BLK`).
+stage keeps these rules in the continuation helpers of
+`parse/block_layout.brp` (`BLK`) and in `parse/body_parser.brp` (`BODY`).
 
 "Past an anchor" is defined once and used throughout:
 
 > A token is **past** an anchor token when it starts on a later line than the
 > anchor *and* in a later column (tab-expanded, [1.1](#11-source-text)), and it
-> is not a `DEDENT` or `EOF` (`LP:4542-4552`, `BLK:33-40`, `QRK:67-73`).
+> is not a `DEDENT` or `EOF` (`LP:4542-4552`, `BLK:33-40`).
 
 ### 4.1 The bracketed-block anchor
 
@@ -1442,9 +1440,7 @@ block is deeper than the enclosing *line*, and the anchor can be a token later
 in that line. Whenever the anchor is the first token of its line, the rule is
 implied by the `INDENT` and adds nothing.
 
-**Implementations.** `QRK:41-73` (`block_may_open`, `ExpressionAnchor`,
-`BlockAnchor`) for the tree path; `BLK:33-74` and `BODY:500-571` for the table
-path.
+**Implementations.** `BLK:33-74` with `BODY:500-571`.
 
 There is one more way into a block. When a lambda's `:` ends a line whose
 break is insignificant (inside brackets nested within an open bracketed block,
@@ -1607,8 +1603,7 @@ indented value is one expression.
 > ```
 >
 > reads `2` as a statement and reports misleading errors where the function
-> ends. The tree reader safely declines this malformed closing layout instead
-> of reproducing that recovery. *(implementation defect)*
+> ends. *(implementation defect)*
 
 **Token grammar.** Expressible, as above.
 
@@ -1637,17 +1632,12 @@ binary operator, `as` or `=` on the line after its closing `DEDENT` continues
 the expression ([3.7](#37-control-expressions-and-blocks)).
 
 **Token grammar.** Expressible: the control expression ends with `DEDENT`, and
-the operator loop simply continues with the next token. The tree reader now
-continues binary operators after completed `if` and `match` operands and
-expression statements, preserving their entry context and operator precedence.
-Same-line direct binding values keep their separate entry rule; next-line
-values use the operator grammar within their own indent. Direct call/list/
-subscript items also retain their bypass. A completed block-lambda tail now
-leaves the next statement or global declaration at the cursor, including
-through prefix operators or as the last operand of a binary expression.
-Grouping clears this ending evidence. Binary operators following that lambda
-tail remain outside the tree reader's coverage, as do the `as`/`=` rejection
-paths. See
+the operator loop simply continues with the next token. Same-line direct
+binding values keep their separate entry rule; next-line values use the
+operator grammar within their own indent. Direct call/list/subscript items also
+retain their bypass. A completed block-lambda tail leaves the next statement or
+global declaration at the cursor, including through prefix operators or as the
+last operand of a binary expression. Grouping clears this ending evidence. See
 [D3](#d3-operator-after-a-block) for the recommended rule.
 
 ### 4.6 Blocks inside same-line bodies
@@ -1684,8 +1674,7 @@ the keyword's column:
         r.read()                      -- error: not past the `with`
 ```
 
-**Token grammar.** An instance of 4.1 with the keyword as anchor. The tree
-path declines these values (`TREE:360-366`).
+**Token grammar.** An instance of 4.1 with the keyword as anchor.
 
 ### 4.8 Case-line nesting
 
@@ -1858,7 +1847,7 @@ these counts one level where it nests inside another counted form:
 - a nested written type: type arguments (`List[List[...]]`), grouped and
   tuple types, and a function type's parameters and its return type, so
   `(A) -> (B) -> C` counts one level per arrow (the return type is parsed by
-  recursion, `TTYPE:345-346`, `TYPE:627-632`);
+  recursion, `TYPE:627-632`);
 - a nested pattern (constructor, tuple and list patterns);
 - a parenthesized dimension expression.
 
@@ -1869,9 +1858,8 @@ suggests binding the inner value to a name or moving the inner block into a
 function of its own.
 
 > **Current behaviour differs:** neither parser has the limit yet; it is
-> planned for the discovery stage's parse state
-> ([DISCOVERY_REDESIGN.md](DISCOVERY_REDESIGN.md), section 3.14). The old
-> parser accepts any depth its stack allows. *(pending language change)*
+> planned for the discovery stage's parse state. The old parser accepts any
+> depth its stack allows. *(pending language change)*
 
 ### 5.5 Interpolation hole contents
 
@@ -1979,8 +1967,7 @@ subtraction. **Recommendation:** an expression that ends with a block's
 `DEDENT` ends there, and what follows is the next statement. A line starting
 with `-` is then a negation statement, and a line starting with any other
 binary operator is ``expected expression`` with the help that an operator
-cannot start a line. The tree reader currently reproduces the frozen binary
-continuation rule for `if` and `match`; this recommendation remains undecided.
+cannot start a line. This recommendation remains undecided.
 
 ### D4. Method-chain continuation
 
@@ -2003,7 +1990,7 @@ anchors, and re-indenting a block that the lexer already reads as a block can
 make it an error. **Recommendation:** replace the anchor with the lexer's
 `INDENT` alone, so a block opened inside an expression is valid when the lexer
 opens a level for it, as for any other block. Every program that is valid
-today stays valid, and `layout_quirks.brp` can be removed. Also reject the
+today stays valid, and the anchor rules can be removed. Also reject the
 block without an `INDENT` described at the end of 4.1, which only unusual
 layouts reach.
 
@@ -2031,8 +2018,7 @@ keywords, and `from` is reserved. They behave unevenly:
 
 `after` looks accidental: it is a keyword only because a timeout arm is
 written `_ after t:`, a position where an identifier would be unambiguous.
-The tree expression reader preserves the frozen value-name rules above;
-this does not settle the contextual-identifier decision. **Recommendation:**
+**Recommendation:**
 reserve `with` and `concurrent` for the reason `debug` and `select` are
 reserved: each starts a block, so binding one creates a name that cannot be
 read. Make `after`, `sealed`, `on`, `concurrently` and `from` contextual
@@ -2128,6 +2114,14 @@ hole toward `MAX_SYNTAX_NESTING`, like any other bracket.
 | A non-`.` line inside an indented chain | Hangs (`LP:7859-7877`) | Ends the chain and reports errors where the function ends (`BODY:1815-1822`) |
 | Interpolation holes | Hole text is kept and parsed later as `x=<hole>` (`FIN:2416-2470`) | Parsed with the module: ``an interpolation hole must hold exactly one expression`` (`BODY:2469-2491`) |
 | Nesting past 128 | Accepted | Accepted today; to be rejected (5.4) |
+| Strings nested three levels deep inside interpolation holes | Misread: the lexer pairs the quotes inside a hole with one flag | Read as 1.7 defines |
+| Braces in an interpolated pipe string | Misread: every brace is taken as a hole | Read as 1.7 defines |
+
+The two interpolation rows are the entries in `ADAPTER_DIFFERENCES` and
+`KNOWN_DIVERGENCES` in `scripts/compiler-new-parity`; the fixtures are under
+`blorp/test/test_compiler/tools/fixtures/known_differences/`. They are the only
+inputs on which the adapter's rebuilt AST differs from the old parser's. They
+stay until the old lexer reads both as the language does or is deleted.
 
 The old parser's diagnostics join the message and its help into one sentence
 in these places, where this document quotes the discovery stage:
@@ -2139,9 +2133,3 @@ in these places, where this document quotes the discovery stage:
 | Assignment in an expression (5.1) | ``An assignment is a statement, not an expression. Assign on its own line first, then use the name where the value is needed`` (`LP:203-206`) | message ``an assignment is a statement, not an expression``, help ``assign on its own line first…`` |
 | Field assignment (5.2) | ``Field assignment is not supported. Use record update syntax: { record \| field = value }`` (`LP:6594-6595`) | message ``field assignment is not supported``, help ``use record update syntax…`` |
 | `?=` binding `_` (5.2) | `` `?=` cannot bind to `_`; use a name for the unwrapped value `` (`LP:6319`) | message `` `?=` cannot bind to `_` ``, help ``use a name for the unwrapped value`` |
-
-The tree path still declines, rather than rejects, some unsupported syntax and
-layout forms. Its remaining first-stop coverage is recorded in the M4 census
-linked from [Discovery Redesign](DISCOVERY_REDESIGN.md). A decline is not a
-disagreement: the table path then reads or rejects the form as the old parser
-does.

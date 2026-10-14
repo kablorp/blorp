@@ -69,7 +69,7 @@ Compiler source is organized by dependency direction:
 | `stage_08_core_lower` | Typed frontend to Core lowering |
 | `stage_09_core` | Core model, transformations, representation, ownership, reuse, and invariants |
 | `stage_10_backend` | Backend-ready Core projection and C artifact emission |
-| `blorp/src/format` | Source-format command and rendering engine; temporarily consumes the parser recovery AST through an explicit migration edge |
+| `blorp/src/format` | Source-format command and rendering engine; consumes the old parser's recovery AST, which keeps the comments the discovery stage drops |
 | `blorp/src/test` | Production implementation of the `blorp test` command; its mirrored tests live in `blorp/test/test_test` |
 | `blorp/src/lsp` | Native LSP protocol, workspace actor, analysis, capabilities, diagnostics, and stdio process |
 
@@ -96,8 +96,18 @@ stage in `blorp/src/compiler_new/stage_01_discovery/` through
 `blorp/src/compiler/discovery_front_end.brp`; its tables are rebuilt into the
 graph the typechecker reads by `blorp/src/compiler/discovery_adapter.brp`. The
 older lexer, parser and module loader remain for `compile --ast`, test discovery
-and doctests, and the LSP; the formatter has its own parser. A syntax change
-lands in both parsers while the older one exists.
+and doctests, and the LSP; the formatter has its own parser. Both parsers are
+permanent, so these rules hold:
+
+- A syntax change lands in both parsers, with the `compiler-new-parity` gate and
+  pinned fixtures proving they agree (`scripts/README.md` describes the gate).
+  Non-urgent syntax and diagnostic changes may wait so they are made once.
+- A rule decidable from syntax alone goes into the parsers, not typecheck.
+- A fixture is run by a gate or deleted. No fixture exists that no gate runs.
+
+The two parsers differ on two interpolated-string inputs the old lexer reads
+wrongly; [GRAMMAR section 8.2](GRAMMAR.md#82-old-parser-and-discovery-stage-disagreements)
+lists them.
 
 ### Lex And Parse
 
@@ -269,15 +279,11 @@ Core starts, so neither `CliCompilePlan` nor `TypecheckedGraph` remains
 reachable on the normal compile path. The `core_lowering_input_ready` memory
 checkpoint directly measures this lifetime boundary. The
 `core_lowering_input_ready` checkpoint owns the measurement of that release
-cut; replacing the remaining raw typed-tree payloads is future work. Adding a typecheck field to the projection
-requires a specific Core consumer; it is not a general escape hatch for
-retaining the typed graph.
+cut. Adding a typecheck field to the projection requires a specific Core
+consumer; it is not a general escape hatch for retaining the typed graph.
 
-Remaining typechecking decomposition is tracked in
-[Identity And Tables](IDENTITY_ROADMAP.md#frontend-facts); module environment
-preparation still rebuilds the same per-module setup once per module and per
-header. Production behavior belongs
-here only after a phase product becomes authoritative.
+Module environment preparation rebuilds the same per-module setup once per
+module and per header.
 
 ## Compile-Time Evaluation
 
@@ -330,6 +336,19 @@ lower + ffi_boundary + list_layout
   -> reuse for prepared unions
   -> backend emit
 ```
+
+`tuple_flatten.brp` turns a tuple that is only ever a local value into a group
+of independent values rather than an object. Two kinds qualify: a `match`
+subject built in place (`match (a, b):`), whose elements are bound once, in
+order, with the decision tree running on the elements; and an immutable local
+bound to a built tuple and only taken apart (read by index, matched, or named
+again by another such local). A local tuple used whole anywhere else (passed,
+returned, stored, compared, captured whole) keeps its box, and a tuple read out
+of a box (a call result, list element, field, payload or parameter) is a source
+whose element reads stay projections of it. The pass adds no box: every box in
+its output is one its input built, so boxes rebuilt from another box's elements
+are zero by construction. It relies on the binder identity contract that a
+local's `(name, id)` pair is bound once in its function.
 
 `tuple_storage.brp` runs after concrete record representation, trait selection
 and local tuple flattening. It interns structural tuple shapes as explicit
@@ -503,8 +522,7 @@ evidence of safety. The owning modules are `stage_09_core/allocation_analysis.br
 
 This is an explanation tool, not a language-level allocation guarantee.
 Backend helper coverage is incomplete, and `no_alloc` syntax and enforcement
-are not implemented. [Allocation Contracts](ALLOCATION_CONTRACT_ROADMAP.md)
-owns that remaining work and the fail-closed proof requirements.
+are not implemented.
 
 ## Backend
 

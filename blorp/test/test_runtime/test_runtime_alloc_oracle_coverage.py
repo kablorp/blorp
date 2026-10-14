@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Coverage gate for the runtime allocation oracle (allocation-contract
-roadmap milestone 6).
+"""Coverage gate for the runtime allocation oracle.
 
 A newly introduced raw allocation call in runtime.c must either be routed
 through one of the oracle's counted wrappers (BLORP_ORACLE_MALLOC/CALLOC/

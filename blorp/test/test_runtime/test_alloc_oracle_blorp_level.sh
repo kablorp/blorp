@@ -1,7 +1,6 @@
 #!/bin/bash
-# Test: Blorp-level allocation oracle assertions (allocation-contract
-# roadmap milestone 6). Each fixture is run in its OWN process with
-# --memory-stats so it does not perturb the shared `bin/blorp
+# Test: Blorp-level allocation oracle assertions. Each fixture is run in its
+# OWN process with --memory-stats so it does not perturb the shared `bin/blorp
 # test --suite` process other runtime tests run in (the flag turns the
 # counters on for the whole process from its first allocation, which
 # several existing MemStats tests depend on being off).
@@ -45,9 +44,9 @@ if grep -q "^PASS" <<< "$for_loop_output"; then
     echo "PASS"
     PASS=$((PASS + 1))
 else
-    echo "FAIL (see docs/ALLOCATION_CONTRACT_ROADMAP.md: this is the case the"
-    echo "  static analysis currently marks unknown because of the cooperative"
-    echo "  checkpoint; a failure here is a genuine finding, not a test bug)"
+    echo "FAIL (static analysis marks this case unknown because of the"
+    echo "  cooperative checkpoint; a failure here is a genuine finding, not a"
+    echo "  test bug)"
     echo "  Got: $for_loop_output"
     FAIL=$((FAIL + 1))
 fi

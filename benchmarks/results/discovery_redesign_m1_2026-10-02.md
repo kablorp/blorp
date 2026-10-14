@@ -5,7 +5,7 @@ counts and names. The adopted syntax model uses ordinary records, so these
 numbers do not validate its construction or return costs. The current model
 must be measured separately before its M1 cost gate is complete.
 
-Cost ledger for step M1 of [`docs/DISCOVERY_REDESIGN.md`](../../docs/DISCOVERY_REDESIGN.md):
+Cost ledger for step M1 of the typed-tree discovery redesign (since retired):
 the syntax types and `IdMint` (section 3.15). Nothing calls the mint yet, so
 this measures minting in isolation, with the probe the parser's shape will
 follow, and compares it with the M0 prototype's mint (`discovery_redesign_m0_2026-10-02.md`
@@ -24,7 +24,7 @@ around.
   M1 does not adopt it, because it cannot keep section 3.15's boundary (see
   "Single layer" below); the gap is the `(IdMint, node)` tuple and the
   `MintState` copy, which increments 2 and 5 of
-  `docs/VALUE_TUPLES_AND_STATE_HANDOFF.md` remove.
+  the value-tuples plan (since retired) remove.
 - **Minting definitions and imports is quadratic per module today.** Each
   append copies the index list: 4 times the calls costs 15 times the
   instructions, on the bare mint as well as through a parse state. Over the
@@ -112,10 +112,10 @@ copied: each append copies the index (and retains every element), because the
 list it holds is shared at the append. The bare mint shows the same, so it is
 not the parse state's nesting: it is today's ownership of a record updated
 inside a function that returns a tuple. Increment 3 of
-`VALUE_TUPLES_AND_STATE_HANDOFF.md` (consuming clones for multi-value
+the value-tuples plan (consuming clones for multi-value
 results) and increment 4 (last-use hand-off out of a `var`) make it linear
 for the bare mint; through the parse state it also needs increment 5 (field
-places), which section 4.4 of that document already lists for `fields.mint`.
+places), which section 4.4 of that plan listed for `fields.mint`.
 
 **Estimate on the self-compile.** A per-file count of declarations, fields,
 variants, enum cases, methods, local functions and globals over `blorp/src`

@@ -34,6 +34,12 @@ benchmarks/
   args/<name>.txt        # optional shared CLI args
 ```
 
+Compiler measurement tools live beside these suites: the `compiler_*` and
+`self_compile*` runners, `build_stage2_compiler`, `c_emission_bytes`,
+`normalize_generated_c_symbols`, the record-update allocation guards, and the
+`blorp/profiles/` programs they drive. `results/` holds markdown summaries only
+(see [Recording Results](#recording-results)).
+
 The benchmark name is the filename without the extension. A benchmark must have
 a blorp source file; C, Go, OCaml, and Python counterparts are optional.
 Blorp benchmark sources can import harness helpers from `./support/benchmark`.
@@ -80,234 +86,11 @@ included in `bench.sh all`.
 | `paradigms` | Functional dispatch, list destructuring, pattern matching, and coroutine-style control flow | blorp |
 | `virtual_threads` | Fiber spawn, join, park, and wake scaling | blorp |
 
-## Runtime Managed-Buffer Copy Diagnostic
-
-`runtime_managed_buffer_copy_profile` compares collection serialization in the
-working tree with a Git control. It compiles both native runtimes at `-O2` with
-`BLORP_MEMORY_DIAGNOSTICS=1` so its allocation counters are available,
-alternates their execution order, verifies byte-identical output, and reports
-managed capacity and retained-memory facts alongside median wall time. Timing
-runs leave the counters disabled; allocation facts come
-from separate lightweight-stat processes. It is deliberately excluded from
-`bench.sh all`.
-
-```bash
-# Short feedback while editing runtime.c.
-benchmarks/runtime_managed_buffer_copy_profile --quick
-
-# Seven paired samples against current origin/main.
-benchmarks/runtime_managed_buffer_copy_profile --control-ref origin/main
-```
-
-Use platform CPU-counter tooling on binaries emitted with
-`--emit-binaries <directory>` when accepting or rejecting a serializer. Wall
-time is a secondary signal; the issue-specific gate requires fewer retired
-instructions without changed output or retained capacity.
-
 ## Compiler Memory Diagnostics
 
 These opt-in compiler benchmarks exercise production bridge actions with
 bounded synthetic fixtures. They are not runtime language comparisons and are
 deliberately excluded from `bench.sh all`.
-
-### Blorp Test Session
-
-`scripts/bench-blorp-test-session` characterizes the production `blorp test`
-route and compares test-session implementations with alternating paired runs.
-It records exact executable and explicitly named companion-input hashes,
-revision and worktree content, effective-environment and cache fingerprints,
-raw output hashes, structured gate/manifests, current timing records, session
-counters, elapsed time, and sampled peak aggregate RSS across the descendant
-process session. With `BLORP_TEST_TIMINGS=1`, the current production route
-reports discovered runnable files, their unique retained source identities and
-bytes, declared suites, aggregate suite harnesses, combined suite files and
-native executions, and individually executed source files.
-The deterministic effective artifact plan is reported once per invocation from
-the first repeat. `--repeat` deliberately rebuilds and executes the same
-batches so compilation, side effects, leak
-checks, and timeouts are exercised again. The `planned_*` names deliberately
-do not claim that compilation or execution completed; compile failures and
-individual doctest expansion remain runtime observations. The retained-source
-names likewise do not claim total discovery I/O because rejected candidates
-are not represented by the retained runnable source records.
-
-Every successful route run must execute at least one test and emit exactly one
-versioned `session_totals` record containing the required structural and plan
-counters. Optional counters report per-route coverage and receive medians only
-when present in every retained measurement. Route elapsed time stops when the
-route process is reaped; post-exit descendant verification is recorded
-separately so benchmark bookkeeping does not inflate tiny-suite latency.
-
-Timeout supervision runs independently of RSS sampling. Cleanup preflights an
-absolute `ps` executable before launching a route, tracks sampled process birth
-identities as well as PIDs, and revalidates post-reap process groups before
-signalling them. A platform without the required process metadata is rejected
-before measurement rather than producing unverifiable cleanup evidence.
-
-Run a local single-route smoke measurement with an isolated warm runtime cache:
-
-```bash
-scripts/bench-blorp-test-session \
-  --baseline bin/blorp \
-  --baseline-label current \
-  --pairs 1 \
-  --warmup-pairs 1 \
-  --cache-state isolated-warm \
-  --allow-dirty \
-  -- test --timeout 30 \
-    blorp/test/test_runtime/test_types/test_bool.brp
-```
-
-Compare two route executables with identical test arguments:
-
-```bash
-scripts/bench-blorp-test-session \
-  --baseline /path/to/baseline/blorp \
-  --candidate /path/to/candidate/blorp \
-  --workload compiler-suite \
-  --pairs 10 \
-  --warmup-pairs 1 \
-  --cache-state isolated-warm \
-  --input blorp/test/test_compiler \
-  --artifact-dir /tmp/blorp-test-session-evidence \
-  --output benchmarks/results/blorp_test_session.json \
-  -- test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_match.brp
-```
-
-Directory discovery enters only `test_*` child folders. Supply explicit suite
-files to characterize compiler stage directories with other names; the example
-above retains the compiler tree as an input fingerprint while executing one
-owning suite.
-
-Comparison mode alternates route order and requires matching characterized
-output for every pair. Runs with at least ten and at most thirty measured pairs
-report deterministic 95% bootstrap intervals for paired elapsed-time and
-sampled-RSS changes; smoke runs report paired samples without inferential
-intervals.
-
-`benchmarks/blorp_test_session_policy.json` keeps comparison and
-characterization workloads in one registry with an explicit `kind`.
-`tiny-suite` gates the upper bound of the paired elapsed-time 95% interval;
-`compiler-suite` gates the upper bound of the paired aggregate-RSS 95%
-interval. Both reject an upper bound above a 10% regression or an interval
-wider than 10 percentage points. A registered comparison must use the
-policy's exact command, isolated-warm cache state, and one warmup, with 10-30
-measured pairs in even-numbered alternating blocks and at least 10,000
-bootstrap samples. The driver records and rechecks the policy hash so the
-policy cannot change during a run. When a registered comparison exceeds
-either bound, the driver retains the JSON result and exits nonzero.
-
-The registry also includes characterization workloads for the remaining
-session shapes: many tiny compatible suites, shared-import fan-out,
-mixed shared/process/filesystem isolation, the full compiler suite, a runtime
-value-types subset, a standard-library dictionary directory, doctests,
-sanitizer, leak checking, and one oversized suite alongside a small suite. The
-runtime subset is explicit because the full directory deliberately contains
-trait-registration collision fixtures that cannot share one combined harness.
-These entries fix the command, cache state, warmup and measured run counts,
-supervisor timeout, and source inputs to fingerprint. They take the same
-exclusive contention lease as comparison evidence, but deliberately have no
-regression assessment or publication ceiling.
-
-Result schema 2 replaces the duplicated `benchmark_policy` object with a
-compact `registered_workload` object and removes `publication_ready`,
-`publication_blockers`, `statistical_policy`, and derived `evidence_level`
-fields. Consumers should use the registration's policy hash and optional
-comparison assessment alongside the direct measurement and parity fields.
-
-Run the dedicated shared-import fan-out characterization with its registered
-settings:
-
-```bash
-scripts/bench-blorp-test-session \
-  --baseline bin/blorp \
-  --baseline-label current \
-  --workload shared-import-fanout \
-  --pairs 3 \
-  --warmup-pairs 1 \
-  --timeout 180 \
-  --cache-state isolated-warm \
-  --input benchmarks/test_blorp_test_session/test_shared_import_fanout \
-  --output benchmarks/results/blorp_test_session_shared_import_fanout.json \
-  -- test --timeout 60 \
-    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_01.brp \
-    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_02.brp \
-    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_03.brp \
-    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_04.brp \
-    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_05.brp \
-    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_06.brp \
-    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_07.brp \
-    benchmarks/test_blorp_test_session/test_shared_import_fanout/test_suite_08.brp
-```
-
-Characterization refuses altered settings or fingerprint inputs. Registered
-characterization is baseline-only so its three-run sample cannot be mistaken
-for balanced candidate evidence. Use the unregistered paired mode for
-exploratory comparisons until an even-sample policy and workload-specific
-thresholds are committed. Use `--allow-dirty` only for local smoke
-measurements; retained baseline evidence must come from a clean revision.
-
-Registered runs acquire the canonical per-user host compiler contention lease
-exclusively and fail immediately while an official build/test gate holds its
-shared lease. Its predictable `/tmp` namespace and lock file are owner-checked,
-symlink-rejecting, and tightened to `0700`/`0600`. Registered runs reject the
-test-only lock-base override. The lease is advisory: other users, unrelated
-compiler invocations, and general machine load do not participate, so evidence
-still requires an otherwise idle machine.
-
-`isolated-cold` gives every route/run a fresh `BLORP_RUNTIME_CACHE` and is the
-comparison default. `isolated-warm` gives each route a separate cache reused by
-its warmup and measured runs and therefore requires at least one warmup pair.
-Test command arguments do not control runtime cache state. Use `--input` for
-shared source trees and `--baseline-input`/`--candidate-input` for
-route-specific binaries, runtime libraries, or other explicit inputs; all are
-hashed before and after the run. `--artifact-dir`
-retains raw streams and per-run JSON even when validation fails. It must name a
-new directory outside the measured worktree. Dirty worktree measurements
-require `--allow-dirty` and are marked in the result; do not use them for
-published speedup claims.
-
-The benchmark driver's phase-local feedback loop is:
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 \
-  python3 -m unittest blorp/test/test_test/test_session_benchmark.py
-```
-
-### Gate Time Profile
-
-A phase-by-phase breakdown of where `scripts/test` gate wall time goes
-(Blorp compile vs. host clang vs. execution vs. harness overhead, per-gate
-artifact/translation-unit counts, and distinct-binary launch counts), built
-from `BLORP_TEST_TIMING`/`BLORP_TEST_ARTIFACT_*` log rows under
-`--release-compiler --timings --log-dir`, is in
-[`results/gate_time_profile_2026-09-22.md`](results/gate_time_profile_2026-09-22.md).
-
-### Record Result Group Preparation
-
-`record_scalar_prepare` checks values, balanced managed allocations/releases,
-and zero live-object change for 24 rows, including the original 18 local-record
-probes. Two new mutually recursive managed-result probes share children or
-discard a fresh child. A mixed fresh/forwarded result control preserves root
-and child identity. This prepares an owned result boundary; it does not implement
-an optimization.
-
-The [recursive-result baseline](results/record_recursive_results_2026-10-07.md)
-records measured child/container counts and the remaining optimization gap.
-
-```bash
-BLORP_CLI_C_OPTIMIZATION=-O2 make
-benchmarks/record_scalar_prepare --output /tmp/record-results-baseline.json
-benchmarks/record_scalar_prepare --sanitize --output /tmp/record-results-sanitize.json
-# Future acceptance: one shared child, or N discarded children plus that child.
-benchmarks/record_scalar_prepare --require-result-groups --output /tmp/record-results-target.json
-```
-
-The default accepts any balanced container count for the recursive probes.
-`--require-result-groups` additionally requires totals of 1 and N+1 allocations
-at N=256/512; target failures retain the observed report and identify the case,
-rounds, observed count and target. Keep formatting outside the scalar counter
-intervals and serialize compiled runs.
 
 ### Compiler Record Layout
 
@@ -327,59 +110,14 @@ fields in an internal heap record, preserved scalar wire-tag and Boolean fields 
 foreign-reachable heap records, and a value struct reachable from a foreign
 signature. The runner appends a temporary layout reporter to the generated C;
 it does not modify production sources or artifacts. Use it as the fast
-feedback loop for representation work tracked in
-[record simplification](../docs/FIXED_LAYOUT_ROADMAP.md).
+feedback loop for record representation changes.
 
 ### Record Update Allocations
 
-`compiler_record_update_allocations` runs a bounded, uniquely owned heap-record
-update loop through the production compiler and reports runtime allocation
-counters:
-
-```bash
-benchmarks/compiler_record_update_allocations
-BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
-  benchmarks/compiler_record_update_allocations
-```
-
-The normal invocation asserts the optimized one-allocation baseline. Override
-`BLORP_RECORD_UPDATE_EXPECT_ALLOCATIONS` to lock in a new expected count. Set
-`BLORP_RECORD_UPDATE_MEASURE_ONLY=1` while intentionally measuring an
-optimization that is expected to change the count. Both probes always assert
-their release and live-object baselines; use
-`BLORP_RECORD_UPDATE_EXPECT_RELEASES` and
-`BLORP_RECORD_UPDATE_EXPECT_CURRENT_OBJECTS` only when intentionally changing
-those lifecycle counts.
-
-`compiler_record_update_temporary_reuse_allocations` measures a nested update in
-the same loop. The source form historically required one fallback allocation
-per iteration after reusing the dead outer temporary: `100001` allocations and
-`100000` releases for 100,000 iterations. Nested mutable self-updates now stage
-their field values and reuse the original record once, so the probe asserts one
-initial allocation, no loop releases, and one live result.
-
-```bash
-benchmarks/compiler_record_update_temporary_reuse_allocations
-BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
-  benchmarks/compiler_record_update_temporary_reuse_allocations
-```
-
-`compiler_record_update_branch_allocations` measures alternating mutable
-self-updates selected by an `if` expression. The source form historically
-retained the old owner in both branches, causing `100001` allocations and
-`100000` releases for 100,000 iterations. When every branch updates from the
-same owner, the ownership preparation pass now transfers that owner within each
-branch, so the probe asserts one initial allocation and no loop releases.
-
-```bash
-benchmarks/compiler_record_update_branch_allocations
-BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
-  benchmarks/compiler_record_update_branch_allocations
-```
-
-`compiler_record_update_match_allocations` measures the same alternating
-self-updates selected by an exhaustive Boolean `match`. Reuse is valid only
-when every returning literal branch transfers the same mutable owner.
+`compiler_record_update_match_allocations` runs a bounded loop of alternating
+self-updates selected by an exhaustive Boolean `match` through the production
+compiler and asserts the runtime allocation counters. Reuse is valid only when
+every returning literal branch transfers the same mutable owner:
 
 ```bash
 benchmarks/compiler_record_update_match_allocations
@@ -399,71 +137,14 @@ BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
   benchmarks/compiler_record_update_nested_match_allocations
 ```
 
-`compiler_dce_facts_builder_allocations` retains a focused 512-identity Core
-expression for DCE value-fact collection. It checks exact identity and order for
-first and duplicate reads and invalidations, then caps managed allocations for
-the collection window so one logical fact cannot regress into several threaded
-`DceFacts` publications:
-
-```bash
-benchmarks/compiler_dce_facts_builder_allocations
-BLORP_DCE_FACTS_SKIP_BUILD=1 \
-  benchmarks/compiler_dce_facts_builder_allocations
-```
-
-`compiler_perceus_allocations` follows the same model but drives the real
-frozen self-compile's Core instead of a synthetic fixture: it freezes an
-input revision, dumps Core just after DCE (`--dump-core-after=dce
---dump-core-file=<path>`), and runs
-`benchmarks/blorp/profiles/perceus_allocations.brp` in-process, which
-advances the dumped Core through the remaining production pass functions
-(consume specialization, static literals, record-update ownership,
-dict-literal ownership and product evaluation) to reach the Core state
-immediately before Perceus. The replay state starts below existing minted
-binder IDs in the decoded program rather than resetting the binder supply.
-The profiler then calls `insert_drops_program` and reports calls,
-allocations, and allocations per call:
-
-```bash
-benchmarks/compiler_perceus_allocations
-BLORP_PERCEUS_SKIP_BUILD=1 BLORP_PERCEUS_INPUT_REV=origin/main \
-  benchmarks/compiler_perceus_allocations
-
-# Measure the one-index-per-function construction floor on the same Core.
-BLORP_PERCEUS_PROFILE_MODE=index \
-  benchmarks/compiler_perceus_allocations
-```
-
-The committed profile calls the public Perceus entry point plus focused
-helpers from `perceus/env.brp`, `perceus/uses.brp`, and, in `index` mode,
-`perceus/index.brp`. It also uses a static traversal of the decoded program
-for the region count (functions, lambdas, and global initializers). The full per-helper breakdown for
-Perceus's private helpers (`infer_user_call_contracts`,
-`build_borrowed_owner_catalog`, the `summarize_linear_ownership_uses`
-family, `rewrite_mutable_assignments`, `protect_repeated_consumes`,
-`stabilize_nested_assignment_rhs`, the synthetic `CoreVar` constructors) was
-captured once with those declarations temporarily made non-private, then
-reverted; see
-`benchmarks/results/perceus_allocation_attribution_2026-09-22.md` for the
-exact methodology, the one-line-per-declaration edit list, and the numbers.
-
-`compiler_core_lowering_allocation_attribution` runs a synthetic 1202-node
-typed program (400 variable-declaration/initializer/reference triples, all
-carrying one shared `SemanticType` object, plus an enclosing block) through
-`lower_typed_program` and reports per-helper allocation costs for
-`core_lower_type`, `core_source_loc`, and the `CoreVar` record shape, plus a
-type-shape ablation (the same fixture lowered with a cheap `Void` type
-instead) that isolates how much of lowering's allocations come from
-rebuilding one repeated non-trivial type. It is an attribution tool, not a
-pass/fail gate — see
-`benchmarks/results/core_lowering_allocation_attribution_2026-09-22.md` for
-the measured numbers and the go/no-go decisions they produced:
-
-```bash
-benchmarks/compiler_core_lowering_allocation_attribution
-BLORP_CORE_LOWERING_ATTRIBUTION_SKIP_BUILD=1 \
-  benchmarks/compiler_core_lowering_allocation_attribution
-```
+The normal invocation asserts the optimized one-allocation baseline. Override
+`BLORP_RECORD_UPDATE_EXPECT_ALLOCATIONS` to lock in a new expected count. Set
+`BLORP_RECORD_UPDATE_MEASURE_ONLY=1` while intentionally measuring an
+optimization that is expected to change the count. Both probes always assert
+their release and live-object baselines; use
+`BLORP_RECORD_UPDATE_EXPECT_RELEASES` and
+`BLORP_RECORD_UPDATE_EXPECT_CURRENT_OBJECTS` only when intentionally changing
+those lifecycle counts.
 
 ### Frontend and Typecheck Function Profile
 
@@ -506,9 +187,6 @@ BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1 \
 This shape is closer to the self-hosted inference module's function-to-type
 declaration ratio while remaining a roughly two-second cached feedback loop.
 Use at least three alternating fallback/retained samples and compare medians.
-The 2026-07-27 baseline and bottleneck analysis are recorded in
-`results/compiler_frontend_profile_2026-07-27.md`, with raw elapsed samples in
-the adjacent `.tsv` file.
 
 The runner builds and directly uses the workspace production
 compiler CLI artifact at `blorp/build/_build/blorp-cli/blorp`, invokes its public
@@ -527,29 +205,6 @@ them as disjoint wall time. Request construction is excluded from
 use the `compiler_typecheck_benchmark_with_request` subtree when comparing the
 typecheck workload itself.
 
-### Global initializer dependency admission
-
-`compiler_global_header_dependency_profile` constructs a real callable-header
-graph before the measured window, then repeatedly invokes
-`global_header_completion_plan_build`. Initializer count, references per
-initializer, duplicate percentage, module count, and fan-in are independent
-controls. Every module defines the same dependency spellings, so the checksum
-also detects accidental name-based identity across modules.
-
-```bash
-benchmarks/compiler_global_header_dependency_profile plain
-benchmarks/compiler_global_header_dependency_profile plain 5 64 512 1 4 512
-benchmarks/compiler_global_header_dependency_profile profile 1 16 128 75 4 128
-```
-
-The summary reports reference visits, modeled growing-list comparisons,
-modeled dictionary probes, accepted dependency edges, ordered output checksum,
-managed allocation counters, and elapsed time. Setup, warmup, and observation
-are outside the measured window. Use `compiler_pass_compare` with already
-built content-addressed executables for speed claims. The accepted issue 117
-measurements are retained in
-`results/compiler_global_header_dependency_admission_2026-09-15.md`.
-
 ### Paired Production-Pass Comparison
 
 `compiler_pass_compare` is a small shared comparison driver for production-pass
@@ -565,70 +220,27 @@ timed comparison. Use `--fixture-source` for benchmark sources that must be
 byte-identical under both source roots; use `--fixture` only for shared
 external input files that are not source-root relative.
 
-`compiler_consume_candidate_index_profile` is itself a build/run driver, so use
-its paired mode for this Core pilot. Run from the candidate checkout with a
-disposable baseline worktree: the driver copies the candidate's benchmark
-sources into both roots, builds each compiler and fixture binary once per
-invocation, then alternates seven samples per compiler. The benchmark warms
-one rewrite before timing its production `rewrite_program` loop. Each compiler
-path below is the root-local `bin/blorp` installed by `make all`; the pinned
-bootstrap is only an input to that build.
-
-```bash
-for candidate_count in 8 0; do
-  benchmarks/compiler_consume_candidate_index_profile \
-    --compiler /path/to/candidate/bin/blorp \
-    --compiler-root /path/to/candidate \
-    --baseline-compiler /path/to/base/bin/blorp \
-    --baseline-compiler-root /path/to/base \
-    --samples 7 --json \
-    plain 20 256 "$candidate_count" 256 25 none \
-    > "/tmp/consume-candidate-index-${candidate_count}.json"
-done
-```
-
-The `8` run measures candidate lookup; the `0` run is the zero-query control
-and should report zero discovered candidates and clones. Each JSON result keeps
-the raw timing and allocation samples, compiler/source/binary hashes, and
-setup and generated-Core checksums. Paired mode rejects differing semantic
-fields; also confirm `workload_valid` is true for both compilers before making a
-speed claim. `setup_microseconds` remains outside the measured loop.
-
 ```bash
 benchmarks/compiler_pass_compare \
-  --label typecheck-phase-headers \
-  --baseline-bin /path/to/base/benchmarks/compiler_typecheck_phase_profile \
-  --candidate-bin /path/to/candidate/benchmarks/compiler_typecheck_phase_profile \
+  --label <label> \
+  --baseline-bin /path/to/base/benchmarks/<benchmark> \
+  --candidate-bin /path/to/candidate/benchmarks/<benchmark> \
   --baseline-source-root /path/to/base \
   --candidate-source-root /path/to/candidate \
-  --fixture-source blorp/benchmark/compiler/compiler_typecheck_phase_profile.brp \
-  --fixture-source blorp/benchmark/compiler/compiler_typecheck_phase_profile_fixture.brp \
-  --prefix TYPECHECK_PHASE_PROFILE \
-  --time-field window_elapsed_microseconds \
-  --checksum-field checksum \
-  --checksum-field constructor_lookup_checksum \
-  --stable-field stage \
-  --stable-field iterations \
-  --stable-field modules \
-  --stable-field shapes_per_module \
-  --stable-field probes_per_module \
-  --stable-field requested_import_fanout \
-  --stable-field effective_import_fanout \
-  --stable-field type_bearing_percent \
-  --stable-field primary_outputs \
-  --stable-field secondary_outputs \
-  --stable-field accepted_constructor_rows \
-  --stable-field accepted_field_rows \
+  --fixture-source blorp/benchmark/compiler/<benchmark>.brp \
+  --prefix <SUMMARY_ROW_PREFIX> \
+  --time-field <elapsed_field> \
+  --checksum-field <checksum_field> \
+  --stable-field <field_that_must_match> \
   --pairs 7 \
   --warmup-pairs 1 \
-  --results /tmp/typecheck-phase-headers-pairs.json \
-  -- headers 20 8 32 64 4
+  --results /tmp/<label>-pairs.json \
+  -- <benchmark arguments>
 ```
 
-The typecheck pilot measures the existing phase-harness production constructor
-selected by the `headers` stage. Fixture construction validates the complete
-phase chain before the profile window, while the driver records raw pairs and
-refuses a speed claim if the structural checksums diverge.
+The driver refuses a speed claim if a checksum or stable field diverges
+between the paired runs; keep the raw pairs file local and commit only a
+markdown summary.
 
 ### Core module flattening profile
 
@@ -675,171 +287,7 @@ are inclusive, so compare identical rows and call counts across sizes or
 revisions; do not add row percentages. The first invocation compiles and
 caches an instrumented benchmark binary. Set
 `BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1` when the workspace compiler is already
-current. The accepted issue 122 measurements are retained in
-`results/compiler_core_lowering_function_deduplication_2026-09-16.md`.
-
-### Scope construction profile
-
-`compiler_scope_construction_profile` isolates registration of one union type
-and its constructors in the type environment. It verifies newest-first
-same-name constructor history and the newest constructor lookup while measuring
-the whole construction interval and ARC allocation counters.
-
-```bash
-benchmarks/compiler_scope_construction_profile 20 16 4
-benchmarks/compiler_scope_construction_profile 20 64 16
-benchmarks/compiler_scope_construction_profile 20 256 64
-benchmarks/compiler_scope_construction_profile 20 1024 256
-```
-
-The positional controls are iterations, constructors per union, and distinct
-constructor names. Passing a smaller distinct-name count introduces controlled
-same-name pressure. Output includes the workload checksum, elapsed
-microseconds, allocation/release counts, live-object count, allocated bytes,
-and `workload_valid=True` only when constructor lookup and complete history
-match the fixture.
-
-### Environment symbol history profile
-
-`compiler_env_symbols_named_profile` isolates ordered symbol-history collection
-across shadowed type-environment scopes. It builds the environment outside the
-timed window, then repeatedly queries one duplicated name and one absent name.
-The result reports scope visits, matching symbols returned, modeled prefix
-elements recopied by the old concat-across-scopes shape, allocation counters,
-five elapsed samples, and an ordered identity checksum.
-
-```bash
-benchmarks/compiler_env_symbols_named_profile 1000 128 2 1 5 1
-benchmarks/compiler_env_symbols_named_profile 1000 512 2 1 5 1
-benchmarks/compiler_env_symbols_named_profile 2000 8 2 1 5 1
-```
-
-The positional controls are iterations, scope count, matching variables per
-nonempty scope, overloads per nonempty scope, empty-scope stride, and unrelated
-symbols per nonempty scope. Set
-`BLORP_ENV_SYMBOLS_NAMED_PROFILE_FUNCTIONS=1` for `--profile` function rows;
-use the default optimized executable for elapsed-time comparisons.
-
-### Infer session reconstruction profile
-
-`compiler_infer_session_reconstruction_profile` compares the current private
-fresh-body state construction pattern against direct `TypecheckState`
-construction from the same immutable body seed. The fixture uses allocator
-reset/stats around each path and checks that preserved module facts remain
-identical while stale body-local context, errors, diagnostics, and memo entries
-are cleared.
-
-```bash
-benchmarks/compiler_infer_session_reconstruction_profile 10000
-```
-
-This is a focused allocation fixture only. Production replay with
-`benchmarks/compiler_typecheck_replay` decides whether a source change is
-accepted.
-
-### Isolated typechecking phases
-
-`compiler_typecheck_phase_profile` measures one pure constructor from the
-migrated Phase 1-3 typechecking architecture. It validates and retains the
-complete phase chain once, then resets function-profile counters and repeats
-only the requested stage. Fixture construction and result reporting are outside
-the function-profile window.
-
-```bash
-benchmarks/compiler_typecheck_phase_profile indexed
-benchmarks/compiler_typecheck_phase_profile source-names 10 32 32 0 8 4 4 memory
-benchmarks/compiler_typecheck_phase_profile source-names 10 32 0 32 8 4 4 memory
-benchmarks/compiler_typecheck_phase_profile importable 20 8 32 64 4
-benchmarks/compiler_typecheck_phase_profile skeleton 20 8 32 64 4
-benchmarks/compiler_typecheck_phase_profile headers 20 8 32 64 4
-```
-
-Available stages are `indexed`, `importable`, `bound`, `skeleton`, `aliases`,
-`parameters`, `headers`, and `accepted`. Each run prints deterministic output
-counts and a structural checksum in addition to setup and measured wall-clock
-times. The checksum covers phase-owned identities and principal output shape;
-it is a benchmark equivalence guard, not a complete serialization of retained
-parsed AST. Focused phase tests remain the semantic authority.
-`window_elapsed_microseconds` includes the begin/end transition so timing calls
-remain outside the function-profile window. Use the same fixture dimensions
-and iteration count for before/after comparisons.
-
-The `source-names` workload prepares and validates the complete indexed graph,
-then measures only production source-name catalog construction over the ordered
-prepared programs. Its positional controls are iterations,
-module count, unique declarations per module, declarations shared by every
-module, requested imported module count, selected symbols per import,
-constructors per selected symbol, and optional `memory`. The reported effective
-import count is bounded by the module count. The first example is duplicate-light;
-the second is duplicate-heavy at the same declaration width. The summary
-reports candidate, unique, and duplicate counts plus the exact ordered catalog
-checksum. In profile output, subtract the registration call
-from each `source_name_catalog_work_*` row. Use the collection-copy summary's
-dictionary counters to detect builder COW; allocation and native-instruction
-comparisons require matched optimized binaries because exact function profiling
-emits unoptimized C.
-
-Set the wrapper to `plain` and disable debug markers for optimized allocation
-and elapsed-time measurements:
-
-```bash
-BLORP_COMPILER_BENCHMARK_INSTRUMENTATION=plain \
-BLORP_COMPILER_BENCHMARK_DEBUG=0 \
-benchmarks/compiler_typecheck_phase_profile \
-  source-names 10 32 96 0 8 4 4 memory
-```
-
-### Known-Type Membership Profile
-
-`compiler_known_type_index_profile` isolates prescan registration and repeated
-ordinary/resource membership queries:
-
-```bash
-benchmarks/compiler_known_type_index_profile
-benchmarks/compiler_known_type_index_profile 5 50 2048 2048
-```
-
-The positional controls are registration iterations, lookup iterations, names
-per kind, and queries per kind. Duplicate registration is included and the
-workload verifies that every resource type is also a known type while ordinary
-types never acquire resource capability. The runner is optimized rather than
-function-instrumented and skips rebuilding the compiler by default. Source
-changes still invalidate its cached executable.
-
-Use `alias` mode to isolate full alias expansion without parsing or graph-wide
-typechecking work:
-
-```bash
-BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1 \
-  benchmarks/compiler_typecheck_profile 20 16 64 128 alias
-```
-
-In this mode the positional controls are iterations, alias-chain depth,
-structural target depth, and resolutions per iteration. The
-`ALIAS_RESOLUTION_PROFILE_BENCH` summary reports logical alias expansions and
-result nodes. Pair those values with the profile call counts for
-`env_resolve_alias_seen`, `apply_subst`, and
-`compiler_env_copy_type` to distinguish required traversal from defensive
-reconstruction. The fixture is deterministic and validates every resolved type
-against the structural target.
-
-Use `alias-register` mode to isolate the persistent-environment boundary that
-stores transparent alias targets:
-
-```bash
-BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1 \
-  benchmarks/compiler_typecheck_profile 256 16 64 1 alias-register
-```
-
-The positional controls are iterations, aliases per fresh environment, and
-structural target depth; the fourth numeric argument is ignored but retained so
-the workload selector remains the fifth argument. Target construction is
-excluded from elapsed time. The timed workload includes registration plus one
-validating lookup and structural comparison per environment. The summary
-reports logical registrations and the recursive copy nodes attributable to
-baseline registration. Subtract candidate from baseline
-`compiler_env_copy_type` calls to isolate those registration copies; the
-remaining calls belong to validation.
+current.
 
 ### Import Graph Profile
 
@@ -898,9 +346,8 @@ as `setup_microseconds` and excluded from `elapsed_microseconds`. Every timed
 iteration validates artifact, declaration, import, diagnostic, CTFE execution,
 and rewritten-global results; `workload_valid=True` is required for a usable
 sample. The fixture also records the expected reachable and irrelevant body
-counts from its generated shape. Those are not observed materialization
-counters yet; Phase 6 adds those before this benchmark can prove that widening
-a module does not materialize irrelevant bodies.
+counts from its generated shape; these are not observed materialization
+counters.
 
 The optimized cached executable is the per-edit feedback loop. Compiler-source
 changes require one cold rebuild; repeated samples then execute the cached
@@ -911,71 +358,10 @@ exists to skip even the workspace build check. Use
 materialization. Instrumented elapsed time is not comparable with the default
 optimized result.
 
-The baseline, prescan result, and profile interpretation are recorded in
-`results/compiler_ctfe_typecheck_profile_2026-08-10.md`. Keep the narrow
+Keep the narrow
 `64 1` depth control beside a wide run when evaluating a change: optimizing
 only dependency-order list mechanics should not be mistaken for reducing
 semantic registration or body checking.
-
-### Bound Visibility Width Profile
-
-`compiler_visibility_width_profile` isolates the graph `ModuleView` keyed occupancy
-relation from parsing, graph construction, and definition-ID lookup. It varies
-the number of dependency modules, alias/selective/local names, duplicate
-attempts, and successful queries independently. The first three counts set
-the bound row width. Duplicate aliases must be idempotent; duplicate selective
-names must conflict without adding rows or bindings. The bound-query checksum
-combines resolved graph module IDs and checked imported paths; it does not
-prove exact selective `DefinitionId` targets or accepted semantic IDs.
-
-```bash
-benchmarks/compiler_visibility_width_profile 1000 16 32 32 16 16 128
-benchmarks/compiler_visibility_width_profile 1000 16 128 128 64 64 512
-benchmarks/compiler_visibility_width_profile 1000 16 128 128 64 64 512 0 1
-benchmarks/compiler_visibility_width_profile 1000 16 128 128 64 64 512 0 1 1
-BLORP_VISIBILITY_WIDTH_PROFILE_FUNCTIONS=1 \
-  benchmarks/compiler_visibility_width_profile 1 16 32 32 16 16 128
-```
-
-The first seven positional controls are iterations, dependency modules,
-aliases, selective imports, locals, duplicate attempts, and queries. An
-optional eighth flag (`1`) reuses alias spellings for selectives, separating
-row width from ordered binding count. An optional ninth flag (`1`) batches
-the initial local-name rows before alias/selective admission; the default
-per-name mode uses that same locals-first order. The candidate tuples for
-batch mode are prepared outside the timed window.
-An optional tenth flag (`1`) uses scope-local graph import admission and
-publishes one view after aliases, selectives, and duplicate decisions; `0`
-keeps scalar per-candidate registration as the direct comparison. Keep the
-ninth flag fixed when comparing those two modes. Setup uses the
-compiler's validated definition identities, then constructs a source-name
-catalog for this direct low-level view workload; this is not a full importer
-or accepted-graph benchmark. `requested_name_operations` counts public
-registration/query requests, not native string hashes or internal index probes.
-Memory `allocated_bytes` is net live bytes after the measured window, not
-cumulative allocation traffic. Profile mode attributes function calls but
-uses unoptimized generated C, so its elapsed time is not comparable to the
-plain run. Binder privacy and diagnostic order are checked separately in the
-declaration suite.
-
-### Constructor Admission Profile
-
-`compiler_constructor_admission_profile` isolates repeated validated graph
-constructor selections. Setup builds one indexed union constructor and a
-source-name catalog outside the measured window; each iteration imports that
-constructor under distinct local names, then projects the accepted constructor
-bindings. Use it to compare occupancy writes, allocation calls, and native
-instructions without measuring parser or graph construction:
-
-```bash
-benchmarks/compiler_constructor_admission_profile 100 64
-/usr/bin/time -l env BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
-  benchmarks/compiler_constructor_admission_profile 100 64
-```
-
-The positional controls are iterations and constructor-import width. This is
-a low-level admission workload, not an accepted-union or source-binder fixture;
-the declaration suite covers that handoff.
 
 ### Module Binding Profile
 
@@ -1000,11 +386,10 @@ on the final state after elapsed timing stops.
 
 `baseline_alternate_candidate_pressure`,
 `baseline_surface_symbol_comparison_pressure`, and
-`baseline_import_binding_comparison_pressure` describe the work performed by
-the list-scanning implementation at the benchmark's introduction. They are not
-required costs: elapsed and inclusive function time should fall when Phase 2
-replaces those scans with graph-owned indexes, even when the number of semantic
-lookup calls remains fixed. Use
+`baseline_import_binding_comparison_pressure` model the work of a
+list-scanning implementation. They are not required costs: elapsed and
+inclusive function time can fall with graph-owned indexes even when the number
+of semantic lookup calls stays fixed. Use
 `BLORP_MODULE_BINDING_PROFILE_FUNCTIONS=1` when exact function call counts are
 needed; plain mode remains the fast comparison loop.
 
@@ -1029,58 +414,6 @@ so one cache key describes one effective compiler graph.
 `BLORP_TYPECHECK_PROFILE_COMPILER` may override the compiler CLI. Set
 `BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1` after building that executable separately
 when repeated source-level measurements should avoid the workspace build check.
-
-### Module Visibility Profile
-
-`compiler_module_visibility_profile` isolates resolved dependency-closure
-traversal through the production `ImportableModuleIndex`. Setup parses and
-indexes a deterministic module graph; the measured loop starts from the
-requested roots and validates the exact visible-module order against an
-independent integer-graph traversal:
-
-```bash
-benchmarks/compiler_module_visibility_profile
-benchmarks/compiler_module_visibility_profile 1000 128 1 1 chain user
-benchmarks/compiler_module_visibility_profile 1000 128 all 1 dense mixed
-```
-
-The positional controls are iterations, module count, imports per module
-(`all` or an integer), root count, graph shape (`empty`, `chain`, `star`,
-`layered`, or `dense`), and origin mode (`user` or `mixed`). Output keeps the
-requested and effective import limits separate and reports fixture-modeled
-resolved edges and queue/adjacency reads, visible modules, checksum, errors,
-elapsed time, and allocator counters. Modeled counts are deterministic workload
-facts; they are not observations of private index contents or production
-function-call instrumentation.
-
-Use `BLORP_COMPILER_BENCHMARK_WORKSPACE_ROOT` to compare implementations in
-separate source trees. Both trees must contain the same fixture and runner.
-Pair and alternate runs, and require identical semantic fields before
-comparing cost.
-
-### Typecheck Name Lookup Profile
-
-`compiler_typecheck_name_lookup_profile` isolates the typecheck state's
-top-level and imported-name indexes. It builds the state outside the timed
-lookup region and validates hit and miss results on every iteration:
-
-```bash
-benchmarks/compiler_typecheck_name_lookup_profile
-benchmarks/compiler_typecheck_name_lookup_profile 500 512 512
-```
-
-The positional controls are the starting iteration count, registered names of
-each kind, and queries of each kind per iteration. The executable doubles the
-iteration count until a calibration sample reaches 50 ms or the one-million
-iteration cap, then reports the minimum, median, and maximum of five timed
-samples. Setup and calibration time remain outside those samples.
-`nanoseconds_per_lookup` normalizes comparisons when calibration selects
-different iteration counts. The wrapper skips
-rebuilding the full compiler because the workload imports the edited typecheck
-source directly. Set
-`BLORP_COMPILER_BENCHMARK_SKIP_BUILD=0` when the compiler executable itself
-must be refreshed. Cached runs use an optimized uninstrumented executable; set
-`BLORP_NAME_LOOKUP_PROFILE_FUNCTIONS=1` only when exact function rows are needed.
 
 ### Typecheck Type-Shape Scanning
 
@@ -1169,18 +502,6 @@ and its execution order, and reports median paired latency and peak-RSS
 percentage changes. Negative changes mean the candidate used less time or
 memory than the baseline.
 
-`compiler_type_ownership` is the fast preset for ownership work. It combines
-bounded resource scans and `Self` resolution, performs two warmups and six
-measured runs, and accepts trailing overrides:
-
-```bash
-benchmarks/compiler_type_ownership
-benchmarks/compiler_type_ownership --runs 9 --self-resolution-depth 96
-benchmarks/compiler_type_ownership \
-  --bridge /tmp/candidate/compiler_typecheck_worker \
-  --baseline-bridge /tmp/baseline/compiler_typecheck_worker
-```
-
 The runner uses `BLORP_TYPECHECK_BENCHMARK_WORKER` when it names an existing
 worker. `--bridge PATH` overrides it. Otherwise, the runner builds a disposable
 worker from `blorp/benchmark/compiler/compiler_typecheck_worker.brp` with the
@@ -1191,17 +512,6 @@ measurements remain auditable.
 The benchmark CI workflow runs the smallest fixture without an override before
 the standard suite. That smoke compiles and links the real worker, executes it,
 and validates its streamed response on each benchmark platform.
-
-`compiler_type_instantiation` is the fast preset for generic type
-instantiation work. Its signatures combine unchanged, partially changed, and
-fully changed recursive transforms in the same request:
-
-```bash
-benchmarks/compiler_type_instantiation
-benchmarks/compiler_type_instantiation \
-  --bridge /tmp/candidate/compiler_typecheck_worker \
-  --baseline-bridge /tmp/baseline/compiler_typecheck_worker
-```
 
 ### Captured Typecheck Replay
 
@@ -1245,8 +555,6 @@ reports parsed graph size, retained CTFE
 program declarations and typed-expression nodes, artifact nodes, and modules
 that exist simultaneously as retained CTFE and emitted typed programs. These
 are logical structure counts, not allocator-byte estimates.
-The recorded self-hosted result and its dominant checkpoint intervals are in
-[`compiler_typecheck_capture_2026-08-26.md`](results/compiler_typecheck_capture_2026-08-26.md).
 Artifact inventory distinguishes a second typed representation
 (`duplicates_retained_ctfe=1`) from direct reuse of the retained CTFE program
 (`reuses_retained_ctfe=1`). Reuse is permitted only when the dependency
@@ -1355,214 +663,7 @@ top-level callable identifier counts and lengths, compile-to-C time/RSS,
 `--compiler-root` to measure another checkout while retaining the same fixture
 bytes. Pass the paired `--baseline-compiler` and `--baseline-compiler-root`
 arguments for timing comparisons; paired mode alternates execution order for
-each sample. The one-sample form is the fast artifact-census loop. Retained
-callable-projection results are in
-`results/compiler_c_symbol_projection_2026-08-23.md`.
-
-`compiler_c_symbol_projection_profile` isolates symbol planning, Core
-projection, and validation from the rest of compilation:
-
-```bash
-BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
-  benchmarks/compiler_c_symbol_projection_profile calls 3 256 96 16
-```
-
-It verifies every projected definition and call against the callable's compact
-artifact-local definition ID. Retained hash-baseline and compact-ID profile
-results are in `results/compiler_c_symbol_projection_profile_2026-08-23.md`;
-the zero-copy emission-plan result is in
-`results/compiler_c_symbol_zero_copy_2026-09-15.md`.
-
-### Core Pipeline Work Profile
-
-`compiler_core_pipeline_work_profile` runs a deterministic synthetic Core
-program through one exact production Core pass entry point and reports a stable
-work row. The fixture controls function count, expression nodes per function,
-union declarations, aliases, callable declarations, call density, union-match
-density, and duplicate-name pressure independently so one-axis scaling can
-identify superlinear work.
-
-```bash
-benchmarks/compiler_core_pipeline_work_profile \
-  1 match_projection 64 64 32 32 64 4 8 0
-
-for unions in 8 16 32 64 128 256 512; do
-  benchmarks/compiler_core_pipeline_work_profile \
-    1 match_projection 64 64 "$unions" 8 64 0 4 0
-done
-
-for nodes in 16 32 64 128 256; do
-  benchmarks/compiler_core_pipeline_work_profile \
-    1 consume_specialize 64 "$nodes" 32 8 64 4 0 0
-done
-```
-
-Rows print `CORE_PIPELINE_WORK_PROFILE` with input/output declaration and
-expression counts, pass-dispatch counters, conservative reconstruction fields,
-targeted declaration lookup candidates for instrumented pass families, allocator
-stats, elapsed microseconds, and deterministic checksums. Use these rows before
-choosing a production Core optimization; do not extrapolate synthetic wins
-without a production self-compilation replay.
-
-### Early-Core Invariant Scan Profile
-
-`compiler_core_invariant_scan_profile` isolates the production debug, mono,
-synth, or resolve invariant check from fixture construction and structural
-census work. The clean compiler-shaped fixture retains ordered violation and
-workload checksums while function profiling supplies actual traversal call
-counts across revisions.
-
-```bash
-benchmarks/compiler_core_invariant_scan_profile plain 100 resolve 64 256
-benchmarks/compiler_core_invariant_scan_profile plain 100 synth 64 256
-
-# Unchanged single-family controls.
-benchmarks/compiler_core_invariant_scan_profile plain 100 debug 64 256
-benchmarks/compiler_core_invariant_scan_profile plain 100 mono 64 256
-
-# Profile builds expose exact helper call counts and inclusive/self time.
-benchmarks/compiler_core_invariant_scan_profile profile 10 resolve 64 256 \
-  2>/tmp/blorp-core-invariant-profile.txt
-```
-
-Use at least one node-count series and matched optimized baseline/candidate
-binaries. Preserve the full ordered diagnostic sequences in unit tests; the
-clean performance fixture intentionally expects zero violations.
-
-### Core Match Binding Profile
-
-`compiler_core_match_binding_profile` calls the production
-`compile_match_cases` boundary with fixture construction, warmup, and semantic
-observation outside the measured window. The recursive shape varies binding
-width and nesting depth. The prefix pair uses the same payload widths and moves
-the wide payload from the first constructor column to the last, isolating work
-that depends on the already-retained arm prefix without comparing the two
-different semantic checksums to each other.
-
-```bash
-benchmarks/compiler_core_match_binding_profile plain recursive 100 128 8 1
-benchmarks/compiler_core_match_binding_profile plain prefix-early 100 128 0 16
-benchmarks/compiler_core_match_binding_profile plain prefix-late 100 128 0 16
-benchmarks/compiler_core_match_binding_profile plain recursive 1000 2 0 1
-
-benchmarks/compiler_core_match_binding_profile profile recursive 100 128 8 1 \
-  2>/tmp/compiler-core-match-binding-profile.txt
-```
-
-Each row reports input and emitted bindings, leaf and owned-spread counts,
-modeled elements transferred by the original recursive and retained-prefix
-`concat` shapes, allocator counters, elapsed microseconds, and an ordered
-name/accessor/mode checksum. Compare each shape only with the same shape from
-another compiler build. The profile form additionally exposes production
-binding-list `concat` call counts and runtime collection-copy counters.
-The accepted reverse-sequence result and paired raw samples are in the
-[`retained result`](results/compiler_core_match_binding_accumulation_2026-09-15.md).
-
-### Core Pattern Membership Profile
-
-`compiler_core_pattern_membership_profile` reaches the two production boolean
-pattern-binding queries through their public owners: `compile_match_cases` for
-free-name shadowing and `convert_program` for closure consumption analysis.
-Fixture construction, warmup, and serialized output checks stay outside the
-measurement window.
-
-```bash
-benchmarks/compiler_core_pattern_membership_profile plain match early 10 512 64
-benchmarks/compiler_core_pattern_membership_profile plain match miss 10 512 64
-benchmarks/compiler_core_pattern_membership_profile plain closure late 5 512 64
-benchmarks/compiler_core_pattern_membership_profile plain closure early 500 2 1
-```
-
-Vary `early`, `late`, and `miss` to distinguish short-circuit behavior. Each
-row reports the expected name comparisons, allocator counters, elapsed time,
-and a checksum of the complete production result. Compare only matching rows
-from baseline and candidate builds. The accepted result and paired samples are
-in the [`retained result`](results/compiler_core_pattern_membership_2026-09-15.md).
-
-### Inference Constructor Coverage Profile
-
-`compiler_infer_constructor_coverage_profile` calls the production
-`infer_expr` match path and varies case count, alternatives per `or`, unique
-outer constructors, and consecutive duplicate stride independently. Fixture
-construction, warmup, and diagnostic observation stay outside the measured
-window. Every valid fixture covers all generated constructors except one
-declaration-last sentinel, so the benchmark verifies the exact diagnostic and
-the number of typed match cases.
-
-```bash
-benchmarks/compiler_infer_constructor_coverage_profile plain 50 16 64 128 4
-benchmarks/compiler_infer_constructor_coverage_profile plain 10000 1 2 2 1
-benchmarks/compiler_infer_constructor_coverage_profile profile 1 16 64 128 4 \
-  2>/tmp/compiler-infer-constructor-coverage-profile.txt
-```
-
-Arguments are `iterations`, `cases`, `options`, `unique`, and
-`duplicate-stride`. The first row is a duplicate-heavy wide workload; the
-second is the two-constructor control. Each row reports modeled outer-pattern
-visits, allocator counters, elapsed time, exact diagnostic checksum, typed case
-count, and validity. The accepted membership-index result and paired samples
-are in the
-[`retained result`](results/compiler_infer_constructor_coverage_2026-09-15.md).
-
-### Inference Capture-Name Profile
-
-`compiler_inference_capture_name_profile` calls the production `infer_expr`
-lambda path with an ordered list of captured bindings. Fixture construction,
-warmup, and exact diagnostic observation stay outside the measured window.
-Capture width controls the number of distinct free names; qualifying percent
-controls how many of those bindings are mutable and therefore selected by the
-last of the four capture filters.
-
-```bash
-benchmarks/compiler_inference_capture_name_profile plain 50 512 100
-benchmarks/compiler_inference_capture_name_profile plain 10000 2 100
-benchmarks/compiler_inference_capture_name_profile profile 1 512 100 \
-  2>/tmp/compiler-inference-capture-name-profile.txt
-```
-
-Arguments are `iterations`, `capture-width`, and `qualifying-percent`. Each row
-reports the ordered-unique producer width, total capture-filter input visits,
-qualifying names, the number of redundant comparisons the former consumer
-deduplication would perform, allocator counters, the exact diagnostic
-checksum, and validity. The comparison-opportunity field describes the fixed
-workload; use exact function-profile call counts to verify whether an
-implementation actually performs those admissions. Compare only identical
-workloads and fixture hashes across compiler builds.
-
-### Consume Candidate Index Profile
-
-`compiler_consume_candidate_index_profile` isolates `consume_specialize` by
-building one Core fixture outside the measured window, warming one rewrite, and
-then timing only repeated production `rewrite_program` calls. The fixture builds
-production Core functions with source-managed parameters, assignment calls that
-can retarget to consuming clones, optional same-definition-ID/different-name
-collision pressure, and a zero-candidate control.
-
-```bash
-benchmarks/compiler_consume_candidate_index_profile plain 1 256 8 256 25 none
-benchmarks/compiler_consume_candidate_index_profile plain 1 64 0 256 25 none
-benchmarks/compiler_consume_candidate_index_profile \
-  plain 1 64 8 256 25 same-def-different-name
-
-benchmarks/compiler_consume_candidate_index_profile \
-  --compiler /path/to/candidate/bin/blorp \
-  --compiler-root /path/to/candidate \
-  --baseline-compiler /path/to/base/bin/blorp \
-  --baseline-compiler-root /path/to/base \
-  --samples 7 \
-  plain 20 256 8 256 25 none
-```
-
-Use each checkout's built compiler for this comparison; the pinned bootstrap
-only builds those compilers through `make`.
-
-Single-compiler rows print `CONSUME_CANDIDATE_INDEX_PROFILE` with discovered
-candidates, emitted clone count, allocator stats, measured rewrite
-microseconds, generated-Core JSON checksum/bytes, compiler/source hashes, and
-benchmark binary hash. Paired rows alternate baseline and candidate execution
-order, overlay byte-identical benchmark sources into both roots, require
-matching generated-Core checksums, and report median elapsed and allocation
-ratios.
+each sample. The one-sample form is the fast artifact-census loop.
 
 ### Captured Backend Replay
 
@@ -1589,7 +690,7 @@ The fixture emits the same backend bridge envelope as a production capture and
 keeps function count, tree shape, and generated C stable across layout changes.
 
 For callable-symbol emission work, generate the bounded 256-function,
-16-calls-per-function request used by the retained projection profile:
+16-calls-per-function request used by the callable-symbol projection profile program:
 
 ```bash
 request=$(mktemp "${TMPDIR:-/tmp}/blorp-c-symbol-projection.XXXXXX.json")
@@ -1679,8 +780,7 @@ and prepared Core.
 
 For end-to-end emission, `generated_c_ownership_census` also reports cleanup
 frame declarations, cleanup-scope guards, and cleanup push/pop/duplicate calls.
-These metrics provide the deterministic generated-C census used by the
-cancellation-cleanup optimization roadmap; compare their values together with
+These metrics provide a deterministic generated-C census; compare their values together with
 `generated_c_bytes`, elapsed time, and peak memory rather than counting source
 text with ad hoc shell patterns.
 
@@ -1710,8 +810,7 @@ explicit record-transfer slots per function. Both use fixed 128-node bodies and
 ordinary name-only heap-record parameters. The borrowed-result fixture uses a
 fixed 256-node body with a balanced 32-terminal result tree; one traversable
 padding subtree remains outside result position. None adds real alias work as
-the owner-count axis grows. Branch and cancellation fixtures will be added with
-the tranches that consume them. Use `--end-to-end` to run
+the owner-count axis grows. Use `--end-to-end` to run
 ownership preparation, Perceus, and the complete post-Perceus tail before
 measuring backend emission. That result includes separate retain, release,
 ARC-only release, cleanup-push, and cleanup-pop counts from the generated
@@ -1808,8 +907,7 @@ parameters. Each outer lambda contains twelve consuming calls, twelve
 transferring record fields, twelve result terminals, and one fixed nested
 lambda region. This preparation matrix deliberately excludes captures and
 globals: their current name-mode overlap would make source-kind timing
-comparisons ambiguous. It records the scalar owner-scaled parent behavior for
-the later lambda-catalog cutover:
+comparisons ambiguous:
 
 ```bash
 benchmarks/compiler_perceus_memory \
@@ -1832,8 +930,9 @@ and the median paired candidate/baseline ratio. Worker processes have a
 60-second default timeout; override it with `--timeout`.
 
 The result reports median elapsed time, median absolute deviation, peak RSS,
-request and worker hashes, and a stable artifact hash. Durable baseline results
-belong under `benchmarks/results/`.
+request and worker hashes, and a stable artifact hash. Record a durable result as one
+markdown summary under `benchmarks/results/`; keep the raw samples under the
+ignored `build/` directory.
 
 `vmmap` sampling perturbs elapsed time, so use regular runs for timing and
 sampled runs for allocator detail. Requests, responses, emitted C, and
@@ -1940,20 +1039,11 @@ Rules:
    baseline and candidate checkouts, as verified in the example above. A
    changed small program is a different workload even if `--input-rev` matches.
 
-Retained baselines live in `benchmarks/results/self_compile_baseline_*.json`
-and `self_compile_small_baseline_*.json`; a new baseline is recorded only when
-the input revision or host changes. Legacy records used one diagnostics-capable
-binary with runtime profiling disabled for instruction samples. Comparing a
-schema-1 baseline with a schema-2 candidate is supported for the accounting
-mode experiment; the harness prints a mode warning so the instruction delta
-is interpreted as part of that experiment. Baselines
-recorded before the toolchain
-fingerprint was added have no `toolchain` key at all; comparing against one
-of them prints a warning ("baseline predates fingerprint recording") instead
-of a hard refusal, and instruction-count deltas against them should be read
-with that in mind rather than trusted outright. Existing baseline files are
-not rewritten retroactively — fingerprints are recorded from this change
-forward only.
+Baseline JSON is raw data: keep it under the ignored `build/` directory and
+commit only a markdown summary of the comparison. A baseline recorded without
+a toolchain fingerprint has no `toolchain` key; comparing against one prints a
+warning ("baseline predates fingerprint recording") instead of a hard refusal,
+so read its instruction-count deltas with that in mind.
 
 For intentional code-generation changes, omit `--require-identical` when
 comparing baseline with candidate; use generated-C review, behavioral and
@@ -1992,179 +1082,6 @@ compiler's own generated-C size is a tracked metric for codegen work. Both
 scripts respect `BLORP_CLI_C_OPTIMIZATION` the same way `make` does; export it
 before building, checking freshness, and measuring so all three agree on the
 optimization level.
-
-### Sampling A Pass
-
-Allocation counters and the exact function profile say how often a pass runs
-its own code; they do not say how much of a pass is runtime work. For that,
-sample the compiler with `sample` and attribute the pass's subtree. Build the
-symbol map and the sampled binary from the *same* generation: `sample` cannot
-resolve the `static` functions in `bin/blorp` by name, and the `brp_NNNN`
-symbol identifiers differ between an embedded-runtime build and a
-`--no-embed-runtime` one, so a map lifted from a differently-configured binary
-points silently into the wrong code (the symptom is a pass with zero samples
-and an unexplained hole in the sampled address range). Generate a profiled C
-only to read its metadata table, which carries
-`{"<blorp name>", "brp_NNNN", "<module>", ...}` rows, then generate and link a
-plain C with identical flags as the target; `--profile-mode calls` does not
-shift the identifiers. Parse `sample`'s call graph by indentation, mark the
-topmost node of each pass subtree, and take self samples per symbol; they sum
-to the subtree's inclusive total. Charge `_tlv_get_addr` to the callers that
-read the thread-local before grouping.
-
-```bash
-boot=$(scripts/blorp-compiler-bootstrap --print-path)
-input=$(benchmarks/self_compile_measure freeze --rev <input_rev>)
-mod=blorp/src/compiler/stage_09_core/perceus
-$boot compile --profile-mode calls --profile-module $mod --no-embed-runtime \
-  --std-dir standard_library/src --no-format -o /tmp/map.c blorp/src/main.brp
-$boot compile --no-embed-runtime --std-dir standard_library/src --no-format \
-  -o /tmp/plain.c blorp/src/main.brp
-cc -O2 -fwrapv -pipe -w -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
-  -include blorp/src/lib/runtime/native/minicoro.h \
-  -c blorp/src/lib/runtime/native/runtime.c -o /tmp/rt.o
-cc -O0 -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
-  -include blorp/src/lib/runtime/native/runtime_decl.c \
-  -Iblorp/src/compiler/stage_01_generated_inputs -Iblorp/src/compiler/stage_04_modules \
-  -Iblorp/src/compiler/stage_06_typecheck/graph -Iblorp/src/compiler/stage_06_typecheck/type_system \
-  -Iblorp/src -Iblorp/src/lib -Iblorp/src/lsp/server -Iblorp/src/test \
-  /tmp/plain.c /tmp/rt.o blorp/build/_build/blorp-cli/runtime_sources.c \
-  blorp/src/lsp/server/native_runtime.c -lm -lpthread -o /tmp/blorp-sampled
-/tmp/blorp-sampled compile --no-format --no-embed-runtime \
-  --std-dir $input/standard_library/src -o /tmp/x.c $input/blorp/src/main.brp &
-sample $! 70 1 -file /tmp/sample.txt
-```
-
-The `-O0` module code against an `-O2` runtime matches how `make` links
-`bin/blorp`, so the runtime-versus-generated split is the one the harness
-measures. `valgrind` and `callgrind` are not available on macOS.
-
-Attribute the resulting `sample.txt` with `benchmarks/attribute_sample`:
-
-```bash
-benchmarks/attribute_sample /tmp/sample.txt --pass blorp/src/compiler/stage_09_core/perceus --map /tmp/map.c
-```
-
-`--pass` matches a raw symbol in the sample directly (a `brp_NNN` id, or a
-runtime symbol like `blorp_cooperative_checkpoint`), and, with `--map`
-(the metadata table a `--profile-mode calls` generation embeds), also against
-the blorp function name or module path there. It finds the topmost matching
-node(s) (a pass can be entered from more than one call site), sums their
-inclusive samples, and prints the runtime symbols underneath by inclusive
-sample count and the same cost categories the roadmap tables use (generated
-code, reference counting, cleanup frames, allocation, list ops, string/dict
-lookups, other), charging `_tlv_get_addr` back to whichever function called
-it.
-
-### Typecheck Cost Attribution
-
-`BLORP_TYPECHECK_BODY_METRICS=1` makes any compile print where the typed
-frontend spent its time, to stderr, once per typechecked graph. It also turns on
-the runtime's lightweight allocation counter, so no other variable is needed.
-With the variable unset nothing is printed and the generated C, the phase
-allocations, and the retired instructions are unchanged.
-
-Two row kinds, both flushed together:
-
-```text
-BLORP_TYPECHECK_PHASE phase=bound_modules microseconds=18256 allocations=117768
-BLORP_TYPECHECK_BODY scope=dependency microseconds=1970 allocations=6555 source_lines=29 module=bytes callable=write_int32_be
-BLORP_TYPECHECK_BODY_TOTAL scope=dependency bodies=598 microseconds=54233 allocations=335086
-```
-
-Phase rows come first, in the order the frontend runs them: `indexed_graph`,
-`importable_modules`, `module_scopes`, `importable_index`, `bound_modules`,
-`ctfe_dependency_plan`, `declaration_skeletons`, `alias_dependencies`,
-`resolved_type_parameters`, `type_headers`, `trait_topology`,
-`callable_headers`, `implementation_headers`, `graph_completion`,
-`ctfe_dependencies`, `ctfe_globals`, `module_bodies`. Two of them are parents of
-rows printed before them: `graph_completion` contains `accepted_aliases`,
-`accepted_records`, `accepted_unions`, `accepted_globals`,
-`global_header_completion` and `accepted_graph`. `global_header_completion` in
-turn contains `prepare_products`, `prepare_bases`, `prepare_traits`,
-`prepare_trait_authority`, `prepare_callables`, `prepare_impls`, and
-`prepare_environments`, in that execution order. `module_bodies` contains every
-`BLORP_TYPECHECK_BODY` row. Do not add a parent and its children together.
-
-Body rows follow, sorted by elapsed time, one per checked body, then three
-`BLORP_TYPECHECK_BODY_TOTAL` rows for `project`, `dependency` and `all`.
-`scope` is the module's origin: a standard-library or package module is a
-`dependency`, a module of the program under compilation is `project`. Run it
-with `--time-phases` to relate the rows to the `typed_frontend` phase total.
-
-### Core Lowering Type Histogram
-
-`BLORP_CORE_LOWERING_TYPE_METRICS=1` makes any compile print, to stderr, how
-many times `core_lower_type_with_prefixes`
-(`blorp/src/compiler/stage_08_core_lower/lower.brp`) was called, a histogram
-of the top 30 lowered `CoreType` objects by allocation identity (the same
-notion `blorp_same_object` compares — never a structural key, so this
-counts pointer reuse, not shape repetition), aggregate `core_source_loc`/
-`core_var` call and allocation counters, and a per-`TypedExpr`-kind
-self/inclusive allocation table, all keyed with the same C-side hash-table
-pattern `BLORP_TYPECHECK_BODY_METRICS` uses. With the variable unset it is
-one branch per call and no allocation; with it set, recording a pointer (or
-an already-computed allocation-counter delta) still allocates nothing, so
-`core_lowering_complete`'s row is identical whether the variable is set or
-not — an earlier version keyed the type histogram by
-`core_type_to_json(...).to_string()`, which allocated on every call and
-inflated that row roughly 4x while the variable was on; see
-`core_lowering_allocation_attribution_2026-09-22.md`'s "Instrumentation
-correctness bug" section. `lower_typed_program_with_ctfe_replacements`
-flushes the counters once per module, so they are cumulative -- the last
-line before a run ends is the whole compile's total:
-
-```bash
-BLORP_MEMORY_STATS=1 BLORP_CORE_LOWERING_TYPE_METRICS=1 bin/blorp compile \
-  --stop-after=lower --no-format --std-dir <std> <entry>.brp >/dev/null 2>lower_histogram.log
-```
-
-```text
-BLORP_CORE_LOWERING_TYPE_METRICS schema=1 calls=1275600 distinct=876528
-BLORP_CORE_LOWERING_TYPE_TOP rank=1 count=167823 object=0xa2f044d80
-BLORP_CORE_LOWERING_SOURCE_LOC schema=1 calls=748990 allocations=1497980
-BLORP_CORE_LOWERING_VAR schema=1 calls=348992 allocations=348992
-BLORP_CORE_LOWERING_NODE_KIND kind=TypedNameExpr calls=271793 self_allocations=3802949 inclusive_allocations=3802949 self_per_call=13.992
-```
-
-See `benchmarks/results/core_lowering_type_histogram_2026-09-22.md` (the
-original type-only histogram; see its errata note) and
-`benchmarks/results/core_lowering_allocation_attribution_2026-09-22.md`'s
-real-program section for the corrected full tables and the design decisions
-they produced (module-level constants for arg-less scalar types, not a
-per-function memo).
-
-### Perceus Engine Allocation Attribution
-
-`BLORP_PERCEUS_ENGINE_METRICS=1` makes any compile print, to stderr, a
-self/inclusive allocation table for the Perceus drop-insertion engine
-(`insert_drops_expr_inner_result` and the `insert_drops_change_aware_*`/
-`rewrite_loop_body`/`inserted_expr`/`plan_managed_let`/`rebuild_managed_let`/
-`add_resolved_value`/`without_bound_value` helpers in
-`blorp/src/compiler/stage_09_core/perceus/results_and_loops.brp`), keyed by
-the visited `CoreExpr`'s own kind tag for the engine's per-node dispatch and
-by a `helper:<name>` label for each named helper, plus construction counts
-for `PerceusInsertedExpr`, `PerceusManagedLetPlan`,
-`PerceusInsertBindingFrameStack` frames and `PerceusResolvedValueIndex`
-updates. Same design as `BLORP_CORE_LOWERING_TYPE_METRICS` above: an
-enter/exit stack over the runtime's own total-allocation counter, keyed by a
-short static string, never a rendered/structural value, so
-`pass_perceus_complete`'s allocation row is identical whether the variable
-is set or not. `insert_drops_program` flushes the counters once per
-compile, right before returning:
-
-```bash
-BLORP_MEMORY_STATS=1 BLORP_PERCEUS_ENGINE_METRICS=1 bin/blorp compile \
-  --no-format --no-embed-runtime --std-dir <std> -o /tmp/out.c <entry>.brp 2>perceus_engine.log
-```
-
-```text
-BLORP_PERCEUS_ENGINE_CONSTRUCT schema=1 kind=PerceusInsertedExpr count=1849101
-BLORP_PERCEUS_ENGINE_NODE kind=helper:rebuild_managed_let calls=57472 self_allocations=15605213 inclusive_allocations=15605213 self_per_call=271.527
-```
-
-See `benchmarks/results/perceus_engine_attribution_2026-09-22.md` for the
-full tables and the go/no-go calls for the roadmap's P3/P4/P5 issues.
 
 ## Timing Model
 
@@ -2249,15 +1166,13 @@ blorp compiles to C with ARC memory management. Common overhead sources are:
 4. **String construction** — immutable string operations need fusion, COW, or
    builder-like paths to avoid repeated copying.
 
-### Callable-header registration profile
+## Recording Results
 
-`compiler_callable_header_profile` runs bounded `typecheck_graph` workloads
-with independent module, header, parameter, and dimension-constraint controls.
-Its summary reports accepted/error counts, checksum, allocations, and elapsed
-time; stderr emits fixed-schema `CALLABLE_HEADER_PROFILE_COUNTERS` values from
-the same profile window. Function times are inclusive and must not be summed.
-
-```bash
-BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
-  benchmarks/compiler_callable_header_profile 5 8 128 4 2 fallback
-```
+A measurement lands as one markdown file, `benchmarks/results/<topic>_<date>.md`,
+that stands on its own: host, source and binary revisions, flags, input hash,
+commands, run order, sample count, headline numbers with spread, output
+identity and caveats. Raw samples, logs, manifests, copied C and per-run
+directories stay under the ignored `build/` directory; `.gitignore` admits only
+markdown into `benchmarks/results/`. Link each report from the plan, README,
+cost ceiling or source comment it supports, and delete the report when that
+decision is superseded.
