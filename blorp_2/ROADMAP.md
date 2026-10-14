@@ -80,6 +80,16 @@ reviews and combined integration pass; see the
 General non-tail joins remain restricted.
 The pilot cannot self-compile yet.
 
+The combined milestone through declaration inventory is validated for main:
+2,090 sanitized unit/runtime/grammar checks and 325 normal-main e2e cases pass,
+with independent component and integration reviews. Declaration IDs are issued
+once in assembly; ownership classification belongs to concrete specialization;
+known concrete nominal requirements reject during checking. The
+[authority repair report](../benchmarks/results/blorp_2_authority_fixes_2026-10-13.md)
+records the matched costs and remaining limits. Validating namespace publication
+and removing downstream visibility rechecks remains a separate follow-up;
+declaration inventory does not establish that stronger namespace guarantee.
+
 | Order | Working increment | Dependency and verdict |
 | --- | --- | --- |
 | 1 | [Mixed finite records and safe field projections](#first-increment-mixed-finite-records) | Accepted: independent reviews, per-object runtime oracles, matched costs and combined strict/native gates pass. |

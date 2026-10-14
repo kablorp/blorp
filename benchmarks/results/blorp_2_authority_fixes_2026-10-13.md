@@ -483,3 +483,41 @@ each append. The final row publication acquires its fields once. Source syntax
 rows incur the expected managed wrappers; no duplicated raw union variant vector
 is published. This supports the narrow construction claim, not global compiler
 linearity. Full normal-main e2e remains the final combined gate after part B.
+
+## Final landing through declaration inventory
+
+The user selected landing all completed Blorp 2 work on main. Main and both
+remote branches were at `3f98023dc`; local blorp-2 contained the accepted aggregate
+milestone at `a16328a59`. The completed repair branch includes that milestone,
+tuple cleanup, upstream ownership facts, concrete admission, the preparation
+test and declaration inventory. Namespace part B was not implemented and remains
+a separate follow-up. This final gate supersedes the earlier plan to wait for B
+before the combined e2e run; it does not claim validated namespace publication.
+
+A small port onto main's older model was reviewed and passed 115 focused checks,
+then preserved under `build/main-tuple-ownership/` when the user clarified the
+landing scope. That port is excluded from the landing and these final counts.
+Its unrelated older representations are not mixed into the accepted milestone.
+
+Fresh validation on clean `cc47af75b` passes 2,090 sanitized unit/runtime/grammar
+callbacks in 137 suites (29.615s) and all 325 normal-main e2e cases (179.378s).
+The e2e run generates and links its compiler exactly once. Both receipts have
+no source drift or timeout; the strict receipt reports balanced allocations,
+and e2e stderr is empty (`final-strict`, `final-e2e`). Two independent compiler
+experts checked the component-review correspondence and final test receipts;
+neither claims an independent review of their own implementation.
+
+The actual compiler produced by that e2e run is SHA-256
+`a70b0f147a73d02034c4b4e92c48768fb3c80ea687291ae224b9c98f39282146`.
+Its C remains exactly `88c211bfdcf97033c53864aaa104fc16c88a039125a8e220495e51cdb4e52e45`;
+the final cost run uses this freshly linked binary, not the earlier binary.
+Against the original frozen a163 compiler, 216 paired samples over all 36 frozen
+inputs are strictly balanced and emit identical C. Maximum allocations increase
+by 2.397525%, and maximum minimum retired instructions increase by 1.243547%,
+below the unchanged 5% ceiling and the 3% target (`final-cost-receipt`). Source,
+library, input and binary hashes are retained; these are owned-input CLI proxies,
+not self-compilation measurements.
+
+The complete branch descends from main, so landing preserves the reviewed history
+with a fast-forward. Host compiler, standard library and scripts are unchanged;
+the diff is confined to Blorp 2 and its retained benchmark reports.
