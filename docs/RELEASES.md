@@ -162,8 +162,8 @@ and sanitizer routes:
 
 ```bash
 env BLORP_TIMEOUT=5 bin/blorp test blorp/test/test_runtime/test_types/test_bool.brp
-env BLORP_STD=standard_library/src BLORP_NO_FORMAT=1 \
-  bin/blorp check blorp/test/test_runtime/test_types/test_bool.brp
+env BLORP_NO_FORMAT=1 \
+  bin/blorp check --std-dir standard_library/src blorp/test/test_runtime/test_types/test_bool.brp
 env BLORP_SANITIZE=1 bin/blorp test --timeout 5 \
   blorp/test/test_runtime/test_types/test_bool.brp
 ```

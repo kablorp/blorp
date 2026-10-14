@@ -3537,6 +3537,12 @@ selects a project standard library, and `[packages]` declares source-package
 aliases. Command-line overrides and common environment variables are listed by
 `--help`.
 
+The standard-library directory is chosen once, in this order: the `--std-dir`
+flag, then `[std].path` from `blorp.toml`, then the copy embedded in the
+compiler. There is no environment variable for it. If source roots in one run
+find `blorp.toml` files that name different directories and no `--std-dir` was
+given, the compiler reports the conflict.
+
 Additional runtime and native-build controls are:
 
 | Variable | Purpose |
