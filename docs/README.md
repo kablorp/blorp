@@ -49,8 +49,8 @@ module inventory lives in
 ## Open Issues And Plans
 
 The old compiler under `blorp/src` stays as the working host and receives fixes
-only; plans to improve it are retired. [Diagnostic Gaps](DIAGNOSTIC_GAPS.md)
-owns diagnostic-quality findings and indexes compiler faults. The successor
+only; plans to improve it are retired. [Compiler Faults](COMPILER_FAULTS.md)
+lists its open defects. The successor
 compiler and its plans live under [`blorp_2/`](../blorp_2/README.md).
 
 ## Maintenance Rules
@@ -58,7 +58,7 @@ compiler and its plans live under [`blorp_2/`](../blorp_2/README.md).
 - Reference docs describe current behavior, not migration history.
 - Work is handed off in messages that follow the [Handoff Spec](HANDOFF_SPEC.md).
   A known problem that needs a durable record lives in the plan or ledger that
-  owns it, such as [Diagnostic Gaps](DIAGNOSTIC_GAPS.md). GitHub is read-only
+  owns it, such as [Compiler Faults](COMPILER_FAULTS.md). GitHub is read-only
   for this project; assignees and discussion do not belong in this tree.
 - A plan for active work lives in this directory and holds only open work.
   When a step lands, delete it from the plan in the same change (Git history
