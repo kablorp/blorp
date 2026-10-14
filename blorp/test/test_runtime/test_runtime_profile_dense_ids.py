@@ -432,6 +432,7 @@ class RuntimeDenseProfileIdTests(unittest.TestCase):
     def test_calls_mode_counts_without_timing_or_stack_work(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #include "minicoro.h"
             #include "runtime.c"
@@ -550,6 +551,7 @@ class RuntimeDenseProfileIdTests(unittest.TestCase):
     def test_calls_mode_polls_deferred_termination_signals(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #include "minicoro.h"
             #include "runtime.c"
@@ -616,6 +618,7 @@ class RuntimeDenseProfileIdTests(unittest.TestCase):
     def test_exact_signal_report_accounts_parked_fiber_frames(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define BLORP_PROFILE_EXACT_TIMING 1
             #define MINICORO_IMPL
             #include "minicoro.h"

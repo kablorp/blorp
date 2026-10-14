@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[3]
 # and a live-object check built on the lightweight allocator statistics.
 PRELUDE = textwrap.dedent(
     """\
+    #define _GNU_SOURCE
     #define MINICORO_IMPL
     #include "minicoro.h"
     #include "runtime.c"

@@ -30,6 +30,7 @@
  *       -lm -lpthread -o /tmp/profile_cases
  *   ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 /tmp/profile_cases <name>
  */
+#define _GNU_SOURCE
 #define BLORP_PROFILE_EXACT_TIMING 1
 #define MINICORO_IMPL
 #include "minicoro.h"

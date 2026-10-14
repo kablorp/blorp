@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[3]
 RUNTIME_INCLUDE = ROOT / "blorp/src/lib/runtime/native"
 
 SOURCE = r'''
+#define _GNU_SOURCE
 #define MINICORO_IMPL
 #define BLORP_MEMORY_DIAGNOSTICS 1
 #include "minicoro.h"

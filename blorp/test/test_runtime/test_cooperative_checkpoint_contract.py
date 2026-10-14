@@ -14,6 +14,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 RUNTIME_INCLUDE = ROOT / "blorp" / "src" / "lib" / "runtime" / "native"
 
+# Feature selection must precede minicoro's system headers; runtime.c's
+# later _GNU_SOURCE definition cannot expose declarations already omitted.
+
 
 class CooperativeCheckpointContractTests(unittest.TestCase):
     def compile_and_run(self, source: str, name: str) -> subprocess.CompletedProcess[str]:
@@ -55,6 +58,7 @@ class CooperativeCheckpointContractTests(unittest.TestCase):
     def test_budget_boundary_and_non_fiber_slow_poll(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #define BLORP_COOPERATIVE_CHECKPOINT_TESTING 1
             #include "minicoro.h"
@@ -100,6 +104,7 @@ class CooperativeCheckpointContractTests(unittest.TestCase):
     def test_cancellation_is_polled_at_every_remaining_budget_offset(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #define BLORP_COOPERATIVE_CHECKPOINT_TESTING 1
             #include "minicoro.h"
@@ -158,6 +163,7 @@ class CooperativeCheckpointContractTests(unittest.TestCase):
     def test_budget_resets_before_cancellation_longjmp(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #define BLORP_COOPERATIVE_CHECKPOINT_TESTING 1
             #include "minicoro.h"
@@ -197,6 +203,7 @@ class CooperativeCheckpointContractTests(unittest.TestCase):
     def test_budget_is_thread_local_and_survives_task_transitions_and_yield(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #define BLORP_COOPERATIVE_CHECKPOINT_TESTING 1
             #include "minicoro.h"

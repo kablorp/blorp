@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[3]
 # Each scenario name selects one fatal path in the harness below.
 HARNESS_SOURCE = textwrap.dedent(
     """\
+    #define _GNU_SOURCE
     #define MINICORO_IMPL
     #include "minicoro.h"
     #include "runtime.c"

@@ -19,6 +19,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
     def test_first_append_to_shared_empty_list_starts_with_four_slots(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #include "minicoro.h"
             #include "runtime.c"
@@ -119,6 +120,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
         # copy-then-release growth path performed.
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #include "minicoro.h"
             #include "runtime.c"
@@ -252,6 +254,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
     def test_optimized_allocation_does_not_require_frame_pointers(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #include "minicoro.h"
             #include "runtime.c"
@@ -322,6 +325,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
     def test_memory_stats_counters_do_not_enable_object_metadata(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #include "minicoro.h"
             #include "runtime.c"
@@ -418,6 +422,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
     def test_reset_starts_an_exact_metadata_tracked_epoch(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #include "minicoro.h"
             #include "runtime.c"
@@ -501,6 +506,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
     def test_compiler_memory_checkpoints_report_process_and_managed_memory(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #include "minicoro.h"
             #include "runtime.c"
@@ -627,6 +633,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
         # process memory belongs to allocator_bytes_in_use only.
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #include "minicoro.h"
             #include "runtime.c"
@@ -702,6 +709,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
     def test_reading_stats_never_starts_counting(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #include "minicoro.h"
             #include "runtime.c"
@@ -740,6 +748,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
         # object's release crosses the reset boundary before worker stress.
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #include "minicoro.h"
             #include "runtime.c"
@@ -813,6 +822,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
     def test_strict_leak_check_reports_types_and_exits_99(self) -> None:
         source = textwrap.dedent(
             """\
+            #define _GNU_SOURCE
             #define MINICORO_IMPL
             #include "minicoro.h"
             #include "runtime.c"
