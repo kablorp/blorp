@@ -39,8 +39,7 @@ private func test_environment_discovery_keeps_configuration_structured() -> Bool
 		xdg_cache_home = None,
 		home = None,
 		temporary_root = "/tmp",
-		raylib_prefix = Some("/raylib root"),
-		discover_raylib_prefix = True
+		discover_raylib_prefix = False
 	}
 	probe: HostEnvironmentProbe = {
 		input = environment_input,
@@ -55,7 +54,7 @@ private func test_environment_discovery_keeps_configuration_structured() -> Bool
 		Ok(environment):
 			(
 				environment.cache_root == "/cache root"
-				and environment.raylib_prefix == Some("/raylib root")
+				and environment.raylib_prefix == None
 				and environment.tls.backend == HostTlsOpenSsl
 				and environment.tls.runtime_arguments == [
 					"-DBLORP_TLS_BACKEND_PROFILE_OPENSSL=1",
@@ -85,7 +84,6 @@ private func test_unsupported_tls_does_not_probe_pkg_config() -> Bool:
 		xdg_cache_home = Some("/xdg"),
 		home = Some("/home"),
 		temporary_root = "/tmp",
-		raylib_prefix = None,
 		discover_raylib_prefix = False
 	}
 	probe: HostEnvironmentProbe = {
@@ -115,8 +113,8 @@ private pure func completed_host_probe(output: String) -> HostProcessExecution:
 	})
 
 
-private func test_optional_raylib_probe_preserves_interruption() -> Bool:
-	probe: HostEnvironmentProbe = {
+private pure func raylib_discovery_probe() -> HostEnvironmentProbe:
+	{
 		input = {
 			tls_backend = None,
 			openssl_compile_arguments = None,
@@ -125,7 +123,6 @@ private func test_optional_raylib_probe_preserves_interruption() -> Bool:
 			xdg_cache_home = None,
 			home = None,
 			temporary_root = "/tmp",
-			raylib_prefix = None,
 			discover_raylib_prefix = True
 		},
 		toolchain = {
@@ -142,7 +139,11 @@ private func test_optional_raylib_probe_preserves_interruption() -> Bool:
 		brew_program = "fake-brew"
 	}
 
-	runner: (ProcessCommand) -> HostProcessExecution = func(request):
+
+private pure func macos_runner_with_brew(
+	brew_result: HostProcessExecution,
+) -> (ProcessCommand) -> HostProcessExecution:
+	func(request):
 		if request.program == "fake-uname":
 			completed_host_probe("Darwin\n")
 		else if request.program == "fake-cc" and request.args.contains("-dumpmachine"):
@@ -150,12 +151,30 @@ private func test_optional_raylib_probe_preserves_interruption() -> Bool:
 		else if request.program == "fake-cc":
 			completed_host_probe("Apple clang version 18.0\n")
 		else:
-			HostProcessInterrupted(15, bytes(2), bytes(3))
+			brew_result
 
-	match discover_compiler_host_environment_with_runner(probe, runner):
+
+private func test_optional_raylib_probe_preserves_interruption() -> Bool:
+	runner: (ProcessCommand) -> HostProcessExecution = macos_runner_with_brew(
+		HostProcessInterrupted(15, bytes(2), bytes(3)),
+	)
+
+	match discover_compiler_host_environment_with_runner(raylib_discovery_probe(), runner):
 		Err(HostPlatformInterrupted(signal, stdout, stderr)):
 			signal == 15 and stdout.length() == 2 and stderr.length() == 3
 		_:
+			False
+
+
+private func test_raylib_prefix_comes_from_homebrew() -> Bool:
+	runner: (ProcessCommand) -> HostProcessExecution = macos_runner_with_brew(
+		completed_host_probe("/opt/homebrew/opt/raylib\n"),
+	)
+
+	match discover_compiler_host_environment_with_runner(raylib_discovery_probe(), runner):
+		Ok(environment):
+			environment.raylib_prefix == Some("/opt/homebrew/opt/raylib")
+		Err(_):
 			False
 
 
@@ -204,6 +223,10 @@ tests: TestSuite = {
 		(
 			"optional raylib probe preserves interruption",
 			test_optional_raylib_probe_preserves_interruption,
+		),
+		(
+			"raylib prefix comes from Homebrew",
+			test_raylib_prefix_comes_from_homebrew,
 		),
 		(
 			"host program resolution inputs are explicit",

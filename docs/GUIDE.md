@@ -3550,8 +3550,6 @@ Additional runtime and native-build controls are:
 | `BLORP_MEMORY_STATS` | Turn on managed-allocation counters (diagnostic runtime only; `run --memory-stats` sets it) |
 | `BLORP_LEAK_CHECK` | Report leaked objects on exit: `1`, `verbose` (per object), or `strict` (exit 99 on a leak; diagnostic runtime only) |
 | `BLORP_FIBER_STACK_SIZE` | Fiber stack size in bytes |
-| `BLORP_FIBER_STACK_CACHE_BYTES` | Maximum cached bytes for dead fiber stacks; `0` disables |
-| `BLORP_FIBER_OBJECT_CACHE_COUNT` | Maximum cached dead fiber handles; `0` disables |
 | `BLORP_OPENSSL_CFLAGS` | C compiler flags for the OpenSSL TLS backend |
 | `BLORP_OPENSSL_LIBS` | Linker flags for the OpenSSL TLS backend |
 | `BLORP_PACKAGE_CACHE` | Source-package cache root; default `$XDG_CACHE_HOME/blorp/packages`, else `$HOME/.cache/blorp/packages` |
