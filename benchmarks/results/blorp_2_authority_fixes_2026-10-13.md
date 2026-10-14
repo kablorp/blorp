@@ -227,3 +227,65 @@ sides. This measures the complete pilot CLI on owned inputs, not self-compilatio
 An independent compiler expert approved the exact frozen production/test patch
 with zero findings. Broader sanitized and e2e gates remain integration work for
 the combined changes; no final release acceptance is claimed by this slice.
+
+## Reviewed namespace implementation contract
+
+Two compiler experts approved the detailed inventory/namespace design. Implement
+it as two separately green parts after admission's checker edits settle.
+
+Part A issues identities in `declarations.issue_inventory` once during assembly
+sealing. Parser module syntax remains raw. One opaque DeclarationInventory owns
+issued function, record and union rows; ParsedContents holds that inventory
+instead of three raw declaration vectors. Function/record rows pair their ID
+with raw syntax. A union row owns its metadata and ordered issued variant rows,
+replacing the raw variant vector rather than retaining both copies.
+
+```blorp
+fixed record FunctionRow {
+    id: FunctionId,
+    declaration: ParsedFunction
+}
+fixed record VariantRow {
+    id: VariantId,
+    declaration: ParsedVariant
+}
+```
+
+Raw function/record/union/variant ID constructors become private to the issuing
+module. Accepted and checked rows carry those issued references; no consumer
+reconstructs them from vector positions. Specialization keeps its separate
+concrete instance domain. A read-only two-vector nominal-order query replaces
+the current checker merge without storing another index. Small direct test
+fixtures use the real inventory producer with actual syntax, not unchecked
+count-based ID minting or opaque casts.
+
+Part B makes `build_namespace` return `Result[Namespace, NamespaceFailure]`.
+Successful namespace facts contain no import problems. Namespace-owned typed
+failures retain source/previous-declaration provenance and map into existing
+CheckError categories at a short adapter; namespace never imports checking.
+Module-level function/type/variant and import visibility clashes move into this
+producer. Generic parameter/binding uniqueness, field labels, annotations,
+receiver compatibility and expected-type constructor selection stay in checking.
+
+Preserve foundation-first and existing import-group priority, then validate
+local type/variant clashes in nominal order and duplicate functions in inventory
+order. Local visibility errors intentionally precede annotation/body errors;
+exact mixed-error tests establish that priority. Same-spelled function/type
+declarations and constructors in distinct unions remain valid where they are
+valid today. Forwarded type/variant identities and definition-site scope remain
+unchanged, and ordinary function imports remain non-reexporting.
+
+Unique direct function/type lookups return Options from validated namespace
+facts, eliminating duplicate direct visibility/uniqueness work. UFCS retains
+its accepted receiver view, with named/local origin preference over method-only
+selection; no accepted signature table enters namespace. Remove its now-redundant
+direct-visibility discriminator in that same producer-to-consumer change.
+
+Issuance is linear in declarations plus variants; use local unique builders and
+freeze once. Do not add growing-vector threading, a graph solver or cache. Part
+A estimates +100–190 production lines; B estimates −180–280, with combined target
+−40–130. Report actual production/test counts separately, without deleting
+coverage or compressing formatting. Stop for review on substantial combined
+growth. Each refactor separately retains the +3% frozen-input allocation and
+instruction ceiling and identical emitted fixture C; all combined changes retain
+the original +5% ceiling.
