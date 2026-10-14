@@ -294,9 +294,11 @@ not a prerequisite for running the tests.
 CI's macOS Blorp 2 lane waits for the existing compiler's build and restores
 that toolchain artifact. It runs unit, runtime, grammar and tooling suites,
 then the e2e suite with `--timeout 0`. The e2e suite uses that host compiler to
-build the pilot once and test every fixture. macOS supplies the
-retired-instruction counters required by the e2e cost checks. A failing suite
-blocks packaging and uploads its test log.
+build the pilot once and test every fixture. Hosted macOS runners may omit
+retired-instruction counters, so that CI step explicitly sets
+`BLORP_2_INSTRUCTION_CHECK=disabled`. Allocation caps, strict leak reports and
+all native ASan/UBSan cases still run. A failing suite blocks packaging and
+uploads its test log.
 
 [`test_end_to_end.brp`](test/e2e/test_end_to_end.brp) is the sole e2e test
 entrypoint; the other case modules provide groups to it and are not standalone
@@ -307,8 +309,13 @@ reuse that binary with explicit argument vectors, byte stdin and exact exit stat
 assertions. Every example has a first case and a list of remaining cases;
 existing examples have one case. Failures identify the case and mismatched
 channel, with output shown as hex so embedded NUL and UTF-8 bytes remain visible.
-Allocation and instruction counters come from the same compilation, once per
-fixture. These checks never reuse output from an earlier fixture compilation.
+By default, `BLORP_2_INSTRUCTION_CHECK` is `required`: allocation and retired-
+instruction counters come from the same compilation, once per fixture. Missing,
+malformed or nonpositive instruction counters remain errors. Explicit `disabled`
+skips `/usr/bin/time` and instruction limits, records instructions as unmeasured,
+and keeps allocation parsing and caps. Empty or unknown settings reject before
+fixture compilation or output changes. These checks never reuse output from an
+earlier fixture compilation.
 
 Every host-compiled source module has a matching unit suite under `test/unit/`.
 The designated target base/prelude are loaded from the explicit library root; they are not host modules.
@@ -403,13 +410,15 @@ Building the compiler with the existing compiler, compiling the emitted C,
 and running the generated program happen outside the cost measurements.
 Allocation counts cover Blorp-managed ARC objects and require zero leaks.
 The `-O0` pilot runs once per fixture with strict allocation diagnostics enabled;
-macOS `/usr/bin/time -l` collects instructions for that same run. Instruction
-counts include allocation bookkeeping and reporting. They are development-test
+in the default `required` mode, macOS `/usr/bin/time -l` collects instructions
+for that same run. Instruction counts include allocation bookkeeping and reporting. They are development-test
 ceilings, and are not directly comparable to the historical minimum of three
 uninstrumented `-O2` runs in the binding increment record.
 
-The instruction check currently requires macOS `/usr/bin/time -l` and its
-retired-instruction counter. Missing or malformed measurements fail the test.
+The default instruction check requires macOS `/usr/bin/time -l` and its
+retired-instruction counter. Missing or malformed required measurements fail
+the test. CI explicitly selects `BLORP_2_INSTRUCTION_CHECK=disabled` because hosted
+runners may lack this counter; that mode retains strict allocation reports and caps.
 The first limits were established on arm64 macOS with Apple Clang 21. See the
 [cost record](../benchmarks/results/blorp_2_costs_2026-10-08.md) for baselines,
 commands, provenance, and measurement limits.

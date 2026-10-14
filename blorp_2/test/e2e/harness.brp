@@ -1,6 +1,8 @@
 import:
 	bytes: to_hex
-	cost: CompilationCost, CostLimits, check_limits, parse_allocations, parse_instructions
+	cost:
+		CompilationCost, CostLimits, InstructionCheck(RequiredInstructions, DisabledInstructions),
+		check_limits, format_cost, parse_allocations, parse_instruction_check, parse_instructions
 	fs: IOError, resource_path, temporary_directory
 	process:
 		ProcessCommand,
@@ -136,39 +138,48 @@ func measure_compilation_cost(
 	directory: String,
 	example: Example,
 ) -> Result[CompilationCost, String]:
-	-- One fresh compilation supplies both counters and the native program's C.
+	-- Validate explicit policy before touching fixture outputs or invoking its compiler.
+	instruction_check ?= parse_instruction_check(getenv("BLORP_2_INSTRUCTION_CHECK"))
 	removed_c ?= remove_existing_file(directory + "/program.c")
-	removed_report ?= remove_existing_file(directory + "/instructions.txt")
-	compiled ?= run_successfully(
-		"/usr/bin/time",
-		[
-			"-l",
-			"-o",
-			directory + "/instructions.txt",
-			"/usr/bin/env",
-			"BLORP_LEAK_CHECK=strict",
-			compiler,
-			"--library-root",
-			"blorp_2/standard_library_temp",
-			example.fixture,
-			directory + "/program.c",
-		],
-	)
+	arguments = [
+		"BLORP_LEAK_CHECK=strict",
+		compiler,
+		"--library-root",
+		"blorp_2/standard_library_temp",
+		example.fixture,
+		directory + "/program.c",
+	]
+	-- Both modes compile exactly once with the same compiler arguments and leak mode.
+	compilation: Result[ProcessOutput, String] = match instruction_check:
+		RequiredInstructions:
+			removed_report ?= remove_existing_file(directory + "/instructions.txt")
+			run_successfully(
+				"/usr/bin/time",
+				["-l", "-o", directory + "/instructions.txt", "/usr/bin/env"].concat(arguments),
+			)
+		DisabledInstructions:
+			run_successfully("/usr/bin/env", arguments)
+	compiled ?= compilation
 
 	if compiled.stdout() != "":
 		Err("the compiler must have empty stdout on success")
 	else:
 		verified ?= verify_generated_c(directory + "/program.c", example.expected_c)
 		allocations ?= parse_allocations(compiled.stderr())
-		report ?= read_file(directory + "/instructions.txt")
-		instructions ?= parse_instructions(report)
-		print(
-			example.name + " compiler: allocations=" + allocations.to_string() + "/" + example.limits.allocations.to_string() + "; instructions=" + instructions.to_string() + "/" + example.limits.instructions.to_string(),
-		)
-		Ok({
+		instruction_result: Result[Option[Int], String] = match instruction_check:
+			RequiredInstructions:
+				report ?= read_file(directory + "/instructions.txt")
+				count ?= parse_instructions(report)
+				Ok(Some(count))
+			DisabledInstructions:
+				Ok(None)
+		instructions ?= instruction_result
+		cost: CompilationCost = {
 			allocations = allocations,
 			instructions = instructions,
-		})
+		}
+		print(example.name + " compiler: " + format_cost(cost, example.limits))
+		Ok(cost)
 
 
 func verify_native_result(directory: String, expected_exit: Int) -> Result[Void, String]:

@@ -30,10 +30,14 @@ Changes under `blorp_2/` are validated with `make -C blorp_2 test`;
 CI's macOS Blorp 2 lane restores the existing compiler's build artifact and
 runs unit, runtime, grammar and tooling suites, then e2e tests. The e2e suite
 builds the pilot once using the restored compiler and runs every fixture.
-macOS supplies the `/usr/bin/time -l` retired-instruction counters required by
-the cost checks. E2e disables the suite timeout; the CI job retains its
-45-minute limit. Failures upload the unit and e2e logs, and packaging waits
-for the matching platform's test lanes.
+Hosted macOS runners may omit `/usr/bin/time -l` retired-instruction counters,
+so the CI step explicitly sets `BLORP_2_INSTRUCTION_CHECK=disabled`. It skips
+only instruction measurement and limits; allocation caps, strict leak parsing,
+native sanitizers and every fixture remain enabled. Local e2e defaults to
+`required`; missing counters still fail, and empty or unknown settings reject.
+E2e disables the suite timeout; the CI job retains its 45-minute limit. Failures
+upload the unit and e2e logs, and packaging waits for the matching platform's
+test lanes.
 
 ## Focused compiler checks
 
