@@ -80,9 +80,7 @@ import:
 		CoreType(BoxedResultType, UnionType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType, StackResultType, TensorType, TupleType, TypeParameterType, VoidType),
 		CoreUnboxKind(PointerUnbox),
 		CoreVar,
-		core_expr_own_node_id,
 		core_expr_type,
-		core_node_id_raw,
 		core_var_equal,
 		core_vars_have_same_definition,
 		product_build_values,
@@ -107,50 +105,6 @@ import:
 	env: OwnershipCallableId, PerceusEnv, contract_for_call, is_managed_type
 	mutable: assignment_rhs_returns_alias
 	results_and_loops: binary_operands_are_borrowed
-
-
--- Local rebinding of the BLORP_PERCEUS_ENGINE_METRICS hooks declared in
--- perceus/results_and_loops.brp (see that file's own foreign block for the
--- design note). There is no re-export in Blorp, so a module that wants to
--- call these foreign functions binds its own name to the same C symbol
--- rather than importing the name across the dependency direction (this
--- module is imported BY results_and_loops.brp, not the other way around).
--- The enabled check itself is read once per program into
--- `PerceusEnv.engine_metrics_enabled` (see perceus/env.brp), so this module
--- only needs the enter/exit hooks.
-foreign:
-	private pure func perceus_engine_node_enter() -> Void = "blorp_perceus_engine_node_enter_c"
-	private pure func perceus_engine_node_exit(
-		kind: String,
-	) -> Void = "blorp_perceus_engine_node_exit_c"
-	-- Duplicate-summary census hooks (BLORP_PERCEUS_ENGINE_METRICS): identity
-	-- of `name` and `expr` at every call to `summarize_linear_ownership_uses`,
-	-- so a call reached from outside this module's own recursion (a depth
-	-- counter kept in `runtime.c` distinguishes the two) can be checked against
-	-- every other external call already seen within the same
-	-- `rebuild_managed_let` invocation. Never renders or hashes either
-	-- argument -- the identity check is a raw pointer compare, the same
-	-- primitive `memory.same_object` exposes as `blorp_same_object`. A no-op
-	-- unless `BLORP_PERCEUS_ENGINE_METRICS` is set.
-	--
-	-- Second-attempt measurement of the Perceus summary memo: the
-	-- `node_id` argument is `core_node_id_raw(core_expr_own_node_id(expr))`, or
-	-- 0 when `expr` has no node id of its own (the `LetExpr`/`BorrowLetExpr`/
-	-- `SeqExpr` wrappers) -- 0 is never treated as a hit. It feeds a second,
-	-- wider-scoped table (reset per function body, not per managed-let
-	-- invocation) that answers a different question than the census above:
-	-- how often the *same node* is re-summarized for the *same variable name*
-	-- anywhere within one function, which is the scope the summary memo design
-	-- would actually key on.
-	private pure func perceus_engine_summary_enter(
-		name: String,
-		expr: CoreExpr,
-		node_id: Int,
-	) -> Void = "blorp_perceus_engine_summary_enter_c"
-	private pure func perceus_engine_summary_exit() -> Void = "blorp_perceus_engine_summary_exit_c"
-	private pure func perceus_engine_summary_node_visit(
-
-	) -> Void = "blorp_perceus_engine_summary_node_visit_c"
 
 
 --- Pending work in the linear ownership-summary walk. A monomorphic list
@@ -757,30 +711,6 @@ private pure func call_result_aliases_target(
 			False
 
 
-pure func summarize_linear_call(
-	env: PerceusEnv,
-	name: String,
-	return_type: CoreType,
-	kind: CoreCallKind,
-	callee: CoreExpr,
-	args: List[CoreExpr],
-) -> OwnershipUseSummary:
-	if not env.engine_metrics_enabled:
-		summarize_linear_call_impl(env, name, return_type, kind, callee, args)
-	else:
-		perceus_engine_node_enter()
-		result: OwnershipUseSummary = summarize_linear_call_impl(
-			env,
-			name,
-			return_type,
-			kind,
-			callee,
-			args,
-		)
-		perceus_engine_node_exit("summary:call")
-		result
-
-
 ---
 Whether `arg` is `name` itself, so a consuming slot takes `name`'s reference
 when the callee starts rather than while the argument is evaluated.
@@ -815,7 +745,7 @@ private pure func borrow_ends_before_call(arg: CoreExpr, arg_uses: OwnershipUseS
 			False
 
 
-private pure func summarize_linear_call_impl(
+pure func summarize_linear_call(
 	env: PerceusEnv,
 	name: String,
 	return_type: CoreType,
@@ -846,11 +776,6 @@ private pure func summarize_linear_call_impl(
 			var target_arg_summary_present: Bool = False
 			var target_arg_returns_alias: Bool = False
 			var index: Int = 0
-
-			if env.engine_metrics_enabled:
-				perceus_engine_node_enter()
-			else:
-				void
 
 			for arg in args:
 				match contract.args.get(index):
@@ -896,12 +821,6 @@ private pure func summarize_linear_call_impl(
 						void
 
 				index += 1
-
-			if env.engine_metrics_enabled:
-				-- Preserve the historical counter key for profile comparisons.
-				perceus_engine_node_exit("summary:call-args-list")
-			else:
-				void
 
 			-- A closure call evaluates the borrowed callee before its arguments.
 			-- Other call kinds reach their callee through the contract. Summarize
@@ -977,20 +896,6 @@ pure func summarize_linear_borrow(
 	name: String,
 	expr: CoreExpr,
 ) -> OwnershipUseSummary:
-	if not env.engine_metrics_enabled:
-		summarize_linear_borrow_impl(env, name, expr)
-	else:
-		perceus_engine_node_enter()
-		result: OwnershipUseSummary = summarize_linear_borrow_impl(env, name, expr)
-		perceus_engine_node_exit("summary:borrow")
-		result
-
-
-private pure func summarize_linear_borrow_impl(
-	env: PerceusEnv,
-	name: String,
-	expr: CoreExpr,
-) -> OwnershipUseSummary:
 	match expr:
 		VarExpr(variable, typ, loc):
 			if variable.name == name:
@@ -1038,28 +943,6 @@ pure func releasing_match_consumes_owner(
 
 
 pure func summarize_match_ownership_uses(
-	env: PerceusEnv,
-	name: String,
-	scrutinee: CoreExpr,
-	release_policy: CoreReleasePolicy,
-	branch_uses: OwnershipUseSummary,
-) -> OwnershipUseSummary:
-	if not env.engine_metrics_enabled:
-		summarize_match_ownership_uses_impl(env, name, scrutinee, release_policy, branch_uses)
-	else:
-		perceus_engine_node_enter()
-		result: OwnershipUseSummary = summarize_match_ownership_uses_impl(
-			env,
-			name,
-			scrutinee,
-			release_policy,
-			branch_uses,
-		)
-		perceus_engine_node_exit("summary:match-combine")
-		result
-
-
-private pure func summarize_match_ownership_uses_impl(
 	env: PerceusEnv,
 	name: String,
 	scrutinee: CoreExpr,
@@ -2327,30 +2210,6 @@ private pure func summarize_repeated_body_uses(
 	body_shadowed: Bool,
 	whole_expr: CoreExpr,
 ) -> OwnershipUseSummary:
-	if not env.engine_metrics_enabled:
-		summarize_repeated_body_uses_impl(env, name, prefix_uses, body, body_shadowed, whole_expr)
-	else:
-		perceus_engine_node_enter()
-		result: OwnershipUseSummary = summarize_repeated_body_uses_impl(
-			env,
-			name,
-			prefix_uses,
-			body,
-			body_shadowed,
-			whole_expr,
-		)
-		perceus_engine_node_exit("summary:repeated-body")
-		result
-
-
-private pure func summarize_repeated_body_uses_impl(
-	env: PerceusEnv,
-	name: String,
-	prefix_uses: OwnershipUseSummary,
-	body: CoreExpr,
-	body_shadowed: Bool,
-	whole_expr: CoreExpr,
-) -> OwnershipUseSummary:
 	body_uses: OwnershipUseSummary = if body_shadowed:
 		NO_OWNERSHIP_USES
 	else:
@@ -2366,24 +2225,6 @@ private pure func summarize_repeated_body_uses_impl(
 
 
 private pure func summarize_constructor_literal_match_uses(
-	env: PerceusEnv,
-	name: String,
-	match_expr: CoreConstructorLiteralMatch,
-) -> OwnershipUseSummary:
-	if not env.engine_metrics_enabled:
-		summarize_constructor_literal_match_uses_impl(env, name, match_expr)
-	else:
-		perceus_engine_node_enter()
-		result: OwnershipUseSummary = summarize_constructor_literal_match_uses_impl(
-			env,
-			name,
-			match_expr,
-		)
-		perceus_engine_node_exit("summary:match-branch-list")
-		result
-
-
-private pure func summarize_constructor_literal_match_uses_impl(
 	env: PerceusEnv,
 	name: String,
 	match_expr: CoreConstructorLiteralMatch,
@@ -2449,24 +2290,6 @@ pure func summarize_constructor_length_branch_uses(
 
 
 private pure func summarize_constructor_length_match_uses(
-	env: PerceusEnv,
-	name: String,
-	match_expr: CoreConstructorLengthMatch,
-) -> OwnershipUseSummary:
-	if not env.engine_metrics_enabled:
-		summarize_constructor_length_match_uses_impl(env, name, match_expr)
-	else:
-		perceus_engine_node_enter()
-		result: OwnershipUseSummary = summarize_constructor_length_match_uses_impl(
-			env,
-			name,
-			match_expr,
-		)
-		perceus_engine_node_exit("summary:match-branch-list")
-		result
-
-
-private pure func summarize_constructor_length_match_uses_impl(
 	env: PerceusEnv,
 	name: String,
 	match_expr: CoreConstructorLengthMatch,
@@ -2545,34 +2368,6 @@ private pure func summarize_constructor_match_case_uses(
 
 
 private pure func summarize_constructor_match_branch_uses(
-	env: PerceusEnv,
-	name: String,
-	scrutinee_aliases_owner: Bool,
-	cases: List[CoreConstructorMatchCase],
-	fallback: CoreConstructorMatchFallback,
-) -> OwnershipUseSummary:
-	if not env.engine_metrics_enabled:
-		summarize_constructor_match_branch_uses_impl(
-			env,
-			name,
-			scrutinee_aliases_owner,
-			cases,
-			fallback,
-		)
-	else:
-		perceus_engine_node_enter()
-		result: OwnershipUseSummary = summarize_constructor_match_branch_uses_impl(
-			env,
-			name,
-			scrutinee_aliases_owner,
-			cases,
-			fallback,
-		)
-		perceus_engine_node_exit("summary:match-branch-list")
-		result
-
-
-private pure func summarize_constructor_match_branch_uses_impl(
 	env: PerceusEnv,
 	name: String,
 	scrutinee_aliases_owner: Bool,
@@ -2813,18 +2608,7 @@ private pure func summarize_linear_ownership_uses_non_binding(
 			body_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, body)
 
 			if cond_uses.consumed_refs > 0 or body_uses.consumed_refs > 0:
-				if not env.engine_metrics_enabled:
-					ownership_uses_from_legacy_count(count_uses(name, expr))
-				else:
-					perceus_engine_node_enter()
-					fallback_result: OwnershipUseSummary = ownership_uses_from_legacy_count(
-						count_uses(
-							name,
-							expr,
-						),
-					)
-					perceus_engine_node_exit("summary:legacy-count-fallback-site")
-					fallback_result
+				ownership_uses_from_legacy_count(count_uses(name, expr))
 			else:
 				seq_ownership_uses(
 					cond_uses,
@@ -3150,79 +2934,10 @@ private pure func summarize_linear_ownership_uses_non_binding(
 				branch_ownership_uses(branch_summaries),
 			)
 		_:
-			if not env.engine_metrics_enabled:
-				ownership_uses_from_legacy_count(count_uses(name, expr))
-			else:
-				perceus_engine_node_enter()
-				fallback_result: OwnershipUseSummary = ownership_uses_from_legacy_count(
-					count_uses(
-						name,
-						expr,
-					),
-				)
-				perceus_engine_node_exit("summary:legacy-count-fallback-site")
-				fallback_result
+			ownership_uses_from_legacy_count(count_uses(name, expr))
 
 
---- The node id `summarize_linear_ownership_uses` keys its memo (and its
---- diagnostic census) on: `core_node_id_raw(core_expr_own_node_id(expr))`,
---- or 0 for the three loc-less wrapper kinds and for a synthetic location.
---- 0 is never a hit: 0 is the reserved synthetic location, and a synthetic node
---- is never memoizable.
-private pure func memoizable_node_id(expr: CoreExpr) -> Int:
-	match core_expr_own_node_id(expr):
-		Some(loc):
-			core_node_id_raw(loc)
-		None:
-			0
-
-
--- Second attempt at the summary memo (worktree core/n3b-summary-entry-memo),
--- parked with numbers: a live entry memo keyed by `(node id, name)` was built and
--- gated (`PerceusEnv.memo_enabled`) to the one call tree analysis said was
--- env-invariant, with proper `blorp_retain`/`blorp_release` on the cached
--- name. It still produced non-identical C on the frozen self-compile
--- input (hundreds of thousands of diff lines against the unmemoized
--- baseline) and an ASan heap-use-after-free when running the compiler's
--- own test suite -- i.e. a real correctness bug survives both the env-
--- invariance fix and the retain/release fix, most likely a node id that
--- is not as unique as the node-id invariant assumes somewhere in `rebuild_managed_let`'s
--- shadowed-match-binding freshening (a subtree can be duplicated across
--- match arms; whether every such duplication mints a fresh id was not
--- fully verified). Per this issue's go/no-go rule ("do not land a net
--- loss"), the memo itself was not landed. The
--- measurement this parks (a genuine ~7M-allocation opportunity, well
--- past the 5M go/no-go floor, that a correct, narrower-scoped memo could
--- still capture).
 pure func summarize_linear_ownership_uses(
-	env: PerceusEnv,
-	name: String,
-	expr: CoreExpr,
-) -> OwnershipUseSummary:
-	summarize_linear_ownership_uses_measured(env, name, expr, memoizable_node_id(expr))
-
-
--- The `BLORP_PERCEUS_ENGINE_METRICS` census wrapper around the actual
--- walk (see `summarize_linear_ownership_uses`'s doc comment for the memo
--- this was going to feed, parked with numbers rather than landed).
-private pure func summarize_linear_ownership_uses_measured(
-	env: PerceusEnv,
-	name: String,
-	expr: CoreExpr,
-	node_id: Int,
-) -> OwnershipUseSummary:
-	if not env.engine_metrics_enabled:
-		summarize_linear_ownership_uses_impl(env, name, expr)
-	else:
-		perceus_engine_node_enter()
-		perceus_engine_summary_enter(name, expr, node_id)
-		result: OwnershipUseSummary = summarize_linear_ownership_uses_impl(env, name, expr)
-		perceus_engine_summary_exit()
-		perceus_engine_node_exit("helper:summarize_linear_ownership_uses")
-		result
-
-
-private pure func summarize_linear_ownership_uses_impl(
 	env: PerceusEnv,
 	name: String,
 	expr: CoreExpr,
@@ -3243,9 +2958,6 @@ private pure func summarize_linear_ownership_uses_impl(
 		DebugBlockExpr(_, _, _):
 			summarize_linear_ownership_uses_binding_impl(env, name, expr)
 		_:
-			if env.engine_metrics_enabled:
-				perceus_engine_summary_node_visit()
-
 			summarize_linear_ownership_uses_non_binding(env, name, expr)
 
 
@@ -3270,9 +2982,6 @@ private pure func summarize_linear_ownership_uses_binding_impl(
 	while not complete:
 		if visiting:
 			current: CoreExpr = current_expr
-
-			if env.engine_metrics_enabled:
-				perceus_engine_summary_node_visit()
 
 			match current:
 				LetExpr(variable, is_mutable, typ, rhs, body):
@@ -3566,9 +3275,6 @@ private pure func summarize_linear_ownership_uses_binding_recovery(
 	while not complete:
 		if visiting:
 			current: CoreExpr = current_expr
-
-			if env.engine_metrics_enabled:
-				perceus_engine_summary_node_visit()
 
 			match current:
 				LetExpr(variable, is_mutable, typ, rhs, body):

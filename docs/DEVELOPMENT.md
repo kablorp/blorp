@@ -627,7 +627,7 @@ stripped runtime exits 2 when a switch below is set):
 | --- | --- |
 | `BLORP_MEMORY_STATS=1` (`blorp run --memory-stats`) | Counters gate: managed allocation, release, live-object and live-byte counters plus the allocation-oracle counters. On the compiler it also prints a `BLORP_COMPILER_MEMORY_CHECKPOINT` line per phase and pass. |
 | `BLORP_LEAK_CHECK=1\|verbose\|strict` (`--leak-check`) | Leak-tracking gate (implies the counters): per-object metadata, a live list and an exit report by type; `verbose` lists objects, `strict` exits 99 on a leak. |
-| `BLORP_TYPECHECK_BODY_METRICS`, `BLORP_CORE_LOWERING_TYPE_METRICS`, `BLORP_PERCEUS_ENGINE_METRICS` | Compiler self-profiling; combine with `BLORP_MEMORY_STATS=1` to attribute allocation counts. `BLORP_TYPECHECK_BODY_METRICS` turns the counters on itself. |
+| `BLORP_TYPECHECK_BODY_METRICS`, `BLORP_CORE_LOWERING_TYPE_METRICS` | Compiler self-profiling; combine with `BLORP_MEMORY_STATS=1` to attribute allocation counts. `BLORP_TYPECHECK_BODY_METRICS` turns the counters on itself. |
 
 `get_mem_stats()` from the `memory` module only reads: with no switch on it
 returns an inactive snapshot (`memory_stats_active == 0`). `reset_mem_stats()`

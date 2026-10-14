@@ -2,7 +2,7 @@
 """The compiler self-profiling code must not ship in user-program runtimes.
 
 Only the compiler's own runtime object (`-DBLORP_COMPILER_RUNTIME_SOURCES=1`)
-carries the typecheck, Core-lowering, and Perceus metrics. Every other runtime
+carries the typecheck and Core-lowering metrics. Every other runtime
 object (user programs, tests, packages) must keep only the no-op entry points
 that compiler sources declare as `foreign func`s, so programs that import
 compiler modules still link.
@@ -22,12 +22,11 @@ ROOT = Path(__file__).resolve().parents[3]
 NATIVE_DIRECTORY = ROOT / "blorp" / "src" / "lib" / "runtime" / "native"
 METRICS_ENTRY_POINT = re.compile(
     r"^\s*(?:long|void)\s+(blorp_(?:typecheck_[a-z_]*metric[a-z_]*"
-    r"|core_lowering_[a-z_]+|perceus_engine_[a-z_]+)_c)\("
+    r"|core_lowering_[a-z_]+)_c)\("
 )
 METRICS_ENVIRONMENT_VARIABLES = (
     b"BLORP_TYPECHECK_BODY_METRICS",
     b"BLORP_CORE_LOWERING_TYPE_METRICS",
-    b"BLORP_PERCEUS_ENGINE_METRICS",
 )
 COMPILER_DEFINE = "-DBLORP_COMPILER_RUNTIME_SOURCES=1"
 
@@ -92,7 +91,9 @@ class RuntimeCompilerOnlyMetricsTests(unittest.TestCase):
     def test_declared_entry_points_are_discovered(self) -> None:
         # Guards the discovery regex: an empty set would make every check
         # below vacuous.
-        self.assertGreaterEqual(len(declared_metrics_entry_points()), 28)
+        declared = declared_metrics_entry_points()
+        self.assertTrue(any(name.startswith("blorp_typecheck_") for name in declared))
+        self.assertTrue(any(name.startswith("blorp_core_lowering_") for name in declared))
 
     def test_user_runtime_keeps_only_noop_entry_points_in_both_modes(self) -> None:
         declared = declared_metrics_entry_points()
@@ -106,7 +107,7 @@ class RuntimeCompilerOnlyMetricsTests(unittest.TestCase):
                 metrics_symbols = {
                     name
                     for name in symbols
-                    if re.search(r"metric|perceus_engine|core_lowering", name)
+                    if re.search(r"metric|core_lowering", name)
                 }
                 self.assertEqual(metrics_symbols, declared)
                 contents = object_path.read_bytes()
