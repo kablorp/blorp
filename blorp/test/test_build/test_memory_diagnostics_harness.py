@@ -8,9 +8,6 @@ import unittest
 import json
 import contextlib
 import io
-import os
-import shlex
-import shutil
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,56 +19,6 @@ emission = runpy.run_path(str(BENCHMARKS_DIR / "c_emission_bytes"))
 
 
 class PairedCompilerTests(unittest.TestCase):
-    def test_benchmark_runner_builds_a_diagnostic_executable(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for subdirectory in (
-                "blorp/src/compiler",
-                "blorp/benchmark/compiler",
-                "standard_library/src",
-                "fake-bin",
-            ):
-                (root / subdirectory).mkdir(parents=True)
-            (root / "blorp.toml").write_text("[package]\n")
-            source = root / "blorp/benchmark/compiler/probe.brp"
-            source.write_text("func main() -> Int:\n\t0\n")
-            compiler = root / "fake-bin/blorp"
-            compiler.write_text(
-                "#!/bin/sh\n"
-                "previous=\n"
-                "for argument do\n"
-                "  if [ \"$previous\" = -o ]; then output=$argument; break; fi\n"
-                "  previous=$argument\n"
-                "done\n"
-                "printf '%s\\n' '#ifndef BLORP_MEMORY_DIAGNOSTICS' "
-                "'#error missing diagnostics mode' '#endif' "
-                "'int main(void) { return BLORP_MEMORY_DIAGNOSTICS == 1 ? 0 : 9; }' > \"$output\"\n"
-            )
-            compiler.chmod(0o755)
-            real_cc = shutil.which("cc")
-            self.assertIsNotNone(real_cc)
-            fake_cc = root / "fake-bin/cc"
-            fake_cc.write_text(
-                "#!/bin/sh\n"
-                "if [ \"${1:-}\" = --version ]; then echo 'test cc'; exit 0; fi\n"
-                f"exec {shlex.quote(real_cc)} \"$@\"\n"
-            )
-            fake_cc.chmod(0o755)
-            environment = {
-                **os.environ,
-                "PATH": f"{fake_cc.parent}:{os.environ['PATH']}",
-                "BLORP_COMPILER_BENCHMARK_WORKSPACE_ROOT": str(root),
-                "BLORP_COMPILER_BENCHMARK_COMPILER": str(compiler),
-                "BLORP_COMPILER_BENCHMARK_SKIP_BUILD": "1",
-                "BLORP_BENCHMARK_CACHE_DIR": str(root / "cache"),
-            }
-            completed = subprocess.run(
-                [str(BENCHMARKS_DIR / "compiler_blorp_benchmark_runner"),
-                 "diagnostic-probe", str(source), "plain"],
-                env=environment, capture_output=True, text=True, check=False,
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-
     def test_make_recipe_selects_diagnostic_mode(self):
         with patch.object(builder["subprocess"], "run", return_value=subprocess.CompletedProcess([], 0, "recipe", "")) as run:
             self.assertEqual(builder["make_recipe"]("compile-prepared-blorp-cli", 1), "recipe")

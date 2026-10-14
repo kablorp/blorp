@@ -1,6 +1,6 @@
 import:
 	../../../src/compiler/stage_02_lex/name_table: NameTable
-	../../../src/compiler/stage_08_core_lower/identity: core_ufcs_function_name
+	../../../src/compiler/stage_08_core_lower/identity: core_module_member_name, core_ufcs_function_name
 	../../../src/compiler/stage_09_core/c_type_layout: type_requires_release
 	../../../src/compiler/stage_09_core/function_origin_fixture:
 		fixture_declaration_index,
@@ -130,6 +130,7 @@ import:
 		map_core_expr_children_with_context,
 		map_core_match_results,
 		map_core_match_results_with_context,
+	memory: get_mem_stats, reset_mem_stats
 	test: TestSuite
 
 
@@ -3894,6 +3895,116 @@ pure func test_rewrites_exact_imported_function_reference_identity() -> Bool:
 			False
 
 
+-- Construction of the resolver's environment must cost allocations in proportion
+-- to the program: functions spread over modules, each calling the next function
+-- of its module by definition id.
+private SCALING_FUNCTIONS_PER_MODULE: Int = 16
+
+private SCALING_BASE_FUNCTION_DEF_ID: Int = 1000
+
+
+private pure func scaling_source_name(function_index: Int) -> String:
+	"scaling_function_${function_index}"
+
+
+private pure func scaling_module_path(function_index: Int) -> String:
+	"scaling/module_${function_index / SCALING_FUNCTIONS_PER_MODULE}"
+
+
+private pure func scaling_function_decl(names: NameTable, function_index: Int) -> CoreDecl:
+	callee_index: Int = if (function_index + 1) % SCALING_FUNCTIONS_PER_MODULE == 0:
+		function_index
+	else:
+		function_index + 1
+	callee_name: String = core_module_member_name(
+		scaling_module_path(callee_index),
+		scaling_source_name(callee_index),
+	)
+
+	FunctionDecl({
+		name = core_module_member_name(
+			scaling_module_path(function_index),
+			scaling_source_name(function_index),
+		),
+		source_module = Some(scaling_module_path(function_index)),
+		type_params = [],
+		params = [core_param("value")],
+		return_type = int_type(),
+		body = Some(selected_call(callee_name, SCALING_BASE_FUNCTION_DEF_ID + callee_index)),
+		is_pure = True,
+		origin = fixture_source_function_origin_in(names, scaling_source_name(function_index)),
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = SCALING_BASE_FUNCTION_DEF_ID + function_index,
+		loc = synthetic_core_source_loc(),
+	})
+
+
+-- Allocations `resolve_core_program` makes for a program of `function_count`
+-- functions. The program and its declaration index are built before the counters
+-- reset, so only the resolver's own work is counted; -1 reports a resolution that
+-- dropped declarations, which would make the count meaningless.
+private func resolver_allocations(function_count: Int) -> Int:
+	var spellings: List[String] = []
+	var decls: List[CoreDecl] = []
+
+	for function_index in 0..function_count:
+		spellings = spellings.append(scaling_source_name(function_index))
+
+	names = fixture_name_table(spellings)
+
+	for function_index in 0..function_count:
+		decls = decls.append(scaling_function_decl(names, function_index))
+
+	source_program = program(decls)
+	declarations = fixture_declaration_index(names, source_program)
+	reset_mem_stats()
+	resolved = resolve_core_program_with_names(declarations, source_program, [], [])
+	stats = get_mem_stats()
+
+	if resolved.decls.length() == function_count:
+		stats.total_allocations
+	else:
+		-1
+
+
+-- Allocations when resolving every prefix of the program, which is what a
+-- construction that rebuilt its environment per declaration would cost.
+private func rebuilt_per_declaration_allocations(function_count: Int) -> Int:
+	var total: Int = 0
+	var complete: Bool = True
+
+	for prefix_length in 1..function_count + 1:
+		allocations = resolver_allocations(prefix_length)
+		complete = complete and allocations >= 0
+		total += allocations
+
+	if complete:
+		total
+	else:
+		-1
+
+
+-- Doubling the problem size must not much more than double the allocations: a
+-- linear construction costs about 2x and a quadratic one about 4x, so the 2.5x
+-- ceiling separates them without a tuned absolute bound.
+private func allocations_grow_linearly(
+	allocations_at: (Int) -> Int,
+	function_count: Int,
+) -> Bool:
+	half = allocations_at(function_count)
+	full = allocations_at(function_count * 2)
+	half > 0 and full > 0 and full * 2 <= half * 5
+
+
+private func test_resolver_construction_allocations_grow_linearly() -> Bool:
+	allocations_grow_linearly(resolver_allocations, 256)
+
+
+private func test_growth_oracle_rejects_quadratic_construction() -> Bool:
+	not allocations_grow_linearly(rebuilt_per_declaration_allocations, 32)
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core binding resolution",
 	tests = [
@@ -4168,6 +4279,14 @@ tests: TestSuite = {
 		(
 			"rewrites exact imported function reference identity",
 			test_rewrites_exact_imported_function_reference_identity,
+		),
+		(
+			"resolver construction allocations grow linearly",
+			test_resolver_construction_allocations_grow_linearly,
+		),
+		(
+			"growth oracle rejects quadratic construction",
+			test_growth_oracle_rejects_quadratic_construction,
 		),
 	]
 }

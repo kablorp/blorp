@@ -368,8 +368,8 @@ stage could not be built.
 - `make tooling-check` holds the stage-2 self-compile C-symbol leak check and
   the Python and shell suites that test the scripts, build, runtime harnesses
   and parity tooling.
-- `make benchmark-tooling-check` holds the benchmark-worker `check` runs and the
-  suites that test benchmark and measurement scripts. Only the premerge gate
+- `make benchmark-tooling-check` holds the suites that test the benchmark runner
+  and the self-compile and memory-diagnostics scripts. Only the premerge gate
   runs it, and only when a change touches an input of those suites.
 - `make artifact-scan` fails on stray generated files the suites left behind.
 - `make c-static-analysis` runs `scripts/c-static-analysis`, which skips the

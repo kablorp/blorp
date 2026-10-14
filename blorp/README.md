@@ -28,7 +28,6 @@ blorp/
 ├── src/compiler/            # Numbered production compiler stages
 ├── src/lib/runtime/native/  # C runtime, declarations, and native headers
 ├── test/compiler/           # Focused compiler tests and registered fixtures
-├── benchmark/compiler/      # Compiler benchmark entry points and fixtures
 ├── tool/                    # Deterministic build-time source generator
 └── build/                   # Version, bootstrap pin, and ignored build products
 ```

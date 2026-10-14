@@ -430,8 +430,8 @@ graph itself. The production fused pass builds and solves those facts once,
 while the standalone ownership pass also annotates the full call tree before
 Perceus for its observable pre-Perceus snapshot. `insert_drops_program`
 stays as a self-contained entry point (it runs `ownership_contracts`'s own
-steps first) for tests, the work profiler, and the benchmark backend bridge,
-none of which go through `CorePassState`. In pipeline order:
+steps first) for tests, which do not go through `CorePassState`. In pipeline
+order:
 `perceus/work_counters.brp` (the `--debug`-only work-counter markers every
 other module calls into; no Perceus dependencies of its own), `perceus/env.brp`
 (`PerceusEnv`, `build_env`, the callable/user-call-contract tables, and the

@@ -509,14 +509,12 @@ block after the run.
 
 ## Function Profiling And Flame Graphs
 
-Profile a Blorp program or compiler benchmark:
+Profile a Blorp program:
 
 ```bash
 bin/blorp run --profile --no-format program.brp 2>/tmp/blorp-profile.txt
 bin/blorp run --profile-mode calls --profile-module blorp/src/compiler/stage_06_typecheck/infer program.brp
 bin/blorp run --profile-mode exact --profile-function blorp/src/compiler/stage_06_typecheck/type_system/env::scope_add_symbol program.brp
-benchmarks/compiler_typecheck_profile 2 2 64 128 \
-  2>/tmp/compiler-typecheck-profile.txt
 ```
 
 A module selector is the logical module path (the source path relative to the
@@ -551,11 +549,11 @@ drawing conclusions from a profile.
 Render the collapsed rows when `flamegraph.pl` is installed:
 
 ```bash
-rg '^FLAME:' /tmp/compiler-typecheck-profile.txt \
+rg '^FLAME:' /tmp/blorp-profile.txt \
   | sed 's/^FLAME://' \
-  > /tmp/compiler-typecheck.collapsed
-flamegraph.pl /tmp/compiler-typecheck.collapsed \
-  > /tmp/compiler-typecheck.svg
+  > /tmp/blorp-profile.collapsed
+flamegraph.pl /tmp/blorp-profile.collapsed \
+  > /tmp/blorp-profile.svg
 ```
 
 Current `FLAME:` rows contain one function name and inclusive total, not a
@@ -568,33 +566,24 @@ A tall inclusive function may mostly contain expensive descendants. Use self
 time, call counts, source inspection, and a bounded microbenchmark to
 distinguish local cost, cumulative cost, and scaling.
 
-For production-pass optimization experiments, prefer a paired benchmark before
-making a speed claim. `benchmarks/compiler_pass_compare` alternates two already
-executable pass benchmarks, preserves raw pairs, reports binary/source/fixture
-provenance, and fails closed when semantic checksums differ. See
-[`benchmarks/README.md`](../benchmarks/README.md#paired-production-pass-comparison)
-for the command template.
-
 ## Measuring The Compiler
 
-Compiler benchmark wrappers live in `benchmarks/`; fixtures and workers live in
-`blorp/benchmark/compiler/`. Use the exact arguments and measurement window in
-[`benchmarks/README.md`](../benchmarks/README.md); its skip-build controls are
-valid only when the executable and all imported sources match the revision
-being measured. To measure compiler-on-compiler typechecking, capture one
-`typecheck_graph` request with `bin/blorp check --no-format
---capture-typecheck-request FILE blorp/src/main.brp` and replay it with
-`benchmarks/compiler_typecheck_replay` (see
-[Captured Typecheck Replay](../benchmarks/README.md#captured-typecheck-replay)).
-Keep headline latency and RSS runs uninstrumented, run allocation attribution
-(`--allocator-stats`) separately, and on macOS treat latency as diagnostic
-because RSS sampling perturbs it.
+Compiler-on-compiler cost is measured with `benchmarks/self_compile_measure`,
+the standard paired self-compile measurement (allocations per phase, retired
+instructions, wall time, peak RSS and the generated-C hash). Use the exact
+commands in the
+[Self-Compile Measurement Protocol](../benchmarks/README.md#self-compile-measurement-protocol);
+the [Worker Checklist](WORKER_CHECKLIST.md) gives the setup/measure/land loop.
+Its skip-build controls are valid only when the executable and all imported
+sources match the revision being measured. Keep headline latency and RSS runs
+uninstrumented, run allocation attribution separately, and on macOS treat
+latency as diagnostic because RSS sampling perturbs it.
 
 Trustworthy performance evidence requires:
 
-1. The same captured request for baseline and candidate.
-2. Workers built from explicitly recorded source revisions.
-3. Byte-identical successful responses.
+1. The same frozen input revision for baseline and candidate.
+2. Compilers built from explicitly recorded source revisions.
+3. Byte-identical generated C for semantics-preserving changes.
 4. Warmup before measured samples.
 5. Alternating baseline/candidate order.
 6. Multiple samples and medians, with raw samples retained.

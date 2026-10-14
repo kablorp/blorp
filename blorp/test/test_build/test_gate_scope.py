@@ -54,9 +54,8 @@ class ClassifyTest(unittest.TestCase):
 	def test_benchmark_tooling_paths_run_the_benchmark_tooling_suites(self) -> None:
 		touched = [
 			"benchmarks/bench_runner.py",
-			"blorp/benchmark/compiler/compiler_typecheck_worker.brp",
-			"blorp/src/compiler/stage_09_core/perceus.brp",
-			"blorp/test/test_compiler/test_benchmark/test_backend_memory.py",
+			"blorp/test/test_build/test_memory_diagnostics_harness.py",
+			"blorp/test/test_compiler/test_benchmark/test_bench_runner.py",
 		]
 		for path in touched:
 			with self.subTest(path=path):

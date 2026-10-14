@@ -1,32 +1,35 @@
--- Bounded in-process workload for CTFE-triggered dependency typechecking.
+-- Test support: a chain of modules whose compile-time global reaches one function
+-- per module, run through the production graph typechecker.
 import:
-	../../src/compiler/stage_03_parse/source_ast_finalize: FinalizedTypecheckProgram
-	../../src/compiler/stage_04_modules/loaded_module: ModuleOrigin(UserModule)
-	../../src/compiler/stage_06_typecheck/bridge:
+	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../src/compiler/stage_03_parse/source_ast_finalize:
+		FinalizedTypecheckProgram,
+		finalized_typecheck_program,
+	../../../src/compiler/stage_04_modules/loaded_module: ModuleOrigin(UserModule)
+	../../../src/compiler/stage_06_typecheck/bridge:
 		TypecheckGraphRequest,
 		TypecheckImportModule,
 		TypecheckResolvedImport,
 		TypecheckedGraph,
 		TypecheckedModule,
 		typecheck_graph_with_metrics,
-	../../src/compiler/stage_06_typecheck/decl: TypedDecl(TypedGlobalVarDecl), TypedProgram
-	../../src/compiler/stage_06_typecheck/infer: TypedExpr(TypedIntLiteralExpr)
-	../../src/compiler/stage_07_ctfe/globals: ctfe_global_replacements_find
-	parsed_program_fixture as ParsedProgramFixture
+	../../../src/compiler/stage_06_typecheck/decl: TypedDecl(TypedGlobalVarDecl), TypedProgram
+	../../../src/compiler/stage_06_typecheck/infer: TypedExpr(TypedIntLiteralExpr)
+	../../../src/compiler/stage_07_ctfe/globals: ctfe_global_replacements_find
+	../../../src/lib/source: source_file
 	string: parse_int
 
 
-fixed record CompilerCtfeTypecheckBenchmarkConfig {
-	iterations: Int,
+fixed record CtfeChainConfig {
+	repetitions: Int,
 	module_count: Int,
 	functions_per_module: Int,
 	retain_parsed_programs: Bool
 }
 
 
-fixed record CompilerCtfeTypecheckBenchmarkResult {
+fixed record CtfeChainResult {
 	artifact_count: Int,
-	dependency_declaration_count: Int,
 	ctfe_dependency_body_check_count: Int,
 	ctfe_reused_body_check_count: Int,
 	ctfe_planned_global_module_count: Int,
@@ -42,85 +45,88 @@ fixed record CompilerCtfeTypecheckBenchmarkResult {
 	evaluated_answer: Int,
 	error_count: Int,
 	ctfe_evaluated_count: Int,
-	checksum: Int,
-	workload_valid: Bool
+	graph_valid: Bool
 }
 
 
 private TARGET_DECLARATION_COUNT: Int = 3
 
 
-private pure func benchmark_module_path(module_index: Int) -> String:
-	"bench/ctfe_typecheck_profile_" + module_index.to_string()
+private pure func chain_module_path(module_index: Int) -> String:
+	"fixture/ctfe_chain_" + module_index.to_string()
 
 
-private pure func benchmark_module_file(module_index: Int) -> String:
-	"/bench/ctfe_typecheck_profile_" + module_index.to_string() + ".brp"
+private pure func chain_module_file(module_index: Int) -> String:
+	"/fixture/ctfe_chain_" + module_index.to_string() + ".brp"
 
 
-private pure func benchmark_function_name(module_index: Int, function_index: Int) -> String:
+private pure func chain_function_name(module_index: Int, function_index: Int) -> String:
 	"ctfe_m" + module_index.to_string() + "_function_" + function_index.to_string()
 
 
-private pure func benchmark_dependency_import(module_index: Int) -> String:
+private pure func chain_dependency_import(module_index: Int) -> String:
 	if module_index == 0:
 		""
 	else:
-		"import:\n\t" + benchmark_module_path(module_index - 1) + " as Previous"
+		"import:\n\t" + chain_module_path(module_index - 1) + " as Previous"
 
 
-private pure func benchmark_function_source(module_index: Int, function_index: Int) -> String:
+private pure func chain_function_source(module_index: Int, function_index: Int) -> String:
 	body: String = if module_index == 0:
 		"value + 1"
 	else:
-		"Previous." + benchmark_function_name(module_index - 1, function_index) + "(value) + 1"
+		"Previous." + chain_function_name(module_index - 1, function_index) + "(value) + 1"
 
-	"pure func " + benchmark_function_name(
+	"pure func " + chain_function_name(
 		module_index,
 		function_index,
 	) + "(value: Int) -> Int:\n\t" + body
 
 
-private pure func benchmark_module_source(module_index: Int, functions_per_module: Int) -> String:
+private pure func chain_module_source(module_index: Int, functions_per_module: Int) -> String:
 	var declarations: List[String] = []
-	dependency_import = benchmark_dependency_import(module_index)
+	dependency_import = chain_dependency_import(module_index)
 
 	if dependency_import.length() > 0:
 		declarations = declarations.append(dependency_import)
 
 	for function_index in 0..functions_per_module:
-		declarations = declarations.append(benchmark_function_source(module_index, function_index))
+		declarations = declarations.append(chain_function_source(module_index, function_index))
 
 	declarations.join("\n\n") + "\n"
 
 
-private pure func benchmark_retained_program(
+private pure func chain_retained_program(
 	path: String,
 	module_name: String,
 	source: String,
 	retain_parsed_programs: Bool,
 ) -> Option[FinalizedTypecheckProgram]:
 	if retain_parsed_programs:
-		Some(ParsedProgramFixture.finalized_typecheck_program_fixture(path, module_name, source))
+		Some(
+			finalized_typecheck_program(
+				parse_compiler_source(source_file(path, module_name, source)),
+			),
+		)
 	else:
 		None
 
 
-private pure func benchmark_module(
+private pure func chain_module(
 	module_index: Int,
 	functions_per_module: Int,
 	retain_parsed_programs: Bool,
 ) -> TypecheckImportModule:
-	module_path = benchmark_module_path(module_index)
-	path = benchmark_module_file(module_index)
-	source = benchmark_module_source(module_index, functions_per_module)
+	module_path = chain_module_path(module_index)
+	path = chain_module_file(module_index)
+	source = chain_module_source(module_index, functions_per_module)
 
 	{
 		path = path,
 		module_name = module_path,
 		module_path = module_path,
 		text = source,
-		typecheck_program = benchmark_retained_program(
+		typecheck_program = chain_retained_program(
 			path,
 			module_path,
 			source,
@@ -131,7 +137,7 @@ private pure func benchmark_module(
 	}
 
 
-private pure func benchmark_resolved_import(
+private pure func chain_resolved_import(
 	from_path: String,
 	from_module: String,
 	imported_module_index: Int,
@@ -139,29 +145,27 @@ private pure func benchmark_resolved_import(
 	{
 		from_path = from_path,
 		from_module = from_module,
-		import_path = benchmark_module_path(imported_module_index),
-		resolved_module = benchmark_module_path(imported_module_index)
+		import_path = chain_module_path(imported_module_index),
+		resolved_module = chain_module_path(imported_module_index)
 	}
 
 
-private pure func benchmark_target_source(last_module_index: Int) -> String:
-	"import:\n\t" + benchmark_module_path(
+private pure func chain_target_source(last_module_index: Int) -> String:
+	"import:\n\t" + chain_module_path(
 		last_module_index,
-	) + " as Dependency\n\nanswer: Int = Dependency." + benchmark_function_name(
+	) + " as Dependency\n\nanswer: Int = Dependency." + chain_function_name(
 		last_module_index,
 		0,
 	) + "(0)\n\nfunc main(args: List[String]) -> Int:\n\tanswer\n"
 
 
-pure func compiler_ctfe_typecheck_benchmark_request(
-	config: CompilerCtfeTypecheckBenchmarkConfig,
-) -> TypecheckGraphRequest:
+pure func ctfe_chain_request(config: CtfeChainConfig) -> TypecheckGraphRequest:
 	var modules: List[TypecheckImportModule] = []
 	var resolved_imports: List[TypecheckResolvedImport] = []
 
 	for module_index in 0..config.module_count:
 		modules = modules.append(
-			benchmark_module(
+			chain_module(
 				module_index,
 				config.functions_per_module,
 				config.retain_parsed_programs,
@@ -170,19 +174,19 @@ pure func compiler_ctfe_typecheck_benchmark_request(
 
 		if module_index > 0:
 			resolved_imports = resolved_imports.append(
-				benchmark_resolved_import(
-					benchmark_module_file(module_index),
-					benchmark_module_path(module_index),
+				chain_resolved_import(
+					chain_module_file(module_index),
+					chain_module_path(module_index),
 					module_index - 1,
 				),
 			)
 
-	target_path: String = "/bench/ctfe_typecheck_profile_main.brp"
-	target_module: String = "bench/ctfe_typecheck_profile_main"
+	target_path: String = "/fixture/ctfe_chain_main.brp"
+	target_module: String = "fixture/ctfe_chain_main"
 	last_module_index: Int = config.module_count - 1
-	target_source = benchmark_target_source(last_module_index)
+	target_source = chain_target_source(last_module_index)
 	resolved_imports = resolved_imports.append(
-		benchmark_resolved_import(
+		chain_resolved_import(
 			target_path,
 			target_module,
 			last_module_index,
@@ -195,7 +199,7 @@ pure func compiler_ctfe_typecheck_benchmark_request(
 			module_name = target_module,
 			module_path = target_module,
 			text = target_source,
-			typecheck_program = benchmark_retained_program(
+			typecheck_program = chain_retained_program(
 				target_path,
 				target_module,
 				target_source,
@@ -212,14 +216,14 @@ pure func compiler_ctfe_typecheck_benchmark_request(
 	}
 
 
-private pure func benchmark_shared_global_consumer(
-	config: CompilerCtfeTypecheckBenchmarkConfig,
+private pure func chain_shared_global_consumer(
+	config: CtfeChainConfig,
 	consumer_index: Int,
 ) -> TypecheckImportModule:
-	module_path = "bench/ctfe_typecheck_profile_consumer_" + consumer_index.to_string()
+	module_path = "fixture/ctfe_chain_consumer_" + consumer_index.to_string()
 	path = "/" + module_path + ".brp"
 	last_module_index = config.module_count - 1
-	source = "import:\n\t" + benchmark_module_path(
+	source = "import:\n\t" + chain_module_path(
 		last_module_index,
 	) + ": SHARED_OFFSET\n\nCONSUMER_VALUE: Int = SHARED_OFFSET + " + consumer_index.to_string() + "\n"
 
@@ -228,7 +232,7 @@ private pure func benchmark_shared_global_consumer(
 		module_name = module_path,
 		module_path = module_path,
 		text = source,
-		typecheck_program = benchmark_retained_program(
+		typecheck_program = chain_retained_program(
 			path,
 			module_path,
 			source,
@@ -239,12 +243,10 @@ private pure func benchmark_shared_global_consumer(
 	}
 
 
-pure func compiler_ctfe_shared_global_benchmark_request(
-	config: CompilerCtfeTypecheckBenchmarkConfig,
-) -> TypecheckGraphRequest:
-	base = compiler_ctfe_typecheck_benchmark_request(config)
+pure func ctfe_chain_shared_global_request(config: CtfeChainConfig) -> TypecheckGraphRequest:
+	base = ctfe_chain_request(config)
 	last_module_index = config.module_count - 1
-	last_module_path = benchmark_module_path(last_module_index)
+	last_module_path = chain_module_path(last_module_index)
 	var modules: List[TypecheckImportModule] = []
 
 	for module in base.modules:
@@ -252,7 +254,7 @@ pure func compiler_ctfe_shared_global_benchmark_request(
 			source = "SHARED_OFFSET: Int = 40\n\n" + module.text
 			modules = modules.append({ module |
 					text = source,
-					typecheck_program = benchmark_retained_program(
+					typecheck_program = chain_retained_program(
 						module.path,
 						module.module_name,
 						source,
@@ -266,7 +268,7 @@ pure func compiler_ctfe_shared_global_benchmark_request(
 	var resolved_imports = base.resolved_imports
 
 	for consumer_index in 1..3:
-		consumer = benchmark_shared_global_consumer(config, consumer_index)
+		consumer = chain_shared_global_consumer(config, consumer_index)
 		modules = modules.append(consumer)
 		module_targets = module_targets.append(consumer.module_path)
 		resolved_imports = resolved_imports.append({
@@ -281,13 +283,6 @@ pure func compiler_ctfe_shared_global_benchmark_request(
 		module_targets = module_targets,
 		resolved_imports = resolved_imports
 	}
-
-
-private pure func expected_dependency_declarations(
-	module_count: Int,
-	functions_per_module: Int,
-) -> Int:
-	module_count * functions_per_module + module_count - 1
 
 
 private pure func evaluated_module_global_int(
@@ -326,19 +321,15 @@ private pure func evaluated_target_answer(graph: TypecheckedGraph) -> Option[Int
 	evaluated_module_global_int(graph.target, "answer")
 
 
-func compiler_ctfe_typecheck_benchmark_with_request(
-	config: CompilerCtfeTypecheckBenchmarkConfig,
+func ctfe_chain_run_with_request(
+	config: CtfeChainConfig,
 	request: TypecheckGraphRequest,
-) -> CompilerCtfeTypecheckBenchmarkResult:
+) -> CtfeChainResult:
 	expected_answer: Int = config.module_count
 	-- The generated call chain reaches exactly function zero in each module.
 	expected_ctfe_reachable_function_body_count: Int = config.module_count
 	expected_ctfe_irrelevant_function_body_count: Int = config.module_count * (config.functions_per_module - 1)
 
-	dependency_declarations = expected_dependency_declarations(
-		config.module_count,
-		config.functions_per_module,
-	)
 	var artifact_count: Int = 0
 	var target_declaration_count: Int = 0
 	var ctfe_dependency_body_check_count: Int = 0
@@ -352,14 +343,13 @@ func compiler_ctfe_typecheck_benchmark_with_request(
 	var evaluated_answer: Int = -1
 	var error_count: Int = 0
 	var ctfe_evaluated_count: Int = 0
-	var checksum: Int = 0
-	var workload_valid: Bool = (
-		config.iterations > 0
+	var graph_valid: Bool = (
+		config.repetitions > 0
 		and config.module_count > 0
 		and config.functions_per_module > 0
 	)
 
-	for _ in 0..config.iterations:
+	for _ in 0..config.repetitions:
 		run = typecheck_graph_with_metrics(request)
 		graph = run.graph
 		ctfe_dependency_body_check_count += run.ctfe.dependency_body_checks
@@ -390,9 +380,9 @@ func compiler_ctfe_typecheck_benchmark_with_request(
 
 			match consumer_value:
 				Some(value):
-					if module.parsed_program.source.path == "/bench/ctfe_typecheck_profile_consumer_1.brp":
+					if module.parsed_program.source.path == "/fixture/ctfe_chain_consumer_1.brp":
 						first_consumer_value = Some(value)
-					else if module.parsed_program.source.path == "/bench/ctfe_typecheck_profile_consumer_2.brp":
+					else if module.parsed_program.source.path == "/fixture/ctfe_chain_consumer_2.brp":
 						second_consumer_value = Some(value)
 				None:
 					void
@@ -411,8 +401,8 @@ func compiler_ctfe_typecheck_benchmark_with_request(
 		else:
 			first_consumer_value.is_none() and second_consumer_value.is_none()
 
-		workload_valid = (
-			workload_valid
+		graph_valid = (
+			graph_valid
 			and artifact_count == request.module_targets.length() + 1
 			and target_declaration_count == TARGET_DECLARATION_COUNT
 			and request.modules.length() >= config.module_count
@@ -424,13 +414,8 @@ func compiler_ctfe_typecheck_benchmark_with_request(
 			and evaluated_answer == expected_answer
 		)
 
-		checksum += artifact_count + dependency_declarations + target_declaration_count + request.resolved_imports.length() + evaluated_answer + first_consumer_value.get_or(
-			0,
-		) + 2 * second_consumer_value.get_or(0)
-
 	{
 		artifact_count = artifact_count,
-		dependency_declaration_count = dependency_declarations,
 		ctfe_dependency_body_check_count = ctfe_dependency_body_check_count,
 		ctfe_reused_body_check_count = ctfe_reused_body_check_count,
 		ctfe_planned_global_module_count = ctfe_planned_global_module_count,
@@ -446,13 +431,10 @@ func compiler_ctfe_typecheck_benchmark_with_request(
 		evaluated_answer = evaluated_answer,
 		error_count = error_count,
 		ctfe_evaluated_count = ctfe_evaluated_count,
-		checksum = checksum,
-		workload_valid = workload_valid
+		graph_valid = graph_valid
 	}
 
 
-func compiler_ctfe_typecheck_benchmark(
-	config: CompilerCtfeTypecheckBenchmarkConfig,
-) -> CompilerCtfeTypecheckBenchmarkResult:
-	request = compiler_ctfe_typecheck_benchmark_request(config)
-	compiler_ctfe_typecheck_benchmark_with_request(config, request)
+func ctfe_chain_run(config: CtfeChainConfig) -> CtfeChainResult:
+	request = ctfe_chain_request(config)
+	ctfe_chain_run_with_request(config, request)

@@ -543,22 +543,13 @@ tooling-check: build-blorp-cli
 	@blorp/test/test_build/test_c_static_analysis_cache.sh
 	@blorp/test/test_build/test_split_translation_units.sh
 
-# The benchmark-worker checks and the suites that test benchmark and
-# measurement tooling (benchmarks/, blorp/benchmark/). They protect the scripts
-# used to judge performance changes, not the compiler. The premerge gate runs
-# them when the change touches their inputs (scripts/gate-scope).
-benchmark-tooling-check: build-blorp-cli
+# The suites that test benchmark and measurement tooling (benchmarks/). They
+# protect the scripts used to judge performance changes, not the compiler. The
+# premerge gate runs them when the change touches their inputs
+# (scripts/gate-scope).
+benchmark-tooling-check:
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_benchmark/test_bench_runner.py
-	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_typecheck_worker.brp
-	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_backend_worker.brp
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_benchmark/test_backend_memory.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_benchmark/test_perceus_memory.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_stage_06_typecheck/test_support/test_worker.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_benchmark/test_typecheck_memory.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_stage_06_typecheck/test_support/test_replay.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_compiler/test_benchmark/test_identity_work_counters.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test_build/test_memory_diagnostics_harness.py
-	@blorp/test/test_compiler/test_benchmark/test_record_layout.sh
 
 # scripts/c-static-analysis owns the analyzer flags and skips the run when
 # its inputs are unchanged since a passing run.
