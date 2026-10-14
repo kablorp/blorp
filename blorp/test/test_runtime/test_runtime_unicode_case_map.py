@@ -261,7 +261,7 @@ class RuntimeUnicodeCaseMapTests(unittest.TestCase):
             executable = Path(temp_name) / "unicode-case-map-differential"
             compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O2",
                     "-w",
                     f"-I{ROOT / 'blorp' / 'src' / 'lib' / 'runtime' / 'native'}",

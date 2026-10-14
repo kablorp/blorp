@@ -21,7 +21,7 @@ class CooperativeCheckpointContractTests(unittest.TestCase):
             executable = Path(temp_name) / name
             compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O0",
                     "-g",
                     "-fwrapv",

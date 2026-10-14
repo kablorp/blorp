@@ -22,7 +22,9 @@ BLORP_CLI_C_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/generated-c-inputs.sha256
 BLORP_CLI_C_HASH := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c.sha256
 BLORP_CLI_C_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/generated-c-build-inputs.sha256
 BLORP_CLI_C_OPTIMIZATION ?= -O0
-BLORP_CLI_RUNTIME_C_OPTIMIZATION ?= -O2
+# The runtime object is always built at -O2; only the generated compiler C
+# follows BLORP_CLI_C_OPTIMIZATION.
+override BLORP_CLI_RUNTIME_C_OPTIMIZATION := -O2
 BLORP_MEMORY_DIAGNOSTICS ?= 0
 ifneq ($(BLORP_MEMORY_DIAGNOSTICS),0)
 ifneq ($(BLORP_MEMORY_DIAGNOSTICS),1)
@@ -37,9 +39,11 @@ BLORP_CC ?= clang
 # Number of translation units the generated CLI C is split into before the
 # host C compile. 8 is the measured default (see
 # benchmarks/results/split_generated_c_O0_O2_2026-09-17.md and
-# benchmarks/results/split_default_build_2026-09-17.md). BLORP_CLI_C_SPLIT=1
-# is the escape hatch: it reproduces the previous single-TU compile exactly.
-BLORP_CLI_C_SPLIT ?= 8
+# benchmarks/results/split_default_build_2026-09-17.md). It is a constant, not a
+# knob; BLORP_CLI_C_SPLIT_JOBS only bounds how many of those units compile at
+# once (default: one per CPU). scripts/docker-gate sets it because each clang
+# job holds several hundred MB and concurrent gates share one VM.
+override BLORP_CLI_C_SPLIT := 8
 BLORP_CLI_SPLITTER := scripts/split-generated-c
 BLORP_CLI_SPLIT_DIR := $(BLORP_CLI_BUILD_DIR)/split-c
 # First line of `$(BLORP_CC) --version`, computed once and reused both for the
@@ -323,8 +327,8 @@ prepare-blorp-cli-c: generate-blorp-cli-c $(BLORP_CLI_RUNTIME_SOURCES_C)
 
 # Compile prepared C inputs with the host C toolchain only.
 #
-# This recipe is deliberately two-phase. Phase 1 produces the per-TU (or
-# single-TU) body objects, gated by $$new_hash: only real source, config, or
+# This recipe is deliberately two-phase. Phase 1 produces the per-TU
+# body objects, gated by $$new_hash: only real source, config, or
 # toolchain changes touch it, so it never runs merely because HEAD moved.
 # Phase 2 links those objects together with the always-fresh build-stamp
 # object, gated by $$link_hash ($$new_hash plus the current commit): a new
@@ -350,20 +354,19 @@ compile-prepared-blorp-cli: $(BLORP_CLI_RUNTIME_OBJECT) $(BLORP_CLI_BUILD_STAMP_
 	old_hash=$$(cat "$(BLORP_CLI_INPUT_HASH)" 2>/dev/null || true); \
 	split_dir="$(BLORP_CLI_SPLIT_DIR)/n$(BLORP_CLI_C_SPLIT)"; \
 	obj_dir="$$split_dir/obj"; \
-	if [ "$(BLORP_CLI_C_SPLIT)" -le 1 ]; then \
-		body_objects="$$obj_dir/blorp_cli_main.o"; \
-		objects_present=0; \
-		[ -s "$$body_objects" ] && objects_present=1; \
-	else \
-		body_objects=""; \
-		objects_present=0; \
-		[ -d "$$obj_dir" ] && ls "$$obj_dir"/split_body_*.o >/dev/null 2>&1 && objects_present=1; \
-	fi; \
+	objects_present=0; \
+	[ -d "$$obj_dir" ] && ls "$$obj_dir"/split_body_*.o >/dev/null 2>&1 && objects_present=1; \
 	if [ "$$new_hash" != "$$old_hash" ] || [ "$$objects_present" != 1 ]; then \
-		if [ "$(BLORP_CLI_C_SPLIT)" -le 1 ]; then \
-			echo "Compiling Blorp CLI (single TU)"; \
-			rm -rf "$$split_dir"; \
-			mkdir -p "$$obj_dir"; \
+		echo "Compiling Blorp CLI ($(BLORP_CLI_C_SPLIT)-way split)"; \
+		rm -rf "$$split_dir"; \
+		mkdir -p "$(BLORP_CLI_SPLIT_DIR)"; \
+		python3 "$(BLORP_CLI_SPLITTER)" "$(BLORP_CLI_C)" "$(BLORP_CLI_SPLIT_DIR)" -n "$(BLORP_CLI_C_SPLIT)"; \
+		mkdir -p "$$obj_dir"; \
+		jobs=$${BLORP_CLI_C_SPLIT_JOBS:-$$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}; \
+		ls "$$split_dir"/split_body_*.c | LC_ALL=C sort | xargs -P "$$jobs" -n 1 sh -c ' \
+			set -e; \
+			src="$$1"; \
+			base=$$(basename "$$src" .c); \
 			$(BLORP_CC) "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
 				-include blorp/src/lib/runtime/native/runtime_decl.c \
 				-Iblorp/src/compiler/stage_01_generated_inputs \
@@ -374,41 +377,14 @@ compile-prepared-blorp-cli: $(BLORP_CLI_RUNTIME_OBJECT) $(BLORP_CLI_BUILD_STAMP_
 				-Iblorp/src/lib \
 				-Iblorp/src/lsp/server \
 				-Iblorp/src/test \
-				-c "$(BLORP_CLI_C)" -o "$$body_objects"; \
-		else \
-			echo "Compiling Blorp CLI ($(BLORP_CLI_C_SPLIT)-way split)"; \
-			rm -rf "$$split_dir"; \
-			mkdir -p "$(BLORP_CLI_SPLIT_DIR)"; \
-			python3 "$(BLORP_CLI_SPLITTER)" "$(BLORP_CLI_C)" "$(BLORP_CLI_SPLIT_DIR)" -n "$(BLORP_CLI_C_SPLIT)"; \
-			mkdir -p "$$obj_dir"; \
-			jobs=$${BLORP_CLI_C_SPLIT_JOBS:-$$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}; \
-			ls "$$split_dir"/split_body_*.c | LC_ALL=C sort | xargs -P "$$jobs" -n 1 sh -c ' \
-				set -e; \
-				src="$$1"; \
-				base=$$(basename "$$src" .c); \
-				$(BLORP_CC) "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
-					-include blorp/src/lib/runtime/native/runtime_decl.c \
-					-Iblorp/src/compiler/stage_01_generated_inputs \
-					-Iblorp/src/compiler/stage_04_modules \
-					-Iblorp/src/compiler/stage_06_typecheck/graph \
-					-Iblorp/src/compiler/stage_06_typecheck/type_system \
-					-Iblorp/src \
-					-Iblorp/src/lib \
-					-Iblorp/src/lsp/server \
-					-Iblorp/src/test \
-					-c "$$src" -o "$(BLORP_CLI_SPLIT_DIR)/n$(BLORP_CLI_C_SPLIT)/obj/$$base.o" \
-			' sh; \
-		fi; \
+				-c "$$src" -o "$(BLORP_CLI_SPLIT_DIR)/n$(BLORP_CLI_C_SPLIT)/obj/$$base.o" \
+		' sh; \
 	else \
 		echo "Blorp CLI objects up to date"; \
 	fi; \
 	printf '%s\n' "$$new_hash" > "$$tmp_hash"; \
 	mv "$$tmp_hash" "$(BLORP_CLI_INPUT_HASH)"; \
-	if [ "$(BLORP_CLI_C_SPLIT)" -le 1 ]; then \
-		obj_files="$$body_objects"; \
-	else \
-		obj_files=$$(ls "$$obj_dir"/split_body_*.o | LC_ALL=C sort); \
-	fi; \
+	obj_files=$$(ls "$$obj_dir"/split_body_*.o | LC_ALL=C sort); \
 	commit=$${BLORP_BUILD_COMMIT:-}; \
 	if [ -z "$$commit" ]; then \
 		commit=$$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown); \

@@ -72,18 +72,6 @@ then
 	echo "FAIL: fast and release compiler builds must share the optimized runtime object" >&2
 	exit 1
 fi
-debug_runtime_build_plan=$(
-	unset BLORP_CC
-	make -n -B BLORP_CLI_RUNTIME_C_OPTIMIZATION=-O0 prepare-blorp-cli-runtime
-)
-debug_runtime_object=$(
-	grep -o 'runtime-[0-9a-f]\{64\}\.o' <<<"$debug_runtime_build_plan" | head -n 1
-)
-if [ -z "$debug_runtime_object" ] || [ "$debug_runtime_object" = "$local_runtime_object" ]
-then
-	echo "FAIL: an explicit runtime optimization override must get a distinct object" >&2
-	exit 1
-fi
 runtime_object_path="blorp/build/_build/blorp-cli/$local_runtime_object"
 runtime_object_probe_created=false
 if [ ! -e "$runtime_object_path" ]; then
@@ -118,15 +106,6 @@ diagnostic_link_hash_recipe=$(grep -F 'link_hash=$(' <<<"$diagnostic_build_plan"
 if [ "$normal_body_hash_recipe" != "$diagnostic_body_hash_recipe" ] ||
 	[ "$normal_link_hash_recipe" = "$diagnostic_link_hash_recipe" ]; then
 	echo "FAIL: diagnostic mode must share Blorp CLI body objects and change the link cache key" >&2
-	exit 1
-fi
-split_one_build_plan=$(
-	unset BLORP_CLI_C_OPTIMIZATION BLORP_CC MAKEFLAGS MFLAGS
-	make -n BLORP_CLI_C_SPLIT=1 compile-prepared-blorp-cli
-)
-split_one_body_hash_recipe=$(grep -F 'new_hash=$(' <<<"$split_one_build_plan")
-if [ "$normal_body_hash_recipe" = "$split_one_body_hash_recipe" ]; then
-	echo "FAIL: BLORP_CLI_C_SPLIT must change the Blorp CLI body cache key" >&2
 	exit 1
 fi
 

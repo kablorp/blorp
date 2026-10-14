@@ -62,7 +62,7 @@ class RuntimeCompilerOnlyMetricsTests(unittest.TestCase):
     def _compile_runtime(self, name: str, memory_diagnostics: int, compiler_runtime: bool) -> Path:
         output = Path(self._temp.name) / name
         arguments = [
-            os.environ.get("CC", "cc"),
+            os.environ.get("BLORP_CC", "clang"),
             "-O0",
             "-w",
             "-fwrapv",

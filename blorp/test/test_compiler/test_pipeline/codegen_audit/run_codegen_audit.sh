@@ -18,7 +18,10 @@ RUNTIME_DECL="$REPO_ROOT/blorp/src/lib/runtime/native/runtime_decl.c"
 # foreign includes of everything that module imports; the module table's native
 # header is the one such header the compiler modules declare.
 COMPILER_NATIVE_INCLUDE="$REPO_ROOT/blorp/src/compiler/stage_04_modules"
-TEST_TIMEOUT="${BLORP_COMPILER_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-30}}"
+# The compiler-test timeout default is shared with the other gates.
+# shellcheck source=scripts/gate-timeouts.env
+. "$REPO_ROOT/scripts/gate-timeouts.env"
+TEST_TIMEOUT="${BLORP_TEST_TIMEOUT:-$GATE_COMPILER_TEST_TIMEOUT}"
 # Worker count: --jobs, else BLORP_CODEGEN_AUDIT_JOBS, else min(CPU count,
 # MAX_DEFAULT_LINUX_JOBS) on Linux and one worker on macOS. macOS keeps one
 # because many freshly compiled processes at once stall in syspolicyd; Linux
@@ -81,7 +84,7 @@ done
 
 case "$TEST_TIMEOUT" in
     ''|*[!0-9]*)
-        echo "FAIL: invalid BLORP_COMPILER_TEST_TIMEOUT (must be a non-negative integer)"
+        echo "FAIL: invalid BLORP_TEST_TIMEOUT (must be a non-negative integer)"
         echo ""
         echo "Results: 0 passed, 1 failed"
         exit 1

@@ -110,12 +110,12 @@ class MemoryCompilerSetupTests(unittest.TestCase):
         make = self.root / "fake-bin/make"
         make.write_text(
             "#!/bin/sh\n"
-            f"printf '%s\\n' \"$BLORP_CLI_C_OPTIMIZATION\" \"$BLORP_CLI_RUNTIME_C_OPTIMIZATION\" \"$BLORP_CLI_C_SPLIT\" > {shlex.quote(str(self.make_marker))}\n"
+            f"printf '%s\\n' \"$BLORP_CLI_C_OPTIMIZATION\" > {shlex.quote(str(self.make_marker))}\n"
             f"cp {shlex.quote(str(self.diagnostic))} {shlex.quote(str(target))}\n"
         )
         result = self.run_setup(supplied=False)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.make_marker.read_text().splitlines(), ["-O2", "-O2", "8"])
+        self.assertEqual(self.make_marker.read_text().splitlines(), ["-O2"])
         self.assertEqual(result.stdout.strip(), str(target.resolve()))
 
     def test_local_build_failure_is_reported(self):

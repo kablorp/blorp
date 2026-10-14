@@ -17,6 +17,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 COMPILER_CHECK = ROOT / "scripts" / "compiler-check"
+GATE_TIMEOUTS = COMPILER_CHECK.with_name("gate-timeouts.env")
+# What compiler-check passes as `--timeout`: the compiler-test default.
+SUITE_TIMEOUT = dict(
+	line.split("=", 1) for line in GATE_TIMEOUTS.read_text(encoding="utf-8").splitlines() if "=" in line
+)["GATE_COMPILER_TEST_TIMEOUT"]
 
 
 def load_script(name: str, script: str):
@@ -44,6 +49,7 @@ class MiniCompilerCheckRepository:
 		(self.root / "blorp/test/test_compiler/test_stage_06_typecheck").mkdir(parents=True)
 		shutil.copy(COMPILER_CHECK, self.script)
 		shutil.copy(COMPILER_CHECK.with_name("blorp_import_graph.py"), self.root / "scripts/blorp_import_graph.py")
+		shutil.copy(COMPILER_CHECK.with_name("gate-timeouts.env"), self.root / "scripts/gate-timeouts.env")
 		self.script.chmod(0o755)
 		self.write_executable("make", "printf 'make\\n' >> tool-runs.log\n")
 		self.write_executable(
@@ -150,9 +156,9 @@ class MiniCompilerCheckRepository:
 	def run(self, *arguments: str) -> subprocess.CompletedProcess[str]:
 		environment = os.environ.copy()
 		environment["PATH"] = f"{self.root}{os.pathsep}{environment['PATH']}"
-		# The plan's expected `--timeout` is compiler-check's default; a gate
+		# The plan's expected `--timeout` is the gate-timeouts.env default; a gate
 		# runner such as docker-gate must not change what this test sees.
-		environment.pop("BLORP_COMPILER_TEST_TIMEOUT", None)
+		environment.pop("BLORP_TEST_TIMEOUT", None)
 		return subprocess.run(
 			[sys.executable, str(self.script), *arguments],
 			cwd=self.root,
@@ -305,7 +311,7 @@ class CompilerCheckPlanTests(unittest.TestCase):
 			self.assertIn("focused suite: blorp/test/test_compiler/test_stage_09_core/test_core_match.brp", plan.stdout)
 			self.assertIn("selected special check: compiler-core-sanitize", plan.stdout)
 			self.assertIn(
-				"Focused action: make; bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_match.brp; scripts/test --no-build --serial compiler-core-sanitize",
+				f"Focused action: make; bin/blorp test --timeout {SUITE_TIMEOUT} blorp/test/test_compiler/test_stage_09_core/test_core_match.brp; scripts/test --no-build --serial compiler-core-sanitize",
 				plan.stdout,
 			)
 			self.assertIn("Recommended additional gate: scripts/test compiler-blorp", plan.stdout)
@@ -316,7 +322,7 @@ class CompilerCheckPlanTests(unittest.TestCase):
 			run = repo.run("--changed")
 			self.assert_success(run)
 			self.assertIn("make", repo.marker.read_text(encoding="utf-8"))
-			self.assertIn("bin/blorp test --timeout 180", repo.marker.read_text(encoding="utf-8"))
+			self.assertIn(f"bin/blorp test --timeout {SUITE_TIMEOUT}", repo.marker.read_text(encoding="utf-8"))
 			self.assertIn("scripts/test --no-build --serial", repo.marker.read_text(encoding="utf-8"))
 
 	def test_execution_failure_retains_selection_logs_and_exact_rerun(self) -> None:
@@ -369,7 +375,7 @@ class CompilerCheckPlanTests(unittest.TestCase):
 			self.assert_success(result)
 
 			self.assertIn("Changed test: blorp/test/test_compiler/test_stage_09_core/test_core_match.brp", result.stdout)
-			self.assertIn("Focused action: make; bin/blorp test --timeout 180 blorp/test/test_compiler/test_stage_09_core/test_core_match.brp", result.stdout)
+			self.assertIn(f"Focused action: make; bin/blorp test --timeout {SUITE_TIMEOUT} blorp/test/test_compiler/test_stage_09_core/test_core_match.brp", result.stdout)
 			self.assertNotIn("Recommended additional gate:", result.stdout)
 			self.assertFalse(repo.marker.exists())
 
@@ -516,7 +522,7 @@ class CompilerCheckPlanTests(unittest.TestCase):
 
 			self.assertIn("Hand-back gates: tree path only", result.stdout)
 			self.assertIn(
-				f"scripts/compiler-build-status --quiet; bin/blorp test --timeout 180 {ADAPTER_SUITE} {TREE_SUITE}; "
+				f"scripts/compiler-build-status --quiet; bin/blorp test --timeout {SUITE_TIMEOUT} {ADAPTER_SUITE} {TREE_SUITE}; "
 				f"python3 -m unittest {PARITY_TESTS}; "
 				"scripts/test --no-build compiler-new compiler-new-parity",
 				result.stdout,
@@ -533,7 +539,7 @@ class CompilerCheckPlanTests(unittest.TestCase):
 			self.assert_success(result)
 
 			self.assertIn("Hand-back gates: tree path only", result.stdout)
-			self.assertIn(f"bin/blorp test --timeout 180 {ADAPTER_SUITE}", result.stdout)
+			self.assertIn(f"bin/blorp test --timeout {SUITE_TIMEOUT} {ADAPTER_SUITE}", result.stdout)
 			# The manifest owns the module and names compiler-new-parity, whose adapter
 			# differential runs the projection, as its broad gate; the test_compiler_new
 			# suites never import it.
@@ -831,7 +837,7 @@ class CompilerCheckPlanTests(unittest.TestCase):
 				tree_only["hand_back"]["commands"],
 				[
 					"scripts/compiler-build-status --quiet",
-					f"bin/blorp test --timeout 180 {ADAPTER_SUITE} {TREE_SUITE}",
+					f"bin/blorp test --timeout {SUITE_TIMEOUT} {ADAPTER_SUITE} {TREE_SUITE}",
 					"scripts/test --no-build compiler-new compiler-new-parity",
 				],
 			)

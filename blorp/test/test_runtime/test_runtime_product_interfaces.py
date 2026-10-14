@@ -335,7 +335,7 @@ class RuntimeProductInterfaceTests(unittest.TestCase):
         cls.directory = tempfile.TemporaryDirectory()
         cls.executable = Path(cls.directory.name) / "product-interfaces"
         compiled = subprocess.run(
-            [os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-w",
+            [os.environ.get("BLORP_CC", "clang"), "-std=gnu11", "-O1", "-w",
              "-DBLORP_MEMORY_DIAGNOSTICS=1",
              f"-I{ROOT / 'blorp/src/lib/runtime/native'}", "-x", "c", "-",
              "-lm", "-lpthread", "-o", str(cls.executable)],

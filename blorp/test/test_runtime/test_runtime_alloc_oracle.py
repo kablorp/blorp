@@ -25,7 +25,7 @@ class RuntimeAllocOracleTests(unittest.TestCase):
             executable = Path(temp_name) / "alloc-oracle"
             compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O0",
                     "-w",
                     "-DBLORP_MEMORY_DIAGNOSTICS=1",
@@ -371,7 +371,7 @@ class RuntimeAllocOracleTests(unittest.TestCase):
             executable = Path(temp_name) / "alloc-oracle-disabled"
             compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O0",
                     "-w",
                     "-DBLORP_MEMORY_DIAGNOSTICS=1",

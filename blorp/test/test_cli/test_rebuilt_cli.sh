@@ -5,11 +5,14 @@ set -u
 
 cd "$(dirname "$0")/../../.."
 
+# shellcheck source=scripts/gate-timeouts.env
+. scripts/gate-timeouts.env
+
 usage() {
     echo "Usage: blorp/test/test_cli/test_rebuilt_cli.sh [--timeout SECONDS]"
 }
 
-test_timeout="${BLORP_TEST_TIMEOUT:-60}"
+test_timeout="${BLORP_TEST_TIMEOUT:-$GATE_TEST_TIMEOUT}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --timeout)

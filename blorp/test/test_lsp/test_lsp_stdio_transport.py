@@ -59,7 +59,7 @@ class LspStdioTransportTests(unittest.TestCase):
             )
         link_result = subprocess.run(
             [
-                os.environ.get("CC", "cc"),
+                os.environ.get("BLORP_CC", "clang"),
                 *compiler_flags,
                 str(generated_c),
                 "-lm",

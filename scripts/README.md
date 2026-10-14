@@ -139,19 +139,18 @@ scripts/test --release-artifacts # compile test artifacts at -O2 (default -O0)
   `syspolicyd`, so do not run compiled binaries in parallel there;
   `scripts/premerge-gate` passes `--serial` on macOS for that reason.
 
-Timeouts (environment overrides):
-
-- `BLORP_TEST_TIMEOUT`: generated test artifacts. `BLORP_RUNTIME_TEST_TIMEOUT`:
-  the single runtime corpus (default 60 seconds; other artifacts 30).
-- `BLORP_LEAK_TEST_TIMEOUT`: the leak-check corpus (default 60 seconds). A
-  positive value is a floor per batch; `bin/blorp test --leak-check` grants each
-  batch the larger of the floor and 5 seconds
-  (`LEAK_CHECKED_SOURCE_TIMEOUT_SECONDS` in `blorp/src/test/plan.brp`) times its
-  test sources. Zero disables the deadline.
-- `BLORP_COMPILER_TEST_TIMEOUT`: compiler tests (grouped suites 360 seconds,
-  individual fixtures and codegen audits 30).
-  `BLORP_COMPILER_SANITIZE_TEST_TIMEOUT`: compiler sanitizer gates (180).
-- `BLORP_COMPILER_TEST_PROGRESS=1` streams per-artifact progress, as CI does.
+Timeouts: the per-gate defaults live in `scripts/gate-timeouts.env`, which
+`scripts/test`, `scripts/compiler-check`, the codegen audit, and the CLI and
+package test scripts all read. They are 30 seconds for ordinary generated
+artifacts, 60 for the single runtime corpus, 60 for the leak-check corpus,
+360 for grouped compiler suites and codegen audits, and 180 for compiler
+sanitizer suites. `BLORP_TEST_TIMEOUT` replaces every one of them (and is the
+variable `bin/blorp test` reads itself); `scripts/premerge-gate --timeout N`
+sets it for the test gates. A positive leak-check value is a floor per batch;
+`bin/blorp test --leak-check` grants each batch the larger of the floor and 5
+seconds (`LEAK_CHECKED_SOURCE_TIMEOUT_SECONDS` in `blorp/src/test/plan.brp`)
+times its test sources. Zero disables the deadline. Set
+`BLORP_COMPILER_TEST_PROGRESS=1` to stream per-artifact progress, as CI does.
 
 ### Gate verdicts
 
@@ -340,15 +339,16 @@ commit relinks rather than recompiles the compiler.
   built from; the Makefile uses it to decide whether to reinstall.
 - `scripts/split-generated-c <generated.c> <out_dir> -n N` splits the compiler's
   generated C into a shared header and N translation units that the Makefile
-  compiles in parallel (`BLORP_CLI_C_SPLIT`).
+  compiles in parallel (N is the Makefile constant `BLORP_CLI_C_SPLIT`, 8;
+  `BLORP_CLI_C_SPLIT_JOBS` caps the parallel compiles).
 - `scripts/with-build-lock COMMAND...` serializes build/test gates per worktree
   (`scripts/test` and `scripts/premerge-gate` use it) so concurrent runs do not
   race on generated caches. It uses `flock`, or a POSIX file lock in
   `scripts/with-build-lock-fcntl` where `flock` is missing.
 - `make install` builds with the pinned release's `blorp compile`. Local builds
   compile generated compiler C at `-O0`; `BLORP_CLI_C_OPTIMIZATION` selects the
-  level (CI and releases use `-O2`) and `BLORP_CLI_RUNTIME_C_OPTIMIZATION` the
-  runtime object's. `make generate-blorp-cli-c`, `prepare-blorp-cli-runtime`,
+  level (CI and releases use `-O2`); the runtime object is always `-O2`.
+  `make generate-blorp-cli-c`, `prepare-blorp-cli-runtime`,
   `prepare-blorp-cli-c`, `compile-prepared-blorp-cli` and
   `install-prepared-blorp-cli` run the phases separately, as CI does.
 - `scripts/blorp-compiler-bootstrap` reads the release identity and per-target

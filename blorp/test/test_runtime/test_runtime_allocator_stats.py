@@ -79,7 +79,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
             executable = Path(temp_name) / "first-list-append"
             compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O2",
                     "-w",
                     "-DBLORP_MEMORY_DIAGNOSTICS=1",
@@ -218,7 +218,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
             executable = Path(temp_name) / "list-growth-ownership"
             compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O2",
                     "-w",
                     "-DBLORP_MEMORY_DIAGNOSTICS=1",
@@ -267,7 +267,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
             executable = Path(temp_name) / "optimized-allocation"
             compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O2",
                     "-fomit-frame-pointer",
                     "-w",
@@ -379,7 +379,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
             executable = Path(temp_name) / "memory-stats-counters"
             compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O0",
                     "-w",
                     "-DBLORP_MEMORY_DIAGNOSTICS=1",
@@ -462,7 +462,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
             executable = Path(temp_name) / "allocator-stats-reset"
             compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O0",
                     "-w",
                     "-DBLORP_MEMORY_DIAGNOSTICS=1",
@@ -519,7 +519,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
             executable = Path(temp_name) / "compiler-memory-checkpoint"
             compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O2",
                     "-w",
                     "-DBLORP_MEMORY_DIAGNOSTICS=1",
@@ -595,7 +595,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
         executable = Path(directory) / name
         compiled = subprocess.run(
             [
-                os.environ.get("CC", "cc"),
+                os.environ.get("BLORP_CC", "clang"),
                 "-O0",
                 "-w",
                 "-DBLORP_MEMORY_DIAGNOSTICS=1",

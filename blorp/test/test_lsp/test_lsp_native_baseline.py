@@ -14,7 +14,7 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
-BLORP = pathlib.Path(os.environ.get("BLORP_TEST_BINARY", ROOT / "bin" / "blorp")).resolve()
+BLORP = pathlib.Path(os.environ.get("BLORP_BIN", ROOT / "bin" / "blorp")).resolve()
 # Initializing against ROOT makes the server recursively discover and read
 # every .brp file in the whole monorepo (thousands of files) before it can
 # answer `initialize`. Tests that don't need real cross-repo navigation use a

@@ -148,7 +148,7 @@ class CancelAfterParkedContract(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory(prefix="blorp-parking-contract-")
         cls.executable = Path(cls.temporary.name) / "contract"
         result = subprocess.run(
-            [os.environ.get("CC", "cc"), "-O0", "-g", "-fwrapv", "-w",
+            [os.environ.get("BLORP_CC", "clang"), "-O0", "-g", "-fwrapv", "-w",
              f"-I{RUNTIME_INCLUDE}", "-x", "c", "-", "-lm", "-lpthread",
              "-o", str(cls.executable)],
             cwd=ROOT, input=SOURCE, text=True, capture_output=True, timeout=60)

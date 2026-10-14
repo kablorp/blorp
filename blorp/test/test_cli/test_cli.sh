@@ -5,6 +5,9 @@ set -u
 
 cd "$(dirname "$0")/../../.."
 
+# shellcheck source=scripts/gate-timeouts.env
+. scripts/gate-timeouts.env
+
 usage() {
     cat <<'EOF'
 Usage: blorp/test/test_cli/test_cli.sh [--all|--smoke] [--timeout SECONDS] [--gate-name NAME]
@@ -12,14 +15,14 @@ Usage: blorp/test/test_cli/test_cli.sh [--all|--smoke] [--timeout SECONDS] [--ga
 Options:
   --all                Run the full CLI integration set, including package and formatter tool checks.
   --smoke              Run public command-surface smoke checks only.
-  --timeout SECONDS    Per-command timeout. Defaults to BLORP_TEST_TIMEOUT or 60.
+  --timeout SECONDS    Per-command timeout. Defaults to BLORP_TEST_TIMEOUT or scripts/gate-timeouts.env.
   --gate-name NAME     Gate name emitted in the BLORP_GATE_RESULT summary.
 EOF
 }
 
 CLI_MODE="all"
 CLI_GATE_NAME="cli"
-CLI_TIMEOUT="${BLORP_TEST_TIMEOUT:-60}"
+CLI_TIMEOUT="${BLORP_TEST_TIMEOUT:-$GATE_TEST_TIMEOUT}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --all)

@@ -5,18 +5,21 @@ set -u
 
 cd "$(dirname "$0")/../../.."
 
+# shellcheck source=scripts/gate-timeouts.env
+. scripts/gate-timeouts.env
+
 usage() {
     cat <<'EOF'
 Usage: blorp/test/test_package/test_package.sh [--timeout SECONDS] [--gate-name NAME]
 
 Options:
-  --timeout SECONDS    Per-command timeout. Defaults to BLORP_TEST_TIMEOUT or 60.
+  --timeout SECONDS    Per-command timeout. Defaults to BLORP_TEST_TIMEOUT or scripts/gate-timeouts.env.
   --gate-name NAME     Gate name emitted in the BLORP_GATE_RESULT summary.
 EOF
 }
 
 CLI_GATE_NAME="package"
-CLI_TIMEOUT="${BLORP_TEST_TIMEOUT:-60}"
+CLI_TIMEOUT="${BLORP_TEST_TIMEOUT:-$GATE_TEST_TIMEOUT}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --timeout)

@@ -33,7 +33,10 @@ PRODUCTION_SOURCE_DIRECTORY = Path("blorp/src")
 COMPILER_TEST_DIRECTORY = Path("blorp/test")
 PRODUCTION_COMPOSITION_ROOTS = (Path("blorp/src/main.brp"),)
 SUPPORTED_SCHEMA_VERSION = 1
-DEFAULT_SUITE_TIMEOUT_SECONDS = "180"
+# Default timeouts for every test gate live in one KEY=VALUE file that
+# scripts/test and the other gate scripts source; BLORP_TEST_TIMEOUT overrides it.
+GATE_TIMEOUTS_PATH = Path(__file__).resolve().parent / "gate-timeouts.env"
+SUITE_TIMEOUT_NAME = "GATE_COMPILER_TEST_TIMEOUT"
 TEST_SUITE_DECLARATION = re.compile(r"^\s*tests\s*:\s*TestSuite\s*=", re.MULTILINE)
 FIXTURE_DIRECTORY_NAMES = {"fixture", "fixtures", "should_pass", "should_fail", "golden", "testdata"}
 # Runtime TestSuites are selected by the runtime/leak/sanitizer gates rather
@@ -825,6 +828,19 @@ def _plan_check_command(check: Check) -> list[str]:
     return list(check.command)
 
 
+def suite_timeout_seconds() -> str:
+    """The `--timeout` for focused compiler suites: the caller's
+    BLORP_TEST_TIMEOUT, else the compiler-test default from the gate defaults."""
+    override = os.environ.get("BLORP_TEST_TIMEOUT")
+    if override:
+        return override
+    for line in GATE_TIMEOUTS_PATH.read_text(encoding="utf-8").splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name == SUITE_TIMEOUT_NAME:
+            return value.strip()
+    raise RuntimeError(f"{GATE_TIMEOUTS_PATH} does not define {SUITE_TIMEOUT_NAME}")
+
+
 def _focused_action_commands(selection: Selection, rebuild: bool = True) -> list[list[str]]:
     """The commands that run `selection`. `rebuild` is false when `bin/blorp` is
     not made from what changed (the tree path), so it needs no `make`."""
@@ -832,7 +848,7 @@ def _focused_action_commands(selection: Selection, rebuild: bool = True) -> list
     if rebuild and (selection.suites or selection.checks):
         commands.append(["make"])
     if selection.suites:
-        timeout = os.environ.get("BLORP_COMPILER_TEST_TIMEOUT", DEFAULT_SUITE_TIMEOUT_SECONDS)
+        timeout = suite_timeout_seconds()
         commands.append(
             ["bin/blorp", "test", "--timeout", timeout, *[suite.path for suite in selection.suites]]
         )
@@ -1094,7 +1110,7 @@ def execute_selection(root: Path, selection: Selection, original_arguments: list
 
     status = _run_logged(["make"], root, log_directory / "prepare.log")
     if status == 0 and selection.suites:
-        timeout = os.environ.get("BLORP_COMPILER_TEST_TIMEOUT", DEFAULT_SUITE_TIMEOUT_SECONDS)
+        timeout = suite_timeout_seconds()
         suites_log = log_directory / "suites.log"
         status = _run_logged(
             ["bin/blorp", "test", "--timeout", timeout, *[suite.path for suite in selection.suites]],

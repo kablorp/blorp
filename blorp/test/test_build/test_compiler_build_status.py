@@ -27,7 +27,6 @@ BUILD_METADATA_ENV_VARS = (
 )
 BUILD_OPTIMIZATION_ENV_VARS = (
 	"BLORP_CLI_C_OPTIMIZATION",
-	"BLORP_CLI_RUNTIME_C_OPTIMIZATION",
 	"BLORP_MEMORY_DIAGNOSTICS",
 )
 
@@ -400,7 +399,6 @@ class CompilerBuildStatusTests(unittest.TestCase):
 				"BLORP_BUILD_CHANNEL": "preview",
 				"BLORP_BUILD_DIRTY": "false",
 				"BLORP_CLI_C_OPTIMIZATION": "-O2",
-				"BLORP_CLI_RUNTIME_C_OPTIMIZATION": "-O3",
 			},
 		):
 			result = self.run_status()
@@ -597,15 +595,6 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		self.assert_status(result, 0, "FRESH")
 		self.assertIn("8-way split", result.stdout)
 		self.assertIn("8 per-TU objects", result.stdout)
-
-	def test_fresh_reports_single_tu_escape_hatch(self) -> None:
-		self.write_fake_binary_version(split_n="1")
-		self.write_fresh_manifests(split_n="1")
-
-		result = self.run_status()
-
-		self.assert_status(result, 0, "FRESH")
-		self.assertIn("single translation unit", result.stdout)
 
 	def test_missing_or_corrupt_provenance_reports_unknown(self) -> None:
 		for path in (

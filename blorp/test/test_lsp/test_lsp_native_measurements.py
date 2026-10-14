@@ -20,7 +20,7 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
-BLORP = pathlib.Path(os.environ.get("BLORP_TEST_BINARY", ROOT / "bin" / "blorp")).resolve()
+BLORP = pathlib.Path(os.environ.get("BLORP_BIN", ROOT / "bin" / "blorp")).resolve()
 MEASUREMENT_TIMEOUT_SECONDS = 60.0
 RUNNER_PATH = pathlib.Path(__file__).with_name("run_lsp_fixtures.py")
 RUNNER_SPEC = importlib.util.spec_from_file_location("run_lsp_fixtures", RUNNER_PATH)

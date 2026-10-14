@@ -62,15 +62,12 @@ def prepare(normal, supplied):
         if not installed.is_file() or not filecmp.cmp(normal, installed, shallow=False):
             raise SetupError("Local memory tests require checkout bin/blorp; supply BLORP_DIAGNOSTIC_BIN for a prebuilt pair")
         checked_run(["scripts/compiler-build-status"])
-        optimization = re.fullmatch(r"cli=(\S+) runtime=(\S+)", normal_version["optimization"])
-        if not optimization or not normal_version["split"].isdigit() or int(normal_version["split"]) < 1:
-            raise SetupError("Cannot read compiler optimization/split configuration")
-        environment = {
-            **os.environ,
-            "BLORP_CLI_C_OPTIMIZATION": optimization.group(1),
-            "BLORP_CLI_RUNTIME_C_OPTIMIZATION": optimization.group(2),
-            "BLORP_CLI_C_SPLIT": normal_version["split"],
-        }
+        optimization = re.fullmatch(r"cli=(\S+) runtime=\S+", normal_version["optimization"])
+        if not optimization:
+            raise SetupError("Cannot read compiler optimization configuration")
+        # The runtime optimization and the split count are Makefile constants;
+        # the version comparison below still checks the pair agrees.
+        environment = {**os.environ, "BLORP_CLI_C_OPTIMIZATION": optimization.group(1)}
         checked_run(["make", "--no-print-directory", "build-blorp-cli-diagnostic"], environment=environment, timeout=600)
         diagnostic = Path("blorp/build/_build/blorp-cli/blorp-diagnostic").resolve()
     diagnostic_version = compiler_version(diagnostic, 1)

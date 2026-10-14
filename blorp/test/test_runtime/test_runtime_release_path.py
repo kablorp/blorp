@@ -56,7 +56,7 @@ class RuntimeReleasePathTests(unittest.TestCase):
             executable = Path(temp_name) / "release-path"
             compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O0",
                     "-w",
                     "-DBLORP_MEMORY_DIAGNOSTICS=1",

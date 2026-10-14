@@ -33,7 +33,7 @@ class RuntimeDenseProfileIdTests(unittest.TestCase):
         executable = Path(temp.name) / "profile-exact-timing-cases"
         compiled = subprocess.run(
             [
-                os.environ.get("CC", "cc"),
+                os.environ.get("BLORP_CC", "clang"),
                 "-O1",
                 "-g",
                 "-fsanitize=address,undefined",
@@ -119,7 +119,7 @@ class RuntimeDenseProfileIdTests(unittest.TestCase):
 
             c_compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O0",
                     "-w",
                     str(generated_c),
@@ -226,7 +226,7 @@ class RuntimeDenseProfileIdTests(unittest.TestCase):
 
             c_compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O0",
                     "-w",
                     str(generated_c),
@@ -388,7 +388,7 @@ class RuntimeDenseProfileIdTests(unittest.TestCase):
 
             c_compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O0",
                     "-w",
                     str(generated_c),
@@ -477,7 +477,7 @@ class RuntimeDenseProfileIdTests(unittest.TestCase):
             executable = Path(temp_name) / "calls-profile"
             compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O1",
                     "-g",
                     "-fsanitize=address,undefined",
@@ -571,7 +571,7 @@ class RuntimeDenseProfileIdTests(unittest.TestCase):
             executable = Path(temp_name) / "calls-profile-signal"
             compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O1",
                     "-w",
                     f"-I{RUNTIME_NATIVE}",
@@ -659,7 +659,7 @@ class RuntimeDenseProfileIdTests(unittest.TestCase):
             executable = Path(temp_name) / "exact-profile-signal"
             compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O1",
                     "-w",
                     f"-I{RUNTIME_NATIVE}",
@@ -846,7 +846,7 @@ class RuntimeDenseProfileIdTests(unittest.TestCase):
 
             c_compiled = subprocess.run(
                 [
-                    os.environ.get("CC", "cc"),
+                    os.environ.get("BLORP_CC", "clang"),
                     "-O0",
                     "-w",
                     str(generated_c),

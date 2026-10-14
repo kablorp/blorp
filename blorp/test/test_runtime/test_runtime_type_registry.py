@@ -23,7 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 RUNTIME = ROOT / "blorp" / "src" / "lib" / "runtime" / "native"
-COMPILER = os.environ.get("CC", "cc")
+COMPILER = os.environ.get("BLORP_CC", "clang")
 
 # Bodies are compiled once through runtime_decl.c with no memory-diagnostics
 # define, then linked against each runtime mode: the shape of generated code.

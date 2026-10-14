@@ -50,7 +50,7 @@ class NativeRuntimeTests(unittest.TestCase):
 
         result = subprocess.run(
             [
-                os.environ.get("CC", "cc"),
+                os.environ.get("BLORP_CC", "clang"),
                 "-D_GNU_SOURCE",
                 "-Wall",
                 "-Wextra",

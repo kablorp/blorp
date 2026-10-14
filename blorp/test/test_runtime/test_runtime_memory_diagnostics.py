@@ -66,7 +66,7 @@ class RuntimeMemoryDiagnosticsTests(unittest.TestCase):
     def _compile(self, mode: int, output: Path) -> None:
         result = subprocess.run(
             [
-                os.environ.get("CC", "cc"),
+                os.environ.get("BLORP_CC", "clang"),
                 "-O2",
                 "-w",
                 f"-DBLORP_MEMORY_DIAGNOSTICS={mode}",
