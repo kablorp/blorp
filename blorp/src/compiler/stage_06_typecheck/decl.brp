@@ -264,7 +264,6 @@ import:
 		TypeHeaderGraph,
 		callable_type_parameter_id_name,
 		type_header_graph_bound_graph,
-		type_header_graph_declaration_skeleton_count,
 		type_header_graph_definition_table,
 	headers/type_header_install:
 		ModuleHeaderProductTable,
@@ -437,14 +436,6 @@ import:
 		typecheck_state_scope_to_program,
 		typecheck_state_type_home_matches,
 		typecheck_state_with_scoped_trait_functions,
-	trace:
-		TYPECHECK_TRACE_UNINDEXED,
-		TypecheckTracePhase(
-			BodiesComplete, BodyDeclComplete, BodyDeclStart, DirectImportsComplete,
-			ImportDeclsComplete, ImportSurfacesComplete, ImportSyntaxComplete, LocalImplsComplete,
-			LocalSignaturesComplete, LocalTypesComplete, PreludeComplete, PrescanComplete,
-			ReachableImportsComplete,
-		),
 	type_occurrence:
 		TypedTypeDefinition,
 		TypedTypeReference,
@@ -6205,61 +6196,6 @@ private pure func typecheck_materialize_standalone_program_bodies_with_import_mo
 	)
 
 
-private func typecheck_materialize_standalone_program_bodies_with_import_modules_with_trace(
-	state: TypecheckState,
-	program: ParsedProgram,
-	import_modules: List[ImportableModule],
-	global_bodies: GlobalBodyMaterialization,
-	function_bodies: FunctionBodyMaterialization,
-	trace: (TypecheckTracePhase, Int) -> Void,
-	main_policy: MainValidationPolicy,
-) -> TypecheckProgramResult:
-	var next_state = state
-	var materialized_decls: List[MaterializedTypedDecl] = []
-	var decl_index: Int = 0
-
-	for decl in program.decls:
-		trace(BodyDeclStart, decl_index)
-		next_state = typecheck_state_reset_type_shape_memo(next_state)
-
-		match decl:
-			ForeignBlockParsedDecl(block_args, functions, block_span):
-				foreign_result: TypedForeignBlockResult = typed_foreign_block(
-					next_state,
-					block_args,
-					functions,
-					block_span,
-				)
-				next_state = foreign_result.state
-
-				for foreign_decl in foreign_result.decls:
-					materialized_decls = materialized_decls.append(
-						MaterializedUncheckedDecl(foreign_decl),
-					)
-			_:
-				result = typecheck_materialize_decl_body(
-					next_state,
-					program.source.module_name,
-					program.decls,
-					import_modules,
-					global_bodies,
-					function_bodies,
-					decl,
-					main_policy,
-				)
-				next_state = result.state
-				materialized_decls = materialized_decls.append(result.decl)
-
-		trace(BodyDeclComplete, decl_index)
-		decl_index += 1
-
-	typecheck_validate_materialized_typed_program(
-		typecheck_state_reset_type_shape_memo(next_state),
-		program,
-		materialized_decls,
-	)
-
-
 private pure func replay_accepted_trait_definition_id(
 	state: TypecheckState,
 	id: TraitId,
@@ -8642,22 +8578,6 @@ pure func recoverable_typecheck_graph_import_modules(
 	graph: RecoverableTypecheckGraph,
 ) -> List[ImportableModule]:
 	importable_module_graph_all(recoverable_typecheck_graph_rep(graph).facts.importable_graph)
-
-
-pure func recoverable_typecheck_graph_declaration_skeleton_count(
-	graph: RecoverableTypecheckGraph,
-) -> Int:
-	type_headers = trait_topology_graph_type_headers(
-		accepted_typecheck_graph_trait_topology(recoverable_typecheck_graph_rep(graph).facts),
-	)
-	type_header_graph_declaration_skeleton_count(type_headers)
-
-
-pure func accepted_typecheck_graph_declaration_skeleton_count(graph: AcceptedTypecheckGraph) -> Int:
-	type_headers = trait_topology_graph_type_headers(
-		accepted_typecheck_graph_trait_topology(accepted_typecheck_graph_rep(graph).facts),
-	)
-	type_header_graph_declaration_skeleton_count(type_headers)
 
 
 pure func accepted_typecheck_graph_import_modules(
@@ -11132,63 +11052,6 @@ pure func typecheck_program_with_type_header_module_for_policy(
 	main_policy: MainValidationPolicy,
 ) -> TypecheckProgramResult:
 	typecheck_program_with_accepted_type_headers(input, main_policy)
-
-
-private func typecheck_program_with_accepted_type_headers_and_trace(
-	input: AcceptedTypecheckModule,
-	trace: (TypecheckTracePhase, Int) -> Void,
-	main_policy: MainValidationPolicy,
-) -> TypecheckProgramResult:
-	representation = accepted_typecheck_module_rep(input)
-	graph = representation.graph_facts
-	bound_module = representation.bound_module
-	program = bound_module_program(bound_module)
-	body_base = accepted_body_module_base(input)
-
-	-- These phases completed when the accepted module prepared its immutable
-	-- body base. Preserve the trace protocol without replaying registration.
-	trace(PreludeComplete, TYPECHECK_TRACE_UNINDEXED)
-	trace(ReachableImportsComplete, TYPECHECK_TRACE_UNINDEXED)
-	trace(ImportSurfacesComplete, TYPECHECK_TRACE_UNINDEXED)
-	trace(DirectImportsComplete, TYPECHECK_TRACE_UNINDEXED)
-	trace(PrescanComplete, TYPECHECK_TRACE_UNINDEXED)
-	trace(ImportSyntaxComplete, TYPECHECK_TRACE_UNINDEXED)
-	trace(ImportDeclsComplete, TYPECHECK_TRACE_UNINDEXED)
-	trace(LocalTypesComplete, TYPECHECK_TRACE_UNINDEXED)
-	trace(LocalSignaturesComplete, TYPECHECK_TRACE_UNINDEXED)
-	trace(LocalImplsComplete, TYPECHECK_TRACE_UNINDEXED)
-	(complete_table, metrics) = check_complete_body_table_in_order(
-		body_base,
-		SourceBodyOrder,
-		main_policy,
-	)
-
-	result = match complete_table:
-		CompleteBodyOutcomeTableRejected(errors):
-			rejected_body_table_result(body_base, errors)
-		CompleteBodyOutcomeTableAccepted(table):
-			complete_main_policy = from_opaque CompleteBodyOutcomeTable(table).main_policy
-			typecheck_materialize_standalone_program_bodies_with_import_modules_with_trace(
-				body_base.state,
-				program,
-				body_base.import_modules,
-				ReuseAcceptedGlobalBodies(graph.completed_globals),
-				ReuseCompleteFunctionBodies(table, graph.implementation_headers),
-				trace,
-				complete_main_policy,
-			)
-
-	trace(BodiesComplete, TYPECHECK_TRACE_UNINDEXED)
-
-	accepted_program_with_native_managed_authority(body_base, result)
-
-
-func typecheck_program_with_type_header_module_and_trace_for_policy(
-	input: AcceptedTypecheckModule,
-	trace: (TypecheckTracePhase, Int) -> Void,
-	main_policy: MainValidationPolicy,
-) -> TypecheckProgramResult:
-	typecheck_program_with_accepted_type_headers_and_trace(input, trace, main_policy)
 
 
 pure func rejected_typecheck_program(
