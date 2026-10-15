@@ -910,30 +910,14 @@ private pure func append_operation(
 
 			Ok(prefix.concat(")"))
 		ConstructDefinition(id, fields):
-			declaration ?= unions
-				.get(union_number(variant_owner(id)))
-				.to_result(internal_error())
-
-			-- A union with no payload anywhere is a bare C enum, so a variant is its tag.
-			if has_payload(declaration):
-				index = union_number(variant_owner(id))
-				-- A boxed node is allocated from the same compound literal.
-				opening = match declaration.representation:
-					BoxedRecursive:
-						"blorp_union_make_".append_int(index).concat("((").concat(boxed_union_struct(index))
-					InlineUnmanaged | InlineOwningPayload:
-						"((".concat(union_c_type(variant_owner(id), declaration))
-				tagged = output
-					.concat(opening)
-					.concat("){.tag=")
-					.concat(c_variant(id))
-				-- A variant without fields omits the payload initializer.
-				if fields.is_empty():
-					Ok(tagged.concat("})"))
-				else:
-					Ok(append_payload_initializer(tagged, id, fields).concat("})"))
-			else:
-				Ok(output.concat(c_variant(id)))
+			var operands: List[String] = []
+			for field in fields:
+				operand = match field:
+					UnmanagedPayload(value): c_value(value)
+					OwnedPayload(_, owner): c_owner(owner)
+				operands = operands.append(operand)
+			value ?= c_union_value(id, operands, unions)
+			Ok(output.concat(value))
 		ConstructListDefinition(_):
 			-- append_value routes list construction to append_list_construction,
 			-- which writes statements; it never reaches this expression writer.
@@ -954,27 +938,57 @@ private pure func append_operation(
 			)
 
 
+-- The one C rendering of a union value, for source constructions and runtime
+-- results alike, so every union value local follows its layout. A union with
+-- no payload anywhere is a bare C enum and a variant is its tag; any other
+-- value is a compound literal, from which a boxed union allocates its counted
+-- node. Each operand is an occurrence the new value owns.
+private pure func c_union_value(
+	variant: VariantInstanceId,
+	operands: List[String],
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	index = union_number(variant_owner(variant))
+	declaration ?= unions
+		.get(index)
+		.to_result(internal_error())
+
+	if has_payload(declaration):
+		opening = match declaration.representation:
+			BoxedRecursive:
+				"blorp_union_make_".append_int(index).concat("((").concat(boxed_union_struct(index))
+			InlineUnmanaged | InlineOwningPayload:
+				"((".concat(union_c_type(variant_owner(variant), declaration))
+		tagged = opening
+			.concat("){.tag=")
+			.concat(c_variant(variant))
+		-- A variant without fields omits the payload initializer.
+		if operands.is_empty():
+			Ok(tagged.concat("})"))
+		else:
+			Ok(append_payload_initializer(tagged, variant, operands).concat("})"))
+	else:
+		Ok(c_variant(variant))
+
+
 private pure func append_payload_initializer(
 	output: String,
 	id: VariantInstanceId,
-	fields: List[StoredPayload],
+	operands: List[String],
 ) -> String:
 	var result = output
 		.concat(",.payload.")
 		.concat(c_payload(id))
 		.concat("={")
 	var position = 0
-	for field in fields:
+	for operand in operands:
 		if IntOps.greater_than(position, 0):
 			result = result.concat(",")
-		stored = match field:
-			UnmanagedPayload(value): c_value(value)
-			OwnedPayload(_, owner): c_owner(owner)
 		result = result
 			.concat(".blorp_uf_")
 			.append_int(position)
 			.concat("=")
-			.concat(stored)
+			.concat(operand)
 		position = IntOps.add(position, 1)
 	result.concat("}")
 
@@ -995,29 +1009,21 @@ private pure func append_optional_value(
 	payload: String,
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
-	type_name ?= c_type(UnionType(variant_owner(option.some)), unions)
+	declaration ?= c_local_declaration(UnionType(variant_owner(option.some)), unions)
+	some ?= c_union_value(option.some, [payload], unions)
+	none ?= c_union_value(option.none, [], unions)
 	name = c_value(id)
 	Ok(
 		output
-			.concat("const ")
-			.concat(type_name)
-			.concat(" ")
+			.concat(declaration)
 			.concat(name)
 			.concat("=")
 			.concat(condition)
-			.concat("?((")
-			.concat(type_name)
-			.concat("){.tag=")
-			.concat(c_variant(option.some))
-			.concat(",.payload.")
-			.concat(c_payload_field(option.some, 0))
-			.concat("=")
-			.concat(payload)
-			.concat("}):((")
-			.concat(type_name)
-			.concat("){.tag=")
-			.concat(c_variant(option.none))
-			.concat("});(void)")
+			.concat("?")
+			.concat(some)
+			.concat(":")
+			.concat(none)
+			.concat(";(void)")
 			.concat(name)
 			.concat(";"),
 	)
@@ -1180,7 +1186,9 @@ private pure func append_equals(
 	right ?= arguments
 		.get(1)
 		.to_result(internal_error())
-	type_name ?= c_type(UnionType(variant_owner(boolean.true_variant)), unions)
+	declaration ?= c_local_declaration(UnionType(variant_owner(boolean.true_variant)), unions)
+	equal ?= c_union_value(boolean.true_variant, [], unions)
+	different ?= c_union_value(boolean.false_variant, [], unions)
 	name = c_value(id)
 	left_value = c_value(argument_value(left))
 	right_value = c_value(argument_value(right))
@@ -1201,16 +1209,14 @@ private pure func append_equals(
 
 	Ok(
 		output
-			.concat("const ")
-			.concat(type_name)
-			.concat(" ")
+			.concat(declaration)
 			.concat(name)
 			.concat("=")
 			.concat(condition)
 			.concat("?")
-			.concat(c_variant(boolean.true_variant))
+			.concat(equal)
 			.concat(":")
-			.concat(c_variant(boolean.false_variant))
+			.concat(different)
 			.concat(";(void)")
 			.concat(name)
 			.concat(";"),

@@ -3,12 +3,17 @@ import:
 	../../../src/emit/emit: emit
 	../../../src/lex/lex: lex
 	../../../src/lower/lower: lower
-	../../../src/own/own: own
+	../../../src/namespace/builtins as Builtins
+	../../../src/own/own as Own: own
 	../../../src/utils/source: module_source, root_module_id
-	../../../src/specialize/specialize: specialize
-	../../../src/utils/syntax: Diagnostic
+	../../../src/specialize/specialize as Concrete: specialize
+	../../../src/utils/syntax: Diagnostic, entry_function
+	../../../src/utils/text: concat
 	../../../src/verify/verify: VerifiedProgram, verify
 	../input: check, parse, setup_diagnostic
+	../module_input: TEST_BASE, parse_modules_with_base
+	../ownership_inputs: span
+	option: to_result
 	test: TestSuite
 
 
@@ -37,6 +42,20 @@ private TRAIL_SOURCE: String =
 	|    0
 	|
 
+-- `get` at Nat holds the runtime call; `naturals` constructs Zero and Succ.
+private RUNTIME_GET_SOURCE: String =
+	|fixed union Nat:
+	|    Zero
+	|    Succ(Nat)
+	|pure func get[T](values: List[T], index: Int) -> Option[T]:
+	|    builtin("list.get")
+	|pure func naturals() -> List[Nat]:
+	|    [Succ(Zero)]
+	|func main() -> Int:
+	|    unused = naturals().get(0)
+	|    0
+	|
+
 -- Independent complete C oracles for the boxed union's declarations and helpers.
 private BOXED_STRUCT: String =
 	"enum blorp_tag_0{blorp_v_0_0,blorp_v_0_1};struct blorp_u_0{_Atomic uint64_t references;enum blorp_tag_0 tag;union{struct{struct blorp_u_0* blorp_uf_0;} blorp_up_1;}payload;};"
@@ -51,6 +70,11 @@ private DROP_HEADER: String = "void blorp_union_drop_0(struct blorp_u_0* value){
 
 private DROP_HELPER: String =
 	"void blorp_union_drop_0(struct blorp_u_0* value){struct blorp_u_0* node=value;while(node!=NULL){if(atomic_fetch_sub_explicit(&node->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;struct blorp_u_0* child=NULL;switch(node->tag){case blorp_v_0_0:break;case blorp_v_0_1:child=node->payload.blorp_up_1.blorp_uf_0;break;}free(node);node=child;}}"
+
+-- A runtime result whose union is boxed is a node made from the ordinary
+-- compound literal, held in a const pointer local.
+private BOXED_RUNTIME_RESULT: String =
+	"struct blorp_u_0* const blorp_vl_2=blorp_runtime_2_some?blorp_union_make_0((struct blorp_u_0){.tag=blorp_v_0_1,.payload.blorp_up_1={.blorp_uf_0=blorp_runtime_2}}):blorp_union_make_0((struct blorp_u_0){.tag=blorp_v_0_0});(void)blorp_vl_2;"
 
 -- A sibling payload is released in its variant's case before the child is saved.
 private TRAIL_DROP_HELPER: String =
@@ -68,6 +92,103 @@ private pure func verified(source: String) -> Result[VerifiedProgram, Diagnostic
 
 private pure func emitted(source: String) -> Result[String, Diagnostic]:
 	verified(source).and_then(emit)
+
+
+private pure func seed_error(message: String) -> Diagnostic:
+	{
+		span = span(0), note = None,
+		message = "invalid boxed runtime result seed: ".concat(message),
+		help = "fix the boxed runtime result test setup"
+	}
+
+
+private pure func called_functions(function: Own.OwnedFunction) -> List[Concrete.FunctionInstanceId]:
+	var called: List[Concrete.FunctionInstanceId] = []
+	for operation in function.operations:
+		match operation:
+			Own.DefineValue(definition):
+				match definition.operation:
+					Own.CallDefinition(call, _):
+						match call.target:
+							Concrete.UserFunction(id): called = called.append(id)
+							Concrete.RuntimeFunction(_): void
+					_: void
+			_: void
+	called
+
+
+private pure func constructed_variants(function: Own.OwnedFunction) -> List[Concrete.VariantInstanceId]:
+	var variants: List[Concrete.VariantInstanceId] = []
+	for operation in function.operations:
+		match operation:
+			Own.DefineValue(definition):
+				match definition.operation:
+					Own.ConstructDefinition(variant, _): variants = variants.append(variant)
+					_: void
+			_: void
+	variants
+
+
+-- Designates Nat's own Succ and Zero as the runtime get's result: the IR a
+-- builtin with written result constructors produced before the foundation
+-- designated Option. The verifier still accepts it.
+private pure func designate_nat(
+	operation: Own.OwnershipOperation,
+	nat: Concrete.TypeRef,
+	succ: Concrete.VariantInstanceId,
+	zero: Concrete.VariantInstanceId,
+) -> Own.OwnershipOperation:
+	match operation:
+		Own.DefineValue(definition):
+			match definition.operation:
+				Own.CallDefinition(call, arguments):
+					match call.target:
+						Concrete.RuntimeFunction(Builtins.ListGet(element, _)):
+							target = Concrete.RuntimeFunction(Builtins.ListGet(element, { some = succ, none = zero }))
+							Own.DefineValue({ definition |
+								value_type = nat,
+								operation = Own.CallDefinition({ call | target = target }, arguments)
+							})
+						_: operation
+				_: operation
+		_: operation
+
+
+-- One real producer issues the identities; the get instance is rebound by hand
+-- to return Nat, and main returns 0 without calling it.
+private pure func boxed_runtime_result() -> Result[VerifiedProgram, Diagnostic]:
+	parsed ?= parse_modules_with_base([{ source = RUNTIME_GET_SOURCE, targets = [] }], TEST_BASE)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	owned ?= specialize(checked).and_then(lower).and_then(own)
+	main_id = entry_function(owned.entrypoint)
+	main ?= owned.functions.get(Concrete.function_number(main_id)).to_result(seed_error("main is missing"))
+	callees = called_functions(main)
+	naturals_id ?= callees.get(0).to_result(seed_error("naturals call is missing"))
+	get_id ?= callees.get(1).to_result(seed_error("get call is missing"))
+	naturals ?= owned.functions.get(Concrete.function_number(naturals_id)).to_result(seed_error("naturals is missing"))
+	get ?= owned.functions.get(Concrete.function_number(get_id)).to_result(seed_error("get is missing"))
+	variants = constructed_variants(naturals)
+	zero ?= variants.get(0).to_result(seed_error("Zero is missing"))
+	succ ?= variants.get(1).to_result(seed_error("Succ is missing"))
+	nat = Concrete.UnionType(Concrete.variant_owner(zero))
+	value ?= match main.operations.get(0):
+		Some(Own.DefineValue(definition)): Ok(definition.id)
+		_: Err(seed_error("main has no first value"))
+	integer_main: Own.OwnedFunction = { main |
+		operations = [Own.DefineValue({
+			id = value, value_type = Concrete.IntType,
+			operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(10)
+		})],
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(value)))
+	}
+	boxed_get: Own.OwnedFunction = { get |
+		signature = { get.signature | return_type = nat },
+		operations = get.operations.map(pure func(operation): designate_nat(operation, nat, succ, zero))
+	}
+	functions = owned.functions
+		.set(Concrete.function_number(main_id), integer_main)
+		.set(Concrete.function_number(get_id), boxed_get)
+	verify({ owned | functions = functions })
 
 
 -- The release helper's text, from its header to the loop's closing braces.
@@ -142,6 +263,16 @@ pure func test_match_reads_the_tag_and_payload_through_the_pointer() -> Bool:
 			)
 
 
+pure func test_runtime_option_rebound_to_a_boxed_union_verifies() -> Bool:
+	boxed_runtime_result().is_ok()
+
+
+pure func test_boxed_runtime_result_is_constructed_as_a_node() -> Bool:
+	match boxed_runtime_result().and_then(emit):
+		Err(_): False
+		Ok(code): code.contains(BOXED_RUNTIME_RESULT)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 boxed recursive union emission",
 	tests = [
@@ -151,5 +282,7 @@ tests: TestSuite = {
 		("sibling payload released before the child is saved", test_sibling_payload_is_released_before_the_child_is_saved),
 		("construction allocates one box from an acquired child", test_construction_allocates_one_box_from_an_acquired_child),
 		("match reads the tag and payload through the pointer", test_match_reads_the_tag_and_payload_through_the_pointer),
+		("runtime Option rebound to a boxed union verifies", test_runtime_option_rebound_to_a_boxed_union_verifies),
+		("boxed runtime result is constructed as a node", test_boxed_runtime_result_is_constructed_as_a_node),
 	]
 }
