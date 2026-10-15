@@ -456,7 +456,7 @@ private pure func append_aggregate_definitions(
 	-- visited. No recursive carrier retains their previous roots.
 	var record_visits = records.map(pure func(_): UnvisitedAggregate)
 	var union_visits = unions.map(pure func(_): UnvisitedAggregate)
-	var result = output
+	var fragments: List[String] = [output]
 	var pending: List[AggregateVisitStep] = []
 	var pending_count = 0
 	var position = unions.length()
@@ -598,9 +598,9 @@ private pure func append_aggregate_definitions(
 									None:
 										invalid = Some(internal_error())
 									Some(layout):
-										match append_record(result, layout, index, unions):
-											Ok(updated):
-												result = updated
+										match append_record("", layout, index, unions):
+											Ok(definition):
+												fragments = fragments.append(definition)
 												record_visits = record_visits.set(
 													index,
 													EmittedAggregate,
@@ -612,9 +612,9 @@ private pure func append_aggregate_definitions(
 									None:
 										invalid = Some(internal_error())
 									Some(layout):
-										match append_union(result, layout, index, unions):
-											Ok(updated):
-												result = updated
+										match append_union("", layout, index, unions):
+											Ok(definition):
+												fragments = fragments.append(definition)
 												union_visits = union_visits.set(
 													index,
 													EmittedAggregate,
@@ -626,7 +626,7 @@ private pure func append_aggregate_definitions(
 		Some(error):
 			Err(error)
 		None:
-			Ok(result)
+			Ok(fragments.join(""))
 
 
 private pure func append_record_prototypes(output: String, index: Int) -> String:
@@ -1429,22 +1429,22 @@ private pure func append_ownership_operations(
 	types: List[TypeRef],
 	records: List[ConcreteRecord],
 ) -> Result[String, Diagnostic]:
-	var result = output
+	var fragments: List[String] = [output]
 	var failure: Option[Diagnostic] = None
 
 	for operation in operations:
-		match append_ownership_operation(result, operation, unions, types, records):
+		match append_ownership_operation("", operation, unions, types, records):
 			Err(error):
 				failure = Some(error)
 				break
 			Ok(emitted):
-				result = emitted
+				fragments = fragments.append(emitted)
 
 	match failure:
 		Some(error):
 			Err(error)
 		None:
-			Ok(result)
+			Ok(fragments.join(""))
 
 
 private pure func append_arm(
@@ -1487,14 +1487,15 @@ private pure func append_match(
 	declaration ?= unions
 		.get(union_number(matched.owner))
 		.to_result(internal_error())
-	var result = output
+	opening = output
 		.concat("switch(")
 		.concat(c_value(argument_value(matched.scrutinee)))
+	var fragments: List[String] = [opening]
 
 	if has_payload(declaration):
-		result = result.concat(".tag")
+		fragments = fragments.append(".tag")
 
-	result = result.concat("){")
+	fragments = fragments.append("){")
 	var has_default = False
 
 	for arm in matched.arms:
@@ -1513,20 +1514,22 @@ private pure func append_match(
 			matched.arms.length(),
 		)
 
-		match append_arm(result, arm, final_default, unions, types, records):
+		match append_arm("", arm, final_default, unions, types, records):
 			Err(error):
 				failure = Some(error)
 				break
 			Ok(emitted):
-				result = emitted
+				fragments = fragments.append(emitted)
 
 		position = IntOps.add(position, 1)
+
+	fragments = fragments.append("}")
 
 	match failure:
 		Some(error):
 			Err(error)
 		None:
-			Ok(result.concat("}"))
+			Ok(fragments.join(""))
 
 
 private pure func append_signature(
@@ -1596,13 +1599,13 @@ private pure func append_function(
 		SelfTailLoop(_):
 			header.concat("{while (1){")
 
-	body ?= append_ownership_operations(opening, function.operations, unions, types, records)
+	body ?= append_ownership_operations("", function.operations, unions, types, records)
 
-	emitted ?= match function.tail:
+	tail ?= match function.tail:
 		ReturnTail(exit):
-			Ok(append_exit(body, exit))
+			Ok(append_exit("", exit))
 		MatchTail(matched):
-			append_match(body, matched, unions, types, records)
+			append_match("", matched, unions, types, records)
 
 	closing = match function.execution:
 		OrdinaryCalls:
@@ -1610,7 +1613,7 @@ private pure func append_function(
 		SelfTailLoop(_):
 			"}}"
 
-	Ok(emitted.concat(closing))
+	Ok([opening, body, tail, closing].join(""))
 
 
 private pure func is_string(type_ref: TypeRef) -> Bool:
@@ -2038,12 +2041,15 @@ private pure func aggregate_runtime_contents(
 	checked: OwnershipProgram,
 	lists: List[ListLayout],
 ) -> Result[String, Diagnostic]:
-	var output = append_list_prototypes("", lists)
+	-- The host copies a `var` list on each append after a `?=` that follows its declaration.
+	-- Both `?=` therefore precede `fragments`; `ready ?=` follows the loops and costs one copy.
+	ordered ?= append_aggregate_definitions(checked.records, checked.unions, "")
+	completed ?= append_list_runtime("", lists, checked.unions, checked.records)
+	var fragments: List[String] = [append_list_prototypes("", lists)]
 	var index: Int = 0
 
 	for layout in checked.records:
-		output = output
-			.concat("typedef struct blorp_r_")
+		fragments = fragments.append("typedef struct blorp_r_"
 			.append_int(index)
 			.concat(
 				match layout.representation:
@@ -2054,24 +2060,23 @@ private pure func aggregate_runtime_contents(
 			)
 			.concat("blorp_r_")
 			.append_int(index)
-			.concat(";")
+			.concat(";"))
 		index = IntOps.add(index, 1)
 
 	index = 0
 
 	for _ in checked.records:
-		output = append_record_prototypes(output, index)
+		fragments = fragments.append(append_record_prototypes("", index))
 		index = IntOps.add(index, 1)
 
-	ordered ?= append_aggregate_definitions(checked.records, checked.unions, output)
-	output = ordered
+	fragments = fragments.append(ordered)
 	index = 0
 	var failure: Option[Diagnostic] = None
 
 	for layout in checked.records:
-		match append_record_ownership(output, layout, index, checked.unions):
-			Ok(updated):
-				output = updated
+		match append_record_ownership("", layout, index, checked.unions):
+			Ok(ownership):
+				fragments = fragments.append(ownership)
 			Err(error):
 				failure = Some(error)
 				break
@@ -2084,11 +2089,11 @@ private pure func aggregate_runtime_contents(
 		None:
 			Ok(void)
 
-	completed ?= append_list_runtime(output, lists, checked.unions, checked.records)
 	arguments = match checked.entrypoint:
 		WithArguments(_, _): arguments_runtime()
 		NoArguments(_, _): ""
-	Ok(completed.concat(arguments))
+	fragments = fragments.concat([completed, arguments])
+	Ok(fragments.join(""))
 
 
 pure func aggregate_runtime(program: VerifiedProgram) -> Result[String, Diagnostic]:
@@ -2100,11 +2105,18 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	checked = verified_contents(program)
 	records = checked.records
 	lists = list_layouts(checked)
+	aggregates ?= aggregate_runtime_contents(checked, lists)
 
-	var output: String = if needs_string_runtime(checked):
+	-- C is collected as fragments and joined once; appending each one to the
+	-- whole output would copy everything emitted so far at every step. The host
+	-- compiler copies a `var` list on every append that comes after a `?=`
+	-- placed between the list's declaration and that append, so no `?=` may sit
+	-- between this declaration and the loops below.
+	prelude = if needs_string_runtime(checked):
 		string_runtime()
 	else:
 		"#include <stdint.h>\n"
+	var fragments: List[String] = [prelude]
 
 	if (
 		not lists.is_empty() or checked.records.any(pure func(layout):
@@ -2115,46 +2127,45 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 					False
 		)
 	):
-		output = output.concat("#include <stdlib.h>\n#include <stdatomic.h>\n")
+		fragments = fragments.append("#include <stdlib.h>\n#include <stdatomic.h>\n")
 
 	if needs_float_runtime(checked):
-		output = output.concat(float_runtime())
+		fragments = fragments.append(float_runtime())
 
 	if needs_runtime(checked, FloatFormatting):
-		output = output.concat(float_string_runtime())
+		fragments = fragments.append(float_string_runtime())
 
 	if needs_runtime(checked, FloatParsing):
-		output = output.concat(float_parse_runtime())
+		fragments = fragments.append(float_parse_runtime())
 
 	if needs_runtime(checked, IntegerAddition):
-		output = output.concat(INTEGER_ADD_RUNTIME)
+		fragments = fragments.append(INTEGER_ADD_RUNTIME)
 
 	if needs_runtime(checked, IntegerArithmetic):
-		output = output.concat(INTEGER_ARITHMETIC_RUNTIME)
+		fragments = fragments.append(INTEGER_ARITHMETIC_RUNTIME)
 
 	if needs_runtime(checked, StringOutput):
-		output = output.concat(string_print_runtime())
+		fragments = fragments.append(string_print_runtime())
 
 	if needs_runtime(checked, IntegerParsing):
-		output = output.concat(string_parse_int_runtime())
+		fragments = fragments.append(string_parse_int_runtime())
 
 	if needs_runtime(checked, StringEquality):
-		output = output.concat(string_equals_runtime())
+		fragments = fragments.append(string_equals_runtime())
 
-	aggregates ?= aggregate_runtime_contents(checked, lists)
-	output = output.concat(aggregates)
+	fragments = fragments.append(aggregates)
 	var index: Int = 0
 	var failure: Option[Diagnostic] = None
 
 	index = 0
 
 	for function in checked.functions:
-		match append_signature(output, function, index, checked.unions):
+		match append_signature("", function, index, checked.unions):
 			Err(error):
 				failure = Some(error)
 				break
 			Ok(signature):
-				output = signature.concat(";")
+				fragments = fragments.append(signature.concat(";"))
 
 		index = IntOps.add(index, 1)
 
@@ -2162,12 +2173,12 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 		index = 0
 
 		for function in checked.functions:
-			match append_function(output, function, index, checked.unions, records):
+			match append_function("", function, index, checked.unions, records):
 				Err(error):
 					failure = Some(error)
 					break
 				Ok(function_code):
-					output = function_code
+					fragments = fragments.append(function_code)
 
 			index = IntOps.add(index, 1)
 
@@ -2175,6 +2186,7 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 		Some(error):
 			Err(error)
 		None:
+			output = fragments.join("")
 			name = c_name(function_number(entry_function(checked.entrypoint)))
 
 			wrapper = match checked.entrypoint:
