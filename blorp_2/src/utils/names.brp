@@ -1,5 +1,6 @@
 import:
 	int as IntOps
+	string as StringOps
 	./text: equals
 
 
@@ -17,7 +18,18 @@ fixed record SpecialNames {
 }
 
 
-opaque type NameTable = List[String]
+-- `spellings` is the authority: an ID is its spelling's position. `buckets` is
+-- an index derived only from `spellings` and written only while extending: a
+-- spelling's bucket lists the IDs whose spellings hash there, and a lookup
+-- compares complete spellings within that one bucket, so a collision costs a
+-- comparison and never a wrong ID. Both live as long as the compilation.
+private fixed record NameRows {
+	spellings: List[String],
+	buckets: List[List[NameId]]
+}
+
+
+opaque type NameTable = NameRows
 
 
 fixed record InternedName {
@@ -38,12 +50,94 @@ fixed record EntrypointNames {
 }
 
 
+-- Extending grows the bucket count from n to 2n+1 whenever names outnumber
+-- buckets, so a bucket holds fewer than two IDs on average. Counts stay odd
+-- because a remainder by a power of two would read only the hash's low bits,
+-- which the multiplication below leaves poorly mixed.
+private MINIMUM_BUCKETS: Int = 31
+
+-- The 64-bit FNV offset basis and prime, adding each byte where FNV uses xor
+-- (the subset has no bit operations). Int multiplication wraps.
+private SPELLING_HASH_BASIS: Int = -3750763034362895579
+
+private SPELLING_HASH_PRIME: Int = 1099511628211
+
+
+-- Host `get` returns an Option even where the index is known to be in range.
+-- Every `None` arm in `spelling_bucket`, `lookup` and `with_bucket_entry` is
+-- unreachable: byte positions stay below the spelling's length, bucket
+-- positions are remainders by the bucket count, and IDs are positions in
+-- `spellings`.
+private pure func spelling_bucket(spelling: String, bucket_count: Int) -> Int:
+	var hash = SPELLING_HASH_BASIS
+	var position: Int = 0
+
+	while IntOps.less_than(position, spelling.length()):
+		match StringOps.get(spelling, position):
+			Some(byte):
+				hash = IntOps.multiply(IntOps.add(hash, to_int(byte)), SPELLING_HASH_PRIME)
+			None:
+				void
+
+		position = IntOps.add(position, 1)
+
+	bucket = IntOps.remainder(hash, bucket_count)
+
+	if IntOps.less_than(bucket, 0):
+		IntOps.add(bucket, bucket_count)
+	else:
+		bucket
+
+
+private pure func lookup(spellings: List[String], buckets: List[List[NameId]], spelling: String) -> Option[NameId]:
+	var found: Option[NameId] = None
+
+	match buckets.get(spelling_bucket(spelling, buckets.length())):
+		Some(bucket):
+			for id in bucket:
+				match spellings.get(from_opaque NameId(id)):
+					Some(known):
+						if equals(known, spelling):
+							found = Some(id)
+							break
+					None:
+						void
+		None:
+			void
+
+	found
+
+
+private pure func with_bucket_entry(buckets: List[List[NameId]], spelling: String, id: NameId) -> List[List[NameId]]:
+	bucket = spelling_bucket(spelling, buckets.length())
+	empty: List[NameId] = []
+	listed = match buckets.get(bucket):
+		Some(ids): ids
+		None: empty
+	buckets.set(bucket, listed.append(id))
+
+
+private pure func index_spellings(spellings: List[String], bucket_count: Int) -> List[List[NameId]]:
+	var buckets: List[List[NameId]] = []
+
+	while IntOps.less_than(buckets.length(), bucket_count):
+		buckets = buckets.append([])
+
+	var position: Int = 0
+
+	for spelling in spellings:
+		buckets = with_bucket_entry(buckets, spelling, into_opaque NameId(position))
+		position = IntOps.add(position, 1)
+
+	buckets
+
+
 pure func program_names() -> EntrypointNames:
 	-- The executable entrypoint is an ABI spelling. Types come from the designated foundation module.
-	spellings: List[String] = []
+	spellings: List[String] = ["main"]
 	{
-		names = into_opaque NameTable(spellings.append("main")),
-		main = into_opaque NameId(spellings.length())
+		names = into_opaque NameTable({ spellings = spellings, buckets = index_spellings(spellings, MINIMUM_BUCKETS) }),
+		main = into_opaque NameId(0)
 	}
 
 
@@ -53,9 +147,10 @@ pure func same_name(left: NameId, right: NameId) -> Bool:
 
 -- Assembly checks the complete spelling-to-ID mapping before accepting a
 -- parser extension. Independent or stale extensions cannot silently mix IDs.
+-- The buckets are derived from the spellings, so the spellings decide.
 pure func same_name_table(left: NameTable, right: NameTable) -> Bool:
-	left_names = from_opaque NameTable(left)
-	right_names = from_opaque NameTable(right)
+	left_names = from_opaque NameTable(left).spellings
+	right_names = from_opaque NameTable(right).spellings
 	var equal = IntOps.equals(left_names.length(), right_names.length())
 	var position: Int = 0
 	for spelling in left_names:
@@ -69,36 +164,47 @@ pure func same_name_table(left: NameTable, right: NameTable) -> Bool:
 
 
 pure func name_spelling(names: NameTable, id: NameId) -> Option[String]:
-	from_opaque NameTable(names).get(from_opaque NameId(id))
+	from_opaque NameTable(names).spellings.get(from_opaque NameId(id))
 
 
 -- String lookup belongs to the parser's local builder, before publication.
--- The scan exits early and stays a loop. The table holds every distinct spelling in the
--- program, so recursion here could outgrow the host's stack where module and
--- diagnostic counts cannot.
 pure func find_name(names: NameTable, spelling: String) -> Option[NameId]:
-	spellings = from_opaque NameTable(names)
-	var index: Int = 0
-	var found: Option[NameId] = None
-
-	for known in spellings:
-		if equals(known, spelling):
-			found = Some(into_opaque NameId(index))
-			break
-
-		index = IntOps.add(index, 1)
-
-	found
+	rows = from_opaque NameTable(names)
+	lookup(rows.spellings, rows.buckets, spelling)
 
 
+-- Builds one extension locally: after the first change copies the shared
+-- input, the private lists grow in place, and the index is rebuilt only when
+-- the bucket count grows.
+pure func extend_names(names: NameTable, spellings: List[String]) -> NameTable:
+	rows = from_opaque NameTable(names)
+	var known = rows.spellings
+	var buckets = rows.buckets
+
+	for spelling in spellings:
+		match lookup(known, buckets, spelling):
+			Some(_):
+				void
+			None:
+				id = into_opaque NameId(known.length())
+				known = known.append(spelling)
+
+				if IntOps.greater_than(known.length(), buckets.length()):
+					grown_count = IntOps.add(IntOps.multiply(buckets.length(), 2), 1)
+					buckets = index_spellings(known, grown_count)
+				else:
+					buckets = with_bucket_entry(buckets, spelling, id)
+
+	into_opaque NameTable({ spellings = known, buckets = buckets })
+
+
+-- Each new spelling copies the table it extends; `extend_names` adds many at once.
 pure func intern_name(names: NameTable, spelling: String) -> InternedName:
 	match find_name(names, spelling):
 		Some(id):
 			{ names = names, id = id }
 		None:
-			spellings = from_opaque NameTable(names)
-			id = into_opaque NameId(spellings.length())
 			{
-				names = into_opaque NameTable(spellings.append(spelling)),
-				id = id
+				names = extend_names(names, [spelling]),
+				id = into_opaque NameId(from_opaque NameTable(names).spellings.length())
 			}

@@ -1,4 +1,4 @@
-# Blorp 2 performance fixes: linear emission, 2026-10-15
+# Blorp 2 performance fixes: linear emission and indexed name lookup, 2026-10-15
 
 Finding 1 of [the 2026-10-14 verification](blorp_2_perf_verification_2026-10-14.md) was that `emit`
 appended each C fragment to the whole output, so every append copied everything emitted so far:
@@ -7,7 +7,10 @@ this change, emit collects fragments and joins them; the emitted C is byte-ident
 compiler-sized proxy, emit falls from 46.1G to 0.76G instructions and the whole compile from 55.4G
 to 10.1G (3.9 s to 0.6 s). Emit now grows linearly (exponent 1.0) in every dimension measured.
 
-The name-table half of this work (finding 2) is recorded separately once it lands.
+For finding 2, a bucket index replaces the linear `find_name` scan (see
+[Name lookup index](#name-lookup-index)). It cuts a lookup to about 3.8K instructions at any table size.
+Interning stays quadratic in distinct names until the lexer interns each module in one batch, because
+`intern_name` still copies the table for each new spelling. This note records that interim cost.
 
 ## Change
 
@@ -132,6 +135,116 @@ compiled with `bin/blorp compile --no-format` and `clang -O0 -DBLORP_MEMORY_DIAG
 - `append_function`, `append_match` and `append_aggregate_definitions` now always receive `""` as
   `output`. Removing that parameter belongs with the lexer-interning change or a small cleanup of its
   own.
+
+## Name lookup index
+
+The index commit on `blorp2/perf-fixes`. It changes only `blorp_2/src/utils/names.brp` (formatted lines 110 -> 243) and its unit suite
+(292 -> 435). The emitted C is byte-identical for all 334 e2e fixtures.
+
+### Key, place, lifetime and collisions
+
+- **Place.** `NameTable` is opaque over `{ spellings: List[String], buckets: List[List[NameId]] }`.
+- **Authority.** `spellings` is the authority: an ID is a spelling's position. `buckets` is an index
+  derived only from `spellings`, written only by `program_names` and `extend_names`.
+- **Key.** The complete spelling. A wrapping FNV-style hash over its bytes chooses a bucket: FNV-1a's
+  basis and prime, adding each byte where FNV xors (the subset has no bit operations). Bytes are read
+  with `StringOps.get` and `to_int`, as the lexer reads them.
+- **Collisions.** A lookup compares full spellings with `text::equals` within that one bucket, so a
+  collision costs one comparison and never yields a wrong ID.
+- **Growth.** The table starts with 31 buckets and grows from n to 2n+1 when names outnumber buckets,
+  rehashing every spelling locally. Counts stay odd so the remainder reads every hash bit.
+- **Lifetime.** One compilation. IDs are never compared across tables, and `same_name_table` compares
+  spellings only.
+- **API.** `find_name` and `intern_name` keep their signatures. `intern_name` is `find_name` plus a
+  one-spelling `extend_names`. `extend_names(names, spellings)` is the batch builder the lexer will
+  use.
+
+### Lookup cost
+
+Harness: `perf/micro/harness.brp` builds a table of N names with `intern_name`, then performs L
+lookups of existing spellings round-robin. The cost of one lookup is
+`(instructions(N, 100,000) - instructions(N, 0)) / 100,000`, minimum of three runs. "Before" is
+`names.brp` at `c4289f0b1`.
+
+| names | find_name before | find_name after |
+| ---: | ---: | ---: |
+| 256 | 46,236 | 3,760 |
+| 1,024 | 277,383 | 3,752 |
+| 4,096 | 835,384 | 3,843 |
+
+### Build cost
+
+| names | intern_name build, before (instructions / allocations) | intern_name build, after (instructions / allocations) |
+| ---: | ---: | ---: |
+| 256 | 34.0M / 782 | 31.4M / 2,310 |
+| 1,024 | 355.8M / 3,088 | 159.2M / 9,239 |
+| 4,096 | 4,289.8M / 12,306 | 1,988.8M / 36,908 |
+
+Instructions fall because each new spelling's lookup is now constant. Allocations roughly triple.
+`intern_name` extends a table that the caller still holds, so each new spelling copies both
+`spellings` and the outer `buckets` list. The bucket it appends to is also copied, because that inner
+list is still shared with the previous table. The copy itself was already there; the index makes it
+larger. It goes away when the lexer builds each module's table in one `extend_names` batch.
+
+That batch is linear (`perf/micro/new/extend.brp`):
+
+| names | allocations | instructions |
+| ---: | ---: | ---: |
+| 1,024 | 4,136 | 34M |
+| 4,096 | 16,449 | 83M |
+| 16,384 | 65,630 | 280M |
+
+### Whole pipeline with today's parser
+
+Load-phase instructions and allocations (the `pre_check` pilot). The emit commit leaves load
+unchanged, so "before" is `c4289f0b1`.
+
+| input | load before | load with the index | exponents before, per doubling up to this row | exponents with the index |
+| --- | ---: | ---: | --- | --- |
+| unions 256 | 356M / 45,988 | 328M / 53,351 | | |
+| unions 512 | 1,308M / 87,463 | 1,022M / 102,003 | | |
+| unions 1024 | 5,096M / 170,410 | 3,582M / 199,296 | | |
+| unions 2048 | 15,681M / 336,301 | 13,389M / 393,870 | 1.88, 1.96, 1.62 | 1.64, 1.81, 1.90 |
+| composite 4/4 | 3,213M / 951,853 | 2,520M / 967,645 | | |
+| composite 8/4 | 9,719M / 1,899,169 | 7,090M / 1,930,491 | 1.31, 1.41, 1.60 | 1.24, 1.31, 1.49 |
+
+Load stays quadratic in distinct names for the reason above: the copy per new spelling. Whole-compile
+allocations rise by +0.3% on composite 4/4 (4,559,058 -> 4,574,850 against the emit commit) and by +14%
+on unions 2048 (410,444 -> 468,013). Composite 4/4 instructions fall from 10,089M to 9,394M.
+
+### Projection: the lexer move (scratch tree, not a commit)
+
+To estimate what interning each module in one batch gives, a scratch tree combined this index with
+the parser from the unlanded reference commit `ef66fbd9b` (branch `blorp2/interning-prepass-ref`).
+That parser extends the table once per module before parsing. It is not the planned lexer design;
+it only stands in for its cost. Raw data: `perf/proj.tsv`.
+
+| input | load before | load projected | whole compile projected |
+| --- | ---: | ---: | ---: |
+| unions 2048 | 15,681M | 757M | 2,890M / 408,326 |
+| composite 4/4 | 3,213M | 1,572M | 8,446M / 4,517,933 |
+| composite 8/4 | 9,719M | 3,267M | 21,543M / 9,028,755 |
+
+Projected load exponents are 0.82, 0.90, 0.96 for unions and 1.05, 1.01, 1.06 for composite.
+
+### Tests
+
+`test_utils/test_names` has five new tests: a batch that skips known and repeated spellings, lookup
+hits and near misses, growth across two doublings, a collision in one bucket, and IDs stable across
+extension and growth. Each oracle was
+checked by mutation:
+
+| mutation | tests that failed |
+| --- | --- |
+| lookup trusts the bucket without comparing spellings | 3, including the collision test |
+| growth rehashes only the input spellings | 2 |
+| a bucket stores the wrong ID | 6 |
+| misses return the first ID | 8 |
+| `extend_names` appends known and repeated spellings too | 1, the batch-skip test |
+| no-op control, and a hash that ignores bytes | none (expected) |
+
+"left" and "third" share bucket 28 of 31; the collision test failing under the first mutation shows
+that they collide.
 
 ## Not measured
 
