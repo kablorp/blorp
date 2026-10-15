@@ -12,6 +12,7 @@ import:
 		ParsedBody(ParsedValueBody, ParsedMatchBody),
 		ParsedFunction,
 		ParsedMatch,
+		ParsedMatchArm,
 		ParsedPattern(PatternConstructor, PatternName, PatternWildcard),
 		PatternHead(BareHead),
 		ParsedStatement(BindingStatement),
@@ -74,6 +75,23 @@ private pure func value_of(function: ParsedFunction) -> Option[ValueExpression]:
 			Some(value)
 		_:
 			None
+
+
+-- An arm's value, when its block ends with one.
+private pure func arm_value_start(arm: ParsedMatchArm) -> Option[Int]:
+	arm.block.value.map(pure func(value): value.span.start)
+
+
+private pure func arm_value_end(arm: ParsedMatchArm) -> Option[Int]:
+	arm.block.value.map(pure func(value): value.span.end)
+
+
+private pure func arm_integer(arm: ParsedMatchArm, expected: Int) -> Bool:
+	match arm.block.value:
+		Some(value):
+			is_integer(value, expected)
+		None:
+			False
 
 
 private pure func is_integer(value: ValueExpression, expected: Int) -> Bool:
@@ -326,14 +344,14 @@ pure func test_match_preserves_structure_names_and_spans() -> Bool:
 										and field.span.end == 48
 										and span.start == 37
 										and span.end == 49
-										and is_integer(arm.body, 42)
+										and arm_integer(arm, 42)
 										and body.keyword_span.start == 21
 										and body.keyword_span.end == 26
 										and body.span.start == 21
 										and body.span.end == 53
 										and arm.span.start == 37
 										and arm.span.end == 53
-										and arm.body.span.start == 51
+										and arm_value_start(arm) == Some(51)
 									)
 								_:
 									False
@@ -362,7 +380,7 @@ pure func test_block_arm_and_inline_sibling() -> Bool:
 		Some(body):
 			match body.arms:
 				[first, second]:
-					match first.statements:
+					match first.block.statements:
 						[BindingStatement(binding)]:
 							(
 								binding.mutability == MutableBinding
@@ -372,9 +390,9 @@ pure func test_block_arm_and_inline_sibling() -> Bool:
 								and binding.initializer.span.end == 72
 								and first.span.start == 37
 								and first.span.end == 83
-								and first.body.span.start == 76
-								and second.body.span.end == 94
-								and second.statements.length() == 0
+								and arm_value_start(first) == Some(76)
+								and arm_value_end(second) == Some(94)
+								and second.block.statements.length() == 0
 							)
 						_:
 							False
@@ -389,7 +407,7 @@ pure func test_block_arm_can_have_no_bindings() -> Bool:
 		Some(body):
 			match body.arms:
 				[arm]:
-					arm.statements.length() == 0 and arm.body.span.start == 54 and arm.body.span.end == 56
+					arm.block.statements.length() == 0 and arm_value_start(arm) == Some(54) and arm_value_end(arm) == Some(56)
 				_:
 					False
 		None:
@@ -415,13 +433,25 @@ pure func test_block_arm_is_exactly_one_level_deeper() -> Bool:
 	)
 
 
-pure func test_block_arm_without_final_value() -> Bool:
-	message = "expected a final expression after the arm bindings"
-	help = "finish the arm with a value expression on its own indented line"
+-- An arm block may end after a statement: it parses with no value, and the
+-- checker decides whether that is allowed where the match stands.
+private pure func first_arm_has_no_value(source: String) -> Bool:
+	match only_match(source):
+		Some(body):
+			match body.arms.get(0):
+				Some(arm):
+					arm.block.value.is_none() and arm.block.statements.length() == 1
+				None:
+					False
+		None:
+			False
+
+
+pure func test_block_arm_without_final_value_parses() -> Bool:
 	(
-		rejects(ARM_BINDING + "\n\t\tEmpty: 0", 73, 75, message, help)
-		and rejects(ARM_BINDING, 72, 72, message, help)
-		and rejects(ARM_BINDING + "\n", 73, 73, message, help)
+		first_arm_has_no_value(ARM_BINDING + "\n\t\tEmpty: 0")
+		and first_arm_has_no_value(ARM_BINDING)
+		and first_arm_has_no_value(ARM_BINDING + "\n")
 	)
 
 
@@ -519,7 +549,7 @@ tests: TestSuite = {
 		("block arm and inline sibling", test_block_arm_and_inline_sibling),
 		("block arm may have zero bindings", test_block_arm_can_have_no_bindings),
 		("block arm is exactly one level deeper", test_block_arm_is_exactly_one_level_deeper),
-		("block arm without final value", test_block_arm_without_final_value),
+		("block arm without final value parses", test_block_arm_without_final_value_parses),
 		("binding prefix", test_binding_prefix),
 		("binding requires initializer and final value", test_binding_requires_initializer_and_final_value),
 		("match preserves structure, names and spans", test_match_preserves_structure_names_and_spans),

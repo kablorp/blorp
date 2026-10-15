@@ -8,7 +8,7 @@ import:
 		CheckerInvariant(InvalidCheckedUnion, InvalidResolvedParameter, UnsupportedPatternReachedResolution),
 		ExpectedTypeSite(InferredBindingDeclaration, SourceAnnotation),
 		MatchError(
-			MatchRequiresUnion, NonExhaustiveMatch, PatternFieldCountMismatch, DuplicatePatternBinding,
+			ArmWithoutValue, MatchRequiresUnion, NonExhaustiveMatch, PatternFieldCountMismatch, DuplicatePatternBinding,
 			UnknownConstructorPattern, UnreachableArm,
 		),
 		StatementError(DuplicateLocal, ImmutableAssignment, NonVoidStatement),
@@ -109,6 +109,21 @@ private pure func unbound(pattern: CheckedPattern, scope: List[LocalBinding]) ->
 	}
 
 
+-- The host's constructor-or-binding rule, in one place: a bare name is the
+-- variant of the matched union it spells unless a local binding shadows
+-- it; otherwise it binds. Used for arm patterns and for their fields.
+private pure func unshadowed_variant(
+	scope: List[LocalBinding],
+	occurrence: UnionOccurrence,
+	name: WrittenName,
+	context: ResolutionContext,
+) -> Result[Option[VariantContract], CheckError]:
+	if lookup_binding(scope, name.id).is_some():
+		Ok(None)
+	else:
+		find_variant(context, occurrence, name)
+
+
 -- A depth-1 name that spells an unshadowed constructor of the field's union
 -- is a nested constructor pattern under the host's rule, not a binding; it
 -- is rejected like any nested pattern until the pattern-compilation
@@ -119,15 +134,12 @@ private pure func names_a_field_constructor(
 	scope: List[LocalBinding],
 	context: ResolutionContext,
 ) -> Result[Bool, CheckError]:
-	if lookup_binding(scope, name.id).is_some():
-		Ok(False)
-	else:
-		match union_occurrence(field_type):
-			None:
-				Ok(False)
-			Some(occurrence):
-				found ?= find_variant(context, occurrence, name)
-				Ok(found.is_some())
+	match union_occurrence(field_type):
+		None:
+			Ok(False)
+		Some(occurrence):
+			found ?= unshadowed_variant(scope, occurrence, name, context)
+			Ok(found.is_some())
 
 
 private pure func resolve_variant_pattern(
@@ -251,10 +263,7 @@ private pure func pattern_variant(
 	match_context: MatchContext,
 	context: ResolutionContext,
 ) -> Result[Option[VariantContract], CheckError]:
-	if lookup_binding(match_context.scope, name.id).is_some():
-		Ok(None)
-	else:
-		find_variant(context, match_context.occurrence, name)
+	unshadowed_variant(match_context.scope, match_context.occurrence, name, context)
 
 
 private pure func remaining_after(
@@ -419,7 +428,7 @@ private pure func resolve_arms(
 			definitions = progress.bindings.concat(pattern.bindings)
 
 			prefix ?= resolve_statements(
-				arm.statements,
+				arm.block.statements,
 				{
 					bindings = definitions,
 					scope = pattern.scope,
@@ -428,9 +437,11 @@ private pure func resolve_arms(
 				definitions.length(),
 				context,
 			)
+			-- A tail match's arm must produce the function's value.
+			body ?= arm.block.value.to_result(match_error(arm.span, ArmWithoutValue))
 			value ?= resolve_return_value(
 				prefix.scope,
-				arm.body,
+				body,
 				match_context.return_type,
 				context,
 			)

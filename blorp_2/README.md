@@ -896,7 +896,15 @@ Lexical and layout rules:
 - `'a'` and `'\n'` are Char literal tokens: one character or escape pair in
   single quotes. The parser rejects them with a teaching message until the
   Char type exists.
-- `func`, `pure`, `match`, `var`, `void`, and lone `_` are reserved. The optional `pure` qualifier precedes `func`
+- Every word GRAMMAR 1.4 reserves is reserved here: `func`, `pure`, `match`,
+  `var`, `void`, `import`, `type`, `private`, `record`, `union`, `builtin`,
+  `as`, `opaque`, `into_opaque`, `from_opaque`, `if`, `else`, `and`, `or`,
+  `not`, `while`, `for`, `in`, `break`, `continue`, `alias`, `debug`, `detach`,
+  `foreign`, `from`, `implements`, `resource`, `select`, `trait`, `try`,
+  `where` and lone `_`. Writing one
+  where a name is declared reports "`word` is a reserved keyword and cannot be
+  used as a name". `fixed`, `methods_only` and `tail_recursive` are names in
+  the host too and remain valid names here. The optional `pure` qualifier precedes `func`
   with spaces between the two keywords. Function, parameter and type names are
   identifiers whose meaning is checked after parsing.
 - A function may declare ordered type parameters, as in
@@ -906,8 +914,8 @@ Lexical and layout rules:
   are unsupported; argument types and known expected results constrain the type
   parameters.
 - `fixed union Type:` introduces one or more variants on indented
-  lines. `fixed` and `union` are contextual header words and remain valid names
-  elsewhere. A variant is bare or declares an ordered list of field types, as in
+  lines. `fixed` is a contextual header word and remains a valid name
+  elsewhere; `union` is reserved. A variant is bare or declares an ordered list of field types, as in
   `Number(Int)`, `Box(T)` or `Pair(String, String)`. A union may declare ordered
   parameters with `fixed union Result[T, E]:`. Every field annotation uses ordinary
   type syntax in the union declaration's module and parameter scope, including
@@ -917,8 +925,8 @@ Lexical and layout rules:
 - `fixed record Pair { first: Int, second: Int }` declares a nominal record;
   its braces may span lines. Field names must be distinct and have supported finite concrete
   types after specialization. `fixed record Box[T] { value: T }` declares ordered
-  type parameters; their identity belongs to this record. `record` remains a
-  contextual header word. Empty and recursive records remain unsupported. Representation follows the
+  type parameters; their identity belongs to this record. `record` is
+  reserved. Empty and recursive records remain unsupported. Representation follows the
   inline-versus-managed field policy described above.
 - `{ second = 9, first = 7 }` constructs the nominal record required by a
   helper return type, receiving parameter or existing binding reassignment.
@@ -944,7 +952,9 @@ Lexical and layout rules:
   a concrete record. Copies and whole-binding reassignment preserve old aliases.
 - `match expression:` starts a nonempty sequence of depth-two arms written
   `Pattern: expression` or `Pattern:` followed by a depth-three block of
-  ordered binding or Void expression statements and a mandatory final expression. A pattern is a bare name,
+  ordered binding or Void expression statements and a final expression; a
+  block ending after a statement parses, and checking rejects such an arm
+  ("match arm has no final value"). A pattern is a bare name,
   `_`, or a constructor name
   followed by parentheses containing zero or more comma-separated patterns, so
   patterns nest; alternatives separated by `|` form an or-pattern; `[]`,
@@ -979,7 +989,7 @@ Lexical and layout rules:
 - `opaque type Name = Underlying` declares an opaque type, and
   `into_opaque Name(value)` / `from_opaque Name(value)` convert one value;
   all three parse, and checking rejects them until the recursive-types
-  milestone. The conversion words are contextual: `into_opaque(7)` is a call.
+  milestone. The conversion words are reserved: `into_opaque(7)` is a syntax error.
 - `LIMIT: Int = 7` declares a module constant; its value may stand alone on
   the next line. The row parses, and checking rejects it until the constants
   milestone.
@@ -1615,7 +1625,7 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    Every expression records its consumed token span directly, without reconstructing
    locations from names or literal values.
    The parser reads identifier IDs and never looks a spelling up; it recognises
-   contextual words such as `import` by the IDs the name seed gives them. Program
+   the few non-reserved header words such as `fixed` by the IDs the name seed gives them. Program
    assembly ([assemble.brp](src/parse/assemble.brp)) seals the complete syntax and immutable name table in an opaque `ParsedProgram`.
    Its [declaration inventory](src/utils/ids.brp) issues function, record,
    union and owner-qualified variant IDs once from the raw syntax. Consumers

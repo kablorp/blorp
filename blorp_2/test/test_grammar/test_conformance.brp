@@ -14,6 +14,7 @@ import:
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
 		ParsedFunction,
 		ParsedMatch,
+		ParsedMatchArm,
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
 		PatternHead(BareHead),
 		ParsedRuntimeOperation(IntegerAddBuiltin, IntegerToStringBuiltin, StringLengthBuiltin, ListRepeatBuiltin, ListLengthBuiltin, ListGetBuiltin),
@@ -31,10 +32,9 @@ private HEADER: String = "func main() -> Int:\n"
 
 private MATCH_HEADER: String = "func f(value: V) -> Int:\n\tmatch value:\n"
 
-private IDENTIFIER_HELP: String = (
-	"use an ASCII identifier starting with a letter or underscore; 'func', 'pure', "
-	+ "'match', 'var', and lone '_' are reserved"
-)
+private IDENTIFIER_HELP: String = "use an ASCII identifier starting with a letter or underscore; keywords and lone '_' are reserved"
+
+private BUILTIN_LABEL_HELP: String = "use int.equals, int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals, list.repeat, list.length, list.get, list.append, list.set or list.concat"
 
 private INDENT_HELP: String = "use tabs only, or spaces in groups of four; do not mix tabs and spaces"
 
@@ -202,25 +202,19 @@ pure func test_builtin_module_unknown_type_and_operation_are_closed_syntax() -> 
 			44,
 			53,
 			"unknown builtin operation",
-			"use int.equals, int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals, list.repeat, list.length, list.get, list.append, list.set or list.concat",
+			BUILTIN_LABEL_HELP,
 		)
 	)
 
 
-pure func test_builtin_labels_are_quoted_and_closed_while_calls_remain_contextual() -> Bool:
-	ordinary = match module_syntax("pure func f(value: Int) -> String:\n\tbuiltin(int.to_string)"):
-		Err(_): False
-		Ok(parsed):
-			match parsed.functions:
-				[function]:
-					match function.body:
-						ParsedValueBody(value):
-							match value.base:
-								DirectApplication(name, [_]): name_spelling(parsed.names, name.id) == Some("builtin")
-								_: False
-						_: False
-				_: False
-	ordinary and module_rejects(
+pure func test_builtin_labels_are_quoted_and_closed() -> Bool:
+	module_rejects(
+		"pure func f(value: Int) -> String:\n\tbuiltin(int.to_string)",
+		44,
+		47,
+		"expected a quoted builtin label",
+		BUILTIN_LABEL_HELP,
+	) and module_rejects(
 		"pure func f(value: Int) -> String:\n\tbuiltin(\"int.to_string\"",
 		59,
 		59,
@@ -426,8 +420,8 @@ pure func test_reserved_keyword_and_word_boundaries() -> Bool:
 			"expected a function declaration at column 1",
 			"start with func main() -> Int:",
 		)
-		and rejects("func func() -> Int:\n\t0", 5, 9, "expected a function name", IDENTIFIER_HELP)
-		and rejects("func main() -> func:\n\t0", 15, 19, "expected a return type", IDENTIFIER_HELP)
+		and rejects_keyword("func func() -> Int:\n\t0", 5, 9, "func")
+		and rejects_keyword("func main() -> func:\n\t0", 15, 19, "func")
 	)
 
 
@@ -789,8 +783,8 @@ pure func test_malformed_and_reserved_pure_are_rejected() -> Bool:
 			"write pure func name() -> Int:",
 		)
 		and rejects("pure", 4, 4, "expected 'func' after 'pure'", "write pure func name() -> Int:")
-		and rejects("func pure() -> Int:\n\t0", 5, 9, "expected a function name", IDENTIFIER_HELP)
-		and rejects("func main() -> pure:\n\t0", 15, 19, "expected a return type", IDENTIFIER_HELP)
+		and rejects_keyword("func pure() -> Int:\n\t0", 5, 9, "pure")
+		and rejects_keyword("func main() -> pure:\n\t0", 15, 19, "pure")
 		and accepts("func purex() -> Int:\n\t0", "purex", 5, 10, "Int", 16, 19)
 	)
 
@@ -1218,8 +1212,8 @@ private pure func unwrap_match_shape(names: NameTable, body: ParsedMatch) -> Boo
 				PatternName(empty_name):
 					match number.pattern:
 						PatternConstructor(BareHead(number_name), [PatternName(field)], span):
-							match first_base(empty.body):
-								IntegerExpression(0):
+							match arm_base(empty):
+								Some(IntegerExpression(0)):
 									(
 										expression_name_is(names, body.scrutinee, "value", 85, 90)
 										and body.span.start == 79
@@ -1229,18 +1223,16 @@ private pure func unwrap_match_shape(names: NameTable, body: ParsedMatch) -> Boo
 										and written_name_is(names, empty_name, "Empty", 94, 99)
 										and empty.span.start == 94
 										and empty.span.end == 102
-										and empty.body.span.start == 101
-										and empty.body.span.end == 102
-										and call_occurrences(empty.body).length() == 0
+										and arm_value_start(empty) == Some(101)
+										and arm_value_end(empty) == Some(102)
+										and arm_calls(empty).length() == 0
 										and written_name_is(names, number_name, "Number", 105, 111)
 										and written_name_is(names, field, "number", 112, 118)
 										and span.start == 105
 										and span.end == 119
 										and number.span.start == 105
 										and number.span.end == 127
-										and expression_name_is(
-											names,
-											number.body,
+										and arm_name_is(names, number,
 											"number",
 											121,
 											127,
@@ -1420,9 +1412,9 @@ pure func test_pattern_alternatives_space_layout_and_following_union() -> Bool:
 						ParsedMatchBody(body):
 							match body.arms:
 								[empty, number, whole, wildcard]:
-									empty_body_ok: Bool = match first_base(empty.body):
-										IntegerExpression(1):
-											match call_occurrences(empty.body):
+									empty_body_ok: Bool = match arm_base(empty):
+										Some(IntegerExpression(1)):
+											match arm_calls(empty):
 												[zero, identity]:
 													(
 														written_name_is(
@@ -1441,8 +1433,8 @@ pure func test_pattern_alternatives_space_layout_and_following_union() -> Bool:
 															77,
 														)
 														and identity.notation == ReceiverCall
-														and empty.body.span.start == 61
-														and empty.body.span.end == 79
+														and arm_value_start(empty) == Some(61)
+														and arm_value_end(empty) == Some(79)
 													)
 												_:
 													False
@@ -1502,9 +1494,9 @@ pure func test_pattern_alternatives_space_layout_and_following_union() -> Bool:
 										and whole_ok
 										and wildcard_ok
 										and empty_body_ok
-										and expression_integer_is(number.body, 2, 104, 105)
-										and expression_integer_is(whole.body, 3, 121, 122)
-										and expression_integer_is(wildcard.body, 4, 134, 135)
+										and arm_integer_is(number, 2, 104, 105)
+										and arm_integer_is(whole, 3, 121, 122)
+										and arm_integer_is(wildcard, 4, 134, 135)
 										and expression_name_is(
 											program.names,
 											body.scrutinee,
@@ -1598,8 +1590,8 @@ private pure func single_wildcard_match_is(source: String, eof: Int) -> Bool:
 														and span.end == 42
 														and arm.span.start == 41
 														and arm.span.end == 45
-														and expression_integer_is(
-															arm.body,
+														and arm_integer_is(
+															arm,
 															1,
 															44,
 															45,
@@ -1627,51 +1619,62 @@ pure func test_match_one_arm_and_optional_final_lf() -> Bool:
 	)
 
 
+-- A reserved word where a name is declared is named in the host's words.
+private pure func rejects_keyword(source: String, start: Int, end: Int, spelling: String) -> Bool:
+	rejects(
+		source,
+		start,
+		end,
+		"`" + spelling + "` is a reserved keyword and cannot be used as a name",
+		"choose another identifier such as `" + spelling + "_name`",
+	)
+
+
 pure func test_match_and_wildcard_are_reserved_in_name_contexts() -> Bool:
 	(
 		rejects_identifier("func _() -> Int:\n\t0", 5, 6, "expected a function name")
-		and rejects_identifier("func match() -> Int:\n\t0", 5, 10, "expected a function name")
+		and rejects_keyword("func match() -> Int:\n\t0", 5, 10, "match")
 		and rejects_identifier("func main() -> _:\n\t0", 15, 16, "expected a return type")
-		and rejects_identifier("func main() -> match:\n\t0", 15, 20, "expected a return type")
+		and rejects_keyword("func main() -> match:\n\t0", 15, 20, "match")
 		and rejects_identifier(
 			"func f(_: Int) -> Int:\n\t0",
 			7,
 			8,
 			"expected a parameter name or ')'",
 		)
-		and rejects_identifier(
+		and rejects_keyword(
 			"func f(match: Int) -> Int:\n\t0",
 			7,
 			12,
-			"expected a parameter name or ')'",
-		)
+			"match",
+			)
 		and rejects_identifier("func f(x: _) -> Int:\n\t0", 10, 11, "expected a parameter type")
-		and rejects_identifier("func f(x: match) -> Int:\n\t0", 10, 15, "expected a parameter type")
+		and rejects_keyword("func f(x: match) -> Int:\n\t0", 10, 15, "match")
 		and rejects_identifier("fixed union _:\n\tA", 12, 13, "expected a union type name")
-		and rejects_identifier("fixed union match:\n\tA", 12, 17, "expected a union type name")
+		and rejects_keyword("fixed union match:\n\tA", 12, 17, "match")
 		and rejects_identifier("fixed union V:\n\t_", 16, 17, "expected a union variant name")
-		and rejects_identifier("fixed union V:\n\tmatch", 16, 21, "expected a union variant name")
+		and rejects_keyword("fixed union V:\n\tmatch", 16, 21, "match")
 		and rejects_identifier("fixed union V:\n\tNumber(_)", 23, 24, "expected a payload type")
-		and rejects_identifier("fixed union V:\n\tNumber(match)", 23, 28, "expected a payload type")
+		and rejects_keyword("fixed union V:\n\tNumber(match)", 23, 28, "match")
 		and rejects_identifier(
 			HEADER + "\t1._()",
 			23,
 			24,
 			"expected a field or function name after '.'",
 		)
-		and rejects_identifier(
+		and rejects_keyword(
 			HEADER + "\t1.match()",
 			23,
 			28,
-			"expected a field or function name after '.'",
-		)
-		and rejects_identifier(MATCH_HEADER + "\t\tmatch: 1", 41, 46, "expected a match pattern")
-		and rejects_identifier(
+			"match",
+			)
+		and rejects_keyword(MATCH_HEADER + "\t\tmatch: 1", 41, 46, "match")
+		and rejects_keyword(
 			MATCH_HEADER + "\t\tNumber(match): 1",
 			48,
 			53,
-			"expected a match pattern",
-		)
+			"match",
+			)
 		and accepts("func matchx()->_t:\n\t0", "matchx", 5, 11, "_t", 15, 17)
 	)
 
@@ -1908,9 +1911,20 @@ pure func test_binding_requires_a_final_expression() -> Bool:
 
 pure func test_var_is_reserved_but_longer_names_are_identifiers() -> Bool:
 	(
-		rejects_identifier("func var() -> Int:\n\t0\n", 5, 8, "expected a function name")
+		rejects_keyword("func var() -> Int:\n\t0\n", 5, 8, "var")
 		and accepts("func variable()->Int:\n\t0", "variable", 5, 13, "Int", 17, 20)
 		and rejects(HEADER + "\tvar = 1\n\t0\n", 25, 26, "expected a binding name", IDENTIFIER_HELP)
+	)
+
+
+-- A reserved word where a binding or parameter is declared names the keyword.
+pure func test_reserved_words_are_named_at_binding_and_parameter_sites() -> Bool:
+	(
+		rejects_keyword(HEADER + "\tin = 1\n\t0\n", 21, 23, "in")
+		and rejects_keyword(HEADER + "\tvar in = 1\n\t0\n", 25, 27, "in")
+		and rejects_keyword("func main(for: Int) -> Int:\n\t0\n", 10, 13, "for")
+		and rejects_keyword(HEADER + "\twhere = 1\n\t0\n", 21, 26, "where")
+		and rejects(HEADER + "\telse:\n\t\t2\n", 21, 25, "expected a return expression", EXPRESSION_HELP)
 	)
 
 
@@ -1951,7 +1965,7 @@ pure func test_arm_block_bindings_and_inline_sibling_spans() -> Bool:
 						ParsedMatchBody(body):
 							match body.arms:
 								[first, second]:
-									match first.statements:
+									match first.block.statements:
 										[BindingStatement(current), BindingStatement(original), BindingStatement(reassigned)]:
 											(
 												current.mutability == MutableBinding
@@ -1998,19 +2012,19 @@ pure func test_arm_block_bindings_and_inline_sibling_spans() -> Bool:
 													102,
 													104,
 												)
-												and expression_name_is(
+												and arm_name_is(
 													program.names,
-													first.body,
+													first,
 													"original",
 													108,
 													116,
 												)
 												and first.span.start == 41
 												and first.span.end == 116
-												and second.statements.length() == 0
+												and second.block.statements.length() == 0
 												and second.span.start == 119
 												and second.span.end == 123
-												and expression_integer_is(second.body, 0, 122, 123)
+												and arm_integer_is(second, 0, 122, 123)
 												and body.span.end == 123
 												and program.end.start == 123
 											)
@@ -2040,8 +2054,8 @@ pure func test_arm_block_without_bindings_and_optional_final_lf() -> Bool:
 									[arm]:
 										accepted = (
 											accepted
-											and arm.statements.length() == 0
-											and expression_integer_is(arm.body, 7, 48, 49)
+											and arm.block.statements.length() == 0
+											and arm_integer_is(arm, 7, 48, 49)
 										)
 									_:
 										accepted = False
@@ -2076,7 +2090,7 @@ pure func test_arm_block_spaces_and_following_declaration() -> Bool:
 						ParsedMatchBody(body):
 							match body.arms:
 								[block, inline]:
-									match block.statements:
+									match block.block.statements:
 										[BindingStatement(binding)]:
 											(
 												written_name_is(
@@ -2092,15 +2106,15 @@ pure func test_arm_block_spaces_and_following_declaration() -> Bool:
 													69,
 													70,
 												)
-												and expression_name_is(
+												and arm_name_is(
 													program.names,
-													block.body,
+													block,
 													"x",
 													83,
 													84,
 												)
-												and inline.statements.length() == 0
-												and expression_integer_is(inline.body, 0, 96, 97)
+												and inline.block.statements.length() == 0
+												and arm_integer_is(inline, 0, 96, 97)
 												and written_name_is(
 													program.names,
 													second.function_name,
@@ -2120,23 +2134,12 @@ pure func test_arm_block_spaces_and_following_declaration() -> Bool:
 					False
 
 
-pure func test_arm_block_requires_result_before_sibling() -> Bool:
-	rejects(
-		MATCH_HEADER + "\t\tA:\n\t\t\tx = 1\n\t\tB: 0",
-		53,
-		55,
-		"expected a final expression after the arm bindings",
-		"finish the arm with a value expression on its own indented line",
-	)
-
-
-pure func test_arm_block_requires_result_before_eof() -> Bool:
-	rejects(
-		MATCH_HEADER + "\t\t_:\n\t\t\tx = 1",
-		52,
-		52,
-		"expected a final expression after the arm bindings",
-		"finish the arm with a value expression on its own indented line",
+-- A block may end after a statement; it then has no value, which the
+-- checker rejects for a tail-match arm. The parser accepts both shapes.
+pure func test_arm_block_may_end_after_a_statement() -> Bool:
+	(
+		parse_source(MATCH_HEADER + "\t\tA:\n\t\t\tx = 1\n\t\tB: 0").is_ok()
+		and parse_source(MATCH_HEADER + "\t\t_:\n\t\t\tx = 1").is_ok()
 	)
 
 
@@ -2537,14 +2540,12 @@ pure func test_recursive_calls_use_ordinary_call_syntax() -> Bool:
 	parse_source(source).is_ok()
 
 
-pure func test_builtin_is_contextual_and_is_the_entire_body() -> Bool:
+pure func test_builtin_is_reserved_and_is_the_entire_body() -> Bool:
 	source: String =
-		|pure func builtin(first: Int, second: Int) -> Int:
-		|    second
 		|pure func add(first: Int, second: Int) -> Int:
 		|    builtin("int.add")
 		|func main() -> Int:
-		|    builtin(20, 22)
+		|    add(20, 22)
 		|
 
 	accepted = match parse_source(source):
@@ -2552,7 +2553,7 @@ pure func test_builtin_is_contextual_and_is_the_entire_body() -> Bool:
 			False
 		Ok(parsed):
 			match root_functions(parsed_contents(parsed)):
-				[_, added, main]:
+				[added, main]:
 					match (added.body, main.body):
 						(ParsedBuiltinBody(IntegerAddBuiltin, _), ParsedValueBody(_)):
 							True
@@ -2560,6 +2561,16 @@ pure func test_builtin_is_contextual_and_is_the_entire_body() -> Bool:
 							False
 				_:
 					False
+	reserved = (
+		rejects_keyword("pure func builtin(first: Int) -> Int:\n    first\n", 10, 17, "builtin")
+		and rejects(
+			"func main() -> Int:\n    builtin(20, 22)\n",
+			32,
+			34,
+			"expected a quoted builtin label",
+			BUILTIN_LABEL_HELP,
+		)
+	)
 
 	with_binding: String =
 		|pure func add(first: Int, second: Int) -> Int:
@@ -2567,7 +2578,7 @@ pure func test_builtin_is_contextual_and_is_the_entire_body() -> Bool:
 		|    builtin("int.add")
 		|
 	start = "pure func add(first: Int, second: Int) -> Int:\n    local = first\n    ".length()
-	accepted and rejects(
+	accepted and reserved and rejects(
 		with_binding,
 		start,
 		start + "builtin".length(),
@@ -2607,7 +2618,7 @@ tests: TestSuite = {
 		("match ends its function", test_match_ends_its_function),
 		("lines that open no block cannot be indented", test_lines_that_open_no_block_cannot_be_indented),
 		("binding line ends after its initializer", test_binding_line_ends_after_its_initializer),
-		("builtin is contextual and is the entire body", test_builtin_is_contextual_and_is_the_entire_body),
+		("builtin is reserved and is the entire body", test_builtin_is_reserved_and_is_the_entire_body),
 		("recursive calls use ordinary syntax", test_recursive_calls_use_ordinary_call_syntax),
 		(
 			"multiple union parameters and application order spans",
@@ -2658,8 +2669,8 @@ tests: TestSuite = {
 			test_builtin_module_unknown_type_and_operation_are_closed_syntax,
 		),
 		(
-			"builtin labels close and ordinary calls remain contextual",
-			test_builtin_labels_are_quoted_and_closed_while_calls_remain_contextual,
+			"builtin labels are quoted and closed",
+			test_builtin_labels_are_quoted_and_closed,
 		),
 		(
 			"foundation and operations share the module parser",
@@ -2674,8 +2685,7 @@ tests: TestSuite = {
 			"arm block spaces and following declaration",
 			test_arm_block_spaces_and_following_declaration,
 		),
-		("arm block result before sibling", test_arm_block_requires_result_before_sibling),
-		("arm block result before EOF", test_arm_block_requires_result_before_eof),
+		("arm block may end after a statement", test_arm_block_may_end_after_a_statement),
 		("arm block is one level deeper", test_arm_block_requires_one_deeper_level),
 		("arm block nested match rejected", test_arm_block_rejects_nested_match),
 		("arm value on the next line must be indented", test_arm_binding_value_on_the_next_line_must_be_indented),
@@ -2687,6 +2697,7 @@ tests: TestSuite = {
 		),
 		("binding requires final expression", test_binding_requires_a_final_expression),
 		("var reserved and word boundaries", test_var_is_reserved_but_longer_names_are_identifiers),
+		("reserved words named at binding and parameter sites", test_reserved_words_are_named_at_binding_and_parameter_sites),
 		(
 			"binding annotations parse and discards unsupported",
 			test_binding_annotations_parse_and_discards_remain_unsupported,
@@ -2799,6 +2810,43 @@ private pure func main_is_range(source: String) -> Bool:
 							False
 				_:
 					False
+
+
+-- Arm readers: an arm's value when its block ends with one.
+private pure func arm_base(arm: ParsedMatchArm) -> Option[ExpressionBase]:
+	arm.block.value.map(pure func(value): first_base(value))
+
+
+private pure func arm_calls(arm: ParsedMatchArm) -> List[CallOccurrence]:
+	match arm.block.value:
+		Some(value):
+			call_occurrences(value)
+		None:
+			[]
+
+
+private pure func arm_value_start(arm: ParsedMatchArm) -> Option[Int]:
+	arm.block.value.map(pure func(value): value.span.start)
+
+
+private pure func arm_value_end(arm: ParsedMatchArm) -> Option[Int]:
+	arm.block.value.map(pure func(value): value.span.end)
+
+
+private pure func arm_name_is(names: NameTable, arm: ParsedMatchArm, spelling: String, start: Int, end: Int) -> Bool:
+	match arm.block.value:
+		Some(value):
+			expression_name_is(names, value, spelling, start, end)
+		None:
+			False
+
+
+private pure func arm_integer_is(arm: ParsedMatchArm, expected: Int, start: Int, end: Int) -> Bool:
+	match arm.block.value:
+		Some(value):
+			expression_integer_is(value, expected, start, end)
+		None:
+			False
 
 
 private pure func first_base(value: ValueExpression) -> ExpressionBase:

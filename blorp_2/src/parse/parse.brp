@@ -17,6 +17,7 @@ import:
 		FunctionHeader,
 		LexedProgram,
 		ParsedBinding,
+		ParsedBlock,
 		ParsedBody(ParsedBuiltinBody, ParsedValueBody, ParsedMatchBody),
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
 		ParsedConstant,
@@ -47,6 +48,8 @@ import:
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
 			Colon, Newline, Indent, Dedent, VarKeyword, VoidKeyword, Equals, LeftBracket, RightBracket,
 			LeftBrace, RightBrace, Bar, Comma, AtSign, Slash, Star, DotDot, Ellipsis,
+			ImportKeyword, TypeKeyword, PrivateKeyword, RecordKeyword, UnionKeyword, BuiltinKeyword, AsKeyword, OpaqueKeyword,
+			IntoOpaqueKeyword, FromOpaqueKeyword,
 		),
 		Token,
 		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, PipeString, CharLiteral),
@@ -57,6 +60,7 @@ import:
 		Visibility(Public, Private),
 		WrittenName,
 		diagnostic,
+		keyword_spelling,
 		source_bundle_error,
 	../utils/text as Text
 
@@ -133,7 +137,7 @@ private IMPORT_IN_BODY_MESSAGE: String = "imports belong at module scope"
 
 private IMPORT_IN_BODY_HELP: String = "move import: and its selected functions before the module's declarations at column 1"
 
-private IDENTIFIER_HELP: String = "use an ASCII identifier starting with a letter or underscore; 'func', 'pure', 'match', 'var', and lone '_' are reserved"
+private IDENTIFIER_HELP: String = "use an ASCII identifier starting with a letter or underscore; keywords and lone '_' are reserved"
 
 private EXPRESSION_HELP: String = "use a literal, a parameter or variant name, or a call as the entire body"
 
@@ -279,6 +283,70 @@ private pure func at_right_bracket(state: ParserState) -> Bool:
 			False
 
 
+private pure func at_import(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(ImportKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_type_keyword(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(TypeKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_private(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(PrivateKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_record(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(RecordKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_union(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(UnionKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_builtin(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(BuiltinKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_as(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(AsKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_opaque(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(OpaqueKeyword):
+			True
+		_:
+			False
+
+
 private pure func at_dot_dot(state: ParserState) -> Bool:
 	match current_symbol(state):
 		Some(DotDot):
@@ -367,12 +435,13 @@ private pure func at_right_brace(state: ParserState) -> Bool:
 			False
 
 
--- The seeded IDs of the contextual words, from the table the source was lexed with.
+-- The seeded IDs of the recognised names, from the table the source was lexed with.
 private pure func words(state: ParserState) -> ContextualWords:
 	contextual_words(state.input.names)
 
 
--- A contextual word is an identifier the parser recognises by its seeded ID.
+-- A recognised name (`fixed`, `methods_only`, a base type name) is an ordinary
+-- identifier the parser compares by its seeded ID; keywords are symbol tokens.
 private pure func at_word(state: ParserState, word: NameId) -> Bool:
 	match current(state):
 		Some(token):
@@ -464,11 +533,16 @@ private pure func end_value_line(state: ParserState) -> Result[ParserState, Diag
 	consume_line_end(state, "expected a newline after the return expression", "put each declaration on a new line")
 
 
-private pure func consume_word(state: ParserState, word: NameId, message: String) -> Result[ParserState, Diagnostic]:
-	if at_word(state, word):
-		Ok(shifted(state, 1))
-	else:
-		Err(expected(state, message, "use the ordinary declaration syntax, such as type Int = builtin or builtin(\"int.add\")"))
+private DECLARATION_WORD_HELP: String = "use the ordinary declaration syntax, such as type Int = builtin or builtin(\"int.add\")"
+
+
+-- A reserved word where a name was expected, in the host's words.
+private pure func reserved_name(span: Span, spelling: String) -> Diagnostic:
+	diagnostic(
+		span,
+		Text.concat(Text.concat("`", spelling), "` is a reserved keyword and cannot be used as a name"),
+		Text.concat(Text.concat("choose another identifier such as `", spelling), "_name`"),
+	)
 
 
 private fixed record ParsedName {
@@ -485,6 +559,12 @@ private pure func consume_name(state: ParserState, message: String) -> Result[Pa
 					Ok({ name = { id = id, span = token.span }, next = shifted(state, 1) })
 				SymbolToken(AtSign):
 					Err(misplaced_annotation(state))
+				SymbolToken(symbol):
+					match keyword_spelling(symbol):
+						Some(spelling):
+							Err(reserved_name(token.span, spelling))
+						None:
+							Err(expected(state, message, IDENTIFIER_HELP))
 				_:
 					Err(expected(state, message, IDENTIFIER_HELP))
 		None:
@@ -874,35 +954,32 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
 		CharLiteral:
 			Err(diagnostic(token.span, "Char literals are not supported yet", "use a one-character String literal such as \"a\""))
 		IdentifierToken(_):
-			if at_opaque_conversion(start, words(start).into_opaque_word):
-				consume_opaque_conversion(start, Wrapping)
-			else if at_opaque_conversion(start, words(start).from_opaque_word):
-				consume_opaque_conversion(start, Unwrapping)
-			else:
-				consume_name_or_call(start)
+			consume_name_or_call(start)
+		SymbolToken(IntoOpaqueKeyword):
+			consume_opaque_conversion(start, Wrapping)
+		SymbolToken(FromOpaqueKeyword):
+			consume_opaque_conversion(start, Unwrapping)
 		_:
 			Err(expected(start, "expected a return expression", EXPRESSION_HELP))
 
 
--- `word Name(` where word is into_opaque or from_opaque: the conversion
--- form, contextual like builtin; the word alone is an ordinary name.
-private pure func at_opaque_conversion(state: ParserState, word: NameId) -> Bool:
-	at_word(state, word) and at_identifier(shifted(state, 1)) and at_left_paren(shifted(state, 2))
+private OPAQUE_CONVERSION_HELP: String = "write into_opaque Name(value) or from_opaque Name(value) with one value"
 
 
--- The two conversion words: into_opaque wraps, from_opaque unwraps.
+-- The two conversion keywords: into_opaque wraps, from_opaque unwraps.
 private fixed union OpaqueDirection:
 	Wrapping
 	Unwrapping
 
 
--- `state` is at the conversion word.
+-- `state` is at the conversion keyword: `into_opaque Name(value)`.
 private pure func consume_opaque_conversion(state: ParserState, direction: OpaqueDirection) -> Result[ParsedBase, Diagnostic]:
 	keyword = parser_span(state)
 	name ?= consume_name(shifted(state, 1), "expected an opaque type name")
-	value ?= consume_value(shifted(name.next, 1))
+	opened ?= expect(name.next, at_left_paren(name.next), "expected '(' after the opaque type name", OPAQUE_CONVERSION_HELP)
+	value ?= consume_value(opened)
 	closing = parser_span(value.next)
-	closed ?= expect(value.next, at_right_paren(value.next), "expected ')' after the converted value", "write into_opaque Name(value) or from_opaque Name(value) with one value")
+	closed ?= expect(value.next, at_right_paren(value.next), "expected ')' after the converted value", OPAQUE_CONVERSION_HELP)
 	base = match direction:
 		Wrapping:
 			OpaqueWrap(name.name, value.body)
@@ -973,7 +1050,7 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 
 -- A base and its postfix operations.
 private pure func consume_operand(start: ParserState) -> Result[ParsedValue, Diagnostic]:
-	scope ?= if at_word(start, words(start).import_word) and at_colon(shifted(start, 1)):
+	scope ?= if at_import(start) and at_colon(shifted(start, 1)):
 		Err(expected(start, IMPORT_IN_BODY_MESSAGE, IMPORT_IN_BODY_HELP))
 	else:
 		Ok(void)
@@ -1356,8 +1433,24 @@ private fixed union BlockLine:
 	FinalLine(ValueExpression, ParserState)
 
 
+-- A line that declares a binding: `var`, a name followed by '=' or ':', or
+-- a keyword followed by '=' so that `in = 1` reports the reserved word
+-- rather than a missing expression. `else:` is a block header, not a binding.
 private pure func at_binding(state: ParserState) -> Bool:
-	at_var(state) or (at_identifier(state) and (at_equals(shifted(state, 1)) or at_colon(shifted(state, 1))))
+	(
+		at_var(state)
+		or (at_identifier(state) and (at_equals(shifted(state, 1)) or at_colon(shifted(state, 1))))
+		or (at_keyword(state) and at_equals(shifted(state, 1)))
+	)
+
+
+-- A reserved word: a symbol token with a keyword spelling.
+private pure func at_keyword(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(symbol):
+			keyword_spelling(symbol).is_some()
+		None:
+			False
 
 
 private INDENTED_VALUE_HELP: String = "put the value on the same line as '=', or alone on the next line indented one level"
@@ -1413,10 +1506,10 @@ private pure func consume_binding_annotation(state: ParserState) -> Result[Parse
 
 
 -- A value line ends its block when the block's Dedent follows it. An
--- `import:` line is tested first: it would otherwise read as an annotated
--- binding named import.
+-- `import:` line is tested first so that it teaches where imports go rather
+-- than reporting `import` as a reserved binding name.
 private pure func consume_block_line(state: ParserState) -> Result[BlockLine, Diagnostic]:
-	if at_word(state, words(state).import_word) and at_colon(shifted(state, 1)):
+	if at_import(state) and at_colon(shifted(state, 1)):
 		Err(expected(state, IMPORT_IN_BODY_MESSAGE, IMPORT_IN_BODY_HELP))
 	else if at_binding(state):
 		consume_binding(state)
@@ -1430,30 +1523,50 @@ private pure func consume_block_line(state: ParserState) -> Result[BlockLine, Di
 			Ok(StatementLine(ExpressionStatement(value.body), next))
 
 
--- Only bindings can leave a block without its final value.
-private pure func require_final_line(state: ParserState, message: String, help: String) -> Result[Void, Diagnostic]:
-	if at_dedent(state):
-		Err(expected(state, message, help))
-	else:
-		Ok(void)
-
-
-private fixed record ArmBlock {
-	statements: List[ParsedStatement],
-	value: ValueExpression,
+private fixed record BlockResult {
+	block: ParsedBlock,
 	next: ParserState
 }
 
 
-private pure func consume_arm_lines(state: ParserState, statements: List[ParsedStatement]) -> Result[ArmBlock, Diagnostic]:
-	unfinished ?= require_final_line(state, "expected a final expression after the arm bindings", "finish the arm with a value expression on its own indented line")
-	line ?= consume_block_line(state)
+-- Where a statement's syntax ends.
+private pure func statement_end(statement: ParsedStatement) -> Int:
+	match statement:
+		BindingStatement(binding):
+			binding.initializer.span.end
+		ExpressionStatement(value):
+			value.span.end
 
-	match line:
-		StatementLine(statement, next):
-			consume_arm_lines(next, statements.append(statement))
+
+-- The lines of an indented block, after its Indent, in one loop: statement
+-- lines accumulate; the block's value is its last line when that line is an
+-- expression, and a block ending after a statement has none. Whether a
+-- valueless block is allowed where it stands is the checker's decision.
+private pure func consume_block(opened: ParserState) -> Result[BlockResult, Diagnostic]:
+	first = parser_span(opened)
+	var statements: List[ParsedStatement] = []
+	-- One Result carries each consumed line, or the first error.
+	var line: Result[BlockLine, Diagnostic] = consume_block_line(opened)
+
+	while True:
+		match line:
+			Ok(StatementLine(statement, next)):
+				statements = statements.append(statement)
+
+				if at_dedent(next):
+					break
+
+				line = consume_block_line(next)
+			_:
+				break
+
+	ended ?= line
+
+	match ended:
 		FinalLine(value, next):
-			Ok({ statements = statements, value = value, next = next })
+			Ok({ block = { statements = statements, value = Some(value), span = { first | end = value.span.end } }, next = next })
+		StatementLine(statement, next):
+			Ok({ block = { statements = statements, value = None, span = { first | end = statement_end(statement) } }, next = shifted(next, 1) })
 
 
 private fixed record ArmResult {
@@ -1463,15 +1576,15 @@ private fixed record ArmResult {
 
 
 -- `colon` follows the pattern: an inline value or an indented block follows.
-private pure func consume_arm_result(colon: ParserState) -> Result[ArmBlock, Diagnostic]:
+private pure func consume_arm_result(colon: ParserState) -> Result[BlockResult, Diagnostic]:
 	if at_newline(colon):
 		newline = shifted(colon, 1)
 		opened ?= expect(newline, at_indent(newline), "expected an indented match arm result", "put the arm's statements and final value one tab or four spaces deeper than its pattern")
-		consume_arm_lines(opened, [])
+		consume_block(opened)
 	else:
 		value ?= consume_value(colon)
 		next ?= end_value_line(value.next)
-		Ok({ statements = [], value = value.body, next = next })
+		Ok({ block = { statements = [], value = Some(value.body), span = value.body.span }, next = next })
 
 
 private pure func consume_arm(state: ParserState) -> Result[ArmResult, Diagnostic]:
@@ -1481,9 +1594,8 @@ private pure func consume_arm(state: ParserState) -> Result[ArmResult, Diagnosti
 	Ok({
 		arm = {
 			pattern = pattern.pattern,
-			statements = block.statements,
-			body = block.value,
-			span = { pattern.span | end = block.value.span.end }
+			block = block.block,
+			span = { pattern.span | end = block.block.span.end }
 		},
 		next = block.next,
 	})
@@ -1528,21 +1640,6 @@ private pure func consume_match(start: ParserState) -> Result[BodyResult, Diagno
 		}),
 		next = arms.next,
 	})
-
-
-private pure func at_builtin_body(state: ParserState) -> Bool:
-	if at_word(state, words(state).builtin_word) and at_left_paren(shifted(state, 1)):
-		match current(shifted(state, 2)):
-			Some(token):
-				match token.kind:
-					QuotedString(_):
-						True
-					_:
-						False
-			None:
-				False
-	else:
-		False
 
 
 private BUILTIN_LABEL_HELP: String = "use int.equals, int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals, list.repeat, list.length, list.get, list.append, list.set or list.concat"
@@ -1655,7 +1752,7 @@ private pure func consume_builtin_operation(opened: ParserState, label: String) 
 
 
 private pure func consume_builtin_body(start: ParserState) -> Result[BodyResult, Diagnostic]:
-	after_builtin ?= consume_word(start, words(start).builtin_word, "expected 'builtin'")
+	after_builtin ?= expect(start, at_builtin(start), "expected 'builtin'", DECLARATION_WORD_HELP)
 	opened ?= expect(after_builtin, at_left_paren(after_builtin), "expected '(' after builtin", "write builtin(\"int.add\") or bind union constructors as builtin(\"string.parse_int\", Some, None)")
 	operation ?= match current(opened):
 		Some(label):
@@ -1696,18 +1793,17 @@ private pure func consume_function_line(state: ParserState, statements: List[Par
 			matched ?= consume_match(state)
 			closed ?= expect(matched.next, at_dedent(matched.next), "a match must end its function", "move the statements after the match before it, or indent further arms one level deeper than the match")
 			Ok(BodyEnd(matched.body, closed))
+		Some(BuiltinKeyword):
+			closed ?= consume_builtin_lines(state, statements)
+			Ok(BodyEnd(closed.body, closed.next))
 		_:
-			if at_builtin_body(state):
-				closed ?= consume_builtin_lines(state, statements)
-				Ok(BodyEnd(closed.body, closed.next))
-			else:
-				line ?= consume_block_line(state)
+			line ?= consume_block_line(state)
 
-				match line:
-					StatementLine(statement, next):
-						Ok(BodyStatement(statement, next))
-					FinalLine(value, next):
-						Ok(BodyEnd(ParsedValueBody(value), next))
+			match line:
+				StatementLine(statement, next):
+					Ok(BodyStatement(statement, next))
+				FinalLine(value, next):
+					Ok(BodyEnd(ParsedValueBody(value), next))
 
 
 -- Statement lines accumulate in a loop, one host frame for the whole block,
@@ -2004,7 +2100,7 @@ private fixed record UnionResult {
 
 private pure func consume_union(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[UnionResult, Diagnostic]:
 	after_fixed = shifted(start, 1)
-	word ?= if at_word(after_fixed, words(after_fixed).union_word):
+	word ?= if at_union(after_fixed):
 		Ok(shifted(after_fixed, 1))
 	else:
 		Err(expected(after_fixed, "expected 'union' after 'fixed'", "write fixed union Choice: followed by indented variant names"))
@@ -2122,7 +2218,7 @@ private pure func unknown_builtin_type(state: ParserState) -> Diagnostic:
 
 
 private pure func consume_builtin_type(start: ParserState) -> Result[BuiltinTypeResult, Diagnostic]:
-	after_type ?= consume_word(start, words(start).type_word, "expected 'type'")
+	after_type ?= expect(start, at_type_keyword(start), "expected 'type'", DECLARATION_WORD_HELP)
 	name ?= if at_identifier(after_type):
 		consume_name(after_type, "expected a builtin type name")
 	else:
@@ -2138,7 +2234,7 @@ private pure func consume_builtin_type(start: ParserState) -> Result[BuiltinType
 		_:
 			Ok(name.next)
 	equals ?= expect(after_name, at_equals(after_name), "expected '=' after the builtin type name", "write type Int = builtin, type Float = builtin, type String = builtin, type Void = builtin or type List[T] = builtin")
-	end ?= consume_word(equals, words(equals).builtin_word, "expected 'builtin'")
+	end ?= expect(equals, at_builtin(equals), "expected 'builtin'", DECLARATION_WORD_HELP)
 	Ok({ declaration = declaration, next = end })
 
 
@@ -2276,7 +2372,7 @@ private pure func consume_import_symbol(state: ParserState) -> Result[ImportSele
 		_:
 			name ?= consume_name(state, "expected an imported function or type name")
 
-			if at_word(name.next, words(name.next).as_word):
+			if at_as(name.next):
 				Err(expected(name.next, "selection aliases are not supported yet", "select the name by its declared spelling, such as ./helper: answer; a module alias is written path as Alias"))
 			else if at_left_paren(name.next):
 				consume_constructor_selection(name)
@@ -2349,7 +2445,7 @@ private fixed record ParsedAlias {
 
 -- `path as Alias` names the module; the alias joins the parser's alias set.
 private pure func consume_module_alias(state: ParserState) -> Result[ParsedAlias, Diagnostic]:
-	if not at_word(state, words(state).as_word):
+	if not at_as(state):
 		Ok({ module_alias = None, next = state })
 	else:
 		name ?= consume_name(shifted(state, 1), "expected a module alias name after 'as'")
@@ -2446,7 +2542,7 @@ private fixed record ParsedOpaqueResult {
 -- `opaque type Name = Underlying` on one line.
 private pure func consume_opaque(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[ParsedOpaqueResult, Diagnostic]:
 	after_opaque = shifted(start, 1)
-	type_word ?= if at_word(after_opaque, words(after_opaque).type_word):
+	type_word ?= if at_type_keyword(after_opaque):
 		Ok(shifted(after_opaque, 1))
 	else:
 		Err(expected(after_opaque, "expected 'type' after 'opaque'", "write opaque type Name = Underlying"))
@@ -2465,16 +2561,16 @@ private fixed record DeclarationResult {
 
 -- `declared` says whether a non-import declaration precedes `state`.
 private pure func consume_declaration(state: ParserState, module: ModuleId, declared: Bool) -> Result[DeclarationResult, Diagnostic]:
-	if at_word(state, words(state).import_word) and declared:
+	if at_import(state) and declared:
 		Err(expected(state, "imports must precede declarations", "move every import: block before the module's functions, fixed unions, and fixed records"))
-	else if at_word(state, words(state).import_word):
+	else if at_import(state):
 		block ?= consume_import_block(state)
 		Ok({ declaration = ImportBlock(block.imports), next = block.next })
-	else if at_word(state, words(state).type_word):
+	else if at_type_keyword(state):
 		parsed ?= consume_builtin_type(state)
 		next ?= end_value_line(parsed.next)
 		Ok({ declaration = BuiltinTypeDeclaration(parsed.declaration), next = next })
-	else if at_word(state, words(state).private_word) and at_word(shifted(state, 1), words(state).type_word):
+	else if at_private(state) and at_type_keyword(shifted(state, 1)):
 		-- Only a well-formed builtin type declaration is rejected as private;
 		-- any other `type` line reports the builtin-type parser's own error.
 		match consume_builtin_type(shifted(state, 1)):
@@ -2482,7 +2578,7 @@ private pure func consume_declaration(state: ParserState, module: ModuleId, decl
 				Err(expected(state, "builtin type declarations cannot be private", "remove private; builtin types belong to the foundation module"))
 			Err(error):
 				Err(error)
-	else if at_word(state, words(state).private_word):
+	else if at_private(state):
 		consume_visible_declaration(shifted(state, 1), module, Private(parser_span(state)))
 	else:
 		consume_visible_declaration(state, module, Public)
@@ -2490,11 +2586,11 @@ private pure func consume_declaration(state: ParserState, module: ModuleId, decl
 
 -- The declarations that may carry `private`.
 private pure func consume_visible_declaration(state: ParserState, module: ModuleId, visibility: Visibility) -> Result[DeclarationResult, Diagnostic]:
-	if at_word(state, words(state).fixed_word) and at_word(shifted(state, 1), words(state).record_word):
+	if at_word(state, words(state).fixed_word) and at_record(shifted(state, 1)):
 		parsed ?= consume_record(state, module, visibility)
 		next ?= end_value_line(parsed.next)
 		Ok({ declaration = RecordDeclaration(parsed.declaration), next = next })
-	else if at_word(state, words(state).opaque_word):
+	else if at_opaque(state):
 		parsed ?= consume_opaque(state, module, visibility)
 		Ok({ declaration = OpaqueDeclaration(parsed.declaration), next = parsed.next })
 	else if at_identifier(state) and at_colon(shifted(state, 1)):
