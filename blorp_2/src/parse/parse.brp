@@ -124,19 +124,6 @@ private pure func bracketed(state: ParserState) -> Bool:
 			False
 
 
--- A value read inside a loop body is a value position: its blocks admit no
--- loop control. Elsewhere the context is unchanged. A line-leading `if` or
--- `match` is not a value position: its condition or scrutinee and its
--- blocks are read under the loop body's own context (a block-ended value
--- in the header fails at the header's `:` anyway).
-private pure func value_position(state: ParserState) -> ParserState:
-	match state.context:
-		LoopBody:
-			with_context(state, ValueInLoop)
-		_:
-			state
-
-
 fixed union ImportOrigin:
 	RelativeImport(Int)
 	LibraryImport
@@ -1431,10 +1418,8 @@ private pure func consume_operand(start: ParserState) -> Result[ParsedValue, Dia
 			match token.kind:
 				SymbolToken(LeftParen):
 					consume_grouped_value(start, token.span)
-				SymbolToken(IfKeyword):
-					consume_if(start)
-				SymbolToken(MatchKeyword):
-					consume_match_value(start)
+				SymbolToken(IfKeyword) | SymbolToken(MatchKeyword):
+					consume_control_operand(start)
 				SymbolToken(FunctionKeyword):
 					consume_lambda(start)
 				SymbolToken(PureKeyword):
@@ -1453,6 +1438,22 @@ private pure func consume_operand(start: ParserState) -> Result[ParsedValue, Dia
 						ending = postfixes.ending,
 						owed = postfixes.owed,
 					})
+
+
+-- `start` is at `if` or `match`: an operand, so a value wherever its line
+-- stands. In a loop its blocks admit no loop control (owner rule), and its
+-- context returns after.
+private pure func consume_control_operand(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	inside = match start.context:
+		LoopBody:
+			with_context(start, ValueInLoop)
+		_:
+			start
+	value ?= if at_if(start):
+		consume_if(inside)
+	else:
+		consume_match_value(inside)
+	Ok({ value | next = with_context(value.next, start.context) })
 
 
 private KEYWORD_HELP: String = "a keyword is missing or misspelled: `in` follows a loop variable, `from` follows a select receive binding and `func` starts a function"
@@ -2096,17 +2097,17 @@ private pure func indented_value_words(operator: BindingOperator) -> IndentedVal
 -- the line end.
 private pure func consume_initializer(equals: ParserState, operator: BindingOperator, line_message: String, line_help: String) -> Result[ParsedValue, Diagnostic]:
 	if not at_newline(equals):
-		value ?= consume_value(value_position(equals))
+		value ?= consume_value(equals)
 		next ?= end_value(value, line_message, line_help)
-		Ok({ value | next = with_context(next, equals.context) })
+		Ok({ value | next = next })
 	else:
 		after_newline = shifted(equals, 1)
 		words = indented_value_words(operator)
 		opened ?= expect(after_newline, at_indent(after_newline), words.indented, words.help)
-		value ?= consume_value(value_position(opened))
+		value ?= consume_value(opened)
 		ended ?= end_value(value, words.one_expression, words.help)
 		closed ?= expect(ended, at_dedent(ended), words.one_expression, words.help)
-		Ok({ value | next = with_context(closed, equals.context) })
+		Ok({ value | next = closed })
 
 
 private BINDING_LINE_MESSAGE: String = "expected a newline after the binding"
@@ -2186,9 +2187,8 @@ private pure func consume_block_line(state: ParserState) -> Result[BlockLine, Di
 
 
 -- The statement or value a code line starts with. A line-leading `if` or
--- `match` is a statement-position form read under the current context;
--- any other value line is a value position, and the line's own context is
--- restored after it.
+-- `match` is a statement whose blocks keep the line's context, so it
+-- bypasses consume_value, where an `if` or `match` operand is a value.
 private pure func consume_line_form(state: ParserState) -> Result[LineForm, Diagnostic]:
 	if at_import(state) and at_colon(shifted(state, 1)):
 		Err(expected(state, IMPORT_IN_BODY_MESSAGE, IMPORT_IN_BODY_HELP))
@@ -2203,19 +2203,20 @@ private pure func consume_line_form(state: ParserState) -> Result[LineForm, Diag
 			Some(control):
 				consume_loop_control(state, control)
 			None:
-				start = if at_if(state) or at_match(state):
-					state
+				value ?= if at_if(state):
+					consume_if(state)
+				else if at_match(state):
+					consume_match_value(state)
 				else:
-					value_position(state)
-				value ?= consume_value(start)
-				Ok(ValueForm({ value | next = with_context(value.next, state.context) }))
+					consume_value(state)
+				Ok(ValueForm(value))
 
 
 -- `state` is at `while`: the condition, then a body read as a loop body.
 -- The loop's context ends with its block.
 private pure func consume_while(state: ParserState) -> Result[LineForm, Diagnostic]:
 	keyword = parser_span(state)
-	condition ?= consume_header_value(value_position(shifted(state, 1)))
+	condition ?= consume_header_value(shifted(state, 1))
 	body ?= consume_header_block(with_context(condition.next, LoopBody), "expected `:` after while condition")
 	loop = { condition = condition.body, body = body.block, span = { keyword | end = body.block.span.end } }
 	Ok(StatementForm(WhileLoop(loop), with_context(body.next, state.context)))
@@ -2227,7 +2228,7 @@ private pure func consume_for(state: ParserState) -> Result[LineForm, Diagnostic
 	keyword = parser_span(state)
 	binder ?= consume_binder(shifted(state, 1), "expected a loop variable after `for`")
 	in_word ?= expect(binder.next, at_in(binder.next), "expected `in` after for loop variable", KEYWORD_HELP)
-	iterable ?= consume_header_value(value_position(in_word))
+	iterable ?= consume_header_value(in_word)
 	body ?= consume_header_block(with_context(iterable.next, LoopBody), "expected `:` after for loop iterable")
 	loop = { binder = binder.binder, iterable = iterable.body, body = body.block, span = { keyword | end = body.block.span.end } }
 	Ok(StatementForm(ForLoop(loop), with_context(body.next, state.context)))
