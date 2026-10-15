@@ -1490,7 +1490,9 @@ owned String on each evaluation.
 cover the 15 new native fixtures, exact byte/lifetime tests, full suites and
 frozen existing-workload comparison. Long-literal probes also identify a
 bounded follow-up: the current host concat helper copies growing buffers in
-byte emission and repeated escape decoding.
+byte emission (`append_string_bytes`). Escape decoding no longer does; the
+[String decoding report](../benchmarks/results/blorp_2_string_decoding_2026-10-16.md)
+has the measurements.
 
 ## Void, ordered statements and print
 

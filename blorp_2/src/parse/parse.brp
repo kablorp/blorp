@@ -204,6 +204,12 @@ private MAX_UNICODE_HEX_DIGITS: Int = 6
 
 private HEX_RADIX: Int = 16
 
+-- Source-format bytes the String decoder compares by code. Ints, not Char
+-- literals: the pilot does not parse Char literals yet.
+private BACKSLASH_BYTE: Int = 92
+private DOLLAR_BYTE: Int = 36
+private OPEN_BRACE_BYTE: Int = 123
+
 private UNICODE_MAX: Int = 1114111
 
 private SURROGATE_START: Int = 55296
@@ -969,52 +975,63 @@ private pure func decode_escape(raw: String, start: Int, span: Span) -> Result[D
 				Err(string_error(span, start, character_end(raw, IntOps.add(start, 1)), "unknown String escape", STRING_ESCAPE_HELP))
 
 
--- Decoded text before `cursor`; raw bytes from `cursor` are not yet decoded.
-private fixed record StringScan {
-	decoded: String,
-	cursor: Int
-}
+-- Bytes are compared by code: a one-byte substring would allocate a String.
+-- False past the end of `raw`.
+private pure func byte_is(raw: String, position: Int, expected: Int) -> Bool:
+	match StringOps.get(raw, position):
+		Some(character):
+			IntOps.equals(to_int(character), expected)
+		None:
+			False
 
 
--- Copies the raw run up to the next escape intact, then decodes that escape.
--- UTF-8 source bytes are never reconstructed as characters or normalized.
-private pure func decode_next_escape(raw: String, span: Span, scan: StringScan) -> Result[StringScan, Diagnostic]:
-	var escape = scan.cursor
+-- The first position at or after `start` of a backslash or a raw interpolation
+-- opener, or the end of `raw`.
+private pure func escape_start(raw: String, start: Int) -> Int:
+	var position = start
 
 	while (
-		IntOps.less_than(escape, raw.length())
-		and not Text.equals(raw.substring(escape, 1), "\\")
-		and not Text.equals(raw.substring(escape, 2), "$".concat("{"))
+		IntOps.less_than(position, raw.length())
+		and not byte_is(raw, position, BACKSLASH_BYTE)
+		and not (byte_is(raw, position, DOLLAR_BYTE) and byte_is(raw, IntOps.add(position, 1), OPEN_BRACE_BYTE))
 	):
-		escape = IntOps.add(escape, 1)
+		position = IntOps.add(position, 1)
 
-	run = raw.substring(scan.cursor, IntOps.subtract(escape, scan.cursor))
-
-	if IntOps.equals(escape, raw.length()):
-		Ok({ decoded = scan.decoded.concat(run), cursor = escape })
-	else if Text.equals(raw.substring(escape, 1), "$"):
-		Err(string_error(span, escape, IntOps.add(escape, 2), "String interpolation is not supported yet", "escape the opening brace as \\{ for literal $".concat("{ text")))
-	else:
-		decoded ?= decode_escape(raw, escape, span)
-		Ok({ decoded = scan.decoded.concat(run).concat(decoded.bytes), cursor = decoded.next })
+	position
 
 
+-- Each raw run between escapes and each decoded escape is one piece, joined
+-- once at the end. UTF-8 source bytes are never reconstructed as characters
+-- or normalized.
 private pure func string_value(raw: String, span: Span) -> Result[String, Diagnostic]:
-	-- One Result carries the decoding to the end of the contents or to the first error.
-	var scan: Result[StringScan, Diagnostic] = Ok({ decoded = "", cursor = 0 })
+	var pieces: List[String] = []
+	var cursor = 0
+	var failure: Option[Diagnostic] = None
 
-	while True:
-		match scan:
-			Ok(text):
-				if IntOps.equals(text.cursor, raw.length()):
-					break
+	while failure.is_none():
+		stop = escape_start(raw, cursor)
+		pieces = pieces.append(raw.substring(cursor, IntOps.subtract(stop, cursor)))
 
-				scan = decode_next_escape(raw, span, text)
-			Err(_):
-				break
+		if IntOps.equals(stop, raw.length()):
+			break
 
-	text ?= scan
-	Ok(text.decoded)
+		-- escape_start stops only at a backslash or a `${` opener, so a `$` here is
+		-- the opener.
+		if byte_is(raw, stop, DOLLAR_BYTE):
+			failure = Some(string_error(span, stop, IntOps.add(stop, 2), "String interpolation is not supported yet", "escape the opening brace as \\{ for literal $".concat("{ text")))
+		else:
+			match decode_escape(raw, stop, span):
+				Ok(decoded):
+					pieces = pieces.append(decoded.bytes)
+					cursor = decoded.next
+				Err(error):
+					failure = Some(error)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(pieces.join(""))
 
 
 -- How a value's syntax ended: inline, so a Newline must follow it, or with
