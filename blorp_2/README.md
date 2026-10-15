@@ -1046,7 +1046,9 @@ Lexical and layout rules:
   rejects it until the join milestone), at depth
   one in a function or depth three in an arm block. Its initializer starts on
   the same line, or stands alone on the next line indented one level, and may
-  continue inside brackets. Bindings and bare expression statements may interleave before
+  continue inside brackets. `name ?= expression` is a propagating binding:
+  it parses like a binding (never with `var`), and checking rejects it until
+  the join milestone. Bindings and bare expression statements may interleave before
   the mandatory final expression or function tail match. A non-final bare
   expression must return Void; bind or return other values. Bindings inside
   arguments and annotations are unsupported. An arm block may end with a

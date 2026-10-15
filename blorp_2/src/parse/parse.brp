@@ -41,7 +41,8 @@ import:
 			FloatAddBuiltin, FloatSubtractBuiltin, FloatMultiplyBuiltin, FloatDivideBuiltin,
 			FloatRemainderBuiltin, FloatToStringBuiltin, StringParseFloatBuiltin,
 		),
-		ParsedStatement(BindingStatement, ExpressionStatement),
+		ParsedPropagation,
+		ParsedStatement(BindingStatement, PropagatingBinding, ExpressionStatement),
 		ParsedUnion,
 		ParsedVariant,
 		PostfixOperation(ReceiverInvocation, FieldAccess),
@@ -50,7 +51,7 @@ import:
 		Span,
 		Symbol(
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
-			Colon, Newline, Indent, Dedent, VarKeyword, VoidKeyword, Equals, LeftBracket, RightBracket,
+			Colon, Newline, Indent, Dedent, VarKeyword, VoidKeyword, Equals, QuestionEquals, LeftBracket, RightBracket,
 			LeftBrace, RightBrace, Bar, Comma, AtSign, Slash, Star, DotDot, Ellipsis, AndKeyword, OrKeyword, NotKeyword,
 			IfKeyword, ElseKeyword,
 			ImportKeyword, TypeKeyword, PrivateKeyword, RecordKeyword, UnionKeyword, BuiltinKeyword, AsKeyword, OpaqueKeyword,
@@ -467,6 +468,26 @@ private pure func at_indent(state: ParserState) -> Bool:
 private pure func at_equals(state: ParserState) -> Bool:
 	match current_symbol(state):
 		Some(Equals):
+			True
+		_:
+			False
+
+
+private pure func at_integer_literal(state: ParserState) -> Bool:
+	match current(state):
+		Some(token):
+			match token.kind:
+				IntegerLiteral(_):
+					True
+				_:
+					False
+		None:
+			False
+
+
+private pure func at_question_equals(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(QuestionEquals):
 			True
 		_:
 			False
@@ -1009,8 +1030,13 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
 			Err(misplaced_annotation(start))
 		SymbolToken(VoidKeyword):
 			Ok({ base = VoidExpression, span = token.span, next = after })
+		-- `.5` teaches the Float form; any other leading dot (a UFCS call on
+		-- its own line, say) is simply no expression, as in the host.
 		SymbolToken(Dot):
-			Err(diagnostic({ token.span | end = parser_span(after).end }, "Float literals need digits before the decimal point", "write 0.5; a source Float literal needs an integer part"))
+			if at_integer_literal(after):
+				Err(diagnostic({ token.span | end = parser_span(after).end }, "Float literals need digits before the decimal point", "write 0.5; a source Float literal needs an integer part"))
+			else:
+				Err(expected(start, "expected a return expression", EXPRESSION_HELP))
 		SymbolToken(LeftBrace):
 			consume_braced_record(after, token.span)
 		SymbolToken(LeftBracket):
@@ -1269,11 +1295,16 @@ private pure func consume_else_branch(state: ParserState) -> Result[ElseResult, 
 private BLOCK_HEADER_HELP: String = "a block header ends with `:` before its indented body, as in `if condition:` or `func name() -> Type:`"
 
 
--- `:` Newline Indent block Dedent after a block header, in the host's words.
-private pure func consume_header_block(state: ParserState, colon_message: String) -> Result[BlockResult, Diagnostic]:
+-- `:` Newline Indent after a block header, in the host's words; `next`
+-- is the block's first token.
+private pure func consume_block_header(state: ParserState, colon_message: String, newline_message: String) -> Result[ParserState, Diagnostic]:
 	newline ?= expect(state, at_colon(state), colon_message, BLOCK_HEADER_HELP)
-	opened ?= expect(newline, at_newline(newline), "expected newline before indented block", "start the next statement or item on its own line")
-	first ?= expect(opened, at_indent(opened), "expected an indented block", "indent the lines of the block under its header")
+	opened ?= expect(newline, at_newline(newline), newline_message, "start the next statement or item on its own line")
+	expect(opened, at_indent(opened), "expected an indented block", "indent the lines of the block under its header")
+
+
+private pure func consume_header_block(state: ParserState, colon_message: String) -> Result[BlockResult, Diagnostic]:
+	first ?= consume_block_header(state, colon_message, "expected newline before indented block")
 	consume_block(first)
 
 
@@ -1636,15 +1667,20 @@ private fixed union BlockLine:
 	FinalLine(ValueExpression, ParserState)
 
 
--- A line that declares a binding: `var`, a name followed by '=' or ':', or
--- a keyword followed by '=' so that `in = 1` reports the reserved word
--- rather than a missing expression. `else:` is a block header, not a binding.
+-- A line that declares a binding: `var`, a name followed by '=', '?=' or
+-- ':', or a keyword followed by '=' or '?=' so that `in = 1` reports the
+-- reserved word rather than a missing expression. `else:` is a block
+-- header, not a binding.
 private pure func at_binding(state: ParserState) -> Bool:
 	(
 		at_var(state)
-		or (at_identifier(state) and (at_equals(shifted(state, 1)) or at_colon(shifted(state, 1))))
-		or (at_keyword(state) and at_equals(shifted(state, 1)))
+		or (at_identifier(state) and (at_assignment(shifted(state, 1)) or at_colon(shifted(state, 1))))
+		or (at_keyword(state) and at_assignment(shifted(state, 1)))
 	)
+
+
+private pure func at_assignment(state: ParserState) -> Bool:
+	at_equals(state) or at_question_equals(state)
 
 
 -- A reserved word: a symbol token with a keyword spelling.
@@ -1656,23 +1692,58 @@ private pure func at_keyword(state: ParserState) -> Bool:
 			False
 
 
-private INDENTED_VALUE_HELP: String = "put the value on the same line as '=', or alone on the next line indented one level"
+-- The operator a binding's value follows: '=' or '?='.
+private fixed union BindingOperator:
+	Assign
+	Propagate
 
 
--- The value after '=' and the end of its line: on the same line, or alone on
--- an indented next line, whose Dedent closes it. `next` follows the line end.
-private pure func consume_initializer(equals: ParserState, line_message: String, line_help: String) -> Result[ParsedValue, Diagnostic]:
+-- The messages of an initializer that must stand on an indented line, in
+-- the words of its operator.
+private fixed record IndentedValueWords {
+	indented: String,
+	one_expression: String,
+	help: String
+}
+
+
+private pure func indented_value_words(operator: BindingOperator) -> IndentedValueWords:
+	match operator:
+		Assign:
+			{
+				indented = "expected an indented value after '='",
+				one_expression = "expected one expression after '='",
+				help = "put the value on the same line as '=', or alone on the next line indented one level"
+			}
+		Propagate:
+			{
+				indented = "expected an indented value after '?='",
+				one_expression = "expected one expression after '?='",
+				help = "put the value on the same line as '?=', or alone on the next line indented one level"
+			}
+
+
+-- The value after the operator and the end of its line: on the same line,
+-- or alone on an indented next line, whose Dedent closes it. `next` follows
+-- the line end.
+private pure func consume_initializer(equals: ParserState, operator: BindingOperator, line_message: String, line_help: String) -> Result[ParsedValue, Diagnostic]:
 	if not at_newline(equals):
 		value ?= consume_value(equals)
 		next ?= end_value(value, line_message, line_help)
 		Ok({ value | next = next })
 	else:
 		after_newline = shifted(equals, 1)
-		opened ?= expect(after_newline, at_indent(after_newline), "expected an indented value after '='", INDENTED_VALUE_HELP)
+		words = indented_value_words(operator)
+		opened ?= expect(after_newline, at_indent(after_newline), words.indented, words.help)
 		value ?= consume_value(opened)
-		ended ?= end_value(value, "expected one expression after '='", INDENTED_VALUE_HELP)
-		closed ?= expect(ended, at_dedent(ended), "expected one expression after '='", INDENTED_VALUE_HELP)
+		ended ?= end_value(value, words.one_expression, words.help)
+		closed ?= expect(ended, at_dedent(ended), words.one_expression, words.help)
 		Ok({ value | next = closed })
+
+
+private BINDING_LINE_MESSAGE: String = "expected a newline after the binding"
+
+private BINDING_LINE_HELP: String = "put each statement on its own line"
 
 
 private pure func consume_binding(state: ParserState) -> Result[BlockLine, Diagnostic]:
@@ -1687,10 +1758,23 @@ private pure func consume_binding(state: ParserState) -> Result[BlockLine, Diagn
 			state
 	name ?= consume_name(after_keyword, "expected a binding name")
 	annotation ?= consume_binding_annotation(name.next)
-	equals ?= expect(annotation.next, at_equals(annotation.next), "expected '=' after the binding name", "write name = expression or var name = expression")
-	initializer ?= consume_initializer(equals, "expected a newline after the binding", "put each statement on its own line")
-	binding = { name = name.name, annotation = annotation.written, mutability = mutability, initializer = initializer.body }
-	Ok(StatementLine(BindingStatement(binding), initializer.next))
+
+	-- Only an immutable name propagates; `var` keeps the plain binding form.
+	propagating = match mutability:
+		ImmutableBinding:
+			at_question_equals(annotation.next)
+		MutableBinding:
+			False
+
+	if propagating:
+		value ?= consume_initializer(shifted(annotation.next, 1), Propagate, BINDING_LINE_MESSAGE, BINDING_LINE_HELP)
+		propagation = { name = name.name, annotation = annotation.written, value = value.body, span = { name.name.span | end = value.body.span.end } }
+		Ok(StatementLine(PropagatingBinding(propagation), value.next))
+	else:
+		equals ?= expect(annotation.next, at_equals(annotation.next), "expected '=' after the binding name", "write name = expression or var name = expression; a propagating binding is name ?= expression")
+		initializer ?= consume_initializer(equals, Assign, BINDING_LINE_MESSAGE, BINDING_LINE_HELP)
+		binding = { name = name.name, annotation = annotation.written, mutability = mutability, initializer = initializer.body }
+		Ok(StatementLine(BindingStatement(binding), initializer.next))
 
 
 private fixed record ParsedBindingType {
@@ -1737,6 +1821,8 @@ private pure func statement_end(statement: ParsedStatement) -> Int:
 	match statement:
 		BindingStatement(binding):
 			binding.initializer.span.end
+		PropagatingBinding(propagation):
+			propagation.value.span.end
 		ExpressionStatement(value):
 			value.span.end
 
@@ -1826,8 +1912,12 @@ private pure func consume_arms(state: ParserState, arms: List[ParsedMatchArm]) -
 -- arm's Dedent like an if-expression.
 private pure func consume_match_value(start: ParserState) -> Result[ParsedValue, Diagnostic]:
 	parsed ?= consume_match_form(start)
-	span = parsed.form.span
-	Ok({ body = { base = MatchExpression(parsed.form), base_span = span, applications = [], span = span }, next = parsed.next, ending = BlockEnding })
+	Ok({ body = match_expression(parsed.form), next = parsed.next, ending = BlockEnding })
+
+
+-- The match as one value with no postfix operations.
+private pure func match_expression(form: ParsedMatch) -> ValueExpression:
+	{ base = MatchExpression(form), base_span = form.span, applications = [], span = form.span }
 
 
 private fixed record MatchResult {
@@ -1845,9 +1935,7 @@ private pure func consume_match_form(start: ParserState) -> Result[MatchResult, 
 	else:
 		Err(expected(after_keyword, "expected a space after 'match'", "put a space between 'match' and the matched expression"))
 	scrutinee ?= consume_value(after_keyword)
-	colon ?= expect(scrutinee.next, at_colon(scrutinee.next), "expected ':' after the match value", "write match value: and put each arm on the next line")
-	newline ?= expect(colon, at_newline(colon), "expected a newline after the match header", "put each pattern on its own indented line, with an inline or indented result")
-	opened ?= expect(newline, at_indent(newline), "expected an indented match arm", "indent each arm one tab or four spaces deeper than its match")
+	opened ?= consume_block_header(scrutinee.next, "expected `:` after match expression", "expected newline before match cases")
 	arms ?= consume_arms(opened, [])
 	Ok({
 		form = {
@@ -2015,8 +2103,7 @@ private pure func consume_function_line(state: ParserState, statements: List[Par
 			if at_dedent(matched.next):
 				Ok(BodyEnd(ParsedMatchBody(matched.form), shifted(matched.next, 1)))
 			else:
-				span = matched.form.span
-				Ok(BodyStatement(ExpressionStatement({ base = MatchExpression(matched.form), base_span = span, applications = [], span = span }), matched.next))
+				Ok(BodyStatement(ExpressionStatement(match_expression(matched.form)), matched.next))
 		Some(BuiltinKeyword):
 			closed ?= consume_builtin_lines(state, statements)
 			Ok(BodyEnd(closed.body, closed.next))
@@ -2750,7 +2837,7 @@ private pure func consume_constant(start: ParserState, module: ModuleId, visibil
 	colon ?= expect(name.next, at_colon(name.next), "expected ':' after the constant name", "write NAME: Type = value")
 	type_name ?= consume_type(colon, "expected the constant's type after ':'")
 	equals ?= expect(type_name.next, at_equals(type_name.next), "expected '=' after the constant type", "write NAME: Type = value")
-	value ?= consume_initializer(equals, "expected a newline after the constant value", "put each declaration on a new line")
+	value ?= consume_initializer(equals, Assign, "expected a newline after the constant value", "put each declaration on a new line")
 	Ok({
 		declaration = { module = module, visibility = visibility, name = name.name, type_name = type_name.written, value = value.body },
 		next = value.next,

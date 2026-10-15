@@ -1,0 +1,146 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, module_contents, parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		Diagnostic,
+		ExpressionBase(DirectApplication, IfExpression),
+		ParsedBody(ParsedValueBody),
+		ParsedFunction,
+		ParsedPropagation,
+		ParsedStatement(BindingStatement, PropagatingBinding, ExpressionStatement),
+	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+private pure func main_function(source: String) -> Option[ParsedFunction]:
+	match parse_source(source):
+		Ok(parsed):
+			module_contents(parsed).functions.get(0)
+		Err(_):
+			None
+
+
+-- The one propagating statement of a function whose body is a value.
+private pure func only_propagation(source: String) -> Option[ParsedPropagation]:
+	match main_function(source):
+		Some(function):
+			match (function.statements, function.body):
+				([PropagatingBinding(propagation)], ParsedValueBody(_)):
+					Some(propagation)
+				_:
+					None
+		None:
+			None
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parse_source(source):
+		Err(diagnostic):
+			diagnostic.span.start == start and diagnostic.span.end == end and diagnostic.message == message and diagnostic.help == help
+		Ok(_):
+			False
+
+
+-- `name ?= value` is its own statement kind, spanning the name to the value.
+pure func test_propagation_keeps_name_value_and_span() -> Bool:
+	match only_propagation(HEADER + "\tx ?= find(1)\n\tx\n"):
+		Some(propagation):
+			match propagation.value.base:
+				DirectApplication(callee, [_]):
+					(
+						propagation.name.span.start == 21 and propagation.name.span.end == 22
+						and callee.span.start == 26 and propagation.span.start == 21 and propagation.span.end == 33
+						and propagation.annotation.is_none()
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_propagation_may_be_annotated() -> Bool:
+	match only_propagation(HEADER + "\tx: Int ?= find(1)\n\tx\n"):
+		Some(propagation):
+			propagation.annotation.is_some() and propagation.span.end == 38
+		None:
+			False
+
+
+-- The value may stand alone on an indented next line, or be a control form
+-- whose dedent ends the statement.
+pure func test_propagation_value_may_be_indented_or_a_block() -> Bool:
+	match (only_propagation(HEADER + "\tx ?=\n\t\tfind(1)\n\tx\n"), only_propagation(HEADER + "\tx ?= if True:\n\t\tfind(1)\n\telse:\n\t\tfind(2)\n\tx\n")):
+		(Some(indented), Some(blocked)):
+			match blocked.value.base:
+				IfExpression(_):
+					indented.span.end == 35 and blocked.span.end == 61
+				_:
+					False
+		_:
+			False
+
+
+-- Only an immutable name propagates; `var` keeps the plain binding form.
+pure func test_var_cannot_propagate() -> Bool:
+	rejects(HEADER + "\tvar x ?= find(1)\n\tx\n", 27, 29, "expected '=' after the binding name", "write name = expression or var name = expression; a propagating binding is name ?= expression")
+
+
+pure func test_propagation_line_and_value_errors_name_the_operator() -> Bool:
+	(
+		rejects(HEADER + "\tx ?= 1 2\n\tx\n", 28, 29, "expected a newline after the binding", "put each statement on its own line")
+		and rejects(HEADER + "\tx ?=\n\tx\n", 27, 28, "expected an indented value after '?='", "put the value on the same line as '?=', or alone on the next line indented one level")
+		and rejects(HEADER + "\tin ?= find(1)\n\t0\n", 21, 23, "`in` is a reserved keyword and cannot be used as a name", "choose another identifier such as `in_name`")
+	)
+
+
+-- A block that ends after a propagation spans through the propagated value.
+pure func test_block_ending_in_a_propagation_spans_its_value() -> Bool:
+	match main_function(HEADER + "\tif True:\n\t\tx ?= find(1)\n\telse:\n\t\t2\n\t0\n"):
+		Some(function):
+			match function.statements:
+				[ExpressionStatement(statement)]:
+					match statement.base:
+						IfExpression(form):
+							form.then_block.value.is_none() and form.then_block.span.start == 32 and form.then_block.span.end == 44
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+-- A plain binding and a propagation interleave with other statements.
+pure func test_propagation_interleaves_with_bindings() -> Bool:
+	match main_function(HEADER + "\ta = 1\n\tb ?= find(a)\n\tprint(b)\n\tb\n"):
+		Some(function):
+			match function.statements:
+				[BindingStatement(_), PropagatingBinding(_), ExpressionStatement(_)]:
+					True
+				_:
+					False
+		None:
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 propagating binding syntax",
+	tests = [
+		("propagation keeps name, value and span", test_propagation_keeps_name_value_and_span),
+		("propagation may be annotated", test_propagation_may_be_annotated),
+		("propagation value may be indented or a block", test_propagation_value_may_be_indented_or_a_block),
+		("var cannot propagate", test_var_cannot_propagate),
+		("propagation line and value errors name the operator", test_propagation_line_and_value_errors_name_the_operator),
+		("propagation interleaves with bindings", test_propagation_interleaves_with_bindings),
+		("block ending in a propagation spans its value", test_block_ending_in_a_propagation_spans_its_value),
+	]
+}
