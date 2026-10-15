@@ -370,6 +370,25 @@ alters emitted C, before a bootstrap rotation picks it up. It needs a `FRESH`
 `--work-dir`). Exit status is 0 at a fixpoint, 1 when the stages differ, 2 when a
 stage could not be built.
 
+### Blorp 2 fixpoint
+
+`scripts/blorp2-fixpoint` is the same proof for the Blorp 2 pilot
+(`blorp_2/src`), strengthened per its self-compile plan: the host builds **A**,
+A builds **B**, B builds **C**, all linked at `-O2` through
+`make -C blorp_2 test-compiler` and `link-test-compiler` so the flags have one
+source. `--prove` requires B and C to emit byte-identical C for `blorp_2/src`
+(the first differing line is printed), A and B to agree on exit status, output
+and C for every e2e fixture, and B to pass the e2e suite
+(`make -C blorp_2 test-e2e BLORP2_COMPILER=...`); it exits 0 at the fixpoint,
+1 at the first failed stage with a one-line reason, 2 on a setup error.
+`--frontier` is the measurement: it reports how many files of `blorp_2/src`
+parse, as `blorp_2/test/unit/test_parse/test_source_tree` counts them, then
+the first rung of the same ladder that fails, and exits 0. Setup errors exit 2
+in both modes: a stage A build failure, or in `--frontier` a failing or
+count-less source-tree suite run. Artifacts, digests and `provenance.txt` are written
+under `blorp_2/build/fixpoint/`. The rungs and their meaning are in the
+script's `--help`.
+
 ## Static and hygiene checks
 
 `make quality` runs `hygiene-check`, `tooling-check`, `artifact-scan` and

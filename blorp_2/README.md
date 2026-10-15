@@ -2061,6 +2061,23 @@ are built at `-O0` without memory diagnostics. The host keeps its current build
 settings, currently CLI `-O0` and runtime `-O2`; read its recorded version before
 interpreting ratios. These fixture measurements do not establish self-compile
 performance or isolate an individual compiler phase.
+
+Self-compilation has one measurement and one gate, both in
+`scripts/blorp2-fixpoint` (details in [scripts/README.md](../scripts/README.md#blorp-2-fixpoint)):
+
+```bash
+scripts/blorp2-fixpoint --frontier   # files of src that parse, then the first failing stage; exits 0
+scripts/blorp2-fixpoint --prove      # A builds B, B builds C, all at -O2; B == C, A == B on every fixture, e2e under B
+```
+
+Both link every stage through this Makefile's `test-compiler` and
+`link-test-compiler` recipes and keep their artifacts and `provenance.txt`
+under `build/fixpoint/`. The parse count is the one
+[`test_parse/test_source_tree`](test/unit/test_parse/test_source_tree.brp)
+reports. If stage A (the host building the pilot) fails, or in `--frontier`
+that suite fails or prints no count, the script exits 2: that is a setup error,
+not a measurement.
+
 The macOS command-behavior suite is separate from portable compiler unit tests:
 
 ```bash
