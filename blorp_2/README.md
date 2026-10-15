@@ -742,6 +742,51 @@ still use ordinary C call depth, and managed values remain outside
 [increment report](../benchmarks/results/blorp_2_recursive_unary_2026-10-15.md).
 
 
+## Recursive data through records and Lists
+
+Every recursive shape the pilot's own source declares is now admitted: a
+union whose payload is a record holding the union, `List[Self]` payloads,
+mutual recursion between records and unions, record-only cycles, and a
+generic union such as `Maybe` applied to a recursive type. The
+[tree example](test/e2e/fixtures/recursive/tree.brp) walks and releases one:
+
+```blorp
+fixed record Expr { form: Form, span: Int }
+fixed union Form:
+    Leaf(Int)
+    Call(String, List[Expr])
+    Field(Expr, Int)
+```
+
+The rule is that the by-value storage graph is acyclic: a union stores each
+direct payload by value, including the payloads of an applied generic union's
+body (`Maybe[Node]` is checked as `Just(Node)`), while a record field, a List
+element and a non-generic union's one direct self payload are pointer edges
+that a cycle may pass through. Union-only cycles (`A(B)`, `B(A)`;
+`Node(Maybe[Node])`) and a generic declaration whose body applies itself to
+one of its parameters (`Tree[T]: Node(List[Tree[T]])`) are rejected at the
+written type that closes the cycle. A record on a cycle is managed and a union
+on one is owning; an uninhabited `record Node { next: Node }` is admitted
+without a warning, as the host admits it. Specialization reserves a layout
+group's identities while it is built and publishes complete rows only;
+identities stay in child-first order, so programs without recursion emit the
+same C as before.
+
+Each managed layout keeps a direct release helper that releases its children
+by calling their helpers, so the helpers of one recursive group call one
+another and release depth follows structure depth. Every record, List and
+boxed union helper is declared before any aggregate definition, and only
+storage by value orders definitions: the
+[group example](test/e2e/fixtures/recursive/group.brp) runs a union that
+stores a later union by value. The unary boxed chain keeps its iterative
+release. Releasing user data therefore has a depth limit: a self-linked record
+such as `record Node { value: Int, next: Option[Node] }` releases at most
+87,505 nodes on an 8 MiB stack and 5,584 on a 512 KiB thread stack when the
+generated C is built at `-O0` (262,520 and 16,760 at `-O2`). The
+[report](../benchmarks/results/blorp_2_recursive_mixed_2026-10-15.md) gives the
+full depth table and the nesting the pilot's own source reaches.
+
+
 ## Finite mixed records
 
 Fixed records can contain any currently supported finite concrete type, including
@@ -1196,10 +1241,11 @@ Semantic rules:
   concrete instances. This applies to unused declarations as well as called ones.
 - Recursive calls do not permit cyclic runtime data. Values remain immutable
   graphs of already constructed values; whole-binding reassignment cannot make
-  an existing value refer back to its replacement. A union may name itself as
-  one direct variant payload and is then stored boxed with an iterative final
-  release; mutual, generic and branching recursive declarations remain deferred
-  until their layouts and bounded-stack destruction are verified.
+  an existing value refer back to its replacement. Recursive declarations
+  through record fields, List elements and one direct self payload are
+  supported; their final release recurses through the group's helpers, while a
+  unary boxed chain is released iteratively. Union-only cycles and generic
+  self-reinstantiation remain deferred.
 - Generic declarations are checked once with distinct rigid type parameters, including
   unused bodies. An arbitrary `T` cannot return an Int literal or call a
   concrete Int/String runtime operation. Parameters cannot share a name with
@@ -1224,8 +1270,10 @@ Semantic rules:
   private variables and tentative facts never escape checking.
   Union instances are keyed by declaration and all ordered concrete arguments; repeated
   direct/UFCS requests reuse the same instance. Layout admission accepts finite
-  owning inline unions, managed records and boxed unary recursive unions before
-  lowering. Other recursive declaration forms remain unsupported.
+  owning inline unions, managed records, boxed unary recursive unions and
+  recursive layout groups through records and Lists before lowering.
+  Union-only cycles and self-reinstantiating generic declarations remain
+  unsupported.
 - Each concrete function has its checked C return type and a generated symbol based
   on its compilation-local identity. `Int` uses `int64_t`; each union uses its own
   synthetic enum when all its variants are nullary. A payload-bearing union
@@ -1255,7 +1303,7 @@ Semantic rules:
   are admitted before an ordinary terminating match. Each selected arm discharges
   prefix obligations after securing its result. Literal construction creates a
   fresh ordinary String owner. COW, joins and managed annotated loops are deferred.
-- Recursive layouts beyond a unary self-reference, nested and non-tail matches (they parse; checking rejects them),
+- Union-only recursive layouts, generic self-reinstantiation, nested and non-tail matches (they parse; checking rejects them),
   guards, qualified/nested/literal patterns, constructor UFCS,
   and function
   values are outside this increment. `Bool` is an ordinary fixed union declared

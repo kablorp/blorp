@@ -78,7 +78,7 @@ their own inventory and plan after M8.
 | [M2](#m2-the-join) | Blocks with parameters; non-tail match, `if`, `and`/`or`/`not`, `?=` | M2.1 in progress; M2.2 after M1b part B; M2.3 after M2.2 and M1b part B (designated `Result`). |
 | [M2b](#m2b-pattern-compilation) | Nested, or-, list and literal patterns | Not started. |
 | [M3](#m3-loops-and-tail-recursion) | Loops with managed carried values; `SelfTailLoop` retired | Not started. |
-| [M4](#m4-recursive-types) | Recursive types, release rule, opaque erasure | Step 1 done; step 2a in progress. |
+| [M4](#m4-recursive-types) | Recursive types, release rule, opaque erasure | Steps 1 and 2a done; 2b, 2c and opaque types remain. |
 | [M6](#m6-library-and-shell) | Library and shell per the parity table | Not started. |
 | [M7](#m7-lambdas) | Lambdas at known callees; function types | Not started. |
 | [M8](#m8-the-fixpoint-gate) | Fixpoint gate | Not started. |
@@ -489,7 +489,13 @@ recursive bindings, backpatching or lazy knot tying. **Scope.** Three steps:
    including mutual recursion within recursive layout groups; step 1's iterative
    chain release stays. A worklist release is a recorded potential optimisation,
    taken only if measured recursion depth or cost demands it. Admitting a shape
-   needs a measured release-depth table, not a bound proved in advance. Test
+   needs a measured release-depth table, not a bound proved in advance. Step
+   2a's table: a self-linked chain overflows at 75,003 levels on an 8 MiB stack
+   and 4,786 on 512 KiB (`-O0`), an alternating record/List chain at 58,335 and
+   3,722, against fewer than about 200 levels in the trees the pilot builds
+   from its own source. The worklist design is kept on branch
+   `blorp2/recursive-worklist-ref`; it is taken if data approaches that table
+   or release must run on small thread stacks. Test
    shared-tail diamonds, repeated slots, mixed inline owning children, all
    variants and deep branching teardown.
 
@@ -514,7 +520,11 @@ admitted shapes at the source's deepest nesting under `ulimit -s 512`; step 1's
 100,000-node chain still passes. See the
 [unary recursion report](../benchmarks/results/blorp_2_recursive_unary_2026-10-15.md).
 
-**Status.** Step 1 done. Step 2a in progress. Step 3 follows step 2.
+**Status.** Step 1 done. Step 2a done: non-generic recursion through record
+fields and `List` elements, released by recursive helpers; see the
+[recursive group report](../benchmarks/results/blorp_2_recursive_mixed_2026-10-15.md).
+Remaining: union-only cycles (2b), generic recursion through a declaration's
+own parameters (2c), and opaque types.
 
 ## M6: library and shell
 

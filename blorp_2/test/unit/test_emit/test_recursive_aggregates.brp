@@ -1,0 +1,153 @@
+import:
+	../../../src/utils/names: program_names
+	../../../src/emit/emit: emit
+	../../../src/lex/lex: lex
+	../../../src/lower/lower: lower
+	../../../src/own/own: own
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/specialize/specialize: specialize
+	../../../src/utils/syntax: Diagnostic
+	../../../src/verify/verify: VerifiedProgram, verify
+	../input: check, parse, setup_diagnostic
+	test: TestSuite
+
+
+-- A record and union recursive through each other and through a List.
+private TREE_SOURCE: String =
+	|fixed record Expr { form: Form, span: Int }
+	|fixed union Form:
+	|    Leaf(Int)
+	|    Call(String, List[Expr])
+	|    Field(Expr, Int)
+	|pure func make() -> Expr:
+	|    { form = Call("f", [{ form = Field({ form = Leaf(1), span = 1 }, 2), span = 3 }]), span = 4 }
+	|func main() -> Int:
+	|    unused = make()
+	|    0
+	|
+
+-- Entered at A, union B completes first: B (index 0) stores A (index 1) by
+-- value, so A must be defined before B although its index is higher.
+private GROUP_SOURCE: String =
+	|fixed union A:
+	|    X(R)
+	|    Done
+	|fixed record R { b: B }
+	|fixed union B:
+	|    Y(A)
+	|    Stop
+	|pure func make() -> A:
+	|    X({ b = Y(Done) })
+	|func main() -> Int:
+	|    unused = make()
+	|    0
+	|
+
+-- Entered at Links, inline union Kind (index 0) completes before the boxed
+-- union Links (index 1) that it stores by pointer, so Kind's helpers call
+-- Links' helpers before Links is defined.
+private KINDS_SOURCE: String =
+	|fixed union Links:
+	|    Done
+	|    Link(Holder, Links)
+	|fixed record Holder { kind: Kind }
+	|fixed union Kind:
+	|    Plain(Int)
+	|    Nested(Links)
+	|pure func make() -> Links:
+	|    Link({ kind = Nested(Done) }, Done)
+	|func main() -> Int:
+	|    unused = make()
+	|    0
+	|
+
+-- The group's release helpers call one another directly: the record
+-- releases its inline union, the union its List and record children, and
+-- the List each element.
+private RECORD_DROP: String =
+	"void blorp_record_drop_0(blorp_r_0 value){if(atomic_fetch_sub_explicit(&value->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;blorp_union_drop_0(value->blorp_rf_0_0);free(value);}"
+
+private FORM_DROP: String =
+	"void blorp_union_drop_0(struct blorp_u_0 value){switch(value.tag){case blorp_v_0_0:break;case blorp_v_0_1:blorp_string_release(value.payload.blorp_up_1.blorp_uf_0);blorp_list_drop_0_r0(value.payload.blorp_up_1.blorp_uf_1);break;case blorp_v_0_2:blorp_record_drop_0(value.payload.blorp_up_2.blorp_uf_0);break;}}"
+
+private LIST_DROP: String =
+	"void blorp_list_drop_0_r0(struct blorp_l_0_r0* value){if(atomic_fetch_sub_explicit(&value->references,1,memory_order_acq_rel)!=1)return;for(int64_t index=0;index<value->length;index++){blorp_r_0 element=value->values[index];(void)element;blorp_record_drop_0(element);}free(value);}"
+
+
+private pure func verified(source: String) -> Result[VerifiedProgram, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parsed ?= parse(tokens)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	lowered ?= specialize(checked).and_then(pure func(program): lower(program))
+	owned ?= own(lowered)
+	verify(owned)
+
+
+private pure func emitted(source: String) -> Result[String, Diagnostic]:
+	verified(source).and_then(emit)
+
+
+private pure func before(code: String, first: String, second: String) -> Bool:
+	match (code.index_of(first), code.index_of(second)):
+		(Some(left), Some(right)): left < right
+		_: False
+
+
+pure func test_record_and_list_prototypes_precede_every_aggregate_definition() -> Bool:
+	match emitted(TREE_SOURCE):
+		Err(_): False
+		Ok(code):
+			(
+				before(code, "void blorp_list_drop_0_r0(struct blorp_l_0_r0*);", "struct blorp_u_0{")
+				and before(code, "typedef struct blorp_r_0* blorp_r_0;void blorp_record_dup_0(blorp_r_0);void blorp_record_drop_0(blorp_r_0);", "struct blorp_u_0{")
+			)
+
+
+pure func test_group_release_helpers_call_each_other_directly() -> Bool:
+	match emitted(TREE_SOURCE):
+		Err(_): False
+		Ok(code):
+			(
+				code.contains(FORM_DROP)
+				and code.contains(RECORD_DROP)
+				and code.contains(LIST_DROP)
+				and before(code, FORM_DROP, "struct blorp_r_0{")
+			)
+
+
+-- The by-value walk owns definition order: A (index 1) is defined before
+-- B (index 0), which stores it by value, and R's typedef forward-declares
+-- the managed record that B reaches by pointer.
+pure func test_by_value_dependency_defines_a_higher_index_first() -> Bool:
+	match emitted(GROUP_SOURCE):
+		Err(_): False
+		Ok(code):
+			(
+				before(code, "struct blorp_u_1{", "struct blorp_u_0{")
+				and before(code, "struct blorp_u_0{", "struct blorp_r_0{")
+				and before(code, "typedef struct blorp_r_0* blorp_r_0;", "struct blorp_u_1{")
+				and code.contains("struct{struct blorp_u_1 blorp_uf_0;} blorp_up_0;")
+			)
+
+
+pure func test_boxed_union_helpers_are_declared_with_the_other_prototypes() -> Bool:
+	match emitted(KINDS_SOURCE):
+		Err(_): False
+		Ok(code):
+			(
+				code.contains("void blorp_record_drop_0(blorp_r_0);struct blorp_u_1;void blorp_union_dup_1(struct blorp_u_1*);void blorp_union_drop_1(struct blorp_u_1*);")
+				and before(code, "struct blorp_u_1;void blorp_union_dup_1(struct blorp_u_1*);", "struct blorp_u_0{")
+				and code.contains("case blorp_v_0_1:blorp_union_drop_1(value.payload.blorp_up_1.blorp_uf_0);break;")
+				and before(code, "void blorp_union_drop_0(struct blorp_u_0 value){", "struct blorp_u_1{")
+			)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 emission for recursive layout groups",
+	tests = [
+		("record and List prototypes precede every aggregate definition", test_record_and_list_prototypes_precede_every_aggregate_definition),
+		("group release helpers call each other directly", test_group_release_helpers_call_each_other_directly),
+		("by-value dependency defines a higher index first", test_by_value_dependency_defines_a_higher_index_first),
+		("boxed union helpers are declared with the other prototypes", test_boxed_union_helpers_are_declared_with_the_other_prototypes),
+	]
+}

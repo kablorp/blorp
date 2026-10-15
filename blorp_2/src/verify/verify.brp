@@ -587,25 +587,21 @@ private pure func valid_union_layout(
 
 							True
 						else:
-							valid = (
-								IntOps.greater_than_or_equal(union_number(id), 0)
-								and IntOps.less_than(union_number(id), position)
-							)
+							-- Any other layout in range: a boxed child is a pointer
+							-- edge, an inline child is stored by value, and the
+							-- layout graph walk below proves the by-value edges
+							-- acyclic. Definition order is the emitter's concern.
+							match unions.get(union_number(id)):
+								Some(child):
+									match child.representation:
+										InlineOwningPayload | BoxedRecursive:
+											owning = True
+										InlineUnmanaged:
+											void
 
-							if valid:
-								match unions.get(union_number(id)):
-									Some(child):
-										match child.representation:
-											InlineOwningPayload | BoxedRecursive:
-												owning = True
-											InlineUnmanaged:
-												void
-
-										True
-									None:
-										False
-							else:
-								False
+									True
+								None:
+									False
 					StringType:
 						owning = True
 						True
@@ -620,7 +616,7 @@ private pure func valid_union_layout(
 					invalid = Some(
 						failure(
 							span,
-							"union payload must reference a supported, earlier layout",
+							"union payload must reference a supported layout",
 						),
 					)
 					break
@@ -684,16 +680,34 @@ private pure func push_layout_visit(
 		steps.append(step)
 
 
-private pure func boxed_self_payload(layout: ConcreteUnion, index: Int, field: TypeRef) -> Bool:
-	match layout.representation:
-		BoxedRecursive:
-			match field:
-				UnionType(id): IntOps.equals(union_number(id), index)
-				_: False
-		InlineUnmanaged | InlineOwningPayload:
-			False
+private pure func list_terminal_presence(
+	element: TypeRef,
+	records: List[ConcreteRecord],
+	unions: List[ConcreteUnion],
+) -> Result[Void, Diagnostic]:
+	span: Span = { source = COMPILER_SOURCE, start = 0, end = 0 }
+	var terminal = element
+	while True:
+		match terminal:
+			ListType(inner): terminal = inner
+			_: break
+	match terminal:
+		RecordType(id):
+			match records.get(record_number(id)):
+				Some(_): Ok(void)
+				None: Err(failure(span, "unknown record layout"))
+		UnionType(id):
+			match unions.get(union_number(id)):
+				Some(_): Ok(void)
+				None: Err(failure(span, "unknown union layout"))
+		_:
+			Ok(void)
 
 
+-- The by-value storage graph of the layouts must be acyclic: every cycle
+-- passes through a managed record, a boxed union or a List, which the walk
+-- does not follow. Each layout is also walked as a root, and a record's
+-- storage summary is checked once its fields are known.
 private pure func verify_layout_graph(
 	records: List[ConcreteRecord],
 	unions: List[ConcreteUnion],
@@ -733,25 +747,48 @@ private pure func verify_layout_graph(
 			Some(step):
 				match step:
 					VisitStoredType(value_type):
+						-- Only storage by value continues the walk: an inline record
+						-- or inline union lies inside its parent. A managed record,
+						-- a boxed union, a List and a String are pointer edges, and
+						-- their layouts are walked as roots of their own.
 						match value_type:
 							RecordType(id):
-								pending = push_layout_visit(
-									pending,
-									pending_count,
-									VisitRecordLayout(record_number(id)),
-								)
-								pending_count = IntOps.add(pending_count, 1)
+								match records.get(record_number(id)):
+									None:
+										invalid = Some(failure(span, "unknown record layout"))
+									Some(child):
+										match child.representation:
+											InlineRecord:
+												pending = push_layout_visit(
+													pending,
+													pending_count,
+													VisitRecordLayout(record_number(id)),
+												)
+												pending_count = IntOps.add(pending_count, 1)
+											ManagedRecord:
+												void
 							UnionType(id):
-								pending = push_layout_visit(
-									pending,
-									pending_count,
-									VisitUnionLayout(union_number(id)),
-								)
-								pending_count = IntOps.add(pending_count, 1)
+								match unions.get(union_number(id)):
+									None:
+										invalid = Some(failure(span, "unknown union layout"))
+									Some(child):
+										match child.representation:
+											InlineUnmanaged | InlineOwningPayload:
+												pending = push_layout_visit(
+													pending,
+													pending_count,
+													VisitUnionLayout(union_number(id)),
+												)
+												pending_count = IntOps.add(pending_count, 1)
+											BoxedRecursive:
+												void
 							ListType(element):
-								pending = push_layout_visit(pending, pending_count, VisitStoredType(element))
-								pending_count = IntOps.add(pending_count, 1)
-							_:
+								-- A pointer edge whose target must exist; its layout is
+								-- walked as a root of its own, not from here.
+								match list_terminal_presence(element, records, unions):
+									Ok(_): void
+									Err(error): invalid = Some(error)
+							VoidType | IntType | FloatType | StringType:
 								void
 					VisitRecordLayout(index):
 						match record_visits.get(index):
@@ -763,7 +800,7 @@ private pure func verify_layout_graph(
 								invalid = Some(
 									failure(
 										span,
-										"recursive aggregate layout is unsupported",
+										"aggregate layouts form a by-value cycle",
 									),
 								)
 							Some(UnvisitedLayout):
@@ -809,7 +846,7 @@ private pure func verify_layout_graph(
 								invalid = Some(
 									failure(
 										span,
-										"recursive aggregate layout is unsupported",
+										"aggregate layouts form a by-value cycle",
 									),
 								)
 							Some(UnvisitedLayout):
@@ -836,14 +873,8 @@ private pure func verify_layout_graph(
 														field_position = IntOps.subtract(field_position, 1)
 														match fields.get(field_position):
 															Some(field):
-																-- A boxed layout's own payload is a pointer edge,
-																-- not a storage dependency; per-layout checks
-																-- have already tied it to the boxed representation.
-																if boxed_self_payload(layout, index, field):
-																	void
-																else:
-																	pending = push_layout_visit(pending, pending_count, VisitStoredType(field))
-																	pending_count = IntOps.add(pending_count, 1)
+																pending = push_layout_visit(pending, pending_count, VisitStoredType(field))
+																pending_count = IntOps.add(pending_count, 1)
 															None:
 																invalid = Some(failure(span, "invalid aggregate layout traversal state"))
 																break

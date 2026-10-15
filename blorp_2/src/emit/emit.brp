@@ -508,6 +508,30 @@ private pure func push_aggregate_visit(
 		steps.append(step)
 
 
+-- Whether a stored type must be defined before its parent: only storage by
+-- value (an inline record or inline union) is a definition dependency. A
+-- managed record, a boxed union and a List are pointers to forward-declared
+-- types, which is what lets a layout group refer back to itself.
+private pure func stored_by_value(value_type: TypeRef, records: List[ConcreteRecord], unions: List[ConcreteUnion]) -> Option[AggregateDefinition]:
+	match value_type:
+		RecordType(id):
+			match records.get(record_number(id)):
+				Some(layout):
+					match layout.representation:
+						InlineRecord: Some(RecordDefinition(record_number(id)))
+						ManagedRecord: None
+				None: None
+		UnionType(id):
+			match unions.get(union_number(id)):
+				Some(layout):
+					match layout.representation:
+						InlineUnmanaged | InlineOwningPayload: Some(UnionDefinition(union_number(id)))
+						BoxedRecursive: None
+				None: None
+		_:
+			None
+
+
 private pure func append_aggregate_definitions(
 	records: List[ConcreteRecord],
 	unions: List[ConcreteUnion],
@@ -587,36 +611,13 @@ private pure func append_aggregate_definitions(
 													child = IntOps.subtract(child, 1)
 
 													match layout.fields.get(child):
-														Some(RecordType(id)):
-															pending = push_aggregate_visit(
-																pending,
-																pending_count,
-																PrepareAggregate(
-																	RecordDefinition(
-																		record_number(id),
-																	),
-																),
-															)
-															pending_count = IntOps.add(
-																pending_count,
-																1,
-															)
-														Some(UnionType(id)):
-															pending = push_aggregate_visit(
-																pending,
-																pending_count,
-																PrepareAggregate(
-																	UnionDefinition(
-																		union_number(id),
-																	),
-																),
-															)
-															pending_count = IntOps.add(
-																pending_count,
-																1,
-															)
-														Some(_):
-															void
+														Some(field):
+															match stored_by_value(field, records, unions):
+																Some(dependency):
+																	pending = push_aggregate_visit(pending, pending_count, PrepareAggregate(dependency))
+																	pending_count = IntOps.add(pending_count, 1)
+																None:
+																	void
 														None:
 															invalid = Some(internal_error())
 															break
@@ -638,18 +639,13 @@ private pure func append_aggregate_definitions(
 															while IntOps.greater_than(field_position, 0):
 																field_position = IntOps.subtract(field_position, 1)
 																match fields.get(field_position):
-																	Some(RecordType(id)):
-																		pending = push_aggregate_visit(pending, pending_count, PrepareAggregate(RecordDefinition(record_number(id))))
-																		pending_count = IntOps.add(pending_count, 1)
-																	Some(UnionType(id)):
-																		-- A verified self payload is a pointer into the
-																		-- definition being emitted, not a dependency.
-																		if IntOps.equals(union_number(id), index):
-																			void
-																		else:
-																			pending = push_aggregate_visit(pending, pending_count, PrepareAggregate(UnionDefinition(union_number(id))))
-																			pending_count = IntOps.add(pending_count, 1)
-																	Some(_): void
+																	Some(field):
+																		match stored_by_value(field, records, unions):
+																			Some(dependency):
+																				pending = push_aggregate_visit(pending, pending_count, PrepareAggregate(dependency))
+																				pending_count = IntOps.add(pending_count, 1)
+																			None:
+																				void
 																	None:
 																		invalid = Some(internal_error())
 																		break
@@ -1493,6 +1489,29 @@ private pure func append_boxed_union_retain(output: String, index: Int) -> Strin
 		.concat("(")
 		.concat(boxed_union_struct(index))
 		.concat("* value){(void)atomic_fetch_add_explicit(&value->references,UINT64_C(1),memory_order_relaxed);}")
+
+
+-- A boxed union is stored by pointer, so any layout may retain and release
+-- it before its definition; its tag and helpers are declared up front with
+-- the record and List prototypes.
+private pure func append_boxed_union_prototypes(output: String, unions: List[ConcreteUnion]) -> String:
+	var fragments: List[String] = [output]
+	var index = 0
+
+	for layout in unions:
+		match layout.representation:
+			BoxedRecursive:
+				node = boxed_union_struct(index)
+				fragments = fragments.append(
+					node.concat(";void blorp_union_dup_").append_int(index).concat("(").concat(node)
+						.concat("*);void blorp_union_drop_").append_int(index).concat("(").concat(node).concat("*);"),
+				)
+			InlineUnmanaged | InlineOwningPayload:
+				void
+
+		index = IntOps.add(index, 1)
+
+	fragments.join("")
 
 
 -- Final release walks the chain instead of recursing: a node whose count
@@ -2367,6 +2386,7 @@ private pure func aggregate_runtime_contents(
 		fragments = fragments.append(append_record_prototypes("", index))
 		index = IntOps.add(index, 1)
 
+	fragments = fragments.append(append_boxed_union_prototypes("", checked.unions))
 	fragments = fragments.append(ordered)
 	index = 0
 	var failure: Option[Diagnostic] = None

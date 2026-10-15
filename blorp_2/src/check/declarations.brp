@@ -39,7 +39,7 @@ import:
 		parameter_position,
 		primitive_ref,
 		same_owner,
-		same_type,
+		same_types,
 		type_parameter_id,
 	../utils/ids:
 		RecordRow,
@@ -607,19 +607,76 @@ private pure func substitute_types(
 			)
 
 
-private fixed union DeclarationVisit:
-	UnvisitedDeclaration
-	VisitingDeclaration
-	CompleteDeclaration
+-- One instance on the by-value walk: a union declaration at the checked type
+-- arguments its body is expanded with. Visiting is per instance, so
+-- `Option[Option[Int]]` expands Option twice without closing a cycle.
+private fixed record UnionInstanceVisit {
+	declaration: UnionId,
+	arguments: List[TypeRef]
+}
+
+
+private pure func same_instance_visit(left: UnionInstanceVisit, right: UnionInstanceVisit) -> Bool:
+	IntOps.equals(union_number(left.declaration), union_number(right.declaration)) and same_types(left.arguments, right.arguments)
+
+
+private pure func contains_instance_visit(visits: List[UnionInstanceVisit], visit: UnionInstanceVisit) -> Bool:
+	var found = False
+
+	for known in visits:
+		if same_instance_visit(known, visit):
+			found = True
+			break
+
+	found
+
+
+-- The instances already proven finite, as argument lists grouped by union
+-- declaration, so a lookup compares only that declaration's instances.
+private pure func no_completed_instances(count: Int) -> List[List[List[TypeRef]]]:
+	var result: List[List[List[TypeRef]]] = []
+	var remaining = count
+
+	while IntOps.greater_than(remaining, 0):
+		result = result.append([])
+		remaining = IntOps.subtract(remaining, 1)
+
+	result
+
+
+private pure func completed_instance(completed: List[List[List[TypeRef]]], instance: UnionInstanceVisit) -> Bool:
+	var found = False
+
+	match completed.get(union_number(instance.declaration)):
+		Some(instances):
+			for arguments in instances:
+				if same_types(arguments, instance.arguments):
+					found = True
+					break
+		None:
+			void
+
+	found
 
 
 private fixed union DeclarationVisitStep:
 	VisitDeclaredType(TypeUse)
-	-- A written payload field of the named union's own variant: the one
-	-- position where a reference back to that union is a supported shape.
+	-- A written payload field of the named union instance's own variant,
+	-- already substituted with the instance arguments: the one position
+	-- where a reference back to that union is a supported shape.
 	VisitVariantPayload(UnionId, TypeUse)
-	FinishRecordDeclaration(RecordId)
-	FinishUnionDeclaration(UnionId)
+	-- A union declaration walked at its own parameters (rigid for a
+	-- generic declaration, none otherwise).
+	VisitUnionRoot(UnionId)
+	FinishUnionInstance
+
+
+-- Where a payload of an expanded union body is reported if it closes a
+-- cycle: at its own written span inside the declaration, or at the written
+-- application that entered the body.
+private fixed union PayloadSpan:
+	WrittenSpan
+	ApplicationSpan(Span)
 
 
 private pure func push_declaration_visit(
@@ -631,6 +688,249 @@ private pure func push_declaration_visit(
 		steps.set(depth, step)
 	else:
 		steps.append(step)
+
+
+private pure func push_type_use(steps: List[TypeUse], depth: Int, step: TypeUse) -> List[TypeUse]:
+	if IntOps.less_than(depth, steps.length()):
+		steps.set(depth, step)
+	else:
+		steps.append(step)
+
+
+private pure func contains_parameter(value_type: TypeRef) -> Bool:
+	match value_type:
+		ParameterType(_):
+			True
+		ListType(element):
+			contains_parameter(element)
+		AppliedRecordType(_, arguments):
+			arguments.any(contains_parameter)
+		AppliedUnionType(_, arguments):
+			arguments.any(contains_parameter)
+		_:
+			False
+
+
+-- The declaration a written type names, whether applied or bare.
+private fixed union NamedDeclaration:
+	NamedRecord(RecordId)
+	NamedUnion(UnionId)
+	NoNamedDeclaration
+
+
+private pure func named_declaration(value_type: TypeRef) -> NamedDeclaration:
+	match value_type:
+		RecordType(id): NamedRecord(id)
+		AppliedRecordType(id, _): NamedRecord(id)
+		UnionType(id): NamedUnion(id)
+		AppliedUnionType(id, _): NamedUnion(id)
+		_: NoNamedDeclaration
+
+
+private pure func unset_flags(count: Int) -> List[Bool]:
+	var result: List[Bool] = []
+	var remaining = count
+
+	while IntOps.greater_than(remaining, 0):
+		result = result.append(False)
+		remaining = IntOps.subtract(remaining, 1)
+
+	result
+
+
+private fixed union GenericCycleRoot:
+	GenericUnionRoot(UnionId)
+	GenericRecordRoot(RecordId)
+
+
+-- The parameters of a declaration as the rigid arguments it is walked at.
+private pure func rigid_arguments(parameters: List[TypeParameterId]) -> List[TypeRef]:
+	var arguments: List[TypeRef] = []
+
+	for parameter in parameters:
+		arguments = arguments.append(ParameterType(parameter))
+
+	arguments
+
+
+-- The written field types of a generic root, with their own spans.
+private pure func root_fields(root: GenericCycleRoot, declarations: CheckedDeclarations) -> Result[List[TypeUse], CheckError]:
+	origin: Span = { source = COMPILER_SOURCE, start = 0, end = 0 }
+
+	match root:
+		GenericUnionRoot(id):
+			declaration ?= declarations.unions.get(union_number(id)).to_result(checker_invariant(origin, InvalidUnionDeclaration(id)))
+			var fields: List[TypeUse] = []
+
+			for variant in declaration.variants:
+				fields = fields.concat(variant.fields)
+
+			Ok(fields)
+		GenericRecordRoot(id):
+			declaration ?= declarations.records.get(record_number(id)).to_result(checker_invariant(origin, InvalidRecordDeclaration(id)))
+			var fields: List[TypeUse] = []
+
+			for field in declaration.fields:
+				fields = fields.append(field.value_type)
+
+			Ok(fields)
+
+
+-- Every generic declaration, each the root of one reinstantiation walk.
+private pure func generic_roots(declarations: CheckedDeclarations) -> List[GenericCycleRoot]:
+	var roots: List[GenericCycleRoot] = []
+
+	for declaration in declarations.unions:
+		if not declaration.type_parameters.is_empty():
+			roots = roots.append(GenericUnionRoot(declaration.id))
+
+	for declaration in declarations.records:
+		if not declaration.type_parameters.is_empty():
+			roots = roots.append(GenericRecordRoot(declaration.id))
+
+	roots
+
+
+-- Whether this written type applies the generic root to one of its own
+-- parameters again: the recursion that could instantiate without bound.
+private pure func reinstantiates_root(value_type: TypeRef, root: GenericCycleRoot) -> Bool:
+	match root:
+		GenericUnionRoot(id):
+			match value_type:
+				AppliedUnionType(other, arguments):
+					IntOps.equals(union_number(other), union_number(id)) and arguments.any(contains_parameter)
+				_: False
+		GenericRecordRoot(id):
+			match value_type:
+				AppliedRecordType(other, arguments):
+					IntOps.equals(record_number(other), record_number(id)) and arguments.any(contains_parameter)
+				_: False
+
+
+-- Walks every edge (payloads, fields, List elements, applied heads and
+-- arguments) reachable from one generic declaration's body, expanding each
+-- declaration once, and reports the written type that applies the root to a
+-- parameter again. Pointer edges are followed: `Tree[T]` behind a List is
+-- still unbounded.
+private pure func generic_reinstantiation_edge(
+	root: GenericCycleRoot,
+	declarations: CheckedDeclarations,
+) -> Result[Option[TypeUse], CheckError]:
+	var union_expanded = unset_flags(declarations.unions.length())
+	var record_expanded = unset_flags(declarations.records.length())
+	var pending: List[TypeUse] = []
+	var pending_count = 0
+	var closing: Option[TypeUse] = None
+	var failure: Option[CheckError] = None
+	origin: Span = { source = COMPILER_SOURCE, start = 0, end = 0 }
+
+	-- The root's own fields are the walk's seeds at their written spans; a
+	-- declaration reached from them is expanded by the shared step below at
+	-- the span of the root's written type that reached it.
+	match root:
+		GenericUnionRoot(id):
+			union_expanded = union_expanded.set(union_number(id), True)
+		GenericRecordRoot(id):
+			record_expanded = record_expanded.set(record_number(id), True)
+
+	match root_fields(root, declarations):
+		Err(error):
+			failure = Some(error)
+		Ok(fields):
+			for field in fields:
+				pending = push_type_use(pending, pending_count, field)
+				pending_count = IntOps.add(pending_count, 1)
+
+	while IntOps.greater_than(pending_count, 0) and not failure.is_some() and not closing.is_some():
+		pending_count = IntOps.subtract(pending_count, 1)
+
+		match pending.get(pending_count):
+			None:
+				failure = Some(checker_invariant(origin, InvalidDeclarationVisit))
+			Some(annotation):
+				if reinstantiates_root(annotation.value_type, root):
+					closing = Some(annotation)
+				else:
+					match annotation.value_type:
+						VoidType | IntType | FloatType | StringType | ParameterType(_):
+							void
+						ListType(element):
+							pending = push_type_use(pending, pending_count, { annotation | value_type = element })
+							pending_count = IntOps.add(pending_count, 1)
+						AppliedRecordType(_, arguments):
+							for argument in arguments:
+								pending = push_type_use(pending, pending_count, { annotation | value_type = argument })
+								pending_count = IntOps.add(pending_count, 1)
+						AppliedUnionType(_, arguments):
+							for argument in arguments:
+								pending = push_type_use(pending, pending_count, { annotation | value_type = argument })
+								pending_count = IntOps.add(pending_count, 1)
+						RecordType(_) | UnionType(_):
+							void
+
+					match named_declaration(annotation.value_type):
+						NamedRecord(id):
+							match record_expanded.get(record_number(id)):
+								Some(False):
+									record_expanded = record_expanded.set(record_number(id), True)
+									match declarations.records.get(record_number(id)):
+										None:
+											failure = Some(checker_invariant(annotation.span, InvalidRecordDeclaration(id)))
+										Some(declaration):
+											for field in declaration.fields:
+												pending = push_type_use(pending, pending_count, { annotation | value_type = field.value_type.value_type })
+												pending_count = IntOps.add(pending_count, 1)
+								Some(True):
+									void
+								None:
+									failure = Some(checker_invariant(annotation.span, InvalidRecordDeclaration(id)))
+						NamedUnion(id):
+							match union_expanded.get(union_number(id)):
+								Some(False):
+									union_expanded = union_expanded.set(union_number(id), True)
+									match declarations.unions.get(union_number(id)):
+										None:
+											failure = Some(checker_invariant(annotation.span, InvalidUnionDeclaration(id)))
+										Some(declaration):
+											for variant in declaration.variants:
+												for field in variant.fields:
+													pending = push_type_use(pending, pending_count, { annotation | value_type = field.value_type })
+													pending_count = IntOps.add(pending_count, 1)
+								Some(True):
+									void
+								None:
+									failure = Some(checker_invariant(annotation.span, InvalidUnionDeclaration(id)))
+						NoNamedDeclaration:
+							void
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(closing)
+
+
+-- A generic declaration whose body reaches an application of itself to one
+-- of its parameters is deferred (recursive data step 2c) and rejected at the
+-- written type that closes that cycle. A generic declaration elsewhere on a
+-- cycle, such as `Option` in `record Node { next: Option[Node] }`, is not on
+-- that cycle through its own body and is admitted.
+private pure func validate_generic_cycles(declarations: CheckedDeclarations) -> Result[Void, CheckError]:
+	var failure: Option[CheckError] = None
+
+	for root in generic_roots(declarations):
+		match generic_reinstantiation_edge(root, declarations):
+			Err(error):
+				failure = Some(error)
+			Ok(Some(closing)):
+				failure = Some(type_declaration_error(closing.span, RecursiveAggregateType(closing.value_type)))
+			Ok(None):
+				void
+
+		if failure.is_some():
+			break
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
 
 
 -- A unary recursive union stores at most one self-reference per variant, so
@@ -655,303 +955,214 @@ private pure func repeated_self_payload(owner: UnionId, fields: List[TypeUse]) -
 	repeated
 
 
--- Every declared aggregate must have a finite layout. The only admitted
--- recursion is a union naming itself as one direct payload of a variant; it
--- is stored boxed later. Recursion through a record, a List, a type
--- argument, another aggregate, or twice in one variant is rejected.
+-- Every declared aggregate must have a finite layout: the by-value storage
+-- graph must be acyclic. A union instance stores each direct payload by
+-- value, including the payloads of an applied generic union's body at its
+-- arguments; a record field, a List element and a non-generic union's one
+-- direct self payload (stored boxed later) are pointer edges a cycle may pass
+-- through. A record on a cycle is always managed, so records need no visit.
+-- A union-only cycle, two self payloads in one variant, and a generic
+-- declaration reinstantiating itself are rejected.
 pure func validate_finite_declarations(
 	declarations: CheckedDeclarations,
 ) -> Result[Void, CheckError]:
+	generic ?= validate_generic_cycles(declarations)
 	-- These vectors stay in one local builder. Passing them through a shared
 	-- record would retain their old roots and copy the entire vector on set.
-	var records = declarations.records.map(pure func(_): UnvisitedDeclaration)
-	var unions = declarations.unions.map(pure func(_): UnvisitedDeclaration)
+	var visiting: List[UnionInstanceVisit] = []
+	var completed = no_completed_instances(declarations.unions.length())
 	var pending: List[DeclarationVisitStep] = []
 	var pending_count = 0
 	var failure: Option[CheckError] = None
-	-- The pending worklist is LIFO: seed unions first so records still visit
-	-- before unions, with both inventories visited in declaration order.
-	var position = declarations.unions.length()
+	origin: Span = { source = COMPILER_SOURCE, start = 0, end = 0 }
+	-- Roots are walked one at a time with an empty path, in declaration
+	-- order: every union at its own parameters (so a generic body's own
+	-- instances are checked whether or not another declaration applies it),
+	-- every record field, and every type found behind a pointer edge (a List
+	-- element, an applied record's arguments), which must itself be finite
+	-- but is not stored by value where it was found. The reinstantiation pass
+	-- ran first, so the instances a generic body reaches stay finite.
+	var roots: List[DeclarationVisitStep] = []
 
-	while IntOps.greater_than(position, 0):
-		position = IntOps.subtract(position, 1)
-		match declarations.unions.get(position):
-			None:
-				failure = Some(checker_invariant({ source = COMPILER_SOURCE, start = 0, end = 0 }, InvalidDeclarationVisit))
-			Some(declaration):
-				pending = push_declaration_visit(
-					pending,
-					pending_count,
-					VisitDeclaredType({
-						value_type = UnionType(declaration.id),
-						span = { source = COMPILER_SOURCE, start = 0, end = 0 },
-					}),
-				)
-				pending_count = IntOps.add(pending_count, 1)
+	for declaration in declarations.unions:
+		roots = roots.append(VisitUnionRoot(declaration.id))
 
-	position = declarations.records.length()
+	for declaration in declarations.records:
+		for field in declaration.fields:
+			roots = roots.append(VisitDeclaredType(field.value_type))
 
-	while IntOps.greater_than(position, 0):
-		position = IntOps.subtract(position, 1)
-		match declarations.records.get(position):
-			None:
-				failure = Some(checker_invariant({ source = COMPILER_SOURCE, start = 0, end = 0 }, InvalidDeclarationVisit))
-			Some(declaration):
-				pending = push_declaration_visit(
-					pending,
-					pending_count,
-					VisitDeclaredType({
-						value_type = RecordType(declaration.id),
-						span = {
-							source = COMPILER_SOURCE,
-							start = 0,
-							end = 0
-						},
-					}),
-				)
-				pending_count = IntOps.add(pending_count, 1)
+	var next_root = 0
 
-	while IntOps.greater_than(pending_count, 0) and not failure.is_some():
-		pending_count = IntOps.subtract(pending_count, 1)
+	while (IntOps.less_than(next_root, roots.length()) or IntOps.greater_than(pending_count, 0)) and not failure.is_some():
+		if IntOps.equals(pending_count, 0):
+			match roots.get(next_root):
+				None:
+					failure = Some(checker_invariant(origin, InvalidDeclarationVisit))
+				Some(root):
+					pending = push_declaration_visit(pending, pending_count, root)
+					pending_count = IntOps.add(pending_count, 1)
 
-		match pending.get(pending_count):
-			None:
-				failure = Some(
-					checker_invariant(
-						{
-							source = COMPILER_SOURCE,
-							start = 0,
-							end = 0
-						},
-						InvalidDeclarationVisit,
-					),
-				)
-			Some(step):
-				match step:
-					FinishRecordDeclaration(id):
-						records = records.set(record_number(id), CompleteDeclaration)
-					FinishUnionDeclaration(id):
-						unions = unions.set(union_number(id), CompleteDeclaration)
-					VisitVariantPayload(owner, annotation):
-						-- The admitted direct self-reference needs no visit; a bare
-						-- union name resolves only for a non-generic declaration.
-						admitted = match annotation.value_type:
-							UnionType(id): IntOps.equals(union_number(id), union_number(owner))
-							_: False
+			next_root = IntOps.add(next_root, 1)
 
-						if not admitted:
-							pending = push_declaration_visit(pending, pending_count, VisitDeclaredType(annotation))
-							pending_count = IntOps.add(pending_count, 1)
-					VisitDeclaredType(annotation):
-						match annotation.value_type:
-							VoidType | IntType | FloatType | StringType | ParameterType(_):
-								void
-							ListType(element):
-								pending = push_declaration_visit(
-									pending,
-									pending_count,
-									VisitDeclaredType({ annotation | value_type = element }),
-								)
-								pending_count = IntOps.add(pending_count, 1)
-							AppliedRecordType(id, arguments):
-								pending = push_declaration_visit(
-									pending,
-									pending_count,
-									VisitDeclaredType({ annotation | value_type = RecordType(id) }),
-								)
-								pending_count = IntOps.add(pending_count, 1)
-								var index = arguments.length()
+		while IntOps.greater_than(pending_count, 0) and not failure.is_some():
+			pending_count = IntOps.subtract(pending_count, 1)
 
-								while IntOps.greater_than(index, 0):
-									index = IntOps.subtract(index, 1)
-
-									match arguments.get(index):
-										Some(argument):
-											pending = push_declaration_visit(
-												pending,
-												pending_count,
-												VisitDeclaredType(
-													{ annotation | value_type = argument },
-												),
-											)
-											pending_count = IntOps.add(pending_count, 1)
+			match pending.get(pending_count):
+				None:
+					failure = Some(checker_invariant(origin, InvalidDeclarationVisit))
+				Some(step):
+					match step:
+						FinishUnionInstance:
+							last = IntOps.subtract(visiting.length(), 1)
+							match visiting.get(last):
+								Some(instance):
+									number = union_number(instance.declaration)
+									match completed.get(number):
+										Some(instances):
+											completed = completed.set(number, instances.append(instance.arguments))
 										None:
-											failure = Some(
-												checker_invariant(
-													annotation.span,
-													InvalidDeclarationVisit,
-												),
-											)
-											break
-							AppliedUnionType(id, arguments):
-								pending = push_declaration_visit(
-									pending,
-									pending_count,
-									VisitDeclaredType({ annotation | value_type = UnionType(id) }),
-								)
-								pending_count = IntOps.add(pending_count, 1)
-								var index = arguments.length()
-
-								while IntOps.greater_than(index, 0):
-									index = IntOps.subtract(index, 1)
-
-									match arguments.get(index):
-										Some(argument):
-											pending = push_declaration_visit(
-												pending,
-												pending_count,
-												VisitDeclaredType(
-													{ annotation | value_type = argument },
-												),
-											)
-											pending_count = IntOps.add(pending_count, 1)
+											failure = Some(checker_invariant(origin, InvalidUnionDeclaration(instance.declaration)))
+									match visiting.remove(last):
+										Some(rest):
+											visiting = rest
 										None:
-											failure = Some(
-												checker_invariant(
-													annotation.span,
-													InvalidDeclarationVisit,
-												),
-											)
-											break
-							RecordType(id):
-								match records.get(record_number(id)):
-									None:
-										failure = Some(
-											checker_invariant(
-												annotation.span,
-												InvalidRecordDeclaration(id),
-											),
-										)
-									Some(CompleteDeclaration):
-										void
-									Some(VisitingDeclaration):
-										failure = Some(
-											type_declaration_error(
-												annotation.span,
-												RecursiveAggregateType(annotation.value_type),
-											),
-										)
-									Some(UnvisitedDeclaration):
-										match declarations.records.get(record_number(id)):
-											None:
-												failure = Some(
-													checker_invariant(
-														annotation.span,
-														InvalidRecordDeclaration(id),
-													),
-												)
-											Some(declaration):
-												records = records.set(
-													record_number(id),
-													VisitingDeclaration,
-												)
-												pending = push_declaration_visit(
-													pending,
-													pending_count,
-													FinishRecordDeclaration(id),
-												)
-												pending_count = IntOps.add(pending_count, 1)
-												var index = declaration.fields.length()
+											failure = Some(checker_invariant(origin, InvalidDeclarationVisit))
+								None:
+									failure = Some(checker_invariant(origin, InvalidDeclarationVisit))
+						VisitUnionRoot(id):
+							-- The root starts an empty path, so its own annotation is never
+							-- reported; its payloads are reported at their written spans.
+							match declarations.unions.get(union_number(id)):
+								None:
+									failure = Some(checker_invariant(origin, InvalidUnionDeclaration(id)))
+								Some(declaration):
+									instance: UnionInstanceVisit = { declaration = id, arguments = rigid_arguments(declaration.type_parameters) }
+									match expand_union_instance(instance, { value_type = UnionType(id), span = origin }, WrittenSpan, declarations, visiting, completed, pending, pending_count):
+										Err(error):
+											failure = Some(error)
+										Ok(expanded):
+											visiting = expanded.visiting
+											pending = expanded.pending
+											pending_count = expanded.pending_count
+						VisitVariantPayload(owner, annotation):
+							-- The admitted direct self-reference needs no visit; a bare
+							-- union name resolves only for a non-generic declaration.
+							admitted = match annotation.value_type:
+								UnionType(id): IntOps.equals(union_number(id), union_number(owner))
+								_: False
 
-												while IntOps.greater_than(index, 0):
-													index = IntOps.subtract(index, 1)
-
-													match declaration.fields.get(index):
-														Some(field):
-															pending = push_declaration_visit(
-																pending,
-																pending_count,
-																VisitDeclaredType(field.value_type),
-															)
-															pending_count = IntOps.add(
-																pending_count,
-																1,
-															)
-														None:
-															failure = Some(
-																checker_invariant(
-																	annotation.span,
-																	InvalidDeclarationVisit,
-																),
-															)
-															break
-							UnionType(id):
-								match unions.get(union_number(id)):
-									None:
-										failure = Some(
-											checker_invariant(
-												annotation.span,
-												InvalidUnionDeclaration(id),
-											),
-										)
-									Some(CompleteDeclaration):
-										void
-									Some(VisitingDeclaration):
-										failure = Some(
-											type_declaration_error(
-												annotation.span,
-												RecursiveAggregateType(annotation.value_type),
-											),
-										)
-									Some(UnvisitedDeclaration):
-										match declarations.unions.get(union_number(id)):
-											None:
-												failure = Some(
-													checker_invariant(
-														annotation.span,
-														InvalidUnionDeclaration(id),
-													),
-												)
-											Some(declaration):
-												unions = unions.set(
-													union_number(id),
-													VisitingDeclaration,
-												)
-												pending = push_declaration_visit(
-													pending,
-													pending_count,
-													FinishUnionDeclaration(id),
-												)
-												pending_count = IntOps.add(pending_count, 1)
-												var index = declaration.variants.length()
-
-												while IntOps.greater_than(index, 0):
-													index = IntOps.subtract(index, 1)
-
-													match declaration.variants.get(index):
-														Some(variant):
-															match repeated_self_payload(id, variant.fields):
-																Some(repeated):
-																	failure = Some(
-																		type_declaration_error(
-																			repeated.span,
-																			RecursiveAggregateType(repeated.value_type),
-																		),
-																	)
-																	break
-																None:
-																	void
-															var field_position = variant.fields.length()
-															while IntOps.greater_than(field_position, 0):
-																field_position = IntOps.subtract(field_position, 1)
-																match variant.fields.get(field_position):
-																	Some(field):
-																		pending = push_declaration_visit(pending, pending_count, VisitVariantPayload(id, field))
-																		pending_count = IntOps.add(pending_count, 1)
-																	None:
-																		failure = Some(checker_invariant(annotation.span, InvalidDeclarationVisit))
-																		break
-														None:
-															failure = Some(
-																checker_invariant(
-																	annotation.span,
-																	InvalidDeclarationVisit,
-																),
-															)
-															break
+							if not admitted:
+								pending = push_declaration_visit(pending, pending_count, VisitDeclaredType(annotation))
+								pending_count = IntOps.add(pending_count, 1)
+						VisitDeclaredType(annotation):
+							match annotation.value_type:
+								VoidType | IntType | FloatType | StringType | ParameterType(_):
+									void
+								RecordType(_):
+									void
+								ListType(element):
+									roots = roots.append(VisitDeclaredType({ annotation | value_type = element }))
+								AppliedRecordType(_, arguments):
+									for argument in arguments:
+										roots = roots.append(VisitDeclaredType({ annotation | value_type = argument }))
+								UnionType(id):
+									match expand_union_instance({ declaration = id, arguments = [] }, annotation, WrittenSpan, declarations, visiting, completed, pending, pending_count):
+										Err(error):
+											failure = Some(error)
+										Ok(expanded):
+											visiting = expanded.visiting
+											pending = expanded.pending
+											pending_count = expanded.pending_count
+								AppliedUnionType(id, arguments):
+									match expand_union_instance({ declaration = id, arguments = arguments }, annotation, ApplicationSpan(annotation.span), declarations, visiting, completed, pending, pending_count):
+										Err(error):
+											failure = Some(error)
+										Ok(expanded):
+											visiting = expanded.visiting
+											pending = expanded.pending
+											pending_count = expanded.pending_count
 
 	match failure:
 		Some(error):
 			Err(error)
 		None:
 			Ok(void)
+
+
+private fixed record ExpandedInstance {
+	visiting: List[UnionInstanceVisit],
+	pending: List[DeclarationVisitStep],
+	pending_count: Int
+}
+
+
+-- Enters one union instance on the by-value walk: a repeated instance on the
+-- current path is a union-only cycle; a completed one needs no second walk.
+private pure func expand_union_instance(
+	instance: UnionInstanceVisit,
+	annotation: TypeUse,
+	reported: PayloadSpan,
+	declarations: CheckedDeclarations,
+	visiting: List[UnionInstanceVisit],
+	completed: List[List[List[TypeRef]]],
+	pending: List[DeclarationVisitStep],
+	pending_count: Int,
+) -> Result[ExpandedInstance, CheckError]:
+	if contains_instance_visit(visiting, instance):
+		Err(type_declaration_error(annotation.span, RecursiveAggregateType(annotation.value_type)))
+	else if completed_instance(completed, instance):
+		Ok({ visiting = visiting, pending = pending, pending_count = pending_count })
+	else:
+		declaration ?= declarations.unions
+			.get(union_number(instance.declaration))
+			.to_result(checker_invariant(annotation.span, InvalidUnionDeclaration(instance.declaration)))
+		substitution: Substitution = { owner = UnionDeclaration(instance.declaration), values = instance.arguments }
+		var steps = push_declaration_visit(pending, pending_count, FinishUnionInstance)
+		var count = IntOps.add(pending_count, 1)
+		var failure: Option[CheckError] = None
+		var index = declaration.variants.length()
+
+		while IntOps.greater_than(index, 0):
+			index = IntOps.subtract(index, 1)
+
+			match declaration.variants.get(index):
+				Some(variant):
+					match repeated_self_payload(instance.declaration, variant.fields):
+						Some(repeated):
+							failure = Some(type_declaration_error(repeated.span, RecursiveAggregateType(repeated.value_type)))
+							break
+						None:
+							void
+
+					var field_position = variant.fields.length()
+
+					while IntOps.greater_than(field_position, 0):
+						field_position = IntOps.subtract(field_position, 1)
+
+						match variant.fields.get(field_position):
+							Some(field):
+								match substitute_type(field.value_type, substitution, field.span):
+									Err(error):
+										failure = Some(error)
+										break
+									Ok(substituted):
+										payload: TypeUse = match reported:
+											WrittenSpan: { field | value_type = substituted }
+											ApplicationSpan(span): { value_type = substituted, span = span }
+										steps = push_declaration_visit(steps, count, VisitVariantPayload(instance.declaration, payload))
+										count = IntOps.add(count, 1)
+							None:
+								failure = Some(checker_invariant(annotation.span, InvalidDeclarationVisit))
+								break
+				None:
+					failure = Some(checker_invariant(annotation.span, InvalidDeclarationVisit))
+					break
+
+			if failure.is_some():
+				break
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok({ visiting = visiting.append(instance), pending = steps, pending_count = count })

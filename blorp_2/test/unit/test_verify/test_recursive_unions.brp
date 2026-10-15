@@ -165,7 +165,8 @@ pure func test_two_self_payloads_in_one_variant_are_rejected() -> Bool:
 			rejects(program(ids, [], [tree]), "boxed union variant may store at most one self-reference")
 
 
-pure func test_boxed_union_cannot_close_a_cycle_through_a_record() -> Bool:
+-- Both edges of this cycle are pointers (managed record, boxed union).
+pure func test_boxed_union_may_close_a_cycle_through_a_managed_record() -> Bool:
 	match recursive_ids():
 		Err(_): False
 		Ok(ids):
@@ -174,19 +175,49 @@ pure func test_boxed_union_cannot_close_a_cycle_through_a_record() -> Bool:
 				variants = [[Concrete.RecordType(ids.record_id)], [Concrete.UnionType(ids.union_id)]],
 				representation = Concrete.BoxedRecursive
 			}
-			rejects(program(ids, records, [looped]), "recursive aggregate layout is unsupported")
+			verify(program(ids, records, [looped])).is_ok()
 
 
--- Direct mutual recursion has no admitted layout: the earlier union would
--- name a later one, which the per-layout ordering rule rejects before any
--- graph walk, even when both claim the boxed representation.
+-- A managed record's field is a pointer edge, so it may hold its own layout.
+pure func test_managed_record_may_hold_itself() -> Bool:
+	match recursive_ids():
+		Err(_): False
+		Ok(ids):
+			records: List[Concrete.ConcreteRecord] = [{ fields = [Concrete.RecordType(ids.record_id)], representation = Concrete.ManagedRecord }]
+			verify(program(ids, records, [])).is_ok()
+
+
+-- Two inline unions holding each other by value have no finite storage.
+pure func test_inline_unions_holding_each_other_form_a_by_value_cycle() -> Bool:
+	match recursive_ids():
+		Err(_): False
+		Ok(ids):
+			first: Concrete.ConcreteUnion = { variants = [[Concrete.UnionType(ids.later_union_id)]], representation = Concrete.InlineOwningPayload }
+			second: Concrete.ConcreteUnion = { variants = [[Concrete.UnionType(ids.union_id)]], representation = Concrete.InlineOwningPayload }
+			rejects(program(ids, [], [first, second]), "aggregate layouts form a by-value cycle")
+
+
+-- An inline record inside an inline union inside that record is by value twice.
+pure func test_inline_record_and_union_form_a_by_value_cycle() -> Bool:
+	match recursive_ids():
+		Err(_): False
+		Ok(ids):
+			records: List[Concrete.ConcreteRecord] = [{ fields = [Concrete.IntType, Concrete.UnionType(ids.union_id)], representation = Concrete.InlineRecord }]
+			holder: Concrete.ConcreteUnion = { variants = [[Concrete.RecordType(ids.record_id)]], representation = Concrete.InlineUnmanaged }
+			-- Records are walked first, so the cycle closes before the record's
+			-- storage summary is checked.
+			rejects(program(ids, records, [holder]), "aggregate layouts form a by-value cycle")
+
+
+-- Direct mutual recursion has no admitted layout: a boxed union must hold
+-- its own layout, and neither of these does.
 pure func test_direct_mutual_boxed_layouts_are_rejected() -> Bool:
 	match recursive_ids():
 		Err(_): False
 		Ok(ids):
 			first: Concrete.ConcreteUnion = { variants = [[Concrete.UnionType(ids.later_union_id)]], representation = Concrete.BoxedRecursive }
 			second: Concrete.ConcreteUnion = { variants = [[Concrete.UnionType(ids.union_id)]], representation = Concrete.BoxedRecursive }
-			rejects(program(ids, [], [first, second]), "union payload must reference a supported, earlier layout")
+			rejects(program(ids, [], [first, second]), "boxed union representation requires a self-referencing payload")
 
 
 pure func test_record_holding_a_boxed_union_must_be_managed() -> Bool:
@@ -208,7 +239,10 @@ tests: TestSuite = {
 		("self payload under an inline representation rejected", test_self_payload_under_an_inline_representation_is_rejected),
 		("boxed layout without a self payload rejected", test_boxed_layout_without_a_self_payload_is_rejected),
 		("two self payloads in one variant rejected", test_two_self_payloads_in_one_variant_are_rejected),
-		("boxed union cannot close a cycle through a record", test_boxed_union_cannot_close_a_cycle_through_a_record),
+		("boxed union may close a cycle through a managed record", test_boxed_union_may_close_a_cycle_through_a_managed_record),
+		("managed record may hold itself", test_managed_record_may_hold_itself),
+		("inline unions holding each other form a by-value cycle", test_inline_unions_holding_each_other_form_a_by_value_cycle),
+		("inline record and union form a by-value cycle", test_inline_record_and_union_form_a_by_value_cycle),
 		("direct mutual boxed layouts rejected", test_direct_mutual_boxed_layouts_are_rejected),
 		("record holding a boxed union must be managed", test_record_holding_a_boxed_union_must_be_managed),
 	]

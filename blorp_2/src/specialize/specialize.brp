@@ -393,9 +393,11 @@ private fixed record InstanceKey {
 }
 
 
-private fixed record TypeSubstitution {
+-- A declaration parameter and the type that replaces it: a concrete TypeRef
+-- during translation, a PartialType while layouts are being prepared.
+private fixed record TypeSubstitution[T] {
 	parameter: Checked.TypeParameterId,
-	value_type: TypeRef
+	value_type: T
 }
 
 
@@ -534,7 +536,7 @@ private pure func translate_field(
 private pure func concrete_record(
 	declaration: Declaration.RecordId,
 	arguments: List[Checked.TypeRef],
-	substitution: List[TypeSubstitution],
+	substitution: List[TypeSubstitution[TypeRef]],
 	unions: List[UnionInstance],
 	span: Span,
 	records: List[RecordInstance],
@@ -563,7 +565,7 @@ private pure func lookup_record_instance(
 private pure func record_instance(
 	declaration: Declaration.RecordId,
 	value: Checked.CheckedExpr,
-	substitution: List[TypeSubstitution],
+	substitution: List[TypeSubstitution[TypeRef]],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 ) -> Result[RecordInstanceId, Diagnostic]:
@@ -578,7 +580,7 @@ private pure func record_instance(
 
 private pure func concrete_type(
 	value_type: Checked.TypeRef,
-	substitution: List[TypeSubstitution],
+	substitution: List[TypeSubstitution[TypeRef]],
 	unions: List[UnionInstance],
 	span: Span,
 	records: List[RecordInstance],
@@ -681,13 +683,13 @@ private pure func find_instance(
 	found
 
 
-private pure func parameter_substitution(
+private pure func parameter_substitution[T](
 	parameters: List[Checked.TypeParameterId],
-	arguments: List[TypeRef],
+	arguments: List[T],
 	owner: Checked.TypeParameterOwner,
 	span: Span,
-) -> Result[List[TypeSubstitution], Diagnostic]:
-	var substitution: List[TypeSubstitution] = []
+) -> Result[List[TypeSubstitution[T]], Diagnostic]:
+	var substitution: List[TypeSubstitution[T]] = []
 	var failure: Option[Diagnostic] = None
 	var position: Int = 0
 
@@ -754,7 +756,7 @@ private pure func instance_substitution(
 	signature: Checked.FunctionSignature,
 	key: InstanceKey,
 	span: Span,
-) -> Result[List[TypeSubstitution], Diagnostic]:
+) -> Result[List[TypeSubstitution[TypeRef]], Diagnostic]:
 	parameter_substitution(
 		signature.type_parameters,
 		key.arguments,
@@ -775,6 +777,73 @@ private fixed record UnionInstance {
 }
 
 
+-- A type named while a layout on the current path is still being built. A
+-- pending reference carries the in-progress layout's key; it is resolved to
+-- that layout's identity when the layout completes. A reader of a pending
+-- reference needs only its ownership class, which membership in a recursive
+-- layout group fixes: a pending union is owning, a pending record managed.
+private fixed union PartialType:
+	KnownType(TypeRef)
+	PendingUnionType(PartialUnionKey)
+	PendingRecordType(PartialRecordKey)
+	PendingListType(PartialType)
+
+
+private fixed record PartialUnionKey {
+	declaration: Declaration.UnionId,
+	arguments: List[PartialType]
+}
+
+
+private fixed record PartialRecordKey {
+	declaration: Declaration.RecordId,
+	arguments: List[PartialType]
+}
+
+
+-- A layout slot of the local builder. A pending slot already has its identity
+-- (its index) and representation; only references to layouts that were still
+-- in progress when it completed remain unresolved, and every one of them is
+-- filled when that layout completes. Sealing accepts complete slots only.
+private fixed union UnionSlot:
+	CompleteUnion(UnionInstance)
+	PendingUnion(PendingUnionInstance)
+
+
+private fixed record PendingUnionInstance {
+	key: PartialUnionKey,
+	variants: List[List[PartialType]],
+	representation: UnionRepresentation
+}
+
+
+private fixed union RecordSlot:
+	CompleteRecord(RecordInstance)
+	PendingRecord(PendingRecordInstance)
+
+
+private fixed record PendingRecordInstance {
+	key: PartialRecordKey,
+	fields: List[PartialType],
+	representation: RecordRepresentation
+}
+
+
+-- The layouts whose children are being prepared, innermost last, each
+-- marked once a child refers back to it.
+private fixed union InProgressLayout:
+	InProgressUnion(PartialUnionKey, BackReference)
+	InProgressRecord(PartialRecordKey, BackReference)
+
+
+-- Whether a child prepared under an in-progress layout referred back to it,
+-- leaving pending references that its completion fills. A layout no child
+-- referred back to completes without revisiting any slot.
+private fixed union BackReference:
+	NotReferencedBack
+	ReferencedBack
+
+
 private fixed union RequestSource:
 	EntrypointRoot
 	ConcreteRequest(Span)
@@ -787,13 +856,22 @@ private fixed record FunctionRequest {
 
 
 private fixed record PreparedType {
-	value_type: TypeRef,
-	unions: List[UnionInstance],
-	records: List[RecordInstance]
+	value_type: PartialType,
+	unions: List[UnionSlot],
+	records: List[RecordSlot],
+	in_progress: List[InProgressLayout]
 }
 
 
 private fixed record PreparedInstances {
+	functions: List[FunctionRequest],
+	unions: List[UnionSlot],
+	records: List[RecordSlot]
+}
+
+
+-- The builder after sealing: every layout complete, read by translation.
+private fixed record SealedInstances {
 	functions: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance]
@@ -843,6 +921,7 @@ private pure func request_span(
 			fallback
 
 
+-- The sealed instance for a key, read by translation.
 private pure func find_union_instance(
 	keys: List[UnionInstance],
 	key: UnionKey,
@@ -863,360 +942,786 @@ private pure func find_union_instance(
 	found
 
 
--- A variant payload while its union's layout is still being built: either a
--- frozen child type or the union's own instance, whose identity is reserved
--- locally until every child layout precedes it.
-private fixed union PreparedPayload:
-	ChildPayload(TypeRef)
-	ReservedSelfPayload
+private pure func same_partial_type(left: PartialType, right: PartialType) -> Bool:
+	match left:
+		KnownType(known):
+			match right:
+				KnownType(other): same_type(known, other)
+				_: False
+		PendingUnionType(key):
+			match right:
+				PendingUnionType(other): same_partial_union_key(key, other)
+				_: False
+		PendingRecordType(key):
+			match right:
+				PendingRecordType(other): same_partial_record_key(key, other)
+				_: False
+		PendingListType(element):
+			match right:
+				PendingListType(other): same_partial_type(element, other)
+				_: False
 
 
--- The admitted recursive edge: the union named by this key. Checking admits
--- it only for a non-generic union, so the key carries no arguments to compare.
-private pure func is_self_reference(written: Checked.TypeRef, key: UnionKey) -> Bool:
-	match written:
-		Checked.UnionType(id):
-			IntOps.equals(Declaration.union_number(id), Declaration.union_number(key.declaration))
-		_:
-			False
+private pure func same_partial_arguments(left: List[PartialType], right: List[PartialType]) -> Bool:
+	var matches = IntOps.equals(left.length(), right.length())
+	var position: Int = 0
+
+	for value in left:
+		if matches:
+			match right.get(position):
+				Some(other): matches = same_partial_type(value, other)
+				None: matches = False
+
+		position = IntOps.add(position, 1)
+
+	matches
 
 
--- Fills the reserved self payloads with the identity the union received.
-private pure func complete_payloads(variants: List[List[PreparedPayload]], id: UnionInstanceId) -> List[List[TypeRef]]:
-	var completed: List[List[TypeRef]] = []
+private pure func same_partial_union_key(left: PartialUnionKey, right: PartialUnionKey) -> Bool:
+	(
+		IntOps.equals(Declaration.union_number(left.declaration), Declaration.union_number(right.declaration))
+		and same_partial_arguments(left.arguments, right.arguments)
+	)
 
-	for prepared in variants:
-		var fields: List[TypeRef] = []
 
-		for field in prepared:
-			fields = fields.append(
-				match field:
-					ChildPayload(value_type): value_type
-					ReservedSelfPayload: UnionType(id)
+private pure func same_partial_record_key(left: PartialRecordKey, right: PartialRecordKey) -> Bool:
+	(
+		IntOps.equals(Declaration.record_number(left.declaration), Declaration.record_number(right.declaration))
+		and same_partial_arguments(left.arguments, right.arguments)
+	)
+
+
+private pure func known_arguments(arguments: List[TypeRef]) -> List[PartialType]:
+	var partial: List[PartialType] = []
+
+	for argument in arguments:
+		partial = partial.append(KnownType(argument))
+
+	partial
+
+
+-- A complete key's known arguments compared against a request's partial
+-- ones in place, so a lookup allocates nothing.
+private pure func same_known_arguments(known: List[TypeRef], partial: List[PartialType]) -> Bool:
+	var matches = IntOps.equals(known.length(), partial.length())
+	var position: Int = 0
+
+	for value in known:
+		if matches:
+			match partial.get(position):
+				Some(KnownType(other)): matches = same_type(value, other)
+				_: matches = False
+
+		position = IntOps.add(position, 1)
+
+	matches
+
+
+private pure func slot_has_union_key(slot: UnionSlot, key: PartialUnionKey) -> Bool:
+	match slot:
+		CompleteUnion(instance):
+			(
+				IntOps.equals(Declaration.union_number(instance.key.declaration), Declaration.union_number(key.declaration))
+				and same_known_arguments(instance.key.arguments, key.arguments)
 			)
+		PendingUnion(instance):
+			same_partial_union_key(instance.key, key)
 
-		completed = completed.append(fields)
 
-	completed
+private pure func slot_has_record_key(slot: RecordSlot, key: PartialRecordKey) -> Bool:
+	match slot:
+		CompleteRecord(instance):
+			(
+				IntOps.equals(Declaration.record_number(instance.key.declaration), Declaration.record_number(key.declaration))
+				and same_known_arguments(instance.key.arguments, key.arguments)
+			)
+		PendingRecord(instance):
+			same_partial_record_key(instance.key, key)
+
+
+private pure func slot_union_representation(slot: UnionSlot) -> UnionRepresentation:
+	match slot:
+		CompleteUnion(instance): instance.layout.representation
+		PendingUnion(instance): instance.representation
+
+
+private pure func slot_record_representation(slot: RecordSlot) -> RecordRepresentation:
+	match slot:
+		CompleteRecord(instance): instance.layout.representation
+		PendingRecord(instance): instance.representation
+
+
+private pure func find_union_slot(slots: List[UnionSlot], key: PartialUnionKey) -> Option[UnionInstanceId]:
+	var found: Option[UnionInstanceId] = None
+	var position: Int = 0
+
+	for slot in slots:
+		if slot_has_union_key(slot, key):
+			found = Some(into_opaque UnionInstanceId(position))
+			break
+
+		position = IntOps.add(position, 1)
+
+	found
+
+
+private pure func find_record_slot(slots: List[RecordSlot], key: PartialRecordKey) -> Option[RecordInstanceId]:
+	var found: Option[RecordInstanceId] = None
+	var position: Int = 0
+
+	for slot in slots:
+		if slot_has_record_key(slot, key):
+			found = Some(into_opaque RecordInstanceId(position))
+			break
+
+		position = IntOps.add(position, 1)
+
+	found
+
+
+-- The in-progress layouts with this union marked as referred back to, if
+-- it is on the current path.
+private pure func refer_back_to_union(layouts: List[InProgressLayout], key: PartialUnionKey) -> Option[List[InProgressLayout]]:
+	var found: Option[List[InProgressLayout]] = None
+	var position = 0
+
+	for layout in layouts:
+		match layout:
+			InProgressUnion(other, _):
+				if same_partial_union_key(other, key):
+					found = Some(layouts.set(position, InProgressUnion(other, ReferencedBack)))
+					break
+			InProgressRecord(_, _):
+				void
+
+		position = IntOps.add(position, 1)
+
+	found
+
+
+private pure func refer_back_to_record(layouts: List[InProgressLayout], key: PartialRecordKey) -> Option[List[InProgressLayout]]:
+	var found: Option[List[InProgressLayout]] = None
+	var position = 0
+
+	for layout in layouts:
+		match layout:
+			InProgressRecord(other, _):
+				if same_partial_record_key(other, key):
+					found = Some(layouts.set(position, InProgressRecord(other, ReferencedBack)))
+					break
+			InProgressUnion(_, _):
+				void
+
+		position = IntOps.add(position, 1)
+
+	found
+
+
+private fixed record LeftLayout {
+	remaining: List[InProgressLayout],
+	back_reference: BackReference
+}
+
+
+-- Pops the innermost in-progress layout once its slot is published.
+private pure func leave_layout(layouts: List[InProgressLayout], span: Span) -> Result[LeftLayout, Diagnostic]:
+	last = IntOps.subtract(layouts.length(), 1)
+	innermost ?= layouts.get(last).to_result(invalid(span, "layout completed outside its own preparation"))
+	remaining ?= layouts.remove(last).to_result(invalid(span, "layout completed outside its own preparation"))
+	back_reference = match innermost:
+		InProgressUnion(_, marked): marked
+		InProgressRecord(_, marked): marked
+	Ok({ remaining = remaining, back_reference = back_reference })
+
+
+-- A List of a known element is itself known.
+private pure func partial_list(element: PartialType) -> PartialType:
+	match element:
+		KnownType(known): KnownType(ListType(known))
+		_: PendingListType(element)
+
+
+private pure func has_pending(value: PartialType) -> Bool:
+	match value:
+		KnownType(_): False
+		PendingUnionType(key): True
+		PendingRecordType(key): True
+		PendingListType(element): has_pending(element)
+
+
+private pure func any_pending(values: List[PartialType]) -> Bool:
+	var found = False
+
+	for value in values:
+		if has_pending(value):
+			found = True
+			break
+
+	found
+
+
+-- The layout that just completed, whose pending references now resolve.
+private fixed union CompletedLayout:
+	CompletedUnion(PartialUnionKey, UnionInstanceId)
+	CompletedRecord(PartialRecordKey, RecordInstanceId)
+
+
+private pure func resolve_partial(value: PartialType, completed: CompletedLayout) -> PartialType:
+	match value:
+		KnownType(_):
+			value
+		PendingUnionType(key):
+			match completed:
+				CompletedUnion(done, id):
+					if same_partial_union_key(key, done):
+						KnownType(UnionType(id))
+					else:
+						PendingUnionType({ key | arguments = resolve_partials(key.arguments, completed) })
+				CompletedRecord(_, _):
+					PendingUnionType({ key | arguments = resolve_partials(key.arguments, completed) })
+		PendingRecordType(key):
+			match completed:
+				CompletedRecord(done, id):
+					if same_partial_record_key(key, done):
+						KnownType(RecordType(id))
+					else:
+						PendingRecordType({ key | arguments = resolve_partials(key.arguments, completed) })
+				CompletedUnion(_, _):
+					PendingRecordType({ key | arguments = resolve_partials(key.arguments, completed) })
+		PendingListType(element):
+			partial_list(resolve_partial(element, completed))
+
+
+private pure func resolve_partials(values: List[PartialType], completed: CompletedLayout) -> List[PartialType]:
+	var resolved: List[PartialType] = []
+
+	for value in values:
+		resolved = resolved.append(resolve_partial(value, completed))
+
+	resolved
+
+
+private pure func known_type(value: PartialType, span: Span) -> Result[TypeRef, Diagnostic]:
+	match value:
+		KnownType(known): Ok(known)
+		_: Err(invalid(span, "layout reference left unresolved after its group completed"))
+
+
+private pure func known_types(values: List[PartialType], span: Span) -> Result[List[TypeRef], Diagnostic]:
+	var known: List[TypeRef] = []
+	var failure: Option[Diagnostic] = None
+
+	for value in values:
+		match known_type(value, span):
+			Ok(resolved): known = known.append(resolved)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(known)
+
+
+-- A pending union instance with no reference left becomes complete.
+private pure func settle_union(instance: PendingUnionInstance, span: Span) -> Result[UnionSlot, Diagnostic]:
+	var pending = any_pending(instance.key.arguments)
+
+	for fields in instance.variants:
+		pending = pending or any_pending(fields)
+
+	if pending:
+		Ok(PendingUnion(instance))
+	else:
+		arguments ?= known_types(instance.key.arguments, span)
+		var variants: List[List[TypeRef]] = []
+		var failure: Option[Diagnostic] = None
+
+		for fields in instance.variants:
+			match known_types(fields, span):
+				Ok(known): variants = variants.append(known)
+				Err(error):
+					failure = Some(error)
+					break
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok(CompleteUnion({
+					key = { declaration = instance.key.declaration, arguments = arguments },
+					layout = { variants = variants, representation = instance.representation },
+				}))
+
+
+private pure func settle_record(instance: PendingRecordInstance, span: Span) -> Result[RecordSlot, Diagnostic]:
+	if any_pending(instance.key.arguments) or any_pending(instance.fields):
+		Ok(PendingRecord(instance))
+	else:
+		arguments ?= known_types(instance.key.arguments, span)
+		fields ?= known_types(instance.fields, span)
+		Ok(CompleteRecord({
+			key = { declaration = instance.key.declaration, arguments = arguments },
+			layout = { fields = fields, representation = instance.representation },
+		}))
+
+
+-- Fills every reference to a completed layout that a child referred back
+-- to. Only slots published while it was in progress, from `first` on, can
+-- hold such a reference, so earlier slots are not revisited.
+private pure func resolve_union_slots(
+	slots: List[UnionSlot],
+	first: Int,
+	completed: CompletedLayout,
+	span: Span,
+) -> Result[List[UnionSlot], Diagnostic]:
+	var resolved = slots
+	var position = first
+	var failure: Option[Diagnostic] = None
+
+	while IntOps.less_than(position, resolved.length()) and not failure.is_some():
+		match resolved.get(position):
+			Some(PendingUnion(instance)):
+				filled: PendingUnionInstance = {
+					key = { instance.key | arguments = resolve_partials(instance.key.arguments, completed) },
+					variants = resolve_variants(instance.variants, completed),
+					representation = instance.representation,
+				}
+				match settle_union(filled, span):
+					Ok(slot): resolved = resolved.set(position, slot)
+					Err(error): failure = Some(error)
+			Some(CompleteUnion(_)):
+				void
+			None:
+				failure = Some(invalid(span, "union slot left its builder"))
+
+		position = IntOps.add(position, 1)
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(resolved)
+
+
+private pure func resolve_variants(variants: List[List[PartialType]], completed: CompletedLayout) -> List[List[PartialType]]:
+	var resolved: List[List[PartialType]] = []
+
+	for fields in variants:
+		resolved = resolved.append(resolve_partials(fields, completed))
+
+	resolved
+
+
+private pure func resolve_record_slots(
+	slots: List[RecordSlot],
+	first: Int,
+	completed: CompletedLayout,
+	span: Span,
+) -> Result[List[RecordSlot], Diagnostic]:
+	var resolved = slots
+	var position = first
+	var failure: Option[Diagnostic] = None
+
+	while IntOps.less_than(position, resolved.length()) and not failure.is_some():
+		match resolved.get(position):
+			Some(PendingRecord(instance)):
+				filled: PendingRecordInstance = {
+					key = { instance.key | arguments = resolve_partials(instance.key.arguments, completed) },
+					fields = resolve_partials(instance.fields, completed),
+					representation = instance.representation,
+				}
+				match settle_record(filled, span):
+					Ok(slot): resolved = resolved.set(position, slot)
+					Err(error): failure = Some(error)
+			Some(CompleteRecord(_)):
+				void
+			None:
+				failure = Some(invalid(span, "record slot left its builder"))
+
+		position = IntOps.add(position, 1)
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(resolved)
+
+
+-- Whether a prepared payload owns managed storage: a managed record, an
+-- owning or boxed union, a String, a List, or any layout still in progress.
+private pure func payload_owns_children(
+	payload: PartialType,
+	unions: List[UnionSlot],
+	records: List[RecordSlot],
+	span: Span,
+) -> Result[Bool, Diagnostic]:
+	match payload:
+		PendingUnionType(_) | PendingRecordType(_) | PendingListType(_):
+			Ok(True)
+		KnownType(known):
+			match known:
+				VoidType | IntType | FloatType:
+					Ok(False)
+				StringType | ListType(_):
+					Ok(True)
+				RecordType(child):
+					match records.get(record_number(child)):
+						None:
+							Err(invalid(span, "missing concrete record child layout"))
+						Some(slot):
+							Ok(
+								match slot_record_representation(slot):
+									ManagedRecord: True
+									InlineRecord: False
+							)
+				UnionType(child):
+					match unions.get(union_number(child)):
+						None:
+							Err(invalid(span, "missing concrete child layout"))
+						Some(slot):
+							Ok(
+								match slot_union_representation(slot):
+									InlineOwningPayload | BoxedRecursive: True
+									InlineUnmanaged: False
+							)
 
 
 private pure func ensure_union(
-	key: UnionKey,
+	key: PartialUnionKey,
 	checked: Checked.CheckedFunctions,
-	unions: List[UnionInstance],
+	unions: List[UnionSlot],
 	span: Span,
-	records: List[RecordInstance],
+	records: List[RecordSlot],
+	in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
-	match find_union_instance(unions, key):
+	match find_union_slot(unions, key):
 		Some(id):
-			Ok({
-				value_type = UnionType(id),
-				unions = unions,
-				records = records,
-			})
+			Ok({ value_type = KnownType(UnionType(id)), unions = unions, records = records, in_progress = in_progress })
 		None:
-			declaration ?= checked.unions
-				.get(Declaration.union_number(key.declaration))
-				.to_result(invalid(span, "unknown union declaration"))
-			substitution ?= parameter_substitution(
-				declaration.type_parameters,
-				key.arguments,
-				Checked.UnionDeclaration(key.declaration),
-				span,
-			)
-			var dependencies = unions
-			var record_dependencies = records
-			var variants: List[List[PreparedPayload]] = []
-			var owning = False
-			var self_referencing = False
-			var failure: Option[Diagnostic] = None
-
-			for variant in declaration.variants:
-				var fields: List[PreparedPayload] = []
-				for written in variant.fields:
-					if is_self_reference(written.value_type, key):
-						-- Checking admitted this edge; the instance identity is
-						-- reserved locally and filled once every child is frozen.
-						self_referencing = True
-						fields = fields.append(ReservedSelfPayload)
-					else:
-						match prepare_type(written.value_type, substitution, checked, dependencies, written.span, record_dependencies):
-							Err(error):
-								failure = Some(error)
-								break
-							Ok(prepared):
-								dependencies = prepared.unions
-								record_dependencies = prepared.records
-								fields = fields.append(ChildPayload(prepared.value_type))
-								match prepared.value_type:
-									RecordType(child):
-										match record_dependencies.get(record_number(child)):
-											Some(child_layout):
-												match child_layout.layout.representation:
-													ManagedRecord:
-														owning = True
-													InlineRecord:
-														void
-											None:
-												failure = Some(
-													invalid(
-														span,
-														"missing concrete record child layout",
-													),
-												)
-												break
-									StringType | ListType(_):
-										owning = True
-									UnionType(child):
-										match dependencies.get(union_number(child)):
-											Some(layout):
-												match layout.layout.representation:
-													InlineOwningPayload | BoxedRecursive:
-														owning = True
-													InlineUnmanaged:
-														void
-											None:
-												failure = Some(
-													invalid(
-														span,
-														"missing concrete child layout",
-													),
-												)
-												break
-									_:
-										void
-				if failure.is_some():
-					break
-				variants = variants.append(fields)
-
-			ready ?= match failure:
-				Some(error):
-					Err(error)
+			match refer_back_to_union(in_progress, key):
+				Some(marked):
+					-- A reference back into a layout on the current path.
+					Ok({ value_type = PendingUnionType(key), unions = unions, records = records, in_progress = marked })
 				None:
-					Ok(void)
+					prepare_union(key, checked, unions, span, records, in_progress)
 
-			-- A self-referencing union is boxed whatever else it stores; the box
-			-- owns every payload. Otherwise an owning child makes it owning.
-			representation = if self_referencing:
-				BoxedRecursive
-			else if owning:
-				InlineOwningPayload
-			else:
-				InlineUnmanaged
 
-			-- Freeze dependencies first: every child precedes its parent, and
-			-- only the parent's own reserved identity may follow it.
-			id: UnionInstanceId = into_opaque UnionInstanceId(dependencies.length())
+private pure func prepare_union(
+	key: PartialUnionKey,
+	checked: Checked.CheckedFunctions,
+	unions: List[UnionSlot],
+	span: Span,
+	records: List[RecordSlot],
+	in_progress: List[InProgressLayout],
+) -> Result[PreparedType, Diagnostic]:
+	declaration ?= checked.unions
+		.get(Declaration.union_number(key.declaration))
+		.to_result(invalid(span, "unknown union declaration"))
+	substitution ?= parameter_substitution(
+		declaration.type_parameters,
+		key.arguments,
+		Checked.UnionDeclaration(key.declaration),
+		span,
+	)
+	var dependencies = unions
+	var record_dependencies = records
+	var layouts = in_progress.append(InProgressUnion(key, NotReferencedBack))
+	var variants: List[List[PartialType]] = []
+	var owning = False
+	var self_referencing = False
+	var failure: Option[Diagnostic] = None
+
+	for variant in declaration.variants:
+		var fields: List[PartialType] = []
+		for written in variant.fields:
+			match prepare_type(written.value_type, substitution, checked, dependencies, written.span, record_dependencies, layouts):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(prepared):
+					dependencies = prepared.unions
+					record_dependencies = prepared.records
+					layouts = prepared.in_progress
+					fields = fields.append(prepared.value_type)
+					-- The union's own direct payload is the boxed unary shape.
+					match prepared.value_type:
+						PendingUnionType(other):
+							if same_partial_union_key(other, key):
+								self_referencing = True
+						_:
+							void
+					match payload_owns_children(prepared.value_type, dependencies, record_dependencies, span):
+						Ok(owns): owning = owning or owns
+						Err(error):
+							failure = Some(error)
+							break
+		if failure.is_some():
+			break
+		variants = variants.append(fields)
+
+	ready ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	-- A self-referencing union is boxed whatever else it stores; the
+	-- box owns every payload. Otherwise an owning child makes it owning.
+	representation = if self_referencing:
+		BoxedRecursive
+	else if owning:
+		InlineOwningPayload
+	else:
+		InlineUnmanaged
+
+	-- Children complete before their parent, so the parent takes the
+	-- next identity; only references back to layouts still on the
+	-- path, including its own direct self payload, remain to fill.
+	id: UnionInstanceId = into_opaque UnionInstanceId(dependencies.length())
+	slot ?= settle_union({ key = key, variants = variants, representation = representation }, span)
+	published = dependencies.append(slot)
+	left ?= leave_layout(layouts, span)
+	match left.back_reference:
+		NotReferencedBack:
+			Ok({ value_type = KnownType(UnionType(id)), unions = published, records = record_dependencies, in_progress = left.remaining })
+		ReferencedBack:
+			completed = CompletedUnion(key, id)
+			resolved_unions ?= resolve_union_slots(published, unions.length(), completed, span)
+			resolved_records ?= resolve_record_slots(record_dependencies, records.length(), completed, span)
 			Ok({
-				value_type = UnionType(id),
-				unions = dependencies.append({
-					key = key,
-					layout = {
-						variants = complete_payloads(variants, id),
-						representation = representation
-					},
-				}),
-				records = record_dependencies,
+				value_type = KnownType(UnionType(id)),
+				unions = resolved_unions,
+				records = resolved_records,
+				in_progress = left.remaining,
 			})
+
+
+-- Whether a prepared field keeps its record inline: a number, or a record
+-- whose own layout is inline.
+private pure func inline_record_field(field: PartialType, records: List[RecordSlot]) -> Result[Bool, Diagnostic]:
+	match field:
+		KnownType(IntType) | KnownType(FloatType):
+			Ok(True)
+		KnownType(RecordType(child)):
+			match records.get(record_number(child)):
+				None:
+					Err(invalid({ source = COMPILER_SOURCE, start = 0, end = 0 }, "missing concrete record child layout"))
+				Some(slot):
+					Ok(
+						match slot_record_representation(slot):
+							InlineRecord: True
+							ManagedRecord: False
+					)
+		_:
+			Ok(False)
 
 
 private pure func ensure_record(
-	key: RecordKey,
+	key: PartialRecordKey,
 	checked: Checked.CheckedFunctions,
-	unions: List[UnionInstance],
+	unions: List[UnionSlot],
 	span: Span,
-	records: List[RecordInstance],
+	records: List[RecordSlot],
+	in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
-	match find_record_instance(records, key):
+	match find_record_slot(records, key):
 		Some(instance):
-			Ok({
-				value_type = RecordType(instance),
-				unions = unions,
-				records = records,
-			})
+			Ok({ value_type = KnownType(RecordType(instance)), unions = unions, records = records, in_progress = in_progress })
 		None:
-			declaration ?= checked.records
-				.get(Declaration.record_number(key.declaration))
-				.to_result(invalid(span, "unknown record declaration"))
-			substitution ?= parameter_substitution(declaration.type_parameters, key.arguments, Checked.RecordDeclaration(key.declaration), span)
-			var fields: List[TypeRef] = []
-			var dependencies = unions
-			var record_dependencies = records
-			var representation = InlineRecord
-			var error: Option[Diagnostic] = None
+			match refer_back_to_record(in_progress, key):
+				Some(marked):
+					Ok({ value_type = PendingRecordType(key), unions = unions, records = records, in_progress = marked })
+				None:
+					prepare_record(key, checked, unions, span, records, in_progress)
 
-			for checked_field in declaration.fields:
-				field = checked_field.value_type
-				match prepare_type(
-					field.value_type,
-					substitution,
-					checked,
-					dependencies,
-					field.span,
-					record_dependencies,
-				):
+
+private pure func prepare_record(
+	key: PartialRecordKey,
+	checked: Checked.CheckedFunctions,
+	unions: List[UnionSlot],
+	span: Span,
+	records: List[RecordSlot],
+	in_progress: List[InProgressLayout],
+) -> Result[PreparedType, Diagnostic]:
+	declaration ?= checked.records
+		.get(Declaration.record_number(key.declaration))
+		.to_result(invalid(span, "unknown record declaration"))
+	substitution ?= parameter_substitution(declaration.type_parameters, key.arguments, Checked.RecordDeclaration(key.declaration), span)
+	var fields: List[PartialType] = []
+	var dependencies = unions
+	var record_dependencies = records
+	var layouts = in_progress.append(InProgressRecord(key, NotReferencedBack))
+	var managed = False
+	var error: Option[Diagnostic] = None
+
+	for checked_field in declaration.fields:
+		field = checked_field.value_type
+		match prepare_type(field.value_type, substitution, checked, dependencies, field.span, record_dependencies, layouts):
+			Err(failure):
+				error = Some(failure)
+				break
+			Ok(prepared):
+				dependencies = prepared.unions
+				record_dependencies = prepared.records
+				layouts = prepared.in_progress
+				fields = fields.append(prepared.value_type)
+				-- Only numbers and inline records keep a record inline;
+				-- every other field, including a layout still in
+				-- progress, needs a counted root.
+				match inline_record_field(prepared.value_type, record_dependencies):
+					Ok(inline):
+						if not inline:
+							managed = True
 					Err(failure):
 						error = Some(failure)
 						break
-					Ok(prepared):
-						dependencies = prepared.unions
-						record_dependencies = prepared.records
-						fields = fields.append(prepared.value_type)
 
-						match prepared.value_type:
-							IntType | FloatType:
-								void
-							RecordType(child):
-								match record_dependencies.get(record_number(child)):
-									Some(child_layout):
-										match child_layout.layout.representation:
-											ManagedRecord:
-												representation = ManagedRecord
-											InlineRecord:
-												void
-									None:
-										error = Some(
-											invalid(
-												field.span,
-												"missing concrete record child layout",
-											),
-										)
-										break
-							_:
-								representation = ManagedRecord
+	ready ?= match error:
+		Some(failure):
+			Err(failure)
+		None:
+			Ok(void)
 
-			ready ?= match error:
-				Some(error):
-					Err(error)
-				None:
-					Ok(void)
-
-			instance: RecordInstanceId = into_opaque RecordInstanceId(
-				record_dependencies.length()
-			)
+	representation = if managed:
+		ManagedRecord
+	else:
+		InlineRecord
+	instance: RecordInstanceId = into_opaque RecordInstanceId(record_dependencies.length())
+	slot ?= settle_record({ key = key, fields = fields, representation = representation }, span)
+	published = record_dependencies.append(slot)
+	left ?= leave_layout(layouts, span)
+	match left.back_reference:
+		NotReferencedBack:
+			Ok({ value_type = KnownType(RecordType(instance)), unions = dependencies, records = published, in_progress = left.remaining })
+		ReferencedBack:
+			completed = CompletedRecord(key, instance)
+			resolved_unions ?= resolve_union_slots(dependencies, unions.length(), completed, span)
+			resolved_records ?= resolve_record_slots(published, records.length(), completed, span)
 			Ok({
-				value_type = RecordType(instance),
-				unions = dependencies,
-				records = record_dependencies.append({
-					key = key,
-					layout = {
-						fields = fields,
-						representation = representation
-					},
-				}),
+				value_type = KnownType(RecordType(instance)),
+				unions = resolved_unions,
+				records = resolved_records,
+				in_progress = left.remaining,
 			})
+
+
+private pure func prepare_arguments(
+	arguments: List[Checked.TypeRef],
+	substitution: List[TypeSubstitution[PartialType]],
+	checked: Checked.CheckedFunctions,
+	unions: List[UnionSlot],
+	span: Span,
+	records: List[RecordSlot],
+	in_progress: List[InProgressLayout],
+) -> Result[PreparedArguments, Diagnostic]:
+	var types: List[PartialType] = []
+	var dependencies = unions
+	var record_dependencies = records
+	var layouts = in_progress
+	var failure: Option[Diagnostic] = None
+
+	for argument in arguments:
+		match prepare_type(argument, substitution, checked, dependencies, span, record_dependencies, layouts):
+			Ok(prepared):
+				types = types.append(prepared.value_type)
+				dependencies = prepared.unions
+				record_dependencies = prepared.records
+				layouts = prepared.in_progress
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok({ arguments = types, unions = dependencies, records = record_dependencies, in_progress = layouts })
+
+
+private fixed record PreparedArguments {
+	arguments: List[PartialType],
+	unions: List[UnionSlot],
+	records: List[RecordSlot],
+	in_progress: List[InProgressLayout]
+}
 
 
 private pure func prepare_type(
 	value: Checked.TypeRef,
-	substitution: List[TypeSubstitution],
+	substitution: List[TypeSubstitution[PartialType]],
 	checked: Checked.CheckedFunctions,
-	unions: List[UnionInstance],
+	unions: List[UnionSlot],
 	span: Span,
-	records: List[RecordInstance],
+	records: List[RecordSlot],
+	in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
 	match value:
+		Checked.VoidType:
+			Ok({ value_type = KnownType(VoidType), unions = unions, records = records, in_progress = in_progress })
+		Checked.IntType:
+			Ok({ value_type = KnownType(IntType), unions = unions, records = records, in_progress = in_progress })
+		Checked.FloatType:
+			Ok({ value_type = KnownType(FloatType), unions = unions, records = records, in_progress = in_progress })
+		Checked.StringType:
+			Ok({ value_type = KnownType(StringType), unions = unions, records = records, in_progress = in_progress })
+		Checked.ParameterType(id):
+			var replacement: Option[PartialType] = None
+
+			for argument in substitution:
+				if Checked.same_parameter(id, argument.parameter):
+					-- A supplied replacement is terminal.
+					replacement = Some(argument.value_type)
+					break
+
+			match replacement:
+				Some(replaced):
+					Ok({ value_type = replaced, unions = unions, records = records, in_progress = in_progress })
+				None:
+					Err(invalid(span, "unresolved or foreign type parameter"))
 		Checked.ListType(element):
-			prepared ?= prepare_type(element, substitution, checked, unions, span, records)
-			Ok({ prepared | value_type = ListType(prepared.value_type) })
+			prepared ?= prepare_type(element, substitution, checked, unions, span, records, in_progress)
+			Ok({ prepared | value_type = partial_list(prepared.value_type) })
 		Checked.RecordType(id):
-			ensure_record({ declaration = id, arguments = [] }, checked, unions, span, records)
+			ensure_record({ declaration = id, arguments = [] }, checked, unions, span, records, in_progress)
 		Checked.UnionType(id):
-			ensure_union(
-				{
-					declaration = id,
-					arguments = []
-				},
-				checked,
-				unions,
-				span,
-				records,
-			)
+			ensure_union({ declaration = id, arguments = [] }, checked, unions, span, records, in_progress)
 		Checked.AppliedRecordType(id, arguments):
-			var types: List[TypeRef] = []
-			var dependencies = unions
-			var record_dependencies = records
-			var failure: Option[Diagnostic] = None
-
-			for argument in arguments:
-				match prepare_type(
-					argument,
-					substitution,
-					checked,
-					dependencies,
-					span,
-					record_dependencies,
-				):
-					Ok(prepared):
-						types = types.append(prepared.value_type)
-						dependencies = prepared.unions
-						record_dependencies = prepared.records
-					Err(error):
-						failure = Some(error)
-						break
-
-			ready ?= match failure:
-				Some(error):
-					Err(error)
-				None:
-					Ok(void)
-
-			ensure_record(
-				{
-					declaration = id,
-					arguments = types
-				},
-				checked,
-				dependencies,
-				span,
-				record_dependencies,
-			)
+			prepared ?= prepare_arguments(arguments, substitution, checked, unions, span, records, in_progress)
+			ensure_record({ declaration = id, arguments = prepared.arguments }, checked, prepared.unions, span, prepared.records, prepared.in_progress)
 		Checked.AppliedUnionType(id, arguments):
-			var types: List[TypeRef] = []
-			var dependencies = unions
-			var record_dependencies = records
-			var failure: Option[Diagnostic] = None
+			prepared ?= prepare_arguments(arguments, substitution, checked, unions, span, records, in_progress)
+			ensure_union({ declaration = id, arguments = prepared.arguments }, checked, prepared.unions, span, prepared.records, prepared.in_progress)
 
-			for argument in arguments:
-				match prepare_type(
-					argument,
-					substitution,
-					checked,
-					dependencies,
-					span,
-					record_dependencies,
-				):
-					Ok(prepared):
-						types = types.append(prepared.value_type)
-						dependencies = prepared.unions
-						record_dependencies = prepared.records
-					Err(error):
-						failure = Some(error)
-						break
 
-			ready ?= match failure:
-				Some(error):
-					Err(error)
-				None:
-					Ok(void)
+-- Every slot is complete once no layout is in progress; sealing projects the
+-- builder into the immutable instance list the translation phase reads.
+private pure func seal_unions(slots: List[UnionSlot]) -> Result[List[UnionInstance], Diagnostic]:
+	var instances: List[UnionInstance] = []
+	var failure: Option[Diagnostic] = None
 
-			ensure_union(
-				{
-					declaration = id,
-					arguments = types
-				},
-				checked,
-				dependencies,
-				span,
-				record_dependencies,
-			)
-		_:
-			concrete ?= concrete_type(value, substitution, unions, span, records)
-			Ok({
-				value_type = concrete,
-				unions = unions,
-				records = records,
-			})
+	for slot in slots:
+		match slot:
+			CompleteUnion(instance):
+				instances = instances.append(instance)
+			PendingUnion(_):
+				failure = Some(invalid({ source = COMPILER_SOURCE, start = 0, end = 0 }, "union layout sealed while still pending"))
+				break
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(instances)
+
+
+private pure func seal_records(slots: List[RecordSlot]) -> Result[List[RecordInstance], Diagnostic]:
+	var instances: List[RecordInstance] = []
+	var failure: Option[Diagnostic] = None
+
+	for slot in slots:
+		match slot:
+			CompleteRecord(instance):
+				instances = instances.append(instance)
+			PendingRecord(_):
+				failure = Some(invalid({ source = COMPILER_SOURCE, start = 0, end = 0 }, "record layout sealed while still pending"))
+				break
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(instances)
 
 
 private pure func value_types(value: Checked.CheckedExpr) -> List[Checked.TypeUse]:
@@ -1329,9 +1834,10 @@ private pure func prepare_function(
 	checked: Checked.CheckedFunctions,
 	initial: PreparedInstances,
 ) -> Result[PreparedInstances, Diagnostic]:
-	substitution ?= instance_substitution(
-		function.signature,
-		request.key,
+	substitution ?= parameter_substitution(
+		function.signature.type_parameters,
+		known_arguments(request.key.arguments),
+		Checked.FunctionDeclaration(request.key.declaration),
 		function.signature.return_type.span,
 	)
 	var prepared = initial
@@ -1346,6 +1852,7 @@ private pure func prepare_function(
 			prepared.unions,
 			request_span(has_type_parameters and contains_parameter(written.value_type), request.source, written.span),
 			prepared.records,
+			[],
 		):
 			Ok(value):
 				prepared = { prepared |
@@ -1377,13 +1884,19 @@ private pure func prepare_function(
 							prepared.unions,
 							request_span(argument_depends_on_caller, request.source, call.span),
 							prepared.records,
+							[],
 						):
 							Ok(value):
 								prepared = { prepared |
 									unions = value.unions,
 									records = value.records
 								}
-								concrete = concrete.append(value.value_type)
+								-- No layout is in progress at a function boundary.
+								match known_type(value.value_type, call.span):
+									Ok(known): concrete = concrete.append(known)
+									Err(error):
+										failure = Some(error)
+										break
 							Err(error):
 								failure = Some(error)
 								break
@@ -1492,7 +2005,7 @@ private pure func translate_optional_roles(
 
 private pure func translate_call(
 	call: Checked.CheckedCall,
-	substitution: List[TypeSubstitution],
+	substitution: List[TypeSubstitution[TypeRef]],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
@@ -1653,7 +2166,7 @@ private pure func translate_variant(
 -- whose instance needs its receiver's concrete record.
 private pure func translate_expr(
 	value: Checked.CheckedExpr,
-	substitution: List[TypeSubstitution],
+	substitution: List[TypeSubstitution[TypeRef]],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
@@ -1729,7 +2242,7 @@ private pure func translate_expr(
 private pure func translate_leaf(
 	form: ConcreteForm,
 	value: Checked.CheckedExpr,
-	substitution: List[TypeSubstitution],
+	substitution: List[TypeSubstitution[TypeRef]],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 ) -> Result[ConcreteExpr, Diagnostic]:
@@ -1739,7 +2252,7 @@ private pure func translate_leaf(
 
 private pure func translate_exprs(
 	values: List[Checked.CheckedExpr],
-	substitution: List[TypeSubstitution],
+	substitution: List[TypeSubstitution[TypeRef]],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
@@ -1764,7 +2277,7 @@ private pure func translate_exprs(
 
 private pure func translate_statements(
 	statements: List[Checked.CheckedStatement],
-	substitution: List[TypeSubstitution],
+	substitution: List[TypeSubstitution[TypeRef]],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
@@ -1803,7 +2316,7 @@ private pure func translate_pattern(
 
 private pure func translate_exit(
 	exit: Checked.CheckedExit,
-	substitution: List[TypeSubstitution],
+	substitution: List[TypeSubstitution[TypeRef]],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
@@ -1932,7 +2445,10 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
 		unions = [],
 		records = []
 	}
-	prepared ?= expand_instances(checked, initial)
+	expanded ?= expand_instances(checked, initial)
+	sealed_unions ?= seal_unions(expanded.unions)
+	sealed_records ?= seal_records(expanded.records)
+	prepared: SealedInstances = { functions = expanded.functions, unions = sealed_unions, records = sealed_records }
 	functions ?= translated_list(prepared.functions, pure func(
 		request: FunctionRequest,
 	) -> Result[ConcreteFunction, Diagnostic]:

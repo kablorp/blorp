@@ -1,0 +1,186 @@
+import:
+	../../../src/check/errors as Errors
+	../input: check_failure, checked_source
+	test: TestSuite
+
+
+-- Root-only programs see no prelude, so the tests declare their own optional.
+private MAYBE: String =
+	|fixed union Maybe[T]:
+	|    Just(T)
+	|    Nothing
+	|
+
+private MAIN: String =
+	|func main() -> Int:
+	|    0
+	|
+
+private HELP: String =
+	"use finite record and union fields; recursion is supported through a record field, a List element or one direct self payload of a non-generic union, such as Next(Node)"
+
+
+-- Step 2a: recursion is admitted when every cycle passes through a record
+-- field or a List element; union-only cycles and generic cycles are not.
+private pure func admits(source: String) -> Bool:
+	checked_source(source + MAIN).is_ok()
+
+
+private pure func rejects_recursive(prefix: String, annotation: String, suffix: String) -> Bool:
+	source = prefix + annotation + suffix + MAIN
+	typed = match check_failure(source):
+		Some(error):
+			match error.kind:
+				Errors.TypeDeclarationRejection(Errors.RecursiveAggregateType(_)):
+					error.span.start == prefix.length() and error.span.end == prefix.length() + annotation.length()
+				_: False
+		None: False
+	match checked_source(source):
+		Ok(_): False
+		Err(error):
+			(
+				typed
+				and error.message == "recursive aggregate types are not supported yet"
+				and error.help == HELP
+				and error.span.start == prefix.length()
+				and error.span.end == prefix.length() + annotation.length()
+			)
+
+
+pure func test_union_through_record_is_admitted() -> Bool:
+	admits("fixed record Expr { form: Form, span: Int }\nfixed union Form:\n    Leaf(Int)\n    Field(Expr, Int)\n")
+
+
+pure func test_union_through_list_is_admitted() -> Bool:
+	admits("fixed union Tree:\n    Leaf(Int)\n    Node(List[Tree])\n")
+
+
+pure func test_record_through_list_of_union_is_admitted() -> Bool:
+	admits("fixed record Expr { form: Form }\nfixed union Form:\n    Leaf(Int)\n    Call(String, List[Expr])\n")
+
+
+pure func test_record_holding_optional_self_is_admitted() -> Bool:
+	admits(MAYBE + "fixed record Node { value: Int, next: Maybe[Node] }\n")
+
+
+pure func test_self_recursive_record_is_admitted() -> Bool:
+	admits("fixed record Node { next: Node }\n")
+
+
+pure func test_mutual_records_are_admitted() -> Bool:
+	admits("fixed record First { next: Second }\nfixed record Second { next: First }\n")
+
+
+pure func test_union_record_union_cycle_is_admitted() -> Bool:
+	admits(MAYBE + "fixed union Branch:\n    ElseIf(Clause)\n    Done\nfixed record Clause { condition: Int, rest: Maybe[Branch] }\n")
+
+
+pure func test_applied_record_argument_is_a_pointer_edge() -> Bool:
+	admits("fixed record Box[T] { value: T }\nfixed union Node:\n    Next(Box[Node])\n    End\n")
+
+
+pure func test_direct_self_payload_inside_a_record_cycle_is_admitted() -> Bool:
+	admits("fixed record Step { operation: Int, rest: Links }\nfixed union Links:\n    Done\n    Link(Step, Links)\n")
+
+
+pure func test_union_only_mutual_cycle_rejects_the_closing_edge() -> Bool:
+	rejects_recursive("fixed union A:\n    Wrap(B)\nfixed union B:\n    Back(", "A", ")\n")
+
+
+pure func test_optional_self_payload_is_a_union_only_cycle() -> Bool:
+	rejects_recursive(MAYBE + "fixed union Node:\n    Next(", "Maybe[Node]", ")\n    End\n")
+
+
+pure func test_two_self_payloads_in_one_variant_still_reject() -> Bool:
+	rejects_recursive("fixed union Tree:\n    Leaf\n    Branch(Tree, ", "Tree", ")\n")
+
+
+pure func test_generic_union_on_a_cycle_through_list_rejects() -> Bool:
+	rejects_recursive("fixed union Tree[T]:\n    Leaf(T)\n    Node(", "List[Tree[T]]", ")\n")
+
+
+pure func test_generic_union_on_a_direct_cycle_rejects() -> Bool:
+	rejects_recursive("fixed union Tree[T]:\n    Leaf(T)\n    Node(", "Tree[T]", ")\n")
+
+
+pure func test_generic_record_on_a_cycle_rejects() -> Bool:
+	rejects_recursive(MAYBE + "fixed record Cell[T] { value: T, next: ", "Maybe[Cell[T]]", " }\n")
+
+
+pure func test_generic_union_body_with_list_parameter_is_a_pointer_edge() -> Bool:
+	admits("fixed union Items[T]:\n    Many(List[T])\n    Empty\nfixed union Node:\n    Next(Items[Node])\n    End\n")
+
+
+pure func test_nested_generic_instances_are_distinct_visits() -> Bool:
+	admits(MAYBE + "fixed record Box[T] { value: T }\nfixed union Node:\n    Pair(Maybe[Maybe[Int]], Box[Box[Int]])\n    End\n")
+
+
+-- A cycle closed inside an applied generic body is reported at the
+-- application that entered it.
+pure func test_generic_reinstantiated_concretely_on_a_union_only_cycle_rejects() -> Bool:
+	rejects_recursive("fixed union Wrap[T]:\n    W(Node)\nfixed union Node:\n    N(", "Wrap[Int]", ")\n")
+
+
+pure func test_generic_reinstantiated_concretely_through_a_record_is_admitted() -> Bool:
+	admits("fixed union Wrap[T]:\n    W(Link)\nfixed record Link { node: Node }\nfixed union Node:\n    N(Wrap[Int])\n")
+
+
+-- A generic body's own instances are checked at its rigid parameters, so
+-- a union-only cycle reachable only from a generic body is still rejected,
+-- whether or not any declaration applies it.
+pure func test_generic_bodies_closing_a_union_only_cycle_reject_unused() -> Bool:
+	rejects_recursive("fixed union A[T]:\n    Stop\n    X(", "B[Int]", ")\nfixed union B[T]:\n    Y(A[Int])\n")
+
+
+pure func test_generic_bodies_closing_a_union_only_cycle_reject_when_used() -> Bool:
+	rejects_recursive("fixed union A[T]:\n    Stop\n    X(", "B[Int]", ")\nfixed union B[T]:\n    Y(A[Int])\npure func mk() -> A[String]:\n    Stop\n")
+
+
+pure func test_generic_union_reinstantiated_concretely_by_itself_rejects_unused() -> Bool:
+	rejects_recursive("fixed union Loop[T]:\n    Stop\n    L(", "Loop[Int]", ")\n")
+
+
+pure func test_generic_union_reinstantiated_concretely_by_itself_rejects_when_used() -> Bool:
+	rejects_recursive("fixed union Loop[T]:\n    Stop\n    L(", "Loop[Int]", ")\npure func mk() -> Loop[String]:\n    Stop\n")
+
+
+-- Walked from A first, the cycle closes at A's own written payload.
+pure func test_generic_pair_reinstantiating_through_parameters_rejects() -> Bool:
+	rejects_recursive("fixed union A[T]:\n    X(", "B[List[T]]", ")\nfixed union B[U]:\n    Stop\n    Y(List[A[U]])\n")
+
+
+pure func test_generic_union_off_the_cycle_is_admitted() -> Bool:
+	-- Maybe is generic but not on the cycle: the cycle runs Node -> Maybe[Node] -> Node.
+	admits(MAYBE + "fixed record Node { next: Maybe[Node] }\n")
+
+
+tests: TestSuite = {
+	description = "Blorp 2 recursive aggregate admission through records and Lists",
+	tests = [
+		("union through record admitted", test_union_through_record_is_admitted),
+		("union through List admitted", test_union_through_list_is_admitted),
+		("record through List of union admitted", test_record_through_list_of_union_is_admitted),
+		("record holding optional self admitted", test_record_holding_optional_self_is_admitted),
+		("self-recursive record admitted", test_self_recursive_record_is_admitted),
+		("mutual records admitted", test_mutual_records_are_admitted),
+		("union-record-union cycle admitted", test_union_record_union_cycle_is_admitted),
+		("applied record argument is a pointer edge", test_applied_record_argument_is_a_pointer_edge),
+		("direct self payload inside a record cycle admitted", test_direct_self_payload_inside_a_record_cycle_is_admitted),
+		("union-only mutual cycle rejected", test_union_only_mutual_cycle_rejects_the_closing_edge),
+		("optional self payload is a union-only cycle", test_optional_self_payload_is_a_union_only_cycle),
+		("two self payloads in one variant still reject", test_two_self_payloads_in_one_variant_still_reject),
+		("generic union on a cycle through List rejects", test_generic_union_on_a_cycle_through_list_rejects),
+		("generic union on a direct cycle rejects", test_generic_union_on_a_direct_cycle_rejects),
+		("generic record on a cycle rejects", test_generic_record_on_a_cycle_rejects),
+		("generic union body with List parameter is a pointer edge", test_generic_union_body_with_list_parameter_is_a_pointer_edge),
+		("nested generic instances are distinct visits", test_nested_generic_instances_are_distinct_visits),
+		("generic reinstantiated concretely on a union-only cycle rejects", test_generic_reinstantiated_concretely_on_a_union_only_cycle_rejects),
+		("generic reinstantiated concretely through a record admitted", test_generic_reinstantiated_concretely_through_a_record_is_admitted),
+		("generic bodies closing a union-only cycle reject unused", test_generic_bodies_closing_a_union_only_cycle_reject_unused),
+		("generic bodies closing a union-only cycle reject when used", test_generic_bodies_closing_a_union_only_cycle_reject_when_used),
+		("generic union reinstantiated concretely by itself rejects unused", test_generic_union_reinstantiated_concretely_by_itself_rejects_unused),
+		("generic union reinstantiated concretely by itself rejects when used", test_generic_union_reinstantiated_concretely_by_itself_rejects_when_used),
+		("generic pair reinstantiating through parameters rejects", test_generic_pair_reinstantiating_through_parameters_rejects),
+		("generic union off the cycle admitted", test_generic_union_off_the_cycle_is_admitted),
+	]
+}

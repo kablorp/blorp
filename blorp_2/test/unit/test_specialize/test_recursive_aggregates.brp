@@ -1,0 +1,222 @@
+import:
+	../../../src/check/check as API
+	../../../src/lex/lex: lex
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic
+	../input: check, parse, setup_diagnostic
+	test: TestSuite
+
+
+private MAYBE: String =
+	|fixed union Maybe[T]:
+	|    Just(T)
+	|    Nothing
+	|
+
+private EXPR: String =
+	|fixed record Expr { form: Form, span: Int }
+	|fixed union Form:
+	|    Leaf(Int)
+	|    Call(String, List[Expr])
+	|    Field(Expr, Int)
+	|
+
+
+private pure func specialized(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parsed ?= parse(tokens)
+	program ?= API.check(parsed).map_err(setup_diagnostic)
+	concrete ?= Concrete.specialize(program)
+	Ok(Concrete.specialized_contents(concrete))
+
+
+private pure func is_union(value_type: Concrete.TypeRef, expected: Int) -> Bool:
+	match value_type:
+		Concrete.UnionType(id): Concrete.union_number(id) == expected
+		_: False
+
+
+private pure func is_record(value_type: Concrete.TypeRef, expected: Int) -> Bool:
+	match value_type:
+		Concrete.RecordType(id): Concrete.record_number(id) == expected
+		_: False
+
+
+private pure func is_list_of_record(value_type: Concrete.TypeRef, expected: Int) -> Bool:
+	match value_type:
+		Concrete.ListType(element): is_record(element, expected)
+		_: False
+
+
+-- Entered at the record: Form completes first (index 0) with pending
+-- references to Expr, which Expr's completion (index 0) fills; the record is
+-- managed and the union owning, and no placeholder is ever published.
+pure func test_record_union_group_publishes_complete_layouts_with_back_references() -> Bool:
+	source: String =
+		|pure func make() -> Expr:
+		|    { form = Field({ form = Leaf(1), span = 2 }, 3), span = 4 }
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+	match specialized(EXPR + source):
+		Err(_): False
+		Ok(program):
+			match (program.records, program.unions):
+				([expr], [form]):
+					match (expr.representation, expr.fields, form.representation, form.variants):
+						(Concrete.ManagedRecord, [field_form, Concrete.IntType], Concrete.InlineOwningPayload, [[Concrete.IntType], [Concrete.StringType, call_elements], [field_expr, Concrete.IntType]]):
+							is_union(field_form, 0) and is_list_of_record(call_elements, 0) and is_record(field_expr, 0)
+						_: False
+				_: False
+
+
+-- Entered at the union through a function signature: the same two layouts
+-- and the same identities result, so order of entry does not matter.
+pure func test_group_entered_at_the_union_agrees() -> Bool:
+	source: String =
+		|pure func leaf() -> Form:
+		|    Leaf(7)
+		|func main() -> Int:
+		|    unused = leaf()
+		|    0
+		|
+	match specialized(EXPR + source):
+		Err(_): False
+		Ok(program):
+			match (program.records, program.unions):
+				([expr], [form]):
+					match (expr.representation, form.representation, form.variants):
+						(Concrete.ManagedRecord, Concrete.InlineOwningPayload, [[Concrete.IntType], [Concrete.StringType, _], [field_expr, Concrete.IntType]]):
+							is_record(field_expr, 0)
+						_: False
+				_: False
+
+
+pure func test_list_of_self_payload_is_an_owning_inline_union() -> Bool:
+	source: String =
+		|fixed union Tree:
+		|    Leaf(Int)
+		|    Node(List[Tree])
+		|pure func make() -> Tree:
+		|    Node([Leaf(1), Leaf(2)])
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+	match specialized(source):
+		Err(_): False
+		Ok(program):
+			match program.unions:
+				[tree]:
+					match (tree.representation, tree.variants):
+						(Concrete.InlineOwningPayload, [[Concrete.IntType], [Concrete.ListType(element)]]): is_union(element, 0)
+						_: False
+				_: False
+
+
+-- Maybe[Node] is prepared while Node is in progress: its instance key holds a
+-- pending argument until Node completes, then both layouts are complete.
+pure func test_generic_instance_over_an_in_progress_record_resolves() -> Bool:
+	source: String =
+		|fixed record Node { value: Int, next: Maybe[Node] }
+		|pure func make() -> Node:
+		|    { value = 1, next = Just({ value = 2, next = Nothing }) }
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+	match specialized(MAYBE + source):
+		Err(_): False
+		Ok(program):
+			match (program.records, program.unions):
+				([node], [maybe]):
+					match (node.representation, node.fields, maybe.representation, maybe.variants):
+						(Concrete.ManagedRecord, [Concrete.IntType, next], Concrete.InlineOwningPayload, [[just], []]):
+							is_union(next, 0) and is_record(just, 0)
+						_: False
+				_: False
+
+
+pure func test_mutual_records_are_both_managed() -> Bool:
+	source: String =
+		|fixed record First { next: Second }
+		|fixed record Second { back: First, value: Int }
+		|pure func make() -> Maybe[First]:
+		|    Nothing
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+	match specialized(MAYBE + source):
+		Err(_): False
+		Ok(program):
+			-- Entered at First, Second completes first and takes index 0.
+			match program.records:
+				[second, first]:
+					match (second.representation, second.fields, first.representation, first.fields):
+						(Concrete.ManagedRecord, [back, Concrete.IntType], Concrete.ManagedRecord, [next]):
+							is_record(back, 1) and is_record(next, 0)
+						_: False
+				_: False
+
+
+pure func test_direct_self_payload_inside_a_record_group_is_boxed() -> Bool:
+	source: String =
+		|fixed record Step { operation: Int, rest: Links }
+		|fixed union Links:
+		|    Done
+		|    Link(Step, Links)
+		|pure func make() -> Links:
+		|    Link({ operation = 1, rest = Done }, Done)
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+	match specialized(source):
+		Err(_): False
+		Ok(program):
+			match (program.records, program.unions):
+				([step], [links]):
+					match (step.representation, step.fields, links.representation, links.variants):
+						(Concrete.ManagedRecord, [Concrete.IntType, rest], Concrete.BoxedRecursive, [[], [link_step, link_rest]]):
+							is_union(rest, 0) and is_record(link_step, 0) and is_union(link_rest, 0)
+						_: False
+				_: False
+
+
+-- The same instance requested twice while its group is in progress is one slot.
+pure func test_repeated_pending_instance_is_one_slot() -> Bool:
+	source: String =
+		|fixed record Node { left: Maybe[Node], right: Maybe[Node] }
+		|pure func make() -> Maybe[Node]:
+		|    Nothing
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+	match specialized(MAYBE + source):
+		Err(_): False
+		Ok(program):
+			match (program.records, program.unions):
+				([node], [maybe]):
+					match node.fields:
+						[left, right]: is_union(left, 0) and is_union(right, 0) and maybe.variants.length() == 2
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 recursive layout groups in specialization",
+	tests = [
+		("record-union group publishes complete layouts with back references", test_record_union_group_publishes_complete_layouts_with_back_references),
+		("group entered at the union agrees", test_group_entered_at_the_union_agrees),
+		("List of self payload is an owning inline union", test_list_of_self_payload_is_an_owning_inline_union),
+		("generic instance over an in-progress record resolves", test_generic_instance_over_an_in_progress_record_resolves),
+		("mutual records are both managed", test_mutual_records_are_both_managed),
+		("direct self payload inside a record group is boxed", test_direct_self_payload_inside_a_record_group_is_boxed),
+		("repeated pending instance is one slot", test_repeated_pending_instance_is_one_slot),
+	]
+}

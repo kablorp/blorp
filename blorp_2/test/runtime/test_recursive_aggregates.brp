@@ -1,0 +1,57 @@
+import:
+	../../src/specialize/specialize as Concrete
+	../../src/verify/verify: VerifiedProgram, verified_contents
+	./test_record: RuntimeCase, runtime_passes
+	test: TestSuite
+
+
+-- Reachable constructors establish the layouts: Expr is record 0 (managed),
+-- Form is union 0 (owning), List[Expr] the one List layout.
+private RUNTIME_SOURCE: String =
+	|fixed record Expr { form: Form, span: Int }
+	|fixed union Form:
+	|    Leaf(Int)
+	|    Call(String, List[Expr])
+	|    Field(Expr, Int)
+	|pure func text(value: Int) -> String:
+	|    builtin("int.to_string")
+	|pure func make() -> Expr:
+	|    { form = Call(text(1), [{ form = Field({ form = Leaf(1), span = 1 }, 2), span = 3 }]), span = 4 }
+	|func main() -> Int:
+	|    unused = make()
+	|    0
+	|
+
+
+private pure func tree_catalog(program: VerifiedProgram) -> Bool:
+	contents = verified_contents(program)
+	match (contents.records, contents.unions):
+		([expr], [form]):
+			match (expr.representation, expr.fields, form.representation, form.variants):
+				(Concrete.ManagedRecord, [Concrete.UnionType(stored), Concrete.IntType], Concrete.InlineOwningPayload, [[Concrete.IntType], [Concrete.StringType, Concrete.ListType(Concrete.RecordType(element))], [Concrete.RecordType(inner), Concrete.IntType]]):
+					Concrete.union_number(stored) == 0 and Concrete.record_number(element) == 0 and Concrete.record_number(inner) == 0
+				_: False
+		_: False
+
+
+private CASES: List[RuntimeCase] = [
+	{ description = "a Field chain frees every node once", name = "field_chain" },
+	{ description = "a Call frees its String, its List root and every element", name = "call_list" },
+	{ description = "a shared subtree survives its first parent", name = "shared_subtree" },
+	{ description = "nonfinal release keeps the tree", name = "nonfinal" },
+	{ description = "a 1,000-deep Expr tree frees every node once", name = "deep" },
+	{ description = "100,000 records in one List free every node once", name = "wide" },
+]
+
+
+func test_runtime() -> Bool:
+	runtime_passes(
+		RUNTIME_SOURCE, tree_catalog,
+		"blorp_2/test/runtime/fixtures/recursive_aggregates_test.c", CASES,
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 release runtime for recursive layout groups",
+	tests = [("Expr tree catalog and exact release counts", test_runtime)]
+}
