@@ -17,6 +17,7 @@ import:
 		LogicalOperator(AndOperator, OrOperator),
 		ElseBranch(ElseIf, ElseBlock),
 		ParsedIf,
+		ParsedMatch,
 		FunctionHeader,
 		LexedProgram,
 		ParsedBinding,
@@ -1033,8 +1034,9 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
 			consume_opaque_conversion(start, Wrapping)
 		SymbolToken(FromOpaqueKeyword):
 			consume_opaque_conversion(start, Unwrapping)
+		-- In any value position: a dangling `else` line, or `x = else`.
 		SymbolToken(ElseKeyword):
-			Err(expected(start, "`else` has no matching `if`", "put else at the indentation of its if, directly after the if branch"))
+			Err(expected(start, "`else` has no matching `if`", "write else on its own line at the indentation of its if, directly after the if branch; else is not a value"))
 		_:
 			Err(expected(start, "expected a return expression", EXPRESSION_HELP))
 
@@ -1195,6 +1197,8 @@ private pure func consume_operand(start: ParserState) -> Result[ParsedValue, Dia
 					consume_grouped_value(start, token.span)
 				SymbolToken(IfKeyword):
 					consume_if(start)
+				SymbolToken(MatchKeyword):
+					consume_match_value(start)
 				_:
 					base ?= consume_base(start, token)
 					postfixes ?= consume_postfixes(base.next, [], base.span.end)
@@ -1818,7 +1822,22 @@ private pure func consume_arms(state: ParserState, arms: List[ParsedMatchArm]) -
 		consume_arms(arm.next, gathered)
 
 
-private pure func consume_match(start: ParserState) -> Result[BodyResult, Diagnostic]:
+-- A match anywhere but a function's tail: one value, ending at its last
+-- arm's Dedent like an if-expression.
+private pure func consume_match_value(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	parsed ?= consume_match_form(start)
+	span = parsed.form.span
+	Ok({ body = { base = MatchExpression(parsed.form), base_span = span, applications = [], span = span }, next = parsed.next, ending = BlockEnding })
+
+
+private fixed record MatchResult {
+	form: ParsedMatch,
+	next: ParserState
+}
+
+
+-- `start` is at `match`: the scrutinee, `:` and the indented arms.
+private pure func consume_match_form(start: ParserState) -> Result[MatchResult, Diagnostic]:
 	keyword = parser_span(start)
 	after_keyword = shifted(start, 1)
 	separated ?= if at_spaced_token(after_keyword):
@@ -1831,12 +1850,12 @@ private pure func consume_match(start: ParserState) -> Result[BodyResult, Diagno
 	opened ?= expect(newline, at_indent(newline), "expected an indented match arm", "indent each arm one tab or four spaces deeper than its match")
 	arms ?= consume_arms(opened, [])
 	Ok({
-		body = ParsedMatchBody({
+		form = {
 			scrutinee = scrutinee.body,
 			arms = arms.arms,
 			keyword_span = keyword,
 			span = { keyword | end = arms.end }
-		}),
+		},
 		next = arms.next,
 	})
 
@@ -1988,10 +2007,16 @@ private fixed union FunctionLine:
 -- block's Dedent must follow it.
 private pure func consume_function_line(state: ParserState, statements: List[ParsedStatement]) -> Result[FunctionLine, Diagnostic]:
 	match current_symbol(state):
+		-- The function's last match is its tail body; an earlier one is a
+		-- statement whose value is a MatchExpression.
 		Some(MatchKeyword):
-			matched ?= consume_match(state)
-			closed ?= expect(matched.next, at_dedent(matched.next), "a match must end its function", "move the statements after the match before it, or indent further arms one level deeper than the match")
-			Ok(BodyEnd(matched.body, closed))
+			matched ?= consume_match_form(state)
+
+			if at_dedent(matched.next):
+				Ok(BodyEnd(ParsedMatchBody(matched.form), shifted(matched.next, 1)))
+			else:
+				span = matched.form.span
+				Ok(BodyStatement(ExpressionStatement({ base = MatchExpression(matched.form), base_span = span, applications = [], span = span }), matched.next))
 		Some(BuiltinKeyword):
 			closed ?= consume_builtin_lines(state, statements)
 			Ok(BodyEnd(closed.body, closed.next))

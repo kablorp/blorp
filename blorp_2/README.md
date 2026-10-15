@@ -835,9 +835,12 @@ if-expression; the form is one expression in value and statement positions
 alike. It ends at its last block's dedent: no operator, range or UFCS
 suffix on the next line continues it, and a binding or line it ends needs
 no newline of its own. An `else` with no `if` to belong to is a syntax
-error. Ranges parse and are rejected by checking
-until the loops milestone; `and`, `or`, `not` and `if` until the join
-milestone.
+error. A `match` anywhere but a function's tail (bound, nested in an arm
+or branch block, or followed by further lines) is likewise one expression
+ending at its last arm's dedent; the function's last match stays its tail
+body. Ranges parse and are rejected by checking
+until the loops milestone; `and`, `or`, `not`, `if` and non-tail `match`
+until the join milestone.
 A dotted type such as `Shared.Span[Int]` is a qualified type. Checking rejects
 qualified forms until the namespace milestone.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
@@ -985,8 +988,8 @@ Lexical and layout rules:
   continue inside brackets. Bindings and bare expression statements may interleave before
   the mandatory final expression or function tail match. A non-final bare
   expression must return Void; bind or return other values. Bindings inside
-  arguments and annotations are unsupported. An arm block cannot contain a
-  nested match.
+  arguments and annotations are unsupported. An arm block may end with a
+  nested match, which checking rejects until the join milestone.
 - Integer literals are decimal values from `-9223372036854775808` through
   `9223372036854775807`, with an optional adjacent minus. `-0` is accepted
   and has value zero. Leading zeros (`00`, `-01`), plus signs, separated minus
@@ -1156,9 +1159,9 @@ Semantic rules:
   are admitted before an ordinary terminating match. Each selected arm discharges
   prefix obligations after securing its result. Literal construction creates a
   fresh ordinary String owner. COW, joins and managed annotated loops are deferred.
-- Recursive layouts, nested matches,
+- Recursive layouts, nested and non-tail matches (they parse; checking rejects them),
   guards, qualified/nested/literal patterns, constructor UFCS, multiline chains,
-  non-tail matches, and function
+  and function
   values are outside this increment. `Bool` is an ordinary fixed union declared
   once in the base module, alongside Option and Result. Local functions and
   explicitly imported functions support both call notations; type selections

@@ -1,0 +1,161 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, module_contents, parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		Diagnostic,
+		ExpressionBase(IfExpression, IntegerExpression, MatchExpression, NameExpression),
+		ParsedBody(ParsedMatchBody, ParsedValueBody),
+		ParsedFunction,
+		ParsedMatch,
+		ParsedStatement(BindingStatement, ExpressionStatement),
+		ValueExpression,
+	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+private EXPRESSION_HELP: String = "use a literal, a parameter or variant name, or a call as the entire body"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+private pure func main_function(source: String) -> Option[ParsedFunction]:
+	match parse_source(source):
+		Ok(parsed):
+			module_contents(parsed).functions.get(0)
+		Err(_):
+			None
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parse_source(source):
+		Err(diagnostic):
+			diagnostic.span.start == start and diagnostic.span.end == end and diagnostic.message == message and diagnostic.help == help
+		Ok(_):
+			False
+
+
+private pure func match_value(value: ValueExpression) -> Option[ParsedMatch]:
+	match value.base:
+		MatchExpression(form):
+			Some(form)
+		_:
+			None
+
+
+-- `x = match v:` binds the match's value; the arms end the binding's line.
+pure func test_bound_match_is_the_initializer() -> Bool:
+	match main_function(HEADER + "\tx = match v:\n\t\tA: 1\n\t\tB: 2\n\tx\n"):
+		Some(function):
+			match (function.statements, function.body):
+				([BindingStatement(binding)], ParsedValueBody(value)):
+					match (match_value(binding.initializer), value.base):
+						(Some(form), NameExpression(_)):
+							(
+								form.span.start == 25 and form.span.end == 47 and form.keyword_span.end == 30
+								and form.arms.length() == 2 and form.scrutinee.span.start == 31 and value.span.start == 49
+							)
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+-- A match followed by more lines is an expression statement; only the
+-- function's last match is its tail.
+pure func test_match_before_a_value_is_a_statement() -> Bool:
+	match main_function(HEADER + "\tmatch v:\n\t\t_: 0\n\t1\n"):
+		Some(function):
+			match (function.statements, function.body):
+				([ExpressionStatement(statement)], ParsedValueBody(value)):
+					match (match_value(statement), value.base):
+						(Some(form), IntegerExpression(1)):
+							form.span.start == 21 and form.span.end == 36 and value.span.start == 38
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_tail_match_stays_the_function_body() -> Bool:
+	match main_function(HEADER + "\tmatch v:\n\t\t_: 0\n"):
+		Some(function):
+			match function.body:
+				ParsedMatchBody(form):
+					function.statements.is_empty() and form.span.end == 36
+				_:
+					False
+		None:
+			False
+
+
+-- An arm block's value may be a match of its own.
+pure func test_arm_block_nests_a_match() -> Bool:
+	match main_function(HEADER + "\tmatch v:\n\t\tA:\n\t\t\tmatch w:\n\t\t\t\t_: 1\n\t\tB: 2\n"):
+		Some(function):
+			match function.body:
+				ParsedMatchBody(outer):
+					match outer.arms:
+						[first, _]:
+							match first.block.value.and_then(pure func(value): match_value(value)):
+								Some(inner):
+									inner.span.start == 38 and inner.span.end == 55 and outer.span.end == 62 and inner.arms.length() == 1
+								None:
+									False
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_if_branch_ends_with_a_match() -> Bool:
+	match main_function(HEADER + "\tif True:\n\t\tmatch v:\n\t\t\t_: 1\n\telse:\n\t\t2\n"):
+		Some(function):
+			match function.body:
+				ParsedValueBody(value):
+					match value.base:
+						IfExpression(form):
+							form.then_block.value.and_then(pure func(value): match_value(value)).is_some()
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+-- A match ends its expression at its last arm's dedent.
+pure func test_match_ends_its_expression_at_the_dedent() -> Bool:
+	rejects(HEADER + "\tx = match v:\n\t\t_: 1\n\tand True\n", 42, 45, "expected a return expression", EXPRESSION_HELP)
+
+
+pure func test_bound_match_keeps_the_match_header_errors() -> Bool:
+	(
+		rejects(HEADER + "\tx = match v\n", 32, 33, "expected ':' after the match value", "write match value: and put each arm on the next line")
+		and rejects(HEADER + "\tx = match v:\n\t0\n", 35, 36, "expected an indented match arm", "indent each arm one tab or four spaces deeper than its match")
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 match expression syntax",
+	tests = [
+		("bound match is the initializer", test_bound_match_is_the_initializer),
+		("match before a value is a statement", test_match_before_a_value_is_a_statement),
+		("tail match stays the function body", test_tail_match_stays_the_function_body),
+		("arm block nests a match", test_arm_block_nests_a_match),
+		("if branch ends with a match", test_if_branch_ends_with_a_match),
+		("match ends its expression at the dedent", test_match_ends_its_expression_at_the_dedent),
+		("bound match keeps the match header errors", test_bound_match_keeps_the_match_header_errors),
+	]
+}
