@@ -1664,11 +1664,11 @@ with structured element types use the same closed contracts. For example,
 `Pair[A, B]` can be a wrapper's element type; the compiler does not impose a
 one-bare-parameter rule.
 
-Emission derives a disposable helper inventory from accepted concrete types,
-including local definitions and runtime operation elements. Helpers retain full
+Emission derives a disposable list-layout table from accepted concrete types,
+including local definitions. Helpers retain full
 record and union instance identities, including phantom type arguments. A flat
 key records outer List depth and terminal type/identity; it is an emission
-projection, never a layout or ownership authority. The inventory is sorted and
+projection, never a layout or ownership authority. The table is sorted and
 deduplicated once, and C names project from the same key without per-use scans.
 Nested helper dependencies reuse their suffix keys rather than rewalking type
 ancestry. The finite concrete layouts remain the authority for element storage

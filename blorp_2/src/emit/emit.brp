@@ -2089,7 +2089,7 @@ private pure func needs_float_runtime(program: OwnershipProgram) -> Bool:
 	needed
 
 
--- This inventory lives for one emission only. Its complete key is a projection
+-- This table lives for one emission only. Its complete key is a projection
 -- of concrete TypeRefs, not an ownership or layout authority. Stable sorting
 -- and adjacent key equality avoid scanning existing helpers at each occurrence.
 private fixed record ListLayout {
@@ -2126,40 +2126,9 @@ private pure func type_list_layouts(value_type: TypeRef) -> List[ListLayout]:
 		_: []
 
 
-private pure func operation_list_layouts(operation: OwnershipOperation) -> List[ListLayout]:
-	match operation:
-		DefineValue(definition):
-			value_layouts = type_list_layouts(definition.value_type)
-			runtime_layouts: List[ListLayout] = match definition.operation:
-				CallDefinition(call, _):
-					match call.target:
-						RuntimeFunction(operation):
-							match operation:
-								ListRepeat(element): element_list_layouts(element)
-								ListLength(element): element_list_layouts(element)
-								ListGet(element, _): element_list_layouts(element)
-								ListAppend(element): element_list_layouts(element)
-								ListSet(element): element_list_layouts(element)
-								ListConcat(element): element_list_layouts(element)
-								_: []
-						_: []
-				_: []
-			value_layouts.concat(runtime_layouts)
-		_: []
-
-
-private pure func block_list_layouts(operations: List[OwnershipOperation]) -> List[ListLayout]:
-	var layouts: List[ListLayout] = []
-	for operation in operations:
-		chunk = operation_list_layouts(operation)
-		for layout in chunk:
-			layouts = layouts.append(layout)
-	layouts
-
-
 -- A function's blocks in the order their values and owners are numbered:
 -- its prefix, then each match arm, each block followed by its joins' arms.
--- Owner types and every inventory below walk exactly these blocks.
+-- Owner types and the program inventory walk exactly these blocks.
 private pure func function_blocks(function: OwnedFunction) -> List[List[OwnershipOperation]]:
 	var blocks = append_block([], function.operations)
 	match function.tail:
@@ -2189,34 +2158,57 @@ private pure func append_block(
 	collected
 
 
-private pure func list_layouts(program: OwnershipProgram) -> List[ListLayout]:
-	var layouts: List[ListLayout] = []
+-- What emission inventories, found in one walk of the verified program: the
+-- type of every declared field and payload and of every defined value, and
+-- every runtime operation called. The list layouts read the types and the list
+-- update helpers read the calls, so neither walks the program again. A
+-- signature type needs no entry of its own because the verifier ties it to a
+-- defined value: a parameter's definition takes its type from the signature, a
+-- call result must match the callee's return type, and the returned value must
+-- match the function's.
+private fixed record ProgramInventory {
+	types: List[TypeRef],
+	runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]]
+}
 
-	for record_layout in program.records:
-		for value_type in record_layout.fields:
-			chunk = type_list_layouts(value_type)
-			for layout in chunk:
-				layouts = layouts.append(layout)
 
-	for declaration in program.unions:
-		for fields in declaration.variants:
+private pure func program_inventory(program: OwnershipProgram) -> ProgramInventory:
+	var types: List[TypeRef] = []
+	var runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]] = []
+
+	for layout in program.records:
+		for field in layout.fields:
+			types = types.append(field)
+
+	for layout in program.unions:
+		for fields in layout.variants:
 			for value_type in fields:
-				chunk = type_list_layouts(value_type)
-				for layout in chunk:
-					layouts = layouts.append(layout)
+				types = types.append(value_type)
 
 	for function in program.functions:
-		for parameter in function.signature.parameters:
-			chunk = type_list_layouts(parameter)
-			for layout in chunk:
-				layouts = layouts.append(layout)
-		returned = type_list_layouts(function.signature.return_type)
-		for layout in returned:
-			layouts = layouts.append(layout)
 		for block in function_blocks(function):
-			chunk = block_list_layouts(block)
-			for layout in chunk:
-				layouts = layouts.append(layout)
+			for operation in block:
+				match operation:
+					DefineValue(definition):
+						types = types.append(definition.value_type)
+						match definition.operation:
+							CallDefinition(call, _):
+								match call.target:
+									RuntimeFunction(runtime): runtime_calls = runtime_calls.append(runtime)
+									_: void
+							_: void
+					AcquireOwner(_, _, _) | DropOwner(_, _):
+						void
+
+	{ types = types, runtime_calls = runtime_calls }
+
+
+private pure func list_layouts(inventory: ProgramInventory) -> List[ListLayout]:
+	var layouts: List[ListLayout] = []
+
+	for value_type in inventory.types:
+		for layout in type_list_layouts(value_type):
+			layouts = layouts.append(layout)
 
 	ordered = layouts
 		.sort_by(pure func(layout): list_key_ordinal(layout.key))
@@ -2235,7 +2227,7 @@ private pure func list_layouts(program: OwnershipProgram) -> List[ListLayout]:
 
 
 -- An update helper is emitted only where its operation is called. The
--- inventory is deduplicated by scanning its own entries: there are at most
+-- helper list is deduplicated by scanning its own entries: there are at most
 -- three per element layout, so the scan stays small for any call count.
 private fixed record ListUpdateHelper {
 	update: ListUpdate,
@@ -2263,30 +2255,18 @@ private pure func update_helper(update: ListUpdate, element: TypeRef) -> ListUpd
 	{ update = update, layout = { element = element, key = list_element_key(element) } }
 
 
-private pure func operation_list_update(operation: OwnershipOperation) -> Option[ListUpdateHelper]:
+private pure func call_list_update(operation: RuntimeOperation[VariantInstanceId, TypeRef]) -> Option[ListUpdateHelper]:
 	match operation:
-		DefineValue(definition):
-			match definition.operation:
-				CallDefinition(call, _):
-					match call.target:
-						RuntimeFunction(operation):
-							match operation:
-								ListAppend(element): Some(update_helper(AppendUpdate, element))
-								ListSet(element): Some(update_helper(SetUpdate, element))
-								ListConcat(element): Some(update_helper(ConcatUpdate, element))
-								_: None
-						_: None
-				_: None
+		ListAppend(element): Some(update_helper(AppendUpdate, element))
+		ListSet(element): Some(update_helper(SetUpdate, element))
+		ListConcat(element): Some(update_helper(ConcatUpdate, element))
 		_: None
 
 
-private pure func add_block_list_updates(
-	helpers: List[ListUpdateHelper],
-	operations: List[OwnershipOperation],
-) -> List[ListUpdateHelper]:
-	var unique = helpers
-	for operation in operations:
-		match operation_list_update(operation):
+private pure func list_update_helpers(inventory: ProgramInventory) -> List[ListUpdateHelper]:
+	var unique: List[ListUpdateHelper] = []
+	for operation in inventory.runtime_calls:
+		match call_list_update(operation):
 			None: void
 			Some(helper):
 				var known = False
@@ -2297,14 +2277,6 @@ private pure func add_block_list_updates(
 				if not known:
 					unique = unique.append(helper)
 	unique
-
-
-private pure func list_update_helpers(program: OwnershipProgram) -> List[ListUpdateHelper]:
-	var helpers: List[ListUpdateHelper] = []
-	for function in program.functions:
-		for block in function_blocks(function):
-			helpers = add_block_list_updates(helpers, block)
-	helpers
 
 
 private pure func append_list_prototypes(output: String, layouts: List[ListLayout]) -> String:
@@ -2379,7 +2351,7 @@ private pure func append_list_updates(
 		var fragments: List[String] = [output]
 		var failure: Option[Diagnostic] = None
 		-- At most three helpers share one layout, so recomputing its few
-		-- fragments costs less than keying them from the layout inventory.
+		-- fragments costs less than keying them from the layout table.
 		for helper in helpers:
 			match element_fragments(helper.layout, unions, records):
 				Err(error):
@@ -2419,12 +2391,13 @@ private pure func append_list_runtime(
 private pure func aggregate_runtime_contents(
 	checked: OwnershipProgram,
 	lists: List[ListLayout],
+	helpers: List[ListUpdateHelper],
 ) -> Result[String, Diagnostic]:
 	-- The host copies a `var` list on each append after a `?=` that follows its declaration.
 	-- Both `?=` therefore precede `fragments`; `ready ?=` follows the loops and costs one copy.
 	ordered ?= append_aggregate_definitions(checked.records, checked.unions)
 	completed ?= append_list_runtime("", lists, checked.unions, checked.records)
-	updates ?= append_list_updates("", list_update_helpers(checked), checked.unions, checked.records)
+	updates ?= append_list_updates("", helpers, checked.unions, checked.records)
 	var fragments: List[String] = [append_list_prototypes("", lists)]
 	var index: Int = 0
 
@@ -2494,14 +2467,16 @@ private pure func has_boxed_union(unions: List[ConcreteUnion]) -> Bool:
 
 pure func aggregate_runtime(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	checked = verified_contents(program)
-	aggregate_runtime_contents(checked, list_layouts(checked))
+	inventory = program_inventory(checked)
+	aggregate_runtime_contents(checked, list_layouts(inventory), list_update_helpers(inventory))
 
 
 pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	checked = verified_contents(program)
 	records = checked.records
-	lists = list_layouts(checked)
-	aggregates ?= aggregate_runtime_contents(checked, lists)
+	inventory = program_inventory(checked)
+	lists = list_layouts(inventory)
+	aggregates ?= aggregate_runtime_contents(checked, lists, list_update_helpers(inventory))
 
 	-- C is collected as fragments and joined once; appending each one to the
 	-- whole output would copy everything emitted so far at every step. The host
