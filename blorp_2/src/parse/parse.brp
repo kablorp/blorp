@@ -1013,16 +1013,21 @@ private pure func string_value(raw: String, span: Span) -> Result[String, Diagno
 
 
 -- How a value's syntax ended: inline, so a Newline must follow it, or with
--- a control form's block, whose Dedent has already ended the line.
+-- a control form's block or a method chain's last line, whose Dedent has
+-- already ended the line.
 private fixed union ValueEnding:
 	InlineEnding
 	BlockEnding
 
 
+-- `owed` counts the Indents a method chain inside the value still owns
+-- (host 4.2): their Dedents follow the value's line end and belong to the
+-- enclosing statement (host D4), so `end_value` consumes them.
 private fixed record ParsedValue {
 	body: ValueExpression,
 	next: ParserState,
-	ending: ValueEnding
+	ending: ValueEnding,
+	owed: Int
 }
 
 
@@ -1040,12 +1045,34 @@ private pure func inline(value: ParsedValue) -> Bool:
 private pure func end_value(value: ParsedValue, message: String, help: String) -> Result[ParserState, Diagnostic]:
 	match value.ending:
 		BlockEnding:
-			Ok(value.next)
+			consume_owed_dedents(value.next, value.owed)
 		InlineEnding:
 			if bracketed(value.next) and at_closing_bracket(value.next):
 				Err(expected(value.next, "a block inside brackets must end before the closing bracket", "put the closing bracket on its own line, at or below the indentation of the line that opened the block"))
 			else:
-				consume_line_end(value.next, message, help)
+				ended ?= consume_line_end(value.next, message, help)
+				consume_owed_dedents(ended, value.owed)
+
+
+-- The Dedents closing a method chain's levels after the value's line end.
+private pure func consume_owed_dedents(state: ParserState, owed: Int) -> Result[ParserState, Diagnostic]:
+	if IntOps.equals(owed, 0):
+		Ok(state)
+	else:
+		closed ?= expect(state, at_dedent(state), "expected the method chain's deeper lines to end", "dedent back to the statement's own indentation after the chain")
+		consume_owed_dedents(closed, IntOps.subtract(owed, 1))
+
+
+-- An `if`, `while`, `for` or `match` header's value. An indented method
+-- chain there would still own its Indent when the header's `:` opens the
+-- block, leaving its Dedent inside the block; the host rejects it too.
+private pure func consume_header_value(state: ParserState) -> Result[ParsedValue, Diagnostic]:
+	value ?= consume_value(state)
+
+	if IntOps.equals(value.owed, 0):
+		Ok(value)
+	else:
+		Err(expected(value.next, "a method chain in a block header must end on its line", "bind the chained value before the header, then use the binding"))
 
 
 -- An expression's base before its postfix operations.
@@ -1246,20 +1273,58 @@ private pure func consume_postfix(state: ParserState) -> Result[ParsedPostfix, D
 		Ok({ operation = FieldAccess(name.name), end = name.name.span.end, next = name.next })
 
 
+-- `ending` is BlockEnding when an indented chain's Dedent ended the line;
+-- `owed` counts the chain's Indents still open when the chain ended with
+-- something other than a line break (host 4.2, leaked indentation).
 private fixed record ParsedPostfixes {
 	applications: List[PostfixOperation],
 	end: Int,
-	next: ParserState
+	next: ParserState,
+	ending: ValueEnding,
+	owed: Int
 }
 
 
 -- `end` is where the last postfix operation, or else the base, ends.
 private pure func consume_postfixes(state: ParserState, applications: List[PostfixOperation], end: Int) -> Result[ParsedPostfixes, Diagnostic]:
-	if not at_dot(state):
-		Ok({ applications = applications, end = end, next = state })
-	else:
+	consume_chain(state, applications, end, 0)
+
+
+-- The postfix loop with the host's method-chain continuation (4.2): a `.`
+-- on the next line continues the chain, at the same indentation or one
+-- Indent deeper, and the chain owns each Indent it takes (`owned`). A
+-- Dedent, with or without a Newline before it, closes one owned level and
+-- ends the chain when none remains. Inside an indented chain a line must
+-- start with `.`. The chain ends with the line's Dedent already consumed,
+-- or inline with its owned levels owed to the enclosing statement.
+private pure func consume_chain(state: ParserState, applications: List[PostfixOperation], end: Int, owned: Int) -> Result[ParsedPostfixes, Diagnostic]:
+	after_newline = shifted(state, 1)
+
+	if at_dot(state):
 		postfix ?= consume_postfix(shifted(state, 1))
-		consume_postfixes(postfix.next, applications.append(postfix.operation), postfix.end)
+		consume_chain(postfix.next, applications.append(postfix.operation), postfix.end, owned)
+	else if at_newline(state) and at_indent(after_newline) and at_dot(shifted(state, 2)):
+		consume_chain(shifted(state, 2), applications, end, IntOps.add(owned, 1))
+	else if at_newline(state) and at_dot(after_newline):
+		consume_chain(after_newline, applications, end, owned)
+	else if IntOps.greater_than(owned, 0) and at_dedent(state):
+		close_chain_level(after_newline, applications, end, owned)
+	else if IntOps.greater_than(owned, 0) and at_newline(state) and at_dedent(after_newline):
+		close_chain_level(shifted(state, 2), applications, end, owned)
+	else if IntOps.greater_than(owned, 0) and at_newline(state):
+		Err(expected(after_newline, "expected `.` to continue the method chain", "start the line with `.`, or move it out of the chain"))
+	else:
+		Ok({ applications = applications, end = end, next = state, ending = InlineEnding, owed = owned })
+
+
+-- `state` follows the Dedent that closed one owned level.
+private pure func close_chain_level(state: ParserState, applications: List[PostfixOperation], end: Int, owned: Int) -> Result[ParsedPostfixes, Diagnostic]:
+	remaining = IntOps.subtract(owned, 1)
+
+	if IntOps.equals(remaining, 0):
+		Ok({ applications = applications, end = end, next = state, ending = BlockEnding, owed = 0 })
+	else:
+		consume_chain(state, applications, end, remaining)
 
 
 -- Precedence, lowest first, as in the host: `or`, `and`, `not`, `..`, then
@@ -1303,7 +1368,7 @@ private pure func consume_conjunction(start: ParserState) -> Result[ParsedValue,
 -- operations of its own.
 private pure func logical(operator: LogicalOperator, left: ParsedValue, right: ParsedValue) -> ParsedValue:
 	span = { left.body.span | end = right.body.span.end }
-	{ body = { base = LogicalExpression(operator, left.body, right.body), base_span = span, applications = [], span = span }, next = right.next, ending = right.ending }
+	{ body = { base = LogicalExpression(operator, left.body, right.body), base_span = span, applications = [], span = span }, next = right.next, ending = right.ending, owed = IntOps.add(left.owed, right.owed) }
 
 
 private pure func consume_negation(start: ParserState) -> Result[ParsedValue, Diagnostic]:
@@ -1313,7 +1378,7 @@ private pure func consume_negation(start: ParserState) -> Result[ParsedValue, Di
 		keyword = parser_span(start)
 		operand ?= consume_negation(shifted(start, 1))
 		span = { keyword | end = operand.body.span.end }
-		Ok({ body = { base = NotExpression(operand.body), base_span = span, applications = [], span = span }, next = operand.next, ending = operand.ending })
+		Ok({ body = { base = NotExpression(operand.body), base_span = span, applications = [], span = span }, next = operand.next, ending = operand.ending, owed = operand.owed })
 
 
 -- One operand, or `low..high`: two operands around '..'. A range has no
@@ -1332,7 +1397,7 @@ private pure func consume_range(start: ParserState) -> Result[ParsedValue, Diagn
 		else:
 			consume_operand(after_dots)
 		span = { low.body.span | end = high.body.span.end }
-		Ok({ body = { base = RangeExpression(low.body, high.body), base_span = span, applications = [], span = span }, next = high.next, ending = high.ending })
+		Ok({ body = { base = RangeExpression(low.body, high.body), base_span = span, applications = [], span = span }, next = high.next, ending = high.ending, owed = IntOps.add(low.owed, high.owed) })
 
 
 -- A base and its postfix operations, or a control form, which takes none.
@@ -1367,7 +1432,8 @@ private pure func consume_operand(start: ParserState) -> Result[ParsedValue, Dia
 							span = { token.span | end = postfixes.end }
 						},
 						next = postfixes.next,
-						ending = InlineEnding,
+						ending = postfixes.ending,
+						owed = postfixes.owed,
 					})
 
 
@@ -1407,6 +1473,7 @@ private pure func consume_lambda(start: ParserState) -> Result[ParsedValue, Diag
 		body = { base = LambdaExpression(lambda), base_span = span, applications = [], span = span },
 		next = with_context(body.next, start.context),
 		ending = body.ending,
+		owed = body.owed,
 	})
 
 
@@ -1502,6 +1569,7 @@ private fixed record LambdaBodyResult {
 	body: LambdaBody,
 	end: Int,
 	ending: ValueEnding,
+	owed: Int,
 	next: ParserState
 }
 
@@ -1513,10 +1581,10 @@ private pure func consume_lambda_body(after_colon: ParserState) -> Result[Lambda
 		newline = shifted(after_colon, 1)
 		first ?= expect(newline, at_indent(newline), INDENTED_BLOCK_MESSAGE, INDENTED_BLOCK_HELP)
 		block ?= consume_block(first)
-		Ok({ body = BlockBody(block.block), end = block.block.span.end, ending = BlockEnding, next = block.next })
+		Ok({ body = BlockBody(block.block), end = block.block.span.end, ending = BlockEnding, owed = 0, next = block.next })
 	else:
 		value ?= consume_value(after_colon)
-		Ok({ body = InlineBody(value.body), end = value.body.span.end, ending = value.ending, next = value.next })
+		Ok({ body = InlineBody(value.body), end = value.body.span.end, ending = value.ending, owed = value.owed, next = value.next })
 
 
 -- `start` is at `if`: the condition, `:` and an indented block, then an
@@ -1526,7 +1594,7 @@ private pure func consume_lambda_body(after_colon: ParserState) -> Result[Lambda
 private pure func consume_if(start: ParserState) -> Result[ParsedValue, Diagnostic]:
 	parsed ?= consume_if_form(start)
 	span = parsed.form.span
-	Ok({ body = { base = IfExpression(parsed.form), base_span = span, applications = [], span = span }, next = parsed.next, ending = BlockEnding })
+	Ok({ body = { base = IfExpression(parsed.form), base_span = span, applications = [], span = span }, next = parsed.next, ending = BlockEnding, owed = 0 })
 
 
 private fixed record IfResult {
@@ -1537,7 +1605,7 @@ private fixed record IfResult {
 
 private pure func consume_if_form(start: ParserState) -> Result[IfResult, Diagnostic]:
 	keyword = parser_span(start)
-	condition ?= consume_value(shifted(start, 1))
+	condition ?= consume_header_value(shifted(start, 1))
 	then_block ?= consume_header_block(condition.next, "expected `:` after if condition")
 	otherwise ?= consume_else_branch(then_block.next)
 	end = match otherwise.branch:
@@ -1630,7 +1698,8 @@ private pure func consume_grouped_value(start: ParserState, opening: Span) -> Re
 			span = { opening | end = postfixes.end }
 		},
 		next = postfixes.next,
-		ending = InlineEnding,
+		ending = postfixes.ending,
+		owed = postfixes.owed,
 	})
 
 
@@ -2137,7 +2206,7 @@ private pure func consume_line_form(state: ParserState) -> Result[LineForm, Diag
 -- The loop's context ends with its block.
 private pure func consume_while(state: ParserState) -> Result[LineForm, Diagnostic]:
 	keyword = parser_span(state)
-	condition ?= consume_value(value_position(shifted(state, 1)))
+	condition ?= consume_header_value(value_position(shifted(state, 1)))
 	body ?= consume_header_block(with_context(condition.next, LoopBody), "expected `:` after while condition")
 	loop = { condition = condition.body, body = body.block, span = { keyword | end = body.block.span.end } }
 	Ok(StatementForm(WhileLoop(loop), with_context(body.next, state.context)))
@@ -2148,7 +2217,7 @@ private pure func consume_for(state: ParserState) -> Result[LineForm, Diagnostic
 	keyword = parser_span(state)
 	binder ?= consume_name(shifted(state, 1), "expected a loop variable after `for`")
 	in_word ?= expect(binder.next, at_in(binder.next), "expected `in` after for loop variable", KEYWORD_HELP)
-	iterable ?= consume_value(value_position(in_word))
+	iterable ?= consume_header_value(value_position(in_word))
 	body ?= consume_header_block(with_context(iterable.next, LoopBody), "expected `:` after for loop iterable")
 	loop = { binder = binder.name, iterable = iterable.body, body = body.block, span = { keyword | end = body.block.span.end } }
 	Ok(StatementForm(ForLoop(loop), with_context(body.next, state.context)))
@@ -2328,7 +2397,7 @@ private pure func consume_arms(state: ParserState, arms: List[ParsedMatchArm]) -
 -- arm's Dedent like an if-expression.
 private pure func consume_match_value(start: ParserState) -> Result[ParsedValue, Diagnostic]:
 	parsed ?= consume_match_form(start)
-	Ok({ body = match_expression(parsed.form), next = parsed.next, ending = BlockEnding })
+	Ok({ body = match_expression(parsed.form), next = parsed.next, ending = BlockEnding, owed = 0 })
 
 
 -- The match as one value with no postfix operations.
@@ -2350,7 +2419,7 @@ private pure func consume_match_form(start: ParserState) -> Result[MatchResult, 
 		Ok(void)
 	else:
 		Err(expected(after_keyword, "expected a space after 'match'", "put a space between 'match' and the matched expression"))
-	scrutinee ?= consume_value(after_keyword)
+	scrutinee ?= consume_header_value(after_keyword)
 	opened ?= consume_block_header(scrutinee.next, "expected `:` after match expression", "expected newline before match cases")
 	arms ?= consume_arms(opened, [])
 	Ok({

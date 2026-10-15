@@ -1,0 +1,154 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, module_contents, parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		Diagnostic,
+		ExpressionBase(LogicalExpression, NameExpression),
+		ParsedBody(ParsedValueBody),
+		ParsedFunction,
+		ParsedStatement(BindingStatement, PropagatingBinding),
+		ValueExpression,
+	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+private HEADER_CHAIN_MESSAGE: String = "a method chain in a block header must end on its line"
+
+private HEADER_CHAIN_HELP: String = "bind the chained value before the header, then use the binding"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+private pure func main_function(source: String) -> Option[ParsedFunction]:
+	match parse_source(source):
+		Ok(parsed):
+			module_contents(parsed).functions.get(0)
+		Err(_):
+			None
+
+
+-- The initializer of a function's first binding or propagation.
+private pure func first_initializer(source: String) -> Option[ValueExpression]:
+	match main_function(source):
+		Some(function):
+			match function.statements.get(0):
+				Some(BindingStatement(binding)):
+					Some(binding.initializer)
+				Some(PropagatingBinding(propagation)):
+					Some(propagation.value)
+				_:
+					None
+		None:
+			None
+
+
+private pure func accepts(source: String) -> Bool:
+	parse_source(source).is_ok()
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parse_source(source):
+		Err(diagnostic):
+			diagnostic.span.start == start and diagnostic.span.end == end and diagnostic.message == message and diagnostic.help == help
+		Ok(_):
+			False
+
+
+-- The pilot's own shape: `x ?= signatures` continued by indented `.` lines;
+-- the statement after the chain needs no newline of its own.
+pure func test_indented_chain_continues_a_propagation() -> Bool:
+	match first_initializer(HEADER + "\tx ?= signatures\n\t\t.get(1)\n\t\t.to_result(2)\n\tx\n"):
+		Some(value):
+			match value.base:
+				NameExpression(_):
+					value.applications.length() == 2 and value.span.start == 26 and value.span.end == 62
+				_:
+					False
+		None:
+			False
+
+
+-- A chain may step in by several levels; a line that steps back out to an
+-- inner level continues it (host 4.2 example).
+pure func test_nested_chain_levels_continue() -> Bool:
+	match first_initializer(HEADER + "\ttotal = items\n\t\t.filter(1)\n\t\t\t.map(2)\n\t\t.sum()\n\t0\n"):
+		Some(value):
+			value.applications.length() == 3
+		None:
+			False
+
+
+-- A leading `.` at the statement's own indentation continues the chain
+-- too, as in the host.
+pure func test_leading_dot_at_the_same_level_continues() -> Bool:
+	match first_initializer(HEADER + "\tx = items\n\t.length()\n\tx\n"):
+		Some(value):
+			value.applications.length() == 1
+		None:
+			False
+
+
+-- A chain may be the function's value and an arm's value.
+pure func test_chain_as_a_block_value() -> Bool:
+	(
+		accepts(HEADER + "\titems\n\t\t.length()\n")
+		and accepts(HEADER + "\tmatch items:\n\t\t_: items\n\t\t\t.length()\n")
+	)
+
+
+-- Leaked indentation (host D4): an operator after the chain's last line
+-- ends the chain inline; the enclosing statement consumes the owed dedent.
+pure func test_operator_after_a_chain_line_keeps_the_chain_levels() -> Bool:
+	match main_function(HEADER + "\tok = xs\n\t\t.is_empty() and ready\n\tok\n"):
+		Some(function):
+			match (function.statements, function.body):
+				([BindingStatement(binding)], ParsedValueBody(_)):
+					match binding.initializer.base:
+						LogicalExpression(_, left, _):
+							left.applications.length() == 1
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+-- Inside an indented chain every line starts with `.`; a `.` line after
+-- the chain's dedent is no link.
+pure func test_chain_lines_must_start_with_a_dot() -> Bool:
+	(
+		rejects(HEADER + "\tx = xs\n\t\t.f()\n\t\ty\n\tx\n", 37, 38, "expected `.` to continue the method chain", "start the line with `.`, or move it out of the chain")
+		and rejects(HEADER + "\tx = xs\n\t\t.f() 2\n\tx\n", 35, 36, "expected a newline after the binding", "put each statement on its own line")
+	)
+
+
+-- An indented chain in a block header would leave its Dedent inside the
+-- block, so each header kind rejects it at the header's `:`.
+pure func test_indented_chain_in_a_block_header_is_rejected() -> Bool:
+	(
+		rejects(HEADER + "\tif xs\n\t\t.ok():\n\t\tprint(1)\n\t0\n", 34, 35, HEADER_CHAIN_MESSAGE, HEADER_CHAIN_HELP)
+		and rejects(HEADER + "\twhile xs\n\t\t.ok():\n\t\tbreak\n\t0\n", 37, 38, HEADER_CHAIN_MESSAGE, HEADER_CHAIN_HELP)
+		and rejects(HEADER + "\tfor x in xs\n\t\t.items():\n\t\tbreak\n\t0\n", 43, 44, HEADER_CHAIN_MESSAGE, HEADER_CHAIN_HELP)
+		and rejects(HEADER + "\tmatch xs\n\t\t.ok():\n\t\t_: 0\n", 37, 38, HEADER_CHAIN_MESSAGE, HEADER_CHAIN_HELP)
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 method chains",
+	tests = [
+		("indented chain continues a propagation", test_indented_chain_continues_a_propagation),
+		("nested chain levels continue", test_nested_chain_levels_continue),
+		("leading dot at the same level continues", test_leading_dot_at_the_same_level_continues),
+		("chain as a block value", test_chain_as_a_block_value),
+		("operator after a chain line keeps the chain levels", test_operator_after_a_chain_line_keeps_the_chain_levels),
+		("chain lines must start with a dot", test_chain_lines_must_start_with_a_dot),
+		("indented chain in a block header is rejected", test_indented_chain_in_a_block_header_is_rejected),
+	]
+}

@@ -890,7 +890,11 @@ an application with an ordered list of arguments, a list literal such as
 such as `IntOps.add(1, 2)` where `IntOps` is a module alias of the import
 block (the alias wins over a local of the same spelling, as in the host), or
 one expression grouped in parentheses. UFCS calls and record field
-suffixes may follow that expression, including a group's closing parenthesis.
+suffixes may follow that expression, including a group's closing parenthesis,
+and may continue on following lines that start with `.`, at the same
+indentation or one level deeper (a method chain, as in the host); inside an
+indented chain every line starts with `.`, and an `if`, `while`, `for` or
+`match` header may not hold an indented chain.
 `low..high` is a range of two such operands; `not a`, `a and b` and `a or b`
 combine them with the host's precedence (`or` below `and` below `not` below
 `..`, `and`/`or` left-associative). A line break after `and` or `or` is
@@ -1251,7 +1255,7 @@ Semantic rules:
   prefix obligations after securing its result. Literal construction creates a
   fresh ordinary String owner. COW, joins and managed annotated loops are deferred.
 - Recursive layouts beyond a unary self-reference, nested and non-tail matches (they parse; checking rejects them),
-  guards, qualified/nested/literal patterns, constructor UFCS, multiline chains,
+  guards, qualified/nested/literal patterns, constructor UFCS,
   and function
   values are outside this increment. `Bool` is an ordinary fixed union declared
   once in the base module, alongside Option and Result. Local functions and
