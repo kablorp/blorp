@@ -1875,137 +1875,15 @@ private pure func append_function(
 	Ok([opening, body, tail, closing].join(""))
 
 
-private pure func is_string(type_ref: TypeRef) -> Bool:
-	match type_ref:
-		StringType:
-			True
-		ListType(element):
-			is_string(element)
-		_:
-			False
-
-
-private pure func operations_need_strings(operations: List[OwnershipOperation]) -> Bool:
-	var needed = False
-
-	for operation in operations:
-		match operation:
-			DefineValue(definition):
-				if is_string(definition.value_type):
-					needed = True
-			AcquireOwner(_, _, _) | DropOwner(_, _):
-				void
-
-	needed
-
-
-private fixed union RuntimeFeature:
-	IntegerAddition
-	IntegerArithmetic
-	StringOutput
-	IntegerParsing
-	StringEquality
-	FloatFormatting
-	FloatParsing
-
-
-private pure func runtime_matches(
-	actual: RuntimeOperation[VariantInstanceId, TypeRef],
-	expected: RuntimeFeature,
-) -> Bool:
-	match actual:
-		IntAdd:
-			match expected:
-				IntegerAddition:
-					True
-				_:
-					False
-		IntSubtract | IntMultiply | IntDivide | IntRemainder:
-			match expected:
-				IntegerArithmetic:
-					True
-				_:
-					False
-		StringPrint:
-			match expected:
-				StringOutput:
-					True
-				_:
-					False
-		StringParseInt(_):
-			match expected:
-				IntegerParsing:
-					True
-				_:
-					False
-		ListRepeat(_) | ListLength(_) | ListGet(_, _) | ListAppend(_) | ListSet(_) | ListConcat(_):
-			False
-		StringEquals(_):
-			match expected:
-				StringEquality:
-					True
-				_:
-					False
-		FloatToString:
-			match expected:
-				FloatFormatting:
-					True
-				_:
-					False
-		StringParseFloat(_):
-			match expected:
-				FloatParsing:
-					True
-				_:
-					False
-		IntEquals(_) | FloatAdd | FloatSubtract | FloatMultiply | FloatDivide | FloatRemainder | IntToString | StringLength:
-			False
-
-
-private pure func operations_need_runtime(
-	operations: List[OwnershipOperation],
-	expected: RuntimeFeature,
-) -> Bool:
-	var needed = False
-
-	for operation in operations:
-		match operation:
-			DefineValue(definition):
-				match definition.operation:
-					CallDefinition(call, _):
-						match call.target:
-							RuntimeFunction(actual):
-								needed = runtime_matches(actual, expected) or needed
-							_:
-								void
-					_:
-						void
-			_:
-				void
-
-	needed
-
-
-private pure func needs_runtime(program: OwnershipProgram, expected: RuntimeFeature) -> Bool:
-	var needed = False
-
-	for function in program.functions:
-		for block in function_blocks(function):
-			if operations_need_runtime(block, expected):
-				needed = True
-
-	needed
-
-
 -- Unsigned addition wraps. Both signed casts below receive representable values;
 -- the negative branch also stays within Int64 at UINT64_MAX - sum == INT64_MAX.
-private INTEGER_ADD_RUNTIME: String =
+INTEGER_ADD_RUNTIME: String =
 	|static int64_t blorp_int_add(int64_t first,int64_t second){uint64_t sum=(uint64_t)first+(uint64_t)second;return sum<=INT64_MAX?(int64_t)sum:-INT64_C(1)-(int64_t)(UINT64_MAX-sum);}
 	|
 
 -- Convert wrapped unsigned bits using only representable signed casts. Division
 -- and remainder guard both zero and the sole overflowing signed quotient.
-private INTEGER_ARITHMETIC_RUNTIME: String =
+INTEGER_ARITHMETIC_RUNTIME: String =
 	|int64_t blorp_int_signed(uint64_t value){return value<=INT64_MAX?(int64_t)value:-INT64_C(1)-(int64_t)(UINT64_MAX-value);}
 	|int64_t blorp_int_subtract(int64_t first,int64_t second){return blorp_int_signed((uint64_t)first-(uint64_t)second);}
 	|int64_t blorp_int_multiply(int64_t first,int64_t second){return blorp_int_signed((uint64_t)first*(uint64_t)second);}
@@ -2014,79 +1892,68 @@ private INTEGER_ARITHMETIC_RUNTIME: String =
 	|
 
 
-private pure func needs_string_runtime(program: OwnershipProgram) -> Bool:
-	var needed = False
-
-	for layout in program.records:
-		for field in layout.fields:
-			needed = is_string(field) or needed
-
-	for layout in program.unions:
-		for fields in layout.variants:
-			for value_type in fields:
-				needed = is_string(value_type) or needed
-
-
-	for function in program.functions:
-		if is_string(function.signature.return_type):
-			needed = True
-
-		for parameter in function.signature.parameters:
-			if is_string(parameter):
-				needed = True
-
-		for block in function_blocks(function):
-			if operations_need_strings(block):
-				needed = True
-
-	needed
-
-
--- Typed Float facts, including generic union payload layouts, select the ABI
--- guard. This follows the existing loaded-module policy; it is not reachability.
-private pure func is_float(value_type: TypeRef) -> Bool:
+-- The type under any List layers. A String or Float there, anywhere in a record,
+-- union or function that specialization kept, selects its ABI prelude even when
+-- no value of it is ever built: a phantom type argument keeps its record
+-- (blorp_2/test/e2e/fixtures/record/phantom_union_fields.brp).
+private pure func innermost_element(value_type: TypeRef) -> TypeRef:
 	match value_type:
-		FloatType:
-			True
-		ListType(element):
-			is_float(element)
-		_:
-			False
+		ListType(element): innermost_element(element)
+		_: value_type
 
 
-private pure func operations_need_floats(operations: List[OwnershipOperation]) -> Bool:
-	operations.any(pure func(operation):
+-- The scalar helper preludes a program selects, read from its inventory: a
+-- String or Float type selects its ABI prelude, and each runtime operation called
+-- selects its own helper. Allocation headers follow from the layouts and the
+-- argument vector from the entrypoint, which already own those facts.
+private fixed record RuntimeRequirements {
+	string_types: Bool,
+	float_types: Bool,
+	integer_addition: Bool,
+	integer_arithmetic: Bool,
+	string_output: Bool,
+	integer_parsing: Bool,
+	string_equality: Bool,
+	float_formatting: Bool,
+	float_parsing: Bool
+}
+
+
+private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRequirements:
+	var requirements: RuntimeRequirements = {
+		string_types = False,
+		float_types = False,
+		integer_addition = False,
+		integer_arithmetic = False,
+		string_output = False,
+		integer_parsing = False,
+		string_equality = False,
+		float_formatting = False,
+		float_parsing = False,
+	}
+
+	for value_type in inventory.types:
+		match innermost_element(value_type):
+			StringType: requirements = { requirements | string_types = True }
+			FloatType: requirements = { requirements | float_types = True }
+			_: void
+
+	for operation in inventory.runtime_calls:
 		match operation:
-			DefineValue(definition):
-				is_float(definition.value_type)
-			_:
-				False
-	)
+			IntAdd: requirements = { requirements | integer_addition = True }
+			IntSubtract | IntMultiply | IntDivide | IntRemainder:
+				requirements = { requirements | integer_arithmetic = True }
+			StringPrint: requirements = { requirements | string_output = True }
+			StringParseInt(_): requirements = { requirements | integer_parsing = True }
+			StringEquals(_): requirements = { requirements | string_equality = True }
+			FloatToString: requirements = { requirements | float_formatting = True }
+			StringParseFloat(_): requirements = { requirements | float_parsing = True }
+			ListRepeat(_) | ListLength(_) | ListGet(_, _) | ListAppend(_) | ListSet(_) | ListConcat(_):
+				void
+			IntEquals(_) | FloatAdd | FloatSubtract | FloatMultiply | FloatDivide | FloatRemainder | IntToString | StringLength:
+				void
 
-
-private pure func needs_float_runtime(program: OwnershipProgram) -> Bool:
-	var needed = False
-
-	for layout in program.records:
-		for field in layout.fields:
-			needed = is_float(field) or needed
-
-	for layout in program.unions:
-		for fields in layout.variants:
-			for value_type in fields:
-				needed = is_float(value_type) or needed
-
-
-	for function in program.functions:
-		needed = is_float(function.signature.return_type) or needed
-
-		for parameter in function.signature.parameters:
-			needed = is_float(parameter) or needed
-
-		for block in function_blocks(function):
-			needed = operations_need_floats(block) or needed
-
-	needed
+	requirements
 
 
 -- This table lives for one emission only. Its complete key is a projection
@@ -2160,12 +2027,12 @@ private pure func append_block(
 
 -- What emission inventories, found in one walk of the verified program: the
 -- type of every declared field and payload and of every defined value, and
--- every runtime operation called. The list layouts read the types and the list
--- update helpers read the calls, so neither walks the program again. A
--- signature type needs no entry of its own because the verifier ties it to a
--- defined value: a parameter's definition takes its type from the signature, a
--- call result must match the callee's return type, and the returned value must
--- match the function's.
+-- every runtime operation called. The list layouts read the types, the list
+-- update helpers read the calls and the runtime requirements read both, so none
+-- of them walks the program again. A signature type needs no entry of its own
+-- because the verifier ties it to a defined value: a parameter's definition
+-- takes its type from the signature, a call result must match the callee's
+-- return type, and the returned value must match the function's.
 private fixed record ProgramInventory {
 	types: List[TypeRef],
 	runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]]
@@ -2475,6 +2342,7 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	checked = verified_contents(program)
 	records = checked.records
 	inventory = program_inventory(checked)
+	requirements = runtime_requirements(inventory)
 	lists = list_layouts(inventory)
 	aggregates ?= aggregate_runtime_contents(checked, lists, list_update_helpers(inventory))
 
@@ -2483,7 +2351,7 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	-- compiler copies a `var` list on every append that comes after a `?=`
 	-- placed between the list's declaration and that append, so no `?=` may sit
 	-- between this declaration and the loops below.
-	prelude = if needs_string_runtime(checked):
+	prelude = if requirements.string_types:
 		string_runtime()
 	else:
 		"#include <stdint.h>\n"
@@ -2500,28 +2368,28 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	):
 		fragments = fragments.append("#include <stdlib.h>\n#include <stdatomic.h>\n")
 
-	if needs_float_runtime(checked):
+	if requirements.float_types:
 		fragments = fragments.append(float_runtime())
 
-	if needs_runtime(checked, FloatFormatting):
+	if requirements.float_formatting:
 		fragments = fragments.append(float_string_runtime())
 
-	if needs_runtime(checked, FloatParsing):
+	if requirements.float_parsing:
 		fragments = fragments.append(float_parse_runtime())
 
-	if needs_runtime(checked, IntegerAddition):
+	if requirements.integer_addition:
 		fragments = fragments.append(INTEGER_ADD_RUNTIME)
 
-	if needs_runtime(checked, IntegerArithmetic):
+	if requirements.integer_arithmetic:
 		fragments = fragments.append(INTEGER_ARITHMETIC_RUNTIME)
 
-	if needs_runtime(checked, StringOutput):
+	if requirements.string_output:
 		fragments = fragments.append(string_print_runtime())
 
-	if needs_runtime(checked, IntegerParsing):
+	if requirements.integer_parsing:
 		fragments = fragments.append(string_parse_int_runtime())
 
-	if needs_runtime(checked, StringEquality):
+	if requirements.string_equality:
 		fragments = fragments.append(string_equals_runtime())
 
 	fragments = fragments.append(aggregates)
