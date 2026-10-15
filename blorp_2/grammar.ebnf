@@ -28,7 +28,8 @@
      retain UFCS/field syntax, including `42.identity()` and `1.5.identity()`.
      A dot directly after an integer must be followed by fraction digits or,
      after optional spaces, a field or function name.
-   - Arrow bytes stay adjacent. Spaces occur only where these rules permit.
+   - Arrow bytes stay adjacent, as do the two dots of `..`; `0..n` is an
+     integer, the range symbol and a name. Spaces occur only where these rules permit.
    - Identifiers and comments remain ASCII; quoted values admit valid UTF-8.
      CR is unsupported as a raw byte, including in comments and quotes.
    - A `|` that is the first byte after a line's indentation, including a
@@ -64,12 +65,16 @@
    Import blocks precede the module's declarations and select functions by their declared names from explicit ./ or leading
    ../ paths, or bare paths under an explicitly supplied target-library root.
    Paths omit .brp and contain adjacent identifier components; interior
-   dot segments, aliases, wildcards and reexports are unsupported. Explicit
+   dot segments, wildcards and reexports are unsupported. `path as Alias`
+   names the module; the alias may stand alone or precede ':' and
+   selections. Symbol aliases are unsupported. Explicit
    Union(First, Second) imports select a union and named constructors; Union()
    selects its type alone. Bare names resolve functions or visible types without capitalization rules.
    A type selection supplies target-local receiver functions for UFCS. The contextual
    suffix methods_only supplies receiver functions without importing the type or constructors.
-   All declarations are public. The prelude is the only implicit import, and only
+   A declaration may start with `private`. Module aliases and `private` are
+   read ahead of their semantics: checking rejects each with an exact
+   message until the namespace milestone. The prelude is the only implicit import, and only
    user modules receive it; modules under the library root see only their own
    declarations and written imports, and cannot import user modules. The base
    module `_base` is imported like any module; the prelude cannot be imported
@@ -325,11 +330,29 @@ record_update    = "{" spaces expression spaces "|" spaces record_field { spaces
 (* A group is transparent: its expression is the result, and postfix
    operations may follow the closing parenthesis. *)
 group            = "(" spaces expression spaces ")" ;
-primary          = "void" | float | integer | string_literal | pipe_string | raw_string | identifier | direct_call | record_literal | record_update | group ;
+(* A qualified form is minted only when its first identifier is a module
+   alias of the import block, even when a local of that spelling is in
+   scope; otherwise `name . name` is a UFCS call or field read. Checking
+   rejects qualified forms until the namespace milestone. *)
+(* The conversion words are contextual: `into_opaque Name(` starts the form,
+   while `into_opaque(` is an ordinary call. *)
+opaque_conversion = ( "into_opaque" | "from_opaque" ) required_spaces identifier spaces "(" spaces expression spaces ")" ;
+qualified_name   = identifier spaces "." spaces identifier ;
+qualified_call   = qualified_name spaces "(" spaces [ arguments ] spaces ")" ;
+(* A list literal parses; checking rejects it until the list intrinsics
+   milestone. *)
+list_literal     = "[" spaces [ arguments ] spaces "]" ;
+primary          = "void" | float | integer | string_literal | pipe_string | raw_string | qualified_call | qualified_name
+                 | opaque_conversion | identifier | direct_call | list_literal | record_literal | record_update | group ;
 receiver_call    = spaces "." spaces identifier spaces "(" spaces [ arguments ] spaces ")" ;
 field_read       = spaces "." spaces identifier ;
-expression       = primary { receiver_call | field_read } ;
-type_annotation  = identifier spaces [ "[" spaces type_annotation { spaces "," spaces type_annotation } trailing_comma spaces "]" ] ;
+(* A range is two operands around ".."; it parses, and checking rejects it
+   until the loops milestone. A range has no postfix operations of its own. *)
+operand          = primary { receiver_call | field_read } ;
+expression       = operand [ spaces ".." spaces operand ] ;
+(* In a type, a dot can only qualify, so no alias set is consulted. *)
+type_arguments   = "[" spaces type_annotation { spaces "," spaces type_annotation } trailing_comma spaces "]" ;
+type_annotation  = identifier [ spaces "." spaces identifier ] spaces [ type_arguments ] ;
 parameter        = identifier spaces ":" spaces type_annotation ;
 type_parameter   = "A".."Z" { letter | digit } ;
 type_parameters = "[" spaces type_parameter { spaces "," spaces type_parameter } trailing_comma spaces "]" spaces ;
@@ -340,7 +363,12 @@ tail_annotation  = "@tail_recursive" (required_spaces | NEWLINE) ;
 function         = [ tail_annotation ] function_header INDENT body DEDENT ;
 field_pattern    = "_" | identifier ;
 pattern          = "_" | identifier spaces [ "(" spaces [ field_pattern { spaces "," spaces field_pattern } trailing_comma ] spaces ")" ] ;
-binding          = [ "var" required_spaces ] identifier spaces "=" spaces expression NEWLINE ;
+(* After '=' the value is on the same line, or alone on an indented next
+   line whose DEDENT closes it. *)
+initializer      = spaces expression NEWLINE | NEWLINE INDENT expression NEWLINE DEDENT ;
+(* A binding may annotate its type; checking rejects the annotation until
+   the join milestone. *)
+binding          = [ "var" required_spaces ] identifier [ spaces ":" spaces type_annotation ] spaces "=" initializer ;
 statement        = binding | expression NEWLINE ;
 arm_block        = { statement } expression NEWLINE ;
 match_arm        = pattern spaces ":" (spaces expression NEWLINE | NEWLINE INDENT arm_block DEDENT) ;
@@ -353,7 +381,13 @@ fixed_union      = "fixed" required_spaces "union" required_spaces identifier sp
 record_member    = identifier spaces ":" spaces type_annotation ;
 fixed_record     = "fixed" required_spaces "record" required_spaces identifier spaces [ type_parameters ] "{" spaces
                    record_member { spaces "," spaces record_member } trailing_comma spaces "}" NEWLINE ;
-declaration      = function | fixed_union | fixed_record | builtin_type ;
+(* Opaque types and their conversions are read ahead of their semantics;
+   checking rejects them until the recursive-types milestone. *)
+opaque_type      = "opaque" required_spaces "type" required_spaces identifier spaces "=" spaces type_annotation NEWLINE ;
+(* A module constant is read ahead of its semantics; checking rejects it
+   until the constants milestone. *)
+constant         = identifier spaces ":" spaces type_annotation spaces "=" initializer ;
+declaration      = [ "private" required_spaces ] ( function | fixed_union | fixed_record | opaque_type | constant ) | builtin_type ;
 relative_prefix  = "./" | "../" { "../" } ;
 module_components = identifier { "/" identifier } ;
 module_path      = [ relative_prefix ] module_components ;
@@ -363,8 +397,10 @@ import_selection = import_symbol { spaces "," spaces import_symbol } trailing_co
 (* The selections follow the path on its line, or on an indented block of
    lines, each holding one or more selections. *)
 selection_line   = import_selection NEWLINE ;
-import_row       = module_path spaces ":" ( spaces import_selection NEWLINE
-                   | NEWLINE INDENT selection_line { selection_line } DEDENT ) ;
+module_alias     = required_spaces "as" required_spaces identifier ;
+import_row       = module_path ( [ module_alias ] spaces ":" ( spaces import_selection NEWLINE
+                   | NEWLINE INDENT selection_line { selection_line } DEDENT )
+                   | module_alias NEWLINE ) ;
 import_block     = "import" spaces ":" NEWLINE INDENT import_row { import_row } DEDENT ;
 program          = { import_block } { declaration } EOF ;
 

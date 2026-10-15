@@ -1,0 +1,143 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, module_contents, parse_module
+	../../../src/utils/names: name_spelling, program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		Diagnostic,
+		ExpressionBase(NameExpression, QualifiedApplication, QualifiedName),
+		ParsedBody(ParsedValueBody),
+		ParsedFunction,
+		PostfixOperation(ReceiverInvocation),
+		TypeSyntax(AtomicType, QualifiedType),
+		ValueExpression,
+	test: TestSuite
+
+
+private ALIASED: String = "import:\n\tint as IntOps\n"
+
+
+-- Module-level parsing: an aliased import row needs no loaded target here.
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+private pure func main_function(source: String) -> Option[ParsedFunction]:
+	match parse_source(source):
+		Ok(parsed):
+			module_contents(parsed).functions.get(0)
+		Err(_):
+			None
+
+
+private pure func main_value(source: String) -> Option[ValueExpression]:
+	match main_function(source):
+		Some(function):
+			match function.body:
+				ParsedValueBody(value):
+					Some(value)
+				_:
+					None
+		None:
+			None
+
+
+-- `Alias.name(arguments)` is a qualified application only when Alias is a
+-- module alias of the import block.
+pure func test_declared_alias_mints_a_qualified_application() -> Bool:
+	match parse_source(ALIASED + "func main() -> Int:\n\tIntOps.add(1, 2).to_string()\n"):
+		Err(_):
+			False
+		Ok(parsed):
+			contents = module_contents(parsed)
+
+			match contents.functions.get(0).map(pure func(function): function.body):
+				Some(ParsedValueBody(value)):
+					match (value.base, value.applications):
+						(QualifiedApplication(qualified, arguments), [ReceiverInvocation(_)]):
+							(
+								name_spelling(contents.names, qualified.module.id) == Some("IntOps")
+								and name_spelling(contents.names, qualified.name.id) == Some("add")
+								and arguments.length() == 2
+								and value.base_span.start == 44 and value.base_span.end == 60
+							)
+						_:
+							False
+				_:
+					False
+
+
+-- The alias set wins over a local of the same spelling, as in the host.
+pure func test_alias_wins_over_a_local_of_the_same_spelling() -> Bool:
+	match main_value(ALIASED + "func main(IntOps: Int) -> Int:\n\tIntOps.add(1)\n"):
+		Some(value):
+			match value.base:
+				QualifiedApplication(_, _):
+					True
+				_:
+					False
+		None:
+			False
+
+
+pure func test_declared_alias_mints_a_qualified_name() -> Bool:
+	match main_value(ALIASED + "func main() -> Int:\n\tIntOps.INT_MAX\n"):
+		Some(value):
+			match value.base:
+				QualifiedName(_):
+					value.applications.length() == 0 and value.base_span.start == 44 and value.base_span.end == 58
+				_:
+					False
+		None:
+			False
+
+
+pure func test_undeclared_name_before_a_dot_is_a_receiver() -> Bool:
+	match main_value("func main() -> Int:\n\tIntOps.add(1, 2)\n"):
+		Some(value):
+			match (value.base, value.applications):
+				(NameExpression(_), [ReceiverInvocation(_)]):
+					True
+				_:
+					False
+		None:
+			False
+
+
+-- A dot in a type position always qualifies; the arguments may follow.
+pure func test_dotted_type_is_qualified_with_optional_arguments() -> Bool:
+	match main_function("func main(first: Shared.Box[Int], second: Shared.Flag) -> Int:\n\t0\n"):
+		Some(function):
+			match function.parameters.map(pure func(parameter): parameter.type_name):
+				[QualifiedType(_, [AtomicType(_)], box_span), QualifiedType(_, [], flag_span)]:
+					box_span.start == 17 and box_span.end == 32 and flag_span.start == 42 and flag_span.end == 53
+				_:
+					False
+		None:
+			False
+
+
+pure func test_dot_in_a_type_needs_a_name() -> Bool:
+	match parse_source("func main(first: Shared.) -> Int:\n\t0\n"):
+		Err(diagnostic):
+			(
+				diagnostic.span.start == 24 and diagnostic.span.end == 25
+				and diagnostic.message == "expected a type name after the module alias and '.'"
+				and diagnostic.help == "use an ASCII identifier starting with a letter or underscore; 'func', 'pure', 'match', 'var', and lone '_' are reserved"
+			)
+		Ok(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 qualified names",
+	tests = [
+		("declared alias mints a qualified application", test_declared_alias_mints_a_qualified_application),
+		("declared alias mints a qualified name", test_declared_alias_mints_a_qualified_name),
+		("alias wins over a local of the same spelling", test_alias_wins_over_a_local_of_the_same_spelling),
+		("undeclared name before a dot is a receiver", test_undeclared_name_before_a_dot_is_a_receiver),
+		("dotted type is qualified with optional arguments", test_dotted_type_is_qualified_with_optional_arguments),
+		("dot in a type needs a name", test_dot_in_a_type_needs_a_name),
+	]
+}

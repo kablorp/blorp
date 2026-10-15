@@ -1,0 +1,117 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, module_contents, parse_module
+	../../../src/utils/names: name_spelling, program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		Diagnostic,
+		ExpressionBase(DirectApplication, IntegerExpression, OpaqueUnwrap, OpaqueWrap),
+		ParsedBody(ParsedValueBody),
+		TypeSyntax(AppliedType, AtomicType),
+		ValueExpression,
+		Visibility(Private, Public),
+	test: TestSuite
+
+
+private MAIN: String = "func main() -> Int:\n\t0\n"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+private pure func main_value(source: String) -> Option[ValueExpression]:
+	match parse_source(source):
+		Ok(parsed):
+			match module_contents(parsed).functions.get(0).map(pure func(function): function.body):
+				Some(ParsedValueBody(value)):
+					Some(value)
+				_:
+					None
+		Err(_):
+			None
+
+
+pure func test_opaque_declarations_keep_name_underlying_and_visibility() -> Bool:
+	match parse_source("opaque type NameId = Int\nprivate opaque type Rows = List[Int]\n" + MAIN):
+		Err(_):
+			False
+		Ok(parsed):
+			contents = module_contents(parsed)
+
+			match contents.opaques:
+				[first, second]:
+					match (first.visibility, first.underlying, second.visibility, second.underlying):
+						(Public, AtomicType(_), Private(span), AppliedType(_, [_], _)):
+							(
+								name_spelling(contents.names, first.type_name.id) == Some("NameId")
+								and first.type_name.span.start == 12 and first.type_name.span.end == 18
+								and name_spelling(contents.names, second.type_name.id) == Some("Rows")
+								and span.start == 25
+							)
+						_:
+							False
+				_:
+					False
+
+
+pure func test_opaque_needs_the_type_word() -> Bool:
+	match parse_source("opaque NameId = Int\n" + MAIN):
+		Err(diagnostic):
+			diagnostic.span.start == 7 and diagnostic.message == "expected 'type' after 'opaque'" and diagnostic.help == "write opaque type Name = Underlying"
+		Ok(_):
+			False
+
+
+-- `into_opaque Name(value)` spans the word to the closing parenthesis.
+pure func test_conversions_wrap_one_value() -> Bool:
+	match (main_value("func main() -> Int:\n\tinto_opaque NameId(7)\n"), main_value("func main() -> Int:\n\tfrom_opaque NameId(id).length()\n")):
+		(Some(wrapped), Some(unwrapped)):
+			match (wrapped.base, unwrapped.base):
+				(OpaqueWrap(_, inner), OpaqueUnwrap(_, _)):
+					match inner.base:
+						IntegerExpression(7):
+							wrapped.base_span.start == 21 and wrapped.base_span.end == 42 and unwrapped.applications.length() == 1
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_conversion_words_alone_are_ordinary_names() -> Bool:
+	match main_value("func main() -> Int:\n\tinto_opaque(7)\n"):
+		Some(value):
+			match value.base:
+				DirectApplication(_, _):
+					True
+				_:
+					False
+		None:
+			False
+
+
+pure func test_conversion_needs_a_closing_parenthesis() -> Bool:
+	match parse_source("func main() -> Int:\n\tinto_opaque NameId(7 8)\n"):
+		Err(diagnostic):
+			(
+				diagnostic.span.start == 42 and diagnostic.span.end == 43
+				and diagnostic.message == "expected ')' after the converted value"
+				and diagnostic.help == "write into_opaque Name(value) or from_opaque Name(value) with one value"
+			)
+		Ok(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 opaque type syntax",
+	tests = [
+		("opaque declarations keep name, underlying type and visibility", test_opaque_declarations_keep_name_underlying_and_visibility),
+		("opaque needs the type word", test_opaque_needs_the_type_word),
+		("conversions wrap one value", test_conversions_wrap_one_value),
+		("conversion words alone are ordinary names", test_conversion_words_alone_are_ordinary_names),
+		("conversion needs a closing parenthesis", test_conversion_needs_a_closing_parenthesis),
+	]
+}

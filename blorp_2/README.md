@@ -819,9 +819,16 @@ specialize to Int, Float, String, Void, a List of any supported finite type, a f
 body has zero or more ordered binding or Void expression statements followed
 by a final expression or a tail match with inline arm results or statement blocks. Expressions
 start with `void`, a signed Int64 or decimal Float64 literal, a quoted UTF-8 String literal, a pipe String or raw block, a binding or variant name, a record literal or update,
-an application with an ordered list of arguments, or one expression grouped in
-parentheses. UFCS calls and record field suffixes may follow that expression,
-including a group's closing parenthesis.
+an application with an ordered list of arguments, a list literal such as
+`[1, 2]` (parsed; checking rejects it until the list intrinsics milestone), a qualified name or call
+such as `IntOps.add(1, 2)` where `IntOps` is a module alias of the import
+block (the alias wins over a local of the same spelling, as in the host), or
+one expression grouped in parentheses. UFCS calls and record field
+suffixes may follow that expression, including a group's closing parenthesis.
+`low..high` is a range of two such operands; it parses, and checking rejects
+it until the loops milestone.
+A dotted type such as `Shared.Span[Int]` is a qualified type. Checking rejects
+qualified forms until the namespace milestone.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
 No other declarations, expressions, literals, or statements are supported.
 Single-line comments begin with `--`; a line holding only `---` at column 1
@@ -943,9 +950,12 @@ Lexical and layout rules:
   pattern is a binder or `_`; literal and nested field patterns are unsupported.
   A nullary constructor pattern may be written `Empty` or `Empty()`. `Number()`
   is valid syntax but fails semantic arity checking for a one-field constructor.
-- A binding line is `name = expression` or `var name = expression`, at depth
+- A binding line is `name = expression` or `var name = expression`, optionally
+  annotated as `name: Type = expression` (the annotation parses, and checking
+  rejects it until the join milestone), at depth
   one in a function or depth three in an arm block. Its initializer starts on
-  the same line and may continue inside brackets. Bindings and bare expression statements may interleave before
+  the same line, or stands alone on the next line indented one level, and may
+  continue inside brackets. Bindings and bare expression statements may interleave before
   the mandatory final expression or function tail match. A non-final bare
   expression must return Void; bind or return other values. Bindings inside
   arguments and annotations are unsupported. An arm block cannot contain a
@@ -958,6 +968,15 @@ Lexical and layout rules:
   A dot followed by a function name starts UFCS: `42.identity()` is a call;
   `42.5` is a Float literal.
   Non-ASCII bytes outside quoted Strings and CRLF source line endings are rejected.
+- A declaration may start with `private`; the row keeps the keyword's span
+  and checking rejects it until the namespace milestone.
+- `opaque type Name = Underlying` declares an opaque type, and
+  `into_opaque Name(value)` / `from_opaque Name(value)` convert one value;
+  all three parse, and checking rejects them until the recursive-types
+  milestone. The conversion words are contextual: `into_opaque(7)` is a call.
+- `LIMIT: Int = 7` declares a module constant; its value may stand alone on
+  the next line. The row parses, and checking rejects it until the constants
+  milestone.
 - Every token must be consumed. Malformed declarations and statements are errors.
 
 Semantic rules:
@@ -1142,7 +1161,9 @@ pure func answer() -> Int:
 The executable exits 42. Each import row starts with `./`
 or leading `../` segments, omits `.brp`, and selects local functions or fixed
 unions. The selections follow the path on its line, or on an indented block
-of lines under a path ending in `:`; each line may end with a comma. A bare
+of lines under a path ending in `:`; each line may end with a comma. `path as
+Alias` names the module, alone or before `:` and selections; the row parses,
+and checking rejects the alias until the namespace milestone. A bare
 selector selects a local function or a visible type; if both
 exist, the selection is ambiguous. `Option(Some, None)` selects a union and those
 constructors, while `Option()` selects the union without constructors. Both

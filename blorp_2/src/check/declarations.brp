@@ -15,9 +15,11 @@ import:
 			ListTypeArgumentCount, MissingUnionTypeArguments, NonApplicableType, MissingRecordTypeArguments, RecordTypeArgumentCountMismatch, OrdinaryRecordApplied,
 			OrdinaryUnionApplied, UnionTypeArgumentCountMismatch, UnknownType,
 		),
+		UnsupportedForm(ImportAlias, PrivateDeclaration, ModuleQualifiedName, OpaqueTypeDeclaration, ModuleConstant),
 		checker_invariant,
 		type_declaration_error,
 		type_term_error,
+		unsupported_form,
 	./model:
 		CheckedField,
 		CheckedRecord,
@@ -41,6 +43,7 @@ import:
 		RecordRow,
 		UnionRow,
 		NominalRow(UnionDeclarationRow, RecordDeclarationRow),
+		inventory_functions,
 		inventory_records,
 		inventory_unions,
 		next_nominal,
@@ -55,12 +58,13 @@ import:
 		TypeCandidate(PrimitiveCandidate, ListCandidate, UnionCandidate, RecordCandidate),
 		type_candidate,
 	option: to_result
-	../parse/assemble: ParsedContents
-	../utils/source: COMPILER_SOURCE, ModuleId
+	../parse/assemble: ParsedContents, ParsedModuleRow
+	../utils/source: COMPILER_SOURCE, ModuleId, same_module
 	../utils/syntax:
 		ParsedRecord,
 		Span,
-		TypeSyntax(AtomicType, AppliedType),
+		TypeSyntax(AtomicType, AppliedType, QualifiedType),
+		Visibility(Public, Private),
 		WrittenName,
 		type_span,
 
@@ -206,6 +210,8 @@ private pure func resolve_atomic_type(
 
 pure func resolve_type(scope: TypeScope, written: TypeSyntax) -> Result[TypeRef, CheckError]:
 	match written:
+		QualifiedType(_, _, span):
+			Err(unsupported_form(span, ModuleQualifiedName))
 		AtomicType(name):
 			resolve_atomic_type(scope, name)
 		AppliedType(name, arguments, span):
@@ -281,6 +287,81 @@ private pure func declared_module(declaration: NominalRow) -> ModuleId:
 			parsed_record.declaration.module
 
 
+
+
+-- The first declaration form that has no semantics yet (module aliases,
+-- private declarations, opaque types, constants), in source order: modules
+-- in load order, forms by position within a module. It runs before the
+-- namespace is built, which would otherwise read these rows and report a
+-- misleading duplicate import or unknown imported name.
+pure func reject_unsupported_declarations(parsed: ParsedContents) -> Result[Void, CheckError]:
+	var failure: Option[CheckError] = None
+
+	for module in parsed.modules:
+		if failure.is_none():
+			failure = module_unsupported_form(parsed, module)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+
+-- The earliest unsupported form of one module, by span start.
+private pure func module_unsupported_form(parsed: ParsedContents, module: ParsedModuleRow) -> Option[CheckError]:
+	var earliest: Option[CheckError] = None
+
+	for request in module.imports:
+		match request.module_alias:
+			Some(module_alias):
+				earliest = earlier(earliest, unsupported_form(module_alias.span, ImportAlias))
+			None:
+				void
+
+	for row in inventory_functions(parsed.declarations):
+		if same_module(row.declaration.module, module.module):
+			earliest = private_candidate(earliest, row.declaration.visibility)
+
+	for row in inventory_records(parsed.declarations):
+		if same_module(row.declaration.module, module.module):
+			earliest = private_candidate(earliest, row.declaration.visibility)
+
+	for row in inventory_unions(parsed.declarations):
+		if same_module(row.module, module.module):
+			earliest = private_candidate(earliest, row.visibility)
+
+	for declaration in parsed.opaques:
+		if same_module(declaration.module, module.module):
+			earliest = private_candidate(earliest, declaration.visibility)
+			earliest = earlier(earliest, unsupported_form(declaration.type_name.span, OpaqueTypeDeclaration))
+
+	for declaration in parsed.constants:
+		if same_module(declaration.module, module.module):
+			earliest = private_candidate(earliest, declaration.visibility)
+			earliest = earlier(earliest, unsupported_form(declaration.name.span, ModuleConstant))
+
+	earliest
+
+
+-- Both errors lie in one module's source, so span starts order them.
+private pure func earlier(current: Option[CheckError], candidate: CheckError) -> Option[CheckError]:
+	match current:
+		None:
+			Some(candidate)
+		Some(existing):
+			if IntOps.less_than(candidate.span.start, existing.span.start):
+				Some(candidate)
+			else:
+				current
+
+
+private pure func private_candidate(current: Option[CheckError], visibility: Visibility) -> Option[CheckError]:
+	match visibility:
+		Private(span):
+			earlier(current, unsupported_form(span, PrivateDeclaration))
+		Public:
+			current
 
 
 pure func validate_declarations(

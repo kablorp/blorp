@@ -11,7 +11,7 @@ import:
 		Symbol(
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
 			Colon, Newline, Indent, Dedent, VarKeyword, VoidKeyword, Equals, LeftBracket,
-			RightBracket, LeftBrace, RightBrace, RecordUpdateBar, Comma, AtSign, Slash, Star,
+			RightBracket, LeftBrace, RightBrace, RecordUpdateBar, Comma, AtSign, Slash, Star, DotDot,
 		),
 		Token,
 		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, PipeString, CharLiteral),
@@ -486,7 +486,8 @@ private pure func numeric_token(text: SourceText, start: Int) -> Result[Token, D
 		start
 	integer_end = run_end(text, digit_start, DecimalDigit)
 	after_dot = IntOps.add(integer_end, 1)
-	dotted = byte_is(text, integer_end, '.')
+	-- `0..n` is an integer and a range symbol, not a Float missing its fraction.
+	dotted = byte_is(text, integer_end, '.') and not byte_is(text, after_dot, '.')
 	fraction = dotted and byte_in(text, after_dot, DecimalDigit)
 	mantissa_end = if fraction:
 		run_end(text, after_dot, DecimalDigit)
@@ -591,6 +592,8 @@ private pure func literal_or_symbol(text: SourceText, cursor: Int) -> Result[Tok
 		char_token(text, cursor)
 	else if byte_is(text, cursor, '-') and byte_is(text, next, '>'):
 		Ok(symbol(text, Arrow, cursor, IntOps.add(cursor, 2)))
+	else if byte_is(text, cursor, '.') and byte_is(text, next, '.'):
+		Ok(symbol(text, DotDot, cursor, IntOps.add(cursor, 2)))
 	else if byte_is(text, cursor, '+'):
 		Err(byte_error(text, cursor, PLUS_SIGN))
 	else if byte_in(text, cursor, DecimalDigit) or byte_is(text, cursor, '-'):
@@ -816,7 +819,8 @@ private pure func pipe_line_end(text: SourceText, start: Int, form: PipeForm) ->
 
 
 -- Whether the line starting at `line_start` begins with exactly the bytes
--- of the indentation prefix `first`.
+-- of the indentation prefix `first`. The prefix lies inside the source, so
+-- the `None` arm cannot be reached; the host requires it, as elsewhere.
 private pure func same_indentation(text: SourceText, first: LinePrefix, line_start: Int) -> Bool:
 	var offset: Int = 0
 	var same: Bool = True
@@ -903,10 +907,10 @@ private pure func raw_block_marker_line(text: SourceText, start: Int) -> Option[
 
 
 -- What the code of a line is, after its indentation prefix: a pipe String
--- or raw block token, or ordinary code starting at the given position.
+-- or raw block token, or ordinary code starting at the prefix's end.
 private fixed union LineCode:
 	PipeLine(Token)
-	OrdinaryCode(Int)
+	OrdinaryCode
 
 
 -- The code of the line with `prefix`: a pipe String starts at a `|` first on
@@ -921,7 +925,7 @@ private pure func line_code(text: SourceText, prefix: LinePrefix) -> Result[Line
 				block ?= pipe_block(text, marker_line, RawText)
 				Ok(PipeLine(token(text, PipeString(block.value), prefix.end, block.end)))
 			None:
-				Ok(OrdinaryCode(prefix.end))
+				Ok(OrdinaryCode)
 
 
 -- Open brackets raise the depth and closing ones lower it, never below zero:
@@ -969,8 +973,8 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 					Ok(PipeLine(pipe)):
 						tokens = tokens.append(ReadyToken(pipe))
 						Ok(pipe.span.end)
-					Ok(OrdinaryCode(start)):
-						Ok(start)
+					Ok(OrdinaryCode):
+						Ok(line.prefix.end)
 					Err(error):
 						Err(error)
 				var brackets: Int = 0
@@ -997,8 +1001,8 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 										Ok(PipeLine(pipe)):
 											tokens = tokens.append(ReadyToken(pipe))
 											Ok(pipe.span.end)
-										Ok(OrdinaryCode(start)):
-											Ok(start)
+										Ok(OrdinaryCode):
+											Ok(continued.end)
 										Err(error):
 											Err(error)
 							else if byte_is(text, cursor, ' '):

@@ -11,7 +11,8 @@ import:
 		Diagnostic,
 		ExpressionBase(
 			VoidExpression, IntegerExpression, FloatExpression, StringExpression, NameExpression, DirectApplication,
-			RecordExpression, RecordUpdateExpression,
+			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, ListExpression, RangeExpression, RecordExpression,
+			RecordUpdateExpression,
 		),
 		FieldPattern(FieldName, FieldWildcard),
 		FunctionHeader,
@@ -19,8 +20,10 @@ import:
 		ParsedBinding,
 		ParsedBody(ParsedBuiltinBody, ParsedValueBody, ParsedMatchBody),
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
+		ParsedConstant,
 		ParsedFunction,
 		ParsedMatchArm,
+		ParsedOpaque,
 		ParsedParameter,
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
 		ParsedRecord,
@@ -42,23 +45,27 @@ import:
 		Symbol(
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
 			Colon, Newline, Indent, Dedent, VarKeyword, VoidKeyword, Equals, LeftBracket, RightBracket,
-			LeftBrace, RightBrace, RecordUpdateBar, Comma, AtSign, Slash, Star,
+			LeftBrace, RightBrace, RecordUpdateBar, Comma, AtSign, Slash, Star, DotDot,
 		),
 		Token,
 		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, PipeString, CharLiteral),
-		TypeSyntax(AtomicType, AppliedType),
+		TypeSyntax(AtomicType, AppliedType, QualifiedType),
 		UTF8_CONTINUATION_END,
 		UTF8_CONTINUATION_START,
 		ValueExpression,
+		Visibility(Public, Private),
 		WrittenName,
 		diagnostic,
 		source_bundle_error,
 	../utils/text as Text
 
 
+-- `aliases` are the module aliases its import block declared so far; a name
+-- followed by '.' is a qualified name only when it is one of them.
 private fixed record ParserState {
 	input: LexedProgram,
-	position: Int
+	position: Int,
+	aliases: List[NameId]
 }
 
 
@@ -79,8 +86,11 @@ fixed union ImportSelection:
 	MethodsOnlySelection(WrittenName, Span)
 
 
+-- `alias` is the module alias written as `path as Alias`; its selections may
+-- be empty.
 fixed record ParsedImport {
 	path: ModulePath,
+	module_alias: Option[WrittenName],
 	symbols: List[ImportSelection],
 	span: Span
 }
@@ -96,6 +106,8 @@ fixed record ParsedModuleContents {
 	functions: List[ParsedFunction],
 	unions: List[ParsedUnion],
 	records: List[ParsedRecord],
+	opaques: List[ParsedOpaque],
+	constants: List[ParsedConstant],
 	end: Span
 }
 
@@ -115,6 +127,10 @@ pure func module_names(parsed: ParsedModule) -> NameTable:
 pure func module_imports(parsed: ParsedModule) -> List[ParsedImport]:
 	from_opaque ParsedModule(parsed).imports
 
+
+private IMPORT_IN_BODY_MESSAGE: String = "imports belong at module scope"
+
+private IMPORT_IN_BODY_HELP: String = "move import: and its selected functions before the module's declarations at column 1"
 
 private IDENTIFIER_HELP: String = "use an ASCII identifier starting with a letter or underscore; 'func', 'pure', 'match', 'var', and lone '_' are reserved"
 
@@ -257,6 +273,14 @@ private pure func at_left_bracket(state: ParserState) -> Bool:
 private pure func at_right_bracket(state: ParserState) -> Bool:
 	match current_symbol(state):
 		Some(RightBracket):
+			True
+		_:
+			False
+
+
+private pure func at_dot_dot(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(DotDot):
 			True
 		_:
 			False
@@ -768,13 +792,39 @@ private pure func reject_function_type_arguments(state: ParserState) -> Result[V
 		Ok(void)
 
 
+-- Whether the import block declared `id` as a module alias.
+private pure func is_module_alias(state: ParserState, id: NameId) -> Bool:
+	var found: Bool = False
+
+	for candidate in state.aliases:
+		found = found or same_name(candidate, id)
+
+	found
+
+
+-- `Alias.name` and `Alias.name(arguments)` where Alias is a declared module
+-- alias; `module` is the alias just consumed.
+private pure func consume_qualified(module: ParsedName) -> Result[ParsedBase, Diagnostic]:
+	member ?= consume_name(shifted(module.next, 1), "expected a name after the module alias and '.'")
+	qualified = { module = module.name, name = member.name }
+
+	if at_left_paren(member.next):
+		call ?= consume_call_arguments(member.next)
+		Ok({ base = QualifiedApplication(qualified, call.arguments), span = { module.name.span | end = call.end }, next = call.next })
+	else:
+		Ok({ base = QualifiedName(qualified), span = { module.name.span | end = member.name.span.end }, next = member.next })
+
+
 private pure func consume_name_or_call(start: ParserState) -> Result[ParsedBase, Diagnostic]:
 	name ?= consume_name(start, "expected a value name")
 	explicit_types ?= reject_function_type_arguments(name.next)
+	after_dot = shifted(name.next, 1)
 
 	if at_left_paren(name.next):
 		call ?= consume_call_arguments(name.next)
 		Ok({ base = DirectApplication(name.name, call.arguments), span = { name.name.span | end = call.end }, next = call.next })
+	else if at_dot(name.next) and at_identifier(after_dot) and is_module_alias(start, name.name.id):
+		consume_qualified(name)
 	else:
 		Ok({ base = NameExpression(name.name), span = name.name.span, next = name.next })
 
@@ -791,6 +841,8 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
 			Err(diagnostic({ token.span | end = parser_span(after).end }, "Float literals need digits before the decimal point", "write 0.5; a source Float literal needs an integer part"))
 		SymbolToken(LeftBrace):
 			consume_braced_record(after, token.span)
+		SymbolToken(LeftBracket):
+			consume_list_literal(after, token.span)
 		FloatLiteral(spelling):
 			value ?= float_value(spelling, token.span)
 			Ok({ base = FloatExpression(value), span = token.span, next = after })
@@ -805,9 +857,41 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
 		CharLiteral:
 			Err(diagnostic(token.span, "Char literals are not supported yet", "use a one-character String literal such as \"a\""))
 		IdentifierToken(_):
-			consume_name_or_call(start)
+			if at_opaque_conversion(start, words(start).into_opaque_word):
+				consume_opaque_conversion(start, Wrapping)
+			else if at_opaque_conversion(start, words(start).from_opaque_word):
+				consume_opaque_conversion(start, Unwrapping)
+			else:
+				consume_name_or_call(start)
 		_:
 			Err(expected(start, "expected a return expression", EXPRESSION_HELP))
+
+
+-- `word Name(` where word is into_opaque or from_opaque: the conversion
+-- form, contextual like builtin; the word alone is an ordinary name.
+private pure func at_opaque_conversion(state: ParserState, word: NameId) -> Bool:
+	at_word(state, word) and at_identifier(shifted(state, 1)) and at_left_paren(shifted(state, 2))
+
+
+-- The two conversion words: into_opaque wraps, from_opaque unwraps.
+private fixed union OpaqueDirection:
+	Wrapping
+	Unwrapping
+
+
+-- `state` is at the conversion word.
+private pure func consume_opaque_conversion(state: ParserState, direction: OpaqueDirection) -> Result[ParsedBase, Diagnostic]:
+	keyword = parser_span(state)
+	name ?= consume_name(shifted(state, 1), "expected an opaque type name")
+	value ?= consume_value(shifted(name.next, 1))
+	closing = parser_span(value.next)
+	closed ?= expect(value.next, at_right_paren(value.next), "expected ')' after the converted value", "write into_opaque Name(value) or from_opaque Name(value) with one value")
+	base = match direction:
+		Wrapping:
+			OpaqueWrap(name.name, value.body)
+		Unwrapping:
+			OpaqueUnwrap(name.name, value.body)
+	Ok({ base = base, span = { keyword | end = closing.end }, next = closed })
 
 
 private fixed record ParsedPostfix {
@@ -853,9 +937,27 @@ private pure func consume_postfixes(state: ParserState, applications: List[Postf
 		consume_postfixes(postfix.next, applications.append(postfix.operation), postfix.end)
 
 
+-- A value is one operand, or `low..high`: two operands around '..'. A range
+-- has no postfix operations of its own; group it to apply any.
 private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	low ?= consume_operand(start)
+
+	if not at_dot_dot(low.next):
+		Ok(low)
+	else:
+		after_dots = shifted(low.next, 1)
+		high ?= if at_newline(after_dots) or at_closing_bracket(after_dots) or at_end(after_dots):
+			Err(expected(after_dots, "expected the range's end after '..'", "write low..high with a value on each side of '..'"))
+		else:
+			consume_operand(after_dots)
+		span = { low.body.span | end = high.body.span.end }
+		Ok({ body = { base = RangeExpression(low.body, high.body), base_span = span, applications = [], span = span }, next = high.next })
+
+
+-- A base and its postfix operations.
+private pure func consume_operand(start: ParserState) -> Result[ParsedValue, Diagnostic]:
 	scope ?= if at_word(start, words(start).import_word) and at_colon(shifted(start, 1)):
-		Err(expected(start, "imports belong at module scope", "move import: and its selected functions before the module's declarations at column 1"))
+		Err(expected(start, IMPORT_IN_BODY_MESSAGE, IMPORT_IN_BODY_HELP))
 	else:
 		Ok(void)
 	match current(start):
@@ -877,6 +979,22 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 						},
 						next = postfixes.next,
 					})
+
+
+-- `start` follows the opening bracket: zero or more comma-separated
+-- elements, then ']'.
+private pure func consume_list_literal(start: ParserState, opening: Span) -> Result[ParsedBase, Diagnostic]:
+	listed ?= if at_right_bracket(start):
+		Ok({ values = [], next = start })
+	else:
+		consume_argument_list(start, [])
+	closed ?= expect(
+		listed.next,
+		at_right_bracket(listed.next),
+		"expected ']' after the list elements",
+		"separate elements with commas, then close the list with ']'",
+	)
+	Ok({ base = ListExpression(listed.values), span = { opening | end = parser_span(listed.next).end }, next = closed })
 
 
 -- `start` is at an opening parenthesis: one expression, then ')'. The group
@@ -927,21 +1045,45 @@ private pure func consume_type_arguments(state: ParserState, types: List[TypeSyn
 			Ok({ types = gathered, next = next })
 
 
-private pure func consume_type(state: ParserState, message: String) -> Result[ParsedType, Diagnostic]:
-	name ?= consume_name(state, message)
+-- The bracketed type arguments after a type name at `state`, or none;
+-- `end` is where the closing bracket ends, or `name_end` without brackets.
+private fixed record ParsedTypeArguments {
+	types: List[TypeSyntax],
+	end: Int,
+	next: ParserState
+}
 
-	if not at_left_bracket(name.next):
-		Ok({ written = AtomicType(name.name), next = name.next })
+
+private pure func consume_optional_type_arguments(state: ParserState, name_end: Int) -> Result[ParsedTypeArguments, Diagnostic]:
+	if not at_left_bracket(state):
+		Ok({ types = [], end = name_end, next = state })
 	else:
-		arguments ?= consume_type_arguments(shifted(name.next, 1), [])
+		arguments ?= consume_type_arguments(shifted(state, 1), [])
 		closed ?= expect(
 			arguments.next,
 			at_right_bracket(arguments.next),
 			"expected ']' after the type arguments",
 			"write comma-separated type arguments, such as Result[Box[Int], Int]",
 		)
-		span = { name.name.span | end = parser_span(arguments.next).end }
-		Ok({ written = AppliedType(name.name, arguments.types, span), next = closed })
+		Ok({ types = arguments.types, end = parser_span(arguments.next).end, next = closed })
+
+
+-- A type is `Name`, `Name[arguments]` or `Module.Name[arguments]`; a dot in
+-- a type can only qualify, so no alias set is consulted here.
+private pure func consume_type(state: ParserState, message: String) -> Result[ParsedType, Diagnostic]:
+	name ?= consume_name(state, message)
+
+	if at_dot(name.next):
+		member ?= consume_name(shifted(name.next, 1), "expected a type name after the module alias and '.'")
+		arguments ?= consume_optional_type_arguments(member.next, member.name.span.end)
+		span = { name.name.span | end = arguments.end }
+		Ok({ written = QualifiedType({ module = name.name, name = member.name }, arguments.types, span), next = arguments.next })
+	else if not at_left_bracket(name.next):
+		Ok({ written = AtomicType(name.name), next = name.next })
+	else:
+		arguments ?= consume_optional_type_arguments(name.next, name.name.span.end)
+		span = { name.name.span | end = arguments.end }
+		Ok({ written = AppliedType(name.name, arguments.types, span), next = arguments.next })
 
 
 private fixed record ParameterResult {
@@ -1060,7 +1202,26 @@ private fixed union BlockLine:
 
 
 private pure func at_binding(state: ParserState) -> Bool:
-	at_var(state) or (at_identifier(state) and at_equals(shifted(state, 1)))
+	at_var(state) or (at_identifier(state) and (at_equals(shifted(state, 1)) or at_colon(shifted(state, 1))))
+
+
+private INDENTED_VALUE_HELP: String = "put the value on the same line as '=', or alone on the next line indented one level"
+
+
+-- The value after '=' and the end of its line: on the same line, or alone on
+-- an indented next line, whose Dedent closes it. `next` follows the line end.
+private pure func consume_initializer(equals: ParserState, line_message: String, line_help: String) -> Result[ParsedValue, Diagnostic]:
+	if not at_newline(equals):
+		value ?= consume_value(equals)
+		next ?= consume_line_end(value.next, line_message, line_help)
+		Ok({ value | next = next })
+	else:
+		after_newline = shifted(equals, 1)
+		opened ?= expect(after_newline, at_indent(after_newline), "expected an indented value after '='", INDENTED_VALUE_HELP)
+		value ?= consume_value(opened)
+		ended ?= consume_line_end(value.next, "expected one expression after '='", INDENTED_VALUE_HELP)
+		closed ?= expect(ended, at_dedent(ended), "expected one expression after '='", INDENTED_VALUE_HELP)
+		Ok({ value | next = closed })
 
 
 private pure func consume_binding(state: ParserState) -> Result[BlockLine, Diagnostic]:
@@ -1074,19 +1235,35 @@ private pure func consume_binding(state: ParserState) -> Result[BlockLine, Diagn
 		ImmutableBinding:
 			state
 	name ?= consume_name(after_keyword, "expected a binding name")
-	equals ?= expect(name.next, at_equals(name.next), "expected '=' after the binding name", "write name = expression or var name = expression")
-	initializer ?= if at_newline(equals):
-		Err(expected(equals, "expected a binding initializer", "put one expression after '=' on the same line"))
+	annotation ?= consume_binding_annotation(name.next)
+	equals ?= expect(annotation.next, at_equals(annotation.next), "expected '=' after the binding name", "write name = expression or var name = expression")
+	initializer ?= consume_initializer(equals, "expected a newline after the binding", "put each statement on its own line")
+	binding = { name = name.name, annotation = annotation.written, mutability = mutability, initializer = initializer.body }
+	Ok(StatementLine(BindingStatement(binding), initializer.next))
+
+
+private fixed record ParsedBindingType {
+	written: Option[TypeSyntax],
+	next: ParserState
+}
+
+
+-- `: Type` after a binding name, or nothing.
+private pure func consume_binding_annotation(state: ParserState) -> Result[ParsedBindingType, Diagnostic]:
+	if not at_colon(state):
+		Ok({ written = None, next = state })
 	else:
-		consume_value(equals)
-	next ?= consume_line_end(initializer.next, "expected a newline after the binding", "put each statement on its own line")
-	binding = { name = name.name, mutability = mutability, initializer = initializer.body }
-	Ok(StatementLine(BindingStatement(binding), next))
+		written ?= consume_type(shifted(state, 1), "expected the binding's type after ':'")
+		Ok({ written = Some(written.written), next = written.next })
 
 
--- A value line ends its block when the block's Dedent follows it.
+-- A value line ends its block when the block's Dedent follows it. An
+-- `import:` line is tested first: it would otherwise read as an annotated
+-- binding named import.
 private pure func consume_block_line(state: ParserState) -> Result[BlockLine, Diagnostic]:
-	if at_binding(state):
+	if at_word(state, words(state).import_word) and at_colon(shifted(state, 1)):
+		Err(expected(state, IMPORT_IN_BODY_MESSAGE, IMPORT_IN_BODY_HELP))
+	else if at_binding(state):
 		consume_binding(state)
 	else:
 		value ?= consume_value(state)
@@ -1584,13 +1761,14 @@ private fixed record FunctionResult {
 }
 
 
-private pure func consume_function(start: ParserState, module: ModuleId) -> Result[FunctionResult, Diagnostic]:
+private pure func consume_function(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[FunctionResult, Diagnostic]:
 	annotation ?= consume_annotation(start)
 	header ?= consume_header(annotation.next)
 	body ?= consume_function_lines(header.next)
 	Ok({
 		function = {
 			module = module,
+			visibility = visibility,
 			tail_annotation = annotation.span,
 			purity = header.header.purity,
 			function_name = header.header.function_name,
@@ -1669,7 +1847,7 @@ private fixed record UnionResult {
 }
 
 
-private pure func consume_union(start: ParserState, module: ModuleId) -> Result[UnionResult, Diagnostic]:
+private pure func consume_union(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[UnionResult, Diagnostic]:
 	after_fixed = shifted(start, 1)
 	word ?= if at_word(after_fixed, words(after_fixed).union_word):
 		Ok(shifted(after_fixed, 1))
@@ -1684,6 +1862,7 @@ private pure func consume_union(start: ParserState, module: ModuleId) -> Result[
 	Ok({
 		declaration = {
 			module = module,
+			visibility = visibility,
 			type_name = name.name,
 			type_parameters = type_parameters.names,
 			variants = variants.variants
@@ -1742,7 +1921,7 @@ private fixed record ParsedRecordResult {
 }
 
 
-private pure func consume_record(start: ParserState, module: ModuleId) -> Result[ParsedRecordResult, Diagnostic]:
+private pure func consume_record(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[ParsedRecordResult, Diagnostic]:
 	name ?= consume_name(shifted(start, 2), "expected a record type name")
 	type_parameters ?= consume_type_parameters(name.next)
 	opened ?= match current_symbol(type_parameters.next):
@@ -1752,7 +1931,7 @@ private pure func consume_record(start: ParserState, module: ModuleId) -> Result
 			Err(unexpected(type_parameters.next, "expected '{' after the record type name", "write fixed record Name { field: Int }"))
 	fields ?= consume_parameter_list(opened, "expected a record field name", [])
 	closed ?= expect(fields.next, at_right_brace(fields.next), "expected '}' after the record declaration", "separate record fields with commas, then close the declaration with '}'")
-	Ok({ declaration = { module = module, type_name = name.name, type_parameters = type_parameters.names, fields = fields.parameters }, next = closed })
+	Ok({ declaration = { module = module, visibility = visibility, type_name = name.name, type_parameters = type_parameters.names, fields = fields.parameters }, next = closed })
 
 
 private fixed record BuiltinTypeResult {
@@ -1818,8 +1997,9 @@ private fixed record ParsedPath {
 }
 
 
+-- `../` lexes as the range symbol and a slash.
 private pure func parent_prefix(state: ParserState) -> Bool:
-	at_dot(state) and at_dot(shifted(state, 1)) and at_slash(shifted(state, 2))
+	at_dot_dot(state) and at_slash(shifted(state, 1))
 
 
 private fixed record ParsedPathParts {
@@ -1830,7 +2010,7 @@ private fixed record ParsedPathParts {
 
 
 private pure func consume_path_parts(state: ParserState, parts: List[NameId]) -> Result[ParsedPathParts, Diagnostic]:
-	interior ?= if at_dot(state):
+	interior ?= if at_dot(state) or at_dot_dot(state):
 		Err(expected(state, "'.' and '..' may only begin an import path", "write ../shared/helper or ./shared/helper without interior dot segments"))
 	else:
 		Ok(void)
@@ -1865,14 +2045,14 @@ private pure func consume_module_path(start: ParserState) -> Result[ParsedPath, 
 
 		while parent_prefix(state):
 			parents = IntOps.add(parents, 1)
-			state = shifted(state, 3)
+			state = shifted(state, 2)
 
 		if IntOps.greater_than(parents, 0):
 			origin = RelativeImport(parents)
 
 	prefix ?= if at_slash(start):
 		Err(expected(start, "absolute import paths are not supported", "write int: add for the target library or ./helper: answer for a local module"))
-	else if IntOps.equals(state.position, start.position) and at_dot(start):
+	else if IntOps.equals(state.position, start.position) and (at_dot(start) or at_dot_dot(start)):
 		Err(expected(start, "expected './' or '../' before a relative import path", "write ./helper: answer or ../shared/helper: answer"))
 	else:
 		Ok(void)
@@ -1945,7 +2125,7 @@ private pure func consume_import_symbol(state: ParserState) -> Result[ImportSele
 			name ?= consume_name(state, "expected an imported function or type name")
 
 			if at_word(name.next, words(name.next).as_word):
-				Err(expected(name.next, "import aliases are not supported yet", "select the function by its declared name, such as ./helper: answer"))
+				Err(expected(name.next, "selection aliases are not supported yet", "select the name by its declared spelling, such as ./helper: answer; a module alias is written path as Alias"))
 			else if at_left_paren(name.next):
 				consume_constructor_selection(name)
 			else if at_word(name.next, words(name.next).methods_only_word):
@@ -2009,19 +2189,46 @@ private fixed record ImportResult {
 }
 
 
+private fixed record ParsedAlias {
+	module_alias: Option[WrittenName],
+	next: ParserState
+}
+
+
+-- `path as Alias` names the module; the alias joins the parser's alias set.
+private pure func consume_module_alias(state: ParserState) -> Result[ParsedAlias, Diagnostic]:
+	if not at_word(state, words(state).as_word):
+		Ok({ module_alias = None, next = state })
+	else:
+		name ?= consume_name(shifted(state, 1), "expected a module alias name after 'as'")
+		Ok({ module_alias = Some(name.name), next = { name.next | aliases = name.next.aliases.append(name.name.id) } })
+
+
+-- A row is `path: selections`, `path as Alias`, or `path as Alias: selections`.
 private pure func consume_import_row(start: ParserState) -> Result[ImportResult, Diagnostic]:
 	path ?= consume_module_path(start)
-	selection ?= if at_word(path.next, words(path.next).as_word):
-		Err(expected(path.next, "import aliases are not supported yet", "select functions directly, such as ./helper: answer"))
-	else if at_dot(path.next):
+	extension ?= if at_dot(path.next):
 		Err(expected(path.next, "import paths omit file extensions", "write ./helper: answer instead of ./helper.brp: answer"))
 	else:
-		expect(path.next, at_colon(path.next), "expected ':' and selected function names after the import path", "write ./helper: answer; module aliases and whole-module imports are not supported yet")
-	symbols ?= consume_import_selection(selection)
-	Ok({
-		request = { path = path.path, symbols = symbols.symbols, span = { path.span | end = symbols.last.end } },
-		next = symbols.next,
-	})
+		Ok(void)
+	aliased ?= consume_module_alias(path.next)
+
+	if at_colon(aliased.next):
+		symbols ?= consume_import_selection(shifted(aliased.next, 1))
+		Ok({
+			request = { path = path.path, module_alias = aliased.module_alias, symbols = symbols.symbols, span = { path.span | end = symbols.last.end } },
+			next = symbols.next,
+		})
+	else:
+		match aliased.module_alias:
+			Some(module_alias):
+				next ?= consume_line_end(aliased.next, "expected a newline after the module alias", "write path as Alias, or path as Alias: followed by selected names")
+				Ok({
+					request = { path = path.path, module_alias = Some(module_alias), symbols = [], span = { path.span | end = module_alias.span.end } },
+					next = next,
+				})
+			None:
+				Err(expected(aliased.next, "expected ':' and selected function names after the import path", "write ./helper: answer, or int as IntOps to alias a module"))
 
 
 private fixed record ImportBlockResult {
@@ -2055,6 +2262,47 @@ private fixed union Declaration:
 	FunctionDeclaration(ParsedFunction)
 	UnionDeclaration(ParsedUnion)
 	RecordDeclaration(ParsedRecord)
+	OpaqueDeclaration(ParsedOpaque)
+	ConstantDeclaration(ParsedConstant)
+
+
+private fixed record ParsedConstantResult {
+	declaration: ParsedConstant,
+	next: ParserState
+}
+
+
+-- `NAME: Type = value`; the value may stand alone on the next line.
+private pure func consume_constant(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[ParsedConstantResult, Diagnostic]:
+	name ?= consume_name(start, "expected a constant name")
+	colon ?= expect(name.next, at_colon(name.next), "expected ':' after the constant name", "write NAME: Type = value")
+	type_name ?= consume_type(colon, "expected the constant's type after ':'")
+	equals ?= expect(type_name.next, at_equals(type_name.next), "expected '=' after the constant type", "write NAME: Type = value")
+	value ?= consume_initializer(equals, "expected a newline after the constant value", "put each declaration on a new line")
+	Ok({
+		declaration = { module = module, visibility = visibility, name = name.name, type_name = type_name.written, value = value.body },
+		next = value.next,
+	})
+
+
+private fixed record ParsedOpaqueResult {
+	declaration: ParsedOpaque,
+	next: ParserState
+}
+
+
+-- `opaque type Name = Underlying` on one line.
+private pure func consume_opaque(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[ParsedOpaqueResult, Diagnostic]:
+	after_opaque = shifted(start, 1)
+	type_word ?= if at_word(after_opaque, words(after_opaque).type_word):
+		Ok(shifted(after_opaque, 1))
+	else:
+		Err(expected(after_opaque, "expected 'type' after 'opaque'", "write opaque type Name = Underlying"))
+	name ?= consume_name(type_word, "expected an opaque type name")
+	equals ?= expect(name.next, at_equals(name.next), "expected '=' after the opaque type name", "write opaque type Name = Underlying")
+	underlying ?= consume_type(equals, "expected the underlying type after '='")
+	next ?= end_value_line(underlying.next)
+	Ok({ declaration = { module = module, visibility = visibility, type_name = name.name, underlying = underlying.written }, next = next })
 
 
 private fixed record DeclarationResult {
@@ -2074,17 +2322,31 @@ private pure func consume_declaration(state: ParserState, module: ModuleId, decl
 		parsed ?= consume_builtin_type(state)
 		next ?= end_value_line(parsed.next)
 		Ok({ declaration = BuiltinTypeDeclaration(parsed.declaration), next = next })
+	else if at_word(state, words(state).private_word) and at_word(shifted(state, 1), words(state).type_word):
+		Err(expected(state, "builtin type declarations cannot be private", "remove private; builtin types belong to the foundation module"))
 	else if at_word(state, words(state).private_word):
-		Err(expected(state, "private declarations are not supported yet", "omit private; local module declarations are public by default"))
-	else if at_word(state, words(state).fixed_word) and at_word(shifted(state, 1), words(state).record_word):
-		parsed ?= consume_record(state, module)
+		consume_visible_declaration(shifted(state, 1), module, Private(parser_span(state)))
+	else:
+		consume_visible_declaration(state, module, Public)
+
+
+-- The declarations that may carry `private`.
+private pure func consume_visible_declaration(state: ParserState, module: ModuleId, visibility: Visibility) -> Result[DeclarationResult, Diagnostic]:
+	if at_word(state, words(state).fixed_word) and at_word(shifted(state, 1), words(state).record_word):
+		parsed ?= consume_record(state, module, visibility)
 		next ?= end_value_line(parsed.next)
 		Ok({ declaration = RecordDeclaration(parsed.declaration), next = next })
+	else if at_word(state, words(state).opaque_word):
+		parsed ?= consume_opaque(state, module, visibility)
+		Ok({ declaration = OpaqueDeclaration(parsed.declaration), next = parsed.next })
+	else if at_identifier(state) and at_colon(shifted(state, 1)):
+		parsed ?= consume_constant(state, module, visibility)
+		Ok({ declaration = ConstantDeclaration(parsed.declaration), next = parsed.next })
 	else if at_word(state, words(state).fixed_word):
-		parsed ?= consume_union(state, module)
+		parsed ?= consume_union(state, module, visibility)
 		Ok({ declaration = UnionDeclaration(parsed.declaration), next = parsed.next })
 	else:
-		parsed ?= consume_function(state, module)
+		parsed ?= consume_function(state, module, visibility)
 		Ok({ declaration = FunctionDeclaration(parsed.function), next = parsed.next })
 
 
@@ -2103,8 +2365,10 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
 	var functions: List[ParsedFunction] = []
 	var unions: List[ParsedUnion] = []
 	var records: List[ParsedRecord] = []
+	var opaques: List[ParsedOpaque] = []
+	var constants: List[ParsedConstant] = []
 	-- One Result carries the parser to the end of the module or to the first error.
-	var scan: Result[ParserState, Diagnostic] = Ok({ input = input, position = 0 })
+	var scan: Result[ParserState, Diagnostic] = Ok({ input = input, position = 0, aliases = [] })
 
 	while True:
 		match scan:
@@ -2112,7 +2376,7 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
 				if at_end(state):
 					break
 
-				declared = not (builtin_types.is_empty() and functions.is_empty() and unions.is_empty() and records.is_empty())
+				declared = not (builtin_types.is_empty() and functions.is_empty() and unions.is_empty() and records.is_empty() and opaques.is_empty() and constants.is_empty())
 				scan = match consume_declaration(state, module, declared):
 					Ok(parsed):
 						match parsed.declaration:
@@ -2127,6 +2391,10 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
 								unions = unions.append(declaration)
 							RecordDeclaration(declaration):
 								records = records.append(declaration)
+							OpaqueDeclaration(declaration):
+								opaques = opaques.append(declaration)
+							ConstantDeclaration(declaration):
+								constants = constants.append(declaration)
 
 						Ok(parsed.next)
 					Err(error):
@@ -2144,5 +2412,7 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
 				functions = functions,
 				unions = unions,
 				records = records,
+				opaques = opaques,
+				constants = constants,
 				end = input.end
 			}))

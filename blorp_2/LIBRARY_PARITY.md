@@ -16,8 +16,11 @@ The milestone names below come from the self-compile plan, which is pending
 adoption into [ROADMAP.md](ROADMAP.md). As this document uses them:
 
 - **M0**: foundation closeout; includes removing the `+` operator sites from `src`.
-- **ML**: List construction intrinsics (`append`, `set`, `concat`, the list literal).
-- **M3**: loops with managed carried values (`for`, `while`, `break`).
+- **M1b** (the "namespace" milestone): `private`, module aliases and qualified names.
+- **ML** (the "list intrinsics" milestone): List construction intrinsics (`append`, `set`, `concat`, the list literal).
+- **M2** (the "join" milestone): non-tail matches, `if`, `and`/`or`/`not`, `?=`, local type annotations.
+- **M3** (the "loops" milestone): loops with managed carried values (`for`, `while`, `break`, `a..b`).
+- **M4** (the "recursive-types" milestone): recursive types and opaque types.
 - **M5**: module-level constants with literal initializers, including in library modules.
 - **M6**: the library and shell increment this table drives; its exit is no MISSING row.
 - **M7**: lambdas at known callees; `pure (T) -> U` parameter types in signatures.
