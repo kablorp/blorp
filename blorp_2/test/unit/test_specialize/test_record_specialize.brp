@@ -1,0 +1,372 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic
+	../input: check, parse, setup_diagnostic
+	test: TestSuite
+
+
+private PAIR: String =
+	|fixed record Pair { first: Int, second: Int }
+	|
+
+private OTHER: String =
+	|fixed record Other { first: Int, second: Int }
+	|
+
+private MAIN: String =
+	|func main() -> Int:
+	|	0
+	|
+
+
+private pure func specialized(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source)
+	parsed ?= parse(tokens)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	program ?= Concrete.specialize(checked)
+	Ok(Concrete.specialized_contents(program))
+
+
+pure func test_second_record_field_uses_its_concrete_owner() -> Bool:
+	helper: String =
+		|pure func make_pair() -> Pair:
+		|	{ first = 1, second = 2 }
+		|pure func make_other() -> Other:
+		|	{ second = 9, first = 7 }
+		|pure func read_other(value: Other) -> Int:
+		|	value.first
+		|
+
+	match specialized(
+		PAIR + OTHER + helper + "func main() -> Int:\n\tunused = make_pair()\n\tread_other(make_other())\n",
+	):
+		Ok(program):
+			match program.functions:
+				[_, _, make, read]:
+					match make.body:
+						Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+							match value.form:
+								Concrete.ConstructRecord(owner, [second, first]):
+									match read.body:
+										Concrete.ConcreteValueBody(Concrete.ReturnExpression(projected)):
+											match projected.form:
+												Concrete.ReadRecordField(_, field):
+													(
+														program.records.length() == 2
+														and Concrete.record_number(
+															owner,
+														) == 1
+														and Concrete.record_number(
+															Concrete.field_owner(
+																second.field,
+															),
+														) == 1
+														and Concrete.field_number(
+															second.field,
+														) == 1
+														and Concrete.field_number(
+															first.field,
+														) == 0
+														and Concrete.record_number(
+															Concrete.field_owner(
+																field,
+															),
+														) == 1
+														and Concrete.field_number(
+															field,
+														) == 0
+														and Concrete.same_type(
+															projected.value_type,
+															Concrete.IntType,
+														)
+													)
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_generic_function_specializes_for_nominal_record() -> Bool:
+	source: String =
+		|pure func identity[T](value: T) -> T:
+		|	value
+		|pure func make() -> Pair:
+		|	{ first = 7, second = 9 }
+		|func main() -> Int:
+		|	identity(make()).first
+		|
+
+	match specialized(PAIR + source):
+		Ok(program):
+			match program.functions:
+				[_, _, identity]:
+					match identity.signature.parameters:
+						[Concrete.RecordType(owner)]:
+							Concrete.record_number(owner) == 0 and Concrete.same_type(
+								identity.signature.return_type,
+								Concrete.RecordType(owner),
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_calls_inside_record_fields_are_collected() -> Bool:
+	source: String =
+		|pure func identity[T](value: T) -> T:
+		|	value
+		|pure func make() -> Pair:
+		|	{ second = identity(9), first = identity(7) }
+		|
+
+	match specialized(PAIR + source + "func main() -> Int:\n\tmake().first\n"):
+		Ok(program):
+			match program.functions:
+				[_, make, identity]:
+					match make.body:
+						Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+							match value.form:
+								Concrete.ConstructRecord(_, [second, first]):
+									match second.value.form:
+										Concrete.InvokeFunction(call, [_]):
+											match first.value.form:
+												Concrete.InvokeFunction(other_call, [_]):
+													match call.target:
+														Concrete.UserFunction(id):
+															match other_call.target:
+																Concrete.UserFunction(other):
+																	(
+																		Concrete.function_number(
+																			id,
+																		) == 2
+																		and Concrete.function_number(
+																			other,
+																		) == 2
+																		and identity.signature.parameters.length() == 1
+																		and Concrete.same_type(
+																			identity.signature.return_type,
+																			Concrete.IntType,
+																		)
+																	)
+																_:
+																	False
+														_:
+															False
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_record_payload_in_generic_union_has_concrete_record_identity() -> Bool:
+	prefix: String =
+		|fixed union Box[T]:
+		|	Value(T)
+		|pure func make_pair() -> Pair:
+		|	{ first = 7, second = 9 }
+		|pure func boxed() -> Box[Pair]:
+		|	Value(make_pair())
+		|
+
+	match specialized(PAIR + prefix + "func main() -> Int:\n\tunused = boxed()\n\t0\n"):
+		Ok(program):
+			match program.unions:
+				[boxed]:
+					match boxed.variants:
+						[[Concrete.RecordType(owner)]]:
+							Concrete.record_number(owner) == 0
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_full_width_field_values_survive_specialization() -> Bool:
+	source: String =
+		|pure func make() -> Pair:
+		|	{ first = -9223372036854775808, second = 9223372036854775807 }
+		|
+
+	match specialized(PAIR + source + "func main() -> Int:\n\tmake().first\n"):
+		Ok(program):
+			match program.functions:
+				[_, make]:
+					match make.body:
+						Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+							match value.form:
+								Concrete.ConstructRecord(_, [first, second]):
+									match first.value.form:
+										Concrete.LiteralInteger(low):
+											match second.value.form:
+												Concrete.LiteralInteger(high):
+													(
+														low == -9223372036854775808
+														and high == 9223372036854775807
+													)
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_mixed_fields_preserve_concrete_types() -> Bool:
+	source: String =
+		|fixed record Entry { count: Int, ratio: Float, text: String, empty: Void }
+		|pure func make() -> Entry:
+		|	{ count = 7, ratio = 2.5, text = "42", empty = void }
+		|func main() -> Int:
+		|	make().count
+		|
+
+	match specialized(source):
+		Ok(program):
+			match program.records:
+				[entry]:
+					match entry.fields:
+						[count, ratio, text, empty]:
+							(
+								Concrete.same_type(count, Concrete.IntType)
+								and Concrete.same_type(ratio, Concrete.FloatType)
+								and Concrete.same_type(text, Concrete.StringType)
+								and Concrete.same_type(empty, Concrete.VoidType)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_numeric_nested_records_are_inline_and_void_root_is_managed() -> Bool:
+	source: String =
+		|fixed record Scalar { number: Int, ratio: Float }
+		|fixed record Nested { scalar: Scalar }
+		|fixed record Unit { empty: Void }
+		|pure func scalar() -> Scalar:
+		|	{ number = 7, ratio = 2.5 }
+		|pure func nested() -> Nested:
+		|	{ scalar = scalar() }
+		|pure func unit(value: Unit) -> Unit:
+		|	value
+		|func main() -> Int:
+		|	unused = unit({ empty = void })
+		|	nested().scalar.number
+		|
+
+	match specialized(source):
+		Ok(program):
+			var inline_count = 0
+			var managed_count = 0
+
+			for layout in program.records:
+				match layout.representation:
+					Concrete.InlineRecord:
+						inline_count += 1
+					Concrete.ManagedRecord:
+						managed_count += 1
+
+			inline_count == 2 and managed_count == 1
+		Err(_):
+			False
+
+
+pure func test_union_record_payload_owns_root_while_phantom_does_not() -> Bool:
+	source: String =
+		|fixed union Box[T]:
+		|	Full(T)
+		|fixed union Token[T]:
+		|	Marker
+		|fixed record Entry { text: String }
+		|pure func entry() -> Entry:
+		|	{ text = "42" }
+		|pure func boxed() -> Box[Entry]:
+		|	Full(entry())
+		|pure func phantom() -> Token[Entry]:
+		|	Marker
+		|func main() -> Int:
+		|	first = boxed()
+		|	second = phantom()
+		|	0
+		|
+
+	match specialized(source):
+		Ok(program):
+			match (program.records, program.unions):
+				([entry], [boxed, phantom]):
+					match (entry.representation, boxed.representation, phantom.representation):
+						(Concrete.ManagedRecord, Concrete.InlineOwningPayload, Concrete.InlineUnmanaged):
+							True
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Concrete fixed records",
+	tests = [
+		(
+			"numeric nested storage and Void root differ",
+			test_numeric_nested_records_are_inline_and_void_root_is_managed,
+		),
+		(
+			"record payload owns root but phantom does not",
+			test_union_record_payload_owns_root_while_phantom_does_not,
+		),
+		("mixed fields retain concrete types", test_mixed_fields_preserve_concrete_types),
+		(
+			"second record field retains concrete owner",
+			test_second_record_field_uses_its_concrete_owner,
+		),
+		(
+			"generic identity specializes for nominal record",
+			test_generic_function_specializes_for_nominal_record,
+		),
+		(
+			"record children contribute generic call requests",
+			test_calls_inside_record_fields_are_collected,
+		),
+		(
+			"generic union record payload retains concrete identity",
+			test_record_payload_in_generic_union_has_concrete_record_identity,
+		),
+		(
+			"full-width field values survive specialization",
+			test_full_width_field_values_survive_specialization,
+		),
+	]
+}

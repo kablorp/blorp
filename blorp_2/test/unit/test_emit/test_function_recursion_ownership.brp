@@ -1,0 +1,670 @@
+import:
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/emit/emit: emit
+	../../../src/lex/lex: lex
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/namespace/builtins as Builtins: RuntimeOperation(IntToString, StringLength)
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, FunctionExecution(OrdinaryCalls), same_span, Entrypoint(NoArguments), EntryResult(IntegerExitStatus), entry_function
+	../../../src/verify/verify: verify
+	../input: check, parse, setup_diagnostic
+	../ownership_inputs: function, integer, parameter, runtime, span
+	test: TestSuite
+
+
+private fixed record RecursionIds {
+	first: Lower.ValueId,
+	second: Lower.ValueId,
+	third: Lower.ValueId,
+	fourth: Lower.ValueId,
+	fifth: Lower.ValueId,
+	entrypoint: Concrete.FunctionInstanceId,
+	left: Concrete.FunctionInstanceId,
+	right: Concrete.FunctionInstanceId
+}
+
+
+private pure func seed_error() -> Diagnostic:
+	{
+		span = span(0),
+		note = None,
+		message = "invalid recursion ownership identity seed",
+		help = "fix the test seed"
+	}
+
+
+private pure func called_id(value: Lower.ValueDefinition) -> Result[Concrete.FunctionInstanceId, Diagnostic]:
+	match value.operation:
+		Lower.CallValue(call, _):
+			match call.target:
+				Concrete.UserFunction(id):
+					Ok(id)
+				_:
+					Err(seed_error())
+		_:
+			Err(seed_error())
+
+
+-- The acyclic seed only issues identities. Every tested body and every raw
+-- ownership operation below is constructed independently of its source body.
+private pure func identities() -> Result[RecursionIds, Diagnostic]:
+	source: String =
+		|func main() -> Int:
+		|	first = 0
+		|	second = 1
+		|	third = 2
+		|	fourth = 3
+		|	text = left("seed")
+		|	unused = right(text)
+		|	0
+		|pure func left(value: String) -> String:
+		|	value
+		|pure func right(value: String) -> String:
+		|	value
+		|
+	tokens ?= lex(module_source(root_module_id()), source)
+	parsed ?= parse(tokens)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	concrete ?= Concrete.specialize(checked)
+	lowered ?= Lower.lower(concrete)
+	contents = Lower.lowered_functions(lowered)
+
+	match contents.functions:
+		[main, _, _]:
+			match main.definitions:
+				[first, second, third, fourth, fifth, left, right, _]:
+					left_id ?= called_id(left)
+					right_id ?= called_id(right)
+					Ok({
+						first = first.id,
+						second = second.id,
+						third = third.id,
+						fourth = fourth.id,
+						fifth = fifth.id,
+						entrypoint = entry_function(contents.entrypoint),
+						left = left_id,
+						right = right_id,
+					})
+				_:
+					Err(seed_error())
+		_:
+			Err(seed_error())
+
+
+private pure func call(
+	value: Lower.ValueId,
+	target: Concrete.FunctionInstanceId,
+	arguments: List[Lower.ValueId],
+	at: Int,
+) -> Lower.ValueDefinition:
+	{
+		id = value,
+		value_type = Concrete.StringType,
+		operation = Lower.CallValue({
+				target = Concrete.UserFunction(target),
+				span = span(at),
+			}, arguments),
+		span = span(at),
+	}
+
+
+private pure func main_stub(ids: RecursionIds) -> Own.OwnedFunction:
+	{
+		execution = OrdinaryCalls,
+		signature = { parameters = [], return_type = Concrete.IntType },
+		operations = [Own.DefineValue({
+				id = ids.first,
+				value_type = Concrete.IntType,
+				operation = Own.IntegerDefinition(0),
+				result = Own.UnmanagedResult,
+				span = span(1),
+			})],
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.first))),
+	}
+
+
+private pure func borrowed_parameter(ids: RecursionIds) -> Own.OwnershipOperation:
+	Own.DefineValue({
+		id = ids.first,
+		value_type = Concrete.StringType,
+		operation = Own.ParameterDefinition(0),
+		result = Own.BorrowedResult(Own.ParameterBorrow(ids.first)),
+		span = span(10),
+	})
+
+
+private pure func parameter_borrow(value: Lower.ValueId) -> Own.OwnedArgument:
+	Own.BorrowedArgument({ value = value, source = Own.ParameterBorrow(value) })
+
+
+private pure func owner_borrow(value: Lower.ValueId, owner: Int) -> Own.OwnedArgument:
+	Own.BorrowedArgument({ value = value, source = Own.OwnerBorrow(Own.owner_id(owner)) })
+
+
+private pure func raw_call(
+	value: Lower.ValueId,
+	target: Concrete.FunctionInstanceId,
+	argument: Own.OwnedArgument,
+	result: Own.ResultOwnership,
+	at: Int,
+) -> Own.OwnershipOperation:
+	Own.DefineValue({
+		id = value,
+		value_type = Concrete.StringType,
+		operation = Own.CallDefinition({
+				target = Concrete.UserFunction(target),
+				span = span(at),
+			}, [argument]),
+		result = result,
+		span = span(at),
+	})
+
+
+private pure func raw_function(
+	operations: List[Own.OwnershipOperation],
+	returned: Own.ReturnTransfer,
+) -> Own.OwnedFunction:
+	{
+		execution = OrdinaryCalls,
+		signature = { parameters = [Concrete.StringType], return_type = Concrete.StringType },
+		operations = operations,
+		tail = Own.ReturnTail(Own.ReturnResult(returned)),
+	}
+
+
+private pure func identity_function(ids: RecursionIds) -> Own.OwnedFunction:
+	raw_function([
+		borrowed_parameter(ids),
+		Own.AcquireOwner(Own.owner_id(0), {
+				value = ids.first,
+				source = Own.ParameterBorrow(ids.first),
+			}, span(10)),
+	], Own.OwnedReturn(ids.first, Own.owner_id(0)))
+
+
+private pure func program(
+	ids: RecursionIds,
+	left: Own.OwnedFunction,
+	right: Own.OwnedFunction,
+) -> Own.OwnershipProgram:
+	{
+		records = [],
+		unions = [],
+		functions = [main_stub(ids), left, right],
+		entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus),
+	}
+
+
+private pure func insert(input: Lower.LoweredFunction) -> Result[Own.OwnedFunction, Diagnostic]:
+	Own.insert_function(input, [], [])
+
+
+private pure func valid(ids: RecursionIds, output: Own.OwnedFunction) -> Bool:
+	verify(program(ids, output, identity_function(ids))).is_ok()
+
+
+private pure func owns(result: Own.ResultOwnership, expected: Int) -> Bool:
+	match result:
+		Own.OwnedResult(owner):
+			Own.owner_number(owner) == expected
+		_:
+			False
+
+
+private pure func borrowed(result: Own.ResultOwnership) -> Bool:
+	match result:
+		Own.BorrowedResult(_): True
+		_: False
+
+
+private pure func borrows_parameter(borrow: Own.BorrowedValue, expected: Int) -> Bool:
+	match borrow.source:
+		Own.ParameterBorrow(source):
+			Lower.value_number(source) == expected and Lower.value_number(borrow.value) == expected
+		_: False
+
+
+private pure func borrows_owner(borrow: Own.BorrowedValue, value: Int, expected: Int) -> Bool:
+	match borrow.source:
+		Own.OwnerBorrow(source):
+			Own.owner_number(source) == expected and Lower.value_number(borrow.value) == value
+		_: False
+
+
+private pure func transfers(tail: Own.OwnedTail, value: Int, owner: Int) -> Bool:
+	match tail:
+		Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(returned, transferred))):
+			Lower.value_number(returned) == value and Own.owner_number(transferred) == owner
+		_:
+			False
+
+
+pure func test_nested_self_calls_have_separate_final_use_positions() -> Bool:
+	match identities():
+		Err(_): False
+		Ok(ids):
+			match Own.last_uses([
+				parameter(ids.first, Concrete.StringType),
+				call(ids.second, ids.left, [ids.first], 20),
+				call(ids.third, ids.left, [ids.second], 30),
+			], ids.third):
+				Ok(uses): uses == [Some(1), Some(2), Some(3)]
+				Err(_): False
+
+
+pure func test_repeated_recursive_argument_has_one_final_use_position() -> Bool:
+	match identities():
+		Err(_): False
+		Ok(ids):
+			match Own.last_uses([
+				parameter(ids.first, Concrete.StringType),
+				{ parameter(ids.second, Concrete.StringType) | operation = Lower.ParameterValue(1) },
+				call(ids.third, ids.left, [ids.first, ids.first], 30),
+			], ids.third):
+				Ok(uses): uses == [Some(2), None, Some(3)]
+				Err(_): False
+
+
+pure func test_self_call_borrows_parameter_and_returns_distinct_owned_value() -> Bool:
+	match identities():
+		Err(_): False
+		Ok(ids):
+			match insert(function([
+				parameter(ids.first, Concrete.StringType),
+				call(ids.second, ids.left, [ids.first], 20),
+			], ids.second, [Concrete.StringType], Concrete.StringType)):
+				Err(_): False
+				Ok(output):
+					match output.operations:
+						[Own.DefineValue(parameter), Own.DefineValue(result)]:
+							match result.operation:
+								Own.CallDefinition(_, [Own.BorrowedArgument(borrow)]):
+									(
+										borrowed(parameter.result)
+										and borrows_parameter(borrow, 0)
+										and Lower.value_number(borrow.value) == 0
+										and Lower.value_number(result.id) == 1
+										and owns(result.result, 0)
+										and transfers(output.tail, 1, 0)
+										and valid(ids, output)
+									)
+								_: False
+						_: False
+
+
+pure func test_self_call_result_exists_before_last_argument_owner_is_dropped() -> Bool:
+	match identities():
+		Err(_): False
+		Ok(ids):
+			match insert(function([
+				parameter(ids.first, Concrete.StringType),
+				integer(ids.second, 7, 20),
+				runtime(ids.third, Builtins.IntToString, [ids.second], Concrete.StringType, 30),
+				call(ids.fourth, ids.left, [ids.third], 40),
+			], ids.fourth, [Concrete.StringType], Concrete.StringType)):
+				Err(_): False
+				Ok(output):
+					match output.operations:
+						[Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(argument), Own.DefineValue(result), Own.DropOwner(dropped, at)]:
+							(
+								owns(argument.result, 0)
+								and owns(result.result, 1)
+								and Own.owner_number(dropped) == 0
+								and same_span(at, span(40))
+								and transfers(output.tail, 3, 1)
+								and valid(ids, output)
+							)
+						_: False
+
+
+pure func test_parameter_reuse_after_self_call_needs_no_retain() -> Bool:
+	match identities():
+		Err(_): False
+		Ok(ids):
+			match insert(function([
+				parameter(ids.first, Concrete.StringType),
+				call(ids.second, ids.left, [ids.first], 20),
+				runtime(ids.third, Builtins.StringLength, [ids.first], Concrete.IntType, 30),
+			], ids.second, [Concrete.StringType], Concrete.StringType)):
+				Err(_): False
+				Ok(output):
+					match output.operations:
+						[Own.DefineValue(_), Own.DefineValue(result), Own.DefineValue(length)]:
+							match length.operation:
+								Own.CallDefinition(_, [Own.BorrowedArgument(borrow)]):
+									(
+										borrows_parameter(borrow, 0)
+										and owns(result.result, 0)
+										and transfers(output.tail, 1, 0)
+										and valid(ids, output)
+									)
+								_: False
+						_: False
+
+
+pure func test_owned_argument_remains_live_through_later_reuse() -> Bool:
+	match identities():
+		Err(_): False
+		Ok(ids):
+			match insert(function([
+				parameter(ids.first, Concrete.StringType),
+				integer(ids.second, 7, 20),
+				runtime(ids.third, Builtins.IntToString, [ids.second], Concrete.StringType, 30),
+				call(ids.fourth, ids.left, [ids.third], 40),
+				runtime(ids.fifth, Builtins.StringLength, [ids.third], Concrete.IntType, 50),
+			], ids.fourth, [Concrete.StringType], Concrete.StringType)):
+				Err(_): False
+				Ok(output):
+					match output.operations:
+						[Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(length), Own.DropOwner(owner, at)]:
+							match length.operation:
+								Own.CallDefinition(_, [Own.BorrowedArgument(borrow)]):
+									(
+										borrows_owner(borrow, 2, 0)
+										and Own.owner_number(owner) == 0
+										and same_span(at, span(50))
+										and transfers(output.tail, 3, 1)
+										and valid(ids, output)
+									)
+								_: False
+						_: False
+
+
+pure func test_unused_recursive_result_is_dropped_before_parameter_return_is_acquired() -> Bool:
+	match identities():
+		Err(_): False
+		Ok(ids):
+			match insert(function([
+				parameter(ids.first, Concrete.StringType),
+				call(ids.second, ids.left, [ids.first], 20),
+			], ids.first, [Concrete.StringType], Concrete.StringType)):
+				Err(_): False
+				Ok(output):
+					match output.operations:
+						[Own.DefineValue(_), Own.DefineValue(_), Own.DropOwner(dropped, at), Own.AcquireOwner(acquired, borrow, _)]:
+							(
+								Own.owner_number(dropped) == 0
+								and same_span(at, span(20))
+								and Own.owner_number(acquired) == 1
+								and borrows_parameter(borrow, 0)
+								and transfers(output.tail, 0, 1)
+								and valid(ids, output)
+							)
+						_: False
+
+
+pure func test_nested_recursive_call_releases_inner_result_after_outer_call() -> Bool:
+	match identities():
+		Err(_): False
+		Ok(ids):
+			match insert(function([
+				parameter(ids.first, Concrete.StringType),
+				call(ids.second, ids.left, [ids.first], 20),
+				call(ids.third, ids.left, [ids.second], 30),
+			], ids.third, [Concrete.StringType], Concrete.StringType)):
+				Err(_): False
+				Ok(output):
+					match output.operations:
+						[Own.DefineValue(_), Own.DefineValue(inner), Own.DefineValue(outer), Own.DropOwner(dropped, at)]:
+							match outer.operation:
+								Own.CallDefinition(_, [Own.BorrowedArgument(borrow)]):
+									(
+										owns(inner.result, 0)
+										and owns(outer.result, 1)
+										and borrows_owner(borrow, 1, 0)
+										and Own.owner_number(dropped) == 0
+										and same_span(at, span(30))
+										and transfers(output.tail, 2, 1)
+										and valid(ids, output)
+									)
+								_: False
+						_: False
+
+
+pure func test_repeated_owned_argument_creates_one_drop_obligation() -> Bool:
+	match identities():
+		Err(_): False
+		Ok(ids):
+			second_parameter = { parameter(ids.second, Concrete.StringType) | operation = Lower.ParameterValue(1) }
+			match insert(function([
+				parameter(ids.first, Concrete.StringType),
+				second_parameter,
+				integer(ids.third, 7, 30),
+				runtime(ids.fourth, Builtins.IntToString, [ids.third], Concrete.StringType, 40),
+				call(ids.fifth, ids.left, [ids.fourth, ids.fourth], 50),
+			], ids.fifth, [Concrete.StringType, Concrete.StringType], Concrete.StringType)):
+				Err(_): False
+				Ok(output):
+					match output.operations:
+						[Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(result), Own.DropOwner(dropped, at)]:
+							match result.operation:
+								Own.CallDefinition(_, [Own.BorrowedArgument(first), Own.BorrowedArgument(second)]):
+									(
+										borrows_owner(first, 3, 0)
+										and borrows_owner(second, 3, 0)
+										and Own.owner_number(dropped) == 0
+										and same_span(at, span(50))
+										and transfers(output.tail, 4, 1)
+										and valid(ids, output)
+									)
+								_: False
+						_: False
+
+
+pure func test_mutual_calls_use_declared_contracts_in_both_directions() -> Bool:
+	match identities():
+		Err(_): False
+		Ok(ids):
+			left = insert(function([
+				parameter(ids.first, Concrete.StringType), call(ids.second, ids.right, [ids.first], 20),
+			], ids.second, [Concrete.StringType], Concrete.StringType))
+			right = insert(function([
+				parameter(ids.first, Concrete.StringType), call(ids.second, ids.left, [ids.first], 20),
+			], ids.second, [Concrete.StringType], Concrete.StringType))
+			match left:
+				Err(_): False
+				Ok(left_function):
+					match right:
+						Err(_): False
+						Ok(right_function):
+							(
+								transfers(left_function.tail, 1, 0)
+								and transfers(right_function.tail, 1, 0)
+								and verify(program(ids, left_function, right_function)).is_ok()
+							)
+
+
+private fixed union RawCase:
+	ValidSelf
+	MissingCallOwner
+	MissingReturnAcquire
+	DropBeforeUse
+	DoubleDrop
+	LeakedResult
+	MistakenParameterBorrow
+	MistakenOwnerBorrow
+	WrongReturnOwner
+	UnmanagedCallArgument
+	UnmanagedCallReturn
+
+
+-- These verifier inputs never pass through ownership insertion. Self calls
+-- return an owned result even when its runtime pointer could alias an argument.
+private pure func raw(ids: RecursionIds, kind: RawCase) -> Own.OwnershipProgram:
+	parameter = borrowed_parameter(ids)
+	first_call = raw_call(ids.second, ids.left, parameter_borrow(ids.first), Own.OwnedResult(Own.owner_id(0)), 20)
+	acquire = Own.AcquireOwner(Own.owner_id(1), {
+			value = ids.first, source = Own.ParameterBorrow(ids.first),
+		}, span(50))
+	result = match kind:
+		ValidSelf:
+			raw_function([parameter, first_call], Own.OwnedReturn(ids.second, Own.owner_id(0)))
+		MissingCallOwner:
+			raw_function([
+				parameter, raw_call(ids.second, ids.left, parameter_borrow(ids.first), Own.BorrowedResult(Own.ParameterBorrow(ids.first)), 20),
+			], Own.OwnedReturn(ids.second, Own.owner_id(0)))
+		MissingReturnAcquire:
+			raw_function([parameter, first_call, Own.DropOwner(Own.owner_id(0), span(30))], Own.OwnedReturn(ids.first, Own.owner_id(1)))
+		DropBeforeUse:
+			raw_function([
+				parameter, first_call, Own.DropOwner(Own.owner_id(0), span(25)),
+				raw_call(ids.third, ids.left, owner_borrow(ids.second, 0), Own.OwnedResult(Own.owner_id(1)), 30),
+			], Own.OwnedReturn(ids.third, Own.owner_id(1)))
+		DoubleDrop:
+			raw_function([
+				parameter, first_call, Own.DropOwner(Own.owner_id(0), span(30)),
+				Own.DropOwner(Own.owner_id(0), span(40)), acquire,
+			], Own.OwnedReturn(ids.first, Own.owner_id(1)))
+		LeakedResult:
+			raw_function([parameter, first_call, acquire], Own.OwnedReturn(ids.first, Own.owner_id(1)))
+		MistakenParameterBorrow:
+			raw_function([
+				parameter, first_call,
+				raw_call(ids.third, ids.left, parameter_borrow(ids.second), Own.OwnedResult(Own.owner_id(1)), 30),
+			], Own.OwnedReturn(ids.third, Own.owner_id(1)))
+		MistakenOwnerBorrow:
+			raw_function([
+				parameter, first_call,
+				raw_call(ids.third, ids.left, owner_borrow(ids.first, 0), Own.OwnedResult(Own.owner_id(1)), 30),
+			], Own.OwnedReturn(ids.third, Own.owner_id(1)))
+		WrongReturnOwner:
+			raw_function([parameter, first_call], Own.OwnedReturn(ids.first, Own.owner_id(0)))
+		UnmanagedCallArgument:
+			raw_function([
+				parameter, raw_call(ids.second, ids.left, Own.UnmanagedArgument(ids.first), Own.OwnedResult(Own.owner_id(0)), 20),
+			], Own.OwnedReturn(ids.second, Own.owner_id(0)))
+		UnmanagedCallReturn:
+			raw_function([parameter, first_call], Own.UnmanagedReturn(ids.second))
+	program(ids, result, identity_function(ids))
+
+
+private pure func rejects(kind: RawCase, message: String, at: Int) -> Bool:
+	match identities():
+		Err(_): False
+		Ok(ids):
+			match verify(raw(ids, kind)):
+				Ok(_): False
+				Err(error):
+					(
+						error.message == "ownership verification failed: " + message
+						and error.help == "report this compiler error with the input program"
+						and same_span(error.span, span(at))
+						and error.note.is_none()
+					)
+
+
+pure func test_raw_verifier_accepts_owned_self_call_result() -> Bool:
+	identities().and_then(pure func(ids): verify(raw(ids, ValidSelf))).is_ok()
+
+
+pure func test_raw_verifier_rejects_self_call_without_result_owner() -> Bool:
+	rejects(MissingCallOwner, "managed result requires an owner", 20)
+
+
+pure func test_raw_verifier_rejects_missing_parameter_return_retain() -> Bool:
+	rejects(MissingReturnAcquire, "owner 1 is not defined", 10)
+
+
+pure func test_raw_verifier_rejects_drop_before_recursive_argument_borrow() -> Bool:
+	rejects(DropBeforeUse, "borrow refers to discharged owner 0", 30)
+
+
+pure func test_raw_verifier_rejects_recursive_result_dropped_twice() -> Bool:
+	rejects(DoubleDrop, "owner 0 has already been discharged", 40)
+
+
+pure func test_raw_verifier_rejects_leaked_recursive_result() -> Bool:
+	rejects(LeakedResult, "owner 0 remains live at return", 10)
+
+
+pure func test_raw_verifier_rejects_call_result_claimed_as_parameter_borrow() -> Bool:
+	rejects(MistakenParameterBorrow, "parameter borrow does not refer to the borrowed parameter", 30)
+
+
+pure func test_raw_verifier_rejects_parameter_claimed_as_result_owner_borrow() -> Bool:
+	rejects(MistakenOwnerBorrow, "owner 0 does not own value 0", 30)
+
+
+pure func test_raw_verifier_rejects_result_owner_transferred_for_argument() -> Bool:
+	rejects(WrongReturnOwner, "returned owner does not own the returned value", 10)
+
+
+pure func test_raw_verifier_rejects_unmanaged_recursive_string_argument() -> Bool:
+	rejects(UnmanagedCallArgument, "managed call argument requires an owner-dependent borrow", 20)
+
+
+pure func test_raw_verifier_rejects_recursive_string_return_without_transfer() -> Bool:
+	rejects(UnmanagedCallReturn, "managed return requires an owner transfer", 20)
+
+
+pure func test_raw_verifier_rejects_missing_owner_across_mutual_call() -> Bool:
+	match identities():
+		Err(_): False
+		Ok(ids):
+			left = raw_function([
+				borrowed_parameter(ids),
+				raw_call(ids.second, ids.right, parameter_borrow(ids.first), Own.BorrowedResult(Own.ParameterBorrow(ids.first)), 20),
+			], Own.OwnedReturn(ids.second, Own.owner_id(0)))
+			right = raw_function([
+				borrowed_parameter(ids),
+				raw_call(ids.second, ids.left, parameter_borrow(ids.first), Own.OwnedResult(Own.owner_id(0)), 20),
+			], Own.OwnedReturn(ids.second, Own.owner_id(0)))
+			match verify(program(ids, left, right)):
+				Ok(_): False
+				Err(error):
+					(
+						error.message == "ownership verification failed: managed result requires an owner"
+						and error.help == "report this compiler error with the input program"
+						and same_span(error.span, span(20))
+					)
+
+
+pure func test_emission_calls_before_releasing_nested_recursive_result() -> Bool:
+	match identities():
+		Err(_): False
+		Ok(ids):
+			match insert(function([
+				parameter(ids.first, Concrete.StringType),
+				call(ids.second, ids.left, [ids.first], 20),
+				call(ids.third, ids.left, [ids.second], 30),
+			], ids.third, [Concrete.StringType], Concrete.StringType)):
+				Err(_): False
+				Ok(output):
+					match verify(program(ids, output, identity_function(ids))).and_then(pure func(checked): emit(checked)):
+						Err(_): False
+						Ok(code):
+							(
+								code.contains("blorp_f_1(blorp_vl_1)")
+								and code.contains("blorp_string_release(blorp_owner_0);return blorp_owner_1;")
+							)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 recursive function ownership contracts",
+	tests = [
+		("nested self calls have separate final-use positions", test_nested_self_calls_have_separate_final_use_positions),
+		("repeated recursive argument has one final-use position", test_repeated_recursive_argument_has_one_final_use_position),
+		("self call borrows parameter and returns distinct owned value", test_self_call_borrows_parameter_and_returns_distinct_owned_value),
+		("self call result precedes final argument owner drop", test_self_call_result_exists_before_last_argument_owner_is_dropped),
+		("parameter reuse after self call needs no retain", test_parameter_reuse_after_self_call_needs_no_retain),
+		("owned argument survives later reuse", test_owned_argument_remains_live_through_later_reuse),
+		("unused recursive result drops before parameter return acquisition", test_unused_recursive_result_is_dropped_before_parameter_return_is_acquired),
+		("nested recursive call releases inner result after outer call", test_nested_recursive_call_releases_inner_result_after_outer_call),
+		("repeated owned argument creates one drop obligation", test_repeated_owned_argument_creates_one_drop_obligation),
+		("mutual calls use declared contracts in both directions", test_mutual_calls_use_declared_contracts_in_both_directions),
+		("raw verifier accepts owned self call result", test_raw_verifier_accepts_owned_self_call_result),
+		("raw verifier rejects self call without result owner", test_raw_verifier_rejects_self_call_without_result_owner),
+		("raw verifier rejects missing parameter return retain", test_raw_verifier_rejects_missing_parameter_return_retain),
+		("raw verifier rejects drop before recursive argument borrow", test_raw_verifier_rejects_drop_before_recursive_argument_borrow),
+		("raw verifier rejects recursive result dropped twice", test_raw_verifier_rejects_recursive_result_dropped_twice),
+		("raw verifier rejects leaked recursive result", test_raw_verifier_rejects_leaked_recursive_result),
+		("raw verifier rejects call result claimed as parameter borrow", test_raw_verifier_rejects_call_result_claimed_as_parameter_borrow),
+		("raw verifier rejects parameter claimed as result owner borrow", test_raw_verifier_rejects_parameter_claimed_as_result_owner_borrow),
+		("raw verifier rejects result owner transferred for argument", test_raw_verifier_rejects_result_owner_transferred_for_argument),
+		("raw verifier rejects unmanaged recursive String argument", test_raw_verifier_rejects_unmanaged_recursive_string_argument),
+		("raw verifier rejects recursive String return without transfer", test_raw_verifier_rejects_recursive_string_return_without_transfer),
+		("raw verifier rejects missing owner across mutual call", test_raw_verifier_rejects_missing_owner_across_mutual_call),
+		("emission calls before releasing nested recursive result", test_emission_calls_before_releasing_nested_recursive_result),
+	]
+}

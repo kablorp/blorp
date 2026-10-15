@@ -1,0 +1,263 @@
+import:
+	../../../src/parse/assemble:
+		ParsedAssembly,
+		ParsedProgram,
+		append_module,
+		assembly_names,
+		begin_program,
+		parsed_contents,
+		seal_program,
+	../../../src/lex/lex: lex
+	../../../src/utils/declarations: function_number, inventory_functions, inventory_records, inventory_unions, record_number, union_number, variant_number, variant_owner
+	../../../src/utils/names: NameTable
+	../../../src/parse/parse: ParsedModule, parse_module
+	../../../src/utils/source:
+		COMPILER_SOURCE,
+		ModuleId,
+		ModuleKind(UserModule, FoundationTypesModule, FoundationPreludeModule, LibraryModule),
+		module_id,
+		module_number,
+		module_source,
+		root_module_id,
+		same_module,
+		same_source,
+	../../../src/utils/syntax: Diagnostic
+	test: TestSuite
+
+
+private BUNDLE_HELP: String = "load each module once in inventory order and supply every import target"
+
+
+private pure func parse_at(source: String, module: ModuleId, names: NameTable) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(module), source)
+	parse_module(tokens, module, names)
+
+
+private pure func bundle_error_is(result: Result[ParsedAssembly, Diagnostic], message: String) -> Bool:
+	match result:
+		Err(error):
+			error.message == message and error.help == BUNDLE_HELP and same_source(error.span.source, COMPILER_SOURCE)
+		Ok(_):
+			False
+
+
+private pure func append_root(source: String, targets: List[ModuleId]) -> Result[ParsedAssembly, Diagnostic]:
+	assembly = begin_program()
+	parsed ?= parse_at(source, root_module_id(), assembly_names(assembly))
+	append_module(assembly, parsed, targets, UserModule)
+
+
+pure func test_sealing_requires_root_and_complete_targets() -> Bool:
+	empty = match seal_program(begin_program()):
+		Err(error):
+			error.message == "source bundle has no root module" and same_source(error.span.source, COMPILER_SOURCE)
+		Ok(_):
+			False
+	missing = match module_id(3):
+		Some(target):
+			match append_root("import:\n    ./helper: answer\n", [target]):
+				Ok(assembly):
+					match seal_program(assembly):
+						Err(error):
+							error.message == "source bundle is missing an imported module" and error.help == BUNDLE_HELP
+						Ok(_):
+							False
+				Err(_):
+					False
+		None:
+			False
+	empty and missing
+
+
+pure func test_assembly_requires_one_target_per_import() -> Bool:
+	message = "source bundle does not supply exactly one target per import"
+	(
+		bundle_error_is(append_root("import:\n    ./helper: answer\n", []), message)
+		and bundle_error_is(append_root("func main() -> Int:\n    0\n", [root_module_id()]), message)
+	)
+
+
+pure func test_assembly_links_each_import_to_its_target_in_order() -> Bool:
+	match (module_id(1), module_id(2)):
+		(Some(first), Some(second)):
+			match append_root("import:\n    ./one: a\n    ./two: b\n", [second, first]):
+				Ok(root):
+					match assemble_roles(root, [FoundationTypesModule, FoundationPreludeModule], 1):
+						Ok(program):
+							match parsed_contents(program).modules.get(0).map(pure func(row): row.imports):
+								Some([one, two]):
+									(
+										same_module(one.target, second)
+										and same_module(two.target, first)
+										and one.span.start == 12
+										and two.span.start == 25
+									)
+								_:
+									False
+						Err(_):
+							False
+				Err(_):
+					False
+		_:
+			False
+
+
+pure func test_assembly_rejects_stale_name_authority() -> Bool:
+	assembly = begin_program()
+
+	match (parse_at("func first() -> Int:\n    1\n", root_module_id(), assembly_names(assembly)), module_id(1)):
+		(Ok(first), Some(next_id)):
+			match (append_module(assembly, first, [], UserModule), parse_at("func second() -> Int:\n    2\n", next_id, assembly_names(assembly))):
+				(Ok(extended), Ok(stale)):
+					bundle_error_is(append_module(extended, stale, [], UserModule), "parsed module does not extend this source bundle's name authority")
+				_:
+					False
+		_:
+			False
+
+
+pure func test_assembly_rejects_wrong_module_identity() -> Bool:
+	assembly = begin_program()
+
+	match module_id(1):
+		Some(other):
+			match parse_at("func main() -> Int:\n    0\n", other, assembly_names(assembly)):
+				Ok(parsed):
+					bundle_error_is(append_module(assembly, parsed, [], UserModule), "parsed module does not have the next source bundle identity")
+				Err(_):
+					False
+		None:
+			False
+
+
+-- Appends one comment-only module per role, in inventory order, then seals.
+private pure func assemble_roles(assembly: ParsedAssembly, roles: List[ModuleKind], ordinal: Int) -> Result[ParsedProgram, Diagnostic]:
+	match roles:
+		[]:
+			seal_program(assembly)
+		[role, ...remaining]:
+			id ?= module_id(ordinal).to_result({ span = { source = COMPILER_SOURCE, start = 0, end = 0 }, note = None, message = "test inventory too large", help = "test setup" })
+			parsed ?= parse_at("-- module\n", id, assembly_names(assembly))
+			next ?= append_module(assembly, parsed, [], role)
+			assemble_roles(next, remaining, ordinal + 1)
+
+
+private pure func roles_reject(roles: List[ModuleKind], message: String, source_ordinal: Int) -> Bool:
+	match assemble_roles(begin_program(), roles, 0):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.message == message
+				and same_source(error.span.source, module_source(module_id(source_ordinal).get_or(root_module_id())))
+				and error.span.start == 10
+				and error.span.end == 10
+				and error.help == BUNDLE_HELP
+			)
+
+
+pure func test_sealing_requires_designated_types_role() -> Bool:
+	roles_reject([UserModule, FoundationPreludeModule], "source bundle has no foundation types module", 0)
+
+
+pure func test_sealing_requires_designated_prelude_role() -> Bool:
+	roles_reject([UserModule, FoundationTypesModule], "source bundle has no foundation prelude module", 0)
+
+
+pure func test_sealing_rejects_duplicate_types_role() -> Bool:
+	roles_reject([UserModule, FoundationTypesModule, FoundationTypesModule, FoundationPreludeModule], "source bundle has more than one foundation types module", 2)
+
+
+pure func test_sealing_rejects_duplicate_prelude_role() -> Bool:
+	roles_reject([UserModule, FoundationTypesModule, FoundationPreludeModule, FoundationPreludeModule], "source bundle has more than one foundation prelude module", 3)
+
+
+pure func test_sealing_requires_user_root_role() -> Bool:
+	roles_reject([FoundationTypesModule, UserModule, FoundationPreludeModule], "source bundle root must be a user module", 0)
+
+
+pure func test_sealing_publishes_actual_designated_module_identities() -> Bool:
+	match assemble_roles(begin_program(), [UserModule, LibraryModule, FoundationPreludeModule, FoundationTypesModule], 0):
+		Err(_):
+			False
+		Ok(program):
+			contents = parsed_contents(program)
+
+			match (module_id(2), module_id(3)):
+				(Some(prelude), Some(types)):
+					(
+						same_module(contents.foundation.prelude, prelude)
+						and same_module(contents.foundation.types, types)
+						and contents.modules.length() == 4
+						and module_number(contents.modules.get(1).map(pure func(row): row.module).get_or(root_module_id())) == 1
+					)
+				_:
+					False
+
+
+pure func test_builtin_declarations_record_their_module() -> Bool:
+	match append_root("type Int = builtin\ntype Void = builtin\n", []):
+		Err(_):
+			False
+		Ok(assembly):
+			match assemble_roles(assembly, [FoundationTypesModule, FoundationPreludeModule], 1):
+				Err(_):
+					False
+				Ok(program):
+					declarations = parsed_contents(program).builtin_types
+					(
+						declarations.length() == 2
+						and declarations.all(pure func(row): same_module(row.module, root_module_id()))
+					)
+
+
+pure func test_sealing_publishes_ids_for_complete_syntax_inventory() -> Bool:
+	source: String =
+		|fixed record Box { value: Int }
+		|fixed union Choice:
+		|    First
+		|    Second(Int)
+		|func main() -> Int:
+		|    0
+		|
+	match append_root(source, []):
+		Err(_): False
+		Ok(assembly):
+			match assemble_roles(assembly, [FoundationTypesModule, FoundationPreludeModule], 1):
+				Err(_): False
+				Ok(program):
+					inventory = parsed_contents(program).declarations
+					match (inventory_functions(inventory), inventory_records(inventory), inventory_unions(inventory)):
+						([function], [record_row], [union_row]):
+							match union_row.variants:
+								[first, second]:
+									(
+										function_number(function.id) == 0 and record_number(record_row.id) == 0 and union_number(union_row.id) == 0
+										and variant_number(first.id) == 0 and variant_number(second.id) == 1
+										and union_number(variant_owner(first.id)) == 0 and union_number(variant_owner(second.id)) == 0
+										and same_module(function.declaration.module, root_module_id())
+										and same_module(record_row.declaration.module, root_module_id()) and same_module(union_row.module, root_module_id())
+										and first.declaration.fields.is_empty() and second.declaration.fields.length() == 1
+									)
+								_: False
+						_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 program assembly",
+	tests = [
+		("sealing requires root and complete targets", test_sealing_requires_root_and_complete_targets),
+		("assembly requires one target per import", test_assembly_requires_one_target_per_import),
+		("assembly links imports to targets in order", test_assembly_links_each_import_to_its_target_in_order),
+		("assembly rejects stale name authority", test_assembly_rejects_stale_name_authority),
+		("assembly rejects wrong module identity", test_assembly_rejects_wrong_module_identity),
+		("sealing requires types role", test_sealing_requires_designated_types_role),
+		("sealing requires prelude role", test_sealing_requires_designated_prelude_role),
+		("sealing rejects duplicate types role", test_sealing_rejects_duplicate_types_role),
+		("sealing rejects duplicate prelude role", test_sealing_rejects_duplicate_prelude_role),
+		("sealing requires user root", test_sealing_requires_user_root_role),
+		("sealing publishes designated IDs", test_sealing_publishes_actual_designated_module_identities),
+		("builtin declarations record their module", test_builtin_declarations_record_their_module),
+		("sealing publishes issued IDs for complete syntax", test_sealing_publishes_ids_for_complete_syntax_inventory),
+	]
+}

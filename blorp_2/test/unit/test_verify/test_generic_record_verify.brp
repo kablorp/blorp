@@ -1,0 +1,107 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/lower/lower: lower
+	../../../src/own/own as Own
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, Span
+	../../../src/verify/verify: verify
+	../input: check, parse, setup_diagnostic
+	test: TestSuite
+
+
+private pure func owned(source: String) -> Result[Own.OwnershipProgram, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source)
+	parsed ?= parse(tokens)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	concrete ?= Concrete.specialize(checked)
+	lowered ?= lower(concrete)
+	Own.own(lowered)
+
+
+private pure func wrong_instance_rejected(source: String) -> Bool:
+	match owned(source):
+		Err(_): False
+		Ok(program):
+			var fields: List[Concrete.FieldInstanceId] = []
+			for function in program.functions:
+				for operation in function.operations:
+					match operation:
+						Own.DefineValue(definition):
+							match definition.operation:
+								Own.ReadRecordFieldDefinition(field, _): fields = fields.append(field)
+								_: void
+						_: void
+			match (fields, verify(program)):
+				([first, second], Ok(_)):
+					if Concrete.record_number(Concrete.field_owner(first)) == Concrete.record_number(Concrete.field_owner(second)):
+						False
+					else:
+						var functions: List[Own.OwnedFunction] = []
+						var changed_span: Option[Span] = None
+						for function in program.functions:
+							var operations: List[Own.OwnershipOperation] = []
+							for operation in function.operations:
+								replacement = match operation:
+									Own.DefineValue(definition):
+										match definition.operation:
+											Own.ReadRecordFieldDefinition(_, argument):
+												match changed_span:
+													None:
+														changed_span = Some(definition.span)
+														Own.DefineValue({ definition | operation = Own.ReadRecordFieldDefinition(second, argument) })
+													Some(_): operation
+											_: operation
+									_: operation
+								operations = operations.append(replacement)
+							functions = functions.append({ function | operations = operations })
+						match (changed_span, verify({ program | functions = functions })):
+							(Some(expected), Err(error)):
+								(
+									error.message == "ownership verification failed: field belongs to a different record layout"
+									and error.help == "report this compiler error with the input program"
+									and error.span.start == expected.start
+									and error.span.end == expected.end
+									and same_source(error.span.source, module_source(root_module_id()))
+								)
+							_: False
+				_: False
+
+
+pure func test_wrong_box_instance_field_rejects_in_raw_ir() -> Bool:
+	source: String =
+		|fixed record Box[T] { value: T }
+		|pure func box[T](value: T) -> Box[T]:
+		|    { value = value }
+		|pure func unbox[T](value: Box[T]) -> T:
+		|    value.value
+		|func main() -> Int:
+		|    unused = unbox(box("42"))
+		|    unbox(box(7))
+		|
+	wrong_instance_rejected(source)
+
+
+pure func test_same_layout_phantom_instance_field_still_rejects() -> Bool:
+	source: String =
+		|fixed record Marker[A, B] { value: Int }
+		|pure func first() -> Marker[Int, String]:
+		|    { value = 7 }
+		|pure func second() -> Marker[String, Int]:
+		|    { value = 9 }
+		|pure func read[A, B](value: Marker[A, B]) -> Int:
+		|    value.value
+		|func main() -> Int:
+		|    unused = read(first())
+		|    read(second())
+		|
+	wrong_instance_rejected(source)
+
+
+tests: TestSuite = {
+	description = "Generic record concrete field authority",
+	tests = [
+		("raw wrong concrete Box field rejects", test_wrong_box_instance_field_rejects_in_raw_ir),
+		("same-layout phantom wrong field rejects", test_same_layout_phantom_instance_field_still_rejects),
+	]
+}

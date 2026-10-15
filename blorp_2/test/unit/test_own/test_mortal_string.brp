@@ -1,0 +1,196 @@
+import:
+	../../../src/own/own as Own
+	../managed_union_inputs: lowered_modules
+	../../../src/utils/syntax: same_span
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/text: concat
+	../compilation: compile, compile_modules
+	../module_input: PRIMITIVE_BASE, INTEGER_OPERATIONS, STRING_OPERATIONS
+	test: TestSuite
+
+
+pure func test_mortal_string_reaches_c_emission() -> Bool:
+	source: String =
+		|import:
+		|	int: Int
+		|	string: String
+		|func main() -> Int:
+		|	value = 7.to_string()
+		|	value.length()
+		|
+
+	match compile_modules([
+		{ source = source, targets = [1, 2] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+		{ source = STRING_OPERATIONS, targets = [] },
+	], PRIMITIVE_BASE):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+pure func test_tail_match_returns_a_fresh_string() -> Bool:
+	source: String =
+		|import:
+		|	int: Int
+		|	string: String
+		|fixed union Choice:
+		|	First
+		|	Second
+		|pure func choose(choice: Choice) -> String:
+		|	match choice:
+		|		First: 7.to_string()
+		|		Second: 42.to_string()
+		|func main() -> Int:
+		|	choose(Second).length()
+		|
+
+	match compile_modules([
+		{ source = source, targets = [1, 2] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+		{ source = STRING_OPERATIONS, targets = [] },
+	], PRIMITIVE_BASE):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+pure func test_tail_match_drops_managed_prefix_in_each_arm() -> Bool:
+	source: String =
+		|import:
+		|	int: Int
+		|fixed union Choice:
+		|	First
+		|	Second
+		|pure func choose(choice: Choice) -> Int:
+		|	unused = 7.to_string()
+		|	match choice:
+		|		First: 0
+		|		Second: 0
+		|func main() -> Int:
+		|	choose(First)
+		|
+
+	match (
+		compile_modules(
+			[
+				{
+					source = source,
+					targets = [1]
+				},
+				{
+					source = INTEGER_OPERATIONS,
+					targets = []
+				},
+			],
+			PRIMITIVE_BASE,
+		)
+	):
+		Err(_):
+			False
+		Ok(c):
+			c.count("blorp_string_release(blorp_owner_0);") == 2
+
+
+pure func test_tail_match_accepts_borrowed_parameter_with_mortal_string() -> Bool:
+	source: String =
+		|import:
+		|	int: Int
+		|	string: String
+		|fixed union Choice:
+		|	First
+		|	Second
+		|pure func flag() -> Choice:
+		|	First
+		|pure func choose(value: String) -> String:
+		|	match flag():
+		|		First: value
+		|		Second: value
+		|func main() -> Int:
+		|	choose(7.to_string()).length()
+		|
+
+	match compile_modules([
+		{ source = source, targets = [1, 2] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+		{ source = STRING_OPERATIONS, targets = [] },
+	], PRIMITIVE_BASE):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+func test_owned_union_prefix_drops_without_retiring_borrowed_parameter() -> Bool:
+	before_call: String =
+		|import:
+		|	int: Int
+		|fixed union Choice:
+		|	First
+		|	Second
+		|fixed union Box[T]:
+		|	Box(T)
+		|pure func box[T](value: T) -> Box[T]:
+		|	Box(value)
+		|pure func flag() -> Choice:
+		|	First
+		|pure func choose(value: String) -> Int:
+		|	unused =
+	prefix = before_call.concat(" ")
+	suffix: String =
+		|box(value)
+		|	match flag():
+		|		First: 0
+		|		Second: 0
+		|func main() -> Int:
+		|	choose(42.to_string())
+		|
+
+	match (
+		lowered_modules([
+			{
+				source = prefix.concat(suffix),
+				targets = [1]
+			},
+			{
+				source = INTEGER_OPERATIONS,
+				targets = []
+			},
+		]).and_then(pure func(program): Own.own(program))
+	):
+		Err(_):
+			False
+		Ok(program):
+			program.functions.any(pure func(function):
+				match function.tail:
+					Own.MatchTail(matched):
+						matched.arms.all(pure func(arm):
+							match arm.operations:
+								[Own.DefineValue(_), Own.DropOwner(owner, _)]:
+									Own.owner_number(owner) == 0
+								_:
+									False
+						)
+					_:
+						False
+			)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 first managed value",
+	tests = [
+		("tail match drops managed prefix in each arm", test_tail_match_drops_managed_prefix_in_each_arm),
+		(
+			"tail match accepts borrowed parameter with mortal String",
+			test_tail_match_accepts_borrowed_parameter_with_mortal_string,
+		),
+		(
+			"owned union prefix preserves borrowed String parameter",
+			test_owned_union_prefix_drops_without_retiring_borrowed_parameter,
+		),
+		("mortal String reaches C emission", test_mortal_string_reaches_c_emission),
+		("tail match returns fresh String", test_tail_match_returns_a_fresh_string),
+	]
+}

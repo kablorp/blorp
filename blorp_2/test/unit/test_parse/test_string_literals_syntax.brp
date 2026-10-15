@@ -1,0 +1,469 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/utils/names: program_names
+	../../../src/parse/assemble: parsed_contents as program_contents
+	../../../src/utils/declarations: inventory_functions
+	../../../src/parse/parse: parse_module
+	../../../src/utils/source: module_source, root_module_id, same_module
+	../../../src/utils/syntax:
+		Diagnostic,
+		ExpressionBase(StringExpression),
+		ParsedBody(ParsedValueBody),
+		TokenKind(QuotedString),
+	bytes as BytesOps
+	../input: parse
+	test: TestSuite
+
+
+private ESCAPE_HELP: String = "use \\n, \\r, \\t, \\0, \\\\, \\\", \\', \\{, \\}, or a Unicode scalar escape such as \\u{E9}"
+
+private UNICODE_HELP: String = "write \\u{H} with one to six hexadecimal digits for a scalar from 0 to 10FFFF, excluding D800 through DFFF"
+
+private UTF8_HELP: String = "use valid UTF-8 text or a Unicode escape such as \\u{E9}; surrogate code points are not Unicode scalars"
+
+
+private pure func decoded(raw: String) -> Result[String, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), "func main() -> String:\n    \"" + raw + "\"\n")
+	parsed ?= parse(tokens)
+	missing = Err({
+		span = tokens.end,
+		note = None,
+		message = "missing literal in parser test",
+		help = "fix test",
+	})
+
+	functions = inventory_functions(program_contents(parsed).declarations)
+		.filter(pure func(row): same_module(row.declaration.module, root_module_id()))
+	match functions:
+		[row]:
+			match row.declaration.body:
+				ParsedValueBody(value):
+					match value.base:
+						StringExpression(bytes):
+							Ok(bytes)
+						_:
+							missing
+				_:
+					missing
+		_:
+			missing
+
+
+private pure func parse_rejects(
+	raw: String,
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+) -> Bool:
+	match decoded(raw):
+		Err(error):
+			(
+				error.span.start == start + 28
+				and error.span.end == end + 28
+				and error.message == message
+				and error.help == help
+			)
+		Ok(_):
+			False
+
+
+private pure func decoded_is(raw: String, expected: String) -> Bool:
+	match decoded(raw):
+		Ok(bytes):
+			bytes == expected
+		Err(_):
+			False
+
+
+private pure func lex_rejects(
+	source: String,
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+) -> Bool:
+	match lex(module_source(root_module_id()), source):
+		Err(error):
+			(
+				error.span.start == start
+				and error.span.end == end
+				and error.message == message
+				and error.help == help
+			)
+		Ok(_):
+			False
+
+
+private pure func raw_bytes(values: List[Int]) -> String:
+	var bytes = BytesOps.bytes(values.length())
+	var position = 0
+
+	for value in values:
+		bytes = bytes.set_index(position, value)
+		position += 1
+
+	bytes.to_string()
+
+
+pure func test_parser_decodes_all_fixed_escapes_once() -> Bool:
+	(
+		decoded_is("\\n\\r\\t\\0\\\\\\\"\\'\\{\\}", "\n\r\t\0\\\"'{}")
+		and decoded_is("\\\\n", "\\n")
+		and decoded_is("$\\{", "$" + "{")
+	)
+
+
+pure func test_raw_utf8_and_unicode_escape_have_identical_bytes() -> Bool:
+	decoded_is("é😀", "é😀") and decoded_is("\\u{E9}\\u{1f600}", "é😀")
+
+
+pure func test_unicode_preserves_normalization_and_noncharacters() -> Bool:
+	(
+		decoded_is("é", "é")
+		and decoded_is("é", "é")
+		and decoded_is("\\u{FDD0}\\u{10FFFF}", "﷐􏿿")
+	)
+
+
+pure func test_unicode_escape_scalar_boundaries() -> Bool:
+	decoded_is(
+		"\\u{0}\\u{7FF}\\u{800}\\u{D7FF}\\u{E000}\\u{FFFF}\\u{10000}\\u{10FFFF}",
+		"\0߿ࠀ퟿￿𐀀􏿿",
+	)
+
+
+pure func test_parser_rejects_unknown_escape_with_whole_character_span() -> Bool:
+	(
+		parse_rejects("a\\q", 1, 3, "unknown String escape", ESCAPE_HELP)
+		and parse_rejects("\\é", 0, 3, "unknown String escape", ESCAPE_HELP)
+	)
+
+
+pure func test_parser_rejects_unicode_escape_shape_and_invalid_scalars() -> Bool:
+	var passed = True
+
+	for raw in [
+		"\\u{}",
+		"\\u{G}",
+		"\\u{é}",
+		"\\ué",
+		"\\u{D800}",
+		"\\u{DFFF}",
+		"\\u{110000}",
+		"\\u{1234567}",
+		"\\u{12",
+		"\\uE9",
+	]:
+		end = if raw == "\\u{G}":
+			4
+		else if raw == "\\u{1234567}":
+			10
+		else if raw == "\\uE9":
+			3
+		else if raw == "\\u{é}":
+			5
+		else:
+			raw.length()
+
+		passed = passed and parse_rejects(raw, 0, end, "invalid Unicode escape", UNICODE_HELP)
+
+	passed
+
+
+pure func test_parser_rejects_raw_interpolation_opener() -> Bool:
+	parse_rejects(
+		"a$" + "{value}",
+		1,
+		3,
+		"String interpolation is not supported yet",
+		"escape the opening brace as \\{ for literal $" + "{ text",
+	)
+
+
+pure func test_lexer_rejects_raw_controls() -> Bool:
+	var passed = True
+
+	for control in [0, 9, 13, 31, 127]:
+		passed = (
+			passed
+			and lex_rejects(
+				"\"a" + raw_bytes([control]) + "\"",
+				2,
+				3,
+				"unsupported raw byte in String literal",
+				"use printable text and fixed escapes for control bytes",
+			)
+		)
+
+	(
+		passed
+		and lex_rejects(
+			"\"a\n",
+			2,
+			3,
+			"String literals must stay on one line",
+			"close the quote before LF; write \\n for a newline byte",
+		)
+	)
+
+
+pure func test_lexer_rejects_missing_quote_and_trailing_backslash() -> Bool:
+	(
+		lex_rejects(
+			"\"abc",
+			0,
+			4,
+			"unterminated String literal",
+			"add a closing double quote on the same line",
+		)
+		and lex_rejects(
+			"\"abc\\",
+			4,
+			5,
+			"unterminated String escape",
+			"complete the escape and close the double quote on the same line",
+		)
+	)
+
+
+pure func test_lexer_accepts_raw_utf8_scalar_boundaries() -> Bool:
+	var passed = True
+
+	for values in (
+		[
+			[194, 128],
+			[223, 191],
+			[224, 160, 128],
+			[237, 159, 191],
+			[238, 128, 128],
+			[239, 183, 144],
+			[239, 191, 191],
+			[240, 144, 128, 128],
+			[244, 143, 191, 191],
+		]
+	):
+		raw = raw_bytes(values)
+		passed = passed and decoded_is(raw, raw)
+
+	passed
+
+
+pure func test_lexer_rejects_invalid_utf8_leads_and_continuations() -> Bool:
+	var passed = True
+
+	for values in (
+		[
+			[128],
+			[192, 128],
+			[193, 191],
+			[245, 128, 128, 128],
+			[255],
+		]
+	):
+		passed = (
+			passed
+			and lex_rejects(
+				"\"" + raw_bytes(values) + "\"",
+				1,
+				2,
+				"invalid UTF-8 in String literal",
+				UTF8_HELP,
+			)
+		)
+
+	(
+		passed
+		and lex_rejects(
+			"\"" + raw_bytes([194]) + "\"",
+			2,
+			3,
+			"invalid UTF-8 in String literal",
+			UTF8_HELP,
+		)
+		and lex_rejects(
+			"\"" + raw_bytes([224, 160]) + "\n",
+			3,
+			4,
+			"invalid UTF-8 in String literal",
+			UTF8_HELP,
+		)
+		and lex_rejects(
+			"\"" + raw_bytes([240, 144]),
+			1,
+			3,
+			"invalid UTF-8 in String literal",
+			UTF8_HELP,
+		)
+	)
+
+
+pure func test_lexer_rejects_overlong_surrogate_and_out_of_range_utf8() -> Bool:
+	var passed = True
+
+	for values in (
+		[
+			[224, 159, 191],
+			[237, 160, 128],
+			[237, 191, 191],
+			[240, 143, 191, 191],
+			[244, 144, 128, 128],
+		]
+	):
+		passed = (
+			passed
+			and lex_rejects(
+				"\"" + raw_bytes(values) + "\"",
+				1,
+				values.length() + 1,
+				"invalid UTF-8 in String literal",
+				UTF8_HELP,
+			)
+		)
+
+	passed
+
+
+pure func test_builtin_labels_match_raw_bytes_without_escape_aliases() -> Bool:
+	prefix = "pure func add(a: Int, b: Int) -> Int:\n    builtin("
+	raw = "int\\u{2E}add"
+
+	match lex(
+		module_source(root_module_id()),
+		prefix + "\"" + raw + "\")",
+	).and_then(
+		pure func(tokens): parse_module(tokens, root_module_id(), program_names().names),
+	):
+		Err(error):
+			(
+				error.message == "unknown builtin operation"
+				and error.help == "use int.equals, int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals, list.repeat, list.length or list.get"
+				and error.span.start == prefix.length()
+				and error.span.end == prefix.length() + raw.length() + 2
+			)
+		Ok(_):
+			False
+
+
+pure func test_lexer_preserves_quoted_contents_and_full_span() -> Bool:
+	source = "\"hello -- world\""
+
+	match lex(module_source(root_module_id()), source):
+		Ok(program):
+			match program.tokens:
+				[token, _]:
+					match token.kind:
+						QuotedString(raw):
+							(
+								raw == "hello -- world"
+								and token.span.start == 0
+								and token.span.end == 16
+							)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_lexer_keeps_escape_bytes_without_decoding() -> Bool:
+	match lex(module_source(root_module_id()), "\"a\\\"b\\n\""):
+		Ok(program):
+			match program.tokens:
+				[token, _]:
+					match token.kind:
+						QuotedString(raw):
+							raw == "a\\\"b\\n" and token.span.end == 8
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_parser_accepts_a_quoted_expression_with_its_source_span() -> Bool:
+	source: String =
+		|func main() -> String:
+		|    "hello"
+		|
+
+	match lex(module_source(root_module_id()), source).and_then(pure func(tokens): parse(tokens)):
+		Ok(parsed):
+			functions = inventory_functions(program_contents(parsed).declarations)
+				.filter(pure func(row): same_module(row.declaration.module, root_module_id()))
+			match functions:
+				[row]:
+					match row.declaration.body:
+						ParsedValueBody(value):
+							(
+								value.base_span.start == 27
+								and value.base_span.end == 34
+								and value.applications.length() == 0
+							)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 quoted String syntax",
+	tests = [
+		(
+			"lexer accepts raw UTF-8 scalar boundaries",
+			test_lexer_accepts_raw_utf8_scalar_boundaries,
+		),
+		("parser decodes all fixed escapes once", test_parser_decodes_all_fixed_escapes_once),
+		(
+			"raw UTF-8 and Unicode escapes have identical bytes",
+			test_raw_utf8_and_unicode_escape_have_identical_bytes,
+		),
+		(
+			"Unicode preserves normalization and noncharacters",
+			test_unicode_preserves_normalization_and_noncharacters,
+		),
+		("Unicode escape scalar boundaries", test_unicode_escape_scalar_boundaries),
+		(
+			"parser rejects unknown escape with whole character span",
+			test_parser_rejects_unknown_escape_with_whole_character_span,
+		),
+		(
+			"parser rejects Unicode escape shapes and invalid scalars",
+			test_parser_rejects_unicode_escape_shape_and_invalid_scalars,
+		),
+		("parser rejects raw interpolation opener", test_parser_rejects_raw_interpolation_opener),
+		("lexer rejects raw controls", test_lexer_rejects_raw_controls),
+		(
+			"lexer rejects missing quote and trailing backslash",
+			test_lexer_rejects_missing_quote_and_trailing_backslash,
+		),
+		(
+			"lexer rejects invalid UTF-8 leads and continuations",
+			test_lexer_rejects_invalid_utf8_leads_and_continuations,
+		),
+		(
+			"lexer rejects overlong surrogate and out-of-range UTF-8",
+			test_lexer_rejects_overlong_surrogate_and_out_of_range_utf8,
+		),
+		(
+			"builtin spelling decodes only as an expression",
+			test_builtin_labels_match_raw_bytes_without_escape_aliases,
+		),
+		(
+			"lexer preserves quoted contents and full span",
+			test_lexer_preserves_quoted_contents_and_full_span,
+		),
+		(
+			"lexer keeps escape bytes without decoding",
+			test_lexer_keeps_escape_bytes_without_decoding,
+		),
+		(
+			"parser accepts quoted expression and source span",
+			test_parser_accepts_a_quoted_expression_with_its_source_span,
+		),
+	]
+}

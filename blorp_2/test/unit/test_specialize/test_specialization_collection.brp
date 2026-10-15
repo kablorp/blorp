@@ -1,0 +1,721 @@
+import:
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/check/check: check
+	../../../src/check/check_model as Checked
+	../../../src/lex/lex: lex
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, same_span, Entrypoint(NoArguments), entry_function
+	../../../src/utils/text: concat
+	../input: parse, setup_diagnostic
+	string: index_of
+	test: TestSuite
+
+
+private pure func payload_free(variants: List[List[Concrete.TypeRef]]) -> Bool:
+	match variants:
+		[[]]:
+			True
+		_:
+			False
+
+
+private pure func specialize(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source)
+	parsed ?= parse(tokens)
+	checked ?= check(parsed)
+		.map_err(setup_diagnostic)
+	program ?= Concrete.specialize(checked)
+	Ok(Concrete.specialized_contents(program))
+
+
+private pure func target_is(call: Concrete.ConcreteCall, expected: Int) -> Bool:
+	match call.target:
+		Concrete.UserFunction(id):
+			Concrete.function_number(id) == expected
+		_:
+			False
+
+
+pure func test_direct_nested_calls_request_distinct_children_before_the_parent() -> Bool:
+	source: String =
+		|pure func left[T](value:T)->T:
+		|    value
+		|pure func right[T](value:T)->T:
+		|    value
+		|pure func outer[T](first:T,second:T)->T:
+		|    first
+		|func main()->Int:
+		|    outer(left(7),right(8))
+
+	match specialize(source.concat("\n")):
+		Ok(contents):
+			match contents.functions:
+				[main, left, right, outer]:
+					match main.body:
+						Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+							match value.form:
+								Concrete.InvokeFunction(parent, [first, second]):
+									match (first.form, second.form):
+										(Concrete.InvokeFunction(first_call, [_]), Concrete.InvokeFunction(second_call, [_])):
+											(
+												target_is(first_call, 1)
+												and target_is(second_call, 2)
+												and target_is(parent, 3)
+												and left.signature.parameters.length() == 1
+												and right.signature.parameters.length() == 1
+												and outer.signature.parameters.length() == 2
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_direct_children_and_ufcs_arguments_precede_their_parent_requests() -> Bool:
+	source: String =
+		|pure func left[T](value:T)->T:
+		|    value
+		|pure func right[T](value:T)->T:
+		|    value
+		|pure func outer[T](first:T,second:T)->T:
+		|    first
+		|func main()->Int:
+		|    left(7).outer(right(8))
+
+	match specialize(source.concat("\n")):
+		Ok(contents):
+			match contents.functions:
+				[main, left, right, outer]:
+					match main.body:
+						Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+							match value.form:
+								Concrete.InvokeFunction(outer_call, [receiver, argument]):
+									match (receiver.form, argument.form):
+										(Concrete.InvokeFunction(left_call, [_]), Concrete.InvokeFunction(right_call, [_])):
+											(
+												target_is(left_call, 1)
+												and target_is(right_call, 2)
+												and target_is(outer_call, 3)
+												and left.signature.parameters.length() == 1
+												and right.signature.parameters.length() == 1
+												and outer.signature.parameters.length() == 2
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func union_is(value: Concrete.TypeRef, expected: Int) -> Bool:
+	match value:
+		Concrete.UnionType(id):
+			Concrete.union_number(id) == expected
+		_:
+			False
+
+
+private pure func binding_at(
+	binding: Concrete.ConcreteBinding,
+	source: String,
+	name: String,
+) -> Bool:
+	(
+		Some(binding.span.start) == source.index_of(name)
+		and binding.span.end == binding.span.start + name.length()
+	)
+
+
+pure func test_unused_payload_captures_keep_complete_types_and_child_first_layouts() -> Bool:
+	source: String =
+		|fixed record Point { coordinate:Int }
+		|fixed union Box[T]:
+		|    Box(T)
+		|pure func ignore_managed(value:Box[Box[String]])->Int:
+		|    match value:
+		|        Box(unused_managed): 1
+		|pure func ignore_record(value:Box[Point])->Int:
+		|    match value:
+		|        Box(unused_record): 2
+		|pure func make_point()->Point:
+		|    { coordinate = 2 }
+		|func main()->Int:
+		|    unused = ignore_managed(Box(Box("kept")))
+		|    point = make_point()
+		|    ignore_record(Box(point))
+
+	match specialize(source.concat("\n")):
+		Err(_):
+			False
+		Ok(contents):
+			match (contents.records, contents.unions, contents.functions):
+				([point], [child, parent, record_box], [_, managed, _, with_record]):
+					match (
+						managed.bindings,
+						with_record.bindings,
+						parent.variants,
+						record_box.variants,
+					):
+						([managed_parameter, managed_capture], [record_parameter, record_capture], [[nested]], [[Concrete.RecordType(stored_record)]]):
+							match (
+								(managed_parameter.origin, managed_capture.origin),
+								(record_parameter.origin, record_capture.origin),
+								record_capture.value_type,
+								point.fields,
+							):
+								((Checked.ParameterBinding(0), Checked.MatchCapture), (Checked.ParameterBinding(0), Checked.MatchCapture), Concrete.RecordType(captured_record), [Concrete.IntType]):
+									(
+										Concrete.function_number(entry_function(contents.entrypoint)) == 0
+										and owning_string_payload(child)
+										and parent.representation == Concrete.InlineOwningPayload
+										and record_box.representation == Concrete.InlineUnmanaged
+										and union_is(nested, 0)
+										and union_is(managed_parameter.value_type, 1)
+										and union_is(managed_capture.value_type, 0)
+										and union_is(record_parameter.value_type, 2)
+										and Concrete.record_number(stored_record) == 0
+										and Concrete.record_number(captured_record) == 0
+										and binding_at(managed_capture, source, "unused_managed")
+										and binding_at(record_capture, source, "unused_record")
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_unused_whole_capture_keeps_complete_managed_generic_layouts() -> Bool:
+	source: String =
+		|fixed union Box[T, Phantom]:
+		|    Box(T)
+		|pure func make() -> Box[Box[String, Void], String]:
+		|    Box(Box("kept"))
+		|pure func ignore[T, Phantom](value: Box[T, Phantom]) -> Int:
+		|    match value:
+		|        whole: 0
+		|func main() -> Int:
+		|    ignore(make())
+		|
+
+	match specialize(source):
+		Err(_): False
+		Ok(contents):
+			match (contents.records, contents.unions, contents.functions):
+				([], [child, parent], [_, make, ignore]):
+					match (ignore.signature.parameters, ignore.bindings, ignore.body):
+						([argument_type], [parameter, capture], Concrete.ConcreteMatchBody(matched)):
+							match matched.arms:
+								[arm]:
+									stored_parent = match parent.variants:
+										[[nested]]: union_is(nested, 0)
+										_: False
+									origins = match (parameter.origin, capture.origin):
+										(Checked.ParameterBinding(0), Checked.MatchCapture): True
+										_: False
+									whole_pattern = match arm.pattern:
+										Concrete.BindingCase(id): Checked.binding_number(id) == 1
+										_: False
+									unused_capture = match arm.body:
+										Concrete.ReturnExpression(value):
+											match value.form:
+												Concrete.LiteralInteger(0):
+													Concrete.same_type(value.value_type, Concrete.IntType)
+												_: False
+										_: False
+									(
+										owning_string_payload(child) and stored_parent
+										and parent.representation == Concrete.InlineOwningPayload
+										and union_is(make.signature.return_type, 1)
+										and union_is(argument_type, 1)
+										and union_is(parameter.value_type, 1)
+										and union_is(capture.value_type, 1)
+										and Concrete.union_number(matched.owner) == 1
+										and union_is(matched.scrutinee.value_type, 1)
+										and Concrete.same_type(ignore.signature.return_type, Concrete.IntType)
+										and origins and whole_pattern and unused_capture
+										and binding_at(capture, source, "whole")
+									)
+								_: False
+						_: False
+				_: False
+
+
+private pure func nested_call_is(
+	value: Concrete.ConcreteExpr,
+	parent_target: Int,
+	child_target: Int,
+	parent_layout: Int,
+	child_layout: Int,
+) -> Bool:
+	match value.form:
+		Concrete.InvokeFunction(parent, [child]):
+			match child.form:
+				Concrete.InvokeFunction(child_call, [_]):
+					(
+						target_is(parent, parent_target)
+						and target_is(child_call, child_target)
+						and union_is(value.value_type, parent_layout)
+						and union_is(child.value_type, child_layout)
+					)
+				_:
+					False
+		_:
+			False
+
+
+private pure func inline_integer_payload(layout: Concrete.ConcreteUnion) -> Bool:
+	match (layout.representation, layout.variants):
+		(Concrete.InlineUnmanaged, [[Concrete.IntType]]):
+			True
+		_:
+			False
+
+
+private pure func inline_union_payload_is(layout: Concrete.ConcreteUnion, expected: Int) -> Bool:
+	match (layout.representation, layout.variants):
+		(Concrete.InlineUnmanaged, [[payload]]):
+			union_is(payload, expected)
+		_:
+			False
+
+
+pure func test_unused_nested_initializers_in_both_arms_keep_nominal_request_order() -> Bool:
+	source: String =
+		|fixed union Flag:
+		|    Off
+		|    On
+		|fixed union Box[T]:
+		|    Box(T)
+		|fixed union Other[T]:
+		|    Other(T)
+		|pure func flag()->Flag:
+		|    On
+		|pure func box[T](value:T)->Box[T]:
+		|    Box(value)
+		|pure func other[T](value:T)->Other[T]:
+		|    Other(value)
+		|pure func choose[T](value:T)->Int:
+		|    match flag():
+		|        Off:
+		|            unused_first = box(box(value))
+		|            1
+		|        On:
+		|            unused_second = other(other(value))
+		|            2
+		|func main()->Int:
+		|    choose(7)
+
+	match specialize(source.concat("\n")):
+		Err(_):
+			False
+		Ok(contents):
+			match (contents.unions, contents.functions):
+				([_, box_child, box_parent, other_child, other_parent], [_, choose, _, first_child, first_parent, second_child, second_parent]):
+					match (choose.bindings, choose.body):
+						([parameter, first, second], Concrete.ConcreteMatchBody(matched)):
+							match matched.arms:
+								[first_arm, second_arm]:
+									match (first_arm.statements, second_arm.statements):
+										([Concrete.InitializeBinding(first_id, first_value)], [Concrete.InitializeBinding(second_id, second_value)]):
+											(
+												Concrete.function_number(entry_function(contents.entrypoint)) == 0
+												and Concrete.same_type(
+													parameter.value_type,
+													Concrete.IntType,
+												)
+												and union_is(first.value_type, 2)
+												and union_is(second.value_type, 4)
+												and inline_integer_payload(box_child)
+												and inline_union_payload_is(box_parent, 1)
+												and inline_integer_payload(other_child)
+												and inline_union_payload_is(other_parent, 3)
+												and union_is(first_child.signature.return_type, 1)
+												and union_is(first_parent.signature.return_type, 2)
+												and union_is(second_child.signature.return_type, 3)
+												and union_is(second_parent.signature.return_type, 4)
+												and Checked.binding_number(first_id) == 1
+												and Checked.binding_number(second_id) == 2
+												and nested_call_is(first_value, 4, 3, 2, 1)
+												and nested_call_is(second_value, 6, 5, 4, 3)
+												and binding_at(first, source, "unused_first")
+												and binding_at(second, source, "unused_second")
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_each_match_arm_prepares_its_assignments_and_nested_dependencies() -> Bool:
+	source: String =
+		|fixed union Flag:
+		|    Off
+		|    On
+		|fixed union Marker[A,B]:
+		|    Only
+		|pure func flag()->Flag:
+		|    On
+		|pure func mark[T](value:T)->Marker[Int,T]:
+		|    Only
+		|pure func choose[T](value:T)->Int:
+		|    match flag():
+		|        Off:
+		|            first = mark(value)
+		|            1
+		|        On:
+		|            second = mark(mark(value))
+		|            2
+		|func main()->Int:
+		|    choose(7)
+
+	match specialize(source.concat("\n")):
+		Ok(contents):
+			match (contents.unions, contents.functions):
+				([_, inner_union, outer_union], [_, choose, _, inner, outer]):
+					match (choose.bindings, choose.body, outer.signature.parameters):
+						([_, first, second], Concrete.ConcreteMatchBody(matched), [input]):
+							match matched.arms:
+								[first_arm, second_arm]:
+									(
+										union_is(first.value_type, 1)
+										and union_is(second.value_type, 2)
+										and union_is(inner.signature.return_type, 1)
+										and union_is(outer.signature.return_type, 2)
+										and union_is(input, 1)
+										and payload_free(inner_union.variants)
+										and payload_free(outer_union.variants)
+										and first_arm.statements.length() == 1
+										and second_arm.statements.length() == 1
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+private BOX: String =
+	|fixed union Box[T]:
+	|	Box(T)
+	|
+
+private BOX_FUNCTION: String =
+	|pure func box[T](value:T)->Box[T]:
+	|	Box(value)
+	|
+
+
+private pure func call_at(
+	call: Concrete.ConcreteCall,
+	target: Int,
+	start: Int,
+	width: Int,
+) -> Bool:
+	target_is(call, target) and same_span(call.span, {
+		source = module_source(root_module_id()),
+		start = start,
+		end = start + width
+	})
+
+
+private pure func owning_string_payload(layout: Concrete.ConcreteUnion) -> Bool:
+	match (layout.representation, layout.variants):
+		(Concrete.InlineOwningPayload, [[Concrete.StringType]]):
+			True
+		_:
+			False
+
+
+-- String payloads are admitted; the old unsupported-payload error ordering
+-- is retired. Published child layouts and call requests retain these orders.
+pure func test_managed_nested_layout_and_request_order() -> Bool:
+	main_source: String =
+		|func main()->Int:
+		|	saved =
+	call_suffix: String =
+		|box(box("7"))
+		|	0
+		|
+	prefix = BOX
+		.concat(BOX_FUNCTION)
+		.concat(main_source.concat(" "))
+	binding_start = BOX
+		.concat(BOX_FUNCTION)
+		.concat("func main()->Int:\n\t")
+		.length()
+
+	match specialize(prefix.concat(call_suffix)):
+		Err(_):
+			False
+		Ok(contents):
+			match (contents.unions, contents.functions):
+				([child_layout, parent_layout], [main, child_function, parent_function]):
+					match (
+						parent_layout.representation,
+						parent_layout.variants,
+						child_function.signature.parameters,
+						parent_function.signature.parameters,
+					):
+						(Concrete.InlineOwningPayload, [[Concrete.UnionType(stored_child)]], [Concrete.StringType], [Concrete.UnionType(input_child)]):
+							match (main.statements, main.bindings):
+								([Concrete.InitializeBinding(binding, parent)], [saved]):
+									match parent.form:
+										Concrete.InvokeFunction(parent_call, [child]):
+											match child.form:
+												Concrete.InvokeFunction(child_call, [_]):
+													(
+														Concrete.function_number(
+															entry_function(contents.entrypoint),
+														) == 0
+														and owning_string_payload(child_layout)
+														and Concrete.union_number(stored_child) == 0
+														and Concrete.union_number(input_child) == 0
+														and union_is(
+															child_function.signature.return_type,
+															0,
+														)
+														and union_is(
+															parent_function.signature.return_type,
+															1,
+														)
+														and main.signature.parameters.length() == 0
+														and Concrete.same_type(
+															main.signature.return_type,
+															Concrete.IntType,
+														)
+														and call_at(
+															parent_call,
+															2,
+															prefix.length(),
+															3,
+														)
+														and call_at(
+															child_call,
+															1,
+															prefix.length() + 4,
+															3,
+														)
+														and union_is(parent.value_type, 1)
+														and union_is(child.value_type, 0)
+														and Checked.binding_number(binding) == 0
+														and union_is(saved.value_type, 1)
+														and same_span(
+															saved.span,
+															{
+																source = module_source(
+																	root_module_id(),
+																),
+																start = binding_start,
+																end = binding_start + 5
+															},
+														)
+													)
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_forwarded_assignments_keep_nominal_request_order() -> Bool:
+	other_source: String =
+		|fixed union Other[T]:
+		|	Other(T)
+		|
+	first_source: String =
+		|pure func other[T](value:T)->Other[T]:
+		|	Other(value)
+		|pure func forward[T](value:T)->T:
+		|	first =
+	later_source: String =
+		|box(value)
+		|	second = other(value)
+		|	value
+		|func main()->Int:
+	first_prefix = BOX
+		.concat(other_source)
+		.concat(BOX_FUNCTION)
+		.concat(first_source)
+		.concat(" ")
+	prefix = first_prefix
+		.concat(later_source)
+		.concat("\n\tsaved = ")
+	second_start = first_prefix.length() + "box(value)\n\tsecond = ".length()
+
+	match specialize(prefix.concat("forward(\"7\")\n\t0\n")):
+		Err(_):
+			False
+		Ok(contents):
+			match (contents.unions, contents.functions):
+				([box_layout, other_layout], [main, forward, box, other]):
+					match (
+						forward.signature.parameters,
+						box.signature.parameters,
+						other.signature.parameters,
+						forward.statements,
+					):
+						([Concrete.StringType], [Concrete.StringType], [Concrete.StringType], [Concrete.InitializeBinding(first_binding, first), Concrete.InitializeBinding(second_binding, second)]):
+							match (first.form, second.form, main.statements):
+								(Concrete.InvokeFunction(first_call, [_]), Concrete.InvokeFunction(second_call, [_]), [Concrete.InitializeBinding(_, main_value)]):
+									match main_value.form:
+										Concrete.InvokeFunction(main_call, [_]):
+											(
+												Concrete.function_number(entry_function(contents.entrypoint)) == 0
+												and owning_string_payload(box_layout)
+												and owning_string_payload(other_layout)
+												and Concrete.same_type(
+													forward.signature.return_type,
+													Concrete.StringType,
+												)
+												and union_is(box.signature.return_type, 0)
+												and union_is(other.signature.return_type, 1)
+												and main.signature.parameters.length() == 0
+												and Concrete.same_type(
+													main.signature.return_type,
+													Concrete.IntType,
+												)
+												and call_at(first_call, 2, first_prefix.length(), 3)
+												and call_at(second_call, 3, second_start, 5)
+												and call_at(main_call, 1, prefix.length(), 7)
+												and Checked.binding_number(first_binding) == 1
+												and Checked.binding_number(second_binding) == 2
+												and union_is(first.value_type, 0)
+												and union_is(second.value_type, 1)
+												and Concrete.same_type(
+													main_value.value_type,
+													Concrete.StringType,
+												)
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+-- Type preparation visits a call's type before its arguments' types, whichever
+-- notation wrote the call, so the call's instance is numbered first. A receiver
+-- chain was numbered receiver first before calls became one node.
+private pure func call_type_precedes_argument_type(source: String) -> Bool:
+	match specialize(source):
+		Err(_):
+			False
+		Ok(contents):
+			match contents.functions:
+				[main, _, _]:
+					match main.statements:
+						[Concrete.InitializeBinding(_, chain)]:
+							match chain.form:
+								Concrete.InvokeFunction(_, [argument]):
+									union_is(chain.value_type, 0) and union_is(argument.value_type, 1)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_nested_call_prepares_the_call_type_before_its_argument_type() -> Bool:
+	source: String =
+		|fixed union Marker[T]:
+		|    Only
+		|pure func integer() -> Marker[Int]:
+		|    Only
+		|pure func text(value: Marker[Int]) -> Marker[String]:
+		|    Only
+		|func main() -> Int:
+		|    saved = text(integer())
+		|    0
+		|
+	call_type_precedes_argument_type(source)
+
+
+pure func test_receiver_chain_prepares_the_call_type_before_its_receiver_type() -> Bool:
+	source: String =
+		|fixed union Marker[T]:
+		|    Only
+		|pure func integer() -> Marker[Int]:
+		|    Only
+		|pure func text(value: Marker[Int]) -> Marker[String]:
+		|    Only
+		|func main() -> Int:
+		|    saved = integer().text()
+		|    0
+		|
+	call_type_precedes_argument_type(source)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 specialization collection ordering",
+	tests = [
+		(
+			"direct nested calls request distinct children before parent",
+			test_direct_nested_calls_request_distinct_children_before_the_parent,
+		),
+		(
+			"direct children and ufcs arguments precede parent requests",
+			test_direct_children_and_ufcs_arguments_precede_their_parent_requests,
+		),
+		(
+			"unused payload captures keep complete types and child-first layouts",
+			test_unused_payload_captures_keep_complete_types_and_child_first_layouts,
+		),
+		(
+			"unused whole capture keeps managed generic layouts without phantom fields",
+			test_unused_whole_capture_keeps_complete_managed_generic_layouts,
+		),
+		(
+			"unused nested initializers in both arms keep nominal request order",
+			test_unused_nested_initializers_in_both_arms_keep_nominal_request_order,
+		),
+		(
+			"every match arm prepares statements and nested dependencies",
+			test_each_match_arm_prepares_its_assignments_and_nested_dependencies,
+		),
+		(
+			"managed child layout and request precede parent",
+			test_managed_nested_layout_and_request_order,
+		),
+		(
+			"forwarded statements preserve distinct nominal request order",
+			test_forwarded_assignments_keep_nominal_request_order,
+		),
+		(
+			"nested call prepares the call type before its argument type",
+			test_nested_call_prepares_the_call_type_before_its_argument_type,
+		),
+		(
+			"receiver chain prepares the call type before its receiver type",
+			test_receiver_chain_prepares_the_call_type_before_its_receiver_type,
+		),
+	]
+}

@@ -1,0 +1,350 @@
+import:
+	../../../src/load/load: SourceInputs
+	../../../src/main: render_diagnostics
+	../../../src/utils/source:
+		COMPILER_SOURCE,
+		module_id,
+		module_number,
+		module_source,
+		root_module_id,
+		same_source,
+	../../../src/utils/syntax: Diagnostic, DiagnosticNote(UnionPayloadDeclaration, CompetingDeclarations), singleton_diagnostic
+	../compilation: compile, diagnostic_sources
+	test: TestSuite
+
+
+private LEXICAL_HELP: String = (
+	"use ASCII function declarations and numeric literals, parameter names, or calls; "
+	+ "keep -> adjacent"
+)
+
+
+pure func test_optional_note_renders_its_meaning_and_declaration_location() -> Bool:
+	error: Diagnostic = {
+		span = {
+			source = module_source(root_module_id()),
+			start = 8,
+			end = 21
+		},
+		note = Some(UnionPayloadDeclaration({
+			source = module_source(root_module_id()),
+			start = 0,
+			end = 7,
+		})),
+		message = "unsupported payload",
+		help = "use Int"
+	}
+	with_note = render_diagnostics(diagnostic_sources("demo", "payload\ninstantiation\n"), singleton_diagnostic(error))
+	without_note = render_diagnostics(
+		diagnostic_sources("demo", "payload\ninstantiation\n"),
+		singleton_diagnostic({ error | note = None }),
+	)
+	(
+		with_note == "demo:2:1: error: unsupported payload\nhelp: use Int\ndemo:1:1: note: union payload declared here"
+		and without_note == "demo:2:1: error: unsupported payload\nhelp: use Int"
+	)
+
+
+pure func test_foundation_diagnostic_uses_inventory_source() -> Bool:
+	match module_id(1):
+		None: False
+		Some(base):
+			inputs: SourceInputs = { modules = [{ path = "main.brp", contents = "" }, { path = "_base.brp", contents = "type Int = builtin\n" }] }
+			error: Diagnostic = { span = { source = module_source(base), start = 19, end = 19 }, note = None, message = "missing String builtin declaration", help = "add type String = builtin to _base.brp" }
+			render_diagnostics(inputs, singleton_diagnostic(error)) == "_base.brp:2:1: error: missing String builtin declaration\nhelp: add type String = builtin to _base.brp"
+
+
+pure func test_program_error_keeps_program_origin() -> Bool:
+	match compile("$"):
+		Err(errors):
+			match errors.remaining:
+				[]:
+					error = errors.first
+					(
+						same_source(error.span.source, module_source(root_module_id()))
+						and error.span.start == 0
+						and error.span.end == 1
+						and error.message == "unsupported character"
+						and error.help == LEXICAL_HELP
+					)
+				_:
+					False
+		Ok(_):
+			False
+
+
+pure func test_competing_declarations_render_every_inventory_location() -> Bool:
+	match module_id(1):
+		None: False
+		Some(dependency):
+			inputs: SourceInputs = { modules = [{ path = "main.brp", contents = "call()\n" }, { path = "ops.brp", contents = "first\nsecond\n" }] }
+			error: Diagnostic = {
+				span = { source = module_source(root_module_id()), start = 0, end = 6 },
+				note = Some(CompetingDeclarations([{ source = module_source(dependency), start = 0, end = 5 }, { source = module_source(dependency), start = 6, end = 12 }])),
+				message = "ambiguous method", help = "select one operation module"
+			}
+			render_diagnostics(inputs, singleton_diagnostic(error)) == "main.brp:1:1: error: ambiguous method\nhelp: select one operation module\nops.brp:1:1: note: candidate declaration or import here\nops.brp:2:1: note: candidate declaration or import here"
+
+
+pure func test_primary_and_note_use_their_own_module_sources() -> Bool:
+	match module_id(module_number(root_module_id()) + 1):
+		None:
+			False
+		Some(dependency):
+			inputs: SourceInputs = {
+				modules = [
+					{ path = "main.brp", contents = "lead\ncall()\n" },
+					{ path = "library.brp", contents = "one\ntwo\npayload\n" },
+				]
+			}
+			error: Diagnostic = {
+				span = { source = module_source(root_module_id()), start = 5, end = 11 },
+				note = Some(UnionPayloadDeclaration({
+					source = module_source(dependency), start = 8, end = 15
+				})),
+				message = "unsupported payload",
+				help = "use Int"
+			}
+			render_diagnostics(inputs, singleton_diagnostic(error)) == (
+				"main.brp:2:1: error: unsupported payload\nhelp: use Int\nlibrary.brp:3:1: note: union payload declared here"
+			)
+
+
+private pure func missing_source_error(note_is_missing: Bool) -> Bool:
+	match module_id(module_number(root_module_id()) + 1):
+		None:
+			False
+		Some(absent):
+			root_span = { source = module_source(root_module_id()), start = 0, end = 1 }
+			missing_span = { root_span | source = module_source(absent) }
+			primary = if note_is_missing:
+				root_span
+			else:
+				missing_span
+			note = if note_is_missing:
+				Some(UnionPayloadDeclaration(missing_span))
+			else:
+				None
+			error: Diagnostic = {
+				span = primary,
+				note = note,
+				message = "original diagnostic",
+				help = "original help"
+			}
+			render_diagnostics(diagnostic_sources("main.brp", "0"), singleton_diagnostic(error)) == (
+				"blorp_2: error: diagnostic references a missing module source\nhelp: report this compiler error with the input files"
+			)
+
+
+pure func test_missing_primary_source_is_an_explicit_error() -> Bool:
+	missing_source_error(False)
+
+
+pure func test_missing_note_source_is_an_explicit_error() -> Bool:
+	missing_source_error(True)
+
+
+pure func test_compiler_origin_has_no_user_file_location() -> Bool:
+	error: Diagnostic = {
+		span = { source = COMPILER_SOURCE, start = 0, end = 0 },
+		note = None,
+		message = "internal compiler error",
+		help = "report the input files"
+	}
+	render_diagnostics(diagnostic_sources("main.brp", "0"), singleton_diagnostic(error)) == (
+		"blorp_2: error: internal compiler error\nhelp: report the input files"
+	)
+
+
+pure func test_complete_pipeline_emits_c() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	0
+		|
+
+	match compile(source):
+		Ok(output):
+			output == "#include <stdint.h>\nint64_t blorp_f_0(void);int64_t blorp_f_0(void){const int64_t blorp_vl_0=INT64_C(0);(void)blorp_vl_0;return blorp_vl_0;}int main(void){return (int)blorp_f_0();}\n"
+		Err(_):
+			False
+
+
+pure func test_lexical_error_precedes_semantic_check() -> Bool:
+	source: String =
+		|func nope() -> Foo:
+		|	?
+		|
+
+	match compile(source):
+		Err(errors):
+			match errors.remaining:
+				[]:
+					diagnostic = errors.first
+					(
+						diagnostic.span.start == 21
+						and diagnostic.span.end == 22
+						and diagnostic.message == "unsupported character"
+						and diagnostic.help == (
+							"use ASCII function declarations and numeric literals, parameter names, or calls; "
+							+ "keep -> adjacent"
+						)
+					)
+				_:
+					False
+		Ok(_):
+			False
+
+
+pure func test_semantic_error_survives_pipeline() -> Bool:
+	source: String =
+		|func nope() -> Int:
+		|	0
+		|
+
+	match compile(source):
+		Err(errors):
+			match errors.remaining:
+				[]:
+					diagnostic = errors.first
+					(
+						diagnostic.span.start == 23
+						and diagnostic.span.end == 23
+						and diagnostic.message == "expected a main function"
+						and diagnostic.help == "declare func main() -> Int: as the entrypoint"
+					)
+				_:
+					False
+		Ok(_):
+			False
+
+
+pure func test_function_and_parameter_renaming_preserves_c() -> Bool:
+	original_source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|func main() -> Int:
+		|	identity(1)
+		|
+	renamed_source: String =
+		|pure func echo(argument: Int) -> Int:
+		|	argument
+		|func main() -> Int:
+		|	echo(1)
+		|
+
+	match compile(original_source):
+		Err(_):
+			False
+		Ok(expected):
+			match compile(renamed_source):
+				Ok(actual):
+					actual == expected
+				Err(_):
+					False
+
+
+pure func test_full_integer_literal_controls_emitted_c() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	42
+		|
+
+	match compile(source):
+		Err(_):
+			False
+		Ok(output):
+			output == "#include <stdint.h>\nint64_t blorp_f_0(void);int64_t blorp_f_0(void){const int64_t blorp_vl_0=INT64_C(42);(void)blorp_vl_0;return blorp_vl_0;}int main(void){return (int)blorp_f_0();}\n"
+
+
+pure func test_signed_direct_and_receiver_arguments() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|func main() -> Int:
+		|	identity(-42).identity()
+		|
+
+	match compile(source):
+		Err(_):
+			False
+		Ok(output):
+			output == "#include <stdint.h>\nint64_t blorp_f_0(void);int64_t blorp_f_1(int64_t blorp_p_0);int64_t blorp_f_0(void){const int64_t blorp_vl_0=(-INT64_C(42));(void)blorp_vl_0;const int64_t blorp_vl_1=blorp_f_1(blorp_vl_0);(void)blorp_vl_1;const int64_t blorp_vl_2=blorp_f_1(blorp_vl_1);(void)blorp_vl_2;return blorp_vl_2;}int64_t blorp_f_1(int64_t blorp_p_0){const int64_t blorp_vl_0=blorp_p_0;(void)blorp_vl_0;return blorp_vl_0;}int main(void){return (int)blorp_f_0();}\n"
+
+
+pure func test_payload_free_union_construction() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|	First
+		|	Second
+		|pure func choose() -> Choice:
+		|	Second
+		|func main() -> Int:
+		|	0
+		|
+
+	match compile(source):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+pure func test_match_coverage_error_survives_pipeline() -> Bool:
+	body: String =
+		|match value:
+		|		Empty: 0
+		|func main() -> Int:
+		|	0
+		|
+	prefix = "fixed union Value:\n\tEmpty\n\tNumber(Int)\npure func unwrap(value: Value) -> Int:\n\t"
+
+	match compile(prefix + body):
+		Ok(_):
+			False
+		Err(errors):
+			match errors.remaining:
+				[]:
+					error = errors.first
+					(
+						error.span.start == prefix.length()
+						and error.span.end == prefix.length() + 5
+						and error.message == "non-exhaustive match"
+						and error.help == "add an arm for the missing variant: Number(_)"
+					)
+				_:
+					False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 compile pipeline",
+	tests = [
+		(
+			"optional note retains meaning and location",
+			test_optional_note_renders_its_meaning_and_declaration_location,
+		),
+		(
+			"foundation diagnostic uses inventory source",
+			test_foundation_diagnostic_uses_inventory_source,
+		),
+		("program error keeps program origin", test_program_error_keeps_program_origin),
+		("primary and note use their own module sources", test_primary_and_note_use_their_own_module_sources),
+		("missing primary source is an explicit error", test_missing_primary_source_is_an_explicit_error),
+		("missing note source is an explicit error", test_missing_note_source_is_an_explicit_error),
+		("compiler origin has no user file location", test_compiler_origin_has_no_user_file_location),
+		(
+			"competing declarations render every location",
+			test_competing_declarations_render_every_inventory_location,
+		),
+		("match coverage error survives pipeline", test_match_coverage_error_survives_pipeline),
+		("payload-free union construction", test_payload_free_union_construction),
+		("signed direct and receiver arguments", test_signed_direct_and_receiver_arguments),
+		("full integer literal controls emitted C", test_full_integer_literal_controls_emitted_c),
+		(
+			"function and parameter renaming preserves C",
+			test_function_and_parameter_renaming_preserves_c,
+		),
+		("complete pipeline emits C", test_complete_pipeline_emits_c),
+		("lexical error precedes semantic check", test_lexical_error_precedes_semantic_check),
+		("semantic error survives pipeline", test_semantic_error_survives_pipeline),
+	]
+}

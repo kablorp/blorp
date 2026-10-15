@@ -1,0 +1,228 @@
+import:
+	../../../src/utils/declarations as Declaration
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/check/check: checked_functions
+	../../../src/check/check_model as Check
+	../../../src/lex/lex: lex
+	../input: check, parse
+	test: TestSuite
+
+
+private pure func call_matches(
+	call: Check.CheckedCall,
+	target: Int,
+	source: String,
+	occurrence: String,
+	name: String,
+) -> Bool:
+	match call.target:
+		Check.UserFunction(id, arguments):
+			match source.index_of(occurrence):
+				None:
+					False
+				Some(start):
+					(
+						Declaration.function_number(id) == target
+						and arguments.length() == 0
+						and call.span.start == start
+						and call.span.end == start + name.length()
+					)
+		Check.RuntimeFunction(_):
+			False
+
+
+pure func test_calls_follow_prefix_children_scrutinee_and_arm_order() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|	Left
+		|	Right
+		|fixed record Pair { left: Int, right: Int }
+		|pure func initial(value: Int) -> Int:
+		|	value
+		|pure func nested(value: Int) -> Int:
+		|	value
+		|pure func reassigned(value: Int) -> Int:
+		|	value
+		|pure func record_right(value: Int) -> Int:
+		|	value
+		|pure func record_left(value: Int) -> Int:
+		|	value
+		|pure func receiver(value: Int) -> Int:
+		|	value
+		|pure func explicit(value: Int) -> Int:
+		|	value
+		|pure func combine(left: Int, right: Int) -> Int:
+		|	left
+		|pure func choose(value: Int) -> Choice:
+		|	Left
+		|pure func arm_init(value: Int) -> Int:
+		|	value
+		|pure func arm_return(value: Int) -> Int:
+		|	value
+		|pure func other_return(value: Int) -> Int:
+		|	value
+		|pure func consume_record(value: Pair) -> Int:
+		|	value.left
+		|pure func inspect() -> Int:
+		|	var current = initial(1)
+		|	current = reassigned(nested(2))
+		|	pair = consume_record({ right = record_right(3), left = record_left(4) })
+		|	match choose(receiver(5).combine(explicit(6))):
+		|		Left:
+		|			current = arm_init(7)
+		|			arm_return(current)
+		|		Right: other_return(8)
+		|func main() -> Int:
+		|	inspect()
+		|
+
+	match lex(module_source(root_module_id()), source).and_then(pure func(tokens): parse(tokens)):
+		Err(_):
+			False
+		Ok(parsed):
+			match check(parsed):
+				Err(_):
+					False
+				Ok(program):
+					match checked_functions(program).functions.get(13):
+						None:
+							False
+						Some(function):
+							match Check.function_calls(function):
+								[initial, nested, reassigned, right, left, consume_record, receiver, explicit, combine, choose, arm_init, arm_return, other_return]:
+									(
+										call_matches(initial, 0, source, "initial(1)", "initial")
+										and call_matches(nested, 1, source, "nested(2)", "nested")
+										and call_matches(
+											reassigned,
+											2,
+											source,
+											"reassigned(nested(2))",
+											"reassigned",
+										)
+										and call_matches(
+											right,
+											3,
+											source,
+											"record_right(3)",
+											"record_right",
+										)
+										and call_matches(
+											left,
+											4,
+											source,
+											"record_left(4)",
+											"record_left",
+										)
+										and call_matches(
+											consume_record,
+											12,
+											source,
+											"consume_record({",
+											"consume_record",
+										)
+										and call_matches(
+											receiver,
+											5,
+											source,
+											"receiver(5)",
+											"receiver",
+										)
+										and call_matches(
+											explicit,
+											6,
+											source,
+											"explicit(6)",
+											"explicit",
+										)
+										and call_matches(
+											combine,
+											7,
+											source,
+											"combine(explicit(6))",
+											"combine",
+										)
+										and call_matches(
+											choose,
+											8,
+											source,
+											"choose(receiver(5)",
+											"choose",
+										)
+										and call_matches(
+											arm_init,
+											9,
+											source,
+											"arm_init(7)",
+											"arm_init",
+										)
+										and call_matches(
+											arm_return,
+											10,
+											source,
+											"arm_return(current)",
+											"arm_return",
+										)
+										and call_matches(
+											other_return,
+											11,
+											source,
+											"other_return(8)",
+											"other_return",
+										)
+									)
+								_:
+									False
+
+
+pure func test_recur_exit_collects_arguments_without_an_ordinary_self_call() -> Bool:
+	source: String =
+		|pure func left(value: Int) -> Int:
+		|	value
+		|pure func right(value: Int) -> Int:
+		|	value
+		|pure func prefix(value: Int) -> Int:
+		|	value
+		|@tail_recursive pure func loop(first: Int, second: Int) -> Int:
+		|	unused = prefix(0)
+		|	loop(left(1), right(2))
+		|func main() -> Int:
+		|	0
+		|
+
+	match lex(module_source(root_module_id()), source).and_then(pure func(tokens): parse(tokens)):
+		Err(_):
+			False
+		Ok(parsed):
+			match check(parsed):
+				Err(_):
+					False
+				Ok(program):
+					match checked_functions(program).functions.get(3):
+						None:
+							False
+						Some(function):
+							match Check.function_calls(function):
+								[prefix, left, right]:
+									(
+										call_matches(prefix, 2, source, "prefix(0)", "prefix")
+										and call_matches(left, 0, source, "left(1)", "left")
+										and call_matches(right, 1, source, "right(2)", "right")
+									)
+								_:
+									False
+
+
+tests: TestSuite = {
+	description = "Checked function call collection",
+	tests = [
+		(
+			"calls follow prefix children scrutinee and arm order",
+			test_calls_follow_prefix_children_scrutinee_and_arm_order,
+		),
+		(
+			"recur exit collects arguments without an ordinary self call",
+			test_recur_exit_collects_arguments_without_an_ordinary_self_call,
+		),
+	]
+}

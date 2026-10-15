@@ -1,0 +1,762 @@
+import:
+	../../../src/check/check: check_errors, checked_functions
+	../../../src/check/check_errors:
+		CheckErrorKind(CallRejection, ConstructorRejection, StatementRejection, ValueRejection),
+		ConstructorError(ConstructorNeedsExpectedType),
+		StatementError(DuplicateLocal, ImmutableAssignment),
+		ValueError(ExpressionTypeMismatch, UnknownValue),
+		CallError(ImpureCall, UncallableBinding),
+	../../../src/check/check_model:
+		BindingMutability(Immutable, Mutable),
+		BindingOrigin(ParameterBinding, BodyLocal, MatchCapture),
+		CheckedBody(CheckedMatchBody),
+		CheckedForm(ReadBinding),
+		CheckedStatement(InitializeBinding, ReassignBinding),
+		TypeRef(IntType),
+		binding_number,
+		same_type,
+	../../../src/lex/lex: lex
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax: Diagnostic
+	../input: check, check_failure, parse, setup_diagnostic, singleton_check_error
+	result: get_or
+	test: TestSuite
+
+
+private pure func accepts(source: String) -> Bool:
+	match checked(source):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+private pure func checked(source: String) -> Result[Void, Diagnostic]:
+	lexed ?= lex(module_source(root_module_id()), source)
+	parsed ?= parse(lexed)
+	accepted ?= check(parsed).map_err(setup_diagnostic)
+	Ok(void)
+
+
+private pure func rejects(
+	body: String,
+	start: Int,
+	end: Int,
+	matches: pure (CheckErrorKind) -> Bool,
+) -> Bool:
+	prefix = "func main() -> Int:\n\t"
+
+	match check_failure(prefix + body):
+		None:
+			False
+		Some(error):
+			(
+				error.span.start == prefix.length() + start
+				and error.span.end == prefix.length() + end
+				and matches(error.kind)
+			)
+
+
+pure func test_immutable_and_mutable_bindings() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|pure func preserve() -> Int:
+		|	original = 1
+		|	var current = original
+		|	current = identity(42)
+		|	original
+		|func main() -> Int:
+		|	preserve()
+		|
+	accepts(source)
+
+
+pure func test_initializer_reads_previous_parameter_scope() -> Bool:
+	source: String =
+		|pure func preserve(value: Int) -> Int:
+		|	var value = value
+		|	value = value
+		|	value
+		|func main() -> Int:
+		|	preserve(42)
+		|
+	accepts(source)
+
+
+pure func test_immutable_assignment_is_rejected() -> Bool:
+	body: String =
+		|value = 1
+		|	value = 2
+		|	value
+		|
+	rejects(body, 11, 16, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			StatementRejection(ImmutableAssignment(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_duplicate_mutable_declaration_is_rejected() -> Bool:
+	body: String =
+		|var value = 1
+		|	var value = 2
+		|	value
+		|
+	rejects(body, 19, 24, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			StatementRejection(DuplicateLocal(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_unknown_self_initializer_is_rejected() -> Bool:
+	body: String =
+		|value = value
+		|	value
+		|
+	rejects(body, 8, 13, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			ValueRejection(UnknownValue(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_unused_impure_initializer_is_rejected() -> Bool:
+	source: String =
+		|func effect() -> Int:
+		|	1
+		|pure func main() -> Int:
+		|	unused = effect()
+		|	0
+		|
+
+	match check_failure(source):
+		None:
+			False
+		Some(error):
+			(
+				match error.kind:
+					CallRejection(ImpureCall(_, _)):
+						True
+					_:
+						False
+				and error.span.start == 60
+				and error.span.end == 66
+			)
+
+
+pure func test_unused_recursive_initializer_is_checked() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	unused = main()
+		|	0
+		|
+	accepts(source)
+
+
+private pure func test_binding_definitions_own_origin_mutability_type_and_span_result(
+
+) -> Result[Bool, Diagnostic]:
+	source: String =
+		|pure func copy(value: Int) -> Int:
+		|	var value = value
+		|	old = value
+		|	value = 42
+		|	old
+		|func main() -> Int:
+		|	copy(1)
+		|
+	lexed ?= lex(module_source(root_module_id()), source)
+	parsed ?= parse(lexed)
+	program ?= check(parsed).map_err(setup_diagnostic)
+	Ok(
+		match checked_functions(program).functions:
+			[copy, _]:
+				match copy.bindings:
+					[parameter, mutable, old]:
+						match copy.statements:
+							[InitializeBinding(current_id, current), InitializeBinding(old_id, previous_value), ReassignBinding(reassigned, _)]:
+								match current.form:
+									ReadBinding(parameter_id):
+										match previous_value.form:
+											ReadBinding(alias_id):
+												(
+													same_origin(
+														parameter.origin,
+														ParameterBinding(0),
+													)
+													and parameter.mutability == Immutable
+													and parameter.span.start == 15
+													and parameter.span.end == 20
+													and same_origin(mutable.origin, BodyLocal)
+													and mutable.mutability == Mutable
+													and mutable.span.start == 40
+													and mutable.span.end == 45
+													and same_origin(old.origin, BodyLocal)
+													and old.mutability == Immutable
+													and same_type(old.value_type, IntType)
+													and binding_number(parameter_id) == 0
+													and binding_number(current_id) == 1
+													and binding_number(old_id) == 2
+													and binding_number(alias_id) == 1
+													and binding_number(reassigned) == 1
+													and same_type(current.value_type, IntType)
+												)
+											_:
+												False
+									_:
+										False
+							_:
+								False
+					_:
+						False
+			_:
+				False
+	)
+
+
+pure func test_union_local_and_reassignment_use_the_established_type() -> Bool:
+	source: String =
+		|fixed union Value:
+		|	Empty
+		|	Number(Int)
+		|pure func number() -> Value:
+		|	Number(1)
+		|pure func copy(value: Value) -> Value:
+		|	var current = value
+		|	old = current
+		|	current = Number(42)
+		|	old
+		|func main() -> Int:
+		|	0
+		|
+	accepts(source)
+
+
+private pure func test_reassignment_rejects_a_different_type_result() -> Result[Bool, Diagnostic]:
+	prefix =
+		|fixed union Value:
+		|	Empty
+		|pure func value() -> Value:
+		|	Empty
+		|func main() -> Int:
+		|	var current = value()
+		|	current = 1
+		|	0
+		|
+	lexed ?= lex(module_source(root_module_id()), prefix)
+	parsed ?= parse(lexed)
+	Ok(
+		match check(parsed):
+			Ok(_):
+				False
+			Err(failure):
+				match singleton_check_error(check_errors(failure)):
+					None:
+						False
+					Some(error):
+						(
+							match error.kind:
+								ValueRejection(ExpressionTypeMismatch(_)):
+									True
+								_:
+									False
+							and error.span.start == 115
+							and error.span.end == 116
+						)
+	)
+
+
+private pure func test_new_union_local_requires_a_receiving_type_result(
+
+) -> Result[Bool, Diagnostic]:
+	source: String =
+		|fixed union Value:
+		|	Empty
+		|func main() -> Int:
+		|	value = Empty
+		|	0
+		|
+	lexed ?= lex(module_source(root_module_id()), source)
+	parsed ?= parse(lexed)
+	Ok(
+		match check(parsed):
+			Ok(_):
+				False
+			Err(failure):
+				match singleton_check_error(check_errors(failure)):
+					None:
+						False
+					Some(error):
+						(
+							match error.kind:
+								ConstructorRejection(ConstructorNeedsExpectedType(_)):
+									True
+								_:
+									False
+							and error.span.start == 55
+							and error.span.end == 60
+						)
+	)
+
+
+pure func test_binding_definitions_own_origin_mutability_type_and_span() -> Bool:
+	test_binding_definitions_own_origin_mutability_type_and_span_result().get_or(False)
+
+
+pure func test_reassignment_rejects_a_different_type() -> Bool:
+	test_reassignment_rejects_a_different_type_result().get_or(False)
+
+
+pure func test_new_union_local_requires_a_receiving_type() -> Bool:
+	test_new_union_local_requires_a_receiving_type_result().get_or(False)
+
+
+pure func test_body_local_shadows_direct_unary_function() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|func main() -> Int:
+		|	identity = 1
+		|	identity(1)
+		|
+
+	match check_failure(source):
+		None:
+			False
+		Some(error):
+			(
+				match error.kind:
+					CallRejection(UncallableBinding(_, _, _)):
+						True
+					_:
+						False
+				and error.span.start == 81
+				and error.span.end == 89
+			)
+
+
+pure func test_body_local_shadows_direct_zero_argument_function() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|func main() -> Int:
+		|	identity = 1
+		|	identity()
+		|
+
+	match check_failure(source):
+		None:
+			False
+		Some(error):
+			(
+				match error.kind:
+					CallRejection(UncallableBinding(_, _, _)):
+						True
+					_:
+						False
+				and error.span.start == 81
+				and error.span.end == 89
+			)
+
+
+pure func test_body_local_does_not_shadow_ufcs_function() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|func main() -> Int:
+		|	identity = 1
+		|	identity.identity()
+		|
+	accepts(source)
+
+
+private ARM_PREFIX: String =
+	|fixed union Value:
+	|	Empty
+	|	Number(Int)
+	|pure func inspect(value: Value) -> Int:
+	|	match value:
+	|
+
+
+private pure func rejects_arm(
+	before: String,
+	spelling: String,
+	after: String,
+	matches: pure (CheckErrorKind) -> Bool,
+) -> Bool:
+	main_source: String =
+		|func main() -> Int:
+		|	inspect(Number(7))
+		|
+
+	match check_failure(ARM_PREFIX + before + spelling + after + main_source):
+		None:
+			False
+		Some(error):
+			(
+				error.span.start == ARM_PREFIX.length() + before.length()
+				and error.span.end == ARM_PREFIX.length() + before.length() + spelling.length()
+				and matches(error.kind)
+			)
+
+
+pure func test_arm_local_mutation_is_pure() -> Bool:
+	arms: String =
+		|		Empty: 0
+		|		Number(payload):
+		|			var current = payload
+		|			original = current
+		|			current = 42
+		|			original
+		|func main() -> Int:
+		|	inspect(Number(7))
+		|
+	accepts(ARM_PREFIX + arms)
+
+
+pure func test_arm_var_initializer_reads_capture_before_shadowing() -> Bool:
+	arms: String =
+		|		Empty: 0
+		|		Number(payload):
+		|			var payload = payload
+		|			payload = 42
+		|			payload
+		|func main() -> Int:
+		|	inspect(Number(7))
+		|
+	accepts(ARM_PREFIX + arms)
+
+
+pure func test_arm_var_can_shadow_an_enclosing_body_local() -> Bool:
+	source: String =
+		|fixed union Value:
+		|	Empty
+		|	Number(Int)
+		|pure func inspect(value: Value) -> Int:
+		|	local = 7
+		|	match value:
+		|		Empty:
+		|			var local = local
+		|			local = 42
+		|			local
+		|		Number(_): local
+		|func main() -> Int:
+		|	inspect(Empty)
+		|
+	accepts(source)
+
+
+pure func test_sibling_arms_can_declare_the_same_local_name() -> Bool:
+	arms: String =
+		|		Empty:
+		|			var local = 0
+		|			local
+		|		Number(payload):
+		|			var local = payload
+		|			local
+		|func main() -> Int:
+		|	inspect(Number(7))
+		|
+	accepts(ARM_PREFIX + arms)
+
+
+pure func test_arm_local_does_not_escape_to_a_sibling() -> Bool:
+	rejects_arm("\t\tEmpty:\n\t\t\tlocal = 0\n\t\t\tlocal\n\t\tNumber(_): ", "local", "\n", pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ValueRejection(UnknownValue(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_arm_capture_assignment_is_rejected() -> Bool:
+	rejects_arm("\t\tEmpty: 0\n\t\tNumber(payload):\n\t\t\t", "payload", " = 42\n\t\t\tpayload\n", pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			StatementRejection(ImmutableAssignment(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_arm_immutable_local_assignment_is_rejected() -> Bool:
+	rejects_arm("\t\tEmpty: 0\n\t\tNumber(payload):\n\t\t\tlocal = payload\n\t\t\t", "local", " = 42\n\t\t\tlocal\n", pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			StatementRejection(ImmutableAssignment(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_arm_duplicate_mutable_declaration_is_rejected() -> Bool:
+	rejects_arm("\t\tEmpty: 0\n\t\tNumber(payload):\n\t\t\tvar local = payload\n\t\t\tvar ", "local", " = 42\n\t\t\tlocal\n", pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			StatementRejection(DuplicateLocal(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_arm_self_initializer_is_not_visible() -> Bool:
+	rejects_arm("\t\tEmpty: 0\n\t\tNumber(_):\n\t\t\tvar local = ", "local", "\n\t\t\tlocal\n", pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ValueRejection(UnknownValue(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_arm_reassignment_keeps_its_established_type() -> Bool:
+	rejects_arm("\t\tEmpty: 0\n\t\tNumber(payload):\n\t\t\tvar local = value\n\t\t\tlocal = ", "payload", "\n\t\t\t0\n", pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ValueRejection(ExpressionTypeMismatch(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_unused_unselected_arm_impure_initializer_is_rejected() -> Bool:
+	rejects_arm("\t\tEmpty:\n\t\t\tunused = ", "effect", "()\n\t\t\t0\n\t\tNumber(payload): payload\nfunc effect() -> Int:\n\t1\n", pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			CallRejection(ImpureCall(_, _)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_unused_unselected_arm_recursive_initializer_is_checked() -> Bool:
+	arms: String =
+		|		Empty:
+		|			unused = inspect(value)
+		|			0
+		|		Number(payload): payload
+		|func main() -> Int:
+		|	inspect(Number(7))
+		|
+	accepts(ARM_PREFIX + arms)
+
+
+pure func test_arm_final_value_must_match_the_function_return_type() -> Bool:
+	rejects_arm("\t\tEmpty: 0\n\t\tNumber(_):\n\t\t\tlocal = value\n\t\t\t", "local", "\n", pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			ValueRejection(ExpressionTypeMismatch(_)):
+				True
+			_:
+				False
+	)
+
+
+private pure func arm_definitions_result() -> Result[Bool, Diagnostic]:
+	first_prefix = ARM_PREFIX + "\t\tEmpty:\n\t\t\tvar "
+	second_prefix = first_prefix + "local = 0\n\t\t\tlocal\n\t\tNumber(payload):\n\t\t\tvar "
+	lexed ?= lex(
+		module_source(root_module_id()),
+		second_prefix + "local = payload\n\t\t\tlocal = 42\n\t\t\tlocal\nfunc main() -> Int:\n\tinspect(Number(7))\n",
+	)
+	parsed ?= parse(lexed)
+	program ?= check(parsed).map_err(setup_diagnostic)
+	Ok(
+		match checked_functions(program).functions:
+			[inspect, _]:
+				match inspect.bindings:
+					[parameter, first, capture, second]:
+						match inspect.body:
+							CheckedMatchBody(matched):
+								match matched.arms:
+									[first_arm, second_arm]:
+										match first_arm.statements:
+											[InitializeBinding(first_id, _)]:
+												match second_arm.statements:
+													[InitializeBinding(second_id, initializer), ReassignBinding(reassigned, _)]:
+														match initializer.form:
+															ReadBinding(captured):
+																(
+																	same_origin(
+																		parameter.origin,
+																		ParameterBinding(0),
+																	)
+																	and same_origin(
+																		first.origin,
+																		BodyLocal,
+																	)
+																	and same_origin(
+																		second.origin,
+																		BodyLocal,
+																	)
+																	and first.mutability == Mutable
+																	and second.mutability == Mutable
+																	and same_origin(
+																		capture.origin,
+																		MatchCapture,
+																	)
+																	and capture.mutability == Immutable
+																	and same_type(
+																		capture.value_type,
+																		IntType,
+																	)
+																	and binding_number(
+																		first_id,
+																	) == 1
+																	and binding_number(
+																		captured,
+																	) == 2
+																	and binding_number(
+																		second_id,
+																	) == 3
+																	and binding_number(
+																		reassigned,
+																	) == 3
+																	and first.span.start == first_prefix.length()
+																	and first.span.end == first_prefix.length() + 5
+																	and second.span.start == second_prefix.length()
+																	and second.span.end == second_prefix.length() + 5
+																)
+															_:
+																False
+													_:
+														False
+											_:
+												False
+									_:
+										False
+							_:
+								False
+					_:
+						False
+			_:
+				False
+	)
+
+
+pure func test_arm_definitions_have_function_owned_ids_and_exact_facts() -> Bool:
+	arm_definitions_result().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 scalar binding checks",
+	tests = [
+		(
+			"arm definitions have function ids and exact facts",
+			test_arm_definitions_have_function_owned_ids_and_exact_facts,
+		),
+		(
+			"arm final value matches function return type",
+			test_arm_final_value_must_match_the_function_return_type,
+		),
+		("arm local mutation is pure", test_arm_local_mutation_is_pure),
+		(
+			"arm var initializer reads capture before shadowing",
+			test_arm_var_initializer_reads_capture_before_shadowing,
+		),
+		("arm var shadows enclosing body local", test_arm_var_can_shadow_an_enclosing_body_local),
+		(
+			"sibling arms may declare same local name",
+			test_sibling_arms_can_declare_the_same_local_name,
+		),
+		("arm local cannot escape to sibling", test_arm_local_does_not_escape_to_a_sibling),
+		("arm capture assignment rejected", test_arm_capture_assignment_is_rejected),
+		(
+			"arm immutable local assignment rejected",
+			test_arm_immutable_local_assignment_is_rejected,
+		),
+		(
+			"arm duplicate mutable declaration rejected",
+			test_arm_duplicate_mutable_declaration_is_rejected,
+		),
+		("arm self initializer is not visible", test_arm_self_initializer_is_not_visible),
+		(
+			"arm reassignment keeps established type",
+			test_arm_reassignment_keeps_its_established_type,
+		),
+		(
+			"unused unselected arm impure initializer rejected",
+			test_unused_unselected_arm_impure_initializer_is_rejected,
+		),
+		(
+			"unused unselected arm recursive initializer checked",
+			test_unused_unselected_arm_recursive_initializer_is_checked,
+		),
+		("body local shadows direct unary function", test_body_local_shadows_direct_unary_function),
+		(
+			"body local shadows direct zero argument function",
+			test_body_local_shadows_direct_zero_argument_function,
+		),
+		("body local does not shadow UFCS function", test_body_local_does_not_shadow_ufcs_function),
+		(
+			"binding definitions own facts and stable ids",
+			test_binding_definitions_own_origin_mutability_type_and_span,
+		),
+		(
+			"union locals and reassignment keep established type",
+			test_union_local_and_reassignment_use_the_established_type,
+		),
+		("reassignment rejects different type", test_reassignment_rejects_a_different_type),
+		("new union local requires receiving type", test_new_union_local_requires_a_receiving_type),
+		("immutable and mutable bindings", test_immutable_and_mutable_bindings),
+		(
+			"initializer reads previous parameter scope",
+			test_initializer_reads_previous_parameter_scope,
+		),
+		("immutable assignment is rejected", test_immutable_assignment_is_rejected),
+		(
+			"duplicate mutable declaration is rejected",
+			test_duplicate_mutable_declaration_is_rejected,
+		),
+		("unknown self initializer is rejected", test_unknown_self_initializer_is_rejected),
+		("unused impure initializer is rejected", test_unused_impure_initializer_is_rejected),
+		("unused recursive initializer is checked", test_unused_recursive_initializer_is_checked),
+	]
+}
+
+
+private pure func same_origin(actual: BindingOrigin, expected: BindingOrigin) -> Bool:
+	match actual:
+		ParameterBinding(index):
+			match expected:
+				ParameterBinding(other):
+					index == other
+				_:
+					False
+		BodyLocal:
+			match expected:
+				BodyLocal:
+					True
+				_:
+					False
+		MatchCapture:
+			match expected:
+				MatchCapture:
+					True
+				_:
+					False

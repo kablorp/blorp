@@ -1,0 +1,502 @@
+import:
+	../../../src/namespace/builtins as Builtins
+	../../../src/check/check: CheckedProgram, checked_functions
+	../../../src/check/check_errors as Errors
+	../../../src/check/check_model as Checked
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/text: concat
+	../../../src/utils/syntax: Diagnostic, ParsedRuntimeOperation(ListRepeatBuiltin, ListLengthBuiltin), Purity(Pure), entry_function
+	../input: checked_source, check_failure
+	int as IntOps
+	option: to_result
+	test: TestSuite
+
+
+private ENTRY_DECLARATIONS: String =
+	|fixed record Entry { number: Int, text: String }
+	|fixed union Maybe[T]:
+	|    Present(T)
+	|    Missing
+	|pure func repeat[T](element: T, count: Int) -> List[T]:
+	|    builtin("list.repeat")
+	|pure func get[T](values: List[T], index: Int) -> Maybe[T]:
+	|    builtin("list.get", Present, Missing)
+	|pure func text(value: Int) -> String:
+	|    builtin("int.to_string")
+	|pure func make_entry(value: Int) -> Entry:
+	|    { number = value, text = text(value) }
+	|pure func selected() -> Maybe[Entry]:
+	|    values = repeat(make_entry(42), 2)
+	|    get(values, 1)
+	|
+
+
+private pure func entry_source() -> String:
+	ENTRY_DECLARATIONS.concat(
+		|func main() -> Int:
+		|    saved = selected()
+		|    0
+		|
+	)
+
+
+private pure func concrete(source: String) -> Result[Concrete.SpecializedProgram, Diagnostic]:
+	checked_source(source).and_then(Concrete.specialize)
+
+
+private pure func setup_error() -> Diagnostic:
+	{
+		span = { source = module_source(root_module_id()), start = 0, end = 0 },
+		note = None,
+		message = "invalid generic List phase seed",
+		help = "fix the typed List phase input"
+	}
+
+
+private pure func selected_function(program: Lower.LoweredProgram) -> Result[Lower.LoweredFunction, Diagnostic]:
+	facts = Lower.lowered_functions(program)
+	main ?= facts.functions.get(Concrete.function_number(entry_function(facts.entrypoint))).to_result(setup_error())
+	first ?= main.definitions.get(0).to_result(setup_error())
+	match first.operation:
+		Lower.CallValue(call, _):
+			match call.target:
+				Concrete.UserFunction(id): facts.functions.get(Concrete.function_number(id)).to_result(setup_error())
+				_: Err(setup_error())
+		_: Err(setup_error())
+
+
+pure func test_repeat_contract_carries_the_same_structured_element_everywhere() -> Bool:
+	element = Concrete.ListType(Concrete.IntType)
+	operation: Builtins.RuntimeOperation[Void, Concrete.TypeRef] = Builtins.ListRepeat(element)
+	contract = Builtins.runtime_contract(operation)
+	parameters = match contract.parameters:
+		[Builtins.ElementRuntimeType(argument), Builtins.PrimitiveRuntimeType(Builtins.BuiltinInt)]:
+			Concrete.same_type(argument, element)
+		_: False
+	result = match contract.return_type:
+		Builtins.ValueResult(Builtins.ListRuntimeType(returned)): Concrete.same_type(returned, element)
+		_: False
+	contract.purity == Pure and parameters and result
+
+
+pure func test_length_contract_carries_element_only_in_its_list_parameter() -> Bool:
+	element = Concrete.ListType(Concrete.StringType)
+	operation: Builtins.RuntimeOperation[Void, Concrete.TypeRef] = Builtins.ListLength(element)
+	contract = Builtins.runtime_contract(operation)
+	parameters = match contract.parameters:
+		[Builtins.ListRuntimeType(argument)]: Concrete.same_type(argument, element)
+		_: False
+	result = match contract.return_type:
+		Builtins.ValueResult(Builtins.PrimitiveRuntimeType(Builtins.BuiltinInt)): True
+		_: False
+	contract.purity == Pure and parameters and result
+
+
+pure func test_concrete_list_builtin_header_still_accepts_numeric_elements() -> Bool:
+	source: String =
+		|pure func count(values: List[Int]) -> Int:
+		|    builtin("list.length")
+		|func main() -> Int:
+		|    0
+		|
+	match checked_source(source):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[count, _]:
+					match count.body:
+						Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+							match value.form:
+								Checked.InvokeFunction(call, [_]):
+									match call.target:
+										Checked.RuntimeFunction(Builtins.ListLength(Checked.IntType)): True
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_generic_structured_element_keeps_all_declared_type_parameters() -> Bool:
+	source: String =
+		|fixed record Pair[A, B] { first: A, second: B }
+		|pure func repeat_pair[A, B](value: Pair[A, B], count: Int) -> List[Pair[A, B]]:
+		|    builtin("list.repeat")
+		|func main() -> Int:
+		|    0
+		|
+	match checked_source(source):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[repeat_pair, _]:
+					parameters = repeat_pair.signature.parameters.map(pure func(parameter): parameter.value_type)
+					match repeat_pair.signature.return_type.value_type:
+						Checked.ListType(element):
+							(IntOps.equals(repeat_pair.signature.type_parameters.length(), 2)
+							and Checked.same_types(parameters, [element, Checked.IntType]))
+						_: False
+				_: False
+
+
+pure func test_reached_structured_repeat_specializes_exact_pair_and_runtime_element() -> Bool:
+	source: String =
+		|fixed record Pair[A, B] { first: A, second: B }
+		|pure func repeat_pair[A, B](value: Pair[A, B], count: Int) -> List[Pair[A, B]]:
+		|    builtin("list.repeat")
+		|func main() -> Int:
+		|    values = repeat_pair({ first = 7, second = "kept" }, 2)
+		|    0
+		|
+	match concrete(source):
+		Err(_): False
+		Ok(program):
+			facts = Concrete.specialized_contents(program)
+			functions = facts.functions.filter(pure func(function):
+				match function.signature.return_type:
+					Concrete.ListType(Concrete.RecordType(_)): True
+					_: False
+			)
+			match functions:
+				[repeat_pair]:
+					match repeat_pair.signature.parameters:
+						[Concrete.RecordType(id), Concrete.IntType]:
+							ordered_fields = match facts.records.get(Concrete.record_number(id)):
+								Some(layout):
+									match layout.fields:
+										[Concrete.IntType, Concrete.StringType]: True
+										_: False
+								None: False
+							accepted_result = Concrete.same_type(repeat_pair.signature.return_type, Concrete.ListType(Concrete.RecordType(id)))
+							accepted_operation = match repeat_pair.body:
+								Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+									match value.form:
+										Concrete.InvokeFunction(call, _):
+											match call.target:
+												Concrete.RuntimeFunction(Builtins.ListRepeat(element)): Concrete.same_type(element, Concrete.RecordType(id))
+												_: False
+										_: False
+								_: False
+							ordered_fields and accepted_result and accepted_operation
+						_: False
+				_: False
+
+
+private pure func mismatch(prefix: String, label: String, expected: ParsedRuntimeOperation, help: String) -> Bool:
+	source = prefix + label + ")\nfunc main() -> Int:\n    0\n"
+	rendered = match checked_source(source):
+		Err(error): error.message == "builtin declaration does not match its runtime contract" and error.help == help
+		Ok(_): False
+	match check_failure(source):
+		None: False
+		Some(error):
+			kind = match error.kind:
+				Errors.BuiltinRejection(Errors.BuiltinContractMismatch(actual)):
+					match expected:
+						ListRepeatBuiltin:
+							match actual:
+								ListRepeatBuiltin: True
+								_: False
+						ListLengthBuiltin:
+							match actual:
+								ListLengthBuiltin: True
+								_: False
+						_: False
+				_: False
+			(
+				kind and same_source(error.span.source, module_source(root_module_id()))
+				and IntOps.equals(error.span.start, prefix.length())
+				and IntOps.equals(error.span.end, IntOps.add(prefix.length(), label.length()))
+				and rendered
+			)
+
+
+pure func test_repeat_rejects_a_different_return_element_at_its_builtin_label() -> Bool:
+	mismatch(
+		"pure func repeat(value: Int, count: Int) -> List[String]:\n    builtin(",
+		"\"list.repeat\"",
+		ListRepeatBuiltin,
+		"declare a pure function with E and Int parameters returning List[E]",
+	)
+
+
+pure func test_length_rejects_a_non_list_parameter_at_its_builtin_label() -> Bool:
+	mismatch(
+		"pure func count(value: Int) -> Int:\n    builtin(",
+		"\"list.length\"",
+		ListLengthBuiltin,
+		"declare a pure function with one List[E] parameter returning Int",
+	)
+
+
+pure func test_lowering_evaluates_repeat_element_and_count_once_in_source_order() -> Bool:
+	match concrete(entry_source()).and_then(Lower.lower).and_then(selected_function):
+		Err(_): False
+		Ok(function):
+			match function.definitions:
+				[number, made, count, repeated, index, selected]:
+					literals = match number.operation:
+						Lower.IntegerValue(42):
+							match count.operation:
+								Lower.IntegerValue(2):
+									match index.operation:
+										Lower.IntegerValue(1): True
+										_: False
+								_: False
+						_: False
+					made_arguments = match made.operation:
+						Lower.CallValue(_, [value]): IntOps.equals(Lower.value_number(value), Lower.value_number(number.id))
+						_: False
+					repeated_arguments = match repeated.operation:
+						Lower.CallValue(call, [element, times]):
+							ordinary_call = match call.target:
+								Concrete.UserFunction(_): True
+								_: False
+							(ordinary_call and IntOps.equals(Lower.value_number(element), Lower.value_number(made.id))
+							and IntOps.equals(Lower.value_number(times), Lower.value_number(count.id)))
+						_: False
+					selected_arguments = match selected.operation:
+						Lower.CallValue(_, [values, offset]):
+							(IntOps.equals(Lower.value_number(values), Lower.value_number(repeated.id))
+							and IntOps.equals(Lower.value_number(offset), Lower.value_number(index.id)))
+						_: False
+					returned = match function.tail:
+						Lower.ExitValue(Lower.ReturnValue(value)): IntOps.equals(Lower.value_number(value), Lower.value_number(selected.id))
+						_: False
+					identities = function.definitions.map(pure func(definition): Lower.value_number(definition.id)) == [0, 1, 2, 3, 4, 5]
+					literals and made_arguments and repeated_arguments and selected_arguments and returned and identities
+				_: False
+
+
+pure func test_get_managed_element_produces_an_owned_inline_union() -> Bool:
+	match concrete(entry_source()):
+		Err(_): False
+		Ok(program):
+			facts = Concrete.specialized_contents(program)
+			match facts.unions:
+				[layout]:
+					fields = match layout.variants:
+						[[Concrete.RecordType(child)], []]:
+							match facts.records.get(Concrete.record_number(child)):
+								Some(entry):
+									match entry.fields:
+										[Concrete.IntType, Concrete.StringType]: True
+										_: False
+								None: False
+						_: False
+					owning = match layout.representation:
+						Concrete.InlineOwningPayload: True
+						Concrete.InlineUnmanaged: False
+					fields and owning
+				_: False
+
+
+private pure func runtime_repeat_element(function: Lower.LoweredFunction) -> Option[Concrete.TypeRef]:
+	match function.definitions:
+		[_, _, result]:
+			match result.operation:
+				Lower.CallValue(call, _):
+					match call.target:
+						Concrete.RuntimeFunction(Builtins.ListRepeat(element)): Some(element)
+						_: None
+				_: None
+		_: None
+
+
+pure func test_runtime_repeat_borrows_element_and_transfers_one_list_root() -> Bool:
+	match concrete(entry_source()).and_then(Lower.lower):
+		Err(_): False
+		Ok(program):
+			facts = Lower.lowered_functions(program)
+			match facts.functions.filter(pure func(function): runtime_repeat_element(function).is_some()):
+				[function]:
+					match Own.insert_function(function, facts.unions, facts.records):
+						Err(_): False
+						Ok(owned):
+							match owned.operations:
+								[Own.DefineValue(parameter), Own.DefineValue(_), Own.DefineValue(result)]:
+									borrowed = match parameter.result:
+										Own.BorrowedResult(Own.ParameterBorrow(source)): IntOps.equals(Lower.value_number(source), Lower.value_number(parameter.id))
+										_: False
+									element_matches = match runtime_repeat_element(function):
+										Some(element): Concrete.same_type(parameter.value_type, element)
+										None: False
+									transfer = match result.result:
+										Own.OwnedResult(owner):
+											match owned.tail:
+												Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, transferred))):
+													IntOps.equals(Lower.value_number(value), Lower.value_number(result.id)) and IntOps.equals(Own.owner_number(owner), Own.owner_number(transferred))
+												_: False
+										_: False
+									borrowed and element_matches and transfer
+								_: False
+				_: False
+
+
+private pure func runtime_get_element(function: Lower.LoweredFunction) -> Option[Concrete.TypeRef]:
+	match function.definitions:
+		[_, _, result]:
+			match result.operation:
+				Lower.CallValue(call, _):
+					match call.target:
+						Concrete.RuntimeFunction(Builtins.ListGet(element, _)): Some(element)
+						_: None
+				_: None
+		_: None
+
+
+pure func test_runtime_get_returns_an_owned_entry_union_without_extra_acquisition() -> Bool:
+	match concrete(entry_source()).and_then(Lower.lower):
+		Err(_): False
+		Ok(program):
+			facts = Lower.lowered_functions(program)
+			match facts.functions.filter(pure func(function): runtime_get_element(function).is_some()):
+				[function]:
+					match Own.insert_function(function, facts.unions, facts.records):
+						Err(_): False
+						Ok(owned):
+							match owned.operations:
+								[Own.DefineValue(parameter), Own.DefineValue(_), Own.DefineValue(result)]:
+									borrowed = match parameter.result:
+										Own.BorrowedResult(Own.ParameterBorrow(_)): True
+										_: False
+									owned_result = match result.result:
+										Own.OwnedResult(_): True
+										_: False
+									returned = match owned.tail:
+										Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, _))): IntOps.equals(Lower.value_number(value), Lower.value_number(result.id))
+										_: False
+									borrowed and owned_result and returned
+								_: False
+				_: False
+
+
+pure func test_runtime_get_numeric_and_void_results_have_no_ownership_obligation() -> Bool:
+	source: String =
+		|fixed union Maybe[T]:
+		|    Present(T)
+		|    Missing
+		|pure func repeat[T](element: T, count: Int) -> List[T]:
+		|    builtin("list.repeat")
+		|pure func get[T](values: List[T], index: Int) -> Maybe[T]:
+		|    builtin("list.get", Present, Missing)
+		|func main() -> Int:
+		|    number = get(repeat(0, 1), 0)
+		|    unit = get(repeat(void, 1), 0)
+		|    0
+		|
+	match concrete(source).and_then(Lower.lower):
+		Err(_): False
+		Ok(program):
+			facts = Lower.lowered_functions(program)
+			functions = facts.functions.filter(pure func(function): runtime_get_element(function).is_some())
+			var valid = IntOps.equals(functions.length(), 2)
+			for function in functions:
+				match Own.insert_function(function, facts.unions, facts.records):
+					Err(_): valid = False
+					Ok(owned):
+						result_unmanaged = match owned.operations:
+							[Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(result)]:
+								match result.result:
+									Own.UnmanagedResult: True
+									_: False
+							_: False
+						return_unmanaged = match owned.tail:
+							Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(_))): True
+							_: False
+						valid = result_unmanaged and return_unmanaged and valid
+			valid
+
+
+private pure func selected_owned(source: String) -> Result[Own.OwnedFunction, Diagnostic]:
+	program ?= concrete(source).and_then(Lower.lower)
+	function ?= selected_function(program)
+	facts = Lower.lowered_functions(program)
+	Own.insert_function(function, facts.unions, facts.records)
+
+
+pure func test_owned_get_result_survives_list_retirement_before_return_transfer() -> Bool:
+	match selected_owned(entry_source()):
+		Err(_): False
+		Ok(owned):
+			match owned.operations:
+				[Own.DefineValue(_), Own.DefineValue(made), Own.DefineValue(_), Own.DefineValue(repeated), Own.DropOwner(original, _), Own.DefineValue(_), Own.DefineValue(selected), Own.DropOwner(retired, _)]:
+					original_released = match made.result:
+						Own.OwnedResult(owner): IntOps.equals(Own.owner_number(owner), Own.owner_number(original))
+						_: False
+					list_released = match repeated.result:
+						Own.OwnedResult(owner): IntOps.equals(Own.owner_number(owner), Own.owner_number(retired))
+						_: False
+					result_transferred = match selected.result:
+						Own.OwnedResult(owner):
+							match owned.tail:
+								Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, transferred))):
+									IntOps.equals(Own.owner_number(owner), Own.owner_number(transferred)) and IntOps.equals(Lower.value_number(value), Lower.value_number(selected.id))
+								_: False
+						_: False
+					original_released and list_released and result_transferred
+				_: False
+
+
+pure func test_escaped_string_acquisition_precedes_option_and_entry_retirement() -> Bool:
+	source = ENTRY_DECLARATIONS.concat(
+		|pure func escape_text() -> String:
+		|    selected = selected()
+		|    match selected:
+		|        Present(entry): entry.text
+		|        Missing: "missing"
+		|func main() -> Int:
+		|    text = escape_text()
+		|    0
+		|
+	)
+	match selected_owned(source):
+		Err(_): False
+		Ok(owned):
+			parent: Option[Own.OwnerId] = match owned.operations:
+				[Own.DefineValue(selected)]:
+					match selected.result:
+						Own.OwnedResult(owner): Some(owner)
+						_: None
+				_: None
+			match owned.tail:
+				Own.MatchTail(matched):
+					match matched.arms:
+						[present, _]:
+							match present.operations:
+								[Own.DefineValue(_), Own.DefineValue(text), Own.AcquireOwner(acquired, borrow, _), Own.DropOwner(retired, _)]:
+									parent_retired = match parent:
+										Some(owner): IntOps.equals(Own.owner_number(owner), Own.owner_number(retired))
+										None: False
+									child_acquired = Concrete.same_type(text.value_type, Concrete.StringType) and IntOps.equals(Lower.value_number(borrow.value), Lower.value_number(text.id))
+									child_transferred = match present.exit:
+										Own.ReturnResult(Own.OwnedReturn(value, owner)):
+											IntOps.equals(Own.owner_number(owner), Own.owner_number(acquired)) and IntOps.equals(Lower.value_number(value), Lower.value_number(text.id))
+										_: False
+									parent_retired and child_acquired and child_transferred
+								_: False
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Generic List immutable phase facts",
+	tests = [
+		("repeat contract keeps structured E", test_repeat_contract_carries_the_same_structured_element_everywhere),
+		("length contract projects E once", test_length_contract_carries_element_only_in_its_list_parameter),
+		("concrete numeric builtin headers remain valid", test_concrete_list_builtin_header_still_accepts_numeric_elements),
+		("structured generic E keeps multiple rigid parameters", test_generic_structured_element_keeps_all_declared_type_parameters),
+		("reached structured E translates exact Pair instance", test_reached_structured_repeat_specializes_exact_pair_and_runtime_element),
+		("repeat mismatch has typed builtin error and exact span", test_repeat_rejects_a_different_return_element_at_its_builtin_label),
+		("length mismatch has typed builtin error and exact span", test_length_rejects_a_non_list_parameter_at_its_builtin_label),
+		("lowering evaluates nested element before count once", test_lowering_evaluates_repeat_element_and_count_once_in_source_order),
+		("managed get result publishes owning union layout", test_get_managed_element_produces_an_owned_inline_union),
+		("runtime repeat borrows E and owns one List root", test_runtime_repeat_borrows_element_and_transfers_one_list_root),
+		("managed get owns its result without a second acquisition", test_runtime_get_returns_an_owned_entry_union_without_extra_acquisition),
+		("numeric and Void get results are unmanaged", test_runtime_get_numeric_and_void_results_have_no_ownership_obligation),
+		("owned get escapes after List retirement", test_owned_get_result_survives_list_retirement_before_return_transfer),
+		("String acquisition precedes parent retirement", test_escaped_string_acquisition_precedes_option_and_entry_retirement),
+	]
+}

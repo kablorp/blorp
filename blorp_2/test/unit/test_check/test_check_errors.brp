@@ -1,0 +1,1099 @@
+import:
+	../../../src/utils/declarations as Declaration
+	../../../src/utils/source: module_id, module_source, root_module_id
+	../../../src/check/check: check, checked_functions, declaration_id, union_declaration_id
+	../../../src/check/check_errors as Errors
+	../../../src/check/check_model as Checked
+	../../../src/check/check_render as Renderer
+	../../../src/lex/lex: lex
+	../../../src/main: render_diagnostics
+	../../../src/utils/names: NameId
+	../../../src/parse/assemble: ParsedProgram, parsed_contents
+	../../../src/utils/syntax: CallNotation(DirectCall, ReceiverCall), Diagnostic, Span, same_span
+	../compilation: diagnostic_sources
+	../input: check_failure, parse, singleton_check_error, check_modules_failure
+	../module_input: PRIMITIVE_BASE, INTEGER_OPERATIONS, STRING_OPERATIONS
+	test: TestSuite
+
+
+private INT_IMPORT: String = "import:\n\tint: to_string\n"
+
+
+private pure func parsed(source: String) -> Result[ParsedProgram, Diagnostic]:
+	lex(module_source(root_module_id()), source).and_then(pure func(tokens): parse(tokens))
+
+
+private pure func span(start: Int, end: Int) -> Span:
+	{
+		source = module_source(root_module_id()),
+		start = start,
+		end = end
+	}
+
+
+pure func test_second_ufcs_argument_has_complete_obligation() -> Bool:
+	prefix = INT_IMPORT + "pure func first(left: Int, right: Int) -> Int:\n\tleft\nfunc main() -> Int:\n\t7.first("
+	argument = "8.to_string()"
+
+	match check_modules_failure([
+		{ source = prefix + argument + ")\n", targets = [1] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+	], PRIMITIVE_BASE):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+					match mismatch.expected_site:
+						Errors.SourceAnnotation(annotation):
+							(
+								same_span(error.span, span(
+									prefix.length(),
+									prefix.length() + argument.length(),
+								))
+								and same_span(mismatch.actual.span, error.span)
+								and mismatch.argument_position == 1
+								and Checked.same_type(mismatch.expected, Checked.IntType)
+								and Checked.same_type(mismatch.actual.value_type, Checked.StringType)
+								and same_span(annotation, span(INT_IMPORT.length() + 34, INT_IMPORT.length() + 37))
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_unary_primary_span_is_distinct_from_actual_occurrence() -> Bool:
+	prefix = INT_IMPORT + "pure func first(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\t"
+
+	match check_modules_failure([
+		{ source = prefix + "first(8.to_string())\n", targets = [1] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+	], PRIMITIVE_BASE):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+					(
+						same_span(error.span, span(prefix.length(), prefix.length() + 5))
+						and same_span(mismatch.actual.span, span(prefix.length() + 6, prefix.length() + 19))
+						and mismatch.argument_position == 0
+						and Checked.same_type(mismatch.expected, Checked.IntType)
+						and Checked.same_type(mismatch.actual.value_type, Checked.StringType)
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_builtin_wrapper_expected_site_keeps_source_annotation() -> Bool:
+	prefix = "import:\n\tstring: length\nfunc main() -> Int:\n\t7."
+
+	match check_modules_failure([
+		{ source = prefix + "length()\n", targets = [1] },
+		{ source = STRING_OPERATIONS, targets = [] },
+	], PRIMITIVE_BASE):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+					match mismatch.expected_site:
+						Errors.SourceAnnotation(annotation):
+							(
+								same_span(error.span, span(prefix.length(), prefix.length() + 6))
+								and same_span(mismatch.actual.span, error.span)
+								and Checked.same_type(mismatch.expected, Checked.StringType)
+								and Checked.same_type(mismatch.actual.value_type, Checked.IntType)
+								and same_span(annotation, {
+									source = module_source(module_id(1).get_or(root_module_id())),
+									start = 24,
+									end = 30
+								})
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_return_mismatch_preserves_annotation_and_actual() -> Bool:
+	prefix = INT_IMPORT + "pure func bad() -> Int:\n\t"
+
+	match check_modules_failure([
+		{ source = prefix + "8.to_string()\nfunc main() -> Int:\n\t0\n", targets = [1] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+	], PRIMITIVE_BASE):
+		Some(error):
+			match error.kind:
+				Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
+					match mismatch.expected_site:
+						Errors.SourceAnnotation(annotation):
+							(
+								same_span(error.span, span(prefix.length(), prefix.length() + 13))
+								and same_span(mismatch.actual.span, error.span)
+								and same_span(annotation, span(INT_IMPORT.length() + 19, INT_IMPORT.length() + 22))
+								and Checked.same_type(mismatch.expected, Checked.IntType)
+								and Checked.same_type(mismatch.actual.value_type, Checked.StringType)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_nominal_union_mismatch_keeps_both_owners() -> Bool:
+	prefix =
+		|fixed union Left:
+		|	Same
+		|fixed union Right:
+		|	Same
+		|pure func right() -> Right:
+		|	Same
+		|pure func use(value: Left) -> Int:
+		|	0
+		|func main() -> Int:
+		|	use(
+
+	match check_failure(prefix + "right())\n"):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+					match (mismatch.expected, mismatch.actual.value_type):
+						(Checked.UnionType(expected), Checked.UnionType(actual)):
+							(
+								Declaration.union_number(expected) == 0
+								and Declaration.union_number(actual) == 1
+								and same_span(mismatch.actual.span, span(
+									prefix.length(),
+									prefix.length() + 7,
+								))
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private BOX_DECLARATIONS: String =
+	|fixed union P[T]:
+	|	P(T)
+	|pure func box[T](value: T) -> P[T]:
+	|	P(value)
+	|pure func first[T](a: P[T], b: P[T], c: P[T]) -> P[T]:
+	|	a
+	|func main() -> Int:
+
+private BOX: String = BOX_DECLARATIONS + "\n\t"
+
+
+pure func test_structural_conflict_retains_earliest_inference_and_outer_types() -> Bool:
+	prefix = INT_IMPORT + BOX + "first("
+	previous = "box(7)"
+	middle = ", box(8), "
+	current = "box(9.to_string())"
+
+	match check_modules_failure([
+		{ source = prefix + previous + middle + current + ")\n", targets = [1] },
+		{ source = INTEGER_OPERATIONS, targets = [] },
+	], PRIMITIVE_BASE):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
+					match (
+						conflict.mismatch.expected,
+						conflict.mismatch.actual.value_type,
+						conflict.mismatch.expected_site,
+						Checked.parameter_owner(conflict.parameter),
+					):
+						(Checked.AppliedUnionType(expected_owner, [Checked.IntType]), Checked.AppliedUnionType(actual_owner, [Checked.StringType]), Errors.SourceAnnotation(annotation), Checked.FunctionDeclaration(function)):
+							start = prefix.length() + previous.length() + middle.length()
+							(
+								Declaration.union_number(expected_owner) == 0
+								and Declaration.union_number(actual_owner) == 0
+								and Declaration.function_number(function) == 1
+								and conflict.mismatch.argument_position == 2
+								and same_span(conflict.previous.span, span(
+									prefix.length(),
+									prefix.length() + previous.length(),
+								))
+								and same_span(conflict.current.span, span(start, start + current.length()))
+								and same_span(conflict.mismatch.actual.span, conflict.current.span)
+								and same_span(error.span, conflict.current.span)
+								and Checked.same_type(conflict.previous.value_type, Checked.IntType)
+								and Checked.same_type(conflict.current.value_type, Checked.StringType)
+								and same_span(annotation, span(INT_IMPORT.length() + 110, INT_IMPORT.length() + 114))
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_uninferable_parameter_keeps_function_owner() -> Bool:
+	source: String =
+		|pure func before[T](value: T) -> T:
+		|	value
+		|pure func absent[T](value: Int) -> Int:
+		|	value
+		|func main() -> Int:
+		|	absent(7)
+		|
+
+	match check_failure(source):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.UninferableTypeParameter(parameter)):
+					match Checked.parameter_owner(parameter):
+						Checked.FunctionDeclaration(function):
+							Declaration.function_number(function) == 1
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_missing_variants_keep_order_and_nominal_owner() -> Bool:
+	body: String =
+		|match value:
+		|		Same: 0
+		|func main() -> Int:
+		|	0
+		|
+	prefix_source: String =
+		|fixed union Earlier:
+		|	Same
+		|	Other
+		|fixed union Later:
+		|	Same
+		|	Other
+		|	Last
+		|pure func inspect(value: Later) -> Int:
+	prefix = prefix_source + "\n\t"
+
+	match check_failure(prefix + body):
+		Some(error):
+			match error.kind:
+				Errors.MatchRejection(Errors.NonExhaustiveMatch([other, last])):
+					(
+						same_span(error.span, span(prefix.length(), prefix.length() + 5))
+						and Declaration.union_number(Declaration.variant_owner(other)) == 1
+						and Declaration.variant_number(other) == 1
+						and Declaration.union_number(Declaration.variant_owner(last)) == 1
+						and Declaration.variant_number(last) == 2
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_duplicate_parameter_retains_first_and_second_occurrences() -> Bool:
+	prefix = "pure func duplicate(value: Int, "
+
+	match check_failure(prefix + "value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\t0\n"):
+		Some(error):
+			match error.kind:
+				Errors.SignatureRejection(Errors.DuplicateParameter(_, previous)):
+					(
+						same_span(error.span, span(prefix.length(), prefix.length() + 5))
+						and same_span(previous, span(20, 25))
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_immutable_capture_keeps_exact_function_binding_and_declaration() -> Bool:
+	prefix_source: String =
+		|fixed union P:
+		|	P(Int)
+		|pure func before(value: Int) -> Int:
+		|	value
+		|pure func after(value: P) -> Int:
+		|	match value:
+		|		P(value):
+	prefix = prefix_source + "\n\t\t\t"
+
+	match check_failure(prefix + "value = 8\n\t\t\tvalue\nfunc main() -> Int:\n\t0\n"):
+		Some(error):
+			match error.kind:
+				Errors.StatementRejection(Errors.ImmutableAssignment(binding)):
+					(
+						same_span(error.span, span(prefix.length(), prefix.length() + 5))
+						and Declaration.function_number(binding.function) == 1
+						and Checked.binding_number(binding.binding) == 1
+						and same_span(binding.span, span(119, 124))
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_renderer_argument_uses_independent_expected_type() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	0
+		|
+
+	match parsed(source):
+		Err(_):
+			False
+		Ok(program):
+			error: Errors.CheckError = {
+				span = span(2, 4),
+				kind = Errors.CallRejection(Errors.ArgumentTypeMismatch({
+					expected = Checked.IntType,
+					actual = {
+						value_type = Checked.StringType,
+						span = span(8, 12)
+					},
+					argument_position = 1,
+					expected_site = Errors.SourceAnnotation(span(20, 23)),
+				}))
+			}
+			diagnostic = Renderer.render_check_error(program, error)
+
+			no_note = match diagnostic.note:
+				None:
+					True
+				_:
+					False
+
+			(
+				same_span(diagnostic.span, error.span)
+				and no_note
+				and diagnostic.message == "argument type does not match the parameter type"
+				and diagnostic.help == "use an expression of type Int here"
+			)
+
+
+pure func test_renderer_structural_conflict_uses_outer_obligation() -> Bool:
+	source: String =
+		|fixed union P[T]:
+		|	P(T)
+		|pure func first[T](value: T) -> T:
+		|	value
+		|func main() -> Int:
+		|	0
+		|
+
+	match parsed(source):
+		Err(_):
+			False
+		Ok(program):
+			match check(program):
+				Err(_):
+					False
+				Ok(checked):
+					match (
+						union_declaration_id(checked, 0),
+						checked_functions(checked).functions,
+					):
+						(Some(owner), [function, _]):
+							match function.signature.type_parameters:
+								[parameter]:
+									error: Errors.CheckError = {
+										span = span(5, 9),
+										kind = Errors.CallRejection(Errors.GenericArgumentConflict({
+											parameter = parameter,
+											previous = {
+												value_type = Checked.IntType,
+												span = span(1, 4)
+											},
+											current = {
+												value_type = Checked.StringType,
+												span = span(5, 9)
+											},
+											mismatch = {
+												expected = Checked.AppliedUnionType(
+													owner,
+													[Checked.IntType],
+												),
+												actual = {
+													value_type = Checked.AppliedUnionType(
+														owner,
+														[Checked.StringType],
+													),
+													span = span(5, 9)
+												},
+												argument_position = 2,
+												expected_site = Errors.SourceAnnotation(
+													span(
+														30,
+														34,
+													),
+												)
+											},
+										}))
+									}
+									diagnostic = Renderer.render_check_error(program, error)
+									(
+										same_span(diagnostic.span, error.span)
+										and diagnostic.message == "argument type does not match the parameter type"
+										and diagnostic.help == "use an expression of type P[Int] here"
+									)
+								_:
+									False
+						_:
+							False
+
+
+pure func test_error_collection_retains_all_rendered_errors_and_rejects_singleton_projection(
+
+) -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	0
+		|
+	diagnostic_source: String =
+		|func main() -> Int:
+		|	0
+		|
+
+	match parsed(source):
+		Err(_):
+			False
+		Ok(program):
+			first: Errors.CheckError = {
+				span = span(0, 4),
+				kind = Errors.SignatureRejection(Errors.MissingMain)
+			}
+			second: Errors.CheckError = {
+				span = span(21, 22),
+				kind = Errors.RecursionRejection(Errors.GrowingRecursiveInstantiation)
+			}
+			errors: Errors.CheckErrors = {
+				first = first,
+				remaining = [second]
+			}
+			rendered = Renderer.render_check_errors(program, errors)
+
+			match (singleton_check_error(errors), rendered.remaining):
+				(None, [tail]):
+					(
+						same_span(rendered.first.span, first.span)
+						and same_span(tail.span, second.span)
+						and render_diagnostics(
+							diagnostic_sources("input.brp", diagnostic_source),
+							rendered,
+						) == "input.brp:1:1: error: expected a main function\nhelp: declare func main() -> Int: as the entrypoint\ninput.brp:2:2: error: recursive calls grow type arguments without bound\nhelp: pass recursive type arguments unchanged, permute them, or reset them to concrete types"
+					)
+				_:
+					False
+
+
+private fixed record RendererFacts {
+	program: ParsedProgram,
+	name: NameId,
+	function: Declaration.FunctionId,
+	parameter: Checked.TypeParameterId,
+	choice: Declaration.UnionId,
+	value: Declaration.UnionId,
+	generic_union: Declaration.UnionId,
+	number: Declaration.VariantId,
+	binding: Errors.BindingSite
+}
+
+
+-- Accepted setup supplies owner-qualified IDs; wording never invokes rejection checking.
+private pure func renderer_facts() -> Option[RendererFacts]:
+	source: String =
+		|fixed union Choice:
+		|	Empty
+		|	Number(Int)
+		|fixed union Value:
+		|	Vacant
+		|fixed union P[T]:
+		|	Payload(T)
+		|pure func zero() -> Int:
+		|	0
+		|pure func generic[T](value: T) -> T:
+		|	value
+		|pure func number() -> Choice:
+		|	Number(7)
+		|func main() -> Int:
+		|	0
+		|
+
+	match parsed(source):
+		Err(_):
+			None
+		Ok(program):
+			match check(program):
+				Err(_):
+					None
+				Ok(checked):
+					zero ?= Declaration.inventory_functions(parsed_contents(program).declarations).get(0).map(pure func(row): row.declaration)
+					generic ?= checked_functions(checked).functions.get(1)
+					number ?= checked_functions(checked).functions.get(2)
+					function ?= declaration_id(checked, 1)
+					choice ?= union_declaration_id(checked, 0)
+					value ?= union_declaration_id(checked, 1)
+					generic_union ?= union_declaration_id(checked, 2)
+
+					parameter ?= match generic.signature.type_parameters:
+						[id]:
+							Some(id)
+						_:
+							None
+
+					binding ?= match generic.body:
+						Checked.CheckedValueBody(Checked.ReturnExpression(body)):
+							match body.form:
+								Checked.ReadBinding(id):
+									Some(id)
+								_:
+									None
+						_:
+							None
+
+					variant ?= match number.body:
+						Checked.CheckedValueBody(Checked.ReturnExpression(body)):
+							match body.form:
+								Checked.ConstructVariant(id, [_]):
+									Some(id)
+								_:
+									None
+						_:
+							None
+
+					Some({
+						program = program,
+						name = zero.function_name.id,
+						function = function,
+						parameter = parameter,
+						choice = choice,
+						value = value,
+						generic_union = generic_union,
+						number = variant,
+						binding = {
+							function = function,
+							binding = binding,
+							name = zero.function_name.id,
+							span = span(10, 15)
+						},
+					})
+
+
+private fixed record RenderingCase {
+	kind: Errors.CheckErrorKind,
+	message: String,
+	help: String
+}
+
+
+pure func test_prior_checker_diagnostics_keep_exact_wording() -> Bool:
+	match renderer_facts():
+		None:
+			False
+		Some(facts):
+			cases: List[RenderingCase] = [
+
+				{
+					kind = Errors.MethodRejection(Errors.ConstructorUFCS(facts.name)),
+					message = "constructors do not support UFCS in this increment",
+					help = "write the constructor directly, such as Number(value)"
+				},
+				{
+					kind = Errors.ConstructorRejection(Errors.ConstructorFieldCountMismatch(facts.number, 1, 2)),
+					message = "constructor field count does not match its declaration",
+					help = "expected 1 fields, got 2; pass one expression per declared field"
+				},
+				{
+					kind = Errors.ConstructorRejection(Errors.ConstructorFieldCountMismatch(facts.number, 1, 0)),
+					message = "constructor field count does not match its declaration",
+					help = "expected 1 fields, got 0; pass one expression per declared field"
+				},
+				{
+					kind = Errors.CallRejection(Errors.UncallableBinding(
+						facts.binding,
+						Checked.BodyLocal,
+						Checked.IntType,
+					)),
+					message = "local bindings cannot be called",
+					help = "use the binding as a value, or rename it to call the function"
+				},
+				{
+					kind = Errors.CallRejection(Errors.UnknownFunction(facts.name)),
+					message = "unknown function",
+					help = "declare the function locally or import it by name; type selections enable receiver calls only"
+				},
+				{
+					kind = Errors.ValueRejection(Errors.UnknownValue(facts.name)),
+					message = "unknown value",
+					help = "use this function's parameter name, a declared variant, or a call"
+				},
+				{
+					kind = Errors.RecursionRejection(Errors.GrowingRecursiveInstantiation),
+					message = "recursive calls grow type arguments without bound",
+					help = (
+						"pass recursive type arguments unchanged, permute them, or reset them to "
+						+ "concrete types"
+					)
+				},
+				{
+					kind = Errors.CallRejection(Errors.ImpureCall(facts.function, facts.function)),
+					message = "pure functions cannot call impure functions",
+					help = "mark the callee pure or remove pure from the caller"
+				},
+				{
+					kind = Errors.CallRejection(Errors.ArgumentCountMismatch({
+						callee = facts.name,
+						expected = 0,
+						actual = 9,
+						notation = ReceiverCall,
+						function = facts.function,
+					})),
+					message = "function takes no arguments",
+					help = "call zero() directly, or choose a function with one parameter"
+				},
+				{
+					kind = Errors.CallRejection(Errors.UncallableBinding(
+						facts.binding,
+						Checked.ParameterBinding(0),
+						Checked.IntType,
+					)),
+					message = "Int parameters cannot be called",
+					help = "use the parameter as a value, or rename it to call the function"
+				},
+				{
+					kind = Errors.CallRejection(Errors.ArgumentCountMismatch({
+						callee = facts.name,
+						expected = 0,
+						actual = 9,
+						notation = DirectCall,
+						function = facts.function,
+					})),
+					message = "function takes no arguments",
+					help = "remove the argument and call the function with ()"
+				},
+				{
+					kind = Errors.CallRejection(Errors.ArgumentCountMismatch({
+						callee = facts.name,
+						expected = 1,
+						actual = 9,
+						notation = DirectCall,
+						function = facts.function,
+					})),
+					message = "function requires one argument",
+					help = "pass one expression of the declared parameter type"
+				},
+				{
+					kind = Errors.SignatureRejection(Errors.MainParameterType),
+					message = "main parameter must have type List[String]",
+					help = "declare main() -> Int: or main(arguments: List[String]) -> Int:"
+				},
+				{
+					kind = Errors.TypeTermRejection(Errors.UnknownType(facts.name)),
+					message = "unknown type",
+					help = "declare or import this type; builtin types and declared type parameters are also available"
+				},
+				{
+					kind = Errors.SignatureRejection(Errors.DuplicateFunction(
+						facts.name,
+						span(1, 3),
+					)),
+					message = "duplicate function name",
+					help = "give every function a distinct name"
+				},
+				{
+					kind = Errors.SignatureRejection(Errors.MissingMain),
+					message = "expected a main function",
+					help = "declare func main() -> Int: as the entrypoint"
+				},
+				{
+					kind = Errors.CallRejection(Errors.ArgumentCountMismatch({
+						callee = facts.name,
+						expected = 2,
+						actual = 9,
+						notation = DirectCall,
+						function = facts.function,
+					})),
+					message = "argument count does not match the function parameters",
+					help = (
+						"pass one expression for each declared parameter; UFCS supplies the receiver "
+						+ "first"
+					)
+				},
+				{
+					kind = Errors.SignatureRejection(Errors.DuplicateParameter(
+						facts.name,
+						span(1, 3),
+					)),
+					message = "duplicate parameter name",
+					help = "give each parameter a distinct name"
+				},
+				{
+					kind = Errors.CallRejection(Errors.UninferableTypeParameter(facts.parameter)),
+					message = "cannot infer the type parameter from the argument",
+					help = (
+						"pass a value whose type determines the declared type parameter; use a concrete "
+						+ "helper when no argument can determine it"
+					)
+				},
+				{
+					kind = Errors.CallRejection(Errors.ArgumentTypeMismatch({
+						expected = Checked.IntType,
+						actual = {
+							value_type = Checked.StringType,
+							span = span(10, 13)
+						},
+						expected_site = Errors.SourceAnnotation(span(20, 23)),
+						argument_position = 1,
+					})),
+					message = "argument type does not match the parameter type",
+					help = "use an expression of type Int here"
+				},
+				{
+					kind = Errors.ConstructorRejection(Errors.ConstructorNeedsExpectedType(facts.name)),
+					message = "constructor needs an expected union type",
+					help = "pass an already-typed union value or call a concrete helper returning the union"
+				},
+				{
+					kind = Errors.CallRejection(Errors.UncallableBinding(
+						facts.binding,
+						Checked.ParameterBinding(0),
+						Checked.StringType,
+					)),
+					message = "parameters cannot be called",
+					help = "use the parameter as a value, or rename it to call the function"
+				},
+				{
+					kind = Errors.CallRejection(Errors.UninferableTypeParameter(facts.parameter)),
+					message = "cannot infer the type parameter from the argument",
+					help = (
+						"pass a value whose type determines the declared type parameter; use a concrete "
+						+ "helper when no argument can determine it"
+					)
+				},
+				{
+					kind = Errors.TypeDeclarationRejection(Errors.TypeParameterTypeNameConflict(facts.name)),
+					message = "type parameter conflicts with a type name",
+					help = "choose a distinct type parameter name, such as T"
+				},
+				{
+					kind = Errors.SignatureRejection(Errors.GenericMain(facts.parameter)),
+					message = "main cannot be generic",
+					help = "declare main() -> Int: without type parameters"
+				},
+				{
+					kind = Errors.CallRejection(Errors.ArgumentTypeMismatch({
+						expected = Checked.StringType,
+						actual = {
+							value_type = Checked.StringType,
+							span = span(10, 13)
+						},
+						expected_site = Errors.SourceAnnotation(span(20, 23)),
+						argument_position = 1,
+					})),
+					message = "argument type does not match the parameter type",
+					help = "use an expression of type String here"
+				},
+				{
+					kind = Errors.ValueRejection(Errors.ExpressionTypeMismatch({
+						expected = Checked.ParameterType(facts.parameter),
+						actual = {
+							value_type = Checked.StringType,
+							span = span(10, 13)
+						},
+						expected_site = Errors.SourceAnnotation(span(20, 23)),
+					})),
+					message = "expression does not match the expected type",
+					help = "use a value already typed as this declaration's type parameter"
+				},
+				{
+					kind = Errors.TypeTermRejection(Errors.NonApplicableType(facts.name)),
+					message = "type does not accept a type argument",
+					help = "apply a declared generic union or record, such as Box[Int]"
+				},
+				{
+					kind = Errors.TypeTermRejection(Errors.OrdinaryUnionApplied(facts.choice)),
+					message = "ordinary union does not accept a type argument",
+					help = "remove the type argument from this union type"
+				},
+				{
+					kind = Errors.TypeTermRejection(Errors.MissingUnionTypeArguments(facts.generic_union, 1)),
+					message = "generic union requires one type argument",
+					help = "write a concrete or symbolic application, such as Box[Int] or Box[T]"
+				},
+				{
+					kind = Errors.ValueRejection(Errors.ExpressionTypeMismatch({
+						expected = Checked.AppliedUnionType(
+							facts.generic_union,
+							[Checked.StringType],
+						),
+						actual = {
+							value_type = Checked.StringType,
+							span = span(10, 13)
+						},
+						expected_site = Errors.SourceAnnotation(span(20, 23)),
+					})),
+					message = "expression does not match the expected type",
+					help = "use an expression of type P[String] here"
+				},
+				{
+					kind = Errors.MatchRejection(Errors.PatternFieldCountMismatch(facts.number, 1, 0)),
+					message = "constructor pattern field count does not match its declaration",
+					help = "expected 1 fields, got 0; write one name or '_' per declared field"
+				},
+				{
+					kind = Errors.ConstructorRejection(Errors.ConstructorFieldCountMismatch(facts.number, 1, 0)),
+					message = "constructor field count does not match its declaration",
+					help = "expected 1 fields, got 0; pass one expression per declared field"
+				},
+				{
+					kind = Errors.ValueRejection(Errors.ExpressionTypeMismatch({
+						expected = Checked.IntType,
+						actual = {
+							value_type = Checked.StringType,
+							span = span(10, 13)
+						},
+						expected_site = Errors.SourceAnnotation(span(20, 23)),
+					})),
+					message = "expression does not match the expected type",
+					help = "use an expression of type Int here"
+				},
+				{
+					kind = Errors.CallRejection(Errors.ArgumentTypeMismatch({
+						expected = Checked.ParameterType(facts.parameter),
+						actual = {
+							value_type = Checked.StringType,
+							span = span(10, 13)
+						},
+						expected_site = Errors.SourceAnnotation(span(20, 23)),
+						argument_position = 1,
+					})),
+					message = "argument type does not match the parameter type",
+					help = "use a value already typed as this declaration's type parameter"
+				},
+				{
+					kind = Errors.TypeDeclarationRejection(Errors.VariantFunctionConflict(
+						facts.name,
+						span(1, 3),
+						span(5, 9),
+					)),
+					message = "variant name conflicts with a function",
+					help = "give functions and union variants distinct names"
+				},
+				{
+					kind = Errors.TypeDeclarationRejection(Errors.DuplicateVariant(
+						facts.name,
+						span(1, 3),
+					)),
+					message = "duplicate variant name",
+					help = "give each variant in a union a distinct name"
+				},
+				{
+					kind = Errors.TypeDeclarationRejection(Errors.DuplicateUnion(
+						facts.name,
+						Errors.SourceTypeDeclaration(span(1, 3)),
+					)),
+					message = "duplicate union type name",
+					help = "give union types distinct names; foundational types are declared by the base module"
+				},
+				{
+					kind = Errors.SignatureRejection(Errors.MainReturnType(Checked.StringType)),
+					message = "main must return Int or Void",
+					help = "return an Int exit status, or omit the return type for exit status 0"
+				},
+				{
+					kind = Errors.CallRejection(Errors.ArgumentTypeMismatch({
+						expected = Checked.UnionType(facts.choice),
+						actual = {
+							value_type = Checked.StringType,
+							span = span(10, 13)
+						},
+						expected_site = Errors.SourceAnnotation(span(20, 23)),
+						argument_position = 1,
+					})),
+					message = "argument type does not match the parameter type",
+					help = "use an expression of type Choice here"
+				},
+				{
+					kind = Errors.ConstructorRejection(Errors.VariantNotInExpectedType(
+						facts.name,
+						Checked.UnionType(facts.choice),
+					)),
+					message = "variant does not belong to the expected type",
+					help = "use an expression of type Choice here"
+				},
+				{
+					kind = Errors.ConstructorRejection(Errors.VariantNotInExpectedType(facts.name, Checked.IntType)),
+					message = "variant does not belong to the expected type",
+					help = "use an expression of type Int here"
+				},
+				{
+					kind = Errors.ConstructorRejection(Errors.PayloadFreeVariantCalled(facts.number)),
+					message = "payload-free variants cannot be called",
+					help = "use the bare variant name without parentheses"
+				},
+				{
+					kind = Errors.ValueRejection(Errors.ExpressionTypeMismatch({
+						expected = Checked.UnionType(facts.choice),
+						actual = {
+							value_type = Checked.StringType,
+							span = span(10, 13)
+						},
+						expected_site = Errors.SourceAnnotation(span(20, 23)),
+					})),
+					message = "expression does not match the expected type",
+					help = "use an expression of type Choice here"
+				},
+				{
+					kind = Errors.MatchRejection(Errors.NonExhaustiveMatch([facts.number])),
+					message = "non-exhaustive match",
+					help = "add an arm for the missing variant: Number(_)"
+				},
+				{
+					kind = Errors.MatchRejection(Errors.UnreachableArm),
+					message = "match arm is unreachable",
+					help = "remove this arm; earlier arms already cover all values it could match"
+				},
+				{
+					kind = Errors.MatchRejection(Errors.UnknownConstructorPattern(
+						facts.name,
+						Checked.UnionType(facts.choice),
+					)),
+					message = "unknown constructor pattern",
+					help = "use an unshadowed variant of the matched union; rename a shadowing local binding"
+				},
+				{
+					kind = Errors.MatchRejection(Errors.PatternFieldCountMismatch(facts.number, 0, 1)),
+					message = "constructor pattern field count does not match its declaration",
+					help = "expected 0 fields, got 1; write one name or '_' per declared field"
+				},
+				{
+					kind = Errors.MatchRejection(Errors.PatternFieldCountMismatch(facts.number, 1, 0)),
+					message = "constructor pattern field count does not match its declaration",
+					help = "expected 1 fields, got 0; write one name or '_' per declared field"
+				},
+				{
+					kind = Errors.MatchRejection(Errors.MatchRequiresUnion(Checked.IntType)),
+					message = "match requires a union value",
+					help = "match a typed union parameter or a call returning a declared union"
+				},
+				{
+					kind = Errors.CallRejection(Errors.UncallableBinding(
+						facts.binding,
+						Checked.MatchCapture,
+						Checked.StringType,
+					)),
+					message = "match bindings cannot be called",
+					help = "use the binding as a value, or rename it to call the function"
+				},
+				{
+					kind = Errors.StatementRejection(Errors.DuplicateLocal(facts.binding)),
+					message = "duplicate local binding",
+					help = (
+						"give each body-local declaration a distinct name; omit var to reassign a "
+						+ "mutable binding"
+					)
+				},
+				{
+					kind = Errors.StatementRejection(Errors.ImmutableAssignment(facts.binding)),
+					message = "cannot assign to an immutable binding",
+					help = "declare the binding with var to allow reassignment"
+				},
+				{
+					kind = Errors.ValueRejection(Errors.ExpressionTypeMismatch({
+						expected = Checked.UnionType(facts.value),
+						actual = {
+							value_type = Checked.StringType,
+							span = span(10, 13)
+						},
+						expected_site = Errors.SourceAnnotation(span(20, 23)),
+					})),
+					message = "expression does not match the expected type",
+					help = "use an expression of type Value here"
+				},
+			]
+			var correct = True
+
+			for expected in cases:
+				diagnostic = Renderer.render_check_error(
+					facts.program,
+					{
+						span = span(2, 5),
+						kind = expected.kind
+					},
+				)
+
+				match diagnostic.note:
+					None:
+						void
+					_:
+						correct = False
+
+				correct = (
+					correct
+					and same_span(diagnostic.span, span(2, 5))
+					and diagnostic.message == expected.message
+					and diagnostic.help == expected.help
+				)
+
+			correct
+
+
+tests: TestSuite = {
+	description = "Blorp 2 typed checker failures",
+	tests = [
+		("prior checker wording remains exact", test_prior_checker_diagnostics_keep_exact_wording),
+		(
+			"second UFCS argument has complete obligation",
+			test_second_ufcs_argument_has_complete_obligation,
+		),
+		(
+			"unary primary span differs from actual occurrence",
+			test_unary_primary_span_is_distinct_from_actual_occurrence,
+		),
+		("builtin wrapper expected site keeps source annotation", test_builtin_wrapper_expected_site_keeps_source_annotation),
+		(
+			"return mismatch preserves annotation and actual",
+			test_return_mismatch_preserves_annotation_and_actual,
+		),
+		("nominal union mismatch keeps both owners", test_nominal_union_mismatch_keeps_both_owners),
+		(
+			"structural conflict retains earliest inference and outer types",
+			test_structural_conflict_retains_earliest_inference_and_outer_types,
+		),
+		(
+			"uninferable parameter keeps function owner",
+			test_uninferable_parameter_keeps_function_owner,
+		),
+		(
+			"missing variants keep order and nominal owner",
+			test_missing_variants_keep_order_and_nominal_owner,
+		),
+		(
+			"duplicate parameter retains both occurrences",
+			test_duplicate_parameter_retains_first_and_second_occurrences,
+		),
+		(
+			"immutable capture keeps exact binding",
+			test_immutable_capture_keeps_exact_function_binding_and_declaration,
+		),
+		(
+			"argument renderer uses independent expected type",
+			test_renderer_argument_uses_independent_expected_type,
+		),
+		(
+			"structural conflict renderer uses outer obligation",
+			test_renderer_structural_conflict_uses_outer_obligation,
+		),
+		(
+			"error collection retains all errors",
+			test_error_collection_retains_all_rendered_errors_and_rejects_singleton_projection,
+		),
+	]
+}

@@ -1,0 +1,779 @@
+import:
+	../../../src/check/check_model as Model
+	../../../src/check/check_errors as Errors
+	../../../src/check/check as API
+	../../../src/check/check_render: render_failure
+	../../../src/utils/declarations as Declaration
+	../../../src/lex/lex: lex
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/source: module_id, module_source, root_module_id, same_source
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, TypeSyntax(AtomicType, AppliedType), type_span
+	../../../src/verify/verify: verify
+	../input: check_failure, parse, setup_diagnostic
+	../module_input: PRIMITIVE_BASE, parse_modules_with_base
+	test: TestSuite
+
+
+private MAIN: String =
+	|func main() -> Int:
+	|    0
+	|
+
+private ENVELOPE: String =
+	|fixed union Envelope:
+	|    Empty
+	|    Item(
+
+private BOX: String =
+	|fixed record Box[T] { value: T }
+	|
+
+
+private pure func checked(source: String) -> Result[API.CheckedProgram, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source)
+	parsed ?= parse(tokens)
+	API.check(parsed).map_err(setup_diagnostic)
+
+
+private pure func specialized(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	program ?= checked(source)
+	concrete ?= Concrete.specialize(program)
+	Ok(Concrete.specialized_contents(concrete))
+
+
+private pure func exact_error(
+	prefix: String,
+	annotation: String,
+	suffix: String,
+	message: String,
+	help: String,
+	matches: pure (Errors.CheckErrorKind) -> Bool,
+) -> Bool:
+	match lex(module_source(root_module_id()), prefix + annotation + suffix).and_then(parse):
+		Ok(parsed):
+			match API.check(parsed):
+				Err(failure):
+					errors = API.check_errors(failure)
+					diagnostic = render_failure(failure).first
+					(
+						errors.remaining.is_empty()
+						and matches(errors.first.kind)
+						and same_source(errors.first.span.source, module_source(root_module_id()))
+						and errors.first.span.start == prefix.length()
+						and errors.first.span.end == prefix.length() + annotation.length()
+						and diagnostic.message == message and diagnostic.help == help
+						and diagnostic.span.start == errors.first.span.start
+						and diagnostic.span.end == errors.first.span.end
+						and same_source(diagnostic.span.source, errors.first.span.source)
+					)
+				Ok(_): False
+		Err(_): False
+
+
+pure func test_nested_payload_ast_retains_complete_and_inner_spans() -> Bool:
+	prefix = BOX + ENVELOPE
+	annotation = "Box[List[String]]"
+	match lex(module_source(root_module_id()), prefix + annotation + ")\n" + MAIN).and_then(parse):
+		Ok(program):
+			match Declaration.inventory_unions(parsed_contents(program).declarations):
+				[envelope]:
+					match envelope.variants:
+						[_, item]:
+							match item.declaration.fields:
+								[AppliedType(_, [AppliedType(_, [AtomicType(text)], list_span)], whole)]:
+									(
+										whole.start == prefix.length()
+										and whole.end == prefix.length() + annotation.length()
+										and list_span.start == prefix.length() + 4
+										and list_span.end == whole.end - 1
+										and text.span.start == prefix.length() + 9
+										and text.span.end == text.span.start + 6
+										and same_source(whole.source, module_source(root_module_id()))
+									)
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+private pure func direct_payload(annotation: String, expected: Model.TypeRef) -> Bool:
+	match checked(ENVELOPE + annotation + ")\n" + MAIN):
+		Ok(program):
+			match API.checked_functions(program).unions:
+				[envelope]:
+					match envelope.variants.map(pure func(variant): variant.fields):
+						[[], [payload]]:
+							(
+								Model.same_type(payload.value_type, expected)
+								and payload.span.start == ENVELOPE.length()
+								and payload.span.end == ENVELOPE.length() + annotation.length()
+								and same_source(payload.span.source, module_source(root_module_id()))
+							)
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_direct_string_publishes_complete_type_use() -> Bool:
+	direct_payload("String", Model.StringType)
+
+
+pure func test_direct_float_publishes_complete_type_use() -> Bool:
+	direct_payload("Float", Model.FloatType)
+
+
+pure func test_direct_void_is_a_payload_separate_from_nullary() -> Bool:
+	direct_payload("Void", Model.VoidType)
+
+
+pure func test_direct_list_string_publishes_complete_element_type() -> Bool:
+	direct_payload("List[String]", Model.ListType(Model.StringType))
+
+
+pure func test_nested_rigid_payload_keeps_union_owned_parameter() -> Bool:
+	source: String =
+		|fixed record Box[T] { value: T }
+		|fixed union Option[T]:
+		|    Some(T)
+		|    None
+		|fixed union Nested[T, Other]:
+		|    Item(Box[Option[T]])
+		|    Alternative(Other)
+		|func main() -> Int:
+		|    0
+		|
+	match checked(source):
+		Ok(program):
+			match (API.checked_functions(program).records, API.checked_functions(program).unions):
+				([box], [option, nested]):
+					match (box.type_parameters, option.type_parameters, nested.type_parameters, nested.variants.map(pure func(variant): variant.fields)):
+						([record_parameter], [option_parameter], [parameter, other], [[item], [alternative]]):
+							match item.value_type:
+								Model.AppliedRecordType(record_owner, [Model.AppliedUnionType(option_owner, [Model.ParameterType(actual)])]):
+									(
+										Declaration.record_number(record_owner) == 0
+										and Declaration.union_number(option_owner) == 0
+										and Model.same_type(Model.ParameterType(actual), Model.ParameterType(parameter))
+										and Model.same_type(alternative.value_type, Model.ParameterType(other))
+										and not Model.same_type(Model.ParameterType(actual), Model.ParameterType(record_parameter))
+										and not Model.same_type(Model.ParameterType(actual), Model.ParameterType(option_parameter))
+									)
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_imported_same_spelling_payload_uses_its_declaration_module() -> Bool:
+	root: String =
+		|import:
+		|    first: First
+		|    second: Second
+		|func main() -> Int:
+		|    0
+		|
+	first: String =
+		|fixed record Value { text: String }
+		|fixed union First:
+		|    Item(Value)
+		|
+	second: String =
+		|fixed record Value { number: Int }
+		|fixed union Second:
+		|    Item(Value)
+		|
+	match parse_modules_with_base([
+		{ source = root, targets = [1, 2] },
+		{ source = first, targets = [] },
+		{ source = second, targets = [] },
+	], PRIMITIVE_BASE).and_then(pure func(parsed): API.check(parsed).map_err(setup_diagnostic)):
+		Ok(program):
+			match API.checked_functions(program).unions:
+				[first, second]:
+					match (first.variants.map(pure func(variant): variant.fields), second.variants.map(pure func(variant): variant.fields), module_id(1), module_id(2)):
+						([[left]], [[right]], Some(first_module), Some(second_module)):
+							match (left.value_type, right.value_type):
+								(Model.RecordType(left_owner), Model.RecordType(right_owner)):
+									(
+										Declaration.record_number(left_owner) == 0
+										and Declaration.record_number(right_owner) == 1
+										and same_source(left.span.source, module_source(first_module))
+										and same_source(right.span.source, module_source(second_module))
+										and not Model.same_type(left.value_type, right.value_type)
+									)
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_unknown_payload_uses_ordinary_annotation_diagnostic() -> Bool:
+	exact_error(ENVELOPE, "Missing", ")\n" + MAIN,
+		"unknown type", "declare or import this type; builtin types and declared type parameters are also available",
+		pure func(kind):
+			match kind:
+				Errors.TypeTermRejection(Errors.UnknownType(_)): True
+				_: False
+	)
+
+
+pure func test_function_spelling_is_not_a_payload_type() -> Bool:
+	prefix = "pure func read() -> Int:\n    0\n" + ENVELOPE
+	exact_error(prefix, "read", ")\n" + MAIN,
+		"unknown type", "declare or import this type; builtin types and declared type parameters are also available",
+		pure func(kind):
+			match kind:
+				Errors.TypeTermRejection(Errors.UnknownType(_)): True
+				_: False
+	)
+
+
+pure func test_missing_record_arguments_keep_owner_and_name_span() -> Bool:
+	exact_error(BOX + ENVELOPE, "Box", ")\n" + MAIN,
+		"generic record requires one type argument", "write a concrete or symbolic application, such as Box[Int] or Box[T]",
+		pure func(kind):
+			match kind:
+				Errors.TypeTermRejection(Errors.MissingRecordTypeArguments(owner, 1)): Declaration.record_number(owner) == 0
+				_: False
+	)
+
+
+pure func test_wrong_record_arity_precedes_unknown_argument() -> Bool:
+	exact_error(BOX + ENVELOPE, "Box[Missing, String]", ")\n" + MAIN,
+		"record type argument count does not match its declaration", "expected 1 type arguments, got 2; supply types in declaration order",
+		pure func(kind):
+			match kind:
+				Errors.TypeTermRejection(Errors.RecordTypeArgumentCountMismatch(owner, 1, 2)): Declaration.record_number(owner) == 0
+				_: False
+	)
+
+
+pure func test_ordinary_record_application_keeps_full_span() -> Bool:
+	exact_error("fixed record Row { value: Int }\n" + ENVELOPE, "Row[String]", ")\n" + MAIN,
+		"ordinary record does not accept a type argument", "remove the type argument from this record type",
+		pure func(kind):
+			match kind:
+				Errors.TypeTermRejection(Errors.OrdinaryRecordApplied(owner)): Declaration.record_number(owner) == 0
+				_: False
+	)
+
+
+pure func test_nonapplicable_payload_keeps_head_span() -> Bool:
+	exact_error(ENVELOPE, "Int", "[String])\n" + MAIN,
+		"type does not accept a type argument", "apply a declared generic union or record, such as Box[Int]",
+		pure func(kind):
+			match kind:
+				Errors.TypeTermRejection(Errors.NonApplicableType(_)): True
+				_: False
+	)
+
+
+pure func test_direct_list_int_publishes_complete_element_type() -> Bool:
+	direct_payload("List[Int]", Model.ListType(Model.IntType))
+
+
+private pure func union_cycle(prefix: String, annotation: String, suffix: String, owner: Int) -> Bool:
+	exact_error(prefix, annotation, suffix,
+		"recursive aggregate types are not supported yet", "use finite record and union fields until recursive data is supported",
+		pure func(kind):
+			match kind:
+				Errors.TypeDeclarationRejection(Errors.RecursiveAggregateType(Model.UnionType(id))): Declaration.union_number(id) == owner
+				_: False
+	)
+
+
+pure func test_unused_self_union_cycle_rejects_at_written_edge() -> Bool:
+	union_cycle("fixed union Node:\n    Next(", "Node", ")\n" + MAIN, 0)
+
+
+pure func test_reachable_self_union_cycle_rejects_before_body() -> Bool:
+	union_cycle("fixed union Node:\n    Next(", "Node", ")\nfunc produce() -> Node:\n    produce()\nfunc main() -> Int:\n    unused = produce()\n    0\n", 0)
+
+
+pure func test_unused_mutual_union_cycle_rejects_closing_edge() -> Bool:
+	union_cycle("fixed union First:\n    Next(Second)\nfixed union Second:\n    Back(", "First", ")\n" + MAIN, 0)
+
+
+pure func test_reachable_mutual_union_cycle_rejects_before_specialization() -> Bool:
+	union_cycle("fixed union First:\n    Next(Second)\nfixed union Second:\n    Back(", "First", ")\nfunc produce() -> First:\n    produce()\nfunc main() -> Int:\n    unused = produce()\n    0\n", 0)
+
+
+pure func test_nested_applied_self_cycle_uses_whole_payload_span() -> Bool:
+	union_cycle("fixed union Box[T]:\n    Item(T)\nfixed union Node:\n    Next(", "Box[Node]", ")\n" + MAIN, 1)
+
+
+pure func test_union_record_cycle_keeps_record_root_priority() -> Bool:
+	exact_error("fixed record Link { node: Node }\nfixed union Node:\n    Next(", "Link", ")\n" + MAIN,
+		"recursive aggregate types are not supported yet", "use finite record and union fields until recursive data is supported",
+		pure func(kind):
+			match kind:
+				Errors.TypeDeclarationRejection(Errors.RecursiveAggregateType(Model.RecordType(owner))): Declaration.record_number(owner) == 0
+				_: False
+	)
+
+
+pure func test_old_record_cycle_wins_over_earlier_union_cycle() -> Bool:
+	exact_error("fixed union Node:\n    Next(Node)\nfixed record Row { value: ", "Row", " }\n" + MAIN,
+		"recursive aggregate types are not supported yet", "use finite record and union fields until recursive data is supported",
+		pure func(kind):
+			match kind:
+				Errors.TypeDeclarationRejection(Errors.RecursiveAggregateType(Model.RecordType(owner))): Declaration.record_number(owner) == 0
+				_: False
+	)
+
+
+pure func test_finite_forward_union_record_references_are_accepted() -> Bool:
+	checked("fixed union First:\n    Next(Second)\nfixed union Second:\n    Item(Row)\nfixed record Row { value: Int }\n" + MAIN).is_ok()
+
+
+private pure func symbolic_list_layout(element: String, expected: Model.TypeRef, concrete: Concrete.TypeRef) -> Bool:
+	source: String =
+		|fixed union Values[T]:
+		|    Items(List[T])
+		|func produce() -> Values[${element}]:
+		|    produce()
+		|func pass(value: Values[${element}]) -> Values[${element}]:
+		|    value
+		|func main() -> Int:
+		|    unused = pass(produce())
+		|    0
+		|
+	match checked(source):
+		Err(_): False
+		Ok(accepted):
+			match API.checked_functions(accepted).unions:
+				[values]:
+					match API.checked_functions(accepted).functions:
+						[produce, pass, _]:
+							typed = match values.type_parameters:
+								[parameter]:
+									match values.variants:
+										[variant]:
+											match pass.signature.parameters:
+												[input]:
+													match variant.fields:
+														[field]:
+															(
+																Model.same_type(field.value_type, Model.ListType(Model.ParameterType(parameter)))
+																and Model.same_type(produce.signature.return_type.value_type, Model.AppliedUnionType(values.id, [expected]))
+																and Model.same_type(input.value_type, produce.signature.return_type.value_type)
+																and Model.same_type(pass.signature.return_type.value_type, input.value_type)
+															)
+														_: False
+												_: False
+										_: False
+								_: False
+							match Concrete.specialize(accepted):
+								Err(_): False
+								Ok(program):
+									match Concrete.specialized_contents(program).unions:
+										[row]:
+											match row.variants:
+												[[actual]]:
+													match row.representation:
+														Concrete.InlineOwningPayload: typed and Concrete.same_type(actual, Concrete.ListType(concrete))
+														_: False
+												_: False
+										_: False
+						_: False
+				_: False
+
+
+pure func test_no_literal_int_list_producer_prepares_complete_layout() -> Bool:
+	symbolic_list_layout("Int", Model.IntType, Concrete.IntType)
+
+
+pure func test_no_literal_string_list_producer_has_supported_layout() -> Bool:
+	symbolic_list_layout("String", Model.StringType, Concrete.StringType)
+
+
+private pure func primitive_layout(annotation: String, argument: String, expected: Concrete.TypeRef) -> Bool:
+	direct: String =
+		|fixed union Envelope:
+		|    Empty
+		|    Item(${annotation})
+		|pure func make(value: ${annotation}) -> Envelope:
+		|    Item(value)
+		|func main() -> Int:
+		|    unused = make(${argument})
+		|    0
+		|
+	generic: String =
+		|fixed union Envelope[T]:
+		|    Empty
+		|    Item(T)
+		|pure func make(value: ${annotation}) -> Envelope[${annotation}]:
+		|    Item(value)
+		|func main() -> Int:
+		|    unused = make(${argument})
+		|    0
+		|
+	match (specialized(direct), specialized(generic)):
+		(Ok(left), Ok(right)):
+			match (left.unions, right.unions):
+				([first], [second]):
+					representation = match (expected, first.representation, second.representation):
+						(Concrete.StringType, Concrete.InlineOwningPayload, Concrete.InlineOwningPayload): True
+						(Concrete.IntType, Concrete.InlineUnmanaged, Concrete.InlineUnmanaged): True
+						(Concrete.FloatType, Concrete.InlineUnmanaged, Concrete.InlineUnmanaged): True
+						(Concrete.VoidType, Concrete.InlineUnmanaged, Concrete.InlineUnmanaged): True
+						_: False
+					match (first.variants, second.variants):
+						([[], [a]], [[], [b]]):
+							representation and Concrete.same_type(a, expected) and Concrete.same_type(b, expected)
+						_: False
+				_: False
+		_: False
+
+
+pure func test_direct_and_generic_string_layouts_agree() -> Bool:
+	primitive_layout("String", "\"42\"", Concrete.StringType)
+
+
+pure func test_direct_and_generic_float_layouts_agree() -> Bool:
+	primitive_layout("Float", "2.5", Concrete.FloatType)
+
+
+pure func test_direct_and_generic_void_layouts_keep_unary_tag() -> Bool:
+	primitive_layout("Void", "void", Concrete.VoidType)
+
+
+private pure func parser_error(prefix: String, marked: String, suffix: String, message: String, help: String) -> Bool:
+	match lex(module_source(root_module_id()), prefix + marked + suffix).and_then(parse):
+		Err(error):
+			(
+				error.message == message and error.help == help
+				and error.span.start == prefix.length() and error.span.end == prefix.length() + marked.length()
+				and same_source(error.span.source, module_source(root_module_id()))
+			)
+		Ok(_): False
+
+
+pure func test_empty_payload_parentheses_teach_nullary_and_unary_forms() -> Bool:
+	parser_error(ENVELOPE, ")", "\n" + MAIN, "expected a payload type",
+		"write bare Variant for no fields, or Variant(String, Int) for fields")
+
+
+pure func test_multiple_payloads_accept_top_level_comma() -> Bool:
+	match lex(module_source(root_module_id()), ENVELOPE + "Int, String)\n" + MAIN).and_then(parse):
+		Ok(program):
+			match Declaration.inventory_unions(parsed_contents(program).declarations):
+				[row]:
+					match row.variants:
+						[_, item]: item.declaration.fields.length() == 2
+						_: False
+				_: False
+		Err(_): False
+
+pure func test_one_payload_accepts_multiple_nested_type_arguments() -> Bool:
+	source: String =
+		|fixed record Pair[A, B] { first: A, second: B }
+		|fixed union Message:
+		|    Item(Pair[Int, String])
+		|func main() -> Int:
+		|    0
+		|
+	checked(source).is_ok()
+
+
+pure func test_missing_union_arguments_keep_nominal_owner() -> Bool:
+	exact_error("fixed union Box[T]:\n    Value(T)\n" + ENVELOPE, "Box", ")\n" + MAIN,
+		"generic union requires one type argument", "write a concrete or symbolic application, such as Box[Int] or Box[T]",
+		pure func(kind):
+			match kind:
+				Errors.TypeTermRejection(Errors.MissingUnionTypeArguments(owner, 1)): Declaration.union_number(owner) == 0
+				_: False
+	)
+
+
+pure func test_wrong_union_arity_precedes_unknown_argument() -> Bool:
+	exact_error("fixed union Box[T]:\n    Value(T)\n" + ENVELOPE, "Box[Missing, String]", ")\n" + MAIN,
+		"union type argument count does not match its declaration", "expected 1 type arguments, got 2; supply types in declaration order",
+		pure func(kind):
+			match kind:
+				Errors.TypeTermRejection(Errors.UnionTypeArgumentCountMismatch(owner, 1, 2)): Declaration.union_number(owner) == 0
+				_: False
+	)
+
+
+pure func test_ordinary_union_application_keeps_whole_span() -> Bool:
+	exact_error("fixed union Choice:\n    First\n" + ENVELOPE, "Choice[String]", ")\n" + MAIN,
+		"ordinary union does not accept a type argument", "remove the type argument from this union type",
+		pure func(kind):
+			match kind:
+				Errors.TypeTermRejection(Errors.OrdinaryUnionApplied(owner)): Declaration.union_number(owner) == 0
+				_: False
+	)
+
+
+pure func test_nested_rigid_substitution_publishes_int_and_string_children() -> Bool:
+	source: String =
+		|fixed record Box[T] { value: T }
+		|fixed union Option[T]:
+		|    Some(T)
+		|    None
+		|fixed union Nested[T, Other]:
+		|    Item(Box[Option[T]])
+		|    Alternative(Other)
+		|pure func make[T](value: T) -> Nested[T, Int]:
+		|    Item({ value = Some(value) })
+		|func main() -> Int:
+		|    first = make(7)
+		|    second = make("42")
+		|    0
+		|
+	match specialized(source):
+		Ok(program):
+			var integer = 0
+			var string = 0
+			for row in program.records:
+				match row.fields:
+					[Concrete.UnionType(owner)]:
+						match program.unions.get(Concrete.union_number(owner)):
+							Some(option):
+								match option.variants:
+									[[Concrete.IntType], []]: integer = integer + 1
+									[[Concrete.StringType], []]: string = string + 1
+									_: void
+							_: void
+					_: void
+			integer == 1 and string == 1 and program.records.length() == 2 and program.unions.length() == 4
+		Err(_): False
+
+
+private pure func record_layout_pair(field: String, value: String, managed: Bool) -> Bool:
+	direct: String =
+		|fixed record Row { value: ${field} }
+		|fixed union Envelope:
+		|    Item(Row)
+		|pure func make(value: Row) -> Envelope:
+		|    Item(value)
+		|func main() -> Int:
+		|    unused = make({ value = ${value} })
+		|    0
+		|
+	generic: String =
+		|fixed record Row { value: ${field} }
+		|fixed union Envelope[T]:
+		|    Item(T)
+		|pure func make(value: Row) -> Envelope[Row]:
+		|    Item(value)
+		|func main() -> Int:
+		|    unused = make({ value = ${value} })
+		|    0
+		|
+	match (specialized(direct), specialized(generic)):
+		(Ok(left), Ok(right)):
+			match (left.records, right.records, left.unions, right.unions):
+				([a], [b], [first], [second]):
+					match (first.variants, second.variants):
+						([[Concrete.RecordType(left_owner)]], [[Concrete.RecordType(right_owner)]]):
+							representation = match (a.representation, b.representation, first.representation, second.representation):
+								(Concrete.InlineRecord, Concrete.InlineRecord, Concrete.InlineUnmanaged, Concrete.InlineUnmanaged): not managed
+								(Concrete.ManagedRecord, Concrete.ManagedRecord, Concrete.InlineOwningPayload, Concrete.InlineOwningPayload): managed
+								_: False
+							fields = match (a.fields, b.fields):
+								([Concrete.IntType], [Concrete.IntType]): not managed
+								([Concrete.StringType], [Concrete.StringType]): managed
+								_: False
+							(
+								representation and fields
+								and Concrete.record_number(left_owner) == 0
+								and Concrete.record_number(right_owner) == 0
+							)
+						_: False
+				_: False
+		_: False
+
+
+pure func test_direct_and_generic_inline_record_representations_agree() -> Bool:
+	record_layout_pair("Int", "7", False)
+
+
+pure func test_direct_and_generic_managed_record_representations_agree() -> Bool:
+	record_layout_pair("String", "\"42\"", True)
+
+
+private pure func owned_producer(field: String, declaration: String, argument: String, is_record: Bool) -> Bool:
+	tail: String =
+		|fixed union Envelope:
+		|    Item(${field})
+		|pure func make(value: ${field}) -> Envelope:
+		|    Item(value)
+		|func main() -> Int:
+		|    unused = make(${argument})
+		|    0
+		|
+	source = declaration + tail
+	match checked(source).and_then(pure func(program): Concrete.specialize(program)).and_then(pure func(program): Lower.lower(program)):
+		Ok(lowered):
+			var lower_valid = False
+			for function in Lower.lowered_functions(lowered).functions:
+				match function.definitions:
+					[parameter, constructed]:
+						match constructed.operation:
+							Lower.ConstructValue(variant, [child]):
+								child_type = match parameter.value_type:
+									Concrete.StringType: not is_record
+									Concrete.RecordType(_): is_record
+									_: False
+								lower_valid = (
+									child_type and Lower.value_number(child) == Lower.value_number(parameter.id)
+									and Concrete.variant_number(variant) == 0
+									and Concrete.same_type(constructed.value_type, function.signature.return_type)
+								)
+							_: void
+					_: void
+			match Own.own(lowered):
+				Ok(owned):
+					var owned_valid = False
+					for function in owned.functions:
+						match function.operations:
+							[Own.DefineValue(parameter), Own.AcquireOwner(child, borrow, _), Own.DefineValue(constructed)]:
+								match (constructed.operation, constructed.result, function.tail):
+									(Own.ConstructDefinition(_, [Own.OwnedPayload(value, transferred)]), Own.OwnedResult(parent), Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(result, returned)))):
+										owned_valid = (
+											Lower.value_number(value) == Lower.value_number(parameter.id)
+											and Lower.value_number(borrow.value) == Lower.value_number(value)
+											and Own.owner_number(transferred) == Own.owner_number(child)
+											and Own.owner_number(returned) == Own.owner_number(parent)
+											and Lower.value_number(result) == Lower.value_number(constructed.id)
+										)
+									_: void
+							_: void
+					lower_valid and owned_valid and verify(owned).is_ok()
+				Err(_): False
+		Err(_): False
+
+
+pure func test_direct_string_lowering_and_borrow_acquisition_preserve_child() -> Bool:
+	owned_producer("String", "", "\"42\"", False)
+
+
+pure func test_direct_managed_record_lowering_and_acquisition_preserve_child() -> Bool:
+	owned_producer("Row", "fixed record Row { text: String }\n", "{ text = \"42\" }", True)
+
+
+private pure func string_list_layout(source: String) -> Bool:
+	match specialized(source):
+		Ok(program):
+			match program.unions:
+				[envelope]:
+					match (envelope.variants, envelope.representation):
+						([[], [Concrete.ListType(Concrete.StringType)]], Concrete.InlineOwningPayload): True
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_direct_and_generic_string_list_layouts_agree() -> Bool:
+	direct: String =
+		|fixed union Envelope:
+		|    Empty
+		|    Item(List[String])
+		|pure func make(value: List[String]) -> Envelope:
+		|    Item(value)
+		|func main(arguments: List[String]) -> Int:
+		|    unused = make(arguments)
+		|    0
+		|
+	generic: String =
+		|fixed union Envelope[T]:
+		|    Empty
+		|    Item(T)
+		|pure func make(value: List[String]) -> Envelope[List[String]]:
+		|    Item(value)
+		|func main(arguments: List[String]) -> Int:
+		|    unused = make(arguments)
+		|    0
+		|
+	string_list_layout(direct) and string_list_layout(generic)
+
+
+private pure func nested_owning_layout(source: String) -> Bool:
+	match specialized(source):
+		Ok(program):
+			match program.unions:
+				[inner, outer]:
+					match (inner.variants, inner.representation, outer.variants, outer.representation):
+						([[Concrete.StringType]], Concrete.InlineOwningPayload, [[Concrete.UnionType(child)]], Concrete.InlineOwningPayload):
+							Concrete.union_number(child) == 0
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_direct_and_generic_nested_owning_union_layouts_agree() -> Bool:
+	direct: String =
+		|fixed union Inner:
+		|    Text(String)
+		|fixed union Outer:
+		|    Item(Inner)
+		|pure func make(value: Inner) -> Outer:
+		|    Item(value)
+		|func main() -> Int:
+		|    unused = make(Text("42"))
+		|    0
+		|
+	generic: String =
+		|fixed union Inner:
+		|    Text(String)
+		|fixed union Outer[T]:
+		|    Item(T)
+		|pure func make(value: Inner) -> Outer[Inner]:
+		|    Item(value)
+		|func main() -> Int:
+		|    unused = make(Text("42"))
+		|    0
+		|
+	nested_owning_layout(direct) and nested_owning_layout(generic)
+
+
+tests: TestSuite = {
+	description = "Direct ordinary unary union payloads",
+	tests = [
+		("direct/generic List[String] layouts", test_direct_and_generic_string_list_layouts_agree),
+		("direct/generic nested owning union layouts", test_direct_and_generic_nested_owning_union_layouts_agree),
+		("empty payload parentheses teach nullary and unary forms", test_empty_payload_parentheses_teach_nullary_and_unary_forms),
+		("multiple fields accept top level comma", test_multiple_payloads_accept_top_level_comma),
+		("one payload accepts multiple nested type arguments", test_one_payload_accepts_multiple_nested_type_arguments),
+		("missing union arguments keep nominal owner", test_missing_union_arguments_keep_nominal_owner),
+		("wrong union arity precedes unknown argument", test_wrong_union_arity_precedes_unknown_argument),
+		("ordinary union application keeps whole span", test_ordinary_union_application_keeps_whole_span),
+		("nested rigid substitution publishes int and string children", test_nested_rigid_substitution_publishes_int_and_string_children),
+		("direct and generic inline record representations agree", test_direct_and_generic_inline_record_representations_agree),
+		("direct and generic managed record representations agree", test_direct_and_generic_managed_record_representations_agree),
+		("direct string lowering and borrow acquisition preserve child", test_direct_string_lowering_and_borrow_acquisition_preserve_child),
+		("direct managed record lowering and acquisition preserve child", test_direct_managed_record_lowering_and_acquisition_preserve_child),
+		("nested payload AST spans", test_nested_payload_ast_retains_complete_and_inner_spans),
+		("direct String TypeUse", test_direct_string_publishes_complete_type_use),
+		("direct Float TypeUse", test_direct_float_publishes_complete_type_use),
+		("direct Void Some versus None", test_direct_void_is_a_payload_separate_from_nullary),
+		("direct List[String] TypeUse", test_direct_list_string_publishes_complete_element_type),
+		("nested rigid declaration owners", test_nested_rigid_payload_keeps_union_owned_parameter),
+		("imported same-spelling module owners", test_imported_same_spelling_payload_uses_its_declaration_module),
+		("unknown payload exact diagnostic", test_unknown_payload_uses_ordinary_annotation_diagnostic),
+		("function spelling is not a type", test_function_spelling_is_not_a_payload_type),
+		("missing record arguments", test_missing_record_arguments_keep_owner_and_name_span),
+		("record arity before argument error", test_wrong_record_arity_precedes_unknown_argument),
+		("ordinary record application", test_ordinary_record_application_keeps_full_span),
+		("nonapplicable payload head span", test_nonapplicable_payload_keeps_head_span),
+		("direct List[Int] complete element type", test_direct_list_int_publishes_complete_element_type),
+		("unused self union cycle", test_unused_self_union_cycle_rejects_at_written_edge),
+		("reachable self union cycle", test_reachable_self_union_cycle_rejects_before_body),
+		("unused mutual union cycle", test_unused_mutual_union_cycle_rejects_closing_edge),
+		("reachable mutual union cycle", test_reachable_mutual_union_cycle_rejects_before_specialization),
+		("nested cycle full payload span", test_nested_applied_self_cycle_uses_whole_payload_span),
+		("union-record cycle root order", test_union_record_cycle_keeps_record_root_priority),
+		("record cycle diagnostic priority", test_old_record_cycle_wins_over_earlier_union_cycle),
+		("finite forward nominal references", test_finite_forward_union_record_references_are_accepted),
+		("no-literal List[Int] complete concrete layout", test_no_literal_int_list_producer_prepares_complete_layout),
+		("no-literal List[String] control", test_no_literal_string_list_producer_has_supported_layout),
+		("direct/generic String slots", test_direct_and_generic_string_layouts_agree),
+		("direct/generic Float slots", test_direct_and_generic_float_layouts_agree),
+		("direct/generic Void slots", test_direct_and_generic_void_layouts_keep_unary_tag),
+	]
+}

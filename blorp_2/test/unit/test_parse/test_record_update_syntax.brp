@@ -1,0 +1,163 @@
+import:
+	../../../src/parse/assemble: ParsedContents, parsed_contents
+	../../../src/utils/declarations: inventory_functions
+	../../../src/lex/lex: lex
+	../../../src/utils/names: name_spelling
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		Diagnostic, ExpressionBase(RecordExpression, RecordUpdateExpression, DirectApplication),
+		ParsedBody(ParsedValueBody), PostfixOperation(FieldAccess), Symbol(RecordUpdateBar), TokenKind(SymbolToken),
+	../../../src/utils/text: concat, equals
+	../input: parse
+	int as IntOps
+	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n    "
+private NAME_HELP: String = "use an ASCII identifier starting with a letter or underscore; 'func', 'pure', 'match', 'var', and lone '_' are reserved"
+
+
+private pure func parsed(source: String) -> Result[ParsedContents, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source)
+	program ?= parse(tokens)
+	Ok(parsed_contents(program))
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parsed(source):
+		Ok(_): False
+		Err(error):
+			(IntOps.equals(error.span.start, start) and IntOps.equals(error.span.end, end)
+			and equals(error.message, message) and equals(error.help, help) and error.note.is_none())
+
+
+pure func test_bar_has_its_own_byte_span() -> Bool:
+	match lex(module_source(root_module_id()), "|"):
+		Ok(program):
+			match program.tokens:
+				[bar, _]:
+					match bar.kind:
+						SymbolToken(RecordUpdateBar): IntOps.equals(bar.span.start, 0) and IntOps.equals(bar.span.end, 1)
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_update_preserves_base_postfix_span_and_written_fields() -> Bool:
+	base_text = "base().inner"
+	prefix = HEADER.concat("{ ")
+	source = prefix.concat(base_text).concat(" | second = 9, first = 7 }.first\n")
+	match parsed(source):
+		Err(_): False
+		Ok(program):
+			match inventory_functions(program.declarations):
+				[row]:
+					match row.declaration.body:
+						ParsedValueBody(value):
+							match value.base:
+								RecordUpdateExpression(base, [second, first]):
+									base_call = match base.base:
+										DirectApplication(_, []): True
+										_: False
+									base_postfix = match base.applications:
+										[FieldAccess(_)]: True
+										_: False
+									outer_postfix = match value.applications:
+										[FieldAccess(_)]: True
+										_: False
+									second_name = match name_spelling(program.names, second.name.id):
+										Some(name): equals(name, "second")
+										None: False
+									first_name = match name_spelling(program.names, first.name.id):
+										Some(name): equals(name, "first")
+										None: False
+									(base_call and base_postfix and outer_postfix
+									and IntOps.equals(base.span.start, prefix.length())
+									and IntOps.equals(base.span.end, IntOps.add(prefix.length(), base_text.length()))
+									and second_name and first_name)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_name_equals_still_selects_a_literal() -> Bool:
+	match parsed(HEADER.concat("{ first = 7 }\n")):
+		Err(_): False
+		Ok(program):
+			match inventory_functions(program.declarations):
+				[row]:
+					match row.declaration.body:
+						ParsedValueBody(value):
+							match value.base:
+								RecordExpression([_]): True
+								_: False
+						_: False
+				_: False
+
+
+pure func test_missing_bar_reports_the_closing_brace() -> Bool:
+	prefix = HEADER.concat("{ base() ")
+	rejects(prefix.concat("}\n"), prefix.length(), IntOps.add(prefix.length(), 1), "expected '|' after the record update base", "write { existing_record | field = expression }")
+
+
+pure func test_empty_update_requires_a_replacement_name() -> Bool:
+	prefix = HEADER.concat("{ base() | ")
+	rejects(prefix.concat("}\n"), prefix.length(), IntOps.add(prefix.length(), 1), "expected a record field name", NAME_HELP)
+
+
+pure func test_missing_replacement_equals_reports_its_value() -> Bool:
+	prefix = HEADER.concat("{ base() | first ")
+	rejects(prefix.concat("7 }\n"), prefix.length(), IntOps.add(prefix.length(), 1), "expected '=' after the record field name", "write field = expression")
+
+
+pure func test_duplicate_separator_is_a_syntax_error() -> Bool:
+	prefix = HEADER.concat("{ base() | first = 7,")
+	rejects(prefix.concat(", second = 9 }\n"), prefix.length(), IntOps.add(prefix.length(), 1), "expected a record field name", NAME_HELP)
+
+
+pure func test_missing_close_reports_the_newline() -> Bool:
+	prefix = HEADER.concat("{ base() | first = 7")
+	rejects(prefix.concat("\n"), prefix.length(), IntOps.add(prefix.length(), 1), "expected '}' after the record update fields", "keep replacement fields on one line, separated by commas")
+
+
+pure func test_duplicate_field_names_reach_semantic_checking() -> Bool:
+	parsed(HEADER.concat("{ base() | first = 7, first = 9 }\n")).is_ok()
+
+
+pure func test_missing_base_reports_the_bar() -> Bool:
+	prefix = HEADER.concat("{ ")
+	rejects(prefix.concat("| first = 7 }\n"), prefix.length(), IntOps.add(prefix.length(), 1), "expected a return expression", "use a literal, a parameter or variant name, or a call as the entire body")
+
+
+pure func test_trailing_comma_requires_another_field() -> Bool:
+	prefix = HEADER.concat("{ base() | first = 7, ")
+	rejects(prefix.concat("}\n"), prefix.length(), IntOps.add(prefix.length(), 1), "expected a record field name", NAME_HELP)
+
+
+pure func test_replacements_cannot_continue_after_a_newline() -> Bool:
+	prefix = HEADER.concat("{ base() |")
+	rejects(prefix.concat("\n    first = 7 }\n"), prefix.length(), IntOps.add(prefix.length(), 1), "expected a record field name", NAME_HELP)
+
+
+pure func test_bar_in_a_string_is_not_update_punctuation() -> Bool:
+	parsed(HEADER.concat("{ base() | text = \"|\" }\n")).is_ok()
+
+
+tests: TestSuite = {
+	description = "Record update syntax",
+	tests = [
+		("bar has its own byte span", test_bar_has_its_own_byte_span),
+		("base postfix and written fields are preserved", test_update_preserves_base_postfix_span_and_written_fields),
+		("name equals still selects a literal", test_name_equals_still_selects_a_literal),
+		("missing bar points at close", test_missing_bar_reports_the_closing_brace),
+		("empty update requires a field", test_empty_update_requires_a_replacement_name),
+		("missing equals points at value", test_missing_replacement_equals_reports_its_value),
+		("duplicate separator is syntax", test_duplicate_separator_is_a_syntax_error),
+		("missing close points at newline", test_missing_close_reports_the_newline),
+		("duplicate names reach checking", test_duplicate_field_names_reach_semantic_checking),
+		("missing base points at bar", test_missing_base_reports_the_bar),
+		("trailing comma requires a field", test_trailing_comma_requires_another_field),
+		("replacement fields stay on one line", test_replacements_cannot_continue_after_a_newline),
+		("bar in String is ordinary content", test_bar_in_a_string_is_not_update_punctuation),
+	]
+}

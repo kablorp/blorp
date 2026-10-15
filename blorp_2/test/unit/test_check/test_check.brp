@@ -1,0 +1,190 @@
+import:
+	../../../src/utils/declarations: function_number
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/check/check: checked_functions
+	../../../src/check/check_model:
+		CallTarget(UserFunction, RuntimeFunction),
+		CheckedBody(CheckedValueBody),
+		CheckedExit(ReturnExpression),
+		CheckedForm(InvokeFunction, LiteralInteger, ReadBinding),
+		CheckedFunction,
+	../../../src/lex/lex: lex
+	../../../src/utils/syntax: Purity(Impure), entry_function
+	../input: check, checked_source, parse
+	test: TestSuite
+
+
+private pure func user_function_number(target: CallTarget) -> Option[Int]:
+	match target:
+		UserFunction(id, _):
+			Some(function_number(id))
+		RuntimeFunction(_):
+			None
+
+
+private pure func form_of(function: CheckedFunction) -> Option[CheckedForm]:
+	match function.body:
+		CheckedValueBody(ReturnExpression(value)):
+			Some(value.form)
+		_:
+			None
+
+
+pure func test_resolved_forward_call_and_entrypoint() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	one()
+		|func one() -> Int:
+		|	1
+		|
+
+	match lex(module_source(root_module_id()), source):
+		Err(_):
+			False
+		Ok(tokens):
+			match parse(tokens):
+				Err(_):
+					False
+				Ok(parsed):
+					match check(parsed):
+						Err(_):
+							False
+						Ok(program):
+							checked = checked_functions(program)
+
+							match checked.functions:
+								[first, second]:
+									second_is_one: Bool = match form_of(second):
+										Some(LiteralInteger(1)):
+											True
+										_:
+											False
+
+									match form_of(first):
+										Some(InvokeFunction(call, [])):
+											(
+												user_function_number(call.target) == Some(1)
+												and second_is_one
+												and first.signature.purity == Impure
+												and second.signature.purity == Impure
+												and function_number(entry_function(checked.entrypoint)) == 0
+											)
+										_:
+											False
+								_:
+									False
+
+
+pure func test_self_recursion_is_checked() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	main()
+		|
+	checked_source(source).is_ok()
+
+
+pure func test_mutual_recursion_is_checked() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	one()
+		|func one() -> Int:
+		|	main()
+		|
+	checked_source(source).is_ok()
+
+
+pure func test_unused_recursive_helper_is_checked() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	0
+		|func one() -> Int:
+		|	one()
+		|
+	checked_source(source).is_ok()
+
+
+pure func test_recursion_in_argument_is_checked() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|func loop() -> Int:
+		|	identity(loop())
+		|func main() -> Int:
+		|	loop()
+		|
+	checked_source(source).is_ok()
+
+
+pure func test_unary_recursion_is_checked() -> Bool:
+	source: String =
+		|func loop(value: Int) -> Int:
+		|	loop(value)
+		|func main() -> Int:
+		|	loop(1)
+		|
+	checked_source(source).is_ok()
+
+
+pure func test_recursion_after_inner_wrapper_is_checked() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|func loop(value: Int) -> Int:
+		|	loop(identity(value))
+		|func main() -> Int:
+		|	loop(1)
+		|
+	checked_source(source).is_ok()
+
+
+pure func test_special_spellings_resolve_by_role_and_declaration_order() -> Bool:
+	source: String =
+		|pure func Int(main: Int) -> Int:
+		|	main
+		|func main() -> Int:
+		|	Int(1)
+		|
+
+	match checked_source(source):
+		Err(_):
+			False
+		Ok(program):
+			checked = checked_functions(program)
+
+			match checked.functions:
+				[helper, entrypoint]:
+					match form_of(helper):
+						Some(ReadBinding(_)):
+							match form_of(entrypoint):
+								Some(InvokeFunction(call, [_])):
+									(
+										function_number(entry_function(checked.entrypoint)) == 1
+										and user_function_number(call.target) == Some(0)
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 semantic checking",
+	tests = [
+		(
+			"special spellings resolve by role and declaration order",
+			test_special_spellings_resolve_by_role_and_declaration_order,
+		),
+		(
+			"recursion after a checked inner wrapper is accepted",
+			test_recursion_after_inner_wrapper_is_checked,
+		),
+		("unary recursion is checked", test_unary_recursion_is_checked),
+		("recursion inside a call argument is accepted", test_recursion_in_argument_is_checked),
+		("resolved forward call and entrypoint", test_resolved_forward_call_and_entrypoint),
+		("unused recursive helper is checked", test_unused_recursive_helper_is_checked),
+		("self recursion is checked", test_self_recursion_is_checked),
+		("mutual recursion is checked", test_mutual_recursion_is_checked),
+	]
+}

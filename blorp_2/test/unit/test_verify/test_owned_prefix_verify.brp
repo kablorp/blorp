@@ -1,0 +1,492 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/utils/source: COMPILER_SOURCE, same_source
+	../../../src/utils/syntax: Diagnostic, Span
+	../../../src/verify/verify: verify
+	../managed_union_inputs: lowered
+	test: TestSuite
+
+
+private SOURCE: String =
+	|fixed union Choice:
+	|	Yes
+	|	No
+	|fixed record Holder { text: String }
+	|pure func make() -> Holder:
+	|	{ text = "42" }
+	|pure func inspect(choice: Choice) -> String:
+	|	owned = make()
+	|	match choice:
+	|		Yes: owned.text
+	|		No: owned.text
+	|func main() -> Int:
+	|	unused = inspect(Yes)
+	|	0
+	|
+
+
+private fixed union RawCase:
+	Valid
+	MissingFirstDrop
+	MissingSecondDrop
+	DoubleFirstDrop
+	WrongPrefixReturn
+	EarlyParentDrop
+	SiblingOwner
+	UndefinedOwner
+	BorrowedEscape
+
+
+private pure func span(at: Int) -> Span:
+	{
+		source = COMPILER_SOURCE,
+		start = at,
+		end = at + 1
+	}
+
+
+private pure func seed_error() -> Diagnostic:
+	{
+		span = {
+			source = COMPILER_SOURCE,
+			start = 0,
+			end = 1
+		},
+		note = None,
+		message = "invalid owned-prefix identity seed",
+		help = "fix test setup"
+	}
+
+
+private pure func raw_arm(
+	arm: Lower.LoweredArm,
+	parent: Lower.ValueId,
+	ordinal: Int,
+	case: RawCase,
+) -> Result[Own.OwnedArm, Diagnostic]:
+	at = if ordinal == 1:
+		span(20)
+	else:
+		span(30)
+
+	match arm.body.definitions:
+		[child]:
+			match child.operation:
+				Lower.ReadRecordFieldValue(field, _):
+					root = Own.owner_id(0)
+					acquired = Own.owner_id(ordinal)
+					var operations: List[Own.OwnershipOperation] = []
+
+					match case:
+						EarlyParentDrop:
+							if ordinal == 1:
+								operations = operations.append(Own.DropOwner(root, at))
+						_:
+							void
+
+					operations = operations.append(Own.DefineValue({
+						id = child.id,
+						value_type = child.value_type,
+						operation = Own.ReadRecordFieldDefinition(
+							field,
+							Own.BorrowedArgument({
+								value = parent,
+								source = Own.OwnerBorrow(root),
+							}),
+						),
+						result = Own.BorrowedResult(Own.PayloadBorrow(parent)),
+						span = at,
+					}))
+
+					escaping_borrow = match case:
+						BorrowedEscape:
+							ordinal == 1
+						_:
+							False
+
+					if not escaping_borrow:
+						operations = operations.append(
+							Own.AcquireOwner(
+								acquired,
+								{
+									value = child.id,
+									source = Own.PayloadBorrow(parent)
+								},
+								at,
+							),
+						)
+
+					missing = match case:
+						MissingFirstDrop | WrongPrefixReturn:
+							ordinal == 1
+						MissingSecondDrop:
+							ordinal == 2
+						_:
+							False
+
+					if not missing:
+						operations = operations.append(Own.DropOwner(root, at))
+
+					match case:
+						DoubleFirstDrop:
+							if ordinal == 1:
+								operations = operations.append(Own.DropOwner(root, at))
+						SiblingOwner:
+							if ordinal == 2:
+								operations = operations.append(Own.DropOwner(Own.owner_id(1), at))
+						UndefinedOwner:
+							if ordinal == 1:
+								operations = operations.append(Own.DropOwner(Own.owner_id(99), at))
+						_:
+							void
+
+					returned = match case:
+						WrongPrefixReturn:
+							if ordinal == 1:
+								root
+							else:
+								acquired
+						_:
+							acquired
+
+					transfer = if escaping_borrow:
+						Own.UnmanagedReturn(child.id)
+					else:
+						Own.OwnedReturn(child.id, returned)
+
+					Ok({
+						label = arm.label,
+						operations = operations,
+						exit = Own.ReturnResult(transfer),
+					})
+				_:
+					Err(seed_error())
+		_:
+			Err(seed_error())
+
+
+private pure func raw_function(
+	function: Lower.LoweredFunction,
+	seed: Lower.LoweredFunctions,
+	case: RawCase,
+) -> Result[Own.OwnedFunction, Diagnostic]:
+	match function.tail:
+		Lower.ExitValue(_):
+			Own.insert_function(function, seed.unions, seed.records)
+		Lower.MatchValue(matched):
+			match (function.definitions, matched.arms):
+				([parameter, parent], [first, second]):
+					match parent.operation:
+						Lower.CallValue(call, []):
+							left ?= raw_arm(first, parent.id, 1, case)
+							right ?= raw_arm(second, parent.id, 2, case)
+							Ok({
+								execution = function.execution,
+								signature = function.signature,
+								operations = [Own.DefineValue({
+										id = parameter.id,
+										value_type = parameter.value_type,
+										operation = Own.ParameterDefinition(0),
+										result = Own.UnmanagedResult,
+										span = parameter.span,
+									}), Own.DefineValue({
+										id = parent.id,
+										value_type = parent.value_type,
+										operation = Own.CallDefinition(call, []),
+										result = Own.OwnedResult(Own.owner_id(0)),
+										span = parent.span,
+									})],
+								tail = Own.MatchTail({
+									scrutinee = Own.UnmanagedArgument(matched.scrutinee),
+									owner = matched.owner,
+									arms = [left, right],
+								}),
+							})
+						_:
+							Err(seed_error())
+				_:
+					Err(seed_error())
+
+
+-- Lowering supplies sealed identities and nominal types only. The target match's
+-- prefix, acquisitions, drops and returns are authored independently here.
+private pure func raw_program(case: RawCase) -> Result[Own.OwnershipProgram, Diagnostic]:
+	lowered ?= lowered(SOURCE)
+	seed = Lower.lowered_functions(lowered)
+	var functions: List[Own.OwnedFunction] = []
+	var invalid: Option[Diagnostic] = None
+
+	for function in seed.functions:
+		built = raw_function(function, seed, case)
+
+		match built:
+			Ok(function):
+				functions = functions.append(function)
+			Err(error):
+				invalid = Some(error)
+				break
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				records = seed.records,
+				unions = seed.unions,
+				functions = functions,
+				entrypoint = seed.entrypoint,
+			})
+
+
+private pure func rejects(case: RawCase, message: String, at: Int) -> Bool:
+	match raw_program(case):
+		Err(_):
+			False
+		Ok(program):
+			match verify(program):
+				Ok(_):
+					False
+				Err(error):
+					(
+						error.message == "ownership verification failed: " + message
+						and error.help == "report this compiler error with the input program"
+						and error.span.start == at
+						and error.span.end == at + 1
+					)
+
+
+pure func test_independent_arm_prefix_discharge_is_valid() -> Bool:
+	raw_program(Valid)
+		.and_then(pure func(program): verify(program))
+		.is_ok()
+
+
+pure func test_first_arm_must_discharge_prefix() -> Bool:
+	rejects(MissingFirstDrop, "owner 0 remains live at return", 20)
+
+
+pure func test_second_arm_must_discharge_prefix() -> Bool:
+	rejects(MissingSecondDrop, "owner 0 remains live at return", 30)
+
+
+pure func test_prefix_cannot_be_dropped_twice() -> Bool:
+	rejects(DoubleFirstDrop, "owner 0 has already been discharged", 20)
+
+
+pure func test_prefix_owner_must_own_returned_value() -> Bool:
+	rejects(WrongPrefixReturn, "returned owner does not own the returned value", 20)
+
+
+pure func test_parent_must_be_live_at_projection() -> Bool:
+	rejects(EarlyParentDrop, "borrow refers to discharged owner 0", 20)
+
+
+pure func test_sibling_owner_gap_is_unavailable() -> Bool:
+	rejects(SiblingOwner, "owner 1 is not available in this match arm", 30)
+
+
+pure func test_unintroduced_owner_is_rejected() -> Bool:
+	rejects(UndefinedOwner, "owner 99 is not defined", 20)
+
+
+pure func test_borrowed_child_cannot_escape_without_owner() -> Bool:
+	rejects(BorrowedEscape, "managed return requires an owner transfer", 20)
+
+
+private STORED_PREFIX_SOURCE: String =
+	|fixed union Choice:
+	|	Yes
+	|	No
+	|fixed record Pair { first: String, second: String }
+	|pure func inspect(choice: Choice) -> Pair:
+	|	text = "42"
+	|	match choice:
+	|		Yes: { first = text, second = text }
+	|		No: { first = text, second = text }
+	|func main() -> Int:
+	|	unused = inspect(Yes)
+	|	0
+	|
+
+
+private fixed union PrefixSlots:
+	DistinctSlots
+	DuplicateSlot
+
+
+private pure func raw_stored_prefix_arm(
+	arm: Lower.LoweredArm,
+	second: Own.OwnerId,
+	introduced: Own.OwnerId,
+	at: Int,
+) -> Result[Own.OwnedArm, Diagnostic]:
+	match arm.body.definitions:
+		[constructed]:
+			match constructed.operation:
+				Lower.ConstructRecordValue(owner, [left, right]):
+					Ok({
+						label = arm.label,
+						operations = [Own.DefineValue({
+							id = constructed.id,
+							value_type = constructed.value_type,
+							operation = Own.ConstructRecordDefinition(owner, [
+								{
+									field = left.field,
+									value = Own.OwnedPayload(left.value, Own.owner_id(0)),
+								},
+								{
+									field = right.field,
+									value = Own.OwnedPayload(right.value, second),
+								},
+							]),
+							result = Own.OwnedResult(introduced),
+							span = span(at),
+						})],
+						exit = Own.ReturnResult(Own.OwnedReturn(constructed.id, introduced)),
+					})
+				_:
+					Err(seed_error())
+		_:
+			Err(seed_error())
+
+
+private pure func raw_stored_prefix_function(
+	function: Lower.LoweredFunction,
+	seed: Lower.LoweredFunctions,
+	slots: PrefixSlots,
+) -> Result[Own.OwnedFunction, Diagnostic]:
+	match function.tail:
+		Lower.ExitValue(_):
+			Own.insert_function(function, seed.unions, seed.records)
+		Lower.MatchValue(matched):
+			match (function.definitions, matched.arms):
+				([parameter, text], [first, second]):
+					match text.operation:
+						Lower.StringValue(contents):
+							var operations = [Own.DefineValue({
+									id = parameter.id,
+									value_type = parameter.value_type,
+									operation = Own.ParameterDefinition(0),
+									result = Own.UnmanagedResult,
+									span = span(10),
+								}), Own.DefineValue({
+									id = text.id,
+									value_type = text.value_type,
+									operation = Own.StringDefinition(contents),
+									result = Own.OwnedResult(Own.owner_id(0)),
+									span = span(11),
+								})]
+
+							second_slot = match slots:
+								DistinctSlots:
+									operations = operations.append(Own.AcquireOwner(
+										Own.owner_id(1),
+										{
+											value = text.id,
+											source = Own.OwnerBorrow(Own.owner_id(0)),
+										},
+										span(12),
+									))
+									1
+								DuplicateSlot:
+									0
+
+							left ?= raw_stored_prefix_arm(
+								first,
+								Own.owner_id(second_slot),
+								Own.owner_id(second_slot + 1),
+								20,
+							)
+							right ?= raw_stored_prefix_arm(
+								second,
+								Own.owner_id(second_slot),
+								Own.owner_id(second_slot + 2),
+								30,
+							)
+							Ok({
+								execution = function.execution,
+								signature = function.signature,
+								operations = operations,
+								tail = Own.MatchTail({
+									scrutinee = Own.UnmanagedArgument(matched.scrutinee),
+									owner = matched.owner,
+									arms = [left, right],
+								}),
+							})
+						_:
+							Err(seed_error())
+				_:
+					Err(seed_error())
+
+
+-- Only sealed identities, field positions and nominal types come from lowering.
+-- Target prefix owners, stored transfers, arm roots and returns are authored here.
+private pure func raw_stored_prefix_program(
+	slots: PrefixSlots,
+) -> Result[Own.OwnershipProgram, Diagnostic]:
+	lowered ?= lowered(STORED_PREFIX_SOURCE)
+	seed = Lower.lowered_functions(lowered)
+	var functions: List[Own.OwnedFunction] = []
+	var invalid: Option[Diagnostic] = None
+
+	for function in seed.functions:
+		match raw_stored_prefix_function(function, seed, slots):
+			Ok(owned):
+				functions = functions.append(owned)
+			Err(error):
+				invalid = Some(error)
+				break
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				records = seed.records,
+				unions = seed.unions,
+				functions = functions,
+				entrypoint = seed.entrypoint,
+			})
+
+
+pure func test_record_slots_consume_distinct_prefix_owners() -> Bool:
+	raw_stored_prefix_program(DistinctSlots)
+		.and_then(pure func(program): verify(program))
+		.is_ok()
+
+
+pure func test_record_slots_cannot_transfer_a_prefix_owner_twice() -> Bool:
+	match raw_stored_prefix_program(DuplicateSlot):
+		Err(_):
+			False
+		Ok(program):
+			match verify(program):
+				Ok(_):
+					False
+				Err(error):
+					(
+						error.message == "ownership verification failed: payload owner has already been discharged"
+						and error.help == "report this compiler error with the input program"
+						and error.span.start == 20
+						and error.span.end == 21
+						and same_source(error.span.source, COMPILER_SOURCE)
+					)
+
+
+tests: TestSuite = {
+	description = "owned match prefix verification",
+	tests = [
+		("record slots consume distinct prefix owners", test_record_slots_consume_distinct_prefix_owners),
+		("record slots cannot transfer a prefix owner twice", test_record_slots_cannot_transfer_a_prefix_owner_twice),
+		("borrowed child escape needs owner", test_borrowed_child_cannot_escape_without_owner),
+		("independent arm prefix discharge", test_independent_arm_prefix_discharge_is_valid),
+		("first arm prefix leak", test_first_arm_must_discharge_prefix),
+		("second arm prefix leak", test_second_arm_must_discharge_prefix),
+		("prefix double drop", test_prefix_cannot_be_dropped_twice),
+		("prefix owner wrong returned value", test_prefix_owner_must_own_returned_value),
+		("projection after prefix parent drop", test_parent_must_be_live_at_projection),
+		("sibling owner gap", test_sibling_owner_gap_is_unavailable),
+		("unintroduced owner", test_unintroduced_owner_is_rejected),
+	]
+}

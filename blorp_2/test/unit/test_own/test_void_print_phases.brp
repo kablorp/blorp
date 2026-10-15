@@ -1,0 +1,561 @@
+import:
+	../../../src/namespace/builtins as Builtins:
+		PrimitiveType(BuiltinString, BuiltinVoid),
+		RuntimeOperation(StringPrint),
+		RuntimeResult(ValueResult),
+		runtime_contract,
+	../../../src/check/check: CheckedProgram, checked_functions
+	../../../src/check/check_errors as Errors
+	../../../src/check/check_model as Check
+	../../../src/lex/lex: lex
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, Purity(Impure)
+	../compilation: compile
+	../input: check, check_failure, parse, setup_diagnostic
+	test: TestSuite
+
+
+private PRINT: String =
+	|func print(value: String) -> Void:
+	|    builtin("string.print")
+	|
+
+private MAIN: String =
+	|func main() -> Int:
+	|    print("hello")
+	|    0
+	|
+
+
+private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source)
+	parsed ?= parse(tokens)
+	check(parsed).map_err(setup_diagnostic)
+
+
+private pure func lowered(source: String) -> Result[Lower.LoweredProgram, Diagnostic]:
+	checked(source)
+		.and_then(pure func(program): Concrete.specialize(program))
+		.and_then(pure func(program): Lower.lower(program))
+
+
+private pure func rejects(
+	source: String,
+	message: String,
+	help: String,
+	start: Int,
+	end: Int,
+) -> Bool:
+	match compile(source):
+		Err(errors):
+			(
+				errors.first.message == message
+				and errors.first.help == help
+				and errors.first.span.start == start
+				and errors.first.span.end == end
+			)
+		Ok(_):
+			False
+
+
+pure func test_runtime_contract_is_impure_string_to_void() -> Bool:
+	operation: RuntimeOperation[Void, Concrete.TypeRef] = Builtins.StringPrint
+	contract = runtime_contract(operation)
+
+	result_matches = match contract.return_type:
+		ValueResult(Builtins.PrimitiveRuntimeType(BuiltinVoid)):
+			True
+		_:
+			False
+
+	parameters_match = match contract.parameters:
+		[Builtins.PrimitiveRuntimeType(BuiltinString)]:
+			True
+		_:
+			False
+
+	contract.purity == Impure and parameters_match and result_matches
+
+
+pure func test_checked_discard_is_void_and_does_not_create_a_binding() -> Bool:
+	match checked(PRINT + MAIN):
+		Ok(program):
+			match checked_functions(program).functions:
+				[printer, main]:
+					match main.statements:
+						[Check.DiscardExpression(value)]:
+							(
+								Check.same_type(value.value_type, Check.VoidType)
+								and main.bindings.is_empty()
+								and Check
+									.function_calls(main)
+									.length() == 1
+								and Check.same_type(
+									printer.signature.return_type.value_type,
+									Check.VoidType,
+								)
+							)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_specialization_preserves_void_statement_and_signature() -> Bool:
+	match checked(PRINT + MAIN).and_then(pure func(program): Concrete.specialize(program)):
+		Ok(program):
+			match Concrete.specialized_contents(program).functions:
+				[main, printer]:
+					match main.statements:
+						[Concrete.DiscardExpression(value)]:
+							(
+								Concrete.same_type(value.value_type, Concrete.VoidType)
+								and Concrete.same_type(
+									printer.signature.return_type,
+									Concrete.VoidType,
+								)
+							)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_lowering_keeps_discarded_call_between_argument_and_result() -> Bool:
+	match lowered(PRINT + MAIN):
+		Ok(program):
+			match Lower.lowered_functions(program).functions:
+				[main, _]:
+					match main.definitions:
+						[text, printed, zero]:
+							match (text.operation, printed.operation, zero.operation):
+								(Lower.StringValue("hello"), Lower.CallValue(_, [argument]), Lower.IntegerValue(0)):
+									(
+										Lower.value_number(argument) == Lower.value_number(text.id)
+										and Lower.value_number(text.id) == 0
+										and Lower.value_number(printed.id) == 1
+										and Lower.value_number(zero.id) == 2
+										and Concrete.same_type(
+											printed.value_type,
+											Concrete.VoidType,
+										)
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_unit_literal_has_one_unmanaged_definition() -> Bool:
+	source: String =
+		|func unit() -> Void:
+		|    void
+		|func main() -> Int:
+		|    unit()
+		|    0
+		|
+
+	match lowered(source):
+		Ok(program):
+			match Lower.lowered_functions(program).functions:
+				[_, unit]:
+					match unit.definitions:
+						[value]:
+							match value.operation:
+								Lower.VoidValue:
+									Concrete.same_type(value.value_type, Concrete.VoidType)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_emission_uses_one_unit_carrier_in_all_value_positions() -> Bool:
+	source: String =
+		|fixed union Box[T]:
+		|    Box(T)
+		|func identity[T](value: T) -> T:
+		|    value
+		|func boxed(value: Void) -> Box[Void]:
+		|    Box(identity(value))
+		|func main() -> Int:
+		|    saved = boxed(void)
+		|    0
+		|
+
+	match compile(source):
+		Ok(output):
+			(
+				output.contains("uint8_t")
+				and output.contains("((uint8_t)0)")
+				and not output.contains("blorp_string_print")
+				and not output.contains("blorp_string_release")
+			)
+		Err(_):
+			False
+
+
+private pure func rejects_builtin_header(header: String) -> Bool:
+	source = header + "\n    builtin(\"string.print\")\nfunc main() -> Int:\n    0\n"
+
+	match compile(source):
+		Err(errors):
+			(
+				errors.first.message == "builtin declaration does not match its runtime contract"
+				and errors.first.help == "declare an impure function with one String parameter returning Void"
+				and errors.first.span.start == header.length() + 13
+				and errors.first.span.end == header.length() + 27
+			)
+		Ok(_):
+			False
+
+
+pure func test_builtin_rejects_pure_print() -> Bool:
+	rejects(
+		"pure func print(value: String) -> Void:\n    builtin(\"string.print\")\nfunc main() -> Int:\n    0\n",
+		"pure functions cannot return Void",
+		"remove pure, or return a non-Void value",
+		34,
+		38,
+	)
+
+
+pure func test_builtin_rejects_wrong_print_argument() -> Bool:
+	rejects_builtin_header("func print(value: Int) -> Void:")
+
+
+pure func test_builtin_rejects_wrong_print_result() -> Bool:
+	rejects_builtin_header("func print(value: String) -> Int:")
+
+
+pure func test_builtin_rejects_wrong_print_arity() -> Bool:
+	(
+		rejects_builtin_header("func print() -> Void:")
+		and rejects_builtin_header("func print(first: String, second: String) -> Void:")
+	)
+
+
+pure func test_builtin_rejects_generic_print() -> Bool:
+	source: String =
+		|func print[T](value: T) -> Void:
+		|    builtin("string.print")
+		|func main() -> Int:
+		|    0
+		|
+	rejects(
+		source,
+		"builtin declaration does not match its runtime contract",
+		"declare an impure function with one String parameter returning Void",
+		45,
+		59,
+	)
+
+
+pure func test_pure_caller_rejects_print_before_a_final_value() -> Bool:
+	source: String =
+		|pure func main() -> Int:
+		|    print("text")
+		|    0
+		|
+
+	typed = match check_failure(PRINT + source):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.ImpureCall(_, _)):
+					True
+				_:
+					False
+		None:
+			False
+
+	start = PRINT.length() + 29
+	(
+		typed
+		and rejects(
+			PRINT + source,
+			"pure functions cannot call impure functions",
+			"mark the callee pure or remove pure from the caller",
+			start,
+			start + 5,
+		)
+	)
+
+
+pure func test_pure_caller_rejects_an_impure_void_wrapper() -> Bool:
+	source: String =
+		|func wrapper() -> Void:
+		|    print("text")
+		|pure func main() -> Int:
+		|    wrapper()
+		|    0
+		|
+	start = PRINT.length() + 71
+	rejects(
+		PRINT + source,
+		"pure functions cannot call impure functions",
+		"mark the callee pure or remove pure from the caller",
+		start,
+		start + 7,
+	)
+
+
+pure func test_pure_caller_rejects_ufcs_print() -> Bool:
+	source: String =
+		|pure func main() -> Int:
+		|    "text".print()
+		|    0
+		|
+	start = PRINT.length() + 36
+	rejects(
+		PRINT + source,
+		"pure functions cannot call impure functions",
+		"mark the callee pure or remove pure from the caller",
+		start,
+		start + 5,
+	)
+
+
+pure func test_string_statement_requires_explicit_binding() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    "unused"
+		|    0
+		|
+
+	match check_failure(source):
+		Some(error):
+			match error.kind:
+				Errors.StatementRejection(Errors.NonVoidStatement(actual)):
+					(
+						Check.same_type(actual, Check.StringType)
+						and error.span.start == 24
+						and error.span.end == 32
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_main_can_return_void() -> Bool:
+	source: String =
+		|func main() -> Void:
+		|    void
+		|
+	compile(source).is_ok()
+
+
+pure func test_void_record_field_has_managed_root() -> Bool:
+	source: String =
+		|fixed record Unit { value: Void }
+		|func main() -> Int:
+		|    0
+		|
+	compile(source).is_ok()
+
+
+pure func test_print_literal_prefix_drops_in_selected_arm() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|    First
+		|func show(choice: Choice) -> Int:
+		|    print("text")
+		|    match choice:
+		|        First: 0
+		|func main() -> Int:
+		|    show(First)
+		|
+
+	match lowered(PRINT + source).and_then(pure func(program): Own.own(program)):
+		Err(_):
+			False
+		Ok(program):
+			program.functions.any(pure func(function):
+				match function.tail:
+					Own.MatchTail(matched):
+						match matched.arms:
+							[arm]:
+								match arm.operations:
+									[Own.DefineValue(_), Own.DropOwner(owner, _)]:
+										Own.owner_number(owner) == 0
+									_:
+										False
+							_:
+								False
+					_:
+						False
+			)
+
+
+pure func test_discarded_print_arguments_are_checked_in_tail_loops() -> Bool:
+	source: String =
+		|@tail_recursive func loop(value: Int) -> Int:
+		|    print("text")
+		|    loop(value)
+		|func main() -> Int:
+		|    loop(0)
+		|
+	start = PRINT.length() + 56
+	rejects(
+		PRINT + source,
+		"managed values in @tail_recursive functions are not supported yet",
+		"use an unmanaged helper, or remove @tail_recursive",
+		start,
+		start + 6,
+	)
+
+
+pure func test_a_void_only_statement_can_precede_a_tail_match() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|    First
+		|func unit() -> Void:
+		|    void
+		|func select(choice: Choice) -> Int:
+		|    unit()
+		|    match choice:
+		|        First: 0
+		|func main() -> Int:
+		|    select(First)
+		|
+	compile(source).is_ok()
+
+
+pure func test_a_discarded_self_call_is_not_a_tail_call() -> Bool:
+	source: String =
+		|@tail_recursive func loop(value: Int) -> Void:
+		|    loop(value)
+		|    void
+		|func main() -> Int:
+		|    0
+		|
+	rejects(
+		source,
+		"recursive call is not in tail position",
+		"return this call directly, or remove @tail_recursive",
+		51,
+		62,
+	)
+
+
+pure func test_a_discarded_generic_call_is_specialized() -> Bool:
+	source: String =
+		|func identity[T](value: T) -> T:
+		|    value
+		|func main() -> Int:
+		|    identity(void)
+		|    0
+		|
+
+	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
+		Ok(program):
+			match Concrete.specialized_contents(program).functions:
+				[main, identity]:
+					match main.statements:
+						[Concrete.DiscardExpression(_)]:
+							Concrete.same_type(identity.signature.return_type, Concrete.VoidType)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_direct_void_union_payload_publishes_void_type() -> Bool:
+	source: String =
+		|fixed union Unit:
+		|    Unit(Void)
+		|func main() -> Int:
+		|    0
+		|
+
+	match checked(source):
+		Ok(program):
+			match checked_functions(program).unions:
+				[unit]:
+					match unit.variants:
+						[variant]:
+							match variant.fields:
+								[payload]:
+									Check.same_type(payload.value_type, Check.VoidType)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 Void and print phase contracts",
+	tests = [
+		(
+			"runtime contract is impure String to Void",
+			test_runtime_contract_is_impure_string_to_void,
+		),
+		(
+			"checked discard adds no binding",
+			test_checked_discard_is_void_and_does_not_create_a_binding,
+		),
+		(
+			"specialization preserves unit statement",
+			test_specialization_preserves_void_statement_and_signature,
+		),
+		(
+			"lowering keeps discarded call",
+			test_lowering_keeps_discarded_call_between_argument_and_result,
+		),
+		("unit literal is one definition", test_unit_literal_has_one_unmanaged_definition),
+		(
+			"uniform C carrier through generic payload",
+			test_emission_uses_one_unit_carrier_in_all_value_positions,
+		),
+		("builtin rejects pure print", test_builtin_rejects_pure_print),
+		("builtin rejects wrong argument", test_builtin_rejects_wrong_print_argument),
+		("builtin rejects wrong result", test_builtin_rejects_wrong_print_result),
+		("builtin rejects wrong arity", test_builtin_rejects_wrong_print_arity),
+		("builtin rejects generic print", test_builtin_rejects_generic_print),
+		(
+			"pure caller cannot print a statement",
+			test_pure_caller_rejects_print_before_a_final_value,
+		),
+		(
+			"pure caller rejects impure Void wrapper",
+			test_pure_caller_rejects_an_impure_void_wrapper,
+		),
+		("pure caller rejects UFCS print", test_pure_caller_rejects_ufcs_print),
+		("String statement needs binding", test_string_statement_requires_explicit_binding),
+		("main can return Void", test_main_can_return_void),
+		("Void record field remains rejected", test_void_record_field_has_managed_root),
+		(
+			"print literal prefix drops in selected arm",
+			test_print_literal_prefix_drops_in_selected_arm,
+		),
+		(
+			"tail loops check discarded print arguments",
+			test_discarded_print_arguments_are_checked_in_tail_loops,
+		),
+		("Void statement before tail match", test_a_void_only_statement_can_precede_a_tail_match),
+		("discarded self call is non-tail", test_a_discarded_self_call_is_not_a_tail_call),
+		("discarded generic call is specialized", test_a_discarded_generic_call_is_specialized),
+		("direct Void union payload accepted", test_direct_void_union_payload_publishes_void_type),
+	]
+}

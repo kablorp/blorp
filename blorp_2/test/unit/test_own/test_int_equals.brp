@@ -1,0 +1,211 @@
+import:
+	../../../src/check/check: CheckedProgram, check_errors, checked_functions
+	../../../src/check/check_errors as Errors
+	../../../src/check/check_model as Check
+	../../../src/check/check_render: render_failure
+	../../../src/utils/declarations as Declaration
+	../../../src/lex/lex: lex
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/namespace/builtins as Builtins
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, Purity(Pure), ParsedRuntimeOperation(IntegerEqualsBuiltin)
+	../compilation: compile
+	../input: check, check_failure, parse, setup_diagnostic
+	option: get_or
+	test: TestSuite
+
+
+private SOURCE: String =
+	|fixed union Answer:
+	|    Different
+	|    Identical
+	|pure func compare(left: Int, right: Int) -> Answer:
+	|    builtin("int.equals", Identical, Different)
+	|func main() -> Int:
+	|    compared = compare(20, 22)
+	|    0
+	|
+
+
+private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source)
+	parsed ?= parse(tokens)
+	check(parsed).map_err(setup_diagnostic)
+
+
+pure func test_checked_comparison_preserves_reversed_roles_and_int_parameters() -> Bool:
+	match checked(SOURCE):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[function, _]:
+					match function.body:
+						Check.CheckedValueBody(Check.ReturnExpression(value)):
+							match value.form:
+								Check.InvokeFunction(call, [left, right]):
+									match call.target:
+										Check.RuntimeFunction(Builtins.IntEquals(roles)):
+											(Declaration.variant_number(roles.equal) == 1
+											and Declaration.variant_number(roles.different) == 0
+											and Check.same_type(left.value_type, Check.IntType)
+											and Check.same_type(right.value_type, Check.IntType))
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_specialization_translates_roles_to_result_instance() -> Bool:
+	match checked(SOURCE).and_then(pure func(program): Concrete.specialize(program)):
+		Err(_): False
+		Ok(program):
+			match Concrete.specialized_contents(program).functions:
+				[_, function]:
+					match function.body:
+						Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+							match (value.form, value.value_type):
+								(Concrete.InvokeFunction(call, [_, _]), Concrete.UnionType(owner)):
+									match call.target:
+										Concrete.RuntimeFunction(Builtins.IntEquals(roles)):
+											(Concrete.variant_number(roles.equal) == 1
+											and Concrete.variant_number(roles.different) == 0
+											and Concrete.union_number(Concrete.variant_owner(roles.equal)) == Concrete.union_number(owner)
+											and Concrete.union_number(Concrete.variant_owner(roles.different)) == Concrete.union_number(owner))
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_ownership_keeps_numeric_comparison_unmanaged() -> Bool:
+	match checked(SOURCE)
+		.and_then(pure func(program): Concrete.specialize(program))
+		.and_then(pure func(program): Lower.lower(program)):
+		Err(_): False
+		Ok(program):
+			contents = Lower.lowered_functions(program)
+			match contents.functions:
+				[_, function]:
+					match Own.insert_function(function, contents.unions, []):
+						Err(_): False
+						Ok(owned):
+							match (owned.operations, owned.tail):
+								([Own.DefineValue(left), Own.DefineValue(right), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(returned)))):
+									match (left.result, right.result, result.result, result.operation):
+										(Own.UnmanagedResult, Own.UnmanagedResult, Own.UnmanagedResult, Own.CallDefinition(_, [Own.UnmanagedArgument(first), Own.UnmanagedArgument(second)])):
+											Lower.value_number(first) == 0 and Lower.value_number(second) == 1 and Lower.value_number(returned) == 2
+										_: False
+								_: False
+				_: False
+
+
+pure func test_emission_uses_numeric_comparison_and_explicit_tags() -> Bool:
+	match compile(SOURCE):
+		Err(_): False
+		Ok(output):
+			(output.contains("(blorp_vl_0==blorp_vl_1)?blorp_v_0_1:blorp_v_0_0")
+			and not output.contains("blorp_string_equals")
+			and not output.contains("blorp_int_equals"))
+
+
+pure func test_runtime_contract_is_pure_binary_int_to_ordinary_union() -> Bool:
+	operation: Builtins.RuntimeOperation[Int, Concrete.TypeRef] = Builtins.IntEquals({ equal = 17, different = 29 })
+	contract = Builtins.runtime_contract(operation)
+	match (contract.purity, contract.parameters, contract.return_type):
+		(Pure, [Builtins.PrimitiveRuntimeType(Builtins.BuiltinInt), Builtins.PrimitiveRuntimeType(Builtins.BuiltinInt)], Builtins.BooleanResult(roles)):
+			roles.equal == 17 and roles.different == 29
+		_: False
+
+
+pure func test_checker_rejects_string_parameter_contract() -> Bool:
+	source: String =
+		|fixed union Answer:
+		|    Different
+		|    Identical
+		|pure func compare(left: String, right: Int) -> Answer:
+		|    builtin("int.equals", Identical, Different)
+		|func main() -> Int:
+		|    0
+		|
+	match check_failure(source):
+		None: False
+		Some(error):
+			match error.kind:
+				Errors.BuiltinRejection(Errors.BuiltinContractMismatch(IntegerEqualsBuiltin(_, _))):
+					match checked(source):
+						Ok(_): False
+						Err(diagnostic):
+							(error.span.start == source.index_of("\"int.equals\"").get_or(-1)
+							and error.span.end == error.span.start + "\"int.equals\"".length()
+							and diagnostic.message == "builtin declaration does not match its runtime contract"
+							and diagnostic.help == "declare a pure nongeneric function with two Int parameters returning a union of two empty variants"
+							and diagnostic.span.start == error.span.start
+							and diagnostic.span.end == error.span.end
+							and diagnostic.note.is_none())
+				_: False
+
+
+pure func test_checker_rejects_duplicate_roles_with_exact_diagnostic() -> Bool:
+	source: String =
+		|fixed union Answer:
+		|    Different
+		|    Identical
+		|pure func compare(left: Int, right: Int) -> Answer:
+		|    builtin("int.equals", Identical, Identical)
+		|func main() -> Int:
+		|    0
+		|
+	match lex(module_source(root_module_id()), source).and_then(pure func(tokens): parse(tokens)):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = check_errors(failure)
+					rendered = render_failure(failure)
+					match errors.first.kind:
+						Errors.BuiltinRejection(Errors.BuiltinRoleCoverage):
+							(errors.remaining.is_empty() and rendered.remaining.is_empty()
+							and rendered.first.message == "builtin constructors must cover the complete result union"
+							and rendered.first.help == "bind two distinct constructors and declare exactly those two variants"
+							and rendered.first.span.start == source.index_of("\"int.equals\"").get_or(-1)
+							and rendered.first.span.end == rendered.first.span.start + "\"int.equals\"".length()
+							and rendered.first.note.is_none())
+						_: False
+
+
+pure func test_parser_requires_explicit_comparison_roles() -> Bool:
+	source: String =
+		|fixed union Answer:
+		|    Different
+		|    Identical
+		|pure func compare(left: Int, right: Int) -> Answer:
+		|    builtin("int.equals")
+		|func main() -> Int:
+		|    0
+		|
+	match checked(source):
+		Ok(_): False
+		Err(error):
+			(error.message == "expected constructor roles after the builtin label"
+			and error.help == "bind the two result constructors after the quoted label"
+			and error.span.start == source.index_of("\"int.equals\"").get_or(-1) + "\"int.equals\"".length()
+			and error.span.end == error.span.start + 1
+			and error.note.is_none())
+
+
+tests: TestSuite = {
+	description = "Blorp 2 Int equality through ordinary Bool roles",
+	tests = [
+		("checked reversed roles and numeric parameters", test_checked_comparison_preserves_reversed_roles_and_int_parameters),
+		("specialized result instance roles", test_specialization_translates_roles_to_result_instance),
+		("unmanaged numeric comparison", test_ownership_keeps_numeric_comparison_unmanaged),
+		("direct numeric C comparison", test_emission_uses_numeric_comparison_and_explicit_tags),
+		("pure numeric runtime contract", test_runtime_contract_is_pure_binary_int_to_ordinary_union),
+		("reject String parameter contract", test_checker_rejects_string_parameter_contract),
+		("reject duplicate result roles", test_checker_rejects_duplicate_roles_with_exact_diagnostic),
+		("parser requires explicit roles", test_parser_requires_explicit_comparison_roles),
+	]
+}

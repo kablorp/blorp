@@ -1,0 +1,629 @@
+import:
+	../../../src/check/check: CheckedProgram, check, checked_functions
+	../../../src/check/check_errors as Errors
+	../../../src/check/check_model as Check
+	../../../src/utils/declarations as Declaration
+	../../../src/emit/emit: emit
+	../../../src/lex/lex: lex
+	../../../src/lower/lower as Lower
+	../../../src/utils/names: same_name, program_names
+	../../../src/own/own as Own
+	../../../src/parse/parse: parse_module
+	../../../src/namespace/builtins as Builtins: check_builtin_types, render_builtin_type_error
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, Entrypoint(NoArguments, WithArguments), EntryResult(IntegerExitStatus), entry_function, FunctionExecution(OrdinaryCalls)
+	../../../src/verify/verify: verify
+	../input: check_failure, initial_names, setup_diagnostic
+	option: get_or
+	../module_input: PRIMITIVE_BASE, TEST_BASE, parse_modules_with_base
+	../ownership_inputs: InputIds, input_ids, parameter, function, span
+	test: TestSuite
+
+
+private SOURCE: String =
+	|fixed union Box[T]:
+	|    Full(T)
+	|pure func identity[T](value: List[T]) -> List[T]:
+	|    value
+	|pure func unbox(value: Box[List[String]]) -> List[String]:
+	|    match value:
+	|        Full(values): values
+	|func main(arguments: List[String]) -> Int:
+	|    saved = identity(arguments)
+	|    unpacked = unbox(Full(saved))
+	|    0
+	|
+
+
+private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
+	parsed ?= parse_modules_with_base([{ source = source, targets = [] }], PRIMITIVE_BASE)
+	check(parsed).map_err(setup_diagnostic)
+
+
+pure func test_prelude_publishes_distinct_list_constructor_identity() -> Bool:
+	match initial_names():
+		Ok(initial):
+			special = initial.special
+			not same_name(special.list, special.string) and not same_name(special.list, special.integer)
+		Err(_): False
+
+
+pure func test_missing_list_constructor_has_exact_diagnostic() -> Bool:
+	source = "type Int = builtin\ntype Float = builtin\ntype String = builtin\ntype Void = builtin\n"
+	match parse_modules_with_base([{ source = "func main() -> Int:\n    0\n", targets = [] }], { PRIMITIVE_BASE | types = source }).and_then(pure func(value): check_builtin_types(value).map_err(render_builtin_type_error)):
+		Err(error): error.message == "missing List builtin declaration" and error.help == "add type List[T] = builtin to _base.brp" and error.span.start == source.length() and error.span.end == source.length()
+		Ok(_): False
+
+
+pure func test_builtin_list_declaration_requires_exact_unary_arity() -> Bool:
+	prefix = TEST_BASE.types + "type List[T"
+	match lex(module_source(root_module_id()), prefix + ", U] = builtin\n").and_then(pure func(tokens): parse_module(tokens, root_module_id(), program_names().names)):
+		Err(error): error.message == "List requires exactly one type parameter" and error.help == "write type List[T] = builtin" and error.span.start == prefix.length() and error.span.end == prefix.length() + 1
+		Ok(_): False
+
+
+pure func test_checker_accepts_argument_main_once() -> Bool:
+	match checked("func main(renamed: List[String]) -> Int:\n    0\n"):
+		Err(_): False
+		Ok(program):
+			facts = checked_functions(program)
+			match (facts.entrypoint, facts.functions):
+				(WithArguments(entry, _), [function]):
+					Declaration.function_number(entry) == 0 and function.signature.type_parameters.is_empty() and Check.same_type(function.signature.parameters.get(0).map(pure func(value): value.value_type).get_or(Check.IntType), Check.ListType(Check.StringType))
+				_: False
+
+
+pure func test_list_structural_equality_recurses_into_element() -> Bool:
+	Check.same_type(Check.ListType(Check.StringType), Check.ListType(Check.StringType)) and not Check.same_type(Check.ListType(Check.StringType), Check.ListType(Check.IntType)) and not Concrete.same_type(Concrete.ListType(Concrete.StringType), Concrete.ListType(Concrete.IntType))
+
+
+pure func test_generic_list_argument_infers_element_and_substitutes_result() -> Bool:
+	match checked(SOURCE):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions.get(2):
+				Some(main):
+					match main.statements:
+						[Check.InitializeBinding(_, value), Check.InitializeBinding(_, _)]:
+							match value.form:
+								Check.InvokeFunction(call, [_]):
+									match call.target:
+										Check.UserFunction(_, [Check.StringType]): Check.same_type(value.value_type, Check.ListType(Check.StringType))
+										_: False
+								_: False
+						_: False
+				None: False
+
+
+private pure func runtime_body(function: Check.CheckedFunction) -> Option[Builtins.RuntimeOperation[Declaration.VariantId, Check.TypeRef]]:
+	match function.body:
+		Check.CheckedValueBody(Check.ReturnExpression(value)):
+			match value.form:
+				Check.InvokeFunction(call, _):
+					match call.target:
+						Check.RuntimeFunction(operation): Some(operation)
+						_: None
+				_: None
+		_: None
+
+
+pure func test_generic_list_length_header_carries_its_rigid_element() -> Bool:
+	source: String =
+		|pure func count[T](values: List[T]) -> Int:
+		|    builtin("list.length")
+		|func main() -> Int:
+		|    0
+		|
+	match checked(source):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[count, _]:
+					parameters = count.signature.parameters.map(pure func(value): value.value_type)
+					accepted_element = match count.signature.type_parameters:
+						[element]: Check.same_types(parameters, [Check.ListType(Check.ParameterType(element))])
+						_: False
+					accepted_operation = match runtime_body(count):
+						Some(Builtins.ListLength(element)):
+							Check.same_types(parameters, [Check.ListType(element)])
+						_: False
+					accepted_element and accepted_operation and Check.same_type(count.signature.return_type.value_type, Check.IntType)
+				_: False
+
+
+pure func test_generic_list_get_header_preserves_its_result_element() -> Bool:
+	source: String =
+		|fixed union Maybe[T]:
+		|    Missing
+		|    Present(T)
+		|pure func item[T](values: List[T], index: Int) -> Maybe[T]:
+		|    builtin("list.get", Present, Missing)
+		|func main() -> Int:
+		|    0
+		|
+	match checked(source):
+		Err(_): False
+		Ok(program):
+			facts = checked_functions(program)
+			match facts.functions:
+				[item, _]:
+					match item.signature.type_parameters:
+						[element]:
+							parameters = item.signature.parameters.map(pure func(value): value.value_type)
+							accepted_parameters = Check.same_types(parameters, [Check.ListType(Check.ParameterType(element)), Check.IntType])
+							accepted_result = match facts.unions:
+								[declaration]: Check.same_type(item.signature.return_type.value_type, Check.AppliedUnionType(declaration.id, [Check.ParameterType(element)]))
+								_: False
+							accepted_operation = match runtime_body(item):
+								Some(Builtins.ListGet(actual, roles)):
+									accepted_roles = match facts.unions:
+										[declaration]:
+											match declaration.variants:
+												[missing, present]:
+													Check.same_variant(roles.present, present.id) and Check.same_variant(roles.absent, missing.id)
+												_: False
+										_: False
+									Check.same_type(actual, Check.ParameterType(element)) and accepted_roles
+								_: False
+							accepted_parameters and accepted_result and accepted_operation
+						_: False
+				_: False
+
+
+pure func test_signature_only_list_prepares_nested_nominal_elements() -> Bool:
+	source: String =
+		|fixed record Entry { number: Int, text: String }
+		|fixed record Box[T] { value: T }
+		|fixed union Maybe[T]:
+		|    Missing
+		|    Present(T)
+		|pure func empty() -> Maybe[List[List[Box[Entry]]]]:
+		|    Missing
+		|func main() -> Int:
+		|    saved = empty()
+		|    0
+		|
+	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
+		Err(_): False
+		Ok(program):
+			facts = Concrete.specialized_contents(program)
+			match facts.records:
+				[entry, box]:
+					entry_fields = match entry.fields:
+						[Concrete.IntType, Concrete.StringType]: True
+						_: False
+					entry_root = match entry.representation:
+						Concrete.ManagedRecord: True
+						Concrete.InlineRecord: False
+					box_child = match box.fields:
+						[Concrete.RecordType(child)]:
+							match facts.records.get(Concrete.record_number(child)):
+								Some(child_layout):
+									match child_layout.fields:
+										[Concrete.IntType, Concrete.StringType]: True
+										_: False
+								None: False
+						_: False
+					box_root = match box.representation:
+						Concrete.ManagedRecord: True
+						Concrete.InlineRecord: False
+					stored_element = match facts.unions:
+						[layout]:
+							match layout.variants:
+								[[], [Concrete.ListType(Concrete.ListType(Concrete.RecordType(child)))]]:
+									match facts.records.get(Concrete.record_number(child)):
+										Some(child_layout):
+											match child_layout.fields:
+												[actual]:
+													match box.fields:
+														[expected]: Concrete.same_type(actual, expected)
+														_: False
+												_: False
+										None: False
+								_: False
+						_: False
+					entry_fields and entry_root and box_child and box_root and stored_element
+				_: False
+
+
+pure func test_concrete_list_element_known_by_substitution_is_accepted() -> Bool:
+	source: String =
+		|fixed union Maybe[T]:
+		|    None
+		|    Some(T)
+		|pure func empty[T](ignored: T) -> Maybe[List[T]]:
+		|    None
+		|func main() -> Int:
+		|    ignored = empty(7)
+		|    0
+		|
+	match checked(source):
+		Err(_): False
+		Ok(program):
+			facts = checked_functions(program)
+			match facts.functions.get(1):
+				Some(main):
+					match main.statements:
+						[Check.InitializeBinding(_, value)]:
+							match facts.unions:
+								[declaration]: Check.same_type(value.value_type, Check.AppliedUnionType(declaration.id, [Check.ListType(Check.IntType)]))
+								_: False
+						_: False
+				None: False
+
+
+
+pure func test_list_type_name_cannot_be_a_generic_parameter() -> Bool:
+	match check_failure("pure func identity[List](value: List) -> List:\n    value\nfunc main() -> Int:\n    0\n"):
+		Some(error):
+			match error.kind:
+				Errors.TypeDeclarationRejection(Errors.TypeParameterTypeNameConflict(_)): True
+				_: False
+		None: False
+
+
+pure func test_specialization_translates_accepted_entrypoint_and_list_layout() -> Bool:
+	match checked(SOURCE).and_then(pure func(value): Concrete.specialize(value)):
+		Err(_): False
+		Ok(program):
+			facts = Concrete.specialized_contents(program)
+			match (facts.entrypoint, facts.unions):
+				(WithArguments(entry, _), [layout]):
+					match (layout.variants, layout.representation):
+						([[Concrete.ListType(Concrete.StringType)]], Concrete.InlineOwningPayload): Concrete.function_number(entry) == 0
+						_: False
+				_: False
+
+
+pure func test_entrypoint_translation_uses_its_instance_identity() -> Bool:
+	match checked(SOURCE):
+		Err(_): False
+		Ok(accepted):
+			declaration = entry_function(checked_functions(accepted).entrypoint)
+			match Concrete.specialize(accepted):
+				Err(_): False
+				Ok(program):
+					facts = Concrete.specialized_contents(program)
+					instance = entry_function(facts.entrypoint)
+					match facts.functions.get(Concrete.function_number(instance)):
+						Some(main):
+							match (facts.entrypoint, main.signature.parameters):
+								(WithArguments(_, _), [Concrete.ListType(Concrete.StringType)]):
+									(
+										Declaration.function_number(declaration) != Concrete.function_number(instance)
+										and Concrete.same_type(main.signature.return_type, Concrete.IntType)
+									)
+								_: False
+						None: False
+
+
+pure func test_specialization_accepts_list_element_known_only_inside_generic_body() -> Bool:
+	source: String =
+		|fixed union Maybe[T]:
+		|    Empty
+		|    Full(T)
+		|pure func make[T](witness: T) -> Maybe[List[T]]:
+		|    Empty
+		|pure func hide[T](witness: T) -> Int:
+		|    unused = make(witness)
+		|    0
+		|func main() -> Int:
+		|    hide(42)
+		|
+	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
+		Err(_): False
+		Ok(program):
+			match Concrete.specialized_contents(program).unions:
+				[layout]:
+					fields = match layout.variants:
+						[[], [Concrete.ListType(Concrete.IntType)]]: True
+						_: False
+					owning = match layout.representation:
+						Concrete.InlineOwningPayload: True
+						Concrete.InlineUnmanaged: False
+					fields and owning
+				_: False
+
+
+
+pure func test_list_nested_generic_dependency_growth_is_rejected_early() -> Bool:
+	prefix: String =
+		|pure func make[T](value: T) -> List[T]:
+		|    make(value)
+		|pure func grow[T](value: T) -> Int:
+		|
+	suffix: String =
+		|func main() -> Int:
+		|    grow("x")
+		|
+	source = prefix + "    grow(make(value))\n" + suffix
+	match checked(source):
+		Err(error):
+			(
+				error.message == "recursive calls grow type arguments without bound"
+				and error.help == "pass recursive type arguments unchanged, permute them, or reset them to concrete types"
+				and same_source(error.span.source, module_source(root_module_id()))
+				and error.span.start == prefix.length() + 4
+				and error.span.end == prefix.length() + 8
+			)
+		Ok(_): False
+
+
+pure func test_lowering_preserves_argument_borrow_type() -> Bool:
+	match checked("func main(arguments: List[String]) -> Int:\n    0\n").and_then(pure func(value): Concrete.specialize(value)).and_then(pure func(value): Lower.lower(value)):
+		Err(_): False
+		Ok(program):
+			facts = Lower.lowered_functions(program)
+			match (facts.entrypoint, facts.functions):
+				(WithArguments(_, _), [function]):
+					match function.definitions:
+						[parameter, _]:
+							match parameter.operation:
+								Lower.ParameterValue(0): Concrete.same_type(parameter.value_type, Concrete.ListType(Concrete.StringType))
+								_: False
+						_: False
+				_: False
+
+
+pure func test_list_root_has_separate_ownership_plan() -> Bool:
+	match Concrete.value_ownership(Concrete.ListType(Concrete.StringType), [], []):
+		Ok(Concrete.ManagedListRoot): True
+		_: False
+
+
+pure func test_returning_borrowed_list_acquires_then_transfers_root() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			list_type = Concrete.ListType(Concrete.StringType)
+			lowered = function([parameter(ids.first, list_type)], ids.first, [list_type], list_type)
+			match Own.insert_function(lowered, [], []):
+				Ok(function):
+					match (function.operations, function.tail):
+						([Own.DefineValue(parameter), Own.AcquireOwner(owner, borrow, _)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(returned, transferred)))):
+							match (parameter.result, borrow.source):
+								(Own.BorrowedResult(Own.ParameterBorrow(source)), Own.ParameterBorrow(dependency)): Lower.value_number(source) == 0 and Lower.value_number(dependency) == 0 and Lower.value_number(borrow.value) == 0 and Lower.value_number(returned) == 0 and Own.owner_number(owner) == Own.owner_number(transferred)
+								_: False
+						_: False
+				Err(_): False
+
+
+private pure func definition(ids: InputIds, value_type: Concrete.TypeRef) -> Own.OwnershipOperation:
+	Own.DefineValue({ id = ids.first, value_type = value_type, operation = Own.ParameterDefinition(0), result = Own.BorrowedResult(Own.ParameterBorrow(ids.first)), span = span(10) })
+
+
+private pure func zero(ids: InputIds) -> Own.OwnedFunction:
+	{ execution = OrdinaryCalls, signature = { parameters = [], return_type = Concrete.IntType }, operations = [Own.DefineValue({ id = ids.first, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(1) })], tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.first))) }
+
+
+private pure func list_identity(ids: InputIds, acquire: Bool) -> Own.OwnedFunction:
+	list_type = Concrete.ListType(Concrete.StringType)
+	operations = if acquire:
+		[definition(ids, list_type), Own.AcquireOwner(Own.owner_id(0), { value = ids.first, source = Own.ParameterBorrow(ids.first) }, span(10))]
+	else:
+		[definition(ids, list_type)]
+	{ execution = OrdinaryCalls, signature = { parameters = [list_type], return_type = list_type }, operations = operations, tail = Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(ids.first, Own.owner_id(0)))) }
+
+
+pure func test_verifier_independently_accepts_acquired_list_transfer() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): verify({ records = [], unions = [], functions = [zero(ids), list_identity(ids, True)], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }).is_ok()
+
+
+pure func test_verifier_rejects_list_transfer_without_acquisition() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match verify({ records = [], unions = [], functions = [zero(ids), list_identity(ids, False)], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }):
+				Err(error): error.message == "ownership verification failed: owner 0 is not defined"
+				Ok(_): False
+
+
+pure func test_verifier_rejects_forged_argument_convention() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match verify({ records = [], unions = [], functions = [zero(ids)], entrypoint = WithArguments(ids.entrypoint, IntegerExitStatus) }):
+				Err(error): error.message == "ownership verification failed: entrypoint signature does not match its accepted argument and result conventions"
+				Ok(_): False
+
+
+pure func test_verifier_accepts_numeric_list_in_unused_signature() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			list_type = Concrete.ListType(Concrete.IntType)
+			unused: Own.OwnedFunction = {
+				execution = OrdinaryCalls,
+				signature = { parameters = [list_type], return_type = Concrete.IntType },
+				operations = [
+					definition(ids, list_type),
+					Own.DefineValue({ id = ids.second, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(20) }),
+				],
+				tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.second)))
+			}
+			verify({ records = [], unions = [], functions = [zero(ids), unused], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }).is_ok()
+
+
+private fixed record NestedSeed {
+	ids: InputIds,
+	unions: List[Concrete.ConcreteUnion],
+	variant: Concrete.VariantInstanceId,
+	field: Concrete.VariantFieldInstanceId,
+	lowered: Lower.LoweredFunction
+}
+
+
+private pure func nested_seed() -> Result[NestedSeed, Diagnostic]:
+	ids ?= input_ids()
+	checked ?= checked(SOURCE)
+	concrete ?= Concrete.specialize(checked)
+	program ?= Lower.lower(concrete)
+	facts = Lower.lowered_functions(program)
+	match facts.functions:
+		[_, _, unbox]:
+			match unbox.tail:
+				Lower.MatchValue(matched):
+					match matched.arms:
+						[arm]:
+							match arm.label:
+								Lower.VariantLabel(variant):
+									field ?= Concrete.variant_field(variant, 0, facts.unions, span(0))
+									Ok({ ids = ids, unions = facts.unions, variant = variant, field = field, lowered = unbox })
+								_: Err({ span = span(0), note = None, message = "expected Box variant", help = "fix phase identity seed" })
+						_: Err({ span = span(0), note = None, message = "expected one Box arm", help = "fix phase identity seed" })
+				_: Err({ span = span(0), note = None, message = "expected Box match", help = "fix phase identity seed" })
+		_: Err({ span = span(0), note = None, message = "expected three concrete roots", help = "fix phase identity seed" })
+
+
+pure func test_nested_list_payload_acquires_borrow_and_transfers_its_root() -> Bool:
+	match nested_seed():
+		Err(_): False
+		Ok(seed):
+			match Own.insert_function(seed.lowered, seed.unions, []):
+				Err(_): False
+				Ok(function):
+					match function.tail:
+						Own.MatchTail(matched):
+							match matched.arms:
+								[arm]:
+									match (arm.operations, arm.exit):
+										([Own.DefineValue(payload), Own.AcquireOwner(owner, borrow, _)], Own.ReturnResult(Own.OwnedReturn(returned, transferred))):
+											match (payload.result, borrow.source):
+												(Own.BorrowedResult(Own.PayloadBorrow(parent)), Own.PayloadBorrow(dependency)): Concrete.same_type(payload.value_type, Concrete.ListType(Concrete.StringType)) and Lower.value_number(parent) == Lower.value_number(dependency) and Lower.value_number(returned) == Lower.value_number(payload.id) and Own.owner_number(owner) == Own.owner_number(transferred)
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+private pure func nested_projection(seed: NestedSeed, acquire: Bool) -> Own.OwnedFunction:
+	ids = seed.ids
+	union_type = Concrete.UnionType(Concrete.variant_owner(seed.variant))
+	parameter = definition(ids, union_type)
+	child: Own.OwnershipOperation = Own.DefineValue({ id = ids.second, value_type = Concrete.ListType(Concrete.StringType), operation = Own.PayloadDefinition(seed.field, ids.first), result = Own.BorrowedResult(Own.PayloadBorrow(ids.first)), span = span(20) })
+	operations = if acquire:
+		[child, Own.AcquireOwner(Own.owner_id(0), { value = ids.second, source = Own.PayloadBorrow(ids.first) }, span(20))]
+	else:
+		[child]
+	matched: Own.OwnedMatch = { scrutinee = Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) }), owner = Concrete.variant_owner(seed.variant), arms = [{ label = Lower.VariantLabel(seed.variant), operations = operations, exit = Own.ReturnResult(Own.OwnedReturn(ids.second, Own.owner_id(0))) }] }
+	{ execution = OrdinaryCalls, signature = { parameters = [union_type], return_type = Concrete.ListType(Concrete.StringType) }, operations = [parameter], tail = Own.MatchTail(matched) }
+
+
+pure func test_verifier_independently_accepts_acquired_nested_list_projection() -> Bool:
+	match nested_seed():
+		Err(_): False
+		Ok(seed): verify({ records = [], unions = seed.unions, functions = [zero(seed.ids), nested_projection(seed, True)], entrypoint = NoArguments(seed.ids.entrypoint, IntegerExitStatus) }).is_ok()
+
+
+pure func test_verifier_rejects_nested_list_return_without_acquisition() -> Bool:
+	match nested_seed():
+		Err(_): False
+		Ok(seed):
+			match verify({ records = [], unions = seed.unions, functions = [zero(seed.ids), nested_projection(seed, False)], entrypoint = NoArguments(seed.ids.entrypoint, IntegerExitStatus) }):
+				Err(error): error.message == "ownership verification failed: owner 0 is not defined"
+				Ok(_): False
+
+
+pure func test_inline_list_union_acquisition_and_drop_emit_root_dispatch() -> Bool:
+	match nested_seed():
+		Err(_): False
+		Ok(seed):
+			ids = seed.ids
+			union_type = Concrete.UnionType(Concrete.variant_owner(seed.variant))
+			borrow: Own.BorrowedValue = { value = ids.first, source = Own.ParameterBorrow(ids.first) }
+			cleanup: Own.OwnedFunction = { execution = OrdinaryCalls, signature = { parameters = [union_type], return_type = Concrete.IntType }, operations = [definition(ids, union_type), Own.AcquireOwner(Own.owner_id(0), borrow, span(20)), Own.DropOwner(Own.owner_id(0), span(30)), Own.DefineValue({ id = ids.second, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(40) })], tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.second))) }
+			program: Own.OwnershipProgram = { records = [], unions = seed.unions, functions = [zero(ids), cleanup], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }
+			match verify(program).and_then(emit):
+				Ok(output): output.contains("blorp_list_dup_0_s(value.payload.blorp_up_0.blorp_uf_0)") and output.contains("blorp_list_drop_0_s(value.payload.blorp_up_0.blorp_uf_0)") and output.contains("blorp_union_dup_0(blorp_vl_0)") and output.contains("blorp_union_drop_0(blorp_owner_0)")
+				Err(_): False
+
+
+pure func test_option_list_cleanup_dispatches_present_and_empty_cases() -> Bool:
+	source: String =
+		|fixed union Option[T]:
+		|    Some(T)
+		|    None
+		|pure func present(values: List[String]) -> Option[List[String]]:
+		|    Some(values)
+		|pure func empty() -> Option[List[String]]:
+		|    None
+		|pure func copy(value: Option[List[String]]) -> Option[List[String]]:
+		|    value
+		|func main(arguments: List[String]) -> Int:
+		|    present_list = copy(present(arguments))
+		|    empty_list = copy(empty())
+		|    0
+		|
+	result = checked(source)
+		.and_then(pure func(value): Concrete.specialize(value))
+		.and_then(pure func(value): Lower.lower(value))
+		.and_then(pure func(value): Own.own(value))
+		.and_then(verify)
+		.and_then(emit)
+	match result:
+		Ok(output):
+			(
+				output.contains("void blorp_union_dup_0(struct blorp_u_0 value){switch(value.tag){case blorp_v_0_0:blorp_list_dup_0_s(value.payload.blorp_up_0.blorp_uf_0);break;case blorp_v_0_1:break;}}")
+				and output.contains("void blorp_union_drop_0(struct blorp_u_0 value){switch(value.tag){case blorp_v_0_0:blorp_list_drop_0_s(value.payload.blorp_up_0.blorp_uf_0);break;case blorp_v_0_1:break;}}")
+				and output.contains("blorp_union_dup_0(blorp_vl_0)")
+				and output.contains("blorp_union_drop_0(blorp_owner_0)")
+				and output.contains("blorp_union_drop_0(blorp_owner_1)")
+			)
+		Err(_): False
+
+
+pure func test_verifier_rejects_nullary_convention_for_borrowed_list_parameter() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			entry = { zero(ids) | signature = { parameters = [Concrete.ListType(Concrete.StringType)], return_type = Concrete.IntType }, operations = [definition(ids, Concrete.ListType(Concrete.StringType)), Own.DefineValue({ id = ids.second, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(20) })], tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.second))) }
+			match verify({ records = [], unions = [], functions = [entry], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }):
+				Err(error): error.message == "ownership verification failed: entrypoint signature does not match its accepted argument and result conventions"
+				Ok(_): False
+
+
+pure func test_verifier_accepts_numeric_list_union_child() -> Bool:
+	match nested_seed():
+		Err(_): False
+		Ok(seed):
+			layout: Concrete.ConcreteUnion = { variants = [[Concrete.ListType(Concrete.IntType)]], representation = Concrete.InlineOwningPayload }
+			verify({ records = [], unions = [layout], functions = [zero(seed.ids)], entrypoint = NoArguments(seed.ids.entrypoint, IntegerExitStatus) }).is_ok()
+
+
+tests: TestSuite = {
+	description = "Blorp 2 explicit List phase contracts",
+	tests = [
+		("prelude owns List identity", test_prelude_publishes_distinct_list_constructor_identity),
+		("prelude requires List declaration", test_missing_list_constructor_has_exact_diagnostic),
+		("List builtin declaration is unary", test_builtin_list_declaration_requires_exact_unary_arity),
+		("checker publishes accepted argument convention", test_checker_accepts_argument_main_once),
+		("List equality is structural", test_list_structural_equality_recurses_into_element),
+		("generic List inference and substitution", test_generic_list_argument_infers_element_and_substitutes_result),
+		("generic List length header carries rigid element", test_generic_list_length_header_carries_its_rigid_element),
+		("generic List get header preserves result element", test_generic_list_get_header_preserves_its_result_element),
+		("signature-only List prepares nested nominal elements", test_signature_only_list_prepares_nested_nominal_elements),
+		("known concrete List substitution is accepted", test_concrete_list_element_known_by_substitution_is_accepted),
+		("List cannot become a rigid parameter name", test_list_type_name_cannot_be_a_generic_parameter),
+		("specialization carries ABI and owning List child", test_specialization_translates_accepted_entrypoint_and_list_layout),
+		("entrypoint translates between distinct identity domains", test_entrypoint_translation_uses_its_instance_identity),
+		("generic body specializes numeric List payload", test_specialization_accepts_list_element_known_only_inside_generic_body),
+		("List nesting rejects growing generic recursion", test_list_nested_generic_dependency_growth_is_rejected_early),
+		("lowering preserves List parameter", test_lowering_preserves_argument_borrow_type),
+		("List root has a distinct ownership plan", test_list_root_has_separate_ownership_plan),
+		("borrowed List return acquires then transfers", test_returning_borrowed_list_acquires_then_transfers_root),
+		("verifier accepts independent acquired List return", test_verifier_independently_accepts_acquired_list_transfer),
+		("verifier rejects unacquired List return", test_verifier_rejects_list_transfer_without_acquisition),
+		("verifier rejects forged argument convention", test_verifier_rejects_forged_argument_convention),
+		("nested List projection acquires and transfers", test_nested_list_payload_acquires_borrow_and_transfers_its_root),
+		("verifier accepts independently acquired nested List", test_verifier_independently_accepts_acquired_nested_list_projection),
+		("verifier rejects nested List without acquisition", test_verifier_rejects_nested_list_return_without_acquisition),
+		("inline union dup and drop dispatch to List root", test_inline_list_union_acquisition_and_drop_emit_root_dispatch),
+		("Option List cleanup covers Some and None", test_option_list_cleanup_dispatches_present_and_empty_cases),
+		("verifier rejects nullary ABI for borrowed List", test_verifier_rejects_nullary_convention_for_borrowed_list_parameter),
+		("verifier accepts numeric List union child", test_verifier_accepts_numeric_list_union_child),
+		("verifier accepts numeric List in unused signature", test_verifier_accepts_numeric_list_in_unused_signature),
+	]
+}

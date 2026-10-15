@@ -1,0 +1,321 @@
+import:
+	../../../src/utils/syntax: Entrypoint(NoArguments), entry_function
+	../../../src/lower/lower as Lower
+	../../../src/namespace/builtins as Builtins: RuntimeOperation(StringLength)
+	../../../src/specialize/specialize as Concrete
+	int as IntOps
+	../managed_union_inputs: lowered_modules
+	../module_input: INTEGER_OPERATIONS, STRING_OPERATIONS
+	system: read_file
+	test: TestSuite
+
+
+private pure func same_value(left: Lower.ValueId, right: Lower.ValueId) -> Bool:
+	IntOps.equals(
+		Lower.value_number(left),
+		Lower.value_number(right),
+	)
+
+
+private pure func same_variant(
+	left: Concrete.VariantInstanceId,
+	right: Concrete.VariantInstanceId,
+) -> Bool:
+	IntOps.equals(
+		Concrete.union_number(Concrete.variant_owner(left)),
+		Concrete.union_number(Concrete.variant_owner(right)),
+	) and IntOps.equals(
+		Concrete.variant_number(left),
+		Concrete.variant_number(right),
+	)
+
+
+private func fixture(
+	path: String,
+	accepts: pure (Lower.LoweredFunctions) -> Bool,
+) -> Bool:
+	match read_file(path):
+		Err(error):
+			print_error(error)
+			False
+		Ok(source):
+			match lowered_modules([
+				{ source = source, targets = [1, 2] },
+				{ source = INTEGER_OPERATIONS, targets = [] },
+				{ source = STRING_OPERATIONS, targets = [] },
+			]):
+				Err(error):
+					print_error(error.message)
+					False
+				Ok(program):
+					accepts(Lower.lowered_functions(program))
+
+
+private pure func projection_matches(
+	arm: Lower.LoweredArm,
+	parent: Lower.ValueId,
+	value_type: Concrete.TypeRef,
+) -> Bool:
+	match (arm.label, arm.body.definitions, arm.body.exit):
+		(Lower.VariantLabel(selected), [payload], Lower.ReturnValue(returned)):
+			match payload.operation:
+				Lower.PayloadValue(field, source):
+					(
+						same_variant(selected, Concrete.variant_field_variant(field))
+						and Concrete.variant_field_number(field) == 0
+						and same_value(source, parent)
+						and same_value(returned, payload.id)
+						and Concrete.same_type(payload.value_type, value_type)
+					)
+				_:
+					False
+		_:
+			False
+
+
+private pure func string_projection(function: Lower.LoweredFunction) -> Bool:
+	match (function.definitions, function.tail):
+		([parameter], Lower.MatchValue(matched)):
+			match matched.arms:
+				[arm]:
+					(
+						same_value(parameter.id, matched.scrutinee)
+						and projection_matches(arm, parameter.id, Concrete.StringType)
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_string_projection_keeps_the_selected_variant_source_and_type() -> Bool:
+	fixture(
+		"blorp_2/test/e2e/fixtures/generic/managed/basic.brp",
+		pure func(program): program.functions.any(string_projection),
+	)
+
+
+private pure func string_construction(function: Lower.LoweredFunction) -> Bool:
+	match (function.definitions, function.signature.return_type, function.tail):
+		([parameter, constructed], Concrete.UnionType(owner), Lower.ExitValue(Lower.ReturnValue(returned))):
+			match constructed.operation:
+				Lower.ConstructValue(selected, [source]):
+					(
+						same_value(source, parameter.id)
+						and same_value(returned, constructed.id)
+						and Concrete.same_type(parameter.value_type, Concrete.StringType)
+						and Concrete.same_type(
+							constructed.value_type,
+							function.signature.return_type,
+						)
+						and IntOps.equals(
+							Concrete.union_number(owner),
+							Concrete.union_number(Concrete.variant_owner(selected)),
+						)
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_string_constructor_keeps_its_exact_input_value_and_layout() -> Bool:
+	fixture(
+		"blorp_2/test/e2e/fixtures/generic/managed/basic.brp",
+		pure func(program): program.functions.any(string_construction),
+	)
+
+
+private pure func reads(definition: Lower.ValueDefinition, expected: Lower.ValueId) -> Bool:
+	match definition.operation:
+		Lower.CallValue(_, [argument]):
+			same_value(argument, expected)
+		_:
+			False
+
+
+private pure func is_string_length(program: Lower.LoweredFunctions, id: Concrete.FunctionInstanceId) -> Bool:
+	match program.functions.get(Concrete.function_number(id)):
+		Some(function):
+			match (function.signature.parameters, function.definitions, function.tail):
+				([Concrete.StringType], [parameter, result], Lower.ExitValue(Lower.ReturnValue(returned))):
+					match result.operation:
+						Lower.CallValue(call, [argument]):
+							match call.target:
+								Concrete.RuntimeFunction(Builtins.StringLength):
+									(
+										Concrete.same_type(function.signature.return_type, Concrete.IntType)
+										and same_value(argument, parameter.id)
+										and same_value(returned, result.id)
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+private pure func length_reads(program: Lower.LoweredFunctions, definition: Lower.ValueDefinition, expected: Lower.ValueId) -> Bool:
+	match definition.operation:
+		Lower.CallValue(call, [argument]):
+			match call.target:
+				Concrete.UserFunction(id):
+					same_value(argument, expected) and is_string_length(program, id)
+				_:
+					False
+		_:
+			False
+
+
+private pure func returns(function: Lower.LoweredFunction, expected: Lower.ValueId) -> Bool:
+	match function.tail:
+		Lower.ExitValue(Lower.ReturnValue(value)):
+			same_value(value, expected)
+		_:
+			False
+
+
+private pure func saved_reads_original(program: Lower.LoweredFunctions) -> Bool:
+	match program.functions.get(Concrete.function_number(entry_function(program.entrypoint))):
+		Some(main):
+			match main.definitions:
+				[_, _, original, saved, _, _, replacement, length]:
+					(
+						reads(saved, original.id)
+						and length_reads(program, length, saved.id)
+						and not same_value(original.id, replacement.id)
+						and Concrete.same_type(original.value_type, replacement.value_type)
+						and returns(main, length.id)
+					)
+				_:
+					False
+		None:
+			False
+
+
+func test_saved_extraction_keeps_the_original_value_after_rebinding() -> Bool:
+	fixture("blorp_2/test/e2e/fixtures/generic/managed/saved.brp", saved_reads_original)
+
+
+private pure func current_reads_replacement(program: Lower.LoweredFunctions) -> Bool:
+	match program.functions.get(Concrete.function_number(entry_function(program.entrypoint))):
+		Some(main):
+			match main.definitions:
+				[_, _, original, saved, _, _, replacement, current, length]:
+					(
+						reads(saved, original.id)
+						and reads(current, replacement.id)
+						and length_reads(program, length, current.id)
+						and not same_value(saved.id, current.id)
+						and not same_value(original.id, replacement.id)
+						and returns(main, length.id)
+					)
+				_:
+					False
+		None:
+			False
+
+
+func test_current_extraction_reads_the_replacement_value_after_rebinding() -> Bool:
+	fixture("blorp_2/test/e2e/fixtures/generic/managed/current.brp", current_reads_replacement)
+
+
+private pure func two_arm_projection(function: Lower.LoweredFunction) -> Bool:
+	match (function.definitions, function.tail):
+		([parameter], Lower.MatchValue(matched)):
+			match matched.arms:
+				[first, second]:
+					match (first.body.definitions, second.body.definitions):
+						([left], [right]):
+							(
+								projection_matches(first, parameter.id, Concrete.StringType)
+								and projection_matches(second, parameter.id, Concrete.StringType)
+								and IntOps.equals(
+									Lower.value_number(parameter.id),
+									0,
+								)
+								and IntOps.equals(
+									Lower.value_number(left.id),
+									1,
+								)
+								and IntOps.equals(
+									Lower.value_number(right.id),
+									2,
+								)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+func test_sibling_string_projections_keep_distinct_global_value_ids() -> Bool:
+	fixture(
+		"blorp_2/test/e2e/fixtures/generic/managed/both_variants.brp",
+		pure func(program): program.functions.any(two_arm_projection),
+	)
+
+
+private pure func nested_projection(function: Lower.LoweredFunction) -> Bool:
+	match (function.signature.return_type, function.definitions, function.tail):
+		(Concrete.UnionType(child), [parameter], Lower.MatchValue(matched)):
+			match matched.arms:
+				[arm]:
+					(
+						projection_matches(arm, parameter.id, function.signature.return_type)
+						and IntOps.equals(
+							Concrete.union_number(child),
+							0,
+						)
+						and IntOps.equals(
+							Concrete.union_number(matched.owner),
+							1,
+						)
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_nested_projection_keeps_the_earlier_child_layout_type() -> Bool:
+	fixture(
+		"blorp_2/test/e2e/fixtures/generic/managed/nested.brp",
+		pure func(program): program.functions.any(nested_projection),
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 managed union value lowering",
+	tests = [
+		(
+			"String projection preserves exact selected variant and source",
+			test_string_projection_keeps_the_selected_variant_source_and_type,
+		),
+		(
+			"String construction preserves exact input and layout",
+			test_string_constructor_keeps_its_exact_input_value_and_layout,
+		),
+		(
+			"saved extraction preserves the original ValueId",
+			test_saved_extraction_keeps_the_original_value_after_rebinding,
+		),
+		(
+			"current extraction reads the replacement ValueId",
+			test_current_extraction_reads_the_replacement_value_after_rebinding,
+		),
+		(
+			"sibling String projections keep global ValueIds",
+			test_sibling_string_projections_keep_distinct_global_value_ids,
+		),
+		(
+			"nested projection preserves earlier child layout",
+			test_nested_projection_keeps_the_earlier_child_layout_type,
+		),
+	]
+}

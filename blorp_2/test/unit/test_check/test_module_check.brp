@@ -1,0 +1,678 @@
+import:
+	../../../src/check/check_model as Model
+	../../../src/parse/assemble: parsed_contents
+	../../../src/check/check: check, check_errors, checked_functions
+	../../../src/check/check_errors as Errors
+	../../../src/check/check_render: render_failure
+	../../../src/utils/declarations: function_number, union_number, record_number
+	../../../src/utils/names: find_name, same_name
+	../../../src/utils/source: module_id, module_source, root_module_id, same_source
+	../../../src/utils/syntax: DiagnosticNote(RecordFieldDeclaration), same_span
+	../module_input: ModuleInput, parse_modules
+	test: TestSuite
+
+
+private pure func accepts(sources: List[ModuleInput]) -> Bool:
+	match parse_modules(sources):
+		Err(_):
+			False
+		Ok(parsed):
+			check(parsed).is_ok()
+
+
+private pure func rejects(
+	sources: List[ModuleInput],
+	expected: pure (Errors.CheckError) -> Bool,
+) -> Bool:
+	match parse_modules(sources):
+		Err(_):
+			False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_):
+					False
+				Err(failure):
+					errors = check_errors(failure)
+					errors.remaining.is_empty() and expected(errors.first)
+
+
+private pure func invokes(function: Model.CheckedFunction, target: Int) -> Bool:
+	match Model.function_calls(function):
+		[call]:
+			match call.target:
+				Model.UserFunction(id, []): function_number(id) == target
+				_: False
+		_: False
+
+
+pure func test_imported_function_uses_its_own_internal_dependency() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: answer
+		|func main() -> Int:
+		|    answer()
+		|
+	helper: String =
+		|pure func answer() -> Int:
+		|    hidden()
+		|pure func hidden() -> Int:
+		|    42
+		|
+	match parse_modules([{source = root, targets = [1]}, {source = helper, targets = []}]):
+		Err(_):
+			False
+		Ok(parsed):
+			match check(parsed):
+				Err(_):
+					False
+				Ok(program):
+					functions = checked_functions(program).functions
+					match (functions.get(0), functions.get(1)):
+						(Some(main), Some(answer)):
+							invokes(main, 1) and invokes(answer, 2)
+						_:
+							False
+
+
+pure func test_same_named_helpers_keep_distinct_module_identities() -> Bool:
+	root: String =
+		|import:
+		|    ./left: left
+		|    ./right: right
+		|func main() -> Int:
+		|    saved = left()
+		|    right()
+		|
+	left: String =
+		|pure func left() -> Int:
+		|    hidden()
+		|pure func hidden() -> Int:
+		|    7
+		|
+	right: String =
+		|pure func right() -> Int:
+		|    hidden()
+		|pure func hidden() -> Int:
+		|    42
+		|
+	match parse_modules([{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}]):
+		Err(_):
+			False
+		Ok(parsed):
+			match check(parsed):
+				Err(_):
+					False
+				Ok(program):
+					functions = checked_functions(program).functions
+					match (functions.get(1), functions.get(3)):
+						(Some(left_function), Some(right_function)):
+							invokes(left_function, 2) and invokes(right_function, 4)
+						_:
+							False
+
+
+private HELPER: String =
+	|pure func answer(value: Int) -> Int:
+	|    hidden(value)
+	|pure func hidden(value: Int) -> Int:
+	|    value
+	|
+
+
+pure func test_unselected_direct_call_is_rejected() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: answer
+		|func main() -> Int:
+		|    hidden(42)
+		|
+	rejects([{source = root, targets = [1]}, {source = HELPER, targets = []}], pure func(error):
+		match error.kind:
+			Errors.CallRejection(Errors.UnknownFunction(_)):
+				same_source(error.span.source, module_source(root_module_id()))
+			_:
+				False
+	)
+
+
+pure func test_unselected_ufcs_call_is_rejected() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: answer
+		|func main() -> Int:
+		|    42.hidden()
+		|
+	rejects([{source = root, targets = [1]}, {source = HELPER, targets = []}], pure func(error):
+		match error.kind:
+			Errors.CallRejection(Errors.UnknownFunction(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_imported_ufcs_ignores_local_value_shadowing() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: answer
+		|pure func invoke(answer: Int) -> Int:
+		|    answer.answer()
+		|func main() -> Int:
+		|    invoke(42)
+		|
+	accepts([{source = root, targets = [1]}, {source = HELPER, targets = []}])
+
+
+pure func test_imported_direct_call_respects_local_value_shadowing() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: answer
+		|pure func invoke(answer: Int) -> Int:
+		|    answer(answer)
+		|func main() -> Int:
+		|    invoke(42)
+		|
+	rejects([{source = root, targets = [1]}, {source = HELPER, targets = []}], pure func(error):
+		match error.kind:
+			Errors.CallRejection(Errors.UncallableBinding(_, _, _)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_dependency_main_is_an_ordinary_generic_function() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: answer
+		|func main() -> Int:
+		|    answer()
+		|
+	helper: String =
+		|pure func answer() -> Int:
+		|    main(42)
+		|pure func main[T](value: T) -> T:
+		|    value
+		|
+	accepts([{source = root, targets = [1]}, {source = helper, targets = []}])
+
+
+pure func test_imported_main_cannot_supply_the_root_entrypoint() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: main
+		|pure func other() -> Int:
+		|    main()
+		|
+	helper: String =
+		|pure func main() -> Int:
+		|    42
+		|
+	rejects([{source = root, targets = [1]}, {source = helper, targets = []}], pure func(error):
+		match error.kind:
+			Errors.SignatureRejection(Errors.MissingMain):
+				same_source(error.span.source, module_source(root_module_id())) and error.span.start == root.length()
+			_:
+				False
+	)
+
+
+pure func test_same_named_union_types_remain_module_local() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: answer
+		|fixed union Choice:
+		|    Ready
+		|pure func choose() -> Choice:
+		|    Ready
+		|func main() -> Int:
+		|    answer()
+		|
+	helper: String =
+		|fixed union Choice:
+		|    Ready
+		|pure func choose() -> Choice:
+		|    Ready
+		|pure func answer() -> Int:
+		|    match choose():
+		|        Ready: 42
+		|
+	accepts([{source = root, targets = [1]}, {source = helper, targets = []}])
+
+
+pure func test_same_named_records_keep_distinct_nominal_ids() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: answer
+		|fixed record Box { value: Int }
+		|pure func make() -> Box:
+		|    { value = 7 }
+		|func main() -> Int:
+		|    answer()
+		|
+	helper: String =
+		|fixed record Box { value: Int }
+		|pure func make() -> Box:
+		|    { value = 42 }
+		|pure func answer() -> Int:
+		|    make().value
+		|
+	match parse_modules([{source = root, targets = [1]}, {source = helper, targets = []}]):
+		Err(_):
+			False
+		Ok(parsed):
+			match check(parsed):
+				Err(_):
+					False
+				Ok(program):
+					contents = checked_functions(program)
+					match (contents.functions.get(0), contents.functions.get(2)):
+						(Some(root_make), Some(helper_make)):
+							match (root_make.signature.return_type.value_type, helper_make.signature.return_type.value_type):
+								(Model.RecordType(root_id), Model.RecordType(helper_id)):
+									record_number(root_id) == 0 and record_number(helper_id) == 1
+								_:
+									False
+						_:
+							False
+
+
+pure func test_foreign_type_spelling_is_not_visible() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: answer
+		|pure func invalid(value: Choice) -> Int:
+		|    0
+		|func main() -> Int:
+		|    answer()
+		|
+	helper: String =
+		|fixed union Choice:
+		|    Ready
+		|pure func answer() -> Int:
+		|    42
+		|
+	rejects([{source = root, targets = [1]}, {source = helper, targets = []}], pure func(error):
+		match error.kind:
+			Errors.TypeTermRejection(Errors.UnknownType(_)):
+				True
+			_:
+				False
+	)
+
+
+private FOREIGN_CHOICE: String =
+	|fixed union Choice:
+	|    Ready
+	|pure func make() -> Choice:
+	|    Ready
+	|pure func take(value: Choice) -> Int:
+	|    42
+	|
+
+
+pure func test_foreign_constructor_value_is_not_visible() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: take
+		|func main() -> Int:
+		|    take(Ready)
+		|
+	rejects([{source = root, targets = [1]}, {source = FOREIGN_CHOICE, targets = []}], pure func(error):
+		match error.kind:
+			Errors.ValueRejection(Errors.UnknownValue(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_foreign_constructor_pattern_is_not_visible() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: make
+		|func main() -> Int:
+		|    match make():
+		|        Ready(): 42
+		|
+	rejects([{source = root, targets = [1]}, {source = FOREIGN_CHOICE, targets = []}], pure func(error):
+		match error.kind:
+			Errors.MatchRejection(Errors.UnknownConstructorPattern(_, _)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_foreign_nominal_mismatch_keeps_annotation_source() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: take
+		|fixed union Choice:
+		|    Ready
+		|pure func make() -> Choice:
+		|    Ready
+		|func main() -> Int:
+		|    take(make())
+		|
+	rejects([{source = root, targets = [1]}, {source = FOREIGN_CHOICE, targets = []}], pure func(error):
+		match (error.kind, module_id(1)):
+			(Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)), Some(helper)):
+				match (mismatch.expected, mismatch.actual.value_type, mismatch.expected_site):
+					(Model.UnionType(expected), Model.UnionType(actual), Errors.SourceAnnotation(annotation)):
+						(
+							union_number(expected) == 1
+							and union_number(actual) == 0
+							and same_source(annotation.source, module_source(helper))
+							and same_source(mismatch.actual.span.source, module_source(root_module_id()))
+						)
+					_:
+						False
+			_:
+				False
+	)
+
+
+pure func test_cross_module_record_note_keeps_its_source() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: take
+		|func main() -> Int:
+		|    take({})
+		|
+	helper: String =
+		|fixed record Box { value: Int }
+		|pure func take(value: Box) -> Int:
+		|    42
+		|
+	match parse_modules([{source = root, targets = [1]}, {source = helper, targets = []}]):
+		Err(_):
+			False
+		Ok(parsed):
+			match (check(parsed), module_id(1)):
+				(Err(failure), Some(helper_module)):
+					diagnostic = render_failure(failure).first
+					match diagnostic.note:
+						Some(RecordFieldDeclaration(span)):
+							(
+								same_source(diagnostic.span.source, module_source(root_module_id()))
+								and same_source(span.source, module_source(helper_module))
+								and diagnostic.message == "missing field in record literal"
+							)
+						_:
+							False
+				_:
+					False
+
+
+pure func test_imported_impure_function_is_checked() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: answer
+		|pure func main() -> Int:
+		|    answer()
+		|
+	helper: String =
+		|func answer() -> Int:
+		|    42
+		|
+	rejects([{source = root, targets = [1]}, {source = helper, targets = []}], pure func(error):
+		match error.kind:
+			Errors.CallRejection(Errors.ImpureCall(_, function)):
+				function_number(function) == 1
+			_:
+				False
+	)
+
+
+pure func test_unused_dependency_body_is_checked() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: answer
+		|func main() -> Int:
+		|    answer()
+		|
+	helper: String =
+		|pure func answer() -> Int:
+		|    42
+		|pure func invalid() -> Int:
+		|    missing()
+		|
+	rejects([{source = root, targets = [1]}, {source = helper, targets = []}], pure func(error):
+		match (error.kind, module_id(1)):
+			(Errors.CallRejection(Errors.UnknownFunction(_)), Some(helper_module)):
+				same_source(error.span.source, module_source(helper_module))
+			_:
+				False
+	)
+
+
+pure func test_no_import_visibility_fault_precedes_payload_annotation() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|    Value(Missing)
+		|pure func repeated() -> Int:
+		|    7
+		|pure func repeated() -> Int:
+		|    42
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules([{source = source, targets = []}]):
+		Err(_): False
+		Ok(parsed):
+			match (check(parsed), find_name(parsed_contents(parsed).names, "repeated")):
+				(Err(failure), Some(expected)):
+					errors = check_errors(failure)
+					diagnostics = render_failure(failure)
+					match errors.first.kind:
+						Errors.SignatureRejection(Errors.DuplicateFunction(name, previous)):
+							(
+								errors.remaining.is_empty() and diagnostics.remaining.is_empty()
+								and same_name(name, expected)
+								and same_source(errors.first.span.source, module_source(root_module_id()))
+								and errors.first.span.start == 84 and errors.first.span.end == 92
+								and same_source(previous.source, module_source(root_module_id()))
+								and previous.start == 49 and previous.end == 57
+								and same_span(diagnostics.first.span, errors.first.span)
+								and diagnostics.first.message == "duplicate function name"
+								and diagnostics.first.help == "give every function a distinct name"
+								and diagnostics.first.note.is_none()
+							)
+						_: False
+				_: False
+
+
+pure func test_valid_namespace_still_checks_unknown_payload_annotation() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|    Value(Missing)
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules([{source = source, targets = []}]):
+		Err(_): False
+		Ok(parsed):
+			match (check(parsed), find_name(parsed_contents(parsed).names, "Missing")):
+				(Err(failure), Some(expected)):
+					errors = check_errors(failure)
+					diagnostics = render_failure(failure)
+					match errors.first.kind:
+						Errors.TypeTermRejection(Errors.UnknownType(name)):
+							(
+								errors.remaining.is_empty() and diagnostics.remaining.is_empty()
+								and same_name(name, expected)
+								and same_source(errors.first.span.source, module_source(root_module_id()))
+								and errors.first.span.start == 30 and errors.first.span.end == 37
+								and same_span(diagnostics.first.span, errors.first.span)
+								and diagnostics.first.message == "unknown type"
+								and diagnostics.first.help == "declare or import this type; builtin types and declared type parameters are also available"
+								and diagnostics.first.note.is_none()
+							)
+						_: False
+				_: False
+
+
+pure func test_diamond_imports_share_one_function_identity() -> Bool:
+	root: String =
+		|import:
+		|    ./left: left
+		|    ./right: right
+		|func main() -> Int:
+		|    saved = left()
+		|    right()
+		|
+	left: String =
+		|import:
+		|    ./shared: value
+		|pure func left() -> Int:
+		|    value()
+		|
+	right: String =
+		|import:
+		|    ./shared: value
+		|pure func right() -> Int:
+		|    value()
+		|
+	shared: String =
+		|pure func value() -> Int:
+		|    42
+		|
+	match parse_modules([
+		{source = root, targets = [1, 2]},
+		{source = left, targets = [3]},
+		{source = right, targets = [3]},
+		{source = shared, targets = []},
+	]):
+		Err(_):
+			False
+		Ok(parsed):
+			match check(parsed):
+				Err(_):
+					False
+				Ok(program):
+					functions = checked_functions(program).functions
+					match (functions.get(1), functions.get(2)):
+						(Some(left_function), Some(right_function)):
+							invokes(left_function, 3) and invokes(right_function, 3)
+						_:
+							False
+
+
+pure func test_imported_names_are_not_reexported() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: value
+		|func main() -> Int:
+		|    value()
+		|
+	helper: String =
+		|import:
+		|    ./shared: value
+		|pure func answer() -> Int:
+		|    value()
+		|
+	shared: String =
+		|pure func value() -> Int:
+		|    42
+		|
+	rejects([
+		{source = root, targets = [1]},
+		{source = helper, targets = [2]},
+		{source = shared, targets = []},
+	], pure func(error):
+		match error.kind:
+			Errors.ImportRejection(Errors.ImportRejected(_)):
+				same_source(error.span.source, module_source(root_module_id()))
+			_:
+				False
+	)
+
+
+pure func test_module_cycle_preserves_ordinary_function_visibility() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: answer
+		|pure func value() -> Int:
+		|    42
+		|func main() -> Int:
+		|    answer()
+		|
+	helper: String =
+		|import:
+		|    ./root: value
+		|pure func answer() -> Int:
+		|    value()
+		|
+	accepts([{source = root, targets = [1]}, {source = helper, targets = [0]}])
+
+
+pure func test_ordinary_type_selection_resolves_parameter_types() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: Choice
+		|pure func identity(value: Choice) -> Choice:
+		|    value
+		|func main() -> Int:
+		|    42
+		|
+	helper: String =
+		|fixed union Choice:
+		|    Ready
+		|
+	accepts([{source = root, targets = [1]}, {source = helper, targets = []}])
+
+
+pure func test_imported_generic_main_in_a_dependency_is_ordinary() -> Bool:
+	root: String =
+		|import:
+		|    ./helper: answer
+		|func main() -> Int:
+		|    answer()
+		|
+	helper: String =
+		|import:
+		|    ./generic: main
+		|pure func answer() -> Int:
+		|    main(42)
+		|
+	generic: String =
+		|pure func main[T](value: T) -> T:
+		|    value
+		|
+	accepts([
+		{source = root, targets = [1]},
+		{source = helper, targets = [2]},
+		{source = generic, targets = []},
+	])
+
+
+tests: TestSuite = {
+	description = "Blorp 2 module checking",
+	tests = [
+		("imported function keeps its internal dependency", test_imported_function_uses_its_own_internal_dependency),
+		("same named helpers have module identities", test_same_named_helpers_keep_distinct_module_identities),
+		("unselected direct call is rejected", test_unselected_direct_call_is_rejected),
+		("unselected UFCS call is rejected", test_unselected_ufcs_call_is_rejected),
+		("imported UFCS ignores local shadowing", test_imported_ufcs_ignores_local_value_shadowing),
+		("imported direct call respects local shadowing", test_imported_direct_call_respects_local_value_shadowing),
+		("dependency main is an ordinary generic helper", test_dependency_main_is_an_ordinary_generic_function),
+		("imported main cannot supply root entrypoint", test_imported_main_cannot_supply_the_root_entrypoint),
+		("same named union types remain module local", test_same_named_union_types_remain_module_local),
+		("same named records have distinct nominal ids", test_same_named_records_keep_distinct_nominal_ids),
+		("foreign type spelling is not visible", test_foreign_type_spelling_is_not_visible),
+		("foreign constructor value is not visible", test_foreign_constructor_value_is_not_visible),
+		("foreign constructor pattern is not visible", test_foreign_constructor_pattern_is_not_visible),
+		("foreign nominal mismatch retains annotation source", test_foreign_nominal_mismatch_keeps_annotation_source),
+		("cross module record note retains source", test_cross_module_record_note_keeps_its_source),
+		("imported impure function is checked", test_imported_impure_function_is_checked),
+		("unused dependency body is checked", test_unused_dependency_body_is_checked),
+		("no import visibility fault precedes payload annotation", test_no_import_visibility_fault_precedes_payload_annotation),
+		("valid namespace checks unknown payload annotation", test_valid_namespace_still_checks_unknown_payload_annotation),
+		("diamond imports share one identity", test_diamond_imports_share_one_function_identity),
+		("imported names are not reexported", test_imported_names_are_not_reexported),
+		("module cycles preserve visibility", test_module_cycle_preserves_ordinary_function_visibility),
+		("ordinary type selection resolves parameter types", test_ordinary_type_selection_resolves_parameter_types),
+		("imported generic main remains ordinary", test_imported_generic_main_in_a_dependency_is_ordinary),
+	]
+}

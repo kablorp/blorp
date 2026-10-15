@@ -1,0 +1,736 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/utils/source: COMPILER_SOURCE
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, Span, entry_function, same_span
+	../../../src/utils/text: concat
+	../../../src/verify/verify: verify
+	../input: check, setup_diagnostic
+	int as IntOps
+	../module_input: TEST_BASE, parse_modules_with_base
+	option: to_result
+	test: TestSuite
+
+
+private ENTRY: String =
+	|fixed record Entry { number: Int, text: String }
+	|
+
+private CLONE: String =
+	|pure func subject(base: Entry) -> Entry:
+	|    { number = 9, text = base.text }
+	|func main() -> Int:
+	|    saved = subject({ number = 42, text = "42" })
+	|    0
+	|
+
+
+private fixed record Seed {
+	program: Lower.LoweredFunctions,
+	function: Lower.LoweredFunction,
+	function_id: Concrete.FunctionInstanceId
+}
+
+
+private pure func setup_error() -> Diagnostic:
+	{
+		span = { source = COMPILER_SOURCE, start = 0, end = 0 },
+		note = None,
+		message = "invalid record update ownership seed",
+		help = "fix the explicit projection and construction input"
+	}
+
+
+-- Each fixture main has exactly one record-returning user call: the tested
+-- constructor/copy helper. The mixed fixture additionally calls List repeat.
+-- Read the lowered call's complete result type and reject zero/multiple targets.
+private pure func seed(source: String) -> Result[Seed, Diagnostic]:
+	parsed ?= parse_modules_with_base([{ source = source, targets = [] }], TEST_BASE)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	program ?= Concrete.specialize(checked).and_then(Lower.lower)
+	facts = Lower.lowered_functions(program)
+	main ?= facts.functions.get(Concrete.function_number(entry_function(facts.entrypoint))).to_result(setup_error())
+	var selected: List[Concrete.FunctionInstanceId] = []
+	for definition in main.definitions:
+		match definition.operation:
+			Lower.CallValue(call, _):
+				match call.target:
+					Concrete.UserFunction(id):
+						match definition.value_type:
+							Concrete.RecordType(_): selected = selected.append(id)
+							_: void
+					_: void
+			_: void
+	match selected:
+		[id]:
+			function ?= facts.functions.get(Concrete.function_number(id)).to_result(setup_error())
+			Ok({ program = facts, function = function, function_id = id })
+		_: Err(setup_error())
+
+
+private pure func inserted(input: Seed) -> Result[Own.OwnedFunction, Diagnostic]:
+	Own.insert_function(input.function, input.program.unions, input.program.records)
+
+
+private pure func value_is(value: Lower.ValueId, number: Int) -> Bool:
+	IntOps.equals(Lower.value_number(value), number)
+
+
+private pure func owner_is(owner: Own.OwnerId, number: Int) -> Bool:
+	IntOps.equals(Own.owner_number(owner), number)
+
+
+private pure func result_owner_is(result: Own.ResultOwnership, number: Int) -> Bool:
+	match result:
+		Own.OwnedResult(owner): owner_is(owner, number)
+		_: False
+
+
+private pure func unmanaged_result(result: Own.ResultOwnership) -> Bool:
+	match result:
+		Own.UnmanagedResult: True
+		_: False
+
+
+private pure func definition_facts(actual: Own.OwnedDefinition, expected: Lower.ValueDefinition) -> Bool:
+	(
+		IntOps.equals(Lower.value_number(actual.id), Lower.value_number(expected.id))
+		and Concrete.same_type(actual.value_type, expected.value_type)
+		and same_span(actual.span, expected.span)
+	)
+
+
+private pure func field_is(actual: Concrete.FieldInstanceId, expected: Concrete.FieldInstanceId) -> Bool:
+	(
+		IntOps.equals(Concrete.record_number(Concrete.field_owner(actual)), Concrete.record_number(Concrete.field_owner(expected)))
+		and IntOps.equals(Concrete.field_number(actual), Concrete.field_number(expected))
+	)
+
+
+private pure func payload_is(field: Own.OwnedRecordField, expected: Lower.RecordFieldValue, owner: Int) -> Bool:
+	match field.value:
+		Own.OwnedPayload(value, obligation):
+			field_is(field.field, expected.field) and IntOps.equals(Lower.value_number(value), Lower.value_number(expected.value)) and owner_is(obligation, owner)
+		_: False
+
+
+private pure func unmanaged_field_is(field: Own.OwnedRecordField, expected: Lower.RecordFieldValue) -> Bool:
+	match field.value:
+		Own.UnmanagedPayload(value): field_is(field.field, expected.field) and IntOps.equals(Lower.value_number(value), Lower.value_number(expected.value))
+		_: False
+
+
+private pure func text_construction(actual: Own.OwnedDefinition, expected: Lower.ValueDefinition, stored_owner: Int) -> Bool:
+	match expected.operation:
+		Lower.ConstructRecordValue(record_id, [number, text]):
+			match actual.operation:
+				Own.ConstructRecordDefinition(owner, [first, second]):
+					(IntOps.equals(Concrete.record_number(owner), Concrete.record_number(record_id))
+					and unmanaged_field_is(first, number) and payload_is(second, text, stored_owner))
+				_: False
+		_: False
+
+
+private pure func projection_from(actual: Own.OwnedDefinition, expected: Lower.ValueDefinition, parent_owner: Option[Int]) -> Bool:
+	match expected.operation:
+		Lower.ReadRecordFieldValue(field, parent):
+			match actual.operation:
+				Own.ReadRecordFieldDefinition(actual_field, Own.BorrowedArgument(borrow)):
+					source = match parent_owner:
+						Some(owner):
+							match borrow.source:
+								Own.OwnerBorrow(id): owner_is(id, owner)
+								_: False
+						None:
+							match borrow.source:
+								Own.ParameterBorrow(id): IntOps.equals(Lower.value_number(id), Lower.value_number(parent))
+								_: False
+					result = match actual.result:
+						Own.BorrowedResult(Own.PayloadBorrow(id)): IntOps.equals(Lower.value_number(id), Lower.value_number(parent))
+						_: False
+					(definition_facts(actual, expected) and field_is(actual_field, field)
+					and IntOps.equals(Lower.value_number(borrow.value), Lower.value_number(parent)) and source and result)
+				_: False
+		_: False
+
+
+private pure func projection_acquisition(borrow: Own.BorrowedValue, expected: Lower.ValueDefinition) -> Bool:
+	match expected.operation:
+		Lower.ReadRecordFieldValue(_, parent):
+			match borrow.source:
+				Own.PayloadBorrow(id):
+					IntOps.equals(Lower.value_number(id), Lower.value_number(parent)) and IntOps.equals(Lower.value_number(borrow.value), Lower.value_number(expected.id))
+				_: False
+		_: False
+
+
+private pure func stored_acquisition(borrow: Own.BorrowedValue, value: Lower.ValueId, owner: Int) -> Bool:
+	match borrow.source:
+		Own.OwnerBorrow(id): owner_is(id, owner) and IntOps.equals(Lower.value_number(borrow.value), Lower.value_number(value))
+		_: False
+
+
+private pure func returns(owned: Own.OwnedFunction, value: Lower.ValueId, owner: Int) -> Bool:
+	match owned.tail:
+		Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(actual, obligation))):
+			IntOps.equals(Lower.value_number(actual), Lower.value_number(value)) and owner_is(obligation, owner)
+		_: False
+
+
+pure func test_borrowed_base_acquires_projection_and_stored_obligation_separately() -> Bool:
+	match seed(ENTRY.concat(CLONE)):
+		Err(_): False
+		Ok(input):
+			match input.function.definitions:
+				[base, number, text, fresh]:
+					match fresh.operation:
+						Lower.ConstructRecordValue(record_id, [number_field, text_field]):
+							match inserted(input):
+								Err(_): False
+								Ok(owned):
+									match owned.operations:
+										[Own.DefineValue(parameter), Own.DefineValue(replacement), Own.DefineValue(projected), Own.AcquireOwner(temporary, projection, projection_span), Own.AcquireOwner(stored, copied, construction_span), Own.DefineValue(result), Own.DropOwner(retired, drop_span)]:
+											parameter_borrow = match parameter.result:
+												Own.BorrowedResult(Own.ParameterBorrow(id)): value_is(id, 0)
+												_: False
+											construction = match result.operation:
+												Own.ConstructRecordDefinition(actual_record, [first, second]):
+													(IntOps.equals(Concrete.record_number(actual_record), Concrete.record_number(record_id))
+													and unmanaged_field_is(first, number_field) and payload_is(second, text_field, 1))
+												_: False
+											root = match result.result:
+												Own.OwnedResult(id): owner_is(id, 2)
+												_: False
+											(
+												value_is(base.id, 0) and value_is(number.id, 1) and value_is(text.id, 2) and value_is(fresh.id, 3)
+												and definition_facts(parameter, base) and parameter_borrow
+												and definition_facts(replacement, number) and projection_from(projected, text, None)
+												and projection_acquisition(projection, text) and owner_is(temporary, 0) and same_span(projection_span, text.span)
+												and stored_acquisition(copied, text.id, 0) and owner_is(stored, 1) and same_span(construction_span, fresh.span)
+												and definition_facts(result, fresh) and construction and root
+												and owner_is(retired, 0) and same_span(drop_span, fresh.span) and returns(owned, fresh.id, 2)
+											)
+										_: False
+						_: False
+				_: False
+
+
+pure func test_owned_base_retires_after_projection_acquisition_before_construction() -> Bool:
+	source = ENTRY.concat(
+		|pure func make() -> Entry:
+		|    { number = 42, text = "42" }
+		|pure func subject() -> Entry:
+		|    base = make()
+		|    { number = 9, text = base.text }
+		|func main() -> Int:
+		|    saved = subject()
+		|    0
+		|
+	)
+	match seed(source):
+		Err(_): False
+		Ok(input):
+			match input.function.definitions:
+				[base, _, text, fresh]:
+					match inserted(input):
+						Err(_): False
+						Ok(owned):
+							match owned.operations:
+								[Own.DefineValue(parent), Own.DefineValue(_), Own.DefineValue(projected), Own.AcquireOwner(temporary, borrowed, at_projection), Own.DropOwner(old, old_span), Own.AcquireOwner(stored, copied, at_construction), Own.DefineValue(result), Own.DropOwner(retired, retired_span)]:
+									(result_owner_is(parent.result, 0)
+									and definition_facts(parent, base) and projection_from(projected, text, Some(0))
+									and projection_acquisition(borrowed, text) and owner_is(temporary, 1)
+									and same_span(at_projection, text.span) and owner_is(old, 0) and same_span(old_span, text.span)
+									and owner_is(stored, 2) and stored_acquisition(copied, text.id, 1) and same_span(at_construction, fresh.span)
+									and definition_facts(result, fresh) and text_construction(result, fresh, 2) and result_owner_is(result.result, 3)
+									and owner_is(retired, 1) and same_span(retired_span, fresh.span) and returns(owned, fresh.id, 3))
+								_: False
+				_: False
+
+
+pure func test_all_replaced_owned_base_drops_before_independent_rhs() -> Bool:
+	source = ENTRY.concat(
+		|pure func make() -> Entry:
+		|    { number = 42, text = "42" }
+		|pure func subject() -> Entry:
+		|    base = make()
+		|    { number = 7, text = "7" }
+		|func main() -> Int:
+		|    saved = subject()
+		|    0
+		|
+	)
+	match seed(source):
+		Err(_): False
+		Ok(input):
+			match input.function.definitions:
+				[base, number, text, fresh]:
+					match inserted(input):
+						Err(_): False
+						Ok(owned):
+							match owned.operations:
+								[Own.DefineValue(parent), Own.DropOwner(old, at_base), Own.DefineValue(replacement_number), Own.DefineValue(replacement_text), Own.AcquireOwner(stored, copied, at_construction), Own.DefineValue(result), Own.DropOwner(retired, at_retirement)]:
+									(definition_facts(parent, base) and result_owner_is(parent.result, 0)
+									and owner_is(old, 0) and same_span(at_base, base.span)
+									and definition_facts(replacement_number, number) and definition_facts(replacement_text, text)
+									and result_owner_is(replacement_text.result, 1)
+									and owner_is(stored, 2) and stored_acquisition(copied, text.id, 1) and same_span(at_construction, fresh.span)
+									and definition_facts(result, fresh) and text_construction(result, fresh, 2) and result_owner_is(result.result, 3)
+									and owner_is(retired, 1) and same_span(at_retirement, fresh.span) and returns(owned, fresh.id, 3))
+								_: False
+				_: False
+
+
+pure func test_inline_numeric_copy_needs_no_ownership_operations() -> Bool:
+	source: String =
+		|fixed record Point { left: Int, right: Int }
+		|pure func subject(base: Point) -> Point:
+		|    { left = 9, right = base.right }
+		|func main() -> Int:
+		|    saved = subject({ left = 1, right = 2 })
+		|    0
+		|
+	match seed(source):
+		Err(_): False
+		Ok(input):
+			match inserted(input):
+				Err(_): False
+				Ok(owned):
+					match input.function.definitions:
+						[base, left, right, fresh]:
+							match owned.operations:
+								[Own.DefineValue(parameter), Own.DefineValue(replacement), Own.DefineValue(projected), Own.DefineValue(result)]:
+									unmanaged = [parameter, replacement, projected, result].all(pure func(definition): unmanaged_result(definition.result))
+									returned = match owned.tail:
+										Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(value))): value_is(value, 3)
+										_: False
+									unmanaged and returned and definition_facts(parameter, base) and definition_facts(replacement, left) and definition_facts(projected, right) and definition_facts(result, fresh)
+								_: False
+						_: False
+
+
+private ALIAS_SOURCE: String =
+	|fixed record Entry { number: Int, text: String }
+	|pure func make() -> Entry:
+	|    { number = 42, text = "42" }
+	|pure func subject() -> Entry:
+	|    old = make()
+	|    alias = old
+	|    kept = alias.number
+	|    { number = 9, text = old.text }
+	|func main() -> Int:
+	|    saved = subject()
+	|    0
+	|
+
+
+-- Reorder the issued rows into the consumer input needed here: base, RHS,
+-- inherited projection, construction, old-alias use. Only ordinary operations
+-- change; all five dense ValueIds and complete field/layout identities are real.
+private pure func alias_function(input: Seed) -> Result[Lower.LoweredFunction, Diagnostic]:
+	match input.function.definitions:
+		[base, old_number, number, text, fresh]:
+			match old_number.operation:
+				Lower.ReadRecordFieldValue(number_field, parent):
+					match text.operation:
+						Lower.ReadRecordFieldValue(text_field, _):
+							match fresh.operation:
+								Lower.ConstructRecordValue(owner, [first, second]):
+									if value_is(parent, 0) and field_is(number_field, first.field) and field_is(text_field, second.field):
+										replacement = { old_number | operation = Lower.IntegerValue(9), span = number.span }
+										projected = { number | value_type = Concrete.StringType, operation = Lower.ReadRecordFieldValue(text_field, base.id), span = text.span }
+										constructed = { text | value_type = fresh.value_type, span = fresh.span, operation = Lower.ConstructRecordValue(owner, [
+											{ field = first.field, value = replacement.id },
+											{ field = second.field, value = projected.id },
+										]) }
+										old_alias = { fresh | value_type = Concrete.IntType, operation = Lower.ReadRecordFieldValue(number_field, base.id), span = old_number.span }
+										Ok({ input.function | definitions = [base, replacement, projected, constructed, old_alias], tail = Lower.ExitValue(Lower.ReturnValue(constructed.id)) })
+									else:
+										Err(setup_error())
+								_: Err(setup_error())
+						_: Err(setup_error())
+				_: Err(setup_error())
+		_: Err(setup_error())
+
+
+pure func test_old_alias_keeps_original_owner_live_past_fresh_construction() -> Bool:
+	match seed(ALIAS_SOURCE):
+		Err(_): False
+		Ok(input):
+			match alias_function(input):
+				Err(_): False
+				Ok(function):
+					match function.definitions:
+						[base, _, text, fresh, old_alias]:
+							match Own.insert_function(function, input.program.unions, input.program.records):
+								Err(_): False
+								Ok(owned):
+									match owned.operations:
+										[Own.DefineValue(parent), Own.DefineValue(_), Own.DefineValue(projected), Own.AcquireOwner(temporary, borrowed, at_projection), Own.AcquireOwner(stored, copied, at_construction), Own.DefineValue(result), Own.DropOwner(retired, at_retirement), Own.DefineValue(old_read), Own.DropOwner(old_owner, at_last_use)]:
+											alias_read = match old_alias.operation:
+												Lower.ReadRecordFieldValue(field, source):
+													match old_read.operation:
+														Own.ReadRecordFieldDefinition(actual, Own.BorrowedArgument(borrow)):
+															field_is(actual, field) and stored_acquisition(borrow, source, 0) and unmanaged_result(old_read.result)
+														_: False
+												_: False
+											(definition_facts(parent, base) and result_owner_is(parent.result, 0)
+											and projection_from(projected, text, Some(0)) and projection_acquisition(borrowed, text) and owner_is(temporary, 1)
+											and same_span(at_projection, text.span) and stored_acquisition(copied, text.id, 1) and owner_is(stored, 2)
+											and same_span(at_construction, fresh.span) and definition_facts(result, fresh) and text_construction(result, fresh, 2) and result_owner_is(result.result, 3)
+											and owner_is(retired, 1) and same_span(at_retirement, fresh.span)
+											and definition_facts(old_read, old_alias) and alias_read and owner_is(old_owner, 0)
+											and same_span(at_last_use, old_alias.span) and returns(owned, fresh.id, 3))
+										_: False
+						_: False
+
+
+pure func test_replacement_and_inherited_projection_have_distinct_slot_obligations() -> Bool:
+	source: String =
+		|fixed record Pair { left: String, right: String }
+		|pure func make() -> Pair:
+		|    { left = "left", right = "right" }
+		|pure func subject() -> Pair:
+		|    base = make()
+		|    { left = base.right, right = base.right }
+		|func main() -> Int:
+		|    saved = subject()
+		|    0
+		|
+	match seed(source):
+		Err(_): False
+		Ok(input):
+			match input.function.definitions:
+				[_, changed, inherited, fresh]:
+					match fresh.operation:
+						Lower.ConstructRecordValue(owner, [left, right]):
+							match inserted(input):
+								Err(_): False
+								Ok(owned):
+									match owned.operations:
+										[Own.DefineValue(_), Own.DefineValue(first), Own.AcquireOwner(first_owner, first_borrow, first_span), Own.DefineValue(second), Own.AcquireOwner(second_owner, second_borrow, second_span), Own.DropOwner(base_owner, base_span), Own.AcquireOwner(left_owner, left_borrow, left_span), Own.AcquireOwner(right_owner, right_borrow, right_span), Own.DefineValue(result), Own.DropOwner(first_retired, first_drop_span), Own.DropOwner(second_retired, second_drop_span)]:
+											construction = match result.operation:
+												Own.ConstructRecordDefinition(actual, [first_field, second_field]):
+													IntOps.equals(Concrete.record_number(actual), Concrete.record_number(owner)) and payload_is(first_field, left, 3) and payload_is(second_field, right, 4)
+												_: False
+											(
+												value_is(changed.id, 1) and value_is(inherited.id, 2) and value_is(fresh.id, 3)
+												and projection_from(first, changed, Some(0)) and projection_from(second, inherited, Some(0))
+												and projection_acquisition(first_borrow, changed) and owner_is(first_owner, 1) and same_span(first_span, changed.span)
+												and projection_acquisition(second_borrow, inherited) and owner_is(second_owner, 2) and same_span(second_span, inherited.span)
+												and owner_is(base_owner, 0) and same_span(base_span, inherited.span)
+												and stored_acquisition(left_borrow, changed.id, 1) and owner_is(left_owner, 3) and same_span(left_span, fresh.span)
+												and stored_acquisition(right_borrow, inherited.id, 2) and owner_is(right_owner, 4) and same_span(right_span, fresh.span)
+												and definition_facts(result, fresh) and construction and result_owner_is(result.result, 5)
+												and owner_is(first_retired, 1) and owner_is(second_retired, 2)
+												and same_span(first_drop_span, fresh.span) and same_span(second_drop_span, fresh.span) and returns(owned, fresh.id, 5)
+											)
+										_: False
+						_: False
+				_: False
+
+
+private pure func zero_child_root(source: String) -> Bool:
+	match seed(source):
+		Err(_): False
+		Ok(input):
+			match input.function.definitions:
+				[base, changed, fresh]:
+					match fresh.operation:
+						Lower.ConstructRecordValue(owner, [field]):
+							match inserted(input):
+								Err(_): False
+								Ok(owned):
+									match owned.operations:
+										[Own.DefineValue(parameter), Own.DefineValue(replacement), Own.DefineValue(result)]:
+											parameter_borrow = match parameter.result:
+												Own.BorrowedResult(Own.ParameterBorrow(value)): IntOps.equals(Lower.value_number(value), Lower.value_number(base.id))
+												_: False
+											construction = match result.operation:
+												Own.ConstructRecordDefinition(actual, [stored]):
+													IntOps.equals(Concrete.record_number(actual), Concrete.record_number(owner)) and unmanaged_field_is(stored, field)
+												_: False
+											(definition_facts(parameter, base) and parameter_borrow and definition_facts(replacement, changed)
+											and unmanaged_result(replacement.result) and definition_facts(result, fresh) and construction
+											and result_owner_is(result.result, 0) and returns(owned, fresh.id, 0))
+										_: False
+						_: False
+				_: False
+
+
+pure func test_void_field_copy_still_owns_a_fresh_record_root() -> Bool:
+	zero_child_root(
+		|fixed record Unit { value: Void }
+		|pure func subject(base: Unit) -> Unit:
+		|    { value = void }
+		|func main() -> Int:
+		|    saved = subject({ value = void })
+		|    0
+		|
+	)
+
+
+pure func test_unmanaged_union_copy_still_owns_a_fresh_record_root() -> Bool:
+	zero_child_root(
+		|fixed record NumberBox { choice: Option[Int] }
+		|pure func subject(base: NumberBox) -> NumberBox:
+		|    { choice = None }
+		|func main() -> Int:
+		|    saved = subject({ choice = None })
+		|    0
+		|
+	)
+
+
+pure func test_omitted_string_escapes_after_both_owned_record_roots_retire() -> Bool:
+	match seed(ALIAS_SOURCE):
+		Err(_): False
+		Ok(input):
+			match alias_function(input):
+				Err(_): False
+				Ok(function):
+					match function.definitions:
+						[base, number, text, fresh, final_value]:
+							match text.operation:
+								Lower.ReadRecordFieldValue(field, _):
+									escaped = { final_value | value_type = Concrete.StringType, operation = Lower.ReadRecordFieldValue(field, fresh.id) }
+									updated = {
+										function |
+										signature = { function.signature | return_type = Concrete.StringType },
+										definitions = [base, number, text, fresh, escaped],
+										tail = Lower.ExitValue(Lower.ReturnValue(escaped.id))
+									}
+									match Own.insert_function(updated, input.program.unions, input.program.records):
+										Err(_): False
+										Ok(owned):
+											match owned.operations:
+												[Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(inherited), Own.AcquireOwner(temporary, first_borrow, first_span), Own.DropOwner(old, old_span), Own.AcquireOwner(stored, copied, stored_span), Own.DefineValue(result), Own.DropOwner(retired, retired_span), Own.DefineValue(child), Own.AcquireOwner(child_owner, child_borrow, child_span), Own.DropOwner(fresh_owner, fresh_span)]:
+													(projection_from(inherited, text, Some(0)) and projection_acquisition(first_borrow, text)
+													and owner_is(temporary, 1) and same_span(first_span, text.span) and owner_is(old, 0) and same_span(old_span, text.span)
+													and stored_acquisition(copied, text.id, 1) and owner_is(stored, 2) and same_span(stored_span, fresh.span)
+													and text_construction(result, fresh, 2) and result_owner_is(result.result, 3)
+													and owner_is(retired, 1) and same_span(retired_span, fresh.span)
+													and projection_from(child, escaped, Some(3)) and projection_acquisition(child_borrow, escaped)
+													and owner_is(child_owner, 4) and same_span(child_span, escaped.span)
+													and owner_is(fresh_owner, 3) and same_span(fresh_span, escaped.span) and returns(owned, escaped.id, 4))
+												_: False
+								_: False
+						_: False
+
+
+pure func test_mixed_inherited_fields_each_get_temporary_and_stored_obligations() -> Bool:
+	source: String =
+		|fixed record Entry { number: Int, text: String }
+		|fixed record Bundle { number: Int, text: String, entry: Entry, choice: Option[String], values: List[Entry] }
+		|pure func repeat[T](element: T, count: Int) -> List[T]:
+		|    builtin("list.repeat")
+		|pure func subject(base: Bundle) -> Bundle:
+		|    { number = 9, text = base.text, entry = base.entry, choice = base.choice, values = base.values }
+		|func main() -> Int:
+		|    saved = subject({ number = 42, text = "42", entry = { number = 42, text = "42" }, choice = Some("42"), values = repeat({ number = 42, text = "42" }, 2) })
+		|    0
+		|
+	match seed(source):
+		Err(_): False
+		Ok(input):
+			match input.function.definitions:
+				[_, _, text, entry, choice, values, fresh]:
+					match fresh.operation:
+						Lower.ConstructRecordValue(owner, [number_field, text_field, entry_field, choice_field, values_field]):
+							match inserted(input):
+								Err(_): False
+								Ok(owned):
+									match owned.operations:
+										[Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(text_value), Own.AcquireOwner(text_temporary, text_borrow, text_span), Own.DefineValue(entry_value), Own.AcquireOwner(entry_temporary, entry_borrow, entry_span), Own.DefineValue(choice_value), Own.AcquireOwner(choice_temporary, choice_borrow, choice_span), Own.DefineValue(list_value), Own.AcquireOwner(list_temporary, list_borrow, list_span), Own.AcquireOwner(text_stored, text_copy, text_store_span), Own.AcquireOwner(entry_stored, entry_copy, entry_store_span), Own.AcquireOwner(choice_stored, choice_copy, choice_store_span), Own.AcquireOwner(list_stored, list_copy, list_store_span), Own.DefineValue(result), Own.DropOwner(text_retired, text_drop_span), Own.DropOwner(entry_retired, entry_drop_span), Own.DropOwner(choice_retired, choice_drop_span), Own.DropOwner(list_retired, list_drop_span)]:
+											construction = match result.operation:
+												Own.ConstructRecordDefinition(actual, [number_slot, text_slot, entry_slot, choice_slot, list_slot]):
+													(IntOps.equals(Concrete.record_number(actual), Concrete.record_number(owner))
+													and unmanaged_field_is(number_slot, number_field) and payload_is(text_slot, text_field, 4)
+													and payload_is(entry_slot, entry_field, 5) and payload_is(choice_slot, choice_field, 6) and payload_is(list_slot, values_field, 7))
+												_: False
+											(projection_from(text_value, text, None) and projection_acquisition(text_borrow, text) and owner_is(text_temporary, 0) and same_span(text_span, text.span)
+											and projection_from(entry_value, entry, None) and projection_acquisition(entry_borrow, entry) and owner_is(entry_temporary, 1) and same_span(entry_span, entry.span)
+											and projection_from(choice_value, choice, None) and projection_acquisition(choice_borrow, choice) and owner_is(choice_temporary, 2) and same_span(choice_span, choice.span)
+											and projection_from(list_value, values, None) and projection_acquisition(list_borrow, values) and owner_is(list_temporary, 3) and same_span(list_span, values.span)
+											and stored_acquisition(text_copy, text.id, 0) and owner_is(text_stored, 4) and same_span(text_store_span, fresh.span)
+											and stored_acquisition(entry_copy, entry.id, 1) and owner_is(entry_stored, 5) and same_span(entry_store_span, fresh.span)
+											and stored_acquisition(choice_copy, choice.id, 2) and owner_is(choice_stored, 6) and same_span(choice_store_span, fresh.span)
+											and stored_acquisition(list_copy, values.id, 3) and owner_is(list_stored, 7) and same_span(list_store_span, fresh.span)
+											and definition_facts(result, fresh) and construction and result_owner_is(result.result, 8)
+											and owner_is(text_retired, 0) and owner_is(entry_retired, 1) and owner_is(choice_retired, 2) and owner_is(list_retired, 3)
+											and same_span(text_drop_span, fresh.span) and same_span(entry_drop_span, fresh.span) and same_span(choice_drop_span, fresh.span) and same_span(list_drop_span, fresh.span)
+											and returns(owned, fresh.id, 8))
+										_: False
+						_: False
+				_: False
+
+
+-- Raw verifier inputs are built independently of Own.insert_function. The
+-- seed supplies only predecessor identities/types and complete layouts.
+private fixed record RawClone {
+	seed: Seed,
+	function: Own.OwnedFunction,
+	construction: Lower.ValueDefinition,
+	projection: Lower.ValueDefinition
+}
+
+
+private pure func raw_clone() -> Result[RawClone, Diagnostic]:
+	input ?= seed(ENTRY.concat(CLONE))
+	match input.function.definitions:
+		[base, number, text, fresh]:
+			match text.operation:
+				Lower.ReadRecordFieldValue(field, parent):
+					match fresh.operation:
+						Lower.ConstructRecordValue(record_id, [number_field, text_field]):
+							parameter: Own.OwnedDefinition = { id = base.id, value_type = base.value_type, operation = Own.ParameterDefinition(0), result = Own.BorrowedResult(Own.ParameterBorrow(base.id)), span = base.span }
+							replacement: Own.OwnedDefinition = { id = number.id, value_type = Concrete.IntType, operation = Own.IntegerDefinition(9), result = Own.UnmanagedResult, span = number.span }
+							projected: Own.OwnedDefinition = { id = text.id, value_type = Concrete.StringType, operation = Own.ReadRecordFieldDefinition(field, Own.BorrowedArgument({ value = parent, source = Own.ParameterBorrow(parent) })), result = Own.BorrowedResult(Own.PayloadBorrow(parent)), span = text.span }
+							constructed: Own.OwnedDefinition = {
+								id = fresh.id, value_type = fresh.value_type, span = fresh.span, result = Own.OwnedResult(Own.owner_id(2)),
+								operation = Own.ConstructRecordDefinition(record_id, [
+									{ field = number_field.field, value = Own.UnmanagedPayload(number_field.value) },
+									{ field = text_field.field, value = Own.OwnedPayload(text_field.value, Own.owner_id(1)) },
+								])
+							}
+							function: Own.OwnedFunction = {
+								execution = input.function.execution, signature = input.function.signature,
+								operations = [
+									Own.DefineValue(parameter), Own.DefineValue(replacement), Own.DefineValue(projected),
+									Own.AcquireOwner(Own.owner_id(0), { value = text.id, source = Own.PayloadBorrow(parent) }, text.span),
+									Own.AcquireOwner(Own.owner_id(1), { value = text.id, source = Own.OwnerBorrow(Own.owner_id(0)) }, fresh.span),
+									Own.DefineValue(constructed), Own.DropOwner(Own.owner_id(0), fresh.span),
+								],
+								tail = Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(fresh.id, Own.owner_id(2))))
+							}
+							Ok({ seed = input, function = function, construction = fresh, projection = text })
+						_: Err(setup_error())
+				_: Err(setup_error())
+		_: Err(setup_error())
+
+
+private pure func raw_program(input: RawClone, function: Own.OwnedFunction) -> Result[Own.OwnershipProgram, Diagnostic]:
+	facts = input.seed.program
+	main_id = entry_function(facts.entrypoint)
+	main ?= facts.functions.get(Concrete.function_number(main_id)).to_result(setup_error())
+	first ?= main.definitions.get(0).to_result(setup_error())
+	dummy: Own.OwnedFunction = {
+		execution = main.execution, signature = main.signature,
+		operations = [Own.DefineValue({ id = first.id, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = first.span })],
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(first.id)))
+	}
+	var functions: List[Own.OwnedFunction] = []
+	var ordinal = 0
+	var invalid = False
+	for _ in facts.functions:
+		if IntOps.equals(ordinal, Concrete.function_number(main_id)):
+			functions = functions.append(dummy)
+		else if IntOps.equals(ordinal, Concrete.function_number(input.seed.function_id)):
+			functions = functions.append(function)
+		else:
+			invalid = True
+			break
+		ordinal = IntOps.add(ordinal, 1)
+	if invalid:
+		Err(setup_error())
+	else:
+		Ok({ records = facts.records, unions = facts.unions, functions = functions, entrypoint = facts.entrypoint })
+
+
+private pure func rejects(input: RawClone, function: Own.OwnedFunction, suffix: String, span: Span) -> Bool:
+	match raw_program(input, function).and_then(verify):
+		Ok(_): False
+		Err(error):
+			(error.message == "ownership verification failed: ".concat(suffix)
+			and error.help == "report this compiler error with the input program"
+			and error.note.is_none() and same_span(error.span, span))
+
+
+pure func test_verifier_accepts_independent_fresh_copy() -> Bool:
+	match raw_clone():
+		Err(_): False
+		Ok(input): raw_program(input, input.function).and_then(verify).is_ok()
+
+
+pure func test_verifier_rejects_wrong_retained_projection_parent() -> Bool:
+	match raw_clone():
+		Err(_): False
+		Ok(input):
+			match input.function.operations:
+				[base, Own.DefineValue(number), Own.DefineValue(projected), acquired, stored, constructed, retired]:
+					changed = { projected | result = Own.BorrowedResult(Own.PayloadBorrow(number.id)) }
+					function = { input.function | operations = [base, Own.DefineValue(number), Own.DefineValue(changed), acquired, stored, constructed, retired] }
+					rejects(input, function, "payload borrow has the wrong parent value", projected.span)
+				_: False
+
+
+pure func test_verifier_rejects_retained_child_without_stored_owner() -> Bool:
+	match raw_clone():
+		Err(_): False
+		Ok(input):
+			match input.function.operations:
+				[base, number, projected, temporary, _, Own.DefineValue(fresh), retired]:
+					match fresh.operation:
+						Own.ConstructRecordDefinition(record_id, [first, second]):
+							match second.value:
+								Own.OwnedPayload(value, _):
+									changed = { fresh | operation = Own.ConstructRecordDefinition(record_id, [first, { second | value = Own.UnmanagedPayload(value) }]), result = Own.OwnedResult(Own.owner_id(1)) }
+									function = {
+										input.function |
+										operations = [base, number, projected, temporary, Own.DefineValue(changed), retired],
+										tail = Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(fresh.id, Own.owner_id(1))))
+									}
+									rejects(input, function, "managed payload requires an owner transfer", fresh.span)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_verifier_rejects_unretired_projection_temporary() -> Bool:
+	match raw_clone():
+		Err(_): False
+		Ok(input):
+			match input.function.operations:
+				[base, number, projected, temporary, stored, fresh, _]:
+					function = { input.function | operations = [base, number, projected, temporary, stored, fresh] }
+					rejects(input, function, "owner 0 remains live at return", input.construction.span)
+				_: False
+
+
+pure func test_verifier_rejects_fresh_managed_record_without_root_owner() -> Bool:
+	match raw_clone():
+		Err(_): False
+		Ok(input):
+			match input.function.operations:
+				[base, number, projected, temporary, stored, Own.DefineValue(fresh), retired]:
+					changed = { fresh | result = Own.UnmanagedResult }
+					function = {
+						input.function |
+						operations = [base, number, projected, temporary, stored, Own.DefineValue(changed), retired],
+						tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(fresh.id)))
+					}
+					rejects(input, function, "managed result requires an owner", fresh.span)
+				_: False
+
+
+tests: TestSuite = {
+	description = "Fresh record update expansion ownership",
+	tests = [
+		("borrowed base acquires temporary and stored owner separately", test_borrowed_base_acquires_projection_and_stored_obligation_separately),
+		("owned base retires after projection before fresh construction", test_owned_base_retires_after_projection_acquisition_before_construction),
+		("all-replaced base retires before independent RHS", test_all_replaced_owned_base_drops_before_independent_rhs),
+		("inline numeric copy has no ownership operations", test_inline_numeric_copy_needs_no_ownership_operations),
+		("old alias keeps original owner past fresh construction", test_old_alias_keeps_original_owner_live_past_fresh_construction),
+		("same child projections own distinct stored slots", test_replacement_and_inherited_projection_have_distinct_slot_obligations),
+		("Void copy has a root without child obligations", test_void_field_copy_still_owns_a_fresh_record_root),
+		("unmanaged union copy has a managed record root", test_unmanaged_union_copy_still_owns_a_fresh_record_root),
+		("omitted String escapes both owned parents", test_omitted_string_escapes_after_both_owned_record_roots_retire),
+		("mixed inherited children acquire per slot", test_mixed_inherited_fields_each_get_temporary_and_stored_obligations),
+		("raw verifier accepts independent fresh copy", test_verifier_accepts_independent_fresh_copy),
+		("raw retained projection has exact parent", test_verifier_rejects_wrong_retained_projection_parent),
+		("raw retained child needs stored obligation", test_verifier_rejects_retained_child_without_stored_owner),
+		("raw fresh copy retires projection temporary", test_verifier_rejects_unretired_projection_temporary),
+		("raw managed fresh result needs root obligation", test_verifier_rejects_fresh_managed_record_without_root_owner),
+	]
+}

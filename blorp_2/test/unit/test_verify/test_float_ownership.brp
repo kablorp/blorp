@@ -1,0 +1,690 @@
+import:
+	../../../src/check/check: check
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/namespace/builtins as Builtins
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, FunctionExecution(OrdinaryCalls), Entrypoint(NoArguments), EntryResult(IntegerExitStatus), entry_function
+	../../../src/verify/verify: verify
+	float as FloatOps
+	../input: setup_diagnostic
+	list: set_index
+	../module_input: parse_modules
+	../ownership_inputs: InputIds, function, input_ids, integer, parameter, runtime, span
+	test: TestSuite
+
+
+private fixed record Seed {
+	ids: InputIds,
+	roles: Builtins.OptionalRoles[Concrete.VariantInstanceId],
+	unions: List[Concrete.ConcreteUnion]
+}
+
+
+-- Real phase authorities supply identities only. Verification tests below
+-- independently construct operations, borrows and obligations without Own repair.
+private pure func seed() -> Result[Seed, Diagnostic]:
+	source: String =
+		|fixed union Maybe[T]:
+		|    Missing
+		|    Present(T)
+		|pure func parse_number(text: String) -> Maybe[Float]:
+		|    builtin("string.parse_float", Present, Missing)
+		|func main() -> Int:
+		|    parsed = parse_number("1.25")
+		|    0
+		|
+	ids ?= input_ids()
+	parsed ?= parse_modules(
+		[
+			{
+				source = source,
+				targets = []
+			},
+		],
+	)
+	checked ?= check(parsed)
+		.map_err(setup_diagnostic)
+	concrete ?= Concrete.specialize(checked)
+	lowered ?= Lower.lower(concrete)
+	contents = Lower.lowered_functions(lowered)
+
+	match contents.functions:
+		[_, parser]:
+			match parser.definitions:
+				[_, result]:
+					match result.operation:
+						Lower.CallValue(call, [_]):
+							match call.target:
+								Concrete.RuntimeFunction(Builtins.StringParseFloat(roles)):
+									Ok({
+										ids = ids,
+										roles = roles,
+										unions = contents.unions,
+									})
+								_:
+									Err(seed_error())
+						_:
+							Err(seed_error())
+				_:
+					Err(seed_error())
+		_:
+			Err(seed_error())
+
+
+private pure func seed_error() -> Diagnostic:
+	{
+		span = span(0),
+		note = None,
+		message = "invalid Float ownership identity seed",
+		help = "fix the Float ownership test seed"
+	}
+
+
+private pure func option_type(seed: Seed) -> Concrete.TypeRef:
+	Concrete.UnionType(Concrete.variant_owner(seed.roles.present))
+
+
+private pure func number(id: Lower.ValueId, value: Float, at: Int) -> Lower.ValueDefinition:
+	{
+		id = id,
+		value_type = Concrete.FloatType,
+		operation = Lower.FloatValue(value),
+		span = span(at)
+	}
+
+
+pure func test_float_and_option_float_have_no_ownership() -> Bool:
+	match seed():
+		Err(_):
+			False
+		Ok(seed):
+			match (
+				Concrete.value_ownership(Concrete.FloatType, seed.unions, []),
+				Concrete.value_ownership(option_type(seed), seed.unions, []),
+			):
+				(Ok(Concrete.NoOwnership), Ok(Concrete.NoOwnership)):
+					True
+				_:
+					False
+
+
+pure func test_literal_is_one_unmanaged_definition_and_return() -> Bool:
+	match seed():
+		Err(_):
+			False
+		Ok(seed):
+			lowered = function(
+				[number(seed.ids.first, -0.0, 10)],
+				seed.ids.first,
+				[],
+				Concrete.FloatType,
+			)
+
+			match Own.insert_function(lowered, [], []):
+				Ok(function):
+					match (function.operations, function.tail):
+						([Own.DefineValue(value)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(returned)))):
+							match (value.operation, value.result):
+								(Own.FloatDefinition(number), Own.UnmanagedResult):
+									FloatOps.less_than(
+										FloatOps.copysign(1.0, number),
+										0.0,
+									) and Lower.value_number(returned) == 0
+								_:
+									False
+						_:
+							False
+				Err(_):
+					False
+
+
+pure func test_arithmetic_has_unmanaged_operands_result_and_return() -> Bool:
+	match seed():
+		Err(_):
+			False
+		Ok(seed):
+			ids = seed.ids
+			operation: Builtins.RuntimeOperation[Concrete.VariantInstanceId, Concrete.TypeRef] = Builtins.FloatAdd
+			lowered = function(
+				[
+					number(ids.first, 0.1, 10),
+					number(ids.second, 0.2, 20),
+					runtime(
+						ids.third,
+						operation,
+						[ids.first, ids.second],
+						Concrete.FloatType,
+						30,
+					),
+				],
+				ids.third,
+				[],
+				Concrete.FloatType,
+			)
+
+			match Own.insert_function(lowered, [], []):
+				Ok(function):
+					match (function.operations, function.tail):
+						([Own.DefineValue(first), Own.DefineValue(second), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(returned)))):
+							match (first.result, second.result, result.operation, result.result):
+								(Own.UnmanagedResult, Own.UnmanagedResult, Own.CallDefinition(_, [Own.UnmanagedArgument(left), Own.UnmanagedArgument(right)]), Own.UnmanagedResult):
+									(
+										Lower.value_number(left) == 0
+										and Lower.value_number(right) == 1
+										and Lower.value_number(returned) == 2
+									)
+								_:
+									False
+						_:
+							False
+				Err(_):
+					False
+
+
+pure func test_parse_borrows_parameter_and_returns_unmanaged_option() -> Bool:
+	match seed():
+		Err(_):
+			False
+		Ok(seed):
+			ids = seed.ids
+			lowered = function(
+				[parameter(ids.first, Concrete.StringType), runtime(
+						ids.second,
+						Builtins.StringParseFloat(seed.roles),
+						[ids.first],
+						option_type(seed),
+						30,
+					)],
+				ids.second,
+				[Concrete.StringType],
+				option_type(seed),
+			)
+
+			match Own.insert_function(lowered, seed.unions, []):
+				Ok(function):
+					match (function.operations, function.tail):
+						([Own.DefineValue(_), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(returned)))):
+							match (result.operation, result.result):
+								(Own.CallDefinition(_, [Own.BorrowedArgument(argument)]), Own.UnmanagedResult):
+									match argument.source:
+										Own.ParameterBorrow(source):
+											(
+												Lower.value_number(source) == 0
+												and Lower.value_number(argument.value) == 0
+												and Lower.value_number(returned) == 1
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				Err(_):
+					False
+
+
+pure func test_parse_drops_owned_input_after_last_borrow() -> Bool:
+	match seed():
+		Err(_):
+			False
+		Ok(seed):
+			ids = seed.ids
+			text: Lower.ValueDefinition = {
+				id = ids.first,
+				value_type = Concrete.StringType,
+				operation = Lower.StringValue("6.5"),
+				span = span(10)
+			}
+			lowered = function(
+				[text, runtime(
+						ids.second,
+						Builtins.StringParseFloat(seed.roles),
+						[ids.first],
+						option_type(seed),
+						30,
+					), integer(ids.third, 0, 50)],
+				ids.third,
+				[],
+				Concrete.IntType,
+			)
+
+			match Own.insert_function(lowered, seed.unions, []):
+				Ok(function):
+					match function.operations:
+						[Own.DefineValue(text), Own.DefineValue(result), Own.DropOwner(dropped, at), Own.DefineValue(_)]:
+							match (text.result, result.operation, result.result):
+								(Own.OwnedResult(owner), Own.CallDefinition(_, [Own.BorrowedArgument(argument)]), Own.UnmanagedResult):
+									match argument.source:
+										Own.OwnerBorrow(borrowed):
+											(
+												Own.owner_number(owner) == 0
+												and Own.owner_number(borrowed) == 0
+												and Own.owner_number(dropped) == 0
+												and at.start == 30
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				Err(_):
+					False
+
+
+private pure func formatted(seed: Seed, returned: Bool) -> Lower.LoweredFunction:
+	ids = seed.ids
+	operation: Builtins.RuntimeOperation[Concrete.VariantInstanceId, Concrete.TypeRef] = Builtins.FloatToString
+	definitions = [
+		parameter(ids.first, Concrete.FloatType),
+		runtime(ids.second, operation, [ids.first], Concrete.StringType, 30),
+	]
+
+	if returned:
+		function(definitions, ids.second, [Concrete.FloatType], Concrete.StringType)
+	else:
+		function(
+			definitions + [integer(ids.third, 0, 50)],
+			ids.third,
+			[Concrete.FloatType],
+			Concrete.IntType,
+		)
+
+
+pure func test_format_transfers_one_fresh_owned_string() -> Bool:
+	match seed():
+		Err(_):
+			False
+		Ok(seed):
+			match Own.insert_function(
+				formatted(seed, True),
+				[],
+				[],
+			):
+				Ok(function):
+					match (function.operations, function.tail):
+						([Own.DefineValue(parameter), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(returned, transferred)))):
+							match (parameter.result, result.operation, result.result):
+								(Own.UnmanagedResult, Own.CallDefinition(_, [Own.UnmanagedArgument(argument)]), Own.OwnedResult(fresh)):
+									(
+										Lower.value_number(argument) == 0
+										and Lower.value_number(returned) == 1
+										and Own.owner_number(fresh) == 0
+										and Own.owner_number(transferred) == 0
+									)
+								_:
+									False
+						_:
+							False
+				Err(_):
+					False
+
+
+pure func test_unused_format_result_drops_one_fresh_string() -> Bool:
+	match seed():
+		Err(_):
+			False
+		Ok(seed):
+			match Own.insert_function(
+				formatted(seed, False),
+				[],
+				[],
+			):
+				Ok(function):
+					match function.operations:
+						[Own.DefineValue(_), Own.DefineValue(result), Own.DropOwner(dropped, at), Own.DefineValue(_)]:
+							match result.result:
+								Own.OwnedResult(fresh):
+									(
+										Own.owner_number(fresh) == 0
+										and Own.owner_number(dropped) == 0
+										and at.start == 30
+									)
+								_:
+									False
+						_:
+							False
+				Err(_):
+					False
+
+
+private pure func define(
+	seed: Seed,
+	value_type: Concrete.TypeRef,
+	operation: Own.OwnedValueOperation,
+	result: Own.ResultOwnership,
+) -> Own.OwnershipOperation:
+	Own.DefineValue({
+		id = seed.ids.first,
+		value_type = value_type,
+		operation = operation,
+		result = result,
+		span = span(30),
+	})
+
+
+private pure func raw(
+	seed: Seed,
+	operations: List[Own.OwnershipOperation],
+	returned: Lower.ValueId,
+	return_type: Concrete.TypeRef,
+	parameters: List[Concrete.TypeRef],
+) -> Own.OwnershipProgram:
+	entry: Own.OwnedFunction = {
+		execution = OrdinaryCalls,
+		signature = {
+			parameters = [],
+			return_type = Concrete.IntType
+		},
+		operations = [define(
+				seed,
+				Concrete.IntType,
+				Own.IntegerDefinition(0),
+				Own.UnmanagedResult,
+			)],
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(seed.ids.first)))
+	}
+	tested: Own.OwnedFunction = {
+		execution = OrdinaryCalls,
+		signature = {
+			parameters = parameters,
+			return_type = return_type
+		},
+		operations = operations,
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(returned)))
+	}
+	{
+		records = [],
+		unions = seed.unions,
+		functions = [entry, tested],
+		entrypoint = NoArguments(seed.ids.entrypoint, IntegerExitStatus)
+	}
+
+
+private pure func rejects(program: Own.OwnershipProgram, message: String) -> Bool:
+	match verify(program):
+		Err(error):
+			(
+				error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+				and same_source(error.span.source, module_source(root_module_id()))
+				and error.span.start == 30
+				and error.span.end == 31
+				and error.note.is_none()
+			)
+		Ok(_):
+			False
+
+
+private pure func raw_literal(
+	seed: Seed,
+	value: Float,
+	value_type: Concrete.TypeRef,
+	result: Own.ResultOwnership,
+) -> Own.OwnershipProgram:
+	raw(seed, [define(
+				seed,
+				value_type,
+				Own.FloatDefinition(value),
+				result,
+			)], seed.ids.first, Concrete.FloatType, [])
+
+
+pure func test_raw_finite_float_literal_is_valid() -> Bool:
+	match seed():
+		Ok(seed):
+			verify(raw_literal(seed, 1.25, Concrete.FloatType, Own.UnmanagedResult)).is_ok()
+		Err(_):
+			False
+
+
+pure func test_verifier_rejects_owned_float_literal() -> Bool:
+	match seed():
+		Ok(seed):
+			rejects(
+				raw_literal(
+					seed,
+					1.25,
+					Concrete.FloatType,
+					Own.OwnedResult(Own.owner_id(0)),
+				),
+				"unmanaged value carries an ownership obligation",
+			)
+		Err(_):
+			False
+
+
+pure func test_verifier_rejects_borrowed_float_literal() -> Bool:
+	match seed():
+		Ok(seed):
+			rejects(
+				raw_literal(
+					seed,
+					1.25,
+					Concrete.FloatType,
+					Own.BorrowedResult(Own.ParameterBorrow(seed.ids.first)),
+				),
+				"unmanaged value carries an ownership obligation",
+			)
+		Err(_):
+			False
+
+
+pure func test_verifier_rejects_wrong_literal_type() -> Bool:
+	match seed():
+		Ok(seed):
+			rejects(
+				raw_literal(seed, 1.25, Concrete.IntType, Own.UnmanagedResult),
+				"definition type does not match its operation",
+			)
+		Err(_):
+			False
+
+
+pure func test_verifier_rejects_nonfinite_literal() -> Bool:
+	match seed():
+		Ok(seed):
+			[FloatOps.INFINITY, FloatOps.NAN].all(pure func(number): rejects(
+					raw_literal(seed, number, Concrete.FloatType, Own.UnmanagedResult),
+					"Float literal must be finite",
+				))
+		Err(_):
+			False
+
+
+private pure func raw_format(seed: Seed, result: Own.ResultOwnership) -> Own.OwnershipProgram:
+	call: Concrete.ConcreteCall = {
+		target = Concrete.RuntimeFunction(Builtins.FloatToString),
+		span = span(30)
+	}
+	first = define(
+		seed,
+		Concrete.FloatType,
+		Own.ParameterDefinition(0),
+		Own.UnmanagedResult,
+	)
+	formatted: Own.OwnedDefinition = {
+		id = seed.ids.second,
+		value_type = Concrete.StringType,
+		operation = Own.CallDefinition(call, [Own.UnmanagedArgument(seed.ids.first)]),
+		result = result,
+		span = span(30)
+	}
+	raw(
+		seed,
+		[first, Own.DefineValue(formatted)],
+		seed.ids.first,
+		Concrete.FloatType,
+		[Concrete.FloatType],
+	)
+
+
+pure func test_verifier_rejects_unmanaged_fresh_format_result() -> Bool:
+	match seed():
+		Ok(seed):
+			rejects(
+				raw_format(seed, Own.UnmanagedResult),
+				"managed result requires an owner",
+			)
+		Err(_):
+			False
+
+
+pure func test_verifier_rejects_borrowed_fresh_format_result() -> Bool:
+	match seed():
+		Ok(seed):
+			rejects(
+				raw_format(
+					seed,
+					Own.BorrowedResult(Own.ParameterBorrow(seed.ids.first)),
+				),
+				"managed result requires an owner",
+			)
+		Err(_):
+			False
+
+
+private pure func raw_parse(seed: Seed, result: Own.ResultOwnership) -> Own.OwnershipProgram:
+	call: Concrete.ConcreteCall = {
+		target = Concrete.RuntimeFunction(Builtins.StringParseFloat(seed.roles)),
+		span = span(30)
+	}
+	first = define(
+		seed,
+		Concrete.StringType,
+		Own.ParameterDefinition(0),
+		Own.BorrowedResult(Own.ParameterBorrow(seed.ids.first)),
+	)
+	parsed: Own.OwnedDefinition = {
+		id = seed.ids.second,
+		value_type = option_type(seed),
+		operation = Own.CallDefinition(call, [Own.BorrowedArgument({
+					value = seed.ids.first,
+					source = Own.ParameterBorrow(seed.ids.first),
+				})]),
+		result = result,
+		span = span(30)
+	}
+	raw(
+		seed,
+		[first, Own.DefineValue(parsed)],
+		seed.ids.second,
+		option_type(seed),
+		[Concrete.StringType],
+	)
+
+
+pure func test_raw_parse_borrow_and_unmanaged_option_are_valid() -> Bool:
+	match seed():
+		Ok(seed):
+			verify(raw_parse(seed, Own.UnmanagedResult)).is_ok()
+		Err(_):
+			False
+
+
+pure func test_verifier_rejects_managed_option_float_result() -> Bool:
+	match seed():
+		Ok(seed):
+			rejects(
+				raw_parse(
+					seed,
+					Own.OwnedResult(Own.owner_id(0)),
+				),
+				"unmanaged value carries an ownership obligation",
+			)
+		Err(_):
+			False
+
+
+pure func test_verifier_rejects_borrowed_option_float_result() -> Bool:
+	match seed():
+		Ok(seed):
+			rejects(
+				raw_parse(
+					seed,
+					Own.BorrowedResult(Own.ParameterBorrow(seed.ids.first)),
+				),
+				"unmanaged value carries an ownership obligation",
+			)
+		Err(_):
+			False
+
+
+pure func test_verifier_rejects_parse_float_int_payload_layout() -> Bool:
+	match seed():
+		Err(_):
+			False
+		Ok(seed):
+			program = raw_parse(seed, Own.UnmanagedResult)
+			owner = Concrete.union_number(Concrete.variant_owner(seed.roles.present))
+
+			match (
+				seed.unions.set_index(
+					owner,
+					{
+						variants = [[], [Concrete.IntType]],
+						representation = Concrete.InlineUnmanaged
+					},
+				)
+			):
+				Some(unions):
+					rejects(
+						{ program | unions = unions },
+						"variant payload does not match its operation",
+					)
+				None:
+					False
+
+
+tests: TestSuite = {
+	description = "Direct Float ownership insertion and independent verification",
+	tests = [
+		(
+			"verifier rejects borrowed Option Float",
+			test_verifier_rejects_borrowed_option_float_result,
+		),
+		(
+			"verifier rejects parse Float Int payload layout",
+			test_verifier_rejects_parse_float_int_payload_layout,
+		),
+		("Float and Option Float have no ownership", test_float_and_option_float_have_no_ownership),
+		(
+			"literal is one unmanaged definition and return",
+			test_literal_is_one_unmanaged_definition_and_return,
+		),
+		(
+			"arithmetic operands and result unmanaged",
+			test_arithmetic_has_unmanaged_operands_result_and_return,
+		),
+		(
+			"parse borrows parameter and returns unmanaged Option",
+			test_parse_borrows_parameter_and_returns_unmanaged_option,
+		),
+		(
+			"parse drops owned input after last borrow",
+			test_parse_drops_owned_input_after_last_borrow,
+		),
+		("format transfers one fresh String", test_format_transfers_one_fresh_owned_string),
+		("unused format drops one fresh String", test_unused_format_result_drops_one_fresh_string),
+		("raw finite Float literal valid", test_raw_finite_float_literal_is_valid),
+		("verifier rejects owned Float literal", test_verifier_rejects_owned_float_literal),
+		("verifier rejects borrowed Float literal", test_verifier_rejects_borrowed_float_literal),
+		("verifier rejects wrong literal type", test_verifier_rejects_wrong_literal_type),
+		("verifier rejects nonfinite literal", test_verifier_rejects_nonfinite_literal),
+		(
+			"verifier rejects unmanaged format result",
+			test_verifier_rejects_unmanaged_fresh_format_result,
+		),
+		(
+			"verifier rejects borrowed format result",
+			test_verifier_rejects_borrowed_fresh_format_result,
+		),
+		("raw parse borrowed String valid", test_raw_parse_borrow_and_unmanaged_option_are_valid),
+		(
+			"verifier rejects managed Option Float",
+			test_verifier_rejects_managed_option_float_result,
+		),
+	]
+}

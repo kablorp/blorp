@@ -1,0 +1,535 @@
+import:
+	../../../src/utils/declarations: union_number, variant_owner
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/check/check: CheckedProgram, checked_functions
+	../../../src/check/check_errors:
+		CallError(ArgumentCountMismatch, ArgumentTypeMismatch, ImpureCall, UncallableBinding),
+		CheckErrorKind(
+			CallRejection, ConstructorRejection, MatchRejection, TypeDeclarationRejection,
+			ValueRejection,
+		),
+		ConstructorError(ConstructorNeedsExpectedType),
+		MatchError(
+			MatchRequiresUnion, NonExhaustiveMatch, PatternFieldCountMismatch,
+			UnknownConstructorPattern, UnreachableArm,
+		),
+		ValueError(UnknownValue),
+	../../../src/check/check_model:
+		BindingId,
+		BindingOrigin(ParameterBinding, MatchCapture),
+		CheckedArm,
+		CheckedBody(CheckedMatchBody, CheckedValueBody),
+		CheckedExit(ReturnExpression),
+		CheckedForm(ConstructVariant, ReadBinding),
+		CheckedFunction,
+		CheckedPattern(VariantCase, BindingCase),
+		TypeRef(IntType),
+		binding_number,
+		same_type,
+	../../../src/lex/lex: lex
+	../../../src/utils/syntax: Diagnostic
+	../input: check, check_failure, parse, setup_diagnostic
+	test: TestSuite
+
+
+private VALUE: String =
+	|fixed union Value:
+	|	Empty
+	|	Number(Int)
+	|
+
+private MAIN: String =
+	|func main() -> Int:
+	|	0
+	|
+
+private UNWRAP: String = "pure func unwrap(value: Value) -> Int:\n\t"
+
+private IDENTITY: String =
+	|pure func identity(value: Int) -> Int:
+	|	value
+	|
+
+
+private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
+	input ?= lex(module_source(root_module_id()), source)
+	parsed ?= parse(input)
+	check(parsed).map_err(setup_diagnostic)
+
+
+private pure func accepts(source: String) -> Bool:
+	match checked(source):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+private pure func rejects(
+	prefix: String,
+	text: String,
+	start: Int,
+	end: Int,
+	matches: pure (CheckErrorKind) -> Bool,
+) -> Bool:
+	match check_failure(prefix + text + MAIN):
+		None:
+			False
+		Some(error):
+			(
+				error.span.start == prefix.length() + start
+				and error.span.end == prefix.length() + end
+				and matches(error.kind)
+			)
+
+
+pure func test_payload_shapes_and_contextual_constructor_owners() -> Bool:
+	source: String =
+		|fixed union Left:
+		|	Number(Int)
+		|fixed union Right:
+		|	Number(Int)
+		|pure func left() -> Left:
+		|	Number(42)
+		|pure func right() -> Right:
+		|	Number(-42)
+		|
+
+	match checked(source + MAIN):
+		Err(_):
+			False
+		Ok(program):
+			rows = checked_functions(program)
+
+			match rows.unions:
+				[first, second]:
+					match first.variants.map(pure func(variant): variant.fields):
+						[[first_type]]:
+							match second.variants.map(pure func(variant): variant.fields):
+								[[second_type]]:
+									(
+										same_type(first_type.value_type, IntType)
+										and same_type(second_type.value_type, IntType)
+										and constructor_owners(rows.functions)
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+private pure func constructor_owners(functions: List[CheckedFunction]) -> Bool:
+	match functions:
+		[left, right, _]:
+			match left.body:
+				CheckedValueBody(ReturnExpression(left)):
+					match right.body:
+						CheckedValueBody(ReturnExpression(right)):
+							match left.form:
+								ConstructVariant(first, [_]):
+									match right.form:
+										ConstructVariant(second, [_]):
+											(
+												union_number(variant_owner(first)) == 0
+												and union_number(variant_owner(second)) == 1
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_parameter_and_arm_bindings_have_distinct_definitions_and_ids() -> Bool:
+	declarations: String =
+		|fixed union Value:
+		|	Number(Int)
+		|	Other(Int)
+		|
+	body: String =
+		|match value:
+		|		Number(item): item
+		|		Other(item): item
+		|
+
+	match checked(declarations + UNWRAP + body + MAIN):
+		Err(_):
+			False
+		Ok(program):
+			match checked_functions(program).functions:
+				[function, _]:
+					match function.body:
+						CheckedMatchBody(body):
+							parameter = match body.scrutinee.form:
+								ReadBinding(id):
+									binding_number(id) == 0
+								_:
+									False
+
+							match body.arms:
+								[first, second]:
+									parameter and arm_binding(first, 1) and arm_binding(second, 2)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+private pure func single_capture(captures: List[Option[BindingId]]) -> Option[BindingId]:
+	if captures.length() == 1:
+		captures.get(0).and_then(pure func(capture): capture)
+	else:
+		None
+
+
+private pure func arm_binding(arm: CheckedArm, expected: Int) -> Bool:
+	match (arm.pattern, arm.body):
+		(VariantCase(_, captures), ReturnExpression(value)):
+			match single_capture(captures):
+				Some(definition):
+					match value.form:
+						ReadBinding(read):
+							binding_number(definition) == expected and binding_number(read) == expected
+						_:
+							False
+				None: False
+		_:
+			False
+
+
+pure func test_whole_binding_shadows_parameter_and_returns_union() -> Bool:
+	source: String =
+		|pure func copy(value: Value) -> Value:
+		|	match value:
+		|		value: value
+		|
+
+	match checked(VALUE + source + MAIN):
+		Err(_):
+			False
+		Ok(program):
+			match checked_functions(program).functions:
+				[function, _]:
+					match function.body:
+						CheckedMatchBody(body):
+							match body.arms:
+								[arm]:
+									match (arm.pattern, arm.body):
+										(BindingCase(id), ReturnExpression(value)):
+											match value.form:
+												ReadBinding(read):
+													(
+														binding_number(id) == 1
+														and binding_number(read) == 1
+													)
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_field_scope_shadowing_and_receiver_function_lookup() -> Bool:
+	receiver_body: String =
+		|match value:
+		|		Empty(): 0
+		|		Number(identity): identity.identity()
+		|
+	constructor_body: String =
+		|match value:
+		|		Empty: 0
+		|		Number(Number): Number
+		|
+	copy_source: String =
+		|pure func copy(Number: Value) -> Value:
+		|	match Number:
+		|		Number: Number
+		|
+	other_union: String =
+		|fixed union Other:
+		|	Unrelated
+		|
+	body: String =
+		|match value:
+		|		Unrelated: 0
+		|
+	(
+		accepts(VALUE + IDENTITY + UNWRAP + receiver_body + MAIN)
+		and accepts(VALUE + UNWRAP + constructor_body + MAIN)
+		and accepts(VALUE + copy_source + MAIN)
+		and accepts(VALUE + other_union + UNWRAP + body + MAIN)
+	)
+
+
+pure func test_bindings_cannot_call_or_leak_to_siblings() -> Bool:
+	prefix = VALUE + IDENTITY + UNWRAP + "match value:\n\t\tEmpty: 0\n\t\tNumber(identity): "
+	leak = VALUE + UNWRAP + "match value:\n\t\tNumber(item): item\n\t\tEmpty: "
+	rejects(prefix, "identity(identity)\n", 0, 8, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			CallRejection(UncallableBinding(_, MatchCapture, _)):
+				True
+			_:
+				False
+	) and rejects(leak, "item\n", 0, 4, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			ValueRejection(UnknownValue(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_expected_type_flows_through_function_and_constructor_spines() -> Bool:
+	copy_source: String =
+		|pure func copy(value: Value) -> Value:
+		|	value
+		|pure func make() -> Value:
+		|	copy(Number(42)).copy()
+		|
+	conversion_source: String =
+		|fixed union Other:
+		|	Number(Int)
+		|pure func convert(value: Value) -> Other:
+		|	match value:
+		|		Empty: Number(0)
+		|		Number(number): Number(number)
+		|
+	accepts(VALUE + copy_source + MAIN) and accepts(VALUE + conversion_source + MAIN)
+
+
+pure func test_constructor_scrutinee_needs_context_not_function_result() -> Bool:
+	prefix = VALUE + "pure func copy() -> Value:\n\tmatch "
+	(
+		rejects(prefix, "Number(42):\n\t\twhole: whole\n", 0, 6, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				ConstructorRejection(ConstructorNeedsExpectedType(_)):
+					True
+				_:
+					False
+		)
+		and rejects(prefix, "Empty:\n\t\twhole: whole\n", 0, 5, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				ConstructorRejection(ConstructorNeedsExpectedType(_)):
+					True
+				_:
+					False
+		)
+	)
+
+
+pure func test_int_scrutinee_is_rejected_even_with_wildcard() -> Bool:
+	rejects(VALUE + UNWRAP + "match ", "42:\n\t\t_: 0\n", 0, 2, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			MatchRejection(MatchRequiresUnion(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_pattern_arity_and_constructor_shadowing() -> Bool:
+	prefix = VALUE + UNWRAP + "match value:\n\t\t"
+	shadow = VALUE + "pure func unwrap(Number: Value) -> Int:\n\tmatch Number:\n\t\tEmpty: 0\n\t\t"
+	rejects(prefix, "Number(): 0\n\t\tEmpty: 0\n", 0, 8, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			MatchRejection(PatternFieldCountMismatch(_, 1, 0)):
+				True
+			_:
+				False
+	) and rejects(prefix, "Number: 0\n\t\tEmpty: 0\n", 0, 6, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			MatchRejection(PatternFieldCountMismatch(_, 1, 0)):
+				True
+			_:
+				False
+	) and rejects(prefix, "Empty(_): 0\n\t\tNumber(_): 0\n", 0, 8, pure func(
+		kind: CheckErrorKind,
+	) -> Bool:
+		match kind:
+			MatchRejection(PatternFieldCountMismatch(_, 0, 1)):
+				True
+			_:
+				False
+	) and rejects(shadow, "Number(item): item\n", 0, 12, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			MatchRejection(UnknownConstructorPattern(_, _)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_usefulness_checks_variants_and_whole_catchalls() -> Bool:
+	prefix = VALUE + UNWRAP + "match value:\n\t\tNumber(first): first\n\t\t"
+	catchall = VALUE + UNWRAP + "match value:\n\t\twhole: 0\n\t\t"
+	covered = VALUE + UNWRAP + "match value:\n\t\tEmpty: 0\n\t\tNumber(_): 0\n\t\t"
+	help = "remove this arm; earlier arms already cover all values it could match"
+	(
+		rejects(prefix, "Number(second): second\n\t\tEmpty: 0\n", 0, 14, pure func(
+			kind: CheckErrorKind,
+		) -> Bool:
+			match kind:
+				MatchRejection(UnreachableArm):
+					True
+				_:
+					False
+		)
+		and rejects(catchall, "Empty: 0\n", 0, 5, pure func(kind: CheckErrorKind) -> Bool:
+			match kind:
+				MatchRejection(UnreachableArm):
+					True
+				_:
+					False
+		)
+		and rejects(covered, "_: 0\n", 0, 1, pure func(kind: CheckErrorKind) -> Bool:
+			match kind:
+				MatchRejection(UnreachableArm):
+					True
+				_:
+					False
+		)
+	)
+
+
+pure func test_missing_coverage_uses_keyword_span_and_payload_witness() -> Bool:
+	body: String =
+		|match value:
+		|		Empty: 0
+		|
+	prefix = VALUE + UNWRAP
+	rejects(prefix, body, 0, 5, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			MatchRejection(NonExhaustiveMatch(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_payload_type_and_value_mismatches() -> Bool:
+	prefix = "fixed union Value:\n\tNumber("
+	argument = VALUE + "pure func empty() -> Value:\n\tEmpty\npure func make() -> Value:\n\t"
+	accepts(prefix + "Float)\n" + MAIN) and rejects(argument, "Number(empty())\n", 0, 6, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			CallRejection(ArgumentTypeMismatch(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_purity_and_recursion_include_construction_arguments_and_hidden_arms() -> Bool:
+	impure_source: String =
+		|func impure(value: Int) -> Int:
+		|	value
+		|
+	argument = VALUE + "func impure() -> Int:\n\t42\npure func make() -> Value:\n\tNumber("
+	arm = VALUE + impure_source + UNWRAP + "match value:\n\t\tEmpty: 0\n\t\tNumber(item): "
+	cycle = VALUE + UNWRAP + "match value:\n\t\tEmpty: 0\n\t\tNumber(item): "
+	scrutinee = VALUE + "pure func copy(value: Value) -> Value:\n\tmatch "
+	rejects(argument, "impure())\n", 0, 6, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			CallRejection(ImpureCall(_, _)):
+				True
+			_:
+				False
+	) and rejects(arm, "impure(item)\n", 0, 6, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			CallRejection(ImpureCall(_, _)):
+				True
+			_:
+				False
+	) and accepts(
+		cycle + "unwrap(Number(item))\n" + MAIN,
+	) and accepts(scrutinee + "copy(value):\n\t\twhole: whole\n" + MAIN)
+
+
+pure func test_function_contract_diagnostics_precede_base_and_purity() -> Bool:
+	impure_source: String =
+		|func impure() -> Int:
+		|	0
+		|
+	prefix = VALUE + impure_source + UNWRAP + "match value:\n\t\tEmpty: 0\n\t\tNumber(_): "
+	rejects(prefix, "impure(missing)\n", 0, 6, pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			CallRejection(ArgumentCountMismatch(_)):
+				True
+			_:
+				False
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 match and payload checking",
+	tests = [
+		(
+			"payload shapes and contextual constructor owners",
+			test_payload_shapes_and_contextual_constructor_owners,
+		),
+		(
+			"parameter and arm bindings have distinct roles and ids",
+			test_parameter_and_arm_bindings_have_distinct_definitions_and_ids,
+		),
+		(
+			"whole binding shadows parameter and returns union",
+			test_whole_binding_shadows_parameter_and_returns_union,
+		),
+		(
+			"field shadowing and receiver function lookup",
+			test_field_scope_shadowing_and_receiver_function_lookup,
+		),
+		("bindings cannot call or leak to siblings", test_bindings_cannot_call_or_leak_to_siblings),
+		(
+			"expected type flows through function and constructor spines",
+			test_expected_type_flows_through_function_and_constructor_spines,
+		),
+		(
+			"constructor scrutinee needs context not function result",
+			test_constructor_scrutinee_needs_context_not_function_result,
+		),
+		(
+			"Int scrutinee rejected even with wildcard",
+			test_int_scrutinee_is_rejected_even_with_wildcard,
+		),
+		("pattern arity and constructor shadowing", test_pattern_arity_and_constructor_shadowing),
+		(
+			"usefulness checks variants and whole catchalls",
+			test_usefulness_checks_variants_and_whole_catchalls,
+		),
+		(
+			"missing coverage keyword span and payload witness",
+			test_missing_coverage_uses_keyword_span_and_payload_witness,
+		),
+		("payload type and value mismatches", test_payload_type_and_value_mismatches),
+		(
+			"purity and recursion include construction arguments and hidden arms",
+			test_purity_and_recursion_include_construction_arguments_and_hidden_arms,
+		),
+		(
+			"function diagnostics precede base and purity",
+			test_function_contract_diagnostics_precede_base_and_purity,
+		),
+	]
+}
