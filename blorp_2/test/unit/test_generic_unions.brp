@@ -7,6 +7,7 @@ import:
 	../../src/specialize as Concrete
 	../../src/syntax: Diagnostic
 	compilation: compile, compile_modules
+	int as IntOps
 	input: check_failure, parse, setup_diagnostic
 	module_input: PRIMITIVE_BASE, STRING_OPERATIONS
 	test: TestSuite
@@ -429,8 +430,8 @@ pure func test_pattern_payload_uses_the_function_owned_rigid_parameter() -> Bool
 private pure func construction_owner(function: Concrete.ConcreteFunction) -> Option[Int]:
 	match function.body:
 		Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
-			match value.base:
-				Concrete.ReturnVariant(id):
+			match value.form:
+				Concrete.ConstructVariant(id, []):
 					Some(Concrete.union_number(Concrete.variant_owner(id)))
 				_:
 					None
@@ -438,39 +439,40 @@ private pure func construction_owner(function: Concrete.ConcreteFunction) -> Opt
 			None
 
 
-private pure func operation_targets(value: Concrete.ConcreteValue, expected: List[Int]) -> Bool:
-	var valid = value.operations.length() == expected.length()
+-- User function numbers along the receiver chain, innermost call first.
+private pure func receiver_targets(value: Concrete.ConcreteExpr) -> List[Int]:
+	match value.form:
+		Concrete.InvokeFunction(call, arguments):
+			inner: List[Int] = match arguments.get(0):
+				Some(receiver):
+					receiver_targets(receiver)
+				None:
+					[]
+
+			match call.target:
+				Concrete.UserFunction(id):
+					inner.append(Concrete.function_number(id))
+				_:
+					inner
+		_:
+			[]
+
+
+private pure func receiver_chain_is(value: Concrete.ConcreteExpr, expected: List[Int]) -> Bool:
+	actual = receiver_targets(value)
+	var same = IntOps.equals(actual.length(), expected.length())
 	var position = 0
 
-	for step in value.operations:
-		match step.operation:
-			Concrete.InvokeFunction(call, _):
-				match call.target:
-					Concrete.UserFunction(id):
-						match expected.get(position):
-							Some(expected):
-								valid = valid and Concrete.function_number(id) == expected
-							None:
-								valid = False
-					_:
-						valid = False
-			_:
-				valid = False
+	for target in actual:
+		match expected.get(position):
+			Some(number):
+				same = same and IntOps.equals(target, number)
+			None:
+				same = False
 
-		position += 1
+		position = IntOps.add(position, 1)
 
-	if value.operations.length() == 0:
-		match value.base:
-			Concrete.ReturnCall(call, _):
-				match call.target:
-					Concrete.UserFunction(id):
-						expected == [Concrete.function_number(id)]
-					_:
-						False
-			_:
-				valid
-	else:
-		valid
+	same
 
 
 pure func test_phantom_instances_keep_nominal_arguments_and_reuse_direct_ufcs_requests() -> Bool:
@@ -523,12 +525,9 @@ pure func test_phantom_instances_keep_nominal_arguments_and_reuse_direct_ufcs_re
 																	second_identity.signature.return_type,
 																	text.signature.return_type,
 																)
-																and operation_targets(
-																	first,
-																	[2, 2],
-																)
-																and operation_targets(again, [2])
-																and operation_targets(other, [4])
+																and receiver_chain_is(first, [1, 2, 2])
+																and receiver_chain_is(again, [1, 2])
+																and receiver_chain_is(other, [3, 4])
 																and Concrete.same_type(
 																	first_binding.value_type,
 																	integer.signature.return_type,
@@ -574,8 +573,8 @@ pure func test_box_instance_translates_constructor_pattern_and_binding_types() -
 						_: False
 					match (box.body, unbox.body):
 						(Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)), Concrete.ConcreteMatchBody(matched)):
-							match (value.base, matched.arms, unbox.bindings):
-								(Concrete.ReturnConstructedVariant(id, [child]), [arm], [_, payload]):
+							match (value.form, matched.arms, unbox.bindings):
+								(Concrete.ConstructVariant(id, [child]), [arm], [_, payload]):
 									match arm.pattern:
 										Concrete.VariantCase(pattern, captures):
 											match single_capture(captures):
@@ -587,7 +586,7 @@ pure func test_box_instance_translates_constructor_pattern_and_binding_types() -
 														and Concrete.union_number(Concrete.variant_owner(pattern)) == 0
 														and Concrete.variant_number(pattern) == Concrete.variant_number(id)
 														and Model.binding_number(binding) == 1
-														and Concrete.same_type(child.base_type, Concrete.IntType)
+														and Concrete.same_type(child.value_type, Concrete.IntType)
 														and Concrete.same_type(payload.value_type, Concrete.IntType)
 														and Concrete.same_type(unbox.signature.return_type, Concrete.IntType)
 														and Concrete.same_type(identity.signature.return_type, box.signature.return_type)

@@ -5,13 +5,12 @@ import:
 	../../src/source: COMPILER_SOURCE, module_source, root_module_id, same_source
 	../../src/specialize:
 		CallTarget(UserFunction, RuntimeFunction),
-		ConcreteBase(ReturnCall),
 		ConcreteBody(ConcreteValueBody, ConcreteMatchBody),
 		ConcreteExit(ReturnExpression),
 		ConcreteFunction,
-		ConcreteOperation(InvokeFunction),
 		ConcreteStatement(InitializeBinding, ReassignBinding),
-		ConcreteValue,
+		ConcreteExpr,
+		ConcreteForm(ConstructVariant, InvokeFunction, LiteralInteger),
 		RecordRepresentation(InlineRecord, ManagedRecord),
 		SpecializedContents,
 		TypeRef(VoidType, IntType, FloatType, StringType, ListType, RecordType, UnionType),
@@ -27,7 +26,8 @@ import:
 		specialized_contents,
 		union_number,
 		value_ownership,
-	../../src/syntax: Diagnostic, Entrypoint(NoArguments), entry_function
+	../../src/syntax: Diagnostic, Entrypoint(NoArguments), entry_function, same_span
+	int as IntOps
 	input: parse, setup_diagnostic
 	test: TestSuite
 
@@ -51,32 +51,35 @@ private pure func fixture(source: String) -> Result[List[ConcreteFunction], Diag
 	program(source).map(pure func(contents): contents.functions)
 
 
-private pure func target(value: ConcreteValue) -> Option[Int]:
-	call = match value.operations:
-		[step]:
-			match step.operation:
-				InvokeFunction(call, _):
-					Some(call)
-				_:
-					None
-		[]:
-			match value.base:
-				ReturnCall(call, _):
-					Some(call)
-				_:
-					None
-		_:
-			None
-
-	match call:
-		Some(call):
+private pure func target(value: ConcreteExpr) -> Option[Int]:
+	match value.form:
+		InvokeFunction(call, _):
 			match call.target:
 				UserFunction(id):
 					Some(function_number(id))
 				RuntimeFunction(_):
 					None
-		None:
+		_:
 			None
+
+
+-- User function numbers along the receiver chain, innermost call first.
+private pure func receiver_targets(value: ConcreteExpr) -> List[Int]:
+	match value.form:
+		InvokeFunction(call, arguments):
+			inner: List[Int] = match arguments.get(0):
+				Some(receiver):
+					receiver_targets(receiver)
+				None:
+					[]
+
+			match call.target:
+				UserFunction(id):
+					inner.append(function_number(id))
+				RuntimeFunction(_):
+					inner
+		_:
+			[]
 
 
 private pure func body_target(function: ConcreteFunction) -> Option[Int]:
@@ -87,13 +90,22 @@ private pure func body_target(function: ConcreteFunction) -> Option[Int]:
 			None
 
 
-private pure func repeated_target(value: ConcreteValue, expected: Int) -> Bool:
-	match value.operations:
-		[first, second]:
-			(
-				target({ value | operations = [first] }) == Some(expected)
-				and target({ value | operations = [second] }) == Some(expected)
-			)
+private pure func equal_targets(actual: Option[Int], expected: Int) -> Bool:
+	match actual:
+		Some(number):
+			IntOps.equals(number, expected)
+		None:
+			False
+
+
+private pure func repeated_target(value: ConcreteExpr, expected: Int) -> Bool:
+	match value.form:
+		InvokeFunction(_, arguments):
+			match arguments.get(0):
+				Some(receiver):
+					equal_targets(target(value), expected) and equal_targets(target(receiver), expected)
+				None:
+					False
 		_:
 			False
 
@@ -101,7 +113,7 @@ private pure func repeated_target(value: ConcreteValue, expected: Int) -> Bool:
 private pure func returns_type(exit: ConcreteExit, expected: TypeRef) -> Bool:
 	match exit:
 		ReturnExpression(value):
-			same_type(value.base_type, expected)
+			same_type(value.value_type, expected)
 		_:
 			False
 
@@ -217,9 +229,9 @@ private pure func binding_types(function: ConcreteFunction, expected: TypeRef) -
 		[InitializeBinding(_, first), InitializeBinding(_, second), ReassignBinding(_, replacement)]:
 			(
 				valid
-				and same_type(first.base_type, expected)
-				and same_type(second.base_type, expected)
-				and same_type(replacement.base_type, expected)
+				and same_type(first.value_type, expected)
+				and same_type(second.value_type, expected)
+				and same_type(replacement.value_type, expected)
 			)
 		_:
 			False
@@ -390,7 +402,7 @@ pure func test_match_scrutinee_assignments_and_results_discover_generic_instance
 													flag.signature.return_type,
 												)
 												and same_type(
-													matched.scrutinee.base_type,
+													matched.scrutinee.value_type,
 													flag.signature.return_type,
 												)
 												and same_type(
@@ -400,7 +412,7 @@ pure func test_match_scrutinee_assignments_and_results_discover_generic_instance
 												and same_type(parameter.value_type, IntType)
 												and same_type(save.signature.return_type, IntType)
 												and same_type(saved_binding.value_type, IntType)
-												and same_type(saved.base_type, IntType)
+												and same_type(saved.value_type, IntType)
 												and returns_type(first.body, IntType)
 											)
 										_:
@@ -722,6 +734,166 @@ pure func test_union_ownership_query_rejects_missing_layout() -> Bool:
 			False
 
 
+private pure func is_integer(value: ConcreteExpr, expected: Int) -> Bool:
+	match value.form:
+		LiteralInteger(actual):
+			IntOps.equals(actual, expected)
+		_:
+			False
+
+
+pure func test_ufcs_chain_nests_each_receiver_as_first_argument() -> Bool:
+	source: String =
+		|pure func one(value: Int) -> Int:
+		|	1
+		|pure func zero(value: Int) -> Int:
+		|	0
+		|func main() -> Int:
+		|	7.one().zero()
+		|
+
+	match fixture(source):
+		Ok([main, _, _]):
+			match main.body:
+				ConcreteValueBody(ReturnExpression(outer)):
+					match outer.form:
+						InvokeFunction(_, [inner]):
+							match inner.form:
+								InvokeFunction(_, [seven]):
+									-- Calls are numbered in request order: `one` is 1, `zero` is 2.
+									match receiver_targets(outer):
+										[1, 2]:
+											is_integer(seven, 7)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_chain_node_span_is_the_occurrence_and_the_anchor_stays_on_the_call() -> Bool:
+	source: String =
+		|pure func one(value: Int) -> Int:
+		|	1
+		|pure func zero(value: Int) -> Int:
+		|	0
+		|func main() -> Int:
+		|	7.one().zero()
+		|
+
+	match fixture(source):
+		Ok([main, _, _]):
+			match main.body:
+				ConcreteValueBody(ReturnExpression(outer)):
+					match outer.form:
+						InvokeFunction(outer_call, [inner]):
+							match inner.form:
+								InvokeFunction(inner_call, [seven]):
+									-- The occurrence extent starts at the written receiver; the callee anchor does not.
+									(
+										IntOps.equals(outer.span.start, seven.span.start)
+										and IntOps.equals(inner.span.start, seven.span.start)
+										and IntOps.greater_than(outer.span.end, inner.span.end)
+										and IntOps.greater_than(outer_call.span.start, inner_call.span.start)
+										and IntOps.less_than(outer.span.start, outer_call.span.start)
+										and not same_span(outer.span, outer_call.span)
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private pure func argument_integers(value: ConcreteExpr) -> List[Int]:
+	match value.form:
+		InvokeFunction(_, arguments):
+			var integers: List[Int] = []
+
+			for argument in arguments:
+				match argument.form:
+					LiteralInteger(integer):
+						integers = integers.append(integer)
+					_:
+						void
+
+			integers
+		_:
+			[]
+
+
+pure func test_direct_and_ufcs_calls_share_one_argument_order() -> Bool:
+	source: String =
+		|pure func pair(left: Int, right: Int) -> Int:
+		|	left
+		|func main() -> Int:
+		|	ufcs = 7.pair(9)
+		|	pair(7, 9)
+		|
+
+	match fixture(source):
+		Ok([main, _]):
+			match main.statements:
+				[InitializeBinding(_, ufcs)]:
+					match main.body:
+						ConcreteValueBody(ReturnExpression(direct)):
+							match argument_integers(ufcs):
+								[7, 9]:
+									match argument_integers(direct):
+										[7, 9]:
+											True
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_payload_free_variant_is_a_construct_with_no_arguments() -> Bool:
+	source: String =
+		|fixed union Step:
+		|	Stop
+		|	Once
+		|pure func pick(step: Step) -> Int:
+		|	match step:
+		|		Stop: 0
+		|		Once: 1
+		|func main() -> Int:
+		|	pick(Stop)
+		|
+
+	match fixture(source):
+		Ok([main, _]):
+			match main.body:
+				ConcreteValueBody(ReturnExpression(value)):
+					match value.form:
+						InvokeFunction(_, [stop]):
+							match stop.form:
+								ConstructVariant(_, []):
+									True
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 specialization",
 	tests = [
@@ -762,6 +934,22 @@ tests: TestSuite = {
 			test_union_ownership_query_rejects_missing_layout,
 		),
 		("direct and UFCS reuse one instance", test_direct_and_ufcs_reuse_one_instance),
+		(
+			"UFCS chain nests each receiver as the first argument",
+			test_ufcs_chain_nests_each_receiver_as_first_argument,
+		),
+		(
+			"chain node span is the occurrence and the anchor stays on the call",
+			test_chain_node_span_is_the_occurrence_and_the_anchor_stays_on_the_call,
+		),
+		(
+			"direct and UFCS calls share one argument order",
+			test_direct_and_ufcs_calls_share_one_argument_order,
+		),
+		(
+			"payload-free variant is a construct with no arguments",
+			test_payload_free_variant_is_a_construct_with_no_arguments,
+		),
 		(
 			"argument types create complete distinct instances",
 			test_argument_types_create_distinct_complete_instances,

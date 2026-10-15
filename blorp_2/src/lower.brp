@@ -5,24 +5,23 @@ import:
 	option: to_result
 	specialize:
 		ConcreteArm,
-		ConcreteBase(
-			ReturnVoid, ReturnInteger, ReturnFloat, ReturnString, ReturnVariant, ReturnConstructedVariant, ReturnBinding, ReturnCall,
-			ReturnRecord, ReturnRecordUpdate,
-		),
 		ConcreteBinding,
 		ConcreteBody(ConcreteValueBody, ConcreteMatchBody),
 		ConcreteCall,
 		ConcreteExit(ReturnExpression, RecurWith),
+		ConcreteExpr,
+		ConcreteForm(
+			LiteralVoid, LiteralInteger, LiteralFloat, LiteralString, ReadBinding, ConstructVariant,
+			ConstructRecord, UpdateRecord, InvokeFunction, ReadRecordField,
+		),
 		ConcreteFunction,
 		ConcreteMatch,
-		ConcreteOperation(InvokeFunction, ReadRecordField),
 		ConcretePattern(VariantCase, WildcardCase, BindingCase),
 		ConcreteRecord,
 		ConcreteRecordField,
 		ConcreteRecordUpdate,
 		ConcreteStatement(InitializeBinding, ReassignBinding, DiscardExpression),
 		ConcreteUnion, VariantFieldInstanceId, variant_field,
-		ConcreteValue,
 		FieldInstanceId,
 		FunctionInstanceId,
 		FunctionSignature,
@@ -195,11 +194,10 @@ private fixed record BuiltArguments {
 private pure func lower_arguments(
 	builder: ExpressionBuilder,
 	bindings: List[Option[ValueId]],
-	arguments: List[ConcreteValue],
-	prefix: List[ValueId],
+	arguments: List[ConcreteExpr],
 ) -> Result[BuiltArguments, Diagnostic]:
 	var current = builder
-	var values = prefix
+	var values: List[ValueId] = []
 	var failure: Option[Diagnostic] = None
 
 	for argument in arguments:
@@ -307,84 +305,40 @@ private pure func lower_record_update(
 private pure func lower_value(
 	builder: ExpressionBuilder,
 	bindings: List[Option[ValueId]],
-	value: ConcreteValue,
+	value: ConcreteExpr,
 ) -> Result[BuiltValue, Diagnostic]:
-	base ?= match value.base:
-		ReturnRecordUpdate(update):
-			match value.base_type:
-				RecordType(owner): lower_record_update(builder, bindings, update, owner, value.base_type, value.base_span)
-				_: Err(invalid_update(value.base_span))
-		ReturnConstructedVariant(variant, values):
-			lower_arguments(builder, bindings, values, []).map(pure func(children): define_value(children.builder, ConstructValue(variant, children.values), value.base_type, value.base_span))
-		ReturnRecord(owner, fields):
-			lower_record(builder, bindings, fields, owner, value.base_type, value.base_span)
-		ReturnBinding(id):
-			read_binding(
-				bindings,
-				id,
-				value.base_span,
-			).map(
-				pure func(id: ValueId) -> BuiltValue: {
-					builder = builder,
-					value = id
-				},
-			)
-		ReturnVoid:
-			Ok(define_value(builder, VoidValue, value.base_type, value.base_span))
-		ReturnString(bytes):
-			Ok(define_value(builder, StringValue(bytes), value.base_type, value.base_span))
-		ReturnInteger(integer):
-			Ok(define_value(builder, IntegerValue(integer), value.base_type, value.base_span))
-		ReturnFloat(number):
-			Ok(define_value(builder, FloatValue(number), value.base_type, value.base_span))
-		ReturnVariant(id):
-			Ok(define_value(builder, VariantValue(id), value.base_type, value.base_span))
-		ReturnCall(call, arguments):
-			lower_arguments(
-				builder,
-				bindings,
-				arguments,
-				[],
-			).map(
-				pure func(children: BuiltArguments) -> BuiltValue: define_value(
-					children.builder,
-					CallValue(call, children.values),
-					value.base_type,
-					value.base_span,
-				),
-			)
+	match value.form:
+		LiteralVoid:
+			Ok(define_value(builder, VoidValue, value.value_type, value.span))
+		LiteralInteger(integer):
+			Ok(define_value(builder, IntegerValue(integer), value.value_type, value.span))
+		LiteralFloat(number):
+			Ok(define_value(builder, FloatValue(number), value.value_type, value.span))
+		LiteralString(bytes):
+			Ok(define_value(builder, StringValue(bytes), value.value_type, value.span))
+		ReadBinding(id):
+			bound ?= read_binding(bindings, id, value.span)
+			Ok({ builder = builder, value = bound })
+		ConstructVariant(variant, values):
+			children ?= lower_arguments(builder, bindings, values)
+			-- The lowered form keeps a separate operation for a payload-free variant.
+			operation = if values.is_empty():
+				VariantValue(variant)
+			else:
+				ConstructValue(variant, children.values)
 
-	var built = base
-	var failure: Option[Diagnostic] = None
-
-	for step in value.operations:
-		match step.operation:
-			InvokeFunction(call, arguments):
-				match lower_arguments(built.builder, bindings, arguments, [built.value]):
-					Err(error):
-						failure = Some(error)
-						break
-					Ok(children):
-						built = define_value(
-							children.builder,
-							CallValue(call, children.values),
-							step.value_type,
-							step.span,
-						)
-			ReadRecordField(field):
-				built = define_value(
-					built.builder,
-					ReadRecordFieldValue(field, built.value),
-					step.value_type,
-					step.span,
-				)
-
-
-	match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(built)
+			Ok(define_value(children.builder, operation, value.value_type, value.span))
+		ConstructRecord(owner, fields):
+			lower_record(builder, bindings, fields, owner, value.value_type, value.span)
+		UpdateRecord(owner, update):
+			lower_record_update(builder, bindings, update, owner, value.value_type, value.span)
+		InvokeFunction(call, arguments):
+			children ?= lower_arguments(builder, bindings, arguments)
+			-- A call's definition is anchored at its callee, not at the whole occurrence.
+			Ok(define_value(children.builder, CallValue(call, children.values), value.value_type, call.span))
+		ReadRecordField(receiver, field):
+			read ?= lower_value(builder, bindings, receiver)
+			Ok(define_value(read.builder, ReadRecordFieldValue(field, read.value), value.value_type, value.span))
 
 
 private fixed record BuiltBlock {
@@ -429,7 +383,7 @@ private pure func binding_slot(bindings: List[Option[ValueId]], id: BindingId, s
 private pure func exit_span(exit: ConcreteExit) -> Span:
 	match exit:
 		ReturnExpression(value):
-			value.base_span
+			value.span
 		RecurWith(_, span):
 			span
 
@@ -501,7 +455,7 @@ private pure func lower_statements(
 					None:
 						void
 					Some(id):
-						match binding_slot(values, id, value.base_span):
+						match binding_slot(values, id, value.span):
 							Ok(position): values = values.set(position, Some(result.value))
 							Err(error):
 								failure = Some(error)

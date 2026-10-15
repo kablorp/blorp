@@ -743,15 +743,17 @@ is an occurrence projection type, analogous to `CheckedStep.value_type`, not a
 second layout catalogue. The enclosing CheckedValue owns the update's result
 record type in `base_type`, before any outer postfix; the last outer step may
 produce a different overall type. It does not own a full expression `.span`:
-`CheckedValue` and `ConcreteValue` have only `base_span` and individual step spans
-(`check_model.brp:192–197`, `specialize.brp:232–237`). Copy the parser-owned complete
+`CheckedValue` has only `base_span` and individual step spans
+(`check_model.brp:192–197`); the concrete `UpdateRecord` node's own `span` is that
+`base_span`, carried through unchanged (`ConcreteExpr`, `specialize.brp`). Copy the parser-owned complete
 base-expression span (`syntax.brp:196–201`) to `base_expression_span`, including
 the base's own postfixes, while publishing the checked update. No reconstruction,
 duplicate owner field, expression-ID domain, optional published
 type or insertion-policy flag is needed. These IDs live in one compilation.
 Only the existing checked-program producer publishes this product.
 
-The concrete counterpart substitutes `ConcreteValue`, `ConcreteRecordField`,
+The concrete counterpart, `UpdateRecord(RecordInstanceId, ConcreteRecordUpdate)`,
+substitutes `ConcreteExpr`, `ConcreteRecordField`,
 FieldInstanceId and concrete TypeRef and carries the unchanged
 `base_expression_span`. Its complete partition survives translation;
 phantom arguments remain part of nominal instance identity. Projected omitted

@@ -199,7 +199,7 @@ pure func runtime_signature(operation: RuntimeOperation[VariantInstanceId, TypeR
 
 fixed record ConcreteRecordField {
 	field: FieldInstanceId,
-	value: ConcreteValue,
+	value: ConcreteExpr,
 	span: Span
 }
 
@@ -208,50 +208,43 @@ fixed record RetainedRecordField { field: FieldInstanceId, value_type: TypeRef }
 
 
 fixed record ConcreteRecordUpdate {
-	base: ConcreteValue,
+	base: ConcreteExpr,
 	base_expression_span: Span,
 	replacements: List[ConcreteRecordField],
 	inherited: List[RetainedRecordField]
 }
 
 
-fixed union ConcreteBase:
-	ReturnRecord(RecordInstanceId, List[ConcreteRecordField])
-	ReturnRecordUpdate(ConcreteRecordUpdate)
-	ReturnConstructedVariant(VariantInstanceId, List[ConcreteValue])
-	ReturnVoid
-	ReturnInteger(Int)
-	ReturnFloat(Float)
-	ReturnString(String)
-	ReturnVariant(VariantInstanceId)
-	ReturnBinding(Checked.BindingId)
-	ReturnCall(ConcreteCall, List[ConcreteValue])
+-- What an expression computes. A receiver is the first argument of its call, so
+-- evaluation order is list order; a payload-free variant has no arguments.
+fixed union ConcreteForm:
+	LiteralVoid
+	LiteralInteger(Int)
+	LiteralFloat(Float)
+	LiteralString(String)
+	ReadBinding(Checked.BindingId)
+	ConstructVariant(VariantInstanceId, List[ConcreteExpr])
+	ConstructRecord(RecordInstanceId, List[ConcreteRecordField])
+	UpdateRecord(RecordInstanceId, ConcreteRecordUpdate)
+	InvokeFunction(ConcreteCall, List[ConcreteExpr])
+	ReadRecordField(ConcreteExpr, FieldInstanceId)
 
 
-fixed union ConcreteOperation:
-	InvokeFunction(ConcreteCall, List[ConcreteValue])
-	ReadRecordField(FieldInstanceId)
-
-
-fixed record ConcreteStep {
-	operation: ConcreteOperation,
+-- One evaluated expression. `span` is the checked node's own span, carried through
+-- unchanged: a base's base_span, or a postfix step's span (the extent from the
+-- base to that postfix). A call's callee anchor is a separate fact, the span of
+-- its ConcreteCall.
+fixed record ConcreteExpr {
+	form: ConcreteForm,
 	value_type: TypeRef,
 	span: Span
 }
 
 
-fixed record ConcreteValue {
-	base: ConcreteBase,
-	base_type: TypeRef,
-	base_span: Span,
-	operations: List[ConcreteStep]
-}
-
-
 fixed union ConcreteStatement:
-	InitializeBinding(Checked.BindingId, ConcreteValue)
-	ReassignBinding(Checked.BindingId, ConcreteValue)
-	DiscardExpression(ConcreteValue)
+	InitializeBinding(Checked.BindingId, ConcreteExpr)
+	ReassignBinding(Checked.BindingId, ConcreteExpr)
+	DiscardExpression(ConcreteExpr)
 
 
 fixed union ConcretePattern:
@@ -268,15 +261,15 @@ fixed record ConcreteArm {
 
 
 fixed record ConcreteMatch {
-	scrutinee: ConcreteValue,
+	scrutinee: ConcreteExpr,
 	owner: UnionInstanceId,
 	arms: List[ConcreteArm]
 }
 
 
 fixed union ConcreteExit:
-	ReturnExpression(ConcreteValue)
-	RecurWith(List[ConcreteValue], Span)
+	ReturnExpression(ConcreteExpr)
+	RecurWith(List[ConcreteExpr], Span)
 
 
 fixed union ConcreteBody:
@@ -1574,11 +1567,11 @@ private pure func translate_value(
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
-) -> Result[ConcreteValue, Diagnostic]:
-	base_span = value_anchor(value)
-	base_type ?= concrete_type(value.base_type, substitution, unions, base_span, records)
+) -> Result[ConcreteExpr, Diagnostic]:
+	anchor = value_anchor(value)
+	base_type ?= concrete_type(value.base_type, substitution, unions, anchor, records)
 
-	base_result: Result[ConcreteBase, Diagnostic] = match value.base:
+	form_result: Result[ConcreteForm, Diagnostic] = match value.base:
 		Checked.ReturnRecordUpdate(update):
 			owner ?= concrete_record_owner(base_type, value.base_span)
 			base ?= translate_value(update.base, substitution, keys, unions, records)
@@ -1592,12 +1585,12 @@ private pure func translate_value(
 				value_type ?= concrete_type(field.value_type, substitution, unions, update.base_expression_span, records)
 				Ok({ field = id, value_type = value_type })
 			)
-			Ok(ReturnRecordUpdate({ base = base, base_expression_span = update.base_expression_span, replacements = replacements, inherited = inherited }))
+			Ok(UpdateRecord(owner, { base = base, base_expression_span = update.base_expression_span, replacements = replacements, inherited = inherited }))
 		Checked.ReturnConstructedVariant(id, children):
 			owner ?= concrete_union_owner(base_type, value.base_span)
 			variant ?= translate_variant(id, owner, unions, value.base_span)
 			values ?= translated_list(children, pure func(child): translate_value(child, substitution, keys, unions, records))
-			Ok(ReturnConstructedVariant(variant, values))
+			Ok(ConstructVariant(variant, values))
 		Checked.ReturnRecord(_, fields):
 			owner ?= concrete_record_owner(base_type, value.base_span)
 			concrete ?= translated_list(fields, pure func(
@@ -1611,28 +1604,28 @@ private pure func translate_value(
 					span = field.span,
 				})
 			)
-			Ok(ReturnRecord(owner, concrete))
+			Ok(ConstructRecord(owner, concrete))
 		Checked.ReturnVoid:
-			Ok(ReturnVoid)
-		Checked.ReturnString(value):
-			Ok(ReturnString(value))
-		Checked.ReturnInteger(value):
-			Ok(ReturnInteger(value))
-		Checked.ReturnFloat(value):
-			Ok(ReturnFloat(value))
+			Ok(LiteralVoid)
+		Checked.ReturnString(text):
+			Ok(LiteralString(text))
+		Checked.ReturnInteger(integer):
+			Ok(LiteralInteger(integer))
+		Checked.ReturnFloat(number):
+			Ok(LiteralFloat(number))
 		Checked.ReturnBinding(id):
-			Ok(ReturnBinding(id))
+			Ok(ReadBinding(id))
 		Checked.ReturnVariant(id):
 			owner ?= concrete_union_owner(base_type, value.base_span)
 			concrete ?= translate_variant(id, owner, unions, value.base_span)
-			Ok(ReturnVariant(concrete))
+			Ok(ConstructVariant(concrete, []))
 		Checked.ReturnCall(call, arguments):
 			concrete ?= translate_call(call, substitution, keys, unions, records, base_type)
 			values ?= translated_list(
 				arguments,
 				pure func(
 					argument: Checked.CheckedValue,
-				) -> Result[ConcreteValue, Diagnostic]: translate_value(
+				) -> Result[ConcreteExpr, Diagnostic]: translate_value(
 					argument,
 					substitution,
 					keys,
@@ -1640,18 +1633,19 @@ private pure func translate_value(
 					records,
 				),
 			)
-			Ok(ReturnCall(concrete, values))
+			Ok(InvokeFunction(concrete, values))
 
-	base ?= base_result
-	var steps: List[ConcreteStep] = []
-	var current_type = base_type
+	form ?= form_result
+	var current: ConcreteExpr = {
+		form = form,
+		value_type = base_type,
+		span = value.base_span,
+	}
 	var failure: Option[Diagnostic] = None
 	for step in value.operations:
-		result = translate_step(step, current_type, substitution, keys, unions, records)
-		match result:
-			Ok(concrete):
-				steps = steps.append(concrete)
-				current_type = concrete.value_type
+		match translate_step(step, current, substitution, keys, unions, records):
+			Ok(next):
+				current = next
 			Err(error):
 				failure = Some(error)
 				break
@@ -1659,12 +1653,7 @@ private pure func translate_value(
 		Some(error): Err(error)
 		None: Ok(void)
 
-	Ok({
-		base = base,
-		base_type = base_type,
-		base_span = base_span,
-		operations = steps,
-	})
+	Ok(current)
 
 
 private pure func concrete_record_owner(value: TypeRef, span: Span) -> Result[RecordInstanceId, Diagnostic]:
@@ -1673,39 +1662,42 @@ private pure func concrete_record_owner(value: TypeRef, span: Span) -> Result[Re
 		_: Err(invalid(span, "record operation has a non-record receiver"))
 
 
+-- A postfix step wraps its already translated receiver: the receiver becomes
+-- the field's source or the call's first argument.
 private pure func translate_step(
 	step: Checked.CheckedStep,
-	receiver_type: TypeRef,
+	receiver: ConcreteExpr,
 	substitution: List[TypeSubstitution],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
-) -> Result[ConcreteStep, Diagnostic]:
-	span = step_anchor(step)
+) -> Result[ConcreteExpr, Diagnostic]:
+	anchor = step_anchor(step)
 	match step.operation:
 		Checked.ReadRecordField(field):
-			owner ?= concrete_record_owner(receiver_type, step.span)
+			owner ?= concrete_record_owner(receiver.value_type, step.span)
 			value_type ?= concrete_record_field_type(field, owner, records, step.span)
 			-- The prepared receiver row already owns this exact concrete field type.
 			translated_field = into_opaque FieldInstanceId({ owner = owner, position = Checked.field_number(field) })
-			Ok({ operation = ReadRecordField(translated_field), value_type = value_type, span = span })
+			Ok({ form = ReadRecordField(receiver, translated_field), value_type = value_type, span = step.span })
 		Checked.InvokeFunction(call, arguments):
-			value_type ?= concrete_type(step.value_type, substitution, unions, span, records)
+			value_type ?= concrete_type(step.value_type, substitution, unions, anchor, records)
 			concrete ?= translate_call(call, substitution, keys, unions, records, value_type)
-			values ?= translated_list(
-				arguments,
-				pure func(
-					argument: Checked.CheckedValue,
-				) -> Result[ConcreteValue, Diagnostic]: translate_value(
-					argument,
-					substitution,
-					keys,
-					unions,
-					records,
-				),
-			)
-			Ok({ operation = InvokeFunction(concrete, values), value_type = value_type, span = span })
+			-- The receiver leads the argument list, so the list is built once.
+			var values: List[ConcreteExpr] = [receiver]
+			var failure: Option[Diagnostic] = None
+			for argument in arguments:
+				match translate_value(argument, substitution, keys, unions, records):
+					Ok(translated):
+						values = values.append(translated)
+					Err(error):
+						failure = Some(error)
+						break
+			ready ?= match failure:
+				Some(error): Err(error)
+				None: Ok(void)
 
+			Ok({ form = InvokeFunction(concrete, values), value_type = value_type, span = step.span })
 
 
 private pure func translate_statements(
@@ -1761,7 +1753,7 @@ private pure func translate_exit(
 		Checked.RecurWith(arguments, span):
 			concrete ?= translated_list(arguments, pure func(
 				value: Checked.CheckedValue,
-			) -> Result[ConcreteValue, Diagnostic]:
+			) -> Result[ConcreteExpr, Diagnostic]:
 				translate_value(value, substitution, keys, unions, records)
 			)
 			Ok(RecurWith(concrete, span))
