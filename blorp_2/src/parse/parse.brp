@@ -17,7 +17,7 @@ import:
 		LogicalOperator(AndOperator, OrOperator),
 		ElseBranch(ElseIf, ElseBlock),
 		ParsedIf,
-		LambdaBinder(LambdaName, LambdaDiscard),
+		ParsedBinder(NamedBinder, DiscardBinder),
 		LambdaParameter,
 		LambdaBody(InlineBody, BlockBody),
 		ParsedLambda,
@@ -757,6 +757,21 @@ private pure func consume_name(state: ParserState, message: String) -> Result[Pa
 					Err(expected(state, message, IDENTIFIER_HELP))
 		None:
 			Err(expected(state, message, IDENTIFIER_HELP))
+
+
+private fixed record BinderResult {
+	binder: ParsedBinder,
+	next: ParserState
+}
+
+
+-- `_` or a name (the host's binder_name).
+private pure func consume_binder(state: ParserState, message: String) -> Result[BinderResult, Diagnostic]:
+	if at_wildcard(state):
+		Ok({ binder = DiscardBinder(parser_span(state)), next = shifted(state, 1) })
+	else:
+		name ?= consume_name(state, message)
+		Ok({ binder = NamedBinder(name.name), next = name.next })
 
 
 private fixed record NameList {
@@ -1534,23 +1549,11 @@ private pure func consume_lambda_parameter(state: ParserState) -> Result[LambdaP
 	Ok({ parameter = { binder = binder.binder, annotation = annotation.written }, next = annotation.next })
 
 
-private fixed record LambdaBinderResult {
-	binder: LambdaBinder,
-	next: ParserState
-}
-
-
 -- A reserved word reports itself; any other non-name token gets the host's
 -- lambda-parameter help.
-private pure func consume_lambda_binder(state: ParserState) -> Result[LambdaBinderResult, Diagnostic]:
-	if at_wildcard(state):
-		Ok({ binder = LambdaDiscard(parser_span(state)), next = shifted(state, 1) })
-	else if at_identifier(state) or at_keyword(state):
-		match consume_name(state, "expected lambda parameter"):
-			Ok(name):
-				Ok({ binder = LambdaName(name.name), next = name.next })
-			Err(error):
-				Err(error)
+private pure func consume_lambda_binder(state: ParserState) -> Result[BinderResult, Diagnostic]:
+	if at_wildcard(state) or at_identifier(state) or at_keyword(state):
+		consume_binder(state, "expected lambda parameter")
 	else:
 		Err(expected(state, "expected lambda parameter", LAMBDA_PARAMETER_HELP))
 
@@ -2218,14 +2221,15 @@ private pure func consume_while(state: ParserState) -> Result[LineForm, Diagnost
 	Ok(StatementForm(WhileLoop(loop), with_context(body.next, state.context)))
 
 
--- `state` is at `for`: `for name in iterable:` and a loop body.
+-- `state` is at `for`: `for name in iterable:` or `for _ in iterable:`,
+-- and a loop body.
 private pure func consume_for(state: ParserState) -> Result[LineForm, Diagnostic]:
 	keyword = parser_span(state)
-	binder ?= consume_name(shifted(state, 1), "expected a loop variable after `for`")
+	binder ?= consume_binder(shifted(state, 1), "expected a loop variable after `for`")
 	in_word ?= expect(binder.next, at_in(binder.next), "expected `in` after for loop variable", KEYWORD_HELP)
 	iterable ?= consume_header_value(value_position(in_word))
 	body ?= consume_header_block(with_context(iterable.next, LoopBody), "expected `:` after for loop iterable")
-	loop = { binder = binder.name, iterable = iterable.body, body = body.block, span = { keyword | end = body.block.span.end } }
+	loop = { binder = binder.binder, iterable = iterable.body, body = body.block, span = { keyword | end = body.block.span.end } }
 	Ok(StatementForm(ForLoop(loop), with_context(body.next, state.context)))
 
 

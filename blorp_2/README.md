@@ -1070,9 +1070,10 @@ Lexical and layout rules:
   the same line, or stands alone on the next line indented one level, and may
   continue inside brackets. `name ?= expression` is a propagating binding:
   it parses like a binding (never with `var`), and checking rejects it until
-  the join milestone. `while condition:` and `for name in iterable:` open a
-  loop body; they, `break` and `continue` are statements with no value, and a
-  loop control stands alone on its line (`break 1` is rejected here while the
+  the join milestone. `while condition:` and `for name in iterable:` (or
+  `for _ in iterable:`, discarding each element) open a loop body; they,
+  `break` and `continue` are statements with no value, and a loop control
+  stands alone on its line (`break 1` is rejected here while the
   host still accepts it, pending GRAMMAR D10).
   As in the host, `break` and `continue` need an enclosing loop body and
   `?=` may not appear anywhere inside one; by owner decision none of the
