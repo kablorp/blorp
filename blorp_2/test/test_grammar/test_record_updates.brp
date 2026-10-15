@@ -1,0 +1,107 @@
+import:
+	../../src/assemble: parsed_contents
+	../../src/declarations: inventory_functions
+	../../src/lex: lex
+	../../src/names: name_spelling
+	../../src/source: module_source, root_module_id
+	../../src/syntax: Diagnostic, ExpressionBase(RecordExpression, RecordUpdateExpression, DirectApplication), ParsedBody(ParsedValueBody), PostfixOperation(FieldAccess)
+	../../src/text: equals
+	../unit/input: parse
+	int as IntOps
+	test: TestSuite
+
+
+private pure func return_expression(source: String) -> Result[Bool, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source)
+	program ?= parse(tokens)
+	contents = parsed_contents(program)
+	match inventory_functions(contents.declarations):
+		[row]:
+			match row.declaration.body:
+				ParsedValueBody(value):
+					match value.base:
+						RecordUpdateExpression(base, [first, second]):
+							base_call = match base.base:
+								DirectApplication(_, []): True
+								_: False
+							field_names = match name_spelling(contents.names, first.name.id):
+								Some(name): equals(name, "second")
+								None: False
+							second_name = match name_spelling(contents.names, second.name.id):
+								Some(name): equals(name, "first")
+								None: False
+							postfix = match value.applications:
+								[FieldAccess(_)]: True
+								_: False
+							Ok(base_call and field_names and second_name and postfix and IntOps.equals(base.applications.length(), 1))
+						_: Ok(False)
+				_: Ok(False)
+		_: Ok(False)
+
+
+pure func test_spaces_repeated_fields_and_outer_postfix_are_grammar_terms() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    { base ( ) . inner | second = 9 , first = 7 } . first -- ordinary inline comment
+		|
+	match return_expression(source):
+		Ok(value): value
+		Err(_): False
+
+
+pure func test_an_update_can_be_the_base_of_another_update() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    { { base() | first = 7 } | second = 9 }
+		|
+	match lex(module_source(root_module_id()), source).and_then(parse):
+		Err(_): False
+		Ok(program):
+			match inventory_functions(parsed_contents(program).declarations):
+				[row]:
+					match row.declaration.body:
+						ParsedValueBody(value):
+							match value.base:
+								RecordUpdateExpression(base, [_]):
+									match base.base:
+										RecordUpdateExpression(_, [_]): True
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_literal_base_and_literal_replacement_remain_separate_terms() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    { { first = 1 } | first = { value = 7 } }
+		|
+	match lex(module_source(root_module_id()), source).and_then(parse):
+		Err(_): False
+		Ok(program):
+			match inventory_functions(parsed_contents(program).declarations):
+				[row]:
+					match row.declaration.body:
+						ParsedValueBody(value):
+							match value.base:
+								RecordUpdateExpression(base, [field]):
+									literal_base = match base.base:
+										RecordExpression([_]): True
+										_: False
+									literal_field = match field.value.base:
+										RecordExpression([_]): True
+										_: False
+									literal_base and literal_field
+								_: False
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Record update EBNF conformance",
+	tests = [
+		("spaces repeated fields and postfix are terms", test_spaces_repeated_fields_and_outer_postfix_are_grammar_terms),
+		("update can be another update's base", test_an_update_can_be_the_base_of_another_update),
+		("literal base and replacement are separate terms", test_literal_base_and_literal_replacement_remain_separate_terms),
+	]
+}

@@ -1,20 +1,19 @@
 import:
-	../../src/declarations: record_number, union_number, variant_number, variant_owner
-	../../src/names: find_name
+	../../src/declarations: VariantId, inventory_records, record_number, union_number, variant_number, variant_owner
+	../../src/names: NameId, find_name, same_name
 	../../src/namespace:
 		ImportProblem(
 			AmbiguousImportSelection, AmbiguousImportedType, MissingImportedType, MethodTypeNotVisible,
 			MissingImportedFunction, ImportedTypeConflict, RepeatedImportedVariant,
 		),
 		MethodSelectionRequest,
-		Namespace,
+		Namespace, NamespaceFailure, NamespaceProblem(ImportSelectionFailure), FunctionCandidate,
 		TypeCandidate(PrimitiveCandidate, ListCandidate, UnionCandidate, RecordCandidate),
 		build_namespace,
-		function_candidates,
-		import_problems,
+		function_candidate,
 		method_selection_requests,
 		same_type_candidate,
-		type_candidates,
+		type_candidate,
 		variant_candidates,
 	../../src/check: check
 	../../src/check_render: render_failure
@@ -42,7 +41,7 @@ import:
 
 private fixed record NamespaceInput {
 	program: ParsedProgram,
-	namespace: Namespace
+	namespace: Result[Namespace, NamespaceFailure]
 }
 
 
@@ -96,16 +95,39 @@ private pure func namespace_input(inputs: List[ModuleInput]) -> Result[Namespace
 	})
 
 
-private pure func candidates(
-	input: NamespaceInput,
-	ordinal: Int,
-	spelling: String,
-) -> List[TypeCandidate]:
-	match (module_id(ordinal), find_name(parsed_contents(input.program).names, spelling)):
-		(Some(module), Some(name)):
-			type_candidates(input.namespace, module, name)
-		_:
-			[]
+-- A failed publication has no scope to query. Negative cases inspect all typed
+-- namespace problems; positive cases require the successful Result explicitly.
+private pure func scope_problems(input: NamespaceInput) -> List[NamespaceProblem]:
+	match input.namespace:
+		Ok(_): []
+		Err(failure): [failure.first].concat(failure.remaining)
+
+
+private pure func candidate(input: NamespaceInput, ordinal: Int, spelling: String) -> Option[TypeCandidate]:
+	match input.namespace:
+		Err(_): None
+		Ok(namespace):
+			match (module_id(ordinal), find_name(parsed_contents(input.program).names, spelling)):
+				(Some(module), Some(name)): type_candidate(namespace, module, name)
+				_: None
+
+
+private pure func scope_function(input: NamespaceInput, module: ModuleId, name: NameId) -> Option[FunctionCandidate]:
+	match input.namespace:
+		Ok(namespace): function_candidate(namespace, module, name)
+		Err(_): None
+
+
+private pure func scope_variants(input: NamespaceInput, module: ModuleId, name: NameId) -> List[VariantId]:
+	match input.namespace:
+		Ok(namespace): variant_candidates(namespace, module, name)
+		Err(_): []
+
+
+private pure func namespace_methods(input: NamespaceInput) -> List[MethodSelectionRequest]:
+	match input.namespace:
+		Ok(namespace): method_selection_requests(namespace)
+		Err(_): []
 
 
 private pure func same_visible_type(
@@ -114,18 +136,33 @@ private pure func same_visible_type(
 	right: Int,
 	spelling: String,
 ) -> Bool:
-	match (candidates(input, left, spelling), candidates(input, right, spelling)):
-		([first], [second]):
+	match (candidate(input, left, spelling), candidate(input, right, spelling)):
+		(Some(first), Some(second)):
 			same_type_candidate(first, second)
 		_:
 			False
+
+
+-- Even a failed publication retains the parsed producer's issued identities.
+-- Inspect those declarations rather than querying an invalid Namespace.
+private pure func distinct_record_owners(input: NamespaceInput, left: Int, right: Int, spelling: String) -> Bool:
+	parsed = parsed_contents(input.program)
+	match (module_id(left), module_id(right), find_name(parsed.names, spelling)):
+		(Some(left_module), Some(right_module), Some(name)):
+			rows = inventory_records(parsed.declarations)
+			left_rows = rows.filter(pure func(row): same_module(row.declaration.module, left_module) and same_name(row.declaration.type_name.id, name))
+			right_rows = rows.filter(pure func(row): same_module(row.declaration.module, right_module) and same_name(row.declaration.type_name.id, name))
+			match (left_rows, right_rows):
+				([first], [second]): record_number(first.id) != record_number(second.id)
+				_: False
+		_: False
 
 
 -- Method requests that select from operation modules. Every user module also
 -- receives the test prelude's selections from the base, whose method set is empty.
 private pure func operation_requests(input: NamespaceInput) -> List[MethodSelectionRequest]:
 	base = parsed_contents(input.program).foundation.types
-	method_selection_requests(input.namespace).filter(pure func(request): not same_module(request.target, base))
+	namespace_methods(input).filter(pure func(request): not same_module(request.target, base))
 
 
 pure func test_bare_record_import_retains_owner_and_publishes_method_request() -> Bool:
@@ -155,11 +192,11 @@ pure func test_bare_record_import_retains_owner_and_publishes_method_request() -
 			False
 		Ok(input):
 			match (
-				candidates(input, 0, "Foo"),
+				candidate(input, 0, "Foo"),
 				operation_requests(input),
 				module_id(1),
 			):
-				([RecordCandidate(receiver)], [request], Some(target)):
+				(Some(RecordCandidate(receiver)), [request], Some(target)):
 					(
 						record_number(receiver) == 0
 						and same_visible_type(input, 0, 1, "Foo")
@@ -168,7 +205,7 @@ pure func test_bare_record_import_retains_owner_and_publishes_method_request() -
 						and same_type_candidate(request.receiver, RecordCandidate(receiver))
 						and request.name.span.start == 19
 						and request.name.span.end == 22
-						and import_problems(input.namespace).is_empty()
+						and input.namespace.is_ok()
 					)
 				_:
 					False
@@ -205,7 +242,7 @@ pure func test_bare_union_import_adds_type_without_constructors() -> Bool:
 				Some(name):
 					(
 						same_visible_type(input, 0, 1, "Choice")
-						and variant_candidates(input.namespace, root_module_id(), name).is_empty()
+						and scope_variants(input, root_module_id(), name).is_empty()
 					)
 				None:
 					False
@@ -234,12 +271,12 @@ pure func test_builtin_types_forward_through_empty_operation_modules() -> Bool:
 		Err(_):
 			False
 		Ok(input):
-			match (candidates(input, 0, "Int"), candidates(input, 0, "List")):
-				([PrimitiveCandidate(BuiltinInt)], [ListCandidate]):
+			match (candidate(input, 0, "Int"), candidate(input, 0, "List")):
+				(Some(PrimitiveCandidate(BuiltinInt)), Some(ListCandidate)):
 					(
 						same_visible_type(input, 0, 1, "Int")
 						and operation_requests(input).length() == 2
-						and import_problems(input.namespace).is_empty()
+						and input.namespace.is_ok()
 					)
 				_:
 					False
@@ -282,7 +319,7 @@ pure func test_forwarded_record_keeps_original_identity() -> Bool:
 			(
 				same_visible_type(input, 0, 2, "Foo")
 				and same_visible_type(input, 1, 2, "Foo")
-				and import_problems(input.namespace).is_empty()
+				and input.namespace.is_ok()
 			)
 
 
@@ -325,7 +362,7 @@ pure func test_diamond_forwarding_is_idempotent() -> Bool:
 		Err(_):
 			False
 		Ok(input):
-			same_visible_type(input, 0, 3, "Foo") and import_problems(input.namespace).is_empty()
+			same_visible_type(input, 0, 3, "Foo") and input.namespace.is_ok()
 
 
 pure func test_seeded_forwarding_cycle_converges() -> Bool:
@@ -364,7 +401,7 @@ pure func test_seeded_forwarding_cycle_converges() -> Bool:
 		Err(_):
 			False
 		Ok(input):
-			same_visible_type(input, 0, 2, "Foo") and import_problems(input.namespace).is_empty()
+			same_visible_type(input, 0, 2, "Foo") and input.namespace.is_ok()
 
 
 pure func test_unseeded_forwarding_cycle_reports_missing_origin() -> Bool:
@@ -398,9 +435,9 @@ pure func test_unseeded_forwarding_cycle_reports_missing_origin() -> Bool:
 		Err(_):
 			False
 		Ok(input):
-			match import_problems(input.namespace):
-				[MissingImportedFunction(_, _), MissingImportedFunction(_, _), MissingImportedFunction(_, _)]:
-					candidates(input, 0, "Foo").is_empty()
+			match scope_problems(input):
+				[ImportSelectionFailure(MissingImportedFunction(_, _)), ImportSelectionFailure(MissingImportedFunction(_, _)), ImportSelectionFailure(MissingImportedFunction(_, _))]:
+					candidate(input, 0, "Foo").is_none()
 				_:
 					False
 
@@ -436,12 +473,15 @@ pure func test_same_spelled_distinct_types_conflict() -> Bool:
 		Err(_):
 			False
 		Ok(input):
-			match import_problems(input.namespace):
-				[ImportedTypeConflict(written, previous)]:
+			match scope_problems(input):
+				[ImportSelectionFailure(ImportedTypeConflict(written, previous))]:
 					(
-						candidates(input, 0, "Foo").length() == 2
-						and written.span.start == 37
-						and previous.start == 20
+						input.namespace.is_err()
+						and distinct_record_owners(input, 1, 2, "Foo")
+						and same_source(written.span.source, module_source(root_module_id()))
+						and same_source(previous.source, module_source(root_module_id()))
+						and written.span.start == 37 and written.span.end == 40
+						and previous.start == 20 and previous.end == 23
 					)
 				_:
 					False
@@ -476,14 +516,14 @@ pure func test_bare_type_and_local_function_selector_is_ambiguous() -> Bool:
 			False
 		Ok(input):
 			match (
-				import_problems(input.namespace),
+				scope_problems(input),
 				find_name(parsed_contents(input.program).names, "Foo"),
 			):
-				([AmbiguousImportSelection(_, written)], Some(name)):
+				([ImportSelectionFailure(AmbiguousImportSelection(_, written))], Some(name)):
 					(
 						written.span.start == 21
-						and candidates(input, 0, "Foo").is_empty()
-						and function_candidates(input.namespace, root_module_id(), name).is_empty()
+						and candidate(input, 0, "Foo").is_none()
+						and scope_function(input, root_module_id(), name).is_none()
 					)
 				_:
 					False
@@ -523,9 +563,9 @@ pure func test_methods_only_requires_independent_caller_type() -> Bool:
 		Err(_):
 			False
 		Ok(input):
-			match import_problems(input.namespace):
-				[MethodTypeNotVisible(written)]:
-					written.span.start == 26 and candidates(input, 0, "Foo").is_empty()
+			match scope_problems(input):
+				[ImportSelectionFailure(MethodTypeNotVisible(written))]:
+					written.span.start == 26 and candidate(input, 0, "Foo").is_none()
 				_:
 					False
 
@@ -557,11 +597,12 @@ pure func test_methods_only_rejects_unrelated_same_named_caller_type() -> Bool:
 		Err(_):
 			False
 		Ok(input):
-			match import_problems(input.namespace):
-				[MethodTypeNotVisible(_)]:
+			match scope_problems(input):
+				[ImportSelectionFailure(MethodTypeNotVisible(written))]:
 					(
-						not same_visible_type(input, 0, 1, "Foo")
-						and operation_requests(input).is_empty()
+						input.namespace.is_err() and distinct_record_owners(input, 0, 1, "Foo")
+						and same_source(written.span.source, module_source(root_module_id()))
+						and written.span.start == 26 and written.span.end == 29
 					)
 				_:
 					False
@@ -598,7 +639,7 @@ pure func test_methods_only_accepts_caller_local_declaration() -> Bool:
 			(
 				same_visible_type(input, 0, 1, "Foo")
 				and operation_requests(input).length() == 2
-				and import_problems(input.namespace).is_empty()
+				and input.namespace.is_ok()
 			)
 
 
@@ -633,7 +674,7 @@ private pure func reordered_methods_valid(root: String, targets: List[Int]) -> B
 			(
 				same_visible_type(input, 0, 2, "Foo")
 				and operation_requests(input).length() == 3
-				and import_problems(input.namespace).is_empty()
+				and input.namespace.is_ok()
 			)
 
 
@@ -684,8 +725,8 @@ pure func test_methods_only_unknown_target_type_is_typed() -> Bool:
 		Err(_):
 			False
 		Ok(input):
-			match import_problems(input.namespace):
-				[MissingImportedType(_, written)]:
+			match scope_problems(input):
+				[ImportSelectionFailure(MissingImportedType(_, written))]:
 					written.span.start == 26
 				_:
 					False
@@ -728,18 +769,18 @@ pure func test_forwarded_constructor_uses_original_union_owner() -> Bool:
 			False
 		Ok(input):
 			match (
-				candidates(input, 0, "Choice"),
+				candidate(input, 0, "Choice"),
 				find_name(parsed_contents(input.program).names, "One"),
 				module_id(1),
 			):
-				([UnionCandidate(owner_id)], Some(name), Some(forwarder)):
-					match variant_candidates(input.namespace, root_module_id(), name):
+				(Some(UnionCandidate(owner_id)), Some(name), Some(forwarder)):
+					match scope_variants(input, root_module_id(), name):
 						[variant]:
 							(
 								union_number(variant_owner(variant)) == union_number(owner_id)
 								and variant_number(variant) == 0
-								and variant_candidates(input.namespace, forwarder, name).is_empty()
-								and import_problems(input.namespace).is_empty()
+								and scope_variants(input, forwarder, name).is_empty()
+								and input.namespace.is_ok()
 							)
 						_:
 							False
@@ -790,8 +831,8 @@ pure func test_constructor_overlap_is_idempotent() -> Bool:
 			match find_name(parsed_contents(input.program).names, "One"):
 				Some(name):
 					(
-						variant_candidates(input.namespace, root_module_id(), name).length() == 1
-						and import_problems(input.namespace).is_empty()
+						scope_variants(input, root_module_id(), name).length() == 1
+						and input.namespace.is_ok()
 					)
 				None:
 					False
@@ -824,8 +865,8 @@ pure func test_repeated_explicit_constructor_selection_still_rejects() -> Bool:
 		Err(_):
 			False
 		Ok(input):
-			match import_problems(input.namespace):
-				[RepeatedImportedVariant(_, _)]:
+			match scope_problems(input):
+				[ImportSelectionFailure(RepeatedImportedVariant(_, _))]:
 					True
 				_:
 					False
@@ -869,9 +910,9 @@ pure func test_function_import_does_not_forward_types_or_dependency_functions() 
 		Err(_):
 			False
 		Ok(input):
-			match import_problems(input.namespace):
-				[MissingImportedFunction(_, _)]:
-					candidates(input, 0, "Foo").is_empty()
+			match scope_problems(input):
+				[ImportSelectionFailure(MissingImportedFunction(_, _))]:
+					candidate(input, 0, "Foo").is_none()
 				_:
 					False
 
@@ -896,9 +937,21 @@ pure func test_base_type_conflicts_with_distinct_local_declaration() -> Bool:
 		Err(_):
 			False
 		Ok(input):
-			match import_problems(input.namespace):
-				[ImportedTypeConflict(written, _)]:
-					written.span.start == 13 and candidates(input, 0, "Int").length() == 2
+			match scope_problems(input):
+				[ImportSelectionFailure(ImportedTypeConflict(written, previous))]:
+					parsed = parsed_contents(input.program)
+					match inventory_records(parsed.declarations):
+						[row]:
+							(
+								input.namespace.is_err() and record_number(row.id) == 0
+								and same_module(row.declaration.module, root_module_id())
+								and same_name(row.declaration.type_name.id, written.id)
+								and same_source(written.span.source, module_source(root_module_id()))
+								and written.span.start == 13 and written.span.end == 16
+								and same_source(previous.source, module_source(parsed.foundation.prelude))
+								and previous.start == 19 and previous.end == 22
+							)
+						_: False
 				_:
 					False
 
@@ -942,19 +995,19 @@ pure func test_prelude_selected_scope_obeys_explicit_module_roles() -> Bool:
 					(
 						same_visible_type(input, 0, 3, "Choice")
 						and same_visible_type(input, 1, 3, "Choice")
-						and candidates(input, 2, "Choice").is_empty()
-						and candidates(input, 4, "Choice").is_empty()
-						and candidates(input, 1, "Int").length() == 1
-						and candidates(input, 2, "Int").is_empty()
-						and candidates(input, 3, "Int").length() == 1
-						and variant_candidates(input.namespace, root_module_id(), one).length() == 1
-						and variant_candidates(input.namespace, helper, one).length() == 1
-						and variant_candidates(input.namespace, library, one).is_empty()
-						and function_candidates(input.namespace, root_module_id(), answer).length() == 1
-						and function_candidates(input.namespace, helper, answer).length() == 1
-						and function_candidates(input.namespace, library, answer).is_empty()
+						and candidate(input, 2, "Choice").is_none()
+						and candidate(input, 4, "Choice").is_none()
+						and candidate(input, 1, "Int").is_some()
+						and candidate(input, 2, "Int").is_none()
+						and candidate(input, 3, "Int").is_some()
+						and scope_variants(input, root_module_id(), one).length() == 1
+						and scope_variants(input, helper, one).length() == 1
+						and scope_variants(input, library, one).is_empty()
+						and scope_function(input, root_module_id(), answer).is_some()
+						and scope_function(input, helper, answer).is_some()
+						and scope_function(input, library, answer).is_none()
 						and operation_requests(input).length() == 3
-						and import_problems(input.namespace).is_empty()
+						and input.namespace.is_ok()
 					)
 				_: False
 
@@ -979,11 +1032,11 @@ pure func test_local_prelude_declarations_do_not_supply_implicit_scope() -> Bool
 			match find_name(parsed_contents(input.program).names, "hidden"):
 				Some(hidden):
 					(
-						candidates(input, 0, "Local").is_empty()
-						and candidates(input, 2, "Local").length() == 1
-						and function_candidates(input.namespace, root_module_id(), hidden).is_empty()
-						and method_selection_requests(input.namespace).is_empty()
-						and import_problems(input.namespace).is_empty()
+						candidate(input, 0, "Local").is_none()
+						and candidate(input, 2, "Local").is_some()
+						and scope_function(input, root_module_id(), hidden).is_none()
+						and namespace_methods(input).is_empty()
+						and input.namespace.is_ok()
 					)
 				None: False
 
@@ -1012,7 +1065,7 @@ pure func test_explicit_and_prelude_function_overlap_is_idempotent() -> Bool:
 		Err(_): False
 		Ok(input):
 			match find_name(parsed_contents(input.program).names, "answer"):
-				Some(answer): function_candidates(input.namespace, root_module_id(), answer).length() == 1 and import_problems(input.namespace).is_empty()
+				Some(answer): scope_function(input, root_module_id(), answer).is_some() and input.namespace.is_ok()
 				None: False
 
 
@@ -1042,10 +1095,10 @@ pure func test_methods_only_adds_no_constructor_bindings() -> Bool:
 			match (find_name(parsed_contents(input.program).names, "One"), module_id(1)):
 				(Some(one), Some(operations_module)):
 					(
-						variant_candidates(input.namespace, root_module_id(), one).is_empty()
-						and variant_candidates(input.namespace, operations_module, one).length() == 1
+						scope_variants(input, root_module_id(), one).is_empty()
+						and scope_variants(input, operations_module, one).length() == 1
 						and same_visible_type(input, 0, 2, "Choice")
-						and import_problems(input.namespace).is_empty()
+						and input.namespace.is_ok()
 					)
 				_: False
 
@@ -1073,8 +1126,21 @@ pure func test_ambiguous_forwarded_type_keeps_both_identities_and_rejects_select
 	]):
 		Err(_): False
 		Ok(input):
-			match import_problems(input.namespace):
-				[AmbiguousImportedType(_, _), ImportedTypeConflict(_, _)]: candidates(input, 0, "Foo").length() == 2
+			match scope_problems(input):
+				[ImportSelectionFailure(AmbiguousImportedType(target, requested)), ImportSelectionFailure(ImportedTypeConflict(written, previous))]:
+					match module_id(1):
+						Some(facade_id):
+							(
+								input.namespace.is_err() and distinct_record_owners(input, 2, 3, "Foo")
+								and same_module(target, facade_id)
+								and same_source(requested.span.source, module_source(root_module_id()))
+								and requested.span.start == 22 and requested.span.end == 25
+								and same_source(written.span.source, module_source(facade_id))
+								and same_source(previous.source, module_source(facade_id))
+								and written.span.start == 37 and written.span.end == 40
+								and previous.start == 20 and previous.end == 23
+							)
+						None: False
 				_: False
 
 
@@ -1105,15 +1171,15 @@ pure func test_base_scope_comes_only_from_imports() -> Bool:
 			match (find_name(parsed_contents(input.program).names, "Some"), module_id(1), module_id(2), module_id(4)):
 				(Some(some), Some(silent), Some(importing_module), Some(prelude_module)):
 					(
-						candidates(input, 1, "Int").is_empty() and candidates(input, 1, "Option").is_empty()
-						and variant_candidates(input.namespace, silent, some).is_empty()
+						candidate(input, 1, "Int").is_none() and candidate(input, 1, "Option").is_none()
+						and scope_variants(input, silent, some).is_empty()
 						and same_visible_type(input, 2, 3, "Int") and same_visible_type(input, 2, 3, "Option")
-						and variant_candidates(input.namespace, importing_module, some).length() == 1
+						and scope_variants(input, importing_module, some).length() == 1
 						and same_visible_type(input, 0, 3, "Int") and same_visible_type(input, 4, 3, "Int")
-						and candidates(input, 0, "Option").is_empty() and candidates(input, 4, "Option").is_empty()
-						and variant_candidates(input.namespace, root_module_id(), some).is_empty()
-						and variant_candidates(input.namespace, prelude_module, some).is_empty()
-						and import_problems(input.namespace).is_empty()
+						and candidate(input, 0, "Option").is_none() and candidate(input, 4, "Option").is_none()
+						and scope_variants(input, root_module_id(), some).is_empty()
+						and scope_variants(input, prelude_module, some).is_empty()
+						and input.namespace.is_ok()
 					)
 				_: False
 
@@ -1152,7 +1218,7 @@ pure func test_prelude_methods_only_selection_reaches_user_modules() -> Bool:
 						and same_module(for_root.target, operations_module)
 						and same_type_candidate(for_root.receiver, PrimitiveCandidate(BuiltinInt))
 						and same_visible_type(input, 0, 2, "Int")
-						and import_problems(input.namespace).is_empty()
+						and input.namespace.is_ok()
 					)
 				_: False
 

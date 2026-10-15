@@ -2,9 +2,10 @@ import:
 	../../src/check_errors as Errors
 	../../src/check_model as Model
 	../../src/check as API
+	../../src/check_render: render_failure
 	../../src/declarations as Declaration
 	../../src/lex: lex
-	../../src/source: module_source, root_module_id
+	../../src/source: module_source, root_module_id, same_source
 	../../src/syntax: Diagnostic
 	input: check_failure, parse, setup_diagnostic
 	test: TestSuite
@@ -823,7 +824,7 @@ pure func test_closed_nested_results_publish_complete_nominal_ancestry() -> Bool
 				None: False
 		Err(_): False
 
-pure func test_closed_unsupported_list_result_precedes_a_later_unknown_child() -> Bool:
+pure func test_deferred_list_result_allows_a_later_unknown_child() -> Bool:
 	declarations: String =
 		|pure func make[T](value: T) -> List[T]:
 		|    make(value)
@@ -832,35 +833,37 @@ pure func test_closed_unsupported_list_result_precedes_a_later_unknown_child() -
 		|func main() -> Int:
 	prefix = declarations + "\n    outer("
 	source = prefix + "make(1), missing)\n"
-	facts = match check_failure(source):
-		Some(error):
-			match error.kind:
-				Errors.TypeTermRejection(Errors.UnsupportedListElement):
-					error.span.start == prefix.length() and error.span.end == prefix.length() + 4
+	exact_failure(source, 157, 164,
+		"unknown value", "use this function's parameter name, a declared variant, or a call",
+		pure func(kind):
+			match kind:
+				Errors.ValueRejection(Errors.UnknownValue(_)): True
 				_: False
-		None: False
-	rendered = match checked(source):
-		Err(error):
-			error.message == "List currently supports only String elements" and error.help == "use List[String]; other concrete element types are not supported yet" and error.span.start == prefix.length() and error.span.end == prefix.length() + 4
-		Ok(_): False
-	facts and rendered
+	)
 
 
 
-private pure func unsupported_list_at(source: String, start: Int, end: Int) -> Bool:
-	facts = match check_failure(source):
-		Some(error):
-			match error.kind:
-				Errors.TypeTermRejection(Errors.UnsupportedListElement): error.span.start == start and error.span.end == end
-				_: False
-		None: False
-	rendered = match checked(source):
-		Err(error): error.message == "List currently supports only String elements" and error.help == "use List[String]; other concrete element types are not supported yet" and error.span.start == start and error.span.end == end
-		Ok(_): False
-	facts and rendered
+private pure func exact_failure(source: String, start: Int, end: Int, message: String, help: String, matches: pure (Errors.CheckErrorKind) -> Bool) -> Bool:
+	match lex(module_source(root_module_id()), source).and_then(parse):
+		Err(_): False
+		Ok(parsed):
+			match API.check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = API.check_errors(failure)
+					diagnostics = render_failure(failure)
+					(
+						matches(errors.first.kind) and errors.remaining.is_empty() and diagnostics.remaining.is_empty()
+						and same_source(errors.first.span.source, module_source(root_module_id()))
+						and errors.first.span.start == start and errors.first.span.end == end
+						and same_source(diagnostics.first.span.source, errors.first.span.source)
+						and diagnostics.first.span.start == start and diagnostics.first.span.end == end
+						and diagnostics.first.message == message and diagnostics.first.help == help
+						and diagnostics.first.note.is_none()
+					)
 
 
-pure func test_substituted_list_parameter_admission_precedes_an_ordinary_mismatch() -> Bool:
+pure func test_substituted_list_parameter_reports_an_ordinary_mismatch() -> Bool:
 	prefix = "pure func choose[T](witness:T, values: "
 	suffix: String =
 		|List[T])->Int:
@@ -868,10 +871,23 @@ pure func test_substituted_list_parameter_admission_precedes_an_ordinary_mismatc
 		|func main()->Int:
 		|    choose(1, "bad")
 		|
-	unsupported_list_at(prefix + suffix, prefix.length(), prefix.length() + 7)
+	exact_failure(prefix + suffix, 92, 97,
+		"argument type does not match the parameter type", "use an expression of type List[Int] here",
+		pure func(kind):
+			match kind:
+				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+					(
+						Model.same_type(mismatch.expected, Model.ListType(Model.IntType))
+						and Model.same_type(mismatch.actual.value_type, Model.StringType)
+						and mismatch.argument_position == 1
+						and mismatch.actual.span.start == 92 and mismatch.actual.span.end == 97
+						and same_source(mismatch.actual.span.source, module_source(root_module_id()))
+					)
+				_: False
+	)
 
 
-pure func test_substituted_list_parameter_admission_precedes_pure_void_result() -> Bool:
+pure func test_pure_void_result_still_precedes_list_argument_mismatch() -> Bool:
 	prefix = "pure func choose[T](witness:T, values: "
 	suffix: String =
 		|List[T])->T:
@@ -879,14 +895,20 @@ pure func test_substituted_list_parameter_admission_precedes_pure_void_result() 
 		|func main()->Int:
 		|    choose(void, "bad")
 		|
-	unsupported_list_at(prefix + suffix, prefix.length(), prefix.length() + 7)
+	exact_failure(prefix + suffix, 86, 92,
+		"pure functions cannot return Void", "remove pure, or return a non-Void value",
+		pure func(kind):
+			match kind:
+				Errors.SignatureRejection(Errors.PureVoidReturn): True
+				_: False
+	)
 
 tests: TestSuite = {
 	description = "Contextual generic-call inference",
 	tests = [
-		("substituted List admission precedes ordinary mismatch", test_substituted_list_parameter_admission_precedes_an_ordinary_mismatch),
-		("substituted List admission precedes pure Void result", test_substituted_list_parameter_admission_precedes_pure_void_result),
-		("closed unsupported List result precedes later unknown", test_closed_unsupported_list_result_precedes_a_later_unknown_child),
+		("substituted List parameter reports ordinary mismatch", test_substituted_list_parameter_reports_an_ordinary_mismatch),
+		("pure Void result still precedes List mismatch", test_pure_void_result_still_precedes_list_argument_mismatch),
+		("deferred List result permits later unknown", test_deferred_list_result_allows_a_later_unknown_child),
 		("known List context opens mixed structural terms", test_known_list_context_opens_only_the_mixed_inference_shape),
 		("closed nested calls retain complete nominal ancestry", test_closed_nested_results_publish_complete_nominal_ancestry),
 		("direct hint rebuilds substituted accepted compound", test_direct_result_hint_rebuilds_the_substituted_compound),

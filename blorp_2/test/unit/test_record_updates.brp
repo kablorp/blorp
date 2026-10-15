@@ -1,0 +1,545 @@
+import:
+	../../src/check: CheckedProgram, check_errors, checked_functions
+	../../src/check_errors as Errors
+	../../src/check_model as Model
+	../../src/check_render: render_failure
+	../../src/declarations: function_number
+	../../src/source: module_source, root_module_id, same_source
+	../../src/syntax: Diagnostic, DiagnosticNote(PreviousField, RecordFieldDeclaration), same_span
+	../../src/text: concat, equals
+	input: check, setup_diagnostic
+	int as IntOps
+	module_input: parse_modules
+	test: TestSuite
+
+
+private ENTRY_SOURCE: String =
+	|import:
+	|    list: repeat
+	|    int: to_string
+	|    io: print
+	|fixed record Entry { number: Int, text: String, values: List[Int] }
+	|pure func make_entry(number: Int) -> Entry:
+	|    { number = number, text = number.to_string(), values = repeat(number, 2) }
+	|pure func replace_text(value: Entry) -> Entry:
+	|    { value | text = 7.to_string() }
+	|func main() -> Void:
+	|    old = make_entry(42)
+	|    alias = old
+	|    fresh = replace_text(old)
+	|    print(alias.text)
+	|    print(fresh.text)
+	|
+
+
+private LIST_SOURCE: String =
+	|pure func repeat[T](element: T, count: Int) -> List[T]:
+	|    builtin("list.repeat")
+	|
+
+
+private INT_SOURCE: String =
+	|pure func to_string(value: Int) -> String:
+	|    builtin("int.to_string")
+	|
+
+
+private IO_SOURCE: String =
+	|func print(value: String) -> Void:
+	|    builtin("string.print")
+	|
+
+
+pure func test_fresh_update_accepts_an_existing_alias() -> Bool:
+	match parse_modules([
+		{ source = ENTRY_SOURCE, targets = [1, 2, 3] },
+		{ source = LIST_SOURCE, targets = [] },
+		{ source = INT_SOURCE, targets = [] },
+		{ source = IO_SOURCE, targets = [] },
+	]):
+		Err(_):
+			False
+		Ok(parsed):
+			check(parsed).is_ok()
+
+
+private BOX_SEED: String =
+	|fixed record Box[T] { value: T }
+	|pure func seed[T]() -> Box[T]:
+	|    seed()
+	|
+
+
+private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
+	parsed ?= parse_modules([{ source = source, targets = [] }])
+	check(parsed).map_err(setup_diagnostic)
+
+
+pure func test_replacement_infers_unsettled_base_arguments() -> Bool:
+	source = BOX_SEED.concat(
+		|pure func inferred() -> Int:
+		|    updated = { seed() | value = 1 }
+		|    updated.value
+		|func main() -> Int:
+		|    0
+		|
+	)
+	match checked(source):
+		Err(_): False
+		Ok(program):
+			facts = checked_functions(program)
+			match facts.functions:
+				[seed, inferred, _]:
+					match inferred.statements:
+						[Model.InitializeBinding(_, value)]:
+							match value.base:
+								Model.ReturnRecordUpdate(update):
+									match update.base.base:
+										Model.ReturnCall(call, []):
+											match call.target:
+												Model.UserFunction(id, [argument]):
+													match facts.records:
+														[box]:
+															(Model.same_type(argument, Model.IntType)
+															and Model.same_type(value.base_type, Model.AppliedRecordType(box.id, [Model.IntType]))
+															and IntOps.equals(function_number(id), function_number(seed.id)))
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+private pure func rejects(
+	source: String,
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+	kind: pure (Errors.CheckErrorKind) -> Bool,
+) -> Bool:
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = check_errors(failure)
+					rendered = render_failure(failure)
+					(errors.remaining.is_empty() and rendered.remaining.is_empty()
+					and IntOps.equals(errors.first.span.start, start)
+					and IntOps.equals(errors.first.span.end, end)
+					and kind(errors.first.kind)
+					and same_source(errors.first.span.source, module_source(root_module_id()))
+					and same_span(errors.first.span, rendered.first.span)
+					and equals(rendered.first.message, message) and equals(rendered.first.help, help)
+					and rendered.first.note.is_none())
+
+
+pure func test_unknown_replacement_precedes_unsettled_base_freeze() -> Bool:
+	prefix = BOX_SEED.concat(
+		|pure func inferred() -> Int:
+		|    updated = { seed() |
+	).concat(" ")
+	suffix: String =
+		|missing = 1 }
+		|    0
+		|func main() -> Int:
+		|    0
+		|
+	source = prefix.concat(suffix)
+	rejects(source, prefix.length(), IntOps.add(prefix.length(), 7), "unknown field 'missing' in Box", "use a field declared by the receiving record", pure func(kind):
+		match kind:
+			Errors.RecordRejection(Errors.UnknownRecordField(_, _)): True
+			_: False
+	)
+
+
+pure func test_nonrecord_postfix_base_reports_its_complete_span() -> Bool:
+	opening: String =
+		|fixed record Pair { first: Int, second: Int }
+		|pure func identity(value: Int) -> Int:
+		|    value
+		|pure func invalid() -> Pair:
+		|    {
+	prefix = opening.concat(" ")
+	base = "1.identity()"
+	suffix: String =
+		| | first = 7 }
+		|func main() -> Int:
+		|    0
+		|
+	source = prefix.concat(base).concat(suffix)
+	rejects(source, prefix.length(), IntOps.add(prefix.length(), base.length()), "record update requires a record value", "write { existing_record | field = expression } with a record base", pure func(kind):
+		match kind:
+			Errors.RecordRejection(Errors.UpdateRequiresRecord(actual)): Model.same_type(actual, Model.IntType)
+			_: False
+	)
+
+
+private PAIR: String =
+	|fixed record Pair { first: Int, second: Int }
+	|
+
+
+private pure func rejects_duplicate(source: String, first_start: Int, duplicate_start: Int, name_bytes: Int) -> Bool:
+	first_span = { source = module_source(root_module_id()), start = first_start, end = IntOps.add(first_start, name_bytes) }
+	duplicate_span = { source = module_source(root_module_id()), start = duplicate_start, end = IntOps.add(duplicate_start, name_bytes) }
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = check_errors(failure)
+					rendered = render_failure(failure)
+					typed = match errors.first.kind:
+						Errors.RecordRejection(Errors.DuplicateUpdateField(_, previous)): same_span(previous, first_span)
+						_: False
+					note = match rendered.first.note:
+						Some(PreviousField(previous)): same_span(previous, first_span)
+						_: False
+					(errors.remaining.is_empty() and rendered.remaining.is_empty() and typed and note
+					and same_span(errors.first.span, duplicate_span) and same_span(rendered.first.span, duplicate_span)
+					and equals(rendered.first.message, "duplicate field in record update")
+					and equals(rendered.first.help, "write each replacement field exactly once"))
+
+
+pure func test_duplicate_replacement_retains_first_written_span() -> Bool:
+	prefix = PAIR.concat(
+		|pure func change(value: Pair) -> Pair:
+		|    { value |
+	).concat(" ")
+	first = "second"
+	middle = " = 7, "
+	suffix: String =
+		|second = 9 }
+		|func main() -> Int:
+		|    0
+		|
+	source = prefix.concat(first).concat(middle).concat(suffix)
+	rejects_duplicate(source, prefix.length(), IntOps.add(IntOps.add(prefix.length(), first.length()), middle.length()), first.length())
+
+
+pure func test_replacement_mismatch_retains_complete_value_and_annotation() -> Bool:
+	prefix = PAIR.concat(
+		|pure func change(value: Pair) -> Pair:
+		|    { value | first =
+	).concat(" ")
+	value = "2.5"
+	suffix: String =
+		| }
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules([{ source = prefix.concat(value).concat(suffix), targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = check_errors(failure)
+					rendered = render_failure(failure)
+					annotation_start = "fixed record Pair { first: ".length()
+					typed = match errors.first.kind:
+						Errors.RecordRejection(Errors.RecordFieldTypeMismatch(field, actual, expected)):
+							(IntOps.equals(Model.field_number(field), 0)
+							and Model.same_type(actual.value_type, Model.FloatType)
+							and Model.same_type(expected.value_type, Model.IntType)
+							and IntOps.equals(expected.span.start, annotation_start)
+							and IntOps.equals(expected.span.end, IntOps.add(annotation_start, "Int".length()))
+							and same_source(expected.span.source, module_source(root_module_id()))
+							and same_span(actual.span, errors.first.span))
+						_: False
+					note = match rendered.first.note:
+						Some(RecordFieldDeclaration(annotation)):
+							(IntOps.equals(annotation.start, annotation_start) and IntOps.equals(annotation.end, IntOps.add(annotation_start, "Int".length()))
+							and same_source(annotation.source, module_source(root_module_id())))
+						_: False
+					(errors.remaining.is_empty() and rendered.remaining.is_empty() and typed and note
+					and IntOps.equals(errors.first.span.start, prefix.length())
+					and IntOps.equals(errors.first.span.end, IntOps.add(prefix.length(), value.length()))
+					and same_source(errors.first.span.source, module_source(root_module_id()))
+					and same_span(errors.first.span, rendered.first.span)
+					and equals(rendered.first.message, "record field requires Int")
+					and equals(rendered.first.help, "use an expression of type Int here"))
+
+
+pure func test_literal_base_uses_the_ordinary_result_context() -> Bool:
+	source = PAIR.concat(
+		|pure func change() -> Pair:
+		|    { { second = 2, first = 1 } | first = 7 }
+		|func main() -> Int:
+		|    0
+		|
+	)
+	match checked(source):
+		Err(_): False
+		Ok(program):
+			facts = checked_functions(program)
+			match facts.functions:
+				[change, _]:
+					match change.body:
+						Model.CheckedValueBody(Model.ReturnExpression(value)):
+							match value.base:
+								Model.ReturnRecordUpdate(update):
+									literal = match update.base.base:
+										Model.ReturnRecord(owner, [second, first]):
+											(IntOps.equals(Model.field_number(second.field), 1)
+											and IntOps.equals(Model.field_number(first.field), 0)
+											and Model.same_type(value.base_type, Model.RecordType(owner)))
+										_: False
+									literal and Model.same_type(value.base_type, update.base.base_type)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_outer_postfix_preserves_the_record_update_head() -> Bool:
+	source = PAIR.concat(
+		|pure func change(value: Pair) -> Int:
+		|    { value | second = 7 }.first
+		|func main() -> Int:
+		|    0
+		|
+	)
+	match checked(source):
+		Err(_): False
+		Ok(program):
+			facts = checked_functions(program)
+			match facts.functions:
+				[change, _]:
+					match change.body:
+						Model.CheckedValueBody(Model.ReturnExpression(value)):
+							match value.base:
+								Model.ReturnRecordUpdate(update):
+									match value.operations:
+										[step]:
+											(Model.same_type(value.base_type, update.base.base_type)
+											and Model.same_type(step.value_type, Model.IntType)
+											and not Model.same_type(value.base_type, step.value_type))
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_generic_update_keeps_the_declaration_owned_parameter() -> Bool:
+	source: String =
+		|fixed record Box[T] { value: T, count: Int }
+		|pure func replace[T](box: Box[T], value: T) -> Box[T]:
+		|    { box | value = value }
+		|func main() -> Int:
+		|    0
+		|
+	match checked(source):
+		Err(_): False
+		Ok(program):
+			facts = checked_functions(program)
+			match facts.functions:
+				[replace, _]:
+					match replace.body:
+						Model.CheckedValueBody(Model.ReturnExpression(value)):
+							match value.base:
+								Model.ReturnRecordUpdate(update):
+									match update.replacements:
+										[field]:
+											match replace.signature.parameters:
+												[base, argument]:
+													inherited = match update.inherited:
+														[count]: IntOps.equals(Model.field_number(count.field), 1) and Model.same_type(count.value_type, Model.IntType)
+														_: False
+													(inherited and Model.same_type(value.base_type, base.value_type)
+													and Model.same_type(update.base.base_type, base.value_type)
+													and Model.same_type(field.value.base_type, argument.value_type))
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_impure_replacement_keeps_the_ordinary_call_error() -> Bool:
+	prefix = PAIR.concat(
+		|func observed() -> Int:
+		|    7
+		|pure func change(value: Pair) -> Pair:
+		|    { value | first =
+	).concat(" ")
+	call = "observed()"
+	suffix: String =
+		| }
+		|func main() -> Int:
+		|    0
+		|
+	rejects(prefix.concat(call).concat(suffix), prefix.length(), IntOps.add(prefix.length(), "observed".length()), "pure functions cannot call impure functions", "mark the callee pure or remove pure from the caller", pure func(kind):
+		match kind:
+			Errors.CallRejection(Errors.ImpureCall(_, _)): True
+			_: False
+	)
+
+
+pure func test_tail_recursion_validation_visits_the_update_base() -> Bool:
+	prefix = PAIR.concat(
+		|@tail_recursive
+		|pure func change(value: Pair) -> Pair:
+		|    {
+	).concat(" ")
+	call = "change(value)"
+	suffix: String =
+		| | first = 7 }
+		|func main() -> Int:
+		|    0
+		|
+	rejects(prefix.concat(call).concat(suffix), prefix.length(), IntOps.add(prefix.length(), call.length()), "recursive call is not in tail position", "return this call directly, or remove @tail_recursive", pure func(kind):
+		match kind:
+			Errors.RecursionRejection(Errors.NonTailSelfCall(_)): True
+			_: False
+	)
+
+
+pure func test_tail_recursion_validation_visits_replacement_children() -> Bool:
+	prefix = PAIR.concat(
+		|@tail_recursive
+		|pure func change(value: Pair) -> Int:
+		|    { value | first =
+	).concat(" ")
+	call = "change(value)"
+	suffix: String =
+		| }.first
+		|func main() -> Int:
+		|    0
+		|
+	rejects(prefix.concat(call).concat(suffix), prefix.length(), IntOps.add(prefix.length(), call.length()), "recursive call is not in tail position", "return this call directly, or remove @tail_recursive", pure func(kind):
+		match kind:
+			Errors.RecursionRejection(Errors.NonTailSelfCall(_)): True
+			_: False
+	)
+
+
+pure func test_growing_generic_recursion_is_found_in_an_update_base() -> Bool:
+	prefix: String =
+		|fixed record Box[T] { value: T, count: Int }
+		|pure func make[T](value: T) -> Box[T]:
+		|    { value = value, count = 0 }
+		|pure func growing[T](value: T) -> Box[T]:
+		|    unused = {
+	base = "growing(make(value))"
+	suffix: String =
+		| | count = 7 }
+		|    make(value)
+		|func main() -> Int:
+		|    0
+		|
+	before = prefix.concat(" ")
+	rejects(before.concat(base).concat(suffix), before.length(), IntOps.add(before.length(), "growing".length()), "recursive calls grow type arguments without bound", "pass recursive type arguments unchanged, permute them, or reset them to concrete types", pure func(kind):
+		match kind:
+			Errors.RecursionRejection(Errors.GrowingRecursiveInstantiation): True
+			_: False
+	)
+
+
+pure func test_same_layout_cannot_change_the_nominal_update_owner() -> Bool:
+	prefix = PAIR.concat(
+		|fixed record Other { first: Int, second: Int }
+		|pure func change(value: Other) -> Pair:
+		|
+	).concat("    ")
+	update = "{ value | first = 7 }"
+	suffix: String =
+		|
+		|func main() -> Int:
+		|    0
+		|
+	rejects(prefix.concat(update).concat(suffix), prefix.length(), IntOps.add(prefix.length(), update.length()), "expression does not match the expected type", "use an expression of type Pair here", pure func(kind):
+		match kind:
+			Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
+				actual_record = match mismatch.actual.value_type:
+					Model.RecordType(_): True
+					_: False
+				expected_record = match mismatch.expected:
+					Model.RecordType(_): True
+					_: False
+				actual_record and expected_record and not Model.same_type(mismatch.actual.value_type, mismatch.expected)
+			_: False
+	)
+
+
+pure func test_unknown_later_field_precedes_earlier_wrong_rhs_type() -> Bool:
+	prefix = PAIR.concat(
+		|pure func change(value: Pair) -> Pair:
+		|    { value | first = 2.5,
+	).concat(" ")
+	suffix: String =
+		|missing = 1 }
+		|func main() -> Int:
+		|    0
+		|
+	rejects(prefix.concat(suffix), prefix.length(), IntOps.add(prefix.length(), "missing".length()), "unknown field 'missing' in Pair", "use a field declared by the receiving record", pure func(kind):
+		match kind:
+			Errors.RecordRejection(Errors.UnknownRecordField(_, _)): True
+			_: False
+	)
+
+
+pure func test_later_duplicate_precedes_earlier_unknown_rhs_value() -> Bool:
+	prefix = PAIR.concat(
+		|pure func change(value: Pair) -> Pair:
+		|    { value |
+	).concat(" ")
+	first = "first"
+	middle = " = missing, "
+	suffix: String =
+		|first = 1 }
+		|func main() -> Int:
+		|    0
+		|
+	source = prefix.concat(first).concat(middle).concat(suffix)
+	rejects_duplicate(source, prefix.length(), IntOps.add(IntOps.add(prefix.length(), first.length()), middle.length()), first.length())
+
+
+pure func test_growing_generic_recursion_is_found_in_a_replacement() -> Bool:
+	prefix: String =
+		|fixed record Box[T] { value: T, count: Int }
+		|pure func make[T](value: T) -> Box[T]:
+		|    { value = value, count = 0 }
+		|pure func growing[T](value: T) -> Int:
+		|    unused = { make(value) | count =
+	before = prefix.concat(" ")
+	call = "growing(make(value))"
+	suffix: String =
+		| }
+		|    0
+		|func main() -> Int:
+		|    0
+		|
+	rejects(before.concat(call).concat(suffix), before.length(), IntOps.add(before.length(), "growing".length()), "recursive calls grow type arguments without bound", "pass recursive type arguments unchanged, permute them, or reset them to concrete types", pure func(kind):
+		match kind:
+			Errors.RecursionRejection(Errors.GrowingRecursiveInstantiation): True
+			_: False
+	)
+
+
+tests: TestSuite = {
+	description = "Fresh record updates",
+	tests = [
+		("fresh update accepts an existing alias", test_fresh_update_accepts_an_existing_alias),
+		("replacement infers unsettled base arguments", test_replacement_infers_unsettled_base_arguments),
+		("unknown replacement precedes base freeze", test_unknown_replacement_precedes_unsettled_base_freeze),
+		("nonrecord postfix base has its complete span", test_nonrecord_postfix_base_reports_its_complete_span),
+		("duplicate replacement notes the first name", test_duplicate_replacement_retains_first_written_span),
+		("replacement mismatch retains value and annotation", test_replacement_mismatch_retains_complete_value_and_annotation),
+		("literal base uses the ordinary result context", test_literal_base_uses_the_ordinary_result_context),
+		("outer postfix preserves the update record head", test_outer_postfix_preserves_the_record_update_head),
+		("generic update preserves rigid parameter identity", test_generic_update_keeps_the_declaration_owned_parameter),
+		("impure replacement has the ordinary call error", test_impure_replacement_keeps_the_ordinary_call_error),
+		("tail recursion validation visits the update base", test_tail_recursion_validation_visits_the_update_base),
+		("tail recursion validation visits replacement children", test_tail_recursion_validation_visits_replacement_children),
+		("growing recursion is found in an update base", test_growing_generic_recursion_is_found_in_an_update_base),
+		("same layout preserves nominal update owner", test_same_layout_cannot_change_the_nominal_update_owner),
+		("later unknown field precedes earlier wrong RHS", test_unknown_later_field_precedes_earlier_wrong_rhs_type),
+		("later duplicate precedes earlier unknown RHS", test_later_duplicate_precedes_earlier_unknown_rhs_value),
+		("growing recursion is found in a replacement", test_growing_generic_recursion_is_found_in_a_replacement),
+	]
+}

@@ -1,6 +1,6 @@
 import:
 	./builtins as Builtins:
-		RuntimeResult(PrimitiveResult, OptionalResult, BooleanResult),
+		RuntimeResult(ValueResult, OptionalResult, BooleanResult),
 		runtime_contract,
 	float as FloatOps
 	int as IntOps
@@ -42,7 +42,7 @@ import:
 		TypeRef(VoidType, IntType, FloatType, StringType, ListType, UnionType, RecordType),
 		UnionRepresentation(InlineUnmanaged, InlineOwningPayload),
 		ValueOwnership(
-			NoOwnership, ManagedStringLeaf, ManagedStringListRoot, ManagedRecordRoot,
+			NoOwnership, ManagedStringLeaf, ManagedListRoot, ManagedRecordRoot,
 			InlineOwnedFields,
 		),
 		VariantInstanceId, variant_field_variant, variant_field_number,
@@ -51,6 +51,7 @@ import:
 		function_number,
 		record_number,
 		runtime_signature,
+		runtime_type_ref,
 		same_type,
 		union_number,
 		value_ownership,
@@ -84,6 +85,24 @@ private pure func failure(span: Span, message: String) -> Diagnostic:
 		message = "ownership verification failed: ".concat(message),
 		help = "report this compiler error with the input program"
 	}
+
+
+-- List storage ownership is a root fact. Raw IR must also name a member of
+-- each supplied concrete catalogue; do not expand nominal fields per query.
+private pure func verify_type_membership(
+	value_type: TypeRef,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+	span: Span,
+) -> Result[Void, Diagnostic]:
+	var terminal = value_type
+	while True:
+		match terminal:
+			ListType(element): terminal = element
+			VoidType | IntType | FloatType | StringType | RecordType(_) | UnionType(_): break
+	match value_ownership(terminal, unions, records):
+		Ok(_): Ok(void)
+		Err(error): Err({ error | span = span })
 
 
 private fixed record KnownValue {
@@ -325,22 +344,26 @@ private pure func call_signature(
 	call: ConcreteCall,
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
 ) -> Result[FunctionSignature, Diagnostic]:
 	match call.target:
 		RuntimeFunction(operation):
+			contract = runtime_signature(operation)
+			var invalid: Option[Diagnostic] = None
+			for parameter in contract.parameters:
+				match verify_type_membership(parameter, unions, records, call.span):
+					Ok(_): void
+					Err(error):
+						invalid = Some(error)
+						break
+			parameters ?= match invalid:
+				None: Ok(void)
+				Some(error): Err(error)
 			validation: Result[Void, Diagnostic] = match runtime_contract(operation).return_type:
-				PrimitiveResult(_):
+				ValueResult(_):
 					Ok(void)
 				OptionalResult(payload, roles):
-					expected_payload = match payload:
-						Builtins.BuiltinInt:
-							IntType
-						Builtins.BuiltinFloat:
-							FloatType
-						Builtins.BuiltinString:
-							StringType
-						Builtins.BuiltinVoid:
-							VoidType
+					expected_payload = runtime_type_ref(payload)
 
 					present ?= variant_type(
 						roles.present,
@@ -390,7 +413,8 @@ private pure func call_signature(
 						)
 
 			valid ?= validation
-			Ok(runtime_signature(operation))
+			result ?= verify_type_membership(contract.return_type, unions, records, call.span)
+			Ok(contract)
 		UserFunction(id):
 			function ?= functions
 				.get(function_number(id))
@@ -426,7 +450,7 @@ private pure func verify_argument(
 				match plan:
 					NoOwnership:
 						Ok(void)
-					ManagedStringLeaf | ManagedStringListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
+					ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
 						Err(
 							failure(
 								span,
@@ -567,9 +591,9 @@ private pure func valid_union_layout(
 					StringType:
 						owning = True
 						True
-					ListType(element):
+					ListType(_):
 						owning = True
-						same_type(element, StringType)
+						True
 
 				if not valid:
 					invalid = Some(
@@ -688,13 +712,8 @@ private pure func verify_layout_graph(
 								)
 								pending_count = IntOps.add(pending_count, 1)
 							ListType(element):
-								if not same_type(element, StringType):
-									invalid = Some(
-										failure(
-											span,
-											"unsupported List element in aggregate layout",
-										),
-									)
+								pending = push_layout_visit(pending, pending_count, VisitStoredType(element))
+								pending_count = IntOps.add(pending_count, 1)
 							_:
 								void
 					VisitRecordLayout(index):
@@ -1004,7 +1023,7 @@ private pure func operation_type(
 		VariantDefinition(id):
 			variant_type(id, [], unions, definition.span)
 		CallDefinition(call, arguments):
-			contract ?= call_signature(call, functions, unions)
+			contract ?= call_signature(call, functions, unions, records)
 			valid ?= verify_arguments(
 				arguments,
 				contract.parameters,
@@ -1150,7 +1169,7 @@ private pure func verify_definition_result(
 					Ok(None)
 				_:
 					Err(failure(definition.span, "unmanaged value carries an ownership obligation"))
-		ManagedStringLeaf | ManagedStringListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
+		ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
 			match definition.operation:
 				ParameterDefinition(_):
 					match definition.result:
@@ -1279,6 +1298,9 @@ private pure func verify_definition_type(
 	):
 		Err(failure(definition.span, "value identity is not the next function ordinal"))
 	else:
+		membership ?= match definition.value_type:
+			ListType(element): verify_type_membership(element, unions, records, definition.span)
+			VoidType | IntType | FloatType | StringType | RecordType(_) | UnionType(_): Ok(void)
 		expected ?= operation_type(
 			definition,
 			state,
@@ -1581,7 +1603,7 @@ private pure func verify_return(
 						Ok(void)
 					Some(_):
 						Err(failure(result.span, "unmanaged return cannot transfer an owner"))
-			ManagedStringLeaf | ManagedStringListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
+			ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
 				match returned_owner:
 					None:
 						Err(failure(result.span, "managed return requires an owner transfer"))
@@ -1679,7 +1701,7 @@ private pure func verify_exit(
 						match plan:
 							NoOwnership:
 								Ok(void)
-							ManagedStringLeaf | ManagedStringListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
+							ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
 								Err(failure(span, "managed value on a recursive backedge"))
 				)
 
@@ -1721,7 +1743,7 @@ private pure func verify_loop_operations(
 				match value_ownership(definition.value_type, unions, records):
 					Err(error):
 						invalid = Some(error)
-					Ok(ManagedStringLeaf) | Ok(ManagedStringListRoot) | Ok(ManagedRecordRoot(_)) | Ok(InlineOwnedFields(_)):
+					Ok(ManagedStringLeaf) | Ok(ManagedListRoot) | Ok(ManagedRecordRoot(_)) | Ok(InlineOwnedFields(_)):
 						invalid = Some(
 							failure(
 								definition.span,
@@ -1781,7 +1803,7 @@ private pure func verify_execution(
 					Err(error):
 						invalid = Some(error)
 						break
-					Ok(ManagedStringLeaf) | Ok(ManagedStringListRoot) | Ok(ManagedRecordRoot(_)) | Ok(InlineOwnedFields(_)):
+					Ok(ManagedStringLeaf) | Ok(ManagedListRoot) | Ok(ManagedRecordRoot(_)) | Ok(InlineOwnedFields(_)):
 						invalid = Some(failure(annotation, "managed signature in a self-tail loop"))
 						break
 					Ok(NoOwnership):
@@ -2155,7 +2177,7 @@ pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnosti
 
 	for function in program.functions:
 		for value_type in function.signature.parameters.append(function.signature.return_type):
-			match value_ownership(value_type, program.unions, program.records):
+			match verify_type_membership(value_type, program.unions, program.records, { source = COMPILER_SOURCE, start = 0, end = 0 }):
 				Ok(_):
 					void
 				Err(error):

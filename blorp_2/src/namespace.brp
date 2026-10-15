@@ -4,6 +4,7 @@ import:
 		function_number, record_number,
 		union_number, variant_number, variant_owner,
 		inventory_functions, inventory_records, inventory_unions,
+		NominalRow(UnionDeclarationRow, RecordDeclarationRow), next_nominal,
 	int as IntOps
 	names: NameId, same_name
 	assemble: ModuleImport, ParsedContents, ParsedModuleRow, ParsedProgram, parsed_contents
@@ -34,10 +35,11 @@ fixed record ImportedFunctionBinding {
 
 
 -- A constructor name visible in a module, whether declared there or imported.
-fixed record VariantBinding {
+private fixed record VariantBinding {
 	module: ModuleId,
 	name: WrittenName,
-	variant: VariantId
+	variant: VariantId,
+	declaration_span: Span
 }
 
 
@@ -73,9 +75,27 @@ fixed union ImportProblem:
 	ImportedTypeConflict(WrittenName, Span)
 
 
+fixed union NamespaceProblem:
+	ImportSelectionFailure(ImportProblem)
+	DuplicateFunctionName(WrittenName, Span)
+	DuplicateUnionName(WrittenName, Span)
+	DuplicateTypeName(WrittenName, Span)
+	DuplicateVariantName(WrittenName, Span)
+	VariantFunctionNameConflict(NameId, Span, Span)
+	ImportedConstructorNameConflict(WrittenName, Span)
+	ImportedFunctionNameConflict(WrittenName, Span)
+	ImportedVariantNameConflict(WrittenName, Span)
+
+
+fixed record NamespaceFailure {
+	first: NamespaceProblem,
+	remaining: List[NamespaceProblem]
+}
+
+
 private fixed record LocalFunctionBinding {
 	module: ModuleId,
-	name: NameId,
+	name: WrittenName,
 	function: FunctionId
 }
 
@@ -109,8 +129,7 @@ private fixed record NamespaceContents {
 	constructors: List[VariantBinding],
 	types: List[TypeBinding],
 	variants: List[VariantBinding],
-	methods: List[MethodSelectionRequest],
-	problems: List[ImportProblem]
+	methods: List[MethodSelectionRequest]
 }
 
 
@@ -154,13 +173,22 @@ pure func same_type_candidate(left: TypeCandidate, right: TypeCandidate) -> Bool
 private pure func local_functions(bindings: List[LocalFunctionBinding], module: ModuleId, name: NameId) -> List[FunctionId]:
 	var candidates: List[FunctionId] = []
 	for binding in bindings:
-		if same_module(binding.module, module) and same_name(binding.name, name):
+		if same_module(binding.module, module) and same_name(binding.name.id, name):
 			candidates = candidates.append(binding.function)
 	candidates
 
 
-pure func local_function_candidates(namespace: Namespace, module: ModuleId, name: NameId) -> List[FunctionId]:
-	local_functions(from_opaque Namespace(namespace).functions, module, name)
+private pure func first_local_function(bindings: List[LocalFunctionBinding], module: ModuleId, name: NameId) -> Option[LocalFunctionBinding]:
+	var found: Option[LocalFunctionBinding] = None
+	for binding in bindings:
+		if same_module(binding.module, module) and same_name(binding.name.id, name):
+			found = Some(binding)
+			break
+	found
+
+
+pure func local_function(namespace: Namespace, module: ModuleId, name: NameId) -> Option[FunctionId]:
+	first_local_function(from_opaque Namespace(namespace).functions, module, name).map(pure func(binding): binding.function)
 
 
 private pure func same_function(left: FunctionId, right: FunctionId) -> Bool:
@@ -175,19 +203,17 @@ private pure func same_variant(left: VariantId, right: VariantId) -> Bool:
 	same_union(variant_owner(left), variant_owner(right)) and IntOps.equals(variant_number(left), variant_number(right))
 
 
-pure func function_candidates(namespace: Namespace, module: ModuleId, name: NameId) -> List[FunctionCandidate]:
+pure func function_candidate(namespace: Namespace, module: ModuleId, name: NameId) -> Option[FunctionCandidate]:
 	contents = from_opaque Namespace(namespace)
-	var candidates: List[FunctionCandidate] = []
-	for function in local_functions(contents.functions, module, name):
-		candidates = candidates.append({ function = function, origin = LocalFunction })
-	for binding in contents.imports:
-		if same_module(binding.module, module) and same_name(binding.name.id, name):
-			var present = False
-			for candidate in candidates:
-				present = present or same_function(candidate.function, binding.function)
-			if not present:
-				candidates = candidates.append({ function = binding.function, origin = ImportedFunction(binding.name.span) })
-	candidates
+	var found: Option[FunctionCandidate] = None
+	match first_local_function(contents.functions, module, name):
+		Some(binding): found = Some({ function = binding.function, origin = LocalFunction })
+		None:
+			for binding in contents.imports:
+				if same_module(binding.module, module) and same_name(binding.name.id, name):
+					found = Some({ function = binding.function, origin = ImportedFunction(binding.name.span) })
+					break
+	found
 
 
 private pure func visible_types(bindings: List[TypeBinding], module: ModuleId, name: NameId) -> List[TypeCandidate]:
@@ -202,8 +228,13 @@ private pure func visible_types(bindings: List[TypeBinding], module: ModuleId, n
 	candidates
 
 
-pure func type_candidates(namespace: Namespace, module: ModuleId, name: NameId) -> List[TypeCandidate]:
-	visible_types(from_opaque Namespace(namespace).types, module, name)
+pure func type_candidate(namespace: Namespace, module: ModuleId, name: NameId) -> Option[TypeCandidate]:
+	var found: Option[TypeCandidate] = None
+	for binding in from_opaque Namespace(namespace).types:
+		if same_module(binding.module, module) and same_name(binding.name.id, name):
+			found = Some(binding.target)
+			break
+	found
 
 
 pure func variant_candidates(namespace: Namespace, module: ModuleId, name: NameId) -> List[VariantId]:
@@ -222,20 +253,12 @@ pure func variant_candidates(namespace: Namespace, module: ModuleId, name: NameI
 	candidates
 
 
-pure func imported_variants(namespace: Namespace) -> List[VariantBinding]:
-	from_opaque Namespace(namespace).constructors
-
-
 pure func imported_functions(namespace: Namespace) -> List[ImportedFunctionBinding]:
 	from_opaque Namespace(namespace).imports
 
 
 pure func method_selection_requests(namespace: Namespace) -> List[MethodSelectionRequest]:
 	from_opaque Namespace(namespace).methods
-
-
-pure func import_problems(namespace: Namespace) -> List[ImportProblem]:
-	from_opaque Namespace(namespace).problems
 
 
 pure func import_problem_span(problem: ImportProblem) -> Span:
@@ -252,6 +275,23 @@ pure func import_problem_span(problem: ImportProblem) -> Span:
 		MissingImportedVariant(name): name.span
 		RepeatedImportedVariant(name, _): name.span
 		ImportedTypeConflict(name, _): name.span
+
+
+pure func namespace_problem_span(problem: NamespaceProblem) -> Span:
+	match problem:
+		ImportSelectionFailure(rejection): import_problem_span(rejection)
+		DuplicateFunctionName(name, _): name.span
+		DuplicateUnionName(name, _): name.span
+		DuplicateTypeName(name, _): name.span
+		DuplicateVariantName(name, _): name.span
+		ImportedConstructorNameConflict(name, _): name.span
+		ImportedFunctionNameConflict(name, _): name.span
+		ImportedVariantNameConflict(name, _): name.span
+		VariantFunctionNameConflict(_, variant, function):
+			if IntOps.less_than(variant.start, function.start):
+				function
+			else:
+				variant
 
 
 -- Row scans over the namespace's binding tables. A row is the same fact when
@@ -553,7 +593,7 @@ private pure func import_module(scan: ImportScan, row: ParsedModuleRow) -> Impor
 
 -- Only the designated prelude supplies an implicit scope. Ordinary module
 -- type forwarding deliberately never forwards imported functions or methods.
-private pure func seal_namespace(scan: ImportScan, parsed: ParsedContents) -> Namespace:
+private pure func complete_scope(scan: ImportScan, parsed: ParsedContents) -> NamespaceContents:
 	var imports = scan.imports
 	var constructors = scan.constructors
 	var methods = scan.methods
@@ -571,27 +611,31 @@ private pure func seal_namespace(scan: ImportScan, parsed: ParsedContents) -> Na
 		for request in scan.methods:
 			if same_module(request.module, parsed.foundation.prelude):
 				methods = methods.append({ request | module = user })
-	into_opaque Namespace({
+	{
 			functions = scan.functions,
 			imports = imports,
 			constructors = constructors,
 			types = scan.types,
 			variants = scan.variants,
-			methods = methods,
-			problems = scan.problems
-		})
+			methods = methods
+		}
 
 
-pure func build_namespace(program: ParsedProgram) -> Namespace:
+-- The private scope includes implicit exposures before validation. No opaque
+-- Namespace exists until all declaration and visibility facts are accepted.
+pure func build_namespace(program: ParsedProgram) -> Result[Namespace, NamespaceFailure]:
 	parsed = parsed_contents(program)
 	var functions: List[LocalFunctionBinding] = []
 	for row in inventory_functions(parsed.declarations):
 		function = row.declaration
-		functions = functions.append({ module = function.module, name = function.function_name.id, function = row.id })
+		functions = functions.append({ module = function.module, name = function.function_name, function = row.id })
 	var variants: List[VariantBinding] = []
 	for declaration in inventory_unions(parsed.declarations):
 		for variant in declaration.variants:
-			variants = variants.append({ module = declaration.module, name = variant.declaration.name, variant = variant.id })
+			variants = variants.append({
+				module = declaration.module, name = variant.declaration.name,
+				variant = variant.id, declaration_span = variant.declaration.name.span
+			})
 	local = local_types(parsed)
 	requests = type_import_requests(parsed.modules, functions)
 	types = complete_types(parsed, requests, local)
@@ -613,4 +657,129 @@ pure func build_namespace(program: ParsedProgram) -> Namespace:
 	}
 	for row in parsed.modules:
 		scan = import_module(scan, row)
-	seal_namespace(scan, parsed)
+	scope = complete_scope(scan, parsed)
+	problems: List[NamespaceProblem] = scan.problems.map(pure func(problem): ImportSelectionFailure(problem))
+		.concat(import_scope_problems(scope))
+		.concat(local_declaration_problems(parsed, scope))
+	match problems:
+		[]: Ok(into_opaque Namespace(scope))
+		[first, ...remaining]: Err({ first = first, remaining = remaining })
+
+
+private pure func visible_function_span(scope: NamespaceContents, module: ModuleId, name: NameId) -> Option[Span]:
+	var found = first_local_function(scope.functions, module, name).map(pure func(binding): binding.name.span)
+	if found.is_none():
+		for binding in scope.imports:
+			if same_module(binding.module, module) and same_name(binding.name.id, name):
+				found = Some(binding.name.span)
+				break
+	found
+
+
+-- The first visible identity wins; a later exposure of that same identity is
+-- not a clash. Import ordering and local precedence match direct lookup.
+private pure func function_import_conflict(scope: NamespaceContents, incoming: ImportedFunctionBinding) -> Option[Span]:
+	var conflict: Option[Span] = None
+	match first_local_function(scope.functions, incoming.module, incoming.name.id):
+		Some(local):
+			if not same_function(local.function, incoming.function):
+				conflict = Some(local.name.span)
+		None:
+			for binding in scope.imports:
+				if same_module(binding.module, incoming.module) and same_name(binding.name.id, incoming.name.id):
+					if not same_function(binding.function, incoming.function):
+						conflict = Some(binding.name.span)
+					break
+	conflict
+
+
+private pure func visible_variant_span(scope: NamespaceContents, module: ModuleId, name: NameId) -> Option[Span]:
+	var found: Option[Span] = None
+	for binding in scope.variants:
+		if same_module(binding.module, module) and same_name(binding.name.id, name):
+			found = Some(binding.declaration_span)
+			break
+	if found.is_none():
+		for binding in scope.constructors:
+			if same_module(binding.module, module) and same_name(binding.name.id, name):
+				found = Some(binding.declaration_span)
+				break
+	found
+
+
+private pure func import_scope_problems(scope: NamespaceContents) -> List[NamespaceProblem]:
+	var problems: List[NamespaceProblem] = []
+	for binding in scope.constructors:
+		match visible_function_span(scope, binding.module, binding.name.id):
+			Some(previous): problems = problems.append(ImportedConstructorNameConflict(binding.name, previous))
+			None: void
+	for binding in scope.imports:
+		match function_import_conflict(scope, binding):
+			Some(previous): problems = problems.append(ImportedFunctionNameConflict(binding.name, previous))
+			None: void
+		match visible_variant_span(scope, binding.module, binding.name.id):
+			Some(previous): problems = problems.append(ImportedVariantNameConflict(binding.name, previous))
+			None: void
+	problems
+
+
+private pure func previous_type(types: List[TypeBinding], incoming: TypeBinding) -> Option[TypeBinding]:
+	var previous: Option[TypeBinding] = None
+	for binding in types:
+		if same_type_name(binding, incoming):
+			previous = Some(binding)
+			break
+	previous
+
+
+-- Nominal order is the declaration authority's projection, not a new index.
+-- Constructors are unique within one union; different owners may share names.
+private pure func local_declaration_problems(parsed: ParsedContents, scope: NamespaceContents) -> List[NamespaceProblem]:
+	var problems: List[NamespaceProblem] = []
+	var types: List[TypeBinding] = []
+	var records_seen = 0
+	var unions_seen = 0
+	while True:
+		match next_nominal(parsed.declarations, records_seen, unions_seen):
+			None: break
+			Some(declaration):
+				incoming: TypeBinding = match declaration:
+					UnionDeclarationRow(row): { module = row.module, name = row.type_name, target = UnionCandidate(row.id) }
+					RecordDeclarationRow(row): { module = row.declaration.module, name = row.declaration.type_name, target = RecordCandidate(row.id) }
+				match previous_type(types, incoming):
+					Some(previous):
+						problem = match incoming.target:
+							UnionCandidate(_):
+								match previous.target:
+									UnionCandidate(_): DuplicateUnionName(incoming.name, previous.name.span)
+									RecordCandidate(_) | PrimitiveCandidate(_) | ListCandidate: DuplicateTypeName(incoming.name, previous.name.span)
+							RecordCandidate(_) | PrimitiveCandidate(_) | ListCandidate: DuplicateTypeName(incoming.name, previous.name.span)
+						problems = problems.append(problem)
+					None: void
+				types = types.append(incoming)
+				match declaration:
+					RecordDeclarationRow(_): records_seen = IntOps.add(records_seen, 1)
+					UnionDeclarationRow(row):
+						unions_seen = IntOps.add(unions_seen, 1)
+						var variants: List[WrittenName] = []
+						for issued in row.variants:
+							variant = issued.declaration.name
+							var previous: Option[Span] = None
+							for written in variants:
+								if same_name(written.id, variant.id):
+									previous = Some(written.span)
+									break
+							match previous:
+								Some(first): problems = problems.append(DuplicateVariantName(variant, first))
+								None: void
+							match first_local_function(scope.functions, row.module, variant.id):
+								Some(function): problems = problems.append(VariantFunctionNameConflict(variant.id, variant.span, function.name.span))
+								None: void
+							variants = variants.append(variant)
+	var functions: List[LocalFunctionBinding] = []
+	for binding in scope.functions:
+		match first_local_function(functions, binding.module, binding.name.id):
+			Some(previous): problems = problems.append(DuplicateFunctionName(binding.name, previous.name.span))
+			None: void
+		functions = functions.append(binding)
+	problems

@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Each named case runs in a fresh process and allocates at most four objects.
+/* Each named case runs in a fresh process and allocates at most eight objects.
  * This fixed capacity is test-local, not a runtime facility. */
 enum { RECORD_TEST_ALLOCATION_CAPACITY = 16 };
 
@@ -55,13 +55,12 @@ static void runtime_test_deallocate(void *value) {
     free(value);
 }
 
-/* All three includes must be written by the Blorp TestSuite from the same pure
+/* Both includes must be written by the Blorp TestSuite from the same pure
  * production emission functions used by normal compilation. No generated
  * language function or language main is included or called here. */
 #define malloc runtime_test_allocate
 #define free runtime_test_deallocate
 #include "string_runtime.c"
-#include "list_runtime.c"
 #include "record_runtime.c"
 #undef free
 #undef malloc

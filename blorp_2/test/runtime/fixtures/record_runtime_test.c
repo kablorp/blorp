@@ -223,15 +223,15 @@ static void test_union_escape(void) {
     assert_frees(child_id, 1);
 }
 
-static struct blorp_string_list *make_list(void) {
+static struct blorp_l_0_s *make_list(void) {
     char first[] = "first";
     char second[] = "second";
     char *arguments[] = { first, second };
-    return blorp_string_list_from_argv(2, arguments);
+    return blorp_list_from_argv(2, arguments);
 }
 
 static void test_list_transfer(void) {
-    struct blorp_string_list *child = make_list();
+    struct blorp_l_0_s *child = make_list();
     const size_t list_id = runtime_test_allocation_id(child);
     const size_t first_id = runtime_test_allocation_id(child->values[0]);
     const size_t second_id = runtime_test_allocation_id(child->values[1]);
@@ -244,7 +244,7 @@ static void test_list_transfer(void) {
     assert(atomic_load(&child->references) == 1);
     assert(atomic_load(&child->values[0]->references) == 1);
     assert(atomic_load(&child->values[1]->references) == 1);
-    assert(blorp_string_list_length(root->blorp_rf_4_0) == 2);
+    assert(blorp_list_length_0_s(root->blorp_rf_4_0) == 2);
     assert_text(child->values[0], "first", 5);
     assert_text(child->values[1], "second", 6);
     blorp_record_drop_4(root);
@@ -255,7 +255,7 @@ static void test_list_transfer(void) {
 }
 
 static void test_list_retain(void) {
-    struct blorp_string_list *child = make_list();
+    struct blorp_l_0_s *child = make_list();
     const size_t list_id = runtime_test_allocation_id(child);
     const size_t first_id = runtime_test_allocation_id(child->values[0]);
     const size_t second_id = runtime_test_allocation_id(child->values[1]);
@@ -285,7 +285,7 @@ static void test_list_retain(void) {
 }
 
 static void test_list_escape(void) {
-    struct blorp_string_list *child = make_list();
+    struct blorp_l_0_s *child = make_list();
     const size_t list_id = runtime_test_allocation_id(child);
     const size_t first_id = runtime_test_allocation_id(child->values[0]);
     const size_t second_id = runtime_test_allocation_id(child->values[1]);
@@ -293,8 +293,8 @@ static void test_list_escape(void) {
         .blorp_rf_4_0 = child
     });
     const size_t root_id = runtime_test_allocation_id(root);
-    struct blorp_string_list *escaped = root->blorp_rf_4_0;
-    blorp_string_list_retain(escaped);
+    struct blorp_l_0_s *escaped = root->blorp_rf_4_0;
+    blorp_list_dup_0_s(escaped);
     assert(atomic_load(&escaped->references) == 2);
     assert(atomic_load(&escaped->values[0]->references) == 1);
     assert(atomic_load(&escaped->values[1]->references) == 1);
@@ -304,11 +304,14 @@ static void test_list_escape(void) {
     assert_frees(first_id, 0);
     assert_frees(second_id, 0);
     assert(atomic_load(&escaped->references) == 1);
-    struct blorp_string *element = blorp_string_list_get(escaped, 1);
+    struct blorp_string *element = NULL;
+    assert(blorp_list_get_0_s(escaped, 1, &element) == 1);
     assert(element == escaped->values[1]);
     assert(atomic_load(&element->references) == 2);
-    assert(blorp_string_list_get(escaped, 2) == NULL);
-    blorp_string_list_release(escaped);
+    struct blorp_string *missing = NULL;
+    assert(blorp_list_get_0_s(escaped, 2, &missing) == 0);
+    assert(missing == NULL);
+    blorp_list_drop_0_s(escaped);
     assert_frees(list_id, 1);
     assert_frees(first_id, 1);
     assert_frees(second_id, 0);
@@ -319,15 +322,17 @@ static void test_list_escape(void) {
 }
 
 static void test_list_empty(void) {
-    struct blorp_string_list *child = blorp_string_list_from_argv(0, NULL);
+    struct blorp_l_0_s *child = blorp_list_from_argv(0, NULL);
     const size_t list_id = runtime_test_allocation_id(child);
     blorp_r_4 root = blorp_record_make_4((struct blorp_r_4){
         .blorp_rf_4_0 = child
     });
     const size_t root_id = runtime_test_allocation_id(root);
     assert(allocation_count == 2);
-    assert(blorp_string_list_length(root->blorp_rf_4_0) == 0);
-    assert(blorp_string_list_get(root->blorp_rf_4_0, 0) == NULL);
+    assert(blorp_list_length_0_s(root->blorp_rf_4_0) == 0);
+    struct blorp_string *missing = NULL;
+    assert(blorp_list_get_0_s(root->blorp_rf_4_0, 0, &missing) == 0);
+    assert(missing == NULL);
     blorp_record_drop_4(root);
     assert_frees(root_id, 1);
     assert_frees(list_id, 1);

@@ -1,0 +1,564 @@
+import:
+	../../src/builtins as Builtins
+	../../src/lower as Lower
+	../../src/own as Own
+	../../src/source: COMPILER_SOURCE
+	../../src/specialize as Concrete
+	../../src/syntax: Diagnostic, Span, Entrypoint(NoArguments), EntryResult(IntegerExitStatus), FunctionExecution(OrdinaryCalls), entry_function, same_span
+	../../src/text: concat
+	../../src/verify: verify
+	input: check, setup_diagnostic
+	int as IntOps
+	io: print_error
+	module_input: PRIMITIVE_BASE, parse_modules_with_base
+	option: to_result
+	ownership_inputs: span
+	test: TestSuite
+
+
+private fixed record MembershipIds {
+	first: Lower.ValueId,
+	second: Lower.ValueId,
+	third: Lower.ValueId,
+	fourth: Lower.ValueId,
+	fifth: Lower.ValueId,
+	entrypoint: Concrete.FunctionInstanceId,
+	record_id: Concrete.RecordInstanceId,
+	union_id: Concrete.UnionInstanceId,
+	first_variant: Concrete.VariantInstanceId,
+	second_variant: Concrete.VariantInstanceId,
+	records: List[Concrete.ConcreteRecord],
+	unions: List[Concrete.ConcreteUnion]
+}
+
+
+private pure func seed_error(message: String) -> Diagnostic:
+	{
+		span = span(0), note = None,
+		message = "invalid List membership identity seed: ".concat(message),
+		help = "fix the List membership test setup"
+	}
+
+
+-- One real producer issues all identities in this fixture. Tests construct raw
+-- ownership operations independently; no insertion output serves as an oracle.
+private pure func membership_ids() -> Result[MembershipIds, Diagnostic]:
+	source: String =
+		|fixed record Item { value: Int }
+		|fixed union Flag:
+		|    Off
+		|    On
+		|pure func consume(value: Flag) -> Int:
+		|    match value:
+		|        Off: 0
+		|        On: 0
+		|pure func make() -> Item:
+		|    { value = 0 }
+		|func main() -> Int:
+		|    unused = consume(Off)
+		|    saved = make()
+		|    third = 2
+		|    fourth = 3
+		|    4
+		|
+	parsed ?= parse_modules_with_base([{ source = source, targets = [] }], PRIMITIVE_BASE)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	lowered ?= Concrete.specialize(checked).and_then(Lower.lower)
+	program = Lower.lowered_functions(lowered)
+	entrypoint = entry_function(program.entrypoint)
+	main ?= program.functions.get(Concrete.function_number(entrypoint)).to_result(seed_error("entrypoint row is missing"))
+	first ?= main.definitions.get(0).to_result(seed_error("first value is missing"))
+	second ?= main.definitions.get(1).to_result(seed_error("consume call is missing"))
+	third ?= main.definitions.get(2).to_result(seed_error("record call is missing"))
+	fourth ?= main.definitions.get(3).to_result(seed_error("fourth value is missing"))
+	fifth ?= main.definitions.get(4).to_result(seed_error("fifth value is missing"))
+	consume_id ?= match second.operation:
+		Lower.CallValue(call, _):
+			match call.target:
+				Concrete.UserFunction(id): Ok(id)
+				_: Err(seed_error("consume is not a user function call"))
+		_: Err(seed_error("second value is not a call"))
+	consume ?= program.functions.get(Concrete.function_number(consume_id)).to_result(seed_error("consume row is missing"))
+	matched ?= match consume.tail:
+		Lower.MatchValue(matched): Ok(matched)
+		_: Err(seed_error("consume has no match tail"))
+	match first.value_type:
+		Concrete.UnionType(union_id):
+			match third.value_type:
+				Concrete.RecordType(record_id):
+					match matched.arms:
+						[first_arm, second_arm]:
+							match first_arm.label:
+								Lower.VariantLabel(first_variant):
+									match second_arm.label:
+										Lower.VariantLabel(second_variant):
+											Ok({
+												first = first.id, second = second.id, third = third.id,
+												fourth = fourth.id, fifth = fifth.id,
+												entrypoint = entrypoint, record_id = record_id, union_id = union_id,
+												first_variant = first_variant, second_variant = second_variant,
+												records = program.records, unions = program.unions
+											})
+										_: Err(seed_error("consume arms do not carry variant identities"))
+								_: Err(seed_error("consume arms do not carry variant identities"))
+						_: Err(seed_error("union/record values or two match arms are missing"))
+				_: Err(seed_error("union/record values or two match arms are missing"))
+		_: Err(seed_error("union/record values or two match arms are missing"))
+
+
+private pure func integer(id: Lower.ValueId, at: Int) -> Own.OwnershipOperation:
+	Own.DefineValue({
+		id = id, value_type = Concrete.IntType,
+		operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult,
+		span = span(at)
+	})
+
+
+private pure func integer_function(id: Lower.ValueId) -> Own.OwnedFunction:
+	{
+		execution = OrdinaryCalls,
+		signature = { parameters = [], return_type = Concrete.IntType },
+		operations = [integer(id, 0)],
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(id)))
+	}
+
+
+private pure func list_parameter(ids: MembershipIds, element: Concrete.TypeRef) -> Own.OwnershipOperation:
+	Own.DefineValue({
+		id = ids.first, value_type = Concrete.ListType(element),
+		operation = Own.ParameterDefinition(0),
+		result = Own.BorrowedResult(Own.ParameterBorrow(ids.first)), span = span(10)
+	})
+
+
+private pure func parameter_function(ids: MembershipIds, element: Concrete.TypeRef) -> Own.OwnedFunction:
+	{
+		execution = OrdinaryCalls,
+		signature = { parameters = [Concrete.ListType(element)], return_type = Concrete.IntType },
+		operations = [list_parameter(ids, element), integer(ids.second, 40)],
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.second)))
+	}
+
+
+private pure func program(
+	ids: MembershipIds,
+	tested: Own.OwnedFunction,
+	records: List[Concrete.ConcreteRecord],
+	unions: List[Concrete.ConcreteUnion],
+) -> Own.OwnershipProgram:
+	{
+		records = records, unions = unions,
+		functions = [integer_function(ids.first), tested],
+		entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus)
+	}
+
+
+private pure func rejects(input: Own.OwnershipProgram, message: String, expected: Span) -> Bool:
+	match verify(input):
+		Err(error):
+			(
+				error.message == message
+				and error.help == "report this compiler error with the input program"
+				and same_span(error.span, expected) and error.note.is_none()
+			)
+		Ok(_): False
+
+
+private pure func compiler_span() -> Span:
+	{ source = COMPILER_SOURCE, start = 0, end = 0 }
+
+
+private pure func accepts_element(element: Concrete.TypeRef) -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids): verify(program(ids, parameter_function(ids, element), ids.records, ids.unions)).is_ok()
+
+
+func test_identity_seed_is_valid() -> Bool:
+	match membership_ids():
+		Ok(_): True
+		Err(error):
+			print_error(error.message)
+			print_error(error.help)
+			print_error("seed span: ".concat(IntOps.to_string(error.span.start)).concat("..").concat(IntOps.to_string(error.span.end)))
+			False
+
+
+pure func test_void_list_is_valid() -> Bool:
+	accepts_element(Concrete.VoidType)
+
+
+pure func test_int_list_is_valid() -> Bool:
+	accepts_element(Concrete.IntType)
+
+
+pure func test_float_list_is_valid() -> Bool:
+	accepts_element(Concrete.FloatType)
+
+
+pure func test_string_list_is_valid() -> Bool:
+	accepts_element(Concrete.StringType)
+
+
+pure func test_nested_list_is_valid() -> Bool:
+	accepts_element(Concrete.ListType(Concrete.ListType(Concrete.IntType)))
+
+
+pure func test_finite_record_list_is_valid() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids): verify(program(ids, parameter_function(ids, Concrete.RecordType(ids.record_id)), ids.records, ids.unions)).is_ok()
+
+
+pure func test_inline_union_list_is_valid() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids): verify(program(ids, parameter_function(ids, Concrete.UnionType(ids.union_id)), ids.records, ids.unions)).is_ok()
+
+
+pure func test_owning_union_list_is_valid() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			unions: List[Concrete.ConcreteUnion] = [{ variants = [[], [Concrete.StringType]], representation = Concrete.InlineOwningPayload }]
+			verify(program(ids, parameter_function(ids, Concrete.UnionType(ids.union_id)), ids.records, unions)).is_ok()
+
+
+pure func test_unused_list_signature_requires_record_membership() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			rejects(
+				program(ids, parameter_function(ids, Concrete.RecordType(ids.record_id)), [], ids.unions),
+				"internal compiler error: invalid record identity in ownership representation", compiler_span(),
+			)
+
+
+pure func test_unused_list_signature_requires_union_membership() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			rejects(
+				program(ids, parameter_function(ids, Concrete.UnionType(ids.union_id)), ids.records, []),
+				"internal compiler error: invalid union identity in ownership representation", compiler_span(),
+			)
+
+
+pure func test_nested_list_signature_requires_record_membership() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			rejects(
+				program(ids, parameter_function(ids, Concrete.ListType(Concrete.RecordType(ids.record_id))), [], ids.unions),
+				"internal compiler error: invalid record identity in ownership representation", compiler_span(),
+			)
+
+
+pure func test_deep_list_signature_requires_union_membership() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			element = Concrete.ListType(Concrete.ListType(Concrete.UnionType(ids.union_id)))
+			rejects(
+				program(ids, parameter_function(ids, element), ids.records, []),
+				"internal compiler error: invalid union identity in ownership representation", compiler_span(),
+			)
+
+
+pure func test_union_list_field_can_hold_a_finite_record() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			unions: List[Concrete.ConcreteUnion] = [{ variants = [[], [Concrete.ListType(Concrete.RecordType(ids.record_id))]], representation = Concrete.InlineOwningPayload }]
+			verify(program(ids, integer_function(ids.first), ids.records, unions)).is_ok()
+
+
+pure func test_record_list_field_requires_nested_union_membership() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			records: List[Concrete.ConcreteRecord] = [{ fields = [Concrete.ListType(Concrete.ListType(Concrete.UnionType(ids.union_id)))], representation = Concrete.ManagedRecord }]
+			rejects(
+				program(ids, integer_function(ids.first), records, []),
+				"ownership verification failed: unknown union layout", compiler_span(),
+			)
+
+
+pure func test_record_list_field_cannot_close_a_nominal_cycle() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			records: List[Concrete.ConcreteRecord] = [{ fields = [Concrete.ListType(Concrete.RecordType(ids.record_id))], representation = Concrete.ManagedRecord }]
+			rejects(
+				program(ids, integer_function(ids.first), records, ids.unions),
+				"ownership verification failed: recursive aggregate layout is unsupported", compiler_span(),
+			)
+
+
+private pure func malformed_local(value: Lower.ValueId, element: Concrete.TypeRef) -> Own.OwnershipOperation:
+	Own.DefineValue({
+		id = value, value_type = Concrete.ListType(element),
+		operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(17)
+	})
+
+
+pure func test_unused_definition_requires_nested_record_membership() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			body = integer_function(ids.second)
+			tested = { body | operations = [malformed_local(ids.first, Concrete.ListType(Concrete.RecordType(ids.record_id))), integer(ids.second, 40)] }
+			rejects(program(ids, tested, [], ids.unions), "internal compiler error: invalid record identity in ownership representation", span(17))
+
+
+pure func test_known_list_member_does_not_hide_operation_mismatch() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			body = integer_function(ids.second)
+			tested = { body | operations = [malformed_local(ids.first, Concrete.IntType), integer(ids.second, 40)] }
+			rejects(program(ids, tested, ids.records, ids.unions), "ownership verification failed: definition type does not match its operation", span(17))
+
+
+pure func test_value_ordinal_precedes_nested_membership() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			body = integer_function(ids.second)
+			tested = { body | operations = [malformed_local(ids.third, Concrete.RecordType(ids.record_id))] }
+			rejects(program(ids, tested, [], ids.unions), "ownership verification failed: value identity is not the next function ordinal", span(17))
+
+
+pure func test_match_arm_definition_requires_record_membership() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			tested: Own.OwnedFunction = {
+				execution = OrdinaryCalls,
+				signature = { parameters = [], return_type = Concrete.IntType },
+				operations = [Own.DefineValue({
+					id = ids.first, value_type = Concrete.UnionType(ids.union_id),
+					operation = Own.VariantDefinition(ids.first_variant), result = Own.UnmanagedResult, span = span(10)
+				})],
+				tail = Own.MatchTail({
+					scrutinee = Own.UnmanagedArgument(ids.first), owner = ids.union_id,
+					arms = [{
+						label = Lower.DefaultLabel,
+						operations = [malformed_local(ids.second, Concrete.RecordType(ids.record_id)), integer(ids.third, 40)],
+						exit = Own.ReturnResult(Own.UnmanagedReturn(ids.third))
+					}]
+				})
+			}
+			rejects(program(ids, tested, [], ids.unions), "internal compiler error: invalid record identity in ownership representation", span(17))
+
+
+private pure func length_function(ids: MembershipIds, element: Concrete.TypeRef) -> Own.OwnedFunction:
+	base = parameter_function(ids, Concrete.IntType)
+	{ base |
+		operations = [list_parameter(ids, Concrete.IntType), Own.DefineValue({
+			id = ids.second, value_type = Concrete.IntType,
+			operation = Own.CallDefinition({ target = Concrete.RuntimeFunction(Builtins.ListLength(element)), span = span(20) }, [Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) })]),
+			result = Own.UnmanagedResult, span = span(30)
+		}), integer(ids.third, 40)],
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.third)))
+	}
+
+
+pure func test_unused_length_result_still_validates_runtime_element() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids): rejects(program(ids, length_function(ids, Concrete.RecordType(ids.record_id)), [], ids.unions), "internal compiler error: invalid record identity in ownership representation", span(20))
+
+
+pure func test_length_contract_validates_nested_runtime_element() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids): rejects(program(ids, length_function(ids, Concrete.ListType(Concrete.RecordType(ids.record_id))), [], ids.unions), "internal compiler error: invalid record identity in ownership representation", span(20))
+
+
+pure func test_valid_length_contract_remains_valid() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids): verify(program(ids, length_function(ids, Concrete.IntType), ids.records, ids.unions)).is_ok()
+
+
+private pure func repeat_function(ids: MembershipIds, element: Concrete.TypeRef) -> Own.OwnedFunction:
+	{
+		execution = OrdinaryCalls,
+		signature = { parameters = [], return_type = Concrete.IntType },
+		operations = [integer(ids.first, 0), integer(ids.second, 1), Own.DefineValue({
+			id = ids.third, value_type = Concrete.ListType(Concrete.IntType),
+			operation = Own.CallDefinition({ target = Concrete.RuntimeFunction(Builtins.ListRepeat(element)), span = span(20) }, [Own.UnmanagedArgument(ids.first), Own.UnmanagedArgument(ids.second)]),
+			result = Own.OwnedResult(Own.owner_id(0)), span = span(30)
+		}), Own.DropOwner(Own.owner_id(0), span(31)), integer(ids.fourth, 40)],
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.fourth)))
+	}
+
+
+pure func test_repeat_contract_validates_element_before_argument_mismatch() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids): rejects(program(ids, repeat_function(ids, Concrete.RecordType(ids.record_id)), [], ids.unions), "internal compiler error: invalid record identity in ownership representation", span(20))
+
+
+pure func test_valid_repeat_contract_keeps_single_drop() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids): verify(program(ids, repeat_function(ids, Concrete.IntType), ids.records, ids.unions)).is_ok()
+
+
+pure func test_union_list_field_requires_record_membership() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			unions: List[Concrete.ConcreteUnion] = [{ variants = [[], [Concrete.ListType(Concrete.RecordType(ids.record_id))]], representation = Concrete.InlineOwningPayload }]
+			rejects(program(ids, integer_function(ids.first), [], unions), "ownership verification failed: unknown record layout", compiler_span())
+
+
+pure func test_union_list_field_cannot_close_a_nominal_cycle() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			unions: List[Concrete.ConcreteUnion] = [{ variants = [[], [Concrete.ListType(Concrete.UnionType(ids.union_id))]], representation = Concrete.InlineOwningPayload }]
+			rejects(program(ids, integer_function(ids.first), ids.records, unions), "ownership verification failed: recursive aggregate layout is unsupported", compiler_span())
+
+
+private pure func get_function(ids: MembershipIds, element: Concrete.TypeRef, roles: Builtins.OptionalRoles[Concrete.VariantInstanceId]) -> Own.OwnedFunction:
+	base = parameter_function(ids, Concrete.IntType)
+	{ base |
+		operations = [list_parameter(ids, Concrete.IntType), integer(ids.second, 15), Own.DefineValue({
+			id = ids.third, value_type = Concrete.UnionType(ids.union_id),
+			operation = Own.CallDefinition(
+				{ target = Concrete.RuntimeFunction(Builtins.ListGet(element, roles)), span = span(20) },
+				[Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) }), Own.UnmanagedArgument(ids.second)],
+			),
+			result = Own.UnmanagedResult, span = span(30)
+		}), integer(ids.fourth, 40)],
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.fourth)))
+	}
+
+
+private pure func integer_option_layout() -> List[Concrete.ConcreteUnion]:
+	[{ variants = [[Concrete.IntType], []], representation = Concrete.InlineUnmanaged }]
+
+
+pure func test_get_contract_validates_element_before_roles() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			roles: Builtins.OptionalRoles[Concrete.VariantInstanceId] = { present = ids.first_variant, absent = ids.second_variant }
+			rejects(
+				program(ids, get_function(ids, Concrete.RecordType(ids.record_id), roles), [], integer_option_layout()),
+				"internal compiler error: invalid record identity in ownership representation", span(20),
+			)
+
+
+pure func test_valid_get_contract_keeps_payload_roles() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			roles: Builtins.OptionalRoles[Concrete.VariantInstanceId] = { present = ids.first_variant, absent = ids.second_variant }
+			verify(program(ids, get_function(ids, Concrete.IntType, roles), ids.records, integer_option_layout())).is_ok()
+
+
+pure func test_known_get_element_preserves_unknown_role_owner_diagnostic() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			roles: Builtins.OptionalRoles[Concrete.VariantInstanceId] = { present = ids.first_variant, absent = ids.second_variant }
+			rejects(
+				program(ids, get_function(ids, Concrete.IntType, roles), ids.records, []),
+				"ownership verification failed: unknown variant owner", span(20),
+			)
+
+
+pure func test_known_get_element_still_rejects_wrong_role_field_count() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			roles: Builtins.OptionalRoles[Concrete.VariantInstanceId] = { present = ids.second_variant, absent = ids.first_variant }
+			rejects(
+				program(ids, get_function(ids, Concrete.IntType, roles), ids.records, integer_option_layout()),
+				"ownership verification failed: variant field count does not match its operation", span(20),
+			)
+
+
+pure func test_known_get_element_still_rejects_wrong_payload_type() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			roles: Builtins.OptionalRoles[Concrete.VariantInstanceId] = { present = ids.first_variant, absent = ids.second_variant }
+			unions: List[Concrete.ConcreteUnion] = [{ variants = [[Concrete.FloatType], []], representation = Concrete.InlineUnmanaged }]
+			rejects(
+				program(ids, get_function(ids, Concrete.IntType, roles), ids.records, unions),
+				"ownership verification failed: variant payload does not match its operation", span(20),
+			)
+
+
+pure func test_mixed_list_catalogues_cannot_close_a_cycle() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			records: List[Concrete.ConcreteRecord] = [{ fields = [Concrete.ListType(Concrete.UnionType(ids.union_id))], representation = Concrete.ManagedRecord }]
+			unions: List[Concrete.ConcreteUnion] = [{ variants = [[], [Concrete.ListType(Concrete.RecordType(ids.record_id))]], representation = Concrete.InlineOwningPayload }]
+			rejects(program(ids, integer_function(ids.first), records, unions), "ownership verification failed: recursive aggregate layout is unsupported", compiler_span())
+
+
+pure func test_signature_preflight_keeps_last_invalid_type_policy() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			base = integer_function(ids.first)
+			tested = { base | signature = { parameters = [Concrete.RecordType(ids.record_id), Concrete.UnionType(ids.union_id)], return_type = Concrete.IntType } }
+			rejects(program(ids, tested, [], []), "internal compiler error: invalid union identity in ownership representation", compiler_span())
+
+
+pure func test_unused_result_signature_requires_record_membership() -> Bool:
+	match membership_ids():
+		Err(_): False
+		Ok(ids):
+			base = integer_function(ids.first)
+			tested = { base | signature = { parameters = [], return_type = Concrete.ListType(Concrete.RecordType(ids.record_id)) } }
+			rejects(program(ids, tested, [], ids.unions), "internal compiler error: invalid record identity in ownership representation", compiler_span())
+
+
+tests: TestSuite = {
+	description = "Raw List element membership",
+	tests = [
+		("all membership identities are issued by the seed", test_identity_seed_is_valid),
+		("Void List membership is valid", test_void_list_is_valid),
+		("Int List membership is valid", test_int_list_is_valid),
+		("Float List membership is valid", test_float_list_is_valid),
+		("String List membership is valid", test_string_list_is_valid),
+		("nested List membership is valid", test_nested_list_is_valid),
+		("finite record List membership is valid", test_finite_record_list_is_valid),
+		("inline union List membership is valid", test_inline_union_list_is_valid),
+		("owning union List membership is valid", test_owning_union_list_is_valid),
+		("unused signature requires record membership", test_unused_list_signature_requires_record_membership),
+		("unused signature requires union membership", test_unused_list_signature_requires_union_membership),
+		("nested signature requires record membership", test_nested_list_signature_requires_record_membership),
+		("deep signature requires union membership", test_deep_list_signature_requires_union_membership),
+		("union List field holds finite record", test_union_list_field_can_hold_a_finite_record),
+		("record List field requires nested union membership", test_record_list_field_requires_nested_union_membership),
+		("record List field cannot close a nominal cycle", test_record_list_field_cannot_close_a_nominal_cycle),
+		("unused definition requires nested record membership", test_unused_definition_requires_nested_record_membership),
+		("known member keeps operation mismatch checking", test_known_list_member_does_not_hide_operation_mismatch),
+		("value ordinal precedes nested membership", test_value_ordinal_precedes_nested_membership),
+		("match arm definition requires record membership", test_match_arm_definition_requires_record_membership),
+		("unused length result validates runtime E", test_unused_length_result_still_validates_runtime_element),
+		("length validates nested runtime E", test_length_contract_validates_nested_runtime_element),
+		("valid length contract remains valid", test_valid_length_contract_remains_valid),
+		("repeat validates E before argument mismatch", test_repeat_contract_validates_element_before_argument_mismatch),
+		("valid repeat contract keeps single drop", test_valid_repeat_contract_keeps_single_drop),
+		("union List field requires record membership", test_union_list_field_requires_record_membership),
+		("union List field cannot close a nominal cycle", test_union_list_field_cannot_close_a_nominal_cycle),
+		("get validates E before constructor roles", test_get_contract_validates_element_before_roles),
+		("valid get keeps payload roles", test_valid_get_contract_keeps_payload_roles),
+		("known get E preserves unknown role owner diagnostic", test_known_get_element_preserves_unknown_role_owner_diagnostic),
+		("known get E rejects wrong role field count", test_known_get_element_still_rejects_wrong_role_field_count),
+		("known get E rejects wrong payload type", test_known_get_element_still_rejects_wrong_payload_type),
+		("mixed List catalogues cannot close cycle", test_mixed_list_catalogues_cannot_close_a_cycle),
+		("signature preflight keeps last invalid type", test_signature_preflight_keeps_last_invalid_type_policy),
+		("unused result signature requires record membership", test_unused_result_signature_requires_record_membership),
+	]
+}

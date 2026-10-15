@@ -350,7 +350,7 @@ pure func test_nonfirst_field_nested_cycle_retains_full_written_span() -> Bool:
 	)
 
 
-private pure func nonfirst_list(element: String, called: Bool) -> Bool:
+private pure func nonfirst_list(element: String, expected: Model.TypeRef, concrete: Concrete.TypeRef, called: Bool) -> Bool:
 	prefix: String =
 		|fixed union Values[T]:
 		|    Items(Int,${" "}
@@ -368,42 +368,58 @@ private pure func nonfirst_list(element: String, called: Bool) -> Bool:
 	else:
 		"    0\n"
 	source = prefix + annotation + functions + body
-	typed = match check_failure(source):
-		Some(error):
-			match error.kind:
-				Errors.TypeTermRejection(Errors.UnsupportedListElement): True
-				_: False
-		None: False
 	match checked(source):
-		Err(error):
-			(
-				element == "Int" and typed
-				and error.message == "List currently supports only String elements"
-				and error.help == "use List[String]; other concrete element types are not supported yet"
-				and error.span.start == 65 and error.span.end == 76
-				and same_source(error.span.source, module_source(root_module_id()))
-			)
-		Ok(_):
-			match specialized(source):
+		Err(_): False
+		Ok(accepted):
+			typed = match API.checked_functions(accepted).unions:
+				[values]:
+					match API.checked_functions(accepted).functions:
+						[produce, pass, _]:
+							match values.type_parameters:
+								[parameter]:
+									match values.variants:
+										[variant]:
+											match pass.signature.parameters:
+												[input]:
+													match variant.fields:
+														[first, second]:
+															(
+																Model.same_type(first.value_type, Model.IntType)
+																and Model.same_type(second.value_type, Model.ListType(Model.ParameterType(parameter)))
+																and Model.same_type(produce.signature.return_type.value_type, Model.AppliedUnionType(values.id, [expected]))
+																and Model.same_type(input.value_type, produce.signature.return_type.value_type)
+																and Model.same_type(pass.signature.return_type.value_type, input.value_type)
+															)
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+			match Concrete.specialize(accepted):
 				Err(_): False
-				Ok(program):
+				Ok(specialized):
+					program = Concrete.specialized_contents(specialized)
 					if called:
 						match program.unions:
 							[row]:
-								match (row.variants, row.representation):
-									([[Concrete.IntType, Concrete.ListType(Concrete.StringType)]], Concrete.InlineOwningPayload): True
+								match row.variants:
+									[[Concrete.IntType, Concrete.ListType(actual)]]:
+										match row.representation:
+											Concrete.InlineOwningPayload: typed and Concrete.same_type(actual, concrete)
+											_: False
 									_: False
 							_: False
 					else:
-						program.unions.is_empty()
+						typed and program.unions.is_empty()
 
 
-pure func test_nonfirst_list_int_no_literal_producer_rejects_at_written_type() -> Bool:
-	nonfirst_list("Int", True)
+pure func test_nonfirst_list_int_no_literal_producer_prepares_complete_layout() -> Bool:
+	nonfirst_list("Int", Model.IntType, Concrete.IntType, True)
 
 
-pure func test_unused_nonfirst_concrete_list_rejects_its_annotation() -> Bool:
-	nonfirst_list("Int", False)
+pure func test_unused_nonfirst_concrete_list_keeps_checked_type_without_layout() -> Bool:
+	nonfirst_list("Int", Model.IntType, Concrete.IntType, False)
 
 
 pure func test_unused_nonfirst_symbolic_list_does_not_prepare_a_concrete_layout() -> Bool:
@@ -421,7 +437,7 @@ pure func test_unused_nonfirst_symbolic_list_does_not_prepare_a_concrete_layout(
 
 
 pure func test_nonfirst_list_string_no_literal_producer_prepares_layout() -> Bool:
-	nonfirst_list("String", True)
+	nonfirst_list("String", Model.StringType, Concrete.StringType, True)
 
 
 pure func test_wildcard_keeps_the_second_same_typed_field_ordinal() -> Bool:
@@ -625,9 +641,10 @@ pure func test_nonfirst_list_and_record_dependencies_emit_before_parent() -> Boo
 				(Some(child), Some(parent)): child < parent
 				_: False
 			(
-				ordered and output.contains("blorp_r_0 blorp_uf_1;struct blorp_string_list* blorp_uf_2;")
+				ordered and output.contains("blorp_r_0 blorp_uf_1;struct blorp_l_0_s* blorp_uf_2;")
 				and output.contains("blorp_record_dup_0(value.payload.blorp_up_0.blorp_uf_1)")
-				and output.contains("blorp_string_list_retain(value.payload.blorp_up_0.blorp_uf_2)")
+				and output.contains("blorp_list_dup_0_s(value.payload.blorp_up_0.blorp_uf_2)")
+				and output.contains("blorp_list_drop_0_s(value.payload.blorp_up_0.blorp_uf_2)")
 			)
 		Err(_): False
 
@@ -717,8 +734,8 @@ tests: TestSuite = {
 		("partial nominal head infers constructor fields", test_partial_nominal_head_infers_all_constructor_fields),
 		("unused nonfirst self cycle rejects", test_nonfirst_field_self_cycle_rejects_even_unused),
 		("nonfirst nested cycle has whole written span", test_nonfirst_field_nested_cycle_retains_full_written_span),
-		("nonfirst List[Int] producer rejects written annotation", test_nonfirst_list_int_no_literal_producer_rejects_at_written_type),
-		("unused nonfirst List[Int] rejects concrete annotation", test_unused_nonfirst_concrete_list_rejects_its_annotation),
+		("nonfirst List[Int] producer prepares complete layout", test_nonfirst_list_int_no_literal_producer_prepares_complete_layout),
+		("unused nonfirst List[Int] keeps checked type without layout", test_unused_nonfirst_concrete_list_keeps_checked_type_without_layout),
 		("unused symbolic List does not prepare layout", test_unused_nonfirst_symbolic_list_does_not_prepare_a_concrete_layout),
 		("nonfirst List[String] producer prepares layout", test_nonfirst_list_string_no_literal_producer_prepares_layout),
 		("wildcard retains second same-typed ordinal", test_wildcard_keeps_the_second_same_typed_field_ordinal),

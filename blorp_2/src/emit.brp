@@ -4,14 +4,17 @@ import:
 		OptionalRoles,
 		RuntimeOperation(
 			IntAdd, IntSubtract, IntMultiply, IntDivide, IntRemainder, IntToString, StringLength,
-			StringPrint, StringParseInt, StringParseFloat, ListLength, ListGet, StringEquals,
+			StringPrint, StringParseInt, StringParseFloat, ListRepeat, ListLength, ListGet, StringEquals,
 			IntEquals, FloatAdd, FloatSubtract, FloatMultiply, FloatDivide, FloatRemainder,
 			FloatToString,
 		),
 	float_literal: c_float_literal
 	float_runtime: float_parse_runtime, float_runtime, float_string_runtime
 	int as IntOps
-	list_runtime: list_runtime
+	list: join
+	list_runtime:
+		ListElementKey, arguments_runtime, list_c_type, list_child_key, list_element_key,
+		list_key_depth, list_key_ordinal, list_key_rank, list_runtime, list_suffix, same_list_key
 	lower: MatchLabel(VariantLabel, DefaultLabel), ValueId, value_number
 	option: to_result
 	own as Own:
@@ -53,6 +56,7 @@ import:
 		union_number,
 		variant_number,
 		variant_owner,
+		value_ownership, ValueOwnership(NoOwnership),
 	string as StringOps
 	string_runtime:
 		string_equals_runtime,
@@ -141,10 +145,12 @@ private pure func c_callable(target: CallTarget) -> String:
 					"blorp_string_parse_int"
 				StringParseFloat(_):
 					"blorp_string_parse_float"
-				ListLength:
-					"blorp_string_list_length"
-				ListGet(_):
-					"blorp_string_list_get"
+				ListRepeat(element):
+					"blorp_list_repeat_".concat(list_suffix(list_element_key(element)))
+				ListLength(element):
+					"blorp_list_length_".concat(list_suffix(list_element_key(element)))
+				ListGet(element, _):
+					"blorp_list_get_".concat(list_suffix(list_element_key(element)))
 				StringEquals(_):
 					"blorp_string_equals"
 				IntEquals(_):
@@ -276,8 +282,8 @@ private pure func c_type(
 			Ok("double")
 		StringType:
 			Ok("struct blorp_string*")
-		ListType(_):
-			Ok("struct blorp_string_list*")
+		ListType(element):
+			Ok(list_c_type(list_element_key(element)))
 		UnionType(id):
 			declaration ?= unions
 				.get(union_number(id))
@@ -978,6 +984,7 @@ private pure func append_list_get(
 	output: String,
 	id: ValueId,
 	roles: OptionalRoles[VariantInstanceId],
+	element: TypeRef,
 	arguments: List[OwnedArgument],
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
@@ -988,19 +995,18 @@ private pure func append_list_get(
 		.get(1)
 		.to_result(internal_error())
 	scratch = "blorp_runtime_".append_int(value_number(id))
+	element_type ?= c_type(element, unions)
 	prefix = output
-		.concat("struct blorp_string *const ")
-		.concat(scratch)
-		.concat("=blorp_string_list_get(")
-		.concat(c_value(argument_value(values)))
-		.concat(",")
-		.concat(c_value(argument_value(index)))
-		.concat(");")
+		.concat(element_type).concat(" ").concat(scratch).concat("={0};const uint8_t ")
+		.concat(scratch).concat("_some=blorp_list_get_")
+		.concat(list_suffix(list_element_key(element))).concat("(")
+		.concat(c_value(argument_value(values))).concat(",")
+		.concat(c_value(argument_value(index))).concat(",&").concat(scratch).concat(");")
 	append_optional_value(
 		prefix,
 		id,
 		roles,
-		scratch.concat("!=NULL"),
+		scratch.concat("_some"),
 		scratch,
 		unions,
 	)
@@ -1037,8 +1043,8 @@ private pure func append_value(
 						"double",
 						"blorp_string_parse_float",
 					)
-				RuntimeFunction(ListGet(roles)):
-					append_list_get(output, id, roles, arguments, unions)
+				RuntimeFunction(ListGet(element, roles)):
+					append_list_get(output, id, roles, element, arguments, unions)
 				RuntimeFunction(StringEquals(roles)):
 					append_equals(output, id, roles, arguments, unions, StringComparison)
 				RuntimeFunction(IntEquals(roles)):
@@ -1267,14 +1273,11 @@ private pure func append_storage_operation(
 					"blorp_record_drop_"
 
 			Ok(Some(prefix.append_int(record_number(id))))
-		ListType(_):
-			name = match action:
-				DuplicateValue:
-					"blorp_string_list_retain"
-				DestroyValue:
-					"blorp_string_list_release"
-
-			Ok(Some(name))
+		ListType(element):
+			prefix = match action:
+				DuplicateValue: "blorp_list_dup_"
+				DestroyValue: "blorp_list_drop_"
+			Ok(Some(prefix.concat(list_suffix(list_element_key(element)))))
 		StringType:
 			Ok(
 				Some(
@@ -1608,8 +1611,10 @@ private pure func append_function(
 
 private pure func is_string(type_ref: TypeRef) -> Bool:
 	match type_ref:
-		StringType | ListType(_):
+		StringType:
 			True
+		ListType(element):
+			is_string(element)
 		_:
 			False
 
@@ -1633,14 +1638,13 @@ private fixed union RuntimeFeature:
 	IntegerArithmetic
 	StringOutput
 	IntegerParsing
-	StringLists
 	StringEquality
 	FloatFormatting
 	FloatParsing
 
 
 private pure func runtime_matches(
-	actual: RuntimeOperation[VariantInstanceId],
+	actual: RuntimeOperation[VariantInstanceId, TypeRef],
 	expected: RuntimeFeature,
 ) -> Bool:
 	match actual:
@@ -1668,12 +1672,8 @@ private pure func runtime_matches(
 					True
 				_:
 					False
-		ListLength | ListGet(_):
-			match expected:
-				StringLists:
-					True
-				_:
-					False
+		ListRepeat(_) | ListLength(_) | ListGet(_, _):
+			False
 		StringEquals(_):
 			match expected:
 				StringEquality:
@@ -1796,6 +1796,8 @@ private pure func is_float(value_type: TypeRef) -> Bool:
 	match value_type:
 		FloatType:
 			True
+		ListType(element):
+			is_float(element)
 		_:
 			False
 
@@ -1841,43 +1843,198 @@ private pure func needs_float_runtime(program: OwnershipProgram) -> Bool:
 	needed
 
 
-private pure func needs_lists(program: OwnershipProgram) -> Bool:
-	var needed = match program.entrypoint:
-		WithArguments(_, _):
-			True
-		NoArguments(_, _):
-			False
+-- This inventory lives for one emission only. Its complete key is a projection
+-- of concrete TypeRefs, not an ownership or layout authority. Stable sorting
+-- and adjacent key equality avoid scanning existing helpers at each occurrence.
+private fixed record ListLayout {
+	element: TypeRef,
+	key: ListElementKey
+}
 
-	for layout in program.records:
-		for field in layout.fields:
-			match field:
-				ListType(_):
-					needed = True
-				_:
-					void
+
+private pure func strip_list_layer(value_type: TypeRef) -> TypeRef:
+	match value_type:
+		ListType(element): element
+		_: value_type
+
+
+private pure func element_list_layouts(element: TypeRef) -> List[ListLayout]:
+	var current = element
+	var key = list_element_key(element)
+	var remaining = list_key_depth(key)
+	var layouts: List[ListLayout] = []
+	layouts = layouts.append({ element = current, key = key })
+
+	while IntOps.greater_than(remaining, 0):
+		current = strip_list_layer(current)
+		key = list_child_key(key)
+		remaining = IntOps.subtract(remaining, 1)
+		layouts = layouts.append({ element = current, key = key })
+
+	layouts
+
+
+private pure func type_list_layouts(value_type: TypeRef) -> List[ListLayout]:
+	match value_type:
+		ListType(element): element_list_layouts(element)
+		_: []
+
+
+private pure func operation_list_layouts(operation: OwnershipOperation) -> List[ListLayout]:
+	match operation:
+		DefineValue(definition):
+			value_layouts = type_list_layouts(definition.value_type)
+			runtime_layouts: List[ListLayout] = match definition.operation:
+				CallDefinition(call, _):
+					match call.target:
+						RuntimeFunction(operation):
+							match operation:
+								ListRepeat(element): element_list_layouts(element)
+								ListLength(element): element_list_layouts(element)
+								ListGet(element, _): element_list_layouts(element)
+								_: []
+						_: []
+				_: []
+			value_layouts.concat(runtime_layouts)
+		_: []
+
+
+private pure func block_list_layouts(operations: List[OwnershipOperation]) -> List[ListLayout]:
+	var layouts: List[ListLayout] = []
+	for operation in operations:
+		chunk = operation_list_layouts(operation)
+		for layout in chunk:
+			layouts = layouts.append(layout)
+	layouts
+
+
+private pure func list_layouts(program: OwnershipProgram) -> List[ListLayout]:
+	var layouts: List[ListLayout] = []
+
+	for record_layout in program.records:
+		for value_type in record_layout.fields:
+			chunk = type_list_layouts(value_type)
+			for layout in chunk:
+				layouts = layouts.append(layout)
+
+	for declaration in program.unions:
+		for fields in declaration.variants:
+			for value_type in fields:
+				chunk = type_list_layouts(value_type)
+				for layout in chunk:
+					layouts = layouts.append(layout)
 
 	for function in program.functions:
-		for value_type in function.signature.parameters.append(function.signature.return_type):
-			match value_type:
-				ListType(_):
-					needed = True
-				_:
-					void
+		for parameter in function.signature.parameters:
+			chunk = type_list_layouts(parameter)
+			for layout in chunk:
+				layouts = layouts.append(layout)
+		returned = type_list_layouts(function.signature.return_type)
+		for layout in returned:
+			layouts = layouts.append(layout)
+		prefix = block_list_layouts(function.operations)
+		for layout in prefix:
+			layouts = layouts.append(layout)
+		branches: List[ListLayout] = match function.tail:
+			ReturnTail(_): []
+			MatchTail(matched):
+				var arms: List[ListLayout] = []
+				for arm in matched.arms:
+					chunk = block_list_layouts(arm.operations)
+					for layout in chunk:
+						arms = arms.append(layout)
+				arms
+		for layout in branches:
+			layouts = layouts.append(layout)
 
-	for layout in program.unions:
-		for fields in layout.variants:
-			for value_type in fields:
-				match value_type:
-					ListType(_): needed = True
-					_: void
+	ordered = layouts
+		.sort_by(pure func(layout): list_key_ordinal(layout.key))
+		.sort_by(pure func(layout): list_key_rank(layout.key))
+		.sort_by(pure func(layout): list_key_depth(layout.key))
+	var unique: List[ListLayout] = []
+	var previous: Option[ListElementKey] = None
+	for layout in ordered:
+		duplicate = match previous:
+			Some(key): same_list_key(key, layout.key)
+			None: False
+		if not duplicate:
+			unique = unique.append(layout)
+			previous = Some(layout.key)
+	unique
 
 
-	needed
+private pure func append_list_prototypes(output: String, layouts: List[ListLayout]) -> String:
+	if layouts.is_empty():
+		output
+	else:
+		var fragments: List[String] = [output]
+		for layout in layouts:
+			suffix = list_suffix(layout.key)
+			type_name = list_c_type(layout.key)
+			fragment = "struct blorp_l_".concat(suffix).concat(";")
+				.concat("void blorp_list_dup_").concat(suffix).concat("(").concat(type_name).concat(");")
+				.concat("void blorp_list_drop_").concat(suffix).concat("(").concat(type_name).concat(");")
+			fragments = fragments.append(fragment)
+		fragments.join("")
 
 
-pure func aggregate_runtime(program: VerifiedProgram) -> Result[String, Diagnostic]:
-	checked = verified_contents(program)
-	var output: String = ""
+private pure func list_runtime_fragment(
+	layout: ListLayout,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	-- Nested helpers use the precomputed suffix key. Rewalking the TypeRef at
+	-- every suffix would make a single deeply nested List require quadratic work.
+	if IntOps.greater_than(list_key_depth(layout.key), 0):
+		child = list_child_key(layout.key)
+		suffix = list_suffix(child)
+		Ok(list_runtime(
+			layout.key,
+			list_c_type(child),
+			"blorp_list_dup_".concat(suffix).concat("(element);"),
+			"blorp_list_drop_".concat(suffix).concat("(element);"),
+		))
+	else:
+		type_name ?= c_type(layout.element, unions)
+		ownership ?= value_ownership(layout.element, unions, records)
+		acquire ?= match ownership:
+			NoOwnership: Ok("")
+			_: append_storage_operation("", layout.element, DuplicateValue, "element", unions)
+		destroy ?= match ownership:
+			NoOwnership: Ok("")
+			_: append_storage_operation("", layout.element, DestroyValue, "element", unions)
+		Ok(list_runtime(layout.key, type_name, acquire, destroy))
+
+
+private pure func append_list_runtime(
+	output: String,
+	layouts: List[ListLayout],
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	if layouts.is_empty():
+		Ok(output)
+	else:
+		var fragments: List[String] = [output]
+		var failure: Option[Diagnostic] = None
+		for layout in layouts:
+			fragment = list_runtime_fragment(layout, unions, records)
+			match fragment:
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(completed):
+					fragments = fragments.append(completed)
+		match failure:
+			Some(error): Err(error)
+			None: Ok(fragments.join(""))
+
+
+private pure func aggregate_runtime_contents(
+	checked: OwnershipProgram,
+	lists: List[ListLayout],
+) -> Result[String, Diagnostic]:
+	var output = append_list_prototypes("", lists)
 	var index: Int = 0
 
 	for layout in checked.records:
@@ -1923,12 +2080,22 @@ pure func aggregate_runtime(program: VerifiedProgram) -> Result[String, Diagnost
 		None:
 			Ok(void)
 
-	Ok(output)
+	completed ?= append_list_runtime(output, lists, checked.unions, checked.records)
+	arguments = match checked.entrypoint:
+		WithArguments(_, _): arguments_runtime()
+		NoArguments(_, _): ""
+	Ok(completed.concat(arguments))
+
+
+pure func aggregate_runtime(program: VerifiedProgram) -> Result[String, Diagnostic]:
+	checked = verified_contents(program)
+	aggregate_runtime_contents(checked, list_layouts(checked))
 
 
 pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	checked = verified_contents(program)
 	records = checked.records
+	lists = list_layouts(checked)
 
 	var output: String = if needs_string_runtime(checked):
 		string_runtime()
@@ -1936,7 +2103,7 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 		"#include <stdint.h>\n"
 
 	if (
-		checked.records.any(pure func(layout):
+		not lists.is_empty() or checked.records.any(pure func(layout):
 			match layout.representation:
 				ManagedRecord:
 					True
@@ -1967,13 +2134,10 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	if needs_runtime(checked, IntegerParsing):
 		output = output.concat(string_parse_int_runtime())
 
-	if needs_lists(checked):
-		output = output.concat(list_runtime())
-
 	if needs_runtime(checked, StringEquality):
 		output = output.concat(string_equals_runtime())
 
-	aggregates ?= aggregate_runtime(program)
+	aggregates ?= aggregate_runtime_contents(checked, lists)
 	output = output.concat(aggregates)
 	var index: Int = 0
 	var failure: Option[Diagnostic] = None
@@ -2022,8 +2186,8 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 						.concat("();return 0;}\n")
 				WithArguments(_, result):
 					prefix = output.concat((
-							"int main(int argc,char **argv){struct blorp_string_list *const "
-							+ "blorp_arguments=blorp_string_list_from_argv(argc,argv);"
+							"int main(int argc,char **argv){struct blorp_l_0_s *const "
+							+ "blorp_arguments=blorp_list_from_argv(argc,argv);"
 						))
 
 					match result:
@@ -2032,14 +2196,14 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 								.concat("const int64_t blorp_result=")
 								.concat(name)
 								.concat(
-									"(blorp_arguments);blorp_string_list_release(blorp_arguments);return (int)blorp_result;}\n",
+									"(blorp_arguments);blorp_list_drop_0_s(blorp_arguments);return (int)blorp_result;}\n",
 								)
 						SuccessfulExit:
 							prefix
 								.concat("(void)")
 								.concat(name)
 								.concat(
-									"(blorp_arguments);blorp_string_list_release(blorp_arguments);return 0;}\n",
+									"(blorp_arguments);blorp_list_drop_0_s(blorp_arguments);return 0;}\n",
 								)
 
 			Ok(wrapper)

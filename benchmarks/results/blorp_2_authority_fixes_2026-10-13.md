@@ -518,6 +518,89 @@ below the unchanged 5% ceiling and the 3% target (`final-cost-receipt`). Source,
 library, input and binary hashes are retained; these are owned-input CLI proxies,
 not self-compilation measurements.
 
-The complete branch descends from main, so landing preserves the reviewed history
-with a fast-forward. Host compiler, standard library and scripts are unchanged;
-the diff is confined to Blorp 2 and its retained benchmark reports.
+Before landing, origin/main advanced to `145d72107` with three cleanup commits.
+The ordinary merge preserves those commits and their removals. Two independent
+reviewers verified that all 552 Blorp 2 paths exactly match `5b93bf6ae`, and all
+2,259 incoming paths exactly match the upstream tree, including deletions.
+Relative to that upstream tree, the completed work is confined to Blorp 2 and
+16 retained Blorp 2 reports. Earlier receipts describe the repair slice before
+the incoming cleanup.
+
+The host was rebuilt from the merged sources and reports FRESH, with SHA-256
+`618b578c6245f7ee3f4d81250683eaeb3472d69208e393588019448d2494b942`.
+Its configuration remains CLI `-O0`, runtime `-O2`, eight-way split, Apple clang
+21.0.0 and bootstrap `dev-0e1598ed616e`. Fresh merged-tree validation passes:
+
+```sh
+bin/blorp test --suite --sanitize --leak-check --timeout 180 \
+  blorp_2/test/unit blorp_2/test/runtime blorp_2/test/test_grammar
+make -C blorp_2 test
+```
+
+The strict run passes 2,090 callbacks in 137 suites in 27.53s, with no sanitizer
+diagnostic and three allocations, three releases and zero leaks. The required
+make target passes the same 2,090 unit/runtime/grammar callbacks and all 325
+normal-main e2e cases in 202.37s total, generating and linking the pilot exactly
+once. All 42 approved source/library hashes remain unchanged. Logs and hashes
+are retained under `build/authority-fixes/merged-main/`.
+
+The final pilot binary is
+`dbb08976eeef9acc27a917f26a801cabf64d1563f45f4a76637f34cbdc7acef1`;
+its C is `04d8f3401ec6e7bc01650916aef803ce63e26c04732628ab863f176beb78ea57`.
+The original a163 source is rebuilt with this same host from an ignored Git
+archive, using the same native `-O0 -DBLORP_MEMORY_DIAGNOSTICS=1` flags and
+`-lm -lpthread`. Its binary is
+`b5ac501f2305d3437ec4a1486950104996ad82fe2f5ecc89068c070d0ea0ce2d`.
+The unchanged paired recipe uses identical executable, input, library and output
+paths. All 44 frozen input/library hashes are verified. Its 216 samples over 36
+programs have balanced strict allocation counts and identical emitted C;
+maximum allocations increase by 2.397525%, and maximum minimum retired
+instructions increase by 0.702616%. Both remain within the 5% ceiling and 3%
+target. Raw samples are in `build/authority-fixes/merged-main-cost/`; provenance
+is in `merged-main/provenance.json`. These are owned-input CLI proxies, not
+self-compilation measurements. Earlier receipts remain historical evidence;
+the rebuilt matched pair is the final merged-tree cost verdict.
+
+The merged branch descends from current main, so local landing preserves the
+reviewed history with a fast-forward. Namespace part B remains a follow-up.
+
+Two further upstream cleanup commits advance main to `5c14f0769`. They remove
+the old identity/magic-spelling tools and replace the diagnostic backlog with
+the compiler-fault list. Five host source edits and two fixture edits change
+only comments or docstrings. None touches Blorp 2 or the executed test targets.
+They are preserved in a second ordinary merge.
+
+The host is rebuilt and FRESH again, with SHA-256
+`ded7e214836307680d8d3a15072cf1eaba686211baa52aa861d24a21cf0a12ae`.
+It emits byte-identical pilot C (`04d8f340...ea57`) and a163 baseline C
+(`06b5bca2...e2da`) compared with the measured pair above. All 552 Blorp 2
+paths, 42 approved source/library hashes and 44 frozen input/library hashes
+are unchanged. The actual measured native binaries are retained unchanged.
+This correspondence supports reusing the passing 2,090/325 test receipts and
+the measured costs; it does not claim new test executions or new instruction
+samples after the comment-only update. The fresh host status, emitted C and
+correspondence hashes are retained under `merged-main/host5c14/`.
+
+## Main synchronization, 2026-10-14
+
+Current main at `4dcb0d20a` contains the completed pilot changes under new commit
+identities, adds pilot CI and retires the old compiler's performance harnesses
+and hooks. It is merged into the working authority branch without changing pilot
+semantics. The combined tree exactly matches incoming main except this report;
+the sole report conflict preserves its previously reviewed historical evidence.
+CI/README updates and retired-file deletions are preserved.
+
+The rebuilt host is FRESH, SHA-256
+`92d1e10d88bd1048d101a9864528695e4c34de6251435ab1c4e6c68ac743b30b`.
+Fresh strict validation passes 2,090 callbacks in 137 suites in 28.63s, with
+three allocations, three releases, zero leaks and no sanitizer diagnostics.
+`make -C blorp_2 test` passes the same 2,090 callbacks and all 325 normal-main
+e2e cases in 201.45s total, generating and linking the pilot exactly once.
+Its actual pilot binary is
+`e6ac8ab7d079670fbceac2eaefb1abd04f1010e7e7230dfb561caf0305d1a4e1`;
+the emitted compiler C remains
+`04d8f3401ec6e7bc01650916aef803ce63e26c04732628ab863f176beb78ea57`.
+Logs and provenance are retained under `build/main-sync-20261014/`.
+Earlier matched costs remain historical measurements; this synchronization
+makes no new comparative performance or self-compilation claim. Namespace B
+remains a separate follow-up.

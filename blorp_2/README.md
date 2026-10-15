@@ -478,7 +478,7 @@ Written annotations admit nested ordered arguments, such as `Box[Box[Int]]`
 or `Result[Box[Int], Int]`. The [nested example](test/e2e/fixtures/generic/nested/written.brp)
 declares `double_box[T](value: T) -> Box[Box[T]]` and extracts the result
 through ordinary `unbox` calls; its real `main` exits 7. Concrete payloads may
-be Int, Float, String, Void, List[String], a finite record, or another finite inline union. Specialization
+be Int, Float, String, Void, a List of any supported finite type, a finite record, or another finite inline union. Specialization
 publishes complete payload types and defines child layouts before parents.
 Constructors and projections carry the selected variant identity through
 lowering, ownership and independent verification. Heterogeneous variants use
@@ -501,8 +501,7 @@ types must be finite, including unused unions.
 
 A nullary variant is bare `Empty`. `Unit(Void)` is unary and is constructed as
 `Unit(void)`; it remains distinct from an empty variant. `Variant()` is invalid,
-and `Variant(Int, String)` declares two ordered fields. `Variant(Pair[Int, String])` names one payload and is valid. Lists retain
-the existing String-only concrete element restriction.
+and `Variant(Int, String)` declares two ordered fields. `Variant(Pair[Int, String])` names one payload and is valid. Lists accept any supported finite element type.
 
 Constructors evaluate each field expression once in written order. Patterns
 write one distinct binder or `_` for each position, such as `Pair(left, _)`.
@@ -693,7 +692,7 @@ finite String-bearing payloads may nest.
 ## Finite mixed records
 
 Fixed records can contain any currently supported finite concrete type, including
-Float, String, Void, List[String], other records and instantiated unions:
+Float, String, Void, List[E] for any supported finite E, other records and instantiated unions:
 
 ```blorp
 fixed record Entry { count: Int, ratio: Float, text: String }
@@ -719,10 +718,71 @@ occurrence; inline owning union fields drop their active payload paths.
 Acquired managed projections remain valid after their parent is destroyed.
 
 Whole-variable reassignment preserves old aliases. Empty record
-declarations, recursive data, field assignment and record-update syntax remain
-unsupported. Recursive declaration references reject before layout expansion.
+declarations, recursive data and field assignment remain unsupported.
+Recursive declaration references reject before layout expansion.
 The [roadmap](ROADMAP.md#first-increment-mixed-finite-records) tracks final
 integrated acceptance and later aggregate extensions.
+
+## Fresh record updates
+
+`{ base | field = expression }` creates a complete record with selected fields
+replaced. The base determines its nominal record type and every type argument;
+replacement names never select a different type. Unchanged fields keep their
+values. Existing aliases retain the original values:
+
+```blorp
+import:
+    list: repeat
+    int: to_string
+    io: print
+fixed record Entry { number: Int, text: String, values: List[Int] }
+pure func make_entry(number: Int) -> Entry:
+    { number = number, text = number.to_string(), values = repeat(number, 2) }
+pure func replace_text(value: Entry) -> Entry:
+    { value | text = 7.to_string() }
+func main() -> Void:
+    old = make_entry(42)
+    alias = old
+    fresh = replace_text(old)
+    print(alias.text)
+    print(fresh.text)
+```
+
+The [alias fixture](test/e2e/fixtures/record/update/aliases.brp) prints exactly
+`42\n7\n` and exits 0. The base executes once. Replacement expressions execute
+once in written order, followed by unchanged-field projections in declaration
+order. Complete construction stores every field in declaration order. The
+[order fixture](test/e2e/fixtures/record/update/order.brp) updates `text` before
+`number` and prints `base\ntext\nnumber\n7\n7\n`.
+
+Managed updates always allocate a fresh root. There is no uniqueness test or
+COW reuse yet, including when a replacement has the same value as the old field.
+Inline numeric records use ordinary complete construction without ARC. Each
+managed stored occurrence receives its own obligation through the existing
+acquire-then-drop protocol: a projection acquires an owned child, construction
+acquires its stored child, and the temporary owner retires after its last use.
+Unchanged fields do not keep their parent alive after their own obligations are
+established. Replaced fields are never projected unnecessarily. All current
+finite field types work, including Void, owning unions, records and nested Lists.
+The [escaped-child fixture](test/e2e/fixtures/record/update/escaped_children.brp)
+returns a List and a mortal String after their updated parents retire.
+
+Generic arguments may be inferred from replacements when the base already has a
+known nominal head. For example, a pending `Box[T]` base updated with `value = 7`
+can become `Box[Int]`. A literal base uses the ordinary result context; fields
+never supply an otherwise unknown record owner. Checking publishes complete
+typed replacement and inherited-field rows, with parser-owned base spans.
+Later stages use resolved field identities rather than spelling lookups.
+
+Updates require at least one replacement, stay on one line and do not allow
+trailing commas. After `{`, a name followed by `=` starts a literal; otherwise
+the parser reads a base expression and requires `|`. Thus `{ first : 7 }` reports
+a missing update bar, while `{ first = 7, second : 9 }` reports the second field's
+missing `=`. Unknown names, duplicates and mismatched field types report
+typed checking errors. A duplicate points to the first written name; a type
+mismatch points to the field annotation. Field assignment and recursive data
+remain deferred. This increment favors correct fresh construction; COW/reuse
+optimization follows separate evidence and review.
 
 ## Generic records
 
@@ -749,25 +809,17 @@ Int from the field. Nested record fields and uniquely resolved UFCS contracts us
 the same rule. An unannotated literal or `identity[T](value: T)` alone supplies no
 record owner. Fields are checked and evaluated in written order. Recursive
 record layouts and recursively growing generic call substitutions reject before
-specialization expands them. Record-owned List[T] fields retain the current
-concrete List[String] limit.
-
-Checking validates concrete List requirements through every nested record and
-union application, including annotations on unused functions. A finite
-declaration walk records which parameters must be String once, then concrete
-annotations and inferred call signatures consult those requirements. Symbolic parameters
-remain valid until their concrete arguments are known. Phantom parameters impose
-no stored-field requirement, but their supplied types must still be valid.
+specialization expands them. Record-owned List[T] fields accept every supported finite element type, including
+other Lists. Checking accepts generic List annotations without a String-only
+admission rule. Specialization prepares all nested nominal element layouts and
+publishes their complete concrete identities before lowering.
 Void remains a valid type argument; the separate rule forbidding pure functions
 from returning Void still applies. When generic forwarding exposes that rule
 only during specialization, diagnostics retain a call-site origin per
 instantiation chain. Concrete written type arguments establish their own origin;
 caller-dependent arguments carry the outer origin. Mixed fixed and symbolic
 arguments can therefore retain an outer location. Argument-specific provenance
-remains future work. Requirements hidden only inside a generic function's body can still become
-known during specialization: the checker does not propagate body constraints
-through the generic call graph yet. Specialization retains that rejection guard
-at the aggregate field's written annotation.
+remains future work.
 
 ## Grammar for this increment
 
@@ -775,10 +827,10 @@ This specification defines only the examples' language: functions with an option
 return annotation (omission means `Void`), an ordered list of explicitly typed parameters, an optional ordered list of type
 parameters on functions, fixed unions and fixed records with
 one or more finite fields after substitution. Union variants have zero or more ordered fields using ordinary type annotations; concrete fields
-specialize to Int, Float, String, Void, List[String], a finite record, or another finite inline union. A function
+specialize to Int, Float, String, Void, a List of any supported finite type, a finite record, or another finite inline union. A function
 body has zero or more ordered binding or Void expression statements followed
 by a final expression or a tail match with inline arm results or statement blocks. Expressions
-start with `void`, a signed Int64 or decimal Float64 literal, a quoted UTF-8 String literal, a binding or variant name, a record literal,
+start with `void`, a signed Int64 or decimal Float64 literal, a quoted UTF-8 String literal, a binding or variant name, a record literal or update,
 or an application with an ordered list of arguments. UFCS calls and record
 field suffixes may follow that expression.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
@@ -848,7 +900,7 @@ Lexical and layout rules:
   type syntax in the union declaration's module and parameter scope, including
   recursive type arguments such as `Box[Box[Int]]` or `Result[T, Box[E]]`.
   Empty declaration parentheses remain unsupported. Concrete field layouts may
-  contain Int, Float, String, Void, List[String], finite inline unions or records.
+  contain Int, Float, String, Void, Lists of supported finite types, finite inline unions or records.
 - `fixed record Pair { first: Int, second: Int }` declares a nominal record
   on one line. Field names must be distinct and have supported finite concrete
   types after specialization. `fixed record Box[T] { value: T }` declares ordered
@@ -860,8 +912,13 @@ Lexical and layout rules:
   Every field appears exactly once. Expressions evaluate in written order;
   field order in the literal may differ from declaration order. A new inferred
   binding alone supplies no record context. `{}` parses and reports the first
-  missing field. Declarations and literals stay on one line; trailing commas,
-  updates and field assignments are unsupported.
+  missing field. Declarations and literals stay on one line; trailing commas
+  and field assignments are unsupported.
+- `{ pair | second = 9, first = 7 }` preserves the base's nominal type and
+  type arguments. The base executes once, replacements execute in written
+  order, and construction stores all fields in declaration order. Every
+  replacement name appears at most once; at least one replacement is required.
+  Updates stay on one line and do not permit trailing commas.
 - `pair.first` reads a declared field; `pair.read_first()` remains a UFCS call.
   A uniquely resolved immediate UFCS receiver parameter may supply a nominal
   literal context, including a head with unresolved generic arguments.
@@ -903,7 +960,7 @@ Semantic rules:
   `List[String]` parameter, and returns `Int` or `Void`. The argument list includes the
   executable name at index zero. A helper
   takes zero or more explicitly typed parameters with distinct names. Helper
-  annotations use the supported scalar, finite record/union, List[String] or
+  annotations use the supported scalar, finite record/union, List[E] or
   declaration-owned generic types described above. An omitted return annotation
   means `Void`. Pure functions
   cannot return `Void`, including concrete generic instances.
@@ -996,7 +1053,7 @@ Semantic rules:
   unused bodies. An arbitrary `T` cannot return an Int literal or call a
   concrete Int/String runtime operation. Parameters cannot share a name with
   `Int`, `String`, or any declared union; separate declarations may reuse `T`.
-  `main` and functions with closed builtin bodies cannot declare type parameters.
+  `main` cannot declare type parameters. List repeat, length and get builtin wrappers may be generic; other closed builtin bodies remain nongeneric.
   Direct and UFCS calls solve private call variables structurally, processing
   argument constraints before a declared expected result. Later sibling evidence
   can solve an earlier pending call. Repeated occurrences, including structural
@@ -1143,7 +1200,7 @@ outside compilation inputs. Its active declarations provide the calculator's
 ordinary unions and concrete numeric, conversion and IO functions.
 Their explicit builtin bodies select closed compiler-known operations. Module functions
 may declare these builtin bodies with the exact concrete runtime signature,
-without statement prefixes, generic parameters or tail annotations. Unknown
+without statement prefixes or tail annotations. List repeat, length and get wrappers may also declare generic parameters; other builtin wrappers remain nongeneric. Unknown
 labels and signature mismatches are errors. There is no arbitrary foreign
 symbol binding. The base types module owns `Int`, `Float`, `String`, `Void` and unary `List`.
 The [validation report](../benchmarks/results/blorp_2_int_add_2026-10-11.md) records
@@ -1288,8 +1345,60 @@ index zero; `main` borrows it. The `list` adapter exposes pure `length` and
 `get`. `get` returns ordinary `Option[String]`: a present result owns a retained
 String, while negative or out-of-range indices return None. No trimming or
 splitting is implicit. OS argument strings cannot contain NUL; source-literal
-tests cover counted NUL bytes separately. Only concrete `List[String]` is
-supported in this increment; generic helpers may abstract over it.
+tests cover counted NUL bytes separately. Lists accept every supported finite element type: Void, Int, Float, String,
+records, unions, and nested Lists. `main` continues to accept exactly
+`List[String]` for its argument parameter.
+
+The temporary `list` module provides three ordinary pure generic functions:
+
+```blorp
+pure func repeat[T](element: T, count: Int) -> List[T]:
+    builtin("list.repeat")
+pure func length[T](values: List[T]) -> Int:
+    builtin("list.length")
+pure func get[T](values: List[T], index: Int) -> Option[T]:
+    builtin("list.get", Some, None)
+```
+
+`repeat` evaluates its element and count once. A nonpositive count produces an
+empty List, including the minimum Int value. Each repeated occurrence owns its
+stored value. `length` returns the initialized element count; `get` returns
+None for a negative or out-of-range index and an independently owned Some value
+otherwise. Zero, Void, an empty String and a nullary union case are valid Some
+payloads. Retaining a List root does not acquire its children again; its final
+release destroys each initialized slot exactly once. No List literal, indexed
+update, append or removal syntax is included in this increment.
+
+For example, a managed record can escape after its containing List is retired:
+
+```blorp
+import:
+    list: repeat, get
+fixed record Entry { number: Int, text: String }
+pure func make_entry() -> Entry:
+    { number = 7, text = "kept" }
+pure func selected_entry() -> Option[Entry]:
+    values = repeat(make_entry(), 2)
+    values.get(1)
+func main() -> Int:
+    saved = selected_entry()
+    0
+```
+
+The make_entry return annotation establishes the record literal's Entry identity. Concrete nongeneric wrappers and generic wrappers
+with structured element types use the same closed contracts. For example,
+`Pair[A, B]` can be a wrapper's element type; the compiler does not impose a
+one-bare-parameter rule.
+
+Emission derives a disposable helper inventory from accepted concrete types,
+including local definitions and runtime operation elements. Helpers retain full
+record and union instance identities, including phantom type arguments. A flat
+key records outer List depth and terminal type/identity; it is an emission
+projection, never a layout or ownership authority. The inventory is sorted and
+deduplicated once, and C names project from the same key without per-use scans.
+Nested helper dependencies reuse their suffix keys rather than rewalking type
+ancestry. The finite concrete layouts remain the authority for element storage
+and destruction.
 
 The [argument validation report](../benchmarks/results/blorp_2_arguments_2026-10-12.md)
 records the entrypoint contract, ownership checks, native tests and matched costs.
@@ -1442,7 +1551,14 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    Integer conversion accumulates negatively against derived range cutoffs,
    checking before multiplication so even the minimum is represented safely.
 3. A frozen namespace maps each module's visible function names to original
-   declaration IDs. Selective imports do not reexport imported names, and an
+   declaration IDs. Its builder returns a complete valid namespace or a nonempty
+   typed failure. Implicit prelude exposures are expanded and validated before
+   publication. After builtin foundation validation, checking reports import and
+   visible declaration clashes before signature annotation errors. Direct
+   function and type queries return at most one binding; constructors retain
+   owner-qualified candidates for type-directed selection. Checking consumes
+   these visibility facts without repeating uniqueness checks.
+   Selective imports do not reexport imported names, and an
    imported function retains its defining scope. Checking resolves nominal union and owned variant identities, then publishes
    one authoritative signature per function. A private resolution context borrows
    accepted declarations, signatures and namespace facts. Target resolution returns a complete
@@ -1540,7 +1656,7 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    share only the function's value allocator, preserving distinct identities.
 6. Concrete specialization owns storage and child-ownership representation.
    Its read-only ownership query classifies a concrete value as having no
-   ownership, being a managed String leaf, List[String] or record root, or
+   ownership, being a managed String leaf, List or record root, or
    containing owned inline union fields. Ownership insertion and verification
    both consume that upstream fact; the query does not inspect or prescribe
    insertion's operations. Producer tests independently cover each supported

@@ -1,38 +1,165 @@
--- Concrete immutable List[String] storage. The root owns every child once;
--- lookups borrow the root and return one independently retained String owner.
-pure func list_runtime() -> String:
+import:
+	int as IntOps
+	specialize:
+		RecordInstanceId,
+		TypeRef(VoidType, IntType, FloatType, StringType, ListType, RecordType, UnionType),
+		UnionInstanceId,
+		record_number,
+		union_number,
+	text: concat
+
+
+private fixed union ElementTerminal:
+	VoidElement
+	IntElement
+	FloatElement
+	StringElement
+	RecordElement(RecordInstanceId)
+	UnionElement(UnionInstanceId)
+
+
+private fixed record ElementKey {
+	depth: Int,
+	terminal: ElementTerminal
+}
+
+
+-- A disposable emission key, never a type or layout authority. Its factory
+-- retains full nominal instance identity and counts only outer List layers.
+opaque type ListElementKey = ElementKey
+
+
+private pure func terminal_key(terminal: ElementTerminal, depth: Int) -> ListElementKey:
+	into_opaque ListElementKey({ depth = depth, terminal = terminal })
+
+
+private pure func element_key_at_depth(element: TypeRef, depth: Int) -> ListElementKey:
+	match element:
+		ListType(child): element_key_at_depth(child, IntOps.add(depth, 1))
+		VoidType: terminal_key(VoidElement, depth)
+		IntType: terminal_key(IntElement, depth)
+		FloatType: terminal_key(FloatElement, depth)
+		StringType: terminal_key(StringElement, depth)
+		RecordType(id): terminal_key(RecordElement(id), depth)
+		UnionType(id): terminal_key(UnionElement(id), depth)
+
+
+pure func list_element_key(element: TypeRef) -> ListElementKey:
+	element_key_at_depth(element, 0)
+
+
+pure func list_key_depth(key: ListElementKey) -> Int:
+	from_opaque ListElementKey(key).depth
+
+
+-- Consumers peel exactly the depth produced by the factory. A terminal key
+-- is unchanged; this total projection does not invent an element or layout.
+pure func list_child_key(key: ListElementKey) -> ListElementKey:
+	contents = from_opaque ListElementKey(key)
+	if IntOps.greater_than(contents.depth, 0):
+		into_opaque ListElementKey({ contents | depth = IntOps.subtract(contents.depth, 1) })
+	else:
+		key
+
+
+private VOID_RANK: Int = 0
+private INT_RANK: Int = 1
+private FLOAT_RANK: Int = 2
+private STRING_RANK: Int = 3
+private RECORD_RANK: Int = 4
+private UNION_RANK: Int = 5
+private NO_NOMINAL_ORDINAL: Int = 0
+
+
+pure func list_key_rank(key: ListElementKey) -> Int:
+	match from_opaque ListElementKey(key).terminal:
+		VoidElement: VOID_RANK
+		IntElement: INT_RANK
+		FloatElement: FLOAT_RANK
+		StringElement: STRING_RANK
+		RecordElement(_): RECORD_RANK
+		UnionElement(_): UNION_RANK
+
+
+pure func list_key_ordinal(key: ListElementKey) -> Int:
+	match from_opaque ListElementKey(key).terminal:
+		RecordElement(id): record_number(id)
+		UnionElement(id): union_number(id)
+		VoidElement | IntElement | FloatElement | StringElement: NO_NOMINAL_ORDINAL
+
+
+pure func same_list_key(left: ListElementKey, right: ListElementKey) -> Bool:
+	(
+		IntOps.equals(list_key_depth(left), list_key_depth(right))
+		and IntOps.equals(list_key_rank(left), list_key_rank(right))
+		and IntOps.equals(list_key_ordinal(left), list_key_ordinal(right))
+	)
+
+
+pure func list_suffix(key: ListElementKey) -> String:
+	terminal = match from_opaque ListElementKey(key).terminal:
+		VoidElement: "v"
+		IntElement: "i"
+		FloatElement: "f"
+		StringElement: "s"
+		RecordElement(id): "r".append_int(record_number(id))
+		UnionElement(id): "u".append_int(union_number(id))
+	"".append_int(list_key_depth(key)).concat("_").concat(terminal)
+
+
+pure func list_c_type(key: ListElementKey) -> String:
+	"struct blorp_l_".concat(list_suffix(key)).concat("*")
+
+
+-- The supplied element ABI and dup/drop fragments come from accepted concrete
+-- layouts. A root owns every initialized slot, including equal occurrences.
+pure func list_runtime(
+	key: ListElementKey,
+	element_type: String,
+	acquire: String,
+	destroy: String,
+) -> String:
+	suffix = list_suffix(key)
+	type_name = list_c_type(key)
+	"struct blorp_l_".concat(suffix).concat("{atomic_size_t references;int64_t length;")
+		.concat(element_type).concat(" values[];};void blorp_list_dup_").concat(suffix)
+		.concat("(").concat(type_name).concat(" value){atomic_fetch_add_explicit(&value->references,1,memory_order_relaxed);}")
+		.concat("void blorp_list_drop_").concat(suffix).concat("(").concat(type_name)
+		.concat(" value){if(atomic_fetch_sub_explicit(&value->references,1,memory_order_acq_rel)!=1)return;")
+		.concat("for(int64_t index=0;index<value->length;index++){").concat(element_type)
+		.concat(" element=value->values[index];(void)element;").concat(destroy).concat("}free(value);}")
+		.concat(type_name).concat(" blorp_list_repeat_").concat(suffix).concat("(")
+		.concat(element_type).concat(" element,int64_t count){const uint64_t requested=count<=0?UINT64_C(0):(uint64_t)count;")
+		.concat("if(requested>(SIZE_MAX-sizeof(struct blorp_l_").concat(suffix)
+		.concat("))/sizeof(").concat(element_type).concat("))abort();")
+		.concat(type_name).concat(" result=malloc(sizeof *result+(size_t)requested*sizeof *result->values);if(!result)abort();")
+		.concat("atomic_init(&result->references,1);result->length=0;")
+		.concat("for(uint64_t index=0;index<requested;index++){").concat(acquire)
+		.concat("result->values[index]=element;result->length++;}return result;}")
+		.concat("int64_t blorp_list_length_").concat(suffix).concat("(const struct blorp_l_")
+		.concat(suffix).concat(" *value){return value->length;}")
+		.concat("int blorp_list_get_").concat(suffix).concat("(const struct blorp_l_")
+		.concat(suffix).concat(" *value,int64_t index,").concat(element_type)
+		.concat(" *result){if(index<0||index>=value->length)return 0;").concat(element_type)
+		.concat(" element=value->values[index];").concat(acquire).concat("*result=element;return 1;}")
+
+
+-- argv uses the same concrete String list root and destruction as source Lists.
+pure func arguments_runtime() -> String:
 	raw
-		|struct blorp_string_list {
-		|atomic_size_t references;
-		|int64_t length;
-		|struct blorp_string *values[];
-		|};
-		|struct blorp_string_list *blorp_string_list_from_argv(int argc,char **argv){
+		|struct blorp_l_0_s *blorp_list_from_argv(int argc,char **argv){
 		|if(argc<0){abort();}
 		|const size_t count=(size_t)argc;
-		|if(count>(SIZE_MAX-sizeof(struct blorp_string_list))/sizeof(struct blorp_string *)){abort();}
-		|struct blorp_string_list *result=malloc(sizeof *result+count*sizeof *result->values);
+		|if(count>(SIZE_MAX-sizeof(struct blorp_l_0_s))/sizeof(struct blorp_string *)){abort();}
+		|struct blorp_l_0_s *result=malloc(sizeof *result+count*sizeof *result->values);
 		|if(result==NULL){abort();}
-		|atomic_init(&result->references,1);result->length=(int64_t)argc;
+		|atomic_init(&result->references,1);result->length=0;
 		|for(size_t index=0;index<count;index++){
 		|const size_t length=strlen(argv[index]);
 		|if(length>(size_t)INT64_MAX||length>SIZE_MAX-sizeof(struct blorp_string)-1){abort();}
 		|result->values[index]=blorp_string_from_bytes(argv[index],(int64_t)length);
+		|result->length++;
 		|}
 		|return result;
-		|}
-		|void blorp_string_list_retain(struct blorp_string_list *value){
-		|atomic_fetch_add_explicit(&value->references,1,memory_order_relaxed);
-		|}
-		|void blorp_string_list_release(struct blorp_string_list *value){
-		|if(atomic_fetch_sub_explicit(&value->references,1,memory_order_acq_rel)==1){
-		|for(int64_t index=0;index<value->length;index++){blorp_string_release(value->values[index]);}
-		|free(value);
-		|}
-		|}
-		|int64_t blorp_string_list_length(const struct blorp_string_list *value){return value->length;}
-		|struct blorp_string *blorp_string_list_get(const struct blorp_string_list *value,int64_t index){
-		|if(index<0||index>=value->length){return NULL;}
-		|struct blorp_string *result=value->values[index];blorp_string_retain(result);return result;
 		|}
 		|

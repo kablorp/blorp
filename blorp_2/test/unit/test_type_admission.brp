@@ -1,21 +1,102 @@
 import:
 	../../src/check as API
 	../../src/check_errors as Errors
-	../../src/check_render: render_check_error, render_failure
-	../../src/check_model: TypeRef(AppliedRecordType, IntType)
-	../../src/check_types: admit_type, validate_declarations, validate_finite_declarations
-	../../src/declarations: inventory_records
+	../../src/check_render: render_failure
+	../../src/check_model as Model
+	../../src/check_types: occurrence_fields, substitute_type, validate_declarations, validate_finite_declarations
+	../../src/declarations as Declaration
 	../../src/assemble: parsed_contents
 	../../src/lex: lex
+	../../src/names: find_name, same_name
 	../../src/namespace: build_namespace
 	../../src/source: module_source, root_module_id, same_source
 	../../src/specialize: specialize
-	../../src/syntax: Span
 	input: check_failure, checked_source, parse
 	test: TestSuite
 
 
-private pure func rejects_list(source: String, start: Int, end: Int) -> Bool:
+private pure func publishes(source: String, matches: pure (Model.CheckedFunctions) -> Bool) -> Bool:
+	match lex(module_source(root_module_id()), source).and_then(parse):
+		Err(_): False
+		Ok(parsed):
+			match API.check(parsed):
+				Err(_): False
+				Ok(accepted):
+					issued = parsed_contents(parsed).declarations
+					facts = API.checked_functions(accepted)
+					(
+						Declaration.inventory_records(issued).map(pure func(row): Declaration.record_number(row.id)) == facts.records.map(pure func(row): Declaration.record_number(row.id))
+						and Declaration.inventory_unions(issued).map(pure func(row): Declaration.union_number(row.id)) == facts.unions.map(pure func(row): Declaration.union_number(row.id))
+						and Declaration.inventory_functions(issued).map(pure func(row): Declaration.function_number(row.id)) == facts.functions.map(pure func(row): Declaration.function_number(row.id))
+						and matches(facts) and specialize(accepted).is_ok()
+					)
+
+
+private pure func list_record(declaration: Model.CheckedRecord) -> Bool:
+	match declaration.type_parameters:
+		[parameter]:
+			match declaration.fields:
+				[field]:
+					(
+						Model.same_owner(Model.parameter_owner(parameter), Model.RecordDeclaration(declaration.id))
+						and Model.parameter_position(parameter) == 0
+						and Model.same_type(field.value_type.value_type, Model.ListType(Model.ParameterType(parameter)))
+					)
+				_: False
+		_: False
+
+
+private pure func list_union(declaration: Model.CheckedUnion) -> Bool:
+	match declaration.type_parameters:
+		[parameter]:
+			match declaration.variants:
+				[empty, items]:
+					match items.fields:
+						[field]:
+							(
+								Model.same_owner(Model.parameter_owner(parameter), Model.UnionDeclaration(declaration.id))
+								and Model.parameter_position(parameter) == 0 and empty.fields.is_empty()
+								and Model.same_type(field.value_type, Model.ListType(Model.ParameterType(parameter)))
+							)
+						_: False
+				_: False
+		_: False
+
+
+private pure func record_parameter(source: String, element: Model.TypeRef, start: Int, end: Int) -> Bool:
+	publishes(source, pure func(facts):
+		match facts.records:
+			[values]:
+				match facts.functions.get(0):
+					Some(function):
+						match function.signature.parameters:
+							[parameter]:
+								(
+									list_record(values) and Model.same_type(parameter.value_type, Model.AppliedRecordType(values.id, [element]))
+									and same_source(parameter.span.source, module_source(root_module_id()))
+									and parameter.span.start == start and parameter.span.end == end
+								)
+							_: False
+					_: False
+			_: False
+	)
+
+
+private pure func integer_call(value: Model.CheckedValue, callee: Declaration.FunctionId, expected: Model.TypeRef) -> Bool:
+	match value.base:
+		Model.ReturnCall(call, [argument]):
+			match call.target:
+				Model.UserFunction(actual, [element]):
+					(
+						Declaration.function_number(actual) == Declaration.function_number(callee)
+						and Model.same_type(element, Model.IntType) and Model.same_type(argument.base_type, Model.IntType)
+						and Model.same_type(value.base_type, expected)
+					)
+				_: False
+		_: False
+
+
+private pure func unknown_value(source: String, start: Int, end: Int) -> Bool:
 	match lex(module_source(root_module_id()), source).and_then(parse):
 		Err(_): False
 		Ok(parsed):
@@ -25,15 +106,20 @@ private pure func rejects_list(source: String, start: Int, end: Int) -> Bool:
 					errors = API.check_errors(failure)
 					diagnostics = render_failure(failure)
 					typed = match errors.first.kind:
-						Errors.TypeTermRejection(Errors.UnsupportedListElement): True
+						Errors.ValueRejection(Errors.UnknownValue(name)):
+							match find_name(parsed_contents(parsed).names, "missing"):
+								Some(expected): same_name(name, expected)
+								None: False
 						_: False
 					(
 						typed and errors.remaining.is_empty() and diagnostics.remaining.is_empty()
 						and same_source(errors.first.span.source, module_source(root_module_id()))
 						and errors.first.span.start == start and errors.first.span.end == end
 						and diagnostics.first.span.start == start and diagnostics.first.span.end == end
-						and diagnostics.first.message == "List currently supports only String elements"
-						and diagnostics.first.help == "use List[String]; other concrete element types are not supported yet"
+						and same_source(diagnostics.first.span.source, errors.first.span.source)
+						and diagnostics.first.message == "unknown value"
+						and diagnostics.first.help == "use this function's parameter name, a declared variant, or a call"
+						and diagnostics.first.note.is_none()
 					)
 
 
@@ -44,7 +130,7 @@ private pure func accepts(source: String) -> Bool:
 -- Exercise the declaration producer and its sealed consumer directly. No
 -- signatures or bodies are checked, and the record identity comes from the
 -- issued declaration row rather than an unchecked ordinal constructor.
-pure func test_forward_declaration_summary_is_available_before_body_checking() -> Bool:
+pure func test_forward_declarations_publish_complete_fields_before_body_checking() -> Bool:
 	source: String =
 		|fixed record Outer[T] { child: Values[T] }
 		|fixed record Values[T] { items: List[T] }
@@ -57,29 +143,41 @@ pure func test_forward_declaration_summary_is_available_before_body_checking() -
 		Err(_): False
 		Ok(program):
 			parsed = parsed_contents(program)
-			namespace = build_namespace(program)
-			match validate_declarations(parsed, namespace).and_then(validate_finite_declarations):
+			match build_namespace(program):
 				Err(_): False
-				Ok(admission):
-					match inventory_records(parsed.declarations).get(0):
-						None: False
-						Some(row):
-							span: Span = { source = module_source(root_module_id()), start = 104, end = 114 }
-							match admit_type(AppliedRecordType(row.id, [IntType]), admission, span):
-								Err(error):
-									typed = match error.kind:
-										Errors.TypeTermRejection(Errors.UnsupportedListElement): True
+				Ok(namespace):
+					match validate_declarations(parsed, namespace):
+						Err(_): False
+						Ok(declarations):
+							match Declaration.inventory_records(parsed.declarations):
+								[outer_row, values_row]:
+									match declarations.records:
+										[outer, values]:
+											match outer.type_parameters:
+												[outer_parameter]:
+													match values.type_parameters:
+														[values_parameter]:
+															match outer.fields:
+																[child]:
+																	(
+																		Declaration.record_number(outer.id) == Declaration.record_number(outer_row.id)
+																		and Declaration.record_number(values.id) == Declaration.record_number(values_row.id)
+																		and Model.same_owner(Model.parameter_owner(outer_parameter), Model.RecordDeclaration(outer_row.id))
+																		and Model.same_owner(Model.parameter_owner(values_parameter), Model.RecordDeclaration(values_row.id))
+																		and Model.parameter_position(outer_parameter) == 0 and Model.parameter_position(values_parameter) == 0
+																		and not Model.same_parameter(outer_parameter, values_parameter)
+																		and Model.same_type(child.value_type.value_type, Model.AppliedRecordType(values_row.id, [Model.ParameterType(outer_parameter)]))
+																		and Model.field_number(child.id) == 0 and list_record(values)
+																		and validate_finite_declarations(declarations).is_ok()
+																	)
+																_: False
+														_: False
+												_: False
 										_: False
-									diagnostic = render_check_error(program, error)
-									(
-										typed and error.span.start == 104 and error.span.end == 114
-										and diagnostic.message == "List currently supports only String elements"
-										and diagnostic.help == "use List[String]; other concrete element types are not supported yet"
-									)
-								Ok(_): False
+								_: False
 
 
-pure func test_second_list_requirement_cannot_be_overlooked() -> Bool:
+pure func test_two_list_fields_keep_distinct_element_parameters() -> Bool:
 	source: String =
 		|fixed record Both[A, B] { first: List[A], second: List[B] }
 		|func unused(value: Both[String, Int]) -> Int:
@@ -87,10 +185,34 @@ pure func test_second_list_requirement_cannot_be_overlooked() -> Bool:
 		|func main() -> Int:
 		|    0
 		|
-	rejects_list(source, 79, 96)
+	publishes(source, pure func(facts):
+		match facts.records:
+			[both]:
+				match facts.functions.get(0):
+					Some(function):
+						match both.type_parameters:
+							[first_parameter, second_parameter]:
+								match both.fields:
+									[first, second]:
+										match function.signature.parameters:
+											[input]:
+												(
+													Model.parameter_position(first_parameter) == 0 and Model.parameter_position(second_parameter) == 1
+													and not Model.same_parameter(first_parameter, second_parameter)
+													and Model.same_type(first.value_type.value_type, Model.ListType(Model.ParameterType(first_parameter)))
+													and Model.same_type(second.value_type.value_type, Model.ListType(Model.ParameterType(second_parameter)))
+													and Model.same_type(input.value_type, Model.AppliedRecordType(both.id, [Model.StringType, Model.IntType]))
+													and input.span.start == 79 and input.span.end == 96
+												)
+											_: False
+									_: False
+							_: False
+					_: False
+			_: False
+	)
 
 
-pure func test_finite_cycle_rejection_precedes_concrete_type_admission() -> Bool:
+pure func test_finite_cycle_rejection_still_precedes_body_checking() -> Bool:
 	source: String =
 		|fixed record Node[T] { next: Node[T], items: List[T] }
 		|func unused(value: Node[Int]) -> Int:
@@ -115,7 +237,7 @@ pure func test_finite_cycle_rejection_precedes_concrete_type_admission() -> Bool
 			)
 
 
-pure func test_nested_first_field_error_precedes_shallower_later_field() -> Bool:
+pure func test_nested_and_later_list_fields_keep_complete_arguments() -> Bool:
 	source: String =
 		|fixed record Values[T] { items: List[T] }
 		|fixed record Marker[T] { value: Int }
@@ -123,10 +245,23 @@ pure func test_nested_first_field_error_precedes_shallower_later_field() -> Bool
 		|func main() -> Int:
 		|    0
 		|
-	rejects_list(source, 106, 125)
+	publishes(source, pure func(facts):
+		match facts.records:
+			[values, marker, parent]:
+				match parent.fields:
+					[first, second]:
+						(
+							list_record(values)
+							and Model.same_type(first.value_type.value_type, Model.AppliedRecordType(marker.id, [Model.AppliedRecordType(values.id, [Model.IntType])]))
+							and Model.same_type(second.value_type.value_type, Model.AppliedRecordType(values.id, [Model.FloatType]))
+							and first.value_type.span.start == 106 and first.value_type.span.end == 125
+						)
+					_: False
+			_: False
+	)
 
 
-pure func test_unknown_later_child_precedes_freeze_only_nominal_admission() -> Bool:
+pure func test_unknown_later_child_precedes_deferred_nominal_inference() -> Bool:
 	source: String =
 		|fixed union Values[T]:
 		|    Empty
@@ -155,7 +290,7 @@ pure func test_unknown_later_child_precedes_freeze_only_nominal_admission() -> B
 			)
 
 
-pure func test_unused_record_parameter_rejects_concrete_list_requirement() -> Bool:
+pure func test_unused_record_parameter_keeps_int_list_application() -> Bool:
 	source: String =
 		|fixed record Values[T] { items: List[T] }
 		|func unused(value: Values[Int]) -> Int:
@@ -163,10 +298,10 @@ pure func test_unused_record_parameter_rejects_concrete_list_requirement() -> Bo
 		|func main() -> Int:
 		|    0
 		|
-	rejects_list(source, 61, 72)
+	record_parameter(source, Model.IntType, 61, 72)
 
 
-pure func test_unused_union_parameter_rejects_concrete_list_requirement() -> Bool:
+pure func test_unused_union_parameter_keeps_int_list_application() -> Bool:
 	source: String =
 		|fixed union Values[T]:
 		|    Empty
@@ -176,10 +311,24 @@ pure func test_unused_union_parameter_rejects_concrete_list_requirement() -> Boo
 		|func main() -> Int:
 		|    0
 		|
-	rejects_list(source, 71, 82)
+	publishes(source, pure func(facts):
+		match facts.unions:
+			[values]:
+				match facts.functions.get(0):
+					Some(function):
+						match function.signature.parameters:
+							[parameter]:
+								(
+									list_union(values) and Model.same_type(parameter.value_type, Model.AppliedUnionType(values.id, [Model.IntType]))
+									and parameter.span.start == 71 and parameter.span.end == 82
+								)
+							_: False
+					_: False
+			_: False
+	)
 
 
-pure func test_unused_return_annotation_rejects_concrete_list_requirement() -> Bool:
+pure func test_unused_return_keeps_int_list_application() -> Bool:
 	source: String =
 		|fixed union Values[T]:
 		|    Empty
@@ -189,20 +338,42 @@ pure func test_unused_return_annotation_rejects_concrete_list_requirement() -> B
 		|func main() -> Int:
 		|    0
 		|
-	rejects_list(source, 74, 85)
+	publishes(source, pure func(facts):
+		match facts.unions:
+			[values]:
+				match facts.functions.get(0):
+					Some(function):
+						(
+							list_union(values) and Model.same_type(function.signature.return_type.value_type, Model.AppliedUnionType(values.id, [Model.IntType]))
+							and function.signature.return_type.span.start == 74 and function.signature.return_type.span.end == 85
+						)
+					_: False
+			_: False
+	)
 
 
-pure func test_record_field_rejects_concrete_child_requirement() -> Bool:
+pure func test_record_field_keeps_concrete_int_list_child() -> Bool:
 	source: String =
 		|fixed record Values[T] { items: List[T] }
 		|fixed record Parent { child: Values[Int] }
 		|func main() -> Int:
 		|    0
 		|
-	rejects_list(source, 71, 82)
+	publishes(source, pure func(facts):
+		match facts.records:
+			[values, parent]:
+				match parent.fields:
+					[child]:
+						(
+							list_record(values) and Model.same_type(child.value_type.value_type, Model.AppliedRecordType(values.id, [Model.IntType]))
+							and child.value_type.span.start == 71 and child.value_type.span.end == 82
+						)
+					_: False
+			_: False
+	)
 
 
-pure func test_union_field_rejects_concrete_child_requirement() -> Bool:
+pure func test_union_field_keeps_concrete_int_list_child() -> Bool:
 	source: String =
 		|fixed record Values[T] { items: List[T] }
 		|fixed union Parent:
@@ -210,10 +381,27 @@ pure func test_union_field_rejects_concrete_child_requirement() -> Bool:
 		|func main() -> Int:
 		|    0
 		|
-	rejects_list(source, 74, 85)
+	publishes(source, pure func(facts):
+		match facts.records:
+			[values]:
+				match facts.unions:
+					[parent]:
+						match parent.variants:
+							[variant]:
+								match variant.fields:
+									[child]:
+										(
+											list_record(values) and Model.same_type(child.value_type, Model.AppliedRecordType(values.id, [Model.IntType]))
+											and child.span.start == 74 and child.span.end == 85
+										)
+									_: False
+							_: False
+					_: False
+			_: False
+	)
 
 
-pure func test_nested_record_requirement_reaches_written_outer_application() -> Bool:
+pure func test_nested_record_application_keeps_list_parameter_identity() -> Bool:
 	source: String =
 		|fixed record Values[T] { items: List[T] }
 		|fixed record Outer[T] { child: Values[T] }
@@ -222,10 +410,48 @@ pure func test_nested_record_requirement_reaches_written_outer_application() -> 
 		|func main() -> Int:
 		|    0
 		|
-	rejects_list(source, 104, 114)
+	publishes(source, pure func(facts):
+		match facts.records:
+			[values, outer]:
+				match facts.functions.get(0):
+					Some(function):
+						match outer.type_parameters:
+							[parameter]:
+								match outer.fields:
+									[child]:
+										match function.signature.parameters:
+											[input]:
+												(
+													list_record(values)
+													and Model.same_type(child.value_type.value_type, Model.AppliedRecordType(values.id, [Model.ParameterType(parameter)]))
+													and Model.same_type(input.value_type, Model.AppliedRecordType(outer.id, [Model.IntType]))
+													and input.span.start == 104 and input.span.end == 114
+												)
+											_: False
+									_: False
+							_: False
+					_: False
+			_: False
+	)
 
 
-pure func test_union_parameter_requirement_is_remapped_by_position() -> Bool:
+private pure func remapped_union_fields(
+	owner: Declaration.RecordId,
+	child: Model.TypeUse,
+	fields: List[Model.TypeUse],
+) -> Bool:
+	match substitute_type(child.value_type, { owner = Model.RecordDeclaration(owner), values = [Model.FloatType] }, child.span):
+		Err(_): False
+		Ok(replaced):
+			match Model.union_occurrence(replaced):
+				None: False
+				Some(occurrence):
+					match occurrence_fields(fields, occurrence):
+						Ok([field]): Model.same_type(field.value_type, Model.ListType(Model.FloatType))
+						_: False
+
+
+pure func test_union_list_element_is_remapped_by_parameter_position() -> Bool:
 	source: String =
 		|fixed union Values[A, B]:
 		|    Empty
@@ -236,10 +462,46 @@ pure func test_union_parameter_requirement_is_remapped_by_position() -> Bool:
 		|func main() -> Int:
 		|    0
 		|
-	rejects_list(source, 122, 134)
+	publishes(source, pure func(facts):
+		match facts.records:
+			[outer]:
+				match facts.unions:
+					[values]:
+						match facts.functions.get(0):
+							Some(function):
+								match values.type_parameters:
+									[first, second]:
+										match outer.type_parameters:
+											[parameter]:
+												match outer.fields:
+													[child]:
+														match values.variants:
+															[empty, items]:
+																match function.signature.parameters:
+																	[input]:
+																		match items.fields:
+																			[field]:
+																				(
+																					Model.parameter_position(first) == 0 and Model.parameter_position(second) == 1 and empty.fields.is_empty()
+																					and Model.same_type(field.value_type, Model.ListType(Model.ParameterType(second)))
+																					and Model.same_type(child.value_type.value_type, Model.AppliedUnionType(values.id, [Model.IntType, Model.ParameterType(parameter)]))
+																					and Model.same_type(input.value_type, Model.AppliedRecordType(outer.id, [Model.FloatType]))
+																					and remapped_union_fields(outer.id, child.value_type, items.fields)
+																					and input.span.start == 122 and input.span.end == 134
+																				)
+																			_: False
+																	_: False
+															_: False
+													_: False
+											_: False
+									_: False
+							_: False
+					_: False
+			_: False
+	)
 
 
-pure func test_phantom_outer_argument_must_still_be_a_valid_type() -> Bool:
+pure func test_phantom_outer_argument_retains_nested_int_list_type() -> Bool:
 	source: String =
 		|fixed record Values[T] { items: List[T] }
 		|fixed record Marker[T] { value: Int }
@@ -248,10 +510,25 @@ pure func test_phantom_outer_argument_must_still_be_a_valid_type() -> Bool:
 		|func main() -> Int:
 		|    0
 		|
-	rejects_list(source, 99, 118)
+	publishes(source, pure func(facts):
+		match facts.records:
+			[values, marker]:
+				match facts.functions.get(0):
+					Some(function):
+						match function.signature.parameters:
+							[input]:
+								(
+									list_record(values)
+									and Model.same_type(input.value_type, Model.AppliedRecordType(marker.id, [Model.AppliedRecordType(values.id, [Model.IntType])]))
+									and input.span.start == 99 and input.span.end == 118
+								)
+							_: False
+					_: False
+			_: False
+	)
 
 
-pure func test_list_type_argument_does_not_satisfy_string_requirement() -> Bool:
+pure func test_list_type_argument_keeps_nested_list_element() -> Bool:
 	source: String =
 		|fixed record Values[T] { items: List[T] }
 		|func unused(value: Values[List[String]]) -> Int:
@@ -259,10 +536,10 @@ pure func test_list_type_argument_does_not_satisfy_string_requirement() -> Bool:
 		|func main() -> Int:
 		|    0
 		|
-	rejects_list(source, 61, 81)
+	record_parameter(source, Model.ListType(Model.StringType), 61, 81)
 
 
-pure func test_void_argument_does_not_satisfy_string_requirement() -> Bool:
+pure func test_void_argument_is_a_complete_list_element() -> Bool:
 	source: String =
 		|fixed record Values[T] { items: List[T] }
 		|func unused(value: Values[Void]) -> Int:
@@ -270,10 +547,10 @@ pure func test_void_argument_does_not_satisfy_string_requirement() -> Bool:
 		|func main() -> Int:
 		|    0
 		|
-	rejects_list(source, 61, 73)
+	record_parameter(source, Model.VoidType, 61, 73)
 
 
-pure func test_inferred_call_result_rejects_at_the_instantiating_call() -> Bool:
+pure func test_inferred_call_result_keeps_int_list_substitution() -> Bool:
 	source: String =
 		|fixed union Values[T]:
 		|    Empty
@@ -284,10 +561,24 @@ pure func test_inferred_call_result_rejects_at_the_instantiating_call() -> Bool:
 		|    saved = make(1)
 		|    0
 		|
-	rejects_list(source, 136, 140)
+	publishes(source, pure func(facts):
+		match facts.unions:
+			[values]:
+				match facts.functions:
+					[make, caller]:
+						match caller.statements:
+							[Model.InitializeBinding(_, value)]:
+								(
+									list_union(values) and integer_call(value, make.id, Model.AppliedUnionType(values.id, [Model.IntType]))
+									and value.base_span.start == 136 and value.base_span.end == 143
+								)
+							_: False
+					_: False
+			_: False
+	)
 
 
-pure func test_forwarded_call_result_rejects_at_the_concrete_call() -> Bool:
+pure func test_forwarded_call_result_keeps_int_list_substitution() -> Bool:
 	source: String =
 		|fixed union Values[T]:
 		|    Empty
@@ -300,10 +591,24 @@ pure func test_forwarded_call_result_rejects_at_the_concrete_call() -> Bool:
 		|    saved = forward(1)
 		|    0
 		|
-	rejects_list(source, 197, 204)
+	publishes(source, pure func(facts):
+		match facts.unions:
+			[values]:
+				match facts.functions:
+					[_, forward, caller]:
+						match caller.statements:
+							[Model.InitializeBinding(_, value)]:
+								(
+									list_union(values) and integer_call(value, forward.id, Model.AppliedUnionType(values.id, [Model.IntType]))
+									and value.base_span.start == 197 and value.base_span.end == 207
+								)
+							_: False
+					_: False
+			_: False
+	)
 
 
-pure func test_invalid_generic_call_in_unused_body_is_checked() -> Bool:
+pure func test_generic_call_in_unused_body_keeps_int_list_substitution() -> Bool:
 	source: String =
 		|fixed union Values[T]:
 		|    Empty
@@ -316,10 +621,24 @@ pure func test_invalid_generic_call_in_unused_body_is_checked() -> Bool:
 		|func main() -> Int:
 		|    0
 		|
-	rejects_list(source, 138, 142)
+	publishes(source, pure func(facts):
+		match facts.unions:
+			[values]:
+				match facts.functions:
+					[make, unused, _]:
+						match unused.statements:
+							[Model.InitializeBinding(_, value)]:
+								(
+									list_union(values) and integer_call(value, make.id, Model.AppliedUnionType(values.id, [Model.IntType]))
+									and value.base_span.start == 138 and value.base_span.end == 145
+								)
+							_: False
+					_: False
+			_: False
+	)
 
 
-pure func test_inferred_call_rejects_invalid_nested_phantom_argument() -> Bool:
+pure func test_inferred_call_keeps_nested_phantom_list_argument() -> Bool:
 	source: String =
 		|fixed union Values[T]:
 		|    Empty
@@ -331,10 +650,27 @@ pure func test_inferred_call_rejects_invalid_nested_phantom_argument() -> Bool:
 		|    saved = make(1)
 		|    0
 		|
-	rejects_list(source, 190, 194)
+	publishes(source, pure func(facts):
+		match facts.records:
+			[marker]:
+				match facts.unions:
+					[values]:
+						match facts.functions:
+							[make, caller]:
+								match caller.statements:
+									[Model.InitializeBinding(_, value)]:
+										(
+											list_union(values) and integer_call(value, make.id, Model.AppliedRecordType(marker.id, [Model.AppliedUnionType(values.id, [Model.IntType])]))
+											and value.base_span.start == 190 and value.base_span.end == 197
+										)
+									_: False
+							_: False
+					_: False
+			_: False
+	)
 
 
-pure func test_invalid_annotation_precedes_unknown_body_value() -> Bool:
+pure func test_valid_int_list_annotation_still_checks_unknown_body_value() -> Bool:
 	source: String =
 		|fixed record Values[T] { items: List[T] }
 		|func unused(value: Values[Int]) -> Int:
@@ -342,7 +678,7 @@ pure func test_invalid_annotation_precedes_unknown_body_value() -> Bool:
 		|func main() -> Int:
 		|    0
 		|
-	rejects_list(source, 61, 72)
+	unknown_value(source, 86, 93)
 
 
 pure func test_unused_string_record_instance_is_accepted() -> Bool:
@@ -370,7 +706,7 @@ pure func test_string_union_instance_includes_unselected_variant_fields() -> Boo
 	accepts(source)
 
 
-pure func test_symbolic_record_requirement_remains_valid() -> Bool:
+pure func test_symbolic_record_list_element_remains_valid() -> Bool:
 	source: String =
 		|fixed record Values[T] { items: List[T] }
 		|pure func identity[T](value: Values[T]) -> Values[T]:
@@ -381,7 +717,7 @@ pure func test_symbolic_record_requirement_remains_valid() -> Bool:
 	accepts(source)
 
 
-pure func test_symbolic_union_requirement_remains_valid() -> Bool:
+pure func test_symbolic_union_list_element_remains_valid() -> Bool:
 	source: String =
 		|fixed union Values[T]:
 		|    Empty
@@ -472,7 +808,7 @@ pure func test_generic_string_forwarding_keeps_terminal_caller_parameters() -> B
 	accepts(source)
 
 
-pure func test_two_string_requirements_are_both_satisfied() -> Bool:
+pure func test_two_string_list_fields_are_accepted() -> Bool:
 	source: String =
 		|fixed record Both[A, B] { first: List[A], second: List[B] }
 		|func unused(value: Both[String, String]) -> Int:
@@ -483,7 +819,7 @@ pure func test_two_string_requirements_are_both_satisfied() -> Bool:
 	accepts(source)
 
 
-pure func test_duplicate_child_requirements_preserve_one_parameter_fact() -> Bool:
+pure func test_repeated_nominal_children_preserve_one_parameter_fact() -> Bool:
 	source: String =
 		|fixed record Values[T] { items: List[T] }
 		|fixed record Pair[T] { left: Values[T], right: Values[T] }
@@ -500,39 +836,39 @@ pure func test_duplicate_child_requirements_preserve_one_parameter_fact() -> Boo
 
 
 tests: TestSuite = {
-	description = "Blorp 2 concrete aggregate type admission",
+	description = "Blorp 2 complete aggregate element types",
 	tests = [
-		("forward declaration summary before bodies", test_forward_declaration_summary_is_available_before_body_checking),
-		("second List requirement is enforced", test_second_list_requirement_cannot_be_overlooked),
-		("finite cycle rejects before concrete admission", test_finite_cycle_rejection_precedes_concrete_type_admission),
-		("first field error precedes shallower later field", test_nested_first_field_error_precedes_shallower_later_field),
-		("unknown later child precedes nominal freeze admission", test_unknown_later_child_precedes_freeze_only_nominal_admission),
-		("unused record parameter rejects Int List requirement", test_unused_record_parameter_rejects_concrete_list_requirement),
-		("unused union parameter rejects Int List requirement", test_unused_union_parameter_rejects_concrete_list_requirement),
-		("unused return rejects Int List requirement", test_unused_return_annotation_rejects_concrete_list_requirement),
-		("record field rejects invalid child instance", test_record_field_rejects_concrete_child_requirement),
-		("union field rejects invalid child instance", test_union_field_rejects_concrete_child_requirement),
-		("nested record requirement reaches outer annotation", test_nested_record_requirement_reaches_written_outer_application),
-		("union requirement remaps parameter position", test_union_parameter_requirement_is_remapped_by_position),
-		("phantom nested argument still requires valid type", test_phantom_outer_argument_must_still_be_a_valid_type),
-		("List type argument cannot satisfy String requirement", test_list_type_argument_does_not_satisfy_string_requirement),
-		("Void cannot satisfy String requirement", test_void_argument_does_not_satisfy_string_requirement),
-		("inferred result rejects at call", test_inferred_call_result_rejects_at_the_instantiating_call),
-		("forwarded result rejects at concrete call", test_forwarded_call_result_rejects_at_the_concrete_call),
-		("unused body still checks generic calls", test_invalid_generic_call_in_unused_body_is_checked),
-		("inferred result checks nested phantom argument", test_inferred_call_rejects_invalid_nested_phantom_argument),
-		("annotation error precedes unknown body value", test_invalid_annotation_precedes_unknown_body_value),
+		("forward declarations publish complete fields before bodies", test_forward_declarations_publish_complete_fields_before_body_checking),
+		("two List fields keep distinct element parameters", test_two_list_fields_keep_distinct_element_parameters),
+		("finite cycle still rejects before bodies", test_finite_cycle_rejection_still_precedes_body_checking),
+		("nested and later fields retain complete arguments", test_nested_and_later_list_fields_keep_complete_arguments),
+		("unknown later child precedes deferred nominal inference", test_unknown_later_child_precedes_deferred_nominal_inference),
+		("unused record parameter retains Int List application", test_unused_record_parameter_keeps_int_list_application),
+		("unused union parameter retains Int List application", test_unused_union_parameter_keeps_int_list_application),
+		("unused return retains Int List application", test_unused_return_keeps_int_list_application),
+		("record field retains concrete Int List child", test_record_field_keeps_concrete_int_list_child),
+		("union field retains concrete Int List child", test_union_field_keeps_concrete_int_list_child),
+		("nested record application preserves parameter identity", test_nested_record_application_keeps_list_parameter_identity),
+		("union List element remaps by parameter position", test_union_list_element_is_remapped_by_parameter_position),
+		("phantom argument retains nested Int List type", test_phantom_outer_argument_retains_nested_int_list_type),
+		("List type argument retains nested element", test_list_type_argument_keeps_nested_list_element),
+		("Void is a complete List element", test_void_argument_is_a_complete_list_element),
+		("inferred call retains Int List substitution", test_inferred_call_result_keeps_int_list_substitution),
+		("forwarded call retains Int List substitution", test_forwarded_call_result_keeps_int_list_substitution),
+		("unused body retains generic call substitution", test_generic_call_in_unused_body_keeps_int_list_substitution),
+		("inferred call retains nested phantom List argument", test_inferred_call_keeps_nested_phantom_list_argument),
+		("valid Int List annotation still checks unknown body", test_valid_int_list_annotation_still_checks_unknown_body_value),
 		("unused String record accepted", test_unused_string_record_instance_is_accepted),
 		("String union checks every variant field", test_string_union_instance_includes_unselected_variant_fields),
-		("symbolic record requirement accepted", test_symbolic_record_requirement_remains_valid),
-		("symbolic union requirement accepted", test_symbolic_union_requirement_remains_valid),
+		("symbolic record List element accepted", test_symbolic_record_list_element_remains_valid),
+		("symbolic union List element accepted", test_symbolic_union_list_element_remains_valid),
 		("record Void payload accepted", test_record_void_payload_is_valid),
 		("pure union containing Void accepted", test_pure_function_can_return_union_containing_void),
 		("phantom Int remains unconstrained", test_phantom_int_parameter_is_unconstrained),
 		("phantom Void remains unconstrained", test_phantom_void_parameter_is_unconstrained),
 		("second parameter accepts String after remap", test_remapped_second_parameter_accepts_string),
 		("generic String forwarding accepted", test_generic_string_forwarding_keeps_terminal_caller_parameters),
-		("two String requirements satisfied", test_two_string_requirements_are_both_satisfied),
-		("duplicate child requirements remain valid", test_duplicate_child_requirements_preserve_one_parameter_fact),
+		("two String List fields accepted", test_two_string_list_fields_are_accepted),
+		("repeated nominal children retain one parameter fact", test_repeated_nominal_children_preserve_one_parameter_fact),
 	]
 }

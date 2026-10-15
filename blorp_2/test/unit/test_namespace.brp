@@ -4,17 +4,17 @@ import:
 	../../src/check_signatures: validate_signatures
 	../../src/check_types: validate_declarations, validate_finite_declarations
 	../../src/builtins: PrimitiveType(BuiltinInt, BuiltinFloat, BuiltinString, BuiltinVoid)
-	../../src/names: find_name
+	../../src/names: find_name, same_name
 	../../src/namespace:
 		FunctionOrigin(ImportedFunction),
 		ImportProblem(RepeatedModuleImport, MissingImportedFunction),
+		NamespaceProblem(ImportSelectionFailure, ImportedFunctionNameConflict, DuplicateFunctionName),
 		TypeCandidate(PrimitiveCandidate, ListCandidate, UnionCandidate, RecordCandidate),
 		build_namespace,
-		function_candidates,
-		import_problems,
-		local_function_candidates,
+		function_candidate,
+		local_function,
 		same_type_candidate,
-		type_candidates,
+		type_candidate,
 		variant_candidates,
 	../../src/assemble: parsed_contents
 	../../src/source: module_id, root_module_id, same_module, same_source, module_source
@@ -72,30 +72,31 @@ pure func test_selected_functions_preserve_identity_and_import_origin() -> Bool:
 			False
 		Ok(program):
 			parsed = parsed_contents(program)
-			namespace = build_namespace(program)
-			match (find_name(parsed.names, "answer"), find_name(parsed.names, "hidden"), module_id(1)):
-				(Some(answer), Some(hidden), Some(dependency)):
-					match (function_candidates(namespace, root_module_id(), answer), local_function_candidates(namespace, dependency, answer)):
-						([imported], [local]):
-							match imported.origin:
-								ImportedFunction(span):
-									(
-										function_number(imported.function) == 1 and function_number(local) == 1
-											and span.start == 22 and span.end == 28
-											and same_source(span.source, module_source(root_module_id()))
-											and local_function_candidates(namespace, root_module_id(), answer).length() == 0
-											and function_candidates(namespace, root_module_id(), hidden).length() == 0
-											and import_problems(namespace).length() == 0
-									)
+			match build_namespace(program):
+				Err(_): False
+				Ok(namespace):
+					match (find_name(parsed.names, "answer"), find_name(parsed.names, "hidden"), module_id(1)):
+						(Some(answer), Some(hidden), Some(dependency)):
+							match (function_candidate(namespace, root_module_id(), answer), local_function(namespace, dependency, answer)):
+								(Some(imported), Some(local)):
+									match imported.origin:
+										ImportedFunction(span):
+											(
+												function_number(imported.function) == 1 and function_number(local) == 1
+													and span.start == 22 and span.end == 28
+													and same_source(span.source, module_source(root_module_id()))
+													and local_function(namespace, root_module_id(), answer).is_none()
+													and function_candidate(namespace, root_module_id(), hidden).is_none()
+											)
+										_:
+											False
 								_:
 									False
 						_:
 							False
-				_:
-					False
 
 
-pure func test_same_named_candidates_from_different_owners_remain_complete() -> Bool:
+pure func test_same_named_imports_from_different_owners_fail_publication() -> Bool:
 	main: String =
 		|import:
 		|    ./left: answer
@@ -105,21 +106,23 @@ pure func test_same_named_candidates_from_different_owners_remain_complete() -> 
 		|
 	helper = "pure func answer() -> Int:\n    42\n"
 	match parse_modules([{ source = main, targets = [1, 2] }, { source = helper, targets = [] }, { source = helper, targets = [] }]):
-		Err(_):
-			False
+		Err(_): False
 		Ok(program):
 			parsed = parsed_contents(program)
-			namespace = build_namespace(program)
-			match find_name(parsed.names, "answer"):
-				None:
-					False
-				Some(answer):
-					match function_candidates(namespace, root_module_id(), answer):
-						[left, right]:
-							function_number(left.function) == 1 and function_number(right.function) == 2
-						_:
-							False
-
+			match (build_namespace(program), inventory_functions(parsed.declarations), find_name(parsed.names, "answer")):
+				(Err(failure), [_, left, right], Some(answer)):
+					match failure.first:
+						ImportedFunctionNameConflict(written, previous):
+							(
+								failure.remaining.is_empty() and same_name(written.id, answer)
+								and function_number(left.id) == 1 and function_number(right.id) == 2
+								and written.span.start == 40 and written.span.end == 46
+								and previous.start == 20 and previous.end == 26
+								and same_source(written.span.source, module_source(root_module_id()))
+								and same_source(previous.source, written.span.source)
+							)
+						_: False
+				_: False
 
 pure func test_types_and_variants_stay_local_to_the_defining_module() -> Bool:
 	main = "import:\n    ./helper: make\nfunc main() -> Int:\n    0\n"
@@ -134,44 +137,57 @@ pure func test_types_and_variants_stay_local_to_the_defining_module() -> Bool:
 			False
 		Ok(program):
 			parsed = parsed_contents(program)
-			namespace = build_namespace(program)
-			match (find_name(parsed.names, "Choice"), find_name(parsed.names, "One"), module_id(1)):
-				(Some(choice), Some(one), Some(dependency)):
-					match (type_candidates(namespace, dependency, choice), variant_candidates(namespace, dependency, one)):
-						([UnionCandidate(owner)], [variant]):
-							(
-								union_number(owner) == 0 and union_number(variant_owner(variant)) == 0
-									and variant_number(variant) == 0
-									and type_candidates(namespace, root_module_id(), choice).length() == 0
-									and variant_candidates(namespace, root_module_id(), one).length() == 0
-							)
+			match build_namespace(program):
+				Err(_): False
+				Ok(namespace):
+					match (find_name(parsed.names, "Choice"), find_name(parsed.names, "One"), module_id(1)):
+						(Some(choice), Some(one), Some(dependency)):
+							match (type_candidate(namespace, dependency, choice), variant_candidates(namespace, dependency, one)):
+								(Some(UnionCandidate(owner)), [variant]):
+									(
+										union_number(owner) == 0 and union_number(variant_owner(variant)) == 0
+											and variant_number(variant) == 0
+											and type_candidate(namespace, root_module_id(), choice).is_none()
+											and variant_candidates(namespace, root_module_id(), one).length() == 0
+									)
+								_:
+									False
 						_:
 							False
-				_:
-					False
 
 
 pure func test_imported_functions_are_not_reexported() -> Bool:
 	main = "import:\n    ./facade: answer\nfunc main() -> Int:\n    0\n"
 	facade = "import:\n    ./helper: answer\n"
 	helper = "pure func answer() -> Int:\n    42\n"
-	match parse_modules([{ source = main, targets = [1] }, { source = facade, targets = [2] }, { source = helper, targets = [] }]):
-		Err(_):
-			False
+	-- First prove the facade's own successful scope, then reject re-export.
+	facade_scope = match parse_modules([
+		{ source = "func main() -> Int:\n    0\n", targets = [] },
+		{ source = facade, targets = [2] }, { source = helper, targets = [] },
+	]):
+		Err(_): False
 		Ok(program):
-			parsed = parsed_contents(program)
-			namespace = build_namespace(program)
-			match (find_name(parsed.names, "answer"), module_id(1), import_problems(namespace)):
-				(Some(answer), Some(facade_id), [MissingImportedFunction(target, written)]):
-					(
-						function_candidates(namespace, root_module_id(), answer).length() == 0
-							and function_candidates(namespace, facade_id, answer).length() == 1
-							and same_module(target, facade_id)
-							and same_source(written.span.source, module_source(root_module_id()))
-					)
-				_:
-					False
-
+			match (build_namespace(program), find_name(parsed_contents(program).names, "answer"), module_id(1)):
+				(Ok(namespace), Some(answer), Some(facade_id)):
+					match function_candidate(namespace, facade_id, answer):
+						Some(candidate):
+							function_number(candidate.function) == 1 and function_candidate(namespace, root_module_id(), answer).is_none()
+						None: False
+				_: False
+	match parse_modules([{ source = main, targets = [1] }, { source = facade, targets = [2] }, { source = helper, targets = [] }]):
+		Err(_): False
+		Ok(program):
+			match (build_namespace(program), module_id(1)):
+				(Err(failure), Some(facade_id)):
+					match failure.first:
+						ImportSelectionFailure(MissingImportedFunction(target, written)):
+							(
+								facade_scope and failure.remaining.is_empty() and same_module(target, facade_id)
+								and written.span.start == 22 and written.span.end == 28
+								and same_source(written.span.source, module_source(root_module_id()))
+							)
+						_: False
+				_: False
 
 pure func test_import_problems_preserve_repeated_missing_and_type_facts() -> Bool:
 	main: String =
@@ -188,39 +204,41 @@ pure func test_import_problems_preserve_repeated_missing_and_type_facts() -> Boo
 		|    42
 		|
 	match parse_modules([{ source = main, targets = [1, 1] }, { source = helper, targets = [] }]):
-		Err(_):
-			False
+		Err(_): False
 		Ok(program):
-			namespace = build_namespace(program)
-			match import_problems(namespace):
-				[MissingImportedFunction(first, _), RepeatedModuleImport(second, previous, current)]:
-					(
-						same_module(first, second)
-							and previous.start == 12 and current.start == 42
-					)
-				_:
-					False
+			match build_namespace(program):
+				Err(failure):
+					match (failure.first, failure.remaining):
+						(ImportSelectionFailure(MissingImportedFunction(first, _)), [ImportSelectionFailure(RepeatedModuleImport(second, previous, current))]):
+							same_module(first, second) and previous.start == 12 and current.start == 42
+						_: False
+				Ok(_): False
 
-
-pure func test_duplicate_local_declarations_remain_multiple_candidates() -> Bool:
+pure func test_duplicate_target_functions_fail_publication_before_local_duplicates() -> Bool:
 	main = "import:\n    ./helper: answer\nfunc main() -> Int:\n    0\n"
 	helper = "pure func answer() -> Int:\n    42\npure func answer() -> Int:\n    7\n"
 	match parse_modules([{ source = main, targets = [1] }, { source = helper, targets = [] }]):
-		Err(_):
-			False
+		Err(_): False
 		Ok(program):
 			parsed = parsed_contents(program)
-			namespace = build_namespace(program)
-			match find_name(parsed.names, "answer"):
-				None:
-					False
-				Some(answer):
-					match function_candidates(namespace, root_module_id(), answer):
-						[first, second]:
-							function_number(first.function) == 1 and function_number(second.function) == 2
-						_:
-							False
-
+			match (build_namespace(program), inventory_functions(parsed.declarations)):
+				(Err(failure), [_, first, second]):
+					match (failure.first, failure.remaining):
+						(ImportedFunctionNameConflict(written, previous), [DuplicateFunctionName(duplicate, first_site)]):
+							(
+								function_number(first.id) == 1 and function_number(second.id) == 2
+								and same_name(written.id, first.declaration.function_name.id)
+								and same_name(written.id, second.declaration.function_name.id)
+								and written.span.start == 22 and written.span.end == 28
+								and previous.start == written.span.start and previous.end == written.span.end
+								and same_source(previous.source, written.span.source)
+								and duplicate.span.start == second.declaration.function_name.span.start
+								and first_site.start == first.declaration.function_name.span.start
+								and same_source(duplicate.span.source, second.declaration.function_name.span.source)
+								and same_source(first_site.source, first.declaration.function_name.span.source)
+							)
+						_: False
+				_: False
 
 pure func test_issued_ids_survive_signatures_bodies_and_nominal_checking() -> Bool:
 	main: String =
@@ -242,24 +260,26 @@ pure func test_issued_ids_survive_signatures_bodies_and_nominal_checking() -> Bo
 		Ok(program):
 			parsed = parsed_contents(program)
 			inventory = parsed.declarations
-			namespace = build_namespace(program)
-			match validate_declarations(parsed, namespace):
+			match build_namespace(program):
 				Err(_): False
-				Ok(declarations):
-					match validate_finite_declarations(declarations):
+				Ok(namespace):
+					match validate_declarations(parsed, namespace):
 						Err(_): False
-						Ok(admission):
-							match (validate_signatures(parsed, namespace, declarations.unions, admission), check(program)):
-								(Ok(signatures), Ok(checked)):
-									accepted = checked_functions(checked)
-									(
-										inventory_functions(inventory).map(pure func(row): function_number(row.id)) == signatures.functions.map(pure func(row): function_number(row.id))
-										and inventory_functions(inventory).map(pure func(row): function_number(row.id)) == accepted.functions.map(pure func(row): function_number(row.id))
-										and inventory_records(inventory).map(pure func(row): record_number(row.id)) == accepted.records.map(pure func(row): record_number(row.id))
-										and inventory_unions(inventory).map(pure func(row): union_number(row.id)) == accepted.unions.map(pure func(row): union_number(row.id))
-										and inventory_unions(inventory).map(pure func(row): row.variants.map(pure func(variant): variant_number(variant.id))) == accepted.unions.map(pure func(row): row.variants.map(pure func(variant): variant_number(variant.id)))
-									)
-								_: False
+						Ok(declarations):
+							match validate_finite_declarations(declarations):
+								Err(_): False
+								Ok(_):
+									match (validate_signatures(parsed, namespace, declarations.unions), check(program)):
+										(Ok(signatures), Ok(checked)):
+											accepted = checked_functions(checked)
+											(
+												inventory_functions(inventory).map(pure func(row): function_number(row.id)) == signatures.functions.map(pure func(row): function_number(row.id))
+												and inventory_functions(inventory).map(pure func(row): function_number(row.id)) == accepted.functions.map(pure func(row): function_number(row.id))
+												and inventory_records(inventory).map(pure func(row): record_number(row.id)) == accepted.records.map(pure func(row): record_number(row.id))
+												and inventory_unions(inventory).map(pure func(row): union_number(row.id)) == accepted.unions.map(pure func(row): union_number(row.id))
+												and inventory_unions(inventory).map(pure func(row): row.variants.map(pure func(variant): variant_number(variant.id))) == accepted.unions.map(pure func(row): row.variants.map(pure func(variant): variant_number(variant.id)))
+											)
+										_: False
 
 
 tests: TestSuite = {
@@ -268,10 +288,10 @@ tests: TestSuite = {
 		("candidate equality distinguishes every kind and nominal owner", test_candidate_equality_distinguishes_every_kind_and_nominal_owner),
 		("issued IDs survive signatures bodies and nominal checking", test_issued_ids_survive_signatures_bodies_and_nominal_checking),
 		("selected functions preserve identity and import origin", test_selected_functions_preserve_identity_and_import_origin),
-		("same named candidates from different owners remain complete", test_same_named_candidates_from_different_owners_remain_complete),
+		("same named imports from different owners fail publication", test_same_named_imports_from_different_owners_fail_publication),
 		("types and variants stay local to the defining module", test_types_and_variants_stay_local_to_the_defining_module),
 		("imported functions are not reexported", test_imported_functions_are_not_reexported),
 		("import problems preserve repeated missing and type facts", test_import_problems_preserve_repeated_missing_and_type_facts),
-		("duplicate local declarations remain multiple candidates", test_duplicate_local_declarations_remain_multiple_candidates),
+		("duplicate target functions fail publication before local duplicates", test_duplicate_target_functions_fail_publication_before_local_duplicates),
 	]
 }

@@ -1,6 +1,6 @@
 # Blorp 2 roadmap
 
-Updated 2026-10-13. This is the single plan for aggregate composition, ownership,
+Updated 2026-10-14. This is the single plan for aggregate composition, ownership,
 generics and recursion. It replaces MEMORY_PLAN, MANAGED_RECORDS_PLAN,
 GENERICS_PLAN and RECURSION_PLAN; their completed evidence remains in Git and
 [benchmarks/results](../benchmarks/results/). Read both [AGENTS.md](AGENTS.md)
@@ -68,11 +68,14 @@ updates replace per-read copies, with one possible initial terminal snapshot
 copy. Two independent experts approve 1,985 sanitized checks, 321 e2e cases and
 quiet matched costs with identical target C; see the
 [builder report](../benchmarks/results/blorp_2_ownership_builders_2026-10-13.md).
-Lowering definition accumulation remains a bounded preparatory task before
-general List construction. This round stops at the validated milestone for
-integration into current `blorp-2`; it does not release the later features.
-No whole-compiler linearity is claimed. Still absent: general
-List construction and updates, recursive data, and generic/managed tail loops.
+Block-local lowering preparation is now accepted, including fresh main-rebase
+validation. Recursive expression-local copying remains documented debt. The
+earlier integration round stopped at its validated milestone; the next approved
+implementation sequence is described below.
+No whole-compiler linearity is claimed. General List construction, length and
+owned lookup are accepted after the final full gate and independent evidence
+reviews. Still absent: record/List updates, recursive data, and
+generic/managed tail loops.
 Locally owned match-prefix values are implemented for ordinary terminating
 matches, with independent per-arm verification. Matched cost checks, two expert
 reviews and combined integration pass; see the
@@ -86,15 +89,16 @@ with independent component and integration reviews. Declaration IDs are issued
 once in assembly; ownership classification belongs to concrete specialization;
 known concrete nominal requirements reject during checking. The
 [authority repair report](../benchmarks/results/blorp_2_authority_fixes_2026-10-13.md)
-records the matched costs and remaining limits. Validating namespace publication
-and removing downstream visibility rechecks remains a separate follow-up;
-declaration inventory does not establish that stronger namespace guarantee.
+records the matched costs and remaining limits. Validated namespace publication
+now rejects incomplete scopes before checking and removes downstream visibility
+rechecks, with separately reviewed producer/provenance tests and mutation oracles;
+see the [namespace report](../benchmarks/results/blorp_2_namespace_publication_2026-10-14.md).
 
 | Order | Working increment | Dependency and verdict |
 | --- | --- | --- |
 | 1 | [Mixed finite records and safe field projections](#first-increment-mixed-finite-records) | Accepted: independent reviews, per-object runtime oracles, matched costs and combined strict/native gates pass. |
-| 2 | [Generic records, direct full union payload types, then multiple payload fields](#finite-aggregate-frontend-increments) | All three increments and use-vector preparation accepted with independent reviews, strict/native gates, mutation oracles and matched costs. Lowering preparation remains before Lists. |
-| 3 | [General List[T] construction, length and owned lookup](#general-lists-and-functional-updates) | Needs complete element layouts; argv behavior stays supported. |
+| 2 | [Generic records, direct full union payload types, then multiple payload fields](#finite-aggregate-frontend-increments) | All three increments, use-vector and block-lowering preparations accepted with independent reviews, strict/native gates, mutation oracles and matched costs. |
+| 3 | [General List[T] construction, length and owned lookup](#general-lists-and-functional-updates) | Accepted: two expert reviews, 2,209 strict checks, 331 e2e cases, mutation oracles and unchanged matched cost ceilings. |
 | 4 | [Functional record/List updates](#general-lists-and-functional-updates) | Start with fresh results and borrowed-input/owned-result contracts; old aliases stay unchanged. |
 | 5 | [Unary recursive union, then mutual/regular-generic and branching mixed data](#recursive-data) | Each shape needs finite representation, acyclic values and bounded-stack destruction. |
 | 6 | [Other collections and broader control flow](#broader-control-flow-and-later-scope) | Set/Dict key semantics, typed joins/edges and managed loops enter through separate examples. |
@@ -112,6 +116,89 @@ exact acceptance criteria and a bounded handoff under
 and remove its replaced representation in that slice. Do not introduce a cache,
 registry, extra pipeline or test driver for hypothetical future needs.
 The agreed excluded features and numeric-width limits remain in AGENTS.md.
+
+### Current implementation sequence
+
+The approved next round started at `e59346426`, incorporating main `4dcb0d20a`.
+Its historical baseline passed 2,090 sanitized callbacks in 137 suites and 325
+e2e cases. Namespace and block-lowering preparation are now rebased onto main
+`d411c7bb0`: fresh required-instruction gates pass 2,120 unit/runtime/grammar
+callbacks in 138 suites and 325 normal-main e2e cases. Incoming main changes and
+all reviewed source/test hashes are preserved; both preparations pass the
+unchanged matched cost ceiling. See the
+[rebase receipt](../benchmarks/results/blorp_2_main_rebase_2026-10-14.md).
+Each slice is independently reviewed and accepted before a dependent slice uses
+it. Namespace and lowering preparation have disjoint frontend/Core ownership;
+implementation and design may proceed in parallel, but compiled validation and
+measurements remain serialized. The coordinator owns integration and this plan.
+
+1. **Validated namespace publication.** Complete authority-repair part B:
+   `build_namespace` publishes either complete valid scope facts or a nonempty
+   typed failure. Expand implicit prelude exposures before validating visibility.
+   Remove the replaced checker uniqueness/direct-visibility authorities in the
+   same slice. Keep accepted signatures, receiver compatibility and expected-type
+   constructor selection in checking; distinct union owners may share a spelling.
+   Accepted with fresh current-main validation; see the
+   [namespace publication report](../benchmarks/results/blorp_2_namespace_publication_2026-10-14.md).
+2. **Bounded lowering preparation.** Keep the growing block definition vector,
+   binding map and cursor in their local block owner. Lower each expression into
+   its own completed chunk and merge it once at the block boundary, preserving
+   exact evaluation order, ValueIds, binding versions, branch isolation and public
+   lowered IR. Keep expression traversal unchanged in this slice: its existing
+   wide/deep construction costs remain explicit follow-up work. The measured
+   expression-task prototypes increased work and source complexity and were
+   rejected. Prove unique block accumulation in generated C and measure statement
+   width separately from expression width/depth. No general IR rewrite or
+   speculative traversal framework is authorized.
+   Accepted with fresh current-main validation; see the
+   [block lowering report](../benchmarks/results/blorp_2_block_lowering_2026-10-14.md).
+3. **General List construction and access.** Start with the standard library's
+   `repeat[T](elem: T, n: Int) -> List[T]`, plus generic length and owned
+   `Option[T]` lookup. A list containing the same mixed record twice exercises
+   per-occurrence ownership; returning an element and then its String field
+   exercises survival after parent retirement. The intrinsic signatures and
+   accepted element facts need an explicit reviewed contract: this is broader
+   than the previous nongeneric String-only builtins. Nonpositive counts produce
+   empty lists. Add no list-literal syntax or update API to this first example.
+   Implemented with typed concrete slots, per-occurrence acquisition/destruction,
+   granular phase tests and 24 native runtime cases. The final required-instruction
+   gate passes 2,209 unit/runtime/grammar callbacks and 331 e2e cases. Final source
+   and evidence reviews approve; this increment is accepted. See the
+   [general List report](../benchmarks/results/blorp_2_general_lists_2026-10-14.md).
+4. **Fresh-result updates.** Add record update, then List append, replacement
+   and removal through separate fixtures. Borrow inputs, acquire each surviving
+   or replacement stored occurrence, allocate a new result and preserve every
+   old alias. Keep unique-root mutation, COW/reuse and consuming-ABI inference
+   deferred.
+   Record updates are implemented with complete typed field partitions and
+   existing ownership/runtime operations. The required gate passes 2,282
+   unit/runtime/grammar checks and 334 e2e cases. See the
+   [record update report](../benchmarks/results/blorp_2_record_updates_2026-10-14.md).
+   List append, replacement and removal remain separate following increments.
+5. **Recursive data.** Begin with the existing unary Nat example and iterative
+   final release; then separately admit mutual, regular-generic and branching
+   mixed shapes. Reserve instance identities locally and publish only complete
+   layouts. Constructors accept completed children, so values remain finite
+   DAGs. Every newly admitted release graph must have bounded C-stack use;
+   mutually recursive release helpers alone do not meet that requirement.
+
+For each preparatory refactor, freeze a matched same-toolchain baseline and
+require identical existing target C and at most +3% allocations/minimum retired
+instructions per frozen input. Namespace part B targets a production reduction;
+lowering preparation stops for design review above +50 production lines or a
+wider algorithmic change. Feature increments may change emitted C and increase
+costs: set their numerical fixture limits before implementation, measure scaling
+on 16/32/64/128-size examples, and report new-feature work separately from the
+shared existing corpus. Until self-compilation works, these are owned-input CLI
+proxies, not self-compile evidence. Existing fixture ceilings stay unchanged
+unless a measured adjustment is reviewed explicitly.
+
+Every affected phase gets granular typed-input/output tests. Insertion and raw
+verification have independent tests; runtime-helper tests observe individual
+objects and stored occurrences; mutations prove the protected failure is caught.
+Real-main e2e, sanitizers and balanced totals supplement those oracles. A worker
+reports an ambiguous boundary, unexpected cost or scope expansion before adding
+a mechanism. The next slice starts only after independent code and test review.
 
 ## Identity and immutable facts
 
@@ -403,6 +490,119 @@ an unmanaged element or gives an owning element an independent obligation;
 absent lookup owns no child. Preserve argv
 List[String] and normal entrypoint conventions.
 
+### First List contract and acceptance
+
+Start with `repeat`, generic `length` and owned `get`, without adding expression
+syntax or update APIs. The first real-main fixture uses pure helpers:
+
+```blorp
+import:
+    list: repeat, length, get
+    int: subtract, to_string
+    io: print
+
+fixed record Entry { number: Int, text: String }
+
+pure func make_entry(text: String, number: Int) -> Entry:
+    { number = number, text = text }
+
+pure func selected_entry() -> Option[Entry]:
+    values = repeat(make_entry("kept", 7), 2)
+    values.get(values.length().subtract(1))
+
+pure func number(value: Option[Entry]) -> Int:
+    match value:
+        Some(entry): entry.number
+        None: -1
+
+pure func text(value: Option[Entry]) -> String:
+    match value:
+        Some(entry): entry.text
+        None: "missing"
+
+func main() -> Void:
+    selected = selected_entry()
+    print(to_string(number(selected)))
+    print(text(selected))
+```
+
+Expected stdout is `7\nkept\n`, exit 0 and empty stderr. A separate fixture
+uses a String produced by `Int.to_string`, alongside literal-byte Strings.
+Both have allocated roots today; static literal bytes are copied into a root.
+Normal-main output alone cannot prove destruction. Phase tests prove parent
+retirement before escaped child use, while direct helper tests independently
+observe actual allocation/free.
+
+The sole phase-neutral runtime contract gains an element parameter. Accepted
+List operations carry E: `ListRepeat(E)`, `ListLength(E)` and
+`ListGet(E, roles)`. Checking extracts E from the resolved header and validates
+all parameter/result positions against that contract before publishing it.
+Valid concrete and generic wrappers, including structured E such as `List[T]`
+or `Pair[T,U]`, use ordinary declaration-owned parameters and substitution.
+Some/None roles are compile-time constructor identities from the declared
+result union, not callbacks or runtime arguments. Other runtime intrinsics
+retain their nongeneric restriction. Malformed headers retain their parsed
+operation for diagnostics rather than inventing an E.
+
+Source calls remain ordinary user-function wrappers; their checked builtin
+bodies carry the accepted runtime operation. Specialization prepares nested E
+and its nominal instances, substitutes it and translates result roles once.
+Remove String-only admissibility summaries and their threading in the same
+slice. Preserve simultaneous substitution, pure-Void rules, finite/increasing
+type-cycle checks and the entrypoint's exact `List[String]` restriction.
+Every currently supported finite concrete E is valid, including Void, numeric
+values, inline and owning unions, records, Strings and nested Lists. Independent
+raw-IR verification validates nested nominal membership even for unused or
+pass-through List values; root ownership cannot conceal a missing child layout.
+
+Runtime storage has concrete typed slots. Successful get returns presence
+separately from the copied/acquired E; zero, Void and empty values remain valid
+present payloads. Repeat clamps nonpositive counts before unsigned conversion,
+checks allocation size without negating INT_MIN, acquires each stored occurrence
+and publishes only initialized logical length. Nonfinal root release drops no
+children; final release drops each initialized occurrence exactly once.
+Construction's internal early length assignment followed by complete infallible
+initialization is observationally equivalent today: inspect publication order
+in C and mutate an advertised length exceeding initialized slots for the native
+failure oracle. Add no tracing hook to manufacture that observation.
+
+A disposable emitter-local inventory derives needed List element types from
+aggregate fields, signatures, all definitions/arms and runtime-operation E.
+It owns no layouts or identities. Current concrete types have unary List nesting
+over primitive or nominal instance identities, so depth plus typed terminal
+kind/identity is a complete key. Derive suffix keys in one walk, use existing
+stable host sorting from terminal identity through kind to depth, then dedup
+complete keys. Test equivalence with semantic type equality, including equal
+raw ordinals in different domains and phantom nominal instances. Project C names
+directly from semantic types/keys; no per-value linear inventory lookup, ABI
+string keys or preprocessor dedup. This temporary host sorting dependency does
+not establish bootstrap readiness. Emit root declarations before aggregate
+ownership helpers and complete typed List bodies after aggregate layouts.
+
+Before propagating the new carrier, inspect its generated host C and measure
+construction/access/destruction, including scalar variants carrying no E.
+The feature's working target is **at most 5%** additional allocations and
+minimum retired instructions on each frozen shared input; **10% per input** is
+the hard investigation/rejection ceiling. This is a feature budget, not a change
+to the preparations' 3% ceiling or existing e2e ceilings. No average may conceal
+an individual breach. Shared-input native behavior and ownership must agree;
+target C may legitimately change with the generalized helper ABI. Bootstrap
+identity checks apply where the compiler can perform them; the pilot still
+cannot self-compile.
+
+Measure runtime slot counts 16/32/64/128 separately from source call-site counts,
+distinct E counts and nested List depth. Runtime count must not grow helper C
+size: one root allocation and exactly n applications of E's stored-occurrence
+duplication/drop contract. Owning E acquires/releases each active child obligation;
+unmanaged E copies without child ownership operations.
+Avoid new depth quadratics when gathering suffixes or projecting child names.
+Record actual production/test line changes separately; forecast net production
+growth is 250–500 lines after removing obsolete admission work. Widening beyond
+that forecast calls for scope review, not compressed code or deleted tests.
+Granular contract, checking, preparation, lowering, ownership, verifier,
+emission and per-object runtime callbacks follow the phase matrix below, with
+genuine failing tests and specific mutation oracles before independent review.
+
 The Go slice lesson translates to these ARC invariants:
 
 - Logical length and initialized owned slots are explicit, separate from capacity.
@@ -413,6 +613,334 @@ The Go slice lesson translates to these ARC invariants:
 - Vacated/moved-from slots no longer own elements. ARC does not require copying
   Go's GC-oriented zeroing rule; it requires correct initialized-slot boundaries
   and no later access/drop of a retired obligation.
+
+### Fresh record updates preserve existing aliases
+
+#### Problem
+
+The pilot constructs and reads records, but cannot express a fresh update. Its
+lexer does not recognize `|` (`blorp_2/src/lex.brp:446–509`); the parser only
+accepts literals after `{` (`parse.brp:765`, `1599–1608`). This program should
+print exactly `42\n7\n`, exit 0, and write no stderr:
+
+```blorp
+import:
+    list: repeat
+    int: to_string
+    io: print
+fixed record Entry { number: Int, text: String, values: List[Int] }
+pure func make_entry(number: Int) -> Entry:
+    { number = number, text = number.to_string(), values = repeat(number, 2) }
+pure func replace_text(value: Entry) -> Entry:
+    { value | text = 7.to_string() }
+func main() -> Void:
+    old = make_entry(42)
+    alias = old
+    fresh = replace_text(old)
+    print(alias.text)
+    print(fresh.text)
+```
+
+After implementation, run it through the normal e2e harness, not a C driver
+calling generated language symbols. Before implementation, root captures a
+behavioral red: a TestSuite callback expects this input to check successfully.
+The source-derived baseline failure is `unsupported character` at `|`, with
+help `use ASCII function declarations and numeric literals, parameter names,
+or calls; keep -> adjacent`. This spec has not executed that reproduction.
+
+A separate fixture uses the same imports, Entry and make_entry, with a reverse
+replacement order and actual IO (expected `base\ntext\nnumber\n7\n7\n`):
+
+```blorp
+func traced_base() -> Entry:
+    print("base")
+    make_entry(42)
+func traced_text() -> String:
+    print("text")
+    7.to_string()
+func traced_number() -> Int:
+    print("number")
+    7
+func main() -> Void:
+    fresh = { traced_base() | text = traced_text(), number = traced_number() }
+    print(fresh.number.to_string())
+    print(fresh.text)
+```
+
+#### Background and dependencies
+
+General List[T] is accepted in `85834e15f`. This is the next bounded design;
+production implementation starts after this plan is reviewed and committed. Root
+retains a source-matched native baseline, owns FRESH-host checks and serializes
+compiled validation. All current finite field classes are in scope.
+
+Parent `docs/GUIDE.md:1273–1279` and `docs/GRAMMAR.md:1128–1154` already specify
+base once, replacements in written order, then field writes. Pilot rules remain
+narrower: one-line braces, at least one replacement, no trailing comma, no field
+assignment, no recursive/empty record declarations, and only `fixed record`.
+Record updates preserve the base's nominal type and type arguments; replacement
+names never infer an owner. All currently supported finite field types work,
+including Void, numeric values, String, inline/owning unions, records and List[E].
+
+#### Proposed solution
+
+Use ordinary projections and complete construction, always fresh for managed
+records. No uniqueness test, COW/reuse branch, or new runtime operation.
+
+1. Parser publishes `RecordUpdateExpression(base, replacements)` with existing
+   `ParsedRecordField` rows in written order. Add a named `RecordUpdateBar` symbol.
+   After `{`, a name followed by `=` selects the existing literal path; otherwise
+   parse one ordinary value, require `|`, then require nonempty replacement fields.
+   Existing empty-literal, postfix, whitespace/comment and brace-span rules stay.
+2. Checking elaborates the base first, using the ordinary expected result type
+   when available. Its nominal record head must be established before resolving
+   fields; ordinary inference may still solve generic arguments from replacements.
+   Keep the base pending until those constraints are solved; elaboration is not
+   an early freeze. Preserve its parsed `ValueExpression.span` explicitly. Resolve each
+   replacement once to its declaration-owned FieldId and instantiated expected
+   type. Validate duplicate ordinals before RHS elaboration. Build the disjoint
+   complement in one declaration-field pass, then freeze complete typed data.
+3. Specialization translates the base, replacements and inherited projection
+   types/FieldIds once to the same concrete record instance. Include their
+   children in all existing preparation and call/recursion traversals.
+4. Lower the base once; lower all replacement RHSs in written order; project
+   inherited fields in declaration order. Populate a uniquely owned local
+   ordinal-slot builder and freeze one declaration-ordered `RecordFieldValue`
+   vector into existing `ConstructRecordValue`. No growing block prefix crosses
+   an additional helper boundary. No field spelling or type lookup occurs here.
+5. Existing ownership insertion, independent verification and emission consume
+   those ordinary operations without a new update opcode or semantic authority.
+
+#### Code and fact ownership
+
+Current checked construction (`check_model.brp:159–180`) is:
+
+```blorp
+fixed record CheckedRecordField { field: FieldId, value: CheckedValue, span: Span }
+fixed union CheckedBase:
+    ReturnRecord(RecordId, List[CheckedRecordField])
+    -- other existing alternatives
+```
+
+Add the smallest complete update product alongside it:
+
+```blorp
+fixed record RetainedRecordField { field: FieldId, value_type: TypeRef }
+fixed record CheckedRecordUpdate {
+    base: CheckedValue,
+    base_expression_span: Span,
+    replacements: List[CheckedRecordField],
+    inherited: List[RetainedRecordField]
+}
+-- CheckedBase gains ReturnRecordUpdate(CheckedRecordUpdate).
+```
+
+`replacements` contains only written/evaluated RHSs in source order; `inherited`
+contains only omitted fields in declaration order. These are disjoint rows,
+not parallel arrays. Construction verifies one exact partition of the base
+record's fields: owner, bounds, uniqueness and coverage. The inherited TypeRef
+is an occurrence projection type, analogous to `CheckedStep.value_type`, not a
+second layout catalogue. The enclosing CheckedValue owns the update's result
+record type in `base_type`, before any outer postfix; the last outer step may
+produce a different overall type. It does not own a full expression `.span`:
+`CheckedValue` and `ConcreteValue` have only `base_span` and individual step spans
+(`check_model.brp:192–197`, `specialize.brp:232–237`). Copy the parser-owned complete
+base-expression span (`syntax.brp:196–201`) to `base_expression_span`, including
+the base's own postfixes, while publishing the checked update. No reconstruction,
+duplicate owner field, expression-ID domain, optional published
+type or insertion-policy flag is needed. These IDs live in one compilation.
+Only the existing checked-program producer publishes this product.
+
+The concrete counterpart substitutes `ConcreteValue`, `ConcreteRecordField`,
+FieldInstanceId and concrete TypeRef and carries the unchanged
+`base_expression_span`. Its complete partition survives translation;
+phantom arguments remain part of nominal instance identity. Projected omitted
+fields and update-base errors use that full base-expression span because omitted
+fields have no written names. Existing child base/step spans remain unchanged.
+
+Current lowering (`lower.brp:214–248`) evaluates literal fields then emits:
+
+```blorp
+Ok(define_value(current, ConstructRecordValue(owner, values), value_type, span))
+```
+
+The update consumer reuses this final operation; its algorithm is:
+
+```text
+base = lower_value(builder, bindings, update.base)       // exactly once
+slots = local Option[RecordFieldValue] storage, one slot per declared field
+for replacement in update.replacements:                // written order
+    child = lower_value(current, bindings, replacement.value)
+    slots[field_number(replacement.field)] = { field, child.value }
+ordered = local List[RecordFieldValue]
+next_inherited = 0
+for slot in slots:                                     // declaration order
+    match slot:
+        Some(field): ordered.append(field)
+        None:
+            retained = update.inherited[next_inherited]
+            child = define_value(current,
+                ReadRecordFieldValue(retained.field, base.value),
+                retained.value_type, update.base_expression_span)
+            ordered.append({ retained.field, child.value })
+            next_inherited += 1
+define_value(current, ConstructRecordValue(owner, ordered), result_type, span)
+```
+
+The table stores only replacements. Completing its empty slots consumes the
+already declaration-ordered inherited rows and publishes complete fields once.
+This avoids a redundant inherited-field table write: the first implementation's
+host-generated setter retained the old table across each such write, forcing a
+full COW copy. Mutations consume uniquely owned roots; the completed replacement
+table is read-only during its completion walk.
+
+The sketch describes local construction, not a new public freeze API or helper
+framework. Carry the full existing FieldInstanceId in each local slot; never
+manufacture it from an ordinal. A missing required inherited row is an internal
+compiler error, never silently skipped or defaulted. Publication preserves all ValueIds/types,
+exact base/RHS/projection spans, and the function's existing allocator.
+Lowering a call base once produces its normal argument definitions and one call
+definition. A binding base reuses its existing ValueId (`lower.brp:263–275`),
+without an extra alias definition; pin both cases independently.
+
+Current `own.brp:434–464` acquires a stored child obligation for **every** owning
+record field, then transfers it into `OwnedPayload`; `558–698` first acquires
+an independent temporary for a managed field projection. Changed RHS owners are
+also copied for storage and subsequently dropped at last use. Preserve this
+acquire-then-drop protocol: there is no `CopyStoredPayload` variant and no direct
+changed-owner transfer optimization in this slice. A retained managed child can
+outlive its base because its projection obligation is acquired before the base
+can retire; stored acquisition precedes constructing the fresh root.
+
+All-replaced updates may retire an otherwise unused base earlier, after its true
+last use. Do not force it live until construction when no dependency remains.
+For unmanaged inline numeric records there is no root/child RC. Managed records
+(including Void/unmanaged-union records) allocate exactly one fresh result root.
+`emit.brp:717–747` already implements that constructor with malloc/refcount 1;
+`754–806` emits ordinary field-designated construction/projection. It does not
+evaluate language RHSs in C initializers: their ValueIds are already defined.
+
+#### Scope and ownership
+
+Implementation owns `syntax`, `lex`, `parse`, `check_model`, `check_values`,
+`check_errors`, `check_render`, `check_recursion`, `specialize`, and `lower` in
+`blorp_2/src/`, plus matching tests and README/EBNF/conformance updates. Required
+closed-tree consumers include `check_model:448`, `check_recursion:68`,
+`specialize:1158,1569`; omitting an update child would hide calls or layouts.
+Existing own/verify/emit/runtime production is expected unchanged; a discovered
+required production change there stops for a separately reviewed correction.
+Raw ownership and native-helper tests may be delegated to a separate expert
+after the checked/concrete product is sealed. Root owns roadmap/report/Git,
+serialized compilation, measurements and final integration.
+
+No List update API, record spelling change, generic constraint solver, general
+expression-tree rewrite, CPS/SSA redesign, cache/index/registry, new layout
+catalogue, host change, consuming ABI, COW/reuse or production tracing.
+
+#### Risks, costs and stop rules
+
+Base evaluation must precede RHSs, even with all fields replaced. Distinguish
+immediate base-elaboration errors (unknown value, impurity, nonrecord head) from
+delayed freeze errors (unsettled generic arguments). Extend existing inference
+work actions and child-first freeze, rather than recursively invoking a second
+checker, prematurely freezing the base, or discarding inference slots. Preserve
+priority: immediate base errors; then all replacement name/duplicate errors in
+written order; then RHS/constraint errors and delayed ordinary freeze errors.
+Expected types cannot make
+an incompatible base a different nominal record. No source spelling survives
+into specialized/lowered update data.
+
+This **unit-only** accepted input proves that the base head can be known while its
+type argument is unsettled, with no outer hint on the update initializer:
+
+```blorp
+fixed record Box[T] { value: T }
+pure func seed[T]() -> Box[T]:
+    seed()
+pure func inferred() -> Int:
+    updated = { seed() | value = 1 }
+    updated.value
+func main() -> Int:
+    0
+```
+
+The typed update must be Box[Int], and its base's accepted call must instantiate
+seed with Int through the replacement constraint. The seed implementation is
+nonterminating; this is checking/phase-test input only, never an executed fixture.
+A sibling input replacing `value` with unknown `missing` must produce
+UnknownRecordField at `missing` before CannotInfer/UninferableTypeParameter.
+Keep seed's forwarding body so ordinary return-context inference is exercised.
+Normal-main fixtures above remain terminating.
+
+After one name resolution per replacement, new partition and lowering work is
+O(F+R), with F fields and R replacements. Current `resolve_record_field` calls
+linear `find_field` (`check_values:110–121`), so total existing lookup work is
+O(F×R); disclose that inherited mechanism. Use direct ordinal marks/slots for
+duplicate/complement/construction work, never a per-field replacement scan.
+Inherited expression-builder COW and aggregate emitter prefix copying remain
+debts; do not claim whole-compiler linearity. Measure fixed-R field width,
+R=F, and many independent update statements at 16/32/64/128; stop if the feature
+adds quadratic work beyond the equivalent explicit projection/construction path.
+Do not add an unmeasured lookup index to conceal that result.
+
+Root-approved feature policy: unchanged shared36 inputs target ≤+5%, hard +10%
+**each input** for allocations and minimum retired instructions, matched
+fresh-host/O0 runs. New fixtures initially propose 25k allocations/150M instructions for
+the small Entry case and 35k/180M for the traced case; confirm from retained
+first-smoke evidence before registration, keeping all old ceilings unchanged.
+Forecast +220–320 handwritten production lines and +450–800 tests; stop above
++350 production for design review, or for widened files/model, unexplained cost,
+missing ownership proof or a host defect. The line threshold is never pressure
+to compress formatting, delete tests or weaken handling. Report physical counts.
+
+#### Testing and acceptance
+
+Start with the small valid-input TestSuite behavioral red, not missing-API
+compilation failure. Then phase callbacks test complete published values:
+
+| Boundary | Exact oracle and deliberate mutant |
+| --- | --- |
+| Lexer/parser/EBNF | Bar span; base and RHS syntax/order; update postfixes/nesting; reject missing base/bar/field/equals/brace, empty update, duplicate separator and multiline braces. Replace update parsing with literal path: valid callback fails. |
+| Checking | Base supplies owner without an outer annotation; known context supports a literal base; nonrecord base gets new UpdateRequiresRecord error at complete base_expression_span; UnknownRecordField and RecordFieldTypeMismatch retain messages/help/declaration notes; new DuplicateUpdateField reports second name plus PreviousField(first span). Tests pin exact typed kinds and rendered message/help/span/note. Pin seed replacement inference and UnknownRecordField before delayed CannotInfer. Cover wrong nominal owner, generic/phantom identity, contextual RHS, purity, Void fields, all finite child classes and hidden growing recursion in base/RHS. |
+| Specialization | Base/result/replacement/inherited fields all belong to the same actual concrete layout; Int/String instances differ when required; unused phantom arguments remain key identity. Calls reachable only inside base/RHS and nominal children appearing only under inherited List are prepared. Omit a child traversal: its precise instance/call oracle fails. |
+| Lowering | Call base evaluated once (one call plus its ordinary argument definitions); binding base reuses an existing ValueId with no new alias operation. All RHSs in written order, then inherited projections and one construction in declaration order; exact IDs/types/spans/field owners/exit. Full base postfix span and outer update postfix returning another type. All-replaced, same-field RHS, nested update, reverse written order, aliases and branch isolation. Reorder RHSs, duplicate the call base, or omit a projection: specific callback fails. |
+| Ownership + raw verification | Borrowed record parameter; numeric inline case; managed zero-child root; owning String/record/union/List children; duplicate pointer occurrences; retained child escapes after base retirement. Pin acquisitions, per-field OwnedPayload transfers and scheduled drops. From proven valid insertion output remove stored/projection acquisition, duplicate an owner transfer, or drop a base before a live projection; verifier rejects exact malformed-IR diagnostics. Keep all existing raw type/layout/borrow checks. |
+| Runtime helpers | Use only aggregate_runtime production fragments plus actual allocator/free wrappers. Compare old/fresh pointers only while the old alias/root is live, including equal replacements. If an all-replaced base retires before fresh allocation, compare distinct allocation occurrence IDs and exact frees; malloc may reuse the address (aggregate_runtime_test.h:36–46). Never inspect a freed base or force unnecessary liveness. Each repeated child slot owns separately; unchanged root/list aliases survive nonfinal drop; final destruction accounts for every occurrence, including active owning-union payloads. Actual mortal Strings, nested Lists and Void/unmanaged-union roots. No generated language-symbol calls. |
+| Real main | Entry prints `42\n7\n`. A second fixture declares number before text but writes `{ traced_base() | text = traced_text(), number = traced_number() }`; actual IO prints `base\ntext\nnumber\n7\n7\n`. Add surviving old child and returned updated-child cases. Exact stdout/exit/empty stderr and strict sanitizer evidence; stdout alone never proves destruction. |
+
+Commands are root-only from the assigned integration worktree, with a FRESH host:
+
+```sh
+scripts/compiler-build-status
+bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_record_updates.brp
+# Expand to affected phase suites, then strict owning/runtime/grammar packet.
+BLORP_MEMORY_STATS=1 BLORP_LEAK_CHECK=strict bin/blorp test --suite --timeout 180 \
+  blorp_2/test/unit blorp_2/test/runtime blorp_2/test/test_grammar
+env BLORP_2_INSTRUCTION_CHECK=required make -C blorp_2 test
+git diff --check
+```
+
+Require passing named callbacks and behavior mutations/restoration, all existing
+e2e plus normal new mains, one compiler build per e2e run, ASan/UBSan and exact
+allocator balances, generated-C ordering/fresh-root proof, current cost ceilings,
+and two independent expert approvals. Shared frozen programs must emit identical
+target C; unrelated layout/ABI changes are not authorized. Inspect default-limit
+C compilation for moderate width/depth; report depth separately from byte size.
+Phase/runtime/source-width measurements have separate workloads. The pilot cannot
+selfcompile: the shared whole-CLI workload is explicitly a proxy excluding host
+bootstrap work and unsupported language features.
+
+#### Release strategy and handback
+
+Review and commit this bounded plan before production. Land one
+complete frontend→construction slice only after every gate; no partially accepted
+update representation or compatibility shim. Revert the slice if a main failure
+cannot be promptly isolated; preserve receipts. Hand back exact changed files,
+source/binary/host/input hashes, independent severity counts/verdicts, red/green
+and mutation receipts, C proof, raw measurements, separate production/test LOC,
+and remaining debts. Ask root before broadening or working around a defect.
+
+### List updates after record updates
 
 Add record update, append, replacement and removal through separate fixtures.
 Initially always allocate fresh results: copy unmanaged slots and acquire

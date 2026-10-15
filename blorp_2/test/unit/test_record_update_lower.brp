@@ -1,0 +1,295 @@
+import:
+	../../src/lower as Lower
+	../../src/source: module_source, root_module_id
+	../../src/specialize as Concrete
+	../../src/syntax: Diagnostic, entry_function
+	../../src/text: concat
+	input: checked_source
+	int as IntOps
+	option: to_result
+	test: TestSuite
+
+
+private PAIR: String =
+	|fixed record Pair { first: Int, second: Int }
+	|func observe(value: Int) -> Int:
+	|    value
+	|func base() -> Pair:
+	|    { first = 1, second = 2 }
+	|
+
+
+private pure func setup_error() -> Diagnostic:
+	{ span = { source = module_source(root_module_id()), start = 0, end = 0 }, note = None, message = "invalid record update lowering seed", help = "fix the test's normal main and returned record field" }
+
+
+-- The real entrypoint's returned field identifies the callee under test.
+private pure func changed(source: String) -> Result[Lower.LoweredFunction, Diagnostic]:
+	checked ?= checked_source(source)
+	specialized ?= Concrete.specialize(checked)
+	program ?= Lower.lower(specialized)
+	facts = Lower.lowered_functions(program)
+	main ?= facts.functions.get(Concrete.function_number(entry_function(facts.entrypoint))).to_result(setup_error())
+	result ?= match main.tail:
+		Lower.ExitValue(Lower.ReturnValue(value)): Ok(value)
+		_: Err(setup_error())
+	definition ?= main.definitions.get(Lower.value_number(result)).to_result(setup_error())
+	parent ?= match definition.operation:
+		Lower.ReadRecordFieldValue(_, parent): Ok(parent)
+		_: Err(setup_error())
+	call ?= main.definitions.get(Lower.value_number(parent)).to_result(setup_error())
+	match call.operation:
+		Lower.CallValue(call, _):
+			match call.target:
+				Concrete.UserFunction(id): facts.functions.get(Concrete.function_number(id)).to_result(setup_error())
+				_: Err(setup_error())
+		_: Err(setup_error())
+
+
+private pure func literal(definition: Lower.ValueDefinition, expected: Int) -> Bool:
+	match definition.operation:
+		Lower.IntegerValue(value): IntOps.equals(value, expected) and Concrete.same_type(definition.value_type, Concrete.IntType)
+		_: False
+
+
+private pure func argument_is(definition: Lower.ValueDefinition, operand: Lower.ValueId) -> Bool:
+	match definition.operation:
+		Lower.CallValue(_, [value]): IntOps.equals(Lower.value_number(value), Lower.value_number(operand))
+		_: False
+
+
+private pure func returned(function: Lower.LoweredFunction, value: Lower.ValueId) -> Bool:
+	match function.tail:
+		Lower.ExitValue(Lower.ReturnValue(result)): IntOps.equals(Lower.value_number(result), Lower.value_number(value))
+		_: False
+
+
+private pure func projects(definition: Lower.ValueDefinition, parent: Lower.ValueDefinition, ordinal: Int, expected: Concrete.TypeRef) -> Bool:
+	match definition.operation:
+		Lower.ReadRecordFieldValue(field, value):
+			(IntOps.equals(Concrete.field_number(field), ordinal)
+			and IntOps.equals(Lower.value_number(value), Lower.value_number(parent.id))
+			and Concrete.same_type(Concrete.RecordType(Concrete.field_owner(field)), parent.value_type)
+			and Concrete.same_type(definition.value_type, expected))
+		_: False
+
+
+private pure func constructs(definition: Lower.ValueDefinition, first: Lower.ValueId, second: Lower.ValueId) -> Bool:
+	match definition.operation:
+		Lower.ConstructRecordValue(owner, [left, right]):
+			(IntOps.equals(Concrete.field_number(left.field), 0)
+			and IntOps.equals(Concrete.field_number(right.field), 1)
+			and Concrete.same_type(Concrete.RecordType(Concrete.field_owner(left.field)), Concrete.RecordType(owner))
+			and Concrete.same_type(Concrete.RecordType(Concrete.field_owner(right.field)), Concrete.RecordType(owner))
+			and Concrete.same_type(definition.value_type, Concrete.RecordType(owner))
+			and IntOps.equals(Lower.value_number(left.value), Lower.value_number(first))
+			and IntOps.equals(Lower.value_number(right.value), Lower.value_number(second)))
+		_: False
+
+
+pure func test_base_call_and_rhs_order_precede_declaration_ordered_storage() -> Bool:
+	source = PAIR.concat(
+		|func change() -> Pair:
+		|    { base() | second = observe(9), first = observe(7) }
+		|func main() -> Int:
+		|    change().first
+		|
+	)
+	match changed(source):
+		Err(_): False
+		Ok(function):
+			match function.definitions:
+				[base, nine, second, seven, first, result]:
+					base_once = match base.operation:
+						Lower.CallValue(_, []): True
+						_: False
+					ordered_fields = match result.operation:
+						Lower.ConstructRecordValue(owner, [left, right]):
+							(IntOps.equals(Concrete.field_number(left.field), 0)
+							and IntOps.equals(Concrete.field_number(right.field), 1)
+							and IntOps.equals(Lower.value_number(left.value), Lower.value_number(first.id))
+							and IntOps.equals(Lower.value_number(right.value), Lower.value_number(second.id))
+							and Concrete.same_type(result.value_type, Concrete.RecordType(owner))
+							and IntOps.equals(Concrete.record_number(Concrete.field_owner(left.field)), Concrete.record_number(owner))
+							and IntOps.equals(Concrete.record_number(Concrete.field_owner(right.field)), Concrete.record_number(owner)))
+						_: False
+					(base_once and literal(nine, 9) and literal(seven, 7)
+					and argument_is(second, nine.id) and argument_is(first, seven.id)
+					and ordered_fields and returned(function, result.id))
+				_: False
+
+
+pure func test_binding_alias_reuses_identity_and_inherited_projection() -> Bool:
+	prefix = PAIR.concat(
+		|func change(value: Pair) -> Pair:
+		|    alias = value
+		|    {
+	)
+	base = "alias"
+	suffix: String =
+		| | second = observe(7) }
+		|func main() -> Int:
+		|    change(base()).first
+		|
+	source = prefix.concat(" ").concat(base).concat(suffix)
+	match changed(source):
+		Err(_): False
+		Ok(function):
+			match function.definitions:
+				[parent, seven, replacement, projection, result]:
+					parameter = match parent.operation:
+						Lower.ParameterValue(index): IntOps.equals(index, 0)
+						_: False
+					inherited = match projection.operation:
+						Lower.ReadRecordFieldValue(field, value):
+							(IntOps.equals(Concrete.field_number(field), 0)
+							and IntOps.equals(Lower.value_number(value), Lower.value_number(parent.id))
+							and IntOps.equals(projection.span.start, IntOps.add(prefix.length(), 1))
+							and IntOps.equals(projection.span.end, IntOps.add(IntOps.add(prefix.length(), 1), base.length()))
+							and Concrete.same_type(projection.value_type, Concrete.IntType)
+							and Concrete.same_type(Concrete.RecordType(Concrete.field_owner(field)), parent.value_type))
+						_: False
+					stored = match result.operation:
+						Lower.ConstructRecordValue(_, [first, second]):
+							(IntOps.equals(Concrete.field_number(first.field), 0)
+							and IntOps.equals(Concrete.field_number(second.field), 1)
+							and IntOps.equals(Lower.value_number(first.value), Lower.value_number(projection.id))
+							and IntOps.equals(Lower.value_number(second.value), Lower.value_number(replacement.id)))
+						_: False
+					(parameter and literal(seven, 7) and argument_is(replacement, seven.id)
+					and inherited and stored and returned(function, result.id))
+				_: False
+
+
+pure func test_postfix_base_is_evaluated_once_and_preserves_projection_span() -> Bool:
+	prefix = PAIR.concat(
+		|fixed record Outer { inner: Pair, ignored: Int }
+		|pure func outer() -> Outer:
+		|    { inner = { first = 1, second = 2 }, ignored = 3 }
+		|func change() -> Pair:
+		|    {
+	).concat(" ")
+	base = "outer().inner"
+	suffix: String =
+		| | second = observe(7) }
+		|func main() -> Int:
+		|    change().first
+		|
+	match changed(prefix.concat(base).concat(suffix)):
+		Err(_): False
+		Ok(function):
+			match function.definitions:
+				[call, selected, seven, replacement, inherited, result]:
+					call_once = match call.operation:
+						Lower.CallValue(_, []): True
+						_: False
+					(call_once and projects(selected, call, 0, function.signature.return_type)
+					and projects(inherited, selected, 0, Concrete.IntType)
+					and IntOps.equals(inherited.span.start, prefix.length())
+					and IntOps.equals(inherited.span.end, IntOps.add(prefix.length(), base.length()))
+					and literal(seven, 7) and argument_is(replacement, seven.id)
+					and constructs(result, inherited.id, replacement.id) and returned(function, result.id))
+				_: False
+
+
+pure func test_nested_updates_use_the_completed_inner_record() -> Bool:
+	source = PAIR.concat(
+		|func change(value: Pair) -> Pair:
+		|    { { value | first = observe(7) } | second = observe(9) }
+		|func main() -> Int:
+		|    change(base()).first
+		|
+	)
+	match changed(source):
+		Err(_): False
+		Ok(function):
+			match function.definitions:
+				[parent, seven, first, old_second, inner, nine, second, new_first, outer]:
+					(literal(seven, 7) and argument_is(first, seven.id)
+					and projects(old_second, parent, 1, Concrete.IntType) and constructs(inner, first.id, old_second.id)
+					and literal(nine, 9) and argument_is(second, nine.id)
+					and projects(new_first, inner, 0, Concrete.IntType) and constructs(outer, new_first.id, second.id)
+					and not IntOps.equals(Lower.value_number(inner.id), Lower.value_number(outer.id))
+					and returned(function, outer.id))
+				_: False
+
+
+pure func test_replacing_a_field_with_itself_still_constructs_a_result() -> Bool:
+	source = PAIR.concat(
+		|func change(value: Pair) -> Pair:
+		|    { value | first = value.first }
+		|func main() -> Int:
+		|    change(base()).first
+		|
+	)
+	match changed(source):
+		Err(_): False
+		Ok(function):
+			match function.definitions:
+				[parent, replacement, inherited, result]:
+					(projects(replacement, parent, 0, Concrete.IntType) and projects(inherited, parent, 1, Concrete.IntType)
+					and constructs(result, replacement.id, inherited.id)
+					and not IntOps.equals(Lower.value_number(result.id), Lower.value_number(parent.id))
+					and returned(function, result.id))
+				_: False
+
+
+private pure func update_arm(arm: Lower.LoweredArm, parent: Lower.ValueDefinition, start: Int, ordinal: Int, number: Int) -> Bool:
+	match arm.body.definitions:
+		[value, replacement, inherited, result]:
+			returned = match arm.body.exit:
+				Lower.ReturnValue(id): IntOps.equals(Lower.value_number(id), Lower.value_number(result.id))
+				_: False
+			stored = if IntOps.equals(ordinal, 0):
+				constructs(result, replacement.id, inherited.id)
+			else:
+				constructs(result, inherited.id, replacement.id)
+			(returned and stored and literal(value, number) and argument_is(replacement, value.id)
+			and projects(inherited, parent, IntOps.subtract(1, ordinal), Concrete.IntType)
+			and IntOps.equals(Lower.value_number(value.id), start)
+			and IntOps.equals(Lower.value_number(replacement.id), IntOps.add(start, 1))
+			and IntOps.equals(Lower.value_number(inherited.id), IntOps.add(start, 2))
+			and IntOps.equals(Lower.value_number(result.id), IntOps.add(start, 3)))
+		_: False
+
+
+pure func test_match_arms_keep_updates_local_and_value_ids_distinct() -> Bool:
+	source = PAIR.concat(
+		|fixed union Flag:
+		|    First
+		|    Second
+		|func change(flag: Flag, value: Pair) -> Pair:
+		|    match flag:
+		|        First: { value | first = observe(7) }
+		|        Second: { value | second = observe(9) }
+		|func main() -> Int:
+		|    change(First, base()).first
+		|
+	)
+	match changed(source):
+		Err(_): False
+		Ok(function):
+			match function.definitions:
+				[flag, parent]:
+					match function.tail:
+						Lower.MatchValue(matched):
+							match matched.arms:
+								[first, second]:
+									(IntOps.equals(Lower.value_number(matched.scrutinee), Lower.value_number(flag.id))
+									and update_arm(first, parent, 2, 0, 7) and update_arm(second, parent, 6, 1, 9))
+								_: False
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Record update lowering",
+	tests = [
+		("base call and RHS order precede declared storage", test_base_call_and_rhs_order_precede_declaration_ordered_storage),
+		("binding alias reuses identity and inherited projection", test_binding_alias_reuses_identity_and_inherited_projection),
+		("postfix base is evaluated once with full span", test_postfix_base_is_evaluated_once_and_preserves_projection_span),
+		("nested update reads the completed inner record", test_nested_updates_use_the_completed_inner_record),
+		("same field value still constructs a result", test_replacing_a_field_with_itself_still_constructs_a_result),
+		("match updates have local distinct identities", test_match_arms_keep_updates_local_and_value_ids_distinct),
+	]
+}

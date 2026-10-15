@@ -6,15 +6,15 @@ import:
 	./check_calls: FunctionContract, function_contract
 	./check_methods: ResolutionContext, ResolvedReceiver(ReceiverCandidates, UniqueReceiver), ReceiverCandidate, classify_receiver, contains_variant, lookup_target, receiver_expectation, method_sites, select_receiver_contract
 	./check_signatures: validate_pure_result
-	./check_types: TypeAdmission, admit_instantiated_type, find_field, occurrence_fields, previous_declaration, validate_list_element
+	./check_types: find_field, occurrence_fields, previous_declaration
 	./check_model:
-		BindingDefinition, BindingId, FieldId, CheckedBase(ReturnRecord, ReturnConstructedVariant, ReturnVoid, ReturnInteger, ReturnFloat, ReturnString, ReturnVariant, ReturnBinding, ReturnCall), CheckedRecord, CheckedField, CheckedOperation(InvokeFunction, ReadRecordField), CheckedRecordField, CheckedStep, CheckedValue, CheckedCall, TypeParameterId, TypeRef(VoidType, IntType, FloatType, StringType, ListType, RecordType, AppliedRecordType, UnionType, AppliedUnionType, ParameterType), TypeUse, UnionOccurrence, CallTarget(UserFunction), same_type, same_parameter, same_variant, field_number, parameter_position
+		BindingDefinition, BindingId, FieldId, CheckedBase(ReturnRecordUpdate, ReturnRecord, ReturnConstructedVariant, ReturnVoid, ReturnInteger, ReturnFloat, ReturnString, ReturnVariant, ReturnBinding, ReturnCall), CheckedRecord, CheckedField, CheckedOperation(InvokeFunction, ReadRecordField), CheckedRecordField, CheckedRecordUpdate, RetainedRecordField, CheckedStep, CheckedValue, CheckedCall, TypeParameterId, TypeRef(VoidType, IntType, FloatType, StringType, ListType, RecordType, AppliedRecordType, UnionType, AppliedUnionType, ParameterType), TypeUse, UnionOccurrence, CallTarget(UserFunction), same_type, same_parameter, same_variant, field_number, parameter_position
 	./check_errors:
 		CheckError, BindingSite, ArgumentMismatch, InfiniteInference, ExpectedTypeSite(SourceAnnotation),
 		CheckErrorKind(ConstructorRejection, RecordRejection),
 		CallError(ArgumentTypeMismatch, GenericArgumentConflict, UninferableTypeParameter, InfiniteTypeArgument, UnknownFunction, UncallableBinding),
 		ConstructorError(ConstructorNeedsExpectedType, VariantNotInExpectedType, PayloadFreeVariantCalled, ConstructorFieldCountMismatch),
-		RecordError(RecordNeedsExpectedType, UnknownRecordField, DuplicateLiteralField, MissingRecordField, RecordFieldTypeMismatch, FieldRequiresRecord),
+		RecordError(UpdateRequiresRecord, DuplicateUpdateField, RecordNeedsExpectedType, UnknownRecordField, DuplicateLiteralField, MissingRecordField, RecordFieldTypeMismatch, FieldRequiresRecord),
 		ValueError(UnknownValue, ExpressionTypeMismatch), MethodError(MethodReceiverNeedsType),
 		CheckerInvariant(InvalidCheckedUnion, InvalidRecordDeclaration, InvalidRecordField, GenericConstructorContract, InvalidInferenceVariable, InvalidInferenceWorklist, InvalidParameterDeclaration, MissingCallParameter, MissingGenericParameter, InvalidFunctionContract),
 		call_error, constructor_error, record_error, value_error, method_error, checker_invariant
@@ -24,7 +24,7 @@ import:
 	source: COMPILER_SOURCE
 	namespace: variant_candidates
 	option: is_some, to_result
-	syntax: BindingSyntax, Span, ValueExpression, WrittenName, ParsedRecordField, PostfixOperation(ReceiverInvocation, FieldAccess), ReceiverApplication, ExpressionBase(VoidExpression, IntegerExpression, FloatExpression, StringExpression, NameExpression, DirectApplication, RecordExpression), Purity, same_span
+	syntax: BindingSyntax, Span, ValueExpression, WrittenName, ParsedRecordField, PostfixOperation(ReceiverInvocation, FieldAccess), ReceiverApplication, ExpressionBase(VoidExpression, IntegerExpression, FloatExpression, StringExpression, NameExpression, DirectApplication, RecordExpression, RecordUpdateExpression), Purity, same_span
 
 
 private fixed union ResolvedPostfix:
@@ -128,8 +128,17 @@ private fixed record PlannedRecordField {
 }
 
 
-private fixed record PlannedRecordLiteral {
-	owner: RecordId,
+-- Literal and update fields share one RHS/constraint engine; only their origins differ.
+private fixed union RecordOrigin:
+	LiteralRecord(RecordId)
+	UpdatedRecord(PendingValue, Span, List[PendingRetainedField])
+
+
+private fixed record PendingRetainedField { field: FieldId, value_type: InferenceType }
+
+
+private fixed record PlannedRecordFields {
+	origin: RecordOrigin,
 	value_type: InferenceType,
 	fields: List[PlannedRecordField],
 	span: Span
@@ -258,7 +267,60 @@ private pure func plan_record_literal(
 		ready ?= match error:
 			Some(error): Err(error)
 			None: Ok(void)
-		Ok(PlannedRecord({ owner = owner, value_type = term, fields = fields, span = span }))
+		Ok(PlannedRecord({ origin = LiteralRecord(owner), value_type = term, fields = fields, span = span }))
+
+
+private pure func plan_record_update(base: PendingValue, written: List[ParsedRecordField], span: Span, expression_span: Span, context: ResolutionContext, slots: List[InferenceSlot]) -> Result[PlannedRecordFields, CheckError]:
+	head ?= inference_head(pending_type(base), slots, expression_span)
+	occurrence_result: Result[RecordOccurrence, CheckError] = match record_occurrence(head):
+		Some(value): Ok(value)
+		None:
+			actual ?= publish_inference_type(head, slots, DiagnosticInference, expression_span)
+			Err(record_error(expression_span, UpdateRequiresRecord(actual)))
+	occurrence ?= occurrence_result
+	declaration ?= context.records.get(record_number(occurrence.owner)).to_result(checker_invariant(span, InvalidRecordDeclaration(occurrence.owner)))
+	hints = record_argument_hints(occurrence.arguments)
+	var replaced: List[Option[Span]] = []
+	for _ in declaration.fields:
+		replaced = replaced.append(None)
+	var fields: List[PlannedRecordField] = []
+	var failure: Option[CheckError] = None
+	for written_field in written:
+		planned: Result[PlannedRecordField, CheckError] = match resolve_record_field(written_field.name, occurrence.owner, context):
+			Err(error): Err(error)
+			Ok(field):
+				match replaced.get(field_number(field.id)):
+					Some(Some(first)): Err(record_error(written_field.name.span, DuplicateUpdateField(written_field.name.id, first)))
+					Some(None): plan_record_field({ field = field, written = written_field }, declaration, hints)
+					None: Err(checker_invariant(span, InvalidRecordField(field.id)))
+		match planned:
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(field):
+				fields = fields.append(field)
+				replaced = replaced.set(field_number(field.field), Some(written_field.name.span))
+	ready ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	var inherited: List[PendingRetainedField] = []
+	for field in declaration.fields:
+		match replaced.get(field_number(field.id)):
+			Some(None):
+				annotation = field.value_type
+				match apply_type_hint(annotation.value_type, declaration.type_parameters, hints):
+					Some(value_type): inherited = inherited.append({ field = field.id, value_type = value_type })
+					None:
+						failure = Some(checker_invariant(annotation.span, InvalidRecordField(field.id)))
+						break
+			Some(Some(_)): void
+			None:
+				failure = Some(checker_invariant(span, InvalidRecordField(field.id)))
+				break
+	complete ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	Ok({ origin = UpdatedRecord(base, expression_span, inherited), value_type = pending_type(base), fields = fields, span = span })
 
 
 private pure func plan_record_field(field: ResolvedLiteralField, accepted: CheckedRecord, hints: List[Option[InferenceType]]) -> Result[PlannedRecordField, CheckError]:
@@ -292,8 +354,10 @@ private pure func validate_record_fields(fields: List[PendingRecordField], slots
 		None: Ok(void)
 
 
-private pure func finish_pending_record(plan: PlannedRecordLiteral, fields: List[PendingRecordField], slots: List[InferenceSlot]) -> Result[PendingValue, CheckError]:
-	var readiness = ClosedInference
+private pure func finish_pending_record(plan: PlannedRecordFields, fields: List[PendingRecordField], slots: List[InferenceSlot]) -> Result[PendingValue, CheckError]:
+	var readiness = match plan.origin:
+		LiteralRecord(_): ClosedInference
+		UpdatedRecord(base, _, _): base.readiness
 	for field in fields:
 		match field.value.readiness:
 			DeferredInference: readiness = DeferredInference
@@ -304,16 +368,19 @@ private pure func finish_pending_record(plan: PlannedRecordLiteral, fields: List
 	valid ?= match readiness:
 		ClosedInference: validate_record_fields(fields, slots)
 		DeferredInference: Ok(void)
-	Ok({ span = plan.span, readiness = readiness, base = PendingReturnRecord(plan.owner, fields), base_type = plan.value_type, base_span = plan.span, operations = NoPendingOperations })
+	base = match plan.origin:
+		LiteralRecord(owner): PendingReturnRecord(owner, fields)
+		UpdatedRecord(base, expression_span, inherited): PendingReturnRecordUpdate(base, expression_span, fields, inherited)
+	Ok({ span = plan.span, readiness = readiness, base = base, base_type = plan.value_type, base_span = plan.span, operations = NoPendingOperations })
 
 
-private pure func freeze_record_fields(fields: List[PendingRecordField], slots: List[InferenceSlot], admission: TypeAdmission) -> Result[List[CheckedRecordField], CheckError]:
+private pure func freeze_record_fields(fields: List[PendingRecordField], slots: List[InferenceSlot]) -> Result[List[CheckedRecordField], CheckError]:
 	var frozen: List[CheckedRecordField] = []
 	var failure: Option[CheckError] = None
 
 	-- All child errors precede ordinary field mismatches, including later children.
 	for field in fields:
-		match freeze_pending_value(field.value, slots, admission):
+		match freeze_pending_value(field.value, slots):
 			Ok(value): frozen = frozen.append({ field = field.field, value = value, span = field.value.span })
 			Err(error):
 				failure = Some(error)
@@ -347,6 +414,7 @@ private fixed union PendingBase:
 	AcceptedBase(CheckedBase)
 	PendingReturnCall(PendingCall, List[PendingValue])
 	PendingReturnRecord(RecordId, List[PendingRecordField])
+	PendingReturnRecordUpdate(PendingValue, Span, List[PendingRecordField], List[PendingRetainedField])
 	PendingReturnVariant(PendingVariantContract, List[PendingValue])
 
 
@@ -498,7 +566,7 @@ private pure func admit_call_type(written: TypeRef, call: PendingCall, slots: Li
 		match written:
 			ListType(element):
 				value ?= admit_call_type(element, call, slots, span)
-				admitted_list(value, span)
+				Ok(ListType(value))
 			AppliedRecordType(owner, arguments):
 				var values: List[TypeRef] = []
 				var failure: Option[CheckError] = None
@@ -1108,7 +1176,8 @@ private fixed union CallPlacement:
 
 private fixed union PlannedBase:
 	PlannedLeaf(ResolvedBase)
-	PlannedRecord(PlannedRecordLiteral)
+	PlannedRecord(PlannedRecordFields)
+	PlannedUpdate(ValueExpression, List[ParsedRecordField], Option[InferenceType])
 	PlannedVariant(PendingVariantContract, List[ValueExpression])
 	PlannedCall(FunctionContract, List[ValueExpression], CallPlacement, Option[InferenceType])
 
@@ -1141,8 +1210,10 @@ private fixed union ExpressionWork:
 	CheckVariant(PendingVariantContract, List[PendingValue], Span)
 	FinishCall(PendingCall, OperandRange, CallPlacement)
 	CheckCall(PendingCall, List[PendingValue], CallPlacement)
-	FinishRecord(PlannedRecordLiteral, OperandRange)
-	CheckRecord(PlannedRecordLiteral, List[PendingRecordField])
+	PlanRecordUpdate(List[ParsedRecordField], Span, Span)
+	ScheduleRecord(PlannedRecordFields)
+	FinishRecord(PlannedRecordFields, OperandRange)
+	CheckRecord(PlannedRecordFields, List[PendingRecordField])
 	SolveConstraint(InferenceEquality)
 	FinishRoot
 	FreezeRoot(PendingValue)
@@ -1191,7 +1262,7 @@ private pure func call_operands(values: List[Option[PendingValue]], range: Opera
 		None: Ok(arguments)
 
 
-private pure func record_operands(values: List[Option[PendingValue]], range: OperandRange, literal: PlannedRecordLiteral) -> Result[List[PendingRecordField], CheckError]:
+private pure func record_operands(values: List[Option[PendingValue]], range: OperandRange, literal: PlannedRecordFields) -> Result[List[PendingRecordField], CheckError]:
 	var fields: List[PendingRecordField] = []
 	var position = range.start
 	var failure: Option[CheckError] = None
@@ -1219,6 +1290,7 @@ private pure func argument_work(call: PendingCall, arguments: List[ValueExpressi
 private pure func plan_base(purity: Purity, scope: List[LocalBinding], body: ValueExpression, expectation: Option[InferenceType], context: ResolutionContext, slots: List[InferenceSlot]) -> Result[PlannedBase, CheckError]:
 	match body.base:
 		RecordExpression(fields): plan_record_literal(fields, body.base_span, expectation, context)
+		RecordUpdateExpression(base, fields): Ok(PlannedUpdate(base, fields, expectation))
 		DirectApplication(name, arguments):
 			classified ?= classify_direct_call(name, arguments, scope, context)
 			match classified:
@@ -1441,16 +1513,13 @@ private pure func elaborate_value(
 												operands = push_operand(operands, operand_count, value)
 												operand_count = IntOps.add(operand_count, 1)
 											PlannedRecord(literal):
-												work = push_expression_work(work, work_count, FinishRecord(literal, { start = operand_count, count = literal.fields.length() }))
+												work = push_expression_work(work, work_count, ScheduleRecord(literal))
 												work_count = IntOps.add(work_count, 1)
-												var position = literal.fields.length()
-												while IntOps.greater_than(position, 0):
-													position = IntOps.subtract(position, 1)
-													match literal.fields.get(position):
-														Some(field):
-															work = push_expression_work(work, work_count, EnterExpression(field.written, Some(field.expected.value_type)))
-															work_count = IntOps.add(work_count, 1)
-														None: failure = Some(checker_invariant(literal.span, InvalidInferenceWorklist))
+											PlannedUpdate(base, fields, hint):
+												work = push_expression_work(work, work_count, PlanRecordUpdate(fields, written.base_span, base.span))
+												work_count = IntOps.add(work_count, 1)
+												work = push_expression_work(work, work_count, EnterExpression(base, hint))
+												work_count = IntOps.add(work_count, 1)
 											PlannedVariant(contract, arguments):
 												range: OperandRange = { start = operand_count, count = arguments.length() }
 												work = push_expression_work(work, work_count, FinishVariant(contract, range, written.span))
@@ -1469,6 +1538,29 @@ private pure func elaborate_value(
 											PlannedCall(contract, arguments, placement, hint):
 												work = push_expression_work(work, work_count, ScheduleCall(contract, arguments, placement, hint))
 												work_count = IntOps.add(work_count, 1)
+					PlanRecordUpdate(fields, span, expression_span):
+						position = IntOps.subtract(operand_count, 1)
+						match expression_operand(operands, position, expression_span):
+							Err(error): failure = Some(error)
+							Ok(base):
+								match plan_record_update(base, fields, span, expression_span, context, slots):
+									Err(error): failure = Some(error)
+									Ok(plan):
+										operands = operands.set(position, None)
+										operand_count = position
+										work = push_expression_work(work, work_count, ScheduleRecord(plan))
+										work_count = IntOps.add(work_count, 1)
+					ScheduleRecord(literal):
+						work = push_expression_work(work, work_count, FinishRecord(literal, { start = operand_count, count = literal.fields.length() }))
+						work_count = IntOps.add(work_count, 1)
+						var position = literal.fields.length()
+						while IntOps.greater_than(position, 0):
+							position = IntOps.subtract(position, 1)
+							match literal.fields.get(position):
+								Some(field):
+									work = push_expression_work(work, work_count, EnterExpression(field.written, Some(field.expected.value_type)))
+									work_count = IntOps.add(work_count, 1)
+								None: failure = Some(checker_invariant(literal.span, InvalidInferenceWorklist))
 					FinishRecord(literal, range):
 						match record_operands(operands, range, literal):
 							Err(error): failure = Some(error)
@@ -1687,7 +1779,7 @@ private pure func elaborate_value(
 											result_state = SolvingResultInference
 									None: void
 					FreezeRoot(value):
-						match freeze_expression(value, slots, body.span, context.admission):
+						match freeze_expression(value, slots, body.span):
 							Err(error): failure = Some(error)
 							Ok(value): accepted = Some(value)
 			_: failure = Some(checker_invariant(body.span, InvalidInferenceWorklist))
@@ -1697,18 +1789,18 @@ private pure func elaborate_value(
 		None: accepted.to_result(checker_invariant(body.span, InvalidInferenceWorklist))
 
 
-private pure func freeze_expression(value: PendingValue, slots: List[InferenceSlot], span: Span, admission: TypeAdmission) -> Result[ResolvedValue, CheckError]:
-	frozen ?= freeze_pending_value(value, slots, admission)
+private pure func freeze_expression(value: PendingValue, slots: List[InferenceSlot], span: Span) -> Result[ResolvedValue, CheckError]:
+	frozen ?= freeze_pending_value(value, slots)
 	value_type ?= publish_inference_type(pending_type(value), slots, CompleteInference, span)
 	Ok({ value = frozen, value_type = value_type })
 
 
-private pure func freeze_pending_values(values: List[PendingValue], slots: List[InferenceSlot], admission: TypeAdmission) -> Result[List[CheckedValue], CheckError]:
+private pure func freeze_pending_values(values: List[PendingValue], slots: List[InferenceSlot]) -> Result[List[CheckedValue], CheckError]:
 	var frozen: List[CheckedValue] = []
 	var failure: Option[CheckError] = None
 
 	for value in values:
-		match freeze_pending_value(value, slots, admission):
+		match freeze_pending_value(value, slots):
 			Err(error):
 				failure = Some(error)
 				break
@@ -1720,8 +1812,8 @@ private pure func freeze_pending_values(values: List[PendingValue], slots: List[
 		None: Ok(frozen)
 
 
-private pure func freeze_pending_call(call: PendingCall, values: List[PendingValue], receiver: Option[InferenceUse], slots: List[InferenceSlot], admission: TypeAdmission) -> Result[ResolvedArguments, CheckError]:
-	arguments ?= freeze_pending_values(values, slots, admission)
+private pure func freeze_pending_call(call: PendingCall, values: List[PendingValue], receiver: Option[InferenceUse], slots: List[InferenceSlot]) -> Result[ResolvedArguments, CheckError]:
+	arguments ?= freeze_pending_values(values, slots)
 	checked_call ?= publish_pending_call(call, slots)
 	var actual = pending_arguments(values)
 
@@ -1731,44 +1823,41 @@ private pure func freeze_pending_call(call: PendingCall, values: List[PendingVal
 
 	parameters ?= admit_call_parameters(call, slots)
 	return_type ?= admit_call_type(call.contract.signature.return_type.value_type, call, slots, call.contract.span)
-	-- Written monomorphic signatures were admitted before body checking. Only a
-	-- completed generic call introduces new nominal argument facts here.
-	admitted ?= if call.contract.signature.type_parameters.is_empty():
-		Ok(void)
-	else:
-		var failure: Option[CheckError] = None
-		var position = 0
-		for parameter in parameters:
-			match call.contract.signature.parameters.get(position):
-				None:
-					failure = Some(checker_invariant(call.contract.span, InvalidFunctionContract))
-					break
-				Some(written):
-					match admit_instantiated_type(written.value_type, parameter.value_type, admission, call.contract.span):
-						Err(error):
-							failure = Some(error)
-							break
-						Ok(_): void
-			position = IntOps.add(position, 1)
-		match failure:
-			Some(error): Err(error)
-			None: admit_instantiated_type(call.contract.signature.return_type.value_type, return_type, admission, call.contract.span)
 	valid ?= validate_complete_arguments(call.contract, parameters, return_type, actual, slots)
 	Ok({ values = arguments, call = checked_call })
 
 
-private pure func freeze_pending_value(value: PendingValue, slots: List[InferenceSlot], admission: TypeAdmission) -> Result[CheckedValue, CheckError]:
+private pure func freeze_retained_fields(fields: List[PendingRetainedField], slots: List[InferenceSlot], span: Span) -> Result[List[RetainedRecordField], CheckError]:
+	var frozen: List[RetainedRecordField] = []
+	var failure: Option[CheckError] = None
+	for field in fields:
+		match publish_inference_type(field.value_type, slots, CompleteInference, span):
+			Ok(value_type): frozen = frozen.append({ field = field.field, value_type = value_type })
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(frozen)
+
+
+private pure func freeze_pending_value(value: PendingValue, slots: List[InferenceSlot]) -> Result[CheckedValue, CheckError]:
 	base_result: Result[CheckedBase, CheckError] = match value.base:
 		AcceptedBase(base): Ok(base)
 		PendingReturnRecord(owner, fields):
-			frozen ?= freeze_record_fields(fields, slots, admission)
+			frozen ?= freeze_record_fields(fields, slots)
 			Ok(ReturnRecord(owner, frozen))
+		PendingReturnRecordUpdate(base, expression_span, fields, inherited):
+			base ?= freeze_pending_value(base, slots)
+			replacements ?= freeze_record_fields(fields, slots)
+			inherited ?= freeze_retained_fields(inherited, slots, expression_span)
+			Ok(ReturnRecordUpdate({ base = base, base_expression_span = expression_span, replacements = replacements, inherited = inherited }))
 		PendingReturnVariant(contract, values):
-			frozen ?= freeze_pending_values(values, slots, admission)
+			frozen ?= freeze_pending_values(values, slots)
 			valid ?= validate_variant_fields(contract, values, slots)
 			Ok(ReturnConstructedVariant(contract.variant, frozen))
 		PendingReturnCall(call, arguments):
-			resolved ?= freeze_pending_call(call, arguments, None, slots, admission)
+			resolved ?= freeze_pending_call(call, arguments, None, slots)
 			Ok(ReturnCall(resolved.call, resolved.values))
 	base ?= base_result
 	base_type ?= publish_inference_type(value.base_type, slots, CompleteInference, value.base_span)
@@ -1797,7 +1886,7 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 				failure = Some(checker_invariant(value.span, InvalidInferenceWorklist))
 				break
 			Some(step):
-				match freeze_pending_step(step, current_type, slots, admission):
+				match freeze_pending_step(step, current_type, slots):
 					Err(error):
 						failure = Some(error)
 						break
@@ -1811,20 +1900,15 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 	Ok({ base = base, base_type = base_type, base_span = value.base_span, operations = operations })
 
 
-private pure func freeze_pending_step(step: PendingStep, receiver: InferenceType, slots: List[InferenceSlot], admission: TypeAdmission) -> Result[CheckedStep, CheckError]:
+private pure func freeze_pending_step(step: PendingStep, receiver: InferenceType, slots: List[InferenceSlot]) -> Result[CheckedStep, CheckError]:
 	operation_result: Result[CheckedOperation, CheckError] = match step.operation:
 		AcceptedOperation(operation): Ok(operation)
 		PendingInvocation(call, values):
-			resolved ?= freeze_pending_call(call, values, Some({ value_type = receiver, span = call.contract.span }), slots, admission)
+			resolved ?= freeze_pending_call(call, values, Some({ value_type = receiver, span = call.contract.span }), slots)
 			Ok(InvokeFunction(resolved.call, resolved.values))
 	operation ?= operation_result
 	value_type ?= publish_inference_type(step.value_type, slots, CompleteInference, step.span)
 	Ok({ operation = operation, value_type = value_type, span = step.span })
-
-
-private pure func admitted_list(element: TypeRef, span: Span) -> Result[TypeRef, CheckError]:
-	valid ?= validate_list_element(element, span)
-	Ok(ListType(element))
 
 
 -- These variables live only while one expression is elaborated. They are distinct
@@ -2425,7 +2509,7 @@ private pure func call_argument_constraint(
 	Ok({ expected = inference_type(written.value_type, contract.signature.type_parameters, call.variable_start), actual = value.value_type, origin = ArgumentConstraint(call, position, value, written), relation = CollectArguments, parameter = None })
 
 
--- Publish solved arguments only; closed-contract admission and argument checks
+-- Publish solved arguments only; pure-result and argument checks
 -- stay together in validate_complete_arguments after child-first freeze.
 private pure func publish_pending_call(
 	call: PendingCall,
@@ -2471,7 +2555,7 @@ private pure func classify_direct_call(
 		None:
 			Ok(void)
 
-	target ?= lookup_target(context, name)
+	target = lookup_target(context, name)
 
 	match target:
 		Some(target):

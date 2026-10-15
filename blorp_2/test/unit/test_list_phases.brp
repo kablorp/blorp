@@ -9,7 +9,7 @@ import:
 	../../src/names: same_name, program_names
 	../../src/own as Own
 	../../src/parse: parse_module
-	../../src/builtins: check_builtin_types, render_builtin_type_error
+	../../src/builtins as Builtins: check_builtin_types, render_builtin_type_error
 	../../src/source: module_source, root_module_id, same_source
 	../../src/specialize as Concrete
 	../../src/syntax: Diagnostic, Entrypoint(NoArguments, WithArguments), EntryResult(IntegerExitStatus), entry_function, FunctionExecution(OrdinaryCalls)
@@ -96,7 +96,138 @@ pure func test_generic_list_argument_infers_element_and_substitutes_result() -> 
 				None: False
 
 
-pure func test_concrete_list_element_known_by_substitution_rejects_in_checker() -> Bool:
+private pure func runtime_body(function: Check.CheckedFunction) -> Option[Builtins.RuntimeOperation[Declaration.VariantId, Check.TypeRef]]:
+	match function.body:
+		Check.CheckedValueBody(Check.ReturnExpression(value)):
+			match value.base:
+				Check.ReturnCall(call, _):
+					match call.target:
+						Check.RuntimeFunction(operation): Some(operation)
+						_: None
+				_: None
+		_: None
+
+
+pure func test_generic_list_length_header_carries_its_rigid_element() -> Bool:
+	source: String =
+		|pure func count[T](values: List[T]) -> Int:
+		|    builtin("list.length")
+		|func main() -> Int:
+		|    0
+		|
+	match checked(source):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[count, _]:
+					parameters = count.signature.parameters.map(pure func(value): value.value_type)
+					accepted_element = match count.signature.type_parameters:
+						[element]: Check.same_types(parameters, [Check.ListType(Check.ParameterType(element))])
+						_: False
+					accepted_operation = match runtime_body(count):
+						Some(Builtins.ListLength(element)):
+							Check.same_types(parameters, [Check.ListType(element)])
+						_: False
+					accepted_element and accepted_operation and Check.same_type(count.signature.return_type.value_type, Check.IntType)
+				_: False
+
+
+pure func test_generic_list_get_header_preserves_its_result_element() -> Bool:
+	source: String =
+		|fixed union Maybe[T]:
+		|    Missing
+		|    Present(T)
+		|pure func item[T](values: List[T], index: Int) -> Maybe[T]:
+		|    builtin("list.get", Present, Missing)
+		|func main() -> Int:
+		|    0
+		|
+	match checked(source):
+		Err(_): False
+		Ok(program):
+			facts = checked_functions(program)
+			match facts.functions:
+				[item, _]:
+					match item.signature.type_parameters:
+						[element]:
+							parameters = item.signature.parameters.map(pure func(value): value.value_type)
+							accepted_parameters = Check.same_types(parameters, [Check.ListType(Check.ParameterType(element)), Check.IntType])
+							accepted_result = match facts.unions:
+								[declaration]: Check.same_type(item.signature.return_type.value_type, Check.AppliedUnionType(declaration.id, [Check.ParameterType(element)]))
+								_: False
+							accepted_operation = match runtime_body(item):
+								Some(Builtins.ListGet(actual, roles)):
+									accepted_roles = match facts.unions:
+										[declaration]:
+											match declaration.variants:
+												[missing, present]:
+													Check.same_variant(roles.present, present.id) and Check.same_variant(roles.absent, missing.id)
+												_: False
+										_: False
+									Check.same_type(actual, Check.ParameterType(element)) and accepted_roles
+								_: False
+							accepted_parameters and accepted_result and accepted_operation
+						_: False
+				_: False
+
+
+pure func test_signature_only_list_prepares_nested_nominal_elements() -> Bool:
+	source: String =
+		|fixed record Entry { number: Int, text: String }
+		|fixed record Box[T] { value: T }
+		|fixed union Maybe[T]:
+		|    Missing
+		|    Present(T)
+		|pure func empty() -> Maybe[List[List[Box[Entry]]]]:
+		|    Missing
+		|func main() -> Int:
+		|    saved = empty()
+		|    0
+		|
+	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
+		Err(_): False
+		Ok(program):
+			facts = Concrete.specialized_contents(program)
+			match facts.records:
+				[entry, box]:
+					entry_fields = match entry.fields:
+						[Concrete.IntType, Concrete.StringType]: True
+						_: False
+					entry_root = match entry.representation:
+						Concrete.ManagedRecord: True
+						Concrete.InlineRecord: False
+					box_child = match box.fields:
+						[Concrete.RecordType(child)]:
+							match facts.records.get(Concrete.record_number(child)):
+								Some(child_layout):
+									match child_layout.fields:
+										[Concrete.IntType, Concrete.StringType]: True
+										_: False
+								None: False
+						_: False
+					box_root = match box.representation:
+						Concrete.ManagedRecord: True
+						Concrete.InlineRecord: False
+					stored_element = match facts.unions:
+						[layout]:
+							match layout.variants:
+								[[], [Concrete.ListType(Concrete.ListType(Concrete.RecordType(child)))]]:
+									match facts.records.get(Concrete.record_number(child)):
+										Some(child_layout):
+											match child_layout.fields:
+												[actual]:
+													match box.fields:
+														[expected]: Concrete.same_type(actual, expected)
+														_: False
+												_: False
+										None: False
+								_: False
+						_: False
+					entry_fields and entry_root and box_child and box_root and stored_element
+				_: False
+
+
+pure func test_concrete_list_element_known_by_substitution_is_accepted() -> Bool:
 	source: String =
 		|fixed union Maybe[T]:
 		|    None
@@ -107,12 +238,20 @@ pure func test_concrete_list_element_known_by_substitution_rejects_in_checker() 
 		|    ignored = empty(7)
 		|    0
 		|
-	match check_failure(source):
-		Some(error):
-			match error.kind:
-				Errors.TypeTermRejection(Errors.UnsupportedListElement): True
-				_: False
-		None: False
+	match checked(source):
+		Err(_): False
+		Ok(program):
+			facts = checked_functions(program)
+			match facts.functions.get(1):
+				Some(main):
+					match main.statements:
+						[Check.InitializeBinding(_, value)]:
+							match facts.unions:
+								[declaration]: Check.same_type(value.base_type, Check.AppliedUnionType(declaration.id, [Check.ListType(Check.IntType)]))
+								_: False
+						_: False
+				None: False
+
 
 
 pure func test_list_type_name_cannot_be_a_generic_parameter() -> Bool:
@@ -159,7 +298,7 @@ pure func test_entrypoint_translation_uses_its_instance_identity() -> Bool:
 						None: False
 
 
-pure func test_specialization_rejects_list_element_known_only_inside_generic_body() -> Bool:
+pure func test_specialization_accepts_list_element_known_only_inside_generic_body() -> Bool:
 	source: String =
 		|fixed union Maybe[T]:
 		|    Empty
@@ -172,19 +311,20 @@ pure func test_specialization_rejects_list_element_known_only_inside_generic_bod
 		|func main() -> Int:
 		|    hide(42)
 		|
-	match checked(source):
+	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
 		Err(_): False
-		Ok(accepted):
-			match Concrete.specialize(accepted):
-				Err(error):
-					(
-						error.message == "List currently supports only String elements"
-						and error.help == "use List[String]; other concrete element types are not supported yet"
-						and same_source(error.span.source, module_source(root_module_id()))
-						and error.span.start == 198
-						and error.span.end == 202
-					)
-				Ok(_): False
+		Ok(program):
+			match Concrete.specialized_contents(program).unions:
+				[layout]:
+					fields = match layout.variants:
+						[[], [Concrete.ListType(Concrete.IntType)]]: True
+						_: False
+					owning = match layout.representation:
+						Concrete.InlineOwningPayload: True
+						Concrete.InlineUnmanaged: False
+					fields and owning
+				_: False
+
 
 
 pure func test_list_nested_generic_dependency_growth_is_rejected_early() -> Bool:
@@ -228,7 +368,7 @@ pure func test_lowering_preserves_argument_borrow_type() -> Bool:
 
 pure func test_list_root_has_separate_ownership_plan() -> Bool:
 	match Concrete.value_ownership(Concrete.ListType(Concrete.StringType), [], []):
-		Ok(Concrete.ManagedStringListRoot): True
+		Ok(Concrete.ManagedListRoot): True
 		_: False
 
 
@@ -290,14 +430,21 @@ pure func test_verifier_rejects_forged_argument_convention() -> Bool:
 				Ok(_): False
 
 
-pure func test_verifier_rejects_unsupported_list_in_unused_signature() -> Bool:
+pure func test_verifier_accepts_numeric_list_in_unused_signature() -> Bool:
 	match input_ids():
 		Err(_): False
 		Ok(ids):
-			bad = { zero(ids) | signature = { parameters = [Concrete.ListType(Concrete.IntType)], return_type = Concrete.IntType } }
-			match verify({ records = [], unions = [], functions = [zero(ids), bad], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }):
-				Err(error): error.message == "internal compiler error: unsupported List element in ownership representation"
-				Ok(_): False
+			list_type = Concrete.ListType(Concrete.IntType)
+			unused: Own.OwnedFunction = {
+				execution = OrdinaryCalls,
+				signature = { parameters = [list_type], return_type = Concrete.IntType },
+				operations = [
+					definition(ids, list_type),
+					Own.DefineValue({ id = ids.second, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(20) }),
+				],
+				tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.second)))
+			}
+			verify({ records = [], unions = [], functions = [zero(ids), unused], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }).is_ok()
 
 
 private fixed record NestedSeed {
@@ -390,7 +537,7 @@ pure func test_inline_list_union_acquisition_and_drop_emit_root_dispatch() -> Bo
 			cleanup: Own.OwnedFunction = { execution = OrdinaryCalls, signature = { parameters = [union_type], return_type = Concrete.IntType }, operations = [definition(ids, union_type), Own.AcquireOwner(Own.owner_id(0), borrow, span(20)), Own.DropOwner(Own.owner_id(0), span(30)), Own.DefineValue({ id = ids.second, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(40) })], tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.second))) }
 			program: Own.OwnershipProgram = { records = [], unions = seed.unions, functions = [zero(ids), cleanup], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }
 			match verify(program).and_then(emit):
-				Ok(output): output.contains("blorp_string_list_retain(value.payload.blorp_up_0.blorp_uf_0)") and output.contains("blorp_string_list_release(value.payload.blorp_up_0.blorp_uf_0)") and output.contains("blorp_union_dup_0(blorp_vl_0)") and output.contains("blorp_union_drop_0(blorp_owner_0)")
+				Ok(output): output.contains("blorp_list_dup_0_s(value.payload.blorp_up_0.blorp_uf_0)") and output.contains("blorp_list_drop_0_s(value.payload.blorp_up_0.blorp_uf_0)") and output.contains("blorp_union_dup_0(blorp_vl_0)") and output.contains("blorp_union_drop_0(blorp_owner_0)")
 				Err(_): False
 
 
@@ -419,8 +566,8 @@ pure func test_option_list_cleanup_dispatches_present_and_empty_cases() -> Bool:
 	match result:
 		Ok(output):
 			(
-				output.contains("void blorp_union_dup_0(struct blorp_u_0 value){switch(value.tag){case blorp_v_0_0:blorp_string_list_retain(value.payload.blorp_up_0.blorp_uf_0);break;case blorp_v_0_1:break;}}")
-				and output.contains("void blorp_union_drop_0(struct blorp_u_0 value){switch(value.tag){case blorp_v_0_0:blorp_string_list_release(value.payload.blorp_up_0.blorp_uf_0);break;case blorp_v_0_1:break;}}")
+				output.contains("void blorp_union_dup_0(struct blorp_u_0 value){switch(value.tag){case blorp_v_0_0:blorp_list_dup_0_s(value.payload.blorp_up_0.blorp_uf_0);break;case blorp_v_0_1:break;}}")
+				and output.contains("void blorp_union_drop_0(struct blorp_u_0 value){switch(value.tag){case blorp_v_0_0:blorp_list_drop_0_s(value.payload.blorp_up_0.blorp_uf_0);break;case blorp_v_0_1:break;}}")
 				and output.contains("blorp_union_dup_0(blorp_vl_0)")
 				and output.contains("blorp_union_drop_0(blorp_owner_0)")
 				and output.contains("blorp_union_drop_0(blorp_owner_1)")
@@ -438,14 +585,12 @@ pure func test_verifier_rejects_nullary_convention_for_borrowed_list_parameter()
 				Ok(_): False
 
 
-pure func test_verifier_rejects_unsupported_list_union_child() -> Bool:
+pure func test_verifier_accepts_numeric_list_union_child() -> Bool:
 	match nested_seed():
 		Err(_): False
 		Ok(seed):
 			layout: Concrete.ConcreteUnion = { variants = [[Concrete.ListType(Concrete.IntType)]], representation = Concrete.InlineOwningPayload }
-			match verify({ records = [], unions = [layout], functions = [zero(seed.ids)], entrypoint = NoArguments(seed.ids.entrypoint, IntegerExitStatus) }):
-				Err(error): error.message == "ownership verification failed: union payload must reference a supported, earlier layout"
-				Ok(_): False
+			verify({ records = [], unions = [layout], functions = [zero(seed.ids)], entrypoint = NoArguments(seed.ids.entrypoint, IntegerExitStatus) }).is_ok()
 
 
 tests: TestSuite = {
@@ -457,11 +602,14 @@ tests: TestSuite = {
 		("checker publishes accepted argument convention", test_checker_accepts_argument_main_once),
 		("List equality is structural", test_list_structural_equality_recurses_into_element),
 		("generic List inference and substitution", test_generic_list_argument_infers_element_and_substitutes_result),
-		("known concrete substitution fails in checking", test_concrete_list_element_known_by_substitution_rejects_in_checker),
+		("generic List length header carries rigid element", test_generic_list_length_header_carries_its_rigid_element),
+		("generic List get header preserves result element", test_generic_list_get_header_preserves_its_result_element),
+		("signature-only List prepares nested nominal elements", test_signature_only_list_prepares_nested_nominal_elements),
+		("known concrete List substitution is accepted", test_concrete_list_element_known_by_substitution_is_accepted),
 		("List cannot become a rigid parameter name", test_list_type_name_cannot_be_a_generic_parameter),
 		("specialization carries ABI and owning List child", test_specialization_translates_accepted_entrypoint_and_list_layout),
 		("entrypoint translates between distinct identity domains", test_entrypoint_translation_uses_its_instance_identity),
-		("generic body exposes unsupported List during specialization", test_specialization_rejects_list_element_known_only_inside_generic_body),
+		("generic body specializes numeric List payload", test_specialization_accepts_list_element_known_only_inside_generic_body),
 		("List nesting rejects growing generic recursion", test_list_nested_generic_dependency_growth_is_rejected_early),
 		("lowering preserves List parameter", test_lowering_preserves_argument_borrow_type),
 		("List root has a distinct ownership plan", test_list_root_has_separate_ownership_plan),
@@ -475,7 +623,7 @@ tests: TestSuite = {
 		("inline union dup and drop dispatch to List root", test_inline_list_union_acquisition_and_drop_emit_root_dispatch),
 		("Option List cleanup covers Some and None", test_option_list_cleanup_dispatches_present_and_empty_cases),
 		("verifier rejects nullary ABI for borrowed List", test_verifier_rejects_nullary_convention_for_borrowed_list_parameter),
-		("verifier rejects unsupported List union child", test_verifier_rejects_unsupported_list_union_child),
-		("verifier rejects List Int in unused signature", test_verifier_rejects_unsupported_list_in_unused_signature),
+		("verifier accepts numeric List union child", test_verifier_accepts_numeric_list_union_child),
+		("verifier accepts numeric List in unused signature", test_verifier_accepts_numeric_list_in_unused_signature),
 	]
 }

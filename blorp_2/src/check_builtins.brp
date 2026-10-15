@@ -8,9 +8,8 @@ import:
 		OptionalRoles,
 		PrimitiveType,
 		RuntimeOperation,
-		RuntimeParameter(PrimitiveParameter, StringListParameter),
-		RuntimeResult(PrimitiveResult, OptionalResult, BooleanResult),
-		builtin_operation,
+		RuntimeType(PrimitiveRuntimeType, ElementRuntimeType, ListRuntimeType),
+		RuntimeResult(ValueResult, OptionalResult, BooleanResult),
 		primitive_operation,
 		runtime_contract,
 	./check_errors:
@@ -42,7 +41,7 @@ import:
 	syntax:
 		ParsedFunction,
 		ParsedRuntimeOperation(
-			StringParseIntBuiltin, StringParseFloatBuiltin, ListGetBuiltin, StringEqualsBuiltin,
+			StringParseIntBuiltin, StringParseFloatBuiltin, ListRepeatBuiltin, ListLengthBuiltin, ListGetBuiltin, StringEqualsBuiltin,
 			IntegerEqualsBuiltin,
 		),
 		Span,
@@ -50,12 +49,43 @@ import:
 		same_purity,
 
 
-private pure func runtime_parameter_ref(parameter: RuntimeParameter) -> TypeRef:
-	match parameter:
-		PrimitiveParameter(primitive):
-			primitive_ref(primitive)
-		StringListParameter:
-			ListType(StringType)
+private pure func runtime_type_ref(value_type: Builtins.RuntimeType[TypeRef]) -> TypeRef:
+	match value_type:
+		PrimitiveRuntimeType(primitive): primitive_ref(primitive)
+		ElementRuntimeType(element): element
+		ListRuntimeType(element): ListType(element)
+
+
+-- Parsed List tags acquire their real element from the resolved header. Other
+-- operations have no Element payload, so their phantom type needs no placeholder.
+private pure func written_operation(parsed: ParsedRuntimeOperation, site: BuiltinSite) -> Result[RuntimeOperation[WrittenName, TypeRef], CheckError]:
+	mismatch = builtin_error(site.span, BuiltinContractMismatch(parsed))
+	match parsed:
+		ListRepeatBuiltin:
+			match site.signature.parameters.get(0):
+				Some(parameter): Ok(Builtins.ListRepeat(parameter.value_type))
+				None: Err(mismatch)
+		ListLengthBuiltin:
+			match site.signature.parameters.get(0):
+				Some(parameter):
+					match parameter.value_type:
+						ListType(element): Ok(Builtins.ListLength(element))
+						_: Err(mismatch)
+				None: Err(mismatch)
+		ListGetBuiltin(present, absent):
+			match site.signature.parameters.get(0):
+				Some(parameter):
+					match parameter.value_type:
+						ListType(element): Ok(Builtins.ListGet(element, { present = present, absent = absent }))
+						_: Err(mismatch)
+				None: Err(mismatch)
+		StringParseIntBuiltin(present, absent): Ok(Builtins.StringParseInt({ present = present, absent = absent }))
+		StringParseFloatBuiltin(present, absent): Ok(Builtins.StringParseFloat({ present = present, absent = absent }))
+		StringEqualsBuiltin(equal, different): Ok(Builtins.StringEquals({ equal = equal, different = different }))
+		IntegerEqualsBuiltin(equal, different): Ok(Builtins.IntEquals({ equal = equal, different = different }))
+		_:
+			primitive: Option[RuntimeOperation[WrittenName, TypeRef]] = primitive_operation(parsed)
+			primitive.to_result(checker_invariant(site.span, RuntimeContractMismatch))
 
 
 -- What validating one builtin body needs: its declaration and signature, and
@@ -127,7 +157,7 @@ private pure func builtin_role(
 
 -- The present constructor carries the operation's payload; the absent one is empty.
 private pure func optional_roles(
-	payload: PrimitiveType,
+	payload: TypeRef,
 	written: OptionalRoles[WrittenName],
 	site: BuiltinSite,
 ) -> Result[OptionalRoles[VariantId], CheckError]:
@@ -136,7 +166,7 @@ private pure func optional_roles(
 
 	present = match actual:
 		[actual]:
-			same_type(actual.value_type, primitive_ref(payload))
+			same_type(actual.value_type, payload)
 		_:
 			False
 
@@ -174,20 +204,24 @@ private pure func boolean_roles(
 pure func validate_builtin_body(
 	parsed: ParsedRuntimeOperation,
 	site: BuiltinSite,
-) -> Result[RuntimeOperation[VariantId], CheckError]:
+) -> Result[RuntimeOperation[VariantId, TypeRef], CheckError]:
 	annotation ?= match site.function.tail_annotation:
 		Some(annotation):
 			Err(builtin_error(annotation, BuiltinTailAnnotation))
 		None:
 			Ok(void)
 
-	written = builtin_operation(parsed)
+	written ?= written_operation(parsed, site)
 	contract = runtime_contract(written)
 	signature = site.signature
-	mismatch = builtin_error(site.span, BuiltinContractMismatch(written))
+	mismatch = builtin_error(site.span, BuiltinContractMismatch(parsed))
+
+	generic_header = match parsed:
+		ListRepeatBuiltin | ListLengthBuiltin | ListGetBuiltin(_, _): True
+		_: signature.type_parameters.is_empty()
 
 	valid_header ?= if (
-		signature.type_parameters.is_empty()
+		generic_header
 		and same_purity(signature.purity, contract.purity)
 		and same_types(
 			signature.parameters.map(
@@ -195,8 +229,8 @@ pure func validate_builtin_body(
 			),
 			contract.parameters.map(
 				pure func(
-					parameter: RuntimeParameter,
-				) -> TypeRef: runtime_parameter_ref(parameter),
+					parameter: Builtins.RuntimeType[TypeRef],
+				) -> TypeRef: runtime_type_ref(parameter),
 			),
 		)
 	):
@@ -207,15 +241,20 @@ pure func validate_builtin_body(
 	disagreement = checker_invariant(site.span, RuntimeContractMismatch)
 
 	match contract.return_type:
-		PrimitiveResult(expected):
-			valid_result ?= if same_type(signature.return_type.value_type, primitive_ref(expected)):
+		ValueResult(expected):
+			valid_result ?= if same_type(signature.return_type.value_type, runtime_type_ref(expected)):
 				Ok(void)
 			else:
 				Err(mismatch)
 
-			primitive_operation(parsed).to_result(disagreement)
+			match written:
+				Builtins.ListRepeat(element): Ok(Builtins.ListRepeat(element))
+				Builtins.ListLength(element): Ok(Builtins.ListLength(element))
+				_:
+					primitive: Option[RuntimeOperation[VariantId, TypeRef]] = primitive_operation(parsed)
+					primitive.to_result(disagreement)
 		OptionalResult(payload, written_roles):
-			roles ?= optional_roles(payload, written_roles, site)
+			roles ?= optional_roles(runtime_type_ref(payload), written_roles, site)
 
 			match parsed:
 				StringParseIntBuiltin(_, _):
@@ -223,7 +262,9 @@ pure func validate_builtin_body(
 				StringParseFloatBuiltin(_, _):
 					Ok(Builtins.StringParseFloat(roles))
 				ListGetBuiltin(_, _):
-					Ok(Builtins.ListGet(roles))
+					match written:
+						Builtins.ListGet(element, _): Ok(Builtins.ListGet(element, roles))
+						_: Err(disagreement)
 				_:
 					Err(disagreement)
 		BooleanResult(written_roles):

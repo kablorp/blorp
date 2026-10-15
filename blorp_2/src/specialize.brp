@@ -5,12 +5,12 @@ import:
 		PrimitiveType(BuiltinInt, BuiltinFloat, BuiltinString, BuiltinVoid),
 		RuntimeOperation(
 			IntAdd, IntSubtract, IntMultiply, IntDivide, IntRemainder, IntToString, StringLength,
-			StringPrint, StringParseInt, StringParseFloat, ListLength, ListGet, StringEquals,
+			StringPrint, StringParseInt, StringParseFloat, ListRepeat, ListLength, ListGet, StringEquals,
 			IntEquals, FloatAdd, FloatSubtract, FloatMultiply, FloatDivide, FloatRemainder,
 			FloatToString,
 		),
-		RuntimeParameter(PrimitiveParameter, StringListParameter),
-		RuntimeResult(PrimitiveResult, OptionalResult, BooleanResult),
+		RuntimeType(PrimitiveRuntimeType, ElementRuntimeType, ListRuntimeType),
+		RuntimeResult(ValueResult, OptionalResult, BooleanResult),
 		runtime_contract,
 	check: CheckedProgram, checked_functions
 	check_model as Checked
@@ -125,7 +125,7 @@ fixed union TypeRef:
 fixed union ValueOwnership:
 	NoOwnership
 	ManagedStringLeaf
-	ManagedStringListRoot
+	ManagedListRoot
 	ManagedRecordRoot(RecordInstanceId)
 	InlineOwnedFields(UnionInstanceId)
 
@@ -150,7 +150,7 @@ fixed record FunctionSignature {
 
 fixed union CallTarget:
 	UserFunction(FunctionInstanceId)
-	RuntimeFunction(RuntimeOperation[VariantInstanceId])
+	RuntimeFunction(RuntimeOperation[VariantInstanceId, TypeRef])
 
 
 fixed record ConcreteCall {
@@ -171,20 +171,19 @@ private pure func primitive_ref(value_type: PrimitiveType) -> TypeRef:
 			StringType
 
 
-private pure func runtime_parameter_ref(parameter: RuntimeParameter) -> TypeRef:
-	match parameter:
-		PrimitiveParameter(primitive):
-			primitive_ref(primitive)
-		StringListParameter:
-			ListType(StringType)
+pure func runtime_type_ref(value_type: Builtins.RuntimeType[TypeRef]) -> TypeRef:
+	match value_type:
+		PrimitiveRuntimeType(primitive): primitive_ref(primitive)
+		ElementRuntimeType(element): element
+		ListRuntimeType(element): ListType(element)
 
 
-pure func runtime_signature(operation: RuntimeOperation[VariantInstanceId]) -> FunctionSignature:
+pure func runtime_signature(operation: RuntimeOperation[VariantInstanceId, TypeRef]) -> FunctionSignature:
 	contract = runtime_contract(operation)
 
 	result = match contract.return_type:
-		PrimitiveResult(primitive):
-			primitive_ref(primitive)
+		ValueResult(value_type):
+			runtime_type_ref(value_type)
 		OptionalResult(_, roles):
 			UnionType(variant_owner(roles.present))
 		BooleanResult(roles):
@@ -192,7 +191,7 @@ pure func runtime_signature(operation: RuntimeOperation[VariantInstanceId]) -> F
 
 	{
 		parameters = contract.parameters.map(
-			pure func(parameter: RuntimeParameter) -> TypeRef: runtime_parameter_ref(parameter),
+			pure func(parameter: Builtins.RuntimeType[TypeRef]) -> TypeRef: runtime_type_ref(parameter),
 		),
 		return_type = result
 	}
@@ -205,8 +204,20 @@ fixed record ConcreteRecordField {
 }
 
 
+fixed record RetainedRecordField { field: FieldInstanceId, value_type: TypeRef }
+
+
+fixed record ConcreteRecordUpdate {
+	base: ConcreteValue,
+	base_expression_span: Span,
+	replacements: List[ConcreteRecordField],
+	inherited: List[RetainedRecordField]
+}
+
+
 fixed union ConcreteBase:
 	ReturnRecord(RecordInstanceId, List[ConcreteRecordField])
+	ReturnRecordUpdate(ConcreteRecordUpdate)
 	ReturnConstructedVariant(VariantInstanceId, List[ConcreteValue])
 	ReturnVoid
 	ReturnInteger(Int)
@@ -435,11 +446,8 @@ pure func value_ownership(
 			Ok(NoOwnership)
 		StringType:
 			Ok(ManagedStringLeaf)
-		ListType(element):
-			if same_type(element, StringType):
-				Ok(ManagedStringListRoot)
-			else:
-				Err(ownership_error("unsupported List element in ownership representation"))
+		ListType(_):
+			Ok(ManagedListRoot)
 		UnionType(id):
 			match unions.get(union_number(id)):
 				Some(layout):
@@ -544,16 +552,7 @@ private pure func concrete_type(
 			Ok(StringType)
 		Checked.ListType(element):
 			concrete ?= concrete_type(element, substitution, unions, span, records)
-
-			if same_type(concrete, StringType):
-				Ok(ListType(concrete))
-			else:
-				Err({
-					span = span,
-					note = None,
-					message = "List currently supports only String elements",
-					help = "use List[String]; other concrete element types are not supported yet",
-				})
+			Ok(ListType(concrete))
 		Checked.AppliedRecordType(id, arguments):
 			arguments ?= translated_list(
 				arguments,
@@ -1029,6 +1028,9 @@ private pure func prepare_type(
 	records: List[RecordInstance],
 ) -> Result[PreparedType, Diagnostic]:
 	match value:
+		Checked.ListType(element):
+			prepared ?= prepare_type(element, substitution, checked, unions, span, records)
+			Ok({ prepared | value_type = ListType(prepared.value_type) })
 		Checked.RecordType(id):
 			ensure_record({ declaration = id, arguments = [] }, checked, unions, span, records)
 		Checked.UnionType(id):
@@ -1162,6 +1164,12 @@ private pure func append_value_types(
 	})
 
 	match value.base:
+		Checked.ReturnRecordUpdate(update):
+			types = append_value_types(types, update.base)
+			for field in update.replacements:
+				types = append_value_types(types, field.value)
+			for field in update.inherited:
+				types = types.append({ value_type = field.value_type, span = update.base_expression_span })
 		Checked.ReturnConstructedVariant(_, children):
 			for child in children:
 				types = append_value_types(types, child)
@@ -1420,51 +1428,54 @@ private pure func translate_call(
 ) -> Result[ConcreteCall, Diagnostic]:
 	target_result: Result[CallTarget, Diagnostic] = match call.target:
 		Checked.RuntimeFunction(operation):
-			concrete_result: Result[RuntimeOperation[VariantInstanceId], Diagnostic] = match operation:
+			concrete_result: Result[RuntimeOperation[VariantInstanceId, TypeRef], Diagnostic] = match operation:
 				IntAdd:
-					accepted: RuntimeOperation[VariantInstanceId] = Builtins.IntAdd
+					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.IntAdd
 					Ok(accepted)
 				IntSubtract:
-					accepted: RuntimeOperation[VariantInstanceId] = Builtins.IntSubtract
+					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.IntSubtract
 					Ok(accepted)
 				IntMultiply:
-					accepted: RuntimeOperation[VariantInstanceId] = Builtins.IntMultiply
+					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.IntMultiply
 					Ok(accepted)
 				IntDivide:
-					accepted: RuntimeOperation[VariantInstanceId] = Builtins.IntDivide
+					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.IntDivide
 					Ok(accepted)
 				IntRemainder:
-					accepted: RuntimeOperation[VariantInstanceId] = Builtins.IntRemainder
+					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.IntRemainder
 					Ok(accepted)
 				IntToString:
-					accepted: RuntimeOperation[VariantInstanceId] = Builtins.IntToString
+					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.IntToString
 					Ok(accepted)
 				FloatAdd:
-					accepted: RuntimeOperation[VariantInstanceId] = Builtins.FloatAdd
+					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.FloatAdd
 					Ok(accepted)
 				FloatSubtract:
-					accepted: RuntimeOperation[VariantInstanceId] = Builtins.FloatSubtract
+					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.FloatSubtract
 					Ok(accepted)
 				FloatMultiply:
-					accepted: RuntimeOperation[VariantInstanceId] = Builtins.FloatMultiply
+					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.FloatMultiply
 					Ok(accepted)
 				FloatDivide:
-					accepted: RuntimeOperation[VariantInstanceId] = Builtins.FloatDivide
+					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.FloatDivide
 					Ok(accepted)
 				FloatRemainder:
-					accepted: RuntimeOperation[VariantInstanceId] = Builtins.FloatRemainder
+					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.FloatRemainder
 					Ok(accepted)
 				FloatToString:
-					accepted: RuntimeOperation[VariantInstanceId] = Builtins.FloatToString
+					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.FloatToString
 					Ok(accepted)
-				ListLength:
-					accepted: RuntimeOperation[VariantInstanceId] = Builtins.ListLength
-					Ok(accepted)
+				ListRepeat(element):
+					concrete ?= concrete_type(element, substitution, unions, call.span, records)
+					Ok(Builtins.ListRepeat(concrete))
+				ListLength(element):
+					concrete ?= concrete_type(element, substitution, unions, call.span, records)
+					Ok(Builtins.ListLength(concrete))
 				StringLength:
-					accepted: RuntimeOperation[VariantInstanceId] = Builtins.StringLength
+					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.StringLength
 					Ok(accepted)
 				StringPrint:
-					accepted: RuntimeOperation[VariantInstanceId] = Builtins.StringPrint
+					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.StringPrint
 					Ok(accepted)
 				StringParseInt(roles):
 					translated ?= translate_optional_roles(roles, result_type, unions, call.span)
@@ -1472,9 +1483,10 @@ private pure func translate_call(
 				StringParseFloat(roles):
 					translated ?= translate_optional_roles(roles, result_type, unions, call.span)
 					Ok(Builtins.StringParseFloat(translated))
-				ListGet(roles):
+				ListGet(element, roles):
+					concrete ?= concrete_type(element, substitution, unions, call.span, records)
 					translated ?= translate_optional_roles(roles, result_type, unions, call.span)
-					Ok(Builtins.ListGet(translated))
+					Ok(Builtins.ListGet(concrete, translated))
 				IntEquals(roles):
 					owner ?= concrete_union_owner(result_type, call.span)
 					equal ?= translate_variant(roles.equal, owner, unions, call.span)
@@ -1567,6 +1579,20 @@ private pure func translate_value(
 	base_type ?= concrete_type(value.base_type, substitution, unions, base_span, records)
 
 	base_result: Result[ConcreteBase, Diagnostic] = match value.base:
+		Checked.ReturnRecordUpdate(update):
+			owner ?= concrete_record_owner(base_type, value.base_span)
+			base ?= translate_value(update.base, substitution, keys, unions, records)
+			replacements ?= translated_list(update.replacements, pure func(field: Checked.CheckedRecordField) -> Result[ConcreteRecordField, Diagnostic]:
+				id ?= translate_field(field.field, owner, records, field.span)
+				child ?= translate_value(field.value, substitution, keys, unions, records)
+				Ok({ field = id, value = child, span = field.span })
+			)
+			inherited ?= translated_list(update.inherited, pure func(field: Checked.RetainedRecordField) -> Result[RetainedRecordField, Diagnostic]:
+				id ?= translate_field(field.field, owner, records, update.base_expression_span)
+				value_type ?= concrete_type(field.value_type, substitution, unions, update.base_expression_span, records)
+				Ok({ field = id, value_type = value_type })
+			)
+			Ok(ReturnRecordUpdate({ base = base, base_expression_span = update.base_expression_span, replacements = replacements, inherited = inherited }))
 		Checked.ReturnConstructedVariant(id, children):
 			owner ?= concrete_union_owner(base_type, value.base_span)
 			variant ?= translate_variant(id, owner, unions, value.base_span)

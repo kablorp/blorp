@@ -1,167 +1,33 @@
 ---
-Rejects import selections that conflict with local functions, variants or
-other imports, before any declaration is checked.
+Translates namespace-owned failures into checking's diagnostic vocabulary.
+No successful namespace is inspected or revalidated here.
 ---
 import:
 	./check_errors:
 		CheckError,
-		CheckerInvariant(InvalidResolvedFunction, InvalidResolvedUnion, InvalidResolvedVariant),
-		ImportError(
-			ImportRejected, ImportedConstructorConflict, ImportedFunctionConflict,
-			ImportedVariantConflict,
-		),
-		checker_invariant,
-		import_error,
-	declarations: function_number, inventory_functions, inventory_unions, union_number, variant_number, variant_owner
-	int as IntOps
+		ImportError(ImportRejected, ImportedConstructorConflict, ImportedFunctionConflict, ImportedVariantConflict),
+		PreviousTypeDeclaration(SourceTypeDeclaration),
+		SignatureError(DuplicateFunction),
+		TypeDeclarationError(DuplicateRecordType, DuplicateUnion, DuplicateVariant, VariantFunctionConflict),
+		import_error, signature_error, type_declaration_error,
 	namespace:
-		FunctionCandidate,
-		FunctionOrigin(LocalFunction, ImportedFunction),
-		Namespace,
-		function_candidates,
-		import_problem_span,
-		import_problems,
-		imported_functions,
-		imported_variants,
-		variant_candidates,
-	option: to_result
-	assemble: ParsedContents
-	syntax: Span
+		NamespaceProblem(
+			ImportSelectionFailure, DuplicateFunctionName, DuplicateUnionName, DuplicateTypeName,
+			DuplicateVariantName, VariantFunctionNameConflict, ImportedConstructorNameConflict,
+			ImportedFunctionNameConflict, ImportedVariantNameConflict,
+		),
+		namespace_problem_span,
 
 
-pure func validate_imports(
-	parsed: ParsedContents,
-	namespace: Namespace,
-) -> Result[Void, CheckError]:
-	match import_problems(namespace).get(0):
-		Some(problem):
-			Err(import_error(import_problem_span(problem), ImportRejected(problem)))
-		None:
-			constructors ?= validate_constructor_imports(parsed, namespace, 0)
-			validate_function_imports(parsed, namespace, 0)
-
-
--- An imported constructor may not share its name with any visible function.
-private pure func validate_constructor_imports(
-	parsed: ParsedContents,
-	namespace: Namespace,
-	position: Int,
-) -> Result[Void, CheckError]:
-	match imported_variants(namespace).get(position):
-		None:
-			Ok(void)
-		Some(binding):
-			conflict: Result[Void, CheckError] = match function_candidates(
-				namespace,
-				binding.module,
-				binding.name.id,
-			).get(0):
-				None:
-					Ok(void)
-				Some(candidate):
-					site ?= function_site(parsed, candidate, binding.name.span)
-					Err(
-						import_error(
-							binding.name.span,
-							ImportedConstructorConflict(binding.name.id, site),
-						),
-					)
-
-			distinct ?= conflict
-			validate_constructor_imports(
-				parsed,
-				namespace,
-				IntOps.add(position, 1),
-			)
-
-
--- Namespace candidates keep declaration and import order, so an imported
--- function conflicts only with a candidate visible before its own binding;
--- later imports validate their own conflicts. It may not name a variant.
-private pure func validate_function_imports(
-	parsed: ParsedContents,
-	namespace: Namespace,
-	position: Int,
-) -> Result[Void, CheckError]:
-	match imported_functions(namespace).get(position):
-		None:
-			Ok(void)
-		Some(binding):
-			function_conflict: Result[Void, CheckError] = match function_candidates(
-				namespace,
-				binding.module,
-				binding.name.id,
-			).get(0):
-				None:
-					Ok(void)
-				Some(candidate):
-					if IntOps.equals(
-						function_number(candidate.function),
-						function_number(binding.function),
-					):
-						Ok(void)
-					else:
-						site ?= function_site(parsed, candidate, binding.name.span)
-						Err(
-							import_error(
-								binding.name.span,
-								ImportedFunctionConflict(binding.name.id, site),
-							),
-						)
-
-			distinct ?= function_conflict
-
-			variant_conflict: Result[Void, CheckError] = match variant_candidates(
-				namespace,
-				binding.module,
-				binding.name.id,
-			).get(0):
-				None:
-					Ok(void)
-				Some(variant):
-					owner = variant_owner(variant)
-					declaration ?= inventory_unions(parsed.declarations)
-						.get(union_number(owner))
-						.to_result(
-							checker_invariant(
-								binding.name.span,
-								InvalidResolvedUnion(owner),
-							),
-						)
-					written ?= declaration.variants
-						.get(variant_number(variant))
-						.to_result(
-							checker_invariant(
-								binding.name.span,
-								InvalidResolvedVariant(variant),
-							),
-						)
-					Err(
-						import_error(
-							binding.name.span,
-							ImportedVariantConflict(binding.name.id, written.declaration.name.span),
-						),
-					)
-
-			unshadowed ?= variant_conflict
-			validate_function_imports(
-				parsed,
-				namespace,
-				IntOps.add(position, 1),
-			)
-
-
--- Where a visible function was introduced: its declaration or its import.
-private pure func function_site(
-	parsed: ParsedContents,
-	candidate: FunctionCandidate,
-	span: Span,
-) -> Result[Span, CheckError]:
-	match candidate.origin:
-		ImportedFunction(site):
-			Ok(site)
-		LocalFunction:
-			function ?= inventory_functions(parsed.declarations)
-				.get(function_number(candidate.function))
-				.to_result(checker_invariant(span, InvalidResolvedFunction(candidate.function)))
-			Ok(function.declaration.function_name.span)
+pure func namespace_error(problem: NamespaceProblem) -> CheckError:
+	span = namespace_problem_span(problem)
+	match problem:
+		ImportSelectionFailure(rejection): import_error(span, ImportRejected(rejection))
+		DuplicateFunctionName(name, previous): signature_error(span, DuplicateFunction(name.id, previous))
+		DuplicateUnionName(name, previous): type_declaration_error(span, DuplicateUnion(name.id, SourceTypeDeclaration(previous)))
+		DuplicateTypeName(name, previous): type_declaration_error(span, DuplicateRecordType(name.id, SourceTypeDeclaration(previous)))
+		DuplicateVariantName(name, previous): type_declaration_error(span, DuplicateVariant(name.id, previous))
+		VariantFunctionNameConflict(name, variant, function): type_declaration_error(span, VariantFunctionConflict(name, variant, function))
+		ImportedConstructorNameConflict(name, previous): import_error(span, ImportedConstructorConflict(name.id, previous))
+		ImportedFunctionNameConflict(name, previous): import_error(span, ImportedFunctionConflict(name.id, previous))
+		ImportedVariantNameConflict(name, previous): import_error(span, ImportedVariantConflict(name.id, previous))

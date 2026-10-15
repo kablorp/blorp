@@ -39,12 +39,15 @@ writes every byte and appends LF. Program input arrives explicitly through
 `main(args: List[String])`, including the executable name at index 0.
 Other IO declarations remain in the reference copy. `Void` is declared once in `_base.brp`.
 
-The small List adapter follows `standard_library/src/list.brp`'s `length` and
-safe `get` APIs, with concrete List[String] signatures for this increment.
-List is declared once in `_base.brp` as a unary builtin. A successful get
-returns an owned String inside ordinary Option, independently of the list's
-lifetime; invalid indexes return None. No list literals, append or mutation are
-enabled yet. The base module provides the ordinary generic Result union with Ok/Err for
+The List adapter follows `standard_library/src/list.brp`'s generic `repeat`,
+`length` and safe `get` APIs. List is declared once in `_base.brp` as a unary
+builtin. Every supported finite type can be an element, including records,
+unions, Void and nested Lists. A successful get returns an independently owned
+element inside ordinary Option; invalid indexes return None. A nonpositive
+repeat count creates an empty List. Each repeated occurrence owns its own
+stored obligation; final root release destroys each initialized slot once.
+No List literals, append or indexed mutation are enabled yet.
+The base module provides the ordinary generic Result union with Ok/Err for
 pure calculator parsing and evaluation; it has no compiler-specific behavior.
 
 Bool, Option and Result are ordinary fixed unions owned by `_base.brp`; user

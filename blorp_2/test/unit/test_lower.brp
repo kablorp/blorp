@@ -1,9 +1,9 @@
 import:
-	../../src/source: module_source, root_module_id
+	../../src/source: module_source, root_module_id, same_source
 	../../src/lex: lex
 	../../src/lower:
 		LoweredExit(ReturnValue),
-		LoweredProgram, LoweredFunction,
+		LoweredProgram, LoweredFunction, ValueDefinition,
 		LoweredTail(ExitValue, MatchValue),
 		ValueOperation(
 			ParameterValue, IntegerValue, VariantValue, CallValue, ConstructValue, PayloadValue,
@@ -71,6 +71,154 @@ private pure func fixture(source: String) -> Result[LoweredProgram, Diagnostic]:
 	parsed ?= parse(lexed)
 	checked ?= check(parsed).map_err(setup_diagnostic)
 	specialize(checked).and_then(pure func(program): lower(program))
+
+
+private pure func definition_has_position(definition: ValueDefinition, expected: Int, start: Int, end: Int) -> Bool:
+	(
+		value_number(definition.id) == expected
+		and same_type(definition.value_type, IntType)
+		and definition.span.start == start
+		and definition.span.end == end
+		and same_source(definition.span.source, module_source(root_module_id()))
+	)
+
+
+private pure func calls_with_values(definition: ValueDefinition, functions: List[LoweredFunction], arity: Int, expected: List[Int]) -> Bool:
+	match definition.operation:
+		CallValue(call, arguments):
+			match call.target:
+				UserFunction(id):
+					match functions.get(function_number(id)):
+						Some(function):
+							function.signature.parameters.length() == arity and arguments.map(value_number) == expected
+						None:
+							False
+				RuntimeFunction(_):
+					False
+		_:
+			False
+
+
+pure func test_scalar_definition_preserves_its_identity_type_and_span() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	42
+		|
+	match fixture(source):
+		Err(_): False
+		Ok(program):
+			match lowered_functions(program).functions:
+				[function]:
+					match function.definitions:
+						[literal]:
+							match literal.operation:
+								IntegerValue(42):
+									returned = match function.tail:
+										ExitValue(exit): returns_value(exit, 0)
+										MatchValue(_): False
+									definition_has_position(literal, 0, 21, 23) and returned
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_nested_ufcs_arguments_and_next_statement_keep_exact_definitions() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|pure func combine(left: Int, right: Int) -> Int:
+		|	right
+		|func main() -> Int:
+		|	result = identity(10).combine(identity(identity(20)))
+		|	next = identity(30)
+		|	result
+		|
+	match fixture(source):
+		Err(_): False
+		Ok(program):
+			functions = lowered_functions(program).functions
+			match functions:
+				[function, _, _]:
+					match function.definitions:
+						[ten, receiver, twenty, inner, outer, combined, thirty, following]:
+							first_literal = match ten.operation:
+								IntegerValue(10): True
+								_: False
+							second_literal = match twenty.operation:
+								IntegerValue(20): True
+								_: False
+							last_literal = match thirty.operation:
+								IntegerValue(30): True
+								_: False
+							order = (
+								definition_has_position(ten, 0, 141, 143)
+								and definition_has_position(receiver, 1, 132, 140)
+								and definition_has_position(twenty, 2, 171, 173)
+								and definition_has_position(inner, 3, 162, 170)
+								and definition_has_position(outer, 4, 153, 161)
+								and definition_has_position(combined, 5, 145, 152)
+								and definition_has_position(thirty, 6, 194, 196)
+								and definition_has_position(following, 7, 185, 193)
+							)
+							arguments = (
+								calls_with_values(receiver, functions, 1, [0])
+								and calls_with_values(inner, functions, 1, [2])
+								and calls_with_values(outer, functions, 1, [3])
+								and calls_with_values(combined, functions, 2, [1, 4])
+								and calls_with_values(following, functions, 1, [6])
+							)
+							returned = match function.tail:
+								ExitValue(exit): returns_value(exit, 5)
+								MatchValue(_): False
+							first_literal and second_literal and last_literal and order and arguments and returned
+						_:
+							False
+				_:
+					False
+
+
+pure func test_empty_call_argument_preserves_the_waiting_receiver() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|	value
+		|pure func combine(left: Int, right: Int) -> Int:
+		|	right
+		|pure func one() -> Int:
+		|	1
+		|func main() -> Int:
+		|	identity(11).combine(one())
+		|
+	match fixture(source):
+		Err(_): False
+		Ok(program):
+			functions = lowered_functions(program).functions
+			match functions:
+				[function, _, _, _]:
+					match function.definitions:
+						[literal, receiver, argument, result]:
+							integer = match literal.operation:
+								IntegerValue(11): True
+								_: False
+							returned = match function.tail:
+								ExitValue(exit): returns_value(exit, 3)
+								MatchValue(_): False
+							(
+								integer and returned
+								and calls_with_values(receiver, functions, 1, [0])
+								and calls_with_values(argument, functions, 0, [])
+								and calls_with_values(result, functions, 2, [1, 2])
+								and definition_has_position(literal, 0, 159, 161)
+								and definition_has_position(receiver, 1, 150, 158)
+								and definition_has_position(argument, 2, 171, 174)
+								and definition_has_position(result, 3, 163, 170)
+							)
+						_:
+							False
+				_:
+					False
 
 
 private pure func fixture_modules(inputs: List[ModuleInput]) -> Result[LoweredProgram, Diagnostic]:
@@ -1056,6 +1204,9 @@ pure func test_arm_string_alias_survives_a_replacement() -> Bool:
 tests: TestSuite = {
 	description = "Blorp 2 ordered value lowering",
 	tests = [
+		("empty call argument leaves the UFCS receiver intact", test_empty_call_argument_preserves_the_waiting_receiver),
+		("scalar definition keeps exact identity type and span", test_scalar_definition_preserves_its_identity_type_and_span),
+		("nested UFCS and next statement preserve every definition", test_nested_ufcs_arguments_and_next_statement_keep_exact_definitions),
 		("arm String alias survives replacement", test_arm_string_alias_survives_a_replacement),
 		(
 			"String computations stay inside distinct arms",
