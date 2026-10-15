@@ -1,0 +1,158 @@
+import:
+	../../../src/check/check as API
+	../../../src/lex/lex: lex
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic
+	../input: check, parse, setup_diagnostic
+	test: TestSuite
+
+
+private NAT: String =
+	|fixed union Nat:
+	|    Zero
+	|    Succ(Nat)
+	|
+
+private MAIN: String =
+	|func main() -> Int:
+	|    0
+	|
+
+
+private pure func specialized(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parsed ?= parse(tokens)
+	program ?= API.check(parsed).map_err(setup_diagnostic)
+	concrete ?= Concrete.specialize(program)
+	Ok(Concrete.specialized_contents(concrete))
+
+
+private pure func is_boxed_nat(layout: Concrete.ConcreteUnion, position: Int) -> Bool:
+	match (layout.representation, layout.variants):
+		(Concrete.BoxedRecursive, [[], [Concrete.UnionType(self)]]):
+			Concrete.union_number(self) == position
+		_: False
+
+
+pure func test_reachable_self_reference_is_boxed_and_names_its_own_instance() -> Bool:
+	source: String =
+		|pure func make() -> Nat:
+		|    Succ(Succ(Zero))
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+	match specialized(NAT + source):
+		Err(_): False
+		Ok(program):
+			match program.unions:
+				[nat]: is_boxed_nat(nat, 0)
+				_: False
+
+
+pure func test_unused_self_reference_prepares_no_layout() -> Bool:
+	match specialized(NAT + MAIN):
+		Err(_): False
+		Ok(program): program.unions.is_empty()
+
+
+pure func test_boxed_child_makes_an_enclosing_union_owning() -> Bool:
+	source: String =
+		|fixed union Wrap:
+		|    Empty
+		|    Full(Nat)
+		|pure func make() -> Wrap:
+		|    Full(Zero)
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+	match specialized(NAT + source):
+		Err(_): False
+		Ok(program):
+			match program.unions:
+				[nat, wrap]:
+					match (wrap.representation, wrap.variants):
+						(Concrete.InlineOwningPayload, [[], [Concrete.UnionType(child)]]):
+							is_boxed_nat(nat, 0) and Concrete.union_number(child) == 0
+						_: False
+				_: False
+
+
+pure func test_boxed_child_makes_an_enclosing_record_managed() -> Bool:
+	source: String =
+		|fixed record Holder { value: Nat }
+		|pure func make() -> Holder:
+		|    { value = Zero }
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+	match specialized(NAT + source):
+		Err(_): False
+		Ok(program):
+			match (program.unions, program.records):
+				([nat], [holder]):
+					match (holder.representation, holder.fields):
+						(Concrete.ManagedRecord, [Concrete.UnionType(child)]):
+							is_boxed_nat(nat, 0) and Concrete.union_number(child) == 0
+						_: False
+				_: False
+
+
+pure func test_self_reference_beside_a_string_keeps_every_payload_and_is_boxed() -> Bool:
+	source: String =
+		|fixed union Trail:
+		|    End
+		|    Step(String, Trail)
+		|pure func make() -> Trail:
+		|    Step("a", End)
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+	match specialized(source):
+		Err(_): False
+		Ok(program):
+			match program.unions:
+				[trail]:
+					match (trail.representation, trail.variants):
+						(Concrete.BoxedRecursive, [[], [Concrete.StringType, Concrete.UnionType(self)]]):
+							Concrete.union_number(self) == 0
+						_: False
+				_: False
+
+
+pure func test_boxed_union_is_a_managed_root_for_ownership() -> Bool:
+	source: String =
+		|pure func make() -> Nat:
+		|    Zero
+		|func main() -> Int:
+		|    unused = make()
+		|    0
+		|
+	match specialized(NAT + source):
+		Err(_): False
+		Ok(program):
+			-- The instance identity comes from the published signature of make.
+			match program.functions.map(pure func(function): function.signature.return_type):
+				[_, Concrete.UnionType(nat)]:
+					match Concrete.value_ownership(Concrete.UnionType(nat), program.unions, program.records):
+						Ok(Concrete.ManagedUnionRoot(id)): Concrete.union_number(id) == 0
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 recursive union representation",
+	tests = [
+		("reachable self-reference is boxed and names its own instance", test_reachable_self_reference_is_boxed_and_names_its_own_instance),
+		("unused self-reference prepares no layout", test_unused_self_reference_prepares_no_layout),
+		("boxed child makes an enclosing union owning", test_boxed_child_makes_an_enclosing_union_owning),
+		("boxed child makes an enclosing record managed", test_boxed_child_makes_an_enclosing_record_managed),
+		("self-reference beside a String keeps every payload and is boxed", test_self_reference_beside_a_string_keeps_every_payload_and_is_boxed),
+		("boxed union is a managed root for ownership", test_boxed_union_is_a_managed_root_for_ownership),
+	]
+}

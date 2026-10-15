@@ -595,6 +595,9 @@ private fixed union DeclarationVisit:
 
 private fixed union DeclarationVisitStep:
 	VisitDeclaredType(TypeUse)
+	-- A written payload field of the named union's own variant: the one
+	-- position where a reference back to that union is a supported shape.
+	VisitVariantPayload(UnionId, TypeUse)
 	FinishRecordDeclaration(RecordId)
 	FinishUnionDeclaration(UnionId)
 
@@ -610,6 +613,32 @@ private pure func push_declaration_visit(
 		steps.append(step)
 
 
+-- A unary recursive union stores at most one self-reference per variant, so
+-- a node has at most one child and its release can walk a chain. The second
+-- written self payload of one variant is the rejected edge.
+private pure func repeated_self_payload(owner: UnionId, fields: List[TypeUse]) -> Option[TypeUse]:
+	var seen = False
+	var repeated: Option[TypeUse] = None
+
+	for field in fields:
+		match field.value_type:
+			UnionType(id):
+				if IntOps.equals(union_number(id), union_number(owner)):
+					if seen:
+						repeated = Some(field)
+						break
+					else:
+						seen = True
+			_:
+				void
+
+	repeated
+
+
+-- Every declared aggregate must have a finite layout. The only admitted
+-- recursion is a union naming itself as one direct payload of a variant; it
+-- is stored boxed later. Recursion through a record, a List, a type
+-- argument, another aggregate, or twice in one variant is rejected.
 pure func validate_finite_declarations(
 	declarations: CheckedDeclarations,
 ) -> Result[Void, CheckError]:
@@ -683,6 +712,16 @@ pure func validate_finite_declarations(
 						records = records.set(record_number(id), CompleteDeclaration)
 					FinishUnionDeclaration(id):
 						unions = unions.set(union_number(id), CompleteDeclaration)
+					VisitVariantPayload(owner, annotation):
+						-- The admitted direct self-reference needs no visit; a bare
+						-- union name resolves only for a non-generic declaration.
+						admitted = match annotation.value_type:
+							UnionType(id): IntOps.equals(union_number(id), union_number(owner))
+							_: False
+
+						if not admitted:
+							pending = push_declaration_visit(pending, pending_count, VisitDeclaredType(annotation))
+							pending_count = IntOps.add(pending_count, 1)
 					VisitDeclaredType(annotation):
 						match annotation.value_type:
 							VoidType | IntType | FloatType | StringType | ParameterType(_):
@@ -861,12 +900,23 @@ pure func validate_finite_declarations(
 
 													match declaration.variants.get(index):
 														Some(variant):
+															match repeated_self_payload(id, variant.fields):
+																Some(repeated):
+																	failure = Some(
+																		type_declaration_error(
+																			repeated.span,
+																			RecursiveAggregateType(repeated.value_type),
+																		),
+																	)
+																	break
+																None:
+																	void
 															var field_position = variant.fields.length()
 															while IntOps.greater_than(field_position, 0):
 																field_position = IntOps.subtract(field_position, 1)
 																match variant.fields.get(field_position):
 																	Some(field):
-																		pending = push_declaration_visit(pending, pending_count, VisitDeclaredType(field))
+																		pending = push_declaration_visit(pending, pending_count, VisitVariantPayload(id, field))
 																		pending_count = IntOps.add(pending_count, 1)
 																	None:
 																		failure = Some(checker_invariant(annotation.span, InvalidDeclarationVisit))

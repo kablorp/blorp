@@ -128,15 +128,20 @@ fixed union ValueOwnership:
 	ManagedListRoot
 	ManagedRecordRoot(RecordInstanceId)
 	InlineOwnedFields(UnionInstanceId)
+	ManagedUnionRoot(UnionInstanceId)
 
 
+-- A union naming itself as a payload has no finite inline storage, so every
+-- value of it is a counted heap node and the self payload is a pointer edge.
 fixed union UnionRepresentation:
 	InlineUnmanaged
 	InlineOwningPayload
+	BoxedRecursive
 
 
 fixed record ConcreteUnion {
-	-- Complete inline storage; the summary is derived once from every child.
+	-- Complete storage; the summary is derived once from every child. A
+	-- BoxedRecursive layout's own instance appears among its payloads.
 	variants: List[List[TypeRef]],
 	representation: UnionRepresentation
 }
@@ -450,6 +455,8 @@ pure func value_ownership(
 								NoOwnership
 							InlineOwningPayload:
 								InlineOwnedFields(id)
+							BoxedRecursive:
+								ManagedUnionRoot(id)
 					)
 				None:
 					Err(ownership_error("invalid union identity in ownership representation"))
@@ -856,6 +863,43 @@ private pure func find_union_instance(
 	found
 
 
+-- A variant payload while its union's layout is still being built: either a
+-- frozen child type or the union's own instance, whose identity is reserved
+-- locally until every child layout precedes it.
+private fixed union PreparedPayload:
+	ChildPayload(TypeRef)
+	ReservedSelfPayload
+
+
+-- The admitted recursive edge: the union named by this key. Checking admits
+-- it only for a non-generic union, so the key carries no arguments to compare.
+private pure func is_self_reference(written: Checked.TypeRef, key: UnionKey) -> Bool:
+	match written:
+		Checked.UnionType(id):
+			IntOps.equals(Declaration.union_number(id), Declaration.union_number(key.declaration))
+		_:
+			False
+
+
+-- Fills the reserved self payloads with the identity the union received.
+private pure func complete_payloads(variants: List[List[PreparedPayload]], id: UnionInstanceId) -> List[List[TypeRef]]:
+	var completed: List[List[TypeRef]] = []
+
+	for prepared in variants:
+		var fields: List[TypeRef] = []
+
+		for field in prepared:
+			fields = fields.append(
+				match field:
+					ChildPayload(value_type): value_type
+					ReservedSelfPayload: UnionType(id)
+			)
+
+		completed = completed.append(fields)
+
+	completed
+
+
 private pure func ensure_union(
 	key: UnionKey,
 	checked: Checked.CheckedFunctions,
@@ -882,58 +926,65 @@ private pure func ensure_union(
 			)
 			var dependencies = unions
 			var record_dependencies = records
-			var variants: List[List[TypeRef]] = []
-			var representation = InlineUnmanaged
+			var variants: List[List[PreparedPayload]] = []
+			var owning = False
+			var self_referencing = False
 			var failure: Option[Diagnostic] = None
 
 			for variant in declaration.variants:
-				var fields: List[TypeRef] = []
+				var fields: List[PreparedPayload] = []
 				for written in variant.fields:
-					match prepare_type(written.value_type, substitution, checked, dependencies, written.span, record_dependencies):
-						Err(error):
-							failure = Some(error)
-							break
-						Ok(prepared):
-							dependencies = prepared.unions
-							record_dependencies = prepared.records
-							fields = fields.append(prepared.value_type)
-							match prepared.value_type:
-								RecordType(child):
-									match record_dependencies.get(record_number(child)):
-										Some(child_layout):
-											match child_layout.layout.representation:
-												ManagedRecord:
-													representation = InlineOwningPayload
-												InlineRecord:
-													void
-										None:
-											failure = Some(
-												invalid(
-													span,
-													"missing concrete record child layout",
-												),
-											)
-											break
-								StringType | ListType(_):
-									representation = InlineOwningPayload
-								UnionType(child):
-									match dependencies.get(union_number(child)):
-										Some(layout):
-											match layout.layout.representation:
-												InlineOwningPayload:
-													representation = InlineOwningPayload
-												InlineUnmanaged:
-													void
-										None:
-											failure = Some(
-												invalid(
-													span,
-													"missing concrete child layout",
-												),
-											)
-											break
-								_:
-									void
+					if is_self_reference(written.value_type, key):
+						-- Checking admitted this edge; the instance identity is
+						-- reserved locally and filled once every child is frozen.
+						self_referencing = True
+						fields = fields.append(ReservedSelfPayload)
+					else:
+						match prepare_type(written.value_type, substitution, checked, dependencies, written.span, record_dependencies):
+							Err(error):
+								failure = Some(error)
+								break
+							Ok(prepared):
+								dependencies = prepared.unions
+								record_dependencies = prepared.records
+								fields = fields.append(ChildPayload(prepared.value_type))
+								match prepared.value_type:
+									RecordType(child):
+										match record_dependencies.get(record_number(child)):
+											Some(child_layout):
+												match child_layout.layout.representation:
+													ManagedRecord:
+														owning = True
+													InlineRecord:
+														void
+											None:
+												failure = Some(
+													invalid(
+														span,
+														"missing concrete record child layout",
+													),
+												)
+												break
+									StringType | ListType(_):
+										owning = True
+									UnionType(child):
+										match dependencies.get(union_number(child)):
+											Some(layout):
+												match layout.layout.representation:
+													InlineOwningPayload | BoxedRecursive:
+														owning = True
+													InlineUnmanaged:
+														void
+											None:
+												failure = Some(
+													invalid(
+														span,
+														"missing concrete child layout",
+													),
+												)
+												break
+									_:
+										void
 				if failure.is_some():
 					break
 				variants = variants.append(fields)
@@ -944,14 +995,24 @@ private pure func ensure_union(
 				None:
 					Ok(void)
 
-			-- Freeze dependencies first: every inline child precedes its parent.
+			-- A self-referencing union is boxed whatever else it stores; the box
+			-- owns every payload. Otherwise an owning child makes it owning.
+			representation = if self_referencing:
+				BoxedRecursive
+			else if owning:
+				InlineOwningPayload
+			else:
+				InlineUnmanaged
+
+			-- Freeze dependencies first: every child precedes its parent, and
+			-- only the parent's own reserved identity may follow it.
 			id: UnionInstanceId = into_opaque UnionInstanceId(dependencies.length())
 			Ok({
 				value_type = UnionType(id),
 				unions = dependencies.append({
 					key = key,
 					layout = {
-						variants = variants,
+						variants = complete_payloads(variants, id),
 						representation = representation
 					},
 				}),

@@ -1,0 +1,155 @@
+import:
+	../../../src/utils/names: program_names
+	../../../src/emit/emit: emit
+	../../../src/lex/lex: lex
+	../../../src/lower/lower: lower
+	../../../src/own/own: own
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/specialize/specialize: specialize
+	../../../src/utils/syntax: Diagnostic
+	../../../src/verify/verify: VerifiedProgram, verify
+	../input: check, parse, setup_diagnostic
+	test: TestSuite
+
+
+private NAT_SOURCE: String =
+	|fixed union Nat:
+	|    Zero
+	|    Succ(Nat)
+	|pure func make() -> Nat:
+	|    Succ(Succ(Zero))
+	|pure func walk(value: Nat) -> Int:
+	|    match value:
+	|        Zero: 7
+	|        Succ(child): walk(child)
+	|func main() -> Int:
+	|    walk(make())
+	|
+
+private TRAIL_SOURCE: String =
+	|fixed union Trail:
+	|    End
+	|    Step(String, Trail)
+	|pure func make() -> Trail:
+	|    Step("a", End)
+	|func main() -> Int:
+	|    unused = make()
+	|    0
+	|
+
+-- Independent complete C oracles for the boxed union's declarations and helpers.
+private BOXED_STRUCT: String =
+	"enum blorp_tag_0{blorp_v_0_0,blorp_v_0_1};struct blorp_u_0{_Atomic uint64_t references;enum blorp_tag_0 tag;union{struct{struct blorp_u_0* blorp_uf_0;} blorp_up_1;}payload;};"
+
+private MAKE_HELPER: String =
+	"struct blorp_u_0* blorp_union_make_0(struct blorp_u_0 fields){struct blorp_u_0* value=malloc(sizeof *value);if(!value)abort();atomic_init(&value->references,UINT64_C(1));value->tag=fields.tag;value->payload=fields.payload;return value;}"
+
+private DUP_HELPER: String =
+	"void blorp_union_dup_0(struct blorp_u_0* value){(void)atomic_fetch_add_explicit(&value->references,UINT64_C(1),memory_order_relaxed);}"
+
+private DROP_HEADER: String = "void blorp_union_drop_0(struct blorp_u_0* value){"
+
+private DROP_HELPER: String =
+	"void blorp_union_drop_0(struct blorp_u_0* value){struct blorp_u_0* node=value;while(node!=NULL){if(atomic_fetch_sub_explicit(&node->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;struct blorp_u_0* child=NULL;switch(node->tag){case blorp_v_0_0:break;case blorp_v_0_1:child=node->payload.blorp_up_1.blorp_uf_0;break;}free(node);node=child;}}"
+
+-- A sibling payload is released in its variant's case before the child is saved.
+private TRAIL_DROP_HELPER: String =
+	"void blorp_union_drop_0(struct blorp_u_0* value){struct blorp_u_0* node=value;while(node!=NULL){if(atomic_fetch_sub_explicit(&node->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;struct blorp_u_0* child=NULL;switch(node->tag){case blorp_v_0_0:break;case blorp_v_0_1:blorp_string_release(node->payload.blorp_up_1.blorp_uf_0);child=node->payload.blorp_up_1.blorp_uf_1;break;}free(node);node=child;}}"
+
+
+private pure func verified(source: String) -> Result[VerifiedProgram, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parsed ?= parse(tokens)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	lowered ?= specialize(checked).and_then(pure func(program): lower(program))
+	owned ?= own(lowered)
+	verify(owned)
+
+
+private pure func emitted(source: String) -> Result[String, Diagnostic]:
+	verified(source).and_then(emit)
+
+
+-- The release helper's text, from its header to the loop's closing braces.
+private pure func release_helper(code: String) -> Option[String]:
+	start ?= code.index_of(DROP_HEADER)
+	tail = code.substring(start, code.length() - start)
+	end ?= tail.index_of("}}")
+	Some(tail.substring(0, end + 2))
+
+
+pure func test_boxed_union_is_defined_once_with_its_headers() -> Bool:
+	match emitted(NAT_SOURCE):
+		Err(_): False
+		Ok(code):
+			(
+				code.count(BOXED_STRUCT) == 1
+				and not code.contains("struct blorp_u_0;")
+				and code.contains("#include <stdlib.h>\n#include <stdatomic.h>\n")
+			)
+
+
+pure func test_boxed_union_helpers_are_constructor_retain_and_release() -> Bool:
+	match emitted(NAT_SOURCE):
+		Err(_): False
+		Ok(code): code.contains(BOXED_STRUCT + MAKE_HELPER + DUP_HELPER + DROP_HELPER)
+
+
+pure func test_release_is_a_loop_that_never_calls_itself() -> Bool:
+	match emitted(NAT_SOURCE):
+		Err(_): False
+		Ok(code):
+			match release_helper(code):
+				None: False
+				Some(helper):
+					(
+						helper == DROP_HELPER
+						and helper.contains("while(node!=NULL)")
+						and helper.count("blorp_union_drop_0(") == 1
+						and not helper.contains("blorp_union_drop_0(child")
+					)
+
+
+pure func test_sibling_payload_is_released_before_the_child_is_saved() -> Bool:
+	match emitted(TRAIL_SOURCE):
+		Err(_): False
+		Ok(code):
+			match release_helper(code):
+				None: False
+				Some(helper): helper == TRAIL_DROP_HELPER and helper.count("blorp_union_drop_0(") == 1
+
+
+pure func test_construction_allocates_one_box_from_an_acquired_child() -> Bool:
+	match emitted(NAT_SOURCE):
+		Err(_): False
+		Ok(code):
+			(
+				code.contains("blorp_union_make_0((struct blorp_u_0){.tag=blorp_v_0_0})")
+				and code.contains("blorp_union_make_0((struct blorp_u_0){.tag=blorp_v_0_1,.payload.blorp_up_1={.blorp_uf_0=blorp_owner_")
+				and code.contains("struct blorp_u_0* blorp_f_1(void);")
+			)
+
+
+pure func test_match_reads_the_tag_and_payload_through_the_pointer() -> Bool:
+	match emitted(NAT_SOURCE):
+		Err(_): False
+		Ok(code):
+			(
+				code.contains("int64_t blorp_f_2(struct blorp_u_0* blorp_p_0)")
+				and code.contains("switch(blorp_vl_0->tag){case blorp_v_0_0:")
+				and code.contains("struct blorp_u_0* const blorp_vl_2=blorp_vl_0->payload.blorp_up_1.blorp_uf_0;")
+				and code.contains("blorp_f_2(blorp_vl_2)")
+			)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 boxed recursive union emission",
+	tests = [
+		("boxed union defined once with its headers", test_boxed_union_is_defined_once_with_its_headers),
+		("boxed union helpers are constructor, retain and release", test_boxed_union_helpers_are_constructor_retain_and_release),
+		("release is a loop that never calls itself", test_release_is_a_loop_that_never_calls_itself),
+		("sibling payload released before the child is saved", test_sibling_payload_is_released_before_the_child_is_saved),
+		("construction allocates one box from an acquired child", test_construction_allocates_one_box_from_an_acquired_child),
+		("match reads the tag and payload through the pointer", test_match_reads_the_tag_and_payload_through_the_pointer),
+	]
+}

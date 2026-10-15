@@ -475,7 +475,8 @@ own only their active variant's children. Their generated dup/drop helpers visit
 that child path; the union root has no heap allocation or reference count.
 Nullary and unmanaged active variants keep the same aggregate obligation while
 performing no child ownership work. Finite nesting composes through child-first
-helpers and managed record roots; recursive layouts remain unsupported.
+helpers and managed record roots; a union may also name itself as one direct
+payload, which stores it boxed (see [unary recursive unions](#unary-recursive-unions)).
 A phantom `Marker[String]` with no parameter payload remains valid, as does
 `Tagged[String]` whose field is explicitly Int. Equal layouts retain distinct
 nominal instance identities.
@@ -496,8 +497,8 @@ write one distinct binder or `_` for each position, such as `Pair(left, _)`.
 Each managed stored occurrence acquires an independent obligation, including
 `Pair(text, text)`; an escaped managed child remains live after its parent retires.
 Nonempty variants use inline C field structs, while nullary variants have no
-payload member. Lists, nested patterns and recursive aggregate types retain
-their existing restrictions.
+payload member. Lists, nested patterns and recursive aggregate types other than
+a direct self-reference retain their existing restrictions.
 
 The [managed payload example](test/e2e/fixtures/generic/managed/basic.brp) runs
 `unbox(box(42.to_string())).length()` and exits 2. Its tail match borrows the
@@ -535,10 +536,10 @@ an arm-local owner across a recursive call. Each fixture runs through its real
 `main`, with unchanged generated C compiled at `-O0` under ASan/UBSan. Every
 fixture has limits of 10,000 allocations and 100,000,000 instructions. Calls
 use the C stack; automatic tail-call optimization and constant-stack recursion are not
-part of this increment. Recursive data remains a separate ownership increment;
-cyclic runtime data is forbidden.
-The [recursive-data roadmap](ROADMAP.md#recursive-data) defines the independently validated
-increments and the ownership requirements for later recursive data.
+part of this increment. Cyclic runtime data is forbidden. The first recursive
+data shape, a [unary recursive union](#unary-recursive-unions), is supported;
+the [recursive-data roadmap](ROADMAP.md#recursive-data) defines the remaining
+shapes and their ownership requirements.
 An explicit `@tail_recursive` function has a checked direct-self loop guarantee:
 
 ```blorp
@@ -677,6 +678,65 @@ no child work, while Err dup/drop visits its String. Written applications and
 finite String-bearing payloads may nest.
 
 
+## Unary recursive unions
+
+A union may name itself as one direct payload of a variant. The
+[depth example](test/e2e/fixtures/recursive/depth.brp) counts a chain:
+
+```blorp
+import:
+    int: add
+fixed union Nat:
+    Zero
+    Succ(Nat)
+pure func make() -> Nat:
+    Succ(Succ(Succ(Zero)))
+pure func count(value: Nat, total: Int) -> Int:
+    match value:
+        Zero: total
+        Succ(child): count(child, add(total, 1))
+func main() -> Int:
+    count(make(), 0)
+```
+
+It exits 3. Checking admits exactly this shape: a non-generic union whose only
+references to itself are direct variant payloads, with at most one such payload
+per variant, so every value is a chain. Mutual recursion (`A(B)`, `B(A)`),
+recursion through a record, a `List[Nat]` payload, a generic `Tree[T]` naming
+`Tree[T]`, and two self payloads in one variant are rejected at the written
+annotation with help naming the admitted form. Other payloads may sit beside the
+self-reference, such as `Step(String, Trail)`.
+
+Specialization reserves the union's instance identity locally while its other
+payloads are prepared and publishes one complete layout whose representation is
+boxed: every value, including a leaf such as `Zero`, is a counted heap node and
+the self payload is a pointer to the child node. A record or union holding a
+boxed union is managed or owning as for any managed child; `List[Nat]` elements
+use the same dup/drop helpers. Verification accepts a layout that refers to
+itself only through a boxed payload and rejects a self payload under an inline
+representation, a boxed layout without one, two self payloads in a variant, and a
+cycle closed through a record.
+
+Constructing `Succ(n)` allocates one node from the same compound literal an
+inline union uses and stores `n` as an acquired occurrence under the existing
+payload rule; matching reads the tag and payload through the pointer, and the
+match binding borrows from its parent as record fields do. The generated C has
+the node struct, a constructor, a retain and an iterative final release: when a
+node's count reaches zero the walk releases its other payloads, saves its one
+child, frees the node and continues with the child while that child also dies,
+so C stack use does not grow with the chain. The
+[trail example](test/e2e/fixtures/recursive/trail.brp) keeps a `Step(String, Trail)`
+chain inside an inline owning union and prints each String. The
+[shared example](test/e2e/fixtures/recursive/shared.brp) stores one chain in two
+record fields and exits 4; the [deep example](test/e2e/fixtures/recursive/deep.brp)
+builds a 10,000-deep chain by ordinary recursion, prints its length and releases
+it. A direct runtime test releases a 100,000-deep chain, built iteratively from
+completed children, on a 512 KiB thread stack. Source construction and traversal
+still use ordinary C call depth, and managed values remain outside
+`@tail_recursive` loops. See the
+[increment report](../benchmarks/results/blorp_2_recursive_unary_2026-10-15.md).
+
+
 ## Finite mixed records
 
 Fixed records can contain any currently supported finite concrete type, including
@@ -706,8 +766,9 @@ occurrence; inline owning union fields drop their active payload paths.
 Acquired managed projections remain valid after their parent is destroyed.
 
 Whole-variable reassignment preserves old aliases. Empty record
-declarations, recursive data and field assignment remain unsupported.
-Recursive declaration references reject before layout expansion.
+declarations, recursive records and field assignment remain unsupported.
+Recursive declaration references other than a union's direct self payload
+reject before layout expansion.
 The [roadmap](ROADMAP.md#first-increment-mixed-finite-records) tracks final
 integrated acceptance and later aggregate extensions.
 
@@ -1101,9 +1162,10 @@ Semantic rules:
   concrete instances. This applies to unused declarations as well as called ones.
 - Recursive calls do not permit cyclic runtime data. Values remain immutable
   graphs of already constructed values; whole-binding reassignment cannot make
-  an existing value refer back to its replacement. Recursive data declarations
-  remain deferred until their managed layouts and bounded-stack destruction are
-  supported and independently verified.
+  an existing value refer back to its replacement. A union may name itself as
+  one direct variant payload and is then stored boxed with an iterative final
+  release; mutual, generic and branching recursive declarations remain deferred
+  until their layouts and bounded-stack destruction are verified.
 - Generic declarations are checked once with distinct rigid type parameters, including
   unused bodies. An arbitrary `T` cannot return an Int literal or call a
   concrete Int/String runtime operation. Parameters cannot share a name with
@@ -1128,8 +1190,8 @@ Semantic rules:
   private variables and tentative facts never escape checking.
   Union instances are keyed by declaration and all ordered concrete arguments; repeated
   direct/UFCS requests reuse the same instance. Layout admission accepts finite
-  owning inline unions and managed records before lowering. Recursive declaration
-  forms remain unsupported.
+  owning inline unions, managed records and boxed unary recursive unions before
+  lowering. Other recursive declaration forms remain unsupported.
 - Each concrete function has its checked C return type and a generated symbol based
   on its compilation-local identity. `Int` uses `int64_t`; each union uses its own
   synthetic enum when all its variants are nullary. A payload-bearing union
@@ -1159,7 +1221,7 @@ Semantic rules:
   are admitted before an ordinary terminating match. Each selected arm discharges
   prefix obligations after securing its result. Literal construction creates a
   fresh ordinary String owner. COW, joins and managed annotated loops are deferred.
-- Recursive layouts, nested and non-tail matches (they parse; checking rejects them),
+- Recursive layouts beyond a unary self-reference, nested and non-tail matches (they parse; checking rejects them),
   guards, qualified/nested/literal patterns, constructor UFCS, multiline chains,
   and function
   values are outside this increment. `Bool` is an ordinary fixed union declared

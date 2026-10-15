@@ -1,0 +1,215 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/utils/source: COMPILER_SOURCE
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, Span, Entrypoint(NoArguments), EntryResult(IntegerExitStatus), FunctionExecution(OrdinaryCalls), entry_function, same_span
+	../../../src/utils/text: concat
+	../../../src/verify/verify: verify
+	../input: check, setup_diagnostic
+	../module_input: PRIMITIVE_BASE, parse_modules_with_base
+	../ownership_inputs: span
+	option: to_result
+	test: TestSuite
+
+
+private fixed record RecursiveIds {
+	first: Lower.ValueId,
+	entrypoint: Concrete.FunctionInstanceId,
+	record_id: Concrete.RecordInstanceId,
+	union_id: Concrete.UnionInstanceId,
+	later_union_id: Concrete.UnionInstanceId,
+	records: List[Concrete.ConcreteRecord],
+	unions: List[Concrete.ConcreteUnion],
+	owned: Own.OwnershipProgram
+}
+
+
+private pure func seed_error(message: String) -> Diagnostic:
+	{
+		span = span(0), note = None,
+		message = "invalid recursive union identity seed: ".concat(message),
+		help = "fix the recursive union verification test setup"
+	}
+
+
+-- One real producer issues the identities; malformed layouts below are built
+-- by hand around them and never come from the specializer.
+private pure func recursive_ids() -> Result[RecursiveIds, Diagnostic]:
+	source: String =
+		|fixed union Nat:
+		|    Zero
+		|    Succ(Nat)
+		|fixed record Holder { value: Nat }
+		|fixed union Wrap:
+		|    Empty
+		|    Full(Nat)
+		|pure func make() -> Holder:
+		|    { value = Succ(Zero) }
+		|pure func wrap() -> Wrap:
+		|    Full(Zero)
+		|func main() -> Int:
+		|    unused = make()
+		|    other = wrap()
+		|    0
+		|
+	parsed ?= parse_modules_with_base([{ source = source, targets = [] }], PRIMITIVE_BASE)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	lowered ?= Concrete.specialize(checked).and_then(Lower.lower)
+	owned ?= Own.own(lowered)
+	program = Lower.lowered_functions(lowered)
+	entrypoint = entry_function(program.entrypoint)
+	main ?= program.functions.get(Concrete.function_number(entrypoint)).to_result(seed_error("entrypoint row is missing"))
+	first ?= main.definitions.get(0).to_result(seed_error("first value is missing"))
+	second ?= main.definitions.get(1).to_result(seed_error("second value is missing"))
+	holder ?= match first.value_type:
+		Concrete.RecordType(id): Ok(id)
+		_: Err(seed_error("make does not return the record"))
+	wrap ?= match second.value_type:
+		Concrete.UnionType(id): Ok(id)
+		_: Err(seed_error("wrap does not return the later union"))
+	layout ?= program.records.get(Concrete.record_number(holder)).to_result(seed_error("record layout is missing"))
+	match layout.fields:
+		[Concrete.UnionType(nat)]:
+			if Concrete.union_number(nat) == 0 and Concrete.union_number(wrap) == 1:
+				Ok({
+					first = first.id, entrypoint = entrypoint, record_id = holder, union_id = nat, later_union_id = wrap,
+					records = program.records, unions = program.unions, owned = owned
+				})
+			else:
+				Err(seed_error("union instances are not ordered Nat then Wrap"))
+		_: Err(seed_error("record does not hold the union"))
+
+
+private pure func integer_main(id: Lower.ValueId) -> Own.OwnedFunction:
+	{
+		execution = OrdinaryCalls,
+		signature = { parameters = [], return_type = Concrete.IntType },
+		operations = [Own.DefineValue({
+			id = id, value_type = Concrete.IntType,
+			operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(10)
+		})],
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(id)))
+	}
+
+
+private pure func program(
+	ids: RecursiveIds,
+	records: List[Concrete.ConcreteRecord],
+	unions: List[Concrete.ConcreteUnion],
+) -> Own.OwnershipProgram:
+	{
+		records = records, unions = unions,
+		functions = [integer_main(ids.first)],
+		entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus)
+	}
+
+
+private pure func compiler_span() -> Span:
+	{ source = COMPILER_SOURCE, start = 0, end = 0 }
+
+
+private pure func rejects(input: Own.OwnershipProgram, message: String) -> Bool:
+	match verify(input):
+		Err(error):
+			(
+				error.message == "ownership verification failed: ".concat(message)
+				and error.help == "report this compiler error with the input program"
+				and same_span(error.span, compiler_span()) and error.note.is_none()
+			)
+		Ok(_): False
+
+
+private pure func nat(ids: RecursiveIds, representation: Concrete.UnionRepresentation) -> Concrete.ConcreteUnion:
+	{ variants = [[], [Concrete.UnionType(ids.union_id)]], representation = representation }
+
+
+pure func test_real_boxed_nat_program_verifies() -> Bool:
+	match recursive_ids():
+		Err(_): False
+		Ok(ids): verify(ids.owned).is_ok()
+
+
+pure func test_boxed_self_payload_layout_is_accepted_alone() -> Bool:
+	match recursive_ids():
+		Err(_): False
+		Ok(ids): verify(program(ids, [], [nat(ids, Concrete.BoxedRecursive)])).is_ok()
+
+
+pure func test_self_payload_under_an_inline_representation_is_rejected() -> Bool:
+	match recursive_ids():
+		Err(_): False
+		Ok(ids):
+			(
+				rejects(program(ids, [], [nat(ids, Concrete.InlineOwningPayload)]), "recursive union payload requires the boxed representation")
+				and rejects(program(ids, [], [nat(ids, Concrete.InlineUnmanaged)]), "recursive union payload requires the boxed representation")
+			)
+
+
+pure func test_boxed_layout_without_a_self_payload_is_rejected() -> Bool:
+	match recursive_ids():
+		Err(_): False
+		Ok(ids):
+			boxed: Concrete.ConcreteUnion = { variants = [[], [Concrete.IntType]], representation = Concrete.BoxedRecursive }
+			rejects(program(ids, [], [boxed]), "boxed union representation requires a self-referencing payload")
+
+
+pure func test_two_self_payloads_in_one_variant_are_rejected() -> Bool:
+	match recursive_ids():
+		Err(_): False
+		Ok(ids):
+			tree: Concrete.ConcreteUnion = {
+				variants = [[], [Concrete.UnionType(ids.union_id), Concrete.UnionType(ids.union_id)]],
+				representation = Concrete.BoxedRecursive
+			}
+			rejects(program(ids, [], [tree]), "boxed union variant may store at most one self-reference")
+
+
+pure func test_boxed_union_cannot_close_a_cycle_through_a_record() -> Bool:
+	match recursive_ids():
+		Err(_): False
+		Ok(ids):
+			records: List[Concrete.ConcreteRecord] = [{ fields = [Concrete.UnionType(ids.union_id)], representation = Concrete.ManagedRecord }]
+			looped: Concrete.ConcreteUnion = {
+				variants = [[Concrete.RecordType(ids.record_id)], [Concrete.UnionType(ids.union_id)]],
+				representation = Concrete.BoxedRecursive
+			}
+			rejects(program(ids, records, [looped]), "recursive aggregate layout is unsupported")
+
+
+-- Direct mutual recursion has no admitted layout: the earlier union would
+-- name a later one, which the per-layout ordering rule rejects before any
+-- graph walk, even when both claim the boxed representation.
+pure func test_direct_mutual_boxed_layouts_are_rejected() -> Bool:
+	match recursive_ids():
+		Err(_): False
+		Ok(ids):
+			first: Concrete.ConcreteUnion = { variants = [[Concrete.UnionType(ids.later_union_id)]], representation = Concrete.BoxedRecursive }
+			second: Concrete.ConcreteUnion = { variants = [[Concrete.UnionType(ids.union_id)]], representation = Concrete.BoxedRecursive }
+			rejects(program(ids, [], [first, second]), "union payload must reference a supported, earlier layout")
+
+
+pure func test_record_holding_a_boxed_union_must_be_managed() -> Bool:
+	match recursive_ids():
+		Err(_): False
+		Ok(ids):
+			inline: List[Concrete.ConcreteRecord] = [{ fields = [Concrete.UnionType(ids.union_id)], representation = Concrete.InlineRecord }]
+			(
+				verify(program(ids, ids.records, ids.unions)).is_ok()
+				and rejects(program(ids, inline, ids.unions), "record storage summary does not match its fields")
+			)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 recursive union layout verification",
+	tests = [
+		("real boxed Nat program verifies", test_real_boxed_nat_program_verifies),
+		("boxed self payload layout accepted alone", test_boxed_self_payload_layout_is_accepted_alone),
+		("self payload under an inline representation rejected", test_self_payload_under_an_inline_representation_is_rejected),
+		("boxed layout without a self payload rejected", test_boxed_layout_without_a_self_payload_is_rejected),
+		("two self payloads in one variant rejected", test_two_self_payloads_in_one_variant_are_rejected),
+		("boxed union cannot close a cycle through a record", test_boxed_union_cannot_close_a_cycle_through_a_record),
+		("direct mutual boxed layouts rejected", test_direct_mutual_boxed_layouts_are_rejected),
+		("record holding a boxed union must be managed", test_record_holding_a_boxed_union_must_be_managed),
+	]
+}

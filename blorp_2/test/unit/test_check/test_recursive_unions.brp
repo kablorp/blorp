@@ -1,0 +1,119 @@
+import:
+	../../../src/check/check: CheckedProgram, checked_functions
+	../../../src/check/errors as Errors
+	../../../src/check/model as Model
+	../../../src/utils/ids as Declaration
+	../../../src/utils/syntax: Diagnostic
+	../input: check_failure, checked_source
+	test: TestSuite
+
+
+private MAIN: String =
+	|func main() -> Int:
+	|    0
+	|
+
+private HELP: String =
+	"use finite record and union fields; a non-generic union may refer to itself only as one direct variant payload, such as Next(Node)"
+
+
+-- Step 1 of recursive data admits exactly a direct self-reference payload.
+private pure func admits(source: String) -> Bool:
+	checked_source(source).is_ok()
+
+
+-- The rejection keeps its typed edge, exact text and the written annotation span.
+private pure func rejects_recursive(prefix: String, annotation: String, suffix: String) -> Bool:
+	source = prefix + annotation + suffix
+	typed = match check_failure(source):
+		Some(error):
+			match error.kind:
+				Errors.TypeDeclarationRejection(Errors.RecursiveAggregateType(_)):
+					error.span.start == prefix.length() and error.span.end == prefix.length() + annotation.length()
+				_: False
+		None: False
+	match checked_source(source):
+		Ok(_): False
+		Err(error):
+			(
+				typed
+				and error.message == "recursive aggregate types are not supported yet"
+				and error.help == HELP
+				and error.span.start == prefix.length()
+				and error.span.end == prefix.length() + annotation.length()
+			)
+
+
+pure func test_unary_self_reference_is_admitted_and_keeps_its_declaration_edge() -> Bool:
+	source: String =
+		|fixed union Nat:
+		|    Zero
+		|    Succ(Nat)
+		|
+	match checked_source(source + MAIN):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).unions:
+				[nat]:
+					match nat.variants.map(pure func(variant): variant.fields):
+						[[], [payload]]:
+							match payload.value_type:
+								Model.UnionType(id): Declaration.union_number(id) == Declaration.union_number(nat.id)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_unused_self_reference_is_admitted() -> Bool:
+	admits("fixed union Node:\n    Next(Node)\n" + MAIN)
+
+
+pure func test_self_reference_beside_a_managed_field_is_admitted() -> Bool:
+	admits("fixed union Trail:\n    End\n    Step(String, Trail)\n" + MAIN)
+
+
+pure func test_self_reference_in_two_variants_is_admitted() -> Bool:
+	admits("fixed union Walk:\n    Stop\n    Left(Walk)\n    Right(Walk)\n" + MAIN)
+
+
+pure func test_two_self_payloads_in_one_variant_reject_the_second() -> Bool:
+	rejects_recursive("fixed union Tree:\n    Leaf\n    Branch(Tree, ", "Tree", ")\n" + MAIN)
+
+
+pure func test_mutual_recursion_rejects_the_closing_edge() -> Bool:
+	rejects_recursive("fixed union A:\n    Wrap(B)\nfixed union B:\n    Back(", "A", ")\n" + MAIN)
+
+
+-- A nested cycle reports the whole written payload, as applied cycles do.
+pure func test_recursion_through_a_list_rejects_the_whole_payload() -> Bool:
+	rejects_recursive("fixed union Nat:\n    Zero\n    Many(", "List[Nat]", ")\n" + MAIN)
+
+
+pure func test_generic_self_reference_rejects_the_applied_edge() -> Bool:
+	rejects_recursive("fixed union Tree[T]:\n    Leaf(T)\n    Node(", "Tree[T]", ")\n" + MAIN)
+
+
+-- Records are visited first, so the union's payload closes the cycle.
+pure func test_recursion_through_a_record_rejects_the_record_edge() -> Bool:
+	rejects_recursive("fixed record Link { next: Node }\nfixed union Node:\n    Step(", "Link", ")\n" + MAIN)
+
+
+pure func test_self_recursive_record_still_rejects() -> Bool:
+	rejects_recursive("fixed record Node { next: ", "Node", " }\n" + MAIN)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 recursive union admission",
+	tests = [
+		("unary self-reference admitted with its declaration edge", test_unary_self_reference_is_admitted_and_keeps_its_declaration_edge),
+		("unused self-reference admitted", test_unused_self_reference_is_admitted),
+		("self-reference beside a managed field admitted", test_self_reference_beside_a_managed_field_is_admitted),
+		("self-reference in two variants admitted", test_self_reference_in_two_variants_is_admitted),
+		("two self payloads in one variant rejected", test_two_self_payloads_in_one_variant_reject_the_second),
+		("mutual recursion rejected", test_mutual_recursion_rejects_the_closing_edge),
+		("recursion through List rejected", test_recursion_through_a_list_rejects_the_whole_payload),
+		("generic self-reference rejected", test_generic_self_reference_rejects_the_applied_edge),
+		("recursion through a record rejected", test_recursion_through_a_record_rejects_the_record_edge),
+		("self-recursive record rejected", test_self_recursive_record_still_rejects),
+	]
+}

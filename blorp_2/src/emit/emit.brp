@@ -50,7 +50,7 @@ import:
 		RecordRepresentation(InlineRecord, ManagedRecord),
 		TypeRef(VoidType, IntType, FloatType, StringType, ListType, UnionType, RecordType),
 		UnionInstanceId,
-		UnionRepresentation(InlineUnmanaged, InlineOwningPayload),
+		UnionRepresentation(InlineUnmanaged, InlineOwningPayload, BoxedRecursive),
 		VariantInstanceId, variant_field_variant, variant_field_number,
 		field_number,
 		field_owner,
@@ -213,13 +213,52 @@ private pure func has_payload(declaration: ConcreteUnion) -> Bool:
 	declaration.variants.any(pure func(fields): not fields.is_empty())
 
 
-private pure func union_c_type(id: UnionInstanceId, declaration: ConcreteUnion) -> String:
-	prefix = if has_payload(declaration):
-		"struct blorp_u_"
-	else:
-		"enum blorp_u_"
+private pure func boxed_union_struct(index: Int) -> String:
+	"struct blorp_u_".append_int(index)
 
-	prefix.append_int(union_number(id))
+
+-- A boxed union value is a pointer to its counted node.
+private pure func union_c_type(id: UnionInstanceId, declaration: ConcreteUnion) -> String:
+	match declaration.representation:
+		BoxedRecursive:
+			boxed_union_struct(union_number(id)).concat("*")
+		InlineUnmanaged | InlineOwningPayload:
+			prefix = if has_payload(declaration):
+				"struct blorp_u_"
+			else:
+				"enum blorp_u_"
+
+			prefix.append_int(union_number(id))
+
+
+-- A local holding a pointer is itself const, so const follows a pointer type.
+-- String, List and boxed union carriers spell their pointer in the C type.
+private pure func c_local_declaration(
+	value_type: TypeRef,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	type_name ?= c_type(value_type, unions)
+	pointer_carrier ?= match value_type:
+		StringType | ListType(_):
+			Ok(True)
+		UnionType(id):
+			match unions.get(union_number(id)):
+				None:
+					Err(internal_error())
+				Some(layout):
+					Ok(
+						match layout.representation:
+							BoxedRecursive: True
+							InlineUnmanaged | InlineOwningPayload: False
+					)
+		_:
+			Ok(False)
+	Ok(
+		if pointer_carrier:
+			type_name.concat(" const ")
+		else:
+			"const ".concat(type_name).concat(" ")
+	)
 
 
 private pure func record_c_type(id: RecordInstanceId) -> String:
@@ -341,6 +380,13 @@ private pure func c_parameters(
 				Ok(output.concat(")"))
 
 
+-- Inline unions are read by value; boxed unions through their node pointer.
+private pure func union_member_selector(declaration: ConcreteUnion) -> String:
+	match declaration.representation:
+		BoxedRecursive: "->"
+		InlineUnmanaged | InlineOwningPayload: "."
+
+
 private pure func c_payload(id: VariantInstanceId) -> String:
 	"blorp_up_".append_int(variant_number(id))
 
@@ -385,7 +431,13 @@ private pure func append_union(
 		result = result
 			.concat("struct blorp_u_")
 			.append_int(index)
-			.concat("{enum blorp_tag_")
+			.concat("{")
+			.concat(
+				match declaration.representation:
+					BoxedRecursive: "_Atomic uint64_t references;"
+					InlineUnmanaged | InlineOwningPayload: ""
+			)
+			.concat("enum blorp_tag_")
 			.append_int(index)
 			.concat(" tag;union{")
 		position = 0
@@ -590,8 +642,13 @@ private pure func append_aggregate_definitions(
 																		pending = push_aggregate_visit(pending, pending_count, PrepareAggregate(RecordDefinition(record_number(id))))
 																		pending_count = IntOps.add(pending_count, 1)
 																	Some(UnionType(id)):
-																		pending = push_aggregate_visit(pending, pending_count, PrepareAggregate(UnionDefinition(union_number(id))))
-																		pending_count = IntOps.add(pending_count, 1)
+																		-- A verified self payload is a pointer into the
+																		-- definition being emitted, not a dependency.
+																		if IntOps.equals(union_number(id), index):
+																			void
+																		else:
+																			pending = push_aggregate_visit(pending, pending_count, PrepareAggregate(UnionDefinition(union_number(id))))
+																			pending_count = IntOps.add(pending_count, 1)
 																	Some(_): void
 																	None:
 																		invalid = Some(internal_error())
@@ -863,9 +920,15 @@ private pure func append_operation(
 
 			-- A union with no payload anywhere is a bare C enum, so a variant is its tag.
 			if has_payload(declaration):
+				index = union_number(variant_owner(id))
+				-- A boxed node is allocated from the same compound literal.
+				opening = match declaration.representation:
+					BoxedRecursive:
+						"blorp_union_make_".append_int(index).concat("((").concat(boxed_union_struct(index))
+					InlineUnmanaged | InlineOwningPayload:
+						"((".concat(union_c_type(variant_owner(id), declaration))
 				tagged = output
-					.concat("((")
-					.concat(union_c_type(variant_owner(id), declaration))
+					.concat(opening)
 					.concat("){.tag=")
 					.concat(c_variant(id))
 				-- A variant without fields omits the payload initializer.
@@ -880,10 +943,14 @@ private pure func append_operation(
 			-- which writes statements; it never reaches this expression writer.
 			Err(internal_error())
 		PayloadDefinition(field, id):
+			declaration ?= unions
+				.get(union_number(variant_owner(variant_field_variant(field))))
+				.to_result(internal_error())
 			Ok(
 				output
 					.concat(c_value(id))
-					.concat(".payload.")
+					.concat(union_member_selector(declaration))
+					.concat("payload.")
 					.concat(c_payload_field(
 						variant_field_variant(field),
 						variant_field_number(field),
@@ -1162,7 +1229,7 @@ private pure func append_regular_value(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[String, Diagnostic]:
-	type_name ?= c_type(value_type, unions)
+	declaration ?= c_local_declaration(value_type, unions)
 	name = c_value(id)
 
 	prepared = match operation:
@@ -1170,14 +1237,6 @@ private pure func append_regular_value(
 			append_string_bytes(output, id, bytes)
 		_:
 			output
-
-	declaration = match value_type:
-		StringType | ListType(_):
-			type_name.concat(" const ")
-		_:
-			"const "
-				.concat(type_name)
-				.concat(" ")
 
 	value ?= append_operation(
 		prepared
@@ -1205,15 +1264,7 @@ private pure func append_owner_alias(
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	name = c_owner(owner)
-	type_name ?= c_type(value_type, unions)
-
-	declaration = match value_type:
-		StringType | ListType(_):
-			type_name.concat(" const ")
-		_:
-			"const "
-				.concat(type_name)
-				.concat(" ")
+	declaration ?= c_local_declaration(value_type, unions)
 
 	Ok(
 		output
@@ -1339,7 +1390,7 @@ private pure func append_storage_operation(
 				match layout.representation:
 					InlineUnmanaged:
 						None
-					InlineOwningPayload:
+					InlineOwningPayload | BoxedRecursive:
 						prefix = match action:
 							DuplicateValue:
 								"blorp_union_dup_"
@@ -1418,6 +1469,94 @@ private pure func append_union_action(
 			Ok(result.concat("}}"))
 
 
+-- One counted node per constructed value: the compound literal's payload
+-- already holds acquired children, so the node takes them without retains.
+private pure func append_boxed_union_constructor(output: String, index: Int) -> String:
+	node = boxed_union_struct(index)
+	output
+		.concat(node)
+		.concat("* blorp_union_make_")
+		.append_int(index)
+		.concat("(")
+		.concat(node)
+		.concat(" fields){")
+		.concat(node)
+		.concat("* value=malloc(sizeof *value);if(!value)abort();")
+		.concat("atomic_init(&value->references,UINT64_C(1));")
+		.concat("value->tag=fields.tag;value->payload=fields.payload;return value;}")
+
+
+private pure func append_boxed_union_retain(output: String, index: Int) -> String:
+	output
+		.concat("void blorp_union_dup_")
+		.append_int(index)
+		.concat("(")
+		.concat(boxed_union_struct(index))
+		.concat("* value){(void)atomic_fetch_add_explicit(&value->references,UINT64_C(1),memory_order_relaxed);}")
+
+
+-- Final release walks the chain instead of recursing: a node whose count
+-- reaches zero releases its other payloads, saves its one self child, is
+-- freed, and the walk continues with that child while it also dies. C stack
+-- use is therefore constant however deep the chain is.
+private pure func append_boxed_union_release(
+	output: String,
+	layout: ConcreteUnion,
+	index: Int,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	node = boxed_union_struct(index)
+	var result = output
+		.concat("void blorp_union_drop_")
+		.append_int(index)
+		.concat("(")
+		.concat(node)
+		.concat("* value){")
+		.concat(node)
+		.concat("* node=value;while(node!=NULL){")
+		.concat("if(atomic_fetch_sub_explicit(&node->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;")
+		.concat(node)
+		.concat("* child=NULL;switch(node->tag){")
+	var position = 0
+	var failure: Option[Diagnostic] = None
+
+	for fields in layout.variants:
+		result = result
+			.concat("case blorp_v_")
+			.append_int(index)
+			.concat("_")
+			.append_int(position)
+			.concat(":")
+		var field_position = 0
+		for value_type in fields:
+			path = "node->payload.blorp_up_"
+				.append_int(position)
+				.concat(".blorp_uf_")
+				.append_int(field_position)
+			self_child = match value_type:
+				UnionType(id): IntOps.equals(union_number(id), index)
+				_: False
+			if self_child:
+				result = result.concat("child=").concat(path).concat(";")
+			else:
+				match append_storage_operation(result, value_type, DestroyValue, path, unions):
+					Ok(updated): result = updated
+					Err(error):
+						failure = Some(error)
+						break
+			field_position = IntOps.add(field_position, 1)
+		if failure.is_some():
+			break
+		result = result.concat("break;")
+		position = IntOps.add(position, 1)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result.concat("}free(node);node=child;}}"))
+
+
 private pure func append_union_ownership(
 	output: String,
 	layout: ConcreteUnion,
@@ -1430,6 +1569,9 @@ private pure func append_union_ownership(
 		InlineOwningPayload:
 			duplicated ?= append_union_action(output, layout, index, unions, DuplicateValue)
 			append_union_action(duplicated, layout, index, unions, DestroyValue)
+		BoxedRecursive:
+			constructed = append_boxed_union_constructor(output, index)
+			append_boxed_union_release(append_boxed_union_retain(constructed, index), layout, index, unions)
 
 
 private pure func append_ownership_operation(
@@ -1529,7 +1671,7 @@ private pure func append_match(
 	var fragments: List[String] = [opening]
 
 	if has_payload(declaration):
-		fragments = fragments.append(".tag")
+		fragments = fragments.append(union_member_selector(declaration).concat("tag"))
 
 	fragments = fragments.append("){")
 	var has_default = False
@@ -2252,6 +2394,21 @@ private pure func aggregate_runtime_contents(
 	Ok(fragments.join(""))
 
 
+-- Boxed union nodes need the allocation and atomic headers like managed records.
+private pure func has_boxed_union(unions: List[ConcreteUnion]) -> Bool:
+	var boxed = False
+
+	for layout in unions:
+		match layout.representation:
+			BoxedRecursive:
+				boxed = True
+				break
+			InlineUnmanaged | InlineOwningPayload:
+				void
+
+	boxed
+
+
 pure func aggregate_runtime(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	checked = verified_contents(program)
 	aggregate_runtime_contents(checked, list_layouts(checked))
@@ -2281,7 +2438,7 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 					True
 				InlineRecord:
 					False
-		)
+		) or has_boxed_union(checked.unions)
 	):
 		fragments = fragments.append("#include <stdlib.h>\n#include <stdatomic.h>\n")
 

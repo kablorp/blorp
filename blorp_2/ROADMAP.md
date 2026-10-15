@@ -75,8 +75,11 @@ earlier integration round stopped at its validated milestone; the next approved
 implementation sequence is described below.
 No whole-compiler linearity is claimed. General List construction, length and
 owned lookup are accepted after the final full gate and independent evidence
-reviews. Still absent: record/List updates, recursive data, and
-generic/managed tail loops.
+reviews. The unary recursive union (recursive data step 1) is implemented with
+a boxed representation and iterative release; see the
+[unary recursion report](../benchmarks/results/blorp_2_recursive_unary_2026-10-15.md).
+Still absent: mutual/generic/branching recursive data and generic/managed tail
+loops.
 Locally owned match-prefix values are implemented for ordinary terminating
 matches, with independent per-arm verification. Matched cost checks, two expert
 reviews and combined integration pass; see the
@@ -101,7 +104,7 @@ see the [namespace report](../benchmarks/results/blorp_2_namespace_publication_2
 | 2 | [Generic records, direct full union payload types, then multiple payload fields](#finite-aggregate-frontend-increments) | All three increments, use-vector and block-lowering preparations accepted with independent reviews, strict/native gates, mutation oracles and matched costs. |
 | 3 | [General List[T] construction, length and owned lookup](#general-lists-and-functional-updates) | Accepted: two expert reviews, 2,209 strict checks, 331 e2e cases, mutation oracles and unchanged matched cost ceilings. |
 | 4 | [Functional record/List updates](#general-lists-and-functional-updates) | Start with fresh results and borrowed-input/owned-result contracts; old aliases stay unchanged. |
-| 5 | [Unary recursive union, then mutual/regular-generic and branching mixed data](#recursive-data) | Each shape needs finite representation, acyclic values and bounded-stack destruction. |
+| 5 | [Unary recursive union, then mutual/regular-generic and branching mixed data](#recursive-data) | Unary step implemented: boxed layout, iterative release proven at 100,000 nodes on a 512 KiB stack. Each later shape needs finite representation, acyclic values and bounded-stack destruction. |
 | 6 | [Other collections and broader control flow](#broader-control-flow-and-later-scope) | Set/Dict key semantics, typed joins/edges and managed loops enter through separate examples. |
 
 Contextual inference is a separate frontend track, not a prerequisite for mixed
@@ -186,9 +189,9 @@ measurements remain serialized. The coordinator owns integration and this plan.
    library declarations was measured and rejected, because loading must stay
    complete for the prelude's `methods_only` imports; see the
    [referenced library check report](../benchmarks/results/blorp_2_referenced_library_check_2026-10-15.md).
-5. **Recursive data.** Begin with the existing unary Nat example and iterative
-   final release; then separately admit mutual, regular-generic and branching
-   mixed shapes. Reserve instance identities locally and publish only complete
+5. **Recursive data.** Step 1, the unary Nat example with an iterative final
+   release, is implemented; then separately admit mutual, regular-generic and
+   branching mixed shapes. Reserve instance identities locally and publish only complete
    layouts. Constructors accept completed children, so values remain finite
    DAGs. Every newly admitted release graph must have bounded C-stack use;
    mutually recursive release helpers alone do not meet that requirement.
@@ -996,6 +999,14 @@ rows after resolution. Box every variant of this recursive union, including
 leaves, while preserving existing finite inline unions. Forward C declarations
 and pointer fields produce finite storage. Cross-union, generic-recursive and
 multi-field recursive shapes remain rejected until their increments.
+
+Status: implemented as `BoxedRecursive` in specialization, with checker
+admission, a verifier rule that a layout refers to itself only through a boxed
+payload, and emitted constructor/retain/iterative-release helpers. The
+[report](../benchmarks/results/blorp_2_recursive_unary_2026-10-15.md) records
+the 100,000-node release on a 512 KiB stack and its recursive-release mutation
+oracle. Source construction of such a chain still uses ordinary call depth
+because managed values remain outside `@tail_recursive` loops.
 
 Constructors take completed children, acquiring independent obligations as needed.
 Projections and escapes use the same parent/acquisition contracts as records.

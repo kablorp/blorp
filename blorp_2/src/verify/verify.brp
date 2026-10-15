@@ -40,10 +40,10 @@ import:
 		RecordInstanceId,
 		RecordRepresentation(InlineRecord, ManagedRecord),
 		TypeRef(VoidType, IntType, FloatType, StringType, ListType, UnionType, RecordType),
-		UnionRepresentation(InlineUnmanaged, InlineOwningPayload),
+		UnionRepresentation(InlineUnmanaged, InlineOwningPayload, BoxedRecursive),
 		ValueOwnership(
 			NoOwnership, ManagedStringLeaf, ManagedListRoot, ManagedRecordRoot,
-			InlineOwnedFields,
+			InlineOwnedFields, ManagedUnionRoot,
 		),
 		VariantInstanceId, variant_field_variant, variant_field_number,
 		field_number,
@@ -450,7 +450,7 @@ private pure func verify_argument(
 				match plan:
 					NoOwnership:
 						Ok(void)
-					ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
+					ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
 						Err(
 							failure(
 								span,
@@ -550,8 +550,11 @@ private pure func valid_union_layout(
 	else:
 		var invalid: Option[Diagnostic] = None
 		var owning = False
+		var self_referencing = False
 
 		for fields in layout.variants:
+			var self_payloads = 0
+
 			for value_type in fields:
 				valid = match value_type:
 					VoidType | IntType | FloatType:
@@ -569,31 +572,49 @@ private pure func valid_union_layout(
 							None:
 								False
 					UnionType(id):
-						valid = (
-							IntOps.greater_than_or_equal(union_number(id), 0)
-							and IntOps.less_than(union_number(id), position)
-						)
+						if IntOps.equals(union_number(id), position):
+							-- The unary recursive shape: a boxed node's pointer to
+							-- at most one child of its own layout.
+							self_referencing = True
+							self_payloads = IntOps.add(self_payloads, 1)
 
-						if valid:
-							match unions.get(union_number(id)):
-								Some(child):
-									match child.representation:
-										InlineOwningPayload:
-											owning = True
-										InlineUnmanaged:
-											void
+							match layout.representation:
+								BoxedRecursive:
+									if IntOps.greater_than(self_payloads, 1):
+										invalid = Some(failure(span, "boxed union variant may store at most one self-reference"))
+								InlineUnmanaged | InlineOwningPayload:
+									invalid = Some(failure(span, "recursive union payload requires the boxed representation"))
 
-									True
-								None:
-									False
+							True
 						else:
-							False
+							valid = (
+								IntOps.greater_than_or_equal(union_number(id), 0)
+								and IntOps.less_than(union_number(id), position)
+							)
+
+							if valid:
+								match unions.get(union_number(id)):
+									Some(child):
+										match child.representation:
+											InlineOwningPayload | BoxedRecursive:
+												owning = True
+											InlineUnmanaged:
+												void
+
+										True
+									None:
+										False
+							else:
+								False
 					StringType:
 						owning = True
 						True
 					ListType(_):
 						owning = True
 						True
+
+				if invalid.is_some():
+					break
 
 				if not valid:
 					invalid = Some(
@@ -610,16 +631,22 @@ private pure func valid_union_layout(
 			Some(error):
 				Err(error)
 			None:
-				matches = match layout.representation:
+				match layout.representation:
+					BoxedRecursive:
+						if self_referencing:
+							Ok(void)
+						else:
+							Err(failure(span, "boxed union representation requires a self-referencing payload"))
 					InlineUnmanaged:
-						not owning
+						if owning:
+							Err(failure(span, "union ownership summary does not match its payloads"))
+						else:
+							Ok(void)
 					InlineOwningPayload:
-						owning
-
-				if matches:
-					Ok(void)
-				else:
-					Err(failure(span, "union ownership summary does not match its payloads"))
+						if owning:
+							Ok(void)
+						else:
+							Err(failure(span, "union ownership summary does not match its payloads"))
 
 
 private pure func valid_record_layout(
@@ -655,6 +682,16 @@ private pure func push_layout_visit(
 		steps.set(depth, step)
 	else:
 		steps.append(step)
+
+
+private pure func boxed_self_payload(layout: ConcreteUnion, index: Int, field: TypeRef) -> Bool:
+	match layout.representation:
+		BoxedRecursive:
+			match field:
+				UnionType(id): IntOps.equals(union_number(id), index)
+				_: False
+		InlineUnmanaged | InlineOwningPayload:
+			False
 
 
 private pure func verify_layout_graph(
@@ -799,8 +836,14 @@ private pure func verify_layout_graph(
 														field_position = IntOps.subtract(field_position, 1)
 														match fields.get(field_position):
 															Some(field):
-																pending = push_layout_visit(pending, pending_count, VisitStoredType(field))
-																pending_count = IntOps.add(pending_count, 1)
+																-- A boxed layout's own payload is a pointer edge,
+																-- not a storage dependency; per-layout checks
+																-- have already tied it to the boxed representation.
+																if boxed_self_payload(layout, index, field):
+																	void
+																else:
+																	pending = push_layout_visit(pending, pending_count, VisitStoredType(field))
+																	pending_count = IntOps.add(pending_count, 1)
 															None:
 																invalid = Some(failure(span, "invalid aggregate layout traversal state"))
 																break
@@ -1218,7 +1261,7 @@ private pure func verify_definition_result(
 					Ok(None)
 				_:
 					Err(failure(definition.span, "unmanaged value carries an ownership obligation"))
-		ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
+		ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
 			match definition.operation:
 				ParameterDefinition(_):
 					match definition.result:
@@ -1614,7 +1657,7 @@ private pure func verify_return(
 						Ok(void)
 					Some(_):
 						Err(failure(result.span, "unmanaged return cannot transfer an owner"))
-			ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
+			ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
 				match returned_owner:
 					None:
 						Err(failure(result.span, "managed return requires an owner transfer"))
@@ -1712,7 +1755,7 @@ private pure func verify_exit(
 						match plan:
 							NoOwnership:
 								Ok(void)
-							ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
+							ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
 								Err(failure(span, "managed value on a recursive backedge"))
 				)
 
@@ -1754,7 +1797,7 @@ private pure func verify_loop_operations(
 				match value_ownership(definition.value_type, unions, records):
 					Err(error):
 						invalid = Some(error)
-					Ok(ManagedStringLeaf) | Ok(ManagedListRoot) | Ok(ManagedRecordRoot(_)) | Ok(InlineOwnedFields(_)):
+					Ok(ManagedStringLeaf) | Ok(ManagedListRoot) | Ok(ManagedRecordRoot(_)) | Ok(InlineOwnedFields(_)) | Ok(ManagedUnionRoot(_)):
 						invalid = Some(
 							failure(
 								definition.span,
@@ -1814,7 +1857,7 @@ private pure func verify_execution(
 					Err(error):
 						invalid = Some(error)
 						break
-					Ok(ManagedStringLeaf) | Ok(ManagedListRoot) | Ok(ManagedRecordRoot(_)) | Ok(InlineOwnedFields(_)):
+					Ok(ManagedStringLeaf) | Ok(ManagedListRoot) | Ok(ManagedRecordRoot(_)) | Ok(InlineOwnedFields(_)) | Ok(ManagedUnionRoot(_)):
 						invalid = Some(failure(annotation, "managed signature in a self-tail loop"))
 						break
 					Ok(NoOwnership):
