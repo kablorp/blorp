@@ -336,29 +336,12 @@ observe actual allocation/free calls; production runtime code has no test mode.
 Generated unit-test code uses the host command's default `-O0`; omit `--release`
 for development tests. Sanitizer builds also use `-O0`.
 
-Each executable example defines allocation and instruction ceilings in its
-end-to-end test. The test prints actual costs and ceilings, then fails when a
-ceiling is exceeded. Ceilings are adjusted deliberately with retained evidence.
-
-| Example | Allocation ceiling | Retired-instruction ceiling |
-| --- | ---: | ---: |
-| return_zero | 800 | 40,000,000 |
-| call_one | 1,000 | 40,000,000 |
-| pure_calls | 1,300 | 40,000,000 |
-| nested_calls | 1,500 | 40,000,000 |
-| nested_order | 1,600 | 40,000,000 |
-| ufcs_calls | 1,500 | 40,000,000 |
-| ufcs_chain | 1,600 | 40,000,000 |
-| return_42 | 800 | 40,000,000 |
-| union_values | 4,000 | 45,000,000 |
-| match_value | 5,000 | 100,000,000 |
-| bindings | 10,000 | 100,000,000 |
-| mortal Strings | 20,000 | 200,000,000 |
-
-Small companion fixtures pass explicit limits of 10,000 allocations and
-100,000,000 instructions. The two structural stress fixtures use explicit
-limits of 100,000 allocations and 500,000,000 instructions. They reuse the
-same single-compilation measurement path as the primary examples.
+Each executable example defines its allocation and retired-instruction ceilings
+in its end-to-end test under [test/e2e/](test/e2e/); those tests are the only
+authority for the values. The test prints actual costs and ceilings, then fails
+when a ceiling is exceeded. Ceilings are adjusted deliberately with retained
+evidence. The figures quoted in the increment history below were the ceilings at
+that increment, not the current ones.
 
 The multiple-argument increment deliberately raises only `union_values` from
 3,600 to 4,000 allocations. Its frozen baseline uses 3,574 allocations and the
