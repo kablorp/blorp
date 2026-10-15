@@ -27,7 +27,7 @@ import:
 		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(
 			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition,
-			StringDefinition, VariantDefinition, CallDefinition, ConstructDefinition,
+			StringDefinition, CallDefinition, ConstructDefinition,
 			PayloadDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition,
 		),
 		OwnerId,
@@ -828,22 +828,6 @@ private pure func append_operation(
 				bytes.length(),
 			)
 			Ok(length.concat(")"))
-		VariantDefinition(id):
-			declaration ?= unions
-				.get(union_number(variant_owner(id)))
-				.to_result(internal_error())
-
-			if has_payload(declaration):
-				Ok(
-					output
-						.concat("((")
-						.concat(union_c_type(variant_owner(id), declaration))
-						.concat("){.tag=")
-						.concat(c_variant(id))
-						.concat("})"),
-				)
-			else:
-				Ok(output.concat(c_variant(id)))
 		CallDefinition(call, arguments):
 			var prefix = output
 				.concat(c_callable(call.target))
@@ -865,29 +849,24 @@ private pure func append_operation(
 
 			Ok(prefix.concat(")"))
 		ConstructDefinition(id, fields):
-			type_name ?= c_type(UnionType(variant_owner(id)), unions)
-			var result = output
-				.concat("((")
-				.concat(type_name)
-				.concat("){.tag=")
-				.concat(c_variant(id))
-				.concat(",.payload.")
-				.concat(c_payload(id))
-				.concat("={")
-			var position = 0
-			for field in fields:
-				if IntOps.greater_than(position, 0):
-					result = result.concat(",")
-				stored = match field:
-					UnmanagedPayload(value): c_value(value)
-					OwnedPayload(_, owner): c_owner(owner)
-				result = result
-					.concat(".blorp_uf_")
-					.append_int(position)
-					.concat("=")
-					.concat(stored)
-				position = IntOps.add(position, 1)
-			Ok(result.concat("}})"))
+			declaration ?= unions
+				.get(union_number(variant_owner(id)))
+				.to_result(internal_error())
+
+			-- A union with no payload anywhere is a bare C enum, so a variant is its tag.
+			if has_payload(declaration):
+				tagged = output
+					.concat("((")
+					.concat(union_c_type(variant_owner(id), declaration))
+					.concat("){.tag=")
+					.concat(c_variant(id))
+				-- A variant without fields omits the payload initializer.
+				if fields.is_empty():
+					Ok(tagged.concat("})"))
+				else:
+					Ok(append_payload_initializer(tagged, id, fields).concat("})"))
+			else:
+				Ok(output.concat(c_variant(id)))
 		PayloadDefinition(field, id):
 			Ok(
 				output
@@ -898,6 +877,31 @@ private pure func append_operation(
 						variant_field_number(field),
 					)),
 			)
+
+
+private pure func append_payload_initializer(
+	output: String,
+	id: VariantInstanceId,
+	fields: List[StoredPayload],
+) -> String:
+	var result = output
+		.concat(",.payload.")
+		.concat(c_payload(id))
+		.concat("={")
+	var position = 0
+	for field in fields:
+		if IntOps.greater_than(position, 0):
+			result = result.concat(",")
+		stored = match field:
+			UnmanagedPayload(value): c_value(value)
+			OwnedPayload(_, owner): c_owner(owner)
+		result = result
+			.concat(".blorp_uf_")
+			.append_int(position)
+			.concat("=")
+			.concat(stored)
+		position = IntOps.add(position, 1)
+	result.concat("}")
 
 
 private pure func argument_value(argument: OwnedArgument) -> ValueId:
