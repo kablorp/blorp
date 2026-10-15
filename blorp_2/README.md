@@ -201,7 +201,7 @@ func main() -> Int:
 ```
 
 An arm block contains zero or more binding or Void expression statements and a final expression,
-indented one level deeper than its pattern. Inline and block arms can coexist.
+indented deeper than its pattern. Inline and block arms can coexist.
 Each arm has its own scope; sibling arms can declare the same name. An explicit
 `var` may shadow an enclosing binding, and its initializer sees the earlier
 binding. Ordinary `=` still reassigns the nearest mutable binding or rejects
@@ -950,13 +950,14 @@ Lexical and layout rules:
   documentation block closed by the next such line; its text is trivia and
   admits any byte but CR. `----` and `--- x` remain comments, and there is no
   docstring metadata yet.
-- The entire indentation prefix of a real code line uses tabs only or spaces in groups of four.
-  Body and variant lines require depth one: one tab or four spaces. Match arms
-  require depth two: two tabs or eight spaces. Arm-block lines require depth
-  three: three tabs or twelve spaces. Mixed indentation is invalid. The lexer
-  emits a newline token ending each code line, an indent token for a line one
-  level deeper and a dedent token per closed level, rejecting a deeper jump;
-  the parser reads blocks from those tokens and never compares depths.
+- The entire indentation prefix of a real code line uses tabs only or spaces in groups of four;
+  mixed indentation is invalid. As in the host, a block's lines may sit at any
+  depth deeper than its header: the lexer emits a newline token ending each
+  code line, an indent token for a line deeper than the innermost open level
+  (opening that level, whatever the step), and a dedent token per closed
+  level, which must land on an open level or the indentation is inconsistent.
+  A line indented between a bracketed block's base and its level closes the
+  block. The parser reads blocks from those tokens and never compares depths.
 - Spaces may separate tokens and trail each line. They are required between
   `func` and the function name, and between `fixed`, `union` and the type name.
   Identifiers are scanned as whole words, so

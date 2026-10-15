@@ -42,9 +42,9 @@ private INVALID_INDENTATION: ErrorText = {
 	help = "use tabs only, or spaces in groups of four; do not mix tabs and spaces"
 }
 
-private DEEP_INDENTATION: ErrorText = {
-	message = "indentation increases by more than one level",
-	help = "indent a block exactly one tab or four spaces deeper than the line that opens it"
+private INCONSISTENT_INDENTATION: ErrorText = {
+	message = "inconsistent indentation",
+	help = "indent every line of a block by the same amount, and dedent only to the indentation of an enclosing block (a tab counts as 4 columns)"
 }
 
 private LINE_ENDING: ErrorText = {
@@ -54,7 +54,7 @@ private LINE_ENDING: ErrorText = {
 
 private SEPARATING_TAB: ErrorText = {
 	message = "tabs are allowed only in the body indentation",
-	help = "separate tokens with spaces and indent the body with one tab or four spaces"
+	help = "separate tokens with spaces and indent the body deeper than its header"
 }
 
 private COMMENT_BYTE: ErrorText = {
@@ -797,9 +797,8 @@ private pure func line_prefix(text: SourceText, start: Int) -> LinePrefix:
 
 
 -- Skips blank, whitespace-only and comment-only lines from the line at `start`
--- to the next code line. A code line may open only one level beyond `depth`,
--- so the open levels are always 0..depth and every dedent lands on one.
-private pure func next_code_line(text: SourceText, start: Int, depth: Int) -> Result[CodeLine, Diagnostic]:
+-- to the next code line, with its indentation level.
+private pure func next_code_line(text: SourceText, start: Int) -> Result[CodeLine, Diagnostic]:
 	-- One Result carries the line past trivia lines, or the first error.
 	var scan: Result[LinePrefix, Diagnostic] = Ok(line_prefix(text, start))
 
@@ -831,11 +830,7 @@ private pure func next_code_line(text: SourceText, start: Int, depth: Int) -> Re
 		Ok({ prefix = { start = end, end = end }, level = 0 })
 	else:
 		level ?= indentation_level(text, prefix)
-
-		if IntOps.greater_than(level, IntOps.add(depth, 1)):
-			Err(error_at(text, prefix.start, prefix.end, DEEP_INDENTATION))
-		else:
-			Ok({ prefix = prefix, level = level })
+		Ok({ prefix = prefix, level = level })
 
 
 -- The two pipe String forms differ only in one byte pair: a pipe String
@@ -1050,6 +1045,33 @@ private pure func blocks_open_below(bodies: List[BracketedBlock], level: Int) ->
 	kept
 
 
+-- The innermost open level; `levels` always holds 0.
+private pure func top_level(levels: List[Int]) -> Int:
+	match levels.get(IntOps.subtract(levels.length(), 1)):
+		Some(level):
+			level
+		None:
+			0
+
+
+-- Host 2.3 L2 case 3: a line indented strictly between the open bracketed
+-- block's base and the block's own level, at the block's bracket depth,
+-- closes the block (the block's lines were deeper; this one belongs to the
+-- enclosing brackets). `level` is then no open level: case 6 would report
+-- it as inconsistent.
+private pure func closes_bracketed_block(bodies: List[BracketedBlock], brackets: Int, level: Int, levels: List[Int]) -> Option[Int]:
+	match innermost_block(bodies):
+		None:
+			None
+		Some(block):
+			between = IntOps.less_than(block.base, level) and IntOps.less_than(level, top_level(levels))
+
+			if IntOps.equals(brackets, block.group) and between and not levels.contains(level):
+				Some(block.base)
+			else:
+				None
+
+
 private pure func is_colon(kind: TokenKind) -> Bool:
 	match kind:
 		SymbolToken(Colon):
@@ -1070,44 +1092,55 @@ private pure func bracket_depth(depth: Int, kind: TokenKind) -> Int:
 			depth
 
 
--- Each code line starts with an Indent when it is one level deeper than the
--- last, or a Dedent for each level it closes, spanning its indentation, and
--- ends with Newline: its LF, or empty at the end of a source without one.
--- Inside an open bracket a LF and the next line's indentation are trivia, so
--- the code line continues there without layout tokens, unless a bracketed
--- block (host GRAMMAR 2.2-2.3) is open at that depth: a `:` ending a line
--- inside brackets opens one, its lines are laid out like any block, and a
--- line dedented to its base closes it. A closing bracket never closes a
--- block; the Dedent comes with the next line, or with the end of the input.
--- The host's L2 case 3 (a line indented strictly between a block's base and
--- its level closes the block) cannot arise here: levels are consecutive
--- integers, one tab or four spaces each, so no width lies between two
--- adjacent levels; such a line is "invalid indentation" instead.
+-- The host's layout algorithm (GRAMMAR 2.2-2.3) over levels counted in
+-- tabs or four-space groups. A code line deeper than the innermost open
+-- level starts with an Indent and opens its level, whatever the step; a
+-- shallower line emits one Dedent per level it closes and must land on an
+-- open level, or it is inconsistent indentation. Each code line ends with
+-- Newline: its LF, or empty at the end of a source without one. Inside an
+-- open bracket a LF and the next line's indentation are trivia, so the code
+-- line continues there without layout tokens, unless a bracketed block is
+-- open at that depth: a `:` ending a line inside brackets opens one, its
+-- lines are laid out like any block, and a line dedented to its base, or
+-- indented strictly between its base and its level, closes it. A closing
+-- bracket never closes a block; the Dedent comes with the next line, or
+-- with the end of the input.
 pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[LexedProgram, Diagnostic]:
 	text: SourceText = { origin = origin, bytes = source }
 	var tokens: List[ScannedToken] = []
 	var spellings: List[String] = []
-	var depth = 0
+	-- The open indentation levels, innermost last; host `levels`.
+	var levels: List[Int] = [0]
 	-- Bracket depth and the open bracketed blocks persist across code lines.
 	var brackets: Int = 0
 	var bodies: List[BracketedBlock] = []
 	-- One Result carries each code line to lay out, or the first error.
-	var lines: Result[CodeLine, Diagnostic] = next_code_line(text, 0, 0)
+	var lines: Result[CodeLine, Diagnostic] = next_code_line(text, 0)
 
 	while True:
 		match lines:
 			Ok(line):
-				if IntOps.greater_than(line.level, depth):
+				if IntOps.greater_than(line.level, top_level(levels)):
 					tokens = tokens.append(ReadyToken(symbol(text, Indent, line.prefix.start, line.prefix.end)))
+					levels = levels.append(line.level)
+				else if IntOps.less_than(line.level, top_level(levels)):
+					-- Host DEDENT-TO: to the line's level, or to the base of the
+					-- bracketed block the line closes (L2 case 3).
+					target = match closes_bracketed_block(bodies, brackets, line.level, levels):
+						Some(base):
+							base
+						None:
+							line.level
 
-				if IntOps.less_than(line.level, depth):
-					bodies = blocks_open_below(bodies, line.level)
+					while IntOps.greater_than(top_level(levels), target):
+						tokens = tokens.append(ReadyToken(symbol(text, Dedent, line.prefix.start, line.prefix.end)))
+						levels = levels.take(IntOps.subtract(levels.length(), 1))
 
-				while IntOps.greater_than(depth, line.level):
-					tokens = tokens.append(ReadyToken(symbol(text, Dedent, line.prefix.start, line.prefix.end)))
-					depth = IntOps.subtract(depth, 1)
+					if not IntOps.equals(top_level(levels), target):
+						lines = Err(error_at(text, line.prefix.start, line.prefix.end, INCONSISTENT_INDENTATION))
+						break
 
-				depth = line.level
+					bodies = blocks_open_below(bodies, target)
 
 				if IntOps.equals(line.prefix.end, source.length()):
 					break
@@ -1138,7 +1171,7 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 							else if IntOps.equals(brackets, 0):
 								True
 							else if opens_bracketed_block(brackets, last_colon, bodies):
-								bodies = bodies.append({ group = brackets, base = depth })
+								bodies = bodies.append({ group = brackets, base = top_level(levels) })
 								True
 							else:
 								not insignificant_break(brackets, bodies)
@@ -1191,7 +1224,7 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 					Ok(line_end):
 						next = IntOps.min(IntOps.add(line_end, 1), source.length())
 						tokens = tokens.append(ReadyToken(symbol(text, Newline, line_end, next)))
-						next_code_line(text, next, depth)
+						next_code_line(text, next)
 					Err(error):
 						Err(error)
 			Err(_):
