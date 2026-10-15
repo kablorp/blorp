@@ -1,0 +1,138 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, module_contents, parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		Diagnostic,
+		ParsedBody(ParsedMatchBody),
+		ParsedPattern(PatternChar, PatternConstructor, PatternList, PatternName, PatternOr, PatternString, PatternWildcard),
+		SpreadTarget(SpreadName, SpreadWildcard),
+		PatternHead(BareHead, QualifiedHead),
+	test: TestSuite
+
+
+private MATCH: String = "func main() -> Int:\n\tmatch value:\n"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+-- The first arm's pattern of a function whose body is a match.
+private pure func first_pattern(source: String) -> Option[ParsedPattern]:
+	match parse_source(source):
+		Ok(parsed):
+			match module_contents(parsed).functions.get(0).map(pure func(function): function.body):
+				Some(ParsedMatchBody(body)):
+					body.arms.get(0).map(pure func(arm): arm.pattern)
+				_:
+					None
+		Err(_):
+			None
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parse_source(source):
+		Err(diagnostic):
+			diagnostic.span.start == start and diagnostic.span.end == end and diagnostic.message == message and diagnostic.help == help
+		Ok(_):
+			False
+
+
+-- A constructor's fields are patterns, so constructors nest; the span of
+-- each constructor runs from its head to its closing parenthesis.
+pure func test_constructor_fields_nest() -> Bool:
+	match first_pattern(MATCH + "\t\tWrap(Some(inner), _): 0\n"):
+		Some(PatternConstructor(BareHead(_), [PatternConstructor(BareHead(_), [PatternName(inner)], inner_span), PatternWildcard(_)], span)):
+			inner.span.start == 46 and inner_span.start == 41 and inner_span.end == 52 and span.start == 36 and span.end == 56
+		_:
+			False
+
+
+pure func test_fields_accept_a_trailing_comma_and_need_patterns() -> Bool:
+	(
+		first_pattern(MATCH + "\t\tPair(left, _,): 0\n").is_some()
+		and rejects(MATCH + "\t\tPair(left, ,): 0\n", 47, 48, "expected a match pattern", "use an ASCII identifier starting with a letter or underscore; 'func', 'pure', 'match', 'var', and lone '_' are reserved")
+	)
+
+
+-- `A | B(_) | _` is one pattern of three alternatives spanning them all;
+-- inside a constructor, alternatives nest like any field pattern.
+pure func test_alternatives_join_into_one_pattern() -> Bool:
+	match first_pattern(MATCH + "\t\tNone | Some(_) | _: 0\n"):
+		Some(PatternOr([PatternName(_), PatternConstructor(_, [_], _), PatternWildcard(_)], span)):
+			span.start == 36 and span.end == 54
+		_:
+			False
+
+
+pure func test_nested_alternatives_are_field_patterns() -> Bool:
+	match first_pattern(MATCH + "\t\tSome(None | Other): 0\n"):
+		Some(PatternConstructor(_, [PatternOr([PatternName(_), PatternName(_)], _)], _)):
+			True
+		_:
+			False
+
+
+pure func test_bar_needs_an_alternative() -> Bool:
+	rejects(MATCH + "\t\tNone | : 0\n", 43, 44, "expected a pattern after '|'", "use an ASCII identifier starting with a letter or underscore; 'func', 'pure', 'match', 'var', and lone '_' are reserved")
+
+
+-- List patterns: empty, fixed-length, and with a rest; elements nest.
+pure func test_list_patterns_keep_elements_and_rest() -> Bool:
+	match (first_pattern(MATCH + "\t\t[]: 0\n"), first_pattern(MATCH + "\t\t[_, Some(x), ...rest]: 0\n"), first_pattern(MATCH + "\t\t[..._]: 0\n")):
+		(Some(PatternList([], None, empty)), Some(PatternList([PatternWildcard(_), PatternConstructor(_, _, _)], Some(SpreadName(rest)), span)), Some(PatternList([], Some(SpreadWildcard(_)), _))):
+			empty.start == 36 and empty.end == 38 and rest.span.start == 52 and span.start == 36 and span.end == 57
+		_:
+			False
+
+
+pure func test_list_patterns_take_no_trailing_comma_and_end_at_the_rest() -> Bool:
+	(
+		rejects(MATCH + "\t\t[a, ]: 0\n", 40, 41, "expected a pattern or '...' after ','", "list patterns take no trailing comma")
+		and rejects(MATCH + "\t\t[...rest, a]: 0\n", 44, 45, "expected ']' after the list rest pattern", "write the rest pattern last, such as [first, ...rest]")
+		and rejects(MATCH + "\t\t[a b]: 0\n", 39, 40, "expected ']' after the list pattern", "separate element patterns with commas; '...rest' may end the list")
+	)
+
+
+-- String patterns decode escapes like String expressions; Char patterns
+-- span their quotes and carry nothing yet.
+pure func test_literal_patterns() -> Bool:
+	match (first_pattern(MATCH + "\t\t\"a\\n\": 0\n"), first_pattern(MATCH + "\t\t'x': 0\n"), first_pattern(MATCH + "\t\tSome(\"--help\"): 0\n")):
+		(Some(PatternString("a\n", text)), Some(PatternChar(char)), Some(PatternConstructor(_, [PatternString("--help", _)], outer))):
+			text.start == 36 and text.end == 41 and char.start == 36 and char.end == 39 and outer.start == 36 and outer.end == 50
+		_:
+			False
+
+
+-- `Errors.Missing(_)` and `Check.IntType` are qualified constructor
+-- patterns, with or without fields; the span runs from the alias.
+pure func test_qualified_heads_are_constructor_patterns() -> Bool:
+	match (first_pattern(MATCH + "\t\tErrors.Missing(_): 0\n"), first_pattern(MATCH + "\t\tCheck.IntType | _: 0\n")):
+		(Some(PatternConstructor(QualifiedHead(_), [PatternWildcard(_)], span)), Some(PatternOr([PatternConstructor(QualifiedHead(_), [], bare), PatternWildcard(_)], _))):
+			span.start == 36 and span.end == 53 and bare.start == 36 and bare.end == 49
+		_:
+			False
+
+
+pure func test_dot_in_a_pattern_needs_a_constructor_name() -> Bool:
+	rejects(MATCH + "\t\tErrors.(_): 0\n", 43, 44, "expected a constructor name after the module alias and '.'", "use an ASCII identifier starting with a letter or underscore; 'func', 'pure', 'match', 'var', and lone '_' are reserved")
+
+
+tests: TestSuite = {
+	description = "Blorp 2 pattern syntax",
+	tests = [
+		("constructor fields nest", test_constructor_fields_nest),
+		("fields accept a trailing comma and need patterns", test_fields_accept_a_trailing_comma_and_need_patterns),
+		("alternatives join into one pattern", test_alternatives_join_into_one_pattern),
+		("nested alternatives are field patterns", test_nested_alternatives_are_field_patterns),
+		("bar needs an alternative", test_bar_needs_an_alternative),
+		("list patterns keep elements and rest", test_list_patterns_keep_elements_and_rest),
+		("list patterns take no trailing comma and end at the rest", test_list_patterns_take_no_trailing_comma_and_end_at_the_rest),
+		("literal patterns", test_literal_patterns),
+		("qualified heads are constructor patterns", test_qualified_heads_are_constructor_patterns),
+		("dot in a pattern needs a constructor name", test_dot_in_a_pattern_needs_a_constructor_name),
+	]
+}

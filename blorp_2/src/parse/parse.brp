@@ -14,7 +14,6 @@ import:
 			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, ListExpression, RangeExpression, RecordExpression,
 			RecordUpdateExpression,
 		),
-		FieldPattern(FieldName, FieldWildcard),
 		FunctionHeader,
 		LexedProgram,
 		ParsedBinding,
@@ -25,9 +24,11 @@ import:
 		ParsedMatchArm,
 		ParsedOpaque,
 		ParsedParameter,
-		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
+		ParsedPattern(PatternName, PatternWildcard, PatternConstructor, PatternOr, PatternList, PatternString, PatternChar),
+		PatternHead(BareHead, QualifiedHead),
 		ParsedRecord,
 		ParsedRecordField,
+		SpreadTarget(SpreadName, SpreadWildcard),
 		ParsedRuntimeOperation(
 			IntegerAddBuiltin, IntegerToStringBuiltin, StringLengthBuiltin, StringPrintBuiltin,
 			StringParseIntBuiltin, ListRepeatBuiltin, ListLengthBuiltin, ListGetBuiltin, ListAppendBuiltin, ListSetBuiltin, ListConcatBuiltin, StringEqualsBuiltin, IntegerEqualsBuiltin, IntegerSubtractBuiltin,
@@ -45,7 +46,7 @@ import:
 		Symbol(
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
 			Colon, Newline, Indent, Dedent, VarKeyword, VoidKeyword, Equals, LeftBracket, RightBracket,
-			LeftBrace, RightBrace, RecordUpdateBar, Comma, AtSign, Slash, Star, DotDot,
+			LeftBrace, RightBrace, Bar, Comma, AtSign, Slash, Star, DotDot, Ellipsis,
 		),
 		Token,
 		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, PipeString, CharLiteral),
@@ -281,6 +282,22 @@ private pure func at_right_bracket(state: ParserState) -> Bool:
 private pure func at_dot_dot(state: ParserState) -> Bool:
 	match current_symbol(state):
 		Some(DotDot):
+			True
+		_:
+			False
+
+
+private pure func at_bar(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(Bar):
+			True
+		_:
+			False
+
+
+private pure func at_ellipsis(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(Ellipsis):
 			True
 		_:
 			False
@@ -1137,56 +1154,194 @@ private fixed record PatternResult {
 }
 
 
-private fixed record PatternFieldResult {
-	field: FieldPattern,
+-- The fields of a constructor pattern, each a pattern; `end` is where the
+-- closing parenthesis ends.
+private fixed record PatternFields {
+	fields: List[ParsedPattern],
+	end: Int,
 	next: ParserState
 }
 
 
-private pure func consume_pattern_field(state: ParserState) -> Result[PatternFieldResult, Diagnostic]:
-	if at_wildcard(state):
-		Ok({ field = FieldWildcard(parser_span(state)), next = shifted(state, 1) })
-	else:
-		name ?= consume_name(state, "expected a field binding or '_'")
-		Ok({ field = FieldName(name.name), next = name.next })
+-- `state` follows the opening parenthesis.
+private pure func consume_pattern_fields(state: ParserState) -> Result[PatternFields, Diagnostic]:
+	var current = state
+	var fields: List[ParsedPattern] = []
+	var failure: Option[Diagnostic] = None
 
+	if not at_right_paren(current):
+		while True:
+			match consume_pattern(current):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(field):
+					fields = fields.append(field.pattern)
 
-private pure func consume_pattern(state: ParserState) -> Result[PatternResult, Diagnostic]:
-	if at_wildcard(state):
-		Ok({ pattern = PatternWildcard(parser_span(state)), span = parser_span(state), next = shifted(state, 1) })
-	else:
-		name ?= consume_name(state, "expected a match pattern")
-
-		if not at_left_paren(name.next):
-			Ok({ pattern = PatternName(name.name), span = name.name.span, next = name.next })
-		else:
-			var current = shifted(name.next, 1)
-			var fields: List[FieldPattern] = []
-			var failure: Option[Diagnostic] = None
-
-			if not at_right_paren(current):
-				while True:
-					match consume_pattern_field(current):
-						Err(error):
-							failure = Some(error)
-							break
-						Ok(field):
-							fields = fields.append(field.field)
-							current = field.next
-
-					match list_separator(current):
+					match list_separator(field.next):
 						ListContinues(next):
 							current = next
 						ListEnds(next):
 							current = next
 							break
 
-			ready ?= match failure:
-				Some(error): Err(error)
-				None: Ok(void)
-			closed ?= expect(current, at_right_paren(current), "expected ')' after the constructor pattern", "write one name or '_' per field, such as Pair(left, _)")
-			span = { name.name.span | end = parser_span(current).end }
-			Ok({ pattern = PatternConstructor(name.name, fields, span), span = span, next = closed })
+	ready ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	closed ?= expect(current, at_right_paren(current), "expected ')' after the constructor pattern", "write one pattern per field, such as Pair(left, _)")
+	Ok({ fields = fields, end = parser_span(current).end, next = closed })
+
+
+-- `opening` is at the '(' after a bare or qualified head; the pattern spans
+-- from `start`, the head's first byte, to the closing parenthesis.
+private pure func consume_constructor_pattern(opening: ParserState, start: Span, head: PatternHead) -> Result[PatternResult, Diagnostic]:
+	fields ?= consume_pattern_fields(shifted(opening, 1))
+	span = { start | end = fields.end }
+	Ok({ pattern = PatternConstructor(head, fields.fields, span), span = span, next = fields.next })
+
+
+-- The spread ending a list pattern: `...rest` or `..._`, after its '...'.
+private fixed record ParsedSpread {
+	target: SpreadTarget,
+	next: ParserState
+}
+
+
+private pure func consume_spread(state: ParserState) -> Result[ParsedSpread, Diagnostic]:
+	if at_wildcard(state):
+		Ok({ target = SpreadWildcard(parser_span(state)), next = shifted(state, 1) })
+	else:
+		name ?= consume_name(state, "expected a name or '_' after '...'")
+		Ok({ target = SpreadName(name.name), next = name.next })
+
+
+-- `[]`, `[...rest]`, `[a, b]` or `[a, b, ...rest]`; as in the host, a list
+-- pattern takes no trailing comma. `start` follows the opening bracket.
+private pure func consume_list_pattern(start: ParserState, opening: Span) -> Result[PatternResult, Diagnostic]:
+	var current = start
+	var elements: List[ParsedPattern] = []
+	var spread: Option[SpreadTarget] = None
+	var failure: Option[Diagnostic] = None
+
+	while not at_right_bracket(current) and failure.is_none():
+		if at_ellipsis(current):
+			match consume_spread(shifted(current, 1)):
+				Err(error):
+					failure = Some(error)
+				Ok(rest):
+					spread = Some(rest.target)
+					current = rest.next
+
+					if not at_right_bracket(current):
+						failure = Some(expected(current, "expected ']' after the list rest pattern", "write the rest pattern last, such as [first, ...rest]"))
+		else:
+			match consume_pattern(current):
+				Err(error):
+					failure = Some(error)
+				Ok(element):
+					elements = elements.append(element.pattern)
+					current = element.next
+
+					if at_comma(current):
+						current = shifted(current, 1)
+
+						if at_right_bracket(current):
+							failure = Some(expected(current, "expected a pattern or '...' after ','", "list patterns take no trailing comma"))
+					else if not at_right_bracket(current):
+						failure = Some(expected(current, "expected ']' after the list pattern", "separate element patterns with commas; '...rest' may end the list"))
+
+	ready ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	span = { opening | end = parser_span(current).end }
+	Ok({ pattern = PatternList(elements, spread, span), span = span, next = shifted(current, 1) })
+
+
+-- A String or Char literal token at `state` as a pattern, or None when
+-- the token is not a literal. A String pattern's escapes decode as in a
+-- String expression.
+private pure func literal_pattern(state: ParserState) -> Option[Result[PatternResult, Diagnostic]]:
+	match current(state):
+		Some(token):
+			match token.kind:
+				QuotedString(raw):
+					decoded: Result[PatternResult, Diagnostic] = match string_value(raw, token.span):
+						Ok(bytes):
+							Ok({ pattern = PatternString(bytes, token.span), span = token.span, next = shifted(state, 1) })
+						Err(error):
+							Err(error)
+					Some(decoded)
+				CharLiteral:
+					Some(Ok({ pattern = PatternChar(token.span), span = token.span, next = shifted(state, 1) }))
+				_:
+					None
+		None:
+			None
+
+
+-- One alternative of a pattern: no '|' is read here.
+private pure func consume_alternative(state: ParserState, message: String) -> Result[PatternResult, Diagnostic]:
+	if at_wildcard(state):
+		Ok({ pattern = PatternWildcard(parser_span(state)), span = parser_span(state), next = shifted(state, 1) })
+	else if at_left_bracket(state):
+		consume_list_pattern(shifted(state, 1), parser_span(state))
+	else:
+		match literal_pattern(state):
+			Some(literal):
+				literal
+			None:
+				consume_named_alternative(state, message)
+
+
+-- A name, `Name(fields)`, or `Module.Name[(fields)]`: a dot in a pattern can
+-- only qualify, so no alias set is consulted, as in a type. A qualified head
+-- without fields is still a constructor pattern.
+private pure func consume_named_alternative(state: ParserState, message: String) -> Result[PatternResult, Diagnostic]:
+	name ?= consume_name(state, message)
+
+	if at_dot(name.next):
+		member ?= consume_name(shifted(name.next, 1), "expected a constructor name after the module alias and '.'")
+		head = QualifiedHead({ module = name.name, name = member.name })
+
+		if at_left_paren(member.next):
+			consume_constructor_pattern(member.next, name.name.span, head)
+		else:
+			span = { name.name.span | end = member.name.span.end }
+			Ok({ pattern = PatternConstructor(head, [], span), span = span, next = member.next })
+	else if at_left_paren(name.next):
+		consume_constructor_pattern(name.next, name.name.span, BareHead(name.name))
+	else:
+		Ok({ pattern = PatternName(name.name), span = name.name.span, next = name.next })
+
+
+-- A pattern is one alternative, or several separated by '|', which span
+-- from the first to the last.
+private pure func consume_pattern(state: ParserState) -> Result[PatternResult, Diagnostic]:
+	first ?= consume_alternative(state, "expected a match pattern")
+
+	if not at_bar(first.next):
+		Ok(first)
+	else:
+		var alternatives: List[ParsedPattern] = [first.pattern]
+		var current = first.next
+		var end = first.span.end
+		var failure: Option[Diagnostic] = None
+
+		while at_bar(current):
+			match consume_alternative(shifted(current, 1), "expected a pattern after '|'"):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(alternative):
+					alternatives = alternatives.append(alternative.pattern)
+					current = alternative.next
+					end = alternative.span.end
+
+		ready ?= match failure:
+			Some(error): Err(error)
+			None: Ok(void)
+		span = { first.span | end = end }
+		Ok({ pattern = PatternOr(alternatives, span), span = span, next = current })
 
 
 private fixed record BodyResult {
@@ -1906,10 +2061,7 @@ private pure func consume_braced_record(start: ParserState, opening: Span) -> Re
 		consume_record_literal(start, opening)
 	else:
 		base ?= consume_value(start)
-		at_bar = match current_symbol(base.next):
-			Some(RecordUpdateBar): True
-			_: False
-		bar ?= expect(base.next, at_bar, "expected '|' after the record update base", "write { existing_record | field = expression }")
+		bar ?= expect(base.next, at_bar(base.next), "expected '|' after the record update base", "write { existing_record | field = expression }")
 		fields ?= consume_literal_fields(bar, [])
 		closed ?= expect(fields.next, at_right_brace(fields.next), "expected '}' after the record update fields", "separate replacement fields with commas, then close the update with '}'")
 		Ok({ base = RecordUpdateExpression(base.body, fields.fields), span = { opening | end = parser_span(fields.next).end }, next = closed })
@@ -2323,7 +2475,13 @@ private pure func consume_declaration(state: ParserState, module: ModuleId, decl
 		next ?= end_value_line(parsed.next)
 		Ok({ declaration = BuiltinTypeDeclaration(parsed.declaration), next = next })
 	else if at_word(state, words(state).private_word) and at_word(shifted(state, 1), words(state).type_word):
-		Err(expected(state, "builtin type declarations cannot be private", "remove private; builtin types belong to the foundation module"))
+		-- Only a well-formed builtin type declaration is rejected as private;
+		-- any other `type` line reports the builtin-type parser's own error.
+		match consume_builtin_type(shifted(state, 1)):
+			Ok(_):
+				Err(expected(state, "builtin type declarations cannot be private", "remove private; builtin types belong to the foundation module"))
+			Err(error):
+				Err(error)
 	else if at_word(state, words(state).private_word):
 		consume_visible_declaration(shifted(state, 1), module, Private(parser_span(state)))
 	else:

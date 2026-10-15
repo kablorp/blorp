@@ -694,7 +694,7 @@ Use ordinary projections and complete construction, always fresh for managed
 records. No uniqueness test, COW/reuse branch, or new runtime operation.
 
 1. Parser publishes `RecordUpdateExpression(base, replacements)` with existing
-   `ParsedRecordField` rows in written order. Add a named `RecordUpdateBar` symbol.
+   `ParsedRecordField` rows in written order. The `|` is the named `Bar` symbol.
    After `{`, a name followed by `=` selects the existing literal path; otherwise
    parse one ordinary value, require `|`, then require nonempty replacement fields.
    Existing empty-literal, postfix, whitespace/comment and brace-span rules stay.

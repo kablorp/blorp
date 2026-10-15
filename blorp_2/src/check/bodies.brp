@@ -5,7 +5,7 @@ and patterns, and the canonical Void tail.
 import:
 	./errors:
 		CheckError,
-		CheckerInvariant(InvalidCheckedUnion, InvalidResolvedParameter),
+		CheckerInvariant(InvalidCheckedUnion, InvalidResolvedParameter, UnsupportedPatternReachedResolution),
 		ExpectedTypeSite(InferredBindingDeclaration, SourceAnnotation),
 		MatchError(
 			MatchRequiresUnion, NonExhaustiveMatch, PatternFieldCountMismatch, DuplicatePatternBinding,
@@ -15,7 +15,7 @@ import:
 		checker_invariant,
 		match_error,
 		statement_error,
-		UnsupportedForm(LocalAnnotation),
+		UnsupportedForm(LocalAnnotation, NestedPattern, OrPattern, ListPattern, StringPattern, CharPattern, QualifiedPattern),
 		unsupported_form,
 	./callables: CallableBinding, ResolutionContext
 	./model:
@@ -52,12 +52,13 @@ import:
 	option: is_some, to_result
 	../utils/syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
-		FieldPattern(FieldName, FieldWildcard),
 		ParsedBinding,
 		ParsedMatch,
 		ParsedMatchArm,
 		ParsedParameter,
-		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
+		ParsedPattern(PatternName, PatternWildcard, PatternConstructor, PatternOr, PatternList, PatternString, PatternChar),
+		PatternHead(BareHead, QualifiedHead),
+		pattern_span,
 		ParsedStatement(BindingStatement, ExpressionStatement),
 		type_span,
 		Span,
@@ -108,12 +109,34 @@ private pure func unbound(pattern: CheckedPattern, scope: List[LocalBinding]) ->
 	}
 
 
+-- A depth-1 name that spells an unshadowed constructor of the field's union
+-- is a nested constructor pattern under the host's rule, not a binding; it
+-- is rejected like any nested pattern until the pattern-compilation
+-- milestone. Without this, `Wrap(A)` would bind `A` and match every value.
+private pure func names_a_field_constructor(
+	name: WrittenName,
+	field_type: TypeRef,
+	scope: List[LocalBinding],
+	context: ResolutionContext,
+) -> Result[Bool, CheckError]:
+	if lookup_binding(scope, name.id).is_some():
+		Ok(False)
+	else:
+		match union_occurrence(field_type):
+			None:
+				Ok(False)
+			Some(occurrence):
+				found ?= find_variant(context, occurrence, name)
+				Ok(found.is_some())
+
+
 private pure func resolve_variant_pattern(
 	contract: VariantContract,
-	fields: List[FieldPattern],
+	fields: List[ParsedPattern],
 	span: Span,
 	ordinal: Int,
 	scope: List[LocalBinding],
+	context: ResolutionContext,
 ) -> Result[ResolvedPattern, CheckError]:
 	if not IntOps.equals(contract.fields.length(), fields.length()):
 		Err(match_error(span, PatternFieldCountMismatch(contract.variant, contract.fields.length(), fields.length())))
@@ -128,9 +151,20 @@ private pure func resolve_variant_pattern(
 			match contract.fields.get(position):
 				None: failure = Some(checker_invariant(span, GenericConstructorContract))
 				Some(annotation):
+					-- A field is one binder or wildcard; the match's pre-scan rejected
+					-- anything deeper before resolution.
 					match field:
-						FieldWildcard(_): captures = captures.append(None)
-						FieldName(name):
+						PatternWildcard(_): captures = captures.append(None)
+						PatternName(name):
+							match names_a_field_constructor(name, annotation.value_type, scope, context):
+								Err(error):
+									failure = Some(error)
+									break
+								Ok(True):
+									failure = Some(unsupported_form(name.span, NestedPattern))
+									break
+								Ok(False):
+									void
 							match previous_declaration(previous, name.id):
 								Some(first):
 									failure = Some(match_error(name.span, DuplicatePatternBinding(name.id, first.span)))
@@ -147,6 +181,9 @@ private pure func resolve_variant_pattern(
 							bindings = bindings.append(definition)
 							captures = captures.append(Some(id))
 							previous = previous.append(name)
+						_:
+							failure = Some(checker_invariant(pattern_span(field), UnsupportedPatternReachedResolution))
+							break
 			if failure.is_some():
 				break
 			position = IntOps.add(position, 1)
@@ -187,15 +224,26 @@ private pure func resolve_pattern(
 
 			match contract:
 				Some(contract):
-					resolve_variant_pattern(contract, [], name.span, ordinal, scope)
+					resolve_variant_pattern(contract, [], name.span, ordinal, scope, context)
 				None:
 					capture = BindingCase(binding_id(ordinal))
 					Ok(bound_pattern(name, match_context.union_type, ordinal, scope, capture))
-		PatternConstructor(name, fields, span):
+		PatternConstructor(head, fields, span):
+			name ?= match head:
+				BareHead(name): Ok(name)
+				QualifiedHead(_): Err(checker_invariant(span, UnsupportedPatternReachedResolution))
 			contract ?= pattern_variant(name, match_context, context)
 			unknown = UnknownConstructorPattern(name.id, match_context.union_type)
 			variant ?= contract.to_result(match_error(span, unknown))
-			resolve_variant_pattern(variant, fields, span, ordinal, scope)
+			resolve_variant_pattern(variant, fields, span, ordinal, scope, context)
+		PatternOr(_, span):
+			Err(checker_invariant(span, UnsupportedPatternReachedResolution))
+		PatternList(_, _, span):
+			Err(checker_invariant(span, UnsupportedPatternReachedResolution))
+		PatternString(_, span):
+			Err(checker_invariant(span, UnsupportedPatternReachedResolution))
+		PatternChar(span):
+			Err(checker_invariant(span, UnsupportedPatternReachedResolution))
 
 
 private pure func pattern_variant(
@@ -250,6 +298,49 @@ private fixed record ArmProgress {
 }
 
 
+-- The first pattern form in the arms that has no semantics yet, arms in
+-- order and left to right, before the scrutinee is typed: a list pattern on
+-- a List scrutinee is then reported as the form, not as a non-union match.
+-- A constructor's fields are scanned one level down; a deeper pattern there
+-- is a nested pattern.
+private pure func unsupported_pattern_form(arms: List[ParsedMatchArm]) -> Option[CheckError]:
+	var failure: Option[CheckError] = None
+
+	for arm in arms:
+		if failure.is_none():
+			failure = pattern_form_rejection(arm.pattern)
+
+	failure
+
+
+private pure func pattern_form_rejection(pattern: ParsedPattern) -> Option[CheckError]:
+	match pattern:
+		PatternName(_) | PatternWildcard(_):
+			None
+		PatternConstructor(QualifiedHead(_), _, span):
+			Some(unsupported_form(span, QualifiedPattern))
+		PatternConstructor(BareHead(_), fields, _):
+			var failure: Option[CheckError] = None
+
+			for field in fields:
+				if failure.is_none():
+					failure = match field:
+						PatternName(_) | PatternWildcard(_):
+							None
+						PatternConstructor(_, _, _) | PatternOr(_, _) | PatternList(_, _, _) | PatternString(_, _) | PatternChar(_):
+							Some(unsupported_form(pattern_span(field), NestedPattern))
+
+			failure
+		PatternOr(_, span):
+			Some(unsupported_form(span, OrPattern))
+		PatternList(_, _, span):
+			Some(unsupported_form(span, ListPattern))
+		PatternString(_, span):
+			Some(unsupported_form(span, StringPattern))
+		PatternChar(span):
+			Some(unsupported_form(span, CharPattern))
+
+
 -- Every arm must be useful, and together the arms must cover every variant.
 private pure func resolve_match(
 	return_type: TypeUse,
@@ -258,6 +349,9 @@ private pure func resolve_match(
 	bindings: List[BindingDefinition],
 	context: ResolutionContext,
 ) -> Result[ResolvedMatch, CheckError]:
+	supported ?= match unsupported_pattern_form(body.arms):
+		Some(error): Err(error)
+		None: Ok(void)
 	scrutinee ?= synthesize_value(scope, body.scrutinee, None, context)
 	occurrence ?= union_occurrence(
 		scrutinee.value_type,
@@ -354,16 +448,6 @@ private pure func resolve_arms(
 				},
 				context,
 			)
-
-
-private pure func pattern_span(pattern: ParsedPattern) -> Span:
-	match pattern:
-		PatternName(name):
-			name.span
-		PatternWildcard(span):
-			span
-		PatternConstructor(_, _, span):
-			span
 
 
 -- The signature was resolved from these parameters, one type each.

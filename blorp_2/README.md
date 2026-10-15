@@ -946,8 +946,14 @@ Lexical and layout rules:
   `Pattern: expression` or `Pattern:` followed by a depth-three block of
   ordered binding or Void expression statements and a mandatory final expression. A pattern is a bare name,
   `_`, or a constructor name
-  followed by parentheses containing zero or more comma-separated field patterns. A field
-  pattern is a binder or `_`; literal and nested field patterns are unsupported.
+  followed by parentheses containing zero or more comma-separated patterns, so
+  patterns nest; alternatives separated by `|` form an or-pattern; `[]`,
+  `[a, b]` and `[first, ...rest]` are list patterns (no trailing comma, the
+  rest last); a String or Char literal is a literal pattern; `Alias.Variant`
+  qualifies a constructor by a module alias. Checking accepts a binder or `_`
+  per field and rejects a nested field pattern, an or-pattern, a list pattern
+  or a literal pattern until the pattern-compilation milestone, and a qualified
+  head until the namespace milestone.
   A nullary constructor pattern may be written `Empty` or `Empty()`. `Number()`
   is valid syntax but fails semantic arity checking for a one-field constructor.
 - A binding line is `name = expression` or `var name = expression`, optionally
