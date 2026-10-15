@@ -1532,7 +1532,7 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    locations from names or literal values.
    A shared interning builder assigns one opaque `NameId` per spelling across the module inventory. Program
    assembly ([assemble.brp](src/parse/assemble.brp)) seals the complete syntax and immutable name table in an opaque `ParsedProgram`.
-   Its [declaration inventory](src/utils/declarations.brp) issues function, record,
+   Its [declaration inventory](src/utils/ids.brp) issues function, record,
    union and owner-qualified variant IDs once from the raw syntax. Consumers
    carry those IDs through accepted and checked rows; vector positions are
    traversal counters, not another identity producer.
