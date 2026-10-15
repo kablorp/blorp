@@ -1,0 +1,114 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, module_contents, parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		Diagnostic,
+		ExpressionBase(LogicalExpression, NameExpression, NotExpression, RangeExpression),
+		LogicalOperator(AndOperator, OrOperator),
+		ParsedBody(ParsedValueBody),
+		ValueExpression,
+	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+private pure func main_value(source: String) -> Option[ValueExpression]:
+	match parse_source(source):
+		Ok(parsed):
+			match module_contents(parsed).functions.get(0).map(pure func(function): function.body):
+				Some(ParsedValueBody(value)):
+					Some(value)
+				_:
+					None
+		Err(_):
+			None
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parse_source(source):
+		Err(diagnostic):
+			diagnostic.span.start == start and diagnostic.span.end == end and diagnostic.message == message and diagnostic.help == help
+		Ok(_):
+			False
+
+
+-- `or` binds below `and`: `a and b or c` is `(a and b) or c` and
+-- `a or b and c` is `a or (b and c)`; both associate left.
+pure func test_and_binds_tighter_than_or() -> Bool:
+	match (main_value(HEADER + "\ta and b or c\n"), main_value(HEADER + "\ta or b and c\n")):
+		(Some(left_first), Some(right_first)):
+			match (left_first.base, right_first.base):
+				(LogicalExpression(OrOperator, conjunction, _), LogicalExpression(OrOperator, _, rest)):
+					match (conjunction.base, rest.base):
+						(LogicalExpression(AndOperator, _, _), LogicalExpression(AndOperator, _, _)):
+							left_first.span.start == 21 and left_first.span.end == 33 and conjunction.span.end == 28
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_chains_associate_left() -> Bool:
+	match main_value(HEADER + "\ta or b or c\n"):
+		Some(value):
+			match value.base:
+				LogicalExpression(OrOperator, left, right):
+					match (left.base, right.base):
+						(LogicalExpression(OrOperator, _, _), NameExpression(_)):
+							True
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+-- `not` binds above `and` and below `..`: `not a and b` is `(not a) and b`,
+-- and `not a..b` negates the range.
+pure func test_not_binds_above_and_and_below_range() -> Bool:
+	match (main_value(HEADER + "\tnot a and b\n"), main_value(HEADER + "\tnot not a..b\n")):
+		(Some(conjunction), Some(negated)):
+			match (conjunction.base, negated.base):
+				(LogicalExpression(AndOperator, left, _), NotExpression(inner)):
+					match (left.base, inner.base):
+						(NotExpression(_), NotExpression(range)):
+							match range.base:
+								RangeExpression(_, _):
+									left.span.start == 21 and left.span.end == 26 and negated.span.start == 21 and negated.span.end == 33
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_operators_need_a_right_operand() -> Bool:
+	(
+		rejects(HEADER + "\ta and\n", 26, 27, "expected a return expression", "use a literal, a parameter or variant name, or a call as the entire body")
+		and rejects(HEADER + "\ta..not b\n", 24, 27, "'not' cannot be an operand of '..'", "write (not value) in parentheses; not binds below a range")
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 and, or and not syntax",
+	tests = [
+		("and binds tighter than or", test_and_binds_tighter_than_or),
+		("chains associate left", test_chains_associate_left),
+		("not binds above and and below range", test_not_binds_above_and_and_below_range),
+		("operators need a right operand", test_operators_need_a_right_operand),
+	]
+}

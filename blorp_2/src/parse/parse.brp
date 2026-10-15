@@ -12,8 +12,9 @@ import:
 		ExpressionBase(
 			VoidExpression, IntegerExpression, FloatExpression, StringExpression, NameExpression, DirectApplication,
 			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, ListExpression, RangeExpression, RecordExpression,
-			RecordUpdateExpression,
+			RecordUpdateExpression, LogicalExpression, NotExpression,
 		),
+		LogicalOperator(AndOperator, OrOperator),
 		FunctionHeader,
 		LexedProgram,
 		ParsedBinding,
@@ -47,7 +48,7 @@ import:
 		Symbol(
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
 			Colon, Newline, Indent, Dedent, VarKeyword, VoidKeyword, Equals, LeftBracket, RightBracket,
-			LeftBrace, RightBrace, Bar, Comma, AtSign, Slash, Star, DotDot, Ellipsis,
+			LeftBrace, RightBrace, Bar, Comma, AtSign, Slash, Star, DotDot, Ellipsis, AndKeyword, OrKeyword, NotKeyword,
 			ImportKeyword, TypeKeyword, PrivateKeyword, RecordKeyword, UnionKeyword, BuiltinKeyword, AsKeyword, OpaqueKeyword,
 			IntoOpaqueKeyword, FromOpaqueKeyword,
 		),
@@ -342,6 +343,30 @@ private pure func at_as(state: ParserState) -> Bool:
 private pure func at_opaque(state: ParserState) -> Bool:
 	match current_symbol(state):
 		Some(OpaqueKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_and(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(AndKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_or(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(OrKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_not(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(NotKeyword):
 			True
 		_:
 			False
@@ -1031,16 +1056,72 @@ private pure func consume_postfixes(state: ParserState, applications: List[Postf
 		consume_postfixes(postfix.next, applications.append(postfix.operation), postfix.end)
 
 
--- A value is one operand, or `low..high`: two operands around '..'. A range
--- has no postfix operations of its own; group it to apply any.
+-- Precedence, lowest first, as in the host: `or`, `and`, `not`, `..`, then
+-- postfix operations. `or` and `and` associate left. A `not` binds below a
+-- range, so `not a..b` negates the range and `a..not b` needs parentheses.
 private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	first ?= consume_conjunction(start)
+	var current = first
+	var failure: Option[Diagnostic] = None
+
+	while at_or(current.next) and failure.is_none():
+		match consume_conjunction(shifted(current.next, 1)):
+			Err(error):
+				failure = Some(error)
+			Ok(right):
+				current = logical(OrOperator, current, right)
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(current)
+
+
+private pure func consume_conjunction(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	first ?= consume_negation(start)
+	var current = first
+	var failure: Option[Diagnostic] = None
+
+	while at_and(current.next) and failure.is_none():
+		match consume_negation(shifted(current.next, 1)):
+			Err(error):
+				failure = Some(error)
+			Ok(right):
+				current = logical(AndOperator, current, right)
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(current)
+
+
+-- `left op right` as one value spanning both operands, with no postfix
+-- operations of its own.
+private pure func logical(operator: LogicalOperator, left: ParsedValue, right: ParsedValue) -> ParsedValue:
+	span = { left.body.span | end = right.body.span.end }
+	{ body = { base = LogicalExpression(operator, left.body, right.body), base_span = span, applications = [], span = span }, next = right.next }
+
+
+private pure func consume_negation(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	if not at_not(start):
+		consume_range(start)
+	else:
+		keyword = parser_span(start)
+		operand ?= consume_negation(shifted(start, 1))
+		span = { keyword | end = operand.body.span.end }
+		Ok({ body = { base = NotExpression(operand.body), base_span = span, applications = [], span = span }, next = operand.next })
+
+
+-- One operand, or `low..high`: two operands around '..'. A range has no
+-- postfix operations of its own; group it to apply any.
+private pure func consume_range(start: ParserState) -> Result[ParsedValue, Diagnostic]:
 	low ?= consume_operand(start)
 
 	if not at_dot_dot(low.next):
 		Ok(low)
 	else:
 		after_dots = shifted(low.next, 1)
-		high ?= if at_newline(after_dots) or at_closing_bracket(after_dots) or at_end(after_dots):
+		high ?= if at_not(after_dots):
+			Err(expected(after_dots, "'not' cannot be an operand of '..'", "write (not value) in parentheses; not binds below a range"))
+		else if at_newline(after_dots) or at_closing_bracket(after_dots) or at_end(after_dots):
 			Err(expected(after_dots, "expected the range's end after '..'", "write low..high with a value on each side of '..'"))
 		else:
 			consume_operand(after_dots)

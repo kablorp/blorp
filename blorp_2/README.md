@@ -825,8 +825,12 @@ such as `IntOps.add(1, 2)` where `IntOps` is a module alias of the import
 block (the alias wins over a local of the same spelling, as in the host), or
 one expression grouped in parentheses. UFCS calls and record field
 suffixes may follow that expression, including a group's closing parenthesis.
-`low..high` is a range of two such operands; it parses, and checking rejects
-it until the loops milestone.
+`low..high` is a range of two such operands; `not a`, `a and b` and `a or b`
+combine them with the host's precedence (`or` below `and` below `not` below
+`..`, `and`/`or` left-associative). A line break after `and` or `or` is
+accepted only inside brackets; the host also accepts it bare, which is a
+follow-up. Ranges parse and are rejected by checking
+until the loops milestone; `and`, `or` and `not` until the join milestone.
 A dotted type such as `Shared.Span[Int]` is a qualified type. Checking rejects
 qualified forms until the namespace milestone.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
