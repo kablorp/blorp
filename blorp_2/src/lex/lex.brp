@@ -1,6 +1,7 @@
 import:
 	int as IntOps
-	../utils/source: SourceId
+	../utils/names: NameTable, intern_names
+	../utils/source: COMPILER_SOURCE, SourceId
 	string as StringOps
 	../utils/text as Text
 	../utils/syntax:
@@ -502,22 +503,30 @@ private pure func numeric_token(text: SourceText, start: Int) -> Result[Token, D
 		numeric_token_end(text, start, mantissa_end, fraction)
 
 
-private pure func word_kind(spelling: String) -> TokenKind:
+private pure func keyword(spelling: String) -> Option[Symbol]:
 	match spelling:
 		"func":
-			SymbolToken(FunctionKeyword)
+			Some(FunctionKeyword)
 		"pure":
-			SymbolToken(PureKeyword)
+			Some(PureKeyword)
 		"void":
-			SymbolToken(VoidKeyword)
+			Some(VoidKeyword)
 		"var":
-			SymbolToken(VarKeyword)
+			Some(VarKeyword)
 		"match":
-			SymbolToken(MatchKeyword)
+			Some(MatchKeyword)
 		"_":
-			SymbolToken(Wildcard)
+			Some(Wildcard)
 		_:
-			IdentifierToken(spelling)
+			None
+
+
+-- Identifier IDs are minted after the scan (see `lex`); until then an
+-- identifier keeps its spelling and byte range. The scan's word arm reads the
+-- spelling once, into the batch `intern_names` receives.
+private fixed union ScannedToken:
+	WordToken(String, Int, Int)
+	ReadyToken(Token)
 
 
 private pure func punctuation(byte: Char) -> Option[Symbol]:
@@ -555,17 +564,31 @@ private pure func punctuation(byte: Char) -> Option[Symbol]:
 
 
 -- Scans the code token at `cursor`; the caller handles spaces, comments and LF.
-private pure func code_token(text: SourceText, cursor: Int) -> Result[Token, Diagnostic]:
+private pure func code_token(text: SourceText, cursor: Int) -> Result[ScannedToken, Diagnostic]:
+	if byte_in(text, cursor, IdentifierStart):
+		end = run_end(text, IntOps.add(cursor, 1), IdentifierByte)
+		spelling = text.bytes.substring(cursor, IntOps.subtract(end, cursor))
+
+		match keyword(spelling):
+			Some(value):
+				Ok(ReadyToken(symbol(text, value, cursor, end)))
+			None:
+				Ok(WordToken(spelling, cursor, end))
+	else:
+		match literal_or_symbol(text, cursor):
+			Ok(scanned):
+				Ok(ReadyToken(scanned))
+			Err(error):
+				Err(error)
+
+
+private pure func literal_or_symbol(text: SourceText, cursor: Int) -> Result[Token, Diagnostic]:
 	next = IntOps.add(cursor, 1)
 
 	if byte_is(text, cursor, '"'):
 		quoted_token(text, cursor)
 	else if byte_is(text, cursor, '\''):
 		char_token(text, cursor)
-	else if byte_in(text, cursor, IdentifierStart):
-		end = run_end(text, next, IdentifierByte)
-		spelling = text.bytes.substring(cursor, IntOps.subtract(end, cursor))
-		Ok(token(text, word_kind(spelling), cursor, end))
 	else if byte_is(text, cursor, '-') and byte_is(text, next, '>'):
 		Ok(symbol(text, Arrow, cursor, IntOps.add(cursor, 2)))
 	else if byte_is(text, cursor, '+'):
@@ -918,9 +941,10 @@ private pure func bracket_depth(depth: Int, kind: TokenKind) -> Int:
 -- ends with Newline: its LF, or empty at the end of a source without one.
 -- Inside an open bracket a LF and the next line's indentation are trivia, so
 -- the code line continues there without layout tokens.
-pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnostic]:
+pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[LexedProgram, Diagnostic]:
 	text: SourceText = { origin = origin, bytes = source }
-	var tokens: List[Token] = []
+	var tokens: List[ScannedToken] = []
+	var spellings: List[String] = []
 	var depth = 0
 	-- One Result carries each code line to lay out, or the first error.
 	var lines: Result[CodeLine, Diagnostic] = next_code_line(text, 0, 0)
@@ -929,10 +953,10 @@ pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnost
 		match lines:
 			Ok(line):
 				if IntOps.greater_than(line.level, depth):
-					tokens = tokens.append(symbol(text, Indent, line.prefix.start, line.prefix.end))
+					tokens = tokens.append(ReadyToken(symbol(text, Indent, line.prefix.start, line.prefix.end)))
 
 				while IntOps.greater_than(depth, line.level):
-					tokens = tokens.append(symbol(text, Dedent, line.prefix.start, line.prefix.end))
+					tokens = tokens.append(ReadyToken(symbol(text, Dedent, line.prefix.start, line.prefix.end)))
 					depth = IntOps.subtract(depth, 1)
 
 				depth = line.level
@@ -943,7 +967,7 @@ pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnost
 				-- One Result carries the cursor across the line to its LF or EOF, or the first error.
 				var code: Result[Int, Diagnostic] = match line_code(text, line.prefix):
 					Ok(PipeLine(pipe)):
-						tokens = tokens.append(pipe)
+						tokens = tokens.append(ReadyToken(pipe))
 						Ok(pipe.span.end)
 					Ok(OrdinaryCode(start)):
 						Ok(start)
@@ -971,7 +995,7 @@ pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnost
 								else:
 									match line_code(text, continued):
 										Ok(PipeLine(pipe)):
-											tokens = tokens.append(pipe)
+											tokens = tokens.append(ReadyToken(pipe))
 											Ok(pipe.span.end)
 										Ok(OrdinaryCode(start)):
 											Ok(start)
@@ -983,10 +1007,16 @@ pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnost
 								comment_end(text, cursor)
 							else:
 								match code_token(text, cursor):
-									Ok(token):
-										tokens = tokens.append(token)
-										brackets = bracket_depth(brackets, token.kind)
-										Ok(token.span.end)
+									Ok(scanned):
+										tokens = tokens.append(scanned)
+
+										match scanned:
+											WordToken(spelling, _, end):
+												spellings = spellings.append(spelling)
+												Ok(end)
+											ReadyToken(ready):
+												brackets = bracket_depth(brackets, ready.kind)
+												Ok(ready.span.end)
 									Err(error):
 										Err(error)
 						Err(_):
@@ -995,7 +1025,7 @@ pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnost
 				lines = match code:
 					Ok(line_end):
 						next = IntOps.min(IntOps.add(line_end, 1), source.length())
-						tokens = tokens.append(symbol(text, Newline, line_end, next))
+						tokens = tokens.append(ReadyToken(symbol(text, Newline, line_end, next)))
 						next_code_line(text, next, depth)
 					Err(error):
 						Err(error)
@@ -1003,4 +1033,41 @@ pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnost
 				break
 
 	finished ?= lines
-	Ok({ tokens = tokens, end = { source = origin, start = source.length(), end = source.length() } })
+	-- Interning during the scan would extend a table the loop still holds,
+	-- which the host copies for each new spelling, so the scan collects the
+	-- spellings and one `intern_names` call mints all their IDs. Its `ids`
+	-- hold one ID per WordToken in order, so the `None` arm never runs.
+	interned = intern_names(names, spellings)
+	var lexed: List[Token] = []
+	var word_position: Int = 0
+	var missing: Option[Diagnostic] = None
+
+	for scanned in tokens:
+		match scanned:
+			ReadyToken(ready):
+				lexed = lexed.append(ready)
+			WordToken(_, start, end):
+				match interned.ids.get(word_position):
+					Some(id):
+						lexed = lexed.append(token(text, IdentifierToken(id), start, end))
+					None:
+						missing = Some(diagnostic(
+							{ source = COMPILER_SOURCE, start = 0, end = 0 },
+							"internal compiler error: a scanned identifier has no interned ID",
+							"report this compiler error with the input files",
+						))
+						break
+
+				word_position = IntOps.add(word_position, 1)
+
+	minted ?= match missing:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+	Ok({
+		tokens = lexed,
+		end = { source = origin, start = source.length(), end = source.length() },
+		base_names = names,
+		names = interned.names
+	})

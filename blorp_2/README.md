@@ -1538,6 +1538,9 @@ The impure command shell owns file I/O and printing. Compilation and
 diagnostic rendering are pure. The pipeline publishes these complete results:
 
 1. Lexing produces tokens with source spans and an explicit end-of-source span.
+   It receives the name table so far, mints one opaque `NameId` per identifier
+   spelling, and publishes the table it was given (`base_names`) and its
+   extension (`names`); identifier tokens carry only the `NameId`.
    Integer tokens retain their complete raw spelling; indent and dedent tokens
    span the indentation prefix, and each token records whether a space precedes
    it. Trivia is skipped over the original
@@ -1551,7 +1554,8 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    syntax stay distinct because their target lookup differs.
    Every expression records its consumed token span directly, without reconstructing
    locations from names or literal values.
-   A shared interning builder assigns one opaque `NameId` per spelling across the module inventory. Program
+   The parser reads identifier IDs and never looks a spelling up; it recognises
+   contextual words such as `import` by the IDs the name seed gives them. Program
    assembly ([assemble.brp](src/parse/assemble.brp)) seals the complete syntax and immutable name table in an opaque `ParsedProgram`.
    Its [declaration inventory](src/utils/ids.brp) issues function, record,
    union and owner-qualified variant IDs once from the raw syntax. Consumers
@@ -1715,12 +1719,12 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    source-language acceptance is already complete. Retains/releases project the
    explicit operations; emission does not invent owners or cleanup.
 
-The names module owns the spelling table and constructs the entrypoint's `main`
-identity. Every module parse extends that shared authority, including the
-designated foundation's five builtin declarations. The sealed program retains
+The names module owns the spelling table and its seed: the entrypoint's `main`
+identity and the parser's contextual words. Every module's lexing extends that
+shared authority, including the designated foundation's five builtin declarations. The sealed program retains
 the entrypoint spelling identity and designated module identities; checking
-validates builtin authority once before constructing the namespace. Parsing uses
-string lookup only in its local interning builder and publishes the immutable table.
+validates builtin authority once before constructing the namespace. Lexing interns
+each module's spellings in one batch and publishes the immutable table.
 Written names contain only a `NameId` and source span. Checking compares identities;
 spelling lookup is reserved for diagnostics and rejects a missing table entry
 as an internal compiler error. IDs are meaningful only within their owning

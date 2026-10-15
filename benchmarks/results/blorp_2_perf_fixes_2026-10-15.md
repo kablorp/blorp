@@ -9,12 +9,12 @@ to 10.1G (3.9 s to 0.6 s). Emit now grows linearly (exponent 1.0) in every dimen
 
 For finding 2, a bucket index replaces the linear `find_name` scan (see
 [Name lookup index](#name-lookup-index)). It cuts a lookup to about 3.8K instructions at any table size.
-Interning stays quadratic in distinct names until the lexer interns each module in one batch, because
-`intern_name` still copies the table for each new spelling. This note records that interim cost.
+The lexer now interns each module in one batch, which removes the remaining copy per new spelling,
+so loading is linear (see [Lexer interning](#lexer-interning)).
 
 ## Change
 
-Commit `59145318b` on `blorp2/perf-fixes`, base `origin/main` `c4289f0b1`. Only
+Commit `20a89291c` on `blorp2/perf-fixes`, base `origin/main` `c4289f0b1`. Only
 `blorp_2/src/emit/emit.brp` changes (formatted lines 2,372 -> 2,386).
 
 Each loop that accumulates C now collects its children into a local `var fragments: List[String]`,
@@ -30,7 +30,7 @@ quadratic under the host compiler (defect 1 below), because the helpers return `
 
 ## Provenance
 
-- Baseline: `origin/main` `c4289f0b1`, exported with `git archive`. Candidate: `59145318b`. Both were
+- Baseline: `origin/main` `c4289f0b1`, exported with `git archive`. Candidate: `20a89291c`. Both were
   built with the same host `bin/blorp` (status FRESH, SHA-256 `7f7289d2…`) using the Makefile's flags,
   `clang -O0 -DBLORP_MEMORY_DIAGNOSTICS=1`.
 - Machine: Apple M4, macOS 26.7.1, Apple clang 21.0.0, arm64. Load average was about 3.5 because
@@ -132,9 +132,10 @@ compiled with `bin/blorp compile --no-format` and `clang -O0 -DBLORP_MEMORY_DIAG
   `append_union_action`), parameters (`c_parameters`), call arguments, payload fields, recur
   arguments and string-literal bytes (`append_string_bytes`). Each grows only with that construct's
   width, not with output size. The byte loop would need an allocation per byte to collect fragments.
-- `append_function`, `append_match` and `append_aggregate_definitions` now always receive `""` as
-  `output`. Removing that parameter belongs with the lexer-interning change or a small cleanup of its
-  own.
+- `append_function`, `append_match` and `append_aggregate_definitions` received only `""` as
+  `output`. The commit "Drop the always-empty output parameter from three Blorp 2 emitters" drops
+  that parameter. `append_signature` and the helpers called from
+  loops still take an `output` prefix that is often `""`.
 
 ## Name lookup index
 
@@ -145,7 +146,7 @@ The index commit on `blorp2/perf-fixes`. It changes only `blorp_2/src/utils/name
 
 - **Place.** `NameTable` is opaque over `{ spellings: List[String], buckets: List[List[NameId]] }`.
 - **Authority.** `spellings` is the authority: an ID is a spelling's position. `buckets` is an index
-  derived only from `spellings`, written only by `program_names` and `extend_names`.
+  derived only from `spellings`, written only by `program_names` and the batch builder.
 - **Key.** The complete spelling. A wrapping FNV-style hash over its bytes chooses a bucket: FNV-1a's
   basis and prime, adding each byte where FNV xors (the subset has no bit operations). Bytes are read
   with `StringOps.get` and `to_int`, as the lexer reads them.
@@ -155,9 +156,10 @@ The index commit on `blorp2/perf-fixes`. It changes only `blorp_2/src/utils/name
   rehashing every spelling locally. Counts stay odd so the remainder reads every hash bit.
 - **Lifetime.** One compilation. IDs are never compared across tables, and `same_name_table` compares
   spellings only.
-- **API.** `find_name` and `intern_name` keep their signatures. `intern_name` is `find_name` plus a
-  one-spelling `extend_names`. `extend_names(names, spellings)` is the batch builder the lexer will
-  use.
+- **API.** The index commit kept `find_name` and `intern_name`, with `intern_name` as `find_name` plus
+  a one-spelling batch, and added the batch builder `extend_names(names, spellings)`. The lexer change
+  renamed the builder `intern_names`, which also returns each spelling's ID, and deleted
+  `intern_name` and `find_name`. Tests read IDs through `intern_names`.
 
 ### Lookup cost
 
@@ -184,7 +186,7 @@ Instructions fall because each new spelling's lookup is now constant. Allocation
 `intern_name` extends a table that the caller still holds, so each new spelling copies both
 `spellings` and the outer `buckets` list. The bucket it appends to is also copied, because that inner
 list is still shared with the previous table. The copy itself was already there; the index makes it
-larger. It goes away when the lexer builds each module's table in one `extend_names` batch.
+larger. It went away once the lexer built each module's table in one batch.
 
 That batch is linear (`perf/micro/new/extend.brp`):
 
@@ -212,21 +214,6 @@ Load stays quadratic in distinct names for the reason above: the copy per new sp
 allocations rise by +0.3% on composite 4/4 (4,559,058 -> 4,574,850 against the emit commit) and by +14%
 on unions 2048 (410,444 -> 468,013). Composite 4/4 instructions fall from 10,089M to 9,394M.
 
-### Projection: the lexer move (scratch tree, not a commit)
-
-To estimate what interning each module in one batch gives, a scratch tree combined this index with
-the parser from the unlanded reference commit `ef66fbd9b` (branch `blorp2/interning-prepass-ref`).
-That parser extends the table once per module before parsing. It is not the planned lexer design;
-it only stands in for its cost. Raw data: `perf/proj.tsv`.
-
-| input | load before | load projected | whole compile projected |
-| --- | ---: | ---: | ---: |
-| unions 2048 | 15,681M | 757M | 2,890M / 408,326 |
-| composite 4/4 | 3,213M | 1,572M | 8,446M / 4,517,933 |
-| composite 8/4 | 9,719M | 3,267M | 21,543M / 9,028,755 |
-
-Projected load exponents are 0.82, 0.90, 0.96 for unions and 1.05, 1.01, 1.06 for composite.
-
 ### Tests
 
 `test_utils/test_names` has five new tests: a batch that skips known and repeated spellings, lookup
@@ -245,6 +232,70 @@ checked by mutation:
 
 "left" and "third" share bucket 28 of 31; the collision test failing under the first mutation shows
 that they collide.
+
+## Lexer interning
+
+Commit "Intern Blorp 2 identifiers in the lexer", on base `4960e16b9`. It supersedes the
+projection recorded earlier for this change.
+
+- **Who mints IDs.** `lex(origin, source, names)` mints identifier IDs, and identifier tokens are
+  `IdentifierToken(NameId)`. `LexedProgram` publishes `base_names` (the table it was given) and `names`.
+  The parser reads IDs and keeps no table, so `ParserState.names` and the parser's
+  "missing from the table" guard are gone.
+- **Contextual words.** The parser recognises 15 contextual words (`import`, `fixed`,
+  `tail_recursive`, ...) by ID. `program_names()` seeds them after `main`, and every table extended
+  from that seed carries them as `ContextualWords`.
+- **Type parameter names.** The capital-letter check for type parameter names still reads the
+  spelling by ID; whether the lexer should split upper- and lower-case identifiers is open for M1a.
+- **Why one batch.** The brief's first option was to thread a local table through the token loop with
+  the one-spelling `intern_name`. It stays quadratic: allocations are flat at 11 per spelling, but every allocation
+  copies the table. A loop of 2,048 / 8,192 / 32,768 identifier occurrences, each spelling twice,
+  costs 0.16G / 2.00G / 30.4G instructions (`perf/micro/lexi/intern.brp`; `extend.brp` behaves the
+  same way).
+- **How the batch works.** The scan collects the spellings, and one `intern_names(names, spellings)`
+  call returns the extended table and an ID per spelling, in order. A second pass over the scanned
+  tokens then makes the identifier tokens.
+- **The cost.** The scanned tokens are a lex-private `ScannedToken` union, which costs one allocation
+  per token.
+
+Load phase (`pre_check` pilot), base `4960e16b9` against this commit:
+
+| input | load before | load after | exponents before | exponents after |
+| --- | ---: | ---: | --- | --- |
+| unions 256, 512, 1024, 2048 | 338M, 1,040M, 3,618M, 13,462M | 129M, 229M, 431M, 841M | 1.62, 1.80, 1.90 | 0.83, 0.91, 0.96 |
+| composite 1/4, 2/4, 4/4, 8/4 | 457M, 1,074M, 2,637M, 7,317M | 418M, 865M, 1,735M, 3,588M | 1.23, 1.30, 1.47 | 1.05, 1.01, 1.05 |
+| functions 256 to 2048 | 99M to 1,009M | 93M to 542M | 0.90, 1.11, 1.33 | 0.76, 0.86, 0.93 |
+
+Per identifier on the `unions` inputs with about 1K, 4K and 16K distinct spellings
+(205, 820 and 3,277 unions; 2,258, 9,023 and 36,050 identifier tokens):
+
+| distinct spellings | before (allocations / instructions per identifier) | after (allocations / instructions per identifier) |
+| ---: | ---: | ---: |
+| ~1K | 20.4 / 106K | 20.5 / 49K |
+| ~4K | 18.8 / 254K | 18.7 / 40K |
+| ~16K | 18.4 / 875K | 18.2 / 38K |
+
+Whole compile, composite (instructions / allocations):
+
+| scale | before | after | wall s before (noisy) | wall s after (noisy) |
+| --- | ---: | ---: | ---: | ---: |
+| 4/4 | 9,509M / 4,625,089 | 8,607M / 4,699,525 | 0.54 | 0.48 |
+| 8/4 | 25,590M / 9,242,497 | 21,865M / 9,390,957 | 1.44 | 1.25 |
+
+Allocations rise 1.6% on composite from the `ScannedToken` allocation per token. They fall slightly on
+unions (unions 2048: 486,636 -> 483,052).
+
+The table above was measured while the parser still read contextual words by spelling. Comparing
+seeded IDs instead lowers composite 4/4 load from 1.735G to 1.722G (allocations unchanged at
+1,092,355; unions 2048 load 0.83G). The other rows were not re-measured.
+
+That 1.72G is above the projection of about 1.69G re-based to `4960e16b9`. The difference is the
+scanned-token pass, and the brief's 1.7G target is missed by 1.3%. Two other second-pass designs
+measured higher:
+- re-interning each word with `intern_name`: 1.98G;
+- `find_name` per word: 1.90G.
+
+Generated C, stdout, stderr and exit status are byte-identical for all 338 e2e fixtures.
 
 ## Not measured
 

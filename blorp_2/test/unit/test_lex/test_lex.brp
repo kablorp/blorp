@@ -1,7 +1,9 @@
 import:
+	../../../src/utils/names: NameId, name_spelling, program_names, same_name, same_name_table
 	../../../src/lex/lex: lex
 	../../../src/utils/source: module_source, root_module_id
 	../../../src/utils/syntax:
+		LexedProgram,
 		Span,
 		Symbol(
 			AtSign, VoidKeyword, PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen,
@@ -23,7 +25,7 @@ pure func span_text(span: Span) -> String:
 
 
 pure func trace(source: String) -> String:
-	match lex(module_source(root_module_id()), source):
+	match lex(module_source(root_module_id()), source, program_names().names):
 		Err(diagnostic):
 			"error@" + span_text(
 				diagnostic.span,
@@ -33,8 +35,12 @@ pure func trace(source: String) -> String:
 
 			for token in program.tokens:
 				kind: String = match token.kind:
-					IdentifierToken(name):
-						"name=" + name
+					IdentifierToken(id):
+						match name_spelling(program.names, id):
+							Some(name):
+								"name=" + name
+							None:
+								"name=?"
 					IntegerLiteral(value):
 						"integer=" + value
 					FloatLiteral(value):
@@ -210,7 +216,7 @@ pure func test_indentation_opens_one_level_at_a_time() -> Bool:
 
 
 private pure func spacing_of(source: String) -> List[String]:
-	match lex(module_source(root_module_id()), source):
+	match lex(module_source(root_module_id()), source, program_names().names):
 		Err(_):
 			[]
 		Ok(program):
@@ -258,7 +264,7 @@ pure func test_record_update_bar_preserves_its_token_span() -> Bool:
 
 
 pure func test_builtin_label_preserves_bytes_and_span() -> Bool:
-	match lex(module_source(root_module_id()), "\"int.to_string\""):
+	match lex(module_source(root_module_id()), "\"int.to_string\"", program_names().names):
 		Ok(program):
 			match program.tokens:
 				[token, _]:
@@ -301,6 +307,80 @@ pure func test_braces_preserve_record_field_token_spans() -> Bool:
 	trace("{first=7}") == "{@0:1\nname=first@1:6\n=@6:7\ninteger=7@7:8\n}@8:9\nLF@9:9\nEOF@9:9"
 
 
+-- The IDs of a lexed program's identifier tokens, in source order.
+private pure func identifier_ids(program: LexedProgram) -> List[NameId]:
+	var ids: List[NameId] = []
+	for token in program.tokens:
+		match token.kind:
+			IdentifierToken(id):
+				ids = ids.append(id)
+			_:
+				void
+	ids
+
+
+private ECHO_SOURCE: String = "func echo(value: Int) -> Int:\n    value\n"
+
+
+pure func test_one_spelling_lexes_to_one_identity() -> Bool:
+	match lex(module_source(root_module_id()), ECHO_SOURCE, program_names().names):
+		Err(_):
+			False
+		Ok(program):
+			match identifier_ids(program):
+				[function, parameter, parameter_type, return_type, value]:
+					(
+						same_name(parameter, value)
+						and same_name(parameter_type, return_type)
+						and not same_name(function, parameter)
+						and not same_name(parameter, parameter_type)
+						and name_spelling(program.names, parameter) == Some("value")
+						and name_spelling(program.names, parameter_type) == Some("Int")
+					)
+				_:
+					False
+
+
+-- Each spelling of the first source keeps its ID and spelling in the second
+-- source's table; only new spellings get new IDs.
+private pure func extends_without_renumbering(first: LexedProgram, second: LexedProgram) -> Bool:
+	var kept = same_name_table(second.base_names, first.names)
+	for id in identifier_ids(first):
+		kept = kept and name_spelling(second.names, id) == name_spelling(first.names, id)
+	match identifier_ids(second):
+		[function, parameter, parameter_type, return_type, value]:
+			(
+				kept
+				and same_name(parameter, value)
+				and same_name(parameter_type, return_type)
+				and name_spelling(second.names, function) == Some("twice")
+				and name_spelling(first.names, function) == None
+				and name_spelling(second.names, parameter) == Some("value")
+			)
+		_:
+			False
+
+
+pure func test_sequential_sources_share_and_extend_identities() -> Bool:
+	match lex(module_source(root_module_id()), ECHO_SOURCE, program_names().names):
+		Err(_):
+			False
+		Ok(first):
+			match lex(module_source(root_module_id()), "func twice(value: Int) -> Int:\n    value\n", first.names):
+				Err(_):
+					False
+				Ok(second):
+					match (identifier_ids(first), identifier_ids(second)):
+						([_, first_value, first_int, _, _], [_, second_value, second_int, _, _]):
+							(
+								extends_without_renumbering(first, second)
+								and same_name(first_value, second_value)
+								and same_name(first_int, second_int)
+							)
+						_:
+							False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 lexer",
 	tests = [
@@ -340,5 +420,7 @@ tests: TestSuite = {
 		("minus requires adjacent digits", test_minus_requires_adjacent_digits),
 		("mixed indentation diagnostic", test_mixed_indentation_diagnostic),
 		("CR line ending diagnostic", test_cr_line_ending_diagnostic),
+		("one spelling lexes to one identity", test_one_spelling_lexes_to_one_identity),
+		("sequential sources share and extend identities", test_sequential_sources_share_and_extend_identities),
 	]
 }
