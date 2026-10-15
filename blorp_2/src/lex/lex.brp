@@ -1004,6 +1004,60 @@ private pure func line_code(text: SourceText, prefix: LinePrefix) -> Result[Line
 				Ok(OrdinaryCode)
 
 
+-- An open bracketed block (host GRAMMAR 2.2): `group` is the bracket depth
+-- whose line breaks it makes significant, `base` the indentation level of
+-- the line that opened it with a `:`.
+private fixed record BracketedBlock {
+	group: Int,
+	base: Int
+}
+
+
+private pure func innermost_block(bodies: List[BracketedBlock]) -> Option[BracketedBlock]:
+	bodies.get(IntOps.subtract(bodies.length(), 1))
+
+
+-- Host 2.2 `insignificant(depth)`: a line break inside brackets is trivia
+-- unless a bracketed block is open at exactly this depth.
+private pure func insignificant_break(brackets: Int, bodies: List[BracketedBlock]) -> Bool:
+	match innermost_block(bodies):
+		None:
+			True
+		Some(block):
+			not IntOps.equals(brackets, block.group)
+
+
+-- Host 2.2 `opens_block(depth)`: a `:` ending a line inside brackets opens
+-- a bracketed block, unless one is already open at this depth or deeper.
+private pure func opens_bracketed_block(brackets: Int, last_colon: Bool, bodies: List[BracketedBlock]) -> Bool:
+	open_deeper = match innermost_block(bodies):
+		None:
+			True
+		Some(block):
+			IntOps.greater_than(brackets, block.group)
+	last_colon and open_deeper
+
+
+-- Host 2.3 DEDENT-TO: a line dedented to `level` closes every bracketed
+-- block whose base is at or above it. Blocks open in stack order with
+-- non-decreasing bases, so the survivors are a prefix.
+private pure func blocks_open_below(bodies: List[BracketedBlock], level: Int) -> List[BracketedBlock]:
+	var kept: List[BracketedBlock] = []
+
+	for block in bodies:
+		if IntOps.less_than(block.base, level):
+			kept = kept.append(block)
+	kept
+
+
+private pure func is_colon(kind: TokenKind) -> Bool:
+	match kind:
+		SymbolToken(Colon):
+			True
+		_:
+			False
+
+
 -- Open brackets raise the depth and closing ones lower it, never below zero:
 -- a closer with nothing open is the parser's error, not a layout change.
 private pure func bracket_depth(depth: Int, kind: TokenKind) -> Int:
@@ -1020,12 +1074,23 @@ private pure func bracket_depth(depth: Int, kind: TokenKind) -> Int:
 -- last, or a Dedent for each level it closes, spanning its indentation, and
 -- ends with Newline: its LF, or empty at the end of a source without one.
 -- Inside an open bracket a LF and the next line's indentation are trivia, so
--- the code line continues there without layout tokens.
+-- the code line continues there without layout tokens, unless a bracketed
+-- block (host GRAMMAR 2.2-2.3) is open at that depth: a `:` ending a line
+-- inside brackets opens one, its lines are laid out like any block, and a
+-- line dedented to its base closes it. A closing bracket never closes a
+-- block; the Dedent comes with the next line, or with the end of the input.
+-- The host's L2 case 3 (a line indented strictly between a block's base and
+-- its level closes the block) cannot arise here: levels are consecutive
+-- integers, one tab or four spaces each, so no width lies between two
+-- adjacent levels; such a line is "invalid indentation" instead.
 pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[LexedProgram, Diagnostic]:
 	text: SourceText = { origin = origin, bytes = source }
 	var tokens: List[ScannedToken] = []
 	var spellings: List[String] = []
 	var depth = 0
+	-- Bracket depth and the open bracketed blocks persist across code lines.
+	var brackets: Int = 0
+	var bodies: List[BracketedBlock] = []
 	-- One Result carries each code line to lay out, or the first error.
 	var lines: Result[CodeLine, Diagnostic] = next_code_line(text, 0, 0)
 
@@ -1034,6 +1099,9 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 			Ok(line):
 				if IntOps.greater_than(line.level, depth):
 					tokens = tokens.append(ReadyToken(symbol(text, Indent, line.prefix.start, line.prefix.end)))
+
+				if IntOps.less_than(line.level, depth):
+					bodies = blocks_open_below(bodies, line.level)
 
 				while IntOps.greater_than(depth, line.level):
 					tokens = tokens.append(ReadyToken(symbol(text, Dedent, line.prefix.start, line.prefix.end)))
@@ -1053,7 +1121,8 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 						Ok(line.prefix.end)
 					Err(error):
 						Err(error)
-				var brackets: Int = 0
+				-- Whether the last token scanned on this code line is a `:`.
+				var last_colon: Bool = False
 
 				while True:
 					match code:
@@ -1061,7 +1130,20 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 							if IntOps.equals(cursor, source.length()):
 								break
 
-							if byte_is(text, cursor, '\n') and IntOps.equals(brackets, 0):
+							-- A LF ends the code line at depth zero, when it opens a
+							-- bracketed block, or when it is inside the one open at
+							-- this depth; any other LF inside brackets is trivia.
+							line_ends = if not byte_is(text, cursor, '\n'):
+								False
+							else if IntOps.equals(brackets, 0):
+								True
+							else if opens_bracketed_block(brackets, last_colon, bodies):
+								bodies = bodies.append({ group = brackets, base = depth })
+								True
+							else:
+								not insignificant_break(brackets, bodies)
+
+							if line_ends:
 								break
 
 							code = if byte_is(text, cursor, '\n'):
@@ -1076,6 +1158,7 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 									match line_code(text, continued):
 										Ok(PipeLine(pipe)):
 											tokens = tokens.append(ReadyToken(pipe))
+											last_colon = False
 											Ok(pipe.span.end)
 										Ok(OrdinaryCode):
 											Ok(continued.end)
@@ -1093,9 +1176,11 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 										match scanned:
 											WordToken(spelling, _, end):
 												spellings = spellings.append(spelling)
+												last_colon = False
 												Ok(end)
 											ReadyToken(ready):
 												brackets = bracket_depth(brackets, ready.kind)
+												last_colon = is_colon(ready.kind)
 												Ok(ready.span.end)
 									Err(error):
 										Err(error)
