@@ -144,6 +144,10 @@ measurements remain serialized. The coordinator owns integration and this plan.
    constructor selection in checking; distinct union owners may share a spelling.
    Accepted with fresh current-main validation; see the
    [namespace publication report](../benchmarks/results/blorp_2_namespace_publication_2026-10-14.md).
+   Module aliases, `private` and qualified values/types (M1b part A) are
+   namespace facts: alias rows scoped to the importing module, visibility on
+   declared rows consulted at import selection and qualified resolution; see
+   the [namespace aliases report](../benchmarks/results/blorp_2_namespace_aliases_2026-10-15.md).
 2. **Bounded lowering preparation.** Keep the growing block definition vector,
    binding map and cursor in their local block owner. Lower each expression into
    its own completed chunk and merge it once at the block boundary, preserving

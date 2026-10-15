@@ -73,17 +73,37 @@ private fixed record DeclaredVariantContract {
 }
 
 
-private pure func find_declared_variant(context: ResolutionContext, owner: UnionId, name: WrittenName) -> Result[Option[DeclaredVariantContract], CheckError]:
-	declaration ?= context.unions.get(union_number(owner)).to_result(checker_invariant(name.span, InvalidCheckedUnion(owner)))
-	var found: Option[DeclaredVariantContract] = None
-	for candidate in variant_candidates(context.namespace, context.module, name.id):
-		match declaration.variants.get(variant_number(candidate)):
-			Some(variant):
-				if same_variant(candidate, variant.id) and same_name(variant.name.id, name.id):
-					found = Some({ variant = variant.id, fields = variant.fields, parameters = declaration.type_parameters })
-					break
-			None: void
+-- The one reader of a variant's declaration: its fields and the union's
+-- parameters, for a variant identity the caller has already established.
+private pure func declared_variant_contract(context: ResolutionContext, owner: UnionId, variant: VariantId, span: Span) -> Result[Option[DeclaredVariantContract], CheckError]:
+	declaration ?= context.unions.get(union_number(owner)).to_result(checker_invariant(span, InvalidCheckedUnion(owner)))
+	found: Option[DeclaredVariantContract] = match declaration.variants.get(variant_number(variant)):
+		Some(declared):
+			if same_variant(variant, declared.id):
+				Some({ variant = declared.id, fields = declared.fields, parameters = declaration.type_parameters })
+			else:
+				None
+		None: None
 	Ok(found)
+
+
+-- A bare constructor resolves among the constructors visible in the caller's
+-- module; an unimported constructor of the union is not found.
+private pure func find_declared_variant(context: ResolutionContext, owner: UnionId, name: WrittenName) -> Result[Option[DeclaredVariantContract], CheckError]:
+	var found: Option[DeclaredVariantContract] = None
+	var failure: Option[CheckError] = None
+	for candidate in variant_candidates(context.namespace, context.module, name.id):
+		match declared_variant_contract(context, owner, candidate, name.span):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(Some(contract)):
+				found = Some(contract)
+				break
+			Ok(None): void
+	match failure:
+		Some(error): Err(error)
+		None: Ok(found)
 
 
 pure func find_variant(context: ResolutionContext, occurrence: UnionOccurrence, name: WrittenName) -> Result[Option[VariantContract], CheckError]:
@@ -385,6 +405,17 @@ private pure func pending_variant(
 	arguments: List[InferenceType] = match shape:
 		InferredUnion(_, arguments): arguments
 		_: []
+	instantiate_variant(variant, head, arguments, name)
+
+
+-- The contract of one declared variant under the union's type arguments
+-- (empty for a nongeneric union). Bare and qualified constructors share it.
+private pure func instantiate_variant(
+	variant: DeclaredVariantContract,
+	head: InferenceType,
+	arguments: List[InferenceType],
+	name: WrittenName,
+) -> Result[PendingVariantContract, CheckError]:
 	var hints: List[Option[InferenceType]] = []
 
 	for argument in arguments:
@@ -411,6 +442,57 @@ private pure func pending_variant(
 		fields = fields,
 		span = name.span,
 	})
+
+
+-- `Alias.Variant` names its union through the alias row, so no expected type
+-- is needed to find the owner; a generic union still takes its arguments
+-- from the expectation, as a bare constructor does.
+private pure func pending_qualified_variant(
+	owner: UnionId,
+	variant: VariantId,
+	name: WrittenName,
+	expected: Option[InferenceType],
+	context: ResolutionContext,
+) -> Result[PendingVariantContract, CheckError]:
+	contract ?= declared_variant_contract(context, owner, variant, name.span)
+	declared ?= contract.to_result(checker_invariant(name.span, InvalidCheckedUnion(owner)))
+	arguments: List[InferenceType] = match expected:
+		Some(hint):
+			match inference_shape(hint):
+				InferredUnion(expected_owner, values):
+					if IntOps.equals(union_number(expected_owner), union_number(owner)):
+						values
+					else:
+						[]
+				_: []
+		None: []
+	head: InferenceType = if arguments.is_empty():
+		AcceptedType(UnionType(owner))
+	else:
+		InferredUnion(owner, arguments)
+	generic ?= if declared.parameters.is_empty() or not arguments.is_empty():
+		Ok(void)
+	else:
+		Err(constructor_error(name.span, ConstructorNeedsExpectedType(name.id)))
+	instantiate_variant(declared, head, arguments, name)
+
+
+pure func plan_qualified_variant(
+	owner: UnionId,
+	variant: VariantId,
+	name: WrittenName,
+	arguments: List[ValueExpression],
+	called: Bool,
+	expected: Option[InferenceType],
+	context: ResolutionContext,
+) -> Result[PlannedBase, CheckError]:
+	contract ?= pending_qualified_variant(owner, variant, name, expected, context)
+	if contract.fields.is_empty() and called:
+		Err(constructor_error(name.span, PayloadFreeVariantCalled(contract.variant)))
+	else if not IntOps.equals(contract.fields.length(), arguments.length()):
+		Err(constructor_error(name.span, ConstructorFieldCountMismatch(contract.variant, contract.fields.length(), arguments.length())))
+	else:
+		Ok(PlannedVariant(contract, arguments))
 
 
 pure func plan_variant(

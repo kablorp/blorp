@@ -43,7 +43,9 @@ import:
 		call_error,
 		record_error,
 		value_error,
-		UnsupportedForm(ModuleQualifiedName, IntoOpaque, FromOpaque, RangeValue, AndOrOperator, NotOperator, IfValue, MatchValue),
+		UnsupportedForm(IntoOpaque, FromOpaque, RangeValue, AndOrOperator, NotOperator, IfValue, MatchValue),
+		QualifiedError(UnknownModuleAlias, BareModuleAlias, UnknownQualifiedName, PrivateQualifiedName, QualifiedFunctionNotCalled),
+		qualified_error,
 		unsupported_form,
 		method_error,
 		checker_invariant
@@ -92,6 +94,7 @@ import:
 		finish_pending_list,
 		list_element_type,
 		plan_list_literal,
+		plan_qualified_variant,
 		validate_list_elements,
 		PlannedRecordFields,
 		RecordOccurrence,
@@ -105,12 +108,18 @@ import:
 		resolve_record_field,
 		validate_record_fields,
 		validate_variant_fields
-	../utils/ids: FunctionId, record_number
+	../utils/ids: FunctionId, record_number, variant_owner
+	../namespace/namespace:
+		QualifiedLookup(ExportedDeclaration, PrivateDeclaration, NoDeclaration),
+		module_alias,
+		qualified_function,
+		qualified_variant,
 	int as IntOps
 	../utils/names: NameId, same_name
 	../utils/source: COMPILER_SOURCE
 	option: to_result
 	../utils/syntax:
+		ParsedQualified,
 		Span,
 		ValueExpression,
 		WrittenName,
@@ -354,13 +363,12 @@ private pure func plan_base(purity: Purity, scope: List[LocalBinding], body: Val
 				None:
 					if contains_variant(context.namespace, context.module, name.id):
 						plan_variant(name, [], False, expectation, slots, context)
+					else if module_alias(context.namespace, context.module, name.id).is_some():
+						Err(qualified_error(name.span, BareModuleAlias(name.id)))
 					else:
 						Err(value_error(name.span, UnknownValue(name.id)))
-		-- A qualified value exists only under a module alias, and the alias is
-		-- rejected before any body is checked, so these two arms cannot be
-		-- reached today; the namespace milestone replaces both with resolution.
-		QualifiedName(_): Err(unsupported_form(body.base_span, ModuleQualifiedName))
-		QualifiedApplication(_, _): Err(unsupported_form(body.base_span, ModuleQualifiedName))
+		QualifiedName(qualified): plan_qualified(qualified, [], False, expectation, slots, context, body)
+		QualifiedApplication(qualified, arguments): plan_qualified(qualified, arguments, True, expectation, slots, context, body)
 		OpaqueWrap(_, _): Err(unsupported_form(body.base_span, IntoOpaque))
 		OpaqueUnwrap(_, _): Err(unsupported_form(body.base_span, FromOpaque))
 		ListExpression(elements): plan_list_literal(elements, expectation, body.base_span)
@@ -373,6 +381,40 @@ private pure func plan_base(purity: Purity, scope: List[LocalBinding], body: Val
 		StringExpression(value): Ok(PlannedLeaf(AcceptedString(value), StringType))
 		IntegerExpression(value): Ok(PlannedLeaf(AcceptedInteger(value), IntType))
 		FloatExpression(value): Ok(PlannedLeaf(AcceptedFloat(value), FloatType))
+
+
+-- `Alias.name` resolves through the alias row to the target's own exported
+-- declarations: a constructor builds that union's variant; a function is a
+-- direct call to it. Imports of the target are not reexported.
+private pure func plan_qualified(
+	qualified: ParsedQualified,
+	arguments: List[ValueExpression],
+	called: Bool,
+	expectation: Option[InferenceType],
+	slots: List[InferenceSlot],
+	context: ResolutionContext,
+	body: ValueExpression,
+) -> Result[PlannedBase, CheckError]:
+	row ?= module_alias(context.namespace, context.module, qualified.module.id)
+		.to_result(qualified_error(qualified.module.span, UnknownModuleAlias(qualified.module.id)))
+	name = qualified.name
+	match qualified_variant(context.namespace, row.target, name.id):
+		ExportedDeclaration(variant):
+			plan_qualified_variant(variant_owner(variant), variant, name, arguments, called, expectation, context)
+		PrivateDeclaration(_):
+			Err(qualified_error(name.span, PrivateQualifiedName(name.id, row.path)))
+		NoDeclaration:
+			match qualified_function(context.namespace, row.target, name.id):
+				ExportedDeclaration(function):
+					if called:
+						contract ?= function_contract(context.caller, name, arguments, function, context.signatures)
+						Ok(PlannedCall(contract, arguments, ReturnPlacement(body.base_span, body.span), expectation))
+					else:
+						Err(qualified_error(body.base_span, QualifiedFunctionNotCalled(qualified.module.id, name.id)))
+				PrivateDeclaration(_):
+					Err(qualified_error(name.span, PrivateQualifiedName(name.id, row.path)))
+				NoDeclaration:
+					Err(qualified_error(name.span, UnknownQualifiedName(qualified.module.id, name.id, row.path)))
 
 
 private pure func resolve_postfixes(purity: Purity, body: ValueExpression, context: ResolutionContext) -> Result[List[ResolvedPostfix], CheckError]:

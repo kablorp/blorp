@@ -902,8 +902,13 @@ ending at its last arm's dedent; the function's last match stays its tail
 body. Ranges parse and are rejected by checking
 until the loops milestone; `and`, `or`, `not`, `if` and non-tail `match`
 until the join milestone.
-A dotted type such as `Shared.Span[Int]` is a qualified type. Checking rejects
-qualified forms until the namespace milestone.
+A dotted type such as `Shared.Span[Int]` is a qualified type. A qualified
+name resolves through the import block's alias row to the target module's
+own public declarations: `IntOps.add(1, 2)` is a direct call to that
+module's function, `S.Circle(2)` and `S.On` build that union's variants, and
+`S.Span` names its record. Private declarations and the target's own imports
+are not exported; a bare alias is not a value, and `Alias.function` without
+a call is rejected.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
 No other declarations, expressions, literals, or statements are supported.
 Single-line comments begin with `--`; a line holding only `---` at column 1
@@ -1061,8 +1066,9 @@ Lexical and layout rules:
   A dot followed by a function name starts UFCS: `42.identity()` is a call;
   `42.5` is a Float literal.
   Non-ASCII bytes outside quoted Strings and CRLF source line endings are rejected.
-- A declaration may start with `private`; the row keeps the keyword's span
-  and checking rejects it until the namespace milestone.
+- A declaration may start with `private` (GUIDE, Visibility): it stays
+  visible within its module and is neither selectable by import nor
+  reachable through an alias from another module.
 - `opaque type Name = Underlying` declares an opaque type, and
   `into_opaque Name(value)` / `from_opaque Name(value)` convert one value;
   all three parse, and checking rejects them until the recursive-types
@@ -1256,17 +1262,20 @@ The executable exits 42. Each import row starts with `./`
 or leading `../` segments, omits `.brp`, and selects local functions or fixed
 unions. The selections follow the path on its line, or on an indented block
 of lines under a path ending in `:`; each line may end with a comma. `path as
-Alias` names the module, alone or before `:` and selections; the row parses,
-and checking rejects the alias until the namespace milestone. A bare
-selector selects a local function or a visible type; if both
+Alias` names the module, alone or before `:` and selections, for qualified
+access such as `Alias.name`; an alias is scoped to its module, cannot reuse a
+declared or imported name there, and each module is imported once (GUIDE,
+One Import Per Module), so an alias and selections of one module share a
+row. A bare selector selects a local function or a visible type; if both
 exist, the selection is ambiguous. `Option(Some, None)` selects a union and those
 constructors, while `Option()` selects the union without constructors. Both
 forms also enable local receiver functions. `Foo methods_only` adds receiver
 functions and requires the exact type independently visible in the caller.
 Imports precede declarations. Bare paths select target-library modules when
 the required explicit library root is supplied. Record type imports and type
-forwarding are supported. Aliases, wildcards, explicit reexport syntax, qualified
-calls and `private` are deferred.
+forwarding are supported. Aliases, qualified names and `private` are supported;
+wildcards and explicit reexport syntax are deferred, and a qualified
+constructor in a pattern still waits for the pattern-compilation milestone.
 
 Each module owns its declarations; same-spelled declarations in different
 modules have distinct identities. Imported functions resolve their annotations

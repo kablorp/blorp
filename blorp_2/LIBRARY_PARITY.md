@@ -16,7 +16,7 @@ The milestone names below come from the self-compile plan, which is pending
 adoption into [ROADMAP.md](ROADMAP.md). As this document uses them:
 
 - **M0**: foundation closeout; includes removing the `+` operator sites from `src`.
-- **M1b** (the "namespace" milestone): `private`, module aliases and qualified names.
+- **M1b** (the "namespace" milestone): `private`, module aliases and qualified names. Part A (aliases, `private`, qualified values and types) landed 2026-10-15; qualified pattern heads remain.
 - **ML** (the "list intrinsics" milestone): List construction intrinsics (`append`, `set`, `concat`, the list literal).
 - **M2** (the "join" milestone): non-tail matches, `if`, `and`/`or`/`not`, `?=`, local type annotations.
 - **M3** (the "loops" milestone): loops with managed carried values (`for`, `while`, `break`, `a..b`).

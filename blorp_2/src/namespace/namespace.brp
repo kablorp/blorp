@@ -8,12 +8,12 @@ import:
 	int as IntOps
 	../utils/names: NameId, same_name
 	../parse/assemble: ModuleImport, ParsedContents, ParsedModuleRow, ParsedProgram, parsed_contents
-	../parse/parse: ImportSelection(NamedSelection, ConstructorSelection, MethodsOnlySelection)
+	../parse/parse: ImportSelection(NamedSelection, ConstructorSelection, MethodsOnlySelection), ModulePath
 	./builtins: PrimitiveType(BuiltinInt, BuiltinFloat, BuiltinString, BuiltinVoid), builtin_type_name
 	../utils/source: ModuleId, ModuleKind(UserModule), same_module
 	../utils/syntax:
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
-		Span, WrittenName,
+		Span, Visibility(Public, Private), WrittenName,
 
 
 fixed union FunctionOrigin:
@@ -35,12 +35,31 @@ fixed record ImportedFunctionBinding {
 
 
 -- A constructor name visible in a module, whether declared there or imported.
+-- `visibility` is the declaring union's: constructors are exported with it.
 private fixed record VariantBinding {
 	module: ModuleId,
 	name: WrittenName,
 	variant: VariantId,
-	declaration_span: Span
+	declaration_span: Span,
+	visibility: Visibility
 }
+
+
+-- `path as Alias` in one module's import block: the alias is a module name,
+-- scoped to the importing module, never a value or type.
+fixed record ModuleAlias {
+	module: ModuleId,
+	name: WrittenName,
+	target: ModuleId,
+	path: ModulePath
+}
+
+
+-- What a qualified name finds among a module's own declarations.
+fixed union QualifiedLookup[A]:
+	ExportedDeclaration(A)
+	PrivateDeclaration(Span)
+	NoDeclaration
 
 
 -- These heads reserve declaration identity; accepted parameter types remain
@@ -73,6 +92,9 @@ fixed union ImportProblem:
 	MissingImportedVariant(WrittenName)
 	RepeatedImportedVariant(WrittenName, Span)
 	ImportedTypeConflict(WrittenName, Span)
+	PrivateImportSelection(WrittenName, ModulePath)
+	RepeatedModuleAlias(WrittenName, Span)
+	ModuleAliasNameConflict(WrittenName, Span)
 
 
 fixed union NamespaceProblem:
@@ -96,14 +118,24 @@ fixed record NamespaceFailure {
 private fixed record LocalFunctionBinding {
 	module: ModuleId,
 	name: WrittenName,
-	function: FunctionId
+	function: FunctionId,
+	visibility: Visibility
 }
+
+
+-- A type name visible in `module`: declared there (builtins belong to the
+-- foundation types module) with its visibility, or forwarded by an import,
+-- which never exports.
+private fixed union TypeOrigin:
+	DeclaredType(Visibility)
+	ImportedType
 
 
 private fixed record TypeBinding {
 	module: ModuleId,
 	name: WrittenName,
-	target: TypeCandidate
+	target: TypeCandidate,
+	origin: TypeOrigin
 }
 
 
@@ -129,7 +161,8 @@ private fixed record NamespaceContents {
 	constructors: List[VariantBinding],
 	types: List[TypeBinding],
 	variants: List[VariantBinding],
-	methods: List[MethodSelectionRequest]
+	methods: List[MethodSelectionRequest],
+	aliases: List[ModuleAlias]
 }
 
 
@@ -257,6 +290,80 @@ pure func imported_functions(namespace: Namespace) -> List[ImportedFunctionBindi
 	from_opaque Namespace(namespace).imports
 
 
+pure func module_alias(namespace: Namespace, module: ModuleId, name: NameId) -> Option[ModuleAlias]:
+	var found: Option[ModuleAlias] = None
+	for row in from_opaque Namespace(namespace).aliases:
+		if same_module(row.module, module) and same_name(row.name.id, name):
+			found = Some(row)
+			break
+	found
+
+
+private pure func exported[A](visibility: Visibility, declaration: A) -> QualifiedLookup[A]:
+	match visibility:
+		Public: ExportedDeclaration(declaration)
+		Private(span): PrivateDeclaration(span)
+
+
+-- The functions a module declares itself; imports are not reexported.
+pure func qualified_function(namespace: Namespace, target: ModuleId, name: NameId) -> QualifiedLookup[FunctionId]:
+	match first_local_function(from_opaque Namespace(namespace).functions, target, name):
+		Some(binding): exported(binding.visibility, binding.function)
+		None: NoDeclaration
+
+
+pure func qualified_variant(namespace: Namespace, target: ModuleId, name: NameId) -> QualifiedLookup[VariantId]:
+	var found: QualifiedLookup[VariantId] = NoDeclaration
+	for binding in from_opaque Namespace(namespace).variants:
+		if same_module(binding.module, target) and same_name(binding.name.id, name):
+			found = exported(binding.visibility, binding.variant)
+			break
+	found
+
+
+pure func qualified_type(namespace: Namespace, target: ModuleId, name: NameId) -> QualifiedLookup[TypeCandidate]:
+	var found: QualifiedLookup[TypeCandidate] = NoDeclaration
+	for binding in from_opaque Namespace(namespace).types:
+		if same_module(binding.module, target) and same_name(binding.name.id, name):
+			match binding.origin:
+				DeclaredType(visibility):
+					found = exported(visibility, binding.target)
+					break
+				ImportedType: void
+	found
+
+
+-- The public functions `module` declares itself: what an importer's method
+-- selection may bind. Visibility is read here, not by the checker.
+pure func exported_functions(namespace: Namespace, module: ModuleId) -> List[FunctionId]:
+	var functions: List[FunctionId] = []
+	for binding in from_opaque Namespace(namespace).functions:
+		if same_module(binding.module, module):
+			match binding.visibility:
+				Public: functions = functions.append(binding.function)
+				Private(_): void
+	functions
+
+
+-- The span of a private declaration `name` in `target`, if any.
+private pure func private_declaration(scan: ImportScan, target: ModuleId, name: NameId) -> Option[Span]:
+	var found: Option[Span] = None
+	match first_local_function(scan.functions, target, name):
+		Some(binding):
+			match binding.visibility:
+				Private(span): found = Some(span)
+				Public: void
+		None:
+			for binding in scan.types:
+				if same_module(binding.module, target) and same_name(binding.name.id, name):
+					match binding.origin:
+						DeclaredType(Private(span)):
+							found = Some(span)
+							break
+						DeclaredType(Public) | ImportedType: void
+	found
+
+
 pure func method_selection_requests(namespace: Namespace) -> List[MethodSelectionRequest]:
 	from_opaque Namespace(namespace).methods
 
@@ -275,6 +382,9 @@ pure func import_problem_span(problem: ImportProblem) -> Span:
 		MissingImportedVariant(name): name.span
 		RepeatedImportedVariant(name, _): name.span
 		ImportedTypeConflict(name, _): name.span
+		PrivateImportSelection(name, _): name.span
+		RepeatedModuleAlias(name, _): name.span
+		ModuleAliasNameConflict(name, _): name.span
 
 
 pure func namespace_problem_span(problem: NamespaceProblem) -> Span:
@@ -350,12 +460,12 @@ private pure func local_types(parsed: ParsedContents) -> List[TypeBinding]:
 				StringBuiltin(_): PrimitiveCandidate(BuiltinString)
 				VoidBuiltin(_): PrimitiveCandidate(BuiltinVoid)
 				ListBuiltin(_): ListCandidate
-			types = types.append({ module = declaration.module, name = builtin_type_name(declaration.declaration), target = target })
+			types = types.append({ module = declaration.module, name = builtin_type_name(declaration.declaration), target = target, origin = DeclaredType(Public) })
 	for declaration in inventory_unions(parsed.declarations):
-		types = types.append({ module = declaration.module, name = declaration.type_name, target = UnionCandidate(declaration.id) })
+		types = types.append({ module = declaration.module, name = declaration.type_name, target = UnionCandidate(declaration.id), origin = DeclaredType(declaration.visibility) })
 	for row in inventory_records(parsed.declarations):
 		declaration = row.declaration
-		types = types.append({ module = declaration.module, name = declaration.type_name, target = RecordCandidate(row.id) })
+		types = types.append({ module = declaration.module, name = declaration.type_name, target = RecordCandidate(row.id), origin = DeclaredType(declaration.visibility) })
 	types
 
 
@@ -411,7 +521,7 @@ private pure func complete_types(
 		for request in requests:
 			for candidate in visible_types(types, request.target, request.name.id):
 				if selected_head(request.kind, candidate):
-					row: TypeBinding = { module = request.module, name = request.name, target = candidate }
+					row: TypeBinding = { module = request.module, name = request.name, target = candidate, origin = ImportedType }
 					types = with_type(types, row)
 					if same_module(request.module, parsed.foundation.prelude):
 						for user in users:
@@ -431,7 +541,7 @@ private pure func implicit_types(
 			if same_module(request.module, parsed.foundation.prelude):
 				for candidate in visible_types(types, request.target, request.name.id):
 					if selected_head(request.kind, candidate):
-						implicit = with_type(implicit, { module = user, name = request.name, target = candidate })
+						implicit = with_type(implicit, { module = user, name = request.name, target = candidate, origin = ImportedType })
 	implicit
 
 
@@ -479,7 +589,8 @@ private fixed record ImportScan {
 	constructors: List[VariantBinding],
 	methods: List[MethodSelectionRequest],
 	problems: List[ImportProblem],
-	bound_types: List[TypeBinding]
+	bound_types: List[TypeBinding],
+	aliases: List[ModuleAlias]
 }
 
 
@@ -487,6 +598,7 @@ private fixed record ImportScan {
 private fixed record ImportSite {
 	module: ModuleId,
 	target: ModuleId,
+	path: ModulePath,
 	selection: ImportSelection
 }
 
@@ -494,7 +606,7 @@ private fixed record ImportSite {
 -- A method-only selection adds no type name; it needs one already visible.
 private pure func import_receiver(scan: ImportScan, site: ImportSite, receiver: TypeCandidate) -> ImportScan:
 	name = written_name(site.selection)
-	row: TypeBinding = { module = site.module, name = name, target = receiver }
+	row: TypeBinding = { module = site.module, name = name, target = receiver, origin = ImportedType }
 	request: MethodSelectionRequest = { module = site.module, target = site.target, name = name, receiver = receiver }
 	match site.selection:
 		MethodsOnlySelection(_, _):
@@ -550,9 +662,17 @@ private pure func import_variants(scan: ImportScan, site: ImportSite, receiver: 
 			scan
 
 
--- A bare name selects a target-local function or a visible type; naming both is ambiguous.
+-- A bare name selects a target-local function or a visible type; naming both is
+-- ambiguous. A private declaration of the target is not selectable (GUIDE,
+-- Visibility: "not visible to importers").
 private pure func import_selection(scan: ImportScan, site: ImportSite) -> ImportScan:
 	name = written_name(site.selection)
+	match private_declaration(scan, site.target, name.id):
+		Some(_): { scan | problems = scan.problems.append(PrivateImportSelection(name, site.path)) }
+		None: select_visible(scan, site, name)
+
+
+private pure func select_visible(scan: ImportScan, site: ImportSite, name: WrittenName) -> ImportScan:
 	functions: List[FunctionId] = match site.selection:
 		NamedSelection(_): local_functions(scan.functions, site.target, name.id)
 		_: []
@@ -574,6 +694,8 @@ private pure func import_selection(scan: ImportScan, site: ImportSite) -> Import
 		{ scan | problems = scan.problems.append(AmbiguousImportSelection(site.target, name)) }
 
 
+-- Each module may be imported once (GUIDE, One Import Per Module): an alias
+-- and selections of one module share a row. An alias is unique in its module.
 private pure func import_module(scan: ImportScan, row: ParsedModuleRow) -> ImportScan:
 	var next = scan
 	var previous: List[ModuleImport] = []
@@ -586,8 +708,18 @@ private pure func import_module(scan: ImportScan, row: ParsedModuleRow) -> Impor
 			Some(span): next = { next | problems = next.problems.append(RepeatedModuleImport(request.target, span, request.span)) }
 			None: void
 		previous = previous.append(request)
+		match request.module_alias:
+			None: void
+			Some(aliased):
+				var repeated: Option[Span] = None
+				for existing in next.aliases:
+					if repeated.is_none() and same_module(existing.module, row.module) and same_name(existing.name.id, aliased.id):
+						repeated = Some(existing.name.span)
+				match repeated:
+					Some(span): next = { next | problems = next.problems.append(RepeatedModuleAlias(aliased, span)) }
+					None: next = { next | aliases = next.aliases.append({ module = row.module, name = aliased, target = request.target, path = request.path }) }
 		for selection in request.symbols:
-			next = import_selection(next, { module = row.module, target = request.target, selection = selection })
+			next = import_selection(next, { module = row.module, target = request.target, path = request.path, selection = selection })
 	next
 
 
@@ -617,7 +749,8 @@ private pure func complete_scope(scan: ImportScan, parsed: ParsedContents) -> Na
 			constructors = constructors,
 			types = scan.types,
 			variants = scan.variants,
-			methods = methods
+			methods = methods,
+			aliases = scan.aliases
 		}
 
 
@@ -628,13 +761,14 @@ pure func build_namespace(program: ParsedProgram) -> Result[Namespace, Namespace
 	var functions: List[LocalFunctionBinding] = []
 	for row in inventory_functions(parsed.declarations):
 		function = row.declaration
-		functions = functions.append({ module = function.module, name = function.function_name, function = row.id })
+		functions = functions.append({ module = function.module, name = function.function_name, function = row.id, visibility = function.visibility })
 	var variants: List[VariantBinding] = []
 	for declaration in inventory_unions(parsed.declarations):
 		for variant in declaration.variants:
 			variants = variants.append({
 				module = declaration.module, name = variant.declaration.name,
-				variant = variant.id, declaration_span = variant.declaration.name.span
+				variant = variant.id, declaration_span = variant.declaration.name.span,
+				visibility = declaration.visibility
 			})
 	local = local_types(parsed)
 	requests = type_import_requests(parsed.modules, functions)
@@ -653,7 +787,8 @@ pure func build_namespace(program: ParsedProgram) -> Result[Namespace, Namespace
 		constructors = [],
 		methods = [],
 		problems = conflicts,
-		bound_types = implicit.concat(local)
+		bound_types = implicit.concat(local),
+		aliases = []
 	}
 	for row in parsed.modules:
 		scan = import_module(scan, row)
@@ -707,8 +842,26 @@ private pure func visible_variant_span(scope: NamespaceContents, module: ModuleI
 	found
 
 
+-- An alias shares the module's namespace with declared and imported names
+-- (GUIDE, Qualified Imports: "an alias cannot reuse a name that already means
+-- something else"); the earlier of the two names is reported as previous.
+private pure func alias_name_conflict(scope: NamespaceContents, row: ModuleAlias) -> Option[Span]:
+	var conflict = visible_function_span(scope, row.module, row.name.id)
+	if conflict.is_none():
+		conflict = visible_variant_span(scope, row.module, row.name.id)
+	if conflict.is_none():
+		for binding in scope.types:
+			if conflict.is_none() and same_module(binding.module, row.module) and same_name(binding.name.id, row.name.id):
+				conflict = Some(binding.name.span)
+	conflict
+
+
 private pure func import_scope_problems(scope: NamespaceContents) -> List[NamespaceProblem]:
 	var problems: List[NamespaceProblem] = []
+	for row in scope.aliases:
+		match alias_name_conflict(scope, row):
+			Some(previous): problems = problems.append(ImportSelectionFailure(ModuleAliasNameConflict(row.name, previous)))
+			None: void
 	for binding in scope.constructors:
 		match visible_function_span(scope, binding.module, binding.name.id):
 			Some(previous): problems = problems.append(ImportedConstructorNameConflict(binding.name, previous))
@@ -744,8 +897,8 @@ private pure func local_declaration_problems(parsed: ParsedContents, scope: Name
 			None: break
 			Some(declaration):
 				incoming: TypeBinding = match declaration:
-					UnionDeclarationRow(row): { module = row.module, name = row.type_name, target = UnionCandidate(row.id) }
-					RecordDeclarationRow(row): { module = row.declaration.module, name = row.declaration.type_name, target = RecordCandidate(row.id) }
+					UnionDeclarationRow(row): { module = row.module, name = row.type_name, target = UnionCandidate(row.id), origin = DeclaredType(row.visibility) }
+					RecordDeclarationRow(row): { module = row.declaration.module, name = row.declaration.type_name, target = RecordCandidate(row.id), origin = DeclaredType(row.declaration.visibility) }
 				match previous_type(types, incoming):
 					Some(previous):
 						problem = match incoming.target:

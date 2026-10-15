@@ -1,0 +1,298 @@
+import:
+	../../../src/utils/ids: function_number, record_number, union_number, variant_owner
+	../../../src/utils/syntax: entry_function
+	../../../src/check/check: checked_functions, check_errors
+	../../../src/check/errors as Errors
+	../../../src/check/model as Checked
+	../../../src/check/render: render_failure
+	../input: check
+	../module_input: parse_modules
+	int as IntOps
+	test: TestSuite
+
+
+private HELPER: String =
+	|fixed union Shape:
+	|    Circle(Int)
+	|    Empty
+	|fixed union Maybe[T]:
+	|    Present(T)
+	|    Missing
+	|fixed record Span { start: Int, end: Int }
+	|private fixed record Pair { first: Int }
+	|pure func make_span(start: Int, end: Int) -> Span:
+	|    { start = start, end = end }
+	|pure func answer() -> Int:
+	|    42
+	|private pure func hidden() -> Int:
+	|    7
+	|fixed record Holder { value: Int }
+	|pure func make_holder(value: Int) -> Holder:
+	|    { value = value }
+	|pure func shown(holder: Holder) -> Int:
+	|    holder.value
+	|private pure func secret_value(holder: Holder) -> Int:
+	|    holder.value
+	|
+
+
+private pure func checked_main(main: String) -> Option[Checked.CheckedFunction]:
+	match parse_modules([{ source = main, targets = [1] }, { source = HELPER, targets = [] }]):
+		Err(_): None
+		Ok(program):
+			match check(program):
+				Err(_): None
+				Ok(checked):
+					facts = checked_functions(checked)
+					entry = function_number(entry_function(facts.entrypoint))
+					var found: Option[Checked.CheckedFunction] = None
+					for function in facts.functions:
+						if IntOps.equals(function_number(function.id), entry):
+							found = Some(function)
+					found
+
+
+private pure func returned(main: String) -> Option[Checked.CheckedExpr]:
+	match checked_main(main):
+		None: None
+		Some(function):
+			match function.body:
+				Checked.CheckedValueBody(Checked.ReturnExpression(value)): Some(value)
+				_: None
+
+
+pure func test_qualified_call_is_a_direct_call_to_the_module_function() -> Bool:
+	main: String =
+		|import:
+		|    ./helper as H
+		|func main() -> Int:
+		|    H.answer()
+		|
+	match returned(main):
+		None: False
+		Some(value):
+			match value.form:
+				Checked.InvokeFunction(call, []):
+					match call.target:
+						Checked.UserFunction(_, []): Checked.same_type(value.value_type, Checked.IntType)
+						_: False
+				_: False
+
+
+pure func test_qualified_constructor_builds_the_module_union_variant() -> Bool:
+	main: String =
+		|import:
+		|    ./helper as H
+		|pure func shape() -> Int:
+		|    0
+		|func main() -> Int:
+		|    value = H.Circle(2)
+		|    empty = H.Empty
+		|    0
+		|
+	match checked_main(main):
+		None: False
+		Some(function):
+			match function.statements:
+				[Checked.InitializeBinding(_, circle), Checked.InitializeBinding(_, empty)]:
+					payload = match circle.form:
+						Checked.ConstructVariant(variant, [_]):
+							match circle.value_type:
+								Checked.UnionType(owner): IntOps.equals(union_number(variant_owner(variant)), union_number(owner))
+								_: False
+						_: False
+					nullary = match empty.form:
+						Checked.ConstructVariant(_, []): True
+						_: False
+					payload and nullary
+				_: False
+
+
+pure func test_qualified_type_names_the_module_record_in_a_signature() -> Bool:
+	main: String =
+		|import:
+		|    ./helper as H
+		|pure func width(span: H.Span) -> Int:
+		|    span.end
+		|func main() -> Int:
+		|    width(H.make_span(2, 7))
+		|
+	match checked_main(main):
+		None: False
+		Some(function):
+			match returned(main):
+				None: False
+				Some(value):
+					match value.form:
+						Checked.InvokeFunction(_, [argument]):
+							match argument.value_type:
+								Checked.RecordType(_): True
+								_: False
+						_: False
+
+
+pure func test_qualified_generic_constructor_takes_its_arguments_from_the_expectation() -> Bool:
+	main: String =
+		|import:
+		|    ./helper as H
+		|pure func present() -> H.Maybe[Int]:
+		|    H.Present(1)
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules([{ source = main, targets = [1] }, { source = HELPER, targets = [] }]):
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Err(_): False
+				Ok(checked):
+					var valid = False
+					for function in checked_functions(checked).functions:
+						match function.body:
+							Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+								match value.form:
+									Checked.ConstructVariant(_, [_]):
+										match value.value_type:
+											Checked.AppliedUnionType(_, [Checked.IntType]): valid = True
+											_: void
+									_: void
+							_: void
+					valid
+
+
+-- `prefix` precedes the rejected name; the error spans exactly `name`.
+private pure func rejects(prefix: String, name: String, suffix: String, message: String, help: String, kind_matches: pure (Errors.CheckErrorKind) -> Bool) -> Bool:
+	main = prefix + name + suffix
+	match parse_modules([{ source = main, targets = [1] }, { source = HELPER, targets = [] }]):
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Ok(_): False
+				Err(failure):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					(
+						kind_matches(error.kind)
+						and IntOps.equals(error.span.start, prefix.length())
+						and IntOps.equals(error.span.end, IntOps.add(prefix.length(), name.length()))
+						and diagnostic.message == message and diagnostic.help == help
+					)
+
+
+pure func test_qualified_generic_constructor_without_expectation_is_rejected() -> Bool:
+	rejects(
+		"import:\n    ./helper as H\nfunc main() -> Int:\n    value = H.", "Present", "(1)\n    0\n",
+		"constructor needs an expected union type", "pass an already-typed union value or call a concrete helper returning the union",
+		pure func(kind):
+			match kind:
+				Errors.ConstructorRejection(Errors.ConstructorNeedsExpectedType(_)): True
+				_: False
+	)
+
+
+pure func test_qualifying_a_private_function_is_rejected() -> Bool:
+	rejects(
+		"import:\n    ./helper as H\nfunc main() -> Int:\n    H.", "hidden", "()\n",
+		"hidden is private to ./helper", "remove private or qualify a public declaration",
+		pure func(kind):
+			match kind:
+				Errors.QualifiedRejection(Errors.PrivateQualifiedName(_, _)): True
+				_: False
+	)
+
+
+pure func test_qualifying_a_private_type_is_rejected() -> Bool:
+	rejects(
+		"import:\n    ./helper as H\npure func first(pair: H.", "Pair", ") -> Int:\n    0\nfunc main() -> Int:\n    0\n",
+		"Pair is private to ./helper", "remove private or qualify a public declaration",
+		pure func(kind):
+			match kind:
+				Errors.QualifiedRejection(Errors.PrivateQualifiedName(_, _)): True
+				_: False
+	)
+
+
+pure func test_unknown_qualified_name_names_the_alias_and_module() -> Bool:
+	rejects(
+		"import:\n    ./helper as H\nfunc main() -> Int:\n    H.", "missing", "()\n",
+		"module ./helper declares no public missing", "H names module ./helper; qualify a public function, constructor or type it declares; imports are not reexported",
+		pure func(kind):
+			match kind:
+				Errors.QualifiedRejection(Errors.UnknownQualifiedName(_, _, _)): True
+				_: False
+	)
+
+
+pure func test_bare_alias_in_value_position_is_rejected() -> Bool:
+	rejects(
+		"import:\n    ./helper as H\nfunc main() -> Int:\n    value = ", "H", "\n    0\n",
+		"H is a module alias", "write H.name to use a declaration of that module",
+		pure func(kind):
+			match kind:
+				Errors.QualifiedRejection(Errors.BareModuleAlias(_)): True
+				_: False
+	)
+
+
+pure func test_qualified_function_without_a_call_is_rejected() -> Bool:
+	rejects(
+		"import:\n    ./helper as H\nfunc main() -> Int:\n    value = ", "H.answer", "\n    0\n",
+		"H.answer names a function", "call it with arguments; a function is not a value",
+		pure func(kind):
+			match kind:
+				Errors.QualifiedRejection(Errors.QualifiedFunctionNotCalled(_, _)): True
+				_: False
+	)
+
+
+pure func test_type_selection_binds_public_methods_only() -> Bool:
+	accepted: String =
+		|import:
+		|    ./helper: Holder, make_holder
+		|func main() -> Int:
+		|    make_holder(3).shown()
+		|
+	public_binds = match returned(accepted):
+		Some(value):
+			match value.form:
+				Checked.InvokeFunction(_, [_]): True
+				_: False
+		None: False
+	public_binds and rejects(
+		"import:\n    ./helper: Holder, make_holder\nfunc main() -> Int:\n    make_holder(3).", "secret_value", "()\n",
+		"unknown function", "declare the function locally or import it by name; type selections enable receiver calls only",
+		pure func(kind):
+			match kind:
+				Errors.CallRejection(Errors.UnknownFunction(_)): True
+				_: False
+	)
+
+
+pure func test_unknown_alias_in_a_type_is_rejected() -> Bool:
+	rejects(
+		"import:\n    ./helper as H\npure func width(span: ", "Shared", ".Span) -> Int:\n    0\nfunc main() -> Int:\n    0\n",
+		"unknown module alias Shared", "add path as Shared to the import block",
+		pure func(kind):
+			match kind:
+				Errors.QualifiedRejection(Errors.UnknownModuleAlias(_)): True
+				_: False
+	)
+
+
+tests: TestSuite = {
+	description = "Qualified names resolve through alias rows",
+	tests = [
+		("qualified call is a direct call to the module function", test_qualified_call_is_a_direct_call_to_the_module_function),
+		("qualified constructor builds the module union variant", test_qualified_constructor_builds_the_module_union_variant),
+		("qualified type names the module record in a signature", test_qualified_type_names_the_module_record_in_a_signature),
+		("qualified generic constructor takes arguments from the expectation", test_qualified_generic_constructor_takes_its_arguments_from_the_expectation),
+		("qualified generic constructor without expectation is rejected", test_qualified_generic_constructor_without_expectation_is_rejected),
+		("qualifying a private function is rejected", test_qualifying_a_private_function_is_rejected),
+		("qualifying a private type is rejected", test_qualifying_a_private_type_is_rejected),
+		("unknown qualified name names the alias and module", test_unknown_qualified_name_names_the_alias_and_module),
+		("bare alias in value position is rejected", test_bare_alias_in_value_position_is_rejected),
+		("qualified function without a call is rejected", test_qualified_function_without_a_call_is_rejected),
+		("unknown alias in a type is rejected", test_unknown_alias_in_a_type_is_rejected),
+		("type selection binds public methods only", test_type_selection_binds_public_methods_only),
+	]
+}

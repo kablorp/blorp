@@ -15,7 +15,9 @@ import:
 			ListTypeArgumentCount, MissingUnionTypeArguments, NonApplicableType, MissingRecordTypeArguments, RecordTypeArgumentCountMismatch, OrdinaryRecordApplied,
 			OrdinaryUnionApplied, UnionTypeArgumentCountMismatch, UnknownType,
 		),
-		UnsupportedForm(ImportAlias, PrivateDeclaration, ModuleQualifiedName, OpaqueTypeDeclaration, ModuleConstant),
+		UnsupportedForm(OpaqueTypeDeclaration, ModuleConstant),
+		QualifiedError(UnknownModuleAlias, UnknownQualifiedName, PrivateQualifiedName),
+		qualified_error,
 		checker_invariant,
 		type_declaration_error,
 		type_term_error,
@@ -55,16 +57,19 @@ import:
 	../utils/names: NameId, same_name
 	../namespace/namespace:
 		Namespace,
+		QualifiedLookup(ExportedDeclaration, PrivateDeclaration, NoDeclaration),
 		TypeCandidate(PrimitiveCandidate, ListCandidate, UnionCandidate, RecordCandidate),
+		module_alias,
+		qualified_type,
 		type_candidate,
 	option: to_result
 	../parse/assemble: ParsedContents, ParsedModuleRow
 	../utils/source: COMPILER_SOURCE, ModuleId, same_module
 	../utils/syntax:
+		ParsedQualified,
 		ParsedRecord,
 		Span,
 		TypeSyntax(AtomicType, AppliedType, QualifiedType),
-		Visibility(Public, Private),
 		WrittenName,
 		type_span,
 
@@ -178,6 +183,31 @@ private pure func record_arity(scope: TypeScope, owner: RecordId, span: Span) ->
 	Ok(declaration.declaration.type_parameters.length())
 
 
+private pure func resolve_atomic_candidate(
+	scope: TypeScope,
+	candidate: TypeCandidate,
+	name: WrittenName,
+) -> Result[TypeRef, CheckError]:
+	match candidate:
+		PrimitiveCandidate(primitive):
+			Ok(primitive_ref(primitive))
+		ListCandidate:
+			Err(type_term_error(name.span, ListTypeArgumentCount))
+		RecordCandidate(id):
+			arity ?= record_arity(scope, id, name.span)
+			if IntOps.equals(arity, 0):
+				Ok(RecordType(id))
+			else:
+				Err(type_term_error(name.span, MissingRecordTypeArguments(id, arity)))
+		UnionCandidate(id):
+			arity ?= union_arity(scope, id, name.span)
+
+			if IntOps.equals(arity, 0):
+				Ok(UnionType(id))
+			else:
+				Err(type_term_error(name.span, MissingUnionTypeArguments(id, arity)))
+
+
 private pure func resolve_atomic_type(
 	scope: TypeScope,
 	name: WrittenName,
@@ -187,70 +217,90 @@ private pure func resolve_atomic_type(
 			Ok(ParameterType(parameter.id))
 		None:
 			match type_candidate(scope.namespace, scope.module, name.id):
-				Some(PrimitiveCandidate(primitive)):
-					Ok(primitive_ref(primitive))
-				Some(ListCandidate):
-					Err(type_term_error(name.span, ListTypeArgumentCount))
-				Some(RecordCandidate(id)):
-					arity ?= record_arity(scope, id, name.span)
-					if IntOps.equals(arity, 0):
-						Ok(RecordType(id))
-					else:
-						Err(type_term_error(name.span, MissingRecordTypeArguments(id, arity)))
-				Some(UnionCandidate(id)):
-					arity ?= union_arity(scope, id, name.span)
-
-					if IntOps.equals(arity, 0):
-						Ok(UnionType(id))
-					else:
-						Err(type_term_error(name.span, MissingUnionTypeArguments(id, arity)))
+				Some(candidate):
+					resolve_atomic_candidate(scope, candidate, name)
 				None:
 					Err(type_term_error(name.span, UnknownType(name.id)))
 
 
+-- A candidate applied to written arguments; the candidate's own arity rules.
+private pure func resolve_applied_candidate(
+	scope: TypeScope,
+	candidate: TypeCandidate,
+	name: WrittenName,
+	arguments: List[TypeSyntax],
+	span: Span,
+) -> Result[TypeRef, CheckError]:
+	match candidate:
+		ListCandidate:
+			match arguments:
+				[element]:
+					value ?= resolve_type(scope, element)
+					Ok(ListType(value))
+				_:
+					Err(type_term_error(span, ListTypeArgumentCount))
+		RecordCandidate(owner):
+			arity ?= record_arity(scope, owner, span)
+			applicable ?= if IntOps.equals(arity, 0):
+				Err(type_term_error(span, OrdinaryRecordApplied(owner)))
+			else if IntOps.equals(arity, arguments.length()):
+				Ok(void)
+			else:
+				Err(type_term_error(span, RecordTypeArgumentCountMismatch(owner, arity, arguments.length())))
+			values ?= resolve_types(scope, arguments, [])
+			Ok(AppliedRecordType(owner, values))
+		UnionCandidate(owner):
+			arity ?= union_arity(scope, owner, span)
+
+			applicable ?= if IntOps.equals(arity, 0):
+				Err(type_term_error(span, OrdinaryUnionApplied(owner)))
+			else if IntOps.equals(arity, arguments.length()):
+				Ok(void)
+			else:
+				Err(
+					type_term_error(
+						span,
+						UnionTypeArgumentCountMismatch(owner, arity, arguments.length()),
+					),
+				)
+
+			values ?= resolve_types(scope, arguments, [])
+			Ok(AppliedUnionType(owner, values))
+		PrimitiveCandidate(_):
+			Err(type_term_error(name.span, NonApplicableType(name.id)))
+
+
+-- `Alias.Name[args]` resolves through the alias row to the target module's
+-- own exported type; forwarded imports and private types are not exported.
+private pure func resolve_qualified_type(
+	scope: TypeScope,
+	qualified: ParsedQualified,
+	arguments: List[TypeSyntax],
+	span: Span,
+) -> Result[TypeRef, CheckError]:
+	row ?= module_alias(scope.namespace, scope.module, qualified.module.id)
+		.to_result(qualified_error(qualified.module.span, UnknownModuleAlias(qualified.module.id)))
+	candidate ?= match qualified_type(scope.namespace, row.target, qualified.name.id):
+		ExportedDeclaration(candidate): Ok(candidate)
+		PrivateDeclaration(_): Err(qualified_error(qualified.name.span, PrivateQualifiedName(qualified.name.id, row.path)))
+		NoDeclaration: Err(qualified_error(qualified.name.span, UnknownQualifiedName(qualified.module.id, qualified.name.id, row.path)))
+	if arguments.is_empty():
+		resolve_atomic_candidate(scope, candidate, qualified.name)
+	else:
+		resolve_applied_candidate(scope, candidate, qualified.name, arguments, span)
+
+
 pure func resolve_type(scope: TypeScope, written: TypeSyntax) -> Result[TypeRef, CheckError]:
 	match written:
-		QualifiedType(_, _, span):
-			Err(unsupported_form(span, ModuleQualifiedName))
+		QualifiedType(qualified, arguments, span):
+			resolve_qualified_type(scope, qualified, arguments, span)
 		AtomicType(name):
 			resolve_atomic_type(scope, name)
 		AppliedType(name, arguments, span):
 			match type_candidate(scope.namespace, scope.module, name.id):
-				Some(ListCandidate):
-					match arguments:
-						[element]:
-							value ?= resolve_type(scope, element)
-							Ok(ListType(value))
-						_:
-							Err(type_term_error(span, ListTypeArgumentCount))
-				Some(RecordCandidate(owner)):
-					arity ?= record_arity(scope, owner, span)
-					applicable ?= if IntOps.equals(arity, 0):
-						Err(type_term_error(span, OrdinaryRecordApplied(owner)))
-					else if IntOps.equals(arity, arguments.length()):
-						Ok(void)
-					else:
-						Err(type_term_error(span, RecordTypeArgumentCountMismatch(owner, arity, arguments.length())))
-					values ?= resolve_types(scope, arguments, [])
-					Ok(AppliedRecordType(owner, values))
-				Some(UnionCandidate(owner)):
-					arity ?= union_arity(scope, owner, span)
-
-					applicable ?= if IntOps.equals(arity, 0):
-						Err(type_term_error(span, OrdinaryUnionApplied(owner)))
-					else if IntOps.equals(arity, arguments.length()):
-						Ok(void)
-					else:
-						Err(
-							type_term_error(
-								span,
-								UnionTypeArgumentCountMismatch(owner, arity, arguments.length()),
-							),
-						)
-
-					values ?= resolve_types(scope, arguments, [])
-					Ok(AppliedUnionType(owner, values))
-				None | Some(PrimitiveCandidate(_)):
+				Some(candidate):
+					resolve_applied_candidate(scope, candidate, name, arguments, span)
+				None:
 					Err(type_term_error(name.span, NonApplicableType(name.id)))
 
 
@@ -289,11 +339,10 @@ private pure func declared_module(declaration: NominalRow) -> ModuleId:
 
 
 
--- The first declaration form that has no semantics yet (module aliases,
--- private declarations, opaque types, constants), in source order: modules
--- in load order, forms by position within a module. It runs before the
--- namespace is built, which would otherwise read these rows and report a
--- misleading duplicate import or unknown imported name.
+-- The first declaration form that has no semantics yet (opaque types,
+-- constants), in source order: modules in load order, forms by position
+-- within a module. It runs before the namespace is built, which would
+-- otherwise read these rows and report a misleading unknown imported name.
 pure func reject_unsupported_declarations(parsed: ParsedContents) -> Result[Void, CheckError]:
 	var failure: Option[CheckError] = None
 
@@ -312,33 +361,12 @@ pure func reject_unsupported_declarations(parsed: ParsedContents) -> Result[Void
 private pure func module_unsupported_form(parsed: ParsedContents, module: ParsedModuleRow) -> Option[CheckError]:
 	var earliest: Option[CheckError] = None
 
-	for request in module.imports:
-		match request.module_alias:
-			Some(module_alias):
-				earliest = earlier(earliest, unsupported_form(module_alias.span, ImportAlias))
-			None:
-				void
-
-	for row in inventory_functions(parsed.declarations):
-		if same_module(row.declaration.module, module.module):
-			earliest = private_candidate(earliest, row.declaration.visibility)
-
-	for row in inventory_records(parsed.declarations):
-		if same_module(row.declaration.module, module.module):
-			earliest = private_candidate(earliest, row.declaration.visibility)
-
-	for row in inventory_unions(parsed.declarations):
-		if same_module(row.module, module.module):
-			earliest = private_candidate(earliest, row.visibility)
-
 	for declaration in parsed.opaques:
 		if same_module(declaration.module, module.module):
-			earliest = private_candidate(earliest, declaration.visibility)
 			earliest = earlier(earliest, unsupported_form(declaration.type_name.span, OpaqueTypeDeclaration))
 
 	for declaration in parsed.constants:
 		if same_module(declaration.module, module.module):
-			earliest = private_candidate(earliest, declaration.visibility)
 			earliest = earlier(earliest, unsupported_form(declaration.name.span, ModuleConstant))
 
 	earliest
@@ -354,14 +382,6 @@ private pure func earlier(current: Option[CheckError], candidate: CheckError) ->
 				Some(candidate)
 			else:
 				current
-
-
-private pure func private_candidate(current: Option[CheckError], visibility: Visibility) -> Option[CheckError]:
-	match visibility:
-		Private(span):
-			earlier(current, unsupported_form(span, PrivateDeclaration))
-		Public:
-			current
 
 
 pure func validate_declarations(

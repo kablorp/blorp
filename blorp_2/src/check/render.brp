@@ -14,9 +14,11 @@ import:
 		variant_number,
 		variant_owner,
 	int as IntOps
+	../parse/parse: ImportOrigin(RelativeImport, LibraryImport), ModulePath
 	../utils/names: NameId, NameTable, name_spelling
 	../namespace/namespace:
 		ImportProblem(
+			PrivateImportSelection, RepeatedModuleAlias, ModuleAliasNameConflict,
 			RepeatedModuleImport, MissingImportedFunction, RepeatedImportedFunction,
 			AmbiguousImportSelection, MissingImportedType, AmbiguousImportedType,
 			MethodTypeNotVisible, MissingImportedUnion, AmbiguousImportedUnion,
@@ -155,8 +157,10 @@ pure func render_check_error(program: ParsedProgram, error: Errors.CheckError) -
 	match error.kind:
 		Errors.UnsupportedSyntax(form):
 			render_unsupported_form(error.span, form)
+		Errors.QualifiedRejection(rejection):
+			render_qualified_error(error.span, rejection, context)
 		Errors.ImportRejection(rejection):
-			render_import_error(error.span, rejection)
+			render_import_error(error.span, rejection, context)
 		Errors.TypeDeclarationRejection(rejection):
 			render_type_declaration_error(error.span, rejection)
 		Errors.TypeTermRejection(rejection):
@@ -188,12 +192,6 @@ pure func render_check_error(program: ParsedProgram, error: Errors.CheckError) -
 -- Each form names itself and the milestone that lands it.
 private pure func render_unsupported_form(span: Span, form: Errors.UnsupportedForm) -> Diagnostic:
 	match form:
-		Errors.ImportAlias:
-			rendered(span, "import aliases are not supported yet", "select names directly, such as int: add; module aliases arrive with the namespace milestone")
-		Errors.PrivateDeclaration:
-			rendered(span, "private declarations are not supported yet", "omit private; visibility arrives with the namespace milestone")
-		Errors.ModuleQualifiedName:
-			rendered(span, "qualified names are not supported yet", "import the name directly, such as int: add; qualified names arrive with the namespace milestone")
 		Errors.OpaqueTypeDeclaration:
 			rendered(span, "opaque types are not supported yet", "declare a fixed record with one field; opaque types arrive with the recursive-types milestone")
 		Errors.IntoOpaque:
@@ -230,10 +228,86 @@ private pure func render_unsupported_form(span: Span, form: Errors.UnsupportedFo
 			rendered(span, "qualified constructor patterns are not supported yet", "import the constructor and write it bare; qualified patterns arrive with the namespace milestone")
 
 
-private pure func render_import_error(span: Span, rejection: Errors.ImportError) -> Diagnostic:
+-- The written import path, as the source spelled it: `./a/b`, `../a` or `int`.
+private pure func module_path_spelling(path: ModulePath, context: ParsedContents, span: Span) -> Result[String, Diagnostic]:
+	var text = match path.origin:
+		LibraryImport: ""
+		RelativeImport(parents):
+			if IntOps.equals(parents, 0):
+				"./"
+			else:
+				var prefix = ""
+				var remaining = parents
+				while IntOps.greater_than(remaining, 0):
+					prefix = prefix.concat("../")
+					remaining = IntOps.subtract(remaining, 1)
+				prefix
+	var position = 0
+	var failure: Option[Diagnostic] = None
+	for part in path.parts:
+		match parsed_spelling(part, context.names, span):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(spelling):
+				if IntOps.greater_than(position, 0):
+					text = text.concat("/")
+				text = text.concat(spelling)
+		position = IntOps.add(position, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(text)
+
+
+private pure func render_qualified_error(span: Span, rejection: Errors.QualifiedError, context: ParsedContents) -> Diagnostic:
+	match rejection:
+		Errors.UnknownModuleAlias(aliased):
+			match parsed_spelling(aliased, context.names, span):
+				Err(error): error
+				Ok(spelling):
+					rendered(span, "unknown module alias ".concat(spelling), "add path as ".concat(spelling).concat(" to the import block"))
+		Errors.BareModuleAlias(aliased):
+			match parsed_spelling(aliased, context.names, span):
+				Err(error): error
+				Ok(spelling):
+					rendered(span, spelling.concat(" is a module alias"), "write ".concat(spelling).concat(".name to use a declaration of that module"))
+		Errors.UnknownQualifiedName(aliased, name, path):
+			match parsed_spelling(aliased, context.names, span):
+				Err(error): error
+				Ok(alias_spelling):
+					match parsed_spelling(name, context.names, span):
+						Err(error): error
+						Ok(name_spelling):
+							match module_path_spelling(path, context, span):
+								Err(error): error
+								Ok(module):
+									rendered(
+										span,
+										"module ".concat(module).concat(" declares no public ").concat(name_spelling),
+										alias_spelling.concat(" names module ").concat(module).concat("; qualify a public function, constructor or type it declares; imports are not reexported"),
+									)
+		Errors.PrivateQualifiedName(name, path):
+			match parsed_spelling(name, context.names, span):
+				Err(error): error
+				Ok(name_spelling):
+					match module_path_spelling(path, context, span):
+						Err(error): error
+						Ok(module):
+							rendered(span, name_spelling.concat(" is private to ").concat(module), "remove private or qualify a public declaration")
+		Errors.QualifiedFunctionNotCalled(aliased, name):
+			match parsed_spelling(aliased, context.names, span):
+				Err(error): error
+				Ok(alias_spelling):
+					match parsed_spelling(name, context.names, span):
+						Err(error): error
+						Ok(name_spelling):
+							rendered(span, alias_spelling.concat(".").concat(name_spelling).concat(" names a function"), "call it with arguments; a function is not a value")
+
+
+private pure func render_import_error(span: Span, rejection: Errors.ImportError, context: ParsedContents) -> Diagnostic:
 	match rejection:
 		Errors.ImportRejected(problem):
-			render_import_problem(span, problem)
+			render_import_problem(span, problem, context)
 		Errors.ImportedFunctionConflict(_, previous):
 			noted(
 				span,
@@ -258,13 +332,25 @@ private pure func render_import_error(span: Span, rejection: Errors.ImportError)
 
 
 -- The namespace's import-selection problems, reported before checking.
-private pure func render_import_problem(span: Span, problem: ImportProblem) -> Diagnostic:
+private pure func render_import_problem(span: Span, problem: ImportProblem, context: ParsedContents) -> Diagnostic:
 	match problem:
+		PrivateImportSelection(name, path):
+			match parsed_spelling(name.id, context.names, span):
+				Err(error): error
+				Ok(name_spelling):
+					match module_path_spelling(path, context, span):
+						Err(error): error
+						Ok(module):
+							rendered(span, name_spelling.concat(" is private to ").concat(module), "remove private or import a public declaration")
+		RepeatedModuleAlias(_, previous):
+			noted(span, "module alias declared more than once", "give each aliased module a distinct alias", PreviousDeclaration(previous))
+		ModuleAliasNameConflict(_, previous):
+			noted(span, "module alias reuses a visible name", "choose an alias that is not a declared or imported name of this module", PreviousDeclaration(previous))
 		RepeatedModuleImport(_, previous, _):
 			noted(
 				span,
 				"module imported more than once",
-				"combine the selected function names into one import",
+				"combine the alias and the selected names into one import, such as path as Alias: name",
 				PreviousDeclaration(previous),
 			)
 		MissingImportedFunction(_, _):
