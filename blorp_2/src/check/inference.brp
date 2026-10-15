@@ -1024,28 +1024,40 @@ private pure func inference_conflict(
 		RecordFieldConstraint(_, _, _): Err(checker_invariant(span, InvalidInferenceWorklist))
 		ListElementConstraint(_, _): Err(checker_invariant(span, InvalidInferenceWorklist))
 		ArgumentConstraint(call, position, occurrence, written):
-			contract = call.contract
-			constraint ?= equality.parameter.to_result(checker_invariant(span, InvalidInferenceWorklist))
-			id = constraint.variable
-			slot ?= slots.get(from_opaque InferenceVariableId(id)).to_result(
-				checker_invariant(span, InvalidInferenceVariable(from_opaque InferenceVariableId(id))),
-			)
-			previous ?= slot.first_argument.to_result(checker_invariant(span, InvalidInferenceWorklist))
-			expected ?= publish_inference_type(inference_type(written.value_type, contract.signature.type_parameters, call.variable_start), slots, DiagnosticInference, span)
-			first ?= publish_inference_type(previous.value_type, slots, DiagnosticInference, previous.span)
-			current ?= publish_inference_type(constraint.actual, slots, DiagnosticInference, span)
-			actual_type ?= publish_inference_type(occurrence.value_type, slots, DiagnosticInference, occurrence.span)
-			Ok(call_error(span, GenericArgumentConflict({
-				parameter = slot.parameter,
-				previous = { value_type = first, span = previous.span },
-				current = { value_type = current, span = span },
-				mismatch = {
-					expected = expected,
-					actual = { value_type = actual_type, span = occurrence.span },
-					argument_position = position,
-					expected_site = SourceAnnotation(written.span),
-				},
-			})))
+			generic_argument_conflict(call, position, occurrence, written, equality.parameter, slots)
+
+
+-- A call's arguments gave one generic parameter different types: the error
+-- names both and the position that disagreed.
+private pure func generic_argument_conflict(
+	call: PendingCall,
+	position: Int,
+	occurrence: InferenceUse,
+	written: TypeUse,
+	parameter: Option[InferenceParameterConstraint],
+	slots: List[InferenceSlot],
+) -> Result[CheckError, CheckError]:
+	constraint ?= parameter.to_result(checker_invariant(occurrence.span, InvalidInferenceWorklist))
+	id = constraint.variable
+	slot ?= slots.get(from_opaque InferenceVariableId(id)).to_result(
+		checker_invariant(occurrence.span, InvalidInferenceVariable(from_opaque InferenceVariableId(id))),
+	)
+	previous ?= slot.first_argument.to_result(checker_invariant(occurrence.span, InvalidInferenceWorklist))
+	expected ?= publish_inference_type(inference_type(written.value_type, call.contract.signature.type_parameters, call.variable_start), slots, DiagnosticInference, occurrence.span)
+	first ?= publish_inference_type(previous.value_type, slots, DiagnosticInference, previous.span)
+	current ?= publish_inference_type(constraint.actual, slots, DiagnosticInference, occurrence.span)
+	actual_type ?= publish_inference_type(occurrence.value_type, slots, DiagnosticInference, occurrence.span)
+	Ok(call_error(occurrence.span, GenericArgumentConflict({
+		parameter = slot.parameter,
+		previous = { value_type = first, span = previous.span },
+		current = { value_type = current, span = occurrence.span },
+		mismatch = {
+			expected = expected,
+			actual = { value_type = actual_type, span = occurrence.span },
+			argument_position = position,
+			expected_site = SourceAnnotation(written.span),
+		},
+	})))
 
 
 private fixed union InferenceAction:
@@ -1157,25 +1169,7 @@ pure func inspect_inference_equality(
 		SameInference:
 			Ok(CompleteEquality)
 		MergeInference(left_id, right_id):
-			left_position = from_opaque InferenceVariableId(left_id)
-			right_position = from_opaque InferenceVariableId(right_id)
-			left_slot ?= slots.get(left_position).to_result(checker_invariant(span, InvalidInferenceVariable(left_position)))
-			right_slot ?= slots.get(right_position).to_result(checker_invariant(span, InvalidInferenceVariable(right_position)))
-			left_rank ?= inference_rank(left_slot.state, span)
-			right_rank ?= inference_rank(right_slot.state, span)
-
-			-- Union by rank bounds chains without repeatedly rewriting old terms.
-			if IntOps.less_than(left_rank, right_rank):
-				Ok(UpdateInferenceSlots([{ position = left_position, slot = { left_slot | state = LinkedVariable(right_id) } }]))
-			else:
-				var updates: List[InferenceSlotUpdate] = [
-					{ position = right_position, slot = { right_slot | state = LinkedVariable(left_id) } },
-				]
-
-				if IntOps.equals(left_rank, right_rank):
-					updates = updates.append({ position = left_position, slot = { left_slot | state = UnboundVariable(IntOps.add(left_rank, 1)) } })
-
-				Ok(UpdateInferenceSlots(updates))
+			link_inference_variables(left_id, right_id, slots, span)
 		BindInference(id, value):
 			position = from_opaque InferenceVariableId(id)
 			slot ?= slots.get(position).to_result(checker_invariant(span, InvalidInferenceVariable(position)))
@@ -1207,6 +1201,29 @@ pure func inspect_inference_equality(
 							Err(error)
 				CollectArguments:
 					Ok(CompleteEquality)
+
+
+-- Two unbound variables become one: the lower-ranked links to the other.
+private pure func link_inference_variables(left_id: InferenceVariableId, right_id: InferenceVariableId, slots: List[InferenceSlot], span: Span) -> Result[InferenceStep, CheckError]:
+	left_position = from_opaque InferenceVariableId(left_id)
+	right_position = from_opaque InferenceVariableId(right_id)
+	left_slot ?= slots.get(left_position).to_result(checker_invariant(span, InvalidInferenceVariable(left_position)))
+	right_slot ?= slots.get(right_position).to_result(checker_invariant(span, InvalidInferenceVariable(right_position)))
+	left_rank ?= inference_rank(left_slot.state, span)
+	right_rank ?= inference_rank(right_slot.state, span)
+
+	-- Union by rank bounds chains without repeatedly rewriting old terms.
+	if IntOps.less_than(left_rank, right_rank):
+		Ok(UpdateInferenceSlots([{ position = left_position, slot = { left_slot | state = LinkedVariable(right_id) } }]))
+	else:
+		var updates: List[InferenceSlotUpdate] = [
+			{ position = right_position, slot = { right_slot | state = LinkedVariable(left_id) } },
+		]
+
+		if IntOps.equals(left_rank, right_rank):
+			updates = updates.append({ position = left_position, slot = { left_slot | state = UnboundVariable(IntOps.add(left_rank, 1)) } })
+
+		Ok(UpdateInferenceSlots(updates))
 
 
 private pure func inference_occurs_error(equality: InferenceEquality, root: InferenceVariableId, value: InferenceType, slots: List[InferenceSlot]) -> Result[CheckError, CheckError]:
