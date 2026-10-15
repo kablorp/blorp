@@ -1,0 +1,198 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, module_contents, parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		Diagnostic,
+		ElseBranch(ElseBlock, ElseIf),
+		ExpressionBase(IfExpression, IntegerExpression, NameExpression),
+		ParsedBody(ParsedValueBody),
+		ParsedFunction,
+		ParsedIf,
+		ParsedStatement(BindingStatement, ExpressionStatement),
+	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+private EXPRESSION_HELP: String = "use a literal, a parameter or variant name, or a call as the entire body"
+
+private BLOCK_HEADER_HELP: String = "a block header ends with `:` before its indented body, as in `if condition:` or `func name() -> Type:`"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+private pure func main_function(source: String) -> Option[ParsedFunction]:
+	match parse_source(source):
+		Ok(parsed):
+			module_contents(parsed).functions.get(0)
+		Err(_):
+			None
+
+
+-- The if-expression that is the function's value, when its body is one.
+private pure func main_if(source: String) -> Option[ParsedIf]:
+	match main_function(source):
+		Some(function):
+			match function.body:
+				ParsedValueBody(value):
+					match value.base:
+						IfExpression(form):
+							Some(form)
+						_:
+							None
+				_:
+					None
+		None:
+			None
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parse_source(source):
+		Err(diagnostic):
+			diagnostic.span.start == start and diagnostic.span.end == end and diagnostic.message == message and diagnostic.help == help
+		Ok(_):
+			False
+
+
+private pure func integer_value(form: ParsedIf, expected: Int) -> Bool:
+	match form.then_block.value:
+		Some(value):
+			match value.base:
+				IntegerExpression(found):
+					found == expected
+				_:
+					False
+		None:
+			False
+
+
+-- `if condition:` and `else:` each open an indented block; the expression
+-- spans from `if` to the end of its last block.
+pure func test_if_else_blocks_keep_their_spans() -> Bool:
+	match main_if(HEADER + "\tif True:\n\t\t1\n\telse:\n\t\t2\n"):
+		Some(form):
+			match form.else_branch:
+				Some(ElseBlock(otherwise)):
+					(
+						form.span.start == 21 and form.span.end == 44
+						and form.condition.span.start == 24 and form.condition.span.end == 28
+						and form.then_block.span.start == 32 and form.then_block.span.end == 33
+						and otherwise.span.start == 43 and otherwise.span.end == 44
+						and integer_value(form, 1)
+					)
+				_:
+					False
+		None:
+			False
+
+
+-- `else if` nests a whole if-expression as the else branch.
+pure func test_else_if_nests_an_if_expression() -> Bool:
+	match main_if(HEADER + "\tif True:\n\t\t1\n\telse if False:\n\t\t2\n\telse:\n\t\t3\n"):
+		Some(form):
+			match form.else_branch:
+				Some(ElseIf(nested)):
+					match nested.else_branch:
+						Some(ElseBlock(last)):
+							(
+								form.span.end == 64 and nested.span.start == 40 and nested.span.end == 64
+								and nested.condition.span.start == 43 and nested.condition.span.end == 48
+								and last.span.start == 63 and integer_value(nested, 2)
+							)
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+-- An if without else is a statement line like any expression; the block
+-- that follows needs no newline of its own after the if's dedent.
+pure func test_if_without_else_is_a_statement_before_the_value() -> Bool:
+	match main_function(HEADER + "\tif True:\n\t\t1\n\t0\n"):
+		Some(function):
+			match (function.statements, function.body):
+				([ExpressionStatement(statement)], ParsedValueBody(value)):
+					match (statement.base, value.base):
+						(IfExpression(form), IntegerExpression(0)):
+							form.else_branch.is_none() and form.span.end == 33 and value.span.start == 35
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_if_initializes_a_binding() -> Bool:
+	match main_function(HEADER + "\tx = if True:\n\t\t1\n\telse:\n\t\t2\n\tx\n"):
+		Some(function):
+			match (function.statements, function.body):
+				([BindingStatement(binding)], ParsedValueBody(value)):
+					match (binding.initializer.base, value.base):
+						(IfExpression(form), NameExpression(_)):
+							form.span.start == 25 and form.span.end == 48 and value.span.start == 50
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+-- A control form ends its expression at its dedent: no operator or range
+-- on the next line continues it.
+pure func test_if_ends_its_expression_at_the_dedent() -> Bool:
+	(
+		rejects(HEADER + "\tx = if True:\n\t\t1\n\telse:\n\t\t2\n\tand True\n", 50, 53, "expected a return expression", EXPRESSION_HELP)
+		and rejects(HEADER + "\tx = if True:\n\t\t1\n\telse:\n\t\t2\n\tor True\n", 50, 52, "expected a return expression", EXPRESSION_HELP)
+		and rejects(HEADER + "\tif True:\n\t\t1\n\telse:\n\t\t2\n\t..3\n", 46, 48, "expected a return expression", EXPRESSION_HELP)
+	)
+
+
+pure func test_if_header_requires_condition_colon_newline_and_block() -> Bool:
+	(
+		rejects(HEADER + "\tif:\n\t\t1\n", 23, 24, "expected a return expression", EXPRESSION_HELP)
+		and rejects(HEADER + "\tif True\n\t\t1\n", 28, 29, "expected `:` after if condition", BLOCK_HEADER_HELP)
+		and rejects(HEADER + "\tif True: 1\n", 30, 31, "expected newline before indented block", "start the next statement or item on its own line")
+		and rejects(HEADER + "\tif True:\n\t0\n", 31, 32, "expected an indented block", "indent the lines of the block under its header")
+	)
+
+
+pure func test_else_requires_colon_or_if() -> Bool:
+	(
+		rejects(HEADER + "\tif True:\n\t\t1\n\telse\n\t\t2\n", 39, 40, "expected `:` after else", BLOCK_HEADER_HELP)
+		and rejects(HEADER + "\tif True:\n\t\t1\n\telse if False\n\t\t2\n", 48, 49, "expected `:` after if condition", BLOCK_HEADER_HELP)
+		and rejects(HEADER + "\tif True:\n\t\t1\n\telse: 2\n", 41, 42, "expected newline before indented block", "start the next statement or item on its own line")
+	)
+
+
+-- `else` opens no expression of its own: alone, or indented into the then
+-- block, it has no if to belong to.
+pure func test_else_without_an_if_is_rejected() -> Bool:
+	help = "put else at the indentation of its if, directly after the if branch"
+	(
+		rejects(HEADER + "\telse:\n\t\t2\n", 21, 25, "`else` has no matching `if`", help)
+		and rejects(HEADER + "\tif True:\n\t\t1\n\t\telse:\n\t\t2\n", 36, 40, "`else` has no matching `if`", help)
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 if syntax",
+	tests = [
+		("if and else blocks keep their spans", test_if_else_blocks_keep_their_spans),
+		("else if nests an if expression", test_else_if_nests_an_if_expression),
+		("if without else is a statement before the value", test_if_without_else_is_a_statement_before_the_value),
+		("if initializes a binding", test_if_initializes_a_binding),
+		("if ends its expression at the dedent", test_if_ends_its_expression_at_the_dedent),
+		("if header requires condition, colon, newline and block", test_if_header_requires_condition_colon_newline_and_block),
+		("else requires colon or if", test_else_requires_colon_or_if),
+		("else without an if is rejected", test_else_without_an_if_is_rejected),
+	]
+}

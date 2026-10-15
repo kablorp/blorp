@@ -15,6 +15,8 @@ import:
 			RecordUpdateExpression, LogicalExpression, NotExpression,
 		),
 		LogicalOperator(AndOperator, OrOperator),
+		ElseBranch(ElseIf, ElseBlock),
+		ParsedIf,
 		FunctionHeader,
 		LexedProgram,
 		ParsedBinding,
@@ -49,6 +51,7 @@ import:
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
 			Colon, Newline, Indent, Dedent, VarKeyword, VoidKeyword, Equals, LeftBracket, RightBracket,
 			LeftBrace, RightBrace, Bar, Comma, AtSign, Slash, Star, DotDot, Ellipsis, AndKeyword, OrKeyword, NotKeyword,
+			IfKeyword, ElseKeyword,
 			ImportKeyword, TypeKeyword, PrivateKeyword, RecordKeyword, UnionKeyword, BuiltinKeyword, AsKeyword, OpaqueKeyword,
 			IntoOpaqueKeyword, FromOpaqueKeyword,
 		),
@@ -372,6 +375,22 @@ private pure func at_not(state: ParserState) -> Bool:
 			False
 
 
+private pure func at_if(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(IfKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_else(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(ElseKeyword):
+			True
+		_:
+			False
+
+
 private pure func at_dot_dot(state: ParserState) -> Bool:
 	match current_symbol(state):
 		Some(DotDot):
@@ -553,9 +572,14 @@ private pure func consume_line_end(state: ParserState, message: String, help: St
 		Ok(next)
 
 
+private VALUE_LINE_MESSAGE: String = "expected a newline after the return expression"
+
+private VALUE_LINE_HELP: String = "put each declaration on a new line"
+
+
 -- Ends a line whose value or declaration is complete.
 private pure func end_value_line(state: ParserState) -> Result[ParserState, Diagnostic]:
-	consume_line_end(state, "expected a newline after the return expression", "put each declaration on a new line")
+	consume_line_end(state, VALUE_LINE_MESSAGE, VALUE_LINE_HELP)
 
 
 private DECLARATION_WORD_HELP: String = "use the ordinary declaration syntax, such as type Int = builtin or builtin(\"int.add\")"
@@ -852,10 +876,35 @@ private pure func string_value(raw: String, span: Span) -> Result[String, Diagno
 	Ok(text.decoded)
 
 
+-- How a value's syntax ended: inline, so a Newline must follow it, or with
+-- a control form's block, whose Dedent has already ended the line.
+private fixed union ValueEnding:
+	InlineEnding
+	BlockEnding
+
+
 private fixed record ParsedValue {
 	body: ValueExpression,
-	next: ParserState
+	next: ParserState,
+	ending: ValueEnding
 }
+
+
+private pure func inline(value: ParsedValue) -> Bool:
+	match value.ending:
+		InlineEnding:
+			True
+		BlockEnding:
+			False
+
+
+-- Ends a value's line: at its Newline, or already at its block's Dedent.
+private pure func end_value(value: ParsedValue, message: String, help: String) -> Result[ParserState, Diagnostic]:
+	match value.ending:
+		BlockEnding:
+			Ok(value.next)
+		InlineEnding:
+			consume_line_end(value.next, message, help)
 
 
 -- An expression's base before its postfix operations.
@@ -984,6 +1033,8 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
 			consume_opaque_conversion(start, Wrapping)
 		SymbolToken(FromOpaqueKeyword):
 			consume_opaque_conversion(start, Unwrapping)
+		SymbolToken(ElseKeyword):
+			Err(expected(start, "`else` has no matching `if`", "put else at the indentation of its if, directly after the if branch"))
 		_:
 			Err(expected(start, "expected a return expression", EXPRESSION_HELP))
 
@@ -1064,7 +1115,7 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 	var current = first
 	var failure: Option[Diagnostic] = None
 
-	while at_or(current.next) and failure.is_none():
+	while inline(current) and at_or(current.next) and failure.is_none():
 		match consume_conjunction(shifted(current.next, 1)):
 			Err(error):
 				failure = Some(error)
@@ -1081,7 +1132,7 @@ private pure func consume_conjunction(start: ParserState) -> Result[ParsedValue,
 	var current = first
 	var failure: Option[Diagnostic] = None
 
-	while at_and(current.next) and failure.is_none():
+	while inline(current) and at_and(current.next) and failure.is_none():
 		match consume_negation(shifted(current.next, 1)):
 			Err(error):
 				failure = Some(error)
@@ -1097,7 +1148,7 @@ private pure func consume_conjunction(start: ParserState) -> Result[ParsedValue,
 -- operations of its own.
 private pure func logical(operator: LogicalOperator, left: ParsedValue, right: ParsedValue) -> ParsedValue:
 	span = { left.body.span | end = right.body.span.end }
-	{ body = { base = LogicalExpression(operator, left.body, right.body), base_span = span, applications = [], span = span }, next = right.next }
+	{ body = { base = LogicalExpression(operator, left.body, right.body), base_span = span, applications = [], span = span }, next = right.next, ending = right.ending }
 
 
 private pure func consume_negation(start: ParserState) -> Result[ParsedValue, Diagnostic]:
@@ -1107,7 +1158,7 @@ private pure func consume_negation(start: ParserState) -> Result[ParsedValue, Di
 		keyword = parser_span(start)
 		operand ?= consume_negation(shifted(start, 1))
 		span = { keyword | end = operand.body.span.end }
-		Ok({ body = { base = NotExpression(operand.body), base_span = span, applications = [], span = span }, next = operand.next })
+		Ok({ body = { base = NotExpression(operand.body), base_span = span, applications = [], span = span }, next = operand.next, ending = operand.ending })
 
 
 -- One operand, or `low..high`: two operands around '..'. A range has no
@@ -1115,7 +1166,7 @@ private pure func consume_negation(start: ParserState) -> Result[ParsedValue, Di
 private pure func consume_range(start: ParserState) -> Result[ParsedValue, Diagnostic]:
 	low ?= consume_operand(start)
 
-	if not at_dot_dot(low.next):
+	if not (inline(low) and at_dot_dot(low.next)):
 		Ok(low)
 	else:
 		after_dots = shifted(low.next, 1)
@@ -1126,10 +1177,10 @@ private pure func consume_range(start: ParserState) -> Result[ParsedValue, Diagn
 		else:
 			consume_operand(after_dots)
 		span = { low.body.span | end = high.body.span.end }
-		Ok({ body = { base = RangeExpression(low.body, high.body), base_span = span, applications = [], span = span }, next = high.next })
+		Ok({ body = { base = RangeExpression(low.body, high.body), base_span = span, applications = [], span = span }, next = high.next, ending = high.ending })
 
 
--- A base and its postfix operations.
+-- A base and its postfix operations, or a control form, which takes none.
 private pure func consume_operand(start: ParserState) -> Result[ParsedValue, Diagnostic]:
 	scope ?= if at_import(start) and at_colon(shifted(start, 1)):
 		Err(expected(start, IMPORT_IN_BODY_MESSAGE, IMPORT_IN_BODY_HELP))
@@ -1142,6 +1193,8 @@ private pure func consume_operand(start: ParserState) -> Result[ParsedValue, Dia
 			match token.kind:
 				SymbolToken(LeftParen):
 					consume_grouped_value(start, token.span)
+				SymbolToken(IfKeyword):
+					consume_if(start)
 				_:
 					base ?= consume_base(start, token)
 					postfixes ?= consume_postfixes(base.next, [], base.span.end)
@@ -1153,7 +1206,71 @@ private pure func consume_operand(start: ParserState) -> Result[ParsedValue, Dia
 							span = { token.span | end = postfixes.end }
 						},
 						next = postfixes.next,
+						ending = InlineEnding,
 					})
+
+
+-- `start` is at `if`: the condition, `:` and an indented block, then an
+-- optional `else:` block or `else if` chain. A control form ends its
+-- expression at its last block's Dedent: no postfix operation, operator or
+-- range continues it, and its line needs no Newline of its own.
+private pure func consume_if(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	parsed ?= consume_if_form(start)
+	span = parsed.form.span
+	Ok({ body = { base = IfExpression(parsed.form), base_span = span, applications = [], span = span }, next = parsed.next, ending = BlockEnding })
+
+
+private fixed record IfResult {
+	form: ParsedIf,
+	next: ParserState
+}
+
+
+private pure func consume_if_form(start: ParserState) -> Result[IfResult, Diagnostic]:
+	keyword = parser_span(start)
+	condition ?= consume_value(shifted(start, 1))
+	then_block ?= consume_header_block(condition.next, "expected `:` after if condition")
+	otherwise ?= consume_else_branch(then_block.next)
+	end = match otherwise.branch:
+		None:
+			then_block.block.span.end
+		Some(ElseIf(nested)):
+			nested.span.end
+		Some(ElseBlock(block)):
+			block.span.end
+	Ok({
+		form = { condition = condition.body, then_block = then_block.block, else_branch = otherwise.branch, span = { keyword | end = end } },
+		next = otherwise.next,
+	})
+
+
+private fixed record ElseResult {
+	branch: Option[ElseBranch],
+	next: ParserState
+}
+
+
+-- Nothing, `else:` with a block, or `else if`, which nests the next if-form.
+private pure func consume_else_branch(state: ParserState) -> Result[ElseResult, Diagnostic]:
+	if not at_else(state):
+		Ok({ branch = None, next = state })
+	else if at_if(shifted(state, 1)):
+		nested ?= consume_if_form(shifted(state, 1))
+		Ok({ branch = Some(ElseIf(nested.form)), next = nested.next })
+	else:
+		block ?= consume_header_block(shifted(state, 1), "expected `:` after else")
+		Ok({ branch = Some(ElseBlock(block.block)), next = block.next })
+
+
+private BLOCK_HEADER_HELP: String = "a block header ends with `:` before its indented body, as in `if condition:` or `func name() -> Type:`"
+
+
+-- `:` Newline Indent block Dedent after a block header, in the host's words.
+private pure func consume_header_block(state: ParserState, colon_message: String) -> Result[BlockResult, Diagnostic]:
+	newline ?= expect(state, at_colon(state), colon_message, BLOCK_HEADER_HELP)
+	opened ?= expect(newline, at_newline(newline), "expected newline before indented block", "start the next statement or item on its own line")
+	first ?= expect(opened, at_indent(opened), "expected an indented block", "indent the lines of the block under its header")
+	consume_block(first)
 
 
 -- `start` follows the opening bracket: zero or more comma-separated
@@ -1194,6 +1311,7 @@ private pure func consume_grouped_value(start: ParserState, opening: Span) -> Re
 			span = { opening | end = postfixes.end }
 		},
 		next = postfixes.next,
+		ending = InlineEnding,
 	})
 
 
@@ -1542,13 +1660,13 @@ private INDENTED_VALUE_HELP: String = "put the value on the same line as '=', or
 private pure func consume_initializer(equals: ParserState, line_message: String, line_help: String) -> Result[ParsedValue, Diagnostic]:
 	if not at_newline(equals):
 		value ?= consume_value(equals)
-		next ?= consume_line_end(value.next, line_message, line_help)
+		next ?= end_value(value, line_message, line_help)
 		Ok({ value | next = next })
 	else:
 		after_newline = shifted(equals, 1)
 		opened ?= expect(after_newline, at_indent(after_newline), "expected an indented value after '='", INDENTED_VALUE_HELP)
 		value ?= consume_value(opened)
-		ended ?= consume_line_end(value.next, "expected one expression after '='", INDENTED_VALUE_HELP)
+		ended ?= end_value(value, "expected one expression after '='", INDENTED_VALUE_HELP)
 		closed ?= expect(ended, at_dedent(ended), "expected one expression after '='", INDENTED_VALUE_HELP)
 		Ok({ value | next = closed })
 
@@ -1596,7 +1714,7 @@ private pure func consume_block_line(state: ParserState) -> Result[BlockLine, Di
 		consume_binding(state)
 	else:
 		value ?= consume_value(state)
-		next ?= end_value_line(value.next)
+		next ?= end_value(value, VALUE_LINE_MESSAGE, VALUE_LINE_HELP)
 
 		if at_dedent(next):
 			Ok(FinalLine(value.body, shifted(next, 1)))
@@ -1664,7 +1782,7 @@ private pure func consume_arm_result(colon: ParserState) -> Result[BlockResult, 
 		consume_block(opened)
 	else:
 		value ?= consume_value(colon)
-		next ?= end_value_line(value.next)
+		next ?= end_value(value, VALUE_LINE_MESSAGE, VALUE_LINE_HELP)
 		Ok({ block = { statements = [], value = Some(value.body), span = value.body.span }, next = next })
 
 

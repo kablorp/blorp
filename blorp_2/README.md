@@ -829,8 +829,15 @@ suffixes may follow that expression, including a group's closing parenthesis.
 combine them with the host's precedence (`or` below `and` below `not` below
 `..`, `and`/`or` left-associative). A line break after `and` or `or` is
 accepted only inside brackets; the host also accepts it bare, which is a
-follow-up. Ranges parse and are rejected by checking
-until the loops milestone; `and`, `or` and `not` until the join milestone.
+follow-up. `if condition:` opens an indented block, optionally followed by
+`else:` with a block or `else if condition:`, which nests the next
+if-expression; the form is one expression in value and statement positions
+alike. It ends at its last block's dedent: no operator, range or UFCS
+suffix on the next line continues it, and a binding or line it ends needs
+no newline of its own. An `else` with no `if` to belong to is a syntax
+error. Ranges parse and are rejected by checking
+until the loops milestone; `and`, `or`, `not` and `if` until the join
+milestone.
 A dotted type such as `Shared.Span[Int]` is a qualified type. Checking rejects
 qualified forms until the namespace milestone.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
