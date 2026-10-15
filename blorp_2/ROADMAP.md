@@ -181,8 +181,11 @@ measurements remain serialized. The coordinator owns integration and this plan.
    The list literal `[a, b]` / `[]` constructs one fresh root inline with n
    stored occurrences under the same acquisition rule as variant payloads;
    `[]` needs an expected List type. Removal remains a following increment.
-   Follow-up: check only referenced library declarations; every compile now
-   pays about 300 allocations per generic library wrapper (884 for the three).
+   Each generic library wrapper costs every compile about 340 allocations:
+   lexing ≈146, parsing ≈104 and checking ≈90. Checking only referenced
+   library declarations was measured and rejected, because loading must stay
+   complete for the prelude's `methods_only` imports; see the
+   [referenced library check report](../benchmarks/results/blorp_2_referenced_library_check_2026-10-15.md).
 5. **Recursive data.** Begin with the existing unary Nat example and iterative
    final release; then separately admit mutual, regular-generic and branching
    mixed shapes. Reserve instance identities locally and publish only complete
