@@ -10,6 +10,7 @@ and the [parent AGENTS.md](../AGENTS.md).
 behavior. The [imports/prelude reference](IMPORTS_AND_PRELUDE_PLAN.md) describes
 that implemented subsystem. Examples and unchecked milestones here are planned
 capabilities, not claims that the current compiler accepts them.
+[LIBRARY_PARITY.md](LIBRARY_PARITY.md) is the authority for which library functions the compiler source may use while the host still builds it.
 
 The immediate goal is correctness and useful composition, not memory
 optimization. Extra retains, copies and fresh allocations are acceptable.
