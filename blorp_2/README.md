@@ -1784,11 +1784,13 @@ data. Those later increments are not implemented here; correctness comes before
 memory optimization.
 
 Compiler source under `src/` stays within the agreed eventual subset: `String`, `Int`
-(64-bit), `Float` (64-bit), `Bool`, `Void`, `List`, `Option`, `Result`, `Dict`,
+(64-bit), `Float` (64-bit), `Bool`, `Char`, `Void`, `List`, `Option`, `Result`, `Dict`,
 `Set`, records/unions and their fixed spellings, opaque types, generics,
-purity, matching, loops, `var`, `?=`, imports, UFCS, and quoted and multiline
-String literals. Supporting every one
-of these in input programs is future work, not a claim about this increment.
+purity, matching, loops, `var`, `?=`, imports, UFCS, anonymous functions
+(`func(...)` values and closures), and quoted and multiline String literals.
+Supporting every one of these in input programs is future work, not a claim
+about this increment. Equality is written with concrete functions such as
+`IntOps.equals` and pattern matching, never `==` or `!=`.
 
 Concurrency, parallelism, tensors and dimension types, tuples, `debug:`, other
 numeric widths, traits, doctests, channels, and FFI are excluded. Compiler tests
