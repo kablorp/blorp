@@ -1,5 +1,6 @@
 import:
 	../namespace/builtins as Builtins:
+		RuntimeOperation,
 		RuntimeResult(ValueResult, OptionalResult, BooleanResult),
 		runtime_contract,
 	float as FloatOps
@@ -400,6 +401,7 @@ private pure func verify_borrow(
 				Err(failure(span, "payload borrow has the wrong parent value"))
 
 
+-- The signature a call's target declares, after its types are shown to exist.
 private pure func call_signature(
 	call: ConcreteCall,
 	functions: List[OwnedFunction],
@@ -408,78 +410,82 @@ private pure func call_signature(
 ) -> Result[FunctionSignature, Diagnostic]:
 	match call.target:
 		RuntimeFunction(operation):
-			contract = runtime_signature(operation)
-			var invalid: Option[Diagnostic] = None
-			for parameter in contract.parameters:
-				match verify_type_membership(parameter, unions, records, call.span):
-					Ok(_): void
-					Err(error):
-						invalid = Some(error)
-						break
-			parameters ?= match invalid:
-				None: Ok(void)
-				Some(error): Err(error)
-			validation: Result[Void, Diagnostic] = match runtime_contract(operation).return_type:
-				ValueResult(_):
-					Ok(void)
-				OptionalResult(payload, option):
-					expected_payload = runtime_type_ref(payload)
-
-					some ?= variant_type(
-						option.some,
-						[expected_payload],
-						unions,
-						call.span,
-					)
-					none ?= variant_type(option.none, [], unions, call.span)
-					owner = variant_owner(option.some)
-					layout ?= unions
-						.get(union_number(owner))
-						.to_result(failure(call.span, "unknown runtime result union"))
-
-					if (
-						same_type(some, none)
-						and IntOps.equals(layout.variants.length(), 2)
-						and not IntOps.equals(variant_number(option.some), variant_number(option.none))
-					):
-						Ok(void)
-					else:
-						Err(
-							failure(
-								call.span,
-								"runtime Option constructors do not cover one result union",
-							),
-						)
-				BooleanResult(boolean):
-					true_type ?= variant_type(boolean.true_variant, [], unions, call.span)
-					false_type ?= variant_type(boolean.false_variant, [], unions, call.span)
-					owner = variant_owner(boolean.true_variant)
-					layout ?= unions
-						.get(union_number(owner))
-						.to_result(failure(call.span, "unknown runtime result union"))
-
-					if (
-						same_type(true_type, false_type)
-						and IntOps.equals(layout.variants.length(), 2)
-						and not IntOps.equals(variant_number(boolean.true_variant), variant_number(boolean.false_variant))
-					):
-						Ok(void)
-					else:
-						Err(
-							failure(
-								call.span,
-								"runtime Bool constructors do not cover one result union",
-							),
-						)
-
-			valid ?= validation
-			result ?= verify_type_membership(contract.return_type, unions, records, call.span)
-			Ok(contract)
+			verify_runtime_signature(operation, call.span, unions, records)
 		UserFunction(id):
 			function ?= functions
 				.get(function_number(id))
 				.to_result(failure(call.span, "unknown called function"))
 			Ok(function.signature)
+
+
+private pure func verify_runtime_signature(
+	operation: RuntimeOperation[VariantInstanceId, TypeRef],
+	span: Span,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[FunctionSignature, Diagnostic]:
+	contract = runtime_signature(operation)
+	var invalid: Option[Diagnostic] = None
+	for parameter in contract.parameters:
+		match verify_type_membership(parameter, unions, records, span):
+			Ok(_): void
+			Err(error):
+				invalid = Some(error)
+				break
+	parameters ?= match invalid:
+		None: Ok(void)
+		Some(error): Err(error)
+	validation: Result[Void, Diagnostic] = match runtime_contract(operation).return_type:
+		ValueResult(_):
+			Ok(void)
+		OptionalResult(payload, option):
+			verify_two_variant_union(
+				option.some,
+				[runtime_type_ref(payload)],
+				option.none,
+				unions,
+				span,
+				"runtime Option constructors do not cover one result union",
+			)
+		BooleanResult(boolean):
+			verify_two_variant_union(
+				boolean.true_variant,
+				[],
+				boolean.false_variant,
+				unions,
+				span,
+				"runtime Bool constructors do not cover one result union",
+			)
+
+	valid ?= validation
+	result ?= verify_type_membership(contract.return_type, unions, records, span)
+	Ok(contract)
+
+
+-- A runtime Option or Bool result: its two constructors must be distinct
+-- variants of one two-variant union.
+private pure func verify_two_variant_union(
+	first: VariantInstanceId,
+	first_payload: List[TypeRef],
+	second: VariantInstanceId,
+	unions: List[ConcreteUnion],
+	span: Span,
+	message: String,
+) -> Result[Void, Diagnostic]:
+	first_type ?= variant_type(first, first_payload, unions, span)
+	second_type ?= variant_type(second, [], unions, span)
+	layout ?= unions
+		.get(union_number(variant_owner(first)))
+		.to_result(failure(span, "unknown runtime result union"))
+
+	if (
+		same_type(first_type, second_type)
+		and IntOps.equals(layout.variants.length(), 2)
+		and not IntOps.equals(variant_number(first), variant_number(second))
+	):
+		Ok(void)
+	else:
+		Err(failure(span, message))
 
 
 private pure func verify_argument(
