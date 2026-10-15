@@ -637,6 +637,110 @@ pure func test_update_contracts_carry_the_same_structured_element_everywhere() -
 	append_valid and set_valid and concat_valid and results
 
 
+private LITERAL_SOURCE: String =
+	|fixed record Entry { number: Int, text: String }
+	|pure func text(value: Int) -> String:
+	|    builtin("int.to_string")
+	|pure func make_entry(value: Int) -> Entry:
+	|    { number = value, text = text(value) }
+	|pure func pair(entry: Entry) -> List[Entry]:
+	|    [entry, entry]
+	|pure func numbers() -> List[Int]:
+	|    [1, 2]
+	|func main() -> Int:
+	|    entries = pair(make_entry(42))
+	|    values = numbers()
+	|    0
+	|
+
+
+private pure func literal_function(function: Lower.LoweredFunction) -> Bool:
+	var found = False
+	for definition in function.definitions:
+		match definition.operation:
+			Lower.ConstructListValue(_): found = True
+			_: void
+	found
+
+
+-- One operation list with its literal's stored payloads, owners and result.
+private pure func owned_literal(function: Lower.LoweredFunction, facts: Lower.LoweredFunctions) -> Option[Own.OwnedFunction]:
+	match Own.insert_function(function, facts.unions, facts.records):
+		Err(_): None
+		Ok(owned): Some(owned)
+
+
+pure func test_managed_literal_acquires_each_stored_occurrence_and_owns_one_root() -> Bool:
+	match concrete(LITERAL_SOURCE).and_then(Lower.lower):
+		Err(_): False
+		Ok(program):
+			facts = Lower.lowered_functions(program)
+			match facts.functions.filter(pure func(function): literal_function(function) and IntOps.equals(function.signature.parameters.length(), 1)):
+				[function]:
+					match owned_literal(function, facts):
+						None: False
+						Some(owned):
+							match owned.operations:
+								[Own.DefineValue(parameter), Own.AcquireOwner(first_owner, first_borrow, _), Own.AcquireOwner(second_owner, second_borrow, _), Own.DefineValue(result)]:
+									borrowed = match parameter.result:
+										Own.BorrowedResult(Own.ParameterBorrow(source)): IntOps.equals(Lower.value_number(source), Lower.value_number(parameter.id))
+										_: False
+									-- Both occurrences borrow the same parameter and acquire separately.
+									occurrences = (
+										IntOps.equals(Lower.value_number(first_borrow.value), Lower.value_number(parameter.id))
+										and IntOps.equals(Lower.value_number(second_borrow.value), Lower.value_number(parameter.id))
+										and not IntOps.equals(Own.owner_number(first_owner), Own.owner_number(second_owner))
+									)
+									stored = match result.operation:
+										Own.ConstructListDefinition([Own.OwnedPayload(first_value, stored_first), Own.OwnedPayload(second_value, stored_second)]):
+											(IntOps.equals(Lower.value_number(first_value), Lower.value_number(parameter.id))
+											and IntOps.equals(Lower.value_number(second_value), Lower.value_number(parameter.id))
+											and IntOps.equals(Own.owner_number(stored_first), Own.owner_number(first_owner))
+											and IntOps.equals(Own.owner_number(stored_second), Own.owner_number(second_owner)))
+										_: False
+									transferred = match result.result:
+										Own.OwnedResult(owner):
+											match owned.tail:
+												Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, returned))):
+													IntOps.equals(Lower.value_number(value), Lower.value_number(result.id)) and IntOps.equals(Own.owner_number(owner), Own.owner_number(returned))
+												_: False
+										_: False
+									entry_list = match result.value_type:
+										Concrete.ListType(Concrete.RecordType(_)): True
+										_: False
+									borrowed and occurrences and stored and transferred and entry_list
+								_: False
+				_: False
+
+
+pure func test_unmanaged_literal_stores_values_without_acquisition_and_owns_one_root() -> Bool:
+	match concrete(LITERAL_SOURCE).and_then(Lower.lower):
+		Err(_): False
+		Ok(program):
+			facts = Lower.lowered_functions(program)
+			match facts.functions.filter(pure func(function): literal_function(function) and function.signature.parameters.is_empty()):
+				[function]:
+					match owned_literal(function, facts):
+						None: False
+						Some(owned):
+							match owned.operations:
+								[Own.DefineValue(first), Own.DefineValue(second), Own.DefineValue(result)]:
+									stored = match result.operation:
+										Own.ConstructListDefinition([Own.UnmanagedPayload(first_value), Own.UnmanagedPayload(second_value)]):
+											IntOps.equals(Lower.value_number(first_value), Lower.value_number(first.id)) and IntOps.equals(Lower.value_number(second_value), Lower.value_number(second.id))
+										_: False
+									transferred = match result.result:
+										Own.OwnedResult(owner):
+											match owned.tail:
+												Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, returned))):
+													IntOps.equals(Lower.value_number(value), Lower.value_number(result.id)) and IntOps.equals(Own.owner_number(owner), Own.owner_number(returned))
+												_: False
+										_: False
+									stored and transferred
+								_: False
+				_: False
+
+
 tests: TestSuite = {
 	description = "Generic List immutable phase facts",
 	tests = [
@@ -658,5 +762,7 @@ tests: TestSuite = {
 		("runtime set borrows inputs and owns one root", test_runtime_set_borrows_list_index_and_entry_and_owns_one_root),
 		("runtime concat borrows both Lists and owns one root", test_runtime_concat_borrows_both_lists_and_owns_one_root),
 		("update contracts keep structured E", test_update_contracts_carry_the_same_structured_element_everywhere),
+		("managed literal acquires each occurrence and owns one root", test_managed_literal_acquires_each_stored_occurrence_and_owns_one_root),
+		("unmanaged literal stores values and owns one root", test_unmanaged_literal_stores_values_without_acquisition_and_owns_one_root),
 	]
 }

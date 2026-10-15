@@ -820,7 +820,7 @@ body has zero or more ordered binding or Void expression statements followed
 by a final expression or a tail match with inline arm results or statement blocks. Expressions
 start with `void`, a signed Int64 or decimal Float64 literal, a quoted UTF-8 String literal, a pipe String or raw block, a binding or variant name, a record literal or update,
 an application with an ordered list of arguments, a list literal such as
-`[1, 2]` (parsed; checking rejects it until the list intrinsics milestone), a qualified name or call
+`[1, 2]` or `[]`, a qualified name or call
 such as `IntOps.add(1, 2)` where `IntOps` is a module alias of the import
 block (the alias wins over a local of the same spelling, as in the host), or
 one expression grouped in parentheses. UFCS calls and record field
@@ -1416,8 +1416,27 @@ the result, surviving or replacement, is acquired independently, so one
 managed value may appear in both the input and the result. `set` with a
 negative or out-of-range index returns an unchanged copy; `append` and
 `concat` always produce the longer List. The runtime helper for an update
-exists only where its operation is called. No List literal or removal syntax
-is included yet.
+exists only where its operation is called.
+
+A list literal `[a, b]` constructs one fresh root of exactly n slots inline
+at its site, storing each element once; `[x, x]` acquires `x` twice, as a
+variant payload would. Every element must have one type: the first element
+decides it, and a later element of another type is rejected at that element
+(`list elements must have one type: element 2 is Float, element 1 is Int`).
+Once E is known, every later element is checked with E as its expected
+type, so `[[1, 2], [], [3]]` gives the inner `[]` the type `List[Int]`.
+`[]` takes its element type from an expected List type. The routes that
+supply one are: a function's non-Void return value; a `var` reassignment; a
+call argument whose parameter is a List, including a generic `List[T]` such
+as `append([], 7)`, which then infers `T`; a record literal or update field;
+a variant payload field; and a later element of a list literal whose E is
+already decided. Without such a context `[]` is rejected (`cannot infer the
+element type of an empty list literal`): a binding initializer supplies no
+expected type until annotations arrive, `[[], [3]]` has nothing deciding E
+before the empty element, and a UFCS receiver such as `[].get(0)` is accepted
+with E = `T` and then reports `cannot infer the type parameter from the
+argument`. No
+removal syntax is included yet.
 
 For example, a managed record can escape after its containing List is retired:
 

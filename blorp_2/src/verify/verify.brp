@@ -18,7 +18,7 @@ import:
 		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(
 			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition,
-			StringDefinition, CallDefinition, ConstructDefinition,
+			StringDefinition, CallDefinition, ConstructDefinition, ConstructListDefinition,
 			PayloadDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition,
 		),
 		OwnerId,
@@ -1053,6 +1053,28 @@ private pure func operation_type(
 				Some(error): Err(error)
 				None: Ok(void)
 			variant_type(id, types, unions, definition.span)
+		ConstructListDefinition(payloads):
+			-- The definition's List type is the one authority for E; every
+			-- stored element must carry exactly that type.
+			element ?= match definition.value_type:
+				ListType(element): Ok(element)
+				_: Err(failure(definition.span, "list construction result must be a List"))
+			var error: Option[Diagnostic] = None
+			for payload in payloads:
+				argument = match payload:
+					UnmanagedPayload(value): value
+					OwnedPayload(value, _): value
+				match value(state, argument, definition.span):
+					Err(failure):
+						error = Some(failure)
+						break
+					Ok(known):
+						if not same_type(known.value_type, element):
+							error = Some(failure(definition.span, "list element type does not match its List"))
+							break
+			match error:
+				Some(error): Err(error)
+				None: Ok(definition.value_type)
 		PayloadDefinition(field, source):
 			selected = variant_field_variant(field)
 			scrutinee ?= value(state, source, definition.span)
@@ -1095,6 +1117,39 @@ private pure func operation_type(
 								"payload projection does not belong to this match arm",
 							),
 						)
+
+
+-- Owner slots after every stored payload of one construction discharged its
+-- obligation into storage; variants, list literals and records share it.
+private fixed record DischargedOwners {
+	prefix_owners: List[OwnerState],
+	owners: List[OwnerState]
+}
+
+
+private pure func discharge_payloads(
+	payloads: List[StoredPayload],
+	state: VerificationFacts,
+	prefix_owners: List[OwnerState],
+	owners: List[OwnerState],
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+	span: Span,
+) -> Result[DischargedOwners, Diagnostic]:
+	var prefix = prefix_owners
+	var local = owners
+	var failure_slot: Option[Diagnostic] = None
+	for payload in payloads:
+		match stored_payload_transfer(payload, state, prefix, local, unions, records, span):
+			Err(error):
+				failure_slot = Some(error)
+				break
+			Ok(Some(PrefixSlot(index))): prefix = prefix.set(index, DischargedOwner)
+			Ok(Some(LocalSlot(index))): local = local.set(index, DischargedOwner)
+			Ok(None): void
+	match failure_slot:
+		Some(error): Err(error)
+		None: Ok({ prefix_owners = prefix, owners = local })
 
 
 private pure func stored_payload_transfer(
@@ -1223,7 +1278,7 @@ private pure func verify_definition_result(
 									"managed projection requires its parent borrow",
 								),
 							)
-				StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | ConstructRecordDefinition(_, _):
+				StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | ConstructListDefinition(_) | ConstructRecordDefinition(_, _):
 					match definition.result:
 						OwnedResult(owner):
 							Ok(Some(owner))
@@ -1371,67 +1426,29 @@ private pure func verify_operations(
 						Err(error)
 					Ok(_):
 						stored: Result[Void, Diagnostic] = match definition.operation:
+							ConstructListDefinition(payloads):
+								match discharge_payloads(payloads, state, prefix_owners, owners, unions, records, definition.span):
+									Err(error): Err(error)
+									Ok(discharged):
+										prefix_owners = discharged.prefix_owners
+										owners = discharged.owners
+										Ok(void)
 							ConstructDefinition(_, payloads):
-								var failure_slot: Option[Diagnostic] = None
-
-								for payload in payloads:
-									match stored_payload_transfer(
-										payload,
-										state,
-										prefix_owners,
-										owners,
-										unions,
-										records,
-										definition.span,
-									):
-										Err(error):
-											failure_slot = Some(error)
-											break
-										Ok(Some(PrefixSlot(index))):
-											prefix_owners = prefix_owners.set(
-												index,
-												DischargedOwner,
-											)
-										Ok(Some(LocalSlot(index))):
-											owners = owners.set(index, DischargedOwner)
-										Ok(None):
-											void
-
-								match failure_slot:
-									Some(error):
-										Err(error)
-									None:
+								match discharge_payloads(payloads, state, prefix_owners, owners, unions, records, definition.span):
+									Err(error): Err(error)
+									Ok(discharged):
+										prefix_owners = discharged.prefix_owners
+										owners = discharged.owners
 										Ok(void)
 							ConstructRecordDefinition(_, fields):
-								var failure_slot: Option[Diagnostic] = None
-
+								var payloads: List[StoredPayload] = []
 								for field in fields:
-									match stored_payload_transfer(
-										field.value,
-										state,
-										prefix_owners,
-										owners,
-										unions,
-										records,
-										definition.span,
-									):
-										Err(error):
-											failure_slot = Some(error)
-											break
-										Ok(Some(PrefixSlot(index))):
-											prefix_owners = prefix_owners.set(
-												index,
-												DischargedOwner,
-											)
-										Ok(Some(LocalSlot(index))):
-											owners = owners.set(index, DischargedOwner)
-										Ok(None):
-											void
-
-								match failure_slot:
-									Some(error):
-										Err(error)
-									None:
+									payloads = payloads.append(field.value)
+								match discharge_payloads(payloads, state, prefix_owners, owners, unions, records, definition.span):
+									Err(error): Err(error)
+									Ok(discharged):
+										prefix_owners = discharged.prefix_owners
+										owners = discharged.owners
 										Ok(void)
 							_:
 								Ok(void)

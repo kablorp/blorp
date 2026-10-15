@@ -178,7 +178,9 @@ measurements remain serialized. The coordinator owns integration and this plan.
    List `append`, `set` and `concat` are implemented as fresh-result intrinsics
    with the same borrowed-input contract; see the
    [list intrinsics report](../benchmarks/results/blorp_2_list_intrinsics_2026-10-15.md).
-   Removal and the List literal remain separate following increments.
+   The list literal `[a, b]` / `[]` constructs one fresh root inline with n
+   stored occurrences under the same acquisition rule as variant payloads;
+   `[]` needs an expected List type. Removal remains a following increment.
    Follow-up: check only referenced library declarations; every compile now
    pays about 300 allocations per generic library wrapper (884 for the three).
 5. **Recursive data.** Begin with the existing unary Nat example and iterative

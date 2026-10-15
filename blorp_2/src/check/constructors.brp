@@ -23,14 +23,18 @@ import:
 		CallError(ArgumentTypeMismatch),
 		ConstructorError(ConstructorNeedsExpectedType, VariantNotInExpectedType, PayloadFreeVariantCalled, ConstructorFieldCountMismatch),
 		RecordError(UpdateRequiresRecord, DuplicateUpdateField, RecordNeedsExpectedType, UnknownRecordField, DuplicateLiteralField, MissingRecordField, RecordFieldTypeMismatch),
-		CheckerInvariant(InvalidCheckedUnion, InvalidRecordDeclaration, InvalidRecordField, GenericConstructorContract),
+		ValueError(EmptyListNeedsElementType, ListElementTypeMismatch),
+		ListElementReference(EarlierElement, ExpectedElement),
+		CheckerInvariant(InvalidCheckedUnion, InvalidRecordDeclaration, InvalidRecordField, GenericConstructorContract, InvalidInferenceWorklist),
 		call_error,
 		constructor_error,
 		record_error,
+		value_error,
 		checker_invariant
 	./inference:
-		PendingBase(PendingConstructRecord, PendingConstructVariant, PendingUpdateRecord),
-		InferenceType(AcceptedType, CallVariable, InferredRecord, InferredUnion),
+		PendingBase(PendingConstructRecord, PendingConstructVariant, PendingUpdateRecord, PendingConstructList),
+		ListElementSource(ExpectedElementType, FirstElementType),
+		InferenceType(AcceptedType, CallVariable, InferredRecord, InferredUnion, InferredList),
 		InferenceReadiness(ClosedInference, DeferredInference),
 		InferencePublication(CompleteInference, DiagnosticInference),
 		InferenceSlot,
@@ -44,6 +48,7 @@ import:
 		inference_complete,
 		inference_head,
 		inference_shape,
+		list_inference_type,
 		pending_type,
 		publish_inference_type
 	../utils/ids: RecordId, UnionId, VariantId, record_number, union_number, variant_number
@@ -504,6 +509,102 @@ pure func finish_pending_variant(
 	})
 
 
+-- A list literal is a construction of n stored occurrences. The expected List
+-- type supplies E when the context establishes one; otherwise the first
+-- element decides, so an empty literal without a List context is rejected.
+pure func plan_list_literal(
+	elements: List[ValueExpression],
+	expectation: Option[InferenceType],
+	span: Span,
+) -> Result[PlannedBase, CheckError]:
+	source = match expectation:
+		Some(hint):
+			match inference_shape(hint):
+				InferredList(element): ExpectedElementType(element)
+				_: FirstElementType
+		None: FirstElementType
+	match source:
+		ExpectedElementType(_): Ok(PlannedList(elements, source))
+		FirstElementType:
+			if elements.is_empty():
+				Err(value_error(span, EmptyListNeedsElementType))
+			else:
+				Ok(PlannedList(elements, source))
+
+
+pure func list_element_type(
+	source: ListElementSource,
+	values: List[PendingValue],
+	span: Span,
+) -> Result[InferenceType, CheckError]:
+	match source:
+		ExpectedElementType(element): Ok(element)
+		FirstElementType:
+			first ?= values.get(0).to_result(checker_invariant(span, InvalidInferenceWorklist))
+			Ok(pending_type(first))
+
+
+-- Every element's published type must equal the published E; the first
+-- mismatch is reported at that element, naming what it had to agree with.
+pure func validate_list_elements(
+	source: ListElementSource,
+	values: List[PendingValue],
+	slots: List[InferenceSlot],
+	span: Span,
+) -> Result[Void, CheckError]:
+	element ?= list_element_type(source, values, span)
+	expected ?= publish_inference_type(element, slots, CompleteInference, span)
+	reference = match source:
+		ExpectedElementType(_): ExpectedElement
+		FirstElementType: EarlierElement
+	var position = 1
+	var failure: Option[CheckError] = None
+	for value in values:
+		match publish_inference_type(pending_type(value), slots, CompleteInference, value.span):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(actual):
+				if not same_type(expected, actual):
+					failure = Some(value_error(value.span, ListElementTypeMismatch({
+						position = position, actual = actual, expected = expected, reference = reference,
+					})))
+					break
+		position = IntOps.add(position, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+
+
+pure func finish_pending_list(
+	source: ListElementSource,
+	values: List[PendingValue],
+	span: Span,
+	base_span: Span,
+	slots: List[InferenceSlot],
+) -> Result[PendingValue, CheckError]:
+	element ?= list_element_type(source, values, base_span)
+	var readiness = ClosedInference
+	for value in values:
+		match value.readiness:
+			DeferredInference: readiness = DeferredInference
+			ClosedInference: void
+	complete ?= inference_complete(element, slots, base_span)
+	if not complete:
+		readiness = DeferredInference
+	valid ?= match readiness:
+		ClosedInference: validate_list_elements(source, values, slots, base_span)
+		DeferredInference: Ok(void)
+	Ok({
+		span = span,
+		readiness = readiness,
+		base = PendingConstructList(source, values),
+		base_type = list_inference_type(element),
+		base_span = base_span,
+		operations = NoPendingOperations,
+	})
+
+
 fixed union CallPlacement:
 	ReturnPlacement(Span, Span)
 	ReceiverPlacement(PendingValue, Span)
@@ -514,4 +615,5 @@ fixed union PlannedBase:
 	PlannedRecord(PlannedRecordFields)
 	PlannedUpdate(ValueExpression, List[ParsedRecordField], Option[InferenceType])
 	PlannedVariant(PendingVariantContract, List[ValueExpression])
+	PlannedList(List[ValueExpression], ListElementSource)
 	PlannedCall(FunctionContract, List[ValueExpression], CallPlacement, Option[InferenceType])

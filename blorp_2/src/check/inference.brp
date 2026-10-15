@@ -63,6 +63,14 @@ fixed union PendingBase:
 	PendingConstructRecord(RecordId, List[PendingRecordField])
 	PendingUpdateRecord(RecordId, PendingValue, Span, List[PendingRecordField], List[PendingRetainedField])
 	PendingConstructVariant(PendingVariantContract, List[PendingValue])
+	PendingConstructList(ListElementSource, List[PendingValue])
+
+
+-- Where a list literal's element type comes from: the expected List's element
+-- when the context establishes one, otherwise the literal's first element.
+fixed union ListElementSource:
+	ExpectedElementType(InferenceType)
+	FirstElementType
 
 
 fixed union PendingOperation:
@@ -329,7 +337,7 @@ private pure func merge_hint(first: InferenceType, next: InferenceType, slots: L
 				Some(value):
 					match retained_hint(left, right):
 						Some(retained): Ok(Some(retained))
-						None: Ok(Some(substituted_list(value)))
+						None: Ok(Some(list_inference_type(value)))
 		RecordEquality(left_arguments, right_arguments):
 			owner_result: Result[RecordId, CheckError] = match left:
 				InferredRecord(owner, _): Ok(owner)
@@ -560,7 +568,7 @@ pure func apply_type_hint(value_type: TypeRef, parameters: List[TypeParameterId]
 							Some(inference_type(value_type, [], 0))
 					None: Some(inference_type(value_type, [], 0))
 			ListType(element):
-				apply_type_hint(element, parameters, hints).map(substituted_list)
+				apply_type_hint(element, parameters, hints).map(list_inference_type)
 			AppliedRecordType(owner, arguments):
 				var values: List[InferenceType] = []
 				var complete = True
@@ -624,6 +632,7 @@ pure func record_argument_origin(equality: InferenceEquality, slots: List[Infere
 		ResultConstraint(_): Ok(None)
 		VariantConstraint(_, _): Ok(None)
 		RecordFieldConstraint(_, _, _): Ok(None)
+		ListElementConstraint(_, _): Ok(None)
 		ArgumentConstraint(_, _, actual, _):
 			match equality.parameter:
 				Some(_): Ok(None)
@@ -683,6 +692,7 @@ fixed union ConstraintOrigin:
 	ResultConstraint(CallResultContext)
 	VariantConstraint(PendingVariantContract, Int)
 	RecordFieldConstraint(FieldId, InferenceUse, Span)
+	ListElementConstraint(Int, Span)
 
 
 fixed union InferenceRelation:
@@ -793,7 +803,7 @@ pure func inference_shape(value: InferenceType) -> InferenceType:
 
 -- Annotation substitution may change accepted children. Build that compound
 -- once rather than retaining its unsubstituted callee-owned annotation.
-private pure func substituted_list(element: InferenceType) -> InferenceType:
+pure func list_inference_type(element: InferenceType) -> InferenceType:
 	match element:
 		AcceptedType(value): AcceptedType(ListType(value))
 		_: InferredList(element)
@@ -998,6 +1008,7 @@ private pure func inference_origin_span(origin: ConstraintOrigin) -> Span:
 			result.span
 		VariantConstraint(contract, _): contract.span
 		RecordFieldConstraint(_, _, span): span
+		ListElementConstraint(_, span): span
 
 
 private pure func inference_conflict(
@@ -1011,6 +1022,7 @@ private pure func inference_conflict(
 			Err(checker_invariant(span, InvalidInferenceWorklist))
 		VariantConstraint(_, _): Err(checker_invariant(span, InvalidInferenceWorklist))
 		RecordFieldConstraint(_, _, _): Err(checker_invariant(span, InvalidInferenceWorklist))
+		ListElementConstraint(_, _): Err(checker_invariant(span, InvalidInferenceWorklist))
 		ArgumentConstraint(call, position, occurrence, written):
 			contract = call.contract
 			constraint ?= equality.parameter.to_result(checker_invariant(span, InvalidInferenceWorklist))
@@ -1189,6 +1201,7 @@ pure func inspect_inference_equality(
 							Ok(IncompatibleResult)
 						VariantConstraint(_, _): Ok(CompleteEquality)
 						RecordFieldConstraint(_, _, _): Ok(CompleteEquality)
+						ListElementConstraint(_, _): Ok(CompleteEquality)
 						ArgumentConstraint(_, _, _, _):
 							error ?= inference_conflict(current, slots)
 							Err(error)
@@ -1207,6 +1220,7 @@ private pure func inference_occurs_error(equality: InferenceEquality, root: Infe
 		ArgumentConstraint(call, _, _, written): Ok(SourceAnnotation(written.span))
 		ResultConstraint(result): Ok(result.expected.site)
 		RecordFieldConstraint(_, expected, _): Ok(SourceAnnotation(expected.span))
+		ListElementConstraint(_, element_span): Ok(SourceAnnotation(element_span))
 		VariantConstraint(contract, position):
 			field ?= contract.fields.get(position).to_result(checker_invariant(span, GenericConstructorContract))
 			Ok(SourceAnnotation(field.span))

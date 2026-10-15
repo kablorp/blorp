@@ -246,3 +246,148 @@ Documentation: +48/-27 across README, LIBRARY_PARITY, ROADMAP and the grammar.
 `probe.brp`/`probe.out` (host semantics), `identity.sh` with
 `identity-baseline2/` and `identity-candidate2/` (post-rebase; the pre-rebase
 pair is retained too), `baseline2/` (pilot, C, frozen library), `smoke/` (generated C of the nine fixtures), `alloc/` and `logs/`.
+
+## List literal (ML part 2)
+
+`[a, b]` and `[]` are a construction, not an update: one fresh root of exactly
+n slots, each element stored once, lowered inline at the site like record
+construction. Base `origin/main` `9d3c35c22` (checkpoint 2a parses
+`ExpressionBase.ListExpression`); the checker's `UnsupportedForm.ListLiteral`
+rejection, its render text and the `unsupported/list_literal.brp` fixture are
+deleted.
+
+### Contract through the phases
+
+- **Checking.** `plan_list_literal` takes E from the expected type when its
+  shape is a List (`ExpectedElementType`), otherwise from the first element
+  (`FirstElementType`); `[]` without a List-shaped expectation is rejected at
+  its brackets. Each later element adds a `ListElementConstraint` equality to
+  the same worklist records and variants use; `validate_list_elements`
+  reports the first disagreeing element at its own span, naming what it had
+  to agree with. The checked form is `ConstructList(elements)` with value type
+  `List[E]`; no second copy of E is stored.
+- **Expected-type routes today:** a function's non-Void return value, a `var`
+  reassignment, call argument positions (including a generic parameter whose
+  hint is `List[T]`, so `append([], 7)` infers `List[Int]`), record literal
+  and update fields, variant payload fields, and later elements of a list
+  literal whose E is already decided (elements enter one at a time under E,
+  so `[[1, 2], [], [3]]` types the inner `[]` as `List[Int]`). Binding
+  initializers synthesize without an expectation, so `x = []` is rejected
+  until annotations arrive (M2); `[[], [3]]` is rejected at the inner `[]`;
+  `repeat([], 2)` is rejected because the hint `T` is not List-shaped; a UFCS
+  receiver `[].get(0)` is accepted with E = `T` and reports the callee's
+  uninferable type parameter.
+- **Specialize/lower/own/verify.** `ConcreteForm.ConstructList`,
+  `ValueOperation.ConstructListValue`, `OwnedValueOperation.ConstructListDefinition`.
+  Ownership reuses the variant-payload rule verbatim: every stored occurrence
+  is an independent acquisition (`[x, x]` acquires `x` twice) and the result
+  is one owned root transferred by the return. The verifier takes E from the
+  definition's `List[E]` and rejects a payload of another type
+  (`list element type does not match its List`); element membership is the
+  existing per-definition List check.
+- **Emission.** Inline C at the site through the part-1 fragments, now
+  parameterized by root name (`list_root_allocation`, `list_slot_store`); the
+  per-layout runtime provides no "from n values" helper and none is added.
+
+### Generated C
+
+`[1, 2, 3]` (`list/literal_int.brp`): the three literals are the stored values.
+
+```c
+struct blorp_l_0_i* const blorp_vl_3=malloc(sizeof *blorp_vl_3+(size_t)3*sizeof *blorp_vl_3->values);if(!blorp_vl_3)abort();
+atomic_init(&blorp_vl_3->references,1);blorp_vl_3->length=0;
+blorp_vl_3->values[0]=blorp_vl_0;blorp_vl_3->length++;
+blorp_vl_3->values[1]=blorp_vl_1;blorp_vl_3->length++;
+blorp_vl_3->values[2]=blorp_vl_2;blorp_vl_3->length++;(void)blorp_vl_3;
+```
+
+`[value, value]` with a managed String parameter: one retain per occurrence
+precedes the construction, and the stores move the acquired owners.
+
+```c
+blorp_string_retain(blorp_vl_0);struct blorp_string* const blorp_owner_0=blorp_vl_0;(void)blorp_owner_0;
+blorp_string_retain(blorp_vl_0);struct blorp_string* const blorp_owner_1=blorp_vl_0;(void)blorp_owner_1;
+struct blorp_l_0_s* const blorp_vl_1=malloc(sizeof *blorp_vl_1+(size_t)2*sizeof *blorp_vl_1->values);if(!blorp_vl_1)abort();
+atomic_init(&blorp_vl_1->references,1);blorp_vl_1->length=0;
+blorp_vl_1->values[0]=blorp_owner_0;blorp_vl_1->length++;
+blorp_vl_1->values[1]=blorp_owner_1;blorp_vl_1->length++;(void)blorp_vl_1;
+```
+
+`[{ x = 1, y = 2 }]` (inline `Point`, `list/literal_points.brp`) stores the
+record value with no ownership operation; `[]` under a `List[Int]` parameter
+(`list/literal_empty.brp`) is `malloc(sizeof *v+(size_t)0*sizeof *v->values)`
+with no stores. Line breaks are added here. `blorp_list_repeat_0_i(` appears
+once in each program, as its definition; no helper is called for a literal.
+
+### Fixtures and ceilings
+
+| Fixture | Exact stdout | Measured | Ceiling |
+| --- | --- | ---: | ---: |
+| `list/literal_int.brp` | `3 1 3` | 14,640 / 68.7M | 16,800 / 81M |
+| `list/literal_entries.brp` | `2 42 42 42` | 17,771 / 76.2M | 20,400 / 90M |
+| `list/literal_points.brp` | `1 2` | 14,826 / 69.2M | 17,000 / 82M |
+| `list/literal_empty.brp` | `0 0 1` | 14,789 / 69.2M | 17,000 / 82M |
+| `list/literal_calls.brp` | `3 7 3` | 16,768 / 73.8M | 19,300 / 87M |
+
+Each stdout value is one line; ceilings carry about 15% allocation and 18%
+instruction headroom. The gate ran with provisional ceilings above these; the
+final ceilings sit above every measurement by that headroom and change no
+compiler behavior. On list-free inputs the pilot's own
+allocations are unchanged by this change: `syntax/continuation.brp` costs
+10,724 with the `9d3c35c22` baseline and 10,716 with the candidate,
+`return/zero.brp` 8,826 and 8,818, `list/entries.brp` 18,300 and 18,309 (the
+rise of those syntax fixtures since part 1 comes from checkpoint 2a on main,
+not from the literal). Size: production `+386/-31` lines in `src`,
+tests `+256/-7` in existing suites plus 299 lines of new
+suite and fixtures, documentation `+139/-7` (this note included).
+
+`list/literal_nested.brp` (`[[1, 2], [], [3]]`, stdout `3 2 0 1`) covers the
+sibling route: measured 17,102 allocations / 81.8M instructions, ceiling 19,700 / 97M.
+
+Rejections: `list/literal_mixed.brp` at `2:18` with
+`list elements must have one type: element 2 is Float, element 1 is Int` /
+`give every element the type Int`; `list/literal_empty_untyped.brp` at `2:14`
+with `cannot infer the element type of an empty list literal` / `give it a
+context with a List type, such as a List parameter, return type or append
+argument`.
+
+### Tests and mutation proofs
+
+Checker (`test_check/test_list_literals.brp`, 10): ordered elements with one
+List type, first-element E without a context, `[]` from a return type and from
+a parameter, an expected E contextualizing a record-literal element, three
+exact mismatch rejections (second element, third element, expected List
+element) and the two empty-literal rejections. Ownership (+2): `[entry, entry]`
+borrows the parameter, acquires two distinct owners into two `OwnedPayload`s
+and transfers one root; `[1, 2]` stores unmanaged payloads. Verifier (+4):
+valid and empty literals, a payload of another type, and element membership.
+Emission (+4): named root fragments, one allocation with a store per element,
+acquired owners stored, an empty root. E2e: five output fixtures and two
+rejections.
+
+Three mutations each fail exactly their oracle: storing borrowed elements
+without acquisition fails the managed-literal ownership test; comparing each
+element with itself fails the three mismatch tests; dropping the last store
+fails the two store-count emission tests. Sources were restored by reversing
+the text edits and compared against a snapshot.
+
+### Identity and gate
+
+Baseline pilots built from `9d3c35c22` and, after the rebase, from
+`e3b74b9b8` (`f1ed47c6b0fbdf3e4618749052729598317c1b5f2f44bd4947f9023892f96599`, generated C `0a012df135f11c8a4762a375ce3f28ea68e1b302be78233dd4a4ed6ed49cec4e`),
+each against its own temp library; candidate from this commit. All
+pre-existing fixtures (364 at `9d3c35c22`, 371 at `e3b74b9b8`; the deleted
+`unsupported/list_literal.brp` excluded) are byte-identical in generated C,
+compile exit/stdout/stderr and native exit/stdout/stderr; the only diff
+headers are the eight new `list/literal_*` fixtures. After the shared
+`store_payloads`/`discharge_payloads` helpers, the candidate's output is also
+byte-identical to the pre-review candidate on every fixture.
+Gate on the rebased commit, `env BLORP_2_INSTRUCTION_CHECK=required make -C blorp_2 test`: exit 0 with no failures; **2,491 unit/runtime/grammar callbacks and 382 e2e cases pass** (log `scratchpad/ml/logs/full-gate-final.log`).
+
+### Follow-ups
+
+- `[make(), make()]` retains and then drops each temporary rather than moving
+  it into the slot, exactly as the variant precedent does for `Pair(make(),
+  make())`; correct, and the move is the later optimisation measured at M8.
+- The ownership and verifier loops for stored payloads are now shared by
+  variants, list literals and records (`store_payloads`, `discharge_payloads`).

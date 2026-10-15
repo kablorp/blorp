@@ -161,7 +161,7 @@ MISSING from `_base` and is an intrinsic type. `main(args: List[String]) -> Int`
 | `==`, `!=`, `<`, `>`, `<=`, `>=`, `-`, `*`, `/`, `%` | trait operators | 0 | none left (the 51 `equal` nodes in the host's Core are derived record equality the host synthesizes, not source text) |
 | `and` / `or` / `not` | language keywords | 134 / 40 / 91 | not library; M2 desugars them to matches on the designated `Bool` |
 | `?=` | language | 668 | not library; M2 |
-| `[a, b, ...]` | list literal | 309 `list_construct` nodes in the host's Core (including empty `[]`) | intrinsic; ML |
+| `[a, b, ...]` | list literal | 309 `list_construct` nodes in the host's Core (including empty `[]`) | exists (ML part 2: one fresh root, n stores) |
 
 ## 1. The intrinsic set this implies for ML and M6
 
@@ -169,7 +169,7 @@ Proposed temp-library declarations (host parameter names kept where the host
 has a plain function; the host's trait-impl methods become plain functions
 under the same name, as the temp `int.brp` already does for `add`):
 
-ML (list construction; `append`, `set` and `concat` landed in part 1):
+ML (list construction; `append`, `set` and `concat` landed in part 1, the literal in part 2):
 
 ```blorp
 -- list.brp
@@ -179,7 +179,7 @@ pure func set[T](values: List[T], index: Int, value: T) -> List[T]:
 	builtin("list.set")
 pure func concat[T](left: List[T], right: List[T]) -> List[T]:
 	builtin("list.concat")
--- plus the list literal `[a, b]` as syntax over the same construction (part 2)
+-- plus the list literal `[a, b]` / `[]`: one fresh root of n stored occurrences
 ```
 
 M6 (representation and machine):

@@ -20,7 +20,7 @@ import:
 	./model:
 		BindingDefinition,
 		BindingId,
-		CheckedForm(UpdateRecord, ConstructRecord, ConstructVariant, LiteralVoid, LiteralInteger, LiteralFloat, LiteralString, ReadBinding, InvokeFunction, ReadRecordField),
+		CheckedForm(UpdateRecord, ConstructRecord, ConstructVariant, ConstructList, LiteralVoid, LiteralInteger, LiteralFloat, LiteralString, ReadBinding, InvokeFunction, ReadRecordField),
 		CheckedRecordField,
 		CheckedRecordUpdate,
 		RetainedRecordField,
@@ -43,15 +43,16 @@ import:
 		call_error,
 		record_error,
 		value_error,
-		UnsupportedForm(ModuleQualifiedName, IntoOpaque, FromOpaque, ListLiteral, RangeValue),
+		UnsupportedForm(ModuleQualifiedName, IntoOpaque, FromOpaque, RangeValue),
 		unsupported_form,
 		method_error,
 		checker_invariant
 	./inference:
-		PendingBase(AcceptedBinding, AcceptedFloat, AcceptedInteger, AcceptedString, AcceptedVoid, PendingConstructRecord, PendingConstructVariant, PendingDirectCall, PendingUpdateRecord),
+		PendingBase(AcceptedBinding, AcceptedFloat, AcceptedInteger, AcceptedString, AcceptedVoid, PendingConstructRecord, PendingConstructVariant, PendingConstructList, PendingDirectCall, PendingUpdateRecord),
+		ListElementSource(ExpectedElementType, FirstElementType),
 		PendingOperation(AcceptedField, PendingInvocation),
 		InferenceType(AcceptedType),
-		ConstraintOrigin(ArgumentConstraint, RecordFieldConstraint, ResultConstraint, VariantConstraint),
+		ConstraintOrigin(ArgumentConstraint, RecordFieldConstraint, ResultConstraint, VariantConstraint, ListElementConstraint),
 		CallResultContext,
 		InferenceReadiness(ClosedInference, DeferredInference),
 		InferenceRelation(CollectArguments, RequireEquality),
@@ -87,7 +88,11 @@ import:
 		validate_complete_arguments
 	./constructors:
 		CallPlacement(ReceiverPlacement, ReturnPlacement),
-		PlannedBase(PlannedCall, PlannedLeaf, PlannedRecord, PlannedUpdate, PlannedVariant),
+		PlannedBase(PlannedCall, PlannedLeaf, PlannedRecord, PlannedUpdate, PlannedVariant, PlannedList),
+		finish_pending_list,
+		list_element_type,
+		plan_list_literal,
+		validate_list_elements,
 		PlannedRecordFields,
 		RecordOccurrence,
 		finish_pending_record,
@@ -245,9 +250,25 @@ private fixed union ExpressionWork:
 	ScheduleRecord(PlannedRecordFields)
 	FinishRecord(PlannedRecordFields, OperandRange)
 	CheckRecord(PlannedRecordFields, List[PendingRecordField])
+	ContinueList(ListProgress)
+	FinishList(ListElementSource, OperandRange, Span, Span)
+	CheckList(ListElementSource, List[PendingValue], Span, Span)
 	SolveConstraint(InferenceEquality)
 	FinishRoot
 	FreezeRoot(PendingValue)
+
+
+-- A list literal's elements entered so far: `position` is the next element to
+-- enter and `start` the operand index of the first, which decides E when no
+-- context supplies one.
+private fixed record ListProgress {
+	source: ListElementSource,
+	elements: List[ValueExpression],
+	position: Int,
+	start: Int,
+	base_span: Span,
+	span: Span
+}
 
 
 private fixed union ResultInferenceState:
@@ -342,7 +363,7 @@ private pure func plan_base(purity: Purity, scope: List[LocalBinding], body: Val
 		QualifiedApplication(_, _): Err(unsupported_form(body.base_span, ModuleQualifiedName))
 		OpaqueWrap(_, _): Err(unsupported_form(body.base_span, IntoOpaque))
 		OpaqueUnwrap(_, _): Err(unsupported_form(body.base_span, FromOpaque))
-		ListExpression(_): Err(unsupported_form(body.base_span, ListLiteral))
+		ListExpression(elements): plan_list_literal(elements, expectation, body.base_span)
 		RangeExpression(_, _): Err(unsupported_form(body.base_span, RangeValue))
 		VoidExpression: Ok(PlannedLeaf(AcceptedVoid, VoidType))
 		StringExpression(value): Ok(PlannedLeaf(AcceptedString(value), StringType))
@@ -558,6 +579,9 @@ private pure func elaborate_value(
 											PlannedCall(contract, arguments, placement, hint):
 												work = push_expression_work(work, work_count, ScheduleCall(contract, arguments, placement, hint))
 												work_count = IntOps.add(work_count, 1)
+											PlannedList(elements, source):
+												work = push_expression_work(work, work_count, ContinueList({ source = source, elements = elements, position = 0, start = operand_count, base_span = written.base_span, span = written.span }))
+												work_count = IntOps.add(work_count, 1)
 					PlanRecordUpdate(fields, span, expression_span):
 						position = IntOps.subtract(operand_count, 1)
 						match expression_operand(operands, position, expression_span):
@@ -644,6 +668,71 @@ private pure func elaborate_value(
 														work_count = IntOps.add(work_count, 1)
 					CheckVariant(contract, values, span):
 						match finish_pending_variant(contract, values, span, slots):
+							Err(error): failure = Some(error)
+							Ok(value):
+								operands = push_operand(operands, operand_count, value)
+								operand_count = IntOps.add(operand_count, 1)
+					-- Elements enter one at a time so that, once E is known, every later
+					-- element is checked under E as its expected type: a nested `[]`
+					-- after a sibling receives its element type from E = List[T].
+					ContinueList(progress):
+						if IntOps.equals(progress.position, progress.elements.length()):
+							work = push_expression_work(work, work_count, FinishList(progress.source, { start = progress.start, count = progress.position }, progress.base_span, progress.span))
+							work_count = IntOps.add(work_count, 1)
+						else:
+							hint_result: Result[Option[InferenceType], CheckError] = match progress.source:
+								ExpectedElementType(element): Ok(Some(element))
+								FirstElementType:
+									if IntOps.equals(progress.position, 0):
+										Ok(None)
+									else:
+										match expression_operand(operands, progress.start, progress.base_span):
+											Err(error): Err(error)
+											Ok(first): Ok(Some(pending_type(first)))
+							match hint_result:
+								Err(error): failure = Some(error)
+								Ok(hint):
+									match progress.elements.get(progress.position):
+										None: failure = Some(checker_invariant(progress.base_span, InvalidInferenceWorklist))
+										Some(element):
+											work = push_expression_work(work, work_count, ContinueList({ progress | position = IntOps.add(progress.position, 1) }))
+											work_count = IntOps.add(work_count, 1)
+											work = push_expression_work(work, work_count, EnterExpression(element, hint))
+											work_count = IntOps.add(work_count, 1)
+					FinishList(source, range, base_span, span):
+						match call_operands(operands, range, base_span):
+							Err(error): failure = Some(error)
+							Ok(values):
+								for position in range.start..operand_count:
+									operands = operands.set(position, None)
+								operand_count = range.start
+								work = push_expression_work(work, work_count, CheckList(source, values, base_span, span))
+								work_count = IntOps.add(work_count, 1)
+								match list_element_type(source, values, base_span):
+									Err(error): failure = Some(error)
+									Ok(element):
+										-- The first element is E itself when no context supplies E.
+										first = match source:
+											ExpectedElementType(_): 0
+											FirstElementType: 1
+										var position = values.length()
+										while IntOps.greater_than(position, first):
+											position = IntOps.subtract(position, 1)
+											match values.get(position):
+												None: failure = Some(checker_invariant(base_span, InvalidInferenceWorklist))
+												Some(actual):
+													settled = match element:
+														AcceptedType(_):
+															match pending_type(actual):
+																AcceptedType(_): True
+																_: False
+														_: False
+													if not settled:
+														equality: InferenceEquality = { expected = element, actual = pending_type(actual), origin = ListElementConstraint(IntOps.add(position, 1), actual.span), relation = CollectArguments, parameter = None }
+														work = push_expression_work(work, work_count, SolveConstraint(equality))
+														work_count = IntOps.add(work_count, 1)
+					CheckList(source, values, base_span, span):
+						match finish_pending_list(source, values, span, base_span, slots):
 							Err(error): failure = Some(error)
 							Ok(value):
 								operands = push_operand(operands, operand_count, value)
@@ -746,6 +835,7 @@ private pure func elaborate_value(
 							ArgumentConstraint(_, _, _, _): void
 							VariantConstraint(_, _): void
 							RecordFieldConstraint(_, _, _): void
+							ListElementConstraint(_, _): void
 
 						if inspect:
 							match record_argument_origin(equality, slots):
@@ -894,6 +984,10 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 			frozen ?= freeze_pending_values(values, slots)
 			valid ?= validate_variant_fields(contract, values, slots)
 			Ok(ConstructVariant(contract.variant, frozen))
+		PendingConstructList(source, values):
+			frozen ?= freeze_pending_values(values, slots)
+			valid ?= validate_list_elements(source, values, slots, value.base_span)
+			Ok(ConstructList(frozen))
 		PendingDirectCall(call, arguments):
 			resolved ?= freeze_pending_call(call, arguments, None, slots)
 			Ok(InvokeFunction(resolved.call, resolved.values))

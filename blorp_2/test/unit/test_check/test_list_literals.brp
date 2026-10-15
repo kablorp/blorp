@@ -1,0 +1,292 @@
+import:
+	../../../src/check/check: checked_functions
+	../../../src/check/errors as Errors
+	../../../src/check/model as Checked
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../input: checked_source, check_failure
+	int as IntOps
+	test: TestSuite
+
+
+private MAIN: String =
+	|func main() -> Int:
+	|    0
+	|
+
+
+-- The first declared function's returned expression.
+private pure func returned_value(source: String) -> Option[Checked.CheckedExpr]:
+	match checked_source(source + MAIN):
+		Err(_): None
+		Ok(program):
+			match checked_functions(program).functions:
+				[function, _]:
+					match function.body:
+						Checked.CheckedValueBody(Checked.ReturnExpression(value)): Some(value)
+						_: None
+				_: None
+
+
+pure func test_literal_elements_are_checked_in_order_with_one_list_type() -> Bool:
+	source: String =
+		|pure func numbers() -> List[Int]:
+		|    [1, 2]
+		|
+	match returned_value(source):
+		None: False
+		Some(value):
+			elements = match value.form:
+				Checked.ConstructList([first, second]):
+					match first.form:
+						Checked.LiteralInteger(1):
+							match second.form:
+								Checked.LiteralInteger(2): True
+								_: False
+						_: False
+				_: False
+			elements and Checked.same_type(value.value_type, Checked.ListType(Checked.IntType))
+
+
+pure func test_first_element_decides_the_type_without_a_context() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    values = ["a", "b"]
+		|    0
+		|
+	match checked_source(source):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[main]:
+					match main.statements:
+						[Checked.InitializeBinding(_, value)]:
+							match value.form:
+								Checked.ConstructList([_, _]): Checked.same_type(value.value_type, Checked.ListType(Checked.StringType))
+								_: False
+						_: False
+				_: False
+
+
+pure func test_empty_literal_takes_its_element_from_the_return_type() -> Bool:
+	source: String =
+		|pure func none() -> List[String]:
+		|    []
+		|
+	match returned_value(source):
+		None: False
+		Some(value):
+			match value.form:
+				Checked.ConstructList([]): Checked.same_type(value.value_type, Checked.ListType(Checked.StringType))
+				_: False
+
+
+pure func test_empty_literal_takes_its_element_from_a_parameter() -> Bool:
+	source: String =
+		|pure func count(values: List[Int]) -> Int:
+		|    0
+		|pure func zero() -> Int:
+		|    count([])
+		|
+	match checked_source(source + MAIN):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[_, zero, _]:
+					match zero.body:
+						Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+							match value.form:
+								Checked.InvokeFunction(_, [argument]):
+									match argument.form:
+										Checked.ConstructList([]): Checked.same_type(argument.value_type, Checked.ListType(Checked.IntType))
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_expected_element_contextualizes_a_record_literal_element() -> Bool:
+	source: String =
+		|fixed record Point { x: Int, y: Int }
+		|pure func points() -> List[Point]:
+		|    [{ x = 1, y = 2 }]
+		|
+	match returned_value(source):
+		None: False
+		Some(value):
+			match value.form:
+				Checked.ConstructList([point]):
+					match point.form:
+						Checked.ConstructRecord(_, [_, _]): True
+						_: False
+				_: False
+
+
+-- `prefix` precedes the offending element; its span is exactly `element`.
+private pure func rejects_element(prefix: String, element: String, suffix: String, position: Int, expected_reference: Errors.ListElementReference, message: String, help: String) -> Bool:
+	source = prefix + element + suffix + MAIN
+	rendered = match checked_source(source):
+		Err(error): error.message == message and error.help == help
+		Ok(_): False
+	match check_failure(source):
+		None: False
+		Some(error):
+			kind = match error.kind:
+				Errors.ValueRejection(Errors.ListElementTypeMismatch(mismatch)):
+					reference = match mismatch.reference:
+						Errors.EarlierElement:
+							match expected_reference:
+								Errors.EarlierElement: True
+								_: False
+						Errors.ExpectedElement:
+							match expected_reference:
+								Errors.ExpectedElement: True
+								_: False
+					IntOps.equals(mismatch.position, position) and reference
+				_: False
+			(
+				kind and same_source(error.span.source, module_source(root_module_id()))
+				and IntOps.equals(error.span.start, prefix.length())
+				and IntOps.equals(error.span.end, IntOps.add(prefix.length(), element.length()))
+				and rendered
+			)
+
+
+pure func test_second_element_must_match_the_first() -> Bool:
+	rejects_element(
+		"pure func mixed() -> Int:\n    values = [1, ", "2.0", "]\n    0\n", 2, Errors.EarlierElement,
+		"list elements must have one type: element 2 is Float, element 1 is Int",
+		"give every element the type Int",
+	)
+
+
+pure func test_third_element_is_reported_at_its_own_position() -> Bool:
+	rejects_element(
+		"pure func mixed() -> Int:\n    values = [\"a\", \"b\", ", "3", "]\n    0\n", 3, Errors.EarlierElement,
+		"list elements must have one type: element 3 is Int, element 1 is String",
+		"give every element the type String",
+	)
+
+
+pure func test_elements_must_match_the_expected_list_element() -> Bool:
+	rejects_element(
+		"pure func numbers() -> List[Int]:\n    [", "1.5", "]\n", 1, Errors.ExpectedElement,
+		"list elements must have one type: element 1 is Float, the expected List holds Int",
+		"give every element the type Int",
+	)
+
+
+pure func test_empty_literal_without_a_list_context_is_rejected_at_its_brackets() -> Bool:
+	prefix = "pure func nothing() -> Int:\n    values = "
+	source = prefix + "[]" + "\n    0\n" + MAIN
+	rendered = match checked_source(source):
+		Err(error):
+			(error.message == "cannot infer the element type of an empty list literal"
+			and error.help == "give it a context with a List type, such as a List parameter, return type or append argument")
+		Ok(_): False
+	match check_failure(source):
+		None: False
+		Some(error):
+			kind = match error.kind:
+				Errors.ValueRejection(Errors.EmptyListNeedsElementType): True
+				_: False
+			(
+				kind and same_source(error.span.source, module_source(root_module_id()))
+				and IntOps.equals(error.span.start, prefix.length())
+				and IntOps.equals(error.span.end, IntOps.add(prefix.length(), 2))
+				and rendered
+			)
+
+
+pure func test_empty_literal_under_a_non_list_expectation_is_rejected() -> Bool:
+	prefix = "pure func nothing() -> Int:\n    "
+	source = prefix + "[]" + "\n" + MAIN
+	match check_failure(source):
+		None: False
+		Some(error):
+			match error.kind:
+				Errors.ValueRejection(Errors.EmptyListNeedsElementType): IntOps.equals(error.span.start, prefix.length())
+				_: False
+
+
+-- Once the first sibling decides E = List[Int], a later `[]` receives Int.
+pure func test_nested_empty_literal_takes_its_element_from_an_earlier_sibling() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    values = [[1, 2], [], [3]]
+		|    0
+		|
+	match checked_source(source):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[main]:
+					match main.statements:
+						[Checked.InitializeBinding(_, value)]:
+							match value.form:
+								Checked.ConstructList([_, empty, _]):
+									match empty.form:
+										Checked.ConstructList([]):
+											(Checked.same_type(empty.value_type, Checked.ListType(Checked.IntType))
+											and Checked.same_type(value.value_type, Checked.ListType(Checked.ListType(Checked.IntType))))
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_nested_empty_literal_before_any_sibling_is_rejected() -> Bool:
+	prefix = "func main() -> Int:\n    values = ["
+	source = prefix + "[]" + ", [3]]\n    0\n"
+	match check_failure(source):
+		None: False
+		Some(error):
+			match error.kind:
+				Errors.ValueRejection(Errors.EmptyListNeedsElementType):
+					IntOps.equals(error.span.start, prefix.length()) and IntOps.equals(error.span.end, IntOps.add(prefix.length(), 2))
+				_: False
+
+
+-- A UFCS receiver has no expected type beyond the callee's `List[T]`, so the
+-- literal is accepted with E = T and the call's parameter stays uninferable.
+pure func test_empty_literal_receiver_reports_the_uninferable_type_parameter() -> Bool:
+	source: String =
+		|fixed union Maybe[T]:
+		|    Present(T)
+		|    Missing
+		|pure func get[T](values: List[T], index: Int) -> Maybe[T]:
+		|    builtin("list.get", Present, Missing)
+		|func main() -> Int:
+		|    first = [].get(0)
+		|    0
+		|
+	rendered = match checked_source(source):
+		Err(error):
+			(error.message == "cannot infer the type parameter from the argument"
+			and error.help == "pass a value whose type determines the declared type parameter; use a concrete helper when no argument can determine it")
+		Ok(_): False
+	match check_failure(source):
+		None: False
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(_): rendered
+				_: False
+
+
+tests: TestSuite = {
+	description = "List literal checking",
+	tests = [
+		("elements are checked in order with one List type", test_literal_elements_are_checked_in_order_with_one_list_type),
+		("first element decides E without a context", test_first_element_decides_the_type_without_a_context),
+		("empty literal takes E from the return type", test_empty_literal_takes_its_element_from_the_return_type),
+		("empty literal takes E from a parameter", test_empty_literal_takes_its_element_from_a_parameter),
+		("expected E contextualizes a record literal element", test_expected_element_contextualizes_a_record_literal_element),
+		("second element must match the first", test_second_element_must_match_the_first),
+		("third element is reported at its position", test_third_element_is_reported_at_its_own_position),
+		("elements must match the expected List element", test_elements_must_match_the_expected_list_element),
+		("empty literal without a List context is rejected", test_empty_literal_without_a_list_context_is_rejected_at_its_brackets),
+		("empty literal under a non-List expectation is rejected", test_empty_literal_under_a_non_list_expectation_is_rejected),
+		("nested empty literal takes E from an earlier sibling", test_nested_empty_literal_takes_its_element_from_an_earlier_sibling),
+		("nested empty literal before any sibling is rejected", test_nested_empty_literal_before_any_sibling_is_rejected),
+		("empty literal receiver reports the uninferable type parameter", test_empty_literal_receiver_reports_the_uninferable_type_parameter),
+	]
+}

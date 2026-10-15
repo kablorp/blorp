@@ -16,8 +16,8 @@ import:
 	../runtime/list:
 		ListElementKey, ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate), arguments_runtime,
 		list_c_type, list_child_key, list_element_key, list_key_depth, list_key_ordinal,
-		list_key_rank, list_runtime, list_suffix, list_update_name, list_update_runtime,
-		same_list_key
+		list_key_rank, list_root_allocation, list_runtime, list_slot_store, list_suffix,
+		list_update_name, list_update_runtime, same_list_key
 	../lower/lower: MatchLabel(VariantLabel, DefaultLabel), ValueId, value_number
 	option: to_result
 	../own/own as Own:
@@ -30,7 +30,7 @@ import:
 		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(
 			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition,
-			StringDefinition, CallDefinition, ConstructDefinition,
+			StringDefinition, CallDefinition, ConstructDefinition, ConstructListDefinition,
 			PayloadDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition,
 		),
 		OwnerId,
@@ -875,6 +875,10 @@ private pure func append_operation(
 					Ok(append_payload_initializer(tagged, id, fields).concat("})"))
 			else:
 				Ok(output.concat(c_variant(id)))
+		ConstructListDefinition(_):
+			-- append_value routes list construction to append_list_construction,
+			-- which writes statements; it never reaches this expression writer.
+			Err(internal_error())
 		PayloadDefinition(field, id):
 			Ok(
 				output
@@ -1063,8 +1067,35 @@ private pure func append_value(
 					append_equals(output, id, roles, arguments, unions, IntegerComparison)
 				_:
 					append_regular_value(output, id, value_type, operation, unions, records)
+		ConstructListDefinition(payloads):
+			append_list_construction(output, id, value_type, payloads, unions)
 		_:
 			append_regular_value(output, id, value_type, operation, unions, records)
+
+
+-- A literal is one fresh root of exactly n slots, written inline at its site
+-- like record construction: the elements' acquisitions precede it, so each
+-- store moves an owner or copies an unmanaged value, publishing length per slot.
+private pure func append_list_construction(
+	output: String,
+	id: ValueId,
+	value_type: TypeRef,
+	payloads: List[StoredPayload],
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	type_name ?= c_type(value_type, unions)
+	name = c_value(id)
+	var result = output.concat(list_root_allocation(
+		type_name.concat(" const"), name, "".append_int(payloads.length()),
+	))
+	var slot = 0
+	for payload in payloads:
+		stored = match payload:
+			UnmanagedPayload(value): c_value(value)
+			OwnedPayload(_, owner): c_owner(owner)
+		result = result.concat(list_slot_store(name, "".append_int(slot), stored))
+		slot = IntOps.add(slot, 1)
+	Ok(result.concat("(void)").concat(name).concat(";"))
 
 
 private fixed union EqualityComparison:

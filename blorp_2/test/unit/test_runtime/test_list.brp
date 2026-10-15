@@ -1,8 +1,8 @@
 import:
 	../../../src/runtime/list:
 		ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate), list_child_key, list_c_type,
-		list_element_key, list_key_depth, list_runtime, list_suffix, list_update_name,
-		list_update_runtime, same_list_key
+		list_element_key, list_key_depth, list_root_allocation, list_runtime, list_slot_store,
+		list_suffix, list_update_name, list_update_runtime, same_list_key
 	../../../src/specialize/specialize as Concrete
 	../../../src/utils/syntax: Diagnostic
 	../compilation: compile
@@ -326,6 +326,67 @@ pure func test_repeat_only_programs_omit_update_helpers() -> Bool:
 			not output.contains("blorp_list_append_") and not output.contains("blorp_list_set_") and not output.contains("blorp_list_concat_")
 
 
+pure func test_root_allocation_and_slot_store_name_their_root() -> Bool:
+	(
+		list_root_allocation("struct blorp_l_0_i* const", "blorp_vl_3", "2")
+			== "struct blorp_l_0_i* const blorp_vl_3=malloc(sizeof *blorp_vl_3+(size_t)2*sizeof *blorp_vl_3->values);if(!blorp_vl_3)abort();atomic_init(&blorp_vl_3->references,1);blorp_vl_3->length=0;"
+		and list_slot_store("blorp_vl_3", "1", "blorp_owner_2") == "blorp_vl_3->values[1]=blorp_owner_2;blorp_vl_3->length++;"
+	)
+
+
+pure func test_literal_is_one_inline_allocation_with_a_store_per_element() -> Bool:
+	source: String =
+		|pure func numbers() -> List[Int]:
+		|    [1, 2, 3]
+		|func main() -> Int:
+		|    values = numbers()
+		|    0
+		|
+	match compile(source):
+		Err(_): False
+		Ok(output):
+			(
+				output.contains("struct blorp_l_0_i* const blorp_vl_3=malloc(sizeof *blorp_vl_3+(size_t)3*sizeof *blorp_vl_3->values);if(!blorp_vl_3)abort();atomic_init(&blorp_vl_3->references,1);blorp_vl_3->length=0;blorp_vl_3->values[0]=blorp_vl_0;blorp_vl_3->length++;blorp_vl_3->values[1]=blorp_vl_1;blorp_vl_3->length++;blorp_vl_3->values[2]=blorp_vl_2;blorp_vl_3->length++;(void)blorp_vl_3;")
+				and IntOps.equals(output.split("blorp_list_repeat_0_i(").length(), 2)
+				and not output.contains("blorp_list_append_")
+			)
+
+
+pure func test_managed_literal_stores_acquired_owners() -> Bool:
+	source: String =
+		|pure func text(value: Int) -> String:
+		|    builtin("int.to_string")
+		|pure func pair(value: String) -> List[String]:
+		|    [value, value]
+		|func main() -> Int:
+		|    values = pair(text(42))
+		|    0
+		|
+	match compile(source):
+		Err(_): False
+		Ok(output):
+			(
+				output.contains("struct blorp_l_0_s* const blorp_vl_1=malloc(sizeof *blorp_vl_1+(size_t)2*sizeof *blorp_vl_1->values);")
+				and output.contains("blorp_vl_1->values[0]=blorp_owner_0;blorp_vl_1->length++;blorp_vl_1->values[1]=blorp_owner_1;blorp_vl_1->length++;(void)blorp_vl_1;")
+				-- One retain precedes each owner: both occurrences of the parameter are acquired.
+				and output.contains("blorp_string_retain(blorp_vl_0);struct blorp_string* const blorp_owner_0=blorp_vl_0;(void)blorp_owner_0;blorp_string_retain(blorp_vl_0);struct blorp_string* const blorp_owner_1=blorp_vl_0;(void)blorp_owner_1;struct blorp_l_0_s* const blorp_vl_1=malloc(")
+			)
+
+
+pure func test_empty_literal_allocates_an_empty_root() -> Bool:
+	source: String =
+		|pure func none() -> List[Int]:
+		|    []
+		|func main() -> Int:
+		|    values = none()
+		|    0
+		|
+	match compile(source):
+		Err(_): False
+		Ok(output):
+			output.contains("struct blorp_l_0_i* const blorp_vl_0=malloc(sizeof *blorp_vl_0+(size_t)0*sizeof *blorp_vl_0->values);if(!blorp_vl_0)abort();atomic_init(&blorp_vl_0->references,1);blorp_vl_0->length=0;(void)blorp_vl_0;")
+
+
 tests: TestSuite = {
 	description = "Blorp 2 concrete List runtime and derived helper keys",
 	tests = [
@@ -351,5 +412,9 @@ tests: TestSuite = {
 		("unmanaged elements copy without ownership operations", test_unmanaged_elements_are_copied_without_ownership_operations),
 		("update helpers exist only where called", test_update_helpers_exist_only_where_their_operation_is_called),
 		("repeat-only programs omit update helpers", test_repeat_only_programs_omit_update_helpers),
+		("root allocation and slot store name their root", test_root_allocation_and_slot_store_name_their_root),
+		("literal is one inline allocation with a store per element", test_literal_is_one_inline_allocation_with_a_store_per_element),
+		("managed literal stores acquired owners", test_managed_literal_stores_acquired_owners),
+		("empty literal allocates an empty root", test_empty_literal_allocates_an_empty_root),
 	]
 }

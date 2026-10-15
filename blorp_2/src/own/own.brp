@@ -12,7 +12,7 @@ import:
 		ValueId,
 		ValueOperation(
 			ParameterValue, VoidValue, IntegerValue, FloatValue, StringValue,
-			CallValue, ConstructValue, PayloadValue, ConstructRecordValue, ReadRecordFieldValue,
+			CallValue, ConstructValue, ConstructListValue, PayloadValue, ConstructRecordValue, ReadRecordFieldValue,
 		),
 		lowered_functions,
 		value_number,
@@ -95,6 +95,7 @@ fixed union OwnedValueOperation:
 	StringDefinition(String)
 	CallDefinition(ConcreteCall, List[OwnedArgument])
 	ConstructDefinition(VariantInstanceId, List[StoredPayload])
+	ConstructListDefinition(List[StoredPayload])
 	PayloadDefinition(VariantFieldInstanceId, ValueId)
 
 
@@ -205,6 +206,8 @@ private pure func use_operands(operation: ValueOperation) -> List[ValueId]:
 			arguments
 		ConstructValue(_, arguments):
 			arguments
+		ConstructListValue(elements):
+			elements
 		PayloadValue(_, value):
 			[value]
 		ParameterValue(_):
@@ -414,6 +417,45 @@ private pure func arguments(
 	)
 
 
+-- Stored payloads of a variant or a list literal. Each stored occurrence
+-- acquires independently, including Pair(x, x) and [x, x]: a unary last-use
+-- transfer cannot safely generalize to repeated values.
+private fixed record StoredPayloads {
+	stored: List[StoredPayload],
+	acquisitions: List[ChildAcquisition],
+	next: Int
+}
+
+
+private pure func store_payloads(
+	values: List[ValueId],
+	sources: List[ResultOwnership],
+	prefix: List[ResultOwnership],
+	first_value: Int,
+	span: Span,
+	acquisitions: List[ChildAcquisition],
+	next_owner: Int,
+) -> Result[StoredPayloads, Diagnostic]:
+	var stored: List[StoredPayload] = []
+	var acquired = acquisitions
+	var next = next_owner
+	var failure: Option[Diagnostic] = None
+	for value in values:
+		match arguments(value, sources, prefix, first_value, span):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(UnmanagedArgument(value)): stored = stored.append(UnmanagedPayload(value))
+			Ok(BorrowedArgument(borrow)):
+				child_owner = owner_id(next)
+				next = IntOps.add(next, 1)
+				acquired = acquired.append({ owner = child_owner, borrow = borrow })
+				stored = stored.append(OwnedPayload(value, child_owner))
+	match failure:
+		Some(error): Err(error)
+		None: Ok({ stored = stored, acquisitions = acquired, next = next })
+
+
 private pure func build_definition(
 	definition: ValueDefinition,
 	sources: List[ResultOwnership],
@@ -480,24 +522,19 @@ private pure func build_definition(
 		FloatValue(value):
 			Ok(FloatDefinition(value))
 		ConstructValue(id, values):
-			-- Each stored occurrence acquires independently, including Pair(x, x).
-			-- A unary last-use transfer cannot safely generalize to repeated values.
-			var stored: List[StoredPayload] = []
-			var failure: Option[Diagnostic] = None
-			for value in values:
-				match arguments(value, sources, prefix, first_value, definition.span):
-					Err(error):
-						failure = Some(error)
-						break
-					Ok(UnmanagedArgument(value)): stored = stored.append(UnmanagedPayload(value))
-					Ok(BorrowedArgument(borrow)):
-						child_owner = owner_id(next)
-						next = IntOps.add(next, 1)
-						acquisitions = acquisitions.append({ owner = child_owner, borrow = borrow })
-						stored = stored.append(OwnedPayload(value, child_owner))
-			match failure:
-				Some(error): Err(error)
-				None: Ok(ConstructDefinition(id, stored))
+			match store_payloads(values, sources, prefix, first_value, definition.span, acquisitions, next):
+				Err(error): Err(error)
+				Ok(payloads):
+					acquisitions = payloads.acquisitions
+					next = payloads.next
+					Ok(ConstructDefinition(id, payloads.stored))
+		ConstructListValue(values):
+			match store_payloads(values, sources, prefix, first_value, definition.span, acquisitions, next):
+				Err(error): Err(error)
+				Ok(payloads):
+					acquisitions = payloads.acquisitions
+					next = payloads.next
+					Ok(ConstructListDefinition(payloads.stored))
 		PayloadValue(variant, value):
 			Ok(PayloadDefinition(variant, value))
 		CallValue(call, written):
@@ -537,7 +574,7 @@ private pure func build_definition(
 							borrow.value
 
 					Ok(BorrowedResult(PayloadBorrow(parent)))
-				StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | ConstructRecordDefinition(_, _):
+				StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | ConstructListDefinition(_) | ConstructRecordDefinition(_, _):
 					Ok(OwnedResult(owner_id(next)))
 				_:
 					Err(internal_error(definition.span, "unsupported managed value operation"))
