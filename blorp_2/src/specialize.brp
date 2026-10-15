@@ -522,6 +522,52 @@ private pure func translate_field(
 	Ok(into_opaque FieldInstanceId({ owner = owner, position = Checked.field_number(field) }))
 
 
+-- The prepared instance of a record declaration at these checked type arguments.
+private pure func concrete_record(
+	declaration: Declaration.RecordId,
+	arguments: List[Checked.TypeRef],
+	substitution: List[TypeSubstitution],
+	unions: List[UnionInstance],
+	span: Span,
+	records: List[RecordInstance],
+) -> Result[RecordInstanceId, Diagnostic]:
+	concrete ?= translated_list(
+		arguments,
+		pure func(
+			value: Checked.TypeRef,
+		): concrete_type(value, substitution, unions, span, records),
+	)
+	lookup_record_instance(declaration, concrete, records, span)
+
+
+-- The prepared instance for a declaration at concrete type arguments.
+private pure func lookup_record_instance(
+	declaration: Declaration.RecordId,
+	arguments: List[TypeRef],
+	records: List[RecordInstance],
+	span: Span,
+) -> Result[RecordInstanceId, Diagnostic]:
+	find_record_instance(records, { declaration = declaration, arguments = arguments }).to_result(invalid(span, "unprepared record instance"))
+
+
+-- A record construction's instance: the declaration its form names, at the type
+-- arguments of its checked type, which checking derived from that declaration.
+private pure func record_instance(
+	declaration: Declaration.RecordId,
+	value: Checked.CheckedExpr,
+	substitution: List[TypeSubstitution],
+	unions: List[UnionInstance],
+	records: List[RecordInstance],
+) -> Result[RecordInstanceId, Diagnostic]:
+	match value.value_type:
+		Checked.RecordType(_):
+			lookup_record_instance(declaration, [], records, value.span)
+		Checked.AppliedRecordType(_, arguments):
+			concrete_record(declaration, arguments, substitution, unions, value.span, records)
+		_:
+			Err(invalid(value.span, "record construction has a non-record type"))
+
+
 private pure func concrete_type(
 	value_type: Checked.TypeRef,
 	substitution: List[TypeSubstitution],
@@ -531,9 +577,9 @@ private pure func concrete_type(
 ) -> Result[TypeRef, Diagnostic]:
 	match value_type:
 		Checked.RecordType(id):
-			find_record_instance(records, { declaration = id, arguments = [] })
-				.map(pure func(owner): RecordType(owner))
-				.to_result(invalid(span, "unprepared record instance"))
+			-- A non-generic record has no arguments to translate.
+			owner ?= lookup_record_instance(id, [], records, span)
+			Ok(RecordType(owner))
 		Checked.VoidType:
 			Ok(VoidType)
 		Checked.IntType:
@@ -546,20 +592,8 @@ private pure func concrete_type(
 			concrete ?= concrete_type(element, substitution, unions, span, records)
 			Ok(ListType(concrete))
 		Checked.AppliedRecordType(id, arguments):
-			arguments ?= translated_list(
-				arguments,
-				pure func(
-					value: Checked.TypeRef,
-				): concrete_type(value, substitution, unions, span, records),
-			)
-			id ?= find_record_instance(
-				records,
-				{
-					declaration = id,
-					arguments = arguments
-				},
-			).to_result(invalid(span, "unprepared generic record instance"))
-			Ok(RecordType(id))
+			owner ?= concrete_record(id, arguments, substitution, unions, span, records)
+			Ok(RecordType(owner))
 		Checked.AppliedUnionType(id, arguments):
 			arguments ?= translated_list(
 				arguments,
@@ -1553,7 +1587,10 @@ private pure func translate_expr(
 	match value.form:
 		Checked.ReadRecordField(receiver, field):
 			source ?= translate_expr(receiver, substitution, keys, unions, records)
-			owner ?= concrete_record_owner(source.value_type, value.span)
+			-- The receiver's translated type already names its record instance.
+			owner ?= match source.value_type:
+				RecordType(owner): Ok(owner)
+				_: Err(invalid(value.span, "record operation has a non-record receiver"))
 			-- The prepared receiver row already owns this exact concrete field type.
 			value_type ?= concrete_record_field_type(field, owner, records, value.span)
 			translated_field = into_opaque FieldInstanceId({ owner = owner, position = Checked.field_number(field) })
@@ -1563,9 +1600,8 @@ private pure func translate_expr(
 			concrete ?= translate_call(call, substitution, keys, unions, records, value_type)
 			values ?= translate_exprs(arguments, substitution, keys, unions, records)
 			Ok({ form = InvokeFunction(concrete, values), value_type = value_type, span = value.span })
-		Checked.UpdateRecord(_, update):
-			record_type ?= concrete_type(value.value_type, substitution, unions, value.span, records)
-			owner ?= concrete_record_owner(record_type, value.span)
+		Checked.UpdateRecord(declaration, update):
+			owner ?= record_instance(declaration, value, substitution, unions, records)
 			base ?= translate_expr(update.base, substitution, keys, unions, records)
 			replacements ?= translated_list(update.replacements, pure func(field: Checked.CheckedRecordField) -> Result[ConcreteRecordField, Diagnostic]:
 				id ?= translate_field(field.field, owner, records, field.span)
@@ -1578,16 +1614,15 @@ private pure func translate_expr(
 				Ok({ field = id, value_type = value_type })
 			)
 			form = UpdateRecord(owner, { base = base, base_expression_span = update.base_expression_span, replacements = replacements, inherited = inherited })
-			Ok({ form = form, value_type = record_type, span = value.span })
+			Ok({ form = form, value_type = RecordType(owner), span = value.span })
 		Checked.ConstructVariant(id, children):
 			value_type ?= concrete_type(value.value_type, substitution, unions, value.span, records)
 			owner ?= concrete_union_owner(value_type, value.span)
 			variant ?= translate_variant(id, owner, unions, value.span)
 			values ?= translate_exprs(children, substitution, keys, unions, records)
 			Ok({ form = ConstructVariant(variant, values), value_type = value_type, span = value.span })
-		Checked.ConstructRecord(_, fields):
-			value_type ?= concrete_type(value.value_type, substitution, unions, value.span, records)
-			owner ?= concrete_record_owner(value_type, value.span)
+		Checked.ConstructRecord(declaration, fields):
+			owner ?= record_instance(declaration, value, substitution, unions, records)
 			concrete ?= translated_list(fields, pure func(
 				field: Checked.CheckedRecordField,
 			) -> Result[ConcreteRecordField, Diagnostic]:
@@ -1599,7 +1634,7 @@ private pure func translate_expr(
 					span = field.span,
 				})
 			)
-			Ok({ form = ConstructRecord(owner, concrete), value_type = value_type, span = value.span })
+			Ok({ form = ConstructRecord(owner, concrete), value_type = RecordType(owner), span = value.span })
 		Checked.LiteralVoid:
 			translate_leaf(LiteralVoid, value, substitution, unions, records)
 		Checked.LiteralString(text):
@@ -1647,12 +1682,6 @@ private pure func translate_exprs(
 			Err(error)
 		None:
 			Ok(translated)
-
-
-private pure func concrete_record_owner(value: TypeRef, span: Span) -> Result[RecordInstanceId, Diagnostic]:
-	match value:
-		RecordType(owner): Ok(owner)
-		_: Err(invalid(span, "record operation has a non-record receiver"))
 
 
 private pure func translate_statements(

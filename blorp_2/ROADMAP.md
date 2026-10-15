@@ -704,10 +704,10 @@ records. No uniqueness test, COW/reuse branch, or new runtime operation.
    types/FieldIds once to the same concrete record instance. Include their
    children in all existing preparation and call/recursion traversals.
 4. Lower the base once; lower all replacement RHSs in written order; project
-   inherited fields in declaration order. Populate a uniquely owned local
-   ordinal-slot builder and freeze one declaration-ordered `RecordFieldValue`
-   vector into existing `ConstructRecordValue`. No growing block prefix crosses
-   an additional helper boundary. No field spelling or type lookup occurs here.
+   inherited fields in declaration order. Append the replacement values, then
+   the inherited reads, into one `RecordFieldValue` vector for the existing
+   `ConstructRecordValue`. Emission names each field, so storage order is
+   evaluation order. No field spelling or type lookup occurs here.
 5. Existing ownership insertion, independent verification and emission consume
    those ordinary operations without a new update opcode or semantic authority.
 
@@ -761,7 +761,8 @@ phantom arguments remain part of nominal instance identity. Projected omitted
 fields and update-base errors use that full base-expression span because omitted
 fields have no written names. Existing child node spans remain unchanged.
 
-Current lowering (`lower.brp:214–248`) evaluates literal fields then emits:
+Current lowering (`lower_record_fields`, `lower.brp:228–255`) evaluates written
+fields; the construction arm then emits:
 
 ```blorp
 Ok(define_value(current, ConstructRecordValue(owner, values), value_type, span))
@@ -771,39 +772,30 @@ The update consumer reuses this final operation; its algorithm is:
 
 ```text
 base = lower_value(builder, bindings, update.base)       // exactly once
-slots = local Option[RecordFieldValue] storage, one slot per declared field
-for replacement in update.replacements:                // written order
-    child = lower_value(current, bindings, replacement.value)
-    slots[field_number(replacement.field)] = { field, child.value }
-ordered = local List[RecordFieldValue]
-next_inherited = 0
-for slot in slots:                                     // declaration order
-    match slot:
-        Some(field): ordered.append(field)
-        None:
-            retained = update.inherited[next_inherited]
-            child = define_value(current,
-                ReadRecordFieldValue(retained.field, base.value),
-                retained.value_type, update.base_expression_span)
-            ordered.append({ retained.field, child.value })
-            next_inherited += 1
-define_value(current, ConstructRecordValue(owner, ordered), result_type, span)
+fields = lowered replacements                          // written order
+for retained in update.inherited:                      // declaration order
+    child = define_value(current,
+        ReadRecordFieldValue(retained.field, base.value),
+        retained.value_type, update.base_expression_span)
+    fields.append({ retained.field, child.value })
+define_value(current, ConstructRecordValue(owner, fields), result_type, span)
 ```
 
-The table stores only replacements. Completing its empty slots consumes the
-already declaration-ordered inherited rows and publishes complete fields once.
-This avoids a redundant inherited-field table write: the first implementation's
-host-generated setter retained the old table across each such write, forcing a
-full COW copy. Mutations consume uniquely owned roots; the completed replacement
-table is read-only during its completion walk.
+Checking guarantees that `replacements` and `inherited` partition the record's
+declared fields, so lowering needs no ordinal table and no completeness check.
+Own, verify and emit identify each stored value by its FieldInstanceId; emission
+writes designated initializers, so the field vector's order is not a layout.
+Ownership insertion acquires stored children and numbers their owners in the
+field vector's order, so for an update that order is the replacements as
+written, then the inherited fields; behaviour does not depend on it
+(`record/update/managed_reorder.brp` covers two managed fields out of order).
 
 The sketch describes local construction, not a new public freeze API or helper
-framework. Carry the full existing FieldInstanceId in each local slot; never
-manufacture it from an ordinal. A missing required inherited row is an internal
-compiler error, never silently skipped or defaulted. Publication preserves all ValueIds/types,
+framework. Carry the full existing FieldInstanceId in each field value; never
+manufacture it from an ordinal. Publication preserves all ValueIds/types,
 exact base/RHS/projection spans, and the function's existing allocator.
 Lowering a call base once produces its normal argument definitions and one call
-definition. A binding base reuses its existing ValueId (`lower.brp:263–275`),
+definition. A binding base reuses its existing ValueId (`lower_value`, `lower.brp:296–298`),
 without an extra alias definition; pin both cases independently.
 
 Current `own.brp:434–464` acquires a stored child obligation for **every** owning

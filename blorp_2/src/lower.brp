@@ -26,7 +26,6 @@ import:
 		FunctionInstanceId,
 		FunctionSignature,
 		RecordInstanceId,
-		field_number,
 		SpecializedProgram,
 		TypeRef(IntType, RecordType),
 		UnionInstanceId,
@@ -218,14 +217,19 @@ private pure func lower_arguments(
 			})
 
 
-private pure func lower_record(
+private fixed record BuiltFields {
+	builder: ExpressionBuilder,
+	values: List[RecordFieldValue]
+}
+
+
+-- Written fields in written order. Emission names each field, so the order of
+-- a record's field values is evaluation order, not declaration order.
+private pure func lower_record_fields(
 	builder: ExpressionBuilder,
 	bindings: List[Option[ValueId]],
 	fields: List[ConcreteRecordField],
-	owner: RecordInstanceId,
-	value_type: TypeRef,
-	span: Span,
-) -> Result[BuiltValue, Diagnostic]:
+) -> Result[BuiltFields, Diagnostic]:
 	var current = builder
 	var values: List[RecordFieldValue] = []
 	var failure: Option[Diagnostic] = None
@@ -246,13 +250,14 @@ private pure func lower_record(
 		Some(error):
 			Err(error)
 		None:
-			Ok(define_value(current, ConstructRecordValue(owner, values), value_type, span))
+			Ok({
+				builder = current,
+				values = values,
+			})
 
 
-private pure func invalid_update(span: Span) -> Diagnostic:
-	{ span = span, note = None, message = "internal compiler error: incomplete record update field plan", help = "report this compiler error with the input program" }
-
-
+-- The base, then the replacements in written order, then reads of the
+-- inherited fields; the checker guarantees the two lists partition the fields.
 private pure func lower_record_update(
 	builder: ExpressionBuilder,
 	bindings: List[Option[ValueId]],
@@ -262,42 +267,15 @@ private pure func lower_record_update(
 	span: Span,
 ) -> Result[BuiltValue, Diagnostic]:
 	base ?= lower_value(builder, bindings, update.base)
-	var current = base.builder
-	var slots: List[Option[RecordFieldValue]] = []
-	for _ in 0..IntOps.add(update.replacements.length(), update.inherited.length()):
-		slots = slots.append(None)
-	var failure: Option[Diagnostic] = None
-	for field in update.replacements:
-		match lower_value(current, bindings, field.value):
-			Err(error):
-				failure = Some(error)
-				break
-			Ok(child):
-				current = child.builder
-				slots = slots.set(field_number(field.field), Some({ field = field.field, value = child.value }))
-	ready ?= match failure:
-		Some(error): Err(error)
-		None: Ok(void)
-	var fields: List[RecordFieldValue] = []
-	var inherited_position = 0
-	-- Replacement slots are complete. Inherited rows already have declaration
-	-- order, so project and append them without another ordinal-table write.
-	for slot in slots:
-		match slot:
-			Some(field): fields = fields.append(field)
-			None:
-				match update.inherited.get(inherited_position):
-					None:
-						failure = Some(invalid_update(span))
-						break
-					Some(field):
-						child = define_value(current, ReadRecordFieldValue(field.field, base.value), field.value_type, update.base_expression_span)
-						current = child.builder
-						fields = fields.append({ field = field.field, value = child.value })
-						inherited_position = IntOps.add(inherited_position, 1)
-	complete ?= match failure:
-		Some(error): Err(error)
-		None: Ok(void)
+	replaced ?= lower_record_fields(base.builder, bindings, update.replacements)
+	var current = replaced.builder
+	var fields = replaced.values
+
+	for field in update.inherited:
+		read = define_value(current, ReadRecordFieldValue(field.field, base.value), field.value_type, update.base_expression_span)
+		current = read.builder
+		fields = fields.append({ field = field.field, value = read.value })
+
 	Ok(define_value(current, ConstructRecordValue(owner, fields), value_type, span))
 
 
@@ -322,7 +300,8 @@ private pure func lower_value(
 			children ?= lower_arguments(builder, bindings, values)
 			Ok(define_value(children.builder, ConstructValue(variant, children.values), value.value_type, value.span))
 		ConstructRecord(owner, fields):
-			lower_record(builder, bindings, fields, owner, value.value_type, value.span)
+			built ?= lower_record_fields(builder, bindings, fields)
+			Ok(define_value(built.builder, ConstructRecordValue(owner, built.values), value.value_type, value.span))
 		UpdateRecord(owner, update):
 			lower_record_update(builder, bindings, update, owner, value.value_type, value.span)
 		InvokeFunction(call, arguments):
