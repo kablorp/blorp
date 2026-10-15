@@ -13,15 +13,16 @@ import:
 	./check_model:
 		CallTarget(RuntimeFunction, UserFunction),
 		CheckedArm,
-		CheckedBase(ReturnCall, ReturnRecord, ReturnRecordUpdate, ReturnConstructedVariant),
 		CheckedBody(CheckedMatchBody, CheckedValueBody),
 		CheckedCall,
 		CheckedExit(RecurWith, ReturnExpression),
+		CheckedExpr,
+		CheckedForm(
+			ConstructRecord, ConstructVariant, InvokeFunction, LiteralFloat, LiteralInteger, LiteralString,
+			LiteralVoid, ReadBinding, ReadRecordField, UpdateRecord,
+		),
 		CheckedFunction,
-		CheckedOperation(InvokeFunction),
-		CheckedRecordField,
 		CheckedStatement(DiscardExpression, InitializeBinding, ReassignBinding),
-		CheckedValue,
 		TypeParameterId,
 		TypeParameterOwner(FunctionDeclaration),
 		TypeRef(AppliedUnionType, AppliedRecordType, ListType, ParameterType),
@@ -44,7 +45,7 @@ private pure func is_self_call(call: CheckedCall, current: FunctionId) -> Bool:
 
 -- The first direct self call among evaluated values, in evaluation order.
 -- These checks traverse evaluated children, never recovering identity from names.
-private pure func first_self_call(values: List[CheckedValue], current: FunctionId) -> Option[Span]:
+private pure func first_self_call(values: List[CheckedExpr], current: FunctionId) -> Option[Span]:
 	var found: Option[Span] = None
 
 	for value in values:
@@ -56,47 +57,43 @@ private pure func first_self_call(values: List[CheckedValue], current: FunctionI
 	found
 
 
-private pure func self_call_in(value: CheckedValue, current: FunctionId) -> Option[Span]:
-	var found = match value.base:
-		ReturnCall(call, arguments):
-			if is_self_call(call, current):
-				Some(value.base_span)
-			else:
-				first_self_call(arguments, current)
-		ReturnConstructedVariant(_, fields):
+-- A node's children are evaluated before the node, so a call's arguments,
+-- receiver first, are searched before the call itself.
+private pure func self_call_in(value: CheckedExpr, current: FunctionId) -> Option[Span]:
+	match value.form:
+		InvokeFunction(call, arguments):
+			match first_self_call(arguments, current):
+				Some(span):
+					Some(span)
+				None:
+					if is_self_call(call, current):
+						Some(value.span)
+					else:
+						None
+		ConstructVariant(_, fields):
 			first_self_call(fields, current)
-		ReturnRecord(_, fields):
-			first_self_call(
-				fields.map(pure func(field: CheckedRecordField) -> CheckedValue: field.value),
-				current,
-			)
-		ReturnRecordUpdate(update):
-			var first = self_call_in(update.base, current)
+		ConstructRecord(_, fields):
+			var found: Option[Span] = None
+			for field in fields:
+				if found.is_some():
+					break
+				found = self_call_in(field.value, current)
+			found
+		UpdateRecord(_, update):
+			var found = self_call_in(update.base, current)
 			for field in update.replacements:
-				if first.is_none():
-					first = self_call_in(field.value, current)
-			first
-		_:
+				if found.is_some():
+					break
+				found = self_call_in(field.value, current)
+			found
+		ReadRecordField(receiver, _):
+			self_call_in(receiver, current)
+		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_):
 			None
-
-	for step in value.operations:
-		if found.is_some():
-			break
-
-		match step.operation:
-			InvokeFunction(call, arguments):
-				found = if is_self_call(call, current):
-					Some(step.span)
-				else:
-					first_self_call(arguments, current)
-			_:
-				void
-
-	found
 
 
 private pure func reject_self_calls(
-	values: List[CheckedValue],
+	values: List[CheckedExpr],
 	current: FunctionId,
 ) -> Result[Void, CheckError]:
 	match first_self_call(values, current):
@@ -106,8 +103,8 @@ private pure func reject_self_calls(
 			Ok(void)
 
 
-private pure func statement_values(statements: List[CheckedStatement]) -> List[CheckedValue]:
-	statements.map(pure func(statement: CheckedStatement) -> CheckedValue:
+private pure func statement_values(statements: List[CheckedStatement]) -> List[CheckedExpr]:
+	statements.map(pure func(statement: CheckedStatement) -> CheckedExpr:
 		match statement:
 			InitializeBinding(_, value):
 				value
@@ -118,43 +115,26 @@ private pure func statement_values(statements: List[CheckedStatement]) -> List[C
 	)
 
 
--- A returned value's final call when it is a direct self call: its last
--- operation, or its call base when it has no operations.
+-- A returned value that is a direct self call; its receiver, if written as one,
+-- is already the first argument.
 private fixed record TailCall {
-	arguments: List[CheckedValue],
+	arguments: List[CheckedExpr],
 	span: Span
 }
 
 
-private pure func tail_call(value: CheckedValue, current: FunctionId) -> Option[TailCall]:
-	last = IntOps.subtract(value.operations.length(), 1)
-
-	match value.operations.get(last):
-		Some(step):
-			match step.operation:
-				InvokeFunction(call, arguments):
-					if is_self_call(call, current):
-						receiver = { value | operations = value.operations.take(last) }
-						Some({
-							arguments = [receiver].concat(arguments),
-							span = step.span,
-						})
-					else:
-						None
-				_:
-					None
-		None:
-			match value.base:
-				ReturnCall(call, arguments):
-					if is_self_call(call, current):
-						Some({
-							arguments = arguments,
-							span = value.base_span,
-						})
-					else:
-						None
-				_:
-					None
+private pure func tail_call(value: CheckedExpr, current: FunctionId) -> Option[TailCall]:
+	match value.form:
+		InvokeFunction(call, arguments):
+			if is_self_call(call, current):
+				Some({
+					arguments = arguments,
+					span = value.span,
+				})
+			else:
+				None
+		_:
+			None
 
 
 private pure func tail_exit(

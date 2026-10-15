@@ -23,14 +23,14 @@ import:
 		BindingOrigin(BodyLocal, MatchCapture, ParameterBinding),
 		CallTarget(RuntimeFunction),
 		CheckedArm,
-		CheckedBase(ReturnBinding, ReturnCall, ReturnVoid),
 		CheckedBody(CheckedMatchBody, CheckedValueBody),
 		CheckedExit(RecurWith, ReturnExpression),
+		CheckedExpr,
+		CheckedForm(InvokeFunction, LiteralVoid, ReadBinding),
 		CheckedFunction,
 		CheckedMatch,
 		CheckedPattern(BindingCase, VariantCase, WildcardCase),
 		CheckedStatement(DiscardExpression, InitializeBinding, ReassignBinding),
-		CheckedValue,
 		TypeRef(VoidType),
 		TypeUse,
 		UnionOccurrence,
@@ -44,7 +44,6 @@ import:
 	./check_types: CheckedDeclarations, previous_declaration
 	./check_values:
 		LocalBinding,
-		ResolvedValue,
 		VariantContract,
 		binding_site,
 		check_value,
@@ -294,7 +293,7 @@ private pure func resolve_match(
 	if resolved.remaining.is_empty():
 		Ok({
 			body = {
-				scrutinee = scrutinee.value,
+				scrutinee = scrutinee,
 				union_type = scrutinee.value_type,
 				arms = resolved.arms
 			},
@@ -351,7 +350,7 @@ private pure func resolve_arms(
 					arms = progress.arms.append({
 						pattern = pattern.pattern,
 						statements = prefix.statements,
-						body = ReturnExpression(value.value),
+						body = ReturnExpression(value),
 					}),
 					remaining = remaining,
 					bindings = prefix.bindings
@@ -443,7 +442,7 @@ private pure func resolve_statements(
 				resolve_statements(
 					written,
 					{ block |
-						statements = block.statements.append(DiscardExpression(value.value))
+						statements = block.statements.append(DiscardExpression(value))
 					},
 					block_start,
 					context,
@@ -501,7 +500,7 @@ private pure func resolve_assignment(
 			)
 			Ok(
 				{ block |
-					statements = block.statements.append(ReassignBinding(binding.id, value.value))
+					statements = block.statements.append(ReassignBinding(binding.id, value))
 				},
 			)
 		None:
@@ -529,7 +528,7 @@ private pure func resolve_assignment(
 						definition = definition
 					},
 				].concat(block.scope),
-				statements = block.statements.append(InitializeBinding(id, value.value)),
+				statements = block.statements.append(InitializeBinding(id, value)),
 			})
 
 
@@ -540,7 +539,7 @@ private pure func resolve_return_value(
 	written: ValueExpression,
 	return_type: TypeUse,
 	context: ResolutionContext,
-) -> Result[ResolvedValue, CheckError]:
+) -> Result[CheckedExpr, CheckError]:
 	if same_type(return_type.value_type, VoidType):
 		synthesize_value(scope, written, None, context)
 	else:
@@ -575,28 +574,26 @@ private pure func resolve_body(
 	match accepted.body:
 		BuiltinBody(operation, span):
 			-- Read the scope's actual binding identities, as ordinary parameter uses do.
-			arguments = initial.map(pure func(binding: LocalBinding) -> CheckedValue:
+			arguments = initial.map(pure func(binding: LocalBinding) -> CheckedExpr:
 				{
-					base = ReturnBinding(binding.id),
-					base_type = binding.definition.value_type,
-					base_span = binding.definition.span,
-					operations = []
+					form = ReadBinding(binding.id),
+					value_type = binding.definition.value_type,
+					span = binding.definition.span
 				}
 			)
 			Ok({
 				bindings = prefix.bindings,
 				statements = prefix.statements,
 				body = CheckedValueBody(ReturnExpression({
-					base = ReturnCall(
+					form = InvokeFunction(
 						{
 							target = RuntimeFunction(operation),
 							span = span
 						},
 						arguments,
 					),
-					base_type = signature.return_type.value_type,
-					base_span = span,
-					operations = [],
+					value_type = signature.return_type.value_type,
+					span = span,
 				})),
 			})
 		ValueBody(body):
@@ -604,7 +601,7 @@ private pure func resolve_body(
 			Ok({
 				bindings = prefix.bindings,
 				statements = prefix.statements,
-				body = CheckedValueBody(ReturnExpression(value.value)),
+				body = CheckedValueBody(ReturnExpression(value)),
 			})
 		MatchBody(body):
 			matched ?= resolve_match(
@@ -699,27 +696,21 @@ private pure func normalize_void_exit(
 				exit = exit
 			}
 		ReturnExpression(value):
-			canonical = match value.base:
-				ReturnVoid:
-					value.operations.is_empty()
+			match value.form:
+				LiteralVoid:
+					{
+						statements = statements,
+						exit = exit
+					}
 				_:
-					False
-
-			if canonical:
-				{
-					statements = statements,
-					exit = exit
-				}
-			else:
-				{
-					statements = statements.append(DiscardExpression(value)),
-					exit = ReturnExpression({
-						base = ReturnVoid,
-						base_type = VoidType,
-						base_span = value.base_span,
-						operations = [],
-					})
-				}
+					{
+						statements = statements.append(DiscardExpression(value)),
+						exit = ReturnExpression({
+							form = LiteralVoid,
+							value_type = VoidType,
+							span = value.span,
+						})
+					}
 
 
 -- A Void body's tails return canonical void after discarding their values.

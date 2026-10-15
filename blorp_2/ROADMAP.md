@@ -713,42 +713,43 @@ records. No uniqueness test, COW/reuse branch, or new runtime operation.
 
 #### Code and fact ownership
 
-Current checked construction (`check_model.brp:159–180`) is:
+Checked construction is one expression node, `CheckedExpr { form, value_type,
+span }`, whose `CheckedForm` includes:
 
 ```blorp
-fixed record CheckedRecordField { field: FieldId, value: CheckedValue, span: Span }
-fixed union CheckedBase:
-    ReturnRecord(RecordId, List[CheckedRecordField])
-    -- other existing alternatives
+fixed record CheckedRecordField { field: FieldId, value: CheckedExpr, span: Span }
+fixed union CheckedForm:
+    ConstructRecord(RecordId, List[CheckedRecordField])
+    UpdateRecord(RecordId, CheckedRecordUpdate)
+    -- other existing forms
 ```
 
-Add the smallest complete update product alongside it:
+The update product is:
 
 ```blorp
 fixed record RetainedRecordField { field: FieldId, value_type: TypeRef }
 fixed record CheckedRecordUpdate {
-    base: CheckedValue,
+    base: CheckedExpr,
     base_expression_span: Span,
     replacements: List[CheckedRecordField],
     inherited: List[RetainedRecordField]
 }
--- CheckedBase gains ReturnRecordUpdate(CheckedRecordUpdate).
 ```
 
 `replacements` contains only written/evaluated RHSs in source order; `inherited`
 contains only omitted fields in declaration order. These are disjoint rows,
 not parallel arrays. Construction verifies one exact partition of the base
 record's fields: owner, bounds, uniqueness and coverage. The inherited TypeRef
-is an occurrence projection type, analogous to `CheckedStep.value_type`, not a
-second layout catalogue. The enclosing CheckedValue owns the update's result
-record type in `base_type`, before any outer postfix; the last outer step may
-produce a different overall type. It does not own a full expression `.span`:
-`CheckedValue` has only `base_span` and individual step spans
-(`check_model.brp:192–197`); the concrete `UpdateRecord` node's own `span` is that
-`base_span`, carried through unchanged (`ConcreteExpr`, `specialize.brp`). Copy the parser-owned complete
+is an occurrence projection type, analogous to a field read's `value_type`, not a
+second layout catalogue. The `UpdateRecord` node owns the update's result
+record type in its `value_type` and carries its declaration as the form's
+`RecordId`, as `ConstructRecord` does; an outer postfix is a separate node
+whose type may differ. The node's `span` is the update's own occurrence, carried
+through unchanged to the concrete `UpdateRecord` node (`ConcreteExpr`,
+`specialize.brp`). Copy the parser-owned complete
 base-expression span (`syntax.brp:196–201`) to `base_expression_span`, including
 the base's own postfixes, while publishing the checked update. No reconstruction,
-duplicate owner field, expression-ID domain, optional published
+expression-ID domain, optional published
 type or insertion-policy flag is needed. These IDs live in one compilation.
 Only the existing checked-program producer publishes this product.
 
@@ -758,7 +759,7 @@ FieldInstanceId and concrete TypeRef and carries the unchanged
 `base_expression_span`. Its complete partition survives translation;
 phantom arguments remain part of nominal instance identity. Projected omitted
 fields and update-base errors use that full base-expression span because omitted
-fields have no written names. Existing child base/step spans remain unchanged.
+fields have no written names. Existing child node spans remain unchanged.
 
 Current lowering (`lower.brp:214–248`) evaluates literal fields then emits:
 

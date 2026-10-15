@@ -10,11 +10,12 @@ import:
 	../../src/check_model:
 		BindingOrigin(ParameterBinding),
 		CallTarget(UserFunction, RuntimeFunction),
-		CheckedBase(ReturnInteger, ReturnBinding, ReturnCall),
 		CheckedBody(CheckedValueBody),
 		CheckedExit(ReturnExpression),
+		CheckedExpr,
+		CheckedForm(ConstructVariant, InvokeFunction, LiteralInteger, ReadBinding),
 		CheckedFunction,
-		CheckedOperation,
+		CheckedStatement(InitializeBinding),
 		TypeRef(IntType),
 		TypeUse,
 		same_type,
@@ -32,21 +33,19 @@ private pure func user_function_number(target: CallTarget) -> Option[Int]:
 			None
 
 
-private pure func base_of(function: CheckedFunction) -> Option[CheckedBase]:
+private pure func returned(function: CheckedFunction) -> Option[CheckedExpr]:
 	match function.body:
 		CheckedValueBody(ReturnExpression(value)):
-			Some(value.base)
+			Some(value)
 		_:
 			None
 
 
-private pure func operations_of(function: CheckedFunction) -> Option[List[CheckedOperation]]:
-	match function.body:
-		CheckedValueBody(ReturnExpression(value)):
-			Some(value.operations.map(
-				pure func(step): step.operation,
-			))
-		_:
+private pure func returned_form(function: CheckedFunction) -> Option[CheckedForm]:
+	match returned(function):
+		Some(value):
+			Some(value.form)
+		None:
 			None
 
 
@@ -178,22 +177,18 @@ pure func test_parameter_slot_and_repeated_wrappers() -> Bool:
 
 			match checked.functions:
 				[first, identity, main]:
-					parameter_is_value: Bool = match base_of(identity):
-						Some(ReturnBinding(_)):
-							operations_of(
-								identity,
-							).map(
-								pure func(values): values.length(),
-							) == Some(0)
+					parameter_is_value: Bool = match returned_form(identity):
+						Some(ReadBinding(_)):
+							True
 						_:
 							False
 
-					match base_of(main):
-						Some(ReturnCall(outer, [nested])):
-							match nested.base:
-								ReturnCall(inner, [literal]):
-									match literal.base:
-										ReturnInteger(1):
+					match returned_form(main):
+						Some(InvokeFunction(outer, [nested])):
+							match nested.form:
+								InvokeFunction(inner, [literal]):
+									match literal.form:
+										LiteralInteger(1):
 											(
 												parameter_is_value
 												and integer_parameter(identity.signature.parameters)
@@ -264,8 +259,8 @@ pure func test_signed_integer_value_survives_checking() -> Bool:
 		Ok(program):
 			match checked_functions(program).functions:
 				[function]:
-					match base_of(function):
-						Some(ReturnInteger(value)):
+					match returned_form(function):
+						Some(LiteralInteger(value)):
 							value == -42
 						_:
 							False
@@ -308,9 +303,161 @@ pure func test_constructor_of_another_union_is_not_a_variant_of_the_expected_uni
 							False
 
 
+private pure func spans_at(expr: CheckedExpr, start: Int, end: Int) -> Bool:
+	expr.span.start == start and expr.span.end == end
+
+
+-- A receiver chain folds into nested calls, each receiver the first argument.
+-- A node's span is its occurrence, from the written receiver to its own postfix;
+-- the callee anchor stays on the call.
+pure func test_ufcs_chain_nests_each_receiver_as_first_argument() -> Bool:
+	source: String =
+		|pure func one(value: Int) -> Int:
+		|	1
+		|pure func zero(value: Int) -> Int:
+		|	0
+		|func main() -> Int:
+		|	7.one().zero()
+		|
+
+	match checked_source(source):
+		Err(_):
+			False
+		Ok(program):
+			match checked_functions(program).functions:
+				[_, _, main]:
+					match returned(main):
+						Some(outer):
+							match outer.form:
+								InvokeFunction(zero, [inner]):
+									match inner.form:
+										InvokeFunction(one, [seven]):
+											match seven.form:
+												LiteralInteger(7):
+													(
+														user_function_number(zero.target) == Some(1)
+														and user_function_number(one.target) == Some(0)
+														and spans_at(outer, 96, 110)
+														and spans_at(inner, 96, 103)
+														and spans_at(seven, 96, 97)
+														and zero.span.start == 104
+														and zero.span.end == 108
+														and one.span.start == 98
+														and one.span.end == 101
+														and same_type(outer.value_type, IntType)
+													)
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						None:
+							False
+				_:
+					False
+
+
+private pure func argument_integers(expr: CheckedExpr) -> List[Int]:
+	match expr.form:
+		InvokeFunction(_, arguments):
+			var integers: List[Int] = []
+
+			for argument in arguments:
+				match argument.form:
+					LiteralInteger(integer):
+						integers = integers.append(integer)
+					_:
+						void
+
+			integers
+		_:
+			[]
+
+
+pure func test_direct_and_ufcs_calls_share_one_argument_order() -> Bool:
+	source: String =
+		|pure func pair(left: Int, right: Int) -> Int:
+		|	left
+		|func main() -> Int:
+		|	ufcs = 7.pair(9)
+		|	pair(7, 9)
+		|
+
+	match checked_source(source):
+		Err(_):
+			False
+		Ok(program):
+			match checked_functions(program).functions:
+				[_, main]:
+					match main.statements:
+						[InitializeBinding(_, ufcs)]:
+							match returned(main):
+								Some(direct):
+									match argument_integers(ufcs):
+										[7, 9]:
+											match argument_integers(direct):
+												[7, 9]:
+													True
+												_:
+													False
+										_:
+											False
+								None:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_payload_free_variant_is_a_construct_with_no_arguments() -> Bool:
+	source: String =
+		|fixed union Step:
+		|	Stop
+		|	Once
+		|pure func pick(step: Step) -> Int:
+		|	match step:
+		|		Stop: 0
+		|		Once: 1
+		|func main() -> Int:
+		|	pick(Stop)
+		|
+
+	match checked_source(source):
+		Err(_):
+			False
+		Ok(program):
+			match checked_functions(program).functions:
+				[_, main]:
+					match returned_form(main):
+						Some(InvokeFunction(_, [stop])):
+							match stop.form:
+								ConstructVariant(_, []):
+									True
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 value synthesis",
 	tests = [
+		(
+			"UFCS chain nests each receiver as the first argument",
+			test_ufcs_chain_nests_each_receiver_as_first_argument,
+		),
+		(
+			"direct and UFCS calls share one argument order",
+			test_direct_and_ufcs_calls_share_one_argument_order,
+		),
+		(
+			"payload-free variant is a construct with no arguments",
+			test_payload_free_variant_is_a_construct_with_no_arguments,
+		),
 		(
 			"constructor of another union is not a variant of the expected union",
 			test_constructor_of_another_union_is_not_a_variant_of_the_expected_union,

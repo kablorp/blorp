@@ -230,10 +230,9 @@ fixed union ConcreteForm:
 	ReadRecordField(ConcreteExpr, FieldInstanceId)
 
 
--- One evaluated expression. `span` is the checked node's own span, carried through
--- unchanged: a base's base_span, or a postfix step's span (the extent from the
--- base to that postfix). A call's callee anchor is a separate fact, the span of
--- its ConcreteCall.
+-- One evaluated expression. `span` is the checked node's own occurrence span,
+-- carried through unchanged. A call's callee anchor is a separate fact, the span
+-- of its ConcreteCall.
 fixed record ConcreteExpr {
 	form: ConcreteForm,
 	value_type: TypeRef,
@@ -1124,69 +1123,50 @@ private pure func prepare_type(
 			})
 
 
-private pure func value_types(value: Checked.CheckedValue) -> List[Checked.TypeUse]:
+private pure func value_types(value: Checked.CheckedExpr) -> List[Checked.TypeUse]:
 	append_value_types([], value)
 
 
--- Checking needs full call extents for tail-position errors. Ordinary concrete
--- expressions retain the established callee anchors for layout and value errors;
--- recur terminals carry their complete occurrence span separately.
-private pure func value_anchor(value: Checked.CheckedValue) -> Span:
-	match value.base:
-		Checked.ReturnCall(call, _):
-			call.span
-		_:
-			value.base_span
-
-
-private pure func step_anchor(step: Checked.CheckedStep) -> Span:
-	match step.operation:
+-- A call's callee anchor locates its type errors; any other node's own span does.
+private pure func anchor(value: Checked.CheckedExpr) -> Span:
+	match value.form:
 		Checked.InvokeFunction(call, _):
 			call.span
 		_:
-			step.span
+			value.span
 
 
+-- A node's type precedes its children's, which follow in order. Instance numbers
+-- follow this order, so it fixes the names in the emitted C.
 private pure func append_value_types(
 	collected: List[Checked.TypeUse],
-	value: Checked.CheckedValue,
+	value: Checked.CheckedExpr,
 ) -> List[Checked.TypeUse]:
 	var types = collected.append({
-		value_type = value.base_type,
-		span = value_anchor(value),
+		value_type = value.value_type,
+		span = anchor(value),
 	})
 
-	match value.base:
-		Checked.ReturnRecordUpdate(update):
+	match value.form:
+		Checked.UpdateRecord(_, update):
 			types = append_value_types(types, update.base)
 			for field in update.replacements:
 				types = append_value_types(types, field.value)
 			for field in update.inherited:
 				types = types.append({ value_type = field.value_type, span = update.base_expression_span })
-		Checked.ReturnConstructedVariant(_, children):
+		Checked.ConstructVariant(_, children):
 			for child in children:
 				types = append_value_types(types, child)
-		Checked.ReturnRecord(_, fields):
+		Checked.ConstructRecord(_, fields):
 			for field in fields:
 				types = append_value_types(types, field.value)
-		Checked.ReturnCall(_, children):
-			for child in children:
-				types = append_value_types(types, child)
-		_:
+		Checked.InvokeFunction(_, arguments):
+			for argument in arguments:
+				types = append_value_types(types, argument)
+		Checked.ReadRecordField(receiver, _):
+			types = append_value_types(types, receiver)
+		Checked.LiteralVoid | Checked.LiteralInteger(_) | Checked.LiteralFloat(_) | Checked.LiteralString(_) | Checked.ReadBinding(_):
 			void
-
-	for step in value.operations:
-		types = types.append({
-			value_type = step.value_type,
-			span = step_anchor(step),
-		})
-
-		match step.operation:
-			Checked.InvokeFunction(_, arguments):
-				for child in arguments:
-					types = append_value_types(types, child)
-			_:
-				void
 
 	types
 
@@ -1561,23 +1541,35 @@ private pure func translate_variant(
 			}))
 
 
-private pure func translate_value(
-	value: Checked.CheckedValue,
+-- A node's type and identity translate before its children, except a field read,
+-- whose instance needs its receiver's concrete record.
+private pure func translate_expr(
+	value: Checked.CheckedExpr,
 	substitution: List[TypeSubstitution],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 ) -> Result[ConcreteExpr, Diagnostic]:
-	anchor = value_anchor(value)
-	base_type ?= concrete_type(value.base_type, substitution, unions, anchor, records)
-
-	form_result: Result[ConcreteForm, Diagnostic] = match value.base:
-		Checked.ReturnRecordUpdate(update):
-			owner ?= concrete_record_owner(base_type, value.base_span)
-			base ?= translate_value(update.base, substitution, keys, unions, records)
+	match value.form:
+		Checked.ReadRecordField(receiver, field):
+			source ?= translate_expr(receiver, substitution, keys, unions, records)
+			owner ?= concrete_record_owner(source.value_type, value.span)
+			-- The prepared receiver row already owns this exact concrete field type.
+			value_type ?= concrete_record_field_type(field, owner, records, value.span)
+			translated_field = into_opaque FieldInstanceId({ owner = owner, position = Checked.field_number(field) })
+			Ok({ form = ReadRecordField(source, translated_field), value_type = value_type, span = value.span })
+		Checked.InvokeFunction(call, arguments):
+			value_type ?= concrete_type(value.value_type, substitution, unions, call.span, records)
+			concrete ?= translate_call(call, substitution, keys, unions, records, value_type)
+			values ?= translate_exprs(arguments, substitution, keys, unions, records)
+			Ok({ form = InvokeFunction(concrete, values), value_type = value_type, span = value.span })
+		Checked.UpdateRecord(_, update):
+			record_type ?= concrete_type(value.value_type, substitution, unions, value.span, records)
+			owner ?= concrete_record_owner(record_type, value.span)
+			base ?= translate_expr(update.base, substitution, keys, unions, records)
 			replacements ?= translated_list(update.replacements, pure func(field: Checked.CheckedRecordField) -> Result[ConcreteRecordField, Diagnostic]:
 				id ?= translate_field(field.field, owner, records, field.span)
-				child ?= translate_value(field.value, substitution, keys, unions, records)
+				child ?= translate_expr(field.value, substitution, keys, unions, records)
 				Ok({ field = id, value = child, span = field.span })
 			)
 			inherited ?= translated_list(update.inherited, pure func(field: Checked.RetainedRecordField) -> Result[RetainedRecordField, Diagnostic]:
@@ -1585,119 +1577,82 @@ private pure func translate_value(
 				value_type ?= concrete_type(field.value_type, substitution, unions, update.base_expression_span, records)
 				Ok({ field = id, value_type = value_type })
 			)
-			Ok(UpdateRecord(owner, { base = base, base_expression_span = update.base_expression_span, replacements = replacements, inherited = inherited }))
-		Checked.ReturnConstructedVariant(id, children):
-			owner ?= concrete_union_owner(base_type, value.base_span)
-			variant ?= translate_variant(id, owner, unions, value.base_span)
-			values ?= translated_list(children, pure func(child): translate_value(child, substitution, keys, unions, records))
-			Ok(ConstructVariant(variant, values))
-		Checked.ReturnRecord(_, fields):
-			owner ?= concrete_record_owner(base_type, value.base_span)
+			form = UpdateRecord(owner, { base = base, base_expression_span = update.base_expression_span, replacements = replacements, inherited = inherited })
+			Ok({ form = form, value_type = record_type, span = value.span })
+		Checked.ConstructVariant(id, children):
+			value_type ?= concrete_type(value.value_type, substitution, unions, value.span, records)
+			owner ?= concrete_union_owner(value_type, value.span)
+			variant ?= translate_variant(id, owner, unions, value.span)
+			values ?= translate_exprs(children, substitution, keys, unions, records)
+			Ok({ form = ConstructVariant(variant, values), value_type = value_type, span = value.span })
+		Checked.ConstructRecord(_, fields):
+			value_type ?= concrete_type(value.value_type, substitution, unions, value.span, records)
+			owner ?= concrete_record_owner(value_type, value.span)
 			concrete ?= translated_list(fields, pure func(
 				field: Checked.CheckedRecordField,
 			) -> Result[ConcreteRecordField, Diagnostic]:
 				id ?= translate_field(field.field, owner, records, field.span)
-				child ?= translate_value(field.value, substitution, keys, unions, records)
+				child ?= translate_expr(field.value, substitution, keys, unions, records)
 				Ok({
 					field = id,
 					value = child,
 					span = field.span,
 				})
 			)
-			Ok(ConstructRecord(owner, concrete))
-		Checked.ReturnVoid:
-			Ok(LiteralVoid)
-		Checked.ReturnString(text):
-			Ok(LiteralString(text))
-		Checked.ReturnInteger(integer):
-			Ok(LiteralInteger(integer))
-		Checked.ReturnFloat(number):
-			Ok(LiteralFloat(number))
-		Checked.ReturnBinding(id):
-			Ok(ReadBinding(id))
-		Checked.ReturnVariant(id):
-			owner ?= concrete_union_owner(base_type, value.base_span)
-			concrete ?= translate_variant(id, owner, unions, value.base_span)
-			Ok(ConstructVariant(concrete, []))
-		Checked.ReturnCall(call, arguments):
-			concrete ?= translate_call(call, substitution, keys, unions, records, base_type)
-			values ?= translated_list(
-				arguments,
-				pure func(
-					argument: Checked.CheckedValue,
-				) -> Result[ConcreteExpr, Diagnostic]: translate_value(
-					argument,
-					substitution,
-					keys,
-					unions,
-					records,
-				),
-			)
-			Ok(InvokeFunction(concrete, values))
+			Ok({ form = ConstructRecord(owner, concrete), value_type = value_type, span = value.span })
+		Checked.LiteralVoid:
+			translate_leaf(LiteralVoid, value, substitution, unions, records)
+		Checked.LiteralString(text):
+			translate_leaf(LiteralString(text), value, substitution, unions, records)
+		Checked.LiteralInteger(integer):
+			translate_leaf(LiteralInteger(integer), value, substitution, unions, records)
+		Checked.LiteralFloat(number):
+			translate_leaf(LiteralFloat(number), value, substitution, unions, records)
+		Checked.ReadBinding(id):
+			translate_leaf(ReadBinding(id), value, substitution, unions, records)
 
-	form ?= form_result
-	var current: ConcreteExpr = {
-		form = form,
-		value_type = base_type,
-		span = value.base_span,
-	}
+
+-- A leaf keeps its checked form; only its type is made concrete.
+private pure func translate_leaf(
+	form: ConcreteForm,
+	value: Checked.CheckedExpr,
+	substitution: List[TypeSubstitution],
+	unions: List[UnionInstance],
+	records: List[RecordInstance],
+) -> Result[ConcreteExpr, Diagnostic]:
+	value_type ?= concrete_type(value.value_type, substitution, unions, value.span, records)
+	Ok({ form = form, value_type = value_type, span = value.span })
+
+
+private pure func translate_exprs(
+	values: List[Checked.CheckedExpr],
+	substitution: List[TypeSubstitution],
+	keys: List[FunctionRequest],
+	unions: List[UnionInstance],
+	records: List[RecordInstance],
+) -> Result[List[ConcreteExpr], Diagnostic]:
+	var translated: List[ConcreteExpr] = []
 	var failure: Option[Diagnostic] = None
-	for step in value.operations:
-		match translate_step(step, current, substitution, keys, unions, records):
-			Ok(next):
-				current = next
+
+	for value in values:
+		match translate_expr(value, substitution, keys, unions, records):
+			Ok(concrete):
+				translated = translated.append(concrete)
 			Err(error):
 				failure = Some(error)
 				break
-	ready ?= match failure:
-		Some(error): Err(error)
-		None: Ok(void)
 
-	Ok(current)
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(translated)
 
 
 private pure func concrete_record_owner(value: TypeRef, span: Span) -> Result[RecordInstanceId, Diagnostic]:
 	match value:
 		RecordType(owner): Ok(owner)
 		_: Err(invalid(span, "record operation has a non-record receiver"))
-
-
--- A postfix step wraps its already translated receiver: the receiver becomes
--- the field's source or the call's first argument.
-private pure func translate_step(
-	step: Checked.CheckedStep,
-	receiver: ConcreteExpr,
-	substitution: List[TypeSubstitution],
-	keys: List[FunctionRequest],
-	unions: List[UnionInstance],
-	records: List[RecordInstance],
-) -> Result[ConcreteExpr, Diagnostic]:
-	anchor = step_anchor(step)
-	match step.operation:
-		Checked.ReadRecordField(field):
-			owner ?= concrete_record_owner(receiver.value_type, step.span)
-			value_type ?= concrete_record_field_type(field, owner, records, step.span)
-			-- The prepared receiver row already owns this exact concrete field type.
-			translated_field = into_opaque FieldInstanceId({ owner = owner, position = Checked.field_number(field) })
-			Ok({ form = ReadRecordField(receiver, translated_field), value_type = value_type, span = step.span })
-		Checked.InvokeFunction(call, arguments):
-			value_type ?= concrete_type(step.value_type, substitution, unions, anchor, records)
-			concrete ?= translate_call(call, substitution, keys, unions, records, value_type)
-			-- The receiver leads the argument list, so the list is built once.
-			var values: List[ConcreteExpr] = [receiver]
-			var failure: Option[Diagnostic] = None
-			for argument in arguments:
-				match translate_value(argument, substitution, keys, unions, records):
-					Ok(translated):
-						values = values.append(translated)
-					Err(error):
-						failure = Some(error)
-						break
-			ready ?= match failure:
-				Some(error): Err(error)
-				None: Ok(void)
-
-			Ok({ form = InvokeFunction(concrete, values), value_type = value_type, span = step.span })
 
 
 private pure func translate_statements(
@@ -1712,13 +1667,13 @@ private pure func translate_statements(
 	) -> Result[ConcreteStatement, Diagnostic]:
 		match statement:
 			Checked.InitializeBinding(id, value):
-				value ?= translate_value(value, substitution, keys, unions, records)
+				value ?= translate_expr(value, substitution, keys, unions, records)
 				Ok(InitializeBinding(id, value))
 			Checked.DiscardExpression(value):
-				value ?= translate_value(value, substitution, keys, unions, records)
+				value ?= translate_expr(value, substitution, keys, unions, records)
 				Ok(DiscardExpression(value))
 			Checked.ReassignBinding(id, value):
-				value ?= translate_value(value, substitution, keys, unions, records)
+				value ?= translate_expr(value, substitution, keys, unions, records)
 				Ok(ReassignBinding(id, value))
 	)
 
@@ -1748,14 +1703,10 @@ private pure func translate_exit(
 ) -> Result[ConcreteExit, Diagnostic]:
 	match exit:
 		Checked.ReturnExpression(value):
-			concrete ?= translate_value(value, substitution, keys, unions, records)
+			concrete ?= translate_expr(value, substitution, keys, unions, records)
 			Ok(ReturnExpression(concrete))
 		Checked.RecurWith(arguments, span):
-			concrete ?= translated_list(arguments, pure func(
-				value: Checked.CheckedValue,
-			) -> Result[ConcreteExpr, Diagnostic]:
-				translate_value(value, substitution, keys, unions, records)
-			)
+			concrete ?= translate_exprs(arguments, substitution, keys, unions, records)
 			Ok(RecurWith(concrete, span))
 
 
@@ -1817,7 +1768,7 @@ private pure func translate_function(
 			concrete ?= translate_exit(value, substitution, keys, unions, records)
 			Ok(ConcreteValueBody(concrete))
 		Checked.CheckedMatchBody(matched):
-			scrutinee ?= translate_value(matched.scrutinee, substitution, keys, unions, records)
+			scrutinee ?= translate_expr(matched.scrutinee, substitution, keys, unions, records)
 			union_type ?= concrete_type(matched.union_type, substitution, unions, span, records)
 			owner ?= concrete_union_owner(union_type, span)
 			arms ?= translated_list(matched.arms, pure func(

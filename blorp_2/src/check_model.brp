@@ -159,7 +159,7 @@ pure func binding_number(id: BindingId) -> Int:
 
 fixed record CheckedRecordField {
 	field: FieldId,
-	value: CheckedValue,
+	value: CheckedExpr,
 	span: Span
 }
 
@@ -168,50 +168,43 @@ fixed record RetainedRecordField { field: FieldId, value_type: TypeRef }
 
 
 fixed record CheckedRecordUpdate {
-	base: CheckedValue,
+	base: CheckedExpr,
 	base_expression_span: Span,
 	replacements: List[CheckedRecordField],
 	inherited: List[RetainedRecordField]
 }
 
 
-fixed union CheckedBase:
-	ReturnRecord(RecordId, List[CheckedRecordField])
-	ReturnRecordUpdate(CheckedRecordUpdate)
-	ReturnConstructedVariant(VariantId, List[CheckedValue])
-	ReturnVoid
-	ReturnInteger(Int)
-	ReturnFloat(Float)
-	ReturnString(String)
-	ReturnVariant(VariantId)
-	ReturnBinding(BindingId)
-	ReturnCall(CheckedCall, List[CheckedValue])
+-- What an expression computes. UFCS is resolved: `a.f(x)` and `f(a, x)` are the
+-- same call, whose receiver is the first argument, so evaluation order is list
+-- order. A payload-free variant has no arguments.
+fixed union CheckedForm:
+	LiteralVoid
+	LiteralInteger(Int)
+	LiteralFloat(Float)
+	LiteralString(String)
+	ReadBinding(BindingId)
+	ConstructVariant(VariantId, List[CheckedExpr])
+	ConstructRecord(RecordId, List[CheckedRecordField])
+	UpdateRecord(RecordId, CheckedRecordUpdate)
+	InvokeFunction(CheckedCall, List[CheckedExpr])
+	ReadRecordField(CheckedExpr, FieldId)
 
 
-fixed union CheckedOperation:
-	InvokeFunction(CheckedCall, List[CheckedValue])
-	ReadRecordField(FieldId)
-
-
-fixed record CheckedStep {
-	operation: CheckedOperation,
+-- One checked expression. `span` is the node's own occurrence: a written base's
+-- extent, or a postfix's extent from the written base to that postfix. A call's
+-- callee anchor is a separate fact, the span of its CheckedCall.
+fixed record CheckedExpr {
+	form: CheckedForm,
 	value_type: TypeRef,
 	span: Span
 }
 
 
-fixed record CheckedValue {
-	base: CheckedBase,
-	base_type: TypeRef,
-	base_span: Span,
-	operations: List[CheckedStep]
-}
-
-
 fixed union CheckedStatement:
-	InitializeBinding(BindingId, CheckedValue)
-	ReassignBinding(BindingId, CheckedValue)
-	DiscardExpression(CheckedValue)
+	InitializeBinding(BindingId, CheckedExpr)
+	ReassignBinding(BindingId, CheckedExpr)
+	DiscardExpression(CheckedExpr)
 
 
 fixed union CheckedPattern:
@@ -228,15 +221,15 @@ fixed record CheckedArm {
 
 
 fixed record CheckedMatch {
-	scrutinee: CheckedValue,
+	scrutinee: CheckedExpr,
 	union_type: TypeRef,
 	arms: List[CheckedArm]
 }
 
 
 fixed union CheckedExit:
-	ReturnExpression(CheckedValue)
-	RecurWith(List[CheckedValue], Span)
+	ReturnExpression(CheckedExpr)
+	RecurWith(List[CheckedExpr], Span)
 
 
 fixed union CheckedBody:
@@ -450,40 +443,33 @@ private pure func append_exit_calls(
 			calls
 
 
+-- Calls in evaluation order: a node's children left to right, then the node.
 private pure func append_value_calls(
 	collected: List[CheckedCall],
-	value: CheckedValue,
+	value: CheckedExpr,
 ) -> List[CheckedCall]:
 	var calls = collected
 
-	match value.base:
-		ReturnRecordUpdate(update):
+	match value.form:
+		UpdateRecord(_, update):
 			calls = append_value_calls(calls, update.base)
 			for field in update.replacements:
 				calls = append_value_calls(calls, field.value)
-		ReturnRecord(_, fields):
+		ConstructRecord(_, fields):
 			for field in fields:
 				calls = append_value_calls(calls, field.value)
-		ReturnConstructedVariant(_, fields):
+		ConstructVariant(_, fields):
 			for field in fields:
 				calls = append_value_calls(calls, field)
-		ReturnCall(call, arguments):
+		InvokeFunction(call, arguments):
 			for argument in arguments:
 				calls = append_value_calls(calls, argument)
 
 			calls = calls.append(call)
-		_:
+		ReadRecordField(receiver, _):
+			calls = append_value_calls(calls, receiver)
+		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_):
 			void
-
-	for step in value.operations:
-		match step.operation:
-			InvokeFunction(call, arguments):
-				for argument in arguments:
-					calls = append_value_calls(calls, argument)
-
-				calls = calls.append(call)
-			_:
-				void
 
 	calls
 

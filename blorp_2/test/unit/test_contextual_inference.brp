@@ -33,7 +33,7 @@ private pure func checked(source: String) -> Result[API.CheckedProgram, Diagnost
 	API.check(parsed).map_err(setup_diagnostic)
 
 
-private pure func body_value(function: Model.CheckedFunction) -> Option[Model.CheckedValue]:
+private pure func body_value(function: Model.CheckedFunction) -> Option[Model.CheckedExpr]:
 	match function.body:
 		Model.CheckedValueBody(Model.ReturnExpression(value)):
 			Some(value)
@@ -58,8 +58,8 @@ pure func test_annotated_result_publishes_complete_zero_argument_substitution() 
 		Ok(program):
 			match API.checked_functions(program).functions.get(2).and_then(body_value):
 				Some(value):
-					match value.base:
-						Model.ReturnCall(call, []):
+					match value.form:
+						Model.InvokeFunction(call, []):
 							one_type_argument(call, Model.IntType)
 						_:
 							False
@@ -80,10 +80,10 @@ pure func test_result_context_flows_through_a_nested_generic_call() -> Bool:
 				Some(function):
 					match body_value(function):
 						Some(value):
-							match value.base:
-								Model.ReturnCall(outer, [inner]):
-									match inner.base:
-										Model.ReturnCall(call, []):
+							match value.form:
+								Model.InvokeFunction(outer, [inner]):
+									match inner.form:
+										Model.InvokeFunction(call, []):
 											(
 												one_type_argument(outer, function.signature.return_type.value_type)
 												and one_type_argument(call, Model.IntType)
@@ -111,10 +111,10 @@ pure func test_concrete_argument_context_solves_a_nested_empty_call() -> Bool:
 		Ok(program):
 			match API.checked_functions(program).functions.get(3).and_then(body_value):
 				Some(value):
-					match value.base:
-						Model.ReturnCall(_, [inner]):
-							match inner.base:
-								Model.ReturnCall(call, []):
+					match value.form:
+						Model.InvokeFunction(_, [inner]):
+							match inner.form:
+								Model.InvokeFunction(call, []):
 									one_type_argument(call, Model.IntType)
 								_:
 									False
@@ -142,13 +142,13 @@ pure func test_later_sibling_evidence_solves_an_earlier_nested_call() -> Bool:
 				Some(function):
 					match function.statements:
 						[Model.InitializeBinding(_, value)]:
-							match value.base:
-								Model.ReturnCall(outer, [inner, _]):
-									match inner.base:
-										Model.ReturnCall(call, []):
+							match value.form:
+								Model.InvokeFunction(outer, [inner, _]):
+									match inner.form:
+										Model.InvokeFunction(call, []):
 											(
 												one_type_argument(call, Model.IntType)
-												and one_type_argument(outer, value.base_type)
+												and one_type_argument(outer, value.value_type)
 											)
 										_:
 											False
@@ -173,8 +173,8 @@ pure func test_generic_result_context_preserves_the_caller_rigid_parameter() -> 
 				Some(function):
 					match (function.signature.type_parameters, body_value(function)):
 						([parameter], Some(value)):
-							match value.base:
-								Model.ReturnCall(call, []):
+							match value.form:
+								Model.InvokeFunction(call, []):
 									one_type_argument(call, Model.ParameterType(parameter))
 								_:
 									False
@@ -409,11 +409,11 @@ pure func test_partial_nominal_argument_hint_solves_constructor_payload() -> Boo
 		Ok(program):
 			match API.checked_functions(program).functions.get(3).and_then(body_value):
 				Some(value):
-					match value.base:
-						Model.ReturnCall(call, [argument]):
-							match argument.base:
-								Model.ReturnConstructedVariant(_, [child]):
-									one_type_argument(call, Model.IntType) and Model.same_type(child.base_type, Model.IntType)
+					match value.form:
+						Model.InvokeFunction(call, [argument]):
+							match argument.form:
+								Model.ConstructVariant(_, [child]):
+									one_type_argument(call, Model.IntType) and Model.same_type(child.value_type, Model.IntType)
 								_: False
 						_: False
 				None: False
@@ -531,12 +531,9 @@ pure func test_unique_ufcs_partial_nominal_receiver_solves_payload() -> Bool:
 		Ok(program):
 			match API.checked_functions(program).functions.get(3).and_then(body_value):
 				Some(value):
-					match value.operations.last():
-						Some(step):
-							match step.operation:
-								Model.InvokeFunction(call, []): one_type_argument(call, Model.IntType)
-								_: False
-						None: False
+					match value.form:
+						Model.InvokeFunction(call, [_]): one_type_argument(call, Model.IntType)
+						_: False
 				None: False
 		Err(_): False
 
@@ -563,18 +560,18 @@ pure func test_two_independent_pending_calls_keep_distinct_fresh_variables() -> 
 		Ok(program):
 			match API.checked_functions(program).functions.get(4).and_then(body_value):
 				Some(value):
-					match value.base:
-						Model.ReturnCall(_, [left, right]): independent_inspection(left, Model.IntType) and independent_inspection(right, Model.StringType)
+					match value.form:
+						Model.InvokeFunction(_, [left, right]): independent_inspection(left, Model.IntType) and independent_inspection(right, Model.StringType)
 						_: False
 				None: False
 		Err(_): False
 
 
-private pure func independent_inspection(value: Model.CheckedValue, expected: Model.TypeRef) -> Bool:
-	match value.base:
-		Model.ReturnCall(call, [inner, _]):
-			match inner.base:
-				Model.ReturnCall(nested, []): one_type_argument(call, expected) and one_type_argument(nested, expected)
+private pure func independent_inspection(value: Model.CheckedExpr, expected: Model.TypeRef) -> Bool:
+	match value.form:
+		Model.InvokeFunction(call, [inner, _]):
+			match inner.form:
+				Model.InvokeFunction(nested, []): one_type_argument(call, expected) and one_type_argument(nested, expected)
 				_: False
 		_: False
 
@@ -599,9 +596,9 @@ pure func test_repeated_result_projection_keeps_a_common_partial_nominal_head() 
 		Err(_): False
 
 
-private pure func repeated_result_substitutions(value: Model.CheckedValue) -> Bool:
-	match value.base:
-		Model.ReturnCall(call, [repeated, _, _]):
+private pure func repeated_result_substitutions(value: Model.CheckedExpr) -> Bool:
+	match value.form:
+		Model.InvokeFunction(call, [repeated, _, _]):
 			outer = match call.target:
 				Model.UserFunction(owner, [Model.IntType, Model.IntType]): Declaration.function_number(owner) == 3
 				_: False
@@ -609,12 +606,12 @@ private pure func repeated_result_substitutions(value: Model.CheckedValue) -> Bo
 		_: False
 
 
-private pure func repeated_argument_substitution(value: Model.CheckedValue) -> Bool:
-	match value.base:
-		Model.ReturnCall(call, [payload]):
-			match (call.target, payload.base, value.base_type):
-				(Model.UserFunction(owner, [argument]), Model.ReturnConstructedVariant(variant, [child]), Model.AppliedUnionType(pair, [first, second])):
-					match payload.base_type:
+private pure func repeated_argument_substitution(value: Model.CheckedExpr) -> Bool:
+	match value.form:
+		Model.InvokeFunction(call, [payload]):
+			match (call.target, payload.form, value.value_type):
+				(Model.UserFunction(owner, [argument]), Model.ConstructVariant(variant, [child]), Model.AppliedUnionType(pair, [first, second])):
+					match payload.value_type:
 						Model.AppliedUnionType(choice, [Model.IntType]):
 							(
 								Declaration.function_number(owner) == 2
@@ -622,8 +619,8 @@ private pure func repeated_argument_substitution(value: Model.CheckedValue) -> B
 								and Declaration.union_number(choice) == 0
 								and Declaration.union_number(Declaration.variant_owner(variant)) == 0
 								and Declaration.variant_number(variant) == 1
-								and Model.same_type(child.base_type, Model.IntType)
-								and Model.same_type(argument, payload.base_type)
+								and Model.same_type(child.value_type, Model.IntType)
+								and Model.same_type(argument, payload.value_type)
 								and Model.same_type(first, argument)
 								and Model.same_type(second, argument)
 							)
@@ -740,8 +737,8 @@ pure func test_direct_result_hint_rebuilds_the_substituted_compound() -> Bool:
 		Ok(program):
 			match API.checked_functions(program).functions.get(3).and_then(body_value):
 				Some(value):
-					match value.base:
-						Model.ReturnCall(call, [constructor, _]):
+					match value.form:
+						Model.InvokeFunction(call, [constructor, _]):
 							one_type_argument(call, Model.IntType) and choice_argument_is_int(constructor)
 						_: False
 				None: False
@@ -757,22 +754,15 @@ pure func test_ufcs_result_hint_rebuilds_the_substituted_receiver_compound() -> 
 		Ok(program):
 			match API.checked_functions(program).functions.get(3).and_then(body_value):
 				Some(value):
-					match value.operations.last():
-						Some(step):
-							match step.operation:
-								Model.InvokeFunction(call, [_]): one_type_argument(call, Model.IntType) and Model.same_type(step.value_type, Model.IntType)
-								_: False
-						None: False
+					match value.form:
+						Model.InvokeFunction(call, [_, _]): one_type_argument(call, Model.IntType) and Model.same_type(value.value_type, Model.IntType)
+						_: False
 				None: False
 		Err(_): False
 
 
-private pure func choice_argument_is_int(value: Model.CheckedValue) -> Bool:
-	value_type = match value.operations.last():
-		Some(step): step.value_type
-		None: value.base_type
-
-	match value_type:
+private pure func choice_argument_is_int(value: Model.CheckedExpr) -> Bool:
+	match value.value_type:
 		Model.AppliedUnionType(owner, [argument]): Declaration.union_number(owner) == 0 and Model.same_type(argument, Model.IntType)
 		_: False
 
@@ -788,8 +778,8 @@ pure func test_known_list_context_opens_only_the_mixed_inference_shape() -> Bool
 		Ok(program):
 			match API.checked_functions(program).functions.get(3).and_then(body_value):
 				Some(value):
-					match value.base:
-						Model.ReturnCall(call, []): one_type_argument(call, Model.StringType)
+					match value.form:
+						Model.InvokeFunction(call, []): one_type_argument(call, Model.StringType)
 						_: False
 				None: False
 		Err(_): False
@@ -811,12 +801,12 @@ pure func test_closed_nested_results_publish_complete_nominal_ancestry() -> Bool
 				Some(function):
 					match function.statements:
 						[Model.InitializeBinding(_, value)]:
-							match value.base:
-								Model.ReturnCall(outer, [inner]):
-									match inner.base:
-										Model.ReturnCall(call, [_]):
-											match value.base_type:
-												Model.AppliedUnionType(owner, [child]): Declaration.union_number(owner) == 0 and Model.same_type(child, inner.base_type) and one_type_argument(outer, inner.base_type) and one_type_argument(call, Model.IntType)
+							match value.form:
+								Model.InvokeFunction(outer, [inner]):
+									match inner.form:
+										Model.InvokeFunction(call, [_]):
+											match value.value_type:
+												Model.AppliedUnionType(owner, [child]): Declaration.union_number(owner) == 0 and Model.same_type(child, inner.value_type) and one_type_argument(outer, inner.value_type) and one_type_argument(call, Model.IntType)
 												_: False
 										_: False
 								_: False
