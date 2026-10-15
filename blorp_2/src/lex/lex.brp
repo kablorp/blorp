@@ -2,6 +2,7 @@ import:
 	int as IntOps
 	../utils/source: SourceId
 	string as StringOps
+	../utils/text as Text
 	../utils/syntax:
 		Diagnostic,
 		LexedProgram,
@@ -12,7 +13,7 @@ import:
 			RightBracket, LeftBrace, RightBrace, RecordUpdateBar, Comma, AtSign, Slash, Star,
 		),
 		Token,
-		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString),
+		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, PipeString, CharLiteral),
 		UTF8_CONTINUATION_END,
 		UTF8_CONTINUATION_START,
 		diagnostic,
@@ -110,6 +111,40 @@ private UNTERMINATED_ESCAPE: ErrorText = {
 	message = "unterminated String escape",
 	help = "complete the escape and close the double quote on the same line"
 }
+
+private CHAR_WIDTH: ErrorText = {
+	message = "Char literals hold one character",
+	help = "write one character or one escape between single quotes, such as 'a' or '\\n'"
+}
+
+private UNTERMINATED_CHAR: ErrorText = {
+	message = "unterminated Char literal",
+	help = "add the closing single quote on the same line"
+}
+
+private CHAR_CONTROL_BYTE: ErrorText = {
+	message = "unsupported raw byte in Char literal",
+	help = "use a printable character or a fixed escape such as '\\t'"
+}
+
+private PIPE_INTERPOLATION: ErrorText = {
+	message = "String interpolation is not supported yet",
+	help = "pipe String lines have no escapes or interpolation; build the text with concat"
+}
+
+private DOC_BLOCK_IN_BRACKETS: ErrorText = {
+	message = "documentation block inside brackets",
+	help = "close the bracket before the --- fence, or put the block before a declaration"
+}
+
+private UNTERMINATED_DOC_BLOCK: ErrorText = {
+	message = "unterminated documentation block",
+	help = "close the block with a line holding only --- at column 1"
+}
+
+
+-- A documentation fence is three dashes alone on their line.
+private DOC_FENCE_WIDTH: Int = 3
 
 
 private SPACE_INDENT_WIDTH: Int = 4
@@ -368,6 +403,48 @@ private pure func quoted_token(text: SourceText, start: Int) -> Result[Token, Di
 	Ok(token(text, QuotedString(contents), start, IntOps.add(closing, 1)))
 
 
+-- The end of the one character or escape pair at `cursor` in a Char literal
+-- opened at `start`. An escaped byte cannot close the literal; decoding the
+-- escape waits for the Char type.
+private pure func char_content_end(text: SourceText, start: Int, cursor: Int) -> Result[Int, Diagnostic]:
+	match StringOps.get(text.bytes, cursor):
+		None:
+			Err(error_at(text, start, cursor, UNTERMINATED_CHAR))
+		Some(character):
+			byte = to_int(character)
+			escaped = IntOps.add(cursor, 1)
+
+			if is_byte(byte, '\n'):
+				Err(error_at(text, start, cursor, UNTERMINATED_CHAR))
+			else if is_byte(byte, '\''):
+				Err(error_at(text, start, escaped, CHAR_WIDTH))
+			else if is_byte(byte, '\\'):
+				if IntOps.equals(escaped, text.bytes.length()) or byte_is(text, escaped, '\n'):
+					Err(error_at(text, start, escaped, UNTERMINATED_CHAR))
+				else:
+					Ok(IntOps.add(escaped, 1))
+			else if IntOps.less_than(byte, ASCII_SPACE) or IntOps.equals(byte, ASCII_DEL):
+				Err(byte_error(text, cursor, CHAR_CONTROL_BYTE))
+			else if IntOps.greater_than(byte, ASCII_DEL):
+				utf8_end(text, cursor, byte)
+			else:
+				Ok(escaped)
+
+
+-- A Char literal: a quote, one character or escape pair, and the closing quote.
+private pure func char_token(text: SourceText, start: Int) -> Result[Token, Diagnostic]:
+	contents_start = IntOps.add(start, 1)
+	contents_end ?= char_content_end(text, start, contents_start)
+	after = IntOps.add(contents_end, 1)
+
+	if byte_is(text, contents_end, '\''):
+		Ok(token(text, CharLiteral, start, after))
+	else if IntOps.equals(contents_end, text.bytes.length()) or byte_is(text, contents_end, '\n'):
+		Err(error_at(text, start, contents_end, UNTERMINATED_CHAR))
+	else:
+		Err(error_at(text, start, after, CHAR_WIDTH))
+
+
 private pure func numeric_token_end(text: SourceText, start: Int, end: Int, is_float: Bool) -> Result[Token, Diagnostic]:
 	if byte_in(text, end, IdentifierStart):
 		Err(error_at(text, start, run_end(text, end, IdentifierByte), NUMERIC_SUFFIX))
@@ -483,6 +560,8 @@ private pure func code_token(text: SourceText, cursor: Int) -> Result[Token, Dia
 
 	if byte_is(text, cursor, '"'):
 		quoted_token(text, cursor)
+	else if byte_is(text, cursor, '\''):
+		char_token(text, cursor)
 	else if byte_in(text, cursor, IdentifierStart):
 		end = run_end(text, next, IdentifierByte)
 		spelling = text.bytes.substring(cursor, IntOps.subtract(end, cursor))
@@ -539,6 +618,56 @@ private pure func comment_starts(text: SourceText, cursor: Int) -> Bool:
 	byte_is(text, cursor, '-') and byte_is(text, IntOps.add(cursor, 1), '-')
 
 
+-- Whether a fence line starts at `start`: DOC_FENCE, spaces, then LF or EOF.
+private pure func fence_at(text: SourceText, start: Int) -> Bool:
+	after_fence = IntOps.add(start, DOC_FENCE_WIDTH)
+	after_spaces = run_end(text, after_fence, SpaceByte)
+	(
+		byte_is(text, start, '-')
+		and byte_is(text, IntOps.add(start, 1), '-')
+		and byte_is(text, IntOps.add(start, 2), '-')
+		and (IntOps.equals(after_spaces, text.bytes.length()) or byte_is(text, after_spaces, '\n'))
+	)
+
+
+-- The start of the line after the one at `start`, or the end of the source.
+-- Documentation text admits any byte but CR.
+private pure func next_line_start(text: SourceText, start: Int) -> Result[Int, Diagnostic]:
+	var end: Int = start
+
+	while IntOps.less_than(end, text.bytes.length()) and not byte_is(text, end, '\n') and not byte_is(text, end, '\r'):
+		end = IntOps.add(end, 1)
+
+	if byte_is(text, end, '\r'):
+		Err(byte_error(text, end, LINE_ENDING))
+	else:
+		Ok(IntOps.min(IntOps.add(end, 1), text.bytes.length()))
+
+
+-- A documentation block opens at the fence line at `fence` and ends after the
+-- next fence line at column 1; the lines between are trivia.
+private pure func doc_block_end(text: SourceText, fence: Int) -> Result[Int, Diagnostic]:
+	-- One Result carries each line start inside the block, or the first error.
+	var scan: Result[Int, Diagnostic] = next_line_start(text, fence)
+
+	while True:
+		match scan:
+			Ok(line):
+				if IntOps.equals(line, text.bytes.length()) or fence_at(text, line):
+					break
+
+				scan = next_line_start(text, line)
+			Err(_):
+				break
+
+	closing ?= scan
+
+	if IntOps.equals(closing, text.bytes.length()):
+		Err(error_at(text, fence, IntOps.add(fence, DOC_FENCE_WIDTH), UNTERMINATED_DOC_BLOCK))
+	else:
+		next_line_start(text, closing)
+
+
 -- Returns where the trivia at `start`, which is an LF, EOF or comment, ends:
 -- `start` itself at LF or EOF, or the LF or EOF ending the comment there.
 private pure func trivia_end(text: SourceText, start: Int) -> Result[Int, Diagnostic]:
@@ -578,11 +707,18 @@ private pure func next_code_line(text: SourceText, start: Int, depth: Int) -> Re
 				if IntOps.equals(line.end, text.bytes.length()) or not (byte_is(text, line.end, '\n') or comment_starts(text, line.end)):
 					break
 
-				scan = match trivia_end(text, line.end):
-					Ok(end):
-						Ok(line_prefix(text, IntOps.min(IntOps.add(end, 1), text.bytes.length())))
-					Err(error):
-						Err(error)
+				scan = if IntOps.equals(line.start, line.end) and fence_at(text, line.end):
+					match doc_block_end(text, line.end):
+						Ok(after_block):
+							Ok(line_prefix(text, after_block))
+						Err(error):
+							Err(error)
+				else:
+					match trivia_end(text, line.end):
+						Ok(end):
+							Ok(line_prefix(text, IntOps.min(IntOps.add(end, 1), text.bytes.length())))
+						Err(error):
+							Err(error)
 			Err(_):
 				break
 
@@ -600,9 +736,188 @@ private pure func next_code_line(text: SourceText, start: Int, depth: Int) -> Re
 			Ok({ prefix = prefix, level = level })
 
 
+-- The two pipe String forms differ only in one byte pair: a pipe String
+-- rejects an interpolation opener; a raw block keeps every byte. In both, a
+-- line's text starts after its single marker, so `||` yields one bar.
+private fixed union PipeForm:
+	PipeMarkers
+	RawText
+
+
+-- A pipe String's joined value and where its last line's text ends: at the
+-- LF that is the code line's Newline, or at the end of the source.
+private fixed record PipeBlock {
+	value: String,
+	end: Int
+}
+
+
+-- A pipe line's text byte: a tab, a printable byte or a UTF-8 scalar.
+private pure func pipe_byte_end(text: SourceText, position: Int, byte: Int) -> Result[Int, Diagnostic]:
+	if is_byte(byte, '\t'):
+		Ok(IntOps.add(position, 1))
+	else:
+		raw_character_end(text, position, byte)
+
+
+-- The end of the pipe line text starting at `start`: its LF or the end of
+-- the source, or the first invalid byte.
+private pure func pipe_line_end(text: SourceText, start: Int, form: PipeForm) -> Result[Int, Diagnostic]:
+	-- One Result carries the scan across the line's text, or the first error.
+	var scan: Result[Int, Diagnostic] = Ok(start)
+
+	while True:
+		match scan:
+			Ok(cursor):
+				match StringOps.get(text.bytes, cursor):
+					None:
+						break
+					Some(character):
+						byte = to_int(character)
+
+						if is_byte(byte, '\n'):
+							break
+
+						scan = match form:
+							PipeMarkers:
+								if is_byte(byte, '$') and byte_is(text, IntOps.add(cursor, 1), '{'):
+									Err(error_at(text, cursor, IntOps.add(cursor, 2), PIPE_INTERPOLATION))
+								else:
+									pipe_byte_end(text, cursor, byte)
+							RawText:
+								pipe_byte_end(text, cursor, byte)
+			Err(_):
+				break
+
+	scan
+
+
+-- Whether the line starting at `line_start` begins with exactly the bytes
+-- of the indentation prefix `first`.
+private pure func same_indentation(text: SourceText, first: LinePrefix, line_start: Int) -> Bool:
+	var offset: Int = 0
+	var same: Bool = True
+
+	while same and IntOps.less_than(offset, IntOps.subtract(first.end, first.start)):
+		same = match StringOps.get(text.bytes, IntOps.add(first.start, offset)):
+			Some(expected):
+				byte_is(text, IntOps.add(line_start, offset), expected)
+			None:
+				False
+		offset = IntOps.add(offset, 1)
+
+	same
+
+
+-- The marker of the next line when it continues the block: the line after
+-- the LF at `line_end` starts with the first marker's indentation bytes and
+-- then `|`.
+private pure func continuing_marker(text: SourceText, line_end: Int, first: LinePrefix) -> Option[Int]:
+	line_start = IntOps.add(line_end, 1)
+	marker = IntOps.add(line_start, IntOps.subtract(first.end, first.start))
+
+	if byte_is(text, line_end, '\n') and same_indentation(text, first, line_start) and byte_is(text, marker, '|'):
+		Some(marker)
+	else:
+		None
+
+
+-- Reads the block whose first marker ends the indentation prefix `first`,
+-- joining the lines' text with LF.
+private pure func pipe_block(text: SourceText, first: LinePrefix, form: PipeForm) -> Result[PipeBlock, Diagnostic]:
+	var value: String = ""
+	-- One Result carries the marker of each line to read, or the first error.
+	var lines: Result[Int, Diagnostic] = Ok(first.end)
+	var end: Int = first.end
+
+	while True:
+		match lines:
+			Ok(marker):
+				text_start = IntOps.add(marker, 1)
+
+				match pipe_line_end(text, text_start, form):
+					Err(error):
+						lines = Err(error)
+					Ok(line_end):
+						value = Text.concat(value, text.bytes.substring(text_start, IntOps.subtract(line_end, text_start)))
+						end = line_end
+
+						match continuing_marker(text, line_end, first):
+							Some(next_marker):
+								value = Text.concat(value, "\n")
+								lines = Ok(next_marker)
+							None:
+								break
+			Err(_):
+				break
+
+	finished ?= lines
+	Ok({ value = value, end = end })
+
+
+-- The word `raw` is compared byte by byte: a substring would allocate.
+private RAW_WORD_WIDTH: Int = 3
+
+
+-- The indentation prefix of the marker line that opens a raw block when the
+-- code at `start` is the word `raw`, trailing spaces, a LF and then that
+-- indented marker line.
+private pure func raw_block_marker_line(text: SourceText, start: Int) -> Option[LinePrefix]:
+	word_end = run_end(text, start, IdentifierByte)
+	line_end = run_end(text, word_end, SpaceByte)
+	marker_line = line_prefix(text, IntOps.add(line_end, 1))
+	is_raw_word = (
+		IntOps.equals(word_end, IntOps.add(start, RAW_WORD_WIDTH))
+		and byte_is(text, start, 'r')
+		and byte_is(text, IntOps.add(start, 1), 'a')
+		and byte_is(text, IntOps.add(start, 2), 'w')
+	)
+
+	if is_raw_word and byte_is(text, line_end, '\n') and byte_is(text, marker_line.end, '|'):
+		Some(marker_line)
+	else:
+		None
+
+
+-- What the code of a line is, after its indentation prefix: a pipe String
+-- or raw block token, or ordinary code starting at the given position.
+private fixed union LineCode:
+	PipeLine(Token)
+	OrdinaryCode(Int)
+
+
+-- The code of the line with `prefix`: a pipe String starts at a `|` first on
+-- the line, on any line including a continuation line inside brackets.
+private pure func line_code(text: SourceText, prefix: LinePrefix) -> Result[LineCode, Diagnostic]:
+	if byte_is(text, prefix.end, '|'):
+		block ?= pipe_block(text, prefix, PipeMarkers)
+		Ok(PipeLine(token(text, PipeString(block.value), prefix.end, block.end)))
+	else:
+		match raw_block_marker_line(text, prefix.end):
+			Some(marker_line):
+				block ?= pipe_block(text, marker_line, RawText)
+				Ok(PipeLine(token(text, PipeString(block.value), prefix.end, block.end)))
+			None:
+				Ok(OrdinaryCode(prefix.end))
+
+
+-- Open brackets raise the depth and closing ones lower it, never below zero:
+-- a closer with nothing open is the parser's error, not a layout change.
+private pure func bracket_depth(depth: Int, kind: TokenKind) -> Int:
+	match kind:
+		SymbolToken(LeftParen) | SymbolToken(LeftBracket) | SymbolToken(LeftBrace):
+			IntOps.add(depth, 1)
+		SymbolToken(RightParen) | SymbolToken(RightBracket) | SymbolToken(RightBrace):
+			IntOps.max(IntOps.subtract(depth, 1), 0)
+		_:
+			depth
+
+
 -- Each code line starts with an Indent when it is one level deeper than the
 -- last, or a Dedent for each level it closes, spanning its indentation, and
 -- ends with Newline: its LF, or empty at the end of a source without one.
+-- Inside an open bracket a LF and the next line's indentation are trivia, so
+-- the code line continues there without layout tokens.
 pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnostic]:
 	text: SourceText = { origin = origin, bytes = source }
 	var tokens: List[Token] = []
@@ -626,15 +941,43 @@ pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnost
 					break
 
 				-- One Result carries the cursor across the line to its LF or EOF, or the first error.
-				var code: Result[Int, Diagnostic] = Ok(line.prefix.end)
+				var code: Result[Int, Diagnostic] = match line_code(text, line.prefix):
+					Ok(PipeLine(pipe)):
+						tokens = tokens.append(pipe)
+						Ok(pipe.span.end)
+					Ok(OrdinaryCode(start)):
+						Ok(start)
+					Err(error):
+						Err(error)
+				var brackets: Int = 0
 
 				while True:
 					match code:
 						Ok(cursor):
-							if IntOps.equals(cursor, source.length()) or byte_is(text, cursor, '\n'):
+							if IntOps.equals(cursor, source.length()):
 								break
 
-							code = if byte_is(text, cursor, ' '):
+							if byte_is(text, cursor, '\n') and IntOps.equals(brackets, 0):
+								break
+
+							code = if byte_is(text, cursor, '\n'):
+								-- A continuation line inside brackets: its indentation is
+								-- trivia, a column-1 fence is an error, and its code may be
+								-- a pipe String as on any line.
+								continued = line_prefix(text, IntOps.add(cursor, 1))
+
+								if IntOps.equals(continued.start, continued.end) and fence_at(text, continued.end):
+									Err(error_at(text, continued.end, IntOps.add(continued.end, DOC_FENCE_WIDTH), DOC_BLOCK_IN_BRACKETS))
+								else:
+									match line_code(text, continued):
+										Ok(PipeLine(pipe)):
+											tokens = tokens.append(pipe)
+											Ok(pipe.span.end)
+										Ok(OrdinaryCode(start)):
+											Ok(start)
+										Err(error):
+											Err(error)
+							else if byte_is(text, cursor, ' '):
 								Ok(IntOps.add(cursor, 1))
 							else if comment_starts(text, cursor):
 								comment_end(text, cursor)
@@ -642,6 +985,7 @@ pure func lex(origin: SourceId, source: String) -> Result[LexedProgram, Diagnost
 								match code_token(text, cursor):
 									Ok(token):
 										tokens = tokens.append(token)
+										brackets = bracket_depth(brackets, token.kind)
 										Ok(token.span.end)
 									Err(error):
 										Err(error)

@@ -1,0 +1,117 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/assemble: ParsedProgram, parsed_contents
+	../../../src/utils/ids: inventory_functions
+	../../../src/utils/source: module_source, root_module_id, same_module
+	../../../src/utils/syntax:
+		Diagnostic,
+		ExpressionBase(IntegerExpression, DirectApplication),
+		ParsedBody(ParsedValueBody),
+		PostfixOperation(FieldAccess, ReceiverInvocation),
+		ValueExpression,
+	../input: parse
+	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+private EXPRESSION_HELP: String = "use a literal, a parameter or variant name, or a call as the entire body"
+
+
+private pure func parse_source(source: String) -> Result[ParsedProgram, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source)
+	parse(tokens)
+
+
+private pure func only_value(source: String) -> Option[ValueExpression]:
+	match parse_source(source):
+		Ok(parsed):
+			functions = inventory_functions(parsed_contents(parsed).declarations)
+				.filter(pure func(row): same_module(row.declaration.module, root_module_id()))
+				.map(pure func(row): row.declaration)
+			match functions:
+				[function]:
+					match function.body:
+						ParsedValueBody(value):
+							Some(value)
+						_:
+							None
+				_:
+					None
+		Err(_):
+			None
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parse_source(source):
+		Err(diagnostic):
+			(
+				diagnostic.span.start == start
+				and diagnostic.span.end == end
+				and diagnostic.message == message
+				and diagnostic.help == help
+			)
+		Ok(_):
+			False
+
+
+-- Parentheses group one expression: the grouped expression is the result,
+-- with its span widened to the parentheses.
+pure func test_parentheses_group_a_literal() -> Bool:
+	match only_value(HEADER + "\t( 7 )\n"):
+		Some(value):
+			match value.base:
+				IntegerExpression(7):
+					(
+						value.applications.length() == 0
+						and value.base_span.start == 23 and value.base_span.end == 24
+						and value.span.start == 21 and value.span.end == 26
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_postfix_operations_follow_the_closing_parenthesis() -> Bool:
+	match only_value(HEADER + "\t(f(1).first).second\n"):
+		Some(value):
+			match (value.base, value.applications):
+				(DirectApplication(_, arguments), [FieldAccess(_), FieldAccess(_)]):
+					arguments.length() == 1 and value.span.start == 21 and value.span.end == 40
+				_:
+					False
+		None:
+			False
+
+
+pure func test_grouped_expression_may_span_lines() -> Bool:
+	match only_value(HEADER + "\t(\n\t\t7\n\t)\n"):
+		Some(value):
+			match value.base:
+				IntegerExpression(7):
+					value.span.start == 21 and value.span.end == 29
+				_:
+					False
+		None:
+			False
+
+
+pure func test_empty_parentheses_are_not_an_expression() -> Bool:
+	rejects(HEADER + "\t()\n", 22, 23, "expected a return expression", EXPRESSION_HELP)
+
+
+pure func test_unclosed_group_is_reported_at_the_next_token() -> Bool:
+	rejects(HEADER + "\t(7 8)\n", 24, 25, "expected ')' after the grouped expression", "close the parentheses after one expression; UFCS and field reads may follow ')'")
+
+
+tests: TestSuite = {
+	description = "Blorp 2 grouping parentheses",
+	tests = [
+		("parentheses group a literal", test_parentheses_group_a_literal),
+		("postfix operations follow the closing parenthesis", test_postfix_operations_follow_the_closing_parenthesis),
+		("grouped expression may span lines", test_grouped_expression_may_span_lines),
+		("empty parentheses are not an expression", test_empty_parentheses_are_not_an_expression),
+		("unclosed group is reported at the next token", test_unclosed_group_is_reported_at_the_next_token),
+	]
+}

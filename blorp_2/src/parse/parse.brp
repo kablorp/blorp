@@ -45,7 +45,7 @@ import:
 			LeftBrace, RightBrace, RecordUpdateBar, Comma, AtSign, Slash, Star,
 		),
 		Token,
-		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString),
+		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, PipeString, CharLiteral),
 		TypeSyntax(AtomicType, AppliedType),
 		UTF8_CONTINUATION_END,
 		UTF8_CONTINUATION_START,
@@ -361,6 +361,31 @@ private pure func at_spaced_token(state: ParserState) -> Bool:
 					False
 		None:
 			False
+
+
+private pure func at_closing_bracket(state: ParserState) -> Bool:
+	at_right_paren(state) or at_right_bracket(state) or at_right_brace(state)
+
+
+-- What follows one item of a bracketed, comma-separated list.
+private fixed union ListSeparator:
+	ListContinues(ParserState)
+	ListEnds(ParserState)
+
+
+-- A comma followed by another item continues the list; no comma, or a
+-- trailing comma before the closing bracket, ends it. The caller then
+-- expects its own closing bracket, so a mismatched closer is still an error.
+private pure func list_separator(state: ParserState) -> ListSeparator:
+	if not at_comma(state):
+		ListEnds(state)
+	else:
+		after_comma = shifted(state, 1)
+
+		if at_closing_bracket(after_comma):
+			ListEnds(after_comma)
+		else:
+			ListContinues(after_comma)
 
 
 -- Consumes the token at `state` when the caller's match found it `present`.
@@ -704,10 +729,11 @@ private pure func consume_argument_list(state: ParserState, arguments: List[Valu
 	value ?= consume_value(state)
 	gathered = arguments.append(value.body)
 
-	if at_comma(value.next):
-		consume_argument_list(shifted(value.next, 1), gathered)
-	else:
-		Ok({ values = gathered, next = value.next })
+	match list_separator(value.next):
+		ListContinues(next):
+			consume_argument_list(next, gathered)
+		ListEnds(next):
+			Ok({ values = gathered, next = next })
 
 
 -- `end` is where the closing parenthesis ends.
@@ -773,6 +799,10 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
 		QuotedString(raw):
 			bytes ?= string_value(raw, token.span)
 			Ok({ base = StringExpression(bytes), span = token.span, next = after })
+		PipeString(value):
+			Ok({ base = StringExpression(value), span = token.span, next = after })
+		CharLiteral:
+			Err(diagnostic(token.span, "Char literals are not supported yet", "use a one-character String literal such as \"a\""))
 		IdentifierToken(_):
 			consume_name_or_call(start)
 		_:
@@ -831,17 +861,46 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 		None:
 			Err(expected(start, "expected a return expression", EXPRESSION_HELP))
 		Some(token):
-			base ?= consume_base(start, token)
-			postfixes ?= consume_postfixes(base.next, [], base.span.end)
-			Ok({
-				body = {
-					base = base.base,
-					base_span = base.span,
-					applications = postfixes.applications,
-					span = { token.span | end = postfixes.end }
-				},
-				next = postfixes.next,
-			})
+			match token.kind:
+				SymbolToken(LeftParen):
+					consume_grouped_value(start, token.span)
+				_:
+					base ?= consume_base(start, token)
+					postfixes ?= consume_postfixes(base.next, [], base.span.end)
+					Ok({
+						body = {
+							base = base.base,
+							base_span = base.span,
+							applications = postfixes.applications,
+							span = { token.span | end = postfixes.end }
+						},
+						next = postfixes.next,
+					})
+
+
+-- `start` is at an opening parenthesis: one expression, then ')'. The group
+-- is transparent: the grouped expression's base and postfix operations are
+-- the result, its span widens to the parentheses, and further postfix
+-- operations may follow the ')'.
+private pure func consume_grouped_value(start: ParserState, opening: Span) -> Result[ParsedValue, Diagnostic]:
+	inner ?= consume_value(shifted(start, 1))
+	closing = parser_span(inner.next)
+	closed ?= expect(
+		inner.next,
+		at_right_paren(inner.next),
+		"expected ')' after the grouped expression",
+		"close the parentheses after one expression; UFCS and field reads may follow ')'",
+	)
+	postfixes ?= consume_postfixes(closed, inner.body.applications, closing.end)
+	Ok({
+		body = {
+			base = inner.body.base,
+			base_span = inner.body.base_span,
+			applications = postfixes.applications,
+			span = { opening | end = postfixes.end }
+		},
+		next = postfixes.next,
+	})
 
 
 private fixed record ParsedType {
@@ -860,10 +919,11 @@ private pure func consume_type_arguments(state: ParserState, types: List[TypeSyn
 	argument ?= consume_type(state, "expected a type argument")
 	gathered = types.append(argument.written)
 
-	if at_comma(argument.next):
-		consume_type_arguments(shifted(argument.next, 1), gathered)
-	else:
-		Ok({ types = gathered, next = argument.next })
+	match list_separator(argument.next):
+		ListContinues(next):
+			consume_type_arguments(next, gathered)
+		ListEnds(next):
+			Ok({ types = gathered, next = next })
 
 
 private pure func consume_type(state: ParserState, message: String) -> Result[ParsedType, Diagnostic]:
@@ -911,10 +971,11 @@ private pure func consume_parameter_list(
 	parameter ?= consume_parameter(state, message)
 	gathered = parameters.append(parameter.parameter)
 
-	if at_comma(parameter.next):
-		consume_parameter_list(shifted(parameter.next, 1), message, gathered)
-	else:
-		Ok({ parameters = gathered, next = parameter.next })
+	match list_separator(parameter.next):
+		ListContinues(next):
+			consume_parameter_list(next, message, gathered)
+		ListEnds(next):
+			Ok({ parameters = gathered, next = next })
 
 
 private pure func consume_parameters(start: ParserState) -> Result[ParsedParameters, Diagnostic]:
@@ -970,9 +1031,12 @@ private pure func consume_pattern(state: ParserState) -> Result[PatternResult, D
 							fields = fields.append(field.field)
 							current = field.next
 
-					if not at_comma(current):
-						break
-					current = shifted(current, 1)
+					match list_separator(current):
+						ListContinues(next):
+							current = next
+						ListEnds(next):
+							current = next
+							break
 
 			ready ?= match failure:
 				Some(error): Err(error)
@@ -1148,10 +1212,7 @@ private pure func at_builtin_body(state: ParserState) -> Bool:
 		False
 
 
-private BUILTIN_LABEL_HELP: String = (
-	"use int.equals, int.add, int.subtract, int.multiply, int.divide, int.remainder, int."
-	+ "to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals, list.repeat, list.length or list.get"
-)
+private BUILTIN_LABEL_HELP: String = "use int.equals, int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals, list.repeat, list.length or list.get"
 
 
 private pure func primitive_operation(label: String) -> Option[ParsedRuntimeOperation]:
@@ -1281,31 +1342,65 @@ private pure func builtin_not_alone(state: ParserState) -> Diagnostic:
 	expected(state, "builtin must be the entire function body", "use builtin as the entire function body; put other work in an ordinary wrapper function")
 
 
+-- One code line of a function body, after its Newline: a statement, or the
+-- body that ends the block.
+private fixed union FunctionLine:
+	BodyStatement(ParsedStatement, ParserState)
+	BodyEnd(ParsedBody, ParserState)
+
+
 -- The function's final line is a value, a builtin body or a tail match; the
 -- block's Dedent must follow it.
-private pure func consume_function_lines(state: ParserState, statements: List[ParsedStatement]) -> Result[StatementBlock, Diagnostic]:
-	unfinished ?= require_final_line(state, "expected a final expression after the bindings", "finish the function with a value expression or tail match")
-
+private pure func consume_function_line(state: ParserState, statements: List[ParsedStatement]) -> Result[FunctionLine, Diagnostic]:
 	match current_symbol(state):
 		Some(MatchKeyword):
 			matched ?= consume_match(state)
 			closed ?= expect(matched.next, at_dedent(matched.next), "a match must end its function", "move the statements after the match before it, or indent further arms one level deeper than the match")
-			Ok({ statements = statements, body = matched.body, next = closed })
+			Ok(BodyEnd(matched.body, closed))
 		_:
 			if at_builtin_body(state):
-				consume_builtin_lines(state, statements)
+				closed ?= consume_builtin_lines(state, statements)
+				Ok(BodyEnd(closed.body, closed.next))
 			else:
 				line ?= consume_block_line(state)
 
 				match line:
 					StatementLine(statement, next):
-						consume_function_lines(next, statements.append(statement))
+						Ok(BodyStatement(statement, next))
 					FinalLine(value, next):
-						Ok({ statements = statements, body = ParsedValueBody(value), next = next })
+						Ok(BodyEnd(ParsedValueBody(value), next))
+
+
+-- Statement lines accumulate in a loop, one host frame for the whole block,
+-- until the body line ends it. A Dedent directly after a statement means the
+-- body line is missing.
+private pure func consume_function_lines(start: ParserState) -> Result[StatementBlock, Diagnostic]:
+	var statements: List[ParsedStatement] = []
+	-- One Result carries each consumed line, or the first error.
+	var line: Result[FunctionLine, Diagnostic] = consume_function_line(start, statements)
+
+	while True:
+		match line:
+			Ok(BodyStatement(statement, next)):
+				if at_dedent(next):
+					break
+
+				statements = statements.append(statement)
+				line = consume_function_line(next, statements)
+			_:
+				break
+
+	ended ?= line
+
+	match ended:
+		BodyEnd(body, next):
+			Ok({ statements = statements, body = body, next = next })
+		BodyStatement(_, next):
+			Err(expected(next, "expected a final expression after the bindings", "finish the function with a value expression or tail match"))
 
 
 -- A builtin body is the function's only line.
-private pure func consume_builtin_lines(state: ParserState, statements: List[ParsedStatement]) -> Result[StatementBlock, Diagnostic]:
+private pure func consume_builtin_lines(state: ParserState, statements: List[ParsedStatement]) -> Result[BodyResult, Diagnostic]:
 	alone ?= if statements.is_empty():
 		Ok(void)
 	else:
@@ -1314,7 +1409,7 @@ private pure func consume_builtin_lines(state: ParserState, statements: List[Par
 	after ?= end_value_line(operation.next)
 
 	if at_dedent(after):
-		Ok({ statements = statements, body = operation.body, next = shifted(after, 1) })
+		Ok({ body = operation.body, next = shifted(after, 1) })
 	else:
 		Err(builtin_not_alone(state))
 
@@ -1353,12 +1448,14 @@ private pure func consume_type_parameter_list(state: ParserState, parameters: Li
 	name ?= consume_type_parameter(state)
 	gathered = parameters.append(name.name)
 
-	if at_right_bracket(name.next):
-		Ok({ names = gathered, next = shifted(name.next, 1) })
-	else if at_comma(name.next):
-		consume_type_parameter_list(shifted(name.next, 1), gathered)
-	else:
-		Err(expected(name.next, "expected ',' or ']' after a type parameter", "separate type parameters with commas and close the list with ']'"))
+	match list_separator(name.next):
+		ListContinues(next):
+			consume_type_parameter_list(next, gathered)
+		ListEnds(next):
+			if at_right_bracket(next):
+				Ok({ names = gathered, next = shifted(next, 1) })
+			else:
+				Err(expected(next, "expected ',' or ']' after a type parameter", "separate type parameters with commas and close the list with ']'"))
 
 
 private pure func consume_type_parameters(state: ParserState) -> Result[NameList, Diagnostic]:
@@ -1478,7 +1575,7 @@ private fixed record FunctionResult {
 private pure func consume_function(start: ParserState, module: ModuleId) -> Result[FunctionResult, Diagnostic]:
 	annotation ?= consume_annotation(start)
 	header ?= consume_header(annotation.next)
-	body ?= consume_function_lines(header.next, [])
+	body ?= consume_function_lines(header.next)
 	Ok({
 		function = {
 			module = module,
@@ -1521,9 +1618,12 @@ private pure func consume_variant(state: ParserState) -> Result[VariantResult, D
 						fields = fields.append(field.written)
 						current = field.next
 
-				if not at_comma(current):
-					break
-				current = shifted(current, 1)
+				match list_separator(current):
+					ListContinues(next):
+						current = next
+					ListEnds(next):
+						current = next
+						break
 
 		ready ?= match failure:
 			Some(error): Err(error)
@@ -1592,10 +1692,11 @@ private pure func consume_literal_fields(state: ParserState, fields: List[Parsed
 	value ?= consume_value(after_equals)
 	gathered = fields.append({ name = name.name, value = value.body })
 
-	if at_comma(value.next):
-		consume_literal_fields(shifted(value.next, 1), gathered)
-	else:
-		Ok({ fields = gathered, next = value.next })
+	match list_separator(value.next):
+		ListContinues(next):
+			consume_literal_fields(next, gathered)
+		ListEnds(next):
+			Ok({ fields = gathered, next = next })
 
 
 -- `start` follows the opening brace.
@@ -1604,7 +1705,7 @@ private pure func consume_record_literal(start: ParserState, opening: Span) -> R
 		Ok({ fields = [], next = start })
 	else:
 		consume_literal_fields(start, [])
-	closed ?= expect(listed.next, at_right_brace(listed.next), "expected '}' after the record fields", "keep record fields on one line, separated by commas")
+	closed ?= expect(listed.next, at_right_brace(listed.next), "expected '}' after the record fields", "separate record fields with commas, then close the literal with '}'")
 	Ok({ base = RecordExpression(listed.fields), span = { opening | end = parser_span(listed.next).end }, next = closed })
 
 
@@ -1619,7 +1720,7 @@ private pure func consume_braced_record(start: ParserState, opening: Span) -> Re
 			_: False
 		bar ?= expect(base.next, at_bar, "expected '|' after the record update base", "write { existing_record | field = expression }")
 		fields ?= consume_literal_fields(bar, [])
-		closed ?= expect(fields.next, at_right_brace(fields.next), "expected '}' after the record update fields", "keep replacement fields on one line, separated by commas")
+		closed ?= expect(fields.next, at_right_brace(fields.next), "expected '}' after the record update fields", "separate replacement fields with commas, then close the update with '}'")
 		Ok({ base = RecordUpdateExpression(base.body, fields.fields), span = { opening | end = parser_span(fields.next).end }, next = closed })
 
 
@@ -1638,7 +1739,7 @@ private pure func consume_record(start: ParserState, module: ModuleId) -> Result
 		_:
 			Err(unexpected(type_parameters.next, "expected '{' after the record type name", "write fixed record Name { field: Int }"))
 	fields ?= consume_parameter_list(opened, "expected a record field name", [])
-	closed ?= expect(fields.next, at_right_brace(fields.next), "expected '}' after the record declaration", "keep nonempty record fields on one line, separated by commas")
+	closed ?= expect(fields.next, at_right_brace(fields.next), "expected '}' after the record declaration", "separate record fields with commas, then close the declaration with '}'")
 	Ok({ declaration = { module = module, type_name = name.name, type_parameters = type_parameters.names, fields = fields.parameters }, next = closed })
 
 
@@ -1783,14 +1884,12 @@ private fixed record ImportSelectionResult {
 private pure func consume_constructor_names(state: ParserState, names: List[WrittenName]) -> Result[NameList, Diagnostic]:
 	name ?= consume_name(state, "expected an imported constructor name")
 	gathered = names.append(name.name)
-	after_comma = shifted(name.next, 1)
 
-	if not at_comma(name.next):
-		Ok({ names = gathered, next = name.next })
-	else if at_right_paren(after_comma):
-		Err(expected(after_comma, "expected a constructor after ','", "omit the trailing comma in Option(Some, None)"))
-	else:
-		consume_constructor_names(after_comma, gathered)
+	match list_separator(name.next):
+		ListContinues(next):
+			consume_constructor_names(next, gathered)
+		ListEnds(next):
+			Ok({ names = gathered, next = next })
 
 
 private ONLY_METHODS_HELP: String = "write Foo(First) to import the type and constructors, or Foo methods_only to import only methods"
@@ -1802,7 +1901,7 @@ private pure func consume_constructor_selection(name: ParsedName) -> Result[Impo
 		Ok({ names = [], next = opened })
 	else:
 		consume_constructor_names(opened, [])
-	closed ?= expect(selected.next, at_right_paren(selected.next), "expected ')' after selected constructors", "write Option(Some, None) or Option() on one line")
+	closed ?= expect(selected.next, at_right_paren(selected.next), "expected ')' after selected constructors", "write Option(Some, None) or Option(), then close the selection with ')'")
 
 	if at_word(closed, "methods_only"):
 		Err(expected(closed, "constructor selection cannot be combined with methods_only", ONLY_METHODS_HELP))
@@ -1850,14 +1949,46 @@ private fixed record ImportSymbols {
 }
 
 
+private SELECTION_LINE_HELP: String = "separate imported names with commas; a path ending in ':' may list them on indented lines"
+
+
+-- The selections written on one line: a comma continues the line unless the
+-- line ends after it.
 private pure func consume_import_symbols(state: ParserState, symbols: List[ImportSelection]) -> Result[ImportSymbols, Diagnostic]:
 	symbol ?= consume_import_symbol(state)
 	gathered = symbols.append(symbol.selection)
+	after_comma = shifted(symbol.next, 1)
 
-	if at_comma(symbol.next):
-		consume_import_symbols(shifted(symbol.next, 1), gathered)
-	else:
+	if not at_comma(symbol.next):
 		Ok({ symbols = gathered, last = symbol.span, next = symbol.next })
+	else if at_newline(after_comma):
+		Ok({ symbols = gathered, last = symbol.span, next = after_comma })
+	else:
+		consume_import_symbols(after_comma, gathered)
+
+
+-- `state` is at a selection line of an indented block; the block ends at its Dedent.
+private pure func consume_selection_lines(state: ParserState, symbols: List[ImportSelection]) -> Result[ImportSymbols, Diagnostic]:
+	line ?= consume_import_symbols(state, symbols)
+	next ?= consume_line_end(line.next, "expected ',' between imported function names", SELECTION_LINE_HELP)
+
+	if at_dedent(next):
+		Ok({ line | next = shifted(next, 1) })
+	else:
+		consume_selection_lines(next, line.symbols)
+
+
+-- `colon` follows the import path's ':': the selections are on this line or
+-- on an indented block of lines.
+private pure func consume_import_selection(colon: ParserState) -> Result[ImportSymbols, Diagnostic]:
+	if not at_newline(colon):
+		symbols ?= consume_import_symbols(colon, [])
+		next ?= consume_line_end(symbols.next, "expected ',' between imported function names", SELECTION_LINE_HELP)
+		Ok({ symbols | next = next })
+	else if at_indent(shifted(colon, 1)):
+		consume_selection_lines(shifted(colon, 2), [])
+	else:
+		Err(expected(colon, "expected an imported function or type name", IDENTIFIER_HELP))
 
 
 private fixed record ImportResult {
@@ -1874,11 +2005,10 @@ private pure func consume_import_row(start: ParserState) -> Result[ImportResult,
 		Err(expected(path.next, "import paths omit file extensions", "write ./helper: answer instead of ./helper.brp: answer"))
 	else:
 		expect(path.next, at_colon(path.next), "expected ':' and selected function names after the import path", "write ./helper: answer; module aliases and whole-module imports are not supported yet")
-	symbols ?= consume_import_symbols(selection, [])
-	next ?= consume_line_end(symbols.next, "expected ',' between imported function names", "write ./helper: answer, other on one line")
+	symbols ?= consume_import_selection(selection)
 	Ok({
 		request = { path = path.path, symbols = symbols.symbols, span = { path.span | end = symbols.last.end } },
-		next = next,
+		next = symbols.next,
 	})
 
 

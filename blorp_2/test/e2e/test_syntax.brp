@@ -1,0 +1,99 @@
+import:
+	./cost: CostLimits
+	./harness: run_output_example, run_source_example, verify_rejected_command, with_directory
+	system: write_file
+	test: TestSuite
+
+
+-- Ceilings from the suite's own run: at most 8,901 allocations and 54.2M
+-- instructions per fixture (2026-10-15).
+private LIMITS: CostLimits = {
+	allocations = 10000,
+	instructions = 65000000
+}
+
+
+private func example(compiler: String, fixture: String, expected: Int) -> Bool:
+	run_source_example(compiler, "blorp_2/test/e2e/fixtures/syntax/" + fixture + ".brp", expected, LIMITS)
+
+
+-- A bracket left open at the end of the source is reported where the
+-- arguments should have closed: at the end of the file.
+private func verify_unclosed_bracket(compiler: String, directory: String) -> Result[Void, String]:
+	source: String =
+		|import:
+		|	int: add
+		|
+		|func main() -> Int:
+		|	add(1,
+		|		2
+		|
+	input = directory + "/unclosed.brp"
+	expected = input + ":7:1: error: expected ')' after the call arguments\nhelp: separate complete expressions with commas, then close the call with ')'\n"
+	written ?= write_file(input, source)
+	verify_rejected_command(compiler, input, directory + "/unclosed.c", expected)
+
+
+-- A Char literal lexes but has no type yet; the parser rejects it exactly.
+private func verify_char_literal_rejected(compiler: String, directory: String) -> Result[Void, String]:
+	source: String =
+		|func main() -> Int:
+		|	'a'
+		|
+	input = directory + "/char.brp"
+	expected = input + ":2:2: error: Char literals are not supported yet\nhelp: use a one-character String literal such as \"a\"\n"
+	written ?= write_file(input, source)
+	verify_rejected_command(compiler, input, directory + "/char.c", expected)
+
+
+-- A function body with this many statement lines, then a line the checker
+-- rejects. The base pilot (ba57e368a) exits 139 on it at the default stack
+-- because the parser recursed once per statement; 2,000 lines still passed.
+-- With the loop, parsing completes and the checker's exact diagnostic on
+-- line 3 is reached before any later phase runs.
+private LONG_BODY_STATEMENTS: Int = 3000
+
+
+private pure func long_body_source() -> String:
+	var source: String = "func main() -> Int:\n"
+	var count: Int = 0
+
+	while count < LONG_BODY_STATEMENTS:
+		source = source + "\tx = 0\n"
+		count = count + 1
+
+	source + "\t0\n"
+
+
+private func verify_long_body_reaches_the_checker(compiler: String, directory: String) -> Result[Void, String]:
+	input = directory + "/long_body.brp"
+	expected = input + ":3:2: error: cannot assign to an immutable binding\nhelp: declare the binding with var to allow reassignment\n"
+	written ?= write_file(input, long_body_source())
+	verify_rejected_command(compiler, input, directory + "/long_body.c", expected)
+
+
+pure func suite(compiler: String) -> TestSuite:
+	{
+		description = "Blorp 2 surface syntax",
+		tests = [
+			("line breaks inside brackets continue the line", func(): example(compiler, "continuation", 7)),
+			("import selections on indented lines", func(): example(compiler, "import_block", 7)),
+			("parentheses group an expression", func(): example(compiler, "grouping", 7)),
+			(
+				"pipe and raw Strings keep their lines",
+				func(): run_output_example(compiler, "blorp_2/test/e2e/fixtures/syntax/pipe_string.brp", "first\n|second\n\\n||$" + "{\n\n", LIMITS),
+			),
+			(
+				"unclosed bracket is rejected at the end of the file",
+				func(): with_directory(func(directory: String): verify_unclosed_bracket(compiler, directory)),
+			),
+			(
+				"Char literal is rejected until the Char type exists",
+				func(): with_directory(func(directory: String): verify_char_literal_rejected(compiler, directory)),
+			),
+			(
+				"a 3,000-statement body is parsed in one frame and reaches the checker",
+				func(): with_directory(func(directory: String): verify_long_body_reaches_the_checker(compiler, directory)),
+			),
+		]
+	}

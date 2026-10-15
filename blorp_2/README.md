@@ -762,8 +762,8 @@ never supply an otherwise unknown record owner. Checking publishes complete
 typed replacement and inherited-field rows, with parser-owned base spans.
 Later stages use resolved field identities rather than spelling lookups.
 
-Updates require at least one replacement, stay on one line and do not allow
-trailing commas. After `{`, a name followed by `=` starts a literal; otherwise
+Updates require at least one replacement and allow a trailing comma; their
+braces may span lines. After `{`, a name followed by `=` starts a literal; otherwise
 the parser reads a base expression and requires `|`. Thus `{ first : 7 }` reports
 a missing update bar, while `{ first = 7, second : 9 }` reports the second field's
 missing `=`. Unknown names, duplicates and mismatched field types report
@@ -818,12 +818,15 @@ one or more finite fields after substitution. Union variants have zero or more o
 specialize to Int, Float, String, Void, a List of any supported finite type, a finite record, or another finite inline union. A function
 body has zero or more ordered binding or Void expression statements followed
 by a final expression or a tail match with inline arm results or statement blocks. Expressions
-start with `void`, a signed Int64 or decimal Float64 literal, a quoted UTF-8 String literal, a binding or variant name, a record literal or update,
-or an application with an ordered list of arguments. UFCS calls and record
-field suffixes may follow that expression.
+start with `void`, a signed Int64 or decimal Float64 literal, a quoted UTF-8 String literal, a pipe String or raw block, a binding or variant name, a record literal or update,
+an application with an ordered list of arguments, or one expression grouped in
+parentheses. UFCS calls and record field suffixes may follow that expression,
+including a group's closing parenthesis.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
 No other declarations, expressions, literals, or statements are supported.
-Single-line comments begin with `--`; docstrings remain deferred.
+Single-line comments begin with `--`; a line holding only `---` at column 1
+opens a documentation block that the next such line closes, and the block is
+trivia.
 
 [`grammar.ebnf`](grammar.ebnf) defines the complete restricted source grammar
 and its EBNF dialect. Whitespace is explicit: LF is `"\n"`, TAB is `"\t"`, and
@@ -853,10 +856,13 @@ Lexical and layout rules:
   separation; the final line may end at EOF.
 - `--` begins a comment anywhere outside a quoted String or builtin label and consumes
   bytes up to LF or EOF. Inline comments preserve the code line's newline;
-  comments cannot continue expressions across lines. `---` is also an ordinary
-  line comment. Comments permit ASCII bytes, including tabs; CR and non-ASCII
-  bytes are rejected at their original byte offsets. There is no docstring
-  metadata or documentation fence syntax yet.
+  comments cannot continue expressions across lines, except inside an open
+  bracket, where the comment and the line break are trivia. Comments permit
+  ASCII bytes, including tabs; CR and non-ASCII bytes are rejected at their
+  original byte offsets. A line holding only `---` at column 1 opens a
+  documentation block closed by the next such line; its text is trivia and
+  admits any byte but CR. `----` and `--- x` remain comments, and there is no
+  docstring metadata yet.
 - The entire indentation prefix of a real code line uses tabs only or spaces in groups of four.
   Body and variant lines require depth one: one tab or four spaces. Match arms
   require depth two: two tabs or eight spaces. Arm-block lines require depth
@@ -870,7 +876,19 @@ Lexical and layout rules:
   `funcmain` is one identifier. The two characters of `->` are adjacent.
   Spaces may surround a UFCS dot and its parentheses, as in `1 . one ( )`.
   Outside comments, tabs occur only in the indentation prefix. Each expression stays on one line,
-  including match scrutinees, binding initializers and final arm results.
+  including match scrutinees, binding initializers and final arm results,
+  except that a line break inside an open bracket continues the line.
+- A `|` first on a line, including a continuation line inside brackets,
+  starts a pipe String: each line's text after its marker, verbatim and
+  without escapes, joined with LF; the literal continues while the next line
+  has the first line's exact indentation bytes before its `|`. `||` yields one
+  `|` and `${` is rejected. `raw` alone on a line followed by marker lines
+  starts a raw block, where `${` is text. The literal is the whole code of its
+  lines, so it stands where an expression line does or as an argument on its
+  own lines; a record update bar therefore never starts a line.
+- `'a'` and `'\n'` are Char literal tokens: one character or escape pair in
+  single quotes. The parser rejects them with a teaching message until the
+  Char type exists.
 - `func`, `pure`, `match`, `var`, `void`, and lone `_` are reserved. The optional `pure` qualifier precedes `func`
   with spaces between the two keywords. Function, parameter and type names are
   identifiers whose meaning is checked after parsing.
@@ -889,8 +907,8 @@ Lexical and layout rules:
   recursive type arguments such as `Box[Box[Int]]` or `Result[T, Box[E]]`.
   Empty declaration parentheses remain unsupported. Concrete field layouts may
   contain Int, Float, String, Void, Lists of supported finite types, finite inline unions or records.
-- `fixed record Pair { first: Int, second: Int }` declares a nominal record
-  on one line. Field names must be distinct and have supported finite concrete
+- `fixed record Pair { first: Int, second: Int }` declares a nominal record;
+  its braces may span lines. Field names must be distinct and have supported finite concrete
   types after specialization. `fixed record Box[T] { value: T }` declares ordered
   type parameters; their identity belongs to this record. `record` remains a
   contextual header word. Empty and recursive records remain unsupported. Representation follows the
@@ -900,13 +918,13 @@ Lexical and layout rules:
   Every field appears exactly once. Expressions evaluate in written order;
   field order in the literal may differ from declaration order. A new inferred
   binding alone supplies no record context. `{}` parses and reports the first
-  missing field. Declarations and literals stay on one line; trailing commas
-  and field assignments are unsupported.
+  missing field. Declarations and literals may span lines inside their
+  braces and allow a trailing comma; field assignments are unsupported.
 - `{ pair | second = 9, first = 7 }` preserves the base's nominal type and
   type arguments. The base executes once, replacements execute in written
   order, and construction stores all fields in declaration order. Every
   replacement name appears at most once; at least one replacement is required.
-  Updates stay on one line and do not permit trailing commas.
+  Updates may span lines inside their braces and permit a trailing comma.
 - `pair.first` reads a declared field; `pair.read_first()` remains a UFCS call.
   A uniquely resolved immediate UFCS receiver parameter may supply a nominal
   literal context, including a head with unresolved generic arguments.
@@ -926,8 +944,8 @@ Lexical and layout rules:
   A nullary constructor pattern may be written `Empty` or `Empty()`. `Number()`
   is valid syntax but fails semantic arity checking for a one-field constructor.
 - A binding line is `name = expression` or `var name = expression`, at depth
-  one in a function or depth three in an arm block. Its initializer occupies
-  the same line. Bindings and bare expression statements may interleave before
+  one in a function or depth three in an arm block. Its initializer starts on
+  the same line and may continue inside brackets. Bindings and bare expression statements may interleave before
   the mandatory final expression or function tail match. A non-final bare
   expression must return Void; bind or return other values. Bindings inside
   arguments and annotations are unsupported. An arm block cannot contain a
@@ -1092,7 +1110,7 @@ Semantic rules:
   are admitted before an ordinary terminating match. Each selected arm discharges
   prefix obligations after securing its result. Literal construction creates a
   fresh ordinary String owner. COW, joins and managed annotated loops are deferred.
-- Parenthesized expressions, recursive layouts, nested matches,
+- Recursive layouts, nested matches,
   guards, qualified/nested/literal patterns, constructor UFCS, multiline chains,
   non-tail matches, and function
   values are outside this increment. `Bool` is an ordinary fixed union declared
@@ -1123,7 +1141,9 @@ pure func answer() -> Int:
 
 The executable exits 42. Each import row starts with `./`
 or leading `../` segments, omits `.brp`, and selects local functions or fixed
-unions. A bare selector selects a local function or a visible type; if both
+unions. The selections follow the path on its line, or on an indented block
+of lines under a path ending in `:`; each line may end with a comma. A bare
+selector selects a local function or a visible type; if both
 exist, the selection is ambiguous. `Option(Some, None)` selects a union and those
 constructors, while `Option()` selects the union without constructors. Both
 forms also enable local receiver functions. `Foo methods_only` adds receiver

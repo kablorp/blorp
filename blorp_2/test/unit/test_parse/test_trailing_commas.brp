@@ -1,0 +1,198 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/assemble: ParsedProgram, parsed_contents
+	../../../src/parse/parse: ImportSelection(ConstructorSelection), module_contents, module_imports, parse_module
+	../../../src/utils/ids: inventory_functions, inventory_unions
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id, same_module
+	../../../src/utils/syntax:
+		Diagnostic,
+		ExpressionBase(DirectApplication, RecordExpression, RecordUpdateExpression),
+		ParsedBody(ParsedMatchBody, ParsedValueBody),
+		ParsedFunction,
+		ParsedPattern(PatternConstructor),
+		ParsedRecord,
+		PostfixOperation(ReceiverInvocation),
+		TypeSyntax(AppliedType),
+		ValueExpression,
+	../input: parse
+	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+
+private pure func parse_source(source: String) -> Result[ParsedProgram, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source)
+	parse(tokens)
+
+
+private pure func root_functions(source: String) -> List[ParsedFunction]:
+	match parse_source(source):
+		Ok(parsed):
+			inventory_functions(parsed_contents(parsed).declarations)
+				.filter(pure func(row): same_module(row.declaration.module, root_module_id()))
+				.map(pure func(row): row.declaration)
+		Err(_):
+			[]
+
+
+private pure func only_value(source: String) -> Option[ValueExpression]:
+	match root_functions(source):
+		[function]:
+			match function.body:
+				ParsedValueBody(value):
+					Some(value)
+				_:
+					None
+		_:
+			None
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parse_source(source):
+		Err(diagnostic):
+			(
+				diagnostic.span.start == start
+				and diagnostic.span.end == end
+				and diagnostic.message == message
+				and diagnostic.help == help
+			)
+		Ok(_):
+			False
+
+
+pure func test_call_arguments_accept_a_trailing_comma() -> Bool:
+	match only_value(HEADER + "\tf(1, 2,)\n").map(pure func(value): value.base):
+		Some(DirectApplication(_, arguments)):
+			arguments.length() == 2
+		_:
+			False
+
+
+pure func test_receiver_arguments_accept_a_trailing_comma() -> Bool:
+	match only_value(HEADER + "\t1.f(2,)\n").map(pure func(value): value.applications):
+		Some([ReceiverInvocation(call)]):
+			call.arguments.length() == 1
+		_:
+			False
+
+
+pure func test_record_literal_accepts_a_trailing_comma() -> Bool:
+	match only_value(HEADER + "\t{ first = 1, second = 2, }\n").map(pure func(value): value.base):
+		Some(RecordExpression(fields)):
+			fields.length() == 2
+		_:
+			False
+
+
+pure func test_record_update_accepts_a_trailing_comma() -> Bool:
+	match only_value(HEADER + "\t{ base | first = 1, }\n").map(pure func(value): value.base):
+		Some(RecordUpdateExpression(_, fields)):
+			fields.length() == 1
+		_:
+			False
+
+
+pure func test_parameters_accept_a_trailing_comma() -> Bool:
+	match root_functions("func main(first: Int, second: Int,) -> Int:\n\t0\n"):
+		[function]:
+			function.parameters.length() == 2
+		_:
+			False
+
+
+pure func test_type_parameters_accept_a_trailing_comma() -> Bool:
+	match root_functions("func main[A, B,](first: A) -> Int:\n\t0\n"):
+		[function]:
+			function.type_parameters.length() == 2
+		_:
+			False
+
+
+pure func test_type_arguments_accept_a_trailing_comma() -> Bool:
+	match root_functions("func main(first: List[Int,]) -> Int:\n\t0\n"):
+		[function]:
+			match function.parameters.get(0).map(pure func(parameter): parameter.type_name):
+				Some(AppliedType(_, arguments, _)):
+					arguments.length() == 1
+				_:
+					False
+		_:
+			False
+
+
+pure func test_record_declaration_accepts_a_trailing_comma() -> Bool:
+	match parse_source("fixed record Pair { first: Int, second: Int, }\n" + HEADER + "\t0\n"):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+pure func test_variant_fields_accept_a_trailing_comma() -> Bool:
+	match parse_source("fixed union Choice:\n\tPair(Int, Int,)\n" + HEADER + "\t0\n"):
+		Ok(parsed):
+			match inventory_unions(parsed_contents(parsed).declarations).filter(pure func(row): same_module(row.module, root_module_id())):
+				[row]:
+					row.variants.get(0).map(pure func(variant): variant.declaration.fields.length()) == Some(2)
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_pattern_fields_accept_a_trailing_comma() -> Bool:
+	match root_functions(HEADER + "\tmatch value:\n\t\tPair(first, _,):\n\t\t\t0\n"):
+		[function]:
+			match function.body:
+				ParsedMatchBody(body):
+					match body.arms.get(0).map(pure func(arm): arm.pattern):
+						Some(PatternConstructor(_, fields, _)):
+							fields.length() == 2
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_constructor_selection_accepts_a_trailing_comma() -> Bool:
+	source = "import:\n\t./choice: Choice(First, Second,)\n" + HEADER + "\t0\n"
+
+	match lex(module_source(root_module_id()), source).and_then(pure func(tokens): parse_module(tokens, root_module_id(), program_names().names)):
+		Ok(parsed):
+			match module_imports(parsed).get(0).map(pure func(row): row.symbols):
+				Some([ConstructorSelection(_, names)]):
+					names.length() == 2
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_a_comma_needs_an_item_before_it() -> Bool:
+	(
+		rejects(HEADER + "\tf(,)\n", 23, 24, "expected a return expression", "use a literal, a parameter or variant name, or a call as the entire body")
+		and rejects(HEADER + "\tf(1,,)\n", 25, 26, "expected a return expression", "use a literal, a parameter or variant name, or a call as the entire body")
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 trailing commas",
+	tests = [
+		("call arguments accept a trailing comma", test_call_arguments_accept_a_trailing_comma),
+		("receiver arguments accept a trailing comma", test_receiver_arguments_accept_a_trailing_comma),
+		("record literal accepts a trailing comma", test_record_literal_accepts_a_trailing_comma),
+		("record update accepts a trailing comma", test_record_update_accepts_a_trailing_comma),
+		("parameters accept a trailing comma", test_parameters_accept_a_trailing_comma),
+		("type parameters accept a trailing comma", test_type_parameters_accept_a_trailing_comma),
+		("type arguments accept a trailing comma", test_type_arguments_accept_a_trailing_comma),
+		("record declaration accepts a trailing comma", test_record_declaration_accepts_a_trailing_comma),
+		("variant fields accept a trailing comma", test_variant_fields_accept_a_trailing_comma),
+		("pattern fields accept a trailing comma", test_pattern_fields_accept_a_trailing_comma),
+		("constructor selection accepts a trailing comma", test_constructor_selection_accepts_a_trailing_comma),
+		("a comma needs an item before it", test_a_comma_needs_an_item_before_it),
+	]
+}

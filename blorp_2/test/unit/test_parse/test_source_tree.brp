@@ -1,0 +1,90 @@
+import:
+	fs: DirectoryEntryKind(EntryFile, EntryDirectory), read_directory
+	system: read_file
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	test: TestSuite
+
+
+-- The compiler's own source, relative to the repository root the tests run from.
+private SOURCE_ROOT: String = "blorp_2/src"
+
+
+-- Every .brp file below `directory`, in name order, or the first listing error.
+private func source_files(directory: String) -> Result[List[String], String]:
+	match read_directory(directory):
+		Err(error):
+			Err("cannot list " + directory + ": " + error.to_string())
+		Ok(entries):
+			var files: List[String] = []
+			var failure: Option[String] = None
+
+			for entry in entries:
+				path = directory + "/" + entry.name
+
+				match entry.kind:
+					EntryDirectory:
+						match source_files(path):
+							Ok(nested):
+								files = files.concat(nested)
+							Err(error):
+								failure = Some(error)
+					EntryFile:
+						if path.ends_with(".brp"):
+							files = files.append(path)
+					_:
+						void
+
+			match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(files)
+
+
+-- Lexes and parses one source file as a root module; the result is the first
+-- diagnostic's message, or None when the whole file parses.
+private func first_diagnostic(path: String) -> Result[Option[String], String]:
+	source ?= read_file(path).map_err(pure func(error): "cannot read " + path + ": " + error)
+
+	match lex(module_source(root_module_id()), source).and_then(pure func(tokens): parse_module(tokens, root_module_id(), program_names().names)):
+		Ok(_):
+			Ok(None)
+		Err(diagnostic):
+			Ok(Some("".append_int(diagnostic.span.start) + ": " + diagnostic.message))
+
+
+-- Reports every file read and how many the pilot parser accepts. The count is
+-- the milestone's frontier; a missing or unreadable tree fails the test.
+func test_source_tree_parse_count() -> Bool:
+	match source_files(SOURCE_ROOT):
+		Err(error):
+			print(error)
+			False
+		Ok(files):
+			var parsed: Int = 0
+			var unreadable: Int = 0
+
+			for path in files:
+				match first_diagnostic(path):
+					Ok(None):
+						parsed = parsed + 1
+						print("parsed  " + path)
+					Ok(Some(message)):
+						print("stopped " + path + " at " + message)
+					Err(error):
+						unreadable = unreadable + 1
+						print(error)
+
+			print("".append_int(parsed) + "/" + "".append_int(files.length()) + " source files parsed")
+			files.length() > 0 and unreadable == 0
+
+
+tests: TestSuite = {
+	description = "Blorp 2 source tree parse frontier",
+	tests = [
+		("every compiler source file is read and the parsed count reported", test_source_tree_parse_count),
+	]
+}

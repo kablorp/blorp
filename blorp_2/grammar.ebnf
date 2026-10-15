@@ -31,6 +31,18 @@
    - Arrow bytes stay adjacent. Spaces occur only where these rules permit.
    - Identifiers and comments remain ASCII; quoted values admit valid UTF-8.
      CR is unsupported as a raw byte, including in comments and quotes.
+   - A `|` that is the first byte after a line's indentation, including a
+     continuation line inside brackets, starts a pipe String: the text after
+     each marker, verbatim, joined with LF, with no escapes. The literal
+     continues on the next line when that line starts with the first marker
+     line's exact indentation bytes and then `|`. The text starts after the
+     single marker, so `||` yields one `|`; `${` is rejected. The word `raw`
+     alone on a code line, followed by a marker line, starts a raw block: the
+     same, but `${` is text. The last line's LF is the line's NEWLINE. Pipe
+     text admits tabs, printable bytes and UTF-8.
+   - A Char literal is one character or one escape pair between single
+     quotes on one line. The lexer produces the token; the parser rejects it
+     until the Char type exists.
    - Quoted String values occupy one physical line. Nine fixed escapes and
      \u{H} with one to six hexadecimal digits are accepted. Unicode escapes
      must denote scalars through 10FFFF, excluding D800..DFFF. Raw UTF-8 must
@@ -38,6 +50,10 @@
      count bytes. Raw ASCII controls and DEL are unsupported inside quotes.
    - `--` starts a single-line comment ending before LF or EOF. It takes
      precedence over a signed integer; `->` still forms an arrow.
+   - A line holding only `---` at column 1, with optional trailing spaces,
+     opens a documentation block that the next such line closes. The block
+     is trivia; its text admits any byte but CR. `----` and `--- x` are
+     comments. An unterminated block is an error at its opening fence.
    - Blank, whitespace-only and comment-only lines are lexical trivia. Their
      indentation has no layout meaning. Only lines containing code produce
      layout tokens, retaining their original byte offsets (see Layout below).
@@ -217,13 +233,24 @@ identifier_byte  = identifier_start | digit ;
 identifier       = (identifier_start { identifier_byte }) - ("func" | "pure" | "match" | "var" | "void" | "_") ;
 
 space            = " " ;
-spaces           = { space } ;
+(* A line break inside an open bracket is trivia: a bracket_break may stand
+   wherever spaces may, but only while more "(", "[" or "{" than ")", "]" or
+   "}" have been read on the lines so far. The lexer enforces that condition;
+   a closer with nothing open leaves the depth at zero. A column-1 fence line
+   inside an open bracket is an error, not a documentation block, and a "|"
+   first on a continuation line starts a pipe_string as on any line. *)
+bracket_trivia_line = { horizontal } [ line_comment ] ( "\n" | EOF ) ;
+bracket_break    = [ line_comment ] "\n" { bracket_trivia_line } { horizontal } ;
+spaces           = { space | bracket_break } ;
 required_spaces  = space spaces ;
 ascii_byte       = "\x00".."\x7F" ;
 comment_byte     = ascii_byte - ("\n" | "\r") ;
 line_comment     = "--" { comment_byte } ;
 horizontal       = space | "\t" ;
-trivia_line      = { horizontal } [ line_comment ] ( "\n" | EOF ) ;
+doc_fence        = "---" { space } ( "\n" | EOF ) ;
+doc_text_line    = { ascii_byte - ( "\n" | "\r" ) | utf8_scalar | "\x80".."\xFF" } "\n" ;
+doc_block        = doc_fence { doc_text_line - doc_fence } doc_fence ;
+trivia_line      = { horizontal } [ line_comment ] ( "\n" | EOF ) | doc_block ;
 indentation      = { "\t" } | { "    " } ;
 
 (* Layout. The lexer turns line structure into the tokens NEWLINE, INDENT and
@@ -239,6 +266,9 @@ indentation      = { "\t" } | { "    " } ;
      with one DEDENT for each level it closes, and EOF closes every open level.
    - INDENT and DEDENT span the line's indentation prefix; at EOF they and
      the final NEWLINE are empty spans at the end of the source.
+   - A line break inside an open bracket produces none of these tokens: the
+     code line continues on the next line, whose indentation is not checked
+     (see bracket_break). Layout resumes at the first line end at depth zero.
    Blocks nest by INDENT and DEDENT alone; no rule names a depth. *)
 NEWLINE          = spaces [ line_comment ] ( "\n" | EOF ) ;
 INDENT           = indentation ;
@@ -274,26 +304,42 @@ string_byte      = "\x20".."\x21" | "\x23".."\x5B" | "\x5D".."\x7E" | utf8_scala
 string_contents  = { string_byte | string_escape } ;
 (* Raw interpolation openers are excluded; $\{ remains literal text. *)
 string_literal   = "\"" (string_contents - (string_contents "${" string_contents)) "\"" ;
-arguments        = expression { spaces "," spaces expression } ;
+char_byte        = "\x20".."\x26" | "\x28".."\x5B" | "\x5D".."\x7E" | utf8_scalar ;
+char_literal     = "'" ( char_byte | "\\" ( ascii_byte - "\n" ) ) "'" ;
+pipe_byte        = "\t" | "\x20".."\x7E" | utf8_scalar ;
+pipe_text        = { pipe_byte } - ( { pipe_byte } "${" { pipe_byte } ) ;
+raw_text         = { pipe_byte } ;
+(* Every marker after the first follows the first marker line's exact
+   indentation bytes; the lexer compares them. A pipe_string begins only
+   where a line's code begins, so a "|" after other code on its line is the
+   record update bar. *)
+pipe_string      = "|" pipe_text { "\n" indentation "|" pipe_text } ;
+raw_string       = "raw" { space } "\n" indentation "|" raw_text { "\n" indentation "|" raw_text } ;
+(* Every bracketed, comma-separated list admits one trailing comma. *)
+trailing_comma   = [ spaces "," ] ;
+arguments        = expression { spaces "," spaces expression } trailing_comma ;
 direct_call      = identifier spaces "(" spaces [ arguments ] spaces ")" ;
 record_field     = identifier spaces "=" spaces expression ;
-record_literal   = "{" spaces [ record_field { spaces "," spaces record_field } ] spaces "}" ;
-record_update    = "{" spaces expression spaces "|" spaces record_field { spaces "," spaces record_field } spaces "}" ;
-primary          = "void" | float | integer | string_literal | identifier | direct_call | record_literal | record_update ;
+record_literal   = "{" spaces [ record_field { spaces "," spaces record_field } trailing_comma ] spaces "}" ;
+record_update    = "{" spaces expression spaces "|" spaces record_field { spaces "," spaces record_field } trailing_comma spaces "}" ;
+(* A group is transparent: its expression is the result, and postfix
+   operations may follow the closing parenthesis. *)
+group            = "(" spaces expression spaces ")" ;
+primary          = "void" | float | integer | string_literal | pipe_string | raw_string | identifier | direct_call | record_literal | record_update | group ;
 receiver_call    = spaces "." spaces identifier spaces "(" spaces [ arguments ] spaces ")" ;
 field_read       = spaces "." spaces identifier ;
 expression       = primary { receiver_call | field_read } ;
-type_annotation  = identifier spaces [ "[" spaces type_annotation { spaces "," spaces type_annotation } spaces "]" ] ;
+type_annotation  = identifier spaces [ "[" spaces type_annotation { spaces "," spaces type_annotation } trailing_comma spaces "]" ] ;
 parameter        = identifier spaces ":" spaces type_annotation ;
 type_parameter   = "A".."Z" { letter | digit } ;
-type_parameters = "[" spaces type_parameter { spaces "," spaces type_parameter } spaces "]" spaces ;
+type_parameters = "[" spaces type_parameter { spaces "," spaces type_parameter } trailing_comma spaces "]" spaces ;
 function_header  = [ "pure" required_spaces ] "func" required_spaces identifier spaces [ type_parameters ] "(" spaces
-                   [ parameter { spaces "," spaces parameter } ] spaces ")" spaces [ "->" spaces type_annotation spaces ] ":"
+                   [ parameter { spaces "," spaces parameter } trailing_comma ] spaces ")" spaces [ "->" spaces type_annotation spaces ] ":"
                    NEWLINE ;
 tail_annotation  = "@tail_recursive" (required_spaces | NEWLINE) ;
 function         = [ tail_annotation ] function_header INDENT body DEDENT ;
 field_pattern    = "_" | identifier ;
-pattern          = "_" | identifier spaces [ "(" spaces [ field_pattern { spaces "," spaces field_pattern } ] spaces ")" ] ;
+pattern          = "_" | identifier spaces [ "(" spaces [ field_pattern { spaces "," spaces field_pattern } trailing_comma ] spaces ")" ] ;
 binding          = [ "var" required_spaces ] identifier spaces "=" spaces expression NEWLINE ;
 statement        = binding | expression NEWLINE ;
 arm_block        = { statement } expression NEWLINE ;
@@ -301,20 +347,24 @@ match_arm        = pattern spaces ":" (spaces expression NEWLINE | NEWLINE INDEN
 match_body       = "match" required_spaces expression spaces ":" NEWLINE INDENT match_arm { match_arm } DEDENT ;
 tail             = expression NEWLINE | match_body ;
 body             = { statement } tail | builtin_body ;
-variant          = identifier spaces [ "(" spaces type_annotation { spaces "," spaces type_annotation } spaces ")" ] NEWLINE ;
+variant          = identifier spaces [ "(" spaces type_annotation { spaces "," spaces type_annotation } trailing_comma spaces ")" ] NEWLINE ;
 fixed_union      = "fixed" required_spaces "union" required_spaces identifier spaces [ type_parameters ] ":"
                    NEWLINE INDENT variant { variant } DEDENT ;
 record_member    = identifier spaces ":" spaces type_annotation ;
 fixed_record     = "fixed" required_spaces "record" required_spaces identifier spaces [ type_parameters ] "{" spaces
-                   record_member { spaces "," spaces record_member } spaces "}" NEWLINE ;
+                   record_member { spaces "," spaces record_member } trailing_comma spaces "}" NEWLINE ;
 declaration      = function | fixed_union | fixed_record | builtin_type ;
 relative_prefix  = "./" | "../" { "../" } ;
 module_components = identifier { "/" identifier } ;
 module_path      = [ relative_prefix ] module_components ;
-constructor_selection = spaces "(" spaces [ identifier { spaces "," spaces identifier } ] spaces ")" ;
+constructor_selection = spaces "(" spaces [ identifier { spaces "," spaces identifier } trailing_comma ] spaces ")" ;
 import_symbol    = identifier [ constructor_selection | required_spaces "methods_only" ] ;
-import_selection = import_symbol { spaces "," spaces import_symbol } ;
-import_row       = module_path spaces ":" spaces import_selection NEWLINE ;
+import_selection = import_symbol { spaces "," spaces import_symbol } trailing_comma ;
+(* The selections follow the path on its line, or on an indented block of
+   lines, each holding one or more selections. *)
+selection_line   = import_selection NEWLINE ;
+import_row       = module_path spaces ":" ( spaces import_selection NEWLINE
+                   | NEWLINE INDENT selection_line { selection_line } DEDENT ) ;
 import_block     = "import" spaces ":" NEWLINE INDENT import_row { import_row } DEDENT ;
 program          = { import_block } { declaration } EOF ;
 
