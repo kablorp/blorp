@@ -28,8 +28,9 @@ Changes under `blorp_2/` are validated with `make -C blorp_2 test`;
 `scripts/compiler-check` selects nothing for that tree.
 
 CI's macOS Blorp 2 lane restores the existing compiler's build artifact and
-runs unit, runtime, grammar and tooling suites, then e2e tests. The e2e suite
-builds the pilot once using the restored compiler and runs every fixture.
+runs unit, runtime, grammar and tooling suites, then e2e tests
+(`make -C blorp_2 test-compiler test-e2e`), which build the pilot once using
+the restored compiler and run every fixture against it.
 Hosted macOS runners may omit `/usr/bin/time -l` retired-instruction counters,
 so the CI step explicitly sets `BLORP_2_INSTRUCTION_CHECK=disabled`. It skips
 only instruction measurement and limits; allocation caps, strict leak parsing,

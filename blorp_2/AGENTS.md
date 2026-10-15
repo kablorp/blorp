@@ -108,9 +108,10 @@ literals in tests does not add them to the pilot's input grammar.
 once at `-O0`. The C compiler builds the unmodified output, and the suite checks the fixture's
 real `main` for exit status, stdout and stderr. Each fixture exposes its
 behavior through that entrypoint; precise phase facts belong in unit tests.
-Run e2e with `bin/blorp test --timeout 0 blorp_2/test/e2e`. Keep artifacts
-under the ignored `build/` or temporary directories; add no persistent
-compiler cache.
+Run e2e with `make -C blorp_2 test-e2e`, which names the compiler under test
+on the suite's command line through the Makefile's `BLORP2_COMPILER`; the
+harness has no default. Keep artifacts under the ignored `build/` or
+temporary directories; add no persistent compiler cache.
 
 **The direct C exception.** Unit tests of target runtime helpers under
 `test/runtime/` may be C, compiled and run by a Blorp `TestSuite`. This includes

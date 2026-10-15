@@ -271,30 +271,33 @@ make -C blorp_2 test             # Run the Blorp TestSuite tests.
 `example` keeps its generated C and executable in `blorp_2/build/` for
 inspection. The tests use temporary directories. `BLORP_CC` selects a C
 compiler executable (default `clang`).
-To run only end-to-end tests, use:
+To run only end-to-end tests, build the pilot and run the suite against it:
 
 ```sh
-bin/blorp test --timeout 0 blorp_2/test/e2e
+make -C blorp_2 test-compiler test-e2e
 ```
 
 The host test runner's default 30-second deadline applies to the entire
-generated suite, including the pilot build and every fixture. End-to-end runs
-disable that deadline. `make -C blorp_2 test` runs e2e separately with
-`--timeout 0`; the other suites retain their 180-second deadline.
+generated suite, including every fixture. End-to-end runs disable that
+deadline. `make -C blorp_2 test` runs e2e separately with `--timeout 0`; the
+other suites retain their 180-second deadline.
 
-Each end-to-end run builds the pilot at the beginning: the host compiler
-generates `build/compiler.c` once, then the C compiler links one `-O0` executable
-with allocation diagnostics enabled. Its executable path is passed
-explicitly to every test group. Build failure stops the run before any fixture
+`test-compiler` builds the pilot once: the host compiler generates
+`build/compiler.c`, then the C compiler links one `-O0` executable with
+allocation diagnostics enabled. `test-e2e` names that executable on the
+suite's command line through the Makefile variable `BLORP2_COMPILER`
+(default `blorp_2/build/compiler`), and the harness passes it explicitly to
+every test group; the harness has no default and rejects a missing or unset
+compiler with an exact message. Build failure stops the run before any fixture
 executes. Existing artifacts are overwritten on the next run; there is no
-persistent compiler cache or input manifest. For manual inspection,
-`make -C blorp_2 test-compiler` performs the same unconditional build; it is
-not a prerequisite for running the tests.
+persistent compiler cache or input manifest. To test another executable, pass
+the variable: `make -C blorp_2 test-e2e BLORP2_COMPILER=path/to/pilot`
+(relative to the repository root).
 
 CI's macOS Blorp 2 lane waits for the existing compiler's build and restores
 that toolchain artifact. It runs unit, runtime, grammar and tooling suites,
-then the e2e suite with `--timeout 0`. The e2e suite uses that host compiler to
-build the pilot once and test every fixture. Hosted macOS runners may omit
+then `make -C blorp_2 test-compiler test-e2e`, which uses that host compiler
+to build the pilot once and tests every fixture. Hosted macOS runners may omit
 retired-instruction counters, so that CI step explicitly sets
 `BLORP_2_INSTRUCTION_CHECK=disabled`. Allocation caps, strict leak reports and
 all native ASan/UBSan cases still run. A failing suite blocks packaging and
